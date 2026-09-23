@@ -1,0 +1,284 @@
+"""Desk gate of actual PCIe adoption preparation and xHCI quiescence."""
+import argparse,pathlib,re,tempfile,subprocess,os,sys,hashlib
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
+import el3_runtime_emitted_check as b
+p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+pc=(b.ROOT/'RaspberryPi4/Lib/pcie.pi4').read_text()
+xh=(b.ROOT/'RaspberryPi4/Lib/xhci.pi4').read_text()
+def proc(s,n):return re.search(r'(?ms)^Procedure(?:\.i)? '+n+r'\([^\n]*\).*?^EndProcedure',s).group()
+body='\n'.join(proc(pc,n) for n in ('PcieAdoptCpu','PcieNeedsTakeover','PcieAdoptHalted','PciePrepareAdoption','PcieProgramWindow','PcieColdFirmwareReady','PcieResetAndTrain','PcieEnumerate','PcieEnableDma','PcieReadDmaOffset','PcieDmaOffset','PcieInboundSizeCode','PcieInboundBytes','PcieDmaTop','PcieDmaOk'))+'\n'+proc(xh,'XhciQuiesceAdopted')+'\n'+proc(xh,'xh_EnableDma')
+# XhciInit's arena section, which is where this driver decides its ring
+# memory is usable at all: reachable through the window AND at the address
+# it thinks it is. Every TRB pointer in that file is a bare physical
+# address, so an inbound window with an offset makes all of them name the
+# wrong memory - and the controller reports success either way.
+arena=proc(xh,'XhciInitAt').split('  xh_Phase(#XHCI_PH_ARENA)')[1].split('  xh_Phase(#XHCI_PH_LOCATE)')[0]
+assert 'PcieDmaOk(' in arena and 'PcieDmaOffset()' in arena, 'arena section not found in XhciInit'
+DMAOFF_CHECK='  If PcieDmaOffset() <> 0\n    ProcedureReturn xh_Fail(#XHCI_ERR_DMA_OFFSET)\n  EndIf\n'
+assert arena.count(DMAOFF_CHECK)==1
+DMAOFF_ERR=int(re.search(r'(?m)^#XHCI_ERR_DMA_OFFSET\s*=\s*(\d+)',xh).group(1))
+body+='\nProcedure.i ProbeArena()\n'+arena+'\n ProcedureReturn 1\nEndProcedure\n'
+defs={m[1]:m[0] for m in re.finditer(r'(?m)^#(\w+)\s*=.*$',pc+'\n'+xh)}
+prefix=proc(xh,'XhciInitAt').split('  xh_err   = #XHCI_ERR_NONE')[0]
+body+='\n'+prefix.replace('XhciInitAt(','ProbeBdf(')+'\n ProcedureReturn 1\nEndProcedure\n'
+init_reset=proc(xh,'XhciInitAt').split('  xh_Phase(#XHCI_PH_RESET)')[1].split('  ; CONFIG -')[0]
+def upstream_bme_order(fragment):
+ return fragment.index('If xh_EnableDma() = 0') < fragment.index('If xh_Halt() = 0') < fragment.index('If xh_Reset() = 0')
+assert upstream_bme_order(init_reset)
+assert not upstream_bme_order(init_reset.replace('If xh_EnableDma() = 0','If xh_EnableDmaWrong() = 0').replace('If xh_Halt() = 0','If xh_EnableDma() = 0').replace('If xh_EnableDmaWrong() = 0','If xh_Halt() = 0'))
+body+='\nProcedure.i ProbeInitReset()\n'+init_reset+'\n ProcedureReturn 1\nEndProcedure\n'
+needed=set(re.findall(r'#(\w+)',body));pending=list(needed)
+while pending:
+ for dep in re.findall(r'#(\w+)',defs[pending.pop()].split(';')[0])[1:]:
+  if dep not in needed:needed.add(dep);pending.append(dep)
+const='\n'.join(v for k,v in defs.items() if k in needed)
+model="""
+Global pcie_err.i,pcie_adoptCpu.i,pcie_adoptHalted.i,xh_err.i
+Global pcie_adopted.i=1,cmd.i=6,live.i=1,ticks.i,reads.i,hazard.i
+Global mode.i=MODE
+Global pcie_up.i=1,pcie_enumerated.i,pcie_barBus.i,pcie_barCpu.i,pcie_barSize.i
+Global epbar.i=$C0000004,bridgewin.i=$C000C000
+Global inboundlow.i=15,inboundhigh.i=4
+Global reset_calls.i
+Global pcie_memBytes.i,pcie_resetStarted.i,pcie_dmaOff.i,pcie_dmaOffRead.i,pcie_vl805Ready.i
+Global fundamental.i,elapsed.i,released.i=-1
+Global pcie_linkSpeed.i,pcie_linkWidth.i,pcie_sscOk.i,linkUpSeen.i
+Global xh_base.i,xh_end.i,xh_brk.i
+Dim rc.i(10000)
+Dim mdio.i(64)
+Global Dim xh_arena.a[#XHCI_ARENA_BYTES]
+Procedure delay(ms.i) : elapsed=elapsed+ms : EndProcedure
+Procedure pcie_Modify(o.i,clear.i,set.i)
+ If o=#PCIE_RGR1_SW_INIT_1
+  If (set & 1)<>0
+   If live<>0 Or (cmd & 4)<>0 : hazard=hazard+1 : EndIf
+   fundamental=fundamental+1
+  EndIf
+  If (clear & 1)<>0 : released=elapsed : EndIf
+ EndIf
+ pcie_Poke(o,(PcieRcPeek(o) & (~clear)) | set)
+EndProcedure
+Procedure.i PcieLinkUp()
+ If fundamental=0 Or released<0 Or elapsed-released<100 : hazard=hazard+1 : EndIf
+ linkUpSeen=1
+ ProcedureReturn 1
+EndProcedure
+; The PHY's MDIO bus and what rides on it. Spread-spectrum clocking and the
+; LNKSTA readout are owned by tools/pcie_reset_policy_check.py; here they are
+; modelled only so PcieResetAndTrain links, and they still refuse to be called
+; on a link that has not trained - this gate's whole subject is ordering.
+Procedure.i pcie_MdioRead(regad.i)
+ ProcedureReturn mdio(regad & 63)
+EndProcedure
+Procedure.i pcie_MdioWrite(regad.i,v.i)
+ mdio(regad & 63)=v
+ ProcedureReturn 1
+EndProcedure
+Procedure.i pcie_SetSsc()
+ If linkUpSeen=0 : hazard=hazard+1 : EndIf
+ pcie_MdioWrite(31,$1100)
+ ProcedureReturn pcie_MdioRead(31)
+EndProcedure
+Procedure pcie_ReadLinkStatus()
+ If linkUpSeen=0 : hazard=hazard+1 : EndIf
+ pcie_linkSpeed=2
+ pcie_linkWidth=1
+EndProcedure
+Procedure xh_Phase(p.i) : EndProcedure
+; Firmware transaction is an explicit successful modeled environment here;
+; its real mailbox handshake has an independent owning gate.
+Procedure.i MailboxNotifyVl805Reset() : ProcedureReturn 1 : EndProcedure
+Procedure.i pcie_TickHz() : ProcedureReturn 1000000 : EndProcedure
+Procedure.i pcie_Ticks() : ticks=ticks+1000 : ProcedureReturn ticks : EndProcedure
+Procedure.i xh_Fail(reason.i) : xh_err=reason : ProcedureReturn 0 : EndProcedure
+Procedure.i xh_Halt() : ProcedureReturn live=0 : EndProcedure
+Procedure xh_FailStop() : EndProcedure
+Procedure.i xh_Reset()
+ reset_calls=reset_calls+1
+ If (cmd & 4)=0 Or live<>0 : ProcedureReturn 0 : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure pcie_Phase(p.i) : EndProcedure
+Procedure.i PcieCpuFromBus(v.i) : ProcedureReturn #PCIE_OUT_CPU+v-#PCIE_OUT_BUS : EndProcedure
+Procedure.i PcieBarSize(b.i,d.i,f.i,o.i)
+ If live<>0 Or (cmd & 6)<>0 : hazard=hazard+1 : EndIf
+ If mode<>7 And (fundamental<>1 Or elapsed-released<100) : hazard=hazard+1 : EndIf
+ ProcedureReturn 65536
+EndProcedure
+Procedure.i PcieCfgRead32(b.i,d.i,f.i,o.i)
+ If b=0
+  If o=$18 : ProcedureReturn $10100 : EndIf
+  If o=4 : ProcedureReturn 6 : EndIf
+  If o=$20
+   If mode=5 : ProcedureReturn 0 : EndIf
+   ProcedureReturn bridgewin
+  EndIf
+ Else
+  If o=0 : ProcedureReturn $34831106 : EndIf
+  If o=8 : ProcedureReturn $0C033000 : EndIf
+  If o=4 : ProcedureReturn cmd | $A0000000 : EndIf
+  If o=$10 : ProcedureReturn epbar : EndIf
+ EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure PcieCfgWrite32(b.i,d.i,f.i,o.i,v.i)
+ If o=4 And (v & $FFFF0000)<>0 : hazard=hazard+1 : EndIf
+ If b=1 And o=4
+  If live<>0 : hazard=hazard+1 : EndIf
+  If mode<>3 And (mode<>8 Or (v & 4)=0) : cmd=v : EndIf
+ EndIf
+ If b=0 And o=$20 : bridgewin=v : EndIf
+ If b=1 And o=$10
+  If live<>0 Or (cmd & 6)<>0 : hazard=hazard+1 : EndIf
+  epbar=v
+ EndIf
+EndProcedure
+Procedure pcie_Poke(o.i,v.i)
+ If (mode=9 Or mode=10) And o=#PCIE_MISC_WIN0_LO And v=#PCIE_OUT_BUS
+  ProcedureReturn
+ EndIf
+ If o=$4034 Or o=$4038
+  If live<>0 Or (cmd & 4)<>0 : hazard=hazard+1 : EndIf
+  If o=$4034 : inboundlow=v : EndIf
+  If o=$4038 : inboundhigh=v : EndIf
+ EndIf
+ rc[o/4]=v
+EndProcedure
+Procedure.i PcieRcPeek(o.i)
+ If o=#PCIE_MISC_PCIE_STATUS : ProcedureReturn 176 : EndIf
+ If o=$4034 : ProcedureReturn inboundlow : EndIf
+ If o=$4038 : ProcedureReturn inboundhigh : EndIf
+ ProcedureReturn rc[o/4]
+EndProcedure
+Procedure.i xh_TickHz() : ProcedureReturn 1000000 : EndProcedure
+; The wait ledger the production body accounts into. Not inert: it counts,
+; and the fixture reads the count back, so a body that stops accounting the
+; firmware handover's two waits turns this gate red rather than quietly
+; losing the only record of how long the handover took.
+#XHCI_W_ADOPT = 4
+#XHCI_W_N = 22
+Global Dim gateWaitRow.i[#XHCI_W_N]
+Procedure.i XhciWaitMark() : ProcedureReturn 0 : EndProcedure
+Procedure XhciAccountWait(site.i,t0.i)
+ If site>=0 And site<#XHCI_W_N : gateWaitRow[site]=gateWaitRow[site]+1 : EndIf
+EndProcedure
+Procedure.i GateWaitVisits(site.i)
+ If site<0 Or site>=#XHCI_W_N : ProcedureReturn -1 : EndIf
+ ProcedureReturn gateWaitRow[site]
+EndProcedure
+Procedure.i xh_Ticks() : ticks=ticks+1000 : ProcedureReturn ticks : EndProcedure
+Procedure.i xh_Rd(base.i,o.i)
+ reads=reads+1
+ If base=#PCIE_OUT_CPU And o=0 : ProcedureReturn $01000040 : EndIf
+ If o=#XHCI_USBSTS
+  If mode=1 Or (mode=4 And ticks<4000) : ProcedureReturn #XHCI_STS_CNR : EndIf
+  If live=0 : ProcedureReturn #XHCI_STS_HALT : EndIf
+ EndIf
+ If o=#XHCI_USBCMD : ProcedureReturn 1 : EndIf
+ ProcedureReturn 0
+EndProcedure
+Procedure xh_Wr(base.i,o.i,v.i)
+ If mode=1 Or (mode=4 And ticks<4000) : hazard=hazard+1 : EndIf
+ If mode<>2 : live=0 : EndIf
+EndProcedure
+"""
+main="""
+Procedure.i Main()
+ Define x.i,y.i
+ Define z.i
+ If mode=7
+  pcie_adopted=0
+  live=0
+  inboundhigh=0
+  PcieProgramWindow()
+  x=1
+ Else
+  x=PciePrepareAdoption()
+ EndIf
+ If mode=6
+  z=PcieEnumerate()
+ Else
+  If x<>0 : y=XhciQuiesceAdopted() : EndIf
+  If y<>0 : z=PcieEnumerate() : EndIf
+ EndIf
+ PokeI($6000000,x)
+ PokeI($6000008,y)
+ PokeI($6000010,hazard)
+ PokeI($6000018,pcie_adoptHalted)
+ PokeI($6000020,cmd)
+ PokeI($6000028,reads)
+ PokeI($6000030,z)
+ PokeI($6000038,inboundhigh)
+ If mode=8 : PokeI($6000040,xh_EnableDma()) : EndIf
+ If mode>=15 : PokeI($6000040,ProbeInitReset()) : EndIf
+ PokeI($6000048,xh_err)
+ PokeI($6000050,fundamental)
+ ProcedureReturn 0
+EndProcedure
+"""
+interp=b.load_interpreter(b.INTERP)
+model=re.sub(r'(?m)^Global (.*)$',lambda m:'\n'.join('Global '+v for v in m[1].split(',')),model)
+main=main.replace('Define x.i,y.i','Define x.i\n Define y.i')
+with tempfile.TemporaryDirectory(prefix='pcie-takeover-') as tmp:
+ w=pathlib.Path(tmp)
+ for mode in range(20):
+  entry=main
+  if mode==10:entry='Procedure.i Main()\n PokeI($6000000,PcieProgramWindow())\n PokeI($6000008,reads)\n PokeI($6000010,inboundhigh)\n ProcedureReturn 0\nEndProcedure'
+  if 11<=mode<15:
+   args_bdf={11:'2,0,0',12:'1,1,0',13:'1,0,1',14:'1,0,0'}[mode]
+   entry='Procedure.i Main()\n PokeI($6000000,ProbeBdf('+args_bdf+'))\n PokeI($6000008,xh_err)\n PokeI($6000010,cmd)\n PokeI($6000018,reads)\n ProcedureReturn 0\nEndProcedure'
+  if mode>=17:
+   # 17 identity window, 18 the firmware's $4_0000_0000 offset, 19 the same
+   # window with the identity check deleted - the witness that the check is
+   # what refuses it and not something else in the arena section.
+   entry=('Procedure.i Main()\n'
+          +(' inboundhigh=0\n' if mode==17 else '')
+          +' PokeI($6000000,ProbeArena())\n PokeI($6000008,xh_err)\n PokeI($6000010,PcieDmaOffset())\n ProcedureReturn 0\nEndProcedure')
+  gatebody=body
+  if mode==19:
+   gatebody=gatebody.replace(DMAOFF_CHECK,'',1)
+  if mode==16:
+   early='  If xh_EnableDma() = 0\n    xh_FailStop()\n    ProcedureReturn 0\n  EndIf\n'
+   assert gatebody.count(early)==1
+   gatebody=gatebody.replace(early,'')
+  src=w/'test.pi4';out=w/'test.img';src.write_text(const+model.replace('MODE',str(mode))+gatebody+'\n'+entry)
+  env=os.environ.copy();env['PMF_ROOT']=str(b.ROOT)
+  r=subprocess.run([a.compiler,'--compile',str(src),'-t','pi4','--entry-returns','--load-addr',hex(b.LOAD),'--stack-addr',hex(b.STACK),'-o',str(out)],env=env,cwd=b.ROOT,capture_output=True,text=True)
+  if r.returncode or not out.exists():raise SystemExit(r.stdout+r.stderr)
+  cpu=interp.A64()
+  for i,v in enumerate(out.read_bytes()):cpu.memory[b.LOAD+i]=v
+  cpu.pc=b.LOAD;cpu.sp=b.STACK;cpu.x[30]=b.RETURN_PC
+  for n in range(1000000):
+   if cpu.pc==b.RETURN_PC:break
+   cpu.step()
+  else:raise AssertionError('deadline failed')
+  v=[b.u64(cpu,b.OUT+8*i) for i in range(11)]
+  print(mode,v,n)
+  if mode>=17:
+   if mode==17:assert v[:3]==[1,0,0],v
+   elif mode==18:assert v[:3]==[0,DMAOFF_ERR,0x400000000],v
+   else:assert v[:3]==[1,0,0x400000000],v
+   continue
+  if 11<=mode<15:
+   assert v[:4]==([1,0,6,0] if mode==14 else [0,45,6,0]),v
+   continue
+  if mode==10:
+   assert v[:3]==[0,0,4],v
+   continue
+  assert v[2]==0,v
+  if mode in (0,4,8,15,16):assert v[:2]==[1,1] and v[3:5]==[0,2] and v[10]==1,v
+  elif mode==9:assert v[:2]==[1,1] and v[3:5]==[0,2] and v[10]==1,v
+  elif mode==7:assert v[:2]==[1,1] and v[3:6]==[0,2,0],v
+  else:assert v[1]==0 and v[3]==0,v
+  if mode==5:assert v[0]==0 and v[5]==0,v
+  if mode in (0,4,7,8,15,16):assert v[6:8]==[1,0],v
+  elif mode==9:assert v[6:8]==[0,0],v
+  else:assert v[6:8]==[0,4],v
+  if mode==8:assert v[8:10]==[0,44],v
+  if mode==3:assert v[9]==45,v
+  if mode==15:assert v[8]==1,v
+  if mode==16:assert v[8]==0,v
+ assert 'PcieResetAndTrain()' in proc(pc,'PcieInit')
+ assert 'If PcieProgramWindow() = 0' in proc(pc,'PcieResetAndTrain')
+ assert 'If PcieResetAndTrain() = 0' in proc(pc,'PcieEnumerate')
+ print('PASS twenty cases including missing-BME mutant, the arena refusing a non-identity inbound window (and the witness that deleting that check accepts it), and exact upstream BME-before-halt/reset order; compiler SHA256',hashlib.sha256(pathlib.Path(a.compiler).read_bytes()).hexdigest())

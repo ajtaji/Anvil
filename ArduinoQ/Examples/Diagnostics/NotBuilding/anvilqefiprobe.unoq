@@ -1,0 +1,1160 @@
+; ======================================================================
+;  anvilqefiprobe.unoq - Arduino UNO Q (QCM2290): WALK THE WHOLE UEFI
+;                       PROTOCOL DATABASE.
+;
+;  WHY THIS EXISTS. The console probe (anvilqconprobe.unoq, silicon
+;  2026-09-02) asked this firmware FOUR questions - ConOut, ConIn, GOP and
+;  a file on the ESP - and it built exactly four GUIDs to ask them with.
+;  Everything anybody has since said about what this board's firmware
+;  publishes has therefore been reasoning from a U-Boot defconfig, not a
+;  measurement, and the vault note that surveys the link question
+;  ("Networking on the UNO Q - the link question") says so in as many
+;  words:
+;
+;      "EFI_SIMPLE_NETWORK_PROTOCOL has never been looked for on this
+;       board. Neither has EFI_MANAGED_NETWORK_PROTOCOL,
+;       EFI_PXE_BASE_CODE_PROTOCOL, EFI_USB2_HC_PROTOCOL,
+;       EFI_USB_IO_PROTOCOL or EFI_RNG_PROTOCOL."
+;
+;  The GOP result is the reason to care rather than to assume. GOP was
+;  EXPECTED and came back ABSENT; the ESP write was the long shot and it
+;  WORKED. This firmware does not answer to expectation.
+;
+;  WHAT IT DOES, AND WHAT IT DELIBERATELY DOES NOT DO.
+;
+;    * It enumerates EVERY handle in the firmware's handle database
+;      (BootServices->LocateHandleBuffer with SearchType AllHandles) and,
+;      for each one, EVERY protocol installed on it
+;      (BootServices->ProtocolsPerHandle). Both are read-only queries
+;      defined in UEFI 2.10 s7.3.
+;
+;    * It prints each GUID in canonical text form, with a NAME where this
+;      file knows one, and RAW where it does not. An unnamed GUID is a
+;      finding, not a gap: it is a vendor protocol nobody here has seen,
+;      and the digits are what somebody looks up next.
+;
+;    * It then asks LocateProtocol directly for the protocols the link
+;      question turns on, so the answer for each is a single status code
+;      and not an inference from a list.
+;
+;    * If EFI_SIMPLE_NETWORK_PROTOCOL is there it READS the
+;      EFI_SIMPLE_NETWORK_MODE structure - state, MAC, MTU, media
+;      present. It does NOT call Start, Initialize, Transmit or Receive.
+;
+;    * If EFI_RNG_PROTOCOL is there it asks for 32 bytes. That is the one
+;      call here with a side effect and it is the point of the exercise:
+;      "a real entropy source" has been the top owed item since
+;      2026-08-23 and it is the only thing keeping drbg.pi4 off this
+;      board.
+;
+;  NO REGISTER IS TOUCHED. There is no clock write, no TLMM write, no
+;  GENI access and no peripheral read anywhere in this program. Every
+;  address it dereferences was handed to it by the firmware. It cannot
+;  hang the bus, which is the whole reason it is cheap to run.
+;
+;  It reports through both proven channels - the UEFI variable sink
+;  (qsink.pi4 -> AnvilQTxt) and \EFI\anvil\qefiprobe.log on the ESP - then
+;  resets back to Debian, which is the default boot entry, so the board
+;  always comes back.
+;
+;  BUILD:  bash tools/build_unoq_efiprobe.sh
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first (they define the seams the core needs) ---
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwinfo_q.unoq"
+; ---- the board's own UEFI plumbing: QCall, QEfiInit, QEspWrite, reset --
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+; ---- portable core, reused unchanged --------------------------------
+XIncludeFile "Anvil/Core/format.pbi"
+
+; ======================================================================
+;  The three EFI_BOOT_SERVICES entries qefi_q.unoq does not already name.
+;  EFI_BOOT_SERVICES is a 24-byte Hdr then the function table in the
+;  spec's order (UEFI 2.10 s4.4); counting from HandleProtocol at $98,
+;  which is proven on this board, gives:
+;
+;    $130  ProtocolsPerHandle
+;    $138  LocateHandleBuffer
+;    $048  FreePool
+; ======================================================================
+#BS_FREEPOOL            = $48
+#BS_PROTOCOLSPERHANDLE  = $130
+#BS_LOCATEHANDLEBUFFER  = $138
+
+; EFI_LOCATE_SEARCH_TYPE (UEFI 2.10 s7.3)
+#EFI_ALL_HANDLES        = 0
+
+; EFI_SIMPLE_NETWORK_PROTOCOL (UEFI 2.10 s24.1). Revision is a UINT64 at
+; $00, then the function pointers in declaration order, then the event
+; and the mode pointer.
+#SNP_START        = $08
+#SNP_INITIALIZE   = $18
+#SNP_GETSTATUS    = $58
+#SNP_TRANSMIT     = $60
+#SNP_RECEIVE      = $68
+#SNP_WAITFORPKT   = $70
+#SNP_MODE         = $78
+
+; EFI_SIMPLE_NETWORK_MODE (s24.1). MCastFilter is 16 EFI_MAC_ADDRESS of
+; 32 bytes each, which is what puts CurrentAddress as far down as $228.
+#SNM_STATE            = $000
+#SNM_HWADDRSIZE       = $004
+#SNM_MEDIAHDRSIZE     = $008
+#SNM_MAXPACKETSIZE    = $00C
+#SNM_NVRAMSIZE        = $010
+#SNM_RXFILTERMASK     = $018
+#SNM_RXFILTERSETTING  = $01C
+#SNM_CURRENTADDRESS   = $228
+#SNM_BROADCASTADDRESS = $248
+#SNM_PERMANENTADDRESS = $268
+#SNM_IFTYPE           = $288
+#SNM_MACCHANGEABLE    = $289
+#SNM_MULTIPLETX       = $28A
+#SNM_MEDIAPRESENTSUP  = $28B
+#SNM_MEDIAPRESENT     = $28C
+
+; EFI_RNG_PROTOCOL (UEFI 2.10 s37.5): GetInfo then GetRNG.
+#RNG_GETINFO = $00
+#RNG_GETRNG  = $08
+
+; NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS, for the variable sink
+#EFI_ATTR = $7
+
+; ======================================================================
+;  THE KNOWN-GUID TABLE.
+;
+;  Each entry is registered by its CANONICAL TEXT, parsed at run time into
+;  the sixteen bytes UEFI actually compares, and carries a numeric name id
+;  written ON THE SAME LINE. The id is what PutGuidName renders.
+;
+;  WHY TEXT AND NOT SIXTEEN POKES EACH. The four GUIDs this tree already
+;  builds are 16 hand-written PokeB calls apiece; fifty-odd of those is
+;  eight hundred lines in which one transposed nibble is invisible and
+;  would present as "the firmware does not publish that protocol", which
+;  is exactly the wrong answer to come back with. A canonical GUID string
+;  can be compared against the specification character by character.
+;
+;  WHY AN ID AND NOT A PARALLEL NAME LIST. Two lists in the same order is
+;  a synchronisation bug waiting for its first insertion. The id travels
+;  on the registration line, so a name can only ever be wrong the way a
+;  typo is wrong - visibly, on one line, next to the digits it belongs to.
+; ======================================================================
+#GN_UNKNOWN        = 0
+#GN_LOADED_IMAGE   = 1
+#GN_LI_DEVPATH     = 2
+#GN_DEVPATH        = 3
+#GN_TXT_IN         = 4
+#GN_TXT_IN_EX      = 5
+#GN_TXT_OUT        = 6
+#GN_SIMPLE_PTR     = 7
+#GN_SERIAL_IO      = 8
+#GN_LOAD_FILE      = 9
+#GN_LOAD_FILE2     = 10
+#GN_SIMPLE_FS      = 11
+#GN_DISK_IO        = 12
+#GN_DISK_IO2       = 13
+#GN_BLOCK_IO       = 14
+#GN_BLOCK_IO2      = 15
+#GN_PARTITION_INFO = 16
+#GN_GOP            = 17
+#GN_DRIVER_BINDING = 18
+#GN_COMPONENT_NAME = 19
+#GN_COMPONENT_NAME2 = 20
+#GN_DP_TO_TEXT     = 21
+#GN_DP_FROM_TEXT   = 22
+#GN_DP_UTIL        = 23
+#GN_UNICODE_COLL   = 24
+#GN_UNICODE_COLL2  = 25
+#GN_HII_DATABASE   = 26
+#GN_HII_STRING     = 27
+#GN_HII_CONFIG_RT  = 28
+#GN_HII_CONFIG_ACC = 29
+#GN_TCG2           = 30
+#GN_DT_FIXUP       = 31
+#GN_HASH2          = 32
+#GN_RNG            = 33
+#GN_SNP            = 34
+#GN_NII            = 35
+#GN_NII31          = 36
+#GN_MNP            = 37
+#GN_MNP_SB         = 38
+#GN_PXE_BC         = 39
+#GN_PXE_BC_CB      = 40
+#GN_ARP            = 41
+#GN_ARP_SB         = 42
+#GN_IP4            = 43
+#GN_IP4_SB         = 44
+#GN_IP4_CONFIG2    = 45
+#GN_IP6            = 46
+#GN_IP6_SB         = 47
+#GN_UDP4           = 48
+#GN_UDP4_SB        = 49
+#GN_TCP4           = 50
+#GN_TCP4_SB        = 51
+#GN_DHCP4          = 52
+#GN_DHCP4_SB       = 53
+#GN_MTFTP4         = 54
+#GN_VLAN_CONFIG    = 55
+#GN_HTTP           = 56
+#GN_HTTP_SB        = 57
+#GN_ADAPTER_INFO   = 58
+#GN_USB2_HC        = 59
+#GN_USB_HC         = 60
+#GN_USB_IO         = 61
+#GN_USBFN_IO       = 62
+#GN_SCSI_PASSTHRU  = 63
+#GN_NVME_PASSTHRU  = 64
+#GN_BLOCK_IO_CRYPT = 65
+#GN_RESET_NOTIFY   = 66
+
+#KNOWN_MAX  = 96          ; capacity of the known table
+#SEEN_MAX   = 256         ; distinct GUIDs the tally can hold
+
+Global Dim gKGuid.b[#KNOWN_MAX * 16]
+Global Dim gKId.i[#KNOWN_MAX]
+Global gKN.i
+
+Global Dim gSeenGuid.b[#SEEN_MAX * 16]
+Global Dim gSeenCount.i[#SEEN_MAX]
+Global gSeenN.i
+Global gSeenOverflow.i
+
+; ---- walk results -----------------------------------------------------
+Global gLhbStatus.i
+Global gHandleCount.i
+Global gHandleBuf.i
+Global gProtoTotal.i
+Global gPphFailures.i
+
+; ---- the direct answers ----------------------------------------------
+Global gSnpStatus.i
+Global gSnp.i
+Global gRngStatus.i
+Global gRng.i
+
+; ---- SNP mode readings ------------------------------------------------
+Global gSnpMode.i
+Global gSnpState.i
+Global gSnpHwAddrSize.i
+Global gSnpMediaHdr.i
+Global gSnpMaxPacket.i
+Global gSnpIfType.i
+Global gSnpMediaPresent.i
+Global gSnpMediaPresentSup.i
+
+; ---- RNG readings -----------------------------------------------------
+Global gRngInfoStatus.i
+Global gRngInfoSize.i
+Global gRngGetStatus.i
+Global Dim gRngBytes.b[32]
+Global gRngNonZero.i
+
+; ---- scratch ----------------------------------------------------------
+Global Dim gTmpGuid.b[16]
+Global Dim gCellA.b[16]
+Global Dim gCellB.b[16]
+
+; ======================================================================
+;  GUID text -> the sixteen bytes UEFI compares.
+;
+;  A GUID's first three fields are stored LITTLE-ENDIAN and its last two
+;  BIG-ENDIAN. That asymmetry is the single most common way a hand-built
+;  GUID is wrong, so it is done once, here, and every entry in the table
+;  is written in the same canonical form the specification prints.
+; ======================================================================
+Procedure.i HexDigit(c.i)
+  If c >= 48 And c <= 57
+    ProcedureReturn c - 48
+  EndIf
+  If c >= 97 And c <= 102
+    ProcedureReturn c - 87
+  EndIf
+  If c >= 65 And c <= 70
+    ProcedureReturn c - 55
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; Two hex characters at text offset p, as one byte. -1 if either is not a
+; hex digit, which can only happen if a table entry is malformed - and
+; BuildKnownGuids checks for exactly that rather than storing a silent 0.
+Procedure.i HexPair(*s, p.i)
+  Define hi.i
+  Define lo.i
+  hi = HexDigit(PeekB(*s + p) & $FF)
+  lo = HexDigit(PeekB(*s + p + 1) & $FF)
+  If hi < 0 Or lo < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (hi << 4) | lo
+EndProcedure
+
+; GuidFromText(*s, dst) - 1 on success, 0 if the text is not a canonical
+; 36-character GUID. Returning a status rather than assuming makes a
+; mistyped table entry a LOUD line in the transcript instead of a protocol
+; that mysteriously never matches.
+Procedure.i GuidFromText(*s, dst.i)
+  Define i.i
+  Define v.i
+  ; the four separators must be where the specification puts them
+  If (PeekB(*s + 8) & $FF) <> 45
+    ProcedureReturn 0
+  EndIf
+  If (PeekB(*s + 13) & $FF) <> 45
+    ProcedureReturn 0
+  EndIf
+  If (PeekB(*s + 18) & $FF) <> 45
+    ProcedureReturn 0
+  EndIf
+  If (PeekB(*s + 23) & $FF) <> 45
+    ProcedureReturn 0
+  EndIf
+  If (PeekB(*s + 36) & $FF) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  ; field 1: four bytes, little-endian
+  i = 0
+  While i < 4
+    v = HexPair(*s, 6 - i * 2)
+    If v < 0
+      ProcedureReturn 0
+    EndIf
+    PokeB(dst + i, v)
+    i = i + 1
+  Wend
+  ; field 2: two bytes, little-endian, text at 9..12
+  v = HexPair(*s, 11)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 4, v)
+  v = HexPair(*s, 9)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 5, v)
+  ; field 3: two bytes, little-endian, text at 14..17
+  v = HexPair(*s, 16)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 6, v)
+  v = HexPair(*s, 14)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 7, v)
+  ; field 4: two bytes, BIG-endian, text at 19..22
+  v = HexPair(*s, 19)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 8, v)
+  v = HexPair(*s, 21)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  PokeB(dst + 9, v)
+  ; field 5: six bytes, BIG-endian, text at 24..35
+  i = 0
+  While i < 6
+    v = HexPair(*s, 24 + i * 2)
+    If v < 0
+      ProcedureReturn 0
+    EndIf
+    PokeB(dst + 10 + i, v)
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; The canonical text of a GUID sitting in memory, printed back out. The
+; same asymmetry, read the other way.
+Procedure PutGuidText(b.i)
+  Define i.i
+  PutHexLower2(PeekA(b + 3))
+  PutHexLower2(PeekA(b + 2))
+  PutHexLower2(PeekA(b + 1))
+  PutHexLower2(PeekA(b + 0))
+  UartWrite(45)
+  PutHexLower2(PeekA(b + 5))
+  PutHexLower2(PeekA(b + 4))
+  UartWrite(45)
+  PutHexLower2(PeekA(b + 7))
+  PutHexLower2(PeekA(b + 6))
+  UartWrite(45)
+  PutHexLower2(PeekA(b + 8))
+  PutHexLower2(PeekA(b + 9))
+  UartWrite(45)
+  i = 10
+  While i < 16
+    PutHexLower2(PeekA(b + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i GuidEq(a.i, b.i)
+  Define i.i
+  i = 0
+  While i < 16
+    If PeekA(a + i) <> PeekA(b + i)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  The table itself. Every GUID below is written in the canonical form
+;  the UEFI specification (or, where noted, the EDK2 header that defines
+;  it) prints, so each line can be checked against the document without
+;  decoding anything.
+; ======================================================================
+Global gKBadEntries.i
+
+Procedure AddGuid(*text, id.i)
+  If gKN >= #KNOWN_MAX
+    gKBadEntries = gKBadEntries + 1
+    ProcedureReturn
+  EndIf
+  If GuidFromText(*text, @gKGuid[gKN * 16]) = 0
+    gKBadEntries = gKBadEntries + 1
+    ProcedureReturn
+  EndIf
+  gKId[gKN] = id
+  gKN = gKN + 1
+EndProcedure
+
+Procedure BuildKnownGuids()
+  gKN = 0
+  gKBadEntries = 0
+
+  ; ---- the images, the paths and the console (UEFI 2.10 s9, s10, s12) --
+  AddGuid("5b1b31a1-9562-11d2-8e3f-00a0c969723b", #GN_LOADED_IMAGE)
+  AddGuid("bc62157e-3e33-4fec-9920-2d3b36d750df", #GN_LI_DEVPATH)
+  AddGuid("09576e91-6d3f-11d2-8e39-00a0c969723b", #GN_DEVPATH)
+  AddGuid("387477c1-69c7-11d2-8e39-00a0c969723b", #GN_TXT_IN)
+  AddGuid("dd9e7534-7762-4698-8c14-f58517a625aa", #GN_TXT_IN_EX)
+  AddGuid("387477c2-69c7-11d2-8e39-00a0c969723b", #GN_TXT_OUT)
+  AddGuid("31878c87-0b75-11d5-9a4f-0090273fc14d", #GN_SIMPLE_PTR)
+  AddGuid("bb25cf6f-f1d4-11d2-9a0c-0090273fc1fd", #GN_SERIAL_IO)
+  AddGuid("9042a9de-23dc-4a38-96fb-7aded080516a", #GN_GOP)
+
+  ; ---- media access (s13) ---------------------------------------------
+  AddGuid("56ec3091-954c-11d2-8e3f-00a0c969723b", #GN_LOAD_FILE)
+  AddGuid("4006c0c1-fcb3-403e-996d-4a6c8724e06d", #GN_LOAD_FILE2)
+  AddGuid("964e5b22-6459-11d2-8e39-00a0c969723b", #GN_SIMPLE_FS)
+  AddGuid("ce345171-ba0b-11d2-8e4f-00a0c969723b", #GN_DISK_IO)
+  AddGuid("151c8eae-7f2c-472c-9e54-9828194f6a88", #GN_DISK_IO2)
+  AddGuid("964e5b21-6459-11d2-8e39-00a0c969723b", #GN_BLOCK_IO)
+  AddGuid("a77b2472-e282-4e9f-a245-c2c0e27bbcc1", #GN_BLOCK_IO2)
+  AddGuid("8cf2f62c-bc9b-4821-808d-ec9ec421a1a0", #GN_PARTITION_INFO)
+  AddGuid("a00490ba-3f1a-4b4c-ab90-4fa99726a1e8", #GN_BLOCK_IO_CRYPT)
+
+  ; ---- the driver model and its naming (s11) --------------------------
+  AddGuid("18a031ab-b443-4d1a-a5c0-0c09261e9f71", #GN_DRIVER_BINDING)
+  AddGuid("107a772c-d5e1-11d4-9a46-0090273fc14d", #GN_COMPONENT_NAME)
+  AddGuid("6a7a5cff-e8d9-4f70-bada-75ab3025ce14", #GN_COMPONENT_NAME2)
+  AddGuid("8b843e20-8132-4852-90cc-551a4e4a7f1c", #GN_DP_TO_TEXT)
+  AddGuid("05c99a21-c70f-4ad2-8a5f-35df3343f51e", #GN_DP_FROM_TEXT)
+  AddGuid("0379be4e-d706-437d-b037-edb82fb772a4", #GN_DP_UTIL)
+  AddGuid("1d85cd7f-f43d-11d2-9a0c-0090273fc14d", #GN_UNICODE_COLL)
+  AddGuid("a4c751fc-23ae-4c3e-92e9-4964cf63f349", #GN_UNICODE_COLL2)
+  AddGuid("9da34ae0-eaf9-4bbf-8ec3-fd60226c44be", #GN_RESET_NOTIFY)
+
+  ; ---- HII (s33-s35) ---------------------------------------------------
+  AddGuid("ef9fc172-a1b2-4693-b327-6d32fc416042", #GN_HII_DATABASE)
+  AddGuid("0fd96974-23aa-4cdc-b9cb-98d17750322a", #GN_HII_STRING)
+  AddGuid("587e72d7-cc50-4f79-8209-ca291fc1a10f", #GN_HII_CONFIG_RT)
+  AddGuid("330d4706-f2a0-4e4f-a369-b66fa8d54385", #GN_HII_CONFIG_ACC)
+
+  ; ---- measured boot, device tree fixup, hashing, ENTROPY -------------
+  AddGuid("607f766c-7455-42be-930b-e4d76db2720f", #GN_TCG2)
+  AddGuid("e617d64c-fe08-46da-f4dc-bbd5870c7300", #GN_DT_FIXUP)
+  AddGuid("55b1d734-c5e1-49db-9647-b16afb0e305b", #GN_HASH2)
+  AddGuid("3152bca5-eade-433d-862e-c01cdc291f44", #GN_RNG)
+
+  ; ---- THE NETWORK STACK - the reason this probe exists ----------------
+  AddGuid("a19832b9-ac25-11d3-9a2d-0090273fc14d", #GN_SNP)
+  AddGuid("e18541cd-f755-4f73-928d-643c8a79b229", #GN_NII)
+  AddGuid("1aced566-76ed-4218-bc81-767f1f977a89", #GN_NII31)
+  AddGuid("7ab33a91-ace5-4326-b572-e7ee33d39f16", #GN_MNP)
+  AddGuid("f36ff770-a7e1-42cf-9ed2-56f0f271f44c", #GN_MNP_SB)
+  AddGuid("03c4e603-ac28-11d3-9a2d-0090273fc14d", #GN_PXE_BC)
+  AddGuid("245dca21-fb7b-11d3-8f01-00a0c969723b", #GN_PXE_BC_CB)
+  AddGuid("f4b427bb-ba21-4f16-bc4e-43e416ab619c", #GN_ARP)
+  AddGuid("f44c00ee-1f2c-4a00-aa09-1c9f3e0800a3", #GN_ARP_SB)
+  AddGuid("41d94cd2-35b6-455a-8258-d4e51334aadd", #GN_IP4)
+  AddGuid("c51711e7-b4bf-404a-bfb8-0a048ef1ffe4", #GN_IP4_SB)
+  AddGuid("5b446ed1-e30b-4faa-871a-3654eca36080", #GN_IP4_CONFIG2)
+  AddGuid("2c8759d5-5c2d-66ef-925f-b66c101957e2", #GN_IP6)
+  AddGuid("ec835dd3-fe0f-617b-a621-b350c3e13388", #GN_IP6_SB)
+  AddGuid("3ad9df29-4501-478d-b1f8-7f7fe70e50f3", #GN_UDP4)
+  AddGuid("83f01464-99bd-45e5-b383-af6305d8e9e6", #GN_UDP4_SB)
+  AddGuid("65530bc7-a359-410f-b010-5aadc7ec2b62", #GN_TCP4)
+  AddGuid("00720665-67eb-4a99-baf7-d3c33a1c7cc9", #GN_TCP4_SB)
+  AddGuid("8a219718-4ef5-4761-91c8-c0f04bda9e56", #GN_DHCP4)
+  AddGuid("9d9a39d8-bd42-4a73-a4d5-8ee94be11380", #GN_DHCP4_SB)
+  AddGuid("78247c57-63db-4708-99c2-a8b4a9a61f6b", #GN_MTFTP4)
+  AddGuid("9e23d768-d2f3-4366-9fc3-3a7aba864374", #GN_VLAN_CONFIG)
+  AddGuid("7a59b29b-910b-4171-8242-a85a0df25b5b", #GN_HTTP)
+  AddGuid("bdc8e6af-d9bc-4379-a72a-e0c4e75dae1c", #GN_HTTP_SB)
+  AddGuid("e5dd1403-d622-c24e-8488-c71b17f5e802", #GN_ADAPTER_INFO)
+
+  ; ---- USB (s17) -------------------------------------------------------
+  AddGuid("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc", #GN_USB2_HC)
+  AddGuid("f5089266-1aa0-4953-97d8-562f0a10b4e6", #GN_USB_HC)
+  AddGuid("2b2f68d6-0cd2-44cf-8e8b-bba20b1b5b75", #GN_USB_IO)
+  AddGuid("32d2963a-fe5d-4f30-b633-6e5dc55803cc", #GN_USBFN_IO)
+
+  ; ---- pass-through controllers ---------------------------------------
+  AddGuid("143b7632-b81b-4cb7-abd3-b625a5b9bffe", #GN_SCSI_PASSTHRU)
+  AddGuid("52c78312-8edc-4233-98f2-1a1aa5e388a5", #GN_NVME_PASSTHRU)
+EndProcedure
+
+Procedure PutGuidName(id.i)
+  Select id
+    Case #GN_LOADED_IMAGE    : Print("EFI_LOADED_IMAGE_PROTOCOL")
+    Case #GN_LI_DEVPATH      : Print("EFI_LOADED_IMAGE_DEVICE_PATH_PROTOCOL")
+    Case #GN_DEVPATH         : Print("EFI_DEVICE_PATH_PROTOCOL")
+    Case #GN_TXT_IN          : Print("EFI_SIMPLE_TEXT_INPUT_PROTOCOL")
+    Case #GN_TXT_IN_EX       : Print("EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL")
+    Case #GN_TXT_OUT         : Print("EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL")
+    Case #GN_SIMPLE_PTR      : Print("EFI_SIMPLE_POINTER_PROTOCOL")
+    Case #GN_SERIAL_IO       : Print("EFI_SERIAL_IO_PROTOCOL")
+    Case #GN_GOP             : Print("EFI_GRAPHICS_OUTPUT_PROTOCOL")
+    Case #GN_LOAD_FILE       : Print("EFI_LOAD_FILE_PROTOCOL")
+    Case #GN_LOAD_FILE2      : Print("EFI_LOAD_FILE2_PROTOCOL")
+    Case #GN_SIMPLE_FS       : Print("EFI_SIMPLE_FILE_SYSTEM_PROTOCOL")
+    Case #GN_DISK_IO         : Print("EFI_DISK_IO_PROTOCOL")
+    Case #GN_DISK_IO2        : Print("EFI_DISK_IO2_PROTOCOL")
+    Case #GN_BLOCK_IO        : Print("EFI_BLOCK_IO_PROTOCOL")
+    Case #GN_BLOCK_IO2       : Print("EFI_BLOCK_IO2_PROTOCOL")
+    Case #GN_PARTITION_INFO  : Print("EFI_PARTITION_INFO_PROTOCOL")
+    Case #GN_BLOCK_IO_CRYPT  : Print("EFI_BLOCK_IO_CRYPTO_PROTOCOL")
+    Case #GN_DRIVER_BINDING  : Print("EFI_DRIVER_BINDING_PROTOCOL")
+    Case #GN_COMPONENT_NAME  : Print("EFI_COMPONENT_NAME_PROTOCOL")
+    Case #GN_COMPONENT_NAME2 : Print("EFI_COMPONENT_NAME2_PROTOCOL")
+    Case #GN_DP_TO_TEXT      : Print("EFI_DEVICE_PATH_TO_TEXT_PROTOCOL")
+    Case #GN_DP_FROM_TEXT    : Print("EFI_DEVICE_PATH_FROM_TEXT_PROTOCOL")
+    Case #GN_DP_UTIL         : Print("EFI_DEVICE_PATH_UTILITIES_PROTOCOL")
+    Case #GN_UNICODE_COLL    : Print("EFI_UNICODE_COLLATION_PROTOCOL")
+    Case #GN_UNICODE_COLL2   : Print("EFI_UNICODE_COLLATION_PROTOCOL2")
+    Case #GN_RESET_NOTIFY    : Print("EFI_RESET_NOTIFICATION_PROTOCOL")
+    Case #GN_HII_DATABASE    : Print("EFI_HII_DATABASE_PROTOCOL")
+    Case #GN_HII_STRING      : Print("EFI_HII_STRING_PROTOCOL")
+    Case #GN_HII_CONFIG_RT   : Print("EFI_HII_CONFIG_ROUTING_PROTOCOL")
+    Case #GN_HII_CONFIG_ACC  : Print("EFI_HII_CONFIG_ACCESS_PROTOCOL")
+    Case #GN_TCG2            : Print("EFI_TCG2_PROTOCOL")
+    Case #GN_DT_FIXUP        : Print("EFI_DT_FIXUP_PROTOCOL (U-Boot)")
+    Case #GN_HASH2           : Print("EFI_HASH2_PROTOCOL")
+    Case #GN_RNG             : Print("EFI_RNG_PROTOCOL")
+    Case #GN_SNP             : Print("EFI_SIMPLE_NETWORK_PROTOCOL")
+    Case #GN_NII             : Print("EFI_NETWORK_INTERFACE_IDENTIFIER_PROTOCOL")
+    Case #GN_NII31           : Print("EFI_NETWORK_INTERFACE_IDENTIFIER_PROTOCOL_31")
+    Case #GN_MNP             : Print("EFI_MANAGED_NETWORK_PROTOCOL")
+    Case #GN_MNP_SB          : Print("EFI_MANAGED_NETWORK_SERVICE_BINDING_PROTOCOL")
+    Case #GN_PXE_BC          : Print("EFI_PXE_BASE_CODE_PROTOCOL")
+    Case #GN_PXE_BC_CB       : Print("EFI_PXE_BASE_CODE_CALLBACK_PROTOCOL")
+    Case #GN_ARP             : Print("EFI_ARP_PROTOCOL")
+    Case #GN_ARP_SB          : Print("EFI_ARP_SERVICE_BINDING_PROTOCOL")
+    Case #GN_IP4             : Print("EFI_IP4_PROTOCOL")
+    Case #GN_IP4_SB          : Print("EFI_IP4_SERVICE_BINDING_PROTOCOL")
+    Case #GN_IP4_CONFIG2     : Print("EFI_IP4_CONFIG2_PROTOCOL")
+    Case #GN_IP6             : Print("EFI_IP6_PROTOCOL")
+    Case #GN_IP6_SB          : Print("EFI_IP6_SERVICE_BINDING_PROTOCOL")
+    Case #GN_UDP4            : Print("EFI_UDP4_PROTOCOL")
+    Case #GN_UDP4_SB         : Print("EFI_UDP4_SERVICE_BINDING_PROTOCOL")
+    Case #GN_TCP4            : Print("EFI_TCP4_PROTOCOL")
+    Case #GN_TCP4_SB         : Print("EFI_TCP4_SERVICE_BINDING_PROTOCOL")
+    Case #GN_DHCP4           : Print("EFI_DHCP4_PROTOCOL")
+    Case #GN_DHCP4_SB        : Print("EFI_DHCP4_SERVICE_BINDING_PROTOCOL")
+    Case #GN_MTFTP4          : Print("EFI_MTFTP4_PROTOCOL")
+    Case #GN_VLAN_CONFIG     : Print("EFI_VLAN_CONFIG_PROTOCOL")
+    Case #GN_HTTP            : Print("EFI_HTTP_PROTOCOL")
+    Case #GN_HTTP_SB         : Print("EFI_HTTP_SERVICE_BINDING_PROTOCOL")
+    Case #GN_ADAPTER_INFO    : Print("EFI_ADAPTER_INFORMATION_PROTOCOL")
+    Case #GN_USB2_HC         : Print("EFI_USB2_HC_PROTOCOL")
+    Case #GN_USB_HC          : Print("EFI_USB_HC_PROTOCOL")
+    Case #GN_USB_IO          : Print("EFI_USB_IO_PROTOCOL")
+    Case #GN_USBFN_IO        : Print("EFI_USBFN_IO_PROTOCOL")
+    Case #GN_SCSI_PASSTHRU   : Print("EFI_EXT_SCSI_PASS_THRU_PROTOCOL")
+    Case #GN_NVME_PASSTHRU   : Print("EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL")
+    Default                  : Print("-- NOT IN THIS PROBE'S TABLE --")
+  EndSelect
+EndProcedure
+
+; The name id for a GUID sitting at b, or #GN_UNKNOWN.
+Procedure.i GuidNameId(b.i)
+  Define i.i
+  i = 0
+  While i < gKN
+    If GuidEq(b, @gKGuid[i * 16]) <> 0
+      ProcedureReturn gKId[i]
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn #GN_UNKNOWN
+EndProcedure
+
+; ======================================================================
+;  THE PARSER HAS AN ORACLE ON THIS BOARD, AND IT IS USED.
+;
+;  Everything this probe concludes rests on GuidFromText producing the
+;  same sixteen bytes the firmware compares against. A parser that got
+;  the little-endian/big-endian split backwards would not crash and would
+;  not print anything odd - it would simply report that this firmware
+;  publishes nothing, which is the answer half the vault already expects,
+;  and it would be believed.
+;
+;  qefi_q.unoq builds two GUIDs the OLD way, sixteen PokeB calls each, and
+;  both are PROVEN on this silicon: the ESP write path went through
+;  EFI_LOADED_IMAGE_PROTOCOL and EFI_SIMPLE_FILE_SYSTEM_PROTOCOL on
+;  2026-09-02 and returned EFI_SUCCESS at every step. So there are two
+;  independently-derived byte patterns sitting in memory to check the new
+;  parser against, and the check costs nothing.
+; ======================================================================
+Global gParseCheckLi.i
+Global gParseCheckSfs.i
+
+Procedure SelfCheckParser()
+  gParseCheckLi = 0
+  gParseCheckSfs = 0
+  If GuidFromText("5b1b31a1-9562-11d2-8e3f-00a0c969723b", @gTmpGuid[0]) <> 0
+    gParseCheckLi = GuidEq(@gTmpGuid[0], @gQLiGuid[0])
+  EndIf
+  If GuidFromText("964e5b22-6459-11d2-8e39-00a0c969723b", @gTmpGuid[0]) <> 0
+    gParseCheckSfs = GuidEq(@gTmpGuid[0], @gQSfsGuid[0])
+  EndIf
+EndProcedure
+
+Procedure PutParserVerdict()
+  Print("GUID parser vs the two hand-built GUIDs proven on this board: LOADED_IMAGE ")
+  If gParseCheckLi <> 0
+    Print("MATCHES")
+  Else
+    Print("DOES NOT MATCH")
+  EndIf
+  Print(", SIMPLE_FILE_SYSTEM ")
+  If gParseCheckSfs <> 0
+    Print("MATCHES")
+  Else
+    Print("DOES NOT MATCH")
+  EndIf
+  PrintNl()
+  If gParseCheckLi = 0 Or gParseCheckSfs = 0
+    PrintN("!! THE GUID PARSER IN THIS PROBE IS WRONG, so every ABSENT below is meaningless - a GUID that does not match cannot be found. Do not record any conclusion from this run; fix GuidFromText and run it again.")
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  EFI_STATUS in words. Rule: an error is a full sentence carrying its
+;  code, never a bare number. An EFI error has bit 63 set, which as a
+;  signed .i is simply "negative", so the top-bit literal this tree
+;  avoids is never needed.
+; ======================================================================
+Procedure PutEfiStatus(st.i)
+  Define code.i
+  PutHex16(st)
+  Print(" ")
+  If st = 0
+    Print("EFI_SUCCESS")
+    ProcedureReturn
+  EndIf
+  If st > 0
+    Print("an EFI WARNING code this probe does not name")
+    ProcedureReturn
+  EndIf
+  code = st & $7FFFFFFFFFFFFFFF
+  Select code
+    Case 1  : Print("EFI_LOAD_ERROR")
+    Case 2  : Print("EFI_INVALID_PARAMETER")
+    Case 3  : Print("EFI_UNSUPPORTED")
+    Case 4  : Print("EFI_BAD_BUFFER_SIZE")
+    Case 5  : Print("EFI_BUFFER_TOO_SMALL")
+    Case 6  : Print("EFI_NOT_READY")
+    Case 7  : Print("EFI_DEVICE_ERROR")
+    Case 8  : Print("EFI_WRITE_PROTECTED")
+    Case 9  : Print("EFI_OUT_OF_RESOURCES")
+    Case 12 : Print("EFI_NO_MEDIA")
+    Case 14 : Print("EFI_NOT_FOUND")
+    Case 15 : Print("EFI_ACCESS_DENIED")
+    Case 18 : Print("EFI_TIMEOUT")
+    Case 19 : Print("EFI_NOT_STARTED")
+    Case 20 : Print("EFI_ALREADY_STARTED")
+    Case 21 : Print("EFI_ABORTED")
+    Default : Print("an EFI error code this probe does not name")
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  The tally - every DISTINCT GUID in the database and how many handles
+;  carry it. Printed after the per-handle listing because that is the
+;  shape somebody reads first: the question "does this firmware have SNP
+;  anywhere at all" should not require reading forty handles.
+; ======================================================================
+Procedure NoteSeen(b.i)
+  Define i.i
+  i = 0
+  While i < gSeenN
+    If GuidEq(b, @gSeenGuid[i * 16]) <> 0
+      gSeenCount[i] = gSeenCount[i] + 1
+      ProcedureReturn
+    EndIf
+    i = i + 1
+  Wend
+  If gSeenN >= #SEEN_MAX
+    gSeenOverflow = gSeenOverflow + 1
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < 16
+    gSeenGuid[gSeenN * 16 + i] = PeekA(b + i)
+    i = i + 1
+  Wend
+  gSeenCount[gSeenN] = 1
+  gSeenN = gSeenN + 1
+EndProcedure
+
+; ======================================================================
+;  THE WALK. LocateHandleBuffer(AllHandles) then ProtocolsPerHandle on
+;  each. Both allocate a pool buffer the caller must release, and both are
+;  released here - a probe that leaks the firmware's pool and then hands
+;  the board back is a probe that changed what it was measuring.
+; ======================================================================
+Procedure WalkHandles()
+  Define i.i
+  Define j.i
+  Define h.i
+  Define st.i
+  Define pcount.i
+  Define pbuf.i
+  Define g.i
+
+  If gQBs = 0
+    ProcedureReturn
+  EndIf
+
+  PokeI(@gCellA[0], 0)
+  PokeI(@gCellB[0], 0)
+  ; LocateHandleBuffer(SearchType, Protocol, SearchKey, *NoHandles, **Buffer)
+  gLhbStatus = QCall(PeekI(gQBs + #BS_LOCATEHANDLEBUFFER), #EFI_ALL_HANDLES, 0, 0, @gCellA[0], @gCellB[0])
+  gHandleCount = PeekI(@gCellA[0])
+  gHandleBuf = PeekI(@gCellB[0])
+
+  Print("LocateHandleBuffer(AllHandles) = ")
+  PutEfiStatus(gLhbStatus)
+  PrintNl()
+  If gLhbStatus <> #QEFI_SUCCESS
+    PrintN("The firmware would not enumerate its handle database, so the per-handle listing below is empty. Check that BootServices is the table this image was handed - it is printed at the top of this report.")
+    ProcedureReturn
+  EndIf
+  Print("handles in the database = ")
+  PrintDec(gHandleCount)
+  Print("   buffer at ")
+  PutHex16(gHandleBuf)
+  PrintNl()
+  PrintNl()
+
+  i = 0
+  While i < gHandleCount
+    h = PeekI(gHandleBuf + i * 8)
+    PokeI(@gCellA[0], 0)
+    PokeI(@gCellB[0], 0)
+    ; ProtocolsPerHandle(Handle, ***ProtocolBuffer, *ProtocolBufferCount)
+    st = QCall(PeekI(gQBs + #BS_PROTOCOLSPERHANDLE), h, @gCellA[0], @gCellB[0], 0, 0)
+    pbuf = PeekI(@gCellA[0])
+    pcount = PeekI(@gCellB[0])
+
+    Print("h[")
+    PrintDec(i)
+    Print("] ")
+    PutHex16(h)
+    If st <> #QEFI_SUCCESS
+      gPphFailures = gPphFailures + 1
+      Print("   ProtocolsPerHandle = ")
+      PutEfiStatus(st)
+      PrintNl()
+      i = i + 1
+      Continue
+    EndIf
+    Print("   ")
+    PrintDec(pcount)
+    Print(" protocol")
+    If pcount <> 1
+      Print("s")
+    EndIf
+    PrintNl()
+
+    j = 0
+    While j < pcount
+      g = PeekI(pbuf + j * 8)
+      If g <> 0
+        gProtoTotal = gProtoTotal + 1
+        NoteSeen(g)
+        Print("      ")
+        PutGuidText(g)
+        Print("  ")
+        PutGuidName(GuidNameId(g))
+        PrintNl()
+      EndIf
+      j = j + 1
+    Wend
+
+    If pbuf <> 0
+      QCall(PeekI(gQBs + #BS_FREEPOOL), pbuf, 0, 0, 0, 0)
+    EndIf
+    i = i + 1
+  Wend
+
+  If gHandleBuf <> 0
+    QCall(PeekI(gQBs + #BS_FREEPOOL), gHandleBuf, 0, 0, 0, 0)
+    gHandleBuf = 0
+  EndIf
+EndProcedure
+
+Procedure PrintTally()
+  Define i.i
+  PrintN("-- every DISTINCT protocol GUID in the database, with how many handles carry it --")
+  i = 0
+  While i < gSeenN
+    Print("   x")
+    PrintDec(gSeenCount[i])
+    Print("  ")
+    PutGuidText(@gSeenGuid[i * 16])
+    Print("  ")
+    PutGuidName(GuidNameId(@gSeenGuid[i * 16]))
+    PrintNl()
+    i = i + 1
+  Wend
+  Print("distinct GUIDs = ")
+  PrintDec(gSeenN)
+  Print("   protocol instances = ")
+  PrintDec(gProtoTotal)
+  PrintNl()
+  If gSeenOverflow > 0
+    Print("!! the distinct-GUID tally filled up and dropped ")
+    PrintDec(gSeenOverflow)
+    PrintN(" further instances, so this list is INCOMPLETE - raise #SEEN_MAX and run it again.")
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  Ask LocateProtocol directly for one GUID, print the verdict on one
+;  line, and hand back the interface pointer (0 when absent).
+; ======================================================================
+Procedure.i AskFor(*text, id.i)
+  Define st.i
+  Define p.i
+  If GuidFromText(*text, @gTmpGuid[0]) = 0
+    PrintN("!! a GUID literal inside this probe is malformed and was not asked for. That is a defect in the probe, not an answer about the board.")
+    ProcedureReturn 0
+  EndIf
+  PokeI(@gCellA[0], 0)
+  st = QCall(PeekI(gQBs + #QBS_LOCATEPROTOCOL), @gTmpGuid[0], 0, @gCellA[0], 0, 0)
+  p = PeekI(@gCellA[0])
+  Print("   ")
+  PutGuidName(id)
+  PrintNl()
+  Print("      ")
+  If st = #QEFI_SUCCESS And p <> 0
+    Print("PRESENT   interface at ")
+    PutHex16(p)
+    Print("   status ")
+    PutEfiStatus(st)
+  Else
+    Print("ABSENT    status ")
+    PutEfiStatus(st)
+  EndIf
+  PrintNl()
+  If st = #QEFI_SUCCESS
+    ProcedureReturn p
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure AskTheQuestions()
+  PrintN("-- the questions this probe exists to answer, asked one at a time --")
+  PrintN("   (LocateProtocol finds the FIRST handle carrying each; absence here is absence everywhere)")
+  gSnp = AskFor("a19832b9-ac25-11d3-9a2d-0090273fc14d", #GN_SNP)
+  AskFor("7ab33a91-ace5-4326-b572-e7ee33d39f16", #GN_MNP)
+  AskFor("f36ff770-a7e1-42cf-9ed2-56f0f271f44c", #GN_MNP_SB)
+  AskFor("03c4e603-ac28-11d3-9a2d-0090273fc14d", #GN_PXE_BC)
+  AskFor("1aced566-76ed-4218-bc81-767f1f977a89", #GN_NII31)
+  AskFor("3e745226-9818-45b6-a2ac-d7cd0e8ba2bc", #GN_USB2_HC)
+  AskFor("2b2f68d6-0cd2-44cf-8e8b-bba20b1b5b75", #GN_USB_IO)
+  AskFor("32d2963a-fe5d-4f30-b633-6e5dc55803cc", #GN_USBFN_IO)
+  gRng = AskFor("3152bca5-eade-433d-862e-c01cdc291f44", #GN_RNG)
+  AskFor("41d94cd2-35b6-455a-8258-d4e51334aadd", #GN_IP4)
+  AskFor("65530bc7-a359-410f-b010-5aadc7ec2b62", #GN_TCP4)
+  AskFor("3ad9df29-4501-478d-b1f8-7f7fe70e50f3", #GN_UDP4)
+  AskFor("8a219718-4ef5-4761-91c8-c0f04bda9e56", #GN_DHCP4)
+  AskFor("7a59b29b-910b-4171-8242-a85a0df25b5b", #GN_HTTP)
+  AskFor("bb25cf6f-f1d4-11d2-9a0c-0090273fc1fd", #GN_SERIAL_IO)
+  AskFor("9042a9de-23dc-4a38-96fb-7aded080516a", #GN_GOP)
+EndProcedure
+
+; ======================================================================
+;  If SNP is there, read its MODE. Nothing is started and nothing is
+;  transmitted: the question at this stage is what the link IS, and a
+;  Start() on a driver nobody has looked at yet is a change to the board's
+;  state made before anybody knew what the board's state was.
+; ======================================================================
+Procedure PutMac(b.i)
+  Define i.i
+  i = 0
+  While i < 6
+    If i > 0
+      UartWrite(58)
+    EndIf
+    PutHexLower2(PeekA(b + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure ReadSnpMode()
+  PrintN("-- EFI_SIMPLE_NETWORK_PROTOCOL detail --")
+  If gSnp = 0
+    PrintN("   There is no EFI_SIMPLE_NETWORK_PROTOCOL on this firmware, so this board gets no link from UEFI and Anvil must carry its own. Nothing was started and nothing was read.")
+    ProcedureReturn
+  EndIf
+  gSnpMode = PeekI(gSnp + #SNP_MODE)
+  Print("   Revision   = ")
+  PutHex16(PeekI(gSnp))
+  PrintNl()
+  Print("   Mode ptr   = ")
+  PutHex16(gSnpMode)
+  PrintNl()
+  If gSnpMode = 0
+    PrintN("   The protocol is published with a NULL Mode pointer, which UEFI 2.10 s24.1 does not allow. Nothing further was read off it.")
+    ProcedureReturn
+  EndIf
+  gSnpState          = PeekL(gSnpMode + #SNM_STATE) & $FFFFFFFF
+  gSnpHwAddrSize     = PeekL(gSnpMode + #SNM_HWADDRSIZE) & $FFFFFFFF
+  gSnpMediaHdr       = PeekL(gSnpMode + #SNM_MEDIAHDRSIZE) & $FFFFFFFF
+  gSnpMaxPacket      = PeekL(gSnpMode + #SNM_MAXPACKETSIZE) & $FFFFFFFF
+  gSnpIfType         = PeekA(gSnpMode + #SNM_IFTYPE)
+  gSnpMediaPresentSup = PeekA(gSnpMode + #SNM_MEDIAPRESENTSUP)
+  gSnpMediaPresent   = PeekA(gSnpMode + #SNM_MEDIAPRESENT)
+
+  Print("   State      = ")
+  PrintDec(gSnpState)
+  Select gSnpState
+    Case 0 : Print("  (EfiSimpleNetworkStopped)")
+    Case 1 : Print("  (EfiSimpleNetworkStarted)")
+    Case 2 : Print("  (EfiSimpleNetworkInitialized)")
+    Default : Print("  (not a state UEFI 2.10 s24.1 defines)")
+  EndSelect
+  PrintNl()
+  Print("   HwAddrSize = ")
+  PrintDec(gSnpHwAddrSize)
+  Print("   MediaHeader= ")
+  PrintDec(gSnpMediaHdr)
+  Print("   MaxPacket  = ")
+  PrintDec(gSnpMaxPacket)
+  PrintNl()
+  Print("   IfType     = ")
+  PrintDec(gSnpIfType)
+  Print("   (1 = Ethernet, RFC 1700)   MediaPresentSupported=")
+  PrintDec(gSnpMediaPresentSup)
+  Print("   MediaPresent=")
+  PrintDec(gSnpMediaPresent)
+  PrintNl()
+  Print("   Current MAC   = ")
+  PutMac(gSnpMode + #SNM_CURRENTADDRESS)
+  PrintNl()
+  Print("   Permanent MAC = ")
+  PutMac(gSnpMode + #SNM_PERMANENTADDRESS)
+  PrintNl()
+  Print("   Broadcast MAC = ")
+  PutMac(gSnpMode + #SNM_BROADCASTADDRESS)
+  PrintNl()
+  Print("   RxFilterMask = ")
+  PutHex8(PeekL(gSnpMode + #SNM_RXFILTERMASK) & $FFFFFFFF)
+  Print("   RxFilterSetting = ")
+  PutHex8(PeekL(gSnpMode + #SNM_RXFILTERSETTING) & $FFFFFFFF)
+  PrintNl()
+EndProcedure
+
+; ======================================================================
+;  If RNG is there, take 32 bytes. This is the entropy question, settled.
+; ======================================================================
+Procedure ReadRng()
+  Define i.i
+  Define n.i
+  PrintN("-- EFI_RNG_PROTOCOL detail (the entropy question) --")
+  If gRng = 0
+    PrintN("   There is no EFI_RNG_PROTOCOL on this firmware, so the Q still has no measured entropy source and drbg.pi4 still has nothing to seed from. The SoC does carry a hardware PRNG at 0x04453000 (qcom,prng-ee) which needs GCC_PRNG_AHB_CLK, and that is a register-touching driver, which this probe deliberately is not.")
+    ProcedureReturn
+  EndIf
+  ; GetInfo(This, *RNGAlgorithmListSize, *RNGAlgorithmList) - asked with a
+  ; zero size first, which is the spec's way of being told how big the
+  ; list is (it answers EFI_BUFFER_TOO_SMALL and fills in the size).
+  PokeI(@gCellA[0], 0)
+  gRngInfoStatus = QCall(PeekI(gRng + #RNG_GETINFO), gRng, @gCellA[0], 0, 0, 0)
+  gRngInfoSize = PeekI(@gCellA[0])
+  Print("   GetInfo(size=0) = ")
+  PutEfiStatus(gRngInfoStatus)
+  Print("   algorithm list needs ")
+  PrintDec(gRngInfoSize)
+  PrintN(" bytes (16 per algorithm)")
+
+  ; GetRNG(This, *RNGAlgorithm, RNGValueLength, *RNGValue). A NULL
+  ; algorithm means "the default", which every conformant implementation
+  ; must provide.
+  i = 0
+  While i < 32
+    gRngBytes[i] = 0
+    i = i + 1
+  Wend
+  gRngGetStatus = QCall(PeekI(gRng + #RNG_GETRNG), gRng, 0, 32, @gRngBytes[0], 0)
+  Print("   GetRNG(default, 32) = ")
+  PutEfiStatus(gRngGetStatus)
+  PrintNl()
+  If gRngGetStatus <> #QEFI_SUCCESS
+    PrintN("   The protocol is published but would not produce bytes, so it is not an entropy source Anvil can use yet. The status above is the whole of what the firmware said.")
+    ProcedureReturn
+  EndIf
+  n = 0
+  Print("   32 bytes  = ")
+  i = 0
+  While i < 32
+    PutHexLower2(gRngBytes[i] & $FF)
+    If gRngBytes[i] <> 0
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  PrintNl()
+  gRngNonZero = n
+  Print("   non-zero bytes = ")
+  PrintDec(n)
+  PrintN(" of 32   (all-zero would mean the call succeeded and produced nothing, which is a defect worth seeing)")
+EndProcedure
+
+; ======================================================================
+;  The report.
+; ======================================================================
+Procedure EmitReport()
+  QOutReset()
+  PrintN("== Anvil UNO Q  UEFI PROTOCOL DATABASE WALK ==")
+  PrintN("   read-only: no register is written and no peripheral is read anywhere in this program")
+  PrintNl()
+
+  Print("SystemTable = ")
+  PutHex16(gQSt)
+  Print("   BootServices = ")
+  PutHex16(gQBs)
+  PrintNl()
+  Print("RuntimeSvcs = ")
+  PutHex16(gQRt)
+  Print("   ConOut = ")
+  PutHex16(gQConOut)
+  Print("   ConIn = ")
+  PutHex16(gQConIn)
+  PrintNl()
+  Print("CurrentEL   = ")
+  PrintDec((RdCurrentEl() >> 2) & 3)
+  Print("   ImageBase = ")
+  PutHex16(QEfiImageBase())
+  Print("   ImageSize = ")
+  PrintDec(QEfiImageSize())
+  PrintNl()
+  Print("known-GUID table = ")
+  PrintDec(gKN)
+  Print(" entries")
+  If gKBadEntries > 0
+    Print("   !! ")
+    PrintDec(gKBadEntries)
+    Print(" entries in this probe's own table are malformed and were dropped, so some GUIDs below will read as unnamed that should not. That is a defect in the probe.")
+  EndIf
+  PrintNl()
+  PutParserVerdict()
+  PrintNl()
+
+  AskTheQuestions()
+  PrintNl()
+  ReadSnpMode()
+  PrintNl()
+  ReadRng()
+  PrintNl()
+
+  PrintN("-- the whole handle database, handle by handle --")
+  WalkHandles()
+  PrintNl()
+  PrintTally()
+  If gPphFailures > 0
+    Print("handles whose protocol list could not be read = ")
+    PrintDec(gPphFailures)
+    PrintNl()
+  EndIf
+  PrintNl()
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of walk ==")
+EndProcedure
+
+; ======================================================================
+Global Dim gVarName.b[24]      ; UTF-16LE "AnvilQTxt", 0
+Global Dim gVarGuid.b[16]
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  ; the same vendor GUID the core proof and the console probe use
+  GuidFromText("a1b2c3d4-5566-7788-99aa-bbccddeeff00", @gVarGuid[0])
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ; Nothing here is safe to touch, and there is no channel to say so on.
+    ProcedureReturn 0
+  EndIf
+
+  BuildKnownGuids()
+  BuildSinkNames()
+  SelfCheckParser()
+
+  QEfiOutStr("Anvil UNO Q - walking the UEFI protocol database...")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qefiprobe.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("walk complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

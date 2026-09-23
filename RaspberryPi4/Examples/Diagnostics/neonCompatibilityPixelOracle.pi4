@@ -1,0 +1,196 @@
+; neonCompatibilityPixelOracle.pi4 - manifest-bound native oracle
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NCO_MAGIC = $4E434F32
+#NCO_VERSION = 1
+#NCO_SCENES = 15
+#NCO_REPORT_HEADER_WORDS = 16
+#NCO_REPORT_RECORD_WORDS = 32
+#NCO_SCENE_BYTES = 16384
+#NCO_CAPTURE_BYTES = #NCO_SCENES * #NCO_SCENE_BYTES
+#NCO_REPORT_WORDS = #NCO_REPORT_HEADER_WORDS + (#NCO_SCENES * #NCO_REPORT_RECORD_WORDS)
+#NCO_REPORT_BYTES = #NCO_REPORT_WORDS * 4
+#NCO_CAPTURE_ADDR = $07000000
+#NCO_ARENA = $04000000
+#NCO_ARENA_BYTES = $01000000
+#NCO_GUARD_WORDS = 1024
+#NCO_POISON = $A5A5A5A5
+#NCO_FIRST_ERROR = 0
+
+; NCO_SCENE_EMPTY NCO_TOKEN_0x13579BDF
+; NCO_SCENE_BOXES NCO_TOKEN_0x2468ACE1
+; NCO_SCENE_GLYPHS_ALL_FONTS NCO_TOKEN_0x31415927
+; NCO_SCENE_CLIPS NCO_TOKEN_0xC1A0C1A0
+; NCO_SCENE_FANS NCO_TOKEN_0xFA005EED
+; NCO_SCENE_LINES NCO_TOKEN_0x11AE5EED
+; NCO_SCENE_MIXED_ORDER NCO_TOKEN_0xA1ED0007
+; NCO_SCENE_ALPHA_OVERLAP NCO_TOKEN_0xA1FA000F
+; NCO_SCENE_BOUNDARIES NCO_TOKEN_0xB00DAB1E
+; NCO_SCENE_ROTATION_0 NCO_TOKEN_0xA0700000
+; NCO_SCENE_ROTATION_90 NCO_TOKEN_0xA0900000
+; NCO_SCENE_ROTATION_180 NCO_TOKEN_0xA1800000
+; NCO_SCENE_ROTATION_270 NCO_TOKEN_0xA2700000
+; NCO_SCENE_CAPACITY NCO_TOKEN_0xCA0AC17A
+; NCO_SCENE_RECOVERY NCO_TOKEN_0xAEC0AEF0
+; NeonFrameBegin( NeonFrameEnd() NeonFanOutline NeonFanEnd Neon_TextTex NeonRebindSurface
+; glyph rows 32..126, UI/SMALL/MONO/BOLD; present generation follows recovery
+
+Global Dim ncoReport.l[#NCO_REPORT_WORDS]
+Global ncoFirstError.i
+Global Dim ncoFlat0.a[25]
+Global Dim ncoFlat1.a[25]
+Global Dim ncoFlat2.a[24]
+Global Dim ncoFlat3.a[25]
+Global Dim ncoTex0.a[33]
+Global Dim ncoTex1.a[33]
+Global Dim ncoTex2.a[32]
+
+Procedure ncoWord(index.i, value.i)
+  If index >= 0 And index < #NCO_REPORT_WORDS : ncoReport[index] = value & $FFFFFFFF : EndIf
+EndProcedure
+
+; Word 31 is reserved in each fixed-width scene record. Progress belongs
+; there so it cannot overwrite scene 0's token at the record base.
+Procedure ncoProgress(scene.i, value.i)
+  ncoWord(#NCO_REPORT_HEADER_WORDS + (scene * #NCO_REPORT_RECORD_WORDS) + 31, value)
+EndProcedure
+
+Procedure.i ncoCall(value.i)
+  If value <> #NEON_OK And ncoFirstError = #NCO_FIRST_ERROR : ncoFirstError = value : EndIf
+  ProcedureReturn value
+EndProcedure
+
+Procedure ncoBuildAscii()
+  Define i.i
+  For i = 0 To 23 : ncoFlat0[i] = 32 + i : ncoFlat1[i] = 56 + i : ncoFlat3[i] = 103 + i : Next
+  For i = 0 To 22 : ncoFlat2[i] = 80 + i : Next
+  For i = 0 To 31 : ncoTex0[i] = 32 + i : ncoTex1[i] = 64 + i : Next
+  For i = 0 To 30 : ncoTex2[i] = 96 + i : Next
+  ncoFlat0[24] = 0 : ncoFlat1[24] = 0 : ncoFlat2[23] = 0 : ncoFlat3[24] = 0
+  ncoTex0[32] = 0 : ncoTex1[32] = 0 : ncoTex2[31] = 0
+EndProcedure
+
+
+Procedure.i ncoToken(scene.i)
+  Select scene
+    Case 0 : ProcedureReturn $13579BDF
+    Case 1 : ProcedureReturn $2468ACE1
+    Case 2 : ProcedureReturn $31415927
+    Case 3 : ProcedureReturn $C1A0C1A0
+    Case 4 : ProcedureReturn $FA005EED
+    Case 5 : ProcedureReturn $11AE5EED
+    Case 6 : ProcedureReturn $A1ED0007
+    Case 7 : ProcedureReturn $A1FA000F
+    Case 8 : ProcedureReturn $B00DAB1E
+    Case 9 : ProcedureReturn $A0700000
+    Case 10 : ProcedureReturn $A0900000
+    Case 11 : ProcedureReturn $A1800000
+    Case 12 : ProcedureReturn $A2700000
+    Case 13 : ProcedureReturn $CA0AC17A
+    Case 14 : ProcedureReturn $AEC0AEF0
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure ncoRecord(scene.i, status.i, lw.i, lh.i, pw.i, ph.i, pitch.i, off.i, pixelBytes.i, draws.i, boxes.i, glyphs.i, runs.i, verts.i, texDraws.i, texGlyphs.i, texVerts.i, clipped.i, guardBad.i, firstError.i)
+  Define b.i
+  b = #NCO_REPORT_HEADER_WORDS + (scene * #NCO_REPORT_RECORD_WORDS)
+  ncoWord(b + 0, ncoToken(scene)) : ncoWord(b + 1, status)
+  ncoWord(b + 2, lw) : ncoWord(b + 3, lh) : ncoWord(b + 4, pw) : ncoWord(b + 5, ph)
+  ncoWord(b + 6, pitch) : ncoWord(b + 7, off) : ncoWord(b + 8, #NCO_SCENE_BYTES) : ncoWord(b + 9, pixelBytes)
+  ncoWord(b + 10, draws) : ncoWord(b + 11, boxes) : ncoWord(b + 12, glyphs) : ncoWord(b + 13, runs)
+  ncoWord(b + 14, verts) : ncoWord(b + 15, texDraws) : ncoWord(b + 16, texGlyphs) : ncoWord(b + 17, texVerts)
+  ncoWord(b + 18, clipped) : ncoWord(b + 19, guardBad) : ncoWord(b + 20, firstError)
+EndProcedure
+
+Procedure ncoFailureDetail()
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 1, ncoFirstError)
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 2, Neon_Error())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 3, V3dError())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 4, V3dBinBfcBefore())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 5, V3dBinBfcAfter())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 6, V3dBinIntSts())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 7, V3dBinCt0cs())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 8, V3dBinCt0ca())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 9, V3dBinCt0ea())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 10, V3dBinMmuCtl())
+  ncoWord(#NCO_REPORT_HEADER_WORDS + 11, V3dBinVioAddr())
+EndProcedure
+
+Procedure.i Main()
+  Define r.i, scene.i, i.i, off.i, lw.i, lh.i, pw.i, ph.i, pitch.i, rot.i, status.i
+  Define draws.i, boxes.i, glyphs.i, runs.i, verts.i, texDraws.i, texGlyphs.i, texVerts.i, clipped.i, guardBad.i, oldBase.i, oldW.i, oldH.i, oldPitch.i, oldRot.i
+  For i = 0 To #NCO_REPORT_WORDS - 1 : ncoReport[i] = 0 : Next
+  ncoWord(0, #NCO_MAGIC) : ncoWord(1, #NCO_VERSION) : ncoWord(2, #NCO_SCENES) : ncoWord(3, #NCO_REPORT_HEADER_WORDS)
+  ncoWord(4, $6EC8CA64) : ncoWord(5, $D4BAE693) : ncoWord(6, $E89D0014) : ncoWord(7, $E9DC9B28)
+  ncoWord(8, $2402889D) : ncoWord(9, $7581487D) : ncoWord(10, $C41C7CCE) : ncoWord(11, $48658134)
+  ncoWord(12, #NCO_CAPTURE_ADDR) : ncoWord(13, #NCO_CAPTURE_BYTES) : ncoWord(14, #NCO_REPORT_BYTES) : ncoWord(15, #NCO_SCENE_BYTES)
+  ncoProgress(0, $101) : If TimerInit() = 0 : ProcedureReturn 0 : EndIf
+  ncoProgress(0, $102) : If MailboxInit() = 0 : ProcedureReturn 0 : EndIf
+  ; The monitor owns the physical DSI panel.  This oracle renders only into
+  ; its explicit RAM surface, so asking firmware to allocate a display would
+  ; make the GPU proof depend on an unrelated #DSP_ESEND refusal.
+  ncoProgress(0, $103) : If NeonArena(#NCO_ARENA, #NCO_ARENA_BYTES) <> #NEON_OK : ProcedureReturn 0 : EndIf
+  ncoProgress(0, $104) : If NeonSurfaceOriented(#NCO_CAPTURE_ADDR, 256, 64, 1024, 0) <> #NEON_OK : ProcedureReturn 0 : EndIf
+  NeonSurfaceMapSpan(#NCO_CAPTURE_BYTES)
+  ncoProgress(0, $105) : If NeonInit() <> #NEON_OK : ProcedureReturn 0 : EndIf
+  NeonPalette() : ncoProgress(0, $106) : If NeonFontUse(?dsp_font8x16, 8, 16, 32, 126) <> #NEON_OK : ProcedureReturn 0 : EndIf
+  NeonFontSetup(0, 1, 0) : NeonFontSetup(1, 1, 0) : NeonFontSetup(2, 1, 0) : NeonFontSetup(3, 1, 1)
+  ncoBuildAscii()
+  For i = 0 To #NCO_CAPTURE_BYTES - 1 : PokeA(#NCO_CAPTURE_ADDR + i, $A5) : Next
+  For i = 0 To #NCO_GUARD_WORDS - 1 : PokeL(Neon_GuardAddr() + (i * 4), #NCO_POISON) : Next
+  For scene = 0 To #NCO_SCENES - 1
+    ncoProgress(scene, $200 + scene)
+    ncoFirstError = #NCO_FIRST_ERROR : status = #NEON_OK : off = scene * #NCO_SCENE_BYTES
+    lw = 64 : lh = 64 : pw = 64 : ph = 64 : pitch = 256 : rot = 0
+    If scene = 2 : lw = 256 : lh = 16 : pw = 256 : ph = 16 : pitch = 1024 : EndIf
+    If scene >= 9 And scene <= 12 : lw = 63 : lh = 47 : rot = (scene - 9) * 90 : If rot = 90 Or rot = 270 : pw = 47 : ph = 63 : pitch = 188 : Else : pw = 63 : ph = 47 : pitch = 252 : EndIf : EndIf
+    If ncoCall(NeonRebindSurface(#NCO_CAPTURE_ADDR + off, lw, lh, pitch, #NCO_SCENE_BYTES, #V3D_OFMT_RGBA8, rot)) <> #NEON_OK : status = ncoFirstError : EndIf
+    If scene = 14
+      oldBase = Neon_SurfaceBase() : oldW = Neon_SurfaceW() : oldH = Neon_SurfaceH() : oldPitch = Neon_SurfacePitch() : oldRot = Neon_SurfaceRotation()
+      r = NeonRebindSurface(#NCO_CAPTURE_ADDR + off, 0, 0, 0, #NCO_SCENE_BYTES, #V3D_OFMT_RGBA8, 0) : If r <> #NEON_ERR_SURFACE : ProcedureReturn 0 : EndIf : If Neon_SurfaceBase() <> oldBase Or Neon_SurfaceW() <> oldW Or Neon_SurfaceH() <> oldH Or Neon_SurfacePitch() <> oldPitch Or Neon_SurfaceRotation() <> oldRot : ProcedureReturn 0 : EndIf : ncoFirstError = r
+      If ncoCall(NeonRebindSurface(#NCO_CAPTURE_ADDR + off, lw, lh, pitch, #NCO_SCENE_BYTES, #V3D_OFMT_RGBA8, 0)) <> #NEON_OK : status = ncoFirstError : EndIf
+    EndIf
+    If ncoCall(NeonFrameBegin(Neon_RGBA(17, 33, 55, 255))) <> #NEON_OK : status = ncoFirstError : EndIf
+    Select scene
+      Case 0
+      Case 1 : ncoCall(Neon_Box(2,3,18,11,Neon_RGBA(40,70,160,255))) : ncoCall(Neon_Box(8,8,24,14,Neon_RGBA(220,90,30,128))) : ncoCall(Neon_Box(-3,-2,9,7,Neon_RGBA(250,250,20,255)))
+      Case 2 : ncoCall(Neon_Text(#NEON_FONT_UI,0,0,@ncoFlat0[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_Text(#NEON_FONT_SMALL,0,0,@ncoFlat1[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_Text(#NEON_FONT_MONO,0,0,@ncoFlat2[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_Text(#NEON_FONT_BOLD,0,0,@ncoFlat3[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,0,0,@ncoTex0[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,0,0,@ncoTex1[0],Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,0,0,@ncoTex2[0],Neon_RGBA(238,196,122,255)))
+      Case 3 : Neon_ScissorSet(3,3,30,24) : ncoCall(Neon_Box(0,0,50,40,Neon_RGBA(200,40,80,255))) : Neon_ScissorSet(10,10,8,8) : ncoCall(Neon_Box(0,0,40,40,Neon_RGBA(20,220,120,255))) : Neon_ScissorSet(0,0,0,0) : ncoCall(Neon_Box(0,0,64,64,Neon_RGBA(250,250,250,255)))
+      Case 4 : ncoCall(NeonFanBegin()) : NeonFanPoint(8,42) : NeonFanPoint(28,38) : NeonFanPoint(34,56) : NeonFanPoint(14,60) : ncoCall(NeonFanOutline(Neon_RGBA(200,68,34,255))) : ncoCall(NeonFanEnd(Neon_RGBA(32,208,144,180)))
+      Case 5 : ncoCall(NeonLinesBegin()) : NeonLine(2,2,61,61) : NeonLine(2,61,61,2) : NeonLine(32,32,32,32) : ncoCall(NeonLinesEnd(Neon_RGBA(200,68,34,255)))
+      Case 6 : ncoCall(Neon_Box(4,4,40,30,Neon_RGBA(40,70,160,255))) : Neon_ScissorSet(10,10,50,20) : ncoCall(Neon_TextTex(#NEON_FONT_UI,12,12,"ORDER",Neon_RGBA(238,196,122,255))) : Neon_ScissorClear() : ncoCall(NeonLinesBegin()) : NeonLine(0,63,63,0) : ncoCall(NeonLinesEnd(Neon_RGBA(200,68,34,255)))
+      Case 7 : ncoCall(Neon_Box(8,8,34,34,Neon_RGBA(255,0,0,128))) : ncoCall(Neon_Box(24,24,34,34,Neon_RGBA(0,0,255,128)))
+      Case 8 : ncoCall(Neon_Box(0,0,1,1,Neon_RGBA(255,0,0,255))) : ncoCall(Neon_Box(63,63,1,1,Neon_RGBA(0,255,0,255))) : ncoCall(Neon_Box(64,64,4,4,Neon_RGBA(0,0,255,255)))
+      Case 9 : ncoCall(Neon_Box(4,8,11,23,Neon_RGBA(40,70,160,255)))
+      Case 10 : ncoCall(Neon_Box(4,8,11,23,Neon_RGBA(40,70,160,255)))
+      Case 11 : ncoCall(Neon_Box(4,8,11,23,Neon_RGBA(40,70,160,255)))
+      Case 12 : ncoCall(Neon_Box(4,8,11,23,Neon_RGBA(40,70,160,255)))
+      Case 13 : For i = 1 To 3505 : ncoCall(Neon_Box((i - 1) & 63, ((i - 1) >> 6) & 63, 1, 1, Neon_RGBA(40,70,160,255))) : Next : For i = 1 To 252 : ncoCall(Neon_Text(#NEON_FONT_UI,0,0,"|||",Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,0,0,"|||",Neon_RGBA(238,196,122,255))) : Next : For i = 1 To 339 : ncoCall(Neon_Text(#NEON_FONT_UI,0,0,"||",Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,0,0,"||",Neon_RGBA(238,196,122,255))) : Next
+      Case 14 : ncoCall(Neon_Box(5,5,20,20,Neon_RGBA(40,70,160,255))) : ncoCall(Neon_Text(#NEON_FONT_UI,8,8,"GEN2",Neon_RGBA(238,196,122,255))) : ncoCall(Neon_TextTex(#NEON_FONT_UI,8,8,"GEN2",Neon_RGBA(238,196,122,255)))
+    EndSelect
+    If ncoCall(NeonFrameEnd()) <> #NEON_OK : status = ncoFirstError : EndIf
+    If scene <> 14 And ncoFirstError <> #NEON_OK
+      ncoFailureDetail()
+      ProcedureReturn 0
+    EndIf
+    If scene = 14 And ncoFirstError <> #NEON_ERR_SURFACE
+      ncoFailureDetail()
+      ProcedureReturn 0
+    EndIf
+    draws = Neon_Draws() : boxes = Neon_Boxes() : glyphs = Neon_Glyphs() : runs = Neon_Runs() : verts = Neon_Verts() : texDraws = Neon_TexDraws() : texGlyphs = Neon_TexGlyphs() : texVerts = Neon_TexVerts() : clipped = Neon_Clipped()
+    guardBad = 0
+    For i = 0 To #NCO_GUARD_WORDS - 1 : If (PeekL(Neon_GuardAddr() + (i * 4)) & $FFFFFFFF) <> #NCO_POISON : guardBad = guardBad + 1 : EndIf : Next
+    ncoRecord(scene,status,lw,lh,pw,ph,pitch,off,pitch * ph,draws,boxes,glyphs,runs,verts,texDraws,texGlyphs,texVerts,clipped,guardBad,ncoFirstError)
+  Next
+  NeonShutdown()
+  ProcedureReturn @ncoReport[0]
+EndProcedure

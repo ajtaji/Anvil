@@ -1,0 +1,209 @@
+; pi4ClockProbe.pi4 - what speed is this machine ACTUALLY running at?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; pi4MailboxProbe found the ARM clock idling at 600 MHz while the
+; compiler's own F_CPU - taken from Boards/Raspberry_Pi_4.board's
+; ClockSpeed - says 1500000000. Every delay_ms and every baud divisor
+; that trusts F_CPU is therefore wrong by a factor of 2.5 on a board
+; sitting at idle, and nothing anywhere says so.
+;
+; This asks the firmware four questions the board file cannot answer -
+; min, max, configured, measured - then tries to RAISE the clock and
+; measures again. The set call reports the rate the firmware APPLIED,
+; not the one it was asked for, because the firmware CLAMPS silently and
+; reports success: ask for 2.5 GHz on a 1.5 GHz part and you are told
+; SUCCESS and given 1500000000. Only the measured rate settles it.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN.
+; It is sent to a resident Anvil and RETURNS to it, so a wrong
+; answer costs a line of output rather than a power cycle. Before
+; --entry-returns existed, testing a library on the board meant an image
+; that could only spin forever, and every failure was a walk to the
+; plug. Build it exactly like this:
+;
+;   PureMetalForge.exe --compile pi4MailboxProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+;
+; The stack is deliberately NOT the monitor's. --entry-returns saves and
+; restores whatever it was handed, so the payload may own its own stack
+; and still come back.
+;
+; IT PRINTS EVERYTHING ITSELF rather than only returning a value. The
+; resident monitor predates the 64-bit rewrite and prints just the low
+; eight digits of x0, so a single returned number cannot carry this much.
+; The return value is a compact verdict for the monitor's own line; the
+; detail goes over the UART.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. Ruled 2026-08-25: PeekB names the SIGNED .b and
+    ; sign-extends on every backend now, so a byte above 127 would come
+    ; back negative and this loop would never see its terminator the way
+    ; it expects. PeekA is the raw-byte accessor and always was.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; One labelled line: "  name ......... value" plus the raw hex.
+Procedure Row(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" = ")
+  PutDec(v)
+  PutS("   ($")
+  PutHex(v, 8)
+  PutS(")")
+  PutNl()
+EndProcedure
+
+
+Procedure Report(*name, id.i)
+  Define cfg.i
+  Define mn.i
+  Define mx.i
+  Define ms.i
+  cfg = MailboxClockRate(id)
+  mn  = MailboxClockRateMin(id)
+  mx  = MailboxClockRateMax(id)
+  ms  = MailboxClockRateMeasured(id)
+  PutS("  ")
+  PutS(*name)
+  PutS("  configured ")
+  PutDec(cfg)
+  PutS("  min ")
+  PutDec(mn)
+  PutS("  max ")
+  PutDec(mx)
+  PutS("  MEASURED ")
+  PutDec(ms)
+  PutNl()
+  ProcedureReturn mx
+EndProcedure
+
+Procedure Main()
+  Define armMax.i
+  Define applied.i
+  Define before.i
+  Define after.i
+
+  PutNl()
+  PutS("=== Pi 4 clock probe - the board file is not the machine ===")
+  PutNl()
+
+  If MailboxInit() = 0
+    PutS("MailboxInit FAILED, error = ")
+    PutDec(MailboxError())
+    PutNl()
+    ProcedureReturn $BAD1
+  EndIf
+
+  PutS("F_CPU the compiler believes: 1500000000")
+  PutNl()
+  PutS("what the firmware says:")
+  PutNl()
+  armMax = Report("ARM ", #MBX_CLK_ARM)
+  Report("CORE", #MBX_CLK_CORE)
+  Report("EMMC", #MBX_CLK_EMMC)
+  Report("UART", #MBX_CLK_UART)
+
+  before = MailboxClockRateMeasured(#MBX_CLK_ARM)
+  PutNl()
+  PutS("raising ARM to its own reported max (")
+  PutDec(armMax)
+  PutS(") ...")
+  PutNl()
+
+  applied = MailboxArmClockSet(armMax)
+  If applied = 0
+    PutS("  the set call FAILED, MailboxError() = ")
+    PutDec(MailboxError())
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  PutS("  firmware APPLIED ")
+  PutDec(applied)
+  PutNl()
+
+  ; MEASURED, NOT CONFIGURED. The on-demand governor can walk the clock
+  ; straight back down with no notification, so the configured rate is
+  ; an intention and only this is an observation.
+  after = MailboxClockRateMeasured(#MBX_CLK_ARM)
+  PutS("  measured before ")
+  PutDec(before)
+  PutS("   after ")
+  PutDec(after)
+  PutNl()
+
+  If after > before
+    PutS("=== the clock moved ===")
+  ElseIf after = before
+    PutS("=== NO CHANGE - the governor or config.txt is holding it ===")
+  Else
+    PutS("=== it went DOWN, which needs explaining ===")
+  EndIf
+  PutNl()
+
+  ProcedureReturn after / 1000000
+EndProcedure

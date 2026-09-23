@@ -1,0 +1,413 @@
+
+; ======================================================================
+;  hw_addr.pi4 - the Pi 4's answer to "is this address safe to touch".
+;
+;  The core asks HwAddrCheck() before every command that takes an address
+;  from the operator (Anvil/Core/addrsafe.pbi, and the contract in
+;  Anvil/Hal/hal.pbi). ON THIS BOARD EVERY ADDRESS THAT EXISTS ANSWERS
+;  SAFE, and this file exists to say so deliberately rather than by
+;  omission. THE ONE REFUSAL IS FOR ADDRESSES THAT DO NOT EXIST: a Pi 4
+;  is sold with 1, 2, 4 or 8 GB fitted, the monitor is the same image on
+;  all of them, and until 2026-09-17 it had no idea which one it was
+;  running on - so `memory 80000000` on a 1 GB board read an address
+;  with no memory behind it and printed the result as though it were
+;  data. See THE TOP OF MEMORY below.
+;
+; ----------------------------------------------------------------------
+;  WHY SAFE FOR EVERYTHING THAT IS THERE, AND WHAT THAT CLAIM IS AND IS NOT
+; ----------------------------------------------------------------------
+;  The seam exists because on the Arduino UNO Q's QCM2290 an MMIO access
+;  to a clock-gated block STALLS THE INTERCONNECT - the instruction never
+;  retires and the board needs its power removing. THE BCM2711 DOES NOT
+;  BEHAVE THAT WAY, and that is a measured difference and not an
+;  assumption about it:
+;
+;    * Every peripheral in the $FE000000 window is behind clocks the
+;      firmware has already started before Anvil is entered. `memory
+;      FE201000 20` reading the PL011 is how the mini-UART routing bug
+;      was cornered, and that read is in this monitor's own history as a
+;      thing that WORKED - see the note at CmdMem in Anvil/Core/memcmd.pbi.
+;    * The V3D, DMA, mailbox, GENET, PCIe/xHCI, EMMC and SDIO register
+;      blocks are all read by this monitor's own drivers, at this
+;      exception level, with no special preparation beyond what those
+;      drivers do. The register windows answer.
+;    * DRAM answers everywhere it is fitted. `mtest` writes and reads it
+;      back. "Everywhere" used to be written here without the last three
+;      words, and that is the sentence THE TOP OF MEMORY below repairs.
+;    * An address with NOTHING behind it reads as a value and does not
+;      hang. It is a wrong answer rather than a hang, and the monitor has
+;      always said out loud that reading such an address is the
+;      operator's risk to take.
+;
+;  SO THE CLAIM IS NARROW AND IT IS TRUE: no address on this board is
+;  known to stall the bus. It is NOT the claim that every address holds
+;  something useful, and it is NOT the claim that a write anywhere is a
+;  good idea - the monitor's own window refusals (HitsMonitor,
+;  InPayload) are unchanged and still run, because they answer a
+;  completely different question: not "will this access complete" but
+;  "will it destroy the thing that is running".
+;
+; ----------------------------------------------------------------------
+;  WHY THIS IS A FILE AND NOT THREE LINES AT THE FOOT OF THE MEMORY MAP
+; ----------------------------------------------------------------------
+;  Two reasons, and the second is the load-bearing one.
+;
+;  It needs #HW_ADDR_SAFE, which is defined in Anvil/Hal/hal.pbi, and
+;  RaspberryPi4/Board/memmap.pi4 is included BEFORE hal.pi4 by
+;  RaspberryPi4/Examples/Diagnostics/pi4BootContainerSelfTest.pi4. Putting
+;  the answer in the memory map would break that diagnostic's build for
+;  no reason at all.
+;
+;  And a board that answers "everything is fine" should have to write
+;  that down somewhere a reader will find it. An empty implementation is
+;  indistinguishable from a forgotten one, and the next person to bring
+;  up a third target will read this file to find out what the seam is
+;  for. If the Pi 4 ever grows a block that has to be voted for - a
+;  power-domain the firmware leaves collapsed, say - the table goes here
+;  and nothing else in the tree changes.
+;
+; ----------------------------------------------------------------------
+;  THE TOP OF MEMORY - the one thing this board refuses. 2026-09-17.
+; ----------------------------------------------------------------------
+;  The instruction that started this work, 2026-09-17: "I think anvil
+;  should be smart enough to know how much ram its working with." It now
+;  is - RaspberryPi4/Board/hw_mem.pi4 decodes the size out of the
+;  firmware's board revision code - and the first thing worth doing with
+;  the number is refusing to read past it.
+;
+;  WHAT AN ADDRESS ABOVE THE MEMORY ACTUALLY DOES HERE, because the
+;  refusal has to be honest about which kind of refusal it is. It does
+;  NOT stall the bus; nothing on this board does. It reads back whatever
+;  the interconnect leaves on the wire, which is a plausible-looking
+;  word, printed in a plausible-looking dump, under a heading that says
+;  it is the contents of memory. That is the worst failure this monitor
+;  has: not a hang, which announces itself, but a wrong answer that
+;  looks exactly like a right one. So the answer is #HW_ADDR_ABSENT -
+;  the fourth answer, added with this work, which says the board KNOWS
+;  there is nothing here rather than that it is afraid of the address.
+;  It is overridable by `force` like every other refusal, because a
+;  debugger that cannot be pointed at an address its board calls empty
+;  cannot prove the board wrong.
+;
+;  WHERE THE MEMORY IS, and it is not one range. The BCM2711 ARM
+;  Peripherals document, 1.2.3 "ARM physical addresses": "The ARM
+;  section of the RAM starts at 0x0_0000_0000 and extends up to the size
+;  of installed SDRAM." Its Figure 1, the "ARM view of the Address Map
+;  in Low Peripheral mode" - which is the mode this board boots in -
+;  shows that run of SDRAM INTERRUPTED at $FC000000 by the main
+;  peripherals and the ARM-local peripherals, and resuming at
+;  $1_0000_0000. So the memory a 4 GB board has is the whole of
+;  $00000000..$FBFFFFFF plus the 64 MB the peripheral window displaced,
+;  which reappears at $1_0000_0000; an 8 GB board's second run is
+;  correspondingly longer; and a 1 GB or 2 GB board has no second run at
+;  all, because all of its memory fits below the peripherals.
+;
+;  AND THIS MONITOR CANNOT REACH THE SECOND RUN. Found on silicon,
+;  build 183, 2026-09-18, by typing the very address the paragraph above
+;  had just invited an operator to type:
+;
+;      memory 103FFFFC0 40
+;      !! Anvil stopped after a processor exception.
+;         EL=3 slot=4 ESR=$96000005 PC=$00367E94 FAR=$103FFFFC0
+;
+;  ESR $96000005 is a data abort, level-1 translation fault. The memory
+;  is there in the silicon; this monitor's PAGE TABLES do not map it.
+;  RaspberryPi4/Lib/mmu.pi4's MmuBuildTables fills sixty-four 1 GiB
+;  level-1 slots and leaves every slot between the low four gigabytes
+;  and the PCIe outbound window at #MMU_DESC_FAULT - deliberately, and
+;  it always has. So exactly two spans translate on this board:
+;
+;      $0_00000000..$0_FFFFFFFF   slots 0..3: DRAM, then the peripheral
+;                                 and ARM-local apertures
+;      $6_00000000..$7_FFFFFFFF   slots #MMU_PCIE_SLOT_LO.._HI: the
+;                                 PCIe outbound window
+;
+;  and everything else faults. A FAULT IS WORSE THAN A WRONG VALUE:
+;  Anvil prints its fatal report and stops, the console dies with it,
+;  and with no deadman armed the board has to have its power removed by
+;  hand. That is the outcome #HW_ADDR_UNCLOCKED's refusal describes word
+;  for word, so that is the answer this file gives for an unmapped
+;  address - and it is given BEFORE the memory-size rules and without
+;  asking the size at all, because the fault does not care how much
+;  memory is fitted or whether the board could say.
+;
+;  THE ORDER IS THEREFORE: unmapped first, then absent, then safe. The
+;  UNO Q's table next door has carried "dangerous first, then safe" from
+;  the day it was written; this board now has something dangerous too.
+;
+;  THE ARITHMETIC THAT IS LEFT IS ONE EDGE, NOT TWO:
+;
+;    lowTop  = the smaller of the size and $FC000000. Everything from
+;              lowTop up to the peripheral window is memory that is not
+;              there - mapped, so it reads a plausible value, which is
+;              why it is refused as ABSENT and not as a fault.
+;
+;  The second run needs no arithmetic any more: every byte of it is
+;  inside the unmapped span, and it is refused for the stronger and
+;  truer reason before the size is ever consulted.
+;
+;  IT BORROWS #MMU_PERIPH_BASE, #MMU_PCIE_SLOT_LO AND #MMU_PCIE_SLOT_HI
+;  FROM RaspberryPi4/Lib/mmu.pi4 rather than writing the addresses
+;  again. Those are the numbers the page tables are actually built from,
+;  and this file's whole claim is about what those tables map: a second
+;  copy of them is a second thing to keep in step, and the first time it
+;  drifted the monitor would stop on an address it had called safe.
+;
+;  WHEN THE SIZE IS NOT KNOWN, NOTHING IS REFUSED FOR BEING PAST IT.
+;  HwMemoryBytes() answers -1 if the mailbox is down or the revision
+;  code is old-style, and the honest response to "I do not know where
+;  memory ends" is the behaviour this board had yesterday. The unmapped
+;  refusal is unaffected: it never asked.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The edges above that are not in the memory map file.
+;
+;  $1_0000_0000 is where Figure 1 resumes SDRAM above the peripheral
+;  aperture; $4_0000_0000 is where that region ends. They are here and
+;  not in RaspberryPi4/Board/memmap.pi4 for the reason the section above
+;  this one gives about #HW_ADDR_SAFE: that file is included BEFORE
+;  hal.pi4 by a diagnostic, and the whole of this answer - the codes,
+;  the sentences and these two edges - belongs to one question that is
+;  asked in one place.
+; ----------------------------------------------------------------------
+; WHERE THE LOW MAPPED SPAN ENDS AND THE UNMAPPED ONE BEGINS. $1_0000_0000
+; is both the first address above level-1 slot 3 and the address at which
+; Figure 1 resumes SDRAM; the two coincide, and the coincidence is why the
+; memory above four gigabytes is real and unreachable at the same time.
+#PI_DRAM_HIGH_BASE  = $100000000
+
+; THE PCIe OUTBOUND WINDOW, THE ONLY OTHER THING THE TABLES MAP. These are
+; mmu.pi4's #MMU_PCIE_SLOT_LO and #MMU_PCIE_SLOT_HI turned into addresses -
+; slot 24 is $6_0000_0000 and slot 31 ends at $7_FFFFFFFF - written out
+; because a constant initialiser in this compiler takes no arithmetic and
+; `#MMU_PCIE_SLOT_LO << 30` cannot be written here. The gate recomputes both
+; from the slot numbers, so the two cannot drift apart in silence.
+#PI_PCIE_WINDOW_LO  = $600000000
+#PI_PCIE_WINDOW_HI  = $7FFFFFFFF
+
+; THE TOP OF WHAT THE TRANSLATION REGIME COVERS AT ALL. mmu.pi4 builds 64
+; level-1 slots of a gigabyte each, so the tables span 64 GiB and an address
+; above this one is outside translation entirely rather than merely landing
+; on a faulting descriptor. Both stop the processor; only the sentence would
+; differ, so one span covers to here and the last arm catches the rest.
+#PI_VA_TOP          = $FFFFFFFFF
+
+; The block the last check matched, and the sentence naming it. Valid
+; only immediately after a HwAddrCheck() that did not answer SAFE - the
+; same rule, and the same reason, as memrange.pi4's gMonHitLo/gMonHitHi.
+; They were three procedures returning 0 until 2026-09-17, when this
+; board acquired something to refuse.
+Global gPiAddrLo.i
+Global gPiAddrHi.i
+Global *gPiAddrWhy
+
+Procedure.i HwAddrReason()
+  ProcedureReturn *gPiAddrWhy
+EndProcedure
+
+Procedure.i HwAddrBlockLo()
+  ProcedureReturn gPiAddrLo
+EndProcedure
+
+Procedure.i HwAddrBlockHi()
+  ProcedureReturn gPiAddrHi
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PiAddrHit - does lo..hi touch blo..bhi AT ALL, and record it if so.
+;
+;  ANY OVERLAP COUNTS. A dump that starts four bytes below the top of
+;  memory still reads past it, and the bytes that are not there are the
+;  ones inside. ArduinoQ/Board/hw_addr_q.unoq's QAddrHit is the same
+;  shape for the same reason, and so is the monitor-overlap check next
+;  door in memrange.pi4.
+; ----------------------------------------------------------------------
+Procedure.i PiAddrHit(lo.i, hi.i, blo.i, bhi.i)
+  If hi >= blo And lo <= bhi
+    gPiAddrLo = blo
+    gPiAddrHi = bhi
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PiMemTooHighWhy(bytes) - the refusal's sentence, naming the size.
+;
+;  It reads after "is " in Anvil/Core/addrsafe.pbi's #HW_ADDR_ABSENT
+;  refusal: "is above the 4 GB of RAM this board has".
+;
+;  ONE WHOLE SENTENCE PER SIZE, and not a number assembled at the point
+;  of printing, because HwAddrReason() returns the ADDRESS of a fragment
+;  - that is the seam's shape on both boards - and a fragment built into
+;  a buffer would need somebody to own the buffer. Six sizes is the
+;  whole of what the MEMSIZE field means today, and the last arm catches
+;  the board that ships a seventh: it still refuses, and it still says
+;  why, without naming a size this monitor would be inventing.
+; ----------------------------------------------------------------------
+Procedure.i PiMemTooHighWhy(bytes.i)
+  If bytes = $10000000
+    ProcedureReturn "above the 256 MB of RAM this board has"
+  ElseIf bytes = $20000000
+    ProcedureReturn "above the 512 MB of RAM this board has"
+  ElseIf bytes = $40000000
+    ProcedureReturn "above the 1 GB of RAM this board has"
+  ElseIf bytes = $80000000
+    ProcedureReturn "above the 2 GB of RAM this board has"
+  ElseIf bytes = $100000000
+    ProcedureReturn "above the 4 GB of RAM this board has"
+  ElseIf bytes = $200000000
+    ProcedureReturn "above the 8 GB of RAM this board has"
+  EndIf
+  ProcedureReturn "above the RAM this board has, which is a size this monitor has no words for - type info for the byte count"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrCheck(lo, hi, forWrite) - the Pi 4's answer.
+;
+;  forWrite IS ACCEPTED AND NOT USED, and that is honest rather than
+;  lazy: an address above the memory this board has is no more readable
+;  than it is writable, and there is no block on this board that may be
+;  read but not written. It stays in the signature because the seam is
+;  shared and a board that DOES have such a block needs somewhere to say
+;  so. Naming it also keeps the signature identical across boards, which
+;  is what makes a backend a swap rather than a rewrite.
+; ----------------------------------------------------------------------
+Procedure.i HwAddrCheck(lo.i, hi.i, forWrite.i)
+  Define bytes.i
+  Define lowTop.i
+
+  *gPiAddrWhy = 0
+  gPiAddrLo = 0
+  gPiAddrHi = 0
+
+  ; ==================================================================
+  ;  1. NOT MAPPED BY THIS MONITOR. Any overlap refuses the whole range,
+  ;     and the size is not consulted: a translation fault stops the
+  ;     board whatever is or is not fitted. See AND THIS MONITOR CANNOT
+  ;     REACH THE SECOND RUN in the header - this arm exists because an
+  ;     operator typed one of these addresses on build 183 and the
+  ;     monitor stopped on it.
+  ; ==================================================================
+  If lo < 0 Or hi < 0
+    *gPiAddrWhy = "past the top of the address space this monitor translates at all: an access there is a fault and Anvil stops on it"
+    gPiAddrLo = 0
+    gPiAddrHi = 0
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If PiAddrHit(lo, hi, #PI_DRAM_HIGH_BASE, #PI_PCIE_WINDOW_LO - 1) <> 0
+    *gPiAddrWhy = "the span above four gigabytes that this monitor's page tables leave unmapped: any memory a 4 or 8 GB board has up here is real and out of this monitor's reach, and an access to it is a translation fault that Anvil stops on"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If PiAddrHit(lo, hi, #PI_PCIE_WINDOW_HI + 1, #PI_VA_TOP) <> 0
+    *gPiAddrWhy = "above the PCI Express window, where this monitor's page tables map nothing at all: an access there is a translation fault that Anvil stops on"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If hi > #PI_VA_TOP Or lo > #PI_VA_TOP
+    *gPiAddrWhy = "past the top of the address space this monitor translates at all: an access there is a fault and Anvil stops on it"
+    gPiAddrLo = 0
+    gPiAddrHi = 0
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ==================================================================
+  ;  2. MAPPED, BUT THERE IS NO MEMORY BEHIND IT. Only the run below the
+  ;     peripheral aperture can be in this state: the run above four
+  ;     gigabytes was refused by arm 1 whether or not it holds memory.
+  ; ==================================================================
+  bytes = HwMemoryBytes()
+  If bytes = #HW_MEM_UNKNOWN
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+  lowTop = bytes
+  If lowTop > #MMU_PERIPH_BASE
+    lowTop = #MMU_PERIPH_BASE
+  EndIf
+  If lowTop < #MMU_PERIPH_BASE
+    If PiAddrHit(lo, hi, lowTop, #MMU_PERIPH_BASE - 1) <> 0
+      *gPiAddrWhy = PiMemTooHighWhy(bytes)
+      ProcedureReturn #HW_ADDR_ABSENT
+    EndIf
+  EndIf
+
+  ProcedureReturn #HW_ADDR_SAFE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrReport() - what `info` prints about this board's answer.
+;
+;  Every board prints its own table here, with where each row came from.
+;  This one has no table, so it says that, and says why - a blank section
+;  under a heading in `info` reads as a monitor that failed to fill it in.
+;
+;  AND IT PRINTS WHERE THE MONITOR IS, because the sentence below sends
+;  the reader straight to "the monitor's own window guards" and there was
+;  no way to ask what those windows are. Two questions meet in this
+;  section and they are not the same one: HwAddrCheck answers "will this
+;  access complete" - here, always yes - and the monitor window answers
+;  "will this access destroy the thing that is running", which is the one
+;  that still refuses writes on this board. The extent was reachable only
+;  by tripping over it: aim a write inside the monitor and the refusal
+;  names the window. A number an operator can only find by hitting it is
+;  not reported, it is hidden.
+;
+;  IT ASKS HwMonLo()/HwMonHi() RATHER THAN READING THE CONSTANTS, even
+;  though on this board they ARE the constants. Those two procedures are
+;  what the overlap test itself asks, so this prints the answer that will
+;  actually be used - and a board that told `info` one thing and the
+;  guard another would then have to be made to disagree on purpose,
+;  rather than by an oversight in one of them.
+; ----------------------------------------------------------------------
+Procedure HwAddrReport()
+  ; WHERE THE MONITOR IS. First, because it is the concrete answer and
+  ; the prose below it explains a refusal that never happens here.
+  ; EVERY REGION, THROUGH THE ONE PRINTER THE MAP HAS - 2026-09-08.
+  ; This block used to print the code window and the data window from
+  ; constants and then say the pair "come from COMPILE-TIME CONSTANTS on
+  ; this board and cannot be wrong". That sentence was true of the data
+  ; window and FALSE of the code window from the moment the monitor
+  ; stopped having a fixed top: its extent is now the size of the image
+  ; the firmware loaded, measured by the running program. A section of
+  ; `info` that explained the old certainty would have been the most
+  ; confident wrong paragraph in the monitor.
+  PutMonitorMap()
+  PrintN("            A write into any of that is refused and the refusal names")
+  PrintN("            the region. The first line is MEASURED, not declared: the")
+  PrintN("            image carries the address of its own end, so the monitor")
+  PrintN("            reserves exactly what it is and there is no maximum size.")
+  PrintN("            Type map for the same numbers with the payload windows.")
+  PrintN("addresses   every address that exists on this board answers SAFE, so")
+  PrintN("            the commands that take an address from you are refused by")
+  PrintN("            nothing but the monitor's own window guards. Nothing here")
+  PrintN("            is known to stall the bus: the peripheral window is")
+  PrintN("            clocked by the firmware before this monitor is entered,")
+  PrintN("            and an address with nothing behind it reads a value")
+  PrintN("            rather than hanging. Anvil asks the question because its")
+  PrintN("            other target is not like this - there, one read of a")
+  PrintN("            gated block stops the processor until the power is")
+  PrintN("            pulled - and one core asks every board the same thing.")
+
+  ; THE ONE REFUSAL, AND THE SHAPE OF THE MEMORY BEHIND IT. NO SIZE IS
+  ; PRINTED HERE, on purpose: this section is printed before the mailbox
+  ; is asked for anything (see CmdInfo), and the size comes from the
+  ; firmware. The RAM row a few lines further down `info` carries the
+  ; number and where it came from. What belongs here is the SHAPE -
+  ; memory, then the peripheral aperture, then memory again - because
+  ; that is the reason an address that looks like it is inside a 4 GB
+  ; board's memory is not, and an operator is entitled to know it before
+  ; typing rather than after being refused.
+  PrintN("memory top  two things are refused here and they are different. An")
+  PrintN("            address past the memory this board has, but below the")
+  PrintN("            peripheral aperture, reads a plausible value rather than")
+  PrintN("            hanging - a wrong answer that looks like a right one is")
+  PrintN("            worse than a stop - so it is refused with the size named.")
+  PrintN("            And EVERYTHING ABOVE FOUR GIGABYTES except the PCI")
+  PrintN("            Express window is refused for a harder reason: this")
+  PrintN("            monitor's page tables map nothing there, so an access is")
+  PrintN("            a translation fault and Anvil stops on it. Memory does")
+  PrintN("            resume up there on a 4 or 8 GB board and this monitor")
+  PrintN("            still cannot reach it. force overrides either refusal for")
+  PrintN("            one address and one command line, as it does any other -")
+  PrintN("            and forcing the second one will stop the board.")
+EndProcedure

@@ -1,0 +1,1881 @@
+; ======================================================================
+;  i2c.pi4 - the BCM2711 BSC (Broadcom Serial Control) I2C master, in
+;  readable code. THE ONE FILE ON THE Pi 4 THAT KNOWS THE BSC REGISTERS.
+;
+;  A QUICK EXAMPLE
+;
+;    XIncludeFile "RaspberryPi4/Lib/gpio.pi4"   ; PinAlt - see DEPENDENCIES
+;    XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+;
+;    Procedure Main()
+;      Define b.i
+;      I2cInit()                          ; mux GPIO 2/3, 100 kHz, enable
+;      If I2cProbe($76) = #I2C_OK         ; a BMP280 at 0x76?
+;        b = 0
+;        I2cWrite($76, @regId, 1)         ; point at register 0xD0
+;        I2cRead($76, @b, 1)              ; read the chip-id byte
+;      EndIf
+;    EndProcedure
+;
+;  ---- WHAT A "BSC" IS, AND WHY THERE IS NO start()/stop() BELOW --------
+;
+;  The header I2C bus on a Pi 4 is BSC1 - a Broadcom Serial Control
+;  master, "compliant with the Philips I2C bus/interface version 2.1"
+;  (BCM2711 ARM Peripherals, section 3.1, p.24). It is a PACKET controller,
+;  not a bit-banger: you load the slave address, a direction bit and a byte
+;  count, set one Start bit, and the hardware drives the whole framed
+;  transaction - START, the address, every data byte with its ACK, and the
+;  STOP - on its own. So this file has no I2cStart / I2cStop / I2cAck the
+;  way a bit-banged driver would; the transaction primitives ARE I2cWrite,
+;  I2cRead and I2cProbe, and the START and STOP are the controller's to
+;  place. The datasheet write and read sequences (section 3.3, pp.29-30,
+;  written there for 10-bit addressing but identical in shape for 7-bit)
+;  are exactly this: set DLEN, set A, set C.ST, poll S.
+;
+;  ***THIS DRIVER IS SINGLE-MASTER, 7-BIT, ONE TRANSACTION AT A TIME.***
+;  That is what the header bus is used for and what can be reasoned about
+;  without silicon. See REPEATED START below for the one thing it does NOT
+;  do and why that is a deliberate refusal rather than an omission.
+;
+;  ---- TWO BUSES, ONE DRIVER -------------------------------------------
+;
+;  The Pi 4 brings out a second I2C bus that has nothing to do with the
+;  40-pin header: BSC0 on GPIO 44/45, which is what the DSI display and
+;  CSI camera connectors are wired to. Both controllers have the same
+;  register file, so this file drives both - I2cSelectBus() moves the
+;  base and the pin pair, and every procedure reads them out of globals.
+;
+;    I2cSelectBus(#I2C_BUS_DISPLAY)     ; BSC0, GPIO 44/45, ALT1
+;    I2cUp()                            ; mux and enable THAT controller
+;    I2cProbe($45)                      ; the panel MCU on a DSI ribbon
+;    I2cSelectBus(#I2C_BUS_HEADER)      ; back to BSC1, GPIO 2/3, ALT0
+;
+;  The default is the header bus, so a program that never selects gets
+;  precisely the driver that existed before this was written. The full
+;  argument, and the ALT1-versus-ALT2 trap that makes a good ribbon look
+;  like a dead one, is at THE SECOND CONTROLLER below.
+;
+;  ---- DEPENDENCIES ----------------------------------------------------
+;
+;  RaspberryPi4/Lib/mailbox.pi4 - for MailboxClockRateMeasured() and
+;  MailboxClockRate(). The clock feeding the divider is asked for, not
+;  assumed - see THE CLOCK. Same arrangement as PinAlt below: this file
+;  does NOT include it, the MAIN file lists it FIRST, and a main file that
+;  forgets fails loudly at compile time on an undefined procedure.
+;
+;  RaspberryPi4/Lib/gpio.pi4  - for PinAlt(). I2cInit() muxes GPIO 2 and 3
+;  to ALT0 (SDA1 / SCL1) through PinAlt rather than poking GPFSEL itself,
+;  because gpio.pi4 already holds the BCM2711's OUT-OF-ORDER ALT table
+;  (ALT0 is FSEL code 4, not 0 - Table 64) in one reviewed place, and
+;  re-deriving it here would be a second copy of the one fact most likely
+;  to be wrong. House rule 10 (a library never includes a library): this
+;  file does NOT XIncludeFile gpio.pi4. The MAIN file lists both, gpio.pi4
+;  first, and if it is missing this file fails LOUDLY at compile time as an
+;  undefined PinAlt - which is the designed failure, not a silent one.
+;
+;  a64_barrier() - dsb sy, from RaspberryPi4/Intrinsics/bcm2711_hardware.def,
+;  the same barrier gpio.pi4 uses. An intrinsic, target-provided for -t pi4,
+;  so it needs no include. See MEMORY ORDERING below.
+;
+;  ---- WHERE THE ADDRESSES COME FROM (do not guess - rule 21) ----------
+;
+;  Every number in this file is from BCM2711 ARM Peripherals, Chapter 3
+;  (BSC), on disk at RaspberryPi4/Reference/ as both
+;  bcm2711-peripherals.pdf and .txt.
+;
+;  THE BASE, derived not remembered. Section 3.2, p.24 lists the eight BSC
+;  masters' bus addresses; BSC1 - the one wired to the 40-pin header - is
+;  at bus 0x7e804000. Bus $7Ennnnnn is ARM physical $FEnnnnnn under the
+;  Pi 4's Low Peripheral mode (the same translation gpio.pi4's header
+;  derives from bcm2711.dtsi's soc ranges and the peripherals PDF section
+;  1.2.4), so BSC1 is at ARM $FE804000. This is a DIFFERENT window from the
+;  0x7e205xxx block the other BSC masters live in - BSC1 is off on its own,
+;  which is why the base here is not $FE205000 + something.
+;
+;  WHICH PINS. Alternative-function table, p.77: GPIO2 ALT0 = SDA1 and
+;  GPIO3 ALT0 = SCL1 - the two header pins (physical 3 and 5) that every
+;  Pi I2C device is wired to. Those pins carry 1.8k pull-ups to 3.3V ON THE
+;  BOARD (Pi 4 product datasheet), so this driver does NOT enable the
+;  BCM2711's internal pulls: the external resistors are the right value and
+;  the weak internal ones would only fight them. A bus with NO device and
+;  the external pulls present rests high, which is exactly what makes the
+;  no-ACK probe below honest rather than phantom - see I2cProbe.
+;
+;  THE REGISTERS. Table 24, p.24 - offsets from the base:
+;    0x00 C     Control       0x10 FIFO  Data FIFO
+;    0x04 S     Status        0x14 DIV   Clock Divider
+;    0x08 DLEN  Data Length   0x18 DEL   Data Delay
+;    0x0c A     Slave Address 0x1c CLKT  Clock Stretch Timeout
+;  and section 3.2 p.24: "All accesses are assumed to be 32-bit" - so every
+;  access below is PeekN / PokeL, exactly as gpio.pi4 argues for its block.
+;
+;  ---- .l / N, NOT .i. THE ONE THAT SILENTLY MISCOMPILES ---------------
+;
+;  Every BSC register is 32 bits. On this 64-bit target a bare Peek/Poke or
+;  a .i is EIGHT bytes; a PeekI of S would span S and DLEN and a PokeI of C
+;  would write S as well. Registers are written with PokeL (a 32-bit store)
+;  and read with PeekN & $FFFFFFFF (PeekN is the UNSIGNED 32-bit read;
+;  PeekL sign-extends, so S with bit 31... - none of these fields is that
+;  high, but the mask matches gpio.pi4 and costs nothing). This is the same
+;  reasoning gpio.pi4's header sets out at length; it is the width of the
+;  silicon, not a 32-bit leftover.
+;
+;  ---- MEMORY ORDERING -------------------------------------------------
+;
+;  BCM2711 ARM Peripherals section 1.3: a barrier before the first access
+;  to a peripheral and after the last, because the AXI fabric can reorder
+;  accesses to DIFFERENT peripherals. Each public procedure here is one
+;  complete BSC service and takes that literally - a64_barrier() on entry
+;  and before returning. WITHIN a transaction, every access is to the SAME
+;  peripheral (BSC1), which section 1.3 says is always ordered, so the poll
+;  loop does not barrier every register touch.
+;
+;  ---- THE ERROR MODEL - NACK, CLOCK-STRETCH TIMEOUT, WEDGED BUS -------
+;
+;  Three ways a transaction can fail, and this driver names all three
+;  rather than returning a bare 0/1 (rule 3, loud errors):
+;
+;    #I2C_NACK    S.ERR (Table 26 bit 8): "Slave has not acknowledged its
+;                 address" (or a byte written to it). This is the ordinary
+;                 "nothing at that address" answer AND the anti-phantom
+;                 guarantee - a probe is "present" ONLY if the addressed
+;                 slave drove ACK, never merely because the lines idle high.
+;    #I2C_CLKT    S.CLKT (Table 26 bit 9): the slave held SCL low past the
+;                 CLKT timeout (Table 32) - it is clock-stretching beyond
+;                 what we allowed, i.e. hung or far too slow. The BCM2711
+;                 "fixes the clock-stretching bug that was present in
+;                 BCM283x devices" (section 3.1), so on THIS part a stretch
+;                 is handled in hardware and this bit means a real overrun.
+;    #I2C_TIMEOUT our own no-progress deadline: the controller did not
+;                 complete or advance a byte within 20 ms. The local
+;                 architectural counter gives elapsed time independently
+;                 of CPU/cache speed. A finite spin backstop also remains
+;                 for an unavailable counter; that fallback
+;                 alone is not a wall-time guarantee. Abort recovery has
+;                 its own 20 ms deadline and refuses a new START if TA
+;                 never clears. See THE WALL-CLOCK BACKSTOP below.
+;
+;  ---- REPEATED START: TWO PATHS, AND THE DEFAULT IS STILL TWO STOPS ---
+;
+;  A register read (write the register pointer, then read the data) is done
+;  BY DEFAULT as two separate transactions - an I2cWrite then an I2cRead -
+;  which puts a STOP between them (write, STOP, START, read). Most
+;  register-style devices (EEPROMs, the common sensors) accept that, and
+;  `i2c read` at the command layer still works exactly that way and still
+;  says so in its own help text.
+;
+;  I2cWriteRead() is the other path, added 2026-09-06, and it emits a real
+;  repeated start. See its own comment block for the recipe. Use it ONLY
+;  for a device that requires Sr; do not "upgrade" the two-transaction
+;  callers to it, because a device that is happy with a STOP gains nothing
+;  and every extra user of a mid-transaction poke is another thing to
+;  re-prove on silicon.
+;
+;  WHY IT WAS REFUSED BEFORE, AND WHAT CHANGED. The refusal said that the
+;  manual's method (section 3.3.2, steps 5-7: start the write, poll S.TA,
+;  then rewrite DLEN and set C.READ|C.ST) is a mid-transaction poke of
+;  exactly the shape this project has already paid for TWICE on the RP2040
+;  and RP2350 (vault: the RP2350 I2C phantom-device fix and the RP2040
+;  repeated-start 4805us->126us fix), and that guessing at it with nothing
+;  on the bench would be shipping the thing most likely to be subtly wrong.
+;  That reasoning still stands and it is why the two-transaction path is
+;  untouched. What changed is that a device which REQUIRES Sr arrived - the
+;  Goodix GT9xx on the display connector's bus, whose 16-bit register
+;  pointer does not survive a STOP - so the choice is no longer "Sr or the
+;  simple path", it is "Sr or a driver that reads the wrong register and
+;  returns data".
+;
+;  THE PART THAT IS STILL OWED SILICON is named in I2cWriteRead's own
+;  comment: the TA race. It is coded to refuse rather than to read, so the
+;  failure mode is a stated error code and not a wrong coordinate.
+;
+;  ---- STATUS ----------------------------------------------------------
+;
+;  Written 2026-09-01. COMPILE-VERIFIED ONLY, for -t pi4, as the board.pi4
+;  build. NOTHING HERE HAS DRIVEN A REAL BUS. Every register offset and bit
+;  is cited against BCM2711 ARM Peripherals Chapter 3 above; the transaction
+;  shape follows section 3.3; the anti-phantom argument is the datasheet's
+;  own S.ERR definition. But a bus scan against a real device and whether
+;  a given sensor tolerates the STOP-between-write-and-read are both still
+;  owed a Pi 4. Do not read a green compile as a working bus. (The SCL
+;  frequency WAS owed here and is not any more - it was measured on the
+;  pin on 2026-09-03; see THE CLOCK.)
+;
+;  UPDATED 2026-09-03, and the update is a correction. This file always
+;  muxed the pins in I2cInit() - the code below is unchanged - but the
+;  `i2c probe` and `i2c speed` paths above it never called I2cInit at all,
+;  so on real silicon the pins stayed plain inputs, the controller stayed
+;  disabled, every transfer spun out, and the monitor blamed the wiring
+;  (forum 584). The caller now brings the bus up in one place before any
+;  subcommand. Two readers were added here so that claim can be CHECKED
+;  rather than assumed: I2cPinsMuxed() reports whether the pads really are
+;  on ALT0, and I2cPadLevel() reports what a pad is actually reading, which
+;  is what turns "the bus looks wedged" from a guess into a measurement.
+;
+;  UPDATED AGAIN 2026-09-03, LATER THE SAME DAY (forum 622), and this one
+;  is the rate itself. Every number this file printed came out of a
+;  datasheet constant of 150 MHz, honestly labelled nominal, while the
+;  board next to the label was measuring its core clock at over three
+;  times that. So the SCL an operator asked for and the SCL on the wire
+;  differed by that ratio, and a request for standard-mode 100 kHz was
+;  really putting the line inside fast mode.
+;
+;  UPDATED 2026-09-06: I2cWriteRead() added, the repeated-start transfer
+;  the header above used to say this file did not offer. Built against
+;  section 3.3.2 steps 5-7, generalised from the manual's 10-bit recipe to
+;  a 7-bit address, with the write bytes pre-loaded into the FIFO the way
+;  the recipe does it and wn capped at the FIFO's sixteen. NOTHING ELSE IN
+;  THIS FILE CHANGED. It is COMPILE- AND EMULATOR-VERIFIED ONLY; no
+;  repeated start from this file has been on a wire. The one race it can
+;  lose - the write completing before S.TA is ever observed - returns the
+;  new #I2C_NOSR and reads nothing, so if it ever happens on silicon it
+;  arrives as a number rather than as a wrong coordinate.
+;
+;  IT IS MEASURED NOW. The divider's source was established on a wire, by
+;  sampling the SCL pad while the controller clocked it at six known
+;  dividers (see THE CLOCK), and the driver derives every rate from that
+;  clock queried at the time of the call. The nominal constant survives
+;  only as a labelled last resort for a firmware that will not answer.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  THE BOARD-SPECIFIC ADDRESS. BSC1, the header bus. bus $7E804000 ->
+;  ARM $FE804000 (section 3.2 p.24 + the Low-Peripheral translation).
+;  The register constants are OFFSETS inside the block (Table 24), so a
+;  missed conversion would not silently write offset $04 for ever - the
+;  same discipline gpio.pi4 adopted when it split base from offsets.
+; ----------------------------------------------------------------------
+#BSC1_BASE     = $FE804000
+
+; ----------------------------------------------------------------------
+;  THE TWO PINS, NAMED ONCE. Alternative-function table, p.77: GPIO2 ALT0
+;  is SDA1 and GPIO3 ALT0 is SCL1 - physical header pins 3 and 5. These
+;  were spelled as bare 2, 3 and 0 inside I2cInit; they are constants now
+;  because three other procedures ask about the same two pins, and three
+;  copies of "2" is how a driver ends up muxing one pin and reading the
+;  other.
+;
+;  #I2C_PIN_ALT IS THE ALT NUMBER, NOT THE FSEL CODE. PinAlt() takes 0..5
+;  and does the BCM2711's out-of-order mapping itself (ALT0 is FSEL 4, and
+;  ALT4 is 3, not 8 - gpio.pi4's Table 64 note). #PIN_ALT0 below is the raw
+;  FSEL code, used only where a code read back out of GPFSEL is compared.
+; ----------------------------------------------------------------------
+#I2C_PIN_SDA   = 2            ; GPIO2, header pin 3 - SDA1 on ALT0
+#I2C_PIN_SCL   = 3            ; GPIO3, header pin 5 - SCL1 on ALT0
+#I2C_PIN_ALT   = 0            ; the alt NUMBER both pins must be on
+
+; ----------------------------------------------------------------------
+;  THE SECOND CONTROLLER - BSC0, THE ONE THE DISPLAY AND CAMERA
+;  CONNECTORS ARE WIRED TO. Same registers, same code, a different base
+;  and a different pair of pads.
+;
+;  This is a SECOND INSTANCE OF THIS LIBRARY, not a second library. Every
+;  procedure below reads the base and the two pins out of the globals
+;  under THE ACTIVE BUS, and I2cSelectBus() is the only thing that writes
+;  them. A copy of this file with three numbers changed would be a
+;  divergence, and the two copies would drift on the first bug fix.
+;
+;  THE BASE. Section 3.2, p.24: BSC0 is at bus 0x7e205000, so ARM
+;  $FE205000 under Low Peripheral mode. Confirmed independently by
+;  bcm283x.dtsi, which names the same window i2c0: i2c@7e205000.
+;
+;  WHICH PINS, AND THE ALT THAT IS EASY TO GET WRONG. The DSI and CSI
+;  connectors do not reach GPIO 0/1; they reach GPIO 44 and 45, and the
+;  Pi device trees mux BSC0 between the two pairs with a pinctrl mux -
+;  i2c0mux, states i2c0_gpio0 (GPIO 0/1) and i2c0_gpio44 (GPIO 44/45),
+;  rpi-6.12.y_bcm2711-rpi.dtsi:21-30. The display child bus is
+;  i2c_csi_dsi: i2c@1, i.e. mux child 1, i.e. GPIO 44/45
+;  (rpi-6.12.y_bcm270x.dtsi:125-144).
+;
+;  ***GPIO 44/45 IS ALT1 FOR BSC0 AND ALT2 FOR BSC1.*** bcm283x.dtsi
+;  :197-208 gives both states by name: i2c0_gpio44 is ALT1, i2c1_gpio44
+;  is ALT2. Picking the wrong one puts the display connector on the wrong
+;  controller, and every transfer then times out with the wiring
+;  blameless - the exact shape of forum 584, where pins that were never
+;  muxed produced a confident diagnosis about a healthy bus. The alt is a
+;  property of the BUS here - I2cBusAlt() derives it from the selector -
+;  so it cannot be muxed right for one controller and read back against
+;  the other.
+;
+;  NO EXTERNAL PULL-UPS ARE PROMISED ON THIS PAIR. The 1.8k resistors in
+;  the Pi 4 product datasheet are on GPIO 2/3. GPIO 44/45 are pulled up
+;  on the DISPLAY BOARD, through the ribbon - so an unplugged or
+;  backwards ribbon shows here as both lines LOW, which I2cPadLevel()
+;  reads and the caller may print. That is a real diagnostic and it is
+;  the cheapest thing on this bench that can tell a bad cable from a bad
+;  driver.
+; ----------------------------------------------------------------------
+#BSC0_BASE     = $FE205000
+
+#I2C_DISP_PIN_SDA = 44        ; GPIO44 - SDA0 on ALT1, the DSI/CSI pair
+#I2C_DISP_PIN_SCL = 45        ; GPIO45 - SCL0 on ALT1
+#I2C_DISP_PIN_ALT = 1         ; ALT1 for BSC0. ALT2 would be BSC1.
+
+; The bus NUMBERS are the Broadcom controller numbers, so they read the
+; same way the datasheet and the device trees do: 1 is the header, 0 is
+; the display and camera connectors.
+#I2C_BUS_HEADER  = 1
+#I2C_BUS_DISPLAY = 0
+
+#BSC_C_OFF     = $00          ; Control
+#BSC_S_OFF     = $04          ; Status
+#BSC_DLEN_OFF  = $08          ; Data Length (bytes, 16-bit)
+#BSC_A_OFF     = $0C          ; Slave Address (7-bit)
+#BSC_FIFO_OFF  = $10          ; Data FIFO (8-bit window, 16 deep)
+#BSC_DIV_OFF   = $14          ; Clock Divider (CDIV, 16-bit)
+#BSC_DEL_OFF   = $18          ; Data Delay (FEDL:REDL)
+#BSC_CLKT_OFF  = $1C          ; Clock Stretch Timeout (TOUT, 16-bit)
+
+; C register bits - Table 25, p.25.
+#BSC_C_I2CEN   = $8000        ; bit 15  enable the controller
+#BSC_C_ST      = $80          ; bit 7   start transfer (one-shot, reads 0)
+#BSC_C_CLEAR   = $20          ; bit 5   clear FIFO (one-shot); 5:4, x1 or 1x
+#BSC_C_READ    = $01          ; bit 0   1 = read packet, 0 = write packet
+
+; S register bits - Table 26, pp.25-27.
+#BSC_S_CLKT    = $200         ; bit 9   clock-stretch timeout (write 1 clears)
+#BSC_S_ERR     = $100         ; bit 8   slave did not ACK (write 1 clears)
+#BSC_S_RXF     = $80          ; bit 7   FIFO full
+#BSC_S_TXE     = $40          ; bit 6   FIFO empty
+#BSC_S_RXD     = $20          ; bit 5   FIFO contains data to read
+#BSC_S_TXD     = $10          ; bit 4   FIFO has space to write
+#BSC_S_RXR     = $08          ; bit 3   FIFO needs reading
+#BSC_S_TXW     = $04          ; bit 2   FIFO needs writing
+#BSC_S_DONE    = $02          ; bit 1   transfer done (write 1 clears)
+#BSC_S_TA      = $01          ; bit 0   transfer active
+
+; ----------------------------------------------------------------------
+;  THE CLOCK. DIV/CDIV, Table 30 p.28: "SCL = core_clock / CDIV. Where
+;  core_clk is nominally 150 MHz." So 150 MHz / 1500 = 100 kHz, which is
+;  the reset default (0x05dc) and the Pi 4's device-tree i2c1 default
+;  (bcm2711-rpi-4-b.dts: clock-frequency = <100000>).
+;
+;  ***THE 150 MHz IS NOT WHAT THIS PART RUNS AT, AND IT IS NO LONGER USED
+;  TO COMPUTE ANYTHING.*** It stays below as a labelled last resort and
+;  nothing else. What replaced it is a measurement.
+;
+;  WHAT WAS MEASURED, 2026-09-03, ON A Pi 4 (forum 622). The divider was
+;  programmed to six known values, a transaction was started at each, and
+;  the SCL pad was sampled in a tight loop while the controller clocked
+;  it; the architectural counter timestamped the first and last falling
+;  edge, so SCL came out of an edge count and a tick count and the source
+;  came out of SCL * CDIV. Six dividers gave one source clock, and that
+;  source is the firmware's MEASURED VideoCore/core clock, at a ratio of
+;  one to one. It is NOT 150 MHz and it is NOT the configured figure the
+;  same mailbox reports for the same clock. See the diagnostic
+;  RaspberryPi4/Examples/Diagnostics/pi4I2cScl.pi4, which is the
+;  instrument that settled it and can be re-run on any board.
+;
+;  SO THE SOURCE IS QUERIED, NOT ASSUMED, AND IT IS QUERIED AT THE TIME
+;  OF THE CALL. The core clock is not a constant on this part: the
+;  firmware's governor moves it for thermal and load reasons with no
+;  notification, and a rate computed from a value cached at boot would
+;  drift away from the wire exactly when the board is busy. I2cSourceHz()
+;  below asks the firmware every time.
+;
+;  ---- DEPENDENCY: THE MAILBOX ----------------------------------------
+;
+;  Asking the firmware means RaspberryPi4/Lib/mailbox.pi4, which this file
+;  does NOT include (house rule 10 - a library never includes a library).
+;  The MAIN file lists mailbox.pi4 BEFORE this one, exactly as it lists
+;  gpio.pi4 before this one for PinAlt; if it does not, the build fails
+;  loudly on an undefined MailboxClockRateMeasured, which is the designed
+;  failure and not a silent one.
+;
+;  A firmware that will not answer is not a crash and not a lie: the
+;  source falls back to the configured rate, and then to the datasheet
+;  nominal, and I2cSourceFrom() says which of the three is in force so a
+;  caller can print it. A number whose provenance cannot be stated is the
+;  thing this whole topic was about.
+; ----------------------------------------------------------------------
+#I2C_CORE_NOMINAL_HZ = 150000000 ; datasheet nominal - THE LAST RESORT ONLY
+#I2C_DEFAULT_HZ = 100000      ; standard-mode 100 kHz, the Pi 4 default
+#I2C_CLKT_TOUT  = $40         ; SCL clocks to allow a stretch (Table 32 reset)
+
+; The divider field's real limits. CDIV is 16 bits and Table 30 says it is
+; "always rounded down to an even number", so 65534 is the largest usable
+; value and 2 the smallest; 0 is special-cased by the hardware to mean
+; 32768 and is never written here. Every rate this driver can and cannot
+; reach follows from these two numbers.
+#I2C_CDIV_MIN  = 2
+#I2C_CDIV_MAX  = 65534
+
+; Where I2cSourceHz() got its answer. Printed by the caller, because "the
+; divider is fed from 500000992 Hz" is worth very little without "and that
+; is the firmware's measurement of it, taken just now".
+#I2C_SRC_MEASURED   = 1       ; the firmware MEASURED the core clock
+#I2C_SRC_CONFIGURED = 2       ; the firmware's configured rate; it would
+                              ; not give a measurement
+#I2C_SRC_NOMINAL    = 3       ; nothing answered - the datasheet constant
+
+; ----------------------------------------------------------------------
+;  THE WALL-CLOCK BACKSTOP. CNTFRQ_EL0/CNTPCT_EL0 give this Pi-specific
+;  driver a real elapsed-time bound without a dependency include. Twenty
+;  milliseconds is over two hundred 100 kHz bit cells and far beyond one
+;  byte or the separately programmed hardware stretch window. Each byte of
+;  progress resets the deadline, so a healthy long transfer does not time
+;  out merely for being long. The spin count remains an independent fallback
+;  for a loader that left CNTFRQ_EL0 at zero.
+; ----------------------------------------------------------------------
+#I2C_SPIN_MAX  = 2000000
+#I2C_PROGRESS_TIMEOUT_US = 20000
+#I2C_RECOVER_TIMEOUT_US = 20000
+
+; Result codes - see hal.pi4's #HW_I2C_* portable vocabulary, which these
+; equal so the board backend can hand them straight up to the core. Named
+; locally too so this library reads on its own.
+#I2C_OK        = 0
+#I2C_NACK      = -2           ; no device / no acknowledge (S.ERR)
+#I2C_CLKT      = -3           ; slave held the clock too long (S.CLKT)
+#I2C_TIMEOUT   = -4           ; controller never finished (bus wedged)
+#I2C_ARG       = -5           ; bad argument (count <= 0, address > 0x7f)
+#I2C_RANGE     = -7           ; a rate the divider cannot reach from the
+                              ; clock it is fed by. NOT the same as #I2C_ARG:
+                              ; the request was well formed and the answer
+                              ; depends on a clock that moves, so the caller
+                              ; is owed the reachable range and not a shrug.
+                              ; -6 is skipped: the seam above this one spends
+                              ; it on "this board has no such bus", and two
+                              ; enumerations that agree by accident are how a
+                              ; bus error gets relabelled silently.
+#I2C_NOSR      = -8           ; the write phase of I2cWriteRead finished
+                              ; before the controller ever reported the
+                              ; transfer ACTIVE, so the repeated start could
+                              ; not be issued and a STOP has already gone out.
+                              ; A device that needs Sr has by now forgotten
+                              ; its register pointer, so reading anyway would
+                              ; return believable rubbish - see the header's
+                              ; REPEATED START section. This code has NO
+                              ; #HW_I2C_* twin on purpose: no procedure in the
+                              ; HwI2c* seam can return it yet, because that
+                              ; seam has no write-read call. When one is added,
+                              ; hal.pi4 gains the twin and hw_i2c.pi4 maps it
+                              ; in the same commit - an unmapped code falling
+                              ; through I2cMapCode's default would be reported
+                              ; as a timeout, which is the wrong sentence.
+
+; One bounded, non-mutating sequence of controller reads for diagnostics.
+; Each member is a 32-bit BSC register read through I2cRd (PeekN); FIFO is
+; deliberately absent because reading it consumes received data. The words
+; are sequential evidence, not an atomic hardware snapshot: S, DLEN or C can
+; change between reads while hardware completes or aborts a transaction. The
+; diagnostic starts no transaction and never reads the side-effecting FIFO.
+#I2C_SNAP_C = 0
+#I2C_SNAP_S = 1
+#I2C_SNAP_DLEN = 2
+#I2C_SNAP_A = 3
+#I2C_SNAP_DIV = 4
+#I2C_SNAP_DEL = 5
+#I2C_SNAP_CLKT = 6
+#I2C_SNAP_WORDS = 7
+
+; Counts transactions that ended in a wedged-bus timeout since boot. A
+; timeout is the one failure that suggests wiring rather than a missing
+; chip, so it is worth being able to print a running total. Same idea as
+; gpio.pi4's gpio_bad_pins.
+Global i2c_timeouts.i
+Global i2c_recover_failed.i
+
+; ----------------------------------------------------------------------
+;  OPT-IN BOOT TRANSACTION TRACE
+;
+;  This is a bounded RAM record of the EXISTING panel-MCU identity and
+;  Goodix identity transactions. It starts no transfer and it never reads
+;  FIFO. The four controller words are sequential observations, not an
+;  atomic snapshot. Tracing is OFF in zeroed BSS and an off trace performs
+;  no MMIO reads at all.
+;
+;  BEGIN is captured before I2cXfer/I2cWriteRead can clear status or call
+;  I2cEnsureIdle; an optional FAULT preserves the polling status plus safe
+;  registers before cleanup; END carries the real return code and whether
+;  that preflight had to run I2cRecover (1 success, -1 failure).
+;  The buffer saturates instead of wrapping, preserving the first failure
+;  and all state that led to it.
+; ----------------------------------------------------------------------
+#I2C_TRACE_MAX = 64
+#I2C_TRACE_FIELDS = 9
+
+#I2C_TRACE_EDGE_BEGIN = 1
+#I2C_TRACE_EDGE_END = 2
+#I2C_TRACE_EDGE_FAULT = 3
+#I2C_TRACE_EDGE_TX = 4
+#I2C_TRACE_EDGE_SWITCH = 5
+#I2C_TRACE_EDGE_RX = 6
+#I2C_TRACE_EDGE_DONE = 7
+
+#I2C_TRACE_FIELD_EDGE = 0
+#I2C_TRACE_FIELD_PHASE = 1
+#I2C_TRACE_FIELD_RESULT = 2
+#I2C_TRACE_FIELD_RECOVERED = 3
+#I2C_TRACE_FIELD_TICKS = 4
+#I2C_TRACE_FIELD_C = 5
+#I2C_TRACE_FIELD_S = 6
+#I2C_TRACE_FIELD_DLEN = 7
+#I2C_TRACE_FIELD_A = 8
+
+#I2C_TRACE_MCU_SIZE_WRITE = 1
+#I2C_TRACE_MCU_SIZE_READ = 2
+#I2C_TRACE_MCU_ID_WRITE = 3
+#I2C_TRACE_MCU_ID_READ = 4
+#I2C_TRACE_MCU_VERSION_WRITE = 5
+#I2C_TRACE_MCU_VERSION_READ = 6
+#I2C_TRACE_GOODIX_5D = 7
+#I2C_TRACE_GOODIX_14 = 8
+
+Global Dim i2c_trace_words.i[#I2C_TRACE_MAX * #I2C_TRACE_FIELDS]
+Global i2c_trace_on.i
+Global i2c_trace_count.i
+Global i2c_trace_overflow.i
+Global i2c_trace_pending.i
+Global i2c_trace_phase.i
+Global i2c_trace_recovered.i
+Global i2c_trace_faulted.i
+Global i2c_trace_goodix.i
+Global i2c_trace_goodix_seen.i
+Global i2c_trace_milestones.i
+
+; ----------------------------------------------------------------------
+;  THE ACTIVE BUS. ONE global, written by I2cSelectBus() and by nothing
+;  else, read by every procedure below.
+;
+;  ***THE ZERO VALUE IS THE HEADER BUS, AND THAT IS NOT A COINCIDENCE.***
+;  Globals on this target live in .bss - `global_i2c_sel` in a built image
+;  sits at $820xxxx, outside the image entirely - so an initialiser is not
+;  data, it is a STORE THAT THE PROGRAM'S STARTUP HAS TO RUN. Every desk
+;  gate in tools/a64 calls procedures DIRECTLY, with the program counter
+;  set at the entry and no startup anywhere: `a64_anvil_check.py`'s call()
+;  zeroes the registers, sets SP and PC and steps. In that world an
+;  initialised global reads ZERO.
+;
+;  So a `Global i2c_base.i = #BSC1_BASE` would have been correct on the
+;  board and silently wrong in every gate - I2cInit would have muxed GPIO
+;  0 to ALT0 and driven a controller at address zero, and the gate would
+;  have failed with a message about pin muxing that pointed nowhere near
+;  the cause. Worse, it would have been a defect that only exists off the
+;  hardware, which is the hardest kind to believe.
+;
+;  The selector is therefore an INDEX whose zero value means the bus this
+;  file has always driven. #I2C_SEL_HEADER is 0 by definition and the
+;  header bus is what an unwritten global selects. Nothing has to run
+;  first, on the board or in a model.
+;
+;  WHY A GLOBAL AND NOT A PARAMETER ON EVERY CALL. A bus argument on
+;  I2cWrite would have to be threaded through every caller in the tree,
+;  including the ones that will never see a second bus - churn with no
+;  reader. And the monitor talks to ONE bus at a time by construction:
+;  there is one set of sticky status bits per controller, but there is
+;  also one operator typing one command, and a driver that could
+;  interleave two buses would need the locking to prove it. This one
+;  cannot, and says so, rather than pretending.
+;
+;  THE STATE THAT IS NOT HERE is the clock divider, deliberately: CDIV
+;  lives in each controller's own DIV register, so the two buses keep
+;  their own rates in hardware and switching back does not disturb one.
+;  i2c_timeouts is shared on purpose - it counts driver events, not bus
+;  events, and a running total nobody can attribute is still the number
+;  that says something is wrong.
+; ----------------------------------------------------------------------
+
+; The SELECTOR, which is not the Broadcom bus number. Zero is the header
+; bus; see THE ZERO VALUE above. I2cBus() converts to the number the
+; datasheet and the device trees use, which is the one a human reads.
+#I2C_SEL_HEADER  = 0
+#I2C_SEL_DISPLAY = 1
+
+Global i2c_sel.i                  ; 0 = BSC1 on GPIO 2/3, no initialiser
+
+; ----------------------------------------------------------------------
+;  I2cAltCode(alt) - the RAW FSEL code for an alt NUMBER, or -1.
+;
+;  gpio.pi4 owns this mapping and PinAlt() applies it, but PinModeGet()
+;  hands back the raw code and there is no public way to ask gpio.pi4 to
+;  convert one. The table is Table 64's out-of-order one - ALT4 is 3 and
+;  ALT5 is 2 - and it is expressed with the constants gpio.pi4 defines,
+;  not with the numbers, so the two cannot drift silently: if gpio.pi4
+;  ever renumbers them this file follows without an edit.
+; ----------------------------------------------------------------------
+Procedure.i I2cAltCode(alt.i)
+  Select alt
+    Case 0
+      ProcedureReturn #PIN_ALT0
+    Case 1
+      ProcedureReturn #PIN_ALT1
+    Case 2
+      ProcedureReturn #PIN_ALT2
+    Case 3
+      ProcedureReturn #PIN_ALT3
+    Case 4
+      ProcedureReturn #PIN_ALT4
+    Case 5
+      ProcedureReturn #PIN_ALT5
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cSelectBus(bus) - point this driver at #I2C_BUS_HEADER (1) or
+;  #I2C_BUS_DISPLAY (0). Returns 1, or 0 for a bus this board has not
+;  been taught.
+;
+;  IT DOES NOT BRING THE NEW BUS UP and it does not take the old one
+;  down. Selecting is not configuring: the caller runs I2cUp() next, and
+;  I2cUp() looks at the bus that is now selected. Doing the mux here
+;  would mean a program could not so much as ASK which bus it is on
+;  without changing two GPIO pads, and a census has to be able to print
+;  the pin states BEFORE it changes them - that is the whole 584 lesson.
+;
+;  Selecting the bus that is already selected is a no-op, so it is safe
+;  on every command line.
+; ----------------------------------------------------------------------
+Procedure.i I2cSelectBus(bus.i)
+  If bus = #I2C_BUS_HEADER
+    i2c_sel = #I2C_SEL_HEADER
+    ProcedureReturn 1
+  EndIf
+  If bus = #I2C_BUS_DISPLAY
+    i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Which bus is selected, and the numbers that make it that bus. A caller
+;  printing a result MUST be able to say which controller and which pads
+;  it is talking about, or the result is unattributable.
+;
+;  Derived from the selector rather than stored beside it, so there is
+;  exactly ONE piece of state and no way for four globals to disagree
+;  about which bus this is.
+; ----------------------------------------------------------------------
+Procedure.i I2cBus()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn #I2C_BUS_DISPLAY
+  EndIf
+  ProcedureReturn #I2C_BUS_HEADER
+EndProcedure
+
+Procedure.i I2cBusBase()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn #BSC0_BASE
+  EndIf
+  ProcedureReturn #BSC1_BASE
+EndProcedure
+
+Procedure.i I2cBusSda()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn #I2C_DISP_PIN_SDA
+  EndIf
+  ProcedureReturn #I2C_PIN_SDA
+EndProcedure
+
+Procedure.i I2cBusScl()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn #I2C_DISP_PIN_SCL
+  EndIf
+  ProcedureReturn #I2C_PIN_SCL
+EndProcedure
+
+Procedure.i I2cBusAlt()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn #I2C_DISP_PIN_ALT
+  EndIf
+  ProcedureReturn #I2C_PIN_ALT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Register access - one 32-bit read, as a positive number, and one
+;  32-bit write. No barrier here; the public procedures barrier at their
+;  edges (section 1.3), and every access inside a transaction is to this
+;  same peripheral, which is ordered.
+;
+;  THE BASE IS CHOSEN HERE, INLINE, and not through I2cBusBase(). These
+;  two run inside I2cXfer's polling loop - the innermost thing this
+;  library does. The live-counter deadline is independent of loop cost;
+;  inline selection avoids unnecessary procedure overhead. The
+;  OFFSETS stay constants: they are the same in every BSC.
+; ----------------------------------------------------------------------
+Procedure.i I2cRd(off.i)
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn PeekN(#BSC0_BASE + off) & $FFFFFFFF
+  EndIf
+  ProcedureReturn PeekN(#BSC1_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure I2cWr(off.i, v.i)
+  If i2c_sel = #I2C_SEL_DISPLAY
+    PokeL(#BSC0_BASE + off, v)
+  Else
+    PokeL(#BSC1_BASE + off, v)
+  EndIf
+EndProcedure
+
+; Enable starts a fresh capture. Disable retains the records so a command can
+; read them later without touching either controller. The boot hook should
+; enable before ScreenUp and disable immediately after TouchBoot.
+Procedure I2cTraceEnable(on.i)
+  If on <> 0
+    i2c_trace_count = 0
+    i2c_trace_overflow = 0
+    i2c_trace_pending = 0
+    i2c_trace_phase = 0
+    i2c_trace_recovered = 0
+    i2c_trace_faulted = 0
+    i2c_trace_goodix = 0
+    i2c_trace_goodix_seen = 0
+    i2c_trace_milestones = 0
+    i2c_trace_on = 1
+  Else
+    i2c_trace_on = 0
+    i2c_trace_pending = 0
+    i2c_trace_goodix = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceEnabled()
+  ProcedureReturn i2c_trace_on
+EndProcedure
+
+Procedure.i I2cTraceCount()
+  ProcedureReturn i2c_trace_count
+EndProcedure
+
+Procedure.i I2cTraceOverflow()
+  ProcedureReturn i2c_trace_overflow
+EndProcedure
+
+; Pure RAM retrieval. Invalid coordinates return zero and never bring a bus
+; up, select one, or read a register.
+Procedure.i I2cTraceGet(index.i, field.i)
+  If index < 0 Or index >= i2c_trace_count
+    ProcedureReturn 0
+  EndIf
+  If field < 0 Or field >= #I2C_TRACE_FIELDS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn i2c_trace_words[index * #I2C_TRACE_FIELDS + field]
+EndProcedure
+
+Procedure I2cTracePut(index.i, field.i, value.i)
+  i2c_trace_words[index * #I2C_TRACE_FIELDS + field] = value
+EndProcedure
+
+Procedure I2cTraceCapture(edge.i, phase.i, result.i, recovered.i)
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_count >= #I2C_TRACE_MAX
+    ProcedureReturn
+  EndIf
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, edge)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, result)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, recovered)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, I2cRd(#BSC_C_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, I2cRd(#BSC_S_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, I2cRd(#BSC_DLEN_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, I2cRd(#BSC_A_OFF))
+EndProcedure
+
+; Return 1 only when this call owns a complete transaction record. Seven
+; records are required up front for BEGIN, four progress milestones, an
+; optional FAULT, and END, so a
+; full buffer cannot retain an orphan BEGIN or hide a fault for lack of room.
+Procedure.i I2cTraceBegin(phase.i)
+  If i2c_trace_on = 0 Or phase <= 0
+    ProcedureReturn 0
+  EndIf
+  If i2c_trace_pending <> 0
+    i2c_trace_overflow = 1
+    ProcedureReturn 0
+  EndIf
+  If i2c_trace_count > #I2C_TRACE_MAX - 7
+    i2c_trace_overflow = 1
+    ProcedureReturn 0
+  EndIf
+  i2c_trace_pending = 1
+  i2c_trace_phase = phase
+  i2c_trace_recovered = 0
+  i2c_trace_faulted = 0
+  i2c_trace_milestones = 0
+  I2cTraceCapture(#I2C_TRACE_EDGE_BEGIN, phase, 0, 0)
+  ProcedureReturn 1
+EndProcedure
+
+; Retain the first observation of a transaction milestone using only the
+; status word the polling loop already loaded. This procedure performs no
+; MMIO access and reserves the final two slots for first FAULT and END.
+Procedure I2cTraceMilestone(edge.i, status.i)
+  Define bit.i
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_pending = 0
+    ProcedureReturn
+  EndIf
+  bit = 1 << edge
+  If (i2c_trace_milestones & bit) <> 0
+    ProcedureReturn
+  EndIf
+  If i2c_trace_count > #I2C_TRACE_MAX - 3
+    i2c_trace_overflow = 1
+    ProcedureReturn
+  EndIf
+  i2c_trace_milestones = i2c_trace_milestones | bit
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, edge)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, i2c_trace_phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, $FFFFFFFF)
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, status)
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, $FFFFFFFF)
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, $FFFFFFFF)
+EndProcedure
+
+; Preserve the decisive controller state BEFORE an error path clears sticky
+; status or invokes recovery. `status` is the word the polling loop already
+; observed; using it avoids a second S read whose value could be later. C,
+; DLEN and A remain sequential, non-atomic observations. FIFO is never read.
+Procedure I2cTraceFault(status.i, result.i)
+  Define index.i
+  If i2c_trace_on = 0 Or i2c_trace_pending = 0 Or i2c_trace_faulted <> 0
+    ProcedureReturn
+  EndIf
+  If i2c_trace_count >= #I2C_TRACE_MAX
+    i2c_trace_overflow = 1
+    ProcedureReturn
+  EndIf
+  index = i2c_trace_count
+  i2c_trace_count = i2c_trace_count + 1
+  i2c_trace_faulted = 1
+  I2cTracePut(index, #I2C_TRACE_FIELD_EDGE, #I2C_TRACE_EDGE_FAULT)
+  I2cTracePut(index, #I2C_TRACE_FIELD_PHASE, i2c_trace_phase)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RESULT, result)
+  I2cTracePut(index, #I2C_TRACE_FIELD_RECOVERED, 0)
+  I2cTracePut(index, #I2C_TRACE_FIELD_TICKS, I2cCounterTicks())
+  I2cTracePut(index, #I2C_TRACE_FIELD_C, I2cRd(#BSC_C_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_S, status)
+  I2cTracePut(index, #I2C_TRACE_FIELD_DLEN, I2cRd(#BSC_DLEN_OFF))
+  I2cTracePut(index, #I2C_TRACE_FIELD_A, I2cRd(#BSC_A_OFF))
+EndProcedure
+
+Procedure I2cTraceEnd(owned.i, result.i)
+  If owned <> 0 And i2c_trace_pending <> 0
+    I2cTraceCapture(#I2C_TRACE_EDGE_END, i2c_trace_phase, result, i2c_trace_recovered)
+    i2c_trace_pending = 0
+    i2c_trace_phase = 0
+    i2c_trace_recovered = 0
+    i2c_trace_faulted = 0
+    i2c_trace_milestones = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceReturn(owned.i, result.i)
+  I2cTraceEnd(owned, result)
+  ProcedureReturn result
+EndProcedure
+
+; Called only by I2cEnsureIdle after it has actually invoked I2cRecover.
+; 1 means recovery reached idle; -1 means it remained fail-closed.
+Procedure I2cTraceEnsureRecovered(ok.i)
+  If i2c_trace_on <> 0 And i2c_trace_pending <> 0
+    If ok <> 0
+      i2c_trace_recovered = 1
+    Else
+      i2c_trace_recovered = -1
+    EndIf
+  EndIf
+EndProcedure
+
+; HwTouchUp brackets only Gt9Begin with this window. The first identity
+; transaction at each legal address is retained; later config/frame accesses
+; are deliberately outside the boot identity trace.
+Procedure I2cTraceGoodixWindow(on.i)
+  If on <> 0
+    i2c_trace_goodix = 1
+    i2c_trace_goodix_seen = 0
+  Else
+    i2c_trace_goodix = 0
+  EndIf
+EndProcedure
+
+Procedure.i I2cTraceGoodixPhase(addr.i)
+  If i2c_trace_on = 0 Or i2c_trace_goodix = 0
+    ProcedureReturn 0
+  EndIf
+  If addr = $5D And (i2c_trace_goodix_seen & 1) = 0
+    i2c_trace_goodix_seen = i2c_trace_goodix_seen | 1
+    ProcedureReturn #I2C_TRACE_GOODIX_5D
+  EndIf
+  If addr = $14 And (i2c_trace_goodix_seen & 2) = 0
+    i2c_trace_goodix_seen = i2c_trace_goodix_seen | 2
+    ProcedureReturn #I2C_TRACE_GOODIX_14
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cSourceHz() - the clock feeding CDIV, in Hz, ASKED FOR NOW.
+;
+;  Three answers in order of honesty, and I2cSourceFrom() records which
+;  one was taken so the caller can say it out loud:
+;
+;    1. the firmware's MEASURED core clock. This is what the divider is
+;       fed by - measured on the wire, 2026-09-03, see THE CLOCK - and it
+;       is an observation rather than an intention.
+;    2. its CONFIGURED core clock, if the measurement is unavailable. The
+;       governor moves the real clock away from this, so it is second.
+;    3. the datasheet's nominal 150 MHz, if the firmware answers neither.
+;       This is the value the whole of forum 622 was about; it survives
+;       only as the answer of last resort, and only ever labelled.
+;
+;  A ZERO from the mailbox is its "I do not know" and is treated as no
+;  answer, exactly as mailbox.pi4's header says to.
+; ----------------------------------------------------------------------
+Global i2c_src_from.i
+
+Procedure.i I2cSourceHz()
+  Define hz.i
+  hz = MailboxClockRateMeasured(#MBX_CLK_CORE)
+  If hz > 0
+    i2c_src_from = #I2C_SRC_MEASURED
+    ProcedureReturn hz
+  EndIf
+  hz = MailboxClockRate(#MBX_CLK_CORE)
+  If hz > 0
+    i2c_src_from = #I2C_SRC_CONFIGURED
+    ProcedureReturn hz
+  EndIf
+  i2c_src_from = #I2C_SRC_NOMINAL
+  ProcedureReturn #I2C_CORE_NOMINAL_HZ
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cSourceFrom() - which of the three the last I2cSourceHz() took.
+;  Meaningless before the first call, which is why every caller here
+;  takes the rate first and asks this second.
+; ----------------------------------------------------------------------
+Procedure.i I2cSourceFrom()
+  ProcedureReturn i2c_src_from
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DIVIDER ARITHMETIC. FOUR PURE PROCEDURES, AND THAT IS DELIBERATE.
+;
+;  None of these reads a register, calls anything or touches a global.
+;  They take a source clock and a number and return a number, so the
+;  project's own A64 interpreter can execute them on the real built image
+;  with a flat memory and no device model - which is what
+;  tools/a64/a64_anvil_check.py does with them. The arithmetic that
+;  decides what goes on the wire is therefore the arithmetic a gate runs
+;  on every build, and the same shape as I2cTimeoutVerdict.
+;
+;  THE ROUNDING GOES THE SAFE WAY, AND IT CHANGED. The old code took
+;  src/hz and truncated, which rounds the DIVIDER down and so pushes the
+;  RATE UP - past the rate that was asked for. On a bus that is the wrong
+;  direction to be wrong in: a device rated for 100 kHz is not harmed by
+;  99,960 Hz and may well be by 100,040. So the divider is rounded UP,
+;  then up again to the next even value, and the achieved rate is at or
+;  below the requested one, always.
+; ----------------------------------------------------------------------
+
+; The fastest SCL this divider can produce from that source: CDIV = 2.
+Procedure.i I2cRateMax(src.i)
+  If src <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn src / #I2C_CDIV_MIN
+EndProcedure
+
+; And the slowest: CDIV = 65534.
+Procedure.i I2cRateMin(src.i)
+  If src <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn src / #I2C_CDIV_MAX
+EndProcedure
+
+; The rate an already-programmed divider gives. CDIV read back as 0 means
+; 32768 in the hardware (Table 30), never a divide by zero.
+Procedure.i I2cRateFor(src.i, cdiv.i)
+  If src <= 0
+    ProcedureReturn 0
+  EndIf
+  If cdiv = 0
+    cdiv = 32768
+  EndIf
+  If cdiv < 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn src / cdiv
+EndProcedure
+
+; The even divider that gives the fastest rate NOT ABOVE hz. Returns 0
+; for a nonsense argument; clamps to the field's limits, so a caller that
+; wants to refuse an unreachable rate must compare against I2cRateMin and
+; I2cRateMax first rather than reading a clamp as a failure.
+Procedure.i I2cCdivFor(src.i, hz.i)
+  Define cdiv.i
+  If src <= 0 Or hz <= 0
+    ProcedureReturn 0
+  EndIf
+  cdiv = (src + hz - 1) / hz          ; round the divider UP - see above
+  If (cdiv & 1) <> 0
+    cdiv = cdiv + 1                   ; Table 30: even, and up not down
+  EndIf
+  If cdiv < #I2C_CDIV_MIN
+    cdiv = #I2C_CDIV_MIN
+  EndIf
+  If cdiv > #I2C_CDIV_MAX
+    cdiv = #I2C_CDIV_MAX
+  EndIf
+  ProcedureReturn cdiv
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cSetDiv(cdiv) / I2cGetDiv() - the register, plainly.
+;
+;  Separated from the rate so an instrument can program a KNOWN divider
+;  and measure what comes out of the pin, which is how the source clock
+;  above was established. Nothing in the ordinary path calls I2cSetDiv
+;  with a number it did not get from I2cCdivFor.
+; ----------------------------------------------------------------------
+Procedure I2cSetDiv(cdiv.i)
+  a64_barrier()
+  I2cWr(#BSC_DIV_OFF, cdiv & $FFFF)
+  a64_barrier()
+EndProcedure
+
+Procedure.i I2cGetDiv()
+  Define cdiv.i
+  a64_barrier()
+  cdiv = I2cRd(#BSC_DIV_OFF) & $FFFF
+  a64_barrier()
+  ProcedureReturn cdiv
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cSetSpeed(hz) - program CDIV for the fastest SCL not above hz, from
+;  the clock the divider is ACTUALLY fed by right now. Returns the
+;  achieved rate in Hz, or:
+;
+;    #I2C_ARG    hz was not a positive number of hertz
+;    #I2C_RANGE  hz is outside what the divider can reach from that clock
+;
+;  A REFUSAL RATHER THAN A CLAMP, and that is the point of the new code.
+;  Asking for 2 kHz on a bus whose slowest is 7.6 kHz used to silently
+;  give 7.6 kHz and report it as if it had been asked for. The caller now
+;  gets #I2C_RANGE and can name the nearest reachable rate from
+;  I2cRateMin / I2cRateMax, which are computed from the same source in
+;  the same call.
+;
+;  The DEL register's edge delays must stay below CDIV/2 (Table 31 note);
+;  the reset DEL (0x0030:0x0030) is 48, which is below CDIV/2 for every
+;  CDIV from 98 upwards - so it holds for any rate this driver will
+;  program below source/98, and the fast end of the range is where a
+;  future DEL adjustment would belong. Left at reset, and said out loud.
+; ----------------------------------------------------------------------
+Procedure.i I2cSetSpeed(hz.i)
+  Define cdiv.i
+  Define src.i
+  If hz <= 0
+    ProcedureReturn #I2C_ARG
+  EndIf
+  src = I2cSourceHz()
+  If hz > I2cRateMax(src) Or hz < I2cRateMin(src)
+    ProcedureReturn #I2C_RANGE
+  EndIf
+  cdiv = I2cCdivFor(src, hz)
+  If cdiv <= 0
+    ProcedureReturn #I2C_ARG
+  EndIf
+  I2cSetDiv(cdiv)
+  ProcedureReturn I2cRateFor(src, cdiv)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cGetSpeed() - the SCL the divider is currently set to, computed from
+;  the source clock as it is NOW. Two calls a second apart can honestly
+;  differ without the divider having been touched, because the governor
+;  moves the clock underneath it; that is a property of this part and not
+;  a defect in this procedure.
+; ----------------------------------------------------------------------
+Procedure.i I2cGetSpeed()
+  ProcedureReturn I2cRateFor(I2cSourceHz(), I2cGetDiv())
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cInit() - mux the header pins, set the clock and stretch timeout,
+;  enable the controller. Idempotent; safe to call more than once.
+;
+;  PinAlt mux GPIO 2 and 3 to ALT0 (SDA1 / SCL1). This is the documented
+;  dependency on gpio.pi4; if that library is not linked ahead of this one
+;  the build fails on PinAlt, which is the point.
+;
+;  ***CALLING THIS IS NOT OPTIONAL AND IT IS NOT A PERFORMANCE CHOICE.***
+;  Until these two PinAlt calls have run, GPIO 2 and 3 are whatever the
+;  firmware left them as - on a Pi 4 that is plain INPUTS - and BSC1's SDA
+;  and SCL are connected to nothing at all. The controller then drives a
+;  transaction into a disconnected bus, never sees DONE, and I2cXfer times
+;  out. That timeout is indistinguishable at the register level from a bus
+;  whose lines are shorted low, which is exactly how forum 584 happened:
+;  every subcommand that skipped this procedure got a confident wiring
+;  diagnosis on a bus that was measurably idle-high and healthy. The pull
+;  state is deliberately left as the board provides it - the Pi 4 carries
+;  1.8k external pull-ups on these two pins and the weak internal ones
+;  would only fight them (see WHICH PINS in the header).
+; ----------------------------------------------------------------------
+Procedure.i I2cInit()
+  Define r.i
+  ; The SELECTED bus's pads and the SELECTED bus's alt. On bus 1 that is
+  ; GPIO 2/3 to ALT0 (SDA1/SCL1); on bus 0 it is GPIO 44/45 to ALT1
+  ; (SDA0/SCL0), the display connector's pair - and ALT1 is the number
+  ; that must not become ALT2, see THE SECOND CONTROLLER.
+  PinAlt(I2cBusSda(), I2cBusAlt())
+  PinAlt(I2cBusScl(), I2cBusAlt())
+  a64_barrier()
+  I2cWr(#BSC_CLKT_OFF, #I2C_CLKT_TOUT)
+  ; 100 kHz from whatever the divider is really fed by. A source that
+  ; cannot reach 100 kHz at all would be an extraordinary board, but the
+  ; refusal is a real return value now, so it is handled rather than
+  ; discarded: the divider is left at the slowest the field allows, which
+  ; is the safe end for a bus whose devices are unknown.
+  r = I2cSetSpeed(#I2C_DEFAULT_HZ)    ; barriers internally
+  If r < 0
+    I2cSetDiv(#I2C_CDIV_MAX)
+  EndIf
+  a64_barrier()
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)     ; enable, idle (READ=0, ST=0)
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cIsUp() - is this bus ALREADY up? 1 yes, 0 no.
+;
+;  Up means both things, not either: the two pads are on the
+;  controller's function AND the controller is enabled. Half of that is
+;  the 584 shape - a controller driving pins it is not connected to, or
+;  pins wired to a controller that is switched off - and neither half
+;  alone is a bus.
+; ----------------------------------------------------------------------
+Procedure.i I2cIsUp()
+  Define c.i
+  If I2cPinsMuxed() <> 1
+    ProcedureReturn 0
+  EndIf
+  a64_barrier()
+  c = I2cRd(#BSC_C_OFF)
+  a64_barrier()
+  If (c & #BSC_C_I2CEN) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cUp() - bring the bus up IF IT IS NOT ALREADY UP. Returns 1.
+;
+;  ***THIS IS NOT THE SAME AS CALLING I2cInit() TWICE, AND THE DIFFERENCE
+;  IS A RATE THE OPERATOR SET.*** I2cInit programs the divider to the
+;  100 kHz default - that is its job, it is how a bus comes up - so a
+;  caller that runs it before every operation quietly throws away any
+;  rate that was chosen since. Found on silicon 2026-09-03 while proving
+;  forum 622: `i2c speed 400000` really did put 400 kHz on the wire, and
+;  the very next `i2c` command line brought the bus "up" again and put it
+;  back to 100 kHz, with the command then honestly reporting 100 kHz. Two
+;  true statements and a setting that evaporated between them.
+;
+;  So: if the bus is up, leave it exactly as it is. If it is not, bring
+;  it up. The Arduino UNO Q's backend already made this distinction for
+;  the same reason ("already configured; leave the rate alone"); this
+;  board did not, and that asymmetry is what made it hard to see.
+;
+;  I2cInit() keeps its old meaning for a caller that really does want the
+;  bus reset to defaults - it is just no longer what the command path
+;  runs on every line.
+; ----------------------------------------------------------------------
+Procedure.i I2cUp()
+  If I2cIsUp() = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn I2cInit()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cPinMuxed(pin) - is that pin on ALT0 right now? 1 yes, 0 no, -1 for
+;  a pin this board does not have.
+;
+;  PinModeGet returns the RAW 3-bit FSEL code, so the comparison is
+;  against #PIN_ALT0 (which is 4 - Table 64 is out of order) and NOT
+;  against #I2C_PIN_ALT, which is the alt NUMBER PinAlt takes. Getting
+;  those two the wrong way round would compare 0 against 4 and report
+;  every muxed pin as unmuxed, so they are named differently on purpose.
+; ----------------------------------------------------------------------
+Procedure.i I2cPinMuxed(pin.i)
+  Define m.i
+  Define want.i
+  m = PinModeGet(pin)
+  If m < 0
+    ProcedureReturn -1
+  EndIf
+  ; The code wanted is the SELECTED bus's alt, translated. On bus 1 that
+  ; is #PIN_ALT0 (4), exactly as before; on bus 0 it is #PIN_ALT1 (5).
+  ; Comparing against a fixed #PIN_ALT0 would report every correctly
+  ; muxed display pin as unmuxed, which is a lie in the direction that
+  ; makes people re-seat cables.
+  want = I2cAltCode(I2cBusAlt())
+  If want < 0
+    ProcedureReturn 0
+  EndIf
+  If m = want
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cPinsMuxed() - 1 only if BOTH bus pins are on ALT0, else 0.
+;  ONE pin muxed is not a working bus; it is a half-configured one, and
+;  it must not read as ready.
+; ----------------------------------------------------------------------
+Procedure.i I2cPinsMuxed()
+  If I2cPinMuxed(I2cBusSda()) <> 1
+    ProcedureReturn 0
+  EndIf
+  If I2cPinMuxed(I2cBusScl()) <> 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cPadLevel(pin) - the level AT THE PAD: 1 high, 0 low, -1 for a bad
+;  pin. DigitalRead reads GPLEV, which on the BCM2711 reflects the pad
+;  whatever FSEL says (section 5.2, Tables 74-75) - so this reads a line
+;  the BSC is driving just as well as one left as an input, and that is
+;  precisely what it is for.
+;
+;  WHY THIS EXISTS. An I2C bus at rest is HIGH on both lines, held there
+;  by pull-up resistors. A transfer that never completes on a bus reading
+;  high has NOT got stuck lines and NOT got missing pull-ups, whatever the
+;  message used to say; a transfer that never completes with either line
+;  low genuinely has. One register read separates the two, and until this
+;  procedure existed nothing read it.
+; ----------------------------------------------------------------------
+Procedure.i I2cPadLevel(pin.i)
+  ProcedureReturn DigitalRead(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cRecover() - put the controller back the way a fresh one would be
+;  found, after a transfer that never finished.
+;
+;  ***WHY THIS EXISTS: MEASURED ON SILICON 2026-09-06, ON BSC0.*** Three
+;  identical probe commands in a row answered, timed out, answered -
+;  exactly alternating. The transfer that fails is not the one that is
+;  broken. Every run ended with a read that never completed; the sticky
+;  status bits are cleared BEFORE a transfer and nothing put the
+;  controller back after one that did not finish, so the wreckage was
+;  handed to the next command, which failed, and whose own failure left
+;  the controller in the state the one after that could use.
+;
+;  ***A DRIVER WHOSE FAILURES ALTERNATE IS WORSE THAN ONE THAT FAILS
+;  EVERY TIME.*** Every second run is green, so a bench session calls it
+;  intermittent, blames the cable, and a retry loop hides it - while half
+;  the readings it produces come off a controller in a state nobody
+;  described. That is why this is a fix in the driver and not a retry at
+;  the call site.
+;
+;  What it does follows the controller definition, the upstream BCM2835
+;  driver's warning, and one deliberately narrow silicon measurement. First
+;  write C with CLEAR and I2CEN OFF. That requests an abort and FIFO clear,
+;  but it does NOT by itself make TA fall: Linux says a non-idle read queues
+;  the abort NACK/STOP for the next time the engine is started
+;  (drivers/i2c/busses/i2c-bcm2835.c:254-260 at commit
+;  50d05c7c76c96b90462f24debacca971d2e86713).
+;
+;  Then enable the engine WITHOUT ST. Measured on BCM2711 2026-09-09, an
+;  as-found C=0/S.TA=1 controller reached TA=0/DONE=1 in 109 us after exactly
+;  C=I2CEN; no address or length register was rewritten and no new START was
+;  requested. Poll TA under the same independent wall-clock/spin bounds.
+;  Only after TA is zero is it safe to issue enabled CLEAR for any residual
+;  FIFO data, clear DONE/ERR/CLKT, and leave C enabled and idle. Clearing
+;  status earlier permits a late abort-completion DONE to contaminate the
+;  next transaction. Build-24 actually left RXD set after abort completion,
+;  so the post-idle FIFO clear is required rather than assumed.
+;
+;  It does NOT touch the divider, the slave address or the stretch timeout -
+;  a recovery that also reset the rate would throw away a rate the operator
+;  chose, which is the mistake I2cUp exists to avoid.
+;
+;  A single framed I2cXfer clears a reported NACK or clock-stretch status and
+;  returns it directly. The combined repeated-start procedure calls recovery
+;  for those errors because they can occur between its two phases, while the
+;  controller still owns a half-transaction. Recovery never changes the
+;  error returned to the caller, so NACK, CLKT and timeout remain distinct.
+; ----------------------------------------------------------------------
+Procedure.i I2cRecover()
+  Define s.i
+  Define spin.i
+  Define deadline.i
+
+  a64_barrier()
+  I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)
+  ; A disabled engine preserves the queued abort. I2CEN alone advances it;
+  ; ST deliberately remains zero so recovery cannot launch an address phase.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
+
+  spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_RECOVER_TIMEOUT_US)
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+    If (s & #BSC_S_TA) = 0
+      Break
+    EndIf
+    spin = spin - 1
+  Until I2cWaitExpired(deadline, spin) <> 0
+
+  If (s & #BSC_S_TA) <> 0
+    ; Restore disabled/fail-closed after the bounded no-ST enable attempt. A
+    ; caller already returning an error must not launch over active TA.
+    I2cWr(#BSC_C_OFF, 0)
+    i2c_recover_failed = 1
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  ; The measured completion retained RXD. Clear both FIFOs only after the
+  ; observed TA-low state, then clear the abort's sticky status separately.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)
+  I2cWr(#BSC_S_OFF, #BSC_S_DONE | #BSC_S_ERR | #BSC_S_CLKT)
+  ; CLEAR is a command field; spell the steady enabled-idle state explicitly.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN)
+  i2c_recover_failed = 0
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; Architectural counter access stays local so this hardware library does not
+; include another library. The counter is fixed-frequency across cache/CPU
+; regimes; zero frequency activates the independent spin fallback.
+Procedure.i I2cCounterHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i I2cCounterTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i I2cDeadlineUs(us.i)
+  Define hz.i
+  hz = I2cCounterHz()
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ; CNTFRQ is 32-bit and these internal deadlines are 20,000 us. Multiply
+  ; before division and round up: 19.2 MHz must not become 19 MHz, nor may
+  ; a valid sub-MHz counter create an immediately expired deadline.
+  ProcedureReturn I2cCounterTicks() + (hz * us + 999999) / 1000000
+EndProcedure
+
+Procedure.i I2cDeadlinePassed(deadline.i)
+  If deadline = 0
+    ProcedureReturn 0
+  EndIf
+  ; The signed delta is wrap-safe for deadlines less than 2^63 ticks away.
+  If (I2cCounterTicks() - deadline) >= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; A working wall clock, not CPU-dependent loop cost, decides expiry. The
+; finite iteration fallback applies only when no frequency was available.
+; A nonzero but stopped architectural counter violates the clock contract;
+; detecting that requires an independent clock, not a guessed spin duration.
+Procedure.i I2cWaitExpired(deadline.i, spinsRemaining.i)
+  If deadline <> 0
+    ProcedureReturn I2cDeadlinePassed(deadline)
+  EndIf
+  ProcedureReturn Bool(spinsRemaining <= 0)
+EndProcedure
+
+; Refuse to launch a fresh transaction over one that recovery could not make
+; idle. The common success path is one status read. A previous failed abort
+; leaves I2CEN off; only a confirmed TA-low recovery may enable it again.
+Procedure.i I2cEnsureIdle()
+  Define r.i
+  Define s.i
+  s = I2cRd(#BSC_S_OFF)
+  If i2c_recover_failed = 0 And (s & #BSC_S_TA) = 0
+    ProcedureReturn 1
+  EndIf
+  I2cTraceFault(s, #I2C_TIMEOUT)
+  r = I2cRecover()
+  I2cTraceEnsureRecovered(r)
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i I2cSnapshot(*snap)
+  If *snap = 0
+    ProcedureReturn 0
+  EndIf
+  PokeL(*snap + #I2C_SNAP_C * 4, I2cRd(#BSC_C_OFF))
+  PokeL(*snap + #I2C_SNAP_S * 4, I2cRd(#BSC_S_OFF))
+  PokeL(*snap + #I2C_SNAP_DLEN * 4, I2cRd(#BSC_DLEN_OFF))
+  PokeL(*snap + #I2C_SNAP_A * 4, I2cRd(#BSC_A_OFF))
+  PokeL(*snap + #I2C_SNAP_DIV * 4, I2cRd(#BSC_DIV_OFF))
+  PokeL(*snap + #I2C_SNAP_DEL * 4, I2cRd(#BSC_DEL_OFF))
+  PokeL(*snap + #I2C_SNAP_CLKT * 4, I2cRd(#BSC_CLKT_OFF))
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cXfer(addr, *buf, n, isRead) - ONE framed transaction. The engine
+;  behind I2cWrite / I2cRead / I2cProbe. Returns #I2C_OK or an error code.
+;
+;  The shape is the datasheet's (section 3.3, generalised to 7-bit):
+;    clear the sticky S bits, set A, set DLEN, then one write to C with
+;    I2CEN + CLEAR + ST (+ READ for a read). Then poll S: feed or drain the
+;    FIFO as TXD/RXD allow, watch ERR and CLKT, and stop on DONE.
+;
+;  ERR AND CLKT ARE CHECKED BEFORE DONE each spin, because a NACK is the
+;  answer we most want to report precisely and it can be set in the same
+;  status word as DONE. The spin backstop is reset on every byte of
+;  progress (see THE WALL-CLOCK BACKSTOP), so it bounds the wait per byte.
+;
+;  addr is a 7-bit address (0..0x7f). n must be >= 1 - a zero-length
+;  transfer is refused here (#I2C_ARG); I2cProbe does its no-data check
+;  with a 1-byte read, not a zero-length transfer, because zero-length
+;  transfers on this controller family are exactly the unreliable corner
+;  the RP2040/RP2350 history warns about.
+; ----------------------------------------------------------------------
+Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
+  Define s.i
+  Define i.i
+  Define ctl.i
+  Define spin.i
+  Define deadline.i
+
+  If n < 1 Or addr < 0 Or addr > $7F
+    ProcedureReturn #I2C_ARG
+  EndIf
+  If I2cEnsureIdle() = 0
+    ProcedureReturn #I2C_TIMEOUT
+  EndIf
+
+  a64_barrier()
+  ; Clear any leftover ERR / CLKT / DONE from a previous transaction, so
+  ; this one's status is its own (all three are write-1-to-clear).
+  I2cWr(#BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+  I2cWr(#BSC_A_OFF, addr & $7F)
+  I2cWr(#BSC_DLEN_OFF, n & $FFFF)
+
+  ctl = #BSC_C_I2CEN | #BSC_C_CLEAR | #BSC_C_ST
+  If isRead <> 0
+    ctl = ctl | #BSC_C_READ
+  EndIf
+  I2cWr(#BSC_C_OFF, ctl)
+
+  i = 0
+  spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+
+    ; --- the two hardware failures, most specific first ---------------
+    If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
+      I2cWr(#BSC_S_OFF, #BSC_S_ERR)   ; clear it
+      a64_barrier()
+      ProcedureReturn #I2C_NACK
+    EndIf
+    If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
+      I2cWr(#BSC_S_OFF, #BSC_S_CLKT)
+      a64_barrier()
+      ProcedureReturn #I2C_CLKT
+    EndIf
+
+    ; --- move a byte if the FIFO is ready and there is one to move ----
+    If isRead <> 0
+      If i < n And (s & #BSC_S_RXD) <> 0
+        I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
+        PokeA(*buf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
+        i = i + 1
+        spin = #I2C_SPIN_MAX          ; progress - reset the backstop
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+        Continue
+      EndIf
+    Else
+      If i < n And (s & #BSC_S_TXD) <> 0
+        I2cTraceMilestone(#I2C_TRACE_EDGE_TX, s)
+        I2cWr(#BSC_FIFO_OFF, PeekA(*buf + i) & $FF)
+        i = i + 1
+        spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+        Continue
+      EndIf
+    EndIf
+
+    ; --- finished? ----------------------------------------------------
+    If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
+      If isRead <> 0
+        ; DONE can be set with bytes still sitting in the FIFO - drain
+        ; whatever is left before declaring the count short.
+        While i < n And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+          PokeA(*buf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
+          i = i + 1
+        Wend
+      EndIf
+      If i < n
+        I2cTraceFault(s, #I2C_TIMEOUT)
+      EndIf
+      I2cWr(#BSC_S_OFF, #BSC_S_DONE)
+      a64_barrier()
+      If i < n
+        ; Controller says done but we did not move every byte. Not a NACK
+        ; and not a stretch - treat as a wedged/short transfer so it is
+        ; never mistaken for success.
+        i2c_timeouts = i2c_timeouts + 1
+        I2cRecover()
+        ProcedureReturn #I2C_TIMEOUT
+      EndIf
+      ProcedureReturn #I2C_OK
+    EndIf
+
+    ; --- the wall-clock backstop -------------------------------------
+    spin = spin - 1
+    If I2cWaitExpired(deadline, spin) <> 0
+      I2cTraceFault(s, #I2C_TIMEOUT)
+      a64_barrier()
+      i2c_timeouts = i2c_timeouts + 1
+      I2cRecover()
+      ProcedureReturn #I2C_TIMEOUT
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cWrite(addr, *buf, n) - write n bytes to the device. One transaction:
+;  START, address+W, the bytes, STOP. Returns #I2C_OK or an error code.
+; ----------------------------------------------------------------------
+Procedure.i I2cWrite(addr.i, *buf, n.i)
+  ProcedureReturn I2cXfer(addr, *buf, n, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cRead(addr, *buf, n) - read n bytes from the device. One transaction:
+;  START, address+R, n bytes in, STOP. Returns #I2C_OK or an error code.
+; ----------------------------------------------------------------------
+Procedure.i I2cRead(addr.i, *buf, n.i)
+  ProcedureReturn I2cXfer(addr, *buf, n, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cWriteRead(addr, *wbuf, wn, *rbuf, rn) - ONE transaction with a
+;  REPEATED START in the middle: START, address+W, wn bytes, Sr,
+;  address+R, rn bytes, STOP. No STOP between the two halves.
+;
+;  Returns #I2C_OK or an error code.
+;
+;  ---- WHY THIS EXISTS NOW, WHEN THE HEADER SAYS IT DOES NOT -----------
+;
+;  It said: "A device that REQUIRES a repeated START ... will misbehave,
+;  and this driver does not offer it", and named section 3.3.2 as the
+;  reference to build this against when there is a Pi 4 to test on. There
+;  is one, and there is now a device that requires Sr: the Goodix GT9xx
+;  touch controller on the display connector's bus. Its register pointer
+;  is 16 bits, written as two bytes, and A STOP AFTER THOSE TWO BYTES
+;  MAKES IT FORGET THEM - the subsequent read then returns whatever the
+;  pointer happens to be aimed at, which is real data at a wrong address
+;  and looks exactly like a working driver reading a wrong-looking panel.
+;  RaspberryPi4/Lib/touch_goodix.pi4's header carries the same warning
+;  from the other side, and RP2350/Lib/gt911.pico2:372-400 hit it first on
+;  a different part.
+;
+;  The two-transaction path stays exactly as it was and is still the right
+;  call for an EEPROM or a common sensor. This is the addition, not a
+;  replacement, and I2cWrite / I2cRead are untouched.
+;
+;  ---- THE RECIPE IS THE UPSTREAM DRIVER'S POLLED EQUIVALENT ------------
+;
+;  BCM2711 ARM Peripherals section 3.3.2 "Reading" (page 30) writes the
+;  procedure out for a 10-bit address, where the low eight bits of the
+;  address are themselves the "write" phase. Steps 5 to 7 are the part
+;  that matters and they are address-width agnostic:
+;
+;     5. Poll the I2CS.TA bit, waiting for the transfer to start
+;     6. Write the number of data bytes to read to the I2CDLEN register
+;     7. Set I2CC.READ = 1 and I2CC.ST = 1, this will send the repeat
+;        start bit, the slave address and the R/W bit (which is 1),
+;        initiating the read
+;
+;  There is a silicon-specific catch which that recipe does not make
+;  obvious. Linux's BCM2835/BCM2711 driver documents the controller state
+;  machine workaround and does NOT preload the FIFO. It starts the write
+;  empty, lets TXW prove the transfer is active, fills as much as TXD
+;  permits, and queues the read immediately when the last write byte has
+;  been put in the FIFO. Primary implementation reference:
+;
+;    Linux 50d05c7c76c96b90462f24debacca971d2e86713
+;    drivers/i2c/busses/i2c-bcm2835.c:209-300
+;    https://github.com/torvalds/linux/blob/50d05c7c76c96b90462f24debacca971d2e86713/drivers/i2c/busses/i2c-bcm2835.c#L209-L300
+;
+;  Waiting only for TA after PRELOADING is not equivalent. It can ask for
+;  READ before the controller has entered the TXW hold which makes the
+;  repeated-start transition reliable. That exact old sequence timed out
+;  on the Pi 4 display bus while ordinary STOP-separated MCU transfers
+;  still worked.
+;
+;  ---- WHY wn IS NOT CAPPED AT THE FIFO DEPTH --------------------------
+;
+;  TXW/TXD are the flow control. Long writes refill the FIFO on later TXW
+;  observations; short Goodix register pointers fit on the first one. The
+;  read is queued in the SAME TXW handling step that enqueues the last byte,
+;  just as the upstream interrupt handler does. Waiting for a second TXW or
+;  FIFO-empty indication can lose the active window and emit a STOP.
+;
+;  ---- THE ONE RACE, AND IT IS NAMED RATHER THAN IGNORED ---------------
+;
+;  If the write phase were to finish entirely before we observe TXW, the
+;  controller would have emitted a STOP and step 7 would begin a fresh
+;  transaction - a plain read, with no Sr, which is precisely the silent
+;  wrong answer this procedure exists to prevent. So the TXW wait ALSO
+;  watches DONE, and DONE-before-the-read returns #I2C_NOSR and reads
+;  nothing. DONE is checked before TXW, matching the upstream handler.
+;
+;  At 100 kHz a two-byte write takes about 270 microseconds and the poll
+;  is a handful of nanoseconds, so this should never fire. "Should never"
+;  is the reason it returns its own code instead of sharing one: if it
+;  ever does fire, the number says so, and nobody spends an afternoon on a
+;  touch panel that reads the wrong register.
+;
+;  A NACK on the write phase is NOT this case - a NACK sets S.ERR, which
+;  is checked first, and comes back as #I2C_NACK. Every combined-transfer
+;  error clears the FIFO/controller transaction state with I2cRecover;
+;  that preserves A, DIV and CLKT, including the selected slave address.
+; ----------------------------------------------------------------------
+Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
+  Define s.i
+  Define i.i
+  Define spin.i
+  Define deadline.i
+  Define trace.i
+  Define tracePhase.i
+  Define before.i
+
+  If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
+    ProcedureReturn #I2C_ARG
+  EndIf
+  tracePhase = I2cTraceGoodixPhase(addr)
+  trace = I2cTraceBegin(tracePhase)
+  If I2cEnsureIdle() = 0
+    ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+  EndIf
+
+  a64_barrier()
+  I2cWr(#BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+  I2cWr(#BSC_A_OFF, addr & $7F)
+
+  ; Start with an EMPTY FIFO. Linux's BCM2835 controller driver names this
+  ; as part of the repeated-start state-machine workaround. CLEAR is written
+  ; without ST and is not repeated at the phase switch.
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR)
+
+  I2cWr(#BSC_DLEN_OFF, wn & $FFFF)
+  i = 0
+  I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST)
+
+  ; The first TXW proves the un-prefilled transfer is active. Each TXW may
+  ; refill a partial FIFO. When the final byte is enqueued, queue READ|ST in
+  ; this same iteration - do not wait for another status transition.
+  spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+    If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
+    EndIf
+    If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
+    EndIf
+    If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
+      ; The write is over and a STOP went with it. Do NOT begin a plain read.
+      I2cTraceFault(s, #I2C_NOSR)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NOSR)
+    EndIf
+
+    If (s & #BSC_S_TXW) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_TX, s)
+      While i < wn
+        s = I2cRd(#BSC_S_OFF)
+        If (s & #BSC_S_ERR) <> 0
+          I2cTraceFault(s, #I2C_NACK)
+          I2cRecover()
+          ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
+        EndIf
+        If (s & #BSC_S_CLKT) <> 0
+          I2cTraceFault(s, #I2C_CLKT)
+          I2cRecover()
+          ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
+        EndIf
+        If (s & #BSC_S_DONE) <> 0
+          I2cTraceFault(s, #I2C_NOSR)
+          I2cRecover()
+          ProcedureReturn I2cTraceReturn(trace, #I2C_NOSR)
+        EndIf
+        If (s & #BSC_S_TXD) = 0
+          Break
+        EndIf
+        I2cWr(#BSC_FIFO_OFF, PeekA(*wbuf + i) & $FF)
+        i = i + 1
+        spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+      Wend
+
+      If i = wn
+        I2cWr(#BSC_DLEN_OFF, rn & $FFFF)
+        I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_ST | #BSC_C_READ)
+        I2cTraceMilestone(#I2C_TRACE_EDGE_SWITCH, s)
+        Break
+      EndIf
+    EndIf
+
+    spin = spin - 1
+    If I2cWaitExpired(deadline, spin) <> 0
+      i2c_timeouts = i2c_timeouts + 1
+      I2cTraceFault(s, #I2C_TIMEOUT)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+    EndIf
+  ForEver
+
+  ; Receive the queued repeated-start phase here. I2cXfer owns a separate
+  ; transaction from START and does not have this direction boundary.
+  i = 0
+  spin = #I2C_SPIN_MAX
+  deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+  Repeat
+    s = I2cRd(#BSC_S_OFF)
+
+    If (s & #BSC_S_ERR) <> 0
+      I2cTraceFault(s, #I2C_NACK)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_NACK)
+    EndIf
+    If (s & #BSC_S_CLKT) <> 0
+      I2cTraceFault(s, #I2C_CLKT)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_CLKT)
+    EndIf
+
+    ; RXD alone is not a phase qualifier at the queued write-to-read
+    ; boundary. On this BCM2711 it was observed only a few core-counter ticks
+    ; after READ|ST, long before a read byte could cross a 100 kHz bus; shared
+    ; FIFO turnaround is the narrow hypothesis, not yet a hardware proof.
+    ; Plain I2cXfer reads may service
+    ; RXD immediately because they do not turn this shared FIFO around.
+    ;
+    ; Match the controller's documented read-qualified conditions here:
+    ; DONE owns the short tail; RXR owns an active FIFO-threshold service.
+    ; This is the same ordering used by the upstream BCM2835 interrupt driver,
+    ; expressed as polling rather than copied from its GPL implementation.
+    If (s & #BSC_S_DONE) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_DONE, s)
+      While i < rn And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+        PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
+        i = i + 1
+      Wend
+      If i < rn
+        i2c_timeouts = i2c_timeouts + 1
+        I2cTraceFault(s, #I2C_TIMEOUT)
+        I2cRecover()
+        ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+      EndIf
+      ; More FIFO data than the caller requested is a length failure, not a
+      ; successful truncated read. Do not consume beyond *rbuf.
+      If (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+        i2c_timeouts = i2c_timeouts + 1
+        I2cTraceFault(s, #I2C_TIMEOUT)
+        I2cRecover()
+        ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+      EndIf
+      I2cWr(#BSC_S_OFF, #BSC_S_DONE)
+      a64_barrier()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_OK)
+    EndIf
+
+    If i < rn And (s & #BSC_S_RXR) <> 0
+      I2cTraceMilestone(#I2C_TRACE_EDGE_RX, s)
+      before = i
+      While i < rn And (I2cRd(#BSC_S_OFF) & #BSC_S_RXD) <> 0
+        PokeA(*rbuf + i, I2cRd(#BSC_FIFO_OFF) & $FF)
+        i = i + 1
+      Wend
+      If i > before
+        spin = #I2C_SPIN_MAX
+        deadline = I2cDeadlineUs(#I2C_PROGRESS_TIMEOUT_US)
+        Continue
+      EndIf
+    EndIf
+
+    spin = spin - 1
+    If I2cWaitExpired(deadline, spin) <> 0
+      i2c_timeouts = i2c_timeouts + 1
+      I2cTraceFault(s, #I2C_TIMEOUT)
+      I2cRecover()
+      ProcedureReturn I2cTraceReturn(trace, #I2C_TIMEOUT)
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cProbe(addr) - is a device answering at this 7-bit address?
+;
+;  Returns #I2C_OK (present - the slave drove ACK on its address), #I2C_NACK
+;  (absent - no ACK), or #I2C_CLKT / #I2C_TIMEOUT for a bus fault. It does a
+;  1-byte READ: for a read the only thing that can NACK is the ADDRESS
+;  (there is no data written to the slave for it to reject - Table 26 bit 8
+;  is "did not acknowledge its address, or a byte written to it"), so a
+;  clean 1-byte read cleanly means "the address was acknowledged". The byte
+;  read is discarded.
+;
+;  WHY THIS IS NOT A PHANTOM. Presence is address-ACK, never idle lines: a
+;  bus with pull-ups and no device rests high, the address goes out, nobody
+;  pulls ACK low, S.ERR sets, and this returns #I2C_NACK. The RP2350's
+;  phantom device came from reading a healthy-bus status as a hit; here the
+;  only thing read as a hit is a driven ACK. (Still owed silicon - a read
+;  probe can disturb a write-only device, and i2cdetect uses a write probe
+;  for part of its range. A future `i2c probe` may want both modes; this
+;  one read-probes, which is safe for the common sensor/EEPROM case and is
+;  what -r on i2cdetect does.)
+; ----------------------------------------------------------------------
+Procedure.i I2cProbe(addr.i)
+  Define b.i
+  b = 0
+  ProcedureReturn I2cXfer(addr, @b, 1, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  I2cTimeoutCount() - wedged-bus timeouts since boot. Non-zero points at
+;  wiring or pull-ups rather than a missing chip.
+; ----------------------------------------------------------------------
+Procedure.i I2cTimeoutCount()
+  ProcedureReturn i2c_timeouts
+EndProcedure

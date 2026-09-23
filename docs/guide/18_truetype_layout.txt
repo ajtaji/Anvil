@@ -1,0 +1,34 @@
+@CHAPTER TrueType pair positioning and line layout
+@INTRO T6 adds bounded legacy kern and GPOS PairPos lookup to the TrueType engine, then lays out UTF-8 glyph runs into caller-owned fixed-point positions. The layer remains independent of the display and Vulkan atlas.
+
+@SECTION Open and close order
+
+Open the font with `AnvilTrueTypeOpen`, then open metrics, cmap, outlines, kern, and GPOS in that order. `AnvilTrueTypeSlotSelect` performs this parser lifecycle for resident fonts. Close in reverse dependency order; the slot layer closes GPOS and kern before outlines, cmap, metrics, and T0. Every module binds itself to the T0 revision and refuses stale table pointers after a later open or close.
+
+`AnvilTrueTypeKernOpen` reads version-0 horizontal format-0 pairs. `AnvilTrueTypeGposOpen` selects the `kern` feature from the `latn` script, or `DFLT` when no Latin script is present, and supports PairPos formats 1 and 2 plus extension lookup type 9. PairPos class definitions and coverage are bounded and validated before lookup. Multiple selected GPOS lookups accumulate in LookupList order.
+
+@SECTION Pair values and fallback
+
+`AnvilTrueTypeGposPair(left, right, values)` writes eight signed design-unit values in this order: x/y placement and x/y advance for the first glyph, followed by the same four values for the second glyph. The output pointer addresses eight native integers. Keeping both advances separate lets layout apply the first value after the left glyph and the second after the right glyph.
+
+`AnvilTrueTypePairPosition` uses the GPOS kern feature when the face has one. A matching GPOS pair is returned as eight values; a miss returns eight zeros and does not apply legacy kern. If the font has no selected GPOS kern feature, the horizontal legacy `kern` value is returned as the first glyph's xAdvance. This face-level source choice avoids double kerning.
+
+Device and variation records are range-checked but their pixel-dependent deltas are not evaluated. Lookups with nonzero LookupFlags and unsupported pair-position formats are reported by `AnvilTrueTypeGposError` as unsupported. Layout keeps drawing with zero pair adjustment and suppresses legacy fallback for that selected feature. Malformed table structure still makes GPOS open fail. Mark attachment, cursive positioning, script-specific shaping outside the selected Latin/default feature, ligatures, bidi, and vertical layout are not implemented here.
+
+@SECTION UTF-8 layout
+
+`AnvilTrueTypeLayoutUtf8(text, byteCount, pixelHeight, maxWidth, lineHeight, glyphOut, xOut, yOut, advanceOut, alignment, capacity, glyphCountOut, lineCountOut, measuredWidthOut)` decodes strict UTF-8 through cmap and writes glyph IDs, x positions, y positions, and advances to caller-owned arrays. The current bounded scratch capacity is 2,048 glyphs. Pixel height is limited to 512; line height to 4,096 pixels; wrap width to 32,767 pixels. The output arrays each need room for `capacity` native integers.
+
+Positions and advances are signed 16.16 pixel values. x is relative to the start of the line; y is positive upward from the baseline. The first line baseline is zero, and later baselines move down by `lineHeight`. Raster bitmap bearings are applied by the renderer when placing the glyph mask. Left, center, and right alignment use `alignment` values 0, 1, and 2. The measured width is the widest positioned line before alignment.
+
+Soft wrapping occurs at glyph boundaries using the actual signed pair advances; a pair is omitted when its glyphs would land on separate lines. CR and LF create hard line breaks, with CRLF counted once. This is a bounded horizontal glyph-run layout, not word wrapping or full text shaping. Callers should rasterize and cache the returned glyph IDs separately.
+
+@SECTION Emitted proof
+
+`tools/truetype_t6_check.py` compiles `RaspberryPi4/Tests/truetype_t6_gate.pi4` with `EnableExplicit`. The synthetic sfnt checks PairPos formats 1 and 2 across two lookups, exact value1/value2 positions and advances, wrapping after pair adjustment, center alignment, CRLF and repeated/trailing hard breaks, legacy-kern selection, unsupported-feature behavior, and malformed class rejection. A compiled source mutant that overwrites rather than accumulates lookup values is rejected. Results are recorded in `_work/truetype-tests-20260918/t6-gate.txt`.
+
+These emitted fixtures prove the covered tables and layout cases. They do not establish browser-grade shaping, device adjustments, or layout behavior for every script and font.
+
+@SECTION Format references
+
+The [OpenType GPOS specification](https://learn.microsoft.com/en-us/typography/opentype/spec/gpos) defines PairPos formats 1 and 2 and the ValueRecord fields. The [OpenType `kern` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/kern) defines the supported legacy pair format.

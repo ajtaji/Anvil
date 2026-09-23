@@ -1,0 +1,390 @@
+; ======================================================================
+; pi4HidTiming.pi4 - WHERE THE FIFTEEN SECONDS GO.
+; ----------------------------------------------------------------------
+; The BCM2711 watchdog cannot be armed beyond PM_WDOG_MAX_TICKS
+; $000FFFFF, about 15.999 s - RaspberryPi4/Lib/safety.pi4:434 and the
+; U-Boot driver it quotes. So "arm a longer deadman" is not a lever that
+; exists, and an enumeration that does not fit inside fifteen seconds is
+; an enumeration that can never be measured on this board: it reboots
+; mid-run with nothing printed.
+;
+; This program does not fix that. It MEASURES it. Every phase of
+; HidFindAndAttachAll is performed here by hand, out of the same public
+; calls the library uses, with a millisecond stamp printed AND DRAINED
+; before the next phase starts. If the board resets halfway, the
+; transcript still names the phase that was running when it did - which
+; is the whole point, and is why nothing here is buffered.
+;
+; It also prints, after every control transfer on a HID interface, the
+; controller's own view of endpoint 0 - XhciEpState(1). xHCI 1.1 section
+; 4.8.3: a Stall on an endpoint moves it to the HALTED state, and a
+; halted endpoint accepts no further transfers until a Reset Endpoint
+; command runs. Linux says the same thing at rpi-6.12.y_xhci.c:3199-3201
+; - "The host side of the halt should already be cleared by a reset
+; endpoint command issued when the STALL event was received." A stack
+; that ignores a stall therefore does not lose one transfer, it loses
+; every transfer after it, and the symptom is a timeout rather than an
+; error. The state codes are xhci.h's: 0 disabled, 1 running, 2 HALTED,
+; 3 stopped, 4 error.
+;
+; DIAGNOSTIC. Never shipped - RULES.md rule 19.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+
+Global g_hz.i  = 0
+Global g_run.i = 0    ; CNTPCT at the start of Main, so every stamp is
+                      ; also an absolute position in the budget.
+
+Procedure.i NowMs()
+  If g_hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn ((Ticks() - g_run) * 1000) / g_hz
+EndProcedure
+
+Procedure.i MsSince(t0.i)
+  If g_hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn ((Ticks() - t0) * 1000) / g_hz
+EndProcedure
+
+; One measured phase, printed as "  +NNNN ms  label  took NNNN ms".
+; DRAINED, always. A line still sitting in the UART FIFO when the
+; watchdog fires is a line that never existed.
+Procedure Stamp(*label, t0.i)
+  UartWriteStr("  +")
+  PrintDec(NowMs())
+  UartWriteStr(" ms  ")
+  UartWriteStr(*label)
+  UartWriteStr("  took ")
+  PrintDec(MsSince(t0))
+  UartWriteStr(" ms")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Note(*label, v.i)
+  UartWriteStr("           ")
+  UartWriteStr(*label)
+  PrintDec(v)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; Endpoint 0's state as the CONTROLLER sees it, not as we hope it is.
+Procedure Ep0(*label)
+  Define s.i
+  s = XhciEpState(1)
+  UartWriteStr("           ep0 state ")
+  PrintDec(s)
+  UartWriteStr(" after ")
+  UartWriteStr(*label)
+  If s = 2
+    UartWriteStr("   <-- HALTED")
+  EndIf
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; One HID interface, walked by hand with a stamp on every transfer.
+; This is HidAttach's sequence, not an approximation of it - the point
+; is to find which of its transfers is expensive and which one halts
+; endpoint zero.
+; ----------------------------------------------------------------------
+Procedure ProbeIface(slot.i, skipIface.i)
+  Define t.i
+  Define n.i
+  Define h.i
+
+  t = Ticks()
+  h = HidAttach(slot, 0, skipIface)
+  Stamp("HidAttach", t)
+  If h = 0
+    UartWriteStr("           refused: ")
+    UartWriteStr(HidErrorText())
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+  Note("handle    ", h)
+  Note("interface ", HidInterface(h))
+  Note("protocol  ", HidProtocol(h))
+  Note("bInterval ", HidInterval(h))
+  Note("idle ok   ", HidIdleAccepted(h))
+  Ep0("attach")
+
+  t = Ticks()
+  n = HidPoll(h)
+  Stamp("GET_REPORT", t)
+  Note("returned  ", n)
+  If n < 0
+    UartWriteStr("           xhci: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    UartDrain()
+  EndIf
+  Ep0("GET_REPORT")
+  ProcedureReturn h
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RE-POLL AN INTERFACE THAT ALREADY ANSWERED, AFTER ANOTHER ONE HAS BEEN
+; TOUCHED. This is the whole experiment.
+;
+; Endpoint zero is SHARED by every interface on a device. xHCI 1.1
+; section 4.8.3: a Stall moves an endpoint to the HALTED state, and the
+; controller then refuses to execute anything more on that ring until a
+; Reset Endpoint command runs - see rpi-6.12.y_xhci_ring.c:2345-2360,
+; "xhci internal endpoint state will go to a 'halt' state for any
+; stall, including default control pipe protocol stall".
+;
+; So if a stall on interface 1's SET_IDLE leaves endpoint 0 halted, then
+; interface 0 - which was answering GET_REPORT in 2 ms a moment earlier
+; - stops answering as well. That is a completely different fault from
+; "this interface does not implement GET_REPORT", and both look
+; identical from outside: one transfer that timed out.
+; ----------------------------------------------------------------------
+Procedure RePoll(h.i, *label)
+  Define t.i
+  Define n.i
+  If h = 0
+    ProcedureReturn
+  EndIf
+  t = Ticks()
+  n = HidPoll(h)
+  Stamp(*label, t)
+  Note("returned  ", n)
+  If n < 0
+    UartWriteStr("           xhci: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    UartDrain()
+  EndIf
+  Ep0("re-poll")
+EndProcedure
+
+Procedure Main()
+  Define t.i
+  Define port.i
+  Define slot.i
+  Define speed.i
+  Define n.i
+  Define cls.i
+  Define proto.i
+  Define hubSlot.i
+  Define hubRoot.i
+  Define hp.i
+  Define h1.i
+  Define h2.i
+
+  If TimerInit() <> 0
+    g_hz = TickHz()
+  EndIf
+  g_run = Ticks()
+
+  PrintNl()
+  UartWriteStr("=== pi4HidTiming - where the enumeration budget goes ===")
+  PrintNl()
+  UartDrain()
+
+  ; PcieInit AND PcieEnumerate, both, before XhciInit. xhci.pi4's header
+  ; says plainly that it does not bring the link up itself, and a probe
+  ; that skips these does not fail cleanly: PcieInit's adopt path is
+  ; where RC_BAR2's inbound offset is zeroed, and with U-Boot's
+  ; $4_0000_0000 still in it the controller cannot reach our memory at
+  ; all - every transfer is queued, doorbelled and never completed.
+  ; That is exactly the "no event of the expected type arrived" this
+  ; program was written to explain, so leaving them out would have
+  ; produced the answer the file was looking for and it would have been
+  ; the wrong one.
+  ; WHICH PATH PcieInit TAKES IS THE DIFFERENCE BETWEEN 0 ms AND 10.9 s,
+  ; so it is recorded rather than inferred. PcieInit adopts a link the
+  ; firmware already trained and returns immediately; if the link reads
+  ; down it asserts PERST and brings it up itself, and on this board
+  ; that path was measured at 10902 ms - most of a watchdog budget, for
+  ; a sequence whose own delay() calls add up to about 202 ms.
+  ; THE FIRST READ OF THIS REGISTER IN A FRESH PROGRAM IS THE WHOLE
+  ; DIFFERENCE, and the two reads below are printed side by side so that
+  ; nobody has to take that on trust. Measured 2026-08-28: an image that
+  ; called PcieInit() as its first PCIe access spent 10902 ms in it;
+  ; the same image with ONE PcieLinkUp() call in front spent 0 ms. If
+  ; read 1 and read 2 differ here, the first read is the reason - and
+  ; PcieInit believing the link is down is what sends it down the PERST
+  ; path it should never take on a board that boots from USB.
+  Note("PCIE_STATUS read 1      ", PcieRcPeek(#PCIE_MISC_PCIE_STATUS))
+  Note("PCIE_STATUS read 2      ", PcieRcPeek(#PCIE_MISC_PCIE_STATUS))
+  Note("link up before PcieInit ", PcieLinkUp())
+  t = Ticks()
+  If PcieInit() = 0
+    Stamp("PcieInit FAILED", t)
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("PcieInit", t)
+  Note("adopted an existing link ", PcieAdopted())
+
+  t = Ticks()
+  If PcieEnumerate() = 0
+    Stamp("PcieEnumerate FAILED", t)
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("PcieEnumerate", t)
+
+  t = Ticks()
+  If XhciInit() = 0
+    Stamp("XhciInit FAILED", t)
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Stamp("XhciInit", t)
+
+  hubSlot = 0
+  hubRoot = 0
+
+  ; ---- the root ports.
+  port = 1
+  While port <= XhciMaxPorts()
+    t = Ticks()
+    If XhciPortConnected(port) = 0
+      port = port + 1
+      Continue
+    EndIf
+    UartWriteStr("  root port ")
+    PrintDec(port)
+    UartWriteStr(" connected")
+    PrintNl()
+    UartDrain()
+
+    t = Ticks()
+    If XhciPortReset(port) = 0
+      Stamp("  XhciPortReset FAILED", t)
+      port = port + 1
+      Continue
+    EndIf
+    Stamp("  XhciPortReset", t)
+    speed = XhciPortSpeed(port)
+
+    t = Ticks()
+    slot = XhciEnableSlot()
+    Stamp("  XhciEnableSlot", t)
+    If slot = 0
+      port = port + 1
+      Continue
+    EndIf
+
+    t = Ticks()
+    If XhciAddressDevice(slot, port, speed) = 0
+      Stamp("  XhciAddressDevice FAILED", t)
+      port = port + 1
+      Continue
+    EndIf
+    Stamp("  XhciAddressDevice", t)
+
+    t = Ticks()
+    n = XhciGetDescriptor(#HID_DT_DEVICE, 0, 0, 8)
+    Stamp("  GET_DESCRIPTOR device 8", t)
+    Note("bytes     ", n)
+    If n < 8
+      port = port + 1
+      Continue
+    EndIf
+    cls   = PeekA(XhciBounceAddr() + 4)
+    proto = PeekA(XhciBounceAddr() + 6)
+    Note("bDeviceClass ", cls)
+
+    If cls = 9
+      t = Ticks()
+      If XhciSetConfiguration(1) = 0
+        Stamp("  hub SET_CONFIGURATION FAILED", t)
+        port = port + 1
+        Continue
+      EndIf
+      Stamp("  hub SET_CONFIGURATION", t)
+
+      t = Ticks()
+      If XhciHubAttach(slot, port, proto) = 0
+        Stamp("  XhciHubAttach FAILED", t)
+        port = port + 1
+        Continue
+      EndIf
+      Stamp("  XhciHubAttach", t)
+      hubSlot = slot
+      hubRoot = port
+    Else
+      ProbeIface(slot, -1)
+    EndIf
+    port = port + 1
+  Wend
+
+  If hubSlot = 0
+    UartWriteStr("no hub found - nothing more to time.")
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  t = Ticks()
+  XhciHubSettle()
+  Stamp("XhciHubSettle", t)
+  Note("hub ports ", XhciHubPorts())
+
+  hp = 1
+  While hp <= XhciHubPorts()
+    t = Ticks()
+    If XhciHubPortConnected(hp) <> 1
+      hp = hp + 1
+      Continue
+    EndIf
+    UartWriteStr("  hub port ")
+    PrintDec(hp)
+    UartWriteStr(" connected")
+    PrintNl()
+    UartDrain()
+
+    t = Ticks()
+    slot = XhciAddressBehindHub(hp)
+    Stamp("  XhciAddressBehindHub", t)
+    If slot = 0
+      UartWriteStr("           refused: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      UartDrain()
+      hp = hp + 1
+      Continue
+    EndIf
+
+    ; BOTH interfaces of the composite device, then the FIRST one again.
+    ; Attaching the second is what issues SET_PROTOCOL and SET_IDLE on
+    ; interface 1, and the re-poll is what says whether doing so cost
+    ; interface 0 its working pipe.
+    h1 = ProbeIface(slot, -1)
+    If h1 <> 0
+      h2 = ProbeIface(slot, HidInterface(h1))
+      RePoll(h1, "GET_REPORT interface 0 AGAIN")
+      If h2 <> 0
+        RePoll(h2, "GET_REPORT interface 1 AGAIN")
+      EndIf
+    EndIf
+    hp = hp + 1
+  Wend
+
+  UartWriteStr("=== done at +")
+  PrintDec(NowMs())
+  UartWriteStr(" ms ===")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

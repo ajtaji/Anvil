@@ -1,0 +1,158 @@
+; ======================================================================
+;  mmu_secondary.pi4 - the cache-cold secondary-core join for BCM2711
+;
+;  Requires RaspberryPi4/Lib/mmu.pi4 before this file. The Pi 4 monitor now
+;  includes it for the explicit, bounded `coretest` acceptance path; boot does
+;  not activate it and no general scheduler enters it.
+;
+;  The primary getters are valid only under the pinned EL3 entry contract. The raw join is a naked,
+;  no-parameter ASM procedure.  It owns no BSS, stack, device, watchdog or
+;  console state and calls nothing.  Register ABI on entry:
+;
+;    x19 expected EL (must be 3)    x20 TTBR0_EL3
+;    x21 TCR of that EL             x22 MAIR of that EL
+;    x23 complete live SCTLR        x0..x18 scratch
+;
+;  It proves EL3, CPUECTLR_EL1.SMPEN and an as-found SCTLR with M, C and I all
+;  clear. Set/way invalidation is restricted to the core-private L1 data
+;  cache: the A72 cluster L2 is shared with the live primary and must never be
+;  selected here. It returns x0=1 only after invalidating private cold L1,
+;  installing the EL3 translation registers, invalidating the EL3 TLB and the
+;  I-cache, enabling the recorded SCTLR, and reading every register back.
+;  x19..x30 are preserved (x30 is the incoming BL return address). The
+;  private-L1 walk is independently derived from
+;  the architected CSSELR_EL1/CCSIDR_EL1/DC ISW fields and the Cortex-A72 cache
+;  topology in Arm TRM 100095 r0p3; no existing U-Boot-derived source is reused.
+;  Calling the ordinary helper would also touch a procedure frame and its
+;  static-source contract is not a secondary-core ABI.
+;
+;  Desk inspection can prove the instructions and order.  It cannot prove
+;  cache coherency, TLB maintenance or system-register behaviour on silicon.
+; ======================================================================
+
+Procedure.i MmuSecondaryTtbr0()
+  ASM
+    mrs  x0, ttbr0_el3
+  EndASM
+EndProcedure
+
+Procedure.i MmuSecondaryTcr()
+  ASM
+    mrs  x0, tcr_el3
+  EndASM
+EndProcedure
+
+Procedure.i MmuSecondaryMair()
+  ASM
+    mrs  x0, mair_el3
+  EndASM
+EndProcedure
+
+ProcedureNaked MmuSecondaryJoinRaw()
+  ASM
+    ; EL2 cannot safely read the implementation-defined CPUECTLR without an
+    ; exception path. This is the pinned armstub's explicit EL3-only path.
+    mrs  x9, currentel
+    lsr  x9, x9, #2
+    cmp  x9, #3
+    b.ne mmuSecJoinFail
+    cmp  x19, #3
+    b.ne mmuSecJoinFail
+
+    ; A cold record that does not request M, C and I together cannot join the
+    ; primary's cache-coherent regime. Refuse before changing any register.
+    movz x9, #4101                    ; $1005 = M | C | I
+    and  x10, x23, x9
+    cmp  x10, x9
+    b.ne mmuSecJoinFail
+
+    ; The set/way walk below DISCARDs cache contents.  That is correct for the
+    ; armstub's cache-cold parked cores and destructive for a warm caller.  Read
+    ; the current bank before any cache/TLB/translation change and refuse when
+    ; even one of M, C or I is already set.  A future warm-join path needs its
+    ; own ownership and clean protocol; it must not fall through this one.
+    mrs  x10, sctlr_el3
+    and  x10, x10, x9
+    cbnz x10, mmuSecJoinFail
+
+    ; SMPEN is required before cache/TLB maintenance or enabling M/C/I. Read
+    ; back the bit set by the pinned EL3 armstub; preserve every CPUECTLR bit.
+    mrs  x10, cpuectlr_el1
+    movz x9, #64
+    and  x10, x10, x9
+    cbz  x10, mmuSecJoinFail
+
+    ; Discard only this PE's cold private L1 data cache. CSSelR level 0 is L1;
+    ; never enumerate CLIDR/LoC, because A72 level 1 is the cluster-shared L2
+    ; that can contain dirty authoritative data owned by the running primary.
+    dsb  sy
+    movz x14, #0
+    msr  csselr_el1, x14
+    isb
+    mrs  x10, ccsidr_el1
+    movz x11, #7
+    and  x2, x10, x11
+    add  x2, x2, #4
+    lsr  x3, x10, #3
+    movz x11, #1023
+    and  x3, x3, x11
+    ; Way number occupies the high end of the set/way operand. Derive its
+    ; shift as 32-floor(log2(waysMinus1))-1 without relying on CLZ support.
+    movz x5, #32
+    mov  x9, x3
+mmuSecJoinWayShift:
+    cbz  x9, mmuSecJoinWayShiftDone
+    lsr  x9, x9, #1
+    sub  x5, x5, #1
+    b    mmuSecJoinWayShift
+mmuSecJoinWayShiftDone:
+    lsr  x4, x10, #13
+    movz x11, #32767
+    and  x4, x4, x11
+    mov  x7, x3
+mmuSecJoinInvWay:
+    mov  x6, x4
+mmuSecJoinInvSet:
+    lsl  x9, x7, x5
+    lsl  x8, x6, x2
+    orr  x8, x8, x9
+    dc   isw, x8
+    subs x6, x6, #1
+    b.ge mmuSecJoinInvSet
+    subs x7, x7, #1
+    b.ge mmuSecJoinInvWay
+    dsb  sy
+    isb
+    ic   iallu
+
+    tlbi alle3
+    dsb  sy
+    isb
+    msr  ttbr0_el3, x20
+    msr  tcr_el3, x21
+    msr  mair_el3, x22
+    dsb  sy
+    isb
+    msr  sctlr_el3, x23
+    isb
+    mrs  x9, ttbr0_el3
+    cmp  x9, x20
+    b.ne mmuSecJoinFail
+    mrs  x9, tcr_el3
+    cmp  x9, x21
+    b.ne mmuSecJoinFail
+    mrs  x9, mair_el3
+    cmp  x9, x22
+    b.ne mmuSecJoinFail
+    mrs  x9, sctlr_el3
+    cmp  x9, x23
+    b.ne mmuSecJoinFail
+
+mmuSecJoinOk:
+    movz x0, #1
+    ret
+mmuSecJoinFail:
+    movz x0, #0
+    ret
+  EndASM
+EndProcedure

@@ -1,0 +1,1662 @@
+; ======================================================================
+;  dsi - the DSI1 host, the panel, and a test pattern on the glass.
+;  Also `mmio`, the one thing the last pass on this bench went without.
+; ----------------------------------------------------------------------
+;  WHY THIS IS A BOARD FILE. Same reason touch_cmd.pi4 is: there is one
+;  board with a DSI panel, there is no HwDsi* vocabulary in hal.pi4, and
+;  designing a seam from one example gives a seam shaped like its first
+;  caller. THE PRESENCE OF THIS FILE IS THE CAPABILITY - board.pi4
+;  includes it, and a board that does not include it does not have the
+;  command.
+;
+;  REQUIRES, and board.pi4 lists them all in order ahead of this file:
+;    RaspberryPi4/Lib/timer.pi4, mailbox.pi4, clocks.pi4
+;    RaspberryPi4/Lib/gpio.pi4, i2c.pi4, dsi_panel_v2.pi4
+;    RaspberryPi4/Lib/mmu.pi4          (MmuCleanRange, for the framebuffer)
+;    RaspberryPi4/Lib/dsi_host.pi4, dsi_panel_v2_dcs.pi4, hvs.pi4
+;    Anvil/Core/parse.pbi, format.pi4  (the usual command kit)
+;
+;  ---- WHY THE SUBCOMMANDS ARE SEPARATE, AND STAY SEPARATE ------------
+;
+;  A DSI bring-up has four blocks in series - the clocks, the host and
+;  its PHY, the panel over escape mode, and then the HVS and the pixel
+;  valve - and any one of them can be perfect while the glass stays
+;  dark. Running all four from one command and looking at the screen
+;  gives exactly one bit of information about four independent things.
+;
+;  So each stage is its own subcommand with its own readback, and `dsi
+;  up` runs them in order printing each result as it goes. The point of
+;  `up` is not convenience; it is that the ORDER is not negotiable and
+;  typing it out four times is how a step gets missed.
+;
+;  ---- WHY `mmio` EXISTS ----------------------------------------------
+;
+;  `memory` defaults to byte reads, and the peripheral blocks on this
+;  part do not answer sub-word reads with register content. They answer
+;  with a block-identity string. On 2026-09-06 the old byte-assembled
+;  `memory.l` read GPFSEL4 as the ASCII "gpio" while `gpio status 44`
+;  read ALT1 out of the same register. `memory.l` now issues true 32-bit
+;  accesses; bare `memory` and `memory.b` deliberately remain byte reads.
+;
+;  `mmio` is one 32-bit load, which is what a peripheral register wants.
+;  It reads and never writes: a monitor command that can write any word
+;  to any address is a way to turn a wrong keystroke into a dead board,
+;  and every write this campaign needs is in a driver where it can be
+;  reviewed.
+; ======================================================================
+
+; The framebuffer's default home. Inside the low payload window
+; (up to $07EFFFFF; its base is above the monitor and `map` prints it - memmap.pi4), far enough in that a payload
+; at the bottom of that window does not reach it, and BELOW $40000000 -
+; which is not a preference but a requirement, because the HVS's view of
+; DRAM is the first gigabyte aliased at $C0000000 and there is no window
+; above that. 800 x 1280 x 4 is 4,096,000 bytes, so this occupies
+; $04000000..$043E7FFF.
+#DSI_FB_DEFAULT = $04000000
+
+; ----------------------------------------------------------------------
+;  DsiUsage
+; ----------------------------------------------------------------------
+Procedure DsiUsage()
+  PrintN("dsi drives the DSI1 host, the panel and the display pipe:")
+  PrintN("  dsi                    what is programmed, and what it reads back")
+  PrintN("  dsi clocks             PLLD, the divider chosen, the rates")
+  PrintN("  dsi id                 the block answers - and a readback it cannot fake")
+  PrintN("  dsi host               clocks, PHY and host enable")
+  PrintN("  dsi panel              the rails, the reset, and the DCS init table")
+  PrintN("  dsi power              Get Power Mode - a byte the PANEL composed")
+  PrintN("  dsi pattern [addr]     framebuffer, HVS and pixel valve - PICTURE")
+  PrintN("  dsi up [addr]          all of the above, in the order that works")
+  PrintN("  dsi regs               the DSI1 register block, one word each")
+  PrintN("  dsi pipe               HVS and pixel valve state, read back")
+  PrintN("  dsi off                video off, valve down, channel down")
+  PrintN("  dsi rails              the panel's rails and reset only, NO commands")
+  PrintN("  dsi poke <off> <val>   one word into the DSI1 block - an instrument")
+  PrintN("  dsi ulps               command the lanes into ULPS and back - the")
+  PrintN("                         one reading that separates PHY from ribbon")
+  PrintN("  dsi forcestop          order data lane 0 into STOP - the block's own")
+  PrintN("                         order to its own lane, no cable involved")
+  PrintN("  dsi domain             ask the FIRMWARE to power the DSI1 domain")
+  PrintN("  dsi snapshot           what the firmware left, captured on the first")
+  PrintN("                         dsi command - no writes of ours on top of it")
+  PrintN("The panel is 800x1280 portrait. The address defaults to 04000000")
+  PrintN("and must be below 40000000 - the video hardware cannot see above it.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiSayHz - a rate in Hz, then the same rate in whole MHz, because a
+;  ten-digit number is not something an eye checks against an expected
+;  value at three in the morning.
+; ----------------------------------------------------------------------
+Procedure DsiSayHz(hz.i)
+  PrintDec(hz)
+  Print(" Hz (")
+  PrintDec(hz / 1000000)
+  Print(" MHz)")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiSayStat - the lane bits of STAT, in words.
+;
+;  THESE ARE LATCHED ENTRY EVENTS, NOT LEVELS - "signalled when the lane
+;  enters the given state", vc4_dsi.c:245-252. So "STOP seen" means a
+;  lane ENTERED the stop state at some point since STAT was last cleared,
+;  and that is a statement about an EDGE.
+;
+;  WHICH MEANS THE CLEAR HAS TO HAPPEN BEFORE THE EDGE, AND FOR A DAY IT
+;  DID NOT. A lane that comes up into LP-11 and stays there enters STOP
+;  exactly ONCE, when the analogue front end leaves reset. The bring-up
+;  used to clear STAT AFTER that instant and then wait 20 ms for a
+;  transition that could no longer happen, and the empty register was
+;  read as "no lane ever reaches STOP" - which is also exactly what a
+;  healthy PHY resting in LP-11 reads as. The conclusion turned out to be
+;  right and the evidence was worthless. See [[Recurring bug shapes]],
+;  "the latch was cleared after the edge it was watching for".
+;
+;  The bring-up now clears STAT immediately BEFORE releasing the AFE and
+;  keeps BOTH windows. Empty in the first is a PHY that never drove;
+;  empty in the second only is a PHY that came up and settled, which is
+;  correct. This procedure prints whichever word it is handed, so the
+;  CALLER has to say which window it came from - and DsiHost does.
+; ----------------------------------------------------------------------
+Procedure DsiSayStat(st.i)
+  Print("  lanes reached STOP: clock ")
+  If (st & $00010000) <> 0
+    Print("yes")
+  Else
+    Print("NO")
+  EndIf
+  Print(", data0 ")
+  If (st & $01000000) <> 0
+    Print("yes")
+  Else
+    Print("NO")
+  EndIf
+  Print(", data1 ")
+  If (st & $04000000) <> 0
+    PrintN("yes")
+  Else
+    PrintN("NO")
+  EndIf
+
+  If (st & $00000800) <> 0
+    PrintN("  ERR_CONT_LP1 - contention on the LP1 line")
+  EndIf
+  If (st & $00000400) <> 0
+    PrintN("  ERR_CONT_LP0 - contention on the LP0 line")
+  EndIf
+  If (st & $00000200) <> 0
+    PrintN("  ERR_CONTROL - a data lane 0 sequence error")
+  EndIf
+  If (st & $00000100) <> 0
+    PrintN("  ERR_SYNC_ESC - an escape-mode sync error")
+  EndIf
+  If (st & $00010000) = 0 And (st & $01000000) = 0
+    PrintN("  NO LANE HAS REACHED STOP. The analogue front end is not driving")
+    PrintN("  the lanes, and nothing sent over them can start until it does.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiClocks - reads only. Safe on a board in any display state, which
+;  is why it is the first thing to type.
+; ----------------------------------------------------------------------
+Procedure DsiClocks()
+  DsiClocksRead()
+
+  Print("PLLD VCO       ")
+  DsiSayHz(DsiPlldVco())
+  PrintNl()
+  Print("PLLD_PER       ")
+  DsiSayHz(DsiPlldPer())
+  PrintNl()
+  Print("PLLD_DSI1 div  ")
+  PrintDec(DsiChanDiv())
+  PrintN("   (what the part holds now)")
+
+  If DsiPlldVco() = 0
+    PrintN("!! PLLD reads a PDIV of zero, so its rate cannot be computed.")
+    PrintN("   Nothing was programmed. This is a read of the part, not a failure")
+    PrintN("   to write it.")
+    ProcedureReturn
+  EndIf
+
+  DsiModePlan(70000000)
+
+  PrintNl()
+  PrintN("The plan, for the panel's 70 MHz pixel clock and two lanes:")
+  Print("  divider      ")
+  PrintDec(DsiPllDiv())
+  PrintNl()
+  Print("  link rate    ")
+  DsiSayHz(DsiPhyHz())
+  PrintNl()
+  Print("  pixel clock  ")
+  DsiSayHz(DsiPixelHz())
+  PrintNl()
+  Print("  htotal       ")
+  PrintDec(DsiHtotal())
+  Print("  (the panel asks 880; the blanking is stretched)")
+  PrintNl()
+  Print("  hsync        ")
+  PrintDec(DsiHsyncS())
+  Print(" .. ")
+  PrintDec(DsiHsyncE())
+  PrintNl()
+  Print("  refresh      ")
+  PrintDec(DsiPixelHz() / (DsiHtotal() * 1324))
+  PrintN(" Hz")
+  PrintNl()
+  PrintN("PLLD ITSELF IS NOT TOUCHED - only its DSI1 channel divider, which")
+  PrintN("nothing else on this part reads. The console cannot be taken down by")
+  PrintN("this stage.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiId - the read that proves the block answers, and then the read
+;  that proves something more than that.
+; ----------------------------------------------------------------------
+Procedure DsiId()
+  Define id.i
+  Define past.i
+
+  id   = DsiRd($8C)
+  past = DsiRd($A0)
+
+  Print("DSI1_ID at FE70008C  ")
+  PutHex8(id)
+  PrintNl()
+  Print("FE7000A0, past the end of the block  ")
+  PutHex8(past)
+  PrintNl()
+
+  If id = past
+    PrintN("THE SAME VALUE COMES BACK FROM BOTH, WHICH IS CORRECT AND EXPECTED.")
+    PrintN("   Every offset in this block that is not a claimed register answers")
+    PrintN("   with the identity string. So the ID read proves the block answers")
+    PrintN("   and nothing else - it cannot tell a live block from a dead one.")
+  EndIf
+
+  PrintNl()
+  If DsiHostProveWritable() <> 0
+    PrintN("THE BLOCK IS WRITABLE. A pattern written into a claimed timing")
+    PrintN("   register came back unchanged, so this is a live block that is")
+    PrintN("   powered and clocked, not an address that echoes.")
+  Else
+    PrintN("!! The block did NOT return what was written to a claimed register.")
+    PrintN("   That is a powered-down or absent block, whatever the ID read says.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiHost - the clocks and the PHY.
+; ----------------------------------------------------------------------
+Procedure DsiHost()
+  If DsiModePlan(70000000) = 0
+    PrintN("!! PLLD could not be read, so no divider could be chosen.")
+    PrintN("   Nothing was programmed.")
+    ProcedureReturn
+  EndIf
+
+  Print("link rate ")
+  DsiSayHz(DsiPhyHz())
+  Print(", pixel ")
+  DsiSayHz(DsiPixelHz())
+  PrintNl()
+
+  If DsiClocksSet() = 0
+    PrintN("!! A clock generator would not go idle inside its bound, or PLLD_PER")
+    PrintN("   read zero. The clocks are in an unknown state and the PHY was NOT")
+    PrintN("   brought up.")
+    ProcedureReturn
+  EndIf
+
+  Print("escape clock  ")
+  DsiSayHz(DsiEscHz())
+  Print("   (the PHY timings assume 100 MHz)")
+  PrintNl()
+  Print("PLLD_DSI1 div now  ")
+  PrintDec(DsiChanDiv())
+  PrintNl()
+
+  DsiHostBringUp()
+
+  PrintNl()
+  Print("CTRL      ")
+  PutHex8(DsiRd($00))
+  PrintNl()
+  Print("PHYC      ")
+  PutHex8(DsiRd($4C))
+  PrintNl()
+  Print("PHY_AFEC0 wanted ")
+  PutHex8(DsiAfec0Want())
+  PrintNl()
+  Print("PHY_AFEC0 read back one instruction later ")
+  PutHex8(DsiAfec0Seen())
+  PrintNl()
+  Print("PHY_AFEC0 now ")
+  PutHex8(DsiRd($70))
+  If DsiRd($70) = DsiAfec0Want() - $2000
+    PrintN("   - the composed word with RESET cleared, which is right")
+  Else
+    PrintN("   - NOT the composed word. The analog fields are not held.")
+  EndIf
+  Print("HS_DLT5   ")
+  PutHex8(DsiRd($64))
+  Print("   (the 5 ms T_INIT, in byte-clock ticks)")
+  PrintNl()
+  ; THE TWO WINDOWS, AND THEY MEAN DIFFERENT THINGS. The first is
+  ; cleared BEFORE the AFE leaves reset, so it contains the one
+  ; transition a lane coming up into LP-11 ever makes. The second is
+  ; cleared after that transition has already happened, so it is
+  ; EXPECTED to be empty and says nothing on its own. The old code took
+  ; only the second and read it as "no lane ever reaches STOP".
+  Print("STAT across the AFE release (cleared BEFORE it) ")
+  PutHex8(DsiStatRelease())
+  PrintNl()
+  DsiSayStat(DsiStatRelease())
+  Print("STAT over a later 20 ms, cleared after         ")
+  PutHex8(DsiStatSettled())
+  Print("   (empty here is normal)")
+  PrintNl()
+  Print("CTRL read back one instruction after it was written ")
+  PutHex8(DsiCtrlSeen())
+  If DsiCtrlSeen() = $00002801
+    PrintN("   - CTRL reads back, so the driver's read-modify-write was sound")
+  Else
+    PrintN("   - CTRL does NOT read back the word written to it. Every")
+    PrintN("     read-modify-write on it in the reference driver is unsafe here.")
+  EndIf
+  Print("STAT      ")
+  PutHex8(DsiRd($38))
+  PrintNl()
+  Print("INT_STAT  ")
+  PutHex8(DsiRd($30))
+  PrintNl()
+  Print("INT_EN    ")
+  PutHex8(DsiRd($34))
+  PrintNl()
+  Print("PHY_FIFO_STAT ")
+  PutHex8(DsiRd($88))
+  PrintNl()
+  Print("DISP0_CTRL ")
+  PutHex8(DsiRd($28))
+  Print("   (video mode, not yet enabled)")
+  PrintNl()
+
+  PrintNl()
+  PrintN("The host is up. THE TIMING REGISTERS READING BACK IS THE PROOF - they")
+  PrintN("are claimed registers, so a value that survives is a value the block")
+  PrintN("stored, which the identity string cannot imitate.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPanel - the panel's rails, its reset, and 200 DCS commands.
+;
+;  The bus is selected and put back here, the same contract touch_cmd
+;  uses, so the next `i2c scan` cannot report BSC0's devices under a
+;  heading naming GPIO 2 and 3.
+; ----------------------------------------------------------------------
+Procedure DsiPanel()
+  Define up.i
+  Define ok.i
+
+  If DsiIsUp() = 0
+    PrintN("!! The DSI host is not up, so there is no escape-mode path and every")
+    PrintN("   command would fail. Run `dsi host` first. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  up = I2cUp()
+  If up = 0
+    PrintN("!! The display connector's I2C bus would not come up. Nothing was done.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+
+  If DsiV2Begin() = 0
+    PrintN("!! The panel MCU at 45 did not acknowledge the power-on write.")
+    PrintN("   The panel is not powered and the init table was NOT sent.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+
+  ok = DsiPanelPrepare()
+
+  ; THE BACKLIGHT GOES BACK ON, AND IT HAS TO BE SAID OUT LOUD.
+  ; DsiV2Begin() above rewrites the whole sixteen-bit shadow to the
+  ; probe state, which CLEARS BL_EN - so a panel that was lit before this
+  ; command is dark after it unless this line runs. A perfect pattern
+  ; behind a dark backlight is indistinguishable from no pattern at all,
+  ; and it is exactly the kind of self-inflicted blank screen that gets
+  ; blamed on the ribbon.
+  If DsiV2Backlight(255) = 0
+    PrintN("!! The backlight would not go back on. Whatever the panel is showing,")
+    PrintN("   nothing will be visible.")
+    ok = 0
+  EndIf
+
+  I2cSelectBus(#I2C_BUS_HEADER)
+
+  Print("DCS commands sent   ")
+  PrintDec(DsiPanelSent())
+  Print(" of 200")
+  PrintNl()
+  Print("failed              ")
+  PrintDec(DsiPanelFailed())
+  PrintNl()
+  If DsiPanelFailAt() >= 0
+    Print("first failure at    ")
+    PrintDec(DsiPanelFailAt())
+    PrintNl()
+  EndIf
+  Print("last INT_STAT       ")
+  PutHex8(DsiLastInt())
+  PrintNl()
+  Print("last STAT           ")
+  PutHex8(DsiLastStat())
+  PrintNl()
+  If DsiPanelGaveUp() <> 0
+    Print("STOPPED EARLY after ")
+    PrintDec(#DSI_PANEL_GIVE_UP)
+    PrintN(" failures in a row - the link is carrying nothing,")
+    PrintN("   and grinding through the other 195 would only have made the board")
+    PrintN("   unreachable while it did it.")
+  EndIf
+
+  PrintNl()
+  If DsiPanelFailed() = 0 And ok <> 0
+    PrintN("Every command completed. THAT IS NOT PROOF THE PANEL HEARD THEM - the")
+    PrintN("   host will clock a packet into a disconnected ribbon and report it")
+    PrintN("   done. `dsi power` is the read that only a live panel can answer.")
+  ElseIf DsiPanelSent() = 0
+    PrintN("!! NOT ONE command completed. That is the link, not the table: either")
+    PrintN("   the PHY is not running or the escape clock is wrong.")
+  Else
+    PrintN("!! Some commands completed and some did not, which is not a pattern")
+    PrintN("   a disconnected panel produces. Read the INT_STAT bits above.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPower - DCS Get Power Mode, and this is THE measurement.
+;
+;  Every write in this campaign can succeed against a panel that is not
+;  there. A read cannot: the bus turns around, the panel drives it, and
+;  the byte that comes back was composed by the part on the other end of
+;  the ribbon. If this answers, the four differential lanes are good.
+; ----------------------------------------------------------------------
+Procedure DsiPower()
+  Define v.i
+
+  If DsiIsUp() = 0
+    PrintN("!! The DSI host is not up. Run `dsi host` first. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  v = DsiDcsRead($0A)
+
+  Print("RXPKT1H  ")
+  PutHex8(DsiLastRxPkt())
+  PrintNl()
+  Print("INT_STAT ")
+  PutHex8(DsiLastInt())
+  PrintNl()
+  Print("STAT     ")
+  PutHex8(DsiLastStat())
+  PrintNl()
+
+  If v < 0
+    PrintN("!! No byte came back.")
+    PrintN("   The panel did not answer a read. With the init table having gone")
+    PrintN("   out without error, the remaining suspect is the four differential")
+    PrintN("   lanes in the ribbon - the I2C pair is proven and they are not.")
+    ProcedureReturn
+  EndIf
+
+  Print("Power Mode = ")
+  PutHex2(v)
+  PrintNl()
+  PrintN("A BYTE CAME BACK FROM THE PANEL. The ribbon's differential lanes")
+  PrintN("   carry traffic in both directions.")
+  Print("   display on  ")
+  If (v & $04) <> 0
+    PrintN("yes (bit 2 set)")
+  Else
+    PrintN("no (bit 2 clear) - Display On has not taken effect")
+  EndIf
+  Print("   not sleeping ")
+  If (v & $10) <> 0
+    PrintN("yes (bit 4 set)")
+  Else
+    PrintN("no (bit 4 clear) - still in sleep mode")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPattern - the framebuffer, the HVS, the pixel valve, and video.
+;
+;  The order below is the driver's and it is not negotiable: HVS channel
+;  first with its list installed, then the valve configured, then the
+;  valve enabled, then the DSI video generator, then VIDEN last
+;  (vc4_crtc.c:657-703).
+; ----------------------------------------------------------------------
+Procedure DsiPattern(fb.i)
+  Define bytes.i
+
+  If DsiPlanned() = 0
+    PrintN("!! No mode has been planned, so the pixel valve has no timing to be")
+    PrintN("   given. Run `dsi host` first. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  If fb > #HVS_PHYS_MAX
+    PrintN("!! That address is above 40000000 and the video hardware cannot see")
+    PrintN("   it - its window on DRAM is the first gigabyte only. Nothing was")
+    PrintN("   done.")
+    ProcedureReturn
+  EndIf
+
+  bytes = 800 * 1280 * 4
+
+  Print("painting the pattern at ")
+  PutHex8(fb)
+  Print(", ")
+  PrintDec(bytes)
+  PrintN(" bytes")
+  HvsPattern(fb, 800, 1280)
+
+  ; Clean to the point of COHERENCY, not unification: these bytes are
+  ; going to be read by another master. With the caches off this costs a
+  ; loop and changes nothing, which is the right price for not having to
+  ; remember whether they were on.
+  MmuCleanRange(fb, bytes)
+
+  If HvsUp(fb, 800, 1280) = 0
+    PrintN("!! The HVS channel did not come out of DISABLED. The list and the")
+    PrintN("   pointer are written; the channel is not running.")
+  EndIf
+
+  Print("HVS core clock ")
+  DsiSayHz(HvsCoreHz())
+  PrintNl()
+
+  PvUp(800, DsiHsyncS(), DsiHsyncE(), DsiHtotal(), 1280, 1300, 1320, 1324)
+  PvEnable()
+  DsiVideoOn()
+  PvVideoOn()
+
+  PrintNl()
+  Print("PV_CONTROL   ")
+  PutHex8(PvRd($00))
+  PrintNl()
+  Print("PV_V_CONTROL ")
+  PutHex8(PvRd($04))
+  PrintNl()
+  Print("HVS channel mode ")
+  PrintDec(HvsChannelMode())
+  PrintN("   (0 disabled, 1 init, 2 run, 3 end of frame)")
+  Print("HVS active list  ")
+  PutHex8(HvsDlistActive())
+  Print("   (asked for ")
+  PrintDec(HvsDlistAt())
+  PrintN(")")
+  Print("line counter     ")
+  PrintDec(HvsChannelLine())
+  Print(" then ")
+  PrintDec(HvsChannelLine())
+  PrintNl()
+  Print("DSI DISP0_CTRL ")
+  PutHex8(DsiRd($28))
+  PrintNl()
+  Print("DSI STAT       ")
+  PutHex8(DsiRd($38))
+  PrintNl()
+
+  PrintNl()
+  PrintN("THE LINE COUNTER IS THE ONE THAT MATTERS. Two different numbers on")
+  PrintN("   the two reads above means the channel is scanning; the same number")
+  PrintN("   twice means it is configured and standing still.")
+  PrintNl()
+  PrintN("WHAT SHOULD BE ON THE GLASS: eight vertical colour bars - black, red,")
+  PrintN("green, blue, yellow, cyan, magenta, white - with a white two-pixel")
+  PrintN("border all the way round, a grey ramp across the bottom eighth, and a")
+  PrintN("white square in ONE corner. The square says which way up it is.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPipe - what the HVS and the valve say about themselves.
+; ----------------------------------------------------------------------
+Procedure DsiPipe()
+  Define d.i
+
+  d = HvsRd($0000)
+  Print("SCALER_DISPCTRL ")
+  PutHex8(d)
+  PrintNl()
+  Print("  HVS enabled   ")
+  If (d & $80000000) <> 0
+    PrintN("yes")
+  Else
+    PrintN("NO - the block is clock-gated off")
+  EndIf
+  Print("  DSP3_MUX      ")
+  PrintDec((d >> 18) & 3)
+  If ((d >> 18) & 3) = 3
+    PrintN("   DISABLED - pixel valve 1 is fed by nothing")
+  Else
+    PrintN("   (the HVS channel pixel valve 1 reads from)")
+  EndIf
+
+  Print("DISPCTRL0    ")
+  PutHex8(HvsRd($0040))
+  PrintNl()
+  Print("DISPBKGND0   ")
+  PutHex8(HvsRd($0044))
+  PrintNl()
+  Print("DISPSTAT0    ")
+  PutHex8(HvsRd($0048))
+  PrintNl()
+  Print("DISPBASE0    ")
+  PutHex8(HvsRd($004C))
+  PrintNl()
+  Print("DISPLIST0    ")
+  PutHex8(HvsRd($0020))
+  PrintNl()
+  Print("DISPLACT0    ")
+  PutHex8(HvsRd($0030))
+  PrintNl()
+  PrintNl()
+  Print("PV_CONTROL   ")
+  PutHex8(PvRd($00))
+  PrintNl()
+  Print("PV_V_CONTROL ")
+  PutHex8(PvRd($04))
+  PrintNl()
+  Print("PV_HORZA     ")
+  PutHex8(PvRd($0C))
+  PrintNl()
+  Print("PV_HORZB     ")
+  PutHex8(PvRd($10))
+  PrintNl()
+  Print("PV_VERTA     ")
+  PutHex8(PvRd($14))
+  PrintNl()
+  Print("PV_VERTB     ")
+  PutHex8(PvRd($18))
+  PrintNl()
+  Print("PV_STAT      ")
+  PutHex8(PvRd($2C))
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDiagRegReadable - the status-safe DSI1 register allowlist.
+;
+;  A register block is not an array of ordinary memory. In particular,
+;  RXPKT_FIFO at $24 consumes reply data when read, and the packet/FIFO
+;  write paths are not status registers. Reserved holes are not evidence
+;  either. The Raspberry Pi Linux VC4 driver's dsi1_regs debugfs list is
+;  the primary cross-check for the readable status/configuration set:
+;  https://github.com/raspberrypi/linux/blob/0ac97ba3443f519b61bbc96079736cd8b881ea22/drivers/gpu/drm/vc4/vc4_dsi.c
+;  Its RXPKT1 description also says long response data is in RXPKT_FIFO.
+;  This is a list of register facts, not copied driver code.
+; ----------------------------------------------------------------------
+Procedure.i DsiDiagRegReadable(off.i)
+  Select off
+    Case #DSI1_CTRL_OFF              : ProcedureReturn 1
+    Case #DSI1_DISP0_CTRL_OFF        : ProcedureReturn 1
+    Case #DSI1_DISP1_CTRL_OFF        : ProcedureReturn 1
+    Case #DSI1_INT_STAT_OFF          : ProcedureReturn 1
+    Case #DSI1_INT_EN_OFF            : ProcedureReturn 1
+    Case #DSI1_STAT_OFF              : ProcedureReturn 1
+    Case #DSI1_HSTX_TO_CNT_OFF       : ProcedureReturn 1
+    Case #DSI1_LPRX_TO_CNT_OFF       : ProcedureReturn 1
+    Case #DSI1_TA_TO_CNT_OFF         : ProcedureReturn 1
+    Case #DSI1_PR_TO_CNT_OFF         : ProcedureReturn 1
+    Case #DSI1_PHYC_OFF              : ProcedureReturn 1
+    Case #DSI1_HS_CLT0_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_CLT1_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_CLT2_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT3_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT4_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT5_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT6_OFF           : ProcedureReturn 1
+    Case #DSI1_HS_DLT7_OFF           : ProcedureReturn 1
+    Case #DSI1_PHY_AFEC0_OFF         : ProcedureReturn 1
+    Case #DSI1_PHY_AFEC1_OFF         : ProcedureReturn 1
+    Case #DSI1_ID_OFF                : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiRegs - the DSI1 status-safe register set, one word at a time,
+;  through a real 32-bit load. Every other word through $8C is named as
+;  skipped rather than read or silently printed as a fabricated zero.
+; ----------------------------------------------------------------------
+Procedure DsiRegs()
+  Define o.i
+
+  o = 0
+  While o <= $8C
+    Print("FE7000")
+    PutHex2(o)
+    Print("  ")
+    If DsiDiagRegReadable(o) <> 0
+      PutHex8(DsiRd(o))
+    Else
+      Print("<skipped: not a status-safe register read>")
+    EndIf
+    PrintNl()
+    o = o + 4
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiStatus - the bare `dsi`.
+; ----------------------------------------------------------------------
+Procedure DsiStatus()
+  Print("mode planned  ")
+  If DsiPlanned() <> 0
+    Print("yes, pixel clock ")
+    DsiSayHz(DsiPixelHz())
+    PrintNl()
+  Else
+    PrintN("no")
+  EndIf
+
+  Print("host up       ")
+  If DsiIsUp() <> 0
+    PrintN("yes")
+  Else
+    PrintN("no")
+  EndIf
+
+  Print("video enabled ")
+  If DsiVideoIsOn() <> 0
+    PrintN("yes")
+  Else
+    PrintN("no")
+  EndIf
+
+  Print("DCS transfers ")
+  PrintDec(DsiXferCount())
+  Print(", failed ")
+  PrintDec(DsiXferFails())
+  PrintNl()
+
+  Print("HVS up        ")
+  If HvsIsUp() <> 0
+    PrintN("yes")
+  Else
+    PrintN("no")
+  EndIf
+
+  Print("valve up      ")
+  If PvIsUp() <> 0
+    PrintN("yes")
+  Else
+    PrintN("no")
+  EndIf
+
+  If HvsFb() <> 0
+    Print("framebuffer   ")
+    PutHex8(HvsFb())
+    PrintNl()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiOff - back down, in the reverse of the order that brought it up.
+; ----------------------------------------------------------------------
+Procedure DsiOff()
+  DsiVideoOff()
+  PvDown()
+  HvsDown()
+  PrintN("Video off, the valve is down and the HVS channel is reset.")
+  PrintN("The panel's rails and backlight are untouched - `touch panel` owns those.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiRails - the panel's rails and its reset, and NOTHING ELSE.
+;
+;  No DCS, so it can be run BEFORE the host is up. That is the point:
+;  the host's bring-up latches a contention error on a lane pair that
+;  nobody is holding, and an unpowered panel holds nothing. Whether the
+;  order matters is a question this bench has not answered, and it
+;  cannot be answered while the only way to power the panel also sends
+;  two hundred commands down a link that may not exist yet.
+; ----------------------------------------------------------------------
+Procedure DsiRails()
+  Define up.i
+  Define ok.i
+
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  up = I2cUp()
+  If up = 0
+    PrintN("!! The display connector's I2C bus would not come up. Nothing was done.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+
+  If DsiV2Begin() = 0
+    PrintN("!! The panel MCU at 45 did not acknowledge the power-on write.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+
+  ok = DsiPanelRails()
+  If DsiV2Backlight(255) = 0
+    ok = 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+
+  If ok <> 0
+    PrintN("Rails up, panel reset released, backlight on at 255. NO DCS was sent.")
+    PrintN("   The panel is powered and holding its lanes; bring the host up now.")
+  Else
+    PrintN("!! Not every expander write acknowledged. The panel may be part")
+    PrintN("   powered, which is worse than not powered - say so before reading")
+    PrintN("   anything else as a DSI result.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiPokeCmd - `dsi poke <off> <value>`, one word into the DSI1 block.
+;
+;  AN INSTRUMENT, AND IT SAYS SO. It exists because PHY_AFEC0 kept three
+;  of the bits written to it and dropped the rest, and no amount of
+;  reading the driver settles whether the others are write-only,
+;  unimplemented, or refused. Two pokes and two reads settle it.
+;
+;  It prints the value before and after, because a poke whose result
+;  nobody read is just a write.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  DsiUlps - COMMAND the lanes into ULPS and back, and say what that
+;  proves. This is the probe that separates the two remaining suspects.
+;
+;  Every reading before this one was passive: configure, release, watch.
+;  A transmitter that is not driving and a transmitter driving LP-11 into
+;  a cable that cannot carry it look identical to a passive reading, and
+;  will keep looking identical however many are taken. This one asks the
+;  PHY to move and watches whether it does.
+; ----------------------------------------------------------------------
+Procedure DsiUlps()
+  Define rc.i
+
+  If DsiIsUp() = 0
+    PrintN("!! The DSI host is not up. Run `dsi host` first. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  PrintN("Commanding both data lanes and the clock lane into ULPS and back.")
+  PrintN("PHYC is put back either way, so nothing is left requesting ULPS.")
+  PrintNl()
+
+  rc = DsiUlpsCycle()
+
+  Print("STAT after the ULPS request   ")
+  PutHex8(DsiUlpsEnter())
+  PrintNl()
+  Print("STAT after it was removed     ")
+  PutHex8(DsiUlpsExit())
+  PrintNl()
+  DsiSayStat(DsiUlpsExit())
+  PrintNl()
+
+  If rc = 2
+    PrintN("BOTH TRANSITIONS HAPPENED. The lane state machines respond to a")
+    PrintN("command, so the digital half of the D-PHY is alive and the fault is")
+    PrintN("downstream of it - the analogue drive, or the ribbon. That rules out")
+    PrintN("a PHY that is doing nothing at all.")
+  ElseIf rc = 1
+    PrintN("ULPS WAS ENTERED AND STOP NEVER CAME BACK. The PHY drives - it")
+    PrintN("reached ULPS on request - but it cannot get back to LP-11, which is")
+    PrintN("what a lane held by something outside the SoC looks like. THE RIBBON")
+    PrintN("IS THE SUSPECT: reseat it at both ends before anything else.")
+  ElseIf rc = 0
+    PrintN("NEITHER TRANSITION HAPPENED. The lane state machines do not move at")
+    PrintN("all, on command, with the AFE out of reset. Nothing outside the SoC")
+    PrintN("can cause that, so this is the PHY itself, and the write-only bias")
+    PrintN("fields are the only candidate left inside it.")
+  Else
+    PrintN("!! The host reported itself down midway. Nothing can be concluded.")
+  EndIf
+EndProcedure
+
+Procedure DsiPokeCmd(off.i, v.i)
+  Define was.i
+
+  was = DsiRd(off)
+  DsiPoke(off, v)
+
+  Print("FE7000")
+  PutHex2(off)
+  Print("  was ")
+  PutHex8(was)
+  Print("  wrote ")
+  PutHex8(v)
+  Print("  reads ")
+  PutHex8(DsiRd(off))
+  PrintNl()
+EndProcedure
+
+; ======================================================================
+;  THE FIRMWARE'S SIDE OF THE DSI1 BLOCK
+; ----------------------------------------------------------------------
+;  THE HYPOTHESIS THIS SECTION EXISTS TO TEST, stated plainly because it
+;  is a hypothesis and not a citation.
+;
+;  On a stock Raspberry Pi the panel is detected over I2C at boot and the
+;  firmware's own display stack owns the DSI block before any driver
+;  touches it. The kernel's DSI driver therefore always meets a PHY whose
+;  analogue side is already powered. On this card the firmware owns NO
+;  display at all - GET_NUM_DISPLAYS answers zero, measured 2026-09-06 -
+;  so on this board nothing has ever powered the analogue side, and every
+;  register written here lands on a block whose PHY is asleep. That fits
+;  every reading taken so far: the digital half answers and latches, the
+;  analogue half does nothing.
+;
+;  THE CAVEAT THAT USED TO STAND HERE IS WITHDRAWN - 2026-09-07, and it
+;  was wrong in the one way a caveat must never be wrong. It said that no
+;  device tree on disk gives dsi1@7e700000 a `power-domains` property, so
+;  the reference driver's runtime-power call for this block was a no-op
+;  and no firmware call was missing from the transcription.
+;
+;  IT IS THERE. It arrives through an include, three files up:
+;  bcm2711-rpi-4-b.dts:6 includes bcm2711-rpi.dtsi, whose :2 includes
+;  bcm2835-rpi.dtsi, and THAT file's :82-84 says
+;
+;      &dsi1 { power-domains = <&power RPI_POWER_DOMAIN_DSI1>; };
+;
+;  All four files are on disk now as Reference/rpi-6.12.y_bcm*.dts[i],
+;  precisely so the next reader cannot repeat the mistake. The mistake
+;  itself was to grep two LEAF dtsi files for `power-domains` and take
+;  the empty result as an answer. `&node { ... }` fragments in an
+;  included file are how the Pi's device tree is assembled, and a
+;  property can be attached to a node from anywhere along the chain.
+;
+;  So this is no longer "asking anyway is cheap". vc4_dsi.c:937,
+;  vc4_dsi_bridge_pre_enable, calls pm_runtime_resume_and_get(dev)
+;  BEFORE its first DSI register write, and on this board that call
+;  lands in raspberrypi-power.c and sends SET_DOMAIN_STATE for DSI1. It
+;  is a step of the working driver that Anvil has never taken, and it
+;  comes FIRST.
+;
+;  THE NUMBERING, and it is the one thing here that is easy to get wrong.
+;  raspberrypi-power.h says in its own header comment "These power domain
+;  indices are the firmware interface's indices MINUS ONE", and
+;  raspberrypi-power.c:119-120 does `dom->domain = xlate_index + 1`. The
+;  binding index for DSI1 is 18, so the number that goes in the mailbox
+;  is NINETEEN. Sending 18 asks about DSI0 and gets a perfectly plausible
+;  answer to a question nobody asked.
+;
+;  Sources, all of them IN THE REPO under RaspberryPi4/Reference/, from
+;  raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y:
+;    rpi-6.12.y_raspberrypi-power.h   include/dt-bindings/power/raspberrypi-power.h
+;    rpi-6.12.y_raspberrypi-power.c   drivers/pmdomain/bcm/raspberrypi-power.c
+;    rpi-6.12.y_bcm2711-rpi-4-b.dts   arch/arm64/boot/dts/broadcom/
+;    rpi-6.12.y_bcm2711-rpi.dtsi      arch/arm64/boot/dts/broadcom/
+;    rpi-6.12.y_bcm2835-rpi.dtsi      arch/arm/boot/dts/broadcom/
+;    rpi-6.12.y_bcm2711.dtsi          arch/arm64/boot/dts/broadcom/
+;  Note the driver's path: it moved OUT of drivers/soc/bcm/ when the
+;  pmdomain subsystem landed, and a fetch from the old path 404s.
+;  The firmware tag enum is raspberrypi-firmware.h, quoted by tag number
+;  below rather than kept as a file.
+; ======================================================================
+
+; THE TAGS, THE DOMAIN INDICES AND THE TRANSACTION ARE NOT HERE ANY
+; MORE. They moved into RaspberryPi4/Lib/dsi_host.pi4, under THE
+; FIRMWARE POWER DOMAIN, with every source line that justifies them.
+;
+; They were written here first, when `dsi domain` was a probe somebody
+; typed. The moment the boot path needed the same message, keeping them
+; in a command file would have meant composing that message twice - and
+; it is the one message this whole campaign turned on. The library owns
+; it; this file PRINTS it.
+
+; ----------------------------------------------------------------------
+;  THE FIRST-COMMAND SNAPSHOT (historically called the boot snapshot)
+;
+;  WHAT IT IS FOR. The question this campaign is now asking is what the
+;  FIRMWARE leaves behind, and by the time `dsi host` has run the answer
+;  is buried under twenty of our own writes. `dsi snapshot` after that
+;  reads back our own arithmetic and proves nothing about the firmware.
+;
+;  IT IS TAKEN ON THE FIRST VALID `dsi` COMMAND OF A SESSION, AFTER THE
+;  command and its arguments have parsed but before that command runs -
+;  and NOT from Main. A typo must not touch hardware. That is a correction,
+;  and the earlier boot-time placement cost a board.
+;
+;  The first version of this ran from Main() before the banner, on the
+;  argument that only that instant is truly the firmware's. The board
+;  went silent after the flash and answered neither the console nor a
+;  ping. Everything else in that image was byte-identical to the one that
+;  had just been answering - the unmodified control builds to the running
+;  image's exact 2,017,416 bytes and CRC32 0C9AB9AD - so this was the
+;  only new code in the boot path, and the boot path is the one place in
+;  this monitor where a fault cannot be reported, because the console
+;  does not exist yet and the radio is not up.
+;
+;  THE ARGUMENT FOR PUTTING IT IN MAIN WAS ALSO WRONG ON ITS OWN TERMS.
+;  Nothing between _start and the prompt writes a DSI1 register: the boot
+;  path brings up the framebuffer console through the mailbox, the
+;  network and the fan, and not one of them touches $FE700000. So a
+;  capture taken at the first `dsi` command is the firmware's state just
+;  as much as one taken in Main, and it is taken somewhere a hang is a
+;  hung command rather than a board that has to be recovered by hand.
+;
+;  THE GENERAL RULE THIS EARNED: new probe code goes where a reset can
+;  undo it. Anything that runs before the console exists has to be worth
+;  a card pull if it is wrong, and a diagnostic never is.
+; ----------------------------------------------------------------------
+Global dsi_snapTaken.i = 0
+Global Dim dsi_snapReg.i[36]     ; DSI1 $00..$8C, 36 words
+Global Dim dsi_snapRegValid.i[36] ; 1 only when that word was actually read
+Global dsi_snapCmPlld.i     = 0
+Global dsi_snapCmLock.i     = 0
+Global dsi_snapCmDsi1Ectl.i = 0
+Global dsi_snapCmDsi1Ediv.i = 0
+Global dsi_snapCmDsi1Pctl.i = 0
+Global dsi_snapCmDsi1Pdiv.i = 0
+Global dsi_snapA2wCtrl.i    = 0
+Global dsi_snapA2wDsi1.i    = 0
+Global dsi_snapGpfsel4.i    = 0
+Global dsi_snapDomDsi1.i    = -1
+Global dsi_snapDomDsi0.i    = -1
+Global dsi_snapDomArm.i     = -1
+
+; CM_LOCK is not in dsi_host.pi4's offset list because nothing there
+; needed it. clk-bcm2835.c: CM_LOCK is $0114 from the CPRMAN base.
+#DSI_CM_LOCK_OFF = $0114
+
+; ----------------------------------------------------------------------
+;  dsi_SnapDomain - ONE read-only GET_DOMAIN_STATE, no printing.
+;
+;  Used by the command-time snapshot and deliberately has no printing of
+;  its own, so the snapshot remains one coherent report when shown later.
+;  Returns the reply's state word, or -1 if the transaction did not
+;  complete. -1 and not 0, because 0 is a good answer meaning "off".
+; ----------------------------------------------------------------------
+Procedure.i dsi_SnapDomain(id.i)
+  ProcedureReturn DsiDomainGet(id)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiSnapshotTake - taken once, after a valid command has parsed and
+;  before the subcommand that triggered it runs. Later calls do nothing.
+; ----------------------------------------------------------------------
+Procedure DsiSnapshotTake()
+  Define i.i
+
+  If dsi_snapTaken <> 0
+    ProcedureReturn
+  EndIf
+
+  i = 0
+  While i < 36
+    If DsiDiagRegReadable(i * 4) <> 0
+      dsi_snapReg[i] = PeekN(#DSI1_BASE + i * 4) & $FFFFFFFF
+      dsi_snapRegValid[i] = 1
+    Else
+      dsi_snapRegValid[i] = 0
+    EndIf
+    i = i + 1
+  Wend
+
+  dsi_snapCmPlld     = DsiCmRd(#CM_PLLD_OFF)
+  dsi_snapCmLock     = DsiCmRd(#DSI_CM_LOCK_OFF)
+  dsi_snapCmDsi1Ectl = DsiCmRd(#CM_DSI1ECTL_OFF)
+  dsi_snapCmDsi1Ediv = DsiCmRd(#CM_DSI1EDIV_OFF)
+  dsi_snapCmDsi1Pctl = DsiCmRd(#CM_DSI1PCTL_OFF)
+  dsi_snapCmDsi1Pdiv = DsiCmRd(#CM_DSI1PDIV_OFF)
+  dsi_snapA2wCtrl    = DsiCmRd(#A2W_PLLD_CTRL_OFF)
+  dsi_snapA2wDsi1    = DsiCmRd(#A2W_PLLD_DSI1_OFF)
+
+  ; GPFSEL4 holds the function select for GPIO 40..49, which is where the
+  ; display connector's I2C pair lives. Whether the firmware left it
+  ; muxed says whether the firmware went looking for a panel.
+  dsi_snapGpfsel4 = PeekN($FE200010) & $FFFFFFFF
+
+  dsi_snapDomDsi1 = dsi_SnapDomain(#DSI_DOMAIN_DSI1)
+  dsi_snapDomDsi0 = dsi_SnapDomain(#DSI_DOMAIN_DSI0)
+  dsi_snapDomArm  = dsi_SnapDomain(#DSI_DOMAIN_ARM)
+
+  dsi_snapTaken = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  dsi_SayDomain - one domain readback in words, or why there is none.
+; ----------------------------------------------------------------------
+Procedure dsi_SayDomain(v.i)
+  If v < 0
+    PrintN("the question could not be asked - the mailbox did not complete")
+  ElseIf v = 0
+    PrintN("0, which the firmware means as OFF")
+  ElseIf v = 1
+    PrintN("1, which the firmware means as ON")
+  Else
+    Print("an unexpected ")
+    PutHex8(v)
+    PrintN(" - not the 0 or 1 this interface is documented to return")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiSnapshotShow - `dsi snapshot`.
+; ----------------------------------------------------------------------
+Procedure DsiSnapshotShow()
+  Define i.i
+
+  If dsi_snapTaken = 0
+    PrintN("!! No snapshot was taken, so there is nothing to show. That is a defect")
+    PrintN("   in this image rather than a fact about the board - the dispatcher is")
+    PrintN("   supposed to take one before the first dsi subcommand runs.")
+    ProcedureReturn
+  EndIf
+
+  PrintN("Captured before the first valid hardware dsi command of this session.")
+  PrintN("This is a command-time snapshot, not a boot-time measurement. Earlier")
+  PrintN("firmware and monitor initialization may already have changed clocks,")
+  PrintN("GPIO or power state; skipped registers were deliberately not read.")
+  PrintNl()
+
+  PrintN("---- captured DSI1 state, FE700000 .. FE70008C --------------------")
+  i = 0
+  While i < 36
+    If OutBreak() <> 0
+      Break
+    EndIf
+    Print("  FE7000")
+    PutHex2(i * 4)
+    Print("  ")
+    If dsi_snapRegValid[i] <> 0
+      PutHex8(dsi_snapReg[i])
+    Else
+      Print("<skipped: not a status-safe register read>")
+    EndIf
+    PrintNl()
+    i = i + 1
+  Wend
+  PrintNl()
+  PrintN("  Reading these: 00647369 is the ASCII identity string, and every")
+  PrintN("  offset the block does not claim answers with it, so an identity")
+  PrintN("  string is not evidence of anything. CTRL is the first word, PHYC is")
+  PrintN("  at 4C, PHY_AFEC0 at 70 and STAT at 38.")
+  PrintNl()
+
+  PrintN("---- captured DSI1 clocks ----------------------------------------")
+  Print("  CM_LOCK      ")
+  PutHex8(dsi_snapCmLock)
+  PrintNl()
+  Print("  CM_PLLD      ")
+  PutHex8(dsi_snapCmPlld)
+  PrintNl()
+  Print("  A2W_PLLD_CTRL ")
+  PutHex8(dsi_snapA2wCtrl)
+  PrintNl()
+  Print("  A2W_PLLD_DSI1 ")
+  PutHex8(dsi_snapA2wDsi1)
+  PrintNl()
+  Print("  CM_DSI1ECTL  ")
+  PutHex8(dsi_snapCmDsi1Ectl)
+  Print("  CM_DSI1EDIV  ")
+  PutHex8(dsi_snapCmDsi1Ediv)
+  PrintNl()
+  Print("  CM_DSI1PCTL  ")
+  PutHex8(dsi_snapCmDsi1Pctl)
+  Print("  CM_DSI1PDIV  ")
+  PutHex8(dsi_snapCmDsi1Pdiv)
+  PrintNl()
+  PrintNl()
+
+  Print("---- captured GPFSEL4: ")
+  PutHex8(dsi_snapGpfsel4)
+  PrintNl()
+  PrintN("  GPIO 44 and 45 are the display connector's I2C pair and they are")
+  PrintN("  ALT1 for BSC0. Their function fields are bits 14:12 and 17:15, and")
+  PrintN("  ALT1 is 5 and plain input is 0. This is the observed mux state;")
+  PrintN("  it does not identify which firmware or driver last configured it.")
+  PrintNl()
+
+  PrintN("---- captured power-domain state --------------------------------")
+  Print("  DSI1, firmware domain 19: ")
+  dsi_SayDomain(dsi_snapDomDsi1)
+  Print("  DSI0, firmware domain 18: ")
+  dsi_SayDomain(dsi_snapDomDsi0)
+  Print("  ARM,  firmware domain 23: ")
+  dsi_SayDomain(dsi_snapDomArm)
+  PrintN("  The ARM row is the control. This board is running on the ARM, so a")
+  PrintN("  firmware that maintains this table at all must say that one is on.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDomainAsk - ONE mailbox transaction, with every word printed.
+;
+;  It prints the request before sending it and the reply after, because a
+;  probe whose traffic nobody can see is a probe that has to be believed.
+;
+;  IT COMPOSES NOTHING. The message is DsiDomainXact's, in the library,
+;  and this is the printer over it - so what a person reads at the
+;  prompt is the traffic the boot path sends, not a second version of it
+;  that happens to look the same today.
+; ----------------------------------------------------------------------
+Procedure.i DsiDomainAsk(tag.i, id.i, state.i, sendState.i)
+  Define v.i
+
+  Print("  sending tag ")
+  PutHex8(tag)
+  Print(", request word 0 = ")
+  PrintDec(id)
+  Print(", request word 1 = ")
+  If sendState <> 0
+    PutHex8(state)
+  Else
+    PutHex8(0)
+  EndIf
+  PrintN(".")
+
+  v = DsiDomainXact(tag, id, state, sendState)
+  If v < 0
+    PrintN("  !! The firmware did not complete the transaction, so whatever is in")
+    PrintN("     the buffer is the request read back and is not reported as a")
+    PrintN("     reply.")
+    ProcedureReturn -1
+  EndIf
+
+  Print("  the firmware answered word 0 = ")
+  PrintDec(DsiDomW0())
+  Print(", word 1 = ")
+  PutHex8(DsiDomW1())
+  Print(", in ")
+  PrintDec(DsiDomBytes())
+  PrintN(" bytes of response.")
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDomain - `dsi domain`. Ask the firmware to power DSI1.
+; ----------------------------------------------------------------------
+Procedure DsiDomain()
+  Define newIf.i
+  Define before.i
+  Define reply.i
+  Define after.i
+  Define dsi0.i
+  Define usb.i
+
+  PrintN("Asking the firmware about the DSI1 power domain. Every word sent and")
+  PrintN("every word received is printed, because a probe nobody can check is a")
+  PrintN("probe that has to be taken on trust.")
+  PrintNl()
+
+  PrintN("---- is this interface implemented at all? ------------------------")
+  PrintN("The firmware does not refuse a tag it does not recognise - it skips the")
+  PrintN("tag and hands the request back unchanged. So the ARM domain is asked")
+  PrintN("with word 1 already set to FFFFFFFF, and a word 1 that comes back")
+  PrintN("DIFFERENT is the only proof that anything answered. That test is")
+  PrintN("raspberrypi-power.c:137-159's own, not an invention of this bench.")
+  newIf = DsiDomainAsk(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_ARM, $FFFFFFFF, 1)
+  If newIf = $FFFFFFFF
+    ; The kernel's own probe sends the BINDING index here, 22, and not the
+    ; firmware index - raspberrypi-power.c:151 is `packet.domain =
+    ; RPI_POWER_DOMAIN_ARM` with no `+ 1`, unlike :120 where the real
+    ; calls get it. Upstream never noticed because the probe only needs
+    ; SOME domain the firmware will answer for. Twenty-three is the last
+    ; valid firmware index and should be answered; if it was not, ask the
+    ; number the working driver actually sends before concluding that a
+    ; whole interface is missing.
+    PrintN("  Unchanged at firmware index 23. Before calling the interface absent,")
+    PrintN("  asking the number the kernel's own probe sends - raspberrypi-power.c")
+    PrintN("  :151 sends the BINDING index 22 here, without the +1 it applies at")
+    PrintN("  :120. If 23 is past the end of this firmware's table that is exactly")
+    PrintN("  what an unanswered word would look like.")
+    newIf = DsiDomainAsk(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_ARM_BINDING, $FFFFFFFF, 1)
+  EndIf
+  If newIf < 0
+    PrintN("  The transaction did not complete, so nothing below can be trusted.")
+    PrintN("  Stopping here rather than sending a SET into a mailbox that is not")
+    PrintN("  answering.")
+    ProcedureReturn
+  ElseIf newIf = $FFFFFFFF
+    PrintN("  THE WORD CAME BACK UNCHANGED AT BOTH 23 AND 22, so this firmware does")
+    PrintN("  not implement GET_DOMAIN_STATE. Nothing below can mean anything, and a")
+    PrintN("  SET on this interface would be skipped in exactly the same silent way.")
+    PrintN("  Stopping here. The hypothesis is not disproved by this - it is")
+    PrintN("  untestable through this door, and the next step is to read what else")
+    PrintN("  the firmware expects, not to guess at config.txt.")
+    ProcedureReturn
+  Else
+    PrintN("  The word changed, so the new domain interface IS implemented on this")
+    PrintN("  firmware and the answers below are real answers.")
+  EndIf
+  PrintNl()
+
+  PrintN("---- DSI1 before anything is set ---------------------------------")
+  before = DsiDomainAsk(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_DSI1, 0, 0)
+  Print("  DSI1, firmware domain 19: ")
+  dsi_SayDomain(before)
+  dsi0 = DsiDomainAsk(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_DSI0, 0, 0)
+  Print("  DSI0, firmware domain 18: ")
+  dsi_SayDomain(dsi0)
+  PrintN("  DSI0 is asked as a control. Nothing on this board uses it, so if both")
+  PrintN("  read the same value under every condition the table is not tracking")
+  PrintN("  anything and neither number is evidence.")
+  PrintNl()
+
+  PrintN("---- setting DSI1 on ---------------------------------------------")
+  reply = DsiDomainAsk(#DSI_TAG_SET_DOMAIN_STATE, #DSI_DOMAIN_DSI1, #DSI_MBX_STATE_ON, 1)
+  If reply < 0
+    PrintN("  The set did not complete. The domain is in whatever state it was.")
+    ProcedureReturn
+  EndIf
+  Print("  the reply's state word: ")
+  dsi_SayDomain(reply)
+  PrintNl()
+
+  PrintN("---- DSI1 read back ----------------------------------------------")
+  after = DsiDomainAsk(#DSI_TAG_GET_DOMAIN_STATE, #DSI_DOMAIN_DSI1, 0, 0)
+  Print("  DSI1, firmware domain 19: ")
+  dsi_SayDomain(after)
+  PrintNl()
+
+  PrintN("---- the OLD interface, and why there is nothing to send on it ----")
+  PrintN("SET_POWER_STATE 00028001 takes a DEVICE id, which is a different table")
+  PrintN("from the domain indices above. The firmware header on this disk does")
+  PrintN("not list that table at all, and the only two device ids named anywhere")
+  PrintN("here are USB 3 and V3D 10, in raspberrypi-power.c:20-21. THERE IS NO")
+  PrintN("DSI DEVICE ID TO SEND, so this command does not invent one - guessing a")
+  PrintN("device number and writing power state to it is how a working peripheral")
+  PrintN("gets turned off by accident.")
+  PrintN("Device 3 is READ below, and only read, as a control: it says whether the")
+  PrintN("device path answers at all, which a silent DSI reply could not.")
+  usb = DsiDomainAsk(#DSI_TAG_GET_POWER_STATE, #DSI_OLD_DEVICE_USB, 0, 0)
+  If usb < 0
+    PrintN("  The USB device read did not complete, so the device path is not")
+    PrintN("  answering either and nothing is owed to it.")
+  Else
+    Print("  USB, device 3: state word ")
+    PutHex8(usb)
+    PrintNl()
+    PrintN("  Bit 0 is powered and bit 1 is 'device does not exist'.")
+  EndIf
+  PrintNl()
+
+  PrintN("---- what to do with this ----------------------------------------")
+  If after = 1 And before <> 1
+    PrintN("THE DOMAIN WAS OFF AND IS NOW ON. That is the hypothesis's best case:")
+    PrintN("run `dsi host` and then `dsi ulps` and `dsi forcestop`. If a lane")
+    PrintN("transitions now where it would not before, the firmware never powered")
+    PrintN("the analogue block and this was the whole fault.")
+  ElseIf after = 1 And before = 1
+    PrintN("THE DOMAIN WAS ALREADY ON AND STILL IS. So the firmware's own answer")
+    PrintN("is that DSI1 is powered, and the hypothesis that it is not gets no")
+    PrintN("support from this door. Run the PHY probes anyway - the SET may still")
+    PrintN("have done something the GET does not report - but expect no change,")
+    PrintN("and say so.")
+  ElseIf after = 0
+    PrintN("THE DOMAIN IS STILL OFF AFTER BEING SET ON. Either this firmware")
+    PrintN("carries the table without acting on it, or a domain with no consumer")
+    PrintN("is refused. Both mean the mailbox door is shut and config.txt is next.")
+  Else
+    PrintN("The readback is neither 0 nor 1, so the interface is not behaving as")
+    PrintN("documented and no conclusion is available from it.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiForceStop - `dsi forcestop`. The most direct order the block takes.
+; ----------------------------------------------------------------------
+Procedure DsiForceStop()
+  Define rc.i
+
+  If DsiIsUp() = 0
+    PrintN("!! The DSI host is not up. Run `dsi host` first. Nothing was done.")
+    ProcedureReturn
+  EndIf
+
+  PrintN("Ordering data lane 0 into STOP through PHYC bit 2, and watching STAT.")
+  PrintN("STAT's latch is cleared BEFORE the order, not after: those bits record")
+  PrintN("the moment a lane ENTERS a state, and a clear taken afterwards erases")
+  PrintN("the only edge there was going to be.")
+  PrintN("PHYC is put back either way.")
+  PrintNl()
+
+  rc = DsiForceStopCycle()
+
+  Print("PHYC before the order        ")
+  PutHex8(DsiFsPhycWas())
+  PrintNl()
+  Print("PHYC read back with it in it ")
+  PutHex8(DsiFsPhycBack())
+  PrintNl()
+  Print("STAT after the wait          ")
+  PutHex8(DsiFsStat())
+  PrintNl()
+  PrintNl()
+
+  If (DsiFsPhycBack() & #DSI_PHYC_DLANE0_FORCE_STOP) = 0
+    PrintN("THE ORDER DID NOT EVEN LATCH. PHYC does not hold bit 2, so the block")
+    PrintN("is refusing the write rather than ignoring the order - a different")
+    PrintN("fault from the one this probe was written for, and a more basic one.")
+    ProcedureReturn
+  EndIf
+
+  If rc = 1
+    PrintN("THE LANE REPORTED STOP. The lane state machine runs and obeys a direct")
+    PrintN("order, so the digital half of the PHY is alive and whatever is wrong is")
+    PrintN("downstream of it.")
+  ElseIf rc = 0
+    PrintN("THE ORDER LATCHED AND THE LANE NEVER REPORTED STOP. Nothing outside")
+    PrintN("this chip is involved in FORCE_STOP - it is an order from the block to")
+    PrintN("one of its own lanes - so a cable cannot explain this reading, and the")
+    PrintN("lane state machine is not running.")
+  Else
+    PrintN("!! The host reported itself down midway. Nothing can be concluded.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiUp - every stage, in the order that works, each reporting.
+; ----------------------------------------------------------------------
+Procedure DsiUp(fb.i)
+  PrintN("---- the panel's rails, before the host ---------------------------")
+  ; THE RAILS COME FIRST HERE, and that is a change from the first
+  ; night. A host brought up against a pair of lanes nobody is holding
+  ; latches a contention error before anything has been asked of it, and
+  ; an unpowered panel holds nothing. The DCS table still goes after the
+  ; host, because it needs a link to travel on.
+  DsiRails()
+  PrintNl()
+  PrintN("---- clocks and the host ----------------------------------------")
+  DsiHost()
+  If DsiIsUp() = 0
+    PrintN("!! Stopped: the host did not come up, so nothing after it can.")
+    ProcedureReturn
+  EndIf
+  PrintNl()
+  PrintN("---- the panel ---------------------------------------------------")
+  DsiPanel()
+  PrintNl()
+  PrintN("---- did the panel answer? ---------------------------------------")
+  DsiPower()
+  PrintNl()
+  PrintN("---- the pattern -------------------------------------------------")
+  DsiPattern(fb)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdDsi - the dispatcher. gPos is already past "dsi".
+; ----------------------------------------------------------------------
+Procedure CmdDsi()
+  Define which.i
+  Define fb.i
+  Define pokeOff.i
+  Define pokeV.i
+
+  SkipSpace()
+  If gLine[gPos] = 0
+    DsiSnapshotTake()
+    DsiStatus()
+    ProcedureReturn
+  EndIf
+
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  which = 0
+  If WordIs("clocks") <> 0
+    which = 1
+  ElseIf WordIs("id") <> 0
+    which = 2
+  ElseIf WordIs("host") <> 0
+    which = 3
+  ElseIf WordIs("panel") <> 0
+    which = 4
+  ElseIf WordIs("power") <> 0
+    which = 5
+  ElseIf WordIs("pattern") <> 0
+    which = 6
+  ElseIf WordIs("up") <> 0
+    which = 7
+  ElseIf WordIs("regs") <> 0
+    which = 8
+  ElseIf WordIs("pipe") <> 0
+    which = 9
+  ElseIf WordIs("off") <> 0
+    which = 10
+  ElseIf WordIs("help") <> 0
+    which = 11
+  ElseIf WordIs("rails") <> 0
+    which = 12
+  ElseIf WordIs("poke") <> 0
+    which = 13
+  ElseIf WordIs("ulps") <> 0
+    which = 14
+  ElseIf WordIs("domain") <> 0
+    which = 15
+  ElseIf WordIs("snapshot") <> 0
+    which = 16
+  ElseIf WordIs("forcestop") <> 0
+    which = 17
+  EndIf
+
+  If which = 0
+    PrintN("!! dsi does not know that subcommand.")
+    DsiUsage()
+    ProcedureReturn
+  EndIf
+
+  ; Help is known syntax but not a hardware command. It must remain safe
+  ; on a machine whose DSI block cannot answer at all.
+  If which = 11
+    DsiUsage()
+    ProcedureReturn
+  EndIf
+
+  ; The two that take an address share the parse, so there is one place
+  ; a default can be wrong.
+  fb = #DSI_FB_DEFAULT
+  If which = 6 Or which = 7
+    SkipSpace()
+    If gLine[gPos] <> 0
+      fb = ParseHex()
+      If gParseOk = 0
+        PrintN("!! That is not an address. Nothing was done.")
+        ProcedureReturn
+      EndIf
+    EndIf
+  ElseIf which = 13
+    SkipSpace()
+    pokeOff = ParseHex()
+    If gParseOk = 0
+      PrintN("!! dsi poke needs an offset and a value, both hex:")
+      PrintN("   dsi poke 70 DB6C0377")
+      PrintN("   The offset is inside the DSI1 block, 0 to 8C, a multiple of four.")
+      ProcedureReturn
+    EndIf
+    SkipSpace()
+    pokeV = ParseHex()
+    If gParseOk = 0
+      PrintN("!! dsi poke needs a value as well as an offset. Nothing was written.")
+      ProcedureReturn
+    EndIf
+    If pokeOff < 0 Or pokeOff > $8C Or (pokeOff & 3) <> 0
+      PrintN("!! That offset is outside the DSI1 register block or is not a")
+      PrintN("   multiple of four. Past 8C there are no registers, only the")
+      PrintN("   identity string. Nothing was written.")
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  ; THE FIRMWARE SNAPSHOT, BEFORE A VALID SUBCOMMAND AND ONLY ONCE.
+  ;
+  ; Capture the state before this command acts, not a claimed pristine
+  ; firmware/boot state: startup drivers can already have changed related
+  ; clocks, power and GPIO. Parsing, including the optional framebuffer
+  ; address, happens first so a typo or malformed command touches nothing.
+  ; It remains here rather than in Main for the recovery reason above
+  ; DsiSnapshotTake.
+  DsiSnapshotTake()
+
+  If which = 1
+    DsiClocks()
+  ElseIf which = 2
+    DsiId()
+  ElseIf which = 3
+    DsiHost()
+  ElseIf which = 4
+    DsiPanel()
+  ElseIf which = 5
+    DsiPower()
+  ElseIf which = 6
+    DsiPattern(fb)
+  ElseIf which = 7
+    DsiUp(fb)
+  ElseIf which = 8
+    DsiRegs()
+  ElseIf which = 9
+    DsiPipe()
+  ElseIf which = 10
+    DsiOff()
+  ElseIf which = 12
+    DsiRails()
+  ElseIf which = 13
+    DsiPokeCmd(pokeOff, pokeV)
+  ElseIf which = 14
+    DsiUlps()
+  ElseIf which = 15
+    DsiDomain()
+  ElseIf which = 16
+    DsiSnapshotShow()
+  ElseIf which = 17
+    DsiForceStop()
+  Else
+    DsiUsage()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdMmio - one 32-bit load, printed. gPos is already past "mmio".
+;
+;  It reads and never writes. See WHY `mmio` EXISTS at the top.
+; ----------------------------------------------------------------------
+Procedure CmdMmio()
+  Define a.i
+  Define n.i
+  Define i.i
+
+  SkipSpace()
+  a = ParseHex()
+  If gParseOver <> 0
+    PrintN("!! That address has too many digits. Nothing was read.")
+    ProcedureReturn
+  EndIf
+  If gParseOk = 0
+    PrintN("!! mmio needs an address, in hex, and reads one 32-bit word from it.")
+    PrintN("   mmio FE70008C")
+    PrintN("   mmio FE700000 8      eight consecutive words")
+    ProcedureReturn
+  EndIf
+
+  If (a & 3) <> 0
+    PrintN("!! That address is not a multiple of four. A peripheral register is a")
+    PrintN("   word and an unaligned load of one is not the read you meant.")
+    PrintN("   Nothing was read.")
+    ProcedureReturn
+  EndIf
+
+  n = 1
+  SkipSpace()
+  If gLine[gPos] <> 0
+    n = ParseHex()
+    If gParseOk = 0 Or n <= 0
+      PrintN("!! That is not a count. Nothing was read.")
+      ProcedureReturn
+    EndIf
+    If n > 64
+      n = 64
+      PrintN("   (clamped to 64 words)")
+    EndIf
+  EndIf
+
+  If AddrAllowed(a, a + n * 4 - 1, 0, "mmio", "read") = 0
+    ProcedureReturn
+  EndIf
+
+  i = 0
+  While i < n
+    If OutBreak() <> 0
+      Break
+    EndIf
+    PutAddr(a + i * 4)
+    Print(": ")
+    PutHex8(PeekN(a + i * 4) & $FFFFFFFF)
+    PrintNl()
+    i = i + 1
+  Wend
+EndProcedure

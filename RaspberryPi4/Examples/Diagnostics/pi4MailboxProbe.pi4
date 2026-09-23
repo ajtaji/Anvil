@@ -1,0 +1,232 @@
+; pi4MailboxProbe.pi4 - does the VideoCore property mailbox actually work?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; mailbox.pi4 was written entirely from documents. Every register offset
+; is cited, every tag number is now citable from
+; Datasheets/pi4/raspberrypi-firmware.h - and not one byte of it had ever
+; crossed the mailbox to the VideoCore. This is the program that finds
+; out, and it is the dependency the display library is waiting on: no
+; mailbox, no framebuffer, ever.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN.
+; It is sent to a resident Anvil and RETURNS to it, so a wrong
+; answer costs a line of output rather than a power cycle. Before
+; --entry-returns existed, testing a library on the board meant an image
+; that could only spin forever, and every failure was a walk to the
+; plug. Build it exactly like this:
+;
+;   PureMetalForge.exe --compile pi4MailboxProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+;
+; The stack is deliberately NOT the monitor's. --entry-returns saves and
+; restores whatever it was handed, so the payload may own its own stack
+; and still come back.
+;
+; IT PRINTS EVERYTHING ITSELF rather than only returning a value. The
+; resident monitor predates the 64-bit rewrite and prints just the low
+; eight digits of x0, so a single returned number cannot carry this much.
+; The return value is a compact verdict for the monitor's own line; the
+; detail goes over the UART.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. Ruled 2026-08-25: PeekB names the SIGNED .b and
+    ; sign-extends on every backend now, so a byte above 127 would come
+    ; back negative and this loop would never see its terminator the way
+    ; it expects. PeekA is the raw-byte accessor and always was.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; One labelled line: "  name ......... value" plus the raw hex.
+Procedure Row(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" = ")
+  PutDec(v)
+  PutS("   ($")
+  PutHex(v, 8)
+  PutS(")")
+  PutNl()
+EndProcedure
+
+Global fails.i
+
+Procedure Clock(*name, id.i)
+  Define hz.i
+  hz = MailboxClockRate(id)
+  If hz = 0
+    PutS("  ")
+    PutS(*name)
+    PutS(" = FAILED, MailboxError() = ")
+    PutDec(MailboxError())
+    PutNl()
+    fails = fails + 1
+  Else
+    Row(*name, hz)
+  EndIf
+EndProcedure
+
+Procedure Main()
+  Define rev.i
+  Define t.i
+  Define tmax.i
+
+  fails = 0
+  PutNl()
+  PutS("=== Pi 4 mailbox probe - first contact with the VideoCore ===")
+  PutNl()
+
+  If MailboxInit() = 0
+    PutS("MailboxInit FAILED, error = ")
+    PutDec(MailboxError())
+    PutNl()
+    ProcedureReturn $BAD1
+  EndIf
+  PutS("MailboxInit ok. buffer $")
+  PutHex(MailboxBufferAddr(), 16)
+  PutS("  bus $")
+  PutHex(MailboxBusAddr(), 8)
+  PutNl()
+
+  ; BOARD REVISION FIRST. It is the cheapest possible round trip - no
+  ; request payload at all - so if the transport is broken this is where
+  ; it shows, before anything with arguments can confuse the diagnosis.
+  rev = MailboxBoardRevision()
+  If rev = 0
+    PutS("  board revision FAILED, MailboxError() = ")
+    PutDec(MailboxError())
+    PutNl()
+    fails = fails + 1
+  Else
+    Row("board revision", rev)
+  EndIf
+
+  PutS("clocks (Hz):")
+  PutNl()
+  Clock("ARM ", #MBX_CLK_ARM)
+  Clock("CORE", #MBX_CLK_CORE)
+  Clock("EMMC", #MBX_CLK_EMMC)
+  Clock("UART", #MBX_CLK_UART)
+
+  ; THE EMMC CLOCK IS THE ONE emmc.pi4 IS BLOCKED ON. Its header says it
+  ; refuses with #SD_ERR_BASECLK rather than guess a frequency, and names
+  ; this exact call as the way to supply one.
+  ;
+  ; THE UART CLOCK IS CHECKABLE AGAINST SOMETHING WE ALREADY KNOW: the
+  ; console is running at 115200 and legible, so config.txt's
+  ; init_uart_clock is in force. If this reports 48000000 the mailbox and
+  ; the working console agree, and that is a much stronger result than
+  ; either alone.
+
+  t = MailboxTemperature()
+  tmax = MailboxTemperatureMax()
+  If t = 0
+    PutS("  temperature FAILED, MailboxError() = ")
+    PutDec(MailboxError())
+    PutNl()
+    fails = fails + 1
+  Else
+    ; Reported in thousandths of a degree C. Fahrenheit because that is
+    ; the house rule and the 2026-09-07 ruling, and the arithmetic is in
+    ; integers throughout: F = C * 9 / 5 + 32, rounded to nearest.
+    ;
+    ; THE ARITHMETIC IS WRITTEN OUT HERE, AND THAT IS THE EXCEPTION.
+    ; The monitor's one conversion is Anvil/Hal/hal.pbi's HwTempMilliF()
+    ; and everything that ships goes through it. This probe is a
+    ; DIAGNOSTIC built standalone against mailbox.pi4 alone, with its own
+    ; four-line UART formatter and no seam behind it; pulling in the
+    ; whole capability vocabulary for one multiply would make it a worse
+    ; instrument, not a better one. It is deliberately the same
+    ; expression, and the fan gate's unit check skips Diagnostics for
+    ; exactly this reason.
+    ;
+    ; THE READING GETS THE SENSOR TRUTH IN BRACKETS AND THE THROTTLE
+    ; POINT DOES NOT, which is the rule the monitor follows too: the
+    ; reading is a measurement somebody may want to check against a
+    ; datasheet, the throttle point is a number the firmware states.
+    PutS("  SoC temperature = ")
+    PutDec((t * 9 + 2500) / 5000 + 32)
+    PutS(" F   (")
+    PutDec((t + 500) / 1000)
+    PutS(" C, ")
+    PutDec(t)
+    PutS(" millidegrees from the firmware; throttles at ")
+    PutDec((tmax * 9 + 2500) / 5000 + 32)
+    PutS(" F)")
+    PutNl()
+  EndIf
+
+  PutS("=== ")
+  If fails = 0
+    PutS("all mailbox calls answered")
+  Else
+    PutDec(fails)
+    PutS(" call(s) failed")
+  EndIf
+  PutS(" ===")
+  PutNl()
+
+  ProcedureReturn fails
+EndProcedure

@@ -1,0 +1,199 @@
+; pi4PcieState.pi4 - the whole PCIe picture, read-only, before anything
+; is started.
+;
+; DIAGNOSTIC. Does not ship. Touches no state at all beyond PcieInit's
+; adopt path, which the XHCI probe takes anyway.
+;
+; WHY. XhciInit gets all the way to setting Run/Stop and then reports
+;
+;     USBSTS $00000015   -> HCHalted, HOST SYSTEM ERROR, Port Change
+;
+; HSE is the controller saying that ITS OWN bus access failed. The first
+; thing an xHC does after Run/Stop is fetch the Device Context Base
+; Address Array from host memory, so the complaint is about the INBOUND
+; direction: the endpoint reading us, not us reading the endpoint.
+;
+; Reading the endpoint clearly works - the capability registers come
+; back correct and sane. So the two directions are configured by
+; different registers and only one of them is right, which is the whole
+; reason this file exists: it prints BOTH.
+;
+; WHAT IS ALREADY RULED OUT, so nobody re-checks it:
+;
+;   * the endpoint's COMMAND has memory-space AND bus-master set -
+;     PcieEnumerate does both, and pi4Vl805Bar printed them back.
+;   * the BRIDGE's COMMAND has both as well, and its MEMORY_BASE/LIMIT
+;     forwarding window is programmed. Getting that wrong gave
+;     $DEADDEAD, the root complex's AXI read-error pattern, and it
+;     does not do that any more.
+;   * the arena is 64-byte aligned and the scratchpad pages are aligned
+;     to 4 KiB, checked in xhci.pi4 at run time.
+;   * the arena passes PcieDmaOk, so it is under the dma-ranges cap.
+;
+; WHAT IS NOT RULED OUT AND IS WHY THIS PRINTS THE INBOUND WINDOW.
+; PcieInit has an ADOPT path: if the link is already up - which it
+; always is here, because the firmware and U-Boot bring it up to boot
+; from USB - it programs the outbound window and returns EARLY, before
+; the step that sets RC_BAR2, the inbound window. On this board U-Boot
+; has already set it, so the adopt path should be fine. "Should be" is
+; what this file is for.
+;
+;   PureMetalForge.exe --compile pi4PcieState.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o pstate.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Dec(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define cmd.i
+  Define lo.i
+  Define hi.i
+  Define misc.i
+  Define scb0.i
+
+  PrintNl()
+  UartWriteStr("=== PCIe state, both directions ===")
+  PrintNl()
+
+  If PcieInit() = 0
+    UartWriteStr("!! ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  UartWriteStr("how the bus came up")
+  PrintNl()
+  Dec("adopted (1 = firmware had it up)", PcieAdopted())
+  Dec("link up                         ", PcieLinkUp())
+  PrintNl()
+
+  ; ---- INBOUND: how the endpoint reaches US -------------------------
+  ; RC_BAR2 is the root complex's own BAR. Its low bits are a SIZE code,
+  ; not an address: the value written is ilog2(size) - 15, so 15 means
+  ; 1 GiB. The same size has to be mirrored into MISC_CTRL's SCB0 field
+  ; at bit 27, and a mismatch between the two is a real way to get a
+  ; window that decodes nothing.
+  UartWriteStr("INBOUND - the window the endpoint DMAs through")
+  PrintNl()
+  lo = PcieRcPeek($4034)
+  hi = PcieRcPeek($4038)
+  misc = PcieRcPeek($4008)
+  Row("RC_BAR2_CONFIG_LO", lo, 8)
+  Row("RC_BAR2_CONFIG_HI", hi, 8)
+  Dec("  size code (low 5 bits)", lo & $1F)
+  UartWriteStr("  that is ")
+  If (lo & $1F) = 0
+    UartWriteStr("ZERO - THE INBOUND WINDOW IS DISABLED.")
+    PrintNl()
+    UartWriteStr("  Nothing the endpoint sends upstream can land. This")
+    PrintNl()
+    UartWriteStr("  alone explains a Host System Error.")
+  Else
+    ; ilog2(size) - 15 = code, so size = 1 << (code + 15).
+    UartWriteStr("1 << ")
+    PrintDec((lo & $1F) + 15)
+    UartWriteStr(" bytes")
+  EndIf
+  PrintNl()
+  Row("MISC_CTRL        ", misc, 8)
+  scb0 = (misc >> 27) & $1F
+  Dec("  SCB0 size code (bit 27)", scb0)
+  UartWriteStr("  SCB0 matches RC_BAR2: ")
+  If scb0 = (lo & $1F)
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("NO - the two disagree, and the window decodes wrong")
+  EndIf
+  PrintNl()
+  Row("RC_BAR1_CONFIG_LO", PcieRcPeek($402C), 8)
+  Row("RC_BAR3_CONFIG_LO", PcieRcPeek($403C), 8)
+  PrintNl()
+
+  ; ---- OUTBOUND: how WE reach the endpoint --------------------------
+  UartWriteStr("OUTBOUND - the window we read the endpoint through")
+  PrintNl()
+  Row("out CPU base ", PcieOutCpu(), 16)
+  Row("out BUS base ", PcieOutBus(), 16)
+  Row("out size     ", PcieOutSize(), 16)
+  Row("dma limit    ", PcieDmaLimit(), 16)
+  PrintNl()
+
+  ; ---- the two config headers ---------------------------------------
+  UartWriteStr("BRIDGE, bus 0")
+  PrintNl()
+  cmd = PcieCfgRead32(0, 0, 0, $04)
+  Row("command/status", cmd, 8)
+  Dec("  memory space", (cmd >> 1) & 1)
+  Dec("  bus master  ", (cmd >> 2) & 1)
+  Row("bus numbers   ", PcieCfgRead32(0, 0, 0, $18), 8)
+  Row("mem base/limit", PcieCfgRead32(0, 0, 0, $20), 8)
+  PrintNl()
+
+  UartWriteStr("ENDPOINT, bus 1")
+  PrintNl()
+  Row("vendor:device ", PcieCfgRead32(1, 0, 0, $00), 8)
+  cmd = PcieCfgRead32(1, 0, 0, $04)
+  Row("command/status", cmd, 8)
+  Dec("  memory space", (cmd >> 1) & 1)
+  Dec("  bus master  ", (cmd >> 2) & 1)
+  Row("BAR0          ", PcieCfgRead32(1, 0, 0, $10), 8)
+  Row("BAR1          ", PcieCfgRead32(1, 0, 0, $14), 8)
+  PrintNl()
+
+  ; ---- where our DMA memory would actually live ---------------------
+  ; A local array stands in for the XHCI arena. What matters is the
+  ; ADDRESS RANGE the linker puts BSS in, because that is the range the
+  ; controller has to be able to reach, and it is easy to assume rather
+  ; than look at.
+  Define probe.i
+  Dim scratch.a[4096]
+  probe = @scratch[0]
+  UartWriteStr("A BSS BUFFER IN THIS IMAGE")
+  PrintNl()
+  Row("address      ", probe, 16)
+  Row("as a bus addr", PcieBusFromCpu(probe), 16)
+  UartWriteStr("  PcieDmaOk for 4 KiB there: ")
+  If PcieDmaOk(probe, 4096) <> 0
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("NO - out of the dma-ranges window")
+  EndIf
+  PrintNl()
+
+  PrintNl()
+  UartWriteStr("=== nothing was started ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

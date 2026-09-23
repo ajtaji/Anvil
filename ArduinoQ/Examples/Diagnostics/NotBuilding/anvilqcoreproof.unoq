@@ -1,0 +1,401 @@
+; ======================================================================
+;  anvilqcoreproof.unoq - Arduino UNO Q (QCM2290) CORE-ON-Q proof (phase 1)
+;
+;  The bring-up probe (anvilqprobe.unoq) proved a PureMetal-built image RUNS on the
+;  Q's A53. THIS image proves the PORTABLE ANVIL CORE COMPUTES CORRECTLY
+;  on the Q's silicon - not just "it ran". It runs the real, unmodified
+;  core libraries against the Q's own hardware backends and reports the
+;  results through the Q's phase-1 output channel (a UEFI NV variable).
+;
+;  WHAT IT REUSES, UNCHANGED (included read-only, never edited):
+;    Anvil/Core/crc.pbi       IEEE-802.3 CRC32 - the known-answer test
+;    Anvil/Core/format.pbi    PutHexN/PutHex8/PutAddr - hex formatting
+;    Anvil/Core/memrange.pbi  InPayload/HitsMonitor/PutWindows - the core
+;                             memory-range classification
+;
+;  WHAT THE Q SUPPLIES (this port's new, Q-local backends):
+;    ArduinoQ/Board/memmap_q.unoq   the Q's memory map + #CRC_POLY
+;    ArduinoQ/Board/qsink.pi4      the output SINK: the console seam
+;                                  (UartWrite + Print router) over a DRAM
+;                                  buffer instead of a UART
+;    ArduinoQ/Board/hwtimer_q.unoq  HwTimer: CNTPCT_EL0 / CNTFRQ_EL0
+;    ArduinoQ/Board/hwinfo_q.unoq   HwInfo: MIDR_EL1, CurrentEL, DRAM
+;
+;  THE PROOFS IT WRITES:
+;   1. crc32 KNOWN-ANSWER TEST. A fixed 4096-byte pattern - buf[i] =
+;      (i*167+13) & 0xFF - is built in the app's own buffer and CRC'd by
+;      Anvil/Core/crc.pbi. The host computes the SAME pattern's CRC with a
+;      different implementation (Python zlib) and the two must MATCH
+;      (expected 0x399208A7). This is the real-compute-is-correct proof.
+;   2. A memrange operation over the buffer: InPayload() and HitsMonitor()
+;      from Anvil/Core/memrange.pbi, with host-predictable answers.
+;   3. CNTPCT_EL0 read twice (advancing) - live execution + a working
+;      arch timer at the confirmed 19.2 MHz.
+;   4. The HwInfo block (MIDR/EL/CNTFRQ/DRAM), formatted via the core
+;      hex formatters through the Q sink.
+;
+;  HOW IT RUNS / DELIVERS: identical to the probe. UEFI enters at x0 =
+;  ImageHandle, x1 = SystemTable (preserved into Main by the compiler's
+;  --entry-returns _start). It writes two NON-VOLATILE UEFI variables via
+;  RuntimeServices->SetVariable - "AnvilQBin" (a compact machine-checkable
+;  struct, magic "ANVILQC1") and "AnvilQTxt" (the core-formatted report) -
+;  then ResetSystem(EfiResetCold) hands the board back to Debian. U-Boot
+;  persists NV variables to /boot/efi/ubootefi.var, so Linux reads the
+;  proof back over SSH (tools/read_qcore_proof.py).
+;
+;  BUILD:  tools/build_unoq_coreproof.sh   (-t unoq, then EFI-wrap)
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first (they define the seams the core needs) ---
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwinfo_q.unoq"
+; ---- portable core, reused unchanged --------------------------------
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+
+; memrange.pbi no longer assumes where the monitor is - it asks the board through
+; HwMonLo()/HwMonHi(), which the real Q board file answers from UEFI's loaded-image
+; protocol (ArduinoQ/Board/qstubs_q.unoq). This diagnostic proves the CORE with
+; host-predictable answers, so it answers with the window it declares above:
+; HitsMonitor(#MON_LO, #MON_HI) must be non-zero and HitsMonitor(buf) zero.
+Procedure.i HwMonLo()
+  ProcedureReturn #MON_LO
+EndProcedure
+
+Procedure.i HwMonHi()
+  ProcedureReturn #MON_HI
+EndProcedure
+
+; ---- captured UEFI entry registers -----------------------------------
+Global gIh.i             ; x0 = EFI ImageHandle at entry
+Global gSt.i             ; x1 = EFI SystemTable at entry
+Global gStSig.i          ; PeekI(SystemTable) - the EFI table signature
+
+; ---- results of the run ----------------------------------------------
+Global gMidr.i
+Global gElRaw.i
+Global gCntfrq.i
+Global gCntpct1.i
+Global gCntpct2.i
+Global gCrc.i            ; CRC32 the Q computed over the pattern
+Global gInPay.i         ; InPayload(buf)          expect 1
+Global gHitBuf.i        ; HitsMonitor(buf)        expect 0
+Global gHitMon.i        ; HitsMonitor(mon window) expect non-zero
+Global gIsQ.i           ; HwInfoIsQ()             expect 1
+Global gBufAddr.i
+Global gBufLen.i
+
+; ---- indirect-call scratch for UefiCall5() (same shape as the probe) --
+Global gCallFn.i
+Global gCallA0.i
+Global gCallA1.i
+Global gCallA2.i
+Global gCallA3.i
+Global gCallA4.i
+Global gCallRet.i
+Global gSetRc1.i
+Global gSetRc2.i
+
+; ---- buffers ---------------------------------------------------------
+Global Dim gName1.b[24]   ; UTF-16LE "AnvilQBin",0
+Global Dim gName2.b[24]   ; UTF-16LE "AnvilQTxt",0
+Global Dim gGuid.b[16]    ; vendor GUID
+Global Dim gBin.b[160]    ; the machine-checkable binary struct
+Global Dim gBuf.b[4096]   ; the known-answer test pattern
+
+; "IBI SYST" as a little-endian 64-bit word - EFI_SYSTEM_TABLE signature.
+#EFI_SYST_SIG = $5453595320494249
+; NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+#EFI_ATTR = $7
+#BIN_LEN  = 144
+#BUF_LEN  = 4096
+
+; ----------------------------------------------------------------------
+;  UefiCall5 - call gCallFn(gCallA0..gCallA4) by the AAPCS64/UEFI
+;  convention, return status in gCallRet. Verbatim from anvilqprobe.unoq:
+;  args cross in globals, target in x9, blr x9, save x0 out.
+; ----------------------------------------------------------------------
+Procedure UefiCall5()
+  ASM
+    adrp x0, global_gcalla0
+    add  x0, x0, #:lo12:global_gcalla0
+    ldr  x0, [x0]
+    adrp x1, global_gcalla1
+    add  x1, x1, #:lo12:global_gcalla1
+    ldr  x1, [x1]
+    adrp x2, global_gcalla2
+    add  x2, x2, #:lo12:global_gcalla2
+    ldr  x2, [x2]
+    adrp x3, global_gcalla3
+    add  x3, x3, #:lo12:global_gcalla3
+    ldr  x3, [x3]
+    adrp x4, global_gcalla4
+    add  x4, x4, #:lo12:global_gcalla4
+    ldr  x4, [x4]
+    adrp x9, global_gcallfn
+    add  x9, x9, #:lo12:global_gcallfn
+    ldr  x9, [x9]
+    blr  x9
+    adrp x10, global_gcallret
+    add  x10, x10, #:lo12:global_gcallret
+    str  x0, [x10]
+  EndASM
+EndProcedure
+
+; A byte-store helper so the buffer construction reads cleanly (probe's).
+Procedure Pb(base.i, off.i, v.i)
+  PokeB(base + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildPattern - the fixed known-answer pattern in the app's own buffer.
+;  buf[i] = (i*167 + 13) & 0xFF. The host reproduces this exact rule.
+; ----------------------------------------------------------------------
+Procedure BuildPattern()
+  Define i.i
+  Define base.i
+  base = @gBuf[0]
+  i = 0
+  While i < #BUF_LEN
+    PokeB(base + i, (i * 167 + 13) & $FF)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EmitReport - the human-readable proof, formatted ENTIRELY through the
+;  portable core hex formatters (format.pbi) and the Print router, so the
+;  text landing in gQOut is itself evidence those ran on the Q.
+; ----------------------------------------------------------------------
+Procedure EmitReport()
+  QOutReset()
+  PrintN("== Anvil UNO Q  core-on-Q proof  (phase 1) ==")
+
+  Print("MIDR_EL1   = ")
+  PutHex16(gMidr)
+  Print("  isQ=")
+  PrintDec(gIsQ)
+  PrintNl()
+
+  Print("CurrentEL  = ")
+  PutHex16(gElRaw)
+  Print("  -> EL")
+  PrintDec((gElRaw >> 2) & 3)
+  PrintNl()
+
+  Print("CNTFRQ_EL0 = ")
+  PrintDec(gCntfrq)
+  PrintN(" Hz")
+
+  Print("CNTPCT #1  = ")
+  PutHex16(gCntpct1)
+  PrintNl()
+  Print("CNTPCT #2  = ")
+  PutHex16(gCntpct2)
+  Print("  delta=")
+  PrintDec(gCntpct2 - gCntpct1)
+  PrintNl()
+
+  Print("uptime ms  = ")
+  PrintDec(HwUptimeMs())
+  PrintNl()
+
+  Print("buf addr   = ")
+  PutAddr(gBufAddr)
+  Print("  len=")
+  PrintDec(gBufLen)
+  PrintNl()
+
+  Print("crc32      = ")
+  PutHex8(gCrc)
+  PrintN("   (Anvil core crc.pbi; host expects 399208A7)")
+
+  Print("InPayload  = ")
+  PrintDec(gInPay)
+  PrintN("   (memrange.pbi over buf; expect 1)")
+  Print("HitsMon buf= ")
+  PrintDec(gHitBuf)
+  PrintN("   (expect 0)")
+  Print("HitsMon win= ")
+  PrintDec(gHitMon)
+  PrintN("   (memrange.pbi over MON window; expect non-zero)")
+
+  Print("DRAM base  = ")
+  PutAddr(HwInfoDramBase())
+  Print("  top=")
+  PutAddr(HwInfoDramTop())
+  PrintNl()
+
+  Print("ST sig     = ")
+  PutHex16(gStSig)
+  PrintNl()
+
+  ; The core's own window renderer, exercised through the Q sink: proves
+  ; format.pbi (PutAddr) and memrange.pbi (PutWindows) cooperate on the Q.
+  PrintN("payload windows (memrange.pbi PutWindows):")
+  PutWindows()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildBinary - the compact, machine-checkable struct. Magic "ANVILQC1"
+;  then fixed little-endian 64-bit fields (see tools/read_qcore_proof.py).
+; ----------------------------------------------------------------------
+Procedure BuildBinary()
+  Define base.i
+  base = @gBin[0]
+  ; magic "ANVILQC1"
+  Pb(base, 0, 65) : Pb(base, 1, 78) : Pb(base, 2, 86) : Pb(base, 3, 73)   ; ANVI
+  Pb(base, 4, 76) : Pb(base, 5, 81) : Pb(base, 6, 67) : Pb(base, 7, 49)   ; LQC1
+  PokeI(base + 8,   gMidr)
+  PokeI(base + 16,  gCntfrq)
+  PokeI(base + 24,  gElRaw)
+  PokeI(base + 32,  gCntpct1)
+  PokeI(base + 40,  gCntpct2)
+  PokeI(base + 48,  gCrc)
+  PokeI(base + 56,  gInPay)
+  PokeI(base + 64,  gHitBuf)
+  PokeI(base + 72,  gHitMon)
+  PokeI(base + 80,  gBufAddr)
+  PokeI(base + 88,  gBufLen)
+  PokeI(base + 96,  HwInfoDramBase())
+  PokeI(base + 104, HwInfoDramTop())
+  PokeI(base + 112, gIh)
+  PokeI(base + 120, gSt)
+  PokeI(base + 128, gStSig)
+  PokeI(base + 136, gIsQ)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildNames / BuildGuid - the UTF-16LE variable names and vendor GUID,
+;  hand-poked exactly like the probe (no dependence on host string libs).
+;  Both names are 9 characters: "AnvilQBin", "AnvilQTxt".
+; ----------------------------------------------------------------------
+Procedure BuildNames()
+  Define b.i
+  ; "AnvilQBin"
+  b = @gName1[0]
+  Pb(b,0,65):Pb(b,1,0)   : Pb(b,2,110):Pb(b,3,0)   ; A n
+  Pb(b,4,118):Pb(b,5,0)  : Pb(b,6,105):Pb(b,7,0)   ; v i
+  Pb(b,8,108):Pb(b,9,0)  : Pb(b,10,81):Pb(b,11,0)  ; l Q
+  Pb(b,12,66):Pb(b,13,0) : Pb(b,14,105):Pb(b,15,0) ; B i
+  Pb(b,16,110):Pb(b,17,0): Pb(b,18,0):Pb(b,19,0)   ; n , NUL
+  ; "AnvilQTxt"
+  b = @gName2[0]
+  Pb(b,0,65):Pb(b,1,0)   : Pb(b,2,110):Pb(b,3,0)   ; A n
+  Pb(b,4,118):Pb(b,5,0)  : Pb(b,6,105):Pb(b,7,0)   ; v i
+  Pb(b,8,108):Pb(b,9,0)  : Pb(b,10,81):Pb(b,11,0)  ; l Q
+  Pb(b,12,84):Pb(b,13,0) : Pb(b,14,120):Pb(b,15,0) ; T x
+  Pb(b,16,116):Pb(b,17,0): Pb(b,18,0):Pb(b,19,0)   ; t , NUL
+EndProcedure
+
+Procedure BuildGuid()
+  Define b.i
+  ; a1b2c3d4-5566-7788-99aa-bbccddeeff00, same vendor GUID as the probe.
+  b = @gGuid[0]
+  Pb(b, 0, $D4) : Pb(b, 1, $C3) : Pb(b, 2, $B2) : Pb(b, 3, $A1)
+  Pb(b, 4, $66) : Pb(b, 5, $55)
+  Pb(b, 6, $88) : Pb(b, 7, $77)
+  Pb(b, 8, $99) : Pb(b, 9, $AA) : Pb(b, 10, $BB) : Pb(b, 11, $CC)
+  Pb(b, 12, $DD): Pb(b, 13, $EE) : Pb(b, 14, $FF) : Pb(b, 15, $00)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SetVar - one RuntimeServices->SetVariable(name, guid, attr, size, data)
+;  call, given the SetVariable function pointer already resolved.
+; ----------------------------------------------------------------------
+Procedure.i SetVar(fn.i, name.i, size.i, data.i)
+  gCallFn = fn
+  gCallA0 = name
+  gCallA1 = @gGuid[0]
+  gCallA2 = #EFI_ATTR
+  gCallA3 = size
+  gCallA4 = data
+  UefiCall5()
+  ProcedureReturn gCallRet
+EndProcedure
+
+Procedure.i Main()
+  Define rt.i
+  Define fn.i
+  Define stOk.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gih
+    add  x9, x9, #:lo12:global_gih
+    str  x0, [x9]
+    adrp x9, global_gst
+    add  x9, x9, #:lo12:global_gst
+    str  x1, [x9]
+  EndASM
+
+  ; ---- HwInfo + HwTimer: read the Q's identity and first time sample --
+  gMidr    = RdMidr()
+  gElRaw   = RdCurrentEl()
+  gCntfrq  = RdCntfrq()
+  gCntpct1 = RdCntpct()
+  gIsQ     = HwInfoIsQ()
+
+  ; ---- core compute: the crc32 KNOWN-ANSWER TEST --------------------
+  BuildPattern()
+  gBufAddr = @gBuf[0]
+  gBufLen  = #BUF_LEN
+  gCrc     = Crc32(gBufAddr, gBufLen)          ; Anvil/Core/crc.pbi
+
+  ; ---- core memory-range operation over the app buffer -------------
+  gInPay  = InPayload(gBufAddr, gBufAddr + gBufLen - 1)   ; expect 1
+  gHitBuf = HitsMonitor(gBufAddr, gBufAddr + gBufLen - 1) ; expect 0
+  gHitMon = HitsMonitor(#MON_LO, #MON_HI)                 ; expect non-zero
+
+  ; ---- second time sample: the counter must have advanced ----------
+  gCntpct2 = RdCntpct()
+
+  ; ---- validate the captured SystemTable before trusting it --------
+  stOk = 0
+  If gSt <> 0
+    If (gSt & 7) = 0
+      If gSt >= $40000000
+        gStSig = PeekI(gSt)
+        If gStSig = #EFI_SYST_SIG
+          stOk = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; ---- format the report (core formatters -> Q sink -> gQOut) -------
+  EmitReport()
+
+  ; ---- build the machine-checkable struct and the var metadata -----
+  BuildBinary()
+  BuildNames()
+  BuildGuid()
+
+  ; ---- write both proofs to non-volatile UEFI variables ------------
+  If stOk = 1
+    rt = PeekI(gSt + $58)              ; EFI_SYSTEM_TABLE.RuntimeServices
+    fn = PeekI(rt + $58)              ; EFI_RUNTIME_SERVICES.SetVariable
+    gSetRc1 = SetVar(fn, @gName1[0], #BIN_LEN, @gBin[0])   ; AnvilQBin
+    gSetRc2 = SetVar(fn, @gName2[0], gQOutLen, @gQOut[0])  ; AnvilQTxt
+
+    ; ---- hand the board back to Linux via a cold reset -------------
+    ; ResetSystem(EfiResetCold=0, EFI_SUCCESS=0, 0, NULL). Does not
+    ; return; if it somehow does, we fall through to the boot manager,
+    ; which boots the default (Debian) entry.
+    fn = PeekI(rt + $68)              ; EFI_RUNTIME_SERVICES.ResetSystem
+    gCallFn = fn
+    gCallA0 = 0
+    gCallA1 = 0
+    gCallA2 = 0
+    gCallA3 = 0
+    gCallA4 = 0
+    UefiCall5()
+  EndIf
+
+  ProcedureReturn 0
+EndProcedure

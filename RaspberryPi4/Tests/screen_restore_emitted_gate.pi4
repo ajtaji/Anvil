@@ -1,0 +1,425 @@
+; Executed-code gate for RESTORING THE CONSOLE FROM RETAINED STATE.
+;
+; The screen now comes up on the defaults before the settings store exists,
+; and is corrected afterwards. What that correction must never do is restore
+; the console from what is left on the glass: at a new rotation or a new
+; magnification those pixels are the wrong shape, and a "restore" that
+; presented them would look right for one frame and be wrong for ever.
+;
+; So the bodies under test are the two rebuild paths and the decision that
+; chooses between them, and the transcript they replay is the SHIPPED
+; Anvil/Core/boot_transcript.pbi rather than a model of it.
+;
+; The leaves - the surface, the renderer, the HVS, the timing record - are
+; stubs that COUNT and RECORD. Nothing here touches hardware.
+
+XIncludeFile "Anvil/Core/boot_transcript.pbi"
+
+#ANVIL_V3D_CONSOLE = 1
+#SCR_SRC_NONE = 0
+#SCR_SRC_HDMI = 1
+#SCR_SRC_DSI  = 2
+#MON_FB_PANEL_W = 800
+#MON_FB_PANEL_H = 1280
+
+Global gScreen.i
+Global gScrSrc.i
+Global gScrRot.i
+Global gScrScale.i
+Global gScreenBg.i
+Global gDma.i
+Global *gConPaint
+
+; What the settings store is pretending to say this run.
+Global gate_wantRot.i
+Global gate_wantScale.i
+Global gate_scaleWidth.i
+
+; The HVS half, modelled as the two-phase machine the product uses.
+Global gate_beginOk.i
+Global gate_resolveReady.i
+Global gate_pending.i
+Global gate_abandons.i
+Global gate_beginRot.i
+Global gate_beginScale.i
+
+; What the rebuild did.
+Global gate_clears.i
+Global gate_banners.i
+Global gate_gridInits.i
+Global gate_presents.i
+Global gate_renderer.i
+Global gate_drain.i
+Global gate_scale.i
+Global gate_kbdResets.i
+Global gate_touchFlushes.i
+Global gate_v3dInvalidates.i
+Global gV3dConOn.i
+Global gCursorGpuOwned.i
+Global gate_hides.i
+Global gate_repaints.i
+Global gate_adopts.i
+Global gate_hvsCalls.i
+Global gate_firmwareCalls.i
+Global gate_marks.i
+Global gate_lastMark.i
+Global gate_ticks.i
+Global gate_prints.i
+
+; The rebuilt grid, so the replayed transcript can be read back in order.
+Global Dim gate_grid.a[#BOOT_TRANSCRIPT_BYTES]
+Global gate_grid_n.i
+
+Procedure ConPaintDma()
+EndProcedure
+
+Procedure str_print_at(p.i) : gate_prints = gate_prints + 1 : EndProcedure
+Procedure UartWriteStr(s.i) : gate_prints = gate_prints + 1 : EndProcedure
+Procedure PrintDec(v.i) : gate_prints = gate_prints + 1 : EndProcedure
+Procedure PrintNl() : gate_prints = gate_prints + 1 : EndProcedure
+
+Procedure.i Ticks() : gate_ticks = gate_ticks + 1000 : ProcedureReturn gate_ticks : EndProcedure
+Procedure.i TickHz() : ProcedureReturn 54000000 : EndProcedure
+
+Procedure BootTimingMark(id.i, v1.i, v2.i)
+  gate_marks = gate_marks + 1
+  gate_lastMark = id
+EndProcedure
+#BTM_READOPT_BEGIN = 15
+#BTM_READOPT_DONE  = 16
+
+Procedure.i ScrRotWanted(src.i) : ProcedureReturn gate_wantRot : EndProcedure
+Procedure.i ScrScaleWanted(src.i, logicalW.i) : gate_scaleWidth = logicalW : ProcedureReturn gate_wantScale : EndProcedure
+Procedure.i ScrSideways(r.i) : ProcedureReturn Bool(r = 90 Or r = 270) : EndProcedure
+Procedure.i ScrLogicalW(r.i, w.i, h.i) : If ScrSideways(r) : ProcedureReturn h : EndIf : ProcedureReturn w : EndProcedure
+Procedure.i ScrScaleOk(s.i) : ProcedureReturn Bool(s >= 1 And s <= 8) : EndProcedure
+
+; The DSI half. Begin stages; Resolve answers 0 until the model says the
+; requested list is active; Abandon makes a late latch harmless.
+Procedure.i ScrDsiReadoptBegin(rot.i, scale.i)
+  gate_hvsCalls = gate_hvsCalls + 1
+  If gate_beginOk = 0
+    ProcedureReturn 0
+  EndIf
+  gate_beginRot = rot
+  gate_beginScale = scale
+  gate_pending = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScrDsiReadoptResolve()
+  If gate_pending = 0
+    ProcedureReturn 1
+  EndIf
+  If gate_resolveReady = 0
+    ProcedureReturn 0
+  EndIf
+  gScrRot = gate_beginRot
+  gScrScale = gate_beginScale
+  gate_adopts = gate_adopts + 1
+  gate_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScrDsiReadoptAbandon()
+  gate_abandons = gate_abandons + 1
+  gate_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScreenDmaUp() : ProcedureReturn 1 : EndProcedure
+Procedure DisplayAutoFlush(on.i) : EndProcedure
+Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn (r << 16) | (g << 8) | b : EndProcedure
+Procedure DisplayColour(fg.i, bg.i) : EndProcedure
+Procedure DisplayClear(c.i) : gate_clears = gate_clears + 1 : EndProcedure
+Procedure DrawBanner() : gate_banners = gate_banners + 1 : EndProcedure
+Procedure DisplayConsole(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure.i DisplayWidth() : ProcedureReturn 1280 : EndProcedure
+Procedure.i DisplayHeight() : ProcedureReturn 800 : EndProcedure
+Procedure.i LogoHeight() : ProcedureReturn 96 : EndProcedure
+Procedure.i DisplayCols() : ProcedureReturn 160 : EndProcedure
+Procedure.i DisplayRows() : ProcedureReturn 42 : EndProcedure
+Procedure DisplayScale(s.i) : gate_scale = s : EndProcedure
+
+; The firmware path. Nothing in either rebuild may reach it: on DSI there is
+; no firmware display at all, and on HDMI the surface is not re-acquired -
+; only the composition over it is redrawn.
+Procedure.i DisplayInit(w.i, h.i, d.i) : gate_firmwareCalls = gate_firmwareCalls + 1 : ProcedureReturn 0 : EndProcedure
+
+Procedure ConGridInit(cols.i, rows.i)
+  gate_gridInits = gate_gridInits + 1
+  gate_grid_n = 0
+EndProcedure
+
+Procedure ConGridPutc(c.i)
+  If gate_grid_n < #BOOT_TRANSCRIPT_BYTES
+    gate_grid[gate_grid_n] = c & $FF
+    gate_grid_n = gate_grid_n + 1
+  EndIf
+EndProcedure
+
+Procedure ConSetRenderer(*fn)
+  *gConPaint = *fn
+  If *fn = 0
+    gate_renderer = 0
+  Else
+    gate_renderer = 1
+  EndIf
+EndProcedure
+Procedure ConRepaint() : gate_repaints = gate_repaints + 1 : EndProcedure
+Procedure UartMirrorSetDrain(*fn)
+  If *fn = 0
+    gate_drain = 0
+  Else
+    gate_drain = 1
+  EndIf
+EndProcedure
+Procedure ConMirrorDrain() : EndProcedure
+Procedure PointerHide() : gate_hides = gate_hides + 1 : EndProcedure
+Procedure TouchKeyboardOverlayReset() : gate_kbdResets = gate_kbdResets + 1 : EndProcedure
+Procedure ScrPresentAll() : gate_presents = gate_presents + 1 : EndProcedure
+Procedure HwTouchFlush() : gate_touchFlushes = gate_touchFlushes + 1 : EndProcedure
+Procedure V3dConInvalidate() : gate_v3dInvalidates = gate_v3dInvalidates + 1 : EndProcedure
+
+; @@BODY@@
+
+Procedure GateFresh(src.i, rot.i, scale.i)
+  gScreen = 1
+  gScrSrc = src
+  gScrRot = rot
+  gScrScale = scale
+  gate_beginOk = 1
+  gate_resolveReady = 0
+  gate_pending = 0
+  gate_abandons = 0
+  gate_clears = 0
+  gate_banners = 0
+  gate_gridInits = 0
+  gate_presents = 0
+  gate_kbdResets = 0
+  gate_touchFlushes = 0
+  gate_v3dInvalidates = 0
+  gV3dConOn = 1
+  gCursorGpuOwned = 1
+  gate_hides = 0
+  gate_repaints = 0
+  gate_adopts = 0
+  gate_hvsCalls = 0
+  gate_firmwareCalls = 0
+  gate_marks = 0
+  gate_scale = 0
+  gate_grid_n = 0
+  gate_prints = 0
+  gate_renderer = 1
+  gate_drain = 1
+  gScreenReadoptSuspended = 0
+EndProcedure
+
+Procedure GateLoad(n.i)
+  Define i.i
+  BootTranscriptStart()
+  i = 0
+  While i < n
+    BootTranscriptPut(65 + (i % 26))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i GateGridMatchesTranscript()
+  Define i.i
+  If gate_grid_n <> BootTranscriptCount()
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < gate_grid_n
+    If gate_grid[i] <> BootTranscriptAt(i)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+
+  GateLoad(300)
+
+  ; ---- 1. THE COMMON CASE COSTS NOTHING. The store names what the screen
+  ;         already came up with, so nothing is suspended, nothing is
+  ;         rebuilt and the glass is not touched.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_wantRot = 90 : gate_wantScale = 1
+  If ScreenApplyStoredGeometry() <> 0 : ProcedureReturn 1 : EndIf
+  If gate_hvsCalls <> 0 Or gate_gridInits <> 0 Or gate_presents <> 0 : ProcedureReturn 2 : EndIf
+  If gate_marks <> 0 Or gate_prints <> 0 : ProcedureReturn 3 : EndIf
+
+  ; ---- 2. A DSI ROTATION CHANGE IS APPLIED IN PLACE AND THE BOOT LOG IS
+  ;         PUT BACK FROM THE TRANSCRIPT, in order, byte for byte.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_wantRot = 270 : gate_wantScale = 2
+  gate_resolveReady = 1
+  If ScreenApplyStoredGeometry() <> 1 : ProcedureReturn 4 : EndIf
+  ; The scale rule was handed the console width AT THE REQUESTED ROTATION
+  ; (270 is sideways, so 1280), not the width of the surface that is still up.
+  If gate_scaleWidth <> 1280 : ProcedureReturn 58 : EndIf
+  If gScrRot <> 270 Or gScrScale <> 2 : ProcedureReturn 5 : EndIf
+  If gate_adopts <> 1 Or gate_abandons <> 0 : ProcedureReturn 6 : EndIf
+  If gate_clears <> 1 Or gate_banners <> 1 Or gate_gridInits <> 1 : ProcedureReturn 7 : EndIf
+  If GateGridMatchesTranscript() = 0 : ProcedureReturn 8 : EndIf
+  ; The rebuilt console is presented exactly once, as a whole - the banner
+  ; band is not part of the grid, so a per-row present would leave it dark.
+  If gate_presents <> 1 : ProcedureReturn 9 : EndIf
+  ; Ownership is handed back: a renderer, a drain, a keyboard layout that
+  ; knows its rectangles are stale, and the pointer lifted before the
+  ; surface moved under it.
+  If gate_renderer <> 1 Or gate_drain <> 1 : ProcedureReturn 10 : EndIf
+  If gate_kbdResets <> 1 Or gate_hides <> 1 : ProcedureReturn 11 : EndIf
+  ; Every touch event queued against the old surface is dropped.
+  If gate_touchFlushes <> 1 : ProcedureReturn 56 : EndIf
+  ; And the GPU is told its geometry-derived state is stale and handed the
+  ; console back to the CPU/DMA tier, before anything was drawn.
+  If gate_v3dInvalidates <> 1 Or gV3dConOn <> 0 Or gCursorGpuOwned <> 0 : ProcedureReturn 57 : EndIf
+  If gScreenReadoptSuspended <> 0 : ProcedureReturn 12 : EndIf
+  ; Nothing asked the firmware for anything. The panel is not one of its
+  ; displays and re-acquiring a surface is not what this path does.
+  If gate_firmwareCalls <> 0 : ProcedureReturn 13 : EndIf
+  If gate_lastMark <> #BTM_READOPT_DONE : ProcedureReturn 14 : EndIf
+
+  ; A rotation that makes the console NARROWER proves the width is the one
+  ; at the REQUESTED rotation and not the live surface's: at 0 the panel's
+  ; console is 800 across while the surface still up is 1280.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_wantRot = 0 : gate_wantScale = 1
+  gate_resolveReady = 1
+  gate_scaleWidth = -1
+  If ScreenApplyStoredGeometry() <> 1 : ProcedureReturn 60 : EndIf
+  If gate_scaleWidth <> 800 Or DisplayWidth() <> 1280 : ProcedureReturn 61 : EndIf
+
+  ; ---- 3. REPLAY IS REPEATABLE. A second rebuild reconstructs the same
+  ;         grid from byte zero - no cursor to resume from, so a rebuild
+  ;         that failed half way can simply be done again.
+  gate_gridInits = 0 : gate_presents = 0
+  ScreenRebuildAtGeometry()
+  If gate_gridInits <> 1 Or GateGridMatchesTranscript() = 0 : ProcedureReturn 15 : EndIf
+
+  ; ---- 4. WHILE THE HVS HAS NOT TAKEN THE LIST, NOTHING PAINTS. The
+  ;         software geometry and the scanned geometry may disagree until
+  ;         DISPLACT names the new list; painting across that is a frame
+  ;         torn between two shapes.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_wantRot = 0 : gate_wantScale = 1
+  gate_resolveReady = 0
+  If ScreenDsiReadoptStart(0, 1) <> 1 : ProcedureReturn 16 : EndIf
+  If gate_renderer <> 0 Or gate_drain <> 0 : ProcedureReturn 17 : EndIf
+  If ScreenDsiReadoptService() <> 0 : ProcedureReturn 18 : EndIf
+  If gate_gridInits <> 0 Or gScrRot <> 90 : ProcedureReturn 19 : EndIf
+  ; A LATE ADOPTION IS STILL RECOGNISED. The request was never cancelled.
+  gate_resolveReady = 1
+  If ScreenDsiReadoptService() <> 1 : ProcedureReturn 20 : EndIf
+  If gScrRot <> 0 Or gate_gridInits <> 1 : ProcedureReturn 21 : EndIf
+  If GateGridMatchesTranscript() = 0 : ProcedureReturn 22 : EndIf
+
+  ; ---- 5. GIVING UP RESTORES THE CONSOLE THAT IS ACTUALLY ON THE GLASS.
+  ;         The software geometry was never changed while pending, so the
+  ;         old renderer is the right one; the staged HVS slot is made
+  ;         harmless rather than pretended cancelled.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_resolveReady = 0
+  If ScreenDsiReadoptStart(180, 1) <> 1 : ProcedureReturn 23 : EndIf
+  ScreenDsiReadoptAbandon()
+  If gate_abandons <> 1 : ProcedureReturn 24 : EndIf
+  If gScrRot <> 90 Or gScrScale <> 1 : ProcedureReturn 25 : EndIf
+  If gate_renderer <> 1 Or gate_drain <> 1 : ProcedureReturn 26 : EndIf
+  If gate_repaints <> 1 Or gate_gridInits <> 0 : ProcedureReturn 27 : EndIf
+  If gScreenReadoptSuspended <> 0 : ProcedureReturn 28 : EndIf
+
+  ; ---- 6. A REFUSED STAGE CHANGES NOTHING AND LEAVES THE CONSOLE RUNNING.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_beginOk = 0
+  gate_wantRot = 180 : gate_wantScale = 1
+  If ScreenApplyStoredGeometry() <> 0 : ProcedureReturn 29 : EndIf
+  If gate_renderer <> 1 Or gate_drain <> 1 Or gate_gridInits <> 0 : ProcedureReturn 30 : EndIf
+  If gScrRot <> 90 : ProcedureReturn 31 : EndIf
+
+  ; ---- 7. HDMI IS A DIFFERENT CONTRACT. Only the magnification can
+  ;         differ, and correcting it is a redraw of the composition: no
+  ;         display list, no re-adoption, no transpose, no firmware call.
+  GateFresh(#SCR_SRC_HDMI, 0, 1)
+  gate_wantRot = 0 : gate_wantScale = 3
+  If ScreenApplyStoredGeometry() <> 1 : ProcedureReturn 32 : EndIf
+  ; On HDMI the live surface IS the answer - the same expression the
+  ; bring-up used, so the comparison cannot disagree with it.
+  If gate_scaleWidth <> DisplayWidth() : ProcedureReturn 59 : EndIf
+  If gate_hvsCalls <> 0 Or gate_adopts <> 0 Or gate_firmwareCalls <> 0 : ProcedureReturn 33 : EndIf
+  If gScrScale <> 3 Or gate_scale <> 3 : ProcedureReturn 34 : EndIf
+  If gate_gridInits <> 1 Or gate_presents <> 1 : ProcedureReturn 35 : EndIf
+  If GateGridMatchesTranscript() = 0 : ProcedureReturn 36 : EndIf
+  If gate_kbdResets <> 1 : ProcedureReturn 37 : EndIf
+
+  ; ---- 8. A ROTATION ASKED FOR ON HDMI IS REFUSED LOUDLY AND THE SCREEN
+  ;         IS NOT TURNED. ScrRotPick answers 0 for HDMI whatever the store
+  ;         says; a value reaching here is a defect upstream, not an
+  ;         instruction to act on.
+  GateFresh(#SCR_SRC_HDMI, 0, 1)
+  gate_prints = 0
+  gate_wantRot = 90 : gate_wantScale = 1
+  If ScreenApplyStoredGeometry() <> 0 : ProcedureReturn 38 : EndIf
+  If gScrRot <> 0 Or gate_gridInits <> 0 Or gate_hvsCalls <> 0 : ProcedureReturn 39 : EndIf
+  If gate_prints = 0 : ProcedureReturn 40 : EndIf
+
+  ; ---- 9. A rotation AND a magnification asked for on HDMI: the rotation
+  ;         is refused and the magnification still applied, because the
+  ;         two are separate statements and dropping the second would be a
+  ;         silent half-refusal.
+  GateFresh(#SCR_SRC_HDMI, 0, 1)
+  gate_wantRot = 180 : gate_wantScale = 2
+  If ScreenApplyStoredGeometry() <> 1 : ProcedureReturn 41 : EndIf
+  If gScrRot <> 0 Or gScrScale <> 2 : ProcedureReturn 42 : EndIf
+  If gate_hvsCalls <> 0 : ProcedureReturn 43 : EndIf
+
+  ; ---- 10. A refused magnification on HDMI leaves the console alone.
+  GateFresh(#SCR_SRC_HDMI, 0, 1)
+  gate_wantRot = 0 : gate_wantScale = 99
+  If ScreenApplyStoredGeometry() <> 0 : ProcedureReturn 44 : EndIf
+  If gScrScale <> 1 Or gate_gridInits <> 0 : ProcedureReturn 45 : EndIf
+
+  ; ---- 11. WITH NO SCREEN AT ALL there is nothing to correct, and the
+  ;          stored geometry must not be applied to a surface that is not
+  ;          there.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gScreen = 0
+  gate_wantRot = 270 : gate_wantScale = 4
+  If ScreenApplyStoredGeometry() <> 0 : ProcedureReturn 46 : EndIf
+  ; AND IT SAYS NOTHING AND RECORDS NOTHING. A refusal that still printed a
+  ; sentence about moving the console, or still stamped the timing record
+  ; with a change that did not happen, is a boot log describing a screen
+  ; that is not there.
+  If gate_hvsCalls <> 0 Or gate_gridInits <> 0 : ProcedureReturn 47 : EndIf
+  If gate_marks <> 0 Or gate_prints <> 0 : ProcedureReturn 55 : EndIf
+
+  ; ---- 12. AN EMPTY TRANSCRIPT REBUILDS AN EMPTY GRID rather than
+  ;          refusing: a board whose screen came up with nothing printed
+  ;          yet still gets its banner back.
+  BootTranscriptReset()
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  gate_wantRot = 180 : gate_wantScale = 1
+  gate_resolveReady = 1
+  If ScreenApplyStoredGeometry() <> 1 : ProcedureReturn 48 : EndIf
+  If gate_grid_n <> 0 Or gate_banners <> 1 Or gate_presents <> 1 : ProcedureReturn 49 : EndIf
+
+  ; ---- 13. THE TWO CONTRACTS REFUSE EACH OTHER'S SCREEN DIRECTLY, not
+  ;          only through the chooser above. A caller that reached either
+  ;          one with the wrong screen would be asking the HVS for a list
+  ;          over a framebuffer the firmware owns, or redrawing an HDMI
+  ;          composition onto a panel that is mid-transpose.
+  GateFresh(#SCR_SRC_DSI, 90, 1)
+  If ScreenHdmiRescale(3) <> 0 : ProcedureReturn 50 : EndIf
+  If gScrScale <> 1 Or gate_scale <> 0 Or gate_gridInits <> 0 : ProcedureReturn 51 : EndIf
+  GateFresh(#SCR_SRC_HDMI, 0, 1)
+  If ScreenDsiReadoptStart(90, 1) <> 0 : ProcedureReturn 52 : EndIf
+  If gate_hvsCalls <> 0 Or gate_renderer <> 1 Or gate_drain <> 1 : ProcedureReturn 53 : EndIf
+  If gScreenReadoptSuspended <> 0 : ProcedureReturn 54 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

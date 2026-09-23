@@ -1,0 +1,94 @@
+@CHAPTER TrueType fonts in the resident Vulkan console
+@INTRO The Pi 4 Vulkan console can rasterize selected TrueType glyphs into a bounded atlas and draw them through its existing text path. Emitted CPU gates and returning-payload GPU comparisons pass for their stated cases. Resident font/Vulkan activation has been observed. The corrected offline Build 210 has not been flashed, so post-fix resident visual and stress checks remain outstanding.
+
+@SECTION Try a checked font
+
+The settings commands from the previous chapter load a font into one of four resident slots, select it, and choose its pixel size. The sample font files were placed flat in the Pi 4 exFAT data partition under `data:/fonts/`. For example:
+
+@FRAG
+font load 0 data:/fonts/Abel-Regular.ttf
+font select 0
+font size 20
+font info
+screen vulkan
+@ENDFRAG
+
+The font parser reads strict UTF-8 through the public layout API. The interactive command words and file path are still ASCII tokens, and the path cannot contain spaces. The existing console model owns cursor positions and cell dimensions. With a TrueType face selected, the Vulkan console batches ASCII cells at their existing grid positions. A glyph that fits the cell keeps its normal size and is translated only as far as needed to fit; an oversized glyph is uniformly scaled down to preserve its complete bitmap. This fit affects fixed-grid console cells only: regular TrueType text continues to use the requested pixel height. Changing the face or size does not change row height, column width, or cursor movement. The Vulkan frame path also renders the cursor and preserves the touch-keyboard band. The bitmap face remains the console default until you select a TrueType slot. Cursor and keyboard visuals still need board validation with `screen vulkan` owning the display.
+
+The `screen vulkan` command opts into the resident Vulkan console. On Build 207, the resident run loaded the 35,220-byte Abel font from `data:/fonts/`, selected slot 0, reported 259 glyphs, UPEM 2048, ascent 2006, descent -604, and size 16, then confirmed the Vulkan console active at 1280x800 with a 160x42 scale-1 grid. Screenshot review found presentation defects. Commit `a3f1216` corrects banner preservation and fixed-cell glyph fit; commit `d0dcbbf` fixes atlas shelf advancement. Build 210 has passed offline build identity and map checks, but has never been flashed. Do not treat the earlier activation or returning-payload tests below as resident visual acceptance.
+
+@SECTION The atlas cache
+
+`NeonVkChromeWarmTrueTypeText(pixelHeight, text)` decodes a NUL-terminated UTF-8 string and prepares its glyphs before a frame begins. It returns the number of decoded glyphs, zero for an empty string, or a negative error. The string is limited to 4,095 bytes; the decoder accepts at most 4,096 glyph IDs for a warm call. Pixel height is 1 through 512.
+
+Each cached glyph is identified by the selected slot, that slot's generation, pixel height, and glyph ID. Replacing a slot advances its generation, so old atlas entries cannot be mistaken for the replacement font. The cache holds at most 512 glyph records and has 1 MiB of CPU coverage storage. A new glyph is rasterized once. All new glyphs from a warm call are uploaded together before the frame references their texture coordinates. If a call repeats only cached glyphs and nothing else has dirtied the atlas, it performs no rasterization and no atlas upload.
+
+`NeonVkChromeTTCacheReset()` clears the complete cache only between frames. It returns success on reset; the next warm call uploads the reset atlas and its new glyphs before drawing. If the cache fills while a grid is being prepared, the console resets and retries the complete current glyph set once. If that cannot fit, the frame fails and the Vulkan owner starts its safe failure transition.
+
+The resident TrueType console batches fixed cells by ink color into at most two draw segments. Chrome reserves `columns × rows + 512` quads for cells and bounded UI geometry; the tested 256×80 grid uses 20,480 cell quads within the 20,992-quad arena. The emitted Chrome gate passed whole-glyph fitting for oversized fixed cells, atomic capacity refusal, two-color flushing, the full 20,480-cell case, and UV/capacity mutants. The resident owner source also reserves the full console dimensions plus two draw segments. This establishes the bounded desk path; dense-grid rendering still needs a resident board run.
+
+`NeonVkChromeFontHeightSet(font, pixelHeight)` sets an optional per-Neon-face height from 1 through 512. A value of zero clears the override. The general TrueType setting remains in the renderer-neutral slot layer. The touch-keyboard mono face uses its current bitmap pixel height as its TrueType raster size when it has no explicit override. When the TrueType measurement backend is active, widget width and line-height queries use UTF-8 layout for the selected face. Width includes pair positioning and determines right- and centre-aligned origins; multiline text uses its widest line. These queries perform layout only: they do not rasterize glyphs, change the atlas cache, or upload textures. If the face is unavailable or the backend is cleared, Neon uses its bitmap measurements.
+
+@SECTION Ownership and safe failure
+
+The board owner exposes `VulkanConsoleStart`, `VulkanConsoleStop`, `VulkanConsoleReady`, `VulkanConsoleError`, and `VulkanConsoleQuarantined`. `VulkanConsolePayloadSuspend` retires the resident Vulkan renderer before the monitor enters another payload; `VulkanConsolePayloadResume` may restore it after the monitor returns. The normal console stays on its established framebuffer path unless you opt into Vulkan.
+
+After a Vulkan frame failure, Anvil first waits for the Vulkan device to become idle and then asks the resident V3D owner to invalidate its mappings. Only when both releases succeed does it detach the atlas mapping, disable the DMA callback, and repaint through the framebuffer renderer. It restores a previously visible cursor through a direct CPU save/draw path after safe release, without re-entering the console repaint callback. If Vulkan idle cannot be proved, it retains device handles and memory, quarantines the screen, performs no CPU repaint or cursor/keyboard writes, and refuses payload entry. If Vulkan is idle but V3D invalidation fails, it still refuses CPU repaint and leaves the owner quarantined. An explicit `screen vulkan` retry is required after the owner can prove it is safe again.
+
+The emitted owner gate executes the actual destroy, failover, stop, and payload-suspend procedures with controlled device and V3D results. Its final cursor/keyboard version passed 28 assertions in 5,422 interpreted instructions, including retained handles and no repaint on failed idle, one fallback repaint after safe release, quarantine after failed V3D invalidation, and payload refusal. This checks owner state transitions in an emitted CPU fixture; it does not emulate Vulkan execution or prove hardware recovery from a real MMU fault.
+
+@SECTION What has been proved
+
+The emitted Chrome cache gate stages the exact production cache and warm procedures, uses a real Abel font in resident memory, and stubs atlas upload rather than invoking Vulkan. It passed 28 checks in 34,927,801 interpreted instructions. It verifies cold raster/upload, a warm hit with no second raster/upload, cache identity across size, slot, and generation, UTF-8 refusal, capacity handling, reset timing, and rejection of a generation-key mutant. The result is recorded in `_work/truetype-tests-20260918/chrome-cache-gate.txt`.
+
+The broader desk gates cover sfnt validation, metrics, cmap and UTF-8, glyf outlines, coverage rasterization, pair layout, resident slot lifecycle, command defaults, and mapped-memory bounds. Their case-specific results are in `_work/truetype-tests-20260918/`. The renderer-neutral measurement gate passes 55 assertions in 14,781,204 interpreted instructions against an independent Abel kerning/advance oracle. It checks UTF-8 and multiline widths, right/centre origins, face sizing and line boxes, bitmap fallback, and that measurement causes no rasterization, cache mutation, or upload: `_work/neon-measure-backend-20260919/gate.txt`. The updated T4 emitted gate also compares the actual-glyph scalar and NEON coverage-conversion paths byte for byte on synthetic and real-font glyphs. The corrected run passed for the synthetic ring, start-on/end-off and all-off-curve glyphs, plus Abel and Bangers O/e-acute at 16 and 32 pixels; measurements are in `_work/truetype-neon-dispatch-20260919/t4-dispatch-results.txt`. NEON handles coverage-count conversion only; outline expansion and raster coverage remain on the scalar path. These tests establish bounded parser, layout, raster, cache, and owner behavior for their stated fixtures. They do not establish browser-grade shaping or resident-console GPU behavior; the separate returning-payload proof below verifies the Vulkan glyph path for its stated specimen.
+
+Twelve static SIL Open Font License 1.1 fonts were copied to the Pi 4 data partition. Their flat card paths are:
+
+@CODE
+data:/fonts/Abel-Regular.ttf
+data:/fonts/Acme-Regular.ttf
+data:/fonts/Aladin-Regular.ttf
+data:/fonts/Almendra-Regular.ttf
+data:/fonts/Amarante-Regular.ttf
+data:/fonts/Anton-Regular.ttf
+data:/fonts/Arbutus-Regular.ttf
+data:/fonts/Arvo-Regular.ttf
+data:/fonts/Bangers-Regular.ttf
+data:/fonts/CourierPrime-Regular.ttf
+data:/fonts/CrimsonText-Regular.ttf
+data:/fonts/Lato-Regular.ttf
+@ENDCODE
+
+Their corresponding license paths are:
+
+@CODE
+data:/fonts/Abel-OFL.txt
+data:/fonts/Acme-OFL.txt
+data:/fonts/Aladin-OFL.txt
+data:/fonts/Almendra-OFL.txt
+data:/fonts/Amarante-OFL.txt
+data:/fonts/Anton-OFL.txt
+data:/fonts/Arbutus-OFL.txt
+data:/fonts/Arvo-OFL.txt
+data:/fonts/Bangers-OFL.txt
+data:/fonts/CourierPrime-OFL.txt
+data:/fonts/CrimsonText-OFL.txt
+data:/fonts/Lato-OFL.txt
+@ENDCODE
+
+The TTF files total 1,536,152 bytes; the twelve license files, `manifest.json`, and `README.txt` bring the set to 26 files. The host copy is pinned to Google Fonts commit `f2bd09badbc763d8757951d52deec29da27e85fb` at `https://github.com/google/fonts/tree/f2bd09badbc763d8757951d52deec29da27e85fb`. The manifest records the exact raw source URL, license URL, and SHA-256 for every font and license. The board readback record says all 26 files matched their host byte counts and SHA-256 on monitor build 204. These static fonts use TrueType `glyf`/`loca`; the inspected set has no `fvar`, CFF, or CFF2 tables. File transfer and byte identity do not prove glyph appearance through the resident renderer.
+
+The first native TrueType Vulkan run did hit `VK_ERROR_DEVICE_LOST` and an L2T MMU fault at `0x0121E340`. After the texture-width fix in commit `d732179`, the returning-payload proof passed on the Pi 4: it returned in 7.8 seconds, passed 67 checks, rendered four draws with 168 vertices, and showed 24 cold rasterizations with three uploads followed by a warm pass with zero rasterizations, zero uploads, and 30 cache hits. The corrected report and screenshot are in `runs/vulkan-truetype-widthfixed-20260919/`. The captured image is a rotated physical diagnostic captured by the monitor after the payload returned; it proves this returning payload's Vulkan path, not the resident `screen vulkan` console path.
+
+A second returning-payload comparison rendered Abel glyph 19 at 16 px using both normal text and fixed-grid placement at 0° and 90°. All four copied 24×24 BGRA crops matched the expected 7×13 atlas coverage exactly: 42 nonzero pixels, zero per-pixel error, and no pixels outside the glyph bounds. After inverse rotation, the text and grid crops also matched each other exactly. Each rotation used two draws and twelve vertices. Evidence and decoded crops are under `_work/vulkan-truetype-grid-diff-instrumented-20260919/`. This verifies the returning target's text/grid geometry, UVs, and rotation for that glyph. Its atlas was produced by the scalar/default path; this is neither a full-console image nor proof of the resident NEON atlas path.
+
+The resident source reserves a protected 16 MiB BSS window at `0x0D000000..0x0DFFFFFF`. Build 207 from `3c42349` booted but had visual defects. Build 208 is the last confirmed board boot; its renderer-resume behavior was proved, but that does not validate the newer source. The attempted Build 209 boot-medium write is unverified because the board became unreachable. Build 210, compiled from source `ab357cf` with identity record `89b9fde`, is an offline artifact at `_work/final-vulkan-monitor-ab357cf-retry-eol/anvil.img` (4,161,468 bytes, SHA-256 `9c5518a3112bd20f0a5dfeea415f0885c5d92a1a3e6431f6485166f4115d3381`); its image range is `0x00200000..0x005F7FBB` and BSS is `0x0D000000..0x0DDA2AEF` (14,297,840 bytes). It has never been flashed. A post-fix resident screenshot, dense grid above 4096 cells, renderer resume on the new image, and final native metrics checks remain outstanding.
+
+@SECTION Source and proof references
+
+The cache implementation is in `Anvil/Graphics/Vulkan/neon_vk_chrome.pi4`; the owner and fallback state machine is in `RaspberryPi4/Board/vulkan_console.pi4`; the monitor's payload boundary is in `RaspberryPi4/Board/cache.pi4`. The emitted cache gate is `tools/truetype_chrome_cache_check.py` with `RaspberryPi4/Tests/truetype_chrome_cache_gate.pi4`. The owner gate is `tools/vulkan_console_owner_check.py` with `RaspberryPi4/Tests/vulkan_console_owner_gate.pi4`; its current cursor/keyboard safe-fallback result is 28 assertions / 5,422 instructions at `_work/truetype-tests-20260918/vulkan-console-owner-cursor-gate.txt`. The full-grid Chrome batch gate is `tools/vulkan_grid_batch_check.py` with `RaspberryPi4/Tests/vulkan_grid_batch_gate.pi4`; its result is `_work/vulkan-grid-batch-20260919/gate.txt`.
+
+The earlier native failure record is under runs/vulkan-truetype-mmu-diagnostics-20260918/; the corrected returning-payload record is under runs/vulkan-truetype-widthfixed-20260919/. Neither is a resident screen-vulkan console proof.
+
+Chapter 4 describes the command and bitmap fallback.

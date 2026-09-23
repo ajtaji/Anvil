@@ -1,0 +1,253 @@
+; ======================================================================
+;  hw_mem.pi4 - the Pi 4's answer to "how much memory is fitted".
+;
+;  The contract is the HwMemory* block in Anvil/Hal/hal.pbi: one total in
+;  BYTES, or -1 when the board honestly cannot know, and a fragment
+;  saying where the number came from.
+;
+; ----------------------------------------------------------------------
+;  WHERE THE NUMBER COMES FROM, AND WHY NOT FROM THE OBVIOUS PLACE
+; ----------------------------------------------------------------------
+;  THE MAILBOX HAS A TAG THAT LOOKS LIKE THE ANSWER AND IS NOT. "Get ARM
+;  memory" ($00010005) reports the ARM's SHARE OF THE FIRST GIGABYTE -
+;  the split between the ARM and the VideoCore that gpu_mem in config.txt
+;  sets. On a 4 GB board it answers about 948 MB, and a monitor that
+;  printed that as the board's memory would be wrong by a factor of four
+;  and would sound completely sure of itself. It is not asked here.
+;
+;  THE REVISION CODE IS THE ANSWER. The firmware's board revision word
+;  carries a MEMSIZE field in bits 22:20, documented by Raspberry Pi
+;  under "Raspberry Pi hardware - New-style revision codes" on
+;  raspberrypi.com. The field is an exponent: the size is 256 MB shifted
+;  left by it, so 0 is 256 MB, 1 is 512 MB, 2 is 1 GB, 3 is 2 GB, 4 is
+;  4 GB and 5 is 8 GB. Consulted, not copied.
+;
+;  DECODED AS A SHIFT AND NOT AS A TABLE, for the same reason
+;  PutRevision() in RaspberryPi4/Board/clock_info.pi4 already decodes the
+;  same field as a shift and says so on the spot: "The memory field is a
+;  power of two multiplying 256 MB, so it needs no table and cannot go
+;  stale when a new size appears." A table would answer nothing for the
+;  first board that ships a size nobody here has seen, and the two
+;  decoders of one field in one monitor must not disagree.
+;
+;  AN OLD-STYLE CODE ANSWERS -1. Bit 23 says which scheme the word is in.
+;  An old-style code is a small board number from a table this monitor
+;  does not carry, and there is no memory field in it at all - so there
+;  is nothing to decode and the honest answer is that this board cannot
+;  say. PutRevision() refuses the same word for the same reason.
+;
+; ----------------------------------------------------------------------
+;  WHY IT IS ASKED ONCE AND REMEMBERED
+; ----------------------------------------------------------------------
+;  A board does not grow memory between two commands, and the first
+;  caller is the address guard (RaspberryPi4/Board/hw_addr.pi4), which
+;  runs in front of every command that takes an address from the
+;  operator. A mailbox round trip on each of those would put a firmware
+;  transaction inside `memory`, `fill`, `copy`, `compare`, `crc32`,
+;  `mtest` and the rest, and the day the firmware is slow to answer is
+;  the day the monitor looks broken. So the first call asks and every
+;  later one reads the remembered word.
+;
+;  IT ASKS QUIETLY, AND THAT IS WHY IT DOES NOT CALL MbxUp(). MbxUp()
+;  (RaspberryPi4/Board/mailbox_info.pi4) PRINTS when the mailbox is down,
+;  which is right for `info` and `clock` - a person typed those - and
+;  wrong here, where the caller is a guard standing in front of somebody
+;  else's command and two lines of mailbox prose would arrive with no
+;  question in front of them. It is also included long after this file.
+;  What the operator gets instead is HwMemoryWhere(), which says why
+;  there is no number, in the one place that is asking.
+;
+;  MailboxInit() IS SAFE TO CALL HERE. It touches no peripheral at all -
+;  it clears the library's own state, aligns the message buffer and reads
+;  the tick frequency out of a system register - and it is asked for only
+;  when MailboxReady() says the library has not been brought up. No
+;  mailbox transaction can be in flight at that moment: every caller in
+;  this monitor builds, sends and reads one message before returning.
+;
+;  INCLUDE ORDER: after RaspberryPi4/Lib/mailbox.pi4 (MailboxReady,
+;  MailboxInit, MailboxBoardRevision), after Anvil/Hal/hal.pbi
+;  (#HW_MEM_UNKNOWN) and after Anvil/Core/format.pbi (PrintDec), and
+;  BEFORE RaspberryPi4/Board/hw_addr.pi4, which asks it. House rule 10:
+;  this file includes nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  WHAT HAS BEEN ASKED, AND WHAT CAME BACK.
+;
+;  gPiMemAsked is 0 until the first question and 1 afterwards, whatever
+;  the answer was - a board that could not say does not get asked again
+;  every command. gPiMemBytes is meaningless until then and is
+;  deliberately not initialised to a plausible size: an uninitialised
+;  read must not look like an answer. *gPiMemWhy is the fragment
+;  HwMemoryWhere() returns and is never left at 0 once asked.
+; ----------------------------------------------------------------------
+Global gPiMemAsked.i
+Global gPiMemBytes.i
+Global *gPiMemWhy
+
+; ----------------------------------------------------------------------
+;  HwMemFromRevision(rev) - the decode, and nothing else.
+;
+;  IT IS A PROCEDURE OF ITS OWN, and not four lines inside
+;  HwMemoryBytes(), for the reason AddrForceArmedFor() in
+;  Anvil/Core/addrsafe.pbi is: it is the only part of this that a gate
+;  can EXECUTE. Everything around it talks to the firmware, and a
+;  firmware is a board. This is pure - two shifts and a mask on one
+;  word - so tools/hw_memory_emitted_check.py compiles this exact
+;  procedure, runs the emitted A64 over every MEMSIZE code and over an
+;  old-style word, and rejects a wrong shift, a wrong base and an
+;  off-by-one code. A decode nothing can test is a decode nobody should
+;  trust.
+;
+;  THE SHIFT IS OF A POSITIVE VALUE. rev is a firmware word below
+;  $01000000 by the time the field is taken, so ">>" being arithmetic
+;  cannot bite - the same note PutRevision() carries over the same
+;  expression.
+;
+;  268435456 IS 256 MB WRITTEN OUT. It is the base of the exponent, in
+;  bytes, and it is a literal here rather than a constant because a
+;  constant in this compiler takes no arithmetic in its initialiser, so
+;  "256 * 1024 * 1024" cannot be written where a reader would want it.
+;  The largest answer this can produce is code 7, which is 32 GB, and
+;  that is a long way inside a signed 64-bit .i.
+; ----------------------------------------------------------------------
+Procedure.i HwMemFromRevision(rev.i)
+  Define mem.i
+  ; NEW-STYLE CODES ONLY. Bit 23 is the scheme bit; an old-style word has
+  ; no memory field at all.
+  If (rev & $00800000) = 0
+    ProcedureReturn #HW_MEM_UNKNOWN
+  EndIf
+  mem = (rev >> 20) & 7
+  ProcedureReturn 268435456 << mem
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryBytes() - the seam. Asked once; see the header.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryBytes()
+  Define rev.i
+
+  If gPiMemAsked <> 0
+    ProcedureReturn gPiMemBytes
+  EndIf
+  gPiMemAsked = 1
+  gPiMemBytes = #HW_MEM_UNKNOWN
+
+  If MailboxReady() = 0
+    If MailboxInit() = 0
+      *gPiMemWhy = "the VideoCore mailbox did not come up"
+      ProcedureReturn gPiMemBytes
+    EndIf
+  EndIf
+
+  rev = MailboxBoardRevision()
+  If rev = 0
+    *gPiMemWhy = "the firmware would not say what board this is"
+    ProcedureReturn gPiMemBytes
+  EndIf
+
+  gPiMemBytes = HwMemFromRevision(rev)
+  If gPiMemBytes = #HW_MEM_UNKNOWN
+    *gPiMemWhy = "an old-style revision code carries no memory field"
+    ProcedureReturn gPiMemBytes
+  EndIf
+
+  *gPiMemWhy = "the board revision code the firmware reports"
+  ProcedureReturn gPiMemBytes
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryWhere() - where that number came from, or why there is none.
+;
+;  IT ASKS HwMemoryBytes() FIRST rather than trusting the caller to have
+;  done so. A provenance fragment read before the question was asked
+;  would be 0, and a caller printing it would print nothing at all -
+;  which is the one outcome this seam exists to prevent. Asking is free
+;  after the first time.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryWhere()
+  HwMemoryBytes()
+  ProcedureReturn *gPiMemWhy
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieTellMemory() - hand the size to the PCI Express driver.
+;
+;  WHY THE DRIVER IS TOLD AND DOES NOT ASK. RaspberryPi4/Lib/pcie.pi4
+;  sizes its inbound DMA window from the memory fitted, exactly as Linux
+;  and U-Boot do; it is a library, the size is a board fact, and the
+;  include order settles it anyway - pcie.pi4 is compiled hundreds of
+;  lines before hal.pi4 and this file. So the board hands the number
+;  over, and every diagnostic that includes the library on its own is
+;  left with the driver's own fallback and behaves exactly as before.
+;
+;  IT LIVES HERE AND NOT AT THE CALL SITES because there are two of them
+;  - UsbEnumerate() in RaspberryPi4/Board/cursor_input.pi4 and the
+;  fallback walk in RaspberryPi4/Board/storage.pi4 - and the sentence
+;  below has to be the same sentence whichever one got there first. This
+;  file is where this board's memory facts are published to the parts of
+;  the machine that need them.
+;
+;  CALL IT BEFORE PcieInit(). After the window is programmed the number
+;  can only make the check and the window disagree, which is the exact
+;  shape of forum 916.
+;
+;  THE NOTE IS PRINTED ONCE PER BOOT, and only when the size is unknown.
+;  Twice would be once per call site, which tells the reader something
+;  about this monitor's structure and nothing about his board; and on a
+;  board that knows its size there is nothing to say here at all -
+;  `info` prints the size and the window follows it silently.
+; ----------------------------------------------------------------------
+Global gPiMemPcieNoted.i
+
+Procedure PcieTellMemory()
+  PcieSetMemoryBytes(HwMemoryBytes())
+  If HwMemoryBytes() <> #HW_MEM_UNKNOWN
+    ProcedureReturn
+  EndIf
+  If gPiMemPcieNoted <> 0
+    ProcedureReturn
+  EndIf
+  gPiMemPcieNoted = 1
+  PrintN("!! this board could not say how much memory it has, so the PCI Express")
+  PrintN("   inbound window is programmed at its largest useful size instead of")
+  PrintN("   being fitted to the memory. That is the safe direction - a window")
+  PrintN("   bigger than the memory behind it costs nothing - and transfers are")
+  PrintN("   still refused above the 3 GB the wrapper erratum allows. Type info")
+  PrintN("   to see why the size is unknown.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PutMemBytes(b) - a byte count as a person would say it.
+;
+;  "4 GB", "512 MB". Not 4294967296, and not 4096 MB: the number on the
+;  box is the number to print, and every size this field can carry is an
+;  exact power of two multiplying 256 MB, so there is never a remainder
+;  to round away or to hide.
+;
+;  IT PRINTS RATHER THAN RETURNING A FRAGMENT because the value is
+;  computed and a returned fragment would have to be assembled into a
+;  buffer that somebody then has to own. Two callers print it: the RAM
+;  row of `info` and nothing else today.
+;
+;  1048576 IS ONE MEGABYTE. The divide is exact for every size this
+;  decoder can produce; it is done in megabytes rather than in bytes so
+;  that a 32 GB board's byte count cannot meet a divisor large enough to
+;  matter.
+; ----------------------------------------------------------------------
+Procedure PutMemBytes(b.i)
+  Define mb.i
+  If b < 0
+    Print("an unknown amount")
+    ProcedureReturn
+  EndIf
+  mb = b / 1048576
+  If mb >= 1024
+    PrintDec(mb / 1024)
+    Print(" GB")
+  Else
+    PrintDec(mb)
+    Print(" MB")
+  EndIf
+EndProcedure

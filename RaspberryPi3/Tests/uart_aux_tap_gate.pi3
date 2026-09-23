@@ -1,0 +1,137 @@
+#P3C_AUX_BYTES = 8192
+#P3C_DEFERRED_RX_BYTES = 1024
+#P3C_SPIN_MAX = 2000000
+Global Dim uart_aux.a[#P3C_AUX_BYTES]
+Global uart_auxOn.i
+Global uart_auxHead.i
+Global uart_auxTail.i
+Global uart_auxLost.i
+Global *uart_auxFlush
+Global uart_auxBusy.i
+Global uart_auxBulk.i
+Global p3c_msgDepth.i
+Global *p3c_msgDrain
+Global p3c_dropped.i
+Global Dim p3c_deferredRx.a[#P3C_DEFERRED_RX_BYTES]
+Global p3c_deferredRxHead.i
+Global p3c_deferredRxTail.i
+Global p3c_deferredRxLost.i
+Global gate_uart_accept.i = 1
+Global gate_uart_count.i
+Global gate_screen_count.i
+Global gate_screen_last.i
+Global gate_flush_count.i
+Global Dim gate_rx_bytes.a[64]
+Global gate_rx_count.i
+Global gate_rx_index.i
+Global gate_rx_reads.i
+
+Procedure.i Pi3UartWrite(c.i)
+  If gate_uart_accept = 0 : ProcedureReturn 0 : EndIf
+  gate_uart_count = gate_uart_count + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3ScreenMirrorByte(c.i)
+  gate_screen_count = gate_screen_count + 1
+  gate_screen_last = c & $FF
+EndProcedure
+
+Procedure.i Pi3UartRead()
+  If gate_rx_index >= gate_rx_count : ProcedureReturn -1 : EndIf
+  gate_rx_reads = gate_rx_reads + 1
+  gate_rx_index = gate_rx_index + 1
+  ProcedureReturn gate_rx_bytes[gate_rx_index - 1] & $FF
+EndProcedure
+
+Procedure.i Pi3UartReadReady()
+  ProcedureReturn Bool(gate_rx_index < gate_rx_count)
+EndProcedure
+
+Procedure p3c_MessagePut(c.i)
+EndProcedure
+
+Declare.i UartWrite(c.i)
+
+; @@UART_AUX_PRODUCTION@@
+
+; @@UART_RX_PRODUCTION@@
+
+Procedure GateFlush()
+  gate_flush_count = gate_flush_count + 1
+EndProcedure
+
+Procedure.i Main()
+  Define n.i
+  Define c.i
+  gate_uart_accept = 1
+  UartAuxMirror(1)
+  If UartWrite(65) <> 1 : ProcedureReturn 1 : EndIf
+  If gate_uart_count <> 1 Or gate_screen_count <> 1 Or gate_screen_last <> 65 : ProcedureReturn 2 : EndIf
+  If UartAuxGet() <> 65 Or UartAuxGet() <> -1 : ProcedureReturn 3 : EndIf
+
+  gate_uart_accept = 0
+  If UartWrite(66) <> 0 : ProcedureReturn 4 : EndIf
+  If gate_uart_count <> 1 Or gate_screen_count <> 1 Or UartAuxGet() <> -1 : ProcedureReturn 5 : EndIf
+  If p3c_dropped <> 1 Or UartAuxLost() <> 0 : ProcedureReturn 6 : EndIf
+
+  gate_uart_accept = 1
+  gate_flush_count = 0
+  UartAuxSetFlush(@GateFlush)
+  If UartWrite(10) <> 1 : ProcedureReturn 7 : EndIf
+  If gate_flush_count <> 1 Or gate_uart_count <> 2 Or gate_screen_count <> 2 : ProcedureReturn 8 : EndIf
+  ; Model output produced inside the active flush. The tap's busy guard must
+  ; enqueue it without recursively invoking the callback.
+  uart_auxBusy = 1
+  If UartWrite(82) <> 1 : ProcedureReturn 9 : EndIf
+  uart_auxBusy = 0
+  If gate_flush_count <> 1 Or gate_uart_count <> 3 Or gate_screen_count <> 3 : ProcedureReturn 10 : EndIf
+  If UartAuxGet() <> 10 Or UartAuxGet() <> 82 Or UartAuxGet() <> -1 : ProcedureReturn 11 : EndIf
+
+  UartAuxSetFlush(0)
+  UartAuxMirror(0)
+  UartAuxMirror(1)
+  For n = 0 To #P3C_AUX_BYTES - 2
+    uart_AuxPut(65)
+  Next
+  If uart_auxHead <> #P3C_AUX_BYTES - 1 Or uart_auxTail <> 0 : ProcedureReturn 12 : EndIf
+  uart_AuxPut(66)
+  If UartAuxLost() <> 1 Or UartAuxFillHigh() <> 1 : ProcedureReturn 13 : EndIf
+  For n = 0 To #P3C_AUX_BYTES - 2
+    If UartAuxGet() <> 65 : ProcedureReturn 14 : EndIf
+  Next
+  If UartAuxGet() <> -1 : ProcedureReturn 15 : EndIf
+
+  UartAuxMirror(0)
+  If UartWrite(67) <> 1 : ProcedureReturn 16 : EndIf
+  If gate_screen_count <> 4 Or gate_screen_last <> 67 Or UartAuxGet() <> -1 : ProcedureReturn 17 : EndIf
+
+  ; Admission only moves bytes from PL011 to a private bounded ring. It does
+  ; not call InputFeedByte or re-enter ReadLine/command dispatch.
+  gate_rx_count = 40 : gate_rx_index = 0 : gate_rx_reads = 0
+  For n = 0 To 39 : gate_rx_bytes[n] = (n + 65) & $FF : Next
+  If UartAdmitPending(99) <> 32 : ProcedureReturn 18 : EndIf
+  If gate_rx_reads <> 32 Or p3c_deferredRxTail <> 32 Or UartDeferredRxLost() <> 0 : ProcedureReturn 19 : EndIf
+  If UartReadReady() = 0 : ProcedureReturn 20 : EndIf
+  For n = 0 To 31
+    c = UartRead()
+    If c <> (n + 65) : ProcedureReturn 21 : EndIf
+  Next
+  If UartReadReady() = 0 : ProcedureReturn 22 : EndIf
+  If UartAdmitPending(8) <> 8 : ProcedureReturn 23 : EndIf
+  If gate_rx_reads <> 40 Or gate_rx_index <> 40 : ProcedureReturn 24 : EndIf
+  For n = 32 To 39
+    c = UartReadWait(1)
+    If c <> (n + 65) : ProcedureReturn 25 : EndIf
+  Next
+  If UartReadWait(1) <> -1 : ProcedureReturn 26 : EndIf
+  p3c_deferredRxHead = 0 : p3c_deferredRxTail = 1
+  p3c_deferredRx[0] = 90
+  If UartReadReady() = 0 Or UartRead() <> 90 : ProcedureReturn 27 : EndIf
+  If UartReadReady() <> 0 : ProcedureReturn 28 : EndIf
+  gate_rx_count = 2 : gate_rx_index = 0 : gate_rx_reads = 0
+  p3c_deferredRxHead = 0 : p3c_deferredRxTail = #P3C_DEFERRED_RX_BYTES - 1
+  If UartAdmitPending(8) <> 0 : ProcedureReturn 29 : EndIf
+  If gate_rx_reads <> 0 Or gate_rx_index <> 0 Or UartDeferredRxLost() <> 0 : ProcedureReturn 30 : EndIf
+  ProcedureReturn 0
+EndProcedure

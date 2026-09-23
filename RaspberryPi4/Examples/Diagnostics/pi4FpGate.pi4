@@ -1,0 +1,1126 @@
+; pi4FpGate.pi4 - THE DIFFERENTIAL GATE. Run every binary32 operation
+;                  through the hardware FPU and through the software core
+;                  in math.pi4 and require the two to agree BIT FOR BIT.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile pi4FpGate.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o fpgate.img
+;
+; ----------------------------------------------------------------------
+; RUN pi4FpState.pi4 FIRST. THIS IS NOT ADVICE.
+; ----------------------------------------------------------------------
+; This program executes floating-point instructions. At EL2 those are
+; gated by CPTR_EL2.TFP, and nothing in this tree installs an exception
+; vector, so on a machine where the trap is closed the first `fmul`
+; branches into whatever reset left in VBAR_EL2 and the board goes
+; silent. The emitted prologue writes CPTR_EL2 = $33FF to open the gate
+; (see EmitCore_A64.pbi's NeedsFloatOps_A64 block), and that write is
+; correct only if HCR_EL2.E2H is 0.
+;
+; pi4FpState.pi4 measures both, prints them, and says in words what they
+; mean. It executes no floating-point instruction and cannot hang. It
+; costs one run. If this program produces no output at all, that is the
+; run to do next, and the answer it gives explains the silence.
+;
+; ----------------------------------------------------------------------
+; WHY A SOFTWARE ORACLE IS THE RIGHT ONE, AND WHY IT IS AVAILABLE HERE
+; ----------------------------------------------------------------------
+; RaspberryPi4/Lib/math.pi4 carries a complete software binary32 core,
+; written in ordinary 64-bit integer arithmetic, because until
+; 2026-08-26 this backend refused every floating-point IR node. Its own
+; header (math.pi4:78-90) says the core is CORRECTLY ROUNDED and
+; therefore "computes the same binary32 an IEEE-754 unit would", and
+; instructs whoever lands hardware floats to re-measure against it.
+;
+; That makes it an oracle of an unusually good kind: it is not a table of
+; expected answers that somebody typed, it is an INDEPENDENT
+; IMPLEMENTATION of the same specification, running on the same board, in
+; the same program, on the same inputs. A table can be wrong in the same
+; direction as the code it checks. Two implementations that share no
+; instruction cannot be.
+;
+; THE COMPARISON IS ON BIT PATTERNS AND NOTHING ELSE. Every operation
+; here takes two 32-bit integers, hands the same two integers to both
+; paths, and compares the two 32-bit integers that come back. No
+; floating-point value is ever printed, compared for equality, or used as
+; a loop bound. That matters because the interesting inputs are exactly
+; the ones ordinary comparison cannot distinguish: +0.0 and -0.0 compare
+; equal and are different answers; two NaNs with different payloads
+; compare unequal to each other and to themselves.
+;
+; THE SOFTWARE SIDE USES THE *B ENTRY POINTS, WHICH IS LOAD-BEARING.
+; MathFAddB, MathFMulB, MathFDivB, MathFCmpB, MathFFromIntB and
+; MathFToIntB take and return raw bit patterns as `.i` integers. They
+; contain no `.f` at all, so they still compile to integer code after
+; this change and cannot accidentally become a test of the hardware
+; against itself. The `.f`-facing wrappers in the same file - MathFAdd
+; and friends - would do exactly that and are deliberately not used.
+;
+; > DO NOT DELETE THE SOFTWARE CORE. math.pi4's own header says the day
+; > the backend learns `.f`, everything under THE SOFT BINARY32 CORE
+; > should be deleted. That instruction is now half-stale and the half
+; > that stands is worth stating precisely: the .f-facing WRAPPERS and
+; > the polynomial call sites should indeed go back to operators, and the
+; > *B CORE MUST STAY, because it is this gate's oracle. Deleting the
+; > reference implementation in the same change that introduces the thing
+; > it checks is how a project ends up unable to tell which half is
+; > wrong.
+;
+; ----------------------------------------------------------------------
+; WHAT IS COMPARED
+; ----------------------------------------------------------------------
+;   add sub mul div      the full N x N cross product of the fixed
+;                        vectors, then a pseudo-random sweep
+;   < <= > >= = <>       all six relations, full cross product. These are
+;                        compared as BOOLEANS, because the hardware path
+;                        no longer produces the four-way code the
+;                        software MathFCmpB returns - see THE COMPARISON
+;                        CONTRACT below.
+;   int -> float         over a list of integers chosen for the 2^24 and
+;                        2^53 boundaries and the 64-bit rails
+;   float -> int         over every fixed vector
+;
+; ----------------------------------------------------------------------
+; THE FIXED VECTORS, AND WHY EACH ONE IS THERE
+; ----------------------------------------------------------------------
+; Every value the brief for this work named, plus the ones that have
+; historically broken binary32 implementations. They are in the
+; DataSection at the foot of this file, one per line, each with the
+; reason it earns its place. In summary:
+;
+;   both zeros              +0 and -0 are different bit patterns that
+;                           compare equal. Sign-of-zero rules are the
+;                           most commonly wrong part of an FP core:
+;                           (+0) + (-0) is +0 under round-to-nearest,
+;                           but (-0) + (-0) is -0, and 0 * -1 is -0.
+;   both infinities         and the operations that must produce a NaN
+;                           from them - Inf - Inf, Inf / Inf, 0 * Inf.
+;   quiet and signalling    a signalling NaN must be QUIETED on output,
+;   NaNs, with payloads     which sets bit 22 and changes the pattern.
+;                           A NaN with a payload is the case that tells
+;                           propagation apart from default-NaN.
+;   the subnormal band      smallest subnormal, largest subnormal, and
+;                           the boundary in both directions. Gradual
+;                           underflow is the part of IEEE-754 that
+;                           hardware most often skips, under the name
+;                           flush-to-zero.
+;   smallest/largest normal both signs. Overflow to infinity and
+;                           underflow into the subnormal band are
+;                           reached from here in one operation.
+;   the 2^24 cliff          16777216 and its neighbours: the first
+;                           integer binary32 cannot represent exactly,
+;                           where round-to-nearest-EVEN stops agreeing
+;                           with round-half-up.
+;   ordinary values         so that a catastrophic failure shows up on
+;                           row one rather than only in the corners.
+;
+; ----------------------------------------------------------------------
+; THE COMPARISON CONTRACT - read this before believing a comparison row
+; ----------------------------------------------------------------------
+; MathFCmpB returns -1, 0, 1 or -2 for unordered. The hardware path
+; produces a BOOLEAN per relation, because `fcmp` sets NZCV and the
+; emitter branches on one condition. Those are different shapes, so this
+; file converts the software code into the same six booleans, using the
+; IEEE-754 rule that EVERY ORDERED RELATION IS FALSE WHEN EITHER OPERAND
+; IS A NaN, and that `<>` is the single relation that is TRUE.
+;
+; That conversion is written out in SoftRel below rather than reused from
+; MathFLt and friends, and the reason is the whole point of this gate:
+; the wrappers in math.pi4 are consumers of MathFCmpB, and the defect
+; this gate exists to catch on the hardware side - an inverted condition
+; that survived because nothing tested the CONSUMER of a comparison
+; result - is a defect of exactly that shape. Two consumers written
+; independently is the check. One consumer used twice is not.
+;
+; ----------------------------------------------------------------------
+; DIFFERENCES THAT ARE PREDICTED. REPORT THEM, DO NOT SILENCE THEM.
+; ----------------------------------------------------------------------
+; Two disagreements are expected from reading both implementations, and
+; they are written down HERE, before the run, so that finding them is a
+; confirmation rather than a discovery and so that nobody is tempted to
+; adjust the test until it passes.
+;
+; 1. NaN PAYLOADS. math.pi4 returns the default NaN $7FC00000 for every
+;    NaN input - see the two `ProcedureReturn 2143289344` lines at the
+;    head of MathFAddB, and the same in MathFMulB and MathFDivB. The
+;    hardware, with FPCR.DN clear, PROPAGATES the input NaN's payload
+;    after quieting it; the rule is in the shared pseudocode at
+;    Datasheets/arm-a64-instruction-set.txt:505965-505985 (FPProcessNaN)
+;    and the default it would substitute instead is built at :505060
+;    (FPDefaultNaN), which for binary32 is $7FC00000 - the same constant
+;    math.pi4 uses.
+;
+;    So every row whose operands include a NaN with a payload other than
+;    the default should mismatch, and the mismatch should be exactly
+;    "hardware kept the payload, software replaced it". Those rows are
+;    COUNTED SEPARATELY below so the rest of the result stays readable.
+;
+;    MEASURED ON SILICON 2026-08-26, so this is no longer a prediction.
+;    1136 rows landed in this class, and the hardware's answers are
+;    EXACTLY FPProcessNaNs as the pseudocode writes it - confirmed by
+;    reproducing the board's hardware checksum, over all 27622 rows, in
+;    an independently written oracle. What the A72 actually does:
+;
+;      - a signalling NaN in either operand beats a quiet one;
+;      - within a class, the FIRST operand wins;
+;      - a signalling NaN is quieted on the way out by setting bit 22,
+;        so $7F800001 comes back as $7FC00001;
+;      - the payload AND THE SIGN come from the operand as written.
+;
+;    That last clause cost the first run its clean sweep, and the fault
+;    was in the ORACLE, not the board. It implemented `a - b` as
+;    `a + (-b)` and selected the NaN after negating, so a NaN propagated
+;    out of the second operand of a subtraction came back with its sign
+;    inverted. FPSub selects from op2 as written - the pseudocode is at
+;    arm-a64-instruction-set.txt:506956-506988, where FPProcessNaNs is
+;    handed op1 and op2 and only the VALUE is negated afterwards. Fixed
+;    in tools/a64/a64_f32_gate.py; the corrected oracle reproduces the
+;    board's number exactly.
+;
+;    THE RULING, WITH THE DATA IN HAND. Setting FPCR.DN would make the
+;    hardware emit $7FC00000 for every NaN and the two paths would agree
+;    on all 27622 rows. THE RECOMMENDATION IS TO LEAVE DN AT 0, and the
+;    argument has three parts:
+;
+;      - FPCR reads $00000000 at reset on this board, so DN = 0 is the
+;        state the machine is already in and costs nothing to keep.
+;        Setting it needs FPCR's field layout, which is still not on
+;        this machine - it would mean fetching Arm DDI 0487 in order to
+;        change behaviour nobody has asked for.
+;      - Propagation is the IEEE-754 recommendation and what every other
+;        AArch64 system does, so a program moving between this bare-metal
+;        target and any hosted ARM64 behaves the same. The fleet-
+;        consistency argument for DN = 1 only aligns the Pi 4 with the
+;        SOFTWARE core, and that core is on its way out of the arithmetic
+;        path anyway.
+;      - The difference is barely observable. IsNaN() answers the same
+;        either way, every domain answer in math.pi4's table (Sqr(-1),
+;        Log(-1), Pow(-2, 0.5) and the rest) is produced FROM NON-NaN
+;        INPUTS and therefore yields $7FC00000 on both paths, and only a
+;        program that feeds a payload-bearing NaN in and reads
+;        FloatBits() out can tell.
+;
+;    WHAT DOES FOLLOW is a documentation obligation rather than a code
+;    change: once math.pi4's wrappers go back to operators, a NaN payload
+;    survives arithmetic on the Pi 4 and does not on the Picos. That is a
+;    real cross-target difference and belongs in the numeric-type notes.
+;
+; 2. THE NEGATIVE OVERFLOW RAIL OF float -> int. MathFToIntB saturates a
+;    too-large negative value at -9223372036854775807 (math.pi4:886-916),
+;    which is -(2^63 - 1). The hardware's `fcvtzs` saturates at
+;    -9223372036854775808, which is -(2^63). They disagree BY ONE, on
+;    that rail only, and only for inputs at or beyond it - which here
+;    means -Infinity and the large negative normals.
+;
+;    Which is right is a question about what the language promises, not
+;    about IEEE-754, which does not specify the result of an invalid
+;    conversion. The hardware's answer is the conventional one. Reported,
+;    counted separately, and left for a ruling.
+;
+; ANY OTHER DISAGREEMENT IS A REAL BUG in one of the two paths and is
+; the most valuable thing this program can produce. Print it, do not
+; explain it away.
+;
+; ----------------------------------------------------------------------
+; WHAT THE OUTPUT LOOKS LIKE, AND HOW TO READ IT
+; ----------------------------------------------------------------------
+; One line per operation group with a pass count and a mismatch count,
+; then up to #FPGATE_MAX_REPORT individual mismatch lines in the form
+;
+;     MISMATCH mul  a=$XXXXXXXX b=$XXXXXXXX soft=$XXXXXXXX hw=$XXXXXXXX
+;
+; and finally two checksums. THE CHECKSUMS ARE THE POINT OF THE THIRD
+; COLUMN. Printing every one of the tens of thousands of results over a
+; 115200 baud line would take longer than the test, so instead each path
+; accumulates a rolling 64-bit hash of every result it produced, in a
+; fixed order. tools/a64/a64_f32_gate.py reproduces the same vector
+; order, the same pseudo-random sequence and the same hash from an
+; INDEPENDENT IEEE-754 oracle on the host, and prints the two numbers it
+; expects. Three implementations agreeing on one 16-digit number is a
+; much stronger statement than two agreeing, and it costs two lines of
+; output.
+;
+; If the hardware checksum matches the host oracle's, every hardware
+; result in the run was correct, whatever the software column did.
+;
+; ----------------------------------------------------------------------
+; COST, AND THE WATCHDOG
+; ----------------------------------------------------------------------
+; The software core is slow by construction: math.pi4:114-121 measures
+; one MathFMul at 1751 executed instructions. The default vector counts
+; below put the run in the region of a few hundred million instructions,
+; which is well under a second at 600 MHz, but the watchdog is petted
+; inside every loop that can run long because the constants at the top
+; are meant to be raised.
+; ----------------------------------------------------------------------
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+
+; The number of fixed vectors in the DataSection at the foot of the file.
+; IT MUST MATCH, and nothing can check it for you: the Read cursor would
+; simply walk off the end of the table into whatever follows. Counted by
+; hand when the table changes, and tools/a64/a64_f32_gate.py re-counts
+; the DataSection lines and refuses to run if the two disagree.
+#FPGATE_VECTORS = 34
+
+; The pseudo-random sweep. Four operations are run on each pair, so the
+; work is four times this number of software operations. Raise it freely;
+; the watchdog is petted inside the loop.
+#FPGATE_RANDOM_PAIRS = 4000
+
+; The seed. Any value; it is here so that a run is reproducible and so
+; that the host oracle can generate the identical sequence.
+#FPGATE_SEED = 20260826
+
+; How many individual mismatch lines to print before falling silent and
+; only counting. A wall of identical mismatches teaches nothing and takes
+; minutes to transmit.
+#FPGATE_MAX_REPORT = 24
+
+Global Dim FpV.i(#FPGATE_VECTORS)
+Global FpRandState.i
+
+; Counters. Separate ones for the two PREDICTED differences, so that a
+; run whose only failures are the known semantic gaps reads as such at a
+; glance instead of looking like a catastrophe.
+Global FpPass.i
+Global FpFail.i
+Global FpNanPayload.i
+Global FpSatRail.i
+Global FpReported.i
+Global FpHashSoft.i
+Global FpHashHw.i
+; THE THIRD HASH, added 2026-08-26 after the first silicon run.
+;
+; It covers ONLY the rows where the two paths agreed, and it exists
+; because the first run exposed a flaw in this file's own verdict logic
+; rather than in the compiler. The board reported REAL MISMATCHES: 0 and
+; a hardware hash that did not match the host oracle's prediction, and
+; the decision table three lines below told the reader that meant the
+; lowering was wrong. It did not. The whole difference lived inside the
+; 1136 rows already classified as a KNOWN divergence, where the two
+; paths are SUPPOSED to differ and the hash therefore carries no
+; information about the lowering at all.
+;
+; A hash over the agreed rows cannot have that problem: every row in it
+; is a row where soft and hw produced the same bits, so if it matches
+; the host oracle then all three implementations agree on all of it.
+; The other two hashes stay, because each still says something the
+; agreed hash cannot - see the decision table at the foot of this file.
+Global FpHashAgree.i
+
+; ======================================================================
+;  THE HARDWARE ARM
+; ======================================================================
+;  EVERY FLOATING-POINT OPERATOR IN THIS FILE IS IN THIS SECTION AND
+;  NOWHERE ELSE. That is deliberate and it is worth preserving: these
+;  eleven procedures are the entire surface being tested, so a reader
+;  can see all of it at once, and a future change to the lowering has
+;  exactly eleven places to be checked against.
+;
+;  Each one takes bit patterns, converts to `.f` WITHOUT arithmetic via
+;  FloatFromBits, applies one operator, and converts back with
+;  FloatBits. FloatFromBits and FloatBits go through memory - PokeN and
+;  PeekN on a local - so they move bits and never numbers; that is why
+;  they are safe to use on a NaN, which any arithmetic would destroy.
+;
+;  The mask against $FFFFFFFF is not decoration. FloatBits returns a
+;  SIGNED 32-bit value by contract (math.pi4:1028-1044), so a negative
+;  float comes back as a negative `.i`, while the MathF*B core returns
+;  the unsigned pattern 0..4294967295. Comparing the two spellings of
+;  the same four bytes without masking would report a mismatch on every
+;  negative result in the run.
+; ======================================================================
+Procedure.i HwAdd(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  Protected r.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  r = x + y
+  ProcedureReturn FloatBits(r) & $FFFFFFFF
+EndProcedure
+
+Procedure.i HwSub(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  Protected r.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  r = x - y
+  ProcedureReturn FloatBits(r) & $FFFFFFFF
+EndProcedure
+
+Procedure.i HwMul(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  Protected r.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  r = x * y
+  ProcedureReturn FloatBits(r) & $FFFFFFFF
+EndProcedure
+
+Procedure.i HwDiv(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  Protected r.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  r = x / y
+  ProcedureReturn FloatBits(r) & $FFFFFFFF
+EndProcedure
+
+; The six relations, each returning 0 or 1. Written as six procedures
+; rather than one with a selector because a selector would be another
+; place for a relation to be mapped to the wrong operator, which is
+; precisely the class of defect being hunted.
+Procedure.i HwLt(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x < y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLe(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x <= y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwGt(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x > y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwGe(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x >= y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwEq(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x = y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwNe(ba.i, bb.i)
+  Protected x.f
+  Protected y.f
+  x = FloatFromBits(ba)
+  y = FloatFromBits(bb)
+  If x <> y
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The two conversions. `x = n` and `n = x` ARE the casts in this
+; language - there is no cast syntax - so these two assignments are the
+; whole test of scvtf and fcvtzs.
+Procedure.i HwI2F(n.i)
+  Protected x.f
+  Protected m.i
+  m = n
+  x = m
+  ProcedureReturn FloatBits(x) & $FFFFFFFF
+EndProcedure
+
+Procedure.i HwF2I(b.i)
+  Protected x.f
+  Protected n.i
+  x = FloatFromBits(b)
+  n = x
+  ProcedureReturn n
+EndProcedure
+
+; ======================================================================
+;  THE SOFTWARE ARM
+; ======================================================================
+;  Thin, because math.pi4 already provides the *B core. Only subtraction
+;  and the six relations need anything written here.
+; ======================================================================
+
+; There is no MathFSubB. math.pi4's own MathFSub flips the sign bit of
+; the subtrahend and adds, which is exact and is correct for a NaN too
+; (a NaN with either sign is still a NaN). Reproduced here on the
+; PATTERN rather than by calling MathFSub, which takes `.f` and would
+; therefore route through the hardware after this change.
+Procedure.i SoftSub(ba.i, bb.i)
+  ProcedureReturn MathFAddB(ba, bb ! 2147483648)
+EndProcedure
+
+; The four-way code turned into the six booleans, by the IEEE rule.
+; rel: 0 = lt, 1 = le, 2 = gt, 3 = ge, 4 = eq, 5 = ne.
+;
+; MathFCmpB answers -2 for unordered. Every ordered relation is FALSE
+; against a NaN and `<>` is TRUE, which is the one line of this file
+; that a reader should check against the standard rather than against
+; the other implementation.
+Procedure.i SoftRel(rel.i, ba.i, bb.i)
+  Protected c.i
+  c = MathFCmpB(ba, bb)
+  If c = -2
+    If rel = 5
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If rel = 0
+    If c = -1 : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If rel = 1
+    If c = -1 : ProcedureReturn 1 : EndIf
+    If c = 0  : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If rel = 2
+    If c = 1 : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If rel = 3
+    If c = 1 : ProcedureReturn 1 : EndIf
+    If c = 0 : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If rel = 4
+    If c = 0 : ProcedureReturn 1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If c <> 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  OUTPUT HELPERS
+; ======================================================================
+;  No character literals - house rule. 48 is the code for the digit
+;  zero, 55 is the letter A minus ten, 36 is the dollar sign and 32 is
+;  a space.
+; ======================================================================
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutHex8(v.i)
+  UartWrite(36)
+  PutHexN(v, 8)
+EndProcedure
+
+Procedure PutHex16(v.i)
+  UartWrite(36)
+  PutHexN(v, 16)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define n.i
+  Define started.i
+  If v = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  If v < 0
+    UartWrite(45)
+    v = 0 - v
+  EndIf
+  d = 1000000000000000000
+  While d > 0
+    n = (v / d) % 10
+    If n <> 0
+      started = 1
+    EndIf
+    If started = 1
+      UartWrite(48 + n)
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutSpace()
+  UartWrite(32)
+EndProcedure
+
+; ======================================================================
+;  THE ROLLING HASH
+; ======================================================================
+;  h = h * 31 + value, wrapping at 64 bits, over every result in a fixed
+;  order. Chosen for one property above all: it is trivially reproducible
+;  in another language, so tools/a64/a64_f32_gate.py can compute the
+;  expected value from its own oracle without sharing a line of code
+;  with this file. A cryptographic hash would be no stronger for this
+;  purpose - the adversary is a mistake, not an attacker - and would be
+;  another thing to get identical on both sides.
+;
+;  ORDER IS PART OF THE HASH. Two runs that produce the same multiset of
+;  results in a different order hash differently, which is correct: the
+;  vector order is part of what is being pinned.
+; ======================================================================
+Procedure HashSoft(v.i)
+  FpHashSoft = FpHashSoft * 31 + v
+EndProcedure
+
+Procedure HashHw(v.i)
+  FpHashHw = FpHashHw * 31 + v
+EndProcedure
+
+; Folded only for a row where the two paths produced identical bits.
+; Called from Judge AFTER the equality test, so the ORDER of this hash's
+; inputs is the order of the agreeing rows, which the host oracle
+; reproduces by applying the same test.
+Procedure HashAgree(v.i)
+  FpHashAgree = FpHashAgree * 31 + v
+EndProcedure
+
+; ======================================================================
+;  THE PSEUDO-RANDOM SOURCE
+; ======================================================================
+;  A 31-bit linear congruential generator, and the width is the point.
+;  The multiply is at most 2^31 x 2^30, which is 2^61 and cannot
+;  overflow a signed 64-bit register - so the sequence is exactly
+;  reproducible in any language with 64-bit integers and needs no
+;  discussion of what this backend does on overflow. A 64-bit generator
+;  would have been shorter to write and would have made the host tool
+;  depend on wrap semantics that are not written down anywhere.
+;
+;  Two draws make one 32-bit pattern, taking the middle bits of each,
+;  because the low bits of an LCG are notoriously non-random and the
+;  point of the sweep is coverage.
+; ======================================================================
+Procedure.i NextRandom32()
+  Protected a.i
+  Protected b.i
+  FpRandState = (FpRandState * 1103515245 + 12345) & $7FFFFFFF
+  a = (FpRandState >> 8) & $FFFF
+  FpRandState = (FpRandState * 1103515245 + 12345) & $7FFFFFFF
+  b = (FpRandState >> 8) & $FFFF
+  ProcedureReturn ((a << 16) | b) & $FFFFFFFF
+EndProcedure
+
+; ======================================================================
+;  THE ADJUDICATOR
+; ======================================================================
+;  One place decides pass, fail, or known-difference, so the three
+;  counters cannot drift apart and the classification rules are stated
+;  once.
+;
+;  op: 0 add, 1 sub, 2 mul, 3 div, 4 i2f, 5 f2i, 6..11 the relations.
+; ======================================================================
+; Written as a ladder of plain If blocks rather than the compact
+; one-line "If ... : ... : ProcedureReturn : EndIf" form. A bare
+; ProcedureReturn after a colon does not parse on this frontend - it is
+; read as the start of an expression - which is a small dialect fact
+; worth leaving recorded here rather than rediscovering.
+Procedure PrintOpName(op.i)
+  If op = 0
+    UartWriteStr("add")
+  ElseIf op = 1
+    UartWriteStr("sub")
+  ElseIf op = 2
+    UartWriteStr("mul")
+  ElseIf op = 3
+    UartWriteStr("div")
+  ElseIf op = 4
+    UartWriteStr("i2f")
+  ElseIf op = 5
+    UartWriteStr("f2i")
+  ElseIf op = 6
+    UartWriteStr("lt ")
+  ElseIf op = 7
+    UartWriteStr("le ")
+  ElseIf op = 8
+    UartWriteStr("gt ")
+  ElseIf op = 9
+    UartWriteStr("ge ")
+  ElseIf op = 10
+    UartWriteStr("eq ")
+  Else
+    UartWriteStr("ne ")
+  EndIf
+EndProcedure
+
+; Is this pattern a NaN? Answered locally rather than through
+; MathFIsNaNB so that the classification of a mismatch does not depend
+; on the implementation being judged.
+Procedure.i PatIsNan(b.i)
+  If ((b >> 23) & 255) <> 255
+    ProcedureReturn 0
+  EndIf
+  If (b & 8388607) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Judge(op.i, a.i, b.i, soft.i, hw.i)
+  Define nanIn.i
+
+  HashSoft(soft)
+  HashHw(hw)
+
+  If soft = hw
+    FpPass = FpPass + 1
+    HashAgree(soft)
+    ProcedureReturn
+  EndIf
+
+  ; --- predicted difference 1: NaN payload propagation ---------------
+  ; Classified, not excused. A row lands here only when an operand was
+  ; already a NaN AND both sides produced a NaN - which is the exact
+  ; shape of "hardware kept the payload, software substituted the
+  ; default". Anything else involving a NaN is a genuine failure and
+  ; falls through to the general counter.
+  nanIn = 0
+  If op < 6
+    If PatIsNan(a) = 1 : nanIn = 1 : EndIf
+    If PatIsNan(b) = 1 : nanIn = 1 : EndIf
+  EndIf
+  If nanIn = 1
+    If PatIsNan(soft) = 1
+      If PatIsNan(hw) = 1
+        FpNanPayload = FpNanPayload + 1
+        ProcedureReturn
+      EndIf
+    EndIf
+  EndIf
+
+  ; --- predicted difference 2: the negative saturation rail ----------
+  ; float -> int only, and only the exact one-apart pair described in
+  ; this file's header. Anything else is a real failure.
+  If op = 5
+    If soft = -9223372036854775807
+      If hw = soft - 1
+        FpSatRail = FpSatRail + 1
+        ProcedureReturn
+      EndIf
+    EndIf
+  EndIf
+
+  FpFail = FpFail + 1
+  If FpReported < #FPGATE_MAX_REPORT
+    FpReported = FpReported + 1
+    UartWriteStr("MISMATCH ")
+    PrintOpName(op)
+    UartWriteStr(" a=")
+    PutHex8(a)
+    UartWriteStr(" b=")
+    PutHex8(b)
+    UartWriteStr(" soft=")
+    PutHex16(soft)
+    UartWriteStr(" hw=")
+    PutHex16(hw)
+    UartWriteNl()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE PHASES
+; ======================================================================
+
+; Load the fixed vector table. Read as `.l` because the DataSection
+; holds 32-bit patterns, then masked to the unsigned spelling so that
+; every comparison downstream is between two values of the same
+; signedness. Data.l of $80000000 arrives here as a negative `.l`; the
+; mask is what makes it the pattern 2147483648 that the MathF*B core
+; expects.
+Procedure LoadVectors()
+  Define i.i
+  Define v.l
+  Restore FpGateVectors
+  For i = 0 To #FPGATE_VECTORS - 1
+    Read.l v
+    FpV(i) = v & $FFFFFFFF
+  Next
+EndProcedure
+
+Procedure RunArithmetic()
+  Define i.i
+  Define j.i
+  Define a.i
+  Define b.i
+  For i = 0 To #FPGATE_VECTORS - 1
+    SafetyWatchdogPet()
+    a = FpV(i)
+    For j = 0 To #FPGATE_VECTORS - 1
+      b = FpV(j)
+      Judge(0, a, b, MathFAddB(a, b), HwAdd(a, b))
+      Judge(1, a, b, SoftSub(a, b),   HwSub(a, b))
+      Judge(2, a, b, MathFMulB(a, b), HwMul(a, b))
+      Judge(3, a, b, MathFDivB(a, b), HwDiv(a, b))
+    Next
+  Next
+EndProcedure
+
+Procedure RunRelations()
+  Define i.i
+  Define j.i
+  Define a.i
+  Define b.i
+  For i = 0 To #FPGATE_VECTORS - 1
+    SafetyWatchdogPet()
+    a = FpV(i)
+    For j = 0 To #FPGATE_VECTORS - 1
+      b = FpV(j)
+      Judge(6,  a, b, SoftRel(0, a, b), HwLt(a, b))
+      Judge(7,  a, b, SoftRel(1, a, b), HwLe(a, b))
+      Judge(8,  a, b, SoftRel(2, a, b), HwGt(a, b))
+      Judge(9,  a, b, SoftRel(3, a, b), HwGe(a, b))
+      Judge(10, a, b, SoftRel(4, a, b), HwEq(a, b))
+      Judge(11, a, b, SoftRel(5, a, b), HwNe(a, b))
+    Next
+  Next
+EndProcedure
+
+; The integers converted to float. Chosen for the boundaries that matter
+; on a 64-bit target: the 2^24 cliff where binary32 stops being able to
+; represent consecutive integers, the ties that round-to-even decides,
+; and both 64-bit rails - including INT64_MIN, which is the one input
+; MathFFromIntB cannot negate (`0 - n` overflows back to itself) and
+; where a disagreement would therefore be a genuine software bug rather
+; than a hardware one.
+Procedure RunI2F()
+  Define i.i
+  Define n.i
+  Restore FpGateInts
+  For i = 0 To 27
+    Read.q n
+    Judge(4, n & $FFFFFFFF, (n >> 32) & $FFFFFFFF, MathFFromIntB(n), HwI2F(n))
+  Next
+EndProcedure
+
+Procedure RunF2I()
+  Define i.i
+  Define a.i
+  For i = 0 To #FPGATE_VECTORS - 1
+    a = FpV(i)
+    Judge(5, a, 0, MathFToIntB(a), HwF2I(a))
+  Next
+EndProcedure
+
+Procedure RunRandom()
+  Define k.i
+  Define a.i
+  Define b.i
+  FpRandState = #FPGATE_SEED
+  For k = 1 To #FPGATE_RANDOM_PAIRS
+    If (k % 64) = 0
+      SafetyWatchdogPet()
+    EndIf
+    a = NextRandom32()
+    b = NextRandom32()
+    Judge(0, a, b, MathFAddB(a, b), HwAdd(a, b))
+    Judge(1, a, b, SoftSub(a, b),   HwSub(a, b))
+    Judge(2, a, b, MathFMulB(a, b), HwMul(a, b))
+    Judge(3, a, b, MathFDivB(a, b), HwDiv(a, b))
+  Next
+EndProcedure
+
+Procedure Line(*label, v.i)
+  UartWriteStr(*label)
+  PutDec(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  UartInit(115200)
+
+  ; Sixty seconds. Generous, because the constants at the top are meant
+  ; to be raised and a watchdog that fires because somebody asked for
+  ; more vectors teaches the wrong lesson. Petted inside every loop.
+  SafetyWatchdogStart(60)
+
+  UartWriteNl()
+  UartWriteStr("pi4FpGate - hardware FPU against the software core in math.pi4")
+  UartWriteNl()
+  UartWriteStr("If nothing follows this line, run pi4FpState.pi4: FP is trapped.")
+  UartWriteNl()
+  UartWriteNl()
+
+  LoadVectors()
+
+  UartWriteStr("phase 1: arithmetic, full cross product")
+  UartWriteNl()
+  RunArithmetic()
+
+  UartWriteStr("phase 2: the six relations, full cross product")
+  UartWriteNl()
+  RunRelations()
+
+  UartWriteStr("phase 3: integer to float")
+  UartWriteNl()
+  RunI2F()
+
+  UartWriteStr("phase 4: float to integer")
+  UartWriteNl()
+  RunF2I()
+
+  UartWriteStr("phase 5: pseudo-random sweep")
+  UartWriteNl()
+  RunRandom()
+
+  UartWriteNl()
+  Line("agreed bit for bit : ", FpPass)
+  Line("REAL MISMATCHES    : ", FpFail)
+  Line("NaN payload rows   : ", FpNanPayload)
+  Line("f2i rail rows      : ", FpSatRail)
+  UartWriteNl()
+
+  UartWriteStr("hash agree = ")
+  PutHex16(FpHashAgree)
+  UartWriteNl()
+  UartWriteStr("hash soft  = ")
+  PutHex16(FpHashSoft)
+  UartWriteNl()
+  UartWriteStr("hash hw    = ")
+  PutHex16(FpHashHw)
+  UartWriteNl()
+  UartWriteStr("Compare all three against: python tools/a64/a64_f32_gate.py")
+  UartWriteNl()
+  UartWriteNl()
+
+  ; --- THE VERDICT READS THE COUNTERS FIRST, AND THAT IS THE FIX -----
+  ;
+  ; The first silicon run, 2026-08-26, printed REAL MISMATCHES: 0 and a
+  ; hardware hash that did not match the host oracle. The verdict this
+  ; block used to print keyed off the hashes and would have told the
+  ; reader the lowering was broken, three lines under a counter saying
+  ; nothing was broken. Two statements in one screen of output
+  ; contradicting each other, and the false one louder.
+  ;
+  ; THE ORDERING RULE THAT PREVENTS IT: FpFail is the only thing that
+  ; can say "something is wrong", because it is the only thing computed
+  ; per row from a direct comparison of the two paths. A hash can differ
+  ; for a reason the row-level classification has ALREADY accepted - a
+  ; NaN payload is the case in point - so a hash may narrow down where a
+  ; difference lives but must never be the thing that declares one.
+  ;
+  ; (For the record, the run that taught this: the oracle was wrong, not
+  ; the board. It flipped a NaN's sign bit when predicting subtraction,
+  ; because it implemented `a - b` as `a + (-b)` and negated BEFORE
+  ; selecting the NaN, while FPSub selects from op2 as written. Fixed;
+  ; the corrected oracle reproduces the board's hardware hash exactly.)
+  If FpFail > 0
+    UartWriteStr("VERDICT: THERE ARE REAL MISMATCHES. One of the two paths on")
+    UartWriteNl()
+    UartWriteStr("         this board is wrong - the rows printed above are")
+    UartWriteNl()
+    UartWriteStr("         outside every known divergence. Report them")
+    UartWriteNl()
+    UartWriteStr("         verbatim. Do not change this test.")
+    UartWriteNl()
+  Else
+    UartWriteStr("VERDICT: NO REAL MISMATCH. Every row either agreed bit for")
+    UartWriteNl()
+    UartWriteStr("         bit or fell into one of the two divergences this")
+    UartWriteNl()
+    UartWriteStr("         file predicted in writing beforehand, both of")
+    UartWriteNl()
+    UartWriteStr("         which are semantic rulings and not defects.")
+    UartWriteNl()
+    UartWriteNl()
+    UartWriteStr("         Now check the hashes, in this order:")
+    UartWriteNl()
+    UartWriteStr("         AGREE matches -> all three implementations agree")
+    UartWriteNl()
+    UartWriteStr("           on every row where agreement was expected. This")
+    UartWriteNl()
+    UartWriteStr("           is the line that clears the lowering.")
+    UartWriteNl()
+    UartWriteStr("         AGREE differs -> the encodings or the lowering ARE")
+    UartWriteNl()
+    UartWriteStr("           suspect. Run tools/a64/a64_fp_check.py first.")
+    UartWriteNl()
+    UartWriteStr("         SOFT differs -> math.pi4's core has changed or has")
+    UartWriteNl()
+    UartWriteStr("           a bug; the hardware is not implicated.")
+    UartWriteNl()
+    UartWriteStr("         HW differs while AGREE matches -> the difference is")
+    UartWriteNl()
+    UartWriteStr("           confined to NaN PAYLOAD VALUES. The hardware is")
+    UartWriteNl()
+    UartWriteStr("           producing a NaN; the host oracle predicted a")
+    UartWriteNl()
+    UartWriteStr("           different one. That is a model question, NOT a")
+    UartWriteNl()
+    UartWriteStr("           lowering defect.")
+  EndIf
+  UartWriteNl()
+
+  UartDrain()
+
+  ; The return value the monitor prints: the count of REAL mismatches,
+  ; so a run whose console scrolled past is still readable from one
+  ; number. Zero is the good answer.
+  ProcedureReturn FpFail
+EndProcedure
+
+; ======================================================================
+;  THE FIXED VECTORS
+; ======================================================================
+;  #FPGATE_VECTORS must equal the count of values here. Counted by hand;
+;  tools/a64/a64_f32_gate.py re-counts them and refuses to run if the
+;  constant disagrees.
+;
+;  ORDER IS PART OF THE CONTRACT because the checksums are order
+;  dependent. Add new vectors at the END and raise the constant; do not
+;  insert into the middle unless you are also regenerating the expected
+;  hashes.
+;
+;  > THE COUNT MUST STAY A MULTIPLE OF TWO, AND HERE IS WHY.
+;  >
+;  > The emitter lays both DataSections down consecutively after one
+;  > `.align 8` (EmitCore_A64.pbi's dataOut block, which explains that a
+;  > doubleword `ldr` on Device memory FAULTS if it is not naturally
+;  > aligned - and with the MMU off, all of DRAM is Device memory).
+;  >
+;  > This table is 4 bytes per entry and the NEXT table is read with
+;  > `Read.q`, eight bytes at a time. So the second table starts at
+;  > 4 x (number of vectors) bytes past an 8-aligned base, and it is
+;  > 8-aligned only when that count is EVEN.
+;  >
+;  > At 34 vectors it is 136 bytes, which is 17 x 8, and everything is
+;  > fine. At 35 it would be 140, the first `Read.q` of FpGateInts would
+;  > be a misaligned doubleword load, and the board would take a data
+;  > abort into an exception vector nothing in this tree installs - a
+;  > silent hang, from adding one test vector.
+;  >
+;  > Verified for the current table by reading the emitted assembly on
+;  > 2026-08-26 rather than by trusting the arithmetic. If you add an odd
+;  > number of vectors, add a padding one as well.
+; ======================================================================
+DataSection
+FpGateVectors:
+  ; the two zeros - different patterns that compare equal
+  Data.l $00000000       ; +0.0
+  Data.l $80000000       ; -0.0
+  ; the smallest and largest subnormals, both signs. Gradual underflow
+  ; is what flush-to-zero silently discards.
+  Data.l $00000001       ; smallest positive subnormal, 2^-149
+  Data.l $80000001       ; smallest negative subnormal
+  Data.l $007FFFFF       ; largest positive subnormal
+  Data.l $807FFFFF       ; largest negative subnormal
+  Data.l $00400000       ; a subnormal in the middle of the band
+  ; the normal boundary in both directions
+  Data.l $00800000       ; smallest positive normal, 2^-126
+  Data.l $80800000       ; smallest negative normal
+  Data.l $7F7FFFFF       ; largest finite, about 3.4028235e38
+  Data.l $FF7FFFFF       ; most negative finite
+  ; the infinities
+  Data.l $7F800000       ; +Infinity
+  Data.l $FF800000       ; -Infinity
+  ; NaNs. The default, a quiet NaN with a payload, a signalling NaN, and
+  ; a negative NaN. The payload cases are the ones that tell propagation
+  ; apart from default-NaN substitution.
+  Data.l $7FC00000       ; the default quiet NaN
+  Data.l $7FC12345       ; a quiet NaN with a payload
+  Data.l $FFC00000       ; a negative quiet NaN
+  Data.l $7F800001       ; a signalling NaN - must be quieted on output
+  Data.l $7FBFFFFF       ; the largest signalling NaN
+  ; ordinary values, so a total failure is visible on the first rows
+  Data.l $3F800000       ; 1.0
+  Data.l $BF800000       ; -1.0
+  Data.l $40000000       ; 2.0
+  Data.l $3F000000       ; 0.5
+  Data.l $40400000       ; 3.0
+  Data.l $40E00000       ; 7.0
+  Data.l $C0490FDB       ; -pi
+  ; the 2^24 cliff, where binary32 stops representing consecutive
+  ; integers and round-to-nearest-EVEN parts company with round-half-up
+  Data.l $4B7FFFFF       ; 16777215, the last exactly representable one
+  Data.l $4B800000       ; 16777216 = 2^24
+  Data.l $4B800001       ; 16777218 - the next representable, not 17
+  Data.l $4B800002       ; 16777220
+  ; values engineered to land on a rounding tie when added or multiplied
+  Data.l $3F800001       ; 1.0 plus one ulp
+  Data.l $33800000       ; 2^-24, the ulp of 1.0 halved - 1.0 + this is a tie
+  Data.l $34000000       ; 2^-23, the ulp of 1.0
+  ; the 2^63 and 2^31 neighbourhoods, which is where float -> int
+  ; saturates and where the two implementations are predicted to differ
+  Data.l $5F000000       ; 2^63 exactly - the first value past INT64_MAX
+  Data.l $4F000000       ; 2^31 exactly
+EndDataSection
+
+; ----------------------------------------------------------------------
+;  The integers for the int -> float direction. Twenty-eight of them;
+;  RunI2F's loop bound must match.
+;
+;  Data.q, not Data.l: `.i` is 64 bits on this target and the whole
+;  question this phase answers is what happens to the bits above 32.
+; ----------------------------------------------------------------------
+DataSection
+FpGateInts:
+  Data.q 0
+  Data.q 1
+  Data.q -1
+  Data.q 2
+  Data.q -2
+  Data.q 16777215            ; 2^24 - 1, the last exact one
+  Data.q 16777216            ; 2^24
+  Data.q 16777217            ; 2^24 + 1 - NOT representable, rounds
+  Data.q 16777218            ; 2^24 + 2 - representable again
+  Data.q 16777219            ; rounds, and the tie goes to even
+  Data.q -16777217
+  Data.q 2147483647          ; INT32_MAX
+  Data.q -2147483648         ; INT32_MIN
+  Data.q 2147483648          ; one past INT32_MAX - a 32-bit conversion
+                             ; would wrap here and a 64-bit one will not
+  Data.q 4294967295          ; UINT32_MAX
+  Data.q 4294967296          ; 2^32
+  Data.q 1099511627775
+  Data.q 9007199254740993    ; 2^53 + 1
+  Data.q 123456789
+  Data.q -123456789
+  Data.q 1000000000000
+  Data.q -1000000000000
+  Data.q 9223372036854775807 ; INT64_MAX
+  Data.q -9223372036854775807
+  ; INT64_MIN. MathFFromIntB negates a negative input with `0 - n`,
+  ; which for this value overflows back to itself, so the software path
+  ; may be wrong here. That is worth knowing and is exactly why it is in
+  ; the list rather than left out for being awkward.
+  Data.q -9223372036854775808
+  Data.q 4611686018427387904 ; 2^62
+  Data.q 6917529027641081856 ; 2^62 + 2^61, a tie at the top of the range
+  Data.q -4611686018427387904
+EndDataSection

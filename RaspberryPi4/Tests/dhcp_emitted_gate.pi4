@@ -1,0 +1,250 @@
+; Executable emitted-code gate for the production DHCP client/server.
+; It includes the shipped serializers and state machine, injects packets
+; and low-32-bit ticks, and returns the first failing assertion number.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+
+Global gate_now.i
+
+Procedure.i millis()
+  ProcedureReturn gate_now
+EndProcedure
+
+Procedure.i net_GetBE16(p.i)
+  ProcedureReturn ((PeekA(p) & $FF) << 8) | (PeekA(p + 1) & $FF)
+EndProcedure
+Procedure.i net_GetBE32(p.i)
+  ProcedureReturn ((PeekA(p) & $FF) << 24) | ((PeekA(p + 1) & $FF) << 16) | ((PeekA(p + 2) & $FF) << 8) | (PeekA(p + 3) & $FF)
+EndProcedure
+Procedure net_PutBE16(p.i, v.i)
+  PokeA(p, (v >> 8) & $FF)
+  PokeA(p + 1, v & $FF)
+EndProcedure
+Procedure net_PutBE32(p.i, v.i)
+  PokeA(p, (v >> 24) & $FF)
+  PokeA(p + 1, (v >> 16) & $FF)
+  PokeA(p + 2, (v >> 8) & $FF)
+  PokeA(p + 3, v & $FF)
+EndProcedure
+
+; Server transport/interface seams: this gate exercises bytes and state,
+; never a device.
+Global gate_listen67.i
+Procedure.i NetIfSetAlt(kind.i, ip.i, mask.i)
+  ProcedureReturn 1
+EndProcedure
+Procedure.i NetUdpListen(kind.i, port.i, on.i)
+  If port = 67
+    gate_listen67 = on
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i NetUdpBuildBcast(kind.i, src.i, dp.i, sp.i, p.i, n.i)
+  ProcedureReturn n
+EndProcedure
+
+XIncludeFile "Anvil/Network/dhcp.pbi"
+XIncludeFile "Anvil/Core/dhcpd.pbi"
+
+Global Dim gate_mac.a[6]
+
+Procedure GateServerSeed(msg.i, ip.i, xid.i)
+  Define i.i
+  dhcpd_rqXid = xid
+  dhcpd_rqFlags = #DHCP_FLAG_BCAST
+  dhcpd_rqCiaddr = 0
+  For i = 0 To 5
+    dhcpd_rqMac[i] = gate_mac[i]
+  Next
+EndProcedure
+
+; Return an option's value offset, -1 when absent, -2 when malformed.
+Procedure.i GateOption(*p, n.i, wanted.i)
+  Define q.i
+  Define code.i
+  Define len.i
+  q = #DHCP_OFF_COOKIE + 4
+  While q < n
+    code = PeekA(*p + q) & $FF
+    If code = #DHCP_OPT_END
+      ProcedureReturn -1
+    EndIf
+    If code = #DHCP_OPT_PAD
+      q = q + 1
+      Continue
+    EndIf
+    If q + 1 >= n
+      ProcedureReturn -2
+    EndIf
+    len = PeekA(*p + q + 1) & $FF
+    If q + 2 + len > n
+      ProcedureReturn -2
+    EndIf
+    If code = wanted
+      ProcedureReturn q + 2
+    EndIf
+    q = q + 2 + len
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i GateReply(msg.i, ip.i, xid.i)
+  GateServerSeed(msg, ip, xid)
+  ProcedureReturn dhcpd_Build(msg, ip)
+EndProcedure
+
+; Replace the END marker with option 42 and a new END marker. The server
+; serializer leaves the rest of its 300-byte BOOTP minimum as PAD bytes.
+Procedure GateAddNtp(*p, n.i, ip.i, len.i)
+  Define q.i
+  q = #DHCP_OFF_COOKIE + 4
+  While q < n And (PeekA(*p + q) & $FF) <> #DHCP_OPT_END
+    If (PeekA(*p + q) & $FF) = #DHCP_OPT_PAD
+      q = q + 1
+    Else
+      q = q + 2 + (PeekA(*p + q + 1) & $FF)
+    EndIf
+  Wend
+  PokeA(*p + q, #DHCP_OPT_NTP)
+  PokeA(*p + q + 1, len)
+  net_PutBE32(*p + q + 2, ip)
+  PokeA(*p + q + 2 + len, #DHCP_OPT_END)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+  Define p.i
+  Define a.i
+  Define xid1.i
+  Define start.i
+  Define ackAt.i
+
+  For i = 0 To 5
+    gate_mac[i] = $20 + i
+  Next
+
+  ; Actual OFFER and ACK bytes: required options present; no false router
+  ; or resolver can install a competing default route on the client.
+  n = GateReply(#DHCP_OFFER, $C0A88902, $10203040)
+  If n <> #DHCP_MIN_LEN : ProcedureReturn 1 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_MSG_TYPE) < 0 : ProcedureReturn 2 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_SERVER_ID) < 0 : ProcedureReturn 3 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_LEASE) < 0 : ProcedureReturn 4 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_SUBNET) < 0 : ProcedureReturn 5 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_ROUTER) <> -1 : ProcedureReturn 6 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_DNS) <> -1 : ProcedureReturn 7 : EndIf
+  n = GateReply(#DHCP_ACK, $C0A88902, $10203040)
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_ROUTER) <> -1 : ProcedureReturn 8 : EndIf
+  If GateOption(@dhcpd_out[0], n, #DHCP_OPT_DNS) <> -1 : ProcedureReturn 9 : EndIf
+
+  ; A full pool does not evict an active lease. One deadline just across
+  ; tick wrap is still active; after wrap it is reusable.
+  gate_now = $FFFFFF00
+  For i = 0 To #DHCPD_SLOTS - 1
+    dhcpd_state[i] = 2
+    dhcpd_until[i] = (gate_now + 60000) & $FFFFFFFF
+    dhcpd_mac[i * 6] = i + 1
+  Next
+  If dhcpd_Alloc(@gate_mac[0]) <> -1 : ProcedureReturn 10 : EndIf
+  dhcpd_until[7] = $FFFFFFF0
+  gate_now = $00000020
+  If dhcpd_Alloc(@gate_mac[0]) <> 7 : ProcedureReturn 11 : EndIf
+
+  ; Two interfaces have distinct transactions. A packet for wired cannot
+  ; advance Wi-Fi even though both clients use UDP port 68.
+  start = $FFF00000
+  If DhcpClientBegin(#HW_LINK_WIRED, @gate_mac[0], start) <> #DHCPC_ACT_DISCOVER : ProcedureReturn 12 : EndIf
+  xid1 = DhcpClientXid(#HW_LINK_WIRED)
+  If DhcpClientBegin(#HW_LINK_WIFI, @gate_mac[0], start) <> #DHCPC_ACT_DISCOVER : ProcedureReturn 13 : EndIf
+  If xid1 = DhcpClientXid(#HW_LINK_WIFI) : ProcedureReturn 14 : EndIf
+  n = GateReply(#DHCP_OFFER, $C0A88902, xid1)
+  GateAddNtp(@dhcpd_out[0], n, $C0A8892A, 4)
+  If DhcpClientInput(#HW_LINK_WIFI, @dhcpd_out[0], n, start) <> #DHCPC_ACT_NONE : ProcedureReturn 15 : EndIf
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, start) <> #DHCPC_ACT_SELECT : ProcedureReturn 16 : EndIf
+  If DhcpClientNtp(#HW_LINK_WIRED) <> $C0A8892A : ProcedureReturn 45 : EndIf
+
+  ; The selected server and address must be the ones ACKed. Mutation of
+  ; either field is ignored without changing REQUESTING state.
+  n = GateReply(#DHCP_ACK, $C0A88903, xid1)
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, start) <> #DHCPC_ACT_NONE : ProcedureReturn 17 : EndIf
+  If DhcpClientState(#HW_LINK_WIRED) <> #DHCPC_REQUESTING : ProcedureReturn 18 : EndIf
+  n = GateReply(#DHCP_ACK, $C0A88902, xid1)
+  p = GateOption(@dhcpd_out[0], n, #DHCP_OPT_SERVER_ID)
+  ; GateOption returns an offset within the supplied packet.
+  PokeA(@dhcpd_out[0] + p + 3, 2)
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, start) <> #DHCPC_ACT_NONE : ProcedureReturn 19 : EndIf
+  n = GateReply(#DHCP_ACK, $C0A88902, xid1)
+  GateAddNtp(@dhcpd_out[0], n, $C0A8892B, 4)
+  ackAt = (start + 10000) & $FFFFFFFF
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, ackAt) <> #DHCPC_ACT_BOUND : ProcedureReturn 20 : EndIf
+  If DhcpClientNtp(#HW_LINK_WIRED) <> $C0A8892B : ProcedureReturn 46 : EndIf
+
+  ; Default T1/T2 are 1/2 and 7/8 of the one-hour lease. Injected ticks
+  ; cross 32-bit wrap and must produce renew, rebind, then deconfigure.
+  ; The first probe is ten seconds before T1 as measured from ACK; it
+  ; proves acquisition time was not subtracted from the granted lease.
+  a = DhcpClientTick(#HW_LINK_WIRED, (start + 1800000) & $FFFFFFFF, 1)
+  If a <> #DHCPC_ACT_NONE : ProcedureReturn 37 : EndIf
+  a = DhcpClientTick(#HW_LINK_WIRED, (ackAt + 1800000) & $FFFFFFFF, 1)
+  If a <> #DHCPC_ACT_RENEW : ProcedureReturn 21 : EndIf
+  a = DhcpClientTick(#HW_LINK_WIRED, (ackAt + 3150000) & $FFFFFFFF, 1)
+  If a <> #DHCPC_ACT_REBIND : ProcedureReturn 22 : EndIf
+  a = DhcpClientTick(#HW_LINK_WIRED, (ackAt + 3600000) & $FFFFFFFF, 1)
+  If a <> #DHCPC_ACT_DROP : ProcedureReturn 23 : EndIf
+  If DhcpClientIp(#HW_LINK_WIRED) <> 0 : ProcedureReturn 24 : EndIf
+  If DhcpClientNtp(#HW_LINK_WIRED) <> 0 : ProcedureReturn 47 : EndIf
+
+  ; Link loss removes the active address, but a return before expiry uses
+  ; INIT-REBOOT. Its real packet has ciaddr=0, option 50, no option 54.
+  DhcpClientBegin(#HW_LINK_WIRED, @gate_mac[0], 1000)
+  xid1 = DhcpClientXid(#HW_LINK_WIRED)
+  n = GateReply(#DHCP_OFFER, $C0A88902, xid1)
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, 1000) <> #DHCPC_ACT_SELECT : ProcedureReturn 25 : EndIf
+  n = GateReply(#DHCP_ACK, $C0A88902, xid1)
+  If DhcpClientInput(#HW_LINK_WIRED, @dhcpd_out[0], n, 1000) <> #DHCPC_ACT_BOUND : ProcedureReturn 26 : EndIf
+  If DhcpClientTick(#HW_LINK_WIRED, 2000, 0) <> #DHCPC_ACT_DROP : ProcedureReturn 27 : EndIf
+  If DhcpClientTick(#HW_LINK_WIRED, 3000, 1) <> #DHCPC_ACT_REBOOT : ProcedureReturn 28 : EndIf
+  n = DhcpClientBuild(#HW_LINK_WIRED, #DHCPC_ACT_REBOOT)
+  If net_GetBE32(DhcpBuf() + #DHCP_OFF_CIADDR) <> 0 : ProcedureReturn 29 : EndIf
+  If GateOption(DhcpBuf(), n, #DHCP_OPT_REQ_IP) < 0 : ProcedureReturn 30 : EndIf
+  If GateOption(DhcpBuf(), n, #DHCP_OPT_SERVER_ID) <> -1 : ProcedureReturn 31 : EndIf
+
+  ; Renew is ciaddr/unicast-form and rebind is ciaddr/broadcast-form;
+  ; neither carries selecting-only options 50/54.
+  dhcpc_state[#HW_LINK_WIRED] = #DHCPC_RENEWING
+  n = DhcpClientBuild(#HW_LINK_WIRED, #DHCPC_ACT_RENEW)
+  If net_GetBE32(DhcpBuf() + #DHCP_OFF_CIADDR) <> $C0A88902 : ProcedureReturn 32 : EndIf
+  If net_GetBE16(DhcpBuf() + #DHCP_OFF_FLAGS) <> 0 : ProcedureReturn 33 : EndIf
+  If GateOption(DhcpBuf(), n, #DHCP_OPT_REQ_IP) <> -1 : ProcedureReturn 34 : EndIf
+  If GateOption(DhcpBuf(), n, #DHCP_OPT_SERVER_ID) <> -1 : ProcedureReturn 35 : EndIf
+  n = DhcpClientBuild(#HW_LINK_WIRED, #DHCPC_ACT_REBIND)
+  If net_GetBE16(DhcpBuf() + #DHCP_OFF_FLAGS) <> #DHCP_FLAG_BCAST : ProcedureReturn 36 : EndIf
+
+  ; Link loss before ACK owns no address and must abandon the transaction,
+  ; not replay a stale OFFER/XID after a different segment appears.
+  If DhcpClientBegin(#HW_LINK_WIFI, @gate_mac[0], 9000) <> #DHCPC_ACT_DISCOVER : ProcedureReturn 38 : EndIf
+  If DhcpClientTick(#HW_LINK_WIFI, 9100, 0) <> #DHCPC_ACT_DROP : ProcedureReturn 39 : EndIf
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_INIT : ProcedureReturn 40 : EndIf
+  If DhcpClientTick(#HW_LINK_WIFI, 9200, 1) <> #DHCPC_ACT_NONE : ProcedureReturn 41 : EndIf
+
+  ; The diagnostics getters expose the same clocks the transition logic
+  ; consumed, not separately maintained status counters.
+  If DhcpClientLease(#HW_LINK_WIRED) <> 3600 : ProcedureReturn 42 : EndIf
+  If DhcpClientT1(#HW_LINK_WIRED) <> 1800 : ProcedureReturn 43 : EndIf
+  If DhcpClientT2(#HW_LINK_WIRED) <> 3150 : ProcedureReturn 44 : EndIf
+
+  ; RFC 2132 option 42 length must be a nonzero multiple of four. A malformed
+  ; three-byte value is ignored and cannot become a stale or broadcast server.
+  DhcpClientReset(#HW_LINK_WIFI)
+  If DhcpClientBegin(#HW_LINK_WIFI, @gate_mac[0], 10000) <> #DHCPC_ACT_DISCOVER : ProcedureReturn 48 : EndIf
+  xid1 = DhcpClientXid(#HW_LINK_WIFI)
+  n = GateReply(#DHCP_OFFER, $C0A88902, xid1)
+  GateAddNtp(@dhcpd_out[0], n, $FFFFFFFF, 3)
+  If DhcpClientInput(#HW_LINK_WIFI, @dhcpd_out[0], n, 10000) <> #DHCPC_ACT_SELECT : ProcedureReturn 49 : EndIf
+  If DhcpClientNtp(#HW_LINK_WIFI) <> 0 : ProcedureReturn 50 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

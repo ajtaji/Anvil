@@ -1,0 +1,838 @@
+
+; ======================================================================
+;  Cache maintenance
+;
+;  We write the payload with ordinary stores while U-Boot's MMU and
+;  caches are still on, so the new instructions can sit dirty in the L1
+;  data cache where instruction fetch will not see them. U-Boot's own
+;  "go" does the equivalent cleanup before it branches; ours has to as
+;  well, or a transfer that landed perfectly executes stale memory.
+;
+;  THE SYS ENCODINGS, FOR ANYONE CHECKING THE DISASSEMBLY. A wrong SYS
+;  encoding is invisible in a listing that assembles cleanly:
+;
+;    SYS = 1101 0101 0000 1 op1(3) CRn(4) CRm(4) op2(3) Rt(5)
+;          base $D5080000 | op1<<16 | CRn<<12 | CRm<<8 | op2<<5 | Rt
+;
+;    dc cvau,  x9  op1=3 CRn=7 CRm=11 op2=1 Rt=9   -> $D50B7B29
+;    dc civac, x9  op1=3 CRn=7 CRm=14 op2=1 Rt=9   -> $D50B7E29
+;    ic ivau,  x9  op1=3 CRn=7 CRm=5  op2=1 Rt=9   -> $D50B7529
+;    ic ialluis    op1=0 CRn=7 CRm=1  op2=0 Rt=31  -> $D508711F
+;
+;  cvau AND civac BOTH APPEAR HERE AND THEY ARE NOT INTERCHANGEABLE.
+;  cvau cleans to the point of UNIFICATION, which is what instruction
+;  fetch needs and is all the payload flush needs. civac cleans to the
+;  point of COHERENCY, which is what putting bytes in DRAM needs, and is
+;  what the autoboot record needs in order to survive a reset. Same
+;  family, one letter apart, and only one of them is right for each job.
+; ======================================================================
+
+Procedure CacheLine()
+  ; One 64-byte line: clean it out of the D-cache to the point of
+  ; unification, then drop any matching I-cache line.
+  ;
+  ; "ldr x9", not "ldr w9". gFlushAddr is a .i and a .i is eight bytes
+  ; here; ldr w9 would read only its low half - the shape of bug the
+  ; widening creates in hand-written asm, where the code assembles, the
+  ; register is the correct one, and the top 32 bits of the address are
+  ; simply gone.
+  ASM
+    adrp x9, global_gflushaddr
+    add  x9, x9, #:lo12:global_gflushaddr
+    ldr  x9, [x9]
+    dc cvau, x9
+    ic ivau, x9
+  EndASM
+EndProcedure
+
+Procedure CacheFlushRange(lo.i, hi.i)
+  Define a.i
+  ; Round down to a 64-byte line. This must NOT be "lo & $FFFFFFC0",
+  ; which is right for a 32-bit address and a TRAP for a 64-bit one: it
+  ; clears the whole top half as well as the low six bits, so a flush of
+  ; anything in the high window would clean lines four gigabytes away -
+  ; silently, and looking entirely normal in a listing.
+  ;
+  ; Shift instead of mask, so no literal has to be sixteen digits wide.
+  ; ">>" is arithmetic here and that is safe because lo is a physical
+  ; address and therefore positive.
+  a = (lo >> 6) << 6
+  While a <= hi
+    gFlushAddr = a
+    CacheLine()
+    a = a + 64
+  Wend
+  a64_barrier()                 ; dsb sy + isb
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CacheCleanRangePoc - clean a range to the point of COHERENCY.
+;
+;  THE SISTER OF CacheFlushRange AND NOT A DUPLICATE OF IT. That one is
+;  cvau + ic ivau, which is what INSTRUCTION FETCH needs and is all a
+;  payload flush needs. This one is civac, which is what putting bytes in
+;  DRAM for somebody else to read needs - a host after a reset, or a bus
+;  master. Same family, one letter apart, and only one of them is right
+;  for each job; the header above is where that distinction is argued.
+;
+;  The rounding is the same shift-don't-mask rule CacheFlushRange carries
+;  and for the same reason: "& $FFFFFFC0" clears the top half of a
+;  64-bit address as well as the low six bits, so a clean of anything in
+;  the high window would clean lines four gigabytes away, silently and
+;  looking entirely normal in a listing.
+; ----------------------------------------------------------------------
+Procedure CacheCleanRangePoc(lo.i, hi.i)
+  Define a.i
+  a = (lo >> 6) << 6
+  While a <= hi
+    gFlushAddr = a
+    ASM
+      adrp x9, global_gflushaddr
+      add  x9, x9, #:lo12:global_gflushaddr
+      ldr  x9, [x9]
+      dc civac, x9
+    EndASM
+    a = a + 64
+  Wend
+  a64_barrier()
+EndProcedure
+
+Procedure AutoFlush()
+  ; The autoboot record's three words, cleaned to the point of COHERENCY.
+  ; #AB_BASE is 4 KiB aligned ($001FF000 since 2026-09-08, when the
+  ; record left the image window because that window stopped having a
+  ; top) and therefore 64-byte aligned, so this is still exactly one
+  ; line - the range is written out rather than assumed so that a record
+  ; that grows past 64 bytes cannot half-reach DRAM.
+  CacheCleanRangePoc(#AB_BASE, #AB_BASE + 23)
+EndProcedure
+
+; ======================================================================
+;  The autoboot record. Raw DRAM, never a Global - see AUTOBOOT in the
+;  header for why BSS would erase it four instructions into _start.
+; ======================================================================
+
+Procedure.i AutoEntry()
+  ; The armed address, or 0 for "nothing armed". BOTH the magic and the
+  ; guard have to agree; uninitialised DRAM is whatever was there
+  ; before, and a magic on its own can be met by a stale record whose
+  ; address field has since been overwritten.
+  Define e.i
+  If PeekI(#AB_BASE) <> #AB_MAGIC
+    ProcedureReturn 0
+  EndIf
+  e = PeekI(#AB_BASE + 8)
+  If PeekI(#AB_BASE + 16) <> (e ! #AB_MAGIC)
+    ProcedureReturn 0
+  EndIf
+  If e = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn e
+EndProcedure
+
+Procedure AutoSet(a.i)
+  ; a = 0 clears. The magic is written LAST on the way in and FIRST on
+  ; the way out, so a record is never briefly valid with a half-written
+  ; address.
+  If a = 0
+    PokeI(#AB_BASE, 0)
+    PokeI(#AB_BASE + 8, 0)
+    PokeI(#AB_BASE + 16, 0)
+  Else
+    PokeI(#AB_BASE + 8, a)
+    PokeI(#AB_BASE + 16, a ! #AB_MAGIC)
+    PokeI(#AB_BASE, #AB_MAGIC)
+  EndIf
+  AutoFlush()
+EndProcedure
+
+; ======================================================================
+;  THE CACHE, BEHIND A FLAG
+;
+;  #ANVIL_CACHE compiles in the runtime `cache` command. The D-cache is
+;  OFF on entry, ALWAYS, so the resident monitor still enters with the
+;  stub's $30C50830 every time and a wrong enable is recovered by a power
+;  cycle rather than being a brick. V3D console initialization may enable
+;  it before the prompt; `cache on` can enable it explicitly at the prompt.
+;  The payload jump path (RunAt) flushes and disables before handing the
+;  board over and brings the monitor's caches back after.
+;
+;  COHERENCE WITH THE D-CACHE ON (the M4 work, done 2026-08-29). Every
+;  region a bus master shares with the CPU is handled so caches-on is fully
+;  coherent, and the V3D console auto-enables the cache for its fast path:
+;    * The FRAMEBUFFER and the GENET receive ring are mapped Normal Non-
+;      Cacheable (CacheEnable -> MmuAddNc), so the display controller, V3D,
+;      the DMA engine and the ethernet DMA are coherent with no maintenance.
+;    * The VideoCore MAILBOX (mailbox.pi4) and the DMA engine (dma.pi4)
+;      clean+invalidate their request/response and control/copy buffers.
+;    * SDIO/CYW43 (the wifi radio) is polled PIO - no DMA buffer to maintain.
+;    * The payload jump (RunAt) flushes and disables before handing the board
+;      over, and brings the monitor's caches back after.
+;  Verified on silicon with caches on: the V3D console (~28 ms/redraw), the
+;  wifi console, info/mailbox, the wb OTA flash, the USB stick, a screenshot
+;  and a payload run. Ethernet frame RX/TX is coherent by construction (the
+;  RX ring NC + genet.pi4's dc civac) but was not verified on a test rig.
+; ======================================================================
+#ANVIL_CACHE = 1          ; 1 = the `cache` command can enable the D-cache.
+                          ; 0 compiles the capability out; the monitor then
+                          ; behaves exactly as it did before caches existed.
+
+Global gCacheOn.i = 0     ; 1 while the cached MMU is live. 0 at every boot.
+
+; 12 KiB of page tables (an L1 table and TWO L2 tables - the top-gigabyte
+; split and the low-gigabyte split that carries the framebuffer's Non-
+; Cacheable blocks) plus 4 KiB of alignment slack, in Anvil's BSS (built
+; BssAddress $0D000000, in the reserved low-memory band disjoint from the
+; Vulkan heap and below the 0x40000000 high-payload window a returning
+; payload can use.
+Global Dim gMmuTables.a[20480]
+
+; The 4 KiB-aligned base inside gMmuTables. Divide-and-multiply, never a
+; mask: "& $FFFFF000" is a 32-bit literal that clears the top half of a
+; 64-bit address - the exact trap mmu.pi4 records for its own rounding.
+Procedure.i CacheTablesBase()
+  ProcedureReturn ((@gMmuTables[0] + 4095) / 4096) * 4096
+EndProcedure
+
+; List every region that must remain coherent with a bus master. The DSI
+; scan and draw surfaces have fixed board-owned addresses even when only one
+; of them is the currently adopted DisplayBase, so map their complete reserved
+; window independently of source and rotation. The adopted display mapping is
+; retained for the firmware-owned HDMI framebuffer.
+Procedure CacheMapNc()
+  MmuClearNc()
+  MmuAddNc(#MON_FB_LO, #MON_FB_HI + 1)
+  If DisplayReady() <> 0 And DisplayBase() > 0
+    MmuAddNc(DisplayBase(), DisplayBase() + DisplaySize())
+  EndIf
+  ; The GENET receive ring - the ethernet DMA writes frames straight into
+  ; it. genet.pi4 also carries dc civac maintenance for this; the NC mapping
+  ; is belt-and-braces so the RX path is coherent by construction. The
+  ; literal is #ETH_RX_BASE .. +#ETH_RX_BYTES because eth_globals.pi4 is
+  ; included after this file.
+  MmuAddNc($08100000, $08180000)
+EndProcedure
+
+; Turn the cached MMU on. Rebuilds the tables every time (a returned
+; payload may have overwritten their DRAM), and MmuEnableCached()
+; invalidates the unknown reset-state D-cache before it sets M|C|I.
+; Returns 1 on success, 0 if this build cannot enable. Idempotent.
+Procedure.i CacheEnable()
+  Define rc.i
+  CompilerIf #ANVIL_CACHE = 1
+  If gCacheOn <> 0
+    ProcedureReturn 1
+  EndIf
+  If MmuBuildable() = 0
+    ProcedureReturn 0
+  EndIf
+  ; MAP THE DMA-SHARED REGIONS NON-CACHEABLE, so the CPU is coherent with
+  ; every bus master that bypasses the D-cache without any dc maintenance.
+  CacheMapNc()
+  rc = MmuBuildTables(CacheTablesBase())
+  If rc <> 0
+    ProcedureReturn 0
+  EndIf
+  MmuEnableCached()
+  gCacheOn = 1
+  ProcedureReturn 1
+  CompilerElse
+  ProcedureReturn 0
+  CompilerEndIf
+EndProcedure
+
+; Flush the whole D-cache to DRAM and disable, in the U-Boot order:
+; MmuDisableCachedFlushed() clears C|M first, THEN cleans by set/way.
+; Safe to call when already off.
+Procedure CacheDisable()
+  CompilerIf #ANVIL_CACHE = 1
+  If gCacheOn = 0
+    ProcedureReturn
+  EndIf
+  MmuDisableCachedFlushed()
+  gCacheOn = 0
+  CompilerEndIf
+EndProcedure
+
+; ======================================================================
+;  The jump
+; ======================================================================
+
+Procedure CallAddr()
+  ; gGoAddr and gGoX0 in, gGoRc out. Everything crosses in BSS globals
+  ; because the stack is the one thing a payload is guaranteed to disturb.
+  ASM
+    ; Save the monitor's sp. The payload's prologue sets sp to its own
+    ; hardcoded $08000000 and, if it returns at all, leaves it there -
+    ; so the value has to come back from somewhere the payload cannot
+    ; reach.
+    mov  x11, sp
+    adrp x10, global_gsp
+    add  x10, x10, #:lo12:global_gsp
+    str  x11, [x10]
+
+    ; Last chance to make freshly written code visible to fetch.
+    dsb  sy
+    ic ialluis
+    dsb  sy
+    isb
+
+    ; BLR, not BR: x30 becomes the instruction after this one, so a
+    ; payload that ends in "ret" comes back here and we can report x0.
+    ; A stock compiled image never does - its _start traps forever after
+    ; calling Main() - unless it was built --entry-returns, which turns
+    ; the trap into a real epilogue. Proven on silicon 2026-08-25.
+    ;
+    ; "ldr x9" for the same reason CacheLine() uses one: an ldr w9 here
+    ; would jump to the low half of the address, which for anything in
+    ; the high window is a wild branch into plausible-looking low DRAM.
+    adrp x9, global_ggoaddr
+    add  x9, x9, #:lo12:global_ggoaddr
+    ldr  x9, [x9]
+
+    ; ------------------------------------------------------------------
+    ; THE PAYLOAD ABI's ENTRY CONTRACT, and this is the whole of it in
+    ; eight instructions. Anvil/Hal/abi.pbi promises a payload that x0
+    ; holds the service table (or 0) and that x1..x7 are ZERO - not
+    ; "unspecified", zero - so that a payload which reads one gets a
+    ; predictable value instead of whatever this procedure happened to
+    ; leave there.
+    ;
+    ; IT IS CHEAPER TO KEEP THAT PROMISE THAN TO DOCUMENT ITS ABSENCE.
+    ; Seven movz instructions cost nothing measurable next to a payload
+    ; entry, and "unspecified" is the kind of guarantee that is true
+    ; until a compiler change makes it false in a way nothing catches.
+    ;
+    ; x0 IS LOADED LAST, after x1..x7 are cleared, because x0 is the one
+    ; with a value in it and a later "mov x0, #0" would silently undo the
+    ; handover. Load order is the correctness here, not an ordering
+    ; preference.
+    ;
+    ; x9 already holds the entry address and x10/x11 are the monitor's
+    ; scratch above; neither is part of the contract, and both are
+    ; caller-saved in this backend's convention.
+    movz x1, #0
+    movz x2, #0
+    movz x3, #0
+    movz x4, #0
+    movz x5, #0
+    movz x6, #0
+    movz x7, #0
+    adrp x0, global_ggox0
+    add  x0, x0, #:lo12:global_ggox0
+    ldr  x0, [x0]
+    ; ------------------------------------------------------------------
+
+    blr  x9
+
+    ; --- it came back --------------------------------------------
+    ; Reclaim exception ownership before any device/service work. Returning
+    ; payloads are same-level trusted code, not an isolation boundary. They
+    ; must leave the monitor's code/BSS and memory mapping accessible.
+    msr daifset, #15
+    ; The whole of x0, not its low half. adrp/add do not touch x0, so it
+    ; is still the payload's return value when the str runs.
+    adrp x10, global_ggorc
+    add  x10, x10, #:lo12:global_ggorc
+    str  x0, [x10]
+    adrp x10, global_gsp
+    add  x10, x10, #:lo12:global_gsp
+    ldr  x11, [x10]
+    mov  sp, x11
+    ; The private monitor stack is back. Reinstall this level's VBAR and
+    ; restore SIMD access before a later exception can enter our vectors.
+    ; ExceptionInstall uses integer code; gGoRc already holds the return.
+    bl exceptioninstall
+    cbnz x0, calladdr_vectors_ready
+calladdr_vector_failure:
+    wfe
+    b calladdr_vector_failure
+calladdr_vectors_ready:
+    ; sp is ours again, so the epilogue below reloads OUR link register
+    ; from OUR frame.
+  EndASM
+EndProcedure
+
+CompilerIf #ANVIL_V3D_CONSOLE = 1
+Declare.i V3dConPayloadSuspend()
+Declare.i V3dConPayloadResume(state.i)
+Declare.i V3dConFailed()
+CompilerEndIf
+
+Procedure RunAt(a.i)
+  Define wasCached.i
+  Define wasEth.i
+  Define resumeEth.i
+  Define dead.i
+  Define v3dState.i
+  Define vkState.i
+  ; The one place a payload is entered, so `g` and the autoboot cannot
+  ; drift apart in what they check or what they print.
+  ;
+  ; NO SECONDARY CORE CROSSES THIS BOUNDARY, IN EITHER DIRECTION.
+  ;
+  ; A released secondary is executing code inside this resident image and
+  ; walking whatever page tables the primary had live when it was
+  ; started - which, for a worker a payload started, are tables in that
+  ; payload's own memory. Parked in this monitor's WFE loop it has valid
+  ; CODE and borrowed TABLES, so loading the next payload over the last
+  ; one's window would leave three cores walking overwritten descriptors
+  ; at EL3. They are therefore sent back to the state the firmware
+  ; handed them over in - MMU and caches off, polling their own spin
+  ; slot, holding nothing - before the machine changes hands, and again
+  ; the moment it comes back. The next parallel run starts them afresh.
+  ;
+  ; Stopped workers are parked for good in this resident code and read
+  ; nothing, and a latched fault means a core that cannot be proven safe
+  ; to talk to. Neither can be reclaimed and for both the answer is
+  ; still a restart.
+  If CoreAcceptOwnsSecondaries() <> 0
+    If CoreAcceptReclaim() = 0
+      PrintN("!! resident secondary cores own this monitor until restart, so no")
+      PrintN("   payload was entered. Restart Anvil before run, go or boot mem.")
+      PrintN("   They were asked to go back to the firmware spin state first and")
+      PrintN("   would not: a core with a job still outstanding, a core parked by")
+      PrintN("   coretest stop, or a core that already stopped answering. Any of")
+      PrintN("   the three is recoverable only by a reset.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ;
+  ; NOT range-checked against the payload windows, on purpose. Jumping
+  ; into something the monitor did not load is a legitimate thing to
+  ; want - a U-Boot-resident blob, or a stub poked in by hand with a few
+  ; w commands - and refusing it would make the monitor less useful than
+  ; the loader it replaces. The one address it will not jump to is its
+  ; own.
+  If HitsMonitor(a, a) <> 0
+    Print("!! ")
+    PutAddr(a)
+    PrintN(" is inside the monitor itself, so nothing was run. Jumping in")
+    PrintN("   there would land in Anvil's own code and take this prompt with it.")
+    Print("   The monitor occupies ")
+    PutAddr(gMonHitLo)
+    Print(" to ")
+    PutAddr(gMonHitHi)
+    PrintN(". Anywhere else is allowed,")
+    PrintN("   and the two payload windows that help prints are the sensible ones.")
+    ProcedureReturn 0
+  EndIf
+  gGoAddr = a
+  gGoRc = 0
+  ; x0 IS CLEARED HERE AND SET BY THE CALLER AFTERWARDS, in that order.
+  ;
+  ; Every entry path that is not a wants-services container - `run`,
+  ; `autoboot`, `g`, a flat image, a container without the flag - hands
+  ; the payload a zero, and this is the single line that makes that true
+  ; for all of them at once rather than each remembering to. The one
+  ; caller that wants a non-zero x0, PmfEnter() in Anvil/Core/pmfboot.pbi,
+  ; sets gGoX0 and then calls RunAt - which is the wrong order to write it
+  ; in and would be a bug, so RunAt does NOT clear it here.
+  ;
+  ; It is cleared at the END of this procedure instead, after CallAddr has
+  ; consumed it, so a value cannot survive into the next entry. See there.
+  ; NO HOST TOOL READS THESE FOUR LINES. Checked across tools/ on
+  ; 2026-08-26: nothing greps for "Starting application", "deadman" or
+  ; "returned, x0". They used to carry U-Boot's "## " decoration, which
+  ; bought nothing a full sentence does not buy, so they are sentences.
+  Print("Starting the payload at ")
+  PutAddr(a)
+  PrintN(". Control leaves the monitor now, and")
+  PrintN("anything printed below this line came from the payload, not from Anvil.")
+
+  ; A command launched over Ethernet must receive the entering notice before
+  ; the controller carrying it is stopped. The aux tap flushes on newlines,
+  ; but make the boundary explicit so a future wording change cannot strand
+  ; a partial line in the ring.
+  NetConsoleFlush()
+
+  ; PUT THE TOUCH KEYBOARD AWAY BEFORE THE MACHINE CHANGES HANDS.
+  ; It is a UI layer over a console this monitor is about to stop owning,
+  ; and its state is spread across three places: contacts and modifiers
+  ; in the key model, a reserved band in the console, and a hit rectangle
+  ; and a capture table in the input dispatcher. One call clears all
+  ; three, ending with InputCancelAll(#AIC_PAYLOAD) so that nothing the
+  ; dispatcher still held can be delivered to an editor that is not
+  ; running. The half-typed command line is deliberately NOT cleared:
+  ; cancellation is about contacts and modifiers, and text belongs to
+  ; whoever typed it.
+  TouchKeyboardPayloadSuspend()
+
+  ; STOP THE ETHERNET BEFORE THE MACHINE CHANGES HANDS. The receive DMA
+  ; engine is a bus master writing into #ETH_RX_BASE on its own schedule.
+  ; EthPayloadQuiesce records whether the port must be restored, stops the
+  ; hardware even if its software flags disagree, and fails closed if the
+  ; bus master cannot be proved stopped. There is no safe jump in that state.
+  wasEth = EthPayloadQuiesce()
+  If wasEth < 0
+    gGoX0 = 0
+    NetConsoleFlush()
+    ProcedureReturn 0
+  EndIf
+
+  ; THE GPU IS A BUS MASTER TOO. The monitor and payload are separate images,
+  ; so neither can see the other's software owner flag. Quiesce and forget the
+  ; resident Neon/V3D console here, while the monitor still owns its caches,
+  ; before the payload gets a chance to publish a CT0 queue or page table.
+  ; A failed release refuses the jump; pretending the GPU is free would turn a
+  ; named ownership error into an unbounded command-list collision.
+  v3dState = 0
+  vkState = 0
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  vkState = VulkanConsolePayloadSuspend()
+  If vkState < 0
+    resumeEth = EthPayloadResume(wasEth)
+    TouchKeyboardPayloadResume()
+    gGoX0 = 0
+    PrintN("!! the resident Vulkan console could not prove a safe release.")
+    PrintN("   The payload was not entered and the screen renderer remains quarantined.")
+    ProcedureReturn 0
+  EndIf
+  CompilerEndIf
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  v3dState = V3dConPayloadSuspend()
+  If v3dState < 0
+    CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+    ; Vulkan was retired before the native owner reported its failed release.
+    ; Do not leave a stale "resume me" token that could resurrect a GPU owner
+    ; whose page-table handoff was not established.
+    VulkanConsolePayloadResume(0)
+    CompilerEndIf
+    resumeEth = EthPayloadResume(wasEth)
+    TouchKeyboardPayloadResume()
+    gGoX0 = 0
+    If resumeEth < 0
+      PrintN("!! the resident V3D console release failed, and the wired controller")
+      PrintN("   could not be restored safely. The monitor is resetting to firmware.")
+      UartDrain()
+      SafetyToFirmware()
+      ProcedureReturn 0
+    EndIf
+    UartMessageBegin()
+    NetDhcpTick()
+    NetConsoleRearm()
+    UartMessageEnd()
+    PrintN("!! the resident V3D console could not release the GPU, so the payload")
+    PrintN("   was not entered. V3dError() retains the exact reset/MMU failure.")
+    NetConsoleFlush()
+    ProcedureReturn 0
+  EndIf
+  CompilerEndIf
+
+  ; THE DEADMAN. If one is set, arm the PM watchdog immediately before
+  ; the jump and stop it immediately after. A payload that returns gets
+  ; its watchdog cancelled and nothing happens; a payload that HANGS
+  ; never reaches the stop, the counter runs out, and the board resets
+  ; itself back into the firmware.
+  ;
+  ; ARMED HERE AND NOWHERE ELSE, because this is the only window in
+  ; which a hang is expected. Leaving it armed at the prompt would
+  ; reboot the board while somebody was reading the last dump, which is
+  ; a rescue that costs more than the thing it rescues from.
+  ;
+  ; DRAIN FIRST. Once the counter is running, the reset can arrive at
+  ; any instruction, and a line still sitting in the PL011 FIFO when it
+  ; does is a line nobody ever sees.
+  ;
+  ; THE SETTING IS TAKEN HERE, ONE-SHOT, the way the screenshot arm is.
+  ; `deadman` says it covers the NEXT payload only, and until 2026-09-16 it
+  ; did not: the watchdog was started and stopped around the jump, but the
+  ; setting stayed, so every later payload got a watchdog nobody had asked
+  ; for (forum 879). Taken after every refusal above, so a jump that was
+  ; refused leaves it armed for the payload it was meant for.
+  dead = gDead
+  gDead = 0
+  If dead > 0
+    Print("The deadman watchdog is armed for ")
+    PrintDec(SafetyWatchdogStart(dead))
+    PrintN(" seconds. If the payload hangs and")
+    PrintN("never comes back, the board will reset itself rather than sit there.")
+    UartDrain()
+  EndIf
+
+  ; HAND THE MACHINE OVER WITH THE CACHES OFF AND DRAM COHERENT. A payload
+  ; expects the stub's world - MMU off, caches cold - so if the monitor is
+  ; running cached, flush every dirty line to DRAM and disable, in the safe
+  ; order (MmuDisableCachedFlushed: clear C|M, then set/way clean). This is
+  ; done INSIDE the deadman window armed just above, so a hang in the flush
+  ; or the re-enable is caught by the watchdog rather than wedging the board.
+  wasCached = gCacheOn
+  If wasCached <> 0
+    CacheDisable()
+  EndIf
+
+  ; THE RUN RECORD, the last write before the jump and the first after it.
+  ; Every refusal above has already had its say, so a run number that moved
+  ; means a payload was entered; the return writes x0 before the picture is
+  ; taken or any device is touched, so a return path that wedges below still
+  ; leaves a record saying the payload came back. `last run` reads it, and a
+  ; host whose return line was lost asks it. See RaspberryPi4/Board/runrecord.pi4.
+  RunRecordEnter(a, dead)
+
+  CallAddr()
+  RunRecordReturn(gGoRc)
+
+  ; ------------------------------------------------------------------
+  ;  THE PICTURE, BEFORE ANYTHING ELSE HAPPENS.
+  ;
+  ;  This is the FIRST statement after the payload came back, and the
+  ;  position is the whole feature. Every line printed below this point
+  ;  goes into the console grid and is painted over the surface the
+  ;  payload left behind, so the frame being asked about is destroyed by
+  ;  the monitor's own report that the payload returned. It has to be
+  ;  copied out of the way before a single character is printed - not
+  ;  after the network is back, not after the caches are, and certainly
+  ;  not at the prompt.
+  ;
+  ;  WHY THE RULING SAYS IT MUST EXIST. A payload ran four times on
+  ;  2026-09-11, returned cleanly every time and put nothing on the
+  ;  panel; the fifth drew a garbled frame. Nothing in any of those five
+  ;  runs came back with evidence of what the screen held, so "clean"
+  ;  and "garbled" were indistinguishable in the transcript. Every board
+  ;  run comes back with a picture now.
+  ;
+  ;  IT ONLY HAPPENS IF SOMEBODY ARMED IT, and the arm is taken here -
+  ;  read and cleared in one call - so a capture cannot be armed once and
+  ;  quietly overwrite the picture of a later run nobody was watching.
+  ;  A payload that wants its own frame kept calls the service slot and
+  ;  does not need this at all.
+  ;
+  ;  NOTHING IS PRINTED ON FAILURE AND THAT IS DELIBERATE HERE. The
+  ;  network has not been reclaimed yet and the console's own state is
+  ;  whatever the payload left; a sentence at this instant would be one
+  ;  more thing that can wedge on the path out of a payload. The result
+  ;  is reported by `shot`, which says plainly that the area holds no
+  ;  picture - and a host tool that armed a capture and got no picture
+  ;  fails its run for exactly that reason.
+  ;
+  ;  x0 IS ALREADY IN gGoRc. CallAddr stored it before anything else it
+  ;  does, so the number in the capture's header is the one the line at
+  ;  the bottom of this procedure prints, by construction.
+  ; ------------------------------------------------------------------
+  If ShotTakeArm() <> 0
+    ScrShotNow(#MON_SHOT_WHO_RETURN, gGoRc)
+  EndIf
+
+  ; RECLAIM GENET BEFORE TOUCHING CACHES, DISPLAY DMA OR NETWORK SOFTWARE.
+  ; A returning payload may have enabled this bus master even when Ethernet
+  ; was down on entry. The checked stop issues a system barrier and reads the
+  ; three owned enable fields back clear. GENET exposes no cited idle/empty
+  ; acknowledgement here, so this is a command/readback boundary, not proof
+  ; that no already-issued final write exists.
+  ;
+  ; Failure is terminal. Continuing into cache-table rebuild, display recovery
+  ; or a prompt would pretend RAM and the interface were safe while an
+  ; untrusted bus master may still be live. Drain the only reliable local
+  ; diagnostic and take the existing PM-watchdog route back to firmware.
+  If EthPayloadReclaim() = 0
+    PrintN("!! the payload returned, but the GENET stop command or an enable-field")
+    PrintN("   readback failed, so a stopped controller was not established.")
+    PrintN("   Cache, display and network recovery have NOT been attempted.")
+    PrintN("   The monitor is resetting rather than run beside an untrusted DMA master.")
+    EthWhyGenet()
+    Print("   The payload x0 value was ")
+    PutHex16(gGoRc)
+    PrintN(".")
+    UartDrain()
+    SafetyToFirmware()
+  EndIf
+
+  ; THE HANDOVER VALUE IS SPENT. Clear it so that the next `run`, `g` or
+  ; autoboot of a plain image cannot be handed a service-table pointer
+  ; that nothing asked for. A payload that finds a live pointer in x0 it
+  ; did not request will either ignore it (harmless) or treat it as its
+  ; own argument (not harmless), and which of the two happens is decided
+  ; by code this monitor has never seen.
+  gGoX0 = 0
+
+  ; The payload has returned. Bring the monitor's own caches back exactly
+  ; as they were; CacheEnable() rebuilds the tables in case the payload
+  ; wrote over their DRAM.
+  If wasCached <> 0
+    CacheEnable()
+  EndIf
+
+  ; TAKE THE SECONDARY CORES BACK, AND DO IT HERE - after the monitor's
+  ; own translation regime is back (the reclaim talks to the workers
+  ; through cacheable rows and needs M, C and I on) and before anything
+  ; can write over the payload's memory. A worker the payload started is
+  ; walking the payload's page tables; every prompt command that loads,
+  ; receives or pokes is a chance to overwrite them, so the window
+  ; between here and the prompt is the whole of the risk and it is
+  ; closed first.
+  If CoreAcceptOwnsSecondaries() <> 0
+    If CoreAcceptReclaim() = 0
+      PrintN("!! the payload returned, but the secondary cores it started would not")
+      PrintN("   go back to the firmware spin state, so they are still running this")
+      PrintN("   monitor's code against the payload's page tables. Do not load or")
+      PrintN("   write over the payload's memory: reset the board instead.")
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  TAKE THE DMA CHANNEL BACK. The payload had the whole machine and
+  ;  the engine is part of the machine: pi4DmaProbe, pi4DmaGate and
+  ;  every display payload drive the same channel 0 this monitor now
+  ;  scrolls with, and one that returned while a transfer was still
+  ;  running would leave CS.ACTIVE set.
+  ;
+  ;  WHY IT MATTERS ENOUGH TO SPEND A LINE ON. CONBLK_AD is read-only
+  ;  while the channel is active, so the monitor's next submission
+  ;  would be ignored and DmaWait() would sit out its full two-second
+  ;  timeout before falling back - turning a 12 ms scroll into a
+  ;  two-second one, on every line, with nothing on the wire to say
+  ;  why. This is the same reasoning the network shutdown before every
+  ;  run is built on: a payload must not leave a bus master running
+  ;  underneath the monitor.
+  ;
+  ;  If reset cannot establish quiescence, suspend screen memory access.
+  ;  Switching to CPU drawing cannot stop outstanding DMA writes.
+  If gDma = 1
+    If DmaChannelReset() = 0
+      gDma = 0
+      DisplayUseDma(0)
+      UartMirror(0)
+      ConNoRenderer()
+      PrintN("DMA error -20: the payload's DMA channel could not be stopped safely.")
+      PrintN("Screen drawing is suspended; CPU fallback would reuse unsafe buffers.")
+      PrintN("Use the console to diagnose the channel before explicit recovery.")
+    EndIf
+  EndIf
+
+  ; The screenshot above captured the payload's untouched frame and DMA is now
+  ; known idle. Only now may the monitor rebuild the V3D console it suspended
+  ; before entry. If recovery fails, its helper binds the safe DMA tier (or no
+  ; screen renderer when DMA itself is unavailable) before this code prints.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If V3dConPayloadResume(v3dState) = 0 And v3dState = 2
+    PrintN("!! the payload returned, but the resident V3D console did not recover.")
+    PrintN("   The monitor is using its safe display tier; V3dError() has the cause.")
+  EndIf
+  CompilerEndIf
+
+  ; Rebuild the opt-in Vulkan owner only after the native V3D payload boundary
+  ; has restored its engine state. Its screen callback and all Vulkan objects
+  ; were retired before the jump, so no stale queue, page table or target can
+  ; survive a returning payload.
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If VulkanConsolePayloadResume(vkState) = 0 And vkState <> 0
+    PrintN("!! the payload returned, but the resident Vulkan console could not be restored.")
+    PrintN("   The framebuffer console remains selected; screen vulkan can retry.")
+  EndIf
+  CompilerEndIf
+
+  ; THE MONITOR OWNS ITS OWN SCREEN AGAIN, so the keyboard layer may
+  ; exist again - and only now, after the caches are back and the display
+  ; DMA channel has been reclaimed or given up. It starts from nothing:
+  ; the surface every key rectangle was derived from was in the payload's
+  ; hands, so the layout is invalidated and re-derived rather than
+  ; trusted. Nothing is shown; the operator asks for it again.
+  TouchKeyboardPayloadResume()
+
+  ; A returning payload may have overwritten the banner band even when the
+  ; resident console and its GPU owners were restored successfully. Rebuild
+  ; the banner from the monitor's own source, then repaint/present the grid.
+  ; Never touch a surface whose renderer could not prove safe ownership.
+  If gScreen <> 0
+    CompilerIf #ANVIL_VULKAN_CONSOLE = 1 And #ANVIL_V3D_CONSOLE = 1
+      If VulkanConsoleQuarantined() = 0 And V3dConFailed() = 0
+        DisplayClear(gScreenBg)
+        DrawBanner()
+        ConRepaint()
+        ScrPresentAll()
+      EndIf
+    CompilerElseIf #ANVIL_VULKAN_CONSOLE = 1
+      If VulkanConsoleQuarantined() = 0
+        DisplayClear(gScreenBg)
+        DrawBanner()
+        ConRepaint()
+        ScrPresentAll()
+      EndIf
+    CompilerElseIf #ANVIL_V3D_CONSOLE = 1
+      If V3dConFailed() = 0
+        DisplayClear(gScreenBg)
+        DrawBanner()
+        ConRepaint()
+        ScrPresentAll()
+      EndIf
+    CompilerElse
+      DisplayClear(gScreenBg)
+      DrawBanner()
+      ConRepaint()
+      ScrPresentAll()
+    CompilerEndIf
+  EndIf
+
+  ; Restore only a controller that was active before the handoff. GENET was
+  ; already reclaimed immediately after CallAddr. This is a
+  ; full bounded hardware start, not trust in peripheral registers left by
+  ; arbitrary code. eth_HwUp deliberately keeps the wired software row: its
+  ; primary address and provenance, link-local/served alias, DHCP machines
+  ; and UDP listeners have lifetimes independent of a MAC reset.
+  resumeEth = EthPayloadResume(wasEth)
+  If resumeEth < 0
+    PrintN("!! the payload returned, but the wired-controller restart then failed")
+    PrintN("   and its stop command or an owned enable-field readback also failed.")
+    PrintN("   DHCP, console rearm and watchdog stop have NOT been attempted.")
+    PrintN("   This readback is not a physical DMA-idle acknowledgement; it is the")
+    PrintN("   strongest safe cleanup boundary this GENET driver currently exposes.")
+    Print("   The payload x0 value was ")
+    PutHex16(gGoRc)
+    PrintN(".")
+    UartDrain()
+    SafetyToFirmware()
+    ProcedureReturn 0
+  EndIf
+
+  ; The prompt did not tick while the payload owned the CPU. Advance lease
+  ; state against the real elapsed clock now, after physical links are back:
+  ; a still-valid lease survives, a T1/T2 deadline schedules renewal, and an
+  ; expired lease is removed rather than used for the return response. This
+  ; existing worker also advances a Wi-Fi lease by elapsed time without
+  ; resetting or rewriting the radio's identity.
+  ;
+  ; BOTH OF THESE ARE THE MONITOR'S OWN HOUSEKEEPING, so what they say - a
+  ; lease dropped, the console now listening somewhere else - is a message
+  ; and not part of the payload's result. It goes to the message log (see
+  ; THE MESSAGE CONTEXT in RaspberryPi4/Lib/uart.pi4), so the lines below
+  ; are the next thing the host reads after the jump.
+  UartMessageBegin()
+  NetDhcpTick()
+
+  ; Re-derive listening and exact peer ownership before the first final line.
+  ; If wired recovery failed or its lease expired, the stale peer is forgotten
+  ; and these lines remain available on the local UART instead of being sent
+  ; through an interface the monitor just said was down.
+  NetConsoleRearm()
+  UartMessageEnd()
+
+  If dead > 0
+    SafetyWatchdogStop()
+    PrintN("The payload came back, so the deadman watchdog has been stopped. The")
+    PrintN("board will not reset itself.")
+  EndIf
+  ; THE LINE THAT MATTERS, and it is not shortened for anyone. When the
+  ; console itself was broken, U-Boot's "## Application terminated,
+  ; rc = 0x..." was the only working debug channel: a probe returning
+  ; (CurrentEL << 16) | PL011_FR came back $80091 and that one number
+  ; solved the bug. Debugging "the console does not work" with no
+  ; console is circular, and this is the way out of the circle.
+  ;
+  ; SIXTEEN DIGITS. x0 is a 64-bit register and always was; eight digits
+  ; is the low half of it, which is fine until the day a payload returns
+  ; a pointer or a raw system register and the interesting bits are the
+  ; ones that were dropped. The resident 1.x build printed eight and the
+  ; top half of a proof value was invisible until the payload printed it
+  ; itself.
+  Print("The payload returned to the monitor. Its x0 register held ")
+  PutHex16(gGoRc)
+  PrintN(",")
+  PrintN("which is whatever it chose to return. A stock image never returns at")
+  PrintN("all, so seeing this line means the payload was built to come back.")
+  ; Close the command-response boundary for a network launcher. Per-line
+  ; flushing normally sent the prose above; this sends any tail a future edit
+  ; leaves behind while the restored controller and peer are still current.
+  NetConsoleFlush()
+  ProcedureReturn 1
+EndProcedure

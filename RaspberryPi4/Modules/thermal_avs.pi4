@@ -1,0 +1,285 @@
+; ======================================================================
+;  THERMAL.MOD - THE BCM2711's OWN TEMPERATURE MONITOR, AS A DRIVER
+;  MODULE. THE FIRST REAL DRIVER TO LEAVE THE CORE.
+; ----------------------------------------------------------------------
+;  BUILD:
+;      PureMetalForge.exe --compile RaspberryPi4/Modules/thermal_avs.pi4
+;           -t pi4 --module -o THERMAL.MOD
+;
+;  and copy THERMAL.MOD to the root of the boot medium beside
+;  SETTINGS.TXT, with a line in MODULES.TXT naming it.
+;
+;  IT INCLUDES Anvil/Hal/seams.pbi AND NOTHING ELSE OF ANVIL'S. That is
+;  the contract working rather than a coincidence: a module is separately
+;  compiled, never sees the monitor source, and reaches the monitor only
+;  through the service-table pointer it is handed. If this file ever
+;  needs a second Anvil include, the contract has leaked and the leak is
+;  the defect, not the include.
+;
+;  A TRAP WORTH AN OPERATOR'S AFTERNOON, MET WHILE WRITING THIS FILE. A
+;  module build refused here with
+;
+;      COMPILER ERROR: Unexpected token 'pi4.thermal.avs'
+;
+;  pointing at the `Module` line, while the identical source built
+;  perfectly from another directory. The cause was not this file and not
+;  the compiler: it read a keyword table FROM THE SOURCE TREE in
+;  preference to its own, and this repository's copy was three days stale
+;  and predated the Module/ModuleABI/ModuleMatch/Seam keywords entirely.
+;  A keyword the table does not carry is not a keyword, so the
+;  declaration parsed as a bare identifier. This repository no longer
+;  carries a keyword table; the compiler owns it. If this error ever
+;  returns, check for a stray keywords.def beside the source first.
+;
+;  THIS FILE HOLDS NO ADDRESS OF ITS OWN. The board declares the device
+;  and hands the driver its base as the second argument to probe and
+;  init. That is what makes the claim "portable driver" checkable instead
+;  of decorative: a module that kept a constant here would work perfectly
+;  on this board and fail the first time the block moved, and nothing
+;  would notice until it did.
+;
+;  WHAT IT IS FOR. It matches `brcm,bcm2711-thermal`, which is the
+;  compatible string the vendor's own kernel driver binds to, and fills
+;  the thermal seam's read function. With it loaded, Anvil's temperature
+;  comes straight off the part; without it, Anvil falls back to the
+;  firmware property interface exactly as it always did.
+;
+; ======================================================================
+;  THE REGISTER, AND WHERE ITS NUMBERS COME FROM
+;
+;  These facts moved here whole from RaspberryPi4/Lib/thermal.pi4 on
+;  2026-09-10. They are the reason to trust the arithmetic below and they
+;  travel with the code that uses them.
+;
+;  THE BLOCK. Datasheets/pi4/bcm2711.dtsi:68-77
+;
+;      avs_monitor: avs-monitor@7d5d2000 {
+;          compatible = "brcm,bcm2711-avs-monitor", "syscon", "simple-mfd";
+;          reg = <0x7d5d2000 0xf00>;
+;          thermal: thermal { compatible = "brcm,bcm2711-thermal"; ... };
+;      };
+;
+;  THE ADDRESS TRANSLATION IS THE DEVICE TREE'S OWN, and it is not the
+;  familiar one. bcm2711.dtsi:40-42 gives the soc node three ranges:
+;
+;      <0x7e000000  0x0 0xfe000000  0x01800000>   the common peripherals
+;      <0x7c000000  0x0 0xfc000000  0x02000000>   the BCM2711-only ones
+;      <0x40000000  0x0 0xff800000  0x00800000>   the ARM-local block
+;
+;  0x7d5d2000 falls in the SECOND range, not the first, so it is
+;  $FD5D2000 from the processor and not $FE5D2000. THAT TRANSLATION NOW
+;  LIVES IN THE BOARD, in RaspberryPi4/Board/hw_mod.pi4's device table,
+;  and arrives here as the `device` argument - which is the right place
+;  for it, because it is a fact about how this SoC is wired rather than
+;  about how the sensor works. The validity bits below are what would
+;  catch a board that got it wrong.
+;
+;  THE REGISTER, ITS VALIDITY BITS AND ITS FIELD.
+;  Datasheets/pi4/pwm/rpi-6.12.y_bcm2711_thermal.c:24-26
+;
+;      #define AVS_RO_TEMP_STATUS            0x200
+;      #define AVS_RO_TEMP_STATUS_VALID_MSK  (BIT(16) | BIT(10))
+;      #define AVS_RO_TEMP_STATUS_DATA_MSK   GENMASK(9, 0)
+;
+;  and its read (same file, lines 42-51) is exactly: read, refuse with
+;  -EIO if EITHER validity bit is clear, mask to ten bits, convert.
+;
+;  THE CONVERSION IS A STRAIGHT LINE and its two coefficients are in the
+;  device tree, not the driver. bcm2711.dtsi:626-629
+;
+;      &cpu_thermal { coefficients = <(-487) 410040>; ... };
+;
+;  which the driver reads as slope and offset and applies as
+;
+;      *temp = slope * val + offset;             (bcm2711_thermal.c:51)
+;
+;  in MILLIDEGREES - the comment one line above says so: "Convert a HW
+;  code to a temperature reading (millidegree celsius)".
+;
+;  THE SLOPE IS NEGATIVE, which is the one thing about this sensor that
+;  will trip a reader: a BIGGER code is a COLDER part. Code 0 would be
+;  410 C and code 1023 would be -88 C, so the whole useful band sits
+;  near the top of the range - about 739 at 50 C and 698 at 70 C. A
+;  conversion written with the sign the other way round produces
+;  plausible-looking numbers that move the wrong way, which is why the
+;  gate checks the DIRECTION as well as the values.
+;
+;  HARDWARE-VERIFIED 2026-09-06 on a Pi 4: `fan` printed 39 C (39920
+;  millidegrees) from this register with both validity bits set,
+;  alongside the firmware's 85 C throttle point. The address, the two
+;  validity bits and the negative slope are measured and not only cited.
+;
+;  READING THIS ADDRESS CANNOT HANG THIS BOARD. That is the Pi 4's
+;  measured property, written down in RaspberryPi4/Board/hw_addr.pi4: no
+;  address on this part is known to stall the interconnect, and an
+;  address with nothing behind it returns a value rather than wedging -
+;  unlike the Arduino Q's QCM2290, where exactly this kind of speculative
+;  read cost a power cycle. So the register may be read before anything
+;  has proved the AVS block is clocked, and the validity bits are what
+;  turn a garbage answer into a refusal instead of into a temperature.
+;  THAT IS ALSO WHY THE PROBE IS ALLOWED TO READ IT: a probe must be
+;  side-effect-free, and on this part this read is.
+; ======================================================================
+
+Module "pi4.thermal.avs"
+ModuleABI 1, 1
+ModuleMatch "brcm,bcm2711-thermal"
+
+; The published contract, and the only Anvil file a module may include.
+XIncludeFile "Anvil/Hal/seams.pbi"
+
+Seam #SVCCAP_THERMAL
+
+#AVS_RO_TEMP_STATUS   = $200
+#AVS_TEMP_VALID_MASK  = $10400        ; BIT(16) | BIT(10)
+#AVS_TEMP_DATA_MASK   = $3FF          ; bits 9:0
+
+; The two coefficients, named separately so a reader can check each one
+; against the device tree line rather than against a folded constant.
+#AVS_TEMP_SLOPE  = -487
+#AVS_TEMP_OFFSET = 410040
+
+; The block base the board handed us at init. Zero until then, and a read
+; before init answers the sentinel rather than dereferencing zero.
+;
+; GLOBALS IN A MODULE ARE INITIALISED ONCE, BEFORE THE FIRST LIFECYCLE
+; ENTRY, by the compiler's own one-time initialiser - the module has no
+; _start and no BSS-zeroing loop of its own, because it is entered on its
+; caller's stack rather than on a machine coming out of reset.
+Global gAvsBase.i = 0
+
+; ----------------------------------------------------------------------
+;  AvsStatus(base) - the status word, unmasked, as an unsigned 32-bit
+;  value. The barriers are the same pair the core file used: this is a
+;  device register and the compiler is entitled to move an ordinary load.
+; ----------------------------------------------------------------------
+Procedure.i AvsStatus(base.i)
+  Define v.i
+  a64_barrier()
+  v = PeekN(base + #AVS_RO_TEMP_STATUS) & $FFFFFFFF
+  a64_barrier()
+  ProcedureReturn v
+EndProcedure
+
+; 1 when BOTH validity bits are set. The vendor driver tests the pair
+; together and so does this: bit 16 alone, or bit 10 alone, is not a
+; reading its own code would use.
+Procedure.i AvsValid(raw.i)
+  If (raw & #AVS_TEMP_VALID_MASK) = #AVS_TEMP_VALID_MASK
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The line, and nothing else. Separated from the read so a gate can drive
+; it over the whole 0..1023 domain without a register model in the way.
+Procedure.i AvsCodeToMilliC(code.i)
+  ProcedureReturn #AVS_TEMP_SLOPE * (code & #AVS_TEMP_DATA_MASK) + #AVS_TEMP_OFFSET
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SERVICE. This is the procedure whose address is published into the
+;  thermal seam, and it is what Anvil calls on every temperature read.
+;
+;  IT TAKES NO ARGUMENT. The driver was handed its device once, at init,
+;  and is not asked again - a seam function that had to be told its own
+;  hardware on every call would push the driver's state back into the
+;  monitor, which is the thing a module exists to stop.
+; ----------------------------------------------------------------------
+Procedure.i ThermalAvsRead()
+  Define raw.i
+  If gAvsBase = 0
+    ProcedureReturn #MOD_TEMP_NONE
+  EndIf
+  raw = AvsStatus(gAvsBase)
+  If AvsValid(raw) = 0
+    ProcedureReturn #MOD_TEMP_NONE
+  EndIf
+  ProcedureReturn AvsCodeToMilliC(raw)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ModuleProbe(services, device) - is this device really here?
+;
+;  SIDE-EFFECT-FREE, AND ON THIS PART THAT IS PROVABLE RATHER THAN
+;  PROMISED: the whole of it is one load from a status register that this
+;  board has recorded as safe to read at any time. It writes nothing, it
+;  stores nothing in its own globals, and it does not publish a service -
+;  the monitor refuses a publish from outside init, so it could not even
+;  if it tried.
+;
+;  A POSITIVE ANSWER CLAIMS THE DEVICE. Zero declines, and declining is a
+;  normal outcome: the id matched but the block is not answering with a
+;  valid reading, which is exactly what a probe is for. The loader then
+;  leaves the seam empty and the monitor keeps using the firmware.
+; ----------------------------------------------------------------------
+Procedure.i ModuleProbe(services.i, device.i)
+  If device = 0
+    ProcedureReturn 0
+  EndIf
+  If AvsValid(AvsStatus(device)) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ModuleInit(services, device) - take the device and publish the service.
+;
+;  THE ONLY THING IT DOES BESIDES REMEMBERING THE BASE IS ONE CALL
+;  THROUGH THE TABLE. The service-table pointer arrives in `services`;
+;  slot #SVC_SEAM_SLOT_FILL of the core group holds SvcSeamFill, and the
+;  address of it is read out and called. That is the whole of a module's
+;  connection to the monitor.
+;
+;  IT RETURNS WHAT THE FILL RETURNED. A module that ignored a refused
+;  fill and answered 0 would be reported ACTIVE while its seam stayed
+;  empty; returning the code makes the loader unwind and say so.
+;
+;  THE BASE IS STORED ONLY AFTER THE FILL SUCCEEDS. If the publish is
+;  refused the driver leaves itself exactly as it was found, so the
+;  unwound record holds a module that has taken nothing.
+; ----------------------------------------------------------------------
+Procedure.i ModuleInit(services.i, device.i)
+  Define *fill
+  Define rc.i
+  If services = 0 Or device = 0
+    ProcedureReturn -1
+  EndIf
+  ; A POINTER VARIABLE AND NOT A PLAIN .i, and the star is load-bearing.
+  ; The compiler refuses `x(...)` on an ordinary integer that was never
+  ; assigned @Procedure - "nothing has ever stored an address in it, so
+  ; that branch goes wherever its current value happens to point" - which
+  ; is exactly the defect that once sent a board to BOOTSEL with nothing
+  ; printed. A `*name` declares the intent, and the call emits BLR.
+  *fill = PeekI(services + #SVC_SEAM_HDR_BYTES + #SVC_SEAM_SLOT_FILL * 8)
+  If *fill = 0
+    ProcedureReturn -2
+  EndIf
+  rc = fill(#SVCCAP_THERMAL, #SEAM_THERMAL_READ, @ThermalAvsRead)
+  If rc <> 0
+    ProcedureReturn rc
+  EndIf
+  gAvsBase = device
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ModuleQuiesce(services, device) - put the hardware down.
+;
+;  THIS DRIVER HAS NOTHING TO PUT DOWN AND SAYS SO BY SUCCEEDING. It
+;  never wrote a register, never enabled a clock and never started a
+;  transfer; the AVS monitor runs whether anything reads it or not.
+;  Forgetting the base is the whole of its teardown, and it matters: the
+;  seam function is about to be withdrawn, and a copy of the pointer
+;  held somewhere the monitor cannot see would otherwise find a driver
+;  still willing to read a device it no longer owns.
+;
+;  A DRIVER WITH REAL STATE ANSWERS NON-ZERO WHEN IT CANNOT. The loader
+;  refuses the unload and leaves the record ACTIVE, because a driver torn
+;  out over its own objection leaves silicon mid-transaction.
+; ----------------------------------------------------------------------
+Procedure.i ModuleQuiesce(services.i, device.i)
+  gAvsBase = 0
+  ProcedureReturn 0
+EndProcedure

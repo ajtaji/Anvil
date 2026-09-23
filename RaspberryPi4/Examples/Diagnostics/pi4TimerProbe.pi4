@@ -1,0 +1,202 @@
+; pi4TimerProbe.pi4 - is the delay still a second when the CPU doubles?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE QUESTION THIS EXISTS TO SETTLE.
+;
+; pi4ClockProbe found the ARM clock idling at 600 MHz on a board whose
+; board file declares ClockSpeed = 1500000000. F_CPU therefore lies by a
+; factor of 2.5 at boot, and anything calibrated against F_CPU - a spin
+; loop, a baud divisor - is wrong by that factor until something raises
+; the clock.
+;
+; timer.pi4 claims immunity. It is built on CNTPCT_EL0 and CNTFRQ_EL0,
+; the ARM architectural counter, which runs at a fixed 54 MHz on the
+; BCM2711 and is deliberately NOT the CPU clock. If that claim is true
+; then delay() is correct at any CPU speed and the F_CPU problem never
+; reaches it.
+;
+; A CLAIM ABOUT INDEPENDENCE CANNOT BE TESTED AT ONE SPEED. So this runs
+; the identical measurement twice - once at whatever the board booted at,
+; once after raising the ARM clock to its maximum - and prints both. If
+; timer.pi4 is right the two agree. If it is secretly spinning on the CPU
+; clock the second number is 2.5x smaller and the whole library is wrong
+; on a machine that has warmed up.
+;
+; BUILT WITH --entry-returns, so a wrong answer costs a line of output
+; and not a power cycle:
+;
+;   PureMetalForge.exe --compile pi4TimerProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; Measure delay(ms) against the architectural counter and report the
+; error in parts per thousand. The counter is the reference because it is
+; the one clock on this part that is specified to be fixed.
+Procedure.i MeasureDelay(ms.i)
+  Define t0.i
+  Define t1.i
+  Define elapsed.i
+  Define hz.i
+  Define expected.i
+  Define err.i
+
+  hz = TickHz()
+  t0 = Ticks()
+  delay(ms)
+  t1 = Ticks()
+  elapsed = t1 - t0
+
+  expected = (hz / 1000) * ms
+  PutS("    delay(")
+  PutDec(ms)
+  PutS(") took ")
+  PutDec(elapsed)
+  PutS(" ticks, expected ")
+  PutDec(expected)
+  PutS("  -> ")
+  ; parts per thousand, signed
+  If expected > 0
+    err = ((elapsed - expected) * 1000) / expected
+    PutDec(err)
+    PutS(" ppt error")
+  EndIf
+  PutNl()
+  ProcedureReturn elapsed
+EndProcedure
+
+Procedure Run(*label)
+  Define armHz.i
+  PutS("  ")
+  PutS(*label)
+  PutS("  ARM measured ")
+  armHz = MailboxClockRateMeasured(#MBX_CLK_ARM)
+  PutDec(armHz)
+  PutS(" Hz")
+  PutNl()
+  MeasureDelay(100)
+  MeasureDelay(500)
+  ProcedureReturn armHz
+EndProcedure
+
+Procedure Main()
+  Define slow.i
+  Define fast.i
+  Define a.i
+  Define b.i
+
+  PutNl()
+  PutS("=== Pi 4 timer probe - does delay() survive a clock change? ===")
+  PutNl()
+
+  If MailboxInit() = 0
+    PutS("MailboxInit FAILED")
+    PutNl()
+    ProcedureReturn $BAD1
+  EndIf
+  If TimerInit() = 0
+    PutS("TimerInit FAILED")
+    PutNl()
+    ProcedureReturn $BAD2
+  EndIf
+
+  PutS("counter ")
+  PutDec(TickHz())
+  PutS(" Hz  (this is CNTFRQ_EL0, NOT the CPU clock)")
+  PutNl()
+
+  ; Ask the firmware for the minimum first, so the two runs are as far
+  ; apart as this board allows.
+  MailboxArmClockSet(MailboxClockRateMin(#MBX_CLK_ARM))
+  slow = Run("at MIN clock: ")
+  a = MeasureDelay(200)
+
+  MailboxArmClockSet(MailboxClockRateMax(#MBX_CLK_ARM))
+  fast = Run("at MAX clock: ")
+  b = MeasureDelay(200)
+
+  PutNl()
+  PutS("ARM went ")
+  PutDec(slow)
+  PutS(" -> ")
+  PutDec(fast)
+  PutS(" Hz.  the same delay(200) took ")
+  PutDec(a)
+  PutS(" then ")
+  PutDec(b)
+  PutS(" ticks.")
+  PutNl()
+
+  ; A tick is ~18.5 ns, so a few hundred ticks of difference across a
+  ; 200 ms wait is loop overhead, not clock dependence. A 2.5x change
+  ; would be millions.
+  If a > b
+    If (a - b) < (a / 20)
+      PutS("=== timer.pi4 is CLOCK-INDEPENDENT: within 5 percent ===")
+    Else
+      PutS("=== IT MOVED WITH THE CPU CLOCK - timer.pi4 is wrong ===")
+    EndIf
+  Else
+    If (b - a) < (b / 20)
+      PutS("=== timer.pi4 is CLOCK-INDEPENDENT: within 5 percent ===")
+    Else
+      PutS("=== IT MOVED WITH THE CPU CLOCK - timer.pi4 is wrong ===")
+    EndIf
+  EndIf
+  PutNl()
+
+  ProcedureReturn 0
+EndProcedure

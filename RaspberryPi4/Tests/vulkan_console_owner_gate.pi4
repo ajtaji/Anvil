@@ -1,0 +1,143 @@
+; Emitted CPU-only exercise of the actual Vulkan console stop and payload
+; suspend procedures. The checker inserts exact production procedure bodies.
+#VK_SUCCESS = 0
+#VK_ERROR_DEVICE_LOST = -4
+#AVC_OK = 0
+#AVC_ERR_VK = -21201
+
+Global avcDevice.i, avcInstance.i, avcPhysical.i, avcQueue.i, avcPool.i
+Global avcImage.i, avcMemory.i, avcView.i, avcRenderPass.i, avcFramebuffer.i
+Global avcImageBase.i, avcImagePitch.i, avcImageBytes.i
+Global avcReady.i, avcActive.i, avcDeviceUnsafe.i, avcQuarantined.i
+Global avcFallbackPaint.i, avcError.i, avcPayloadWasActive.i
+Global gScreen.i, gScreenBg.i
+Global gCursorGpuOwned.i, gCurShown.i
+Global gCurX.i, gCurY.i, displayMemorySafeFlag.i
+Global gDma.i, displayUseDmaCount.i
+Global idleResult.i, invalidateResult.i, destroyCount.i, invalidateCount.i
+Global noRendererCount.i, cpuPaintCount.i, rendererSetCount.i, clearMapCount.i
+Global displayCount.i
+Global touchKeyboardCpuCount.i, pointerShowCount.i
+Global cursorSaveCount.i, cursorDrawCount.i
+
+Procedure.i vkDeviceWaitIdle(device.i)
+  ProcedureReturn idleResult
+EndProcedure
+Procedure.i AnvilTrueTypeRasterAlphaHandlerSet(callback.i) : ProcedureReturn 1 : EndProcedure
+Procedure vkDestroyFramebuffer(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyRenderPass(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyImageView(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyImage(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkFreeMemory(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyCommandPool(device.i, handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyDevice(device.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure vkDestroyInstance(handle.i, allocator.i) : destroyCount+1 : EndProcedure
+Procedure.i NeonVkChromeReady() : ProcedureReturn 0 : EndProcedure
+Procedure NeonVkChromeDestroy() : destroyCount+1 : EndProcedure
+Procedure.i V3dConInvalidate()
+  invalidateCount+1
+  ProcedureReturn invalidateResult
+EndProcedure
+Procedure.i NeonGpuExtraMap(base.i, bytes.i)
+  If base=0 And bytes=0 : clearMapCount+1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure ConNoRenderer() : noRendererCount+1 : EndProcedure
+Procedure ConSetRenderer(callback.i) : rendererSetCount+1 : EndProcedure
+Procedure ConPaintDma() : cpuPaintCount+1 : EndProcedure
+Procedure.i DisplayMemorySafe() : ProcedureReturn displayMemorySafeFlag : EndProcedure
+Procedure CursorSave(x.i, y.i) : cursorSaveCount+1 : EndProcedure
+Procedure CursorDraw(x.i, y.i) : cursorDrawCount+1 : EndProcedure
+Procedure.i DisplayUseDma(enable.i) : displayUseDmaCount+1 : ProcedureReturn 1 : EndProcedure
+Procedure ConOverlayMarkWhole() : EndProcedure
+Procedure ConGridMarkAll() : EndProcedure
+Procedure TouchKeyboardComposeCpu() : touchKeyboardCpuCount+1 : EndProcedure
+Procedure PointerShow() : pointerShowCount+1 : EndProcedure
+Procedure ScrPresentAll() : EndProcedure
+Procedure DisplayClear(color.i) : displayCount+1 : EndProcedure
+Procedure DrawBanner() : EndProcedure
+Procedure DisplayConsole(x.i, y.i, width.i, height.i) : EndProcedure
+Procedure.i LogoHeight() : ProcedureReturn 0 : EndProcedure
+Procedure.i DisplayWidth() : ProcedureReturn 640 : EndProcedure
+Procedure.i DisplayHeight() : ProcedureReturn 480 : EndProcedure
+
+;@@OWNER_PROCS@@
+
+Procedure.i ownerCheck(ok.i)
+  If ok=0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected fails.i
+  avcDevice=$100 : avcInstance=$101 : avcPool=$102 : avcFramebuffer=$103
+  avcRenderPass=$104 : avcView=$105 : avcImage=$106 : avcMemory=$107
+  avcImageBase=$108 : avcImagePitch=2560 : avcImageBytes=1228800
+  avcPhysical=$109 : avcQueue=$10A : avcReady=1 : avcActive=1
+  gScreen=1 : gScreenBg=0 : gDma=1 : displayUseDmaCount=0
+  gCursorGpuOwned=1 : gCurShown=1 : gCurX=17 : gCurY=23 : displayMemorySafeFlag=1
+  touchKeyboardCpuCount=0 : pointerShowCount=0 : cursorSaveCount=0 : cursorDrawCount=0
+  avcDeviceUnsafe=0 : avcQuarantined=0 : avcFallbackPaint=$10B
+  avcError=0 : avcPayloadWasActive=0
+  idleResult=#VK_ERROR_DEVICE_LOST : invalidateResult=1
+  destroyCount=0 : invalidateCount=0 : noRendererCount=0 : cpuPaintCount=0
+  rendererSetCount=0 : clearMapCount=0 : displayCount=0 : displayUseDmaCount=0
+
+  ; Failed quiescence must not free resources, invalidate V3D, repaint, or
+  ; permit the returning-payload boundary to proceed.
+  If ownerCheck(avcFailover(-77)=0) : ProcedureReturn 11 : EndIf
+  If ownerCheck(avcError=-77 And avcActive=0 And avcReady=0 And avcQuarantined=1) : ProcedureReturn 12 : EndIf
+  If ownerCheck(avcDeviceUnsafe=1 And avcDevice=$100 And avcFramebuffer=$103) : ProcedureReturn 13 : EndIf
+  If ownerCheck(destroyCount=0 And invalidateCount=0 And clearMapCount=0) : ProcedureReturn 14 : EndIf
+  If ownerCheck(cpuPaintCount=0 And rendererSetCount=0 And displayCount=0 And displayUseDmaCount=0 And gDma=1) : ProcedureReturn 15 : EndIf
+  If ownerCheck(noRendererCount=1) : ProcedureReturn 16 : EndIf
+  If ownerCheck(gCursorGpuOwned=1 And gCurShown=1 And touchKeyboardCpuCount=0 And pointerShowCount=0 And cursorSaveCount=0 And cursorDrawCount=0) : ProcedureReturn 17 : EndIf
+
+  ; The payload boundary propagates that failed stop as a refusal token.
+  destroyCount=0 : invalidateCount=0 : noRendererCount=0 : cpuPaintCount=0
+  rendererSetCount=0 : clearMapCount=0 : displayCount=0 : displayUseDmaCount=0
+  gCursorGpuOwned=1 : gCurShown=1 : touchKeyboardCpuCount=0 : pointerShowCount=0 : cursorSaveCount=0 : cursorDrawCount=0
+  avcActive=1 : avcReady=1 : avcPayloadWasActive=0 : avcError=0
+  fails+ownerCheck(VulkanConsolePayloadSuspend()=-1)
+  fails+ownerCheck(avcActive=0 And avcReady=0 And avcQuarantined=1)
+  fails+ownerCheck(avcDeviceUnsafe=1 And avcDevice=$100 And avcFramebuffer=$103)
+  fails+ownerCheck(destroyCount=0 And invalidateCount=0 And clearMapCount=0)
+  fails+ownerCheck(cpuPaintCount=0 And rendererSetCount=0 And displayCount=0 And displayUseDmaCount=0 And gDma=1)
+  fails+ownerCheck(noRendererCount=1 And avcPayloadWasActive=0)
+  fails+ownerCheck(gCursorGpuOwned=1 And gCurShown=1 And touchKeyboardCpuCount=0 And pointerShowCount=0 And cursorSaveCount=0 And cursorDrawCount=0)
+  fails+ownerCheck(VulkanConsoleStop()=0)
+  fails+ownerCheck(destroyCount=0 And invalidateCount=0 And cpuPaintCount=0)
+
+  ; A fresh safe release permits exactly one fallback repaint.
+  avcDevice=$100 : avcInstance=$101 : avcPool=$102 : avcFramebuffer=$103
+  avcRenderPass=$104 : avcView=$105 : avcImage=$106 : avcMemory=$107
+  avcReady=1 : avcActive=1 : avcDeviceUnsafe=0 : avcQuarantined=0
+  avcFallbackPaint=$10B : avcError=0 : idleResult=#VK_SUCCESS : invalidateResult=1
+  destroyCount=0 : invalidateCount=0 : noRendererCount=0 : cpuPaintCount=0
+  rendererSetCount=0 : clearMapCount=0 : displayCount=0 : displayUseDmaCount=0 : gDma=1
+  gCursorGpuOwned=1 : gCurShown=1 : touchKeyboardCpuCount=0 : pointerShowCount=0 : cursorSaveCount=0 : cursorDrawCount=0
+  fails+ownerCheck(VulkanConsolePayloadSuspend()=1)
+  fails+ownerCheck(avcActive=0 And avcReady=0 And avcQuarantined=0)
+  fails+ownerCheck(avcDevice=0 And destroyCount>=8 And invalidateCount=1)
+  fails+ownerCheck(clearMapCount=1 And cpuPaintCount=1 And rendererSetCount=1 And displayUseDmaCount=1 And gDma=0)
+  fails+ownerCheck(displayCount=1 And avcPayloadWasActive=1)
+  fails+ownerCheck(gCursorGpuOwned=0 And gCurShown=1 And touchKeyboardCpuCount=1 And pointerShowCount=0 And cursorSaveCount=1 And cursorDrawCount=1)
+
+  ; V3D invalidation failure after a proven Vulkan idle may retire Vulkan
+  ; resources, but must quarantine without exposing the framebuffer to CPU.
+  avcDevice=$200 : avcInstance=$201 : avcPool=$202 : avcFramebuffer=$203
+  avcRenderPass=$204 : avcView=$205 : avcImage=$206 : avcMemory=$207
+  avcReady=1 : avcActive=1 : avcDeviceUnsafe=0 : avcQuarantined=0
+  avcFallbackPaint=$20B : avcError=0 : idleResult=#VK_SUCCESS : invalidateResult=0
+  destroyCount=0 : invalidateCount=0 : noRendererCount=0 : cpuPaintCount=0
+  rendererSetCount=0 : clearMapCount=0 : displayCount=0 : displayUseDmaCount=0 : gDma=1
+  gCursorGpuOwned=1 : gCurShown=1 : touchKeyboardCpuCount=0 : pointerShowCount=0 : cursorSaveCount=0 : cursorDrawCount=0
+  fails+ownerCheck(VulkanConsolePayloadSuspend()=-1)
+  fails+ownerCheck(avcDevice=0 And avcQuarantined=1 And avcDeviceUnsafe=0)
+  fails+ownerCheck(invalidateCount=1 And clearMapCount=0)
+  fails+ownerCheck(cpuPaintCount=0 And rendererSetCount=0 And displayCount=0 And displayUseDmaCount=0 And gDma=1)
+  fails+ownerCheck(noRendererCount=1 And avcPayloadWasActive=0)
+  fails+ownerCheck(gCursorGpuOwned=1 And gCurShown=1 And touchKeyboardCpuCount=0 And pointerShowCount=0 And cursorSaveCount=0 And cursorDrawCount=0)
+
+  ProcedureReturn fails
+EndProcedure

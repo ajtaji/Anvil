@@ -1,0 +1,506 @@
+; ======================================================================
+;  anvilqnetproof.unoq - Arduino UNO Q: THE LINK SURVEY, AND THE WHOLE IP
+;                       STACK EXECUTED ON THIS SILICON OVER A FILE.
+;
+;  TWO THINGS, AND THE SECOND IS THE ONE THAT MATTERS.
+;
+;  ONE - THE LINK SURVEY. It asks this board's own HwLink* backend
+;  (ArduinoQ/Board/hw_link_q.pi4) the same five questions for every kind
+;  of wire Anvil knows about, and prints the answers with the board's own
+;  sentence attached to each. That table is the answer to "what link does
+;  the UNO Q actually have", printed by the board rather than argued from
+;  a device tree. Asking whether the firmware publishes
+;  EFI_SERIAL_IO_PROTOCOL is part of it, and that question is read-only.
+;
+;  TWO - THE CONFORMANCE RUN. Every layer of this project's IP stack
+;  compiles for `-t unoq` and passes its gate built that way, and not one
+;  byte of it had ever EXECUTED on a QCM2290. Rule 17 exists because an
+;  emulator agrees with itself: on the RP2350's first silicon run the
+;  full self-test found four failures that PASSED emulated, two of them
+;  the reverse of what was predicted.
+;
+;  So this program runs the stack on the part. The host writes Ethernet
+;  frames into \EFI\anvil\net.in, this image reads them through
+;  RaspberryPi4/Lib/link.pi4 - the SAME portable policy layer the
+;  Raspberry Pi 4 runs, over the SAME Anvil/Network/net.pbi - and
+;  every reply the stack stages is written back to \EFI\anvil\net.out for
+;  the host to grade. tools/qnetfile_script.py is the host end.
+;
+;  WHAT IT PROVES: the codecs, the checksums, the ARP cache, the byte
+;  order, the alignment behaviour of this compiler's output on this
+;  silicon, and the arithmetic - on the real core, at the real addresses,
+;  in the real image.
+;
+;  WHAT IT DOES NOT PROVE, AND THIS HALF MUST BE SAID EVERY TIME THE
+;  OTHER HALF IS: timing, a driver, an interrupt, a DMA engine, a
+;  cache-coherency question, or anything whatsoever about a wire. A frame
+;  that arrives from a file arrives instantly and perfectly. Nothing here
+;  can catch a retransmission bug that only a lossy link produces, and a
+;  result from this channel described as "networking works on the Q"
+;  would be a silent wrong answer with a very long tail.
+;
+;  NO REGISTER IS TOUCHED. Every address this program dereferences was
+;  either handed to it by the firmware or is its own BSS. It reads
+;  CNTPCT_EL0 and CNTFRQ_EL0, which are system registers on every
+;  ARMv8-A core, and nothing else. It cannot hang the bus.
+;
+;  THE ADDRESSES ARE FIXED AND BOTH ENDS CARRY THEM. The board is
+;  10.0.0.2, the mask is 255.255.255.252 and the peer is 10.0.0.1 - a
+;  two-host subnet, which is what a point-to-point channel is. They are
+;  written out here and in tools/qnetfile_script.py, and if the two ever
+;  disagree every reply comes back addressed to a host that is not
+;  listening, which the host script says out loud rather than counting as
+;  a silent zero.
+;
+;  It reports through both proven channels - the UEFI variable sink
+;  (AnvilQTxt) and \EFI\anvil\qnetproof.log on the ESP - then resets back
+;  to Debian, which is the default boot entry, so the board always comes
+;  back.
+;
+;  BUILD:  bash tools/build_unoq_netproof.sh
+;  GATE:   python tools/a64/a64_qnetproof_check.py
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first: they define the seams the rest needs ----
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+; timer.pi4 is the Pi 4's file and it is included UNCHANGED. It has no
+; dependencies at all - CNTPCT_EL0 and CNTFRQ_EL0 are architectural, and
+; it reads the frequency at run time rather than baking 54 MHz, so it is
+; correct on this part's 19.2 MHz without one character changing. It is
+; here for Micros() and millis(), which link.pi4 asks for.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+XIncludeFile "Anvil/Core/format.pbi"
+; The seam contract and the #HW_LINK_* vocabulary.
+XIncludeFile "Anvil/Hal/hal.pbi"
+; ---- the Q's three link-capable pieces, then its HwLink* backend -----
+XIncludeFile "ArduinoQ/Lib/qserial_q.pi4"
+XIncludeFile "ArduinoQ/Lib/qslip.pi4"
+XIncludeFile "ArduinoQ/Lib/qnetfile.pi4"
+XIncludeFile "ArduinoQ/Board/hw_link_q.pi4"
+; The six HwLink* names added to the seam on 2026-09-05. link.pi4
+; below calls three of them, so a board that answers only the ten
+; frame-moving names no longer links.
+XIncludeFile "ArduinoQ/Board/hw_net_q.pi4"
+; ---- and the portable stack, the same files the Pi 4 builds ----------
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+
+; EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS, the
+; three attributes the other Q probes set on AnvilQTxt so one reader tool
+; finds every transcript.
+#EFI_ATTR = $7
+
+; The two-host subnet. See the header.
+#NP_IP   = $0A000002       ; 10.0.0.2
+#NP_MASK = $FFFFFFFC       ; 255.255.255.252
+#NP_PEER = $0A000001       ; 10.0.0.1
+
+; A conformance script is a few dozen frames. The cap exists so that a
+; malformed stream cannot spin this image forever on a board with no
+; console to interrupt it; it is deliberately far above any real script,
+; and it is REPORTED when it is hit rather than ending the run quietly.
+#NP_MAX_FRAMES = 4096
+
+Global gNpPumped.i          ; frames the pump actually consumed
+Global gNpReplies.i         ; verdicts that staged a reply
+Global gNpPongs.i
+Global gNpUdp.i
+Global gNpLearned.i
+Global gNpIgnored.i
+Global gNpErrors.i
+Global gNpCapped.i
+Global Dim gVarName.b[24]      ; UTF-16LE "AnvilQTxt", 0
+Global Dim gVarGuid.b[16]
+
+; ----------------------------------------------------------------------
+;  PutDotted - an IPv4 address the way a person reads one.
+; ----------------------------------------------------------------------
+Procedure PutDotted(v.i)
+  PrintDec((v >> 24) & $FF)
+  Print(".")
+  PrintDec((v >> 16) & $FF)
+  Print(".")
+  PrintDec((v >> 8) & $FF)
+  Print(".")
+  PrintDec(v & $FF)
+EndProcedure
+
+Procedure PutMacAt(p.i)
+  Define i.i
+  If p = 0
+    Print("(none)")
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < 6
+    If i > 0
+      Print(":")
+    EndIf
+    PutHex2(PeekA(p + i))
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE LINK SURVEY - the board answering for itself.
+;
+;  Every row is the board's own HwLink* backend answering, not this
+;  file's opinion. A kind the board does not have still gets a row and
+;  still gets its sentence, because "no" with a reason is the answer
+;  somebody is actually looking for - the survey exists precisely because
+;  everything said about this board's networking so far has been read off
+;  a device tree rather than asked of the board.
+; ----------------------------------------------------------------------
+Procedure SurveyKind(kind.i, *label)
+  Define has.i
+  has = HwLinkHas(kind)
+  Print("  ")
+  UartWriteStr(*label)
+  Print("  ")
+  If has <> 0
+    Print("YES ")
+  Else
+    Print("no  ")
+  EndIf
+  Print(" txmax=")
+  PrintDec(HwLinkTxMax(kind))
+  Print("  mac=")
+  PutMacAt(HwLinkMacPtr(kind))
+  Print("  ")
+  UartWriteStr(HwLinkName(kind))
+  PrintNl()
+EndProcedure
+
+Procedure LinkSurvey()
+  PrintN("-- what this board can carry a frame on, asked of the board --")
+  SurveyKind(#HW_LINK_WIRED, "wired   ")
+  SurveyKind(#HW_LINK_WIFI, "wifi    ")
+  SurveyKind(#HW_LINK_SERIAL, "serial  ")
+  SurveyKind(#HW_LINK_FIRMWARE, "firmware")
+  SurveyKind(#HW_LINK_FILE, "file    ")
+  PrintNl()
+  Print("EFI_SERIAL_IO_PROTOCOL: ")
+  If QSerialPresent() <> 0
+    Print("PUBLISHED, LocateProtocol status ")
+    PutHex16(gQSerSt)
+    Print(", the firmware reports ")
+    PrintDec(QSerialBaud())
+    PrintN(" baud.")
+    PrintN("   SLIP over the JCTL header is therefore reachable from this image.")
+    PrintN("   It still needs the 1.8 V level shifter on the bench; a protocol")
+    PrintN("   that exists and a wire that exists are two different facts.")
+  Else
+    Print("ABSENT, LocateProtocol status ")
+    PutHex16(gQSerSt)
+    PrintNl()
+    PrintN("   So SLIP over the JCTL header cannot be reached from a UEFI")
+    PrintN("   application on this firmware, and the GENI registers would be")
+    PrintN("   the only other route to that port. Nothing here touches them.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CONFORMANCE RUN.
+; ----------------------------------------------------------------------
+Procedure.i ConformanceRun()
+  Define r.i
+  Define n.i
+  Define k.i
+
+  PrintN("-- the conformance channel: \EFI\anvil\net.in -> the stack -> \EFI\anvil\net.out --")
+
+  If QNetFileBegin() = 0
+    Print("no conformance script is staged: opening \EFI\anvil\net.in answered ")
+    PutHex16(gQnfOpenSt)
+    PrintNl()
+    PrintN("   That is the normal state of a board nobody has staged one onto,")
+    PrintN("   and it is not an error. Write a script with")
+    PrintN("   tools/qnetfile_script.py and stage it beside this image.")
+    ProcedureReturn 0
+  EndIf
+
+  Print("net.in loaded: ")
+  PrintDec(QNetFileInBytes())
+  Print(" bytes")
+  If QNetFileTruncated() <> 0
+    Print("  !! THE FILE WAS LONGER THAN THE INPUT BUFFER AND WAS CUT SHORT - every frame after the cut is missing and the run below is incomplete")
+  EndIf
+  PrintNl()
+
+  ; ---- choose the link BY NAME. LinkSelect is the two-link board's
+  ; ---- policy and it has nothing to decide here; LinkUseKind refuses a
+  ; ---- kind this board does not have rather than accepting it and
+  ; ---- finding it empty at the first send.
+  k = LinkUseKind(#HW_LINK_FILE)
+  If k <> #HW_LINK_FILE
+    PrintN("!! the board refused the file-backed channel, so nothing was run.")
+    Print("   ")
+    UartWriteStr(LinkWhyText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  NetInit()
+  If NetSetMac(HwLinkMacPtr(#HW_LINK_FILE)) = 0
+    Print("!! the network stack refused this channel's hardware address, error ")
+    PrintDec(NetError())
+    PrintN(". Nothing was run.")
+    ProcedureReturn 0
+  EndIf
+  If NetSetIPv4(#NP_IP, #NP_MASK, #NP_PEER) = 0
+    Print("!! the network stack refused the address/mask/gateway, error ")
+    PrintDec(NetError())
+    PrintN(". Nothing was run.")
+    ProcedureReturn 0
+  EndIf
+
+  Print("the stack is configured as ")
+  PutDotted(NetIPv4())
+  Print(" mask ")
+  PutDotted(#NP_MASK)
+  Print(" gateway ")
+  PutDotted(#NP_PEER)
+  Print(" at ")
+  PutMacAt(HwLinkMacPtr(#HW_LINK_FILE))
+  PrintNl()
+  Print("the link in use is ")
+  UartWriteStr(LinkName())
+  PrintNl()
+  PrintNl()
+
+  n = 0
+  Repeat
+    ; ONE SLICE OF THE SAME PUMP THE PI 4 RUNS. A frame in, through
+    ; NetInput, and whatever it staged back out - and the timeout is
+    ; zero because a file has either got a frame in it or it has not.
+    r = LinkPumpNet(0)
+    If r = #LINK_RX_NONE
+      Break
+    EndIf
+    n = n + 1
+    gNpPumped = gNpPumped + 1
+    Print("frame ")
+    PrintDec(n)
+    Print("  in=")
+    PrintDec(LinkRxLen())
+    Print("  verdict=")
+    PrintDec(r)
+    If r = #NET_IN_REPLY
+      gNpReplies = gNpReplies + 1
+      Print(" REPLY staged=")
+      PrintDec(NetOutLen())
+    ElseIf r = #NET_IN_PONG
+      gNpPongs = gNpPongs + 1
+      Print(" PONG from ")
+      PutDotted(NetPongFrom())
+      Print(" ident=")
+      PrintDec(NetPongIdent())
+      Print(" seq=")
+      PrintDec(NetPongSeq())
+    ElseIf r = #NET_IN_UDP
+      gNpUdp = gNpUdp + 1
+      Print(" UDP ")
+      PrintDec(NetUdpRxLen())
+      Print(" bytes from ")
+      PutDotted(NetUdpRxFrom())
+    ElseIf r = #NET_IN_LEARNED
+      gNpLearned = gNpLearned + 1
+      Print(" ARP LEARNED")
+    ElseIf r = #NET_IN_IGNORED
+      gNpIgnored = gNpIgnored + 1
+      Print(" ignored")
+    ElseIf r < 0
+      gNpErrors = gNpErrors + 1
+      Print(" REFUSED, error ")
+      PrintDec(NetError())
+    EndIf
+    PrintNl()
+    If n >= #NP_MAX_FRAMES
+      gNpCapped = 1
+      PrintN("!! the frame cap was reached, so the rest of the script was NOT run.")
+      Break
+    EndIf
+  ForEver
+
+  PrintNl()
+  If QNetFileFlush() = 0
+    Print("!! net.out could not be written, EFI status ")
+    PutHex16(gQEspWriteSt)
+    PrintNl()
+    PrintN("   The replies below were produced but the host cannot read them.")
+  Else
+    Print("net.out written: ")
+    PrintDec(QNetFileOutBytes())
+    PrintN(" bytes plus the terminator")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Tally()
+  PrintNl()
+  PrintN("-- the tally --")
+  Print("frames in  = ")
+  PrintDec(QNetFileInFrames())
+  Print("   pumped = ")
+  PrintDec(gNpPumped)
+  Print("   frames out = ")
+  PrintDec(QNetFileOutFrames())
+  Print("   dropped = ")
+  PrintDec(QNetFileDropped())
+  PrintNl()
+  Print("replies staged = ")
+  PrintDec(gNpReplies)
+  Print("   pongs = ")
+  PrintDec(gNpPongs)
+  Print("   udp = ")
+  PrintDec(gNpUdp)
+  Print("   arp learned = ")
+  PrintDec(gNpLearned)
+  Print("   ignored = ")
+  PrintDec(gNpIgnored)
+  Print("   refused = ")
+  PrintDec(gNpErrors)
+  PrintNl()
+  Print("the link's own counters: rx=")
+  PrintDec(LinkRxFrames())
+  Print(" tx=")
+  PrintDec(LinkTxCount())
+  Print(" txfail=")
+  PrintDec(LinkTxFails())
+  Print(" swaps=")
+  PrintDec(LinkSwaps())
+  PrintNl()
+  Print("the stack's own counters: in=")
+  PrintDec(NetInCount())
+  Print(" replies=")
+  PrintDec(NetReplyCount())
+  Print(" drops=")
+  PrintDec(NetDropCount())
+  PrintNl()
+  If QNetFileDropped() > 0
+    PrintN("!! REPLIES WERE DROPPED because the output buffer filled. The host's")
+    PrintN("   transcript stops early, which looks exactly like a stack that")
+    PrintN("   stopped answering. It is not. Shorten the script or raise")
+    PrintN("   #QNF_OUT_MAX.")
+  EndIf
+  If gNpCapped <> 0
+    PrintN("!! THE RUN WAS CAPPED and the script was not finished.")
+  EndIf
+EndProcedure
+
+Procedure Honesty()
+  PrintNl()
+  PrintN("-- what this run is evidence of, and what it is not --")
+  PrintN("PROVES, on this silicon, in this image, at these addresses: the")
+  PrintN("codecs, the checksums, the ARP cache, the byte order, the alignment")
+  PrintN("behaviour of this compiler's output on a Cortex-A53, and the")
+  PrintN("arithmetic - all of it executing on the part rather than under an")
+  PrintN("interpreter written in this same tree.")
+  PrintN("DOES NOT PROVE: timing, a driver, an interrupt, a DMA engine, a")
+  PrintN("cache-coherency question, or anything at all about a wire. A frame")
+  PrintN("that arrives from a file arrives instantly and perfectly, and no")
+  PrintN("retransmission bug that only a lossy link produces can appear here.")
+  PrintN("THIS IS NOT A NETWORK LINK and must never be reported as one.")
+EndProcedure
+
+Procedure EmitReport()
+  QOutReset()
+  PrintN("== Anvil UNO Q  LINK SURVEY AND IP CONFORMANCE ==")
+  PrintN("   no register is written and no peripheral is read anywhere in this program")
+  PrintNl()
+  Print("SystemTable = ")
+  PutHex16(gQSt)
+  Print("   BootServices = ")
+  PutHex16(gQBs)
+  Print("   CNTFRQ = ")
+  PrintDec(TickHz())
+  PrintN(" Hz")
+  PrintNl()
+
+  LinkSurvey()
+  PrintNl()
+  ConformanceRun()
+  Tally()
+  Honesty()
+
+  PrintNl()
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of run ==")
+EndProcedure
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  ; a1b2c3d4-5566-7788-99aa-bbccddeeff00 - the same vendor GUID the core
+  ; proof, the console probe and the protocol walk all use, so one reader
+  ; tool finds every transcript. UEFI 2.10 appendix A: the first three
+  ; fields are little-endian on the wire and the last two are not, which
+  ; is why the digits below are not simply the text read left to right.
+  b = @gVarGuid[0]
+  QPb(b, 0,$D4):QPb(b, 1,$C3):QPb(b, 2,$B2):QPb(b, 3,$A1)
+  QPb(b, 4,$66):QPb(b, 5,$55)
+  QPb(b, 6,$88):QPb(b, 7,$77)
+  QPb(b, 8,$99):QPb(b, 9,$AA):QPb(b,10,$BB):QPb(b,11,$CC)
+  QPb(b,12,$DD):QPb(b,13,$EE):QPb(b,14,$FF):QPb(b,15,$00)
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ; Nothing here is safe to touch, and there is no channel to say so on.
+    ProcedureReturn 0
+  EndIf
+
+  If TimerInit() = 0
+    ; Every bounded wait above this line is bounded by the counter. A
+    ; stopped counter would make each one either instant or eternal, and
+    ; both are worse than refusing.
+    QEfiOutStr("the architectural counter reads as stopped - refusing to run timed code")
+    QEfiReset()
+    ProcedureReturn 0
+  EndIf
+
+  QSlipInit()
+  BuildSinkNames()
+
+  QEfiOutStr("Anvil UNO Q - link survey and IP conformance...")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qnetproof.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("run complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

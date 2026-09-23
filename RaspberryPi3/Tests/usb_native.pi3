@@ -1,0 +1,39 @@
+Global native_ticks.i
+Global native_reply_mode.i
+Procedure.i Pi3Micros()
+  native_ticks+100
+  ProcedureReturn native_ticks
+EndProcedure
+Procedure.i Pi3MailboxCall(buffer.i,bytes.i)
+  If bytes<>32 Or PeekL(buffer+8)<>$28001 Or PeekL(buffer+20)<>3 Or PeekL(buffer+24)<>3:ProcedureReturn 0:EndIf
+  PokeL(buffer+16,$80000008):PokeL(buffer+24,1)
+  If native_reply_mode=1
+    PokeL(buffer+24,3)
+  EndIf
+  If native_reply_mode=2
+    PokeL(buffer+16,$80000004)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+XIncludeFile "../Lib/usb_native.pbi"
+XIncludeFile "../Lib/usb_host_core.pbi"
+XIncludeFile "../Lib/usb_host_init.pbi"
+Procedure.i Main()
+  If PeekI($06000000)=1
+    ProcedureReturn Pi3UsbPowerAcquire()
+  EndIf
+  If PeekI($06000000)=2
+    ProcedureReturn Pi3UsbRead($40)
+  EndIf
+  If PeekI($06000000)=3
+    Pi3UsbWrite($18,0)
+    ProcedureReturn Pi3UsbTime()
+  EndIf
+  If PeekI($06000000)=4
+    ProcedureReturn Pi3UsbHostInit()
+  EndIf
+  If PeekI($06000000)=5
+    ProcedureReturn Pi3UsbRootPortReset()
+  EndIf
+  ProcedureReturn Pi3UsbNativeContext()
+EndProcedure

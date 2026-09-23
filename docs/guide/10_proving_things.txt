@@ -1,0 +1,377 @@
+; Chapter 10 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   README.md                       - how a gate is invoked, the interp.
+;   tools/a64/gatecheck.py          - the abstain guard, exit code 2.
+;   tools/a64/a64_interp.py         - the interpreter and the alignment rule.
+;   tools/a64/interpreter_dependency_check.py - the isolated host gate.
+;   tools/tcp_multiif_emitted_check.py - the shared emitted-gate runner
+;                                     and the mutant pattern.
+;   tools/ntp_service_emitted_check.py - quoted whole as the template.
+;   tools/build_count_check.py      - twelve checks and eight sabotages.
+;   tools/check_no_write.sh         - "A CONSTANT IS NOT PROOF."
+;   docs/BOARD_RUN.md, docs/MODULE_PIPELINE.md - the closing boundaries.
+;
+; DESK RUNS BEHIND THIS CHAPTER (2026-09-16), both quoted verbatim:
+;   python tools/board_run_parse_check.py
+;   python tools/module_engine_check.py   (with no compiler configured)
+;
+; STATED PLAINLY BECAUSE IT IS TRUE: there is no runner that runs every
+; gate. Gates are invoked one at a time.
+@CHAPTER Proving things
+@INTRO A listing is not proof. A gate that examined nothing has not passed. And a host test is not a hardware claim, however green it is.
+
+@SECTION The shape of the argument
+
+This project's tests do not read code and conclude things about it. They
+**compile** the real source, **execute** the emitted instructions, and
+report how many instructions ran.
+
+That last number is not trivia. It is the anti-vacuity number: a gate
+that reports two hundred assertions and fourteen million instructions
+did something, and a gate that reports a pass and nothing else might
+have done nothing at all.
+
+@SECTION The house rule
+
+@FRAG
+Trust the disassembled hex, not the listing.
+@ENDFRAG
+
+It was earned by the worst bug in this project's history: a compiler
+listing showed stack frame setup that the actual binary did not contain.
+Everybody reading the listing agreed the code was correct. It was not.
+
+@NOTE There is a subtler second half. Some transformations happen inside
+the assembler, **after** the listing is written - so a correct build can
+produce a listing that legitimately disagrees with the binary. It is not
+wrong; it is **earlier**. Somebody verifying a fix by searching the
+listing concludes the fix did not work. The rule points the same way in
+both cases: go to what executes.
+
+Inside this repository the rule shows up as one line at the top of a
+check script:
+
+@FRAG
+#  A CONSTANT IS NOT PROOF. Neither is a promise in a comment.
+@ENDFRAG
+
+and as one line in the README:
+
+@FRAG
+Host builds and emitted-code tests are valuable gates, but they are not
+a substitute for hardware proof.
+@ENDFRAG
+
+@SECTION The interpreter
+
+`tools/a64/a64_interp.py` is a standalone AArch64 instruction
+interpreter. It models the integer and system subset this backend emits,
+and it is what every emitted gate runs the compiled image in.
+
+@NOTE It **predates the assembler**, and that ordering is the whole
+point. The house rule for a new processor is: write and self-test the
+interpreter against hand-assembled bytes **before** the assembler
+exists. Then cross-check the assembler against the interpreter, and the
+code generator against that. When the interpreter and the assembler
+later disagree, **the assembler is the suspect** - because the
+interpreter could not have inherited its assumptions. An interpreter
+written afterwards, by the same person, on the same afternoon, would
+have agreed with the assembler for exactly the same wrong reason.
+
+That rule has caught a real bug every single time it has been applied.
+
+@TRAP The interpreter holds the one copy of the alignment rule, and it
+is a rule about real silicon. With the MMU off - which is how a payload
+runs unless it says otherwise - a wide data access whose address is not
+a multiple of its size is **fatal on the part, and silent**. The model
+serviced such accesses happily until that was found. Any gate that
+installs its own memory closures has to call the alignment guard, or it
+is modelling a machine that is kinder than the one you have.
+
+The interpreter is handed to gates by path, through `PMF_A64_INTERP` or
+`--interp`, and loaded by path rather than imported - so a private copy
+on somebody's machine cannot substitute itself silently. There is a
+separate gate for exactly that: it runs in an isolated interpreter
+process, executes one floating-point instruction, checks the arithmetic
+bit-exactly, and asserts that the helper it resolved is the
+repository-local one.
+
+@SECTION Running a gate
+
+There is no runner. Gates are invoked one at a time:
+
+@FRAG
+python3 tools/module_engine_check.py
+python3 tools/a64/interpreter_dependency_check.py
+python tools/screen_shot_emitted_check.py --compiler <compiler> --interp tools/a64/a64_interp.py
+python tools/board_run_parse_check.py
+python tools/board_run_refusal_check.py
+python tools/board_run_outcome_check.py
+@ENDFRAG
+
+@NOTE That is a real limitation and it is stated rather than papered
+over: there is no `run_all_gates`, no make target, no shell wrapper.
+Roughly 180 check scripts live in `tools/` and about 50 more in
+`tools/a64/`, and a lane runs the subset that its change could possibly
+affect.
+
+What you will see. This is a real desk run:
+
+@FRAG
+$ python tools/board_run_parse_check.py
+board_run_parse_check: PASS - 53 assertions over 14 recorded board replies, including four streams that must be refused
+  the live `p` stream and the kept `shot` stream decode to the same
+  pixels, which is what lets one host decoder serve both.
+  Recorded replies, not a board. This proves the decoder, not a panel.
+@ENDFRAG
+
+@NOTE Read the last line of that output. The gate finishes by saying
+what it did **not** prove. That is the house style and it is what makes
+a green result worth anything.
+
+A gate can also prove that a tool FAILS correctly, which is harder and
+more useful. This one drives the real host console over a socket that
+answers like a monitor, and asserts that a refused boot is reported in
+the board's own words inside the round trip rather than after the
+ten-minute default, that a run killed mid-step has already written a
+record naming that step, and that a console with nobody behind it is a
+sentence and not a traceback:
+
+@FRAG
+$ python tools/board_run_refusal_check.py
+board_run_refusal_check: PASS - 64 causal assertions; no board
+  a refused boot ends in the round trip, not in --timeout;
+  a killed run leaves a record that names the stage it died at;
+  an unlistened console is a sentence naming the address and port.
+@ENDFRAG
+
+Its sibling does the same for a long silence. The scripted board sits
+behind a scripted firewall that drops the board's datagrams once the host
+has been silent too long - the failure measured on the bench - and each of
+the five ways a run without a return line can end must be reported as
+itself. Five mutants of the tool, one per decision, must each fail it:
+
+@FRAG
+$ python tools/board_run_outcome_check.py
+board_run_outcome_check: PASS - 36 causal assertions over eight scripted boards behind a modelled firewall; 5/5 mutants caught; no board
+@ENDFRAG
+
+@NOTE "No board" is the whole of what that proves: the host tool's
+decisions. That the monitor writes its run record at the jump, the return
+and an exception, and that the empty keepalive datagram is harmless to it,
+are board facts, and a board run is where they are proven.
+
+A gate that needs the compiler and cannot find it says so and does not
+pretend:
+
+@FRAG
+$ python tools/module_engine_check.py
+module engine gate: set PMF_COMPILER, or provide PureMetalForge.exe in the repo
+@ENDFRAG
+
+@SECTION The one gate every lane runs
+
+Almost every gate above compiles something. One does not, and it is the
+one to run before any commit, whatever you changed:
+
+@FRAG
+python tools/layering_check.py
+@ENDFRAG
+
+It is the layering gate. A library exists once and boards differ in the
+interface under it, and this refuses the ways that rule gets broken: a
+shared file calling a name only one board defines, a shared file
+including a board path, a board-extension file appearing under `Anvil/`,
+a second implementation of a protocol the tree already owns, a call into
+another file's private namespace, and one name defined twice in files
+that can be linked into one image.
+
+It resolves names rather than walking includes, because the include
+model here is flat: a shared file calls a board procedure with no
+include edge to find, and a single non-test downward include sits in
+front of nine hundred downward calls. It needs no compiler and no board
+and finishes in a few seconds.
+
+@NOTE Today's findings are recorded in `tools/layering_ratchet.json` and
+the gate fails on a NEW one, not on the existing ones. It is a ratchet:
+counts may fall and the tool will ask you to refresh the file, and
+raising one needs `--allow-growth "<reason>"`, which prints a banner.
+`--self-test` builds a throwaway tree with one violation of every rule
+planted in it and proves each rule goes red. `docs/LAYERING.md` has the
+rules, the measured counts, and the list of what its parser cannot see.
+
+@SECTION A gate that examined nothing has not passed
+
+This is the sharpest idea in the whole test suite and it deserves its
+own section.
+
+A checking tool usually ends the same way: return failure if problems
+were found, success otherwise. That is correct right up until the
+collection it was checking comes back **empty**. Then there are no
+problems, because there was no work - the loop body never ran - and the
+tool prints its success line having verified nothing at all. The
+denominator went to zero and the verdict stayed green.
+
+So there is a guard. You count what you actually examined, and say so
+before you are allowed to succeed:
+
+@FRAG
+from gatecheck import examined
+...
+examined(len(cases), "boot container cases", minimum=3)
+return 1 if problems else 0
+@ENDFRAG
+
+@TRAP The exit code for abstaining is **2, not 1**, deliberately. A gate
+that failed found something wrong. A gate that abstained found nothing
+to look at - a broken harness, a bad path, a moved corpus - which is a
+different problem needing a different fix. Anything scripting these
+tools should treat 2 as "this told you nothing" rather than folding it
+into "failed".
+
+The guard has its own self-test, whose comment is the whole philosophy
+in one line: *a guard nobody has seen fail is a guess.*
+
+@NOTE Honest gap: at the time of writing, that guard is imported by
+exactly **one** gate. The idea is right and its adoption is not
+finished. If you are writing a gate that iterates a corpus, use it.
+
+@SECTION The template
+
+Every emitted gate has the same shape. Here is a complete one, in full:
+
+@FRAG
+#!/usr/bin/env python3
+"""Compile and execute the nonblocking SNTP service state/ownership gate."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+import tcp_multiif_emitted_check as emitted
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
+    parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
+    args = parser.parse_args()
+    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
+    emitted.PROBE = emitted.ROOT / "RaspberryPi4" / "Tests" / "ntp_service_emitted_gate.pi4"
+    a64 = emitted.load_interpreter(interp)
+    with tempfile.TemporaryDirectory(prefix="anvil-ntp-service-emitted-") as temporary:
+        image = emitted.build(compiler, Path(temporary))
+        result, steps = emitted.execute(a64, image)
+    if result:
+        print(f"ntp_service_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
+        return 1
+    print(f"ntp_service_emitted_check: PASS - 35 assertions, {steps:,} A64 instructions")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+@ENDFRAG
+
+@SECTION Adding a check
+
+@FRAG
+1. Name it <subject>_check.py in tools/, or <subject>_emitted_check.py
+   if it compiles and executes. Gates about the instruction set live in
+   tools/a64/ as a64_<subject>_check.py.
+2. Give it a one-line docstring saying what is compiled and executed.
+   argparse takes it as the description.
+3. Two options, both defaulting from the environment: --compiler from
+   PMF_COMPILER, --interp from PMF_A64_INTERP. NEVER a hard-coded path.
+4. Resolve them through required_path, so a missing tool is a sentence
+   naming the variable, not a traceback.
+5. Put the assertions in a .pi4 gate source under RaspberryPi4/Tests/,
+   not in the Python. The thing under test is the emitted code.
+6. Compile into a temporary directory. Write nothing into the tree.
+7. Execute under the sandbox: alignment guard on every access, a read
+   whitelist of image, BSS and stack, a write whitelist of BSS and
+   stack, a step limit. An access outside those ranges is a refusal
+   naming the address, not a silent zero.
+8. Return the failing assertion number in x0. Zero is pass.
+9. Print one line: "<gate>: PASS - <n> assertions, <steps> A64
+   instructions", or the FAIL form naming the assertion.
+10. Write the mutants.
+11. Say what it does not prove.
+@ENDFRAG
+
+@TRAP Item 3 is not style. Thirty gate harnesses once read a hard-coded
+path to one particular working copy, which meant they tested that copy
+and not the tree they were run from. A hard-coded path in a test is a
+test of somebody else's disk.
+
+@SECTION The mutants are what make it a gate
+
+A test that only proves the good path is half a test. The shared runner
+rebuilds the same gate source with deliberate defects injected and
+requires each one to be caught - and not merely caught, but caught by
+**the specific assertion that owns that property**:
+
+@FRAG
+if mutation_result != expected:
+    print(f"FAIL {mutation} mutation returned {mutation_result}; expected assertion {expected}")
+@ENDFRAG
+
+Not "it failed". *Which* assertion caught it. A mutant caught by the
+wrong assertion means two checks are entangled and one of them is not
+testing what its name says.
+
+@NOTE The build-number gate is the fullest worked example: twelve named
+checks - bump by one, date and time stamped, ledger line, every caller,
+a fixture is not the monitor, frozen, refusals, counted once, the
+compiler is named, concurrent builds, the lock blocks - and **eight
+deliberate sabotages**, each of which must be rejected by the check that
+owns that property. Drop the lock. Drop the stamp. Bump by two. Forget
+an already-counted compile. Bump a frozen marker. Leave the compiler out
+of the ledger line.
+
+@SECTION The last paragraph of every gate
+
+Every gate document in this repository ends by naming its own boundary.
+Two examples, quoted:
+
+@FRAG
+The gates execute emitted code over a modelled panel. They cannot show
+that the bytes at the scanout base are the bytes the glass is lit with,
+that a real 12 MiB region is free on real silicon, that a 4 MB copy fits
+in the window between a payload returning and the console repainting, or
+that a picture survives the trip over UDP. Those are board facts and
+they are owed.
+@ENDFRAG
+
+@FRAG
+Neither is a hardware claim. There is no MMU, no cache, no DMA and no
+firmware in either; the device register is interpreter RAM and cache
+maintenance is a stub. Silicon acceptance is a separate, board-slot
+claim.
+@ENDFRAG
+
+@NOTE Write that paragraph for your own gate, and write it **first**.
+It is much harder to write honestly after you have watched the thing
+turn green.
+
+@SECTION And then the board
+
+A green gate set means the emitted code does what the assertions say
+under a model. It does not mean the hardware agrees.
+
+When a board is attached, the board is where the verdict comes from.
+The reason is not ideology: an emulator agrees with itself. On one
+project's first silicon run of a suite that had been passing under a
+model, the board caught a wrong expectation the model had been happily
+confirming, and found failures that passed emulated - two of them the
+reverse of what had been predicted.
+
+The model stays right for the things a board cannot do: exact
+instruction counts, constant-time work, a run with no board attached,
+and developing the model itself.

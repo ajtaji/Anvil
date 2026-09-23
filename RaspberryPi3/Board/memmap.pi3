@@ -1,0 +1,359 @@
+; ======================================================================
+;  memmap.pi3 - the Raspberry Pi 3 monitor's memory map, and the seam the
+;               shared core asks it through.
+;
+;  Anvil/Core/memrange.pbi refuses a range that would land on the running
+;  monitor and offers the windows a payload may live in; it knows no
+;  addresses of its own and walks whatever the board enumerates. This is
+;  this board's enumeration. Its counterpart is
+;  RaspberryPi4/Board/memmap.pi4, which is far longer because that board
+;  carries a boot trail, a screenshot area, a DSI framebuffer and a
+;  module arena; none of those exist here yet, and a region declared for
+;  something that does not exist would refuse addresses for no reason.
+;
+; ----------------------------------------------------------------------
+;  WHERE EVERYTHING IS, AND WHO DECIDED
+; ----------------------------------------------------------------------
+;  The direct `pi3` build fixes the monitor image/BSS/stack addresses in
+;  board.pi3 and the linker invocation. The firmware supplies the DTB
+;  pointer in x0; framebuffer scanout is also firmware-allocated. This
+;  file records the monitor's reserved ranges and legal payload windows.
+;
+;    $00000000..$000FFFFF   the firmware's own low memory and the ARM
+;                           spin table. Not ours and not mapped as ours.
+;    $00200000..           THE MONITOR'S CODE. Firmware loads kernel8.img
+;                           here; the end is measured from the image.
+;    firmware x0..x0+size  THE DEVICE TREE. Its validated live range is
+;                           protected below; $01000000 is only the fallback
+;                           range before firmware x0 has been captured.
+;    $01100000..$01DFFFFF   the monitor's variables. BSS_ADDRESS.
+;    $01E00000..$01EFFFFF   the monitor's stack, growing DOWN from
+;                           STACK_ADDRESS. One megabyte.
+;    $01F10000..$01F12FFF   the page tables. #MMU3_TABLE_BASE.
+;    $01FF0000..$01FFFFFF   the legacy updater handoff reservation.
+;    $02000000..$02DFFFFF   the legacy update staging reservation. It
+;                           remains protected from payload placement.
+;    $02E00000..$02FFFFFF   low payload window, ending before the fixed
+;                           display backbuffer at $03000000.
+;    $03000000..$038C9FFF   the 9,216,000-byte offscreen display buffer.
+;                           DMA copies completed render work to scanout.
+;    $03A00000..            high payload window. The gap through
+;                           $039FFFFF is excluded because the 2 MiB NC
+;                           page-table granularity covers the buffer.
+;                           The window ends at firmware-reported ARM RAM.
+;    $3F000000..$3FFFFFFF   the peripherals. Not memory.
+;
+;  EACH PAYLOAD WINDOW'S TOP IS READ, NOT WRITTEN DOWN. pi3_ram_end comes
+;  from the firmware's "get ARM memory" property tag during boot, and it
+;  is BELOW the fitted size by whatever gpu_mem takes. A window that
+;  ended at a constant would offer an operator memory the VideoCore owns
+;  on a board configured with a larger split, and the failure would be a
+;  payload that loads and then behaves oddly - the worst kind.
+;
+;  THESE ARE TWO WINDOWS AROUND MONITOR-OWNED DISPLAY MEMORY, not two
+;  separate DRAM banks. The BCM2837 has no memory above its peripheral
+;  aperture; both windows stay below $3F000000.
+;
+; ----------------------------------------------------------------------
+;  DEPENDENCIES: include after RaspberryPi3/Lib/mmu.pi3 (#MMU3_TABLE_BASE,
+;  #MMU3_TABLE_BYTES) and after the A/B module (#PI3_UPDATE_HANDOFF,
+;  pi3_ram_end). Include BEFORE Anvil/Core/state.pbi, which is where
+;  #CRC_POLY comes from on every board. House rule 10: this file includes
+;  nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE GRAIN IS ONE MEGABYTE.
+;
+;  The monitor's code region is the live image rounded UP to a megabyte,
+;  and the payload window starts at the next megabyte above the staging
+;  arena. Rounding is what keeps a payload's load address stable across
+;  builds: without it, every rebuild that changed the image's size by one
+;  byte would move the address a host tool was told to use.
+; ----------------------------------------------------------------------
+#MON_GRAIN = $100000
+
+#MON_LO        = $200000        ; the slot contract's LOAD_ADDRESS
+#MON_DATA_LO   = $1100000       ; BSS_ADDRESS
+#MON_DATA_HI   = $1DFFFFF       ; one below the stack region
+#MON_STACK     = $1F00000       ; STACK_ADDRESS - the TOP; it grows down
+#MON_STACK_LO  = $1E00000       ; one megabyte of stack, reserved
+#MON_STACK_HI  = $1EFFFFF
+#MON_DTB_LO    = $1000000       ; fallback before firmware x0 is captured
+#MON_DTB_HI    = $10FFFFF       ; live range uses pi3_dtb/pi3_dtb_end
+#MON_HANDOFF_LO = $1FF0000      ; #PI3_UPDATE_HANDOFF
+#MON_HANDOFF_HI = $1FFFFFF
+#MON_TABLES_LO = $1F10000       ; #MMU3_TABLE_BASE
+#MON_TABLES_HI = $1F12FFF       ; + #MMU3_TABLE_BYTES - 1
+#MON_STAGE_LO  = $2000000       ; the A/B staging arena, as the loader
+#MON_STAGE_HI  = $2DFFFFF       ; configures it: base $2000000, $E00000
+#MON_FB_RENDER_LO = $3000000    ; fixed-size, NC display render backbuffer
+#MON_FB_RENDER_HI = $38C9FFF    ; 9,216,000 bytes; source for DMA scanout
+
+; The payload window's floor. Everything the boot machinery owns is
+; below it, by construction and not by luck.
+#PAY0_LO = $2E00000
+#PAY1_LO = $3A00000             ; first 2 MiB block after render NC coverage
+
+; Its ceiling when the firmware would not say how much memory the ARM
+; has. $3EFFFFFF is the last byte below the peripheral aperture, so this
+; is the largest value that could ever be right; HwPayHi() clamps to the
+; firmware's answer whenever there is one.
+#PAY0_HI_MAX = $3EFFFFFF
+
+; ----------------------------------------------------------------------
+;  The region indices, named so that the Select blocks below and any
+;  reader of `map` agree about what region 4 is.
+; ----------------------------------------------------------------------
+#MON_REGION_CODE    = 0
+#MON_REGION_DATA    = 1
+#MON_REGION_STACK   = 2
+#MON_REGION_TABLES  = 3
+#MON_REGION_DTB     = 4
+#MON_REGION_HANDOFF = 5
+#MON_REGION_STAGE   = 6
+#MON_REGION_FB_RENDER = 7
+#MON_REGION_FB_SCANOUT = 8
+#MON_REGION_COUNT   = 9
+
+; ======================================================================
+;  WHERE THIS IMAGE ACTUALLY IS - measured from the linker's own symbols.
+;
+;  The slot contract pins the load address, so on this board these will
+;  answer $200000 and the image end every time. They are still READ
+;  rather than written down, for two reasons that both cost nothing:
+;  a monitor built for a bench experiment at another address reports
+;  itself correctly, and HwMonBytes() below becomes the size of the image
+;  rather than a number somebody has to remember to update.
+;
+;  THE ASM WRITES TO A GLOBAL AND THE PROCEDURE RETURNS IT. An ASM block
+;  cannot hand a value to the expression around it, so the read must come
+;  back through memory. Each procedure has its own slot: these are
+;  link-time constants, the same bytes on every call, so separate slots
+;  cost eight bytes and remove a question.
+;
+;  x16 and x17 are the scratch pair the emitted preamble itself uses, so
+;  neither can be live across an ASM block here.
+; ======================================================================
+Global monimage_lo.i = 0
+Global monimage_end.i = 0
+
+Procedure.i MonImageLo()
+  ASM
+    adrp x16, __image_start__
+    add  x16, x16, #:lo12:__image_start__
+    adrp x17, global_monimage_lo
+    add  x17, x17, #:lo12:global_monimage_lo
+    str  x16, [x17]
+  EndASM
+  ProcedureReturn monimage_lo
+EndProcedure
+
+; ONE PAST the last byte, which is the end the linker states.
+Procedure.i MonImageEnd()
+  ASM
+    adrp x16, __image_end__
+    add  x16, x16, #:lo12:__image_end__
+    adrp x17, global_monimage_end
+    add  x17, x17, #:lo12:global_monimage_end
+    str  x16, [x17]
+  EndASM
+  ProcedureReturn monimage_end
+EndProcedure
+
+Procedure.i HwMonBytes()
+  ProcedureReturn MonImageEnd() - MonImageLo()
+EndProcedure
+
+; Round UP to the next multiple of #MON_GRAIN. A divide rather than a
+; mask because every address handed to it is a positive .i well inside 63
+; bits, and the divide says what it means.
+Procedure.i MonGrainUp(a.i)
+  ProcedureReturn ((a + #MON_GRAIN - 1) / #MON_GRAIN) * #MON_GRAIN
+EndProcedure
+
+Procedure.i HwMonLo()
+  ProcedureReturn MonImageLo()
+EndProcedure
+
+Procedure.i HwMonHi()
+  ProcedureReturn MonGrainUp(MonImageEnd()) - 1
+EndProcedure
+
+Procedure.i HwMonStack()
+  ProcedureReturn #MON_STACK
+EndProcedure
+
+; ======================================================================
+;  EVERY REGION THIS MONITOR OWNS.
+;
+;  HitsMonitor() in Anvil/Core/memrange.pbi walks these and refuses any
+;  command whose range touches one. The list contains fixed monitor
+;  ranges, the live firmware DTB, and display buffers:
+;
+;    THE DEVICE TREE is region 4 at the range validated from firmware x0.
+;    A `fill` over it could corrupt the boot description still used by
+;    the monitor, so its live range stays reserved.
+;
+;    THE HANDOFF RECORD is region 5, retained for the separate legacy
+;    recovery/update path.
+;
+;    THE STAGING ARENA is region 6, retained for recovery/update tools.
+;
+;  THE ORDER IS DELIBERATE. Region 0 is the code, because it is the one
+;  an operator hits by aiming a payload at the load address.
+; ======================================================================
+Procedure.i HwMonRegions()
+  ProcedureReturn #MON_REGION_COUNT
+EndProcedure
+
+Procedure.i HwMonRegionLo(i.i)
+  Select i
+    Case #MON_REGION_CODE    : ProcedureReturn HwMonLo()
+    Case #MON_REGION_DATA    : ProcedureReturn #MON_DATA_LO
+    Case #MON_REGION_STACK   : ProcedureReturn #MON_STACK_LO
+    Case #MON_REGION_TABLES  : ProcedureReturn #MON_TABLES_LO
+    Case #MON_REGION_DTB
+      If pi3_dtb>0 And pi3_dtb_end>pi3_dtb : ProcedureReturn pi3_dtb : EndIf
+      ProcedureReturn #MON_DTB_LO
+    Case #MON_REGION_HANDOFF : ProcedureReturn #MON_HANDOFF_LO
+    Case #MON_REGION_STAGE   : ProcedureReturn #MON_STAGE_LO
+    Case #MON_REGION_FB_RENDER : ProcedureReturn #MON_FB_RENDER_LO
+    Case #MON_REGION_FB_SCANOUT : ProcedureReturn Pi3FbScanoutBase()
+  EndSelect
+  ; A region index this board does not have. An address here would make
+  ; HitsMonitor() refuse a range for a region that does not exist; an
+  ; empty range - lo above hi - matches nothing, which is the only answer
+  ; that cannot invent a refusal.
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwMonRegionHi(i.i)
+  Select i
+    Case #MON_REGION_CODE    : ProcedureReturn HwMonHi()
+    Case #MON_REGION_DATA    : ProcedureReturn #MON_DATA_HI
+    Case #MON_REGION_STACK   : ProcedureReturn #MON_STACK_HI
+    Case #MON_REGION_TABLES  : ProcedureReturn #MON_TABLES_HI
+    Case #MON_REGION_DTB
+      If pi3_dtb>0 And pi3_dtb_end>pi3_dtb : ProcedureReturn pi3_dtb_end-1 : EndIf
+      ProcedureReturn #MON_DTB_HI
+    Case #MON_REGION_HANDOFF : ProcedureReturn #MON_HANDOFF_HI
+    Case #MON_REGION_STAGE   : ProcedureReturn #MON_STAGE_HI
+    Case #MON_REGION_FB_RENDER : ProcedureReturn #MON_FB_RENDER_HI
+    Case #MON_REGION_FB_SCANOUT
+      If Pi3FbScanoutBase()<>0 And Pi3FbSize()>0 : ProcedureReturn Pi3FbScanoutBase()+Pi3FbSize()-1 : EndIf
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; A short phrase naming the region, printed by `map` beside its
+; addresses. A printing procedure rather than a returned string because
+; the board owns the prose about its own hardware and the core owns the
+; layout of the line.
+Procedure HwMonRegionSay(i.i)
+  Select i
+    Case #MON_REGION_CODE
+      Print("this monitor's code, measured from the image")
+    Case #MON_REGION_DATA
+      Print("its variables, placed by the slot contract")
+    Case #MON_REGION_STACK
+      Print("its stack, growing down from the top of this range")
+    Case #MON_REGION_TABLES
+      Print("the page tables the MMU is translating through")
+    Case #MON_REGION_DTB
+      Print("the device tree, where the firmware and the loader pinned it")
+    Case #MON_REGION_HANDOFF
+      Print("the loader's A/B handoff record")
+    Case #MON_REGION_STAGE
+      Print("the A/B staging arena a serial update reads into")
+    Case #MON_REGION_FB_RENDER
+      Print("the offscreen display backbuffer used by DMA")
+    Case #MON_REGION_FB_SCANOUT
+      Print("the firmware-owned HDMI scanout surface")
+    Default
+      Print("a region this board does not have")
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  THE PAYLOAD WINDOW.
+;
+;  ONE window, and its ceiling is the firmware's answer. pi3_ram_end is
+;  set by Pi3BootMemory() from the "get ARM memory" property tag before
+;  the MMU comes on; it is one past the last byte the ARM was given.
+;  Until it has been set it is 0, and the window is then reported at its
+;  largest possible extent rather than as empty - an empty window would
+;  make `receive` refuse everywhere during boot, which is exactly when a
+;  recovery upload is most wanted.
+; ======================================================================
+Procedure.i HwPayWindows()
+  ; Never advertise a payload range beyond a known firmware RAM limit.
+  ; Before discovery, keep the conservative maximum recovery windows.
+  If pi3_ram_end>0 And pi3_ram_end<=#PAY0_LO : ProcedureReturn 0 : EndIf
+  If pi3_ram_end>0 And pi3_ram_end<=#PAY1_LO : ProcedureReturn 1 : EndIf
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwPayLo(i.i)
+  If i = 0
+    ProcedureReturn #PAY0_LO
+  ElseIf i = 1
+    ProcedureReturn #PAY1_LO
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPayHi(i.i)
+  If i < 0 Or i > 1
+    ProcedureReturn 0
+  EndIf
+  If i=0
+    If pi3_ram_end>0 And pi3_ram_end<=#MON_FB_RENDER_LO : ProcedureReturn pi3_ram_end-1 : EndIf
+    ProcedureReturn #MON_FB_RENDER_LO-1
+  EndIf
+  If pi3_ram_end>0
+    If pi3_ram_end<=#PAY1_LO : ProcedureReturn #PAY1_LO-1 : EndIf
+    If pi3_ram_end-1<#PAY0_HI_MAX : ProcedureReturn pi3_ram_end-1 : EndIf
+  EndIf
+  ProcedureReturn #PAY0_HI_MAX
+EndProcedure
+
+; A version-2 payload declares only its stack top. Admission checks the
+; initial 16-byte ABI stack area inside the DRAM window available to
+; payloads; the PMF format does not describe later stack growth.
+Procedure.i HwPmfStackAllowed(lo.i, hi.i)
+  Define w.i
+  Define r.i
+  Define regionCount.i
+  If lo<0 Or hi<lo
+    ProcedureReturn 0
+  EndIf
+  For w=0 To HwPayWindows()-1
+    If lo>=HwPayLo(w) And hi<=HwPayHi(w)
+      ; Dynamic firmware scanout is also monitor-owned. Do not allow a
+      ; payload's initial stack to land there even though the interval is
+      ; otherwise inside the reported RAM window.
+      regionCount=HwMonRegions()
+      For r=0 To regionCount-1
+        If lo<=HwMonRegionHi(r) And hi>=HwMonRegionLo(r)
+          ProcedureReturn 0
+        EndIf
+      Next
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwStageAddr() - where a host should put a file it is sending.
+;
+;  The bottom of the payload window and nothing more: the first address
+;  clear of everything the boot arrangement owns, in the window every
+;  refusal already prints. Host tools ask for this rather than carrying a
+;  constant of their own, which is how a tool learns that the monitor
+;  grew.
+; ----------------------------------------------------------------------
+Procedure.i HwStageAddr()
+  ProcedureReturn HwPayLo(0)
+EndProcedure

@@ -1,0 +1,848 @@
+; ======================================================================
+;  qefi_q.pi4 - Arduino UNO Q: the UEFI BOOT-SERVICES PLUMBING.
+;
+;  Anvil runs on the Q as a UEFI application with BOOT SERVICES STILL UP.
+;  It is launched by systemd-boot under U-Boot's EFI implementation, it
+;  never calls ExitBootServices, and it hands the board back with
+;  RuntimeServices->ResetSystem. That is not an incidental detail - it is
+;  the entire reason this board has a console at all, so it is worth
+;  stating plainly at the top of the file that depends on it.
+;
+;  This file owns everything that talks to the firmware. Nothing above it
+;  knows what a GUID is. It provides:
+;
+;    QEfiInit(ih, st)      validate the SystemTable and resolve ConIn,
+;                          ConOut, BootServices and RuntimeServices
+;    QEfiOutStr / OutChar  text to EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL
+;    QEfiReadKey()         one key from EFI_SIMPLE_TEXT_INPUT_PROTOCOL,
+;                          or -1 when none is waiting
+;    QEfiEspWrite/Read     a FILE on the EFI System Partition
+;    QEfiStall / QEfiReset
+;
+;  WHAT THE BOARD ACTUALLY ANSWERED, measured 2026-09-02 by
+;  ArduinoQ/Examples/Diagnostics/anvilqconprobe.pi4 (rule 21 - the sources
+;  and the silicon, not a guess). These are the numbers this file is
+;  written against:
+;
+;    ConOut   ALIVE. 80x25, MaxMode 1, OutputString returns EFI_SUCCESS.
+;    ConIn    ALIVE. WaitForKey is a real EFI_EVENT; ReadKeyStroke answers
+;             EFI_NOT_READY (8000000000000006), which is the protocol
+;             working correctly and reporting no key waiting.
+;    GOP      ABSENT. LocateProtocol returns EFI_NOT_FOUND
+;             (800000000000000E). THERE IS NO FRAMEBUFFER ON THIS BOARD
+;             UNDER UEFI. Do not write a screenshot path against one.
+;    ESP file WORKS. LoadedImage -> DeviceHandle -> SimpleFileSystem ->
+;             OpenVolume -> Open(CREATE) -> Write all return EFI_SUCCESS.
+;
+;  The consequence that shapes everything above this file: ConOut is real
+;  and the firmware accepts our bytes, but with no GOP the firmware's
+;  console lands on its serial stdout - the GENI SE4 UART, which is 1.8 V
+;  and unreadable on this bench. So ConOut is written to (a monitor that
+;  refused to drive the console it has would be wrong, and anyone who
+;  attaches a level shifter gets a live terminal for free) but it CANNOT
+;  BE OBSERVED FROM HERE. The observable channel is the ESP file, and that
+;  is what the transcript and the capture ride on.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UEFI structure offsets, all from the UEFI 2.10 specification. Named,
+;  not inlined, so a reader can check each against the document.
+; ----------------------------------------------------------------------
+
+; EFI_SYSTEM_TABLE (s4.3): a 24-byte Hdr, then pointers.
+#QST_CONIN        = $30
+#QST_CONOUT       = $40
+#QST_RUNTIME      = $58
+#QST_BOOT         = $60
+
+; EFI_RUNTIME_SERVICES (s4.5)
+#QRT_SETVARIABLE  = $58
+#QRT_RESETSYSTEM  = $68
+
+; EFI_BOOT_SERVICES (s4.4)
+#QBS_ALLOCATEPAGES  = $28
+#QBS_FREEPAGES      = $30
+#QBS_HANDLEPROTOCOL = $98
+#QBS_STALL          = $F8
+#QBS_LOCATEPROTOCOL = $140
+
+; EFI_ALLOCATE_TYPE / EFI_MEMORY_TYPE (s7.2). Model/runtime buffers are
+; ordinary loader-owned data and are released before this UEFI app returns.
+#QALLOC_ANY_PAGES   = 0
+#QMEM_LOADER_DATA   = 2
+#QEFI_PAGE_BYTES    = 4096
+
+; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL (s12.4)
+#QTXO_RESET        = $00
+#QTXO_OUTPUTSTRING = $08
+#QTXO_QUERYMODE    = $18
+#QTXO_SETATTR      = $28
+#QTXO_CLEARSCREEN  = $30
+#QTXO_ENABLECURSOR = $40
+#QTXO_MODE         = $48
+
+; EFI text attributes are foreground in bits 0..3 and background in 4..6.
+; Light green on black is the visible Anvil prompt colour on a text-console
+; target; it never becomes a byte in the transcript or serial stream.
+#QTXT_LIGHTGREEN   = $0A
+#QTXT_LIGHTGRAY    = $07
+
+; EFI_SIMPLE_TEXT_INPUT_PROTOCOL (s12.3)
+#QTXI_RESET       = $00
+#QTXI_READKEY     = $08
+#QTXI_WAITFORKEY  = $10
+
+; EFI_LOADED_IMAGE_PROTOCOL (UEFI 2.10 s9.1). Every field is laid out on
+; its natural 8-byte boundary, so the offsets are simply counted:
+;
+;   $00  Revision         UINT32, then four bytes of padding
+;   $08  ParentHandle
+;   $10  SystemTable
+;   $18  DeviceHandle     <- the ESP chain uses this one
+;   $20  FilePath
+;   $28  Reserved
+;   $30  LoadOptionsSize  UINT32, then four bytes of padding
+;   $38  LoadOptions
+;   $40  ImageBase        <- where the firmware actually put us
+;   $48  ImageSize
+;
+; IMAGEBASE WAS $20 AND IMAGESIZE $28, WHICH ARE FilePath AND Reserved.
+; The list above was written out correctly in the first version of this
+; comment and then mis-added: DeviceHandle is the FOURTH field, not the
+; last one before ImageBase. The board found it. Reserved is NULL, so the
+; size read back as 0, QEfiResolveImage refused to believe the answer,
+; and HwMonHi() fell back to "the whole of DRAM is the monitor" - which
+; made `boot mem` refuse every payload with a message naming
+; 40000000..13FFFFFFF as the monitor's home.
+;
+; THAT FAILURE IS THE FAIL-SAFE WORKING, and it is worth saying so. A
+; wrong offset that returned a plausible small window would have let a
+; payload be placed over the running monitor; this one refused
+; everything, loudly, and cost a transcript rather than a board.
+#QLI_DEVICEHANDLE = $18
+#QLI_IMAGEBASE    = $40
+#QLI_IMAGESIZE    = $48
+
+; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL (s13.4) / EFI_FILE_PROTOCOL (s13.5)
+#QSFS_OPENVOLUME  = $08
+#QFILE_OPEN       = $08
+#QFILE_CLOSE      = $10
+#QFILE_DELETE     = $18
+#QFILE_READ       = $20
+#QFILE_WRITE      = $28
+#QFILE_GETPOS     = $30
+#QFILE_SETPOS     = $38
+#QFILE_FLUSH      = $50
+
+#QFILE_MODE_READ  = 1
+#QFILE_MODE_WRITE = 2
+; CREATE is bit 63. It is built with a shift rather than written as a
+; literal: not one hex constant with the top bit set appears anywhere in
+; this tree, so the tokeniser is not asked to prove it can take one.
+
+#QEFI_SUCCESS     = 0
+#QEFI_NOT_READY   = $8000000000000006
+
+; "IBI SYST" little-endian - the EFI_SYSTEM_TABLE signature.
+#QEFI_SYST_SIG    = $5453595320494249
+
+; ---- the entry registers and the resolved tables ---------------------
+Global gQIh.i           ; x0 at entry - the EFI ImageHandle
+Global gQSt.i           ; x1 at entry - the EFI SystemTable
+Global gQConIn.i
+Global gQConOut.i
+Global gQBs.i
+Global gQRt.i
+Global gQEfiOk.i        ; 1 once QEfiInit has validated the SystemTable
+Global gQAllocSt.i      ; status from the last AllocatePages/FreePages call
+
+; ---- indirect-call scratch -------------------------------------------
+Global gQCallFn.i
+Global gQCallA0.i
+Global gQCallA1.i
+Global gQCallA2.i
+Global gQCallA3.i
+Global gQCallA4.i
+Global gQCallRet.i
+
+; ---- scratch buffers --------------------------------------------------
+Global Dim gQW.b[544]        ; UTF-16LE scratch for OutputString / file names
+Global Dim gQCell1.b[16]     ; a UINTN / pointer out-parameter cell
+Global Dim gQCell2.b[16]
+Global Dim gQCell3.b[16]
+Global Dim gQKey.b[8]        ; EFI_INPUT_KEY { UINT16 ScanCode; CHAR16 Char; }
+Global Dim gQLiGuid.b[16]
+Global Dim gQSfsGuid.b[16]
+
+; ----------------------------------------------------------------------
+;  QUefiCall - call gQCallFn(gQCallA0..gQCallA4) by the AAPCS64/UEFI
+;  convention and save x0 to gQCallRet. This is the shape proven on
+;  silicon by anvilqprobe.pi4 and anvilqcoreproof.pi4: arguments cross in
+;  globals because the compiler has no way to spell an indirect call
+;  through a function pointer, the target goes in x9, blr x9.
+;
+;  Calls taking fewer than five arguments simply ignore the surplus
+;  registers - that is exactly what AAPCS64 guarantees, so one helper
+;  serves every arity the firmware exposes.
+; ----------------------------------------------------------------------
+Procedure QUefiCall()
+  ASM
+    adrp x0, global_gqcalla0
+    add  x0, x0, #:lo12:global_gqcalla0
+    ldr  x0, [x0]
+    adrp x1, global_gqcalla1
+    add  x1, x1, #:lo12:global_gqcalla1
+    ldr  x1, [x1]
+    adrp x2, global_gqcalla2
+    add  x2, x2, #:lo12:global_gqcalla2
+    ldr  x2, [x2]
+    adrp x3, global_gqcalla3
+    add  x3, x3, #:lo12:global_gqcalla3
+    ldr  x3, [x3]
+    adrp x4, global_gqcalla4
+    add  x4, x4, #:lo12:global_gqcalla4
+    ldr  x4, [x4]
+    adrp x9, global_gqcallfn
+    add  x9, x9, #:lo12:global_gqcallfn
+    ldr  x9, [x9]
+    blr  x9
+    adrp x10, global_gqcallret
+    add  x10, x10, #:lo12:global_gqcallret
+    str  x0, [x10]
+  EndASM
+EndProcedure
+
+Procedure.i QCall(fn.i, a0.i, a1.i, a2.i, a3.i, a4.i)
+  If fn = 0
+    ProcedureReturn -1
+  EndIf
+  gQCallFn = fn
+  gQCallA0 = a0
+  gQCallA1 = a1
+  gQCallA2 = a2
+  gQCallA3 = a3
+  gQCallA4 = a4
+  QUefiCall()
+  ProcedureReturn gQCallRet
+EndProcedure
+
+Procedure.i QEfiConAttribute()
+  Protected mode.i
+  Protected attribute.i
+  If gQConOut=0
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  mode=PeekI(gQConOut+#QTXO_MODE)
+  If mode=0
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  attribute=PeekL(mode+8)&$FFFFFFFF
+  If attribute<0 Or attribute>$7F
+    ProcedureReturn #QTXT_LIGHTGRAY
+  EndIf
+  ProcedureReturn attribute
+EndProcedure
+
+Procedure.i QEfiSetConAttribute(attribute.i)
+  Protected fn.i
+  If gQConOut=0 Or attribute<0 Or attribute>$7F
+    ProcedureReturn 0
+  EndIf
+  fn=PeekI(gQConOut+#QTXO_SETATTR)
+  If fn=0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Bool(QCall(fn,gQConOut,attribute,0,0,0)=#QEFI_SUCCESS)
+EndProcedure
+
+Procedure QPb(base.i, off.i, v.i)
+  PokeB(base + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QWiden(*s) - a NUL-terminated ASCII string into gQW as UTF-16LE, whose
+;  address is returned. Every UEFI text and filename call takes CHAR16*
+;  and this tree's string literals are byte strings, so every literal that
+;  reaches the firmware goes through here. 260 characters is the cap,
+;  which comfortably covers a path and a console line.
+; ----------------------------------------------------------------------
+Procedure.i QWiden(*s)
+  Define i.i
+  Define c.i
+  Define b.i
+  b = @gQW[0]
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0 Or i >= 260
+      Break
+    EndIf
+    PokeB(b + i * 2, c)
+    PokeB(b + i * 2 + 1, 0)
+    i = i + 1
+  ForEver
+  PokeB(b + i * 2, 0)
+  PokeB(b + i * 2 + 1, 0)
+  ProcedureReturn b
+EndProcedure
+
+; QWidenN(base, len) - the same, for a counted (not NUL-terminated) run of
+; bytes, which is what a console line buffer hands over.
+Procedure.i QWidenN(base.i, len.i)
+  Define i.i
+  Define c.i
+  Define b.i
+  b = @gQW[0]
+  If len > 260
+    len = 260
+  EndIf
+  i = 0
+  While i < len
+    c = PeekB(base + i) & $FF
+    PokeB(b + i * 2, c)
+    PokeB(b + i * 2 + 1, 0)
+    i = i + 1
+  Wend
+  PokeB(b + i * 2, 0)
+  PokeB(b + i * 2 + 1, 0)
+  ProcedureReturn b
+EndProcedure
+
+Procedure QBuildGuids()
+  Define b.i
+  ; EFI_LOADED_IMAGE_PROTOCOL_GUID 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+  b = @gQLiGuid[0]
+  QPb(b,0,$A1):QPb(b,1,$31):QPb(b,2,$1B):QPb(b,3,$5B)
+  QPb(b,4,$62):QPb(b,5,$95)
+  QPb(b,6,$D2):QPb(b,7,$11)
+  QPb(b,8,$8E):QPb(b,9,$3F):QPb(b,10,$00):QPb(b,11,$A0)
+  QPb(b,12,$C9):QPb(b,13,$69):QPb(b,14,$72):QPb(b,15,$3B)
+  ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID 964e5b22-6459-11d2-8e39-00a0c969723b
+  b = @gQSfsGuid[0]
+  QPb(b,0,$22):QPb(b,1,$5B):QPb(b,2,$4E):QPb(b,3,$96)
+  QPb(b,4,$59):QPb(b,5,$64)
+  QPb(b,6,$D2):QPb(b,7,$11)
+  QPb(b,8,$8E):QPb(b,9,$39):QPb(b,10,$00):QPb(b,11,$A0)
+  QPb(b,12,$C9):QPb(b,13,$69):QPb(b,14,$72):QPb(b,15,$3B)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QEfiInit(ih, st) - validate what UEFI handed us and resolve the tables.
+;
+;  The SystemTable is checked the way anvilqcoreproof.pi4 checks it -
+;  non-NULL, 8-byte aligned, above DRAM base, and carrying the 'IBI SYST'
+;  signature - before a single pointer is dereferenced out of it. A bad
+;  x1 must produce a clean refusal, not a wild branch through whatever
+;  happened to be in a register.
+;  Returns 1 when the firmware is usable, 0 when it is not.
+; ----------------------------------------------------------------------
+Procedure.i QEfiInit(ih.i, st.i)
+  gQIh = ih
+  gQSt = st
+  gQEfiOk = 0
+  If st = 0
+    ProcedureReturn 0
+  EndIf
+  If (st & 7) <> 0
+    ProcedureReturn 0
+  EndIf
+  If st < $40000000
+    ProcedureReturn 0
+  EndIf
+  If PeekI(st) <> #QEFI_SYST_SIG
+    ProcedureReturn 0
+  EndIf
+  gQConIn  = PeekI(st + #QST_CONIN)
+  gQConOut = PeekI(st + #QST_CONOUT)
+  gQRt     = PeekI(st + #QST_RUNTIME)
+  gQBs     = PeekI(st + #QST_BOOT)
+  QBuildGuids()
+  gQEfiOk = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Page allocation while boot services remain live. This is the safe seam
+;  for large generated programs (models, frame buffers, decompression work
+;  areas): the firmware chooses free physical pages instead of the caller
+;  guessing at a DRAM address. These calls never request runtime, reserved,
+;  MMIO or persistent memory.
+; ----------------------------------------------------------------------
+Procedure.i QEfiAllocatePages(bytes.i)
+  Define pages.i
+  Define addr.i
+  If gQBs = 0 Or bytes <= 0
+    gQAllocSt = -1
+    ProcedureReturn 0
+  EndIf
+  pages = (bytes + #QEFI_PAGE_BYTES - 1) / #QEFI_PAGE_BYTES
+  If pages <= 0
+    gQAllocSt = -1
+    ProcedureReturn 0
+  EndIf
+  PokeI(@gQCell1[0], 0)
+  gQAllocSt = QCall(PeekI(gQBs + #QBS_ALLOCATEPAGES), #QALLOC_ANY_PAGES, #QMEM_LOADER_DATA, pages, @gQCell1[0], 0)
+  If gQAllocSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  addr = PeekI(@gQCell1[0])
+  ProcedureReturn addr
+EndProcedure
+
+Procedure.i QEfiFreePages(addr.i, bytes.i)
+  Define pages.i
+  If gQBs = 0 Or addr = 0 Or bytes <= 0
+    gQAllocSt = -1
+    ProcedureReturn 0
+  EndIf
+  pages = (bytes + #QEFI_PAGE_BYTES - 1) / #QEFI_PAGE_BYTES
+  gQAllocSt = QCall(PeekI(gQBs + #QBS_FREEPAGES), addr, pages, 0, 0, 0)
+  If gQAllocSt = #QEFI_SUCCESS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Console output. QEfiOutRun writes a counted run of ASCII bytes; the
+;  caller batches, because each of these is a firmware call and Anvil
+;  prints in lines, not characters.
+; ----------------------------------------------------------------------
+Procedure QEfiOutRun(base.i, len.i)
+  If gQConOut = 0 Or len <= 0
+    ProcedureReturn
+  EndIf
+  QCall(PeekI(gQConOut + #QTXO_OUTPUTSTRING), gQConOut, QWidenN(base, len), 0, 0, 0)
+EndProcedure
+
+Procedure QEfiOutStr(*s)
+  If gQConOut = 0
+    ProcedureReturn
+  EndIf
+  QCall(PeekI(gQConOut + #QTXO_OUTPUTSTRING), gQConOut, QWiden(*s), 0, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QEfiReadKey() - one keystroke, or -1 when none is waiting.
+;
+;  EFI_INPUT_KEY is { UINT16 ScanCode; CHAR16 UnicodeChar; }. A printable
+;  key arrives as UnicodeChar with ScanCode 0; the arrows, Home/End and
+;  friends arrive as ScanCode with UnicodeChar 0. Anvil's line editor
+;  wants BYTES, so this returns the Unicode character when there is one
+;  and translates the handful of scan codes a line editor cares about into
+;  their traditional control bytes - which is exactly the mapping the
+;  editor would have received from a real terminal.
+;
+;  Returns -1 for "nothing waiting" (EFI_NOT_READY) and for a key that has
+;  no byte meaning, so a caller polls this and never blocks.
+; ----------------------------------------------------------------------
+Procedure.i QEfiReadKey()
+  Define st.i
+  Define scan.i
+  Define ch.i
+  If gQConIn = 0
+    ProcedureReturn -1
+  EndIf
+  PokeI(@gQKey[0], 0)
+  st = QCall(PeekI(gQConIn + #QTXI_READKEY), gQConIn, @gQKey[0], 0, 0, 0)
+  If st <> #QEFI_SUCCESS
+    ProcedureReturn -1
+  EndIf
+  scan = PeekW(@gQKey[0]) & $FFFF
+  ch   = PeekW(@gQKey[0] + 2) & $FFFF
+  If ch <> 0
+    ; UEFI reports Enter as CR and Backspace as 8, which is what the
+    ; editor already expects from a serial terminal.
+    ProcedureReturn ch & $FF
+  EndIf
+  ; EFI_SCAN_* (UEFI 2.10 table 12-3) -> the control bytes a terminal sends
+  If scan = $08          ; SCAN_DELETE
+    ProcedureReturn 127
+  EndIf
+  If scan = $17          ; SCAN_ESC
+    ProcedureReturn 27
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure QEfiStall(us.i)
+  If gQBs = 0
+    ProcedureReturn
+  EndIf
+  QCall(PeekI(gQBs + #QBS_STALL), us, 0, 0, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE EFI SYSTEM PARTITION - the Q's observable output channel.
+;
+;  ImageHandle -> LoadedImage -> DeviceHandle -> SimpleFileSystem ->
+;  OpenVolume -> root. QEspRoot() resolves that chain once and caches the
+;  root directory handle; every status is kept in a global so a failure
+;  names the step that failed instead of reporting a bare no.
+; ----------------------------------------------------------------------
+Global gQEspRoot.i
+Global gQEspLiSt.i
+Global gQEspSfsSt.i
+Global gQEspVolSt.i
+Global gQEspOpenSt.i
+Global gQEspWriteSt.i
+
+Procedure.i QEspRoot()
+  Define li.i
+  Define sfs.i
+  Define dev.i
+  If gQEspRoot <> 0
+    ProcedureReturn gQEspRoot
+  EndIf
+  If gQBs = 0
+    ProcedureReturn 0
+  EndIf
+  PokeI(@gQCell1[0], 0)
+  gQEspLiSt = QCall(PeekI(gQBs + #QBS_HANDLEPROTOCOL), gQIh, @gQLiGuid[0], @gQCell1[0], 0, 0)
+  If gQEspLiSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  li = PeekI(@gQCell1[0])
+  If li = 0
+    ProcedureReturn 0
+  EndIf
+  dev = PeekI(li + #QLI_DEVICEHANDLE)
+
+  PokeI(@gQCell1[0], 0)
+  gQEspSfsSt = QCall(PeekI(gQBs + #QBS_HANDLEPROTOCOL), dev, @gQSfsGuid[0], @gQCell1[0], 0, 0)
+  If gQEspSfsSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  sfs = PeekI(@gQCell1[0])
+  If sfs = 0
+    ProcedureReturn 0
+  EndIf
+
+  PokeI(@gQCell1[0], 0)
+  gQEspVolSt = QCall(PeekI(sfs + #QSFS_OPENVOLUME), sfs, @gQCell1[0], 0, 0, 0)
+  If gQEspVolSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  gQEspRoot = PeekI(@gQCell1[0])
+  ProcedureReturn gQEspRoot
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QEspWrite(*path, data, len) - create/overwrite a file on the ESP.
+;
+;  EFI_FILE_PROTOCOL Open with CREATE does NOT truncate an existing file,
+;  so a shorter write would leave the tail of the previous one behind and
+;  a transcript would end in somebody else's text. The file is therefore
+;  DELETED first when it exists, so every write starts from empty.
+;  Returns 1 on success.
+; ----------------------------------------------------------------------
+Procedure.i QEspWrite(*path, data.i, len.i)
+  Define root.i
+  Define f.i
+  Define mode.i
+  Define offset.i
+  Define wanted.i
+  Define wrote.i
+  root = QEspRoot()
+  If root = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Delete any previous copy: open it for writing and Delete(), which
+  ; closes the handle too (UEFI 2.10 s13.5 EFI_FILE_PROTOCOL.Delete).
+  PokeI(@gQCell2[0], 0)
+  If QCall(PeekI(root + #QFILE_OPEN), root, @gQCell2[0], QWiden(*path), #QFILE_MODE_READ | #QFILE_MODE_WRITE, 0) = #QEFI_SUCCESS
+    f = PeekI(@gQCell2[0])
+    If f <> 0
+      QCall(PeekI(f + $18), f, 0, 0, 0, 0)      ; EFI_FILE_PROTOCOL.Delete
+    EndIf
+  EndIf
+
+  mode = 1
+  mode = mode << 63                              ; EFI_FILE_MODE_CREATE
+  mode = mode | #QFILE_MODE_WRITE | #QFILE_MODE_READ
+
+  PokeI(@gQCell2[0], 0)
+  gQEspOpenSt = QCall(PeekI(root + #QFILE_OPEN), root, @gQCell2[0], QWiden(*path), mode, 0)
+  If gQEspOpenSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  f = PeekI(@gQCell2[0])
+  If f = 0
+    ProcedureReturn 0
+  EndIf
+
+  offset = 0
+  gQEspWriteSt = #QEFI_SUCCESS
+  While offset < len
+    wanted = len - offset
+    If wanted > 1048576
+      wanted = 1048576
+    EndIf
+    PokeI(@gQCell3[0], wanted)
+    gQEspWriteSt = QCall(PeekI(f + #QFILE_WRITE), f, @gQCell3[0], data + offset, 0, 0)
+    wrote = PeekI(@gQCell3[0])
+    If gQEspWriteSt <> #QEFI_SUCCESS Or wrote <= 0 Or wrote > wanted
+      gQEspWriteSt = -1
+      Break
+    EndIf
+    offset = offset + wrote
+  Wend
+  QCall(PeekI(f + #QFILE_FLUSH), f, 0, 0, 0, 0)
+  QCall(PeekI(f + #QFILE_CLOSE), f, 0, 0, 0, 0)
+
+  If gQEspWriteSt = #QEFI_SUCCESS And offset = len
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QEspRead(*path, buf, maxlen) - read a file off the ESP into buf.
+;  Returns the byte count, or -1 if the file is not there. This is the
+;  INPUT path: a command script staged over SSH from Linux.
+; ----------------------------------------------------------------------
+Procedure.i QEspRead(*path, buf.i, maxlen.i)
+  Define root.i
+  Define f.i
+  Define st.i
+  Define got.i
+  root = QEspRoot()
+  If root = 0
+    ProcedureReturn -1
+  EndIf
+  PokeI(@gQCell2[0], 0)
+  st = QCall(PeekI(root + #QFILE_OPEN), root, @gQCell2[0], QWiden(*path), #QFILE_MODE_READ, 0)
+  If st <> #QEFI_SUCCESS
+    ProcedureReturn -1
+  EndIf
+  f = PeekI(@gQCell2[0])
+  If f = 0
+    ProcedureReturn -1
+  EndIf
+  PokeI(@gQCell3[0], maxlen)
+  st = QCall(PeekI(f + #QFILE_READ), f, @gQCell3[0], buf, 0, 0)
+  got = PeekI(@gQCell3[0])
+  QCall(PeekI(f + #QFILE_CLOSE), f, 0, 0, 0, 0)
+  If st <> #QEFI_SUCCESS
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn got
+EndProcedure
+
+; ======================================================================
+;  A HELD-OPEN FILE ON THE ESP - open / size / read-at-offset / close.
+;
+;  QEspRead above is a one-shot: open, read from the beginning, close.
+;  That is right for the staged command script, which is small and is
+;  read once. It is the wrong shape for a boot container, which is read
+;  in two pieces to two different places - a fixed header into the
+;  monitor's own memory, and then, only after the header has been
+;  believed, the image itself to the address the header names. Doing that
+;  with the one-shot would mean reading the whole file into a payload
+;  window before anything had been validated, which is precisely backwards
+;  for a command whose entire job is to validate before it commits.
+;
+;  So this is the same protocol chain kept OPEN across several calls.
+;  Everything here is EFI_FILE_PROTOCOL, UEFI 2.10 s13.5.
+;
+;  THE SIZE IS MEASURED BY SEEKING, NOT BY GetInfo. GetInfo would need the
+;  EFI_FILE_INFO_GUID and a variable-length structure whose useful field
+;  sits at a fixed offset inside a buffer whose required size the firmware
+;  tells you by failing once - three more things to get right, and a
+;  fourth GUID in a file that already builds two by hand. s13.5 says
+;  plainly that SetPosition with 0xFFFFFFFFFFFFFFFF sets the position to
+;  the end of the file, so seek-to-end, ask where that was, seek back. It
+;  is two calls and it cannot be wrong about a length in a way that reads
+;  as a plausible smaller number.
+; ======================================================================
+
+Global gQFile.i          ; the open EFI_FILE_PROTOCOL handle, 0 for none
+Global gQFileSize.i      ; its length in bytes, measured at open
+Global gQFileOpenSt.i    ; the status Open returned, for a failure report
+Global gQFileReadSt.i    ; the status the last Read returned
+
+Procedure.i QEspOpenRead(*path)
+  Define root.i
+  Define f.i
+  Define st.i
+  Define endpos.i
+
+  ; Close any previous one first, inline rather than by calling
+  ; QEspFileClose - that procedure is declared BELOW this one, and this
+  ; language resolves a call to a procedure it has already seen.
+  If gQFile <> 0
+    QCall(PeekI(gQFile + #QFILE_CLOSE), gQFile, 0, 0, 0, 0)
+    gQFile = 0
+  EndIf
+  gQFileSize = 0
+
+  root = QEspRoot()
+  If root = 0
+    gQFileOpenSt = -1
+    ProcedureReturn 0
+  EndIf
+
+  PokeI(@gQCell2[0], 0)
+  gQFileOpenSt = QCall(PeekI(root + #QFILE_OPEN), root, @gQCell2[0], QWiden(*path), #QFILE_MODE_READ, 0)
+  If gQFileOpenSt <> #QEFI_SUCCESS
+    ProcedureReturn 0
+  EndIf
+  f = PeekI(@gQCell2[0])
+  If f = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- length: seek to the end, ask where that is, seek back ----------
+  ; -1 as an .i IS 0xFFFFFFFFFFFFFFFF, which is the "end of file" position
+  ; s13.5 defines. Written as -1 rather than as a sixteen-F literal for
+  ; the same reason EFI_FILE_MODE_CREATE is built with a shift above: no
+  ; hex constant with the top bit set appears anywhere in this tree, so
+  ; the tokeniser is never asked to prove it can take one.
+  st = QCall(PeekI(f + #QFILE_SETPOS), f, -1, 0, 0, 0)
+  If st <> #QEFI_SUCCESS
+    QCall(PeekI(f + #QFILE_CLOSE), f, 0, 0, 0, 0)
+    gQFileOpenSt = st
+    ProcedureReturn 0
+  EndIf
+  PokeI(@gQCell3[0], 0)
+  st = QCall(PeekI(f + #QFILE_GETPOS), f, @gQCell3[0], 0, 0, 0)
+  If st <> #QEFI_SUCCESS
+    QCall(PeekI(f + #QFILE_CLOSE), f, 0, 0, 0, 0)
+    gQFileOpenSt = st
+    ProcedureReturn 0
+  EndIf
+  endpos = PeekI(@gQCell3[0])
+  QCall(PeekI(f + #QFILE_SETPOS), f, 0, 0, 0, 0)
+
+  gQFile = f
+  gQFileSize = endpos
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i QEspFileSize()
+  ProcedureReturn gQFileSize
+EndProcedure
+
+; QEspReadAt(off, buf, n) - n bytes from byte offset off into buf.
+; Returns the count actually delivered, or -1 if the firmware refused.
+; The seek is unconditional, including for off = 0: this seam promises an
+; OFFSET and not a stream position, so reading offset 0 twice must give
+; the same bytes twice.
+Procedure.i QEspReadAt(off.i, buf.i, n.i)
+  Define st.i
+  Define got.i
+  If gQFile = 0
+    ProcedureReturn -1
+  EndIf
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  st = QCall(PeekI(gQFile + #QFILE_SETPOS), gQFile, off, 0, 0, 0)
+  If st <> #QEFI_SUCCESS
+    gQFileReadSt = st
+    ProcedureReturn -1
+  EndIf
+  PokeI(@gQCell3[0], n)
+  gQFileReadSt = QCall(PeekI(gQFile + #QFILE_READ), gQFile, @gQCell3[0], buf, 0, 0)
+  got = PeekI(@gQCell3[0])
+  If gQFileReadSt <> #QEFI_SUCCESS
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn got
+EndProcedure
+
+Procedure QEspFileClose()
+  If gQFile <> 0
+    QCall(PeekI(gQFile + #QFILE_CLOSE), gQFile, 0, 0, 0, 0)
+    gQFile = 0
+  EndIf
+  gQFileSize = 0
+EndProcedure
+
+; ======================================================================
+;  WHERE THE FIRMWARE ACTUALLY PUT US.
+;
+;  Anvil does not choose its own address on this board. UEFI's LoadImage
+;  allocates pages and relocates the application into them, and the
+;  ImageBase in the PE header that tools/unoq_efi_wrap.py writes is a
+;  REQUEST the firmware is free to ignore - the image is position
+;  independent precisely so that it can.
+;
+;  That matters far beyond curiosity, because Anvil is a bootloader now.
+;  Anvil/Core/memrange.pbi's HitsMonitor() is what stops a payload being
+;  placed on top of the running monitor, and until this existed the Q
+;  answered that question with the invented constants in memmap_q.pi4 -
+;  a "reserved-by-convention" megabyte that the monitor is almost
+;  certainly NOT in. The check ran, printed a confident sentence, and
+;  protected nothing.
+;
+;  EFI_LOADED_IMAGE_PROTOCOL carries the true answer in ImageBase and
+;  ImageSize (UEFI 2.10 s9.1), and this image already resolves that
+;  protocol on itself to find the ESP. Two more reads off the same
+;  structure and the refusal becomes real.
+;
+;  RESOLVED ONCE AND CACHED. It cannot change while we run, and
+;  HitsMonitor is called from every range check in the monitor.
+; ======================================================================
+Global gQImgBase.i
+Global gQImgSize.i
+Global gQImgKnown.i        ; 0 not asked, 1 answered, -1 asked and refused
+
+Procedure QEfiResolveImage()
+  Define li.i
+  If gQImgKnown <> 0
+    ProcedureReturn
+  EndIf
+  gQImgKnown = -1
+  If gQBs = 0
+    ProcedureReturn
+  EndIf
+  PokeI(@gQCell1[0], 0)
+  If QCall(PeekI(gQBs + #QBS_HANDLEPROTOCOL), gQIh, @gQLiGuid[0], @gQCell1[0], 0, 0) <> #QEFI_SUCCESS
+    ProcedureReturn
+  EndIf
+  li = PeekI(@gQCell1[0])
+  If li = 0
+    ProcedureReturn
+  EndIf
+  gQImgBase = PeekI(li + #QLI_IMAGEBASE)
+  gQImgSize = PeekI(li + #QLI_IMAGESIZE)
+  ; A base of 0 or a size of 0 is not an answer. Better to say "not
+  ; known" and let the caller fall back loudly than to hand the range
+  ; checks a window of nothing, which would refuse no payload at all
+  ; while looking exactly like a working guard.
+  If gQImgBase = 0 Or gQImgSize <= 0
+    gQImgBase = 0
+    gQImgSize = 0
+    ProcedureReturn
+  EndIf
+  gQImgKnown = 1
+EndProcedure
+
+Procedure.i QEfiImageBase()
+  QEfiResolveImage()
+  ProcedureReturn gQImgBase
+EndProcedure
+
+Procedure.i QEfiImageSize()
+  QEfiResolveImage()
+  ProcedureReturn gQImgSize
+EndProcedure
+
+Procedure.i QEfiImageKnown()
+  QEfiResolveImage()
+  ProcedureReturn gQImgKnown
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QEfiReset() - ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL). Hands
+;  the board back to Debian, which is the DEFAULT boot entry, so the Q
+;  always comes back however this image ended. Does not return.
+; ----------------------------------------------------------------------
+Procedure QEfiReset()
+  If gQRt = 0
+    ProcedureReturn
+  EndIf
+  QCall(PeekI(gQRt + #QRT_RESETSYSTEM), 0, 0, 0, 0, 0)
+EndProcedure

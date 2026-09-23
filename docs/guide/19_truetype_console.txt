@@ -1,0 +1,41 @@
+@CHAPTER TrueType console commands and defaults
+@INTRO The font commands load checked TrueType files into bounded resident slots, select a face for rendering, set a shared pixel height, and optionally restore a saved default path at boot. Built-in bitmap text remains available as the fallback.
+
+@SECTION Load and select a font
+
+`font load <slot> <path>` reads one file path into an empty slot. Slots are numbered 0 through 3; each file is limited to 1 MiB. The path is one whitespace-free token, such as `data:/fonts/Abel-Regular.ttf`. Loading validates the font and its supported tables before publishing the slot. It leaves the current font selection unchanged.
+
+@CODE
+font load 0 data:/fonts/Abel-Regular.ttf
+font select 0
+font info
+@ENDCODE
+
+The load response reports the slot and byte count. Selection binds the slot's checked face for rendering. `font select bitmap` returns to the built-in bitmap font. `font unload <slot>` releases a slot and automatically deselects it first when it is active. It refuses the unload if that slot's generation cannot advance safely. The lower-level slot API itself refuses to unload an active slot.
+
+`font info` reports each slot's size and generation, the selected face's basic metrics when its parser is bound, the current pixel height, and the configured default. It marks an unavailable saved default when the bitmap fallback is active.
+
+@SECTION Size and saved defaults
+
+`font size <pixels>` accepts an integer from 1 through 512. A valid value updates the renderer-neutral TrueType size for the current boot and records `font.size` in settings. The console asks for `settings save` to write pending settings to the boot medium. Invalid values or trailing text leave the previous size unchanged.
+
+@CODE
+font size 24
+settings save
+font default 0
+settings save
+@ENDCODE
+
+`font default <slot>` saves the path already associated with a loaded slot, selects that slot now, and sets it as the default for this boot. `font default bitmap` selects bitmap text and removes the saved TrueType path. These edits are pending until `settings save` succeeds.
+
+At startup, after settings have loaded, Anvil attempts the configured default path once. A valid file is loaded into slot 0 and selected. If the storage or file is unavailable or validation fails, the monitor reports the problem and keeps bitmap text active; render calls do not retry the load. With no saved font path, startup does not perform an extra font-file read.
+
+@SECTION Limits and proof
+
+The settings layer persists a default path and pixel height; it does not persist arbitrary slot contents or restore all four slots. Only the default path is loaded at startup. Paths with spaces are not supported by the current one-token command parser. The file is copied into bounded resident memory before its parser is opened, so later rendering does not depend on an open file handle. The Vulkan screen renderer is the current consumer of these TrueType settings; changing the selected face does not replace the bitmap glyphs in the CPU or native V3D rendering paths. Console command text remains on its existing console renderer path. The command parser accepts its documented ASCII keywords and one-token paths; UTF-8 decoding is provided by `AnvilTrueTypeLayoutUtf8`, not by command parsing.
+
+The emitted `font_command_gate.pi4` checks command parsing, load/select/bitmap behavior, size bounds and trailing-text refusal, settings values, one-time default restoration, and unavailable-file fallback. `truetype_slots_gate.pi4` exercises parser binding and slot generations using Abel-Regular.ttf. These are desk-emitted checks; they do not substitute for a board-specific font appearance proof.
+
+@SECTION References
+
+The TrueType/OpenType specification defines the sfnt tables accepted by the font reader: https://learn.microsoft.com/en-us/typography/opentype/spec/. Chapter 4, "The console," describes command output and the explicit settings-save step.

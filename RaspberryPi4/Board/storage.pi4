@@ -1,0 +1,544 @@
+
+; ======================================================================
+;  Until now every boot needed a computer on the other end of a serial
+;  cable. This is the command that ends that: the board picks its own
+;  program up off the card.
+;
+;      f                    report card and volume, mounting if needed
+;      f <name>             load <name> to the low window base, 00400000
+;      f <name> <addr>      load it somewhere else (hex)
+;
+;  The name is an 8.3 SHORT name in the ROOT directory and is
+;  case-insensitive - PMF.IMG, pmf.img and Pmf.Img are the same file.
+;  Long names are refused by fat.pi4 rather than half-matched.
+;
+;  ONE-TIME BRING-UP, and the order is not arbitrary:
+;
+;    SdSetBaseClockKhz(250000)  the EMMC clock, and it is NOT a guess -
+;                               250 MHz measured off the VideoCore
+;                               mailbox on this board. emmc.pi4 refuses
+;                               to run rather than assume one, which is
+;                               why this line has to exist at all.
+;    SdInit()                   card reset, voltage, CID/RCA, 25 MHz
+;    FsSetRangeReader(...)      fat.pi4 has NO default block source; it
+;                               returns #FAT_ERR_NO_READER without this
+;    FatMount(1)                partition 1 - U-Boot's "usb 0:1"
+;
+;  DONE ONCE AND REMEMBERED. A card takes a noticeable time to
+;  initialise and there is no reason to pay it per file. gSdUp/gFatUp
+;  are the record; f with no argument reports them.
+;
+;  WHY THE LOAD IS WINDOW-CHECKED AND w IS NOT. w writes four bytes at
+;  an address you typed and stops; this writes a whole FILE, whose
+;  length the CARD chose. A short name and a wrong address could walk
+;  over the monitor from underneath it, so the destination is checked
+;  against the payload windows the same way the b and l loaders are.
+;
+;  FatRead RETURNS -1 ON ERROR AND 0 AT EOF, and those are different
+;  things - 0 is a legitimate empty file. On -1 the destination may
+;  already hold PART of the file, so the entry point is deliberately
+;  NOT armed after a failed read: half an image at the right address is
+;  the most dangerous state this monitor can leave behind.
+Global gSdUp.i
+Global gFatUp.i
+Global gUsbUp.i                ; 1 once a USB block device is readable
+Global gMedium.i               ; 0 none, 1 USB, 2 SD card
+Global Dim gUsbCfg.a[512]      ; a configuration descriptor, DMA-reachable
+
+; ======================================================================
+;  THE USB PATH TO A BLOCK DEVICE
+; ======================================================================
+;  This board boots off a USB stick and is going to keep doing so, so
+;  the storage command tries USB FIRST and only then the card. Until
+;  2026-08-26 it tried the card and nothing else, which on this bench
+;  meant `f` could not reach the filesystem the machine had just booted
+;  from - it reported "no card" and it was right, and it was useless.
+;
+;  THE WHOLE CHAIN, and every step of it was earned separately:
+;
+;    PcieInit         link, outbound window, and the INBOUND OFFSET -
+;                     the root complex holds an offset, not a base, and
+;                     the firmware leaves $4_0000_0000 in it
+;    PcieEnumerate    a BAR for the endpoint plus the bridge's own
+;                     forwarding window
+;    XhciInit         halt, reset, rings, 31 scratchpad pages, run
+;    port reset       a connected port's speed means nothing until then
+;    Enable/Address   a slot and a bus address
+;    descriptors      find the interface that says mass storage, and its
+;                     two bulk endpoints
+;    SET_CONFIGURATION then Configure Endpoint, in THAT order
+;    MscInit          TEST UNIT READY until ready, INQUIRY, capacity
+;
+;  IT IS DONE ONCE AND REMEMBERED. Re-running it would reset a
+;  controller that is already working.
+; ----------------------------------------------------------------------
+Procedure.i UsbDiskUp()
+  Define p.i
+  Define n.i
+  Define speed.i
+  Define slot.i
+  Define total.i
+  Define off.i
+  Define len.i
+  Define typ.i
+  Define cls.i
+  Define sub.i
+  Define prot.i
+  Define epOut.i
+  Define epIn.i
+  Define mpsOut.i
+  Define mpsIn.i
+  Define burstOut.i
+  Define burstIn.i
+  Define lastEp.i
+  Define cfgVal.i
+  Define found.i
+  Define got.i
+
+  If gUsbUp <> 0
+    ProcedureReturn 1
+  EndIf
+
+  ; THE UNIFIED PATH FIRST. UsbEnumerate brings the controller up ONCE
+  ; and sets the stick up alongside the mouse and keyboard, so storage
+  ; and the cursor share one controller instead of tearing each other
+  ; down. If it found a stick, we are done and the cursor is untouched.
+  If UsbEnumerate() <> 0
+    If XhciBulkReady() <> 0
+      gUsbUp = 1
+      ProcedureReturn 1
+    EndIf
+  EndIf
+
+  ; FALLBACK: no mass storage came out of the unified walk. Do the
+  ; original dedicated walk below. It can reset ports and so drop a
+  ; cursor - but it only runs when there was no stick for the two to
+  ; share, which is to say when there is nothing to coexist with.
+
+  ; EACH STEP SAYS WHAT IT WAS DOING AND WHAT IT MEANS THAT IT FAILED,
+  ; and then hands over to the library's own sentence for the detail.
+  ; The libraries already return whole English - see PcieErrorText() in
+  ; RaspberryPi4/Lib/pcie.pi4 - so the monitor's job here is context and
+  ; consequence, not a second copy of the reason.
+  ; The same one line the unified walk runs before its own PcieInit -
+  ; see PcieTellMemory in RaspberryPi4/Board/hw_mem.pi4. Both paths need
+  ; it because either can be the first to program the inbound window, and
+  ; the note it may print is printed once per boot whichever arrives.
+  PcieTellMemory()
+  If PcieInit() = 0
+    PrintN("!! the PCI Express controller would not start, so the USB ports on")
+    PrintN("   this board cannot be reached at all - they hang off it. Nothing on")
+    PrintN("   a USB stick can be read. The SD card slot does not go through PCI")
+    PrintN("   Express and is tried next.")
+    Print("   The controller said: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If XhciQuiesceAdopted() = 0
+    PrintN("USB firmware handover refused; DMA mapping preserved.")
+    ProcedureReturn 0
+  EndIf
+  If PcieEnumerate() = 0
+    PrintN("!! the PCI Express bus started but walking it to find what is on it")
+    PrintN("   failed, so the USB host controller was never found and no USB stick")
+    PrintN("   can be read. The SD card slot is tried next.")
+    Print("   The bus said: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If XhciInit() = 0
+    PrintN("!! the USB host controller was found on the bus but would not start,")
+    PrintN("   so nothing plugged into a USB port can be read. The SD card slot is")
+    PrintN("   tried next.")
+    Print("   The controller said: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  found = 0
+  n = XhciMaxPorts()
+  For p = 1 To n
+    If XhciPortConnected(p) = 0
+      Continue
+    EndIf
+    If XhciPortReset(p) = 0
+      Continue
+    EndIf
+    speed = XhciPortSpeed(p)
+    slot = XhciEnableSlot()
+    If slot = 0
+      Continue
+    EndIf
+    If XhciAddressDevice(slot, p, speed) = 0
+      Continue
+    EndIf
+    ; got, NOT n. n is the loop bound - the port count - and reusing it
+    ; for the descriptor length rewrites that bound mid-loop. It worked
+    ; by accident while a hub answered 25 and stopped the moment the
+    ; first answer was smaller than the port the stick is on.
+    got = XhciGetDescriptor(2, 0, 0, 64)
+    If got < 9
+      Continue
+    EndIf
+    If XhciCopyIn(@gUsbCfg[0], got) <= 0
+      Continue
+    EndIf
+    total = PeekA(@gUsbCfg[0] + 2) | (PeekA(@gUsbCfg[0] + 3) << 8)
+    If total > got
+      Continue
+    EndIf
+    cfgVal = PeekA(@gUsbCfg[0] + 5)
+
+    cls = 0
+    epOut = 0
+    epIn = 0
+    burstOut = 0
+    burstIn = 0
+    lastEp = 0
+    off = 0
+    While off < total
+      len = PeekA(@gUsbCfg[0] + off)
+      typ = PeekA(@gUsbCfg[0] + off + 1)
+      If len = 0
+        Break
+      EndIf
+      If typ = 4
+        cls  = PeekA(@gUsbCfg[0] + off + 5)
+        sub  = PeekA(@gUsbCfg[0] + off + 6)
+        prot = PeekA(@gUsbCfg[0] + off + 7)
+        lastEp = 0
+      ElseIf typ = 5 And cls = 8
+        lastEp = 0
+        If (PeekA(@gUsbCfg[0] + off + 3) & 3) = 2
+          If (PeekA(@gUsbCfg[0] + off + 2) & $80) <> 0
+            epIn  = PeekA(@gUsbCfg[0] + off + 2)
+            mpsIn = PeekA(@gUsbCfg[0] + off + 4) | (PeekA(@gUsbCfg[0] + off + 5) << 8)
+            lastEp = 2
+          Else
+            epOut  = PeekA(@gUsbCfg[0] + off + 2)
+            mpsOut = PeekA(@gUsbCfg[0] + off + 4) | (PeekA(@gUsbCfg[0] + off + 5) << 8)
+            lastEp = 1
+          EndIf
+        EndIf
+      ElseIf typ = $30 And len >= 3
+        ; The SuperSpeed Endpoint Companion after an endpoint: its
+        ; bMaxBurst. See XhciConfigureBulk and MscSetupCurrent.
+        If lastEp = 1
+          burstOut = PeekA(@gUsbCfg[0] + off + 2) & $0F
+        ElseIf lastEp = 2
+          burstIn = PeekA(@gUsbCfg[0] + off + 2) & $0F
+        EndIf
+        lastEp = 0
+      EndIf
+      off = off + len
+    Wend
+
+    ; A hub is a perfectly good answer to "what is on this port" and is
+    ; simply not the answer wanted here. Keep looking.
+    If cls <> 8 Or sub <> 6 Or prot <> $50
+      Continue
+    EndIf
+    If epOut = 0 Or epIn = 0
+      Continue
+    EndIf
+    found = p
+    Break
+  Next
+
+  If found = 0
+    PrintN("!! there is no USB storage device plugged directly into this board.")
+    PrintN("   Every USB port was looked at and none of them had a memory stick or")
+    PrintN("   a disk on it. If something IS plugged in, check that it is in a port")
+    PrintN("   on the board itself and not behind a hub: this monitor does not walk")
+    PrintN("   through hubs yet, so a stick in a hub is invisible to it.")
+    PrintN("   The SD card slot is tried next.")
+    ProcedureReturn 0
+  EndIf
+
+  If XhciSetConfiguration(cfgVal) = 0
+    PrintN("!! a USB storage device was found, but telling it which of its own")
+    PrintN("   configurations to switch into failed, so it is not usable and")
+    PrintN("   nothing can be read off it. The SD card slot is tried next.")
+    Print("   The USB controller said: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If XhciConfigureBulk(epOut, mpsOut, burstOut, epIn, mpsIn, burstIn) = 0
+    PrintN("!! a USB storage device was found and configured, but opening the two")
+    PrintN("   pipes that carry the actual data to and from it failed. Nothing can")
+    PrintN("   be read off it. The SD card slot is tried next.")
+    Print("   The USB controller said: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If MscInit() = 0
+    PrintN("!! the USB storage device is connected and its pipes are open, but it")
+    PrintN("   would not answer the questions that establish how big it is and")
+    PrintN("   whether it has a medium in it. Nothing can be read off it, and the")
+    PrintN("   SD card slot is tried next.")
+    Print("   The device said: ")
+    UartWriteStr(MscErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  gUsbUp = 1
+  ProcedureReturn 1
+EndProcedure
+
+;  storage_MountAny - mount partition 1, or failing that the first of 2..4
+;  that mounts. A medium whose boot partition will not mount can still carry
+;  a data partition worth reaching, so one bad slot does not take the whole
+;  medium away. Partition 1's own refusal is printed before the others are
+;  tried, because it is the one a path with no N: would have used.
+Procedure.i storage_MountAny(*medium)
+  Define n.i
+  If FsSelectPartition(1) <> 0
+    ProcedureReturn 1
+  EndIf
+  Print("!! partition 1 of the ")
+  UartWriteStr(*medium)
+  PrintN(" could not be mounted, so a path with no N: prefix")
+  PrintN("   will not open. The other partitions are tried next.")
+  Print("   The filesystem said: ")
+  UartWriteStr(FsErrorText())
+  PrintNl()
+  n = 2
+  While n <= #FS_MAX_PARTITION
+    If FsSelectPartition(n) <> 0
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i StorageUp()
+  ; 1 if a filesystem is mounted and ready, 0 with a reason printed.
+  ;
+  ; USB FIRST, CARD SECOND, because that is the order this machine
+  ; actually boots in. Both are tried before giving up, and which one
+  ; answered is reported - two media that behave identically until they
+  ; do not is exactly the sort of thing worth naming out loud.
+  If gFatUp <> 0
+    ProcedureReturn 1
+  EndIf
+
+  ; THE BOOT TRAIL (forum 880) marks each step of the mount as well as the
+  ; SCSI conversation under it, so a boot that stops here says where.
+  MonPhaseMark(#BPH_STORAGE | 1)
+  If UsbDiskUp() <> 0
+    MonPhaseMark(#BPH_STORAGE | 2)
+    FsSetRangeReader(@MscReadBlocks)
+    If storage_MountAny("USB stick") = 0
+      MonPhaseMark(#BPH_STORAGE | 4)
+      PrintN("!! the USB stick is readable but none of its four partitions could be")
+      PrintN("   mounted, so no file on it can be opened. This monitor reads FAT32")
+      PrintN("   and exFAT partitions, from an MBR partition table or, for exFAT, a")
+      PrintN("   GPT one.")
+      Print("   The last partition tried said: ")
+      UartWriteStr(FsErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    MonPhaseMark(#BPH_STORAGE | 3)
+    gMedium = 1
+    gFatUp = 1
+    ; THE FILE SEAM'S WRITE GATE, set where the fact is known. The flag
+    ; itself is declared in Anvil/Storage/hwfile.pbi, which has to be
+    ; included long before this file - see its INCLUDE ORDER note. Writing
+    ; is implemented for USB and not for the card, so this is the medium
+    ; that gets a 1.
+    gHwFileWritable = 1
+    gHwFileMounted  = 1
+    gHwFileWriter   = @MscWriteBlocks  ; the medium that mounted names its
+                                       ; own writer - see hwfile.pbi
+    FsSetBlockFlusher(@MscFlush)       ; SYNCHRONIZE CACHE before the dirty
+                                       ; mark is cleared - see MscFlush
+    Print("Mounted the USB stick, which calls itself ")
+    UartWriteStr(MscVendor())
+    Print(" ")
+    UartWriteStr(MscProduct())
+    PrintN(" and")
+    Print("holds ")
+    PrintDec((MscBlockCount() / 2048) / 1024)
+    PrintN(" GB. Files will be read from and written to this.")
+    ProcedureReturn 1
+  EndIf
+
+  MonPhaseMark(#BPH_STORAGE | 5)
+  PrintN("Nothing usable on USB, so the SD card slot is being tried instead.")
+  If gSdUp = 0
+    SdSetBaseClockKhz(250000)
+    If SdInit() = 0
+      PrintN("!! there is no usable SD card either, so no medium came up at all and")
+      PrintN("   no file can be read or written. Check that a card is seated in the")
+      PrintN("   slot, or plug a USB stick into one of the ports on the board.")
+      Print("   The card slot said: ")
+      ; UartWriteStr, NOT PrintN. SdErrorText returns an .i POINTER and
+      ; Print picks its formatter by argument type, so PrintN prints the
+      ; string's ADDRESS in decimal - measured on the board as
+      ; "!! no card: 25246364". The warning was already written at
+      ; PutClockRow after the same mistake there; I walked into it anyway,
+      ; which is why it is repeated at every one of these call sites.
+      UartWriteStr(SdErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    gSdUp = 1
+  EndIf
+  FsSetRangeReader(@SdReadBlocks)
+  If storage_MountAny("SD card") = 0
+    PrintN("!! the SD card is readable but none of its four partitions could be")
+    PrintN("   mounted, so no file on it can be opened. This monitor reads FAT32")
+    PrintN("   and exFAT partitions, from an MBR partition table or, for exFAT, a")
+    PrintN("   GPT one.")
+    Print("   The last partition tried said: ")
+    UartWriteStr(FsErrorText())   ; a POINTER - see the note on SdErrorText
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  gMedium = 2
+  gFatUp = 1
+  gHwFileWritable = 0            ; readable, not writable - see above
+  gHwFileMounted  = 1            ; but readable, which is what this one says
+  gHwFileWriter   = 0            ; and there is no writer for a card here
+  PrintN("Mounted the SD card. Files will be read from this. Note that writing is")
+  PrintN("only implemented for USB, so save and settings save will refuse.")
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  HwStorageUp() - the storage seam's BRING-UP step.
+;
+;  This is a one-line wrapper over StorageUp() and it exists for a reason
+;  that is about include order rather than about hardware, so it is worth
+;  stating plainly.
+;
+;  Anvil's core needs two different things from storage and they cannot
+;  live in the same file on this board. The FILE operations - open by
+;  name, size, read at an offset, write the whole thing - are needed EARLY,
+;  by Anvil/Core/settings.pbi, which is included right after fat.pi4. The
+;  BRING-UP is needed LATE, because StorageUp() calls UsbEnumerate(), which
+;  lives in Board/cursor_input.pi4, which needs the display, which needs
+;  the mailbox. One file cannot be in both places.
+;
+;  So the file operations are in Anvil/Storage/hwfile.pbi, included early, and the
+;  bring-up is this procedure, at the bottom of the file that already owns
+;  it. The core calls HwStorageUp() from its COMMANDS - which is exactly
+;  the contract that already held, since SettingsLoad has never brought a
+;  medium up and RaspberryPi4/Lib/wifi.pi4:342 says so.
+;
+;  IT RETURNS StorageUp()'s ANSWER UNCHANGED and prints nothing of its own.
+;  StorageUp already names which step failed and in whose words; a second
+;  sentence here would either repeat it or contradict it.
+; ======================================================================
+Procedure.i HwStorageUp()
+  ProcedureReturn StorageUp()
+EndProcedure
+
+; ======================================================================
+;  HwStorageReport() - what this board's boot medium IS, in its own words.
+;
+;  The core's bare `f` used to print these facts itself, which meant four
+;  Pi 4 names - MscBlockCount, SdBlockCount, FatType, FatBytesPerCluster -
+;  inline in a file that also compiles for a board with no blocks and no
+;  FAT of ours. The sentences are the truth here and they are not the
+;  truth anywhere else, so the board says them.
+;
+;  IT NAMES THE MEDIUM THAT IS ACTUALLY MOUNTED, which is a correction
+;  this text already carries: it once printed SdBlockCount()
+;  unconditionally, so a mounted USB stick reported "card 0 blocks of 512
+;  bytes" - a line both wrong and alarming, sitting directly under one
+;  that correctly said the volume was fine.
+;
+;  It assumes the caller has already brought the medium up, the same as
+;  the rest of the seam.
+; ======================================================================
+Procedure HwStorageReport()
+  Define n.i
+  Define t.i
+  Define blocks.i
+  If gMedium = 1
+    Print("The boot medium is a USB stick holding ")
+    PrintDec(MscBlockCount())
+  Else
+    Print("The boot medium is an SD card holding ")
+    PrintDec(SdBlockCount())
+  EndIf
+  PrintN(" blocks of 512 bytes each.")
+
+  ; EVERY PARTITION, not only the first. Each slot the table names is
+  ; mounted in turn - which only reads - and reported with what it is, or
+  ; with the filesystem's own refusal. Until 2026-09-16 this said "Its first
+  ; partition is formatted ..." and nothing could reach a second one.
+  If FsTableRead() = 0
+    PrintN("!! the partition table in sector 0 could not be read, so the")
+    PrintN("   partitions are not listed.")
+    Print("   The medium said: ")
+    UartWriteStr(FsErrorText())
+    PrintNl()
+    ProcedureReturn
+  EndIf
+  If FsTableIsMbr() = 0
+    PrintN("It has no MBR partition table (a GPT disk, or one volume written")
+    PrintN("straight onto the medium), so each partition number is tried in turn:")
+  Else
+    PrintN("Its MBR partition table names these partitions:")
+  EndIf
+  n = 1
+  While n <= #FS_MAX_PARTITION
+    t = FsTableType(n)
+    If t = 0
+      n = n + 1
+      Continue
+    EndIf
+    Print("  ")
+    PrintDec(n)
+    Print(":  ")
+    If FsSelectPartition(n) <> 0
+      If FsType() = #FS_EXFAT
+        Print("exFAT")
+      Else
+        Print("FAT32")
+      EndIf
+      Print(", clusters of ")
+      PrintDec(FsBytesPerCluster())
+      Print(" bytes")
+      blocks = FsTableBlocks(n)
+      If blocks > 0
+        Print(", ")
+        PrintDec(blocks / 2048)
+        Print(" MB from block ")
+        PrintDec(FsTableStart(n))
+      EndIf
+      PrintNl()
+    Else
+      If t > 0
+        Print("type ")
+        PutHex2(t)
+        Print(", not mounted: ")
+      Else
+        Print("not mounted: ")
+      EndIf
+      UartWriteStr(FsErrorText())
+      PrintNl()
+    EndIf
+    n = n + 1
+  Wend
+  PrintN("  A path picks its partition with N: in front - 2:/folder/file.txt - and")
+  PrintN("  a path with no N: is always partition 1. Quote a path with spaces.")
+  PrintN("  exFAT: UTF-8 long names in folders, matched case-insensitively through")
+  PrintN("  the volume's own up-case table. FAT32: 8.3 short names in the root")
+  PrintN("  directory only; a long name or a folder is refused, not half-matched.")
+  If gMedium <> 1
+    PrintN("  Writing is implemented for the USB medium only, so save, mkdir, rm,")
+    PrintN("  rename and saveenv will refuse while this card is what came up.")
+  EndIf
+EndProcedure

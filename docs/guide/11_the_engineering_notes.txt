@@ -1,0 +1,288 @@
+; Chapter 11 of THE ANVIL GUIDE.
+;
+; SOURCE OF TRUTH: the files themselves. Every one-line description
+; below was written after reading that note's own opening statement, on
+; 2026-09-16, and the status words (desk-only, silicon-accepted,
+; not-integrated) are the note's own words, not a summary of them.
+;
+; THIS CHAPTER WILL GO STALE FASTER THAN ANY OTHER. It is a map, and
+; docs/ grows. Anything here that disagrees with the note it points at
+; is wrong, and the note is right.
+@CHAPTER Where the engineering notes are
+@INTRO Seventy-odd notes sit beside this book. This chapter is the map, arranged by what you are trying to do.
+
+@SECTION Why this chapter exists
+
+This book is the way in. It is not the whole record.
+
+Beside `docs/guide/` there are about seventy engineering notes. Each one
+is the account of a single piece of work: what was built, how it was
+proven, and - the part that matters most - exactly where its boundary
+is. They are written for somebody who already knows the machine, and
+several of them exist mainly to stop a future reader from believing
+something is finished when it is not.
+
+You do not read them in order. You go to the one that owns the thing you
+are touching. This chapter tells you which one that is.
+
+@NOTE Read the STATUS SENTENCE FIRST. Most of these notes open with a
+status line, and it is load-bearing: "desk-proven", "not integrated into
+a board build", "passed on Pi 4 silicon in builds 98 and 99", "no
+hardware run or cold-boot causality claim". The difference between
+"proven on a desk" and "proven on a board" has cost this project real
+days. The status line is the note telling you which kind of claim
+follows.
+
+@SECTION Start here
+
+@FRAG
+ARCHITECTURE.md     The layer model, the resident-monitor role, runtime
+                    memory ownership, the rendering boundary. If you read
+                    one note, read this one.
+PORTABILITY.md      How includes and extensions are arranged so the
+                    portable core stays portable.
+LAYERING.md         The gate that keeps a library from depending on one
+                    board, why it resolves names instead of walking
+                    includes, and what its parser cannot see.
+MIGRATION.md        How this repository came to exist.
+PROVENANCE.md       The two records Anvil keeps instead of trusting an
+                    old export hash. PROVENANCE_INVENTORY.md is the
+                    review; PUBLICATION_REVIEW.md is the publication
+                    question separately.
+LICENSING.md        What is MIT and what is not, and the boot-media
+                    names for redistributable firmware.
+THIRD_PARTY_NOTICES.md  The third-party map.
+NEW_BOARD_PORTS.md  What the non-bootable board stubs are for.
+@ENDFRAG
+
+@SECTION Building and identity
+
+@FRAG
+BUILD_NUMBER.md     Where the build number lives, how it moves, the
+                    ledger, and why there is no way to build without
+                    counting. Chapter 2 is the short version.
+@ENDFRAG
+
+@SECTION Payloads, services and the console
+
+@FRAG
+PAYLOAD_LIFECYCLE.md  The contract a returning payload signs: hardware
+                      ownership, the Ethernet recovery path, and the
+                      checks that are still owed. Chapter 5's source.
+BOARD_RUN.md          Running a payload from the host and what is
+                      recorded about it. Chapter 6's source.
+CONSOLE_PROMPT_STYLE.md  Why the prompt looks the way it does.
+WALL_CLOCK.md         Wall time: the sources, the trust boundary, and
+                      why an unset clock says so.
+HTTP_SERVER.md        The portable HTTP connection engine.
+EXFAT.md              The target-neutral exFAT filesystem.
+@ENDFRAG
+
+@SECTION Cores
+
+@FRAG
+RAW_CORES.md        The first milestone for joining the other BCM2711
+                    cores - the desk-gated, inactive foundation.
+MULTICORE_STATUS.md Where secondary cores actually stand, including what
+                    passed on silicon and what has not. Chapter 7's
+                    source.
+CORE_ACCEPTANCE.md  The bounded acceptance command for the cores.
+SCHEDULER_PLAN.md   Lifecycle, cooperative contexts, and the separate
+                    asynchronous work.
+SCHEDULER_BINDING.md The explicit EL3 binding, with its emitted-code
+                    desk proof.
+@ENDFRAG
+
+@SECTION EL3 and boot firmware
+
+@FRAG
+EL3_BOOT_ACCEPTANCE.md  The cold-boot acceptance record, and the exact
+                        remaining boundary. Read before touching boot
+                        configuration.
+EL3_ACCEPTANCE_COMMAND.md  el3test: an opt-in silicon diagnostic that is
+                        never run during boot.
+EL3_DESK_STATUS.md      The desk-gate status.
+EL3_STARTUP_REVIEW.md   The startup review, desk-only.
+@ENDFRAG
+
+@SECTION Driver modules
+
+@FRAG
+MODULE_FORMAT.md    The pinned PMFMOD v1 binary contract and the current
+                    HAL seam. Chapter 9's source.
+MODULE_PIPELINE.md  Why a module pipeline is wanted at all.
+@ENDFRAG
+
+@SECTION Networking
+
+@FRAG
+NET_TRANSFER_ROUTE.md      The contract get and put are built on, and
+                           the two status paths.
+NET_RECEIVE_OWNERSHIP.md   A frame comes off a receive queue exactly
+                           once, and what went wrong when two readers
+                           existed.
+NET_RECV_ORDERLY_CLOSE.md  Why a peer's close is not the end of an
+                           upload.
+WIFI_RECOVERY.md           The automatic reconnect path, stated as an
+                           explicit policy rather than a reflex.
+WIFI_INITIALIZATION_RETRY.md  The radio-initialization retry slice.
+WIFI_RX_GLOM_DESIGN.md     Receive-glom loss and the parser change.
+WIFI_RX_READINESS_TELEMETRY.md  Evidence collection for idle polling.
+@ENDFRAG
+
+@SECTION USB, PCIe and storage
+
+@FRAG
+USB_HOST_PHASES.md        What the two boot-log lines actually cover.
+USB_COLD_READINESS.md     Why the successful boot and the intermittent
+                          failure are separate questions.
+USB_HOST_BOOT_HANG_20260912.md  The narrowed boot stop at USB host.
+USB_LOCAL_FLOW_GATE.md    A gate that overstated its own coverage, and
+                          the correction. Worth reading as an example.
+XHCI_RETAINED_MARKERS.md  The trace hook that does nothing but mark.
+XHCI_STOP_OWNERSHIP_AUDIT.md  A read-only source audit, explicitly not a
+                          claim about the hang.
+PCIE_ADOPT_ORDER.md       PCIe ownership and adoption order.
+VL805_COLD_FIRMWARE.md    The cold PCIe path and the endpoint.
+@ENDFRAG
+
+@SECTION Display, touch and graphics
+
+@FRAG
+EARLY_DISPLAY_BOOT.md      Where display comes up in the boot order.
+EARLY_V3D_BOOT.md          When the V3D console is activated.
+DSI_CACHE_MAP.md           What CacheEnable maps for the panel.
+DSI_EARLY_CACHE.md         Arming exactly the next ScreenUp.
+SCREEN_DSI_READOPTION.md   Changing drawing geometry without changing
+                           ownership.
+BANNER_STATUS_ROW.md       The identity row, and the seam argument about
+                           what a service-table call may reach.
+BOOT_TIMING_RECORD.md      screen timing: reading back the boot record.
+BOOT_I2C_TRACE.md          touch trace: reading retained failure
+                           evidence without probing again.
+TOUCH_VISUAL_TEST.md       touch test, after touch reports ready.
+TOUCH_KEYBOARD_LABELS.md   How key labels get their face.
+DMA_CACHE_WALK.md          The per-line cache walk kept in registers.
+DMA_QUIESCENCE.md          A desk-tested correction, with no causality
+                           claim attached.
+VULKAN_COMPATIBILITY_STATUS.md  The honest inventory: implemented
+                           layers, missing prerequisites, and no claim
+                           of a production Vulkan device.
+Anvil/Graphics/Vulkan/COVERAGE.md  The four proof classes and the
+                           current public command boundary.
+Anvil/Graphics/Vulkan/ROADMAP.md  What remains after the resident Neon
+                           adapter and before broader Vulkan coverage.
+VULKAN_IDE_CHROME_ACCEPTANCE_2026-09-16.md  Exact Pi 4 atlas/chrome
+                           artifacts, hashes, commands and acceptance boundary.
+VULKAN_NEON_CHROME_ADAPTER_2026-09-16.md  The persistent widget adapter,
+                           real-widget desk ledger and remaining Pi proof.
+@ENDFRAG
+
+The remaining `VULKAN_*` notes are dated proofs of individual slices -
+descriptor state, sampled state, dynamic render geometry - and are best
+read from the compatibility inventory outward.
+
+The current Vulkan conversion boundary is specific. Public draw lists can
+snapshot one dynamic scissor per draw. The Pi backend normalizes that rectangle
+and changes the V3D clip packet only when needed. Atlas sampling, UV vertices,
+push tint, exact source-over blend and one display-DMA presentation are joined
+by `vulkanAtlasChromeProof.pi4`; cache ranges are maintained as one batch with
+one final barrier. The final build-148 RAM-only Pi 4 run returned exact
+x0=0x6C85A0 in 10.2 seconds. Its report records one TFU advance, one bin/render
+pair and one display-DMA presentation; the exact report and pixel oracle pass
+all 211 checks, and fresh capture sequence 8 is a clean rotated 800x1280
+picture. The monitor returned to its prompt with the deadman off and no core
+leases, so this scene is now a silicon pass.
+
+The first real adapter dependency is now present too. Neon can publish its
+current font's linear CPU RGBA8 raster, exact dimensions and copied glyph UVs
+through a read-only contract. A font change invalidates every query until the
+next successful ensure. The CPU-only ensure does not run the TFU or V3D and
+does not expose or publish the private tiled atlas. It also reserves one opaque
+white texel and copies its UV rectangle so boxes and glyphs can share one
+sampled+tinted pipeline. Its emitted gate passes 26 source checks, 41 run-time
+assertions and five hostile mutation checks.
+
+That refactor and the renderer hook change the returning diagnostic's bytes.
+The current tree builds a 977,076-byte PMF with expected report pointer
+x0=0x6C85C8. It is desk-green,
+but another lane owns the shared Pi 4, so the book does not transfer the older
+image's silicon result to those new bytes. The same bounded returning run is
+still required after the lease is released.
+
+The persistent Vulkan-backed adapter for Neon's boxes, atlas text, fans,
+outlines, line lists and clipping is now desk-green. It keeps its pipeline,
+descriptor set, atlas and vertex storage resident, installs one complete
+primitive family, and submits once per frame without processor pixel drawing.
+Fan and line builders are bounded and lower only into public Vulkan
+triangle-list vertices. The real existing panel, menu, list and text widgets
+produce 109 quads, 47 draws, 654 vertices and five scissor states; the scene
+consumes one present intent and calls display DMA once. The next gate is that
+exact frame plus the new primitive shapes and screenshot on the Pi 4, then
+clean return on HDMI, DSI, rotation and resize.
+
+@SECTION Other boards
+
+@FRAG
+PI3_BOOT.md                 Pi 3 cold entry, desk implementation.
+PI3_SELF_UPDATE.md          Direct firmware boot-file staging and replacement.
+PI3_INTERRUPT_TIMER.md      Core 0's physical timer ownership.
+PI3_USB_FOUNDATION.md       The controller-independent USB layer.
+PI3_USB_ENUMERATION.md      Enumeration, not yet boot-wired.
+PI3_USB_DIAGNOSTIC.md       usbdiag in the updater.
+PI3_LAN9514_TRANSPORT.md    The USB Ethernet transport, desk-proven.
+PI3_LAN9514_RUNTIME.md      Its runtime half.
+ROCKPI4C_FOUNDATION.md      RK3399: MiniDP first light on hardware.
+ROCKPI4C_DISPLAY_INITIALIZATION.md  The MiniDP contract.
+@ENDFRAG
+
+@SECTION Related project notes
+
+The forum notes - `FORUM_PLAN.md`, `FORUM_COMPATIBILITY.md`,
+`FORUM_REGISTRATION.md` - describe a separate application built on this
+foundation, not a part of the monitor.
+
+@SECTION Where this book lives, and when it has to move
+
+One house rule governs this book itself, and it applies to every public
+repository in this family:
+
+@FRAG
+Each public repository carries its book in docs/guide/, as chapter
+files and as a rendered PDF beside them.
+
+The book is updated in the SAME COMMIT as any change to what a
+developer does - a command, a flag, a file name, a printed message, a
+procedure, a boundary.
+
+A book that lags the code is a DEFECT, not a chore. It is filed and
+fixed like any other.
+@ENDFRAG
+
+The reasoning is the same one that runs through the rest of this
+repository. A reader who follows a documented command and gets something
+else has learned that the documentation lies, and they stop trusting all
+of it - including the parts that are right. Stale documentation is worse
+than none, because none at least sends people to the source.
+
+So the test for a change is not "did I break a chapter". It is: **would
+a developer following this book now do something that does not work?**
+If the answer is yes, the book moves in that commit, the PDF is
+re-rendered, and both go in together.
+
+@NOTE The command that renders the PDF is in `docs/GUIDE.md`, beside the
+chapter index. It takes any folder of these chapter files, so every
+book in this family is produced by the one renderer - which is what
+stops two books drifting into two formats.
+
+@SECTION The one habit worth copying
+
+Notice what almost every note in this list has in common: it says what
+was NOT established. "Desk-proven, not integrated into a board build and
+not silicon-proven." "No hardware run or cold-boot causality claim."
+"The previous frame gate overstated its coverage."
+
+That is the whole reason the set is usable. A note that only recorded
+successes would leave you to discover the boundaries yourself, one board
+at a time. If you add a note, write the boundary down first and the
+achievement second.

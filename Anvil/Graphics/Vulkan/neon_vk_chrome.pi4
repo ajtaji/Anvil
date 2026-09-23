@@ -1,0 +1,1833 @@
+; neon_vk_chrome.pi4 - resident Neon chrome renderer over public Vulkan.
+;
+; Include after neon.pi4, vk_api.pbi, vk_spirv_fixtures.pbi and the active
+; Vulkan backend.  This layer owns its Vulkan resources and command buffer,
+; but not the caller's device, queue, command pool, render pass or framebuffer.
+; Presentation remains a display/WSI decision: End publishes one present
+; intent after its one successful frame submission, and the owner consumes it.
+;
+; NeonFrameBegin/NeonFrameEnd are deliberately never called here.  Create
+; installs Neon's renderer-neutral primitive hooks only after every
+; persistent resource and the CPU-atlas upload are complete.
+
+#NEON_VK_CHROME_OK             = 0
+#NEON_VK_CHROME_ERR_ARGS       = -21201
+#NEON_VK_CHROME_ERR_STATE      = -21202
+#NEON_VK_CHROME_ERR_CAPACITY   = -21203
+#NEON_VK_CHROME_ERR_ATLAS      = -21204
+#NEON_VK_CHROME_ERR_VULKAN     = -21205
+
+#NEON_VK_CHROME_VERTEX_BYTES   = 24
+#NEON_VK_CHROME_ATLAS_PAD      = 64
+#NEON_VK_CHROME_MAX_QUADS      = 4096
+#NEON_VK_CHROME_MAX_VERTICES   = #NEON_VK_CHROME_MAX_QUADS * 6
+; Draw records remain capped at 4096. Resident console text uses one cached
+; glyph quad per visible cell, bounded by the full 256x80 grid plus 512 UI
+; quads. At the current 24-byte vertex stride this reserves 3,022,848 bytes.
+#NEON_VK_CHROME_MAX_VERTEX_QUADS = 20992
+#NEON_VK_CHROME_MAX_PATH_POINTS = 4096
+#NEON_VK_CHROME_WAIT_NS        = 2000000000
+#NEON_VK_CHROME_F_ONE          = $3F800000
+#NEON_VK_CHROME_TT_ATLAS_W     = 512
+; Keep the image and persistent staging buffer within the shared 16 MiB
+; Vulkan heap alongside renderer targets, vertices, and backend state. A
+; 512x1024 RGBA atlas uses 2 MiB for each of those two allocations.
+; Larger targets may fail allocation cleanly if the board heap is insufficient.
+#NEON_VK_CHROME_TT_ATLAS_H     = 1024
+#NEON_VK_CHROME_TT_CACHE_MAX   = 512
+#NEON_VK_CHROME_TT_COVERAGE    = 1048576
+#NEON_VK_CHROME_TT_RUN_GLYPHS  = 4096
+
+#NVC_PATH_NONE                 = 0
+#NVC_PATH_FAN                  = 1
+#NVC_PATH_LINES                = 2
+
+Global nvcReady.i
+Global nvcInFrame.i
+Global nvcMapped.i
+Global nvcTargetGeneration.i
+Global nvcNextTargetGeneration.i
+Global nvcNextFrameSequence.q
+#NVC_MAX_GENERATION          = $7FFFFFFFFFFFFFFF
+Global nvcHooksInstalled.i
+Global nvcError.i
+Global nvcWidth.i
+Global nvcHeight.i
+Global nvcLogicalW.i
+Global nvcLogicalH.i
+Global nvcPhysicalW.i
+Global nvcPhysicalH.i
+Global nvcPitch.i
+Global nvcRotation.i
+Global nvcMaxQuads.i
+Global nvcMaxVertexQuads.i
+Global nvcVertices.i
+Global nvcDrawCount.i
+Global nvcGridBatchActive.i
+Global nvcGridBatchFirst.i
+Global nvcGridBatchSlot.i
+Global nvcGridBatchGeneration.i
+Global nvcPathKind.i
+Global nvcPathCount.i
+Global nvcPathError.i
+Global Dim nvcPathX.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
+Global Dim nvcPathY.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
+
+Global nvcPhysical.i
+Global nvcDevice.i
+Global nvcQueue.i
+Global nvcCommandPool.i
+Global nvcRenderPass.i
+Global nvcFramebuffer.i
+Global nvcCommand.i
+Global nvcFence.i
+
+Global nvcVertexBuffer.i
+Global nvcVertexMemory.i
+Global nvcUniformBuffer.i
+Global nvcUniformMemory.i
+Global nvcAtlasImage.i
+Global nvcAtlasMemory.i
+Global nvcAtlasView.i
+Global nvcSampler.i
+Global nvcUploadBuffer.i
+Global nvcUploadMemory.i
+Global nvcSetLayout.i
+Global nvcDescriptorPool.i
+Global nvcDescriptorSet.i
+Global nvcPipelineLayout.i
+Global nvcPipeline.i
+
+Global nvcAtlasW.i
+Global nvcAtlasH.i
+Global nvcAtlasBaseW.i
+Global nvcAtlasBaseH.i
+Global nvcAtlasBytes.i
+Global nvcAtlasUploadMapped.i
+Global nvcAtlasUploadCount.i
+; Preserve the first failing create boundary before rollback can replace the
+; Vulkan fault with a secondary cleanup diagnostic.
+Global nvcCreateStage.i
+Global nvcCreateFaultCode.i
+Global nvcCreateFaultText.i
+Global nvcAtlasRasterCountAtFrame.i
+Global nvcAtlasUploadAtFrame.i
+Global nvcTTDirty.i
+Global nvcTTCacheHits.i
+Global nvcTTCacheMisses.i
+Global nvcTTNextX.i
+Global nvcTTNextY.i
+Global nvcTTRowH.i
+Global nvcTTCount.i
+Global nvcTTFontPixels.i = 16
+Global nvcTTLayoutRc.i
+Global nvcTTLayoutError.i
+Global nvcTTErrorStage.i
+Global nvcTTUnitsProbe.i
+Global nvcTTCountProbe.i
+Global nvcTTLinesProbe.i
+Global nvcTTMeasuredProbe.i
+Global nvcTTMetricsStateProbe.i
+Global nvcSubmitStage.i
+Global nvcSubmitRc.i
+Global Dim nvcTTFontHeight.i[4]
+Global Dim nvcTTSlot.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTGen.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTHeight.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTGlyph.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTX.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTY.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTW.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTH.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTBearingX.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTBearingY.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTAdvance.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTCoverage.a[#NEON_VK_CHROME_TT_COVERAGE]
+Global Dim nvcTTDecoded.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutGlyph.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutX.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutY.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTLayoutAdvance.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global nvcWhiteU0.i
+Global nvcWhiteV0.i
+Global nvcWhiteU1.i
+Global nvcWhiteV1.i
+Global nvcClipX.i
+Global nvcClipY.i
+Global nvcClipW.i
+Global nvcClipH.i
+
+Global Dim nvcFs.l[256]
+
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_wsi_bridge.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_display.pi4"
+
+Declare NeonVkChromeDestroy()
+Declare.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
+Declare.i NeonVkChromeRebind(framebuffer.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, pitch.i, rotation.i)
+Declare.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
+Declare NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
+Declare NeonVkChromeScissorClear()
+Declare.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
+Declare.i NeonVkChromeMeasureWidth(font.i, *s)
+Declare.i NeonVkChromeMeasureLineHeight(font.i)
+Declare.i NeonVkChromeFanBegin()
+Declare NeonVkChromeFanPoint(x.i, y.i)
+Declare.i NeonVkChromeFanEnd(colour.i)
+Declare.i NeonVkChromeFanOutline(colour.i)
+Declare.i NeonVkChromeLinesBegin()
+Declare NeonVkChromeLine(x0.i, y0.i, x1.i, y1.i)
+Declare.i NeonVkChromeLinesEnd(colour.i)
+
+Procedure.i nvcFail(code.i)
+  nvcError = code
+  ProcedureReturn code
+EndProcedure
+
+Procedure.i NeonVkChromeError()
+  ProcedureReturn nvcError
+EndProcedure
+
+Procedure.i NeonVkChromeReady()
+  ProcedureReturn nvcReady
+EndProcedure
+
+Procedure.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
+  If nvcReady = 0 Or nvdPresentPending() <> 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  ProcedureReturn nvdWsiAttach(device, swapchain, imageIndex, nvcTargetGeneration)
+EndProcedure
+
+; Rebind is a failure-atomic target transaction. The caller owns the
+; framebuffer extent and attachment lifetime; this adapter records the
+; identity and validated logical/physical geometry but does not create or
+; resize the framebuffer. The active target remains untouched until every
+; check passes.
+Procedure.i NeonVkChromeRebind(framebuffer.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, pitch.i, rotation.i)
+  Define expectedW.i
+  Define expectedH.i
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvdWsiEnabled() <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If framebuffer = 0 Or logicalW < 1 Or logicalH < 1 Or physicalW < 1 Or physicalH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If physicalW > $1FFFFFFFFFFFFFFF Or pitch < physicalW * 4
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If rotation <> 0 And rotation <> 90 And rotation <> 180 And rotation <> 270
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If rotation = 90 Or rotation = 270
+    expectedW = logicalH : expectedH = logicalW
+  Else
+    expectedW = logicalW : expectedH = logicalH
+  EndIf
+  If physicalW <> expectedW Or physicalH <> expectedH
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcNextTargetGeneration = #NVC_MAX_GENERATION
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcFramebuffer = framebuffer
+  nvcLogicalW = logicalW : nvcLogicalH = logicalH
+  nvcPhysicalW = physicalW : nvcPhysicalH = physicalH
+  nvcPitch = pitch : nvcRotation = rotation
+  nvcWidth = logicalW : nvcHeight = logicalH
+  nvcNextTargetGeneration = nvcNextTargetGeneration + 1
+  nvcTargetGeneration = nvcNextTargetGeneration
+  nvcError = 0
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i NeonVkChromeDrawCount()
+  ProcedureReturn nvcDrawCount
+EndProcedure
+
+Procedure.i NeonVkChromeVertexCount()
+  ProcedureReturn nvcVertices
+EndProcedure
+
+Procedure.i NeonVkChromePresentPending()
+  ProcedureReturn nvdPresentPending()
+EndProcedure
+
+Procedure.i NeonVkChromePresentConsume()
+  If nvdPresentPending() = 0
+    ProcedureReturn 0
+  EndIf
+  If nvdPresentMatches(nvcTargetGeneration, nvcFramebuffer) = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvdPresentConsume(nvcTargetGeneration, nvcFramebuffer) = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvcHostMemoryType(typeBits.i)
+  Define mp.VkPhysicalDeviceMemoryProperties
+  Define i.i
+  vkGetPhysicalDeviceMemoryProperties(nvcPhysical, @mp)
+  i = 0
+  While i < mp\memoryTypeCount
+    If (typeBits & (1 << i)) <> 0
+      If (mp\memoryTypes[i]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) <> 0
+        If (mp\memoryTypes[i]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) <> 0
+          ProcedureReturn i
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i nvcBufferCreate(bytes.i, usage.i, *outBuffer, *outMemory)
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define buffer.i
+  Define memory.i
+  Define mt.i
+  Define rc.i
+
+  If bytes <= 0 Or *outBuffer = 0 Or *outMemory = 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bci\size = bytes
+  bci\usage = usage
+  bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  rc = vkCreateBuffer(nvcDevice, @bci, 0, @buffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  vkGetBufferMemoryRequirements(nvcDevice, buffer, @req)
+  mt = nvcHostMemoryType(req\memoryTypeBits)
+  If mt < 0
+    vkDestroyBuffer(nvcDevice, buffer, 0)
+    ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN
+  EndIf
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = mt
+  rc = vkAllocateMemory(nvcDevice, @mai, 0, @memory)
+  If rc = #VK_SUCCESS
+    rc = vkBindBufferMemory(nvcDevice, buffer, memory, 0)
+  EndIf
+  If rc <> #VK_SUCCESS
+    If memory <> 0 : vkFreeMemory(nvcDevice, memory, 0) : EndIf
+    vkDestroyBuffer(nvcDevice, buffer, 0)
+    ProcedureReturn rc
+  EndIf
+  PokeI(*outBuffer, buffer)
+  PokeI(*outMemory, memory)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; One ordered submission seam serves the one-time atlas upload at Create and
+; each completed frame. Therefore frame End still has exactly one submission,
+; while resource initialization does not duplicate queue/fence ownership.
+Procedure.i nvcSubmitAndWait()
+  Define si.VkSubmitInfo
+  Define cmdHandle.i
+  Define fenceHandle.i
+  Define rc.i
+  nvcSubmitStage = 2 : nvcSubmitRc = #VK_SUCCESS
+  fenceHandle = nvcFence
+  rc = vkResetFences(nvcDevice, 1, @fenceHandle)
+  cmdHandle = nvcCommand
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cmdHandle
+  If rc = #VK_SUCCESS
+    nvcSubmitStage = 3
+    rc = vkQueueSubmit(nvcQueue, 1, @si, nvcFence)
+  EndIf
+  If rc = #VK_SUCCESS
+    nvcSubmitStage = 4
+    rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS)
+  EndIf
+  nvcSubmitRc = rc
+  ProcedureReturn rc
+EndProcedure
+
+; The bitmap atlas publishes exact power-of-two normalized texel edges. Recover
+; its integer source coordinate before dividing by the widened image extent.
+Procedure.i nvcF32Pixel(bits.i, dimension.i)
+  Define exponent.i
+  Define mantissa.i
+  Define dimShift.i
+  Define shift.i
+  If bits = 0 Or dimension < 1 : ProcedureReturn 0 : EndIf
+  While (1 << dimShift) < dimension : dimShift + 1 : Wend
+  If (1 << dimShift) <> dimension : ProcedureReturn -1 : EndIf
+  exponent = (bits >> 23) & $FF
+  mantissa = (bits & $7FFFFF) | $800000
+  shift = exponent - 150 + dimShift
+  If shift >= 0
+    ProcedureReturn mantissa << shift
+  EndIf
+  ProcedureReturn mantissa >> (0 - shift)
+EndProcedure
+
+Procedure.i nvcAtlasMapBitmapUV(*uv.NeonAtlasGlyphUV)
+  Define x0.i, x1.i, y0.i, y1.i
+  If *uv = 0 Or nvcAtlasBaseW < 1 Or nvcAtlasBaseH < 1
+    ProcedureReturn 0
+  EndIf
+  x0 = nvcF32Pixel(*uv\left, nvcAtlasBaseW)
+  x1 = nvcF32Pixel(*uv\right, nvcAtlasBaseW)
+  y0 = nvcF32Pixel(*uv\top, nvcAtlasBaseH)
+  y1 = nvcF32Pixel(*uv\bottom, nvcAtlasBaseH)
+  If x0 < 0 Or x1 < x0 Or x1 > nvcAtlasBaseW Or y0 < 0 Or y1 < y0 Or y1 > nvcAtlasBaseH
+    ProcedureReturn 0
+  EndIf
+  *uv\left = neon_F32Ratio(x0, nvcAtlasW)
+  *uv\right = neon_F32Ratio(x1, nvcAtlasW)
+  *uv\top = neon_F32Ratio(y0, nvcAtlasH)
+  *uv\bottom = neon_F32Ratio(y1, nvcAtlasH)
+  ProcedureReturn 1
+EndProcedure
+
+; Dynamic glyph misses are uploaded only before a frame begins. The persistent
+; host-visible staging allocation is fully rewritten, then copied to the one
+; shared sampled image; callers never mutate its texels during a render pass.
+Procedure.i nvcAtlasUploadWarm()
+  Define bi.VkCommandBufferBeginInfo
+  Define bar.VkImageMemoryBarrier
+  Define copy.VkBufferImageCopy
+  Define rc.i
+  If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 Or nvcUploadBuffer = 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  rc = vkResetCommandBuffer(nvcCommand, 0)
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(nvcCommand, @bi) : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = nvcAtlasImage
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  copy\bufferOffset = #NEON_VK_CHROME_ATLAS_PAD
+  copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  copy\imageSubresource\layerCount = 1
+  copy\imageExtent\width = nvcAtlasW : copy\imageExtent\height = nvcAtlasH : copy\imageExtent\depth = 1
+  If rc = #VK_SUCCESS
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyBufferToImage(nvcCommand, nvcUploadBuffer, nvcAtlasImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    rc = vkEndCommandBuffer(nvcCommand)
+  EndIf
+  If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
+  If rc = #VK_SUCCESS : nvcAtlasUploadCount + 1 : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+; Fragment shader:
+;   sampled atlas * per-draw RGBA push tint + a persistent zero UBO.
+; The zero UBO keeps the exact proven sampled/push lowering used by the
+; atlas acceptance path while leaving every visible colour draw-owned.
+Procedure.i nvcBuildFragmentShader()
+  vtpBuf = @nvcFs[0]
+  vtpHeader(35)
+  vtpIns(#VTP_OpCapability, 1) : vtpW(#VTP_CapShader)
+  vtpIns(#VTP_OpMemoryModel, 2) : vtpW(#VTP_AddrLogical) : vtpW(#VTP_MemGLSL450)
+  vtpIns(#VTP_OpEntryPoint, 6) : vtpW(#VTP_EmFragment) : vtpW(24) : vtpW(#VTP_NAME0) : vtpW(#VTP_NAME1) : vtpW(12) : vtpW(13)
+  vtpIns(#VTP_OpExecutionMode, 2) : vtpW(24) : vtpW(#VTP_ModeOriginUpperLeft)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(11) : vtpW(#VTP_DecDescriptorSet) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(11) : vtpW(#VTP_DecBinding) : vtpW(1)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(12) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(13) : vtpW(#VTP_DecLocation) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 2) : vtpW(14) : vtpW(#VTP_DecBlock)
+  vtpIns(#VTP_OpMemberDecorate, 4) : vtpW(14) : vtpW(0) : vtpW(#VTP_DecOffset) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(16) : vtpW(#VTP_DecDescriptorSet) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 3) : vtpW(16) : vtpW(#VTP_DecBinding) : vtpW(0)
+  vtpIns(#VTP_OpDecorate, 2) : vtpW(20) : vtpW(#VTP_DecBlock)
+  vtpIns(#VTP_OpMemberDecorate, 4) : vtpW(20) : vtpW(0) : vtpW(#VTP_DecOffset) : vtpW(0)
+  vtpIns(#VTP_OpTypeVoid, 1) : vtpW(1)
+  vtpIns(#VTP_OpTypeFunction, 2) : vtpW(2) : vtpW(1)
+  vtpIns(#VTP_OpTypeFloat, 2) : vtpW(3) : vtpW(32)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(4) : vtpW(3) : vtpW(2)
+  vtpIns(#VTP_OpTypeVector, 3) : vtpW(5) : vtpW(3) : vtpW(4)
+  vtpIns(#VTP_OpTypeImage, 8) : vtpW(6) : vtpW(3) : vtpW(1) : vtpW(0) : vtpW(0) : vtpW(0) : vtpW(1) : vtpW(0)
+  vtpIns(#VTP_OpTypeSampledImage, 2) : vtpW(7) : vtpW(6)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(8) : vtpW(#VTP_ScUniformConstant) : vtpW(7)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(9) : vtpW(#VTP_ScInput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(10) : vtpW(#VTP_ScOutput) : vtpW(5)
+  vtpIns(#VTP_OpTypeStruct, 2) : vtpW(14) : vtpW(5)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(15) : vtpW(#VTP_ScUniform) : vtpW(14)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(17) : vtpW(#VTP_ScUniform) : vtpW(5)
+  vtpIns(#VTP_OpTypeInt, 3) : vtpW(18) : vtpW(32) : vtpW(1)
+  vtpIns(#VTP_OpConstant, 3) : vtpW(18) : vtpW(19) : vtpW(0)
+  vtpIns(#VTP_OpTypeStruct, 2) : vtpW(20) : vtpW(5)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(21) : vtpW(#VTP_ScPushConstant) : vtpW(20)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(23) : vtpW(#VTP_ScPushConstant) : vtpW(5)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(8) : vtpW(11) : vtpW(#VTP_ScUniformConstant)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(9) : vtpW(12) : vtpW(#VTP_ScInput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(10) : vtpW(13) : vtpW(#VTP_ScOutput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(15) : vtpW(16) : vtpW(#VTP_ScUniform)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(21) : vtpW(22) : vtpW(#VTP_ScPushConstant)
+  vtpIns(#VTP_OpFunction, 4) : vtpW(1) : vtpW(24) : vtpW(0) : vtpW(2)
+  vtpIns(#VTP_OpLabel, 1) : vtpW(25)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(7) : vtpW(26) : vtpW(11)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(27) : vtpW(12)
+  vtpIns(#VTP_OpImageSampleImplicitLod, 4) : vtpW(5) : vtpW(28) : vtpW(26) : vtpW(27)
+  vtpIns(#VTP_OpAccessChain, 4) : vtpW(17) : vtpW(29) : vtpW(16) : vtpW(19)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(5) : vtpW(30) : vtpW(29)
+  vtpIns(#VTP_OpAccessChain, 4) : vtpW(23) : vtpW(31) : vtpW(22) : vtpW(19)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(5) : vtpW(32) : vtpW(31)
+  vtpIns(133, 4) : vtpW(5) : vtpW(33) : vtpW(28) : vtpW(32)
+  vtpIns(129, 4) : vtpW(5) : vtpW(34) : vtpW(33) : vtpW(30)
+  vtpIns(#VTP_OpStore, 2) : vtpW(13) : vtpW(34)
+  vtpIns(#VTP_OpReturn, 0)
+  vtpIns(#VTP_OpFunctionEnd, 0)
+  ProcedureReturn vtpN * 4
+EndProcedure
+
+Procedure.i nvcAtlasCreateAndUpload()
+  Define ici.VkImageCreateInfo
+  Define imageProps.VkImageFormatProperties
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define sci.VkSamplerCreateInfo
+  Define bci.VkBufferCreateInfo
+  Define bar.VkImageMemoryBarrier
+  Define copy.VkBufferImageCopy
+  Define bi.VkCommandBufferBeginInfo
+  Define stage.i
+  Define stageMem.i
+  Define mapped.i
+  Define source.i
+  Define sourceBytes.i
+  Define bytes.i
+  Define mt.i
+  Define i.i
+  Define x.i
+  Define y.i
+  Define target.i
+  Define rc.i
+  Define white.NeonAtlasGlyphUV
+
+  rc = Neon_AtlasRasterEnsure()
+  If rc <> #NEON_OK Or Neon_AtlasRasterReady() = 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS
+  EndIf
+  source = Neon_AtlasRasterBase()
+  nvcAtlasBaseW = Neon_AtlasRasterWidth()
+  nvcAtlasBaseH = Neon_AtlasRasterHeight()
+  sourceBytes = Neon_AtlasRasterBytes()
+  If source = 0 Or nvcAtlasBaseW < 1 Or nvcAtlasBaseW > 16 Or nvcAtlasBaseH < 1 Or sourceBytes <> nvcAtlasBaseW * nvcAtlasBaseH * 4
+    ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS
+  EndIf
+  nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W
+  nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
+  If nvcAtlasBaseH > nvcAtlasH : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+  nvcAtlasBytes = nvcAtlasW * nvcAtlasH * 4
+  bytes = nvcAtlasBytes
+  If bytes < sourceBytes Or bytes > 8388608
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  nvcCreateStage = 410
+  rc = vkGetPhysicalDeviceImageFormatProperties(nvcPhysical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT, 0, @imageProps)
+  If rc <> #VK_SUCCESS Or imageProps\maxExtent\width < nvcAtlasW Or imageProps\maxExtent\height < nvcAtlasH Or imageProps\maxResourceSize < bytes
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+
+  ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  ici\imageType = #VK_IMAGE_TYPE_2D
+  ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ici\extent\width = nvcAtlasW : ici\extent\height = nvcAtlasH : ici\extent\depth = 1
+  ici\mipLevels = 1 : ici\arrayLayers = 1 : ici\samples = #VK_SAMPLE_COUNT_1_BIT
+  ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+  ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  nvcCreateStage = 411
+  rc = vkCreateImage(nvcDevice, @ici, 0, @nvcAtlasImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  vkGetImageMemoryRequirements(nvcDevice, nvcAtlasImage, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  nvcCreateStage = 412
+  rc = vkAllocateMemory(nvcDevice, @mai, 0, @nvcAtlasMemory)
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 413
+    rc = vkBindImageMemory(nvcDevice, nvcAtlasImage, nvcAtlasMemory, 0)
+  EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  nvcCreateStage = 414
+  rc = nvcBufferCreate(#NEON_VK_CHROME_ATLAS_PAD + bytes, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, @stage, @stageMem)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  nvcUploadBuffer = stage : nvcUploadMemory = stageMem
+  nvcCreateStage = 415
+  rc = vkMapMemory(nvcDevice, stageMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  i = 0
+  While i < bytes
+    PokeA(mapped + #NEON_VK_CHROME_ATLAS_PAD + i, 0)
+    i + 1
+  Wend
+  For y = 0 To nvcAtlasBaseH - 1
+    For x = 0 To nvcAtlasBaseW * 4 - 1
+      target = y * nvcAtlasW * 4 + x
+      PokeA(mapped + #NEON_VK_CHROME_ATLAS_PAD + target, PeekA(source + y * nvcAtlasBaseW * 4 + x))
+    Next
+  Next
+  nvcAtlasUploadMapped = mapped
+  nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
+  If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
+  nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
+  nvcWhiteU1 = neon_F32Ratio(nvcF32Pixel(white\right, nvcAtlasBaseW), nvcAtlasW)
+  nvcWhiteV0 = neon_F32Ratio(nvcF32Pixel(white\top, nvcAtlasBaseH), nvcAtlasH)
+  nvcWhiteV1 = neon_F32Ratio(nvcF32Pixel(white\bottom, nvcAtlasBaseH), nvcAtlasH)
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = nvcAtlasImage : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  nvcCreateStage = 416
+  rc = vkCreateImageView(nvcDevice, @ivci, 0, @nvcAtlasView)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  sci\sType = #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+  sci\magFilter = #VK_FILTER_NEAREST : sci\minFilter = #VK_FILTER_NEAREST
+  sci\mipmapMode = #VK_SAMPLER_MIPMAP_MODE_NEAREST
+  sci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sci\addressModeV = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sci\addressModeW = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  nvcCreateStage = 417
+  rc = vkCreateSampler(nvcDevice, @sci, 0, @nvcSampler)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = nvcAtlasImage
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  copy\bufferOffset = #NEON_VK_CHROME_ATLAS_PAD
+  copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  copy\imageSubresource\layerCount = 1
+  copy\imageExtent\width = nvcAtlasW : copy\imageExtent\height = nvcAtlasH : copy\imageExtent\depth = 1
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  nvcCreateStage = 418
+  rc = vkResetCommandBuffer(nvcCommand, 0)
+  If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(nvcCommand, @bi) : EndIf
+  If rc = #VK_SUCCESS
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyBufferToImage(nvcCommand, stage, nvcAtlasImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    rc = vkEndCommandBuffer(nvcCommand)
+  EndIf
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 419
+    rc = nvcSubmitAndWait()
+  EndIf
+  If rc = #VK_SUCCESS : nvcAtlasUploadCount = 1 : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i nvcDescriptorsAndPipeline()
+  Define Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Define dslci.VkDescriptorSetLayoutCreateInfo
+  Define Dim sizes.VkDescriptorPoolSize[2]
+  Define dpci.VkDescriptorPoolCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define dii.VkDescriptorImageInfo
+  Define Dim writes.VkWriteDescriptorSet[2]
+  Define plci.VkPipelineLayoutCreateInfo
+  Define pcr.VkPushConstantRange
+  Define smci.VkShaderModuleCreateInfo
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define bind.VkVertexInputBindingDescription
+  Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vp.VkViewport
+  Define vpstate.VkPipelineViewportStateCreateInfo
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define dyn.VkPipelineDynamicStateCreateInfo
+  ; VkDynamicState is a Vulkan enum (32 bits); native-width .i entries make
+  ; the API's 4-byte walk read the high half of VIEWPORT twice.
+  Dim dynStates.l[2]
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define vs.i
+  Define fs.i
+  Define layoutArray.i
+  Define mapped.i
+  Define rc.i
+  Define vsBytes.i
+  Define fsBytes.i
+
+  rc = nvcBufferCreate(16, #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, @nvcUniformBuffer, @nvcUniformMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rc = vkMapMemory(nvcDevice, nvcUniformMemory, 0, 16, 0, @mapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  PokeL(mapped + 0, 0) : PokeL(mapped + 4, 0) : PokeL(mapped + 8, 0) : PokeL(mapped + 12, 0)
+  vkUnmapMemory(nvcDevice, nvcUniformMemory)
+
+  bindings[0]\binding = 0 : bindings[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[0]\descriptorCount = 1 : bindings[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  bindings[1]\binding = 1 : bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  bindings[1]\descriptorCount = 1 : bindings[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
+  rc = vkCreateDescriptorSetLayout(nvcDevice, @dslci, 0, @nvcSetLayout)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  dpci\maxSets = 1 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  rc = vkCreateDescriptorPool(nvcDevice, @dpci, 0, @nvcDescriptorPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  layoutArray = nvcSetLayout
+  dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsai\descriptorPool = nvcDescriptorPool : dsai\descriptorSetCount = 1 : dsai\pSetLayouts = @layoutArray
+  rc = vkAllocateDescriptorSets(nvcDevice, @dsai, @nvcDescriptorSet)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  dbi\buffer = nvcUniformBuffer : dbi\range = 16
+  dii\sampler = nvcSampler : dii\imageView = nvcAtlasView : dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  writes[0]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writes[0]\dstSet = nvcDescriptorSet : writes[0]\dstBinding = 0
+  writes[0]\descriptorCount = 1 : writes[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  writes[0]\pBufferInfo = @dbi
+  writes[1]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writes[1]\dstSet = nvcDescriptorSet : writes[1]\dstBinding = 1
+  writes[1]\descriptorCount = 1 : writes[1]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  writes[1]\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @writes[0], 0, 0)
+  If AnvilVkFaultCode() <> #ANVIL_VK_OK : ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @writes[1], 0, 0)
+  If AnvilVkFaultCode() <> #ANVIL_VK_OK : ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN : EndIf
+
+  pcr\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT : pcr\size = 16
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  plci\setLayoutCount = 1 : plci\pSetLayouts = @layoutArray
+  plci\pushConstantRangeCount = 1 : plci\pPushConstantRanges = @pcr
+  rc = vkCreatePipelineLayout(nvcDevice, @plci, 0, @nvcPipelineLayout)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  vsBytes = vtpBuildVsD()
+  fsBytes = nvcBuildFragmentShader()
+  smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  smci\pCode = @vtpVsD[0] : smci\codeSize = vsBytes
+  rc = vkCreateShaderModule(nvcDevice, @smci, 0, @vs)
+  If rc = #VK_SUCCESS
+    smci\pCode = @nvcFs[0] : smci\codeSize = fsBytes
+    rc = vkCreateShaderModule(nvcDevice, @smci, 0, @fs)
+  EndIf
+  If rc <> #VK_SUCCESS
+    If vs <> 0 : vkDestroyShaderModule(nvcDevice, vs, 0) : EndIf
+    If fs <> 0 : vkDestroyShaderModule(nvcDevice, fs, 0) : EndIf
+    ProcedureReturn rc
+  EndIf
+
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT : stages[0]\module = vs
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT : stages[1]\module = fs
+  bind\binding = 0 : bind\stride = #NEON_VK_CHROME_VERTEX_BYTES : bind\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0 : attrs[0]\binding = 0 : attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[1]\location = 1 : attrs[1]\binding = 0 : attrs[1]\format = #VK_FORMAT_R32G32_SFLOAT : attrs[1]\offset = 8
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\vertexBindingDescriptionCount = 1 : vi\pVertexBindingDescriptions = @bind
+  vi\vertexAttributeDescriptionCount = 2 : vi\pVertexAttributeDescriptions = @attrs[0]
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  PokeL(@vp\width, neon_F32Int(nvcWidth))
+  PokeL(@vp\height, neon_F32Int(nvcHeight))
+  PokeL(@vp\maxDepth, #NEON_VK_CHROME_F_ONE)
+  vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vpstate\viewportCount = 1 : vpstate\pViewports = @vp
+  vpstate\scissorCount = 1 : vpstate\pScissors = 0
+  dynStates[0] = #VK_DYNAMIC_STATE_VIEWPORT
+  dynStates[1] = #VK_DYNAMIC_STATE_SCISSOR
+  dyn\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+  dyn\dynamicStateCount = 2 : dyn\pDynamicStates = @dynStates[0]
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL : rs\cullMode = #VK_CULL_MODE_NONE
+  rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, #NEON_VK_CHROME_F_ONE)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+  ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+  cba\blendEnable = #VK_TRUE
+  cba\srcColorBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
+  cba\dstColorBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+  cba\colorBlendOp = #VK_BLEND_OP_ADD
+  cba\srcAlphaBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
+  cba\dstAlphaBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+  cba\alphaBlendOp = #VK_BLEND_OP_ADD
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+  cb\attachmentCount = 1 : cb\pAttachments = @cba
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2 : gp\pStages = @stages[0]
+  gp\pVertexInputState = @vi : gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vpstate : gp\pRasterizationState = @rs
+  gp\pMultisampleState = @ms : gp\pColorBlendState = @cb : gp\pDynamicState = @dyn
+  gp\layout = nvcPipelineLayout : gp\renderPass = nvcRenderPass : gp\subpass = 0 : gp\basePipelineIndex = -1
+  rc = vkCreateGraphicsPipelines(nvcDevice, 0, 1, @gp, 0, @nvcPipeline)
+  vkDestroyShaderModule(nvcDevice, vs, 0)
+  vkDestroyShaderModule(nvcDevice, fs, 0)
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxDraws.i, maxVertexQuads.i)
+  Define cbai.VkCommandBufferAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define rc.i
+
+  If nvcReady <> 0 Or nvcInFrame <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If NeonDrawBackendActive() <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If physicalDevice = 0 Or device = 0 Or queue = 0 Or commandPool = 0 Or renderPass = 0 Or framebuffer = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If width < 1 Or height < 1 Or maxDraws < 1 Or maxDraws > #NEON_VK_CHROME_MAX_QUADS
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If maxVertexQuads < 1 Or maxVertexQuads > #NEON_VK_CHROME_MAX_VERTEX_QUADS
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcNextTargetGeneration = #NVC_MAX_GENERATION
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcPhysical = physicalDevice : nvcDevice = device : nvcQueue = queue : nvcCommandPool = commandPool
+  nvcRenderPass = renderPass : nvcFramebuffer = framebuffer
+  nvcLogicalW = width : nvcLogicalH = height
+  nvcPhysicalW = width : nvcPhysicalH = height : nvcPitch = width * 4 : nvcRotation = 0
+  nvcWidth = width : nvcHeight = height
+  nvcMaxQuads = maxDraws : nvcMaxVertexQuads = maxVertexQuads
+  nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
+  nvcError = 0
+  nvcCreateStage = 0 : nvcCreateFaultCode = 0 : nvcCreateFaultText = 0
+  nvdPresentClear()
+
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = commandPool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY : cbai\commandBufferCount = 1
+  nvcCreateStage = 1
+  rc = vkAllocateCommandBuffers(device, @cbai, @nvcCommand)
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 2
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    rc = vkCreateFence(device, @fci, 0, @nvcFence)
+  EndIf
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 3
+    rc = nvcBufferCreate(maxVertexQuads * 6 * #NEON_VK_CHROME_VERTEX_BYTES, #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, @nvcVertexBuffer, @nvcVertexMemory)
+  EndIf
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 4
+    rc = nvcAtlasCreateAndUpload()
+  EndIf
+  If rc = #VK_SUCCESS
+    nvcCreateStage = 5
+    rc = nvcDescriptorsAndPipeline()
+  EndIf
+  If rc <> #VK_SUCCESS
+    nvcError = rc
+    nvcCreateFaultCode = AnvilVkFaultCode()
+    nvcCreateFaultText = AnvilVkFaultText()
+    NeonVkChromeDestroy()
+    nvcError = rc
+    ProcedureReturn rc
+  EndIf
+  ; The family goes in as parameters, never through a structure: see
+  ; NeonDrawBackendInstall and forum 915.
+  rc = NeonDrawBackendInstall(@NeonVkChromeBox, @NeonVkChromeText, @NeonVkChromeScissorSet, @NeonVkChromeScissorClear, @NeonVkChromeFanBegin, @NeonVkChromeFanPoint, @NeonVkChromeFanEnd, @NeonVkChromeFanOutline, @NeonVkChromeLinesBegin, @NeonVkChromeLine, @NeonVkChromeLinesEnd)
+  If rc <> #NEON_OK
+    nvcError = #NEON_VK_CHROME_ERR_STATE
+    NeonVkChromeDestroy()
+    nvcError = #NEON_VK_CHROME_ERR_STATE
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  nvcHooksInstalled = 1
+  rc = NeonMeasureBackendInstall(@NeonVkChromeMeasureWidth, @NeonVkChromeMeasureLineHeight)
+  If rc <> #NEON_OK
+    nvcError = #NEON_VK_CHROME_ERR_STATE
+    NeonVkChromeDestroy()
+    nvcError = #NEON_VK_CHROME_ERR_STATE
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  nvcNextTargetGeneration = nvcNextTargetGeneration + 1
+  nvcTargetGeneration = nvcNextTargetGeneration
+  nvcReady = 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Compatibility entry keeps the original one-capacity contract for existing
+; demos and the proof fixture. Resident grid mode opts into a larger vertex
+; buffer without raising the independent Vulkan draw-record ceiling.
+Procedure.i NeonVkChromeCreate(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxQuads.i)
+  ProcedureReturn NeonVkChromeCreateWithCapacities(physicalDevice, device, queue, commandPool, renderPass, framebuffer, width, height, maxQuads, maxQuads)
+EndProcedure
+
+Procedure.i NeonVkChromeBegin(*clearValue)
+  Define bi.VkCommandBufferBeginInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define viewport.VkViewport
+  Define Dim clear.l[4]
+  Define setHandle.i
+  Define bufferHandle.i
+  Define offset.q
+  Define rc.i
+
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcTTDirty <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = 0
+  If *clearValue <> 0
+    clear[0] = PeekL(*clearValue + 0) : clear[1] = PeekL(*clearValue + 4)
+    clear[2] = PeekL(*clearValue + 8) : clear[3] = PeekL(*clearValue + 12)
+  EndIf
+  rc = vkMapMemory(nvcDevice, nvcVertexMemory, 0, #VK_WHOLE_SIZE, 0, @nvcMapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  rc = vkResetCommandBuffer(nvcCommand, 0)
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(nvcCommand, @bi) : EndIf
+  If rc <> #VK_SUCCESS
+    vkUnmapMemory(nvcDevice, nvcVertexMemory) : nvcMapped = 0
+    ProcedureReturn nvcFail(rc)
+  EndIf
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = nvcRenderPass : rpbi\framebuffer = nvcFramebuffer
+  rpbi\renderArea\extent\width = nvcPhysicalW : rpbi\renderArea\extent\height = nvcPhysicalH
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @clear[0]
+  vkCmdBeginRenderPass(nvcCommand, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  ; VkViewport stores IEEE-754 bit words; keep zero offsets literal without
+  ; asking the monitor frontend to enable its optional floating-point syntax.
+  PokeL(@viewport\x, 0) : PokeL(@viewport\y, 0)
+  PokeL(@viewport\width, neon_F32Int(nvcPhysicalW))
+  PokeL(@viewport\height, neon_F32Int(nvcPhysicalH))
+  PokeL(@viewport\minDepth, 0) : PokeL(@viewport\maxDepth, #NEON_VK_CHROME_F_ONE)
+  vkCmdSetViewport(nvcCommand, 0, 1, @viewport)
+  vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipeline)
+  bufferHandle = nvcVertexBuffer : offset = 0
+  vkCmdBindVertexBuffers(nvcCommand, 0, 1, @bufferHandle, @offset)
+  setHandle = nvcDescriptorSet
+  vkCmdBindDescriptorSets(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipelineLayout, 0, 1, @setHandle, 0, 0)
+  nvcVertices = 0 : nvcDrawCount = 0 : nvcInFrame = 1 : nvcError = 0
+  nvcAtlasRasterCountAtFrame = AnvilTrueTypeRasterCount()
+  nvcAtlasUploadAtFrame = nvcAtlasUploadCount
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+  NeonVkChromeScissorClear()
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i nvcClipXBits(x.i)
+  ProcedureReturn neon_F32Ratio((x * 2) - nvcPhysicalW, nvcPhysicalW)
+EndProcedure
+
+Procedure.i nvcClipYBits(y.i)
+  ProcedureReturn neon_F32Ratio((y * 2) - nvcPhysicalH, nvcPhysicalH)
+EndProcedure
+
+Procedure nvcVertex(index.i, x.i, y.i, u.i, v.i)
+  Define p.i
+  Define tx.i
+  Define ty.i
+  If nvcRotation = 90
+    tx = nvcLogicalH - y : ty = x
+  ElseIf nvcRotation = 180
+    tx = nvcLogicalW - x : ty = nvcLogicalH - y
+  ElseIf nvcRotation = 270
+    tx = y : ty = nvcLogicalW - x
+  Else
+    tx = x : ty = y
+  EndIf
+  p = nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
+  PokeL(p + 0, nvcClipXBits(tx)) : PokeL(p + 4, nvcClipYBits(ty))
+  PokeL(p + 8, u) : PokeL(p + 12, v)
+  PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+EndProcedure
+
+Procedure nvcQuad(first.i, x0.i, y0.i, x1.i, y1.i, u0.i, v0.i, u1.i, v1.i)
+  nvcVertex(first + 0, x0, y0, u0, v0)
+  nvcVertex(first + 1, x0, y1, u0, v1)
+  nvcVertex(first + 2, x1, y1, u1, v1)
+  nvcVertex(first + 3, x0, y0, u0, v0)
+  nvcVertex(first + 4, x1, y1, u1, v1)
+  nvcVertex(first + 5, x1, y0, u1, v0)
+EndProcedure
+
+; The public Vulkan pipeline is triangle-list only. These helpers lower solid
+; fan triangles and one-pixel line quads through the atlas's owned white texel;
+; no native Neon/V3D record or CPU framebuffer path is reachable here.
+Procedure nvcSolidTriangle(first.i, x0.i, y0.i, x1.i, y1.i, x2.i, y2.i)
+  nvcVertex(first + 0, x0, y0, nvcWhiteU0, nvcWhiteV0)
+  nvcVertex(first + 1, x1, y1, nvcWhiteU0, nvcWhiteV0)
+  nvcVertex(first + 2, x2, y2, nvcWhiteU0, nvcWhiteV0)
+EndProcedure
+
+Procedure nvcSolidQuad(x0.i, y0.i, x1.i, y1.i, x2.i, y2.i, x3.i, y3.i)
+  nvcSolidTriangle(nvcVertices + 0, x0, y0, x1, y1, x2, y2)
+  nvcSolidTriangle(nvcVertices + 3, x0, y0, x2, y2, x3, y3)
+EndProcedure
+
+Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
+  Define dx.i
+  Define dy.i
+  dx = x1 - x0 : If dx < 0 : dx = 0 - dx : EndIf
+  dy = y1 - y0 : If dy < 0 : dy = 0 - dy : EndIf
+  If dx = 0 And dy = 0
+    nvcSolidQuad(x0, y0, x0 + 1, y0, x0 + 1, y0 + 1, x0, y0 + 1)
+  ElseIf dx >= dy
+    nvcSolidQuad(x0, y0, x1, y1, x1, y1 + 1, x0, y0 + 1)
+  Else
+    nvcSolidQuad(x0, y0, x1, y1, x1 + 1, y1, x0 + 1, y0)
+  EndIf
+EndProcedure
+
+; Neon colours are logical packed 0xAARRGGBB. The sampled fragment shader
+; consumes float RGBA, independent of the attachment's BGRA byte layout.
+Procedure nvcTint(colour.i, *push)
+  PokeL(*push + 0, neon_F32Byte((colour >> 16) & $FF))
+  PokeL(*push + 4, neon_F32Byte((colour >> 8) & $FF))
+  PokeL(*push + 8, neon_F32Byte(colour & $FF))
+  PokeL(*push + 12, neon_F32Byte((colour >> 24) & $FF))
+EndProcedure
+
+Procedure.i nvcDraw(first.i, count.i, colour.i)
+  Define sc.VkRect2D
+  Define Dim push.l[4]
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  sc\offset\x = nvcClipX : sc\offset\y = nvcClipY
+  sc\extent\width = nvcClipW : sc\extent\height = nvcClipH
+  vkCmdSetScissor(nvcCommand, 0, 1, @sc)
+  nvcTint(colour, @push[0])
+  vkCmdPushConstants(nvcCommand, nvcPipelineLayout, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @push[0])
+  vkCmdDraw(nvcCommand, count, 1, first, 0)
+  nvcDrawCount = nvcDrawCount + 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
+  Define first.i
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If w <= 0 Or h <= 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ; Capacity is preflighted before any vertex write or ordered cursor change.
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  first = nvcVertices
+  ; Boxes sample only Neon's dedicated opaque-white atlas texel.
+  nvcQuad(first, x, y, x + w, y + h, nvcWhiteU0, nvcWhiteV0, nvcWhiteU1, nvcWhiteV1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn nvcDraw(first, 6, colour)
+EndProcedure
+
+Procedure.i nvcTTCacheFind(slot.i, generation.i, pixelHeight.i, glyph.i)
+  Define i.i
+  For i = 0 To nvcTTCount - 1
+    If nvcTTSlot[i] = slot And nvcTTGen[i] = generation And nvcTTHeight[i] = pixelHeight And nvcTTGlyph[i] = glyph
+      ProcedureReturn i
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i nvcTTFixed16Floor(value.i)
+  If value >= 0 : ProcedureReturn value >> 16 : EndIf
+  ProcedureReturn 0 - (((0 - value) + $FFFF) >> 16)
+EndProcedure
+
+Procedure.i nvcTTCacheClear()
+  Define x.i, y.i, p.i
+  If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 : ProcedureReturn 0 : EndIf
+  For y = 0 To nvcAtlasH - 1
+    p = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (y * nvcAtlasW + 32) * 4
+    For x = 32 To nvcAtlasW - 1
+      PokeL(p, 0) : p + 4
+    Next
+  Next
+  nvcTTCount = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
+  nvcTTDirty = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
+  Define width.i, height.i, stride.i, bearingX.i, bearingY.i, advance.i
+  Define paddedW.i, paddedH.i, x.i, y.i, shelfHeight.i, copyRow.i, col.i, entry.i, p.i
+  If nvcTTCount >= #NEON_VK_CHROME_TT_CACHE_MAX : ProcedureReturn -1 : EndIf
+  If AnvilTrueTypeRasterizeGlyph(glyph, pixelHeight, @nvcTTCoverage[0], #NEON_VK_CHROME_TT_COVERAGE, @width, @height, @stride, @bearingX, @bearingY, @advance) = 0
+    ProcedureReturn -1
+  EndIf
+  If width < 0 Or height < 0 Or stride < width Or stride * height > #NEON_VK_CHROME_TT_COVERAGE
+    ProcedureReturn -1
+  EndIf
+  x = nvcTTNextX : y = nvcTTNextY : shelfHeight = nvcTTRowH
+  paddedW = width + 2 : paddedH = height + 2
+  If paddedW > nvcAtlasW - 32 Or paddedH > nvcAtlasH - 1 : ProcedureReturn -1 : EndIf
+  If x + paddedW > nvcAtlasW
+    x = 32 : y = y + shelfHeight : shelfHeight = 0
+  EndIf
+  If y + paddedH > nvcAtlasH : ProcedureReturn -1 : EndIf
+  If width > 0 And height > 0
+    For copyRow = 0 To height - 1
+      For col = 0 To width - 1
+        p = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (((y + 1 + copyRow) * nvcAtlasW + x + 1 + col) * 4)
+        PokeL(p, $00FFFFFF | ((PeekA(@nvcTTCoverage[copyRow * stride + col]) & $FF) << 24))
+      Next
+    Next
+  EndIf
+  entry = nvcTTCount
+  nvcTTSlot[entry] = slot : nvcTTGen[entry] = generation
+  nvcTTHeight[entry] = pixelHeight : nvcTTGlyph[entry] = glyph
+  If width > 0 And height > 0
+    nvcTTX[entry] = x + 1 : nvcTTY[entry] = y + 1
+  Else
+    nvcTTX[entry] = 0 : nvcTTY[entry] = 0
+  EndIf
+  nvcTTW[entry] = width : nvcTTH[entry] = height
+  nvcTTBearingX[entry] = bearingX : nvcTTBearingY[entry] = bearingY : nvcTTAdvance[entry] = advance
+  nvcTTCount = nvcTTCount + 1
+  nvcTTNextX = x + paddedW
+  nvcTTNextY = y
+  If height + 2 > shelfHeight : shelfHeight = height + 2 : EndIf
+  nvcTTRowH = shelfHeight
+  nvcTTDirty = 1 : nvcTTCacheMisses + 1
+  ProcedureReturn entry
+EndProcedure
+
+; Warm complete UTF-8 runs before Begin. The cache key includes slot generation
+; and pixel height; a miss is rasterized once and uploaded as one full-atlas
+; transaction before any frame can reference the new UVs.
+Procedure.i NeonVkChromeWarmTrueTypeText(pixelHeight.i, *s)
+  Define length.i, decoded.i, i.i, slot.i, generation.i, glyph.i, entry.i
+  If nvcReady = 0 Or nvcInFrame <> 0 Or *s = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0 Or pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  While length < 4096 And PeekA(*s + length) <> 0 : length + 1 : Wend
+  If length >= 4096 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  decoded = AnvilTrueTypeDecodeUtf8(*s, length, @nvcTTDecoded[0], #NEON_VK_CHROME_TT_CACHE_MAX * 8)
+  If decoded < 0 Or decoded > #NEON_VK_CHROME_TT_CACHE_MAX * 8
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
+  EndIf
+  If length > 0 And decoded = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  For i = 0 To decoded - 1
+    glyph = nvcTTDecoded[i]
+    entry = nvcTTCacheFind(slot, generation, pixelHeight, glyph)
+    If entry >= 0
+      nvcTTCacheHits + 1
+    Else
+      entry = nvcTTAddGlyph(slot, generation, pixelHeight, glyph)
+      If entry < 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+    EndIf
+  Next
+  If nvcTTDirty <> 0
+    If nvcAtlasUploadWarm() <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
+    nvcTTDirty = 0
+  EndIf
+  ProcedureReturn decoded
+EndProcedure
+
+; Admit a deduplicated grid's glyph IDs before a render pass. The owner may
+; build this list from the shared console grid, then append cached cells in
+; the frame. The single upload here keeps atlas mutations outside the pass.
+Procedure.i NeonVkChromeGridWarm(*glyphs, count.i, pixelHeight.i)
+  Define i.i
+  Define glyph.i
+  Define slot.i
+  Define generation.i
+  Define entry.i
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcGridBatchActive <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If count < 0 Or count > #NEON_VK_CHROME_TT_CACHE_MAX Or pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If count > 0 And *glyphs = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  For i = 0 To count - 1
+    ; Console owners publish packed 32-bit glyph IDs in a `.l` array; `.i`
+    ; is 64-bit in this compiler and would step beyond each element.
+    glyph = PeekL(*glyphs + (i * 4))
+    If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+    entry = nvcTTCacheFind(slot, generation, pixelHeight, glyph)
+    If entry < 0
+      entry = nvcTTAddGlyph(slot, generation, pixelHeight, glyph)
+      If entry < 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+    Else
+      nvcTTCacheHits + 1
+    EndIf
+  Next
+  If nvcTTDirty <> 0
+    If nvcAtlasUploadWarm() <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
+    nvcTTDirty = 0
+  EndIf
+  ProcedureReturn count
+EndProcedure
+
+; Begin a consecutive grid-text batch inside an active frame. A batch records
+; no color until flush, so callers can traverse the grid once per ink color
+; and keep each color in one contiguous vertex range / Vulkan draw.
+Procedure.i NeonVkChromeGridBatchBegin()
+  Define slot.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcMapped = 0 Or nvcGridBatchActive <> 0 Or nvcTTDirty <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcGridBatchSlot = slot
+  nvcGridBatchGeneration = AnvilTrueTypeSlotGeneration(slot)
+  nvcGridBatchFirst = nvcVertices
+  nvcGridBatchActive = 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Reserve the complete grid before the first append. `neededQuads` is a
+; conservative count (including bounded UI quads); a refusal leaves both the
+; vertex cursor and draw cursor unchanged, so callers cannot submit half a grid.
+Procedure.i NeonVkChromeGridBatchReserve(neededQuads.i, drawSegments.i)
+  If nvcInFrame = 0 Or nvcGridBatchActive = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If neededQuads < 0 Or neededQuads > #NEON_VK_CHROME_MAX_VERTEX_QUADS Or drawSegments < 0 Or drawSegments > 2
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcVertices > (nvcMaxVertexQuads - neededQuads) * 6 Or nvcDrawCount > nvcMaxQuads - drawSegments
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Append a previously warmed glyph inside its fixed cell. Preserve the full
+; atlas rectangle: translate a fitting glyph only when its bearing puts it
+; outside the cell, and uniformly shrink oversized bitmap bounds to fit.
+; The cache key is checked exactly; a miss during a render pass fails before
+; touching the vertex buffer because raster/upload is pre-frame work.
+Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i)
+  Define slot.i
+  Define entry.i
+  Define units.i
+  Define ascent.i
+  Define lineHeight.i
+  Define baseline.i
+  Define glyphLeft.i
+  Define glyphTop.i
+  Define glyphRight.i
+  Define glyphBottom.i
+  Define cellRight.i
+  Define cellBottom.i
+  Define glyphW.i
+  Define glyphH.i
+  Define u0.i, v0.i, u1.i, v1.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcMapped = 0 Or nvcGridBatchActive = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If pixelHeight < 1 Or pixelHeight > 512 Or cellW < 1 Or cellH < 1 Or glyph < 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot <> nvcGridBatchSlot
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If AnvilTrueTypeSlotParserBound() = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If AnvilTrueTypeSlotGeneration(slot) <> nvcGridBatchGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  entry = nvcTTCacheFind(slot, nvcGridBatchGeneration, pixelHeight, glyph)
+  If entry < 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  If nvcTTW[entry] = 0 Or nvcTTH[entry] = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcVertices > (nvcMaxVertexQuads * 6) - 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  units = AnvilTrueTypeUnitsPerEm()
+  If units < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  ascent = (AnvilTrueTypeAscender() * pixelHeight) / units
+  lineHeight = ((AnvilTrueTypeAscender() - AnvilTrueTypeDescender()) * pixelHeight) / units
+  baseline = cellY + ((cellH - lineHeight) / 2) + ascent
+  glyphLeft = cellX + ((cellW - nvcTTAdvance[entry]) / 2) + nvcTTBearingX[entry]
+  glyphTop = baseline - nvcTTBearingY[entry]
+  glyphW = nvcTTW[entry] : glyphH = nvcTTH[entry]
+  cellRight = cellX + cellW : cellBottom = cellY + cellH
+  If glyphW > cellW Or glyphH > cellH
+    ; Pick the limiting axis and apply one uniform scale. Keep the complete
+    ; source UV range so narrow console cells cannot cut off glyph strokes.
+    If cellW * glyphH < cellH * glyphW
+      glyphW = cellW : glyphH = (nvcTTH[entry] * glyphW) / nvcTTW[entry]
+    Else
+      glyphH = cellH : glyphW = (nvcTTW[entry] * glyphH) / nvcTTH[entry]
+    EndIf
+    If glyphW < 1 : glyphW = 1 : EndIf
+    If glyphH < 1 : glyphH = 1 : EndIf
+    If glyphW > cellW : glyphW = cellW : EndIf
+    If glyphH > cellH : glyphH = cellH : EndIf
+    glyphLeft = cellX + ((cellW - glyphW) / 2)
+    glyphTop = cellY + ((cellH - glyphH) / 2)
+  Else
+    ; Preserve the existing baseline/advance placement unless its bitmap
+    ; extends beyond a cell edge; then move it only as far as needed.
+    If glyphLeft < cellX : glyphLeft = cellX : EndIf
+    If glyphLeft + glyphW > cellRight : glyphLeft = cellRight - glyphW : EndIf
+    If glyphTop < cellY : glyphTop = cellY : EndIf
+    If glyphTop + glyphH > cellBottom : glyphTop = cellBottom - glyphH : EndIf
+  EndIf
+  glyphRight = glyphLeft + glyphW : glyphBottom = glyphTop + glyphH
+  u0 = neon_F32Ratio(nvcTTX[entry], nvcAtlasW)
+  v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
+  u1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
+  v1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
+  nvcQuad(nvcVertices, glyphLeft, glyphTop, glyphRight, glyphBottom, u0, v0, u1, v1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Flush only the vertices appended since the last flush, then advance the
+; segment boundary. Empty style passes consume no Vulkan draw record.
+Procedure.i NeonVkChromeGridBatchFlush(colour.i)
+  Define count.i
+  Define rc.i
+  If nvcInFrame = 0 Or nvcGridBatchActive = 0 Or nvcGridBatchFirst > nvcVertices
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  count = nvcVertices - nvcGridBatchFirst
+  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If (count % 6) <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  rc = nvcDraw(nvcGridBatchFirst, count, colour)
+  If rc = #NEON_VK_CHROME_OK : nvcGridBatchFirst = nvcVertices : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i NeonVkChromeGridBatchEnd()
+  If nvcInFrame = 0 Or nvcGridBatchActive = 0 Or nvcGridBatchFirst <> nvcVertices
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcGridBatchActive = 0 : nvcGridBatchFirst = nvcVertices
+  nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeVertexQuadCapacity()
+  ProcedureReturn nvcMaxVertexQuads
+EndProcedure
+
+Procedure.i NeonVkChromeTrueTypeSize(pixelHeight.i)
+  If pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  nvcTTFontPixels = pixelHeight
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Optional per-Neon-face pixel-height override for the regular Neon_Text
+; callback. Zero restores a live Neon_LineHeight(font) lookup, which tracks
+; face scaling such as the touch keyboard. Direct TrueType callers continue
+; to use NeonVkChromeTrueTypeSize/NeonVkChromeTrueTypeText unchanged.
+Procedure.i NeonVkChromeFontHeightSet(font.i, pixelHeight.i)
+  If font < 0 Or font > 3 Or pixelHeight < 0 Or pixelHeight > 512
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  nvcTTFontHeight[font] = pixelHeight
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Resolve the same size as NeonVkChromeText. Use Neon's raw bitmap line height
+; for the scaled Mono face, so this remains safe when the measurement hook is
+; active and cannot recurse through Neon_LineHeight.
+Procedure.i nvcTTFontHeightFor(font.i)
+  Define pixels.i
+  If font < 0 Or font > 3 : ProcedureReturn 0 : EndIf
+  If nvcTTFontHeight[font] > 0
+    pixels = nvcTTFontHeight[font]
+  ElseIf font = #NEON_FONT_MONO
+    pixels = NeonBitmapLineHeight(font)
+  Else
+    pixels = AnvilTrueTypePixelHeight()
+    If pixels < 1 : pixels = NeonBitmapLineHeight(font) : EndIf
+  EndIf
+  If pixels < 1 Or pixels > 512 : ProcedureReturn 0 : EndIf
+  ProcedureReturn pixels
+EndProcedure
+
+; Owner prewarm callers use this to match per-face drawing exactly without
+; confusing the TT pixel raster size with the widget line-box height.
+Procedure.i NeonVkChromeFontPixelHeight(font.i)
+  ProcedureReturn nvcTTFontHeightFor(font)
+EndProcedure
+
+; UTF-8 width with the same pair positioning used by the draw callback. This
+; path is intentionally CPU-only: it does not rasterize or touch the atlas.
+Procedure.i NeonVkChromeMeasureWidth(font.i, *s)
+  Define length.i, pixels.i, count.i, lines.i, measured.i
+  If *s = 0 Or AnvilTrueTypeSlotSelected() < 0 Or AnvilTrueTypeSlotParserBound() = 0
+    ProcedureReturn -1
+  EndIf
+  pixels = nvcTTFontHeightFor(font)
+  If pixels < 1 Or AnvilTrueTypeMetricsOpenState() = 0 Or AnvilTrueTypeCmapOpenState() = 0
+    ProcedureReturn -1
+  EndIf
+  While length < 4096 And PeekA(*s + length) <> 0 : length + 1 : Wend
+  If length >= 4096 : ProcedureReturn -1 : EndIf
+  If AnvilTrueTypeLayoutUtf8(*s, length, pixels, 0, pixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured) = 0
+    ProcedureReturn -1
+  EndIf
+  If measured <= 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn (measured + 65535) / 65536
+EndProcedure
+
+Procedure.i NeonVkChromeMeasureLineHeight(font.i)
+  Define pixels.i
+  If AnvilTrueTypeSlotSelected() < 0 Or AnvilTrueTypeSlotParserBound() = 0
+    ProcedureReturn -1
+  EndIf
+  pixels = nvcTTFontHeightFor(font)
+  If pixels < 1 Or AnvilTrueTypeMetricsOpenState() = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn pixels + 2
+EndProcedure
+
+Procedure.i NeonVkChromeAtlasUploadCount()
+  ProcedureReturn nvcAtlasUploadCount
+EndProcedure
+
+; Explicit whole-cache eviction is allowed only between frames. Callers that
+; need a different resident set reset once, then prewarm every run needed by
+; the upcoming frame before Begin; no queued quad can reference evicted texels.
+Procedure.i NeonVkChromeTTCacheReset()
+  If nvcReady = 0 Or nvcInFrame <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcTTCacheClear() = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ; The next warm call uploads the reset page and all newly packed glyphs once.
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeFrameRasterDelta()
+  ProcedureReturn AnvilTrueTypeRasterCount() - nvcAtlasRasterCountAtFrame
+EndProcedure
+
+Procedure.i NeonVkChromeFrameUploadDelta()
+  ProcedureReturn nvcAtlasUploadCount - nvcAtlasUploadAtFrame
+EndProcedure
+
+Procedure.i NeonVkChromeTTCacheHits()
+  ProcedureReturn nvcTTCacheHits
+EndProcedure
+
+Procedure.i NeonVkChromeTTCacheMisses()
+  ProcedureReturn nvcTTCacheMisses
+EndProcedure
+
+Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
+  Define length.i, i.i, slot.i, generation.i, entry.i, rc.i
+  Define count.i, lines.i, measured.i, visible.i, maxWidth.i, originX.i, baseline.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
+  nvcTTErrorStage = 0 : nvcTTUnitsProbe = 0 : nvcTTCountProbe = 0
+  nvcTTLinesProbe = 0 : nvcTTMeasuredProbe = 0 : nvcTTMetricsStateProbe = 0
+  If nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcTTDirty <> 0 : nvcTTErrorStage = 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0 : nvcTTErrorStage = 2 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  While length < 4096 And PeekA(*s + length) <> 0 : length + 1 : Wend
+  If length >= 4096 : nvcTTErrorStage = 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  maxWidth = nvcWidth - x
+  If maxWidth < 1 : maxWidth = 1 : EndIf
+  If maxWidth > 32767 : maxWidth = 32767 : EndIf
+  rc = AnvilTrueTypeLayoutUtf8(*s, length, nvcTTFontPixels, maxWidth, nvcTTFontPixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured)
+  nvcTTLayoutRc = rc
+  nvcTTLayoutError = AnvilTrueTypeLayoutError()
+  nvcTTCountProbe = count : nvcTTLinesProbe = lines : nvcTTMeasuredProbe = measured
+  nvcTTMetricsStateProbe = AnvilTrueTypeMetricsOpenState()
+  If rc = 0 Or count < 0 Or count > #NEON_VK_CHROME_TT_RUN_GLYPHS : nvcTTErrorStage = 4 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  For i = 0 To count - 1
+    entry = nvcTTCacheFind(slot, generation, nvcTTFontPixels, nvcTTLayoutGlyph[i])
+    If entry < 0 : nvcTTErrorStage = 5 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+    If nvcTTW[entry] > 0 And nvcTTH[entry] > 0 : visible + 1 : EndIf
+  Next
+  If visible = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + visible * 6 > nvcMaxVertexQuads * 6
+    nvcTTErrorStage = 6 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  units = AnvilTrueTypeUnitsPerEm()
+  nvcTTUnitsProbe = units
+  If units < 1 : nvcTTErrorStage = 7 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  lineAscent = (AnvilTrueTypeAscender() * nvcTTFontPixels) / units
+  first = nvcVertices
+  For i = 0 To count - 1
+    entry = nvcTTCacheFind(slot, generation, nvcTTFontPixels, nvcTTLayoutGlyph[i])
+    If nvcTTW[entry] > 0 And nvcTTH[entry] > 0
+      uv0 = neon_F32Ratio(nvcTTX[entry], nvcAtlasW)
+      uv1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
+      vv0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
+      vv1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
+      originX = x + nvcTTFixed16Floor(nvcTTLayoutX[i])
+      baseline = y + lineAscent - nvcTTFixed16Floor(nvcTTLayoutY[i])
+      nvcQuad(nvcVertices, originX + nvcTTBearingX[entry], baseline - nvcTTBearingY[entry], originX + nvcTTBearingX[entry] + nvcTTW[entry], baseline - nvcTTBearingY[entry] + nvcTTH[entry], uv0, vv0, uv1, vv1)
+      nvcVertices + 6
+    EndIf
+  Next
+  If visible = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  rc = nvcDraw(first, visible * 6, colour)
+  If rc <> #NEON_VK_CHROME_OK : nvcTTErrorStage = 8 : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i NeonVkChromeTrueTypeText(pixelHeight.i, x.i, y.i, *s, colour.i)
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcTTFontPixels = pixelHeight
+  ProcedureReturn nvcTTText(x, y, *s, colour)
+EndProcedure
+
+; One NUL-terminated Neon text call becomes one ordered Vulkan draw containing
+; every supported glyph quad, including the transparent atlas cell for space.
+Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
+  Define uv.NeonAtlasGlyphUV
+  Define i.i
+  Define ch.i
+  Define cx.i
+  Define first.i
+  Define count.i
+  Define glyphCount.i
+  Define adv.i
+  Define cellH.i
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If AnvilTrueTypeSlotSelected() >= 0
+    If font < 0 Or font > 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+    nvcTTFontPixels = nvcTTFontHeightFor(font)
+    If nvcTTFontPixels < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+    ProcedureReturn nvcTTText(x, y, *s, colour)
+  EndIf
+  adv = Neon_CharWidth(font) : cellH = Neon_LineHeight(font)
+  If adv < 1 Or cellH < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  ; Count the complete immutable run first. A capacity refusal must not leave
+  ; half a string in reusable storage or advance either ordered cursor.
+  i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
+        glyphCount = glyphCount + 1
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  first = nvcVertices : cx = x : i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
+        If nvcAtlasMapBitmapUV(@uv) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
+        nvcVertices = nvcVertices + 6 : count = count + 6
+      EndIf
+      cx = cx + adv
+    EndIf
+    i = i + 1
+  Wend
+  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ProcedureReturn nvcDraw(first, count, colour)
+EndProcedure
+
+; Fan and line builders retain only bounded logical points. End performs one
+; complete capacity preflight, writes triangle-list geometry, then appends one
+; ordered Vulkan draw. FanOutline deliberately keeps the fan cursor alive so
+; the existing outline-then-fill call order reuses the same logical points.
+Procedure.i NeonVkChromeFanBegin()
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcPathKind = #NVC_PATH_FAN : nvcPathCount = 0 : nvcPathError = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure NeonVkChromeFanPoint(x.i, y.i)
+  If nvcPathKind <> #NVC_PATH_FAN
+    nvcPathError = #NEON_VK_CHROME_ERR_STATE
+    nvcFail(nvcPathError)
+    ProcedureReturn
+  EndIf
+  If nvcPathCount >= #NEON_VK_CHROME_MAX_PATH_POINTS
+    nvcPathError = #NEON_VK_CHROME_ERR_CAPACITY
+    nvcFail(nvcPathError)
+    ProcedureReturn
+  EndIf
+  nvcPathX[nvcPathCount] = x : nvcPathY[nvcPathCount] = y
+  nvcPathCount = nvcPathCount + 1
+EndProcedure
+
+Procedure.i NeonVkChromeFanOutline(colour.i)
+  Define first.i
+  Define needed.i
+  Define i.i
+  Define j.i
+  If nvcPathKind <> #NVC_PATH_FAN : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcPathError <> 0 : ProcedureReturn nvcPathError : EndIf
+  If nvcPathCount < 2 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  needed = nvcPathCount * 6
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  first = nvcVertices : i = 0
+  While i < nvcPathCount
+    j = i + 1 : If j = nvcPathCount : j = 0 : EndIf
+    nvcLineQuad(nvcPathX[i], nvcPathY[i], nvcPathX[j], nvcPathY[j])
+    nvcVertices = nvcVertices + 6 : i = i + 1
+  Wend
+  ProcedureReturn nvcDraw(first, needed, colour)
+EndProcedure
+
+Procedure.i NeonVkChromeFanEnd(colour.i)
+  Define first.i
+  Define needed.i
+  Define i.i
+  Define rc.i
+  If nvcPathKind <> #NVC_PATH_FAN : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcPathError <> 0
+    rc = nvcPathError
+  ElseIf nvcPathCount < 3
+    rc = #NEON_VK_CHROME_OK
+  Else
+    needed = (nvcPathCount - 2) * 3
+    If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+      rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+    Else
+      first = nvcVertices : i = 1
+      While i < nvcPathCount - 1
+        nvcSolidTriangle(nvcVertices, nvcPathX[0], nvcPathY[0], nvcPathX[i], nvcPathY[i], nvcPathX[i + 1], nvcPathY[i + 1])
+        nvcVertices = nvcVertices + 3 : i = i + 1
+      Wend
+      rc = nvcDraw(first, needed, colour)
+    EndIf
+  EndIf
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i NeonVkChromeLinesBegin()
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcPathKind = #NVC_PATH_LINES : nvcPathCount = 0 : nvcPathError = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure NeonVkChromeLine(x0.i, y0.i, x1.i, y1.i)
+  If nvcPathKind <> #NVC_PATH_LINES
+    nvcPathError = #NEON_VK_CHROME_ERR_STATE
+    nvcFail(nvcPathError)
+    ProcedureReturn
+  EndIf
+  If nvcPathCount + 2 > #NEON_VK_CHROME_MAX_PATH_POINTS
+    nvcPathError = #NEON_VK_CHROME_ERR_CAPACITY
+    nvcFail(nvcPathError)
+    ProcedureReturn
+  EndIf
+  nvcPathX[nvcPathCount] = x0 : nvcPathY[nvcPathCount] = y0
+  nvcPathX[nvcPathCount + 1] = x1 : nvcPathY[nvcPathCount + 1] = y1
+  nvcPathCount = nvcPathCount + 2
+EndProcedure
+
+Procedure.i NeonVkChromeLinesEnd(colour.i)
+  Define first.i
+  Define needed.i
+  Define i.i
+  Define rc.i
+  If nvcPathKind <> #NVC_PATH_LINES : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcPathError <> 0
+    rc = nvcPathError
+  ElseIf nvcPathCount < 2
+    rc = #NEON_VK_CHROME_OK
+  Else
+    needed = (nvcPathCount / 2) * 6
+    If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+      rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+    Else
+      first = nvcVertices : i = 0
+      While i < nvcPathCount
+        nvcLineQuad(nvcPathX[i], nvcPathY[i], nvcPathX[i + 1], nvcPathY[i + 1])
+        nvcVertices = nvcVertices + 6 : i = i + 2
+      Wend
+      rc = nvcDraw(first, needed, colour)
+    EndIf
+  EndIf
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+  ProcedureReturn rc
+EndProcedure
+
+; Vulkan scissors use framebuffer coordinates. Legal negative/out-of-bounds
+; rectangles are intersected in signed 64-bit arithmetic, preventing x+w
+; overflow; an empty intersection becomes the Vulkan zero-size collapse.
+Procedure NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
+  Define x0.q : Define y0.q : Define spanX.q : Define spanY.q
+  x0 = x : y0 = y : spanX = w : spanY = h
+  If w <= 0 Or h <= 0
+    nvcClipX = 0 : nvcClipY = 0 : nvcClipW = 0 : nvcClipH = 0
+    ProcedureReturn
+  EndIf
+  ; Clip negative origins by subtracting from the positive span before doing
+  ; any endpoint addition. This stays defined even for hostile INT64 extrema.
+  If x0 < 0
+    If x0 <= (0 - spanX) : spanX = 0 : Else : spanX = spanX + x0 : EndIf
+    x0 = 0
+  EndIf
+  If y0 < 0
+    If y0 <= (0 - spanY) : spanY = 0 : Else : spanY = spanY + y0 : EndIf
+    y0 = 0
+  EndIf
+  If x0 >= nvcWidth Or y0 >= nvcHeight Or spanX <= 0 Or spanY <= 0
+    nvcClipX = 0 : nvcClipY = 0 : nvcClipW = 0 : nvcClipH = 0
+  Else
+    If spanX > (nvcWidth - x0) : spanX = nvcWidth - x0 : EndIf
+    If spanY > (nvcHeight - y0) : spanY = nvcHeight - y0 : EndIf
+    If nvcRotation = 90
+      nvcClipX = nvcLogicalH - (y0 + spanY) : nvcClipY = x0
+      nvcClipW = spanY : nvcClipH = spanX
+    ElseIf nvcRotation = 180
+      nvcClipX = nvcLogicalW - (x0 + spanX) : nvcClipY = nvcLogicalH - (y0 + spanY)
+      nvcClipW = spanX : nvcClipH = spanY
+    ElseIf nvcRotation = 270
+      nvcClipX = y0 : nvcClipY = nvcLogicalW - (x0 + spanX)
+      nvcClipW = spanY : nvcClipH = spanX
+    Else
+      nvcClipX = x0 : nvcClipY = y0 : nvcClipW = spanX : nvcClipH = spanY
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure NeonVkChromeScissorClear()
+  nvcClipX = 0 : nvcClipY = 0 : nvcClipW = nvcPhysicalW : nvcClipH = nvcPhysicalH
+EndProcedure
+
+Procedure.i NeonVkChromeEnd()
+  Define rc.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcGridBatchActive <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  ; The current backend requires at least one draw in a render pass. An empty
+  ; chrome frame still owns a clear/present transaction, so record one fully
+  ; transparent quad; blending makes it a visual no-op.
+  If nvcDrawCount = 0
+    rc = NeonVkChromeBox(0, 0, nvcWidth, nvcHeight, 0)
+  EndIf
+  vkCmdEndRenderPass(nvcCommand)
+  If nvcMapped <> 0
+    vkUnmapMemory(nvcDevice, nvcVertexMemory) : nvcMapped = 0
+  EndIf
+  nvcSubmitStage = 1 : nvcSubmitRc = rc
+  If rc = #VK_SUCCESS : rc = vkEndCommandBuffer(nvcCommand) : nvcSubmitRc = rc : EndIf
+  If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
+  nvcInFrame = 0
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  nvcNextFrameSequence = nvcNextFrameSequence + 1
+  If nvdWsiEnabled() <> 0
+    If nvdWsiMarkReady() <> #VK_SUCCESS : nvdWsiRollback() : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+    If nvdWsiReserve() <> #VK_SUCCESS : nvdWsiRollback() : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+    If nvdWsiCommit() <> #VK_SUCCESS : nvdWsiRollback() : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  EndIf
+  If nvdPresentPublish(nvcTargetGeneration, nvcFramebuffer, nvcNextFrameSequence, nvcLogicalW, nvcLogicalH, nvcPhysicalW, nvcPhysicalH, nvcPitch, nvcRotation) = 0
+    If nvdWsiEnabled() <> 0 : nvdWsiRollback() : EndIf
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure NeonVkChromeDestroy()
+  Define cmd.i
+  nvdWsiRollback()
+  nvdPresentClear()
+  If nvcHooksInstalled <> 0
+    NeonDrawBackendClear()
+    nvcHooksInstalled = 0
+  EndIf
+  If nvcMapped <> 0 And nvcDevice <> 0 And nvcVertexMemory <> 0
+    vkUnmapMemory(nvcDevice, nvcVertexMemory)
+  EndIf
+  nvcMapped = 0 : nvcInFrame = 0 : nvcReady = 0
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+  If nvcDevice <> 0
+    vkDeviceWaitIdle(nvcDevice)
+    If nvcPipeline <> 0 : vkDestroyPipeline(nvcDevice, nvcPipeline, 0) : EndIf
+    If nvcPipelineLayout <> 0 : vkDestroyPipelineLayout(nvcDevice, nvcPipelineLayout, 0) : EndIf
+    If nvcDescriptorPool <> 0 : vkDestroyDescriptorPool(nvcDevice, nvcDescriptorPool, 0) : EndIf
+    If nvcSetLayout <> 0 : vkDestroyDescriptorSetLayout(nvcDevice, nvcSetLayout, 0) : EndIf
+    If nvcSampler <> 0 : vkDestroySampler(nvcDevice, nvcSampler, 0) : EndIf
+    If nvcAtlasView <> 0 : vkDestroyImageView(nvcDevice, nvcAtlasView, 0) : EndIf
+    If nvcAtlasUploadMapped <> 0 And nvcUploadMemory <> 0
+      vkUnmapMemory(nvcDevice, nvcUploadMemory) : nvcAtlasUploadMapped = 0
+    EndIf
+    If nvcUploadBuffer <> 0 : vkDestroyBuffer(nvcDevice, nvcUploadBuffer, 0) : EndIf
+    If nvcUploadMemory <> 0 : vkFreeMemory(nvcDevice, nvcUploadMemory, 0) : EndIf
+    If nvcAtlasImage <> 0 : vkDestroyImage(nvcDevice, nvcAtlasImage, 0) : EndIf
+    If nvcAtlasMemory <> 0 : vkFreeMemory(nvcDevice, nvcAtlasMemory, 0) : EndIf
+    If nvcUniformBuffer <> 0 : vkDestroyBuffer(nvcDevice, nvcUniformBuffer, 0) : EndIf
+    If nvcUniformMemory <> 0 : vkFreeMemory(nvcDevice, nvcUniformMemory, 0) : EndIf
+    If nvcVertexBuffer <> 0 : vkDestroyBuffer(nvcDevice, nvcVertexBuffer, 0) : EndIf
+    If nvcVertexMemory <> 0 : vkFreeMemory(nvcDevice, nvcVertexMemory, 0) : EndIf
+    If nvcFence <> 0 : vkDestroyFence(nvcDevice, nvcFence, 0) : EndIf
+    If nvcCommand <> 0 And nvcCommandPool <> 0
+      cmd = nvcCommand
+      vkFreeCommandBuffers(nvcDevice, nvcCommandPool, 1, @cmd)
+    EndIf
+  EndIf
+  nvcCommand = 0 : nvcFence = 0 : nvcPipeline = 0 : nvcPipelineLayout = 0
+  nvcDescriptorSet = 0 : nvcDescriptorPool = 0 : nvcSetLayout = 0
+  nvcSampler = 0 : nvcAtlasView = 0 : nvcAtlasImage = 0 : nvcAtlasMemory = 0
+  nvcUploadBuffer = 0 : nvcUploadMemory = 0
+  nvcUniformBuffer = 0 : nvcUniformMemory = 0 : nvcVertexBuffer = 0 : nvcVertexMemory = 0
+  nvcPhysical = 0 : nvcDevice = 0 : nvcQueue = 0 : nvcCommandPool = 0
+  nvcRenderPass = 0 : nvcFramebuffer = 0 : nvcWidth = 0 : nvcHeight = 0
+  nvcLogicalW = 0 : nvcLogicalH = 0 : nvcPhysicalW = 0 : nvcPhysicalH = 0 : nvcPitch = 0 : nvcRotation = 0
+  nvcMaxQuads = 0 : nvcMaxVertexQuads = 0 : nvcVertices = 0 : nvcDrawCount = 0
+  nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
+  nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
+  nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0
+  nvcTTCount = 0 : nvcTTDirty = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
+  nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
+  nvcTargetGeneration = 0
+EndProcedure

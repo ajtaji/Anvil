@@ -1,0 +1,902 @@
+; Pi 3 Model B Wi-Fi association adapter.
+;
+; This file deliberately owns no SDIO, storage, settings implementation or
+; IP stack. The board must first identify/attach the radio and load the
+; exact selected firmware profile. It then supplies the validated station MAC
+; selected by the firmware DTB/OTP policy. The functions below use the shared scan/retry and
+; WPA2 supplicant/crypto code with Pi 3's native hardware RNG.
+
+#PI3_WIFI_RSN_IE_LEN = 22
+#PI3_WIFI_RSN_IE_MAX = 160
+#PI3_WIFI_JOIN_SLICE_MS = 100
+#PI3_WIFI_JOIN_SLICES = 50
+#PI3_WIFI_EAPOL_M1_MS = 5000
+#PI3_WIFI_EAPOL_M3_MS = 5000
+#PI3_WIFI_REKEY_NONCE_WAIT_US = 50000
+; Automatic association is a prompt-service state machine. Scan, join, EAPOL
+; and key-control waits each occupy their own bounded service turn; PBKDF2 uses
+; the shared stepped engine instead of the synchronous 4096-iteration call.
+; A failed complete pass waits before rescanning, so an absent AP cannot turn
+; the prompt into a tight retry loop.
+#PI3_WIFI_AUTO_IDLE          = 0
+#PI3_WIFI_AUTO_RNG           = 1
+#PI3_WIFI_AUTO_RSN            = 2
+#PI3_WIFI_AUTO_SECITEM        = 3
+#PI3_WIFI_AUTO_SCAN_START     = 4
+#PI3_WIFI_AUTO_SCAN_POLL      = 5
+#PI3_WIFI_AUTO_SELECT         = 6
+#PI3_WIFI_AUTO_PMK_BEGIN      = 7
+#PI3_WIFI_AUTO_PMK_STEP       = 8
+#PI3_WIFI_AUTO_DISASSOC       = 9
+#PI3_WIFI_AUTO_QUIET          = 10
+#PI3_WIFI_AUTO_JOIN_START     = 11
+#PI3_WIFI_AUTO_JOIN_POLL      = 12
+#PI3_WIFI_AUTO_VERIFY         = 13
+#PI3_WIFI_AUTO_ASSOC_IE       = 14
+#PI3_WIFI_AUTO_EAPOL_BEGIN    = 15
+#PI3_WIFI_AUTO_EAPOL_RX       = 16
+#PI3_WIFI_AUTO_EAPOL_TX       = 17
+#PI3_WIFI_AUTO_INSTALL_PTK    = 18
+#PI3_WIFI_AUTO_INSTALL_GTK    = 19
+#PI3_WIFI_AUTO_READY          = 20
+#PI3_WIFI_AUTO_BACKOFF        = 21
+#PI3_WIFI_AUTO_FAILED         = 22
+#PI3_WIFI_AUTO_SCAN_SLICE_MS  = 50
+#PI3_WIFI_AUTO_JOIN_SLICE_MS  = 100
+#PI3_WIFI_AUTO_EAPOL_SLICE_MS = 60
+#PI3_WIFI_AUTO_SCAN_SLICES    = 100
+#PI3_WIFI_AUTO_JOIN_SLICES    = 50
+#PI3_WIFI_AUTO_PBKDF_PRFS     = 16
+#PI3_WIFI_AUTO_RETRY_MS       = 60000
+#PI3_WIFI_AUTO_QUIET_MS       = 120
+
+Global pi3_wifi_assoc_keyed.i
+Global pi3_wifi_assoc_stage.i
+Global Dim pi3_wifi_assoc_mac.a[6]
+Global Dim pi3_wifi_assoc_apmac.a[6]
+Global Dim pi3_wifi_assoc_snonce.a[32]
+Global Dim pi3_wifi_assoc_pmk.a[32]
+Global Dim pi3_wifi_assoc_rsn.a[#PI3_WIFI_RSN_IE_MAX]
+Global pi3_wifi_assoc_rsn_len.i
+Global Dim pi3_wifi_assoc_join_ssid.a[32]
+Global pi3_wifi_assoc_join_ssid_len.i
+Global *pi3_wifi_assoc_progressFn
+Global pi3_wifi_auto_phase.i = #PI3_WIFI_AUTO_IDLE
+Global pi3_wifi_auto_result.i = 0
+Global pi3_wifi_auto_error.i = 0
+Global pi3_wifi_auto_progressFn.i = 0
+Global pi3_wifi_auto_at.i = 0
+Global pi3_wifi_auto_slices.i = 0
+Global pi3_wifi_auto_found.i = 0
+Global pi3_wifi_auto_index.i = 0
+Global pi3_wifi_auto_band.i = 0
+Global pi3_wifi_auto_slot.i = 0
+Global pi3_wifi_auto_attempt.i = 0
+Global pi3_wifi_auto_secitem.i = 0
+Global pi3_wifi_auto_event_base.i = 0
+Global pi3_wifi_auto_passLen.i = 0
+Global pi3_wifi_auto_ssidLen.i = 0
+Global pi3_wifi_auto_sendPending.i = 0
+Global pi3_wifi_auto_settings_revision.i = 0
+Global Dim pi3_wifi_auto_pass.a[#WPA2_PASS_MAX + 1]
+Global Dim pi3_wifi_auto_ssid.a[33]
+Global pi3_wifi_assoc_eapol_seen.i
+Global pi3_wifi_assoc_eapol_errors.i
+Global pi3_wifi_assoc_ptk_rekeys.i
+Global pi3_wifi_assoc_gtk_rekeys.i
+Global pi3_wifi_ip_started.i
+
+DataSection
+  pi3_wifi_assoc_default_rsn:
+  Data.b $30, $14, $01, $00
+  Data.b $00, $0F, $AC, $04
+  Data.b $01, $00, $00, $0F, $AC, $04
+  Data.b $01, $00, $00, $0F, $AC, $02
+  Data.b $0C, $00
+EndDataSection
+
+Procedure Pi3WifiAssocWipeCandidate()
+  Protected i.i
+  For i = 0 To 31
+    pi3_wifi_assoc_pmk[i] = 0
+  Next
+  Pbkdf2Wipe()
+EndProcedure
+
+Procedure Pi3WifiAssocWipeHandshake()
+  Protected i.i
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  For i = 0 To 31 : pi3_wifi_assoc_snonce[i] = 0 : Next
+EndProcedure
+
+; A failed handshake wipes its nonce. Generate a new nonce for each
+; handshake callback, including retries of the same SSID.
+Procedure.i Pi3WifiAssocNewSnonceBounded(timeoutUs.i)
+  Protected i.i, n.i, nonzero.i
+  If timeoutUs < 1 Or timeoutUs > #PI3_WIFI_RNG_MAX_WAIT_US
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 31 : pi3_wifi_assoc_snonce[i] = 0 : Next
+  n = Pi3WifiRngBytes(@pi3_wifi_assoc_snonce[0], 32, timeoutUs)
+  If n <> 32
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn 0
+  EndIf
+  nonzero = 0
+  For i = 0 To 31
+    If pi3_wifi_assoc_snonce[i] <> 0 : nonzero = 1 : EndIf
+  Next
+  If nonzero = 0
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3WifiAssocNewSnonce()
+  ProcedureReturn Pi3WifiAssocNewSnonceBounded(#PI3_WIFI_RNG_MAX_WAIT_US)
+EndProcedure
+
+; Use the validated station MAC resolved by the firmware DTB/OTP policy.
+; A caller cannot start WPA2 without a real unicast station address.
+Procedure.i Pi3WifiAssocSecuritySetup(*mac)
+  Protected i.i
+  If *mac = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To 5
+    pi3_wifi_assoc_mac[i] = PeekA(*mac + i)
+  Next
+  If Pi3WifiMacValid(@pi3_wifi_assoc_mac[0]) = 0 : ProcedureReturn 0 : EndIf
+  If Pi3WifiRngStart() <> #PI3_WIFI_RNG_READY : ProcedureReturn 0 : EndIf
+  If Cyw43SetWpaIe(?pi3_wifi_assoc_default_rsn, #PI3_WIFI_RSN_IE_LEN, 2000) <> 0
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 3
+    If Cyw43SecItem(i, 2000) <> 0 : Pi3WifiAssocWipeHandshake() : ProcedureReturn 0 : EndIf
+  Next
+  If Cyw43SecItem(8, 2000) <> 0 : Pi3WifiAssocWipeHandshake() : ProcedureReturn 0 : EndIf
+  Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3WifiAssocFindStored(*ssid, ssidLen.i, *slotOut)
+  If *slotOut = 0
+    ProcedureReturn
+  EndIf
+  PokeL(*slotOut, 0)
+  If *ssid = 0 Or ssidLen < 1 Or ssidLen > 32
+    ProcedureReturn
+  EndIf
+  PokeL(*slotOut, SettingsWifiFindSsid(*ssid))
+EndProcedure
+
+Procedure.i Pi3WifiAssocReadRsnIe()
+  Protected n.i, p.i, i.i, j.i, length.i
+  Protected ieId.i, ieLen.i
+  pi3_wifi_assoc_rsn_len = 0
+  If Cyw43GetAssocReqIes(#PI3_WIFI_RSN_IE_MAX, 2000) <> 0 : ProcedureReturn 0 : EndIf
+  n = Cyw43ReplyLen()
+  p = Cyw43ReplyPtr()
+  If n < 0 Or n > #PI3_WIFI_RSN_IE_MAX Or (n > 0 And p = 0) : ProcedureReturn 0 : EndIf
+  i = 0
+  While i + 2 <= n
+    ieId = PeekA(p + i) & $FF
+    ieLen = PeekA(p + i + 1) & $FF
+    If i + 2 + ieLen > n : ProcedureReturn 0 : EndIf
+    If ieId = 48
+      length = ieLen + 2
+      If length > #PI3_WIFI_RSN_IE_MAX : ProcedureReturn 0 : EndIf
+      For j = 0 To length - 1 : pi3_wifi_assoc_rsn[j] = PeekA(p + i + j) : Next
+      pi3_wifi_assoc_rsn_len = length
+      ProcedureReturn 1
+    EndIf
+    i = i + ieLen + 2
+  Wend
+  ; Firmware may omit the echo; use the exact RSN IE configured above.
+  For i = 0 To #PI3_WIFI_RSN_IE_LEN - 1
+    pi3_wifi_assoc_rsn[i] = PeekA(?pi3_wifi_assoc_default_rsn + i)
+  Next
+  pi3_wifi_assoc_rsn_len = #PI3_WIFI_RSN_IE_LEN
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3WifiAssocSendSup()
+  Protected n.i, src.i, dst.i, i.i
+  n = Wpa2SupTxLen()
+  If n <= 0 : ProcedureReturn -1 : EndIf
+  src = Wpa2SupTxPtr()
+  dst = Cyw43DataPtr()
+  If src = 0 Or dst = 0 : ProcedureReturn -1 : EndIf
+  For i = 0 To n - 1 : PokeA(dst + i, PeekA(src + i)) : Next
+  ProcedureReturn Cyw43Send(n)
+EndProcedure
+
+; Registered with the Wi-Fi HwLink only after a successful association.
+; This follows the Pi 4 receive contract: consume EAPOL before NetInput,
+; use the shared session supplicant for MIC/replay/key-wrap checks, and
+; install keys in the order the peer expects them.
+Procedure.i Pi3WifiAssocServiceEapolFrame(*frame, len.i)
+  Protected result.i, sendResult.i, keyResult.i, n.i, nonzero.i
+  If *frame = 0 Or len < 14
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(*frame + 12) & $FF) <> $88 Or (PeekA(*frame + 13) & $FF) <> $8E
+    ProcedureReturn 0
+  EndIf
+  ; Once this backend owns EAPOL, even malformed frames must not fall
+  ; through to the IP parser as if they were Ethernet payload.
+  If pi3_wifi_assoc_keyed = 0 Or Cyw43Attached() = 0 Or Wpa2SupInSession() = 0
+    ProcedureReturn 1
+  EndIf
+  pi3_wifi_assoc_eapol_seen = pi3_wifi_assoc_eapol_seen + 1
+  If Wpa2SupPeekPtkM1(*frame, len) <> 0
+    ; This is the live RX path, so cap entropy polling to 50 ms. The RNG
+    ; was started before association; if it is no longer producing words,
+    ; consume the request and leave the existing keys untouched.
+    n = Pi3WifiRngBytes(@pi3_wifi_assoc_snonce[0], 32, #PI3_WIFI_REKEY_NONCE_WAIT_US)
+    If n <> 32
+      For n = 0 To 31 : pi3_wifi_assoc_snonce[n] = 0 : Next
+      pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+      ProcedureReturn 1
+    EndIf
+    nonzero = 0
+    For n = 0 To 31
+      If pi3_wifi_assoc_snonce[n] <> 0 : nonzero = 1 : EndIf
+    Next
+    If nonzero = 0
+      For n = 0 To 31 : pi3_wifi_assoc_snonce[n] = 0 : Next
+      pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+      ProcedureReturn 1
+    EndIf
+    Wpa2SupSetSnonce(@pi3_wifi_assoc_snonce[0])
+  EndIf
+
+  result = Wpa2SupHandleSession(*frame, len)
+  If result = #WPA2SUP_SENT_M2
+    If Pi3WifiAssocSendSup() <> 0
+      pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+    EndIf
+  ElseIf result = #WPA2SUP_SENT_M4
+    ; Match the tested Pi 4 order: send M4 before changing the AP's PTK.
+    sendResult = Pi3WifiAssocSendSup()
+    If sendResult = 0
+      keyResult = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+      If keyResult = 0
+        keyResult = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+      EndIf
+      If keyResult = 0
+        Wpa2SupSessionArm()
+        pi3_wifi_assoc_ptk_rekeys = pi3_wifi_assoc_ptk_rekeys + 1
+      Else
+        pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+      EndIf
+    Else
+      pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+    EndIf
+  ElseIf result = #WPA2SUP_SENT_G2
+    ; Group message 2 is sent only after the new GTK is installed.
+    keyResult = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+    If keyResult = 0
+      If Pi3WifiAssocSendSup() = 0
+        pi3_wifi_assoc_gtk_rekeys = pi3_wifi_assoc_gtk_rekeys + 1
+      Else
+        pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+      EndIf
+    Else
+      pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+    EndIf
+  ElseIf result < 0
+    pi3_wifi_assoc_eapol_errors = pi3_wifi_assoc_eapol_errors + 1
+  EndIf
+  For n = 0 To 31 : pi3_wifi_assoc_snonce[n] = 0 : Next
+  Cyw43KeyWipe() : AesWipe() : KwWipe()
+  ProcedureReturn 1
+EndProcedure
+
+; Shared retry policy callback. Writes a Boolean result through the output
+; slot instead of depending on an untyped callback's return-value ABI.
+Procedure Pi3WifiAssocHandshake(*resultOut)
+  Protected n.i, r.i, gotM1.i, gotM3.i, keyed.i, waitMs.i, start.i, j.i, i.i
+  If *resultOut = 0
+    ProcedureReturn
+  EndIf
+  PokeL(*resultOut, 0)
+  If pi3_wifi_join_abort <> 0
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn
+  EndIf
+  If Pi3WifiAssocNewSnonce() = 0
+    ProcedureReturn
+  EndIf
+  For n = 0 To 5 : pi3_wifi_assoc_apmac[n] = 0 : Next
+  If Pi3WifiAssocReadRsnIe() = 0
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn
+  EndIf
+  If Wpa2SupBegin(@pi3_wifi_assoc_pmk[0], @pi3_wifi_assoc_mac[0], @pi3_wifi_assoc_apmac[0], @pi3_wifi_assoc_rsn[0], pi3_wifi_assoc_rsn_len) = 0
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn
+  EndIf
+  Wpa2SupSetSnonce(@pi3_wifi_assoc_snonce[0])
+  gotM1 = 0 : gotM3 = 0 : keyed = 0
+  waitMs = #PI3_WIFI_EAPOL_M1_MS
+  start = millis()
+  While (millis() - start) < waitMs And gotM3 = 0 And pi3_wifi_join_abort = 0
+    n = Cyw43Receive(60)
+    If n >= 14
+      r = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+      If r = #WPA2SUP_SENT_M2
+        r = Pi3WifiAssocSendSup()
+        If r = 0
+          gotM1 = gotM1 + 1
+          start = millis()
+          waitMs = #PI3_WIFI_EAPOL_M3_MS
+        Else
+          Break
+        EndIf
+      ElseIf r = #WPA2SUP_SENT_M4
+        r = Pi3WifiAssocSendSup()
+        If r = 0
+          gotM3 = 1
+          j = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+          r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+          If j = 0 And r = 0 : keyed = 1 : EndIf
+        Else
+          Break
+        EndIf
+      EndIf
+    EndIf
+    Pi3WifiAssocProgress()
+  Wend
+  If keyed <> 0
+    Wpa2SupSessionArm()
+    For i = 0 To 31 : pi3_wifi_assoc_snonce[i] = 0 : Next
+    PokeL(*resultOut, 1)
+  Else
+    Wpa2SupWipe()
+  EndIf
+  Cyw43KeyWipe() : AesWipe() : KwWipe()
+EndProcedure
+
+Procedure Pi3WifiAssocProgress()
+  ; Service is delegated to the board's bounded UART/display/network tick.
+  If pi3_wifi_assoc_progressFn <> 0 : pi3_wifi_assoc_progressFn() : EndIf
+EndProcedure
+
+Procedure Pi3WifiAssocEvent(event.i, attempt.i)
+  pi3_wifi_assoc_stage = event * 10 + attempt
+EndProcedure
+
+Procedure.i Pi3WifiAssocCandidate(slot.i, ssid.i, ssidLen.i)
+  Protected pass.i, passLen.i, r.i
+  If pi3_wifi_join_abort <> 0 : ProcedureReturn 0 : EndIf
+  Pi3WifiAssocWipeCandidate()
+  pass = SettingsWifiSlotPassword(slot)
+  passLen = SettingsLength(SettingsWifiSlotPasswordKey(slot))
+  If pass = 0 Or passLen < #WPA2_PASS_MIN Or passLen > #WPA2_PASS_MAX : ProcedureReturn 0 : EndIf
+  If pi3_wifi_join_abort <> 0 : Pi3WifiAssocWipeCandidate() : ProcedureReturn 0 : EndIf
+  r = Wpa2Psk(pass, passLen, ssid, ssidLen, @pi3_wifi_assoc_pmk[0])
+  Pbkdf2Wipe()
+  If r <> 32 : Pi3WifiAssocWipeCandidate() : ProcedureReturn 0 : EndIf
+  If pi3_wifi_join_abort <> 0 : Pi3WifiAssocWipeCandidate() : ProcedureReturn 0 : EndIf
+  r = AnvilWifiAssociateCandidate(ssid, ssidLen, 2000, #PI3_WIFI_JOIN_SLICE_MS, #PI3_WIFI_JOIN_SLICES, @Pi3WifiAssocHandshake, @Pi3WifiAssocProgress, @Pi3WifiAssocEvent)
+  If pi3_wifi_join_abort <> 0
+    Pi3WifiAssocWipeCandidate()
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn 0
+  EndIf
+  If r <> 0
+    pi3_wifi_assoc_join_ssid_len = ssidLen
+    For r = 0 To ssidLen - 1 : pi3_wifi_assoc_join_ssid[r] = PeekA(ssid + r) : Next
+    pi3_wifi_assoc_keyed = 1
+    Pi3WifiAssocWipeCandidate()
+    ProcedureReturn 1
+  EndIf
+  Pi3WifiAssocWipeCandidate()
+  Pi3WifiAssocWipeHandshake()
+  ProcedureReturn 0
+EndProcedure
+
+; Requires the caller to finish selected radio firmware/WifiUp first and pass
+; the same validated DTB WLAN MAC used to construct runtime NVRAM.
+Procedure.i Pi3WifiJoinKnown(*mac, radioReady.i, *progressFn)
+  Protected slot.i, ssid.i, ssidLen.i, r.i
+  pi3_wifi_assoc_keyed = 0
+  pi3_wifi_assoc_stage = 0
+  pi3_wifi_assoc_progressFn = *progressFn
+  If pi3_wifi_join_abort <> 0 Or radioReady = 0 Or Cyw43Attached() = 0 Or Pi3WifiAssocSecuritySetup(*mac) = 0 : ProcedureReturn 0 : EndIf
+  r = AnvilWifiJoinKnownScan(@Pi3WifiAssocFindStored, @Pi3WifiAssocCandidate, @Pi3WifiAssocProgress, @slot, @ssid, @ssidLen)
+  If pi3_wifi_join_abort <> 0
+    Pi3WifiAssocWipeCandidate()
+    Pi3WifiAssocWipeHandshake()
+    ProcedureReturn 0
+  EndIf
+  If r = 1 And slot <> 0 : ProcedureReturn 1 : EndIf
+  Pi3WifiAssocWipeCandidate()
+  Pi3WifiAssocWipeHandshake()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3WifiAssocKeyed() : ProcedureReturn pi3_wifi_assoc_keyed : EndProcedure
+Procedure.i Pi3WifiAssocStage() : ProcedureReturn pi3_wifi_assoc_stage : EndProcedure
+Procedure.i Pi3WifiAssocEapolSeen() : ProcedureReturn pi3_wifi_assoc_eapol_seen : EndProcedure
+Procedure.i Pi3WifiAssocEapolErrors() : ProcedureReturn pi3_wifi_assoc_eapol_errors : EndProcedure
+Procedure.i Pi3WifiAssocPtkRekeys() : ProcedureReturn pi3_wifi_assoc_ptk_rekeys : EndProcedure
+Procedure.i Pi3WifiAssocGtkRekeys() : ProcedureReturn pi3_wifi_assoc_gtk_rekeys : EndProcedure
+
+; Start the common per-interface DHCP client only after the board has
+; registered Pi3WifiAssocServiceEapolFrame with the HwLink and the shared
+; raw receive path reports the association ready. NetDhcpTick, NetInput,
+; NetServiceInput, and NetAddressBound remain the one common IP path.
+Procedure.i Pi3WifiNetworkStartDhcp()
+  Protected r.i
+  If pi3_wifi_ip_started <> 0
+    ProcedureReturn 1
+  EndIf
+  If Pi3WifiAssocKeyed() = 0 Or HwLinkReady(#HW_LINK_WIFI) = 0
+    ProcedureReturn 0
+  EndIf
+  r = NetDhcpStart(#HW_LINK_WIFI, 1)
+  If r > 0
+    pi3_wifi_ip_started = 1
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; Optional bounded foreground wait for callers that need an address before
+; proceeding. This is the common DHCP transaction; keepRunning leaves its
+; client state active so the prompt can finish it later via the RxTick and
+; shared NetDhcpTick service.
+Procedure.i Pi3WifiNetworkAcquireAddress(waitMs.i)
+  If waitMs < 1 Or waitMs > 60000 : ProcedureReturn 0 : EndIf
+  If Pi3WifiNetworkStartDhcp() <= 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn NetDhcpAcquire(#HW_LINK_WIFI, waitMs, 1)
+EndProcedure
+
+; The shared prompt already advances NetDhcpTick and NetConsolePump. Before
+; Wi-Fi has an IPv4 address it is not in NetIfNext(), so give that interface
+; one bounded receive turn here; once a console owns its receive queue, stand
+; down and let the common pump consume it exactly once.
+Procedure Pi3WifiNetworkRxTick()
+  If pi3_wifi_ip_started = 0 Or Pi3WifiAssocKeyed() = 0
+    ProcedureReturn
+  EndIf
+  If NetIfRxOwner() = #HW_LINK_WIFI
+    ProcedureReturn
+  EndIf
+  netcon_PumpOne(#HW_LINK_WIFI)
+EndProcedure
+
+Procedure.i Pi3WifiNetworkAddressReady()
+  If pi3_wifi_ip_started = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn NetIfUsable(#HW_LINK_WIFI)
+EndProcedure
+
+Procedure.i Pi3WifiNetworkDhcpState()
+  If pi3_wifi_ip_started = 0 : ProcedureReturn #DHCPC_INIT : EndIf
+  ProcedureReturn DhcpClientState(#HW_LINK_WIFI)
+EndProcedure
+
+Procedure.i Pi3WifiAssocRawHandler()
+  ProcedureReturn @Pi3WifiAssocServiceEapolFrame
+EndProcedure
+
+; Cooperative automatic saved-network connection. Begin performs only bounded
+; in-memory validation; Tick executes one primitive and returns to the prompt.
+; The board owns the watchdog around each Tick and calls this path only after
+; firmware start/MAC policy has completed. A retry waits before rescanning.
+Procedure Pi3WifiAutoWipeCandidate()
+  Protected i.i
+  Pbkdf2StepWipe()
+  Pbkdf2Wipe()
+  For i = 0 To #WPA2_PASS_MAX : pi3_wifi_auto_pass[i] = 0 : Next
+  For i = 0 To 31
+    pi3_wifi_assoc_pmk[i] = 0
+    pi3_wifi_auto_ssid[i] = 0
+  Next
+  pi3_wifi_auto_passLen = 0
+  pi3_wifi_auto_ssidLen = 0
+EndProcedure
+
+Procedure Pi3WifiAutoWipeHandshake()
+  Pi3WifiAssocWipeHandshake()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+EndProcedure
+
+Procedure Pi3WifiAutoFail(code.i)
+  Pi3WifiAutoWipeCandidate()
+  Pi3WifiAutoWipeHandshake()
+  pi3_wifi_assoc_keyed = 0
+  pi3_wifi_auto_error = code
+  pi3_wifi_auto_result = -1
+  pi3_wifi_auto_at = millis()
+  pi3_wifi_auto_phase = #PI3_WIFI_AUTO_BACKOFF
+  pi3_wifi_join_abort = 0
+EndProcedure
+
+Procedure Pi3WifiAutoNextCandidate()
+  Pi3WifiAutoWipeCandidate()
+  Pi3WifiAutoWipeHandshake()
+  pi3_wifi_auto_attempt = 0
+  ; SELECT advanced the scan index when it copied this SSID. Do not advance a
+  ; second time here or a failed stored network would hide the next candidate.
+  pi3_wifi_auto_phase = #PI3_WIFI_AUTO_SELECT
+EndProcedure
+
+Procedure Pi3WifiAutoJoinRetry()
+  Pi3WifiAutoWipeHandshake()
+  If pi3_wifi_auto_attempt = 0
+    pi3_wifi_auto_attempt = 1
+    pi3_wifi_auto_phase = #PI3_WIFI_AUTO_DISASSOC
+  Else
+    Pi3WifiAutoNextCandidate()
+  EndIf
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinBegin(*mac, radioReady.i, *progressFn)
+  Protected i.i
+  If pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_IDLE And pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_FAILED
+    ProcedureReturn 0
+  EndIf
+  If *mac = 0 Or radioReady = 0 Or Cyw43Attached() = 0
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 5
+    pi3_wifi_assoc_mac[i] = PeekA(*mac + i)
+  Next
+  If Pi3WifiMacValid(@pi3_wifi_assoc_mac[0]) = 0
+    ProcedureReturn 0
+  EndIf
+  Pi3WifiAutoWipeCandidate()
+  Pi3WifiAutoWipeHandshake()
+  pi3_wifi_assoc_keyed = 0
+  pi3_wifi_auto_result = 0
+  pi3_wifi_auto_error = 0
+  pi3_wifi_auto_progressFn = *progressFn
+  pi3_wifi_assoc_progressFn = *progressFn
+  pi3_wifi_auto_settings_revision = SettingsWifiRevision()
+  pi3_wifi_join_abort = 0
+  pi3_wifi_auto_phase = #PI3_WIFI_AUTO_RNG
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinActive()
+  ProcedureReturn Bool(pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_IDLE And pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_READY And pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_FAILED)
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinState()
+  ProcedureReturn pi3_wifi_auto_phase
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinResult()
+  ProcedureReturn pi3_wifi_auto_result
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinLastError()
+  ProcedureReturn pi3_wifi_auto_error
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinNeedsWatchdog()
+  ProcedureReturn Pi3WifiAutoPhaseNeedsWatchdog(pi3_wifi_auto_phase)
+EndProcedure
+
+Procedure.i Pi3WifiAutoPhaseNeedsWatchdog(phase.i)
+  Select phase
+    Case #PI3_WIFI_AUTO_RNG
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_RSN
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_SECITEM
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_SCAN_START
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_SCAN_POLL
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_DISASSOC
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_JOIN_START
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_JOIN_POLL
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_VERIFY
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_ASSOC_IE
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_EAPOL_BEGIN
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_EAPOL_RX
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_EAPOL_TX
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_INSTALL_PTK
+      ProcedureReturn 1
+    Case #PI3_WIFI_AUTO_INSTALL_GTK
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Pi3WifiAutoJoinCancel()
+  If pi3_wifi_auto_phase <> #PI3_WIFI_AUTO_READY
+    Pi3WifiAutoWipeCandidate()
+    Pi3WifiAutoWipeHandshake()
+    pi3_wifi_assoc_keyed = 0
+  EndIf
+  pi3_wifi_auto_phase = #PI3_WIFI_AUTO_IDLE
+  pi3_wifi_auto_result = 0
+  pi3_wifi_auto_progressFn = 0
+  pi3_wifi_assoc_progressFn = 0
+EndProcedure
+
+Procedure.i Pi3WifiAutoJoinTick()
+  Protected i.i, n.i, r.i, state.i, slot.i, pass.i, passLen.i, phase.i
+  Protected p.i, code.i, now.i, same.i, handshakeResult.i
+  If Pi3WifiAutoJoinActive() = 0
+    ProcedureReturn pi3_wifi_auto_result
+  EndIf
+  If pi3_wifi_join_abort <> 0
+    Pi3WifiAutoFail(1)
+    ProcedureReturn pi3_wifi_auto_result
+  EndIf
+  If SettingsWifiRevision() <> pi3_wifi_auto_settings_revision
+    pi3_wifi_auto_settings_revision = SettingsWifiRevision()
+    Pi3WifiAutoFail(11)
+    ProcedureReturn pi3_wifi_auto_result
+  EndIf
+
+  phase = pi3_wifi_auto_phase
+
+  Select pi3_wifi_auto_phase
+    Case #PI3_WIFI_AUTO_RNG
+      If Pi3WifiRngStart() <> #PI3_WIFI_RNG_READY
+        Pi3WifiAutoFail(2)
+      Else
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_RSN
+      EndIf
+
+    Case #PI3_WIFI_AUTO_RSN
+      If Cyw43SetWpaIe(?pi3_wifi_assoc_default_rsn, #PI3_WIFI_RSN_IE_LEN, 2000) <> 0
+        Pi3WifiAutoFail(3)
+      Else
+        pi3_wifi_auto_secitem = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_SECITEM
+      EndIf
+
+    Case #PI3_WIFI_AUTO_SECITEM
+      If pi3_wifi_auto_secitem < 4
+        r = Cyw43SecItem(pi3_wifi_auto_secitem, 2000)
+        pi3_wifi_auto_secitem = pi3_wifi_auto_secitem + 1
+      Else
+        r = Cyw43SecItem(8, 2000)
+        pi3_wifi_auto_secitem = 5
+      EndIf
+      If r <> 0
+        Pi3WifiAutoFail(4)
+      ElseIf pi3_wifi_auto_secitem >= 5
+        Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_SCAN_START
+      EndIf
+
+    Case #PI3_WIFI_AUTO_SCAN_START
+      If Cyw43ScanStart(0, 2000) <> 0
+        Pi3WifiAutoFail(5)
+      Else
+        pi3_wifi_auto_slices = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_SCAN_POLL
+      EndIf
+
+    Case #PI3_WIFI_AUTO_SCAN_POLL
+      r = Cyw43ScanPoll(#PI3_WIFI_AUTO_SCAN_SLICE_MS)
+      pi3_wifi_auto_slices = pi3_wifi_auto_slices + 1
+      If r = #CYW43_SCAN_DONE
+        pi3_wifi_auto_found = Cyw43ScanCount()
+        pi3_wifi_auto_band = 0
+        pi3_wifi_auto_index = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_SELECT
+      ElseIf r = #CYW43_SCAN_FAILED Or pi3_wifi_auto_slices >= #PI3_WIFI_AUTO_SCAN_SLICES
+        Pi3WifiAutoFail(6)
+      EndIf
+
+    Case #PI3_WIFI_AUTO_SELECT
+      If pi3_wifi_auto_index >= pi3_wifi_auto_found
+        If pi3_wifi_auto_band = 0
+          pi3_wifi_auto_band = 1
+          pi3_wifi_auto_index = 0
+        Else
+          Pi3WifiAutoFail(7)
+        EndIf
+      Else
+        i = pi3_wifi_auto_index
+        pi3_wifi_auto_index = pi3_wifi_auto_index + 1
+        p = Cyw43ScanSsid(i)
+        n = Cyw43ScanSsidLen(i)
+        slot = 0
+        If p <> 0 And n > 0 And n <= 32
+          slot = SettingsWifiFindSsid(p)
+        EndIf
+        If slot <> 0 And ((pi3_wifi_auto_band = 0 And Cyw43ScanChannel(i) <= 14) Or (pi3_wifi_auto_band = 1 And Cyw43ScanChannel(i) > 14))
+          For r = 0 To n - 1 : pi3_wifi_auto_ssid[r] = PeekA(p + r) : Next
+          pi3_wifi_auto_ssid[n] = 0
+          pi3_wifi_auto_ssidLen = n
+          pi3_wifi_auto_slot = slot
+          pi3_wifi_auto_attempt = 0
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_PMK_BEGIN
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_AUTO_PMK_BEGIN
+      pass = SettingsWifiSlotPassword(pi3_wifi_auto_slot)
+      passLen = SettingsLength(SettingsWifiSlotPasswordKey(pi3_wifi_auto_slot))
+      If pass = 0 Or passLen < #WPA2_PASS_MIN Or passLen > #WPA2_PASS_MAX
+        Pi3WifiAutoNextCandidate()
+      Else
+        For i = 0 To #WPA2_PASS_MAX : pi3_wifi_auto_pass[i] = 0 : Next
+        For i = 0 To passLen - 1 : pi3_wifi_auto_pass[i] = PeekA(pass + i) : Next
+        pi3_wifi_auto_passLen = passLen
+        If Wpa2PskStepBegin(@pi3_wifi_auto_pass[0], passLen, @pi3_wifi_auto_ssid[0], pi3_wifi_auto_ssidLen, @pi3_wifi_assoc_pmk[0]) <> #PBKDF2_STEP_RUNNING
+          Pi3WifiAutoNextCandidate()
+        Else
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_PMK_STEP
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_AUTO_PMK_STEP
+      state = Pbkdf2Step(#PI3_WIFI_AUTO_PBKDF_PRFS)
+      If state = #PBKDF2_STEP_DONE
+        Pbkdf2StepWipe()
+        For i = 0 To #WPA2_PASS_MAX : pi3_wifi_auto_pass[i] = 0 : Next
+        pi3_wifi_auto_passLen = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_DISASSOC
+      ElseIf state <> #PBKDF2_STEP_RUNNING
+        Pi3WifiAutoNextCandidate()
+      EndIf
+
+    Case #PI3_WIFI_AUTO_DISASSOC
+      r = Cyw43Disassoc(2000)
+      If r <> #CYW43_IO_OK And Not (r = #CYW43_IO_STATUS And Cyw43IoctlStatus() = -17)
+        Pi3WifiAutoFail(8)
+      Else
+        pi3_wifi_auto_at = millis()
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_QUIET
+      EndIf
+
+    Case #PI3_WIFI_AUTO_QUIET
+      If ((millis() - pi3_wifi_auto_at) & $FFFFFFFF) >= #PI3_WIFI_AUTO_QUIET_MS
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_JOIN_START
+      EndIf
+
+    Case #PI3_WIFI_AUTO_JOIN_START
+      pi3_wifi_auto_event_base = Cyw43EventsDropped()
+      If Cyw43JoinStart(@pi3_wifi_auto_ssid[0], pi3_wifi_auto_ssidLen, 2000) <> 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        pi3_wifi_auto_slices = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_JOIN_POLL
+      EndIf
+
+    Case #PI3_WIFI_AUTO_JOIN_POLL
+      r = Cyw43JoinPoll(#PI3_WIFI_AUTO_JOIN_SLICE_MS)
+      pi3_wifi_auto_slices = pi3_wifi_auto_slices + 1
+      If Cyw43EventsDropped() <> pi3_wifi_auto_event_base
+        Pi3WifiAutoFail(9)
+      ElseIf r = #CYW43_JOIN_JOINED
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_VERIFY
+      ElseIf r = #CYW43_JOIN_FAILED Or pi3_wifi_auto_slices >= #PI3_WIFI_AUTO_JOIN_SLICES
+        Pi3WifiAutoJoinRetry()
+      EndIf
+
+    Case #PI3_WIFI_AUTO_VERIFY
+      same = Bool(Cyw43ReadSsid(2000) = 0 And Cyw43LinkSsidLen() = pi3_wifi_auto_ssidLen)
+      If same <> 0
+        p = Cyw43LinkSsid()
+        For i = 0 To pi3_wifi_auto_ssidLen - 1
+          If PeekA(p + i) <> pi3_wifi_auto_ssid[i] : same = 0 : EndIf
+        Next
+      EndIf
+      If same = 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_ASSOC_IE
+      EndIf
+
+    Case #PI3_WIFI_AUTO_ASSOC_IE
+      If Pi3WifiAssocReadRsnIe() = 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_BEGIN
+      EndIf
+
+    Case #PI3_WIFI_AUTO_EAPOL_BEGIN
+      If Pi3WifiAssocNewSnonceBounded(#PI3_WIFI_REKEY_NONCE_WAIT_US) = 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        For i = 0 To 5 : pi3_wifi_assoc_apmac[i] = 0 : Next
+        If Wpa2SupBegin(@pi3_wifi_assoc_pmk[0], @pi3_wifi_assoc_mac[0], @pi3_wifi_assoc_apmac[0], @pi3_wifi_assoc_rsn[0], pi3_wifi_assoc_rsn_len) = 0
+          Pi3WifiAutoJoinRetry()
+        Else
+          Wpa2SupSetSnonce(@pi3_wifi_assoc_snonce[0])
+          pi3_wifi_auto_at = millis()
+          pi3_wifi_auto_sendPending = 0
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_RX
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_AUTO_EAPOL_RX
+      n = Cyw43Receive(#PI3_WIFI_AUTO_EAPOL_SLICE_MS)
+      If n >= 14
+        code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+        If code = #WPA2SUP_SENT_M2
+          pi3_wifi_auto_sendPending = 2
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_TX
+        ElseIf code = #WPA2SUP_SENT_M4
+          pi3_wifi_auto_sendPending = 4
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_TX
+        ElseIf code < 0
+          Pi3WifiAutoJoinRetry()
+        EndIf
+      EndIf
+      If pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_RX
+        now = millis()
+        If ((now - pi3_wifi_auto_at) & $FFFFFFFF) >= #PI3_WIFI_EAPOL_M1_MS
+          Pi3WifiAutoJoinRetry()
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_AUTO_EAPOL_TX
+      If Pi3WifiAssocSendSup() <> 0
+        Pi3WifiAutoJoinRetry()
+      ElseIf pi3_wifi_auto_sendPending = 4
+        pi3_wifi_auto_at = millis()
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_INSTALL_PTK
+      Else
+        pi3_wifi_auto_at = millis()
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_EAPOL_RX
+      EndIf
+
+    Case #PI3_WIFI_AUTO_INSTALL_PTK
+      r = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+      If r <> 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_INSTALL_GTK
+      EndIf
+
+    Case #PI3_WIFI_AUTO_INSTALL_GTK
+      r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+      If r <> 0
+        Pi3WifiAutoJoinRetry()
+      Else
+        Wpa2SupSessionArm()
+        Cyw43KeyWipe() : AesWipe() : KwWipe()
+        pi3_wifi_assoc_keyed = 1
+        pi3_wifi_assoc_join_ssid_len = pi3_wifi_auto_ssidLen
+        For i = 0 To pi3_wifi_auto_ssidLen - 1 : pi3_wifi_assoc_join_ssid[i] = pi3_wifi_auto_ssid[i] : Next
+        For i = 0 To 31 : pi3_wifi_assoc_snonce[i] = 0 : Next
+        Pi3WifiAutoWipeCandidate()
+        If Pi3WifiNetworkStartDhcp() > 0
+          pi3_wifi_auto_result = 1
+          pi3_wifi_auto_phase = #PI3_WIFI_AUTO_READY
+        Else
+          Pi3WifiAutoFail(10)
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_AUTO_BACKOFF
+      If ((millis() - pi3_wifi_auto_at) & $FFFFFFFF) >= #PI3_WIFI_AUTO_RETRY_MS
+        pi3_wifi_auto_result = 0
+        pi3_wifi_auto_phase = #PI3_WIFI_AUTO_RNG
+      EndIf
+  EndSelect
+
+  ; One service callback per tick. The board owns the verified watchdog before
+  ; entering this procedure and stops it before returning to the prompt.
+  If pi3_wifi_auto_progressFn <> 0 And Pi3WifiAutoPhaseNeedsWatchdog(phase) <> 0
+    Pi3WifiAssocProgress()
+  EndIf
+  ProcedureReturn pi3_wifi_auto_result
+EndProcedure

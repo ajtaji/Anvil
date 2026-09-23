@@ -1,0 +1,140 @@
+; Bounded read-only RK3399 secure-APB PL330 discriminator for Anvil.
+; Build exactly with:
+;   --load-addr 0x03A4BBD8 --bss-addr 0x03AD0000
+;   --stack-addr 0x03E40000 --entry-returns
+;
+; The only MMIO write is a 32-bit UART2 THR write after LSR reports THRE.
+; SDMAC0 is sampled first, followed by SDMAC1.  Each line contains one short
+; marker and eleven fixed-order 32-bit hex fields:
+;   S0/S1 DS CR0 CRD PID0 PID1 PID2 PID3 CID0 CID1 CID2 CID3
+; pmf:target rockpi4c
+; pmf:load $03A4BBD8
+
+#ALIAS_UART2_THR = $FF1A0000
+#ALIAS_UART2_LSR = $FF1A0014
+#ALIAS_UART2_THRE = $20
+#ALIAS_UART_SPINS = 1000000
+
+#ALIAS_SDMAC0 = $FFFC0000
+#ALIAS_SDMAC1 = $FFFD0000
+
+#ALIAS_OK = $53443000
+#ALIAS_ERR_UART = $5344E004
+#ALIAS_ERR_ZERO = $5344E00A
+#ALIAS_ERR_ID = $5344E00B
+
+Procedure.i AliasTx(value.i)
+  Protected attempt.i
+  For attempt=0 To #ALIAS_UART_SPINS-1
+    If (PeekL(#ALIAS_UART2_LSR) & #ALIAS_UART2_THRE)<>0
+      PokeL(#ALIAS_UART2_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i AliasHex32(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      If AliasTx(48+digit)=0 : ProcedureReturn 0 : EndIf
+    Else
+      If AliasTx(55+digit)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i AliasWord(value.i)
+  If AliasHex32(value)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn AliasTx(32)
+EndProcedure
+
+Procedure.i AliasNewline()
+  If AliasTx(13)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn AliasTx(10)
+EndProcedure
+
+Procedure.i Main()
+  Protected ds.i
+  Protected cr0.i
+  Protected crd.i
+  Protected pid0.i
+  Protected pid1.i
+  Protected pid2.i
+  Protected pid3.i
+  Protected cid0.i
+  Protected cid1.i
+  Protected cid2.i
+  Protected cid3.i
+  Protected pid.i
+  Protected cid.i
+
+  If AliasTx(83)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasTx(48)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasTx(32)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+
+  ds=PeekL(#ALIAS_SDMAC0+$000) & $FFFFFFFF
+  If AliasWord(ds)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cr0=PeekL(#ALIAS_SDMAC0+$E00) & $FFFFFFFF
+  If AliasWord(cr0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  crd=PeekL(#ALIAS_SDMAC0+$E14) & $FFFFFFFF
+  If AliasWord(crd)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid0=PeekL(#ALIAS_SDMAC0+$FE0) & $FFFFFFFF
+  If AliasWord(pid0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid1=PeekL(#ALIAS_SDMAC0+$FE4) & $FFFFFFFF
+  If AliasWord(pid1)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid2=PeekL(#ALIAS_SDMAC0+$FE8) & $FFFFFFFF
+  If AliasWord(pid2)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid3=PeekL(#ALIAS_SDMAC0+$FEC) & $FFFFFFFF
+  If AliasWord(pid3)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid0=PeekL(#ALIAS_SDMAC0+$FF0) & $FFFFFFFF
+  If AliasWord(cid0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid1=PeekL(#ALIAS_SDMAC0+$FF4) & $FFFFFFFF
+  If AliasWord(cid1)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid2=PeekL(#ALIAS_SDMAC0+$FF8) & $FFFFFFFF
+  If AliasWord(cid2)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid3=PeekL(#ALIAS_SDMAC0+$FFC) & $FFFFFFFF
+  If AliasHex32(cid3)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasNewline()=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+
+  pid=(pid0 & $FF) | ((pid1 & $FF) << 8) | ((pid2 & $FF) << 16) | ((pid3 & $FF) << 24)
+  cid=(cid0 & $FF) | ((cid1 & $FF) << 8) | ((cid2 & $FF) << 16) | ((cid3 & $FF) << 24)
+
+  If AliasTx(83)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasTx(49)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasTx(32)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+
+  ds=PeekL(#ALIAS_SDMAC1+$000) & $FFFFFFFF
+  If AliasWord(ds)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cr0=PeekL(#ALIAS_SDMAC1+$E00) & $FFFFFFFF
+  If AliasWord(cr0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  crd=PeekL(#ALIAS_SDMAC1+$E14) & $FFFFFFFF
+  If AliasWord(crd)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid0=PeekL(#ALIAS_SDMAC1+$FE0) & $FFFFFFFF
+  If AliasWord(pid0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid1=PeekL(#ALIAS_SDMAC1+$FE4) & $FFFFFFFF
+  If AliasWord(pid1)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid2=PeekL(#ALIAS_SDMAC1+$FE8) & $FFFFFFFF
+  If AliasWord(pid2)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  pid3=PeekL(#ALIAS_SDMAC1+$FEC) & $FFFFFFFF
+  If AliasWord(pid3)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid0=PeekL(#ALIAS_SDMAC1+$FF0) & $FFFFFFFF
+  If AliasWord(cid0)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid1=PeekL(#ALIAS_SDMAC1+$FF4) & $FFFFFFFF
+  If AliasWord(cid1)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid2=PeekL(#ALIAS_SDMAC1+$FF8) & $FFFFFFFF
+  If AliasWord(cid2)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  cid3=PeekL(#ALIAS_SDMAC1+$FFC) & $FFFFFFFF
+  If AliasHex32(cid3)=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+  If AliasNewline()=0 : ProcedureReturn #ALIAS_ERR_UART : EndIf
+
+  If pid=0 And cid=0 : ProcedureReturn #ALIAS_ERR_ZERO : EndIf
+  If (pid & $FFFFF)<>$41330 Or cid<>$B105F00D
+    ProcedureReturn #ALIAS_ERR_ID
+  EndIf
+  ProcedureReturn #ALIAS_OK
+EndProcedure

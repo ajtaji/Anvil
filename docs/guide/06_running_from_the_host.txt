@@ -1,0 +1,872 @@
+; Chapter 6 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   tools/board_run.py    - the only tool here with a real argparse help
+;                           screen; its --help output is quoted from a
+;                           desk run.
+;   tools/pi4_upload.py   - argparse with add_help=False; its own
+;                           docstring IS its help text, quoted from it.
+;   tools/anvil.py        - the shared serial driver and the one map
+;                           parser. NOT run: its main() opens a serial
+;                           port for ANY argument, --help included.
+;   tools/anvil_putfile.py, tools/pmfshot.py - docstrings quoted.
+;   docs/BOARD_RUN.md     - the ruling, the capture area, the checks.
+;   Anvil/Core/help.pbi   - get/put, the TFTP half.
+;
+; DESK RUN BEHIND THIS CHAPTER (2026-09-16):
+;   python tools/board_run.py --help    - quoted verbatim.
+; Every other quoted block is a docstring or a source string, and the
+; chapter says which.
+;
+; The example board_run.py invocation and the runs/ result record are
+; real, from this repository and the vault; addresses inside them are
+; this bench's and are labelled as such.
+@CHAPTER Running payloads from the host
+@INTRO You do not type payloads in at the prompt. One command sends it, proves it landed, runs it, and brings back the answer and a picture.
+
+@SECTION The tools, and what each is for
+
+@FRAG
+tools/board_run.py     one complete run: stage, verify, boot, return,
+                       screenshot. The one you will use.
+tools/board_model_run.py
+                       a model run from a manifest: assets sent only
+                       if not already in memory, run, readback, WAV.
+tools/pi4_upload.py    bulk image transfer over the network, with the
+                       hash verdict. Used on its own to put a file on
+                       the board or on its boot medium.
+tools/anvil_update.py  replace the monitor itself. Chapter 8.
+tools/anvil_putfile.py put arbitrary files on the boot medium, with a
+                       read-back check.
+tools/anvil_wifi.py    the interactive network console. Chapter 3.
+tools/pmfshot.py       a screenshot over the serial line.
+tools/anvil.py         the shared serial driver the others import, and
+                       a small command-line front end.
+@ENDFRAG
+
+@TRAP Do not run `python tools/anvil.py --help`. It has no argument
+parser: its entry point constructs its serial driver for **any**
+argument, so `--help` opens the serial port. A bare
+`python tools/anvil.py` with no arguments is safe and prints the usage.
+Every other tool in the list parses its arguments before touching
+anything.
+
+@SECTION Ask the board where to put things
+
+None of these tools has a built-in staging address, and that is
+deliberate.
+
+Every tool in this tree used to carry `0x400000` as a constant of its
+own - four copies of one number on the far side of a cable, none of
+which could find out it had changed. The monitor has no fixed size; the
+first free address above it moves with every build. So the tools ask,
+with `map`, and one parser does it for all of them.
+
+@NOTE If a monitor is too old to have `map`, the parser returns nothing
+rather than guessing. A fallback to `0x400000` there would be
+reintroducing the constant with an extra step. Each caller says what it
+needs and stops.
+
+@SECTION One complete run
+
+@FRAG
+$ python tools/board_run.py --help
+usage: board_run.py [-h] [--console-ip CONSOLE_IP]
+                    [--console-port CONSOLE_PORT] [--board-ip BOARD_IP]
+                    [--port PORT] [--addr ADDR] [--out OUT] [--name NAME]
+                    [--tier {dma,v3d,cpu}] [--deadman DEADMAN] [--trace TRACE]
+                    [--expect-x0 EXPECT_X0] [--timeout TIMEOUT]
+                    [--ask-seconds ASK_SECONDS] [--shot-timeout SHOT_TIMEOUT]
+                    [--settle SETTLE] [--twin] [--no-shot]
+                    payload
+
+positional arguments:
+  payload               the .pmf container to run
+@ENDFRAG
+
+The positional argument is the `.pmf` container - the one chapter 2
+explained, and the one chapter 5 tells you how to produce. Not the raw
+image. The container carries the load address, so the tool does not have
+to be told it.
+
+What the options mean, from the tool's own description:
+
+@FRAG
+--console-ip A     the board's UDP console. Default from --board-ip.
+--console-port N   5555 unless somebody has changed it.
+--board-ip A       where the image is streamed to. Defaults to
+                   --console-ip.
+--port N           the one-shot TCP listener's port. Default 5001.
+--addr HEX         where the container is staged. Default: ask the board
+                   with `map`.
+--out DIR          where the run's files go. Default runs/<name>.
+--name NAME        what to call them. Default the payload's stem.
+--tier dma|v3d|cpu send `screen <tier>` before the run.
+--deadman S        arm the deadman watchdog for the payload's window.
+--trace HEX[:LEN]  read this many bytes back (default 256, at most
+                   4096) after the run, with `readback`.
+--expect-x0 N      accept this unsigned 64-bit return value.
+--timeout S        how long the payload may take. Default 600.
+--ask-seconds S    when no return line came, how long to wait for the
+                   board to answer before calling the payload still
+                   running. Default 60.
+--settle S         twin mode only: how long to let it draw. Default 20.
+--twin             the payload never returns.
+--no-shot          do not arm a capture on return.
+@ENDFRAG
+
+A real invocation, from this project's own records:
+
+@FRAG
+py -3 tools\board_run.py <path>\myPayload.img.pmf --console-ip 192.168.1.102 --tier dma --deadman 15 --trace 5A6000:280 --timeout 90 --shot-timeout 90 --out <path>\silicon-run --name my-run
+@ENDFRAG
+
+@TRAP **Never wrap this tool in an outer `timeout`, and never pipe it
+through `tail` while it runs.** Its own `--timeout` is the bound on the
+payload and nothing else needs to impose one; a board that refuses to enter
+a payload answers in the round trip rather than running that bound out. An
+outer `timeout` kills the process where it stands, and `tail` prints
+nothing until the tool exits - so a long run that is working looks exactly
+like a hang, which is the state somebody kills a run in. Worse, the shell
+then reports **tail's** exit status and not the tool's.
+
+That is not a hypothetical. On 2026-09-16 a run was driven twice as
+`timeout 600 python tools/board_run.py ... | tail -30`, about ten minutes
+each, and produced no output at all, an empty run directory, and `EXIT=0`.
+The board had refused the payload within milliseconds of each `boot mem` -
+its load address was inside the monitor - and had been idle at its prompt
+ever since.
+
+Send the output to a file if you want to keep it, and put the run in the
+background if it is long. Do not put a clock or a pager in front of it.
+
+@SECTION What it leaves behind, while it is still running
+
+The record and the transcript are written after **every** step, each
+carrying a `stage` field naming the step just reached:
+
+@FRAG
+map -> listener armed -> sent -> verified -> deadman -> boot ->
+return -> trace -> picture
+@ENDFRAG
+
+and the terminal stages `listener refused`, `no transfer verdict`,
+`upload did not verify`, `deadman refused`, `boot refused`,
+`still running`, `deadman reset`, `restarted`, `never entered`,
+`processor exception` and `outcome unknown`. A record that also
+carries a `finished` timestamp is one the tool wrote the ending of; one
+without it was killed where its `stage` says it was.
+
+A payload whose return line was lost, but which the board says came back,
+goes on through `return`, `trace` and `picture` like any other, and its
+record carries `return_line_lost: true` and an `outcome` naming the
+evidence. There is no stage called "never returned" any more - see the next
+two sections for why that sentence was retired.
+
+@NOTE **An empty run directory is not something this tool can produce.**
+The directory is not created until the payload has been read and the
+staging address is known, so a run that cannot start leaves nothing at all
+- and a directory is therefore evidence that a board was spoken to.
+
+The exit codes say which of the three happened:
+
+@FRAG
+0   the payload returned what was expected and its picture is on disk
+1   the run started and failed. The directory says where it stopped
+2   the run never started. Nothing was sent to the board and nothing was
+    written - not even the directory
+@ENDFRAG
+
+@SECTION A refusal is an answer, and it arrives at once
+
+`boot mem` refuses for eight different reasons - the address lands inside
+the running monitor, the last transfer did not arrive cleanly, the resident
+secondary cores own the board until it restarts, the word after the address
+was not `shot`. Every one of them prints its sentence and goes straight
+back to the prompt, and **none of them is the payload's return line**.
+
+So the boot step ends on any of three things: the return line, the
+processor-exception marker, or the board's prompt coming back after the
+echo of the command. The third is a refusal, and the tool quotes the board:
+
+@FRAG
+!! THIS RUN FAILED:
+   the board's prompt came back 0.1 s after `boot mem 500000 shot` and the payload's return line never did, so the board REFUSED TO ENTER THE PAYLOAD and nothing ran. The board said:
+   !! resident secondary cores own this monitor until restart, so no
+      payload was entered. Restart Anvil before run, go or boot mem.
+@ENDFRAG
+
+@NOTE The tool keeps **no list of refusal strings**. What is generic is the
+shape - the prompt came back and the line being waited for did not - and
+what is specific is quoted verbatim from the board. A host tool that
+matched on the monitor's wording would go silent again the first time one
+of those sentences was reworded.
+
+@TRAP The echo is what makes the prompt usable. The reply to any command
+**opens** with the prompt it was typed at, so a bare `pmf>` would decide
+that every command had finished before it began - the opposite failure, and
+just as quiet. Only a prompt after the echoed line belongs to the command.
+
+Nothing is asked of the board after a refusal. There is no new capture to
+read and no trace to dump, and streaming the previous run's picture back is
+exactly how a refused run would acquire a screenshot it has no right to.
+
+@SECTION When nobody is listening on the console port
+
+A UDP console has no connection to refuse, so the refusal arrives as an
+ICMP port-unreachable that the operating system reports on the next
+receive:
+
+@FRAG
+!! THIS RUN NEVER STARTED, so nothing was sent to the board and nothing was
+   written:
+   nothing is listening on the Anvil console at 192.168.137.1:5555: this machine's datagram came back unreachable ([WinError 10054] An existing connection was forcibly closed by the remote host). Either the board is not powered or not on this network, or the address or the port is not its console's - check the board's own `net` output for the address it answers on, and that UDP 5555 is the port. Nothing was sent to any board and nothing was written.
+@ENDFRAG
+
+@NOTE "An existing connection was forcibly closed" is a strange thing to be
+told about a protocol with no connections, which is why the number stays in
+the sentence: 10054 is what you will find if you search for it, and the
+sentence is what tells you it means nobody answered.
+
+@SECTION A long silence, and the host's firewall
+
+The network console is UDP, and the PC's own firewall is stateful: it lets
+the board's datagrams in because this socket recently sent the board
+something, and it **forgets** that after a while of silence. A payload that
+computes for minutes and prints nothing is exactly that silence, and the
+return line it prints at the end is then dropped on the way in.
+
+That was measured on the bench Pi 4 on 2026-09-16, with no payload at all:
+`sleep N` typed at the prompt, the host silent until the prompt should come
+back.
+
+@FRAG
+sleep 60     reply arrived
+sleep 120    reply arrived
+sleep 150    reply LOST
+sleep 300    reply LOST
+sleep 300    reply arrived - other interpreter, allowed on this profile
+sleep 300    reply arrived - empty datagram to the board every 20 s
+@ENDFRAG
+
+The cable was a Public network to the PC, and the Python it ran under had
+an inbound allow rule for Private networks only. That interpreter's replies
+depended on the firewall's memory of the flow; the one allowed on Public did
+not. On the same day three Kokoro runs of 158 s to 328 s had been reported as
+"never returned" while a 107 s one was not. A 7.7 KB payload that waits
+silently reproduced it: 300 s, returned, result block complete, capture taken
+on return - and not one datagram from any address reached the host socket
+between the boot line and the tool's next command.
+
+So every wait in `board_run.py`'s console now sends an **empty** datagram
+to the board when nothing has gone to it for 20 seconds. The monitor takes
+an empty datagram as no keystrokes at all - the `sleep 300` above was not
+cut short by fourteen of them - and it keeps the flow alive. The same
+300 s payload, through the fixed tool, on build 151:
+
+@FRAG
+  deadman 15 s
+  boot mem 500000 shot
+  returned expected x0 = 000000000000012C after 300.7 s
+  picture 1280 x 800, capture number 3, v3d tier, 90 degrees, the monitor took it on return
+Run complete: the payload returned expected x0 000000000000012C and the picture it left behind is on disk.
+@ENDFRAG
+
+@NOTE Allowing the interpreter on the network's profile also fixes it on
+one machine. The keepalive fixes it for every machine this tool is run on,
+which is why the tool carries it rather than a setup step.
+
+@SECTION A missing return line is asked about, not believed
+
+A line on a network can always be lost. What the host cannot do by itself
+is find out afterwards which of these happened:
+
+@FRAG
+the payload returned, and only its line was lost
+the payload is still running
+the deadman reset the board
+the payload stopped at a processor exception
+the monitor never entered the payload
+@ENDFRAG
+
+So when no return line arrives inside `--timeout`, the tool asks the board.
+First it waits up to `--ask-seconds` for the board to answer at all - a
+payload that still holds the processor cannot, and nor can a board part-way
+through the boot after a deadman reset. No answer is the first outcome:
+
+@FRAG
+no return line arrived inside 600 s and the board has not answered its console for a further 60 s, so THE PAYLOAD IS STILL RUNNING: it still holds the processor, which is the one state in which the monitor cannot answer. A 15 s deadman was armed, so the payload is petting it and has not hung. Nothing was sent to the board. Wait, or reset it.
+@ENDFRAG
+
+If the board answers, the tool reads the monitor's **run record** with
+`last run` - which it also read just before `boot mem`, so a run number that
+did not move means nothing was entered. The record is written by the monitor
+at the jump, at the return and at a processor exception, in a page a reset
+does not erase, and it counts boots, so a reset under a running payload is a
+fact the board states rather than a guess the host makes. A payload the
+record says returned goes on to its trace and picture with the x0 the
+record holds.
+
+@TRAP `last run` is in **monitor build 152**, which is built and not yet
+on the board. On build 151 and older the word is refused, and the tool
+does the one honest thing left: if the capture on return was armed and its
+number moved, the payload returned and the capture's x0 is used; otherwise
+it says the outcome is **not known** - and that this is not evidence the
+payload never returned.
+
+The sentences in this section are the tool's own wording at its default
+bounds, taken from the tool and exercised by its desk gate against a
+scripted board. The board-side proof of each outcome waits for build 152 on
+the board.
+
+@SECTION What a run actually does, in order
+
+@FRAG
+1. ask the board where to stage           map
+2. arm a one-shot listener and stream     net recv <port> <addr>
+3. prove the bytes landed                 the board's own length and
+                                          SHA-256 of the MEMORY, compared
+                                          against the file on disk
+4. pick a renderer, if asked              screen <tier>
+5. arm the deadman, if asked
+6. note the capture sequence number       shot status
+7. note the run number                    last run
+8. run it                                 boot mem <addr> shot
+9. wait for the return line and its x0,
+   and if it does not come, ask           last run
+10. read the payload's trace, if asked    readback <addr> <len>
+11. read the picture                      shot
+@ENDFRAG
+
+It writes three files into the output directory: `<name>.png`,
+`<name>.json` - the return value, the timings, the capture header, the
+digest of the decoded pixels and the transfer verdict - and `<name>.txt`,
+the whole console transcript. It exits **non-zero** if the return value
+is not what you expected, or if no picture came back.
+
+A clean run ends like this:
+
+@FRAG
+Run complete: the payload returned expected x0 0000000000000000 and the picture it left behind is on disk.
+@ENDFRAG
+
+A real result record from this repository, to show what the JSON holds:
+console `192.168.137.1:5555`, stage `00500000`, payload 801,108 bytes,
+expected and actual x0 both `0000000000723698`, transfer 801,108 bytes
+in 87 ms with its SHA-256, and a capture header saying sequence 2,
+1280 by 800, rotation 90, tier `v3d`, source `dsi`, taken by "the monitor
+took it on return".
+
+@SECTION Step 3 is the one that matters
+
+The board hashes **the memory**, after the transfer, not the bytes as
+they came off the wire. This tool hashes the local file. Equal means the
+DRAM that is about to be entered holds the file on your disk.
+
+Unequal - by one bit - and the tool exits non-zero and boots nothing.
+
+There are three ways step 3 can end badly, and each says something
+different:
+
+@FRAG
+!! the board did not arm a listener, so nothing was sent. It said:
+@ENDFRAG
+
+@FRAG
+!! the board never printed a length and a digest, so this transfer HAS NO VERDICT AT ALL - which is not the same as a good one. Nothing was booted.
+@ENDFRAG
+
+@FRAG
+!! THE UPLOAD DID NOT VERIFY, so nothing was booted.
+   host  <N> bytes <sha>
+   board <N> bytes <sha>
+@ENDFRAG
+
+@NOTE Read the middle one twice. "No verdict at all" is not a pass. A
+tool that treated a missing answer as a good one would be exactly the
+silent-wrong-answer failure this whole project is built to avoid.
+
+@SECTION What a refusal looks like
+
+Stage a payload on top of the running monitor and the tool stops before
+sending a byte:
+
+@FRAG
+!! REFUSING TO SEND: staging 801108 bytes at 00200000 would land on the monitor that is running this run (00200000..004B144B). Leave --addr out and it goes to 00500000, which is where this board says to put it.
+@ENDFRAG
+
+The upload tool's version of the same refusal names the overlap in
+bytes and says why it would be so hard to diagnose:
+
+@FRAG
+!! REFUSING TO SEND: staging <n> bytes at <addr> would overwrite the monitor that is
+   running this upload. Its image is <lo>..<hi>, and the <n> bytes would land
+   on <addr>..<end> - an overlap of <k> bytes.
+   The board would keep answering and stop understanding commands, because its
+   command names are strings near the end of the image. Nothing was sent.
+   Leave --addr out and it goes to <stage>, which is where this board says to
+   put it.
+@ENDFRAG
+
+@TRAP That is measured behaviour, not caution. A board that had its last
+few kilobytes overwritten **kept its address, kept answering, and could
+not execute a single command** - because the command names are strings
+near the end of the image. It looked alive. It cost somebody a trip to
+the power lead.
+
+@NOTE **There is no override flag on that refusal.** `--addr` already is
+the way to say where something goes; a force flag beside the refusal
+would be a second path to the same place, which is how a safety check
+becomes decoration.
+
+The monitor refuses the same thing from its own side. This is a recorded
+board session:
+
+@FRAG
+pmf> net recv 5001 200000
+!! that range runs over the monitor itself, which lives at 00200000
+   to 003FFFFF. Receiving there would overwrite the running
+   monitor and take this prompt and this connection with it, so nothing
+   was armed and no port was opened.
+   Send the image to 400000 for the low window, or to 40000000 for the
+   high one.
+pmf>
+@ENDFRAG
+
+@SECTION Every run comes back with a picture
+
+This is a rule, not an option, and it exists because of one afternoon: a
+payload ran four times and came back clean every time while nothing
+reached the panel - and then drew a garbled mess that nobody had been
+watching for.
+
+The picture cannot be taken afterwards. When a payload returns, the
+monitor prints, and printing goes through the console onto the surface
+the payload left behind. The frame you want to look at is destroyed by
+the monitor's own report that the payload returned, before a prompt
+exists to ask for it. So the frame is copied out of the way **while it
+still exists**, into a reserved capture area, and read back from the
+copy.
+
+Two ways it gets filled:
+
+@FRAG
+the payload asks   SvcScreenCapture(), after SvcFrameEnd. It copies and
+                   does not present. This is the only way a payload's
+                   own picture can be kept.
+the monitor takes  shot arm arms one capture for the next payload entry;
+it on return       boot mem <addr> shot arms and boots in one line. The
+                   copy is the FIRST statement after the payload
+                   returns, before a single character is printed.
+@ENDFRAG
+
+The arm is one-shot. An arm that stayed set would overwrite the picture
+somebody was still reading with the next run's - and the next run is the
+one nobody was watching. A refused jump does not spend the arm.
+
+@SECTION The two checks that make a picture evidence
+
+@TRAP **The stale-capture check is the one you need to understand.** The
+capture area keeps the last picture until something overwrites it. A run
+whose capture silently failed would stream the **previous** run's
+picture - perfectly well formed, correct dimensions, no error anywhere.
+So the tool reads the sequence number before the run and fails a picture
+whose number did not move:
+
+@FRAG
+the picture that came back is number 2 and the board already held number 2 before this run, so no new capture was taken. What was streamed is the PREVIOUS run's screen; this run has no picture.
+@ENDFRAG
+
+The second check is the run count. The board counts the encoded runs it
+emitted and says so at the end of the stream; a lost datagram takes runs
+with it and the two numbers stop agreeing. A decoder that ignored the
+count would write a plausible picture with a band missing.
+
+Everything the decoder can refuse says why, and says that nothing was
+written:
+
+@FRAG
+the stream stopped before its END marker; <n> runs arrived. Nothing was written, because half a picture that decodes looks exactly like a display fault.
+@ENDFRAG
+
+@SECTION One command for a model run
+
+A model run is more than one payload. The weights and the other inputs have
+to be in the board's memory first, and the answer is a region of memory - a
+waveform - that has to come back and become a file. Driven one tool at a
+time, that is eight steps with a wait between every two of them, and on
+2026-09-16 a payload had returned on the board's screen minutes before its
+WAV existed. `tools/board_model_run.py` does the whole run from one
+manifest, in one console connection, with nothing typed in between:
+
+@FRAG
+python tools/board_model_run.py <manifest.json> --console-ip <board> --lease-file <BOARD-SHARE.md> --lane "<name>"
+python tools/board_model_run.py <manifest.json> --console-ip <board> --no-lease
+@ENDFRAG
+
+The manifest names the payload and the value it must return, the deadman,
+every asset with its address and SHA-256, the regions to read back, and what
+to make of them. This is the Kitten TTS one from the ONNX compiler
+repository's `examples/pi4/kitten-rosie.run.json`, digests shortened:
+
+@FRAG
+{
+  "format": "anvil-board-model-run 1",
+  "name": "kitten-rosie",
+  "base": "kitten-nano-0.8",
+  "out": "pi4-rosie/board-model-run",
+  "payload": {"file": "pi4-rosie/kitten-rosie.img.pmf",
+              "sha256": "6e0c2bd0...", "stage": "0x03000000",
+              "expect_x0": "0", "timeout_seconds": 900},
+  "deadman_seconds": 15,
+  "assets": [
+    {"name": "weights", "file": "pi4/kitten.pmw",
+     "address": "0x40000000", "sha256": "173baffd..."},
+    {"name": "noise", "file": "pi4-rosie/kitten-rosie-noise.f32",
+     "address": "0x54000000", "sha256": "9fcf6549..."}],
+  "results": [
+    {"name": "wave", "address": "0x57000000", "bytes": 2382400,
+     "board_sha256": true},
+    {"name": "trace", "address": "0x57E00000", "bytes": 256}],
+  "post": {"wav": [{"from": "wave", "rate": 24000,
+                    "file": "kitten-rosie.wav"}]}
+}
+@ENDFRAG
+
+Paths are relative to `base`, and `base` to the manifest's own folder;
+`--base` replaces it. A key the tool does not know is refused rather than
+ignored, and so is an asset whose file on disk no longer has the manifest's
+digest. `post` may also carry `compare`, a command run after everything
+else, with `{python}`, `{base}`, `{out}`, `{result.NAME}` and `{wav.NAME}`
+filled in.
+
+What one run does, in order:
+
+@FRAG
+lease      the live-holder callout and a ledger row, re-read to confirm;
+           released with a row at the end, whatever happened
+identify   version, map, coretest status, cache (on for the digests)
+assets     sha256sum <addr> <len> of what is ALREADY in memory: equal to
+           the manifest, "resident" and no upload; otherwise net recv,
+           the file, and the board's SHA-256 of where it landed
+payload    net recv to its stage address, verified
+run        deadman, last run, boot mem - and the moment it returns:
+wave       readback of the regions a WAV is made from, checked by crc32
+           and by the board's own sha256sum, then the WAV and the line
+           "WAV ready: <path>"
+the rest   the other regions, deadman off, coretest status, the cache put
+           back, the lease released - then compare, if there is one
+@ENDFRAG
+
+The second of two runs on build 160, with both assets already in memory
+from the first (a board transcript, run folder shortened):
+
+@FRAG
+[    2.1 s] lease: taken (2.0 s waiting), confirmed by two re-reads.
+[    4.2 s] board: build 160 date 20260916 time 223809; coretest started=0 stopped=0 runs=0 nonce=285 error=0 core=0
+[    4.6 s] asset weights: asking the board for sha256sum 40000000 3575C80
+[   36.5 s] asset weights: resident - the board's digest of 40000000 equals the manifest's (31.9 s), no upload
+[   36.5 s] asset noise: asking the board for sha256sum 54000000 1522950
+[   49.4 s] asset noise: resident - the board's digest of 54000000 equals the manifest's (12.9 s), no upload
+[   50.8 s] payload: 1404264 bytes at 03000000, verified (1.00 s)
+[   52.2 s] run: `boot mem 3000000`, deadman 15 s; waiting up to 900 s for the return line
+[  121.5 s] returned: x0 = 0000000000000000 after 69.3 s; reading back now
+[  126.5 s] readback wave: 2382400 bytes from 57000000 in 4.97 s, crc32 and board sha256 equal verified
+WAV ready: <run folder>\kitten-rosie.wav  (5.1 s after the payload returned)
+[  126.9 s] readback trace: 256 bytes from 57E00000 in 0.21 s, crc32 verified
+[  127.1 s] readback ticks: 131072 bytes from 57D00000 in 0.28 s, crc32 verified
+[  127.7 s] readback bss: 334080 bytes from 01000000 in 0.57 s, crc32 verified
+[  128.6 s] lease: released with a ledger row.
+@ENDFRAG
+
+The first run, straight after a reset, found neither asset in memory and
+uploaded both: 180.0 s of board time. The second, above, skipped both:
+126.5 s. Both waveforms were the same 2,382,400 bytes, sha256
+`6e3b3646...`, and so were their WAVs.
+
+@NOTE **Checking costs a digest; uploading costs a digest too.** The board
+hashed 56 MB in 31.9 s and 22 MB in 12.9 s on that run. A resident asset
+costs only that check. One that has to go up costs the check and then the
+upload, whose own verdict is the same digest over again: 37.6 s and 14.9 s
+here. After a reset every asset pays both.
+
+@TRAP **Never wrap it in an outer `timeout` or pipe it through `tail`**, for
+the reasons above - and one more: this tool holds the shared board's lease,
+and releases it in a `finally`. A process killed from outside never reaches
+that `finally`, so the ledger says the board is still held.
+
+The exit codes are the same three: `0` the payload returned what was
+expected, every region verified and the WAVs are written; `1` the run
+started and failed, and `<name>.json` in the run folder says where; `2`
+nothing was sent to the board.
+
+@SECTION Uploading without running
+
+`tools/pi4_upload.py` is the bulk transfer on its own. It drives the
+board's `net recv`: the console arms a one-shot TCP listener, the image
+goes over that connection, and the board prints how many bytes landed
+and the SHA-256 of the memory they landed in.
+
+@FRAG
+python tools/pi4_upload.py <image> [options]
+
+  --to ram        leave it in memory (the default)
+  --to card       and then `save <name> <addr> <len>` onto the boot medium
+  --boot          and then enter it: `boot mem <addr>`, or `boot <name>`
+                  for --to card
+  --reset         and then reset the board
+  --addr HEX      where in DRAM it goes. Default: ASK THE BOARD, with `map`
+  --port N        the port the board listens on. Default 5001
+  --name NAME     the file --to card writes. Default KERNEL8.IMG
+  --board-ip A    the board's address. Default: ask it, with `wifi ip`
+  --console serial|net      how the commands get there. Default serial
+  --com PORT      the serial port. Default COM7
+  --console-ip A  the board's address for the network console
+  --console-port N  the network console's UDP port. Default 5555
+  --cache         send `cache on` first
+  --keep-cache    leave the caches on afterwards
+  --corrupt [OFF] the bench instrument - see below
+@ENDFRAG
+
+A real invocation, putting the firmware stub on the boot medium:
+
+@FRAG
+python tools/pi4_upload.py _work/armstub8.bin --to card --name ARMSTUB8.BIN --console wifi --board-ip <ip>
+@ENDFRAG
+
+@NOTE `--cache` is worth knowing about. On this part SHA-256 runs at
+about 61 KB/s with the caches off and about 4,041 KB/s with them on, so
+the digest is otherwise the slow half of the run. The default puts the
+caches back the way it found them.
+
+@SECTION The negative control
+
+`--corrupt` flips one bit of one byte on its way out, while still
+comparing against the digest of the real file. **The run must fail.**
+
+@TRAP This is not a debugging aid you will never need. It is the reason
+to believe the verifier at all: a verifier nobody has ever seen refuse
+is a verifier nobody has any reason to believe. This is what it looks
+like when it does its job, from a recorded board session:
+
+@FRAG
+  !! --corrupt IS ARMED: bit 0 of byte 812818 is flipped ON THE WIRE, and the
+     comparison is still against the digest above. THIS RUN MUST FAIL.
+  net recv 5001 400000
+  1625636 bytes on the wire in 7.68 s (207 KB/s at this end)
+    Received 1625636 bytes from 192.168.1.24 to 00400000 in 7676 ms.
+      sha256 7945d151c6041f9f72ac300d5a063e2dc53d0fb4a0fdf862c0758aaaab1780f7
+!! THE UPLOAD DID NOT VERIFY, so nothing was saved and nothing was booted.
+   the digests DIFFER:
+     host  85370e48df79c7fe06956c2c47a27fef049b3e475d44cbba6395422df6ab463f
+     board 7945d151c6041f9f72ac300d5a063e2dc53d0fb4a0fdf862c0758aaaab1780f7
+   What is in the board's memory at 400000 is NOT this file. Do not boot it.
+@ENDFRAG
+
+@SECTION Reading things back
+
+There are two different readback paths and they answer different
+questions.
+
+**Over the console.** `load <NAME> <addr>` reads a file off the boot
+medium into memory, and `crc32 <addr> <len>` or `sha256sum <addr> <len>`
+hashes it there. This is the one to use after writing a file, because it
+asks the filesystem rather than the command that did the writing:
+
+@FRAG
+pmf> load ARMSTUB8.BIN 400000
+pmf> crc32 400000 200
+@ENDFRAG
+
+@TRAP `anvil_putfile.py` verifies every file twice, and the second time
+is the one that counts. The transfer's own CRC proves the wire was clean
+and proves nothing whatever about what reached the filesystem. So the
+file is loaded **back off the medium into a different address** and
+hashed there. A firmware image wrong by one byte does not fail loudly;
+it makes a radio that almost works, which is far more expensive to debug
+than a refusal.
+
+@TRAP And one parsing trap worth knowing, because it bit this project:
+when you read a CRC out of the console's reply, anchor on the sentence
+that carries the answer. A looser match once read `EDB88320` - the
+CRC-32 **polynomial**, which the command helpfully prints two lines
+below the result - and reported a perfectly good file as corrupt.
+
+**Over TFTP.** The monitor has `get` and `put`:
+
+@FRAG
+get <name> [address]
+                fetch a file from the TFTP server into memory.
+put <name> <address> <length>
+                send that many bytes of memory to the server as a
+                file. Both numbers hex, the length in bytes. Most
+                servers refuse to be written to until they are told to
+                allow it, and the server's own refusal is printed here
+                word for word when that happens.
+@ENDFRAG
+
+**Over the console, for a machine.** `readback <addr> <len>` sends the
+range as base64 with a byte count and a crc32 on its last line, to the
+console that asked and to no other (chapter 4 has the format). Every
+host tool in this repository that takes bytes off the board uses one
+reader for it, `tools/anvil_readback.py`:
+
+@FRAG
+from anvil_readback import read_range
+data, stats = read_range(console, 0x57400000, 1812000)
+@ENDFRAG
+
+It asks in requests of up to 256 KiB - fewer if the console socket's
+receive buffer is smaller - anchors on the header that names
+this address and length, stops at the closing line rather than waiting
+for the console to go quiet, and accepts a request only when the decoded
+length and `zlib.crc32` both equal what the board says it sent. A request
+that fails is asked for once more - `readback` changes nothing on the
+board - and a second failure is refused in a sentence that quotes both.
+`board_run.py`'s `--trace`, `pi4_svcprobe_proof.py` and the compiler
+repository's single-tensor readback tool all read through it.
+
+@TRAP Why it exists, measured. The console readback used to be 4096-byte
+`memory` dumps: 1,812,000 bytes took 1,048 s, 1,729 bytes a second, on a
+cable that carries TFTP at 965 KB/s. The time was not the network. 1.762
+s of each 2.365 s chunk was the board's serial port, which every
+character of the hex went through first; 0.600 s was the host waiting
+for silence before sending the next command; the 261 datagrams a chunk
+cost almost nothing. Neither of those survives in `readback`.
+
+@TRAP **A burst the host's socket cannot hold is dropped without a word.**
+On 2026-09-16 a 1 MiB request lost 345,600 of its 1,048,576 bytes, twice:
+the board sends a request at the link's speed, and the host socket's
+default receive buffer - 64 KB on Windows - overflowed whenever the reader
+fell a moment behind. The reader now raises the console socket's receive
+buffer to 8 MiB once, before the first request, and caps each request so
+its whole reply fits in half of what the operating system actually
+granted. `tools/anvil_readback_burst_check.py` sends a whole reply before
+reading a byte of it, on loopback: the old configuration must lose it, and
+2,382,400 bytes read the new way must arrive complete.
+
+@NOTE `board_run.py` does **not** use TFTP. Its trace comes back with
+`readback` over the console, and its picture comes back over the console
+stream. TFTP is a monitor feature you drive yourself when you want a
+large region off the board as a file.
+
+@TRAP `tftpboot` and `tftpput` are deliberately **not** accepted as
+aliases. U-Boot takes the address first and the name second; this
+monitor takes the name first, to match its own `load` and `save`. An
+alias whose arguments mean something else is worse than no alias - a
+line pasted out of a U-Boot session would run, and fetch a file called
+`0x400000`.
+
+@SECTION How fast a transfer goes, and the rule behind it
+
+A `get` or a `put` is **stop-and-wait**: the board sends one 512-byte
+block, the server acknowledges it, and only then does the next block go
+out. Nothing is in flight but one block, so a transfer's speed is
+decided entirely by how quickly the board notices the acknowledgement.
+Notice it in a millisecond and 512 bytes cost a millisecond. Notice it
+in two hundred and the same 512 bytes cost two hundred.
+
+That is not a theoretical range. Until build 146 the transfer loop used
+the monitor's **fair** receive pump, which polls every interface without
+waiting and then blocks its whole 200 ms slice on one of them, taken in
+turn. Fairness is right for a listener with no expectation - an idle
+prompt, a passive TCP open - because no interface is likelier than
+another to hold the next frame. It is wrong for a loop that has just
+sent something and knows exactly which wire the reply is coming back
+over.
+
+A Raspberry Pi 4 running this monitor usually holds **two** addresses at
+once - one on the cable and one on the radio - and both interfaces are
+then usable, so that blocking branch is live. Follow one block through
+it:
+
+@FRAG
+turn 1   the poll takes the acknowledgement off the cable, and the
+         rotation moves on to the radio. The next block goes out.
+turn 2   the poll runs microseconds later; the server has not answered
+         yet, so nothing is anywhere - and the slice is spent BLOCKED
+         ON THE RADIO. The acknowledgement lands on the cable a
+         millisecond in and sits there for the other 199.
+turn 3   the poll finds it, and it all happens again.
+@ENDFRAG
+
+@TRAP The rotation never rescues it. Taking a frame off the cable sets
+the cursor one past the cable, and the idle slice that follows walks it
+round and back, so the wait lands on the radio after **every** block
+rather than half of them.
+
+Measured on a board, both interfaces up, before and after:
+
+@FRAG
+                            before            after
+98,304 bytes, 193 blocks    36.35 s           0.106 s
+                            2.70 KB/s         930 KB/s
+                            188 ms a block    0.55 ms a block
+
+1,812,000 bytes,            ~666 s, and       1.877 s
+3,540 blocks                REFUSED at the    965 KB/s
+                            ten-minute
+                            ceiling
+
+retransmissions             0                 0
+duplicates ignored          0                 0
+gaps                        0                 0
+datagrams for us            194               194
+@ENDFRAG
+
+@TRAP Read those counters again, because they are the interesting part.
+**Nothing was ever being lost.** Every acknowledgement arrived and was
+taken, on both builds - the counters are identical and only the clock
+moved. A transfer that is slow for this reason looks perfectly healthy
+in every tally the monitor prints, which is exactly why it went
+unnoticed: there is no error to find, and the only symptom is the
+wall clock.
+
+The rule, from build 146: **a stop-and-wait transfer's blocking wait
+belongs on the wire its answers arrive on.** The loop still polls every
+usable interface before it waits anywhere - ARP requests, pings, the
+DHCP service the board runs on the cable and console keystrokes on the
+radio are all still answered during a transfer, including the keystroke
+that cancels one - but the slice itself is spent on the interface the
+transfer was routed onto, and on no other. A block then costs one host
+round trip, a millisecond or two, instead of a whole slice.
+
+@NOTE The slice is still 200 ms and that is deliberate. A receive
+deadline is a **ceiling, not a cost**: the call returns the instant a
+frame arrives, so once the wait is on the right wire the 200 only
+decides how long a *dead* transfer sits between its own retransmissions.
+Shrinking it would buy nothing and would risk a slice shorter than the
+time a slow link needs to assemble one frame, which turns a working
+transfer into a stream of runts.
+
+@TRAP This is the rule to reach for whenever a loop sends and then
+waits, and it applies to more than TFTP: the address resolution a
+transfer does first has the same shape, and takes the same treatment.
+Any future request-and-reply command on this board should ask, before it
+waits, *which wire is the answer coming back on* - and wait there.
+
+@SECTION Screenshots on their own
+
+@FRAG
+python tools/pmfshot.py COM7 anvil.png
+@ENDFRAG
+
+That drives the monitor's live-screen command over the serial line,
+decodes the run-length stream it sends back, and writes a PNG plus the
+raw stream beside it.
+
+@NOTE It run-length encodes first for a reason worth appreciating. The
+framebuffer is 1824 by 984 by 4 bytes - about 7.18 MB, or 14 MB as hex,
+or roughly twenty minutes of wire time at 115200. A console screen is
+overwhelmingly one background colour in long horizontal runs, and
+collapses to a few tens of kilobytes.
+
+@SECTION What none of this proves
+
+The gates behind the capture path execute emitted code over a modelled
+panel. They cannot show that the bytes in the scanout region are the
+bytes the glass is lit with, that a 12 MiB capture region is really free
+on silicon, that a 4 MB copy fits in the window between a payload
+returning and the console repainting, or that a picture survives the
+trip over UDP. Those are board facts, and the repository records them as
+owed rather than assumed.

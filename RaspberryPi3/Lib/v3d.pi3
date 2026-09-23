@@ -1,0 +1,513 @@
+; ======================================================================
+; Pi3 V3D (VideoCore IV / VC4) bring-up eligibility and identity probe.
+;
+; Source basis (Raspberry Pi Linux rpi-6.12.y):
+;   arch/arm/boot/dts/broadcom/bcm2837-rpi-3-b.dts
+;     -> bcm2836-rpi.dtsi -> bcm2835-rpi-common.dtsi, which adds
+;     power-domains = <&power RPI_POWER_DOMAIN_V3D>.
+;   include/dt-bindings/power/raspberrypi-power.h: V3D binding index 10;
+;     drivers/pmdomain/bcm/raspberrypi-power.c maps binding index + 1,
+;     so firmware domain ID 11. That driver enables V3D only through the
+;     new GET/SET_DOMAIN_STATE interface; its old interface fallback is
+;     initialized for USB only. Unknown/new-interface-unsupported is a
+;     hard refusal here (no guessed legacy V3D operation).
+;   Pi3's V3D node has no `clocks` property. vc4_v3d.c requests an
+;     optional clock, so do not guess/set firmware clock ID 5. The Linux
+;     runtime power-domain provider is the applicable board path.
+;   bcm2835-common.dtsi: V3D bus register window 0x7ec00000/0x1000;
+;     bcm2837.dtsi translates 0x7e000000 to ARM 0x3f000000, so physical
+;     address is 0x3fc00000. vc4_regs.h: IDENT0/1/2 offsets 0/4/8 and
+;     expected IDENT0 encoding.
+;
+; This module never touches BCM2835 PM/ASB registers and never powers V3D
+; off. It uses the same firmware mailbox interface as Linux, checks the
+; live board revision, EL3/MMU state and address guard, then enables the
+; V3D domain only when its firmware interface is positively
+; identified. The probe validates the live firmware DTB itself and must be
+; run under the monitor-owned deadman before any renderer/job is added.
+; Include after mailbox.pbi, mmu.pi3, hw_mem.pi3, hw_id.pi3 and hw_addr.pi3.
+; ======================================================================
+
+#PI3_V3D_BASE = $3FC00000
+#PI3_V3D_BYTES = $1000
+#PI3_V3D_DOMAIN_ID = 11
+#PI3_V3D_DOMAIN_SENTINEL_ID = 22 ; exact binding ID passed by Linux probe
+#PI3_V3D_TAG_GET_DOMAIN_STATE = $00030030
+#PI3_V3D_TAG_SET_DOMAIN_STATE = $00038030
+#PI3_V3D_TAG_BYTES = 8
+#PI3_V3D_MSG_BYTES = 32
+#PI3_V3D_IDENT0 = 0
+#PI3_V3D_IDENT1 = 4
+#PI3_V3D_IDENT2 = 8
+#PI3_V3D_IDENT0_EXPECTED = $02443356
+#PI3_V3D_FDT_MAGIC = $D00DFEED
+#PI3_V3D_FDT_MAX_BYTES = $100000
+#PI3_V3D_FDT_MAX_DEPTH = 32
+
+#PI3_V3D_ERR_ARGS = -1
+#PI3_V3D_ERR_BOARD = -2
+#PI3_V3D_ERR_CONTEXT = -3
+#PI3_V3D_ERR_MAILBOX = -4
+#PI3_V3D_ERR_DOMAIN_API = -5
+#PI3_V3D_ERR_DOMAIN = -6
+#PI3_V3D_ERR_MMIO_RANGE = -7
+#PI3_V3D_ERR_IDENT = -8
+#PI3_V3D_ERR_DTB = -9
+
+Global pi3_v3d_domain_api.i = -1
+Global pi3_v3d_domain_state.i = -1
+Global pi3_v3d_ident0.i = 0
+Global pi3_v3d_ident1.i = 0
+Global pi3_v3d_ident2.i = 0
+Global pi3_v3d_error.i = 0
+Global pi3_v3d_dtb_stage.i = 0
+Global pi3_v3d_probe_stage.i = 0
+Global pi3_v3d_set_ack.i = -1
+Global pi3_v3d_domain_state_initial.i = -1
+Global pi3_v3d_set_mailbox_ok.i = -1
+Global pi3_v3d_set_tag_echo.i = -1
+Global pi3_v3d_set_size_echo.i = -1
+Global pi3_v3d_set_response_size.i = -1
+Global pi3_v3d_set_domain_echo.i = -1
+Global pi3_v3d_set_state_reply.i = -1
+; The probe is also callable from a bounded returning monitor payload. In that
+; case these point at the resident mailbox's registered NC scratch and owner
+; flag; never substitute payload-local memory after MMU/cache enable.
+Global pi3_v3d_mailbox_scratch.i = 0
+Global pi3_v3d_mailbox_owner.i = 0
+
+Structure Pi3V3dIdentity
+  ident0.l
+  ident1.l
+  ident2.l
+  version.l
+  revision.l
+  slices.l
+  qpusPerSlice.l
+  tmusPerSlice.l
+  semaphores.l
+  vpmKiB.l
+EndStructure
+
+Procedure.i p3vBe32(p.i)
+  ProcedureReturn (((PeekA(p) & $FF) << 24) | ((PeekA(p + 1) & $FF) << 16) | ((PeekA(p + 2) & $FF) << 8) | (PeekA(p + 3) & $FF)) & $FFFFFFFF
+EndProcedure
+
+Procedure.i p3vNameEq(p.i, limit.i, text.i)
+  Protected n.i
+  For n = 0 To 127
+    If p + n >= limit : ProcedureReturn 0 : EndIf
+    If (PeekA(p + n) & $FF) <> (PeekA(text + n) & $FF) : ProcedureReturn 0 : EndIf
+    If PeekA(text + n) = 0 : ProcedureReturn 1 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i p3vListHas(p.i, bytes.i, text.i)
+  Protected at.i, n.i, k.i, equal.i
+  at = 0
+  While at < bytes
+    n = 0
+    While at + n < bytes And PeekA(p + at + n) <> 0 : n = n + 1 : Wend
+    If at + n >= bytes : ProcedureReturn 0 : EndIf
+    k = 0
+    While PeekA(text + k) <> 0 : k = k + 1 : Wend
+    equal = (n = k)
+    If equal <> 0
+      For k = 0 To n - 1
+        If (PeekA(p + at + k) & $FF) <> (PeekA(text + k) & $FF) : equal = 0 : Break : EndIf
+      Next
+    EndIf
+    If equal <> 0 : ProcedureReturn 1 : EndIf
+    at = at + n + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; Validate the actual Pi 3 firmware DTB path Linux binds. This checks the
+; /soc child by compatible and register tuple, then resolves the
+; power-domains phandle to the Raspberry Pi firmware power provider. It
+; deliberately rejects missing/ambiguous bindings and does not infer a
+; clock or a register base from the board model alone.
+Procedure.i Pi3V3dDtbValid(*dtb, *dtbEnd)
+  Protected total.i, structOff.i, stringsOff.i, structBytes.i, stringsBytes.i
+  Protected struct.i, structEnd.i, strings.i, stringsEnd.i, token.i, depth.i
+  Protected scan.i, nameLen.i, propLen.i, nameOff.i, propName.i, idx.i
+  Protected provider.i, providerFound.i, targetFound.i, hostBus.i, hostSize.i, hostPower.i
+  Protected v3dPowerPhandle.i, v3dDomainValid.i
+  Protected rootAddrCells.i, rootSizeCells.i, socAddrCells.i, socSizeCells.i
+  Protected socRangesValid.i, mapAt.i, translated.i
+  Protected v3dCompat.i, v3dReg.i, v3dPower.i, providerCompat.i
+  Protected Dim nodeSoc.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeTarget.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeProvider.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeCompat.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeProviderCompat.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeReg.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodePower.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodePowerPhandle.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodePhandle.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodePowerCells.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeBus.i[#PI3_V3D_FDT_MAX_DEPTH]
+  Protected Dim nodeSize.i[#PI3_V3D_FDT_MAX_DEPTH]
+  pi3_v3d_dtb_stage = 1
+  If *dtb = 0 Or *dtbEnd <= *dtb Or *dtbEnd - *dtb < 40 : ProcedureReturn 0 : EndIf
+  If p3vBe32(*dtb) <> #PI3_V3D_FDT_MAGIC : ProcedureReturn 0 : EndIf
+  total = p3vBe32(*dtb + 4)
+  If total < 40 Or total > #PI3_V3D_FDT_MAX_BYTES Or total > *dtbEnd - *dtb : ProcedureReturn 0 : EndIf
+  If p3vBe32(*dtb + 20) < 17 Or p3vBe32(*dtb + 24) > 17 : ProcedureReturn 0 : EndIf
+  structOff = p3vBe32(*dtb + 8) : stringsOff = p3vBe32(*dtb + 12)
+  stringsBytes = p3vBe32(*dtb + 32) : structBytes = p3vBe32(*dtb + 36)
+  If structOff < 40 Or (structOff & 3) <> 0 Or structBytes < 4 Or structOff > total - structBytes : ProcedureReturn 0 : EndIf
+  If stringsOff < 40 Or stringsBytes < 1 Or stringsOff > total - stringsBytes : ProcedureReturn 0 : EndIf
+  If structOff < stringsOff + stringsBytes And stringsOff < structOff + structBytes : ProcedureReturn 0 : EndIf
+  struct = *dtb + structOff : structEnd = struct + structBytes
+  strings = *dtb + stringsOff : stringsEnd = strings + stringsBytes
+  pi3_v3d_dtb_stage = 2
+  depth = 0 : providerFound = 0 : targetFound = 0 : provider = 0
+  rootAddrCells = 0 : rootSizeCells = 0 : socAddrCells = 0 : socSizeCells = 0 : socRangesValid = 0
+  v3dPowerPhandle = 0 : v3dDomainValid = 0 : hostBus = 0 : hostSize = 0
+  v3dCompat = 0 : v3dReg = 0 : v3dPower = 0
+  While struct <= structEnd - 4
+    token = p3vBe32(struct) : struct = struct + 4
+    pi3_v3d_dtb_stage = 100 + token
+    Select token
+      Case 1
+        If depth >= #PI3_V3D_FDT_MAX_DEPTH : ProcedureReturn 0 : EndIf
+        scan = struct : nameLen = 0
+        While scan < structEnd And PeekA(scan) <> 0 And nameLen < 256
+          scan = scan + 1 : nameLen = nameLen + 1
+        Wend
+        If scan >= structEnd Or nameLen = 256 : ProcedureReturn 0 : EndIf
+        idx = depth
+        nodeSoc[idx] = 0 : nodeTarget[idx] = 0 : nodeProvider[idx] = 0
+        nodeCompat[idx] = 0 : nodeProviderCompat[idx] = 0 : nodeReg[idx] = 0 : nodePower[idx] = 0 : nodePowerPhandle[idx] = 0
+        nodePhandle[idx] = 0 : nodePowerCells[idx] = 0 : nodeBus[idx] = 0 : nodeSize[idx] = 0
+        If depth = 1 And nameLen = 3 And p3vNameEq(struct, struct + nameLen + 1, "soc") <> 0
+          nodeSoc[idx] = 1
+        EndIf
+        If depth = 2 And nodeSoc[depth - 1] <> 0 : nodeTarget[idx] = 1 : EndIf
+        nodeProvider[idx] = 1
+        struct = (scan + 4) & $FFFFFFFFFFFFFFFC
+        depth = depth + 1
+      Case 2
+        If depth < 1 : ProcedureReturn 0 : EndIf
+        idx = depth - 1
+        If nodeProvider[idx] <> 0 And nodeProviderCompat[idx] <> 0 And nodePhandle[idx] <> 0 And nodePowerCells[idx] = 1
+          If providerFound <> 0 And provider <> nodePhandle[idx] : ProcedureReturn 0 : EndIf
+          provider = nodePhandle[idx] : providerFound = 1
+        EndIf
+        If nodeTarget[idx] <> 0 And nodeCompat[idx] <> 0 And nodeReg[idx] <> 0 And nodePower[idx] <> 0
+          If targetFound <> 0 : ProcedureReturn 0 : EndIf
+          hostBus = nodeBus[idx] : hostSize = nodeSize[idx]
+          v3dPowerPhandle = nodePowerPhandle[idx] : v3dDomainValid = nodePower[idx]
+          targetFound = 1
+        EndIf
+        depth = depth - 1
+      Case 3
+        If depth < 1 Or struct > structEnd - 8 : ProcedureReturn 0 : EndIf
+        propLen = p3vBe32(struct) : nameOff = p3vBe32(struct + 4) : struct = struct + 8
+        If propLen > structEnd - struct Or nameOff >= stringsBytes : ProcedureReturn 0 : EndIf
+        propName = strings + nameOff
+        scan = propName
+        While scan < stringsEnd And PeekA(scan) <> 0 : scan = scan + 1 : Wend
+        If scan >= stringsEnd : ProcedureReturn 0 : EndIf
+        idx = depth - 1
+        If nodeTarget[idx] <> 0
+          If p3vNameEq(propName, scan + 1, "compatible") <> 0
+            nodeCompat[idx] = Bool(p3vListHas(struct, propLen, "brcm,bcm2835-v3d") <> 0 Or p3vListHas(struct, propLen, "brcm,vc4-v3d") <> 0)
+          ElseIf p3vNameEq(propName, scan + 1, "reg") <> 0 And propLen = 8
+            nodeBus[idx] = p3vBe32(struct) : nodeSize[idx] = p3vBe32(struct + 4)
+            nodeReg[idx] = Bool(nodeBus[idx] = $7EC00000 And nodeSize[idx] = $1000)
+          ElseIf p3vNameEq(propName, scan + 1, "power-domains") <> 0 And propLen = 8
+            nodePower[idx] = Bool(p3vBe32(struct + 4) = 10)
+            nodePowerPhandle[idx] = p3vBe32(struct)
+          EndIf
+        EndIf
+        If depth = 1
+          If p3vNameEq(propName, scan + 1, "#address-cells") <> 0 And propLen = 4
+            rootAddrCells = p3vBe32(struct)
+          ElseIf p3vNameEq(propName, scan + 1, "#size-cells") <> 0 And propLen = 4
+            rootSizeCells = p3vBe32(struct)
+          EndIf
+        EndIf
+        If nodeSoc[idx] <> 0
+          If p3vNameEq(propName, scan + 1, "#address-cells") <> 0 And propLen = 4
+            socAddrCells = p3vBe32(struct)
+          ElseIf p3vNameEq(propName, scan + 1, "#size-cells") <> 0 And propLen = 4
+            socSizeCells = p3vBe32(struct)
+          ElseIf p3vNameEq(propName, scan + 1, "ranges") <> 0 And propLen = 24
+            mapAt = struct
+            If p3vBe32(mapAt) = $7E000000 And p3vBe32(mapAt + 4) = $3F000000 And p3vBe32(mapAt + 8) = $01000000
+              If p3vBe32(mapAt + 12) = $40000000 And p3vBe32(mapAt + 16) = $40000000 And p3vBe32(mapAt + 20) = $1000
+                socRangesValid = 1
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+        If nodeProvider[idx] <> 0
+          If p3vNameEq(propName, scan + 1, "compatible") <> 0
+            nodeProviderCompat[idx] = p3vListHas(struct, propLen, "raspberrypi,bcm2835-power")
+          ElseIf p3vNameEq(propName, scan + 1, "phandle") <> 0 Or p3vNameEq(propName, scan + 1, "linux,phandle") <> 0
+            If propLen = 4 : nodePhandle[idx] = p3vBe32(struct) : EndIf
+          ElseIf p3vNameEq(propName, scan + 1, "#power-domain-cells") <> 0
+            If propLen = 4 : nodePowerCells[idx] = p3vBe32(struct) : EndIf
+          EndIf
+        EndIf
+        struct = (struct + propLen + 3) & $FFFFFFFFFFFFFFFC
+      Case 4
+      Case 9
+        pi3_v3d_dtb_stage = 90
+        If depth <> 0 : ProcedureReturn 0 : EndIf
+        If providerFound = 0 : pi3_v3d_dtb_stage = 911 : ProcedureReturn 0 : EndIf
+        If targetFound = 0 : pi3_v3d_dtb_stage = 912 : ProcedureReturn 0 : EndIf
+        If v3dPowerPhandle = 0 : pi3_v3d_dtb_stage = 913 : ProcedureReturn 0 : EndIf
+        If v3dDomainValid = 0 : pi3_v3d_dtb_stage = 914 : ProcedureReturn 0 : EndIf
+        pi3_v3d_dtb_stage = 92
+        If rootAddrCells <> 1 Or rootSizeCells <> 1 Or socAddrCells <> 1 Or socSizeCells <> 1 Or socRangesValid = 0
+          ProcedureReturn 0
+        EndIf
+        pi3_v3d_dtb_stage = 93
+        If hostBus < $7E000000 Or hostBus + hostSize > $7F000000 : ProcedureReturn 0 : EndIf
+        translated = $3F000000 + hostBus - $7E000000
+        pi3_v3d_dtb_stage = 94
+        If translated <> #PI3_V3D_BASE Or hostSize <> #PI3_V3D_BYTES : ProcedureReturn 0 : EndIf
+        pi3_v3d_dtb_stage = 95
+        If v3dPowerPhandle <> provider : ProcedureReturn 0 : EndIf
+        pi3_v3d_dtb_stage = 99
+        ProcedureReturn 1
+      Default
+        ProcedureReturn 0
+    EndSelect
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; New-style revision model IDs that Linux identifies as BCM2837 boards:
+; Pi 3B, Compute Module 3, 3B+, 3A+, and Compute Module 3+ (incl. Lite).
+; Pi Zero/Zero 2, Pi 4 and unknown IDs fail closed.
+Procedure.i Pi3V3dBoardRevisionSupported(revision.i)
+  Protected model.i
+  If revision < 0 Or (revision & $800000) = 0 : ProcedureReturn 0 : EndIf
+  model = (revision >> 4) & $FF
+  Select model
+    Case $08
+      ProcedureReturn 1
+    Case $0A
+      ProcedureReturn 1
+    Case $0D
+      ProcedureReturn 1
+    Case $0E
+      ProcedureReturn 1
+    Case $10
+      ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; A valid response is intentionally exact. New power-domain state is a
+; Boolean; unlike the legacy power API it has no "device exists" bit.
+Procedure.i Pi3V3dDomainStateValid(state.i)
+  If state = 0 Or state = 1 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i pi3V3dProperty(tag.i, id.i, value.i, sendValue.i, *reply)
+  Protected buffer.i
+  Protected tagState.i
+  If tag = #PI3_V3D_TAG_SET_DOMAIN_STATE
+    pi3_v3d_set_mailbox_ok = 0
+    pi3_v3d_set_tag_echo = -1 : pi3_v3d_set_size_echo = -1
+    pi3_v3d_set_response_size = -1 : pi3_v3d_set_domain_echo = -1
+    pi3_v3d_set_state_reply = -1
+  EndIf
+  If *reply = 0 Or pi3_v3d_mailbox_scratch = 0 Or pi3_v3d_mailbox_owner = 0
+    ProcedureReturn 0
+  EndIf
+  If PeekI(pi3_v3d_mailbox_owner) <> 0
+    ProcedureReturn 0
+  EndIf
+  buffer = ((pi3_v3d_mailbox_scratch + 15) >> 4) << 4
+  PokeL(buffer, #PI3_V3D_MSG_BYTES) : PokeL(buffer + 4, 0)
+  PokeL(buffer + 8, tag) : PokeL(buffer + 12, #PI3_V3D_TAG_BYTES)
+  PokeL(buffer + 16, 4 + sendValue * 4)
+  PokeL(buffer + 20, id) : PokeL(buffer + 24, value)
+  PokeL(buffer + 28, 0)
+  If Pi3MailboxCallTimeout(buffer, #PI3_V3D_MSG_BYTES, 250000) = 0
+    ProcedureReturn 0
+  EndIf
+  If tag = #PI3_V3D_TAG_SET_DOMAIN_STATE
+    pi3_v3d_set_mailbox_ok = 1
+    pi3_v3d_set_tag_echo = PeekL(buffer + 8) & $FFFFFFFF
+    pi3_v3d_set_size_echo = PeekL(buffer + 12) & $FFFFFFFF
+    pi3_v3d_set_response_size = PeekL(buffer + 16) & $FFFFFFFF
+    pi3_v3d_set_domain_echo = PeekL(buffer + 20) & $FFFFFFFF
+    pi3_v3d_set_state_reply = PeekL(buffer + 24) & $FFFFFFFF
+  EndIf
+  If PeekL(buffer + 8) <> tag Or PeekL(buffer + 12) <> #PI3_V3D_TAG_BYTES
+    ProcedureReturn 0
+  EndIf
+  tagState = PeekL(buffer + 16) & $FFFFFFFF
+  If tagState <> $80000008 : ProcedureReturn 0 : EndIf
+  ; Linux's rpi_firmware_set_power() treats a successful property
+  ; transaction as the SET acknowledgement. Firmware may return zero in
+  ; the domain word for SET, so only GET responses require an ID echo.
+  If tag <> #PI3_V3D_TAG_SET_DOMAIN_STATE
+    If (PeekL(buffer + 20) & $FFFFFFFF) <> id : ProcedureReturn 0 : EndIf
+  EndIf
+  PokeI(*reply, PeekL(buffer + 24) & $FFFFFFFF)
+  ProcedureReturn 1
+EndProcedure
+
+; Probe the firmware's *new* domain interface with the same sentinel
+; procedure used by Linux raspberrypi-power.c. Linux passes the ARM binding
+; index (22) here, while actual new-style domain requests use binding+1.
+; Unknown tags are skipped by firmware; unchanged sentinel means unsupported.
+Procedure.i Pi3V3dDomainInterfaceAvailable()
+  Protected state.i
+  state = $FFFFFFFF
+  If pi3V3dProperty(#PI3_V3D_TAG_GET_DOMAIN_STATE, #PI3_V3D_DOMAIN_SENTINEL_ID, state, 1, @state) = 0
+    ProcedureReturn 0
+  EndIf
+  If state = $FFFFFFFF : ProcedureReturn 0 : EndIf
+  If Pi3V3dDomainStateValid(state) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3V3dGetDomainState(*state)
+  If Pi3V3dDomainInterfaceAvailable() = 0 : ProcedureReturn 0 : EndIf
+  ; The Raspberry Pi Linux power driver sends the two-word domain packet
+  ; for GET_DOMAIN_STATE too; seed the output word so an unsupported tag
+  ; cannot masquerade as a valid powered-off result.
+  ProcedureReturn pi3V3dProperty(#PI3_V3D_TAG_GET_DOMAIN_STATE, #PI3_V3D_DOMAIN_ID, $FFFFFFFF, 1, *state)
+EndProcedure
+
+Procedure.i Pi3V3dSetDomainOn()
+  Protected state.i
+  If Pi3V3dDomainInterfaceAvailable() = 0 : ProcedureReturn 0 : EndIf
+  If pi3V3dProperty(#PI3_V3D_TAG_SET_DOMAIN_STATE, #PI3_V3D_DOMAIN_ID, 1, 1, @state) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Linux rpi_firmware_set_power() treats a successful property transaction
+  ; as the SET acknowledgement. The returned payload is not the authoritative
+  ; power state; Pi3V3dProbeIdentity immediately issues GET_DOMAIN_STATE.
+  pi3_v3d_set_ack = state
+  ProcedureReturn 1
+EndProcedure
+
+; Pure decoder shared by the real probe and its emitted gate. Return 1 only
+; for the Linux VC4 expected IDENT0 signature; retain all other words for
+; diagnosis without interpreting a V3D 4.x hub/core register layout.
+Procedure.i Pi3V3dDecodeIdentity(ident0.i, ident1.i, ident2.i, *out.Pi3V3dIdentity)
+  If *out = 0 : ProcedureReturn #PI3_V3D_ERR_ARGS : EndIf
+  *out\ident0 = ident0 & $FFFFFFFF
+  *out\ident1 = ident1 & $FFFFFFFF
+  *out\ident2 = ident2 & $FFFFFFFF
+  *out\version = (ident0 >> 24) & $FF
+  *out\revision = ident1 & $F
+  *out\slices = (ident1 >> 4) & $F
+  *out\qpusPerSlice = (ident1 >> 8) & $F
+  *out\tmusPerSlice = (ident1 >> 12) & $F
+  *out\semaphores = (ident1 >> 16) & $FF
+  *out\vpmKiB = ((ident1 >> 28) & $F) * 1
+  If (ident0 & $FFFFFFFF) <> #PI3_V3D_IDENT0_EXPECTED
+    ProcedureReturn #PI3_V3D_ERR_IDENT
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; This is the only routine that reads V3D MMIO. It is fail-closed until
+; the live BCM2837 revision, EL3/MMU context, registered NC mailbox context,
+; firmware domain support and domain-on state all agree. It does
+; not reset the core, change its clock rate, touch ASB, or write V3D regs.
+Procedure.i Pi3V3dProbeIdentity(*dtb, *dtbEnd, *out.Pi3V3dIdentity, *mailboxScratch, *mailboxOwner)
+  Protected revision.i
+  Protected state.i
+  Protected identRc.i
+  Protected mailboxAligned.i
+  If *out = 0 Or *mailboxScratch = 0 Or *mailboxOwner = 0
+    pi3_v3d_error = #PI3_V3D_ERR_ARGS : ProcedureReturn pi3_v3d_error
+  EndIf
+  pi3_v3d_error = 0
+  pi3_v3d_probe_stage = 1
+  pi3_v3d_set_ack = -1
+  pi3_v3d_domain_state_initial = -1
+  pi3_v3d_set_mailbox_ok = -1
+  pi3_v3d_set_tag_echo = -1 : pi3_v3d_set_size_echo = -1
+  pi3_v3d_set_response_size = -1 : pi3_v3d_set_domain_echo = -1
+  pi3_v3d_set_state_reply = -1
+  pi3_v3d_mailbox_scratch = *mailboxScratch
+  pi3_v3d_mailbox_owner = *mailboxOwner
+  If Pi3V3dDtbValid(*dtb, *dtbEnd) = 0
+    pi3_v3d_error = #PI3_V3D_ERR_DTB : ProcedureReturn pi3_v3d_error
+  EndIf
+  If HwPmfTargetId() <> 2837
+    pi3_v3d_error = #PI3_V3D_ERR_BOARD : ProcedureReturn pi3_v3d_error
+  EndIf
+  revision = HwMemoryRevision()
+  If Pi3V3dBoardRevisionSupported(revision) = 0
+    pi3_v3d_error = #PI3_V3D_ERR_BOARD : ProcedureReturn pi3_v3d_error
+  EndIf
+  If MmuAtEl3() = 0 Or MmuEnabled() = 0 Or Pi3MailboxContextState() <> 2
+    pi3_v3d_error = #PI3_V3D_ERR_CONTEXT : ProcedureReturn pi3_v3d_error
+  EndIf
+  mailboxAligned = ((pi3_v3d_mailbox_scratch + 15) >> 4) << 4
+  If Pi3MailboxBufferContext(mailboxAligned, #PI3_V3D_MSG_BYTES) = 0
+    pi3_v3d_error = #PI3_V3D_ERR_CONTEXT : ProcedureReturn pi3_v3d_error
+  EndIf
+  If HwAddrCheck(#PI3_V3D_BASE, #PI3_V3D_BASE + #PI3_V3D_BYTES - 1, 0) <> #HW_ADDR_SAFE
+    pi3_v3d_error = #PI3_V3D_ERR_MMIO_RANGE : ProcedureReturn pi3_v3d_error
+  EndIf
+
+  pi3_v3d_domain_api = Pi3V3dDomainInterfaceAvailable()
+  If pi3_v3d_domain_api = 0
+    pi3_v3d_probe_stage = 10
+    pi3_v3d_error = #PI3_V3D_ERR_DOMAIN_API : ProcedureReturn pi3_v3d_error
+  EndIf
+  pi3_v3d_probe_stage = 11
+  If Pi3V3dGetDomainState(@state) = 0
+    pi3_v3d_probe_stage = 12
+    pi3_v3d_error = #PI3_V3D_ERR_DOMAIN : ProcedureReturn pi3_v3d_error
+  EndIf
+  If Pi3V3dDomainStateValid(state) = 0
+    pi3_v3d_probe_stage = 13
+    pi3_v3d_error = #PI3_V3D_ERR_DOMAIN : ProcedureReturn pi3_v3d_error
+  EndIf
+  pi3_v3d_domain_state = state
+  pi3_v3d_domain_state_initial = state
+  If state = 0
+    pi3_v3d_probe_stage = 20
+    If Pi3V3dSetDomainOn() = 0
+      pi3_v3d_probe_stage = 21
+      pi3_v3d_error = #PI3_V3D_ERR_DOMAIN : ProcedureReturn pi3_v3d_error
+    EndIf
+    pi3_v3d_probe_stage = 22
+    If Pi3V3dGetDomainState(@state) = 0
+      pi3_v3d_probe_stage = 23
+      pi3_v3d_error = #PI3_V3D_ERR_DOMAIN : ProcedureReturn pi3_v3d_error
+    EndIf
+    If state <> 1
+      pi3_v3d_probe_stage = 24
+      pi3_v3d_error = #PI3_V3D_ERR_DOMAIN : ProcedureReturn pi3_v3d_error
+    EndIf
+    pi3_v3d_domain_state = state
+  EndIf
+
+  pi3_v3d_probe_stage = 30
+  ASM
+    dsb sy
+  EndASM
+  pi3_v3d_ident0 = PeekL(#PI3_V3D_BASE + #PI3_V3D_IDENT0) & $FFFFFFFF
+  pi3_v3d_ident1 = PeekL(#PI3_V3D_BASE + #PI3_V3D_IDENT1) & $FFFFFFFF
+  pi3_v3d_ident2 = PeekL(#PI3_V3D_BASE + #PI3_V3D_IDENT2) & $FFFFFFFF
+  ASM
+    dsb sy
+  EndASM
+  identRc = Pi3V3dDecodeIdentity(pi3_v3d_ident0, pi3_v3d_ident1, pi3_v3d_ident2, *out)
+  If identRc <> 1
+    pi3_v3d_probe_stage = 31
+    pi3_v3d_error = #PI3_V3D_ERR_IDENT : ProcedureReturn pi3_v3d_error
+  EndIf
+  pi3_v3d_probe_stage = 32
+  ProcedureReturn 1
+EndProcedure

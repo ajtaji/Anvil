@@ -1,0 +1,713 @@
+; Resident Vulkan endpoint for the shared console grid.
+;
+; The console core remains the sole owner of output draining and model state.
+; This file owns the Vulkan target/Chrome lifetime and paints the already
+; drained grid when registered through ConSetRenderer(). It does not install
+; a second text engine: NeonVkChrome's callback family backs the same Neon
+; widget/text calls used by the V3D renderer.
+
+#AVC_OK                 = 0
+#AVC_ERR_DISPLAY        = -22101
+#AVC_ERR_V3D            = -22102
+#AVC_ERR_WINDOW         = -22103
+#AVC_ERR_VK              = -22104
+#AVC_ERR_TARGET         = -22105
+#AVC_ERR_CHROME         = -22106
+#AVC_ERR_PRESENT        = -22107
+#AVC_WINDOW_BASE        = #MON_VK_HEAP_LO
+#AVC_WINDOW_BYTES       = #MON_VK_HEAP_BYTES
+#AVC_ARENA_BASE         = $0A000000
+#AVC_ARENA_BYTES        = $01000000
+#AVC_MAX_DRAWS          = #NEON_VK_CHROME_MAX_QUADS
+#AVC_UI_QUAD_RESERVE    = 512
+#AVC_MAX_QUADS          = (#CON_MAXCOLS * #CON_MAXROWS) + #AVC_UI_QUAD_RESERVE
+
+Global avcReady.i
+Global avcActive.i
+Global avcQuarantined.i
+Global avcDeviceUnsafe.i
+Global avcNeonAllowed.i = 1
+Global avcError.i
+Global avcInstance.i
+Global avcPhysical.i
+Global avcDevice.i
+Global avcQueue.i
+Global avcPool.i
+Global avcImage.i
+Global avcMemory.i
+Global avcView.i
+Global avcRenderPass.i
+Global avcFramebuffer.i
+Global avcImageBase.i
+Global avcImagePitch.i
+Global avcImageBytes.i
+Global avcWidth.i
+Global avcHeight.i
+Global avcLogicalW.i
+Global avcLogicalH.i
+Global avcPitch.i
+Global avcRotation.i
+Global avcUiHeight.i
+Global avcFallbackPaint.i
+Global avcPayloadWasActive.i
+Global Dim avcClear.l[4]
+Global Dim avcGlyph.a[2]
+Global Dim avcGridGlyphs.l[#NEON_VK_CHROME_TT_CACHE_MAX - 1]
+
+Procedure.i VulkanConsoleError()
+  ProcedureReturn avcError
+EndProcedure
+
+Procedure.i avcCreateTarget()
+  Define rc.i
+  Define count.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define imageProps.VkImageFormatProperties
+  Define formatProps.VkFormatProperties
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+  Define mapped.i
+
+  If NeonGpuRangeMapped(#AVC_WINDOW_BASE, #AVC_WINDOW_BYTES) = 0
+    ProcedureReturn #AVC_ERR_WINDOW
+  EndIf
+  If AnvilVkV3dWindow(#AVC_WINDOW_BASE, #AVC_WINDOW_BYTES) <> #VK_SUCCESS
+    ProcedureReturn #AVC_ERR_WINDOW
+  EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @avcInstance)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_VK : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(avcInstance, @count, @avcPhysical)
+  If rc <> #VK_SUCCESS Or count <> 1 Or avcPhysical = 0 : ProcedureReturn #AVC_ERR_VK : EndIf
+
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(avcPhysical, @dci, 0, @avcDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_VK : EndIf
+  vkGetDeviceQueue(avcDevice, 0, 0, @avcQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(avcDevice, @pci, 0, @avcPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_VK : EndIf
+
+  vkGetPhysicalDeviceFormatProperties(avcPhysical, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  If (formatProps\linearTilingFeatures & #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) = 0
+    ProcedureReturn #AVC_ERR_TARGET
+  EndIf
+  rc = vkGetPhysicalDeviceImageFormatProperties(avcPhysical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, @imageProps)
+  If rc <> #VK_SUCCESS Or imageProps\maxExtent\width < avcWidth Or imageProps\maxExtent\height < avcHeight
+    ProcedureReturn #AVC_ERR_TARGET
+  EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = avcWidth : imageInfo\extent\height = avcHeight : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(avcDevice, @imageInfo, 0, @avcImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_TARGET : EndIf
+  vkGetImageMemoryRequirements(avcDevice, avcImage, @req)
+  If req\size <= 0 Or req\size > #AVC_WINDOW_BYTES Or imageProps\maxResourceSize < req\size
+    ProcedureReturn #AVC_ERR_TARGET
+  EndIf
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(avcDevice, @alloc, 0, @avcMemory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(avcDevice, avcImage, avcMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_TARGET : EndIf
+  avcImageBase = AnvilVkImageAddress(avcImage)
+  avcImagePitch = AnvilVkImageRowPitch(avcImage)
+  avcImageBytes = req\size
+  If avcImageBase = 0 Or avcImagePitch < avcWidth * 4 Or avcImagePitch * avcHeight > req\size
+    ProcedureReturn #AVC_ERR_TARGET
+  EndIf
+  mapped = 0
+  rc = vkMapMemory(avcDevice, avcMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> avcImageBase : ProcedureReturn #AVC_ERR_TARGET : EndIf
+  vkUnmapMemory(avcDevice, avcMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = avcImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(avcDevice, @viewInfo, 0, @avcView)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_TARGET : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(avcDevice, @passInfo, 0, @avcRenderPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_TARGET : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = avcRenderPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @avcView : frameInfo\width = avcWidth
+  frameInfo\height = avcHeight : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(avcDevice, @frameInfo, 0, @avcFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_TARGET : EndIf
+
+  rc = NeonVkChromeCreateWithCapacities(avcPhysical, avcDevice, avcQueue, avcPool, avcRenderPass, avcFramebuffer, avcWidth, avcHeight, #AVC_MAX_DRAWS, #AVC_MAX_QUADS)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_CHROME : EndIf
+  rc = NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation)
+  If rc <> #VK_SUCCESS : ProcedureReturn #AVC_ERR_CHROME : EndIf
+  ProcedureReturn #AVC_OK
+EndProcedure
+
+Procedure.i VulkanConsoleDestroy()
+  Define idleRc.i
+  idleRc = #VK_SUCCESS
+  If avcDevice <> 0
+    idleRc = vkDeviceWaitIdle(avcDevice)
+  EndIf
+  If idleRc <> #VK_SUCCESS
+    avcDeviceUnsafe = 1
+    ProcedureReturn 0
+  EndIf
+  If NeonVkChromeReady() <> 0 : NeonVkChromeDestroy() : EndIf
+  If avcDevice <> 0
+    If avcFramebuffer <> 0 : vkDestroyFramebuffer(avcDevice, avcFramebuffer, 0) : EndIf
+    If avcRenderPass <> 0 : vkDestroyRenderPass(avcDevice, avcRenderPass, 0) : EndIf
+    If avcView <> 0 : vkDestroyImageView(avcDevice, avcView, 0) : EndIf
+    If avcImage <> 0 : vkDestroyImage(avcDevice, avcImage, 0) : EndIf
+    If avcMemory <> 0 : vkFreeMemory(avcDevice, avcMemory, 0) : EndIf
+    If avcPool <> 0 : vkDestroyCommandPool(avcDevice, avcPool, 0) : EndIf
+    vkDestroyDevice(avcDevice, 0)
+  EndIf
+  If avcInstance <> 0 : vkDestroyInstance(avcInstance, 0) : EndIf
+  avcInstance = 0 : avcPhysical = 0 : avcDevice = 0 : avcQueue = 0 : avcPool = 0
+  avcImage = 0 : avcMemory = 0 : avcView = 0 : avcRenderPass = 0 : avcFramebuffer = 0
+  avcImageBase = 0 : avcImagePitch = 0 : avcImageBytes = 0 : avcReady = 0
+  ProcedureReturn Bool(idleRc = #VK_SUCCESS)
+EndProcedure
+
+; All asynchronous pump failures enter this one-way transition. CPU painting
+; is permitted only after both Vulkan idle and resident V3D invalidation prove
+; that no device can still own the target. Otherwise leave the screen detached.
+Procedure avcCpuCursorRefresh(wasShown.i)
+  ; This is deliberately the direct CPU branch of PointerShow. Calling
+  ; PointerShow here would make the compiler's callback graph recurse through
+  ; ConRepaint -> gConPaint -> VulkanConsolePump -> avcFailover.
+  If wasShown = 0 Or DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  CursorSave(gCurX, gCurY)
+  CursorDraw(gCurX, gCurY)
+  gCurShown = 1
+EndProcedure
+
+Procedure.i avcFailover(reason.i)
+  Define idleSafe.i, v3dSafe.i, hadCursor.i
+  hadCursor = gCurShown
+  If avcError = 0 : avcError = reason : EndIf
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  avcActive = 0
+  avcReady = 0
+  ConNoRenderer()
+  idleSafe = VulkanConsoleDestroy()
+  If idleSafe = 0
+    avcQuarantined = 1
+    avcFallbackPaint = 0
+    ProcedureReturn 0
+  EndIf
+  v3dSafe = V3dConInvalidate()
+  avcQuarantined = Bool(v3dSafe = 0)
+  If avcQuarantined <> 0
+    avcFallbackPaint = 0
+    ProcedureReturn 0
+  EndIf
+  ; Ownership changes only after both idle and invalidation succeeded. An
+  ; unsafe quarantine must keep pointer events away from CPU save-under writes.
+  gCursorGpuOwned = 0
+  gCurShown = 0
+  NeonGpuExtraMap(0, 0)
+  ; Do not probe the blitter from the console callback: its diagnostics would
+  ; re-enter the UART pump. Use the proven CPU framebuffer painter here.
+  gDma = 0 : DisplayUseDma(0)
+  If avcFallbackPaint = 0 : avcFallbackPaint = @ConPaintDma : EndIf
+  If gScreen <> 0
+    DisplayClear(gScreenBg) : DrawBanner()
+    DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+    ConSetRenderer(avcFallbackPaint)
+    ConOverlayMarkWhole() : ConGridMarkAll() : ConPaintDma()
+    TouchKeyboardComposeCpu()
+    ScrPresentAll()
+    avcCpuCursorRefresh(hadCursor)
+  Else
+    ConNoRenderer()
+  EndIf
+  avcFallbackPaint = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avcStartupFallback(reason.i)
+  avcError = reason
+  ConNoRenderer()
+  If V3dConInvalidate() = 0
+    avcQuarantined = 1
+    avcFallbackPaint = 0
+    ProcedureReturn 0
+  EndIf
+  avcQuarantined = 0
+  NeonGpuExtraMap(0, 0)
+  gDma = ScreenDmaUp()
+  ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i VulkanConsoleStart()
+  Define rc.i
+  Define fbBase.i, fbBytes.i
+  Define dramBytes.i
+  If avcActive <> 0 : ProcedureReturn #AVC_OK : EndIf
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  avcError = 0
+  If gScreen = 0 Or DisplayBase() = 0 Or DisplayBytesPerPixel() <> 4
+    avcError = #AVC_ERR_DISPLAY
+    ProcedureReturn #AVC_ERR_DISPLAY
+  EndIf
+  If gScrSrc = #SCR_SRC_DSI And gScrRot <> 0 And gScrRot <> 90 And gScrRot <> 180 And gScrRot <> 270
+    avcError = #AVC_ERR_DISPLAY : ProcedureReturn #AVC_ERR_DISPLAY
+  EndIf
+  ; Static reservations are checked in memmap; also check the firmware's
+  ; live allocation because HDMI framebuffer addresses are dynamic.
+  fbBase = DisplayBase() : fbBytes = DisplaySize()
+  If fbBase <= 0 Or fbBytes <= 0
+    avcError = #AVC_ERR_DISPLAY : ProcedureReturn #AVC_ERR_DISPLAY
+  EndIf
+  dramBytes = HwMemoryBytes()
+  If dramBytes = #HW_MEM_UNKNOWN Or #AVC_WINDOW_BASE + #AVC_WINDOW_BYTES > dramBytes
+    avcError = #AVC_ERR_WINDOW : ProcedureReturn #AVC_ERR_WINDOW
+  EndIf
+  If HwAddrCheck(#AVC_WINDOW_BASE, #AVC_WINDOW_BASE + #AVC_WINDOW_BYTES - 1, 0) <> #HW_ADDR_SAFE
+    avcError = #AVC_ERR_WINDOW : ProcedureReturn #AVC_ERR_WINDOW
+  EndIf
+  If fbBase < #AVC_WINDOW_BASE + #AVC_WINDOW_BYTES And #AVC_WINDOW_BASE < fbBase + fbBytes
+    avcError = #AVC_ERR_WINDOW : ProcedureReturn #AVC_ERR_WINDOW
+  EndIf
+  If avcQuarantined <> 0
+    If avcDeviceUnsafe <> 0
+      avcError = #AVC_ERR_VK : ProcedureReturn #AVC_ERR_VK
+    EndIf
+    If V3dConInvalidate() = 0
+      avcError = #AVC_ERR_V3D : ProcedureReturn #AVC_ERR_V3D
+    EndIf
+    avcQuarantined = 0
+  EndIf
+  ; Retire any prior Neon page table before changing its extra map. The heap
+  ; occupies a separately reserved monitor region; it is not an extension of
+  ; the framebuffer or of the Neon arena.
+  If gV3dConOn <> 0 : V3dConStop() : EndIf
+  If V3dConInvalidate() = 0
+    avcError = #AVC_ERR_V3D : ProcedureReturn #AVC_ERR_V3D
+  EndIf
+  ConSetRenderer(@ConPaintDma)
+  If NeonGpuExtraMap(#AVC_WINDOW_BASE, #AVC_WINDOW_BYTES) <> #NEON_OK
+    avcStartupFallback(#AVC_ERR_V3D)
+    ProcedureReturn #AVC_ERR_V3D
+  EndIf
+  If V3dConSetupOnce() = 0
+    avcStartupFallback(#AVC_ERR_V3D)
+    ProcedureReturn #AVC_ERR_V3D
+  EndIf
+  If gV3dConOn <> 0 : V3dConStop() : EndIf
+  avcLogicalW = DisplayWidth() : avcLogicalH = DisplayHeight()
+  avcWidth = ScrGpuPhysicalW() : avcHeight = ScrGpuPhysicalH()
+  avcPitch = ScrGpuPitch() : avcRotation = ScrGpuRotation()
+  If avcLogicalW < 1 Or avcLogicalH < 1 Or avcWidth < 1 Or avcHeight < 1 Or avcPitch < avcWidth * 4
+    avcStartupFallback(#AVC_ERR_DISPLAY)
+    ProcedureReturn #AVC_ERR_DISPLAY
+  EndIf
+  rc = avcCreateTarget()
+  If rc <> #AVC_OK
+    avcError = rc
+    avcActive = 0
+    ConNoRenderer()
+    If VulkanConsoleDestroy() = 0
+      avcQuarantined = 1
+      avcFallbackPaint = 0
+      ProcedureReturn rc
+    EndIf
+    If V3dConInvalidate() = 0
+      avcQuarantined = 1
+      avcFallbackPaint = 0
+      ProcedureReturn rc
+    EndIf
+    avcQuarantined = 0
+    NeonGpuExtraMap(0, 0)
+    gDma = ScreenDmaUp()
+    ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
+    ProcedureReturn rc
+  EndIf
+  avcFallbackPaint = @ConPaintDma
+  ; Retire any framebuffer save-under before the Vulkan renderer takes
+  ; cursor ownership. It is redrawn into each rendered frame below.
+  If gCurShown <> 0 And gCursorGpuOwned = 0
+    CursorRestore(gCurX, gCurY)
+    ScrPresent(gCurY, gCurY + #CUR_H - 1)
+  EndIf
+  gCursorGpuOwned = 1
+  ; The Pi 4 armstub enables CPACR_EL1.FPEN before entering this monitor.
+  ; Keep SIMD opt-in for this known boot context; payload handoff permanently
+  ; returns the dispatch to scalar until reset.
+  If avcNeonAllowed <> 0
+    AnvilTrueTypeRasterAlphaHandlerSet(@AnvilTrueTypeCoverageCountsToAlphaNeon)
+  EndIf
+  ConSetRenderer(@VulkanConsolePump)
+  avcActive = 1 : avcReady = 1 : avcError = 0
+  ConGridMarkAll()
+  ProcedureReturn #AVC_OK
+EndProcedure
+
+Procedure.i VulkanConsoleStop()
+  Define hadCursor.i
+  hadCursor = gCurShown
+  If avcActive = 0 And avcReady = 0
+    If avcQuarantined <> 0
+      If avcDeviceUnsafe <> 0 : ConNoRenderer() : ProcedureReturn 0 : EndIf
+      If V3dConInvalidate() = 0 : ConNoRenderer() : ProcedureReturn 0 : EndIf
+      avcQuarantined = 0
+      NeonGpuExtraMap(0, 0)
+      gCursorGpuOwned = 0
+      gCurShown = 0
+      If gScreen <> 0
+        DisplayClear(gScreenBg) : DrawBanner()
+        DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+        ConOverlayMarkWhole() : ConGridMarkAll()
+        ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
+        avcCpuCursorRefresh(hadCursor)
+      EndIf
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  avcActive = 0
+  avcReady = 0
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  ConNoRenderer()
+  If VulkanConsoleDestroy() = 0
+    avcQuarantined = 1
+    avcFallbackPaint = 0
+    ProcedureReturn 0
+  EndIf
+  If V3dConInvalidate() = 0
+    avcQuarantined = 1
+    avcFallbackPaint = 0
+    ProcedureReturn 0
+  EndIf
+  avcQuarantined = 0
+  NeonGpuExtraMap(0, 0)
+  gCursorGpuOwned = 0
+  gCurShown = 0
+  avcFallbackPaint = 0
+  If gScreen <> 0
+    gDma = 0 : DisplayUseDma(0)
+    DisplayClear(gScreenBg) : DrawBanner()
+    DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+    ConOverlayMarkWhole() : ConGridMarkAll()
+    ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
+    avcCpuCursorRefresh(hadCursor)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The returning payload is a different image/BSS and may reprogram V3D MMU
+; state. Release Vulkan/Chrome while the monitor still owns the GPU, then
+; reconstruct this opt-in tier only after the existing V3D payload owner has
+; returned the engine. 0 means it was not selected before handoff.
+Procedure.i VulkanConsolePayloadSuspend()
+  avcNeonAllowed = 0
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  If avcActive = 0
+    avcPayloadWasActive = 0
+    If avcQuarantined <> 0 : ProcedureReturn -1 : EndIf
+    ProcedureReturn 0
+  EndIf
+  avcPayloadWasActive = 1
+  If VulkanConsoleStop() = 0
+    avcPayloadWasActive = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i VulkanConsolePayloadResume(state.i)
+  If state = 0 Or avcPayloadWasActive = 0
+    avcPayloadWasActive = 0
+    ProcedureReturn 1
+  EndIf
+  avcPayloadWasActive = 0
+  If gScreen = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bool(VulkanConsoleStart() = #AVC_OK)
+EndProcedure
+
+Procedure.i VulkanConsoleReady()
+  ProcedureReturn avcReady
+EndProcedure
+
+Procedure.i VulkanConsoleQuarantined()
+  ProcedureReturn avcQuarantined
+EndProcedure
+
+Procedure.i avcWarmGrid()
+  Define pass.i, r.i, c.i, n.i, rc.i, i.i, at.i, height.i
+  Define cp.i, glyph.q, j.i, found.i, glyphCount.i
+  If AnvilTrueTypeSlotSelected() < 0 : ProcedureReturn #VK_SUCCESS : EndIf
+  avcUiHeight = AnvilTrueTypePixelHeight()
+  If avcUiHeight < 1 Or avcUiHeight > 512 : avcUiHeight = NeonBitmapLineHeight(#NEON_FONT_UI) : EndIf
+  If NeonVkChromeFontHeightSet(#NEON_FONT_UI, avcUiHeight) <> #NEON_VK_CHROME_OK
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  If avcUiHeight < 1 Or avcUiHeight > 512 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
+  For pass = 0 To 1
+    rc = #VK_SUCCESS
+    glyphCount = 0
+    For r = 0 To ConGridRows() - 1
+      For c = 0 To ConGridCols() - 1
+        cp = ConGridCell(r, c)
+        If cp <> 32
+          glyph = AnvilTrueTypeGlyphForCodepoint(cp)
+          If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
+            rc = #NEON_VK_CHROME_ERR_ATLAS : Break
+          EndIf
+          found = 0
+          For j = 0 To glyphCount - 1
+            If avcGridGlyphs[j] = glyph : found = 1 : Break : EndIf
+          Next
+          If found = 0
+            If glyphCount >= #NEON_VK_CHROME_TT_CACHE_MAX
+              rc = #NEON_VK_CHROME_ERR_CAPACITY : Break
+            EndIf
+            avcGridGlyphs[glyphCount] = glyph
+            glyphCount + 1
+          EndIf
+        EndIf
+      Next
+      If rc < 0 : Break : EndIf
+    Next
+    If rc >= 0
+      rc = NeonVkChromeGridWarm(@avcGridGlyphs[0], glyphCount, avcUiHeight)
+    EndIf
+    ; The touch-keyboard labels are another set of the same Neon text calls.
+    ; Warm their exact scaled mono faces before Begin as well; painting them
+    ; after Begin must never trigger rasterization or an atlas upload.
+    If rc >= 0 And TouchKeyboardLayoutOk() <> 0 And TouchKeyboardViewVisible() = 0
+      n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
+      For i = 0 To n - 1
+        If TouchKeyboardDrawKind(i) = #TKB_DRAW_TEXT
+      at = TouchKeyboardDrawScale(i)
+      NeonFontSetup(#NEON_FONT_MONO, at, 0)
+      height = NeonVkChromeFontPixelHeight(#NEON_FONT_MONO)
+          rc = NeonVkChromeWarmTrueTypeText(height, TouchKeyboardDrawText(i))
+          If rc < 0 : Break : EndIf
+        EndIf
+      Next
+      NeonFontSetup(#NEON_FONT_MONO, gScrScale, 0)
+    EndIf
+    If rc >= 0 : ProcedureReturn #VK_SUCCESS : EndIf
+    ; Atlas capacity can be recovered only outside an active frame. Reset the
+    ; complete cache, then warm the exact current grid again before Begin.
+    If pass <> 0 : ProcedureReturn rc : EndIf
+    If NeonVkChromeTTCacheReset() <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  ProcedureReturn rc
+EndProcedure
+
+; Copy the physical Vulkan raster into the established display draw surface.
+; The source already has the physical orientation selected by Chrome's rebind.
+; Leave the existing banner rectangle untouched, then use the display layer's
+; ordinary present path (including DSI rotation/HVS ownership) to publish it.
+Procedure.i avcCopyToDisplay()
+  Define dst.i, dstPitch.i, width.i, height.i, bx.i, by.i, bw.i, bh.i, rotation.i
+  Define keepKeyboard.i, keyboardY0.i, keyboardY1.i
+  Define row.i, leftBytes.i, rightBytes.i, srcRow.i, dstRow.i
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
+  width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
+  If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight
+    ProcedureReturn 0
+  EndIf
+  bx = 0 : by = 0 : bw = width : bh = LogoHeight()
+  rotation = ScrGpuRotation()
+  keepKeyboard = 0 : keyboardY0 = 0 : keyboardY1 = -1
+  If TouchKeyboardLayoutOk() <> 0 And TouchKeyboardViewVisible() <> 0
+    keepKeyboard = 1
+    keyboardY0 = TouchKeyboardBandY()
+    keyboardY1 = keyboardY0 + TouchKeyboardBandH() - 1
+  EndIf
+  If rotation = 90
+    bx = width - LogoHeight() : by = 0 : bw = LogoHeight() : bh = height
+  ElseIf rotation = 270
+    bx = 0 : by = 0 : bw = LogoHeight() : bh = height
+  ElseIf gScrSrc = #SCR_SRC_DSI And gScrRot = 180
+    ; The HVS applies the 180-degree mirror after this physical buffer, so
+    ; its logical top banner is the bottom physical strip in this source.
+    bx = 0 : by = height - LogoHeight() : bw = width : bh = LogoHeight()
+  EndIf
+  If bx < 0 Or by < 0 Or bw < 0 Or bh < 0 Or bx + bw > width Or by + bh > height
+    ProcedureReturn 0
+  EndIf
+  For row = 0 To height - 1
+    srcRow = avcImageBase + row * avcImagePitch
+    dstRow = dst + row * dstPitch
+    ; HDMI presents in place at rotation zero, so leave the existing CPU
+    ; keyboard band untouched while replacing the GPU-composed rows. DSI
+    ; copies to MON_FB_DRAW and restores the band from the presented front
+    ; below through the display layer's canonical rotation transform.
+    If gScrSrc = #SCR_SRC_HDMI And rotation = 0 And keepKeyboard <> 0 And row >= keyboardY0 And row <= keyboardY1
+      Continue
+    ElseIf gScrSrc = #SCR_SRC_DSI Or row < by Or row >= by + bh
+      DspCopyUp(dstRow, srcRow, width * 4)
+    Else
+      leftBytes = bx * 4
+      rightBytes = (width - bx - bw) * 4
+      If leftBytes > 0 : DspCopyUp(dstRow, srcRow, leftBytes) : EndIf
+      If rightBytes > 0 : DspCopyUp(dstRow + (bx + bw) * 4, srcRow + (bx + bw) * 4, rightBytes) : EndIf
+    EndIf
+  Next
+  ; MON_FB_DRAW may still contain the CPU logical banner from before the
+  ; first Vulkan frame. Restore the physical, rotation-correct banner just
+  ; as the V3D painter does before presenting this DSI surface.
+  If gScrSrc = #SCR_SRC_DSI
+    If ScrGpuKeepBanner(dst) = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If gScrSrc = #SCR_SRC_DSI And keepKeyboard <> 0
+    V3dConKeepKeyboardBand(dst)
+  EndIf
+  MmuCleanRange(dst, dstPitch * height)
+  ProcedureReturn ScrGpuPresent(dst, ScrGpuBytes())
+EndProcedure
+
+Procedure VulkanConsolePump()
+  Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i, cp.i
+  Define glyph.q
+  If avcReady = 0 Or avcActive = 0 Or gScreen = 0
+    ProcedureReturn
+  EndIf
+  rc = avcWarmGrid()
+  If rc < 0
+    avcFailover(#AVC_ERR_CHROME)
+    ProcedureReturn
+  EndIf
+  avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
+  If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS
+    avcFailover(#AVC_ERR_CHROME)
+    ProcedureReturn
+  EndIf
+  ch = Neon_LineHeight(#NEON_FONT_UI) : cw = Neon_CharWidth(#NEON_FONT_UI)
+  ; The console model owns fixed cell positions. Font-size changes may alter
+  ; glyph fit inside a cell, but never change cursor/row geometry.
+  If AnvilTrueTypeSlotSelected() >= 0
+    ; Append fixed cells into one contiguous vertex stream per ink. This
+    ; preserves the model's cursor positions without spending one Vulkan
+    ; draw record per glyph; the full grid remains bounded by CON_MAXCOLS x
+    ; CON_MAXROWS and Chrome separately bounds its vertex arena.
+    rc = NeonVkChromeGridBatchBegin()
+    If rc = #NEON_VK_CHROME_OK
+      rc = NeonVkChromeGridBatchReserve(ConGridCols() * ConGridRows() + #AVC_UI_QUAD_RESERVE, 2)
+    EndIf
+    If rc = #NEON_VK_CHROME_OK
+      For pass = 0 To 1
+        If pass = 0 : colour = V3dCon_Ink() : Else : colour = V3dCon_PromptInk() : EndIf
+        For r = 0 To ConGridRows() - 1
+          y = LogoHeight() + r * ch
+          For c = 0 To ConGridCols() - 1
+            If (pass = 1 And ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT) Or (pass = 0 And ConGridCellStyle(r, c) <> #UART_SCREEN_STYLE_PROMPT)
+              cp = ConGridCell(r, c)
+              If cp <> 32
+                glyph = AnvilTrueTypeGlyphForCodepoint(cp)
+                If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
+                  rc = #NEON_VK_CHROME_ERR_ATLAS : Break
+                EndIf
+                rc = NeonVkChromeGridGlyphAppend(glyph, avcUiHeight, c * cw, y, cw, ch)
+                If rc <> #NEON_VK_CHROME_OK : Break : EndIf
+              EndIf
+            EndIf
+          Next
+          If rc <> #NEON_VK_CHROME_OK : Break : EndIf
+        Next
+        If rc <> #NEON_VK_CHROME_OK : Break : EndIf
+        rc = NeonVkChromeGridBatchFlush(colour)
+        If rc <> #NEON_VK_CHROME_OK : Break : EndIf
+      Next
+    EndIf
+    If rc = #NEON_VK_CHROME_OK
+      rc = NeonVkChromeGridBatchEnd()
+    EndIf
+    If rc <> #NEON_VK_CHROME_OK
+      avcFailover(#AVC_ERR_CHROME)
+      ProcedureReturn
+    EndIf
+  Else
+    For r = 0 To ConGridRows() - 1
+      y = LogoHeight() + r * ch : c = 0
+      While c < ConGridCols()
+        If ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT
+          colour = V3dCon_PromptInk()
+        Else
+          colour = V3dCon_Ink()
+        EndIf
+        n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+        If n > 0
+          Neon_Text(#NEON_FONT_UI, c * cw, y, @gConRowBuf[0], colour)
+          c = c + n
+        Else
+          c + 1
+        EndIf
+      Wend
+    Next
+  EndIf
+  TouchKeyboardComposeNeon()
+  V3dConRenderCursor()
+  rc = NeonVkChromeError()
+  endRc = NeonVkChromeEnd()
+  If rc <> 0 Or endRc <> #VK_SUCCESS
+    If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+    avcFailover(#AVC_ERR_CHROME)
+    ProcedureReturn
+  EndIf
+  If NeonVkChromePresentPending() <> 1
+    avcFailover(#AVC_ERR_PRESENT)
+    ProcedureReturn
+  EndIf
+  If NeonVkChromePresentConsume() <> 1
+    avcFailover(#AVC_ERR_PRESENT)
+    ProcedureReturn
+  EndIf
+  If avcCopyToDisplay() = 0
+    avcFailover(#AVC_ERR_PRESENT)
+    ProcedureReturn
+  EndIf
+  ConGridClearDirty()
+  ConOverlayDamage()
+  avcError = 0
+EndProcedure

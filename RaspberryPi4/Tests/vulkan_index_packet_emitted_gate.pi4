@@ -1,0 +1,41 @@
+; ======================================================================
+;  V3D 4.2 indexed primitive packet emitted gate
+; ======================================================================
+; Desk-only. The host checker executes these production encoders and reads
+; the exact bytes. No MMIO or cache-maintenance instruction is permitted.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+Global Dim vipPacket.a[1023]
+Global Dim vipResult.i[12]
+
+Procedure.i Main()
+  vipResult[0] = V3dClBegin(@vipPacket[0], 512)
+  V3dClIndexBufferSetup($12345678, $11223344)
+  V3dClIndexedPrims(#V3D_PRIM_TRIANGLES, 3, 1, 4)
+  vipResult[1] = V3dClFinish()
+  vipResult[2] = V3dClLen()
+
+  vipResult[3] = V3dClBegin(@vipPacket[256], 512)
+  V3dClIndexBufferSetup($10203040, $55667788)
+  V3dClIndexedPrims(#V3D_PRIM_TRIANGLES, $10203, 2, $1020304)
+  vipResult[4] = V3dClFinish()
+  vipResult[5] = V3dClLen()
+
+  ; Extension-only UINT8 (hardware value zero) and a wrapped setup extent
+  ; are both refused before one byte is written.
+  vipResult[6] = V3dClBegin(@vipPacket[512], 512)
+  V3dClIndexedPrims(#V3D_PRIM_TRIANGLES, 3, 0, 0)
+  vipResult[7] = V3dClFinish()
+  vipResult[8] = V3dClLen()
+  vipResult[9] = V3dClBegin(@vipPacket[768], 512)
+  V3dClIndexBufferSetup($FFFFFFFC, 8)
+  vipResult[10] = V3dClFinish()
+  vipResult[11] = V3dClLen()
+  ProcedureReturn @vipResult[0]
+EndProcedure

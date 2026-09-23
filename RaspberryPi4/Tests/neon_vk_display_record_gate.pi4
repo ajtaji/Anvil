@@ -1,0 +1,129 @@
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_wsi_bridge.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_display.pi4"
+
+Procedure.i NvdWsiRollbackGate()
+  Define instance.i, physical.i, device.i, provider.i, surface.i, swapchain.i
+  Define count.l, image.l, result.i, ticket.i
+  Define formats.AnvilVkWsiFormat, modes.i, info.AnvilVkWsiProviderInfo
+  Define ci.AnvilVkWsiSwapchainInfo
+  Dim images.i[2]
+
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_DRAW)
+  If AnvilVkInstanceCreate(@instance) <> #VK_SUCCESS : ProcedureReturn 101 : EndIf
+  count = 1
+  If AnvilVkPhysicalEnumerate(instance, @count, @physical) <> #VK_SUCCESS : ProcedureReturn 102 : EndIf
+  If AnvilVkDeviceCreate(physical, @device) <> #VK_SUCCESS : ProcedureReturn 103 : EndIf
+
+  formats\format = #VK_FORMAT_B8G8R8A8_UNORM
+  formats\colorSpace = #VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+  modes = #VK_PRESENT_MODE_FIFO_KHR
+  info\cookie = $52454344
+  info\capabilities\minImageCount = 2
+  info\capabilities\maxImageCount = 2
+  info\capabilities\currentWidth = 640
+  info\capabilities\currentHeight = 480
+  info\capabilities\minWidth = 320
+  info\capabilities\minHeight = 240
+  info\capabilities\maxWidth = 1920
+  info\capabilities\maxHeight = 1080
+  info\capabilities\maxImageArrayLayers = 1
+  info\capabilities\supportedTransforms = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  info\capabilities\currentTransform = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  info\capabilities\supportedCompositeAlpha = #VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+  info\capabilities\supportedUsageFlags = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+  info\formatCount = 1 : info\formats = @formats
+  info\presentModeCount = 1 : info\presentModes = @modes
+  If avkWsiProviderRegister(@info, @provider) <> #VK_SUCCESS : ProcedureReturn 104 : EndIf
+  If avkWsiSurfaceCreate(instance, provider, $3333, @surface) <> #VK_SUCCESS : ProcedureReturn 105 : EndIf
+  ci\surface = surface : ci\minImageCount = 2
+  ci\imageFormat = #VK_FORMAT_B8G8R8A8_UNORM
+  ci\imageColorSpace = #VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+  ci\imageWidth = 640 : ci\imageHeight = 480 : ci\imageArrayLayers = 1
+  ci\imageUsage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+  ci\imageSharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  ci\preTransform = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  ci\compositeAlpha = #VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+  ci\presentMode = #VK_PRESENT_MODE_FIFO_KHR : ci\clipped = 1
+  images[0] = $410000 : images[1] = $420000
+  ci\providerImageCount = 2 : ci\providerImages = @images[0]
+  If avkWsiSwapchainCreate(device, @ci, @swapchain) <> #VK_SUCCESS : ProcedureReturn 106 : EndIf
+
+  If avkWsiAcquire(device, swapchain, 0, @image) <> #VK_SUCCESS : ProcedureReturn 107 : EndIf
+  If nvdWsiAttach(device, swapchain, image, 7) <> #VK_SUCCESS : ProcedureReturn 108 : EndIf
+  If nvdWsiMarkReady() <> #VK_SUCCESS : ProcedureReturn 109 : EndIf
+  If nvdWsiRollback() <> #VK_SUCCESS : ProcedureReturn 110 : EndIf
+  If avkWsiImageState(device, swapchain, image) <> #ANVIL_VK_WSI_IMAGE_AVAILABLE : ProcedureReturn 111 : EndIf
+  If nvdWsiEnabled() <> 0 Or nvdWsiTicket <> 0 : ProcedureReturn 112 : EndIf
+
+  If avkWsiAcquire(device, swapchain, 0, @image) <> #VK_SUCCESS : ProcedureReturn 113 : EndIf
+  If nvdWsiAttach(device, swapchain, image, 7) <> #VK_SUCCESS : ProcedureReturn 114 : EndIf
+  If nvdWsiMarkReady() <> #VK_SUCCESS : ProcedureReturn 115 : EndIf
+  If nvdWsiReserve() <> #VK_SUCCESS : ProcedureReturn 116 : EndIf
+  ticket = nvdWsiTicket
+  If nvdWsiState <> #NVD_WSI_RESERVED Or ticket = 0 : ProcedureReturn 117 : EndIf
+  nvdWsiTicket = ticket + 1
+  result = nvdWsiRollback()
+  If result = #VK_SUCCESS Or nvdWsiState <> #NVD_WSI_RESERVED Or nvdWsiTicket <> ticket + 1 : ProcedureReturn 118 : EndIf
+  nvdWsiTicket = ticket
+  If nvdWsiRollback() <> #VK_SUCCESS : ProcedureReturn 119 : EndIf
+  If avkWsiImageState(device, swapchain, image) <> #ANVIL_VK_WSI_IMAGE_AVAILABLE : ProcedureReturn 120 : EndIf
+  If nvdWsiTicket <> 0 : ProcedureReturn 121 : EndIf
+
+  If avkWsiAcquire(device, swapchain, 0, @image) <> #VK_SUCCESS : ProcedureReturn 122 : EndIf
+  If nvdWsiAttach(device, swapchain, image, 7) <> #VK_SUCCESS : ProcedureReturn 123 : EndIf
+  If nvdWsiMarkReady() <> #VK_SUCCESS : ProcedureReturn 124 : EndIf
+  If nvdWsiReserve() <> #VK_SUCCESS : ProcedureReturn 125 : EndIf
+  If nvdWsiCommit() <> #VK_SUCCESS : ProcedureReturn 126 : EndIf
+  If nvdWsiRollback() <> #VK_SUCCESS : ProcedureReturn 127 : EndIf
+  If avkWsiImageState(device, swapchain, image) <> #ANVIL_VK_WSI_IMAGE_AVAILABLE : ProcedureReturn 128 : EndIf
+  If nvdWsiEnabled() <> 0 : ProcedureReturn 129 : EndIf
+
+  If avkWsiAcquire(device, swapchain, 0, @image) <> #VK_SUCCESS : ProcedureReturn 130 : EndIf
+  If nvdWsiAttach(device, swapchain, image, 7) <> #VK_SUCCESS : ProcedureReturn 131 : EndIf
+  If nvdWsiMarkReady() <> #VK_SUCCESS : ProcedureReturn 132 : EndIf
+  If nvdWsiReserve() <> #VK_SUCCESS : ProcedureReturn 133 : EndIf
+  If nvdWsiCommit() <> #VK_SUCCESS : ProcedureReturn 134 : EndIf
+  ticket = nvdWsiTicket
+  nvdPresentClear()
+  If nvdPresentPublish(7, $5678, 1, 640, 480, 640, 480, 2560, 0) = 0 : ProcedureReturn 135 : EndIf
+  nvdWsiTicket = ticket + 1
+  If nvdPresentInvalidate(7, $5678) <> 0 Or nvdPresentPending() = 0 : ProcedureReturn 136 : EndIf
+  nvdWsiTicket = ticket
+  If nvdPresentInvalidate(7, $5678) = 0 : ProcedureReturn 137 : EndIf
+  If avkWsiImageState(device, swapchain, image) <> #ANVIL_VK_WSI_IMAGE_AVAILABLE : ProcedureReturn 138 : EndIf
+
+  avkWsiSwapchainDestroy(device, swapchain)
+  avkWsiSurfaceDestroy(instance, surface)
+  avkWsiProviderDestroy(provider)
+  AnvilVkDeviceDestroy(device)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NeonVkDisplayRecordGate()
+  If NvdWsiRollbackGate() <> 0 : ProcedureReturn 100 : EndIf
+  If nvdWsiEnabled() <> 0 : ProcedureReturn 14 : EndIf
+  If nvdWsiRollback() <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+  nvdPresentClear()
+  If nvdPresentPublish(4, $1234, 1, 640, 360, 640, 360, 2560, 0) = 0 : ProcedureReturn 1 : EndIf
+  If nvdPresentPending() = 0 : ProcedureReturn 12 : EndIf
+  If nvdPresentMatches(4, $1234) = 0 : ProcedureReturn 2 : EndIf
+  If nvdPresentMatches(5, $1234) <> 0 : ProcedureReturn 3 : EndIf
+  If nvdPresentConsume(4, $1234) = 0 : ProcedureReturn 4 : EndIf
+  If nvdPresentPending() <> 0 : ProcedureReturn 13 : EndIf
+  If nvdPresentConsume(4, $1234) <> 0 : ProcedureReturn 5 : EndIf
+  If nvdPresentPublish(4, $1234, 2, 640, 360, 640, 360, 2560, 0) = 0 : ProcedureReturn 6 : EndIf
+  If nvdPresentInvalidate(4, $1235) <> 0 : ProcedureReturn 7 : EndIf
+  If nvdPresentInvalidate(4, $1234) = 0 : ProcedureReturn 8 : EndIf
+  If nvdPresentPublish(4, $1234, 3, 640, 360, 640, 360, 2560, 0) = 0 : ProcedureReturn 9 : EndIf
+  If nvdPresentInvalidate(5, $1234) <> 0 : ProcedureReturn 10 : EndIf
+  nvdPresentClear()
+  If nvdPresentConsume(4, $1234) <> 0 : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  ProcedureReturn NeonVkDisplayRecordGate()
+EndProcedure

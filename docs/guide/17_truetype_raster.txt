@@ -1,0 +1,18 @@
+@CHAPTER TrueType coverage rasterization
+@INTRO T4 converts expanded TrueType outlines into bounded 8-bit grayscale coverage masks. The reader does not apply hinting or depend on a display backend.
+
+@SECTION The raster contract
+
+Open the T0 font, T1 metrics, and T3 outline modules, then call `AnvilTrueTypeRasterizeGlyph(glyph, pixelHeight, coverage, capacity, widthOut, heightOut, strideOut, bearingXOut, bearingYOut, advanceOut)`. It expands one glyph and writes a caller-owned coverage buffer. `pixelHeight` must be 1 through 512. Width and height are each limited to 1024 pixels; point, contour and flattened-edge work is bounded to 4096 points, 2048 contours and 16384 edges. Coverage is one byte per pixel with values from 0 through 255. The caller supplies the byte capacity. Stride equals width. The x bearing is the floored scaled left bound, the y bearing is the ceiled scaled top bound, and the advance is rounded to output pixels. Malformed glyphs, unsupported formats, arithmetic overflow, and undersized buffers fail without reporting a successful bitmap.
+
+The current rasterizer uses four-by-four subpixel samples and adaptively flattens quadratic curves with a maximum one-eighth-pixel chord error. Empty glyphs have zero bitmap extent. Contours use nonzero winding, so reversed inner contours preserve holes. Atlas packing, cache lifetime, shaping, hinting, and final drawing are separate layers and are not proven by this gate.
+
+@SECTION Emitted and independent proof
+
+The emitted gate checks an exact two-contour ring mask with reversed inner winding, an on-curve start with an off-curve end, an all-off-curve contour whose implied midpoint is fractional at low UPEM and 64-pixel output, an empty glyph, and capacity refusal. The raster is compared with independently flattened `fontTools` outlines. The reference casts rays at the same four-by-four sample positions; a second direct ray-cast implementation cross-checks the optimized crossing reference. Every differing real-font pixel must intersect the dense reference outline within a one-eighth-pixel-expanded pixel rectangle, and no pixel differs by more than three four-by-four sample quanta. The separate 32-by-32 reference reports high-resolution deviation; it is a quality measurement, not the rasterizer's sampling contract.
+
+The recorded corpus comparisons use Abel Regular and Bangers Regular, glyphs O and é, at 16 and 32 pixels. The complete measurements and interpreter counts are in `_work/truetype-tests-20260918/t4-results.txt`; the emitted image and symbols are retained under `_work/truetype-tests-20260918/t4-work/`. These desk gates verify masks and bounds for this corpus. They do not establish hinting quality, performance on every font, or visible output through the Vulkan renderer.
+
+@SECTION Format references
+
+The [OpenType `glyf` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/glyf) defines quadratic outline points and contour flags. The [OpenType `head` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/head) defines units per em and glyph-location format.

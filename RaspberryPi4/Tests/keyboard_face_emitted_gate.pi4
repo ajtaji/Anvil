@@ -1,0 +1,364 @@
+; ======================================================================
+;  keyboard_face_emitted_gate.pi4
+;
+;  Executes the REAL framebuffer composer for the touch keyboard - the
+;  fenced TouchKeyboardComposeCpu out of RaspberryPi4/Board/
+;  banner_clock.pi4, lifted verbatim by the checker - over the REAL key
+;  model and the REAL view, on the A64 oracle.
+;
+;  WHAT IT IS FOR. The key labels are drawn with the 30 px anti-aliased
+;  face whenever the key's box has room for it, and with the bitmap cell
+;  font at integer magnification when it does not. Three things have to
+;  be true of that and none can be read off the source:
+;
+;    1. on the panel this monitor actually runs on, at the geometry it
+;       actually lays out, EVERY key label gets the smooth face - that
+;       is the whole request, and "it compiles" does not prove it;
+;    2. a box the smooth face does not fit still gets its label, drawn
+;       with the bitmap face, rather than losing it;
+;    3. whichever face draws it, the label is CENTRED in the box and
+;       inside it - the view stopped computing text extents when it
+;       stopped knowing which font would draw them, so the centring is
+;       now entirely the renderer's and has to be shown to be right.
+;
+;  THE WIDTH ORACLE IS THE BAKED FONT ITSELF. SmoothTextWidth below sums
+;  the advance byte of the same RaspberryPi4/Monitor/anvil_fonts.pi4
+;  metrics the board's renderer reads, so the composer is deciding
+;  against the real face's real widths. What is under test is the
+;  DECISION, not the width.
+;
+;  DIAGNOSTIC. No MMIO, framebuffer, GPU submission, DMA or cache
+;  operation occurs; the harness arms a hard stop on any MMIO access.
+; ======================================================================
+
+#KF_MAGIC_AT = $06000000
+#KF_MAGIC    = $4B424446          ; "KBDF"
+#KF_META     = $06000100
+#KF_SCEN     = $06010000
+#KF_STRIDE   = $00010000
+
+; Per scenario: a header, then one 64-byte record per drawn label.
+#KF_OK       = 0
+#KF_ITEMS    = 8                  ; draw items the view produced
+#KF_LABELS   = 16                 ; text items among them
+#KF_SMOOTH   = 24                 ; of those, drawn with the smooth face
+#KF_BITMAP   = 32                 ; of those, drawn with the bitmap face
+#KF_SCALEEND = 40                 ; the library magnification left behind
+#KF_FIDMIN   = 48                 ; smallest font id the composer asked for
+#KF_FIDMAX   = 56                 ; largest
+#KF_TEXTN    = 64                 ; text items in the list the view produced
+#KF_REC      = $400
+#KF_RECSZ    = 96
+#KF_MAXREC   = 200
+
+; One label record.
+#KF_R_FACE   = 0                  ; 1 smooth, 2 bitmap
+#KF_R_BOXX   = 8
+#KF_R_BOXY   = 16
+#KF_R_BOXW   = 24
+#KF_R_BOXH   = 32
+#KF_R_DRAWX  = 40                 ; left edge of what was drawn
+#KF_R_DRAWW  = 48                 ; width of what was drawn
+#KF_R_TOP    = 56                 ; top edge of what was drawn
+#KF_R_DRAWH  = 64                 ; height of what was drawn
+#KF_R_TEXT   = 72                 ; the label itself, copied in, 16 bytes
+
+; ---- the leaves console.pi4 needs and this gate does not exercise -----
+Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
+Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
+Procedure.i UartMirrorReadStyle() : ProcedureReturn 0 : EndProcedure
+
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
+
+; ======================================================================
+;  THE BOARD'S DRAWING LEAVES, RECORDED RATHER THAN PERFORMED.
+; ======================================================================
+#CUR_W = 8
+#CUR_H = 14
+
+Global gScreen.i = 1
+Global gCursorGpuOwned.i = 0
+Global gCurShown.i = 0
+Global gCurX.i = 0
+Global gCurY.i = 0
+Global dsp_scale.i = 1
+Global gTkbCpuDamage.i = #TKB_DAMAGE_ALL
+
+Global gKfSlot.i = 0
+Global gKfRecN.i = 0
+Global gKfSmooth.i = 0
+Global gKfBitmap.i = 0
+Global gKfFidMin.i = 99
+Global gKfFidMax.i = -1
+Global gKfWidthFid.i = -1
+Global gKfBoxX.i
+Global gKfBoxY.i
+Global gKfBoxW.i
+Global gKfBoxH.i
+Global gKfCharX.i
+Global gKfCharY.i
+Global gKfCharN.i
+Global gKfCharText.i
+Global gKfFills.i = 0
+Global gKfPresents.i = 0
+
+Procedure.i DisplayBase() : ProcedureReturn $01000000 : EndProcedure
+Procedure.i DisplayCharWidth() : ProcedureReturn 8 * dsp_scale : EndProcedure
+Procedure.i DisplayCharHeight() : ProcedureReturn 16 * dsp_scale : EndProcedure
+Procedure DisplayScale(s.i) : dsp_scale = s : EndProcedure
+Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn ($FF000000 | (r << 16)) | (g << 8) | b : EndProcedure
+Procedure DisplayFillRect(x.i, y.i, w.i, h.i, c.i) : gKfFills = gKfFills + 1 : EndProcedure
+Procedure DisplayFlushRect(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure ScrPresent(y0.i, y1.i) : gKfPresents = gKfPresents + 1 : EndProcedure
+; The reserved band above the console, which the composer subtracts to
+; turn a pixel row into a console row. The scenarios below hand the view
+; the same number as the band height.
+Procedure.i LogoHeight() : ProcedureReturn 120 : EndProcedure
+Procedure CursorRestore(x.i, y.i) : EndProcedure
+Procedure CursorSave(x.i, y.i) : EndProcedure
+Procedure CursorDraw(x.i, y.i) : EndProcedure
+; The two leaves the composer's GPU-tier branch stands on. This gate runs
+; the FRAMEBUFFER tier (gCursorGpuOwned stays 0) so neither is reached;
+; they exist because the composer is one procedure for both tiers and the
+; V3D tier's own gate is keyboard_gpu_face_emitted_gate.pi4.
+Procedure a64_barrier() : EndProcedure
+Procedure TouchKeyboardPresentedCursor(y0.i, y1.i) : EndProcedure
+
+; Write one field of the record being built for the item in flight.
+Procedure KfPut(field.i, value.i)
+  PokeI(#KF_SCEN + gKfSlot * #KF_STRIDE + #KF_REC + gKfRecN * #KF_RECSZ + field, value)
+EndProcedure
+
+; THE LABEL IS COPIED, NOT POINTED AT. The view hands out labels from one
+; reused arena, so a pointer kept here would name whatever the NEXT
+; scenario put in that slot - which is how a record comes to say a key was
+; drawn with another key's text.
+Procedure KfPutLabel(*s)
+  Define i.i
+  Define c.i
+  Define at.i
+  at = #KF_SCEN + gKfSlot * #KF_STRIDE + #KF_REC + gKfRecN * #KF_RECSZ + #KF_R_TEXT
+  i = 0
+  c = PeekA(*s) & $FF
+  While c <> 0 And i < 15
+    PokeA(at + i, c)
+    i = i + 1
+    c = PeekA(*s + i) & $FF
+  Wend
+  PokeA(at + i, 0)
+EndProcedure
+
+; THE GATE'S OWN READING OF THE SAME BAKED METRICS the board's renderer
+; reads - the oracle for a width, not the thing under test. It also
+; records which face the composer asked about, because asking the 48 px
+; banner face for a key label would fit nothing and fall back silently.
+Procedure.i SmoothTextWidth(*s, fid.i)
+  Define i.i
+  Define c.i
+  Define w.i
+  gKfWidthFid = fid
+  If fid < gKfFidMin : gKfFidMin = fid : EndIf
+  If fid > gKfFidMax : gKfFidMax = fid : EndIf
+  i = 0
+  w = 0
+  c = PeekA(*s) & $FF
+  While c <> 0
+    If c >= #FONT_keys_FIRST And c < (#FONT_keys_FIRST + #FONT_keys_COUNT)
+      w = w + PeekA(?fontKeysMeta + (c - #FONT_keys_FIRST) * 8)
+    EndIf
+    i = i + 1
+    c = PeekA(*s + i) & $FF
+  Wend
+  ProcedureReturn w
+EndProcedure
+
+; The smooth renderer, recorded. `base` is the BASELINE row, so the top
+; of the line is base minus the face's ascent - the checker grades the
+; line box, which is what has to sit inside the key.
+Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
+  Define w.i
+  w = SmoothTextWidth(*s, fid)
+  If fid < gKfFidMin : gKfFidMin = fid : EndIf
+  If fid > gKfFidMax : gKfFidMax = fid : EndIf
+  If gKfRecN < #KF_MAXREC
+    KfPut(#KF_R_FACE, 1)
+    KfPut(#KF_R_BOXX, gKfBoxX)
+    KfPut(#KF_R_BOXY, gKfBoxY)
+    KfPut(#KF_R_BOXW, gKfBoxW)
+    KfPut(#KF_R_BOXH, gKfBoxH)
+    KfPut(#KF_R_DRAWX, x)
+    KfPut(#KF_R_DRAWW, w)
+    KfPut(#KF_R_TOP, base - #FONT_keys_ASC)
+    KfPut(#KF_R_DRAWH, #FONT_keys_LINEH)
+    KfPutLabel(*s)
+    gKfRecN = gKfRecN + 1
+  EndIf
+  gKfSmooth = gKfSmooth + 1
+  ProcedureReturn w
+EndProcedure
+
+; The bitmap renderer, recorded a character at a time. The composer
+; advances by DisplayCharWidth() between calls, so the run is folded back
+; into one record here rather than trusting a stride.
+Procedure DisplayChar(x.i, y.i, c.i, fg.i, bg.i)
+  If gKfCharN = 0
+    gKfCharX = x
+    gKfCharY = y
+  EndIf
+  gKfCharN = gKfCharN + 1
+EndProcedure
+
+; The composer walks the label a byte at a time, so the run's own text is
+; whatever the item was handed. The accessor below keeps it.
+Procedure.i KfDrawText(i.i)
+  gKfCharText = TouchKeyboardDrawText(i)
+  ProcedureReturn gKfCharText
+EndProcedure
+
+Procedure KfCloseBitmapRun()
+  If gKfCharN < 1
+    ProcedureReturn
+  EndIf
+  If gKfRecN < #KF_MAXREC
+    KfPut(#KF_R_FACE, 2)
+    KfPut(#KF_R_BOXX, gKfBoxX)
+    KfPut(#KF_R_BOXY, gKfBoxY)
+    KfPut(#KF_R_BOXW, gKfBoxW)
+    KfPut(#KF_R_BOXH, gKfBoxH)
+    KfPut(#KF_R_DRAWX, gKfCharX)
+    KfPut(#KF_R_DRAWW, gKfCharN * DisplayCharWidth())
+    KfPut(#KF_R_TOP, gKfCharY)
+    KfPut(#KF_R_DRAWH, DisplayCharHeight())
+    KfPutLabel(gKfCharText)
+    gKfRecN = gKfRecN + 1
+  EndIf
+  gKfBitmap = gKfBitmap + 1
+  gKfCharN = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE BOX THE COMPOSER WAS HANDED.
+;
+;  The composer asks the view for a text item's rectangle through these
+;  four accessors, so wrapping them is how the gate learns which box each
+;  recorded label belongs to WITHOUT knowing how the view produced it.
+;  The bitmap run of the PREVIOUS item is closed here, because a new X
+;  read is the first thing the next item does.
+; ----------------------------------------------------------------------
+Procedure.i KfDrawX(i.i)
+  KfCloseBitmapRun()
+  gKfBoxX = TouchKeyboardDrawX(i)
+  ProcedureReturn gKfBoxX
+EndProcedure
+
+Procedure.i KfDrawY(i.i)
+  gKfBoxY = TouchKeyboardDrawY(i)
+  ProcedureReturn gKfBoxY
+EndProcedure
+
+Procedure.i KfDrawW(i.i)
+  gKfBoxW = TouchKeyboardDrawW(i)
+  ProcedureReturn gKfBoxW
+EndProcedure
+
+Procedure.i KfDrawH(i.i)
+  gKfBoxH = TouchKeyboardDrawH(i)
+  ProcedureReturn gKfBoxH
+EndProcedure
+
+; The lifted composer, with the four rectangle accessors redirected
+; through the recorders above. The redirection is the checker's, applied
+; to the lifted text and named in its output.
+XIncludeFile "RaspberryPi4/Tests/_keyboard_face_lift.pbi"
+
+; ----------------------------------------------------------------------
+;  One scenario: lay the real keyboard out at a surface, show it, and run
+;  the real composer over the real draw list.
+; ----------------------------------------------------------------------
+Global gKfM.TouchKeyboardMetrics
+
+Procedure.i KfScenario(slot.i, page.i, lw.i, lh.i, ppi.i, ds.i)
+  Define b.i
+  Define i.i
+  Define n.i
+  b = #KF_SCEN + slot * #KF_STRIDE
+  gKfSlot = slot
+  gKfRecN = 0
+  gKfSmooth = 0
+  gKfBitmap = 0
+  gKfCharN = 0
+  gKfFidMin = 99
+  gKfFidMax = -1
+  dsp_scale = ds
+
+  TouchKeyboardInit()
+  TkSetPage(page)
+  gKfM\logicalW     = lw
+  gKfM\logicalH     = lh
+  gKfM\bannerH      = 120
+  gKfM\cellW        = 8 * ds
+  gKfM\cellH        = 16 * ds
+  gKfM\ppi          = ppi
+  gKfM\displayScale = ds
+  If TouchKeyboardLayout(@gKfM) = 0
+    PokeI(b + #KF_OK, 0)
+    ProcedureReturn 0
+  EndIf
+  TouchKeyboardViewSetVisible(1)
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_ALL
+
+  TouchKeyboardComposeCpu()
+  KfCloseBitmapRun()
+
+  ; How many labels the view actually asked for, so a label that was
+  ; simply not drawn is a failure and not an absence nobody counted.
+  n = 0
+  i = 0
+  While i < TouchKeyboardDrawCount()
+    If TouchKeyboardDrawKind(i) = #TKB_DRAW_TEXT
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  PokeI(b + #KF_TEXTN, n)
+
+  PokeI(b + #KF_OK, 1)
+  PokeI(b + #KF_ITEMS, TouchKeyboardDrawCount())
+  PokeI(b + #KF_LABELS, gKfSmooth + gKfBitmap)
+  PokeI(b + #KF_SMOOTH, gKfSmooth)
+  PokeI(b + #KF_BITMAP, gKfBitmap)
+  PokeI(b + #KF_SCALEEND, dsp_scale)
+  PokeI(b + #KF_FIDMIN, gKfFidMin)
+  PokeI(b + #KF_FIDMAX, gKfFidMax)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  PokeI(#KF_MAGIC_AT, #KF_MAGIC)
+
+  ; 0 - THE BENCH PANEL, the geometry this monitor lays out on the screen
+  ; a finger actually touches. 149 px/in is the panel's own reading.
+  KfScenario(0, 0, 1280, 800, 149, 1)
+  ; 1 - the same panel in its own portrait scan.
+  KfScenario(1, 0, 800, 1280, 149, 1)
+  ; 2 - the bench panel at the large-text setting.
+  KfScenario(2, 0, 1280, 800, 149, 2)
+  ; 3 - the symbol page, which has the other long labels on it.
+  KfScenario(3, 1, 1280, 800, 149, 1)
+  ; 4 - THE SMALLEST SURFACE THIS ARRANGEMENT STILL FITS. The keys are
+  ; narrow enough here that the longest label cannot be set in the smooth
+  ; face, which is the fallback's whole reason to exist.
+  KfScenario(4, 0, 640, 480, 149, 1)
+  ; 5 - a screen that never said how big it is: the display-scale
+  ; fallback, which is a different floor and a different key size.
+  KfScenario(5, 0, 1280, 800, 0, 1)
+
+  PokeI(#KF_META, #FONT_keys_LINEH)
+  PokeI(#KF_META + 8, #FONT_keys_ASC)
+  PokeI(#KF_META + 16, gKfFills)
+  PokeI(#KF_META + 24, gKfPresents)
+  ProcedureReturn 0
+EndProcedure

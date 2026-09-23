@@ -1,0 +1,913 @@
+; Resident-only BCM2711 EL3 coherent-job acceptance owner.
+; Include after board memmap + mmu + mmu_secondary, INSTEAD OF core_worker.
+; The fixed secondary code and all rows must remain resident until restart.
+#CORE_RAW_RESIDENT_JOBS = 1
+XIncludeFile "RaspberryPi4/Lib/core_worker_impl.pi4"
+
+#CORE_ACCEPT_STRIDE = 256
+#CORE_ACCEPT_MAX_WORK = 4096
+#CORE_ACCEPT_ROUNDS = 16
+#CORE_ACCEPT_SPINS = 1000000
+
+; ----------------------------------------------------------------------
+;  THE FOUR-CORE PAYLOAD JOB - ABI group 15, SvcParallelRun.
+;
+;  ONE RESIDENT OWNER, TWO KINDS OF JOB. `coretest` and the payload
+;  service are not two owners of the secondary cores; they are two jobs
+;  the one resident acceptance owner accepts. A job with a zero entry at
+;  +56 is the fixed arithmetic witness `coretest` asks for; a job with a
+;  non-zero entry is a call into payload code. That is why this lives
+;  here rather than in a second composition: two owners of three cores
+;  would need a protocol between them, and the tree already refuses a
+;  mixed composition at compile time for exactly that reason.
+;
+;  PARTITION 0 RUNS ON THE PRIMARY. Four partitions, four cores, and the
+;  core that dispatched is not idle while the other three work.
+;
+;  THE DEADLINE IS FIVE SECONDS AND NOTHING HERE PETS THE WATCHDOG. A
+;  wedged secondary beside a healthy primary that keeps petting is the
+;  half-hang the deadman cannot see and the board needs hands for; that
+;  is the case this bound exists for and it is the case nothing else
+;  covers.
+;
+;  WHAT THE BOUND DOES NOT COVER, SAID PLAINLY: the primary's own
+;  partition. Partition 0 runs here, as a call into payload code, and
+;  nothing can interrupt it - a payload entry that never returns on the
+;  primary is the payload's own infinite loop, and the deadman is its
+;  answer exactly as it would be on one core. The bound is armed at entry
+;  so its five seconds are measured from before that call rather than
+;  after it, which keeps the arithmetic honest; it cannot make a
+;  non-returning primary return.
+;
+;  Five seconds sits under a 15-second deadman with the payload's own pet
+;  immediately before the call; a kernel whose partition cannot finish
+;  inside it is split by the payload into more calls. The bound is never
+;  widened toward the deadman.
+; ----------------------------------------------------------------------
+#CORE_PAR_MAX_PARTS   = 4
+#CORE_PAR_DEADLINE_S  = 5
+#CORE_PAR_STATUS_DONE = 4
+#CORE_PAR_STATUS_RELEASED = 5
+
+; The row words the generic-entry job adds. The first seven (0..48) are
+; the arithmetic witness's and do not move.
+#CORE_PAR_O_ENTRY     = 56
+#CORE_PAR_O_ARGS      = 64
+#CORE_PAR_O_RET       = 72
+#CORE_PAR_O_FPCR      = 80
+
+; The third kind of job: go back to the firmware spin state. A REQUEST
+; STATES ITS WHOLE KIND, so every dispatch site writes this word, and the
+; worker reads it before it looks at the entry word.
+#CORE_PAR_O_RELEASE   = 88
+
+; ----------------------------------------------------------------------
+;  THE STACK GUARD, AND WHY IT IS NOT OPTIONAL.
+;
+;  A payload entry is ordinary generated code with a real frame, the
+;  board's three secondary stack pages are CONTIGUOUS, and there are no
+;  per-core exception vectors. So core 3 running off the bottom of its
+;  page writes into core 2's live stack, nothing faults, and the answer
+;  comes back wrong and quiet - the one outcome this project does not
+;  accept.
+;
+;  The lowest 256 bytes of each page are therefore not stack. The primary
+;  fills them with a pattern before the job and reads them back after the
+;  join; a changed word refuses the job and latches the service failed.
+;  Usable depth is 3840 bytes, which the desk gate MEASURES against the
+;  real worker rather than assuming.
+; ----------------------------------------------------------------------
+#CORE_PAR_GUARD_BYTES = 256
+#CORE_PAR_GUARD_WORD  = $5041524B47554152
+
+#CORE_PAR_ERR_NONE    = 0
+#CORE_PAR_ERR_ARG     = -1
+#CORE_PAR_ERR_CONTEXT = -2
+#CORE_PAR_ERR_BUSY    = -3
+#CORE_PAR_ERR_STATE   = -4
+#CORE_PAR_ERR_TIMEOUT = -5
+#CORE_PAR_ERR_FPCR    = -6
+#CORE_PAR_ERR_GUARD   = -7
+#CORE_PAR_ERR_WORKER  = -8
+
+; request, ack, count, seed, result, observed core, status, entry, args,
+; return value, FPCR. No shared line between cores. Primary changes input
+; only after prior ack (acquire).
+Global Dim core_accept_rows.i[160]
+Global core_accept_started.i
+Global core_accept_stopped.i
+Global core_accept_fault.i
+Global core_accept_nonce.i
+Global core_accept_runs.i
+Global core_accept_failed_core.i
+Global core_accept_addr.i
+Global core_accept_value.i
+Global Dim core_par_ret.i[#CORE_PAR_MAX_PARTS]
+Global Dim core_par_status.i[#CORE_PAR_MAX_PARTS]
+Global core_par_err.i
+Global core_par_failed_core.i
+Global core_par_count.i
+Global core_par_runs.i
+Global core_par_callentry.i
+Global core_par_callargs.i
+Global core_par_callret.i
+XIncludeFile "RaspberryPi4/Lib/acceptance_lease.pi4"
+
+Procedure.i CoreAcceptOwnsSecondaries()
+  ProcedureReturn accept_secondary_owner
+EndProcedure
+
+Procedure.i CoreAcceptRow(core.i)
+  If core < 1 Or core > 3 : ProcedureReturn 0 : EndIf
+  ProcedureReturn ((@core_accept_rows[0] + 255) & -256) + core * 256
+EndProcedure
+
+Procedure.i coreAcceptTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptSmpen()
+  ; Caller must have proved EL3 before this implementation-defined read.
+  ASM
+    mrs x0, cpuectlr_el1
+    movz x9, #64
+    and x0, x0, x9
+  EndASM
+EndProcedure
+
+Procedure.i coreAcceptAcquire()
+  ASM
+    adrp x9, global_core_accept_addr
+    add x9, x9, #:lo12:global_core_accept_addr
+    ldr x9, [x9]
+    ldar x0, [x9]
+  EndASM
+EndProcedure
+
+Procedure coreAcceptPublish()
+  ASM
+    adrp x9, global_core_accept_addr
+    add x9, x9, #:lo12:global_core_accept_addr
+    ldr x9, [x9]
+    adrp x10, global_core_accept_value
+    add x10, x10, #:lo12:global_core_accept_value
+    ldr x10, [x10]
+    stlr x10, [x9]
+    dsb sy
+    sev
+  EndASM
+EndProcedure
+
+Procedure.i CoreAcceptContext()
+  If acceptLeaseCore() <> 0 : ProcedureReturn 0 : EndIf
+  If (acceptLeaseDaif() & $3C0) <> $3C0 : ProcedureReturn 0 : EndIf
+  If MmuEl() <> 3 : ProcedureReturn 0 : EndIf
+  If (MmuSctlr() & #MMU_SCTLR_MCI) <> #MMU_SCTLR_MCI : ProcedureReturn 0 : EndIf
+  If coreAcceptSmpen() = 0 : ProcedureReturn 0 : EndIf
+  If coreAcceptHz() < 1 Or coreAcceptHz() > 1000000000 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i coreAcceptFail(code.i, core.i)
+  core_accept_fault = code
+  core_accept_failed_core = core
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i coreAcceptWait(core.i, expected.i, ready.i)
+  Define start.i
+  Define limit.i
+  Define spin.i
+  Define value.i
+  start = coreAcceptTicks()
+  limit = coreAcceptHz() * 2
+  For spin = 1 To #CORE_ACCEPT_SPINS
+    If ready <> 0
+      value = CoreRawState(core)
+    Else
+      core_accept_addr = CoreAcceptRow(core) + 8
+      value = coreAcceptAcquire()
+    EndIf
+    If value = expected : ProcedureReturn 1 : EndIf
+    If coreAcceptTicks() - start >= limit : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i CoreAcceptStart()
+  Define core.i
+  Define slot.i
+  Define row.i
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_started <> 0 Or core_accept_stopped <> 0 Or core_accept_fault <> 0
+    ProcedureReturn coreAcceptFail(-2, 0)
+  EndIf
+  If AcceptLeaseAcquire(#ACCEPT_OWNER_CORE, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    ProcedureReturn coreAcceptFail(-13, 0)
+  EndIf
+  ; Refuse another owner's secondary before preparing any record.
+  For core = 1 To 3
+    If core_raw_prepared[core] <> 0 Or core_raw_released[core] <> 0 Or PeekI(CoreRawReleaseAddr(core)) <> 0
+      If AcceptLeaseRelease(#ACCEPT_OWNER_CORE, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+        ProcedureReturn coreAcceptFail(-14, core)
+      EndIf
+      ProcedureReturn coreAcceptFail(-3, core)
+    EndIf
+  Next
+  core_accept_started = 1
+  accept_secondary_owner = 1
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    For slot = 0 To 31 : PokeI(row + slot * 8, 0) : Next
+    If CoreRawPrepare(core, HwCoreRawStackBase(core), HwCoreRawStackBytes(core), row) = 0
+      ProcedureReturn coreAcceptFail(-4, core)
+    EndIf
+    MmuCleanRange(row, 256)
+  Next
+  For core = 1 To 3
+    If CoreRawRelease(core) = 0 : ProcedureReturn coreAcceptFail(-5, core) : EndIf
+  Next
+  For core = 1 To 3
+    If coreAcceptWait(core, #CORE_RAW_STATE_READY, 1) = 0
+      ProcedureReturn coreAcceptFail(-6, core)
+    EndIf
+    If CoreRawResult(core, #CORE_RAW_R_CORE) <> core Or CoreRawResult(core, #CORE_RAW_R_CONTEXT) <> CoreAcceptRow(core) Or CoreRawResult(core, #CORE_RAW_R_EL) <> 12 Or CoreRawResult(core, #CORE_RAW_R_SP) <> HwCoreRawStackBase(core) + HwCoreRawStackBytes(core)
+      ProcedureReturn coreAcceptFail(-7, core)
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i coreAcceptRound(count.i)
+  Define core.i
+  Define row.i
+  Define seed.i
+  Define expected.i
+  ; Never replace inputs under an outstanding reader, including after timeout.
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    core_accept_addr = row + 8
+    If coreAcceptAcquire() <> PeekI(row) : ProcedureReturn coreAcceptFail(-8, core) : EndIf
+  Next
+  If core_accept_nonce >= $7FFFFFFF : ProcedureReturn coreAcceptFail(-9, 0) : EndIf
+  core_accept_nonce = core_accept_nonce + 1
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    seed = core_accept_nonce * 257 + core * 17
+    ; A REQUEST STATES ITS WHOLE KIND. The worker decides between the
+    ; arithmetic witness and a call into payload code by whether the entry
+    ; word is zero, so this writes the zero rather than inheriting whatever
+    ; the previous job left there. A `coretest stop` that silently re-ran
+    ; the last payload entry is exactly the shape this prevents.
+    PokeI(row + #CORE_PAR_O_ENTRY, 0)
+    PokeI(row + #CORE_PAR_O_RELEASE, 0)
+    PokeI(row + 16, count)
+    PokeI(row + 24, seed)
+    core_accept_addr = row
+    core_accept_value = core_accept_nonce
+    coreAcceptPublish()
+  Next
+  For core = 1 To 3
+    If coreAcceptWait(core, core_accept_nonce, 0) = 0 : ProcedureReturn coreAcceptFail(-10, core) : EndIf
+    row = CoreAcceptRow(core)
+    If count = 0
+      If PeekI(row + 48) <> 2 : ProcedureReturn coreAcceptFail(-11, core) : EndIf
+    Else
+      seed = core_accept_nonce * 257 + core * 17
+      expected = seed * count + count * (count - 1) / 2 + core
+      If PeekI(row + 32) <> expected Or PeekI(row + 40) <> core Or PeekI(row + 48) <> 1
+        ProcedureReturn coreAcceptFail(-12, core)
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i CoreAcceptRun()
+  Define round.i
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_stopped <> 0 Or core_accept_fault <> 0 : ProcedureReturn 0 : EndIf
+  If core_accept_started = 0
+    If CoreAcceptStart() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  For round = 1 To #CORE_ACCEPT_ROUNDS
+    If coreAcceptRound(#CORE_ACCEPT_MAX_WORK - round) = 0 : ProcedureReturn 0 : EndIf
+  Next
+  core_accept_runs = core_accept_runs + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i CoreAcceptStop()
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-1, 0) : EndIf
+  If core_accept_started = 0 Or core_accept_stopped <> 0 : ProcedureReturn 0 : EndIf
+  ; Stop may recover a completed timed-out job, never a pending job or failed join.
+  If core_raw_released[1] = 0 Or core_raw_released[2] = 0 Or core_raw_released[3] = 0 : ProcedureReturn 0 : EndIf
+  If CoreRawState(1) <> 2 Or CoreRawState(2) <> 2 Or CoreRawState(3) <> 2 : ProcedureReturn 0 : EndIf
+  If coreAcceptRound(0) = 0 : ProcedureReturn 0 : EndIf
+  core_accept_stopped = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  CoreAcceptReclaim() - MANY PAYLOADS PER BOOT.
+; ----------------------------------------------------------------------
+;  A WORKER'S TRANSLATION REGIME BELONGS TO WHOEVER WAS PRIMARY WHEN IT
+;  WAS STARTED, and that is the whole reason this procedure exists.
+;  CoreRawPrepare records the live TTBR0_EL3, TCR_EL3, MAIR_EL3 and
+;  SCTLR_EL3, and a payload that turns its own MMU on builds its tables
+;  in its OWN memory. A worker parked in this monitor's WFE loop
+;  therefore has valid CODE and borrowed TABLES: load the next payload
+;  over the last one's window and three cores walk overwritten
+;  descriptors, translate to arbitrary physical addresses and execute
+;  whatever is there, at EL3 - after a TLB eviction, so intermittently
+;  and silently. That is the failure this project refuses to ship, and
+;  it is why keeping the workers across a payload was never an option.
+;
+;  So no secondary is live across a payload boundary, in either
+;  direction. Each worker acknowledges, clears its own firmware spin
+;  slot, turns its MMU and caches off and re-enters an MMU-off WFE loop
+;  polling that slot - the state the armstub handed the core over in,
+;  which depends on nobody's page tables. The next SvcParallelRun starts
+;  them again under the regime that is live then, which is also what
+;  keeps all four cores on literally the same register values - the
+;  thing bit identity rests on.
+;
+;  WHAT IT WILL NOT RECLAIM, and each refusal is the honest one:
+;    * a latched fault - a core that stopped answering cannot be proven
+;      safe to talk to, and asking it to leave is still talking to it;
+;    * workers `coretest stop` parked for good - they are in a WFE loop
+;      that reads nothing and there is no warm rejoin, deliberately;
+;    * a job whose acknowledgement is still outstanding.
+;  For all three the answer is unchanged and it is a reset.
+; ======================================================================
+Procedure.i CoreAcceptReclaim()
+  Define core.i
+  Define row.i
+  Define start.i
+  Define limit.i
+  Define pending.i
+  If core_accept_started = 0 : ProcedureReturn 1 : EndIf
+  If CoreAcceptContext() = 0 : ProcedureReturn coreAcceptFail(-30, 0) : EndIf
+  If core_accept_fault <> 0 Or core_accept_stopped <> 0 : ProcedureReturn 0 : EndIf
+  ; Every core ready, released, and with nothing outstanding - checked in
+  ; full before the first word of the first request is written.
+  For core = 1 To 3
+    If core_raw_released[core] = 0 : ProcedureReturn coreAcceptFail(-31, core) : EndIf
+    If CoreRawState(core) <> #CORE_RAW_STATE_READY : ProcedureReturn coreAcceptFail(-32, core) : EndIf
+    row = CoreAcceptRow(core)
+    core_accept_addr = row + 8
+    If coreAcceptAcquire() <> PeekI(row) : ProcedureReturn coreAcceptFail(-33, core) : EndIf
+  Next
+  If core_accept_nonce >= $7FFFFFFF : ProcedureReturn coreAcceptFail(-34, 0) : EndIf
+  core_accept_nonce = core_accept_nonce + 1
+  For core = 1 To 3
+    row = CoreAcceptRow(core)
+    PokeI(row + #CORE_PAR_O_ENTRY, 0)
+    PokeI(row + 16, 0)
+    PokeI(row + 48, 0)
+    PokeI(row + #CORE_PAR_O_RELEASE, 1)
+    core_accept_addr = row
+    core_accept_value = core_accept_nonce
+    coreAcceptPublish()
+  Next
+  ; The same bound the parallel job uses, and nothing pets the watchdog
+  ; inside it. A core that will not leave is a core that was already gone.
+  start = coreAcceptTicks()
+  limit = coreAcceptHz() * #CORE_PAR_DEADLINE_S
+  pending = 1
+  While pending <> 0
+    pending = 0
+    For core = 1 To 3
+      row = CoreAcceptRow(core)
+      core_accept_addr = row + 8
+      If coreAcceptAcquire() <> core_accept_nonce : pending = 1 : EndIf
+    Next
+    If pending <> 0 And coreAcceptTicks() - start >= limit
+      For core = 1 To 3
+        row = CoreAcceptRow(core)
+        core_accept_addr = row + 8
+        If coreAcceptAcquire() <> core_accept_nonce
+          core_accept_fault = -35
+          core_accept_failed_core = core
+          ProcedureReturn 0
+        EndIf
+      Next
+    EndIf
+  Wend
+  For core = 1 To 3
+    If PeekI(CoreAcceptRow(core) + 48) <> #CORE_PAR_STATUS_RELEASED
+      ProcedureReturn coreAcceptFail(-36, core)
+    EndIf
+  Next
+  ; Each worker cleared its own spin slot BEFORE it acknowledged, so
+  ; CoreRawReclaimed()'s slot check is a question about a store that has
+  ; already happened rather than a race with one that has not.
+  For core = 1 To 3
+    If CoreRawReclaimed(core) = 0 : ProcedureReturn coreAcceptFail(-37, core) : EndIf
+    row = CoreAcceptRow(core)
+    PokeI(row + #CORE_PAR_O_RELEASE, 0)
+    PokeI(row, 0)
+    PokeI(row + 8, 0)
+    PokeI(row + 48, 0)
+    MmuCleanRange(row, 256)
+  Next
+  ; The nonce keeps counting. It is not restarted with the workers,
+  ; because a stale acknowledgement from a core that left late must never
+  ; match a request made after it came back.
+  core_accept_started = 0
+  core_par_err = #CORE_PAR_ERR_NONE
+  core_par_failed_core = 0
+  core_par_count = 0
+  accept_secondary_owner = 0
+  If AcceptLeaseRelease(#ACCEPT_OWNER_CORE, #ACCEPT_LEASE_GIC | #ACCEPT_LEASE_WATCHDOG) = 0
+    ProcedureReturn coreAcceptFail(-38, 0)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE FOUR-CORE PAYLOAD JOB - the primary side.
+; ======================================================================
+
+Procedure.i coreParFpcr()
+  ASM
+    mrs x0, fpcr
+  EndASM
+EndProcedure
+
+; Partition 0, on the primary, through the same indirect call the
+; secondaries make - so the four partitions run identical code reached the
+; identical way, and a difference between "what core 0 did" and "what core
+; 2 did" cannot hide in two different call paths.
+;
+; GLOBALS RATHER THAN PARAMETERS because this language has no call through
+; a procedure pointer; the same shape coreAcceptPublish() uses. The frame
+; is the compiler's, so x30 is saved and restored around the BLR by the
+; prologue and epilogue this procedure already has.
+Procedure coreParCallPrimary()
+  ASM
+    adrp x9, global_core_par_callentry
+    add x9, x9, #:lo12:global_core_par_callentry
+    ldr x9, [x9]
+    adrp x10, global_core_par_callargs
+    add x10, x10, #:lo12:global_core_par_callargs
+    ldr x0, [x10]
+    blr x9
+    adrp x10, global_core_par_callret
+    add x10, x10, #:lo12:global_core_par_callret
+    str x0, [x10]
+  EndASM
+EndProcedure
+
+Procedure.i coreParFail(code.i, core.i)
+  core_par_err = code
+  core_par_failed_core = core
+  ProcedureReturn 0
+EndProcedure
+
+Procedure coreParGuardArm(core.i)
+  Define base.i
+  Define i.i
+  base = HwCoreRawStackBase(core)
+  If base <> 0
+    For i = 0 To #CORE_PAR_GUARD_BYTES / 8 - 1
+      PokeI(base + i * 8, #CORE_PAR_GUARD_WORD)
+    Next
+  EndIf
+EndProcedure
+
+Procedure.i coreParGuardIntact(core.i)
+  Define base.i
+  Define i.i
+  base = HwCoreRawStackBase(core)
+  If base = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To #CORE_PAR_GUARD_BYTES / 8 - 1
+    If PeekI(base + i * 8) <> #CORE_PAR_GUARD_WORD
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; How many partitions this monitor will actually run at once. Never an
+; error: a payload sizes its split from this and never has to guess, and
+; 1 is the honest answer for "this Anvil will run it on the core you are
+; already on". An older monitor answers the same 1 by not having the slot
+; at all, so the payload's fallback path is the same one either way.
+Procedure.i CoreParallelCores()
+  Define core.i
+  If CoreAcceptContext() = 0 : ProcedureReturn 1 : EndIf
+  If core_accept_stopped <> 0 Or core_accept_fault <> 0 Or core_par_err <> 0
+    ProcedureReturn 1
+  EndIf
+  If core_accept_started = 0
+    For core = 1 To 3
+      If core_raw_prepared[core] <> 0 Or core_raw_released[core] <> 0 Or PeekI(CoreRawReleaseAddr(core)) <> 0
+        ProcedureReturn 1
+      EndIf
+    Next
+  EndIf
+  ProcedureReturn #CORE_PAR_MAX_PARTS
+EndProcedure
+
+; What partition `index` did on the last CoreParallelRun: its entry's own
+; return value. Valid only immediately after the call.
+Procedure.i CoreParallelStatus(index.i)
+  If index < 0 Or index >= #CORE_PAR_MAX_PARTS : ProcedureReturn 0 : EndIf
+  ProcedureReturn core_par_ret[index]
+EndProcedure
+
+Procedure.i CoreParallelErr()
+  ProcedureReturn core_par_err
+EndProcedure
+
+Procedure.i CoreParallelFailedCore()
+  ProcedureReturn core_par_failed_core
+EndProcedure
+
+; entry(argsBase + i * argsStride) on cores 0..count-1, all of them, then
+; join. Returns 1 only when every partition ran, every guard is intact,
+; every core agreed with the primary's FPCR and every entry returned zero.
+Procedure.i CoreParallelRun(entry.i, argsBase.i, argsStride.i, count.i)
+  Define i.i
+  Define core.i
+  Define row.i
+  Define start.i
+  Define limit.i
+  Define ack.i
+  Define waiting.i
+
+  core_par_err = #CORE_PAR_ERR_NONE
+  core_par_failed_core = 0
+  core_par_count = 0
+  For i = 0 To #CORE_PAR_MAX_PARTS - 1
+    core_par_ret[i] = 0
+    core_par_status[i] = 0
+  Next
+
+  If entry = 0 Or (entry & 3) <> 0 Or argsStride < 0 Or count < 1 Or count > #CORE_PAR_MAX_PARTS
+    ProcedureReturn coreParFail(#CORE_PAR_ERR_ARG, 0)
+  EndIf
+  ; EL3, DAIF masked, SMPEN, a sane counter frequency, and core 0. The ABI
+  ; is core-0-only and this is the one slot a payload might think relaxed
+  ; it, so it is enforced rather than documented.
+  If CoreAcceptContext() = 0
+    ProcedureReturn coreParFail(#CORE_PAR_ERR_CONTEXT, 0)
+  EndIf
+  If core_accept_stopped <> 0 Or core_accept_fault <> 0
+    ProcedureReturn coreParFail(#CORE_PAR_ERR_STATE, 0)
+  EndIf
+
+  ; Arm the bound BEFORE anything is dispatched, so it covers the primary's
+  ; own partition too and the whole call is bounded, not only the join.
+  start = coreAcceptTicks()
+  limit = coreAcceptHz() * #CORE_PAR_DEADLINE_S
+
+  If count > 1
+    If core_accept_started = 0
+      If CoreAcceptStart() = 0
+        ProcedureReturn coreParFail(#CORE_PAR_ERR_BUSY, core_accept_failed_core)
+      EndIf
+    EndIf
+    ; Never replace inputs under an outstanding reader, including after a
+    ; previous timeout, and check every core before writing any of them.
+    For core = 1 To count - 1
+      row = CoreAcceptRow(core)
+      core_accept_addr = row + 8
+      If coreAcceptAcquire() <> PeekI(row)
+        ProcedureReturn coreParFail(#CORE_PAR_ERR_STATE, core)
+      EndIf
+      If CoreRawState(core) <> #CORE_RAW_STATE_READY
+        ProcedureReturn coreParFail(#CORE_PAR_ERR_STATE, core)
+      EndIf
+    Next
+    If core_accept_nonce >= $7FFFFFFF
+      ProcedureReturn coreParFail(#CORE_PAR_ERR_STATE, 0)
+    EndIf
+    core_accept_nonce = core_accept_nonce + 1
+    For core = 1 To count - 1
+      coreParGuardArm(core)
+      row = CoreAcceptRow(core)
+      PokeI(row + 16, 0)
+      PokeI(row + #CORE_PAR_O_RELEASE, 0)
+      PokeI(row + #CORE_PAR_O_ENTRY, entry)
+      PokeI(row + #CORE_PAR_O_ARGS, argsBase + core * argsStride)
+      PokeI(row + #CORE_PAR_O_RET, 0)
+      PokeI(row + #CORE_PAR_O_FPCR, 0)
+      PokeI(row + 48, 0)
+      ; The release store below orders every word above it. DRAM here is
+      ; Normal Write-Back Inner Shareable and all four cores have SMPEN, so
+      ; the secondaries see them with no cache maintenance at all - see
+      ; MmuSecondaryJoinRaw for the regime they joined.
+      core_accept_addr = row
+      core_accept_value = core_accept_nonce
+      coreAcceptPublish()
+    Next
+  EndIf
+
+  ; Partition 0, here, while the others run.
+  core_par_callentry = entry
+  core_par_callargs = argsBase
+  core_par_callret = 0
+  coreParCallPrimary()
+  core_par_ret[0] = core_par_callret
+  core_par_status[0] = #CORE_PAR_STATUS_DONE
+
+  If count > 1
+    waiting = 1
+    While waiting <> 0
+      waiting = 0
+      For core = 1 To count - 1
+        If core_par_status[core] = 0
+          row = CoreAcceptRow(core)
+          core_accept_addr = row + 8
+          ack = coreAcceptAcquire()
+          If ack = core_accept_nonce
+            ; The acquire above orders every load below it after every
+            ; store the secondary made before its release - the partition's
+            ; outputs included. NOTHING IS CLEANED OR INVALIDATED HERE AND
+            ; NOTHING MAY BE: two partitions share the cache line at each
+            ; output-range boundary, and a clean of that line would write
+            ; one core's copy of it over the other's.
+            core_par_ret[core] = PeekI(row + #CORE_PAR_O_RET)
+            core_par_status[core] = PeekI(row + 48)
+          Else
+            waiting = 1
+          EndIf
+        EndIf
+      Next
+      If waiting <> 0 And coreAcceptTicks() - start >= limit
+        For core = 1 To count - 1
+          If core_par_status[core] = 0
+            core_accept_fault = -20
+            core_accept_failed_core = core
+            ProcedureReturn coreParFail(#CORE_PAR_ERR_TIMEOUT, core)
+          EndIf
+        Next
+      EndIf
+    Wend
+  EndIf
+
+  ; Every partition answered. Now the three things that decide whether its
+  ; answer can be believed.
+  For core = 1 To count - 1
+    If core_par_status[core] <> #CORE_PAR_STATUS_DONE
+      ProcedureReturn coreParFail(#CORE_PAR_ERR_STATE, core)
+    EndIf
+    If coreParGuardIntact(core) = 0
+      core_accept_fault = -21
+      core_accept_failed_core = core
+      ProcedureReturn coreParFail(#CORE_PAR_ERR_GUARD, core)
+    EndIf
+    If PeekI(CoreAcceptRow(core) + #CORE_PAR_O_FPCR) <> coreParFpcr()
+      ProcedureReturn coreParFail(#CORE_PAR_ERR_FPCR, core)
+    EndIf
+  Next
+  For i = 0 To count - 1
+    If core_par_ret[i] <> 0
+      ProcedureReturn coreParFail(#CORE_PAR_ERR_WORKER, i)
+    EndIf
+  Next
+
+  core_par_count = count
+  core_par_runs = core_par_runs + 1
+  ProcedureReturn 1
+EndProcedure
+
+; x0=context (our row), x1=core from the verified raw bootstrap. The
+; arithmetic witness uses only x0..x18 with no stack and no generated call;
+; the generic-entry job calls payload code and therefore uses this core's
+; own reserved page. Requests are consumed once by nonce.
+ProcedureNaked CoreAcceptSecondary()
+  ASM
+    b coreAcceptSecondaryEnd
+coreAcceptSecondaryEntry:
+    movz x3, #0
+coreAcceptSecondaryWait:
+    ldar x4, [x0]
+    cmp x4, x3
+    b.ne coreAcceptSecondaryJob
+    wfe
+    b coreAcceptSecondaryWait
+coreAcceptSecondaryJob:
+    mov x3, x4
+    ; A REQUEST STATES ITS WHOLE KIND, and release is asked about first
+    ; because it is the one kind that must not be confused with a stale
+    ; entry address left by the job before it.
+    ldr x5, [x0, #88]
+    cbnz x5, coreAcceptSecondaryRelease
+    ldr x5, [x0, #56]
+    cbnz x5, coreAcceptSecondaryCall
+    ldr x5, [x0, #16]
+    cbz x5, coreAcceptSecondaryStop
+    movz x6, #4096
+    cmp x5, x6
+    b.hi coreAcceptSecondaryBad
+    ldr x6, [x0, #24]
+    mov x7, x1
+coreAcceptSecondarySum:
+    add x7, x7, x6
+    add x6, x6, #1
+    subs x5, x5, #1
+    b.ne coreAcceptSecondarySum
+    str x7, [x0, #32]
+    str x1, [x0, #40]
+    movz x8, #1
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+    b coreAcceptSecondaryWait
+    ; ------------------------------------------------------------------
+    ;  THE GENERIC-ENTRY JOB - ABI group 15, SvcParallelRun.
+    ;
+    ;  The primary published an entry address at +56 and this partition's
+    ;  argument pointer at +64. The LDAR above is the acquire that orders
+    ;  both loads after the primary's release store of the nonce, so a
+    ;  half-written pair cannot be read.
+    ;
+    ;  IC IALLU BEFORE EVERY CALL, NOT ONCE AT JOIN. The instruction cache
+    ;  is not coherent with the data cache (Arm ARM DDI 0487 B2.4.4), these
+    ;  workers stay resident across payloads, and a second payload loaded
+    ;  over the same window would otherwise be executed from the first
+    ;  payload's lines at the same addresses. Three instructions against a
+    ;  partition of roughly a second of work. The primary does NOT need
+    ;  this for its own partition: it is already executing the payload it
+    ;  is about to call into.
+    ;
+    ;  THE CALLED CODE IS ORDINARY GENERATED A64 and may clobber x0-x18
+    ;  and x30, so the row, the core number and the latched nonce go on
+    ;  this core's own stack across the call rather than into a register
+    ;  the callee is entitled to destroy. SP is 16-byte aligned on entry
+    ;  (the board hands a page top) and stays so.
+    ; ------------------------------------------------------------------
+coreAcceptSecondaryCall:
+    ic iallu
+    dsb sy
+    isb
+    ldr x6, [x0, #64]
+    sub sp, sp, #32
+    str x0, [sp, #0]
+    str x1, [sp, #8]
+    str x3, [sp, #16]
+    mov x0, x6
+    blr x5
+    mov x6, x0
+    ldr x0, [sp, #0]
+    ldr x1, [sp, #8]
+    ldr x3, [sp, #16]
+    add sp, sp, #32
+    str x6, [x0, #72]
+    ; FPCR is per-PE and it decides the bits. Publish what this core is
+    ; actually rounding with, every job, so the primary can refuse a
+    ; disagreement instead of shipping a different waveform.
+    mrs x7, fpcr
+    str x7, [x0, #80]
+    str x1, [x0, #40]
+    movz x8, #4
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+    b coreAcceptSecondaryWait
+    ; ------------------------------------------------------------------
+    ;  THE RELEASE JOB - go back to the state the armstub handed this
+    ;  core over in, so that nothing this core holds belongs to the
+    ;  payload that is about to leave.
+    ;
+    ;  ORDER IS THE CORRECTNESS HERE, and it is four things in one
+    ;  direction:
+    ;
+    ;   1. CLEAR OUR OWN FIRMWARE SPIN SLOT FIRST, while this core is
+    ;      still cacheable and coherent with the primary, and clean the
+    ;      line to the point of coherency so the MMU-off loop at the
+    ;      bottom - whose loads bypass every cache - reads the zero. The
+    ;      owner's CoreRawReclaimed() refuses unless this store landed,
+    ;      which is why it happens before the acknowledgement and not
+    ;      after it.
+    ;   2. ACKNOWLEDGE, with the release store that orders 1 before it.
+    ;      The owner may write a fresh entry into the slot the instant it
+    ;      sees this; that is safe, because SEV sets this PE's event
+    ;      register whether or not it has reached its WFE yet, and the
+    ;      loop re-reads the slot after every wake.
+    ;   3. M, C AND I OFF, THEN CLEAN THIS CORE'S PRIVATE L1 BY SET/WAY -
+    ;      in that order, which is mmu.pi4's measured rule: a set/way
+    ;      walk issued while C is still on races the A72's own line
+    ;      migration and misses lines. NO STACK IS TOUCHED between the
+    ;      clear and the end of the walk, for the same reason
+    ;      MmuDisableCachedFlushed is one inline block. LEVEL 0 ONLY: the
+    ;      A72's level 1 is the cluster-shared L2 that holds the live
+    ;      primary's dirty data and a secondary must never enumerate it.
+    ;   4. PARK. The loop below is the armstub's `secondary_spin` written
+    ;      out again - WFE, read the slot, branch when it is non-zero.
+    ;      With M clear the PC and that load are physical, so this core
+    ;      now walks no page tables at all and does not care what the
+    ;      next payload does to DRAM. CoreRawSecondary re-derives
+    ;      everything it needs from MPIDR_EL1 and the cold record, so a
+    ;      later CoreRawPrepare/CoreRawRelease brings it back exactly as
+    ;      the first one did.
+    ; ------------------------------------------------------------------
+coreAcceptSecondaryRelease:
+    lsl x9, x1, #3
+    movz x13, #216
+    add x13, x13, x9
+    movz x9, #0
+    str x9, [x13]
+    dc cvac, x13
+    dsb sy
+    str x1, [x0, #40]
+    movz x8, #5
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+    ; --- M, C, I off, at EL3 ------------------------------------------
+    mrs x9, sctlr_el3
+    movn x10, #4101
+    and x9, x9, x10
+    msr sctlr_el3, x9
+    dsb sy
+    isb
+    ; --- clean+invalidate this core's private L1 by set/way ------------
+    ; Derived from CSSELR_EL1/CCSIDR_EL1 the same way MmuSecondaryJoinRaw
+    ; derives its cold invalidate, with `dc cisw` in place of `dc isw`
+    ; because this core has dirty lines and DRAM must get them.
+    movz x14, #0
+    msr csselr_el1, x14
+    isb
+    mrs x10, ccsidr_el1
+    movz x11, #7
+    and x2, x10, x11
+    add x2, x2, #4
+    lsr x3, x10, #3
+    movz x11, #1023
+    and x3, x3, x11
+    movz x5, #32
+    mov x9, x3
+coreAcceptRelWayShift:
+    cbz x9, coreAcceptRelWayShiftDone
+    lsr x9, x9, #1
+    sub x5, x5, #1
+    b coreAcceptRelWayShift
+coreAcceptRelWayShiftDone:
+    lsr x4, x10, #13
+    movz x11, #32767
+    and x4, x4, x11
+    mov x7, x3
+coreAcceptRelWay:
+    mov x6, x4
+coreAcceptRelSet:
+    lsl x9, x7, x5
+    lsl x8, x6, x2
+    orr x8, x8, x9
+    dc cisw, x8
+    subs x6, x6, #1
+    b.ge coreAcceptRelSet
+    subs x7, x7, #1
+    b.ge coreAcceptRelWay
+    dsb sy
+    isb
+    ic iallu
+    tlbi alle3
+    dsb sy
+    isb
+    ; --- the firmware's own spin state, re-created --------------------
+coreAcceptSecondarySpin:
+    wfe
+    ldr x4, [x13]
+    cbz x4, coreAcceptSecondarySpin
+    movz x0, #0
+    movz x1, #0
+    movz x2, #0
+    movz x3, #0
+    br x4
+coreAcceptSecondaryBad:
+    movz x8, #3
+    b coreAcceptSecondaryParkAck
+coreAcceptSecondaryStop:
+    movz x8, #2
+coreAcceptSecondaryParkAck:
+    str x8, [x0, #48]
+    add x9, x0, #8
+    stlr x3, [x9]
+    dsb sy
+    sev
+coreAcceptSecondaryPark:
+    wfe
+    b coreAcceptSecondaryPark
+coreAcceptSecondaryEnd:
+    ret
+  EndASM
+EndProcedure

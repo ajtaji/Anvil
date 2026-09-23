@@ -1,0 +1,397 @@
+; ======================================================================
+; VC4 render-only clear job for BCM2837/Pi 3.
+;
+; Packet/register basis: Raspberry Pi downstream Linux rpi-6.12.y at
+; 9c40c75f681b0b8882db9b624dfec8f81ff492f2, drivers/gpu/drm/vc4/
+; vc4_render_cl.c, vc4_packet.h, vc4_regs.h and vc4_gem.c. This is a
+; one-tile render command list (RCL), with no binning list, QPU program,
+; scanout, firmware framebuffer, Pi 4 packet format, or CPU/DMA clear.
+; It is intended for a separately owned, aligned offscreen target only.
+;
+; The first API builds a 39-byte Linux-shaped clear RCL. The second API
+; executes it only after a successful Pi3V3dProbeIdentity() has left the
+; domain on and the caller supplies the returned identity. It uses the
+; BCM2837 Linux dma-ranges mapping (bus = ARM physical + 0xC0000000).
+; Buffers and command list must live wholly in the explicit caller arena.
+; ======================================================================
+
+#PI3_VC4_DMA_BASE = $C0000000
+#PI3_VC4_PHYS_LIMIT = $3F000000
+#PI3_VC4_RCL_BYTES = 39
+#PI3_VC4_CLEAR_WIDTH = 64
+#PI3_VC4_CLEAR_HEIGHT = 64
+#PI3_VC4_CLEAR_BYTES = 16384
+#PI3_VC4_CACHE_LINE = 64
+
+#PI3_VC4_PKT_STORE_TILE_BUFFER_GENERAL = 28
+#PI3_VC4_PKT_STORE_MS_TILE_BUFFER_AND_EOF = 25
+#PI3_VC4_PKT_TILE_RENDERING_MODE_CONFIG = 113
+#PI3_VC4_PKT_CLEAR_COLORS = 114
+#PI3_VC4_PKT_TILE_COORDINATES = 115
+#PI3_VC4_TRMC_RGBA8888_LINEAR = 4
+
+#PI3_VC4_REG_INTCTL = $30
+#PI3_VC4_REG_CT0CS = $100
+#PI3_VC4_REG_CT1CS = $104
+#PI3_VC4_REG_CT1EA = $10C
+#PI3_VC4_REG_CT1CA = $114
+#PI3_VC4_REG_CT1PC = $12C
+#PI3_VC4_REG_PCS = $130
+#PI3_VC4_REG_L2CACTL = $020
+#PI3_VC4_REG_SLCACTL = $024
+#PI3_VC4_L2CACTL_L2CCLR = $04
+#PI3_VC4_SLCACTL_FULL_CLEAR = $0F0F0F0F
+#PI3_VC4_SLCACTL_TEXTURE_CLEAR = $0F0F0000
+#PI3_VC4_INT_SPILLUSE = $08
+#PI3_VC4_INT_OUTOMEM = $04
+#PI3_VC4_INT_FLDONE = $02
+#PI3_VC4_INT_FRDONE = $01
+#PI3_VC4_CS_RESET = $8000
+#PI3_VC4_CS_CTRUN = $20
+#PI3_VC4_CS_CTERR = $08
+#PI3_VC4_TIMEOUT_US = 100000
+#PI3_VC4_RESET_TIMEOUT_US = 10000
+
+#PI3_VC4_ERR_ARGS = -1
+#PI3_VC4_ERR_EXTENT = -2
+#PI3_VC4_ERR_ALIGN = -3
+#PI3_VC4_ERR_OVERLAP = -4
+#PI3_VC4_ERR_PROBE = -5
+#PI3_VC4_ERR_MMIO = -6
+#PI3_VC4_ERR_BUSY = -7
+#PI3_VC4_ERR_TIMER = -8
+#PI3_VC4_ERR_TIMEOUT = -9
+#PI3_VC4_ERR_GPU = -10
+#PI3_VC4_ERR_RESET = -11
+#PI3_VC4_ERR_UNSAFE_BUSY = -12
+
+Structure Pi3Vc4JobResult
+  result.i
+  phase.i
+  interrupt.i
+  binnerStatus.i
+  threadStatus.i
+  threadStart.i
+  threadEnd.i
+  programCounter.i
+  elapsedUs.i
+  resetResult.i
+  preInterrupt.i
+  prePcs.i
+  postPcs.i
+EndStructure
+
+Global gPi3Vc4CacheAddr.i
+
+Procedure Pi3Vc4CleanLine()
+  ASM
+    adrp x9, global_gpi3vc4cacheaddr
+    add  x9, x9, #:lo12:global_gpi3vc4cacheaddr
+    ldr  x9, [x9]
+    dc cvac, x9
+  EndASM
+EndProcedure
+
+Procedure Pi3Vc4CleanInvalidateLine()
+  ASM
+    adrp x9, global_gpi3vc4cacheaddr
+    add  x9, x9, #:lo12:global_gpi3vc4cacheaddr
+    ldr  x9, [x9]
+    dc civac, x9
+  EndASM
+EndProcedure
+
+Procedure Pi3Vc4InvalidateLine()
+  ASM
+    adrp x9, global_gpi3vc4cacheaddr
+    add  x9, x9, #:lo12:global_gpi3vc4cacheaddr
+    ldr  x9, [x9]
+    dc ivac, x9
+  EndASM
+EndProcedure
+
+Procedure Pi3Vc4CleanRange(lo.i, bytes.i)
+  Protected line.i
+  Protected last.i
+  If bytes <= 0 Or lo < 0 Or lo > #PI3_VC4_PHYS_LIMIT - bytes
+    ProcedureReturn 0
+  EndIf
+  line = (lo >> 6) << 6
+  last = (lo + bytes - 1) & (~(#PI3_VC4_CACHE_LINE - 1))
+  While line <= last
+    gPi3Vc4CacheAddr = line
+    Pi3Vc4CleanLine()
+    line = line + #PI3_VC4_CACHE_LINE
+  Wend
+  ASM
+    dsb sy
+  EndASM
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3Vc4CleanInvalidateRange(lo.i, bytes.i)
+  Protected line.i
+  Protected last.i
+  If bytes <= 0 Or lo < 0 Or lo > #PI3_VC4_PHYS_LIMIT - bytes
+    ProcedureReturn 0
+  EndIf
+  line = (lo >> 6) << 6
+  last = (lo + bytes - 1) & (~(#PI3_VC4_CACHE_LINE - 1))
+  While line <= last
+    gPi3Vc4CacheAddr = line
+    Pi3Vc4CleanInvalidateLine()
+    line = line + #PI3_VC4_CACHE_LINE
+  Wend
+  ASM
+    dsb sy
+  EndASM
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3Vc4InvalidateRange(lo.i, bytes.i)
+  Protected line.i
+  Protected last.i
+  If bytes <= 0 Or lo < 0 Or lo > #PI3_VC4_PHYS_LIMIT - bytes
+    ProcedureReturn 0
+  EndIf
+  line = (lo >> 6) << 6
+  last = (lo + bytes - 1) & (~(#PI3_VC4_CACHE_LINE - 1))
+  While line <= last
+    gPi3Vc4CacheAddr = line
+    Pi3Vc4InvalidateLine()
+    line = line + #PI3_VC4_CACHE_LINE
+  Wend
+  ASM
+    dsb sy
+  EndASM
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3Vc4SpanInArena(address.i, bytes.i, arenaLo.i, arenaHi.i)
+  If address <= 0 Or bytes <= 0 Or arenaLo < 0 Or arenaHi < arenaLo
+    ProcedureReturn 0
+  EndIf
+  If address < arenaLo Or address > arenaHi : ProcedureReturn 0 : EndIf
+  If bytes - 1 > arenaHi - address : ProcedureReturn 0 : EndIf
+  If address > #PI3_VC4_PHYS_LIMIT - bytes : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3Vc4ValidateClearBuffers(target.i, targetCapacity.i, rcl.i, rclCapacity.i, arenaLo.i, arenaHi.i)
+  If targetCapacity < #PI3_VC4_CLEAR_BYTES Or rclCapacity < #PI3_VC4_RCL_BYTES
+    ProcedureReturn #PI3_VC4_ERR_ARGS
+  EndIf
+  If (target & (#PI3_VC4_CACHE_LINE - 1)) <> 0 Or (rcl & 15) <> 0
+    ProcedureReturn #PI3_VC4_ERR_ALIGN
+  EndIf
+  If Pi3Vc4SpanInArena(target, #PI3_VC4_CLEAR_BYTES, arenaLo, arenaHi) = 0
+    ProcedureReturn #PI3_VC4_ERR_EXTENT
+  EndIf
+  If Pi3Vc4SpanInArena(rcl, #PI3_VC4_RCL_BYTES, arenaLo, arenaHi) = 0
+    ProcedureReturn #PI3_VC4_ERR_EXTENT
+  EndIf
+  If target < rcl + #PI3_VC4_RCL_BYTES And rcl < target + #PI3_VC4_CLEAR_BYTES
+    ProcedureReturn #PI3_VC4_ERR_OVERLAP
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; V3D_INT_OUTOMEM is the binner's overflow-memory request, not a CT1 render
+; completion/fault signal. The clear-only RCL has no binner. As in Linux's
+; render path, completion is FRDONE and a render-thread CTERR is fatal; retain
+; other IRQ bits for diagnostics without misclassifying the job.
+Procedure.i Pi3Vc4ClassifyRenderStatus(interrupt.i, threadStatus.i)
+  If (threadStatus & #PI3_VC4_CS_CTERR) <> 0
+    ProcedureReturn #PI3_VC4_ERR_GPU
+  EndIf
+  If (interrupt & #PI3_VC4_INT_FRDONE) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Match Linux vc4_submit_next_bin_job() cache flush followed by
+; vc4_submit_next_render_job() texture flush. Even an empty bin list takes
+; this path before its render list is submitted.
+Procedure Pi3Vc4FlushBeforeRender()
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_L2CACTL, #PI3_VC4_L2CACTL_L2CCLR)
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_SLCACTL, #PI3_VC4_SLCACTL_FULL_CLEAR)
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_L2CACTL, #PI3_VC4_L2CACTL_L2CCLR)
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_SLCACTL, #PI3_VC4_SLCACTL_TEXTURE_CLEAR)
+  ASM
+    dsb sy
+  EndASM
+EndProcedure
+
+Procedure Pi3Vc4Put16(address.i, value.i)
+  PokeA(address, value & $FF)
+  PokeA(address + 1, (value >> 8) & $FF)
+EndProcedure
+
+Procedure Pi3Vc4Put32(address.i, value.i)
+  PokeA(address, value & $FF)
+  PokeA(address + 1, (value >> 8) & $FF)
+  PokeA(address + 2, (value >> 16) & $FF)
+  PokeA(address + 3, (value >> 24) & $FF)
+EndProcedure
+
+; Construct the Linux vc4_render_cl.c clear-only RCL for one 64x64 tile.
+; No bytes are touched unless every extent/alignment/overlap check passes.
+Procedure.i Pi3Vc4BuildClearRcl(target.i, targetCapacity.i, rcl.i, rclCapacity.i, arenaLo.i, arenaHi.i, rgba.i)
+  Protected rc.i
+  Protected at.i
+  Protected targetBus.i
+  rc = Pi3Vc4ValidateClearBuffers(target, targetCapacity, rcl, rclCapacity, arenaLo, arenaHi)
+  If rc <> 1 : ProcedureReturn rc : EndIf
+  If target > $FFFFFFFF - #PI3_VC4_DMA_BASE
+    ProcedureReturn #PI3_VC4_ERR_EXTENT
+  EndIf
+  targetBus = target + #PI3_VC4_DMA_BASE
+  at = rcl
+  PokeA(at, #PI3_VC4_PKT_CLEAR_COLORS) : at = at + 1
+  Pi3Vc4Put32(at, rgba) : at = at + 4
+  Pi3Vc4Put32(at, rgba) : at = at + 4
+  Pi3Vc4Put32(at, 0) : at = at + 4
+  PokeA(at, 0) : at = at + 1 ; stencil byte; clear_z supplies the VG byte
+  PokeA(at, #PI3_VC4_PKT_TILE_COORDINATES) : at = at + 1
+  PokeA(at, 0) : at = at + 1 : PokeA(at, 0) : at = at + 1
+  PokeA(at, #PI3_VC4_PKT_STORE_TILE_BUFFER_GENERAL) : at = at + 1
+  Pi3Vc4Put16(at, 0) : at = at + 2 ; initial NONE-mode clear-state latch
+  Pi3Vc4Put32(at, 0) : at = at + 4
+  PokeA(at, #PI3_VC4_PKT_TILE_RENDERING_MODE_CONFIG) : at = at + 1
+  Pi3Vc4Put32(at, targetBus) : at = at + 4
+  Pi3Vc4Put16(at, #PI3_VC4_CLEAR_WIDTH) : at = at + 2
+  Pi3Vc4Put16(at, #PI3_VC4_CLEAR_HEIGHT) : at = at + 2
+  Pi3Vc4Put16(at, #PI3_VC4_TRMC_RGBA8888_LINEAR) : at = at + 2
+  PokeA(at, #PI3_VC4_PKT_TILE_COORDINATES) : at = at + 1
+  PokeA(at, 0) : at = at + 1 : PokeA(at, 0) : at = at + 1
+  PokeA(at, #PI3_VC4_PKT_STORE_MS_TILE_BUFFER_AND_EOF) : at = at + 1
+  If at - rcl <> #PI3_VC4_RCL_BYTES
+    ProcedureReturn #PI3_VC4_ERR_ARGS
+  EndIf
+  ProcedureReturn at - rcl
+EndProcedure
+
+Procedure.i Pi3Vc4ResetRenderThread(startUs.i, timeoutUs.i)
+  Protected now.i
+  Protected cs.i
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CS, #PI3_VC4_CS_RESET)
+  ASM
+    dsb sy
+  EndASM
+  Repeat
+    cs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CS) & $FFFFFFFF
+    now = Pi3Micros()
+    If now < startUs Or now - startUs >= timeoutUs : ProcedureReturn 0 : EndIf
+  Until (cs & (#PI3_VC4_CS_RESET | #PI3_VC4_CS_CTRUN)) = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3Vc4UnsafePark()
+  Repeat
+    ASM
+      wfe
+    EndASM
+  ForEver
+EndProcedure
+
+; Run only after a successful identity/domain probe. The resident watchdog
+; owner flag and active full-reset mode are checked here. A failed CT1 reset
+; records ERR_UNSAFE_BUSY and parks; this routine never returns while GPU
+; ownership of caller memory might remain.
+Procedure.i Pi3Vc4RunClear(*identity.Pi3V3dIdentity, target.i, targetCapacity.i, rcl.i, rclCapacity.i, arenaLo.i, arenaHi.i, rgba.i, *result.Pi3Vc4JobResult)
+  Protected rc.i
+  Protected used.i
+  Protected startUs.i
+  Protected now.i
+  Protected intctl.i
+  Protected cs.i
+  Protected binCs.i
+  Protected resetStart.i
+  If *result = 0 : ProcedureReturn #PI3_VC4_ERR_ARGS : EndIf
+  *result\result = #PI3_VC4_ERR_ARGS : *result\phase = 0 : *result\interrupt = 0
+  *result\binnerStatus = 0 : *result\threadStatus = 0 : *result\threadStart = 0 : *result\threadEnd = 0
+  *result\programCounter = 0 : *result\elapsedUs = 0 : *result\resetResult = 0
+  *result\preInterrupt = 0 : *result\prePcs = 0 : *result\postPcs = 0
+  If pi3_mon_deadman_owned = 0 Or (PeekL($3F10001C) & $30) <> $20
+    *result\result = #PI3_VC4_ERR_ARGS : ProcedureReturn *result\result
+  EndIf
+  If *identity = 0 Or *identity\ident0 <> #PI3_V3D_IDENT0_EXPECTED Or pi3_v3d_domain_state <> 1
+    *result\result = #PI3_VC4_ERR_PROBE : ProcedureReturn *result\result
+  EndIf
+  rc = Pi3Vc4ValidateClearBuffers(target, targetCapacity, rcl, rclCapacity, arenaLo, arenaHi)
+  If rc <> 1 : *result\result = rc : ProcedureReturn rc : EndIf
+  If HwAddrCheck(#PI3_V3D_BASE, #PI3_V3D_BASE + #PI3_VC4_REG_PCS + 3, 1) <> #HW_ADDR_SAFE
+    *result\result = #PI3_VC4_ERR_MMIO : ProcedureReturn *result\result
+  EndIf
+  binCs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT0CS) & $FFFFFFFF
+  cs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CS) & $FFFFFFFF
+  *result\binnerStatus = binCs : *result\threadStatus = cs
+  If (binCs & (#PI3_VC4_CS_RESET | #PI3_VC4_CS_CTRUN | #PI3_VC4_CS_CTERR)) <> 0 Or (cs & (#PI3_VC4_CS_RESET | #PI3_VC4_CS_CTRUN | #PI3_VC4_CS_CTERR)) <> 0
+    *result\phase = 1 : *result\result = #PI3_VC4_ERR_BUSY : ProcedureReturn *result\result
+  EndIf
+  used = Pi3Vc4BuildClearRcl(target, targetCapacity, rcl, rclCapacity, arenaLo, arenaHi, rgba)
+  If used <> #PI3_VC4_RCL_BYTES : *result\result = used : ProcedureReturn used : EndIf
+  If Pi3Vc4CleanInvalidateRange(target, #PI3_VC4_CLEAR_BYTES) = 0 Or Pi3Vc4CleanRange(rcl, used) = 0
+    *result\phase = 2 : *result\result = #PI3_VC4_ERR_EXTENT : ProcedureReturn *result\result
+  EndIf
+  *result\preInterrupt = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_INTCTL) & $FFFFFFFF
+  *result\prePcs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_PCS) & $FFFFFFFF
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_INTCTL, #PI3_VC4_INT_FRDONE | #PI3_VC4_INT_SPILLUSE | #PI3_VC4_INT_OUTOMEM)
+  Pi3Vc4FlushBeforeRender()
+  startUs = Pi3Micros()
+  If startUs < 0 : *result\phase = 3 : *result\result = #PI3_VC4_ERR_TIMER : ProcedureReturn *result\result : EndIf
+  *result\phase = 3
+  *result\threadStart = rcl + #PI3_VC4_DMA_BASE
+  *result\threadEnd = *result\threadStart + used
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CA, *result\threadStart)
+  ASM
+    dsb sy
+  EndASM
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1EA, *result\threadEnd)
+  ASM
+    dsb sy
+  EndASM
+  Repeat
+    intctl = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_INTCTL) & $FFFFFFFF
+    cs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CS) & $FFFFFFFF
+    now = Pi3Micros()
+    If now < startUs
+      rc = #PI3_VC4_ERR_TIMER : Break
+    EndIf
+    rc = Pi3Vc4ClassifyRenderStatus(intctl, cs)
+    If rc <> 0 : Break : EndIf
+    If now - startUs >= #PI3_VC4_TIMEOUT_US
+      rc = #PI3_VC4_ERR_TIMEOUT : Break
+    EndIf
+  ForEver
+  *result\interrupt = intctl : *result\threadStatus = cs
+  *result\threadStart = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1CA) & $FFFFFFFF
+  *result\threadEnd = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1EA) & $FFFFFFFF
+  *result\programCounter = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_CT1PC) & $FFFFFFFF
+  *result\postPcs = PeekL(#PI3_V3D_BASE + #PI3_VC4_REG_PCS) & $FFFFFFFF
+  *result\elapsedUs = now - startUs
+  If rc = 1
+    *result\phase = 4 : *result\result = 1
+    PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_INTCTL, #PI3_VC4_INT_FRDONE)
+    If Pi3Vc4InvalidateRange(target, #PI3_VC4_CLEAR_BYTES) = 0
+      *result\result = #PI3_VC4_ERR_EXTENT : ProcedureReturn *result\result
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ; Keep the pre-reset CS/IRQ/PC/CA/EA snapshot in *result for diagnosis.
+  *result\phase = 5 : *result\result = rc
+  resetStart = Pi3Micros()
+  If resetStart < 0
+    *result\resetResult = 0 : *result\result = #PI3_VC4_ERR_UNSAFE_BUSY
+    Pi3Vc4UnsafePark()
+  EndIf
+  If Pi3Vc4ResetRenderThread(resetStart, #PI3_VC4_RESET_TIMEOUT_US) = 0
+    *result\resetResult = 0 : *result\result = #PI3_VC4_ERR_UNSAFE_BUSY
+    Pi3Vc4UnsafePark()
+  EndIf
+  *result\resetResult = 1
+  PokeL(#PI3_V3D_BASE + #PI3_VC4_REG_INTCTL, #PI3_VC4_INT_FRDONE | #PI3_VC4_INT_SPILLUSE | #PI3_VC4_INT_OUTOMEM)
+  Pi3Vc4InvalidateRange(target, #PI3_VC4_CLEAR_BYTES)
+  ProcedureReturn rc
+EndProcedure

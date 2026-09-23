@@ -1,0 +1,26 @@
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+Procedure Main()
+  DmaWait(20000)
+  DmaAbort()
+  DmaBusy()
+  DmaQuarantined()
+  DmaSetChannel(2)
+  DmaSetScratch($900000,512)
+  DmaSetBounds($A00000,4096)
+  DmaInit()
+  DisplayUseDma(0)
+  DisplayFillRect(0,0,2,2,1)
+  DisplayPixel(0,0,1)
+  DisplayGetPixel(0,0)
+  DisplayCopyRect(0,0,1,1,1,1)
+  DisplayBlit($A10000,8,0,0,2,2)
+  DisplayChar(0,0,65,1,0)
+  DisplayCharClear(0,0,65,1)
+  DisplayFlush()
+  DisplayBase()
+  DisplayMemorySafe()
+EndProcedure

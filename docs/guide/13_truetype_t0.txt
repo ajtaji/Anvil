@@ -1,0 +1,51 @@
+@CHAPTER TrueType font container
+@INTRO T0 admits an in-memory sfnt font or the first face of a TrueType collection after checking every table boundary and checksum.
+
+@SECTION The memory contract
+
+T0 is the file admission layer for the TrueType engine. It accepts a font
+already in memory and proves that its sfnt header, table directory, table
+bounds and table checksums are safe to inspect. It also accepts a TrueType
+collection and selects its first face. It does not load a file from a disk,
+decode metrics or character maps, read outlines, rasterise a glyph, or draw.
+
+The public memory contract is:
+
+  AnvilTrueTypeOpen(data, bytes)
+  AnvilTrueTypeClose()
+  AnvilTrueTypeTableCount()
+  AnvilTrueTypeTableTag(index)
+  AnvilTrueTypeTableOffset(index)
+  AnvilTrueTypeTableLength(index)
+  AnvilTrueTypeFind(tag)
+  AnvilTrueTypeError()
+  AnvilTrueTypeErrorTag()
+  AnvilTrueTypeErrorOffset()
+  AnvilTrueTypeErrorText()  ; pointer to a bounded NUL-terminated ASCII sentence
+
+Table offsets in a collection are offsets from the beginning of the whole
+collection. Every table is checked before it is read. A duplicate tag,
+overlapping table, truncated table, unsupported collection header or checksum
+failure refuses the font. The refusal names the table and offset when those
+are available through both numeric accessors and the bounded diagnostic text
+buffer. The head table checksum is calculated with its
+checkSumAdjustment field treated as zero, as required by the sfnt format.
+
+Every open attempt invalidates the previous table view, including a failed
+attempt. `AnvilTrueTypeClose()` clears the table count, data accessors and
+diagnostic sentence. A decoder that caches table pointers should keep the T0
+revision token and discard those pointers after any close or new open.
+
+The gate uses two small in-memory fonts, one standalone sfnt and one
+collection whose first face is selected. It then corrupts the directory in
+several independent ways: truncation, an out-of-bounds table, a bad checksum,
+an overlap, a duplicate tag and an invalid collection offset. These are
+container checks only; lifecycle cases also prove that a refusal, a later
+successful open and close do not leave stale table data or diagnostics.
+Passing them does not claim metrics, cmap, outline, raster or renderer support.
+Later atlas work will continue to use the existing single rasterise-once cache
+and its Vulkan texture path.
+
+@SECTION Format references
+
+The container follows the OpenType sfnt rules in the [OpenType overview](https://learn.microsoft.com/en-us/typography/opentype/spec/otff) and the [`head`](https://learn.microsoft.com/en-us/typography/opentype/spec/head) table specification. The [Apple TrueType Reference Manual](https://developer.apple.com/fonts/TrueType-Reference-Manual/) documents the TrueType collection and outline format.

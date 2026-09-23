@@ -1,0 +1,2735 @@
+; ======================================================================
+;  ConPaintDma - THE DMA / CPU SCREEN RENDERER.
+;
+;  It paints the ONE shared console grid (console.pi4) to the framebuffer.
+;  It is what `screen dma` and `screen cpu` register with the console core;
+;  gDma decides DMA-accelerated versus pure-CPU drawing, which is the only
+;  difference between those two tiers. It NEVER reads the mirror ring - the
+;  hub (ScreenPump) already drained it into the grid - so it can never
+;  double-consume or scroll differently from the V3D renderer. Only rows
+;  the grid marked dirty are repainted, and a scroll is one hardware DMA
+;  scroll of the picture, so this stays as responsive as the DMA console
+;  always was.
+;
+;  The banner band above the console is drawn once by DrawBanner (in
+;  ScreenUpOn); it is not part of the grid and this never touches it.
+; ======================================================================
+Procedure ConPaintDma()
+  Define r.i
+  Define y.i
+  Define ch.i
+  Define fg.i
+  Define n.i
+  Define c.i
+  Define cw.i
+  Define style.i
+  Define hadCur.i
+  Define pLo.i
+  Define pHi.i
+
+  If DisplayBase() = 0
+    ProcedureReturn
+  EndIf
+  ch = DisplayCharHeight()
+  cw = DisplayCharWidth()
+
+  ; Lift the mouse cursor before touching the framebuffer, so a scroll or a
+  ; repaint does not smear its save-under; it goes back on top at the end.
+  hadCur = gCurShown
+  If hadCur <> 0
+    CursorRestore(gCurX, gCurY)
+    gCurShown = 0
+  EndIf
+
+  ; THE BAND THIS PASS TOUCHED, in the console's own pixel rows, so the
+  ; display seam can present exactly that much and no more. It is
+  ; tracked here rather than guessed at afterwards because this
+  ; procedure is the only thing that knows: a repaint of three scattered
+  ; dirty rows and a whole-screen clear are the same call from outside.
+  ; pLo > pHi means nothing was drawn, which is the common case at the
+  ; prompt and has to cost nothing.
+  pLo = DisplayHeight()
+  pHi = -1
+
+  If ConGridFullClear() <> 0
+    DisplayFillRect(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight(), gScreenBg)
+    pLo = 0
+    pHi = DisplayHeight() - 1
+  ElseIf ConGridScrollN() > 0
+    ; Hardware-scroll the picture up by the net rows the grid scrolled, then
+    ; only the changed/newly-exposed rows are repainted below.
+    If ScreenFastScroll(ConGridScrollN()) = 0
+      ; The engine declined (CPU tier, or a whole-screen scroll): clear and
+      ; repaint everything.
+      DisplayFillRect(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight(), gScreenBg)
+      ConGridMarkAll()
+    EndIf
+    ; A SCROLL MOVES EVERY ROW WHETHER OR NOT IT IS DIRTY, so the whole
+    ; console below the banner has to be presented even though the loop
+    ; below will only repaint the exposed rows. Getting this wrong on a
+    ; rotated panel shows as a picture that scrolls its bottom line and
+    ; leaves the rest standing.
+    pLo = LogoHeight()
+    pHi = DisplayHeight() - 1
+  EndIf
+
+  r = 0
+  While r < ConGridRows()
+    If ConGridRowDirty(r) <> 0
+      y = LogoHeight() + r * ch
+      DisplayFillRect(0, y, DisplayWidth(), ch, gScreenBg)
+      ; One draw per contiguous style run. The row was cleared above, and
+      ; x is derived from the run's first cell, so splitting the string
+      ; changes colour only - never spacing or terminal content.
+      c = 0
+      While c < ConGridCols()
+        style = ConGridCellStyle(r, c)
+        n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+        If style = #UART_SCREEN_STYLE_PROMPT
+          fg = DisplayRGB(80, 255, 120)
+        Else
+          fg = DisplayRGB(226, 232, 240)
+        EndIf
+        If n > 0
+          DisplayTextClear(c * cw, y, @gConRowBuf[0], fg)
+          c = c + n
+        Else
+          c = c + 1
+        EndIf
+      Wend
+      If y < pLo
+        pLo = y
+      EndIf
+      If (y + ch - 1) > pHi
+        pHi = y + ch - 1
+      EndIf
+    EndIf
+    r = r + 1
+  Wend
+
+  ConGridClearDirty()
+
+  If hadCur <> 0
+    CursorSave(gCurX, gCurY)
+    CursorDraw(gCurX, gCurY)
+    gCurShown = 1
+    ; THE CURSOR IS PART OF THE PICTURE AND IT MOVES ON ITS OWN. It is
+    ; drawn after the grid, often on a row nothing else touched, so its
+    ; own rows join the band. Leaving it out is the bug where a rotated
+    ; panel shows a cursor that never moves.
+    If gCurY < pLo
+      pLo = gCurY
+    EndIf
+    If (gCurY + #CUR_H - 1) > pHi
+      pHi = gCurY + #CUR_H - 1
+    EndIf
+  EndIf
+
+  ; The seam. On HDMI, and on the panel at rotation 0 and 180, this is
+  ; one comparison and a return: the bytes just drawn are the bytes
+  ; being scanned.
+  If pHi >= pLo
+    ScrPresent(pLo, pHi)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenAttachFramebuffer - make the DMA/CPU framebuffer renderer the
+;  active screen endpoint (dmaOn = 1 binds the DMA engine, 0 forces plain
+;  CPU). Used by `screen dma` / `screen cpu` and as the boot fallback when
+;  V3D is unavailable. Detaches V3D, registers ConPaintDma, and repaints
+;  the whole screen fresh - the banner band, then the shared grid - so the
+;  content is byte-identical to what V3D was showing, just CPU/DMA-painted.
+; ----------------------------------------------------------------------
+Procedure.i ScreenAttachFramebuffer(dmaOn.i)
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If VulkanConsoleReady() <> 0 Or VulkanConsoleQuarantined() <> 0
+    If VulkanConsoleStop() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  CompilerEndIf
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  gV3dConOn = 0
+  gCursorGpuOwned = 0
+  CompilerEndIf
+  If dmaOn <> 0
+    gDma = ScreenDmaUp()
+  Else
+    gDma = 0
+    DisplayUseDma(0)
+  EndIf
+  ConSetRenderer(@ConPaintDma)
+  DisplayClear(gScreenBg)
+  DrawBanner()
+  ConRepaint()
+  ; The banner band is not part of the console grid, so ConRepaint's own
+  ; present does not cover it. This is the one call that does the lot.
+  ScrPresentAll()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ScreenUpOn - bring the console up, optionally on a chosen display.
+;
+; index is the display to ask for, or -1 for "let the firmware's own
+; choice stand". MINUS ONE IS THE OLD BEHAVIOUR, EXACTLY: display.pi4
+; sends no selection tag at all in that case and the mailbox traffic is
+; identical to what Anvil has been booting with. Nothing that
+; calls plain ScreenUp() has changed in any way.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+; THE SILENT "screen on" REGRESSION - FOUND ON THE BOARD, 2026-08-26
+;
+; This procedure used to open with
+;
+;     If gScreen <> 0
+;       ProcedureReturn 1
+;     EndIf
+;
+; and that early return is why every form of "screen on" printed NOTHING
+; AT ALL on hardware. Anvil brings the screen up during boot, so by the
+; time an operator types anything gScreen is already 1 and the guard
+; fires before a single character is printed - and, far worse, before
+; the display index is even looked at. "screen on 5" on a board with one
+; display returned success, silently, having neither moved the screen
+; nor said that display 5 does not exist.
+;
+; SILENCE IS THE WORST FAILURE THIS COMMAND CAN HAVE. An operator who
+; sees nothing cannot tell "it worked" from "it was refused" from "it
+; was not understood", and the wire is the only record on this bench.
+; So the rule for this procedure is now absolute: EVERY PATH OUT OF IT
+; PRINTS SOMETHING, and the "already up" test happens LAST, after the
+; index has been checked, rather than first.
+;
+; The order below is the whole fix and each step is where it is for a
+; reason:
+;   1. the tag table, because nothing can be asked of the firmware
+;      without it - including the index check
+;   2. the index, because "there is no display 5" is true whether or not
+;      a screen is already running, and an operator who typed a wrong
+;      number needs telling either way
+;   3. only then, is it already up? - and if it is, either say so or
+;      take it down and move it
+;
+; MOVING A RUNNING SCREEN IS A REAL OUTCOME, not a refusal. "screen on 1"
+; typed at a board whose screen is on display 0 means move it, and
+; answering "turn it off first" would be a monitor arguing with a
+; perfectly clear instruction. The console comes down and goes back up
+; on the display asked for; the serial line never stops working, which
+; is why this is safe to do from a command typed over it.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  ScreenUpOn - BRING THE CONSOLE UP ON ONE OF THE SCREENS THIS BOARD
+;  HAS.
+;
+;  src is #SCR_SRC_HDMI, #SCR_SRC_DSI, or #SCR_SRC_AUTO for "whichever
+;  one is actually there", which is what the boot path asks for. index
+;  is the firmware display to put it on; it means nothing to the panel,
+;  which is not one of the firmware's displays, and -1 - "let the
+;  firmware's own choice stand" - is the only value the DSI path takes.
+;
+;  THE SHAPE, AND IT IS THE WHOLE POINT OF THE SEAM. Everything up to
+;  and including the surface differs between the two screens. NOTHING
+;  after it does. So this is two short acquisition branches and one long
+;  shared tail, and the tail is the code that was here before, moved and
+;  not rewritten: the blitter, the background colour, the clear, the
+;  banner, the console rectangle, the shared grid, the renderer, the
+;  mirror, the report. Neither screen has a console of its own.
+;
+;  THE SILENT "screen on" REGRESSION note below still governs every path
+;  out of here: EVERY ONE OF THEM PRINTS SOMETHING.
+; ----------------------------------------------------------------------
+Global gScreenDsiEarlyCacheArm.i
+
+Procedure ScreenDsiEarlyCacheArm()
+  gScreenDsiEarlyCacheArm = 1
+EndProcedure
+
+Procedure.i ScreenDsiEarlyCacheTake()
+  Define armed.i
+  armed = gScreenDsiEarlyCacheArm
+  gScreenDsiEarlyCacheArm = 0
+  ProcedureReturn armed
+EndProcedure
+
+; Enable the cache early only for the armed boot call and Anvil's fixed DSI window. HDMI remains on
+; the late V3D path because V3dConTryDouble may replace its firmware-owned
+; framebuffer before CacheEnable records the adopted range.
+Procedure ScreenDsiEarlyCache(armed.i)
+  If armed <> 0 And gScrSrc = #SCR_SRC_DSI
+    CacheEnable()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE SCREEN COMES UP BEFORE THE SETTINGS EXIST, AND IS CORRECTED AFTER
+; ----------------------------------------------------------------------
+;  WHAT THIS REPLACED, AND WHY THE OLD REASONING WAS RIGHT AND STILL HAD
+;  TO GO. boot.pi4's header argued the screen must come up AFTER the
+;  settings store, because which screen the console goes on and which way
+;  up it sits are settings - and a screen brought up on a default would
+;  have to be torn down and rebuilt when the real answer arrived,
+;  "erasing the boot log it was brought up early to carry."
+;
+;  Every clause of that is true. The conclusion followed only because a
+;  rebuild was the only way to change the geometry, and because the boot
+;  log existed nowhere but on the glass. Both of those are now false:
+;
+;    THE GEOMETRY CHANGES IN PLACE. ScrDsiReadoptBegin re-points the HVS
+;    at the other fixed display list and re-installs the drawing surface.
+;    It touches no panel power, no reset, no DSI host, no clock, no pixel
+;    valve and no allocation - the panel never stops scanning. On HDMI
+;    there is no re-adoption at all: the firmware's surface does not
+;    change and only the magnification can, which is a redraw.
+;
+;    THE BOOT LOG EXISTS OFF THE GLASS. Anvil/Core/boot_transcript.pbi
+;    retains the byte stream the console was built from, so a grid
+;    rebuilt at a new geometry is reconstructed from what was SAID.
+;    Restoring from retained state, never from stale pixels: the pixels
+;    are the wrong shape, which is the entire reason the geometry moved.
+;
+;  SO THE COST THAT PARAGRAPH ACCEPTED IS PAID BACK. The USB, PCIe and
+;  boot-medium lines used to reach the wire before the glass existed.
+;  They are now on the panel, as they happen, which is the whole of what
+;  was asked for.
+;
+;  AND THE COMMON CASE COSTS NOTHING. SETTINGS.TXT names no rotation on
+;  this bench, so the stored answer IS the default, ScreenApplyStoredGeometry
+;  finds nothing to change and returns without touching the screen.
+; ======================================================================
+
+Global *gScreenReadoptPaint
+Global gScreenReadoptSuspended.i
+
+; ----------------------------------------------------------------------
+;  ScreenRebuildAtGeometry - THE SHARED COMPOSITION TAIL.
+;
+;  The surface is whatever it now is; this rebuilds everything composed
+;  ON it and puts the retained boot log back. It is the same tail
+;  ScreenUpOn runs after its two acquisition branches, and it is shared
+;  for the same reason: NOTHING after the surface differs between the two
+;  screens, so a second copy of it would be where a DSI assumption and an
+;  HDMI assumption start to diverge.
+;
+;  THE REPLAY GOES STRAIGHT INTO THE GRID AND NOT THROUGH THE RING. The
+;  transcript is taken in ConDrainRing (console.pi4), so feeding it back
+;  through the ring would capture it a second time and double the log on
+;  the next geometry change. ConGridPutc is below that tap, which is also
+;  why capture may stay armed across this: the lines printed after the
+;  rebuild are captured exactly once, in order, as they arrive.
+;
+;  IT ENDS WITH ONE PRESENT OF THE WHOLE SURFACE. Every renderer's own
+;  present covers the band it painted and the banner band is not part of
+;  the grid, so this is the one call that puts the anvil on the glass.
+; ----------------------------------------------------------------------
+Procedure ScreenRebuildAtGeometry()
+  Define i.i
+  Define c.i
+
+  ; THE GPU'S STATE IS DERIVED FROM A GEOMETRY THAT NO LONGER EXISTS, and
+  ; it has to be told so BEFORE anything is drawn - the same statement
+  ; ScreenDetach makes when the console leaves a surface. Ownership goes
+  ; back to the CPU/DMA tier here and the GPU picks the console up again
+  ; the next time it is asked to; a renderer pointer moved out from under
+  ; a GPU that still believed it owned the frame is how a cursor ends up
+  ; drawn by two things at once.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  V3dConInvalidate()
+  gV3dConOn = 0
+  gCursorGpuOwned = 0
+  CompilerEndIf
+
+  gDma = ScreenDmaUp()
+  DisplayAutoFlush(1)
+  gScreenBg = DisplayRGB(0, 0, 40)
+  DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
+  DisplayClear(gScreenBg)
+  DrawBanner()
+  DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
+  ConGridInit(DisplayCols(), DisplayRows())
+  ConSetRenderer(@ConPaintDma)
+  UartMirrorSetDrain(@ConMirrorDrain)
+
+  ; THE RETAINED LOG, FROM BYTE ZERO, EVERY TIME. There is no cursor to
+  ; get wrong: a rebuild that fails half way clears the grid and walks
+  ; again rather than resuming into a prefix nobody can account for.
+  i = 0
+  While i < BootTranscriptCount()
+    c = BootTranscriptAt(i)
+    If c < 0
+      Break
+    EndIf
+    ConGridPutc(c)
+    i = i + 1
+  Wend
+
+  ; THE KEYBOARD'S RECTANGLES WERE DERIVED FROM THE OLD SURFACE and every
+  ; one of them is now a guess - the same statement TouchKeyboardPayloadResume
+  ; makes about a surface a payload had. The layout is re-taken against
+  ; the live metrics on the next service tick.
+  TouchKeyboardOverlayReset()
+
+  ; AND SO IS EVERY TOUCH EVENT STILL IN THE QUEUE. The rotation or the
+  ; size may have changed a line ago; anything sampled before that was
+  ; mapped against a surface that no longer exists, and a finger that went
+  ; down on the old geometry must not come up on the new one. This is the
+  ; same call, for the same reason, that ScreenUpOn makes after a move.
+  HwTouchFlush()
+
+  ScrPresentAll()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DSI HALF. Suspend painting, then ask the HVS for the other slot.
+;
+;  RENDERING STAYS SUSPENDED WHILE THE REQUEST IS PENDING, and that is
+;  not caution - it is the only honest state. Linux writes SCALER_DISPLISTX
+;  and does not believe the switch until SCALER_DISPLACTX names that list
+;  (rpi-6.12.y_vc4_hvs.c:1151-1174, 1248-1345); until then the software
+;  geometry and the scanned geometry may disagree, and painting across
+;  that is a frame torn between two shapes.
+; ----------------------------------------------------------------------
+Procedure.i ScreenDsiReadoptStart(rot.i, scale.i)
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_DSI Or gScreenReadoptSuspended <> 0
+    ProcedureReturn 0
+  EndIf
+  *gScreenReadoptPaint = *gConPaint
+  UartMirrorSetDrain(0)
+  ConSetRenderer(0)
+  PointerHide()
+  gScreenReadoptSuspended = 1
+  If ScrDsiReadoptBegin(rot, scale) = 0
+    ConSetRenderer(*gScreenReadoptPaint)
+    UartMirrorSetDrain(@ConMirrorDrain)
+    gScreenReadoptSuspended = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Service a staged change. 0 while pending, 1 once the requested list is
+; ACTIVE and the console has been rebuilt at the new geometry with the
+; retained boot log back in it.
+Procedure.i ScreenDsiReadoptService()
+  If gScreenReadoptSuspended = 0
+    ProcedureReturn 1
+  EndIf
+  If ScrDsiReadoptResolve() = 0
+    ProcedureReturn 0
+  EndIf
+  ScreenRebuildAtGeometry()
+  gScreenReadoptSuspended = 0
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenDsiReadoptAbandon - the bounded caller gave up.
+;
+;  THE REQUEST CANNOT SIMPLY BE FORGOTTEN. DISPLIST has been written and
+;  the block may latch the staged slot at any later frame. So the staged
+;  slot is rewritten to describe exactly what the ACTIVE one describes
+;  (ScrDsiReadoptAbandon -> HvsFlipAbandon), which makes the two slots
+;  identical and the outcome of a late latch irrelevant - instead of
+;  leaving a picture that might turn itself over minutes later.
+;
+;  The software geometry was never changed while pending, so putting the
+;  old renderer back is putting the console back to what the panel is
+;  actually scanning.
+; ----------------------------------------------------------------------
+Procedure ScreenDsiReadoptAbandon()
+  If gScreenReadoptSuspended = 0
+    ProcedureReturn
+  EndIf
+  ScrDsiReadoptAbandon()
+  ConSetRenderer(*gScreenReadoptPaint)
+  UartMirrorSetDrain(@ConMirrorDrain)
+  gScreenReadoptSuspended = 0
+  ConRepaint()
+  ScrPresentAll()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE HDMI HALF, AND IT IS A DIFFERENT CONTRACT ON PURPOSE.
+;
+;  NOTHING HERE MAY BORROW A DSI ASSUMPTION AND THERE IS NOTHING HERE FOR
+;  DSI TO BORROW. An HDMI surface is the firmware's: this monitor did not
+;  choose its address, its stride or its scanout, there is no HVS display
+;  list of ours pointing at it, there is no second buffer and there is no
+;  transpose. ScrRotPick answers 0 for HDMI whatever the store says - a
+;  console moved off a turned panel must not inherit the panel's turn -
+;  so the only stored geometry an HDMI console can be wrong about is the
+;  MAGNIFICATION, and correcting that is a redraw of the composition and
+;  nothing else.
+;
+;  A rotation reaching here would be a bug in ScrRotPick rather than
+;  something to act on, so it is refused loudly rather than applied.
+; ----------------------------------------------------------------------
+Procedure.i ScreenHdmiRescale(scale.i)
+  If gScreen = 0 Or gScrSrc <> #SCR_SRC_HDMI
+    ProcedureReturn 0
+  EndIf
+  If ScrScaleOk(scale) = 0
+    ProcedureReturn 0
+  EndIf
+  PointerHide()
+  gScrScale = scale
+  DisplayScale(gScrScale)
+  ScreenRebuildAtGeometry()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenApplyStoredGeometry - THE ONE CALL THE BOOT PATH MAKES.
+;
+;  The screen came up on the defaults because the settings store did not
+;  exist yet. It exists now. If it names the same geometry - which is the
+;  case on any board whose SETTINGS.TXT says nothing about the screen -
+;  this returns 0 having touched nothing at all.
+;
+;  Returns 1 when the console was rebuilt, 0 when nothing needed doing or
+;  the change could not be made. Every path prints, because a screen that
+;  changes shape at boot and a screen that does not must be told apart
+;  from the wire.
+; ----------------------------------------------------------------------
+Procedure.i ScreenApplyStoredGeometry()
+  Define rot.i
+  Define scale.i
+  Define deadline.i
+
+  If gScreen = 0
+    ProcedureReturn 0
+  EndIf
+
+  rot = ScrRotWanted(gScrSrc)
+  ; THE WIDTH HANDED TO THE SCALE RULE IS THE CONSOLE'S OWN, AND THE TWO
+  ; SCREENS GET IT FROM DIFFERENT PLACES. It is used for one thing - the
+  ; eighty-column cap - and a wrong one makes the type smaller for no
+  ; reason and then makes this procedure believe the store disagrees with
+  ; the screen at every boot.
+  ;
+  ; On the panel it has to be the width AT THE REQUESTED ROTATION, which
+  ; the live surface does not know yet: turning the console is exactly
+  ; what is being decided here. On HDMI there is no rotation and the live
+  ; surface is the answer - and it is the same expression ScreenUpOn used
+  ; to compute the magnification the screen came up with, so the
+  ; comparison below cannot disagree with the bring-up.
+  If gScrSrc = #SCR_SRC_DSI
+    scale = ScrScaleWanted(gScrSrc, ScrLogicalW(rot, #MON_FB_PANEL_W, #MON_FB_PANEL_H))
+  Else
+    scale = ScrScaleWanted(gScrSrc, DisplayWidth())
+  EndIf
+  If rot = gScrRot And scale = gScrScale
+    ProcedureReturn 0
+  EndIf
+
+  BootTimingMark(#BTM_READOPT_BEGIN, rot, scale)
+
+  ; ---- HDMI: the magnification, and only the magnification -----------
+  If gScrSrc <> #SCR_SRC_DSI
+    If rot <> gScrRot
+      Print("!! the settings store asks for rotation ")
+      PrintDec(rot)
+      PrintN(" on an HDMI display, which")
+      PrintN("   this monitor does not turn - the firmware hands HDMI over already")
+      PrintN("   landscape. The rotation was ignored; nothing on the screen changed.")
+      PrintN("   Rotation is a property of the DSI panel and is applied there only.")
+    EndIf
+    If scale = gScrScale
+      ProcedureReturn 0
+    EndIf
+    Print("The settings store asks for magnification ")
+    PrintDec(scale)
+    Print(" and the screen came up")
+    Print(" at ")
+    PrintDec(gScrScale)
+    PrintN(", so the console is being redrawn at that size now.")
+    If ScreenHdmiRescale(scale) = 0
+      PrintN("!! that magnification was refused, so the console was left exactly as")
+      PrintN("   it was. Only 1 to 8 are accepted; type screen scale to see what is")
+      PrintN("   in the store and screen scale auto to remove it.")
+      ProcedureReturn 0
+    EndIf
+    BootTimingMark(#BTM_READOPT_DONE, BootTranscriptCount(), BootTranscriptLost())
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- the DSI panel: in place, without the panel ever stopping ------
+  Print("The settings store asks for the console turned ")
+  PrintDec(rot)
+  Print(" degrees at")
+  Print(" magnification ")
+  PrintDec(scale)
+  PrintN(". The panel keeps scanning throughout; it")
+  PrintN("is neither powered down nor re-initialised, and the boot log so far is")
+  PrintN("put back from what was printed rather than from what is on the glass.")
+
+  If ScreenDsiReadoptStart(rot, scale) = 0
+    PrintN("!! that geometry was refused before anything was changed, so the")
+    PrintN("   console is still exactly as it came up. The rotation must be 0, 90,")
+    PrintN("   180 or 270 and the magnification 1 to 8; type screen rotate and")
+    PrintN("   screen scale to see what the store actually says.")
+    ProcedureReturn 0
+  EndIf
+
+  ; THE WAIT IS BOUNDED AND THE BOUND IS ARGUED. The HVS latches a newly
+  ; selected display list at a frame boundary, so at this panel's 60 Hz
+  ; the answer is due within about 17 ms; 500 ms is thirty frames. A
+  ; block that has not taken the list in thirty frames is not scanning,
+  ; which is a different fault entirely and one an operator has to be
+  ; told about rather than have the boot hang on.
+  deadline = Ticks() + TickHz() / 2
+  While ScreenDsiReadoptService() = 0
+    If Ticks() > deadline
+      ScreenDsiReadoptAbandon()
+      PrintN("!! the display controller did not take the new display list within")
+      PrintN("   thirty frames, so the console has been left at the geometry it")
+      PrintN("   came up with and the request has been withdrawn - both of the")
+      PrintN("   controller's list slots now describe the picture on the glass, so")
+      PrintN("   a late switch cannot change it. The panel is still scanning and")
+      PrintN("   the serial line is unaffected. Type screen rotate to try again.")
+      ProcedureReturn 0
+    EndIf
+  Wend
+
+  BootTimingMark(#BTM_READOPT_DONE, BootTranscriptCount(), BootTranscriptLost())
+  If BootTranscriptLost() > 0
+    Print("!! the boot log was ")
+    PrintDec(BootTranscriptLost())
+    PrintN(" bytes longer than the retained buffer holds,")
+    PrintN("   so what is on the screen above is the BEGINNING of the log and not")
+    PrintN("   all of it. The earliest lines are the ones kept, deliberately: they")
+    PrintN("   are where a hang shows. The serial line and the network console")
+    PrintN("   received every byte.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScreenUpOn(src.i, index.i)
+  Define w.i
+  Define h.i
+  Define rc.i
+  Define earlyCache.i
+
+  ; Consume before every early return. A failed/no-display boot attempt must
+  ; not leave permission for a later manual screen command to re-enable cache.
+  earlyCache = ScreenDsiEarlyCacheTake()
+
+  BootTimingMark(#BTM_SCREEN_BEGIN, src, index)
+
+  ; ---- 0. WHICH SCREEN ------------------------------------------------
+  ; The panel that is physically plugged in wins over a firmware default
+  ; - see ScrChoose. Asking costs one I2C conversation and the answer is
+  ; cached; on a board with no panel it costs nothing else at all, since
+  ; no DSI register is touched and no power-domain message is sent.
+  If src = #SCR_SRC_AUTO
+    DisplayStandardTags()
+    src = ScrChoose(ScrDsiPanelSeen(), DisplayCount())
+  EndIf
+  BootTimingMark(#BTM_SRC_CHOSEN, src, 0)
+
+  ; ---- 0b. WHICH WAY UP, FOR WHICHEVER SCREEN THAT TURNED OUT TO BE --
+  ; ONE ASSIGNMENT, BOTH BRANCHES, AND IT IS DELIBERATELY ABOVE THEM.
+  ; The rotation decides the mirror bits that go into the display list
+  ; the DSI bring-up writes, the width and height of the drawing
+  ; surface, and through the width the font magnification - so it cannot
+  ; be read after the bring-up. And it has to be assigned on the HDMI
+  ; path too: gScrRot is "the rotation in effect on the screen that is
+  ; up", and a console moved from a turned panel to HDMI while gScrRot
+  ; still said 90 would have every report describing a geometry nothing
+  ; is drawing at. ScrRotWanted answers 0 for HDMI by construction.
+  gScrRot = ScrRotWanted(src)
+
+  If src = #SCR_SRC_NONE
+    PrintN("There is no screen to put the console on. No DSI panel answered on")
+    PrintN("the display connector, and the firmware found no display of its own")
+    PrintN("- it only looks for one when the board powers on, so an HDMI cable")
+    PrintN("plugged in afterwards is not seen. Connect a display and reset the")
+    PrintN("board, or plug the DSI panel in and reset. The serial line and the")
+    PrintN("network console are unaffected: the screen is one optional endpoint")
+    PrintN("of the console, not the console.")
+    ScreenReportDisplays()
+    ProcedureReturn 0
+  EndIf
+
+  ; ==================================================================
+  ;  THE DSI PANEL - Anvil's own pipeline, end to end
+  ; ==================================================================
+  If src = #SCR_SRC_DSI
+    If ScrDsiPanelSeen() <> 1
+      PrintN("!! no DSI panel answered on the display connector, so there is")
+      PrintN("   nothing to put a console on and nothing was changed. The panel's")
+      PrintN("   own micro is read over I2C before anything is powered, and a")
+      PrintN("   panel that does not answer that is either not plugged in or its")
+      PrintN("   flat cable is not seated. Reseat it at BOTH ends and reset.")
+      ProcedureReturn 0
+    EndIf
+
+    If gScreen <> 0 And gScrSrc = #SCR_SRC_DSI
+      Print("The screen is already on the DSI panel, so nothing was changed")
+      ScreenPutGeometry()
+      ScreenReportActive()
+      PrintN("Type screen off to turn it off, screen rotate to turn the console")
+      PrintN("round, or screen on 0 to move it to an HDMI display.")
+      ProcedureReturn 1
+    EndIf
+
+    If gScreen <> 0
+      PrintN("The screen is on an HDMI display, so it is being moved to the DSI")
+      PrintN("panel now. The serial line keeps working throughout.")
+      If ScreenDetach() = 0
+        PrintN("!! Vulkan ownership is quarantined; the screen was not moved.")
+        ProcedureReturn 0
+      EndIf
+    EndIf
+
+    PrintN("Bringing the DSI panel up. This monitor does the whole of it - the")
+    PrintN("firmware owns no DSI display and cannot be asked for one.")
+    If ScrDsiBringUp() = 0
+      ScrDsiSayStep()
+      PrintN("   The screen has been left off and the serial line is unaffected.")
+      ProcedureReturn 0
+    EndIf
+
+    ; THE PANEL IS LIT AND SCANNING AS OF THIS LINE, and that is a
+    ; separate event from having something to draw on: the seventh-pass
+    ; sequence ended with the pixel valve running, and the surface over
+    ; it is the next step. One tick for both would hide whichever of the
+    ; two is the slow one.
+    BootTimingMark(#BTM_DSI_LIT, 0, 0)
+
+    rc = ScrDsiSurface()
+    If rc <> #DSP_OK
+      Print("!! the panel is lit and scanning, but the drawing surface over it")
+      Print(" was refused with code ")
+      PrintDec(rc)
+      PrintN(".")
+      PrintN("   That is this monitor refusing its own arithmetic rather than the")
+      PrintN("   panel failing, and it should not happen. The screen is off.")
+      ProcedureReturn 0
+    EndIf
+
+    ; NO PIXEL-ORDER QUERY HERE, AND ITS ABSENCE IS DELIBERATE. That tag
+    ; asks the FIRMWARE which way round it is putting the bytes, and the
+    ; firmware is not putting these bytes anywhere. The display list this
+    ; monitor wrote says RGBA8888 in ARGB order, which is exactly the
+    ; word DisplayRGB packs at 32 bits. Asking would be asking the wrong
+    ; party about our own surface, and believing the answer would be how
+    ; a red banner comes out blue.
+    DisplayColourSwap(0)
+
+    gScrSrc = #SCR_SRC_DSI
+    gScreenIndex = -1
+  Else
+    ; ==================================================================
+    ;  HDMI, THROUGH THE FIRMWARE - what it always was
+    ; ==================================================================
+  ; ---- 1. the tag table ---------------------------------------------
+  If DisplayStandardTags() = 0
+    PrintN("!! the list of questions this monitor asks the firmware would not")
+    PrintN("   load, so the firmware cannot be asked anything at all - not how")
+    PrintN("   many displays there are, and not for a picture to draw on. The")
+    PrintN("   screen has been left off and the serial line is unaffected.")
+    PrintN("   Reset the board; if it happens every time, the firmware on the boot")
+    PrintN("   medium is not one this monitor can talk to.")
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 2. the index, BEFORE the already-up test ----------------------
+  ; The choice has to be armed BEFORE DisplayInit(), because the tag that
+  ; carries it travels at the head of the same messages that set the
+  ; framebuffer up - see DISPLAY SELECTION in display.pi4. Arming it is
+  ; inert until then, which is what makes it safe to do this early: if
+  ; the screen turns out to be up on that display already, the armed
+  ; value is the one it is already using and nothing has changed.
+  If index >= 0
+    If DisplaySelect(index) = 0
+      Print("!! there is no display ")
+      PrintDec(index)
+      PrintN(" to put the picture on, so the screen was not")
+      PrintN("   changed. The number you give is a position in the list below, and")
+      PrintN("   NOT the number printed on the socket.")
+      ScreenReportDisplays()
+      ; Only offer the advice when there is something to choose. With no
+      ; displays at all the census above has already said so and telling
+      ; somebody to pick one of nothing would be the same kind of
+      ; confident nonsense as naming a socket we had not asked about.
+      If DisplayCount() > 0
+        PrintN("Type screen on with one of the numbers listed above, as in screen on 0.")
+      EndIf
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; ---- 3. is it already up? ------------------------------------------
+  ; ON THIS SCREEN, which is a question that did not exist while there
+  ; was only one screen. A console running on the DSI panel is not
+  ; "already up" for the purposes of "screen on 0"; it has to come down
+  ; and move, and the test that decides that has to look at the SOURCE
+  ; and not only at the index.
+  If gScreen <> 0 And gScrSrc = #SCR_SRC_HDMI
+    ; Asked for no display in particular, or for the one it is already
+    ; on. Nothing to do but say so - and say the size, because the
+    ; operator who typed this wanted to know the screen was working.
+    If index < 0 Or index = gScreenIndex
+      Print("The screen is already on, so nothing was changed")
+      ScreenPutGeometry()
+      ScreenReportActive()
+      PrintN("Type screen off to turn it off, or screen displays to see what else")
+      PrintN("it could be put on.")
+      ProcedureReturn 1
+    EndIf
+
+    ; A DIFFERENT display. Take the console down and fall through to
+    ; bring it up again on the one asked for. ScreenDetach() rather than
+    ; ScreenDown(): the second ends with "the screen is off", which in
+    ; the middle of a move reads as though the command had given up.
+    ; MINUS ONE IS NOT A DISPLAY NUMBER and must never be printed as
+    ; one. It means nobody chose and the firmware's pick stands, which
+    ; is exactly the state "screen on 0" is useful for turning into a
+    ; certainty - so it is the common case here, not a corner one.
+    If gScreenIndex < 0
+      Print("The screen is on whichever display the firmware chose for itself")
+    Else
+      Print("The screen is on display ")
+      PrintDec(gScreenIndex)
+    EndIf
+    Print(", so it is being moved to display ")
+    PrintDec(index)
+    PrintN(" now. The serial line keeps working throughout.")
+    ; The screen is down as of this line. If the bring-up below fails,
+    ; it stays down - and ScreenDetach() also stops the shared grid and
+    ; forgets the index and the source, which the three lines that used
+    ; to be here did not: a grid left running with its renderer pointed
+    ; at a surface nobody owns any more is a repaint into detached
+    ; memory the first time anything prints.
+    If ScreenDetach() = 0
+      PrintN("!! Vulkan ownership is quarantined; the screen was not moved.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; A bare "screen on" must not quietly inherit an earlier "screen on 1".
+  ; The operator asked for the default and the default is the firmware's
+  ; own pick. Done here rather than in step 2 because step 2 can return
+  ; early on a screen that is already running, and clearing the
+  ; selection out from under a running screen would make gScreenIndex a
+  ; lie.
+  If index < 0
+    DisplaySelectNone()
+  EndIf
+
+  ; Ask for 1080p and take whatever the firmware clamps it to. It
+  ; applies overscan of its own accord - this board comes back
+  ; 1824x984 - and arguing with that is not worth a line of code.
+  ; ASK TWICE IF THE FIRST ANSWER IS ABSURD.
+  ;
+  ; Booted directly by the firmware rather than through U-Boot, the first
+  ; DisplayInit comes back with a VIRTUAL size of 2 x 2 while the
+  ; PHYSICAL size reads a perfectly good 1920 x 1080. The set-physical
+  ; step answers with the size the firmware has settled on, and on this
+  ; path it has not settled on one yet at the moment it is asked - so
+  ; the virtual size is built from a placeholder, and the console then
+  ; computes a negative number of rows out of a two-pixel-tall screen.
+  ;
+  ; Asking again once the firmware has a mode gets the real answer. This
+  ; is a retry rather than a fix for the underlying ordering, and it is
+  ; labelled as one; display.pi4 is where that belongs and it is not
+  ; being changed from here.
+  ; ONE ATTEMPT. A retry loop lived here and is gone: ten tries over
+  ; 1.8 seconds returned 2 x 2 every single time, which disproved the
+  ; idea that the firmware merely needed a moment to settle.
+  ;
+  ; The cause was in how the request was made, not when - and it is
+  ; FIXED now, in display.pi4, so this is history rather than a warning.
+  ;
+  ; The firmware allocates against the state accumulated inside a SINGLE
+  ; property transaction. display.pi4 used to send seven separate
+  ; messages, one tag each, so the allocate ran against a default and
+  ; returned a 2 x 2 surface behind a perfectly good 1920 x 1080 mode.
+  ; It never showed under U-Boot, because U-Boot had already made the
+  ; combined call. It now sends the same two messages U-Boot does - a
+  ; GET_PHYSICAL query, then nine tags together - per
+  ; arch/arm/mach-bcm283x/msg.c in Datasheets/pi4/uboot/v2025.01_msg.c.
+  ;
+  ; Waiting longer for a request that is shaped wrong is superstition,
+  ; so the wait is not kept "just in case".
+  DisplayInit(1920, 1080, 32)
+  BootTimingMark(#BTM_FW_SURFACE, DisplayWidth(), DisplayHeight())
+
+  ; A SCREEN TOO SMALL FOR THE BANNER IS NO SCREEN. The console would be
+  ; given a negative height and report "0 cols x -7 rows", which is what
+  ; a 2 x 2 framebuffer produced before the retry above existed. Refusing
+  ; is better than a console whose geometry is nonsense.
+  If DisplayReady() <> 0
+    If DisplayHeight() <= (#BANNER_H + 32) Or DisplayWidth() < 320
+      Print("!! the firmware gave back a picture only ")
+      PrintDec(DisplayWidth())
+      Print(" pixels across and ")
+      PrintDec(DisplayHeight())
+      PrintN(" down, which is far too small to")
+      PrintN("   put a console on - there would not be room for a single line of")
+      PrintN("   text. The screen has been left off and the serial line is")
+      PrintN("   unaffected. This usually means the firmware had not settled on a")
+      PrintN("   video mode when it was asked. Reset the board and try again.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  If DisplayReady() = 0
+    ; STILL DO NOT NAME A SOCKET OUT OF NOTHING. This used to say "HDMI0
+    ; was not connected", which was an assumption rather than a reading,
+    ; and it sent anybody with the cable in HDMI1 to the wrong end of
+    ; the board. What is different now is that the monitor can ASK: the
+    ; census below is the firmware's own answer, so a socket is named
+    ; only when the firmware named it.
+    PrintN("The firmware would not give this monitor a framebuffer, so there")
+    PrintN("is no screen to draw on. The usual cause is that no HDMI display")
+    PrintN("was connected when the board powered on - the firmware only looks")
+    PrintN("for a display at boot, so one plugged in afterwards is not seen.")
+    PrintN("Connect a display to either HDMI socket and reset the board. A")
+    PrintN("warm reset is enough: the firmware probes again every reset.")
+    ScreenReportDisplays()
+    ProcedureReturn 0
+  EndIf
+
+  ; RED AND BLUE MAY BE THE OTHER WAY ROUND, and which way DEPENDS ON HOW
+  ; THE BOARD BOOTED - so it is asked, not assumed.
+  ;
+  ; Under U-Boot the firmware reported pixel order 1, and a background
+  ; asked for as RGB(0, 0, 40) came out of the HDMI socket reddish brown
+  ; with the orange "Forge" blue, which is the low byte being read as red
+  ; when DisplayRGB puts blue there. Hardcoding the swap fixed it.
+  ;
+  ; Booted straight from the firmware, the same tag answers 0. The
+  ; hardcoded swap would then be wrong in the other direction, and the
+  ; colours would be inverted again on the boot path that matters most.
+  ;
+  ; display.pi4 NOW SETS the pixel order, to BGR, as part of the single
+  ; nine-tag message - it did not when this was written, and the comment
+  ; here said the opposite. So the firmware will answer 0 and no swap is
+  ; wanted, which is the arrangement DisplayRGB packs for anyway.
+  ;
+  ; The query is kept rather than replaced by a constant. It costs one
+  ; mailbox round trip at startup and it is the difference between
+  ; agreeing with the panel and assuming agreement - and assuming is
+  ; exactly what produced a blue "Forge" the first time.
+  ;
+  ; It has to be said before the first DisplayRGB call, because that
+    ; procedure bakes the order into the packed word.
+    If ScreenPixelOrder() = 1
+      DisplayColourSwap(1)
+    Else
+      DisplayColourSwap(0)
+    EndIf
+
+    gScrSrc = #SCR_SRC_HDMI
+    gScreenIndex = index
+  EndIf
+
+  ; ==================================================================
+  ;  EVERYTHING FROM HERE IS THE SAME CONSOLE ON EITHER SCREEN
+  ; ==================================================================
+
+  ; ---- THE FONT SIZE. ONE ASSIGNMENT, BOTH SCREENS, AND IT IS HERE --
+  ; ON PURPOSE, IN THE SHARED TAIL.
+  ;
+  ; It used to be one line inside the DSI branch and NOTHING AT ALL on
+  ; the HDMI one, which was two bugs at once. The obvious one is that
+  ; HDMI never had a rule; the quiet one is that dsp_scale is global, so
+  ; a console moved from the panel to an HDMI display kept the panel's
+  ; magnification and drew at whatever the panel had last wanted.
+  ;
+  ; See THE FONT SIZE IS COMPUTED FROM HOW BIG THE GLASS IS in
+  ; screen_geom.pi4. The size comes from the SCREEN's diagonal in pixels
+  ; and in inches - neither of which changes when the console is turned
+  ; - and the console's own width is passed in for one purpose only, the
+  ; eighty-column cap. That is why 1280 x 800 landscape and 800 x 1280
+  ; portrait now draw the same size of letter on the same panel, which
+  ; is the whole of what this seam got wrong.
+  ;
+  ; It has to be before DrawBanner (which draws at scale 3 and puts the
+  ; scale back to whatever it found) and before DisplayConsole (which
+  ; measures the console rectangle in cells of this size).
+  gScrScale = ScrScaleWanted(gScrSrc, DisplayWidth())
+  DisplayScale(gScrScale)
+
+  ; The DSI surface is now adopted and both of its fixed buffers are mapped
+  ; NC by CacheEnable. Turning normal code/data caching on here accelerates
+  ; the first visible clear/banner without changing panel power/reset or DMA
+  ; setup. HDMI deliberately does nothing here; see ScreenDsiEarlyCache.
+  BootTimingMark(#BTM_ACQUIRED, DisplayBase(), DisplayPitch())
+  ScreenDsiEarlyCache(earlyCache)
+  BootTimingMark(#BTM_MAPPED, gCacheOn, 0)
+
+  ; THE BLITTER, BEFORE ANYTHING IS DRAWN. It has to come after the
+  ; surface is installed, whichever way it was got, because it is bound
+  ; to THAT surface - and it wants to be before the first clear, because
+  ; that clear is millions of bytes and is one of the things it makes
+  ; fast.
+  ;
+  ; gDma is set from the return value and from nothing else. Every
+  ; accelerated path in this file tests it, so a board where the engine
+  ; will not start draws exactly what this monitor drew before - which
+  ; is the property that makes turning the engine on safe on a program
+  ; whose whole job is to still be there when nothing else is.
+  gDma = ScreenDmaUp()
+  BootTimingMark(#BTM_DMA_READY, gDma, 0)
+
+  ; Per-glyph flushing. The alternative is flushing the whole surface
+  ; after every batch, and at 1920x1080x4 that is 8.29 MB of cache
+  ; maintenance to put one character on the screen.
+  DisplayAutoFlush(1)
+
+  ; ONE EXPRESSION, TWO PLACES IT HAS TO BE THE SAME. ScreenFastScroll()
+  ; fills the vacated rows itself and has to fill them with what the
+  ; library would have filled them with, and display.pi4 offers no way
+  ; to read the background back. So the value is computed once, here,
+  ; beside the call that installs it.
+  gScreenBg = DisplayRGB(0, 0, 40)
+  DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
+
+  ; The WHOLE screen, once. Everything after this only ever touches the
+  ; console rectangle, so whatever the firmware left in the logo band
+  ; would survive forever if it were not cleared here.
+  DisplayClear(DisplayRGB(0, 0, 40))
+  ; INTO RAM. Nothing is on the glass yet at 90 or 270: this cleared the
+  ; buffer the console draws into, and the panel is scanning the other
+  ; one until the present below.
+  BootTimingMark(#BTM_CLEAR_DONE, 0, 0)
+
+  DrawBanner()
+  BootTimingMark(#BTM_BANNER_DRAWN, 0, 0)
+
+  ; The console starts BELOW the band. Everything printed from here on
+  ; scrolls inside that rectangle and cannot reach the anvil.
+  w = DisplayWidth()
+  h = DisplayHeight()
+  DisplayConsole(0, LogoHeight(), w, h - LogoHeight())
+
+  ; THE ONE SHARED GRID. Size it from the console rectangle just set, clear
+  ; it, and register the DMA/CPU renderer as the active screen endpoint.
+  ; From here the console is the shared model: the hub feeds this grid and
+  ; this renderer (or the V3D one) paints it - there is no private grid and
+  ; no second consumer of the ring.
+  ;
+  ; THE GRID IS 256 COLUMNS BY 80 ROWS AND ConGridInit CLAMPS TO IT, WHICH
+  ; IS WORTH CHECKING NOW THAT THE FONT IS SMALLER. Both screens are
+  ; comfortably inside, and neither can grow:
+  ;
+  ;   the DSI panel   1280 x 800 landscape at magnification 1 is 160 x 42,
+  ;                   800 x 1280 portrait is 100 x 72. The panel scans one
+  ;                   mode and this monitor sends only that one.
+  ;   HDMI            DisplayInit asks for 1920 x 1080 and the firmware
+  ;                   clamps DOWN from there, never up - this board comes
+  ;                   back 1824 x 984. The worst case is therefore 1920 x
+  ;                   1080 at magnification 1, which is 240 x 60.
+  ;
+  ; SO THE CLAMP CANNOT FIRE TODAY, and it is not being armoured against.
+  ; What would reach it is somebody raising that DisplayInit request: a
+  ; surface wider than 2048 or taller than 1400 would silently give the
+  ; library more columns than the grid holds, and text would wrap at 256
+  ; on a screen the console appeared to own. If you widen the request,
+  ; widen the grid or floor the magnification with it.
+  ConGridInit(DisplayCols(), DisplayRows())
+  ConSetRenderer(@ConPaintDma)
+  ; Long synchronous commands can produce much more than the UART mirror's
+  ; 8 KiB staging ring before the prompt pumps again. Drain those bytes into
+  ; the shared model as they are produced, but do not render here; ScreenPump
+  ; paints the final model once after the command returns.
+  UartMirrorSetDrain(@ConMirrorDrain)
+
+  ; THE BANNER BAND IS NOT PART OF THE GRID, so no repaint will ever
+  ; present it. On HDMI, and on the panel at 0 and 180, this costs one
+  ; comparison; on a rotated panel it is the one pass that puts the
+  ; anvil on the glass.
+  ScrPresentAll()
+  ; ON THE PANEL. This is the first tick at which the pixels above are the
+  ; pixels being scanned, and the gap between it and #BTM_BANNER_DRAWN is
+  ; what the transpose costs on a turned panel - zero on HDMI and at 0/180.
+  BootTimingMark(#BTM_PRESENTED, gScrRot, gScrScale)
+
+  ; Everything from here on - including this header - arrives through the
+  ; mirror ring, the one output hub, so it lands in the shared grid whichever
+  ; renderer paints it. (It was two direct DisplayPrintLn calls that bypassed
+  ; the grid; now it is ordinary output.)
+  UartMirror(1)
+  PrintN("PureMetal Forge - Anvil")
+  PrintN("")
+  gScreen = 1
+  ; A NEW SURFACE MEANS THE OLD TOUCH EVENTS ARE ABOUT THE WRONG ONE.
+  ; The rotation, the size, or the screen itself may all have changed
+  ; between the flush in ScreenDetach and here; anything queued in
+  ; between was mapped against neither. See hal.pi4's HwTouchFlush.
+  HwTouchFlush()
+  ; WHICH display this screen is on was recorded by the branch that
+  ; acquired it, and it is NOT re-set here. It used to be, and it cannot
+  ; be any more: the DSI panel is not one of the firmware's displays, so
+  ; there is no index to carry, and writing the caller's index over it
+  ; would make gScreenIndex describe a display the picture is not on.
+
+  ; ScreenPutGeometry() asks the library for the size rather than being
+  ; handed the w and h the console was built from a few lines above.
+  ; That is on purpose: it is the same procedure the already-up path
+  ; calls, where no such locals exist, and one report that always comes
+  ; from one place cannot drift into describing the same screen two
+  ; ways.
+  Print("The screen is now on")
+  ScreenPutGeometry()
+  ScreenReportActive()
+  PrintN("Everything this monitor prints from now on goes to both the screen and")
+  PrintN("this serial line. Type screen off to turn it off again.")
+  ; THE CONSOLE IS LIVE AS OF HERE, which is the event that matters to
+  ; anybody watching a boot: every line printed after this paints as it is
+  ; printed, instead of queueing for a screen that does not exist yet.
+  BootTimingMark(#BTM_CONSOLE_UP, DisplayCols(), DisplayRows())
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenUp - THE BOOT PATH, AND THE ONE THE BENCH TYPES BARE.
+;
+;  No screen chosen and no display chosen: whichever screen is actually
+;  there, and the firmware's own pick among its displays if that turns
+;  out to be HDMI. It is the same procedure with #SCR_SRC_AUTO, so there
+;  is one bring-up and not a boot copy of one.
+; ----------------------------------------------------------------------
+Procedure.i ScreenUp()
+  ProcedureReturn ScreenUpOn(#SCR_SRC_AUTO, -1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScreenDetach - TAKE THE CONSOLE OFF THE SCREEN AND SAY NOTHING.
+;
+;  Everything ScreenDown() does except the sentence it ends with. It
+;  exists because there are TWO reasons a screen comes down and only one
+;  of them is "turn the screen off":
+;
+;    the operator typed `screen off`      -> ScreenDown(), which says so
+;    the console is being MOVED           -> this, which says nothing,
+;      (a different display, a different     because ScreenUpOn is about
+;       screen, a different rotation)        to say where it went
+;
+;  "The screen is off - the display endpoint is detached" is exactly
+;  right for the first and reads as a FAILURE in the middle of the
+;  second: it lands between "the console is now turned 270 degrees" and
+;  "bringing the DSI panel up", where an operator has every reason to
+;  read it as the command having given up half way. ScreenUpOn's
+;  display-move and screen-move branches already avoided ScreenDown()
+;  for that reason, in a comment saying so; `screen rotate` did not, and
+;  it printed it on the bench tonight. This is the one procedure the
+;  three of them share instead.
+; ----------------------------------------------------------------------
+Procedure.i ScreenDetach()
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If VulkanConsoleReady() <> 0 Or VulkanConsoleQuarantined() <> 0
+    If VulkanConsoleStop() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  CompilerEndIf
+  UartMirrorSetDrain(0)
+  UartMirror(0)
+  ; Take the shared grid down and unregister the screen renderer. The screen
+  ; is just ONE endpoint of the console; detaching it changes nothing about
+  ; the others.
+  ConGridStop()
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  V3dConInvalidate()
+  CompilerEndIf
+  gScreen = 0
+  ; Forget which display it was on. Leaving the old index behind would
+  ; make a later "screen on 0" look like "already up on display 0" to
+  ; the test in ScreenUpOn() if gScreen were ever set without going
+  ; through it. The SOURCE is forgotten for exactly the same reason and
+  ; in the same breath - the two are one fact about a screen that is no
+  ; longer running, and letting them get out of step is how the
+  ; already-up test starts answering about a screen that is off.
+  gScreenIndex = -1
+  gScrSrc = #SCR_SRC_NONE
+  ; AND THE TOUCH QUEUE GOES WITH IT. hal.pi4 puts it in as many words:
+  ; "CALLED ON EVERY SCREEN CHANGE - a stale tap that lands on the new
+  ; screen is the bug that makes a driver change duty status by
+  ; accident." Every event still waiting was mapped onto the surface
+  ; that has just gone away, so delivering it against the next one is a
+  ; press at a pixel nobody touched.
+  HwTouchFlush()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScreenDown()
+  If ScreenDetach() = 0 : ProcedureReturn 0 : EndIf
+  PrintN("The screen is off - the display endpoint is detached. The serial line")
+  PrintN("and the wireless console keep running exactly as before; the screen is")
+  PrintN("one optional endpoint of the console, not the console. Type screen on to")
+  PrintN("attach it again.")
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  p - send the screen back over the serial line
+; ======================================================================
+;  A screenshot of a machine with no operating system, over a 115200
+;  baud wire.
+;
+;  RAW WOULD BE ABSURD. 1824 x 984 x 4 bytes is 7.18 MB; as hex text
+;  that is 14 MB, and at 115200 baud - about 11.5 KB a second - it would
+;  take twenty minutes and any single dropped byte would ruin it.
+;
+;  SO IT IS RUN-LENGTH ENCODED, which suits this picture exactly. A
+;  console screen is overwhelmingly one background colour in very long
+;  horizontal runs, and even the banner is flat fills. The encoder emits
+;  one line per run:
+;
+;      <count-hex> <pixel-hex>
+;
+;  and the whole screen collapses to a few tens of kilobytes.
+;
+;  RUNS DO NOT CROSS ROWS. The framebuffer has a PITCH that is not
+;  necessarily the row width - here it happens to be equal, but a mode
+;  with padding would have bytes between rows that are not pixels, and
+;  a run that walked through them would encode the padding as picture.
+;  Reset at every row and the encoding is correct in both cases.
+;
+;  THE MIRROR IS TURNED OFF FIRST, and that is not an optimisation. The
+;  screen console is fed from the UART mirror, so dumping the screen to
+;  the UART would print tens of thousands of lines ONTO the screen being
+;  dumped - the picture would change while it was being read, and the
+;  bottom of the image would be a picture of the dump of the top of it.
+; ----------------------------------------------------------------------
+Procedure CmdPic()
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define x.i
+  Define y.i
+  Define px.i
+  Define run.i
+  Define cur.i
+  Define runs.i
+  Define wasMirror.i
+
+  If gScreen = 0
+    PrintN("!! there is no screen to photograph, so nothing was sent. The console")
+    PrintN("   is not running on any display at the moment.")
+    PrintN("   Type screen on to bring it up, then screenshot again. If that refuses")
+    PrintN("   too, attach HDMI or the DSI panel and reset the board so its display")
+    PrintN("   source can be detected and brought up cleanly.")
+    ProcedureReturn
+  EndIf
+
+  ; Take one immutable description of the surface being presented. In
+  ; particular, sideways DSI scans the PHYSICAL 800x1280 front even though
+  ; DisplayBase describes the 1280x800 logical drawing surface.
+  If ScrCaptureSnapshot(@fb, @w, @h, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    PrintN("!! the console thinks it is running but there is no picture behind it")
+    PrintN("   to read - its presented surface has either no address or a size of")
+    PrintN("   nothing. Nothing was sent. This should not happen; reset the")
+    PrintN("   board, and if it happens again it is a fault in this monitor rather")
+    PrintN("   than anything you typed.")
+    ProcedureReturn
+  EndIf
+
+  ; See the header: dumping to the UART would feed the screen console.
+  wasMirror = UartMirrorOn()
+  UartMirror(0)
+
+  ; ------------------------------------------------------------------
+  ; EVERYTHING FROM HERE TO "END" IS A MACHINE FORMAT, NOT PROSE.
+  ; tools/pmfshot.py parses it with three regular expressions and
+  ; nothing else, and all three are anchored to the whole line:
+  ;
+  ;   ^PIC ([0-9A-F]{8}) ([0-9A-F]{8}) ([0-9A-F]{2})$   the header
+  ;   ^([0-9A-F]{6}) ([0-9A-F]{8})$                     one run
+  ;   ^END ([0-9A-F]{8})$                               the terminator
+  ;
+  ; So the word PIC, the single spaces, the exact digit counts and the
+  ; upper-case hex are all fixed. A friendlier header would make the
+  ; script report "no PIC header in the reply" and refuse to write a
+  ; PNG. This was audited during the plain-English sweep on 2026-08-26
+  ; and deliberately left exactly as it was.
+  ; ------------------------------------------------------------------
+  Print("PIC ")
+  PutHexN(w, 8)
+  Print(" ")
+  PutHexN(h, 8)
+  Print(" ")
+  PutHexN(bpp, 2)
+  PrintNl()
+  UartDrain()
+
+  ; COALESCE THE RUN STREAM. A busy screen is tens of thousands of short
+  ; run-lines; flushed one datagram per line over Wi-Fi that firehose
+  ; overruns buffers and drops a datagram mid-stream, which strips the
+  ; capture of a run (an unrecoverable gap) or its END (no PNG at all). Bulk
+  ; mode lets the aux tap fill full ~1 KB datagrams instead - same bytes,
+  ; ~16x fewer packets - which is what makes a full busy-screen capture
+  ; decode cleanly. The header above went out first, at its line boundary,
+  ; so the host sees PIC without waiting for a datagram to fill. The serial
+  ; screenshot path does not use the aux tap and is unaffected.
+  UartAuxBulk(1)
+
+  runs = 0
+  y = 0
+  While y < h
+    ; ONE CHECK PER SCREEN ROW, and Ctrl-C ONLY - see OutBreakCtrlC()
+    ; for why this path does not take the any-byte rule. A row is a few
+    ; runs, so this is far finer-grained than the once-a-line the text
+    ; commands get, and it costs one MMIO read out of a seven-minute
+    ; transfer.
+    If OutBreakCtrlC() <> 0
+      Break
+    EndIf
+    x = 0
+    cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+    run = 0
+    While x < w
+      px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+      If px = cur
+        run = run + 1
+      Else
+        PutHexN(run, 6)
+        UartWrite(32)
+        PutHexN(cur, 8)
+        PrintNl()
+        runs = runs + 1
+        cur = px
+        run = 1
+      EndIf
+      x = x + 1
+    Wend
+    ; The last run of the row. Rows never merge - see the header.
+    If run > 0
+      PutHexN(run, 6)
+      UartWrite(32)
+      PutHexN(cur, 8)
+      PrintNl()
+      runs = runs + 1
+    EndIf
+    y = y + 1
+  Wend
+
+  ; "END <count>" ONLY IF IT REALLY ENDED. An aborted stream says ABORT
+  ; instead, and that spelling is load-bearing: tools/pmfshot.py matches
+  ; "^END ([0-9A-F]{8})$" and nothing else, so a truncated capture makes
+  ; the script report "the stream stopped before END" and refuse to
+  ; write a PNG. A short stream that still said END would parse, the run
+  ; count would disagree, and the script would blame the wire. The count
+  ; is printed either way, because knowing how far it got is worth a
+  ; line.
+  ; Leave bulk mode so the terminator and the last coalesced runs are
+  ; flushed by the per-line rule, and send the terminator THREE TIMES.
+  ; Losing the one datagram that carried END would otherwise waste the whole
+  ; capture (the host would decode nothing); with the marker repeated, a
+  ; single drop cannot strip it. The host stops at the first well-formed
+  ; terminator, so the extra lines are harmless. The run COUNT is what proves
+  ; the stream arrived whole, so a surviving END still validates the capture.
+  Define termI.i
+  UartAuxBulk(0)
+  termI = 0
+  While termI < 3
+    If OutBroke() <> 0
+      Print("ABORT ")
+    Else
+      Print("END ")
+    EndIf
+    PutHexN(runs, 8)
+    PrintNl()
+    termI = termI + 1
+  Wend
+  UartDrain()
+
+  ; The mirror buffer filled with the dump while it was off, so putting
+  ; it back also empties it - otherwise the next prompt would replay
+  ; several thousand lines of hex onto the screen.
+  If wasMirror <> 0
+    UartMirror(0)
+    UartMirror(1)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  shot - THE PICTURE THAT OUTLIVED THE PAYLOAD
+; ----------------------------------------------------------------------
+;  `p` photographs the LIVE screen and is unchanged. `shot` photographs
+;  the capture area - the copy of a presented frame that was taken while
+;  it still existed, by ScrCaptureToArea in screen_source.pi4, either
+;  because the payload asked for it through the service table or because
+;  the operator armed a capture on return.
+;
+;  THE TWO COMMANDS EMIT THE SAME MACHINE FORMAT, and that is the point
+;  rather than a convenience. tools/pmfshot.py has decoded PIC/runs/END
+;  since 2026-08-26 and every host that knows how to turn a screenshot
+;  into a PNG knows that and nothing else. A second wire format for the
+;  same picture would be a second decoder to keep right.
+;
+;  THE HEADER GOES OUT FIRST, AS ONE MACHINE LINE. It is what the live
+;  screen does not need and a kept frame does: which run this was, what
+;  the payload returned, which renderer drew it, which way up it was, and
+;  how many bytes were kept. It is deliberately NOT part of the PIC
+;  stream - pmfshot.py's three regular expressions are anchored whole-line
+;  and simply do not match it, so an existing host decodes the picture and
+;  ignores the line, while tools/board_run.py reads both.
+;
+;      SHOT <seq8> <w8> <h8> <pitch8> <rot8> <tier8> <x0:16>
+;           <panelW8> <panelH8> <bpp2> <src2> <who2> <bytes8>
+;
+;  all upper-case hex, single spaces, one line. The same fixed-width
+;  discipline the PIC header is written under and for the same reason.
+;
+;  THE MIRROR IS TURNED OFF for exactly the reason CmdPic explains: the
+;  screen console is fed from the UART mirror, so dumping to the UART
+;  would print the dump onto the screen being described.
+; ======================================================================
+
+; WHICH RENDERER DREW THE FRAME. Asked here rather than in the display
+; seam because gV3dConOn is declared in v3d_console.pi4, which is
+; included after screen_source.pi4; this file is included after both, so
+; this is the first place in the build where both halves of the answer
+; exist. It reads the live state and keeps no copy of it - a second
+; variable saying which tier is up would be a second opinion, and the two
+; would disagree the first time one of them was not updated.
+Procedure.i ScrShotTier()
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If gV3dConOn <> 0
+    ProcedureReturn #HW_TIER_V3D
+  EndIf
+  CompilerEndIf
+  If gDma <> 0
+    ProcedureReturn #HW_TIER_DMA
+  EndIf
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+
+; Take a capture of the live screen right now, on the operator's behalf.
+; The same copy the service slot makes, so `shot now` and a payload's own
+; call leave the area in exactly one shape.
+Procedure.i ScrShotNow(who.i, x0.i)
+  ProcedureReturn ScrCaptureToArea(who, x0, ScrShotTier())
+EndProcedure
+
+Procedure ShotPutHeader()
+  Print("SHOT ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_SEQ), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_W), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_H), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PITCH), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_ROT), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_TIER), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_X0), 16)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PANELW), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_PANELH), 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BPP), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_SRC), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_WHO), 2)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BYTES), 8)
+  PrintNl()
+EndProcedure
+
+Procedure ShotSayNothing()
+  PrintN("!! there is no kept picture to send: the capture area holds no complete")
+  PrintN("   capture, so nothing was streamed. Either no run has been captured")
+  PrintN("   since this board started, or the last attempt was refused because")
+  PrintN("   there was no screen behind the console at the time.")
+  PrintN("   shot arm, then boot the payload, gets one. shot now takes one of the")
+  PrintN("   screen as it is at this instant, which is what p sends live.")
+EndProcedure
+
+Procedure ShotDump()
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define x.i
+  Define y.i
+  Define px.i
+  Define run.i
+  Define cur.i
+  Define runs.i
+  Define wasMirror.i
+  Define termI.i
+
+  If ScrShotValid() = 0
+    ShotSayNothing()
+    ProcedureReturn
+  EndIf
+
+  ; ONE IMMUTABLE DESCRIPTION, READ BEFORE A SINGLE PIXEL. The area is
+  ; not going to change under this loop - nothing else writes it - but
+  ; reading the geometry once is what makes the header line and the
+  ; stream describe the same picture by construction rather than by
+  ; nobody having changed anything in between.
+  fb     = ScrShotPixels()
+  w      = ScrShotField(#MON_SHOT_OFF_W)
+  h      = ScrShotField(#MON_SHOT_OFF_H)
+  pitch  = ScrShotField(#MON_SHOT_OFF_PITCH)
+  rot    = ScrShotField(#MON_SHOT_OFF_ROT)
+  panelW = ScrShotField(#MON_SHOT_OFF_PANELW)
+  panelH = ScrShotField(#MON_SHOT_OFF_PANELH)
+
+  If w < 1 Or h < 1 Or pitch < 4 Or panelW < 1 Or panelH < 1
+    PrintN("!! the kept picture's header does not describe a picture - one of its")
+    PrintN("   sizes is zero or negative - so nothing was streamed. That is a fault")
+    PrintN("   in this monitor rather than anything you typed; take another capture")
+    PrintN("   and say so if it happens again.")
+    ProcedureReturn
+  EndIf
+
+  wasMirror = UartMirrorOn()
+  UartMirror(0)
+
+  ShotPutHeader()
+  UartDrain()
+
+  ; The same two lines CmdPic sends and the same format. See EVERYTHING
+  ; FROM HERE TO "END" IS A MACHINE FORMAT there; it is not repeated.
+  Print("PIC ")
+  PutHexN(w, 8)
+  Print(" ")
+  PutHexN(h, 8)
+  Print(" ")
+  PutHexN(ScrShotField(#MON_SHOT_OFF_BPP), 2)
+  PrintNl()
+  UartDrain()
+  UartAuxBulk(1)
+
+  runs = 0
+  y = 0
+  While y < h
+    If OutBreakCtrlC() <> 0
+      Break
+    EndIf
+    x = 0
+    cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+    run = 0
+    While x < w
+      px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+      If px = cur
+        run = run + 1
+      Else
+        PutHexN(run, 6)
+        UartWrite(32)
+        PutHexN(cur, 8)
+        PrintNl()
+        runs = runs + 1
+        cur = px
+        run = 1
+      EndIf
+      x = x + 1
+    Wend
+    If run > 0
+      PutHexN(run, 6)
+      UartWrite(32)
+      PutHexN(cur, 8)
+      PrintNl()
+      runs = runs + 1
+    EndIf
+    y = y + 1
+  Wend
+
+  UartAuxBulk(0)
+  termI = 0
+  While termI < 3
+    If OutBroke() <> 0
+      Print("ABORT ")
+    Else
+      Print("END ")
+    EndIf
+    PutHexN(runs, 8)
+    PrintNl()
+    termI = termI + 1
+  Wend
+  UartDrain()
+
+  If wasMirror <> 0
+    UartMirror(0)
+    UartMirror(1)
+  EndIf
+EndProcedure
+
+Procedure ShotStatus()
+  Print("A capture on the next payload return is ")
+  If ShotArmed() <> 0
+    PrintN("ARMED.")
+  Else
+    PrintN("not armed.")
+  EndIf
+  PrintN("  shot arm      arms it for the next run, once")
+  PrintN("  shot disarm   puts it back")
+  PrintN("  boot mem <address> shot   arms it and boots in one line")
+  If ScrShotValid() = 0
+    PrintN("The capture area holds no picture yet.")
+    ProcedureReturn
+  EndIf
+  Print("The capture area holds picture number ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_SEQ))
+  Print(", ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_W))
+  Print(" by ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_H))
+  PrintN(" as the")
+  Print("console saw it, taken ")
+  If ScrShotField(#MON_SHOT_OFF_WHO) = #MON_SHOT_WHO_RETURN
+    Print("by this monitor as a payload returned (its x0 was ")
+    PutHex16(ScrShotField(#MON_SHOT_OFF_X0))
+    PrintN(")")
+  Else
+    PrintN("by the payload itself, through the service table")
+  EndIf
+  Print("from ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_BYTES))
+  Print(" bytes of the ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_PANELW))
+  Print(" by ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_PANELH))
+  Print(" surface the panel was")
+  Print(" scanning, at ")
+  PrintDec(ScrShotField(#MON_SHOT_OFF_ROT))
+  PrintN(" degrees.")
+  PrintN("  shot          streams it, in the same format p streams the live screen")
+EndProcedure
+
+Procedure CmdShot()
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If gWordLen = 0
+    ShotDump()
+    ProcedureReturn
+  EndIf
+  If WordIs("arm") <> 0
+    ShotArm(1)
+    PrintN("The next payload this board enters will have its last presented frame")
+    PrintN("copied into the capture area before anything repaints over it, whether")
+    PrintN("or not the payload asks. Read it back afterwards with shot.")
+    PrintN("  It is armed for ONE run. Arm it again for the next one - an arm that")
+    PrintN("  stayed set would overwrite a picture somebody was still reading.")
+    ProcedureReturn
+  EndIf
+  If WordIs("disarm") <> 0 Or WordIs("off") <> 0
+    ShotArm(0)
+    PrintN("The capture on return is disarmed. A payload that asks for a capture")
+    PrintN("itself still gets one; nothing is taken on its way back.")
+    ProcedureReturn
+  EndIf
+  If WordIs("now") <> 0
+    If ScrShotNow(#MON_SHOT_WHO_PAYLOAD, 0) = 0
+      PrintN("!! nothing was captured: there is no screen behind the console, or its")
+      PrintN("   presented surface is larger than the capture area. Type screen on,")
+      PrintN("   then shot now. map prints the area and its size.")
+      ProcedureReturn
+    EndIf
+    Print("Kept the screen as it is now; it is picture number ")
+    PrintDec(ScrShotField(#MON_SHOT_OFF_SEQ))
+    PrintN(".")
+    ProcedureReturn
+  EndIf
+  If WordIs("status") <> 0 Or WordIs("header") <> 0
+    ShotStatus()
+    ProcedureReturn
+  EndIf
+
+  PrintN("? shot takes arm, disarm, now, status, or nothing at all to stream the")
+  PrintN("  kept picture, so nothing was done.")
+EndProcedure
+
+; ======================================================================
+;  pr - THE RELIABLE SCREENSHOT, for the wireless console.
+;
+;  WHY p IS NOT ENOUGH OVER WI-FI, measured on silicon 2026-08-30: p's
+;  run stream rides the console's byte tap as fire-and-forget UDP.
+;  Coalescing and pacing (the first fix) carried a ~50k-run screen
+;  cleanly but a ~58k-run screen still lost a datagram mid-burst on 2 of
+;  3 tries - the decode refused (by design), but there was no way to WIN,
+;  only to fail honestly. Reliability needs acknowledgement, and a byte
+;  stream has no unit to acknowledge.
+;
+;  SO pr USES THE RAW DATAGRAM SEAM, NOT A FORK OF THE CONSOLE. wifi.pi4
+;  provides NetConsoleSendPeer/NetConsolePollUdp exactly so a binary protocol can own
+;  its datagrams (the OTA wb transfer is the precedent - stop-and-wait,
+;  offset-tagged, acked, and it never loses data in either direction).
+;  pr is wb's scheme with the roles reversed: every datagram this board
+;  sends carries a 4-byte little-endian tag, and the host echoes the tag
+;  back as the acknowledgement before the next datagram goes out.
+;
+;      [$FFFFFFFE][w:4][h:4][runs:4][8:4]      the header
+;      [byteOffset][up to 127 runs of [count:4][pixel:4]]
+;      [$FFFFFFFF][total:4][crc32:4][status:4] the end (status 1 = whole)
+;
+;  The CRC32 (same polynomial as wb's, zlib's) spans every run record,
+;  so the host proves the assembled stream byte-for-byte before it
+;  writes a PNG. Lost datagram -> no ack -> resent, up to 8 times; a
+;  host that vanishes leaves the board printing a failure, not hanging.
+;
+;  TWO PASSES OVER THE FRAMEBUFFER, ON PURPOSE. Pass 1 counts the runs
+;  (for the header), pass 2 emits them; nothing repaints between the
+;  two because nothing pumps the console inside a command, so both
+;  walks read the same picture - the same stillness p already relies
+;  on. The alternative, buffering ~1 MB of records in DRAM, would need
+;  a scratch region this command has no claim on ($400000 is the OTA
+;  stage, and a wb ... pr ... save sequence would corrupt the staged
+;  image).
+;
+;  THE CONSOLE'S TEXT TAP IS MUTED while the binary flows (UartAuxMirror
+;  off), so the host never has to tell a text datagram from a chunk:
+;  everything after the header tag is protocol. The serial console still
+;  shows the outcome line, and the tap comes back before it is printed.
+; ======================================================================
+#PICR_RUNS_MAX = 127             ; 4 + 127*8 = 1020 bytes, under the 1024 cap
+#PICR_TAG_HDR  = $FFFFFFFE
+#PICR_TAG_END  = $FFFFFFFF
+#PICR_TRIES    = 8               ; resends before declaring the host gone
+#PICR_ACK_MS   = 600             ; wait per try for the echoed tag
+
+Global Dim gPicrBuf.a[1024]      ; [tag:4][payload up to 1020]
+Global gPicrN.i                  ; run records in the buffer, not yet sent
+Global gPicrOff.i                ; byte offset of the buffer's first record
+Global gPicrRuns.i               ; total runs emitted
+Global gPicrCrc.i                ; rolling CRC32 (pre-inversion form)
+Global gPicrOk.i                 ; 0 the moment the peer stops answering
+
+; Send gPicrBuf (tag + len payload bytes) and wait for the tag echoed
+; back. Stop-and-wait, wb's discipline: a datagram whose ack does not
+; come back is simply resent, and a stale ack (a resend's twin) is
+; ignored rather than trusted.
+Procedure.i picr_SendWait(tag.i, len.i)
+  Define try.i
+  Define plen.i
+  Define got.i
+  PokeL(@gPicrBuf[0], tag & $FFFFFFFF)
+  try = 0
+  While try < #PICR_TRIES
+    NetConsoleSendPeer(@gPicrBuf[0], 4 + len)
+    plen = NetConsolePollUdp(#PICR_ACK_MS)
+    While plen >= 0
+      If plen = 4
+        got = PeekN(NetUdpRxData()) & $FFFFFFFF
+        If got = (tag & $FFFFFFFF)
+          ProcedureReturn 1
+        EndIf
+      EndIf
+      ; Not our ack (a stale one, or a stray keystroke datagram): keep
+      ; listening briefly before spending a resend on it.
+      plen = NetConsolePollUdp(100)
+    Wend
+    try = try + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; Append one run record; when the datagram is full, CRC it and send it.
+Procedure picr_PushRun(cnt.i, px.i)
+  If gPicrOk = 0
+    ProcedureReturn
+  EndIf
+  PokeL(@gPicrBuf[4 + (gPicrN * 8)], cnt & $FFFFFFFF)
+  PokeL(@gPicrBuf[8 + (gPicrN * 8)], px & $FFFFFFFF)
+  gPicrN = gPicrN + 1
+  gPicrRuns = gPicrRuns + 1
+  If gPicrN >= #PICR_RUNS_MAX
+    gPicrCrc = Crc32Part(gPicrCrc, @gPicrBuf[4], gPicrN * 8)
+    If picr_SendWait(gPicrOff, gPicrN * 8) = 0
+      gPicrOk = 0
+    EndIf
+    gPicrOff = gPicrOff + (gPicrN * 8)
+    gPicrN = 0
+  EndIf
+EndProcedure
+
+Procedure CmdPicR()
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define x.i
+  Define y.i
+  Define px.i
+  Define run.i
+  Define cur.i
+  Define runs1.i
+  Define wasMirror.i
+  Define wasAux.i
+  Define aborted.i
+
+  If gScreen = 0
+    PrintN("!! there is no screen to photograph, so nothing was sent. Type")
+    PrintN("   screen on to bring it up, then screenshot again.")
+    ProcedureReturn
+  EndIf
+  If NetConsoleOn() = 0 Or NetConsolePeerOk() = 0
+    PrintN("!! pr streams the screen to the wireless console's peer, and there")
+    PrintN("   is no peer yet - nothing has spoken to the UDP console. Run it")
+    PrintN("   from tools/pmfshot_wifi.py (which speaks first), or use p on the")
+    PrintN("   serial line.")
+    ProcedureReturn
+  EndIf
+
+  ; Snapshot the real front and its logical-to-physical map once. Both passes
+  ; below use these exact values, so counting and CRC emission cannot disagree
+  ; because some temporary Display metadata was swapped around them.
+  If ScrCaptureSnapshot(@fb, @w, @h, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    PrintN("!! the console thinks it is running but there is no picture behind")
+    PrintN("   it to read. Nothing was sent; reset the board if this repeats.")
+    ProcedureReturn
+  EndIf
+
+  ; ---- pass 1: count the runs, touching nothing -----------------------
+  runs1 = 0
+  y = 0
+  While y < h
+    If OutBreakCtrlC() <> 0
+      Break
+    EndIf
+    x = 0
+    cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+    run = 0
+    While x < w
+      px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+      If px <> cur
+        runs1 = runs1 + 1
+        cur = px
+      EndIf
+      x = x + 1
+    Wend
+    runs1 = runs1 + 1                ; the row's last run; rows never merge
+    y = y + 1
+  Wend
+  If OutBroke() <> 0
+    PrintN("Screenshot aborted before anything was sent.")
+    ProcedureReturn
+  EndIf
+
+  ; ---- go quiet: binary only between the header and the end marker ----
+  wasMirror = UartMirrorOn()
+  UartMirror(0)                      ; same feedback rule as p
+  NetConsoleFlush()                  ; the command's own echo reaches the host first
+  wasAux = UartAuxOn()
+  UartAuxMirror(0)
+
+  gPicrN = 0
+  gPicrOff = 0
+  gPicrRuns = 0
+  gPicrCrc = $FFFFFFFF
+  gPicrOk = 1
+  aborted = 0
+
+  ; ---- the header ------------------------------------------------------
+  PokeL(@gPicrBuf[4], w)
+  PokeL(@gPicrBuf[8], h)
+  PokeL(@gPicrBuf[12], runs1)
+  PokeL(@gPicrBuf[16], 8)
+  If picr_SendWait(#PICR_TAG_HDR, 16) = 0
+    gPicrOk = 0
+  EndIf
+
+  ; ---- pass 2: emit the same runs, acknowledged ------------------------
+  If gPicrOk <> 0
+    y = 0
+    While y < h
+      If OutBreakCtrlC() <> 0
+        aborted = 1
+        Break
+      EndIf
+      If gPicrOk = 0
+        Break
+      EndIf
+      x = 0
+      cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+      run = 0
+      While x < w
+        px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+        If px = cur
+          run = run + 1
+        Else
+          picr_PushRun(run, cur)
+          cur = px
+          run = 1
+        EndIf
+        x = x + 1
+      Wend
+      If run > 0
+        picr_PushRun(run, cur)
+      EndIf
+      y = y + 1
+    Wend
+  EndIf
+
+  ; The tail that has not filled a datagram yet.
+  If gPicrOk <> 0 And aborted = 0 And gPicrN > 0
+    gPicrCrc = Crc32Part(gPicrCrc, @gPicrBuf[4], gPicrN * 8)
+    If picr_SendWait(gPicrOff, gPicrN * 8) = 0
+      gPicrOk = 0
+    EndIf
+    gPicrOff = gPicrOff + (gPicrN * 8)
+    gPicrN = 0
+  EndIf
+
+  ; ---- the end marker - sent even after a Ctrl-C, so the host is told
+  ; the stream is over (status 0) rather than left to time out.
+  If gPicrOk <> 0
+    PokeL(@gPicrBuf[4], gPicrRuns)
+    PokeL(@gPicrBuf[8], (gPicrCrc ! $FFFFFFFF) & $FFFFFFFF)
+    If aborted <> 0
+      PokeL(@gPicrBuf[12], 0)
+    Else
+      PokeL(@gPicrBuf[12], 1)
+    EndIf
+    If picr_SendWait(#PICR_TAG_END, 12) = 0
+      gPicrOk = 0
+    EndIf
+  EndIf
+
+  ; ---- text flows again, then say what happened ------------------------
+  If wasAux <> 0
+    UartAuxMirror(1)
+  EndIf
+  If wasMirror <> 0
+    UartMirror(0)
+    UartMirror(1)
+  EndIf
+  If gPicrOk = 0
+    PrintN("!! the peer stopped acknowledging, so the reliable screenshot did")
+    PrintN("   not complete. Nothing half-made is left on either side - run it")
+    PrintN("   again.")
+  ElseIf aborted <> 0
+    PrintN("Screenshot aborted by Ctrl-C; the host was told so.")
+  Else
+    Print("Sent ")
+    PrintDec(gPicrRuns)
+    Print(" runs (")
+    PrintDec(gPicrOff)
+    PrintN(" bytes), every datagram acknowledged, CRC32 checked host-side.")
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  screen rotate - WHICH WAY UP THE CONSOLE SITS ON THE PANEL.
+;
+;  The panel is 800 across and 1280 down and nothing changes that; see
+;  THE ROTATION in screen_source.pi4 for why 0 and 180 are free and 90
+;  and 270 are not. This command says the cost every time, because the
+;  bench is choosing between a readable eighty-column landscape console
+;  and a fast one, and a choice offered without its price is not a
+;  choice.
+;
+;  THE DEFAULT IS 90 - LANDSCAPE - because that is how the panel is
+;  bolted to the bench, and this command is the ONLY thing anybody
+;  should have to touch if the first picture comes up upside down:
+;  `screen rotate 270`, once. It is saved. Rebuilding the monitor to
+;  turn a screen round is the wrong answer and the report below says so.
+;
+;  IT SAVES. A rotation typed once and lost at the next reset would be a
+;  setting in name only - the whole point is that the panel comes up the
+;  way the bench left it, with nothing typed.
+; ======================================================================
+Procedure CmdScreenRotate()
+  Define n.i
+  Define buf.i
+  Define was.i
+
+  If gScrSrc <> #SCR_SRC_DSI
+    ; SAY IT AND SAVE IT ANYWAY. Rotation is a property of the DSI panel
+    ; and refusing to record one because the panel is not up right now
+    ; would mean the bench cannot set it before plugging the panel in -
+    ; which is exactly when somebody would want to.
+    PrintN("The console is not on the DSI panel at the moment, so nothing on the")
+    PrintN("glass will change until it is. The setting is still recorded and the")
+    PrintN("panel will come up that way.")
+  EndIf
+
+  n = ParseDec()
+  If gParseOk = 0
+    Print("The console is turned ")
+    PrintDec(gScrRot)
+    PrintN(" degrees on the DSI panel right now, and it")
+    Print("comes up at ")
+    PrintDec(ScrRotWanted(#SCR_SRC_DSI))
+    PrintN(" degrees with nothing typed.")
+    If ScrRotOk(ScrRotStored()) <> 0
+      PrintN("That is what screen.rotate says in the settings store.")
+    ElseIf ScrRotStored() = #SCR_ROT_UNSET
+      PrintN("That is the default - landscape, because the panel is mounted with")
+      PrintN("its long edge across - and the settings store names no rotation.")
+    Else
+      PrintN("That is the default, because screen.rotate in the settings store is")
+      PrintN("not one of the four this can do, and a value nobody meant is not")
+      PrintN("rounded to the nearest one that works.")
+    EndIf
+    PrintNl()
+    ; THE TYPE IS THE SAME SIZE AT EVERY ROTATION AND THIS TEXT SAYS SO,
+    ; because it used to say the opposite and the opposite was the bug.
+    ; The font is computed from how big the panel is, not from how many
+    ; pixels the console is across, so turning it changes how much text
+    ; fits and what a repaint costs - and nothing else.
+    Print("The type is the same size at every rotation: ")
+    ScreenPutThou(ScrGlyphThou(ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H), ScrPpi(#SCR_SRC_DSI)))
+    PrintN(" inch to a line,")
+    PrintN("computed from the size of the panel and not from the width of the")
+    PrintN("picture. What changes below is how much text fits and what it costs.")
+    PrintNl()
+    Print("  screen rotate 90   LANDSCAPE, AND THE DEFAULT - ")
+    PrintDec(ScrColsFor(#MON_FB_PANEL_H, ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H)))
+    Print(" columns by ")
+    PrintDec(ScrRowsFor(#MON_FB_PANEL_W, LogoHeight(), ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H)))
+    PrintN(" lines,")
+    PrintN("                     the long edge across, which is how the panel is")
+    PrintN("                     mounted on this bench. THE COST: this hardware")
+    PrintN("                     has no 90 degree rotation, so the console draws")
+    PrintN("                     into a buffer of its own and every repaint is")
+    PrintN("                     transposed onto the panel - and a scroll becomes")
+    PrintN("                     a full repaint, because a turned row is not a run")
+    PrintN("                     of memory.")
+    PrintN("  screen rotate 270  landscape the other way up. IF THE PICTURE IS")
+    PrintN("                     UPSIDE DOWN ON THE GLASS, THIS IS THE FIX, AND")
+    PrintN("                     IT IS THE WHOLE FIX - it saves, so the panel")
+    PrintN("                     comes up that way afterwards with nothing typed.")
+    PrintN("                     Nobody rebuilds the monitor to turn a screen.")
+    PrintN("  screen rotate 0    the panel's own scan direction. It is 800 across")
+    Print("                     by 1280 down, so the console is ")
+    PrintDec(ScrColsFor(#MON_FB_PANEL_W, ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_W)))
+    Print(" columns by ")
+    PrintDec(ScrRowsFor(#MON_FB_PANEL_H, LogoHeight(), ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_W)))
+    PrintN(" lines")
+    PrintN("                     of the SAME SIZE type, standing on its side on")
+    PrintN("                     this bench - taller and narrower, not smaller.")
+    PrintN("                     Nothing is moved per pixel and the hardware")
+    PrintN("                     scroll works. This is the fast one.")
+    PrintN("  screen rotate 180  the same, upside down. Also free: the video")
+    PrintN("                     scaler mirrors it as it scans, so no pixel is")
+    PrintN("                     moved and the hardware scroll still works.")
+    PrintN("  screen scale <n>   how big the type is, if the calculation has it")
+    PrintN("                     wrong for your eyes or your bench distance.")
+    ProcedureReturn
+  EndIf
+
+  If ScrRotOk(n) = 0
+    Print("!! ")
+    PrintDec(n)
+    PrintN(" is not a rotation this can do, so nothing was changed. The four")
+    PrintN("   are 0, 90, 180 and 270, and they are whole quarter turns because")
+    PrintN("   anything else would need every pixel filtered rather than moved.")
+    ProcedureReturn
+  EndIf
+
+  buf = @gScrRotBuf[0]
+  PmfPutDec(n, buf)
+  If SettingsSet(ScrRotKey(), buf) = 0
+    PrintN("!! the rotation could not be recorded in the settings store, so it")
+    PrintN("   was not applied either - a rotation that is on the glass but not")
+    PrintN("   in the store is one that vanishes at the next reset without")
+    PrintN("   saying so. Nothing was changed.")
+    ProcedureReturn
+  EndIf
+  If SettingsSave() = 0
+    PrintN("!! the settings store would not write to the boot medium, so this")
+    PrintN("   rotation is in memory only and will be gone at the next reset.")
+    PrintN("   The console is being turned anyway; type settings save when the")
+    PrintN("   medium is back to make it stick.")
+  EndIf
+
+  was = gScrRot
+  gScrRot = n
+  Print("The console is now turned ")
+  PrintDec(n)
+  PrintN(" degrees on the DSI panel, and it will come")
+  PrintN("up that way with nothing typed.")
+
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn
+  EndIf
+
+  ; THE PANEL IS REBUILT RATHER THAN NUDGED. Turning the console changes
+  ; the surface it draws into, its width and height, the font
+  ; magnification, the console rectangle, the grid, and the mirror bits
+  ; in the display list. Setting six things by hand and hoping they agree
+  ; is how the two halves of a screen end up describing different
+  ; geometries; taking it down and bringing it up is the same path the
+  ; boot takes and cannot disagree with itself.
+  gScrRot = was
+  If ScreenDetach() = 0
+    PrintN("!! Vulkan ownership is quarantined; rotation was not applied.")
+    ProcedureReturn
+  EndIf
+  gScrRot = n
+  ScreenUpOn(#SCR_SRC_DSI, -1)
+EndProcedure
+
+; ======================================================================
+;  screen scale - HOW BIG THE TYPE IS, WHEN THE CALCULATION IS WRONG
+;  FOR THESE EYES AT THIS DISTANCE.
+;
+;  IT IS AN OVERRIDE AND NOT THE MECHANISM. The size of the type is
+;  computed from how big the screen is - see THE FONT SIZE IS COMPUTED
+;  FROM HOW BIG THE GLASS IS in screen_geom.pi4 - and this command is
+;  what a bench types when that answer, which is a general one, does not
+;  suit a particular pair of eyes or a particular working distance. A
+;  monitor whose only way to change the type size was to be rebuilt
+;  would be one where every such disagreement costs somebody a build.
+;
+;  IT SAVES, AND `screen scale auto` PUTS IT BACK. A setting that could
+;  be typed but never untyped is a trap: the calculation would go on
+;  improving underneath a stored number that nobody remembered was
+;  there. Removing the key is a first-class operation and it is spelled.
+;
+;  IT APPLIES TO WHICHEVER SCREEN THE CONSOLE IS ON, unlike the
+;  rotation. A rotation is a fact about how one panel is bolted down; a
+;  scale is a statement about the person reading it, and they do not
+;  become far-sighted when the console moves to HDMI.
+; ======================================================================
+Procedure CmdScreenScale()
+  Define n.i
+  Define buf.i
+  Define wantAuto.i
+
+  ; "auto" is a word, so it has to be looked for as one before ParseDec
+  ; is asked for a number - the same shape `screen on dsi` uses. gPos is
+  ; put back either way so the numeric path is unaffected.
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  wantAuto = 0
+  If WordIs("auto") <> 0 Or WordIs("default") <> 0 Or WordIs("computed") <> 0
+    wantAuto = 1
+  EndIf
+  gPos = gWordAt
+
+  If wantAuto = 0
+    n = ParseDec()
+    If gParseOk = 0
+      ; ---- THE REPORT --------------------------------------------------
+      If gScreen = 0
+        PrintN("There is no screen on at the moment, so nothing is being drawn at")
+        PrintN("any size. These are the numbers the DSI panel would come up with:")
+        Print("  magnification ")
+        PrintDec(ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H))
+        Print(", ")
+        PrintDec(ScrColsFor(#MON_FB_PANEL_H, ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H)))
+        Print(" columns by ")
+        PrintDec(ScrRowsFor(#MON_FB_PANEL_W, LogoHeight(), ScrScaleWanted(#SCR_SRC_DSI, #MON_FB_PANEL_H)))
+        PrintN(" lines landscape,")
+        Print("  from ")
+        PrintDec(ScrPpi(#SCR_SRC_DSI))
+        Print(" pixels to the inch and a target of ")
+        ScreenPutThou(#SCR_GLYPH_THOU)
+        PrintN(" inch to a line.")
+      Else
+        Print("The screen is on")
+        ScreenPutGeometry()
+      EndIf
+      PrintNl()
+      PrintN("The size of the type is COMPUTED, not picked: this monitor works out")
+      PrintN("how many pixels there are to the inch on the screen it is drawing on,")
+      Print("and magnifies its 8 x 16 font to the whole multiple nearest ")
+      ScreenPutThou(#SCR_GLYPH_THOU)
+      PrintN(" inch")
+      PrintN("to a line - which is what was found to read at a bench. Turning the")
+      PrintN("console does not change it: the panel is the same size sideways.")
+      PrintNl()
+      PrintN("  screen scale <n>   magnify the font by n instead. 1 is the built-in")
+      PrintN("                     8 x 16; 2 is 16 x 32 and half as much text. It")
+      PrintN("                     is saved, so it survives a reset")
+      PrintN("  screen scale auto  forget it and go back to the calculation")
+      ProcedureReturn
+    EndIf
+
+    If ScrScaleOk(n) = 0
+      Print("!! ")
+      PrintDec(n)
+      PrintN(" is not a magnification this can do, so nothing was changed.")
+      Print("   They are the whole numbers 1 to ")
+      PrintDec(#SCR_SCALE_MAX)
+      PrintN(". Whole, because the font is one")
+      PrintN("   bit per pixel and a filtered 1-bit glyph is a blurred glyph; and")
+      Print("   no higher than ")
+      PrintDec(#SCR_SCALE_MAX)
+      PrintN(", because that is already a 64 by 128 cell and about ten")
+      PrintN("   columns on this panel - past there a number is far likelier to be")
+      PrintN("   a typo than an instruction. Type screen scale auto for the")
+      PrintN("   computed size.")
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  ; ---- WRITE THE STORE, OR CLEAR IT --------------------------------
+  If wantAuto <> 0
+    ; SettingsRemove is allowed to answer 0 for a key that was not there,
+    ; and that is not a failure - "there is no override" is the state
+    ; being asked for and it already holds.
+    SettingsRemove(ScrScaleKey())
+    If SettingsSave() = 0
+      PrintN("!! the settings store would not write to the boot medium, so the")
+      PrintN("   override is cleared in memory only and would come back at the")
+      PrintN("   next reset. Type settings save when the medium is back.")
+    EndIf
+    PrintN("The type size is computed again. screen.scale is out of the settings")
+    PrintN("store, so this board and any board with this image works it out from")
+    PrintN("the size of whatever screen it is drawing on.")
+  Else
+    buf = @gScrScaleBuf[0]
+    PmfPutDec(n, buf)
+    If SettingsSet(ScrScaleKey(), buf) = 0
+      PrintN("!! the magnification could not be recorded in the settings store, so")
+      PrintN("   it was not applied either - type that is on the glass but not in")
+      PrintN("   the store is type that vanishes at the next reset without saying")
+      PrintN("   so. Nothing was changed.")
+      ProcedureReturn
+    EndIf
+    If SettingsSave() = 0
+      PrintN("!! the settings store would not write to the boot medium, so this")
+      PrintN("   magnification is in memory only and will be gone at the next")
+      PrintN("   reset. The type is being resized anyway; type settings save when")
+      PrintN("   the medium is back to make it stick.")
+    EndIf
+    Print("The font is now magnified by ")
+    PrintDec(n)
+    PrintN(", on whichever screen the console is")
+    PrintN("on, and it will come up that way with nothing typed.")
+  EndIf
+
+  If gScreen = 0
+    PrintN("There is no screen on, so nothing on any glass changed. It will")
+    PrintN("apply the next time one is turned on.")
+    ProcedureReturn
+  EndIf
+
+  ; THE SCREEN IS REBUILT RATHER THAN NUDGED, for the same reason
+  ; `screen rotate` rebuilds: the magnification decides the cell size,
+  ; the console rectangle, the number of columns and rows, and the size
+  ; of the shared grid. Bringing it up again is the boot path and cannot
+  ; disagree with itself.
+  If gScrSrc = #SCR_SRC_DSI
+    If ScreenDetach() = 0
+      PrintN("!! Vulkan ownership is quarantined; the display was not rebuilt.")
+      ProcedureReturn
+    EndIf
+    ScreenUpOn(#SCR_SRC_DSI, -1)
+  Else
+    If ScreenDetach() = 0
+      PrintN("!! Vulkan ownership is quarantined; the display was not rebuilt.")
+      ProcedureReturn
+    EndIf
+    ScreenUpOn(#SCR_SRC_HDMI, gScreenIndex)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  screen keyboard show | hide | state - THE TOUCH KEYBOARD FROM THE
+;  CONSOLE, BECAUSE UNTIL NOW IT COULD ONLY BE ASKED FOR WITH A FINGER.
+;
+;  Every other thing on this screen can be driven from any of the
+;  monitor's console channels - serial, network, the screen itself - and
+;  the keyboard could not. That made every proof of what it looks like a
+;  trip to the bench, and it made the band unreachable from the wire on a
+;  board sitting somewhere else.
+;
+;  IT IS A REAL COMMAND, NOT A TEST HOOK. It writes the model's intent
+;  and runs the service tick, which is exactly what a tap on the prompt
+;  line does: the same focus generation, the same viewport move, the same
+;  dispatcher rectangle, the same refusal counter, the same repaint. See
+;  TouchKeyboardRequest in RaspberryPi4/Board/banner_clock.pi4, which is
+;  inside the fenced section the touch keyboard integration gate lifts
+;  and executes.
+;
+;  NOTHING HERE PRINTS FROM THE SERVICE TICK. The layer never prints; a
+;  refusal is a whole sentence waiting in TouchKeyboardRefusal() and this
+;  is the caller that prints it.
+; ======================================================================
+; The refusal is a whole sentence or it is nothing at all - gTkbRefusal is
+; 0 until a layout actually refuses one. Printing a null pointer as a
+; string is how a report about a failure becomes a second failure.
+Procedure ScreenKeyboardSayRefusal()
+  If TouchKeyboardRefusal() = 0
+    PrintN("   (the layer recorded no reason, which means the refusal did not come")
+    PrintN("   from the layout - screen keyboard state prints what it believes.)")
+    ProcedureReturn
+  EndIf
+  Print("   ")
+  PrintN(TouchKeyboardRefusal())
+EndProcedure
+
+Procedure CmdScreenKeyboard()
+  Define up.i
+
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+
+  If gScreen = 0
+    PrintN("!! there is no screen up, so there is no keyboard to show. The serial")
+    PrintN("   line and the wireless/network consoles are unaffected - the screen is")
+    PrintN("   one optional channel among them. Type screen on first.")
+    ProcedureReturn
+  EndIf
+  If HwTouchReady() = 0
+    PrintN("!! this board has no touch controller, so the touch keyboard is not laid")
+    PrintN("   out and nothing can be tapped on the glass. Type touch status to see")
+    PrintN("   what the controller answered.")
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardLayerSuspended() <> 0
+    PrintN("!! a payload owns the processor, so the touch keyboard layer is suspended")
+    PrintN("   and may not be brought back until the monitor has its screen again.")
+    ProcedureReturn
+  EndIf
+
+  ; The layer lays itself out from the prompt spin; ask for that here too,
+  ; so the first command after a reset does not have to be typed twice.
+  TouchKeyboardScreenAttach()
+
+  If WordIs("show") <> 0 Or WordIs("on") <> 0 Or WordIs("up") <> 0
+    up = TouchKeyboardRequest(1)
+    If up <> 0
+      Print("The touch keyboard is up: ")
+      PrintDec(TouchKeyboardKeys())
+      Print(" keys in ")
+      PrintDec(TouchKeyboardRows())
+      Print(" rows, a band ")
+      PrintDec(TouchKeyboardBandW())
+      Print(" x ")
+      PrintDec(TouchKeyboardBandH())
+      Print(" at row ")
+      PrintDec(TouchKeyboardBandY())
+      Print(", and the console is showing ")
+      PrintDec(TouchKeyboardConsoleRows())
+      PrintN(" rows.")
+      PrintN("  It types into the same line a serial byte does. The chevron on the")
+      PrintN("  utility row puts it away, and so does screen keyboard hide.")
+    Else
+      PrintN("!! the touch keyboard was asked for and the surface refused it:")
+      ScreenKeyboardSayRefusal()
+      Print("   Refused ")
+      PrintDec(TouchKeyboardRefusedCount())
+      PrintN(" times since the last layout that was accepted.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If WordIs("hide") <> 0 Or WordIs("off") <> 0 Or WordIs("down") <> 0
+    up = TouchKeyboardRequest(0)
+    If up = 0
+      PrintN("The touch keyboard is down and the console has its rows back - nothing")
+      PrintN("was taken out of the grid to put it up, so the text that was under it")
+      PrintN("is the text that is there.")
+    Else
+      PrintN("!! the touch keyboard was asked to hide and it is still up. That is a")
+      PrintN("   defect; screen keyboard state prints what the layer believes.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; ---- screen keyboard, or screen keyboard state ----------------------
+  If gWordLen > 0 And WordIs("state") = 0 And WordIs("status") = 0
+    PrintN("!! screen keyboard takes show, hide or state.")
+    ProcedureReturn
+  EndIf
+  Print("Touch keyboard: ")
+  If TouchKeyboardLayoutOk() = 0
+    PrintN("not laid out for this screen, so nothing is on the glass.")
+    Print("  Refused ")
+    PrintDec(TouchKeyboardRefusedCount())
+    PrintN(" times. The last reason, if there was one:")
+    ScreenKeyboardSayRefusal()
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardViewVisible() <> 0
+    PrintN("up.")
+  Else
+    PrintN("down - the button beside the prompt is how a finger asks for it.")
+  EndIf
+  Print("  Band ")
+  PrintDec(TouchKeyboardBandW())
+  Print(" x ")
+  PrintDec(TouchKeyboardBandH())
+  Print(" at row ")
+  PrintDec(TouchKeyboardBandY())
+  Print(", ")
+  PrintDec(TouchKeyboardKeys())
+  Print(" keys in ")
+  PrintDec(TouchKeyboardRows())
+  Print(" rows, targets at least ")
+  PrintDec(TouchKeyboardTargetMinPx())
+  PrintN(" pixels.")
+  Print("  The density was ")
+  If TouchKeyboardDensityKnown() <> 0
+    Print("MEASURED - the panel said how big it is. ")
+  Else
+    Print("not available, so the display scale decided the size. ")
+  EndIf
+  Print("The dispatcher holds ")
+  If TouchKeyboardLayerRegion() = 2
+    PrintN("the band.")
+  ElseIf TouchKeyboardLayerRegion() = 1
+    PrintN("the prompt line and the button.")
+  Else
+    PrintN("nothing.")
+  EndIf
+  Print("  Renderer: ")
+  If gCursorGpuOwned <> 0
+    PrintN("the V3D tier composes the band with the CPU and carries it")
+    PrintN("  through each GPU frame, so the key labels are the 30 px anti-aliased")
+    PrintN("  face - the same kind the banner's title is set in.")
+  Else
+    PrintN("the framebuffer tier, key labels in the 30 px anti-aliased")
+    PrintN("  face wherever the key has room for them.")
+  EndIf
+  Print("  Refused ")
+  PrintDec(TouchKeyboardRefusedCount())
+  PrintN(" times since the last layout that was accepted.")
+EndProcedure
+
+; Read EDID bytes directly from a BCM2711 HDMI DDC controller. This is a
+; capability read only: it does not tell firmware to select a timing and
+; does not replace the firmware-owned HDMI framebuffer.
+Procedure CmdScreenEdid()
+  Protected port.i
+  Protected mode.i
+  Protected width.i
+  Protected height.i
+  Protected refresh.i
+  Protected clock.i
+  Protected rc.i
+
+  port = 0
+  SkipSpace()
+  If gLine[gPos] <> 0
+    port = ParseDec()
+    If gParseOk = 0 Or (port <> 0 And port <> 1)
+      PrintN("Use screen edid [0|1] for HDMI0 or HDMI1. No display mode was changed.")
+      ProcedureReturn
+    EndIf
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("Use screen edid [0|1] for HDMI0 or HDMI1. No display mode was changed.")
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  rc = Pi4HdmiDdcReadAttached(port)
+  If rc = 0
+    Print("!! Direct HDMI DDC read/parser failed on HDMI") : PrintDec(port) : Print(" (error ")
+    PrintDec(Pi4HdmiDdcError()) : Print(", block ") : PrintDec(Pi4HdmiDdcErrorBlock()) : PrintN(").")
+    ProcedureReturn
+  EndIf
+  Print("Raw EDID was read from HDMI") : PrintDec(port) : Print(" over the BCM2711 DDC controller: ")
+  PrintDec(Pi4HdmiDdcReceivedBlocks() * #PI4_DDC_BLOCK_BYTES) : PrintN(" bytes.")
+  PrintN("These are monitor capabilities from direct DDC; the active HDMI timing is reported separately.")
+  If Pi4HdmiDdcTruncated() <> 0
+    Print("The EDID extension read is truncated (transport error ")
+    PrintDec(Pi4HdmiDdcError()) : PrintN("); the valid base block is retained.")
+  EndIf
+  Print("Preferred EDID timing: ")
+  PrintDec(AnvilEdidPreferredWidth()) : Print(" x ") : PrintDec(AnvilEdidPreferredHeight())
+  Print(" at ") : PrintDec(AnvilEdidPreferredRefreshMilliHz() / 1000) : PrintN(" Hz.")
+  Print("EDID supported modes: ") : PrintDec(AnvilEdidModeCount()) : PrintN(":")
+  For mode = 0 To AnvilEdidModeCount() - 1
+    If AnvilEdidModeAt(mode,@width,@height,@refresh,@clock) <> 0
+      Print("  ") : PrintDec(width) : Print(" x ") : PrintDec(height)
+      Print("  ") : PrintDec(refresh / 1000) : Print(" Hz  ") : PrintDec(clock) : PrintN(" kHz")
+    EndIf
+  Next
+  PrintN("No mode switch was requested; screen timing remains whatever the display controller is using.")
+EndProcedure
+
+Procedure CmdScreen()
+  Define n.i
+
+  ; "screen on" and "screen off" read better than "screen 1", so take
+  ; the words too. Checked BEFORE ParseDec, which sees "on" as no number
+  ; at all and would report instead of acting. gPos is put back either
+  ; way so the numeric path is unaffected.
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If WordIs("on") <> 0
+    ; "screen on" may be followed by WHICH SCREEN, or by which of the
+    ; firmware's displays. The two are different questions and they are
+    ; spelled differently: a word names the screen, a number names a
+    ; firmware display - and a number has always meant a firmware
+    ; display, so it still does.
+    SkipSpace()
+    gWordAt = gPos
+    SkipWord()
+    gWordLen = gPos - gWordAt
+    If WordIs("dsi") <> 0 Or WordIs("panel") <> 0
+      ScreenUpOn(#SCR_SRC_DSI, -1)
+      ProcedureReturn
+    EndIf
+    If WordIs("hdmi") <> 0
+      ScreenUpOn(#SCR_SRC_HDMI, -1)
+      ProcedureReturn
+    EndIf
+    gPos = gWordAt
+
+    ; ParseDec() starts from where SkipWord() left off, so the number
+    ; after "on" is the next thing it sees; when there is no number
+    ; gParseOk stays 0 and this is the plain "screen on" it always was.
+    n = ParseDec()
+    If gParseOk <> 0
+      ScreenUpOn(#SCR_SRC_HDMI, n)
+    Else
+      ScreenUp()
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; ---- screen rotate --------------------------------------------------
+  If WordIs("rotate") <> 0
+    CmdScreenRotate()
+    ProcedureReturn
+  EndIf
+  ; ---- screen scale ---------------------------------------------------
+  If WordIs("scale") <> 0 Or WordIs("font") <> 0 Or WordIs("size") <> 0
+    CmdScreenScale()
+    ProcedureReturn
+  EndIf
+  ; ---- screen keyboard -------------------------------------------------
+  If WordIs("keyboard") <> 0 Or WordIs("keys") <> 0 Or WordIs("kb") <> 0
+    CmdScreenKeyboard()
+    ProcedureReturn
+  EndIf
+  If WordIs("displays") <> 0
+    ScreenReportDisplays()
+    ScreenReportActive()
+    ProcedureReturn
+  EndIf
+  If WordIs("edid") <> 0
+    CmdScreenEdid()
+    ProcedureReturn
+  EndIf
+  ; ---- screen timing ---------------------------------------------------
+  ; Reads the retained record and touches no hardware at all: no mailbox,
+  ; no panel, no HVS, no I2C. It is safe on a board whose screen is off
+  ; and safe while a payload's result is still in DRAM.
+  If WordIs("timing") <> 0 Or WordIs("times") <> 0 Or WordIs("boot") <> 0
+    BootTimingReport()
+    ProcedureReturn
+  EndIf
+  If WordIs("off") <> 0
+    If ScreenDown() = 0
+      PrintN("!! Vulkan ownership is quarantined; screen detach was refused.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; ---- the console tier: V3D GPU, DMA framebuffer, or plain CPU ---------
+  ; These are the manual overrides for the boot-time auto-selection. V3D is
+  ; the preferred tier; dma and cpu drop to the framebuffer console (the
+  ; same code - gDma is the only difference, DMA scroll vs CPU scroll), and
+  ; they exist even in a build with no V3D so the operator can force CPU.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  If WordIs("v3d") <> 0 Or WordIs("gpu") <> 0 Or WordIs("neon") <> 0
+    CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+    If VulkanConsoleReady() <> 0 Or VulkanConsoleQuarantined() <> 0
+      If VulkanConsoleStop() = 0
+        PrintN("!! Vulkan ownership is quarantined; V3D was not started.")
+        ProcedureReturn
+      EndIf
+    EndIf
+    CompilerEndIf
+    V3dConStart()
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If WordIs("vulkan") <> 0
+    If gScreen = 0
+      PrintN("There is no display to render on. Type screen on, then screen vulkan.")
+      ProcedureReturn
+    EndIf
+    If VulkanConsoleStart() = #AVC_OK
+      PrintN("The console is now rendered through the resident Vulkan Chrome adapter.")
+      PrintN("  Type screen dma to return to the framebuffer console; screen v3d")
+      PrintN("  returns to the native V3D renderer. Vulkan remains opt-in.")
+    Else
+      Print("!! Vulkan console startup failed (code ")
+      PrintDec(VulkanConsoleError())
+      PrintN(").")
+      If VulkanConsoleQuarantined() <> 0
+        PrintN("Screen drawing is suspended because GPU ownership could not be released safely.")
+      Else
+        PrintN("The framebuffer console remains active.")
+      EndIf
+    EndIf
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
+
+  If WordIs("dma") <> 0
+    If gScreen = 0
+      PrintN("There is no display, so there is no screen renderer to pick a tier for.")
+      PrintN("The serial line and the wireless/network consoles are running regardless")
+      PrintN("- the screen is one optional channel, not the console. Attach a display")
+      PrintN("and type screen on, then screen v3d / dma / cpu.")
+      ProcedureReturn
+    EndIf
+    If ScreenAttachFramebuffer(1) = 0
+      PrintN("!! Vulkan ownership is quarantined; framebuffer repaint was refused.")
+      ProcedureReturn
+    EndIf
+    If gDma <> 0
+      PrintN("Screen renderer: DMA-accelerated framebuffer (CPU draw, DMA scroll).")
+    Else
+      PrintN("Screen renderer: plain CPU framebuffer - the DMA engine would not bind,")
+      PrintN("so scrolling is drawn by the processor. Everything still works.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If WordIs("cpu") <> 0 Or WordIs("text") <> 0
+    If gScreen = 0
+      PrintN("There is no display, so there is no screen renderer to pick a tier for.")
+      PrintN("The serial line and the wireless/network consoles are running regardless")
+      PrintN("- the screen is one optional channel, not the console. Attach a display")
+      PrintN("and type screen on, then screen v3d / dma / cpu.")
+      ProcedureReturn
+    EndIf
+    If ScreenAttachFramebuffer(0) = 0
+      PrintN("!! Vulkan ownership is quarantined; framebuffer repaint was refused.")
+      ProcedureReturn
+    EndIf
+    PrintN("Screen renderer: plain CPU framebuffer (no DMA scroll; the processor")
+    PrintN("draws everything). This is the lowest tier and always available.")
+    ProcedureReturn
+  EndIf
+
+  gPos = gWordAt
+
+  n = ParseDec()
+  If gParseOk = 0 And gWordLen > 0
+    ; A WORD THIS COMMAND DOES NOT KNOW, AND IT SAYS SO. Before this, an
+    ; unrecognised word fell through to the bare-screen path below: the
+    ; word was thrown away in silence and the command did something else
+    ; entirely. "screen dispaly" turned the screen on and reported, which
+    ; looks like success and is not what was asked for.
+    Define k.i
+    Print("? screen does not know the word ")
+    k = 0
+    While k < gWordLen And k < 24
+      UartWrite(gLine[gWordAt + k] & $FF)
+      k = k + 1
+    Wend
+    PrintN(", so nothing was changed.")
+    PrintN("  screen             say whether the screen is on, and turn it on if")
+    PrintN("                     it is off")
+    PrintN("  screen on          turn it on, letting the firmware choose which")
+    PrintN("                     display it goes to")
+    PrintN("  screen on dsi      turn it on on the DSI panel, which this monitor")
+    PrintN("                     lights itself")
+    PrintN("  screen on hdmi     turn it on on an HDMI display")
+    PrintN("  screen on <number> turn it on, on the display at that position in")
+    PrintN("                     the list that screen displays prints. A NUMBER")
+    PrintN("                     is always a firmware display; the DSI panel is")
+    PrintN("                     not one and is spelled by name")
+    PrintN("  screen off         turn it off. The serial line is unaffected")
+    PrintN("  screen displays    list every screen this board has and say which")
+    PrintN("                     one the picture is going to")
+    PrintN("  screen edid [0|1]  read HDMI0/HDMI1 EDID bytes directly over DDC and")
+    PrintN("                     list the monitor's preferred and supported modes;")
+    PrintN("                     does not switch the active display timing")
+    PrintN("  screen keyboard    show, hide or describe the touch keyboard - the")
+    PrintN("                     same path a finger on the prompt line takes, so")
+    PrintN("                     it can be opened from the serial line or over")
+    PrintN("                     the network. show | hide | state")
+    PrintN("  screen rotate <n>  turn the console 0, 90, 180 or 270 degrees on")
+    PrintN("                     the DSI panel, and remember it. With no number,")
+    PrintN("                     say what it is now and what each one costs")
+    PrintN("  screen scale <n>   magnify the font by n and remember it. The size")
+    PrintN("                     is normally COMPUTED from how many pixels there")
+    PrintN("                     are to the inch on the screen; this overrides it")
+    PrintN("                     for eyes or a bench distance it does not suit.")
+    PrintN("                     screen scale auto goes back to the calculation")
+    PrintN("  screen timing      what this boot spent its milliseconds on, read")
+    PrintN("                     back from the retained record the boot wrote.")
+    PrintN("                     Painting into memory and presenting to the panel")
+    PrintN("                     are separate rows. Touches no hardware")
+    PrintN("  The console tier is auto-selected at boot by driver availability,")
+    PrintN("  V3D preferred. Override it:")
+    CompilerIf #ANVIL_V3D_CONSOLE = 1
+    PrintN("  screen v3d         the V3D GPU (NeonArcade) - the preferred tier")
+    CompilerEndIf
+    PrintN("  screen dma         the DMA-accelerated framebuffer console")
+    PrintN("  screen cpu         the plain-CPU framebuffer console (no DMA scroll)")
+    CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+    PrintN("  screen vulkan      the resident Vulkan Chrome console (opt-in)")
+    CompilerEndIf
+    ProcedureReturn
+  EndIf
+  If gParseOk = 0
+    ; Bare s reports, and turns the screen ON if it is off. Reporting
+    ; only would make the common case two commands.
+    If gScreen <> 0
+      Print("The screen is on")
+      ScreenPutGeometry()
+      ; The surface itself, so the picture can be checked with the memory
+      ; command without anybody having to be in front of the monitor.
+      Print("  The picture starts in memory at ")
+      PutAddr(DisplayBase())
+      Print(" and each row of it is")
+      PrintNl()
+      Print("  ")
+      PrintDec(DisplayPitch())
+      PrintN(" bytes long, so you can read it with the memory command")
+      PrintN("  without standing in front of the display.")
+      Print("  The band across the top holding the logo is ")
+      PrintDec(LogoHeight())
+      PrintN(" pixels deep, and the")
+      PrintN("  text scrolls underneath it.")
+      If UartMirrorLost() > 0
+        Print("!! ")
+        PrintDec(UartMirrorLost())
+        PrintN(" characters never reached the screen, because output arrived")
+        PrintN("   faster than it could be drawn and the buffer feeding the screen")
+        PrintN("   filled up. Nothing was lost off the serial line - the wire is")
+        PrintN("   always the complete record and the screen is the convenience.")
+      EndIf
+      ; Which socket the picture is going to, and what else the firmware
+      ; found. This is the question the monitor used to answer with a
+      ; guess; it now answers it with the firmware's own census, or
+      ; admits that it cannot.
+      ScreenReportDisplays()
+      ScreenReportActive()
+      PrintN("  Type screen off to turn it off and screen on to turn it back on.")
+    Else
+      ScreenUp()
+    EndIf
+    ProcedureReturn
+  EndIf
+  ; THE BARE NUMBER STILL MEANS OFF AND ON, not a display. "screen 1"
+  ; has meant "turn the screen on" since this command existed and
+  ; changing it under somebody's fingers to mean "use display 1" would
+  ; be the nastiest kind of silent change - the same words doing
+  ; something else. Choosing a display is spelled "screen on 1", where
+  ; the word "on" is what makes the number an argument to something.
+  If n = 0
+    If ScreenDown() = 0
+      PrintN("!! Vulkan ownership is quarantined; screen detach was refused.")
+    EndIf
+  Else
+    ScreenUp()
+  EndIf
+EndProcedure

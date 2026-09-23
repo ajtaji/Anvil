@@ -1,0 +1,74 @@
+; Emitted Pi3 CPU banner formatting/clearing gate.
+Global pi3_screen_fault.i
+Global pi3_screen_cell_w.i=10
+Global pi3_screen_cell_h.i=16
+Global pi3_screen_scale.i=2
+Global gateFillCount.i
+Global gateDrawCount.i
+Global Dim gateCell.i[12]
+
+Procedure.i Pi3FbReady()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3FbWriteAllowed()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3FbPack(r.i,g.i,b.i)
+  ProcedureReturn ((r&255)<<16)|((g&255)<<8)|(b&255)
+EndProcedure
+Procedure.i Pi3FbFillRect(x.i,y.i,w.i,h.i,color.i)
+  Protected cell.i=(x-24)/pi3_screen_cell_w
+  If cell<0 Or cell>=12 : ProcedureReturn 0 : EndIf
+  gateCell[cell]=0
+  gateFillCount=gateFillCount+1
+  ProcedureReturn 1
+EndProcedure
+Procedure Pi3ScreenDrawGlyph(code.i,x.i,y.i,scale.i,fg.i)
+  Protected cell.i=(x-24)/pi3_screen_cell_w
+  If cell>=0 And cell<12
+    gateCell[cell]=code
+    gateDrawCount=gateDrawCount+1
+  EndIf
+EndProcedure
+
+; @@CPU_USAGE_DRAW@@
+
+Procedure.i GateCellsMatch(text.i,length.i)
+  Protected i.i
+  For i=0 To 11
+    If i<length
+      If gateCell[i]<>(PeekA(text+i)&255) : ProcedureReturn 0 : EndIf
+    Else
+      If gateCell[i]<>0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Protected i.i
+  pi3_screen_cell_w=10 : pi3_screen_cell_h=16 : pi3_screen_scale=2
+  pi3_screen_fault=0
+  For i=0 To 11 : gateCell[i]=0 : Next
+
+  ; Longest value leaves the cell after '%' occupied.
+  gateFillCount=0 : gateDrawCount=0
+  Pi3ScreenUsageDraw(10000)
+  If gateFillCount<>12 Or gateDrawCount<>12 : ProcedureReturn 1 : EndIf
+  If GateCellsMatch("CPU0 100.00%",12)=0 : ProcedureReturn 2 : EndIf
+
+  ; A shorter number must erase both former trailing cells and leave one %.
+  gateFillCount=0 : gateDrawCount=0
+  Pi3ScreenUsageDraw(327)
+  If gateFillCount<>12 Or gateDrawCount<>10 : ProcedureReturn 3 : EndIf
+  If GateCellsMatch("CPU0 3.27%",10)=0 : ProcedureReturn 4 : EndIf
+  If gateCell[9]<>37 Or gateCell[10]<>0 Or gateCell[11]<>0 : ProcedureReturn 5 : EndIf
+
+  ; Unavailable has the same one-percent/trailing-clear contract.
+  gateFillCount=0 : gateDrawCount=0
+  Pi3ScreenUsageDraw(-1)
+  If gateFillCount<>12 Or gateDrawCount<>11 : ProcedureReturn 6 : EndIf
+  If GateCellsMatch("CPU0 --.--%",11)=0 : ProcedureReturn 7 : EndIf
+  If gateCell[10]<>37 Or gateCell[11]<>0 : ProcedureReturn 8 : EndIf
+  ProcedureReturn 0
+EndProcedure

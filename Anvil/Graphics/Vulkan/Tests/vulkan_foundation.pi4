@@ -1,0 +1,429 @@
+; Registry-ABI and lifecycle probe for Anvil's Vulkan surface.
+;
+; The A64 host gate builds and runs this image. It is never a board
+; diagnostic: it links the explicit test backend, which owns no GPU and
+; writes no pixels, and it touches no hardware at all.
+;
+; Everything below goes through the PUBLIC vk* entry points wherever one
+; exists, because a private shortcut proves the engine and not the API.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VKT_OUT = $06000000
+#VKT_HEAP = $00200000
+#VKT_HEAP_BYTES = $00080000
+
+Global vktFails.i = 0
+Global vktChecks.i = 0
+
+Procedure Vkt(ok.i)
+  PokeN(#VKT_OUT + $100 + (vktChecks * 8), ok)
+  vktChecks = vktChecks + 1
+  If ok = 0 : vktFails = vktFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define count.i
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define mp.VkPhysicalDeviceMemoryProperties
+  Define qf.VkQueueFamilyProperties
+  Define qfCount.l
+  Define selectedFamily.i
+  Define features.VkPhysicalDeviceFeatures
+  Define formatProps.VkFormatProperties
+  Define imageProps.VkImageFormatProperties
+  Define featureFailures.i
+  Define i.i
+
+  ; ------------------------------------------------------------------
+  ;  Exact AArch64 C layout of every public record.
+  ; ------------------------------------------------------------------
+  Vkt(SizeOf(VkExtent2D) = 8)
+  Vkt(SizeOf(VkExtent3D) = 12)
+  Vkt(SizeOf(VkOffset2D) = 8)
+  Vkt(SizeOf(VkOffset3D) = 12)
+  Vkt(SizeOf(VkViewport) = 24)
+  Vkt(SizeOf(VkComponentMapping) = 16)
+  Vkt(SizeOf(VkRect2D) = 16)
+  Vkt(OffsetOf(VkRect2D\extent\height) = 12)
+  Vkt(SizeOf(VkFormatProperties) = 12)
+  Vkt(OffsetOf(VkFormatProperties\optimalTilingFeatures) = 4)
+  Vkt(OffsetOf(VkFormatProperties\bufferFeatures) = 8)
+  Vkt(SizeOf(VkImageFormatProperties) = 32)
+  Vkt(OffsetOf(VkImageFormatProperties\maxExtent\depth) = 8)
+  Vkt(OffsetOf(VkImageFormatProperties\maxMipLevels) = 12)
+  Vkt(OffsetOf(VkImageFormatProperties\maxArrayLayers) = 16)
+  Vkt(OffsetOf(VkImageFormatProperties\sampleCounts) = 20)
+  Vkt(OffsetOf(VkImageFormatProperties\maxResourceSize) = 24)
+  Vkt(SizeOf(VkExtensionProperties) = 260)
+  Vkt(OffsetOf(VkExtensionProperties\specVersion) = 256)
+  Vkt(SizeOf(VkLayerProperties) = 520)
+  Vkt(OffsetOf(VkLayerProperties\description) = 264)
+  Vkt(SizeOf(VkApplicationInfo) = 48)
+  Vkt(OffsetOf(VkApplicationInfo\pNext) = 8)
+  Vkt(OffsetOf(VkApplicationInfo\pApplicationName) = 16)
+  Vkt(OffsetOf(VkApplicationInfo\applicationVersion) = 24)
+  Vkt(OffsetOf(VkApplicationInfo\pEngineName) = 32)
+  Vkt(OffsetOf(VkApplicationInfo\apiVersion) = 44)
+  Vkt(SizeOf(VkAllocationCallbacks) = 48)
+  Vkt(SizeOf(VkPhysicalDeviceFeatures) = 220)
+  Vkt(OffsetOf(VkPhysicalDeviceFeatures\robustBufferAccess) = 0)
+  Vkt(OffsetOf(VkPhysicalDeviceFeatures\inheritedQueries) = 216)
+  Vkt(SizeOf(VkDeviceQueueCreateInfo) = 40)
+  Vkt(OffsetOf(VkDeviceQueueCreateInfo\pNext) = 8)
+  Vkt(OffsetOf(VkDeviceQueueCreateInfo\pQueuePriorities) = 32)
+  Vkt(SizeOf(VkDeviceCreateInfo) = 72)
+  Vkt(OffsetOf(VkDeviceCreateInfo\pQueueCreateInfos) = 24)
+  Vkt(OffsetOf(VkDeviceCreateInfo\ppEnabledLayerNames) = 40)
+  Vkt(OffsetOf(VkDeviceCreateInfo\pEnabledFeatures) = 64)
+  Vkt(SizeOf(VkInstanceCreateInfo) = 64)
+  Vkt(OffsetOf(VkInstanceCreateInfo\pApplicationInfo) = 24)
+  Vkt(OffsetOf(VkInstanceCreateInfo\ppEnabledLayerNames) = 40)
+  Vkt(OffsetOf(VkInstanceCreateInfo\ppEnabledExtensionNames) = 56)
+  Vkt(SizeOf(VkCommandPoolCreateInfo) = 24)
+  Vkt(OffsetOf(VkCommandPoolCreateInfo\queueFamilyIndex) = 20)
+  Vkt(SizeOf(VkCommandBufferAllocateInfo) = 32)
+  Vkt(OffsetOf(VkCommandBufferAllocateInfo\commandPool) = 16)
+  Vkt(OffsetOf(VkCommandBufferAllocateInfo\level) = 24)
+  Vkt(SizeOf(VkCommandBufferInheritanceInfo) = 56)
+  Vkt(OffsetOf(VkCommandBufferInheritanceInfo\framebuffer) = 32)
+  Vkt(OffsetOf(VkCommandBufferInheritanceInfo\pipelineStatistics) = 48)
+  Vkt(SizeOf(VkCommandBufferBeginInfo) = 32)
+  Vkt(OffsetOf(VkCommandBufferBeginInfo\pInheritanceInfo) = 24)
+  Vkt(SizeOf(VkSubmitInfo) = 72)
+  Vkt(OffsetOf(VkSubmitInfo\pWaitSemaphores) = 24)
+  Vkt(OffsetOf(VkSubmitInfo\pCommandBuffers) = 48)
+  Vkt(OffsetOf(VkSubmitInfo\pSignalSemaphores) = 64)
+  Vkt(SizeOf(VkSemaphoreCreateInfo) = 24)
+  Vkt(OffsetOf(VkSemaphoreCreateInfo\flags) = 16)
+
+  ; The records this slice adds. VkDeviceSize is eight bytes, so every
+  ; one of these would move if it were ever declared as a native int.
+  Vkt(SizeOf(VkMemoryAllocateInfo) = 32)
+  Vkt(OffsetOf(VkMemoryAllocateInfo\allocationSize) = 16)
+  Vkt(OffsetOf(VkMemoryAllocateInfo\memoryTypeIndex) = 24)
+  Vkt(SizeOf(VkMemoryRequirements) = 24)
+  Vkt(OffsetOf(VkMemoryRequirements\alignment) = 8)
+  Vkt(OffsetOf(VkMemoryRequirements\memoryTypeBits) = 16)
+  Vkt(SizeOf(VkMemoryType) = 8)
+  Vkt(SizeOf(VkMemoryHeap) = 16)
+  Vkt(SizeOf(VkPhysicalDeviceMemoryProperties) = 520)
+  Vkt(OffsetOf(VkPhysicalDeviceMemoryProperties\memoryTypes) = 4)
+  Vkt(OffsetOf(VkPhysicalDeviceMemoryProperties\memoryHeapCount) = 260)
+  Vkt(OffsetOf(VkPhysicalDeviceMemoryProperties\memoryHeaps) = 264)
+  Vkt(SizeOf(VkQueueFamilyProperties) = 24)
+  Vkt(OffsetOf(VkQueueFamilyProperties\minImageTransferGranularity) = 12)
+  Vkt(SizeOf(VkImageCreateInfo) = 88)
+  Vkt(OffsetOf(VkImageCreateInfo\extent) = 28)
+  Vkt(OffsetOf(VkImageCreateInfo\mipLevels) = 40)
+  Vkt(OffsetOf(VkImageCreateInfo\samples) = 48)
+  Vkt(OffsetOf(VkImageCreateInfo\pQueueFamilyIndices) = 72)
+  Vkt(OffsetOf(VkImageCreateInfo\initialLayout) = 80)
+  Vkt(SizeOf(VkImageSubresourceRange) = 20)
+  Vkt(OffsetOf(VkImageSubresourceRange\layerCount) = 16)
+  Vkt(SizeOf(VkImageMemoryBarrier) = 72)
+  Vkt(OffsetOf(VkImageMemoryBarrier\oldLayout) = 24)
+  Vkt(OffsetOf(VkImageMemoryBarrier\image) = 40)
+  Vkt(OffsetOf(VkImageMemoryBarrier\subresourceRange) = 48)
+  Vkt(SizeOf(VkImageSubresourceLayers) = 16)
+  Vkt(SizeOf(VkBufferImageCopy) = 56)
+  Vkt(OffsetOf(VkBufferImageCopy\imageSubresource) = 16)
+  Vkt(OffsetOf(VkBufferImageCopy\imageOffset) = 32)
+  Vkt(OffsetOf(VkBufferImageCopy\imageExtent) = 44)
+  Vkt(SizeOf(VkFenceCreateInfo) = 24)
+  Vkt(OffsetOf(VkFenceCreateInfo\flags) = 16)
+  Vkt(SizeOf(VkSamplerCreateInfo) = 80)
+  Vkt(OffsetOf(VkSamplerCreateInfo\magFilter) = 20)
+  Vkt(OffsetOf(VkSamplerCreateInfo\addressModeW) = 40)
+  Vkt(OffsetOf(VkSamplerCreateInfo\maxAnisotropy) = 52)
+  Vkt(OffsetOf(VkSamplerCreateInfo\unnormalizedCoordinates) = 76)
+
+  ; ------------------------------------------------------------------
+  ;  The production boundary, then the explicit test backend.
+  ; ------------------------------------------------------------------
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  inst = 123
+  Vkt(AnvilVkBackendAvailable() = 0)
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #VK_ERROR_INCOMPATIBLE_DRIVER)
+  Vkt(inst = #VK_NULL_HANDLE)
+
+  AnvilVkTestBackendHeap(#VKT_HEAP, #VKT_HEAP_BYTES)
+  AnvilVkTestBackendLimits(257, 64)
+  Vkt(AnvilVkBackendAvailable() = 1)
+  Vkt(AnvilVkBackendIsGpu() = 0)
+
+  ; A create-info whose sType is wrong, a pNext chain, host allocation
+  ; callbacks, a layer and an extension are each refused with their own
+  ; real code before any object is made.
+  ici\sType = #VK_STRUCTURE_TYPE_APPLICATION_INFO
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #ANVIL_VK_ERR_ARGS)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  ici\pNext = @ici
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #ANVIL_VK_ERR_UNSUPPORTED)
+  ici\pNext = 0
+  Vkt(vkCreateInstance(@ici, @ici, @inst) = #ANVIL_VK_ERR_UNSUPPORTED)
+  ici\enabledLayerCount = 1
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #VK_ERROR_LAYER_NOT_PRESENT)
+  ici\enabledLayerCount = 0
+  ici\enabledExtensionCount = 1
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #VK_ERROR_EXTENSION_NOT_PRESENT)
+  ici\enabledExtensionCount = 0
+  Vkt(AnvilVkFaultText() <> 0)
+
+  Vkt(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  Vkt(inst <> #VK_NULL_HANDLE)
+  Vkt(avkTokenKind(inst) = #ANVIL_VK_TYPE_INSTANCE)
+
+  count = 0
+  Vkt(vkEnumeratePhysicalDevices(inst, @count, 0) = #VK_SUCCESS)
+  Vkt(count = 1)
+  count = 0
+  phys = 99
+  Vkt(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_INCOMPLETE)
+  Vkt(count = 0 And phys = 99)
+  count = 1
+  Vkt(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS)
+  Vkt(count = 1 And phys <> 0)
+
+  ; The query owns the all-false feature record. Poison every byte first:
+  ; merely leaving caller memory untouched cannot look like support for none.
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    PokeL(@features + i, $FFFFFFFF)
+    i = i + 4
+  Wend
+  vkGetPhysicalDeviceFeatures(phys, @features)
+  featureFailures = 0
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    If PeekL(@features + i) <> #VK_FALSE : featureFailures = featureFailures + 1 : EndIf
+    i = i + 4
+  Wend
+  Vkt(featureFailures = 0)
+
+  ; Query an exact set, not merely a non-zero one: the current physical
+  ; device owns linear BGRA8 sampled-image, colour-attachment and the exact
+  ; straight source-over blend path.
+  ; Poison first so
+  ; every zero field must have been written by the implementation.
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT))
+  Vkt(formatProps\optimalTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+  Vkt(formatProps\bufferFeatures = 0)
+  Vkt(AnvilVkBackendCanBlendSourceOver() = 1)
+
+  ; Image-format properties carry only combinations creation accepts.  The
+  ; deliberately awkward 257 limit also proves that maxResourceSize uses the
+  ; backend's 64-byte row alignment: roundUp(257*4,64)*257 = 279616.
+  imageProps\maxExtent\width = $FFFFFFFF
+  imageProps\maxExtent\height = $FFFFFFFF
+  imageProps\maxExtent\depth = $FFFFFFFF
+  imageProps\maxMipLevels = $FFFFFFFF
+  imageProps\maxArrayLayers = $FFFFFFFF
+  imageProps\sampleCounts = $FFFFFFFF
+  imageProps\maxResourceSize = -1
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, @imageProps) = #VK_SUCCESS)
+  Vkt(imageProps\maxExtent\width = 257 And imageProps\maxExtent\height = 257 And imageProps\maxExtent\depth = 1)
+  Vkt(imageProps\maxMipLevels = 1 And imageProps\maxArrayLayers = 1)
+  Vkt(imageProps\sampleCounts = #VK_SAMPLE_COUNT_1_BIT)
+  Vkt(imageProps\maxResourceSize = 279616)
+
+  ; Every unsupported creation field gets the registry's one query refusal.
+  ; The structure is cleared first so stale caller poison cannot resemble a
+  ; partially supported limit.
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_R8G8B8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(imageProps\maxExtent\width = 0 And imageProps\maxResourceSize = 0)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_1D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageProps) = #VK_SUCCESS)
+  Vkt(imageProps\maxExtent\width = 257 And imageProps\maxExtent\height = 257 And imageProps\maxResourceSize = 304128)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_SAMPLED_BIT, 0, @imageProps) = #VK_SUCCESS)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, 0, 0, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, 0) = #ANVIL_VK_ERR_ARGS)
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_R8G8B8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = 0)
+  Vkt(formatProps\optimalTilingFeatures = 0)
+  Vkt(formatProps\bufferFeatures = 0)
+
+  ; The draw-capable test backend advertises a normal Vulkan graphics
+  ; queue as well as transfer. An application scanning queue families
+  ; for VK_QUEUE_GRAPHICS_BIT therefore selects family zero.
+  qfCount = 0
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, 0)
+  Vkt(qfCount = 1)
+  qfCount = 1
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, @qf)
+  Vkt(qfCount = 1)
+  Vkt((qf\queueFlags & #VK_QUEUE_TRANSFER_BIT) <> 0)
+  Vkt((qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0)
+  Vkt((qf\queueFlags & #VK_QUEUE_COMPUTE_BIT) = 0)
+  Vkt(qf\queueCount = 1)
+  Vkt(qf\minImageTransferGranularity\depth = 1)
+  selectedFamily = -1
+  If (qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0 : selectedFamily = 0 : EndIf
+  Vkt(selectedFamily = #ANVIL_VK_QUEUE_FAMILY)
+
+  ; A draw backend without the independent blend capability still reports a
+  ; colour attachment, but never COLOR_ATTACHMENT_BLEND.
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW)
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+  Vkt(AnvilVkBackendCanBlendSourceOver() = 0)
+
+  ; The same API over a live backend without CAP_DRAW tells the smaller
+  ; truth: transfer only, so the identical scan finds no graphics queue.
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR)
+  qfCount = 1
+  vkGetPhysicalDeviceQueueFamilyProperties(phys, @qfCount, @qf)
+  Vkt(qfCount = 1)
+  Vkt(qf\queueFlags = #VK_QUEUE_TRANSFER_BIT)
+  selectedFamily = -1
+  If (qf\queueFlags & #VK_QUEUE_GRAPHICS_BIT) <> 0 : selectedFamily = 0 : EndIf
+  Vkt(selectedFamily = -1)
+  formatProps\linearTilingFeatures = $FFFFFFFF
+  formatProps\optimalTilingFeatures = $FFFFFFFF
+  formatProps\bufferFeatures = $FFFFFFFF
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(formatProps\linearTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+  Vkt(formatProps\optimalTilingFeatures = #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+  Vkt(formatProps\bufferFeatures = 0)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, @imageProps) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageProps) = #VK_SUCCESS)
+  Vkt(imageProps\maxExtent\width = 257 And imageProps\maxResourceSize = 279616)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER)
+
+  vkGetPhysicalDeviceMemoryProperties(phys, @mp)
+  Vkt(mp\memoryTypeCount = 2)
+  Vkt(mp\memoryHeapCount = 1)
+  Vkt(mp\memoryHeaps[0]\size = #VKT_HEAP_BYTES)
+  Vkt((mp\memoryHeaps[0]\flags & #VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) <> 0)
+  Vkt((mp\memoryTypes[0]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = 0)
+  Vkt((mp\memoryTypes[1]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) <> 0)
+  Vkt(mp\memoryTypes[1]\heapIndex = 0)
+
+  ; vkCreateDevice's own refusals.
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueFamilyIndex = 0
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  dci\enabledExtensionCount = 1
+  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_ERROR_EXTENSION_NOT_PRESENT)
+  dci\enabledExtensionCount = 0
+
+  ; A non-null all-false structure is explicitly valid. Then turn on
+  ; each of the 55 members in isolation and require every one to be
+  ; refused, so a partial scan cannot masquerade as complete validation.
+  dci\pEnabledFeatures = @features
+  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+  vkDestroyDevice(dev, 0)
+  featureFailures = 0
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceFeatures)
+    PokeL(@features + i, #VK_TRUE)
+    dev = #VK_NULL_HANDLE
+    If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_ERROR_FEATURE_NOT_PRESENT
+      featureFailures = featureFailures + 1
+      If dev <> #VK_NULL_HANDLE : vkDestroyDevice(dev, 0) : EndIf
+    EndIf
+    PokeL(@features + i, #VK_FALSE)
+    i = i + 4
+  Wend
+  Vkt(featureFailures = 0)
+  dci\pEnabledFeatures = 0
+  qci\queueCount = 2
+  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #ANVIL_VK_ERR_ARGS)
+  qci\queueCount = 1
+  Vkt(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+
+  queue = 99
+  vkGetDeviceQueue(dev, 1, 0, @queue)
+  Vkt(queue = #VK_NULL_HANDLE)
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  Vkt(queue <> #VK_NULL_HANDLE)
+
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  pci\queueFamilyIndex = 7
+  Vkt(vkCreateCommandPool(dev, @pci, 0, @pool) = #ANVIL_VK_ERR_ARGS)
+  pci\queueFamilyIndex = 0
+  Vkt(vkCreateCommandPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 2
+  Vkt(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  cbai\commandBufferCount = 1
+  Vkt(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
+
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\pInheritanceInfo = @bi
+  Vkt(vkBeginCommandBuffer(cmd, @bi) = #ANVIL_VK_ERR_UNSUPPORTED)
+  bi\pInheritanceInfo = 0
+  bi\flags = $80
+  Vkt(vkBeginCommandBuffer(cmd, @bi) = #ANVIL_VK_ERR_ARGS)
+  bi\flags = 0
+  Vkt(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  Vkt(vkBeginCommandBuffer(cmd, @bi) = #ANVIL_VK_ERR_STATE)
+  Vkt(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+
+  ; Parent destruction cascades and every stale handle stays dead.
+  Vkt(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
+  Vkt(AnvilVkInstanceDestroy(inst) = #VK_SUCCESS)
+  Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkDeviceQueue(dev, @queue) = #ANVIL_VK_ERR_HANDLE)
+  formatProps\linearTilingFeatures = 123
+  formatProps\optimalTilingFeatures = 123
+  formatProps\bufferFeatures = 123
+  AnvilVkFaultClear()
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  Vkt(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vkt(formatProps\linearTilingFeatures = 123 And formatProps\optimalTilingFeatures = 123 And formatProps\bufferFeatures = 123)
+  imageProps\maxExtent\width = 123
+  imageProps\maxResourceSize = 456
+  AnvilVkFaultClear()
+  Vkt(vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageProps) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vkt(imageProps\maxExtent\width = 123 And imageProps\maxResourceSize = 456)
+  Vkt(AnvilVkInstanceDestroy(inst) = #ANVIL_VK_ERR_HANDLE)
+
+  ; The test backend was never asked to execute anything here.
+  Vkt(AnvilVkTestBackendCalls() = 0)
+
+  PokeN(#VKT_OUT + 0, $564B5445) ; "VKTE"
+  PokeN(#VKT_OUT + 8, vktChecks)
+  PokeN(#VKT_OUT + 16, vktFails)
+  PokeI(#VKT_OUT + 24, inst)
+  PokeI(#VKT_OUT + 32, phys)
+  PokeI(#VKT_OUT + 40, dev)
+  PokeI(#VKT_OUT + 48, queue)
+  ProcedureReturn vktFails
+EndProcedure

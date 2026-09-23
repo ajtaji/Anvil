@@ -1,0 +1,86 @@
+; Emitted contract test for the shared CYW43 association retry controller.
+#CYW43_JOIN_RUNNING=0
+#CYW43_JOIN_JOINED=1
+#CYW43_JOIN_FAILED=2
+
+Global gate_mode.i
+Global gate_refuse_first.i
+Global gate_handshake_result.i
+Global gate_starts.i
+Global gate_polls.i
+Global gate_handshakes.i
+Global gate_progress.i
+Global gate_events.i
+Global gate_disassoc.i
+Global gate_drains.i
+Global Dim gate_event.i[8]
+Global Dim gateSSID.a[32]
+
+Procedure.i Cyw43JoinStart(*ssid,len.i,timeoutMs.i)
+  gate_starts=gate_starts+1
+  If *ssid<>@gateSSID[0] Or len<>6 Or timeoutMs<>2000 : ProcedureReturn -1 : EndIf
+  If gate_refuse_first<>0 And gate_starts=1 : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43JoinPoll(sliceMs.i)
+  gate_polls=gate_polls+1
+  If sliceMs<>20 : ProcedureReturn #CYW43_JOIN_FAILED : EndIf
+  If gate_mode=2 : ProcedureReturn #CYW43_JOIN_RUNNING : EndIf
+  ProcedureReturn #CYW43_JOIN_JOINED
+EndProcedure
+Procedure.i Cyw43Disassoc(ms.i) : gate_disassoc=gate_disassoc+1 : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43DrainEvents(ms.i) : gate_drains=gate_drains+1 : ProcedureReturn 0 : EndProcedure
+Procedure GateHandshake(*result)
+  gate_handshakes=gate_handshakes+1
+  PokeI(*result, gate_handshake_result)
+EndProcedure
+Procedure.i GateProgress() : gate_progress=gate_progress+1 : ProcedureReturn 0 : EndProcedure
+Procedure.i GateEvent(event.i,attempt.i)
+  If gate_events<8 : gate_event[gate_events]=event*10+attempt : EndIf
+  gate_events=gate_events+1
+  ProcedureReturn 0
+EndProcedure
+
+; @@ASSOC_CONSTANTS@@
+; @@SHARED_ASSOC@@
+
+Procedure GateReset()
+  gate_starts=0 : gate_polls=0 : gate_handshakes=0 : gate_progress=0
+  gate_events=0 : gate_disassoc=0 : gate_drains=0 : gate_refuse_first=0
+  gate_handshake_result=1 : gate_mode=1
+EndProcedure
+
+Procedure.i Main()
+  Protected rc.i
+  If AnvilWifiAssociateCandidate(0,6,2000,20,2,@GateHandshake,@GateProgress,@GateEvent)<>0
+    ProcedureReturn 1
+  EndIf
+  If gate_starts<>0 Or gate_disassoc<>0 : ProcedureReturn 2 : EndIf
+
+  ; First-attempt success: one join poll and one handshake callback.
+  GateReset()
+  If AnvilWifiAssociateCandidate(@gateSSID[0],6,2000,20,2,@GateHandshake,@GateProgress,@GateEvent)<>1 : ProcedureReturn 3 : EndIf
+  If gate_starts<>1 Or gate_polls<>1 Or gate_handshakes<>1 Or gate_disassoc<>1 Or gate_drains<>1 Or gate_progress<>2 : ProcedureReturn 4 : EndIf
+  If gate_events<>1 Or gate_event[0]<>(#ANVIL_WIFI_ASSOC_EVENT_KEYING*10) : ProcedureReturn 5 : EndIf
+
+  ; A refused first start is drained and retried once, without handshaking it.
+  GateReset() : gate_refuse_first=1
+  If AnvilWifiAssociateCandidate(@gateSSID[0],6,2000,20,2,@GateHandshake,@GateProgress,@GateEvent)<>1 : ProcedureReturn 6 : EndIf
+  If gate_starts<>2 Or gate_polls<>1 Or gate_handshakes<>1 Or gate_disassoc<>2 Or gate_drains<>2 Or gate_progress<>2 : ProcedureReturn 7 : EndIf
+  If gate_events<>2 : ProcedureReturn 81 : EndIf
+  If gate_event[0]<>(#ANVIL_WIFI_ASSOC_EVENT_REFUSED*10) : ProcedureReturn 82 : EndIf
+  If gate_event[1]<>(#ANVIL_WIFI_ASSOC_EVENT_KEYING*10+1) : ProcedureReturn 830000 + gate_event[1] : EndIf
+
+  ; Running forever is bounded to maxSlices for each of the two attempts.
+  GateReset() : gate_mode=2
+  If AnvilWifiAssociateCandidate(@gateSSID[0],6,2000,20,2,@GateHandshake,@GateProgress,@GateEvent)<>0 : ProcedureReturn 9 : EndIf
+  If gate_starts<>2 Or gate_polls<>4 Or gate_handshakes<>0 Or gate_disassoc<>3 Or gate_drains<>3 Or gate_progress<>6 : ProcedureReturn 10 : EndIf
+  If gate_events<>2 Or gate_event[0]<>(#ANVIL_WIFI_ASSOC_EVENT_RETRY*10) Or gate_event[1]<>(#ANVIL_WIFI_ASSOC_EVENT_FAILED*10+1) : ProcedureReturn 11 : EndIf
+
+  ; Association without a completed key handshake is not success; retry once.
+  GateReset() : gate_handshake_result=0
+  If AnvilWifiAssociateCandidate(@gateSSID[0],6,2000,20,2,@GateHandshake,@GateProgress,@GateEvent)<>0 : ProcedureReturn 12 : EndIf
+  If gate_starts<>2 Or gate_polls<>2 Or gate_handshakes<>2 Or gate_disassoc<>3 Or gate_drains<>3 Or gate_progress<>4 : ProcedureReturn 13 : EndIf
+  If gate_events<>4 Or gate_event[0]<>(#ANVIL_WIFI_ASSOC_EVENT_KEYING*10) Or gate_event[1]<>(#ANVIL_WIFI_ASSOC_EVENT_KEY_FAILED*10) Or gate_event[2]<>(#ANVIL_WIFI_ASSOC_EVENT_KEYING*10+1) Or gate_event[3]<>(#ANVIL_WIFI_ASSOC_EVENT_KEY_FAILED*10+1) : ProcedureReturn 14 : EndIf
+  ProcedureReturn 0
+EndProcedure

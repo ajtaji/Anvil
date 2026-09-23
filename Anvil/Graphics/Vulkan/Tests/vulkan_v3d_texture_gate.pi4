@@ -1,0 +1,211 @@
+; ======================================================================
+;  Emitted gate: isolated V3D optimal-texture planner and TFU seam
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; Desk-only. The five TFU functions are mocks defined before the production
+; module is included. A successful conversion must reach them in exact order;
+; every hostile input and every injected owner failure must stop before the
+; next call. There is no MMIO and no processor tiling fallback in this image.
+
+#TG_OUT   = $06000000
+#TG_MAGIC = $56545446                ; "VTTF"
+
+Global Dim tgReport.i[512]
+Global Dim tgSeq.i[16]
+Global tgChecks.i = 0
+Global tgFails.i = 0
+Global tgCalls.i = 0
+Global tgFailAt.i = 0
+Global tgA0.i = 0
+Global tgA1.i = 0
+Global tgA2.i = 0
+Global tgWait.i = 0
+
+Procedure tgCheck(ok.i)
+  tgReport[8 + tgChecks] = ok
+  tgChecks = tgChecks + 1
+  If ok = 0 : tgFails = tgFails + 1 : EndIf
+EndProcedure
+
+Procedure tgMockReset(failAt.i)
+  Protected i.i
+  tgCalls = 0
+  tgFailAt = failAt
+  tgA0 = 0
+  tgA1 = 0
+  tgA2 = 0
+  tgWait = 0
+  i = 0
+  While i < 16
+    tgSeq[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i tgMockEnter(which.i)
+  tgCalls = tgCalls + 1
+  tgSeq[tgCalls] = which
+  If tgFailAt = which : ProcedureReturn -24000 - which : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i V3dTfuBegin(width.i, height.i, texType.i)
+  tgA0 = width
+  tgA1 = height
+  tgA2 = texType
+  ProcedureReturn tgMockEnter(1)
+EndProcedure
+
+Procedure.i V3dTfuSourceRaster(address.i, strideTexels.i, bytes.i)
+  tgA0 = address
+  tgA1 = strideTexels
+  tgA2 = bytes
+  ProcedureReturn tgMockEnter(2)
+EndProcedure
+
+Procedure.i V3dTfuDest(address.i, outputFormat.i, bytes.i)
+  tgA0 = address
+  tgA1 = outputFormat
+  tgA2 = bytes
+  ProcedureReturn tgMockEnter(3)
+EndProcedure
+
+Procedure.i V3dTfuSubmit()
+  ProcedureReturn tgMockEnter(4)
+EndProcedure
+
+Procedure.i V3dTfuWait(timeoutUs.i)
+  tgWait = timeoutUs
+  ProcedureReturn tgMockEnter(5)
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure tgValid(*t.AvkV3dTextureTransfer)
+  *t\windowBase = $02000000
+  *t\windowBytes = $00100000
+  *t\sourceBase = $02001000
+  *t\sourceBytes = 1028
+  *t\destinationBase = $02002000
+  *t\destinationBytes = 2048
+  *t\width = 17
+  *t\height = 13
+  *t\sourcePitch = 80
+  *t\timeoutUs = 250000
+EndProcedure
+
+Procedure.i Main()
+  Protected p.AvkV3dTexturePlan
+  Protected t.AvkV3dTextureTransfer
+  Protected rc.i
+  Protected i.i
+
+  ; Pure geometry: small, boundary and maximum cases. The Python half of the
+  ; gate independently enumerates their UIF byte offsets.
+  tgCheck(AnvilVkV3dTexturePlanBuild(1, 1, 4, @p) = 0)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 8 And p\sourceReadBytes = 4 And p\destinationBytes = 1024)
+  tgCheck(AnvilVkV3dTexturePlanBuild(4, 4, 16, @p) = 0)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 8 And p\sourceReadBytes = 64)
+  tgCheck(AnvilVkV3dTexturePlanBuild(5, 5, 20, @p) = 0)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 8 And p\sourceReadBytes = 100)
+  tgCheck(AnvilVkV3dTexturePlanBuild(8, 8, 32, @p) = 0)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 8 And p\destinationBytes = 1024)
+  tgCheck(AnvilVkV3dTexturePlanBuild(9, 9, 36, @p) = 0)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 16 And p\destinationBytes = 2048)
+  tgCheck(AnvilVkV3dTexturePlanBuild(17, 13, 80, @p) = 0)
+  tgCheck(p\sourceStrideTexels = 20 And p\sourceReadBytes = 1028)
+  tgCheck(p\paddedWidth = 32 And p\paddedHeight = 16 And p\destinationBytes = 2048)
+  tgCheck(p\rawTextureType = 29 And p\tfuOutputFormat = 6 And p\textureMemoryFormat = 4 And p\outputPadBlocks = 0)
+  tgCheck(AnvilVkV3dTexturePlanBuild(4096, 4096, 16384, @p) = 0)
+  tgCheck(p\paddedWidth = 4096 And p\paddedHeight = 4096)
+  tgCheck(p\sourceReadBytes = 67108864 And p\destinationBytes = 67108864)
+
+  ; Planner refusals clear the caller's prior answer rather than leaving a
+  ; plausible stale layout behind.
+  p\destinationBytes = 777
+  tgCheck(AnvilVkV3dTexturePlanBuild(0, 1, 4, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(p\destinationBytes = 0 And p\width = 0)
+  tgCheck(AnvilVkV3dTexturePlanBuild(4097, 1, 16388, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(AnvilVkV3dTexturePlanBuild(1, 4097, 4, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(AnvilVkV3dTexturePlanBuild(17, 13, 67, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(AnvilVkV3dTexturePlanBuild(17, 13, 64, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(AnvilVkV3dTexturePlanBuild(17, 13, $100000000, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+  tgCheck(AnvilVkV3dTexturePlanBuild(17, 13, 80, 0) = #ANVIL_V3D_TEXTURE_ERR_ARGS)
+
+  ; Valid transfer: exact packet arguments and call order.
+  tgValid(@t)
+  tgMockReset(0)
+  rc = AnvilVkV3dTextureConvert(@t, @p)
+  tgCheck(rc = 0 And tgCalls = 5)
+  tgCheck(tgSeq[1] = 1 And tgSeq[2] = 2 And tgSeq[3] = 3 And tgSeq[4] = 4 And tgSeq[5] = 5)
+  tgCheck(tgWait = 250000)
+  tgCheck(p\sourceReadBytes = 1028 And p\destinationBytes = 2048)
+
+  ; Re-run one call at a time so the arguments saved by each mock are exact.
+  tgMockReset(1)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = -24001)
+  tgCheck(tgCalls = 1 And tgA0 = 17 And tgA1 = 13 And tgA2 = 29)
+  tgMockReset(2)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = -24002)
+  tgCheck(tgCalls = 2 And tgA0 = $02001000 And tgA1 = 20 And tgA2 = 1028)
+  tgMockReset(3)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = -24003)
+  tgCheck(tgCalls = 3 And tgA0 = $02002000 And tgA1 = 6 And tgA2 = 2048)
+  tgMockReset(4)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = -24004 And tgCalls = 4)
+  tgMockReset(5)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = -24005 And tgCalls = 5 And tgWait = 250000)
+
+  ; Hostile transfer requests. Every one must refuse before V3dTfuBegin.
+  tgValid(@t) : t\windowBase = $02000001 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\windowBytes = 0 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\windowBase = $FFFFF000 : t\windowBytes = 8192 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\sourceBase = $02001001 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgValid(@t) : t\destinationBase = $02002040 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgValid(@t) : t\sourceBytes = 1027 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\destinationBytes = 2047 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\sourceBase = $02100000 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\destinationBase = $02100000 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tgValid(@t) : t\destinationBase = $02001000 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_OVERLAP And tgCalls = 0)
+  tgValid(@t) : t\timeoutUs = 0 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgValid(@t) : t\timeoutUs = 1000001 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgValid(@t) : t\width = 0 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(0, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+  tgValid(@t) : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, 0) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
+
+  ; Maximum supported image fits two disjoint 64 MiB spans in a 256 MiB
+  ; mapped window and still carries 32-bit addresses throughout.
+  t\windowBase = $10000000
+  t\windowBytes = $10000000
+  t\sourceBase = $10000000
+  t\sourceBytes = 67108864
+  t\destinationBase = $14000000
+  t\destinationBytes = 67108864
+  t\width = 4096
+  t\height = 4096
+  t\sourcePitch = 16384
+  t\timeoutUs = 1000000
+  tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureConvert(@t, @p) = 0 And tgCalls = 5)
+
+  tgReport[0] = #TG_MAGIC
+  tgReport[1] = tgChecks
+  tgReport[2] = tgFails
+  ProcedureReturn @tgReport[0]
+EndProcedure

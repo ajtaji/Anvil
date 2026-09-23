@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "limits": {
+    "flat_draws": 4096,
+    "flat_vertices": 262144,
+    "textured_draws": 2048,
+    "textured_vertices": 98304
+  },
+  "baseline": [
+    {"op": "frame_begin"},
+    {"op": "preflight", "flat_draws": 4096, "flat_vertices": 262144},
+    {"op": "preflight", "textured_draws": 2048, "textured_vertices": 98304},
+    {"op": "atlas_replace", "generation": 2, "submit_refs": 1},
+    {"op": "atlas_complete", "generation": 2},
+    {"op": "atlas_release", "generation": 1, "count": 1},
+    {"op": "atlas_replace", "generation": 3, "submit_refs": 0},
+    {"op": "atlas_rollback", "generation": 3},
+    {"op": "target_rebind_begin", "generation": 2},
+    {"op": "target_rebind_commit", "generation": 2},
+    {"op": "target_rebind_begin", "generation": 3},
+    {"op": "target_rollback", "generation": 3},
+    {"op": "frame_end"},
+    {"op": "present_reserve", "target_generation": 2, "atlas_generation": 2, "image": 7},
+    {"op": "present_commit"},
+    {"op": "present_consume"},
+    {"op": "teardown"}
+  ],
+  "controls": [
+    {"name": "independent_capacity_boundaries", "ops": [{"op": "frame_begin"}, {"op": "preflight", "flat_draws": 4096, "flat_vertices": 262144}, {"op": "preflight", "textured_draws": 2048, "textured_vertices": 98304}, {"op": "frame_end"}]}
+  ],
+  "mutations": [
+    {"name": "partial_overflow", "expected_index": 1, "expected_error": "capacity refusal", "ops": [{"op": "frame_begin"}, {"op": "preflight", "flat_draws": 4097, "flat_vertices": 1}]},
+    {"name": "stale_descriptor", "expected_index": 2, "expected_error": "stale atlas descriptor", "ops": [{"op": "atlas_replace", "generation": 2, "submit_refs": 1}, {"op": "atlas_complete", "generation": 2}, {"op": "atlas_use", "generation": 1}]},
+    {"name": "premature_atlas_retirement", "expected_index": 2, "expected_error": "invalid atlas release", "ops": [{"op": "atlas_replace", "generation": 2, "submit_refs": 1}, {"op": "atlas_complete", "generation": 2}, {"op": "atlas_release", "generation": 1, "count": 2}]},
+    {"name": "stale_present", "expected_index": 4, "expected_error": "stale target present", "ops": [{"op": "frame_begin"}, {"op": "target_rebind_begin", "generation": 2}, {"op": "target_rebind_commit", "generation": 2}, {"op": "frame_end"}, {"op": "present_reserve", "target_generation": 1, "atlas_generation": 1, "image": 7}]},
+    {"name": "precompletion_present", "expected_index": 1, "expected_error": "present reservation refused", "ops": [{"op": "frame_begin"}, {"op": "present_reserve", "target_generation": 1, "atlas_generation": 1, "image": 7}]},
+    {"name": "duplicate_present", "expected_index": 3, "expected_error": "present reservation refused", "ops": [{"op": "frame_begin"}, {"op": "frame_end"}, {"op": "present_reserve", "target_generation": 1, "atlas_generation": 1, "image": 7}, {"op": "present_reserve", "target_generation": 1, "atlas_generation": 1, "image": 7}]},
+    {"name": "lost_target", "expected_index": 4, "expected_error": "present commit refused", "ops": [{"op": "frame_begin"}, {"op": "frame_end"}, {"op": "present_reserve", "target_generation": 1, "atlas_generation": 1, "image": 7}, {"op": "target_loss"}, {"op": "present_commit"}]},
+    {"name": "target_rollback_without_stage", "expected_index": 0, "expected_error": "target rollback is not a staged change", "ops": [{"op": "target_rollback", "generation": 2}]},
+    {"name": "leak", "expected_index": 1, "expected_error": "teardown leaked live resources", "ops": [{"op": "resource_retain", "count": 1}, {"op": "teardown"}]}
+  ]
+}

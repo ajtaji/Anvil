@@ -1,0 +1,274 @@
+; ======================================================================
+; pi4SilentReturn.pi4 - A PAYLOAD THAT SAYS NOTHING FOR A LONG TIME, THEN
+;                       COMES BACK. On purpose, and for a stated length.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHAT IT IS FOR. On 2026-09-16 three long payloads - two to five minutes
+; of compute each, printing nothing - finished and returned, and the host
+; runner reported that they had never returned. Short payloads came back
+; fine through the same path. The thing under test is therefore NOT this
+; program: it is what the monitor and the host do across a long silence.
+; This is the cheapest payload that can produce one, so the silence can be
+; measured at 30 s, 120 s or 300 s without spending a Kokoro run on it.
+;
+;   PureMetalForge.exe --compile
+;        RaspberryPi4/Examples/Diagnostics/pi4SilentReturn.pi4
+;        -t pi4 --load-addr 0x700000 --stack-addr 0x3000000
+;        --entry-returns --wants-services -o _work/silent.img
+;
+; THE LENGTH AND THE MODE ARE READ FROM MEMORY, NOT BUILT IN, so one image
+; covers every case and nothing needs rebuilding between runs. Before the
+; run, at the prompt:
+;
+;   fill 1500000 4D505753 1     the magic, 'SWPM'
+;   fill 1500004 <seconds> 1    how long to stay silent, hex
+;   fill 1500008 <mode> 1       what to do while silent, below
+;
+; With no magic there it waits 30 seconds in mode 0, so a forgotten `fill`
+; is a short ordinary run rather than a surprise.
+;
+;   mode 0   wait, petting the deadman through the service table
+;   mode 1   the same, with its own caches on and the four-core service
+;            running a job on every core throughout the wait
+;   mode 2   wait WITHOUT petting - an armed deadman shorter than the wait
+;            resets the board, which is that outcome on demand
+;   mode 3   wait, petting, then read an address past the end of the
+;            physical address space - a processor exception on demand
+;
+; THE RESULT BLOCK at $01400000, so what happened can be read back even
+; when the return line was not:
+;
+;   +0   'SWRS' magic          +8   the seconds it was asked for
+;   +16  the mode              +24  the counter at entry
+;   +32  the counter at the end of the wait
+;   +40  wait iterations       +48  four-core jobs run (mode 1)
+;   +56  jobs that failed      +64  'DONE' - written last
+; ======================================================================
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#SR_PARAM      = $01500000
+#SR_PARAM_MAGIC = $4D505753          ; 'SWPM'
+#SR_RESULT     = $01400000
+#SR_MAGIC      = $53525753           ; 'SWRS'
+#SR_DONE       = $454E4F44           ; 'DONE'
+#SR_TABLES     = $00600000           ; mode 1's own identity map
+
+#SR_DEFAULT_SECONDS = 30
+#SR_MAX_SECONDS     = 3600
+
+#SVC_MAGIC     = $53564E41           ; 'ANVS'
+#SVC_HDR_BYTES = 16
+#SLOT_PET      = 6
+#SLOT_PARCORES = 184
+#SLOT_PARRUN   = 185
+
+#SR_PARTS = 4
+#SR_SLOTS = 256
+
+Global gSvcTable.i
+Global *svc_pet
+Global *svc_parcores
+Global *svc_parrun
+Global Dim sr_args.i[#SR_PARTS * 4]
+Global Dim sr_out.i[#SR_SLOTS]
+
+; x0 still holds the table at Main's first statement.
+Procedure CaptureX0()
+  ASM
+    adrp x1, global_gsvctable
+    add  x1, x1, #:lo12:global_gsvctable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+Procedure.i SrTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i SrHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i Slot(i.i)
+  ProcedureReturn PeekI(gSvcTable + #SVC_HDR_BYTES + i * 8)
+EndProcedure
+
+Procedure.i Hdr32(off.i)
+  ProcedureReturn PeekA(gSvcTable + off) | (PeekA(gSvcTable + off + 1) << 8) | (PeekA(gSvcTable + off + 2) << 16) | (PeekA(gSvcTable + off + 3) << 24)
+EndProcedure
+
+Procedure.i Param32(off.i)
+  ProcedureReturn PeekA(#SR_PARAM + off) | (PeekA(#SR_PARAM + off + 1) << 8) | (PeekA(#SR_PARAM + off + 2) << 16) | (PeekA(#SR_PARAM + off + 3) << 24)
+EndProcedure
+
+Procedure Put(word.i, v.i)
+  PokeI(#SR_RESULT + word * 8, v)
+EndProcedure
+
+Procedure Pet()
+  If *svc_pet <> 0
+    svc_pet()
+  EndIf
+EndProcedure
+
+; One partition of the four-core job: fill its range and return.
+Procedure.i SrWorker(*p.i)
+  Protected outBase.i
+  Protected first.i
+  Protected last.i
+  Protected i.i
+  If *p = 0
+    ProcedureReturn 1
+  EndIf
+  outBase = PeekI(*p)
+  first = PeekI(*p + 8)
+  last = PeekI(*p + 16)
+  If outBase = 0 Or first < 0 Or last > #SR_SLOTS Or first > last
+    ProcedureReturn 2
+  EndIf
+  i = first
+  While i < last
+    PokeI(outBase + i * 8, i * 7 + 3)
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i SrJob(count.i)
+  Define i.i
+  For i = 0 To #SR_SLOTS - 1
+    sr_out[i] = 0
+  Next
+  For i = 0 To #SR_PARTS * 4 - 1
+    sr_args[i] = 0
+  Next
+  For i = 0 To count - 1
+    sr_args[i * 4 + 0] = @sr_out[0]
+    sr_args[i * 4 + 1] = #SR_SLOTS * i / count
+    sr_args[i * 4 + 2] = #SR_SLOTS * (i + 1) / count
+    sr_args[i * 4 + 3] = i
+  Next
+  If svc_parrun(@SrWorker, @sr_args[0], 32, count) <> 0
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To #SR_SLOTS - 1
+    If sr_out[i] <> i * 7 + 3
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define seconds.i
+  Define mode.i
+  Define hz.i
+  Define t0.i
+  Define deadline.i
+  Define nextPet.i
+  Define loops.i
+  Define jobs.i
+  Define bad.i
+  Define cores.i
+  Define cached.i
+
+  CaptureX0()
+
+  seconds = #SR_DEFAULT_SECONDS
+  mode = 0
+  If Param32(0) = #SR_PARAM_MAGIC
+    seconds = Param32(4)
+    mode = Param32(8)
+  EndIf
+  If seconds < 1 Or seconds > #SR_MAX_SECONDS
+    seconds = #SR_DEFAULT_SECONDS
+  EndIf
+
+  Put(0, #SR_MAGIC)
+  Put(1, seconds)
+  Put(2, mode)
+  Put(3, 0)
+  Put(4, 0)
+  Put(5, 0)
+  Put(6, 0)
+  Put(7, 0)
+  Put(8, 0)
+
+  *svc_pet = 0
+  *svc_parcores = 0
+  *svc_parrun = 0
+  If gSvcTable <> 0
+    If Hdr32(0) = #SVC_MAGIC
+      *svc_pet = Slot(#SLOT_PET)
+      If Hdr32(12) > #SLOT_PARRUN
+        *svc_parcores = Slot(#SLOT_PARCORES)
+        *svc_parrun = Slot(#SLOT_PARRUN)
+      EndIf
+    EndIf
+  EndIf
+
+  cached = 0
+  cores = 1
+  If mode = 1 And *svc_parrun <> 0
+    If MmuBuildTables(#SR_TABLES) = 0
+      MmuEnableCached()
+      If MmuEnabled() = 1
+        cached = 1
+        cores = svc_parcores()
+        If cores < 1 Or cores > #SR_PARTS
+          cores = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  hz = SrHz()
+  If hz <= 0
+    hz = 54000000
+  EndIf
+  t0 = SrTicks()
+  Put(3, t0)
+  deadline = t0 + seconds * hz
+  nextPet = t0
+  loops = 0
+  jobs = 0
+  bad = 0
+  While SrTicks() < deadline
+    If mode <> 2
+      If SrTicks() >= nextPet
+        Pet()
+        nextPet = SrTicks() + hz
+      EndIf
+    EndIf
+    If cached <> 0
+      If SrJob(cores) = 0
+        bad = bad + 1
+      EndIf
+      jobs = jobs + 1
+    EndIf
+    loops = loops + 1
+  Wend
+  Put(4, SrTicks())
+  Put(5, loops)
+  Put(6, jobs)
+  Put(7, bad)
+
+  If cached <> 0
+    MmuDisableCachedFlushed()
+  EndIf
+
+  If mode = 3
+    Put(8, #SR_DONE)
+    ; Past the end of the 44-bit physical address space: an address size
+    ; fault with the MMU off, which is a synchronous exception at once.
+    ProcedureReturn PeekI($FFFFFFFFFFF00000)
+  EndIf
+
+  Put(8, #SR_DONE)
+  ProcedureReturn seconds
+EndProcedure

@@ -1,0 +1,62 @@
+; Emitted-code tests for the pure Pi 3 board/radio profile resolver.
+Global gate_gpio.i
+Global gate_gpio_state.i
+Global gate_gpio_calls.i
+
+Procedure.i Pi3FirmwareGpioSetState(gpioId.i, state.i)
+  gate_gpio = gpioId
+  gate_gpio_state = state
+  gate_gpio_calls = gate_gpio_calls + 1
+  ProcedureReturn 1
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/wifi_profile.pi3"
+
+Procedure.i Main()
+  Define r.i
+
+  ; Firmware revision $00A22082 is a Pi 3 Model B (new-style type 8).
+  r = Pi3WifiBoardProfile($00A22082)
+  If r <> #PI3_WIFI_BOARD_B : ProcedureReturn 1 : EndIf
+  If Pi3WifiBoardSdioBase() <> $3F300000 Or Pi3WifiBoardBusWidth() <> 4 : ProcedureReturn 2 : EndIf
+  If Pi3WifiBoardResetLine() <> 1 Or Pi3WifiBoardResetActiveLow() <> 1 Or Pi3WifiBoardResetWired() <> 1 : ProcedureReturn 3 : EndIf
+  If Pi3WifiBoardSetReset(1) <> 1 Or gate_gpio <> 129 Or gate_gpio_state <> 0 : ProcedureReturn 26 : EndIf
+  If Pi3WifiBoardSetReset(0) <> 1 Or gate_gpio <> 129 Or gate_gpio_state <> 1 : ProcedureReturn 27 : EndIf
+  If Pi3WifiBoardSetReset(2) <> 0 : ProcedureReturn 28 : EndIf
+
+  ; brcmfmac sdio.c: 43430 A0 bit 0, A1 bit 1, B0 mask bits 2..31.
+  If Pi3WifiResolveProfile($00A22082, $A9A6, 0) <> #PI3_WIFI_RADIO_43430_A0 : ProcedureReturn 4 : EndIf
+  If Pi3WifiRadioCoreFamily() <> #PI3_WIFI_CORE_CM3 : ProcedureReturn 5 : EndIf
+  If Pi3WifiResolveProfile($00A22082, $A9A6, 1) <> #PI3_WIFI_RADIO_43430_A1 : ProcedureReturn 6 : EndIf
+  If Pi3WifiResolveProfile($00A22082, $A9A6, 2) <> #PI3_WIFI_RADIO_43430_B0 : ProcedureReturn 7 : EndIf
+  If Pi3WifiResolveProfile($00A22082, $A9A6, 31) <> #PI3_WIFI_RADIO_43430_B0 : ProcedureReturn 8 : EndIf
+
+  ; Pi 3B+ type 13 and 3A+ type 14 use the exact 4345 revision masks.
+  If Pi3WifiBoardProfile($008000D0) <> #PI3_WIFI_BOARD_BPLUS : ProcedureReturn 9 : EndIf
+  If Pi3WifiBoardResetLine() <> 1 Or Pi3WifiBoardResetWired() <> 1 : ProcedureReturn 10 : EndIf
+  If Pi3WifiResolveProfile($008000D0, $4345, 6) <> #PI3_WIFI_RADIO_43455 : ProcedureReturn 11 : EndIf
+  If Pi3WifiRadioCoreFamily() <> #PI3_WIFI_CORE_CR4 : ProcedureReturn 12 : EndIf
+  If Pi3WifiResolveProfile($008000D0, $4345, 9) <> #PI3_WIFI_RADIO_43456 : ProcedureReturn 13 : EndIf
+  If Pi3WifiResolveProfile($008000D0, $4345, 5) <> 0 : ProcedureReturn 14 : EndIf
+  If Pi3WifiRadioCoreFamily() <> 0 : ProcedureReturn 15 : EndIf
+
+  If Pi3WifiBoardProfile($008000E0) <> #PI3_WIFI_BOARD_APLUS : ProcedureReturn 16 : EndIf
+  If Pi3WifiBoardResetWired() <> 0 : ProcedureReturn 17 : EndIf
+  r = gate_gpio_calls
+  If Pi3WifiBoardSetReset(1) <> 0 Or gate_gpio_calls <> r : ProcedureReturn 29 : EndIf
+  If Pi3WifiResolveProfile($008000E0, $4345, 10) <> #PI3_WIFI_RADIO_43455 : ProcedureReturn 18 : EndIf
+
+  ; Unknown board, legacy revision, wrong board/chip pairing, and unknown
+  ; chip/revision all fail closed and clear radio/core selection state.
+  If Pi3WifiBoardProfile($00800100) <> 0 : ProcedureReturn 19 : EndIf
+  If Pi3WifiBoardSdioBase() <> 0 : ProcedureReturn 20 : EndIf
+  r = gate_gpio_calls
+  If Pi3WifiBoardSetReset(1) <> 0 Or gate_gpio_calls <> r : ProcedureReturn 30 : EndIf
+  If Pi3WifiBoardProfile($00000008) <> 0 : ProcedureReturn 21 : EndIf
+  If Pi3WifiResolveProfile($00A22082, $4345, 6) <> 0 : ProcedureReturn 22 : EndIf
+  If Pi3WifiRadioCoreFamily() <> 0 : ProcedureReturn 23 : EndIf
+  If Pi3WifiResolveProfile($00A22082, $A9A6, 32) <> 0 : ProcedureReturn 24 : EndIf
+  If Pi3WifiResolveProfile($008000D0, $A9A6, 0) <> 0 : ProcedureReturn 25 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

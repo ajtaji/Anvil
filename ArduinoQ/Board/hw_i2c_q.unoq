@@ -1,0 +1,335 @@
+; ======================================================================
+;  hw_i2c_q.pi4 - the Arduino UNO Q HwI2c* backend. THE BOARD SIDE OF THE
+;  HwI2c* SEAM declared in Anvil/Hal/hal.pbi; the `i2c` command above it
+;  (Anvil/Core/i2c_cmd.pbi) knows only bus numbers, 7-bit addresses, byte
+;  buffers and the portable #HW_I2C_* codes - never a GENI register.
+;
+;  Thin wrappers over ArduinoQ/Lib/geni_i2c.unoq, whose header carries all
+;  the register-level reasoning: the QUP wrapper at $04AC0000, the six
+;  serial engines at $04A80000 + n*$4000, the protocol-firmware question
+;  and how it was measured, the SCL counter tables, the FIFO packing and
+;  the deliberate absence of repeated start and DMA.
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * ArduinoQ/Board/hwtimer_q.unoq  BEFORE Lib/geni_i2c.pi4 - every wait
+;      in the driver is bounded by HwTimerUs().
+;    * ArduinoQ/Lib/geni_i2c.unoq     BEFORE this file - it defines
+;      GeniI2cInit/Probe/Read/Write and the #GENI_I2C_* codes translated
+;      here. A library never includes a library (house rule 10), so
+;      board.pi4 lists both.
+;    * Anvil/Hal/hal.pbi             BEFORE this file - the #HW_I2C_*
+;      vocabulary these return.
+;
+;  WHY MAP THE CODES EXPLICITLY when #GENI_I2C_* happen to equal
+;  #HW_I2C_*. The same reason RaspberryPi4/Board/hw_i2c.pi4 does it: two
+;  enumerations defined in different files for different reasons, and a
+;  future divergence must fail HERE, visibly, rather than silently
+;  mislabelling a bus error as success.
+;
+; ----------------------------------------------------------------------
+;  WHICH BUSES THIS BOARD HAS, AND WHY THE NUMBERS ARE WHAT THEY ARE
+; ----------------------------------------------------------------------
+;  The QCM2290 has ONE QUP wrapper with six serial engines, and what each
+;  engine IS depends on the protocol firmware the boot chain loaded into
+;  it. Read off this board (see the driver header for the raw register
+;  values):
+;
+;      SE0  I2C    -> exposed here as bus 0
+;      SE1  I2C    -> exposed here as bus 1   <- the board's real bus
+;      SE2  UART
+;      SE3  UART
+;      SE4  UART   <- the firmware console. NOT offered, at any number.
+;      SE5  SPI
+;
+;  BUS NUMBER = ENGINE NUMBER, deliberately, because that is also what
+;  Linux calls them on this board: /sys/bus/i2c/devices/i2c-0 is
+;  4a80000.i2c (SE0) and i2c-1 is 4a84000.i2c (SE1). So an address seen
+;  in `i2c probe 1` under Anvil is the same address `i2cdetect -y 1`
+;  shows under Debian, and the two views of the board can be compared
+;  without a translation table. The Pi 4 backend makes the same choice
+;  for the same reason.
+;
+;  ONLY 0 AND 1 ARE VALID. Any other number gets the honest
+;  #HW_I2C_NOBUS refusal - including 4, which IS an engine but is a UART
+;  carrying the console. That refusal is enforced twice over: here by
+;  HwI2cBusValid, and again inside the driver, which reads the engine's
+;  firmware protocol and declines anything that is not I2C. Belt and
+;  braces, because the cost of getting it wrong is the transcript
+;  vanishing mid-command with no way to see why.
+;
+;  WHAT IS ON BUS 1 - from the running board's own device tree, not
+;  guessed. Eight devices answer:
+;      $58  anx7625, the MIPI-DSI to DisplayPort bridge for the USB-C
+;           port. It is the one with a name in the device tree, so it is
+;           the device a bus scan should be checked against.
+;      $2A $2C $38 $39 $3D $3F $42   enumerated but unnamed.
+;  Bus 0 is a real I2C engine with nothing enumerated on it.
+;
+; ----------------------------------------------------------------------
+;  #CAP_I2C IS 1 ON THIS BOARD - and here is exactly what that claims
+; ----------------------------------------------------------------------
+;  It claims the engine is reachable and the transaction shape is right.
+;  It does NOT claim the bus has been proven at every speed, and there is
+;  one honest gap worth naming at the seam rather than burying:
+;
+;  ANVIL MAKES NO INTERCONNECT VOTE. Linux votes for QUP core bandwidth
+;  before every transfer, and on this SoC that vote is really a clock
+;  enable delivered by an RPM message, not a register write - Anvil has
+;  no RPM IPC. If the boot chain left no standing vote, transfers stall.
+;  The driver turns a stall into #HW_I2C_TIMEOUT within 50 ms rather than
+;  hanging, so the failure is loud and the monitor survives it; but a
+;  board where every address times out while the engine reports itself
+;  present is showing THAT, not a wiring fault. See the driver header.
+; ======================================================================
+
+; The engines this board offers as I2C buses.
+#Q_I2C_BUS_SE0 = 0
+#Q_I2C_BUS_SE1 = 1
+
+; The bus `i2c` uses when the operator names none: bus 1, serial engine
+; 1, the one with devices on it. Spelled as the literal because a
+; constant here may not be declared in terms of another constant.
+#Q_I2C_DEFAULT_BUS = 1
+
+; The rate a bus comes up at. 100 kHz is the conservative choice for a
+; bus whose seven unnamed devices have unknown timing tolerance.
+#Q_I2C_DEFAULT_HZ = 100000
+
+; ----------------------------------------------------------------------
+;  QI2cMapCode - Lib/geni_i2c.pi4's #GENI_I2C_* into hal.pi4's #HW_I2C_*.
+; ----------------------------------------------------------------------
+Procedure.i QI2cMapCode(c.i)
+  Select c
+    Case #GENI_I2C_OK
+      ProcedureReturn #HW_I2C_OK
+    Case #GENI_I2C_NACK
+      ProcedureReturn #HW_I2C_NACK
+    Case #GENI_I2C_CLKT
+      ProcedureReturn #HW_I2C_CLKT
+    Case #GENI_I2C_TIMEOUT
+      ProcedureReturn #HW_I2C_TIMEOUT
+    Case #GENI_I2C_ARG
+      ProcedureReturn #HW_I2C_ARG
+    Case #GENI_I2C_NOBUS
+      ProcedureReturn #HW_I2C_NOBUS
+  EndSelect
+  ; An unmapped value is a backend bug, not a bus fault. Surface it as a
+  ; timeout - the "something is wrong we cannot name" code - rather than
+  ; letting an unknown value fall through as if it were success.
+  ProcedureReturn #HW_I2C_TIMEOUT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cDefaultBus() - the bus `i2c` uses when none is named.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cDefaultBus()
+  ProcedureReturn #Q_I2C_DEFAULT_BUS
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cBusValid(bus) - 1 if this board drives that bus, else 0.
+;
+;  Two conditions, and BOTH are required. The number must be one this
+;  board offers, AND the engine behind it must actually be an I2C engine
+;  right now. The second is not paranoia: the protocol is a property of
+;  firmware in the engine's RAM, so it is a RUN-TIME fact, and an engine
+;  that reads back as UART - or does not read back at all because its
+;  clock is off - must not be handed to the transfer path.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cBusValid(bus.i)
+  If bus <> #Q_I2C_BUS_SE0 And bus <> #Q_I2C_BUS_SE1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn GeniI2cPresent(bus)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cUp(bus) - bring the bus up. 1 on success, 0 for a bus this board
+;  does not have. Idempotent, so the command may call it before every
+;  operation without tracking state.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cUp(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  If GeniI2cGetSpeed(bus) > 0
+    ProcedureReturn 1          ; already configured; leave the rate alone
+  EndIf
+  ProcedureReturn GeniI2cInit(bus, #Q_I2C_DEFAULT_HZ)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cProbe(bus, addr) - is a device answering at this 7-bit address?
+;  #HW_I2C_OK present, #HW_I2C_NACK absent, #HW_I2C_TIMEOUT bus fault,
+;  #HW_I2C_NOBUS for a bus this board does not have.
+;
+;  The probe is an ADDRESS-ONLY cycle - no data byte is written and none
+;  is read. On a bus carrying a display bridge and seven unidentified
+;  devices that distinction is not academic: a scan that writes a byte is
+;  a scan that can move a device's register pointer. See the driver.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cProbe(bus.i, addr.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  If HwI2cUp(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn QI2cMapCode(GeniI2cProbe(bus, addr))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cWrite(bus, addr, *buf, n) - write n bytes. One transaction
+;  (START, address+W, bytes, STOP).
+; ----------------------------------------------------------------------
+Procedure.i HwI2cWrite(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  If HwI2cUp(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn QI2cMapCode(GeniI2cWrite(bus, addr, *buf, n))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cRead(bus, addr, *buf, n) - read n bytes. One transaction
+;  (START, address+R, n bytes, STOP).
+;
+;  A REGISTER READ (write a pointer, then read) is composed by the CALLER
+;  from HwI2cWrite then HwI2cRead, which puts a STOP between the two.
+;  This backend offers no repeated-start combined read, deliberately and
+;  for the reason the driver header gives - the same limitation the Pi 4
+;  backend has, so the seam behaves the same way on both boards.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cRead(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  If HwI2cUp(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn QI2cMapCode(GeniI2cRead(bus, addr, *buf, n))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cSetSpeed(bus, hz) - set the SCL. Returns the achieved rate in Hz,
+;  or a negative #HW_I2C_* code.
+;
+;  ONLY 100 kHz, 400 kHz AND 1 MHz ARE ACCEPTED, and a request for
+;  anything else is refused rather than rounded. The SCL high/low/cycle
+;  counts come from a table the vendor characterised at exactly those
+;  three rates; interpolating between them would be inventing timing
+;  nobody has validated, on a bus with an unknown mix of devices.
+;  Refusing is the loud-error answer (vault rule 3).
+; ----------------------------------------------------------------------
+Procedure.i HwI2cSetSpeed(bus.i, hz.i)
+  Define r.i
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  r = GeniI2cSetSpeed(bus, hz)
+  If r <= 0
+    ProcedureReturn QI2cMapCode(r)
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cGetSpeed(bus) - the SCL the bus is set to, in Hz.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cGetSpeed(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn GeniI2cGetSpeed(bus)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CLOCK SEAM - AND THIS BOARD ANSWERS "THAT IS NOT HOW MY RATE
+;  WORKS", WHICH IS A DIFFERENT REFUSAL FROM THE PIN SEAM'S
+;
+;  The Pi 4 answers these with a core clock it queries and a divider
+;  range it computes, because its rate really is one number divided by
+;  another and both are knowable at run time (forum 622). This board's
+;  rate is not that shape at all:
+;
+;    * THERE IS NO DIVIDER TO NAME. A GENI engine's SCL comes from three
+;      counter fields - high, low and cycle - loaded from a table the
+;      vendor characterised at exactly 100 kHz, 400 kHz and 1 MHz. The
+;      rate is a table lookup, not a division, so "the clock feeding the
+;      divider" has no value on this part and 0 is the honest answer.
+;    * THE ACCEPTED RATES ARE A SET, NOT A RANGE. Reporting a minimum of
+;      100000 and a maximum of 1000000 would be true at the ends and a
+;      lie in the middle: 250000 is inside that range and is refused,
+;      because interpolating between characterised points would be
+;      inventing timing nobody validated. A range that contains rates the
+;      board will not accept is worse than no range, so 0 - "this board
+;      will not say" - is what the core is given, and the core then
+;      prints no range instead of one it would have to walk back.
+;
+;  The existing refusal is unchanged and still correct: an unsupported
+;  rate comes back #HW_I2C_ARG from HwI2cSetSpeed above, which the core
+;  renders as an out-of-range argument. It never returns #HW_I2C_RANGE,
+;  because that code means "your rate is fine but this divider cannot
+;  reach it from its clock", and there is no such divider here.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cSourceHz(bus.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwI2cSourceWhere(bus.i)
+  ProcedureReturn 0                  ; no source to describe - see above
+EndProcedure
+
+Procedure.i HwI2cRateMin(bus.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwI2cRateMax(bus.i)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PIN SEAM - AND THIS BOARD ANSWERS "I CANNOT SAY", ON PURPOSE
+;
+;  The Pi 4 backend answers these four with GPIO 2 and 3 on alt0, and the
+;  core prints the pins and reads the pads to decide whether a stalled
+;  transfer really is a wedged bus (forum 584). This board cannot join in,
+;  and pretending otherwise would be worse than saying nothing:
+;
+;    * THE PINS ARE NOT ON THE HEADER. All 32 header pins on an UNO Q
+;      belong to the STM32U585, not to the QCM2290. SE0's and SE1's SDA
+;      and SCL are SoC pads routed on the board to the on-board devices;
+;      there is no pin an operator can put a probe on, and no
+;      `gpio status` that would show them.
+;    * THE PAD LEVEL IS NOT READABLE THE WAY THE Pi 4'S IS. Reading a GENI
+;      pad means reading TLMM for a pin this driver never claims, on a part
+;      where an MMIO read of an unclocked block does not fault - it STALLS
+;      THE BUS and costs a power cycle (see the address-safety seam). A
+;      speculative read taken to make a message prettier is exactly the
+;      trade this project does not make.
+;    * AND A STALL HERE HAS A DIFFERENT CAUSE ANYWAY. When every address on
+;      this board times out, the thing to suspect is the missing
+;      interconnect vote named in the header above, not stuck lines. A pad
+;      reading would be answering a question nobody asked.
+;
+;  So: -1 from the three numeric answers and 0 from the name. The core then
+;  says plainly that the pads could not be read, and gives the verdict it
+;  can actually support instead of one this board would have to invent.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cPin(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwI2cPinFunc(bus.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwI2cPinReady(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwI2cPadLevel(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure

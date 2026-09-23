@@ -1,0 +1,242 @@
+; pi4XhciHw.pi4 - the XHCI driver against the REAL VL805.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY THIS EXISTS SEPARATELY FROM pi4XhciSelfTest.pi4, and it is worth
+; being clear because confusing the two cost a reboot.
+;
+; pi4XhciSelfTest is an ORACLE GATE. It defines its own PcieCfgRead32 and
+; friends over a FAKE config space at $700000000 that the Python harness
+; models, and it is run by tools/a64/a64_xhci_check.py. That is exactly
+; what it should be: it exercises the driver's state machine against a
+; controller that can be made to misbehave on demand, and it found a real
+; cycle-bit race that way.
+;
+; It is NOT a hardware test, and running it on the board is how this
+; afternoon lost a boot: on silicon $700000000 is backed by nothing, so
+; the first config read took a data abort and reset the CPU. The mistake
+; was mine and not the file's - the file says what it is.
+;
+; THIS program is the other half: the same driver, the REAL pcie.pi4, and
+; the actual VL805 on the actual bus.
+;
+; THE BUS MUST BE BROUGHT UP BY THE CALLER, in this order, and each step
+; was learned by getting it wrong on hardware:
+;
+;   PcieInit()            reset, train the link, map the outbound window
+;   PcieEnumerate()       give the endpoint a BAR, enable memory space
+;                         and bus master, AND program the root port's
+;                         forwarding window
+;   PcieEndpointReady()   check before dereferencing anything
+;
+; Skipping the second gave a data abort - PERST had wiped the BAR the
+; firmware left behind. Doing it without the bridge half gave $DEADDEAD,
+; the root complex's AXI read-error pattern, because the bridge was still
+; forwarding the firmware's old range at $C0000000.
+;
+;   pmfc pi4XhciHw.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Dec(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define p.i
+  Define n.i
+  Define sp.i
+
+  PrintNl()
+  UartWriteStr("=== XHCI on the real VL805 ===")
+  PrintNl()
+
+  ; ---- the bus -------------------------------------------------------
+  If PcieInit() = 0
+    UartWriteStr("!! PCIe: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("!! enumerate: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEndpointReady() = 0
+    UartWriteStr("!! endpoint not addressable - refusing to go further")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Row("BAR cpu      ", PcieBarCpu(), 16)
+
+  ; ---- READ THE CAPABILITIES BEFORE ANYTHING IS STARTED ---------------
+  ; Ordered this way deliberately. XhciInit both CONFIGURES and STARTS the
+  ; controller, and a started controller is a DMA master. The previous run
+  ; got as far as "XhciInit ... ok" and then took a synchronous abort
+  ; while printing - so the facts that would explain it were still
+  ; unprinted when the board died, and each attempt costs a reboot.
+  ;
+  ; These are plain reads of the capability block through the BAR. They
+  ; need no driver state and cannot start anything.
+  Define cap0.i
+  Define hcs1.i
+  Define hcs2.i
+  Define hcc1.i
+  Define pgsz.i
+  Define base.i
+  base = PcieBarCpu()
+  cap0 = PeekN(base)
+  hcs1 = PeekN(base + 4)
+  hcs2 = PeekN(base + 8)
+  hcc1 = PeekN(base + 16)
+  Row("CAPLENGTH/VER", cap0, 8)
+  Row("HCSPARAMS1   ", hcs1, 8)
+  Row("HCSPARAMS2   ", hcs2, 8)
+  Row("HCCPARAMS1   ", hcc1, 8)
+  Dec("max ports    ", (hcs1 >> 24) & $FF)
+  Dec("max slots    ", hcs1 & $FF)
+
+  ; HCS_MAX_SCRATCHPAD is TWO fields of HCSPARAMS2 spliced together -
+  ; xhci.h: ((p >> 16) & 0x3e0) | ((p >> 27) & 0x1f). Reading only the
+  ; top five bits is the classic way to get a plausible small number.
+  Dec("scratchpads  ", ((hcs2 >> 16) & $3E0) | ((hcs2 >> 27) & $1F))
+
+  ; PAGESIZE is in the OPERATIONAL block, at CAPLENGTH + $08, and bit 0
+  ; set means 4 KiB. The scratchpad stride depends on it, so a controller
+  ; wanting something else silently invalidates every page address.
+  pgsz = PeekN(base + (cap0 & $FF) + 8)
+  Row("PAGESIZE     ", pgsz, 8)
+  Dec("  page bytes ", 4096)
+  UartWriteStr("  PAGESIZE bit0 (4 KiB): ")
+  If (pgsz & 1) <> 0
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("NO - the scratchpad stride is wrong and everything after it")
+  EndIf
+  PrintNl()
+  UartDrain()
+
+  ; ---- the controller -------------------------------------------------
+  ; Drained before the first thing that can abort, so the last line out
+  ; is not still sitting in the PL011 FIFO if this resets the board.
+  UartWriteStr("XhciInit ... ")
+  UartDrain()
+  If XhciInit() = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    UartWriteStr("  ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    Row("USBSTS       ", XhciLastSts(), 8)
+    ; The parameters ARE valid even when init refuses - the refusal
+    ; happens after the capability registers are read. Printing them
+    ; on the failure path is what turns "it did not work" into a
+    ; number to act on, and costs one boot instead of two.
+    Row("HCIVERSION   ", XhciVersion(), 4)
+    Dec("CAPLENGTH    ", XhciCapLength())
+    Dec("max slots    ", XhciMaxSlots())
+    Dec("max ports    ", XhciMaxPorts())
+    Dec("scratchpads  ", XhciScratchpads())
+    Dec("context size ", XhciContextSize())
+    Row("HCCPARAMS1   ", XhciHccParams1(), 8)
+    ProcedureReturn 2
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+
+  Row("HCIVERSION   ", XhciVersion(), 4)
+  Dec("CAPLENGTH    ", XhciCapLength())
+  Dec("max slots    ", XhciMaxSlots())
+  Dec("max ports    ", XhciMaxPorts())
+  Dec("max intrs    ", XhciMaxIntrs())
+  Dec("scratchpads  ", XhciScratchpads())
+  Dec("context size ", XhciContextSize())
+  Row("HCCPARAMS1   ", XhciHccParams1(), 8)
+  Row("USBSTS       ", XhciUsbSts(), 8)
+  Row("USBCMD       ", XhciUsbCmd(), 8)
+
+  ; ---- a command the controller has to answer -------------------------
+  ; A No-Op does nothing except produce a completion event, which is the
+  ; cheapest possible proof that the command ring, the doorbell and the
+  ; event ring all work together. If this passes, DMA in both directions
+  ; is working - the controller read our TRB and wrote our event.
+  PrintNl()
+  UartWriteStr("No-Op command ... ")
+  UartDrain()
+  If XhciNoOp() = 0
+    UartWriteStr("FAILED: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    Row("completion   ", XhciLastComp(), 8)
+    ProcedureReturn 3
+  EndIf
+  UartWriteStr("ok - the rings work in both directions")
+  PrintNl()
+
+  ; ---- what is plugged in ---------------------------------------------
+  PrintNl()
+  UartWriteStr("ports:")
+  PrintNl()
+  n = XhciMaxPorts()
+  For p = 1 To n
+    UartWriteStr("  port ")
+    PrintDec(p)
+    UartWriteStr("  PORTSC $")
+    PutHexN(XhciPortSc(p), 8)
+    If XhciPortConnected(p) <> 0
+      sp = XhciPortSpeed(p)
+      UartWriteStr("  CONNECTED, ")
+      UartWriteStr(XhciSpeedText(sp))
+    Else
+      UartWriteStr("  empty")
+    EndIf
+    PrintNl()
+  Next
+
+  p = XhciFirstConnectedPort()
+  PrintNl()
+  If p = 0
+    UartWriteStr("=== controller up, nothing plugged in ===")
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  UartWriteStr("first device on port ")
+  PrintDec(p)
+  PrintNl()
+  UartWriteStr("=== controller up and a device is present ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

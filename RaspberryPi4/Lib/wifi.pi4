@@ -1,0 +1,3981 @@
+; ======================================================================
+;  wifi.pi4 - the radio, brought into the monitor.
+;
+;  Asked for 2026-08-28: "we need the wifi code added to anvil. it need to
+;  boot and check for known access points it could connect to by the
+;  file on the usb stick".
+;
+;  This is the SHIPPABLE version of the flow that pi4WifiScan.pi4,
+;  pi4WifiJoin.pi4 and pi4WifiKey.pi4 proved on the bench. It reads the
+;  firmware blobs off the boot stick, brings the CYW43455 up, scans, and
+;  reports which of the networks stored in the settings table are on the
+;  air. The KEYED JOIN (the host four-way handshake) is milestone 2 and
+;  is added on top of this once this bring-up is proven inside Anvil.
+;
+;  TWO THINGS THIS FILE KNOWS THAT THE PAYLOADS LEARNED THE HARD WAY:
+;
+;  1. THE HDMI FRAMEBUFFER FIGHTS THE MAILBOX. pi4WifiKey.pi4 measured
+;     the EMMC-clock mailbox query returning zero with Anvil's
+;     framebuffer up, and told the operator to `screen off` first. So
+;     WifiClockHz() RETRIES the query, and the caller that runs at boot
+;     is expected to run BEFORE the screen is turned on, where the
+;     mailbox is uncontended. From the prompt, if the clock will not
+;     answer, this says `screen off` rather than guessing a base clock -
+;     sdio.pi4 refuses to guess and so does this.
+;
+;  2. THE BLOBS ARE READ ONCE. gWifiLoaded and gWifiUp gate the two
+;     expensive stages so a second `wifi scan` does not re-upload 600 KB
+;     of firmware into a radio that is already running.
+;
+;  The addresses, lengths and CRCs below are pi4WifiKey.pi4's, measured
+;  on the board by reading each file back off the stick. They are the
+;  same numbers and they are meant to stay the same numbers.
+; ======================================================================
+
+; Where each file is read to. The low payload window (0x00400000 up) is
+; free at boot - the monitor is at 0x00200000 and its data at
+; 0x0D000000 - so these do not collide with anything the monitor holds.
+#WIFI_FW_ADDR   = $01000000
+#WIFI_FW_LEN    = 609309
+#WIFI_FW_WINDOW = 4096
+#WIFI_FW_CRC_HEAD = $A61DFDB1
+#WIFI_FW_CRC_TAIL = $9E75B809
+
+#WIFI_NV_ADDR = $01200000
+#WIFI_NV_LEN  = 2074
+#WIFI_NV_CRC  = $2BDBDDF6
+
+#WIFI_CLM_ADDR = $01300000
+#WIFI_CLM_LEN  = 2676
+#WIFI_CLM_CRC  = $346D4B26
+
+; Work buffers for the uploads. pi4WifiKey.pi4's, unchanged.
+#WIFI_NV_WORK     = $01210000
+#WIFI_NV_WORK_MAX = 4096
+#WIFI_SCRATCH     = $01220000
+#WIFI_SCRATCH_LEN = 2048
+
+; Mailbox clock id 1 is EMMC. NOT 12, which is EMMC2's. Eight tries with
+; a 25 ms gap is pi4WifiKey.pi4's measured recovery for the framebuffer
+; contention described in the header.
+#WIFI_CLOCK_ID_EMMC = 1
+#WIFI_CLOCK_TRIES   = 8
+#WIFI_CLOCK_GAP_MS  = 25
+
+; The scan's wall clock. pi4WifiJoin.pi4's numbers: a 50 ms slice, up to
+; five seconds total.
+#WIFI_SCAN_BUDGET_MS = 5000
+#WIFI_SCAN_SLICE_MS  = 50
+
+; THE CONSOLE'S UDP PORT IS #NETCON_PORT IN Anvil/Hal/hal.pbi NOW, 2026-09-07.
+; It was #WIFI_CON_PORT here, which was right while the console could only
+; ride this radio. The console rides the wired link too now
+; (Anvil/Core/netconsole.pbi) and the number belongs where both can read it.
+; The number itself is unchanged: 5555.
+
+; 1 once the three blobs are in DRAM and their CRCs check; 1 once the
+; radio has been uploaded, started and taken through Cyw43WifiUp.
+Global gWifiLoaded.i = 0
+Global gWifiUp.i     = 0
+; Explicit, default-off receive-readiness observation session. These baselines
+; never reset production counters and never participate in receive policy.
+Global gWifiRxReadyArmed.i = 0
+Global gWifiRxReadyGeneration.i = 0
+Global gWifiRxReadyMs.i = 0
+Global gWifiRxReadyRaw.i = 0
+Global gWifiRxReadyFrames.i = 0
+Global gWifiRxReadyEmpty.i = 0
+Global gWifiRxReadyFirst.i = 0
+Global gWifiRxReadyCmd53.i = 0
+Global gWifiRxReadyFirstPending.i = 0 : Global gWifiRxReadyFirstQuiet.i = 0
+Global gWifiRxReadyNonPending.i = 0 : Global gWifiRxReadyNonQuiet.i = 0
+Global gWifiRxReadyEmptyPending.i = 0 : Global gWifiRxReadyEmptyQuiet.i = 0
+Global gWifiRxReadyInherited.i : Global gWifiRxReadyNew.i
+Global gWifiRxReadyQData.i : Global gWifiRxReadyQControl.i : Global gWifiRxReadyQEvent.i : Global gWifiRxReadyQGlom.i
+Global gWifiRxReadyQUnknown.i : Global gWifiRxReadyQMalformed.i : Global gWifiRxReadyQPrevNext.i
+Global gWifiRxReadyQSeqOk.i : Global gWifiRxReadyQSeqGap.i
+Global gWifiRxReadyQPostPending.i : Global gWifiRxReadyQPostQuiet.i : Global gWifiRxReadyQPostFail.i
+
+; Optional cooperative service hook. The radio remains independent of the
+; screen: it only announces completed lines and bounded wait slices. The board
+; may register its display service, while a payload may leave this at zero.
+Global *gWifiProgressHook = 0
+Global gWifiProgressBusy.i = 0
+Procedure WifiSetProgressHook(*fn)
+  *gWifiProgressHook = *fn
+EndProcedure
+Procedure wifi_Progress()
+  If *gWifiProgressHook <> 0 And gWifiProgressBusy = 0
+    gWifiProgressBusy = 1
+    gWifiProgressHook()
+    gWifiProgressBusy = 0
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wifi_PrintSsid - an SSID is bytes and a length, not a C string, so it
+;  is printed a byte at a time. A byte below space or above ~ is shown
+;  as a dot rather than sent to the terminal as a control code.
+; ----------------------------------------------------------------------
+Procedure wifi_PrintSsid(p.i, n.i)
+  Define i.i
+  Define c.i
+  For i = 0 To n - 1
+    c = PeekA(p + i)
+    If c < 32 Or c > 126
+      c = 46                     ; '.'
+    EndIf
+    UartWrite(c)
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wifi_LoadBlob - one file off the stick into DRAM at a fixed address,
+;  with its length checked. Returns 1 on success, and prints its own
+;  reason on failure in the monitor's usual voice.
+;
+;  The medium is Anvil's already-mounted USB stick; StorageUp() is what
+;  the monitor's own `load` calls first, so this shares its bring-up and
+;  does not race it.
+; ----------------------------------------------------------------------
+Procedure.i wifi_LoadBlob(*name, addr.i, wantLen.i)
+  Define n.i
+  Define got.i
+  If StorageUp() = 0
+    PrintN("!! the boot medium would not come up, so the Wi-Fi firmware could")
+    PrintN("   not be read. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+  If FatOpen(*name) = 0
+    Print("!! ")
+    UartWriteStr(*name)
+    PrintN(" is not on the boot stick, so the radio cannot")
+    PrintN("   start. The three files BRCMFW.BIN, BRCMNV.TXT and BRCMCLM.BLB")
+    PrintN("   must be in the root of the stick beside KERNEL8.IMG.")
+    ProcedureReturn 0
+  EndIf
+  n = FatSize()
+  If n <> wantLen
+    FatClose()
+    Print("!! ")
+    UartWriteStr(*name)
+    Print(" is ")
+    PrintDec(n)
+    Print(" bytes but should be ")
+    PrintDec(wantLen)
+    PrintN(".")
+    PrintN("   It is the wrong file or a truncated one. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+  got = FatRead(addr, n)
+  FatClose()
+  If got <> n
+    Print("!! ")
+    UartWriteStr(*name)
+    PrintN(" could not be read to the end. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiLoadBlobs - the three firmware files, read once and checked.
+;
+;  The firmware is 609 KB and CRCing all of it a byte at a time with the
+;  MMU off is 5.8 s that buys nothing - Cyw43UploadFirmware reads every
+;  byte back out of the radio and compares it anyway. So the head and
+;  tail 4 KB are checked here (a missing, wrong or short file) and the
+;  middle is left to the upload's own read-back. The two small blobs are
+;  checked whole; they are 45 ms.
+; ----------------------------------------------------------------------
+Procedure.i WifiLoadBlobs()
+  If gWifiLoaded <> 0
+    ProcedureReturn 1
+  EndIf
+
+  If wifi_LoadBlob("BRCMFW.BIN", #WIFI_FW_ADDR, #WIFI_FW_LEN) = 0
+    ProcedureReturn 0
+  EndIf
+  If Crc32(#WIFI_FW_ADDR, #WIFI_FW_WINDOW) <> #WIFI_FW_CRC_HEAD
+    PrintN("!! BRCMFW.BIN is on the stick but its first bytes are wrong - the")
+    PrintN("   wrong file, or corrupt. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+  If Crc32(#WIFI_FW_ADDR + #WIFI_FW_LEN - #WIFI_FW_WINDOW, #WIFI_FW_WINDOW) <> #WIFI_FW_CRC_TAIL
+    PrintN("!! BRCMFW.BIN is on the stick but its last bytes are wrong - it is")
+    PrintN("   truncated or corrupt. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+
+  If wifi_LoadBlob("BRCMNV.TXT", #WIFI_NV_ADDR, #WIFI_NV_LEN) = 0
+    ProcedureReturn 0
+  EndIf
+  If Crc32(#WIFI_NV_ADDR, #WIFI_NV_LEN) <> #WIFI_NV_CRC
+    PrintN("!! BRCMNV.TXT is on the stick but its contents are wrong.")
+    ProcedureReturn 0
+  EndIf
+
+  If wifi_LoadBlob("BRCMCLM.BLB", #WIFI_CLM_ADDR, #WIFI_CLM_LEN) = 0
+    ProcedureReturn 0
+  EndIf
+  If Crc32(#WIFI_CLM_ADDR, #WIFI_CLM_LEN) <> #WIFI_CLM_CRC
+    PrintN("!! BRCMCLM.BLB is on the stick but its contents are wrong.")
+    ProcedureReturn 0
+  EndIf
+
+  gWifiLoaded = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiClockHz - the EMMC base clock, from the mailbox, WITH RETRIES.
+;  Returns the rate in Hz, or 0 after #WIFI_CLOCK_TRIES failures. See
+;  the header: the framebuffer is the known cause of a zero here.
+; ----------------------------------------------------------------------
+Procedure.i WifiClockHz()
+  Define hz.i
+  Define tries.i
+  hz = 0
+  tries = 0
+  While tries < #WIFI_CLOCK_TRIES And hz <= 0
+    hz = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)
+    If hz <= 0
+      delay(#WIFI_CLOCK_GAP_MS)
+    EndIf
+    tries = tries + 1
+  Wend
+  ProcedureReturn hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiRadioUp - blobs -> bus -> chip -> firmware -> radio.
+;
+;  The exact order pi4WifiKey.pi4 runs. Returns 1 with the radio up and
+;  Cyw43WifiUp done, or 0 having printed why. Runs its expensive half
+;  once; a second call with gWifiUp set is a no-op that returns 1.
+; ----------------------------------------------------------------------
+; Every destructive radio generation shares the forum-737 snapshot boundary.
+; Return the exact optional-telemetry disable result so a synchronous owner can
+; stop and the cooperative owner can retain it in phase diagnostics.
+Procedure.i wifi_RadioGenerationPreflight()
+  If Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqRestorePending() <> 0
+    If gWifiRxReadyArmed <> 0
+      ProcedureReturn WifiRxReadyDisable()
+    EndIf
+    ProcedureReturn Cyw43RxIrqTelemetry(0)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i WifiRadioUp()
+  Define r.i
+  Define hz.i
+
+  If gWifiUp <> 0
+    ProcedureReturn 1
+  EndIf
+
+  r = wifi_RadioGenerationPreflight()
+  If r <> 1
+    PrintN("!! Wi-Fi radio initialization cannot replace the current SDIO generation")
+    PrintN("   because its optional receive-readiness snapshot was not restored.")
+    ProcedureReturn 0
+  EndIf
+
+  If WifiLoadBlobs() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; -- the bus --
+  If MailboxInit() = 0
+    PrintN("!! the VideoCore mailbox would not initialise, so the radio's clock")
+    PrintN("   cannot be asked for. Nothing was brought up.")
+    ProcedureReturn 0
+  EndIf
+  hz = WifiClockHz()
+  If hz <= 0
+    PrintN("!! the firmware would not report the EMMC clock. The HDMI")
+    PrintN("   framebuffer is the known cause of this - type screen off and try")
+    PrintN("   again. This monitor will not guess a base clock and neither will")
+    PrintN("   sdio.pi4.")
+    ProcedureReturn 0
+  EndIf
+  SdioSetBaseClockKhz(hz / 1000)
+
+  If SdioAssertWlOn() = 0
+    PrintN("!! WL_ON would not assert - the radio's own power line. Nothing was")
+    PrintN("   brought up.")
+    ProcedureReturn 0
+  EndIf
+  If SdioInit() = 0
+    Print("!! ")
+    UartWriteStr(SdioErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If SdioEnableFunction(1) = 0
+    PrintN("!! SDIO function 1 would not come ready.")
+    ProcedureReturn 0
+  EndIf
+
+  ; -- the chip and the firmware --
+  Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+  If Cyw43Attach() = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  Cyw43SetBlockMode(1)
+  If Cyw43PrepareDownload() = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  ; Head-and-tail read-back verify, not the full 609 KB byte compare -
+  ; the reset vector and the tail are checked, the middle is caught
+  ; downstream if function 2 fails to come ready. This is where the
+  ; ten-second upload went.
+  Cyw43SetVerify(2)
+  Define upMs.i
+  upMs = millis()
+  If Cyw43UploadFirmware(#WIFI_FW_ADDR, #WIFI_FW_LEN, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN) = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  Print("  firmware uploaded to the radio in ")
+  PrintDec(millis() - upMs)
+  PrintN(" ms.")
+  wifi_Progress()
+  If Cyw43UploadNvram(#WIFI_NV_ADDR, #WIFI_NV_LEN, #WIFI_NV_WORK, #WIFI_NV_WORK_MAX, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN) = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If Cyw43Start() = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  If Cyw43HtClock() = 0
+    Print("!! ")
+    UartWriteStr(Cyw43ErrorText())
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+  Cyw43AnnounceHost()
+  If SdioEnableFunction(2) = 0
+    PrintN("!! SDIO function 2 never came ready - the firmware did not boot.")
+    ProcedureReturn 0
+  EndIf
+
+  ; -- the transport, with the join event mask so milestone 2 can join --
+  r = Cyw43WifiUp(#WIFI_CLM_ADDR, #WIFI_CLM_LEN, #CYW43_EVMASK_JOIN, 2000)
+  If r <> 0
+    PrintN("!! Cyw43WifiUp refused - the CLM blob or the event mask. The radio")
+    PrintN("   is powered but not configured.")
+    ProcedureReturn 0
+  EndIf
+
+  ; --------------------------------------------------------------
+  ;  STAY JOINED: state the two firmware policies rather than
+  ;  inheriting them. Both are sent AFTER WLC_UP, which is where the
+  ;  reference driver sends them too, and neither is fatal.
+  ;
+  ;  roam_off - the supplicant is in the HOST on this part, so a
+  ;  firmware roam leaves the pairwise key aimed at the BSSID it was
+  ;  derived with and the link stops decrypting while still reporting
+  ;  itself associated. The host owns the association; the backstop
+  ;  handles an access point that really went away.
+  ;
+  ;  PM off - the wireless console IS the console on this board, so
+  ;  the receiver stays on. "A board that is joined but cannot be
+  ;  reached is not joined."
+  ; --------------------------------------------------------------
+  r = Cyw43SetRoamOff(1, 2000)
+  If r <> 0
+    Print("Wi-Fi: the firmware would not turn its own roaming off (")
+    PrintDec(r)
+    PrintN("). It may")
+    PrintN("   move the association by itself; a roam is reported and re-joined.")
+  EndIf
+  r = Cyw43SetPowerMode(#CYW43_PM_OFF, 2000)
+  If r <> 0
+    Print("Wi-Fi: the firmware would not turn power save off (")
+    PrintDec(r)
+    PrintN("). The radio")
+    PrintN("   may doze between beacons, which costs latency, not the link.")
+  EndIf
+
+  gWifiUp = 1
+  ProcedureReturn 1
+EndProcedure
+
+;  wifi_EnsureSettings - the stored networks live in SETTINGS.TXT on the
+;  stick and Anvil does NOT read them at boot, so a fresh boot has an
+;  empty table and every SSID match fails silently. The radio flow reads
+;  them itself: if nothing is loaded, load them. Idempotent - a second
+;  call with slots already in memory does nothing.
+Procedure wifi_EnsureSettings()
+  If SettingsWifiSlotCount() <> 0
+    ProcedureReturn
+  EndIf
+  ; SettingsLoad() does NOT bring the medium up - CmdSettingsLoad does
+  ; that first, and so must this. Without it a fresh boot's FatOpen
+  ; fails, the table stays empty, and every scan matches nothing while
+  ; the networks sit unread in SETTINGS.TXT.
+  If StorageUp() = 0
+    ProcedureReturn
+  EndIf
+  SettingsLoad()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiScanMatch - scan, and report which STORED networks are on the
+;  air. Returns the number of stored networks seen, or -1 on a scan
+;  failure. Prints one line per match: name, channel, RSSI.
+;
+;  A scan row with no matching stored credential is NOT printed - it is
+;  a network somebody else owns, and listing it would be both noise and
+;  a small privacy leak onto the HDMI console.
+; ----------------------------------------------------------------------
+Procedure.i WifiScanMatch()
+  Define r.i
+  Define slices.i
+  Define stop.i
+  Define found.i
+  Define i.i
+  Define slot.i
+  Define matched.i
+
+  ; A foreground scan owns radio bring-up synchronously. An older automatic
+  ; initialization generation must not resume after this command returns and
+  ; publish over the state it established.
+  WifiRadioInitCancel()
+
+  ; Load the stored networks if a fresh boot has not. Done before the
+  ; radio comes up so a missing SETTINGS.TXT is reported before 600 KB
+  ; of firmware is uploaded for a scan that would match nothing.
+  wifi_EnsureSettings()
+
+  If WifiRadioUp() = 0
+    ProcedureReturn -1
+  EndIf
+
+  r = Cyw43ScanStart(0, 2000)
+  If r <> 0
+    PrintN("!! the scan would not start. The radio is up but the firmware")
+    PrintN("   refused the scan request.")
+    ProcedureReturn -1
+  EndIf
+
+  slices = 0
+  stop = 0
+  While stop = 0 And slices < (#WIFI_SCAN_BUDGET_MS / #WIFI_SCAN_SLICE_MS)
+    r = Cyw43ScanPoll(#WIFI_SCAN_SLICE_MS)
+    slices = slices + 1
+    If r = #CYW43_SCAN_DONE
+      stop = 1
+    EndIf
+    If r = #CYW43_SCAN_FAILED
+      stop = 1
+    EndIf
+  Wend
+
+  found = Cyw43ScanCount()
+  matched = 0
+  PrintN("Networks in range that this monitor has a stored passphrase for:")
+  For i = 0 To found - 1
+    slot = SettingsWifiFindSsid(Cyw43ScanSsid(i))
+    If slot <> 0
+      matched = matched + 1
+      Print("  ")
+      wifi_PrintSsid(Cyw43ScanSsid(i), Cyw43ScanSsidLen(i))
+      Print("   channel ")
+      PrintDec(Cyw43ScanChannel(i))
+      Print("   RSSI ")
+      PrintDec(Cyw43ScanRssi(i))
+      PrintN(" dBm")
+    EndIf
+  Next
+  If matched = 0
+    PrintN("  none - either none are on the air, or none are stored. Type wifi")
+    PrintN("  to see what is stored and wifi ssid / wifi password to add one.")
+  EndIf
+  ProcedureReturn matched
+EndProcedure
+
+; ======================================================================
+;  THE KEYED JOIN - actually get on the network.
+;
+;  The 43455 has NO firmware supplicant (extsae, not idsup), so the host
+;  runs the WPA2 four-way handshake itself: derive the PMK from the
+;  passphrase and SSID, associate 802.11-open with the right RSN element,
+;  then EAPOL messages 1..4 in wpa2sup.pi4, and install the pairwise and
+;  group keys. Proven end to end on the bench by pi4WifiKey.pi4; this is
+;  that flow made part of the monitor, taking its credentials from the
+;  settings store and deriving the PMK inline rather than from a staged
+;  table.
+;
+;  PBKDF2 COSTS ABOUT TEN SECONDS PER NETWORK with the MMU off, so the
+;  key is derived only for a network that is actually ON THE AIR, and
+;  2.4 GHz is tried before 5 GHz - on this bench the 5 GHz radio wants
+;  WPA3/SAE and refuses, and there is no reason to spend ten seconds on a
+;  network that will say no. (PMK caching so a second boot skips this is
+;  the next improvement.)
+; ======================================================================
+
+#WIFI_RSN_IE_LEN    = 22
+#WIFI_RSN_IE_MAX    = 64
+#WIFI_JOIN_SLICE_MS = 20
+#WIFI_JOIN_SLICES   = 400
+#WIFI_EAPOL_M1_MS   = 2600
+#WIFI_EAPOL_M3_MS   = 800
+
+; Exact EAPOL failure ownership. Foreground join failures are diagnostic only;
+; steady-state failures additionally latch a deferred outer-service action.
+; The receive callback never tears down or re-enters the radio/network stack.
+#WIFI_EAPOL_FAIL_NONE        = 0
+#WIFI_EAPOL_FAIL_JOIN_M2_TX  = 1
+#WIFI_EAPOL_FAIL_JOIN_M4_TX  = 2
+#WIFI_EAPOL_FAIL_REKEY_M2_TX = 3
+#WIFI_EAPOL_FAIL_REKEY_M4_TX = 4
+#WIFI_EAPOL_FAIL_REKEY_PTK   = 5
+#WIFI_EAPOL_FAIL_REKEY_M4_GTK = 6
+#WIFI_EAPOL_FAIL_REKEY_G2_TX = 7
+#WIFI_EAPOL_FAIL_REKEY_NONCE = 8
+#WIFI_EAPOL_FAIL_REKEY_G2_GTK = 9
+
+Global gWifiEapolFailStage.i = #WIFI_EAPOL_FAIL_NONE
+Global gWifiEapolFailRc.i = 0
+Global gWifiEapolRecover.i = 0
+Global gWifiEapolRecoverStage.i = #WIFI_EAPOL_FAIL_NONE
+Global gWifiEapolRecoverRc.i = 0
+Global gWifiKeyed.i = 0
+Global gWifiSecDone.i = 0
+Global gWifiHaveIp.i = 0
+Global gWifiIp.i = 0
+Global gWifiSettingsRevisionSeen.i = 0
+
+Procedure wifi_RecordEapolFailure(stage.i, rc.i, deferred.i)
+  gWifiEapolFailStage = stage
+  gWifiEapolFailRc = rc
+  ; Preserve the first pending failure until its owning outer service turn.
+  If deferred <> 0 And gWifiEapolRecover = 0
+    gWifiEapolRecoverStage = stage
+    gWifiEapolRecoverRc = rc
+    gWifiEapolRecover = 1
+    ; Scalar eligibility closes synchronously when the receive callback
+    ; returns. HwLinkReady consults gWifiKeyed, so no subsequent IP send can
+    ; select this partially changed session while outer service is pending.
+    ; DHCP/interface cleanup itself remains outside the callback.
+    gWifiKeyed = 0
+    gWifiHaveIp = 0
+    gWifiSecDone = 0
+  EndIf
+EndProcedure
+
+Global Dim wifi_ourMac.a[6]
+; Scratch for reading back the hardware address on net.pi4's row for the
+; radio, so wifi_NetAddrIsOurs can compare it with the radio's own
+; without a local array in a procedure that runs on every prompt spin.
+Global Dim wifi_netMac.a[6]
+Global Dim wifi_apMac.a[6]
+Global Dim wifi_snonce.a[32]
+Global Dim wifi_pmk.a[32]
+Global Dim wifi_ie.a[#WIFI_RSN_IE_MAX]
+Global wifi_ieLen.i = 0
+Global Dim wifi_joinSsid.a[36]
+Global wifi_joinSsidLen.i = 0
+
+; WPA2-PSK, CCMP pairwise and group. Exactly pi4WifiKey.pi4's, byte for byte.
+DataSection
+  wifi_rsnIe:
+  Data.b $30, $14, $01, $00
+  Data.b $00, $0F, $AC, $04
+  Data.b $01, $00, $00, $0F, $AC, $04
+  Data.b $01, $00, $00, $0F, $AC, $02
+  Data.b $0C, $00
+EndDataSection
+
+Procedure.i wifi_SendSup()
+  Define n.i
+  Define src.i
+  Define dst.i
+  Define i.i
+  n = Wpa2SupTxLen()
+  If n <= 0
+    ProcedureReturn -1
+  EndIf
+  src = Wpa2SupTxPtr()
+  dst = Cyw43DataPtr()
+  i = 0
+  While i < n
+    PokeA(dst + i, PeekA(src + i))
+    i = i + 1
+  Wend
+  ProcedureReturn Cyw43Send(n)
+EndProcedure
+
+; Our MAC, a fresh SNonce, the RSN element and the WSEC/WPA_AUTH items.
+; Runs once; returns 1 on success.
+Procedure.i wifi_SecuritySetup()
+  Define i.i
+  Define n.i
+  Define ok.i
+  If gWifiSecDone <> 0
+    ProcedureReturn 1
+  EndIf
+  If Cyw43MacAddress(@wifi_ourMac[0], 2000) <> 0
+    PrintN("!! the radio would not report its own MAC, without which the")
+    PrintN("   pairwise key cannot be derived. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  If EntropyBegin() = 0
+    EntropyWarmupWait(#ENTROPY_SPINS)
+  EndIf
+  n = EntropyBytes(@wifi_snonce[0], 32, #ENTROPY_SPINS)
+  If n <> 32
+    PrintN("!! the hardware RNG would not fill the nonce, so a session key")
+    PrintN("   would be guessable. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  ok = 0
+  For i = 0 To 31
+    If wifi_snonce[i] <> 0
+      ok = 1
+    EndIf
+  Next
+  If ok = 0
+    PrintN("!! the nonce came back all zeros. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  If Cyw43SetWpaIe(?wifi_rsnIe, #WIFI_RSN_IE_LEN, 2000) <> 0
+    PrintN("!! the radio refused the RSN element. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  ok = 1
+  For i = 0 To 3
+    If Cyw43SecItem(i, 2000) <> 0
+      ok = 0
+    EndIf
+  Next
+  If Cyw43SecItem(8, 2000) <> 0
+    ok = 0
+  EndIf
+  If ok = 0
+    PrintN("!! a security item was refused. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+  gWifiSecDone = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The RSN element the firmware actually transmitted - message 2 repeats
+; it, not what we asked for. Fills wifi_ie / wifi_ieLen.
+Procedure wifi_ReadAssocIe()
+  Define n.i
+  Define p.i
+  Define i.i
+  Define j.i
+  Define k.i
+  wifi_ieLen = 0
+  If Cyw43GetAssocReqIes(160, 2000) <> 0
+    ProcedureReturn
+  EndIf
+  n = Cyw43ReplyLen()
+  p = Cyw43ReplyPtr()
+  i = 0
+  While i + 2 <= n
+    j = PeekA(p + i + 1)
+    If i + 2 + j > n
+      Break
+    EndIf
+    If PeekA(p + i) = 48 And (j + 2) <= #WIFI_RSN_IE_MAX
+      wifi_ieLen = j + 2
+      For k = 0 To wifi_ieLen - 1
+        wifi_ie[k] = PeekA(p + i + k)
+      Next
+    EndIf
+    i = i + 2 + j
+  Wend
+EndProcedure
+
+; Finish one foreground supplicant transaction. The handshake borrows its PMK
+; from wifi_TrySlot; it owns only the supplicant/key-install scratch. A failed
+; transaction must wipe that scratch, while a keyed transaction keeps the
+; armed session material needed for a later group rekey.
+Procedure.i wifi_HandshakeFinish(keyed.i)
+  If keyed <> 0
+    Wpa2SupSessionArm()
+  Else
+    Wpa2SupWipe()
+  EndIf
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  ProcedureReturn keyed
+EndProcedure
+
+; The four-way handshake on a fresh association. wifi_pmk is borrowed and
+; remains caller-owned so the same candidate can make its one bounded retry.
+; Returns 1 if both keys installed.
+Procedure.i wifi_Handshake()
+  Define n.i
+  Define code.i
+  Define r.i
+  Define m1.i
+  Define m3.i
+  Define keyed.i
+  Define waitMs.i
+  Define t0.i
+  Define jrc.i
+  For n = 0 To 5
+    wifi_apMac[n] = 0
+  Next
+  wifi_ReadAssocIe()
+  If wifi_ieLen >= 2
+    r = Wpa2SupBegin(@wifi_pmk[0], @wifi_ourMac[0], @wifi_apMac[0], @wifi_ie[0], wifi_ieLen)
+  Else
+    r = Wpa2SupBegin(@wifi_pmk[0], @wifi_ourMac[0], @wifi_apMac[0], ?wifi_rsnIe, #WIFI_RSN_IE_LEN)
+  EndIf
+  If r = 0
+    ProcedureReturn wifi_HandshakeFinish(0)
+  EndIf
+  Wpa2SupSetSnonce(@wifi_snonce[0])
+  m1 = 0
+  m3 = 0
+  keyed = 0
+  waitMs = #WIFI_EAPOL_M1_MS
+  t0 = millis()
+  While (millis() - t0) < waitMs And m3 = 0
+    n = Cyw43Receive(60)
+    If n >= 14
+      code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+      If code = #WPA2SUP_SENT_M2
+        r = wifi_SendSup()
+        If r = 0
+          m1 = m1 + 1
+          t0 = millis()
+          waitMs = #WIFI_EAPOL_M3_MS
+        Else
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_JOIN_M2_TX, r, 0)
+          Print("Wi-Fi: handshake message 2 was not transmitted (driver rc ")
+          PrintDec(r)
+          PrintN(").")
+          Break
+        EndIf
+      ElseIf code = #WPA2SUP_SENT_M4
+        r = wifi_SendSup()
+        If r = 0
+          m3 = 1
+          jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+          r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+          If jrc = 0 And r = 0
+            keyed = 1
+          EndIf
+        Else
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_JOIN_M4_TX, r, 0)
+          Print("Wi-Fi: handshake message 4 was not transmitted (driver rc ")
+          PrintDec(r)
+          PrintN(").")
+          Break
+        EndIf
+      EndIf
+    EndIf
+    wifi_Progress()
+  Wend
+  ProcedureReturn wifi_HandshakeFinish(keyed)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PMK CACHE. PBKDF2 is about ten seconds with the MMU off, so the
+;  derived key is stored - keyed to a fingerprint of (SSID + passphrase)
+;  - and every boot after the first is instant. A changed passphrase
+;  changes the fingerprint, misses the cache and re-derives. The value
+;  lives under a "...pmk.secret" key so settings.pbi MASKS IT on screen
+;  exactly like the passphrase it is derived from.
+; ----------------------------------------------------------------------
+Global Dim wifi_keyBuf.a[24]
+Global Dim wifi_pmkVal.a[80]
+Global gWifiPmkDirty.i = 0
+
+Procedure.i wifi_HexDigit(v.i)
+  If v < 10
+    ProcedureReturn 48 + v
+  EndIf
+  ProcedureReturn 87 + v
+EndProcedure
+
+Procedure.i wifi_HexVal(c.i)
+  If c >= 48 And c <= 57
+    ProcedureReturn c - 48
+  EndIf
+  If c >= 97 And c <= 102
+    ProcedureReturn c - 87
+  EndIf
+  If c >= 65 And c <= 70
+    ProcedureReturn c - 55
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure wifi_ByteToHex(dst.i, off.i, b.i)
+  PokeA(dst + off, wifi_HexDigit((b >> 4) & $F))
+  PokeA(dst + off + 1, wifi_HexDigit(b & $F))
+EndProcedure
+
+Procedure wifi_U32ToHex(dst.i, v.i)
+  wifi_ByteToHex(dst, 0, (v >> 24) & $FF)
+  wifi_ByteToHex(dst, 2, (v >> 16) & $FF)
+  wifi_ByteToHex(dst, 4, (v >> 8) & $FF)
+  wifi_ByteToHex(dst, 6, v & $FF)
+EndProcedure
+
+Procedure.i wifi_HexToU32(p.i)
+  Define v.i
+  Define i.i
+  Define d.i
+  v = 0
+  For i = 0 To 7
+    d = wifi_HexVal(PeekA(p + i))
+    If d < 0
+      ProcedureReturn 0
+    EndIf
+    v = ((v << 4) | d) & $FFFFFFFF
+  Next
+  ProcedureReturn v & $FFFFFFFF
+EndProcedure
+
+Procedure.i wifi_HexToBytes(p.i, dst.i, n.i)
+  Define i.i
+  Define hi.i
+  Define lo.i
+  For i = 0 To n - 1
+    hi = wifi_HexVal(PeekA(p + i * 2))
+    lo = wifi_HexVal(PeekA(p + i * 2 + 1))
+    If hi < 0 Or lo < 0
+      ProcedureReturn 0
+    EndIf
+    PokeA(dst + i, (hi << 4) | lo)
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Validate the complete stored cache row before decoding any part of it. This
+; prevents a malformed tail from leaving a partially replaced PMK in the
+; candidate buffer, including the fingerprint-zero ambiguity of HexToU32.
+Procedure.i wifi_HexValid(p.i, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    If wifi_HexVal(PeekA(p + i)) < 0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; FNV-1a over SSID, a separator, then the passphrase. 32-bit. Not a
+; security hash - it only has to change when the credential changes.
+Procedure.i wifi_Fp(ssid.i, ssidLen.i, pass.i, passLen.i)
+  Define h.i
+  Define i.i
+  h = $811C9DC5
+  For i = 0 To ssidLen - 1
+    h = (h ! PeekA(ssid + i)) & $FFFFFFFF
+    h = (h * 16777619) & $FFFFFFFF
+  Next
+  h = (h ! 31) & $FFFFFFFF
+  h = (h * 16777619) & $FFFFFFFF
+  For i = 0 To passLen - 1
+    h = (h ! PeekA(pass + i)) & $FFFFFFFF
+    h = (h * 16777619) & $FFFFFFFF
+  Next
+  ProcedureReturn h & $FFFFFFFF
+EndProcedure
+
+; Build "wifi.<slot>.pmk.secret" (slot 1..9) and return a pointer to it.
+Procedure.i wifi_PmkKey(slot.i)
+  wifi_keyBuf[0]  = 119    ; w
+  wifi_keyBuf[1]  = 105    ; i
+  wifi_keyBuf[2]  = 102    ; f
+  wifi_keyBuf[3]  = 105    ; i
+  wifi_keyBuf[4]  = 46     ; .
+  wifi_keyBuf[5]  = 48 + slot
+  wifi_keyBuf[6]  = 46     ; .
+  wifi_keyBuf[7]  = 112    ; p
+  wifi_keyBuf[8]  = 109    ; m
+  wifi_keyBuf[9]  = 107    ; k
+  wifi_keyBuf[10] = 46     ; .
+  wifi_keyBuf[11] = 115    ; s
+  wifi_keyBuf[12] = 101    ; e
+  wifi_keyBuf[13] = 99     ; c
+  wifi_keyBuf[14] = 114    ; r
+  wifi_keyBuf[15] = 101    ; e
+  wifi_keyBuf[16] = 116    ; t
+  wifi_keyBuf[17] = 0
+  ProcedureReturn @wifi_keyBuf[0]
+EndProcedure
+
+; Write SETTINGS.TXT if a new PMK was cached this run. Arms the block
+; writer exactly as CmdSettingsSave does and disarms it after.
+Procedure wifi_PersistPmkIfDirty()
+  If gWifiPmkDirty = 0
+    ProcedureReturn
+  EndIf
+  If StorageUp() = 0
+    gWifiPmkDirty = 0
+    ProcedureReturn
+  EndIf
+  FatSetRangeWriter(@MscWriteBlocks)
+  If SettingsSave() <> 0
+    PrintN("  cached the key to SETTINGS.TXT - the next boot skips the ten seconds.")
+  EndIf
+  FatSetRangeWriter(0)
+  gWifiPmkDirty = 0
+EndProcedure
+
+; wifi_TrySlot owns the foreground candidate PMK and encoded cache scratch.
+; Wpa2Psk's private U/T/counter state is part of the same candidate lifetime.
+; This is deliberately separate from the armed Wpa2Sup session material.
+Procedure.i wifi_CandidateFinish(result.i)
+  Define i.i
+  For i = 0 To 31
+    wifi_pmk[i] = 0
+  Next
+  For i = 0 To 79
+    wifi_pmkVal[i] = 0
+  Next
+  Pbkdf2Wipe()
+  ProcedureReturn result
+EndProcedure
+
+; Board callbacks for the shared association retry controller. The security
+; handshake and its key material stay owned by this board adapter.
+Procedure wifi_AssocHandshake(*result)
+  PokeI(*result, Bool(wifi_Handshake() <> 0))
+EndProcedure
+
+Procedure wifi_AssocProgress()
+  wifi_Progress()
+EndProcedure
+
+Procedure wifi_AssocEvent(event.i, attempt.i)
+  Select event
+    Case #ANVIL_WIFI_ASSOC_EVENT_REFUSED
+      PrintN("    the radio refused to start the association.")
+    Case #ANVIL_WIFI_ASSOC_EVENT_RETRY
+      PrintN("    did not associate on the first try - clearing any stale")
+      PrintN("    association and retrying once.")
+    Case #ANVIL_WIFI_ASSOC_EVENT_FAILED
+      PrintN("    did not associate (refused, or not this passphrase's network).")
+    Case #ANVIL_WIFI_ASSOC_EVENT_KEYING
+      PrintN("    associated - running the four-way handshake...")
+    Case #ANVIL_WIFI_ASSOC_EVENT_KEY_FAILED
+      PrintN("    associated but the handshake did not complete.")
+  EndSelect
+EndProcedure
+
+; One stored slot: derive its PMK, associate, run the handshake.
+Procedure.i wifi_TrySlot(slot.i, ssid.i, ssidLen.i)
+  Define pass.i
+  Define passLen.i
+  Define fp.i
+  Define key.i
+  Define cached.i
+  Define used.i
+  Define hi.i
+  Define pskResult.i
+  Define oldProgress.i
+  Define needsStore.i
+
+  ; This procedure is the sole owner of the foreground candidate buffer.
+  ; Start and every exit wipe leftovers from an earlier candidate, while the
+  ; successfully armed supplicant keeps its distinct session-owned copy.
+  wifi_CandidateFinish(0)
+  pass    = SettingsWifiSlotPassword(slot)
+  passLen = SettingsLength(SettingsWifiSlotPasswordKey(slot))
+  If pass = 0 Or passLen < 8
+    ProcedureReturn wifi_CandidateFinish(0)
+  EndIf
+  fp = wifi_Fp(ssid, ssidLen, pass, passLen)
+  key = wifi_PmkKey(slot)
+  used = 0
+  needsStore = 0
+  cached = SettingsGet(key)
+  If cached <> 0
+    If SettingsLength(key) = 72 And wifi_HexValid(cached, 72) <> 0
+      If wifi_HexToU32(cached) = fp
+        If wifi_HexToBytes(cached + 8, @wifi_pmk[0], 32) <> 0
+          used = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+  Print("  ")
+  wifi_PrintSsid(ssid, ssidLen)
+  If used <> 0
+    PrintN(": using the cached network key.")
+  Else
+    PrintN(": deriving the network key (PBKDF2)...")
+    wifi_Progress()
+    oldProgress = Pbkdf2SetProgress(@wifi_Progress)
+    pskResult = Wpa2Psk(pass, passLen, ssid, ssidLen, @wifi_pmk[0])
+    Pbkdf2SetProgress(oldProgress)
+    Pbkdf2Wipe()
+    If pskResult <> 32
+      PrintN("    key derivation failed. Skipping.")
+      wifi_Progress()
+      ProcedureReturn wifi_CandidateFinish(0)
+    EndIf
+    needsStore = 1
+  EndIf
+  If AnvilWifiAssociateCandidate(ssid, ssidLen, 2000, #WIFI_JOIN_SLICE_MS, #WIFI_JOIN_SLICES, @wifi_AssocHandshake, @wifi_AssocProgress, @wifi_AssocEvent) <> 0
+    ; A derived PMK is only an optimization until this candidate has both
+    ; pairwise and group keys installed. Persist only after that success.
+    If needsStore <> 0
+      wifi_U32ToHex(@wifi_pmkVal[0], fp)
+      For hi = 0 To 31
+        wifi_ByteToHex(@wifi_pmkVal[0], 8 + hi * 2, wifi_pmk[hi])
+      Next
+      wifi_pmkVal[72] = 0
+      If SettingsSet(key, @wifi_pmkVal[0]) <> 0
+        gWifiPmkDirty = 1
+      Else
+        PrintN("    connected, but the derived key could not be cached in settings.")
+      EndIf
+    EndIf
+    ProcedureReturn wifi_CandidateFinish(1)
+  EndIf
+  ProcedureReturn wifi_CandidateFinish(0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiJoinKnown - bring the radio up, scan, and join the first stored
+;  network that is on the air and whose passphrase keys us. 2.4 GHz
+;  before 5 GHz. Returns 1 if a link is up and keyed.
+; ----------------------------------------------------------------------
+Procedure.i wifi_JoinCandidate(slot.i, ssid.i, ssidLen.i)
+  ProcedureReturn wifi_TrySlot(slot, ssid, ssidLen)
+EndProcedure
+
+; Storage lookup is supplied to the board-neutral scan policy through this
+; output-slot callback. Keep SettingsWifiFindSsid and its current matching
+; behavior here, beside the settings owner.
+Procedure wifi_FindStoredCandidate(*ssid, ssidLen.i, *slotOut)
+  If *slotOut = 0
+    ProcedureReturn
+  EndIf
+  PokeL(*slotOut, 0)
+  If *ssid = 0 Or ssidLen < 1 Or ssidLen > 32
+    ProcedureReturn
+  EndIf
+  PokeL(*slotOut, SettingsWifiFindSsid(*ssid))
+EndProcedure
+
+Procedure.i WifiJoinKnown()
+  Define r.i
+  Define slot.i
+  Define ssid.i
+  Define ssidLen.i
+  ; Boot and explicit join are the synchronous compatibility owner. Cancel a
+  ; pending automatic radio generation before either reads or changes state.
+  WifiRadioInitCancel()
+  If gWifiKeyed <> 0
+    ProcedureReturn 1
+  EndIf
+  wifi_EnsureSettings()
+  If WifiRadioUp() = 0
+    ProcedureReturn 0
+  EndIf
+  If wifi_SecuritySetup() = 0
+    ProcedureReturn 0
+  EndIf
+  PrintN("Joining a known Wi-Fi network...")
+  wifi_Progress()
+  If AnvilWifiJoinKnownScan(@wifi_FindStoredCandidate, @wifi_JoinCandidate, @wifi_Progress, @slot, @ssid, @ssidLen) < 0
+    PrintN("!! the scan would not start, so there is no way to tell which stored")
+    PrintN("   network is in range. Not joining.")
+    ProcedureReturn 0
+  EndIf
+  If slot <> 0
+    gWifiKeyed = 1
+    wifi_joinSsidLen = ssidLen
+    For r = 0 To ssidLen - 1
+      wifi_joinSsid[r] = PeekA(ssid + r)
+    Next
+    Print("KEYED to ")
+    wifi_PrintSsid(ssid, ssidLen)
+    PrintN(" - the link is up and encrypted.")
+    wifi_PersistPmkIfDirty()
+    ProcedureReturn 1
+  EndIf
+  wifi_PersistPmkIfDirty()
+  PrintN("No stored network could be joined - none on the air keyed cleanly.")
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  Wi-Fi address mirror
+; ======================================================================
+; DHCP packet construction, validation, lease time and retransmission are
+; owned by Lib/dhcp.pi4 plus Core/netconsole.pbi. These values only mirror
+; the radio's per-interface address for radio health/status code.
+Global gWifiMask.i = 0
+Global gWifiGw.i   = 0
+
+; xx:xx:xx:xx:xx:xx from six bytes.
+Procedure wifi_PrintMac(p.i)
+  Define i.i
+  Define b.i
+  For i = 0 To 5
+    If i > 0
+      UartWrite(58)              ; ':'
+    EndIf
+    b = PeekA(p + i)
+    UartWrite(wifi_HexDigit((b >> 4) & $F))
+    UartWrite(wifi_HexDigit(b & $F))
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiPrintNet - the identity of the link: SSID, MAC, IP, and where the
+;  wireless console is. Printed once when the board first connects at
+;  boot, and again on demand by the 'wifi ip' command.
+; ----------------------------------------------------------------------
+Procedure WifiPrintNet()
+  If gWifiKeyed = 0
+    PrintN("Wi-Fi is not connected. Type wifi join to connect, or wifi to see the")
+    PrintN("stored networks.")
+    ProcedureReturn
+  EndIf
+  Print("  network  ")
+  wifi_PrintSsid(@wifi_joinSsid[0], wifi_joinSsidLen)
+  PrintNl()
+  Print("  MAC      ")
+  wifi_PrintMac(@wifi_ourMac[0])
+  PrintNl()
+  If gWifiHaveIp <> 0
+    Print("  IP       ")
+    PutIp(gWifiIp)
+    PrintNl()
+    Print("  netmask  ")
+    PutIp(gWifiMask)
+    PrintNl()
+    Print("  router   ")
+    PutIp(gWifiGw)
+    PrintNl()
+    ; ----------------------------------------------------------------
+    ; THE CONSOLE ANSWERS HERE, FULL STOP - not "when the radio is the
+    ; link carrying the console", which is what this said until
+    ; 2026-09-07 and which was a hedge covering a real limitation. There
+    ; was ONE address on the board, so whichever interface took it last
+    ; owned the console and this address answered only while the radio
+    ; happened to be holding it.
+    ;
+    ; With one address PER INTERFACE (Anvil/Core/netif.pbi) the console
+    ; listens on every interface that holds one and replies out of the
+    ; interface a request arrived on, so this address answers whether or
+    ; not a cable is in as well. What the cable still wins is OUTBOUND
+    ; traffic this board starts, which `net` reports separately: "which
+    ; address answers" and "which door does a frame leave by" are
+    ; different questions and merging them is how the old report came to
+    ; be believed.
+    ; ----------------------------------------------------------------
+    Print("  console  UDP ")
+    PutIp(gWifiIp)
+    Print(" port ")
+    PrintDec(#NETCON_PORT)
+    PrintN(" - the network console answers here.")
+    PrintN("           It listens on EVERY interface that holds an address, so a")
+    PrintN("           cable being in as well does not take it off this one. Type")
+    PrintN("           net to see every address this board holds at once.")
+  Else
+    PrintN("  no IP address yet (DHCP has not completed).")
+  EndIf
+EndProcedure
+
+; PROOF OF THE ROUND TRIP - the link-death evidence the association poll
+; cannot fake. PROVEN NECESSARY ON SILICON 2026-08-30, TWICE, in two
+; refinements the same day:
+;
+;   * The link died mid-session (console deaf) while Cyw43ReadBssid kept
+;     answering "still associated" - the poll asks the firmware's
+;     OPINION, not the air - so the poll-based health check never fired
+;     and the board sat deaf until a manual `wifi rejoin`.
+;   * The first cut of this detector stamped the clock on ANY received
+;     frame, and the very next natural death (20:01 that evening) fooled
+;     IT too: that death was TX-ONLY. The board still heard everything -
+;     the host's probes kept arriving every 30 s and kept the clock
+;     fresh - while nothing it transmitted reached anyone. Seven deaf
+;     probes, the counter stuck at 1, the detector silent: watched live
+;     over the serial line while it happened.
+;
+; So: ONLY ROUND-TRIP EVIDENCE counts. A frame that can only exist
+; because OUR transmission got through - the gateway's ARP reply to the
+; keepalive's request (#NET_IN_LEARNED), or the completed DHCP exchange
+; at bind - stamps this clock. A frame that merely ARRIVED (console
+; input, broadcast chatter) proves only the receive half and resets
+; nothing. WifiLinkTick declares the link dead when two solicited
+; keepalives in a row have gone out and no round trip has completed for
+; #WIFI_PROOF_MS - whatever the poll claims, however chatty the inbound
+; side looks. Declared here, above WifiDhcp and the receive paths.
+Global gWifiRxProof.i  = 0     ; millis() of the last completed round trip
+Global gWifiKaProbes.i = 0     ; keepalive probes sent since that round trip
+
+; ----------------------------------------------------------------------
+;  MID-SESSION REKEY - the cure, and its instrumentation.
+;
+;  gWifiRekeyOn services the rekey (the fix). Turn it OFF (`wifi rekey
+;  off`) to reproduce the death: the rekey frame is still logged, but not
+;  answered, so the link goes TX-only dead exactly as it did before.
+;  gWifiHealOn gates the AUTOMATIC rejoin (the backstop). Turn it OFF
+;  (`wifi heal off`) to let a death PERSIST for observation; manual
+;  `wifi rejoin` still works. Both default ON.
+;
+;  The counters and the last-event fields are what `wifi eapol` reports -
+;  the silicon evidence that a rekey arrives on the hour and that it is
+;  being answered (re-association count staying 0 is the other half).
+; ----------------------------------------------------------------------
+Global gWifiRekeyOn.i   = 1    ; 1 = answer a mid-session rekey (the fix)
+Global gWifiHealOn.i    = 1    ; 1 = automatic rejoin may fire (the backstop)
+Global gWifiEapolLog.i  = 1    ; 1 = narrate each EAPOL frame to the console
+Global gWifiEapolSeen.i = 0    ; steady-state EAPOL-Key frames received
+Global gWifiGrpKeyed.i  = 0    ; group rekeys serviced (GTK reinstalled)
+Global gWifiPtkKeyed.i  = 0    ; PTK rekeys serviced (pairwise reinstalled)
+Global gWifiEapolErr.i  = 0    ; EAPOL frames that could not be serviced
+Global gWifiEapolLast.i = 0    ; millis() of the last EAPOL frame
+Global gWifiEapolInfo.i = 0    ; key-info word of the last EAPOL frame
+Global gWifiEvtLast.i   = 0    ; millis() of the last async radio event
+Global gWifiEvtType.i   = -1   ; type of the last async radio event
+Global gWifiEvtReason.i = 0    ; reason of the last async radio event
+Global gWifiDeauths.i   = 0    ; DEAUTH/DISASSOC events seen in steady state
+
+; ----------------------------------------------------------------------
+;  THE RADIO SAID THE LINK IS GONE - a latch, not an action.
+;
+;  The event ring is drained from the receive pump, which runs on every
+;  spin of the prompt, because a teardown that sits unread for up to a
+;  keepalive period is twenty seconds of a board believing something the
+;  radio has already contradicted - and because the ring is sixteen deep
+;  and an access point that is tearing down repeats itself (33 deauths in
+;  six minutes, measured on this bench 2026-08-31). A full ring drops
+;  events silently, and a dropped teardown is a drop nobody ever learns
+;  about.
+;
+;  BUT THE PUMP MUST NOT RE-ASSOCIATE. WifiRejoin scans, handshakes and
+;  re-leases, and it consumes frames itself; running it from inside the
+;  frame loop would re-enter that loop. So the drain LATCHES what it saw
+;  and WifiLinkTick - the one place a re-association is ever started -
+;  acts on the latch at once, ahead of its own rate limit.
+;
+;  WHAT COUNTS AS GONE is the reference driver's own test, and it is
+;  narrower than "any of the four events":
+;
+;      DEAUTH, DEAUTH_IND, DISASSOC_IND, or LINK with the up bit CLEAR
+;
+;  (brcmf_is_linkdown, v6.12_brcmfmac_cfg80211.c). Two consequences this
+;  file had wrong. LINK-down was NOT in the acted-on set at all, and it
+;  is the canonical one - it is what the firmware reports when it loses
+;  the beacon, when it is told to leave, and when the access point goes
+;  away without saying goodbye; it was recorded and then ignored. And
+;  plain DISASSOC (11) WAS in the acted-on set although the reference
+;  deliberately leaves it out and does not even subscribe to it, because
+;  it is the locally generated one - so it no longer forces a
+;  re-association by itself; it forces the next authoritative
+;  association poll instead, and that decides.
+; ----------------------------------------------------------------------
+Global gWifiTeardown.i  = 0    ; latched: the radio reported the link gone
+Global gWifiTdType.i    = -1   ; the event that said so
+Global gWifiTdReason.i  = 0    ; its reason code
+Global gWifiVerify.i    = 0    ; latched: poll the association now, do not wait
+Global gWifiRoams.i     = 0    ; firmware roam events seen (should stay 0)
+Global gWifiEvtDrops.i  = 0    ; events the ring lost - any is a blind spot
+
+; ----------------------------------------------------------------------
+;  wifi_StackIsFree HAS BEEN REMOVED, and the removal is recorded rather
+;  than done silently because the procedure was right for four days and
+;  the reason it stopped being right is the reason for the whole change.
+;
+;  IT ASKED "may this radio write its address into the ONE IP layer, or
+;  is another interface using it?", and it existed because a wired lease
+;  taken at boot and a wireless auto-join afterwards wrote the same
+;  single record: the second overwrote the first and left the stack with
+;  one interface's hardware address and another's IP.
+;
+;  net.pi4 now holds ONE ADDRESS ROW PER INTERFACE, keyed by #HW_LINK_*.
+;  The radio writes the radio's row and the cable writes the cable's, so
+;  there is no shared record left to be busy and no question left to ask
+;  - the honest answer became "always yes", and a predicate that can only
+;  return one value is worse than no predicate: it reads as a guard.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  wifi_BindAddress - THE ONE PLACE THE RADIO GAINS AN ADDRESS.
+;
+;  Every path that can leave this board reachable over the air ends here
+;  and nowhere else: the boot bring-up, the `wifi join` command, the
+;  auto-heal WifiRejoin, the keepalive tick's background DHCP retry, and
+;  - through WifiAdoptAddress and the HwLinkAddressBound seam - the
+;  portable `dhcp` command running over the radio.
+;
+;  IT ARMS THE WIRELESS CONSOLE, and that is the point of gathering the
+;  paths. Arming used to be the CALLER's job, done after its own DHCP
+;  returned, and a caller whose one-shot address check had already run
+;  before the lease bound simply never did it - the board came up on the
+;  network with a deaf console and stayed that way until a human typed
+;  `wifi join` on the serial line. With the arm AT the transition there
+;  is no caller left to forget: whoever binds the address arms the
+;  console by the act of binding it.
+;
+;  IT NO LONGER ARMS THE CONSOLE ITSELF, 2026-09-07, AND THAT IS NOT A
+;  RETREAT FROM THE PARAGRAPH ABOVE. The console became link-agnostic
+;  (Anvil/Core/netconsole.pbi): it re-derives on every spin of the prompt
+;  whether it should be listening and on WHICH interface, from the board's
+;  actual state. An arm from inside this procedure could only ever assert
+;  "the radio has an address, so the console belongs on the radio", which
+;  is exactly the claim that stops being true the moment a cable is in.
+;  Whoever binds an address still gets a console within one turn of the
+;  prompt; what it does not get is a vote on which link that console uses.
+;
+;  IT NO LONGER HAS TO ASK PERMISSION TO WRITE, and that is the
+;  per-interface layer arriving. There used to be ONE IP record, so on a
+;  board that took a wired lease at boot and then auto-joined a wireless
+;  network, writing this lease into it would leave the stack holding the
+;  WIRED hardware address and the RADIO's IP - a board whose every reply
+;  is filtered out by something, with nothing anywhere reporting a fault.
+;  This procedure therefore wrote only when no other link was using the
+;  record. With one row PER INTERFACE the write can only ever land on the
+;  radio's own row, so the cable's is untouched no matter what happens
+;  here and there is nothing left to ask permission of.
+; ----------------------------------------------------------------------
+Procedure wifi_BindAddress(ip.i, mask.i, gw.i)
+  gWifiHaveIp = 1
+  ; BOTH HALVES OF THE IDENTITY, TOGETHER. The hardware address used to
+  ; be set by the console's own bring-up, which was fine while a console
+  ; could only be on this radio and was a hole the moment it could not:
+  ; the console now DERIVES which interface it belongs on by comparing
+  ; each link's hardware address against the row net.pi4 holds for it, so
+  ; a row with an address and no hardware address on it belongs to nobody
+  ; and no console can arm anywhere. Caught by
+  ; tools/a64/a64_wifistay_check.py, 2026-09-07, which reported it as
+  ; "the console did not arm after the bind" - the whole Wi-Fi-only boot
+  ; path, silently.
+  NetSetMac(#HW_LINK_WIFI, @wifi_ourMac[0])
+  NetSetIPv4(#HW_LINK_WIFI, ip, mask, gw)
+  ; ------------------------------------------------------------------
+  ; AND RECORD WHERE THE ADDRESS CAME FROM, 2026-09-07.
+  ;
+  ; The two lines above and this one write the SAME row - since the
+  ; per-interface change NetIfSet is a thin wrapper that sets the row's
+  ; MAC and address too (Anvil/Core/netif.pbi) - so this is not a second
+  ; copy of the address. What it adds is the provenance, #NET_ADDR_LEASE,
+  ; which is what `net` reports and what tells a later link-local
+  ; acquisition that this address was leased rather than picked.
+  ;
+  ; IT IS KEPT BESIDE THEM RATHER THAN REPLACING THEM because it reaches
+  ; the six bytes through HwLinkMacPtr and would do nothing at all if the
+  ; backend had not been handed the radio's pointer yet, whereas the pair
+  ; above writes wifi_ourMac unconditionally. Without the address on the
+  ; row the radio's boot lease - taken by WifiDhcp, which does not go
+  ; through Anvil/Core/netcfg.pbi's NetAddressBound - would appear on no
+  ; interface at all, so the console would arm on the cable and never on
+  ; the radio: the whole Wi-Fi boot path, silently.
+  ; ------------------------------------------------------------------
+  NetIfSet(#HW_LINK_WIFI, ip, mask, gw, #NET_ADDR_LEASE)
+  ; Seed the round-trip clock: the exchange that got us here is a
+  ; completed round trip (our REQUEST went out, the ACK came back), so
+  ; the link-death detector starts from now rather than from a stale
+  ; (or zero) timestamp.
+  gWifiRxProof = millis()
+  gWifiKaProbes = 0
+EndProcedure
+
+Procedure.i WifiDhcp()
+  If gWifiHaveIp <> 0
+    ProcedureReturn 1
+  EndIf
+  If gWifiKeyed = 0
+    ProcedureReturn 0
+  EndIf
+  ; Boot, manual join and recovery all drive the same per-interface
+  ; state/transport. The bounded foreground slice keeps running in the
+  ; background if the access point answers later.
+  If NetDhcpAcquire(#HW_LINK_WIFI, 6000, 1) = 0
+    PrintN("  DHCP: no lease completed in the foreground window. The common client")
+    PrintN("  remains active and will retry without disturbing the association.")
+    NetDhcpSay(#HW_LINK_WIFI)
+    ProcedureReturn 0
+  EndIf
+  WifiPrintNet()
+  NetDhcpSay(#HW_LINK_WIFI)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiAdoptAddress - THE RADIO WAS GIVEN AN ADDRESS BY SOMETHING THAT IS
+;  NOT WifiDhcp, and this is the board taking it as its own.
+;
+;  WHY IT EXISTS, and it is the whole of the 2026-09-06 defect. WifiDhcp
+;  above is not the only way this board ends up with an address on the
+;  radio: the portable `dhcp` command runs its own DISCOVER/REQUEST over
+;  whichever link the policy layer selected, and on this bench that link
+;  is the radio. That command lives in the shared command core, which is
+;  not allowed to name a radio, so it did the only portable thing - it
+;  put the lease into the one IP layer and moved on. The result was a
+;  board that ANSWERED PING and whose wireless console was DEAF: the
+;  IP layer had an address, the radio's own globals said it had none,
+;  and so the arm above never ran and the console's own
+;  "gWifiHaveIp = 0" guard would have refused it even if it had. Ping
+;  worked because the prompt's TCP tick pumps the IP layer whenever a
+;  link is selected, whether or not a console is listening - which is
+;  exactly why the board looked healthy from the outside.
+;
+;  The command tells the board through the HwLinkAddressBound seam and
+;  the board lands here. One bind point, whatever completed DHCP.
+; ----------------------------------------------------------------------
+Procedure WifiAdoptAddress(ip.i, mask.i, gw.i)
+  If ip = 0
+    ; Explicit address loss. The association and its keys remain intact;
+    ; only the lease-derived identity and clocks are invalidated.
+    gWifiIp = 0
+    gWifiMask = 0
+    gWifiGw = 0
+    gWifiHaveIp = 0
+    ProcedureReturn
+  EndIf
+  gWifiIp   = ip
+  gWifiMask = mask
+  gWifiGw   = gw
+  wifi_BindAddress(ip, mask, gw)
+EndProcedure
+
+; Put whatever net.pi4 staged in its out buffer onto the wire.
+Procedure wifi_SendNetOut()
+  Define n.i
+  Define i.i
+  Define src.i
+  Define dst.i
+  n = NetOutLen()
+  If n <= 0
+    ProcedureReturn
+  EndIf
+  src = NetOutBuf()
+  dst = Cyw43DataPtr()
+  i = 0
+  While i < n
+    PokeA(dst + i, PeekA(src + i))
+    i = i + 1
+  Wend
+  Cyw43Send(n)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wifi_ServiceEapol - one received EAPOL-Key (ethertype 0x888E) frame,
+;  DURING a live association. This is the receive path the death hid in:
+;  before this, the steady-state loops handed every frame to NetInput,
+;  which knows ARP/ICMP/UDP and silently drops 0x888E - so a mid-session
+;  rekey the access point started was never answered and the link went
+;  TX-only dead. Now the frame goes to the session supplicant, the new
+;  key is installed, and the reply goes back out.
+;
+;  It is called with the frame still in the CYW43 receive buffer; the
+;  supplicant writes to it (zeroes the MIC to check it, restores it) and
+;  the caller must not reuse the pointer afterward expecting the old
+;  bytes. Logging and the counters are the silicon evidence behind
+;  `wifi eapol`.
+; ----------------------------------------------------------------------
+Procedure wifi_ServiceEapol(*frame, len.i)
+  Define info.i
+  Define code.i
+  Define n.i
+  Define jrc.i
+  Define r.i
+
+  gWifiEapolSeen = gWifiEapolSeen + 1
+  gWifiEapolLast = millis()
+  If len >= #WPA2_FRAME_MIN
+    info = (PeekA(*frame + #WPA2_K_INFO) << 8) | PeekA(*frame + #WPA2_K_INFO + 1)
+  Else
+    info = 0
+  EndIf
+  gWifiEapolInfo = info
+
+  If gWifiEapolLog <> 0
+    Print("Wi-Fi: EAPOL-Key in, ")
+    PrintDec(len)
+    Print(" bytes, key-info $")
+    UartWrite(wifi_HexDigit((info >> 12) & 15))
+    UartWrite(wifi_HexDigit((info >> 8) & 15))
+    UartWrite(wifi_HexDigit((info >> 4) & 15))
+    UartWrite(wifi_HexDigit(info & 15))
+    Print("  ")
+    If (info & #WPA2_KI_MIC) = 0
+      PrintN("(PTK rekey message 1)")
+    ElseIf (info & #WPA2_KI_PAIRWISE) <> 0
+      PrintN("(PTK rekey message 3)")
+    Else
+      PrintN("(GROUP key rekey message 1)")
+    EndIf
+  EndIf
+
+  ; The observation build: log the rekey but do NOT answer it, so the
+  ; death it causes can be watched. The heal (if enabled) is the only
+  ; thing that then recovers - which is the mitigation, not the cure.
+  If gWifiRekeyOn = 0
+    ProcedureReturn
+  EndIf
+
+  ; A PTK rekey re-runs the four-way; give it a fresh SNonce first, the
+  ; same as wpa_supplicant does. A group rekey needs no nonce.
+  If Wpa2SupPeekPtkM1(*frame, len) <> 0
+    r = EntropyBytes(@wifi_snonce[0], 32, #ENTROPY_SPINS)
+    If r <> 32
+      For n = 0 To 31
+        wifi_snonce[n] = 0
+      Next
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_NONCE, r, 1)
+      ProcedureReturn
+    EndIf
+    Wpa2SupSetSnonce(@wifi_snonce[0])
+  EndIf
+
+  code = Wpa2SupHandleSession(*frame, len)
+
+  If code = #WPA2SUP_SENT_M2
+    ; PTK rekey, message 2 out. Keys not ready until message 3.
+    r = wifi_SendSup()
+    If r <> 0
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M2_TX, r, 1)
+    EndIf
+
+  ElseIf code = #WPA2SUP_SENT_M4
+    ; PTK rekey complete. SEND MESSAGE 4 FIRST, then install - the AP
+    ; installs its PTK on receiving message 4, so a frame sent under the
+    ; new key before then arrives as noise (the join learned this).
+    r = wifi_SendSup()
+    If r <> 0
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_TX, r, 1)
+    Else
+      jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+      If jrc <> 0
+        gWifiEapolErr = gWifiEapolErr + 1
+        wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_PTK, jrc, 1)
+      Else
+        r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+        If r <> 0
+          gWifiEapolErr = gWifiEapolErr + 1
+          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_GTK, r, 1)
+        Else
+          Wpa2SupSessionArm()
+          gWifiPtkKeyed = gWifiPtkKeyed + 1
+          If gWifiEapolLog <> 0
+            PrintN("Wi-Fi: pairwise key rekeyed mid-session - the link stays up.")
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+
+  ElseIf code = #WPA2SUP_SENT_G2
+    ; GROUP rekey. Install the new GTK (RX of broadcast), then send group
+    ; message 2. The PAIRWISE key is untouched. This is the frame that,
+    ; unanswered, was killing the link on the hour.
+    r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+    If r <> 0
+      gWifiEapolErr = gWifiEapolErr + 1
+      wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_GTK, r, 1)
+    Else
+      r = wifi_SendSup()
+      If r <> 0
+        gWifiEapolErr = gWifiEapolErr + 1
+        wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_TX, r, 1)
+      Else
+        gWifiGrpKeyed = gWifiGrpKeyed + 1
+        If gWifiEapolLog <> 0
+          PrintN("Wi-Fi: group key rekeyed - the hourly rekey is now serviced,")
+          PrintN("       so the link no longer goes TX-only dead when it happens.")
+        EndIf
+      EndIf
+    EndIf
+
+  ElseIf code < 0
+    gWifiEapolErr = gWifiEapolErr + 1
+    If gWifiEapolLog <> 0
+      Print("Wi-Fi: a mid-session EAPOL frame could not be serviced, code ")
+      PrintDec(code)
+      PrintNl()
+    EndIf
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE SEAMS THE POLICY AND CONSOLE LAYERS REACH THIS FILE THROUGH
+; ======================================================================
+;  RaspberryPi4/Lib/link.pi4 pumps received frames on behalf of every
+;  command that needs the network - ping, dns, dhcp, get, put, tcp,
+;  http get - so that those commands work over whichever interface is up
+;  (the ruling of 2026-09-02, forum topic 591), and Anvil/Core/
+;  netconsole.pbi pumps them on behalf of the console. ONE thing on this
+;  board is RADIO-SPECIFIC and must happen in both, or a long command over
+;  Wi-Fi loses the link and loses the operator:
+;
+;    the mid-session rekey, which is not IP and which NetInput drops
+;
+;  It is exposed as a public procedure rather than copied, because two
+;  copies of "what to do with an EAPOL frame" is exactly how one of them
+;  gets fixed and the other does not. Both pumps reach it through the
+;  board's HwLinkOfferRaw, so there is ONE implementation.
+;
+;  THE CONSOLE'S OWN DATAGRAMS USED TO BE THE SECOND SEAM HERE and are
+;  not any more. Taking a keystroke out of the stream is not a property
+;  of a radio - it never was, and treating it as one is what left a
+;  board on a cable with no console at all on 2026-09-07. It lives in
+;  Anvil/Core/netconsole.pbi now, which knows which interface it armed
+;  on; RaspberryPi4/Board/hw_link.pi4's HwLinkOfferUdp simply asks it.
+; ----------------------------------------------------------------------
+; WifiNoteRxProof - "something we asked for came back".
+;
+; gWifiRxProof is the ONLY input to the TX-only-death detector, and
+; until 2026-09-04 the only thing that fed it was the console pump
+; seeing an ARP reply. That was safe while the console pump was the
+; only consumer of received frames. It stopped being safe the moment
+; link.pi4 started pumping for the network commands: an ARP reply
+; consumed there never reached the console pump, the proof clock went
+; stale while the link was in fact perfectly healthy, and the self-heal
+; fired in the middle of a command - which is exactly what happened on
+; the first silicon run of `http get`, and it looked like a radio fault.
+;
+; Whoever consumes the frame feeds the clock. One line, one caller each.
+Procedure WifiNoteRxProof()
+  gWifiRxProof = millis()
+  gWifiKaProbes = 0
+EndProcedure
+
+; A MID-SESSION KEY FRAME IS NEVER THE ANSWER TO A COMMAND. The access point
+; sends it on its own schedule, and whichever pump happens to be running -
+; the prompt's, or the one inside `ping` or a transfer - delivers it. So
+; what servicing it says is a message, bracketed here at the one entry both
+; pumps share, and it never lands on the command line or inside another
+; command's output. See THE MESSAGE CONTEXT in RaspberryPi4/Lib/uart.pi4.
+Procedure.i WifiServiceEapolFrame(*frame, len.i)
+  UartMessageBegin()
+  wifi_ServiceEapol(*frame, len)
+  UartMessageEnd()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wifi_NetAddrIsOurs - is net.pi4's ROW FOR THE RADIO configured, and
+;  configured with the radio's own hardware address?
+;
+;  IT USED TO ASK A DIFFERENT AND HARDER QUESTION. There was ONE IP layer
+;  that two links could configure (project ruling 2026-09-02:
+;  net/ping/dns/dhcp/get/put/tcp ride whichever link is up), so net.pi4
+;  held exactly one hardware address at a time and the one it held said
+;  which interface owned the layer. A "no" meant the CABLE had it, and
+;  anything this file then built would have left the radio wearing the
+;  cable's hardware address - a frame every access point filters out,
+;  with nothing anywhere reporting a fault.
+;
+;  WITH ONE ROW PER INTERFACE A "NO" CAN ONLY MEAN ONE THING: nothing has
+;  written the radio's row yet, because the only two writers of that row
+;  on this board (wifi_BindAddress here and HwLinkOpen's radio arm in
+;  RaspberryPi4/Board/eth.pi4) both write wifi_ourMac into it. The
+;  comparison is kept rather than reduced to NetMacSet(#HW_LINK_WIFI)
+;  because it is six byte compares that turn "some third writer got the
+;  kind wrong" from a silent radio into a caught one, and this is the
+;  file that would be blamed for it.
+;
+;  IT IS NO LONGER THE CONSOLE'S TEST, 2026-09-07. The console asks the
+;  same question of EVERY link and arms on whichever one answers yes
+;  (Anvil/Core/netconsole.pbi). What is left here are the two things that
+;  really are the radio's alone: whether the radio's own receive pump may
+;  hand a frame to the IP layer, and whether the keepalive must refresh
+;  the row before it builds an ARP request out of it.
+; ----------------------------------------------------------------------
+Procedure.i wifi_NetAddrIsOurs()
+  Define i.i
+  If NetMacSet(#HW_LINK_WIFI) = 0
+    ProcedureReturn 0
+  EndIf
+  If NetGetMac(#HW_LINK_WIFI, @wifi_netMac[0]) = 0
+    ProcedureReturn 0
+  EndIf
+  For i = 0 To 5
+    If wifi_netMac[i] <> wifi_ourMac[i]
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiDrainEvents - read everything the radio has said since last time,
+;  and latch anything that means the link is gone.
+;
+;  NO BUS ACCESS. The receive path already pulled these off the wire into
+;  the ring; this walks the ring. It is therefore cheap enough to call on
+;  every spin of the prompt, which is the point - see the long note over
+;  gWifiTeardown for why twenty seconds was too slow and why this latches
+;  rather than acting.
+; ----------------------------------------------------------------------
+Procedure WifiDrainEvents()
+  Define et.i
+  Define er.i
+  Define ef.i
+  Define down.i
+
+  gWifiEvtDrops = Cyw43EventsDropped()
+
+  While Cyw43PopEvent() <> 0
+    et = Cyw43JoinEventType()
+    er = Cyw43JoinEventReason()
+    ef = Cyw43JoinEventFlags()
+    gWifiEvtLast = millis()
+    gWifiEvtType = et
+    gWifiEvtReason = er
+
+    down = 0
+    If et = #CYW43_EV_DEAUTH Or et = #CYW43_EV_DEAUTH_IND Or et = #CYW43_EV_DISASSOC_IND
+      down = 1
+    ElseIf et = #CYW43_EV_LINK
+      ; The up/down bit is in FLAGS, not status. Clear means down, and
+      ; this is the event the old drain read past.
+      If (ef & #CYW43_EV_LINK_UP_FLAG) = 0
+        down = 1
+      EndIf
+    EndIf
+
+    If down <> 0
+      gWifiDeauths = gWifiDeauths + 1
+      gWifiTeardown = 1
+      gWifiTdType = et
+      gWifiTdReason = er
+    ElseIf et = #CYW43_EV_DISASSOC
+      ; Locally generated, per the reference driver. Not a teardown on its
+      ; own - but ask the firmware, now, rather than at the next cadence.
+      gWifiVerify = 1
+    ElseIf et = #CYW43_EV_ROAM
+      ; THE FIRMWARE MOVED THE ASSOCIATION AND OUR KEYS DID NOT MOVE WITH
+      ; IT. On this part the supplicant is in the host, and the pairwise
+      ; key it installed is bound to the BSSID it handshook with; the
+      ; reference driver hands a roam up to the host stack precisely
+      ; because it cannot rekey by itself. So a roam is a link that is
+      ; about to stop decrypting, and the honest answer is to re-run the
+      ; association we own. The bring-up asks the firmware not to roam at
+      ; all (roam_off); this counter is how we find out it did anyway.
+      gWifiRoams = gWifiRoams + 1
+      gWifiTeardown = 1
+      gWifiTdType = et
+      gWifiTdReason = er
+    EndIf
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiRadioPump - KEEP THE RADIO SERVICED WHATEVER ELSE IS OR IS NOT
+;  RUNNING. This is the fix for the rekey that arrived and was not read
+;  for half an hour.
+;
+;  THE DEFECT IT CLOSES. Until 2026-09-06 exactly two things in the whole
+;  monitor ever consumed a frame from the radio at the prompt, and BOTH
+;  of them are gated on state that has nothing to do with the radio:
+;
+;    the console pump   returns at its first line unless the console is
+;                       listening
+;    TcpTick            returns at its first line unless LinkUp() - some
+;                       network command has run and chosen an interface
+;
+;  On a board that has auto-joined at boot and had no command typed at
+;  it, gLinkKind is #HW_LINK_NONE, so the second is a no-op; and if the
+;  console has not armed, so is the first. NOTHING READS THE RADIO. The
+;  access point's group-key rekey then sits in the firmware's queue
+;  unanswered - which is the death this lane exists for - and the
+;  evidence is that the rekey line printed during the MANUAL re-join
+;  half an hour later, because that was the first thing to drain the
+;  queue.
+;
+;  SERVICING A REKEY MUST NOT DEPEND ON A CONSOLE BEING ARMED. It is
+;  called from WifiLinkTick, which the prompt runs unconditionally.
+;
+;  IT DOES NOT DUPLICATE THE CONSOLE PUMP, AND THE TEST IS NOW WHETHER
+;  THE CONSOLE IS ON *THIS RADIO*, 2026-09-07. It used to be "is the
+;  console listening at all", which was the same question while a console
+;  could only ride a radio. It is not the same question any more: a
+;  console armed on the CABLE consumes nothing from the radio, so this
+;  pump must keep running or the group-key rekey goes unread again - the
+;  exact death of 2026-09-06, reintroduced from the other side. The board
+;  is told which link the console armed on (HwLinkConsoleArmed) and this
+;  file keeps the one bit it needs.
+;
+;  TWO CONSUMERS OF ONE QUEUE IS WHY THE BIT EXISTS. When the console IS
+;  on the radio, both pumps read the same firmware queue and only one of
+;  them delivers keystrokes - so anything this one swallowed would be an
+;  operator's typing, silently lost.
+;
+;  IT WILL NOT ANSWER OUT OF THE WRONG IDENTITY. If the IP layer is
+;  configured for some OTHER interface, a frame is still read (so the
+;  queue drains and a rekey is serviced) but it is NOT handed to NetInput
+;  - answering an ARP for the wired card out of the radio is the mistake
+;  the MAC comparison above exists to stop.
+; ----------------------------------------------------------------------
+Global gWifiRadioLast.i = 0        ; millis() of the last radio pump
+#WIFI_PUMP_BUDGET = 4              ; frames per pump; a burst must not stall
+                                   ;   the prompt, and a rekey is one frame
+
+; 1 while the network console is armed ON THIS RADIO and is therefore the
+; thing consuming its received frames. Written only by the board's
+; HwLinkConsoleArmed, which the console calls when it arms and disarms.
+Global gWifiConOwnsRx.i = 0
+
+Procedure WifiSetConsoleOwnsRx(on.i)
+  If on <> 0
+    gWifiConOwnsRx = 1
+  Else
+    gWifiConOwnsRx = 0
+  EndIf
+EndProcedure
+
+Procedure WifiRadioPump()
+  Define nRx.i
+  Define rc.i
+  Define k.i
+
+  WifiDrainEvents()
+
+  If gWifiKeyed = 0
+    ProcedureReturn
+  EndIf
+  If gWifiConOwnsRx <> 0
+    ProcedureReturn
+  EndIf
+  If (millis() - gWifiRadioLast) < 5
+    ProcedureReturn
+  EndIf
+  gWifiRadioLast = millis()
+
+  k = 0
+  While k < #WIFI_PUMP_BUDGET
+    nRx = Cyw43Receive(0)
+    If nRx < 14
+      Break
+    EndIf
+    If HwLinkOfferRaw(#HW_LINK_WIFI, Cyw43ReceivePtr(), nRx) = 0
+      ; The radio pump and the console pump use the same dispatcher. In
+      ; particular, a port-68 OFFER arriving before this interface has an
+      ; address must reach the common DHCP client rather than be discarded
+      ; merely because wifi_NetAddrIsOurs is still false.
+      rc = NetInput(#HW_LINK_WIFI, Cyw43ReceivePtr(), nRx)
+      HwLinkNoteRx(#HW_LINK_WIFI, rc)
+      NetServiceInput(#HW_LINK_WIFI, Cyw43ReceivePtr(), rc)
+    EndIf
+    k = k + 1
+    ; A serviced EAPOL frame may have invalidated this live session. Finish the
+    ; complete frame iteration, then stop before another receive can be offered
+    ; to IP under keys that outer service has not yet cleaned up.
+    If gWifiEapolRecover <> 0
+      Break
+    EndIf
+  Wend
+
+  WifiDrainEvents()
+EndProcedure
+
+; ======================================================================
+;  LINK HEALTH - keep the association alive, and get it back if it dies.
+;
+;  THE PROBLEM THIS SOLVES, observed on the bench: after a long idle the
+;  access point DEAUTHENTICATES the board (~2 h with no traffic seen),
+;  and NOTHING on the board notices. gWifiKeyed stays 1 and the console
+;  stays armed, so the monitor still believes it is at the previous lease address,
+;  while a host trying to reach it gets "destination host unreachable".
+;  The only recovery was a serial reset - which defeats the whole point
+;  of a console that rides the network.
+;
+;  TWO INDEPENDENT HALVES, and both are wanted:
+;
+;   1. A KEEPALIVE so the idle-out never happens. Every #WIFI_KA_MS we
+;      send one real over-the-air frame - an ARP request for the router -
+;      which resets the AP's inactivity timer for this station. It is a
+;      broadcast, so it needs no neighbour cache, and its reply also
+;      exercises the return path. #WIFI_KA_MS is 20 s, two orders of
+;      magnitude under the ~2 h the AP was seen to tolerate.
+;
+;   2. A DETECTOR so that if the link dies anyway - a reboot of the AP, a
+;      channel change, walking out of range - the board gets itself back
+;      rather than sitting there unreachable. On the same cadence we ask
+;      the FIRMWARE ITSELF whether it is still associated, with
+;      Cyw43ReadBssid: it answers 0 when it has been deauthenticated
+;      (WLC_GET_BSSID returns -17 NOTASSOCIATED). That is authoritative -
+;      it is the radio's own opinion, not a guess from missing traffic -
+;      and it costs one SDIO ioctl, no over-the-air round trip.
+;
+;  WHY A STRIKE COUNTER. A re-association is disruptive (a scan, the
+;  handshake, a fresh DHCP - several seconds with the console down), so
+;  it must not fire on a single flaky ioctl read. Two consecutive bad
+;  reads (#WIFI_LINK_STRIKES) are required, ~40 s of the firmware
+;  agreeing it is gone, which against a 2 h idle window is still prompt.
+;
+;  WHAT STAYS UP ACROSS A REJOIN. The chip, the firmware and the 600 KB
+;  blob upload (gWifiUp) all survive - only the 802.11 association and the
+;  DHCP lease were lost. Automatic recovery replays the same scan, security,
+;  handshake and common-DHCP transitions as explicit phases, giving the
+;  prompt and the cable a service turn between them. The manual WifiRejoin
+;  compatibility path remains synchronous and uses the proven boot helpers.
+;  The console re-arms from the per-interface address when DHCP binds.
+;
+;  This module keeps NO screen dependency, exactly like the rest of
+;  wifi.pi4 - it prints through the mirror ring and the monitor's pump
+;  puts that on the glass. WifiLinkTick is called from the prompt's spin
+;  loop (parse.pi4), so it never runs during a payload, a flash, or a long
+;  command - only while the board is sitting at the prompt, which is
+;  exactly when a silent idle-out would otherwise strand it.
+; ======================================================================
+
+#WIFI_KA_MS        = 20000     ; keepalive + health cadence, ms (<< AP idle)
+#WIFI_BSSID_MS     = 400       ; ioctl timeout for the association probe
+#WIFI_LINK_STRIKES = 2         ; consecutive bad reads before a rejoin
+#WIFI_PROOF_MS     = 45000     ; nothing heard for this long, with keepalives asking
+                               ;   for an answer -> the link is dead whatever the
+                               ;   firmware's association poll says (see below)
+#WIFI_HEAL_MS      = 60000     ; cadence of automatic rejoin retries after a heal failed
+
+Global gWifiLinkOn.i   = 1     ; 1 = periodic keepalive + health active
+Global gWifiKaLast.i   = 0     ; millis() of the last health cycle (0 = unseeded)
+Global gWifiBadReads.i = 0     ; consecutive "not associated" reads
+Global gWifiRejoins.i  = 0     ; successful re-associations since boot
+Global gWifiDropReq.i  = 0     ; test hook: force the next tick to rejoin
+
+; gWifiRxProof / gWifiKaProbes - the proof-of-traffic clock the detector
+; below runs on - are declared up beside WifiDhcp, because the DHCP bind
+; and the receive paths (which run earlier in this file) feed them and
+; EnableExplicit rightly demands declaration before use.
+Global gWifiHealPend.i = 0     ; a rejoin failed part-way; keep retrying on the cadence
+Global gWifiHealLast.i = 0     ; millis() of the last automatic heal retry
+
+; Automatic recovery is a cooperative state machine. Boot and explicit
+; commands retain their synchronous, narrated path; WifiLinkTick never calls
+; that path. A phase may contain one existing atomic firmware ioctl, whose
+; timeout is still a real stall until CYW43 gains a begin/poll control API,
+; but scan/join/handshake/DHCP and PBKDF never form a multi-second loop here.
+#WIFI_REC_IDLE          = 0
+#WIFI_REC_LEAVE         = 1
+#WIFI_REC_QUIET         = 2
+#WIFI_REC_SEC_MAC       = 3
+#WIFI_REC_SEC_ENTROPY   = 4
+#WIFI_REC_SEC_RSN       = 5
+#WIFI_REC_SEC_ITEM      = 6
+#WIFI_REC_SCAN_START    = 7
+#WIFI_REC_SCAN_POLL     = 8
+#WIFI_REC_SCAN_SELECT   = 9
+#WIFI_REC_PMK           = 10
+#WIFI_REC_PBKDF         = 11
+#WIFI_REC_DISASSOC      = 12
+#WIFI_REC_JOIN_QUIET    = 13
+#WIFI_REC_JOIN_START    = 14
+#WIFI_REC_JOIN_POLL     = 15
+#WIFI_REC_VERIFY_SSID   = 16
+#WIFI_REC_ASSOC_IE      = 17
+#WIFI_REC_EAPOL_BEGIN   = 18
+#WIFI_REC_EAPOL_RX      = 19
+#WIFI_REC_PTK_INSTALL   = 20
+#WIFI_REC_GTK_INSTALL   = 21
+#WIFI_REC_PERSIST       = 22
+#WIFI_REC_DHCP_START    = 23
+#WIFI_REC_DHCP_WAIT     = 24
+
+; Radio initialization is deliberately a DIFFERENT generation from association
+; recovery. It advances one existing top-level primitive per WifiLinkTick and
+; leaves every primitive's present synchronous bound intact. The coarse slice
+; removes the whole-chain retry from prompt service; it does not claim that an
+; individual mailbox, SDIO or firmware-control call is nonblocking.
+#WIFI_RINIT_IDLE        = 0
+#WIFI_RINIT_BACKOFF     = 1
+#WIFI_RINIT_RESTORE     = 2
+#WIFI_RINIT_BLOBS       = 3
+#WIFI_RINIT_MBX_INIT    = 4
+#WIFI_RINIT_CLOCK_BEGIN = 5
+#WIFI_RINIT_CLOCK_TRY   = 6
+#WIFI_RINIT_CLOCK_WAIT  = 7
+#WIFI_RINIT_CLOCK_SET   = 8
+#WIFI_RINIT_WLON        = 9
+#WIFI_RINIT_SDIO        = 10
+#WIFI_RINIT_F1          = 11
+#WIFI_RINIT_IO          = 12
+#WIFI_RINIT_BLOCK_IO    = 13
+#WIFI_RINIT_ATTACH      = 14
+#WIFI_RINIT_BLOCK_MODE  = 15
+#WIFI_RINIT_PREPARE     = 16
+#WIFI_RINIT_VERIFY_MODE = 17
+#WIFI_RINIT_FW          = 18
+#WIFI_RINIT_NVRAM       = 19
+#WIFI_RINIT_START       = 20
+#WIFI_RINIT_HT          = 21
+#WIFI_RINIT_ANNOUNCE    = 22
+#WIFI_RINIT_F2          = 23
+#WIFI_RINIT_TRANSPORT   = 24
+#WIFI_RINIT_ROAM        = 25
+#WIFI_RINIT_POWER       = 26
+#WIFI_RINIT_READY       = 27
+
+#WIFI_REC_QUIET_MS      = 120
+#WIFI_REC_PBKDF_PRFS    = 16  ; compute-work bound, not a time promise
+; RNG200 generates at the configured 1 MHz and withholds the first 262144
+; bits. Two seconds is a failure deadline more than seven warm-up intervals,
+; not a delay: every ready word advances immediately.
+#WIFI_REC_ENTROPY_MS    = 2000
+
+Global gWifiRecPhase.i = #WIFI_REC_IDLE
+Global gWifiRecGeneration.i = 0
+Global gWifiRecStepGeneration.i = 0
+Global gWifiRecAnnounce.i = 0
+Global gWifiRecAt.i = 0
+Global gWifiRecSlices.i = 0
+Global gWifiRecFound.i = 0
+Global gWifiRecBand.i = 0
+Global gWifiRecScan.i = 0
+Global gWifiRecSlot.i = 0
+Global gWifiRecAttempt.i = 0
+Global gWifiRecSecItem.i = 0
+Global gWifiRecFp.i = 0
+Global gWifiRecM1.i = 0
+Global gWifiRecPtkRc.i = 0
+Global gWifiRecEntropyWords.i = 0
+; Diagnostics survive cancellation so `wifi status` and a failure line can
+; identify the exact cooperative phase and the driver's return. A firmware
+; status is meaningful only when the transport return is #CYW43_IO_STATUS.
+Global gWifiRecLastFailPhase.i = #WIFI_REC_IDLE
+Global gWifiRecLastFailRc.i = 0
+Global gWifiRecLastFailStatus.i = 0
+; Cyw43EventsDropped is cumulative across ring clears. Snapshot it for each
+; join request and reject only a new delta belonging to that attempt.
+Global gWifiRecEventDropBase.i = 0
+; A fingerprint selects a cache row; it does not prove the cached PMK. One
+; failed cached-key handshake is therefore allowed exactly one fresh PBKDF.
+Global gWifiRecPmkCached.i = 0
+Global gWifiRecFreshFallback.i = 0
+Global gWifiRecPmkNeedsStore.i = 0
+Global Dim wifi_recSsid.a[33]
+Global gWifiRecSsidLen.i = 0
+; SettingsGet promises a value pointer only until that key is removed or the
+; table is reset. PBKDF spans hundreds of prompt turns, so a generic settings
+; load/reset must not leave it retaining an invalid borrowed address. Copy the
+; bounded WPA2 passphrase into recovery-owned storage for the whole derivation
+; and wipe it with the rest of the generation's secret material.
+Global Dim wifi_recPass.a[#WPA2_PASS_MAX + 1]
+Global gWifiRecPassLen.i = 0
+Global Dim wifi_recPmk.a[32]
+
+; Coarse radio-initialization ownership. BACKOFF uses the existing slow heal
+; cadence and unsigned subtraction; it schedules a new attempt but is not the
+; mechanism that makes the attempt cooperative. A primitive may synchronously
+; consume its documented timeout, after which the next phase returns control to
+; the ordinary wired/display/watchdog service loop.
+Global gWifiRinitPhase.i = #WIFI_RINIT_IDLE
+Global gWifiRinitGeneration.i = 0
+Global gWifiRinitStepGeneration.i = 0
+
+Global gWifiRinitAt.i = 0
+Global gWifiRinitAttempts.i = 0
+Global gWifiRinitClockHz.i = 0
+Global gWifiRinitClockTry.i = 0
+Global gWifiRinitClockAt.i = 0
+Global gWifiRinitAnnounce.i = 0
+Global gWifiRinitLastFailPhase.i = #WIFI_RINIT_IDLE
+Global gWifiRinitLastFailRc.i = 0
+Global gWifiRinitLastSdio.i = 0
+Global gWifiRinitLastCyw.i = 0
+Global gWifiRinitRoamRc.i = 0
+Global gWifiRinitPowerRc.i = 0
+Global gWifiRinitBlockMode.i = 0
+Global gWifiRinitFwCalls.i = 0
+
+; Cancellation performs no radio I/O. It invalidates phase ownership so a late
+; return from a synchronous primitive cannot advance or publish an old
+; generation. Saved settings and the persisted PMK cache are not touched.
+Procedure WifiRadioInitCancel()
+  gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+  gWifiRinitStepGeneration = 0
+  gWifiRinitPhase = #WIFI_RINIT_IDLE
+  gWifiRinitAt = 0
+  gWifiRinitAnnounce = 0
+  gWifiRinitClockHz = 0
+  gWifiRinitClockTry = 0
+  gWifiRinitClockAt = 0
+  gWifiRinitBlockMode = 0
+EndProcedure
+
+Procedure.i WifiRadioInitActive()
+  ProcedureReturn Bool(gWifiRinitPhase <> #WIFI_RINIT_IDLE)
+EndProcedure
+
+Procedure.i WifiRadioInitPhase()
+  ProcedureReturn gWifiRinitPhase
+EndProcedure
+
+Procedure.i WifiRadioInitAttempts()
+  ProcedureReturn gWifiRinitAttempts
+EndProcedure
+
+Procedure.i WifiRadioInitFirmwareCalls()
+  ProcedureReturn gWifiRinitFwCalls
+EndProcedure
+
+Procedure.i WifiRadioInitLastFailPhase()
+  ProcedureReturn gWifiRinitLastFailPhase
+EndProcedure
+
+Procedure.i WifiRadioInitLastFailRc()
+  ProcedureReturn gWifiRinitLastFailRc
+EndProcedure
+
+; Cancel has no radio I/O. Generation invalidation makes an old phase unable
+; to resume after a manual command or configuration change has taken over.
+; The private resumable U/T state and every recovery-owned PMK byte go too.
+Procedure WifiRecoveryCancel()
+  Define i.i
+  Define wasActive.i
+  Define ownedHandshake.i
+  Define brokenSession.i
+  wasActive = Bool(gWifiRecPhase <> #WIFI_REC_IDLE)
+  ownedHandshake = Bool(gWifiRecPhase >= #WIFI_REC_EAPOL_BEGIN And gWifiRecPhase <= #WIFI_REC_GTK_INSTALL)
+  brokenSession = Bool(gWifiEapolRecover <> 0)
+  ; Every explicit/manual/settings/policy owner already crosses this common
+  ; cancellation seam. Let the radio owner invalidate its own generation
+  ; before the association generation is replaced.
+  WifiRadioInitCancel()
+  gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
+  gWifiRecStepGeneration = 0
+  gWifiRecPhase = #WIFI_REC_IDLE
+  gWifiHealPend = 0
+  Pbkdf2StepWipe()
+  For i = 0 To #WPA2_PASS_MAX
+    wifi_recPass[i] = 0
+  Next
+  gWifiRecPassLen = 0
+  gWifiRecPmkCached = 0
+  gWifiRecFreshFallback = 0
+  gWifiRecPmkNeedsStore = 0
+  ; Manual replacement, policy cancellation and every new recovery generation
+  ; own this boundary. A late callback failure must not tear down their newer
+  ; session; retain the last diagnostic but discard its pending action.
+  gWifiEapolRecover = 0
+  gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE
+  gWifiEapolRecoverRc = 0
+  For i = 0 To 31
+    wifi_recPmk[i] = 0
+    wifi_pmk[i] = 0
+    wifi_snonce[i] = 0
+  Next
+  ; Once GTK installation has completed, Wpa2SupSessionArm owns the live
+  ; association's rekey material. Cancelling a later DHCP wait must not wipe
+  ; that live session merely because the address is still pending.
+  If wasActive <> 0 And ownedHandshake <> 0
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+  EndIf
+  ; If an explicit policy/manual owner cancels after a callback latched failure
+  ; but before WifiLinkTick consumes it, cancellation owns the same live-session
+  ; cleanup. Scalar eligibility was already closed in the callback; this also
+  ; revokes the common DHCP/interface identity and live crypto state.
+  If brokenSession <> 0
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+    wifi_RecordLinkDown()
+  EndIf
+EndProcedure
+
+; Record the link-down truth independently of the policy that decides
+; whether to re-associate. Observation mode may suppress healing, but it
+; must not leave a dead association keyed, addressed and route-eligible.
+Procedure wifi_RecordLinkDown()
+  NetDhcpLinkDown(#HW_LINK_WIFI)
+  gWifiKeyed = 0
+  gWifiHaveIp = 0
+  gWifiSecDone = 0
+  gWifiBadReads = 0
+  gWifiTeardown = 0
+  gWifiVerify = 0
+  gWifiHealPend = 0
+  gWifiKaProbes = 0
+  gWifiKaLast = 0
+EndProcedure
+
+; Arm one slow automatic retry after a foreground boot attempt failed before
+; gWifiUp was published. This owns no saved credential or PMK bytes: radio
+; initialization only makes the firmware available, then hands current settings
+; to the existing association-recovery machine.
+Procedure WifiRadioInitArm(announce.i)
+  If gWifiUp <> 0 Or gWifiRinitPhase <> #WIFI_RINIT_IDLE
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0
+    ProcedureReturn
+  EndIf
+  If SettingsWifiSlotCount() = 0
+    ProcedureReturn
+  EndIf
+
+  ; The association generation and any live lease/key claim are not valid for
+  ; an unready radio. Cancel first, then establish a new radio owner.
+  WifiRecoveryCancel()
+  wifi_RecordLinkDown()
+  gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+  gWifiRinitStepGeneration = gWifiRinitGeneration
+  gWifiRinitPhase = #WIFI_RINIT_BACKOFF
+  gWifiRinitAt = millis()
+  gWifiRinitAnnounce = Bool(announce <> 0)
+  If gWifiRinitAnnounce <> 0
+    PrintN("Wi-Fi: radio initialization will retry cooperatively; wired Ethernet remains available.")
+  EndIf
+EndProcedure
+
+Procedure.i wifi_RadioInitStillOwned(generation.i)
+  If gWifiRinitPhase = #WIFI_RINIT_IDLE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Bool(gWifiRinitGeneration = generation And gWifiRinitStepGeneration = generation)
+EndProcedure
+
+Procedure wifi_RadioInitFail(phase.i, rc.i)
+  gWifiUp = 0
+  gWifiRinitLastFailPhase = phase
+  gWifiRinitLastFailRc = rc
+  gWifiRinitLastSdio = SdioLastError()
+  gWifiRinitLastCyw = Cyw43LastError()
+  wifi_RecordLinkDown()
+  gWifiRinitPhase = #WIFI_RINIT_BACKOFF
+  gWifiRinitAt = millis()
+  If gWifiRinitAnnounce <> 0
+    Print("Wi-Fi: cooperative radio initialization stopped at phase ")
+    PrintDec(phase)
+    Print(" (result ")
+    PrintDec(rc)
+    PrintN("); it will retry on the normal recovery cadence.")
+  EndIf
+EndProcedure
+
+; One existing top-level primitive per call. Read-only accessors and state
+; publication do not count as bus work. Every primitive is followed by the
+; generation check before phase state can advance, so a nested cancellation or
+; foreground takeover makes the result stale.
+Procedure WifiRadioInitTick()
+  Define phase.i
+  Define generation.i
+  Define r.i
+  Define now.i
+
+  If gWifiRinitPhase = #WIFI_RINIT_IDLE
+    ProcedureReturn
+  EndIf
+  If gWifiUp <> 0
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0 Or SettingsWifiSlotCount() = 0
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiRinitStepGeneration <> gWifiRinitGeneration
+    WifiRadioInitCancel()
+    ProcedureReturn
+  EndIf
+
+  phase = gWifiRinitPhase
+  generation = gWifiRinitGeneration
+
+  Select phase
+    Case #WIFI_RINIT_BACKOFF
+      now = millis()
+      If ((now - gWifiRinitAt) & $FFFFFFFF) < #WIFI_HEAL_MS
+        ProcedureReturn
+      EndIf
+      ; A retry is a new hardware generation. No failed attempt's phase or
+      ; partial firmware offset is eligible for reuse.
+      gWifiRinitGeneration = (gWifiRinitGeneration + 1) & $FFFFFFFF
+      gWifiRinitStepGeneration = gWifiRinitGeneration
+      gWifiRinitAttempts = gWifiRinitAttempts + 1
+      gWifiRinitPhase = #WIFI_RINIT_RESTORE
+      ProcedureReturn
+
+    Case #WIFI_RINIT_RESTORE
+      ; The optional forum-737 observer owns exact old-generation card/host
+      ; snapshots until verified disable. No destructive primitive below may run
+      ; after a failed restoration.
+      r = wifi_RadioGenerationPreflight()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOBS
+
+    Case #WIFI_RINIT_BLOBS
+      r = WifiLoadBlobs()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_MBX_INIT
+
+    Case #WIFI_RINIT_MBX_INIT
+      r = MailboxInit()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK_BEGIN
+
+    Case #WIFI_RINIT_CLOCK_BEGIN
+      gWifiRinitClockTry = 0
+      gWifiRinitClockAt = millis()
+      gWifiRinitClockHz = 0
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK_TRY
+      ProcedureReturn
+
+    Case #WIFI_RINIT_CLOCK_TRY
+      ; One complete mailbox transaction remains atomic. The retry loop and
+      ; its gaps do not: each failed reply returns to the outer service owner.
+      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <= 0
+        gWifiRinitClockTry = gWifiRinitClockTry + 1
+        If gWifiRinitClockTry >= #WIFI_CLOCK_TRIES
+          wifi_RadioInitFail(phase, r)
+          ProcedureReturn
+        EndIf
+        gWifiRinitClockAt = millis()
+        gWifiRinitPhase = #WIFI_RINIT_CLOCK_WAIT
+        ProcedureReturn
+      EndIf
+      gWifiRinitClockHz = r
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK_SET
+
+    Case #WIFI_RINIT_CLOCK_WAIT
+      If ((millis() - gWifiRinitClockAt) & $FFFFFFFF) < #WIFI_CLOCK_GAP_MS
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_CLOCK_TRY
+
+    Case #WIFI_RINIT_CLOCK_SET
+      SdioSetBaseClockKhz(gWifiRinitClockHz / 1000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_WLON
+
+    Case #WIFI_RINIT_WLON
+      r = SdioAssertWlOn()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_SDIO
+
+    Case #WIFI_RINIT_SDIO
+      r = SdioInit()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_F1
+
+    Case #WIFI_RINIT_F1
+      r = SdioEnableFunction(1)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_IO
+
+    Case #WIFI_RINIT_IO
+      r = Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOCK_IO
+
+    Case #WIFI_RINIT_BLOCK_IO
+      r = Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ATTACH
+
+    Case #WIFI_RINIT_ATTACH
+      r = Cyw43Attach()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_BLOCK_MODE
+
+    Case #WIFI_RINIT_BLOCK_MODE
+      r = Cyw43SetBlockMode(1)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      ; This API returns the selected mode, not an operation status. Zero is
+      ; the supported byte-mode fallback used by the existing radio path.
+      gWifiRinitBlockMode = r
+      gWifiRinitPhase = #WIFI_RINIT_PREPARE
+
+    Case #WIFI_RINIT_PREPARE
+      r = Cyw43PrepareDownload()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_VERIFY_MODE
+
+    Case #WIFI_RINIT_VERIFY_MODE
+      Cyw43SetVerify(2)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_FW
+
+    Case #WIFI_RINIT_FW
+      gWifiRinitFwCalls = gWifiRinitFwCalls + 1
+      r = Cyw43UploadFirmware(#WIFI_FW_ADDR, #WIFI_FW_LEN, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_NVRAM
+
+    Case #WIFI_RINIT_NVRAM
+      r = Cyw43UploadNvram(#WIFI_NV_ADDR, #WIFI_NV_LEN, #WIFI_NV_WORK, #WIFI_NV_WORK_MAX, #WIFI_SCRATCH, #WIFI_SCRATCH_LEN)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_START
+
+    Case #WIFI_RINIT_START
+      r = Cyw43Start()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_HT
+
+    Case #WIFI_RINIT_HT
+      r = Cyw43HtClock()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ANNOUNCE
+
+    Case #WIFI_RINIT_ANNOUNCE
+      r = Cyw43AnnounceHost()
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_F2
+
+    Case #WIFI_RINIT_F2
+      r = SdioEnableFunction(2)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 1
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_TRANSPORT
+
+    Case #WIFI_RINIT_TRANSPORT
+      r = Cyw43WifiUp(#WIFI_CLM_ADDR, #WIFI_CLM_LEN, #CYW43_EVMASK_JOIN, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      If r <> 0
+        wifi_RadioInitFail(phase, r)
+        ProcedureReturn
+      EndIf
+      gWifiRinitPhase = #WIFI_RINIT_ROAM
+
+    Case #WIFI_RINIT_ROAM
+      r = Cyw43SetRoamOff(1, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitRoamRc = r
+      gWifiRinitPhase = #WIFI_RINIT_POWER
+
+    Case #WIFI_RINIT_POWER
+      r = Cyw43SetPowerMode(#CYW43_PM_OFF, 2000)
+      If wifi_RadioInitStillOwned(generation) = 0
+        ProcedureReturn
+      EndIf
+      gWifiRinitPowerRc = r
+      gWifiRinitPhase = #WIFI_RINIT_READY
+
+    Case #WIFI_RINIT_READY
+      ; Publish only after every mandatory stage. Roam/power policy retains the
+      ; existing nonfatal meaning and its exact result remains diagnostic.
+      gWifiUp = 1
+      gWifiRinitPhase = #WIFI_RINIT_IDLE
+      gWifiRinitStepGeneration = 0
+      If gWifiRinitAnnounce <> 0
+        PrintN("Wi-Fi: radio initialization recovered; association will continue cooperatively.")
+      EndIf
+      gWifiRinitAnnounce = 0
+      WifiRecoveryStart(1)
+
+    Default
+      wifi_RadioInitFail(phase, -1)
+  EndSelect
+EndProcedure
+
+; A failed foreground join at boot has the same eventual-connect obligation
+; whether it stopped before or after the firmware became ready. An unready radio
+; arms the coarse initializer above; a ready radio arms the existing association
+; generation. Both use the same slow cadence and neither reruns a whole blocking
+; foreground join from prompt service.
+Procedure WifiRecoveryInitialJoinFailed()
+  If gWifiUp = 0
+    If gWifiLinkOn = 0 Or gWifiHealOn = 0
+      wifi_RecordLinkDown()
+      PrintN("Wi-Fi: radio bring-up did not finish and automatic connection policy is OFF.")
+      ProcedureReturn
+    EndIf
+    If SettingsWifiSlotCount() = 0
+      wifi_RecordLinkDown()
+      PrintN("Wi-Fi: radio bring-up did not finish and no saved network is available for automatic retry.")
+      ProcedureReturn
+    EndIf
+    WifiRadioInitArm(1)
+    ProcedureReturn
+  EndIf
+  wifi_RecordLinkDown()
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0
+    PrintN("Wi-Fi: the radio is ready, but automatic connection policy is OFF; the failed boot join is left down.")
+    ProcedureReturn
+  EndIf
+  gWifiHealPend = 1
+  gWifiHealLast = millis()
+  gWifiKaLast = 0
+  PrintN("Wi-Fi: the radio is ready; the failed boot join will be retried cooperatively.")
+EndProcedure
+
+; Reconcile an explicit policy/configuration/foreground event after its old
+; owner has been cancelled. This is deliberately event-driven: WifiLinkTick
+; does not arm an unready radio merely because it observes gWifiUp = 0.
+Procedure WifiRecoveryReconcile(announce.i)
+  If gWifiKeyed <> 0
+    ; GTK installation publishes the live association before recovery reaches
+    ; DHCP_START. A successful settings command may cancel in that interval;
+    ; preserve the valid session and explicitly hand address acquisition back
+    ; to the common per-interface client instead of waiting for a later tick.
+    If gWifiHaveIp = 0
+      NetDhcpStart(#HW_LINK_WIFI, 1)
+    EndIf
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0 Or SettingsWifiSlotCount() = 0
+    ProcedureReturn
+  EndIf
+  If gWifiUp = 0
+    WifiRadioInitArm(announce)
+  Else
+    WifiRecoveryStart(announce)
+  EndIf
+EndProcedure
+
+; Successful Wi-Fi-specific settings commands cross one common ownership seam:
+; invalidate the old association/radio generation, then schedule the current
+; configuration according to radio readiness and policy.
+Procedure WifiConfigChanged()
+  gWifiSettingsRevisionSeen = SettingsWifiRevision()
+  WifiRecoveryCancel()
+  WifiRecoveryReconcile(0)
+EndProcedure
+
+Procedure WifiHealSet(on.i)
+  If on <> 0
+    gWifiHealOn = 1
+    WifiRecoveryReconcile(1)
+  Else
+    WifiRecoveryCancel()
+    gWifiHealOn = 0
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiRejoin - re-associate and re-lease after the link was lost.
+;
+;  announce <> 0 prints a line or two (used for the automatic path and the
+;  `wifi rejoin` command); 0 is silent. Returns 1 once keyed AND leased.
+; ----------------------------------------------------------------------
+Procedure.i WifiRejoin(announce.i)
+  ; An explicit/manual recovery owns the radio now. It must invalidate any
+  ; older cooperative generation before its blocking compatibility path acts.
+  WifiRecoveryCancel()
+  ; Only the association and the lease were lost; the radio stays up. Reset
+  ; the gates that make WifiJoinKnown/WifiDhcp no-ops and force a fresh
+  ; handshake nonce (gWifiSecDone).
+  ;
+  ; IT NO LONGER DROPS THE CONSOLE'S PEER, 2026-09-07. It used to, so that
+  ; the com-port model re-learned whoever spoke next rather than answering
+  ; an address that might no longer be listening. That was right while the
+  ; console could only be on this radio and is WRONG now that it can be on
+  ; the cable: a re-association here would throw away a peer that is
+  ; talking to the board over an interface this procedure has not touched.
+  ; The console drops its own peer when the link or the address under it
+  ; actually changes, and any incoming datagram re-learns the peer anyway.
+  ; Record the down edge before the blocking association path can bring it
+  ; back. The common client retains only a genuinely bound lease and will
+  ; verify that lease with INIT-REBOOT after the new association keys.
+  wifi_RecordLinkDown()
+
+  If announce <> 0
+    PrintN("Wi-Fi: the link to the access point is gone. Re-associating...")
+  EndIf
+
+  ; Tear down any half-open association the firmware still holds, so the
+  ; join below is not refused as a duplicate - the same reason wifi_TrySlot
+  ; disassociates before it joins. Cyw43Leave also resets the join state
+  ; machine (joinDone/joinState/phase), which WifiJoinKnown assumes clean.
+  Cyw43Leave(2000)
+  Cyw43DrainEvents(120)
+
+  If WifiJoinKnown() = 0
+    PrintN("Wi-Fi: re-association did not succeed this time. It will be retried.")
+    ; Leave gWifiKaLast unseeded so the next tick retries promptly instead
+    ; of waiting a whole keepalive period. And FLAG THE PENDING HEAL:
+    ; gWifiKeyed is 0 now, so the tick's keyed gate would otherwise stop
+    ; it from ever retrying - one failed re-association (an access point
+    ; rebooting, say) would strand the board offline for good. The flag
+    ; keeps the automatic retry alive on the #WIFI_HEAL_MS cadence.
+    gWifiHealPend = 1
+    gWifiHealLast = millis()
+    gWifiKaLast = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; One bounded foreground slice of the common machine. It performs
+  ; INIT-REBOOT when an in-session lease survived the link loss, otherwise
+  ; starts a fresh transaction and continues asynchronously if unanswered.
+  WifiDhcp()
+  If gWifiHaveIp = 0
+    PrintN("Wi-Fi: re-associated, but DHCP did not return an address. Retrying.")
+    gWifiKaLast = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; THE CONSOLE IS NOT ARMED FROM HERE ANY MORE, 2026-09-07. This library
+  ; must not decide that a console belongs on this radio - that is exactly
+  ; the assumption that left a board on a cable unreachable. The prompt
+  ; re-derives the whole arming question on every spin from the board's
+  ; actual state (Anvil/Core/netconsole.pbi), and WifiRejoin runs FROM the
+  ; prompt, so the console is back within one turn either way.
+
+  gWifiHealPend = 0
+  gWifiRejoins = gWifiRejoins + 1
+  gWifiKaLast = millis()
+  If announce <> 0
+    Print("Wi-Fi: reconnected as ")
+    PutIp(gWifiIp)
+    Print(" (re-association #")
+    PrintDec(gWifiRejoins)
+    PrintN("). The wireless console answers again.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  wifi_KeepAliveArp - one ARP request for `target`, OUT OF THIS RADIO'S
+;  OWN IDENTITY. 1 if a frame went.
+;
+;  WHY THIS IS NOT JUST NetArpRequest + wifi_SendNetOut ANY MORE, and it
+;  is worth being exact because the old two lines were correct for a year.
+;  They built the request out of whatever hardware address and source
+;  address net.pi4 was holding, and net.pi4 was always holding this
+;  radio's, because nothing else ever configured it while the console was
+;  up. From 2026-09-07 the WIRED side takes a lease at boot and is the
+;  preferred interface when the cable is in, so the single record the
+;  stack then had routinely held the cable's identity while this radio
+;  was joined and idle.
+;
+;  SENDING THAT FRAME OUT OF THE RADIO WOULD BE THE QUIETEST POSSIBLE
+;  FAULT. The access point sees a station transmitting under a hardware
+;  address it has no association for and drops it; the reply never comes;
+;  the round-trip detector counts two unanswered probes and declares a
+;  perfectly healthy link TX-only dead, then re-associates - repeatedly,
+;  for as long as the cable is in. Nothing anywhere would report an error.
+;
+;  THE IDENTITY USED TO BE BORROWED FROM THE OTHER LINK AND PUT BACK, and
+;  THAT SAVE-AND-RESTORE HAS BEEN DELETED, not merely simplified. net.pi4
+;  now keys every identity by #HW_LINK_*, so what is read and written here
+;  is the RADIO'S row and nothing else: there is no cable identity in it
+;  to displace, and therefore nothing to give back. Restoring would be
+;  worse than pointless now - the value saved would be the radio's own
+;  stale address, and putting it back after the request would undo the
+;  correction this procedure had just made, every single tick.
+;
+;  WHAT IS LEFT IS A REFRESH, NOT A BORROW. The row can legitimately be
+;  stale or empty when we get here: eth.pi4's controller bring-up calls
+;  NetInit(), which clears EVERY row including this one, so a `get` over
+;  the cable can leave the radio unconfigured between one tick and the
+;  next. Rewriting it from gWifiIp is a handful of stores that touch
+;  neither the neighbour cache nor any socket, and it is skipped entirely
+;  when the row already says what it should - the ordinary case, costing
+;  one comparison.
+; ----------------------------------------------------------------------
+Procedure.i wifi_KeepAliveArp(target.i)
+  Define ok.i
+  If gWifiIp = 0
+    ProcedureReturn 0
+  EndIf
+  If wifi_NetAddrIsOurs() = 0 Or NetIPv4(#HW_LINK_WIFI) <> gWifiIp
+    If NetSetMac(#HW_LINK_WIFI, @wifi_ourMac[0]) = 0
+      ProcedureReturn 0
+    EndIf
+    If NetSetIPv4(#HW_LINK_WIFI, gWifiIp, gWifiMask, gWifiGw) = 0
+      ; A row with the radio's MAC on it and no address is a state the
+      ; next tick will try to fix again, and it is better than a missed
+      ; keepalive built out of an address net.pi4 rejected.
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ok = 0
+  If NetArpRequest(#HW_LINK_WIFI, target) <> 0
+    wifi_SendNetOut()
+    ok = 1
+  EndIf
+  ProcedureReturn ok
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  COOPERATIVE AUTOMATIC RECOVERY
+;
+; One call advances one phase. Small byte copies and one 16-PRF PBKDF
+; slice are finite CPU work; a phase carrying Cyw43* may still block for
+; that ONE ioctl's stated timeout. There is deliberately no callback into
+; NetInput from crypto or a CYW43 receive drain. The prompt regains control
+; between phases and services wired TCP/console plus both DHCP clients.
+; ----------------------------------------------------------------------
+Procedure.i WifiRecoveryActive()
+  ProcedureReturn Bool(gWifiRecPhase <> #WIFI_REC_IDLE)
+EndProcedure
+
+Procedure wifi_RecoverForgetPmk()
+  Define i.i
+  Pbkdf2StepWipe()
+  For i = 0 To #WPA2_PASS_MAX
+    wifi_recPass[i] = 0
+  Next
+  gWifiRecPassLen = 0
+  For i = 0 To 31
+    wifi_recPmk[i] = 0
+    wifi_pmk[i] = 0
+  Next
+  gWifiRecPmkCached = 0
+  gWifiRecFreshFallback = 0
+  gWifiRecPmkNeedsStore = 0
+EndProcedure
+
+; A failed candidate is not a neutral cancellation. In particular, a failure
+; after GTK installation or during DHCP must revoke the keyed/addressed route
+; rather than leave an unaccepted candidate eligible while retry is pending.
+Procedure wifi_RecoverCandidateFail()
+  WifiRecoveryCancel()
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  wifi_RecordLinkDown()
+  gWifiHealPend = 1
+  gWifiHealLast = millis()
+  gWifiKaLast = 0
+EndProcedure
+
+Procedure wifi_RecoverFail()
+  wifi_RecoverCandidateFail()
+  PrintN("Wi-Fi: recovery did not succeed this time. It will be retried.")
+EndProcedure
+
+; Record a synchronous firmware-control refusal without converting its exact
+; transport/status result into a generic association failure. The individual
+; ioctl is still atomic and may occupy its existing timeout; later work needs
+; a begin/poll control contract to remove that final service stall.
+Procedure wifi_RecoverControlFail(phase.i, rc.i)
+  gWifiRecLastFailPhase = phase
+  gWifiRecLastFailRc = rc
+  gWifiRecLastFailStatus = 0
+  If rc = #CYW43_IO_STATUS
+    gWifiRecLastFailStatus = Cyw43IoctlStatus()
+  EndIf
+  Print("Wi-Fi: recovery control phase ")
+  If phase = #WIFI_REC_LEAVE
+    Print("LEAVE")
+  ElseIf phase = #WIFI_REC_DISASSOC
+    Print("DISASSOC")
+  Else
+    PrintDec(phase)
+  EndIf
+  Print(" failed (driver rc ")
+  PrintDec(rc)
+  If rc = #CYW43_IO_STATUS
+    Print(", firmware status ")
+    PrintDec(gWifiRecLastFailStatus)
+  EndIf
+  PrintN("). It will be retried.")
+  wifi_RecoverCandidateFail()
+EndProcedure
+
+; Wpa2SupHandle has prepared an exact M2/M4 frame, but preparation is not
+; transmission. wifi_SendSup returns -1 when no frame/buffer is available and
+; otherwise returns Cyw43Send's exact transport result (0 success, negative
+; refusal/error). Never promote either M2 or M4 past this boundary on failure.
+; A transport refusal did not test the PMK, so it owns an association retry,
+; not the cached-key rejection/fresh-derivation transition.
+Procedure wifi_RecoverSupplicantSendFail(rc.i)
+  gWifiRecLastFailPhase = #WIFI_REC_EAPOL_RX
+  gWifiRecLastFailRc = rc
+  gWifiRecLastFailStatus = 0
+  Print("Wi-Fi: recovery handshake frame was not transmitted (driver rc ")
+  PrintDec(rc)
+  PrintN("). The candidate will be retried.")
+  wifi_RecoverJoinFailed()
+EndProcedure
+
+Procedure wifi_RecoverEventDropFail()
+  gWifiRecLastFailPhase = gWifiRecPhase
+  gWifiRecLastFailRc = Cyw43EventsDropped() - gWifiRecEventDropBase
+  gWifiRecLastFailStatus = 0
+  PrintN("Wi-Fi: the radio event ring overflowed during recovery; the candidate is not accepted.")
+  wifi_RecoverCandidateFail()
+EndProcedure
+
+; Teardown is idempotent. The firmware's exact signed NOTASSOCIATED status
+; means the requested end state already holds; no other control/status error
+; is converted to success.
+Procedure.i wifi_RecoverTeardownOk(rc.i)
+  If rc = #CYW43_IO_OK
+    ProcedureReturn 1
+  EndIf
+  If rc = #CYW43_IO_STATUS And Cyw43IoctlStatus() = -17
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Move to the next scanned candidate without retaining key material or an
+; incomplete supplicant transcript from the candidate that just failed.
+Procedure wifi_RecoverNextCandidate()
+  wifi_RecoverForgetPmk()
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  gWifiRecAttempt = 0
+  gWifiRecPhase = #WIFI_REC_SCAN_SELECT
+EndProcedure
+
+; Retry one association to the same candidate, preserving only its PMK.
+Procedure wifi_RecoverJoinFailed()
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  If gWifiRecAttempt = 0
+    gWifiRecAttempt = 1
+    gWifiRecPhase = #WIFI_REC_DISASSOC
+  Else
+    wifi_RecoverNextCandidate()
+  EndIf
+EndProcedure
+
+; A cached PMK is only an optimization. If the four-way handshake rejects it,
+; discard that RAM cache row and derive once from the recovery-owned password.
+; Association failures do not take this path, and a freshly derived PMK can
+; never loop back into another derivation for the same candidate attempt.
+Procedure wifi_RecoverHandshakeFailed()
+  Define i.i
+  If gWifiRecPmkCached <> 0 And gWifiRecFreshFallback = 0
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+    SettingsRemove(wifi_PmkKey(gWifiRecSlot))
+    For i = 0 To 31
+      wifi_recPmk[i] = 0
+      wifi_pmk[i] = 0
+    Next
+    gWifiRecPmkCached = 0
+    gWifiRecFreshFallback = 1
+    gWifiRecPmkNeedsStore = 0
+    gWifiRecAttempt = 0
+    PrintN("Wi-Fi: the cached network key failed the handshake; deriving it again once.")
+    If Wpa2PskStepBegin(@wifi_recPass[0], gWifiRecPassLen, @wifi_recSsid[0], gWifiRecSsidLen, @wifi_recPmk[0]) = #PBKDF2_STEP_RUNNING
+      gWifiRecPhase = #WIFI_REC_PBKDF
+    Else
+      ; Begin rejected its arguments/state after the old PMK was wiped. Never
+      ; continue into a join carrying that all-zero destination.
+      wifi_RecoverFail()
+    EndIf
+    ProcedureReturn
+  EndIf
+  wifi_RecoverJoinFailed()
+EndProcedure
+
+; Catch configuration changes even when they came through the generic
+; settings command rather than `wifi ...`. The recovery never resumes with a
+; passphrase pointer or PMK belonging to an older version of the slot.
+Procedure.i wifi_RecoverCredentialCurrent()
+  Define pass.i
+  Define passLen.i
+  Define i.i
+  If SettingsWifiFindSsid(@wifi_recSsid[0]) <> gWifiRecSlot
+    ProcedureReturn 0
+  EndIf
+  pass = SettingsWifiSlotPassword(gWifiRecSlot)
+  passLen = SettingsLength(SettingsWifiSlotPasswordKey(gWifiRecSlot))
+  If pass = 0 Or passLen < #WPA2_PASS_MIN Or passLen > #WPA2_PASS_MAX
+    ProcedureReturn 0
+  EndIf
+  If passLen <> gWifiRecPassLen
+    ProcedureReturn 0
+  EndIf
+  If wifi_Fp(@wifi_recSsid[0], gWifiRecSsidLen, pass, passLen) <> gWifiRecFp
+    ProcedureReturn 0
+  EndIf
+  ; The fingerprint selects a cached PMK; it is not an identity proof. Keep
+  ; the generation bound to the exact credential bytes as well, so even a
+  ; collision cannot let a changed setting continue an old derivation.
+  For i = 0 To passLen - 1
+    If PeekA(pass + i) <> wifi_recPass[i]
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Completion belongs to the common per-interface DHCP client, not to the
+; compatibility gWifiHaveIp flag alone. All four views must name the same
+; nonzero leased address before recovery may announce or count success.
+Procedure.i wifi_RecoverLeaseBound()
+  Define ip.i
+  If gWifiHaveIp = 0
+    ProcedureReturn 0
+  EndIf
+  If DhcpClientState(#HW_LINK_WIFI) <> #DHCPC_BOUND
+    ProcedureReturn 0
+  EndIf
+  If NetIfSrc(#HW_LINK_WIFI) <> #NET_ADDR_LEASE
+    ProcedureReturn 0
+  EndIf
+  ip = DhcpClientIp(#HW_LINK_WIFI)
+  If ip = 0 Or NetIPv4(#HW_LINK_WIFI) <> ip Or gWifiIp <> ip
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure WifiRecoveryStart(announce.i)
+  WifiRecoveryCancel()
+  wifi_RecordLinkDown()
+  ; Start is a proven link-down transition, not a neutral cancellation: no
+  ; session from the dead association remains eligible for a later rekey.
+  Wpa2SupWipe()
+  Cyw43KeyWipe()
+  AesWipe()
+  KwWipe()
+  gWifiRecGeneration = (gWifiRecGeneration + 1) & $FFFFFFFF
+  If gWifiRecGeneration = 0
+    gWifiRecGeneration = 1
+  EndIf
+  gWifiRecStepGeneration = gWifiRecGeneration
+  gWifiRecAnnounce = Bool(announce <> 0)
+  gWifiRecPhase = #WIFI_REC_LEAVE
+  gWifiHealPend = 1
+  If announce <> 0
+    PrintN("Wi-Fi: starting cooperative re-association; wired service remains active.")
+  EndIf
+EndProcedure
+
+Procedure WifiRecoveryTick()
+  Define r.i
+  Define n.i
+  Define i.i
+  Define p.i
+  Define slot.i
+  Define pass.i
+  Define passLen.i
+  Define key.i
+  Define cached.i
+  Define state.i
+  Define code.i
+  Define same.i
+  Define now.i
+
+  If gWifiRecPhase = #WIFI_REC_IDLE
+    ProcedureReturn
+  EndIf
+  If gWifiRecStepGeneration <> gWifiRecGeneration
+    WifiRecoveryCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiLinkOn = 0 Or gWifiHealOn = 0
+    WifiRecoveryCancel()
+    ProcedureReturn
+  EndIf
+  If gWifiUp = 0
+    ; A permanently unready radio is not an association candidate. Cancel the
+    ; generation and leave it unarmed rather than waking once a minute only to
+    ; rediscover that firmware initialization never completed.
+    WifiRecoveryCancel()
+    WifiRecoveryInitialJoinFailed()
+    ProcedureReturn
+  EndIf
+  ; JoinStart clears the ring but not its cumulative overflow counter. A
+  ; historical nonzero count is harmless; any delta during this attempt makes
+  ; both a JOINED verdict and a later keyed/DHCP state ambiguous. Check before
+  ; every poll/phase, including DHCP_WAIT before an address is announced.
+  If gWifiRecPhase >= #WIFI_REC_JOIN_POLL And gWifiRecPhase <= #WIFI_REC_DHCP_WAIT
+    If Cyw43EventsDropped() <> gWifiRecEventDropBase
+      wifi_RecoverEventDropFail()
+      ProcedureReturn
+    EndIf
+  EndIf
+  ; JoinPoll exclusively owns the event ring through its JOINED verdict. From
+  ; the following verify/handshake/install phases onward, classify any event
+  ; already queued by the receive work of the preceding turn. A definitive
+  ; new down edge invalidates this generation immediately; ordinary join
+  ; narration is merely drained. WifiDrainEvents performs no bus transaction.
+  If gWifiRecPhase >= #WIFI_REC_VERIFY_SSID And gWifiRecPhase <= #WIFI_REC_PERSIST
+    WifiDrainEvents()
+    If gWifiTeardown <> 0
+      WifiRecoveryStart(1)
+      ProcedureReturn
+    EndIf
+  EndIf
+  If gWifiRecPhase > #WIFI_REC_PMK And gWifiRecPhase <= #WIFI_REC_DHCP_WAIT
+    If wifi_RecoverCredentialCurrent() = 0
+      PrintN("Wi-Fi: recovery cancelled because its saved network changed.")
+      wifi_RecoverCandidateFail()
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  now = millis()
+  Select gWifiRecPhase
+    Case #WIFI_REC_LEAVE
+      ; Atomic-control limitation: this one request can still occupy as much
+      ; as its 2 s timeout. The old scan/join/DHCP loops no longer follow it.
+      r = Cyw43Leave(2000)
+      If wifi_RecoverTeardownOk(r) = 0
+        wifi_RecoverControlFail(#WIFI_REC_LEAVE, r)
+      Else
+        gWifiRecAt = millis()
+        gWifiRecPhase = #WIFI_REC_QUIET
+      EndIf
+
+    Case #WIFI_REC_QUIET
+      ; Elapsed time supplies the old teardown backoff without a busy loop.
+      ; The steady-state pump is intentionally excluded while recovery owns
+      ; the event ring; JoinStart clears this old LEAVE attempt's fallout.
+      If ((now - gWifiRecAt) & $FFFFFFFF) >= #WIFI_REC_QUIET_MS
+        gWifiRecPhase = #WIFI_REC_SEC_MAC
+      EndIf
+
+    Case #WIFI_REC_SEC_MAC
+      If Cyw43MacAddress(@wifi_ourMac[0], 2000) <> 0
+        wifi_RecoverFail()
+      Else
+        gWifiRecEntropyWords = -1
+        gWifiRecPhase = #WIFI_REC_SEC_ENTROPY
+      EndIf
+
+    Case #WIFI_REC_SEC_ENTROPY
+      If gWifiRecEntropyWords < 0
+        EntropyBegin()
+        gWifiRecEntropyWords = 0
+        gWifiRecAt = millis()
+        ProcedureReturn
+      EndIf
+      r = EntropyTryWord(@wifi_snonce[0] + gWifiRecEntropyWords * 4)
+      If r = #ENTROPY_OK
+        gWifiRecEntropyWords = gWifiRecEntropyWords + 1
+        If gWifiRecEntropyWords >= 8
+          same = 0
+          For i = 0 To 31
+            If wifi_snonce[i] <> 0
+              same = 1
+            EndIf
+          Next
+          If same = 0
+            wifi_RecoverFail()
+          Else
+            gWifiRecPhase = #WIFI_REC_SEC_RSN
+          EndIf
+        EndIf
+      ElseIf r < 0
+        wifi_RecoverFail()
+      ElseIf ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_REC_ENTROPY_MS
+        wifi_RecoverFail()
+      EndIf
+
+    Case #WIFI_REC_SEC_RSN
+      If Cyw43SetWpaIe(?wifi_rsnIe, #WIFI_RSN_IE_LEN, 2000) <> 0
+        wifi_RecoverFail()
+      Else
+        gWifiRecSecItem = 0
+        gWifiRecPhase = #WIFI_REC_SEC_ITEM
+      EndIf
+
+    Case #WIFI_REC_SEC_ITEM
+      ; One firmware setting per spin; 0..3 then 8 is the proven setup.
+      If gWifiRecSecItem < 4
+        r = Cyw43SecItem(gWifiRecSecItem, 2000)
+        gWifiRecSecItem = gWifiRecSecItem + 1
+      Else
+        r = Cyw43SecItem(8, 2000)
+        gWifiRecSecItem = 5
+      EndIf
+      If r <> 0
+        wifi_RecoverFail()
+      ElseIf gWifiRecSecItem >= 5
+        Cyw43SetJoinExpectation(#CYW43_JOINEXP_NOKEY)
+        gWifiSecDone = 1
+        gWifiRecPhase = #WIFI_REC_SCAN_START
+      EndIf
+
+    Case #WIFI_REC_SCAN_START
+      If Cyw43ScanStart(0, 2000) <> 0
+        wifi_RecoverFail()
+      Else
+        gWifiRecSlices = 0
+        gWifiRecPhase = #WIFI_REC_SCAN_POLL
+      EndIf
+
+    Case #WIFI_REC_SCAN_POLL
+      r = Cyw43ScanPoll(#WIFI_SCAN_SLICE_MS)
+      gWifiRecSlices = gWifiRecSlices + 1
+      If r = #CYW43_SCAN_DONE
+        gWifiRecFound = Cyw43ScanCount()
+        gWifiRecBand = 0
+        gWifiRecScan = 0
+        gWifiRecPhase = #WIFI_REC_SCAN_SELECT
+      ElseIf r = #CYW43_SCAN_FAILED Or gWifiRecSlices >= (#WIFI_SCAN_BUDGET_MS / #WIFI_SCAN_SLICE_MS)
+        wifi_RecoverFail()
+      EndIf
+
+    Case #WIFI_REC_SCAN_SELECT
+      If gWifiRecScan >= gWifiRecFound
+        If gWifiRecBand = 0
+          gWifiRecBand = 1
+          gWifiRecScan = 0
+        Else
+          wifi_RecoverFail()
+        EndIf
+        ProcedureReturn
+      EndIf
+      i = gWifiRecScan
+      gWifiRecScan = gWifiRecScan + 1
+      slot = SettingsWifiFindSsid(Cyw43ScanSsid(i))
+      If slot = 0
+        ProcedureReturn
+      EndIf
+      If (gWifiRecBand = 0 And Cyw43ScanChannel(i) > 14) Or (gWifiRecBand = 1 And Cyw43ScanChannel(i) <= 14)
+        ProcedureReturn
+      EndIf
+      n = Cyw43ScanSsidLen(i)
+      If n < 1 Or n > 32
+        ProcedureReturn
+      EndIf
+      p = Cyw43ScanSsid(i)
+      For r = 0 To n - 1
+        wifi_recSsid[r] = PeekA(p + r)
+      Next
+      wifi_recSsid[n] = 0
+      gWifiRecSsidLen = n
+      gWifiRecSlot = slot
+      gWifiRecAttempt = 0
+      gWifiRecPhase = #WIFI_REC_PMK
+
+    Case #WIFI_REC_PMK
+      pass = SettingsWifiSlotPassword(gWifiRecSlot)
+      passLen = SettingsLength(SettingsWifiSlotPasswordKey(gWifiRecSlot))
+      If pass = 0 Or passLen < #WPA2_PASS_MIN Or passLen > #WPA2_PASS_MAX
+        wifi_RecoverNextCandidate()
+        ProcedureReturn
+      EndIf
+      gWifiRecFp = wifi_Fp(@wifi_recSsid[0], gWifiRecSsidLen, pass, passLen)
+      ; SettingsGet's address lifetime ends if the key is removed or the table
+      ; is reset/reloaded while this derivation yields between slices. Keep no
+      ; borrowed secret pointer across ticks even when the newly loaded
+      ; credential has identical bytes and therefore the same fingerprint.
+      For i = 0 To #WPA2_PASS_MAX
+        wifi_recPass[i] = 0
+      Next
+      For i = 0 To passLen - 1
+        wifi_recPass[i] = PeekA(pass + i)
+      Next
+      gWifiRecPassLen = passLen
+      gWifiRecPmkCached = 0
+      gWifiRecFreshFallback = 0
+      gWifiRecPmkNeedsStore = 0
+      key = wifi_PmkKey(gWifiRecSlot)
+      cached = SettingsGet(key)
+      If cached <> 0 And SettingsLength(key) >= 72
+        If wifi_HexToU32(cached) = gWifiRecFp
+          If wifi_HexToBytes(cached + 8, @wifi_recPmk[0], 32) <> 0
+            gWifiRecPmkCached = 1
+            gWifiRecPhase = #WIFI_REC_DISASSOC
+            ProcedureReturn
+          EndIf
+        EndIf
+      EndIf
+      If Wpa2PskStepBegin(@wifi_recPass[0], gWifiRecPassLen, @wifi_recSsid[0], gWifiRecSsidLen, @wifi_recPmk[0]) <> #PBKDF2_STEP_RUNNING
+        wifi_RecoverNextCandidate()
+      Else
+        gWifiRecPhase = #WIFI_REC_PBKDF
+      EndIf
+
+    Case #WIFI_REC_PBKDF
+      state = Pbkdf2Step(#WIFI_REC_PBKDF_PRFS)
+      If state = #PBKDF2_STEP_DONE
+        wifi_U32ToHex(@wifi_pmkVal[0], gWifiRecFp)
+        For i = 0 To 31
+          wifi_ByteToHex(@wifi_pmkVal[0], 8 + i * 2, wifi_recPmk[i])
+        Next
+        wifi_pmkVal[72] = 0
+        ; Do not put a newly derived replacement into persistent settings
+        ; until this candidate has actually installed keys successfully.
+        gWifiRecPmkCached = 0
+        gWifiRecPmkNeedsStore = 1
+        Pbkdf2StepWipe()
+        gWifiRecPhase = #WIFI_REC_DISASSOC
+      ElseIf state <> #PBKDF2_STEP_RUNNING
+        wifi_RecoverNextCandidate()
+      EndIf
+
+    Case #WIFI_REC_DISASSOC
+      r = Cyw43Disassoc(2000)
+      If wifi_RecoverTeardownOk(r) = 0
+        wifi_RecoverControlFail(#WIFI_REC_DISASSOC, r)
+      Else
+        gWifiRecAt = millis()
+        gWifiRecPhase = #WIFI_REC_JOIN_QUIET
+      EndIf
+
+    Case #WIFI_REC_JOIN_QUIET
+      If ((now - gWifiRecAt) & $FFFFFFFF) >= #WIFI_REC_QUIET_MS
+        gWifiRecPhase = #WIFI_REC_JOIN_START
+      EndIf
+
+    Case #WIFI_REC_JOIN_START
+      ; Snapshot immediately before the request: JoinStart clears queued
+      ; events, while the cumulative overflow count deliberately survives.
+      gWifiRecEventDropBase = Cyw43EventsDropped()
+      If Cyw43JoinStart(@wifi_recSsid[0], gWifiRecSsidLen, 2000) <> 0
+        wifi_RecoverJoinFailed()
+      Else
+        gWifiRecSlices = 0
+        gWifiRecPhase = #WIFI_REC_JOIN_POLL
+      EndIf
+
+    Case #WIFI_REC_JOIN_POLL
+      r = Cyw43JoinPoll(#WIFI_JOIN_SLICE_MS)
+      gWifiRecSlices = gWifiRecSlices + 1
+      ; The poll itself may have received the overflowing burst. Do not act on
+      ; its verdict until the same-attempt cumulative counter is rechecked.
+      If Cyw43EventsDropped() <> gWifiRecEventDropBase
+        wifi_RecoverEventDropFail()
+      ElseIf r = #CYW43_JOIN_JOINED
+        gWifiRecPhase = #WIFI_REC_VERIFY_SSID
+      ElseIf r = #CYW43_JOIN_FAILED Or gWifiRecSlices >= #WIFI_JOIN_SLICES
+        wifi_RecoverJoinFailed()
+      EndIf
+
+    Case #WIFI_REC_VERIFY_SSID
+      ; JoinStart clears the event ring for this request; this readback also
+      ; binds the completion to the candidate bytes copied before the join.
+      same = Bool(Cyw43ReadSsid(2000) = 0 And Cyw43LinkSsidLen() = gWifiRecSsidLen)
+      If same <> 0
+        p = Cyw43LinkSsid()
+        For i = 0 To gWifiRecSsidLen - 1
+          If PeekA(p + i) <> wifi_recSsid[i]
+            same = 0
+          EndIf
+        Next
+      EndIf
+      If same = 0
+        wifi_RecoverJoinFailed()
+      Else
+        gWifiRecPhase = #WIFI_REC_ASSOC_IE
+      EndIf
+
+    Case #WIFI_REC_ASSOC_IE
+      wifi_ReadAssocIe()
+      gWifiRecPhase = #WIFI_REC_EAPOL_BEGIN
+
+    Case #WIFI_REC_EAPOL_BEGIN
+      For i = 0 To 5
+        wifi_apMac[i] = 0
+      Next
+      If wifi_ieLen >= 2
+        r = Wpa2SupBegin(@wifi_recPmk[0], @wifi_ourMac[0], @wifi_apMac[0], @wifi_ie[0], wifi_ieLen)
+      Else
+        r = Wpa2SupBegin(@wifi_recPmk[0], @wifi_ourMac[0], @wifi_apMac[0], ?wifi_rsnIe, #WIFI_RSN_IE_LEN)
+      EndIf
+      If r = 0
+        wifi_RecoverHandshakeFailed()
+      Else
+        Wpa2SupSetSnonce(@wifi_snonce[0])
+        gWifiRecM1 = 0
+        gWifiRecAt = millis()
+        gWifiRecPhase = #WIFI_REC_EAPOL_RX
+      EndIf
+
+    Case #WIFI_REC_EAPOL_RX
+      n = Cyw43Receive(#WIFI_JOIN_SLICE_MS)
+      If n >= 14
+        code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+        If code = #WPA2SUP_SENT_M2
+          r = wifi_SendSup()
+          If r = 0
+            gWifiRecM1 = 1
+            gWifiRecAt = millis()
+          Else
+            wifi_RecoverSupplicantSendFail(r)
+          EndIf
+        ElseIf code = #WPA2SUP_SENT_M4
+          r = wifi_SendSup()
+          If r = 0
+            gWifiRecPhase = #WIFI_REC_PTK_INSTALL
+          Else
+            wifi_RecoverSupplicantSendFail(r)
+          EndIf
+        ElseIf code < 0
+          wifi_RecoverHandshakeFailed()
+        EndIf
+      EndIf
+      If gWifiRecPhase = #WIFI_REC_EAPOL_RX
+        If gWifiRecM1 = 0
+          If ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_EAPOL_M1_MS
+            wifi_RecoverHandshakeFailed()
+          EndIf
+        ElseIf ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_EAPOL_M3_MS
+          wifi_RecoverHandshakeFailed()
+        EndIf
+      EndIf
+
+    Case #WIFI_REC_PTK_INSTALL
+      gWifiRecPtkRc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+      If gWifiRecPtkRc <> 0
+        wifi_RecoverHandshakeFailed()
+      Else
+        gWifiRecPhase = #WIFI_REC_GTK_INSTALL
+      EndIf
+
+    Case #WIFI_REC_GTK_INSTALL
+      r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+      If r <> 0
+        wifi_RecoverHandshakeFailed()
+      Else
+        Wpa2SupSessionArm()
+        Cyw43KeyWipe()
+        AesWipe()
+        KwWipe()
+        gWifiKeyed = 1
+        wifi_joinSsidLen = gWifiRecSsidLen
+        For i = 0 To gWifiRecSsidLen - 1
+          wifi_joinSsid[i] = wifi_recSsid[i]
+        Next
+        gWifiRecPhase = #WIFI_REC_PERSIST
+      EndIf
+
+    Case #WIFI_REC_PERSIST
+      ; One separately visible storage phase; not hidden inside crypto or a
+      ; firmware poll. A fresh PMK reaches the masked .secret setting only
+      ; after both pairwise and group keys have installed successfully.
+      r = 1
+      If gWifiRecPmkNeedsStore <> 0
+        r = SettingsSet(wifi_PmkKey(gWifiRecSlot), @wifi_pmkVal[0])
+        If r <> 0
+          gWifiPmkDirty = 1
+        Else
+          ; The association is valid without the optimization. Do not mark it
+          ; dirty or claim it was saved when the settings table refused it.
+          PrintN("Wi-Fi: connected, but the freshly derived key could not be cached in settings.")
+        EndIf
+        gWifiRecPmkNeedsStore = 0
+      EndIf
+      If r <> 0
+        wifi_PersistPmkIfDirty()
+      EndIf
+      gWifiRecPhase = #WIFI_REC_DHCP_START
+
+    Case #WIFI_REC_DHCP_START
+      r = NetDhcpStart(#HW_LINK_WIFI, 1)
+      If r <= 0
+        gWifiRecLastFailPhase = #WIFI_REC_DHCP_START
+        gWifiRecLastFailRc = r
+        gWifiRecLastFailStatus = 0
+        Print("Wi-Fi: DHCP could not start for the recovered interface (rc ")
+        PrintDec(r)
+        PrintN("). It will be retried.")
+        wifi_RecoverCandidateFail()
+      Else
+        gWifiRecPhase = #WIFI_REC_DHCP_WAIT
+      EndIf
+
+    Case #WIFI_REC_DHCP_WAIT
+      ; NetDhcpTick, immediately after this service in parse.pbi, owns every
+      ; retransmission and lease transition. Do not create a second timer.
+      If wifi_RecoverLeaseBound() <> 0
+        gWifiRecPhase = #WIFI_REC_IDLE
+        gWifiHealPend = 0
+        gWifiRejoins = gWifiRejoins + 1
+        gWifiKaLast = millis()
+        wifi_RecoverForgetPmk()
+        If gWifiRecAnnounce <> 0
+          Print("Wi-Fi: reconnected as ")
+          PutIp(gWifiIp)
+          Print(" (re-association #")
+          PrintDec(gWifiRejoins)
+          PrintN(").")
+        EndIf
+      EndIf
+  EndSelect
+EndProcedure
+
+Procedure.i wifi_EapolFailureName(stage.i)
+  Select stage
+    Case #WIFI_EAPOL_FAIL_JOIN_M2_TX
+      ProcedureReturn "foreground M2 transmit"
+    Case #WIFI_EAPOL_FAIL_JOIN_M4_TX
+      ProcedureReturn "foreground M4 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_M2_TX
+      ProcedureReturn "live M2 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_M4_TX
+      ProcedureReturn "live M4 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_PTK
+      ProcedureReturn "live PTK install"
+    Case #WIFI_EAPOL_FAIL_REKEY_M4_GTK
+      ProcedureReturn "live M4 GTK install"
+    Case #WIFI_EAPOL_FAIL_REKEY_G2_TX
+      ProcedureReturn "live G2 transmit"
+    Case #WIFI_EAPOL_FAIL_REKEY_NONCE
+      ProcedureReturn "live PTK nonce entropy"
+    Case #WIFI_EAPOL_FAIL_REKEY_G2_GTK
+      ProcedureReturn "live G2 GTK install"
+  EndSelect
+  ProcedureReturn "unknown EAPOL stage"
+EndProcedure
+
+; Consume a steady-state EAPOL failure only after WifiRadioPump has returned.
+; The callback has already recorded the first pending stage/rc, but performed
+; no association, DHCP or radio-control action. This boundary invalidates the
+; broken live identity even when automatic policy is disabled; policy controls
+; whether a new association starts, not whether partial keys remain usable.
+Procedure.i wifi_ServiceDeferredEapolFailure()
+  Define stage.i
+  Define rc.i
+  If gWifiEapolRecover = 0
+    ProcedureReturn 0
+  EndIf
+  stage = gWifiEapolRecoverStage
+  rc = gWifiEapolRecoverRc
+  ; Consume before cleanup so no nested/later service can apply this event to
+  ; a replacement generation. Last-failure diagnostics remain available.
+  gWifiEapolRecover = 0
+  gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE
+  gWifiEapolRecoverRc = 0
+  Print("Wi-Fi: live EAPOL service failed: ")
+  UartWriteStr(wifi_EapolFailureName(stage))
+  Print(" (stage ")
+  PrintDec(stage)
+  Print(", driver rc ")
+  PrintDec(rc)
+  PrintN("); the current keyed session is no longer trusted.")
+  If gWifiLinkOn <> 0 And gWifiHealOn <> 0
+    WifiRecoveryStart(1)
+  Else
+    WifiRecoveryCancel()
+    Wpa2SupWipe()
+    Cyw43KeyWipe()
+    AesWipe()
+    KwWipe()
+    wifi_RecordLinkDown()
+    PrintN("Wi-Fi: automatic recovery is OFF, so the failed session is being left down.")
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiLinkTick - the periodic keepalive + health check.
+;
+;  Called every turn of the prompt's spin loop; cheap and self-rate-
+;  limiting. Does nothing until the board is keyed. Once keyed but not yet
+;  leased it retries DHCP in the background (so a slow first boot still ends
+;  armed with no manual second join); once leased it runs the keepalive and
+;  health check that keep the association alive and heal it if it drops.
+; ----------------------------------------------------------------------
+Procedure WifiLinkTick()
+  Define now.i
+  Define assoc.i
+  Define et.i
+  Define er.i
+  Define age.i
+  Define rr.i
+  Define settingsRevision.i
+
+  ; Generic settings/env mutation and load paths publish only a revision; they
+  ; never call back while the settings table or parser buffers are owned.
+  settingsRevision = SettingsWifiRevision()
+  If settingsRevision <> gWifiSettingsRevisionSeen
+    gWifiSettingsRevisionSeen = settingsRevision
+    WifiRecoveryCancel()
+    WifiRecoveryReconcile(0)
+    ProcedureReturn
+  EndIf
+
+  ; An unready radio has no valid steady-state receive/event owner. Advance one
+  ; coarse initialization phase and return to the board's outer service loop,
+  ; which preserves wired Ethernet and the console between phases.
+  If WifiRadioInitActive() <> 0
+    WifiRadioInitTick()
+    ProcedureReturn
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; RECOVERY OWNS JOIN EVENTS AND HANDSHAKE FRAMES.
+  ;
+  ; Cyw43JoinStart can receive AUTH/LINK events while it waits for the
+  ; SET_SSID control reply. Those events are already in CYW43's event ring
+  ; when the next prompt spin begins, and Cyw43JoinPoll must pop and classify
+  ; them. WifiRadioPump's steady-state WifiDrainEvents deliberately only
+  ; latches link-down truth; calling it first here would steal the join
+  ; verdict. The same ownership keeps locally generated LEAVE/DISASSOC
+  ; events from restarting the recovery generation: JoinStart clears that
+  ; old-attempt ring immediately before issuing the new association.
+  ;
+  ; DHCP_WAIT is the boundary at which the four-way handshake and key
+  ; installation are complete. From there the normal pump must run so DHCP
+  ; replies and teardown events are serviced. No recovery phase before that
+  ; boundary shares receive/event ownership with WifiRadioPump.
+  ; ------------------------------------------------------------------
+  If WifiRecoveryActive() <> 0 And gWifiRecPhase <> #WIFI_REC_DHCP_WAIT
+    If gWifiLinkOn = 0 Or gWifiHealOn = 0
+      WifiRecoveryCancel()
+    Else
+      WifiRecoveryTick()
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; SERVICE THE STEADY-STATE RADIO, RATE LIMIT OR NOT.
+  ;
+  ; This drains the event ring and, when nothing else is reading the
+  ; radio, the received frames - which is how a mid-session rekey gets
+  ; answered on a board whose wireless console has not armed and which
+  ; has had no network command typed at it. See WifiRadioPump. It is
+  ; ahead of every steady-state gate below including the keyed one, because
+  ; the event that says the link is gone can arrive at any moment and the
+  ; drain itself touches no bus. The recovery-owner exception above is what
+  ; prevents this monitor from consuming an in-progress join's evidence.
+  ; ------------------------------------------------------------------
+  WifiRadioPump()
+
+  ; A rekey callback may only latch failure. Consume it here, after the receive
+  ; pump is complete, so recovery cannot recursively enter that pump.
+  If wifi_ServiceDeferredEapolFailure() <> 0
+    ProcedureReturn
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; THE RADIO SAID THE LINK IS GONE. Act on it now, not at the next
+  ; twenty-second cadence, and SAY SO - the standing rule is that the
+  ; backstop announces itself on every console whenever it acts.
+  ; ------------------------------------------------------------------
+  If gWifiTeardown <> 0
+    gWifiTeardown = 0
+    et = gWifiTdType
+    er = gWifiTdReason
+    gWifiVerify = 0
+    Print("Wi-Fi: the radio reports ")
+    UartWriteStr(Cyw43EventName(et))
+    Print(" (reason ")
+    PrintDec(er)
+    PrintN(") - the link really is gone.")
+    If gWifiLinkOn <> 0 And gWifiHealOn <> 0
+      ; A new definitive edge always starts a new recovery generation. No
+      ; phase from the association that just died may resume afterward.
+      WifiRecoveryStart(1)
+      ProcedureReturn
+    EndIf
+    WifiRecoveryCancel()
+    wifi_RecordLinkDown()
+    PrintN("Wi-Fi: automatic recovery is OFF, so the link is being left down.")
+    ProcedureReturn
+  EndIf
+
+  ; `wifi link off` disables the keepalive, health detector and automatic
+  ; recovery policy. It does not disable radio service or link-down truth:
+  ; EAPOL rekeys and teardown events still leave the finite firmware queue,
+  ; and the definitive event above still invalidates a dead live identity.
+  If gWifiLinkOn = 0
+    If WifiRecoveryActive() <> 0
+      WifiRecoveryCancel()
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; Recovery owns the radio until it reaches an address or an explicit
+  ; command/policy cancellation invalidates its generation.
+  If WifiRecoveryActive() <> 0
+    If gWifiHealOn = 0
+      WifiRecoveryCancel()
+    Else
+      WifiRecoveryTick()
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If gWifiKeyed = 0
+    ; NOT KEYED. Normally nothing to do (never joined this boot) - but if
+    ; a heal attempt failed part-way, gWifiKeyed is 0 BECAUSE recovery
+    ; recorded the down edge, and returning silently here would mean one failed
+    ; re-association (an access point mid-reboot, say) strands the board
+    ; offline forever. Keep retrying on a slow cadence until it works;
+    ; attempt strands the board. The new phase generation starts silently
+    ; here; its final success/failure owns any narration.
+    If gWifiHealPend <> 0 And gWifiHealOn <> 0
+      If ((millis() - gWifiHealLast) & $FFFFFFFF) >= #WIFI_HEAL_MS
+        gWifiHealLast = millis()
+        WifiRecoveryStart(0)
+      EndIf
+    EndIf
+    ProcedureReturn
+  EndIf
+  ; Association health and address ownership are independent. Once keyed,
+  ; ask the common client to maintain this interface; it alone schedules
+  ; DISCOVER/REQUEST/renew/rebind and the prompt calls NetDhcpTick next.
+  If gWifiHaveIp = 0
+    NetDhcpStart(#HW_LINK_WIFI, 1)
+    ProcedureReturn
+  EndIf
+
+  now = millis()
+  If gWifiKaLast = 0
+    ; First eligible tick: seed the clock and let one period pass before
+    ; the first probe, so a board that just connected is not immediately
+    ; poked.
+    gWifiKaLast = now
+    ProcedureReturn
+  EndIf
+  ; gWifiVerify - a DISASSOC arrived, which the reference driver treats as
+  ; locally generated and not a teardown. It is not grounds for a
+  ; re-association, but it IS grounds for asking the firmware straight
+  ; away instead of waiting out the cadence.
+  If gWifiDropReq = 0 And gWifiVerify = 0 And (now - gWifiKaLast) < #WIFI_KA_MS
+    ProcedureReturn
+  EndIf
+  gWifiVerify = 0
+  gWifiKaLast = now
+
+  ; The event ring is drained by WifiRadioPump at the top of every tick
+  ; now, and a teardown is acted on there - not here, twenty seconds
+  ; late. What used to be a drain in this spot is the block above.
+
+  ; --- the test hook: a forced, immediate rejoin ----------------------
+  If gWifiDropReq <> 0
+    gWifiDropReq = 0
+    WifiRecoveryStart(1)
+    ProcedureReturn
+  EndIf
+
+  ; --- detect, part 1: does the firmware still think it is associated? -
+  ; NECESSARY BUT NOT SUFFICIENT. This catches the clean deauth (the AP
+  ; said goodbye and the firmware knows it). It does NOT catch the silent
+  ; death proven on silicon 2026-08-30, where the link stopped carrying
+  ; traffic while Cyw43ReadBssid kept answering "still associated" - the
+  ; poll asks the firmware's OPINION, not the air.
+  assoc = Cyw43ReadBssid(#WIFI_BSSID_MS)
+  If assoc = 1
+    gWifiBadReads = 0
+  Else
+    ; 0 = the firmware says NOTASSOCIATED; -1 = the query itself failed.
+    ; Either way the link is not usable. Require a couple in a row so a
+    ; single flaky read does not trigger a disruptive re-association.
+    gWifiBadReads = gWifiBadReads + 1
+    If gWifiBadReads >= #WIFI_LINK_STRIKES
+      gWifiBadReads = 0
+      If gWifiHealOn <> 0
+        WifiRecoveryStart(1)
+        ProcedureReturn
+      EndIf
+      wifi_RecordLinkDown()
+      PrintN("Wi-Fi: firmware reports NOT associated, but auto-heal is OFF.")
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  ; --- detect, part 2: are our transmissions actually LANDING? ---------
+  ; The round-trip check (see gWifiRxProof). Two keepalive probes have
+  ; gone out - each one an ARP the gateway answers within milliseconds
+  ; on a live link - and no reply to ANY of ours has come back for
+  ; #WIFI_PROOF_MS. That is a dead link whatever the association poll
+  ; just said and however much inbound chatter still arrives: the
+  ; 2026-08-30 evening death was TX-only, the host's own probes kept
+  ; the receive side busy the whole time, and only the missing round
+  ; trip gave it away.
+  If gWifiKaProbes >= 2 And (now - gWifiRxProof) >= #WIFI_PROOF_MS
+    PrintN("Wi-Fi: the gateway has stopped answering this board's keepalives -")
+    PrintN("the firmware still claims the association, but nothing sent out is")
+    PrintN("coming back. The link is TX-only dead.")
+    If gWifiHealOn <> 0
+      gWifiKaProbes = 0
+      gWifiBadReads = 0
+      PrintN("Wi-Fi: treating the link as dead and reconnecting (the backstop).")
+      WifiRecoveryStart(1)
+      ProcedureReturn
+    EndIf
+    ; Observation suppresses reassociation, not the link-down truth. The
+    ; counters and message retain the evidence while the dead row is no
+    ; longer advertised as usable.
+    wifi_RecordLinkDown()
+    PrintN("Wi-Fi: auto-heal is OFF, so the death is being left to observe.")
+    ProcedureReturn
+  EndIf
+
+  ; --- keepalive: one over-the-air frame so the AP does not idle us out.
+  ; An ARP request for the router refreshes the association and its reply
+  ; proves the path both ways. Broadcast, so no neighbour cache is needed.
+  ; Fall back to the DHCP server if there is no gateway. Each send is
+  ; counted so the proof check above knows an answer was solicited - and
+  ; the count is zeroed by any frame that arrives.
+  If gWifiGw <> 0
+    If wifi_KeepAliveArp(gWifiGw) <> 0
+      gWifiKaProbes = gWifiKaProbes + 1
+    EndIf
+  ElseIf DhcpClientServer(#HW_LINK_WIFI) <> 0
+    If wifi_KeepAliveArp(DhcpClientServer(#HW_LINK_WIFI)) <> 0
+      gWifiKaProbes = gWifiKaProbes + 1
+    EndIf
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WifiLinkDrop - the `wifi drop` test hook: really disassociate, then let
+;  the automatic detector notice and reconnect on its own. This proves the
+;  WHOLE detect-and-rejoin loop for real, without waiting two hours for an
+;  idle-out. Cyw43Leave genuinely leaves the network, so the next
+;  WifiLinkTick's Cyw43ReadBssid returns 0 and the rejoin path runs.
+; ----------------------------------------------------------------------
+Procedure WifiLinkDrop()
+  If gWifiKeyed = 0 Or gWifiHaveIp = 0
+    PrintN("Wi-Fi is not connected, so there is nothing to drop.")
+    ProcedureReturn
+  EndIf
+  WifiRecoveryCancel()
+  Cyw43Leave(2000)
+  Cyw43DrainEvents(120)
+  ; Prime the detector so the next tick reads NOTASSOCIATED and crosses the
+  ; strike threshold at once, and make that tick due immediately.
+  gWifiBadReads = #WIFI_LINK_STRIKES - 1
+  gWifiKaLast = millis() - #WIFI_KA_MS
+  PrintN("Wi-Fi: simulated an access-point drop (really disassociated). The")
+  PrintN("health check will detect it within a moment and reconnect. Watch for")
+  PrintN("the re-association line, or type wifi link to see the count.")
+EndProcedure
+
+; Read-only accessors for the wifi command's status line.
+Procedure.i WifiLinkActive()
+  ProcedureReturn gWifiLinkOn
+EndProcedure
+Procedure.i WifiRejoinCount()
+  ProcedureReturn gWifiRejoins
+EndProcedure
+Procedure WifiLinkSet(on.i)
+  If on <> 0
+    gWifiLinkOn = 1
+    gWifiKaLast = 0
+    ; Re-enabling policy is an explicit retry event. Do not poll gWifiUp and
+    ; auto-arm on every prompt turn; a radio-off policy must remain meaningful.
+    WifiRecoveryReconcile(1)
+  Else
+    gWifiLinkOn = 0
+    WifiRecoveryCancel()
+  EndIf
+EndProcedure
+
+Procedure.i WifiRxReadyArm()
+  If gWifiRxReadyArmed <> 0
+    ProcedureReturn Bool(gWifiRxReadyArmed = 1 And gWifiRxReadyGeneration = gWifiRinitGeneration And Cyw43RxIrqRestorePending() = 0)
+  EndIf
+  If gWifiUp = 0 Or gWifiRinitStepGeneration <> 0 Or Cyw43RxIrqRestorePending() <> 0
+    ProcedureReturn 0
+  EndIf
+  If Cyw43SetRxIrqIo(@SdioRxIrqOp) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Own the callback/generation conservatively before ARM. Failure may retain
+  ; an exact old-generation snapshot which only disable may release.
+  gWifiRxReadyArmed = 2
+  gWifiRxReadyGeneration = gWifiRinitGeneration
+  gWifiRxReadyMs = millis()
+  gWifiRxReadyRaw = Cyw43RxIrqRawReady()
+  gWifiRxReadyFrames = Cyw43RxIrqFrameIndications()
+  gWifiRxReadyEmpty = Cyw43RxEmpty()
+  gWifiRxReadyFirst = Cyw43RxFirstReads()
+  gWifiRxReadyCmd53 = SdioCmd53Calls()
+  gWifiRxReadyFirstPending=Cyw43RxIrqFirstPending() : gWifiRxReadyFirstQuiet=Cyw43RxIrqFirstNoPending()
+  gWifiRxReadyNonPending=Cyw43RxIrqNonemptyPending() : gWifiRxReadyNonQuiet=Cyw43RxIrqNonemptyNoPending()
+  gWifiRxReadyEmptyPending=Cyw43RxIrqEmptyPending() : gWifiRxReadyEmptyQuiet=Cyw43RxIrqEmptyNoPending()
+  gWifiRxReadyInherited=Cyw43RxIrqFirstInherited() : gWifiRxReadyNew=Cyw43RxIrqFirstNew()
+  gWifiRxReadyQData=Cyw43RxIrqQuietData() : gWifiRxReadyQControl=Cyw43RxIrqQuietControl()
+  gWifiRxReadyQEvent=Cyw43RxIrqQuietEvent() : gWifiRxReadyQGlom=Cyw43RxIrqQuietGlom()
+  gWifiRxReadyQUnknown=Cyw43RxIrqQuietUnknown() : gWifiRxReadyQMalformed=Cyw43RxIrqQuietMalformed()
+  gWifiRxReadyQPrevNext=Cyw43RxIrqQuietPrevNext()
+  gWifiRxReadyQSeqOk=Cyw43RxIrqQuietSeqOk() : gWifiRxReadyQSeqGap=Cyw43RxIrqQuietSeqGap()
+  gWifiRxReadyQPostPending=Cyw43RxIrqQuietPostPending() : gWifiRxReadyQPostQuiet=Cyw43RxIrqQuietPostQuiet()
+  gWifiRxReadyQPostFail=Cyw43RxIrqQuietPostFail()
+  If Cyw43RxIrqTelemetry(1) = 0
+    ; A failed ARM may retain the old transport snapshot. Only unregister when
+    ; verified cleanup says there is no retryable ownership.
+    If Cyw43RxIrqRestorePending() = 0
+      Cyw43SetRxIrqIo(0)
+      gWifiRxReadyArmed = 0
+      gWifiRxReadyGeneration = 0
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  gWifiRxReadyArmed = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i WifiRxReadyDisable()
+  If gWifiRxReadyArmed = 0 And Cyw43RxIrqRestorePending() = 0
+    ProcedureReturn 1
+  EndIf
+  If Cyw43RxIrqTelemetry(0) = 0
+    ProcedureReturn 0
+  EndIf
+  If Cyw43SetRxIrqIo(0) = 0
+    ProcedureReturn 0
+  EndIf
+  gWifiRxReadyArmed = 0
+  gWifiRxReadyGeneration = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i WifiRxReadyActive()
+  ProcedureReturn Bool(gWifiRxReadyArmed = 1)
+EndProcedure
+Procedure.i WifiRxReadyGeneration()
+  ProcedureReturn gWifiRxReadyGeneration
+EndProcedure
+Procedure.i WifiRxReadyGenerationValid()
+  ProcedureReturn Bool(gWifiRxReadyArmed = 1 And gWifiRxReadyGeneration = gWifiRinitGeneration)
+EndProcedure
+Procedure.i WifiRxReadyElapsed()
+  ProcedureReturn (millis() - gWifiRxReadyMs) & $FFFFFFFF
+EndProcedure
+Procedure.i WifiRxReadyRawDelta()
+  ProcedureReturn Cyw43RxIrqRawReady() - gWifiRxReadyRaw
+EndProcedure
+Procedure.i WifiRxReadyFrameDelta()
+  ProcedureReturn Cyw43RxIrqFrameIndications() - gWifiRxReadyFrames
+EndProcedure
+Procedure.i WifiRxReadyEmptyDelta()
+  ProcedureReturn Cyw43RxEmpty() - gWifiRxReadyEmpty
+EndProcedure
+Procedure.i WifiRxReadyFirstDelta()
+  ProcedureReturn Cyw43RxFirstReads() - gWifiRxReadyFirst
+EndProcedure
+Procedure.i WifiRxReadyCmd53Delta()
+  ProcedureReturn SdioCmd53Calls() - gWifiRxReadyCmd53
+EndProcedure
+Procedure.i WifiRxReadyFirstPendingDelta() : ProcedureReturn Cyw43RxIrqFirstPending()-gWifiRxReadyFirstPending : EndProcedure
+Procedure.i WifiRxReadyFirstQuietDelta() : ProcedureReturn Cyw43RxIrqFirstNoPending()-gWifiRxReadyFirstQuiet : EndProcedure
+Procedure.i WifiRxReadyNonPendingDelta() : ProcedureReturn Cyw43RxIrqNonemptyPending()-gWifiRxReadyNonPending : EndProcedure
+Procedure.i WifiRxReadyNonQuietDelta() : ProcedureReturn Cyw43RxIrqNonemptyNoPending()-gWifiRxReadyNonQuiet : EndProcedure
+Procedure.i WifiRxReadyEmptyPendingDelta() : ProcedureReturn Cyw43RxIrqEmptyPending()-gWifiRxReadyEmptyPending : EndProcedure
+Procedure.i WifiRxReadyEmptyQuietDelta() : ProcedureReturn Cyw43RxIrqEmptyNoPending()-gWifiRxReadyEmptyQuiet : EndProcedure
+Procedure.i WifiRxReadyInheritedDelta() : ProcedureReturn Cyw43RxIrqFirstInherited()-gWifiRxReadyInherited : EndProcedure
+Procedure.i WifiRxReadyNewDelta() : ProcedureReturn Cyw43RxIrqFirstNew()-gWifiRxReadyNew : EndProcedure
+Procedure.i WifiRxReadyQDataDelta() : ProcedureReturn Cyw43RxIrqQuietData()-gWifiRxReadyQData : EndProcedure
+Procedure.i WifiRxReadyQControlDelta() : ProcedureReturn Cyw43RxIrqQuietControl()-gWifiRxReadyQControl : EndProcedure
+Procedure.i WifiRxReadyQEventDelta() : ProcedureReturn Cyw43RxIrqQuietEvent()-gWifiRxReadyQEvent : EndProcedure
+Procedure.i WifiRxReadyQGlomDelta() : ProcedureReturn Cyw43RxIrqQuietGlom()-gWifiRxReadyQGlom : EndProcedure
+Procedure.i WifiRxReadyQUnknownDelta() : ProcedureReturn Cyw43RxIrqQuietUnknown()-gWifiRxReadyQUnknown : EndProcedure
+Procedure.i WifiRxReadyQMalformedDelta() : ProcedureReturn Cyw43RxIrqQuietMalformed()-gWifiRxReadyQMalformed : EndProcedure
+Procedure.i WifiRxReadyQPrevNextDelta() : ProcedureReturn Cyw43RxIrqQuietPrevNext()-gWifiRxReadyQPrevNext : EndProcedure
+Procedure.i WifiRxReadyQSeqOkDelta() : ProcedureReturn Cyw43RxIrqQuietSeqOk()-gWifiRxReadyQSeqOk : EndProcedure
+Procedure.i WifiRxReadyQSeqGapDelta() : ProcedureReturn Cyw43RxIrqQuietSeqGap()-gWifiRxReadyQSeqGap : EndProcedure
+Procedure.i WifiRxReadyQPostPendingDelta() : ProcedureReturn Cyw43RxIrqQuietPostPending()-gWifiRxReadyQPostPending : EndProcedure
+Procedure.i WifiRxReadyQPostQuietDelta() : ProcedureReturn Cyw43RxIrqQuietPostQuiet()-gWifiRxReadyQPostQuiet : EndProcedure
+Procedure.i WifiRxReadyQPostFailDelta() : ProcedureReturn Cyw43RxIrqQuietPostFail()-gWifiRxReadyQPostFail : EndProcedure

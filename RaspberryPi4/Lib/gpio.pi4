@@ -1,0 +1,698 @@
+; ======================================================================
+;  gpio.pi4 - BCM2711 general-purpose I/O, in readable code
+; ======================================================================
+;
+;  PinMode / PinAlt / DigitalWrite / DigitalRead / PinToggle / PinPull
+;  over all 58 of the BCM2711's GPIO lines.
+;
+;  A QUICK EXAMPLE
+;
+;    XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+;
+;    Procedure Main()
+;      PinMode(21, #PIN_OUTPUT)
+;      PinPull(20, #PULL_UP)
+;      PinMode(20, #PIN_INPUT)
+;
+;      DigitalWrite(21, DigitalRead(20))
+;    EndProcedure
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE. This file includes no other library.
+;
+;  It uses no delays, so it does not need RaspberryPi4/Lib/timer.pi4 -
+;  and the reason that is worth stating is that on a BCM2835 or BCM2836
+;  it WOULD have: the old pull mechanism required a timed wait. See the
+;  pull section below.
+;
+;  House rule 10 (vault RULES.md, 2026-07-30): a library never
+;  includes another library. The MAIN file lists what it needs, one per
+;  line; a dependency is documented in a header like this one and fails
+;  loudly at compile time as an undefined procedure if it is missing.
+;
+;  ---- WHERE THE ADDRESSES COME FROM ---------------------------------
+;
+;  Every number in this file is traceable. Two documents, both on disk
+;  under RaspberryPi4/Reference/ :
+;
+;    bcm283x.dtsi / bcm2711.dtsi   - which peripheral is at which BUS
+;                                    address, and the bus->ARM window
+;    bcm2711-peripherals.pdf       - "BCM2711 ARM Peripherals", the
+;                                    register-level authority
+;
+;  THE BASE ADDRESS, derived and not remembered:
+;
+;    bcm283x.dtsi line 107:  gpio: gpio@7e200000
+;    bcm2711.dtsi lines 41-43, the soc node's ranges:
+;        ranges = <0x7e000000  0x0 0xfe000000  0x01800000>, ...
+;
+;    so bus $7E200000 sits at ARM $FE200000, which the peripherals PDF
+;    states independently in section 1.2.4 (p.6): "a peripheral
+;    described in this document as being at legacy address 0x7Enn_nnnn
+;    ... is visible to the ARM at 0x0_FEnn_nnnn if Low Peripheral mode
+;    is enabled". Low Peripheral mode is what the Pi 4 firmware sets and
+;    what pi4Hello.pi4 and anvil.pi4 have both used on this board
+;    (the PL011 at $FE201000 is the same window, 0x1000 further along).
+;
+;  ---- .l, NOT .i. THE ONE THAT SILENTLY MISCOMPILES ------------------
+;
+;  ***EVERY REGISTER BELOW IS 32 BITS WIDE AND IS TOUCHED WITH PeekL /
+;  PokeL.*** BCM2711 ARM Peripherals section 5.2 (p.66) says it outright
+;  for this block: "All accesses are assumed to be 32-bit."
+;
+;  On this target .i, a bare pointer, and PeekI/PokeI are EIGHT bytes -
+;  they were four before the 64-bit rewrite. A PeekI of GPLEV0 would be
+;  a 64-bit read spanning GPLEV0 and GPLEV1, and a PokeI of GPSET0 would
+;  write GPSET1 as well, setting pins you never named. Nothing faults.
+;  See the LANGUAGE FACTS section of RaspberryPi4/Monitor/anvil.pi4
+;  for the long version; the short version is that .l is not a leftover
+;  from the 32-bit days, it is the width of the silicon.
+;
+;  PeekL SIGN-EXTENDS into the X register (the emitter appends sxtw), so
+;  a register with bit 31 set - GPLEV0 with GPIO31 high, say - comes
+;  back NEGATIVE. Every read in this file goes through GpioReadReg(),
+;  which masks with $FFFFFFFF so that later shifts and comparisons see a
+;  plain positive 32-bit value.
+;
+;  ---- THE PULL MECHANISM. READ THIS BEFORE PORTING ANYTHING ---------
+;
+;  ***THE BCM2711 DOES NOT HAVE GPPUD OR GPPUDCLK.*** Not "has them and
+;  prefers something else" - they are absent from the register map. The
+;  string "GPPUD" does not occur anywhere in the BCM2711 ARM Peripherals
+;  document.
+;
+;  Every Pi 3 example, every tutorial, and a great deal of code still in
+;  circulation configures a pull with the BCM2835/BCM2836 sequence:
+;  write the desired state to GPPUD ($7E200094), wait 150 cycles, write
+;  a pin mask to GPPUDCLK0/1 ($7E200098/$7E20009C), wait 150 cycles,
+;  clear both. That is a clock-and-latch protocol, it needs a delay
+;  loop, and ON THIS PART IT DOES NOTHING USEFUL. Offsets 0x94-0x9c are
+;  not in Table 63 at all. Writing there is not an error - it is a write
+;  into the GPIO block's address space that changes no pull, so the pin
+;  keeps whatever pull the firmware left on it and the failure looks
+;  like a floating input or an unexpectedly strong one.
+;
+;  WHAT THE BCM2711 HAS INSTEAD is four ordinary read/write registers,
+;  two bits per pin, no sequence and no delay:
+;
+;    Table 63, section 5.2, p.66:
+;      0xe4  GPIO_PUP_PDN_CNTRL_REG0    GPIOs 0..15
+;      0xe8  GPIO_PUP_PDN_CNTRL_REG1    GPIOs 16..31
+;      0xec  GPIO_PUP_PDN_CNTRL_REG2    GPIOs 32..47
+;      0xf0  GPIO_PUP_PDN_CNTRL_REG3    GPIOs 48..57
+;
+;    Table 90, p.74, field GPIO_PUP_PDN_CNTRL<n> at bits [2n+1:2n]:
+;      00 = No resistor is selected
+;      01 = Pull up resistor is selected
+;      10 = Pull down resistor is selected
+;      11 = Reserved
+;
+;    and, from the same table's description: "Reading these registers
+;    gives the current pull-state" - so PinPullGet() below is a real
+;    read-back, not a shadow copy.
+;
+;  THIS IS THE MECHANISM IMPLEMENTED HERE: a plain read-modify-write of
+;  the two bits, and nothing else.
+;
+;  The reset values are NOT all "no pull" and are not uniform: Table 90
+;  gives GPIO0-8 a reset of 0x1 (pull up) and GPIO9-15 a reset of 0x2
+;  (pull down), and the per-pin defaults after a power down are in the
+;  alternate function table (Table 94), also reproduced as the "Default
+;  Pull" column of Table 5 in the Pi 4 product datasheet. So a pin you
+;  have not configured is NOT floating, and "it reads high" is not
+;  evidence of anything until you have set the pull yourself.
+;
+;  ---- MEMORY ORDERING -------------------------------------------------
+;
+;  BCM2711 ARM Peripherals section 1.3, pp.6-7: the AXI system does not
+;  always return read data in order, and the ARM core has no logic to
+;  cope with that. Accesses to the SAME peripheral are always in order;
+;  it is only switching between peripherals that can reorder. The
+;  document's rule is "a memory write barrier before the first write to
+;  a peripheral, a memory read barrier after the last read".
+;
+;  Every public procedure below is a complete little peripheral service,
+;  so it takes that rule literally: a barrier on entry and a barrier
+;  after its last read. The barrier is a64_barrier() - dsb sy + isb -
+;  from RaspberryPi4/Intrinsics/bcm2711_hardware.def.
+;
+;  That is deliberately the CONSERVATIVE reading, and it is not free. If
+;  you are bit-banging a protocol out of DigitalWrite in a tight loop
+;  and nothing else in that loop touches another peripheral, section 1.3
+;  says you do not need a barrier per access - but measure before you go
+;  and write an unbarriered variant, because a dsb on an A72 is cheaper
+;  than the mistake it prevents.
+;
+;  ---- STATUS ---------------------------------------------------------
+;
+;  Written 2026-08-24. Compiles for -t pi4. The emitted assembly was
+;  read back and checked instruction by instruction against Table 63:
+;
+;    GPFSEL   movz w11, #65056, lsl #16      -> $FE200000 + (pin/10)*4
+;    GPSET0   movz w12, #28  + the same movk -> $FE20001C + (pin/32)*4
+;    GPCLR0   movz w12, #40                  -> $FE200028 + (pin/32)*4
+;    GPLEV0   movz w11, #52                  -> $FE200034 + (pin/32)*4
+;    pulls    movz w11, #228                 -> $FE2000E4 + (pin/16)*4
+;
+;  and the field arithmetic likewise: *3 for FSEL, *2 for the pulls, and
+;  PinMode's mask emitting lsl / mvn / and / lsl / orr / str w - a
+;  32-bit store, which is what a 32-bit register wants.
+;
+;  NOT YET HARDWARE-VERIFIED. Nothing here has driven a real pin.
+;
+;  RE-CHECKED 2026-08-27 AND STILL TRUE, and dated twice on purpose: an
+;  undated "not yet verified" reads as present tense for ever, and six
+;  headers in this directory were false for days because of exactly
+;  that. The check is mechanical and repeatable in one command - nothing
+;  anywhere under RaspberryPi4/ carries
+;  `XIncludeFile "RaspberryPi4/Lib/gpio.pi4"`, so no image that has ever
+;  booted contains a line of this file.
+;
+;  DO NOT READ THE NEIGHBOURS ACROSS. Plenty of GPIO has been driven on
+;  this board and none of it went through here: uart.pi4 muxes GPIO
+;  14/15 with its own PokeL, bluetooth.pi4 reads GPFSEL1/GPFSEL3 directly
+;  to decide where the PL011 points, and an inverted pull encoding was
+;  found and fixed in the monitor. Those prove the ADDRESSES in the
+;  $FE2000xx window are right - which is worth something, since a wrong
+;  base is this project's most expensive recurring mistake - and prove
+;  nothing whatever about the procedures below.
+;
+;  Two things in particular need silicon rather than a listing:
+;
+;    * that PinPull() actually changes a pad. The whole argument for the
+;      GPIO_PUP_PDN_CNTRL registers over GPPUD is documentary; it wants
+;      a meter on a floating pin. THE PULL ENCODING IS THE PART WITH A
+;      KNOWN HISTORY: an inverted one was found on this part in other
+;      code, so a readback that merely looks plausible is not evidence.
+;    * the reset pull states of Table 90 (GPIO0-8 up, GPIO9-15 down),
+;      read back through PinPullGet() before anything writes them.
+;
+;  ---- SUPERSEDED CROSS-REFERENCE -------------------------------------
+;
+;  This header used to point at "the 32-bit-.i truncation described in
+;  the STATUS note of RaspberryPi4/Lib/timer.pi4", saying it affects the
+;  backend but not this file. THAT TRUNCATION WAS FIXED ON 2026-08-24
+;  and timer.pi4's note has been retired to a SUPERSEDED block; the
+;  pointer is kept here so a reader who finds the old wording in the git
+;  history does not go looking for a live defect.
+;
+;  The reason it did not affect this file is still worth stating,
+;  because it is why nothing here had to change when the model moved:
+;  every value in this file - pin numbers, 3- and 2-bit fields, and
+;  addresses in the $FE2000xx window - fits in 32 bits with room to
+;  spare, so neither model can lose anything.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  The register block.
+;
+;  BCM2711 ARM Peripherals, Table 63 (section 5.2, p.66). The GPIO
+;  register base is legacy $7E200000 -> ARM $FE200000; the offsets are
+;  copied from that table verbatim and the arithmetic that turns a pin
+;  number into an address is in the helpers further down, so that the
+;  numbers themselves are reviewable against the table one line each.
+;
+;  Only the registers this library actually uses are named. The event
+;  detect group - GPEDS0/1 at 0x40/0x44, GPREN 0x4c/0x50, GPFEN
+;  0x58/0x5c, GPHEN 0x64/0x68, GPLEN 0x70/0x74, GPAREN 0x7c/0x80,
+;  GPAFEN 0x88/0x8c - is in the same table and is deliberately LEFT OUT:
+;  edge and level detection is an interrupt story, and this library has
+;  no interrupt story yet. Their offsets are recorded here so the next
+;  person does not have to re-derive them.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  THE ONE BOARD-SPECIFIC ADDRESS IN THIS FILE. THERE ARE NO OTHERS.
+;
+;  Changed 2026-08-26. There used to be six absolute BCM2711 addresses
+;  here; there is now one, and the five register constants below are
+;  OFFSETS INSIDE THE BLOCK, which are identical on the BCM2835,
+;  BCM2836, BCM2837 and BCM2711 - only the window they sit in moves.
+;
+;  Renaming them to "_OFF" is not cosmetic. Had #GPSET0 merely changed
+;  value from $FE20001C to $1C, any use site the conversion missed
+;  would still compile and would then set a bit at address $1C for
+;  ever. With the rename, a missed site does not build.
+;
+;  This literal stays here rather than coming from
+;  RaspberryPi4/Lib/soc.pi4 for the reason set out at length in
+;  uart.pi4: soc.pi4 would have to become a mandatory include for
+;  everything at once. soc.pi4 holds the same number with fuller
+;  citations, and tools/a64/a64_socbase_check.py fails if this line
+;  and that file disagree.
+;
+;  CITATION. gpio@7e200000 - Datasheets/pi4/bcm283x.dtsi:107, and
+;  bcm2711-peripherals.pdf 5.2 Register View, p.67, "The GPIO register
+;  base address is 0x7e200000". Bus $7Ennnnnn is ARM physical
+;  $FEnnnnnn - bcm2711.dtsi:41.
+; ----------------------------------------------------------------------
+#GPIO_BASE   = $FE200000      ; bus $7E200000, translated per soc ranges
+
+#GPFSEL0_OFF = $00            ; function select, 10 pins per reg
+#GPSET0_OFF  = $1C            ; output set,      32 pins per reg
+#GPCLR0_OFF  = $28            ; output clear,    32 pins per reg
+#GPLEV0_OFF  = $34            ; pin level,       32 pins per reg
+#GPIO_PUP_PDN_CNTRL_REG0_OFF = $E4  ; pulls,     16 pins per reg
+
+; ----------------------------------------------------------------------
+;  Pin modes - the RAW three-bit FSEL codes, not an invented enumeration.
+;
+;  BCM2711 ARM Peripherals, Table 64 (section 5.2, p.66), which spells
+;  the encoding out for every FSEL field:
+;
+;      000 = input          011 = alternate function 4
+;      001 = output         010 = alternate function 5
+;      100 = alternate function 0
+;      101 = alternate function 1
+;      110 = alternate function 2
+;      111 = alternate function 3
+;
+;  ***NOTE ALT4 AND ALT5.*** The ALT codes are NOT 4+n. ALT0..ALT3 are
+;  4,5,6,7 but ALT4 is 3 and ALT5 is 2 - the table is out of order and
+;  it is out of order on purpose in the silicon. Writing 8 for "ALT4"
+;  or computing 4+alt selects a different peripheral onto the pad, which
+;  is a fault-free way to drive the wrong signal. These constants ARE
+;  the table, so a reviewer can check six lines against six lines.
+;
+;  Holding the raw codes in the constants is the same choice
+;  RA4M1AndRelated/Lib/gpio.unor4 makes with its PmnPFS values, and for
+;  the same reason: one translation step is one place to be wrong.
+;
+;  WHY THESE ARE DECIMAL AND NOT %000 / %100, WHICH IS HOW THE DATASHEET
+;  WRITES THEM AND HOW THIS FILE WAS FIRST WRITTEN: binary literals do
+;  not compile on this backend. `v = %1010` emits `adrp x11, %1010` and
+;  the build dies with "A64 ASSEMBLER FATAL: unknown symbol '%1010'".
+;  A64LooksNumeric() in RaspberryPi4/A64Assembler.pbi handles $, 0x and
+;  decimal but has no % case, so a binary literal is classified as a
+;  SYMBOL. The same gap exists in A64Numeric() next to it. It is a
+;  compiler defect, reported 2026-08-24, NOT fixed here - the compiler
+;  sources are held by another worker. The bit pattern from the table is
+;  in the comment on every line so the review against Table 64 is still
+;  a six-line-against-six-line check.
+; ----------------------------------------------------------------------
+#PIN_INPUT  = 0               ; 000
+#PIN_OUTPUT = 1               ; 001
+#PIN_ALT0   = 4               ; 100
+#PIN_ALT1   = 5               ; 101
+#PIN_ALT2   = 6               ; 110
+#PIN_ALT3   = 7               ; 111
+#PIN_ALT4   = 3               ; 011   <- not 8
+#PIN_ALT5   = 2               ; 010   <- not 9
+
+#PIN_LOW  = 0
+#PIN_HIGH = 1
+
+; Pull states. Table 90, p.74. These are the raw two-bit field values.
+#PULL_NONE = 0                ; 00 - no resistor is selected
+#PULL_UP   = 1                ; 01
+#PULL_DOWN = 2                ; 10
+; 11 is Reserved and is refused by PinPull() rather than written.
+
+; ----------------------------------------------------------------------
+;  How many GPIOs there are, and why 57 and not 53.
+;
+;  BCM2711 ARM Peripherals section 5.1 (p.65): "There are 58 General-
+;  Purpose Input/Output (GPIO) lines split into three banks. Bank 0
+;  contains GPIOs 0 to 27, bank 1 contains GPIOs 28 to 45, and bank 2
+;  contains GPIOs 46 to 57."
+;
+;  Confirmed by bcm2711.dtsi line 646, which overrides the inherited
+;  BCM2835 node: gpio-ranges = <&gpio 0 0 58>. The bcm283x.dtsi original
+;  says 54 - that is the older part, and it is exactly the sort of stale
+;  number a Pi 3 port would carry in.
+;
+;  Only GPIO0..27 reach the 40-pin header (Pi 4 product datasheet,
+;  section 5.1, "28x user GPIO"). 28..57 are real lines on the die used
+;  for on-board functions, so they are addressable here but you should
+;  know what you are taking over before you drive one.
+; ----------------------------------------------------------------------
+#PIN_MAX   = 57
+#PIN_COUNT = 58
+
+; Counts every call that was refused for an out-of-range pin. A silent
+; refusal is still a silent wrong answer at 3am; this makes it countable
+; without every call site having to check a return code. Same idea as
+; GpioBadPinCount() in RA4M1AndRelated/Lib/gpio.unor4.
+Global gpio_bad_pins.i
+
+; ----------------------------------------------------------------------
+;  GpioBarrier() - the section 1.3 barrier, named once.
+;
+;  a64_barrier() is dsb sy + isb, from
+;  RaspberryPi4/Intrinsics/bcm2711_hardware.def. Exposed as a procedure
+;  so that a caller sequencing GPIO against another peripheral can place
+;  one without reaching for an intrinsic, and so there is one place to
+;  change if the barrier ever needs to be weaker.
+; ----------------------------------------------------------------------
+Procedure GpioBarrier()
+  a64_barrier()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GpioReadReg(addr) - one 32-bit register, as a positive number.
+;
+;  PeekL sign-extends, so a register with bit 31 set arrives negative
+;  and every subsequent shift and comparison is then wrong in a way that
+;  only shows up on GPIO15, 31 or 47. The mask is not decoration.
+; ----------------------------------------------------------------------
+Procedure.i GpioReadReg(addr.i)
+  ProcedureReturn PeekN(addr) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GpioPinValid(pin) - 1 if the pin exists, 0 otherwise (and counted).
+; ----------------------------------------------------------------------
+Procedure.i GpioPinValid(pin.i)
+  If pin < 0 Or pin > #PIN_MAX
+    gpio_bad_pins = gpio_bad_pins + 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The address arithmetic, one procedure per register family.
+;
+;  There is no modulo operator in this language, so every "pin mod N" is
+;  written as pin - (pin/N)*N. Integer division truncates toward zero
+;  and pin is non-negative at every call site (GpioPinValid ran first),
+;  so that identity is exact here.
+; ----------------------------------------------------------------------
+
+; GPFSEL: ten 3-bit fields per register, six registers covering 0..59.
+; Table 64 shows FSEL0..FSEL9 in GPFSEL0 at bits 2:0, 5:3, ... 29:27,
+; with 31:30 Reserved - hence ten per register and a 3-bit stride.
+Procedure.i GpioFselAddr(pin.i)
+  ProcedureReturn #GPIO_BASE + #GPFSEL0_OFF + (pin / 10) * 4
+EndProcedure
+
+Procedure.i GpioFselShift(pin.i)
+  Define reg.i
+  reg = pin / 10
+  ProcedureReturn (pin - reg * 10) * 3
+EndProcedure
+
+; GPSET / GPCLR / GPLEV: one bit per pin, 32 pins per register, so bank
+; 0 is pins 0..31 and bank 1 is pins 32..57 (Tables 70-75, pp.70-71;
+; bank 1 has bits 31:26 Reserved, which is why #PIN_MAX is 57).
+Procedure.i GpioBankAddr(base.i, pin.i)
+  ProcedureReturn base + (pin / 32) * 4
+EndProcedure
+
+Procedure.i GpioBankMask(pin.i)
+  Define bank.i
+  bank = pin / 32
+  ProcedureReturn 1 << (pin - bank * 32)
+EndProcedure
+
+; GPIO_PUP_PDN_CNTRL: sixteen 2-bit fields per register, four registers
+; covering 0..63 (Table 63 for the four offsets, Table 90 for the field
+; layout - CNTRL00 at bits 1:0 up to CNTRL15 at bits 31:30).
+Procedure.i GpioPullAddr(pin.i)
+  ProcedureReturn #GPIO_BASE + #GPIO_PUP_PDN_CNTRL_REG0_OFF + (pin / 16) * 4
+EndProcedure
+
+Procedure.i GpioPullShift(pin.i)
+  Define reg.i
+  reg = pin / 16
+  ProcedureReturn (pin - reg * 16) * 2
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinMode(pin, mode) - function select.
+;
+;  mode is one of #PIN_INPUT, #PIN_OUTPUT, #PIN_ALT0..#PIN_ALT5 - i.e. a
+;  raw 3-bit FSEL code. Returns 1 on success, 0 for a bad pin or a mode
+;  outside 0..7.
+;
+;  READ-MODIFY-WRITE, and it has to be: one GPFSEL register carries ten
+;  pins, so a blind store would set nine other pins to input. There is
+;  no atomic set/clear alias for GPFSEL the way there is for the output
+;  registers - Table 63 offers none - so this sequence is not
+;  interrupt-safe or core-safe against another writer of the same
+;  GPFSEL register. If a second core configures pins in the same group
+;  of ten, that is the caller's problem to serialise; this library does
+;  not own a lock.
+;
+;  NOTE THE ORDER WHEN YOU ARE SETTING UP AN INPUT: configure the pull
+;  FIRST with PinPull(), then the mode. The other order works too - the
+;  pull register is independent of FSEL - but doing the pull first means
+;  the pin is never briefly an input with the previous pull on it.
+;
+;  Parentheses around every shift are not style. Operator precedence in
+;  this language is NOT the host language's: & | ! bind TIGHTER than << >>, so
+;  `v & ~7 << sh` would parse as `v & ~(7 << (sh))`... and worse forms
+;  parse as something plausible. Written out, always.
+; ----------------------------------------------------------------------
+Procedure.i PinMode(pin.i, mode.i)
+  Define a.i
+  Define sh.i
+  Define v.i
+
+  If GpioPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If mode < 0 Or mode > 7
+    ProcedureReturn 0
+  EndIf
+
+  GpioBarrier()                       ; section 1.3: before the first write
+  a  = GpioFselAddr(pin)
+  sh = GpioFselShift(pin)
+  v  = GpioReadReg(a)
+  v  = v & ~(7 << sh)
+  v  = v | (mode << sh)
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinModeGet(pin) - the pin's current 3-bit FSEL code, or -1 for a bad
+;  pin. Compare against #PIN_INPUT, #PIN_OUTPUT, #PIN_ALT0 and friends.
+; ----------------------------------------------------------------------
+Procedure.i PinModeGet(pin.i)
+  Define v.i
+  If GpioPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  GpioBarrier()
+  v = (GpioReadReg(GpioFselAddr(pin)) >> GpioFselShift(pin)) & 7
+  GpioBarrier()                       ; section 1.3: after the last read
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The three common cases, spelled out. PinAlt() takes 0..5 and does the
+;  out-of-order mapping from Table 64 in ONE place, so no caller ever
+;  has to remember that ALT4 is 3.
+; ----------------------------------------------------------------------
+Procedure.i PinInput(pin.i)
+  ProcedureReturn PinMode(pin, #PIN_INPUT)
+EndProcedure
+
+Procedure.i PinOutput(pin.i)
+  ProcedureReturn PinMode(pin, #PIN_OUTPUT)
+EndProcedure
+
+Procedure.i PinAlt(pin.i, alt.i)
+  Define code.i
+  Select alt
+    Case 0
+      code = #PIN_ALT0
+    Case 1
+      code = #PIN_ALT1
+    Case 2
+      code = #PIN_ALT2
+    Case 3
+      code = #PIN_ALT3
+    Case 4
+      code = #PIN_ALT4
+    Case 5
+      code = #PIN_ALT5
+    Default
+      ProcedureReturn 0
+  EndSelect
+  ProcedureReturn PinMode(pin, code)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinHigh / PinLow - the atomic set and clear registers.
+;
+;  Tables 70-73, p.70. These are WRITE-ONLY and writing a 0 to a bit
+;  HAS NO EFFECT, which is the whole point: "Separating the set and
+;  clear functions removes the need for read-modify-write operations".
+;  So a single store touches exactly the one pin named and no other, and
+;  two cores driving two different pins in the same bank cannot lose
+;  each other's writes.
+;
+;  DO NOT try to read GPSET or GPCLR back. They are WO in the table; a
+;  read returns nothing useful. The pin's actual state is GPLEV, which
+;  is what DigitalRead() uses.
+;
+;  If the pin is currently an input the write is remembered but not
+;  driven - Table 70's description: "if the pin is subsequently defined
+;  as an output then the bit will be set according to the last set/clear
+;  operation". That is a feature; it lets you stage a level before
+;  switching the pin to output, so the pad never glitches through the
+;  old value.
+; ----------------------------------------------------------------------
+Procedure.i PinHigh(pin.i)
+  If GpioPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  GpioBarrier()
+  PokeL(GpioBankAddr(#GPIO_BASE + #GPSET0_OFF, pin), GpioBankMask(pin))
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PinLow(pin.i)
+  If GpioPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  GpioBarrier()
+  PokeL(GpioBankAddr(#GPIO_BASE + #GPCLR0_OFF, pin), GpioBankMask(pin))
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DigitalWrite(pin, level) - level 0 clears, anything else sets.
+;
+;  "Anything else sets" rather than "1 sets" so that DigitalWrite(pin,
+;  DigitalRead(other)) and DigitalWrite(pin, flags & mask) both do the
+;  obvious thing instead of quietly clearing when the mask value is 4.
+; ----------------------------------------------------------------------
+Procedure.i DigitalWrite(pin.i, level.i)
+  If level = #PIN_LOW
+    ProcedureReturn PinLow(pin)
+  EndIf
+  ProcedureReturn PinHigh(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DigitalRead(pin) - 0 or 1 from GPLEV, or -1 for a bad pin.
+;
+;  Tables 74-75, p.71: "The pin level registers return the actual value
+;  of the pin." THE ACTUAL PAD, not a shadow of what you last wrote - so
+;  this reads back a pin driven by something else, and it reads back an
+;  output pin's real level, which is how you notice you are fighting an
+;  external driver.
+;
+;  -1 for a bad pin, not 0. A bad pin returning 0 is indistinguishable
+;  from a real low, which is exactly the silent wrong answer this
+;  project keeps paying for.
+; ----------------------------------------------------------------------
+Procedure.i DigitalRead(pin.i)
+  Define v.i
+  If GpioPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  GpioBarrier()
+  v = GpioReadReg(GpioBankAddr(#GPIO_BASE + #GPLEV0_OFF, pin))
+  GpioBarrier()                       ; section 1.3: after the last read
+  If (v & GpioBankMask(pin)) <> 0
+    ProcedureReturn #PIN_HIGH
+  EndIf
+  ProcedureReturn #PIN_LOW
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinToggle(pin) - drive the pin to the opposite of what the PAD reads.
+;
+;  There is no toggle register in Table 63, so this is read-then-write
+;  and it is NOT atomic: another core, or an interrupt, can change the
+;  pin between the GPLEV read and the GPSET/GPCLR write.
+;
+;  It also reads the PAD, not an intention. On an output pin that is the
+;  same thing. On a pin being fought by an external driver it is not,
+;  and PinToggle will keep re-deciding based on who is winning. If you
+;  need a deterministic square wave, keep your own state and call
+;  PinHigh/PinLow - a single write each, atomic by construction.
+; ----------------------------------------------------------------------
+Procedure.i PinToggle(pin.i)
+  Define lvl.i
+  lvl = DigitalRead(pin)
+  If lvl < 0
+    ProcedureReturn 0
+  EndIf
+  If lvl = #PIN_HIGH
+    ProcedureReturn PinLow(pin)
+  EndIf
+  ProcedureReturn PinHigh(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinPull(pin, pull) - the BCM2711 pull-up / pull-down control.
+;
+;  pull is #PULL_NONE, #PULL_UP or #PULL_DOWN. Returns 1 on success, 0
+;  for a bad pin or a value outside those three.
+;
+;  ***THIS IS THE BCM2711 MECHANISM, NOT THE BCM2835 ONE.*** No GPPUD,
+;  no GPPUDCLK, no 150-cycle waits, no clocking sequence - a plain
+;  read-modify-write of two bits in GPIO_PUP_PDN_CNTRL_REGn. See the
+;  long note in the file header for why a ported Pi 3 routine fails
+;  here without complaining.
+;
+;  %11 IS REFUSED rather than written. Table 90 marks it Reserved, and
+;  "reserved" on a pad control is not a value to find out about on a
+;  board somebody else is using.
+;
+;  Read-modify-write, so the same caveat as PinMode: sixteen pins share
+;  a register and this library does not serialise concurrent writers.
+; ----------------------------------------------------------------------
+Procedure.i PinPull(pin.i, pull.i)
+  Define a.i
+  Define sh.i
+  Define v.i
+
+  If GpioPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If pull <> #PULL_NONE And pull <> #PULL_UP And pull <> #PULL_DOWN
+    ProcedureReturn 0
+  EndIf
+
+  GpioBarrier()
+  a  = GpioPullAddr(pin)
+  sh = GpioPullShift(pin)
+  v  = GpioReadReg(a)
+  v  = v & ~(3 << sh)
+  v  = v | (pull << sh)
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PinPullGet(pin) - the pin's current pull state, or -1 for a bad pin.
+;
+;  A genuine read-back. Table 90's description: "Reading these registers
+;  gives the current pull-state." Returns #PULL_NONE / #PULL_UP /
+;  #PULL_DOWN, or 3 if the field somehow holds the reserved value.
+;
+;  Worth calling before you conclude a pin is floating: the reset states
+;  are not uniform (Table 90 gives GPIO0-8 pull-up and GPIO9-15
+;  pull-down) and the firmware sets its own pulls on pins it uses.
+; ----------------------------------------------------------------------
+Procedure.i PinPullGet(pin.i)
+  Define v.i
+  If GpioPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  GpioBarrier()
+  v = (GpioReadReg(GpioPullAddr(pin)) >> GpioPullShift(pin)) & 3
+  GpioBarrier()                       ; section 1.3: after the last read
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GpioBadPinCount() - how many calls have been refused for a pin number
+;  outside 0..#PIN_MAX since the program started.
+;
+;  Non-zero means somewhere a pin number is wrong, and the call it came
+;  from did nothing. Cheaper to print this once at the end of a test
+;  than to check a return code at four hundred call sites.
+; ----------------------------------------------------------------------
+Procedure.i GpioBadPinCount()
+  ProcedureReturn gpio_bad_pins
+EndProcedure

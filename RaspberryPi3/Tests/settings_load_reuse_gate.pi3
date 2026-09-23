@@ -1,0 +1,51 @@
+; Emitted test of the exact implicit settings-load condition used by the
+; Pi3 font boot loader and deferred Wi-Fi autoconnect service.
+
+Global gate_loaded.i
+Global gate_load_calls.i
+Global gate_revision.i
+
+Procedure.i SettingsLoadState()
+  ProcedureReturn gate_loaded
+EndProcedure
+
+Procedure.i SettingsLoad()
+  gate_load_calls = gate_load_calls + 1
+  gate_revision = gate_revision + 1
+  gate_loaded = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i FontImplicitLoad()
+  Protected loadRc.i
+  ; @@FONT_SETTINGS_LOAD@@
+  ProcedureReturn loadRc
+EndProcedure
+
+Procedure.i AutoImplicitLoad()
+  Protected settingsRc.i
+  ; @@AUTO_SETTINGS_LOAD@@
+  ProcedureReturn settingsRc
+EndProcedure
+
+Procedure.i Main()
+  ; Font restore loads first; autoconnect must reuse the clean table.
+  gate_loaded = 0 : gate_load_calls = 0 : gate_revision = 0
+  If FontImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 1 : ProcedureReturn 1 : EndIf
+  If AutoImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 1 : ProcedureReturn 2 : EndIf
+
+  ; Autoconnect loads first; font restore must reuse the clean table too.
+  gate_loaded = 0 : gate_load_calls = 0 : gate_revision = 0
+  If AutoImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 1 : ProcedureReturn 3 : EndIf
+  If FontImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 1 : ProcedureReturn 4 : EndIf
+
+  ; A never-loaded or partial table still triggers the normal read/reparse.
+  gate_loaded = 2 : gate_load_calls = 0 : gate_revision = 7
+  If FontImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 8 : ProcedureReturn 5 : EndIf
+  gate_loaded = 0 : gate_load_calls = 0 : gate_revision = 8
+  If AutoImplicitLoad() <> 1 Or gate_load_calls <> 1 Or gate_revision <> 9 : ProcedureReturn 6 : EndIf
+
+  ; Explicit/manual reload still uses SettingsLoad and advances revision.
+  If SettingsLoad() <> 1 Or gate_load_calls <> 2 Or gate_revision <> 10 : ProcedureReturn 7 : EndIf
+  ProcedureReturn 0
+EndProcedure

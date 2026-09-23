@@ -1,0 +1,124 @@
+; Isolated emitted test for the board-neutral stored-network scan policy.
+#CYW43_SCAN_DONE = 2
+#CYW43_SCAN_FAILED = 3
+XIncludeFile "Anvil/Net/wifi_join_policy.pbi"
+; @@SCAN_CONSTANTS@@
+
+Global gate_start_result.i
+Global gate_poll_result.i
+Global gate_poll_limit.i
+Global gate_poll_count.i
+Global gate_progress_count.i
+Global gate_scan_started.i
+Global gate_candidate_count.i
+Global gate_candidate_mode.i
+Global Dim gate_candidate_slots.i[16]
+Global Dim gate_candidate_names.i[16]
+Global Dim gate_candidate_lens.i[16]
+
+Global Dim gate_name0.a[8]
+Global Dim gate_name1.a[8]
+Global Dim gate_name2.a[8]
+Global Dim gate_name3.a[8]
+Global Dim gate_name4.a[8]
+
+Procedure.i Cyw43ScanStart(passive.i, timeoutMs.i)
+  gate_scan_started = gate_scan_started + 1
+  If passive <> 0 Or timeoutMs <> 2000 : ProcedureReturn -1 : EndIf
+  ProcedureReturn gate_start_result
+EndProcedure
+
+Procedure.i Cyw43ScanPoll(sliceMs.i)
+  gate_poll_count = gate_poll_count + 1
+  If sliceMs <> #ANVIL_WIFI_SCAN_SLICE_MS : ProcedureReturn #CYW43_SCAN_FAILED : EndIf
+  If gate_poll_count < gate_poll_limit : ProcedureReturn 1 : EndIf
+  ProcedureReturn gate_poll_result
+EndProcedure
+
+Procedure.i Cyw43ScanCount() : ProcedureReturn 5 : EndProcedure
+Procedure.i Cyw43ScanSsid(i.i)
+  Select i
+    Case 0 : ProcedureReturn @gate_name0[0]
+    Case 1 : ProcedureReturn @gate_name1[0]
+    Case 2 : ProcedureReturn @gate_name2[0]
+    Case 3 : ProcedureReturn @gate_name3[0]
+    Case 4 : ProcedureReturn @gate_name4[0]
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43ScanSsidLen(i.i) : ProcedureReturn 4 : EndProcedure
+Procedure.i Cyw43ScanChannel(i.i)
+  Select i
+    Case 0 : ProcedureReturn 36
+    Case 1 : ProcedureReturn 1
+    Case 2 : ProcedureReturn 6
+    Case 3 : ProcedureReturn 11
+    Case 4 : ProcedureReturn 149
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure gateFindStored(*ssid, ssidLen.i, *slotOut)
+  Protected slot.i = 0
+  If ssidLen = 4
+    If *ssid = @gate_name0[0] Or *ssid = @gate_name4[0] : slot = 2 : EndIf
+    If *ssid = @gate_name2[0] : slot = 1 : EndIf
+    If *ssid = @gate_name3[0] : slot = 3 : EndIf
+  EndIf
+  PokeL(*slotOut, slot)
+EndProcedure
+
+Procedure gateProgress() : gate_progress_count = gate_progress_count + 1 : EndProcedure
+
+Procedure.i gateCandidate(slot.i, ssid.i, ssidLen.i)
+  If gate_candidate_count < 16
+    gate_candidate_slots[gate_candidate_count] = slot
+    gate_candidate_names[gate_candidate_count] = ssid
+    gate_candidate_lens[gate_candidate_count] = ssidLen
+  EndIf
+  gate_candidate_count = gate_candidate_count + 1
+  If gate_candidate_mode = 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected slot.i, name.i, nameLen.i, r.i
+  ; Fixed, NUL-terminated mock scan rows. Row 1 is deliberately unmatched.
+  PokeA(@gate_name0[0], 102) : PokeA(@gate_name0[1], 105) : PokeA(@gate_name0[2], 118) : PokeA(@gate_name0[3], 101)
+  PokeA(@gate_name1[0], 110) : PokeA(@gate_name1[1], 111) : PokeA(@gate_name1[2], 112) : PokeA(@gate_name1[3], 101)
+  PokeA(@gate_name2[0], 104) : PokeA(@gate_name2[1], 111) : PokeA(@gate_name2[2], 109) : PokeA(@gate_name2[3], 101)
+  PokeA(@gate_name3[0], 111) : PokeA(@gate_name3[1], 102) : PokeA(@gate_name3[2], 102) : PokeA(@gate_name3[3], 105)
+  PokeA(@gate_name4[0], 119) : PokeA(@gate_name4[1], 111) : PokeA(@gate_name4[2], 114) : PokeA(@gate_name4[3], 107)
+
+  gate_start_result = 0 : gate_poll_result = #CYW43_SCAN_DONE : gate_poll_limit = 3
+  gate_candidate_mode = 0
+  r = AnvilWifiJoinKnownScan(@gateFindStored, @gateCandidate, @gateProgress, @slot, @name, @nameLen)
+  If r <> 1 Or slot <> 1 Or name <> @gate_name2[0] Or nameLen <> 4 : ProcedureReturn 1 : EndIf
+  If gate_candidate_count <> 1 Or gate_candidate_slots[0] <> 1 Or gate_candidate_names[0] <> @gate_name2[0] : ProcedureReturn 2 : EndIf
+  If gate_poll_count <> 3 Or gate_progress_count <> 3 : ProcedureReturn 3 : EndIf
+
+  ; Reject every 2.4-GHz candidate, then confirm all such records precede
+  ; the 5-GHz candidates, preserving scan order within each band.
+  gate_candidate_count = 0 : gate_poll_count = 0 : gate_progress_count = 0
+  gate_candidate_mode = 1
+  r = AnvilWifiJoinKnownScan(@gateFindStored, @gateCandidate, @gateProgress, @slot, @name, @nameLen)
+  If r <> 0 Or slot <> 0 Or name <> 0 Or nameLen <> 0 : ProcedureReturn 4 : EndIf
+  If gate_candidate_count <> 4 : ProcedureReturn 5 : EndIf
+  If gate_candidate_slots[0] <> 1 Or gate_candidate_slots[1] <> 3 Or gate_candidate_slots[2] <> 2 Or gate_candidate_slots[3] <> 2 : ProcedureReturn 6 : EndIf
+  If gate_candidate_names[0] <> @gate_name2[0] Or gate_candidate_names[1] <> @gate_name3[0] Or gate_candidate_names[2] <> @gate_name0[0] Or gate_candidate_names[3] <> @gate_name4[0] : ProcedureReturn 7 : EndIf
+
+  ; Scan-start failure must not invoke the candidate or leave stale outputs.
+  gate_candidate_count = 0 : gate_start_result = -1 : gate_poll_count = 0
+  r = AnvilWifiJoinKnownScan(@gateFindStored, @gateCandidate, @gateProgress, @slot, @name, @nameLen)
+  If r <> -1 Or gate_candidate_count <> 0 Or slot <> 0 Or name <> 0 Or nameLen <> 0 : ProcedureReturn 8 : EndIf
+  ; A terminal scan failure still permits using the records collected so far.
+  gate_start_result = 0 : gate_poll_result = #CYW43_SCAN_FAILED : gate_poll_limit = 1
+  gate_candidate_count = 0 : gate_poll_count = 0 : gate_progress_count = 0 : gate_candidate_mode = 0
+  r = AnvilWifiJoinKnownScan(@gateFindStored, @gateCandidate, @gateProgress, @slot, @name, @nameLen)
+  If r <> 1 Or gate_candidate_count <> 1 Or gate_poll_count <> 1 : ProcedureReturn 9 : EndIf
+  ; Missing outputs/candidate callback fail before touching the radio.
+  gate_scan_started = 0
+  If AnvilWifiJoinKnownScan(@gateFindStored, 0, @gateProgress, @slot, @name, @nameLen) <> -1 Or gate_scan_started <> 0 : ProcedureReturn 10 : EndIf
+  If AnvilWifiJoinKnownScan(0, @gateCandidate, @gateProgress, @slot, @name, @nameLen) <> -1 Or gate_scan_started <> 0 : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure

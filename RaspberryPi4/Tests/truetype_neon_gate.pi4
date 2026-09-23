@@ -1,0 +1,54 @@
+EnableExplicit
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster_neon.pbi"
+
+; The PMF map exposes 0x00600000..0x07EFFFFF as low payload RAM. Keep all
+; native test buffers and the post-return result record inside that window.
+; Test buffers start one byte off alignment; every read/write stays within the
+; explicitly reported 0x01000000..0x0100201F touch span.
+#N_A=$01000001
+#N_B=$01001001
+#N_REPORT=$01002000
+#N_REPORT_MAGIC=$4E4E5053
+
+Procedure.i Main()
+  Protected length.i,n.i,value.i,expected.i,rc.i
+  For length=0 To 63
+    PokeA(#N_A-1,$A5) : PokeA(#N_B-1,$A5)
+    For n=0 To length-1
+      value=n-(n/17)*17
+      PokeA(#N_A+n,value) : PokeA(#N_B+n,value)
+    Next
+    PokeA(#N_A+length,$5A) : PokeA(#N_B+length,$5A)
+    If AnvilTrueTypeCoverageCountsToAlpha(#N_A,length,length)=0 : ProcedureReturn 1 : EndIf
+    If AnvilTrueTypeCoverageCountsToAlphaNeon(#N_B,length,length)=0 : ProcedureReturn 2 : EndIf
+    If (PeekA(#N_A-1)&$FF)<>$A5 Or (PeekA(#N_B-1)&$FF)<>$A5 : ProcedureReturn 3 : EndIf
+    If (PeekA(#N_A+length)&$FF)<>$5A Or (PeekA(#N_B+length)&$FF)<>$5A : ProcedureReturn 4 : EndIf
+    For n=0 To length-1
+      If (PeekA(#N_A+n)&$FF)<>(PeekA(#N_B+n)&$FF) : ProcedureReturn 5 : EndIf
+    Next
+  Next
+  For n=0 To 16
+    PokeA(#N_B+n,n)
+  Next
+  If AnvilTrueTypeCoverageCountsToAlphaNeon(#N_B,17,17)=0 : ProcedureReturn 6 : EndIf
+  For n=0 To 16
+    expected=(n*255+8)/16
+    If (PeekA(#N_B+n)&$FF)<>expected : ProcedureReturn 7 : EndIf
+  Next
+  PokeA(#N_B,$00) : PokeA(#N_B+1,$01) : PokeA(#N_B+2,$11) : PokeA(#N_B+3,$02) : PokeA(#N_B+4,$A5)
+  If AnvilTrueTypeCoverageCountsToAlphaNeon(#N_B,4,4)<>0 : ProcedureReturn 8 : EndIf
+  If (PeekA(#N_B)&$FF)<>0 Or (PeekA(#N_B+1)&$FF)<>1 Or (PeekA(#N_B+2)&$FF)<>17 Or (PeekA(#N_B+3)&$FF)<>2 Or (PeekA(#N_B+4)&$FF)<>$A5 : ProcedureReturn 9 : EndIf
+  PokeA(#N_B,$00) : PokeA(#N_B+1,$01) : PokeA(#N_B+2,$02) : PokeA(#N_B+3,$03) : PokeA(#N_B+4,$A5)
+  If AnvilTrueTypeCoverageCountsToAlphaNeon(#N_B,4,3)<>0 : ProcedureReturn 10 : EndIf
+  If (PeekA(#N_B)&$FF)<>0 Or (PeekA(#N_B+1)&$FF)<>1 Or (PeekA(#N_B+2)&$FF)<>2 Or (PeekA(#N_B+3)&$FF)<>3 Or (PeekA(#N_B+4)&$FF)<>$A5 : ProcedureReturn 11 : EndIf
+  PokeL(#N_REPORT,#N_REPORT_MAGIC)
+  PokeL(#N_REPORT+4,#N_A-1) : PokeL(#N_REPORT+8,#N_A+63)
+  PokeL(#N_REPORT+12,#N_B-1) : PokeL(#N_REPORT+16,#N_B+63)
+  PokeL(#N_REPORT+20,64) : PokeL(#N_REPORT+24,17) : PokeL(#N_REPORT+28,2)
+  ProcedureReturn 0
+EndProcedure

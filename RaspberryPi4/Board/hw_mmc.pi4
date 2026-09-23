@@ -1,0 +1,184 @@
+; ======================================================================
+;  hw_mmc.pi4 - the Pi 4 HwMmc* backend. THE ONE FILE THAT KNOWS THE
+;  BCM2711'S SD/eMMC CARD IS DRIVEN BY Lib/emmc.pi4; the core above it
+;  (Anvil/Core/mmc_cmd.pbi) knows only the HwMmc* seam and the portable
+;  #HW_MMC_* vocabulary.
+;
+;  This is the board side of the HwMmc* seam declared in Anvil/Hal/hal.pbi.
+;  The raw `mmc` command calls these names and never touches a register, a
+;  CMDn word, or SdReadBlock directly; this file is thin wrappers over
+;  RaspberryPi4/Lib/emmc.pi4, whose header carries all the register-level
+;  reasoning (the $FE340000 EMMC2 base, the 32-bit-only accesses, the
+;  broken-cd handling, and why the base clock has to be supplied).
+;
+;  DISTINCT FROM #CAP_STORAGE, ON PURPOSE. Anvil/Hal/hal.pbi says it in as
+;  many words: HwMmc* is "the raw `mmc` family, distinct from the
+;  mounted-filesystem path #CAP_STORAGE rides". `f`/`mount`/`load`/`save`
+;  go through RaspberryPi4/Board/storage.pi4, which puts a FAT layer over a
+;  block reader and tries USB first. `mmc` goes straight at the SD card as
+;  512-byte blocks, no filesystem, no USB - the debugger's view of the
+;  medium.
+;
+;  INCLUDE ORDER, and it is not arbitrary (board.pi4 lists all of these):
+;    * RaspberryPi4/Lib/emmc.pi4  BEFORE this file - it defines SdInit,
+;      SdReadBlock, SdWriteBlock, SdBlockCount, SdIsSdhc, SdErrorText and
+;      #SD_BLOCK_SIZE, which these wrappers ride. A library never includes
+;      a library (house rule), so board.pi4 lists both, emmc.pi4 first.
+;    * Anvil/Hal/hal.pbi          BEFORE this file - it defines the
+;      #HW_MMC_* vocabulary HwMmcType() returns.
+;    * RaspberryPi4/Board/storage.pi4  BEFORE this file - it defines the
+;      gSdUp bring-up record. THIS IS SHARED DELIBERATELY, see below.
+;
+;  WHY gSdUp IS SHARED RATHER THAN A SECOND FLAG. SdInit() resets the
+;  controller. storage.pi4 already brings the card up once and remembers it
+;  in gSdUp so it never pays that cost twice. If this file kept its OWN "is
+;  it up" flag, then `f` (mount, which sets gSdUp) followed by `mmc info`
+;  (which would see its own flag still 0) would call SdInit() a SECOND
+;  time, resetting the card out from under the FAT layer storage.pi4 just
+;  mounted on it. One record, one reset. HwMmcUp() reads and sets the same
+;  gSdUp storage.pi4 does, so the two paths cooperate instead of fighting.
+;
+;  THE BASE CLOCK IS 250000 kHz AND IT IS NOT A GUESS. emmc.pi4 refuses to
+;  run rather than assume a base clock (#SD_ERR_BASECLK); 250 MHz was
+;  measured off the VideoCore mailbox on THIS board and is the same number
+;  storage.pi4 supplies. If that ever changes, both call sites change - the
+;  value lives at both because emmc.pi4's rule is that the CALLER owns it.
+;
+;  #CAP_MMC IS 1 ON THIS BOARD, so this real backend is what runs. A board
+;  that declares #CAP_MMC = 0 provides no HwMmc backend and RequireCap in
+;  Anvil/Core/mmc_cmd.pbi refuses the command before any of these are
+;  reached - so these wrappers never have to defend against being called on
+;  a board with no card slot.
+;
+;  WRITE IS EXPOSED, AND HERE IS THE HONEST BOUNDARY.
+;  --------------------------------------------------
+;  Lib/emmc.pi4 HAS a write path: SdWriteBlock (CMD24), a full peer of
+;  SdReadBlock. So HwMmcCanWrite() returns 1 on this board and
+;  HwMmcWriteBlock rides SdWriteBlock. A board or driver with no write path
+;  would return 0 from HwMmcCanWrite() and the `mmc write` command refuses
+;  cleanly and loudly - it never silently no-ops. That is the whole reason
+;  HwMmcCanWrite() exists as a seam and is not just hard-coded in the core.
+;
+;  NOT HARDWARE-VERIFIED, IN EITHER DIRECTION. emmc.pi4's header is blunt:
+;  the code has executed on silicon but NO SD CARD HAS EVER ANSWERED IT -
+;  the bench boots from USB. So neither the read path NOR the write path
+;  here has ever moved a byte to or from a real card. Everything in this
+;  file is COMPILE-VERIFIED ONLY and a real transfer is owed a Pi 4 with a
+;  card in the slot. Reading is safe to attempt on a live card; writing is
+;  destructive by definition, which is why the core makes the operator ask
+;  for it by name and guards the RAM side hard.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HwMmcUp - bring the SD card up if it is not already, and report whether
+;  a card is ready. 1 ready, 0 not (the reason is in HwMmcErrorText()).
+;
+;  Idempotent through the SHARED gSdUp record - see the header. The first
+;  call pays the reset/identify cost; every call after it is a flag read.
+;  emmc.pi4 never prints, so this is silent: the core prints the context
+;  and, on failure, the sentence HwMmcErrorText() returns.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcUp()
+  If gSdUp <> 0
+    ProcedureReturn 1
+  EndIf
+  ; The base clock the controller cannot discover for itself. Measured,
+  ; not guessed - see the header.
+  SdSetBaseClockKhz(250000)
+  If SdInit() = 0
+    ProcedureReturn 0
+  EndIf
+  gSdUp = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcInfo - the seam's named entry point. Brings the card up (through
+;  HwMmcUp) and returns 1 if the card is ready to be queried and read,
+;  0 otherwise. The getters below are meaningful only after this returns 1.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcInfo()
+  ProcedureReturn HwMmcUp()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Geometry.
+;
+;  HwMmcBlockSize is the transfer unit, always 512 on this driver
+;  (Lib/emmc.pi4 #SD_BLOCK_SIZE - SDHC/SDXC are fixed at 512 and CMD16
+;  sets SDSC to match). HwMmcBlockCount is the capacity in those blocks, or
+;  0 when the CSD could not be decoded (which emmc.pi4 treats as "unknown",
+;  not an error) - the core renders 0 as "unknown" rather than "empty".
+; ----------------------------------------------------------------------
+Procedure.i HwMmcBlockSize()
+  ProcedureReturn #SD_BLOCK_SIZE
+EndProcedure
+
+Procedure.i HwMmcBlockCount()
+  ProcedureReturn SdBlockCount()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcType - the card class, normalised to the portable #HW_MMC_*
+;  vocabulary so the core never learns "CCS" or "SDHC".
+;
+;  SdIsSdhc() is 1 for a block-addressed card (SDHC or SDXC) and 0 for a
+;  byte-addressed one (SDSC). That is the distinction that actually matters
+;  to a reader of raw blocks, so it is the one the vocabulary carries.
+;  Before a successful HwMmcInfo() the answer is #HW_MMC_UNKNOWN.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcType()
+  If gSdUp = 0
+    ProcedureReturn #HW_MMC_UNKNOWN
+  EndIf
+  If SdIsSdhc() <> 0
+    ProcedureReturn #HW_MMC_SDHC
+  EndIf
+  ProcedureReturn #HW_MMC_SDSC
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcReadBlock - one 512-byte block from the card at lba into *buf.
+;  1 on success, 0 with the reason in HwMmcErrorText(). *buf must be
+;  4-byte aligned and non-null; emmc.pi4 refuses otherwise (#SD_ERR_ALIGN
+;  / #SD_ERR_NULL_BUF), and the core pre-checks alignment for a clearer
+;  message before it ever gets here.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcReadBlock(lba.i, *buf)
+  ProcedureReturn SdReadBlock(lba, *buf)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcCanWrite - 1 if this backend can write a block, 0 if it cannot.
+;
+;  THE GATE FOR THE ENTIRE `mmc write` PATH. On this board Lib/emmc.pi4
+;  supplies SdWriteBlock, so this is 1. A future board whose driver is
+;  read-only returns 0 here and the core refuses `mmc write` with an
+;  honest sentence rather than pretending. This is the seam that lets the
+;  same core command be correct on both kinds of board.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcCanWrite()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcWriteBlock - one 512-byte block from *buf to the card at lba.
+;  1 on success, 0 with the reason in HwMmcErrorText(). Same alignment
+;  rule as the read. Callers MUST have checked HwMmcCanWrite() first; on a
+;  backend that cannot write this would not exist, so there is no
+;  "unsupported" return here - the refusal happens one level up, at the
+;  gate, before a destructive command is attempted at all.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcWriteBlock(lba.i, *buf)
+  ProcedureReturn SdWriteBlock(lba, *buf)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMmcErrorText - the address of a NUL-terminated English sentence for
+;  the last emmc.pi4 failure. Rides SdErrorText() unchanged; it names the
+;  STAGE, and the core prints it with UartWriteStr (it is a POINTER - see
+;  the Print/formatter trap documented all over this tree).
+; ----------------------------------------------------------------------
+Procedure.i HwMmcErrorText()
+  ProcedureReturn SdErrorText()
+EndProcedure

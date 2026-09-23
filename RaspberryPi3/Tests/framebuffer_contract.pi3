@@ -1,0 +1,76 @@
+; Desk-only framebuffer contract fixture.  The host gate supplies a modeled
+; BCM2837 property mailbox and framebuffer; this file must never be booted.
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+
+; This isolated fixture deliberately does not include the production MMU table
+; builder.  Fail closed for cached mailbox ownership: the emitted gate runs the
+; property protocol through the supported cache-off context and separately
+; exercises the real MMU/NC contract in the board build.
+Procedure.i MmuIsNcRange(lo.i, hi.i)
+  If lo >= $03000000 And hi < $038CA000 : ProcedureReturn 1 : EndIf
+  If lo >= $10000000 And hi < $12000000 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "Anvil/Graphics/edid.pbi"
+XIncludeFile "RaspberryPi3/Lib/framebuffer.pbi"
+
+Global pi3_screen_head.i
+Global pi3_screen_tail.i
+Global pi3_screen_dropped.i
+Global Dim pi3_screen_ring.a[8192]
+
+; Kept byte-for-byte aligned with the producer procedure in pi3stubs.pi3;
+; the Python gate checks that the emitted queue case exercises this body.
+Procedure Pi3ScreenMirrorByte(c.i)
+  Protected nextHead.i
+  nextHead=(pi3_screen_head+1)&8191
+  If nextHead=pi3_screen_tail
+    pi3_screen_tail=(pi3_screen_tail+1)&8191
+    pi3_screen_dropped=pi3_screen_dropped+1
+  EndIf
+  pi3_screen_ring[pi3_screen_head]=c&$FF
+  pi3_screen_head=nextHead
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  ; Volatile-looking runtime selection keeps each callable under test in the
+  ; emitted image without ever making this a bootable hardware program.
+  Select PeekI($06000000)
+    Case 1 : ProcedureReturn Pi3FbInit(PeekI($06000008),PeekI($06000010),PeekI($06000018),PeekI($06000020))
+    Case 2 : ProcedureReturn Pi3FbPack(PeekI($06000018),PeekI($06000020),PeekI($06000028))
+    Case 3 : ProcedureReturn Pi3FbPixel(PeekI($06000030),PeekI($06000038),PeekI($06000040))
+    Case 4 : ProcedureReturn Pi3MailboxContext()
+    Case 5 : ProcedureReturn Pi3FbClear(PeekI($06000018))
+    Case 6 : ProcedureReturn Pi3FbReadEdid(PeekI($06000048))
+    Case 7 : ProcedureReturn Pi3FbEdidStatus()
+    Case 8 : ProcedureReturn AnvilEdidValid()
+    Case 9 : ProcedureReturn AnvilEdidBlockCount()
+    Case 10 : ProcedureReturn AnvilEdidPreferredWidth()
+    Case 11 : ProcedureReturn AnvilEdidPreferredHeight()
+    Case 12 : ProcedureReturn Pi3FbScrollUp(PeekI($06000008),PeekI($06000010))
+    Case 13 : ProcedureReturn Pi3FbFillRect(PeekI($06000018),PeekI($06000020),PeekI($06000028),PeekI($06000030),PeekI($06000038))
+    Case 14 : ProcedureReturn Pi3FbScrollRegionUp(PeekI($06000008),PeekI($06000010),PeekI($06000018),PeekI($06000020))
+    Case 15 : ProcedureReturn Pi3FbScrollRegionStart(PeekI($06000008),PeekI($06000010),PeekI($06000018),PeekI($06000020))
+    Case 16 : ProcedureReturn Pi3FbScrollPoll()
+    Case 17
+      For i=0 To 8192
+        Pi3ScreenMirrorByte(i)
+      Next
+      ProcedureReturn pi3_screen_dropped
+    Case 18 : ProcedureReturn Pi3FbPresentBegin()
+    Case 19 : ProcedureReturn Pi3FbPresentPoll()
+    Case 20 : ProcedureReturn Pi3FirmwareGpioGetStateStep(PeekI($06000008),$06000100)
+    Case 21 : ProcedureReturn Pi3ClockMaxRate(PeekI($06000008))
+    Case 22 : ProcedureReturn Pi3FbDeferredPrepare(PeekI($06000008),PeekI($06000010),PeekI($06000018),PeekI($06000020))
+    Case 23 : ProcedureReturn Pi3FbAttachStep()
+    Case 24 : ProcedureReturn Pi3FbDetachStep()
+    Case 25 : Pi3FbInitialPresence(PeekI($06000008)) : ProcedureReturn 1
+    Case 26 : ProcedureReturn Pi3FbPowerBegin(PeekI($06000008))
+    Case 27 : ProcedureReturn Pi3FbPowerPoll()
+  EndSelect
+  ProcedureReturn Pi3FbError()
+EndProcedure

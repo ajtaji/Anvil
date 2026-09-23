@@ -1,0 +1,184 @@
+
+; ======================================================================
+;  The VideoCore. i and c, and nothing else, need it.
+;
+;  BROUGHT UP LAZILY, ON FIRST USE. A monitor that ran MailboxInit() in
+;  its startup path would be a monitor that never reaches its prompt on
+;  a board whose firmware handoff is not what mailbox.pi4 expects - and
+;  the prompt is the thing you need most when something is wrong. The
+;  cost is one branch per i / c.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  PutMailboxWhy - turn a MailboxError() number into a sentence.
+;
+;  WHY THIS EXISTS. Three places used to print "MailboxError() = 7" and
+;  stop there, which asks the reader to go and find mailbox.pi4 line 818
+;  before he knows whether the board is broken or the firmware simply
+;  said no. Seven means the firmware answered and refused. That is a
+;  completely different afternoon from four, which means the VideoCore
+;  never took the request at all.
+;
+;  The number is STILL PRINTED, because it is what you would grep the
+;  library for, and because a code this procedure has not been taught
+;  yet must not come out as silence. Data and prose, both, every time.
+; ----------------------------------------------------------------------
+Procedure PutMailboxWhy(e.i)
+  Print("   the VideoCore mailbox reported error ")
+  PrintDec(e)
+  Print(", which means ")
+  If e = #MBX_ERR_NOINIT
+    PrintN("the mailbox")
+    PrintN("   was never brought up, or bringing it up failed earlier.")
+  ElseIf e = #MBX_ERR_ADDRESS
+    PrintN("the message buffer")
+    PrintN("   sits above 1 GiB, where the VideoCore cannot reach it at all.")
+  ElseIf e = #MBX_ERR_TOOBIG
+    PrintN("the answer the")
+    PrintN("   firmware wanted to give does not fit in the buffer it was given.")
+  ElseIf e = #MBX_ERR_TXTIMEOUT
+    PrintN("the VideoCore")
+    PrintN("   never took the request. Its side of the mailbox stayed full, so it")
+    PrintN("   is busy, wedged, or not running.")
+  ElseIf e = #MBX_ERR_RXTIMEOUT
+    PrintN("no reply ever")
+    PrintN("   came back. The request went out and nothing answered it.")
+  ElseIf e = #MBX_ERR_ECHO
+    PrintN("the reply that")
+    PrintN("   came back was an answer to somebody else's message, not to ours.")
+  ElseIf e = #MBX_ERR_STATUS
+    PrintN("the firmware")
+    PrintN("   answered and said no. The mailbox itself is working; the firmware")
+    PrintN("   simply refused this particular request.")
+  ElseIf e = #MBX_ERR_TAG
+    PrintN("the firmware")
+    PrintN("   returned the message without marking this question as answered,")
+    PrintN("   which is how it says it does not recognise the question.")
+  ElseIf e = #MBX_ERR_MODE
+    PrintN("two mailbox")
+    PrintN("   calls were mixed up in a way that would have sent a half-built")
+    PrintN("   message. That is a fault in this monitor, not in the board.")
+  ElseIf e = #MBX_ERR_EMPTY
+    PrintN("a message with")
+    PrintN("   no questions in it was about to be sent, so it was not sent.")
+  Else
+    PrintN("nothing this")
+    PrintN("   monitor has been taught to explain. Look the number up in the error")
+    PrintN("   code table in RaspberryPi4/Lib/mailbox.pi4.")
+  EndIf
+EndProcedure
+
+Procedure.i MbxUp()
+  If gMbx = 1
+    ProcedureReturn 1
+  EndIf
+  If gMbx = -1
+    ; ALREADY KNOWN TO BE DOWN, AND STILL SAY SO. Returning 0 in silence
+    ; here made the second and every later `info` print a board row with
+    ; no explanation on it, as though the question had simply not been
+    ; asked. It was asked; the mailbox is down.
+    PrintN("!! the VideoCore mailbox did not come up earlier in this session, and")
+    PrintN("   it is not tried again. Reset the board to try it once more.")
+    ProcedureReturn 0
+  EndIf
+  If MailboxInit() = 0
+    gMbx = -1
+    PrintN("!! the VideoCore mailbox did not come up, so nothing can be asked of")
+    PrintN("   the firmware - not the board revision, not the temperature, not any")
+    PrintN("   clock rate, and not the screen.")
+    PutMailboxWhy(MailboxError())
+    ProcedureReturn 0
+  EndIf
+  gMbx = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure PutRate(hz.i)
+  ; HERTZ, NOT CONVERTED. House rule 20 asks for US customary units in
+  ; anything a person reads, and states its own exception where the US
+  ; unit IS the SI one - volts, amps, watts, hertz, seconds, bytes. A
+  ; clock is 1500 MHz and there is no other thing to call it.
+  ;
+  ; The MHz gloss is here because 1500345728 is not a number anyone
+  ; reads at a glance, and the exact figure is here because the last
+  ; three digits are how you tell "measured" from "configured".
+  PrintDec(hz)
+  Print(" Hz (")
+  PrintDec(hz / 1000000)
+  Print(" MHz)")
+EndProcedure
+
+Procedure PutTempF(mC.i)
+  ; IN, thousandths of a degree Celsius - the mailbox's documented unit,
+  ; which mailbox.pi4 deliberately does not convert because converting
+  ; it there would make the library unreadable against the firmware
+  ; documentation. OUT, Fahrenheit, because that is what a person reads
+  ; here (house rule 20, and the 2026-09-07 ruling that made it explicit
+  ; for every temperature).
+  ;
+  ; THE ARITHMETIC IS NOT HERE ANY MORE. It used to be the expression
+  ; `(mC * 9) / 5 + 32000` written out in this procedure, and there were
+  ; other copies of the same expression elsewhere in the tree - which is
+  ; one chance per copy for two lines of one report to differ by a
+  ; degree. It is now Anvil/Hal/hal.pbi's HwTempMilliF(), once, for
+  ; everything: the same function the fan policy and the fan report go
+  ; through. That one also rounds to nearest and is correct below zero,
+  ; which the expression here was not.
+  ;
+  ; ONE DECIMAL PLACE, because the sensor is worth about that much and a
+  ; whole degree hides a thermal trend. The fan report rounds to a whole
+  ; degree and shows the raw millidegrees beside it instead; both are
+  ; the same milli-Fahrenheit number, formatted for what their line is
+  ; for.
+  ;
+  ; REQUIRES Anvil/Hal/hal.pbi included before this file, which
+  ; RaspberryPi4/Board/board.pi4 does - house rule 10 keeps the include
+  ; in the main file and not here.
+  Define mF.i
+  mF = HwTempMilliF(mC)
+  PrintDec(mF / 1000)
+  UartWrite(46)                ; '.'
+  PrintDec((mF % 1000) / 100)
+  Print(" F")
+EndProcedure
+
+Procedure PutTempReadF(mC.i)
+  ; THE READ LINE. Fahrenheit leads; the firmware's own answer follows
+  ; in brackets, in whole degrees celsius and in the raw millidegrees it
+  ; actually sent. Same shape as the `fan` command's temperature line
+  ; and for the same reason: this is the line somebody checks against a
+  ; datasheet or against another tool, so the evidence for the
+  ; Fahrenheit is printed next to it. A THRESHOLD - the throttle point -
+  ; has no sensor behind it and gets PutTempF() alone.
+  PutTempF(mC)
+  Print(" (")
+  PrintDec(HwTempWhole(mC))
+  Print(" C, ")
+  PrintDec(mC)
+  Print(" millidegrees from the firmware)")
+EndProcedure
+
+Procedure PutClockRow(id.i)
+  ; THE CLOCK'S NAME IS PRINTED BY THE CALLER, and that is not a style
+  ; choice. This took a "*name" parameter and did Print(*name) for
+  ; exactly one build, and the model printed
+  ;
+  ;     2139496  configured 600000000   measured 600169920
+  ;
+  ; - the ADDRESS of the string, in decimal. Print()'s router picks its
+  ; formatter from the argument's TYPE: a string LITERAL is recognised
+  ; and goes to str_print_at, and anything else goes to printdec. An
+  ; untyped pointer parameter is not a .s, so it took the number path
+  ; and printed a perfectly plausible-looking wrong answer with no
+  ; diagnostic. Print() a literal, or call UartWriteStr() with the
+  ; pointer; do not Print() a pointer parameter.
+  ; The two numbers keep their bare Hz because they are DATA in a column,
+  ; read against each other. The words that say which is which are here,
+  ; and the paragraph explaining what the pair means is printed once by
+  ; the caller rather than four times over.
+  Print("configured ")
+  PrintDec(ClockHz(id))
+  Print(" Hz, measured ")
+  PrintDec(ClockMeasuredHz(id))
+  PrintN(" Hz")
+EndProcedure

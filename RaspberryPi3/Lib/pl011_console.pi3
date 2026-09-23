@@ -1,0 +1,640 @@
+; ======================================================================
+;  pl011_console.pi3 - the CONSOLE NAME SET the shared Anvil core prints
+;                      and reads through, over the Pi 3's PL011.
+;
+;  Anvil/Core/*.pbi never names a chip. It calls UartWrite, UartWriteStr,
+;  UartDrain, UartRead, UartReadReady and the message brackets, and the
+;  compiler's own Print/PrintN keywords resolve BY NAME to three more.
+;  The Pi 4 supplies all of them from the bottom third of
+;  RaspberryPi4/Lib/uart.pi4; the Arduino UNO Q supplies them from
+;  ArduinoQ/Board/qcon_q.unoq over UEFI's text protocols. This file is the
+;  Pi 3's answer, and it is the file that makes `pmf>` possible here.
+;
+; ----------------------------------------------------------------------
+;  THE PRINT ROUTER, AND WHY THREE OF THESE NAMES LOOK ARBITRARY
+; ----------------------------------------------------------------------
+;  Print and PrintN are COMPILER KEYWORDS on this target. The router
+;  picks a formatter from the argument's TYPE and calls one of three
+;  procedures BY NAME, lowercased: str_print_at, printdec, printnl. It
+;  does NOT choose the transport - whichever file defines those three
+;  owns where every Print in the program goes.
+;
+;  Renaming one does not produce a link error. It produces a front-end
+;  message about a missing string-output file, which is a confusing thing
+;  to be told about a file you are looking at. Do not rename them, and do
+;  not add a second copy of them in another file while they are here: two
+;  definitions is the RIGHT error - a program has one Print destination -
+;  but it will point at the wrong file.
+;
+;  WHEN A SECOND DESTINATION APPEARS ON THIS BOARD (the HDMI console of
+;  milestone 3), the three names stay here and the MIRROR hangs off
+;  UartWrite, exactly as it does on the Pi 4. A console is a transport
+;  plus its taps, not two transports.
+;
+; ----------------------------------------------------------------------
+;  WHAT THIS FILE OWNS AND WHAT RaspberryPi3/Lib/uart.pbi OWNS
+; ----------------------------------------------------------------------
+;  THIS FILE IS NOT A DRIVER. It is the seam's names over one, and the
+;  driver is the boot lane's - the same file the immutable loader and the
+;  serial updater are built from, proven on silicon. Nothing in it is
+;  restated here.
+;
+;    uart.pbi DRIVES THE PART: the GPIO 14/15 ALT0 mux, the old-style
+;    GPPUD/GPPUDCLK pull sequence the BCM2837 uses and the BCM2711 does
+;    not, the baud divisor from a firmware-supplied clock, the line
+;    control and control registers, and the bounded per-byte transmit and
+;    receive. Pi3UartInit, Pi3UartWrite, Pi3UartRead and Pi3UartWaitClear
+;    are the whole of what this file calls.
+;
+;    THIS FILE OWNS THE SEAM: the message bracket, the drop counter, the
+;    three names the compiler's print router resolves, and the mapping
+;    from the driver's return values onto the contracts THE CONSOLE BYTES
+;    declares in Anvil/Hal/hal.pbi.
+;
+;  THIS FILE DOES NOT TOUCH REGISTERS. RaspberryPi3/Lib/uart.pbi exposes
+;  Pi3UartReadReady() beside the consuming Pi3UartRead(), so the seam can
+;  report readiness without duplicating the PL011 register knowledge.
+;
+;  WHAT THE SEAM REQUIRES AND THE DRIVER ALREADY HAS, checked rather than
+;  assumed: BOUNDED WRITES - Pi3UartWrite waits on the transmit-full flag
+;  through Pi3UartWaitClear, which is bounded by the system timer and by
+;  an iteration count - and DRAIN ON THE LAST STOP BIT rather than on an
+;  empty queue, which is exactly what Pi3UartWaitClear(8) waits for.
+;  Neither needed a change.
+;
+;  A CONSEQUENCE WORTH KNOWING: this file works only after Pi3UartInit()
+;  has run. Before that the port is not muxed, the divisor is not set,
+;  and a byte written here goes nowhere at all - silently, because there
+;  is no bit that says "this port was never configured". UartRunning()
+;  answers that by reading the driver's own ready flag rather than
+;  keeping a second one.
+;
+; ----------------------------------------------------------------------
+;  BOUNDED, NEVER WEDGED - except in the one place where blocking is the
+;  whole point
+; ----------------------------------------------------------------------
+;  UartWrite() gives up after #P3C_SPIN_MAX attempts and counts the
+;  character. A monitor that spins for ever on a FIFO that will never
+;  drain is a monitor that looks identical, from the other end of the
+;  cable, to a board that has crashed - and this board is on a shared
+;  bench behind a fifteen-second deadman that would then reset it with no
+;  explanation.
+;
+;  UartRead() blocks for ever ON PURPOSE. It is the line editor's read
+;  and waiting for a human is its entire job. Inside a transfer loop it
+;  is the wrong call and UartReadWait() is the right one, which is the
+;  same split RaspberryPi4/Lib/uart.pi4 makes for the same reason.
+;
+; ----------------------------------------------------------------------
+;  DEPENDENCIES: RaspberryPi3/Lib/uart.pbi must be included BEFORE this
+;  file (Pi3UartInit, Pi3UartWaitClear, pi3_uart_ready, #PI3_UART), and
+;  uart.pbi in turn needs RaspberryPi3/Lib/timer.pbi. House rule 10: this
+;  file includes nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UartReadReady() - check the software ring, then ask the driver.
+; ----------------------------------------------------------------------
+
+; The default iteration bound for UartReadWait(). A count and not a
+; duration on purpose: the contract is "one byte or -1", and a transfer
+; that dies halfway must leave a live prompt behind rather than a wedged
+; board on a shared bench.
+#P3C_SPIN_MAX = 2000000
+
+; The message ring. 8 KiB holds a long boot's worth of background
+; sentences between drains; the drain runs on every newline, so this is a
+; backstop for a drain that could not run, not an expected path.
+#P3C_MSG_BYTES = 8192
+; The network console is a second reader of accepted UART output. Keep its
+; tap bounded and independent from the display mirror, just as on Pi 4.
+; It is disabled until NetConsoleStart() explicitly enables it.
+#P3C_AUX_BYTES = 8192
+; Bytes accepted from PL011 while a synchronous Wi-Fi phase owns the
+; command thread are held here and consumed by the next ordinary ReadLine.
+; One slot stays empty to distinguish full from empty. A full ring stops
+; admission without consuming another byte from the hardware FIFO.
+#P3C_DEFERRED_RX_BYTES = 1024
+
+Global p3c_dropped.i           ; characters UartWrite gave up on
+Global Dim p3c_deferredRx.a[#P3C_DEFERRED_RX_BYTES]
+Global p3c_deferredRxHead.i
+Global p3c_deferredRxTail.i
+Global p3c_deferredRxLost.i
+
+; ======================================================================
+;  THE MESSAGE CONTEXT - output that is FOR the operator but is not the
+;  answer to the command they typed.
+; ======================================================================
+;  A background service - a lease renewing, a radio coming back, a link
+;  arming - must never print onto the command line. The command line
+;  carries the prompt, the typed input and the output of the command that
+;  was run, and nothing else.
+;
+;  THE DECISION IS MADE HERE, AT THE ONE BYTE EVERY CONSOLE SHARES, and
+;  not sentence by sentence in thirty callers. Code running on behalf of
+;  nobody at the keyboard brackets itself with UartMessageBegin and
+;  UartMessageEnd, and every byte written inside goes into the ring
+;  instead of to the wire. Anvil/Core/messages.pbi registers a drain and
+;  moves them out as lines. The bracket NESTS: a service that calls
+;  another service is one message context, not two.
+;
+;  NOBODY REGISTERED, NOTHING DIVERTED. A diagnostic that includes this
+;  file and has no message log must not have its output vanish into a
+;  ring nobody reads, so with no drain the bracket is counted and ignored
+;  and every byte goes where it always went.
+;
+;  A FATAL REPORT IS NOT A MESSAGE. The exception reporter calls
+;  UartMessageAbandon() first, so a fault taken inside a background
+;  service is still printed.
+; ======================================================================
+Global Dim p3c_msg.a[#P3C_MSG_BYTES]
+Global p3c_msgDepth.i
+Global p3c_msgHead.i
+Global p3c_msgTail.i
+Global p3c_msgLost.i
+Global p3c_msgBytes.i
+Global *p3c_msgDrain
+Global p3c_msgBusy.i
+
+; Independent auxiliary output tap consumed by common NetConsoleFlush.
+; The screen mirror and this ring have separate cursors, so neither steals
+; bytes from the other. Overflow drops newest and is counted.
+Global Dim uart_aux.a[#P3C_AUX_BYTES]
+Global uart_auxOn.i
+Global uart_auxHead.i
+Global uart_auxTail.i
+Global uart_auxLost.i
+Global *uart_auxFlush
+Global uart_auxBusy.i
+Global uart_auxBulk.i
+
+; Register the message log's drain, or 0 to stop diverting. The drain
+; MUST NOT print: it runs inside UartWrite. It is re-entry guarded
+; regardless, because "must not" is not a mechanism.
+Procedure UartMessageSetDrain(*fn)
+  *p3c_msgDrain = *fn
+EndProcedure
+
+Procedure UartMessageBegin()
+  p3c_msgDepth = p3c_msgDepth + 1
+EndProcedure
+
+; Closing the OUTERMOST bracket hands whatever the context wrote to the
+; drain, so a message that did not end in a newline is not left sitting
+; in the ring until the next one arrives and joins onto it.
+Procedure UartMessageEnd()
+  If p3c_msgDepth <= 0
+    p3c_msgDepth = 0
+    ProcedureReturn
+  EndIf
+  p3c_msgDepth = p3c_msgDepth - 1
+  If p3c_msgDepth = 0 And *p3c_msgDrain <> 0 And p3c_msgBusy = 0
+    p3c_msgBusy = 1
+    p3c_msgDrain()
+    p3c_msgBusy = 0
+  EndIf
+EndProcedure
+
+; Leave every bracket at once. The fatal-exception path only.
+Procedure UartMessageAbandon()
+  p3c_msgDepth = 0
+EndProcedure
+
+Procedure.i UartMessageDepth()
+  ProcedureReturn p3c_msgDepth
+EndProcedure
+
+; 1 while a byte written now would be diverted.
+Procedure.i UartMessageActive()
+  If p3c_msgDepth > 0 And *p3c_msgDrain <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartMessageGet()
+  Define c.i
+  If p3c_msgTail = p3c_msgHead
+    ProcedureReturn -1
+  EndIf
+  c = p3c_msg[p3c_msgTail] & $FF
+  p3c_msgTail = p3c_msgTail + 1
+  If p3c_msgTail >= #P3C_MSG_BYTES
+    p3c_msgTail = 0
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure.i UartMessageLost()
+  ProcedureReturn p3c_msgLost
+EndProcedure
+
+Procedure.i UartMessageBytes()
+  ProcedureReturn p3c_msgBytes
+EndProcedure
+
+; Overflow drops the NEWEST and counts it. Dropping the oldest would
+; silently rewrite history the operator has not read yet.
+Procedure p3c_MessagePut(c.i)
+  Define nxt.i
+  Define n.i
+  p3c_msgBytes = p3c_msgBytes + 1
+  nxt = p3c_msgHead + 1
+  If nxt >= #P3C_MSG_BYTES
+    nxt = 0
+  EndIf
+  If nxt = p3c_msgTail
+    p3c_msgLost = p3c_msgLost + 1
+    ProcedureReturn
+  EndIf
+  p3c_msg[p3c_msgHead] = c & $FF
+  p3c_msgHead = nxt
+  n = p3c_msgHead - p3c_msgTail
+  If n < 0
+    n = n + #P3C_MSG_BYTES
+  EndIf
+  If p3c_msgBusy = 0
+    If c = 10 Or n > (#P3C_MSG_BYTES - 2048)
+      p3c_msgBusy = 1
+      p3c_msgDrain()
+      p3c_msgBusy = 0
+    EndIf
+  EndIf
+EndProcedure
+
+; Enable or disable the common netconsole output tap.
+Procedure UartAuxMirror(on.i)
+  uart_auxOn = on
+  If on = 0
+    uart_auxHead = 0
+    uart_auxTail = 0
+  EndIf
+EndProcedure
+
+; The flush callback is called only from accepted-output handling. It must
+; not print; the busy guard also prevents accidental recursive flushing.
+Procedure UartAuxSetFlush(*fn)
+  *uart_auxFlush = *fn
+EndProcedure
+
+Procedure UartAuxBulk(on.i)
+  If on <> 0
+    uart_auxBulk = 1
+  Else
+    uart_auxBulk = 0
+  EndIf
+EndProcedure
+
+Procedure.i UartAuxFillHigh()
+  Define n.i
+  n = uart_auxHead - uart_auxTail
+  If n < 0 : n = n + #P3C_AUX_BYTES : EndIf
+  If n > (#P3C_AUX_BYTES - 2048) : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartAuxOn()
+  ProcedureReturn uart_auxOn
+EndProcedure
+
+Procedure.i UartAuxGet()
+  Define c.i
+  If uart_auxTail = uart_auxHead : ProcedureReturn -1 : EndIf
+  c = uart_aux[uart_auxTail] & $FF
+  uart_auxTail = uart_auxTail + 1
+  If uart_auxTail >= #P3C_AUX_BYTES : uart_auxTail = 0 : EndIf
+  ProcedureReturn c
+EndProcedure
+
+Procedure.i UartAuxLost()
+  ProcedureReturn uart_auxLost
+EndProcedure
+
+Procedure uart_AuxPut(c.i)
+  Define nxt.i
+  nxt = uart_auxHead + 1
+  If nxt >= #P3C_AUX_BYTES : nxt = 0 : EndIf
+  If nxt = uart_auxTail
+    uart_auxLost = uart_auxLost + 1
+    ProcedureReturn
+  EndIf
+  uart_aux[uart_auxHead] = c & $FF
+  uart_auxHead = nxt
+  If *uart_auxFlush <> 0 And uart_auxBusy = 0
+    If (uart_auxBulk = 0 And c = 10) Or UartAuxFillHigh() <> 0
+      uart_auxBusy = 1
+      uart_auxFlush()
+      uart_auxBusy = 0
+    EndIf
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  Transmit and receive.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UartWrite(c) - one byte.
+;
+;  THE DRIVER DOES THE WAITING AND THE BOUNDING. Pi3UartWrite() waits for
+;  the transmit FIFO to stop being full and gives up rather than spinning
+;  for ever, and answers 1 or 0. All this adds is the message bracket in
+;  front of it and the drop counter behind it, which are the seam's
+;  business and not the part's.
+;
+;  A MESSAGE NEVER TOUCHES THE WIRE. One compare when no bracket is open,
+;  which is every character the operator ever waits for.
+; ----------------------------------------------------------------------
+Procedure.i UartWrite(c.i)
+  If p3c_msgDepth > 0
+    If *p3c_msgDrain <> 0
+      p3c_MessagePut(c)
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  If Pi3UartWrite(c & $FF) <> 0
+    ; HDMI is a mirror of the accepted UART stream, never a second print
+    ; destination. The adapter makes no UART calls, so this cannot recurse.
+    Pi3ScreenMirrorByte(c & $FF)
+    If uart_auxOn <> 0
+      uart_AuxPut(c & $FF)
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ; The port was never brought up, or its FIFO never drained. Count it:
+  ; this is the number that separates "printed nothing" from "printed and
+  ; the port ate it".
+  p3c_dropped = p3c_dropped + 1
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartWriteStr(*s) - a NUL-terminated string.
+;
+;  NOTE ON THE STAR, and it is not a typo: in a procedure taking "*s" the
+;  bare name inside the body IS the address, and PeekB does the
+;  dereferencing. PeekB SIGN-EXTENDS, so a byte of 200 arrives as -56;
+;  the NUL test would still work but the character would be wrong, so it
+;  is masked.
+; ----------------------------------------------------------------------
+Procedure UartWriteStr(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekB(*s + i) & $FF
+    If c = 0
+      Break
+    EndIf
+    UartWrite(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+; CR and LF both, because the reader is a terminal.
+Procedure UartWriteNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; UartReadReady() - software-deferred data first, then hardware readiness.
+; ----------------------------------------------------------------------
+Procedure UartReadReady()
+  If p3c_deferredRxHead <> p3c_deferredRxTail
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn Pi3UartReadReady()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartRead() - one byte. BLOCKS FOR EVER, deliberately.
+;
+;  The line editor's read; waiting for a human is the whole job. Inside a
+;  transfer loop this is the wrong call - use UartReadWait(), which
+;  leaves a live prompt behind when the wire dies.
+;
+;  Pi3UartRead() answers -1 for "nothing there" and -2 for a receive
+;  error or a port that was never brought up. BOTH ARE SKIPPED HERE and
+;  the difference matters: a framing error is a byte this console has no
+;  honest value for, and handing the line editor a corrupted character
+;  would put it in the operator's command line. The driver has already
+;  cleared the error. A port that was never brought up loops here for
+;  ever, which is correct - there is nothing to read and nothing to say
+;  it on.
+; ----------------------------------------------------------------------
+Procedure.i UartRead()
+  Define c.i
+  Repeat
+    If p3c_deferredRxHead <> p3c_deferredRxTail
+      c = p3c_deferredRx[p3c_deferredRxHead]
+      p3c_deferredRxHead = (p3c_deferredRxHead + 1) % #P3C_DEFERRED_RX_BYTES
+    Else
+      c = Pi3UartRead()
+    EndIf
+  Until c >= 0
+  ProcedureReturn c
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartReadWait(spins) - one byte, or -1 if none arrived.
+;
+;  spins is an iteration count; pass 0 for the default.
+; ----------------------------------------------------------------------
+Procedure.i UartReadWait(spins.i)
+  Define n.i
+  Define c.i
+  If spins <= 0
+    spins = #P3C_SPIN_MAX
+  EndIf
+  n = 0
+  Repeat
+    If p3c_deferredRxHead <> p3c_deferredRxTail
+      c = p3c_deferredRx[p3c_deferredRxHead]
+      p3c_deferredRxHead = (p3c_deferredRxHead + 1) % #P3C_DEFERRED_RX_BYTES
+    Else
+      c = Pi3UartRead()
+    EndIf
+    If c >= 0
+      ProcedureReturn c
+    EndIf
+    n = n + 1
+  Until n >= spins
+  ProcedureReturn -1
+EndProcedure
+
+; Admit a small batch of physical input without invoking the line editor or
+; command dispatcher. The currently running command is still on the stack;
+; bytes remain ordered in this ring and are returned by UartRead after it
+; completes. When full, leave additional bytes in PL011's hardware FIFO.
+Procedure.i UartAdmitPending(maxBytes.i)
+  Protected n.i, c.i, tailNext.i, attempts.i
+  If maxBytes < 1 : ProcedureReturn 0 : EndIf
+  If maxBytes > 32 : maxBytes = 32 : EndIf
+  n = 0 : attempts = 0
+  While attempts < maxBytes
+    If Pi3UartReadReady() = 0
+      Break
+    EndIf
+    tailNext = (p3c_deferredRxTail + 1) % #P3C_DEFERRED_RX_BYTES
+    If tailNext = p3c_deferredRxHead
+      Break
+    EndIf
+    c = Pi3UartRead()
+    attempts = attempts + 1
+    If c = -1 : Break : EndIf
+    If c = -2
+      p3c_deferredRxLost = p3c_deferredRxLost + 1
+      Continue
+    EndIf
+    p3c_deferredRx[p3c_deferredRxTail] = c & $FF
+    p3c_deferredRxTail = tailNext
+    n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i UartDeferredRxLost()
+  ProcedureReturn p3c_deferredRxLost
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartDrain() - block, bounded, until everything has left the wire.
+;
+;  BUSY, NOT "FIFO EMPTY", and the driver already has exactly that wait:
+;  Pi3UartWaitClear(8) waits for the transmitter-busy flag, bounded by
+;  the system timer and by an iteration count. An empty FIFO only means
+;  the last byte reached the shift register; BUSY stays set until that
+;  byte and all of its stop bits have actually been sent. The difference
+;  is one character time, and it is the difference between a clean last
+;  line and a truncated one when the next thing the monitor does is reset
+;  the board - which here is what happens after `reboot` and after a
+;  failed A/B confirm.
+; ----------------------------------------------------------------------
+Procedure.i UartDrain()
+  ProcedureReturn Pi3UartWaitClear(8)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartDropped() - how many characters UartWrite() has given up on.
+;
+;  Zero with no output means the port was never brought up or is not
+;  routed; non-zero means it is there and not draining.
+; ----------------------------------------------------------------------
+Procedure.i UartDropped()
+  ProcedureReturn p3c_dropped
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartRunning() - has the port been brought up.
+;
+;  READ FROM uart.pbi's OWN FLAG rather than kept a second time here.
+;  Two files each remembering whether the port is up is two answers that
+;  can disagree, and the one that would be wrong is this one - uart.pbi
+;  is what sets it, and uart.pbi is what would clear it.
+; ----------------------------------------------------------------------
+Procedure.i UartRunning()
+  ProcedureReturn pi3_uart_ready
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  UartInit(baud) - the core's name for bringing the port up.
+;
+;  THE CLOCK COMES FROM THE FIRMWARE AND CANNOT BE BAKED. The PL011's
+;  input clock on this part is whatever the firmware set, read through
+;  the property mailbox as clock id 2; it is 48 MHz on a stock Pi 3 and
+;  it is not a constant this file may assume. So this entry point is a
+;  convenience for a caller that already has the number, and the monitor
+;  itself calls Pi3ClockRate(2) and Pi3UartInit() directly during the
+;  pre-MMU phase - see the ORDER section of RaspberryPi3/Lib/mmu.pi3 for
+;  why every mailbox transaction has to happen there.
+;
+;  It answers 0 rather than guessing a clock. A console brought up at the
+;  wrong divisor prints plausible-looking rubbish, which is worse than
+;  printing nothing: the operator debugs their terminal.
+; ----------------------------------------------------------------------
+Procedure.i UartInit(baud.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i UartInitClk(baud.i, clkhz.i)
+  ProcedureReturn Pi3UartInit(clkhz, baud)
+EndProcedure
+
+; ======================================================================
+; ======================================================================
+;  THE PRINT ROUTER'S THREE PROCEDURES.
+;
+;  The compiler resolves these BY NAME, lowercased: str_print_at,
+;  printdec, printnl. See the header before touching any of them.
+; ======================================================================
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  str_print_at(p) - the raw-address string walk.
+;
+;  It takes a plain .i and not a "*s" for the reason the note in
+;  UartWriteStr() gives: in a procedure taking "*s" the bare name IS the
+;  address and "*s" dereferences it, so a plain .i is the clearer of the
+;  two spellings here. The same choice, for the same reason, as the Pi 4
+;  and RP2350 twins.
+; ----------------------------------------------------------------------
+Procedure str_print_at(p.i)
+  Define c.i
+  c = PeekB(p) & $FF
+  While c <> 0
+    UartWrite(c)
+    p = p + 1
+    c = PeekB(p) & $FF
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PrintDec(v) - a signed 64-bit integer in decimal.
+;
+;  THE MOST NEGATIVE VALUE IS THE TRAP AND IT IS HANDLED BY NOT NEGATING
+;  IT. -9223372036854775808 has no positive counterpart in a signed
+;  64-bit value, so `v = -v` on it returns the same number and a naive
+;  loop prints nothing or spins. The digits are taken from the negative
+;  side throughout and the sign is printed first, which needs no special
+;  case at all.
+;
+;  A remainder taken from a negative dividend is negative here, so the
+;  digit is 48 - r rather than 48 + r.
+; ----------------------------------------------------------------------
+Procedure PrintDec(v.i)
+  Define Dim d.a[24]
+  Define n.i
+  Define q.i
+  Define r.i
+  If v = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  If v > 0
+    v = -v
+  Else
+    UartWrite(45)
+  EndIf
+  n = 0
+  While v <> 0
+    q = v / 10
+    r = v - q * 10
+    d[n] = 48 - r
+    n = n + 1
+    v = q
+  Wend
+  While n > 0
+    n = n - 1
+    UartWrite(d[n])
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PrintNl() - end the line. CR and LF, because the reader is a terminal.
+; ----------------------------------------------------------------------
+Procedure PrintNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure

@@ -1,0 +1,125 @@
+; BCM2837 native RNG adapter for Wi-Fi WPA2 nonces.
+; Register map and first-enable sequence match Raspberry Pi Linux's
+; bcm2835-rng driver and bcm2835-common.dtsi. No timer-derived fallback.
+
+#PI3_WIFI_RNG_BASE = $3F104000
+#PI3_WIFI_RNG_CTRL = $00
+#PI3_WIFI_RNG_STATUS = $04
+#PI3_WIFI_RNG_DATA = $08
+#PI3_WIFI_RNG_RBGEN = $00000001
+#PI3_WIFI_RNG_WARMUP = $00040000
+#PI3_WIFI_RNG_MAX_WAIT_US = 1000000
+
+#PI3_WIFI_RNG_OFF = 0
+#PI3_WIFI_RNG_READY = 1
+#PI3_WIFI_RNG_ERROR = -1
+
+Global pi3_wifi_rng_state.i = #PI3_WIFI_RNG_OFF
+Global pi3_wifi_rng_error.i
+Global pi3_wifi_rng_words.i
+
+; Kept as tiny procedures so the emitted fixture can substitute a register
+; model while compiling the exact start/read algorithms below.
+Procedure.i Pi3WifiRngReadReg(offset.i)
+  If offset <> #PI3_WIFI_RNG_CTRL And offset <> #PI3_WIFI_RNG_STATUS And offset <> #PI3_WIFI_RNG_DATA
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn PeekL(#PI3_WIFI_RNG_BASE + offset) & $FFFFFFFF
+EndProcedure
+
+Procedure Pi3WifiRngWriteReg(offset.i, value.i)
+  If offset = #PI3_WIFI_RNG_STATUS Or offset = #PI3_WIFI_RNG_CTRL
+    PokeL(#PI3_WIFI_RNG_BASE + offset, value)
+  EndIf
+EndProcedure
+
+; Linux init semantics: only issue the warm-up write when the generator is
+; disabled, then enable RBGEN. A pre-running firmware RNG is left untouched.
+Procedure.i Pi3WifiRngStart()
+  Protected ctrl.i
+  pi3_wifi_rng_error = 0
+  ctrl = Pi3WifiRngReadReg(#PI3_WIFI_RNG_CTRL)
+  If ctrl < 0
+    pi3_wifi_rng_error = 1
+    pi3_wifi_rng_state = #PI3_WIFI_RNG_ERROR
+    ProcedureReturn #PI3_WIFI_RNG_ERROR
+  EndIf
+  If (ctrl & #PI3_WIFI_RNG_RBGEN) = 0
+    Pi3WifiRngWriteReg(#PI3_WIFI_RNG_STATUS, #PI3_WIFI_RNG_WARMUP)
+    Pi3WifiRngWriteReg(#PI3_WIFI_RNG_CTRL, #PI3_WIFI_RNG_RBGEN)
+    ctrl = Pi3WifiRngReadReg(#PI3_WIFI_RNG_CTRL)
+    If ctrl < 0 Or (ctrl & #PI3_WIFI_RNG_RBGEN) = 0
+      pi3_wifi_rng_error = 2
+      pi3_wifi_rng_state = #PI3_WIFI_RNG_ERROR
+      ProcedureReturn #PI3_WIFI_RNG_ERROR
+    EndIf
+  EndIf
+  pi3_wifi_rng_state = #PI3_WIFI_RNG_READY
+  ProcedureReturn #PI3_WIFI_RNG_READY
+EndProcedure
+
+; Read whole FIFO words until exactly `bytes` are produced. `timeoutUs` is
+; one aggregate monotonic deadline, matching the Linux driver's bounded
+; wait rather than permitting a wedged peripheral to hang association.
+Procedure.i Pi3WifiRngBytes(*dst, bytes.i, timeoutUs.i)
+  Protected start.i
+  Protected now.i
+  Protected status.i
+  Protected words.i
+  Protected word.i
+  Protected take.i
+  Protected i.i
+  Protected out.i
+  If *dst = 0 Or bytes < 4 Or bytes > 256 Or (bytes & 3) <> 0 Or timeoutUs < 1 Or timeoutUs > #PI3_WIFI_RNG_MAX_WAIT_US
+    pi3_wifi_rng_error = 3
+    ProcedureReturn 0
+  EndIf
+  If pi3_wifi_rng_state <> #PI3_WIFI_RNG_READY
+    If Pi3WifiRngStart() <> #PI3_WIFI_RNG_READY : ProcedureReturn 0 : EndIf
+  EndIf
+  start = Pi3Micros()
+  If start < 0 : pi3_wifi_rng_error = 4 : ProcedureReturn 0 : EndIf
+  out = 0
+  While out < bytes
+    status = Pi3WifiRngReadReg(#PI3_WIFI_RNG_STATUS)
+    If status < 0 : pi3_wifi_rng_error = 5 : Break : EndIf
+    words = (status >> 24) & $FF
+    If words > 0
+      word = Pi3WifiRngReadReg(#PI3_WIFI_RNG_DATA)
+      If word < 0 : pi3_wifi_rng_error = 6 : Break : EndIf
+      take = bytes - out
+      If take > 4 : take = 4 : EndIf
+      For i = 0 To take - 1
+        PokeA(*dst + out + i, (word >> (i * 8)) & $FF)
+      Next
+      out = out + take
+      pi3_wifi_rng_words = pi3_wifi_rng_words + 1
+    Else
+      now = Pi3Micros()
+      If now < start Or now - start >= timeoutUs
+        pi3_wifi_rng_error = 7
+        Break
+      EndIf
+      Pi3DelayUs(34)
+    EndIf
+  Wend
+  If out = bytes
+    pi3_wifi_rng_error = 0
+    ProcedureReturn bytes
+  EndIf
+  ; Do not return partial nonce material as if it were a usable SNonce.
+  For i = 0 To bytes - 1 : PokeA(*dst + i, 0) : Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3WifiRngState()
+  ProcedureReturn pi3_wifi_rng_state
+EndProcedure
+
+Procedure.i Pi3WifiRngError()
+  ProcedureReturn pi3_wifi_rng_error
+EndProcedure
+
+Procedure.i Pi3WifiRngWords()
+  ProcedureReturn pi3_wifi_rng_words
+EndProcedure

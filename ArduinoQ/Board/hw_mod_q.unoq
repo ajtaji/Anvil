@@ -1,0 +1,137 @@
+; ======================================================================
+;  hw_mod_q.unoq - THE UNO Q's HALF OF THE DRIVER-MODULE CONTRACT
+; ----------------------------------------------------------------------
+;  REQUIRES, in this order, in the main file:
+;      Anvil/Hal/seams.pbi              the #SVCCAP_* vocabulary
+;      ArduinoQ/Board/qstubs_q.unoq     HwMonRegion* / HwPay*
+;
+;  THIS BOARD DECLARES NO MODULE ARENA YET, AND SAYS SO RATHER THAN
+;  INVENTING ONE. That is the whole content of this file and it is a
+;  deliberate answer, not a stub left behind.
+;
+;  WHY IT CANNOT BE A CONSTANT HERE THE WAY IT IS ON THE Pi 4. This
+;  monitor is a UEFI application: the firmware chooses where the image
+;  lands, owns every byte of DRAM it has not handed out, and publishes a
+;  memory map that is not the same twice. There is no round megabyte in
+;  this part's map that belongs to Anvil by construction - which is
+;  exactly why HwMonLo() and HwMonHi() are procedures on this board and
+;  constants on the other one.
+;
+;  WHAT THE REAL ANSWER IS, WRITTEN DOWN SO THE NEXT LANE DOES NOT HAVE
+;  TO DERIVE IT:
+;
+;    AllocatePages(AllocateAnyPages, EfiLoaderData, n) through
+;    ArduinoQ/Board/qefi_q.unoq's boot-services table. UEFI pages are
+;    4 KiB, which is exactly the alignment the loader requires, and the
+;    firmware's allocator is the one authority on this board about what
+;    is free - so asking it is strictly better than any window a person
+;    could choose.
+;
+;    ONE Q-ONLY RULE COMES WITH IT: pages taken from boot services must
+;    be FREED when a module fails to activate, or Anvil leaks them across
+;    a reset. The loader already unwinds a failed activation's services;
+;    the pages are the board's to give back, so the free belongs in this
+;    file beside the allocate, not in the core.
+;
+;    It is not written today because it cannot be tested today: there is
+;    no UNO Q on this bench, and a firmware allocation that has never run
+;    is not something to ship as though it had. Compilation is not
+;    acceptance, and this file refusing honestly is a better state than
+;    an untested allocator that reports success.
+;
+;  UNTIL THEN: HwModArenaBase() answers 0, ModArenaInit() refuses with
+;  #MOD_ERR_NOARENA, the boot walk stays silent about it, and `mod` says
+;  in one sentence that this board declares no arena. Everything else in
+;  the loader - the container reader, the validator, the relocator, the
+;  registry, the lifecycle and the console - compiles and links here
+;  identically to the Pi 4, which is the build-closure claim this file
+;  exists to keep true.
+; ======================================================================
+
+Procedure.i HwModArenaBase()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwModArenaBytes()
+  ProcedureReturn 0
+EndProcedure
+
+; No region of this board's map is the arena, so there is no index for
+; ModArenaInit() to skip. -1 matches no region.
+Procedure.i HwModArenaRegion()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwModStageAddr()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwModStageBytes()
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwModCodeSync(base, bytes) - REFUSES, and refusing is the correct
+;  answer rather than a placeholder.
+;
+;  The loader calls this after it has written a module's bytes and before
+;  anything branches into them, and it treats a non-1 answer as
+;  #MOD_ERR_SYNC: the module is NOT initialised and the arena bytes are
+;  cleared again. Answering 1 without performing the maintenance would
+;  make the loader believe a cache state nobody established, which is the
+;  one failure in this whole path that produces no message at all - a
+;  branch into stale instruction lines.
+;
+;  Anvil runs at EL1 under UEFI here with the firmware's caches and MMU
+;  configuration, and this project has not established what maintenance
+;  is permitted from that state on this part. Until it has, this returns
+;  0 and nothing is ever executed from the arena - which is consistent
+;  with there being no arena.
+; ----------------------------------------------------------------------
+Procedure.i HwModCodeSync(base.i, bytes.i)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DEVICES. None are declared, and that is the truth rather than an
+;  omission: nothing on this part has been enumerated to the point where
+;  a driver could be handed a block and told it is safe to read. The
+;  QCM2290 is the part where a speculative read of an unclocked block
+;  cost a power cycle (RaspberryPi4/Board/hw_addr.pi4 records the
+;  contrast), so a device list here is a list of things a probe is
+;  allowed to touch, and it may not be guessed.
+; ----------------------------------------------------------------------
+Procedure.i HwDevCount()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevIdAddr(i.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevSeam(i.i)
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwDevToken(i.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwDevSay(i.i)
+  Print("a device this board does not declare")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CAPABILITY QUESTIONS. Both answer 0 for both new ids: this board
+;  reaches neither seam from the core, and neither piece of hardware has
+;  been established as present in a form a driver could use. A board that
+;  claimed otherwise would send an operator looking for a module to load
+;  that could never bind to anything.
+; ----------------------------------------------------------------------
+Procedure.i HwSeamCore(id.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwSeamPossible(id.i)
+  ProcedureReturn 0
+EndProcedure

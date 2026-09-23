@@ -1,0 +1,410 @@
+; ======================================================================
+; pi4ParallelPayloadProof.pi4 - MANY FOUR-CORE PAYLOADS PER BOOT.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; It is a returning payload that runs one job on all four cores, checks
+; the answer against its own serial reference, and comes back. That is
+; all it does, and the smallness is the point: THE THING UNDER TEST IS
+; NOT THIS PROGRAM. It is what happens when the SAME image is entered a
+; SECOND TIME with no reset in between - which used to be refused, one
+; four-core payload per boot, because the resident secondary cores owned
+; the monitor until restart.
+;
+;   PureMetalForge.exe --compile
+;        RaspberryPi4/Examples/Diagnostics/pi4ParallelPayloadProof.pi4
+;        -t pi4 --load-addr 0x700000 --stack-addr 0x3000000
+;        --entry-returns --wants-services -o _work/parproof.img
+;
+; THE LOAD ADDRESS IS NOT 0x400000, AND THE REASON IS WORTH THE LINE.
+; Every older payload in this folder says 0x400000, and on a board
+; running a monitor of this size that address is INSIDE THE MONITOR:
+; the monitor's extent is the size of its own image rounded up to the
+; megabyte, so it grows as the monitor does, and it had reached
+; 00200000..004FFFFF by build 145. `boot mem` refuses that correctly and
+; loudly - "runs over the monitor itself... nothing was entered" - but
+; the refusal is a board telling you a constant went stale. ASK THE
+; BOARD: `map` prints the low window's real bottom edge, and it is the
+; only answer that is right for the monitor actually running.
+;
+; THE BENCH PROCEDURE, and step 3 is the whole of it:
+;
+;   1. `version` says the build carrying the payload-boundary reclaim.
+;   2. Run this payload. It must return x0 = 0.
+;   3. RUN IT AGAIN, WITH NO RESET, NO RELOAD AND NO POWER CYCLE. It must
+;      be entered - not refused - and must return x0 = 0 again.
+;   4. `md 1400000` after each run for the result block below.
+;   5. `coretest status`: nothing resident, no fault, after both.
+;
+; ----------------------------------------------------------------------
+; WHY THIS PAYLOAD BRINGS UP ITS OWN TRANSLATION REGIME
+; ----------------------------------------------------------------------
+; Anvil hands a payload the machine with the caches OFF, and the parallel
+; service will not start a core unless the primary has M, C and I set -
+; because every core must join the SAME regime, and a regime that is not
+; on cannot be joined. So a payload that wants four cores has to enable
+; its own, and the number of partitions on offer is therefore NOT a
+; constant for a payload's life: asked before the enable it is 1, and
+; asked afterwards it is 4. This program asks BOTH TIMES and records
+; both, because that ordering is the single easiest thing for a payload
+; author to get wrong and it fails silently - as one core, with correct
+; output, four times slower.
+;
+; AND IT IS ALSO WHY THE WORKERS CANNOT OUTLIVE A PAYLOAD. The tables the
+; secondaries are given are the ones live here, at #PPP_TABLES, in THIS
+; image's memory. A second payload loaded over this window would pull
+; them out from under three cores still walking them. That is the defect
+; the monitor's payload boundary now closes, and running this image twice
+; is what exercises it.
+; ======================================================================
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+; The identity map this payload builds for itself, inside the low payload
+; window and clear of this image (a few tens of kilobytes at $00400000)
+; and of the result block below.
+#PPP_TABLES = $00600000
+
+; The result block, at a stated address rather than a Global, so the
+; bench operator and a host tool read the same words from the same place
+; without looking anything up in a symbol map. The reference payload
+; makes the same choice for the same reason.
+#PPP_RESULT = $01400000
+#PPP_MAGIC  = $34505050        ; 'PPP4' - a dump of the wrong address is
+                               ; then obvious instead of reading as zeroes
+#PPP_DONE   = $454E4F44        ; 'DONE', written last, so a half-written
+                               ; block cannot be read as a complete pass
+#PPP_UNSET  = $554E534554      ; 'UNSET' - a word this run never reached.
+                               ; DRAM nothing clears reads back rubbish on
+                               ; the part and zero under an interpreter,
+                               ; and both of those read as ANSWERS.
+
+#R_MAGIC     = 0
+#R_TABLE     = 1
+#R_HDRMAGIC  = 2
+#R_HDRMAJOR  = 3
+#R_HDRMINOR  = 4
+#R_HDRCOUNT  = 5
+#R_CORESCOLD = 6               ; partitions offered BEFORE this payload's
+                               ; own caches are on - the honest 1
+#R_CORESWARM = 7               ; and after, which is what it splits by
+#R_RC1       = 8
+#R_VERIFY1   = 9
+#R_RC2       = 10
+#R_VERIFY2   = 11
+#R_ST0       = 12
+#R_ST1       = 13
+#R_ST2       = 14
+#R_ST3       = 15
+#R_FAILS     = 16
+#R_DONE      = 17
+#R_WORDS     = 18
+
+#SVC_MAGIC      = $53564E41    ; 'ANVS'
+#SVC_HDR_BYTES  = 16
+#SVC_OK         = 0
+#PPP_NEED_MAJOR = 1
+#PPP_NEED_COUNT = 192          ; the parallel group opens at 184 and
+                               ; reserves eight, so a table shorter than
+                               ; this does not carry it at all
+
+#SLOT_PARCORES  = 184
+#SLOT_PARRUN    = 185
+#SLOT_PARSTATUS = 186
+
+#PPP_PARTS  = 4
+#PPP_SLOTS  = 256
+#PPP_STRIDE = 32               ; four words per partition block
+
+; THE '*' IN THESE DECLARATIONS IS LOAD-BEARING, AND SO IS ITS ABSENCE
+; AT THE CALL. A name declared with '*' already holds an address, which
+; is what lets the compiler accept a call through it at all. But the call
+; itself is written svc_parcores() with NO star: *svc_parcores() compiles
+; perfectly well and DEREFERENCES THE RETURN VALUE.
+;
+; That is not hypothetical. The first version of this file called all
+; three slots with the star. It ran on build 145, wrote six result words,
+; and then read address 4 - the partition count, dereferenced - and
+; wedged. The deadman reset the board, which is exactly what it is for,
+; and the result block's UNSET words said precisely where it stopped.
+Global gSvcTable.i
+Global gFails.i
+Global *svc_parcores
+Global *svc_parrun
+Global *svc_parstatus
+Global Dim ppp_args.i[#PPP_PARTS * 4]
+Global Dim ppp_out.i[#PPP_SLOTS]
+
+; The handover, as Main's first statement. x0 still holds the table
+; there: nothing between the entry and this call touches it but the
+; preamble and a prologue, neither of which uses x0.
+Procedure CaptureX0()
+  ASM
+    adrp x1, global_gsvctable
+    add  x1, x1, #:lo12:global_gsvctable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+; PeekI and not a 32-bit read: a narrow read takes the low half of a
+; procedure address and an indirect call through it branches into
+; plausible-looking low memory instead of faulting.
+Procedure.i Slot(i.i)
+  ProcedureReturn PeekI(gSvcTable + #SVC_HDR_BYTES + i * 8)
+EndProcedure
+
+; The four header fields are at +0, +4, +8 and +12, so two of them are
+; not eight-byte aligned and a wide read is an alignment abort with no
+; message at all. PeekA and not PeekB, because PeekB sign-extends here.
+Procedure.i Hdr32(off.i)
+  ProcedureReturn PeekA(gSvcTable + off) | (PeekA(gSvcTable + off + 1) << 8) | (PeekA(gSvcTable + off + 2) << 16) | (PeekA(gSvcTable + off + 3) << 24)
+EndProcedure
+
+Procedure Put(i.i, v.i)
+  PokeI(#PPP_RESULT + i * 8, v)
+EndProcedure
+
+; The two output helpers this file uses, over the one library it
+; includes. Spelled here rather than assumed, because a payload has no
+; console of its own and the shape is the one every diagnostic beside
+; this file already uses.
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+EndProcedure
+
+; A POINTER AND NOT A STRING PARAMETER. A declared .s parameter pulls in
+; the host runtime's string copy, which a bare-metal image has no
+; business linking and which the assembler refuses by name. Every
+; sentence here is a literal, and a literal is already an address.
+Procedure Fail(*text)
+  gFails = gFails + 1
+  PutS("FAIL: ")
+  PutS(*text)
+  PutNl()
+EndProcedure
+
+; The value at an output index does NOT depend on which partition wrote
+; it - the same property an output-channel split of a convolution has, so
+; the split is checkable against one serial reference rather than against
+; a per-partition expectation.
+Procedure.i PppValue(index.i)
+  ProcedureReturn index * 7 + 3
+EndProcedure
+
+; ONE PARTITION, ONE CONTIGUOUS OUTPUT RANGE, AND NOTHING ELSE TOUCHED.
+; Ordinary generated code with a real frame, real parameters and real
+; locals, which is the thing the four-core service newly allows on a
+; secondary and therefore the thing worth running there. It calls no
+; service slot, prints nothing, touches no device and returns.
+Procedure.i PppWorker(*p.i)
+  Protected outBase.i
+  Protected first.i
+  Protected last.i
+  Protected i.i
+  If *p = 0
+    ProcedureReturn 1
+  EndIf
+  outBase = PeekI(*p)
+  first = PeekI(*p + 8)
+  last = PeekI(*p + 16)
+  If outBase = 0 Or first < 0 Or last > #PPP_SLOTS Or first > last
+    ProcedureReturn 2
+  EndIf
+  i = first
+  While i < last
+    PokeI(outBase + i * 8, PppValue(i))
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure PppSplit(count.i)
+  Define i.i
+  For i = 0 To #PPP_PARTS - 1
+    ppp_args[i * 4 + 0] = 0
+    ppp_args[i * 4 + 1] = 0
+    ppp_args[i * 4 + 2] = 0
+    ppp_args[i * 4 + 3] = 0
+  Next
+  For i = 0 To count - 1
+    ppp_args[i * 4 + 0] = @ppp_out[0]
+    ppp_args[i * 4 + 1] = #PPP_SLOTS * i / count
+    ppp_args[i * 4 + 2] = #PPP_SLOTS * (i + 1) / count
+    ppp_args[i * 4 + 3] = i
+  Next
+EndProcedure
+
+; Every slot, against the serial reference. A partition skipped, run
+; twice with another partition's block, or run over somebody else's range
+; fails here rather than being averaged away.
+Procedure.i PppVerify()
+  Define i.i
+  For i = 0 To #PPP_SLOTS - 1
+    If ppp_out[i] <> PppValue(i)
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure PppClear()
+  Define i.i
+  For i = 0 To #PPP_SLOTS - 1
+    ppp_out[i] = 0
+  Next
+EndProcedure
+
+Procedure.i PppJob(count.i)
+  PppClear()
+  PppSplit(count)
+  ProcedureReturn svc_parrun(@PppWorker, @ppp_args[0], #PPP_STRIDE, count)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define cores.i
+  Define rc.i
+
+  ; 1. THE HANDOVER, FIRST, BEFORE ANYTHING CAN DISTURB x0.
+  CaptureX0()
+
+  ; 2. EVERY WORD SAYS "NEVER WRITTEN" UNTIL IT IS WRITTEN. The block is
+  ;    in DRAM nothing clears, so an unreached word reads back rubbish on
+  ;    the part and zero under an interpreter - and both read as answers.
+  i = 0
+  While i < #R_WORDS
+    Put(i, #PPP_UNSET)
+    i = i + 1
+  Wend
+  Put(#R_MAGIC, #PPP_MAGIC)
+  Put(#R_TABLE, gSvcTable)
+  gFails = 0
+
+  UartInit(115200)
+  PutNl()
+  PutS("four-core payload proof: one job on all four cores, then back.")
+  PutNl()
+
+  ; 3. A ZERO TABLE ENDS THE RUN. Everything below reads through it, and
+  ;    reading through 0 with the MMU off returns low DRAM - the firmware
+  ;    spin table, which looks like plausible small integers.
+  If gSvcTable = 0
+    Fail("no service table was handed over. Build the container with the")
+    PutS("      services flag and enter it with run, go or boot mem.")
+    PutNl()
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #PPP_DONE)
+    ProcedureReturn gFails
+  EndIf
+
+  Put(#R_HDRMAGIC, Hdr32(0))
+  Put(#R_HDRMAJOR, Hdr32(4))
+  Put(#R_HDRMINOR, Hdr32(8))
+  Put(#R_HDRCOUNT, Hdr32(12))
+  If Hdr32(0) <> #SVC_MAGIC
+    Fail("the table does not begin with the service-table magic.")
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #PPP_DONE)
+    ProcedureReturn gFails
+  EndIf
+  If Hdr32(4) <> #PPP_NEED_MAJOR Or Hdr32(12) < #PPP_NEED_COUNT
+    Fail("this monitor's table is older than the four-core group, so there")
+    PutS("      is nothing here to prove. Flash a monitor that carries it.")
+    PutNl()
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #PPP_DONE)
+    ProcedureReturn gFails
+  EndIf
+
+  *svc_parcores = Slot(#SLOT_PARCORES)
+  *svc_parrun = Slot(#SLOT_PARRUN)
+  *svc_parstatus = Slot(#SLOT_PARSTATUS)
+
+  ; 4. ASK BEFORE THE CACHES ARE ON, AND RECORD THE ANSWER. It is 1, and
+  ;    it is the truth: no core can join a regime that is not running.
+  ;    A payload that split by this number would be correct and single
+  ;    core, which is the silent version of this whole feature failing.
+  Put(#R_CORESCOLD, svc_parcores())
+
+  ; 5. THIS PAYLOAD'S OWN IDENTITY MAP. MmuBuildTables RETURNS 0 ON
+  ;    SUCCESS; reading it the other way round has already cost this
+  ;    project a run, because everything afterwards looks complete.
+  If MmuBuildTables(#PPP_TABLES) <> 0
+    Fail("this payload could not build its own translation tables, so no")
+    PutS("      core can be started and there is nothing left to measure.")
+    PutNl()
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #PPP_DONE)
+    ProcedureReturn gFails
+  EndIf
+  MmuEnableCached()
+  If MmuEnabled() <> 1
+    Fail("the payload's own caches did not come on.")
+    Put(#R_FAILS, gFails)
+    Put(#R_DONE, #PPP_DONE)
+    ProcedureReturn gFails
+  EndIf
+
+  ; 6. ASK AGAIN. THIS is the number to split by.
+  cores = svc_parcores()
+  Put(#R_CORESWARM, cores)
+  PutS("partitions offered: ")
+  PrintDec(cores)
+  PutNl()
+  If cores < 1 Or cores > #PPP_PARTS
+    Fail("the monitor offered a partition count this payload cannot use.")
+    cores = 1
+  EndIf
+
+  ; 7. THE JOB. Twice, so that "it worked once" and "it works" are not
+  ;    the same observation even inside one entry.
+  rc = PppJob(cores)
+  Put(#R_RC1, rc)
+  Put(#R_VERIFY1, PppVerify())
+  If rc <> #SVC_OK
+    Fail("the first parallel run was refused.")
+  EndIf
+  If PppVerify() = 0
+    Fail("the first parallel run's output does not match the serial reference.")
+  EndIf
+
+  rc = PppJob(cores)
+  Put(#R_RC2, rc)
+  Put(#R_VERIFY2, PppVerify())
+  If rc <> #SVC_OK
+    Fail("the second parallel run was refused.")
+  EndIf
+  If PppVerify() = 0
+    Fail("the second parallel run's output does not match the serial reference.")
+  EndIf
+
+  Put(#R_ST0, svc_parstatus(0))
+  Put(#R_ST1, svc_parstatus(1))
+  Put(#R_ST2, svc_parstatus(2))
+  Put(#R_ST3, svc_parstatus(3))
+  For i = 0 To cores - 1
+    If PeekI(#PPP_RESULT + (#R_ST0 + i) * 8) <> 0
+      Fail("a partition reported a non-zero status of its own.")
+    EndIf
+  Next
+
+  ; 8. HAND THE MACHINE BACK THE WAY IT WAS GIVEN. The monitor re-enables
+  ;    its own caches after a payload returns, but it flushed to DRAM
+  ;    before entering and this payload has been writing cached ever
+  ;    since. Leaving dirty lines behind would hand back memory that
+  ;    disagrees with itself.
+  MmuDisableCachedFlushed()
+
+  Put(#R_FAILS, gFails)
+  Put(#R_DONE, #PPP_DONE)
+  PutS("failures: ")
+  PrintDec(gFails)
+  PutNl()
+  PutS("run this image again with NO reset. It must be entered, not refused.")
+  PutNl()
+  ProcedureReturn gFails
+EndProcedure

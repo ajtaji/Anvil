@@ -1,0 +1,95 @@
+; Pi 4 composition of primary-core exception capture and masked GIC support.
+; Include after exceptions.pbi, interrupts.pi4, UART, and console formatting.
+; Fatal output first uses a bounded raw PL011 writer with no callback or heap.
+; The regular console mirror is best effort only: if it faults, the exception
+; layer parks without overwriting the original record. No recovery is faked.
+Global gExceptionReady.i
+Global gInterruptReady.i
+
+Procedure HwExceptionByte(value.i)
+  Define attempt.i
+  For attempt = 0 To 4095
+    If (PeekL($FE201018) & $20) = 0
+      PokeL($FE201000, value & 255)
+      ProcedureReturn
+    EndIf
+  Next
+EndProcedure
+
+Procedure HwExceptionText(text.i)
+  Define i.i
+  Define c.i
+  ; Only fixed literals are supplied, but the read itself remains bounded.
+  For i = 0 To 191
+    c = PeekA(text + i)
+    If c = 0
+      ProcedureReturn
+    EndIf
+    HwExceptionByte(c)
+  Next
+EndProcedure
+
+Procedure HwExceptionHex(value.i)
+  Define digit.i
+  Define shift.i
+  For shift = 60 To 0 Step -4
+    digit = (value >> shift) & 15
+    If digit < 10
+      HwExceptionByte(48 + digit)
+    Else
+      HwExceptionByte(65 + digit - 10)
+    EndIf
+  Next
+EndProcedure
+
+Procedure HwExceptionReport()
+  ; A payload that stops here never returns, and the deadman then resets the
+  ; board and takes this report with the UART. Recording it first, in the
+  ; run record that survives the reset, is what lets `last run` say "stopped
+  ; at a processor exception" afterwards. Plain DRAM writes, flushed; it
+  ; does nothing unless a payload is recorded as inside.
+  RunRecordException(ExceptionEsr(), ExceptionPc(), ExceptionFar())
+  HwExceptionText("ANVIL FATAL EL=")
+  HwExceptionHex(ExceptionEl())
+  HwExceptionText(" SLOT=")
+  HwExceptionHex(ExceptionSlot())
+  HwExceptionText(" ESR=")
+  HwExceptionHex(ExceptionEsr())
+  HwExceptionText(" PC=")
+  HwExceptionHex(ExceptionPc())
+  HwExceptionText(" FAR=")
+  HwExceptionHex(ExceptionFar())
+  HwExceptionByte(13)
+  HwExceptionByte(10)
+
+  ; These mirrors can use a working display or network console, but cannot
+  ; be guaranteed if the fault occurred inside those devices or renderers.
+  ; A FAULT IS NOT A MESSAGE: one taken inside a background service would
+  ; otherwise be diverted into the message log with everything else that
+  ; service was saying. Leave every message bracket first.
+  UartMessageAbandon()
+  PrintN("!! Anvil stopped after a processor exception. Record these values;")
+  PrintN("   check the matching build's symbols before restarting the board.")
+  Print("   EL=") : PutHex16(ExceptionEl())
+  Print(" slot=") : PutHex16(ExceptionSlot())
+  Print(" ESR=") : PutHex16(ExceptionEsr()) : PrintNl()
+  Print("   PC=") : PutHex16(ExceptionPc())
+  Print(" FAR=") : PutHex16(ExceptionFar())
+  Print(" SP=") : PutHex16(ExceptionSp()) : PrintNl()
+EndProcedure
+
+Procedure HwExceptionPrepare()
+  ExceptionSetReporter(@HwExceptionReport)
+  gExceptionReady = ExceptionInstall()
+EndProcedure
+
+Procedure HwInterruptPrepare()
+  ; Every existing device driver remains polled. Do not unmask CPU IRQ or
+  ; enable any peripheral line just because the dispatcher now exists.
+  If gExceptionReady <> 0
+    gInterruptReady = InterruptInit(ExceptionVbar())
+    If gInterruptReady <> 0
+      ExceptionSetIrqHandler(@InterruptDispatch)
+    EndIf
+  EndIf
+EndProcedure

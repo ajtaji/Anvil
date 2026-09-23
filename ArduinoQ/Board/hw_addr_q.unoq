@@ -1,0 +1,487 @@
+
+; ======================================================================
+;  hw_addr_q.pi4 - the Arduino UNO Q's answer to "is this address safe
+;  to touch".
+;
+;  The core asks HwAddrCheck() before every command that takes an address
+;  from the operator; the contract is in Anvil/Hal/hal.pbi and the asking
+;  side is Anvil/Core/addrsafe.pbi. This file is the table, and it is the
+;  reason the seam exists at all.
+;
+; ----------------------------------------------------------------------
+;  WHAT THIS SOC DOES, AND WHY IT IS WORSE THAN A FAULT
+; ----------------------------------------------------------------------
+;  On the QCM2290 an MMIO access to a block whose clock is gated does not
+;  fault, does not time out, and does not read back a bus-error pattern.
+;  THE ACCESS NEVER COMPLETES. The processor stops on it, the console
+;  stops mid-line, the network stops answering, and the board has to have
+;  its power physically removed. No watchdog helps - the watchdog would
+;  have to be serviced by a processor that is stalled - and no reset
+;  command can be typed, because there is nothing left to type at.
+;
+;  It has happened three times on this board in two days, and the first
+;  one is why this file exists. The whole event was one command:
+;
+;      memory 4AC0004 10
+;
+;  a plain read of the QUPv3 wrapper's own version register, typed at
+;  Anvil's prompt as the first line of a scripted session. The board's
+;  transcript is flushed after every command, so the log settles it
+;  exactly: the line before completed, and that line has no echo in the
+;  file at all.
+;
+;  THE I2C DRIVER'S OWN PRESENCE CHECK WAS CORRECT AND NEVER RAN.
+;  `memory` goes straight to the address - that is what it is for - so a
+;  guard living inside a driver protected nothing. That is the finding
+;  this table is the answer to.
+;
+; ----------------------------------------------------------------------
+;  WHERE EVERY ROW COMES FROM, AND WHY THE PROVENANCE IS IN THE TABLE
+; ----------------------------------------------------------------------
+;  Three grades of evidence, and they are NOT merged, because merging
+;  them is how "the device tree implies it is fine" turns into "the board
+;  says it is safe" and then into somebody's afternoon:
+;
+;    PROVEN     read or written on THIS board, at THIS exception level,
+;               under THIS firmware, and it answered (or it hung).
+;               Only these earn SAFE.
+;    MEASURED   read from Linux on this board over SSH, or observed by a
+;               probe that got far enough to report. Strong, but Linux
+;               runs after its own drivers have voted for clocks that a
+;               UEFI application has not.
+;    DECLARED   what the device tree and the vendor clock driver say.
+;               Good enough to say "this is behind a GDSC, do not touch
+;               it" - a positive claim of DANGER is safe to make from a
+;               weaker source. NOT good enough to say SAFE.
+;
+;  THE ASYMMETRY IS DELIBERATE AND IT IS THE WHOLE DESIGN. A wrong
+;  UNCLOCKED costs one refusal the operator can override in two words. A
+;  wrong SAFE costs a power cycle and whatever was on the board. So
+;  UNCLOCKED is claimed from DECLARED evidence and SAFE is claimed only
+;  from PROVEN evidence, and everything else answers UNKNOWN and says it
+;  is ignorance.
+;
+;  Sources, all in this repository:
+;    ArduinoQ/Reference/agatti.dtsi                    the SoC device tree
+;    ArduinoQ/Reference/unoq-live-device-tree.dts      read off THIS board
+;    ArduinoQ/Reference/Adreno702/linux/drivers/clk/qcom/gcc-qcm2290.c
+;    ArduinoQ/Reference/Adreno702/linux/drivers/clk/qcom/gpucc-qcm2290.c
+;
+;  A TRAP WORTH NAMING BEFORE THE TABLE: the six serial engines are BELOW
+;  the wrapper, not inside it. SE0..SE5 run $04A80000..$04A97FFF and the
+;  wrapper is at $04AC0000 (agatti.dtsi:1178-1180, :1190-1557). A range
+;  check written as "the wrapper and its size" covers not one engine.
+;
+;  A SECOND ONE: the device tree's GMU window ($0596A000 + $30000) SWALLOWS
+;  the whole of GPUCC ($05990000 + $9000). That overlap is real in the
+;  source and it is an artefact of a shim - there is no true GMU on this
+;  part (agatti.dtsi:1798, "qcom,adreno-gmu-wrapper"). The rows below
+;  split it around GPUCC rather than reproducing the overlap, because
+;  GPUCC is the one window in that whole region that has been read here.
+; ======================================================================
+
+; The block the last check matched, and the sentence naming it. Valid
+; only immediately after a HwAddrCheck() that did not answer SAFE - the
+; same rule, and the same reason, as memrange.pi4's gMonHitLo/gMonHitHi.
+Global gQAddrLo.i
+Global gQAddrHi.i
+Global *gQAddrWhy
+
+; ----------------------------------------------------------------------
+;  QAddrHit - does lo..hi touch blo..bhi AT ALL, and record it if so.
+;
+;  ANY OVERLAP COUNTS, and that is the right test for a dangerous block:
+;  a 64-byte dump that starts four bytes before the aperture still reads
+;  into it, and the read that stalls is the one inside. The monitor-
+;  overlap check next door uses exactly this shape for exactly this
+;  reason.
+; ----------------------------------------------------------------------
+Procedure.i QAddrHit(lo.i, hi.i, blo.i, bhi.i)
+  If hi >= blo And lo <= bhi
+    gQAddrLo = blo
+    gQAddrHi = bhi
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  QAddrIn - is lo..hi WHOLLY INSIDE blo..bhi.
+;
+;  THE SAFE LIST USES THIS ONE AND NOT QAddrHit, and the difference is
+;  load-bearing. "This range touches something known good" is not a
+;  reason to allow it: the other end may be in something known bad. A
+;  range earns SAFE only when every byte of it is inside one window this
+;  board has actually read.
+; ----------------------------------------------------------------------
+Procedure.i QAddrIn(lo.i, hi.i, blo.i, bhi.i)
+  If lo >= blo And hi <= bhi
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrCheck(lo, hi, forWrite) - the answer.
+;
+;  ORDER MATTERS AND IT IS: dangerous first, then safe, then named
+;  ignorance, then plain ignorance. Anything that touches a block known
+;  not to answer is refused whatever else it also touches.
+;
+;  forWrite IS ACCEPTED AND NOT USED HERE, and that is honest rather than
+;  lazy: on this part a READ of a gated block hangs exactly as hard as a
+;  write. There is no block on this board that may be read but not
+;  written, so there is nothing for the flag to say. It stays in the
+;  signature because the seam is shared and a board that DOES have such a
+;  block needs somewhere to say so.
+; ----------------------------------------------------------------------
+Procedure.i HwAddrCheck(lo.i, hi.i, forWrite.i)
+  *gQAddrWhy = 0
+  gQAddrLo = 0
+  gQAddrHi = 0
+
+  ; ==================================================================
+  ;  1. KNOWN NOT TO ANSWER. Any overlap refuses the whole range.
+  ; ==================================================================
+
+  ; ---- THE QUPv3 SERIAL BLOCK. PROVEN, the hard way. ---------------
+  ; The wrapper first, because it is the one that was actually typed.
+  If QAddrHit(lo, hi, $04AC0000, $04AC1FFF) <> 0
+    *gQAddrWhy = "the QUPv3 wrapper, the serial block's own control aperture: reading its version register at 04AC0004 is the exact command that stalled this board, and it took a power cycle to get it back"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  ; SE4 is carved out of the engine span BEFORE the span is tested, so
+  ; that it can answer with its own sentence rather than the general one.
+  ; It is the console engine and it is the one honest disagreement in
+  ; this file - see the UNKNOWN section below, which is where it lands.
+  If QAddrHit(lo, hi, $04A80000, $04A8FFFF) <> 0
+    *gQAddrWhy = "one of QUP serial engines 0 to 3: two AHB clocks gate all six engines and the wrapper that owns them is proven dark here, so no engine in this aperture can answer"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $04A94000, $04A97FFF) <> 0
+    *gQAddrWhy = "QUP serial engine 5, the SPI link to the on-board microcontroller: the same two AHB clocks gate it and the wrapper is proven dark here"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  ; The GPI DMA engine sits in the same block's address neighbourhood and
+  ; behind the same kind of vote (agatti.dtsi:1160, disabled by default).
+  If QAddrHit(lo, hi, $04A00000, $04A5FFFF) <> 0
+    *gQAddrWhy = "the GPI DMA engine that feeds the serial block, which is voted for the same way the serial engines are"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ---- THE GPU. The suspect in the third hang. ---------------------
+  ; agatti.dtsi:1699 - the Adreno register window, on the GX rail with
+  ; VDDCX behind it. A probe that powered the CX domain up and then read
+  ; this window did not come back.
+  If QAddrHit(lo, hi, $05900000, $0593FFFF) <> 0
+    *gQAddrWhy = "the graphics processor's register window, which lives behind a power domain the firmware leaves collapsed: it answers only while that domain has been brought up on purpose, and a probe that read it after powering the domain is the third thing to have hung this board"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05961000, $059617FF) <> 0
+    *gQAddrWhy = "the graphics processor's CX debug block, on the same collapsed power domain as its register window"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  ; The GMU shim window, SPLIT AROUND GPUCC - see the note in the header.
+  If QAddrHit(lo, hi, $0596A000, $0598FFFF) <> 0
+    *gQAddrWhy = "the graphics power-sequencing window, which sits behind two of the graphics power domains at once"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05999000, $0599FFFF) <> 0
+    *gQAddrWhy = "the graphics processor's CX memory window, on the collapsed graphics power domain"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $059A0000, $059AFFFF) <> 0
+    *gQAddrWhy = "the graphics processor's own address translator, which is behind the graphics CX power domain"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ---- EVERYTHING ELSE THE DEVICE TREE PUTS BEHIND A GDSC OR AN
+  ;      OFF-BY-DEFAULT CLOCK. DECLARED evidence, refusing rather than
+  ;      allowing, which is the safe direction for a weaker source.
+  If QAddrHit(lo, hi, $01613000, $01615FFF) <> 0
+    *gQAddrWhy = "one of the two USB physical-layer blocks, both of which are off until a driver votes for them"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $01B04000, $01B3FFFF) <> 0
+    *gQAddrWhy = "the crypto engine and its DMA controller, which share a clock nothing has voted for here"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  ; The random-number generator LOOKS always-on and is not: it carries a
+  ; managed clock of its own (agatti.dtsi:1004-1008). It is called out
+  ; separately because it is exactly the row a reader would assume is safe.
+  If QAddrHit(lo, hi, $04453000, $04453FFF) <> 0
+    *gQAddrWhy = "the hardware random-number generator, which despite sitting among always-on blocks has a managed clock of its own that nothing has voted for here"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $04744000, $0474FFFF) <> 0
+    *gQAddrWhy = "the first storage-card controller, which is behind a managed power domain"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $04784000, $04784FFF) <> 0
+    *gQAddrWhy = "the second storage-card controller, which is behind a managed power domain and is not even enabled on this board"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $04E00000, $04E0CCFF) <> 0
+    *gQAddrWhy = "the USB host controller, which is behind a power domain that is collapsed until its driver runs"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $04EF8800, $04EF8BFF) <> 0
+    *gQAddrWhy = "the USB controller's glue registers, behind the same collapsed power domain as the controller"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05804000, $05848FFF) <> 0
+    *gQAddrWhy = "the IP accelerator block, which is clocked only on a vote from the power manager and is not present in this board's own device tree at all"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05A00000, $05AEFFFF) <> 0
+    *gQAddrWhy = "the video codec, which is behind two power domains at once"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05C11000, $05C79FFF) <> 0
+    *gQAddrWhy = "the camera subsystem, which is behind a power domain and is disabled on this board"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05E00000, $05EB2FFF) <> 0
+    *gQAddrWhy = "the display subsystem, which is behind the display power domain"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $05F00000, $05F1FFFF) <> 0
+    *gQAddrWhy = "the display clock controller, whose own registers need a clock the display power domain supplies"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $06080000, $060800FF) <> 0
+    *gQAddrWhy = "the modem processor's control block"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  ; THE AUDIO SUBSYSTEM IS THE WORST REGION ON THE BOARD. Every window in
+  ; it is clocked by a vote held by the audio DSP, so reaching it needs
+  ; another processor to be running and voting. Two of its windows are
+  ; NOT marked disabled in the device tree, so a reader applying "enabled
+  ; means safe" walks straight into them.
+  If QAddrHit(lo, hi, $0A600000, $0A7EFFFF) <> 0
+    *gQAddrWhy = "the low-power audio subsystem, every window of which is clocked only while the audio processor is running and holding a vote for it - and some of those windows are not marked disabled anywhere, so they look reachable and are not"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $0A950000, $0A95FFFF) <> 0
+    *gQAddrWhy = "the audio subsystem's second pin-controller window, on the same audio-processor vote as the rest of that block"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $0AB00000, $0AB000FF) <> 0
+    *gQAddrWhy = "the audio processor's control block"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+  If QAddrHit(lo, hi, $0C800000, $0CFFFFFF) <> 0
+    *gQAddrWhy = "the Wi-Fi block, an 8 MB aperture that is dark until its firmware has been loaded and its rails brought up"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ==================================================================
+  ;  2. SAFE. PROVEN on this board, and the range must be WHOLLY inside.
+  ; ==================================================================
+
+  ; THE PIN CONTROLLER. PROVEN: all 127 lines were read and one was
+  ; driven and read back, on silicon, from this monitor at this exception
+  ; level. It is in the always-on domain and needs nobody's permission.
+  ; This is the control that separates "peripheral MMIO is blocked under
+  ; this firmware" - which is false - from "that one block is gated",
+  ; which is true.
+  If QAddrIn(lo, hi, $00500000, $007FFFFF) <> 0
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+
+  ; THE GRAPHICS CLOCK CONTROLLER. PROVEN: the graphics bring-up probe
+  ; reached it bare metal and read its PLL and divider registers, which
+  ; were sitting at their reset defaults under this firmware. It is the
+  ; one window in the whole graphics region that has answered here - and
+  ; it is next door to the register window that hung the board, which is
+  ; why the two are named separately rather than lumped together as "the
+  ; GPU".
+  If QAddrIn(lo, hi, $05990000, $05998FFF) <> 0
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+
+  ; DRAM. PROVEN in the most direct way there is: this monitor is running
+  ; out of it, its transfers land in it, and its payload boot placed an
+  ; image in it and hashed it. Two ranges, because there is a
+  ; firmware-reserved gap between the first bank and the second - see the
+  ; UNKNOWN row for that gap below.
+  If QAddrIn(lo, hi, #Q_DRAM_BASE, $7D9FFFFF) <> 0
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+  If QAddrIn(lo, hi, $80000000, #Q_DRAM_TOP - 1) <> 0
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+
+  ; ==================================================================
+  ;  3. UNKNOWN, WITH SOMETHING TO SAY. These are the rows where the
+  ;     answer is "nobody has read this here" but the reason a reader
+  ;     wants is more specific than that.
+  ; ==================================================================
+
+  ; SERIAL ENGINE 4, THE CONSOLE ENGINE, AND THE ONE HONEST DISAGREEMENT
+  ; IN THIS FILE. It was reported clocked on the grounds that the
+  ; firmware console rides it. That reasoning is exactly the assumption
+  ; the first hang disproved: the wrapper is the first thing in the
+  ; aperture, it was dark, and the two AHB clocks that gate it gate all
+  ; six engines. It may still be true that the boot chain ungates the
+  ; engine while it is transmitting. Nobody has read the engine here and
+  ; lived to report it, so this says UNKNOWN and says why, rather than
+  ; SAFE on an argument or UNCLOCKED on a guess.
+  If QAddrHit(lo, hi, $04A90000, $04A93FFF) <> 0
+    *gQAddrWhy = "QUP serial engine 4, the firmware console's engine: it is reported clocked because the console rides it, but that is the same reasoning that stalled this board once, and no read of it here has ever completed"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+
+  ; THE ALWAYS-ON SET. The device tree gives these no clock and no power
+  ; domain, which on this vendor's trees is how "always on" is spelled.
+  ; That is DECLARED evidence and it is almost certainly right - but
+  ; almost certainly right is what SAFE must not mean, so they answer
+  ; UNKNOWN with the reason stated and are two words away from being
+  ; read. This row is why the seam has three answers instead of two.
+  If QAddrHit(lo, hi, $00340000, $0035FFFF) <> 0 Or QAddrHit(lo, hi, $003C0000, $003FFFFF) <> 0
+    *gQAddrWhy = "a system-wide configuration block that this SoC's device tree puts in the always-on domain - so it very probably answers, and nobody has read it from here to find out"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  If QAddrHit(lo, hi, $01400000, $015EFFFF) <> 0
+    *gQAddrWhy = "the main clock controller, which the device tree puts in the always-on domain: it is the block you would have to write to in order to ungate anything else, and nobody has read it from here yet"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  If QAddrHit(lo, hi, $01B44000, $01B46FFF) <> 0 Or QAddrHit(lo, hi, $04410000, $04411FFF) <> 0
+    *gQAddrWhy = "a fuse or temperature-sensor block the device tree puts in the always-on domain, unread from here"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  ; Five windows with gaps between them, tested as one span because every
+  ; byte of it - window or gap - gets the same answer and only the
+  ; sentence would differ, so the sentence says "in or between".
+  If QAddrHit(lo, hi, $01C0A000, $03F9FFFF) <> 0
+    *gQAddrWhy = "in or between the five windows of the power-management-chip bus, which the device tree puts in the always-on domain, unread from here"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  If QAddrHit(lo, hi, $045F0000, $045F6FFF) <> 0 Or QAddrHit(lo, hi, $04690000, $0469FFFF) <> 0
+    *gQAddrWhy = "the power manager's shared message memory, which the device tree puts in the always-on domain, unread from here"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  If QAddrHit(lo, hi, $0F017000, $0F017FFF) <> 0 Or QAddrHit(lo, hi, $0F111000, $0F128FFF) <> 0 Or QAddrHit(lo, hi, $0F200000, $0F3FFFFF) <> 0
+    *gQAddrWhy = "one of the processor-complex blocks - the watchdog, the mailbox, the memory-mapped timer or the interrupt controller - all of which the device tree puts in the always-on domain, and none of which has been read from here"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+  If QAddrHit(lo, hi, $0C600000, $0C67FFFF) <> 0
+    *gQAddrWhy = "the system address translator: its global page is in the always-on domain but its per-client register banks are behind four separate votes, so part of this window answers and part of it does not, and which part is which has not been established here"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+
+  ; THE GAP BETWEEN THE DRAM BANKS. 38 MB with no memory in it, sitting
+  ; between two ranges that ARE safe, which makes it exactly the sort of
+  ; address a mistyped digit lands on.
+  If QAddrHit(lo, hi, $7DA00000, $7FFFFFFF) <> 0
+    *gQAddrWhy = "the firmware-reserved gap between this board's first and second memory banks: there is no memory here, and the two ranges either side of it are both fine, which is what makes a mistyped digit land in it"
+    ProcedureReturn #HW_ADDR_UNKNOWN
+  EndIf
+
+  ; ==================================================================
+  ;  4. NOTHING KNOWN AT ALL.
+  ; ==================================================================
+  ProcedureReturn #HW_ADDR_UNKNOWN
+EndProcedure
+
+Procedure.i HwAddrReason()
+  ProcedureReturn *gQAddrWhy
+EndProcedure
+
+Procedure.i HwAddrBlockLo()
+  ProcedureReturn gQAddrLo
+EndProcedure
+
+Procedure.i HwAddrBlockHi()
+  ProcedureReturn gQAddrHi
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrReport() - what `info` prints about this board's answer.
+;
+;  IT PRINTS THE PROVENANCE, not just the verdict. An operator who is
+;  about to type `force` needs to know whether they are overriding a
+;  measurement or a reading of somebody else's source code, and those two
+;  deserve very different amounts of nerve.
+;
+;  AND IT PRINTS WHERE THE MONITOR IS, for the same reason and with more
+;  force on this board than on the other one. Two different questions
+;  meet here: whether an access will COMPLETE (the table below) and
+;  whether it will DESTROY THE THING THAT IS RUNNING (the monitor
+;  window). On the other target the second answer is a compile-time
+;  constant and cannot be wrong. Here the firmware decides where this
+;  image goes and says so only afterwards, so the answer is read back at
+;  run time - which makes this the one board where an operator has a
+;  reason to ask, and until now the only way to find out was to aim a
+;  payload at it and read the refusal.
+;
+;  IT ASKS HwMonLo()/HwMonHi(), which is what the overlap test asks. Not
+;  the firmware record directly: printing the same fact through a second
+;  path is how `info` ends up disagreeing with the guard that decides.
+; ----------------------------------------------------------------------
+Procedure HwAddrReport()
+  ; WHERE THE MONITOR IS, and where that answer came from.
+  Print("  monitor      ")
+  PutAddr(HwMonLo())
+  Print(" .. ")
+  PutAddr(HwMonHi())
+  If QEfiImageKnown() = 1
+    PrintN("   this monitor's own code and")
+    PrintN("               data, from the firmware's LOADED-IMAGE RECORD - read")
+    PrintN("               back at run time, because on this board the firmware")
+    PrintN("               chooses where the image goes and a compile-time")
+    PrintN("               constant would be a guess. This is the pair the")
+    PrintN("               overlap test uses, so a payload aimed inside it is")
+    PrintN("               refused and the refusal names this window.")
+  Else
+    PrintN("   WHICH IS THE WHOLE OF MEMORY,")
+    PrintN("               and is not where the monitor is. The firmware would")
+    PrintN("               not say where it loaded this image, so the board")
+    PrintN("               refuses everything rather than claim an extent it")
+    PrintN("               cannot prove - which is why boot is refusing every")
+    PrintN("               payload. That is the safe direction and it is")
+    PrintN("               deliberate; it has not been seen on real firmware.")
+  EndIf
+  Print("               ")
+  PutAddr(#MON_DATA_LO)
+  Print(" .. ")
+  PutAddr(#MON_DATA_HI)
+  PrintN("   a second window the overlap")
+  PrintN("               test also refuses. It is a COMPILE-TIME CONSTANT here")
+  PrintN("               and nominal - reserved by convention, not measured -")
+  PrintN("               so it is named separately rather than folded into the")
+  PrintN("               line above, which is not nominal at all.")
+  PrintN("  addresses    this board answers a safety question before any command")
+  PrintN("               touches an address you typed, because an access to a")
+  PrintN("               block whose clock is off does not fail here - it stalls")
+  PrintN("               the processor and the board has to be unplugged.")
+  PrintN("    SAFE, proven on this board by reading it:")
+  PrintN("      00500000..007FFFFF  the pin controller (127 lines read, one driven)")
+  PrintN("      05990000..05998FFF  the graphics clock controller (read bare metal)")
+  Print("      ")
+  PutAddr(#Q_DRAM_BASE)
+  PrintN("..7D9FFFFF  memory, first bank")
+  Print("      80000000..")
+  PutAddr(#Q_DRAM_TOP - 1)
+  PrintN("  memory, second and third banks")
+  PrintN("    REFUSED, known not to answer:")
+  PrintN("      04AC0000..04AC1FFF  the serial block's wrapper - PROVEN: reading")
+  PrintN("                          04AC0004 is the command that stalled this board")
+  PrintN("      04A80000..04A8FFFF  serial engines 0 to 3, and")
+  PrintN("      04A94000..04A97FFF  engine 5 - the wrapper's clocks gate them all")
+  PrintN("      05900000..0593FFFF  the graphics register window (behind a")
+  PrintN("                          collapsed power domain - the third hang)")
+  PrintN("      plus the graphics debug, sequencing, memory and translator")
+  PrintN("      windows, the storage, USB, video, camera, display, modem,")
+  PrintN("      audio, crypto, random-number and Wi-Fi blocks - each behind a")
+  PrintN("      power domain or a clock vote this monitor has never cast.")
+  PrintN("    UNKNOWN, and refused for that reason - the notable one:")
+  PrintN("      04A90000..04A93FFF  serial engine 4, the console's engine. It is")
+  PrintN("                          reported clocked because the console rides it,")
+  PrintN("                          which is the reasoning the first hang")
+  PrintN("                          disproved, so this board will not claim it.")
+  PrintN("    Everything else answers UNKNOWN and is refused, which is")
+  PrintN("    ignorance and says so. Type force <address> and repeat the")
+  PrintN("    command to go ahead anyway; help force explains why it is two")
+  PrintN("    lines and not a flag.")
+EndProcedure

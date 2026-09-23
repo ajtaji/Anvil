@@ -1,0 +1,170 @@
+; Original ROCK Pi 4C v1.2 / RK3399 foundation. Not for the 4C+.
+; pmf:target rockpi4c
+; pmf:load $00041000
+; pmf:bss $02800000
+; pmf:stack $05000000
+#ANVIL_BUILD = 124 ; pmf:build
+#ANVIL_BUILD_DATE = 20260922 ; pmf:builddate
+#ANVIL_BUILD_TIME = 184508 ; pmf:buildtime
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+XIncludeFile "RockPi4C/Lib/security.pbi"
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+; Shared CRC implementation consumes this core polynomial definition.
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "Anvil/Storage/hwfile.pbi"
+XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
+XIncludeFile "RockPi4C/Lib/exceptions_el3.pbi"
+XIncludeFile "RockPi4C/Lib/gicv3.pbi"
+XIncludeFile "Anvil/Graphics/edid.pbi"
+XIncludeFile "RockPi4C/Lib/display_mode.pbi"
+XIncludeFile "RockPi4C/Lib/cru.pbi"
+XIncludeFile "RockPi4C/Lib/gpu_probe.pbi"
+XIncludeFile "RockPi4C/Lib/watchdog.pbi"
+XIncludeFile "RockPi4C/Lib/dma_pl330.pbi"
+XIncludeFile "RockPi4C/Lib/sdmmc.pbi"
+XIncludeFile "RockPi4C/Lib/storage.pbi"
+XIncludeFile "RockPi4C/Lib/storage_proof.pbi"
+XIncludeFile "RockPi4C/Lib/pmic.pbi"
+XIncludeFile "RockPi4C/Lib/tcphy.pbi"
+XIncludeFile "RockPi4C/Lib/cdn_dp.pbi"
+XIncludeFile "RockPi4C/Lib/vop.pbi"
+XIncludeFile "RockPi4C/Lib/display.pbi"
+XIncludeFile "RockPi4C/Lib/hdmi.pbi"
+XIncludeFile "RockPi4C/Lib/screen_console.pbi"
+XIncludeFile "RockPi4C/Lib/font_atlas.pbi"
+XIncludeFile "RockPi4C/Lib/hdmi_display.pbi"
+XIncludeFile "RockPi4C/Lib/recovery.pbi"
+
+Procedure RockPark()
+  ASM
+    msr daifset, #15
+rock_cold_park:
+    wfe
+    b rock_cold_park
+  ENDASM
+EndProcedure
+
+Procedure RockRecoveryLoop()
+  ; Only entered after the direct-SD EL3/timer/UART contract has passed.
+  ; IRQ stays masked: actively poll UART instead of sleeping in WFE, which
+  ; cannot service an incoming FTDI command without an interrupt source.
+  If RockRecoveryInit() = 0 : RockPark() : EndIf
+  Repeat
+    ; A watchdog armed by HDMI stays live for the rest of this healthy
+    ; recovery session. Pet it only from the ordinary command loop; fatal
+    ; exception recovery deliberately cannot hide a wedged subsystem.
+    RockWatchdogPet()
+    RockRecoveryPoll()
+    RockScreenService()
+    RockWatchdogPet()
+    RockTimerWaitUs(1000)
+  ForEver
+EndProcedure
+
+Procedure Main()
+  ; The generic A64 startup preserves firmware x0 through BSS clear and sets
+  ; SP to the explicit profile value before calling Main.
+  ASM
+    msr daifset, #15
+    adrp x9, global_rock_dtb
+    add x9, x9, #:lo12:global_rock_dtb
+    str x0, [x9]
+    adrp x9, global_rock_entry_sp
+    add x9, x9, #:lo12:global_rock_entry_sp
+    mov x10, sp
+    str x10, [x9]
+  ENDASM
+  ; Establish and reject the actual execution level before timer, UART or any
+  ; board service executes. A lower-level Image handoff is never promoted.
+  RockCaptureEnvironment()
+  If rock_current_el <> 12 : RockPark() : EndIf
+  If (rock_entry_sp & 15) <> 0 : RockPark() : EndIf
+  RockCaptureSctlrEl3()
+  ; Direct SD entry contract: stage the linked physical image with EL3 MMU,
+  ; data cache and instruction cache disabled. Do not guess at translation
+  ; tables or silently change firmware cache ownership here.
+  If (rock_sctlr_el3 & $1005) <> 0 : RockPark() : EndIf
+  If RockExceptionInstall() = 0 : RockPark() : EndIf
+  If RockTimerInit() = 0 : RockPark() : EndIf
+  ; A watchdog armed by a previous warm session can survive CPU reset. Adopt
+  ; and feed it before any boot diagnostics; a cold disabled watchdog is left
+  ; untouched until a deadman-protected operation explicitly arms it.
+  If (PeekL(#ROCK_WATCHDOG_BASE+#ROCK_WATCHDOG_CR) & 1) <> 0
+    rock_watchdog_active=1
+    RockWatchdogPet()
+  EndIf
+  ; UART is adopted before DT parsing so malformed handoffs remain visible.
+  If RockUartAdopt() <> 0
+    RockUartLine("ANVIL ROCK PI 4C V1.2 RK3399 EL3 EARLY UART2 1500000")
+  EndIf
+  If RockValidateEntry() = 0
+    If rock_uart_ready <> 0 : RockUartLine("STOP: RK3399 DIRECT SD HANDOFF REFUSED") : EndIf
+    RockPark()
+  EndIf
+  ; The RK3399 BootROM protects DDR/SRAM regions during its first stage.
+  ; Release and verify those EL3-owned regions before SDMMC or display DMA.
+  If RockSecurityReleaseDma()=0
+    If rock_uart_ready<>0
+      RockUartLine("STOP: RK3399 DMA SECURITY RELEASE REFUSED")
+      RockSecurityTelemetry()
+    EndIf
+    RockPark()
+  EndIf
+  RockSecurityTelemetry()
+  ; EL3 GIC/timer and display ownership are explicit opt-in capabilities.
+  ; Keep IRQ masked. HDMI VOPB has an explicit serial command for the initial
+  ; direct-loader proof; automatic initialization remains a build-time opt-in.
+  If #ROCK_DIRECTSD_GIC_ENABLED <> 0
+    If RockGicInitTimerFoundation() = 0
+      If rock_uart_ready <> 0 : RockUartLine("STOP: RK3399 GICV3 FOUNDATION REFUSED") : EndIf
+      RockPark()
+    EndIf
+  EndIf
+  If #ROCK_DIRECTSD_DISPLAY_ENABLED <> 0
+    If RockDisplayUp() = 0
+      If rock_uart_ready <> 0 : RockUartLine("STOP: RK3399 MINIDP BRING-UP REFUSED") : EndIf
+      RockRecoveryLoop()
+    EndIf
+  EndIf
+  If #ROCK_DIRECTSD_HDMI_ENABLED <> 0 And #ROCK_DIRECTSD_HDMI_AUTO <> 0
+    ; Automatic HDMI obeys the same deadman gate as the serial command. A
+    ; failed watchdog setup leaves all display registers untouched.
+    If RockWatchdogArm()=0
+      If rock_uart_ready<>0
+        RockUartLine("STOP: RK3399 HDMI DEADMAN REFUSED")
+        RockWatchdogTelemetry()
+      EndIf
+      RockRecoveryLoop()
+    EndIf
+    RockWatchdogPet()
+    ; Latch before touching shared display hardware. Recovery cannot issue a
+    ; second attempt if initialization partially transitions before failing.
+    rock_recovery_hdmi_attempted=1
+    If RockHdmiDisplayUp()=0
+      If rock_uart_ready<>0 : RockUartLine("STOP: RK3399 HDMI BRING-UP REFUSED") : EndIf
+      RockRecoveryLoop()
+    EndIf
+  EndIf
+  If rock_uart_ready <> 0
+    If #ROCK_DIRECTSD_DISPLAY_ENABLED <> 0
+      RockUartLine("ANVIL ROCK PI 4C EL3 FOUNDATION READY; IRQ STILL MASKED")
+    ElseIf #ROCK_DIRECTSD_HDMI_ENABLED <> 0
+      RockUartLine("ANVIL ROCK PI 4C EL3 READY; TYPE HDMI; VOPB; AUTO OFF")
+    Else
+      RockUartLine("ANVIL ROCK PI 4C EL3 ENTRY READY; GIC/DISPLAY DEFERRED")
+    EndIf
+  EndIf
+  RockRecoveryLoop()
+EndProcedure

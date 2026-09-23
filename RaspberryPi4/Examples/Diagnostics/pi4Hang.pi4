@@ -1,0 +1,36 @@
+; pi4Hang.pi4 - a payload that deliberately never returns.
+;
+; DIAGNOSTIC. Does not ship. It exists to be rescued from.
+;
+; This is the counterpart to Anvil's deadman: the only honest way to
+; prove that a hung payload gets the board back is to hang a payload and
+; watch the board come back. A test that only checks the register writes
+; proves the writes, not the rescue.
+;
+; Run it with the deadman OFF and the board is wedged until someone
+; pulls the power - which is exactly the state this work removed, so it
+; is worth seeing once.
+;
+;   pmf> d 3
+;   pmf> map              <- it prints `stage a file at <stage>`. The
+;                            --load-addr below does not pin the image.
+;   pmf> g <stage>
+;
+;   PureMetalForge.exe --compile pi4Hang.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o hang.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+
+Procedure.i Main()
+  PrintNl()
+  UartWriteStr("=== hanging on purpose. nothing below this line runs. ===")
+  PrintNl()
+  UartDrain()
+
+  ; No exit, no counter, no condition. If the board comes back it is
+  ; because something outside this program brought it back.
+  Repeat
+  ForEver
+
+  ProcedureReturn 0
+EndProcedure

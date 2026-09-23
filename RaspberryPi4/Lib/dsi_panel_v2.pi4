@@ -1,0 +1,541 @@
+; ======================================================================
+;  dsi_panel_v2.pi4 - the SECOND-GENERATION Waveshare DSI panel's control
+;  MCU at I2C $45. A 16-bit GPIO expander and one PWM register.
+; ----------------------------------------------------------------------
+;  READ THIS FIRST: THIS IS NOT dsi_panel.pi4 AND THE TWO ARE NOT
+;  ALTERNATIVES FOR THE SAME BOARD.
+;
+;  Waveshare ship two incompatible generations that both put an MCU at
+;  $45 and are both sold as "10.1inch DSI LCD". They share the address
+;  and NOTHING ELSE:
+;
+;    v1   dsi_panel.pi4. Registers $C0 $C2 $AC $AD $AB $AA. The MCU is
+;         the whole control surface and the panel needs no DSI init.
+;    v2   THIS FILE. Registers $94..$99. The MCU is a GPIO expander that
+;         owns the panel's rails, its reset, the touch controller's reset
+;         and a backlight PWM - and the panel itself needs a 205-command
+;         DCS init table over DSI before it will show anything.
+;
+;  Writing v1's registers to a v2 MCU is not a no-op: $AB and $AD are
+;  outside this MCU's map (max_register is $96 in the Linux regmap) and
+;  what an out-of-range write does is undocumented. Identify the board
+;  BEFORE driving it - the touch controller's address and its ID string
+;  are what identify it, see touch_goodix.pi4.
+;
+;  The bench board, 2026-09-06: the overlay line is
+;  vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a on DSI1, so it is v2 and
+;  this file is the one for it.
+;
+;  ---- USE ------------------------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/gpio.pi4"       ; i2c.pi4 needs it
+;    XIncludeFile "RaspberryPi4/Lib/timer.pi4"      ; delay()
+;    XIncludeFile "RaspberryPi4/Lib/i2c.pi4"        ; REQUIRED, before this
+;    XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2.pi4"
+;
+;    I2cSelectBus(#I2C_BUS_DISPLAY)   ; the panel is NOT on the header bus
+;    I2cUp()
+;    If DsiV2Begin() = 1              ; VCC on, touch out of reset
+;      DsiV2Backlight(255)            ; light it, with no DSI at all
+;    EndIf
+;
+;  House rule 10: a library never includes a library. The MAIN file lists
+;  all four in that order and a main file that forgets one fails LOUDLY
+;  at compile time on an undefined I2cWrite or delay, which is the
+;  designed failure.
+;
+;  ---- WHERE EVERY NUMBER COMES FROM (do not guess - rule 21) ----------
+;
+;  RaspberryPi4/Reference/rpi-6.12.y_waveshare-panel-regulator.c, fetched
+;  2026-09-06 from
+;  https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+;  drivers/regulator/waveshare-panel-regulator.c
+;  It is the driver the device tree binds to the $45 node, whose
+;  compatible string is "waveshare,touchscreen-panel-regulator"
+;  (:307), and it is the ONLY published description of this MCU.
+;
+;    :18-23   the six registers below, by name
+;    :38-42   the regmap: 8-bit register, 8-bit value, max_register $96
+;    :112-133 every GPIO write sends BOTH $94 and $95 from a 16-bit
+;             shadow - see THE SHADOW IS THE INTERFACE
+;    :155-192 the read: address byte, STOP, 5-10 ms, then a SEPARATE
+;             one-byte read - see THE READ IS TWO TRANSACTIONS
+;    :232-236 probe writes the shadow $0300 and waits 20 ms
+;    :137-152 the backlight: BL_EN through the expander, then $96 = level
+;
+;  and the pin numbers from
+;  RaspberryPi4/Reference/rpi-6.12.y_vc4-kms-dsi-waveshare-panel-v2-overlay.dts
+;  which is where each expander bit is given its job by name.
+;
+;  ---- THE SHADOW IS THE INTERFACE ------------------------------------
+;
+;  There is no per-pin register. The MCU holds sixteen output bits as two
+;  bytes, $94 is the HIGH byte and $95 is the LOW one, and Linux keeps a
+;  16-bit shadow and writes BOTH bytes on every single pin change
+;  (:126-131). So does this file. A driver that writes only the byte it
+;  thinks it changed will eventually clear the other eight bits, and the
+;  symptom is a panel that goes dark when the touch controller is reset -
+;  which reads as a hardware fault and is not one.
+;
+;  The shadow is also why nothing here reads a pin back off the MCU:
+;  Linux's own get() returns the shadow, not the part (:96-108). There is
+;  no register that reports the outputs. DsiV2Pins() therefore reports
+;  WHAT WAS ASKED FOR and says so in its comment; do not let a caller
+;  print it as a measurement.
+;
+;  ---- THE READ IS TWO TRANSACTIONS, NOT A REPEATED START -------------
+;
+;  This MCU is the exception to the rule the Goodix taught us. Linux does
+;  NOT use a repeated start here: it sends the register address as a
+;  complete write with a STOP, then sleeps 5 to 10 ms, then issues a
+;  separate one-byte read (:161-192). The sleep is between the two
+;  transactions and is not optional - the comment-free usleep_range is
+;  the only thing standing between the address write and the read, and a
+;  microcontroller bit-banging its own I2C slave is exactly the kind of
+;  part that needs it.
+;
+;  So DsiV2Read() must NOT be written with I2cWriteRead(). Using the
+;  repeated start here would be "the more correct I2C" and would be the
+;  wrong protocol for this part.
+;
+;  ---- WHAT IS READABLE, AND WHY IT MATTERS MORE THAN AN ACK ----------
+;
+;  $97 size, $98 hw id, $99 version. An ACK only says something is at the
+;  address; three plausible values say it is THIS part. On a bench where
+;  the open question is whether a ribbon cable is in the right way round,
+;  a read-back is the only proof that does not need an eye.
+;
+;  THE VALUES ARE NOT PUBLISHED. Linux prints them and asserts nothing
+;  (:229-241), so this file records them and refuses to invent an
+;  expected value. What is checkable is that they are not all $00 and not
+;  all $FF - the two things a floating or held bus reads as.
+; ======================================================================
+
+EnableExplicit
+
+#DSI_V2_ADDR = $45
+
+; The six registers, :18-23. $94 and $95 are written together, always.
+#DSI_V2_REG_TP      = $94   ; expander bits 15..8  (HIGH byte)
+#DSI_V2_REG_LCD     = $95   ; expander bits 7..0   (LOW byte)
+#DSI_V2_REG_PWM     = $96   ; backlight, 0..255, NOT inverted
+#DSI_V2_REG_SIZE    = $97   ; read-only: panel size
+#DSI_V2_REG_ID      = $98   ; read-only: hardware id
+#DSI_V2_REG_VERSION = $99   ; read-only: MCU firmware version
+
+; ----------------------------------------------------------------------
+;  THE EXPANDER BITS, each named by the device-tree property that claims
+;  it. Every one of these is GPIO_ACTIVE_HIGH and every gpiod is
+;  requested GPIOD_OUT_LOW, so a set bit is the asserted state and the
+;  reset state of the whole expander is zero.
+;
+;    v2-overlay.dts:26  enable-gpio  = <&display_mcu 2>   BL_EN
+;    v2-overlay.dts:31  reset-gpio   = <&display_mcu 9>   the TOUCH reset
+;    v2-overlay.dts:50  reset-gpio   = <&display_mcu 1>   the PANEL reset
+;    v2-overlay.dts:51  iovcc-gpio   = <&display_mcu 4>
+;    v2-overlay.dts:52  avdd-gpio    = <&display_mcu 0>
+;
+;  BIT 8 HAS NO NAME IN THE DEVICE TREE and it is not optional. The
+;  driver's probe sets BIT(9) | BIT(8) with the comment "Enable VCC"
+;  (:232), so bit 8 is a rail and bit 9 releases the touch controller
+;  from reset. Nothing else in either source mentions bit 8, so it is
+;  called VCC here after that comment and not after a guess.
+; ----------------------------------------------------------------------
+#DSI_V2_BIT_AVDD       = 0
+#DSI_V2_BIT_PANEL_RST  = 1
+#DSI_V2_BIT_BL_EN      = 2
+#DSI_V2_BIT_IOVCC      = 4
+#DSI_V2_BIT_VCC        = 8   ; unnamed in the DT; "Enable VCC" at :232
+#DSI_V2_BIT_TOUCH_RST  = 9
+
+; The probe state: bit 8 (VCC) and bit 9 (touch out of reset), which is
+; (1 << #DSI_V2_BIT_VCC) | (1 << #DSI_V2_BIT_TOUCH_RST). Written as the
+; literal because constants in this language are literals with the
+; derivation in the comment, the way every other register file here does
+; it - and the derivation is checked by the gate, not by the reader.
+#DSI_V2_POWERON = $0300
+
+#DSI_V2_BL_MAX = 255
+
+; The delays, all from the two drivers, in milliseconds.
+#DSI_V2_MS_POWER   = 20   ; regulator probe, :236
+#DSI_V2_MS_RAIL    = 20   ; iovcc and avdd, panel-v2 prepare
+#DSI_V2_MS_RESET   = 60   ; panel reset low, then high
+#DSI_V2_MS_READ    = 10   ; between the address write and the read, :169
+
+; ----------------------------------------------------------------------
+;  State. dsi_v2_pins is THE SHADOW - what was last written to $94/$95,
+;  which is the only place the value exists on the host side.
+; ----------------------------------------------------------------------
+Global dsi_v2_pins.i     = 0     ; the 16-bit shadow
+Global dsi_v2_ready.i    = 0     ; 1 once the power-on write ACKed
+Global dsi_v2_bl.i       = -1    ; last level asked for, -1 if never
+Global dsi_v2_code.i     = 0     ; the last #I2C_* code
+Global dsi_v2_writes.i   = 0     ; register writes that ACKed since Begin
+Global dsi_v2_id.i       = -1    ; $98, or -1 if it was never read
+Global dsi_v2_size.i     = -1    ; $97
+Global dsi_v2_version.i  = -1    ; $99
+
+; ----------------------------------------------------------------------
+;  DsiV2Write(reg, v) - one register write, two bytes, one transaction.
+;  Returns 1 or 0, with the reason in DsiV2BusCode().
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Write(reg.i, v.i)
+  Define r.i
+  Dim pkt.a[2]
+
+  pkt[0] = reg & $FF
+  pkt[1] = v & $FF
+  r = I2cWrite(#DSI_V2_ADDR, @pkt, 2)
+  dsi_v2_code = r
+  If r <> #I2C_OK
+    ProcedureReturn 0
+  EndIf
+  dsi_v2_writes = dsi_v2_writes + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Read(reg) - one register read. Returns 0..255, or -1 with the
+;  reason in DsiV2BusCode().
+;
+;  TWO TRANSACTIONS WITH A DELAY BETWEEN THEM, not a repeated start. See
+;  THE READ IS TWO TRANSACTIONS in the header before changing this.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Read(reg.i)
+  Define r.i
+  Define phase.i
+  Define traced.i
+  Dim a.a[1]
+  Dim b.a[1]
+
+  a[0] = reg & $FF
+  phase = 0
+  If reg = #DSI_V2_REG_SIZE
+    phase = #I2C_TRACE_MCU_SIZE_WRITE
+  ElseIf reg = #DSI_V2_REG_ID
+    phase = #I2C_TRACE_MCU_ID_WRITE
+  ElseIf reg = #DSI_V2_REG_VERSION
+    phase = #I2C_TRACE_MCU_VERSION_WRITE
+  EndIf
+  traced = I2cTraceBegin(phase)
+  r = I2cWrite(#DSI_V2_ADDR, @a, 1)
+  I2cTraceEnd(traced, r)
+  dsi_v2_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+
+  ; The MCU is given the same window Linux gives it. Skipping this reads
+  ; the byte the part had not finished fetching.
+  delay(#DSI_V2_MS_READ)
+
+  b[0] = 0
+  If phase = #I2C_TRACE_MCU_SIZE_WRITE
+    phase = #I2C_TRACE_MCU_SIZE_READ
+  ElseIf phase = #I2C_TRACE_MCU_ID_WRITE
+    phase = #I2C_TRACE_MCU_ID_READ
+  ElseIf phase = #I2C_TRACE_MCU_VERSION_WRITE
+    phase = #I2C_TRACE_MCU_VERSION_READ
+  EndIf
+  traced = I2cTraceBegin(phase)
+  r = I2cRead(#DSI_V2_ADDR, @b, 1)
+  I2cTraceEnd(traced, r)
+  dsi_v2_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn b[0]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Flush() - push the shadow out as BOTH bytes, high then low.
+;
+;  The order is Linux's order ($94 then $95) and it is kept because the
+;  MCU may well latch on the second write. Returns 1 or 0.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Flush()
+  If DsiV2Write(#DSI_V2_REG_TP, (dsi_v2_pins >> 8) & $FF) = 0
+    ProcedureReturn 0
+  EndIf
+  If DsiV2Write(#DSI_V2_REG_LCD, dsi_v2_pins & $FF) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Pin(bit, on) - set or clear one expander bit and push the whole
+;  shadow. Returns 1 or 0; refuses a bit outside 0..15.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Pin(bit.i, on.i)
+  If bit < 0 Or bit > 15
+    dsi_v2_code = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  If on = 0
+    dsi_v2_pins = dsi_v2_pins & ~(1 << bit)
+  Else
+    dsi_v2_pins = dsi_v2_pins | (1 << bit)
+  EndIf
+  ProcedureReturn DsiV2Flush()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Begin() - the power-on write the Linux probe does, and nothing
+;  more. Returns 1 if both bytes ACKed, else 0.
+;
+;  It sets VCC and releases the TOUCH controller from reset, then waits
+;  20 ms. IT DOES NOT LIGHT THE BACKLIGHT and it does not bring the
+;  panel's own rails up - those are DsiV2Backlight() and DsiV2Prepare(),
+;  separate on purpose, because "is the MCU there" and "make the screen
+;  do something" are different questions and the first one has to be
+;  answerable without the second.
+;
+;  ***THE TOUCH CONTROLLER CANNOT ANSWER UNTIL THIS HAS RUN.*** Its reset
+;  line is expander bit 9 and nothing else on the Pi reaches it - there
+;  is no touch reset on any Pi GPIO. A touch scan before this call reads
+;  as a dead bus and is really a chip held in reset, which is the single
+;  most misleading result available on this hardware.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Begin()
+  dsi_v2_ready  = 0
+  dsi_v2_bl     = -1
+  dsi_v2_writes = 0
+  dsi_v2_code   = #I2C_OK
+  dsi_v2_pins   = #DSI_V2_POWERON
+
+  If DsiV2Flush() = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_POWER)
+
+  dsi_v2_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Identify() - read $97, $98 and $99 into the readers below.
+;  Returns 1 if all three reads completed, else 0.
+;
+;  THIS IS THE PROOF THAT THE RIBBON IS IN AND THE RIGHT WAY ROUND, and
+;  it is a better one than an ACK: three bytes came back from a part that
+;  had to be addressed, had to hold the register number across a STOP,
+;  and had to drive data. It does not prove any DSI lane works - the I2C
+;  pair and the differential lanes are different wires in the same FPC -
+;  but a ribbon that carries I2C is seated.
+;
+;  It asserts nothing about the values because nothing published says
+;  what they should be. DsiV2Plausible() draws the only honest line.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Identify()
+  Define v.i
+
+  dsi_v2_size = -1
+  dsi_v2_id = -1
+  dsi_v2_version = -1
+
+  v = DsiV2Read(#DSI_V2_REG_SIZE)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  dsi_v2_size = v
+
+  v = DsiV2Read(#DSI_V2_REG_ID)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  dsi_v2_id = v
+
+  v = DsiV2Read(#DSI_V2_REG_VERSION)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  dsi_v2_version = v
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Plausible() - 1 if the three identity bytes are not all $00 and
+;  not all $FF, else 0. -1 if they have not been read.
+;
+;  This is deliberately the weakest claim that is still worth making. All
+;  $FF is what an undriven bus with pull-ups reads; all $00 is what a bus
+;  held low reads. Anything else means a part answered with content. It
+;  is NOT a check that the part is the right one, and the procedure is
+;  named so that nobody can quote it as one.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Plausible()
+  If dsi_v2_id < 0 Or dsi_v2_size < 0 Or dsi_v2_version < 0
+    ProcedureReturn -1
+  EndIf
+  If dsi_v2_id = $FF And dsi_v2_size = $FF And dsi_v2_version = $FF
+    ProcedureReturn 0
+  EndIf
+  If dsi_v2_id = 0 And dsi_v2_size = 0 And dsi_v2_version = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Prepare() - the panel's own power-up, exactly as the panel driver
+;  does it before it sends one DCS byte. Returns 1 or 0.
+;
+;    iovcc high, 20 ms
+;    avdd  high, 20 ms
+;    panel reset LOW, 60 ms, then HIGH, 60 ms
+;
+;  from ws_panel_prepare(), rpi-6.12.y_panel-waveshare-dsi-v2.c:1743-1771.
+;  The reset is driven low explicitly even though the shadow starts at
+;  zero, because this procedure has to be correct when it is called a
+;  second time on a panel that is already up.
+;
+;  AFTER THIS THE PANEL IS POWERED AND STILL BLANK. It shows nothing
+;  until the DCS init table has been sent over DSI and video is running.
+;  A lit backlight over a blank panel is the expected picture at this
+;  point and it is a RESULT, not a failure.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Prepare()
+  If dsi_v2_ready = 0
+    dsi_v2_code = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+
+  If DsiV2Pin(#DSI_V2_BIT_IOVCC, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_RAIL)
+
+  If DsiV2Pin(#DSI_V2_BIT_AVDD, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_RAIL)
+
+  If DsiV2Pin(#DSI_V2_BIT_PANEL_RST, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_RESET)
+
+  If DsiV2Pin(#DSI_V2_BIT_PANEL_RST, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_RESET)
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2Backlight(level) - 0 dark to 255 full. Returns 1 or 0.
+;
+;  ***NOT INVERTED.*** The v1 MCU takes $FF minus the brightness; this
+;  one takes the brightness. A reader who knows dsi_panel.pi4 will expect
+;  the inversion and it is not here, which is why this paragraph is.
+;  Linux: regmap_write(state->regmap, REG_PWM, brightness) (:152).
+;
+;  BL_EN first. The expander's bit 2 is the backlight enable and the
+;  driver drives it from the same call (:145-150): non-zero brightness
+;  enables it, zero disables it. The PWM value alone would leave a
+;  disabled driver holding a duty cycle nobody can see.
+;
+;  A level outside 0..255 is REFUSED rather than clamped, for the reason
+;  dsi_panel.pi4 gives: a clamp turns a caller's arithmetic bug into a
+;  working screen at the wrong brightness, and nobody ever finds it.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Backlight(level.i)
+  If dsi_v2_ready = 0
+    dsi_v2_code = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  If level < 0 Or level > #DSI_V2_BL_MAX
+    dsi_v2_code = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+
+  If level = 0
+    If DsiV2Pin(#DSI_V2_BIT_BL_EN, 0) = 0
+      ProcedureReturn 0
+    EndIf
+  Else
+    If DsiV2Pin(#DSI_V2_BIT_BL_EN, 1) = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  If DsiV2Write(#DSI_V2_REG_PWM, level) = 0
+    ProcedureReturn 0
+  EndIf
+
+  dsi_v2_bl = level
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiV2TouchReset(hold_ms) - pull the touch controller's reset low for
+;  hold_ms and release it. Returns 1 or 0.
+;
+;  There is no other way to reset the Goodix on this wiring: its reset is
+;  expander bit 9 and no Pi GPIO reaches it. A touch controller that has
+;  stopped answering is reset from here or not at all.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2TouchReset(hold_ms.i)
+  If dsi_v2_ready = 0
+    dsi_v2_code = #I2C_ARG
+    ProcedureReturn 0
+  EndIf
+  If hold_ms < 1
+    hold_ms = 1
+  EndIf
+  If DsiV2Pin(#DSI_V2_BIT_TOUCH_RST, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(hold_ms)
+  If DsiV2Pin(#DSI_V2_BIT_TOUCH_RST, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(#DSI_V2_MS_POWER)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Readers. Everything except the three identity bytes reports what was
+;  ASKED FOR: this MCU has no register that reads an output back, and
+;  Linux's own get() returns its shadow. Do not print these as
+;  measurements.
+; ----------------------------------------------------------------------
+Procedure.i DsiV2Ready()
+  ProcedureReturn dsi_v2_ready
+EndProcedure
+
+; DsiV2Pins() - the 16-bit shadow, i.e. what was last written. NOT read
+; back off the part; no register offers that.
+Procedure.i DsiV2Pins()
+  ProcedureReturn dsi_v2_pins
+EndProcedure
+
+; DsiV2BacklightAsked() - the last level passed in, or -1.
+Procedure.i DsiV2BacklightAsked()
+  ProcedureReturn dsi_v2_bl
+EndProcedure
+
+; These three ARE measurements - bytes that came back off the part.
+Procedure.i DsiV2Id()
+  ProcedureReturn dsi_v2_id
+EndProcedure
+
+Procedure.i DsiV2Size()
+  ProcedureReturn dsi_v2_size
+EndProcedure
+
+Procedure.i DsiV2Version()
+  ProcedureReturn dsi_v2_version
+EndProcedure
+
+Procedure.i DsiV2BusCode()
+  ProcedureReturn dsi_v2_code
+EndProcedure
+
+Procedure.i DsiV2WriteCount()
+  ProcedureReturn dsi_v2_writes
+EndProcedure

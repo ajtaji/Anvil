@@ -1,0 +1,284 @@
+; pi4UsbEnum.pi4 - reset a port, address the device, and ask it who it is.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THIS IS THE FIRST PROGRAM IN THE PROJECT THAT TALKS TO A USB DEVICE
+; rather than to the controller in front of it. Everything up to now
+; proved the controller works; this asks whether the thing plugged into
+; it will answer.
+;
+; WHAT HAD TO LAND FIRST, because the order was not obvious and each
+; step was a separate evening:
+;
+;   PcieInit          the link, and the outbound window
+;   PcieEnumerate     a BAR for the endpoint, and the bridge's own
+;                     forwarding window - the second half was missed
+;                     once and produced $DEADDEAD, which is the root
+;                     complex's AXI read-error pattern, not a crash
+;   the inbound offset  RC_BAR2 holds an OFFSET, not a base, and the
+;                     firmware had left $4_0000_0000 in it. Every DMA
+;                     address was short by four gigabytes, the endpoint
+;                     could not reach us, and the controller reported
+;                     USBSTS $15 - Host System Error - which reads like
+;                     a broken controller and is nothing of the kind
+;   XhciInit          halt, reset, CNR, rings, scratchpad, run
+;   XhciNoOp          the cheapest possible proof that DMA works BOTH
+;                     ways: the controller read our TRB and wrote our
+;                     event
+;
+; SO WHAT IS NEW HERE IS ONLY THE LAST MILE. A port has to be RESET
+; before its device is usable - a connected port reports its speed as
+; undefined until then, which is why the earlier probe printed
+; "CONNECTED, undefined" and was not wrong to.
+;
+; THE SEQUENCE, and it is not negotiable:
+;
+;   1. reset the port and wait for enable
+;   2. read the speed - it is only meaningful after the reset
+;   3. Enable Slot, which asks the controller for a device slot
+;   4. Address Device, which builds an input context and gives the
+;      device an address on the bus
+;   5. GET_DESCRIPTOR on endpoint zero - the first words the DEVICE
+;      itself ever sends us
+;
+;   pmfc pi4UsbEnum.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o usbenum.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Num(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure Fail(*what)
+  UartWriteStr("!! ")
+  UartWriteStr(*what)
+  UartWriteStr(": ")
+  UartWriteStr(XhciErrorText())
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; The device descriptor, USB 2.0 section 9.6.1. Eighteen bytes, and the
+; layout is worth spelling out because every field below is read by
+; offset and a wrong offset produces a plausible number.
+;
+;   0  bLength            1
+;   1  bDescriptorType    1   = 1
+;   2  bcdUSB             2   BCD, so $0200 is USB 2.0
+;   4  bDeviceClass       1   0 means "look at the interface instead"
+;   5  bDeviceSubClass    1
+;   6  bDeviceProtocol    1
+;   7  bMaxPacketSize0    1
+;   8  idVendor           2
+;  10  idProduct          2
+;  12  bcdDevice          2
+;  14  iManufacturer      1   string indices, not strings
+;  15  iProduct           1
+;  16  iSerialNumber      1
+;  17  bNumConfigurations 1
+Procedure ShowDeviceDescriptor(*d)
+  Define lo.i
+  Define hi.i
+  Num("bLength          ", PeekA(*d + 0))
+  Row("bDescriptorType  ", PeekA(*d + 1), 2)
+  lo = PeekA(*d + 2)
+  hi = PeekA(*d + 3)
+  Row("bcdUSB           ", (hi << 8) | lo, 4)
+  Row("bDeviceClass     ", PeekA(*d + 4), 2)
+  Row("bDeviceSubClass  ", PeekA(*d + 5), 2)
+  Row("bDeviceProtocol  ", PeekA(*d + 6), 2)
+  Num("bMaxPacketSize0  ", PeekA(*d + 7))
+  lo = PeekA(*d + 8)
+  hi = PeekA(*d + 9)
+  Row("idVendor         ", (hi << 8) | lo, 4)
+  lo = PeekA(*d + 10)
+  hi = PeekA(*d + 11)
+  Row("idProduct        ", (hi << 8) | lo, 4)
+  Num("bNumConfigurations", PeekA(*d + 17))
+
+  ; A class of 0 in the DEVICE descriptor is the normal case and means
+  ; the interesting answer lives in the interface descriptor. Saying so
+  ; here saves the next reader from concluding the device is broken.
+  If PeekA(*d + 4) = 0
+    UartWriteStr("  device class 0 - the class is per-INTERFACE; a mass")
+    PrintNl()
+    UartWriteStr("  storage stick reports 08 there, not here.")
+    PrintNl()
+  ElseIf PeekA(*d + 4) = 9
+    UartWriteStr("  class 09 - this is a HUB, not a device")
+    PrintNl()
+  EndIf
+EndProcedure
+
+; One root port, all the way from reset to the device's own words.
+; Returns 1 if the device answered.
+;
+; SPLIT OUT SO IT CAN BE CALLED IN A LOOP. The first run of this probe
+; did port 1 only, found a VIA Labs hub, and stopped - which is a true
+; answer to a question nobody wanted the answer to. The stick is
+; somewhere on this bus and the only way to find out where is to ask
+; every port that says something is attached.
+Procedure.i DoPort(p.i)
+  Define speed.i
+  Define slot.i
+  Define n.i
+  Define cls.i
+  Dim desc.a[64]
+
+  PrintNl()
+  UartWriteStr("---- root port ")
+  PrintDec(p)
+  UartWriteStr(" ----")
+  PrintNl()
+  Row("PORTSC before reset ", XhciPortSc(p), 8)
+  UartDrain()
+
+  UartWriteStr("port reset ... ")
+  UartDrain()
+  If XhciPortReset(p) = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("reset")
+    ProcedureReturn 0
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+  Row("PORTSC after reset  ", XhciPortSc(p), 8)
+
+  speed = XhciPortSpeed(p)
+  UartWriteStr("  speed  ")
+  UartWriteStr(XhciSpeedText(speed))
+  PrintNl()
+  UartDrain()
+
+  UartWriteStr("enable slot ... ")
+  UartDrain()
+  slot = XhciEnableSlot()
+  If slot = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("enable slot")
+    ProcedureReturn 0
+  EndIf
+  UartWriteStr("ok, slot ")
+  PrintDec(slot)
+  PrintNl()
+  UartDrain()
+
+  UartWriteStr("address device ... ")
+  UartDrain()
+  If XhciAddressDevice(slot, p, speed) = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("address device")
+    ProcedureReturn 0
+  EndIf
+  UartWriteStr("ok, address ")
+  PrintDec(XhciDeviceAddress())
+  PrintNl()
+  UartDrain()
+
+  UartWriteStr("GET_DESCRIPTOR(device) ... ")
+  UartDrain()
+  n = XhciGetDeviceDescriptor(@desc[0], 18)
+  If n <= 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("get descriptor")
+    ProcedureReturn 0
+  EndIf
+  UartWriteStr("ok, ")
+  PrintDec(n)
+  UartWriteStr(" bytes")
+  PrintNl()
+  ShowDeviceDescriptor(@desc[0])
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define p.i
+  Define n.i
+  Define found.i
+
+  PrintNl()
+  UartWriteStr("=== USB enumeration on the real bus ===")
+  PrintNl()
+
+  If PcieInit() = 0
+    UartWriteStr("!! pcie: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("!! enumerate: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  Row("inbound DMA offset", PcieDmaOffset(), 16)
+  Row("inbound window    ", PcieDmaWindowSize(), 16)
+  UartDrain()
+
+  UartWriteStr("XhciInit ... ")
+  UartDrain()
+  If XhciInit() = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("init")
+    ProcedureReturn 2
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+
+  ; EVERY port that reports something attached, not just the first.
+  n = XhciMaxPorts()
+  found = 0
+  For p = 1 To n
+    If XhciPortConnected(p) <> 0
+      found = found + 1
+      DoPort(p)
+    EndIf
+  Next
+
+  PrintNl()
+  If found = 0
+    UartWriteStr("=== nothing attached to any root port ===")
+  Else
+    UartWriteStr("=== ")
+    PrintDec(found)
+    UartWriteStr(" occupied root port(s) walked ===")
+  EndIf
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

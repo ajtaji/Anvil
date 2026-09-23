@@ -1,0 +1,112 @@
+; pi4WatchdogProbe.pi4 - the PM watchdog, exercised so a harness can
+; watch every register write it makes.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_watchdog_check.py runs. It does NOT
+; call SafetyToFirmware(), because that one never returns by design -
+; the gate covers it separately by stopping the interpreter when the
+; fuse is lit.
+;
+; WHAT IS WORTH CHECKING HERE, and it is not "does it compile":
+;
+;   1. THE PASSWORD IS IN EVERY WRITE. The PM block silently ignores a
+;      write without $5A in the top byte. Ignored, not faulted - so a
+;      missing password produces a watchdog that never fires, which is
+;      indistinguishable from no watchdog at all until the day something
+;      hangs and nothing rescues it.
+;
+;   2. ARMING IS READ-MODIFY-WRITE ON PM_RSTC. The WRCFG field shares
+;      the register. A gate that only checked "FULL_RESET got set" would
+;      pass a version that clobbered every other bit.
+;
+;   3. THE CLAMP IS REAL AND VISIBLE. The counter is 20 bits at 65536
+;      ticks/second: ~15.999 s maximum. Asking for 60 must produce 16,
+;      not 60 truncated into whatever the low 20 bits happen to be.
+;
+;   4. STOP DOES NOT RESET. PM_RSTC_RESET is named for resetting the
+;      WATCHDOG, and writing it must leave the chip alone.
+;
+;   pmfc pi4WatchdogProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o wdog.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  PrintNl()
+  UartWriteStr("=== PM watchdog ===")
+  PrintNl()
+
+  ; --- the tick conversion, before any register is touched -----------
+  ; Pure arithmetic. If this is wrong nothing below means anything, and
+  ; getting it wrong is easy: the driver writes it as (ms << 16) / 1000,
+  ; which is a tick of 1/65536 s and NOT 1/1000 s.
+  UartWriteStr("ticks for n seconds")
+  PrintNl()
+  Line("1 s          ", SafetyWatchdogTicks(1))
+  Line("2 s          ", SafetyWatchdogTicks(2))
+  Line("15 s         ", SafetyWatchdogTicks(15))
+  Line("16 s CLAMPED ", SafetyWatchdogTicks(16))
+  Line("60 s CLAMPED ", SafetyWatchdogTicks(60))
+  Line("0 s -> expire", SafetyWatchdogTicks(0))
+  PrintNl()
+
+  ; --- state before anything is armed --------------------------------
+  Line("running (want 0)", SafetyWatchdogRunning())
+  Line("armed   (want 0)", SafetyArmed())
+
+  ; --- arm ------------------------------------------------------------
+  UartWriteStr("SafetyWatchdogStart(2) -> ")
+  PrintDec(SafetyWatchdogStart(2))
+  UartWriteStr(" s")
+  PrintNl()
+  Line("running (want 1)", SafetyWatchdogRunning())
+  Line("armed   (want 1)", SafetyArmed())
+
+  ; --- pet --------------------------------------------------------------
+  Line("pet     (want 1)", SafetyWatchdogPet())
+
+  ; --- stop -------------------------------------------------------------
+  SafetyWatchdogStop()
+  Line("running (want 0)", SafetyWatchdogRunning())
+
+  ; --- petting a stopped watchdog must NOT restart it -------------------
+  ; The one behaviour here that is a judgement call rather than a
+  ; transcription, so it is the one most worth pinning down.
+  Line("pet stopped (want 0)", SafetyWatchdogPet())
+
+  ; --- a clamped arm, so the harness sees MAX_TICKS on the wire ---------
+  UartWriteStr("SafetyWatchdogStart(60) -> ")
+  PrintDec(SafetyWatchdogStart(60))
+  UartWriteStr(" s")
+  PrintNl()
+  SafetyWatchdogStop()
+
+  PrintNl()
+  UartWriteStr("=== done, nothing reset ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

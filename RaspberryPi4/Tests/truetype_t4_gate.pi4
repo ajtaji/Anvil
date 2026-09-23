@@ -1,0 +1,58 @@
+; T4 emitted raster gate; the host supplies a tiny checksummed sfnt in memory.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster_neon.pbi"
+
+#T4_META=$0F000000 : #T4_BASE=$10000000 : #T4_MAGIC=$54543452
+#T4_OUT=$0F010000 : #T4_COVER=$0F020000 : #T4_COVER_NEON=$0F030000
+
+Procedure.i Main()
+  Protected bytes.i,glyph.i,height.i,out.i,coverage.i,result.i,n.i,scalarBytes.i
+  ; This is a returning emitted entry point, so it cannot rely on the
+  ; module's source-time initializer for the optional callback slot.
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  If PeekL(#T4_META)<>#T4_MAGIC : ProcedureReturn 0 : EndIf
+  bytes=PeekL(#T4_META+4)
+  If AnvilTrueTypeOpen(#T4_BASE,bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeOutlinesOpen()=0 : ProcedureReturn 1 : EndIf
+  If PeekL(#T4_META+8)=1
+    glyph=PeekL(#T4_META+12) : height=PeekL(#T4_META+16)
+    result=AnvilTrueTypeRasterizeGlyph(glyph,height,#T4_COVER,4096,#T4_OUT,#T4_OUT+8,#T4_OUT+16,#T4_OUT+24,#T4_OUT+32,#T4_OUT+40)
+    If result=0 : ProcedureReturn 2 : EndIf
+    scalarBytes=PeekI(#T4_OUT)*PeekI(#T4_OUT+8)
+    If AnvilTrueTypeRasterAlphaHandlerSet(@AnvilTrueTypeCoverageCountsToAlphaNeon)=0 : ProcedureReturn 3 : EndIf
+    result=AnvilTrueTypeRasterizeGlyph(glyph,height,#T4_COVER_NEON,4096,#T4_OUT+48,#T4_OUT+56,#T4_OUT+64,#T4_OUT+72,#T4_OUT+80,#T4_OUT+88)
+    AnvilTrueTypeRasterAlphaHandlerSet(0)
+    If result=0 : ProcedureReturn 4 : EndIf
+    If PeekI(#T4_OUT)<>PeekI(#T4_OUT+48) Or PeekI(#T4_OUT+8)<>PeekI(#T4_OUT+56) Or PeekI(#T4_OUT+16)<>PeekI(#T4_OUT+64) Or PeekI(#T4_OUT+24)<>PeekI(#T4_OUT+72) Or PeekI(#T4_OUT+32)<>PeekI(#T4_OUT+80) Or PeekI(#T4_OUT+40)<>PeekI(#T4_OUT+88) : ProcedureReturn 5 : EndIf
+    If scalarBytes<>PeekI(#T4_OUT+48)*PeekI(#T4_OUT+56) Or scalarBytes>4096 : ProcedureReturn 6 : EndIf
+    For n=0 To scalarBytes-1
+      If (PeekA(#T4_COVER+n)&$FF)<>(PeekA(#T4_COVER_NEON+n)&$FF) : ProcedureReturn 7 : EndIf
+    Next
+    ProcedureReturn 0
+  EndIf
+  AnvilTrueTypeRasterCountReset()
+  For glyph=1 To 4
+    height=16 : If glyph=3 : height=64 : EndIf
+    out=#T4_OUT+(glyph-1)*48 : coverage=#T4_COVER+(glyph-1)*4096
+    result=AnvilTrueTypeRasterizeGlyph(glyph,height,coverage,4096,out,out+8,out+16,out+24,out+32,out+40)
+    If result=0 : ProcedureReturn 10+glyph : EndIf
+  Next
+  If AnvilTrueTypeRasterCount()<>4 Or AnvilTrueTypeRasterError()<>#ANVIL_TTR_E_NONE : ProcedureReturn 20 : EndIf
+  ; Exercise the actual-glyph dispatch on the synthetic start-on/end-off
+  ; contour, not only the isolated 0..16 conversion kernel.
+  glyph=2 : height=16
+  If AnvilTrueTypeRasterizeGlyph(glyph,height,#T4_COVER+16384,4096,#T4_OUT+256,#T4_OUT+264,#T4_OUT+272,#T4_OUT+280,#T4_OUT+288,#T4_OUT+296)=0 : ProcedureReturn 21 : EndIf
+  scalarBytes=PeekI(#T4_OUT+256)*PeekI(#T4_OUT+264)
+  If AnvilTrueTypeRasterAlphaHandlerSet(@AnvilTrueTypeCoverageCountsToAlphaNeon)=0 : ProcedureReturn 22 : EndIf
+  result=AnvilTrueTypeRasterizeGlyph(glyph,height,#T4_COVER_NEON,4096,#T4_OUT+304,#T4_OUT+312,#T4_OUT+320,#T4_OUT+328,#T4_OUT+336,#T4_OUT+344)
+  AnvilTrueTypeRasterAlphaHandlerSet(0)
+  If result=0 : ProcedureReturn 23 : EndIf
+  If PeekI(#T4_OUT+256)<>PeekI(#T4_OUT+304) Or PeekI(#T4_OUT+264)<>PeekI(#T4_OUT+312) Or PeekI(#T4_OUT+272)<>PeekI(#T4_OUT+320) Or PeekI(#T4_OUT+280)<>PeekI(#T4_OUT+328) Or PeekI(#T4_OUT+288)<>PeekI(#T4_OUT+336) Or PeekI(#T4_OUT+296)<>PeekI(#T4_OUT+344) : ProcedureReturn 24 : EndIf
+  If scalarBytes<>PeekI(#T4_OUT+304)*PeekI(#T4_OUT+312) Or scalarBytes>4096 : ProcedureReturn 25 : EndIf
+  For n=0 To scalarBytes-1
+    If (PeekA(#T4_COVER+16384+n)&$FF)<>(PeekA(#T4_COVER_NEON+n)&$FF) : ProcedureReturn 26 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure

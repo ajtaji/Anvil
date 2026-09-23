@@ -1,0 +1,667 @@
+; Executable gate for the optional CYW43 receive-readiness telemetry path.
+; Scripted F1/core registers, mailbox causes, a function-2 FIFO and the
+; operation callback drive the real production capture and receive code.
+; Main returns the first failed assertion number, or zero.
+
+Global Dim gate_fifo.a[8192]
+Global gate_fifoLen.i
+Global gate_fifoPos.i
+Global gate_f2Reads.i
+Global gate_f2Writes.i
+Global gate_coreBase.i
+Global gate_statusFirst.i
+Global gate_statusFresh.i
+Global gate_statusReads.i
+Global gate_mail.i
+Global gate_statusWrites.i
+Global gate_statusWriteLast.i
+Global gate_mailAcks.i
+Global gate_failStatusRead.i
+Global gate_failStatusWrite.i
+Global gate_failMailRead.i
+Global gate_failMailAck.i
+Global gate_failF2Read.i
+Global gate_irqArm.i
+Global gate_irqPending.i
+Global gate_irqPendingAfter.i
+Global gate_irqQuiesce.i
+Global gate_irqRearm.i
+Global gate_irqDisable.i
+Global gate_irqArmCalls.i
+Global gate_irqPendingCalls.i
+Global gate_irqQuiesceCalls.i
+Global gate_irqRearmCalls.i
+Global gate_irqDisableCalls.i
+Global gate_irqBusySeen.i
+Global gate_baseIoCalls.i
+
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+
+Procedure GateClear(*p, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    PokeB(*p + i, 0)
+  Next
+EndProcedure
+
+Procedure GatePut16(*p, v.i)
+  PokeB(*p, v & $FF)
+  PokeB(*p + 1, (v >> 8) & $FF)
+EndProcedure
+
+Procedure GatePut32(*p, v.i)
+  PokeB(*p, v & $FF)
+  PokeB(*p + 1, (v >> 8) & $FF)
+  PokeB(*p + 2, (v >> 16) & $FF)
+  PokeB(*p + 3, (v >> 24) & $FF)
+EndProcedure
+
+Procedure GateHeader(*p, n.i, seq.i, chan.i, window.i)
+  GateClear(*p, 12)
+  GatePut16(*p, n)
+  GatePut16(*p + 2, (~n) & $FFFF)
+  PokeB(*p + #CYW43_SDPCM_OFF_SEQ, seq & $FF)
+  PokeB(*p + #CYW43_SDPCM_OFF_CHAN, chan & $FF)
+  PokeB(*p + #CYW43_SDPCM_OFF_DOFF, #CYW43_SDPCM_HDRLEN)
+  PokeB(*p + #CYW43_SDPCM_OFF_WIN, window & $FF)
+EndProcedure
+
+Procedure.i GateReserve(n.i)
+  Define p.i
+  p = @gate_fifo[0] + gate_fifoLen
+  GateClear(p, n)
+  gate_fifoLen = gate_fifoLen + n
+  ProcedureReturn p
+EndProcedure
+
+Procedure GateAppendEmpty()
+  GateReserve(64)
+EndProcedure
+
+Procedure GateAppendData(seq.i, marker.i, window.i)
+  Define *p
+  *p = GateReserve(80)
+  GateHeader(*p, 80, seq, #CYW43_CHAN_DATA, window)
+  PokeB(*p + 15, 0)
+  PokeB(*p + 16, marker)
+  PokeB(*p + 79, marker + 1)
+EndProcedure
+
+Procedure GateAppendControl(seq.i, id.i, window.i)
+  Define *p
+  *p = GateReserve(64)
+  GateHeader(*p, 28, seq, #CYW43_CHAN_CONTROL, window)
+  GatePut32(*p + 12 + #CYW43_BCDC_OFF_FLAGS, id << #CYW43_BCDC_ID_SHIFT)
+EndProcedure
+
+Procedure GateFifoReset()
+  gate_fifoLen = 0
+  gate_fifoPos = 0
+  gate_f2Reads = 0
+  gate_f2Writes = 0
+EndProcedure
+
+Procedure.i GateRb(fn.i, addr.i)
+  gate_baseIoCalls = gate_baseIoCalls + 1
+  If fn = #CYW43_FN_BACKPLANE
+    If addr = #CYW43_RFRAMEBCHI Or addr = #CYW43_RFRAMEBCLO
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GateWb(fn.i, addr.i, v.i)
+  gate_baseIoCalls = gate_baseIoCalls + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateRd(fn.i, addr.i, *dst, n.i, incr.i)
+  Define i.i
+  Define off.i
+  Define v.i
+
+  gate_baseIoCalls = gate_baseIoCalls + 1
+  If fn = #CYW43_FN_WLAN
+    If gate_failF2Read <> 0
+      gate_failF2Read = gate_failF2Read - 1
+      ProcedureReturn 0
+    EndIf
+    If incr <> 0 Or gate_fifoPos + n > gate_fifoLen
+      ProcedureReturn 0
+    EndIf
+    For i = 0 To n - 1
+      PokeB(*dst + i, gate_fifo[gate_fifoPos + i])
+    Next
+    gate_fifoPos = gate_fifoPos + n
+    gate_f2Reads = gate_f2Reads + 1
+    ProcedureReturn 1
+  EndIf
+
+  If fn = #CYW43_FN_BACKPLANE And n = 4 And incr = 1
+    off = addr & #CYW43_SB_OFT_ADDR_MASK
+    If off = ((gate_coreBase + #CYW43_SD_INTSTATUS_OFF) & #CYW43_SB_OFT_ADDR_MASK)
+      gate_statusReads = gate_statusReads + 1
+      If gate_failStatusRead = gate_statusReads
+        ProcedureReturn 0
+      EndIf
+      If gate_statusReads = 1
+        v = gate_statusFirst
+      Else
+        v = gate_statusFresh
+      EndIf
+      GatePut32(*dst, v)
+      ProcedureReturn 1
+    EndIf
+    If off = ((gate_coreBase + #CYW43_SD_TOHOSTMBDATA) & #CYW43_SB_OFT_ADDR_MASK)
+      If gate_failMailRead <> 0
+        gate_failMailRead = gate_failMailRead - 1
+        ProcedureReturn 0
+      EndIf
+      GatePut32(*dst, gate_mail)
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  GatePut32(*dst, 0)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWr(fn.i, addr.i, *src, n.i, incr.i)
+  Define off.i
+  Define v.i
+  gate_baseIoCalls = gate_baseIoCalls + 1
+  If fn = #CYW43_FN_WLAN
+    gate_f2Writes = gate_f2Writes + 1
+    ProcedureReturn 1
+  EndIf
+  If fn = #CYW43_FN_BACKPLANE And n = 4 And incr = 1
+    off = addr & #CYW43_SB_OFT_ADDR_MASK
+    v = PeekN(*src)
+    If off = ((gate_coreBase + #CYW43_SD_INTSTATUS_OFF) & #CYW43_SB_OFT_ADDR_MASK)
+      If gate_failStatusWrite <> 0
+        gate_failStatusWrite = gate_failStatusWrite - 1
+        ProcedureReturn 0
+      EndIf
+      gate_statusWrites = gate_statusWrites + 1
+      gate_statusWriteLast = v
+      ProcedureReturn 1
+    EndIf
+    If off = ((gate_coreBase + #CYW43_SD_TOSBMAILBOX) & #CYW43_SB_OFT_ADDR_MASK)
+      If gate_failMailAck <> 0
+        gate_failMailAck = gate_failMailAck - 1
+        ProcedureReturn 0
+      EndIf
+      If v = #CYW43_SMB_INT_ACK
+        gate_mailAcks = gate_mailAcks + 1
+      EndIf
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The callback records whether the observer's re-entry guard is armed while
+; the callback runs. It does NOT observe from in here. A step written
+; 'cyw43_rxIrqOp(...)' is a call through a variable, so it is a call to every
+; procedure the variable can hold, and an observation made from the callback
+; would be a loop back into the observer that the backend refuses outright -
+; parameters live in globals, not in a per-call frame, so a second entry
+; would overwrite the first one's arguments. The guard is proven from both
+; ends instead: this counter shows the flag is armed for every operation the
+; observer issues, and the main body arms the flag by hand and shows an
+; observation made under it is refused without reaching the device at all.
+Procedure.i GateIrqOp(op.i)
+  If cyw43_rxIrqBusy <> 0
+    gate_irqBusySeen = gate_irqBusySeen + 1
+  EndIf
+  Select op
+    Case #CYW43_RXIRQ_ARM
+      gate_irqArmCalls = gate_irqArmCalls + 1
+      ProcedureReturn gate_irqArm
+    Case #CYW43_RXIRQ_PENDING
+      gate_irqPendingCalls = gate_irqPendingCalls + 1
+      If gate_irqPendingCalls > 1 : ProcedureReturn gate_irqPendingAfter : EndIf
+      ProcedureReturn gate_irqPending
+    Case #CYW43_RXIRQ_QUIESCE
+      gate_irqQuiesceCalls = gate_irqQuiesceCalls + 1
+      ProcedureReturn gate_irqQuiesce
+    Case #CYW43_RXIRQ_REARM
+      gate_irqRearmCalls = gate_irqRearmCalls + 1
+      ProcedureReturn gate_irqRearm
+    Case #CYW43_RXIRQ_DISABLE
+      gate_irqDisableCalls = gate_irqDisableCalls + 1
+      ProcedureReturn gate_irqDisable
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure GateIrqScriptReset()
+  gate_statusFirst = 0
+  gate_statusFresh = 0
+  gate_statusReads = 0
+  gate_mail = 0
+  gate_statusWrites = 0
+  gate_statusWriteLast = 0
+  gate_mailAcks = 0
+  gate_failStatusRead = 0
+  gate_failStatusWrite = 0
+  gate_failMailRead = 0
+  gate_failMailAck = 0
+  gate_failF2Read = 0
+  gate_irqArm = 1
+  gate_irqPending = 0
+  gate_irqPendingAfter = 0
+  gate_irqQuiesce = 1
+  gate_irqRearm = 0
+  gate_irqDisable = 1
+  gate_irqBusySeen = 0
+  gate_irqArmCalls = 0
+  gate_irqPendingCalls = 0
+  gate_irqQuiesceCalls = 0
+  gate_irqRearmCalls = 0
+  gate_irqDisableCalls = 0
+EndProcedure
+
+Procedure GateTelemetryCountersReset()
+  cyw43_rxIrqPending = 0
+  cyw43_rxIrqFault = 0
+  cyw43_rxIrqRestoreFailed = 0
+  cyw43_rxIrqObserveCalls = 0
+  cyw43_rxIrqNested = 0
+  cyw43_rxIrqRawReady = 0
+  cyw43_rxIrqCaptures = 0
+  cyw43_rxIrqZeroCause = 0
+  cyw43_rxIrqFrameInd = 0
+  cyw43_rxIrqHostInt = 0
+  cyw43_rxIrqFcChange = 0
+  cyw43_rxIrqFcState = 0
+  cyw43_rxIrqChipActive = 0
+  cyw43_rxIrqMailbox = 0
+  cyw43_rxIrqMailboxLast = 0
+  cyw43_rxIrqNakHandled = 0
+  cyw43_rxIrqDevReady = 0
+  cyw43_rxIrqFwReady = 0
+  cyw43_rxIrqFwHalt = 0
+  cyw43_rxIrqVersion = -1
+  cyw43_rxIrqRearmReady = 0
+  cyw43_rxIrqFirstPending = 0
+  cyw43_rxIrqFirstNoPending = 0
+  cyw43_rxIrqNonemptyPending = 0
+  cyw43_rxIrqNonemptyNoPending = 0
+  cyw43_rxIrqEmptyPending = 0
+  cyw43_rxIrqEmptyNoPending = 0
+  cyw43_rxIrqFirstInherited=0 : cyw43_rxIrqFirstNew=0
+  cyw43_rxIrqQuietData=0 : cyw43_rxIrqQuietControl=0 : cyw43_rxIrqQuietEvent=0 : cyw43_rxIrqQuietGlom=0
+  cyw43_rxIrqQuietUnknown=0 : cyw43_rxIrqQuietMalformed=0 : cyw43_rxIrqQuietPrevNext=0
+  cyw43_rxIrqQuietSeqOk=0 : cyw43_rxIrqQuietSeqGap=0
+  cyw43_rxIrqQuietPostPending=0 : cyw43_rxIrqQuietPostQuiet=0 : cyw43_rxIrqQuietPostFail=0 : cyw43_rxIrqPrevNext=0
+EndProcedure
+
+Procedure GateReenable()
+  If Cyw43RxIrqRestorePending() <> 0
+    gate_irqDisable = 1
+    Cyw43RxIrqTelemetry(0)
+  EndIf
+  gate_irqArm = 1
+  Cyw43RxIrqTelemetry(1)
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define reads.i
+  Define observes.i
+  Define restores.i
+  Define ioCalls.i
+  Define ops.i
+  Define nested.i
+  Define *p
+
+  gate_coreBase = #CYW43_ENUM_BASE + $2000
+  If Cyw43SetIo(@GateRb, @GateWb, @GateRd, @GateWr) = 0 : ProcedureReturn 1 : EndIf
+  If Cyw43SetBlockIo(@GateRd, @GateWr) = 0 : ProcedureReturn 1 : EndIf
+  cyw43_f2ByteMax = 512
+  cyw43_f2Blk = 512
+  cyw43_hz = 54000000
+  cyw43_attached = 1
+  cyw43_ncores = 1
+  cyw43_coreId[0] = #CYW43_CORE_SDIO_DEV
+  cyw43_coreBase[0] = gate_coreBase
+  Cyw43TransportReset()
+  GateIrqScriptReset()
+  GateTelemetryCountersReset()
+
+  ; Default-off and unregistered: the legacy empty FIRSTREAD still happens.
+  GateFifoReset()
+  GateAppendEmpty()
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> 1 : ProcedureReturn 2 : EndIf
+  If gate_irqPendingCalls <> 0 Or Cyw43RxIrqObserveCalls() <> 0 : ProcedureReturn 3 : EndIf
+
+  If Cyw43SetRxIrqIo(@GateIrqOp) = 0 : ProcedureReturn 4 : EndIf
+  If Cyw43RxIrqTelemetry(1) = 0 Or gate_irqArmCalls <> 1 Or Cyw43RxIrqActive() = 0 : ProcedureReturn 5 : EndIf
+  If Cyw43SetRxIrqIo(0) <> 0 : ProcedureReturn 6 : EndIf
+
+  ; Quiet readiness never suppresses the legacy read.
+  GateFifoReset()
+  GateAppendEmpty()
+  gate_irqPending = 0
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> 1 : ProcedureReturn 7 : EndIf
+  If Cyw43RxIrqFirstNoPending() <> 1 Or Cyw43RxIrqEmptyNoPending() <> 1 : ProcedureReturn 8 : EndIf
+
+  ; One FRAME_IND authorizes a burst in telemetry, but scheduling remains one
+  ; real read per call and the all-zero header is the only burst closure.
+  GateFifoReset()
+  GateIrqScriptReset()
+  gate_irqPending = 1
+  gate_statusFirst = #CYW43_I_HMB_FRAME_IND
+  GateAppendData(0, $A0, 9)
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $A0 : ProcedureReturn 9 : EndIf
+  If gate_f2Reads <> 2 Or gate_statusWrites <> 1 Or gate_statusWriteLast <> #CYW43_I_HMB_FRAME_IND : ProcedureReturn 10 : EndIf
+  gate_irqPending = 0
+  GateAppendEmpty()
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> 3 : ProcedureReturn 11 : EndIf
+  If Cyw43RxIrqNonemptyPending() <> 1 Or Cyw43RxIrqEmptyPending() <> 1 : ProcedureReturn 12 : EndIf
+  If Cyw43RxIrqFirstNew()<>1 Or Cyw43RxIrqFirstInherited()<>1 : ProcedureReturn 95 : EndIf
+  If (cyw43_rxIrqPending & #CYW43_I_HMB_FRAME_IND) <> 0 : ProcedureReturn 13 : EndIf
+
+  ; A nonempty frame without an observed indication is retained as evidence,
+  ; not rejected. This is the eventual enforcement admission criterion.
+  cyw43_rxSeqSeen=1 : cyw43_rxSeqExpect=1
+  GateFifoReset()
+  GateIrqScriptReset()
+  GateAppendData(1, $B0, 10)
+  If Cyw43Receive(0) <> 64 Or gate_f2Reads <> 2 : ProcedureReturn 14 : EndIf
+  If Cyw43RxIrqNonemptyNoPending() <> 1 : ProcedureReturn 15 : EndIf
+  If Cyw43RxIrqQuietData()<>1 Or Cyw43RxIrqQuietSeqOk()<>1 Or Cyw43RxIrqQuietPostQuiet()<>1 : ProcedureReturn 90 : EndIf
+
+  ; A raw host bit appearing only after the F2 result is correlation evidence,
+  ; not a cause claim, and still adds no second F2 read.
+  GateFifoReset() : GateIrqScriptReset() : gate_irqPendingAfter=1
+  GateAppendData(2,$B1,10)
+  If Cyw43Receive(0)<>64 Or gate_f2Reads<>2 : ProcedureReturn 91 : EndIf
+  If Cyw43RxIrqQuietPostPending()<>1 Or Cyw43RxIrqQuietData()<>2 : ProcedureReturn 92 : EndIf
+
+  ; Per-call scratch cannot leak the preceding quiet classification into a
+  ; queued frame, a pending wire frame, or a call after telemetry is disabled.
+  ioCalls=Cyw43RxIrqQuietData()
+  If cyw43_RxqPush(@cyw43_rx[0],cyw43_rxFrameLen,1,1)=0 : ProcedureReturn 97 : EndIf
+  Cyw43Receive(0)
+  GateFifoReset() : GateIrqScriptReset() : gate_irqPending=1 : gate_statusFirst=#CYW43_I_HMB_FRAME_IND : GateAppendData(3,$B3,10) : Cyw43Receive(0)
+  If Cyw43RxIrqQuietData()<>ioCalls : ProcedureReturn 98 : EndIf
+  If Cyw43RxIrqTelemetry(0)=0 : ProcedureReturn 99 : EndIf
+  GateFifoReset() : GateIrqScriptReset() : GateAppendData(4,$B4,10) : Cyw43Receive(0)
+  If Cyw43RxIrqQuietData()<>ioCalls : ProcedureReturn 100 : EndIf
+  If Cyw43RxIrqTelemetry(1)=0 : ProcedureReturn 101 : EndIf
+
+  ioCalls=Cyw43RxIrqQuietPrevNext() : restores=Cyw43RxIrqQuietSeqGap() : cyw43_rxIrqPrevNext=1
+  GateFifoReset() : GateIrqScriptReset() : GateAppendData(9,$B2,10)
+  Cyw43Receive(0)
+  If Cyw43RxIrqQuietPrevNext()<>ioCalls+1 : ProcedureReturn 93 : EndIf
+  If Cyw43RxIrqQuietSeqGap()<>restores+1 : ProcedureReturn 96 : EndIf
+  GateFifoReset() : GateIrqScriptReset() : GateAppendControl(10,$2222,10) : Cyw43Receive(0)
+  GateFifoReset() : GateIrqScriptReset() : *p=GateReserve(64) : GateHeader(*p,28,11,#CYW43_CHAN_EVENT,10) : Cyw43Receive(0)
+  GateFifoReset() : GateIrqScriptReset() : *p=GateReserve(64) : GateHeader(*p,28,12,#CYW43_CHAN_GLOM,10) : Cyw43Receive(0)
+  GateFifoReset() : GateIrqScriptReset() : *p=GateReserve(64) : GateHeader(*p,28,13,7,10) : Cyw43Receive(0)
+  GateFifoReset() : GateIrqScriptReset() : *p=GateReserve(64) : GateHeader(*p,28,14,#CYW43_CHAN_DATA,10) : PokeB(*p+2,0) : Cyw43Receive(0)
+  If Cyw43RxIrqQuietControl()<>1 Or Cyw43RxIrqQuietEvent()<>1 Or Cyw43RxIrqQuietGlom()<>1 Or Cyw43RxIrqQuietUnknown()<>1 Or Cyw43RxIrqQuietMalformed()<>1 : ProcedureReturn 94 : EndIf
+  ioCalls=Cyw43RxIrqQuietMalformed() : cyw43_rxIrqPrevNext=0
+  GateFifoReset() : GateIrqScriptReset() : *p=GateReserve(64) : GateHeader(*p,28,15,#CYW43_CHAN_DATA,10) : PokeB(*p+#CYW43_SDPCM_OFF_DOFF,63) : Cyw43Receive(0)
+  If Cyw43RxIrqQuietMalformed()<>ioCalls+1 Or cyw43_rxIrqPrevNext<>0 : ProcedureReturn 102 : EndIf
+
+  ; FC_CHANGE is reread after clear. HOST_INT is read then ACKed; NAKHANDLED
+  ; becomes a software FRAME_IND and readiness/version/halt remain distinct.
+  GateFifoReset()
+  GateIrqScriptReset()
+  gate_irqPending = 1
+  gate_statusFirst = #CYW43_I_HMB_FC_CHANGE | #CYW43_I_HMB_HOST_INT
+  gate_statusFresh = #CYW43_I_HMB_FC_STATE
+  gate_mail = #CYW43_HMB_NAKHANDLED | #CYW43_HMB_DEVREADY | #CYW43_HMB_FWREADY | #CYW43_HMB_FWHALT | (4 << 16)
+  GateAppendEmpty()
+  If Cyw43Receive(0) <> 0 : ProcedureReturn 16 : EndIf
+  If gate_statusReads <> 2 Or gate_statusWrites <> 2 Or gate_mailAcks <> 1 : ProcedureReturn 17 : EndIf
+  If Cyw43RxIrqFlowChanges() <> 1 Or Cyw43RxIrqFlowState() <> 1 : ProcedureReturn 18 : EndIf
+  If Cyw43RxIrqHostInterrupts() <> 1 Or Cyw43RxIrqMailboxCount() <> 1 : ProcedureReturn 19 : EndIf
+  If Cyw43RxIrqNakHandled() <> 1 Or Cyw43RxIrqDevReady() <> 1 Or Cyw43RxIrqFwReady() <> 1 : ProcedureReturn 20 : EndIf
+  If Cyw43RxIrqFwHalt() <> 1 Or Cyw43RxIrqVersion() <> 4 : ProcedureReturn 21 : EndIf
+  If (cyw43_rxIrqPending & #CYW43_I_HMB_FRAME_IND) <> 0 : ProcedureReturn 22 : EndIf
+
+  ; A cause crossing clear/rearm is recorded immediately and captured on the
+  ; next shared pass; there is no recursive read inside rearm.
+  GateFifoReset()
+  GateIrqScriptReset()
+  gate_irqPending = 1
+  gate_irqRearm = 1
+  gate_statusFirst = #CYW43_I_HMB_FRAME_IND
+  GateAppendEmpty()
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqRearmReady() <> 1 : ProcedureReturn 23 : EndIf
+  If gate_irqRearmCalls <> 1 Or gate_f2Reads <> 1 : ProcedureReturn 24 : EndIf
+
+  ; A nested observation is refused without touching the device state, and
+  ; the outer observation still completes once. The callback cannot make the
+  ; nested call itself - see the note above GateIrqOp - so the guard is shown
+  ; from both ends: every operation the outer observation issues runs with the
+  ; flag armed, and an observation made under a hand-armed flag is counted as
+  ; nested, returns zero and issues no operation at all, while the same call
+  ; with the flag down reaches the device again.
+  GateFifoReset()
+  GateIrqScriptReset()
+  gate_irqPending = 1
+  gate_statusFirst = #CYW43_I_HMB_FRAME_IND
+  GateAppendEmpty()
+  If Cyw43Receive(0) <> 0 : ProcedureReturn 25 : EndIf
+  If gate_irqQuiesceCalls <> 1 Or gate_irqRearmCalls <> 1 : ProcedureReturn 26 : EndIf
+  If gate_irqArmCalls <> 0 Or gate_irqDisableCalls <> 0 : ProcedureReturn 103 : EndIf
+  ops = gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls
+  If gate_irqBusySeen <> ops : ProcedureReturn 104 : EndIf
+  nested = Cyw43RxIrqNestedCalls()
+  observes = Cyw43RxIrqObserveCalls()
+  cyw43_rxIrqBusy = 1
+  If cyw43_RxIrqObserve() <> 0 : ProcedureReturn 105 : EndIf
+  cyw43_rxIrqBusy = 0
+  If Cyw43RxIrqNestedCalls() <> nested + 1 : ProcedureReturn 106 : EndIf
+  If Cyw43RxIrqObserveCalls() <> observes + 1 : ProcedureReturn 107 : EndIf
+  If gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls <> ops : ProcedureReturn 108 : EndIf
+  If gate_irqArmCalls <> 0 Or gate_irqDisableCalls <> 0 : ProcedureReturn 109 : EndIf
+  If cyw43_RxIrqObserve() <> 0 : ProcedureReturn 110 : EndIf
+  If gate_irqPendingCalls + gate_irqQuiesceCalls + gate_irqRearmCalls <> ops + 1 : ProcedureReturn 111 : EndIf
+
+  ; A retained frame is software-ready. It neither probes readiness nor reads
+  ; F2, and its already-accounted sequence/window metadata stays authoritative.
+  GateFifoReset()
+  GateIrqScriptReset()
+  GateAppendData(2, $C0, 11)
+  If cyw43_RxFrame(-1, 0) <> 5 : ProcedureReturn 27 : EndIf
+  If cyw43_RxqPush(@cyw43_rx[0], cyw43_rxFrameLen, 1, 1) = 0 : ProcedureReturn 28 : EndIf
+  reads = gate_f2Reads
+  observes = Cyw43RxIrqObserveCalls()
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $C0 : ProcedureReturn 29 : EndIf
+  If gate_f2Reads <> reads Or Cyw43RxIrqObserveCalls() <> observes : ProcedureReturn 30 : EndIf
+
+  ; A latched receive-abort fault returns before both readiness and F2.
+  cyw43_rxAbortActive = 1
+  cyw43_rxAbortFault = 1
+  reads = gate_f2Reads
+  observes = Cyw43RxIrqObserveCalls()
+  If Cyw43Receive(0) <> 0 : ProcedureReturn 31 : EndIf
+  If gate_f2Reads <> reads Or Cyw43RxIrqObserveCalls() <> observes : ProcedureReturn 32 : EndIf
+  cyw43_rxAbortActive = 0
+  cyw43_rxAbortFault = 0
+
+  ; Data ahead of a matching control reply is queued, the same request id
+  ; completes, and no telemetry branch consumes or resends either frame.
+  GateFifoReset()
+  GateIrqScriptReset()
+  GateAppendData(3, $D0, 12)
+  GateAppendControl(4, $1234, 13)
+  r = cyw43_Poll($1234, 0, 1, #CYW43_POLL_CONTROL)
+  If r <> #CYW43_IO_OK Or Cyw43RxQueueDepth() <> 1 : ProcedureReturn 33 : EndIf
+  reads = gate_f2Reads
+  If Cyw43Receive(0) <> 64 Or PeekA(Cyw43ReceivePtr()) <> $D0 : ProcedureReturn 34 : EndIf
+  If gate_f2Reads <> reads Or Cyw43RxQueueDepth() <> 0 : ProcedureReturn 35 : EndIf
+
+  ; Every capture failure disables telemetry and still executes the legacy F2
+  ; read from the same call. The optional observer has its own fault channel;
+  ; it must preserve the transport error which preceded it. Re-enable between
+  ; rows to give each fault an independent callback lifetime.
+  GateFifoReset() : GateIrqScriptReset() : GateAppendEmpty()
+  gate_irqPending = -1 : reads = gate_f2Reads : cyw43_err = $5A
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> reads + 1 : ProcedureReturn 36 : EndIf
+  If Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_PENDING Or Cyw43LastError() <> $5A : ProcedureReturn 37 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_irqQuiesce = 0 : reads = gate_f2Reads : cyw43_err = $5B
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> reads + 1 : ProcedureReturn 38 : EndIf
+  If Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_QUIESCE Or Cyw43LastError() <> $5B : ProcedureReturn 39 : EndIf
+
+  GateFifoReset() : GateIrqScriptReset() : GateAppendEmpty()
+  GateReenable() : gate_irqPending = 1 : gate_failStatusRead = 1 : reads = gate_f2Reads : cyw43_err = $5C
+  If Cyw43Receive(0) <> 0 Or gate_f2Reads <> reads + 1 : ProcedureReturn 40 : EndIf
+  If Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_STATUS_RD Or Cyw43LastError() <> $5C : ProcedureReturn 41 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_statusFirst = #CYW43_I_HMB_FRAME_IND : gate_failStatusWrite = 1 : cyw43_err = $5D
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_STATUS_WR Or Cyw43LastError() <> $5D : ProcedureReturn 42 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_statusFirst = #CYW43_I_HMB_FC_CHANGE : gate_failStatusRead = 2 : cyw43_err = $5E
+  ; The first status read succeeds; the FC_CHANGE reread fails.
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_FC_RD Or Cyw43LastError() <> $5E : ProcedureReturn 43 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_statusFirst = #CYW43_I_HMB_HOST_INT : gate_failMailRead = 1 : cyw43_err = $5F
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_MAIL_RD Or Cyw43LastError() <> $5F : ProcedureReturn 44 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_statusFirst = #CYW43_I_HMB_HOST_INT : gate_failMailAck = 1 : cyw43_err = $60
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_MAIL_ACK Or Cyw43LastError() <> $60 : ProcedureReturn 45 : EndIf
+
+  GateIrqScriptReset() : GateReenable() : GateFifoReset() : GateAppendEmpty()
+  gate_irqPending = 1 : gate_statusFirst = #CYW43_I_HMB_FRAME_IND : gate_irqRearm = -1 : cyw43_err = $61
+  If Cyw43Receive(0) <> 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_REARM Or Cyw43LastError() <> $61 : ProcedureReturn 46 : EndIf
+
+  ; Instrumentation failure does not hide a real F2 transport failure which
+  ; follows it in the unchanged legacy receive path.
+  GateIrqScriptReset() : GateReenable() : GateFifoReset()
+  gate_irqPending = 1 : gate_failStatusRead = 1 : gate_failF2Read = 1 : cyw43_err = $62
+  If Cyw43Receive(0) <> 0 Or Cyw43LastError() <> #CYW43_ERR_XFER : ProcedureReturn 47 : EndIf
+  If Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_STATUS_RD Or gate_f2Reads <> 0 : ProcedureReturn 48 : EndIf
+
+  ; Failed snapshot restoration remains retryable and blocks callback
+  ; replacement/re-arm until a later exact DISABLE succeeds.
+  GateIrqScriptReset() : GateReenable()
+  gate_irqDisable = 0
+  restores = Cyw43RxIrqRestoreFailures()
+  If Cyw43RxIrqTelemetry(0) <> 0 Or Cyw43RxIrqRestorePending() = 0 : ProcedureReturn 49 : EndIf
+  If Cyw43RxIrqRestoreFailures() <> restores + 1 Or Cyw43SetRxIrqIo(0) <> 0 : ProcedureReturn 50 : EndIf
+  If Cyw43RxIrqTelemetry(1) <> 0 : ProcedureReturn 51 : EndIf
+  gate_irqDisable = 1
+  If Cyw43RxIrqTelemetry(0) = 0 Or Cyw43RxIrqRestorePending() <> 0 : ProcedureReturn 52 : EndIf
+  If Cyw43SetRxIrqIo(0) = 0 : ProcedureReturn 53 : EndIf
+
+  ; Conservatively own a callback before ARM: refusal followed by failed
+  ; cleanup blocks replacement and another ARM until DISABLE is proved.
+  GateIrqScriptReset()
+  gate_irqArm = 0
+  gate_irqDisable = 0
+  If Cyw43SetRxIrqIo(@GateIrqOp) = 0 : ProcedureReturn 54 : EndIf
+  cyw43_err = $71
+  restores = Cyw43RxIrqRestoreFailures()
+  If Cyw43RxIrqTelemetry(1) <> 0 Or gate_irqArmCalls <> 1 Or gate_irqDisableCalls <> 1 : ProcedureReturn 55 : EndIf
+  If Cyw43RxIrqRestorePending() = 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_RESTORE : ProcedureReturn 56 : EndIf
+  If Cyw43RxIrqRestoreFailures() <> restores + 1 Or Cyw43LastError() <> $71 : ProcedureReturn 57 : EndIf
+  If Cyw43SetRxIrqIo(0) <> 0 Or Cyw43RxIrqTelemetry(1) <> 0 : ProcedureReturn 58 : EndIf
+  gate_irqDisable = 1
+  If Cyw43RxIrqTelemetry(0) = 0 Or Cyw43RxIrqRestorePending() <> 0 : ProcedureReturn 59 : EndIf
+
+  ; An ARM refusal whose cleanup succeeds releases ownership but still records
+  ; the optional ARM fault and preserves the caller's transport diagnostic.
+  GateIrqScriptReset()
+  gate_irqArm = 0
+  gate_irqDisable = 1
+  cyw43_err = $72
+  If Cyw43RxIrqTelemetry(1) <> 0 Or Cyw43RxIrqRestorePending() <> 0 : ProcedureReturn 60 : EndIf
+  If Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_ARM Or Cyw43LastError() <> $72 : ProcedureReturn 61 : EndIf
+  If Cyw43SetRxIrqIo(0) = 0 : ProcedureReturn 62 : EndIf
+
+  ; An active readiness owner blocks every callback/core/transport generation
+  ; replacement before it mutates state or performs I/O. Even an invalid
+  ; callback value cannot overwrite the owner which holds the old snapshot.
+  GateIrqScriptReset()
+  If Cyw43SetRxIrqIo(@GateIrqOp) = 0 Or Cyw43RxIrqTelemetry(1) = 0 : ProcedureReturn 63 : EndIf
+  cyw43_rxIrqPending = $40
+  cyw43_seq = $21
+  cyw43_reqid = $1234
+  cyw43_rambase = $198000
+  cyw43_ramsize = $C0000
+  cyw43_fwLoaded = 1
+  cyw43_rstvec = $B83EF198
+  cyw43_nvLoaded = 1
+  cyw43_nvBytes = $6D4
+  ioCalls = gate_baseIoCalls
+  If Cyw43SetRxIrqIo($1234) <> 0 Or *cyw43_rxIrqOp <> @GateIrqOp Or Cyw43RxIrqActive() = 0 : ProcedureReturn 64 : EndIf
+  If Cyw43SetIo(0, 0, 0, 0) <> 0 Or Cyw43LastError() <> #CYW43_ERR_RXIRQ_OWNED Or *cyw43_rb <> @GateRb Or *cyw43_rd <> @GateRd : ProcedureReturn 65 : EndIf
+  If Cyw43SetBlockIo(0, 0) <> 0 Or *cyw43_rdb <> @GateRd Or *cyw43_wrb <> @GateWr : ProcedureReturn 66 : EndIf
+  If Cyw43Attach() <> 0 Or cyw43_attached <> 1 Or cyw43_ncores <> 1 Or cyw43_coreBase[0] <> gate_coreBase Or cyw43_rxIrqPending <> $40 : ProcedureReturn 67 : EndIf
+  If gate_baseIoCalls <> ioCalls : ProcedureReturn 68 : EndIf
+  If Cyw43TransportReset() <> 0 Or cyw43_seq <> $21 Or cyw43_reqid <> $1234 Or cyw43_rxIrqPending <> $40 : ProcedureReturn 69 : EndIf
+  If Cyw43PrepareDownload() <> 0 Or Cyw43LastError() <> #CYW43_ERR_RXIRQ_OWNED Or gate_baseIoCalls <> ioCalls : ProcedureReturn 70 : EndIf
+  If Cyw43Start() <> 0 Or Cyw43LastError() <> #CYW43_ERR_RXIRQ_OWNED Or gate_baseIoCalls <> ioCalls : ProcedureReturn 71 : EndIf
+  If Cyw43WifiUp(0, 0, #CYW43_EVMASK_JOIN, 1) <> #CYW43_IO_OWNED Or cyw43_seq <> $21 Or cyw43_reqid <> $1234 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 72 : EndIf
+  If Cyw43EnumerateCores() <> 0 Or cyw43_ncores <> 1 Or cyw43_coreBase[0] <> gate_coreBase Or gate_baseIoCalls <> ioCalls : ProcedureReturn 81 : EndIf
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_rambase <> $198000 Or cyw43_ramsize <> $C0000 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 82 : EndIf
+  If Cyw43UploadFirmware(0, 0, 0, 0) <> 0 Or cyw43_fwLoaded <> 1 Or cyw43_rstvec <> $B83EF198 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 83 : EndIf
+  If Cyw43UploadNvram(0, 0, 0, 0, 0, 0) <> 0 Or cyw43_nvLoaded <> 1 Or cyw43_nvBytes <> $6D4 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 84 : EndIf
+
+  ; Failed DISABLE keeps callback/snapshot ownership even though capture is no
+  ; longer active. Generation operations remain inert and retryable until the
+  ; same callback proves restoration.
+  gate_irqDisable = 0
+  If Cyw43RxIrqTelemetry(0) <> 0 Or Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqRestorePending() = 0 : ProcedureReturn 73 : EndIf
+  cyw43_seq = $22
+  cyw43_reqid = $5678
+  cyw43_rambase = $198000
+  cyw43_ramsize = $C0000
+  cyw43_fwLoaded = 1
+  cyw43_rstvec = $B83EF198
+  cyw43_nvLoaded = 1
+  cyw43_nvBytes = $6D4
+  ioCalls = gate_baseIoCalls
+  If Cyw43SetIo(0, 0, 0, 0) <> 0 Or Cyw43Attach() <> 0 Or Cyw43TransportReset() <> 0 : ProcedureReturn 74 : EndIf
+  If cyw43_seq <> $22 Or cyw43_reqid <> $5678 Or gate_baseIoCalls <> ioCalls Or *cyw43_rb <> @GateRb : ProcedureReturn 75 : EndIf
+  If Cyw43SetRxIrqIo($5678) <> 0 Or *cyw43_rxIrqOp <> @GateIrqOp : ProcedureReturn 76 : EndIf
+  If Cyw43EnumerateCores() <> 0 Or cyw43_ncores <> 1 Or cyw43_coreBase[0] <> gate_coreBase Or gate_baseIoCalls <> ioCalls : ProcedureReturn 85 : EndIf
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_rambase <> $198000 Or cyw43_ramsize <> $C0000 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 86 : EndIf
+  If Cyw43UploadFirmware(0, 0, 0, 0) <> 0 Or cyw43_fwLoaded <> 1 Or cyw43_rstvec <> $B83EF198 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 87 : EndIf
+  If Cyw43UploadNvram(0, 0, 0, 0, 0, 0) <> 0 Or cyw43_nvLoaded <> 1 Or cyw43_nvBytes <> $6D4 Or gate_baseIoCalls <> ioCalls : ProcedureReturn 88 : EndIf
+
+  ; A verified disable releases the old generation. Callback replacement and
+  ; transport reset are then allowed, with no active/restore/pending latch
+  ; surviving into the new generation.
+  gate_irqDisable = 1
+  If Cyw43RxIrqTelemetry(0) = 0 Or Cyw43RxIrqActive() <> 0 Or Cyw43RxIrqRestorePending() <> 0 Or cyw43_rxIrqPending <> 0 Or cyw43_rxIrqBusy <> 0 Or cyw43_rxIrqCore <> 0 : ProcedureReturn 77 : EndIf
+  If Cyw43SetRxIrqIo(0) = 0 Or Cyw43SetIo(@GateRb, @GateWb, @GateRd, @GateWr) = 0 Or Cyw43SetBlockIo(@GateRd, @GateWr) = 0 : ProcedureReturn 78 : EndIf
+  If Cyw43TransportReset() = 0 Or cyw43_seq <> 0 Or cyw43_reqid <> 0 Or Cyw43RxQueueDepth() <> 0 Or cyw43_rxIrqPending <> 0 : ProcedureReturn 79 : EndIf
+  GateIrqScriptReset()
+  If Cyw43SetRxIrqIo(@GateIrqOp) = 0 Or Cyw43RxIrqTelemetry(1) = 0 Or Cyw43RxIrqFault() <> #CYW43_RXIRQ_FAULT_NONE : ProcedureReturn 80 : EndIf
+  If Cyw43RxIrqTelemetry(0) = 0 : ProcedureReturn 89 : EndIf
+
+  ; Pi3 brcmfmac ordering performs cur_etheraddr GET/SET after the framed
+  ; transport reset but before CLM/event/WLC_UP. The continuation must keep
+  ; that exact sequence/request generation and may be consumed only once.
+  If Cyw43WifiUpBegin() <> #CYW43_IO_OK Or cyw43_wifiup_reset_ready <> 1 : ProcedureReturn 90 : EndIf
+  cyw43_seq = $25 : cyw43_reqid = $1234
+  ioCalls = gate_baseIoCalls
+  Cyw43WifiUpAfterTransportReset(0, 0, #CYW43_EVMASK_JOIN, 1)
+  If cyw43_wifiup_reset_ready <> 0 Or cyw43_seq <= $25 Or cyw43_reqid <= $1234 Or gate_baseIoCalls <= ioCalls : ProcedureReturn 91 : EndIf
+  ioCalls = gate_baseIoCalls
+  If Cyw43WifiUpAfterTransportReset(0, 0, #CYW43_EVMASK_JOIN, 1) <> #CYW43_IO_OWNED Or gate_baseIoCalls <> ioCalls : ProcedureReturn 92 : EndIf
+
+  ; A fresh reset invalidates any pending continuation token, preventing a
+  ; caller from resetting after MAC IOCTLs then resuming the old generation.
+  If Cyw43WifiUpBegin() <> #CYW43_IO_OK Or cyw43_wifiup_reset_ready <> 1 : ProcedureReturn 93 : EndIf
+  If Cyw43TransportReset() = 0 Or cyw43_wifiup_reset_ready <> 0 : ProcedureReturn 94 : EndIf
+  ioCalls = gate_baseIoCalls
+  If Cyw43WifiUpAfterTransportReset(0, 0, #CYW43_EVMASK_JOIN, 1) <> #CYW43_IO_OWNED Or gate_baseIoCalls <> ioCalls : ProcedureReturn 95 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

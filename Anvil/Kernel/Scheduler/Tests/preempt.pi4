@@ -1,0 +1,98 @@
+EnableFloatingPoint
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/preempt_a64.pbi"
+Global quantum.i = 5000
+Global checks.i
+Global failures.i
+Global first.i
+Global second.i
+Global overlap.i
+Global Dim progress.i[2]
+ProcedureNaked TimerArm()
+  ASM
+    mrs x9, cntpct_el0
+    adrp x10, global_quantum
+    add x10, x10, #:lo12:global_quantum
+    ldr x10, [x10]
+    add x9, x9, x10
+    msr cntp_cval_el0, x9
+    movz x9, #1
+    msr cntp_ctl_el0, x9
+    movz x0, #1
+    ret
+  ENDASM
+EndProcedure
+ProcedureNaked TimerStop()
+  ASM
+    movz x9, #0
+    msr cntp_ctl_el0, x9
+    movz x0, #1
+    ret
+  ENDASM
+EndProcedure
+ProcedureNaked TimerPending()
+  ASM
+    mrs x0, cntp_ctl_el0
+    movz x9, #4
+    and x0, x0, x9
+    ret
+  ENDASM
+EndProcedure
+Procedure.i TimerAck()
+  If TimerPending() = 0 : ProcedureReturn 0 : EndIf
+  If progress[0] > 0 And progress[1] > 0
+    If SchedState(first) <> #SCHED_DONE And SchedState(second) <> #SCHED_DONE
+      overlap = 1
+    EndIf
+  EndIf
+  ProcedureReturn TimerArm()
+EndProcedure
+Procedure Check(a.i, b.i)
+  checks = checks + 1
+  If a <> b : failures = failures + 1 : EndIf
+EndProcedure
+Procedure.i CpuBound()
+  Protected id.i
+  Protected n.i
+  Protected sum.f
+  Protected expected.f
+  id = ApArgument()
+  If id = 0
+    sum = 0.5
+    expected = 1875.5
+  Else
+    sum = 1.5
+    expected = 1876.5
+  EndIf
+  For n = 1 To 1500
+    sum = sum + 1.25
+    progress[id] = n
+  Next
+  If sum <> expected : ProcedureReturn -1 : EndIf
+  ProcedureReturn id + 10
+EndProcedure
+Procedure Main()
+  Check(ApInstall($8000, @TimerAck, @TimerArm, @TimerStop, $400000, $200000), 1)
+  first = ApCreate(@CpuBound, 0)
+  second = ApCreate(@CpuBound, 1)
+  Check(first > 0, 1)
+  Check(second > 0, 1)
+  Check(ApRun(), 1)
+  Check(ap_result[SchedSlot(first)], 10)
+  Check(ap_result[SchedSlot(second)], 11)
+  Check(progress[0], 1500)
+  Check(progress[1], 1500)
+  Check(overlap, 1)
+  Check(ap_ticks > 4, 1)
+  Check(SchedState(first), #SCHED_DONE)
+  Check(SchedState(second), #SCHED_DONE)
+  Check(ApReap(first), 1)
+  Check(ApReap(second), 1)
+  Check(ApUninstall(), 1)
+  ApEnvironment()
+  Check(ap_vbar, $8000)
+  Check(ap_thread, 0)
+  Check(ap_daif, 960)
+  PokeI($6000000, checks)
+  PokeI($6000008, failures)
+EndProcedure

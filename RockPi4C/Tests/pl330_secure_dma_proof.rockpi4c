@@ -1,0 +1,243 @@
+; Bounded RK3399 secure-DMAC0 doubling-fill and blit proof for Anvil's live payload stage.
+; Build exactly with:
+;   --load-addr 0x03A4BBD8 --bss-addr 0x03AD0000
+;   --stack-addr 0x03E40000 --entry-returns
+;
+; The resident monitor arms the physical watchdog before entry. This payload
+; adopts that deadman, uses only the silicon-proven SDMAC0 APB aperture at
+; $FFFC0000, and exercises private BSS buffers. The driver bounds every debug
+; and job wait and issues a bounded channel-0 KILL before returning a failed
+; transfer. DMAC1 and both normal-world DMA apertures remain unowned.
+; pmf:target rockpi4c
+; pmf:load $03A4BBD8
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
+
+Procedure ProofHexNibble(value.i)
+  value=value & 15
+  If value<10 : RockUartByte(48+value) : Else : RockUartByte(55+value) : EndIf
+EndProcedure
+
+Procedure RockDisplayHexLong(value.i)
+  Protected shift.i
+  For shift=28 To 0 Step -4
+    ProofHexNibble(value >> shift)
+  Next
+EndProcedure
+
+XIncludeFile "RockPi4C/Lib/security.pbi"
+
+; Focused production dependencies. The complete CRU/display and watchdog
+; libraries contain unrelated bring-up entry points. This proof needs only
+; the exact helpers called by dma_pl330.pbi and the resident deadman's pet.
+#ROCK_CRU = $FF760000
+#ROCK_CRU_CLKSEL = $100
+#ROCK_CRU_CLKGATE = $300
+#ROCK_CRU_SOFTRST = $400
+#ROCK_WATCHDOG_BASE = $FF848000
+#ROCK_WATCHDOG_CRR = $0C
+#ROCK_WATCHDOG_RESTART = $76
+
+Global rock_cru_error.i
+Global rock_watchdog_active.i
+
+Procedure.i RockCruRead(offset.i)
+  ProcedureReturn PeekL(#ROCK_CRU+offset) & $FFFFFFFF
+EndProcedure
+
+Procedure RockCruWrite(offset.i,value.i)
+  PokeL(#ROCK_CRU+offset,value & $FFFFFFFF)
+EndProcedure
+
+Procedure RockCruField(offset.i,mask.i,value.i)
+  RockCruWrite(offset,(mask << 16) | (value & mask))
+EndProcedure
+
+Procedure RockCruGate(bank.i,bit.i,enable.i)
+  Protected value.i=1 << (bit+16)
+  If enable=0 : value=value | (1 << bit) : EndIf
+  RockCruWrite(#ROCK_CRU_CLKGATE+bank*4,value)
+EndProcedure
+
+Procedure.i RockCruPllRate(offset.i,integerOnly.i,errorCode.i)
+  Protected con0.i=RockCruRead(offset)
+  Protected con1.i=RockCruRead(offset+4)
+  Protected con2.i=RockCruRead(offset+8)
+  Protected con3.i=RockCruRead(offset+12)
+  Protected fb.i=con0 & $FFF
+  Protected ref.i=con1 & $3F
+  Protected post1.i=(con1 >> 8) & 7
+  Protected post2.i=(con1 >> 12) & 7
+  Protected fraction.i
+  Protected scaled.i
+  Protected vco.i
+  Protected rate.i
+  If (con2 & $80000000)=0 Or ((con3 >> 8) & 3)<>1 Or (con3 & 1)<>0
+    rock_cru_error=errorCode : ProcedureReturn 0
+  EndIf
+  If integerOnly<>0 And (con3 & 8)=0
+    rock_cru_error=errorCode : ProcedureReturn 0
+  EndIf
+  If fb<16 Or fb>3200 Or ref=0 Or post1=0 Or post2=0
+    rock_cru_error=errorCode+1 : ProcedureReturn 0
+  EndIf
+  If (con3 & 8)=0 : fraction=con2 & $FFFFFF : EndIf
+  scaled=fb*16777216+fraction
+  vco=(24000000*scaled/ref)/16777216
+  rate=(24000000*scaled/ref)/(16777216*post1*post2)
+  If vco<800000000 Or vco>3200000000 Or rate<16000000 Or rate>3200000000
+    rock_cru_error=errorCode+2 : ProcedureReturn 0
+  EndIf
+  ProcedureReturn rate
+EndProcedure
+
+Procedure.i RockCruCeilingDivider(parent.i,target.i)
+  Protected divider.i
+  If parent<=0 Or target<=0 : ProcedureReturn 0 : EndIf
+  divider=(parent+target-1)/target
+  If divider<1 Or divider>32 : ProcedureReturn 0 : EndIf
+  ProcedureReturn divider
+EndProcedure
+
+Procedure RockWatchdogPet()
+  If rock_watchdog_active<>0
+    PokeL(#ROCK_WATCHDOG_BASE+#ROCK_WATCHDOG_CRR,#ROCK_WATCHDOG_RESTART)
+    ASM
+      dsb sy
+    ENDASM
+  EndIf
+EndProcedure
+
+XIncludeFile "RockPi4C/Lib/dma_pl330.pbi"
+
+#PROOF_WORDS = 128
+#PROOF_BYTES = #PROOF_WORDS*4
+#PROOF_FILL = $A5C33CA5
+#PROOF_COPY_WORDS = 256
+#PROOF_COPY_BYTES = #PROOF_COPY_WORDS*4
+
+#PROOF_OK = $444D4100
+#PROOF_ERR_EL = $444D4E01
+#PROOF_ERR_CACHE = $444D4E02
+#PROOF_ERR_TIMER = $444D4E03
+#PROOF_ERR_UART = $444D4E04
+#PROOF_ERR_WATCHDOG = $444D4E05
+#PROOF_ERR_ALIGN = $444D4E06
+#PROOF_ERR_INIT = $444D4E07
+#PROOF_ERR_FILL = $444D4E0A
+#PROOF_ERR_FILL_COMPARE = $444D4E0B
+#PROOF_ERR_COPY = $444D4E0C
+#PROOF_ERR_COPY_COMPARE = $444D4E0D
+
+Global Dim proof_fill.l(#PROOF_WORDS-1)
+Global Dim proof_source.l(#PROOF_COPY_WORDS-1)
+Global Dim proof_dest.l(#PROOF_COPY_WORDS-1)
+
+Procedure ProofLine(label.i,value.i)
+  RockUartText(label)
+  RockDisplayHexLong(value)
+  RockUartLine("")
+EndProcedure
+
+Procedure ProofProgramLine()
+  Protected index.i
+  Protected value.i
+  RockUartText(" DMA_PROGRAM_CODE=")
+  If rock_dma_pl330_program_address>0 And rock_dma_pl330_program_address<=$FFFFFFFF And rock_dma_pl330_program_bytes>=0 And rock_dma_pl330_program_bytes<=#ROCK_DMA_PL330_MAX_PROGRAM
+    For index=0 To rock_dma_pl330_program_bytes-1
+      value=PeekA(rock_dma_pl330_program_address+index) & $FF
+      ProofHexNibble(value >> 4)
+      ProofHexNibble(value)
+    Next
+  Else
+    RockUartText("INVALID")
+  EndIf
+  RockUartLine("")
+EndProcedure
+
+Procedure.i Main()
+  Protected index.i
+  Protected result.i=#PROOF_OK
+
+  RockCaptureEnvironment()
+  RockCaptureSctlrEl3()
+  If rock_current_el<>12 : ProcedureReturn #PROOF_ERR_EL : EndIf
+  If (rock_sctlr_el3 & $1005)<>0 : ProcedureReturn #PROOF_ERR_CACHE : EndIf
+  If RockTimerInit()=0 : ProcedureReturn #PROOF_ERR_TIMER : EndIf
+  If RockUartAdopt()=0 : ProcedureReturn #PROOF_ERR_UART : EndIf
+  ; The monitor owns watchdog setup. Adopt its already-running deadman so the
+  ; driver's healthy polling loop may pet it; never reprogram the watchdog.
+  rock_watchdog_active=1
+  If rock_watchdog_active=0 : ProcedureReturn #PROOF_ERR_WATCHDOG : EndIf
+
+  If (@proof_fill(0) & 7)<>0
+    ProcedureReturn #PROOF_ERR_ALIGN
+  EndIf
+
+  For index=0 To #PROOF_WORDS-1
+    proof_fill(index)=0
+  Next
+  For index=0 To #PROOF_COPY_WORDS-1
+    proof_source(index)=$5A000000 | index
+    proof_dest(index)=0
+  Next
+  ASM
+    dsb sy
+  ENDASM
+
+  RockUartLine("SDMAC0 DOUBLING FILL PROOF BEGIN")
+  If RockDmaPl330Init()=0
+    result=#PROOF_ERR_INIT
+  ElseIf RockDmaPl330Fill32(@proof_fill(0),#PROOF_FILL,#PROOF_BYTES)=0
+    result=#PROOF_ERR_FILL
+  Else
+    For index=0 To #PROOF_WORDS-1
+      If (proof_fill(index) & $FFFFFFFF)<>#PROOF_FILL
+        result=#PROOF_ERR_FILL_COMPARE
+        Break
+      EndIf
+    Next
+    If result=#PROOF_OK
+      If RockDmaPl330Copy(@proof_dest(0),@proof_source(0),#PROOF_COPY_BYTES)=0
+        result=#PROOF_ERR_COPY
+      Else
+        For index=0 To #PROOF_COPY_WORDS-1
+          If (proof_dest(index) & $FFFFFFFF)<>($5A000000 | index)
+            result=#PROOF_ERR_COPY_COMPARE
+            Break
+          EndIf
+        Next
+      EndIf
+    EndIf
+  EndIf
+
+  ASM
+    dsb sy
+  ENDASM
+  ProofLine(" SDMAC0_PID=",rock_dma_pl330_pid)
+  ProofLine(" SDMAC0_CID=",rock_dma_pl330_cid)
+  ProofLine(" DMA_ERROR=",rock_dma_pl330_error)
+  ProofLine(" DMA_COMPLETED=",rock_dma_pl330_completed_bytes)
+  ProofLine(" DMA_FAULT_VALID=",rock_dma_pl330_fault_valid)
+  ProofLine(" DMA_FAULT_DS=",rock_dma_pl330_fault_ds)
+  ProofLine(" DMA_FAULT_DPC=",rock_dma_pl330_fault_dpc)
+  ProofLine(" DMA_FAULT_FSM=",rock_dma_pl330_fault_fsm)
+  ProofLine(" DMA_FAULT_FSC=",rock_dma_pl330_fault_fsc)
+  ProofLine(" DMA_FAULT_FTM=",rock_dma_pl330_fault_ftm)
+  ProofLine(" DMA_FAULT_CS0=",rock_dma_pl330_fault_cs0)
+  ProofLine(" DMA_FAULT_FTC0=",rock_dma_pl330_fault_ftc0)
+  ProofLine(" DMA_FAULT_CPC0=",rock_dma_pl330_fault_cpc0)
+  ProofLine(" DMA_FAULT_SA0=",rock_dma_pl330_fault_sa0)
+  ProofLine(" DMA_FAULT_DA0=",rock_dma_pl330_fault_da0)
+  ProofLine(" DMA_FAULT_CC0=",rock_dma_pl330_fault_cc0)
+  ProofLine(" DMA_PROGRAM_ADDRESS=",rock_dma_pl330_program_address)
+  ProofLine(" DMA_PROGRAM_BYTES=",rock_dma_pl330_program_bytes)
+  ProofProgramLine()
+  ProofLine(" RESULT=",result)
+  RockUartLine("SDMAC0 DOUBLING FILL PROOF END")
+  ProcedureReturn result
+EndProcedure

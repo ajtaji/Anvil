@@ -1,0 +1,112 @@
+; Bounded emitted test of the real shared serial block receiver.
+#BLK = 4
+#CRC_POLY = $EDB88320
+#ANVIL_WIFI_OTA = 0
+#CAP_NET = 0
+#REC_MAX = 260
+#MON_DATA_LO = $00110000
+
+Global gParseOk.i,gParseOver.i,gRecs.i,gBytes.i,gBad.i,gFail.i
+Global gLoLo.i,gHiHi.i,gEntry.i,gHaveEntry.i,gMonHitLo.i,gMonHitHi.i
+Global gate_arg_index.i,gate_rx_index.i,gate_rx_limit.i,gate_rx_calls.i
+Global gate_ready_lines.i,gate_ok_lines.i,gate_crc_lines.i,gate_timeout_seen.i
+Global gate_acks.i,gate_flushes.i,gate_payload_bytes.i,gate_output_len.i
+Global gate_printn.i
+Global Dim gate_args.i[3]
+Global Dim gate_payload.a[128]
+Global Dim gate_output.a[4096]
+
+Procedure.i ParseHex()
+  Protected result.i
+  If gate_arg_index < 3
+    result = gate_args[gate_arg_index]
+    gate_arg_index + 1
+    gParseOk = 1
+    gParseOver = 0
+    ProcedureReturn result
+  EndIf
+  gParseOk = 0
+  gParseOver = 0
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HexVal(c.i)
+  If c>=48 And c<=57 : ProcedureReturn c-48 : EndIf
+  If c>=65 And c<=70 : ProcedureReturn c-55 : EndIf
+  If c>=97 And c<=102 : ProcedureReturn c-87 : EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HitsMonitor(lo.i,hi.i)
+  If lo <= $00110FFF And hi >= $00110000
+    gMonHitLo = $00110000
+    gMonHitHi = $00110FFF
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i InPayload(lo.i,hi.i)
+  If lo >= $00500000 And hi <= $005FFFFF : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwStageAddr() : ProcedureReturn $00500000 : EndProcedure
+Procedure.i HwPayLo(which.i) : ProcedureReturn $80000000 : EndProcedure
+Procedure PutWindows() : EndProcedure
+Procedure PutMonitorMap() : EndProcedure
+
+Procedure.i RxByte()
+  gate_rx_calls + 1
+  If gate_rx_index >= gate_rx_limit : ProcedureReturn -1 : EndIf
+  gate_rx_index + 1
+  ProcedureReturn PeekA(@gate_payload[gate_rx_index - 1]) & $FF
+EndProcedure
+
+Procedure UartWrite(c.i)
+  If c = 43 : gate_acks + 1 : EndIf
+  If gate_output_len < 4096
+    gate_output[gate_output_len] = c
+    gate_output_len + 1
+  EndIf
+EndProcedure
+
+Procedure GatePrint()
+EndProcedure
+Procedure GatePrintN()
+  gate_printn+1
+EndProcedure
+Procedure GatePrintNl() : EndProcedure
+Procedure GatePrintDec() : EndProcedure
+Procedure GatePutAddr() : EndProcedure
+Procedure GatePutHex8() : EndProcedure
+Procedure CacheFlushRange(lo.i,hi.i) : gate_flushes+1 : EndProcedure
+
+XIncludeFile "Anvil/Core/crc.pbi"
+; The checker inserts the exact CmdBlock procedure from xfer.pbi here, with
+; the output primitives renamed to the test sinks above.
+;@@CMD_BLOCK@@
+
+Procedure.i Main()
+  Protected i.i
+  For i=0 To 127 : gate_payload[i]=PeekA($06000100+i) : Next
+  Select PeekI($06000000)
+    Case 1 ; complete, correctly checksummed 65-byte transfer
+      gate_args[0]=$00500000 : gate_args[1]=65 : gate_args[2]=PeekI($06000010)
+      gate_rx_limit=65
+    Case 2 ; short receive / timeout after seven bytes
+      gate_args[0]=$00500000 : gate_args[1]=65 : gate_args[2]=0
+      gate_rx_limit=7
+    Case 3 ; checksum mismatch after a complete receive
+      gate_args[0]=$00500000 : gate_args[1]=65 : gate_args[2]=PeekI($06000010) ! 1
+      gate_rx_limit=65
+    Case 4 ; intersects the modeled monitor window; must not read input
+      gate_args[0]=$00110FFC : gate_args[1]=8 : gate_args[2]=0
+      gate_rx_limit=65
+  EndSelect
+  gate_arg_index=0 : gate_rx_index=0 : gate_rx_calls=0
+  gate_ready_lines=0 : gate_ok_lines=0 : gate_crc_lines=0 : gate_timeout_seen=0 : gate_printn=0
+  gate_acks=0 : gate_flushes=0 : gate_output_len=0 : gHaveEntry=0
+  CmdBlock()
+  ProcedureReturn 0
+EndProcedure

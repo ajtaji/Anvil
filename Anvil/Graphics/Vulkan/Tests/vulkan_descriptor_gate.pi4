@@ -1,0 +1,1246 @@
+; ======================================================================
+;  Mixed descriptor/lifetime gate -- small public API execution path
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; This desk-only gate deliberately avoids parsing SPIR-V. It seeds only two
+; verified shader semantic slots, then drives the real public descriptor,
+; pipeline, command-buffer and queue APIs over the state-only test backend.
+; The full vulkan_pipeline_gate remains the independent SPIR-V -> typed IR ->
+; V3D proof; descriptor mutants use this small path so every mutant can truly
+; compile and execute without repeating the expensive parser campaign.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#DG_HEAP = $06200000
+#DG_HEAP_BYTES = $00100000
+#DG_OUT = $06100000
+#DG_SEEN = #DG_OUT + ((512 + 1) * 8)
+#DG_MAGIC = $564B4447                  ; "VKDG"
+#DG_VERSION = 1
+#DG_POISON = $5A3CC3A5
+#DG_W = 16
+#DG_H = 16
+
+Global Dim dgReport.i[512]
+Global Dim dgPoolLive.a[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolGen.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolDev.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolMax.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolSets.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolUboCap.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolSampleCap.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolUboOut.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgPoolSampleOut.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim dgSetLive.a[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
+Global Dim dgSetGen.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
+Global Dim dgSetDev.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
+Global Dim dgSetPool.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
+Global Dim dgSetCount.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1]
+Global Dim dgSetType.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetStages.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetBuf.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetOffset.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetRange.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetSampler.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetView.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSetImageLayout.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgDslLive.a[#ANVIL_VK_MAX_SET_LAYOUTS + 1]
+Global Dim dgDslGen.i[#ANVIL_VK_MAX_SET_LAYOUTS + 1]
+Global Dim dgDslDev.i[#ANVIL_VK_MAX_SET_LAYOUTS + 1]
+Global Dim dgDslCount.i[#ANVIL_VK_MAX_SET_LAYOUTS + 1]
+Global Dim dgDslType.i[(#ANVIL_VK_MAX_SET_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgDslStages.i[(#ANVIL_VK_MAX_SET_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgSamplerLive.a[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgSamplerGen.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgSamplerDev.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgSamplerMag.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgSamplerMin.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgSamplerFlight.i[#ANVIL_VK_MAX_SAMPLERS + 1]
+Global Dim dgLayoutLive.a[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutGen.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutDev.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutPush.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutSetCount.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutBindingCount.i[#ANVIL_VK_MAX_LAYOUTS + 1]
+Global Dim dgLayoutType.i[(#ANVIL_VK_MAX_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgLayoutStages.i[(#ANVIL_VK_MAX_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+Global dgCbSet.i
+Global dgCbSetCount.i
+Global dgCbBindingCount.i
+Global dgCbPushBytes.i
+Global Dim dgCbType.i[#ANVIL_VK_MAX_SET_BINDINGS]
+Global Dim dgCbStages.i[#ANVIL_VK_MAX_SET_BINDINGS]
+Global dgCbPushCount.i
+Global Dim dgCbPushWord.i[4]
+
+Procedure dgPut(slot.i, value.i)
+  If slot < 0 Or slot > 511
+    ProcedureReturn
+  EndIf
+  dgReport[slot] = value
+  PokeI(#DG_OUT + (slot * 8), value)
+  PokeA(#DG_SEEN + slot, 1)
+  PokeI(#DG_OUT + (512 * 8), slot)
+EndProcedure
+
+Procedure.i dgStop(status.i)
+  dgPut(1, status)
+  dgPut(2, AnvilVkFaultCode())
+  dgPut(3, AnvilVkFaultText())
+  ProcedureReturn @dgReport[0]
+EndProcedure
+
+; The compact gate owns a fresh process image. Refuse to seed over any live
+; shader slot, then clear every piece of slot-owned semantic state used by
+; pipeline creation. Generation is advanced only after the clear completes.
+Procedure.i dgPrepareShaderSlot(slot.i)
+  Define i.i
+  Define base.i
+  If slot < 1 Or slot > #ANVIL_VK_MAX_SHADER_MODULES
+    ProcedureReturn 0
+  EndIf
+  If avkShLive[slot] <> 0 : ProcedureReturn 0 : EndIf
+  avkShDev[slot] = 0 : avkShIrGen[slot] = 0
+  avkShStage[slot] = 0 : avkShWords[slot] = 0 : avkShInstr[slot] = 0
+  avkShInCount[slot] = 0 : avkShOutCount[slot] = 0
+  avkShPosAttr[slot] = 0 : avkShColourSrc[slot] = 0 : avkShColourIdx[slot] = 0
+  avkShPush[slot] = 0 : avkShUniform[slot] = 0
+  avkShUniformSet[slot] = 0 : avkShUniformBinding[slot] = 0
+  avkShSample[slot] = 0 : avkShSampleSet[slot] = 0
+  avkShSampleBinding[slot] = 0 : avkShSampleCoord[slot] = 0
+  avkShUsesVarying[slot] = 0
+  base = slot * #ANVIL_SPV_MAX_ATTRS : i = 0
+  While i < #ANVIL_SPV_MAX_ATTRS
+    avkShInComp[base + i] = 0
+    i = i + 1
+  Wend
+  base = slot * #ANVIL_SPV_MAX_VARYINGS : i = 0
+  While i < #ANVIL_SPV_MAX_VARYINGS
+    avkShOutComp[base + i] = 0 : avkShOutSrc[base + i] = 0
+    i = i + 1
+  Wend
+  base = slot * 4 : i = 0
+  While i < 4
+    avkShConst[base + i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < SizeOf(AvkSpirvIrStorage)
+    PokeA(@avkShIr[slot] + i, 0)
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i dgShaderTableFresh()
+  Define i.i = 1
+  While i <= #ANVIL_VK_MAX_SHADER_MODULES
+    If avkShLive[i] <> 0 : ProcedureReturn 0 : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotPools()
+  Define i.i = 1
+  While i <= #ANVIL_VK_MAX_DESCRIPTOR_POOLS
+    dgPoolLive[i] = avkDpLive[i] : dgPoolGen[i] = avkDpGen[i] : dgPoolDev[i] = avkDpDev[i]
+    dgPoolMax[i] = avkDpMaxSets[i] : dgPoolSets[i] = avkDpSetsOut[i]
+    dgPoolUboCap[i] = avkDpUboCapacity[i] : dgPoolSampleCap[i] = avkDpSampleCapacity[i]
+    dgPoolUboOut[i] = avkDpUboOut[i] : dgPoolSampleOut[i] = avkDpSampleOut[i]
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i dgPoolsUnchanged()
+  Define i.i = 1
+  While i <= #ANVIL_VK_MAX_DESCRIPTOR_POOLS
+    If dgPoolLive[i] <> avkDpLive[i] Or dgPoolGen[i] <> avkDpGen[i] Or dgPoolDev[i] <> avkDpDev[i] Or dgPoolMax[i] <> avkDpMaxSets[i] Or dgPoolSets[i] <> avkDpSetsOut[i] Or dgPoolUboCap[i] <> avkDpUboCapacity[i] Or dgPoolSampleCap[i] <> avkDpSampleCapacity[i] Or dgPoolUboOut[i] <> avkDpUboOut[i] Or dgPoolSampleOut[i] <> avkDpSampleOut[i]
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotSets()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_DESCRIPTOR_SETS
+    dgSetLive[i] = avkDsLive[i] : dgSetGen[i] = avkDsGen[i] : dgSetDev[i] = avkDsDev[i]
+    dgSetPool[i] = avkDsPool[i] : dgSetCount[i] = avkDsCount[i]
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      dgSetType[idx] = avkDsType[idx] : dgSetStages[idx] = avkDsStages[idx]
+      dgSetBuf[idx] = avkDsBuf[idx] : dgSetOffset[idx] = avkDsOffset[idx] : dgSetRange[idx] = avkDsRange[idx]
+      dgSetSampler[idx] = avkDsSampler[idx] : dgSetView[idx] = avkDsView[idx] : dgSetImageLayout[idx] = avkDsImageLayout[idx]
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i dgSetsUnchanged()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_DESCRIPTOR_SETS
+    If dgSetLive[i] <> avkDsLive[i] Or dgSetGen[i] <> avkDsGen[i] Or dgSetDev[i] <> avkDsDev[i] Or dgSetPool[i] <> avkDsPool[i] Or dgSetCount[i] <> avkDsCount[i]
+      ProcedureReturn 0
+    EndIf
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      If dgSetType[idx] <> avkDsType[idx] Or dgSetStages[idx] <> avkDsStages[idx] Or dgSetBuf[idx] <> avkDsBuf[idx] Or dgSetOffset[idx] <> avkDsOffset[idx] Or dgSetRange[idx] <> avkDsRange[idx] Or dgSetSampler[idx] <> avkDsSampler[idx] Or dgSetView[idx] <> avkDsView[idx] Or dgSetImageLayout[idx] <> avkDsImageLayout[idx]
+        ProcedureReturn 0
+      EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotDsls()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_SET_LAYOUTS
+    dgDslLive[i] = avkDslLive[i] : dgDslGen[i] = avkDslGen[i]
+    dgDslDev[i] = avkDslDev[i] : dgDslCount[i] = avkDslCount[i]
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      dgDslType[idx] = avkDslType[idx] : dgDslStages[idx] = avkDslStages[idx]
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i dgDslsUnchanged()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_SET_LAYOUTS
+    If dgDslLive[i] <> avkDslLive[i] Or dgDslGen[i] <> avkDslGen[i] Or dgDslDev[i] <> avkDslDev[i] Or dgDslCount[i] <> avkDslCount[i]
+      ProcedureReturn 0
+    EndIf
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      If dgDslType[idx] <> avkDslType[idx] Or dgDslStages[idx] <> avkDslStages[idx]
+        ProcedureReturn 0
+      EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotSamplers()
+  Define i.i = 1
+  While i <= #ANVIL_VK_MAX_SAMPLERS
+    dgSamplerLive[i] = avkSampLive[i] : dgSamplerGen[i] = avkSampGen[i]
+    dgSamplerDev[i] = avkSampDev[i] : dgSamplerMag[i] = avkSampMag[i]
+    dgSamplerMin[i] = avkSampMin[i] : dgSamplerFlight[i] = avkSampInFlight[i]
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i dgSamplersUnchanged()
+  Define i.i = 1
+  While i <= #ANVIL_VK_MAX_SAMPLERS
+    If dgSamplerLive[i] <> avkSampLive[i] Or dgSamplerGen[i] <> avkSampGen[i] Or dgSamplerDev[i] <> avkSampDev[i] Or dgSamplerMag[i] <> avkSampMag[i] Or dgSamplerMin[i] <> avkSampMin[i] Or dgSamplerFlight[i] <> avkSampInFlight[i]
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotLayouts()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_LAYOUTS
+    dgLayoutLive[i] = avkLayLive[i] : dgLayoutGen[i] = avkLayGen[i] : dgLayoutDev[i] = avkLayDev[i]
+    dgLayoutPush[i] = avkLayPushBytes[i] : dgLayoutSetCount[i] = avkLaySetCount[i] : dgLayoutBindingCount[i] = avkLayBindingCount[i]
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      dgLayoutType[idx] = avkLayBindingType[idx] : dgLayoutStages[idx] = avkLayBindingStages[idx]
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i dgLayoutsUnchanged()
+  Define i.i = 1
+  Define k.i
+  Define idx.i
+  While i <= #ANVIL_VK_MAX_LAYOUTS
+    If dgLayoutLive[i] <> avkLayLive[i] Or dgLayoutGen[i] <> avkLayGen[i] Or dgLayoutDev[i] <> avkLayDev[i] Or dgLayoutPush[i] <> avkLayPushBytes[i] Or dgLayoutSetCount[i] <> avkLaySetCount[i] Or dgLayoutBindingCount[i] <> avkLayBindingCount[i]
+      ProcedureReturn 0
+    EndIf
+    k = 0
+    While k < #ANVIL_VK_MAX_SET_BINDINGS
+      idx = (i * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      If dgLayoutType[idx] <> avkLayBindingType[idx] Or dgLayoutStages[idx] <> avkLayBindingStages[idx] : ProcedureReturn 0 : EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotCbDescriptor(c.i)
+  Define k.i = 0
+  dgCbSet = avkCbDescSet[c] : dgCbSetCount = avkCbDescSetCount[c]
+  dgCbBindingCount = avkCbDescBindingCount[c] : dgCbPushBytes = avkCbDescPushBytes[c]
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    dgCbType[k] = avkCbDescType[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    dgCbStages[k] = avkCbDescStages[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+    k = k + 1
+  Wend
+EndProcedure
+
+Procedure.i dgCbDescriptorUnchanged(c.i)
+  Define k.i = 0
+  If dgCbSet <> avkCbDescSet[c] Or dgCbSetCount <> avkCbDescSetCount[c] Or dgCbBindingCount <> avkCbDescBindingCount[c] Or dgCbPushBytes <> avkCbDescPushBytes[c]
+    ProcedureReturn 0
+  EndIf
+  While k < #ANVIL_VK_MAX_SET_BINDINGS
+    If dgCbType[k] <> avkCbDescType[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k] Or dgCbStages[k] <> avkCbDescStages[(c * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+      ProcedureReturn 0
+    EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure dgSnapshotCbPush(c.i)
+  Define k.i = 0
+  dgCbPushCount = avkCbPushBytes[c]
+  While k < 4
+    dgCbPushWord[k] = avkCbPushWord[(c * 4) + k]
+    k = k + 1
+  Wend
+EndProcedure
+
+Procedure.i dgCbPushUnchanged(c.i)
+  Define k.i = 0
+  If dgCbPushCount <> avkCbPushBytes[c] : ProcedureReturn 0 : EndIf
+  While k < 4
+    If dgCbPushWord[k] <> avkCbPushWord[(c * 4) + k] : ProcedureReturn 0 : EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i dgSemaphoreReservationStageSum()
+  Define i.i = 1
+  Define n.i = 0
+  While i <= #ANVIL_VK_MAX_SEMAPHORE_RESERVATIONS
+    n = n + avkSemTxStage[i]
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure dgObserveRetains(ubo.i, sampler.i, sampleView.i, sampleImage.i, attachmentView.i, attachmentImage.i)
+  Define ub.i = avkBufSlot(ubo)
+  Define si.i = avkSamplerSlot(sampler)
+  Define sv.i = avkIvSlot(sampleView)
+  Define sm.i = avkImgSlot(sampleImage)
+  Define av.i = avkIvSlot(attachmentView)
+  Define ai.i = avkImgSlot(attachmentImage)
+  If ub = 0 Or si = 0 Or sv = 0 Or sm = 0 Or av = 0 Or ai = 0
+    AnvilVkTestBackendObserveRetains(0, 0, 0, 0, 0, 0, 0, 0, 0)
+    ProcedureReturn
+  EndIf
+  AnvilVkTestBackendObserveRetains(@avkBufInFlight[ub], @avkMemInFlight[avkBufMemSlot[ub]], @avkSampInFlight[si], @avkIvInFlight[sv], @avkImgInFlight[sm], @avkMemInFlight[avkImgMemSlot[sm]], @avkIvInFlight[av], @avkImgInFlight[ai], @avkMemInFlight[avkImgMemSlot[ai]])
+EndProcedure
+
+Procedure.i dgFlightSum(ubo.i, sampler.i, sampleView.i, sampleImage.i, attachmentView.i, attachmentImage.i)
+  Define ub.i = avkBufSlot(ubo)
+  Define si.i = avkSamplerSlot(sampler)
+  Define sv.i = avkIvSlot(sampleView)
+  Define sm.i = avkImgSlot(sampleImage)
+  Define av.i = avkIvSlot(attachmentView)
+  Define ai.i = avkImgSlot(attachmentImage)
+  If ub = 0 Or si = 0 Or sv = 0 Or sm = 0 Or av = 0 Or ai = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkBufInFlight[ub] + avkMemInFlight[avkBufMemSlot[ub]] + avkSampInFlight[si] + avkIvInFlight[sv] + avkImgInFlight[sm] + avkMemInFlight[avkImgMemSlot[sm]] + avkIvInFlight[av] + avkImgInFlight[ai] + avkMemInFlight[avkImgMemSlot[ai]]
+EndProcedure
+
+Procedure.i dgRecordMixed(cmd.i, rp.i, fb.i, pipeline.i, vertexBuffer.i, descriptorSet.i, layout.i, *push)
+  Define rc.i
+  Define vertexOffset.q = 0
+  Define vertexHandle.i = vertexBuffer
+  Define setHandle.i = descriptorSet
+  Define bi.VkCommandBufferBeginInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define Dim clear.l[4]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  rc = vkResetCommandBuffer(cmd, 0) : If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rc = vkBeginCommandBuffer(cmd, @bi) : If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #DG_W : rpbi\renderArea\extent\height = #DG_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @clear[0]
+  AnvilVkFaultClear()
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setHandle, 0, 0)
+  vkCmdPushConstants(cmd, layout, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, *push)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  If AnvilVkFaultCode() <> 0 : ProcedureReturn AnvilVkFaultCode() : EndIf
+  ProcedureReturn vkEndCommandBuffer(cmd)
+EndProcedure
+
+; Shader parsing/lowering is intentionally outside this small gate. Seed only
+; the semantic owner state that public vkCreateGraphicsPipelines consumes.
+; No pipeline/layout/set/command state is seeded. Live publishes last.
+Procedure.i dgSeedVertex(device.i, slot.i)
+  Define d.i = avkDevSlot(device)
+  If d = 0 Or dgPrepareShaderSlot(slot) = 0
+    ProcedureReturn #VK_NULL_HANDLE
+  EndIf
+  avkShGen[slot] = avkNextGen(avkShGen[slot])
+  avkShDev[slot] = d
+  avkShStage[slot] = 0
+  avkShInCount[slot] = 1
+  avkShInComp[(slot * #ANVIL_SPV_MAX_ATTRS) + 0] = 4
+  avkShOutCount[slot] = 1
+  avkShOutComp[(slot * #ANVIL_SPV_MAX_VARYINGS) + 0] = 4
+  avkShOutSrc[(slot * #ANVIL_SPV_MAX_VARYINGS) + 0] = 0
+  avkShPosAttr[slot] = 0
+  avkShColourSrc[slot] = -1
+  avkShColourIdx[slot] = -1
+  avkShPush[slot] = 0 : avkShUniform[slot] = 0 : avkShSample[slot] = 0
+  avkShUsesVarying[slot] = 0
+  avkShIr[slot]\module\stage = #ANVIL_IR_STAGE_VERTEX
+  avkShIr[slot]\valid = 1 : avkShIrGen[slot] = avkShGen[slot]
+  avkShLive[slot] = 1
+  ProcedureReturn avkToken(#ANVIL_VK_TYPE_SHADER_MODULE, slot, avkShGen[slot])
+EndProcedure
+
+Procedure.i dgSeedFragment(device.i, slot.i)
+  Define d.i = avkDevSlot(device)
+  If d = 0 Or dgPrepareShaderSlot(slot) = 0
+    ProcedureReturn #VK_NULL_HANDLE
+  EndIf
+  avkShGen[slot] = avkNextGen(avkShGen[slot])
+  avkShDev[slot] = d
+  avkShStage[slot] = 4
+  avkShInCount[slot] = 1
+  avkShInComp[(slot * #ANVIL_SPV_MAX_ATTRS) + 0] = 4
+  avkShOutCount[slot] = 1
+  avkShOutComp[(slot * #ANVIL_SPV_MAX_VARYINGS) + 0] = 4
+  avkShPosAttr[slot] = -1
+  avkShColourSrc[slot] = #ANVIL_SPV_COLOUR_IR
+  avkShColourIdx[slot] = -1
+  avkShPush[slot] = 1
+  avkShUniform[slot] = 1 : avkShUniformSet[slot] = 0 : avkShUniformBinding[slot] = 0
+  avkShSample[slot] = 1 : avkShSampleSet[slot] = 0 : avkShSampleBinding[slot] = 1
+  avkShSampleCoord[slot] = 0 : avkShUsesVarying[slot] = 1
+  avkShIr[slot]\module\stage = #ANVIL_IR_STAGE_FRAGMENT
+  avkShIr[slot]\valid = 1 : avkShIrGen[slot] = avkShGen[slot]
+  avkShLive[slot] = 1
+  ProcedureReturn avkToken(#ANVIL_VK_TYPE_SHADER_MODULE, slot, avkShGen[slot])
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define k.i
+  Define count.i
+  Define bad.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define dev2.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define fence.i
+  Define signalSem.i
+  Define probeSem.i
+  Define img.i
+  Define mem.i
+  Define view.i
+  Define sampleImg.i
+  Define sampleMem.i
+  Define sampleView.i
+  Define sampler.i
+  Define rp.i
+  Define fb.i
+  Define fb2.i
+  Define vbuf.i
+  Define vmem.i
+  Define ubuf.i
+  Define umem.i
+  Define dsl.i
+  Define dslAlt.i
+  Define dslSingleUbo.i
+  Define dslSingleSample.i
+  Define dslReuse.i
+  Define dslDev2.i
+  Define dpool.i
+  Define dpool2.i
+  Define dpoolDev2.i
+  Define dset.i
+  Define dset2.i
+  Define dsetDev2.i
+  Define layout.i
+  Define layoutCompat.i
+  Define layoutNoPush.i
+  Define layoutReuse.i
+  Define layoutDev2.i
+  Define pipeline.i
+  Define vs.i
+  Define fs.i
+  Define setArray.i
+  Define bufferHandle.i
+  Define bufferOffset.q
+  Define oldDsl.i
+  Define oldLayout.i
+  Define oldFb.i
+  Define oldDslSlot.i
+  Define oldLayoutSlot.i
+  Define oldFbSlot.i
+  Define poolSlot.i
+  Define cbSlot.i
+  Define beforeSubmit.i
+  Define beforeCalls.i
+  Define beforeDraws.i
+  Define beforeTx.i
+  Define beforeSignal.i
+  Define beforeValue0.i
+  Define beforeValue1.i
+  Define beforeValue2.i
+  Define sampleView2.i
+  Define ubuf2.i
+  Define umem2.i
+
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define priority.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define fci.VkFenceCreateInfo
+  Define sci.VkSemaphoreCreateInfo
+  Define si.VkSubmitInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo
+  Define sampci.VkSamplerCreateInfo
+  Define bar.VkImageMemoryBarrier
+  Define dslci.VkDescriptorSetLayoutCreateInfo
+  Define Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Define Dim bindingsAlt.VkDescriptorSetLayoutBinding[2]
+  Define oneBinding.VkDescriptorSetLayoutBinding
+  Define dpci.VkDescriptorPoolCreateInfo
+  Define Dim sizes.VkDescriptorPoolSize[5]
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dsai2.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define dii.VkDescriptorImageInfo
+  Define writeUbo.VkWriteDescriptorSet
+  Define writeSample.VkWriteDescriptorSet
+  Define pcr.VkPushConstantRange
+  Define plci.VkPipelineLayoutCreateInfo
+  Define plci2.VkPipelineLayoutCreateInfo
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define bind.VkVertexInputBindingDescription
+  Define attr.VkVertexInputAttributeDescription
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define vp.VkViewport
+  Define sc.VkRect2D
+  Define vps.VkPipelineViewportStateCreateInfo
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define Dim clear.l[4]
+  Define Dim push.l[4]
+
+  dgPut(0, #DG_MAGIC) : dgPut(4, #DG_VERSION)
+  AnvilVkTestBackendHeap(#DG_HEAP, #DG_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : ProcedureReturn dgStop(10) : EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn dgStop(11) : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : ProcedureReturn dgStop(12) : EndIf
+  If vkCreateDevice(phys, @dci, 0, @dev2) <> #VK_SUCCESS : ProcedureReturn dgStop(17) : EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : ProcedureReturn dgStop(13) : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY : cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : ProcedureReturn dgStop(14) : EndIf
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : ProcedureReturn dgStop(15) : EndIf
+  sci\sType = #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+  If vkCreateSemaphore(dev, @sci, 0, @signalSem) <> #VK_SUCCESS : ProcedureReturn dgStop(16) : EndIf
+  If vkCreateSemaphore(dev, @sci, 0, @probeSem) <> #VK_SUCCESS : ProcedureReturn dgStop(18) : EndIf
+
+  ; Attachment image/view/render pass/framebuffer.
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D : imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #DG_W : imgci\extent\height = #DG_H : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1 : imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS : ProcedureReturn dgStop(20) : EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO : mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @mem) <> #VK_SUCCESS : ProcedureReturn dgStop(21) : EndIf
+  If vkBindImageMemory(dev, img, mem, 0) <> #VK_SUCCESS : ProcedureReturn dgStop(22) : EndIf
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D : ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS : ProcedureReturn dgStop(23) : EndIf
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM : att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE : att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED : att\finalLayout = #VK_IMAGE_LAYOUT_GENERAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS : sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1 : rpci\pAttachments = @att : rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS : ProcedureReturn dgStop(24) : EndIf
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp : fbci\attachmentCount = 1 : fbci\pAttachments = @view
+  fbci\width = #DG_W : fbci\height = #DG_H : fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS : ProcedureReturn dgStop(25) : EndIf
+
+  ; Separate sampled image and public layout transition.
+  imgci\extent\width = 1 : imgci\extent\height = 1 : imgci\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
+  If vkCreateImage(dev, @imgci, 0, @sampleImg) <> #VK_SUCCESS : ProcedureReturn dgStop(30) : EndIf
+  vkGetImageMemoryRequirements(dev, sampleImg, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @sampleMem) <> #VK_SUCCESS : ProcedureReturn dgStop(31) : EndIf
+  If vkBindImageMemory(dev, sampleImg, sampleMem, 0) <> #VK_SUCCESS : ProcedureReturn dgStop(32) : EndIf
+  ivci\image = sampleImg
+  If vkCreateImageView(dev, @ivci, 0, @sampleView) <> #VK_SUCCESS : ProcedureReturn dgStop(33) : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED : bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\image = sampleImg : bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn dgStop(34) : EndIf
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO : si\commandBufferCount = 1 : si\pCommandBuffers = @cmd
+  vkResetFences(dev, 1, @fence)
+  If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : ProcedureReturn dgStop(35) : EndIf
+  If vkWaitForFences(dev, 1, @fence, 1, 1000000000) <> #VK_SUCCESS : ProcedureReturn dgStop(36) : EndIf
+
+  ; Vertex and uniform buffers.
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bufci\size = 3 * 16 : bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  If vkCreateBuffer(dev, @bufci, 0, @vbuf) <> #VK_SUCCESS : ProcedureReturn dgStop(40) : EndIf
+  vkGetBufferMemoryRequirements(dev, vbuf, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @vmem) <> #VK_SUCCESS : ProcedureReturn dgStop(41) : EndIf
+  If vkBindBufferMemory(dev, vbuf, vmem, 0) <> #VK_SUCCESS : ProcedureReturn dgStop(42) : EndIf
+  bufci\size = 32 : bufci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+  If vkCreateBuffer(dev, @bufci, 0, @ubuf) <> #VK_SUCCESS : ProcedureReturn dgStop(43) : EndIf
+  vkGetBufferMemoryRequirements(dev, ubuf, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @umem) <> #VK_SUCCESS : ProcedureReturn dgStop(44) : EndIf
+  If vkBindBufferMemory(dev, ubuf, umem, 0) <> #VK_SUCCESS : ProcedureReturn dgStop(45) : EndIf
+
+  sampci\sType = #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+  sampci\magFilter = #VK_FILTER_LINEAR : sampci\minFilter = #VK_FILTER_NEAREST
+  sampci\mipmapMode = #VK_SAMPLER_MIPMAP_MODE_NEAREST
+  sampci\addressModeU = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sampci\addressModeV = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  sampci\addressModeW = #VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+  If vkCreateSampler(dev, @sampci, 0, @sampler) <> #VK_SUCCESS : ProcedureReturn dgStop(46) : EndIf
+
+  ; Canonical mixed schema, duplicate-row pool and independent updates.
+  bindings[0]\binding = 0 : bindings[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[0]\descriptorCount = 1 : bindings[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  bindings[1]\binding = 1 : bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  bindings[1]\descriptorCount = 1 : bindings[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
+  If vkCreateDescriptorSetLayout(dev, @dslci, 0, @dsl) <> #VK_SUCCESS : ProcedureReturn dgStop(50) : EndIf
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  sizes[2]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[2]\descriptorCount = 1
+  dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  dpci\maxSets = 2 : dpci\poolSizeCount = 3 : dpci\pPoolSizes = @sizes[0]
+  If vkCreateDescriptorPool(dev, @dpci, 0, @dpool) <> #VK_SUCCESS : ProcedureReturn dgStop(51) : EndIf
+  i = avkDpSlot(dpool) : dgPut(100, avkDpUboCapacity[i]) : dgPut(101, avkDpSampleCapacity[i])
+  dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsai\descriptorPool = dpool : dsai\descriptorSetCount = 1 : dsai\pSetLayouts = @dsl
+  If vkAllocateDescriptorSets(dev, @dsai, @dset) <> #VK_SUCCESS : ProcedureReturn dgStop(52) : EndIf
+  i = avkDpSlot(dpool)
+  dgPut(154, Bool(avkDpSetsOut[i] = 1 And avkDpUboOut[i] = 1 And avkDpSampleOut[i] = 1))
+  dgPut(108, Bool(AnvilVkDescriptorSetSchemaType(dset, 0) = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And AnvilVkDescriptorSetSchemaStages(dset, 0) = #VK_SHADER_STAGE_FRAGMENT_BIT And AnvilVkDescriptorSetSchemaType(dset, 1) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And AnvilVkDescriptorSetSchemaStages(dset, 1) = #VK_SHADER_STAGE_FRAGMENT_BIT))
+  dbi\buffer = ubuf : dbi\offset = 0 : dbi\range = 16
+  writeUbo\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writeUbo\dstSet = dset : writeUbo\dstBinding = 0 : writeUbo\descriptorCount = 1
+  writeUbo\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : writeUbo\pBufferInfo = @dbi
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0) : dgPut(102, AnvilVkFaultCode())
+  dii\sampler = sampler : dii\imageView = sampleView : dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  writeSample\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writeSample\dstSet = dset : writeSample\dstBinding = 1 : writeSample\descriptorCount = 1
+  writeSample\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : writeSample\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0) : dgPut(103, AnvilVkFaultCode())
+
+  ; Pipeline layout and actual public pipeline from safely seeded semantics.
+  pcr\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT : pcr\offset = 0 : pcr\size = 16
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  plci\setLayoutCount = 1 : plci\pSetLayouts = @dsl
+  plci\pushConstantRangeCount = 1 : plci\pPushConstantRanges = @pcr
+  If vkCreatePipelineLayout(dev, @plci, 0, @layout) <> #VK_SUCCESS : ProcedureReturn dgStop(53) : EndIf
+  dgPut(109, Bool(avkLayBindingCount[avkLaySlot(layout)] = 2 And avkLayBindingType[(avkLaySlot(layout) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkLayBindingStages[(avkLaySlot(layout) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkLayBindingType[(avkLaySlot(layout) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And avkLayBindingStages[(avkLaySlot(layout) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT))
+  If dgShaderTableFresh() = 0 : ProcedureReturn dgStop(54) : EndIf
+  vs = dgSeedVertex(dev, 1) : fs = dgSeedFragment(dev, 2)
+  If vs = 0 Or fs = 0 : ProcedureReturn dgStop(54) : EndIf
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT : stages[0]\module = vs
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT : stages[1]\module = fs
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  bind\binding = 0 : bind\stride = 16 : bind\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attr\location = 0 : attr\binding = 0 : attr\format = #VK_FORMAT_R32G32B32A32_SFLOAT : attr\offset = 0
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\vertexBindingDescriptionCount = 1 : vi\pVertexBindingDescriptions = @bind
+  vi\vertexAttributeDescriptionCount = 1 : vi\pVertexAttributeDescriptions = @attr
+  PokeL(@vp\width, $41800000) : PokeL(@vp\height, $41800000) : PokeL(@vp\maxDepth, $3F800000)
+  sc\extent\width = #DG_W : sc\extent\height = #DG_H
+  vps\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vps\viewportCount = 1 : vps\pViewports = @vp : vps\scissorCount = 1 : vps\pScissors = @sc
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL : rs\cullMode = #VK_CULL_MODE_NONE : rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, $3F800000)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO : ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO : cb\attachmentCount = 1 : cb\pAttachments = @cba
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2 : gp\pStages = @stages[0] : gp\pVertexInputState = @vi : gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vps : gp\pRasterizationState = @rs : gp\pMultisampleState = @ms : gp\pColorBlendState = @cb
+  gp\layout = layout : gp\renderPass = rp : gp\basePipelineIndex = -1
+  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeline) <> #VK_SUCCESS : ProcedureReturn dgStop(55) : EndIf
+  i = avkPipeSlot(pipeline)
+  dgPut(127, Bool(avkPipeSetCount[i] = 1 And avkPipeBindingCount[i] = 2 And avkPipeBindingType[(i * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkPipeBindingType[(i * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
+  dgPut(128, Bool(avkPipeBindingStages[(i * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkPipeBindingStages[(i * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT))
+
+  ; One real mixed draw reaches the public backend with all three inputs.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #DG_W : rpbi\renderArea\extent\height = #DG_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @clear[0]
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+  bufferHandle = vbuf : bufferOffset = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufferHandle, @bufferOffset)
+  setArray = dset
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  cbSlot = avkCmdSlot(cmd)
+  dgPut(119, Bool(avkCbDescBindingCount[cbSlot] = 2 And avkCbDescType[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkCbDescStages[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkCbDescType[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And avkCbDescStages[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT))
+  push[0] = $3F800000 : push[1] = $3F000000 : push[2] = 0 : push[3] = $3F800000
+  vkCmdPushConstants(cmd, layout, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @push[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0) : vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn dgStop(56) : EndIf
+  AnvilVkTestBackendObserveRetains(@avkBufInFlight[avkBufSlot(ubuf)], @avkMemInFlight[avkBufMemSlot[avkBufSlot(ubuf)]], @avkSampInFlight[avkSamplerSlot(sampler)], @avkIvInFlight[avkIvSlot(sampleView)], @avkImgInFlight[avkImgSlot(sampleImg)], @avkMemInFlight[avkImgMemSlot[avkImgSlot(sampleImg)]], @avkIvInFlight[avkIvSlot(view)], @avkImgInFlight[avkImgSlot(img)], @avkMemInFlight[avkImgMemSlot[avkImgSlot(img)]])
+  AnvilVkTestBackendHold(1)
+  si\signalSemaphoreCount = 1 : si\pSignalSemaphores = @signalSem
+  vkResetFences(dev, 1, @fence)
+  dgPut(104, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(105, AnvilVkTestBackendDraws())
+  k = 0
+  While k < 9 : dgPut(110 + k, AnvilVkTestBackendObservedRetain(k)) : k = k + 1 : Wend
+  AnvilVkTestBackendHold(0)
+  dgPut(106, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+  dgPut(107, avkBufInFlight[avkBufSlot(ubuf)] + avkMemInFlight[avkBufMemSlot[avkBufSlot(ubuf)]] + avkSampInFlight[avkSamplerSlot(sampler)] + avkIvInFlight[avkIvSlot(sampleView)] + avkImgInFlight[avkImgSlot(sampleImg)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(sampleImg)]] + avkIvInFlight[avkIvSlot(view)] + avkImgInFlight[avkImgSlot(img)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(img)]])
+
+  ; ------------------------------------------------------------------
+  ; Pool arithmetic and allocation transactionality. Duplicate pool-size
+  ; rows are legal and are summed per descriptor type in either order.
+  ; ------------------------------------------------------------------
+  bindingsAlt[0]\binding = bindings[1]\binding : bindingsAlt[0]\descriptorType = bindings[1]\descriptorType
+  bindingsAlt[0]\descriptorCount = bindings[1]\descriptorCount : bindingsAlt[0]\stageFlags = bindings[1]\stageFlags
+  bindingsAlt[0]\pImmutableSamplers = 0
+  bindingsAlt[1]\binding = bindings[0]\binding : bindingsAlt[1]\descriptorType = bindings[0]\descriptorType
+  bindingsAlt[1]\descriptorCount = bindings[0]\descriptorCount : bindingsAlt[1]\stageFlags = bindings[0]\stageFlags
+  bindingsAlt[1]\pImmutableSamplers = 0
+  dslci\pBindings = @bindingsAlt[0]
+  dgPut(130, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dslAlt))
+  dgPut(131, Bool(AnvilVkSetLayoutBindingTypeOf(dslAlt, 0) = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And AnvilVkSetLayoutBindingTypeOf(dslAlt, 1) = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And AnvilVkSetLayoutBindingStagesOf(dslAlt, 0) = #VK_SHADER_STAGE_FRAGMENT_BIT And AnvilVkSetLayoutBindingStagesOf(dslAlt, 1) = #VK_SHADER_STAGE_FRAGMENT_BIT))
+  dslci\pBindings = @bindings[0]
+
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[1]\descriptorCount = 1
+  sizes[2]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[2]\descriptorCount = 1
+  dpci\maxSets = 2 : dpci\poolSizeCount = 3 : dpci\pPoolSizes = @sizes[0]
+  dgPut(132, vkCreateDescriptorPool(dev, @dpci, 0, @dpool2))
+  poolSlot = avkDpSlot(dpool2)
+  dgPut(133, Bool(poolSlot <> 0 And avkDpUboCapacity[poolSlot] = 1 And avkDpSampleCapacity[poolSlot] = 2))
+  vkDestroyDescriptorPool(dev, dpool2, 0) : dpool2 = 0
+
+  ; poolSizeCount has no artificial row cap. A five-row valid input is folded
+  ; in one pass, while an unsupported final row refuses before publication.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  sizes[2]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[2]\descriptorCount = 2
+  sizes[3]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[3]\descriptorCount = 2
+  sizes[4]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[4]\descriptorCount = 3
+  dpci\maxSets = 1 : dpci\poolSizeCount = 5 : dpci\pPoolSizes = @sizes[0]
+  dgPut(155, vkCreateDescriptorPool(dev, @dpci, 0, @dpool2))
+  poolSlot = avkDpSlot(dpool2)
+  dgPut(156, Bool(poolSlot <> 0 And avkDpUboCapacity[poolSlot] = 6 And avkDpSampleCapacity[poolSlot] = 3))
+  vkDestroyDescriptorPool(dev, dpool2, 0) : dpool2 = 0
+  sizes[4]\type = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : dgSnapshotPools() : bad = #DG_POISON
+  dgPut(157, vkCreateDescriptorPool(dev, @dpci, 0, @bad)) : dgPut(158, bad)
+  dgPut(159, dgPoolsUnchanged())
+
+  ; UINT32 overflow must fail before a pool slot or output is published.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = $FFFFFFFF
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[1]\descriptorCount = 1
+  dpci\poolSizeCount = 2 : dgSnapshotPools() : bad = #DG_POISON
+  dgPut(134, vkCreateDescriptorPool(dev, @dpci, 0, @bad)) : dgPut(135, bad)
+  dgPut(136, dgPoolsUnchanged())
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[0]\descriptorCount = $FFFFFFFF
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  dgSnapshotPools() : bad = #DG_POISON
+  dgPut(137, vkCreateDescriptorPool(dev, @dpci, 0, @bad)) : dgPut(138, bad)
+  dgPut(139, dgPoolsUnchanged())
+
+  oneBinding\binding = bindings[0]\binding : oneBinding\descriptorType = bindings[0]\descriptorType
+  oneBinding\descriptorCount = bindings[0]\descriptorCount : oneBinding\stageFlags = bindings[0]\stageFlags
+  oneBinding\pImmutableSamplers = 0
+  dslci\bindingCount = 1 : dslci\pBindings = @oneBinding
+  dgPut(140, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dslSingleUbo))
+  oneBinding\binding = 0 : oneBinding\descriptorType = bindings[1]\descriptorType
+  oneBinding\descriptorCount = bindings[1]\descriptorCount : oneBinding\stageFlags = bindings[1]\stageFlags
+  oneBinding\pImmutableSamplers = 0
+  dgPut(141, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dslSingleSample))
+  dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
+
+  ; Sample-only capacity isolates the missing UBO arm. The mixed allocation
+  ; consumes neither family and leaks no set; sample-only must still succeed.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[0]\descriptorCount = 1
+  dpci\maxSets = 2 : dpci\poolSizeCount = 1 : dpci\pPoolSizes = @sizes[0]
+  dgPut(142, vkCreateDescriptorPool(dev, @dpci, 0, @dpool2))
+  poolSlot = avkDpSlot(dpool2) : dgSnapshotSets()
+  beforeValue0 = avkDpSetsOut[poolSlot] : beforeValue1 = avkDpUboOut[poolSlot] : beforeValue2 = avkDpSampleOut[poolSlot]
+  dsai2\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO : dsai2\descriptorPool = dpool2 : dsai2\descriptorSetCount = 1 : dsai2\pSetLayouts = @dslAlt
+  bad = #DG_POISON : dgPut(143, vkAllocateDescriptorSets(dev, @dsai2, @bad)) : dgPut(144, bad)
+  dgPut(145, Bool(dgSetsUnchanged() = 1 And avkDpSetsOut[poolSlot] = beforeValue0 And avkDpUboOut[poolSlot] = beforeValue1 And avkDpSampleOut[poolSlot] = beforeValue2))
+  dsai2\pSetLayouts = @dslSingleSample
+  dgPut(146, vkAllocateDescriptorSets(dev, @dsai2, @dset2))
+  dgPut(147, Bool(avkDpSetsOut[poolSlot] = 1 And avkDpUboOut[poolSlot] = 0 And avkDpSampleOut[poolSlot] = 1))
+  vkDestroyDescriptorPool(dev, dpool2, 0) : dpool2 = 0 : dset2 = 0
+
+  ; UBO-only capacity isolates the missing sample arm symmetrically.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  dpci\pPoolSizes = @sizes[0]
+  dgPut(148, vkCreateDescriptorPool(dev, @dpci, 0, @dpool2))
+  poolSlot = avkDpSlot(dpool2) : dgSnapshotSets()
+  beforeValue0 = avkDpSetsOut[poolSlot] : beforeValue1 = avkDpUboOut[poolSlot] : beforeValue2 = avkDpSampleOut[poolSlot]
+  dsai2\descriptorPool = dpool2 : dsai2\pSetLayouts = @dslAlt : bad = #DG_POISON
+  dgPut(149, vkAllocateDescriptorSets(dev, @dsai2, @bad)) : dgPut(150, bad)
+  dgPut(151, Bool(dgSetsUnchanged() = 1 And avkDpSetsOut[poolSlot] = beforeValue0 And avkDpUboOut[poolSlot] = beforeValue1 And avkDpSampleOut[poolSlot] = beforeValue2))
+  dsai2\pSetLayouts = @dslSingleUbo
+  dgPut(152, vkAllocateDescriptorSets(dev, @dsai2, @dset2))
+  dgPut(153, Bool(avkDpSetsOut[poolSlot] = 1 And avkDpUboOut[poolSlot] = 1 And avkDpSampleOut[poolSlot] = 0))
+  vkDestroyDescriptorPool(dev, dpool2, 0) : dpool2 = 0 : dset2 = 0
+
+  ; These one-binding schemas were only allocation probes. Releasing them now
+  ; leaves honest capacity for the later second-device ownership fixtures.
+  vkDestroyDescriptorSetLayout(dev, dslSingleUbo, 0) : dslSingleUbo = 0
+  vkDestroyDescriptorSetLayout(dev, dslSingleSample, 0) : dslSingleSample = 0
+
+  ; ------------------------------------------------------------------
+  ; Immutable schema ownership through DSL -> set/layout -> pipeline -> CB.
+  ; ------------------------------------------------------------------
+  setArray = dslAlt
+  plci2\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  plci2\setLayoutCount = 1 : plci2\pSetLayouts = @setArray
+  plci2\pushConstantRangeCount = 1 : plci2\pPushConstantRanges = @pcr
+  dgPut(160, vkCreatePipelineLayout(dev, @plci2, 0, @layoutCompat))
+  dgPut(161, Bool(avkLayBindingCount[avkLaySlot(layoutCompat)] = 2 And avkLayBindingType[(avkLaySlot(layoutCompat) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkLayBindingType[(avkLaySlot(layoutCompat) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And avkLayBindingStages[(avkLaySlot(layoutCompat) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkLayBindingStages[(avkLaySlot(layoutCompat) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkLayPushBytes[avkLaySlot(layoutCompat)] = 16))
+  plci2\pushConstantRangeCount = 0 : plci2\pPushConstantRanges = 0
+  dgPut(162, vkCreatePipelineLayout(dev, @plci2, 0, @layoutNoPush))
+  plci2\pushConstantRangeCount = 1 : plci2\pPushConstantRanges = @pcr
+
+  oldDsl = dsl : oldDslSlot = avkDslSlot(dsl)
+  dgSnapshotSets() : dgSnapshotLayouts()
+  vkDestroyDescriptorSetLayout(dev, dsl, 0) : dsl = 0
+  dslci\bindingCount = 1 : dslci\pBindings = @oneBinding
+  dgPut(163, vkCreateDescriptorSetLayout(dev, @dslci, 0, @dslReuse))
+  dgPut(164, Bool(avkDslSlot(dslReuse) = oldDslSlot))
+  dgPut(165, dgSetsUnchanged())
+  dgPut(166, dgLayoutsUnchanged())
+  setArray = oldDsl : plci2\pSetLayouts = @setArray : bad = #DG_POISON
+  dgPut(167, vkCreatePipelineLayout(dev, @plci2, 0, @bad)) : dgPut(168, bad)
+
+  ; Record through a distinct compatible layout. Destroy/reuse that layout
+  ; afterward; the command buffer and pipeline must retain copied signatures.
+  dgPut(169, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layoutCompat, @push[0]))
+  cbSlot = avkCmdSlot(cmd)
+  dgPut(170, Bool(avkCbDescSetCount[cbSlot] = 1 And avkCbDescBindingCount[cbSlot] = 2 And avkCbDescPushBytes[cbSlot] = 16 And avkCbDescType[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkCbDescType[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And avkCbDescStages[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkCbDescStages[(cbSlot * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT))
+  dgSnapshotCbDescriptor(cbSlot)
+  oldLayout = layoutCompat : oldLayoutSlot = avkLaySlot(layoutCompat)
+  vkDestroyPipelineLayout(dev, layoutCompat, 0) : layoutCompat = 0
+  setArray = dslReuse : plci2\pSetLayouts = @setArray : plci2\pushConstantRangeCount = 0 : plci2\pPushConstantRanges = 0
+  dgPut(171, vkCreatePipelineLayout(dev, @plci2, 0, @layoutReuse))
+  dgPut(172, Bool(avkLaySlot(layoutReuse) = oldLayoutSlot))
+  dgPut(173, Bool(avkPipeSetCount[avkPipeSlot(pipeline)] = 1 And avkPipeBindingCount[avkPipeSlot(pipeline)] = 2 And avkPipeBindingType[(avkPipeSlot(pipeline) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER And avkPipeBindingStages[(avkPipeSlot(pipeline) * #ANVIL_VK_MAX_SET_BINDINGS) + 0] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkPipeBindingType[(avkPipeSlot(pipeline) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER And avkPipeBindingStages[(avkPipeSlot(pipeline) * #ANVIL_VK_MAX_SET_BINDINGS) + 1] = #VK_SHADER_STAGE_FRAGMENT_BIT And avkPipePushBytes[avkPipeSlot(pipeline)] = 16))
+  dgPut(174, dgCbDescriptorUnchanged(cbSlot))
+  si\signalSemaphoreCount = 0 : si\pSignalSemaphores = 0
+  vkResetFences(dev, 1, @fence)
+  dgPut(175, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(176, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+
+  ; Incompatible bind attempts preserve the full previously-copied CB schema.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  setArray = dset
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutNoPush, 0, 1, @setArray, 0, 0)
+  dgSnapshotCbDescriptor(cbSlot)
+  AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutReuse, 0, 1, @setArray, 0, 0)
+  dgPut(177, AnvilVkFaultCode())
+  dgPut(178, dgCbDescriptorUnchanged(cbSlot))
+  vkResetCommandBuffer(cmd, 0)
+
+  ; Isolate every set-zero compatibility dimension. Count, type and stage
+  ; mismatches are injected into the set's already-copied immutable schema so
+  ; creation-time validation cannot mask the bind comparator. Each refusal
+  ; must leave the complete prior CB descriptor signature untouched.
+  i = avkDsSlot(dset)
+  vkBeginCommandBuffer(cmd, @bi) : setArray = dset
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgSnapshotCbDescriptor(cbSlot) : avkDsCount[i] = 1 : AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgPut(330, AnvilVkFaultCode()) : dgPut(331, dgCbDescriptorUnchanged(cbSlot))
+  avkDsCount[i] = 2 : vkResetCommandBuffer(cmd, 0)
+
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgSnapshotCbDescriptor(cbSlot) : avkDsType[i * #ANVIL_VK_MAX_SET_BINDINGS] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgPut(332, AnvilVkFaultCode()) : dgPut(333, dgCbDescriptorUnchanged(cbSlot))
+  avkDsType[i * #ANVIL_VK_MAX_SET_BINDINGS] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : vkResetCommandBuffer(cmd, 0)
+
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgSnapshotCbDescriptor(cbSlot) : avkDsStages[i * #ANVIL_VK_MAX_SET_BINDINGS] = 0 : AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, @setArray, 0, 0)
+  dgPut(334, AnvilVkFaultCode()) : dgPut(335, dgCbDescriptorUnchanged(cbSlot))
+  avkDsStages[i * #ANVIL_VK_MAX_SET_BINDINGS] = #VK_SHADER_STAGE_FRAGMENT_BIT : vkResetCommandBuffer(cmd, 0)
+
+  ; A no-push layout has the identical set schema. Record real push data
+  ; through the compatible push layout, then bind through the no-push layout:
+  ; only the copied push-range signature differs at draw validation.
+  vkBeginCommandBuffer(cmd, @bi)
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline)
+  bufferHandle = vbuf : bufferOffset = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufferHandle, @bufferOffset)
+  vkCmdPushConstants(cmd, layout, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @push[0])
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutNoPush, 0, 1, @setArray, 0, 0)
+  beforeValue0 = avkCbDrawCount[cbSlot] : beforeValue1 = avkCbDrawFirst[cbSlot] : beforeValue2 = avkCbDrawVerts[cbSlot]
+  AnvilVkFaultClear() : vkCmdDraw(cmd, 3, 1, 0, 0)
+  dgPut(336, AnvilVkFaultCode())
+  dgPut(337, Bool(avkCbDrawCount[cbSlot] = beforeValue0 And avkCbDrawFirst[cbSlot] = beforeValue1 And avkCbDrawVerts[cbSlot] = beforeValue2))
+  vkResetCommandBuffer(cmd, 0)
+
+  ; ------------------------------------------------------------------
+  ; Cross-device guards. Each row reaches its own ownership branch.
+  ; ------------------------------------------------------------------
+  bindingsAlt[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT : bindingsAlt[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  dslci\bindingCount = 2 : dslci\pBindings = @bindingsAlt[0]
+  dgPut(180, vkCreateDescriptorSetLayout(dev2, @dslci, 0, @dslDev2))
+  setArray = dslDev2 : plci2\pSetLayouts = @setArray : plci2\pushConstantRangeCount = 1 : plci2\pPushConstantRanges = @pcr
+  dgSnapshotLayouts() : bad = #DG_POISON : dgPut(181, vkCreatePipelineLayout(dev, @plci2, 0, @bad)) : dgPut(182, bad)
+  dgPut(339, dgLayoutsUnchanged())
+  dgPut(183, vkCreatePipelineLayout(dev2, @plci2, 0, @layoutDev2))
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  dpci\maxSets = 1 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  dgPut(341, vkCreateDescriptorPool(dev, @dpci, 0, @dpool2))
+  dsai2\descriptorPool = dpool2 : dsai2\pSetLayouts = @dslDev2 : bad = #DG_POISON
+  dgSnapshotPools() : dgSnapshotSets()
+  dgPut(184, vkAllocateDescriptorSets(dev, @dsai2, @bad)) : dgPut(185, bad)
+  dgPut(340, Bool(dgPoolsUnchanged() = 1 And dgSetsUnchanged() = 1))
+  vkDestroyDescriptorPool(dev, dpool2, 0) : dpool2 = 0
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  dpci\maxSets = 1 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  dgPut(186, vkCreateDescriptorPool(dev2, @dpci, 0, @dpoolDev2))
+  dsai2\descriptorPool = dpoolDev2 : dsai2\pSetLayouts = @dslDev2
+  dgPut(187, vkAllocateDescriptorSets(dev2, @dsai2, @dsetDev2))
+  dgSnapshotSets()
+  writeUbo\dstSet = dsetDev2
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0)
+  dgPut(188, AnvilVkFaultCode())
+  dgPut(189, dgSetsUnchanged())
+  writeUbo\dstSet = dset
+  vkBeginCommandBuffer(cmd, @bi)
+  setArray = dset
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutNoPush, 0, 1, @setArray, 0, 0)
+  dgSnapshotCbDescriptor(cbSlot)
+  setArray = dsetDev2 : AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutNoPush, 0, 1, @setArray, 0, 0)
+  dgPut(190, AnvilVkFaultCode())
+  dgPut(191, dgCbDescriptorUnchanged(cbSlot))
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  setArray = dset
+  dgSnapshotCbDescriptor(cbSlot)
+  AnvilVkFaultClear()
+  vkCmdBindDescriptorSets(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, layoutDev2, 0, 1, @setArray, 0, 0)
+  dgPut(192, AnvilVkFaultCode()) : dgPut(338, dgCbDescriptorUnchanged(cbSlot))
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  dgSnapshotCbPush(cbSlot) : AnvilVkFaultClear()
+  vkCmdPushConstants(cmd, layoutDev2, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @push[0])
+  dgPut(193, AnvilVkFaultCode()) : dgPut(194, dgCbPushUnchanged(cbSlot))
+  vkResetCommandBuffer(cmd, 0)
+
+  ; Independent updates preserve the other binding; failed replacement is
+  ; fail-before-write for the whole existing mixed descriptor state.
+  writeSample\dstSet = dset : writeSample\dstBinding = 1 : writeSample\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0)
+  dgPut(200, AnvilVkFaultCode())
+  writeUbo\dstSet = dset : writeUbo\dstBinding = 0 : dbi\range = 16
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0)
+  dgPut(201, AnvilVkFaultCode())
+  dgPut(202, Bool(AnvilVkDescriptorSetBuffer(dset, 0) = ubuf And AnvilVkDescriptorSetSamplerHandle(dset, 1) = sampler And AnvilVkDescriptorSetImageViewHandle(dset, 1) = sampleView))
+  dgSnapshotSets()
+  dbi\range = 8 : AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0)
+  dgPut(203, AnvilVkFaultCode())
+  dgPut(204, dgSetsUnchanged())
+  dgSnapshotSets() : dbi\range = $7FFFFFFFFFFFFFFF : AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0)
+  dgPut(207, AnvilVkFaultCode()) : dgPut(208, dgSetsUnchanged())
+  dbi\range = 16 : dii\imageLayout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : dgSnapshotSets()
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0)
+  dgPut(205, AnvilVkFaultCode())
+  dgPut(206, dgSetsUnchanged())
+  dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+
+  ; Backend refusal occurs after the callback sees the retains; rollback must
+  ; release all nine and leave no pending flight.
+  dgPut(232, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  dgObserveRetains(ubuf, sampler, sampleView, sampleImg, view, img)
+  AnvilVkTestBackendDrawFailNext() : vkResetFences(dev, 1, @fence)
+  dgPut(233, vkQueueSubmit(queue, 1, @si, fence))
+  k = 0 : While k < 9 : dgPut(234 + k, AnvilVkTestBackendObservedRetain(k)) : k = k + 1 : Wend
+  dgPut(243, dgFlightSum(ubuf, sampler, sampleView, sampleImg, view, img))
+
+  ; The same view/image/memory may be both sampled and attached. Retains are
+  ; counts, not booleans: those three dependencies must be 2 and return to 0.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  bar\srcAccessMask = #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_GENERAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\image = img
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  dgPut(244, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fence) : dgPut(245, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(246, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+  dii\imageView = view : writeSample\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0) : dgPut(247, AnvilVkFaultCode())
+  dgPut(248, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  dgObserveRetains(ubuf, sampler, view, img, view, img)
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fence)
+  dgPut(249, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(250, AnvilVkTestBackendObservedRetain(3))
+  dgPut(251, AnvilVkTestBackendObservedRetain(4))
+  dgPut(252, AnvilVkTestBackendObservedRetain(5))
+  dgPut(253, AnvilVkTestBackendObservedRetain(6))
+  dgPut(254, AnvilVkTestBackendObservedRetain(7))
+  dgPut(255, AnvilVkTestBackendObservedRetain(8))
+  AnvilVkTestBackendHold(0) : dgPut(256, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+  dgPut(257, dgFlightSum(ubuf, sampler, view, img, view, img))
+  dii\imageView = sampleView : writeSample\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0) : dgPut(258, AnvilVkFaultCode())
+
+  ; ------------------------------------------------------------------
+  ; Both descriptor families are preflighted before any semaphore, fence,
+  ; flight, submit count, callback observer or backend state is changed.
+  ; ------------------------------------------------------------------
+  dgPut(260, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  AnvilVkTestBackendPoisonObservedRetains($13579BDF)
+  beforeSubmit = AnvilVkSubmitCount() : beforeCalls = AnvilVkTestBackendCalls() : beforeDraws = AnvilVkTestBackendDraws()
+  beforeTx = dgSemaphoreReservationStageSum() : beforeSignal = avkSemaphoreState(dev, probeSem)
+  beforeValue0 = avkIvSlot(sampleView)
+  vkResetFences(dev, 1, @fence)
+  si\signalSemaphoreCount = 1 : si\pSignalSemaphores = @probeSem
+  vkDestroyImageView(dev, sampleView, 0) : sampleView = 0
+  dgPut(261, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(293, AnvilVkFaultCode())
+  dgPut(262, AnvilVkSubmitCount() - beforeSubmit) : dgPut(263, AnvilVkTestBackendCalls() - beforeCalls) : dgPut(264, AnvilVkTestBackendDraws() - beforeDraws)
+  dgPut(265, dgSemaphoreReservationStageSum() - beforeTx) : dgPut(266, avkSemaphoreState(dev, probeSem) - beforeSignal)
+  dgPut(267, AnvilVkTestBackendObservedRetain(0))
+  dgPut(282, vkGetFenceStatus(dev, fence))
+  dgPut(283, avkBufInFlight[avkBufSlot(ubuf)] + avkMemInFlight[avkBufMemSlot[avkBufSlot(ubuf)]] + avkSampInFlight[avkSamplerSlot(sampler)] + avkIvInFlight[beforeValue0] + avkImgInFlight[avkImgSlot(sampleImg)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(sampleImg)]] + avkIvInFlight[avkIvSlot(view)] + avkImgInFlight[avkImgSlot(img)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(img)]])
+  ivci\image = sampleImg : bad = 0
+  dgPut(268, vkCreateImageView(dev, @ivci, 0, @sampleView2))
+  sampleView = sampleView2 : dii\imageView = sampleView : writeSample\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeSample, 0, 0) : dgPut(269, AnvilVkFaultCode())
+
+  dgPut(270, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  AnvilVkTestBackendPoisonObservedRetains($2468ACE0)
+  beforeSubmit = AnvilVkSubmitCount() : beforeCalls = AnvilVkTestBackendCalls() : beforeDraws = AnvilVkTestBackendDraws()
+  beforeTx = dgSemaphoreReservationStageSum() : beforeSignal = avkSemaphoreState(dev, probeSem)
+  beforeValue0 = avkBufSlot(ubuf)
+  vkResetFences(dev, 1, @fence)
+  vkDestroyBuffer(dev, ubuf, 0) : ubuf = 0
+  dgPut(271, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(294, AnvilVkFaultCode())
+  dgPut(272, AnvilVkSubmitCount() - beforeSubmit) : dgPut(273, AnvilVkTestBackendCalls() - beforeCalls) : dgPut(274, AnvilVkTestBackendDraws() - beforeDraws)
+  dgPut(275, dgSemaphoreReservationStageSum() - beforeTx) : dgPut(276, avkSemaphoreState(dev, probeSem) - beforeSignal)
+  dgPut(277, AnvilVkTestBackendObservedRetain(0))
+  dgPut(284, vkGetFenceStatus(dev, fence))
+  dgPut(285, avkBufInFlight[beforeValue0] + avkMemInFlight[avkBufMemSlot[beforeValue0]] + avkSampInFlight[avkSamplerSlot(sampler)] + avkIvInFlight[avkIvSlot(sampleView)] + avkImgInFlight[avkImgSlot(sampleImg)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(sampleImg)]] + avkIvInFlight[avkIvSlot(view)] + avkImgInFlight[avkImgSlot(img)] + avkMemInFlight[avkImgMemSlot[avkImgSlot(img)]])
+  bufci\size = 32 : bufci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+  dgPut(278, vkCreateBuffer(dev, @bufci, 0, @ubuf2))
+  vkGetBufferMemoryRequirements(dev, ubuf2, @req) : mai\allocationSize = req\size
+  dgPut(279, vkAllocateMemory(dev, @mai, 0, @umem2))
+  dgPut(280, vkBindBufferMemory(dev, ubuf2, umem2, 0))
+  ubuf = ubuf2 : dbi\buffer = ubuf : dbi\range = 16 : writeUbo\pBufferInfo = @dbi
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(dev, 1, @writeUbo, 0, 0) : dgPut(281, AnvilVkFaultCode())
+  si\signalSemaphoreCount = 0 : si\pSignalSemaphores = 0
+
+  ; A recorded framebuffer dependency is generation tagged too. Destroying it
+  ; before submit must refuse before the backend, and recreation restores the
+  ; ordinary public draw path.
+  dgPut(286, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  beforeCalls = AnvilVkTestBackendCalls() : beforeSubmit = AnvilVkSubmitCount()
+  vkDestroyFramebuffer(dev, fb, 0) : fb = 0
+  vkResetFences(dev, 1, @fence)
+  dgPut(287, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(288, Bool(AnvilVkTestBackendCalls() = beforeCalls And AnvilVkSubmitCount() = beforeSubmit And vkGetFenceStatus(dev, fence) = #VK_NOT_READY))
+  fbci\pAttachments = @view
+  dgPut(289, vkCreateFramebuffer(dev, @fbci, 0, @fb))
+  dgPut(290, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  vkResetFences(dev, 1, @fence)
+  dgPut(291, vkQueueSubmit(queue, 1, @si, fence))
+  dgPut(292, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+
+  ; ------------------------------------------------------------------
+  ; Destructive lifetime probes run only after every ordinary submit path.
+  ; Six descriptor dependencies plus three attachment dependencies are
+  ; retained before the backend callback and released on completion.
+  ; The stale-UBO recovery above produced a new buffer and memory pair; make
+  ; that backing allocation the canonical handle before testing its guard.
+  ; ------------------------------------------------------------------
+  vkFreeMemory(dev, umem, 0) : umem = umem2 : umem2 = 0
+  dgPut(210, dgRecordMixed(cmd, rp, fb, pipeline, vbuf, dset, layout, @push[0]))
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cmd : si\signalSemaphoreCount = 0 : si\pSignalSemaphores = 0
+  dgObserveRetains(ubuf, sampler, sampleView, sampleImg, view, img)
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fence)
+  dgPut(211, vkQueueSubmit(queue, 1, @si, fence))
+  k = 0 : While k < 9 : dgPut(212 + k, AnvilVkTestBackendObservedRetain(k)) : k = k + 1 : Wend
+  AnvilVkFaultClear() : vkDestroyBuffer(dev, ubuf, 0) : dgPut(221, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkFreeMemory(dev, umem, 0) : dgPut(222, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroySampler(dev, sampler, 0) : dgPut(223, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyImageView(dev, sampleView, 0) : dgPut(224, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyImage(dev, sampleImg, 0) : dgPut(225, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkFreeMemory(dev, sampleMem, 0) : dgPut(226, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyImageView(dev, view, 0) : dgPut(227, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyImage(dev, img, 0) : dgPut(228, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkFreeMemory(dev, mem, 0) : dgPut(229, AnvilVkFaultCode())
+  oldFb = fb : oldFbSlot = avkFbSlot(fb)
+  AnvilVkFaultClear() : vkDestroyFramebuffer(dev, fb, 0) : dgPut(309, AnvilVkFaultCode())
+  dgPut(319, Bool(avkFbSlot(oldFb) = oldFbSlot And oldFbSlot <> 0))
+  dgPut(320, vkCreateFramebuffer(dev, @fbci, 0, @fb2))
+  dgPut(321, Bool(avkFbSlot(fb2) <> 0 And avkFbSlot(fb2) <> oldFbSlot))
+  vkDestroyFramebuffer(dev, fb2, 0) : fb2 = 0
+  AnvilVkTestBackendHold(0)
+  dgPut(230, vkWaitForFences(dev, 1, @fence, 1, 1000000000))
+  AnvilVkFaultClear() : vkDestroyFramebuffer(dev, oldFb, 0) : dgPut(322, AnvilVkFaultCode())
+  dgPut(323, Bool(avkFbSlot(oldFb) = 0))
+  dgPut(324, vkCreateFramebuffer(dev, @fbci, 0, @fb))
+  dgPut(231, dgFlightSum(ubuf, sampler, sampleView, sampleImg, view, img))
+  dgPut(300, avkBufInFlight[avkBufSlot(ubuf)])
+  dgPut(301, avkMemInFlight[avkBufMemSlot[avkBufSlot(ubuf)]])
+  dgPut(302, avkSampInFlight[avkSamplerSlot(sampler)])
+  dgPut(303, avkIvInFlight[avkIvSlot(sampleView)])
+  dgPut(304, avkImgInFlight[avkImgSlot(sampleImg)])
+  dgPut(305, avkMemInFlight[avkImgMemSlot[avkImgSlot(sampleImg)]])
+  dgPut(306, avkIvInFlight[avkIvSlot(view)])
+  dgPut(307, avkImgInFlight[avkImgSlot(img)])
+  dgPut(308, avkMemInFlight[avkImgMemSlot[avkImgSlot(img)]])
+
+  ; Public wrapper ordering: a non-null allocator is refused only after the
+  ; output is cleared, and before any live/generation slot can change.
+  dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
+  dgSnapshotDsls() : bad = #DG_POISON
+  dgPut(310, vkCreateDescriptorSetLayout(dev, @dslci, @count, @bad)) : dgPut(311, bad)
+  dgPut(312, dgDslsUnchanged())
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
+  dpci\maxSets = 1 : dpci\poolSizeCount = 1 : dpci\pPoolSizes = @sizes[0]
+  dgSnapshotPools() : bad = #DG_POISON
+  dgPut(313, vkCreateDescriptorPool(dev, @dpci, @count, @bad)) : dgPut(314, bad)
+  dgPut(315, dgPoolsUnchanged())
+  dgSnapshotSamplers() : bad = #DG_POISON
+  dgPut(316, vkCreateSampler(dev, @sampci, @count, @bad)) : dgPut(317, bad)
+  dgPut(318, dgSamplersUnchanged())
+
+  ; Public wrapper output-null order with NULL create-info and poisoned output.
+  bad = #DG_POISON : dgPut(120, vkCreateDescriptorSetLayout(dev, 0, 0, @bad)) : dgPut(121, bad)
+  bad = #DG_POISON : dgPut(122, vkCreateDescriptorPool(dev, 0, 0, @bad)) : dgPut(123, bad)
+  bad = #DG_POISON : dgPut(124, vkCreateSampler(dev, 0, 0, @bad)) : dgPut(125, bad)
+
+  ; Teardown also proves seeded shader lifetime is consumed by value.
+  vkDestroyPipeline(dev, pipeline, 0)
+  vkDestroyPipelineLayout(dev, layout, 0)
+  vkDestroyPipelineLayout(dev, layoutNoPush, 0)
+  vkDestroyPipelineLayout(dev, layoutReuse, 0)
+  vkDestroyDescriptorPool(dev, dpool, 0)
+  vkDestroyDescriptorSetLayout(dev, dslAlt, 0)
+  vkDestroyDescriptorSetLayout(dev, dslSingleUbo, 0)
+  vkDestroyDescriptorSetLayout(dev, dslSingleSample, 0)
+  vkDestroyDescriptorSetLayout(dev, dslReuse, 0)
+  vkDestroyShaderModule(dev, fs, 0) : vkDestroyShaderModule(dev, vs, 0)
+  dgPut(126, avkShLive[1] + avkShLive[2] + avkShIr[1]\valid + avkShIr[2]\valid + avkShIrGen[1] + avkShIrGen[2])
+  vkDestroySampler(dev, sampler, 0)
+  vkDestroyFramebuffer(dev, fb, 0) : vkDestroyRenderPass(dev, rp, 0)
+  vkDestroyImageView(dev, sampleView, 0) : vkDestroyImage(dev, sampleImg, 0) : vkFreeMemory(dev, sampleMem, 0)
+  vkDestroyImageView(dev, view, 0) : vkDestroyImage(dev, img, 0) : vkFreeMemory(dev, mem, 0)
+  vkDestroyBuffer(dev, ubuf, 0) : vkFreeMemory(dev, umem2, 0) : vkFreeMemory(dev, umem, 0)
+  vkDestroyBuffer(dev, vbuf, 0) : vkFreeMemory(dev, vmem, 0)
+  vkDestroyDescriptorPool(dev2, dpoolDev2, 0)
+  vkDestroyPipelineLayout(dev2, layoutDev2, 0)
+  vkDestroyDescriptorSetLayout(dev2, dslDev2, 0)
+  vkDestroyDevice(dev2, 0)
+  vkDestroySemaphore(dev, probeSem, 0) : vkDestroySemaphore(dev, signalSem, 0) : vkDestroyFence(dev, fence, 0)
+  vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0) : vkDestroyInstance(inst, 0)
+  AnvilVkFaultClear()
+  ProcedureReturn dgStop(0)
+EndProcedure

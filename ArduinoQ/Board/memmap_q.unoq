@@ -1,0 +1,100 @@
+; ======================================================================
+;  memmap_q.pi4 - Arduino UNO Q (QCM2290) memory-map constants.
+;
+;  This is the Q's answer to RaspberryPi4/Board/memmap.pi4. It is a
+;  Q-LOCAL file: it supplies the named constants the PORTABLE core libs
+;  (Anvil/Core/crc.pbi, Anvil/Core/memrange.pbi) reference, but with the
+;  QCM2290's real numbers instead of the BCM2711's. Nothing here touches
+;  a Pi-4 file - the core files reach these names by inclusion order in
+;  anvilqcoreproof.pi4, exactly as board.pi4 reaches memmap.pi4's.
+;
+;  EVERY NUMBER BELOW IS A CONFIRMED SILICON FACT from the vault
+;  (Arduino UNO Q port plan - phase 1.md, "ROOT-LEVEL CONFIRMATIONS
+;  2026-08-29"), read off the running board over ADB from /proc/iomem and
+;  /proc/device-tree - not an estimate:
+;
+;    DRAM base 0x40000000, three banks
+;      0x40000000 + 0x3DA00000   (986 MB)
+;      0x80000000 + 0x40000000   (1 GB)
+;      0xC0000000 + 0x80000000   (2 GB)   -> top = 0x140000000  (~3.96 GB)
+;    Large CONTIGUOUS free block 0x63900000-0x7D9FFFFF (~356 MB), clear of
+;      the Qualcomm TZ/firmware/modem reserved apertures.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  #CRC_POLY - the IEEE 802.3 reflected polynomial.
+;
+;  Anvil/Core/crc.pbi references #CRC_POLY and does NOT define it; on the
+;  Pi 4 the definition lives in Anvil/Core/state.pbi:101. state.pi4 also
+;  carries the whole console/line-editor global set, none of which this
+;  phase-1 proof uses, so it is NOT included here. The polynomial is a
+;  public constant of the algorithm (the same value state.pi4 defines),
+;  so restating it is not a fork of the core file - crc.pi4 is included
+;  read-only and unchanged.
+; ----------------------------------------------------------------------
+#CRC_POLY  = $EDB88320         ; IEEE 802.3, reflected
+
+; ----------------------------------------------------------------------
+;  DRAM extent - the Q's identity, reported by HwInfo.
+; ----------------------------------------------------------------------
+#Q_DRAM_BASE     = $40000000       ; low bank base (confirmed)
+#Q_DRAM_TOP      = $140000000      ; one past the top of the 2 GB bank
+#Q_FREE_LO       = $63900000       ; confirmed contiguous free block, lo
+#Q_FREE_HI       = $7D9FFFFF       ; confirmed contiguous free block, hi
+
+; ----------------------------------------------------------------------
+;  Payload windows - what Anvil/Core/memrange.pbi's InPayload() checks.
+;
+;  On the Pi 4 these are the two DRAM windows a loaded image may live in.
+;  On the Q, a UEFI application's buffers are placed by the firmware
+;  anywhere in DRAM, so the windows are set to span the WHOLE confirmed
+;  DRAM extent (0x40000000 .. 0x13FFFFFFF). The consequence is a property
+;  the host can predict without knowing where UEFI put the image: any
+;  buffer that lives in the Q's DRAM classifies as "in a payload window",
+;  so InPayload() over the proof buffer must return 1.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  The monitor's stack top. On the Pi 4 (RaspberryPi4/Board/memmap.pi4)
+;  Main() moves SP here by hand because the firmware's boot stack is in
+;  the way. On the Q the firmware is UEFI and it hands us a perfectly good
+;  stack that we must NOT move - the image returns into the boot manager
+;  and UEFI's own stack has to still be there. So this is REPORTED, never
+;  installed, and the value is the link-time stack top the build passes
+;  with --stack-addr.
+;
+;  Moved here from qstubs_q.pi4 on 2026-09-08: it is a memory-map
+;  constant, HwMonStack() is part of the map seam the core asks through,
+;  and the two proof harnesses include this file and not that one.
+; ----------------------------------------------------------------------
+#MON_STACK = $68000000
+
+#PAY0_LO   = $40000000         ; low window: all of the 32-bit DRAM space
+#PAY0_HI   = $FFFFFFFF
+#PAY1_LO   = $100000000        ; high window: the DRAM tail above 4 GB
+#PAY1_HI   = $13FFFFFFF
+
+; ----------------------------------------------------------------------
+;  Nominal "monitor" windows - what memrange.pi4's HitsMonitor() refuses.
+;
+;  There is no resident Anvil monitor on the Q in phase 1 (this is a
+;  run-and-report EFI app, not the interactive monitor), so these name a
+;  1 MB reserved-by-convention region INSIDE the confirmed free block.
+;  They exist so the proof can exercise HitsMonitor() the way the real
+;  monitor does and get a host-predictable answer: HitsMonitor() over the
+;  monitor window itself must return non-zero, and over the proof buffer
+;  (which UEFI places elsewhere) must return zero.
+; ----------------------------------------------------------------------
+#MON_LO      = $63900000       ; nominal monitor code window (in free block)
+#MON_HI      = $639FFFFF
+#MON_DATA_LO = $63A00000       ; nominal monitor data window
+#MON_DATA_HI = $63AFFFFF
+
+; ----------------------------------------------------------------------
+;  HwMonLo() / HwMonHi() ARE NOT HERE. They belong with the memory map by
+;  subject and they cannot live here by dependency: on this board the
+;  answer comes from EFI_LOADED_IMAGE_PROTOCOL, and this file is included
+;  BEFORE ArduinoQ/Board/qefi_q.unoq, which is what talks to the firmware.
+;  They are at the foot of ArduinoQ/Board/qstubs_q.unoq instead, with the
+;  reasoning. See the note on #MON_LO above for why the constants in this
+;  file are not the answer.
+; ----------------------------------------------------------------------

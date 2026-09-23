@@ -1,0 +1,913 @@
+; ======================================================================
+;  hvs.pi4 - the BCM2711's Hardware Video Scaler and pixel valve 1: the
+;  two blocks that turn a framebuffer in DRAM into pixels arriving at
+;  the DSI host.
+; ----------------------------------------------------------------------
+;  THE THREE-BLOCK PICTURE, because nothing here makes sense without it.
+;
+;      DRAM framebuffer          the bytes
+;            |
+;      HVS channel 0             reads them through a DISPLAY LIST,
+;            |                   composites, and pushes pixels into a
+;            |                   composite output buffer
+;      pixel valve 1             takes pixels and applies the video
+;            |                   timing - sync, front and back porch
+;      DSI1 host + D-PHY         serialises them onto the ribbon
+;
+;  There is no doorbell and no "go" bit connecting the first two. The
+;  HVS latches SCALER_DISPLISTn at the next frame start and copies it
+;  into SCALER_DISPLACTn, which is how a page flip is detected. So the
+;  way to change what is on screen is to write a complete new list
+;  somewhere free and then write its index - never to edit a live one.
+;
+;  ---- USE ------------------------------------------------------------
+;
+;    XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"   ; the core clock
+;    XIncludeFile "RaspberryPi4/Lib/clocks.pi4"
+;    XIncludeFile "RaspberryPi4/Lib/hvs.pi4"
+;
+;    HvsPattern($04000000, 800, 1280)   ; paint something into DRAM
+;    HvsUp($04000000, 800, 1280)        ; core clock, HVS, channel, list
+;    PvUp(...)                          ; the timing, then video enable
+;
+;  House rule 10: a library never includes a library. This one calls
+;  ClockSetHz() and the main file lists clocks.pi4 ahead of it.
+;
+;  ---- WHERE EVERY NUMBER COMES FROM (do not guess - rule 21) ----------
+;
+;  RaspberryPi4/Reference/rpi-6.12.y_vc4_regs.h for every offset and
+;  bit; _vc4_hvs.c for the channel and COB sequences; _vc4_crtc.c for
+;  the pixel valve; and vc4_plane.c and vc4_kms.c, fetched 2026-09-06
+;  from https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+;  drivers/gpu/drm/vc4/{vc4_plane.c,vc4_kms.c} for the display-list word
+;  format and the output multiplexing. The block addresses are
+;  bcm2711.dtsi's, fetched from
+;  https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/
+;  arch/arm/boot/dts/broadcom/bcm2711.dtsi
+;
+;  ---- FIVE THINGS THAT LOOK OPTIONAL AND ARE NOT --------------------
+;
+;  1. THE VIDEOCORE CORE CLOCK. The HVS runs on it and the driver
+;     clamps it to at least 500 MHz for the whole time a display is on
+;     (vc4_kms.c:440-454). There is no CPRMAN register for it on this
+;     part - it is a firmware clock, id 4, and it goes through the
+;     mailbox. Left at the boot rate the HVS underruns and the picture
+;     tears or does not appear at all, with every register reading
+;     correct.
+;
+;  2. SCALER_DISPCTRL's ENABLE, bit 31. The header calls it the "global
+;     register for clock gating the HVS". Read-modify-write it; the same
+;     word holds the output multiplexing.
+;
+;  3. DSP3_MUX. Pixel valve 1's HVS output number is 3, and its route is
+;     bits 19:18 of SCALER_DISPCTRL. The driver initialises that field
+;     to 3, WHICH MEANS DISABLED (vc4_hvs.c:1688-1691). So a bring-up
+;     that programs the valve and the panel perfectly and forgets this
+;     one field gets a blank screen and no error anywhere - and it looks
+;     exactly like a dead D-PHY.
+;
+;  4. THE COMPOSITE OUTPUT BUFFER. SCALER_DISPBASE0/1/2 carve the HVS's
+;     44,416-pixel output buffer between the three channels. Nothing
+;     else programs them, the firmware's values are for the firmware's
+;     own channel layout, and a channel with no buffer underruns at
+;     once.
+;
+;  5. THE CHANNEL RESET, three separate writes: 0, then RESET, then 0.
+;     The driver does it unconditionally before every enable
+;     (vc4_hvs.c:957-959).
+;
+;  ---- AND ONE BIT THAT MOVED BETWEEN GENERATIONS --------------------
+;
+;  In a display-list control word, UNITY - "this plane is not scaled" -
+;  is BIT 4 on the older VideoCore and BIT 15 on this one
+;  (SCALER5_CTL0_UNITY, vc4_regs.h:1168-1169). On this part bit 4 is
+;  part of the five-bit pixel format field instead. Set the wrong one
+;  and the plane is both wrongly formatted and asked to scale.
+;
+;  The same trap in the channel control register: WIDTH and HEIGHT are
+;  bits 23:12 and 11:0 on the older part, and 28:16 and 12:0 here. This
+;  file uses the VC5 spellings throughout because the BCM2711 is VC5,
+;  and says so at each one.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  THE BLOCKS. bcm2711.dtsi's soc ranges map bus $7E000000 to ARM
+;  $FE000000 (:41-43), which is the same rebase every other file here
+;  uses.
+;
+;    pixelvalve1  bus $7E207000  ARM $FE207000  size $100  (dtsi:261-263)
+;    hvs          bus $7E400000  ARM $FE400000  size $8000 (dtsi:292-295)
+;
+;  PIXEL VALVE 1 IS DSI1'S. Not by name - the driver has no name for it
+;  - but by the table at vc4_crtc.c:1270-1284, where bcm2711_pv1_data's
+;  encoder_types[0] is VC4_ENCODER_TYPE_DSI1 and its hvs_output is 3.
+;  The index into that array is also the value that goes in the valve's
+;  CLK_SELECT field, so DSI1 is clock select 0.
+; ----------------------------------------------------------------------
+#PV1_BASE = $FE207000
+#HVS_BASE = $FE400000
+
+; Pixel valve registers, vc4_regs.h:145-236.
+#PV_CONTROL_OFF     = $00
+#PV_V_CONTROL_OFF   = $04
+#PV_VSYNCD_EVEN_OFF = $08
+#PV_HORZA_OFF       = $0C
+#PV_HORZB_OFF       = $10
+#PV_VERTA_OFF       = $14
+#PV_VERTB_OFF       = $18
+#PV_VERTA_EVEN_OFF  = $1C
+#PV_VERTB_EVEN_OFF  = $20
+#PV_INTEN_OFF       = $24
+#PV_INTSTAT_OFF     = $28
+#PV_STAT_OFF        = $2C
+#PV_HACT_ACT_OFF    = $30
+#PV_MUX_CFG_OFF     = $34
+
+#PV_CONTROL_EN                = $0001   ; bit 0
+#PV_CONTROL_FIFO_CLR          = $0002   ; bit 1
+#PV_CONTROL_CLK_SELECT_SHIFT  = 2       ; bits 3:2, and DSI is 0
+#PV_CONTROL_PIXEL_REP_SHIFT   = 4       ; bits 5:4
+#PV_CONTROL_WAIT_HSTART       = $1000   ; bit 12
+#PV_CONTROL_TRIGGER_UNDERFLOW = $2000   ; bit 13
+#PV_CONTROL_CLR_AT_START      = $4000   ; bit 14
+#PV_CONTROL_FIFO_LEVEL_SHIFT  = 15      ; bits 20:15
+#PV_CONTROL_FORMAT_SHIFT      = 21      ; bits 23:21
+#PV_CONTROL_FORMAT_DSIV_24    = 4
+
+#PV_VCONTROL_VIDEN     = $01   ; bit 0
+#PV_VCONTROL_CONTINUOUS = $02  ; bit 1
+#PV_VCONTROL_DSI       = $08   ; bit 3
+
+; PV_MUX_CFG's RGB pixel mux mode, NO_SWAP = 8 at shift 2 (vc4_regs.h
+; :232-235, written unconditionally on this generation at
+; vc4_crtc.c:460-463).
+#PV_MUX_CFG_NO_SWAP = $20
+
+; ----------------------------------------------------------------------
+;  THE FIFO FULL LEVEL, and it is a formula rather than a number.
+;
+;  vc4_get_fifo_full_level (vc4_crtc.c:238-294) with
+;  HVS_FIFO_LATENCY_PIX = 6 (:52). For the 24-bit DSI video format on
+;  this generation, and an output that is not number 5, the answer is
+;  fifo_depth - 3 * 6. Pixel valve 1's depth is 64 (:1273), so the level
+;  is 46 - and 46 fits in the six-bit low field, which is why the
+;  PV5 high field above bit 24 stays zero here.
+; ----------------------------------------------------------------------
+#PV1_FIFO_DEPTH = 64
+#PV1_FIFO_LEVEL = 46
+
+; ----------------------------------------------------------------------
+;  HVS registers, vc4_regs.h:240-470. The per-channel ones are a stride
+;  of $10 apart and this file only ever uses channel 0, so they are
+;  written out rather than computed - one fewer place for an index to be
+;  wrong.
+; ----------------------------------------------------------------------
+#SCALER_DISPCTRL_OFF   = $0000
+#SCALER_DISPSTAT_OFF   = $0004
+#SCALER_DISPID_OFF     = $0008
+#SCALER_DISPECTRL_OFF  = $000C
+#SCALER_DISPDITHER_OFF = $0014
+#SCALER_DISPEOLN_OFF   = $0018
+#SCALER_DISPLIST0_OFF  = $0020
+#SCALER_DISPLIST1_OFF  = $0024
+#SCALER_DISPLIST2_OFF  = $0028
+#SCALER_DISPLACT0_OFF  = $0030
+
+#SCALER_DISPCTRL0_OFF  = $0040
+#SCALER_DISPBKGND0_OFF = $0044
+#SCALER_DISPSTAT0_OFF  = $0048
+#SCALER_DISPBASE0_OFF  = $004C
+#SCALER_DISPBASE1_OFF  = $005C
+#SCALER_DISPBASE2_OFF  = $006C
+
+#SCALER_DISPCTRL_ENABLE    = $80000000   ; bit 31, the HVS clock gate
+#SCALER_DISPCTRL_PANIC_ALL = $2A000000   ; PANIC0/1/2 all set to 2:
+                                         ; (2<<24)|(2<<26)|(2<<28)
+#SCALER_DISPCTRL_PANIC_MASK = $3F000000  ; bits 29:24, all three fields
+#SCALER_DISPCTRL_DSP3_MUX_MASK  = $000C0000   ; bits 19:18
+#SCALER_DISPCTRL_DSP3_MUX_SHIFT = 18
+
+#SCALER_DISPCTRLX_ENABLE = $80000000   ; bit 31
+#SCALER_DISPCTRLX_RESET  = $40000000   ; bit 30
+#SCALER5_DISPCTRLX_WIDTH_SHIFT = 16    ; bits 28:16 - VC5, not 23:12
+
+#SCALER5_DISPBKGND_BCK2BCK  = $80000000   ; bit 31
+#SCALER_DISPBKGND_INTERLACE = $40000000   ; bit 30
+#SCALER_DISPBKGND_GAMMA     = $20000000   ; bit 29
+#SCALER_DISPBKGND_FILL      = $01000000   ; bit 24
+
+; The channel status register's mode field, bits 31:30, and the two
+; FIFO flags below it - the only honest way to ask whether a channel is
+; actually running.
+#SCALER_DISPSTATX_MODE_SHIFT = 30
+#SCALER_DISPSTATX_FULL       = $20000000   ; bit 29
+#SCALER_DISPSTATX_EMPTY      = $10000000   ; bit 28
+
+; ----------------------------------------------------------------------
+;  THE DISPLAY LIST WINDOW. On this generation it starts $4000 into the
+;  HVS block and runs $4000 bytes - vc4_hvs.c:2150-2153 with
+;  SCALER5_DLIST_START (vc4_regs.h:540). That is 4096 dwords.
+;
+;  THE FIRST 32 DWORDS ARE LEFT ALONE, and the driver's comment says why
+;  (vc4_hvs.c:1570-1575): the firmware's own boot display list lives
+;  there and overwriting it scrambles whatever is already on a screen
+;  during the handover. There is no firmware display on this board, but
+;  the reservation is kept - it costs 128 bytes out of 16 KB and it
+;  means this file behaves the same way on a board where there is one.
+;
+;  SCALER_DISPLISTn HOLDS A DWORD INDEX, not a byte offset and not an
+;  address. Byte address = $FE404000 + 4 * index.
+; ----------------------------------------------------------------------
+#HVS_DLIST_OFF   = $4000
+#HVS_DLIST_FIRST = 32
+#HVS_DLIST_SECOND = 41
+
+; ----------------------------------------------------------------------
+;  DISPLAY LIST WORD FIELDS, vc4_plane.c:1666-1736 for the VC5 branch
+;  and vc4_regs.h:1114-1340 for the bits.
+; ----------------------------------------------------------------------
+#SCALER_CTL0_END        = $80000000   ; bit 31 - the terminator word
+#SCALER_CTL0_VALID      = $40000000   ; bit 30
+#SCALER_CTL0_SIZE_SHIFT = 24          ; bits 29:24 - dwords in THIS entry
+#SCALER5_CTL0_UNITY     = $00008000   ; bit 15 - NOT bit 4 on this part
+#SCALER_CTL0_ORDER_SHIFT = 13         ; bits 14:13
+#SCALER5_CTL0_ALPHA_EXPAND = $1000    ; bit 12
+#SCALER5_CTL0_RGB_EXPAND   = $0800    ; bit 11
+
+; Pixel format and order for XRGB8888: format RGBA8888 is 7 and the
+; order that makes it read as XRGB is ARGB, which is 2
+; (vc4_plane.c:41-92, vc4_regs.h:1058-1106).
+#HVS_PIXEL_FORMAT_RGBA8888 = 7
+#HVS_PIXEL_ORDER_ARGB      = 2
+
+; The context words the HVS scribbles in. The driver writes this exact
+; filler and it is not a magic number so much as a visible one: seeing
+; $C0C0C0C0 still in a dump means the HVS never read the list.
+#SCALER_DLIST_CONTEXT = $C0C0C0C0
+
+; CTL2's alpha, vc4_plane.c:1692-1698: mode FIXED (1) in bits 31:30 and
+; a twelve-bit alpha of $FFF at bit 4, for a plane with no alpha
+; channel. (1 << 30) | ($FFF << 4).
+#SCALER5_CTL2_OPAQUE = $4000FFF0
+
+; ----------------------------------------------------------------------
+;  THE ONLY ROTATION THIS HARDWARE HAS IS A PAIR OF MIRRORS.
+;
+;  vc4_plane.c:2782-2786 advertises the whole of what a VC4/VC5 plane can
+;  be asked to do:
+;
+;      drm_plane_create_rotation_property(plane, DRM_MODE_ROTATE_0,
+;                                         DRM_MODE_ROTATE_0 |
+;                                         DRM_MODE_ROTATE_180 |
+;                                         DRM_MODE_REFLECT_X |
+;                                         DRM_MODE_REFLECT_Y);
+;
+;  ROTATE_90 and ROTATE_270 ARE NOT IN THAT LIST and there is no display
+;  list bit for them. Every rotation the block can do is composed from
+;  the two mirror bits - vc4_plane.c:1979-1985 reduces whatever DRM asked
+;  for down to ROTATE_0 plus REFLECT_X and REFLECT_Y before it writes a
+;  word - and 180 degrees is exactly both mirrors at once.
+;
+;  On this generation those two bits live in POS0, not CTL0
+;  (vc4_regs.h:1191-1192, and vc4_plane.c:1684-1690 for the VC5 branch
+;  that writes them):
+;
+;      SCALER5_POS0_VFLIP  BIT(31)
+;      SCALER5_POS0_HFLIP  BIT(15)
+;
+;  AND VFLIP MOVES THE POINTER. vc4_plane.c:1410-1413, in as many words:
+;  "We must point to the last line when Y reflection is enabled" -
+;  src_y += height - 1. The pitch stays positive; the hardware walks
+;  backwards from the row it is given. Setting the bit and leaving PTR0
+;  at the top row reads one screen's worth of whatever lies BELOW the
+;  framebuffer and shows it upside down, which looks like a plausible
+;  picture of the wrong memory rather than an error.
+; ----------------------------------------------------------------------
+#SCALER5_POS0_VFLIP = $80000000   ; bit 31
+#SCALER5_POS0_HFLIP = $00008000   ; bit 15
+
+; ----------------------------------------------------------------------
+;  THE FRAMEBUFFER ADDRESS IS A BUS ADDRESS, AND THIS IS THE TRAP THAT
+;  COSTS A FLASH CYCLE.
+;
+;  The pointer word in a display list is what the VideoCore sees, not
+;  what the ARM sees. The HVS's DMA ranges (bcm2711.dtsi:45) are
+;  <0xc0000000 0x0 0x00000000 0x40000000>: bus = physical + $C0000000,
+;  for the first gigabyte only. So a framebuffer MUST live below
+;  $40000000 physical and the list gets its address with $C0000000 set.
+;
+;  Writing the plain physical address instead produces a list the HVS
+;  reads without complaint, pointing at whatever is 3 GB away.
+; ----------------------------------------------------------------------
+#HVS_BUS_ALIAS = $C0000000
+#HVS_PHYS_MAX  = $3FFFFFFF
+
+; The VideoCore core clock the HVS runs on. Mailbox clock id 4, and the
+; floor the driver clamps to (vc4_kms.c:440-448).
+#HVS_CORE_CLK_ID = 4
+#HVS_CORE_HZ_MIN = 500000000
+
+Global hvs_core_hz.i   = 0    ; what the firmware gave for the core clock
+Global hvs_dlist_at.i  = 0    ; the dword index the list was written at
+Global hvs_fb.i        = 0    ; the framebuffer, ARM physical
+Global hvs_w.i         = 0
+Global hvs_h.i         = 0
+Global hvs_up.i        = 0
+Global pv_up.i         = 0
+Global hvs_mode_at_enable.i = 0  ; DISPSTAT0's mode field the instant
+                              ; the channel was enabled. Reported, not
+                              ; judged - see HvsUp.
+Global hvs_hflip.i     = 0    ; the two mirror bits the next display list
+Global hvs_vflip.i     = 0    ; will carry. See HvsMirror().
+Global hvs_flip_pending.i = 0
+Global hvs_flip_at.i = 0
+Global hvs_flip_fb.i = 0
+Global hvs_flip_hf.i = 0
+Global hvs_flip_vf.i = 0
+
+; ======================================================================
+;  ACCESSORS
+; ======================================================================
+Procedure.i HvsRd(off.i)
+  ProcedureReturn PeekN(#HVS_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure HvsWr(off.i, v.i)
+  PokeN(#HVS_BASE + off, v & $FFFFFFFF)
+  a64_barrier()
+EndProcedure
+
+Procedure.i PvRd(off.i)
+  ProcedureReturn PeekN(#PV1_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure PvWr(off.i, v.i)
+  PokeN(#PV1_BASE + off, v & $FFFFFFFF)
+  a64_barrier()
+EndProcedure
+
+; ======================================================================
+;  THE FRAMEBUFFER
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HvsPattern(fb, w, h) - paint a test pattern, XRGB8888, w*4 pitch.
+;
+;  WHAT THE PATTERN IS, and every part of it answers a question that a
+;  plain colour fill cannot:
+;
+;    a two-pixel white border          is the whole panel being scanned,
+;                                      and is the geometry right? A
+;                                      border that is off one edge is a
+;                                      wrong pitch or a wrong width.
+;    eight vertical colour bars        is the pixel format and the byte
+;                                      order right? Red where red should
+;                                      be, not blue.
+;    a horizontal grey ramp            is the panel showing all eight
+;                                      bits, or banding?
+;    one white square, top left        which way up is it? A portrait
+;                                      panel can be shown four ways and
+;                                      only an asymmetric mark says so.
+;
+;  A SOLID FILL WOULD BE A WORSE TEST. Half the ways this can go wrong -
+;  a byte-swapped format, a doubled pitch, a rotated panel - produce a
+;  perfectly convincing solid colour.
+;
+;  It writes with the caches in whatever state the monitor has them.
+;  The caller flushes; see HvsUp().
+; ----------------------------------------------------------------------
+Procedure HvsPattern(fb.i, w.i, h.i)
+  Define x.i
+  Define y.i
+  Define px.i
+  Define row.i
+  Define band.i
+  Define v.i
+
+  y = 0
+  While y < h
+    row = fb + y * w * 4
+    x = 0
+    While x < w
+      ; The colour bars: eight of them across the width.
+      band = (x * 8) / w
+      If band = 0
+        px = $00000000        ; black
+      ElseIf band = 1
+        px = $00FF0000        ; red
+      ElseIf band = 2
+        px = $0000FF00        ; green
+      ElseIf band = 3
+        px = $000000FF        ; blue
+      ElseIf band = 4
+        px = $00FFFF00        ; yellow
+      ElseIf band = 5
+        px = $0000FFFF        ; cyan
+      ElseIf band = 6
+        px = $00FF00FF        ; magenta
+      Else
+        px = $00FFFFFF        ; white
+      EndIf
+
+      ; The bottom eighth of the panel is a grey ramp instead, so the
+      ; bars and the ramp are both visible at once.
+      If y > (h - h / 8)
+        v = (x * 255) / w
+        px = (v << 16) | (v << 8) | v
+      EndIf
+
+      ; The orientation mark: a filled square in the top-left corner,
+      ; one sixteenth of the width on a side.
+      If x < w / 16 And y < w / 16
+        px = $00FFFFFF
+      EndIf
+
+      ; The border goes on last so nothing paints over it.
+      If x < 2 Or y < 2 Or x > (w - 3) Or y > (h - 3)
+        px = $00FFFFFF
+      EndIf
+
+      PokeN(row + x * 4, px)
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HvsFill(fb, w, h, argb) - a plain fill, for when the question is
+;  "is anything scanning at all" rather than "is it right".
+; ----------------------------------------------------------------------
+Procedure HvsFill(fb.i, w.i, h.i, argb.i)
+  Define i.i
+  Define n.i
+
+  n = w * h
+  i = 0
+  While i < n
+    PokeN(fb + i * 4, argb)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  THE DISPLAY LIST
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HvsWriteDlist(idx, fb, w, h) - one unity-scaled XRGB8888 plane and
+;  the terminator, written at dword index idx in the list window.
+;
+;  Eight words for the plane and one to end the list. The plane's own
+;  word count goes in CTL0's SIZE field, which the driver patches in
+;  after building the entry (vc4_plane.c:1839-1840) - here it is known
+;  in advance because this entry has one fixed shape.
+;
+;  THE POSITION-1 WORD IS ABSENT ON PURPOSE. It carries the destination
+;  size for a scaled plane and the driver omits it entirely when the
+;  plane is unity (vc4_plane.c:1704). Writing it anyway with plausible
+;  numbers would shift every following word by one and the HVS would
+;  read the pitch as a pointer.
+;
+;  Returns the dword index the list starts at.
+; ----------------------------------------------------------------------
+Procedure.i HvsWriteDlistFor(idx.i, fb.i, w.i, h.i, hf.i, vf.i)
+  Define a.i
+  Define ctl0.i
+  Define pos0.i
+  Define ptr.i
+
+  a = #HVS_BASE + #HVS_DLIST_OFF + idx * 4
+
+  ctl0 = #SCALER_CTL0_VALID
+  ctl0 = ctl0 | (8 << #SCALER_CTL0_SIZE_SHIFT)
+  ctl0 = ctl0 | #SCALER5_CTL0_UNITY
+  ctl0 = ctl0 | (#HVS_PIXEL_ORDER_ARGB << #SCALER_CTL0_ORDER_SHIFT)
+  ctl0 = ctl0 | #SCALER5_CTL0_ALPHA_EXPAND
+  ctl0 = ctl0 | #SCALER5_CTL0_RGB_EXPAND
+  ctl0 = ctl0 | #HVS_PIXEL_FORMAT_RGBA8888
+  ; tiling stays 0 - LINEAR - and scl0/scl1 stay 0, which is what unity
+  ; means (vc4_plane.c:518-522).
+
+  ; The list window takes 32-bit writes only; the driver says so where
+  ; it copies a list in (vc4_plane.c:2405-2407).
+  ; POS0: x 0, y 0, plus whatever mirrors HvsMirror() asked for.
+  pos0 = 0
+  If hf <> 0
+    pos0 = pos0 | #SCALER5_POS0_HFLIP
+  EndIf
+  ; A VERTICAL MIRROR STARTS AT THE BOTTOM ROW. vc4_plane.c:1410-1413.
+  ; The pitch below stays positive either way; the block counts down
+  ; from the row it is handed.
+  ptr = fb
+  If vf <> 0
+    pos0 = pos0 | #SCALER5_POS0_VFLIP
+    ptr = fb + (h - 1) * w * 4
+  EndIf
+
+  PokeN(a,      ctl0)
+  PokeN(a + 4,  pos0)                   ; POS0: x 0, y 0, mirrors
+  PokeN(a + 8,  #SCALER5_CTL2_OPAQUE)   ; CTL2: fixed alpha, fully opaque
+  PokeN(a + 12, (h << 16) | w)          ; POS2: height 28:16, width 12:0
+  PokeN(a + 16, #SCALER_DLIST_CONTEXT)  ; POS3: the HVS writes here
+  PokeN(a + 20, (ptr & $3FFFFFFF) | #HVS_BUS_ALIAS)  ; PTR0, a BUS address
+  PokeN(a + 24, #SCALER_DLIST_CONTEXT)  ; pointer context
+  PokeN(a + 28, w * 4)                  ; PITCH0, bytes, 16-bit field
+  PokeN(a + 32, #SCALER_CTL0_END)
+  a64_barrier()
+
+  ProcedureReturn idx
+EndProcedure
+
+Procedure.i HvsWriteDlist(idx.i, fb.i, w.i, h.i)
+  hvs_dlist_at = HvsWriteDlistFor(idx, fb, w, h, hvs_hflip, hvs_vflip)
+  ProcedureReturn hvs_dlist_at
+EndProcedure
+
+; ======================================================================
+;  BRINGING THE HVS UP
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  HvsCoreClock() - raise the VideoCore core clock to the floor the HVS
+;  needs, and RETURN WHAT THE FIRMWARE ACTUALLY GAVE.
+;
+;  Never a boolean. The firmware clamps silently, so the difference
+;  between what was asked for and what was applied is the only
+;  interesting part - the same reason clocks.pi4 gives for every setter
+;  in it returning a rate.
+; ----------------------------------------------------------------------
+Procedure.i HvsCoreClock()
+  hvs_core_hz = ClockSetHz(#HVS_CORE_CLK_ID, #HVS_CORE_HZ_MIN)
+  ProcedureReturn hvs_core_hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HvsUp(fb, w, h) - everything between the framebuffer and the pixel
+;  valve, in the driver's order.
+;
+;  Returns 1 if the channel came up reporting a sane mode, 0 otherwise.
+;  It does NOT return 1 for "the writes went in" - the channel's own
+;  status register is read back and has to agree.
+; ----------------------------------------------------------------------
+Procedure.i HvsUp(fb.i, w.i, h.i)
+  Define d.i
+  Define bg.i
+  Define st.i
+
+  hvs_fb = fb
+  hvs_w  = w
+  hvs_h  = h
+  hvs_up = 0
+  hvs_flip_pending = 0
+
+  ; The core clock first: everything below runs on it.
+  HvsCoreClock()
+
+  ; The global enable and the panic thresholds, read-modify-write so the
+  ; multiplexing fields in the same word survive.
+  d = HvsRd(#SCALER_DISPCTRL_OFF)
+  d = d | #SCALER_DISPCTRL_ENABLE
+  d = (d & ~#SCALER_DISPCTRL_PANIC_MASK) | #SCALER_DISPCTRL_PANIC_ALL
+  HvsWr(#SCALER_DISPCTRL_OFF, d)
+
+  ; The composite output buffer, vc4_hvs.c:2011-2029 evaluated:
+  ;   channel 2: base 0, top 12288          -> $30000000
+  ;   channel 1: base 12304, top 24592      -> $60103010
+  ;   channel 0: base 24608, top 44416      -> $AD806020
+  ; Channel 0 gets the largest share, which is why it is the one used.
+  HvsWr(#SCALER_DISPBASE2_OFF, $30000000)
+  HvsWr(#SCALER_DISPBASE1_OFF, $60103010)
+  HvsWr(#SCALER_DISPBASE0_OFF, $AD806020)
+
+  ; The channel reset - three writes, in this order, always.
+  HvsWr(#SCALER_DISPCTRL0_OFF, 0)
+  HvsWr(#SCALER_DISPCTRL0_OFF, #SCALER_DISPCTRLX_RESET)
+  HvsWr(#SCALER_DISPCTRL0_OFF, 0)
+
+  ; The list, then the pointer at it. In that order: the HVS latches the
+  ; index at the next frame start and reads the list then, so a pointer
+  ; written before the list would race.
+  HvsWriteDlist(#HVS_DLIST_FIRST, fb, w, h)
+  HvsWr(#SCALER_DISPLIST0_OFF, #HVS_DLIST_FIRST)
+
+  ; Enable the channel with the active size. WIDTH is bits 28:16 and
+  ; HEIGHT is bits 12:0 on this generation, and they are the display
+  ; size, NOT the size minus one.
+  HvsWr(#SCALER_DISPCTRL0_OFF, #SCALER_DISPCTRLX_ENABLE | (w << #SCALER5_DISPCTRLX_WIDTH_SHIFT) | h)
+
+  ; Background fill stays on. The driver leaves it on always on this
+  ; generation because the core clock can then run lower
+  ; (vc4_hvs.c:1327-1334), and it also means an area no plane covers is
+  ; a defined colour rather than whatever the buffer held.
+  bg = HvsRd(#SCALER_DISPBKGND0_OFF)
+  bg = bg & ~#SCALER5_DISPBKGND_BCK2BCK
+  bg = bg & ~#SCALER_DISPBKGND_GAMMA
+  bg = bg & ~#SCALER_DISPBKGND_INTERLACE
+  bg = (bg & $FF000000) | #SCALER_DISPBKGND_FILL | $00202020
+  HvsWr(#SCALER_DISPBKGND0_OFF, bg)
+
+  ; Route pixel valve 1 - HVS output 3 - to channel 0. Initialised to 3,
+  ; which means DISABLED, and forgetting it looks exactly like a dead
+  ; panel. See the header.
+  d = HvsRd(#SCALER_DISPCTRL_OFF)
+  d = (d & ~#SCALER_DISPCTRL_DSP3_MUX_MASK) | (0 << #SCALER_DISPCTRL_DSP3_MUX_SHIFT)
+  HvsWr(#SCALER_DISPCTRL_OFF, d)
+
+  ; ------------------------------------------------------------------
+  ;  THE READBACK, AND WHAT IT IS AND IS NOT EVIDENCE OF.
+  ;
+  ;  Mode 0 is DISABLED and anything else means the channel is at least
+  ;  trying - but READ THE INSTANT THE CHANNEL IS ENABLED IT IS STILL 0
+  ;  ON THIS PART, because nothing is pulling pixels out of it yet. The
+  ;  mode leaves DISABLED when the pixel valve starts asking, which
+  ;  happens several steps later (PvUp, PvEnable, then video).
+  ;
+  ;  SO A ZERO HERE IS NOT A FAILURE AND THIS PROCEDURE NO LONGER
+  ;  REPORTS IT AS ONE. It returns 1 whenever the channel was
+  ;  configured and enabled, and hvs_up records that. What it costs is
+  ;  a claim nobody could act on; what it buys is a caller that does not
+  ;  give up one step before the thing it is waiting for can happen.
+  ;
+  ;  WHAT THIS COST BEFORE IT WAS WRITTEN DOWN: the first boot-path
+  ;  bring-up of the panel stopped here, reporting that the scaler
+  ;  channel would not start, on a board where the channel was
+  ;  perfectly configured - DISPCTRL0 read 83200500, the enable bit set
+  ;  with 800 by 1280 in it, and the display list index in DISPLIST0.
+  ;  `dsi pattern` had never noticed because it prints this as a warning
+  ;  and carries on to the valve regardless, which is the behaviour that
+  ;  turns out to be right.
+  ;
+  ;  THE HONEST TEST IS THE LINE COUNTER, AFTER VIDEO IS ON, and it is
+  ;  the caller's to make because only the caller knows when that is:
+  ;  read HvsChannelLine() twice and see it move. A configured channel
+  ;  and a scanning one are different claims and this procedure can only
+  ;  make the first.
+  ; ------------------------------------------------------------------
+  hvs_up = 1
+  hvs_mode_at_enable = (HvsRd(#SCALER_DISPSTAT0_OFF) >> #SCALER_DISPSTATX_MODE_SHIFT) & 3
+  ProcedureReturn hvs_up
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HvsChannelMode() / HvsChannelLine() - what the channel says about
+;  itself. Mode 0 DISABLED, 1 INIT, 2 RUN, 3 EOF, and the line counter,
+;  which is the one number that proves scanning is HAPPENING rather than
+;  configured: read it twice and it must have moved.
+; ----------------------------------------------------------------------
+Procedure.i HvsChannelMode()
+  ProcedureReturn (HvsRd(#SCALER_DISPSTAT0_OFF) >> #SCALER_DISPSTATX_MODE_SHIFT) & 3
+EndProcedure
+
+Procedure.i HvsChannelLine()
+  ProcedureReturn HvsRd(#SCALER_DISPSTAT0_OFF) & $FFF
+EndProcedure
+
+Procedure.i HvsDlistActive()
+  ProcedureReturn HvsRd(#SCALER_DISPLACT0_OFF)
+EndProcedure
+
+; ======================================================================
+;  THE PIXEL VALVE
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  PvReset() - vc4_crtc_pixelvalve_reset (vc4_crtc.c:329-343). TWO
+;  writes, and the order is the point: the valve has to be disabled
+;  before its FIFO can be cleared.
+; ----------------------------------------------------------------------
+Procedure PvReset()
+  PvWr(#PV_CONTROL_OFF, PvRd(#PV_CONTROL_OFF) & ~#PV_CONTROL_EN)
+  PvWr(#PV_CONTROL_OFF, PvRd(#PV_CONTROL_OFF) | #PV_CONTROL_FIFO_CLR)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PvUp(...) - vc4_crtc_config_pv (vc4_crtc.c:345-489) for the
+;  non-interlaced DSI case, which is the only case this panel has.
+;
+;  THE HORIZONTAL NUMBERS ARE THE STRETCHED ONES. The mode this valve is
+;  programmed with is not the panel's published mode: the DSI link
+;  landed on an integer divider and the horizontal blanking was widened
+;  to put the refresh rate back. dsi_host.pi4 computes that; the caller
+;  passes the result in here. Feeding this the published 880 with a link
+;  running faster than 70 MHz gives a picture at the wrong refresh rate
+;  and a panel entitled to refuse it.
+;
+;  THE EVEN-FIELD REGISTERS ARE NOT WRITTEN. They exist only for
+;  interlace and the driver writes them only inside its interlaced
+;  branch. Writing zeros into them "to be tidy" would be inventing a
+;  configuration the driver has never produced.
+; ----------------------------------------------------------------------
+Procedure PvUp(hdisp.i, hsyncS.i, hsyncE.i, htotal.i, vdisp.i, vsyncS.i, vsyncE.i, vtotal.i)
+  Define ctl.i
+
+  PvReset()
+
+  ; HORZA: back porch in 31:16, sync width in 15:0.
+  PvWr(#PV_HORZA_OFF, ((htotal - hsyncE) << 16) | (hsyncE - hsyncS))
+
+  ; HORZB: front porch in 31:16, active in 15:0.
+  PvWr(#PV_HORZB_OFF, ((hsyncS - hdisp) << 16) | hdisp)
+
+  ; VERTA / VERTB, the same shape vertically.
+  PvWr(#PV_VERTA_OFF, ((vtotal - vsyncE) << 16) | (vsyncE - vsyncS))
+  PvWr(#PV_VERTB_OFF, ((vsyncS - vdisp) << 16) | vdisp)
+
+  ; Continuous, and tell the valve its sink is DSI. ODD_TIMING is a
+  ; later-generation bit and is deliberately not set here.
+  PvWr(#PV_V_CONTROL_OFF, #PV_VCONTROL_CONTINUOUS | #PV_VCONTROL_DSI)
+  PvWr(#PV_VSYNCD_EVEN_OFF, 0)
+
+  ; The DSI-only register: the active width again, un-divided.
+  PvWr(#PV_HACT_ACT_OFF, hdisp)
+
+  PvWr(#PV_MUX_CFG_OFF, #PV_MUX_CFG_NO_SWAP)
+
+  ctl = #PV_CONTROL_FIFO_CLR
+  ctl = ctl | (#PV1_FIFO_LEVEL << #PV_CONTROL_FIFO_LEVEL_SHIFT)
+  ctl = ctl | (#PV_CONTROL_FORMAT_DSIV_24 << #PV_CONTROL_FORMAT_SHIFT)
+  ctl = ctl | #PV_CONTROL_CLR_AT_START
+  ctl = ctl | #PV_CONTROL_TRIGGER_UNDERFLOW
+  ctl = ctl | #PV_CONTROL_WAIT_HSTART
+  ; CLK_SELECT is 0 for DSI and PIXEL_REP is 0, so neither is OR-ed in;
+  ; both are named in the constants above so that is visible rather than
+  ; looking like an omission.
+  PvWr(#PV_CONTROL_OFF, ctl)
+
+  ; No interrupts. The monitor polls.
+  PvWr(#PV_INTEN_OFF, 0)
+  PvWr(#PV_INTSTAT_OFF, $3FF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PvEnable() - the valve, then the video enable, as two steps, because
+;  the DSI host's own video enable belongs between them in the driver's
+;  order and a caller has to be able to put it there.
+; ----------------------------------------------------------------------
+Procedure PvEnable()
+  PvWr(#PV_CONTROL_OFF, PvRd(#PV_CONTROL_OFF) | #PV_CONTROL_EN)
+  pv_up = 1
+EndProcedure
+
+Procedure PvVideoOn()
+  PvWr(#PV_V_CONTROL_OFF, PvRd(#PV_V_CONTROL_OFF) | #PV_VCONTROL_VIDEN)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PvDown() - the disable sequence, vc4_crtc.c:502-551, INCLUDING the
+;  twenty millisecond wait, which is not padding: on this part a pixel
+;  can be left stuck in the valve's downstream FIFO and the driver waits
+;  for it before resetting anything.
+; ----------------------------------------------------------------------
+Procedure PvDown()
+  Define spin.i
+
+  PvWr(#PV_V_CONTROL_OFF, PvRd(#PV_V_CONTROL_OFF) & ~#PV_VCONTROL_VIDEN)
+
+  spin = 100000
+  While spin > 0
+    If (PvRd(#PV_V_CONTROL_OFF) & #PV_VCONTROL_VIDEN) = 0
+      Break
+    EndIf
+    spin = spin - 1
+  Wend
+
+  delay(20)
+  PvReset()
+  pv_up = 0
+EndProcedure
+
+Procedure HvsDown()
+  HvsWr(#SCALER_DISPCTRL0_OFF, #SCALER_DISPCTRLX_RESET)
+  HvsWr(#SCALER_DISPCTRL0_OFF, 0)
+  hvs_up = 0
+  hvs_flip_pending = 0
+EndProcedure
+
+; ======================================================================
+;  READERS
+; ======================================================================
+; ----------------------------------------------------------------------
+;  HvsMirror - set the two mirror bits the display list carries, and put
+;  them into effect at once if a channel is already running.
+;
+;  hf and vf are the horizontal and vertical mirrors. Both together are
+;  a 180 degree rotation and that is the ONLY rotation this block has -
+;  see THE ONLY ROTATION THIS HARDWARE HAS IS A PAIR OF MIRRORS above.
+;  Ninety degrees is not offered here because the hardware does not have
+;  it; whatever wants it has to write the pixels the other way round.
+;
+;  The list is rewritten in place rather than the channel being reset:
+;  the HVS latches the list index at the next frame start and reads the
+;  words then, so a list rewritten between frames is picked up whole on
+;  the next one. That is the same property HvsUp() relies on when it
+;  writes the list before the pointer at it.
+; ----------------------------------------------------------------------
+Procedure HvsMirror(hf.i, vf.i)
+  hvs_hflip = 0
+  hvs_vflip = 0
+  If hf <> 0
+    hvs_hflip = 1
+  EndIf
+  If vf <> 0
+    hvs_vflip = 1
+  EndIf
+  If hvs_up <> 0 And hvs_fb <> 0
+    HvsWriteDlist(hvs_dlist_at, hvs_fb, hvs_w, hvs_h)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HvsRepoint - scan out a DIFFERENT framebuffer of the same geometry.
+;  One list rewrite; the channel keeps running. Used when the screen
+;  moves between the buffer the console draws in and the buffer the
+;  panel scans, which is what a 90 degree rotation makes of it.
+; ----------------------------------------------------------------------
+Procedure HvsRepoint(fb.i)
+  If hvs_up = 0 Or fb = 0
+    ProcedureReturn
+  EndIf
+  hvs_fb = fb
+  HvsWriteDlist(hvs_dlist_at, fb, hvs_w, hvs_h)
+EndProcedure
+
+; Stage a complete list in the inactive fixed slot, then ask the HVS to
+; adopt it. A zero from HvsFlipResolve means pending, never rolled back:
+; DISPLIST has been written and the hardware may latch it later.
+Procedure.i HvsFlipBegin(fb.i, hf.i, vf.i)
+  Define at.i
+  If hvs_up = 0 Or fb = 0 Or hvs_flip_pending <> 0
+    ProcedureReturn 0
+  EndIf
+  at = #HVS_DLIST_FIRST
+  If hvs_dlist_at = #HVS_DLIST_FIRST
+    at = #HVS_DLIST_SECOND
+  EndIf
+  hvs_flip_hf = Bool(hf <> 0)
+  hvs_flip_vf = Bool(vf <> 0)
+  hvs_flip_fb = fb
+  hvs_flip_at = at
+  HvsWriteDlistFor(at, fb, hvs_w, hvs_h, hvs_flip_hf, hvs_flip_vf)
+  HvsWr(#SCALER_DISPLIST0_OFF, at)
+  hvs_flip_pending = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HvsFlipResolve()
+  If hvs_flip_pending = 0
+    ProcedureReturn 1
+  EndIf
+  If HvsDlistActive() <> hvs_flip_at
+    ProcedureReturn 0
+  EndIf
+  hvs_dlist_at = hvs_flip_at
+  hvs_fb = hvs_flip_fb
+  hvs_hflip = hvs_flip_hf
+  hvs_vflip = hvs_flip_vf
+  hvs_flip_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+; The caller's bounded wait expired. THE REQUEST CANNOT BE UNMADE:
+; SCALER_DISPLIST0 has already been written and the block may take the
+; staged slot at any later frame. Forgetting it would leave a picture
+; that can change shape on its own, minutes later, with nothing in the
+; software describing why.
+;
+; So the staged slot is REWRITTEN to say exactly what the active slot
+; says - same framebuffer, same size, same mirror bits. The two slots
+; become identical and it stops mattering which of them the hardware
+; ends up on. Nothing is rolled back, because there is nothing the
+; hardware would let us roll back.
+;
+; DISPLIST is deliberately NOT pointed back at the old slot. That would
+; be a second request racing the first, and the block would still be
+; free to latch either.
+Procedure.i HvsFlipAbandon()
+  If hvs_flip_pending = 0
+    ProcedureReturn 1
+  EndIf
+  If hvs_up = 0 Or hvs_fb = 0
+    hvs_flip_pending = 0
+    ProcedureReturn 0
+  EndIf
+  HvsWriteDlistFor(hvs_flip_at, hvs_fb, hvs_w, hvs_h, hvs_hflip, hvs_vflip)
+  hvs_flip_pending = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HvsFlipPending() : ProcedureReturn hvs_flip_pending : EndProcedure
+
+Procedure.i HvsModeAtEnable() : ProcedureReturn hvs_mode_at_enable : EndProcedure
+Procedure.i HvsHFlip()   : ProcedureReturn hvs_hflip    : EndProcedure
+Procedure.i HvsVFlip()   : ProcedureReturn hvs_vflip    : EndProcedure
+Procedure.i HvsWidth()   : ProcedureReturn hvs_w        : EndProcedure
+Procedure.i HvsHeight()  : ProcedureReturn hvs_h        : EndProcedure
+Procedure.i HvsCoreHz()  : ProcedureReturn hvs_core_hz  : EndProcedure
+Procedure.i HvsDlistAt() : ProcedureReturn hvs_dlist_at : EndProcedure
+Procedure.i HvsFb()      : ProcedureReturn hvs_fb       : EndProcedure
+Procedure.i HvsIsUp()    : ProcedureReturn hvs_up       : EndProcedure
+Procedure.i PvIsUp()     : ProcedureReturn pv_up        : EndProcedure

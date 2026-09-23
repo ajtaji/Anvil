@@ -1,0 +1,86 @@
+; Arduino UNO Q / Qualcomm QRB2210 (QCM2290, "Imola") phase-1 CPU intrinsics.
+@TARGET QCM2290
+;
+; The quad Cortex-A53 is ARMv8.0-A - the same baseline as the Pi 4's A72 - so
+; these are identical to the BCM2711 set: they are architecture-generic, not
+; SoC-specific. Peripheral operations belong in readable libraries once a
+; register table exists; only instructions with no language-level equivalent
+; belong here.
+
+@INTRINSIC a64_wait_for_event
+@ARGS 0
+@DOC Sleeps until an event or interrupt wakes the Cortex-A53 core.
+@SIG a64_wait_for_event()
+@EXAMPLE a64_wait_for_event()
+@ASM
+  wfe
+@END
+
+@INTRINSIC a64_send_event
+@ARGS 0
+@DOC Sends an event to wake cores waiting in WFE.
+@SIG a64_send_event()
+@EXAMPLE a64_send_event()
+@ASM
+  sev
+@END
+
+@INTRINSIC a64_barrier
+@ARGS 0
+@DOC Completes prior memory accesses and synchronizes the instruction stream.
+@SIG a64_barrier()
+@EXAMPLE a64_barrier()
+@ASM
+  dsb sy
+  isb
+@END
+
+; ======================================================================
+;  ADVANCED SIMD, added 2026-09-05 with the NEON campaign's phase 2.
+; ======================================================================
+;  TWO INSTRUCTIONS, AND THE SHORTNESS IS THE POINT.
+;
+;  House rule 9 is libraries, never intrinsics, unless the language
+;  genuinely cannot express the thing - and here it cannot: there is no
+;  vector type, so a 128-bit value cannot be a variable, a parameter or
+;  a return. Sixteen bytes cannot be moved in one access from this
+;  language by any other route.
+;
+;  WHY THERE IS NO LOOP HERE, and this is the part worth reading before
+;  adding one. A vector loop needs a moving pointer and a counter in
+;  GENERAL-PURPOSE registers. A template can only name %N - the
+;  caller's own argument registers - and modifying one of those
+;  corrupts whatever the caller had there; every other integer register
+;  is either in the allocator's pool (t2-t6, a2-a7) or used by the
+;  emitter's own lowerings (x16 in the division sequence, x17/x18 in
+;  the entry prologue). "Used only transiently, so it is probably free"
+;  is precisely the reasoning behind the two intrinsic-clobbers-a-live-
+;  caller-register defects still open in the known-bugs note.
+;
+;  So the LOOPS live in RaspberryPi4/Lib/simd.pi4 (the Q has no library layer of
+;  its own yet, and that file is architecture-generic AArch64 - see
+;  ArduinoQ/Lib/README.md), where a whole
+;  procedure owns its registers and x9..x13 are the library layer's
+;  documented scratch. These two are the instruction-level reach, they
+;  touch v0 and nothing else, and they read their arguments without
+;  writing them.
+
+@INTRINSIC a64_neon_zero128
+@ARGS 1
+@DOC Writes sixteen zero bytes at the address. One store, no loop: it is the 128-bit access the language has no other way to make. The address must be 16-byte aligned.
+@SIG a64_neon_zero128(*at)
+@EXAMPLE a64_neon_zero128(@block)
+@ASM
+  movi v0.4s, #0
+  st1 { v0.4s }, [%1]
+@END
+
+@INTRINSIC a64_neon_copy128
+@ARGS 2
+@DOC Copies sixteen bytes from the second address to the first, in one load and one store. Both addresses must be 16-byte aligned, and the two regions must not overlap.
+@SIG a64_neon_copy128(*dst, *src)
+@EXAMPLE a64_neon_copy128(@dst, @src)
+@ASM
+  ld1 { v0.4s }, [%2]
+  st1 { v0.4s }, [%1]
+@END

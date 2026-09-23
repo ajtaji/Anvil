@@ -1,0 +1,86 @@
+@CHAPTER Anvil on a Raspberry Pi 3
+
+@INTRO The same Anvil core on a BCM2837 board. The firmware starts a small
+Pi 3 EL3 stub, then enters the complete monitor directly as `kernel8.img`.
+
+@SECTION What this board runs
+
+The Raspberry Pi 3 Model B runs the shared Anvil core with backends for the
+BCM2837. Its composition root is `RaspberryPi3/Board/board.pi3`; its own
+firmware stub is `RaspberryPi3/Board/armstub8.asm`. Shared commands and
+filesystems come from `Anvil/`.
+
+@FRAG
+RaspberryPi3/Board/board.pi3       composition, placement and prompt
+RaspberryPi3/Board/armstub8.asm    firmware EL3 entry stub
+RaspberryPi3/Lib/mmu.pi3           BCM2837 page tables
+RaspberryPi3/Lib/*.pbi             Pi 3 timer, UART, mailbox and SDHOST
+@ENDFRAG
+
+@SECTION Direct firmware entry
+
+The normal cold boot does not run an Anvil slot selector. Firmware loads the
+custom `armstub8.bin` at address zero, then the complete Anvil monitor as
+`kernel8.img` at `$200000`. The stub configures the BCM2837 counter and SMP
+coherency, establishes EL3 state, masks exceptions, parks secondary cores,
+and enters AArch64 EL3h. It passes the firmware DTB address in x0; the compiler
+startup reaches Main with that value intact. The monitor verifies EL3 at entry
+and in `Main`, and refuses a lower-level handoff.
+
+@FRAG
+monitor image and entry     $200000
+firmware DTB                $1000000
+monitor BSS                 $1100000
+monitor stack top           $1F00000
+@ENDFRAG
+
+These values are checked against the emitted PMF metadata and firmware config.
+The Pi 3 stub uses the BCM2837 local-control block at `$40000000` and its
+19.2 MHz counter source. It does not configure the Pi 4 GIC.
+
+@SECTION Startup and storage
+
+Main captures x0 before its first ordinary runtime call. It validates the
+firmware DTB and RAM extent, performs required firmware mailbox queries before
+enabling the MMU, then initializes the console and prompt. It does not mount a
+filesystem or verify slot metadata before showing the prompt. SDHOST starts
+lazily on the first card operation, using the CORE clock remembered before
+MMU/cache enable; its cached execution path refuses an absent clock handoff or
+a mixed MMU/cache state.
+
+The monitor keeps Anvil's `boot <name>` command for file-backed payloads after
+startup. That payload loader is separate from firmware's cold loading of
+`kernel8.img`. On the verified Model B v1.2, the configured TrueType font is
+loaded before the first banner; saved Wi-Fi connects automatically, obtains
+DHCP, and serves the UDP console. A 64 KiB wireless transfer passed its board
+CRC check. These are hardware results for that board revision, not claims for
+every Pi 3 variant.
+
+VideoCore IV has a returning-payload proof for power-domain activation, IDENT
+read, and a 64×64 offscreen clear. It does not yet provide Pi 3 Vulkan or a
+GPU-to-scanout presentation path. USB host and USB Ethernet are also not
+implemented.
+
+@SECTION Building and checking
+
+@CODE
+python tools/build.py pi3 --compiler <PureMetalForge.exe>
+python tools/pi3_direct_boot_check.py
+@ENDCODE
+
+The board target builds the stub and complete monitor. The direct-boot gate
+checks the stub firmware slots, EL3 register setup, primary DTB handoff,
+secondary-core parking and release, PMF placement, and the actual emitted
+stub-to-compiler-startup-to-Main path. It is a host check; a board cold boot is
+still required to establish firmware and silicon behavior.
+
+@SECTION Replacing the boot files
+
+Use `tools/pi3_boot_stage.py` to validate the exact monitor and stub hashes
+against the pinned firmware set and create a new bundle. Review its
+`SHA256.json` manifest, then use `tools/pi3_provision.py` on an already-mounted
+boot volume with the reviewed manifest hash and a new host backup directory.
+The provisioner backs up files it changes before writing, checks readback
+hashes, and does not partition or format media. The normal update replaces
+direct firmware files; it is not an A/B slot transaction. See `docs/PI3_BOOT.md`
+and `docs/PI3_SELF_UPDATE.md` for the full contract and commands.

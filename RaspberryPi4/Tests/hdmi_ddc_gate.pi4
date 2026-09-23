@@ -1,0 +1,35 @@
+; Desk-only BCM2711 DDC gate. Python models MMIO; never boot this image.
+XIncludeFile "Anvil/Graphics/edid.pbi"
+Global ddc_gate_expired.i
+
+Procedure.i I2cDeadlineUs(us.i)
+  ProcedureReturn 1000
+EndProcedure
+
+Procedure.i I2cDeadlinePassed(deadline.i)
+  ProcedureReturn ddc_gate_expired
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/hdmi_ddc.pi4"
+
+Procedure.i Main()
+  ddc_gate_expired=PeekI($06000008)
+  Select PeekI($06000000)
+    Case 1 : ProcedureReturn Pi4HdmiDdcInit(PeekI($06000010))
+    Case 2 : ProcedureReturn Pi4HdmiDdcReadBlock(PeekI($06000010),PeekI($06000018),PeekI($06000020))
+    Case 3 : ProcedureReturn Pi4HdmiDdcRead(PeekI($06000010),PeekI($06000020),PeekI($06000018),$06000080,$06000088)
+    Case 4 : ProcedureReturn Pi4HdmiDdcError()
+    Case 5 : ProcedureReturn Pi4HdmiDdcErrorBlock()
+    Case 6 : ProcedureReturn Pi4HdmiDdcReady()
+    Case 7 : ProcedureReturn AnvilEdidValid()
+    Case 8 : ProcedureReturn AnvilEdidPreferredWidth()
+    Case 9 : ProcedureReturn AnvilEdidPreferredHeight()
+    Case 10 : ProcedureReturn AnvilEdidModeCount()
+    Case 11 : ProcedureReturn AnvilEdidTruncated()
+    Case 12 : ProcedureReturn AnvilEdidError()
+    Case 13 : ProcedureReturn AnvilEdidExtensionCount()
+    Case 14 : ProcedureReturn AnvilEdidModeAt(PeekI($06000010),$06000028,$06000030,$06000038,$06000040)
+    Case 15 : ProcedureReturn AnvilEdidParse($06001000,256,2,0)
+  EndSelect
+  ProcedureReturn -99
+EndProcedure

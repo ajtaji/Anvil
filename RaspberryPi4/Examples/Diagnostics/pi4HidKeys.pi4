@@ -1,0 +1,643 @@
+; ======================================================================
+; pi4HidKeys - the bench instrument for RaspberryPi4/Lib/hid.pi4.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHAT IT IS FOR, in order of importance:
+;
+;   1. PRINT THE WHOLE USB TREE. Root ports, what is on each, and - for
+;      the hub that is soldered to this board - every downstream port
+;      with what is on it and at what speed. Until this prints, nothing
+;      about a keyboard is worth debugging, because a keyboard that is
+;      not enumerated is not a keyboard problem.
+;
+;   2. PRINT THE RAW REPORT BYTES OF A REAL KEYPRESS, exactly as they
+;      arrive, before any decoding. This is the number the report on
+;      this work has to carry. A decoded 'a' proves the decoder; the
+;      eight bytes prove the bus.
+;
+;   3. PRINT THE DECODED RESULT beside them, so the two can be compared
+;      by eye rather than trusted.
+;
+;   4. MEASURE THE POLL. hid.pi4's whole design rests on a control-pipe
+;      poll being fast enough to use, and its header says the number
+;      that decides it is a measurement and not an opinion. This program
+;      is where that measurement is taken: mean and WORST-CASE
+;      microseconds per GET_REPORT, printed against the bInterval the
+;      keyboard's own interrupt endpoint asked for. If the worst case is
+;      far above that interval, interrupt endpoints in xhci.pi4 are
+;      justified; if it is not, they are not, and the difference is a
+;      week of work.
+;
+;   pmfc pi4HidKeys.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o hidkeys.img
+;
+; PLUG A USB KEYBOARD INTO ONE OF THE USB-A PORTS BEFORE RUNNING IT.
+; Either colour works; a keyboard is low- or full-speed either way and
+; will appear behind the internal hub in both cases. If a mouse is
+; plugged in as well, both are found and both are polled.
+;
+; IT STOPS ON ITS OWN. Whichever comes first: #POLL_BUDGET_MS of wall
+; clock, #MAX_POLLS polls, ESCAPE on the USB keyboard, or any byte on
+; the serial console. The wall clock is the one that matters and it is
+; there because the BCM2711 watchdog cannot be armed past about
+; 15.999 s (safety.pi4:434) - a soak bounded only by a poll count could
+; never reach the measurement it exists to print, and did not. See
+; #POLL_BUDGET_MS.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+
+; How many polls before the loop gives up on its own. At a few
+; milliseconds each this is a couple of minutes, which is long enough to
+; type on and short enough that a forgotten board frees itself.
+#MAX_POLLS = 40000
+
+; ======================================================================
+;  AND A WALL-CLOCK BUDGET, WHICH IS THE ONE THAT ACTUALLY STOPS IT.
+; ======================================================================
+;  A POLL COUNT IS NOT A TIME LIMIT, and on this board that difference
+;  is fatal rather than untidy. The BCM2711 watchdog cannot be armed
+;  past PM_WDOG_MAX_TICKS $000FFFFF, about 15.999 s - safety.pi4:434 -
+;  so a payload run under the monitor's deadman has a HARD sixteen
+;  second life and there is no register that will give it more. Forty
+;  thousand polls at a few milliseconds each is a couple of minutes,
+;  which means this program could NEVER reach its own measurement: the
+;  board reset mid-loop and the numbers it exists to print - the mean
+;  and, far more importantly, the WORST CASE - were never printed once.
+;
+;  "Press ESCAPE to stop" is not an answer either. There is no keyboard
+;  paired to the receiver on this bench, and a serial byte needs
+;  somebody watching. A soak that only terminates when a person
+;  intervenes does not terminate.
+;
+;  So the loop ends at whichever comes first: the poll count, a key, a
+;  serial byte, or this many milliseconds. Eight seconds leaves about
+;  half the budget for the bring-up in front of it - measured at 445 ms
+;  on 2026-08-28, so the margin is enormous - and for printing the
+;  measurement afterwards, which is the whole point of running it.
+;
+;  RAISE THIS ONLY WITH THE DEADMAN DISARMED. It is sized for the
+;  monitor's `deadman 15`, not for the program.
+#POLL_BUDGET_MS = 8000
+
+; How often the latency line is reprinted, in polls.
+#STATS_EVERY = 2000
+
+Global Dim gdesc.a[64]
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Num(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure Fail(*what)
+  UartWriteStr("!! ")
+  UartWriteStr(*what)
+  UartWriteStr(": ")
+  UartWriteStr(XhciErrorText())
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure HidFail(*what)
+  UartWriteStr("!! ")
+  UartWriteStr(*what)
+  UartWriteStr(": ")
+  UartWriteStr(HidErrorText())
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; The tree, printed FROM THE STATE HidFindAndAttachAll LEFT BEHIND.
+;
+; THE ORDER HERE IS NOT A PREFERENCE AND THE FIRST VERSION OF THIS FILE
+; GOT IT WRONG. It printed the tree FIRST, walking the bus itself -
+; resetting each root port, taking a slot, addressing the device and
+; reading its descriptor - and then called HidFindAndAttachAll, which
+; walks the whole bus again from the top.
+;
+; That second walk cannot work, and the reason is worth writing down
+; because it is not obvious:
+;
+;   * ADDRESS DEVICE SENDS SET_ADDRESS TO THE DEFAULT ADDRESS, zero. A
+;     device that has already been addressed is no longer listening
+;     there, so addressing it a second time on a second slot fails.
+;   * The obvious repair - reset the port first, which returns the
+;     device to the default state - does not happen either, because
+;     XhciPortReset() returns successfully WITHOUT TOUCHING a port that
+;     is already enabled. That early return is correct and deliberate;
+;     it just means the first walk's work is not undone.
+;   * And every device would consume a second device slot, so a bench
+;     with a hub, a stick, a keyboard and a mouse would run out of the
+;     eight this driver has.
+;
+; So there is one walk, HidFindAndAttachAll's, and this procedure prints
+; what it found. That is also the more honest instrument: the tree that
+; gets printed is the tree the DRIVER saw, not a second opinion that
+; might differ from it.
+;
+; It is READ-ONLY. Nothing here resets a port or takes a slot.
+; ----------------------------------------------------------------------
+Procedure ShowTree()
+  Define p.i
+  Define n.i
+  Define hp.i
+  Define st.i
+
+  n = XhciMaxPorts()
+  UartWriteStr("root ports: ")
+  PrintDec(n)
+  PrintNl()
+
+  For p = 1 To n
+    UartWriteStr("  root port ")
+    PrintDec(p)
+    UartWriteStr("  PORTSC $")
+    PutHexN(XhciPortSc(p), 8)
+    If XhciPortConnected(p) = 0
+      UartWriteStr("   empty")
+      PrintNl()
+      Continue
+    EndIf
+    UartWriteStr("   ")
+    UartWriteStr(XhciSpeedText(XhciPortSpeed(p)))
+    If p = XhciHubRootPort() And XhciHubSlot() <> 0
+      UartWriteStr("   <- THE HUB, slot ")
+      PrintDec(XhciHubSlot())
+    EndIf
+    PrintNl()
+    UartDrain()
+  Next
+
+  If XhciHubSlot() = 0
+    PrintNl()
+    UartWriteStr("  NO HUB WAS ATTACHED. On this board that means no")
+    PrintNl()
+    UartWriteStr("  keyboard is reachable, because the VL805's own USB 2")
+    PrintNl()
+    UartWriteStr("  hub is where every low- and full-speed device lives.")
+    PrintNl()
+    ProcedureReturn
+  EndIf
+
+  PrintNl()
+  UartWriteStr("  the hub:")
+  PrintNl()
+  Num("  downstream ports    ", XhciHubPorts())
+  Row("  wHubCharacteristics ", XhciHubChar(), 4)
+  Num("  TT think time field ", XhciHubTtt())
+  Num("  power-good delay ms ", XhciHubPgood())
+  For hp = 1 To XhciHubPorts()
+    st = XhciHubPortStatus(hp)
+    UartWriteStr("    hub port ")
+    PrintDec(hp)
+    If st < 0
+      UartWriteStr("  status unreadable - ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    UartWriteStr("  status $")
+    PutHexN(st & $FFFF, 4)
+    UartWriteStr("  change $")
+    PutHexN((st >> 16) & $FFFF, 4)
+    If (st & $0001) = 0
+      UartWriteStr("   empty")
+    Else
+      UartWriteStr("   OCCUPIED, ")
+      UartWriteStr(XhciSpeedText(XhciHubPortSpeed(hp)))
+    EndIf
+    PrintNl()
+    UartDrain()
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+; The vendor and product id of one attached device, read through its own
+; slot. Printed separately from the tree because it costs a control
+; transfer per device and because it is the line that says WHICH
+; keyboard, which is what a bench actually wants when two are plugged in.
+; ----------------------------------------------------------------------
+Procedure ShowIds(h.i)
+  Define vid.i
+  Define pid.i
+  If XhciUseSlot(HidSlot(h)) = 0
+    UartWriteStr("  (slot unusable: ")
+    UartWriteStr(XhciErrorText())
+    UartWriteStr(")")
+    ProcedureReturn
+  EndIf
+  If XhciGetDescriptor(1, 0, 0, 12) < 12
+    UartWriteStr("  (no descriptor)")
+    ProcedureReturn
+  EndIf
+  vid = PeekA(XhciBounceAddr() + 8) | (PeekA(XhciBounceAddr() + 9) << 8)
+  pid = PeekA(XhciBounceAddr() + 10) | (PeekA(XhciBounceAddr() + 11) << 8)
+  UartWriteStr("  $")
+  PutHexN(vid, 4)
+  UartWriteStr(":$")
+  PutHexN(pid, 4)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; What hid.pi4 took, and the endpoint each device declared.
+;
+; THE bInterval IS THE POINT OF THIS BLOCK. It is the number of
+; milliseconds the device's own designer expected between polls, and it
+; is the yardstick the measured poll time below is compared against.
+; ----------------------------------------------------------------------
+Procedure ShowAttached()
+  Define h.i
+  For h = 1 To 4
+    If HidSlot(h) = 0
+      Continue
+    EndIf
+    ; SELECT THE SLOT FIRST. XhciSlotSpeed() and XhciSlotRoute() report
+    ; the CURRENT slot, which is whatever spoke last - so reading them
+    ; without selecting would print the previous handle's topology
+    ; beside this handle's endpoint. That is the exact class of mistake
+    ; hid.pi4's own hid_Select() exists to prevent, and a diagnostic
+    ; that makes it prints a confident wrong answer.
+    If XhciUseSlot(HidSlot(h)) = 0
+      UartWriteStr("  handle ")
+      PrintDec(h)
+      UartWriteStr("  slot ")
+      PrintDec(HidSlot(h))
+      UartWriteStr("  UNUSABLE: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    UartWriteStr("  handle ")
+    PrintDec(h)
+    UartWriteStr("  slot ")
+    PrintDec(HidSlot(h))
+    UartWriteStr("  interface ")
+    PrintDec(HidInterface(h))
+    If HidProtocol(h) = #HID_PROTO_KEYBOARD
+      UartWriteStr("  KEYBOARD")
+    ElseIf HidProtocol(h) = #HID_PROTO_MOUSE
+      UartWriteStr("  MOUSE")
+    Else
+      UartWriteStr("  ?")
+    EndIf
+    UartWriteStr("  ep $")
+    PutHexN(HidEndpoint(h), 2)
+    UartWriteStr(" mps ")
+    PrintDec(HidEndpointMps(h))
+    UartWriteStr(" bInterval ")
+    PrintDec(HidInterval(h))
+    UartWriteStr("  ")
+    UartWriteStr(XhciSpeedText(XhciSlotSpeed()))
+    If XhciSlotRoute() = 0
+      UartWriteStr(" on a root port")
+    Else
+      UartWriteStr(" on hub port ")
+      PrintDec(XhciSlotRoute())
+    EndIf
+    ShowIds(h)
+    If HidIdleAccepted(h) = 0
+      ; HID 1.11 Appendix C lists Set_Idle support as a keyboard design
+      ; requirement, so a keyboard that refuses it is out of
+      ; specification. Said out loud rather than swallowed, because it
+      ; is the kind of thing that explains later misbehaviour.
+      UartWriteStr("  (SET_IDLE refused)")
+    EndIf
+    PrintNl()
+  Next
+  UartDrain()
+EndProcedure
+
+Procedure ShowStats(h.i)
+  UartWriteStr("  polls ")
+  PrintDec(HidPollCount())
+  UartWriteStr("   mean ")
+  PrintDec(HidPollMeanUs())
+  UartWriteStr(" us   WORST ")
+  PrintDec(HidPollWorstUs())
+  UartWriteStr(" us   vs bInterval ")
+  PrintDec(HidInterval(h))
+  UartWriteStr(" ms")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; The raw eight bytes, then the decode. Both, every time, so that a
+; decode nobody expected can be checked against the bytes that produced
+; it without another run.
+Procedure ShowReport(h.i)
+  Define i.i
+  UartWriteStr("  raw ")
+  For i = 0 To 7
+    PutHexN(HidReportByte(h, i), 2)
+    UartWrite(32)
+  Next
+  UartWriteStr(" (")
+  PrintDec(HidReportLength(h))
+  UartWriteStr(" bytes)")
+  PrintNl()
+EndProcedure
+
+Procedure ShowKeyEvents(h.i)
+  Define i.i
+  Define c.i
+  For i = 0 To HidKeyEventCount() - 1
+    UartWriteStr("    usage $")
+    PutHexN(HidKeyUsage(i), 2)
+    If HidKeyDown(i) <> 0
+      UartWriteStr("  DOWN")
+    Else
+      UartWriteStr("  up  ")
+    EndIf
+    UartWriteStr("  mods $")
+    PutHexN(HidKeyMods(i), 2)
+    c = HidKeyCharAt(i)
+    If c >= 32 And c < 127
+      UartWriteStr("  char '")
+      UartWrite(c)
+      UartWriteStr("'")
+    ElseIf c > 0
+      UartWriteStr("  char $")
+      PutHexN(c, 2)
+    Else
+      UartWriteStr("  (no character)")
+    EndIf
+    PrintNl()
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define kbd.i
+  Define mouse.i
+  Define n.i
+  Define polls.i
+  Define quit.i
+  Define hz.i
+  Define t0.i
+  Define budget.i
+
+  PrintNl()
+  UartWriteStr("=== USB HID on the real bus ===")
+  PrintNl()
+
+  If PcieInit() = 0
+    UartWriteStr("!! pcie: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("!! enumerate: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("XhciInit ... ")
+  UartDrain()
+  If XhciInit() = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    Fail("init")
+    ProcedureReturn 2
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+
+  ; ---- 1. ONE walk of the bus, the driver's own.
+  ;
+  ; See the long note on ShowTree() for why this happens BEFORE the tree
+  ; is printed rather than after: a second walk cannot re-address a
+  ; device the first walk already addressed, because Address Device
+  ; sends SET_ADDRESS to the default address and the device has left it.
+  ; The tree that gets printed below is therefore the tree the DRIVER
+  ; saw, which is the one that matters.
+  PrintNl()
+  UartWriteStr("---- HidFindAndAttachAll ----")
+  PrintNl()
+  UartDrain()
+  n = HidFindAndAttachAll()
+  UartWriteStr("  attached ")
+  PrintDec(n)
+  UartWriteStr(" HID interface(s)")
+  PrintNl()
+  If HidLastError() <> #HID_ERR_NONE
+    ; Not necessarily a failure - the walk offers every device to
+    ; HidAttach and most of them are not HID, so the last error is very
+    ; often "no boot HID interface" from something perfectly healthy.
+    UartWriteStr("  last attach outcome: ")
+    UartWriteStr(HidErrorText())
+    PrintNl()
+  EndIf
+
+  ; ---- 2. the tree, as the driver left it.
+  PrintNl()
+  UartWriteStr("---- the bus ----")
+  PrintNl()
+  ShowTree()
+
+  PrintNl()
+  UartWriteStr("---- what was attached ----")
+  PrintNl()
+  ShowAttached()
+
+  kbd   = HidFind(#HID_PROTO_KEYBOARD)
+  mouse = HidFind(#HID_PROTO_MOUSE)
+  If kbd = 0 And mouse = 0
+    PrintNl()
+    UartWriteStr("=== no keyboard and no mouse found ===")
+    PrintNl()
+    UartWriteStr("Check the tree above. On this board a keyboard is NOT")
+    PrintNl()
+    UartWriteStr("on a root port - it is behind the VL805's internal hub,")
+    PrintNl()
+    UartWriteStr("so an empty hub port list is the thing to chase.")
+    PrintNl()
+    ProcedureReturn 3
+  EndIf
+
+  ; ---- 3. poll.
+  ;
+  ; The budget is worked out in TICKS once, here, rather than converted
+  ; to milliseconds inside the loop: a division per poll would be part
+  ; of what the loop is measuring. hz is zero if the timebase refused,
+  ; and in that case the budget is simply not applied - the poll count
+  ; still bounds the loop, and a wrong time limit would be worse than
+  ; none.
+  hz = HidTickHz()
+  budget = 0
+  If hz > 0
+    budget = (hz / 1000) * #POLL_BUDGET_MS
+  EndIf
+  t0 = Ticks()
+
+  PrintNl()
+  UartWriteStr("---- polling for up to ")
+  PrintDec(#POLL_BUDGET_MS)
+  UartWriteStr(" ms. Press ESCAPE to stop sooner. ----")
+  PrintNl()
+  UartDrain()
+  HidPollResetStats()
+  polls = 0
+  quit = 0
+  While polls < #MAX_POLLS And quit = 0
+    If kbd <> 0
+      n = HidKeyboardPoll(kbd)
+      If n < 0
+        ; ONE DEAD INTERFACE MUST NOT HIDE A LIVE ONE. This used to
+        ; Break, which abandoned the whole loop before the mouse was
+        ; ever polled - and on a wireless receiver with a mouse paired
+        ; and no keyboard, the keyboard interface is exactly the one
+        ; that does not answer. The device is dropped from the rotation
+        ; and the loop carries on, so what still works is still
+        ; measured. Measured on silicon 2026-08-28.
+        UartWriteStr("  keyboard poll failed, dropping it: ")
+        UartWriteStr(HidErrorText())
+        UartWriteStr(" / ")
+        UartWriteStr(XhciErrorText())
+        UartWriteStr("  (skipped events ")
+        PrintDec(XhciSkippedEvents())
+        UartWriteStr(")")
+        PrintNl()
+        UartDrain()
+        kbd = 0
+        If mouse = 0
+          ; Nothing left to poll. RECORD WHY before leaving, or the
+          ; summary below reports an abort as a completed soak.
+          quit = 4
+          Break
+        EndIf
+      EndIf
+      If n > 0
+        ShowReport(kbd)
+        ShowKeyEvents(kbd)
+        ; The lamps follow the locks this file tracks. Only issues a
+        ; transfer when something changed.
+        HidSyncLeds(kbd)
+        UartDrain()
+        ; HUT 1.21 page 84: usage $29 is ESCAPE.
+        If HidKeyIsHeld(kbd, $29) <> 0
+          quit = 1
+        EndIf
+      EndIf
+    EndIf
+
+    If mouse <> 0
+      n = HidMousePoll(mouse)
+      If n > 0
+        UartWriteStr("  mouse buttons $")
+        PutHexN(HidMouseButtons(), 2)
+        UartWriteStr("  dx ")
+        PrintDec(HidMouseDx())
+        UartWriteStr("  dy ")
+        PrintDec(HidMouseDy())
+        If HidMouseHasWheel() <> 0
+          UartWriteStr("  wheel ")
+          PrintDec(HidMouseWheel())
+        Else
+          UartWriteStr("  (no wheel byte)")
+        EndIf
+        PrintNl()
+        HidMouseTake()
+        UartDrain()
+      EndIf
+    EndIf
+
+    ; The serial console is the escape hatch when the keyboard is the
+    ; thing that is broken. Any byte stops the loop.
+    If UartReadReady() <> 0
+      UartRead()
+      quit = 2
+    EndIf
+
+    ; THE WALL CLOCK, and it is checked LAST so that a poll already in
+    ; flight is always finished and counted. quit = 3 so the summary can
+    ; say the budget ran out rather than that somebody stopped it -
+    ; those are different results and a soak that cannot tell them apart
+    ; is reporting a stop as a finish.
+    If budget > 0
+      If (Ticks() - t0) >= budget
+        quit = 3
+      EndIf
+    EndIf
+
+    polls = polls + 1
+    If polls % #STATS_EVERY = 0
+      If kbd <> 0
+        ShowStats(kbd)
+      EndIf
+    EndIf
+  Wend
+
+  PrintNl()
+  UartWriteStr("---- the measurement ----")
+  PrintNl()
+  ; WHY THE LOOP STOPPED, said plainly. A soak that ran out of budget
+  ; and one that a person interrupted produce the same numbers and mean
+  ; different things.
+  UartWriteStr("  stopped by: ")
+  Select quit
+    Case 0
+      UartWriteStr("the poll count")
+    Case 1
+      UartWriteStr("ESCAPE on the USB keyboard")
+    Case 2
+      UartWriteStr("a byte on the serial console")
+    Case 3
+      UartWriteStr("the wall-clock budget - a full soak, not an abort")
+    Default
+      UartWriteStr("a dead interface with nothing left to poll")
+  EndSelect
+  PrintNl()
+  If kbd <> 0
+    ShowStats(kbd)
+  EndIf
+  Num("total polls        ", HidPollCount())
+  Num("dropped key events ", HidKeyOverflows())
+  Num("tick frequency Hz  ", HidTickHz())
+  PrintNl()
+  UartWriteStr("WHAT TO DO WITH THIS: the worst case is the number that")
+  PrintNl()
+  UartWriteStr("matters, not the mean. A mean of 2 ms with a 200 ms stall")
+  PrintNl()
+  UartWriteStr("is a keyboard that feels broken. Compare the worst case")
+  PrintNl()
+  UartWriteStr("against the bInterval above - that is the interval the")
+  PrintNl()
+  UartWriteStr("device itself asked for - and only if it is far worse is")
+  PrintNl()
+  UartWriteStr("an interrupt endpoint in xhci.pi4 justified.")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

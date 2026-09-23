@@ -1,0 +1,204 @@
+; ======================================================================
+;  Bounded indexed-draw public-path emitted gate
+; ======================================================================
+; Desk-only. It drives the real command recorder, submission preflight and
+; captured-flight ledger over the state-only backend. No MMIO is reachable.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VID_HEAP = $06400000
+#VID_HEAP_BYTES = $00200000
+#VID_OUT = $06300000
+#VID_MAGIC = $564B4944                 ; "VKID"
+#VID_W = 16
+#VID_H = 16
+#VID_STRIDE = 16
+#VID_REPORT_WORDS = 48
+
+Global Dim vidReport.i[#VID_REPORT_WORDS]
+Global Dim vidClear.l[4]
+
+Procedure vidPut(slot.i, value.i)
+  vidReport[slot] = value
+  PokeI(#VID_OUT + (slot * 8), value)
+EndProcedure
+
+Procedure.i vidStop(code.i)
+  vidPut(1, code) : vidPut(2, AnvilVkFaultCode())
+  ProcedureReturn @vidReport[0]
+EndProcedure
+
+Procedure.i vidSeedPipeline(device.i, renderPass.i)
+  Define slot.i = 1
+  avkPipeGen[slot] = avkNextGen(avkPipeGen[slot])
+  avkPipeLive[slot] = 1 : avkPipeDev[slot] = avkDevSlot(device)
+  avkPipeRp[slot] = avkRpSlot(renderPass) : avkPipeBindCount[slot] = 1
+  avkPipeBindStride[slot * #ANVIL_VK_MAX_BINDINGS] = #VID_STRIDE
+  avkPipeSetCount[slot] = 0 : avkPipeBindingCount[slot] = 0
+  avkPipeUsesPush[slot] = 0 : avkPipeUsesUniform[slot] = 0 : avkPipeUsesSample[slot] = 0
+  avkPipeSampleMask[slot] = 1 : avkPipeBlendMode[slot] = #ANVIL_VK_BLEND_DISABLED
+  avkPipeViewW[slot] = #VID_W : avkPipeViewH[slot] = #VID_H
+  avkPipeDynamicScissor[slot] = 0
+  avkPipeScissorX[slot] = 0 : avkPipeScissorY[slot] = 0
+  avkPipeScissorW[slot] = #VID_W : avkPipeScissorH[slot] = #VID_H
+  ProcedureReturn avkToken(#ANVIL_VK_TYPE_PIPELINE, slot, avkPipeGen[slot])
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define img.i, imgMem.i, view.i, rp.i, fb.i
+  Define vertex.i, vertexMem.i, index16.i, index16Mem.i, index32.i, index32Mem.i
+  Define pipe.i, fence.i, fenceArray.i, count.i, rc.i, c.i, b.i, m.i
+  Define beforeSubmit.i, beforeComplete.i, beforeCalls.i, beforeDraws.i
+  Define vertexHandle.i, vertexOffset.q, cmdHandle.i
+  Define *list.AnvilVkBackendDrawList, *draw.AnvilVkBackendDraw
+  Define ici.VkInstanceCreateInfo, qci.VkDeviceQueueCreateInfo, dci.VkDeviceCreateInfo
+  Define prio.l, pci.VkCommandPoolCreateInfo, cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo, imgci.VkImageCreateInfo, req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo, ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription, aref.VkAttachmentReference
+  Define sub.VkSubpassDescription, rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo, bufci.VkBufferCreateInfo
+  Define rpbi.VkRenderPassBeginInfo, fci.VkFenceCreateInfo, si.VkSubmitInfo
+
+  vidPut(0, #VID_MAGIC)
+  AnvilVkTestBackendHeap(#VID_HEAP, #VID_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : ProcedureReturn vidStop(10) : EndIf
+  count = 1 : If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn vidStop(11) : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO : qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO : dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : ProcedureReturn vidStop(12) : EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO : pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : ProcedureReturn vidStop(13) : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO : cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY : cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : ProcedureReturn vidStop(14) : EndIf
+
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO : imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM : imgci\extent\width = #VID_W : imgci\extent\height = #VID_H : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1 : imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR : imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS : ProcedureReturn vidStop(15) : EndIf
+  vkGetImageMemoryRequirements(dev, img, @req) : mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO : mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @imgMem) <> #VK_SUCCESS Or vkBindImageMemory(dev, img, imgMem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(16) : EndIf
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO : ivci\image = img : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D : ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT : ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS : ProcedureReturn vidStop(17) : EndIf
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM : att\samples = #VK_SAMPLE_COUNT_1_BIT : att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE : att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED : att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS : sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO : rpci\attachmentCount = 1 : rpci\pAttachments = @att : rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS : ProcedureReturn vidStop(18) : EndIf
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO : fbci\renderPass = rp : fbci\attachmentCount = 1 : fbci\pAttachments = @view
+  fbci\width = #VID_W : fbci\height = #VID_H : fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS : ProcedureReturn vidStop(19) : EndIf
+
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO : bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : bufci\size = 3 * #VID_STRIDE
+  If vkCreateBuffer(dev, @bufci, 0, @vertex) <> #VK_SUCCESS : ProcedureReturn vidStop(20) : EndIf
+  vkGetBufferMemoryRequirements(dev, vertex, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @vertexMem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, vertex, vertexMem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(21) : EndIf
+  bufci\usage = #VK_BUFFER_USAGE_INDEX_BUFFER_BIT : bufci\size = 16
+  If vkCreateBuffer(dev, @bufci, 0, @index16) <> #VK_SUCCESS : ProcedureReturn vidStop(22) : EndIf
+  vkGetBufferMemoryRequirements(dev, index16, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @index16Mem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, index16, index16Mem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(23) : EndIf
+  bufci\size = 32
+  If vkCreateBuffer(dev, @bufci, 0, @index32) <> #VK_SUCCESS : ProcedureReturn vidStop(24) : EndIf
+  vkGetBufferMemoryRequirements(dev, index32, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @index32Mem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, index32, index32Mem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(25) : EndIf
+
+  pipe = vidSeedPipeline(dev, rp)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO : rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #VID_W : rpbi\renderArea\extent\height = #VID_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @vidClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO : bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  cmdHandle = cmd : si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO : si\commandBufferCount = 1 : si\pCommandBuffers = @cmdHandle
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : ProcedureReturn vidStop(26) : EndIf
+  fenceArray = fence : vertexHandle = vertex : vertexOffset = 0
+
+  ; UINT16: bind offset two and firstIndex one are intentionally distinct.
+  ; The closed record keeps the bind base, while exactly one packet offset
+  ; accounts for firstIndex. The scan observes 2,0,1 and closes maxVertex=2.
+  PokeW(AnvilVkBufferAddress(index16) + 2, 99)
+  PokeW(AnvilVkBufferAddress(index16) + 4, 2)
+  PokeW(AnvilVkBufferAddress(index16) + 6, 0)
+  PokeW(AnvilVkBufferAddress(index16) + 8, 1)
+  vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index16, 2, #VK_INDEX_TYPE_UINT16)
+  vkCmdDrawIndexed(cmd, 3, 1, 1, 0, 0) : vkCmdEndRenderPass(cmd)
+  vidPut(3, vkEndCommandBuffer(cmd))
+  AnvilVkTestBackendHold(1) : vidPut(4, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(5, Bool(*list\drawCount = 1 And *draw\indexBase = AnvilVkBufferAddress(index16) + 2 And *draw\indexBytes = 14))
+  vidPut(6, Bool(*draw\indexType = #VK_INDEX_TYPE_UINT16 And *draw\firstVertex = 1 And *draw\vertexCount = 3 And *draw\maxVertex = 2))
+  b = avkBufSlot(index16) : m = avkBufMemSlot[b]
+  vidPut(7, Bool(avkBufInFlight[b] = 1 And avkMemInFlight[m] = 1))
+  AnvilVkFaultClear() : vkDestroyBuffer(dev, index16, 0) : vidPut(8, AnvilVkFaultCode())
+  AnvilVkTestBackendHold(0) : vidPut(9, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  vidPut(10, Bool(avkBufInFlight[b] = 0 And avkMemInFlight[m] = 0))
+
+  ; UINT32 reaches the same closure with hardware type two and a four-byte
+  ; firstIndex unit. Its max-index scan is independent of indexCount.
+  PokeL(AnvilVkBufferAddress(index32) + 4, 77) : PokeL(AnvilVkBufferAddress(index32) + 8, 1)
+  PokeL(AnvilVkBufferAddress(index32) + 12, 2) : PokeL(AnvilVkBufferAddress(index32) + 16, 0)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 4, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 3, 1, 1, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(11, vkEndCommandBuffer(cmd)) : vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1) : vidPut(12, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(13, Bool(*draw\indexBase = AnvilVkBufferAddress(index32) + 4 And *draw\indexBytes = 28 And *draw\indexType = #VK_INDEX_TYPE_UINT32))
+  vidPut(14, Bool(*draw\firstVertex = 1 And *draw\vertexCount = 3 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(15, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; Misalignment is a recording error and cannot append a draw.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index16, 1, #VK_INDEX_TYPE_UINT16) : vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0)
+  c = avkCmdSlot(cmd) : vidPut(16, avkCbDrawCount[c]) : vkCmdEndRenderPass(cmd) : vidPut(17, vkEndCommandBuffer(cmd))
+
+  ; A selected range beyond the buffer is refused at record time.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index16, 2, #VK_INDEX_TYPE_UINT16) : vkCmdDrawIndexed(cmd, 3, 1, 6, 0, 0)
+  c = avkCmdSlot(cmd) : vidPut(18, avkCbDrawCount[c]) : vkCmdEndRenderPass(cmd) : vidPut(19, vkEndCommandBuffer(cmd))
+
+  ; Stale generation: destroy after recording. Queue preflight must refuse
+  ; before the submission/backend/fence counters or captured ledger move.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 4, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 3, 1, 1, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(20, vkEndCommandBuffer(cmd))
+  vkDestroyBuffer(dev, index32, 0) : vkFreeMemory(dev, index32Mem, 0)
+  beforeSubmit = AnvilVkSubmitCount() : beforeComplete = AnvilVkCompleteCount()
+  beforeCalls = AnvilVkTestBackendCalls() : beforeDraws = AnvilVkTestBackendDraws()
+  vkResetFences(dev, 1, @fenceArray) : vidPut(21, vkQueueSubmit(queue, 1, @si, fence))
+  vidPut(22, AnvilVkSubmitCount() - beforeSubmit) : vidPut(23, AnvilVkCompleteCount() - beforeComplete)
+  vidPut(24, AnvilVkTestBackendCalls() - beforeCalls) : vidPut(25, AnvilVkTestBackendDraws() - beforeDraws)
+  vidPut(26, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And AnvilVkSubmissionOutstanding() = 0))
+
+  ; Live resource but hostile index value: maxVertex=3 cannot fit a three-
+  ; vertex binding. This is also an atomic preflight refusal.
+  bufci\size = 16 : If vkCreateBuffer(dev, @bufci, 0, @index32) <> #VK_SUCCESS : ProcedureReturn vidStop(27) : EndIf
+  vkGetBufferMemoryRequirements(dev, index32, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @index32Mem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, index32, index32Mem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(28) : EndIf
+  PokeL(AnvilVkBufferAddress(index32), 0) : PokeL(AnvilVkBufferAddress(index32) + 4, 3) : PokeL(AnvilVkBufferAddress(index32) + 8, 1)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 0, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(27, vkEndCommandBuffer(cmd))
+  beforeSubmit = AnvilVkSubmitCount() : beforeCalls = AnvilVkTestBackendCalls()
+  vidPut(28, vkQueueSubmit(queue, 1, @si, fence))
+  vidPut(29, AnvilVkSubmitCount() - beforeSubmit) : vidPut(30, AnvilVkTestBackendCalls() - beforeCalls)
+  vidPut(31, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And AnvilVkSubmissionOutstanding() = 0))
+  ProcedureReturn @vidReport[0]
+EndProcedure

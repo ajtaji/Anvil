@@ -1,0 +1,164 @@
+; Executable gate for the bounded SDPCM receive-glom parser.
+; Main returns the first failed assertion number, or zero.
+
+Global Dim gate_desc.a[128]
+
+Procedure GatePut16(*p, v.i)
+  PokeB(*p, v & $FF)
+  PokeB(*p + 1, (v >> 8) & $FF)
+EndProcedure
+
+Procedure GateClear(*p, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    PokeB(*p + i, 0)
+  Next
+EndProcedure
+
+Procedure GateHeader(*p, n.i, seq.i, rawchan.i, next.i, doff.i, flow.i, window.i)
+  GateClear(*p, 12)
+  GatePut16(*p, n)
+  GatePut16(*p + 2, (~n) & $FFFF)
+  PokeB(*p + 4, seq & $FF)
+  PokeB(*p + 5, rawchan & $FF)
+  PokeB(*p + 6, next & $FF)
+  PokeB(*p + 7, doff & $FF)
+  PokeB(*p + 8, flow & $FF)
+  PokeB(*p + 9, window & $FF)
+EndProcedure
+
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+
+Procedure.i GateDescriptor3(next.i)
+  GateClear(@gate_desc[0], 128)
+  GateHeader(@gate_desc[0], 18, 9, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM, next, 12, 0, 0)
+  GatePut16(@gate_desc[12], 152)
+  GatePut16(@gate_desc[14], 80)
+  GatePut16(@gate_desc[16], 84)
+  ProcedureReturn Cyw43RxGlomLoadDescriptor(@gate_desc[0], 18, 512, 4)
+EndProcedure
+
+Procedure GateSuper3()
+  Define *p
+  Define i.i
+  *p = Cyw43RxGlomReadPtr()
+  For i = 0 To 511
+    PokeB(*p + i, $EE)
+  Next
+  ; Outer superframe: 316 meaningful bytes, 512 bytes on F2.
+  GateHeader(*p, 316, 10, #CYW43_RXG_CH_GLOM, 0, 12, 3, 27)
+  ; The first descriptor segment contains the 12-byte outer header and
+  ; this 140-byte data subframe.
+  GateHeader(*p + 12, 140, 10, #CYW43_RXG_CH_DATA, 0, 12, 0, 0)
+  PokeB(*p + 24, $A0)
+  PokeB(*p + 151, $A1)
+  ; Segment two starts at descriptor offset 152 and is an event.
+  GateHeader(*p + 152, 80, 11, #CYW43_RXG_CH_EVENT, 0, 12, 0, 0)
+  PokeB(*p + 164, $B0)
+  PokeB(*p + 231, $B1)
+  ; Segment three is the exact final frame; bytes 316..511 are F2 pad.
+  GateHeader(*p + 232, 84, 12, #CYW43_RXG_CH_DATA, 0, 12, 0, 0)
+  PokeB(*p + 244, $C0)
+  PokeB(*p + 315, $C1)
+EndProcedure
+
+Procedure.i Main()
+  Define *p
+  Define i.i
+
+  Cyw43RxGlomReset()
+  If Cyw43RxGlomLoadDescriptor(0, 18, 512, 4) <> #CYW43_RXG_E_NULL : ProcedureReturn 1 : EndIf
+
+  If GateDescriptor3(32) <> #CYW43_RXG_OK : ProcedureReturn 2 : EndIf
+  If Cyw43RxGlomDescriptorFrames() <> 3 Or Cyw43RxGlomDescriptorBytes() <> 316 : ProcedureReturn 3 : EndIf
+  If Cyw43RxGlomReadBytes() <> 512 Or Cyw43RxGlomDescriptorNextBytes() <> 512 : ProcedureReturn 4 : EndIf
+  If Cyw43RxGlomDescriptorNextMismatch() <> 0 : ProcedureReturn 5 : EndIf
+  GateSuper3()
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_OK : ProcedureReturn 6 : EndIf
+  If Cyw43RxGlomReady() = 0 Or Cyw43RxGlomFrameCount() <> 3 : ProcedureReturn 7 : EndIf
+  If Cyw43RxGlomOuterLength() <> 316 Or Cyw43RxGlomOuterSequence() <> 10 : ProcedureReturn 8 : EndIf
+  If Cyw43RxGlomOuterFlowControl() <> 3 Or Cyw43RxGlomOuterWindow() <> 27 : ProcedureReturn 9 : EndIf
+  If Cyw43RxGlomFrameChannel(0) <> #CYW43_RXG_CH_DATA : ProcedureReturn 10 : EndIf
+  If Cyw43RxGlomFrameChannel(1) <> #CYW43_RXG_CH_EVENT : ProcedureReturn 11 : EndIf
+  If Cyw43RxGlomFrameChannel(2) <> #CYW43_RXG_CH_DATA : ProcedureReturn 12 : EndIf
+  If Cyw43RxGlomFrameSequence(0) <> 10 Or Cyw43RxGlomFrameSequence(1) <> 11 Or Cyw43RxGlomFrameSequence(2) <> 12 : ProcedureReturn 13 : EndIf
+  If Cyw43RxGlomFrameBytes(0) <> 140 Or Cyw43RxGlomFrameBytes(1) <> 80 Or Cyw43RxGlomFrameBytes(2) <> 84 : ProcedureReturn 14 : EndIf
+  If Cyw43RxGlomPayloadBytes(0) <> 128 Or Cyw43RxGlomPayloadBytes(1) <> 68 Or Cyw43RxGlomPayloadBytes(2) <> 72 : ProcedureReturn 15 : EndIf
+  If PeekA(Cyw43RxGlomPayloadPtr(0)) <> $A0 Or PeekA(Cyw43RxGlomPayloadPtr(0) + 127) <> $A1 : ProcedureReturn 16 : EndIf
+  If PeekA(Cyw43RxGlomPayloadPtr(1)) <> $B0 Or PeekA(Cyw43RxGlomPayloadPtr(1) + 67) <> $B1 : ProcedureReturn 17 : EndIf
+  If PeekA(Cyw43RxGlomPayloadPtr(2)) <> $C0 Or PeekA(Cyw43RxGlomPayloadPtr(2) + 71) <> $C1 : ProcedureReturn 18 : EndIf
+  If Cyw43RxGlomPayloadPtr(2) + Cyw43RxGlomPayloadBytes(2) <> Cyw43RxGlomReadPtr() + 316 : ProcedureReturn 19 : EndIf
+
+  ; The eight-bit NEXTLEN hint cannot describe every legal 32 KiB glom.
+  ; A mismatch is reported but the complete descriptor remains authoritative.
+  If GateDescriptor3(1) <> #CYW43_RXG_OK Or Cyw43RxGlomDescriptorNextMismatch() <> 1 : ProcedureReturn 20 : EndIf
+
+  ; Descriptor structure, bounds and negotiated alignment.
+  GateClear(@gate_desc[0], 128)
+  GateHeader(@gate_desc[0], 17, 0, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM, 0, 12, 0, 0)
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 17, 512, 4) <> #CYW43_RXG_E_DESCRIPTOR : ProcedureReturn 21 : EndIf
+  GateClear(@gate_desc[0], 128)
+  GateHeader(@gate_desc[0], 78, 0, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM, 0, 12, 0, 0)
+  For i = 0 To 32 : GatePut16(@gate_desc[12 + (i * 2)], 24) : Next
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 78, 512, 4) <> #CYW43_RXG_E_COUNT : ProcedureReturn 22 : EndIf
+  GateClear(@gate_desc[0], 128)
+  GateHeader(@gate_desc[0], 14, 0, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM, 0, 12, 0, 0)
+  GatePut16(@gate_desc[12], 22)
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 14, 512, 4) <> #CYW43_RXG_E_LENGTH : ProcedureReturn 23 : EndIf
+  GatePut16(@gate_desc[12], 26)
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 14, 512, 4) <> #CYW43_RXG_E_ALIGNMENT : ProcedureReturn 24 : EndIf
+  GateClear(@gate_desc[0], 128)
+  GateHeader(@gate_desc[0], 76, 0, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM, 0, 12, 0, 0)
+  For i = 0 To 31 : GatePut16(@gate_desc[12 + (i * 2)], 1028) : Next
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 76, 512, 4) <> #CYW43_RXG_E_CAPACITY : ProcedureReturn 25 : EndIf
+  GateDescriptor3(32)
+  gate_desc[5] = #CYW43_RXG_CH_DATA
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 18, 512, 4) <> #CYW43_RXG_E_CHANNEL : ProcedureReturn 26 : EndIf
+  GateDescriptor3(32)
+  gate_desc[5] = #CYW43_RXG_CH_GLOM
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 18, 512, 4) <> #CYW43_RXG_E_DESCRIPTOR : ProcedureReturn 27 : EndIf
+  GateDescriptor3(32)
+  gate_desc[7] = 16
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 18, 512, 4) <> #CYW43_RXG_E_OFFSET : ProcedureReturn 28 : EndIf
+  GateDescriptor3(32)
+  gate_desc[2] = 0 : gate_desc[3] = 0
+  If Cyw43RxGlomLoadDescriptor(@gate_desc[0], 18, 512, 4) <> #CYW43_RXG_E_DESCRIPTOR : ProcedureReturn 29 : EndIf
+
+  ; A complete superframe must be read before validation, and a failure
+  ; exposes no prefix of the aggregate.
+  GateDescriptor3(32) : GateSuper3()
+  If Cyw43RxGlomAcceptSuperframe(316) <> #CYW43_RXG_E_READ_LENGTH : ProcedureReturn 30 : EndIf
+  If Cyw43RxGlomFrameCount() <> 0 : ProcedureReturn 31 : EndIf
+  If Cyw43RxGlomReadPtr() <> 0 Or Cyw43RxGlomReadBytes() <> 0 : ProcedureReturn 32 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  PokeB(*p + 2, 0) : PokeB(*p + 3, 0)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_SUPER_HEADER : ProcedureReturn 33 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  PokeB(*p + 5, #CYW43_RXG_DESC_FLAG | #CYW43_RXG_CH_GLOM)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_CHANNEL : ProcedureReturn 34 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  GatePut16(*p + 152, 100) : GatePut16(*p + 154, (~100) & $FFFF)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_SUB_HEADER : ProcedureReturn 35 : EndIf
+  If Cyw43RxGlomFrameCount() <> 0 : ProcedureReturn 36 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  PokeB(*p + 157, #CYW43_RXG_CH_CONTROL)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_CHANNEL : ProcedureReturn 37 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  PokeB(*p + 239, 8)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_OFFSET : ProcedureReturn 38 : EndIf
+  GateDescriptor3(32) : GateSuper3()
+  *p = Cyw43RxGlomReadPtr()
+  PokeB(*p + 234, 0) : PokeB(*p + 235, 0)
+  If Cyw43RxGlomAcceptSuperframe(512) <> #CYW43_RXG_E_SUB_HEADER : ProcedureReturn 39 : EndIf
+  If Cyw43RxGlomLastError() <> #CYW43_RXG_E_SUB_HEADER : ProcedureReturn 40 : EndIf
+
+  Cyw43RxGlomReset()
+  If Cyw43RxGlomReady() <> 0 Or Cyw43RxGlomFrameCount() <> 0 : ProcedureReturn 41 : EndIf
+  If Cyw43RxGlomFramePtr(0) <> 0 Or Cyw43RxGlomPayloadPtr(0) <> 0 : ProcedureReturn 42 : EndIf
+  ProcedureReturn 0
+EndProcedure

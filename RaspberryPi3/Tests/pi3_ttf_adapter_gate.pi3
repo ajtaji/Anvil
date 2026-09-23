@@ -1,0 +1,229 @@
+; Emitted Pi3 TrueType framebuffer adapter gate.
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+
+#PI3_SCREEN_TTF_FIRST = 32
+#PI3_SCREEN_TTF_GLYPHS = 95
+#PI3_SCREEN_TTF_SCALES = 3
+#PI3_SCREEN_TTF_CACHE_CELL_BYTES = 16*24
+#PI3_SCREEN_TTF_COVERAGE_BYTES = 1024
+#TTA_FONT_BASE = $10000000
+#TTA_FONT_BYTES = $00100000
+
+Global pi3_screen_fault.i
+Global pi3_fb_pixel_order.i
+Global pi3_fb_alpha_mode.i
+Global pi3_screen_ttf_slot.i = -2
+Global pi3_screen_ttf_generation.i
+Global pi3_screen_ttf_base_size.i
+Global Dim pi3_screen_ttf_valid.a[#PI3_SCREEN_TTF_GLYPHS*#PI3_SCREEN_TTF_SCALES]
+Global Dim pi3_screen_ttf_alpha.a[#PI3_SCREEN_TTF_GLYPHS*#PI3_SCREEN_TTF_SCALES*#PI3_SCREEN_TTF_CACHE_CELL_BYTES]
+Global Dim pi3_screen_ttf_coverage.a[#PI3_SCREEN_TTF_COVERAGE_BYTES]
+
+Global Dim tta_render.a[8192]
+Global Dim tta_scanout.a[8192]
+Global tta_dirty_calls.i
+Global tta_dirty_x.i
+Global tta_dirty_y.i
+Global tta_dirty_w.i
+Global tta_dirty_h.i
+Global tta_debug_actual.i
+Global tta_debug_expected.i
+Global tta_debug_alpha.i
+Global tta_debug_x.i
+Global tta_debug_y.i
+Global tta_debug_fg.i
+Global tta_debug_bg.i
+Global tta_debug_clear.i
+Global tta_debug_draw_rc.i
+Global tta_debug_addr.i
+Global tta_width.i = 40
+Global tta_height.i = 32
+Global tta_pitch.i = 192
+
+Procedure.i Pi3FbBase()
+  ProcedureReturn @tta_render[32]
+EndProcedure
+Procedure.i Pi3FbPitch()
+  ProcedureReturn tta_pitch
+EndProcedure
+Procedure.i Pi3FbWidth()
+  ProcedureReturn tta_width
+EndProcedure
+Procedure.i Pi3FbHeight()
+  ProcedureReturn tta_height
+EndProcedure
+Procedure.i Pi3FbWriteAllowed()
+  ProcedureReturn 1
+EndProcedure
+Procedure Pi3FbDirtyAdd(x.i,y.i,w.i,h.i)
+  tta_dirty_calls=tta_dirty_calls+1
+  tta_dirty_x=x : tta_dirty_y=y : tta_dirty_w=w : tta_dirty_h=h
+EndProcedure
+
+; @@PI3_TTF_ADAPTER_PROCS@@
+
+; @@PI3_TTF_PACK@@
+
+Procedure.i ttaCheck(ok.i)
+  If ok=0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected i.i,rc.i,stepsBefore.i,stepsAfter.i,cacheIndex.i,cacheOffset.i
+  Protected code.i,scale.i,fg.i,bg.i,alpha.i,px.i,py.i,pixel.i
+  Protected r.i,g.i,b.i,er.i,eg.i,eb.i,expected.i,found.i,nonzero.i,lastRows.i
+  Protected slot0Gen.i,slot1Gen.i
+  For i=0 To 8191
+    tta_render[i]=$A5 : tta_scanout[i]=$5A
+  Next
+  ; This fixture starts at Main directly; explicitly model the framebuffer
+  ; geometry and cache sentinel normally initialized before the live screen.
+  tta_width=40 : tta_height=32 : tta_pitch=192
+  pi3_screen_fault=0 : pi3_screen_ttf_slot=-2
+  pi3_screen_ttf_generation=0 : pi3_screen_ttf_base_size=0
+  tta_dirty_calls=0
+  pi3_fb_pixel_order=0 : pi3_fb_alpha_mode=0
+  If AnvilTrueTypeSlotLoad(0,#TTA_FONT_BASE,#TTA_FONT_BYTES)=0 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeSlotSelect(0)=0 : ProcedureReturn 2 : EndIf
+  If AnvilTrueTypeSetPixelHeight(13)=0 : ProcedureReturn 3 : EndIf
+  slot0Gen=AnvilTrueTypeSlotGeneration(0)
+  ; Space may be a zero-area font glyph; it must remain visually blank.
+  pi3_fb_pixel_order=0 : bg=Pi3FbPack(12,18,28)
+  For py=0 To 15
+    For px=16 To 25
+      PokeL(@tta_render[32]+py*tta_pitch+px*4,bg)
+    Next
+  Next
+  Pi3ScreenDrawGlyph(32,16,0,2,Pi3FbPack(240,180,64))
+  For py=0 To 15
+    For px=16 To 25
+      If PeekL(@tta_render[32]+py*tta_pitch+px*4)<>bg : ProcedureReturn 4 : EndIf
+    Next
+  Next
+  ; Fit and paint representative uppercase, lowercase and descender glyphs.
+  For i=0 To 4
+    Select i
+      Case 0 : code=65
+      Case 1 : code=103
+      Case 2 : code=106
+      Case 3 : code=112
+      Case 4 : code=121
+    EndSelect
+    rc=Pi3ScreenBuildTrueTypeCell(code,2)
+    If rc=0 : ProcedureReturn 60+i : EndIf
+    Pi3ScreenDrawGlyph(code,0,i*4,2,Pi3FbPack(240,180,64))
+    cacheIndex=95+(code-32)
+    If pi3_screen_ttf_valid[cacheIndex]=0 : ProcedureReturn 10+i : EndIf
+  Next
+  ; Every printable ASCII character must build from the selected TTF, rather
+  ; than appearing to pass through the bitmap fallback path.
+  For code=33 To 126
+    If Pi3ScreenBuildTrueTypeCell(code,2)=0 : ProcedureReturn 1600+code : EndIf
+    cacheIndex=95+(code-32)
+    If pi3_screen_ttf_valid[cacheIndex]=0 : ProcedureReturn 1700+code : EndIf
+  Next
+  ; The normal console is scale 2; the shared banner also uses scale 3.
+  If Pi3ScreenBuildTrueTypeCell(65,3)=0 : ProcedureReturn 18 : EndIf
+  If pi3_screen_ttf_valid[223]=0 : ProcedureReturn 19 : EndIf
+  If Pi3ScreenBuildTrueTypeCell(103,3)=0 : ProcedureReturn 22 : EndIf
+  If pi3_screen_ttf_valid[261]=0 : ProcedureReturn 23 : EndIf
+  ; Re-rendering a warm glyph must not invoke the rasterizer again.
+  stepsBefore=AnvilTrueTypeRasterCount()
+  Pi3ScreenDrawGlyph(65,0,0,2,Pi3FbPack(240,180,64))
+  stepsAfter=AnvilTrueTypeRasterCount()
+  If stepsAfter<>stepsBefore : ProcedureReturn 21 : EndIf
+  ; Descender cells must retain ink in their bottom two rows after fitting.
+  For i=1 To 4
+    Select i
+      Case 1 : code=103
+      Case 2 : code=106
+      Case 3 : code=112
+      Case 4 : code=121
+    EndSelect
+    cacheIndex=95+(code-32) : cacheOffset=cacheIndex*#PI3_SCREEN_TTF_CACHE_CELL_BYTES
+    nonzero=0
+    For py=12 To 13
+      For px=0 To 9
+        If (PeekA(@pi3_screen_ttf_alpha[cacheOffset+py*16+px])&255)>0 : nonzero=nonzero+1 : EndIf
+      Next
+    Next
+    If nonzero=0 : ProcedureReturn 30+i : EndIf
+  Next
+  ; Find a true intermediate coverage sample in A's cache cell.
+  cacheIndex=95+(65-32) : cacheOffset=cacheIndex*#PI3_SCREEN_TTF_CACHE_CELL_BYTES
+  found=0
+  For py=0 To 15
+    For px=0 To 9
+      alpha=PeekA(@pi3_screen_ttf_alpha[cacheOffset+py*16+px])&255
+      If alpha>0 And alpha<255 : found=1 : Break : EndIf
+    Next
+    If found<>0 : Break : EndIf
+  Next
+  If found=0 : ProcedureReturn 41 : EndIf
+  ; Both byte orders must blend an intermediate coverage sample correctly.
+  For i=0 To 1
+    found=0
+    pi3_fb_pixel_order=i
+    If i=0
+      r=Pi3FbPack(240,180,64) : bg=Pi3FbPack(12,18,28)
+    Else
+      r=Pi3FbPack(240,180,64) : bg=Pi3FbPack(12,18,28)
+    EndIf
+    For py=0 To tta_height-1
+      For px=0 To tta_width-1
+        PokeL(@tta_render[32]+py*tta_pitch+px*4,bg)
+      Next
+    Next
+    tta_debug_addr=@tta_render[32]+3*tta_pitch+2*4
+    PokeL(tta_debug_addr,bg)
+    tta_debug_clear=PeekL(@tta_render[32]+3*tta_pitch+2*4)
+    ; Re-find the sample after clearing the render surface.
+    For py=0 To 15
+      For px=0 To 9
+        alpha=PeekA(@pi3_screen_ttf_alpha[cacheOffset+py*16+px])&255
+        If alpha>0 And alpha<255 : found=1 : Break : EndIf
+      Next
+      If found<>0 : Break : EndIf
+    Next
+    tta_debug_draw_rc=Pi3ScreenDrawTrueType(65,0,0,2,r,@tta_render[32],tta_pitch,tta_width,tta_height)
+    pixel=PeekL(@tta_render[32]+py*tta_pitch+px*4)
+    If i=1
+      er=r&255 : eg=(r>>8)&255 : eb=(r>>16)&255
+      r=bg&255 : g=(bg>>8)&255 : b=(bg>>16)&255
+    Else
+      er=(r>>16)&255 : eg=(r>>8)&255 : eb=r&255
+      r=(bg>>16)&255 : g=(bg>>8)&255 : b=bg&255
+    EndIf
+    expected=Pi3FbPack((er*alpha+r*(255-alpha)+127)/255,(eg*alpha+g*(255-alpha)+127)/255,(eb*alpha+b*(255-alpha)+127)/255)
+    If pixel<>expected
+      tta_debug_actual=pixel : tta_debug_expected=expected : tta_debug_alpha=alpha
+      tta_debug_x=px : tta_debug_y=py : tta_debug_fg=r : tta_debug_bg=bg
+      ProcedureReturn 42+i
+    EndIf
+  Next
+  ; The selected slot, generation, and base height all invalidate cached cells.
+  stepsBefore=AnvilTrueTypeRasterCount()
+  If AnvilTrueTypeSetPixelHeight(12)=0 : ProcedureReturn 44 : EndIf
+  If Pi3ScreenBuildTrueTypeCell(65,2)=0 : ProcedureReturn 45 : EndIf
+  If AnvilTrueTypeRasterCount()<=stepsBefore : ProcedureReturn 46 : EndIf
+  stepsBefore=AnvilTrueTypeRasterCount()
+  If AnvilTrueTypeSlotLoad(1,#TTA_FONT_BASE,#TTA_FONT_BYTES)=0 : ProcedureReturn 47 : EndIf
+  If AnvilTrueTypeSlotSelect(1)=0 : ProcedureReturn 48 : EndIf
+  If Pi3ScreenBuildTrueTypeCell(65,2)=0 : ProcedureReturn 49 : EndIf
+  If AnvilTrueTypeRasterCount()<=stepsBefore : ProcedureReturn 50 : EndIf
+  ; Prefix/suffix canaries, row padding, and the separate scanout stay intact.
+  For i=0 To 8191
+    If i<32 Or i>=32+tta_pitch*tta_height
+      If (PeekA(@tta_render[i])&255)<>$A5 : ProcedureReturn 51 : EndIf
+    EndIf
+    If (PeekA(@tta_scanout[i])&255)<>$5A : ProcedureReturn 52 : EndIf
+  Next
+  For py=0 To tta_height-1
+    For px=tta_width*4 To tta_pitch-1
+      If (PeekA(@tta_render[32+py*tta_pitch+px])&255)<>$A5 : ProcedureReturn 53 : EndIf
+    Next
+  Next
+  ProcedureReturn 0
+EndProcedure

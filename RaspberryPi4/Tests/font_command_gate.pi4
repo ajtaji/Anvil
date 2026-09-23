@@ -1,0 +1,321 @@
+; Emitted test of the real Anvil font command parser with fake storage/slot seams.
+#ANVIL_TTS_MAX_SLOTS = 4
+#ANVIL_TTS_MAX_BYTES = 1048576
+#PB_Ascii = 0
+Global Dim gLine.a[1024]
+Global Dim gName.a[1024]
+Global Dim gNumBuf.b[32]
+Global gPos.i, gWordAt.i, gWordLen.i, gParseOk.i
+Global fontInfoCalls.i, fontLoadSlot.i, fontSelected.i=-1, fontDeselects.i
+Global fontPixelHeight.i=16, fontDefaultSlot.i=-1
+Global fontFileOpens.i, fontFileMatched.i, fontFileOpenFails.i, fontChecks.i, fontFailures.i
+Global Dim fontFileExpected.a[64]
+Global Dim fontSettingDefault.a[96]
+Global Dim fontSettingSize.a[8]
+Global Dim fakeSlotBytes.i[4]
+Global Dim fakeSlotGen.i[4]
+
+Procedure PrintDec(value.i)
+EndProcedure
+Procedure PrintNl()
+EndProcedure
+Procedure UartWriteStr(*value)
+EndProcedure
+Procedure str_print_at(*value)
+EndProcedure
+
+Procedure.i FakeFontSettingKind(*key)
+  If PeekA(*key)=102 And PeekA(*key+1)=111 And PeekA(*key+2)=110 And PeekA(*key+3)=116 And PeekA(*key+4)=46
+    If PeekA(*key+5)=100 : ProcedureReturn 1 : EndIf
+    If PeekA(*key+5)=115 : ProcedureReturn 2 : EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i SettingsGet(*key)
+  Select FakeFontSettingKind(*key)
+    Case 1 : If fontSettingDefault[0]<>0 : ProcedureReturn @fontSettingDefault[0] : EndIf
+    Case 2 : If fontSettingSize[0]<>0 : ProcedureReturn @fontSettingSize[0] : EndIf
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+Procedure.i SettingsLength(*key)
+  Protected n.i
+  If FakeFontSettingKind(*key)<>1 : ProcedureReturn -1 : EndIf
+  While n<96 And fontSettingDefault[n]<>0 : n+1 : Wend
+  ProcedureReturn n
+EndProcedure
+Procedure.i SettingsHas(*key)
+  If SettingsGet(*key)<>0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i SettingsSet(*key,*value)
+  Protected n.i, kind.i
+  kind=FakeFontSettingKind(*key)
+  If kind=1
+    While n<95 And PeekA(*value+n)<>0 : fontSettingDefault[n]=PeekA(*value+n) : n+1 : Wend
+    fontSettingDefault[n]=0 : ProcedureReturn 1
+  ElseIf kind=2
+    While n<7 And PeekA(*value+n)<>0 : fontSettingSize[n]=PeekA(*value+n) : n+1 : Wend
+    fontSettingSize[n]=0 : ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i SettingsRemove(*key)
+  Protected n.i
+  If FakeFontSettingKind(*key)=1
+    For n=0 To 95 : fontSettingDefault[n]=0 : Next
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i SettingsLoadState()
+  ProcedureReturn 1
+EndProcedure
+Procedure PmfPutDec(value.i,*dst)
+  Protected n.i
+  If value>=100 : PokeA(*dst+n,48+value/100) : n+1 : value=value-(value/100)*100 : EndIf
+  If n>0 Or value>=10 : PokeA(*dst+n,48+value/10) : n+1 : value=value-(value/10)*10 : EndIf
+  PokeA(*dst+n,48+value) : PokeA(*dst+n+1,0)
+EndProcedure
+Procedure.i PmfDecOf(*value,defaultValue.i)
+  Protected n.i, result.i, c.i
+  While n<8
+    c=PeekA(*value+n)
+    If c=0 : Break : EndIf
+    If c<48 Or c>57 : ProcedureReturn defaultValue : EndIf
+    result=result*10+c-48 : n+1
+  Wend
+  If n=0 : ProcedureReturn defaultValue : EndIf
+  ProcedureReturn result
+EndProcedure
+
+Procedure SkipSpace()
+  While gLine[gPos] = 32 Or gLine[gPos] = 9 : gPos + 1 : Wend
+EndProcedure
+Procedure SkipWord()
+  ; Match parse.pbi: tabs are not a SkipWord delimiter.
+  While gLine[gPos] <> 0 And gLine[gPos] <> 32 : gPos + 1 : Wend
+EndProcedure
+Procedure.i WordIs(*word)
+  Protected n.i, a.i, b.i
+  n = 0
+  Repeat
+    b = PeekA(*word + n) & $FF
+    If b = 0 : Break : EndIf
+    If n >= gWordLen : ProcedureReturn 0 : EndIf
+    a = gLine[gWordAt+n] & $FF
+    If a >= 65 And a <= 90 : a + 32 : EndIf
+    If b >= 65 And b <= 90 : b + 32 : EndIf
+    If a <> b : ProcedureReturn 0 : EndIf
+    n + 1
+  ForEver
+  If n <> gWordLen : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i ParseDec()
+  Protected value.i, digits.i
+  SkipSpace() : gParseOk = 1
+  While gLine[gPos] >= 48 And gLine[gPos] <= 57
+    value = value * 10 + gLine[gPos] - 48 : gPos + 1 : digits + 1
+  Wend
+  If digits = 0 : gParseOk = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn value
+EndProcedure
+Procedure.i ParseStoragePath()
+  Protected start.i, n.i
+  SkipSpace() : start = gPos
+  While gLine[gPos] <> 0 And gLine[gPos] <> 32 And gLine[gPos] <> 9
+    If n < 1023 : gName[n] = gLine[gPos] : n + 1 : EndIf
+    gPos + 1
+  Wend
+  gName[n] = 0
+  ProcedureReturn n
+EndProcedure
+
+Procedure AnvilTrueTypeSlotsInit()
+EndProcedure
+Procedure.i AnvilTrueTypeSlotSelected()
+  ProcedureReturn fontSelected
+EndProcedure
+Procedure.i AnvilTrueTypeSlotBytes(slot.i)
+  ProcedureReturn fakeSlotBytes(slot)
+EndProcedure
+Procedure.i AnvilTrueTypeSlotGeneration(slot.i)
+  ProcedureReturn fakeSlotGen(slot)
+EndProcedure
+Procedure.i AnvilTrueTypeSlotParserBound()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypePixelHeight()
+  ProcedureReturn fontPixelHeight
+EndProcedure
+Procedure.i AnvilTrueTypeSetPixelHeight(value.i)
+  If value<1 Or value>512 : ProcedureReturn 0 : EndIf
+  fontPixelHeight=value : ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypeDefaultSlot()
+  ProcedureReturn fontDefaultSlot
+EndProcedure
+Procedure.i AnvilTrueTypeSetDefaultSlot(value.i)
+  If value < -1 Or value > 3 : ProcedureReturn 0 : EndIf
+  fontDefaultSlot=value : ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypeUnitsPerEm()
+  fontInfoCalls + 1
+  ProcedureReturn 1000
+EndProcedure
+Procedure.i AnvilTrueTypeGlyphCount()
+  ProcedureReturn 256
+EndProcedure
+Procedure.i AnvilTrueTypeAscender()
+  ProcedureReturn 800
+EndProcedure
+Procedure.i AnvilTrueTypeDescender()
+  ProcedureReturn -200
+EndProcedure
+Procedure.i AnvilTrueTypeLineGap()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i AnvilTrueTypeSlotLoad(slot.i, data.i, bytes.i)
+  fontLoadSlot = slot : fakeSlotBytes(slot) = bytes : fakeSlotGen(slot) = fakeSlotGen(slot) + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypeSlotSelect(slot.i)
+  If fakeSlotBytes(slot) = 0 : ProcedureReturn 0 : EndIf
+  fontSelected = slot : ProcedureReturn 1
+EndProcedure
+Procedure AnvilTrueTypeSlotDeselect()
+  fontSelected = -1 : fontDeselects + 1
+EndProcedure
+Procedure.i AnvilTrueTypeSlotUnload(slot.i)
+  fakeSlotBytes(slot) = 0 : ProcedureReturn 1
+EndProcedure
+Procedure.i HwStorageUp()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwFileOpen(*path)
+  Protected n.i
+  fontFileOpens + 1 : fontFileMatched = 1
+  If fontFileOpenFails<>0 : ProcedureReturn 0 : EndIf
+  While PeekA(*path+n) <> 0 And n < 1024
+    If PeekA(*path+n) <> PeekA(@fontFileExpected+n) : fontFileMatched = 0 : EndIf
+    n + 1
+  Wend
+  If PeekA(@fontFileExpected+n) <> 0 : fontFileMatched = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwFileSize()
+  ProcedureReturn 64
+EndProcedure
+Procedure.i HwFileReadAt(offset.i, target.i, bytes.i)
+  ProcedureReturn bytes
+EndProcedure
+Procedure HwFileClose()
+EndProcedure
+Procedure.i HwFileErrorText()
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "Anvil/Core/font_cmd.pbi"
+
+Procedure SetCommand(command.i)
+  Protected n.i, pathPos.i
+  For n = 0 To 1023 : gLine[n] = 0 : Next
+  If command = 1
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116
+    gLine[4]=32 : gLine[5]=105 : gLine[6]=110 : gLine[7]=102 : gLine[8]=111
+  ElseIf command = 2
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=108 : gLine[6]=111 : gLine[7]=97 : gLine[8]=100 : gLine[9]=32
+    gLine[10]=49 : gLine[11]=32 : n=12
+    While fontFileExpected[pathPos] <> 0
+      gLine[n]=fontFileExpected[pathPos] : n + 1 : pathPos + 1
+    Wend
+  ElseIf command = 3 Or command = 5
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=115 : gLine[6]=101 : gLine[7]=108 : gLine[8]=101 : gLine[9]=99
+    gLine[10]=116 : gLine[11]=32
+    If command = 3 : gLine[12]=49 : Else : gLine[12]=50 : EndIf
+  ElseIf command = 4
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=115 : gLine[6]=101 : gLine[7]=108 : gLine[8]=101 : gLine[9]=99
+    gLine[10]=116 : gLine[11]=32 : gLine[12]=98 : gLine[13]=105
+    gLine[14]=116 : gLine[15]=109 : gLine[16]=97 : gLine[17]=112
+  ElseIf command >= 6 And command <= 9
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=115 : gLine[6]=105 : gLine[7]=122 : gLine[8]=101 : gLine[9]=32
+    If command=6 : gLine[10]=50 : gLine[11]=52
+    ElseIf command=7 : gLine[10]=48
+    ElseIf command=8 : gLine[10]=53 : gLine[11]=49 : gLine[12]=51
+    Else : gLine[10]=51 : gLine[11]=50 : gLine[12]=32 : gLine[13]=120 : EndIf
+  ElseIf command = 10 Or command = 12
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=100 : gLine[6]=101 : gLine[7]=102 : gLine[8]=97 : gLine[9]=117
+    gLine[10]=108 : gLine[11]=116 : gLine[12]=32
+    If command=10 : gLine[13]=49 : Else : gLine[13]=50 : EndIf
+  ElseIf command = 11
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=100 : gLine[6]=101 : gLine[7]=102 : gLine[8]=97 : gLine[9]=117
+    gLine[10]=108 : gLine[11]=116 : gLine[12]=32 : gLine[13]=98 : gLine[14]=105
+    gLine[15]=116 : gLine[16]=109 : gLine[17]=97 : gLine[18]=112
+  ElseIf command = 13
+    gLine[0]=102 : gLine[1]=111 : gLine[2]=110 : gLine[3]=116 : gLine[4]=32
+    gLine[5]=117 : gLine[6]=110 : gLine[7]=108 : gLine[8]=111 : gLine[9]=97 : gLine[10]=100 : gLine[11]=32 : gLine[12]=48
+  EndIf
+  gPos = 0 : gWordAt = 0 : gWordLen = 0 : gParseOk = 1
+EndProcedure
+Procedure Check(ok.i)
+  fontChecks + 1
+  If ok = 0 : fontFailures + 1 : EndIf
+EndProcedure
+Procedure.i Main()
+  fontSelected = 1 : fakeSlotBytes(1) = 64
+  SetCommand(1) : gPos = 5 : CmdFont()
+  Check(fontInfoCalls = 1)
+  fontSelected = -1 : fakeSlotBytes(1)=0
+
+  fontFileExpected[0]=100 : fontFileExpected[1]=97 : fontFileExpected[2]=116 : fontFileExpected[3]=97
+  fontFileExpected[4]=58 : fontFileExpected[5]=47 : fontFileExpected[6]=102 : fontFileExpected[7]=111
+  fontFileExpected[8]=110 : fontFileExpected[9]=116 : fontFileExpected[10]=115 : fontFileExpected[11]=47
+  fontFileExpected[12]=65 : fontFileExpected[13]=98 : fontFileExpected[14]=101 : fontFileExpected[15]=108
+  fontFileExpected[16]=45 : fontFileExpected[17]=82 : fontFileExpected[18]=101 : fontFileExpected[19]=103
+  fontFileExpected[20]=117 : fontFileExpected[21]=108 : fontFileExpected[22]=97 : fontFileExpected[23]=114
+  fontFileExpected[24]=46 : fontFileExpected[25]=116 : fontFileExpected[26]=116 : fontFileExpected[27]=102
+  fontFileExpected[28]=0
+  SetCommand(2) : gPos = 5 : CmdFont()
+  Check(fontLoadSlot = 1 And fakeSlotBytes(1) = 64)
+  Check(fontFileOpens = 1 And fontFileMatched = 1)
+
+  SetCommand(3) : gPos = 5 : CmdFont()
+  Check(fontSelected = 1)
+  SetCommand(4) : gPos = 5 : CmdFont()
+  Check(fontSelected = -1 And fontDeselects = 1)
+
+  SetCommand(5) : gPos = 5 : CmdFont()
+  Check(fontSelected = -1) ; numeric path must not be mistaken for bitmap
+  SetCommand(6) : gPos=5 : CmdFont()
+  Check(AnvilTrueTypePixelHeight()=24 And PmfDecOf(SettingsGet("font.size"),-1)=24)
+  SetCommand(7) : gPos=5 : CmdFont() : Check(AnvilTrueTypePixelHeight()=24)
+  SetCommand(8) : gPos=5 : CmdFont() : Check(AnvilTrueTypePixelHeight()=24)
+  SetCommand(9) : gPos=5 : CmdFont() : Check(AnvilTrueTypePixelHeight()=24)
+  SetCommand(10) : gPos=5 : CmdFont()
+  Check(AnvilTrueTypeDefaultSlot()=1 And fontSelected=1 And SettingsLength("font.default")=28)
+  anvil_font_bootChecked=0
+  Check(AnvilFontSettingsBootApply()=1)
+  Check(AnvilTrueTypeDefaultSlot()=0 And fontSelected=0 And fakeSlotBytes(0)=64)
+  Check(AnvilTrueTypePixelHeight()=24 And fontFileOpens=2)
+  SetCommand(13) : gPos=5 : CmdFont()
+  Check(fontSelected=-1 And fakeSlotBytes(0)=0 And AnvilTrueTypeDefaultSlot()=0 And SettingsGet("font.default")<>0)
+  ; Simulate a following boot with the same saved path but missing file.
+  fontFileOpenFails=1 : anvil_font_bootChecked=0
+  Check(AnvilFontSettingsBootApply()=0)
+  Check(fontSelected=-1 And AnvilTrueTypeDefaultSlot()=0 And fontFileOpens=3)
+  Check(AnvilFontSettingsBootApply()=1 And fontFileOpens=3) ; one attempt only
+  fontFileOpenFails=0
+  SetCommand(11) : gPos=5 : CmdFont()
+  Check(AnvilTrueTypeDefaultSlot()=-1 And fontSelected=-1 And SettingsGet("font.default")=0)
+  SetCommand(12) : gPos=5 : CmdFont()
+  Check(AnvilTrueTypeDefaultSlot()=-1 And SettingsGet("font.default")=0)
+  If fontFailures <> 0 : ProcedureReturn fontFailures : EndIf
+  ProcedureReturn 0
+EndProcedure

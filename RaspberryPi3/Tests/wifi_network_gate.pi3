@@ -1,0 +1,358 @@
+; Emitted orchestration gate for the Pi 3 WPA2 association adapter.
+; Every hardware/credential/crypto primitive is stubbed, while the adapter,
+; shared scan policy and shared retry controller are compiled from source.
+
+#WPA2_PASS_MIN = 8
+#WPA2_PASS_MAX = 63
+#CYW43_SCAN_DONE = 2
+#CYW43_SCAN_FAILED = 3
+#CYW43_JOIN_RUNNING = 0
+#CYW43_JOIN_JOINED = 1
+#CYW43_JOIN_FAILED = 2
+#CYW43_IO_OK = 0
+#CYW43_IO_STATUS = -3
+#CYW43_JOINEXP_NOKEY = 2
+#CYW43_CRYPTO_ALGO_AES_CCM = 4
+#WPA2SUP_SENT_M2 = 1
+#WPA2SUP_SENT_M4 = 2
+#WPA2SUP_SENT_G2 = 3
+#PI3_WIFI_RNG_READY = 1
+#PI3_WIFI_RNG_MAX_WAIT_US = 1000000
+#PBKDF2_STEP_RUNNING = 1
+#PBKDF2_STEP_DONE = 2
+#PBKDF2_STEP_ERROR = -1
+#PI3_WIFI_REKEY_NONCE_WAIT_US = 50000
+#HW_LINK_WIFI = 2
+#HW_LINK_SPEED_UNKNOWN = -1
+#HW_LINK_DUPLEX_UNKNOWN = -1
+#DHCPC_INIT = 0
+
+Global pi3_wifi_radio_profile.i = 1
+Global pi3_wifi_join_abort.i
+Global gate_scan_started.i, gate_join_started.i, gate_join_polls.i
+Global gate_rng_start.i, gate_rng_bytes.i, gate_sec_items.i, gate_set_ie.i
+Global gate_crypto_calls.i, gate_rx_frames.i, gate_key_installs.i
+Global gate_nonce_set.i, gate_session_arm.i, gate_progress.i, gate_last_event.i
+Global gate_millis.i
+Global gate_session_code.i, gate_ptk_m1.i, gate_in_session.i
+Global gate_send_calls.i, gate_op_order.i, gate_send_order.i
+Global gate_key0_order.i, gate_key1_order.i, gate_snonce_calls.i
+Global gate_dhcp_starts.i, gate_dhcp_pumps.i, gate_rx_owner.i
+Global gate_net_usable.i, gate_dhcp_state.i
+Global gate_dhcp_acquires.i
+Global gate_rng_fail.i, gate_key_fail_index.i, gate_key_fail_once.i
+Global gate_abort_on_progress.i, gate_nonce_first.i, gate_nonce_second.i
+Global gate_settings_revision.i, gate_scan_count.i = 1, gate_auto_mode.i
+Global gate_current_join_first.i, gate_auto_join_polls.i, gate_auto_step_begins.i
+Global gate_auto_step_calls.i, gate_auto_radio_ops.i, gate_auto_turns.i
+Global gate_auto_second_seen.i, gate_step_active.i, gate_step_calls_this_key.i
+Global *gate_step_dst
+Global Dim gate_ssid.a[5]
+Global Dim gate_ssid2.a[5]
+Global Dim gate_pass.a[8]
+Global Dim gate_mac.a[6]
+Global Dim gate_tx.a[4]
+Global Dim gate_data.a[64]
+Global Dim gate_key.a[16]
+Global Dim gate_rsc.a[8]
+
+Procedure.i Pi3WifiMacValid(*mac)
+  If *mac = 0 Or (PeekA(*mac) & 1) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3WifiRngStart() : gate_rng_start = gate_rng_start + 1 : ProcedureReturn #PI3_WIFI_RNG_READY : EndProcedure
+Procedure.i Pi3WifiRngBytes(*dst, bytes.i, timeout.i)
+  Protected i.i
+  gate_rng_bytes = gate_rng_bytes + 1
+  If bytes <> 32 : ProcedureReturn 0 : EndIf
+  If timeout <> #PI3_WIFI_REKEY_NONCE_WAIT_US And timeout <> #PI3_WIFI_RNG_MAX_WAIT_US : ProcedureReturn 0 : EndIf
+  If gate_rng_fail <> 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To 31 : PokeA(*dst + i, gate_rng_bytes * 32 + i + 1) : Next
+  ProcedureReturn 32
+EndProcedure
+
+Procedure.i SettingsWifiFindSsid(*ssid) : If *ssid = @gate_ssid[0] : ProcedureReturn 1 : EndIf : If *ssid = @gate_ssid2[0] : ProcedureReturn 2 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i SettingsWifiRevision() : ProcedureReturn gate_settings_revision : EndProcedure
+Procedure.i SettingsWifiSlotPassword(slot.i) : If slot = 1 Or slot = 2 : ProcedureReturn @gate_pass[0] : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i SettingsWifiSlotPasswordKey(slot.i) : ProcedureReturn slot : EndProcedure
+Procedure.i SettingsLength(key.i) : If key = 1 Or key = 2 : ProcedureReturn 8 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i Wpa2Psk(*pass, passLen.i, *ssid, ssidLen.i, *out)
+  Protected i.i
+  gate_crypto_calls = gate_crypto_calls + 1
+  If passLen <> 8 Or ssidLen <> 4 : ProcedureReturn 0 : EndIf
+  For i = 0 To 31 : PokeA(*out + i, i + 1) : Next
+  ProcedureReturn 32
+EndProcedure
+Procedure Pbkdf2Wipe() : EndProcedure
+Procedure Pbkdf2StepWipe() : gate_step_active = 0 : EndProcedure
+Procedure.i Wpa2PskStepBegin(*pass, passLen.i, *ssid, ssidLen.i, *out)
+  gate_auto_step_begins = gate_auto_step_begins + 1
+  If *pass = 0 Or passLen <> 8 Or *ssid = 0 Or ssidLen <> 4 Or *out = 0 : ProcedureReturn #PBKDF2_STEP_ERROR : EndIf
+  gate_step_active = 1 : gate_step_calls_this_key = 0 : *gate_step_dst = *out
+  ProcedureReturn #PBKDF2_STEP_RUNNING
+EndProcedure
+Procedure.i Pbkdf2Step(budget.i)
+  Protected i.i
+  gate_auto_step_calls = gate_auto_step_calls + 1
+  If gate_step_active = 0 Or budget <> 16 : ProcedureReturn #PBKDF2_STEP_ERROR : EndIf
+  gate_step_calls_this_key = gate_step_calls_this_key + 1
+  If gate_step_calls_this_key < 3 : ProcedureReturn #PBKDF2_STEP_RUNNING : EndIf
+  For i = 0 To 31 : PokeA(*gate_step_dst + i, i + 1) : Next
+  gate_step_active = 0
+  ProcedureReturn #PBKDF2_STEP_DONE
+EndProcedure
+Procedure Wpa2SupWipe() : EndProcedure
+Procedure Cyw43KeyWipe() : EndProcedure
+Procedure AesWipe() : EndProcedure
+Procedure KwWipe() : EndProcedure
+
+Procedure.i Cyw43SetWpaIe(*ie, len.i, timeout.i)
+  gate_auto_radio_ops = gate_auto_radio_ops + 1
+  gate_set_ie = gate_set_ie + 1
+  If *ie = 0 Or len <> 22 Or timeout <> 2000 : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43SecItem(idx.i, timeout.i)
+  gate_auto_radio_ops = gate_auto_radio_ops + 1
+  gate_sec_items = gate_sec_items + 1
+  If idx < 0 Or idx > 8 Or timeout <> 2000 : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure Cyw43SetJoinExpectation(mode.i) : If mode <> #CYW43_JOINEXP_NOKEY : gate_last_event = 99 : EndIf : EndProcedure
+Procedure.i Cyw43Attached() : ProcedureReturn 1 : EndProcedure
+Procedure.i Cyw43DataMax() : ProcedureReturn 64 : EndProcedure
+Procedure.i NetDhcpStart(kind.i, automatic.i)
+  gate_dhcp_starts = gate_dhcp_starts + 1
+  If kind = #HW_LINK_WIFI And automatic = 1 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetDhcpAcquire(kind.i, waitMs.i, keepRunning.i)
+  gate_dhcp_acquires = gate_dhcp_acquires + 1
+  If kind = #HW_LINK_WIFI And waitMs = 6000 And keepRunning = 1 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetIfRxOwner() : ProcedureReturn gate_rx_owner : EndProcedure
+Procedure.i NetIfPreferred() : ProcedureReturn #HW_LINK_WIFI : EndProcedure
+Procedure netcon_PumpOne(kind.i) : If kind = #HW_LINK_WIFI : gate_dhcp_pumps = gate_dhcp_pumps + 1 : EndIf : EndProcedure
+Procedure.i NetIfUsable(kind.i) : If kind = #HW_LINK_WIFI : ProcedureReturn gate_net_usable : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i NetConsoleOfferUdp(*p, kind.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NetOutLen() : ProcedureReturn 14 : EndProcedure
+Procedure.i NetOutBuf() : ProcedureReturn @gate_data[0] : EndProcedure
+Procedure.i DhcpClientState(kind.i) : If kind = #HW_LINK_WIFI : ProcedureReturn gate_dhcp_state : EndIf : ProcedureReturn #DHCPC_INIT : EndProcedure
+Procedure.i Cyw43ScanStart(passive.i, timeout.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : gate_scan_started = gate_scan_started + 1 : If passive = 0 And timeout = 2000 : ProcedureReturn 0 : EndIf : ProcedureReturn -1 : EndProcedure
+Procedure.i Cyw43ScanPoll(slice.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : If slice = 50 : ProcedureReturn #CYW43_SCAN_DONE : EndIf : ProcedureReturn #CYW43_SCAN_FAILED : EndProcedure
+Procedure.i Cyw43ScanCount() : ProcedureReturn gate_scan_count : EndProcedure
+Procedure.i Cyw43ScanSsid(i.i) : If i = 0 : ProcedureReturn @gate_ssid[0] : EndIf : If i = 1 : ProcedureReturn @gate_ssid2[0] : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ScanSsidLen(i.i) : If i = 0 Or i = 1 : ProcedureReturn 4 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ScanChannel(i.i) : If i = 0 Or i = 1 : ProcedureReturn 6 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43Disassoc(timeout.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : ProcedureReturn 0 : EndProcedure
+Procedure Cyw43DrainEvents(timeout.i) : EndProcedure
+Procedure.i Cyw43EventsDropped() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43IoctlStatus() : ProcedureReturn -17 : EndProcedure
+Procedure.i Cyw43JoinStart(*ssid, n.i, timeout.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : gate_join_started = gate_join_started + 1 : If n = 4 And timeout = 2000 : gate_current_join_first = PeekA(*ssid) & $FF : If gate_current_join_first = 117 : gate_auto_second_seen = 1 : EndIf : ProcedureReturn 0 : EndIf : ProcedureReturn -1 : EndProcedure
+Procedure.i Cyw43JoinPoll(slice.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : gate_join_polls = gate_join_polls + 1 : If slice = 100 : If gate_auto_mode <> 0 And gate_current_join_first = 116 : gate_auto_join_polls = gate_auto_join_polls + 1 : ProcedureReturn #CYW43_JOIN_FAILED : EndIf : ProcedureReturn #CYW43_JOIN_JOINED : EndIf : ProcedureReturn #CYW43_JOIN_RUNNING : EndProcedure
+Procedure.i Cyw43ReadSsid(timeout.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43LinkSsidLen() : ProcedureReturn 4 : EndProcedure
+Procedure.i Cyw43LinkSsid() : If gate_current_join_first = 117 : ProcedureReturn @gate_ssid2[0] : EndIf : ProcedureReturn @gate_ssid[0] : EndProcedure
+
+Procedure.i Cyw43GetAssocReqIes(bytes.i, timeout.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : If bytes = 160 And timeout = 2000 : ProcedureReturn 0 : EndIf : ProcedureReturn -1 : EndProcedure
+Procedure.i Cyw43ReplyLen() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReplyPtr() : ProcedureReturn 0 : EndProcedure
+Procedure.i Wpa2SupBegin(*pmk, *mac, *ap, *ie, len.i)
+  If *pmk = 0 Or *mac = 0 Or (PeekA(*mac) & $FF) <> $02 Or *ap = 0 Or *ie = 0 Or len <> 22 : ProcedureReturn 0 : EndIf
+  gate_rx_frames = 0
+  ProcedureReturn 1
+EndProcedure
+Procedure Wpa2SupSetSnonce(*n)
+  Protected i.i, sum.i
+  For i = 0 To 31 : sum = sum + (PeekA(*n + i) & $FF) : Next
+  If sum > 0
+    gate_nonce_set = gate_nonce_set + 1
+    If gate_nonce_set = 1 : gate_nonce_first = PeekA(*n) & $FF : EndIf
+    If gate_nonce_set = 2 : gate_nonce_second = PeekA(*n) & $FF : EndIf
+  EndIf
+EndProcedure
+Procedure.i Wpa2SupInSession() : ProcedureReturn gate_in_session : EndProcedure
+Procedure.i Wpa2SupPeekPtkM1(*p, n.i) : ProcedureReturn gate_ptk_m1 : EndProcedure
+Procedure.i Wpa2SupHandleSession(*p, n.i) : ProcedureReturn gate_session_code : EndProcedure
+Procedure.i Cyw43Receive(timeout.i) : gate_auto_radio_ops = gate_auto_radio_ops + 1 : If timeout = 60 : ProcedureReturn 14 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReceivePtr() : ProcedureReturn @gate_data[0] : EndProcedure
+Procedure.i Wpa2SupHandle(*p, n.i)
+  gate_rx_frames = gate_rx_frames + 1
+  If *p = @gate_data[0] And n >= 14
+    If gate_rx_frames = 1 : ProcedureReturn #WPA2SUP_SENT_M2 : EndIf
+    If gate_rx_frames = 2 : ProcedureReturn #WPA2SUP_SENT_M4 : EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Wpa2SupTxLen() : ProcedureReturn 4 : EndProcedure
+Procedure.i Wpa2SupTxPtr() : ProcedureReturn @gate_tx[0] : EndProcedure
+Procedure.i Cyw43DataPtr() : ProcedureReturn @gate_data[0] : EndProcedure
+Procedure.i Cyw43Send(bytes.i)
+  gate_auto_radio_ops = gate_auto_radio_ops + 1
+  gate_send_calls = gate_send_calls + 1
+  gate_op_order = gate_op_order + 1
+  gate_send_order = gate_op_order
+  If bytes = 4 : ProcedureReturn 0 : EndIf
+  ProcedureReturn -1
+EndProcedure
+Procedure.i Wpa2SupTk() : ProcedureReturn @gate_key[0] : EndProcedure
+Procedure.i Wpa2SupTkLen() : ProcedureReturn 16 : EndProcedure
+Procedure.i Wpa2SupApMac() : ProcedureReturn @gate_mac[0] : EndProcedure
+Procedure.i Wpa2SupGtkIndex() : ProcedureReturn 1 : EndProcedure
+Procedure.i Wpa2SupGtk() : ProcedureReturn @gate_key[0] : EndProcedure
+Procedure.i Wpa2SupGtkLen() : ProcedureReturn 16 : EndProcedure
+Procedure.i Wpa2SupGtkRsc() : ProcedureReturn @gate_rsc[0] : EndProcedure
+Procedure.i Cyw43SetWsecKey(index.i, *key, bytes.i, algo.i, *ea, *rsc, timeout.i)
+  gate_auto_radio_ops = gate_auto_radio_ops + 1
+  If (index = 0 Or index = 1) And *key <> 0 And bytes = 16 And algo = #CYW43_CRYPTO_ALGO_AES_CCM And timeout = 2000
+    gate_op_order = gate_op_order + 1
+    If index = 0 : gate_key0_order = gate_op_order : Else : gate_key1_order = gate_op_order : EndIf
+    gate_key_installs = gate_key_installs + 1
+    If gate_key_fail_index = index
+      If gate_key_fail_once = 0 : ProcedureReturn -1 : EndIf
+      gate_key_fail_once = 0
+      gate_key_fail_index = -1
+      ProcedureReturn -1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+Procedure Wpa2SupSessionArm() : gate_session_arm = gate_session_arm + 1 : EndProcedure
+Procedure.i millis() : gate_millis = gate_millis + 1 : ProcedureReturn gate_millis : EndProcedure
+Procedure gateProgress()
+  gate_progress = gate_progress + 1
+  If gate_abort_on_progress <> 0 : pi3_wifi_join_abort = 1 : EndIf
+EndProcedure
+
+XIncludeFile "Anvil/Net/wifi_assoc.pbi"
+XIncludeFile "Anvil/Net/wifi_join_policy.pbi"
+XIncludeFile "RaspberryPi3/Lib/wifi_network.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_link_wifi.pi3"
+
+Procedure.i Main()
+  Protected i.i, result.i, handshakeResult.i, rngBefore.i
+  gate_key_fail_index = -1
+  pi3_wifi_join_abort = 0
+  gate_scan_count = 1
+  gate_auto_mode = 0
+  For i = 0 To 3 : gate_ssid[i] = 116 : Next
+  gate_ssid[4] = 0
+  For i = 0 To 7 : gate_pass[i] = 112 : Next
+  gate_mac[0] = $02 : gate_mac[1] = $11 : gate_mac[2] = $22 : gate_mac[3] = $33 : gate_mac[4] = $44 : gate_mac[5] = $55
+  result = Pi3WifiJoinKnown(@gate_mac[0], 1, @gateProgress)
+  If result <> 1 : ProcedureReturn 1 : EndIf
+  If Pi3WifiAssocKeyed() <> 1 : ProcedureReturn 7 : EndIf
+  If Pi3HwWifiSetMac(@gate_mac[0]) <> 1 : ProcedureReturn 31 : EndIf
+  Pi3HwWifiSetRawHandler(Pi3WifiAssocRawHandler())
+  If HwLinkReady(#HW_LINK_WIFI) <> 1 : ProcedureReturn 32 : EndIf
+  If gate_rng_start <> 1 Or gate_rng_bytes <> 1 Or gate_set_ie <> 1 Or gate_sec_items <> 5 : ProcedureReturn 2 : EndIf
+  If gate_crypto_calls <> 1 Or gate_scan_started <> 1 Or gate_join_started <> 1 Or gate_join_polls <> 1 : ProcedureReturn 3 : EndIf
+  If gate_rx_frames <> 2 Or gate_nonce_set <> 1 Or gate_key_installs <> 2 Or gate_session_arm <> 1 : ProcedureReturn 4 : EndIf
+  If gate_rng_bytes <> 1 Or gate_nonce_first = 0 : ProcedureReturn 33 : EndIf
+  If gate_progress < 3 Or Pi3WifiAssocStage() <> 40 : ProcedureReturn 5 : EndIf
+  For i = 0 To 31
+    If pi3_wifi_assoc_pmk[i] <> 0 Or pi3_wifi_assoc_snonce[i] <> 0 : ProcedureReturn 6 : EndIf
+  Next
+  ; Mid-session EAPOL rekey routing and key/response ordering.
+  gate_data[0] = 0 : gate_data[1] = 0 : gate_data[2] = 0
+  gate_data[12] = $88 : gate_data[13] = $8E
+  gate_in_session = 1 : gate_ptk_m1 = 1
+  gate_session_code = #WPA2SUP_SENT_M2
+  If HwLinkOfferRaw(#HW_LINK_WIFI, @gate_data[0], 14) <> 1 : ProcedureReturn 8 : EndIf
+  If gate_rng_bytes <> 2 Or gate_nonce_set <> 2 Or gate_nonce_second = gate_nonce_first Or gate_send_calls <> 3 : ProcedureReturn 9 : EndIf
+  gate_ptk_m1 = 0 : gate_session_code = #WPA2SUP_SENT_M4
+  gate_op_order = 0 : gate_send_order = 0 : gate_key0_order = 0 : gate_key1_order = 0
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 14) <> 1 : ProcedureReturn 10 : EndIf
+  If gate_send_order = 0 Or gate_send_order >= gate_key0_order Or gate_key0_order >= gate_key1_order : ProcedureReturn 11 : EndIf
+  If Pi3WifiAssocPtkRekeys() <> 1 : ProcedureReturn 12 : EndIf
+  gate_session_code = #WPA2SUP_SENT_G2
+  gate_op_order = 0 : gate_send_order = 0 : gate_key0_order = 0 : gate_key1_order = 0
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 14) <> 1 : ProcedureReturn 13 : EndIf
+  If gate_key1_order = 0 Or gate_key1_order >= gate_send_order : ProcedureReturn 14 : EndIf
+  If Pi3WifiAssocGtkRekeys() <> 1 Or Pi3WifiAssocEapolErrors() <> 0 : ProcedureReturn 15 : EndIf
+  gate_data[12] = 0 : gate_data[13] = 0
+  If HwLinkOfferRaw(#HW_LINK_WIFI, @gate_data[0], 14) <> 0 : ProcedureReturn 16 : EndIf
+  ; Reject short and non-EAPOL frames, consume owned-but-not-session frames,
+  ; and fail closed if the native RNG cannot supply a fresh rekey nonce.
+  gate_data[12] = $88 : gate_data[13] = $8E
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 13) <> 0 : ProcedureReturn 23 : EndIf
+  gate_in_session = 0
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 14) <> 1 Or Pi3WifiAssocEapolSeen() <> 3 : ProcedureReturn 24 : EndIf
+  gate_in_session = 1 : gate_ptk_m1 = 1 : gate_rng_fail = 1
+  gate_session_code = #WPA2SUP_SENT_M2
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 14) <> 1 : ProcedureReturn 25 : EndIf
+  If gate_rng_bytes <> 3 Or Pi3WifiAssocEapolErrors() <> 1 : ProcedureReturn 26 : EndIf
+  gate_rng_fail = 0 : gate_ptk_m1 = 0 : gate_session_code = #WPA2SUP_SENT_M4
+  gate_key_fail_index = 0
+  gate_op_order = 0 : gate_send_order = 0 : gate_key0_order = 0 : gate_key1_order = 0
+  If Pi3WifiAssocServiceEapolFrame(@gate_data[0], 14) <> 1 : ProcedureReturn 27 : EndIf
+  If gate_send_order = 0 Or gate_key0_order = 0 Or gate_key1_order <> 0 : ProcedureReturn 28 : EndIf
+  If Pi3WifiAssocPtkRekeys() <> 1 Or Pi3WifiAssocEapolErrors() <> 2 : ProcedureReturn 29 : EndIf
+  gate_key_fail_index = -1
+  ; The Pi3 adapter enters the existing per-interface DHCP client, while
+  ; the common prompt continues NetDhcpTick/NetConsolePump service.
+  If Pi3WifiNetworkStartDhcp() <> 1 Or Pi3WifiNetworkStartDhcp() <> 1 : ProcedureReturn 17 : EndIf
+  If gate_dhcp_starts <> 1 Or Pi3WifiNetworkDhcpState() <> #DHCPC_INIT : ProcedureReturn 18 : EndIf
+  Pi3WifiNetworkRxTick()
+  If gate_dhcp_pumps <> 1 : ProcedureReturn 19 : EndIf
+  gate_rx_owner = #HW_LINK_WIFI
+  Pi3WifiNetworkRxTick()
+  If gate_dhcp_pumps <> 1 : ProcedureReturn 20 : EndIf
+  gate_net_usable = 1 : gate_dhcp_state = 4
+  If Pi3WifiNetworkAddressReady() <> 1 Or Pi3WifiNetworkDhcpState() <> 4 : ProcedureReturn 21 : EndIf
+  If Pi3WifiAssocRawHandler() = 0 Or HwLinkOfferRaw(#HW_LINK_WIFI, @gate_data[0], 14) <> 1 : ProcedureReturn 22 : EndIf
+  If Pi3WifiNetworkAcquireAddress(6000) <> 1 Or gate_dhcp_acquires <> 1 : ProcedureReturn 30 : EndIf
+  ; A retry invokes the handshake callback again for the same SSID. The
+  ; first key install fails, forcing that retry; the second handshake must
+  ; receive a distinct RNG nonce rather than the wiped all-zero value.
+  gate_rx_frames = 0 : gate_nonce_set = 0 : gate_nonce_first = 0 : gate_nonce_second = 0
+  gate_key_installs = 0 : gate_key_fail_index = 0 : gate_key_fail_once = 1
+  pi3_wifi_assoc_keyed = 0
+  If Pi3WifiAssocCandidate(1, @gate_ssid[0], 4) <> 1 : ProcedureReturn 34 : EndIf
+  If gate_nonce_set <> 2 Or gate_nonce_first = 0 Or gate_nonce_second = 0 Or gate_nonce_first = gate_nonce_second : ProcedureReturn 35 : EndIf
+  ; A callback re-entered after the service layer sets abort must return
+  ; before taking entropy or issuing any handshake work.
+  pi3_wifi_join_abort = 1 : handshakeResult = 9 : rngBefore = gate_rng_bytes
+  Pi3WifiAssocHandshake(@handshakeResult)
+  If handshakeResult <> 0 Or gate_rng_bytes <> rngBefore : ProcedureReturn 38 : EndIf
+  ; Abort raised by the service hook must prevent a successful return from
+  ; being committed as keyed state.
+  gate_key_fail_index = -1 : gate_abort_on_progress = 1 : pi3_wifi_join_abort = 0 : pi3_wifi_assoc_keyed = 0
+  If Pi3WifiAssocCandidate(1, @gate_ssid[0], 4) <> 0 : ProcedureReturn 36 : EndIf
+  If pi3_wifi_join_abort = 0 Or Pi3WifiAssocKeyed() <> 0 : ProcedureReturn 37 : EndIf
+
+  ; Boot automatic association is cooperative: first saved SSID fails both
+  ; bounded association attempts, then the adjacent second candidate keys.
+  ; Every Tick has at most one radio transaction/poll, and PBKDF2 advances
+  ; only through the shared finite-step engine.
+  gate_abort_on_progress = 0 : pi3_wifi_join_abort = 0 : gate_auto_mode = 1
+  gate_scan_count = 2 : gate_auto_join_polls = 0 : gate_auto_second_seen = 0
+  gate_auto_step_begins = 0 : gate_auto_step_calls = 0 : gate_auto_turns = 0
+  gate_net_usable = 0
+  gate_dhcp_state = #DHCPC_INIT
+  gate_ssid2[0] = 117 : gate_ssid2[1] = 117 : gate_ssid2[2] = 117 : gate_ssid2[3] = 117 : gate_ssid2[4] = 0
+  If Pi3HwWifiSetMac(@gate_mac[0]) <> 1 : ProcedureReturn 39 : EndIf
+  Pi3HwWifiSetRawHandler(Pi3WifiAssocRawHandler())
+  pi3_wifi_ip_started = 0
+  ; A new authorized generation must not inherit a stale manual-join abort.
+  pi3_wifi_join_abort = 1
+  If Pi3WifiAutoJoinBegin(@gate_mac[0], 1, @gateProgress) <> 1 : ProcedureReturn 40 : EndIf
+  If pi3_wifi_join_abort <> 0 : ProcedureReturn 47 : EndIf
+  If gate_auto_step_begins <> 0 Or gate_scan_started <> 1 : ProcedureReturn 41 : EndIf
+  For i = 0 To 999
+    If Pi3WifiAutoJoinActive() = 0 : Break : EndIf
+    gate_auto_radio_ops = 0
+    result = Pi3WifiAutoJoinTick()
+    gate_auto_turns = gate_auto_turns + 1
+    If gate_auto_radio_ops > 1 : ProcedureReturn 42 : EndIf
+    If result = 1 : Break : EndIf
+  Next
+  If result <> 1 Or Pi3WifiAutoJoinResult() <> 1 Or Pi3WifiAutoJoinState() <> #PI3_WIFI_AUTO_READY : ProcedureReturn 43 : EndIf
+  If gate_auto_step_begins <> 2 Or gate_auto_step_calls <> 6 Or gate_auto_join_polls <> 2 Or gate_auto_second_seen = 0 : ProcedureReturn 44 : EndIf
+  If gate_crypto_calls <> 3 Or gate_dhcp_starts <> 2 Or Pi3WifiNetworkAddressReady() <> 0 : ProcedureReturn 45 : EndIf
+  If gate_auto_turns < 250 Or gate_auto_turns > 999 : ProcedureReturn 46 : EndIf
+  Pi3WifiAutoJoinCancel()
+  ProcedureReturn 0
+EndProcedure

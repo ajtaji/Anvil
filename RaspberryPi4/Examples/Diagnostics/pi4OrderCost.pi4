@@ -1,0 +1,285 @@
+; pi4OrderCost.pi4 - IS `stlr` ACTUALLY CHEAPER THAN `dsb sy` + `str`?
+;
+; smp.pi4 publishes each core's arrival word with `dsb sy` + `str` +
+; `dsb sy` (smp.pi4:696-702). The assembler now encodes `stlr`, and the
+; standing suggestion is that `stlr` on the producer with `ldar` on the
+; consumer is the same protocol with no barrier and less cost, because
+; `dsb sy` orders everything against everything AND WAITS FOR
+; COMPLETION, while `stlr` orders only earlier accesses against itself
+; and does not wait.
+;
+; THAT IS AN ARCHITECTURAL ARGUMENT, AND THIS BOARD MAY NOT HONOUR IT.
+; Every payload in this tree runs WITH THE MMU OFF, and with the MMU off
+; ARMv8-A treats every access as Device-nGnRnE - which is NON-REORDERING
+; by definition. If the memory regime is already refusing to reorder and
+; refusing to post writes, then the `dsb sy` may be ordering something
+; that was never going to be reordered, and `stlr` may save nothing at
+; all. That is the same regime fact that broke the exclusives -
+; atomic.pi4's STOP block - so it is not a hypothetical.
+;
+; A protocol that has been proven on silicon should not be rewritten for
+; a saving nobody has measured. So this measures it, on one core, with
+; no SMP involved and nothing that can wedge the board.
+;
+; THREE LOOPS, same target, same count:
+;   1. plain `str`            - the floor. What the store alone costs.
+;   2. `dsb sy` + `str`       - what smp.pi4 does today.
+;   3. `stlr`                 - what is proposed.
+;
+; The number that decides the question is (2) minus (3). If it is close
+; to zero the change is not worth making on cost grounds, whatever the
+; architecture says it ought to be.
+;
+; WHAT THIS CANNOT ANSWER: whether the ordering is CORRECT. One core
+; cannot observe its own reordering, and no gate in this tree can fail a
+; program for getting ordering wrong - a64_interp.py is single-threaded
+; with one flat memory. Correctness needs core 1 running and a reader
+; that can catch a torn row. This measures COST ONLY and says so.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+
+; Module-level, because an ASM block cannot see a local and parameters
+; in this language are static .bss slots anyway.
+Global ord_target.i
+Global ord_count.i
+
+Procedure OrdPlainStr()
+  ASM
+    adrp x0, global_ord_target
+    add  x0, x0, #:lo12:global_ord_target
+    adrp x1, global_ord_count
+    add  x1, x1, #:lo12:global_ord_count
+    ldr  x1, [x1]
+    movz x2, #$AA
+ord_plain_loop:
+    str  x2, [x0]
+    sub  x1, x1, #1
+    cbnz x1, ord_plain_loop
+  EndASM
+EndProcedure
+
+Procedure OrdDsbStr()
+  ASM
+    adrp x0, global_ord_target
+    add  x0, x0, #:lo12:global_ord_target
+    adrp x1, global_ord_count
+    add  x1, x1, #:lo12:global_ord_count
+    ldr  x1, [x1]
+    movz x2, #$BB
+ord_dsb_loop:
+    dsb  sy
+    str  x2, [x0]
+    sub  x1, x1, #1
+    cbnz x1, ord_dsb_loop
+  EndASM
+EndProcedure
+
+Procedure OrdStlr()
+  ASM
+    adrp x0, global_ord_target
+    add  x0, x0, #:lo12:global_ord_target
+    adrp x1, global_ord_count
+    add  x1, x1, #:lo12:global_ord_count
+    ldr  x1, [x1]
+    movz x2, #$CC
+ord_stlr_loop:
+    stlr x2, [x0]
+    sub  x1, x1, #1
+    cbnz x1, ord_stlr_loop
+  EndASM
+EndProcedure
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Report(*name, ticks.i, hz.i, n.i)
+  Define ns.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ticks ")
+  PrintDec(ticks)
+  If hz > 0 And n > 0
+    ; Nanoseconds per iteration. The counter is 54 MHz, so one tick is
+    ; about 18.5 ns - the per-iteration figure is only meaningful
+    ; because the loop count is large.
+    ns = (ticks * 1000000000) / hz
+    ns = ns / n
+    UartWriteStr("   per iteration ")
+    PrintDec(ns)
+    UartWriteStr(" ns")
+  EndIf
+  PrintNl()
+EndProcedure
+
+Procedure Main()
+  Define hz.i
+  Define t0.i
+  Define tPlain.i
+  Define tDsb.i
+  Define tStlr.i
+  Define n.i
+
+  PrintNl()
+  UartWriteStr("=== the cost of ordering, MMU off, one core ===")
+  PrintNl()
+
+  If TimerInit() = 0
+    UartWriteStr("TimerInit failed - no clock, no measurement.")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  hz = TickHz()
+  UartWriteStr("counter ")
+  PrintDec(hz)
+  UartWriteStr(" Hz")
+  PrintNl()
+
+  n = 200000
+  ord_count = n
+  UartWriteStr("iterations per loop ")
+  PrintDec(n)
+  PrintNl()
+  PrintNl()
+
+  ; THE ORDER IS DELIBERATELY REVERSED FROM THE OBVIOUS ONE, AND EVERY
+  ; LOOP RUNS TWICE.
+  ;
+  ; The first version of this probe ran plain, then dsb, then stlr, and
+  ; measured stlr as FASTER THAN A PLAIN STORE - 87 ns against 153. A
+  ; store-release can only ever add ordering work to a store, so that
+  ; result is impossible as stated and something other than the
+  ; instruction was being measured. The two candidates are position in
+  ; the run (warm-up, or the UART drain before it) and code alignment.
+  ;
+  ; Reversing the order tests the first: if stlr is fastest wherever it
+  ; sits, the effect follows the INSTRUCTION. If the last loop is
+  ; always fastest, the effect follows the POSITION and the first
+  ; numbers were an artifact. Running each twice and printing both
+  ; passes tests warm-up directly - a first pass slower than its own
+  ; second pass is warm-up, visibly.
+  ;
+  ; Announce before each and drain, so a loop that never returns still
+  ; leaves the evidence of which one it was.
+  UartWriteStr("stlr ...")
+  UartDrain()
+  t0 = Ticks()
+  OrdStlr()
+  tStlr = Ticks() - t0
+  PrintNl()
+
+  UartWriteStr("dsb sy + str ...")
+  UartDrain()
+  t0 = Ticks()
+  OrdDsbStr()
+  tDsb = Ticks() - t0
+  PrintNl()
+
+  UartWriteStr("plain str ...")
+  UartDrain()
+  t0 = Ticks()
+  OrdPlainStr()
+  tPlain = Ticks() - t0
+  PrintNl()
+
+  UartWriteStr("-- pass 1, run in the order stlr / dsb+str / plain")
+  PrintNl()
+  Report("stlr         ", tStlr,  hz, n)
+  Report("dsb sy + str ", tDsb,   hz, n)
+  Report("plain str    ", tPlain, hz, n)
+  PrintNl()
+
+  ; Pass two, same order. Anything that moves between the passes is
+  ; not a property of the instruction.
+  UartWriteStr("-- pass 2, identical")
+  PrintNl()
+  UartDrain()
+  t0 = Ticks()
+  OrdStlr()
+  tStlr = Ticks() - t0
+  t0 = Ticks()
+  OrdDsbStr()
+  tDsb = Ticks() - t0
+  t0 = Ticks()
+  OrdPlainStr()
+  tPlain = Ticks() - t0
+
+  Report("stlr         ", tStlr,  hz, n)
+  Report("dsb sy + str ", tDsb,   hz, n)
+  Report("plain str    ", tPlain, hz, n)
+  PrintNl()
+
+  ; DID THE LOOPS ACTUALLY STORE? The first run measured stlr at 87 ns
+  ; against a plain store's 153, and a store-RELEASE cannot be cheaper
+  ; than the bare store it contains - so before that number is believed,
+  ; each loop must be shown to have written. Each writes a DISTINCT
+  ; value and the target is poisoned first, so "never written" and
+  ; "wrote the wrong thing" are different readings.
+  UartWriteStr("-- did they store?")
+  PrintNl()
+  ord_target = $DEAD
+  OrdStlr()
+  UartWriteStr("  after stlr        target $")
+  PutHexN(ord_target, 4)
+  If ord_target = $CC
+    UartWriteStr("   correct")
+  Else
+    UartWriteStr("   WRONG - expected $CC")
+  EndIf
+  PrintNl()
+  ord_target = $DEAD
+  OrdPlainStr()
+  UartWriteStr("  after plain str   target $")
+  PutHexN(ord_target, 4)
+  If ord_target = $AA
+    UartWriteStr("   correct")
+  Else
+    UartWriteStr("   WRONG - expected $AA")
+  EndIf
+  PrintNl()
+  ord_target = $DEAD
+  OrdDsbStr()
+  UartWriteStr("  after dsb sy+str  target $")
+  PutHexN(ord_target, 4)
+  If ord_target = $BB
+    UartWriteStr("   correct")
+  Else
+    UartWriteStr("   WRONG - expected $BB")
+  EndIf
+  PrintNl()
+  PrintNl()
+
+  UartWriteStr("-- the verdict, on pass 2")
+  PrintNl()
+  If tDsb > tStlr
+    UartWriteStr("stlr is CHEAPER. dsb+str costs ")
+    PrintDec(((tDsb - tStlr) * 100) / tStlr)
+    UartWriteStr("% more than stlr.")
+    PrintNl()
+  ElseIf tStlr > tDsb
+    UartWriteStr("stlr is DEARER by ")
+    PrintDec(((tStlr - tDsb) * 100) / tDsb)
+    UartWriteStr("%. The change would cost time, not save it.")
+    PrintNl()
+  Else
+    UartWriteStr("They measure the same. No cost argument either way.")
+    PrintNl()
+  EndIf
+  UartWriteStr("Sanity: both must be >= plain str, or the loop was")
+  PrintNl()
+  UartWriteStr("optimised away and none of these numbers mean anything.")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

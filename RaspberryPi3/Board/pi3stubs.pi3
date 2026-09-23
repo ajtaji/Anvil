@@ -1,0 +1,1920 @@
+; ======================================================================
+;  pi3stubs.pi3 - WHAT THIS BOARD DOES NOT DO, SAID OUT LOUD.
+;
+;  Every capability this board declares 0 still needs its Hw* seam to
+;  EXIST, and this is where they are. Its counterpart is
+;  ArduinoQ/Board/qstubs_q.unoq, which does the same job on that board
+;  for a longer list.
+;
+; ----------------------------------------------------------------------
+;  WHY A BOARD SUPPLIES A SEAM IT CANNOT ANSWER
+; ----------------------------------------------------------------------
+;  An ABSENT procedure is a link error naming a symbol, which tells a
+;  reader nothing about the board. A seam that is optional in places
+;  produces a board that builds and then behaves differently for a reason
+;  nobody can see. So a board supplies the WHOLE seam, the gate in front
+;  of it refuses the command, and the procedure behind the gate answers
+;  the way a board with no such hardware should - which is what the
+;  sections below are.
+;
+;  NOTHING HERE IS REACHED IN NORMAL USE. RequireCap() in
+;  Anvil/Hal/hal.pbi reads the capability flag and refuses the command
+;  with a whole sentence before any of these is called. They exist so
+;  that the image LINKS and so that a flag raised before its backend is
+;  written fails in a way somebody can read.
+;
+; ----------------------------------------------------------------------
+;  EVERY ZERO HERE SAYS WHICH KIND OF ZERO IT IS
+; ----------------------------------------------------------------------
+;  Anvil/Hal/hal.pbi is explicit that 0 covers both "the board has no
+;  such hardware" and "no backend has been written for it yet", because
+;  from the operator's seat those are the same fact and the same honest
+;  refusal. They are NOT the same fact for the next person to work here,
+;  so each section below says which it is - and on this board most of
+;  them are the second, sometimes with a working driver sitting in the
+;  tree that this image deliberately does not carry.
+;
+;  THIS IS NOT FEATURE-GATING TO SAVE SPACE. hal.pbi forbids that in as
+;  many words and nothing here is hidden that works.
+;
+;  INCLUDE ORDER: after Anvil/Hal/hal.pbi (every #HW_* code these
+;  answer with), after RaspberryPi3/Lib/pl011_console.pi3 (PrintN) and
+;  after the A/B module (pi3_dtb). House rule 10: this file includes
+;  nothing itself.
+; ======================================================================
+
+; ======================================================================
+;  #CAP_CONSOLE = 1 - FIRMWARE HDMI SCANOUT, OFFSCREEN DRAW, DMA PRESENT.
+;
+;  The Pi 3 framebuffer adapter uses the firmware-allocated, validated
+;  32-bit scanout from framebuffer.pbi. It mirrors PL011 output for the
+;  resident monitor and provides the shared HwCon* payload drawing seam.
+;  Dimensions come from the framebuffer reply (which in turn follows the
+;  selected EDID/firmware mode); the adapter does not assume a fixed mode.
+;  All drawing targets a reserved offscreen render buffer. A claimed DMA
+;  channel presents changed pixels to firmware scanout; no CPU scanout path
+;  is enabled when DMA is unavailable.
+; ======================================================================
+
+Global gScreen.i = 0
+Global pi3_screen_attached.i
+Global pi3_screen_frame.i
+Global pi3_screen_scale.i
+Global pi3_screen_cell_w.i
+Global pi3_screen_cell_h.i
+Global pi3_screen_origin_y.i
+Global pi3_screen_cols.i
+Global pi3_screen_rows.i
+Global pi3_screen_col.i
+Global pi3_screen_row.i
+Global pi3_screen_head.i
+Global pi3_screen_tail.i
+Global pi3_screen_dropped.i
+Global pi3_screen_fault.i
+Global pi3_screen_usage.i = -2
+Global pi3_screen_usage_ms.i
+Global pi3_screen_initialized.i
+Global pi3_screen_init_state.i
+Global pi3_screen_banner_phase.i
+Global pi3_screen_banner_pos.i
+Global pi3_screen_logo_row.i
+Global pi3_screen_font_boot.i
+Global pi3_screen_font_bytes.i
+Global pi3_screen_font_offset.i
+Global pi3_screen_font_path_bytes.i
+Global pi3_screen_font_auto_default.i
+Global Dim pi3_screen_font_path.a[1024]
+Global pi3_screen_font_seen.i
+Global pi3_screen_font_seen_slot.i = -2
+Global pi3_screen_font_seen_generation.i
+Global pi3_screen_font_seen_size.i
+Global Dim pi3_screen_font_message.a[40]
+Global pi3_screen_font_service_phase.i
+Global pi3_screen_font_service_last_phase.i
+Global pi3_screen_font_service_last_us.i
+Global pi3_screen_font_service_max_us.i
+Global pi3_screen_font_service_max_phase.i
+Global pi3_screen_ttf_ready_us.i = -1
+Global pi3_screen_first_banner_us.i = -1
+Global pi3_display_redraw_phase.i
+Global pi3_screen_service_busy.i
+Global Dim pi3_screen_banner_title.a[32]
+Global Dim pi3_screen_banner_subtitle.a[80]
+Global Dim pi3_screen_banner_identity.a[64]
+Global pi3_screen_scroll_pending.i
+Global Dim pi3_screen_ring.a[8192]
+
+; One compact raster cache for printable ASCII at the three sizes used by
+; the shared banner/console primitives. Each entry is an alpha-only cell;
+; the selected slot, generation, and configured base size form its identity.
+#PI3_SCREEN_TTF_FIRST = 32
+#PI3_SCREEN_TTF_GLYPHS = 95
+#PI3_SCREEN_TTF_SCALES = 3
+#PI3_SCREEN_TTF_CACHE_CELL_BYTES = 16*24
+#PI3_SCREEN_TTF_COVERAGE_BYTES = 1024
+; Keep these local: pi3stubs is included before the shared font command file.
+; They match the shared font command file's bounded slot/read-chunk contract.
+#PI3_SCREEN_FONT_MAX_BYTES = 1048576
+#PI3_SCREEN_FONT_READ_CHUNK = 4096
+Global pi3_screen_ttf_slot.i = -2
+Global pi3_screen_ttf_generation.i
+Global pi3_screen_ttf_base_size.i
+Global Dim pi3_screen_ttf_valid.a[#PI3_SCREEN_TTF_GLYPHS*#PI3_SCREEN_TTF_SCALES]
+Global Dim pi3_screen_ttf_alpha.a[#PI3_SCREEN_TTF_GLYPHS*#PI3_SCREEN_TTF_SCALES*#PI3_SCREEN_TTF_CACHE_CELL_BYTES]
+Global Dim pi3_screen_ttf_coverage.a[#PI3_SCREEN_TTF_COVERAGE_BYTES]
+
+Procedure.i Pi3ScreenWidth()
+  If Pi3FbReady() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3FbWidth()
+EndProcedure
+
+Procedure.i Pi3ScreenHeight()
+  If Pi3FbReady() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3FbHeight()
+EndProcedure
+
+Procedure Pi3ScreenClearCell(col.i,row.i)
+  Protected bg.i
+  Protected rc.i
+  If pi3_screen_fault<>0 Or Pi3FbWriteAllowed()=0 Or col < 0 Or col >= pi3_screen_cols Or row < 0 Or row >= pi3_screen_rows
+    ProcedureReturn
+  EndIf
+  bg=Pi3FbPack(12,18,28)
+  rc=Pi3FbFillRect(col*pi3_screen_cell_w,pi3_screen_origin_y+row*pi3_screen_cell_h,pi3_screen_cell_w,pi3_screen_cell_h,bg)
+  If rc<>1 : pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0 : EndIf
+EndProcedure
+
+Procedure.i Pi3ScreenBuildTrueTypeCell(code.i,scale.i)
+  Protected slot.i,generation.i,baseSize.i,pixelHeight.i
+  Protected glyph.i,width.i,height.i,stride.i,bearingX.i,bearingY.i,advance.i
+  Protected units.i,ascender.i,descender.i,lineGap.i,lineBox.i,baseline.i
+  Protected targetWidth.i,targetHeight.i,drawX.i,drawY.i,x.i,y.i
+  Protected glyphIndex.i,cacheIndex.i,cacheOffset.i,targetOffset.i,value.i
+  If code<#PI3_SCREEN_TTF_FIRST Or code>#PI3_SCREEN_TTF_FIRST+#PI3_SCREEN_TTF_GLYPHS-1 Or scale<1 Or scale>#PI3_SCREEN_TTF_SCALES
+    ProcedureReturn 0
+  EndIf
+  If AnvilTrueTypeSlotParserBound()=0
+    ProcedureReturn 0
+  EndIf
+  slot=AnvilTrueTypeSlotSelected()
+  If slot<0 Or slot>=4
+    ProcedureReturn 0
+  EndIf
+  generation=AnvilTrueTypeSlotGeneration(slot)
+  baseSize=AnvilTrueTypePixelHeight()
+  If generation<1 Or baseSize<1 Or baseSize>13
+    ProcedureReturn 0
+  EndIf
+  If slot<>pi3_screen_ttf_slot Or generation<>pi3_screen_ttf_generation Or baseSize<>pi3_screen_ttf_base_size
+    For glyphIndex=0 To #PI3_SCREEN_TTF_GLYPHS*#PI3_SCREEN_TTF_SCALES-1
+      pi3_screen_ttf_valid[glyphIndex]=0
+    Next
+    pi3_screen_ttf_slot=slot
+    pi3_screen_ttf_generation=generation
+    pi3_screen_ttf_base_size=baseSize
+  EndIf
+  glyphIndex=code-#PI3_SCREEN_TTF_FIRST
+  cacheIndex=(scale-1)*#PI3_SCREEN_TTF_GLYPHS+glyphIndex
+  cacheOffset=cacheIndex*#PI3_SCREEN_TTF_CACHE_CELL_BYTES
+  If pi3_screen_ttf_valid[cacheIndex]<>0
+    ProcedureReturn 1
+  EndIf
+  pixelHeight=(baseSize*scale+1)/2
+  If pixelHeight<1 : pixelHeight=1 : EndIf
+  If pixelHeight>512 : pixelHeight=512 : EndIf
+  glyph=AnvilTrueTypeGlyphForCodepoint(code)
+  If AnvilTrueTypeRasterizeGlyph(glyph,pixelHeight,@pi3_screen_ttf_coverage[0],#PI3_SCREEN_TTF_COVERAGE_BYTES,@width,@height,@stride,@bearingX,@bearingY,@advance)=0
+    ProcedureReturn 0
+  EndIf
+  For glyphIndex=0 To #PI3_SCREEN_TTF_CACHE_CELL_BYTES-1
+    pi3_screen_ttf_alpha[cacheOffset+glyphIndex]=0
+  Next
+  targetWidth=5*scale : targetHeight=8*scale
+  If width=0 Or height=0
+    pi3_screen_ttf_valid[cacheIndex]=1
+    ProcedureReturn 1
+  EndIf
+  units=AnvilTrueTypeUnitsPerEm()
+  If units<1 : ProcedureReturn 0 : EndIf
+  ascender=(AnvilTrueTypeAscender()*pixelHeight)/units
+  descender=(AnvilTrueTypeDescender()*pixelHeight)/units
+  lineGap=(AnvilTrueTypeLineGap()*pixelHeight)/units
+  lineBox=ascender-descender+lineGap
+  If lineBox<1 Or lineBox>targetHeight : ProcedureReturn 0 : EndIf
+  baseline=(targetHeight-lineBox)/2+ascender
+  drawX=(targetWidth-advance)/2+bearingX
+  drawY=baseline-bearingY
+  ; Keep the native raster size and one face-wide baseline. If a glyph does
+  ; not fit the fixed cell, fall back for that glyph rather than clipping or
+  ; silently shrinking its height independently of its neighbours.
+  If drawX<0 Or drawY<0 Or drawX+width>targetWidth Or drawY+height>targetHeight
+    ProcedureReturn 0
+  EndIf
+  For y=0 To height-1
+    For x=0 To width-1
+      value=PeekA(@pi3_screen_ttf_coverage[0]+y*stride+x)&$FF
+      targetOffset=drawY+y
+      pi3_screen_ttf_alpha[cacheOffset+targetOffset*16+drawX+x]=value
+    Next
+  Next
+  pi3_screen_ttf_valid[cacheIndex]=1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3ScreenDrawTrueType(code.i,x.i,y.i,scale.i,fg.i,base.i,pitch.i,sw.i,sh.i)
+  Protected cacheIndex.i,cacheOffset.i,xx.i,yy.i,px.i,py.i,alpha.i
+  Protected fgR.i,fgG.i,fgB.i,dst.i,dstR.i,dstG.i,dstB.i,outR.i,outG.i,outB.i
+  If Pi3ScreenBuildTrueTypeCell(code,scale)=0
+    ProcedureReturn 0
+  EndIf
+  cacheIndex=(scale-1)*#PI3_SCREEN_TTF_GLYPHS+(code-#PI3_SCREEN_TTF_FIRST)
+  cacheOffset=cacheIndex*#PI3_SCREEN_TTF_CACHE_CELL_BYTES
+  If pi3_fb_pixel_order=1
+    fgR=fg&255 : fgG=(fg>>8)&255 : fgB=(fg>>16)&255
+  Else
+    fgR=(fg>>16)&255 : fgG=(fg>>8)&255 : fgB=fg&255
+  EndIf
+  For yy=0 To 8*scale-1
+    py=y+yy
+    If py>=0 And py<sh
+      For xx=0 To 5*scale-1
+        px=x+xx
+        If px>=0 And px<sw
+          alpha=PeekA(@pi3_screen_ttf_alpha[cacheOffset+yy*16+xx])&255
+          If alpha>0
+            dst=PeekL(base+py*pitch+px*4)
+            If pi3_fb_pixel_order=1
+              dstR=dst&255 : dstG=(dst>>8)&255 : dstB=(dst>>16)&255
+            Else
+              dstR=(dst>>16)&255 : dstG=(dst>>8)&255 : dstB=dst&255
+            EndIf
+            outR=(fgR*alpha+dstR*(255-alpha)+127)/255
+            outG=(fgG*alpha+dstG*(255-alpha)+127)/255
+            outB=(fgB*alpha+dstB*(255-alpha)+127)/255
+            PokeL(base+py*pitch+px*4,Pi3FbPack(outR,outG,outB))
+          EndIf
+        EndIf
+      Next
+    EndIf
+  Next
+  Pi3FbDirtyAdd(x,y,5*scale,8*scale)
+  ProcedureReturn 1
+EndProcedure
+
+; Restore a font only after the prompt and framebuffer are alive. Font bytes
+; are read in one 4 KiB slice per service turn; reopening each turn avoids
+; retaining the shared filesystem's single open-file state across commands.
+Procedure Pi3ScreenFontBootTick()
+  Protected loadRc.i
+  Protected *configured
+  Protected *sizeValue
+  Protected i.i
+  Protected n.i
+  Protected got.i
+  Protected target.i
+  Protected take.i
+  Protected path.i
+  Protected initialPreload.i
+  Protected Dim sizeText.a[16]
+  If pi3_screen_font_boot=2 Or pi3_screen_fault<>0
+    ProcedureReturn
+  EndIf
+  initialPreload=Bool(pi3_screen_initialized=0 And pi3_screen_init_state=2 And pi3_screen_banner_phase=0)
+  If initialPreload=0
+    If pi3_screen_initialized=0 Or pi3_screen_frame<>0 Or Pi3FbPresentPending()<>0 Or pi3_screen_scroll_pending<>0 Or pi3_screen_tail<>pi3_screen_head
+      ProcedureReturn
+    EndIf
+  EndIf
+  AnvilTrueTypeSlotsInit()
+  If pi3_screen_font_boot=0
+    pi3_screen_font_service_phase=1
+    AnvilFontPixelLimitSet(13)
+    ; Auto-connect and font restore share one settings table. A clean parse
+    ; already in memory is authoritative; reloading here would bump the
+    ; Wi-Fi revision and invalidate an in-flight association attempt. Keep
+    ; the existing retry/refusal behavior for never-loaded or partial state.
+    If SettingsLoadState()=1
+      loadRc=1
+    Else
+      loadRc=SettingsLoad()
+    EndIf
+    ; SET_ERR_NO_FILE is 12 in settings.pbi, included later than this board
+    ; seam. Other load errors must not trigger a default-font restore.
+    If loadRc=0 And SettingsLastError()<>12
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    *sizeValue=SettingsGet("font.size")
+    If *sizeValue<>0
+      n=PmfDecOf(*sizeValue,16)
+      If n>=1 And n<=13
+        AnvilTrueTypeSetPixelHeight(n)
+      Else
+        AnvilTrueTypeSetPixelHeight(13)
+      EndIf
+    Else
+      AnvilTrueTypeSetPixelHeight(13)
+    EndIf
+    *configured=SettingsGet("font.default")
+    If *configured<>0 And SettingsLength("font.default")=6
+      If PeekA(*configured)=98 And PeekA(*configured+1)=105 And PeekA(*configured+2)=116 And PeekA(*configured+3)=109 And PeekA(*configured+4)=97 And PeekA(*configured+5)=112
+        AnvilTrueTypeSetDefaultSlot(-1) : AnvilTrueTypeSlotDeselect()
+        pi3_screen_font_boot=2
+        ProcedureReturn
+      EndIf
+    EndIf
+    If *configured<>0 And SettingsLength("font.default")>0 And SettingsLength("font.default")<1024
+      pi3_screen_font_path_bytes=SettingsLength("font.default")
+      For i=0 To pi3_screen_font_path_bytes-1
+        pi3_screen_font_path[i]=PeekA(*configured+i)
+      Next
+      pi3_screen_font_path[pi3_screen_font_path_bytes]=0
+      pi3_screen_font_auto_default=0
+    Else
+      path="2:/fonts/CourierPrime-Regular.ttf"
+      pi3_screen_font_path_bytes=StrLenZ(path)
+      AnvilBuildCopy(@pi3_screen_font_path[0],path)
+      pi3_screen_font_auto_default=1
+    EndIf
+    If pi3_screen_font_path_bytes<1 Or pi3_screen_font_path_bytes>=1024 Or anvil_font_SlotAddress(0)=0
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    pi3_screen_font_boot=1
+    ProcedureReturn
+  EndIf
+
+  If pi3_screen_font_boot=1
+    pi3_screen_font_service_phase=2
+    If HwStorageUp()=0 Or HwFileOpen(@pi3_screen_font_path[0])=0
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    n=HwFileSize()
+    If n<1 Or n>#PI3_SCREEN_FONT_MAX_BYTES Or (pi3_screen_font_bytes<>0 And n<>pi3_screen_font_bytes)
+      HwFileClose()
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    pi3_screen_font_bytes=n
+    take=pi3_screen_font_bytes-pi3_screen_font_offset
+    If take>#PI3_SCREEN_FONT_READ_CHUNK : take=#PI3_SCREEN_FONT_READ_CHUNK : EndIf
+    target=anvil_font_SlotAddress(0)+pi3_screen_font_offset
+    got=HwFileReadAt(pi3_screen_font_offset,target,take)
+    HwFileClose()
+    If got<>take
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    pi3_screen_font_offset=pi3_screen_font_offset+got
+    If pi3_screen_font_offset<pi3_screen_font_bytes
+      ProcedureReturn
+    EndIf
+    pi3_screen_font_service_phase=3
+    If AnvilTrueTypeSlotLoad(0,anvil_font_SlotAddress(0),pi3_screen_font_bytes)=0 Or AnvilTrueTypeSlotSelect(0)=0
+      pi3_screen_font_boot=2
+      ProcedureReturn
+    EndIf
+    anvil_font_CopySlotPath(0,@pi3_screen_font_path[0],pi3_screen_font_path_bytes)
+    AnvilTrueTypeSetDefaultSlot(0)
+    If pi3_screen_font_auto_default<>0
+      SettingsSet("font.default",@pi3_screen_font_path[0])
+      PmfPutDec(AnvilTrueTypePixelHeight(),@sizeText[0])
+      SettingsSet("font.size",@sizeText[0])
+    EndIf
+    If pi3_screen_ttf_ready_us<0 : pi3_screen_ttf_ready_us=Pi3Micros() : EndIf
+    pi3_screen_font_boot=2
+    ; During first startup the text ring contains the already-emitted UART
+    ; banner and prompt. Keep it intact: the first graphical banner below
+    ; will use this face and the normal ring drain will paint those bytes once.
+    If initialPreload<>0
+      ProcedureReturn
+    EndIf
+    ; Rebuild the shared top banner with the selected face. UART bytes remain
+    ; in the independent bounded ring and are drained after the new banner.
+    pi3_screen_initialized=0 : pi3_screen_init_state=0
+    pi3_screen_banner_phase=0 : pi3_screen_banner_pos=0 : pi3_screen_logo_row=0
+    AnvilBuildCopy(@pi3_screen_font_message[0],"TrueType active; pmf> ")
+    For i=0 To 22
+      If pi3_screen_font_message[i]=0 : Break : EndIf
+      Pi3ScreenMirrorByte(pi3_screen_font_message[i]&$FF)
+    Next
+    For i=0 To TextEditLength()-1
+      Pi3ScreenMirrorByte(PeekA(TextEditText()+i)&$FF)
+    Next
+  EndIf
+EndProcedure
+
+Procedure Pi3ScreenFontServiceTick()
+  Protected fontStart.i
+  Protected fontEnd.i
+  Protected fontElapsed.i
+  Protected fontPhase.i
+  fontStart=Pi3Micros()
+  Pi3ScreenFontBootTick()
+  fontEnd=Pi3Micros()
+  fontPhase=pi3_screen_font_service_phase
+  pi3_screen_font_service_last_phase=fontPhase
+  pi3_screen_font_service_phase=0
+  If fontStart>=0 And fontEnd>=fontStart
+    fontElapsed=fontEnd-fontStart
+    pi3_screen_font_service_last_us=fontElapsed
+    If fontElapsed>pi3_screen_font_service_max_us
+      pi3_screen_font_service_max_us=fontElapsed
+      pi3_screen_font_service_max_phase=fontPhase
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure Pi3ScreenDrawGlyph(code.i,x.i,y.i,scale.i,fg.i)
+  Protected bits.i
+  Protected row.i,col.i,sx.i,sy.i,px.i,py.i
+  Protected base.i,pitch.i,sw.i,sh.i,dst.i
+  If pi3_screen_fault<>0 Or Pi3FbWriteAllowed()=0
+    ProcedureReturn
+  EndIf
+  If code<32 Or code>126 : code=63 : EndIf
+  If scale<1
+    ProcedureReturn
+  EndIf
+  base=Pi3FbBase() : pitch=Pi3FbPitch() : sw=Pi3FbWidth() : sh=Pi3FbHeight()
+  If base=0 Or pitch<sw*4 Or sw<1 Or sh<1
+    ProcedureReturn
+  EndIf
+  If Pi3ScreenDrawTrueType(code,x,y,scale,fg,base,pitch,sw,sh)<>0
+    ProcedureReturn
+  EndIf
+  bits=AnvilTextGlyph(code)
+  For row=0 To 6
+    For col=0 To 3
+      If (bits & (1 << ((6-row)*4+3-col)))<>0
+        For sy=0 To scale-1
+          For sx=0 To scale-1
+            px=x+col*scale+sx : py=y+row*scale+sy
+            If px>=0 And px<sw And py>=0 And py<sh
+              dst=base+py*pitch+px*4
+              PokeL(dst,fg)
+            EndIf
+          Next
+        Next
+      EndIf
+    Next
+  Next
+  Pi3FbDirtyAdd(x,y,4*scale,7*scale)
+EndProcedure
+
+Procedure Pi3ScreenScroll()
+  Protected rc.i
+  If Pi3FbReady()=0 Or pi3_screen_cell_h<=0 Or Pi3FbWriteAllowed()=0
+    ProcedureReturn
+  EndIf
+  rc=Pi3FbScrollRegionStart(pi3_screen_origin_y,pi3_screen_rows*pi3_screen_cell_h,pi3_screen_cell_h,Pi3FbPack(12,18,28))
+  If rc<>1
+    ; In particular, a DMA timeout whose writes may still be in flight must
+    ; never fall through to CPU drawing on the same scanout surface.
+    pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+    ProcedureReturn
+  EndIf
+  pi3_screen_scroll_pending=1
+  pi3_screen_row=pi3_screen_rows-1
+EndProcedure
+
+Procedure Pi3ScreenNewline()
+  pi3_screen_col=0
+  pi3_screen_row=pi3_screen_row+1
+  If pi3_screen_row>=pi3_screen_rows
+    Pi3ScreenScroll()
+    pi3_screen_row=pi3_screen_rows-1
+  EndIf
+EndProcedure
+
+Procedure Pi3ScreenPaintByte(code.i)
+  Protected fg.i
+  Protected spaces.i
+  If pi3_screen_fault<>0 Or Pi3FbDmaState()=3 Or Pi3FbReady()=0 Or pi3_screen_cols<1 Or pi3_screen_rows<1
+    ProcedureReturn
+  EndIf
+  Select code
+    Case 13
+      pi3_screen_col=0
+    Case 10
+      Pi3ScreenNewline()
+    Case 8
+      If pi3_screen_col>0 : pi3_screen_col=pi3_screen_col-1 : Pi3ScreenClearCell(pi3_screen_col,pi3_screen_row) : EndIf
+    Case 127
+      If pi3_screen_col>0 : pi3_screen_col=pi3_screen_col-1 : Pi3ScreenClearCell(pi3_screen_col,pi3_screen_row) : EndIf
+    Case 9
+      spaces=4-(pi3_screen_col & 3)
+      While spaces>0
+        If pi3_screen_col>=pi3_screen_cols : Pi3ScreenNewline() : EndIf
+        Pi3ScreenClearCell(pi3_screen_col,pi3_screen_row)
+        pi3_screen_col=pi3_screen_col+1
+        spaces=spaces-1
+      Wend
+    Default
+      If code<32
+        ProcedureReturn
+      EndIf
+      If pi3_screen_col>=pi3_screen_cols : Pi3ScreenNewline() : EndIf
+      Pi3ScreenClearCell(pi3_screen_col,pi3_screen_row)
+      fg=Pi3FbPack(236,232,220)
+      Pi3ScreenDrawGlyph(code,pi3_screen_col*pi3_screen_cell_w,pi3_screen_origin_y+pi3_screen_row*pi3_screen_cell_h,pi3_screen_scale,fg)
+      pi3_screen_col=pi3_screen_col+1
+  EndSelect
+EndProcedure
+
+Procedure Pi3ScreenAttach()
+  Protected w.i,h.i
+  If pi3_screen_attached<>0 Or Pi3FbReady()=0
+    ProcedureReturn
+  EndIf
+  w=Pi3FbWidth() : h=Pi3FbHeight()
+  If w<80 Or h<64
+    ProcedureReturn
+  EndIf
+  ; Match the shared monitor console: 4x7 glyphs drawn at 2x in fixed
+  ; 8x16 cells, independent of scanout resolution.
+  pi3_screen_scale=2
+  pi3_screen_cell_w=10 : pi3_screen_cell_h=16
+  ; Reserve the top 120 pixels for the shared Anvil banner and CPU0 field.
+  pi3_screen_origin_y=120
+  pi3_screen_cols=w/pi3_screen_cell_w : pi3_screen_rows=(h-pi3_screen_origin_y)/pi3_screen_cell_h
+  If pi3_screen_cols<1 Or pi3_screen_rows<1
+    ProcedureReturn
+  EndIf
+  pi3_screen_attached=1 : gScreen=1
+  pi3_screen_col=0 : pi3_screen_row=0
+  pi3_screen_usage=-2 : pi3_screen_usage_ms=Pi3Micros()
+  pi3_screen_init_state=0 : pi3_screen_initialized=0
+  pi3_screen_banner_phase=0 : pi3_screen_banner_pos=0 : pi3_screen_logo_row=0
+  AnvilBuildCopy(@pi3_screen_banner_subtitle[0],"Anvil Monitor  |  Raspberry Pi 3  |  BCM2837 EL3")
+  AnvilBuildCopy(@pi3_screen_banner_identity[0],"Build 00")
+  AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
+EndProcedure
+
+Procedure Pi3ScreenUsageDraw(value.i)
+  Protected Dim chars.i[13]
+  Protected i.i
+  Protected fg.i
+  Protected whole.i
+  Protected frac.i
+  Protected pos.i
+  Protected drawCount.i
+  If pi3_screen_fault<>0 Or Pi3FbReady()=0 Or Pi3FbWriteAllowed()=0 Or pi3_screen_cell_h<1
+    ProcedureReturn
+  EndIf
+  ; Protected local arrays are not assumed to start zeroed between calls.
+  ; Clear every slot before composing, then draw only the known formatted
+  ; length; this avoids stale stack bytes becoming a second percent sign.
+  For i=0 To 12
+    chars[i]=0
+  Next
+  ; Clear the full fixed field. Each fill remains below the DMA
+  ; threshold and this routine is called by the scheduled screen lane, never
+  ; by UartWrite.
+  chars[0]=67 : chars[1]=80 : chars[2]=85 : chars[3]=48 : chars[4]=32
+  pos=5
+  If value<0
+    chars[pos]=45 : chars[pos+1]=45 : chars[pos+2]=46
+    chars[pos+3]=45 : chars[pos+4]=45 : chars[pos+5]=37 : chars[pos+6]=0
+    drawCount=11
+  Else
+    If value>10000 : value=10000 : EndIf
+    whole=value/100 : frac=value % 100
+    If whole>=100
+      chars[pos]=49 : chars[pos+1]=48 : chars[pos+2]=48 : pos=pos+3
+    ElseIf whole>=10
+      chars[pos]=48+(whole/10) : chars[pos+1]=48+(whole % 10) : pos=pos+2
+    Else
+      chars[pos]=48+whole : pos=pos+1
+    EndIf
+    chars[pos]=46 : chars[pos+1]=48+(frac/10) : chars[pos+2]=48+(frac % 10)
+    chars[pos+3]=37 : chars[pos+4]=0
+    drawCount=pos+4
+  EndIf
+  fg=Pi3FbPack(130,200,230)
+  For i=0 To 11
+    If Pi3FbFillRect(24+i*pi3_screen_cell_w,96,pi3_screen_cell_w,pi3_screen_cell_h,Pi3FbPack(0,0,40))<>1
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+      ProcedureReturn
+    EndIf
+  Next
+  For i=0 To drawCount-1
+    Pi3ScreenDrawGlyph(chars[i],24+i*pi3_screen_cell_w,96,pi3_screen_scale,fg)
+  Next
+EndProcedure
+
+Procedure.i Pi3ScreenDrawText(text.i,x.i,y.i,scale.i,fg.i,start.i,limit.i)
+  Protected i.i=start
+  Protected count.i=0
+  Protected code.i
+  While count<limit
+    code=PeekA(text+i)&255
+    If code=0 : Break : EndIf
+    Pi3ScreenDrawGlyph(code,x+i*(5*scale),y,scale,fg)
+    i=i+1 : count=count+1
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+Procedure Pi3ScreenRememberFont()
+  pi3_screen_font_seen_slot=AnvilTrueTypeSlotSelected()
+  pi3_screen_font_seen_generation=0
+  If pi3_screen_font_seen_slot>=0 And pi3_screen_font_seen_slot<4
+    pi3_screen_font_seen_generation=AnvilTrueTypeSlotGeneration(pi3_screen_font_seen_slot)
+  EndIf
+  pi3_screen_font_seen_size=AnvilTrueTypePixelHeight()
+  pi3_screen_font_seen=1
+EndProcedure
+
+Procedure Pi3ScreenBannerStep()
+  Protected x.i,y.i,rows.i,xx.i,yy.i,rr.i,gg.i,bb.i,px.i
+  Protected text.i
+  Protected steel.i,orange.i,faint.i
+  If pi3_screen_fault<>0 Or Pi3FbWriteAllowed()=0
+    ProcedureReturn
+  EndIf
+  steel=Pi3FbPack(226,232,240) : orange=Pi3FbPack(255,148,48) : faint=Pi3FbPack(120,132,150)
+  Select pi3_screen_banner_phase
+    Case 0
+      If pi3_screen_first_banner_us<0 : pi3_screen_first_banner_us=Pi3Micros() : EndIf
+      AnvilBuildCopy(@pi3_screen_banner_title[0],"PureMetal Forge")
+      PokeA(@pi3_screen_banner_title[15],0)
+      Pi3ScreenDrawText(@pi3_screen_banner_title[0],24,18,3,steel,0,10)
+      Pi3ScreenDrawText(@pi3_screen_banner_title[0],24,18,3,orange,10,5)
+      pi3_screen_banner_phase=1 : pi3_screen_banner_pos=0
+    Case 1
+      text=@pi3_screen_banner_subtitle[0]
+      pi3_screen_banner_pos=Pi3ScreenDrawText(text,24,56,2,faint,pi3_screen_banner_pos,20)
+      If PeekA(text+pi3_screen_banner_pos)=0 : pi3_screen_banner_phase=2 : pi3_screen_banner_pos=0 : EndIf
+    Case 2
+      text=AnvilBuildLabel(#ANVIL_BUILD,#ANVIL_BUILD_DATE,#ANVIL_BUILD_TIME)
+      pi3_screen_banner_pos=Pi3ScreenDrawText(text,24,78,2,steel,pi3_screen_banner_pos,20)
+      If PeekA(text+pi3_screen_banner_pos)=0 : pi3_screen_banner_phase=3 : EndIf
+    Case 3
+      Pi3ScreenUsageDraw(-1)
+      pi3_screen_banner_phase=4
+    Case 4
+      If Pi3FbWidth()<500
+        pi3_screen_banner_phase=5
+      Else
+        x=Pi3FbWidth()-96
+        y=12
+        rows=6
+        If pi3_screen_logo_row+rows>#ANVIL_PIC_H : rows=#ANVIL_PIC_H-pi3_screen_logo_row : EndIf
+        For yy=0 To rows-1
+          For xx=0 To #ANVIL_PIC_W-1
+            px=?anvilPix+((pi3_screen_logo_row+yy)*#ANVIL_PIC_W+xx)*3
+            rr=PeekA(px)&255 : gg=PeekA(px+1)&255 : bb=PeekA(px+2)&255
+            Pi3FbPixel(x+xx,y+pi3_screen_logo_row+yy,Pi3FbPack(rr,gg,bb))
+          Next
+        Next
+        pi3_screen_logo_row=pi3_screen_logo_row+rows
+        If pi3_screen_logo_row>=#ANVIL_PIC_H : pi3_screen_banner_phase=5 : EndIf
+      EndIf
+    Case 5
+      If Pi3FbFillRect(24,116,Pi3FbWidth()-48,2,Pi3FbPack(255,148,48))<>1
+        pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+        ProcedureReturn
+      EndIf
+      pi3_screen_banner_phase=6
+    Case 6
+      pi3_screen_initialized=1
+      Pi3ScreenRememberFont()
+      If Pi3FbPresentBegin()<>1
+        pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+      EndIf
+  EndSelect
+EndProcedure
+
+Procedure Pi3ScreenUsageTick()
+  Protected now.i
+  Protected value.i
+  If pi3_screen_attached=0 Or pi3_screen_initialized=0 Or pi3_screen_fault<>0 Or Pi3FbWriteAllowed()=0
+    ProcedureReturn
+  EndIf
+  now=Pi3Micros()
+  If now<0 Or pi3_screen_usage_ms<0 Or now-pi3_screen_usage_ms<1000000
+    ProcedureReturn
+  EndIf
+  pi3_screen_usage_ms=now
+  value=AnvilCpuUsageHundredths()
+  If value=pi3_screen_usage
+    ProcedureReturn
+  EndIf
+  pi3_screen_usage=value
+  Pi3ScreenUsageDraw(value)
+  If Pi3FbPresentBegin()<>1
+    pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+  EndIf
+EndProcedure
+
+Procedure Pi3ScreenDrain()
+  Protected c.i
+  Protected dirty.i=0
+  Protected processed.i=0
+  Protected start.i
+  Protected now.i
+  Protected rc.i
+  If pi3_screen_fault<>0 Or pi3_screen_frame<>0 Or Pi3FbReady()=0
+    ProcedureReturn
+  EndIf
+  Pi3ScreenAttach()
+  If pi3_screen_attached=0
+    ProcedureReturn
+  EndIf
+  If pi3_screen_init_state=0
+    If Pi3FbClearStart(Pi3FbPack(0,0,40))<>1
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+      ProcedureReturn
+    EndIf
+    pi3_screen_init_state=1
+    ProcedureReturn
+  ElseIf pi3_screen_init_state=1
+    rc=Pi3FbClearPoll()
+    If rc=0
+      ProcedureReturn
+    EndIf
+    If rc<0
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+      ProcedureReturn
+    EndIf
+    pi3_screen_init_state=2
+    ProcedureReturn
+  ElseIf pi3_screen_initialized=0
+    ; Keep the boot text in its bounded UART mirror ring while the saved face
+    ; is loaded. Banner drawing starts only after a terminal font decision,
+    ; so the first graphical glyph uses TrueType when it is available.
+    If pi3_screen_font_boot<>2
+      Pi3ScreenFontServiceTick()
+      If pi3_screen_font_boot<>2
+        ProcedureReturn
+      EndIf
+    EndIf
+    Pi3ScreenBannerStep()
+    ProcedureReturn
+  EndIf
+  If pi3_screen_scroll_pending<>0
+    now=Pi3FbScrollPoll()
+    If now=0
+      ProcedureReturn
+    EndIf
+    If now<0
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0 : pi3_screen_scroll_pending=0
+      ProcedureReturn
+    EndIf
+    pi3_screen_scroll_pending=0
+    If Pi3FbPresentBegin()<>1
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+    EndIf
+    ProcedureReturn
+  EndIf
+  If Pi3FbPresentPending()<>0
+    rc=Pi3FbPresentPoll()
+    If rc<0 : pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0 : EndIf
+    ProcedureReturn
+  EndIf
+  If pi3_screen_font_seen<>0
+    If AnvilTrueTypeSlotSelected()<>pi3_screen_font_seen_slot Or AnvilTrueTypePixelHeight()<>pi3_screen_font_seen_size
+      pi3_screen_initialized=0 : pi3_screen_init_state=0
+      pi3_screen_banner_phase=0 : pi3_screen_banner_pos=0 : pi3_screen_logo_row=0
+      ProcedureReturn
+    EndIf
+    If pi3_screen_font_seen_slot>=0 And AnvilTrueTypeSlotGeneration(pi3_screen_font_seen_slot)<>pi3_screen_font_seen_generation
+      pi3_screen_initialized=0 : pi3_screen_init_state=0
+      pi3_screen_banner_phase=0 : pi3_screen_banner_pos=0 : pi3_screen_logo_row=0
+      ProcedureReturn
+    EndIf
+  EndIf
+  Pi3ScreenFontServiceTick()
+  ; The successful loader has restarted banner initialization and queued a
+  ; prompt/input repaint. Never draw into the just-cleared backbuffer here.
+  If pi3_screen_initialized=0 Or pi3_screen_init_state<>2
+    ProcedureReturn
+  EndIf
+  start=Pi3Micros()
+  While pi3_screen_tail<>pi3_screen_head And processed<32
+    If (processed & 3)=0
+      now=Pi3Micros()
+      If start<0 Or now<start Or now-start>=1500 : Break : EndIf
+    EndIf
+    c=pi3_screen_ring[pi3_screen_tail]&$FF
+    pi3_screen_tail=(pi3_screen_tail+1)&8191
+    Pi3ScreenPaintByte(c)
+    dirty=1
+    processed=processed+1
+    If pi3_screen_scroll_pending<>0 : Break : EndIf
+  Wend
+  If dirty<>0 And pi3_screen_scroll_pending=0
+    rc=Pi3FbPresentBegin()
+    If rc<>1 : pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0 : EndIf
+  EndIf
+EndProcedure
+
+Procedure.i ScreenWorkPending()
+  ; A missing framebuffer cannot make the scheduler spin forever. Once ready,
+  ; an unattached or partially drawn screen is real bounded service work.
+  ProcedureReturn Bool(Pi3FbReady()<>0 And (pi3_screen_tail<>pi3_screen_head Or pi3_screen_attached=0 Or pi3_screen_initialized=0 Or pi3_screen_scroll_pending<>0 Or Pi3FbPresentPending()<>0 Or pi3_fb_clear_pending<>0) And pi3_screen_fault=0)
+EndProcedure
+
+Procedure.i Pi3ScreenDroppedBytes()
+  ProcedureReturn pi3_screen_dropped
+EndProcedure
+
+Procedure Pi3ScreenMirrorByte(c.i)
+  Protected nextHead.i
+  ; UART output is never permitted to enter the renderer or wait for scanout.
+  ; This fixed ring is the only work performed on the serial producer path.
+  nextHead=(pi3_screen_head+1)&8191
+  If nextHead=pi3_screen_tail
+    pi3_screen_tail=(pi3_screen_tail+1)&8191
+    pi3_screen_dropped=pi3_screen_dropped+1
+  EndIf
+  pi3_screen_ring[pi3_screen_head]=c&$FF
+  pi3_screen_head=nextHead
+EndProcedure
+
+Procedure.i HwConBacklight(pct.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwConCapture()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwConFrameBegin()
+  Pi3ScreenAttach()
+  If pi3_screen_fault<>0 Or pi3_screen_initialized=0 Or Pi3FbWriteAllowed()=0 Or Pi3FbReady()=0 : ProcedureReturn 0 : EndIf
+  If pi3_screen_frame<>0 : ProcedureReturn 0 : EndIf
+  pi3_screen_frame=1
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwConFrameEnd()
+  If pi3_screen_fault<>0 Or pi3_screen_frame=0 Or Pi3FbReady()=0 : ProcedureReturn 0 : EndIf
+  pi3_screen_frame=0
+  If Pi3FbPresentBegin()<>1
+    pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+    ProcedureReturn 0
+  EndIf
+  Pi3ScreenDrain()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwConHeight()
+  ProcedureReturn Pi3ScreenHeight()
+EndProcedure
+Procedure HwConRect(x.i,y.i,w.i,h.i,argb.i)
+  Protected sw.i,sh.i,xx.i,yy.i,a.i,r.i,g.i,b.i,d.i,dr.i,dg.i,db.i
+  If pi3_screen_fault<>0 Or Pi3FbWriteAllowed()=0 Or Pi3FbReady()=0 Or w<=0 Or h<=0
+    ProcedureReturn
+  EndIf
+  sw=Pi3FbWidth() : sh=Pi3FbHeight()
+  If y<pi3_screen_origin_y : h=h-(pi3_screen_origin_y-y) : y=pi3_screen_origin_y : EndIf
+  If x<0 : w=w+x : x=0 : EndIf
+  If y<0 : h=h+y : y=0 : EndIf
+  If x>=sw Or y>=sh
+    ProcedureReturn
+  EndIf
+  If x+w>sw : w=sw-x : EndIf
+  If y+h>sh : h=sh-y : EndIf
+  If w<=0 Or h<=0
+    ProcedureReturn
+  EndIf
+  a=(argb>>24)&255 : r=(argb>>16)&255 : g=(argb>>8)&255 : b=argb&255
+  If a=0
+    ProcedureReturn
+  EndIf
+  If a=255
+    If Pi3FbFillRect(x,y,w,h,Pi3FbPack(r,g,b))<>1
+      pi3_screen_fault=1 : pi3_screen_attached=0 : gScreen=0
+    EndIf
+    ProcedureReturn
+  EndIf
+  For yy=y To y+h-1
+    For xx=x To x+w-1
+      d=PeekL(Pi3FbBase()+yy*Pi3FbPitch()+xx*4)
+      If pi3_fb_pixel_order=1
+        dr=d&255 : dg=(d>>8)&255 : db=(d>>16)&255
+      Else
+        dr=(d>>16)&255 : dg=(d>>8)&255 : db=d&255
+      EndIf
+      dr=(a*r+(255-a)*dr+127)/255 : dg=(a*g+(255-a)*dg+127)/255 : db=(a*b+(255-a)*db+127)/255
+      Pi3FbPixel(xx,yy,Pi3FbPack(dr,dg,db))
+    Next
+  Next
+EndProcedure
+
+Procedure.i HwConText(x.i,y.i,*utf8,argb.i,bg.i)
+  Protected n.i=0,byte.i,step.i,code.i,tx.i,ty.i,count.i,advance.i,scale.i,maxWidth.i
+  Protected fg.i,bgOpaque.i
+  If Pi3FbReady()=0 Or pi3_screen_initialized=0 Or Pi3FbWriteAllowed()=0 Or *utf8=0 : ProcedureReturn 0 : EndIf
+  Pi3ScreenAttach()
+  If pi3_screen_attached=0 : ProcedureReturn 0 : EndIf
+  scale=2 : advance=8 : tx=x : ty=y-16
+  If ty<pi3_screen_origin_y : ty=pi3_screen_origin_y : EndIf
+  fg=Pi3FbPack((argb>>16)&255,(argb>>8)&255,argb&255)
+  ; The seam's text background is an opaque RGB colour, unlike rectangle
+  ; alpha. Force opacity when routing through HwConRect.
+  bgOpaque=$FF000000 | (bg & $00FFFFFF)
+  While n<4096
+    byte=PeekA(*utf8+n)&255 : If byte=0 : Break : EndIf
+    step=1 : code=byte
+    If byte<128
+      code=byte
+    Else
+      code=63
+      If byte>=$C2 And byte<=$DF : step=2 : ElseIf byte>=$E0 And byte<=$EF : step=3 : ElseIf byte>=$F0 And byte<=$F4 : step=4 : EndIf
+      count=1
+      While count<step And ((PeekA(*utf8+n+count)&$C0)=$80) : count=count+1 : Wend
+      If count<step : step=1 : EndIf
+    EndIf
+    Select code
+      Case 13
+        tx=x
+      Case 10
+        If tx-x>maxWidth : maxWidth=tx-x : EndIf
+        tx=x : ty=ty+pi3_screen_cell_h
+      Case 9
+        Repeat
+          HwConRect(tx,ty,advance,pi3_screen_cell_h,bgOpaque)
+          tx=tx+advance
+        Until ((tx-x)/advance & 3)=0
+      Default
+        If code<32 : code=63 : EndIf
+        HwConRect(tx,ty,advance,pi3_screen_cell_h,bgOpaque)
+        Pi3ScreenDrawGlyph(code,tx,ty,scale,fg)
+        tx=tx+advance
+    EndSelect
+    n=n+step
+  Wend
+  If tx-x>maxWidth : maxWidth=tx-x : EndIf
+  ProcedureReturn maxWidth
+EndProcedure
+Procedure.i HwConTextHeight()
+  Pi3ScreenAttach()
+  ProcedureReturn 16
+EndProcedure
+Procedure.i HwConTextWidth(*utf8)
+  Protected n.i=0,byte.i,step.i,count.i,maxCount.i,j.i
+  If *utf8=0 : ProcedureReturn 0 : EndIf
+  Pi3ScreenAttach()
+  While n<4096
+    byte=PeekA(*utf8+n)&255 : If byte=0 : Break : EndIf
+    If byte=10
+      If count>maxCount : maxCount=count : EndIf
+      count=0 : n=n+1
+    ElseIf byte=13
+      n=n+1
+    Else
+      step=1
+      If byte<128
+        step=1
+      ElseIf byte>=$C2 And byte<=$DF
+        step=2
+      ElseIf byte>=$E0 And byte<=$EF
+        step=3
+      ElseIf byte>=$F0 And byte<=$F4
+        step=4
+      EndIf
+      j=1
+      While j<step And n+j<4096 And ((PeekA(*utf8+n+j)&$C0)=$80)
+        j=j+1
+      Wend
+      If j<step : step=1 : EndIf
+      count=count+1
+      n=n+step
+    EndIf
+  Wend
+  If count>maxCount : maxCount=count : EndIf
+  ProcedureReturn maxCount*8
+EndProcedure
+Procedure.i HwConTier()
+  ProcedureReturn #HW_TIER_CPU
+EndProcedure
+Procedure.i HwConWidth()
+  ProcedureReturn Pi3ScreenWidth()
+EndProcedure
+
+; ======================================================================
+;  #CAP_GPIO = 0 - NO BACKEND, AND THE HARDWARE IS RIGHT THERE.
+;
+;  The BCM2837's GPIO block is at $3F200000 and this monitor already
+;  writes it: RaspberryPi3/Lib/uart.pbi muxes GPIO 14 and 15 to the
+;  PL011 and runs the old-style GPPUD/GPPUDCLK pull sequence, and
+;  RaspberryPi3/Lib/sdhost.pbi muxes 48 to 53 for the card. So this 0 is
+;  "no backend has been written", not "Anvil cannot reach the pins".
+;
+;  HwGpioCount() ANSWERS 0 AND NOT 54. A count with no backend behind it
+;  would make `gpio` print a table of pins it cannot read, which is worse
+;  than refusing: every row would be a plausible-looking lie.
+;
+;  WHAT WRITING THIS BACKEND ACTUALLY NEEDS, so nobody starts it thinking
+;  it is an afternoon: the reserved-pin list. This board has the console
+;  on 14 and 15, the card on 48 to 53, and the radio on 34 to 39 in ALT3 -
+;  and driving any of those from `gpio` takes the machine down under
+;  itself. HwGpioReservedReason() is the seam for saying so per pin, and
+;  it is the part that has to be right before the write half is offered.
+; ======================================================================
+
+Procedure.i HwGpioAltGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioLevelGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioMode(pin.i, mode.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioModeGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioPullGet(pin.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioToggle(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwGpioUserMax()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwGpioWrite(pin.i, level.i)
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_I2C = 0 - NO BACKEND. The BCM2837 has two Broadcom Serial
+;  Controllers and nothing in this tree drives either of them. Not a
+;  platform problem and not a hardware absence: unwritten work, in a
+;  group nothing on this bench currently needs.
+; ======================================================================
+
+Procedure.i HwI2cDefaultBus()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cGetSpeed(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cPadLevel(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cPin(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cPinFunc(bus.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cPinReady(bus.i, which.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwI2cProbe(bus.i, addr.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRateMax(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRateMin(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cRead(bus.i, addr.i, *buf, n.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSetSpeed(bus.i, hz.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSourceHz(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cSourceWhere(bus.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwI2cUp(bus.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+Procedure.i HwI2cWrite(bus.i, addr.i, *buf, n.i)
+  ProcedureReturn #HW_I2C_NOBUS
+EndProcedure
+
+; ======================================================================
+;  #CAP_MMC = 0 - AND THE CARD WORKS. This group is the RAW BLOCK family:
+;  `mmc read`, `mmc write`, sector counts. The card is reached instead
+;  through the storage and file seams, which is a different question and
+;  a different command set.
+;
+;  It is 0 rather than 1 because the raw family's contract includes
+;  things this board's driver deliberately refuses - an unrestricted
+;  write, for one. RaspberryPi3/Lib/sdhost.pbi will only write inside a
+;  window somebody declared, because the card carries the immutable
+;  loader and both A/B slots, and `mmc write 0` on the boot card is a
+;  board that stops booting. Offering the family and then refusing half
+;  of it would be worse than not offering it.
+; ======================================================================
+
+Procedure.i HwMmcUp()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcBlockCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcCanWrite()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcErrorText()
+  ProcedureReturn "this board has no raw block family: its card is reached through the filesystem seam, not through mmc"
+EndProcedure
+Procedure.i HwMmcInfo()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcType()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcWriteBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_PWM = 0 - NO BACKEND AND NO FAN. The part has two PWM channels;
+;  nothing here drives them, and a Pi 3 Model B has no fan header for the
+;  family's main use. Unwritten work in a group nothing needs.
+; ======================================================================
+
+Procedure.i HwPwmBegin(pin.i, hz.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDefaultPin()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwPwmDetail(which.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDuty(permille.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmEnd()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHz()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzDefault()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzMax(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmHzMin(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmKind()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmPinAt(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwPwmPinCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmPinIsHard(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwPwmReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure HwPwmService()
+EndProcedure
+
+; ======================================================================
+;  THE TEMPERATURE - NOT A CAPABILITY, AND NOT KNOWN.
+;
+;  HwTemp* has no #CAP_ flag: the core takes a reading once a second at
+;  the prompt whether or not a fan is armed, and a board that cannot
+;  answer says so with #HW_TEMP_NONE rather than by being absent.
+;
+;  THE SENSOR EXISTS. The BCM2837 has an on-die thermal sensor and the
+;  firmware will report it through the property mailbox. This monitor
+;  does not ask, for the reason every mailbox question on this board runs
+;  into: the mailbox stops answering once the MMU is on, and a
+;  once-a-second reading is exactly the kind of thing that cannot be
+;  asked during boot and remembered. Reading the sensor's own registers
+;  is the answer, and it is work nobody has done here.
+;
+;  SO IT ANSWERS UNKNOWN AND THE ROW SAYS UNKNOWN. A plausible constant
+;  would be the worst possible value in a field whose whole purpose is to
+;  tell somebody their board is hot.
+; ======================================================================
+
+Procedure.i HwTempMaxMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+Procedure.i HwTempMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+Procedure.i HwTempSource()
+  ProcedureReturn #HW_TEMP_SRC_NONE
+EndProcedure
+
+; ======================================================================
+;  #CAP_TOUCH = 0 - THERE IS NO PANEL. Not unwritten work: there is no
+;  touch controller on this bench's Pi 3 and no plan for one.
+; ======================================================================
+
+Procedure HwTouchFlush()
+EndProcedure
+Procedure.i HwTouchMaxPoints()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchPoll(*ev)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchQueued()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchReady()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchTick()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwTouchUp()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_USB = 0 - THE DRIVERS EXIST AND THE MONITOR DOES NOT CARRY THEM.
+;
+;  This board has a DWC2 host controller and a LAN9514 hub-and-Ethernet
+;  part behind it, and RaspberryPi3/Lib/usb_*.pbi and lan9514_*.pbi are
+;  real drivers that pass their desk gates. They are the BOOT LANE's, they
+;  are compiled into the serial updater, and they are NOT in this image.
+;
+;  That is a deliberate milestone-1 boundary rather than an oversight.
+;  Bringing a USB host up on this part means DMA, and this monitor has
+;  just turned its caches on for the first time; the coherency discipline
+;  those drivers would need has never run here. Adding both at once would
+;  mean the first failure has two candidate causes.
+;
+;  So the group is 0, and the `usb` family refuses in a sentence. When the
+;  drivers come in, this section goes and a hw_usb.pi3 replaces it.
+; ======================================================================
+
+; What is left of the device-listing seam after the USB protocol moved
+; into Anvil/Bus/usb_core.pbi: choosing WHICH device, and naming the
+; driver that holds an interface. This board drives no USB host this
+; monitor can reach, so a load always fails and no interface is claimed.
+; A listing handed that prints the sentence about an empty bus, which is
+; the truth here and not a failure to read.
+Procedure.i HwUsbDescLoad(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDescLoaded()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevRootPort(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevParent(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevIfaceDriver(i.i, ifnum.i)
+  ProcedureReturn "no driver"
+EndProcedure
+Procedure.i HwUsbBurstIn()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbBurstOut()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevAddress(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevClass(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevKind(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevPid(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevRoute(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevSlot(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevSpeed(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevVid(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbEnumerate()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostFirmware()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkSpeed()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkSsc()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostLinkWidth()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostPid()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostVersion()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostVid()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortSpeed(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPorts()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubRootPort()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldCount(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldName(r.i, f.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldValue(r.i, f.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegName(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegNote(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegValue(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortLinkState(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortPowerTimeouts(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortSpeed(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadAvailable()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlocks(lba.i, count.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageBlockCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageConfigLen()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageError()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageProduct()
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbStorageProtocol()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageReady()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageUas()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageVendor()
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbTree()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitBytes()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitFirstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitLastUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure HwUsbWaitLedgerReset()
+EndProcedure
+Procedure.i HwUsbWaitName(i.i)
+  ProcedureReturn "none"
+EndProcedure
+Procedure.i HwUsbWaitTotalUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitVisits(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitWorstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkComp(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkErr(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkErrText(c.i)
+  ProcedureReturn "this board declares no USB host, so no enumeration walk was ever started"
+EndProcedure
+Procedure.i HwUsbWalkIsHub(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkPort(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkPortsc(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkReached(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkSlot(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkStep(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkStepText(s.i)
+  ProcedureReturn "no step - this board declares no USB host"
+EndProcedure
+Procedure.i HwUsbWalkUsbCmd()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWalkUsbSts()
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  #CAP_BOOT_EL1 = 0 - AND ON THIS BOARD THAT IS NOT A PLATFORM LIMIT.
+;
+;  The Arduino UNO Q answers 0 here because UEFI runs it at EL1 and there
+;  is no higher exception level from which to install one. This board's
+;  monitor runs at EL3, so a lower-level handoff is architecturally
+;  reachable but remains unimplemented.
+;
+;  IT IS NOT WRITTEN BECAUSE THE PIECES AROUND IT ARE NOT. Dropping an
+;  arm64 Image to EL1 means handing it a device tree - this board has
+;  one, pinned at $1000000 - and it means the caches and MMU this monitor
+;  just turned on being put back exactly as the kernel expects to find
+;  them, which on this part has never been done and cannot be proven
+;  without a kernel to boot. That is a milestone of its own.
+; ======================================================================
+
+Procedure HwBootToEl1(entry.i, dtb.i)
+  ; Unreachable: #CAP_BOOT_EL1 = 0 gates every caller. If it is ever
+  ; reached, a capability was declared without a backend, and saying so
+  ; is far better than branching somewhere with the wrong exception
+  ; level and the caches in an unknown state.
+  PrintN("!! HwBootToEl1 was reached on a board that declares #CAP_BOOT_EL1 = 0.")
+  PrintN("   That is a bug in this board's capability declaration, not in the")
+  PrintN("   command. Nothing was done and nothing was branched to.")
+EndProcedure
+
+; ======================================================================
+;  HwFirmwareDtb() - AND THIS ONE IS A REAL ANSWER, NOT A STUB.
+;
+;  It sits in this file because it is one procedure and has no family to
+;  live with, not because this board cannot answer it. The Pi 3 CAN: the
+;  device tree is at $1000000, pinned there by the boot arrangement -
+;  Pi3UpdateConfigure() refuses any other value, the loader passes it in
+;  x0 when it branches, and Pi3BootMemory() has already walked its header
+;  and checked its magic and its length before this monitor printed
+;  anything.
+;
+;  SO IT RETURNS pi3_dtb AND NOT A CONSTANT. If boot validation refused,
+;  pi3_dtb is left at whatever it was and the boot stopped long before
+;  here; if it succeeded, this is a pointer somebody has already checked.
+;  Returning $1000000 unconditionally would be the same number with none
+;  of that behind it.
+; ======================================================================
+
+Procedure.i HwFirmwareDtb()
+  ProcedureReturn pi3_dtb
+EndProcedure
+
+; ======================================================================
+;  THE CONSTANTS AND GLOBALS THE SHARED CORE READS FROM ITS BOARD.
+;
+;  Not a seam and not a capability: a handful of names that shared files
+;  reference directly and that only a board can fill in. The Arduino
+;  UNO Q keeps its set at the foot of qstubs_q.unoq for the same reason.
+; ======================================================================
+
+; The console's own base, which the banner prints so an operator can see
+; WHICH port the text they are reading came out of. A real address here,
+; unlike the UNO Q, whose console is a firmware protocol with no base.
+#UART_BASE = $3F201000
+
+; ----------------------------------------------------------------------
+;  THE BOOT COUNTER - THIS BOARD HAS NONE, AND SAYS SO.
+;
+;  Anvil/Core/uptime.pbi reads a cell that survives a reset and holds a
+;  magic and a count, so `uptime` can say how many times the board has
+;  restarted. On the Pi 4 a library maintains it; nothing maintains one
+;  here, and writing one would be new work in a lane that has been told
+;  not to add libraries that do not exist yet.
+;
+;  SO THE MAGIC IS ZERO AND CAN NEVER MATCH, which is what makes uptime
+;  report the count as not available instead of reporting a number that
+;  came from whatever was in memory. The address still has to be one that
+;  is safe to READ, because the read happens before the magic is tested:
+;  the loader's handoff page is mapped, owned by the boot arrangement,
+;  and never holds this magic.
+;
+;  WHAT A REAL ONE WOULD NEED, so nobody starts it by accident: a cell
+;  outside both the monitor's BSS and the loader's, in a region
+;  memmap.pi3 declares so that `fill` cannot reach it, incremented once
+;  per boot before anything can fault, and reset by a confirmed update.
+;  That is a milestone, not a constant.
+; ----------------------------------------------------------------------
+#SAFETY_COUNT_ADDR = $1FF0000      ; the loader handoff page - readable,
+                                   ; and never this magic
+#SAFETY_MAGIC      = $00000000     ; can never match; the count is absent
+
+; ----------------------------------------------------------------------
+;  Globals the shared line editor and commands read. On the Pi 4 they
+;  live in that board's display globals; this board has no display
+;  service and no USB input, so they are constants that say so.
+; ----------------------------------------------------------------------
+Global gMouseTried.i = 1     ; 1 = "already tried", so ReadLine never asks
+Global gKbdH.i = 0           ; no USB HID keyboard on this board
+Global gLastCR.i = 0         ; the line editor's CR/LF de-duplication state
+Global gBootTicks.i = 0      ; the counter at entry, set by Main()
+Global gBase.i = 0           ; the `base` command's address base
+Global gMbx.i = 0            ; the mailbox library keeps its own state
+
+; ======================================================================
+;  THE SERVICE HOOKS THE PROMPT CALLS ON EVERY SPIN.
+;
+;  Anvil's core is one set of bytes for every board, so the command loop
+;  and the line editor call these unconditionally. A board that has none
+;  of the hardware behind them still has to make the NAMES resolve, and
+;  the honest answer is a no-op that says which kind of nothing it is.
+;
+;  THE TWO THAT RETURN VALUES ARE THE DANGEROUS ONES. KeyboardChar() and
+;  NetConsoleGetc() feed the line editor; the only safe answers here are
+;  "no character" and "idle", and anything else is a phantom keystroke in
+;  somebody's command.
+; ======================================================================
+
+Declare ScreenServiceTick()
+
+Procedure ScreenPump()
+  ScreenServiceTick()
+EndProcedure
+
+Procedure ScreenBannerTick()
+  ScreenServiceTick()
+EndProcedure
+
+Procedure Pi3DisplayLifecycleStart()
+  If pi3_fb_deferred_ready<>0
+    ScreenConnectionRegister(1000)
+  EndIf
+EndProcedure
+
+Procedure.i Pi3DisplayProbe()
+  Protected revision.i=HwMemoryRevision()
+  Protected model.i=(revision>>4)&$FF
+  Protected raw.i
+  Protected rc.i
+  If model=$08
+    rc=Pi3FirmwareGpioGetStateStep(#PI3_FIRMWARE_HDMI0_HPD,@raw)
+    If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+    If rc<0 : ProcedureReturn -10 : EndIf
+    If raw=0 : Pi3FbInitialPresence(1) : ProcedureReturn #SCREEN_CONNECTION_COMPLETE : EndIf
+    Pi3FbInitialPresence(0) : ProcedureReturn #SCREEN_CONNECTION_RESULT_ABSENT
+  EndIf
+  ; Pi 3B+/3A+ route active-low HDMI0 HPD to SoC GPIO28.
+  If model=$0D Or model=$0E
+    raw=(PeekL($3F200034)>>28)&1
+    If raw=0 : Pi3FbInitialPresence(1) : ProcedureReturn #SCREEN_CONNECTION_COMPLETE : EndIf
+    Pi3FbInitialPresence(0) : ProcedureReturn #SCREEN_CONNECTION_RESULT_ABSENT
+  EndIf
+  ProcedureReturn -11
+EndProcedure
+
+Procedure.i Pi3DisplayAttachStep()
+  Protected rc.i=Pi3FbAttachStep()
+  If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+  If rc=2 : ProcedureReturn #SCREEN_CONNECTION_RETRY : EndIf
+  If rc<0 : ProcedureReturn -20 : EndIf
+  If Pi3FbDmaInit()=0 : ProcedureReturn -200-Pi3FbDmaError() : EndIf
+  ProcedureReturn #SCREEN_CONNECTION_COMPLETE
+EndProcedure
+
+Procedure.i Pi3DisplayDetachStep()
+  Protected rc.i=Pi3FbDetachStep()
+  If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+  pi3_display_redraw_phase=0
+  pi3_screen_attached=0 : pi3_screen_initialized=0 : gScreen=0
+  pi3_screen_scroll_pending=0 : pi3_screen_frame=0
+  If rc<0 : ProcedureReturn -30 : EndIf
+  ProcedureReturn #SCREEN_CONNECTION_COMPLETE
+EndProcedure
+
+Procedure.i Pi3DisplayRedraw()
+  Protected rc.i
+  If pi3_display_redraw_phase=0
+    pi3_screen_fault=0 : pi3_screen_attached=0 : pi3_screen_initialized=0
+    pi3_screen_init_state=0 : pi3_screen_banner_phase=0
+    pi3_screen_banner_pos=0 : pi3_screen_logo_row=0
+    pi3_display_redraw_phase=1
+  EndIf
+  If pi3_display_redraw_phase=1
+    Pi3ScreenDrain()
+    If pi3_screen_fault<>0 : pi3_display_redraw_phase=0 : ProcedureReturn -40 : EndIf
+    If pi3_screen_initialized=0 Or Pi3FbPresentPending()<>0 Or pi3_fb_dirty<>0 Or pi3_fb_dma_active<>0 Or pi3_fb_clear_pending<>0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+    pi3_display_redraw_phase=2
+  EndIf
+  If pi3_display_redraw_phase=2
+    rc=Pi3FbPowerBegin(1)
+    If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+    If rc<0 : pi3_display_redraw_phase=0 : ProcedureReturn -41 : EndIf
+    pi3_display_redraw_phase=3 : ProcedureReturn #SCREEN_CONNECTION_PENDING
+  EndIf
+  If pi3_display_redraw_phase=3
+    rc=Pi3FbPowerPoll()
+    If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+    If rc<0 : pi3_display_redraw_phase=0 : ProcedureReturn -42 : EndIf
+    pi3_display_redraw_phase=4
+  EndIf
+  If pi3_display_redraw_phase=4
+    rc=Pi3FbBlankBegin(0)
+    If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+    If rc<0 : pi3_display_redraw_phase=0 : ProcedureReturn -43 : EndIf
+    pi3_display_redraw_phase=5 : ProcedureReturn #SCREEN_CONNECTION_PENDING
+  EndIf
+  rc=Pi3FbBlankPoll()
+  If rc=0 : ProcedureReturn #SCREEN_CONNECTION_PENDING : EndIf
+  pi3_display_redraw_phase=0
+  If rc<0 : ProcedureReturn -44 : EndIf
+  ProcedureReturn #SCREEN_CONNECTION_COMPLETE
+EndProcedure
+
+Procedure ScreenServiceTick()
+  Protected action.i
+  Protected result.i
+  Protected now.i=millis()
+  If pi3_screen_service_busy<>0
+    ProcedureReturn
+  EndIf
+  pi3_screen_service_busy=1
+  action=ScreenConnectionNextAction(now)
+  Select action
+    Case #SCREEN_CONNECTION_ACTION_PROBE : result=Pi3DisplayProbe()
+    Case #SCREEN_CONNECTION_ACTION_ATTACH : result=Pi3DisplayAttachStep()
+    Case #SCREEN_CONNECTION_ACTION_DETACH : result=Pi3DisplayDetachStep()
+    Case #SCREEN_CONNECTION_ACTION_REDRAW : result=Pi3DisplayRedraw()
+  EndSelect
+  If action<>#SCREEN_CONNECTION_ACTION_NONE
+    ScreenConnectionComplete(action,result,now)
+  EndIf
+  If ScreenConnectionState()=#SCREEN_CONNECTION_ATTACHED
+    Pi3ScreenDrain()
+    Pi3ScreenUsageTick()
+  EndIf
+  pi3_screen_service_busy=0
+EndProcedure
+
+; No USB host in this image, so no keyboard and no mouse to attach.
+Procedure MouseTryAttach()
+EndProcedure
+
+Procedure MouseTick()
+EndProcedure
+
+Procedure.i KeyboardChar()
+  ProcedureReturn 0            ; 0 = no character
+EndProcedure
+
+; No touch controller on this board at all.
+Procedure TouchTick()
+EndProcedure
+
+; The general TCP service remains unavailable on this Pi 3 composition.
+; The shared UDP console/DHCP path is linked separately; unknown TCP frames
+; reach this explicit drop seam until a TCP backend is composed and proven.
+Procedure.i TcpInput()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure TcpTick()
+EndProcedure
+
+Procedure WifiLinkTick()
+  ; Automatic bring-up/join runs only in the idle prompt. A command may call
+  ; ReadLine recursively, but its foreground owner suppresses Wi-Fi mutation.
+  If pi3_wifi_foreground_active = 0
+    Pi3WifiAutoLinkTick()
+  EndIf
+  ; In the idle/no-address interval NetConsole has no receive ownership yet.
+  ; The Wi-Fi adapter advances one bounded RX/protocol turn; after the shared
+  ; console claims that interface its pump consumes the queue instead.
+  If pi3_wifi_link_active <> 0
+    Pi3WifiNetworkRxTick()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  CACHE MAINTENANCE - and on this board it is REAL, not a stub.
+;
+;  The memory family flushes a range before running code that was just
+;  written into it, so the instruction fetch sees the new bytes rather
+;  than whatever the instruction cache had. On a board with the caches
+;  off that can be nothing; this monitor turns them ON during boot, so it
+;  has to be the real maintenance or `run` would branch into stale lines.
+;
+;  CLEAN TO THE POINT OF UNIFICATION, THEN INVALIDATE THE INSTRUCTION
+;  LINE, which is the ARM-documented pair for exactly this: `dc cvau`
+;  pushes the data the processor wrote out to where an instruction fetch
+;  will see it, and `ic ivau` throws away any instruction line that was
+;  already holding the old bytes. One without the other is the failure
+;  that produces no message at all.
+;
+;  SIXTY-FOUR BYTES IS THE A53's CACHE LINE, the same as the A72's, so
+;  the other board's step carries over unchanged.
+;
+;  THE ADDRESS GOES THROUGH A GLOBAL because an ASM block cannot take a
+;  local as an operand here. Its own procedure, so the loop around it
+;  stays readable.
+; ======================================================================
+Global gPi3FlushAddr.i
+
+Procedure Pi3CacheLine()
+  ASM
+    adrp x9, global_gpi3flushaddr
+    add  x9, x9, #:lo12:global_gpi3flushaddr
+    ldr  x9, [x9]
+    dc cvau, x9
+    ic ivau, x9
+  EndASM
+EndProcedure
+
+Procedure CacheFlushRange(lo.i, hi.i)
+  Define a.i
+  If hi < lo
+    ProcedureReturn
+  EndIf
+  a = (lo >> 6) << 6
+  While a <= hi
+    gPi3FlushAddr = a
+    Pi3CacheLine()
+    a = a + 64
+  Wend
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  AUTOBOOT - THIS BOARD HAS SOMETHING BETTER AND DOES NOT NEED IT.
+;
+;  On the Pi 4 an autoboot cell in preserved memory holds an entry point
+;  to run without being asked. This board's equivalent is the A/B slot
+;  machinery itself: the loader already chooses what runs, verifies it,
+;  gives it a trial and falls back if it does not confirm. An autoboot
+;  cell beside that would be a second, weaker answer to a question this
+;  board has already answered well.
+;
+;  So there is no armed entry and nothing to store, and Banner() reports
+;  none - which is true rather than merely unimplemented.
+; ======================================================================
+Procedure.i AutoEntry()
+  ProcedureReturn 0            ; 0 = no autoboot entry armed
+EndProcedure
+
+Procedure AutoSet(a.i)
+  ; Nothing to store. The command that calls this says so rather than
+  ; falling silent.
+EndProcedure
+
+; ======================================================================
+;  RunAt(a) - BRANCH INTO A PAYLOAD AND COME BACK.
+;
+;  This is `run` and `go`, and it is the one place this monitor hands the
+;  processor to code it did not compile. It is here rather than in a stub
+;  section because it is REAL: it is short because there is very little a
+;  board has to do, not because there is nothing.
+;
+;  THE ADDRESS IS NOT CHECKED HERE and that is not an omission. The
+;  command that got it has already been through the address guard and the
+;  monitor-window refusals, which is where an address is judged; a second
+;  opinion at the branch would either agree, and be noise, or disagree,
+;  and leave two answers to one question.
+;
+;  ZERO IS THE ONE VALUE REFUSED, because it is what every "no entry
+;  point" answer in this tree is spelled as - AutoEntry() above returns it
+;  - and branching to it would turn a missing payload into a fault at
+;  address nothing.
+;
+;  THE INSTRUCTION CACHE IS THE CALLER'S PROBLEM AND IT IS HANDLED. A
+;  payload that arrived over the serial line was WRITTEN as data with the
+;  caches on, so the instruction fetch at its entry point could see
+;  whatever was there before. Anvil/Core/memcmd.pbi calls
+;  CacheFlushRange() over the received range before it calls this, which
+;  is exactly why the real maintenance above is not a no-op on this
+;  board.
+;
+;  THE PAYLOAD IS ENTERED WITH THIS MONITOR RESIDENT. It returns here,
+;  and everything this board owns - the card, the console, the page
+;  tables - is still owned when it does.
+; ======================================================================
+Procedure RunAt(a.i)
+  Define dead.i
+  Define stop.i
+  If a = 0
+    ProcedureReturn
+  EndIf
+  dead = pi3_deadman_seconds
+  ; Consume before the branch, including an arm refusal, so a later
+  ; unrelated payload cannot inherit a stale safety setting.
+  pi3_deadman_seconds = 0
+  If dead > 0
+    ; Let the operator's announcement leave PL011 before the timer starts.
+    UartDrain()
+    If Pi3MonDeadmanStart(dead) = 0
+      ; Start rolls back a failed partial arm itself. Retry only a watchdog
+      ; still explicitly marked as ours; external owners are never stopped.
+      stop=Pi3MonDeadmanStop()
+      PrintN("!! payload refused: the hardware watchdog could not be armed")
+      PrintN("   without taking over another owner's active watchdog.")
+      If stop=0 And pi3_mon_deadman_owned<>0
+        PrintN("!! rollback was not verified; reset before attempting another payload.")
+      EndIf
+      ProcedureReturn
+    EndIf
+    Print("## hardware watchdog armed for ")
+    PrintDec(dead)
+    PrintN(" seconds; entering payload.")
+    UartDrain()
+  EndIf
+  Pi3EnterPayload(a)
+  If dead > 0
+    If Pi3MonDeadmanStop() = 0
+      PrintN("!! the payload returned, but its owned watchdog did not verify")
+      PrintN("   stopped. Reset before entering another payload.")
+    Else
+      PrintN("## returned; the owned hardware watchdog is stopped.")
+    EndIf
+  EndIf
+EndProcedure

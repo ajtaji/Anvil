@@ -1,0 +1,1141 @@
+; ======================================================================
+;  Emitted-code gate for the layout-independent touch keyboard.
+;
+;  Anvil/Core/touch_keyboard.pbi is compiled UNCHANGED and executed. The
+;  only things scripted are the view's hit test - which this file makes
+;  a straight identity, x IS the key index, so the gate is about the
+;  model and never about geometry - and the clock, which is injected as
+;  plain numbers because every timing rule in the keyboard is arithmetic
+;  on the value handed to TouchKeyboardTick.
+;
+;  Main returns the number of the first failing assertion, or 0.
+;  A return of 1000 + c means printable ASCII character c was never
+;  produced by any key on any page under any modifier state.
+; ======================================================================
+
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+
+; ----------------------------------------------------------------------
+;  The view lane, reduced to the one question the model asks it. The hit
+;  rectangles "tile" trivially: every x in range is a key and every x
+;  out of range is not this keyboard.
+; ----------------------------------------------------------------------
+; Non-zero makes the view answer with a key index that does not exist,
+; which is the only way to reach the model's refusal of a view that is
+; wrong. A real view cannot be asked to be wrong on purpose.
+Global gateForceHit.i = 0
+
+Procedure.i TouchKeyboardHitKey(x.i, y.i)
+  If gateForceHit <> 0
+    ProcedureReturn gateForceHit
+  EndIf
+  If x < 0
+    ProcedureReturn -1
+  EndIf
+  If x >= TouchKeyboardKeyCount()
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn x
+EndProcedure
+
+Global Dim gateEv.a[32]
+Global Dim gateSeen.i[160]
+Global gateBad.i = 0            ; TEXT codes outside 32..126, ever
+Global gateText.i = 0
+Global gateKeyDown.i = 0
+Global gateKeyUp.i = 0
+Global gateCancel.i = 0
+Global gateEvents.i = 0
+Global gateLastKind.i = 0
+Global gateLastCode.i = 0
+Global gateLastMods.i = 0
+Global gateFirstKind.i = 0
+Global gateFirstCode.i = 0
+Global gateFirstMods.i = 0
+Global gateShiftOnText.i = 0    ; a TEXT event that carried #AIM_SHIFT
+
+Procedure GateCounters()
+  gateText = 0
+  gateKeyDown = 0
+  gateKeyUp = 0
+  gateCancel = 0
+  gateEvents = 0
+  gateLastKind = 0
+  gateLastCode = 0
+  gateLastMods = 0
+  gateFirstKind = 0
+  gateFirstCode = 0
+  gateFirstMods = 0
+EndProcedure
+
+; Drain the model's ring into the gate's counters. This is the same loop
+; the integration will run, minus the push into the dispatcher. The
+; per-sweep counters are reset first, so every assertion below reads
+; "what came out since the last time I looked" rather than a running
+; total that quietly makes every later count wrong. gateSeen, gateBad
+; and gateShiftOnText are deliberately NOT reset: they are claims about
+; the whole run.
+Procedure GateSweep()
+  Define c.i
+  GateCounters()
+  While TouchKeyboardPop() <> 0
+    If gateEvents = 0
+      gateFirstKind = TouchKeyboardEventKind()
+      gateFirstCode = TouchKeyboardEventCode()
+      gateFirstMods = TouchKeyboardEventModifiers()
+    EndIf
+    gateEvents = gateEvents + 1
+    gateLastKind = TouchKeyboardEventKind()
+    gateLastCode = TouchKeyboardEventCode()
+    gateLastMods = TouchKeyboardEventModifiers()
+    Select TouchKeyboardEventKind()
+      Case #AIE_TEXT
+        gateText = gateText + 1
+        c = TouchKeyboardEventCode()
+        If c < 32 Or c > 126
+          gateBad = gateBad + 1
+        Else
+          gateSeen[c] = 1
+        EndIf
+        If (TouchKeyboardEventModifiers() & #AIM_SHIFT) <> 0
+          gateShiftOnText = gateShiftOnText + 1
+        EndIf
+      Case #AIE_KEY_DOWN
+        gateKeyDown = gateKeyDown + 1
+      Case #AIE_KEY_UP
+        gateKeyUp = gateKeyUp + 1
+      Case #AIE_CANCEL
+        gateCancel = gateCancel + 1
+    EndSelect
+  Wend
+EndProcedure
+
+Procedure.i GateRoute(id.i, key.i, st.i)
+  PokeL(@gateEv[0] + #TK_EV_X, key)
+  PokeL(@gateEv[0] + #TK_EV_Y, 0)
+  PokeL(@gateEv[0] + #TK_EV_ID, id)
+  PokeL(@gateEv[0] + #TK_EV_ST, st)
+  ProcedureReturn TouchKeyboardRouteTouch(@gateEv[0])
+EndProcedure
+
+Procedure GateTap(id.i, key.i)
+  GateRoute(id, key, #TK_TOUCH_DOWN)
+  GateRoute(id, key, #TK_TOUCH_UP)
+EndProcedure
+
+; Bring the keyboard up and leave it Visible with a clean slate. Writing
+; the model's own globals is a fixture liberty taken only for the page
+; selector and the modifier latches, so a scenario starts from a stated
+; state instead of from whatever the last one left.
+Procedure GateFresh(now.i)
+  TouchKeyboardCancelAll(#TK_CANCEL_CLIENT)
+  gTkPage = #TK_PAGE_ABC
+  gTkShift = #TK_SHIFT_OFF
+  gTkCtrl = #TK_CTRL_OFF
+  gTkShiftHeld = 0
+  gTkCtrlHeld = 0
+  gTkShiftChord = 0
+  gTkCtrlChord = 0
+  gTkShiftTapSeen = 0
+  gTkErr = #TK_ERR_NONE
+  gTkDropped = 0
+  TouchKeyboardShow(11, 22)
+  TouchKeyboardTick(now)
+  TouchKeyboardTick(now + #TK_SLIDE_MS)
+  While TouchKeyboardPop() <> 0
+  Wend
+  GateCounters()
+EndProcedure
+
+; Find a key on the CURRENT page by what it is, so the assertions below
+; name characters and key codes rather than table positions that move
+; the first time a row is reordered.
+Procedure.i GateFindChar(ch.i)
+  Define i.i
+  Define f.i
+  For i = 0 To TouchKeyboardKeyCount() - 1
+    f = TkFlat(i)
+    If gTkKeyKind[f] = #TK_KIND_CHAR And gTkKeyBase[f] = ch
+      ProcedureReturn i
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i GateFindKey(code.i)
+  Define i.i
+  Define f.i
+  For i = 0 To TouchKeyboardKeyCount() - 1
+    f = TkFlat(i)
+    If gTkKeyKind[f] = #TK_KIND_KEY And gTkKeyBase[f] = code
+      ProcedureReturn i
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i GateFindKind(kind.i)
+  Define i.i
+  For i = 0 To TouchKeyboardKeyCount() - 1
+    If TouchKeyboardKeyKind(i) = kind
+      ProcedureReturn i
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+
+; ======================================================================
+Procedure.i Main()
+  Define i.i
+  Define k.i
+  Define m.i
+  Define p.i
+  Define kind.i
+  Define ka.i
+  Define ks.i
+  Define n.i
+
+  ; ---------------- 1..9  the shared contract's numbers ----------------
+  If #AIE_TEXT <> 1 Or #AIE_KEY_DOWN <> 2 Or #AIE_KEY_UP <> 3 Or #AIE_CANCEL <> 4
+    ProcedureReturn 1
+  EndIf
+  If #AIK_ENTER <> 1 Or #AIK_BACKSPACE <> 2 Or #AIK_DELETE <> 3 Or #AIK_LEFT <> 4
+    ProcedureReturn 2
+  EndIf
+  If #AIK_RIGHT <> 5 Or #AIK_HOME <> 6 Or #AIK_END <> 7 Or #AIK_TAB <> 8
+    ProcedureReturn 3
+  EndIf
+  If #AIK_ESC <> 9 Or #AIK_CANCEL_COMMAND <> 10
+    ProcedureReturn 4
+  EndIf
+  If #AIS_PHYSICAL <> 1 Or #AIS_NETWORK <> 2 Or #AIS_TOUCH_KEYBOARD <> 3
+    ProcedureReturn 5
+  EndIf
+  If #AIM_SHIFT <> 1 Or #AIM_CTRL <> 2
+    ProcedureReturn 6
+  EndIf
+  If #TK_REPEAT_DELAY_MS <> 450 Or #TK_REPEAT_INTERVAL_MS <> 50 Or #TK_CAPS_DOUBLE_MS <> 350
+    ProcedureReturn 7
+  EndIf
+  If #TK_MAX_CONTACTS <> 10 Or #TK_QUEUE_MAX <> 64
+    ProcedureReturn 8
+  EndIf
+
+  TouchKeyboardInit()
+
+  ; ---------------- 10..19  the tables ----------------
+  If TouchKeyboardErr() <> #TK_ERR_NONE
+    ProcedureReturn 10
+  EndIf
+  gTkPage = #TK_PAGE_ABC
+  If TouchKeyboardKeyCount() <> 53
+    ProcedureReturn 11
+  EndIf
+  If TouchKeyboardRowCount() <> 6
+    ProcedureReturn 12
+  EndIf
+  gTkPage = #TK_PAGE_SYM
+  If TouchKeyboardKeyCount() <> 44
+    ProcedureReturn 13
+  EndIf
+  If TouchKeyboardRowCount() <> 5
+    ProcedureReturn 14
+  EndIf
+  If gTkKeyCount <> 97
+    ProcedureReturn 15
+  EndIf
+  gTkPage = #TK_PAGE_ABC
+  ; The utility row is the same nine keys in the same order on both
+  ; pages; a row that moves between pages puts Backspace somewhere else
+  ; every time the user switches.
+  For p = 0 To #TK_PAGES - 1
+    gTkPage = p
+    If TouchKeyboardKeyKind(0) <> #TK_KIND_KEY Or TouchKeyboardKeyRow(0) <> 0
+      ProcedureReturn 16
+    EndIf
+    If PeekA(TouchKeyboardKeyLabel(0)) <> 69       ; 'E' of Esc
+      ProcedureReturn 17
+    EndIf
+    If TouchKeyboardKeyKind(2) <> #TK_KIND_CTRL
+      ProcedureReturn 18
+    EndIf
+    If TouchKeyboardKeyKind(8) <> #TK_KIND_HIDE Or TouchKeyboardKeyWidthUnits(8) <> 2
+      ProcedureReturn 19
+    EndIf
+    If TouchKeyboardKeyColumn(8) <> 8
+      ProcedureReturn 20
+    EndIf
+  Next
+  gTkPage = #TK_PAGE_ABC
+  ; An index outside the current page is refused, not silently taken
+  ; from the other page's table.
+  If TouchKeyboardKeyRow(53) <> -1 Or TouchKeyboardKeyRow(-1) <> -1
+    ProcedureReturn 21
+  EndIf
+
+  ; ---------------- 22..29  visibility and the toggle race ------------
+  ; Show and Hide write intent only. The tick is the single writer of
+  ; the state, so a burst of taps between two ticks collapses to the
+  ; last one instead of playing out as a queue of transitions.
+  gTkState = #TK_STATE_HIDDEN
+  gTkDesired = #TK_STATE_HIDDEN
+  TouchKeyboardShow(5, 6)
+  If TouchKeyboardState() <> #TK_STATE_HIDDEN
+    ProcedureReturn 22
+  EndIf
+  If TouchKeyboardDesiredState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 23
+  EndIf
+  If TouchKeyboardClient() <> 5 Or TouchKeyboardSurface() <> 6
+    ProcedureReturn 24
+  EndIf
+  TouchKeyboardTick(1000)
+  If TouchKeyboardState() <> #TK_STATE_OPENING
+    ProcedureReturn 25
+  EndIf
+  ; A DOWN while merely Opening is not ours: the keyboard is not on the
+  ; glass yet and a tap that lands there belongs to what is underneath.
+  If GateRoute(1, 3, #TK_TOUCH_DOWN) <> 0
+    ProcedureReturn 26
+  EndIf
+  TouchKeyboardTick(1000 + #TK_SLIDE_MS)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE Or TouchKeyboardSlidePermille() <> 1000
+    ProcedureReturn 27
+  EndIf
+  ; Hide, Show, Hide, Show inside one frame: the last one wins and the
+  ; machine never leaves Visible.
+  TouchKeyboardHide()
+  TouchKeyboardShow(5, 6)
+  TouchKeyboardHide()
+  TouchKeyboardShow(5, 6)
+  TouchKeyboardTick(1000 + #TK_SLIDE_MS + 1)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 28
+  EndIf
+  ; A hide part way through an open reverses from where it is rather
+  ; than snapping shut or finishing the open first.
+  TouchKeyboardHide()
+  TouchKeyboardTick(1500)
+  If TouchKeyboardState() <> #TK_STATE_CLOSING
+    ProcedureReturn 29
+  EndIf
+  TouchKeyboardShow(5, 6)
+  TouchKeyboardTick(1500 + 40)
+  If TouchKeyboardState() <> #TK_STATE_OPENING
+    ProcedureReturn 30
+  EndIf
+  If TouchKeyboardSlidePermille() < 500
+    ProcedureReturn 31
+  EndIf
+  TouchKeyboardHide()
+  TouchKeyboardTick(1600)
+  TouchKeyboardTick(1600 + #TK_SLIDE_MS)
+  If TouchKeyboardState() <> #TK_STATE_HIDDEN Or TouchKeyboardSlidePermille() <> 0
+    ProcedureReturn 32
+  EndIf
+  ; Hiding a keyboard nobody is touching sends the editor nothing at
+  ; all. Opening and closing never clears the command.
+  GateCounters()
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 33
+  EndIf
+
+  ; ---------------- 40..49  ASCII coverage over every page ------------
+  ; Every key, on every page, under no modifier, one-shot Shift, Caps
+  ; Lock and a physically held Shift. Page and hide keys are excluded
+  ; because their whole job is to change which table is being walked;
+  ; assertions 60..69 prove they emit nothing.
+  GateFresh(2000)
+  For p = 0 To #TK_PAGES - 1
+    For m = 0 To 3
+      For k = 0 To 200
+        gTkPage = p
+        If k >= TouchKeyboardKeyCount()
+          Break
+        EndIf
+        kind = TouchKeyboardKeyKind(k)
+        If kind <> #TK_KIND_PAGE And kind <> #TK_KIND_HIDE
+          gTkShift = #TK_SHIFT_OFF
+          gTkCtrl = #TK_CTRL_OFF
+          gTkShiftHeld = 0
+          gTkCtrlHeld = 0
+          gTkShiftChord = 0
+          gTkCtrlChord = 0
+          Select m
+            Case 1
+              gTkShift = #TK_SHIFT_ONESHOT
+            Case 2
+              gTkShift = #TK_SHIFT_CAPS
+            Case 3
+              gTkShiftHeld = 1
+          EndSelect
+          GateTap(1, k)
+          GateSweep()
+        EndIf
+      Next
+    Next
+  Next
+  If gateBad <> 0
+    ProcedureReturn 40
+  EndIf
+  For i = 32 To 126
+    If gateSeen[i] = 0
+      ProcedureReturn 1000 + i
+    EndIf
+  Next
+  ; Nothing below 32 or above 126 can have been recorded, and nothing
+  ; outside that window may be seen for the rest of this gate either.
+  For i = 0 To 31
+    If gateSeen[i] <> 0
+      ProcedureReturn 41
+    EndIf
+  Next
+  For i = 127 To 159
+    If gateSeen[i] <> 0
+      ProcedureReturn 42
+    EndIf
+  Next
+  ; A TEXT event never reports Shift: the shift is already inside the
+  ; character, and reporting it as well invites a second application.
+  If gateShiftOnText <> 0
+    ProcedureReturn 43
+  EndIf
+
+  ; ---------------- 50..59  pages ----------------
+  GateFresh(3000)
+  k = GateFindKind(#TK_KIND_PAGE)
+  If k < 0
+    ProcedureReturn 50
+  EndIf
+  GateTap(1, k)
+  GateSweep()
+  If TouchKeyboardPage() <> #TK_PAGE_SYM
+    ProcedureReturn 51
+  EndIf
+  If gateEvents <> 0
+    ProcedureReturn 52
+  EndIf
+  If TouchKeyboardKeyCount() <> 44
+    ProcedureReturn 53
+  EndIf
+  k = GateFindKind(#TK_KIND_PAGE)
+  GateTap(1, k)
+  GateSweep()
+  If TouchKeyboardPage() <> #TK_PAGE_ABC Or gateEvents <> 0
+    ProcedureReturn 54
+  EndIf
+  ; A page switch under another finger disarms that finger: its index
+  ; belonged to the page it was taken from.
+  ka = GateFindChar(97)
+  If ka < 0
+    ProcedureReturn 55
+  EndIf
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  k = GateFindKind(#TK_KIND_PAGE)
+  GateTap(2, k)
+  GateRoute(1, ka, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 56
+  EndIf
+
+  ; ---------------- 60..69  the hide key ----------------
+  GateFresh(4000)
+  k = GateFindKind(#TK_KIND_HIDE)
+  If k < 0
+    ProcedureReturn 60
+  EndIf
+  GateTap(1, k)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 61
+  EndIf
+  If TouchKeyboardDesiredState() <> #TK_STATE_HIDDEN
+    ProcedureReturn 62
+  EndIf
+  TouchKeyboardTick(4200)
+  If TouchKeyboardState() <> #TK_STATE_CLOSING
+    ProcedureReturn 63
+  EndIf
+
+  ; ---------------- 70..99  modifiers ----------------
+  GateFresh(5000)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  ka = GateFindChar(97)
+  If ks < 0 Or ka < 0
+    ProcedureReturn 70
+  EndIf
+  GateTap(1, ks)
+  If TouchKeyboardShiftState() <> #TK_SHIFT_ONESHOT
+    ProcedureReturn 71
+  EndIf
+  If TouchKeyboardKeyIsLatched(ks) <> 1
+    ProcedureReturn 72
+  EndIf
+  ; The label a key draws follows the latch, so a one-shot Shift is
+  ; visible on every key rather than only on Shift itself.
+  If PeekA(TouchKeyboardKeyLabel(ka)) <> 65
+    ProcedureReturn 73
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastKind <> #AIE_TEXT Or gateLastCode <> 65
+    ProcedureReturn 74
+  EndIf
+  If TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 75
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateLastCode <> 97
+    ProcedureReturn 76
+  EndIf
+  ; Two taps 100 ms apart latch Caps Lock.
+  TouchKeyboardTick(5200)
+  GateTap(1, ks)
+  TouchKeyboardTick(5300)
+  GateTap(1, ks)
+  If TouchKeyboardShiftState() <> #TK_SHIFT_CAPS
+    ProcedureReturn 77
+  EndIf
+  If TouchKeyboardKeyIsLatched(ks) <> 2
+    ProcedureReturn 78
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateLastCode <> 65
+    ProcedureReturn 79
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateLastCode <> 65 Or TouchKeyboardShiftState() <> #TK_SHIFT_CAPS
+    ProcedureReturn 80
+  EndIf
+  ; Caps Lock is letters only: a digit is still a digit.
+  k = GateFindChar(49)
+  GateTap(1, k)
+  GateSweep()
+  If gateLastCode <> 49
+    ProcedureReturn 81
+  EndIf
+  ; Caps Lock and Shift together give the lower case letter back, which
+  ; is what the same two keys do on a desk.
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  GateTap(2, ka)
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  GateSweep()
+  If gateLastCode <> 97
+    ProcedureReturn 82
+  EndIf
+  ; Tapping a latched Shift clears it.
+  gTkShift = #TK_SHIFT_CAPS
+  gTkShiftTapSeen = 0
+  GateTap(1, ks)
+  If TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 83
+  EndIf
+  ; Two taps further apart than 350 ms are two taps, not a latch.
+  GateFresh(6000)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  ka = GateFindChar(97)
+  TouchKeyboardTick(6000)
+  GateTap(1, ks)
+  TouchKeyboardTick(6400)
+  GateTap(1, ks)
+  If TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 84
+  EndIf
+
+  ; The chord snapshot: Shift is taken at ARM time, so lifting it before
+  ; the letter cannot change the letter.
+  GateFresh(7000)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  ka = GateFindChar(97)
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  If TouchKeyboardShiftHeld() <> 1 Or TouchKeyboardKeyIsLatched(ks) <> 3
+    ProcedureReturn 85
+  EndIf
+  GateRoute(2, ka, #TK_TOUCH_DOWN)
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  If TouchKeyboardShiftHeld() <> 0
+    ProcedureReturn 86
+  EndIf
+  GateRoute(2, ka, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastCode <> 65
+    ProcedureReturn 87
+  EndIf
+  ; A held Shift that modified a key is spent; it must not leave a
+  ; one-shot behind that capitalises the next letter too.
+  If TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 88
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateLastCode <> 97
+    ProcedureReturn 89
+  EndIf
+
+  ; Ctrl: one-shot, consumed by the next applicable key, reported in the
+  ; modifiers because it is not folded into any character.
+  GateFresh(8000)
+  k = GateFindKind(#TK_KIND_CTRL)
+  ka = GateFindChar(97)
+  If k < 0
+    ProcedureReturn 90
+  EndIf
+  GateTap(1, k)
+  If TouchKeyboardCtrlState() <> #TK_CTRL_ONESHOT Or TouchKeyboardKeyIsLatched(k) <> 1
+    ProcedureReturn 91
+  EndIf
+  GateTap(1, ka)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastKind <> #AIE_TEXT Or gateLastCode <> 97
+    ProcedureReturn 92
+  EndIf
+  If gateLastMods <> #AIM_CTRL
+    ProcedureReturn 93
+  EndIf
+  If TouchKeyboardCtrlState() <> #TK_CTRL_OFF
+    ProcedureReturn 94
+  EndIf
+  ; Ctrl+C is the cancel the monitor already understands, by name, not
+  ; the letter C with a bit set beside it.
+  ka = GateFindChar(99)
+  GateTap(1, k)
+  GateTap(1, ka)
+  GateSweep()
+  If gateEvents <> 2 Or gateFirstKind <> #AIE_KEY_DOWN
+    ProcedureReturn 95
+  EndIf
+  If gateFirstCode <> #AIK_CANCEL_COMMAND Or gateFirstMods <> #AIM_CTRL
+    ProcedureReturn 96
+  EndIf
+  If gateLastKind <> #AIE_KEY_UP Or gateLastCode <> #AIK_CANCEL_COMMAND
+    ProcedureReturn 97
+  EndIf
+  ; A named key under Shift DOES report Shift - there is no character
+  ; for the shift to have been folded into.
+  GateFresh(8500)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  k = GateFindKey(#AIK_LEFT)
+  If k < 0
+    ProcedureReturn 98
+  EndIf
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  GateTap(2, k)
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2 Or gateFirstKind <> #AIE_KEY_DOWN Or gateFirstCode <> #AIK_LEFT
+    ProcedureReturn 99
+  EndIf
+  If gateFirstMods <> #AIM_SHIFT
+    ProcedureReturn 100
+  EndIf
+
+  ; ---------------- 110..139  repeat, on an injected clock ------------
+  GateFresh(10000)
+  k = GateFindKey(#AIK_BACKSPACE)
+  If k < 0
+    ProcedureReturn 110
+  EndIf
+  TouchKeyboardTick(10000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  ; Nothing at all until the key is released or 450 ms have passed.
+  TouchKeyboardTick(10449)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 111
+  EndIf
+  TouchKeyboardTick(10450)
+  GateSweep()
+  If gateEvents <> 2 Or gateKeyDown <> 1 Or gateKeyUp <> 1
+    ProcedureReturn 112
+  EndIf
+  If gateFirstCode <> #AIK_BACKSPACE Or gateLastCode <> #AIK_BACKSPACE
+    ProcedureReturn 113
+  EndIf
+  ; 50 ms between repeats, and a tick inside that window produces none.
+  TouchKeyboardTick(10480)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 114
+  EndIf
+  TouchKeyboardTick(10500)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 115
+  EndIf
+  ; At most one repeat per contact per tick: a service loop that stalled
+  ; must not then delete a screenful in one pass.
+  TouchKeyboardTick(12000)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 116
+  EndIf
+  ; The release after repeating began commits nothing more.
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 117
+  EndIf
+  TouchKeyboardTick(12100)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 118
+  EndIf
+  ; A short press commits exactly once, on the release.
+  GateFresh(13000)
+  k = GateFindKey(#AIK_BACKSPACE)
+  TouchKeyboardTick(13000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(13400)
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2 Or gateKeyDown <> 1
+    ProcedureReturn 119
+  EndIf
+  ; Letters never repeat, however long they are held.
+  GateFresh(14000)
+  ka = GateFindChar(97)
+  TouchKeyboardTick(14000)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(16000)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 120
+  EndIf
+  GateRoute(1, ka, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastCode <> 97
+    ProcedureReturn 121
+  EndIf
+  ; Enter never repeats: a command submitted twice is not a typo, it is
+  ; a second command.
+  GateFresh(17000)
+  k = GateFindKey(#AIK_ENTER)
+  TouchKeyboardTick(17000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(19000)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 122
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2 Or gateFirstCode <> #AIK_ENTER
+    ProcedureReturn 123
+  EndIf
+  ; Nor Esc, nor a modifier, nor a page switch.
+  GateFresh(20000)
+  k = GateFindKey(#AIK_ESC)
+  TouchKeyboardTick(20000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(22000)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 124
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 125
+  EndIf
+  GateFresh(23000)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  TouchKeyboardTick(23000)
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(25000)
+  GateSweep()
+  If gateEvents <> 0 Or TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 126
+  EndIf
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  ; Delete, Left and Right repeat; Home and End do not.
+  GateFresh(26000)
+  k = GateFindKey(#AIK_DELETE)
+  TouchKeyboardTick(26000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(26450)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 127
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  GateFresh(27000)
+  k = GateFindKey(#AIK_RIGHT)
+  TouchKeyboardTick(27000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(27450)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 128
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  GateFresh(28000)
+  k = GateFindKey(#AIK_HOME)
+  TouchKeyboardTick(28000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(30000)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 129
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+
+  ; ---------------- 140..159  two fingers, one key --------------------
+  ; A key is a key. A second finger on the same face is not a second
+  ; press, which is why two thumbs cannot submit two commands.
+  GateFresh(31000)
+  k = GateFindKey(#AIK_ENTER)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  GateRoute(2, k, #TK_TOUCH_DOWN)
+  If TouchKeyboardContactCount() <> 2
+    ProcedureReturn 140
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2 Or gateFirstCode <> #AIK_ENTER
+    ProcedureReturn 141
+  EndIf
+  GateRoute(2, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 142
+  EndIf
+  ; The same, with the blocked finger lifting first.
+  GateFresh(32000)
+  k = GateFindKey(#AIK_ENTER)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  GateRoute(2, k, #TK_TOUCH_DOWN)
+  GateRoute(2, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 143
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 144
+  EndIf
+  ; Two different non-modifier keys commit in the order they are
+  ; released, one event each.
+  GateFresh(33000)
+  ka = GateFindChar(97)
+  ks = GateFindChar(115)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  GateRoute(2, ks, #TK_TOUCH_DOWN)
+  GateRoute(2, ks, #TK_TOUCH_UP)
+  GateRoute(1, ka, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 2 Or gateFirstCode <> 115 Or gateLastCode <> 97
+    ProcedureReturn 145
+  EndIf
+
+  ; ---------------- 160..179  sliding ---------------------------------
+  ; Leaving every key region disarms; the release then commits nothing.
+  GateFresh(34000)
+  ka = GateFindChar(97)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  If TouchKeyboardKeyIsArmed(ka) <> 1
+    ProcedureReturn 160
+  EndIf
+  GateRoute(1, -1, #TK_TOUCH_MOVE)
+  If TouchKeyboardKeyIsArmed(ka) <> 0
+    ProcedureReturn 161
+  EndIf
+  GateRoute(1, -1, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 162
+  EndIf
+  ; A contact that began off the keyboard is never ours, so sliding on
+  ; cannot manufacture a keypress - there is nothing recorded to slide.
+  GateFresh(35000)
+  ka = GateFindChar(97)
+  If GateRoute(1, -1, #TK_TOUCH_DOWN) <> 0
+    ProcedureReturn 163
+  EndIf
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 164
+  EndIf
+  If GateRoute(1, ka, #TK_TOUCH_MOVE) <> 0
+    ProcedureReturn 165
+  EndIf
+  If GateRoute(1, ka, #TK_TOUCH_UP) <> 0
+    ProcedureReturn 166
+  EndIf
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 167
+  EndIf
+  ; Moving to another key re-arms it, and the release commits THAT one.
+  GateFresh(36000)
+  ka = GateFindChar(97)
+  ks = GateFindChar(115)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  GateRoute(1, ks, #TK_TOUCH_MOVE)
+  If TouchKeyboardKeyIsArmed(ka) <> 0 Or TouchKeyboardKeyIsArmed(ks) <> 1
+    ProcedureReturn 168
+  EndIf
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastCode <> 115
+    ProcedureReturn 169
+  EndIf
+  ; Re-arming restarts the repeat clock rather than inheriting the time
+  ; the finger spent on the key it came from.
+  GateFresh(37000)
+  k = GateFindKey(#AIK_BACKSPACE)
+  ka = GateFindChar(97)
+  TouchKeyboardTick(37000)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(37400)
+  GateRoute(1, k, #TK_TOUCH_MOVE)
+  TouchKeyboardTick(37500)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 170
+  EndIf
+  TouchKeyboardTick(37850)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 171
+  EndIf
+  GateRoute(1, k, #TK_TOUCH_UP)
+  GateSweep()
+
+  ; ---------------- 180..199  cancellation ----------------------------
+  GateFresh(40000)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  k = GateFindKey(#AIK_BACKSPACE)
+  TouchKeyboardTick(40000)
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  GateRoute(2, k, #TK_TOUCH_DOWN)
+  TouchKeyboardTick(40500)
+  GateSweep()
+  If gateEvents <> 2
+    ProcedureReturn 180
+  EndIf
+  If GateRoute(3, 0, #TK_TOUCH_CANCEL) <> 1
+    ProcedureReturn 181
+  EndIf
+  GateSweep()
+  If gateCancel <> 1 Or gateLastCode <> #TK_CANCEL_TOUCH
+    ProcedureReturn 182
+  EndIf
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 183
+  EndIf
+  If TouchKeyboardShiftHeld() <> 0 Or TouchKeyboardShiftState() <> #TK_SHIFT_OFF
+    ProcedureReturn 184
+  EndIf
+  ; The repeat is gone with it: no stuck Backspace.
+  TouchKeyboardTick(41000)
+  TouchKeyboardTick(41500)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 185
+  EndIf
+  ; A focus generation change cancels everything and is carried on the
+  ; cancellation event, and the events emitted afterwards carry the new
+  ; generation.
+  GateFresh(42000)
+  k = GateFindKey(#AIK_BACKSPACE)
+  ka = GateFindChar(97)
+  TouchKeyboardTick(42000)
+  GateRoute(1, k, #TK_TOUCH_DOWN)
+  TouchKeyboardSetGeneration(9)
+  GateSweep()
+  If gateCancel <> 1 Or gateLastCode <> #TK_CANCEL_GENERATION
+    ProcedureReturn 186
+  EndIf
+  If TouchKeyboardGeneration() <> 9 Or TouchKeyboardContactCount() <> 0
+    ProcedureReturn 187
+  EndIf
+  TouchKeyboardTick(43000)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 188
+  EndIf
+  GateTap(1, ka)
+  If TouchKeyboardPop() = 0
+    ProcedureReturn 189
+  EndIf
+  If TouchKeyboardEventGeneration() <> 9
+    ProcedureReturn 190
+  EndIf
+  If TouchKeyboardEventSource() <> #AIS_TOUCH_KEYBOARD
+    ProcedureReturn 191
+  EndIf
+  If TouchKeyboardEventTimestamp() <> 43000
+    ProcedureReturn 192
+  EndIf
+  GateSweep()
+  ; Starting to close cancels the fingers that were down, and says so.
+  GateFresh(44000)
+  ka = GateFindChar(97)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  TouchKeyboardHide()
+  TouchKeyboardTick(44100)
+  GateSweep()
+  If gateCancel <> 1 Or gateLastCode <> #TK_CANCEL_HIDDEN
+    ProcedureReturn 193
+  EndIf
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 194
+  EndIf
+  ; The release of that cancelled contact commits nothing.
+  GateRoute(1, ka, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 195
+  EndIf
+
+  ; ---------------- 200..219  the eleventh contact --------------------
+  GateFresh(50000)
+  ka = GateFindChar(97)
+  For i = 1 To 10
+    If GateRoute(i, ka + i - 1, #TK_TOUCH_DOWN) <> 1
+      ProcedureReturn 200
+    EndIf
+  Next
+  If TouchKeyboardContactCount() <> 10
+    ProcedureReturn 201
+  EndIf
+  If TouchKeyboardErr() <> #TK_ERR_NONE
+    ProcedureReturn 202
+  EndIf
+  GateRoute(11, ka, #TK_TOUCH_DOWN)
+  If TouchKeyboardErr() <> #TK_ERR_CONTACTS_FULL
+    ProcedureReturn 203
+  EndIf
+  GateSweep()
+  If gateCancel <> 1 Or gateLastCode <> #TK_CANCEL_CONTACTS
+    ProcedureReturn 204
+  EndIf
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 205
+  EndIf
+  If PeekA(TouchKeyboardErrText()) <> 84        ; 'T' of "Touch keyboard error 2"
+    ProcedureReturn 206
+  EndIf
+
+  ; ---------------- 220..239  the queue fills -------------------------
+  ; Every one of these taps is a committed keystroke. The ring holds 64
+  ; and reserves its last slot, so the 64th ordinary event is REFUSED,
+  ; loudly, and everything in flight is cancelled - a key-UP is never
+  ; dropped in silence.
+  GateFresh(60000)
+  ka = GateFindChar(97)
+  ks = GateFindKind(#TK_KIND_SHIFT)
+  GateRoute(2, ks, #TK_TOUCH_DOWN)
+  For i = 1 To 70
+    GateTap(1, ka)
+  Next
+  If TouchKeyboardErr() <> #TK_ERR_QUEUE_FULL
+    ProcedureReturn 220
+  EndIf
+  If TouchKeyboardDropped() < 1
+    ProcedureReturn 221
+  EndIf
+  If TouchKeyboardQueued() <> #TK_QUEUE_MAX
+    ProcedureReturn 222
+  EndIf
+  If TouchKeyboardContactCount() <> 0 Or TouchKeyboardShiftHeld() <> 0
+    ProcedureReturn 223
+  EndIf
+  ; The reserved slot holds the cancellation, so it is the last thing
+  ; the consumer reads and nothing it already accepted was lost.
+  n = 0
+  m = 0
+  While TouchKeyboardPop() <> 0
+    n = n + 1
+    If TouchKeyboardEventKind() = #AIE_CANCEL
+      m = n
+      If TouchKeyboardEventCode() <> #TK_CANCEL_OVERFLOW
+        ProcedureReturn 225
+      EndIf
+    EndIf
+  Wend
+  If n <> #TK_QUEUE_MAX
+    ProcedureReturn 226
+  EndIf
+  If m <> #TK_QUEUE_MAX
+    ProcedureReturn 224
+  EndIf
+  If PeekA(TouchKeyboardErrText()) <> 84        ; 'T' of "Touch keyboard error 1"
+    ProcedureReturn 227
+  EndIf
+  TouchKeyboardClearErr()
+  If TouchKeyboardErr() <> #TK_ERR_NONE
+    ProcedureReturn 228
+  EndIf
+
+  ; ---------------- 240..249  a lost UP -------------------------------
+  ; A DOWN for a contact that is already down means the stream dropped
+  ; its release. Reconcile against what is true now; do not commit a key
+  ; whose release was never seen.
+  GateFresh(70000)
+  ka = GateFindChar(97)
+  ks = GateFindChar(115)
+  GateRoute(1, ka, #TK_TOUCH_DOWN)
+  GateRoute(1, ks, #TK_TOUCH_DOWN)
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 240
+  EndIf
+  If TouchKeyboardContactCount() <> 1
+    ProcedureReturn 241
+  EndIf
+  GateRoute(1, ks, #TK_TOUCH_UP)
+  GateSweep()
+  If gateEvents <> 1 Or gateLastCode <> 115
+    ProcedureReturn 242
+  EndIf
+  ; An UP or a MOVE for a contact nobody started is not ours.
+  If GateRoute(77, ka, #TK_TOUCH_UP) <> 0
+    ProcedureReturn 243
+  EndIf
+  If GateRoute(77, ka, #TK_TOUCH_MOVE) <> 0
+    ProcedureReturn 244
+  EndIf
+  GateSweep()
+  If gateEvents <> 0
+    ProcedureReturn 245
+  EndIf
+
+  ; ---------------- 250..259  the view answering nonsense -------------
+  GateFresh(80000)
+  gTkPage = #TK_PAGE_ABC
+  gateForceHit = 500
+  If GateRoute(1, 0, #TK_TOUCH_DOWN) <> 1
+    ProcedureReturn 250
+  EndIf
+  gateForceHit = 0
+  If TouchKeyboardErr() <> #TK_ERR_BAD_KEY
+    ProcedureReturn 251
+  EndIf
+  If TouchKeyboardContactCount() <> 0
+    ProcedureReturn 252
+  EndIf
+  If PeekA(TouchKeyboardErrText()) <> 84        ; 'T' of "Touch keyboard error 3"
+    ProcedureReturn 253
+  EndIf
+  TouchKeyboardClearErr()
+
+  ; ---------------- 260  nothing unprintable, all gate long -----------
+  If gateBad <> 0
+    ProcedureReturn 260
+  EndIf
+  If gateShiftOnText <> 0
+    ProcedureReturn 261
+  EndIf
+
+  ProcedureReturn 0
+EndProcedure

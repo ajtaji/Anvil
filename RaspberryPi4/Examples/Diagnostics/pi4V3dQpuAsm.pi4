@@ -1,0 +1,1086 @@
+; pi4V3dQpuAsm.pi4 - the QPU assembler's corpus, printed.
+;
+; DIAGNOSTIC. Does not ship. TOUCHES NO HARDWARE AT ALL except the
+; UART it prints on - no V3D, no mailbox, no timer, no MMU.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM IS FOR
+; ======================================================================
+;
+;  It assembles a fixed list of QPU instructions with
+;  RaspberryPi4/Lib/v3dqpu.pi4 and prints each one as two 32-bit
+;  halves. It checks nothing itself and it has no verdict.
+;
+;  THE VERDICT COMES FROM SOMEWHERE ELSE, AND THAT IS THE POINT.
+;  tools/a64/a64_v3d_qpu_check.py runs this image in the A64 emulator,
+;  reads these lines, assembles THE SAME LIST with py-videocore6 -
+;  a complete independent implementation of this instruction set,
+;  written by a third party from the same hardware - and compares all
+;  sixty-four bits of every instruction.
+;
+;  Every other gate in this project compares a model this project
+;  wrote against a document this project read. This one compares two
+;  transcriptions that share no author, no language and no reasoning.
+;
+;  IT ALSO RUNS ON THE BOARD, and there is a small reason to. The A64
+;  code generator is the thing under test everywhere else in this
+;  tree; running the same corpus on silicon says the shifts and masks
+;  the emulator interpreted are the shifts and masks the part
+;  executes. It costs one image and thirty seconds.
+;
+; ======================================================================
+;  THE LINE FORMAT, AND WHY IT IS THIS UGLY
+; ======================================================================
+;
+;    I <index> <hi8> <lo8> <name>
+;    R <index> <code> <name>
+;
+;  `I` is an instruction that packed; `R` is one the library REFUSED,
+;  with the refusal code. The index is decimal and increments over
+;  both kinds, so the gate can insist the two lists are the same
+;  length and in the same order - a corpus that has silently drifted
+;  apart at entry forty is worse than no corpus, because it will
+;  still agree about the first thirty-nine.
+;
+;  THE NAME IS THE KEY AND IT IS CHECKED. The gate holds the same
+;  names beside its py-videocore6 expressions and refuses if any name
+;  is missing, extra or out of order. A gate whose needle matched a
+;  label rather than the value beside it is a defect this project has
+;  already had once (see a64_v3d_check.py's mutation notes), so the
+;  gate parses the HEX and the NAME and demands both.
+;
+;  No columns, no padding, one space between fields. This is machine
+;  output and a human reading it wants to diff it.
+;
+; ======================================================================
+;  WHAT THE CORPUS COVERS
+; ======================================================================
+;
+;  Section 1  the zero-source ADD operations, where BOTH mux fields
+;             carry the operation's identity rather than an operand.
+;             These are the ones a leftover register value silently
+;             turns into a different instruction, so they are first.
+;  Section 2  the one-source ADD operations, including the four
+;             float-to-integer conversions and the six whose output
+;             pack lives in the mux_b field.
+;  Section 3  the two-source ADD operations, and the four
+;             commutative float operations TWICE EACH with their
+;             operands both ways round - which is the only thing that
+;             tells FADD from FADDNF and FMIN from FMAX.
+;  Section 4  the MUL half, every operation, reached by dual-issuing
+;             against a NOP.
+;  Section 5  dual issue and the register file: two register reads in
+;             one instruction, which is the hardware's limit.
+;  Section 6  small immediates from all three groups of the
+;             forty-eight, including two of the sixteen that are
+;             FLOAT BIT PATTERNS rather than integers.
+;  Section 7  the signal field, twenty-one of its twenty-seven legal
+;             values, including the six that put a WRITE ADDRESS in
+;             the condition field instead of a condition.
+;  Section 8  the condition field in nine of its eleven shapes.
+;  Section 9  the branch form: all seven conditions, all four
+;             destinations, the uniform-address extension, the
+;             offset split, and the ONE BIT THE TWO IMPLEMENTATIONS
+;             DISAGREE ABOUT.
+;  Section 10 refusals. Twelve things the library must say no to.
+;  Section 11 a real program built through the buffer and the hazard
+;             checker, then dumped - which is the only section that
+;             exercises V3dQpuEmit(), the memory writes and the
+;             p37 restrictions.
+;
+;  SIX OPERATIONS THIS LIBRARY ENCODES ARE NOT IN THE CORPUS BECAUSE
+;  THE ORACLE CANNOT CHECK THEM. py-videocore6's operation table
+;  (assembler.py:740-809) has no fxcd, xcd, fycd, ycd, flafirst or
+;  flnafirst, and no vadd or vsub. Putting them in the corpus would
+;  mean the gate comparing this library against itself for those
+;  eight lines, which is the exact thing this corpus exists to avoid.
+;  They are transcribed in v3dqpu.pi4 with their table lines cited and
+;  they are UNWITNESSED. Said here, and said again in the gate's
+;  output, because an unwitnessed line inside a witnessed file is the
+;  easiest kind of claim to over-read.
+;
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; Where the section-11 program is built. Well clear of the image,
+; which is linked at $400000, and of the stack top at $3000000.
+#QPU_PROG_ADDR  = $700000
+#QPU_PROG_BYTES = 4096
+
+; The magic write addresses this file names, spelled out here rather
+; than reached for from the library's constants so that a reader can
+; see what a line does without a second file open.
+#MW_R0    = 0
+#MW_R1    = 1
+#MW_R2    = 2
+#MW_R3    = 3
+#MW_R4    = 4
+#MW_NULL  = 6
+#MW_TMUD  = 11
+#MW_TMUA  = 12
+#MW_SYNCB = 18
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA and not PeekB. PeekB names the SIGNED .b and sign-extends,
+    ; so a byte above 127 would come back negative and this loop would
+    ; run off the end.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; ======================================================================
+;  THE EMITTERS THE CORPUS IS WRITTEN WITH
+; ======================================================================
+;
+;  EVERY ONE OF THEM CALLS V3dQpuPack() AND NOT V3dQpuEmit().
+;
+;  That is deliberate and it is worth a paragraph. V3dQpuEmit() runs
+;  the hazard checker, and the corpus IS NOT A PROGRAM - it is a
+;  hundred and thirty unrelated instructions in a row, several of
+;  which are thread switches three apart and branches next to
+;  branches. Run through the hazard checker the corpus would be
+;  refused at about entry ninety, and the refusal would be correct.
+;
+;  So the corpus tests the ENCODER and section 11 tests the EMITTER.
+;  Conflating them would have meant either a corpus bent into a shape
+;  the hazard rules allow - which is a corpus chosen by the checker
+;  rather than by the encoding - or a hazard checker that had to be
+;  turned off, which is a switch nobody should be able to reach.
+
+Global idx.i = 0
+
+Procedure Show(*name)
+  Define r.i
+  r = V3dQpuPack()
+  If r <> #V3DQ_OK
+    PutS("R ")
+    PutDec(idx)
+    PutS(" ")
+    PutDec(r)
+  Else
+    PutS("I ")
+    PutDec(idx)
+    PutS(" ")
+    PutHex(V3dQpuHi(), 8)
+    PutS(" ")
+    PutHex(V3dQpuLo(), 8)
+  EndIf
+  PutS(" ")
+  PutS(*name)
+  PutNl()
+  idx = idx + 1
+EndProcedure
+
+; A zero-source ADD. The muxes passed are junk on purpose: 7 and 7,
+; which is the WORST possible leftover because mux 7 is the
+; small-immediate slot. If the packer failed to substitute the fixed
+; values these would all encode as VFLNB or worse, and the gate would
+; see it immediately.
+Procedure ShowA0(*name, op.i, waddr.i, magic.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, 7, 7)
+  Show(*name)
+EndProcedure
+
+Procedure ShowA1(*name, op.i, waddr.i, magic.i, muxA.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, 7)
+  Show(*name)
+EndProcedure
+
+Procedure ShowA2(*name, op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, muxB)
+  Show(*name)
+EndProcedure
+
+Procedure ShowM2(*name, op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  V3dQpuReset()
+  V3dQpuMul(op, waddr, magic, muxA, muxB)
+  Show(*name)
+EndProcedure
+
+Procedure ShowM1(*name, op.i, waddr.i, magic.i, muxA.i)
+  V3dQpuReset()
+  V3dQpuMul(op, waddr, magic, muxA, 7)
+  Show(*name)
+EndProcedure
+
+; A NOP carrying one signal, with the signal's destination.
+Procedure ShowSig(*name, sigMask.i, sigWaddr.i, sigMagic.i)
+  V3dQpuReset()
+  V3dQpuSig(sigMask)
+  V3dQpuSigAddr(sigWaddr, sigMagic)
+  Show(*name)
+EndProcedure
+
+; A two-source ADD carrying flags.
+Procedure ShowCond(*name, ac.i, mc.i, apf.i, mpf.i, auf.i, muf.i)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, 1, 2)
+  V3dQpuFlags(ac, mc, apf, mpf, auf, muf)
+  Show(*name)
+EndProcedure
+
+; A two-source ADD and a two-source MUL in one instruction, carrying
+; flags for both halves. The two-halves-both-conditional shapes are
+; the ones the packing table is most likely to get wrong.
+Procedure ShowCond2(*name, ac.i, mc.i, apf.i, mpf.i, auf.i, muf.i)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, 1, 2)
+  V3dQpuMul(#V3DQ_M_ADD, #MW_R3, 1, 0, 1)
+  V3dQpuFlags(ac, mc, apf, mpf, auf, muf)
+  Show(*name)
+EndProcedure
+
+Procedure ShowBranch(*name, cond.i, bdi.i, ub.i, bdu.i, setLink.i, offset.i, raddrA.i)
+  V3dQpuReset()
+  V3dQpuBranchSet(cond, #V3DQ_MSFIGN_NONE, bdi, ub, bdu, setLink, offset, raddrA)
+  Show(*name)
+EndProcedure
+
+; An ADD with BOTH register-file read addresses set and an explicit
+; magic bit. The VPM family needs this shape and the helpers above do
+; not offer it: it puts a non-zero value in every field the family
+; touches at once, which is what "a field is only pinned down by a
+; value whose bits are not all zero" asks for.
+Procedure ShowVpm(*name, op.i, waddr.i, magic.i, muxA.i, muxB.i, raddrA.i, raddrB.i)
+  V3dQpuReset()
+  V3dQpuAdd(op, waddr, magic, muxA, muxB)
+  V3dQpuRaddr(raddrA, raddrB)
+  Show(*name)
+EndProcedure
+
+; VFPACK with the two f32 input unpacks, which are the only thing that
+; moves it between opcodes 53-55, 57-59 and 61-63.
+Procedure ShowVfpackUnp(*name, waddr.i, magic.i, muxA.i, muxB.i, ua.i, ub.i)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VFPACK, waddr, magic, muxA, muxB)
+  V3dQpuAddPacking(#V3DQ_PACK_NONE, ua, ub)
+  Show(*name)
+EndProcedure
+
+; ======================================================================
+;  SECTION 11's PROGRAM
+; ======================================================================
+;
+;  IT IS pi4V3dCsd.pi4's SHADER, CHARACTER FOR CHARACTER, AND THE GATE
+;  ENFORCES THAT. a64_v3d_qpu_check.py extracts this procedure and the
+;  one in pi4V3dCsd.pi4, strips comments and whitespace, and requires
+;  them to be identical - because the whole value of this section is
+;  that the seventeen instructions the ORACLE checks here are the
+;  seventeen instructions the BOARD runs there. Two copies that drifted
+;  apart would leave the silicon running a program nothing had checked,
+;  while this section went on passing.
+;
+;  Copied rather than shared because the alternative is a shader
+;  builder in a library, and a shader for one diagnostic does not
+;  belong in a library that everything else will include. The check
+;  makes the copy safe; an unchecked copy would not be.
+;
+;    nop            sig = ldunifrf(rf0)   ; rf0 = the destination base
+;    nop            sig = ldunifrf(rf1)   ; rf1 = the pattern seed
+;    eidx  r0                             ; r0 = 0..15, the lane index
+;    shl   r1, r0, 2                      ; r1 = lane * 4
+;    add   r1, r1, rf0                    ; r1 = base + lane * 4
+;    bor   r2, r0, rf1                    ; r2 = seed | lane
+;    mov   tmud, r2                       ; the datum
+;    mov   tmua, r1                       ; the address - THIS FIRES IT
+;    tmuwt                                ; wait for it to land
+;    ... the eight-instruction thread end
+;
+;  WHY THE DATUM IS SEED-OR-LANE AND NOT A CONSTANT. A constant
+;  pattern proves the unit wrote; a per-lane value proves SIXTEEN
+;  LANES each wrote, in the right places. "Wrote the same word
+;  sixteen times" and "wrote sixteen different words" are
+;  distinguishable answers and the second is the one worth having.
+;
+;  Returns #V3DQ_OK or the first refusal.
+; ----------------------------------------------------------------------
+Procedure.i BuildShader()
+  Define r.i
+
+  r = V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; The two uniforms, in the order the stream holds them. Each is a
+  ; NOP carrying the LDUNIFRF signal, whose destination lives in the
+  ; condition field - which is why an instruction with one of these
+  ; may not also carry a condition.
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 0, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 1, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; eidx r0. Zero-source: BOTH mux fields carry the operation's
+  ; identity, so the values passed are ignored and substituted.
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, #MW_R0, 1)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; shl r1, r0, 2. The 2 is small immediate index 2, on mux 7.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, #MW_R1, 1, #V3DQ_MUX_R0, 0, 2)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; add r1, r1, rf0. Mux 6 is raddr_a, which holds 0 - rf0.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R1, 1, #V3DQ_MUX_R1, #V3DQ_MUX_A)
+  V3dQpuRaddr(0, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; bor r2, r0, rf1. The ADD half's OR; raddr_a is now 1 - rf1.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_OR, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_A)
+  V3dQpuRaddr(1, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; mov tmud, r2 - the data register. Nothing happens yet.
+  r = V3dQpuMov(#MW_TMUD, 1, #V3DQ_MUX_R2, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; mov tmua, r1 - WRITING THE ADDRESS REGISTER IS THE STORE.
+  r = V3dQpuMov(#MW_TMUA, 1, #V3DQ_MUX_R1, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; tmuwt. Without it the thread can end with the store in flight.
+  r = V3dQpuAdd0(#V3DQ_A_TMUWT, #MW_NULL, 1)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 2 - the QPU assembler's corpus ===")
+  PutNl()
+  PutS("format: I index hi lo name | R index code name")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. ZERO-SOURCE ADD. Both muxes are the opcode.
+  ; ------------------------------------------------------------------
+  ShowA0("nop",       #V3DQ_A_NOP,       #MW_NULL,  1)
+  ShowA0("tidx",      #V3DQ_A_TIDX,      #MW_R0,    1)
+  ShowA0("eidx",      #V3DQ_A_EIDX,      #MW_R1,    1)
+  ShowA0("lr",        #V3DQ_A_LR,        #MW_R0,    1)
+  ShowA0("vfla",      #V3DQ_A_VFLA,      #MW_R0,    1)
+  ShowA0("vflna",     #V3DQ_A_VFLNA,     #MW_R0,    1)
+  ShowA0("vflb",      #V3DQ_A_VFLB,      #MW_R0,    1)
+  ShowA0("vflnb",     #V3DQ_A_VFLNB,     #MW_R0,    1)
+  ShowA0("msf",       #V3DQ_A_MSF,       #MW_R0,    1)
+  ShowA0("revf",      #V3DQ_A_REVF,      #MW_R0,    1)
+  ShowA0("iid",       #V3DQ_A_IID,       #MW_R0,    1)
+  ShowA0("sampid",    #V3DQ_A_SAMPID,    #MW_R0,    1)
+  ShowA0("barrierid", #V3DQ_A_BARRIERID, #MW_SYNCB, 1)
+  ShowA0("tmuwt",     #V3DQ_A_TMUWT,     #MW_NULL,  1)
+  ShowA0("vpmwt",     #V3DQ_A_VPMWT,     #MW_R0,    1)
+
+  ; ------------------------------------------------------------------
+  ;  2. ONE-SOURCE ADD.
+  ; ------------------------------------------------------------------
+  ShowA1("bnot",    #V3DQ_A_NOT,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("neg",     #V3DQ_A_NEG,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("flapush", #V3DQ_A_FLAPUSH, #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("flbpush", #V3DQ_A_FLBPUSH, #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("flpop",   #V3DQ_A_FLPOP,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("setmsf",  #V3DQ_A_SETMSF,  #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("setrevf", #V3DQ_A_SETREVF, #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("itof",    #V3DQ_A_ITOF,    #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("clz",     #V3DQ_A_CLZ,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("utof",    #V3DQ_A_UTOF,    #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ftoin",   #V3DQ_A_FTOIN,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ftoiz",   #V3DQ_A_FTOIZ,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ftouz",   #V3DQ_A_FTOUZ,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ftoc",    #V3DQ_A_FTOC,    #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("fround",  #V3DQ_A_FROUND,  #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ftrunc",  #V3DQ_A_FTRUNC,  #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("ffloor",  #V3DQ_A_FFLOOR,  #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("fceil",   #V3DQ_A_FCEIL,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("fdx",     #V3DQ_A_FDX,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("fdy",     #V3DQ_A_FDY,     #MW_R0, 1, #V3DQ_MUX_R1)
+
+  ; The SFU operations. Note the destination: py-videocore6 spells
+  ; these as recip(dst, src) and builds an ALU whose ADD operation is
+  ; _op_recip, so the destination is an ordinary write address and
+  ; NOT the magic RECIP register. Both spellings exist on this part -
+  ; a write to magic waddr 19 also starts a reciprocal - and they
+  ; encode differently. This corpus checks the operation form.
+  ShowA1("recip",   #V3DQ_A_RECIP,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("rsqrt",   #V3DQ_A_RSQRT,   #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("exp",     #V3DQ_A_EXP,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("log",     #V3DQ_A_LOG,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("sin",     #V3DQ_A_SIN,     #MW_R0, 1, #V3DQ_MUX_R1)
+  ShowA1("rsqrt2",  #V3DQ_A_RSQRT2,  #MW_R0, 1, #V3DQ_MUX_R1)
+
+  ; ------------------------------------------------------------------
+  ;  3. TWO-SOURCE ADD.
+  ; ------------------------------------------------------------------
+  ShowA2("add",  #V3DQ_A_ADD,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("sub",  #V3DQ_A_SUB,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("imin", #V3DQ_A_MIN,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("imax", #V3DQ_A_MAX,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("umin", #V3DQ_A_UMIN, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("umax", #V3DQ_A_UMAX, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("shl",  #V3DQ_A_SHL,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("shr",  #V3DQ_A_SHR,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("asr",  #V3DQ_A_ASR,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("ror",  #V3DQ_A_ROR,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("band", #V3DQ_A_AND,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("bor",  #V3DQ_A_OR,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("bxor", #V3DQ_A_XOR,  #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+
+  ; THE FOUR COMMUTATIVE FLOAT OPERATIONS, EACH BOTH WAYS ROUND.
+  ; FADD and FADDNF share opcodes 0-47 and FMIN and FMAX share
+  ; 128-175; nothing but the operand order distinguishes them. If the
+  ; packer's swap is missing, "fadd r0 r1" and "fadd r1 r0" come out
+  ; identical and one of them is silently FADDNF - so these eight
+  ; lines are the sharpest in the corpus.
+  ShowA2("fadd01",   #V3DQ_A_FADD,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("fadd10",   #V3DQ_A_FADD,   #MW_R2, 1, #V3DQ_MUX_R1, #V3DQ_MUX_R0)
+  ShowA2("faddnf01", #V3DQ_A_FADDNF, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("faddnf10", #V3DQ_A_FADDNF, #MW_R2, 1, #V3DQ_MUX_R1, #V3DQ_MUX_R0)
+  ShowA2("fmin01",   #V3DQ_A_FMIN,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("fmin10",   #V3DQ_A_FMIN,   #MW_R2, 1, #V3DQ_MUX_R1, #V3DQ_MUX_R0)
+  ShowA2("fmax01",   #V3DQ_A_FMAX,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("fmax10",   #V3DQ_A_FMAX,   #MW_R2, 1, #V3DQ_MUX_R1, #V3DQ_MUX_R0)
+  ShowA2("fsub",     #V3DQ_A_FSUB,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowA2("fcmp",     #V3DQ_A_FCMP,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+
+  ; The float output packs and input unpacks, on FADD, which is the
+  ; one arm that carries all three in the opcode's low six bits.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_FADD, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuAddPacking(#V3DQ_PACK_L, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("fadd_packl")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_FADD, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuAddPacking(#V3DQ_PACK_H, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("fadd_packh")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_FADD, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuAddPacking(#V3DQ_PACK_NONE, #V3DQ_UNPACK_ABS, #V3DQ_UNPACK_NONE)
+  Show("fadd_absa")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_FADD, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuAddPacking(#V3DQ_PACK_NONE, #V3DQ_UNPACK_L, #V3DQ_UNPACK_H)
+  Show("fadd_unplh")
+
+  ; ------------------------------------------------------------------
+  ;  4. THE MUL HALF. The ADD half stays a NOP with the default
+  ;     destination, which is how py-videocore6 spells a
+  ;     mul-only instruction.
+  ; ------------------------------------------------------------------
+  ShowM2("mul_add",    #V3DQ_M_ADD,    #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM2("mul_sub",    #V3DQ_M_SUB,    #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM2("mul_umul24", #V3DQ_M_UMUL24, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM2("mul_smul24", #V3DQ_M_SMUL24, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM2("mul_multop", #V3DQ_M_MULTOP, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM2("mul_fmul",   #V3DQ_M_FMUL,   #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  ShowM1("mul_mov",    #V3DQ_M_MOV,    #MW_R2, 1, #V3DQ_MUX_R0)
+  ShowM1("mul_movtmud", #V3DQ_M_MOV,   #MW_TMUD, 1, #V3DQ_MUX_R0)
+  ShowM1("mul_fmov",   #V3DQ_M_FMOV,   #MW_R2, 1, #V3DQ_MUX_R0)
+
+  ; FMUL's packs, which are added rather than ORed into the opcode -
+  ; the one place in the encoding where that matters.
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuMulPacking(#V3DQ_PACK_L, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("mul_fmul_packl")
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuMulPacking(#V3DQ_PACK_NONE, #V3DQ_UNPACK_ABS, #V3DQ_UNPACK_L)
+  Show("mul_fmul_unp")
+  ; FMOV's pack, which is SPLIT between the opcode and the mux.
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMOV, #MW_R2, 1, #V3DQ_MUX_R0, 0)
+  V3dQpuMulPacking(#V3DQ_PACK_H, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("mul_fmov_packh")
+
+  ; ------------------------------------------------------------------
+  ;  5. DUAL ISSUE AND THE REGISTER FILE.
+  ; ------------------------------------------------------------------
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  V3dQpuMul(#V3DQ_M_FMUL, #MW_R3, 1, #V3DQ_MUX_R0, #V3DQ_MUX_R1)
+  Show("dual_add_fmul")
+
+  ; band rf3, r0, rf1. One register-file read, on raddr_a, reached by
+  ; mux 6; the destination is the register file too, so magic is 0.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_AND, 3, 0, #V3DQ_MUX_R0, #V3DQ_MUX_A)
+  V3dQpuRaddr(1, 0)
+  Show("band_rf3_r0_rf1")
+
+  ; add rf10, rf1, rf2. TWO register-file reads, which is the
+  ; hardware's limit: raddr_a on mux 6 and raddr_b on mux 7.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, 10, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(1, 2)
+  Show("add_rf10_rf1_rf2")
+
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_SHL, 5, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(5, 6)
+  Show("shl_rf5_rf5_rf6")
+
+  ; ------------------------------------------------------------------
+  ;  6. SMALL IMMEDIATES, all three groups.
+  ; ------------------------------------------------------------------
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(0)
+  Show("add_imm0")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(15)
+  Show("add_imm15")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(-1)
+  Show("add_immm1")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(-16)
+  Show("add_immm16")
+  ; 1.0f. THE VALUE PASSED IS THE BIT PATTERN, not the number: this
+  ; library has no float type and the table's last sixteen entries are
+  ; f32 encodings.
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm($3F800000)
+  Show("fmul_imm1f")
+  ; 2.0^-8, the bottom of the float group.
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm($3B800000)
+  Show("fmul_immtiny")
+  ; mov rf5, 1 - py-videocore6 spells a move of an immediate as
+  ; bor(dst, imm, imm), so BOTH muxes are 7 and the one immediate is
+  ; read twice.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_OR, 5, 0, #V3DQ_MUX_B, #V3DQ_MUX_B)
+  V3dQpuSmallImm(1)
+  Show("bor_rf5_imm1")
+
+  ; ------------------------------------------------------------------
+  ;  7. SIGNALS.
+  ; ------------------------------------------------------------------
+  ShowSig("sig_thrsw",     #V3DQ_SIG_THRSW,     0, 0)
+  ShowSig("sig_ldunif",    #V3DQ_SIG_LDUNIF,    0, 0)
+  ShowSig("sig_ldunifa",   #V3DQ_SIG_LDUNIFA,   0, 0)
+  ShowSig("sig_wrtmuc",    #V3DQ_SIG_WRTMUC,    0, 0)
+  ShowSig("sig_ucb",       #V3DQ_SIG_UCB,       0, 0)
+  ; The six that carry a WRITE ADDRESS in the condition field.
+  ShowSig("sig_ldunifrf0",  #V3DQ_SIG_LDUNIFRF,  0,  0)
+  ShowSig("sig_ldunifarf1", #V3DQ_SIG_LDUNIFARF, 1,  0)
+  ShowSig("sig_ldtmu_r4",   #V3DQ_SIG_LDTMU,     4,  1)
+  ShowSig("sig_ldvary_rf2", #V3DQ_SIG_LDVARY,    2,  0)
+  ShowSig("sig_ldtlb_rf3",  #V3DQ_SIG_LDTLB,     3,  0)
+  ShowSig("sig_ldtlbu_rf4", #V3DQ_SIG_LDTLBU,    4,  0)
+  ; Combinations.
+  ShowSig("sig_thrsw_ldunif",   #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIF,   0, 0)
+  ShowSig("sig_thrsw_ldunifrf", #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIFRF, 7, 0)
+  ShowSig("sig_thrsw_wrtmuc",   #V3DQ_SIG_THRSW | #V3DQ_SIG_WRTMUC,   0, 0)
+  ShowSig("sig_ldtmu_ldunif",   #V3DQ_SIG_LDTMU | #V3DQ_SIG_LDUNIF,   4, 1)
+  ShowSig("sig_thrsw_ldtmu",    #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU,    4, 1)
+  ShowSig("sig_ldvary_ldunif",  #V3DQ_SIG_LDVARY | #V3DQ_SIG_LDUNIF,  1, 0)
+  ShowSig("sig_thrsw_ldvary",   #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY,   1, 0)
+  ShowSig("sig_ldvary_wrtmuc",  #V3DQ_SIG_LDVARY | #V3DQ_SIG_WRTMUC,  2, 0)
+
+  ; A signal on a real instruction rather than a NOP.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_R2)
+  V3dQpuSig(#V3DQ_SIG_LDTMU)
+  V3dQpuSigAddr(4, 1)
+  Show("add_sig_ldtmu")
+
+  ; SMIMM plus LDVARY is signal 14, and SMIMM plus LDTMU is 31 - the
+  ; two rows of the table that pair the immediate with a load.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(15)
+  V3dQpuSig(v3dq_sig | #V3DQ_SIG_LDVARY)
+  V3dQpuSigAddr(1, 0)
+  Show("add_imm_ldvary")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R1, #V3DQ_MUX_B)
+  V3dQpuSmallImm(15)
+  V3dQpuSig(v3dq_sig | #V3DQ_SIG_LDTMU)
+  V3dQpuSigAddr(4, 1)
+  Show("add_imm_ldtmu")
+
+  ; ------------------------------------------------------------------
+  ;  8. CONDITIONS AND FLAG UPDATES.
+  ; ------------------------------------------------------------------
+  ShowCond("cond_apushz", #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_PUSHZ, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond("cond_apushn", #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_PUSHN, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond("cond_apushc", #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_PUSHC, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond("cond_ifa",    #V3DQ_COND_IFA,  #V3DQ_COND_NONE, #V3DQ_PF_NONE,  #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond("cond_ifnb",   #V3DQ_COND_IFNB, #V3DQ_COND_NONE, #V3DQ_PF_NONE,  #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond("cond_aandz",  #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_NONE,  #V3DQ_PF_NONE, #V3DQ_UF_ANDZ, #V3DQ_UF_NONE)
+  ShowCond("cond_anorc",  #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_NONE,  #V3DQ_PF_NONE, #V3DQ_UF_NORC, #V3DQ_UF_NONE)
+
+  ShowCond2("cond_mpushz", #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_NONE, #V3DQ_PF_PUSHZ, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond2("cond_mifb",   #V3DQ_COND_NONE, #V3DQ_COND_IFB,  #V3DQ_PF_NONE, #V3DQ_PF_NONE,  #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond2("cond_mandnz", #V3DQ_COND_NONE, #V3DQ_COND_NONE, #V3DQ_PF_NONE, #V3DQ_PF_NONE,  #V3DQ_UF_NONE, #V3DQ_UF_ANDNZ)
+  ShowCond2("cond_ac_mpf", #V3DQ_COND_IFA,  #V3DQ_COND_NONE, #V3DQ_PF_NONE, #V3DQ_PF_PUSHZ, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond2("cond_mc_apf", #V3DQ_COND_NONE, #V3DQ_COND_IFA,  #V3DQ_PF_PUSHZ, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond2("cond_mc_ac",  #V3DQ_COND_IFA,  #V3DQ_COND_IFB,  #V3DQ_PF_NONE, #V3DQ_PF_NONE,  #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  ShowCond2("cond_mc_auf", #V3DQ_COND_NONE, #V3DQ_COND_IFA,  #V3DQ_PF_NONE, #V3DQ_PF_NONE,  #V3DQ_UF_ANDZ, #V3DQ_UF_NONE)
+
+  ; ------------------------------------------------------------------
+  ;  9. BRANCHES.
+  ;
+  ;  BDU IS 1 IN ALL BUT ONE OF THESE, AND THAT IS NOT AN ODD CHOICE -
+  ;  it is py-videocore6's constructor default (assembler.py:1075),
+  ;  written unconditionally at :1121 whether or not UB is set. Mesa
+  ;  writes BDU only when UB is set (qpu_pack.c:2485-2489). The two
+  ;  DISAGREE about bits 17:15 of a branch with UB clear, and
+  ;  "br_bdu0" below is the line that makes them say so out loud.
+  ; ------------------------------------------------------------------
+  ShowBranch("br_always", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 0, 1, 0, 0, 0)
+  ShowBranch("br_a0",     #V3DQ_BR_A0,     #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_na0",    #V3DQ_BR_NA0,    #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_alla",   #V3DQ_BR_ALLA,   #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_anyna",  #V3DQ_BR_ANYNA,  #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_anya",   #V3DQ_BR_ANYA,   #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_allna",  #V3DQ_BR_ALLNA,  #V3DQ_BDEST_REL, 0, 1, 0, $100, 0)
+  ShowBranch("br_abs",    #V3DQ_BR_ALWAYS, #V3DQ_BDEST_ABS, 0, 1, 0, $1000, 0)
+  ShowBranch("br_link",   #V3DQ_BR_ALWAYS, #V3DQ_BDEST_LINK_REG, 0, 1, 0, 0, 0)
+  ShowBranch("br_reg7",   #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REGFILE,  0, 1, 0, 0, 7)
+  ShowBranch("br_setlink", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 0, 1, 1, $100, 0)
+  ShowBranch("br_unifrel", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 1, 1, 0, $100, 0)
+  ShowBranch("br_unifabs", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 1, 0, 0, $100, 0)
+  ShowBranch("br_unifreg", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 1, 3, 0, $100, 9)
+  ; The offset split. $0ABCDEF8 exercises both halves and the
+  ; three-bit hole at the bottom.
+  ShowBranch("br_bigoff", #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 0, 1, 0, $0ABCDEF8, 0)
+  ; THE DISAGREEMENT, on its own line.
+  ShowBranch("br_bdu0",   #V3DQ_BR_ALWAYS, #V3DQ_BDEST_REL, 0, 0, 0, $100, 0)
+
+  ; ------------------------------------------------------------------
+  ;  9b. THE VPM FAMILY AND VFPACK, added at stage 4 because a vertex
+  ;      shader cannot read an attribute or write a shaded vertex
+  ;      without them and a fragment shader cannot write f16 colour
+  ;      without VFPACK.
+  ;
+  ;      THE TWO HALVES OF THIS SECTION HAVE DIFFERENT EVIDENCE BEHIND
+  ;      THEM AND THE GATE PRINTS THEM SEPARATELY.
+  ;
+  ;        - VFPACK and STVPMV/D/P are in py-videocore6's operation
+  ;          table (assembler.py:744 and :804-806), so they are
+  ;          ORACLE-CHECKED like everything above.
+  ;        - THE SEVEN LDVPM OPERATIONS ARE NOT. py-videocore6 has no
+  ;          ldvpm at all; in its tables opcode 188 is only reachable
+  ;          as rsqrt/exp/log/sin/rsqrt2. Their expected words are
+  ;          assembled by the GATE from the Mesa tables it parses,
+  ;          which is a model against a model and is labelled as one.
+  ;
+  ;      THE STVPM ENTRIES ARE THE INTERESTING ONES. This file hands
+  ;      the library waddr 0 every time and the library substitutes
+  ;      0, 1 and 2 from the operation (qpu_pack.c:1578-1589) while
+  ;      py-videocore6 is handed rf0, rf1 and rf2 explicitly. So the
+  ;      OVERRIDE ITSELF is what the comparison tests: without it
+  ;      stvpmd would encode waddr 0 and the oracle would say 1.
+  ; ------------------------------------------------------------------
+  ShowVpm("vfpack",     #V3DQ_A_VFPACK, #MW_R0, 1, 1, 2, 0, 0)
+  ShowVfpackUnp("vfpack_unp_lh", #MW_R0, 1, 1, 2, #V3DQ_UNPACK_L, #V3DQ_UNPACK_H)
+  ShowVpm("vfpack_tlbu", #V3DQ_A_VFPACK, #V3DQ_WADDR_TLBU, 1, 1, 2, 0, 0)
+  ShowVpm("stvpmv",     #V3DQ_A_STVPMV, 0, 0, 1, 2, 0, 0)
+  ShowVpm("stvpmd",     #V3DQ_A_STVPMD, 0, 0, 1, 2, 0, 0)
+  ShowVpm("stvpmp",     #V3DQ_A_STVPMP, 0, 0, 1, 2, 0, 0)
+  ; THE OVERRIDE, AND THE MAGIC SUPPRESSION, ON ONE LINE. waddr 63 and
+  ; magic 1 are both handed in and both must vanish: STVPMV has no
+  ; destination operand at all (qpu_instr.c:479) and no_magic_write
+  ; suppresses bit 44 (qpu_pack.c:1580, :1762). The expected word is
+  ; identical to "stvpmv" above, which is the whole claim.
+  ShowVpm("stvpmv_override", #V3DQ_A_STVPMV, 63, 1, 1, 2, 0, 0)
+
+  ; The seven VPM loads. waddr 37 is 0b100101 so a shifted or narrowed
+  ; destination field moves it; mux_a 6 reads raddr_a and mux_b 5 is
+  ; DELIBERATE JUNK for the five forms whose mux_b carries the variant
+  ; - if the packer failed to substitute, LDVPMV_IN would come out as
+  ; LOG. raddr_a 27 and raddr_b 41 fill both six-bit read fields.
+  ShowVpm("ldvpmv_in",   #V3DQ_A_LDVPMV_IN,  37, 0, 6, 5, 27, 41)
+  ShowVpm("ldvpmv_out",  #V3DQ_A_LDVPMV_OUT, 37, 0, 6, 5, 27, 41)
+  ShowVpm("ldvpmd_in",   #V3DQ_A_LDVPMD_IN,  37, 0, 6, 5, 27, 41)
+  ShowVpm("ldvpmd_out",  #V3DQ_A_LDVPMD_OUT, 37, 0, 6, 5, 27, 41)
+  ShowVpm("ldvpmp",      #V3DQ_A_LDVPMP,     37, 0, 6, 5, 27, 41)
+  ; The gathered forms take TWO real sources, so mux_b 5 is an operand
+  ; here and must survive.
+  ShowVpm("ldvpmg_in",   #V3DQ_A_LDVPMG_IN,  37, 0, 6, 5, 27, 41)
+  ShowVpm("ldvpmg_out",  #V3DQ_A_LDVPMG_OUT, 37, 0, 6, 5, 27, 41)
+
+  ; ------------------------------------------------------------------
+  ;  10. REFUSALS. Twelve things the library must say no to, entered
+  ;      here rather than reasoned about, because a guard nobody has
+  ;      seen refuse anything is a guard nobody knows is broken.
+  ;
+  ;      These print as `R index code name`. py-videocore6 has no
+  ;      opinion about most of them, so the gate checks the CODE
+  ;      against a list of its own rather than against the oracle -
+  ;      and says so in its output, because that half is a model
+  ;      agreeing with itself.
+  ; ------------------------------------------------------------------
+  ; An operation this file does not encode. VFPACK AND STVPMV USED TO
+  ; BE THESE TWO LINES and both are encoded since stage 4; the two
+  ; operations named here are what is genuinely left of the 4.2 ADD
+  ; table, so the refusal keeps testing a refusal rather than becoming
+  ; a line that can no longer fail.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VFMIN, #MW_R0, 1, 0, 1)
+  Show("ref_addop_vfmin")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VPMSETUP, #MW_R0, 1, 0, 1)
+  Show("ref_addop_vpmsetup")
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VDWWT, #MW_R0, 1, 0, 1)
+  Show("ref_addop_vdwwt")
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_VFMUL, #MW_R0, 1, 0, 1)
+  Show("ref_mulop_vfmul")
+  ; A signal combination with no 4.2 encoding.
+  V3dQpuReset()
+  V3dQpuSig(#V3DQ_SIG_THRSW | #V3DQ_SIG_UCB)
+  Show("ref_sig_thrsw_ucb")
+  ; LDVPM, which is refused by name at the setter rather than at the
+  ; table, so this one prints its code from V3dQpuSig()'s own path.
+  V3dQpuReset()
+  r = V3dQpuSig(#V3DQ_SIG_LDVPM)
+  PutS("R ")
+  PutDec(idx)
+  PutS(" ")
+  PutDec(r)
+  PutS(" ref_sig_ldvpm")
+  PutNl()
+  idx = idx + 1
+  ; A condition on an instruction whose signal owns the field.
+  V3dQpuReset()
+  V3dQpuSig(#V3DQ_SIG_LDTMU)
+  V3dQpuSigAddr(4, 1)
+  V3dQpuFlags(#V3DQ_COND_IFA, #V3DQ_COND_NONE, #V3DQ_PF_NONE, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_NONE)
+  Show("ref_flags_with_sig")
+  ; A combination of conditions the table has no row for: an ADD
+  ; condition and a MUL update.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, 0, 1)
+  V3dQpuMul(#V3DQ_M_ADD, #MW_R3, 1, 0, 1)
+  V3dQpuFlags(#V3DQ_COND_IFA, #V3DQ_COND_NONE, #V3DQ_PF_NONE, #V3DQ_PF_NONE, #V3DQ_UF_NONE, #V3DQ_UF_ANDZ)
+  Show("ref_flags_ac_muf")
+  ; A pack on an operation that takes none.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, 0, 1)
+  V3dQpuAddPacking(#V3DQ_PACK_L, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("ref_pack_on_add")
+  ; ABS on a float-to-integer conversion, which has nowhere to put it.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_FTOIZ, #MW_R0, 1, 1, 0)
+  V3dQpuAddPacking(#V3DQ_PACK_NONE, #V3DQ_UNPACK_ABS, #V3DQ_UNPACK_NONE)
+  Show("ref_abs_on_ftoiz")
+  ; A value that is not one of the forty-eight small immediates.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, 1, #V3DQ_MUX_B)
+  r = V3dQpuSmallImm(17)
+  PutS("R ")
+  PutDec(idx)
+  PutS(" ")
+  PutDec(r)
+  PutS(" ref_smallimm_17")
+  PutNl()
+  idx = idx + 1
+  ; A small immediate asked for when raddr_b already holds a register.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(1, 2)
+  r = V3dQpuSmallImm(3)
+  PutS("R ")
+  PutDec(idx)
+  PutS(" ")
+  PutDec(r)
+  PutS(" ref_smimm_clash")
+  PutNl()
+  idx = idx + 1
+  ; A write address outside the six-bit field.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, 64, 0, 0, 1)
+  Show("ref_waddr_64")
+  ; A MAGIC DESTINATION ON A VPM LOAD. qpu_pack.c:1595 asserts
+  ; !magic_write on this exact instruction; bit 44 is the IN/OUT
+  ; selector for the seven LDVPM forms and not the magic flag, so a
+  ; caller who asked for a magic destination asked for LDVPMV_OUT
+  ; without knowing it. The ACCEPTED side of this guard is
+  ; "ldvpmv_in" above, which passes magic 0 and encodes.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_LDVPMV_IN, 5, 1, 6, 0)
+  Show("ref_ldvpm_magic")
+  ; ABS ON A VFPACK OPERAND. qpu_pack.c:1667-1670 returns false for it
+  ; on either side, and the reason is visible in the opcode table: the
+  ; five values an ABS operand would produce - 48-52, 56 and 60 - are
+  ; exactly the ones the three VFPACK ranges skip. The ACCEPTED side
+  ; is "vfpack_unp_lh", which uses L and H.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VFPACK, #MW_R0, 1, 1, 2)
+  V3dQpuAddPacking(#V3DQ_PACK_NONE, #V3DQ_UNPACK_ABS, #V3DQ_UNPACK_NONE)
+  Show("ref_vfpack_abs_a")
+  ; AN OUTPUT PACK ON A VFPACK, WHICH THIS FILE IS STRICTER ABOUT THAN
+  ; EITHER ORACLE. Mesa and py-videocore6 both ignore it; there is
+  ; nowhere in the encoding to put one, so ignoring it produces an
+  ; instruction that does something else. The ACCEPTED side is
+  ; "vfpack" above, with PACK_NONE.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_VFPACK, #MW_R0, 1, 1, 2)
+  V3dQpuAddPacking(#V3DQ_PACK_L, #V3DQ_UNPACK_NONE, #V3DQ_UNPACK_NONE)
+  Show("ref_vfpack_pack")
+
+  ; ------------------------------------------------------------------
+  ;  11. A REAL PROGRAM, THROUGH THE EMITTER.
+  ; ------------------------------------------------------------------
+  PutNl()
+  r = BuildShader()
+  PutS("P build ")
+  PutDec(r)
+  PutS(" hazard ")
+  PutDec(V3dQpuHazardName())
+  PutS(" count ")
+  PutDec(V3dQpuCount())
+  PutS(" bytes ")
+  PutDec(V3dQpuProgramBytes())
+  PutNl()
+
+  If r = #V3DQ_OK
+    n = V3dQpuProgramBytes() / 8
+    i = 0
+    While i < n
+      PutS("S ")
+      PutDec(i)
+      PutS(" ")
+      PutHex(PeekN(#QPU_PROG_ADDR + (i * 8) + 4), 8)
+      PutS(" ")
+      PutHex(PeekN(#QPU_PROG_ADDR + (i * 8)), 8)
+      PutNl()
+      i = i + 1
+    Wend
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  12. THE HAZARD CHECKER, entered on purpose.
+  ;
+  ;      Each of these builds a fresh program in the same buffer and
+  ;      drives it into one restriction. The line is
+  ;      `H <name> <err> <hazard>`.
+  ; ------------------------------------------------------------------
+  PutNl()
+
+  ; Two TMU writes in one instruction - one from each half.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_TMUD, 1, 0, 1)
+  V3dQpuMul(#V3DQ_M_ADD, #MW_TMUA, 1, 0, 1)
+  r = V3dQpuEmit()
+  PutS("H two_tmu ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; An SFU write and then a read of r4 one instruction later.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, 19, 1, 0, 1)
+  V3dQpuEmit()
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R0, 1, #V3DQ_MUX_R4, 1)
+  r = V3dQpuEmit()
+  PutS("H sfu_r4 ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; Two thread switches two apart.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  V3dQpuNop()
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  PutS("H thrsw_near ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; A register-file write in a thread-end delay slot.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, 5, 0, 0, 1)
+  r = V3dQpuEmit()
+  PutS("H rf_threnD ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; LDUNIF immediately after LDVARY.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuNopSig(#V3DQ_SIG_LDVARY, 1, 0)
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIF, 0, 0)
+  PutS("H unif_vary ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; A branch in a branch's delay slots.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuReset()
+  V3dQpuBranchSet(#V3DQ_BR_ALWAYS, #V3DQ_MSFIGN_NONE, #V3DQ_BDEST_REL, 0, 0, 0, 0, 0)
+  V3dQpuEmit()
+  V3dQpuReset()
+  V3dQpuBranchSet(#V3DQ_BR_ALWAYS, #V3DQ_MSFIGN_NONE, #V3DQ_BDEST_REL, 0, 0, 0, 0, 0)
+  r = V3dQpuEmit()
+  PutS("H br_br ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; A program with no thread end at all.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, #QPU_PROG_BYTES)
+  V3dQpuNop()
+  r = V3dQpuProgramEnd()
+  PutS("H no_threnD ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; A buffer too small for the instruction being emitted.
+  V3dQpuProgramBegin(#QPU_PROG_ADDR, 8)
+  V3dQpuNop()
+  r = V3dQpuNop()
+  PutS("H buf_full ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; A misaligned program buffer.
+  r = V3dQpuProgramBegin(#QPU_PROG_ADDR + 4, #QPU_PROG_BYTES)
+  PutS("H buf_align ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; AND ONE THAT MUST BE ACCEPTED, at plus EIGHT.
+  ;
+  ; This line exists because a mutation run said so. The alignment
+  ; refusal was mutated from `addr % 8` to `addr % 16` and SURVIVED:
+  ; the only alignment case in this section was plus four, which is
+  ; refused by both. A guard is only pinned down by a case on each
+  ; side of it, and eight is the boundary the instruction word
+  ; actually has.
+  r = V3dQpuProgramBegin(#QPU_PROG_ADDR + 8, #QPU_PROG_BYTES)
+  PutS("H buf_align8 ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  12b. THE SINGLE-SEGMENT PROGRAM, added at stage 4.
+  ;
+  ;  A vertex or coordinate shader that never switches threads is
+  ;  SPAWNED ALREADY IN THE FINAL THREAD SECTION and its whole thread
+  ;  end is one THRSW and three NOPs - no last-THRSW pair, because it
+  ;  is already past that point. qpu_validate.c:430 encodes exactly
+  ;  this as `.last_thrsw_found = !c->last_thrsw`.
+  ;
+  ;  THREE CASES, BECAUSE A GUARD NEEDS A CASE ON EACH SIDE. The same
+  ;  four instructions must be ACCEPTED with singleSeg 1 and REFUSED
+  ;  with singleSeg 0, and a second THRSW next to the first must be
+  ;  refused as a duplicate last-THRSW marker (qpu_validate.c:314).
+  ; ------------------------------------------------------------------
+  V3dQpuProgramBeginSeg(#QPU_PROG_ADDR, #QPU_PROG_BYTES, 1)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  V3dQpuNop()
+  V3dQpuNop()
+  V3dQpuNop()
+  r = V3dQpuProgramEnd()
+  PutS("H singleseg_ok ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  V3dQpuProgramBeginSeg(#QPU_PROG_ADDR, #QPU_PROG_BYTES, 0)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  V3dQpuNop()
+  V3dQpuNop()
+  V3dQpuNop()
+  r = V3dQpuProgramEnd()
+  PutS("H singleseg_off ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  V3dQpuProgramBeginSeg(#QPU_PROG_ADDR, #QPU_PROG_BYTES, 1)
+  V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  PutS("H singleseg_two ") : PutDec(r) : PutS(" ") : PutDec(V3dQpuHazardName()) : PutNl()
+
+  PutNl()
+  PutS("corpus entries ")
+  PutDec(idx)
+  PutNl()
+  PutS("=== end ===")
+  PutNl()
+
+  ProcedureReturn idx
+EndProcedure

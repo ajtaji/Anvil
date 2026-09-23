@@ -1,0 +1,231 @@
+; The checker injects exact production command, RunAt and watchdog bodies.
+#CAP_NET = 0
+#CAP_TOUCH = 0
+#CAP_PWM = 0
+
+Global pi3_deadman_seconds.i
+Global pi3_mon_deadman_owned.i
+Global gate_control.i
+Global gate_wdog.i
+Global gate_ctrlReads.i
+Global gate_ctrlWrites.i
+Global gate_wdogWrites.i
+Global gate_badArmReadback.i
+Global gate_badStopReadback.i
+Global gate_badRefreshReadback.i
+Global gate_calls.i
+Global gate_callAddress.i
+Global gate_drains.i
+Global gPos.i
+Global gWordAt.i
+Global gWordLen.i
+Global gParseOk.i
+Global gParseOver.i
+Global Dim gLine.a[128]
+
+;@@DEADMAN_PROCS@@
+
+Procedure.i GatePeekL(address.i)
+  If address = $3F10001C
+    gate_ctrlReads = gate_ctrlReads + 1
+    If gate_badRefreshReadback <> 0 And gate_ctrlReads = 2 : ProcedureReturn $10 : EndIf
+    If gate_badArmReadback <> 0 And gate_ctrlReads = 2 : ProcedureReturn $10 : EndIf
+    If gate_badStopReadback <> 0 And gate_ctrlReads >= 3 : ProcedureReturn $20 : EndIf
+    ProcedureReturn gate_control
+  EndIf
+  If address = $3F100024 : ProcedureReturn gate_wdog : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure GatePokeL(address.i, value.i)
+  If address = $3F100024
+    gate_wdog = value
+    gate_wdogWrites = gate_wdogWrites + 1
+  ElseIf address = $3F10001C
+    gate_ctrlWrites = gate_ctrlWrites + 1
+    If (value & $FFFFFFFF) = $5A000102
+      gate_control = 0
+    Else
+      gate_control = value & $FFFFFFFF
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure UartDrain()
+  gate_drains = gate_drains + 1
+EndProcedure
+
+Procedure Pi3EnterPayload(address.i)
+  gate_calls = gate_calls + 1
+  gate_callAddress = address
+EndProcedure
+
+Procedure GatePrint(*text)
+EndProcedure
+Procedure GatePrintN(*text)
+EndProcedure
+Procedure GatePrintDec(value.i)
+EndProcedure
+
+Procedure SkipSpace()
+  While gLine[gPos] = 32 Or gLine[gPos] = 9
+    gPos = gPos + 1
+  Wend
+EndProcedure
+
+Procedure SkipWord()
+  While gLine[gPos] <> 0 And gLine[gPos] <> 32
+    gPos = gPos + 1
+  Wend
+EndProcedure
+
+Procedure.i WordIs(*name)
+  Define i.i
+  Define a.i
+  Define b.i
+  i = 0
+  Repeat
+    b = PeekA(*name + i) & $FF
+    If b = 0 : Break : EndIf
+    If i >= gWordLen : ProcedureReturn 0 : EndIf
+    a = gLine[gWordAt + i] & $FF
+    If a >= 65 And a <= 90 : a = a + 32 : EndIf
+    If b >= 65 And b <= 90 : b = b + 32 : EndIf
+    If a <> b : ProcedureReturn 0 : EndIf
+    i = i + 1
+  ForEver
+  ProcedureReturn Bool(i = gWordLen)
+EndProcedure
+
+Procedure.i ParseDec()
+  Define value.i
+  Define digit.i
+  value = 0
+  gParseOk = 0
+  gParseOver = 0
+  SkipSpace()
+  Repeat
+    digit = gLine[gPos] & $FF
+    If digit < 48 Or digit > 57 : Break : EndIf
+    value = value * 10 + digit - 48
+    gPos = gPos + 1
+  ForEver
+  If gPos > gWordAt
+    gParseOk = 1
+  EndIf
+  ProcedureReturn value
+EndProcedure
+
+Procedure GateSetLine(kind.i)
+  Define i.i
+  For i = 0 To 127 : gLine[i] = 0 : Next
+  gLine[0]=100 : gLine[1]=101 : gLine[2]=97 : gLine[3]=100
+  gLine[4]=109 : gLine[5]=97 : gLine[6]=110 : gLine[7]=32
+  Select kind
+    Case 1 : gLine[8]=49 : gLine[9]=53
+    Case 2 : gLine[8]=111 : gLine[9]=102 : gLine[10]=102
+    Case 3 : gLine[8]=49 : gLine[9]=54
+    Case 4 : gLine[8]=51 : gLine[9]=32 : gLine[10]=101 : gLine[11]=120 : gLine[12]=116 : gLine[13]=114 : gLine[14]=97
+    Case 5 : gLine[8]=111 : gLine[9]=102 : gLine[10]=102 : gLine[11]=32 : gLine[12]=101 : gLine[13]=120 : gLine[14]=116 : gLine[15]=114 : gLine[16]=97
+    Case 6 : gLine[8]=48
+    Case 7 : gLine[8]=51 : gLine[9]=120
+  EndSelect
+  gPos = 7
+  gWordAt = 0
+  gWordLen = 7
+EndProcedure
+
+Procedure GateReset()
+  gate_control = 0
+  gate_wdog = 0
+  gate_ctrlReads = 0
+  gate_ctrlWrites = 0
+  gate_wdogWrites = 0
+  gate_badArmReadback = 0
+  gate_badStopReadback = 0
+  gate_badRefreshReadback = 0
+  gate_calls = 0
+  gate_callAddress = 0
+  gate_drains = 0
+  pi3_deadman_seconds = 0
+  pi3_mon_deadman_owned = 0
+EndProcedure
+
+Procedure.i Main()
+  ; External owner: refuse before touching its watchdog or entering payload.
+  GateReset()
+  gate_control = $20
+  pi3_deadman_seconds = 4
+  RunAt($2E00000)
+  If gate_calls <> 0 Or gate_wdogWrites <> 0 Or gate_ctrlWrites <> 0 : ProcedureReturn 1 : EndIf
+  If pi3_deadman_seconds <> 0 Or pi3_mon_deadman_owned <> 0 : ProcedureReturn 2 : EndIf
+
+  ; A mismatched arm readback is rolled back, and never branches.
+  GateReset()
+  gate_badArmReadback = 1
+  pi3_deadman_seconds = 3
+  RunAt($2E00000)
+  If gate_calls <> 0 Or gate_ctrlWrites <> 2 Or gate_wdogWrites <> 1 : ProcedureReturn 3 : EndIf
+  If gate_control <> 0 Or pi3_mon_deadman_owned <> 0 Or pi3_deadman_seconds <> 0 : ProcedureReturn 4 : EndIf
+
+  ; Successful arm: correct timeout, drain before start/entry, one call, owned stop.
+  GateReset()
+  gate_control = $100
+  pi3_deadman_seconds = 5
+  RunAt($2E01000)
+  If gate_calls <> 1 Or gate_callAddress <> $2E01000 : ProcedureReturn 5 : EndIf
+  If gate_wdog <> ($5A000000 | (5 * 65536)) Or gate_wdogWrites <> 1 : ProcedureReturn 6 : EndIf
+  If gate_ctrlWrites <> 2 Or gate_control <> 0 Or pi3_mon_deadman_owned <> 0 : ProcedureReturn 7 : EndIf
+  If pi3_deadman_seconds <> 0 Or gate_drains <> 2 : ProcedureReturn 8 : EndIf
+
+  ; No one-shot setting preserves ordinary RunAt with no watchdog access.
+  GateReset()
+  RunAt($2E02000)
+  If gate_calls <> 1 Or gate_ctrlReads <> 0 Or gate_ctrlWrites <> 0 Or gate_wdogWrites <> 0 : ProcedureReturn 9 : EndIf
+
+  ; A stop readback failure cannot erase ownership; no second payload gets in.
+  GateReset()
+  gate_badStopReadback = 1
+  pi3_deadman_seconds = 2
+  RunAt($2E03000)
+  If gate_calls <> 1 Or pi3_mon_deadman_owned <> 1 : ProcedureReturn 10 : EndIf
+  If Pi3MonDeadmanStart(2) <> 0 Or gate_wdogWrites <> 1 : ProcedureReturn 11 : EndIf
+
+  ; Command parsing accepts decimal 1..15 and off; bad/extra args preserve state.
+  GateReset() : pi3_deadman_seconds = 0 : GateSetLine(1) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 15 : ProcedureReturn 12 : EndIf
+  GateSetLine(2) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 0 : ProcedureReturn 13 : EndIf
+  pi3_deadman_seconds = 6 : GateSetLine(3) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 6 : ProcedureReturn 14 : EndIf
+  GateSetLine(4) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 6 : ProcedureReturn 15 : EndIf
+  GateSetLine(5) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 6 : ProcedureReturn 16 : EndIf
+  GateSetLine(6) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 6 : ProcedureReturn 17 : EndIf
+  GateSetLine(7) : CmdPi3Deadman()
+  If pi3_deadman_seconds <> 6 : ProcedureReturn 18 : EndIf
+
+  ; A refresh reloads only PM_WDOG while retaining the owned RSTC mode.
+  GateReset() : gate_control = $124 : pi3_mon_deadman_owned = 1
+  If Pi3MonDeadmanRefresh(15) <> 1 : ProcedureReturn 19 : EndIf
+  If gate_control <> $124 Or gate_ctrlWrites <> 0 Or gate_wdogWrites <> 1 : ProcedureReturn 20 : EndIf
+  If gate_wdog <> $5A0F0000 Or pi3_mon_deadman_owned <> 1 : ProcedureReturn 21 : EndIf
+
+  ; Refuse unowned, non-armed, invalid-timeout, and failed readback refreshes.
+  GateReset() : gate_control = $20
+  If Pi3MonDeadmanRefresh(15) <> 0 Or gate_wdogWrites <> 0 : ProcedureReturn 22 : EndIf
+  pi3_mon_deadman_owned = 1 : gate_control = $10
+  If Pi3MonDeadmanRefresh(15) <> 0 Or gate_wdogWrites <> 0 : ProcedureReturn 23 : EndIf
+  gate_control = $20
+  If Pi3MonDeadmanRefresh(16) <> 0 Or Pi3MonDeadmanRefresh(0) <> 0 Or gate_wdogWrites <> 0 : ProcedureReturn 24 : EndIf
+  gate_ctrlReads = 0
+  gate_badRefreshReadback = 1
+  If Pi3MonDeadmanRefresh(15) <> 0 : ProcedureReturn 25 : EndIf
+  If gate_wdogWrites = 0 : ProcedureReturn 26 : EndIf
+  If gate_wdogWrites <> 1 : ProcedureReturn 27 : EndIf
+  If gate_ctrlWrites <> 0 : ProcedureReturn 28 : EndIf
+  If pi3_mon_deadman_owned <> 1 : ProcedureReturn 29 : EndIf
+  ProcedureReturn 0
+EndProcedure

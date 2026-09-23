@@ -1,0 +1,124 @@
+; ======================================================================
+;  The emitted varying-interpolation expectation gate
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; A DESK INSTRUMENT. It does not ship and it never runs on the board.
+;
+; It drives Anvil/Graphics/Vulkan/vk_interp_expect.pbi over a table of
+; triangles and probe pixels the CHECKER writes into memory, and reports
+; every number that file produces: the screen coordinates it derives from
+; clip space, twice the signed area, the three barycentric numerators at
+; each probe, whether the probe is strictly inside, the four channels and
+; the packed pixel.
+;
+; NOTHING IS HARD CODED HERE. The triangles arrive through memory, so a
+; new case is a change to the checker and not to this file, and the two
+; sides of every comparison are written in different languages by
+; different code - which is the whole point, because an expectation the
+; implementation produced would only prove the implementation agrees with
+; itself.
+;
+; THIS GATE TOUCHES NO HARDWARE AT ALL. vk_interp_expect.pbi is integer
+; arithmetic over memory the checker supplies; there is no MMIO access in
+; it, and the checker arms a hard stop to require that.
+;
+;   PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
+;       py -3 tools/vulkan_interp_check.py --mutate
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_interp_expect.pbi"
+
+#VIG_IN = $06000000
+#VIG_OUT = $06100000
+#VIG_MAGIC = $564B4950                 ; "VKIP"
+
+; One case in, one case out, both a fixed number of 8-byte slots so a
+; reader can find any field by multiplying.
+#VIG_IN_SLOTS = 64
+#VIG_OUT_SLOTS = 128
+#VIG_HEAD = 64
+#VIG_MAX_CASES = 16
+#VIG_MAX_PROBES = 8
+#VIG_PROBE_BASE = 16
+#VIG_PROBE_SLOTS = 9
+
+; The one fixed pair AnvilVkInterpDistance is exercised on, so the
+; distance rule is checked in every case rather than assumed.
+#VIG_DIST_A = $FF102030
+#VIG_DIST_B = $FE152B33
+
+Procedure.i vigIn(caseIndex.i, slot.i)
+  ProcedureReturn PeekI(#VIG_IN + #VIG_HEAD + (caseIndex * #VIG_IN_SLOTS * 8) + (slot * 8))
+EndProcedure
+
+Procedure vigOut(caseIndex.i, slot.i, value.i)
+  PokeI(#VIG_OUT + #VIG_HEAD + (caseIndex * #VIG_OUT_SLOTS * 8) + (slot * 8), value)
+EndProcedure
+
+Procedure.i Main()
+  Define n.i
+  Define i.i
+  Define k.i
+  Define p.i
+  Define probes.i
+  Define px.i
+  Define py.i
+  Define base.i
+  Define rc.i
+
+  PokeI(#VIG_OUT, #VIG_MAGIC)
+  n = PeekI(#VIG_IN)
+  If n < 0 : n = 0 : EndIf
+  If n > #VIG_MAX_CASES : n = #VIG_MAX_CASES : EndIf
+  PokeI(#VIG_OUT + 8, n)
+
+  i = 0
+  While i < n
+    rc = AnvilVkInterpBegin(vigIn(i, 0), vigIn(i, 1))
+    vigOut(i, 0, rc)
+    ; The vertices and the colours go in even when Begin refused, so a
+    ; refusal is visible as a refusal and not as a table of stale
+    ; numbers left over from the previous case.
+    k = 0
+    While k < 3
+      AnvilVkInterpVertex(k, vigIn(i, 2 + (k * 3)), vigIn(i, 3 + (k * 3)), vigIn(i, 4 + (k * 3)))
+      AnvilVkInterpColour(k, vigIn(i, 11 + (k * 4)), vigIn(i, 12 + (k * 4)), vigIn(i, 13 + (k * 4)), vigIn(i, 14 + (k * 4)))
+      k = k + 1
+    Wend
+
+    vigOut(i, 1, AnvilVkInterpArea())
+    vigOut(i, 2, AnvilVkInterpScreenX(0))
+    vigOut(i, 3, AnvilVkInterpScreenY(0))
+    vigOut(i, 4, AnvilVkInterpScreenX(1))
+    vigOut(i, 5, AnvilVkInterpScreenY(1))
+    vigOut(i, 6, AnvilVkInterpScreenX(2))
+    vigOut(i, 7, AnvilVkInterpScreenY(2))
+    vigOut(i, 8, AnvilVkInterpTolerance())
+
+    probes = vigIn(i, 23)
+    If probes < 0 : probes = 0 : EndIf
+    If probes > #VIG_MAX_PROBES : probes = #VIG_MAX_PROBES : EndIf
+    vigOut(i, 9, probes)
+    vigOut(i, 10, AnvilVkInterpDistance(#VIG_DIST_A, #VIG_DIST_A))
+    vigOut(i, 11, AnvilVkInterpDistance(#VIG_DIST_A, #VIG_DIST_B))
+
+    p = 0
+    While p < probes
+      px = vigIn(i, 24 + (p * 2))
+      py = vigIn(i, 25 + (p * 2))
+      base = #VIG_PROBE_BASE + (p * #VIG_PROBE_SLOTS)
+      vigOut(i, base + 0, AnvilVkInterpInside(px, py))
+      vigOut(i, base + 1, AnvilVkInterpExpect(px, py))
+      vigOut(i, base + 2, AnvilVkInterpChannel(px, py, 0))
+      vigOut(i, base + 3, AnvilVkInterpChannel(px, py, 1))
+      vigOut(i, base + 4, AnvilVkInterpChannel(px, py, 2))
+      vigOut(i, base + 5, AnvilVkInterpChannel(px, py, 3))
+      vigOut(i, base + 6, AnvilVkInterpWeight(px, py, 0))
+      vigOut(i, base + 7, AnvilVkInterpWeight(px, py, 1))
+      vigOut(i, base + 8, AnvilVkInterpWeight(px, py, 2))
+      p = p + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn #VIG_OUT
+EndProcedure

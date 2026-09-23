@@ -1,0 +1,189 @@
+; pi4FbAsk.pi4 - ask the firmware what display it has, before telling it
+; what display to have.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHY. DisplayInit(1920, 1080, 32) fails at its first step with the
+; firmware answering $80000001, ERROR PARSING REQUEST BUFFER, while the
+; same buffer carries a clock query successfully a few lines earlier.
+; A malformed buffer that is only malformed for one tag is not really a
+; malformed buffer, so the next question is not about the buffer.
+;
+; Every tag below is a GET. Nothing here changes any state, so it can be
+; run against a board in any condition and repeated as often as needed.
+; The point is to find out whether the firmware believes a display
+; exists at all - which is a different question from whether our request
+; was well formed, and the two have been tangled together.
+;
+; Tag numbers are the property-interface ones:
+;   $00040003  get physical (display) width/height
+;   $00040004  get virtual (buffer) width/height
+;   $00040005  get depth
+;   $00040006  get pixel order
+;   $00040008  get pitch
+;   $00040001  ALLOCATE buffer   - the only non-GET, and it is last
+;   $00030046  GET THROTTLED - not "number of displays". See below.
+;
+;   TWO TAGS HERE WERE MISLABELLED, AND ONE OF THE LABELS WAS ALARMING.
+;   Corrected 2026-08-26 after a real run printed
+;
+;       num displays    0
+;
+;   on a board with a working 1920x1080 screen in front of it. Nobody
+;   should have to reconcile that.
+;
+;   $00030046 is GET THROTTLED, cited in RaspberryPi4/Lib/mailbox.pi4:232
+;   among the tags that file deliberately does not wrap. The 0 it
+;   returned was the correct and cheerful answer to a question nobody
+;   here meant to ask: this board is not being thermally throttled.
+;
+;   $00040013 was labelled "get display id". It is GET_NUM_DISPLAYS -
+;   Datasheets/pi4/hdmi/raspberrypi-firmware-downstream.h:124. So its
+;   answer of 1 was right and useful and described as the wrong thing:
+;   ONE DISPLAY IS CONNECTED. The real GET_DISPLAY_ID is $00040016
+;   (same header, :122) and has never been asked.
+;
+;   Both labels are corrected below rather than removed. The tags are
+;   citable after all - they are simply not in U-Boot's v2025.01_mbox.h,
+;   which stops at PALETTE ($0004000b, mbox.h:466-495) because U-Boot
+;   never needed to pick a display. The downstream Linux header does,
+;   and it is on the disk.
+;
+;   WHICH UNBLOCKS THE REAL QUESTION. $00048013 SET_DISPLAY_NUM (same
+;   header, :123) is how a program CHOOSES between HDMI0 and HDMI1.
+;   display.pi4 does not send it, so Anvil takes whichever socket the
+;   firmware picked and cannot say which that was - which made the
+;   framebuffer failure message confidently blame HDMI0. That message no
+;   longer names a socket, and the selection itself is now buildable.
+;
+;   PureMetalForge.exe --compile pi4FbAsk.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o fbask.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; One tag, one line. valBytes is the size of the value buffer the tag
+; needs - for a GET that is the size of the ANSWER, and the request half
+; is left as zeros.
+;
+; Prints the raw response code alongside the values, because a tag the
+; firmware did not recognise and a tag that answered zero look identical
+; if you only print the values.
+Procedure AskTag(*name, tag.i, valBytes.i, showWords.i)
+  Define ok.i
+  Define i.i
+  Define b.i
+
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+
+  If MailboxBegin(tag, valBytes, valBytes) = 0
+    UartWriteStr("begin failed")
+    PrintNl()
+    ProcedureReturn
+  EndIf
+  ok = MailboxSend()
+  b = MailboxBufferAddr()
+
+  If ok = 0
+    UartWriteStr("send failed, MailboxError ")
+    PrintDec(MailboxError())
+    UartWriteStr("   code $")
+    PutHexN(PeekN(b + 4) & $FFFFFFFF, 8)
+    UartWriteStr("  tagcode $")
+    PutHexN(PeekN(b + 16) & $FFFFFFFF, 8)
+  Else
+    For i = 0 To showWords - 1
+      If i > 0
+        UartWriteStr(", ")
+      EndIf
+      PrintDec(MailboxWord(i))
+    Next
+    UartWriteStr("   (raw $")
+    For i = 0 To showWords - 1
+      If i > 0
+        UartWriteStr(" $")
+      EndIf
+      PutHexN(MailboxWord(i), 8)
+    Next
+    UartWriteStr(")")
+  EndIf
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  PrintNl()
+  UartWriteStr("=== what display does the firmware think it has? ===")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! MailboxInit failed, error ")
+    PrintDec(MailboxError())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; Control first, same as before: if this fails the rest means nothing.
+  UartWriteStr("control: ARM clock ")
+  PrintDec(MailboxClockRate(3))
+  UartWriteStr(" Hz")
+  PrintNl()
+  PrintNl()
+
+  ; NOT "displays and identity" any more - see the long note in the
+  ; header. Neither tag asked what its label claimed. What is left is
+  ; the one of the two that is actually cited, asking the question it
+  ; actually answers.
+  UartWriteStr("displays")
+  PrintNl()
+  ; GET_NUM_DISPLAYS - raspberrypi-firmware-downstream.h:124. How many
+  ; the firmware found at boot, NOT which one we are drawing on.
+  AskTag("count         ", $00040013, 4, 1)
+  ; GET_DISPLAY_ID - same header, :122. Never asked before today.
+  AskTag("display id    ", $00040016, 4, 1)
+  PrintNl()
+
+  UartWriteStr("thermal")
+  PrintNl()
+  AskTag("throttled     ", $00030046, 4, 1)
+  UartWriteStr("    0 = never throttled since boot. Bits set mean the")
+  PrintNl()
+  UartWriteStr("    firmware has capped something - see mailbox.pi4:232.")
+  PrintNl()
+  PrintNl()
+
+  UartWriteStr("current mode, as the firmware reports it")
+  PrintNl()
+  AskTag("phys  w,h     ", $00040003, 8, 2)
+  AskTag("virt  w,h     ", $00040004, 8, 2)
+  AskTag("depth         ", $00040005, 4, 1)
+  AskTag("pixel order   ", $00040006, 4, 1)
+  AskTag("pitch         ", $00040008, 4, 1)
+  AskTag("virt offset   ", $00040009, 8, 2)
+  PrintNl()
+
+  ; A zero physical size means the firmware has no mode - which would
+  ; explain a set-physical being rejected, and would point at HDMI
+  ; rather than at anything in this repo.
+  UartWriteStr("if phys w,h is 0,0 the firmware has no display mode and")
+  PrintNl()
+  UartWriteStr("setting one is the problem, not the request buffer.")
+  PrintNl()
+
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,492 @@
+; Executable emitted-code gate for TCP endpoint ownership across two
+; interfaces. It includes the production net/link/tcp stack and supplies
+; only a scripted hardware-link seam. Main returns the first assertion.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+#HW_LINK_UART  = 3
+#HW_LINK_USB   = 4
+#HW_LINK_FILE  = 5
+#HW_LINK_SPEED_UNKNOWN = -1
+#HW_LINK_DUPLEX_UNKNOWN = -1
+#LINK_RX_BUDGET = 64
+
+Global gate_now.i
+Global Dim gate_ready.a[6]
+Global Dim gate_mac.a[36]
+Global Dim gate_rx1.a[128]
+Global Dim gate_rx2.a[128]
+Global Dim gate_rxPtr.i[6]
+Global Dim gate_rxLen.i[6]
+Global Dim gate_tx.a[1600]
+Global gate_txLen.i
+Global gate_txKind.i
+Global Dim gate_upload.a[32]
+
+Procedure.i Micros()
+  ProcedureReturn gate_now
+EndProcedure
+
+Procedure.i millis()
+  ProcedureReturn gate_now / 1000
+EndProcedure
+
+XIncludeFile "Anvil/Network/net.pbi"
+
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIRED Or kind = #HW_LINK_WIFI
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkReady(kind.i)
+  ProcedureReturn gate_ready[kind] & $FF
+EndProcedure
+
+Procedure.i HwLinkTxMax(kind.i)
+  If HwLinkHas(kind) <> 0
+    ProcedureReturn 1514
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkSend(kind.i, *buf, n.i, ms.i)
+  Define i.i
+  If gate_ready[kind] = 0 Or *buf = 0 Or n < 1 Or n > 1600
+    ProcedureReturn 0
+  EndIf
+  gate_txKind = kind
+  gate_txLen = n
+  For i = 0 To n - 1
+    gate_tx[i] = PeekA(*buf + i) & $FF
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwLinkRecv(kind.i, *buf, max.i, ms.i)
+  Define n.i
+  n = gate_rxLen[kind]
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  gate_rxLen[kind] = 0
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i HwLinkRxPtr(kind.i)
+  ProcedureReturn gate_rxPtr[kind]
+EndProcedure
+
+Procedure.i HwLinkMacPtr(kind.i)
+  ProcedureReturn @gate_mac[kind * 6]
+EndProcedure
+
+Procedure.i HwLinkName(kind.i)
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn "wired"
+  EndIf
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn "wifi"
+  EndIf
+  ProcedureReturn "none"
+EndProcedure
+
+Procedure.i HwLinkSpeed(kind.i)
+  ProcedureReturn 1000
+EndProcedure
+
+Procedure.i HwLinkDuplex(kind.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwLinkWhyText(kind.i)
+  ProcedureReturn ""
+EndProcedure
+
+Procedure.i HwLinkOfferRaw(kind.i, *frame, n.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkOfferUdp(kind.i, *frame)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwLinkNoteRx(kind.i, rc.i)
+EndProcedure
+
+; The production netif layer asks the same three facts. Kept local so
+; this gate tests link.pi4 without pulling in console/settings policy.
+Procedure.i NetIfUsable(kind.i)
+  If HwLinkHas(kind) = 0 Or HwLinkReady(kind) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn NetConfigured(kind)
+EndProcedure
+
+; Defined before link.pi4 and tcp.pi4 intentionally. PureMetal resolves
+; procedure references after the include closure; TcpInput is production.
+Procedure.i NetServiceInput(kind.i, *frame, rc.i)
+  If rc = #NET_IN_REPLY
+    LinkTxStagedOn(kind)
+    ProcedureReturn 1
+  EndIf
+  If rc = #NET_IN_TCP
+    TcpInput()
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+XIncludeFile "RaspberryPi4/Lib/tcp.pi4"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/netrecv.pbi"
+
+Procedure GatePut16(*p, v.i)
+  PokeA(*p, (v >> 8) & $FF)
+  PokeA(*p + 1, v & $FF)
+EndProcedure
+
+Procedure GatePut32(*p, v.i)
+  PokeA(*p, (v >> 24) & $FF)
+  PokeA(*p + 1, (v >> 16) & $FF)
+  PokeA(*p + 2, (v >> 8) & $FF)
+  PokeA(*p + 3, v & $FF)
+EndProcedure
+
+Procedure.i GateGet32(*p)
+  ProcedureReturn ((PeekA(*p) & $FF) << 24) | ((PeekA(*p + 1) & $FF) << 16) | ((PeekA(*p + 2) & $FF) << 8) | (PeekA(*p + 3) & $FF)
+EndProcedure
+
+Procedure.i GateSum(*p, n.i, seed.i)
+  Define i.i
+  Define sum.i
+  sum = seed
+  i = 0
+  While i + 1 < n
+    sum = sum + ((PeekA(*p + i) & $FF) << 8) + (PeekA(*p + i + 1) & $FF)
+    i = i + 2
+  Wend
+  If i < n
+    sum = sum + ((PeekA(*p + i) & $FF) << 8)
+  EndIf
+  ProcedureReturn sum
+EndProcedure
+
+Procedure.i GateFold(sum.i)
+  While (sum >> 16) <> 0
+    sum = (sum & $FFFF) + (sum >> 16)
+  Wend
+  ProcedureReturn ($FFFF - sum) & $FFFF
+EndProcedure
+
+; Queue one checksum-correct, header-only TCP segment on `kind`.
+Procedure GateQueueTcp(kind.i, srcIp.i, dstIp.i, srcPort.i, dstPort.i, seq.i, ack.i, flags.i)
+  Define p.i
+  Define i.i
+  Define sum.i
+  If kind = #HW_LINK_WIRED
+    p = @gate_rx1[0]
+  Else
+    p = @gate_rx2[0]
+  EndIf
+  For i = 0 To 127
+    PokeA(p + i, 0)
+  Next
+  ; Ethernet destination: this interface. Source: stable peer MAC.
+  For i = 0 To 5
+    PokeA(p + i, gate_mac[kind * 6 + i] & $FF)
+    PokeA(p + 6 + i, $A0 + kind * 8 + i)
+  Next
+  GatePut16(p + 12, $0800)
+  ; IPv4, 20-byte header and a 20-byte TCP segment.
+  PokeA(p + 14, $45)
+  GatePut16(p + 16, 40)
+  GatePut16(p + 18, $1234 + kind)
+  GatePut16(p + 20, 0)
+  PokeA(p + 22, 64)
+  PokeA(p + 23, 6)
+  GatePut16(p + 24, 0)
+  GatePut32(p + 26, srcIp)
+  GatePut32(p + 30, dstIp)
+  GatePut16(p + 24, GateFold(GateSum(p + 14, 20, 0)))
+  ; TCP.
+  GatePut16(p + 34, srcPort)
+  GatePut16(p + 36, dstPort)
+  GatePut32(p + 38, seq)
+  GatePut32(p + 42, ack)
+  PokeA(p + 46, $50)
+  PokeA(p + 47, flags)
+  GatePut16(p + 48, 4096)
+  GatePut16(p + 50, 0)
+  GatePut16(p + 52, 0)
+  sum = GateSum(p + 26, 8, 0)
+  sum = sum + 6 + 20
+  sum = GateSum(p + 34, 20, sum)
+  GatePut16(p + 50, GateFold(sum))
+  gate_rxPtr[kind] = p
+  gate_rxLen[kind] = 60
+EndProcedure
+
+Procedure GateResetCapture()
+  gate_txLen = 0
+  gate_txKind = #HW_LINK_NONE
+EndProcedure
+
+; Add a deterministic binary payload to the segment just queued. Checksums
+; cover the actual wire bytes, not direct changes to TCP's internal state.
+Procedure GateTcpPayload(kind.i, n.i)
+  Define p.i
+  Define i.i
+  Define sum.i
+  p = gate_rxPtr[kind]
+  For i = 0 To n - 1
+    PokeA(p + 54 + i, (i * 17) & $FF)
+  Next
+  GatePut16(p + 16, 40 + n)
+  GatePut16(p + 24, 0)
+  GatePut16(p + 24, GateFold(GateSum(p + 14, 20, 0)))
+  GatePut16(p + 50, 0)
+  sum = GateSum(p + 26, 8, 0) + 6 + 20 + n
+  sum = GateSum(p + 34, 20 + n, sum)
+  GatePut16(p + 50, GateFold(sum))
+  gate_rxLen[kind] = 54 + n
+  If gate_rxLen[kind] < 60 : gate_rxLen[kind] = 60 : EndIf
+EndProcedure
+
+; mode0: short binary file; mode1: empty FIN; mode2: ceiling refusal;
+; mode3: no connection; mode4: revoked listener, never connected.
+; Both network interfaces run every mode.
+Procedure.i GateShortReceiver(kind.i, localIp.i, peerIp.i, mode.i)
+  Define i.i
+  Define n.i
+  Define room.i
+  Define expected.i
+  Define ack.i
+  Define sock.i
+  Define rst0.i
+  Define seq.i
+  Define state.i
+  TcpInit()
+  For i = 0 To 31 : gate_upload[i] = $AA : Next
+  n = 16 : room = 16 : expected = #NR_DONE
+  If mode = 1 : n = 0 : EndIf
+  If mode = 2 : room = 8 : expected = #NR_OVER : EndIf
+  If NetRecvArm(5100, @gate_upload[1], @gate_upload[room]) <> #NR_WAIT : ProcedureReturn 1 : EndIf
+  TcpUse(3)
+  If mode = 3 Or mode = 4
+    If mode = 4
+      TcpUse(NetRecvSock())
+      TcpUnlisten()
+      TcpUse(3)
+    EndIf
+    If NetRecvStep() <> #NR_WAIT : ProcedureReturn 2 : EndIf
+    If NetRecvCount() <> 0 Or TcpCurrent() <> 3 : ProcedureReturn 3 : EndIf
+    gate_now = gate_now + (#NR_ARM_MS + 1) * 1000
+    If NetRecvStep() <> #NR_TIME : ProcedureReturn 4 : EndIf
+    NetRecvRelease()
+    If gate_upload[0] <> $AA Or gate_upload[1] <> $AA : ProcedureReturn 5 : EndIf
+    ProcedureReturn 0
+  EndIf
+
+  GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1000, 0, #TCP_SYN)
+  If NetRecvStep() <> #NR_WAIT : ProcedureReturn 6 : EndIf
+  If TcpCurrent() <> 3 : ProcedureReturn 7 : EndIf
+  TcpUse(NetRecvSock())
+  If TcpState() <> #TCP_SYN_RECEIVED : ProcedureReturn 8 : EndIf
+  ack = tcp_snd_nxt
+  TcpUse(3)
+  If mode >= 5
+    GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_ACK)
+    gate_now = gate_now + 1000
+    If NetRecvStep() <> #NR_RECV : ProcedureReturn 26 : EndIf
+    rst0 = tcp_rst_tx
+    If mode = 5
+      gNrState = #NR_STOP
+    ElseIf mode = 6
+      gate_now = gate_now + (#NR_IDLE_MS + 1) * 1000
+      If NetRecvStep() <> #NR_TIME : ProcedureReturn 27 : EndIf
+    Else
+      GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_RST)
+      If NetRecvStep() <> #NR_RST : ProcedureReturn 28 : EndIf
+    EndIf
+    sock = NetRecvSock()
+    NetRecvRelease()
+    TcpUse(sock)
+    If TcpState() <> #TCP_CLOSED Or tcp_inuse <> 0 : ProcedureReturn 29 : EndIf
+    If mode = 7
+      If tcp_rst_tx <> rst0 : ProcedureReturn 30 : EndIf
+    Else
+      If tcp_rst_tx <> rst0 + 1 : ProcedureReturn 31 : EndIf
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ; The final handshake ACK may also carry data and FIN. This is a real
+  ; protocol path into CLOSE_WAIT in one poll, before NR_WAIT saw ESTABLISHED.
+  GateQueueTcp(kind, peerIp, localIp, 44000, 5100, 1001, ack, #TCP_ACK | #TCP_FIN)
+  GateTcpPayload(kind, n)
+  gate_now = gate_now + 1000
+  state = NetRecvStep()
+  If state <> expected : ProcedureReturn 9 : EndIf
+  If TcpCurrent() <> 3 : ProcedureReturn 10 : EndIf
+  If n > room : n = room : EndIf
+  If NetRecvCount() <> n : ProcedureReturn 11 : EndIf
+  If NetRecvPeer() <> peerIp : ProcedureReturn 12 : EndIf
+  For i = 0 To n - 1
+    If gate_upload[i + 1] <> ((i * 17) & $FF) : ProcedureReturn 13 : EndIf
+  Next
+  If gate_upload[0] <> $AA Or gate_upload[n + 1] <> $AA : ProcedureReturn 14 : EndIf
+  sock = NetRecvSock()
+  rst0 = tcp_rst_tx
+  If expected = #NR_DONE
+    TcpUse(sock)
+    If TcpState() <> #TCP_LAST_ACK Or tcp_listen_port <> 0 : ProcedureReturn 15 : EndIf
+    If gate_txLen < 54 Or (gate_tx[47] & (#TCP_FIN | #TCP_ACK | #TCP_RST)) <> (#TCP_FIN | #TCP_ACK) : ProcedureReturn 16 : EndIf
+    ack = tcp_snd_nxt
+    seq = tcp_rcv_nxt
+    TcpUse(3)
+  Else
+    ; LAST_ACK alone is not proof of receiver success. A failed owner may
+    ; already have initiated close; release must still abort that session.
+    TcpUse(sock)
+    TcpUnlisten()
+    TcpClose()
+    If TcpState() <> #TCP_LAST_ACK : ProcedureReturn 25 : EndIf
+    TcpUse(3)
+  EndIf
+  NetRecvRelease()
+  If TcpCurrent() <> 3 Or NetRecvSock() <> -1 : ProcedureReturn 17 : EndIf
+  TcpUse(sock)
+  If expected = #NR_DONE
+    If TcpState() <> #TCP_LAST_ACK Or tcp_listen_port <> 0 Or tcp_inuse = 0 : ProcedureReturn 18 : EndIf
+    If tcp_rst_tx <> rst0 : ProcedureReturn 19 : EndIf
+    If mode = 0
+      GateQueueTcp(kind, peerIp, localIp, 44000, 5100, seq, ack, #TCP_ACK)
+      TcpPoll(0)
+      If TcpState() <> #TCP_CLOSED : ProcedureReturn 20 : EndIf
+      TcpTick()
+    Else
+      ; Withhold the final ACK. Ordinary service must retransmit FIN and
+      ; eventually reclaim the parked socket without emitting a reset.
+      For i = 0 To #TCP_MAX_RETRIES
+        gate_now = gate_now + 60000000
+        TcpTick()
+      Next
+      If TcpState() <> #TCP_CLOSED : ProcedureReturn 32 : EndIf
+      TcpTick()
+    EndIf
+    If tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 24 : EndIf
+    If tcp_rst_tx <> rst0 : ProcedureReturn 21 : EndIf
+  Else
+    If TcpState() <> #TCP_CLOSED Or tcp_listen_port <> 0 Or tcp_inuse <> 0 : ProcedureReturn 22 : EndIf
+    If tcp_rst_tx <> rst0 + 1 : ProcedureReturn 23 : EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define wiredIp.i
+  Define wiredAlias.i
+  Define wifiIp.i
+  Define peerWired.i
+  Define peerWifi.i
+  Define ack.i
+  Define rst0.i
+  Define result.i
+
+  wiredIp = $A9FEAAFA       ; 169.254.170.250
+  wiredAlias = $C0A88901    ; 192.168.137.1
+  wifiIp = $C0A80110        ; 192.168.1.16
+  peerWired = $C0A88902     ; 192.168.137.2
+  peerWifi = $C0A8010F      ; 192.168.1.15
+
+  For i = 0 To 5
+    gate_mac[#HW_LINK_WIRED * 6 + i] = $20 + i
+    gate_mac[#HW_LINK_WIFI * 6 + i] = $40 + i
+  Next
+  gate_ready[#HW_LINK_WIRED] = 1
+  gate_ready[#HW_LINK_WIFI] = 1
+  NetInit()
+  If NetSetMac(#HW_LINK_WIRED, @gate_mac[#HW_LINK_WIRED * 6]) = 0 : ProcedureReturn 1 : EndIf
+  If NetSetMac(#HW_LINK_WIFI, @gate_mac[#HW_LINK_WIFI * 6]) = 0 : ProcedureReturn 2 : EndIf
+  If NetSetIPv4(#HW_LINK_WIRED, wiredIp, $FFFF0000, 0) = 0 : ProcedureReturn 3 : EndIf
+  If NetSetIPv4Alt(#HW_LINK_WIRED, wiredAlias, $FFFFFF00) = 0 : ProcedureReturn 4 : EndIf
+  If NetSetIPv4(#HW_LINK_WIFI, wifiIp, $FFFFFF00, $C0A80102) = 0 : ProcedureReturn 5 : EndIf
+  TcpInit()
+
+  ; A wildcard port has one owner, even while its accepted connection is
+  ; active and carries the re-arm marker in tcp_listen_port.
+  TcpUse(0)
+  If TcpListen(5001) <> #NET_TCP_OK : ProcedureReturn 6 : EndIf
+  TcpUse(1)
+  If TcpListen(5001) <> #NET_TCP_E_BUSY : ProcedureReturn 7 : EndIf
+  TcpUse(0)
+
+  ; Route preference is deliberately Wi-Fi. A SYN to the cable alias must
+  ; still be accepted on wired and answered from the exact alias.
+  LinkUseKind(#HW_LINK_WIFI)
+  GateResetCapture()
+  GateQueueTcp(#HW_LINK_WIRED, peerWired, wiredAlias, 42000, 5001, 100, 0, #TCP_SYN)
+  TcpPoll(0)
+  If TcpState() <> #TCP_SYN_RECEIVED : ProcedureReturn 8 : EndIf
+  If TcpLinkKind() <> #HW_LINK_WIRED : ProcedureReturn 9 : EndIf
+  If TcpLocalIp() <> wiredAlias : ProcedureReturn 10 : EndIf
+  If gate_txKind <> #HW_LINK_WIRED Or gate_txLen < 54 : ProcedureReturn 11 : EndIf
+  If GateGet32(@gate_tx[26]) <> wiredAlias : ProcedureReturn 12 : EndIf
+  If GateGet32(@gate_tx[30]) <> peerWired : ProcedureReturn 13 : EndIf
+
+  ack = tcp_snd_nxt
+  GateResetCapture()
+  GateQueueTcp(#HW_LINK_WIRED, peerWired, wiredAlias, 42000, 5001, 101, ack, #TCP_ACK)
+  TcpPoll(0)
+  If TcpState() <> #TCP_ESTABLISHED : ProcedureReturn 14 : EndIf
+  If TcpLocalIp() <> wiredAlias Or TcpLinkKind() <> #HW_LINK_WIRED : ProcedureReturn 15 : EndIf
+
+  ; Same peer/ports/interface but a different local destination is not
+  ; this connection. It gets a RST sourced from the address it probed and
+  ; cannot alter the accepted socket.
+  rst0 = tcp_rst_tx
+  GateResetCapture()
+  GateQueueTcp(#HW_LINK_WIRED, peerWired, wiredIp, 42000, 5001, 101, ack, #TCP_ACK)
+  TcpPoll(0)
+  If tcp_rst_tx <> rst0 + 1 : ProcedureReturn 16 : EndIf
+  If TcpState() <> #TCP_ESTABLISHED : ProcedureReturn 17 : EndIf
+  If TcpLocalIp() <> wiredAlias : ProcedureReturn 18 : EndIf
+  If gate_txKind <> #HW_LINK_WIRED Or GateGet32(@gate_tx[26]) <> wiredIp : ProcedureReturn 19 : EndIf
+
+  ; Removing the exact accepted address ends the connection instead of
+  ; silently migrating it. A server returns to wildcard LISTEN.
+  NetSetIPv4Alt(#HW_LINK_WIRED, 0, 0)
+  TcpPoll(0)
+  If TcpState() <> #TCP_LISTEN : ProcedureReturn 20 : EndIf
+  If TcpLocalIp() <> 0 Or TcpLinkKind() <> #HW_LINK_NONE : ProcedureReturn 21 : EndIf
+
+  ; The same listener next accepts over Wi-Fi even though global route
+  ; selection still names Wi-Fi only by coincidence; acceptance itself
+  ; is proven by the receive kind and exact local destination.
+  GateResetCapture()
+  GateQueueTcp(#HW_LINK_WIFI, peerWifi, wifiIp, 43000, 5001, 200, 0, #TCP_SYN)
+  TcpPoll(0)
+  If TcpState() <> #TCP_SYN_RECEIVED : ProcedureReturn 22 : EndIf
+  If TcpLinkKind() <> #HW_LINK_WIFI Or TcpLocalIp() <> wifiIp : ProcedureReturn 23 : EndIf
+  If gate_txKind <> #HW_LINK_WIFI Or gate_txLen < 54 : ProcedureReturn 24 : EndIf
+  If GateGet32(@gate_tx[26]) <> wifiIp Or GateGet32(@gate_tx[30]) <> peerWifi : ProcedureReturn 25 : EndIf
+
+  ; Duplicate wildcard conflict remains in force after acceptance.
+  TcpUse(1)
+  If TcpListen(5001) <> #NET_TCP_E_BUSY : ProcedureReturn 26 : EndIf
+  TcpUse(0)
+  If NetSetIPv4Alt(#HW_LINK_WIRED, wiredAlias, $FFFFFF00) = 0 : ProcedureReturn 27 : EndIf
+  For i = 0 To 7
+    LinkUseKind(#HW_LINK_WIFI)
+    result = GateShortReceiver(#HW_LINK_WIRED, wiredAlias, peerWired, i)
+    If result <> 0 : ProcedureReturn 100 + i * 20 + result : EndIf
+    LinkUseKind(#HW_LINK_WIRED)
+    result = GateShortReceiver(#HW_LINK_WIFI, wifiIp, peerWifi, i)
+    If result <> 0 : ProcedureReturn 200 + i * 20 + result : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure

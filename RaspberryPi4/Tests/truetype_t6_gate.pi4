@@ -1,0 +1,80 @@
+EnableExplicit
+; Keep the emitted layout gate independent of the renderer/atlas aggregate.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_kern.pbi"
+XIncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+XIncludeFile "Anvil/Graphics/truetype_layout.pbi"
+
+#T6_META=$0F000000
+#T6_BASE=$10000000
+#T6_MAGIC=$54543652
+#T6_TEXT=$0E000000
+#T6_GLYPHS=$0F030000
+#T6_X=$0F031000
+#T6_Y=$0F032000
+#T6_ADV=$0F033000
+#T6_COUNT=$0F034000
+#T6_LINES=$0F034008
+#T6_WIDTH=$0F034010
+
+Procedure.i Main()
+  Protected bytes.i,mode.i,result.i,n.i
+  Dim values.i[8]
+  If PeekL(#T6_META)<>#T6_MAGIC : ProcedureReturn 1 : EndIf
+  bytes=PeekL(#T6_META+4) : mode=PeekL(#T6_META+8)
+  If AnvilTrueTypeOpen(#T6_BASE,bytes)=0 : ProcedureReturn 2 : EndIf
+  If AnvilTrueTypeMetricsOpen()=0 : ProcedureReturn 3 : EndIf
+  If AnvilTrueTypeKernOpen()=0 : ProcedureReturn 4 : EndIf
+  If AnvilTrueTypeGposOpen()=0
+    If mode=4 : ProcedureReturn 0 : EndIf
+    ProcedureReturn 200+AnvilTrueTypeGposErrorOffset()
+  EndIf
+  If mode=4 : ProcedureReturn 6 : EndIf
+  If AnvilTrueTypeGposOpenState()=0 : ProcedureReturn 7 : EndIf
+  If mode=3
+    If AnvilTrueTypeGposHasUnresolvedKern()=0 : ProcedureReturn 15 : EndIf
+    If AnvilTrueTypeGposPair(1,2,@values[0])<>0 Or AnvilTrueTypeGposError()<>#ANVIL_TG_E_UNSUPPORTED : ProcedureReturn 16 : EndIf
+    If AnvilTrueTypePairPosition(1,2,@values[0])=0 : ProcedureReturn 17 : EndIf
+    For n=0 To 7 : If values[n]<>0 : ProcedureReturn 18 : EndIf : Next
+    If AnvilTrueTypeGposError()<>#ANVIL_TG_E_UNSUPPORTED : ProcedureReturn 19 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If mode=2
+    If AnvilTrueTypeGposHasKernFeature()<>0 : ProcedureReturn 20 : EndIf
+    If AnvilTrueTypePairPosition(1,2,@values[0])=0 Or values[2]<>-30 : ProcedureReturn 21 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If AnvilTrueTypeGposPair(1,2,@values[0])=0 : ProcedureReturn 8 : EndIf
+  If values[0]<>3 Or values[1]<>-4 Or values[2]<>-150 Or values[3]<>0 Or values[4]<>5 Or values[5]<>6 Or values[6]<>30 Or values[7]<>0
+    ProcedureReturn 9
+  EndIf
+  If AnvilTrueTypePairPosition(1,2,@values[0])=0 : ProcedureReturn 10 : EndIf
+  If values[0]<>3 Or values[1]<>-4 Or values[2]<>-150 Or values[4]<>5 Or values[5]<>6 Or values[6]<>30 : ProcedureReturn 11 : EndIf
+  If AnvilTrueTypePairPosition(1,3,@values[0])=0 : ProcedureReturn 12 : EndIf
+  For n=0 To 7 : If values[n]<>0 : ProcedureReturn 13 : EndIf : Next
+  If AnvilTrueTypeKerning(1,2)<>-30 : ProcedureReturn 14 : EndIf
+  If AnvilTrueTypeCmapOpen()=0 : ProcedureReturn 16 : EndIf
+  If mode=5
+    result=AnvilTrueTypeLayoutUtf8(#T6_TEXT,5,20,40,24,#T6_GLYPHS,#T6_X,#T6_Y,#T6_ADV,#ANVIL_TTL_ALIGN_CENTER,8,#T6_COUNT,#T6_LINES,#T6_WIDTH)
+    If result=0 Or PeekL(#T6_COUNT)<>3 Or PeekL(#T6_LINES)<>2 : ProcedureReturn 17 : EndIf
+    If PeekI(#T6_WIDTH)<>1153433 Or PeekI(#T6_X)<>737935 Or PeekI(#T6_X+8)<>1199308 Or PeekI(#T6_X+16)<>983040 : ProcedureReturn 18 : EndIf
+    If PeekI(#T6_Y+16)<>-1572864 : ProcedureReturn 19 : EndIf
+    ProcedureReturn 0
+  ElseIf mode=6
+    result=AnvilTrueTypeLayoutUtf8(#T6_TEXT,5,20,0,24,#T6_GLYPHS,#T6_X,#T6_Y,#T6_ADV,#ANVIL_TTL_ALIGN_LEFT,8,#T6_COUNT,#T6_LINES,#T6_WIDTH)
+    If result=0 Or PeekL(#T6_COUNT)<>2 Or PeekL(#T6_LINES)<>4 Or PeekI(#T6_Y+8)<>-3145728 : ProcedureReturn 20 : EndIf
+    ProcedureReturn 0
+  ElseIf mode=7
+    result=AnvilTrueTypeLayoutUtf8(#T6_TEXT,2,20,0,24,#T6_GLYPHS,#T6_X,#T6_Y,#T6_ADV,#ANVIL_TTL_ALIGN_LEFT,8,#T6_COUNT,#T6_LINES,#T6_WIDTH)
+    If result=0 Or PeekL(#T6_COUNT)<>1 Or PeekL(#T6_LINES)<>2 Or PeekI(#T6_Y)<>-1572864 : ProcedureReturn 21 : EndIf
+    ProcedureReturn 0
+  EndIf
+  result=AnvilTrueTypeLayoutUtf8(#T6_TEXT,3,20,18,24,#T6_GLYPHS,#T6_X,#T6_Y,#T6_ADV,#ANVIL_TTL_ALIGN_LEFT,8,#T6_COUNT,#T6_LINES,#T6_WIDTH)
+  If result=0 Or PeekL(#T6_COUNT)<>3 Or PeekL(#T6_LINES)<>2 : ProcedureReturn 22 : EndIf
+  If PeekI(#T6_WIDTH)<>1153433 : ProcedureReturn 23 : EndIf
+  If PeekI(#T6_X+8)<>465305 : ProcedureReturn 24 : EndIf
+  If PeekI(#T6_Y+16)<>-1572864 : ProcedureReturn 25 : EndIf
+  ProcedureReturn 0
+EndProcedure
