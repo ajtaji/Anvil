@@ -207,10 +207,10 @@ list) and `RaspberryPi4/Lib/neon.pi4` (tiling/format material) rest on the same
 Mesa reading. For a block with one line of vendor documentation, that backend
 is the specification, and these two files are where that shows most.
 
-### `Anvil/Net/cyw43.pbi`, `cyw43_rx_glom.pi4` — Linux brcmfmac, read for SDIO and BCDC — **acknowledged in the files**
+### `Anvil/Net/cyw43.pbi`, `cyw43_rx_glom.pbi` — Linux brcmfmac, read for SDIO and BCDC — **acknowledged in the files**
 
 Both carry the ISC copyright line in their own headers and point at
-`licenses/Broadcom-brcmfmac-ISC.txt`. `cyw43_rx_glom.pi4` says "Adapted from
+`licenses/Broadcom-brcmfmac-ISC.txt`. `cyw43_rx_glom.pbi` says "Adapted from
 Linux brcmfmac `sdio.c`/`bcmsdh.c` receive-glom semantics" in its second line.
 Those acknowledgments stay as their authors wrote them, and
 `licenses/Broadcom-brcmfmac-ISC.txt` stays beside them.
@@ -552,6 +552,36 @@ Consolidating them is cheap and would make this inventory re-checkable from one
 place. It is recorded, not done: both trees are outside this repository and
 neither is this lane's to reorganize.
 
+### The CYW43455 move, and the ROCK Pi 4C gap (2026-09-22)
+
+The CYW43455 driver became a shared library under rule 30: `RaspberryPi4/Lib/cyw43.pi4`
+is gone and `RaspberryPi4/Lib/cyw43_rx_glom.pi4` is now a two-line compatibility
+include for `Anvil/Net/cyw43_rx_glom.pbi`. This table still named the old paths
+after the code moved; both are now `Anvil/Net/cyw43.pbi` and
+`Anvil/Net/cyw43_rx_glom.pbi`, matching `PROVENANCE.json`'s `third_party.relocations`
+entry for the move. No citation was added, removed or restated.
+
+Separately, and pre-existing rather than caused by that move: ten `RockPi4C/Lib/*.pbi`
+files cited `linux-v6.12` and/or `uboot-v2025.01` (mainline Linux's and U-Boot's RK3399
+drivers) with no inventory row at all — the ROCK Pi 4C board's provenance had never
+been classified in this document. Those ten rows are now added.
+
+Three of those ten (`dma_pl330.pbi`, `gpu_probe.pbi`, `hdmi.pbi`) were also flagged
+against `linux-dt-bcm2711` — the **Raspberry Pi 4's** Broadcom device tree. Reading
+them shows none cites anything Broadcom: each names an RK3399 (Rockchip) `.dtsi`
+file (`rk3399.dtsi`, `rk3399-base.dtsi`). The flag is a false positive from
+`linux-dt-bcm2711`'s own citation pattern, whose generic `*.dtsi` alternative
+matches any device-tree filename regardless of vendor, not just BCM2711's. Tightening
+that pattern is not done here: it is shared by every `linux-dt-bcm2711` row in this
+table, and two existing legitimate ones (`RaspberryPi3/Board/usb_diagnostic.pbi`'s
+`bcm283x-rpi-smsc9514.dtsi`-style citations) plus at least one that looks like the
+same mistake already committed (`ArduinoQ/Board/hwtimer_q.unoq` cites `agatti.dtsi`,
+which is not a Broadcom file either) depend on that same looseness or share the same
+bug. Filing a `linux-dt-bcm2711` row for the three ROCK Pi 4C files to quiet the
+checker would be recording a false citation, so it is reported here instead: the
+pattern needs a real fix (scoped to Broadcom/Raspberry Pi filenames) that also
+re-examines `hwtimer_q.unoq`, in its own change.
+
 ## Proven versus reasoned
 
 **Proven** — by reading the current source, the pinned upstream headers on disk,
@@ -796,15 +826,15 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/aes.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/bignum.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/core_worker.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
-| `RaspberryPi4/Lib/cyw43.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/cyw43_rx_glom.pi4` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
-| `RaspberryPi4/Lib/cyw43_rx_glom.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
+| `Anvil/Net/cyw43.pbi` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `Anvil/Net/cyw43.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Net/cyw43_rx_glom.pbi` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
+| `Anvil/Net/cyw43_rx_glom.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `Anvil/Network/dhcp.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/display.pi4` | reference-only | dejavu-fonts | DejaVu/Bitstream Vera | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/display.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
@@ -1100,3 +1130,18 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4XhciHw.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4XhciSelfTest.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RockPi4C/Lib/cdn_dp.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/cru.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/cru.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/dma_pl330.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/gpu_probe.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/hdmi.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/hdmi.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/pmic.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/sdmmc.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/sdmmc.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/security.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/vop.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/vop.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RockPi4C/Lib/watchdog.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RockPi4C/Lib/watchdog.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
