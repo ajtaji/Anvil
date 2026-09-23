@@ -1,0 +1,26 @@
+[all]
+# Anvil Raspberry Pi 3 family direct cold entry.
+# The Pi 3-specific stub starts at EL3 and keeps the complete Anvil image at
+# EL3. It preserves the firmware DTB pointer and parks secondary cores.
+arm_64bit=1
+kernel=kernel8.img
+kernel_address=0x200000
+armstub=armstub8.bin
+
+# Let Raspberry Pi firmware select the model-matched device tree from the
+# board revision. The Pi 3 family bundle contains the firmware's B and B+
+# DTBs; Raspberry Pi firmware maps A+ boards to the B+ equivalent.
+device_tree_address=0x1000000
+
+# Anvil's first diagnostics use PL011 on GPIO14/15. On Pi 3, Bluetooth owns
+# PL011 unless the official overlay releases it.
+enable_uart=1
+dtoverlay=disable-bt
+
+# Leave HPD truthful. Anvil defers display timing and framebuffer allocation
+# until a sink is connected, so a headless boot stays headless.
+# Use the panel's full active geometry; no firmware overscan border.
+disable_overscan=1
+# Keep the firmware rainbow visible during this first silicon diagnosis.  The
+# Anvil framebuffer replaces it after ARM entry reaches the display path.
+disable_splash=0

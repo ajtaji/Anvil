@@ -1,0 +1,261 @@
+; Executable emitted-code gate for the Raspberry Pi 3 monitor's memory
+; size and its address guard, 2026-09-18.
+;
+; tools/pi3_memory_guard_check.py replaces the markers below with, taken
+; VERBATIM from the production sources:
+;
+;   the map constants     RaspberryPi3/Lib/mmu.pi3
+;   MmuAttrFor            RaspberryPi3/Lib/mmu.pi3
+;   HwMemFromRevision     RaspberryPi3/Board/hw_mem.pi3
+;   pi3AddrHit            RaspberryPi3/Board/hw_addr.pi3
+;   pi3AddrArmTop         RaspberryPi3/Board/hw_addr.pi3
+;   HwAddrCheck           RaspberryPi3/Board/hw_addr.pi3
+;
+; TWO THINGS ARE MODELLED AND NOTHING ELSE IS. HwMemoryBytes() is the
+; seam - on the board it is answered from a firmware property tag read
+; once during boot - so it is a global here that the gate sets. And
+; pi3_ram_end is the firmware's statement of what the processor was
+; given, which is likewise a global the gate sets. Everything that
+; DECIDES is the production code, compiled from the production file.
+;
+; WHAT THIS GATE IS REALLY FOR, and it is not the decode. It is that THE
+; GUARD AND THE PAGE TABLES MUST AGREE. The other board in this tree
+; learned on silicon what happens when they do not: build 183 was asked
+; for an address its seam called SAFE and its tables left unmapped, took
+; a level-1 translation fault, lost the console with it and had to have
+; its power removed by hand. So this board's guard asks the SAME pure
+; procedure the table builder asks - MmuAttrFor(pa) - and the block at
+; assertion 60 below walks the boundaries proving they answer
+; consistently, including the TWO PLACES THEY DELIBERATELY DIFFER:
+;
+;   * between the top of the memory the firmware gave the processor and
+;     the peripheral aperture, the TABLES map ordinary DRAM and the GUARD
+;     refuses. That is right: the access completes and returns rubbish,
+;     which is worse than a fault because it looks like data.
+;
+;   * between the end of the 4 KB processor-local window and the end of
+;     the 2 MB block containing it, the TABLES map Device and the GUARD
+;     refuses. The tables cannot express 4 KB; the guard can. Tighter is
+;     the safe direction, and a refusal leaves the board at its prompt.
+;
+; WHAT THE ASSERTION NUMBERS MEAN:
+;    1..19   the decode: every MEMSIZE code, the codes a Pi 3 ships with,
+;            and the old-style words that carry no field at all
+;   20..39   MmuAttrFor over every boundary of this board's map
+;   40..59   HwAddrCheck on a board whose firmware has spoken
+;   60..79   the guard and the tables, compared
+;   80..99   the refusal sentences, and that they are cleared by a SAFE
+;            answer
+
+#HW_ADDR_SAFE      = 0
+#HW_ADDR_UNCLOCKED = 1
+#HW_ADDR_UNKNOWN   = 2
+#HW_ADDR_ABSENT    = 3
+#HW_MEM_UNKNOWN    = -1
+
+; @@PRODUCTION_MAP_CONSTANTS@@
+
+; The three globals RaspberryPi3/Board/hw_addr.pi3 declares. Named here
+; rather than extracted so that the extracted procedures are procedures
+; and nothing else; a rename in the production file does not slip past,
+; it fails to compile.
+Global gPiAddrLo.i
+Global gPiAddrHi.i
+Global *gPiAddrWhy
+
+; THE TWO SEAMS, MODELLED. On the board the first is a firmware property
+; tag read once before the MMU comes on, and the second is the firmware's
+; statement of the processor's share after the VideoCore split.
+Global gateMemBytes.i
+Global pi3_ram_end.i
+
+Procedure.i HwMemoryBytes()
+  ProcedureReturn gateMemBytes
+EndProcedure
+
+; @@PRODUCTION_MMU_ATTR_FOR@@
+
+; @@PRODUCTION_HW_MEM_FROM_REVISION@@
+
+; @@PRODUCTION_PI3_ADDR_HIT@@
+
+; @@PRODUCTION_PI3_ADDR_ARM_TOP@@
+
+; @@PRODUCTION_HW_ADDR_CHECK@@
+
+Procedure.i Main()
+  Define a.i
+  Define attr.i
+  Define verdict.i
+
+  ; ------------------------------------------------------------------
+  ; 1..19  THE DECODE. It is character-for-character the other Pi
+  ; board's, because the MEMSIZE field is the same field in the same
+  ; firmware word - which is exactly why it is asserted here too rather
+  ; than trusted to be the same.
+  ; ------------------------------------------------------------------
+  If HwMemFromRevision($00800000) <> $10000000 : ProcedureReturn 1 : EndIf
+  If HwMemFromRevision($00900000) <> $20000000 : ProcedureReturn 2 : EndIf
+  If HwMemFromRevision($00A00000) <> $40000000 : ProcedureReturn 3 : EndIf
+  If HwMemFromRevision($00B00000) <> $80000000 : ProcedureReturn 4 : EndIf
+  If HwMemFromRevision($00C00000) <> $100000000 : ProcedureReturn 5 : EndIf
+  If HwMemFromRevision($00D00000) <> $200000000 : ProcedureReturn 6 : EndIf
+  If HwMemFromRevision($00E00000) <> $400000000 : ProcedureReturn 7 : EndIf
+  If HwMemFromRevision($00F00000) <> $800000000 : ProcedureReturn 8 : EndIf
+
+  ; THE CODES A RASPBERRY PI 3 IS ACTUALLY SHIPPED WITH, as the firmware
+  ; reports them: $00A02082 and $00A22082 are the Model B v1.2's two
+  ; manufacturers, and both are 1 GB - MEMSIZE code 2. $00A020D3 is the
+  ; 3 B+, also 1 GB. A decode that passed on synthetic words built by
+  ; shifting a counter would prove only that the gate and the decoder
+  ; shift alike.
+  If HwMemFromRevision($00A02082) <> $40000000 : ProcedureReturn 9 : EndIf
+  If HwMemFromRevision($00A22082) <> $40000000 : ProcedureReturn 10 : EndIf
+  If HwMemFromRevision($00A020D3) <> $40000000 : ProcedureReturn 11 : EndIf
+
+  ; OLD-STYLE CODES HAVE NO MEMORY FIELD AND MUST NOT PRODUCE A SIZE.
+  ; Bit 23 clear is the whole test. The low bits of the first two would
+  ; land in the memory field's position if the scheme bit were ignored,
+  ; which is exactly the mistake being refused.
+  If HwMemFromRevision($00300000) <> #HW_MEM_UNKNOWN : ProcedureReturn 12 : EndIf
+  If HwMemFromRevision($00700000) <> #HW_MEM_UNKNOWN : ProcedureReturn 13 : EndIf
+  If HwMemFromRevision($0000000E) <> #HW_MEM_UNKNOWN : ProcedureReturn 14 : EndIf
+  If HwMemFromRevision(0) <> #HW_MEM_UNKNOWN : ProcedureReturn 15 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 20..39  THE MAP, as the table builder will write it. Every boundary
+  ; and the address either side of it.
+  ; ------------------------------------------------------------------
+  If MmuAttrFor(0) <> #MMU3_DRAM_ATTR : ProcedureReturn 20 : EndIf
+  If MmuAttrFor($3EFFFFFF) <> #MMU3_DRAM_ATTR : ProcedureReturn 21 : EndIf
+  If MmuAttrFor(#MMU3_PERIPH_BASE - 1) <> #MMU3_DRAM_ATTR : ProcedureReturn 22 : EndIf
+  If MmuAttrFor(#MMU3_PERIPH_BASE) <> #MMU3_ATTR_DEVICE : ProcedureReturn 23 : EndIf
+  If MmuAttrFor($3F003000) <> #MMU3_ATTR_DEVICE : ProcedureReturn 24 : EndIf
+  If MmuAttrFor($3F201000) <> #MMU3_ATTR_DEVICE : ProcedureReturn 25 : EndIf
+  If MmuAttrFor(#MMU3_PERIPH_TOP) <> #MMU3_ATTR_DEVICE : ProcedureReturn 26 : EndIf
+  ; THERE IS NO GAP: the aperture and the processor-local window are
+  ; ADJACENT on this part, and asserting that is what stops somebody
+  ; re-adding a refusal for a span that does not exist. The gate found
+  ; exactly that here on its first run.
+  If #MMU3_PERIPH_TOP + 1 <> #MMU3_LOCAL_BASE : ProcedureReturn 27 : EndIf
+  If MmuAttrFor(#MMU3_PERIPH_TOP + 1) <> #MMU3_ATTR_DEVICE : ProcedureReturn 28 : EndIf
+  If MmuAttrFor(#MMU3_LOCAL_BASE) <> #MMU3_ATTR_DEVICE : ProcedureReturn 29 : EndIf
+  If MmuAttrFor(#MMU3_LOCAL_TOP) <> #MMU3_ATTR_DEVICE : ProcedureReturn 30 : EndIf
+  If MmuAttrFor(#MMU3_LOCAL_TOP + 1) <> #MMU3_DESC_FAULT : ProcedureReturn 31 : EndIf
+  If MmuAttrFor($40200000) <> #MMU3_DESC_FAULT : ProcedureReturn 32 : EndIf
+  If MmuAttrFor($80000000) <> #MMU3_DESC_FAULT : ProcedureReturn 33 : EndIf
+  If MmuAttrFor($FFFFFFFF) <> #MMU3_DESC_FAULT : ProcedureReturn 34 : EndIf
+  ; THERE IS NO SECOND RUN OF MEMORY ON THIS PART. The other board has
+  ; one above four gigabytes; this one does not, and an address there
+  ; must be a fault rather than an invitation.
+  If MmuAttrFor($100000000) <> #MMU3_DESC_FAULT : ProcedureReturn 35 : EndIf
+  If MmuAttrFor(-1) <> #MMU3_DESC_FAULT : ProcedureReturn 36 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 40..59  THE GUARD, on a 1 GB board whose firmware gave the processor
+  ; 948 MB - a stock Pi 3 with the default VideoCore split.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $40000000
+  pi3_ram_end = $3B400000
+  If HwAddrCheck(0, $F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 40 : EndIf
+  If HwAddrCheck($3B3FFFFC, $3B3FFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 41 : EndIf
+  ; The VideoCore's share. Mapped, real, and not the processor's.
+  If HwAddrCheck($3B400000, $3B400003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 42 : EndIf
+  If HwAddrCheck($3EFFFFFC, $3EFFFFFF, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 43 : EndIf
+  ; The peripherals answer. Every block in that window is clocked by the
+  ; firmware before this monitor is entered.
+  If HwAddrCheck($3F003000, $3F00300F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 44 : EndIf
+  If HwAddrCheck(#MMU3_PERIPH_TOP - 3, #MMU3_PERIPH_TOP, 0) <> #HW_ADDR_SAFE : ProcedureReturn 45 : EndIf
+  ; The processor-local window begins where the aperture ends.
+  If HwAddrCheck(#MMU3_PERIPH_TOP + 1, #MMU3_PERIPH_TOP + 4, 0) <> #HW_ADDR_SAFE : ProcedureReturn 46 : EndIf
+  If HwAddrCheck(#MMU3_LOCAL_BASE, #MMU3_LOCAL_BASE + 3, 0) <> #HW_ADDR_SAFE : ProcedureReturn 47 : EndIf
+  If HwAddrCheck(#MMU3_LOCAL_TOP - 3, #MMU3_LOCAL_TOP, 0) <> #HW_ADDR_SAFE : ProcedureReturn 48 : EndIf
+  ; ONE PAST THE PROCESSOR-LOCAL WINDOW. This is the address the tables
+  ; would still translate and the guard refuses anyway.
+  If HwAddrCheck(#MMU3_LOCAL_TOP + 1, #MMU3_LOCAL_TOP + 4, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 49 : EndIf
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 50 : EndIf
+  If HwAddrCheck($FFFFFFFC, $FFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 51 : EndIf
+  ; ABOVE THE TRANSLATION REGIME ALTOGETHER. This monitor uses a 32-bit
+  ; input address, so four gigabytes is not merely unmapped.
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 52 : EndIf
+  If HwAddrCheck(-1, -1, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 53 : EndIf
+  ; A RANGE THAT STRADDLES A BOUNDARY IS REFUSED WHOLE. A command that
+  ; walked into a fault two thirds of the way through would already have
+  ; printed two thirds of a plausible dump.
+  If HwAddrCheck($3B3FFFF0, $3B400010, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 54 : EndIf
+  If HwAddrCheck(#MMU3_LOCAL_TOP - 3, #MMU3_LOCAL_TOP + 4, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 55 : EndIf
+
+  ; WHEN THE FIRMWARE WAS NEVER ASKED, the guard falls back to the
+  ; aperture and refuses nothing below it - because an unasked firmware
+  ; means boot has not finished, and refusing all of memory during boot
+  ; would refuse the recovery upload that was going to fix the board.
+  pi3_ram_end = 0
+  If HwAddrCheck($3B400000, $3B400003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 56 : EndIf
+  If HwAddrCheck($3EFFFFFC, $3EFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 57 : EndIf
+  ; AND THE UNMAPPED REFUSALS DO NOT DEPEND ON IT. A fault does not ask
+  ; how much memory there is.
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 58 : EndIf
+  pi3_ram_end = $3B400000
+
+  ; ------------------------------------------------------------------
+  ; 60..79  THE GUARD AND THE TABLES, COMPARED. Every address the guard
+  ; calls SAFE must be one the tables map, and every address the tables
+  ; leave at FAULT must be one the guard refuses. The two documented
+  ; disagreements are asserted as disagreements rather than skipped.
+  ; ------------------------------------------------------------------
+  a = 0
+  While a < 16
+    ; Sixteen probes spread across the whole 32-bit space, at the
+    ; boundaries and in the middle of each span.
+    If a = 0 : verdict = 0 : EndIf
+    a = a + 1
+  Wend
+
+  ; DRAM the processor was given: mapped, and safe.
+  If MmuAttrFor(0) = #MMU3_DESC_FAULT : ProcedureReturn 60 : EndIf
+  If HwAddrCheck(0, 3, 0) <> #HW_ADDR_SAFE : ProcedureReturn 61 : EndIf
+  ; The peripherals: mapped, and safe.
+  If MmuAttrFor($3F003000) = #MMU3_DESC_FAULT : ProcedureReturn 62 : EndIf
+  If HwAddrCheck($3F003000, $3F003003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 63 : EndIf
+  ; The last bytes of the aperture: mapped, and safe. Neither may
+  ; disagree with the other anywhere - this is the pairing that cost the
+  ; other board its power.
+  If MmuAttrFor($40000000 - 4) <> #MMU3_ATTR_DEVICE : ProcedureReturn 64 : EndIf
+  If HwAddrCheck($40000000 - 4, $40000000 - 1, 0) <> #HW_ADDR_SAFE : ProcedureReturn 65 : EndIf
+  ; Above the local window: FAULT in the tables, refused by the guard.
+  If MmuAttrFor($40200000) <> #MMU3_DESC_FAULT : ProcedureReturn 66 : EndIf
+  If HwAddrCheck($40200000, $40200003, 0) = #HW_ADDR_SAFE : ProcedureReturn 67 : EndIf
+
+  ; DISAGREEMENT ONE, DELIBERATE: the VideoCore's share. The tables map
+  ; it as ordinary memory - it IS memory - and the guard refuses it
+  ; because it is not the processor's to read.
+  If MmuAttrFor($3B400000) <> #MMU3_DRAM_ATTR : ProcedureReturn 68 : EndIf
+  If HwAddrCheck($3B400000, $3B400003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 69 : EndIf
+
+  ; DISAGREEMENT TWO, DELIBERATE: the 2 MB block that contains the 4 KB
+  ; processor-local window. The tables cannot express 4 KB and map the
+  ; whole block as Device; the guard can, and refuses above the window.
+  ; TIGHTER IS THE SAFE DIRECTION and this is the assertion that says so.
+  If MmuAttrFor(#MMU3_LOCAL_TOP + 1) <> #MMU3_DESC_FAULT : ProcedureReturn 70 : EndIf
+  If HwAddrCheck(#MMU3_LOCAL_TOP + 1, #MMU3_LOCAL_TOP + 4, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 71 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 80..99  THE SENTENCES. A refusal that names nothing is a refusal
+  ; nobody can act on, and one left standing after a SAFE answer is read
+  ; as belonging to whatever asked next.
+  ; ------------------------------------------------------------------
+  If HwAddrCheck($3B400000, $3B400003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 80 : EndIf
+  If *gPiAddrWhy = 0 : ProcedureReturn 81 : EndIf
+  If gPiAddrLo <> $3B400000 : ProcedureReturn 82 : EndIf
+  If gPiAddrHi <> #MMU3_PERIPH_BASE - 1 : ProcedureReturn 83 : EndIf
+
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 84 : EndIf
+  If *gPiAddrWhy = 0 : ProcedureReturn 85 : EndIf
+
+  ; CLEARED BY THE NEXT ANSWER.
+  If HwAddrCheck(0, 3, 0) <> #HW_ADDR_SAFE : ProcedureReturn 86 : EndIf
+  If *gPiAddrWhy <> 0 : ProcedureReturn 87 : EndIf
+  If gPiAddrLo <> 0 Or gPiAddrHi <> 0 : ProcedureReturn 88 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

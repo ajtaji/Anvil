@@ -1,0 +1,439 @@
+; Chapter 3 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   README.md                          - what is and is not bundled.
+;   RaspberryPi4/Board/armstub8.asm    - the EL3 stub, its own header.
+;   RaspberryPi4/Board/hw_id.pi4       - the banner text, #UART_BASE.
+;   Anvil/Core/flow_cmd.pbi            - PutIdLine / PutProcessorLine.
+;   RaspberryPi4/Board/memmap.pi4      - #MON_LO = $00200000.
+;   Anvil/Hal/hal.pbi                  - #NETCON_PORT = 5555.
+;   tools/anvil_wifi.py, tools/pi4_upload.py - the host side.
+;   docs/EL3_BOOT_ACCEPTANCE.md        - the acceptance and the boundary.
+;   Boards/RaspberryPi4/sdcard/        - the skeleton this chapter points
+;                                        at; its README.md is the same
+;                                        layout in reference form.
+;   Boards/RaspberryPi4/sdcard/SHA256SUMS - hashes for the packaged image and
+;                                          required EL3 stub.
+;
+; HISTORICAL TRANSCRIPT:
+;   The first-boot banner transcript below is from 2026-09-05 and reflects an
+;   old EL2 session. Current Anvil refuses EL2; the shipping config shown below
+;   selects the required EL3 stub; do not use the old EL2 transition steps.
+;
+; REDACTIONS in quoted transcripts: the wireless network name and the
+; board's hardware address are replaced with placeholders in angle
+; brackets. Nothing else is altered.
+@CHAPTER Installing Anvil on a Raspberry Pi 4
+@INTRO Six required files on a boot volume: three from Raspberry Pi and three from the Anvil package. Then a serial cable, and a prompt.
+
+@SECTION What this chapter assumes
+
+A Raspberry Pi 4 Model B. A boot volume the Pi's firmware can read - the
+bench this was written against boots from a **USB stick, not an SD
+card** - a USB-to-serial adapter, and the image you built in chapter 2.
+
+@NOTE On the card question. Everything in this chapter is about the FAT
+boot volume, and the layout is identical on an SD card. But be honest
+with yourself about what is proven: no procedure in this project has
+ever been executed against a Pi 4 SD card. The bench uses a stick. The
+host tool's `--to card` option is only the tool's word for "the boot
+medium"; it writes the stick. If you are on a card and something behaves
+differently, you are ahead of this book.
+
+@SECTION The short way: the skeleton in the repository
+
+If you would rather copy files than read forty paragraphs first,
+`Boards/RaspberryPi4/sdcard/` holds the Anvil files for the boot volume; add
+the three firmware files published by Raspberry Pi:
+
+@FRAG
+Boards/RaspberryPi4/sdcard/
+  kernel8.img            build 212 monitor image
+  armstub8.bin           required EL3 entry stub
+  SHA256SUMS             image and stub hashes
+  config.txt             selects the required EL3 stub
+  SETTINGS.TXT.example   optional; rename and edit
+  README.md              the card layout, and the first commands
+@ENDFRAG
+
+The package contains **build 212**, 4,200,128 bytes, SHA-256
+`d6d40968e176aba4d69501119d5a84c0f6d221763d7fbc3c4a285721c253294f`, and the
+512-byte EL3 stub with SHA-256
+`9f96324d137ebb4c1452ab00477ffe8c5bf77c53a3bb80ae7fb34234d693f2a2`. Verify
+both with `sha256sum -c SHA256SUMS` before copying. Build 212 is the current
+compiled package identity; the historical hardware acceptance record is
+Build 99, so these hashes do not claim that Build 212 itself has completed a
+new physical acceptance run.
+
+The rest of this chapter is the same thing with the reasons attached,
+and the reasons are what stop you losing an evening to `disable-bt`.
+
+@SECTION What goes on the boot volume
+
+Six required files. Three come from this repository.
+
+@FRAG
+start4.elf          Raspberry Pi firmware. Not in this repository.
+fixup4.dat          Its matching file. Not in this repository.
+bcm2711-rpi-4-b.dtb The device tree. Not in this repository.
+CONFIG.TXT          You write this. Contents below.
+KERNEL8.IMG         Boards/RaspberryPi4/sdcard/kernel8.img
+ARMSTUB8.BIN        Required EL3 firmware entry stub.
+@ENDFRAG
+
+@TRAP There is **no `bootcode.bin` on a Pi 4**. The Pi 4 boots its
+second stage from an onboard EEPROM. `bootcode.bin` is a Pi 3 file, and
+the only place it appears in this repository is the Pi 3's pinned
+firmware manifest. Copying a Pi 3 boot set onto a Pi 4 volume will not
+work and will waste your afternoon.
+
+@NOTE This repository deliberately does not bundle vendor boot firmware,
+a complete boot partition, or board-specific display configuration. Get
+the firmware files from the official Raspberry Pi firmware distribution.
+The vendor firmware files are not redistributed here. The Anvil image and
+stub are pinned by the package's `SHA256SUMS` file.
+
+Rename the image when you copy it:
+
+@FRAG
+copy build\pi4\anvil.img E:\KERNEL8.IMG
+@ENDFRAG
+
+@TRAP Names on the volume are **8.3**. The monitor's own filesystem code
+writes short directory entries only and generates no long-name chains,
+so a file it writes is `KERNEL8.IMG`, `SETTINGS.TXT`, `CONFIG.BAK` - and
+anything you put there with a long name will not be visible to it the
+way you expect. Keep every name you intend the board to touch inside
+eight characters plus three.
+
+If you want Wi-Fi, two more files from this repository go on the volume
+as well:
+
+@FRAG
+Firmware/CYW43455/brcmfmac43455-sdio.bin       -> BRCMFW.BIN
+Firmware/CYW43455/brcmfmac43455-sdio.clm_blob  -> BRCMCLM.BLB
+@ENDFRAG
+
+A third, the NVRAM file, is **deliberately not bundled** because it may
+carry calibration and identity data. You supply a board-appropriate one
+as `BRCMNV.TXT`. See `docs/LICENSING.md` for the redistribution terms on
+all three - the radio firmware is separately licensed and is not MIT.
+
+@SECTION config.txt
+
+This is the live bench file, quoted whole. The comments in it are the
+reasons, and they were all paid for:
+
+@FRAG
+# Raspberry Pi 4 / BCM2711 - bare-metal boot via U-Boot
+# PureMetal Forge, 2026-08-24
+
+arm_64bit=1
+
+kernel=kernel8.img
+kernel_address=0x200000
+armstub=armstub8.bin
+
+dtoverlay=disable-bt
+enable_uart=1
+init_uart_clock=48000000
+
+disable_overscan=1
+dtoverlay=vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a
+uart_2ndstage=1
+dtdebug=on
+@ENDFRAG
+
+The first two comments in the historical config referred to U-Boot. The
+current package boots Anvil directly from firmware; it does not load U-Boot.
+The active directives above select the required custom stub so Anvil enters
+at EL3.
+
+Line by line, the ones that matter:
+
+`kernel_address=0x200000` is **not optional**. Anvil is built to run at
+`0x200000`, and its BSS - which includes a large USB host arena - runs
+well past the end of the image. Loaded at the 64-bit default of
+`0x80000`, that BSS would reach down through `0x100000`, which is where
+Anvil puts its own stack. Loading it where it was linked keeps the
+memory map that has actually been tested.
+
+`dtoverlay=disable-bt` is **not optional either**, and this one cost an
+evening. With Bluetooth enabled, the Pi 4 gives header pins 8 and 10 to
+the mini-UART and routes the PL011 to the Bluetooth module. A program
+writing to the PL011 is then talking to a device that works perfectly
+and is not attached to any wire. Reads came back healthy, writes
+vanished, and nothing faulted. `disable-bt` puts the PL011 back on the
+header.
+
+`init_uart_clock=48000000` matters once the PL011 is back on the header.
+The mini-UART derives its baud rate from the video core clock, which the
+firmware scales; a PL011 with a pinned reference does not move.
+
+`disable_overscan=1` stops the firmware trimming 48 pixels from every
+edge of a TV-style HDMI mode. Without it, a 1920x1080 panel comes up as
+1824x984 - and it goes unnoticed, because the display code asks the
+firmware what the physical size is and then faithfully requests the
+already-shrunken answer.
+
+The `vc4-kms-dsi-waveshare-panel-v2` line is bench-specific: it is there
+for one particular DSI panel. If you have no DSI panel, leave it out.
+
+@SECTION Wiring the serial console
+
+Three wires, all on the even-numbered row of the header, consecutive:
+
+@FRAG
+adapter GND  ->  pin 6    GND
+adapter RX   ->  pin 8    GPIO14 / TXD0
+adapter TX   ->  pin 10   GPIO15 / RXD0
+@ENDFRAG
+
+Pin 2 is the corner nearest the USB-C end; pins 6, 8 and 10 are the
+third, fourth and fifth along that row. RX and TX cross - the adapter's
+receive takes the Pi's transmit.
+
+**115200 baud, 8 data bits, no parity, one stop bit, no flow control.**
+
+@TRAP **Leave the adapter's VCC disconnected.** The Pi powers itself.
+Back-feeding 5 V onto the header is how boards die. The serial lines are
+3.3 V TTL; never attach an RS-232 voltage-level port directly.
+
+@TRAP Ground can bite you in the other direction too. On this bench the
+serial adapter stopped enumerating on the host with "Device Descriptor
+Request Failed", and it came back the instant its **ground** wire was
+lifted off the Pi. A DSI panel's return current was flowing through the
+adapter's ground into the laptop. If you power a panel, give it its own
+5 V supply rather than the Pi's header pins.
+
+@SECTION First boot: what you will see
+
+The lines below are from a recorded board session of 2026-09-05. The
+network name and the board's hardware address are replaced with
+placeholders; nothing else is changed.
+
+@FRAG
+PureMetal Forge - Anvil, the Raspberry Pi 4 monitor. Version 2.0,
+64-bit AArch64, running with no operating system underneath it.
+The serial port is the PL011 at FE201000, set up from cold to 115200 baud,
+eight data bits, no parity, one stop bit.
+The processor is a Cortex-A72 in AArch64 at exception level 2.
+This monitor occupies 00200000 onwards, with its stack growing down
+from 00100000 and its variables at 0D000000.
+A payload may be loaded into either of these:
+  the low window   00400000 to 07EFFFFF   (about 123 MB)
+  the high window  40000000 to FBFFFFFF   (about 3 GB)
+The tick counter every timeout here is measured on runs at 54000000 Hz.
+Type info to see what board this is, or help for the list of commands.
+@ENDFRAG
+
+Then the board brings itself up, one line per thing it starts:
+
+@FRAG
+Bringing up the board - each line names what it is starting, so a
+hang or a failure shows exactly where.
+  PCI Express .......... ok
+  USB host (xHCI) ...... ok
+  USB devices .......... mass storage
+Mounted the USB stick, which calls itself Samsung  Flash Drive FIT  and
+holds 119 GB. Files will be read from and written to this.
+  settings ............. read from SETTINGS.TXT
+  firmware uploaded to the radio in 315 ms.
+Joining a known Wi-Fi network...
+  <your network>: using the cached key (no ten-second derivation this boot).
+    associated - running the four-way handshake...
+KEYED to <your network> - the link is up and encrypted.
+Wireless console listening on UDP 192.168.1.25 port 5555.
+  A host reaches it with tools/anvil_wifi.py <ip> - send it a line
+  and the prompt answers over the air. The serial console still works.
+  network  <your network>
+  MAC      <this board's MAC>
+  IP       192.168.1.25
+  netmask  255.255.255.0
+  router   192.168.1.2
+  console  UDP 192.168.1.25 port 5555 - reach it with tools/anvil_wifi.py
+pmf>
+@ENDFRAG
+
+That `pmf>` is the prompt. You are in.
+
+@NOTE "each line names what it is starting, so a hang or a failure shows
+exactly where" is not decoration. If your board stops, the last line
+printed is the thing that hung, and that is usually the entire diagnosis.
+A boot that stops at `USB host (xHCI)` and a boot that stops at
+`PCI Express` are completely different problems.
+
+@SECTION Two things about that banner
+
+**The exception level is read from the processor, not printed as prose.**
+The line above says "exception level 2" because that session was an EL2
+boot, before the firmware stub existed. With the stub installed it reads
+"exception level 3", because the code decodes the current level register
+and prints the digit it finds.
+
+@NOTE This transcript is historical and predates the EL3 stub. Hardware
+acceptance for the Pi 4 EL3 path is recorded in
+`docs/EL3_BOOT_ACCEPTANCE.md`; the current supported config selects the stub.
+On your board, verify the live level with `info` rather than relying on this
+old transcript.
+
+**The memory windows in the banner are the real ones**, measured at
+runtime rather than baked in. The monitor reads its own image extent
+symbols at boot and rounds its reservation up to a megabyte boundary.
+That is why chapter 6 insists you read `map` from the running monitor
+before staging anything, instead of copying an address out of a note.
+
+@SECTION The network console
+
+The monitor listens on **UDP port 5555** as soon as it has an address,
+on whichever interface holds one - the Ethernet cable or the Wi-Fi
+radio, wired preferred when both are up. Whoever sends it a datagram
+becomes the peer: from then on everything the monitor prints comes back
+as UDP, and every line you type is fed into its command input, exactly
+like the serial console.
+
+@FRAG
+python tools/anvil_wifi.py <board-ip>
+python tools/anvil_wifi.py <board-ip> "info"
+python tools/anvil_wifi.py --find
+@ENDFRAG
+
+The first is interactive. The second sends one command and prints the
+answer. The third broadcasts a `version` to every directly connected
+IPv4 subnet and lists who answers, together with the local interface
+that heard it - which is how you find a board whose address you have
+lost.
+
+@NOTE The tool is called `anvil_wifi.py` for historical reasons and the
+name is kept so older notes still work. It is the network console, same
+port and same datagrams over either link.
+
+@SECTION How the board gets an address
+
+Three rungs, tried in this order, and the boot log says which one it
+took in one line:
+
+@FRAG
+wired: lease from 192.168.137.1
+wired: saved address 192.168.137.2, no DHCP answer
+wired: link-local 169.254.170.250 (no DHCP answer)
+wired: no cable
+@ENDFRAG
+
+A DHCP lease first, because a DHCP server is the only thing on a segment
+that can say for certain an address is free. Then a saved address, if
+somebody typed one on purpose and ran `settings save` - that outranks
+anything the board invents for itself. Then a link-local address the
+board has proved free with its own probes, because an address it
+invented safely still beats no address, and no address means a board
+nobody can reach.
+
+The practical consequence is the one worth remembering:
+
+@NOTE **A Pi 4 on a bare Ethernet cable into a laptop answers its
+console after a reset with nothing typed on the board and nothing
+changed on the laptop.** No DHCP server, no connection sharing, no
+static address, no firewall rule. Both ends give themselves a
+link-local address the way the standard says to, and the board's is
+seeded from its hardware address - so it comes back to the same one
+across flashes.
+
+@TRAP A link-local address is **never** written to `SETTINGS.TXT`. If it
+were saved, the next boot would put a `169.254.x` address on the wire
+without probing whether it was still free. If you find one saved, some
+tool put it there and it is a bug.
+
+@SECTION Two commands to run first
+
+`version` tells you which image is running:
+
+@FRAG
+pmf> version
+@ENDFRAG
+
+It prints the build number from chapter 2, and the date and time that
+build was made. That is what the number is for.
+
+@TRAP **The build number is not an identity.** It is a label that a
+person reads, and a label can be stale if an image was built somewhere
+the counter did not reach. This bench once had an image reporting build
+20 that was actually build 21. **The length identifies it**, together
+with its CRC32 or SHA-256. Chapter 4 shows how to get both off the board
+itself.
+
+`map` tells you what memory is yours:
+
+@FRAG
+pmf> map
+@ENDFRAG
+
+Read it before you stage anything anywhere. Every host tool that writes
+to this board parses a validated `map` response from the running monitor
+and refuses unknown or malformed output. Do not derive an upload address
+from an example, from a previous build, or from this book.
+
+@SECTION The EL3 stub, and the reason to be careful
+
+Anvil's supported runtime is EL3 - the highest privilege level on this
+processor. `armstub8.bin` is required. The firmware loads it at address zero
+and enters it at EL3; it does the machine setup the stock stub does, then
+branches straight into `KERNEL8.IMG` without returning to EL2. The monitor
+checks its current exception level and refuses a lower-level entry.
+
+It is 512 bytes. It is a source translation of Raspberry Pi's own stub,
+pinned to a named upstream commit, and it keeps its upstream
+BSD-3-Clause notice.
+
+@TRAP **A monitor watchdog cannot repair a bad firmware-stage stub.** If
+the board fails before Anvil starts, nothing on the board can help you and you
+must restore files from a host. Keep physical access to the medium and a known
+good copy of both the image and stub before changing the package. Do not test
+the new monitor at EL2 first: Anvil refuses that entry level.
+
+@FRAG
+1. Back up the existing boot files and `CONFIG.TXT` to a host and verify the
+   backup.
+2. Copy `kernel8.img`, `armstub8.bin`, and `config.txt` from the same verified
+   package. Keep the firmware files already supplied for the board.
+3. Verify `kernel8.img` and `armstub8.bin` against that package's
+   `SHA256SUMS`; ensure `config.txt` contains `armstub=armstub8.bin`.
+4. Connect serial, power the board, and confirm `info` reports EL3 before
+   using other commands.
+@ENDFRAG
+
+If the board fails before the prompt, restore the complete known-good image,
+stub, and configuration from the host. Removing `armstub=` is not a usable
+Anvil fallback because the monitor deliberately refuses EL2.
+
+@SECTION Keep a way back
+
+Before you install anything, put a known-good image on the medium under
+its own name, and know the command that restores it:
+
+@FRAG
+pmf> load SCALEOK.IMG 800000
+pmf> save KERNEL8.IMG 800000 20C940
+pmf> reset
+@ENDFRAG
+
+That is a real recovery from this bench: a named spare image is loaded
+to a staging address, written over `KERNEL8.IMG`, and the board reset
+into it.
+
+@TRAP Two details in those three lines have each cost a board's worth of
+trouble. `save` takes an address and a **LENGTH**, in hex, not an end
+address - and so does `crc32`. And `load` with no address defaults to
+`00400000`, which on a large image can land on the tail of the running
+monitor. Stage at `800000`. Chapter 4 goes through the argument shapes
+properly.
+
+@TRAP **Never enter a monitor image as a payload.** `boot mem` places an
+image at the address it was built for, which for a monitor is
+`$00200000` - over the running monitor - and enters it. Do that while
+anything else is in flight and the board goes down with no console and
+no serial, and somebody has to pull the medium. This is not theoretical;
+it was avoided once by a margin of one command.
+
+If the board is silent on the serial line a minute or so after a reset,
+write down that it hung and what the last step was, and stop. A power
+cycle is the next move, not another command into the dark.

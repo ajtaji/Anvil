@@ -1,0 +1,1600 @@
+; ======================================================================
+;  board.pi3 - THE RASPBERRY PI 3 MODEL B COMPILE TARGET.
+;
+;      python tools/build.py pi3 --compiler <PureMetalForge.exe>
+;  This emits build/pi3/kernel8.img and its Pi 3 firmware armstub8.bin.
+;
+;  This is the third Anvil composition, after RaspberryPi4/Board/board.pi4
+;  and ArduinoQ/Board/board.unoq. It includes this board's hardware
+;  backends and the shared Anvil core, declares what this board can and
+;  cannot do, and holds Main(). Same core bytes as the other two.
+;  Different hardware. No fork.
+;
+;  Until 2026-09-18 this file was a program that printed and parked. What
+;  it is now is a composition, and everything that made that possible is
+;  one of two things: a library that already existed once, or a thin
+;  backend under it.
+;
+; ----------------------------------------------------------------------
+;  0. WHERE THIS IMAGE RUNS: IT IS kernel8.img
+; ----------------------------------------------------------------------
+;  Firmware loads this complete monitor at $200000 as kernel8.img. The
+;  separate Pi 3 armstub starts at EL3, parks secondary cores, preserves
+;  the firmware DTB in x0 and enters this image at masked EL3h. This Main
+;  path does not mount storage or perform A/B slot admission before the
+;  console; Anvil's own payload loader remains available after startup.
+;
+;  The load/BSS/stack addresses are shared with the firmware config and
+;  the direct Pi 3 build target. Firmware loads the image; no slot header
+;  is involved in normal monitor startup.
+;
+;  ENTRY CONTRACT: Main captures the firmware-provided DTB pointer in x0
+;  before ordinary code runs. The source validates that pointer against
+;  the RAM extent rather than replacing it with a slot handoff address.
+;
+;  The monitor does not inherit a slot-trial watchdog. Failures park with
+;  the serial reason intact; reset or replace kernel8.img to recover.
+; ----------------------------------------------------------------------
+LoadAddress  $200000
+BssAddress   $1100000
+StackAddress $1F00000
+
+; ----------------------------------------------------------------------
+;  THE BUILD NUMBER. An ordinary constant that `version` prints; the
+;  trailing marker is what makes a successful build raise it by one,
+;  writing back that one line and nothing else.
+;
+;  THIS BOARD COUNTS ITS OWN BUILDS. tools/build_count.py maps the target
+;  name `pi3` to this file, and `pi3-loader` and `pi3-updater` to the
+;  other two Pi 3 board files, so three programs on one board keep three
+;  numbers and none of them moves when another is built.
+; ----------------------------------------------------------------------
+#ANVIL_BUILD = 45 ; pmf:build
+#ANVIL_BUILD_DATE = 20260920 ; pmf:builddate
+#ANVIL_BUILD_TIME = 205259 ; pmf:buildtime
+
+; ======================================================================
+;  1. THIS BOARD'S LOW-LEVEL LIBRARIES.
+;
+;  These are the board's timer, UART, mailbox and SD host libraries.
+;  They are also shared by the separate recovery/updater programs. The
+;  direct monitor uses the SD host lazily after it has enabled the MMU.
+;
+;  Order: the timer first because the UART's bounded waits are measured
+;  against it, then the UART, then the mailbox, then the card.
+; ======================================================================
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "RaspberryPi3/Lib/sdio.pi3"
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
+XIncludeFile "Anvil/Graphics/edid.pbi"
+XIncludeFile "RaspberryPi3/Lib/framebuffer.pbi"
+XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
+
+; ----------------------------------------------------------------------
+;  This lane's two: the console seam over that UART, and the MMU.
+; ----------------------------------------------------------------------
+XIncludeFile "RaspberryPi3/Lib/pl011_console.pi3"
+XIncludeFile "RaspberryPi3/Lib/mmu.pi3"
+XIncludeFile "RaspberryPi3/Board/hwtimer.pi3"
+
+; ----------------------------------------------------------------------
+;  The board facts captured from firmware before anything reads them.
+;  pi3_ram_base/end come from ARM-memory properties; pi3_dtb is captured
+;  from the direct firmware entry argument x0.
+; ----------------------------------------------------------------------
+Global pi3_dtb.i
+Global pi3_dtb_end.i
+Global pi3_ram_base.i
+Global pi3_ram_end.i
+Global pi3_boot_status.i
+Global pi3_sd_core_actual.i
+Global pi3_sd_clock_ceiling.i
+Global pi3_wifi_link_active.i
+; Automatic radio work is admitted only after the first visible prompt and
+; never advances while a foreground command owns the parser.
+Global pi3_wifi_prompt_ready.i = 0
+Global pi3_wifi_foreground_active.i = 0
+Global pi3_wifi_auto_link_phase.i = 0
+Global pi3_wifi_auto_link_cancelled.i = 0
+Global pi3_wifi_auto_link_at.i = 0
+Global pi3_wifi_auto_link_error.i = 0
+Global pi3_wifi_auto_link_mac_ready.i = 0
+Global Dim pi3_wifi_auto_link_mac.a[6]
+#PI3_WIFI_LINK_WAIT_PROMPT = 0
+#PI3_WIFI_LINK_SETTINGS    = 1
+#PI3_WIFI_LINK_BACKOFF     = 2
+#PI3_WIFI_LINK_PROBE       = 3
+#PI3_WIFI_LINK_ASSETS      = 4
+#PI3_WIFI_LINK_PREPARE     = 5
+#PI3_WIFI_LINK_VERIFY      = 6
+#PI3_WIFI_LINK_FIRMWARE    = 7
+#PI3_WIFI_LINK_NVRAM       = 8
+#PI3_WIFI_LINK_START       = 9
+#PI3_WIFI_LINK_HT          = 10
+#PI3_WIFI_LINK_ANNOUNCE    = 11
+#PI3_WIFI_LINK_FUNCTION2   = 12
+#PI3_WIFI_LINK_UP_BEGIN    = 13
+#PI3_WIFI_LINK_MAC         = 14
+#PI3_WIFI_LINK_UP_FINISH   = 15
+#PI3_WIFI_LINK_JOIN_BEGIN  = 16
+#PI3_WIFI_LINK_JOIN_TICK   = 17
+#PI3_WIFI_LINK_READY       = 18
+#PI3_WIFI_LINK_RETRY_MS    = 60000
+; A one-shot timeout consumed by the next RunAt() payload entry. Zero is off.
+Global pi3_deadman_seconds.i
+Global Dim pi3_build_text.a[32]
+XIncludeFile "RaspberryPi3/Board/pi3_boot_primitives.pbi"
+
+; ======================================================================
+;  2. THIS BOARD'S CAPABILITIES - what it offers Anvil's command families.
+;
+;  1 means "a family gated behind this may assume the board's backend is
+;  present and works". 0 means Anvil cannot reach the group here -
+;  because the hardware is genuinely absent, or because no backend has
+;  been written for it yet. From the operator's seat those are the same
+;  fact and the same honest refusal, so one flag carries both; each line
+;  below says WHICH it is, because they are not the same fact for the
+;  next person to work here.
+;
+;  NOTHING IS 0 TO MAKE THE IMAGE SMALLER. Anvil/Hal/hal.pbi forbids that
+;  in as many words and nothing here is hidden that works.
+;
+;  They must be declared BEFORE Anvil/Hal/hal.pbi and before every gated
+;  command file, because that is where RequireCap reads them.
+; ======================================================================
+#CAP_STORAGE  = 1   ; YES. The card is reached through this board's own
+                    ; host driver behind the shared filesystems' block
+                    ; seam, and the file family comes from
+                    ; Anvil/Storage/hwfile.pbi, which every board with a
+                    ; block device answers with. Nothing about FAT32 or
+                    ; exFAT is written twice.
+#CAP_NET      = 1   ; The Pi 3 SDIO/CYW43 transport, firmware startup,
+                    ; WPA2 association, DHCP, UDP console, and CRC-checked
+                    ; wireless block receiver passed the combined hardware
+                    ; proof. Pi 3 exposes its focused `wifi` and `wb` paths;
+                    ; Pi 4-only general net command files remain excluded.
+#CAP_GPIO     = 0   ; NO BACKEND. The block is at $3F200000 and this
+                    ; monitor already writes it - the console's pin mux
+                    ; and the card's - so this is unwritten work rather
+                    ; than unreachable hardware. What it needs first is
+                    ; the reserved-pin list: the console on 14 and 15,
+                    ; the card on 48 to 53 and the radio on 34 to 39, any
+                    ; of which takes the machine down under itself.
+#CAP_I2C      = 0   ; NO BACKEND. Two Broadcom Serial Controllers, and
+                    ; nothing in this tree drives either.
+#CAP_TOUCH    = 0   ; NO PANEL. Not unwritten work - there is no touch
+                    ; controller on this bench's board and no plan.
+#CAP_MMC      = 0   ; NOT OFFERED, AND THE CARD WORKS. The raw-block
+                    ; family has no monitor-owned policy covering the
+                    ; firmware files, kernel8.img and user files together.
+#CAP_USB      = 0   ; NO BACKEND IN THIS IMAGE - see #CAP_NET.
+#CAP_PWM      = 0   ; NO BACKEND, and a Model B has no fan header for the
+                    ; family's main use.
+#CAP_BOOT_EL1 = 0   ; REACHABLE AND NOT WRITTEN. This monitor runs at EL3,
+                    ; but an EL1 kernel handoff still needs the caches
+                    ; and MMU returned to the kernel's required state,
+                    ; which has never been implemented or proven here.
+#CAP_CONSOLE  = 1   ; HDMI pixel surface is firmware-allocated and validated
+                    ; at startup when a display is attached. HwCon* draws
+                    ; through the bounded CPU adapter; dimensions come from
+                    ; the accepted framebuffer response, never a fixed mode.
+#CAP_GNSS     = 0   ; NO RECEIVER.
+#CAP_UART     = 0   ; NO SECOND PORT OFFERED. The console's PL011 is the
+                    ; console's; the mini-UART is not driven.
+#CAP_SPI      = 0   ; NO BACKEND.
+#CAP_VEHLINK  = 0   ; NO BACKEND and no unit.
+#CAP_RTC      = 0   ; NO CLOCK HARDWARE. A Pi keeps no time across a
+                    ; power cut without an add-on board, and there is
+                    ; none here - so this is genuine absence.
+#CAP_PARALLEL = 0   ; NO SECONDARY-CORE OWNER. The part has four A53s and
+                    ; this monitor starts one. The spin table is the
+                    ; firmware's; claiming the group without a core owner
+                    ; would let a payload ask for workers that never come.
+
+; ======================================================================
+;  3. THE HAL SEAM, THE SHARED LIBRARIES, AND THIS BOARD'S BACKENDS.
+;
+;  ORDER IS THE WHOLE OF THIS SECTION AND IT IS NOT ARBITRARY:
+;
+;    hal.pbi needs the capability constants above it.
+;    state.pbi owns #CRC_POLY, which crc.pbi reads.
+;    format.pbi owns PutAddr, which hw_mem.pi3 prints with.
+;    The filesystems need crc and sha256 under them.
+;    hwfile.pbi DECLARES gHwFileMounted / gHwFileWritable / gHwFileWriter
+;      and storage.pi3 ASSIGNS them, so the shared file comes first -
+;      the same order board.pi4 uses for the same reason.
+;    hw_mem.pi3 comes before hw_addr.pi3, which asks it.
+; ======================================================================
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Kernel/exceptions.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+
+; The shared USB core - the descriptor vocabulary and the walk over it,
+; which Anvil/Core/usb_cmd.pbi decodes with. INCLUDED EVEN THOUGH
+; #CAP_USB IS 0 ON THIS BOARD: a configuration descriptor has the same
+; shape on every bus on every board, so the decoding is written once and
+; a board only fetches. With no host backend here nothing ever fetches,
+; the `usb` family refuses at the gate, and this costs the constants and
+; the dead code - which is the price of the core being one set of bytes
+; for every board.
+XIncludeFile "Anvil/Bus/usb_core.pbi"
+
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+XIncludeFile "Anvil/Storage/hwfile.pbi"
+XIncludeFile "Anvil/Storage/ab_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/boot_record.pbi"
+
+XIncludeFile "RaspberryPi3/Board/memmap.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_mem.pi3"
+XIncludeFile "RaspberryPi3/Lib/wifi_profile.pi3"
+XIncludeFile "RaspberryPi3/Lib/wifi_rng.pi3"
+; The register-free receive-glom parser is shared with CYW43 and precedes
+; the backplane/identity library that consumes its limits.
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+XIncludeFile "RaspberryPi3/Board/hw_addr.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_id.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_board.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_mod.pi3"
+XIncludeFile "RaspberryPi3/Board/storage.pi3"
+Declare Pi3WifiNetworkRxTick()
+Declare Pi3WifiAutoLinkTick()
+XIncludeFile "RaspberryPi3/Board/pi3stubs.pi3"
+
+; The board's identity for the payload ABI, one of Anvil/Hal/abi.pbi's
+; #SVC_BOARD_* codes. INFORMATIONAL ONLY - a payload that branches on it
+; has re-forked the thing the capability model exists to prevent, and the
+; ABI gate looks for exactly that. 3 was appended to that vocabulary for
+; this board; the list is append-only, so nothing that already knew 1 and
+; 2 changes meaning.
+#SVC_BOARD_ID = 3   ; #SVC_BOARD_PI3
+
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Hal/abi.pbi"
+
+; ======================================================================
+;  4. THE SHARED ANVIL CORE, included unchanged. Not one of these files
+;     knows which board it is on.
+; ======================================================================
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+Declare NetDhcpTick()
+Declare NetConsoleRearm()
+Declare NetConsolePump()
+Declare NetConsoleLlTick()
+Declare.i NetConsoleGetc()
+XIncludeFile "Anvil/Core/parse.pbi"
+XIncludeFile "Anvil/Core/messages.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+XIncludeFile "Anvil/Core/addrsafe.pbi"
+XIncludeFile "Anvil/Core/xfer.pbi"
+XIncludeFile "Anvil/Core/argfmt.pbi"
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "Anvil/Core/memcmd.pbi"
+XIncludeFile "Anvil/Core/uptime.pbi"
+XIncludeFile "Anvil/Core/flow_cmd.pbi"
+XIncludeFile "Anvil/Core/gpio_cmd.pbi"
+XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+XIncludeFile "Anvil/Core/mmc_cmd.pbi"
+XIncludeFile "Anvil/Core/usb_cmd.pbi"
+XIncludeFile "Anvil/Core/boot_cmd.pbi"
+XIncludeFile "Anvil/Core/datapath.pbi"
+XIncludeFile "Anvil/Core/fs_cmd.pbi"
+XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
+XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+XIncludeFile "Anvil/Core/fan.pbi"
+XIncludeFile "Anvil/Core/fan_cmd.pbi"
+; The same renderer-neutral TrueType parser, resident slots, and font
+; commands used by the other monitor. Pi 3 rasterizes to its NC backbuffer;
+; the framebuffer owner still presents only through DMA.
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+XIncludeFile "Anvil/Core/font_cmd.pbi"
+XIncludeFile "Anvil/Core/help.pbi"
+
+; The Pi 3 Wi-Fi backend defers radio work until the visible prompt is
+; servicing idle input. net/netif/DHCP and the UDP console use the shared
+; implementation; `wb` is the same range-checked CRC receiver. The Pi 4-only
+; `net` and `wifi` command files stay excluded.
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "Anvil/Core/netif.pbi"
+XIncludeFile "Anvil/Network/dhcp.pbi"
+; DNS query/reply codec is board-neutral; its network byte-order helpers
+; are supplied by the shared net.pbi above.
+XIncludeFile "Anvil/Network/dns_codec.pbi"
+; netfmt retains shared diagnostics for Ethernet/TFTP paths. Pi 3 has no
+; GENET or TFTP backend, so those messages must fail closed if called.
+Procedure.i GenetErrorText()
+  ProcedureReturn "GENET is not present on Pi 3"
+EndProcedure
+Procedure.i TftpErrorText()
+  ProcedureReturn "TFTP is not available on Pi 3"
+EndProcedure
+XIncludeFile "Anvil/Core/netfmt.pbi"
+XIncludeFile "Anvil/Core/sntp_codec.pbi"
+XIncludeFile "Anvil/Core/ntp_service.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
+XIncludeFile "Anvil/Crypto/sha1.pbi"
+XIncludeFile "Anvil/Crypto/hmacsha1.pbi"
+XIncludeFile "Anvil/Crypto/pbkdf2.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/keywrap.pbi"
+XIncludeFile "Anvil/Net/wpa2sup.pbi"
+XIncludeFile "Anvil/Net/wifi_join_policy.pbi"
+XIncludeFile "Anvil/Net/wifi_assoc.pbi"
+XIncludeFile "RaspberryPi3/Lib/wifi_bringup.pi3"
+XIncludeFile "RaspberryPi3/Board/hw_link_wifi.pi3"
+Global pi3_wifi_join_abort.i
+Declare NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
+Declare NetAddressLost(kind.i)
+; The Pi 3 build serves as a Wi-Fi client only. The common console still
+; distinguishes UDP/67, but there is intentionally no DHCP-server policy
+; or command on this target, so DHCP server input is left unhandled.
+Procedure.i DhcpdInput(kind.i, *packet, n.i, fromIp.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i DhcpdOn()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i DhcpdKind()
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+Procedure DhcpdStop()
+EndProcedure
+; Pi 3 has one IP-capable interface and no link-pin command; let the shared
+; per-interface policy choose its only usable Wi-Fi address.
+Procedure.i LinkPin()
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+XIncludeFile "Anvil/Core/netconsole.pbi"
+; Pi 3 serves the shared UDP network console only; it has no TCP/HTTP
+; listener. The shared scheduler hook remains an explicit no-op.
+Procedure HttpServerPoll()
+EndProcedure
+XIncludeFile "RaspberryPi3/Lib/wifi_network.pi3"
+
+; NetCfg is intentionally not imported: that module owns the Pi 4 wired
+; compatibility globals and configuration commands. The common DHCP worker
+; needs only this per-interface lease tail on Pi 3.
+Procedure NetAddressBound(kind.i, ip.i, mask.i, gw.i, src.i)
+  NetIfSet(kind, ip, mask, gw, src)
+  If src = #NET_ADDR_LEASE
+    NetIfSetLease(kind, DhcpClientLeaseLeft(kind), millis())
+    NetIfSetDns(kind, DhcpClientDns(kind))
+  Else
+    NetIfSetLease(kind, 0, 0)
+    NetIfSetDns(kind, 0)
+  EndIf
+  HwLinkAddressBound(kind, ip, mask, gw)
+  NetConsoleRearm()
+EndProcedure
+
+Procedure NetAddressLost(kind.i)
+  NetIfClear(kind)
+  HwLinkAddressBound(kind, 0, 0, 0)
+  NetConsoleRearm()
+EndProcedure
+
+; Deferred workspace for post-prompt automatic bring-up and explicit `wifi
+; start`. Long radio blobs live in RAM only after prompt servicing begins;
+; they are not read or initialized on the fast boot path. Long-word arrays
+; keep every DMA/source buffer naturally word aligned and leave padding beyond
+; exact file lengths.
+Global pi3_wifi_resident_radio_ready.i
+Global pi3_wifi_resident_joined.i
+Global pi3_wifi_resident_error.i
+Global pi3_wifi_resident_profile.i
+Global pi3_wifi_resident_fw_bytes.i
+Global pi3_wifi_resident_clm_bytes.i
+Global pi3_wifi_resident_nvram_bytes.i
+Global Dim pi3_wifi_resident_firmware.l[99836]
+Global Dim pi3_wifi_resident_clm.l[1184]
+Global Dim pi3_wifi_resident_nvram_text.l[4096]
+Global Dim pi3_wifi_resident_nvram_runtime.l[4096]
+Global Dim pi3_wifi_resident_nvram_work.l[4096]
+Global Dim pi3_wifi_resident_scratch.l[512]
+#PI3_WIFI_JOIN_WALL_MS = 65000
+Global pi3_wifi_join_started.i
+
+; ======================================================================
+;  5. DIRECT FIRMWARE BOOT
+; ======================================================================
+;  Two constraints shape every line of Main(), and neither is negotiable.
+;
+;  FIRMWARE PROPERTY CALLS NEED A VERIFIED COHERENT BUFFER.
+;  The generic mailbox entry allows the cold cache-off boot path, and the
+;  post-MMU path only when M/C are both enabled and the entire buffer is
+;  proven to use a registered Normal Non-Cacheable page-table descriptor.
+;  Mixed cache/MMU state and unregistered buffers are refused. Startup
+;  captures the DTB, RAM, board revision and boot clocks before MmuUp();
+;
+;  THE ORDER, THEREFORE:
+;      UART first, so that everything after it can say what went wrong
+;      the firmware questions, while they can still be asked
+;      the firmware properties, clock state and HDMI allocation
+;      validated normal mappings and caches
+;      optional SD initialization on the first file command
+;      the banner and the prompt
+; ======================================================================
+
+; The monitor validates firmware RAM and its supplied DTB before using
+; either pointer for general boot work.
+Procedure.i Pi3MonitorBootMemory()
+  Define buffer.i
+  Define size.i
+  Define total.i
+  If pi3_mailbox_outstanding <> 0 : ProcedureReturn 0 : EndIf
+  buffer = ((@pi3_property[0] + 15) >> 4) << 4
+  PokeL(buffer,32) : PokeL(buffer + 4,0)
+  PokeL(buffer + 8,$10005) : PokeL(buffer + 12,8)
+  PokeL(buffer + 16,0) : PokeL(buffer + 20,0)
+  PokeL(buffer + 24,0) : PokeL(buffer + 28,0)
+  If Pi3MailboxCall(buffer,32) = 0 : ProcedureReturn 0 : EndIf
+  If PeekL(buffer + 8) <> $10005 Or PeekL(buffer + 12) <> 8 Or (PeekL(buffer + 16) & $FFFFFFFF) <> $80000008
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_base = PeekL(buffer + 20) & $FFFFFFFF
+  size = PeekL(buffer + 24) & $FFFFFFFF
+  If pi3_ram_base <> 0 Or size < $3000000 Or size > $3F000000
+    ProcedureReturn 0
+  EndIf
+  pi3_ram_end = pi3_ram_base + size
+  If pi3_dtb < $1000 Or (pi3_dtb & 7) <> 0 Or pi3_dtb > pi3_ram_end - 40 : ProcedureReturn 0 : EndIf
+  If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
+  total = Pi3ReadBe32(pi3_dtb + 4)
+  If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
+    ProcedureReturn 0
+  EndIf
+  pi3_dtb_end = pi3_dtb + total
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pi3BootFail(*why) - say it, then park.
+;
+;  ONE PLACE, so that every failure in the window looks the same and none
+;  of them forgets to drain the port before the watchdog resets the
+;  board. UartDrain() waits for the last stop bit; without it the reason
+;  is cut off mid-sentence and the operator sees a board that reset for
+;  no stated cause.
+; ----------------------------------------------------------------------
+Procedure Pi3BootFail(*why)
+  PrintN("!! Anvil could not start on this board.")
+  Print("   ")
+  UartWriteStr(*why)
+  PrintNl()
+  PrintN("   The direct kernel image has no slot watchdog or automatic fallback.")
+  PrintN("   Correct kernel8.img or firmware configuration, then reset the board.")
+  UartDrain()
+  Pi3Park()
+EndProcedure
+
+Procedure Pi3DirectFaultReport()
+  UartWriteStr("!! fatal processor exception; monitor parked. ESR=$")
+  PutHexN(ExceptionEsr(), 8)
+  UartWriteStr(" ELR=$")
+  PutHexN(ExceptionElr(), 16)
+  UartWriteStr(" FAR=$")
+  PutHexN(ExceptionFar(), 16)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdPi3Info() - what this computer is, as this board can answer it.
+;
+;  THE RAM ROW IS THE ONE WORTH READING TWICE. It reports the memory
+;  FITTED, from the board revision code, because that is what the question
+;  "how much memory does this computer have" means. What the processor was
+;  actually GIVEN is smaller and is printed under it, with the reason:
+;  the VideoCore takes its share, and the top sixteen megabytes of the
+;  gigabyte are under the peripheral window and - unlike the other Pi in
+;  this tree - do not reappear anywhere. Three different true numbers, and
+;  a monitor that printed one of them as all three would be lying twice.
+; ----------------------------------------------------------------------
+Procedure CmdPi3Info()
+  PrintN("")
+  Print("board       ") : UartWriteStr(HwIdBoard())
+  Print(", ") : UartWriteStr(HwIdCpu())
+  Print(", four cores, one started")
+  If HwMemoryRevision() <> 0
+    Print("   (revision code $") : PutHexN(HwMemoryRevision(), 8) : Print(")")
+  EndIf
+  PrintNl()
+
+  Print("RAM         ") : PutMemBytes(HwMemoryBytes())
+  Print(", from ") : UartWriteStr(HwMemoryWhere()) : PrintN(".")
+  HwMemSayArm()
+
+  Print("exception   EL") : PrintDec(HwIdEl()) : PrintN("")
+  Print("translation ")
+  If (HwMmuState() & 1) = 0
+    PrintN("off - which this monitor never runs with; say so if you see it")
+  Else
+    Print("on, ")
+    If (HwMmuState() & 2) <> 0
+      Print("data cache on, ")
+    Else
+      Print("data cache OFF, ")
+    EndIf
+    If (HwMmuState() & 4) <> 0
+      PrintN("instruction cache on")
+    Else
+      PrintN("instruction cache OFF")
+    EndIf
+  EndIf
+
+  PrintN("")
+  HwIdSayConsole()
+  PrintN("")
+  HwStorageReport()
+  PrintN("")
+  HwAddrReport()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CmdPi3Reset() - reset the board through the power-management watchdog.
+;
+;  IT SAYS SO AND DRAINS FIRST. HwReboot() waits for the last stop bit
+;  before it writes the register, so the sentence reaches the operator
+;  rather than being cut off by the reset it is announcing.
+; ----------------------------------------------------------------------
+Procedure CmdPi3Reset()
+  PrintN("resetting. Firmware will reload kernel8.img from the boot partition.")
+  HwReboot()
+EndProcedure
+
+Procedure CmdPi3Deadman()
+  Define n.i
+  Define k.i
+  Define c.i
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If gWordLen = 0
+    If pi3_deadman_seconds > 0
+      Print("The next payload has a one-shot watchdog for ")
+      PrintDec(pi3_deadman_seconds)
+      PrintN(" seconds.")
+    Else
+      PrintN("The payload watchdog is off.")
+    EndIf
+    PrintN("  deadman <1..15> arms the next payload; deadman off clears it.")
+    ProcedureReturn
+  EndIf
+  If WordIs("off") <> 0
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("? deadman off takes no extra words; the setting is unchanged.")
+      ProcedureReturn
+    EndIf
+    pi3_deadman_seconds = 0
+    PrintN("The next-payload watchdog is off.")
+    ProcedureReturn
+  EndIf
+  ; Accept decimal digits only, so a mistyped hexadecimal value cannot
+  ; silently become a timeout with a different meaning.
+  k = 0
+  While k < gWordLen
+    c = gLine[gWordAt + k] & $FF
+    If c < 48 Or c > 57
+      PrintN("? give whole decimal seconds from 1 to 15, or type off.")
+      ProcedureReturn
+    EndIf
+    k = k + 1
+  Wend
+  gPos = gWordAt
+  n = ParseDec()
+  If gParseOk = 0 Or gParseOver <> 0 Or n < 1 Or n > 15
+    PrintN("? give whole decimal seconds from 1 to 15, or type off.")
+    ProcedureReturn
+  EndIf
+  SkipSpace()
+  If gLine[gPos] <> 0
+    PrintN("? deadman accepts one number only; the setting is unchanged.")
+    ProcedureReturn
+  EndIf
+  pi3_deadman_seconds = n
+  Print("The next payload gets a one-shot ")
+  PrintDec(n)
+  PrintN(" second hardware watchdog. It is armed just before entry and")
+  PrintN("stopped only if that payload returns.")
+EndProcedure
+
+; Read-only `font info` must not cancel the deferred font.default restore.
+; Only explicit slot/settings-changing verbs take ownership of the shared
+; font buffers. Preserve the parser cursor because CmdFont parses the same
+; subcommand immediately afterwards.
+Procedure.i Pi3FontCommandMutates()
+  Protected savedPos.i
+  Protected savedWordAt.i
+  Protected savedWordLen.i
+  Protected savedParseOk.i
+  Protected mutates.i
+  savedPos = gPos
+  savedWordAt = gWordAt
+  savedWordLen = gWordLen
+  savedParseOk = gParseOk
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  mutates = 0
+  If WordIs("load") <> 0 Or WordIs("select") <> 0 Or WordIs("unload") <> 0 Or WordIs("size") <> 0 Or WordIs("default") <> 0
+    mutates = 1
+  EndIf
+  gPos = savedPos
+  gWordAt = savedWordAt
+  gWordLen = savedWordLen
+  gParseOk = savedParseOk
+  ProcedureReturn mutates
+EndProcedure
+
+; Guarded first-stage radio probe. It reads standardized CIS identity,
+; enables only SDIO function 1, then uses the shared CYW43 attach path to
+; read the actual silicon ID/revision and EROM. Attach performs only the
+; documented SDIO function setup, clock request and backplane reads; it
+; does not reset a radio core or upload firmware/NVRAM/CLM.
+Procedure Pi3WifiResidentInvalidate()
+  ; A fresh SDIO probe asserts the module reset line. Clear software link,
+  ; DHCP, key, and console ownership first so status/service code cannot
+  ; advertise state belonging to the radio instance being torn down.
+  pi3_wifi_resident_radio_ready = 0
+  pi3_wifi_resident_joined = 0
+  pi3_wifi_link_active = 0
+  pi3_wifi_resident_profile = 0
+  pi3_wifi_radio_profile = 0
+  pi3_wifi_radio_core_family = 0
+  Pi3HwWifiSetRawHandler(0)
+  Pi3HwWifiSetMac(0)
+  Pi3WifiAssocWipeCandidate()
+  Pi3WifiAssocWipeHandshake()
+  pi3_wifi_assoc_keyed = 0
+  pi3_wifi_ip_started = 0
+  NetDhcpCancel(#HW_LINK_WIFI)
+  If NetIfRxOwner() = #HW_LINK_WIFI : NetIfReleaseRx() : EndIf
+  NetAddressLost(#HW_LINK_WIFI)
+  HwLinkConsoleArmed(#HW_LINK_WIFI, 0)
+EndProcedure
+
+Procedure.i Pi3WifiProbeBody(profile.i, quiet.i)
+  Define clock.i
+  If profile = 0 Or Pi3WifiBoardSdioBase() <> #P3SDIO_BASE Or Pi3WifiBoardBusWidth() <> 4
+    ProcedureReturn 1
+  EndIf
+  Pi3WifiResidentInvalidate()
+  If quiet = 0 : PrintN("wifi probe: querying the profile's SDHCI source clock.") : UartDrain() : EndIf
+  clock = Pi3ClockRate(Pi3WifiBoardClockId())
+  If clock < 1000000 : ProcedureReturn 2 : EndIf
+
+  If quiet = 0 : PrintN("wifi probe: initializing SDHCI and enumerating SDIO.") : UartDrain() : EndIf
+  ; Firmware may leave the alternate EMMC/SDHCI mux on GPIO48..53. Route the
+  ; boot-card pins through the exact SDHOST pinctrl path before using the
+  ; independent SDHCI Wi-Fi group, regardless of whether storage mounted.
+  If Pi3SdRoutePins() = 0 : ProcedureReturn 4 : EndIf
+  Pi3SdioSetResetCallback(@Pi3WifiBoardSetReset, Pi3WifiBoardResetWired())
+  If Pi3SdioInit(clock, Pi3WifiBoardBusWidth()) = 0 : ProcedureReturn 5 : EndIf
+  If quiet = 0 : PrintN("wifi probe: reading CCCR and bounded common/function CIS tuples.") : UartDrain() : EndIf
+  If Pi3SdioDiscover() = 0 : ProcedureReturn 6 : EndIf
+  If Pi3SdioFunctionCount() < 1 : ProcedureReturn 7 : EndIf
+  If quiet = 0 : PrintN("wifi probe: enabling SDIO function 1 and connecting shared CYW43 I/O.") : UartDrain() : EndIf
+  If Pi3SdioEnableFunction(1) = 0 : ProcedureReturn 8 : EndIf
+  If Cyw43SetIo(@Pi3SdioCmd52Read, @Pi3SdioCmd52Write, @Pi3SdioCmd53Read, @Pi3SdioCmd53Write) = 0
+    ProcedureReturn 9
+  EndIf
+  If quiet = 0 : PrintN("wifi probe: reading silicon chip ID and core table (no firmware upload).") : UartDrain() : EndIf
+  If Cyw43Attach() = 0 : ProcedureReturn 10 : EndIf
+  If Pi3WifiResolveProfile(HwMemoryRevision(), Cyw43ChipId(), Cyw43ChipRev()) = 0
+    ProcedureReturn 11
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Radio bring-up is deferred until a user explicitly asks for it. The
+; firmware-sized buffers are resident BSS, so the selected source APIs can
+; perform the same tested asset/read/upload sequence without keeping a
+; payload or borrowing the live monitor's memory.
+Procedure.i Pi3WifiResidentStartBody()
+  Define profile.i
+  Define result.i
+  If pi3_wifi_resident_radio_ready <> 0
+    ProcedureReturn 1
+  EndIf
+  profile = Pi3WifiBoardProfile(HwMemoryRevision())
+  If profile = 0 : pi3_wifi_resident_error = 30 : ProcedureReturn 0 : EndIf
+  If StorageUp() = 0 : pi3_wifi_resident_error = 31 : ProcedureReturn 0 : EndIf
+  If Pi3SdioReady() <> 0 And Cyw43Attached() <> 0
+    profile = Pi3WifiResolveProfile(HwMemoryRevision(), Cyw43ChipId(), Cyw43ChipRev())
+    If profile = 0 : pi3_wifi_resident_error = 11 : ProcedureReturn 0 : EndIf
+  Else
+    result = Pi3WifiProbeBody(profile, 0)
+    If result <> 0
+      pi3_wifi_resident_error = result
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  PrintN("wifi start: reading the selected firmware, CLM and board NVRAM.")
+  UartDrain()
+  profile = Pi3WifiPrepareSelectedAssets(HwMemoryRevision(), pi3_dtb, pi3_dtb_end, @pi3_wifi_resident_firmware[0], #PI3_WIFI_FW_BYTES, @pi3_wifi_resident_fw_bytes, @pi3_wifi_resident_clm[0], #PI3_WIFI_CLM_BYTES, @pi3_wifi_resident_clm_bytes, @pi3_wifi_resident_nvram_text[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_nvram_runtime[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_nvram_bytes)
+  If profile = 0
+    pi3_wifi_resident_error = 32
+    ProcedureReturn 0
+  EndIf
+  pi3_wifi_resident_profile = profile
+  PrintN("wifi start: loading and starting the selected radio firmware.")
+  UartDrain()
+  If Pi3WifiStartSelectedRadio(profile, @pi3_wifi_resident_firmware[0], pi3_wifi_resident_fw_bytes, @pi3_wifi_resident_nvram_runtime[0], pi3_wifi_resident_nvram_bytes, @pi3_wifi_resident_nvram_work[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_clm[0], pi3_wifi_resident_clm_bytes, @pi3_wifi_resident_scratch[0], #PI3_WIFI_UPLOAD_SCRATCH_BYTES) = 0
+    pi3_wifi_resident_error = 33
+    ProcedureReturn 0
+  EndIf
+  pi3_wifi_resident_radio_ready = 1
+  pi3_wifi_resident_error = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3WifiResidentJoinBody()
+  Protected macResult.i
+  If pi3_wifi_resident_radio_ready = 0 Or Cyw43Attached() = 0
+    pi3_wifi_resident_error = 40
+    ProcedureReturn 0
+  EndIf
+  If StorageUp() = 0 Or SettingsLoad() = 0
+    pi3_wifi_resident_error = 41
+    ProcedureReturn 0
+  EndIf
+  If SettingsWifiSlotCount() = 0
+    pi3_wifi_resident_error = 42
+    ProcedureReturn 0
+  EndIf
+  If Cyw43MacAddress(@pi3_wifi_selected_mac[0], 2000) <> #CYW43_IO_OK
+    pi3_wifi_resident_error = 43
+    ProcedureReturn 0
+  EndIf
+  If Pi3HwWifiSetMac(@pi3_wifi_selected_mac[0]) = 0
+    pi3_wifi_resident_error = 44
+    ProcedureReturn 0
+  EndIf
+  Print("wifi join: trying saved network slots in order ( ")
+  PrintDec(SettingsWifiSlotCount())
+  PrintN(" configured; passphrases are never printed).")
+  UartDrain()
+  macResult = Pi3WifiJoinKnown(@pi3_wifi_selected_mac[0], 1, @Pi3WifiJoinProgress)
+  If pi3_wifi_join_abort <> 0
+    pi3_wifi_resident_error = 47
+    ProcedureReturn 0
+  EndIf
+  If macResult = 0 Or Pi3WifiAssocKeyed() = 0
+    pi3_wifi_resident_error = 45
+    ProcedureReturn 0
+  EndIf
+  Pi3HwWifiSetRawHandler(Pi3WifiAssocRawHandler())
+  If Pi3WifiNetworkStartDhcp() <= 0
+    pi3_wifi_resident_error = 46
+    ProcedureReturn 0
+  EndIf
+  pi3_wifi_resident_joined = 1
+  pi3_wifi_link_active = 1
+  pi3_wifi_resident_error = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Pi3WifiJoinProgress()
+  Protected now.i
+  If pi3_wifi_join_abort <> 0
+    ProcedureReturn
+  EndIf
+  now = millis()
+  If ((now - pi3_wifi_join_started) & $FFFFFFFF) >= #PI3_WIFI_JOIN_WALL_MS
+    pi3_wifi_join_abort = 1
+    ProcedureReturn
+  EndIf
+  ; Radio polling has finite slices. Reload only the countdown while keeping
+  ; the owned reset-control enable bit set; never stop/re-arm the deadman.
+  If Pi3MonDeadmanRefresh(15) = 0
+    pi3_wifi_join_abort = 1
+    ProcedureReturn
+  EndIf
+  ; Preserve newly received bytes for the next normal ReadLine without
+  ; entering InputFeedByte or invoking the command parser from this callback.
+  UartAdmitPending(32)
+  ; Keep the independently serviced DMA display advancing between bounded
+  ; join slices.
+  ScreenServiceTick()
+EndProcedure
+
+Procedure.i Pi3WifiRunStartWindow()
+  Define result.i
+  PrintN("wifi start: arming the owned 15-second operation watchdog.")
+  UartDrain()
+  If Pi3MonDeadmanStart(15) = 0 : ProcedureReturn -1 : EndIf
+  result = Pi3WifiResidentStartBody()
+  If Pi3MonDeadmanStop() = 0 : ProcedureReturn -2 : EndIf
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i Pi3WifiRunJoinWindow()
+  Define result.i
+  PrintN("wifi join: arming the owned 15-second operation watchdog.")
+  UartDrain()
+  If Pi3MonDeadmanStart(15) = 0 : ProcedureReturn -1 : EndIf
+  pi3_wifi_join_abort = 0
+  pi3_wifi_join_started = millis()
+  result = Pi3WifiResidentJoinBody()
+  If Pi3MonDeadmanStop() = 0 : ProcedureReturn -2 : EndIf
+  ProcedureReturn result
+EndProcedure
+
+; Background startup is deliberately staged through WifiLinkTick after the
+; prompt has appeared. Each firmware/SDIO primitive owns a fresh bounded
+; watchdog window and returns to the normal prompt service loop afterwards.
+Procedure Pi3WifiAutoLinkBackoff(error.i, retryJoin.i)
+  pi3_wifi_auto_link_error = error
+  pi3_wifi_auto_link_at = millis()
+  pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_BACKOFF
+  pi3_wifi_auto_link_mac_ready = 0
+  pi3_wifi_join_abort = 0
+  If retryJoin = 0
+    pi3_wifi_resident_radio_ready = 0
+    pi3_wifi_resident_joined = 0
+    pi3_wifi_link_active = 0
+    pi3_wifi_resident_error = error
+    Pi3WifiAutoJoinCancel()
+  EndIf
+EndProcedure
+
+Procedure Pi3WifiAutoLinkCancel()
+  Pi3WifiAutoJoinCancel()
+  pi3_wifi_auto_link_cancelled = 1
+  pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_WAIT_PROMPT
+  pi3_wifi_auto_link_mac_ready = 0
+  pi3_wifi_join_abort = 0
+EndProcedure
+
+Procedure Pi3WifiAutoProgress()
+  ; Called after one bounded adapter turn. Admit UART into the existing ring;
+  ; the ordinary prompt service slots continue DMA and display work afterwards.
+  UartAdmitPending(32)
+EndProcedure
+
+Procedure.i Pi3WifiAutoLinkGuardedStep()
+  Protected result.i
+  Protected stopResult.i
+  Protected profile.i
+  Protected settingsRc.i
+  If Pi3MonDeadmanStart(15) = 0
+    If pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_BEGIN Or pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_TICK
+      Pi3WifiAutoLinkBackoff(86, 1)
+    Else
+      Pi3WifiAutoLinkBackoff(86, 0)
+    EndIf
+    ProcedureReturn -1
+  EndIf
+
+  result = 1
+  Select pi3_wifi_auto_link_phase
+    Case #PI3_WIFI_LINK_SETTINGS
+      If StorageUp() = 0
+        Pi3WifiAutoLinkBackoff(70, 0)
+      Else
+        ; The font restore may have loaded this same table first. Reuse only
+        ; a clean parse; never let a second implicit read bump WifiRevision
+        ; between AutoJoinBegin's snapshot and its bounded adapter ticks.
+        If SettingsLoadState() = 1
+          settingsRc = 1
+        Else
+          settingsRc = SettingsLoad()
+        EndIf
+        If settingsRc = 0
+          Pi3WifiAutoLinkBackoff(70, 0)
+        ElseIf SettingsWifiSlotCount() = 0
+          ; No stored network: keep the radio idle and retry slowly.
+          Pi3WifiAutoLinkBackoff(0, 0)
+        Else
+          pi3_wifi_auto_link_error = 0
+          pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_PROBE
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_LINK_PROBE
+      profile = Pi3WifiBoardProfile(HwMemoryRevision())
+      If profile = 0
+        Pi3WifiAutoLinkBackoff(71, 0)
+      Else
+        result = Pi3WifiProbeBody(profile, 1)
+        If result <> 0
+          Pi3WifiAutoLinkBackoff(100 + result, 0)
+        Else
+          pi3_wifi_resident_profile = Pi3WifiResolveProfile(HwMemoryRevision(), Cyw43ChipId(), Cyw43ChipRev())
+          pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_ASSETS
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_LINK_ASSETS
+      profile = Pi3WifiPrepareSelectedAssets(HwMemoryRevision(), pi3_dtb, pi3_dtb_end, @pi3_wifi_resident_firmware[0], #PI3_WIFI_FW_BYTES, @pi3_wifi_resident_fw_bytes, @pi3_wifi_resident_clm[0], #PI3_WIFI_CLM_BYTES, @pi3_wifi_resident_clm_bytes, @pi3_wifi_resident_nvram_text[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_nvram_runtime[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_nvram_bytes)
+      If profile = 0
+        Pi3WifiAutoLinkBackoff(72, 0)
+      Else
+        pi3_wifi_resident_profile = profile
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_PREPARE
+      EndIf
+
+    Case #PI3_WIFI_LINK_PREPARE
+      If Cyw43PrepareDownload() = 0
+        Pi3WifiAutoLinkBackoff(73, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_VERIFY
+      EndIf
+
+    Case #PI3_WIFI_LINK_VERIFY
+      Cyw43SetVerify(2)
+      pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_FIRMWARE
+
+    Case #PI3_WIFI_LINK_FIRMWARE
+      If Cyw43UploadFirmware(@pi3_wifi_resident_firmware[0], pi3_wifi_resident_fw_bytes, @pi3_wifi_resident_scratch[0], #PI3_WIFI_UPLOAD_SCRATCH_BYTES) = 0
+        Pi3WifiAutoLinkBackoff(74, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_NVRAM
+      EndIf
+
+    Case #PI3_WIFI_LINK_NVRAM
+      If Cyw43UploadNvram(@pi3_wifi_resident_nvram_runtime[0], pi3_wifi_resident_nvram_bytes, @pi3_wifi_resident_nvram_work[0], #PI3_WIFI_NVRAM_MAX_BYTES, @pi3_wifi_resident_scratch[0], #PI3_WIFI_UPLOAD_SCRATCH_BYTES) = 0
+        Pi3WifiAutoLinkBackoff(75, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_START
+      EndIf
+
+    Case #PI3_WIFI_LINK_START
+      If Cyw43Start() = 0
+        Pi3WifiAutoLinkBackoff(76, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_HT
+      EndIf
+
+    Case #PI3_WIFI_LINK_HT
+      If Cyw43HtClock() = 0
+        Pi3WifiAutoLinkBackoff(77, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_ANNOUNCE
+      EndIf
+
+    Case #PI3_WIFI_LINK_ANNOUNCE
+      If Cyw43AnnounceHost() = 0
+        Pi3WifiAutoLinkBackoff(78, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_FUNCTION2
+      EndIf
+
+    Case #PI3_WIFI_LINK_FUNCTION2
+      If Pi3SdioEnableFunction(2) = 0
+        Pi3WifiAutoLinkBackoff(79, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_UP_BEGIN
+      EndIf
+
+    Case #PI3_WIFI_LINK_UP_BEGIN
+      If Cyw43WifiUpBegin() <> #CYW43_IO_OK
+        Pi3WifiAutoLinkBackoff(80, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_MAC
+      EndIf
+
+    Case #PI3_WIFI_LINK_MAC
+      If Pi3WifiFinalizeMac() = 0
+        Pi3WifiAutoLinkBackoff(81, 0)
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_UP_FINISH
+      EndIf
+
+    Case #PI3_WIFI_LINK_UP_FINISH
+      If Cyw43WifiUpAfterTransportReset(@pi3_wifi_resident_clm[0], pi3_wifi_resident_clm_bytes, #CYW43_EVMASK_JOIN, 2000) <> 0
+        Pi3WifiAutoLinkBackoff(82, 0)
+      Else
+        pi3_wifi_resident_radio_ready = 1
+        pi3_wifi_resident_error = 0
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_BEGIN
+      EndIf
+
+    Case #PI3_WIFI_LINK_JOIN_BEGIN
+      If Cyw43MacAddress(@pi3_wifi_auto_link_mac[0], 2000) <> #CYW43_IO_OK Or Pi3HwWifiSetMac(@pi3_wifi_auto_link_mac[0]) = 0
+        Pi3WifiAutoLinkBackoff(83, 1)
+      Else
+        Pi3HwWifiSetRawHandler(Pi3WifiAssocRawHandler())
+        If Pi3WifiAutoJoinBegin(@pi3_wifi_auto_link_mac[0], 1, @Pi3WifiAutoProgress) = 0
+          Pi3WifiAutoLinkBackoff(84, 1)
+        Else
+          pi3_wifi_auto_link_mac_ready = 1
+          pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_TICK
+        EndIf
+      EndIf
+
+    Case #PI3_WIFI_LINK_JOIN_TICK
+      result = Pi3WifiAutoJoinTick()
+      If result = 1
+        pi3_wifi_resident_joined = 1
+        pi3_wifi_link_active = 1
+        pi3_wifi_auto_link_error = 0
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_READY
+      ElseIf result < 0
+        pi3_wifi_auto_link_error = Pi3WifiAutoJoinLastError()
+      EndIf
+  EndSelect
+
+  stopResult = Pi3MonDeadmanStop()
+  If stopResult = 0
+    pi3_wifi_auto_link_error = 85
+    pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_BACKOFF
+    pi3_wifi_auto_link_at = millis()
+    pi3_wifi_auto_link_cancelled = 1
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn result
+EndProcedure
+
+Procedure Pi3WifiAutoLinkTick()
+  If pi3_wifi_auto_link_cancelled <> 0 Or pi3_wifi_prompt_ready = 0 Or pi3_wifi_foreground_active <> 0
+    ProcedureReturn
+  EndIf
+  If pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_READY
+    ProcedureReturn
+  EndIf
+  If pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_WAIT_PROMPT
+    pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_SETTINGS
+    ProcedureReturn
+  EndIf
+  If pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_BACKOFF
+    If ((millis() - pi3_wifi_auto_link_at) & $FFFFFFFF) >= #PI3_WIFI_LINK_RETRY_MS
+      If pi3_wifi_resident_radio_ready <> 0
+        Pi3WifiAutoJoinCancel()
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_BEGIN
+      Else
+        pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_SETTINGS
+      EndIf
+    EndIf
+    ProcedureReturn
+  EndIf
+  If pi3_wifi_auto_link_phase = #PI3_WIFI_LINK_JOIN_TICK
+    If Pi3WifiAutoJoinNeedsWatchdog() = 0
+      Pi3WifiAutoJoinTick()
+      ProcedureReturn
+    EndIf
+  EndIf
+  Pi3WifiAutoLinkGuardedStep()
+EndProcedure
+
+Procedure CmdPi3Wifi()
+  Define profile.i
+  Define result.i
+  Define revision.i
+
+  SkipSpace()
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If WordIs("start") <> 0 Or WordIs("up") <> 0
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("? wifi start takes no extra words; nothing was touched.")
+      ProcedureReturn
+    EndIf
+    Pi3WifiAutoLinkCancel()
+    result = Pi3WifiRunStartWindow()
+    If result = -1
+      PrintN("wifi start refused: exclusive watchdog ownership was not verified.")
+      ProcedureReturn
+    ElseIf result = -2
+      PrintN("wifi start watchdog stop did not verify; reset may follow.")
+      UartDrain()
+      ProcedureReturn
+    ElseIf result = 0
+      Print("wifi start stopped at stage ") : PrintDec(pi3_wifi_resident_error)
+      PrintN("; radio networking was not declared ready.")
+      ProcedureReturn
+    EndIf
+    If WordIs("up") <> 0
+      result = Pi3WifiRunJoinWindow()
+      If result <> 1
+        Print("wifi up stopped at join stage ") : PrintDec(pi3_wifi_resident_error) : PrintN(".")
+        ProcedureReturn
+      EndIf
+    EndIf
+    If pi3_wifi_resident_joined = 0
+      PrintN("wifi radio is ready. Use `wifi join` to associate and start DHCP.")
+    EndIf
+    If pi3_wifi_resident_joined <> 0
+      PrintN("Wi-Fi association is keyed; DHCP is running in the prompt service loop.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If WordIs("join") <> 0
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("? wifi join takes no extra words; nothing was touched.")
+      ProcedureReturn
+    EndIf
+    If pi3_wifi_resident_radio_ready = 0
+      PrintN("wifi join refused: run `wifi start` first.")
+      ProcedureReturn
+    EndIf
+    Pi3WifiAutoLinkCancel()
+    result = Pi3WifiRunJoinWindow()
+    If result = -1
+      PrintN("wifi join refused: exclusive watchdog ownership was not verified.")
+    ElseIf result = -2
+      PrintN("wifi join watchdog stop did not verify; reset may follow.")
+      UartDrain()
+    ElseIf result = 0
+      If pi3_wifi_resident_error = 42
+        PrintN("wifi join: no saved network slots are configured; settings were not changed.")
+      Else
+        Print("wifi join stopped at stage ") : PrintDec(pi3_wifi_resident_error) : PrintN(".")
+      EndIf
+    Else
+      PrintN("wifi join keyed successfully; DHCP continues in the prompt service loop.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If WordIs("status") <> 0
+    SkipSpace()
+    If gLine[gPos] <> 0
+      PrintN("? wifi status takes no extra words.")
+      ProcedureReturn
+    EndIf
+    Print("radio ")
+    If pi3_wifi_resident_radio_ready <> 0 : Print("ready, profile ") : PrintDec(pi3_wifi_resident_profile)
+    Else : Print("not started") : EndIf
+    Print(", association ")
+    If Pi3WifiAssocKeyed() <> 0 : Print("keyed") : Else : Print("not keyed") : EndIf
+    Print(", address ")
+    If Pi3WifiNetworkAddressReady() <> 0 : Print("bound") : Else : Print("waiting for DHCP") : EndIf
+    Print(", auto phase ") : PrintDec(pi3_wifi_auto_link_phase)
+    If pi3_wifi_auto_link_error <> 0 : Print("/error ") : PrintDec(pi3_wifi_auto_link_error) : EndIf
+    PrintN("")
+    ProcedureReturn
+  EndIf
+  If WordIs("probe") = 0
+    PrintN("Usage: wifi probe | start | join | up | status")
+    PrintN("  probe reads identity; start loads the supported radio; join uses saved slots.")
+    ProcedureReturn
+  EndIf
+  SkipSpace()
+  If gLine[gPos] <> 0
+    PrintN("? wifi probe takes no extra words; nothing was touched.")
+    ProcedureReturn
+  EndIf
+
+  revision = HwMemoryRevision()
+  profile = Pi3WifiBoardProfile(revision)
+  If profile = 0
+    Print("wifi probe refused: unsupported firmware board revision $")
+    PutHexN(revision, 8)
+    PrintN("; no GPIO or SDIO access was made.")
+    ProcedureReturn
+  EndIf
+
+  Pi3WifiAutoLinkCancel()
+  PrintN("wifi probe: starting bounded 15-second owned watchdog window.")
+  UartDrain()
+  If Pi3MonDeadmanStart(15) = 0
+    PrintN("wifi probe refused: could not verify exclusive watchdog ownership.")
+    ProcedureReturn
+  EndIf
+  result = Pi3WifiProbeBody(profile, 0)
+  If Pi3MonDeadmanStop() = 0
+    PrintN("wifi probe watchdog stop did not verify; reset may follow.")
+    UartDrain()
+    ProcedureReturn
+  EndIf
+
+  If result = 4
+    PrintN("wifi probe refused: SDHOST pin routing did not pass its EL3/MMU context check; SDIO was not touched.")
+    ProcedureReturn
+  EndIf
+
+  If result <> 0
+    Print("wifi probe stopped at stage ") : PrintDec(result)
+    Print(" (SDIO error ") : PrintDec(Pi3SdioError()) : PrintN("). No radio firmware/core writes were made.")
+    Print("  host version ") : PrintDec(Pi3SdioHostVersion())
+    Print(", controller clock ") : PrintDec(Pi3SdioClockHz()) : PrintN(" Hz.")
+    Print("  optional SDIO reset status ") : PrintDec(Pi3SdioResetStatus())
+    Print(", CMD0 status ") : PrintDec(Pi3SdioGoIdleStatus()) : PrintN("")
+    Print("  CMD $") : PutHexN(Pi3SdioLastCommand(), 2)
+    Print(" INT $") : PutHexN(Pi3SdioLastInterrupt(), 8)
+    Print(" PRESENT $") : PutHexN(Pi3SdioLastPresent(), 8)
+    Print(" R5 $") : PutHexN(Pi3SdioLastR5(), 4) : PrintN("")
+    If result >= 10 : Print("  CYW43 attach error ") : PrintDec(Cyw43LastError()) : PrintN("") : EndIf
+    If result = 11
+      Print("  silicon chip $") : PutHexN(Cyw43ChipId(), 4)
+      Print(" rev ") : PrintDec(Cyw43ChipRev()) : PrintN(" is not supported by this board profile.")
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  Print("wifi probe: board profile ") : PrintDec(profile)
+  Print(", SDIO functions ") : PrintDec(Pi3SdioFunctionCount())
+  Print(", host spec ") : PrintDec(Pi3SdioHostVersion())
+  Print(", clock ") : PrintDec(Pi3SdioClockHz()) : PrintN(" Hz.")
+  Print("  CCCR revision/capabilities $") : PutHexN(Pi3SdioCccrRevision(), 2)
+  Print("/$") : PutHexN(Pi3SdioCccrCapabilities(), 2) : PrintN("")
+  Print("  common CIS MANFID $") : PutHexN(Pi3SdioCisVendor(), 4)
+  Print("/$") : PutHexN(Pi3SdioCisDevice(), 4) : PrintN("")
+  Print("  function 1 CIS MANFID $") : PutHexN(Pi3SdioFunc1Vendor(), 4)
+  Print("/$") : PutHexN(Pi3SdioFunc1Device(), 4) : PrintN("")
+  Print("  silicon chip $") : PutHexN(Cyw43ChipId(), 4)
+  Print(" rev ") : PrintDec(Cyw43ChipRev())
+  Print(", package ") : PrintDec(Cyw43ChipPackage())
+  Print(", EROM cores ") : PrintDec(Cyw43CoreCount())
+  Print(", selected radio profile ") : PrintDec(Pi3WifiResolveProfile(HwMemoryRevision(), Cyw43ChipId(), Cyw43ChipRev())) : PrintN(".")
+  PrintN("  Identity/EROM read only; no radio core reset or firmware/NVRAM/CLM upload was made.")
+EndProcedure
+
+Procedure Main()
+  Define clock.i
+  Define c.i
+  Define k.i
+  Define suf.i
+  Define tmv.i
+  Define nc_before.i
+  Define propertyBuffer.i
+  Define framebufferBuffer.i
+
+  ; Firmware's armstub8 supplies the DTB in x0. Capture before any C-like
+  ; initialization so later boot code never relies on a caller-saved register.
+  ASM
+    adrp x1, global_pi3_dtb
+    add x1, x1, #:lo12:global_pi3_dtb
+    str x0, [x1]
+  EndASM
+
+  ; ------------------------------------------------------------------
+  ;  IDENTITY FROM THE FIRMWARE ENTRY REGISTER, not a slot handoff.
+  ; ------------------------------------------------------------------
+  pi3_boot_status = 1
+
+  ; ------------------------------------------------------------------
+  ;  THE CONSOLE FIRST, and before it the one mailbox question it needs.
+  ;  Everything after this line can say what went wrong; nothing before
+  ;  it can.
+  ; ------------------------------------------------------------------
+  If Pi3MailboxContext() = 0 : Pi3Park() : EndIf
+  clock = Pi3ClockRate(2)
+  If clock <= 0 : Pi3Park() : EndIf
+  If Pi3UartInit(clock, 115200) = 0 : Pi3Park() : EndIf
+
+  ExceptionSetReporter(@Pi3DirectFaultReport)
+  If ExceptionInstall() = 0 : Pi3Park() : EndIf
+  ; The Pi 3 monitor contract is EL3, established by the firmware armstub.
+  ; Keep a wrong/old EL2 handoff from silently running a second mode.
+  If MmuEl() <> 3
+    PrintN("STOP: this kernel requires the Pi 3 EL3 firmware entry; EL2 startup is refused.")
+    UartDrain()
+    Pi3Park()
+  EndIf
+  PrintN("Anvil starting.")
+
+  ; ------------------------------------------------------------------
+  ;  THE REST OF THE FIRMWARE QUESTIONS, while they can still be asked.
+  ; ------------------------------------------------------------------
+  If Pi3MonitorBootMemory() = 0
+    pi3_boot_status = -4
+    Pi3BootFail("The firmware RAM extent or its x0 device-tree pointer failed validation. Check the firmware boot files and board memory configuration.")
+  EndIf
+  ; Asked once, here, and remembered - see the header of hw_mem.pi3. A 0
+  ; is not fatal: a monitor that would not come up because it could not
+  ; learn its memory size is worse than one that says it does not know.
+  HwMemAsk()
+
+  ; Query and remember every firmware value needed by the card before the
+  ; MMU. The mailbox buffer is marked NC before translation is enabled.
+  If Pi3BootSetStockClocks() = 0
+    PrintN("Warning: firmware did not accept the preferred ARM/CORE rates; using its reported current rates.")
+  EndIf
+  clock = Pi3BootMaxCoreClock()
+  If clock < 1000000
+    clock = 0
+  EndIf
+  ; CORE clock is queried directly before MMU, then passed to SDHOST so it
+  ; never needs a mailbox call from translated code.
+  pi3_sd_core_actual = Pi3ClockRate(4)
+  If pi3_sd_core_actual < 1000000
+    clock = 0
+  ElseIf Pi3SdSetBootClock(pi3_sd_core_actual) = 0
+    clock = 0
+  EndIf
+
+  ; A headless boot allocates no framebuffer. Reserve only the fixed renderer
+  ; and the firmware VC reservation in the NC map so a later HPD attach can
+  ; safely allocate scanout after translation is enabled.
+  nc_before=MmuNcCount()
+  propertyBuffer=((@pi3_property[0]+15)>>4)<<4
+  framebufferBuffer=((@pi3_fb_message[0]+15)>>4)<<4
+  ; Register the exact aligned spans handed to firmware. The backing arrays
+  ; include alignment slack, but registering from the raw array address made
+  ; a 176-byte allocation message overrun the exact MmuIsNcRange proof when
+  ; the linker placed pi3_fb_message eight bytes off a 16-byte boundary.
+  MmuAddNc(propertyBuffer,propertyBuffer+127)
+  MmuAddNc(framebufferBuffer,framebufferBuffer+175)
+  If MmuNcCount() <> nc_before + 2
+    pi3_boot_status = -10
+    Pi3BootFail("The firmware property buffers could not be added to the non-cacheable map.")
+  EndIf
+  If Pi3FbDeferredPrepare(pi3_dtb,pi3_dtb_end,pi3_ram_base,pi3_ram_end)=0
+    PrintN("HDMI late attach unavailable: firmware VC reservation query failed; continuing on UART.")
+  Else
+    MmuAddNc(#PI3_FB_RENDER_BASE,#PI3_FB_RENDER_BASE+#PI3_FB_RENDER_BYTES-1)
+    MmuAddNc(pi3_fb_vc_base,pi3_fb_vc_base+pi3_fb_vc_bytes-1)
+    If MmuNcCount() <> nc_before + 4
+      pi3_boot_status = -10
+      Pi3BootFail("The deferred HDMI render/VC reservations could not be added to the non-cacheable map.")
+    EndIf
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  THE MMU AND THE CACHES. After this line the mailbox is closed for
+  ;  the rest of the boot and every mailbox answer above is all this
+  ;  monitor will ever have.
+  ;
+  ;  IT IS NOT AN OPTIMISATION HERE. With translation off every access is
+  ;  to Device memory and an unaligned access to Device memory is an
+  ;  alignment fault whatever SCTLR.A says - so the shared filesystems'
+  ;  packed directory entries and the hash's message blocks would fault
+  ;  rather than run slowly. The whole argument is at the top of
+  ;  RaspberryPi3/Lib/mmu.pi3.
+  ;
+  ;  THE MAILBOX PROPERTY BUFFER IS MARKED NON-CACHEABLE BEFORE THE
+  ;  TABLES ARE BUILT even though nothing asks the mailbox afterwards.
+  ;  It costs one 2 MB block of cacheability in a region that holds this
+  ;  monitor's variables, and it is what makes the day somebody adds a
+  ;  mailbox call after boot a working day instead of a mystery.
+  ; ------------------------------------------------------------------
+  If MmuUp() <> 0
+    pi3_boot_status = -10
+    Pi3BootFail("The page tables would not build at their reserved address; translation was not enabled.")
+  EndIf
+
+  ; The shared helper enables WFE only for the qualified Pi 3 EL3 timer path.
+  ; A failed timer/EL-state check leaves the cooperative polling path active.
+  AnvilSchedulerQualifyPi3Wfe()
+  ; The on-screen console has fixed 8x16 cells; reject font sizes that
+  ; cannot be rendered at their requested native metrics in that grid.
+  AnvilFontPixelLimitSet(13)
+
+  ; HDMI discovery starts only after the MMU/coherency contract is live.
+
+  ; The SD host is PIO. Bring it up only on the first file command, after
+  ; Device-nGnRnE mappings exist; no card scan or mount delays the prompt.
+  pi3_sd_clock_ceiling = clock
+
+  ; ------------------------------------------------------------------
+  ;  FROM HERE IT IS THE SAME MONITOR EVERY OTHER BOARD RUNS.
+  ; ------------------------------------------------------------------
+  pi3_boot_status = 2
+  gBootTicks = Ticks()
+  Banner()
+  Pi3DisplayLifecycleStart()
+
+  ; ==================================================================
+  ;  THE PROMPT.
+  ;
+  ;  Written out rather than called because there is no CommandLoop() in
+  ;  the core to call - on every Anvil board the loop lives inline in
+  ;  the board's Main(), and the other two are the reference. That is a
+  ;  duplication this monitor has three copies of and it is not this
+  ;  lane's to fix; it is recorded in the layering plan.
+  ;
+  ;  "pmf> " IS LOAD-BEARING: five characters, a trailing space, no
+  ;  newline. Host tools match on it. Do not tidy it.
+  ; ==================================================================
+  Repeat
+    Print("pmf> ")
+    UartDrain()
+    ; Mirror the prompt and previous command's final bytes before releasing
+    ; the active UDP-console peer. ReadLine belongs to the next line; arm
+    ; that command owner only after input has been accepted.
+    NetConsoleFlush()
+    NetConsoleCommandDone()
+    pi3_wifi_prompt_ready = 1
+    ReadLine()
+    pi3_wifi_foreground_active = 1
+    NetConsoleCommandBegin()
+
+    OutBreakArm()
+    gPos = 0
+    SkipSpace()
+    gWordAt = gPos
+    c = gLine[gPos] & $FF
+    SkipWord()
+    gWordLen = gPos - gWordAt
+
+    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
+    ; When the word moves, the single-letter character moves with it; a
+    ; refusal sets that character to zero, which the empty-line arm below
+    ; already runs nothing for.
+    tmv = TimeArm()
+    If tmv = 1
+      c = gLine[gWordAt] & $FF
+    ElseIf tmv = 2
+      c = 0
+    EndIf
+
+    gMemWidth = 0
+    ; THE SAFETY OVERRIDE AGES HERE, beside the width reset and for the
+    ; same reason: state must not leak from one command line into the
+    ; next. `force <address>` arms one address for the NEXT line and this
+    ; ends it, used or not.
+    ForceAge()
+    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46      ; 46 = .
+      suf = gLine[gWordAt + gWordLen - 1] & $FF
+      If suf = 98 Or suf = 66                                    ; b / B
+        gMemWidth = 1
+      ElseIf suf = 119 Or suf = 87                               ; w / W
+        gMemWidth = 2
+      ElseIf suf = 108 Or suf = 76                               ; l / L
+        gMemWidth = 4
+      EndIf
+      If gMemWidth <> 0
+        gWordLen = gWordLen - 2                                  ; hide .x
+      EndIf
+    EndIf
+
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
+      CmdMem()
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
+      CmdWrite()
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+    ; force - arm one address this board refused, for the next command
+    ; line only. A whole word, no alias and no abbreviation: it is the
+    ; confirmation for an access the board has said is not safe, and a
+    ; short way to type it would be the accident it exists to prevent.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
+      CmdGo()
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+    ; The shared raw-block receiver is the fast, CRC-checked staging path.
+    ; Keep the old S-record loader available for serial tools that use it.
+    ElseIf WordIs("receive") <> 0 Or LetterIs(98) <> 0   ; b
+      CmdBlock()
+    ; Same shared guarded block receiver and CRC verdict, over the active
+    ; Wi-Fi UDP console. The command is present only with #CAP_NET enabled.
+    ElseIf WordIs("wb") <> 0
+      CmdWirelessBlock()
+    ElseIf WordIs("srecord") <> 0 Or WordIs("loads") <> 0 Or LetterIs(108) <> 0 ; l
+      SrecLoad()
+    ; THE FILE COMMANDS, over the shared filesystems and the shared file
+    ; seam. Unedited for this board: it supplies a block reader and a
+    ; block writer and nothing else.
+    ElseIf WordIs("load") <> 0 Or WordIs("fatload") <> 0 Or LetterIs(102) <> 0
+      CmdFat()
+    ElseIf WordIs("save") <> 0
+      CmdSave()
+    ElseIf WordIs("mkdir") <> 0
+      CmdMkdir()
+    ElseIf WordIs("rmdir") <> 0
+      CmdRmdir()
+    ElseIf WordIs("rm") <> 0 Or WordIs("del") <> 0
+      CmdRemove()
+    ElseIf WordIs("rename") <> 0 Or WordIs("mv") <> 0
+      CmdRename()
+    ElseIf WordIs("fatls") <> 0 Or WordIs("ls") <> 0 Or WordIs("dir") <> 0
+      CmdFatls()
+    ; THE SETTINGS STORE. SETTINGS.TXT on the boot partition, which is
+    ; where the other board keeps its too - a board that lost its
+    ; settings to a data-partition swap would be a board that lost its
+    ; network credentials to one.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+    ElseIf WordIs("font") <> 0
+      ; Only mutation subcommands take ownership; `font info` is observational.
+      If Pi3FontCommandMutates() <> 0 : pi3_screen_font_boot = 2 : EndIf
+      CmdFont()
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+    ; map - where this image put itself, measured rather than declared.
+    ; A whole word only; m is the memory dump.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
+      CmdPi3Info()
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
+      CmdPi3Reset()
+    ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0 ; d
+      CmdPi3Deadman()
+    ElseIf WordIs("wifi") <> 0
+      CmdPi3Wifi()
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
+      Help()
+    Else
+      Print("? this monitor does not know the command ")
+      k = 0
+      While k < gWordLen And k < 24
+        UartWrite(gLine[gWordAt + k] & $FF)
+        k = k + 1
+      Wend
+      PrintN(", so nothing was done.")
+      PrintN("  Type help, or just a question mark, for the list of commands.")
+      PrintN("  Every command is a whole word; the old single letters still work.")
+    EndIf
+
+    ; What the command above cost, on this board's own counter, if the
+    ; line began with `measure`. Silent otherwise.
+    TimeReport()
+    pi3_wifi_foreground_active = 0
+  ForEver
+EndProcedure

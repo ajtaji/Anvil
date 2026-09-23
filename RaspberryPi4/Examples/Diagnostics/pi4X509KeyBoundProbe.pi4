@@ -1,0 +1,577 @@
+; ======================================================================
+; pi4X509KeyBoundProbe.pi4 - THE X.509 END-ENTITY KEY BUFFER'S OWN
+;                            BOUND, ON AArch64.
+; ======================================================================
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE A64 TWIN OF THE 32-BIT KEY-BOUND PROBE, CASE FOR CASE
+; ----------------------------------------------------------------------
+; The 32-bit families landed a second bound:
+; the decoded end-entity public key is copied OUT of the engine's
+; 2048-byte context RAM and INTO xEePkey, a permanent buffer of exactly
+; #X_EEPKEY_SIZE bytes, and the copy's length is popped off the T0 data
+; stack, which is to say it is a certificate byte. XrInRange guards the
+; SOURCE of that copy and cannot see the DESTINATION at all: the key
+; window starts at offset 480 in a 2048-byte array, so the context-RAM
+; guard is perfectly happy with a 1568-byte access there - three times
+; what the destination holds.
+;
+; Four native words take those lengths:
+;
+;     copy-ee-rsa-pkey   nlen, elen   ->  write nlen+elen bytes to xEePkey
+;     copy-ee-ec-pkey    qlen         ->  write qlen bytes to xEePkey
+;     do-rsa-vrfy        nlen, elen   ->  @xRam[pkey_data], @xRam[+nlen]
+;     do-ecdsa-vrfy      qlen         ->  @xRam[pkey_data], qlen
+;
+; XkeyFits guards all four, with its own name and its own number,
+; #X509ERR_KEY_BOUNDS (901), beside the context RAM's 900.
+;
+; ----------------------------------------------------------------------
+; WHY THE PORT NEEDED ITS OWN PROOF AND NOT A CITATION OF THE PICO'S
+; ----------------------------------------------------------------------
+; The bound's FORM is what makes it width-independent - `n > SIZE - e` is
+; correct at every register width and `n + e > SIZE` is correct at none -
+; and that is exactly the claim a 32-bit pass cannot make for this part.
+; `.i` is 64 bits here, so:
+;
+;   * THE WRAP CASE MOVED. Two $7FFFFFFF halves sum to 4,294,967,294 on
+;     this part, comfortably positive, and the naive test would catch
+;     them. The hostile pair here is $7FFFFFFFFFFFFFFF twice, which wraps
+;     a 64-bit add to -2 exactly as the smaller pair wraps a 32-bit one.
+;     Check 54 runs the naive test on the part's own arithmetic and shows
+;     it answering FITS on the line above the one that refuses the pair.
+;   * A NEGATIVE LENGTH is a 64-bit negative. The published exponent
+;     address for a refused n = -1 would be @xEePkey[-1], one byte BELOW
+;     the array, which is worse than a short copy and is check 52.
+;   * EVERY VERDICT IS COMPARED AT FULL WIDTH. A refusal whose set bits
+;     are all above bit 31 reads as a pass to anything that truncates,
+;     and the A64 GCM gate lost a mutation to exactly that.
+;
+; ----------------------------------------------------------------------
+; WHAT CONFIRMS THE FIX, AND WHAT REFUTES IT
+; ----------------------------------------------------------------------
+;   "x509 key-buffer bound: PASS  n/n"
+;         -> the second bound is correct on this part.
+;
+;   any "check N EXPECTED x SAW y" line
+;         -> read which check. Checks 1-31 and 65-67 are ACCEPTANCE: a
+;            failure there means the bound is refusing key sizes real
+;            certificates carry, and would break chain validation rather
+;            than protect it. Checks 32-64 are REFUSALS: a failure there
+;            means an oversized length still reaches the copy and the
+;            hole is open. Checks 48 and 49 are the overrun WITNESSES - a
+;            failure there means bytes really did land past the end of
+;            the buffer, in the globals next door.
+;
+; This program is the witness for the bound's LOGIC. The claim that the
+; bound does not disturb REAL work is a different claim and is carried by
+; tools/a64/a64_x509_check.py, whose modes A/B/C walk real captured
+; certificate chains whose keys go through this very copy.
+;
+; ======================================================================
+;  BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN.
+; ======================================================================
+; It is sent to a resident Anvil and RETURNS to it, so a wrong answer
+; costs a line of output rather than a power cycle. Build it exactly
+; like this - the same flags tools/a64/a64_x509key_check.py uses, so the
+; image the emulator judges is the image a board would be handed:
+;
+;   PureMetalForge.exe --compile \
+;        RaspberryPi4/Examples/Diagnostics/pi4X509KeyBoundProbe.pi4 \
+;        -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 \
+;        --entry-returns -s -o probe.img
+;
+; NO TimerInit(). It reads CNTFRQ_EL0 with an MRS and the A64 oracle
+; models no system register; nothing on the path under test needs a
+; clock. Leaving it out is what makes the identical source run in both
+; places.
+;
+; THE SEAM STAYS STUBBED. #X509_SIG_LINKED = 0, so RsaVrfy and EcdsaVrfy
+; answer -1 and the caller turns that into #X509ERR_SEAM - a DEFINITE
+; verdict, which is all the two vrfy acceptance cases are asked for. No
+; real signature arithmetic runs here, which is also why the whole suite
+; is a few million model instructions rather than a few hundred million.
+;
+; ======================================================================
+EnableExplicit
+
+#X509_SIG_LINKED = 0
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "RaspberryPi4/Lib/x509_blob.pi4"
+XIncludeFile "RaspberryPi4/Lib/x509.pi4"
+
+#XK_MAX = 96
+Global Dim xkGot.i[#XK_MAX]
+Global Dim xkWant.i[#XK_MAX]
+Global xkN.i = 0
+Global xkBad.i = 0
+; Set on the last line of Main. A gate that read xkBad without this
+; could not tell "nothing failed" from "nothing ran".
+Global xkRan.i = 0
+
+; How far past the END of the destination array the overrun witnesses
+; sit. The array is declared #X_EEPKEY_SIZE, so its last element is at
+; index #X_EEPKEY_SIZE - 1 and anything at or above that size belongs to
+; the globals next door. 540 and 550 are comfortably past, and far enough
+; apart that two neighbours would both have to hold the exact source byte
+; for the witness to lie.
+#XK_WITNESS_A = 540
+#XK_WITNESS_B = 550
+; The oversized length used for the overrun cases. Deliberately modest:
+; it must reach past the array to prove the point and no further than it
+; has to, because an UNGUARDED build really does write every one of these
+; bytes and the report has to survive the sabotage run to be read.
+#XK_OVERRUN   = 560
+; The LARGEST length the context-RAM guard permits at the key window: the
+; array's size less the window's offset, #X_RAM_SIZE - #X_pkey_data =
+; 2048 - 480. Written out rather than computed - a constant declaration
+; on this frontend takes a single number and nothing else -
+; and checks 57 and 58 assert the arithmetic at RUN TIME against
+; XrInRange itself, so the literal cannot drift away from the two
+; constants it stands for.
+#XK_RAM_MAX   = 1568
+
+; A real 2048-bit RSA key: 256 bytes of modulus, 3 of exponent (65537).
+#XK_RSA_N = 256
+#XK_RSA_E = 3
+; A real P-256 public point, uncompressed: 04 || X || Y.
+#XK_EC_Q  = 65
+#XK_EC_CURVE = 23
+
+; The wrap case's two halves, held in globals so the sum is done in the
+; part's own arithmetic rather than folded at compile time on the host.
+; $7FFFFFFFFFFFFFFF, not the 32-bit probe's $7FFFFFFF: `.i` is 64 bits
+; here and the smaller pair does not wrap this register.
+Global xkHalf.i
+Global xkNaive.i
+
+; ----------------------------------------------------------------------
+; xkChk(got, want) - record one check. The values are STORED rather than
+; printed, so the whole report can be emitted in one pass at the end and
+; a capture that started late still gets all of it. The 32-bit twin does
+; this because its host may not have opened the port yet; here it keeps
+; the two programs the same shape.
+; ----------------------------------------------------------------------
+Procedure xkChk(got.i, want.i)
+  If xkN < #XK_MAX
+    xkGot[xkN] = got
+    xkWant[xkN] = want
+  EndIf
+  xkN = xkN + 1
+  If got <> want
+    xkBad = xkBad + 1
+  EndIf
+EndProcedure
+
+; xkClear() - back to a live machine with no pending refusal.
+Procedure xkClear()
+  xErr = 0
+  t0_ip = 0
+  t0_dp = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; The source pattern. Position-dependent on purpose: a byte that lands in
+; the destination proves not only THAT it was copied but WHERE FROM, so a
+; copy that is off by an offset cannot pass.
+; ----------------------------------------------------------------------
+Procedure.i xkPat(i.i)
+  ProcedureReturn (i * 7 + 3) & 255
+EndProcedure
+
+; Fill the key window in the context RAM through the ranged accessor, so
+; the fill itself is subject to the guard the other bound proves.
+Procedure xkFillSource()
+  Protected i.i
+  i = 0
+  While i < 640
+    XrSet8(#X_pkey_data + i, xkPat(i))
+    i = i + 1
+  Wend
+EndProcedure
+
+; Wipe the destination and the published key description, so every case
+; starts from a state in which "nothing happened" is distinguishable.
+Procedure xkResetKey()
+  Protected i.i
+  i = 0
+  While i < #X_EEPKEY_SIZE
+    xEePkey[i] = 0
+    i = i + 1
+  Wend
+  X509EePkeyType = 0
+  X509EeNAddr = 0
+  X509EeNLen = 0
+  X509EeEAddr = 0
+  X509EeELen = 0
+  X509EeCurve = 0
+  X509EeQAddr = 0
+  X509EeQLen = 0
+  xPkeyType = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; xkHit(off) - 1 if the byte `off` bytes into the destination array holds
+; the source byte that WOULD have been written there, 0 otherwise.
+;
+; At or past #X_EEPKEY_SIZE this reads a neighbouring global on purpose:
+; that is precisely what an unguarded copy overwrites, and reading it is
+; the only way to show whether it did. Each witness is checked BEFORE its
+; case as well as after, so a neighbour that happened to already hold the
+; source byte would be reported rather than mistaken for a pass.
+; ----------------------------------------------------------------------
+Procedure.i xkHit(off.i)
+  If (PeekA(@xEePkey[0] + off) & 255) = xkPat(off)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; xkRun() - the bound, both halves.
+; ----------------------------------------------------------------------
+Procedure xkRun()
+  xkClear()
+  xkFillSource()
+  xkHalf = $7FFFFFFFFFFFFFFF
+
+  ; ====================================================================
+  ; ACCEPTANCE - real key sizes round-trip.
+  ;
+  ; These come FIRST and they are not decoration. A bound that refused
+  ; everything would pass every refusal check below and be worse than no
+  ; bound at all, because it would reject every certificate on earth.
+  ; ====================================================================
+
+  ; ---- a 2048-bit RSA key, the commonest thing on the wire -----------
+  xkResetKey()
+  xkClear()
+  T0Push(#XK_RSA_N)
+  T0Push(#XK_RSA_E)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, 0)                                        ; 1  allowed
+  xkChk(t0_ip, 0)                                       ; 2  not halted
+  xkChk(X509EePkeyType, 1)                              ; 3  RSA published
+  xkChk(X509EeNLen, #XK_RSA_N)                          ; 4
+  xkChk(X509EeELen, #XK_RSA_E)                          ; 5
+  xkChk(xEePkey[0] & 255, xkPat(0))                     ; 6  first byte
+  xkChk(xEePkey[#XK_RSA_N - 1] & 255, xkPat(#XK_RSA_N - 1))          ; 7  end of modulus
+  xkChk(xEePkey[#XK_RSA_N + #XK_RSA_E - 1] & 255, xkPat(#XK_RSA_N + #XK_RSA_E - 1)) ; 8 end of exponent
+  xkChk(xEePkey[#XK_RSA_N + #XK_RSA_E] & 255, 0)        ; 9  and NOTHING beyond
+  xkChk(X509EeEAddr - X509EeNAddr, #XK_RSA_N)           ; 10 e sits after n
+
+  ; ---- RSA filling the buffer EXACTLY --------------------------------
+  xkResetKey()
+  xkClear()
+  T0Push(#X_EEPKEY_SIZE - 3)
+  T0Push(3)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, 0)                                        ; 11 exactly the capacity allowed
+  xkChk(X509EeNLen, #X_EEPKEY_SIZE - 3)                 ; 12
+  xkChk(xEePkey[#X_EEPKEY_SIZE - 1] & 255, xkPat(#X_EEPKEY_SIZE - 1)) ; 13 last byte landed
+  xkChk(X509EeEAddr - X509EeNAddr, #X_EEPKEY_SIZE - 3)  ; 14 e still inside the array
+
+  ; ---- the tightest legal packing there is: the exponent's only byte IS
+  ;      the array's last byte. This is the case an off-by-one bound gets
+  ;      wrong in the tight direction, and the one where the published
+  ;      exponent address sits at the highest index that exists.
+  xkResetKey()
+  xkClear()
+  T0Push(#X_EEPKEY_SIZE - 1)
+  T0Push(1)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, 0)                                        ; 15 allowed
+  xkChk(X509EeELen, 1)                                  ; 16
+  xkChk(X509EeEAddr - X509EeNAddr, #X_EEPKEY_SIZE - 1)  ; 17 last index, not past it
+
+  ; ---- a P-256 public point ------------------------------------------
+  xkResetKey()
+  xkClear()
+  T0Push(#XK_EC_CURVE)
+  T0Push(#XK_EC_Q)
+  X509Native(#T0N_copy_ee_ec_pkey)
+  xkChk(xErr, 0)                                        ; 18 allowed
+  xkChk(X509EePkeyType, 2)                              ; 19 EC published
+  xkChk(X509EeCurve, #XK_EC_CURVE)                      ; 20 curve carried
+  xkChk(X509EeQLen, #XK_EC_Q)                           ; 21
+  xkChk(xEePkey[0] & 255, xkPat(0))                     ; 22
+  xkChk(xEePkey[#XK_EC_Q - 1] & 255, xkPat(#XK_EC_Q - 1))            ; 23 last byte of q
+  xkChk(xEePkey[#XK_EC_Q] & 255, 0)                     ; 24 and nothing beyond
+
+  ; ---- an EC point filling the buffer exactly ------------------------
+  xkResetKey()
+  xkClear()
+  T0Push(#XK_EC_CURVE)
+  T0Push(#X_EEPKEY_SIZE)
+  X509Native(#T0N_copy_ee_ec_pkey)
+  xkChk(xErr, 0)                                        ; 25 exactly the capacity allowed
+  xkChk(X509EeQLen, #X_EEPKEY_SIZE)                     ; 26
+  xkChk(xEePkey[#X_EEPKEY_SIZE - 1] & 255, xkPat(#X_EEPKEY_SIZE - 1)) ; 27 last byte landed
+
+  ; ---- the two verify natives reach the seam with legal lengths ------
+  ; They hand a raw address out of the file, so the bound applies to them
+  ; too; what must survive is that a LEGAL length still gets there. With
+  ; the seam stubbed the verifier answers "not linked", which the caller
+  ; turns into #X509ERR_SEAM - a definite verdict, pushed.
+  xkClear()
+  XrSet8(#X_cert_signer_key_type, 1)
+  xkClear()
+  T0Push(#XK_RSA_N)
+  T0Push(#XK_RSA_E)
+  X509Native(#T0N_do_rsa_vrfy)
+  xkChk(T0Pop(), #X509ERR_SEAM)                         ; 28 reached the seam
+  xkChk(xErr, 0)                                        ; 29 no refusal
+
+  xkClear()
+  XrSet8(#X_cert_signer_key_type, 2)
+  xkClear()
+  T0Push(#XK_EC_CURVE)
+  T0Push(#XK_EC_Q)
+  X509Native(#T0N_do_ecdsa_vrfy)
+  xkChk(T0Pop(), #X509ERR_SEAM)                         ; 30 reached the seam
+  xkChk(xErr, 0)                                        ; 31 no refusal
+
+  ; ====================================================================
+  ; REFUSALS - a length the destination cannot hold is a NAMED refusal
+  ; and a stopped machine, never a wrapped write or a neighbour scribble.
+  ; ====================================================================
+
+  ; ---- one byte past the capacity: the classic off-by-one ------------
+  xkResetKey()
+  xkClear()
+  T0Push(#X_EEPKEY_SIZE - 2)
+  T0Push(3)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 32 named refusal, 901
+  xkChk(t0_ip, -1)                                      ; 33 machine halted
+  xkChk(T0Run(), #T0_HALT)                              ; 34 host can SEE it
+  xkClear()
+  xkChk(X509EePkeyType, 0)                              ; 35 no key published
+  xkChk(X509EeNLen, 0)                                  ; 36
+  xkChk(xEePkey[0] & 255, 0)                            ; 37 not one byte copied
+
+  ; ---- the same for EC ------------------------------------------------
+  xkResetKey()
+  xkClear()
+  T0Push(#XK_EC_CURVE)
+  T0Push(#X_EEPKEY_SIZE + 1)
+  X509Native(#T0N_copy_ee_ec_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 38
+  xkChk(t0_ip, -1)                                      ; 39
+  xkClear()
+  xkChk(X509EePkeyType, 0)                              ; 40
+  xkChk(X509EeQLen, 0)                                  ; 41
+  xkChk(xEePkey[0] & 255, 0)                            ; 42
+
+  ; ---- A LENGTH THE CONTEXT-RAM GUARD WOULD HAVE WAVED THROUGH.
+  ;      This is the whole point of a second bound. The source window
+  ;      starts at offset 480 in a 2048-byte array, so a read of this
+  ;      length is perfectly in range there - XrInRange has no objection
+  ;      to it whatever - and it is 40 bytes past the end of the
+  ;      destination. Without XkeyFits every one of those bytes is
+  ;      written into the globals next door.
+  xkResetKey()
+  xkClear()
+  xkChk(xkHit(#XK_WITNESS_A), 0)                        ; 43 witness clean BEFORE
+  xkChk(xkHit(#XK_WITNESS_B), 0)                        ; 44 second witness clean
+  xkChk(XrInRange(#X_pkey_data, #XK_OVERRUN), 1)        ; 45 the SOURCE read is in range
+  xkClear()
+  T0Push(#XK_OVERRUN)
+  T0Push(0)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 46 refused anyway
+  xkChk(t0_ip, -1)                                      ; 47
+  xkClear()
+  xkChk(xkHit(#XK_WITNESS_A), 0)                        ; 48 NOTHING written past the end
+  xkChk(xkHit(#XK_WITNESS_B), 0)                        ; 49
+  xkChk(xEePkey[0] & 255, 0)                            ; 50 and the copy never started
+
+  ; ---- a negative length - what a length subtraction underflow makes,
+  ;      and the case a bare "n > SIZE" test misses completely. Left
+  ;      unrefused the copy loop simply does not run - and the engine then
+  ;      publishes @xEePkey[-1], one byte BELOW the array, as the exponent
+  ;      address, which is worse than a short copy.
+  xkResetKey()
+  xkClear()
+  T0Push(-1)
+  T0Push(0)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 51
+  xkChk(X509EeNAddr, 0)                                 ; 52 nothing published
+
+  ; a negative EXPONENT length, which would make the pair LOOK small
+  xkResetKey()
+  xkClear()
+  T0Push(4)
+  T0Push(-8)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 53
+
+  ; ---- THE WRAP, AT SIXTY-FOUR BITS. Two hostile halves that sum, in
+  ;      this part's register, to a small number: $7FFFFFFFFFFFFFFF twice
+  ;      is -2. A bound written "n + e > SIZE" accepts that pair and then
+  ;      runs a loop bounded by the wrapped sum; the bound is written
+  ;      "n > SIZE - e" for exactly this reason. Check 54 runs the naive
+  ;      test on the SAME two numbers, on this part's own arithmetic, so
+  ;      the report SHOWS it answering "fits" right beside the check that
+  ;      refuses them. The halves come out of a global so the sum is
+  ;      computed on the target and not folded at compile time.
+  ;
+  ;      THE 32-BIT PROBE'S PAIR DOES NOT WRAP HERE, and that is the
+  ;      finding worth writing down rather than papering over: the guard
+  ;      is width-independent because of its FORM, not because the two
+  ;      parts see the same hostile input.
+  xkNaive = 0
+  If (xkHalf + xkHalf) > #X_EEPKEY_SIZE
+    xkNaive = 1
+  EndIf
+  xkChk(xkNaive, 0)                                     ; 54 naive test says FITS
+  xkResetKey()
+  xkClear()
+  T0Push(xkHalf)
+  T0Push(xkHalf)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 55 refused all the same
+  xkChk(xEePkey[0] & 255, 0)                            ; 56
+
+  ; ---- the verify natives, whose lengths become a raw ADDRESS ---------
+  ; These do not copy: they hand @xRam[pkey_data] and @xRam[pkey_data +
+  ; nlen] to a verifier that will read through them and has no way to
+  ; know how long they really are. #XK_RAM_MAX is the LARGEST length the
+  ; context-RAM guard permits at this window - the exact number that
+  ; makes the point: XrInRange is perfectly happy with it, the read it
+  ; describes ends exactly on the array's last byte, while the exponent
+  ; pointer it produces lands one past the end of the context RAM.
+  ; Nothing may be pushed either: a pushed verdict on a refused call is a
+  ; verdict the caller will read as an answer.
+  xkClear()
+  XrSet8(#X_cert_signer_key_type, 1)
+  ; 57/58 also pin #XK_RAM_MAX to the two constants it was written out
+  ; from: XrInRange accepts exactly #X_RAM_SIZE - #X_pkey_data at this
+  ; window and refuses one more, so a moved layout fails here instead of
+  ; quietly weakening the case.
+  xkChk(XrInRange(#X_pkey_data, #XK_RAM_MAX), 1)        ; 57 the context RAM allows it
+  xkClear()
+  xkChk(XrInRange(#X_pkey_data, #XK_RAM_MAX + 1), 0)    ; 58 and not one byte more
+  xkClear()
+  T0Push(#XK_RAM_MAX)
+  T0Push(0)
+  X509Native(#T0N_do_rsa_vrfy)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 59 the key bound does not
+  xkChk(t0_ip, -1)                                      ; 60
+  xkChk(t0_dp, 0)                                       ; 61 no verdict pushed
+
+  ; a wild length, not merely an adjacent one
+  xkClear()
+  XrSet8(#X_cert_signer_key_type, 2)
+  xkClear()
+  T0Push(#XK_EC_CURVE)
+  T0Push(100000)
+  X509Native(#T0N_do_ecdsa_vrfy)
+  xkChk(xErr, #X509ERR_KEY_BOUNDS)                      ; 62
+  xkChk(t0_ip, -1)                                      ; 63
+  xkChk(t0_dp, 0)                                       ; 64 no verdict pushed
+
+  ; ---- THE BOUND DOES NOT LATCH. A refusal stops the machine; it must
+  ;      not poison the next chain. Ten refusals in, a real key still
+  ;      copies - which is also the last word on "does this break the
+  ;      parser".
+  xkResetKey()
+  xkClear()
+  T0Push(#XK_RSA_N)
+  T0Push(#XK_RSA_E)
+  X509Native(#T0N_copy_ee_rsa_pkey)
+  xkChk(xErr, 0)                                        ; 65 still works
+  xkChk(X509EeNLen, #XK_RSA_N)                          ; 66
+  xkChk(xEePkey[#XK_RSA_N - 1] & 255, xkPat(#XK_RSA_N - 1))          ; 67
+
+  xkClear()
+EndProcedure
+
+Procedure xkReport()
+  Protected i.i
+
+  PrintNl()
+  PrintN("PureMetal Forge Pi 4 X.509 KEY-BUFFER BOUND PROBE")
+  Print("key buffer ")
+  PrintDec(#X_EEPKEY_SIZE)
+  Print(" bytes, context RAM ")
+  PrintDec(#X_RAM_SIZE)
+  Print(" bytes, refusal code ")
+  PrintDec(#X509ERR_KEY_BOUNDS)
+  PrintNl()
+  Print("  a read of ")
+  PrintDec(#XK_OVERRUN)
+  Print(" bytes at the key window is IN RANGE for the context RAM and ")
+  PrintDec(#XK_OVERRUN - #X_EEPKEY_SIZE)
+  PrintN(" bytes past the key buffer")
+
+  ; Every check, pass or fail, with what it wanted and what it got. A
+  ; count with no diagnosis is not a report.
+  i = 0
+  While i < xkN And i < #XK_MAX
+    Print("  check ")
+    PrintDec(i + 1)
+    If xkGot[i] = xkWant[i]
+      Print("  ok    ")
+    Else
+      Print("  FAIL  ")
+    EndIf
+    Print("expected ")
+    PrintDec(xkWant[i])
+    Print(" saw ")
+    PrintDec(xkGot[i])
+    PrintNl()
+    i = i + 1
+  Wend
+
+  PrintNl()
+  If xkBad = 0
+    Print("x509 key-buffer bound: PASS  ")
+    PrintDec(xkN)
+    Print("/")
+    PrintDec(xkN)
+    PrintNl()
+    PrintN("  The end-entity key buffer refuses a certificate-derived length it")
+    PrintN("  cannot hold, by its own name and number, and stops the machine;")
+    PrintN("  every key size a real certificate carries still round-trips. The")
+    PrintN("  context-RAM guard covers the read side; this covers the write.")
+  Else
+    Print("x509 key-buffer bound: FAIL  ")
+    PrintDec(xkBad)
+    Print(" of ")
+    PrintDec(xkN)
+    PrintN(" checks")
+    PrintN("  Checks 1-31 and 65-67 are ACCEPTANCE: a failure there means the")
+    PrintN("  bound is refusing key sizes real certificates carry, and would")
+    PrintN("  break chain validation rather than protect it. Checks 32-64 are")
+    PrintN("  REFUSALS: a failure there means an oversized length still reaches")
+    PrintN("  the copy and the hole is open. Checks 48 and 49 are the overrun")
+    PrintN("  witnesses - a failure there means bytes really did land past the")
+    PrintN("  end of the buffer, in the globals next door.")
+  EndIf
+  PrintNl()
+  PrintN("pi4X509KeyBoundProbe done")
+EndProcedure
+
+Procedure.i Main()
+  UartInit(115200)
+
+  xkRun()
+  xkReport()
+
+  ; LAST, and after the report: the gate reads this to tell "no failures"
+  ; from "never ran".
+  xkRan = 1
+
+  If xkBad = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Main()

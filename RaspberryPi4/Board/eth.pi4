@@ -1,0 +1,1332 @@
+; ======================================================================
+;  THE LINK SEAM'S BOARD HALF - 2026-09-04, forum topic 591, the ruling of
+;  2026-09-02 that net/ping/dns must ride whichever link is up.
+; ======================================================================
+;  RaspberryPi4/Lib/link.pi4 holds the POLICY (which interface wins) and
+;  the MECHANISM (put a frame on it, take a frame off it). What it
+;  deliberately does not hold is the FACTS, because the facts live in
+;  the settings store and in two drivers' state, and a library that read
+;  the settings store would be a library that could not be gated.
+;
+;  HwLinkOpen() below is where the facts are gathered and handed to
+;  LinkSelect, and it is the ONLY place in the monitor that decides
+;  which interface a command will use. Every command calls it, through
+;  the seam - it was called LinkBringUp until 2026-09-05, which read as
+;  a portable name and hid the fact that the shared core was reaching
+;  into a board file for it.
+;
+;  WHY IT DOES NOT ALWAYS GO LOOKING FOR A CABLE
+;  ----------------------------------------------------------------------
+;  Bringing the wired controller up costs #ETH_LINK_MS - five seconds -
+;  waiting for a link and for auto-negotiation, and on this bench the
+;  usual state is a board on Wi-Fi with a lease and NOTHING plugged into
+;  the Ethernet socket. Spending five silent seconds looking for a cable
+;  that was not there a minute ago, before every ping, while a working
+;  radio waits, is not what "Ethernet preferred when both" asks for -
+;  it is a monitor that feels broken.
+;
+;  So the wired side is brought up when it is ALREADY up (a live
+;  GenetPhyLinkUp re-check, which is one MDIO read), when the radio has
+;  nothing to offer, or when the operator has said `net link wired`.
+;  Otherwise the radio carries it and `net` says why in a full sentence.
+;  A cable plugged in mid-session is therefore picked up by `net link
+;  wired`, or by the next command after the radio drops - and that
+;  trade is written here rather than left to be discovered.
+; ----------------------------------------------------------------------
+
+; THE OPERATOR'S PIN MOVED OUT ON 2026-09-05. It was #LINK_PREF_AUTO /
+; _WIRED / _WIFI and a gLinkPref here, which put half of one decision in
+; a board file and gave the seam a second vocabulary for a thing the
+; #HW_LINK_* kinds already name. It is now LinkPin() in
+; RaspberryPi4/Lib/link.pi4, holding a kind or #HW_LINK_NONE for "choose
+; each time", and this file reads it rather than owning it.
+
+; EthDown - stop the MAC. Safe to call when it was never up.
+;
+; THIS NAME STAYS, and it stays because two board files outside the
+; network commands call it for one reason that has nothing to do with
+; networking: RaspberryPi4/Board/cache.pi4 and
+; RaspberryPi4/Board/hw_boot.pi4 stop the receive DMA before control
+; leaves the monitor, so a running payload is never sharing memory with a
+; live bus master. HwLinkClose() below is the seam's name for the same
+; act and is what Anvil/Core/net_cmd.pbi calls; renaming this one would
+; have gained nothing and moved a guarantee two other files depend on.
+Procedure EthDown()
+  ; gEthUp is the monitor's logical state, not a hardware interlock. A
+  ; half-failed start can have enabled receive DMA before that flag was set,
+  ; so always ask the idempotent driver stop to clear both enable paths.
+  GenetStop()
+  gEthUp = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The returning-payload hardware lease.
+;
+;  A payload may use the CPU, caches and explicitly handed-over devices;
+;  it does not own Anvil's image/BSS or unrelated devices. No recovery can
+;  make arbitrary corruption of the monitor's RAM meaningful again, and
+;  none is claimed here. GENET is different: its receive DMA is a live bus
+;  master before the jump, so Anvil explicitly disables it and cannot enter
+;  the payload unless the enable bits read back clear after a system barrier.
+;  That is the strongest boundary this driver exposes: it proves the stop
+;  writes reached the Device register block and were accepted there. It is
+;  NOT a hardware idle/empty acknowledgement and cannot rule out a final
+;  already-issued write. The RX arena is therefore still monitor-owned and
+;  must not be repurposed by a returning payload.
+;
+;  The return value preserves only whether the wired controller was active.
+;  IP addresses, provenance, lease timers, aliases, UDP listeners and the
+;  direct-cable DHCP server already live in their owning software rows. They
+;  are neither copied nor cleared. EthPayloadResume performs a complete,
+;  bounded hardware start because the payload had the machine and the old
+;  peripheral register contents cannot be trusted.
+;
+;  RESULTS FROM EthPayloadQuiesce:
+;    -1  the stop command/readback boundary failed; DO NOT JUMP
+;     0  it was not active; nothing is owed on return
+;     1  it was active and must be restarted on return
+; ----------------------------------------------------------------------
+
+; eth_HwUp has four results rather than a Boolean because a failed start has
+; two materially different end states. Zero means the controller was checked
+; down and the prompt may continue. A negative result means the stop command or
+; one of its three enable-field readbacks failed; treating that value as merely
+; "not up" would let the monitor keep running beside a possibly live bus master.
+#ETH_HWUP_UNSAFE  = -1
+#ETH_HWUP_DOWN    = 0
+#ETH_HWUP_STARTED = 1
+#ETH_HWUP_ALREADY = 2
+
+Procedure.i EthPayloadStopChecked()
+  Define cmd.i
+  Define tdma.i
+  Define rdma.i
+
+  If GenetStop() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Device accesses to GENET are ordered with one another by the MMU mapping,
+  ; and this dsb sy/isb makes the whole stop sequence complete before either
+  ; a payload instruction or a monitor DRAM reuse can follow it. Readback is
+  ; deliberately limited to the three enable fields the driver owns. There is
+  ; no cited GENETv5 "DMA idle" acknowledgement in this driver, so do not turn
+  ; these clear bits into a stronger claim than they make.
+  a64_barrier()
+  cmd  = PeekL(#GENET_BASE + #GENET_UMAC_CMD) & $FFFFFFFF
+  tdma = PeekL(#GENET_BASE + #GENET_TDMA_CTRL) & $FFFFFFFF
+  rdma = PeekL(#GENET_BASE + #GENET_RDMA_CTRL) & $FFFFFFFF
+  a64_barrier()
+  If (cmd & (#GENET_CMD_TX_EN | #GENET_CMD_RX_EN)) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (tdma & #GENET_DMA_EN) <> 0 Or (rdma & #GENET_DMA_EN) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EthPayloadQuiesce()
+  Define was.i
+  was = 0
+  If gEthUp <> 0 Or GenetStarted() <> 0
+    was = 1
+  EndIf
+  If EthPayloadStopChecked() = 0
+    gEthUp = 0
+    PrintN("!! the Ethernet stop command or an enable-field readback failed, so")
+    PrintN("   a stopped controller was not established and the payload was")
+    PrintN("   NOT run. Running it with a bus master still writing into Anvil's")
+    PrintN("   receive memory would give two programs ownership of the same RAM.")
+    EthWhyGenet()
+    ProcedureReturn -1
+  EndIf
+  gEthUp = 0
+  ProcedureReturn was
+EndProcedure
+
+Procedure.i EthPayloadReclaim()
+  ; This is called IMMEDIATELY after CallAddr, with the monitor's caches still
+  ; in their handoff state. A payload may have started or partly programmed
+  ; GENET even when it was down before entry, so software flags are irrelevant.
+  If EthPayloadStopChecked() = 0
+    gEthUp = 0
+    ProcedureReturn 0
+  EndIf
+  gEthUp = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EthPayloadResume(was.i)
+  Define r.i
+  ; EthPayloadReclaim already established the stop/readback boundary before
+  ; cache, display, DHCP or console recovery. This procedure only restores the
+  ; physical controller that was active before entry.
+  If was = 0
+    ProcedureReturn 1
+  EndIf
+  PrintN("The wired controller was active before the payload. Reinitialising it")
+  PrintN("from hardware now; the wait is bounded by the Ethernet link timeout.")
+  r = eth_HwUp()
+  If r < 0
+    ; The raw start already named the failed cleanup. Do not reset here: RunAt
+    ; owns the captured payload x0 and must print all sixteen digits first.
+    ProcedureReturn -1
+  EndIf
+  If r = #ETH_HWUP_DOWN
+    ; A zero from eth_HwUp means its checked stop succeeded. The controller's
+    ; three owned enable fields read back clear, although that is deliberately
+    ; not described as proof that every previously issued DMA write is idle.
+    PrintN("!! the payload returned, but the wired controller did not come back.")
+    PrintN("   Its saved network identity is retained; no inactive link is being")
+    PrintN("   reported as active. Fix the link and type net up to try it again.")
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkClose - the seam's teardown. 1 if something was actually
+;  stopped, 0 if there was nothing to stop.
+;
+;  THE RETURN VALUE IS THE WHOLE REASON THIS IS NOT JUST EthDown. `net
+;  down` tells the operator either "the controller has been stopped" or
+;  "it was not up, so nothing changed", and those are different
+;  sentences about different states. It used to read gEthUp - a Pi 4
+;  global - from the shared core to decide which. Now the board answers.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkClose()
+  Define was.i
+  was = gEthUp
+  EthDown()
+  If was = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EthUp - bring the Ethernet up, or say in full why it did not.
+;
+;  IDEMPOTENT AND CHEAP THE SECOND TIME. Once the port is up it stays
+;  up, so a run of get commands pays the bring-up once. The re-check is
+;  a live one rather than a remembered flag: GenetStarted() says the
+;  driver believes it started and GenetPhyLinkUp() is one MDIO read that
+;  says the cable is still in. A cable pulled between two commands is a
+;  thing that happens on a bench and a monitor that keeps insisting the
+;  network is up would be lying.
+;
+;  THE WAIT IS ANNOUNCED BEFORE IT IS TAKEN, and the line is drained
+;  before the wait starts. Five seconds of an unresponsive prompt is
+;  indistinguishable from a hung board - that is the exact complaint
+;  that produced OutBreak() in this file - so the operator is told what
+;  is being waited for and for how long, and sees it before the silence
+;  rather than after it.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  eth_HwUp - the controller-and-identity bring-up, with NO IP
+;  configuration. The shared core of EthUp, EthUpIp and EthLinkUp.
+;
+;  RETURNS:
+;   -1  bring-up failed and the stop command or its enable-field readback also
+;       failed. The caller MUST take the local firmware-reset path;
+;    2  already up and the link is still there - the caller need not
+;       reconfigure, net.pi4's wired row still holds whatever IP it had;
+;    1  freshly brought up - the wired row's MAC is revalidated in net.pi4;
+;       its existing logical address, lease, alias and listeners are kept;
+;    0  it did not come up, and the reason has been printed.
+;
+;  WHY THIS EXISTS. Until ping, dns and dhcp were added, this bring-up
+;  was one inline body inside EthUp. Those three need the SAME controller
+;  bring-up with different amounts of configuration on top: dhcp needs no
+;  IP at all (it has none yet), ping and dns need a destination, and get
+;  and put need the TFTP server. One shared core is the reason the four
+;  paths cannot drift about how the GENET comes up.
+;
+;  THAT SENTENCE USED TO END "get and put need all four", which stopped
+;  being true on 2026-09-10: none of these four commands reads an address
+;  out of the settings store on its way in any more. Each asks which
+;  interface can reach the machine it is talking to and sources from what
+;  that interface is already holding.
+;
+;  IT CLEARS NO ADDRESS ROW. It used to call NetInit(), which reset the
+;  whole stack, and was narrowed to NetClearIPv4(WIRED). That was still
+;  hardware start erasing logical state: a returning payload or `net down`
+;  followed by `net up` lost a live lease, a link-local primary, the
+;  direct-cable alias and its listener. A controller reset invalidates its
+;  registers and DMA rings, not the software identity above it. The MAC is
+;  re-applied below and the wired ARP entries are flushed; the address row,
+;  DHCP client/server machines and listeners keep their own lifecycle.
+;
+;  THE WIRED ARP ROWS ARE STILL FLUSHED deliberately: a freshly restarted
+;  MAC means every entry learned through its old incarnation is suspect.
+;  The radio's independently learned neighbours are not touched.
+;
+;  The wired row's MAC is set again immediately below. An ordinary caller
+;  may still apply a new address afterward; a payload return keeps the one
+;  that was already bound.
+; ----------------------------------------------------------------------
+Procedure.i eth_HwUp()
+  Define startErr.i
+  If gEthUp = 1
+    If GenetStarted() = 1
+      If GenetPhyLinkUp() = 1
+        ProcedureReturn #ETH_HWUP_ALREADY
+      EndIf
+    EndIf
+    PrintN("The Ethernet was up and is not any more - the link has gone away since")
+    PrintN("the last command. Bringing it up again from the beginning.")
+    gEthUp = 0
+  EndIf
+
+  ; EVERY REBUILD STARTS FROM ONE PROVED-DOWN HARDWARE STATE. This is after
+  ; the genuinely-live shortcut above, so an already working controller pays
+  ; nothing. Every other path may be a cold start, a stale software flag, a
+  ; lost link with the old DMA generation still enabled, or a retry after an
+  ; incomplete caller. GenetStop is probe-independent: it addresses the fixed
+  ; BCM2711 GENET block directly. EthPayloadStopChecked then orders and reads
+  ; back the MAC TX/RX and both DMA enable fields. Only after that boundary can
+  ; a later Probe/MAC/RX-region refusal honestly return #ETH_HWUP_DOWN.
+  gEthUp = 0
+  If EthPayloadStopChecked() = 0
+    PrintN("!! the Ethernet rebuild could not establish a stopped controller.")
+    PrintN("   Its stop command or an enable-field readback failed. The caller")
+    PrintN("   must reset rather than continue beside a possibly active MAC or DMA.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_UNSAFE
+  EndIf
+
+  EthMacFetch()
+
+  If GenetProbe() = 0
+    PrintN("!! the Ethernet controller did not identify itself, so nothing was")
+    PrintN("   done. This is the MAC inside the processor and it is always")
+    PrintN("   present, so a failure here is not a cable and not a switch - it is")
+    PrintN("   this monitor reading the wrong address or a part that is not a")
+    PrintN("   BCM2711.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  If GenetSetMac(@gEthMac[0]) = 0
+    PrintN("!! the Ethernet controller refused this board's hardware address, so")
+    PrintN("   nothing was done.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+  If GenetSetRxRegion(#ETH_RX_BASE, #ETH_RX_BYTES) = 0
+    PrintN("!! the Ethernet controller refused the receive region, so nothing was")
+    PrintN("   done. That region is a constant in this monitor and not something")
+    PrintN("   you typed, so this is a fault in Anvil rather than in what you did.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  Print("Bringing the Ethernet up. Waiting up to ")
+  PrintDec(#ETH_LINK_MS)
+  PrintN(" milliseconds for the link")
+  PrintN("to come up and for auto-negotiation to finish, so this pauses.")
+  UartDrain()
+
+  If GenetStart(#ETH_LINK_MS) = 0
+    ; STOP WHAT IT ALREADY STARTED, BEFORE SAYING WHY IT FAILED.
+    ;
+    ; GenetStart() runs the bring-up in the driver's order and the link
+    ; wait is near the END of it: by the time it fails for want of a
+    ; cable it has already reset the UniMAC, initialised 256 receive
+    ; descriptors pointing into #ETH_RX_BASE and ENABLED THE DMA. It
+    ; does not undo any of that, and it is not wrong not to - a
+    ; half-started controller is exactly what somebody diagnosing this
+    ; wants to be able to read registers out of.
+    ;
+    ; It is wrong to LEAVE it that way at a live prompt, though. The one
+    ; thing this monitor promises about #ETH_RX_BASE is that no bus
+    ; master is writing there while a payload runs, and "the network
+    ; failed to come up" is precisely the state somebody then types
+    ; `run` from. The checked stop and its three enable-field readbacks remove
+    ; the question or return the distinct unsafe result below.
+    startErr = GenetError()
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the Ethernet start failed, and its cleanup stop command or an")
+      PrintN("   enable-field readback also failed. The caller must reset rather")
+      PrintN("   than continue beside a possibly active MAC or DMA engine.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
+    If startErr = #GENET_ERR_NO_LINK
+      PrintN("!! there is no Ethernet link, so the network is not up and nothing")
+      PrintN("   was done. Nothing is plugged into this board's Ethernet socket, or")
+      PrintN("   the other end of the cable is not powered, or the cable is bad. Put")
+      PrintN("   one in, wait a moment for the socket lights, and type the command")
+      PrintN("   again. This monitor waited five seconds and then answered, rather")
+      PrintN("   than sitting here looking like a hung board.")
+      ProcedureReturn #ETH_HWUP_DOWN
+    EndIf
+    If startErr = #GENET_ERR_ANEG
+      PrintN("!! the Ethernet link came up but auto-negotiation never finished, so")
+      PrintN("   nothing was done. The speed and duplex a PHY reports before")
+      PrintN("   negotiation completes are left over from last time and acting on")
+      PrintN("   them would configure the controller wrongly. This is usually an")
+      PrintN("   old switch or a fixed-speed port at the other end. The network is")
+      PrintN("   not up and nothing was done.")
+      ProcedureReturn #ETH_HWUP_DOWN
+    EndIf
+    If startErr = #GENET_ERR_HALF_DUPLEX
+      PrintN("!! the link negotiated HALF duplex and this driver refuses to run on")
+      PrintN("   one, so the network is not up and nothing was done. Half duplex")
+      PrintN("   means collisions, and the controller's collision handling is not")
+      PrintN("   implemented here - genet.pi4 refuses it rather than passing")
+      PrintN("   traffic badly. Set the port at the other end to full duplex, or")
+      PrintN("   use a different port.")
+      ProcedureReturn #ETH_HWUP_DOWN
+    EndIf
+    PrintN("!! the Ethernet controller did not start, so the network is not up and")
+    PrintN("   nothing was done.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  ; Initialise mutable defaults only on the first software attachment.
+  ; A hardware restart must not silently replace a checksum policy or any
+  ; listener state the running monitor deliberately selected.
+  If NetMacSet(#HW_LINK_WIRED) = 0
+    NetDefaults()
+  EndIf
+  ; The controller has new rings, so neighbours learned through its old
+  ; incarnation are stale. Flush only this interface; the radio keeps its
+  ; independently learned neighbours and its entire identity row.
+  NetArpFlush(#HW_LINK_WIRED)
+  If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0
+    ; This logical refusal happened after GenetStart enabled the MAC and DMA.
+    ; Reclaim the hardware before printing it. NetError is owned by net.pi4
+    ; and is not changed by this GENET cleanup.
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the network stack refused the wired address, and the controller")
+      PrintN("   cleanup stop command or an enable-field readback failed. The caller")
+      PrintN("   must reset rather than continue beside a possibly active MAC or DMA.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
+    PrintN("!! the network stack refused this board's hardware address, so nothing")
+    PrintN("   was done.")
+    EthWhyNet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  gEthUp = 1
+  ProcedureReturn #ETH_HWUP_STARTED
+EndProcedure
+
+; Ordinary monitor callers use this wrapper, never the raw four-result value directly.
+; If an attempted bring-up cannot prove the three owned enable fields clear,
+; there is no safe local prompt to return to. The returning-payload path is the
+; one exception: it must first print the payload's complete captured x0, so
+; EthPayloadResume propagates the negative result to RunAt instead.
+Procedure.i eth_HwUpLocal()
+  Define r.i
+  r = eth_HwUp()
+  If r < 0
+    PrintN("The monitor is resetting through firmware because GENET could not be")
+    PrintN("proved disabled after a failed local start.")
+    UartDrain()
+    SafetyToFirmware()
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EthCableIn - IS THERE A CABLE IN THE SOCKET, cheaply, without starting
+;  anything. 1 yes, 0 no or cannot tell.
+;
+;  WHY IT IS NOT eth_HwUp(). Bringing the controller up costs
+;  #ETH_LINK_MS - five seconds - waiting for the link and for
+;  auto-negotiation, and the boot path must not spend that on a board
+;  with nothing plugged in. This asks the PHY instead: the identity
+;  register (one 32-bit read, no clock to enable and no reset to
+;  release), then the MDIO scan for the PHY address if it has not been
+;  found yet, then the link-status bit. Bounded at 640 ms in the worst
+;  case - a full 32-address sweep of a board whose PHY is not answering -
+;  and a few milliseconds in the ordinary one.
+;
+;  THE PHY ADDRESS IS SCANNED HERE RATHER THAN ASSUMED. GenetPhyLinkUp
+;  reads whatever address the driver has settled on, and before
+;  GenetStart has run that is address zero, which is not this board's
+;  PHY. Reading the link bit out of an address nobody answers at would
+;  be a plausible-looking "no cable" that no cable could ever change.
+;
+;  A NEGATIVE FROM GenetPhyLinkUp IS AN MDIO FAULT AND NOT A DOWN LINK,
+;  and the two must not be conflated: callers of that procedure are told
+;  to test for negative before testing for zero. Both answer 0 here,
+;  because for this question "cannot tell" and "no" lead to the same
+;  next step - but the distinction is not lost, it is printed by the
+;  bring-up that follows if one is asked for.
+; ----------------------------------------------------------------------
+Procedure.i EthCableIn()
+  Define v.i
+  If GenetProbe() = 0
+    ProcedureReturn 0
+  EndIf
+  If GenetPhyAddress() = 0 And GenetPhyId() = 0
+    If GenetPhyScan() < 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  v = GenetPhyLinkUp()
+  If v = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkStaticUp - PUT THE STORED ADDRESS ON THE WIRE, NOW. Returns the
+;  #HW_LINK_* kind that ended up carrying it, or #HW_LINK_NONE.
+;
+;  WHAT IT IS FOR, and it is the whole of the 2026-09-07 evening. The
+;  three stored addresses reached the IP layer only as a SIDE EFFECT of
+;  the next command that happened to choose an interface, and the
+;  automatic choice deliberately will not pay the five-second wired
+;  bring-up while a radio is working (the reasoning is at the top of this
+;  file and it is right). So a board with `net address 192.168.137.2`
+;  typed into it, a cable in the socket and a radio joined to something
+;  else went on carrying its traffic over the radio, and the console with
+;  it - and the machine on the other end of the cable could ping the
+;  board and not talk to it.
+;
+;  THIS IS THE EXPLICIT ACT, AND THAT IS WHY IT IS ALLOWED TO PAY THE
+;  WAIT. `net address` is somebody saying what this board's wired address
+;  is; the boot fallback is a board with no lease and a cable in it. Both
+;  are moments where five seconds spent on the socket is exactly what was
+;  asked for. Nothing in the automatic path changed, so `ping` on a
+;  cable-less bench still costs nothing.
+;
+;  EVERY ARM IS BOUNDED AND IT CANNOT SPIN:
+;
+;    no stored address     two settings reads and a parse
+;    no cable              EthCableIn - a register read and at worst one
+;                          MDIO sweep, 640 ms in the pathological case
+;    cable, link not up    ONE eth_HwUp, which is the announced
+;                          five-second link wait and then an answer
+;    already up            one MDIO read
+;
+;  IT ASKS THE CABLE BEFORE IT PAYS FOR THE LINK, in that order, so a
+;  board with the addresses stored and nothing plugged in answers in
+;  milliseconds - which is the ordinary state of a bench that runs on
+;  Wi-Fi and has a wired address left over from a previous session.
+;
+;  THE PREFERENCE ORDER IS NOT RE-IMPLEMENTED HERE. Once the controller
+;  is up, HwLinkOpen is what chooses - with the wired side now presenting
+;  BOTH a carrier and an address, which is LinkSelect's outright win, and
+;  with the operator's `net link wifi` pin still able to overrule it.
+;  That is why this answers the kind that actually won rather than 1: a
+;  caller that assumed "wired" would print a sentence about the cable
+;  while the radio carried the traffic.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkStaticUp()
+  If EthHasIpConfig() = 0
+    ProcedureReturn #HW_LINK_NONE
+  EndIf
+  If EthCableIn() = 0
+    ProcedureReturn #HW_LINK_NONE
+  EndIf
+  If gEthUp <> 1 Or GenetStarted() <> 1 Or GenetPhyLinkUp() <> 1
+    If eth_HwUpLocal() <= #ETH_HWUP_DOWN
+      ProcedureReturn #HW_LINK_NONE
+    EndIf
+  EndIf
+  If HwLinkOpen(1) = 0
+    ProcedureReturn #HW_LINK_NONE
+  EndIf
+  ProcedureReturn LinkKind()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EthBootWired - THE BOOT POLICY'S WIRED HALF. Called before the
+;  wireless auto-join, from RaspberryPi4/Board/boot.pi4.
+;
+;  WHAT IT IS FOR. On 2026-09-07 this board had a cable running straight
+;  to the machine that wanted to talk to it, an address waiting for it at
+;  the other end, and NO CONSOLE, because the console could only ride the
+;  radio and the wired side took no address until somebody typed a
+;  command - over the console that did not exist. A board that comes up
+;  on a cable must be reachable on that cable with nothing typed at it,
+;  the same way a board that comes up on a radio has been since
+;  2026-09-06.
+;
+;  THE ORDER IS LEASE FIRST, STORED ADDRESS SECOND, and it is that way
+;  round on purpose. A DHCP server is the only thing on a segment that
+;  can say an address is free; a stored address is this board's memory of
+;  a segment it may not be plugged into any more. Preferring the memory
+;  would put a board that has been moved onto a network it does not
+;  belong to, silently, and the collision would land on whoever holds
+;  that address now. So the wire is asked first and the memory is the
+;  fallback - which is also the case the bench actually has, because a
+;  cable straight into a Windows laptop has no DHCP server on it at all.
+;
+;  IT IS BOUNDED, IT IS LOUD, AND IT NEVER SPINS. Rule for anything new
+;  in a boot path: it must not be able to strand the board. The costs,
+;  written out because a boot that pauses is indistinguishable from a
+;  hung one unless the arithmetic is on the screen:
+;
+;    no cable                 a few milliseconds, and it says so
+;    cable, a server answers  the five-second link wait plus the
+;                             exchange, which is two round trips
+;    cable, nobody answers    the five-second link wait, then FOUR
+;                             DISCOVERs at three seconds each - twelve
+;                             seconds - and then the stored address if
+;                             there is one, which costs one more MDIO
+;                             read because the link is already up
+;
+;  The REQUEST retries cost nothing here: they only run after an OFFER
+;  has arrived, and if an OFFER arrived there is a server.
+;
+;  ONE dhcp AND NOT A LOOP OF THEM, and that is deliberate: the command
+;  already retries four whole exchanges internally, which is more retry
+;  than the wireless loop beside it does with three. Wrapping it in an
+;  outer loop would multiply a bounded twelve seconds into a minute of a
+;  silent-looking board for exactly the case - a cable into a machine
+;  whose DHCP server is not running - where the answer is not going to
+;  change.
+;
+;  IT SAYS WHICH OF THE THREE HAPPENED, in one line beginning `wired:`,
+;  because the boot log is the only account anybody has of a board that
+;  came up unreachable and "it printed some Ethernet lines" is not an
+;  account. The three are exhaustive:
+;
+;      wired: lease from <server>
+;      wired: saved address <a.b.c.d>, no DHCP answer
+;      wired: no cable
+;
+;  GIVING UP IS NOT FAILING. The console arms itself on whichever
+;  interface ends up holding an address, re-derived on every spin of the
+;  prompt, so a lease that arrives later - the radio joins, or somebody
+;  types dhcp - brings the console up with nobody asking for it.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  EthServeDhcp - NOTHING ANSWERED ON THIS CABLE, SO THIS BOARD HANDS
+;  OUT THE ADDRESSES.  The bench ruling of 2026-09-07, in the words it
+;  was given in: "if the pi is getting that 169 address it changes over
+;  to dhcp and divvy out an address."
+;
+;  IT IS CALLED ONLY WHERE THE DISCOVERS WENT UNANSWERED, which is the
+;  measurement the whole server role rests on - see the header of
+;  Anvil/Core/dhcpd.pbi for why the board has to earn the seat rather
+;  than assume it.
+;
+;  THE ONE REFUSAL, AND IT IS NOT A TIDINESS CHECK: if the address this
+;  board already holds on the cable is itself inside 192.168.137.0/24,
+;  the server is NOT started. That is somebody's saved static address on
+;  the very subnet the pool comes out of, so serving it would mean
+;  handing a peer an address out of a range this board is also sitting
+;  in with no idea which parts of it are free - a collision the board
+;  would create itself and then not be able to explain.
+;
+;  IT PRINTS WHAT IT DID in the boot log, with the pool, because a
+;  machine that suddenly has a 192.168.137.x address it did not ask for
+;  is entitled to an explanation somewhere.
+; ----------------------------------------------------------------------
+Procedure EthServeDhcp()
+  If (gEthIp & DhcpdMask()) = (DhcpdSelf() & DhcpdMask())
+    PrintN("wired: this board is NOT handing out addresses on this cable - the")
+    PrintN("   address it holds is already inside the block the pool comes out of,")
+    PrintN("   so it cannot tell which of those addresses are free.")
+    ProcedureReturn
+  EndIf
+  If DhcpdStart(#HW_LINK_WIRED) = 0
+    PrintN("!! this board could not take the DHCP server role on the cable, so a")
+    PrintN("   machine set to DHCP at the other end will fall back to a link-local")
+    PrintN("   address of its own. That still reaches this board - the console is")
+    PrintN("   listening on 169.254.x.y as well - so nothing is lost, but a lease")
+    PrintN("   would have been steadier.")
+    ProcedureReturn
+  EndIf
+  PrintN("wired: nothing answered a DHCP discover on this cable, so THIS BOARD is")
+  Print("   the DHCP server on it now: ")
+  PutIp(DhcpdSelf())
+  Print(" for itself, leases from ")
+  PutIp(#DHCPD_POOL_LO)
+  Print(" to ")
+  PutIp(#DHCPD_POOL_HI)
+  PrintN(",")
+  PrintN("   one hour each. A machine at the other end set to DHCP - which is what")
+  PrintN("   an Ethernet port is by default - gets a real address with nothing")
+  PrintN("   changed on it. If a real DHCP server ever answers on this cable, this")
+  PrintN("   board gives the role up at once and takes a lease like anybody else.")
+EndProcedure
+
+Procedure EthBootWired()
+  Define k.i
+  If EthCableIn() = 0
+    PrintN("wired: no cable. Nothing is plugged into the Ethernet socket, so no")
+    PrintN("address was asked for and nothing was started. This costs no time and")
+    PrintN("is the ordinary answer on a bench that runs on Wi-Fi.")
+    ProcedureReturn
+  EndIf
+
+  PrintN("Ethernet: the cable is in, so an address is asked for by DHCP first -")
+  PrintN("a server on this segment is the only thing that can say an address is")
+  PrintN("free. If nothing answers, the stored address is used; and if there is")
+  PrintN("no stored address either, this board picks one for itself out of")
+  PrintN("169.254.0.0/16 and proves it is free (RFC 3927), which is what the")
+  PrintN("machine at the other end of a bare cable has already done.")
+  UartDrain()
+
+  If CmdDhcp() <> 0
+    Print("wired: lease from ")
+    PutIp(DhcpServerId())
+    PrintN(".")
+    ProcedureReturn
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; THE STORED ADDRESS SECOND, AND IT IS TESTED BEFORE LINK-LOCAL ON
+  ; PURPOSE. Somebody typed it and ran `settings save`; that outranks
+  ; anything this board invents for itself, whatever the invention's
+  ; provenance. A board with a saved address never reaches the third
+  ; step at all, which is what "a saved static address wins over
+  ; link-local" means in one `If`.
+  ;
+  ; NOTE THE ORDER OF THE TWO TESTS BELOW. EthHasIpConfig() now answers
+  ; YES for a link-local address as well (netcfg.pbi), because
+  ; everything downstream has to treat one like any other address - so
+  ; reading it here as "there is a saved address" would be wrong the
+  ; second time round. It cannot be, at this point in the boot: nothing
+  ; has taken a link-local address yet, gEthLlIp is still zero, and the
+  ; only thing this can be answering about is the settings store.
+  ; ------------------------------------------------------------------
+  If EthHasIpConfig() <> 0
+    k = NetStaticApply()
+    If k <> #HW_LINK_NONE
+      Print("wired: saved address ")
+      PutIp(gEthIp)
+      PrintN(", no DHCP answer.")
+      EthServeDhcp()
+      ProcedureReturn
+    EndIf
+    PrintN("!! no DHCP server answered and the stored address could not be put on")
+    PrintN("   the wire either. Trying a link-local address instead.")
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ; AND IF NOTHING ELSE, AN ADDRESS OF THIS BOARD'S OWN.  2026-09-07.
+  ;
+  ; This is the case the bench actually has and the one the whole lane
+  ; exists for: a cable running straight into a laptop, no server on it,
+  ; nothing saved, and until tonight NO ADDRESS AND THEREFORE NO
+  ; CONSOLE - a board wired to the machine trying to reach it with no
+  ; way in. The laptop at the other end had already given itself
+  ; a link-local address for exactly the same reason. This is the board doing
+  ; the same thing, by the same document.
+  ;
+  ; BOUNDED: nine seconds if nobody objects, nineteen in the worst case,
+  ; and it prints the arithmetic before it waits. See
+  ; Anvil/Core/netll.pbi.
+  ; ------------------------------------------------------------------
+  If NetLinkLocalAcquire(#HW_LINK_WIRED) <> 0
+    Print("wired: link-local ")
+    PutIp(gEthIp)
+    PrintN(" (no DHCP answer).")
+    ; ----------------------------------------------------------------
+    ; AND NOW THE BOARD BECOMES THE SERVER. This is the case the bench
+    ; named: a cable with nothing on it that hands out addresses, and a
+    ; laptop at the other end whose Ethernet port is a DHCP client that
+    ; nobody has answered. The link-local address is kept as well - it
+    ; is the interface's PRIMARY address, probed and defended, and it is
+    ; the only address a peer that is not a DHCP client can reach - so
+    ; both peers are served, which is the whole point of the pair.
+    ; ----------------------------------------------------------------
+    EthServeDhcp()
+    ProcedureReturn
+  EndIf
+
+  PrintN("!! the cable is in and this board has no address on it at all - no")
+  PrintN("   lease, nothing stored, and no link-local address could be taken.")
+  PrintN("   Nothing is broken and nothing was left half-started: the boot")
+  PrintN("   carries on and the console arms on whichever interface does end up")
+  PrintN("   holding an address. Typing dhcp, or net address, arms it by itself.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkSayDetail - what THIS BOARD has to add about the link in use,
+;  once the shared command has printed everything that is the same on
+;  every board.
+;
+;  WHAT THE COMMAND LAYER ALREADY PRINTS, so that nothing is said twice:
+;  which interface won and why (LinkSay), the negotiated speed and duplex
+;  (LinkSpeed / LinkDuplex over the HwLink* getters), the hardware
+;  address frames leave with (PutLinkMac over LinkMacPtr), and the four
+;  configured addresses. This used to be eth_SayUp() and printed all of
+;  that itself, in this file, for the wired link only.
+;
+;  WHAT IS LEFT IS TRUE OF THIS BOARD AND NOTHING ELSE:
+;
+;    THE RECEIVE REGION. Half a megabyte at a fixed address that the MAC
+;    writes into by DMA. An operator about to type `run` is entitled to
+;    know where a bus master is writing, and the reassurance that it is
+;    outside both payload windows is a fact about this memory map.
+;
+;    THE MADE-UP HARDWARE ADDRESS. When the VideoCore would not report
+;    this board's own address, a locally administered one is used
+;    instead - and that will not match a DHCP reservation or a switch
+;    port locked to the address printed on the board. It is a warning
+;    and it must not be lost.
+;
+;  IT SAYS NOTHING AT ALL WHEN THE RADIO CARRIES THE TRAFFIC. Neither
+;  fact is about the radio, and a receive region printed under a Wi-Fi
+;  status line would be an invitation to believe the wrong thing.
+; ----------------------------------------------------------------------
+Procedure HwLinkSayDetail()
+  If LinkKind() <> #HW_LINK_WIRED
+    ProcedureReturn
+  EndIf
+  If gEthMacKnown = 1 And gEthMacFirmware = 0
+    PrintN("  This board's hardware address is MADE UP, not its own. The firmware")
+    PrintN("  would not tell us the real one, so a locally administered address is")
+    PrintN("  being used instead. It works on an ordinary network and it will NOT")
+    PrintN("  match a DHCP reservation or a switch port locked to the address")
+    PrintN("  printed on the board.")
+  EndIf
+  Print("  Received frames land at ")
+  PutAddr(#ETH_RX_BASE)
+  Print(", ")
+  PrintDec(#ETH_RX_BYTES)
+  PrintN(" bytes of them, which is")
+  PrintN("  outside both payload windows so nothing you load can be put there.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  eth_SayCount - one counter, as a sentence, and only when it is not
+;  zero unless it is one of the two that are meant to be printed anyway.
+;
+;  WHY MOST OF THEM ARE HIDDEN AT ZERO. Sixteen lines of "0" is a wall a
+;  reader skims, and the whole point of this command is that one non-zero
+;  number should be impossible to miss. The two that always print are the
+;  packet counts, because "nothing has been counted at all" and "nothing
+;  has gone wrong" are different answers and a screen with neither would
+;  be indistinguishable from a command that did not run.
+; ----------------------------------------------------------------------
+Procedure eth_SayCount(*what, v.i, always.i)
+  If v < 0
+    Print("  ")
+    UartWriteStr(*what)
+    PrintN(": the controller would not answer that read, so this number is")
+    PrintN("  not known. That is a fault in this monitor, not in the network.")
+    ProcedureReturn
+  EndIf
+  If v = 0 And always = 0
+    ProcedureReturn
+  EndIf
+  Print("  ")
+  UartWriteStr(*what)
+  Print(": ")
+  PrintDec(v)
+  PrintN(".")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  eth_SayRadioCounters - THE RADIO'S HALF OF `net stats`.
+;
+;  THIS BOARD HAS TWO INTERFACES AND THE COMMAND ANSWERS FOR BOTH. The
+;  wired half is a hardware statistics block; this half is a DOCUMENTED
+;  ABSENCE, and it is printed rather than left out: a command that answers
+;  about one interface and says nothing at all about the other reads as a
+;  command that only knows about one interface.
+;
+;  WHAT IS ACTUALLY ABSENT. The CYW43 is reached over SDIO and its
+;  firmware keeps its counters inside itself; this driver reads no
+;  statistics block from it, so there is no pause, checksum, collision or
+;  ring-overflow number here to print. That is a fact about what this
+;  driver asks for, not about the part - and saying which of the two it
+;  is, is the whole value of the sentence.
+;
+;  THE NUMBERS THE RADIO DOES HAVE are the ones kept one layer up, and
+;  `net` prints them. This points there instead of copying them: two
+;  places counting one thing is how the two numbers end up different.
+; ----------------------------------------------------------------------
+Procedure eth_SayRadioCounters()
+  PrintNl()
+  PrintN("THE WI-FI RADIO.")
+  If gWifiHaveIp <> 0
+    PrintN("  The radio is joined and holds an address.")
+  Else
+    PrintN("  The radio is not joined to a network with an address of its own.")
+  EndIf
+  PrintN("  Either way it has none of the counters above. They come out of the")
+  PrintN("  Ethernet controller's own statistics block, and the CYW43 keeps its")
+  PrintN("  equivalents inside its firmware where this driver does not ask for")
+  PrintN("  them - so there is no pause, checksum, collision or ring-overflow")
+  PrintN("  number here, and an absent number is not a zero. Type net for the")
+  PrintN("  frames in, frames out and refusals this board counts for the radio")
+  PrintN("  itself, and wifi status for the link. Nothing was read from the radio")
+  PrintN("  and nothing was changed.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwLinkSayCounters - WHAT THE ETHERNET CONTROLLER ITSELF COUNTED.
+;
+;  THIS EXISTS BECAUSE OF ONE DAY WITH NO NUMBER IN IT. On 2026-09-08
+;  this board came up on a cable straight into the bench laptop during a
+;  display bring-up, and between 17:38:57 and 17:41:16 the laptop's
+;  Realtek Ethernet card logged "reset by tx hang" twelve times, at 11 to
+;  13 second intervals, before Windows stopped the device. Nothing was
+;  run against that card from the PC, so the only thing on the far end of
+;  the cable was this board. The explanation that fitted - this board
+;  holding 802.3x PAUSE asserted through a stretch when nothing was
+;  reading its receive ring - had an EXACT ANSWER SITTING IN A UNIMAC
+;  COUNTER, and no command in this monitor would print it. The bench lost
+;  its Ethernet for the day and the diagnosis stayed a hypothesis.
+;
+;  It is not a hypothesis now, and the first line below is why: with
+;  genet.pi4 setting CMD_TX_PAUSE_IGNORE on every link the MAC cannot
+;  emit a PAUSE frame, so "pause frames sent" reads zero, and a boot on a
+;  cable that leaves it at zero is the proof that this board is not the
+;  thing stopping anybody's card.
+;
+;  THE COUNTS ARE SINCE THE INTERFACE CAME UP, not since the board did.
+;  The bring-up zeroes the whole statistics block, so "times this
+;  interface has been brought up" is printed beside them: a zero counter
+;  on an interface rebuilt four seconds ago says much less than a zero
+;  counter on one that has been up for an hour.
+;
+;  IT READS AND PRINTS. Nothing here writes a register, nothing here
+;  clears a counter, and it is safe to type twice in a row - which is
+;  exactly how anybody would use it.
+;
+;  IT IS PER INTERFACE, LIKE EVERYTHING ELSE ON THIS BOARD. It used to
+;  begin by refusing whenever LinkKind() was not the wired link. LinkKind()
+;  is WHICH INTERFACE OUTBOUND TRAFFIC LEAVES BY - a routing choice made
+;  with `net link`. It is not evidence about what any interface HOLDS or
+;  what any controller HAS COUNTED. The GENET counts every frame that
+;  reaches its MAC from the moment the interface is up, whether or not the
+;  policy layer is pointing at it; so on a board with a cable in and the
+;  radio pinned, the command refused to print the exact number it exists
+;  for, and named `net link wired` - a command that CHANGES THE BOARD - as
+;  the cure for a request that reads nothing. It now prints the wired
+;  controller's counters whatever is selected, and says of the radio what
+;  is absent, rather than staying silent about it.
+; ----------------------------------------------------------------------
+Procedure HwLinkSayCounters()
+  ; ---- THE WIRED ETHERNET ------------------------------------------
+  PrintN("THE WIRED ETHERNET, as its own controller counted it.")
+  If GenetStarted() <> 1
+    PrintN("  The Ethernet controller has not been started, so it has counted")
+    PrintN("  nothing. Put a cable in and type net up, then ask again. Nothing was")
+    PrintN("  read and nothing was changed.")
+    eth_SayRadioCounters()
+    ProcedureReturn
+  EndIf
+
+  PrintN("What the Ethernet controller has counted since this interface came up.")
+  PrintN("A counter that is zero is not printed, apart from the two packet counts,")
+  PrintN("so anything you see below is a number worth reading.")
+  PrintNl()
+
+  ; THE FLOW-CONTROL PAIR FIRST, AND THE FIRST LINE IS THE ONE THAT
+  ; MATTERS. It is printed whatever it says, because "zero" is the
+  ; answer this board owes anybody whose network card it is sharing a
+  ; cable with.
+  Print("  Pause frames this board SENT: ")
+  PrintDec(GenetMibTxPause())
+  PrintN(".")
+  If GenetMibTxPause() > 0
+    PrintN("  !! THAT MUST BE ZERO. This board is telling the machine at the other")
+    PrintN("     end of the cable to stop transmitting, and a machine whose transmit")
+    PrintN("     queue is held shut long enough resets its own network card. It is")
+    PrintN("     how the bench laptop's Ethernet was stopped on 2026-09-08. The MAC")
+    PrintN("     is configured never to send one, so a number here means that")
+    PrintN("     configuration did not land - see THE PAUSE PROMISE in genet.pi4.")
+  EndIf
+  eth_SayCount("Pause frames the other end sent us", GenetMibRxPause(), 0)
+  If GenetMibRxPause() > 0
+    PrintN("     That is the other end asking US to stop, which this board ignores")
+    PrintN("     on purpose. It is not a fault here; it means the machine on the")
+    PrintN("     other end of the cable is the one that is behind.")
+  EndIf
+  PrintNl()
+
+  eth_SayCount("Good frames the controller received", GenetMibRxPackets(), 1)
+  eth_SayCount("Good frames the controller sent", GenetMibTxPackets(), 1)
+  PrintNl()
+
+  ; THE ERROR COUNTERS. Silent when they are zero, which is what a
+  ; healthy gigabit link into one switch looks like.
+  eth_SayCount("Frames arriving with a bad checksum", GenetMibRxFcsErrors(), 0)
+  eth_SayCount("Frames arriving misaligned", GenetMibRxAlignErrors(), 0)
+  eth_SayCount("Frames arriving with an impossible length", GenetMibRxLengthErrors(), 0)
+  eth_SayCount("Frames arriving oversize", GenetMibRxOversize(), 0)
+  eth_SayCount("Jabber", GenetMibRxJabber(), 0)
+  eth_SayCount("Frames sent with a bad checksum", GenetMibTxFcsErrors(), 0)
+  eth_SayCount("Frames sent oversize", GenetMibTxOversize(), 0)
+  eth_SayCount("Late collisions", GenetMibTxLateColl(), 0)
+  eth_SayCount("Excessive collisions", GenetMibTxExcessColl(), 0)
+  If GenetMibTxLateColl() > 0 Or GenetMibTxExcessColl() > 0
+    PrintN("     A full-duplex link has no collisions at all, so a collision count")
+    PrintN("     means the two ends disagree about the duplex. That produces a link")
+    PrintN("     that works and is dreadful, rather than one that fails.")
+  EndIf
+
+  ; THE TWO OVERRUN COUNTS, WHICH ARE THE SAME EVENT ONE STAGE APART.
+  eth_SayCount("Frames dropped because the receive buffer was full", GenetRbufOverflows(), 0)
+  eth_SayCount("Frames dropped because the receive ring was full", GenetRxDiscards(), 0)
+  If GenetRbufOverflows() > 0 Or GenetRxDiscards() > 0
+    PrintN("     Dropping a frame when nothing has read the ring recently is the")
+    PrintN("     ORDINARY and correct outcome for a monitor - it is what this board")
+    PrintN("     does INSTEAD of telling the other end to stop. Every protocol above")
+    PrintN("     it copes, and the same stack runs over the radio, which has no flow")
+    PrintN("     control of any kind.")
+  EndIf
+  eth_SayCount("Receive buffer errors", GenetRbufErrors(), 0)
+  eth_SayCount("Address filter errors", GenetMdfErrors(), 0)
+  PrintNl()
+
+  ; AND THE THREE SOFTWARE COUNTS THAT SAY WHAT THE NUMBERS ABOVE ARE
+  ; ABOUT. Every bring-up zeroes the hardware block, so this one has to
+  ; print even at 1.
+  Print("  Times this interface has been brought up: ")
+  PrintDec(GenetStartCount())
+  PrintN(". Each one clears every")
+  PrintN("  counter above, so they are about the most recent bring-up only.")
+  eth_SayCount("Times auto-negotiation was restarted", GenetAnegRestarts(), 0)
+  If GenetAnegRestarts() > 1
+    PrintN("     More than one is worth explaining. Restarting negotiation takes the")
+    PrintN("     link down for seconds, and a machine whose cable keeps going away")
+    PrintN("     mid-transmit is the other way to make it reset its network card.")
+  EndIf
+  eth_SayCount("Times the link was seen to drop and come back", GenetLinkDrops(), 0)
+  If GenetLinkDrops() > 0
+    PrintN("     That count is a floor and not a total: the PHY latches one drop")
+    PrintN("     until somebody reads it, so any number of drops between two looks")
+    PrintN("     counts as one. Zero means none was seen, not that none happened.")
+  EndIf
+  eth_SayRadioCounters()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  HwLinkAddressBound - a link of this kind has just been handed an
+;  address by something that is not this board's own bring-up.
+;
+;  TODAY THAT IS THE `dhcp` COMMAND, and it is the whole of a defect that
+;  cost a day. That command is portable: it runs DISCOVER/OFFER/REQUEST/
+;  ACK over whichever link the policy layer chose and gives the lease to
+;  the one IP layer. Over the WIRED link that is the end of the story -
+;  the caller writes gEthIp/gEthMask/gEthGw itself and nothing else on
+;  this board cares. Over the RADIO it is half the story: wifi.pi4 keeps
+;  its own gWifiHaveIp, everything the radio does tests it, and the
+;  wireless console will not arm while it says no.
+;
+;  THE SYMPTOM THAT MADE IT URGENT, 2026-09-06: the board took its
+;  address this way, ANSWERED PING - the prompt's TCP tick pumps the IP
+;  layer for whichever link is selected, console or no console - and its
+;  UDP console on port 5555 was DEAF. With the serial cable out that is a
+;  board on the network that nobody can reach, and the only cure was to
+;  type `wifi join` on the console that was not working.
+;
+;  WifiAdoptAddress is idempotent and so is this: a renewal of an address
+;  the radio already has re-records the same three numbers and finds the
+;  console already listening.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  HwLinkAddressBound HAS MOVED, and it is BELOW HwLinkOpen now.
+;
+;  It has to be: since 2026-09-07 it CALLS HwLinkOpen, and this language
+;  resolves a call to a procedure it has already seen. See the procedure
+;  itself, after HwLinkOpen, for what it does with it and why.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  HwLinkOpen - the seam's bring-up. Choose an interface, make sure the
+;  IP layer's row for it holds that interface's identity, and say in a
+;  full sentence why not if nothing can carry traffic. 1 if something
+;  now can.
+;
+;  IT WAS CALLED LinkBringUp UNTIL 2026-09-05 and it lived here under a
+;  portable-looking name, which is why Anvil/Core/net_cmd.pbi and
+;  Anvil/Core/tcp_cmd.pbi called into a Pi 4 board file four times over
+;  without it being obvious that they did. The name now says which side
+;  of the seam it is on; Anvil/Hal/hal.pbi states the contract.
+;
+;  IT IS SILENT ON SUCCESS. It used to print through EthUp / EthUpIp,
+;  which wrapped it. The command layer prints which link won and why,
+;  because that wording is the same on every board, and asks this board
+;  for the rest through HwLinkSayDetail.
+;
+;  THE ADDRESSES ARE RE-READ BEFORE THE BRING-UP, not after, and that
+;  order is the whole point: they live in the settings store, which the
+;  operator can change between one transfer and the next - `net server`
+;  is exactly the thing somebody retypes after a get has failed - and a
+;  port that ignored what was just typed would be the silent wrong answer
+;  this project exists to refuse. EthHasIpConfig() below reads them.
+;
+;  IDEMPOTENT AND CHEAP THE SECOND TIME (eth_HwUp returns 2): once the
+;  port is up it stays up, so a run of get commands pays the bring-up
+;  once. The re-check is live - GenetStarted() and one MDIO read - so a
+;  cable pulled between two commands is noticed rather than lied about.
+;
+;  needIp = 1  the caller must be able to SEND from an address (ping,
+;              dns, get, put, tcp, http get)
+;  needIp = 0  the caller has no address yet and is about to ask for one
+;              (dhcp), so an interface with a link but no address is a
+;              perfectly good answer
+;
+;  THE MAC AND THE IP MUST COME FROM THE SAME INTERFACE. That is the one
+;  thing this procedure exists to make impossible to get wrong: an
+;  interface's six bytes and its address are two fields of ONE ROW in
+;  net.pi4, keyed by #HW_LINK_*, and writing the wired card's hardware
+;  address into the row the radio then builds its frames from produces a
+;  board whose every reply is filtered out by its own access point, with
+;  nothing anywhere reporting a fault. The per-interface rows make the
+;  two halves impossible to CROSS between interfaces; they do not make it
+;  impossible to write one row badly, which is why the kind below is
+;  spelled out beside each pair rather than carried in a variable.
+; ----------------------------------------------------------------------
+Procedure.i HwLinkOpen(needIp.i)
+  Define wiredLink.i
+  Define wiredIp.i
+  Define wifiUp.i
+  Define wifiIp.i
+  Define k.i
+  Define r.i
+
+  ; ---- HAND THE HwLink BACKEND THE WIRED CARD'S ADDRESS. gEthMac lives
+  ; ---- in eth_globals.pi4, which the board file includes long after
+  ; ---- hw_link.pi4 has to be included, so the backend keeps a pointer
+  ; ---- rather than a second copy of the six bytes. Set here because
+  ; ---- this is the one procedure in the monitor that chooses a link,
+  ; ---- so nothing can select an interface without it having been set.
+  HwLinkSetWiredMacPtr(@gEthMac[0])
+
+  ; ---- what the radio can do. Nothing is started here: the radio is
+  ; ---- brought up by `wifi join` or at boot, and a network command is
+  ; ---- not the place to start joining one.
+  wifiUp = 0
+  wifiIp = 0
+  If gWifiUp <> 0
+    wifiUp = 1
+    If gWifiHaveIp <> 0
+      wifiIp = 1
+    EndIf
+  EndIf
+
+  ; ---- what the wired side can do. EthConfigIp() reads the settings
+  ; ---- store and validates the three addresses; it is quiet when they
+  ; ---- are simply absent, which is the ordinary case on a bench that
+  ; ---- runs on Wi-Fi.
+  wiredIp = 0
+  If EthHasIpConfig() <> 0
+    wiredIp = 1
+  EndIf
+
+  wiredLink = 0
+  If gEthUp = 1
+    If GenetStarted() = 1
+      If GenetPhyLinkUp() = 1
+        wiredLink = 1                  ; already up: one MDIO read
+      Else
+        gEthUp = 0                     ; the cable has gone since last time
+      EndIf
+    EndIf
+  EndIf
+
+  ; The five-second bring-up is paid only when it is worth paying: the
+  ; operator asked for wired, or the radio has nothing.
+  If wiredLink = 0
+    If LinkPin() = #HW_LINK_WIRED Or wifiIp = 0
+      If LinkPin() <> #HW_LINK_WIFI
+        If eth_HwUpLocal() > #ETH_HWUP_DOWN
+          wiredLink = 1
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  ; The operator's override, HANDED TO THE POLICY AS A FACT. It used to
+  ; be applied here by zeroing the other interface's two facts before
+  ; calling, which is how `net` came to say "there is nothing plugged
+  ; into the Ethernet socket" about a cable that was in, negotiated and
+  ; holding two addresses: LinkSelect stamped the only reason it had for
+  ; choosing the radio with the wired facts clear. Every fact it is
+  ; given below is now true, the pin included, and the reason it stamps
+  ; describes the instruction that was actually given. The pin is a
+  ; #HW_LINK_* kind and lives in RaspberryPi4/Lib/link.pi4 beside the
+  ; preference order it overrides.
+  k = LinkSelect(LinkPin(), wiredLink, wiredIp, wifiUp, wifiIp)
+  If k = #HW_LINK_NONE
+    PrintN("!! no interface is carrying traffic, so nothing was done.")
+    Print("   ")
+    UartWriteStr(LinkWhyText())
+    PrintNl()
+    PrintN("   Plug a cable into the Ethernet socket and set an address with")
+    PrintN("   net ip, or join a wireless network with wifi join, then try again.")
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- fill in the IP layer's row for the interface that won --------
+  ; ---- Only that one row: the other interface keeps whatever it was
+  ; ---- given, so a `get` over the cable no longer costs the radio the
+  ; ---- address its console is answering on.
+  If k = #HW_LINK_WIRED
+    If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0
+      PrintN("!! the network stack refused this board's wired hardware address, so")
+      PrintN("   nothing was done.")
+      EthWhyNet()
+      ProcedureReturn 0
+    EndIf
+    If wiredIp <> 0
+      If NetSetIPv4(#HW_LINK_WIRED, gEthIp, gEthMask, gEthGw) = 0
+        PrintN("!! the network stack refused the wired addresses, so nothing was")
+        PrintN("   done.")
+        EthWhyNet()
+        ProcedureReturn 0
+      EndIf
+    ElseIf needIp <> 0
+      PrintN("!! the wired link is up but no address is set for it, so nothing")
+      PrintN("   could be sent. Type dhcp to be given one, or net ip <a.b.c.d>.")
+      ProcedureReturn 0
+    EndIf
+  Else
+    If NetSetMac(#HW_LINK_WIFI, @wifi_ourMac[0]) = 0
+      PrintN("!! the network stack refused the radio's hardware address, so")
+      PrintN("   nothing was done.")
+      EthWhyNet()
+      ProcedureReturn 0
+    EndIf
+    If wifiIp <> 0
+      If NetSetIPv4(#HW_LINK_WIFI, gWifiIp, gWifiMask, gWifiGw) = 0
+        PrintN("!! the network stack refused the radio's addresses, so nothing was")
+        PrintN("   done.")
+        EthWhyNet()
+        ProcedureReturn 0
+      EndIf
+    ElseIf needIp <> 0
+      PrintN("!! the radio is joined but has no address, so nothing could be sent.")
+      PrintN("   Type dhcp, or wifi join again.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ----------------------------------------------------------------------
+;  HwLinkAddressBound - a link of this kind has just been handed an
+;  address by something that is not this board's own bring-up.
+;
+;  IT IS BELOW HwLinkOpen BECAUSE IT CALLS IT. That is the 2026-09-07
+;  addition and the whole of the second half of this comment.
+;
+;  TODAY THAT IS THE `dhcp` COMMAND, and it is the whole of a defect that
+;  cost a day. That command is portable: it runs DISCOVER/OFFER/REQUEST/
+;  ACK over whichever link the policy layer chose and gives the lease to
+;  the one IP layer. Over the WIRED link that is the end of the story -
+;  the caller writes gEthIp/gEthMask/gEthGw itself and nothing else on
+;  this board cares. Over the RADIO it is half the story: wifi.pi4 keeps
+;  its own gWifiHaveIp, everything the radio does tests it, and the
+;  wireless console will not arm while it says no.
+;
+;  THE SYMPTOM THAT MADE IT URGENT, 2026-09-06: the board took its
+;  address this way, ANSWERED PING - the prompt's TCP tick pumps the IP
+;  layer for whichever link is selected, console or no console - and its
+;  UDP console on port 5555 was DEAF. With the serial cable out that is a
+;  board on the network that nobody can reach, and the only cure was to
+;  type `wifi join` on the console that was not working.
+;
+;  ======================================================================
+;  AND A RADIO LEASE MUST NOT TAKE THE ONE IP LAYER OFF THE CABLE.
+;  ======================================================================
+;  MEASURED OVER THE CABLE, 2026-09-07, with a laptop talking to the
+;  board on a link-local address: the access point idled the board out,
+;  WifiLinkTick noticed, re-associated and re-leased - and the board
+;  printed that Wi-Fi had reconnected with its new lease. That lease went into the
+;  ONE IP layer, the console re-armed on the radio, and the wired console
+;  the laptop was in the middle of using went silent. The laptop is not
+;  on 192.168.1.x and cannot be, so from the bench the board simply
+;  vanished, mid-session, with no cable touched and nothing typed.
+;
+;  IT IS THE INTERFACE PREFERENCE ORDER BEING OVERRULED BY A SIDE
+;  EFFECT. LinkSelect's rule is that the wired side wins when both are
+;  usable, and RaspberryPi4/Board/boot.pi4 says in as many words that a
+;  wireless join must "add a second interface without moving the console
+;  off the cable". Nothing enforced it: the lease path applies its
+;  result to the shared stack and nobody asks the policy layer whether
+;  that link is the one that should be carrying traffic.
+;
+;  SO THE POLICY LAYER IS ASKED, HERE, ONCE. HwLinkOpen re-derives the
+;  whole preference order from live facts - the cable, the PHY's link
+;  bit, both addresses, the operator's pin - and reconfigures the IP
+;  layer for whichever link wins. On a board with a cable holding an
+;  address that puts the stack straight back on the cable, with the
+;  radio's own state (gWifiIp, gWifiHaveIp) correctly recorded by the
+;  WifiAdoptAddress above; on a board with no cable it selects the radio
+;  and the effect is exactly what it was before this line existed.
+;
+;  IT COSTS ONE MDIO READ ON A LINK THAT IS ALREADY UP, and it cannot
+;  pay the five-second bring-up while a radio has an address: that is
+;  HwLinkOpen's own rule, unchanged, and the radio has one by
+;  construction here. NetAddressBound calls NetConsoleRearm immediately
+;  after this returns, so the console is re-derived from the restored
+;  state rather than from the moment in the middle of it.
+;
+;  WifiAdoptAddress is idempotent and so is this: a renewal of an address
+;  the radio already has re-records the same three numbers, re-derives
+;  the same winner and finds the console already listening.
+; ----------------------------------------------------------------------
+Procedure HwLinkAddressBound(kind.i, ip.i, mask.i, gw.i)
+  If kind = #HW_LINK_WIFI
+    WifiAdoptAddress(ip, mask, gw)
+    If ip = 0
+      ProcedureReturn
+    EndIf
+    ; Ask the preference order who should be carrying traffic now. Its
+    ; refusals print in full sentences and none of them can happen here -
+    ; the radio has just taken an address, so there is always at least
+    ; one usable interface - but the answer is not ignored either: if it
+    ; somehow could not choose, the stack keeps the radio's lease, which
+    ; is the state this procedure was left in before today.
+    HwLinkOpen(1)
+    ProcedureReturn
+  EndIf
+  ; The wired side has nothing to do. gEthIp/gEthMask/gEthGw belong to
+  ; the caller, which has already written them, and no wired-only feature
+  ; on this board waits on an address.
+EndProcedure
+
+; ======================================================================
+;  WHAT LEFT THIS FILE ON 2026-09-05, AND WHERE IT WENT
+; ======================================================================
+;  Every one of these was called from Anvil/Core/net_cmd.pbi or
+;  Anvil/Core/tcp_cmd.pbi, which is a shared core that is supposed to
+;  name no board. None of them touched genet or cyw43; they were here
+;  because this is where the network commands' caller half grew up, and
+;  that is a history rather than a reason.
+;
+;    LinkBringUp  -> HwLinkOpen, above. The seam's name for the same act.
+;    LinkSay      -> Anvil/Core/net_cmd.pbi. It prints, in words that are
+;    PutLinkMac      the same on every board, what the portable policy
+;                    layer already knows.
+;    LinkMacPtr   -> RaspberryPi4/Lib/link.pi4. It is HwLinkMacPtr of the
+;                    kind that won.
+;    EthUp        -> Anvil/Core/net_cmd.pbi as NetLinkUpFull /
+;    EthUpIp         NetLinkUpSay / HwLinkOpen(0). The three differed only
+;    EthLinkUp       in how much configuration went on top and in how much
+;                    they printed, and none of that is a property of a MAC.
+;    EthResolve   -> Anvil/Core/net_cmd.pbi as NetResolveHop. It is
+;                    net.pi4's ARP plus this project's pump plus a
+;                    keypress check - portable in every line.
+;    EthSendStaged-> Anvil/Core/net_cmd.pbi as NetXferSend.
+;    EthPump      -> Anvil/Core/net_cmd.pbi as NetXferPump / NetXferRun.
+;    EthRun          tftp.pi4 and net.pi4 are portable libraries and the
+;                    loop over them never was anything else.
+;    eth_SayUp    -> split: the speed, the duplex, the hardware address
+;                    and the four addresses are printed by the shared
+;                    command out of the HwLink* getters; the receive
+;                    region and the made-up-address warning stayed here
+;                    as HwLinkSayDetail, because they are true of this
+;                    board and of nothing else.
+;
+;  WHAT STAYED IS WHAT TOUCHES THE PART: eth_HwUp (probe, MAC, receive
+;  region, GenetStart and its four refusals), EthDown/HwLinkClose
+;  (GenetStop), and HwLinkOpen's fact-gathering, which reads gEthUp,
+;  GenetStarted and one MDIO read. That is the whole of the board's half
+;  and it is the half that could never have moved.
+; ======================================================================

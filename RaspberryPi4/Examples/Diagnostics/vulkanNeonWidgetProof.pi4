@@ -1,0 +1,522 @@
+; vulkanNeonWidgetProof.pi4 - production NeonVkChrome widget proof on Pi 4.
+;
+; DIAGNOSTIC. DOES NOT SHIP. This is a returning, RAM-only payload. It creates
+; the attachment, view, render pass, framebuffer, device, queue and command
+; pool through the public Vulkan API, gives those real objects to the shipped
+; NeonVkChrome adapter, and asks the real Neon widget scene to render once.
+; There is no model renderer, CPU paint path, native-Neon frame, private V3D
+; draw shortcut, flash operation, reset, or boot-medium write in this file.
+;
+; Desk build:
+;   PureMetalForge.exe --compile \
+;     RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetProof.pi4 -t pi4 \
+;     --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;     -o vulkanNeonWidgetProof.img
+;
+; The return value is a pointer to exactly 64 little-endian 32-bit report
+; words (256 bytes). tools/vulkan_neon_widget_proof_check.py owns the separate
+; report and raw-BGRA pixel oracle.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"
+
+#NW_MAGIC             = $4157564E       ; bytes "NVWA"
+#NW_TAIL              = $4E565741       ; bytes "AWVN"
+#NW_REPORT_WORDS      = 64
+#NW_REPORT_BYTES      = #NW_REPORT_WORDS * 4
+
+#NW_ARENA             = $0A000000
+#NW_ARENA_BYTES       = $01000000
+#NW_SURFACE           = $06000000
+#NW_SURFACE_PITCH     = 3200
+#NW_SURFACE_BYTES     = 4096000
+#NW_WINDOW            = $063E8000
+#NW_WINDOW_BYTES      = $00800000
+#NW_MAP_SPAN          = $00BE8000
+#NW_DSI_SCAN          = $08A00000
+#NW_SHOW_MS           = 3000
+
+#NW_OK                = 0
+#NW_NOT_TRIED         = 1
+#NW_ERR_NEON          = 2
+#NW_ERR_WINDOW        = 3
+#NW_ERR_INSTANCE      = 4
+#NW_ERR_DEVICE        = 5
+#NW_ERR_IMAGE         = 6
+#NW_ERR_MEMORY        = 7
+#NW_ERR_VIEW          = 8
+#NW_ERR_RENDERPASS    = 9
+#NW_ERR_FRAMEBUFFER   = 10
+#NW_ERR_PRIME         = 11
+#NW_ERR_ADAPTER       = 12
+#NW_ERR_DISPLAY       = 13
+#NW_ERR_SCENE         = 14
+#NW_ERR_COUNTS        = 15
+#NW_ERR_PRESENT       = 16
+#NW_ERR_PIXELS        = 17
+
+; Fixed report schema. Each slot is one 32-bit word; the monitor has no
+; 64-bit dump width, so this is deliberately not an array of native integers.
+#NW_S_MAGIC           = 0
+#NW_S_STATUS          = 1
+#NW_S_STEP            = 2
+#NW_S_BYTES           = 3
+#NW_S_INSTANCE        = 4
+#NW_S_PHYSICAL        = 5
+#NW_S_DEVICE          = 6
+#NW_S_QUEUE           = 7
+#NW_S_POOL            = 8
+#NW_S_IMAGE           = 9
+#NW_S_MEMORY          = 10
+#NW_S_VIEW            = 11
+#NW_S_RENDERPASS      = 12
+#NW_S_FRAMEBUFFER     = 13
+#NW_S_IMAGE_BASE      = 14
+#NW_S_IMAGE_SIZE      = 15
+#NW_S_IMAGE_PITCH     = 16
+#NW_S_PRIME_RC        = 17
+#NW_S_CREATE_RC       = 18
+#NW_S_SCENE_RC        = 19
+#NW_S_READY_BEFORE    = 20
+#NW_S_READY_AFTER     = 21
+#NW_S_HOOK_BEFORE     = 22
+#NW_S_HOOK_AFTER      = 23
+#NW_S_DRAW_ACTUAL     = 24
+#NW_S_VERTEX_ACTUAL   = 25
+#NW_S_DRAW_EXPECT     = 26
+#NW_S_VERTEX_EXPECT   = 27
+#NW_S_BOX_EXPECT      = 28
+#NW_S_TEXT_EXPECT     = 29
+#NW_S_GLYPH_EXPECT    = 30
+#NW_S_SCISSOR_EXPECT  = 31
+#NW_S_DMA_DELTA       = 32
+#NW_S_DMA_FALLBACK    = 33
+#NW_S_DMA_REFUSAL     = 34
+#NW_S_PRESENT_PENDING = 35
+#NW_S_BACKEND_ERROR   = 36
+#NW_S_DISPLAY_ERROR   = 37
+#NW_S_PIXEL_COUNT     = 38
+#NW_S_PIXEL0          = 39             ; twelve words, through slot 50
+#NW_S_FAULT_COUNT     = 51
+#NW_S_FAULT_TEXT      = 52
+#NW_S_SHUTDOWN        = 53
+#NW_S_FORMAT_LINEAR   = 54
+#NW_S_FORMAT_OPTIMAL  = 55
+#NW_S_MEMORY_BITS     = 56
+#NW_S_MEMORY_TYPE     = 57
+#NW_S_CLEAR_R         = 58
+#NW_S_CLEAR_G         = 59
+#NW_S_CLEAR_B         = 60
+#NW_S_CLEAR_A         = 61
+#NW_S_RESERVED        = 62
+#NW_S_TAIL            = 63
+
+Global Dim nwReport.l[#NW_REPORT_WORDS]
+Global Dim nwDmaScratch.a[768]
+Global Dim nwClear.l[4]
+Global Dim nwProbeX.i[12]
+Global Dim nwProbeY.i[12]
+
+Procedure nwPut(slot.i, value.i)
+  If slot >= 0 And slot < #NW_REPORT_WORDS
+    nwReport[slot] = value & $FFFFFFFF
+  EndIf
+EndProcedure
+
+Procedure.i nwGet(slot.i)
+  If slot < 0 Or slot >= #NW_REPORT_WORDS : ProcedureReturn 0 : EndIf
+  ProcedureReturn nwReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure.i nwReturn(status.i)
+  nwPut(#NW_S_STATUS, status)
+  nwPut(#NW_S_FAULT_COUNT, AnvilVkFaultCount())
+  nwPut(#NW_S_FAULT_TEXT, AnvilVkFaultText())
+  ProcedureReturn @nwReport[0]
+EndProcedure
+
+Procedure nwSeedProbes()
+  ; Ground, menu bar, panel body/header/accent, list normal/selected/clip edge,
+  ; drop-down body, outside drop-down, and lower panel. None intersects text.
+  nwProbeX[0] = 400 : nwProbeY[0] = 100
+  nwProbeX[1] = 700 : nwProbeY[1] = 10
+  nwProbeX[2] = 30  : nwProbeY[2] = 150
+  nwProbeX[3] = 700 : nwProbeY[3] = 125
+  nwProbeX[4] = 25  : nwProbeY[4] = 125
+  nwProbeX[5] = 700 : nwProbeY[5] = 205
+  nwProbeX[6] = 700 : nwProbeY[6] = 225
+  nwProbeX[7] = 700 : nwProbeY[7] = 263
+  nwProbeX[8] = 700 : nwProbeY[8] = 264
+  nwProbeX[9] = 15  : nwProbeY[9] = 40
+  nwProbeX[10] = 200 : nwProbeY[10] = 40
+  nwProbeX[11] = 700 : nwProbeY[11] = 300
+EndProcedure
+
+Procedure nwCapturePixels(base.i, pitch.i)
+  Define k.i
+  k = 0
+  While k < 12
+    nwPut(#NW_S_PIXEL0 + k, PeekL(base + (nwProbeY[k] * pitch) + (nwProbeX[k] * 4)))
+    k = k + 1
+  Wend
+  nwPut(#NW_S_PIXEL_COUNT, 12)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define count.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define image.i
+  Define memory.i
+  Define view.i
+  Define renderPass.i
+  Define framebuffer.i
+  Define imageBase.i
+  Define imagePitch.i
+  Define mapped.i
+  Define dmaScratch.i
+  Define dmaBefore.i
+  Define fallbackBefore.i
+  Define refusalBefore.i
+  Define adapterMade.i
+  Define vkMade.i
+  Define neonMade.i
+  Define ici.VkInstanceCreateInfo
+  Define fp.VkFormatProperties
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define priority.l
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define props.VkPhysicalDeviceMemoryProperties
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  nwPut(#NW_S_MAGIC, #NW_MAGIC)
+  nwPut(#NW_S_TAIL, #NW_TAIL)
+  nwPut(#NW_S_BYTES, #NW_REPORT_BYTES)
+  nwPut(#NW_S_STATUS, #NW_NOT_TRIED)
+  nwPut(#NW_S_STEP, 0)
+  nwPut(#NW_S_CLEAR_R, $3DCCCCCD)       ; 0.1, deliberately unlike the scene
+  nwPut(#NW_S_CLEAR_G, $3E4CCCCD)       ; 0.2
+  nwPut(#NW_S_CLEAR_B, $3E99999A)       ; 0.3
+  nwPut(#NW_S_CLEAR_A, $3F800000)       ; 1.0
+  nwClear[0] = nwGet(#NW_S_CLEAR_R) : nwClear[1] = nwGet(#NW_S_CLEAR_G)
+  nwClear[2] = nwGet(#NW_S_CLEAR_B) : nwClear[3] = nwGet(#NW_S_CLEAR_A)
+  nwSeedProbes()
+  TimerInit()
+
+  ; The normal monitor-owned deadman remains the only run limiter. The payload
+  ; itself neither resets nor writes any persistent medium.
+  nwPut(#NW_S_STEP, 1)
+  If NeonArena(#NW_ARENA, #NW_ARENA_BYTES) <> #NEON_OK
+    ProcedureReturn nwReturn(#NW_ERR_NEON)
+  EndIf
+  If NeonSurface(#NW_SURFACE, #NVWA_WIDTH, #NVWA_HEIGHT, #NW_SURFACE_PITCH) <> #NEON_OK
+    ProcedureReturn nwReturn(#NW_ERR_NEON)
+  EndIf
+  NeonSurfaceMapSpan(#NW_MAP_SPAN)
+  If NeonInit() <> #NEON_OK
+    ProcedureReturn nwReturn(#NW_ERR_NEON)
+  EndIf
+  neonMade = 1
+  ; NeonInit owns graphics memory and V3D state; the visible widget contract
+  ; still needs the same public palette/font/state setup as the shipping UI.
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  NeonAnimReset()
+  NeonStateReset()
+
+  nwPut(#NW_S_STEP, 2)
+  rc = AnvilVkV3dWindow(#NW_WINDOW, #NW_WINDOW_BYTES)
+  If rc <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_WINDOW)
+  EndIf
+
+  ; Public Vulkan object chain: instance -> physical device -> device/queue ->
+  ; resettable command pool -> linear BGRA attachment/view -> pass/framebuffer.
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @inst)
+  If rc <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_INSTANCE)
+  EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or phys = 0
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_INSTANCE)
+  EndIf
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
+  nwPut(#NW_S_FORMAT_LINEAR, fp\linearTilingFeatures)
+  nwPut(#NW_S_FORMAT_OPTIMAL, fp\optimalTilingFeatures)
+
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @dev)
+  If rc <> #VK_SUCCESS
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_DEVICE)
+  EndIf
+  vkMade = 1
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(dev, @pci, 0, @pool)
+  If rc <> #VK_SUCCESS
+    vkDestroyDevice(dev, 0) : vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_DEVICE)
+  EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NVWA_WIDTH : imageInfo\extent\height = #NVWA_HEIGHT : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @imageInfo, 0, @image)
+  If rc <> #VK_SUCCESS
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0) : vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, image, @req)
+  vkGetPhysicalDeviceMemoryProperties(phys, @props)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  nwPut(#NW_S_MEMORY_BITS, req\memoryTypeBits)
+  nwPut(#NW_S_MEMORY_TYPE, alloc\memoryTypeIndex)
+  rc = vkAllocateMemory(dev, @alloc, 0, @memory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, image, memory, 0) : EndIf
+  If rc <> #VK_SUCCESS
+    vkDestroyImage(dev, image, 0) : vkDestroyCommandPool(dev, pool, 0)
+    vkDestroyDevice(dev, 0) : vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_MEMORY)
+  EndIf
+  imageBase = AnvilVkImageAddress(image)
+  imagePitch = AnvilVkImageRowPitch(image)
+  mapped = 0
+  rc = vkMapMemory(dev, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> imageBase
+    vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_MEMORY)
+  EndIf
+  vkUnmapMemory(dev, memory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = image : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(dev, @viewInfo, 0, @view)
+  If rc <> #VK_SUCCESS
+    vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_VIEW)
+  EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(dev, @passInfo, 0, @renderPass)
+  If rc <> #VK_SUCCESS
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_RENDERPASS)
+  EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = renderPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @view : frameInfo\width = #NVWA_WIDTH
+  frameInfo\height = #NVWA_HEIGHT : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)
+  If rc <> #VK_SUCCESS
+    vkDestroyRenderPass(dev, renderPass, 0) : vkDestroyImageView(dev, view, 0)
+    vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_FRAMEBUFFER)
+  EndIf
+
+  nwPut(#NW_S_INSTANCE, inst) : nwPut(#NW_S_PHYSICAL, phys)
+  nwPut(#NW_S_DEVICE, dev) : nwPut(#NW_S_QUEUE, queue) : nwPut(#NW_S_POOL, pool)
+  nwPut(#NW_S_IMAGE, image) : nwPut(#NW_S_MEMORY, memory) : nwPut(#NW_S_VIEW, view)
+  nwPut(#NW_S_RENDERPASS, renderPass) : nwPut(#NW_S_FRAMEBUFFER, framebuffer)
+  nwPut(#NW_S_IMAGE_BASE, imageBase) : nwPut(#NW_S_IMAGE_SIZE, req\size)
+  nwPut(#NW_S_IMAGE_PITCH, imagePitch)
+
+  ; Settle the genuine immediate-mode scene with its complete no-op family.
+  ; No Vulkan object or pixel is touched by this measurement-only pass.
+  nwPut(#NW_S_STEP, 3)
+  nwPut(#NW_S_HOOK_BEFORE, NeonDrawBackendActive())
+  rc = NvwaPrime()
+  nwPut(#NW_S_PRIME_RC, rc)
+  If rc <> #NVWA_OK Or NeonDrawBackendActive() <> 0
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PRIME)
+  EndIf
+
+  ; The shipped adapter allocates all resident resources here and publishes
+  ; the widget callbacks only after its Vulkan atlas upload has completed.
+  nwPut(#NW_S_STEP, 4)
+  rc = NeonVkChromeCreate(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_EXPECT_QUADS)
+  nwPut(#NW_S_CREATE_RC, rc)
+  nwPut(#NW_S_READY_BEFORE, NeonVkChromeReady())
+  nwPut(#NW_S_HOOK_AFTER, NeonDrawBackendActive())
+  If rc <> #VK_SUCCESS Or NeonVkChromeReady() <> 1 Or NeonDrawBackendActive() <> 1
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_ADAPTER)
+  EndIf
+  adapterMade = 1
+
+  ; Bind the display owner's DMA path before the scene consumes the adapter's
+  ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
+  nwPut(#NW_S_STEP, 5)
+  rc = DisplayAdopt(#NW_DSI_SCAN, #NW_SURFACE_PITCH, #NVWA_WIDTH, #NVWA_HEIGHT, 32)
+  nwPut(#NW_S_DISPLAY_ERROR, DisplayLastError())
+  If rc <> #DSP_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_DISPLAY)
+  EndIf
+  dmaScratch = @nwDmaScratch[0] + 255 : dmaScratch = dmaScratch - (dmaScratch % 256)
+  If DmaSetScratch(dmaScratch, 512) = 0 Or DisplayDmaBind() = 0 Or DmaInit() = 0
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_DISPLAY)
+  EndIf
+  DisplayDmaReadback(1) : DisplayUseDma(1)
+  dmaBefore = DisplayDmaOps()
+  fallbackBefore = DisplayDmaFallbacks()
+  refusalBefore = DisplayDmaRefusals()
+
+  nwPut(#NW_S_STEP, 6)
+  rc = NvwaRenderFrame(@nwClear[0], imageBase, imagePitch)
+  nwPut(#NW_S_SCENE_RC, rc)
+  nwPut(#NW_S_DRAW_ACTUAL, NeonVkChromeDrawCount())
+  nwPut(#NW_S_VERTEX_ACTUAL, NeonVkChromeVertexCount())
+  nwPut(#NW_S_DRAW_EXPECT, NvwaExpectedDraws())
+  nwPut(#NW_S_VERTEX_EXPECT, NvwaExpectedVertices())
+  nwPut(#NW_S_BOX_EXPECT, NvwaExpectedBoxCalls())
+  nwPut(#NW_S_TEXT_EXPECT, NvwaExpectedTextCalls())
+  nwPut(#NW_S_GLYPH_EXPECT, NvwaExpectedGlyphQuads())
+  nwPut(#NW_S_SCISSOR_EXPECT, NvwaExpectedScissorCalls())
+  nwPut(#NW_S_DMA_DELTA, DisplayDmaOps() - dmaBefore)
+  nwPut(#NW_S_DMA_FALLBACK, DisplayDmaFallbacks() - fallbackBefore)
+  nwPut(#NW_S_DMA_REFUSAL, DisplayDmaRefusals() - refusalBefore)
+  nwPut(#NW_S_PRESENT_PENDING, NeonVkChromePresentPending())
+  nwPut(#NW_S_BACKEND_ERROR, NeonVkChromeError())
+  If rc <> #NVWA_OK
+    DisplayUseDma(0) : NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_SCENE)
+  EndIf
+  If nwGet(#NW_S_DRAW_ACTUAL) <> #NVWA_EXPECT_DRAWS Or nwGet(#NW_S_VERTEX_ACTUAL) <> #NVWA_EXPECT_VERTICES
+    DisplayUseDma(0) : NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_COUNTS)
+  EndIf
+  If nwGet(#NW_S_DMA_DELTA) <> 1 Or nwGet(#NW_S_DMA_FALLBACK) <> 0 Or nwGet(#NW_S_DMA_REFUSAL) <> 0 Or nwGet(#NW_S_PRESENT_PENDING) <> 0
+    DisplayUseDma(0) : NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PRESENT)
+  EndIf
+
+  ; The payload records the same stable probes the separate host checker reads
+  ; from the DSI capture. These are observation only; no CPU pixel is written.
+  nwCapturePixels(imageBase, imagePitch)
+  DisplayUseDma(0)
+  DisplayFlush()
+  delay(#NW_SHOW_MS)
+
+  ; Destroy the production adapter first: it removes the complete callback
+  ; family and retires every resource it owns. Then retire caller-owned Vulkan.
+  nwPut(#NW_S_STEP, 7)
+  NeonVkChromeDestroy()
+  nwPut(#NW_S_READY_AFTER, NeonVkChromeReady())
+  vkDeviceWaitIdle(dev)
+  vkDestroyFramebuffer(dev, framebuffer, 0)
+  vkDestroyRenderPass(dev, renderPass, 0)
+  vkDestroyImageView(dev, view, 0)
+  vkDestroyImage(dev, image, 0)
+  vkFreeMemory(dev, memory, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  nwPut(#NW_S_SHUTDOWN, 1)
+  nwPut(#NW_S_STEP, 8)
+
+  If nwGet(#NW_S_READY_AFTER) <> 0 Or NeonDrawBackendActive() <> 0
+    ProcedureReturn nwReturn(#NW_ERR_ADAPTER)
+  EndIf
+  ProcedureReturn nwReturn(#NW_OK)
+EndProcedure

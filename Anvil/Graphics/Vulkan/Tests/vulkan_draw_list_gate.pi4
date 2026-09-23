@@ -1,0 +1,370 @@
+; ======================================================================
+;  Compact recorded draw-list / captured-flight-ledger gate
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; Desk-only emitted-A64 instrument. It drives the real public command and
+; queue path over the state-only backend, but seeds two already-validated
+; pipeline objects so mutation runs do not pay for unrelated SPIR-V/QPU
+; lowering. No MMIO and no render-target write is permitted.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#DL_HEAP = $06200000
+#DL_HEAP_BYTES = $00100000
+#DL_OUT = $06100000
+#DL_MAGIC = $564B444C                 ; "VKDL"
+#DL_W = 16
+#DL_H = 16
+#DL_STRIDE_A = 24
+#DL_STRIDE_P = 8
+#DL_STRIDE_C = 16
+#DL_REPORT_WORDS = 68
+
+Global Dim dlReport.i[#DL_REPORT_WORDS]
+Global Dim dlClear.l[4]
+
+Procedure dlPut(slot.i, value.i)
+  If slot < 0 Or slot >= #DL_REPORT_WORDS
+    ProcedureReturn
+  EndIf
+  dlReport[slot] = value
+  PokeI(#DL_OUT + (slot * 8), value)
+EndProcedure
+
+Procedure.i dlStop(code.i)
+  dlPut(1, code)
+  dlPut(2, AnvilVkFaultCode())
+  ProcedureReturn @dlReport[0]
+EndProcedure
+
+Procedure.i dlSeedPipeline(device.i, renderPass.i, slot.i, bindingCount.i, stride0.i, stride1.i)
+  Define base.i
+  avkPipeGen[slot] = avkNextGen(avkPipeGen[slot])
+  avkPipeLive[slot] = 1
+  avkPipeDev[slot] = avkDevSlot(device)
+  avkPipeRp[slot] = avkRpSlot(renderPass)
+  avkPipeBindCount[slot] = bindingCount
+  base = slot * #ANVIL_VK_MAX_BINDINGS
+  avkPipeBindStride[base + 0] = stride0
+  avkPipeBindStride[base + 1] = stride1
+  avkPipeSetCount[slot] = 0
+  avkPipeBindingCount[slot] = 0
+  avkPipeUsesPush[slot] = 0
+  avkPipeUsesUniform[slot] = 0
+  avkPipeUsesSample[slot] = 0
+  avkPipeSampleMask[slot] = 1
+  avkPipeBlendMode[slot] = #ANVIL_VK_BLEND_DISABLED
+  avkPipeViewW[slot] = #DL_W : avkPipeViewH[slot] = #DL_H
+  avkPipeDynamicViewport[slot] = 0
+  avkPipeDynamicScissor[slot] = 0
+  avkPipeScissorX[slot] = 0 : avkPipeScissorY[slot] = 0
+  avkPipeScissorW[slot] = #DL_W : avkPipeScissorH[slot] = #DL_H
+  ProcedureReturn avkToken(#ANVIL_VK_TYPE_PIPELINE, slot, avkPipeGen[slot])
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define img.i, imgMem.i, view.i, rp.i, fb.i
+  Define bufA.i, memA.i, bufP.i, memP.i, bufC.i, memC.i
+  Define pipeA.i, pipeC.i, fence.i, rejectFence.i, fenceArray.i
+  Define count.i, rc.i, i.i, slot.i
+  Define oldPipeSlot.i, oldBufSlot.i
+  Define beforeSubmit.i, beforeComplete.i, beforeCalls.i, beforeDraws.i
+  Define bufHandle.i, bufOffset.q
+  Define *list.AnvilVkBackendDrawList
+  Define *d0.AnvilVkBackendDraw
+  Define *d1.AnvilVkBackendDraw
+  Define *d2.AnvilVkBackendDraw
+  Define *b0.AnvilVkBackendBinding
+  Define *b1.AnvilVkBackendBinding
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define bar.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Define cbHandle.i
+  Define Dim twoBufs.i[2]
+  Define Dim twoOffsets.q[2]
+  Define scA.VkRect2D
+  Define scB.VkRect2D
+  Define dyn.VkPipelineDynamicStateCreateInfo
+  Define dynVp.VkPipelineViewportStateCreateInfo
+  Define dynView.VkViewport
+  Define dynState.l
+  Define Dim dynStates.l[2]
+  Define dynOut.i
+  Define dynViewOut.i
+
+  dlPut(0, #DL_MAGIC)
+  AnvilVkTestBackendHeap(#DL_HEAP, #DL_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : ProcedureReturn dlStop(10) : EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn dlStop(11) : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : ProcedureReturn dlStop(12) : EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : ProcedureReturn dlStop(13) : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY : cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : ProcedureReturn dlStop(14) : EndIf
+
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D : imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #DL_W : imgci\extent\height = #DL_H : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1 : imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR : imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS : ProcedureReturn dlStop(15) : EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO : mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @imgMem) <> #VK_SUCCESS : ProcedureReturn dlStop(16) : EndIf
+  If vkBindImageMemory(dev, img, imgMem, 0) <> #VK_SUCCESS : ProcedureReturn dlStop(17) : EndIf
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D : ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS : ProcedureReturn dlStop(18) : EndIf
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM : att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE : att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED : att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1 : rpci\pAttachments = @att : rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS : ProcedureReturn dlStop(19) : EndIf
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp : fbci\attachmentCount = 1 : fbci\pAttachments = @view
+  fbci\width = #DL_W : fbci\height = #DL_H : fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS : ProcedureReturn dlStop(20) : EndIf
+
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  bufci\size = 6 * #DL_STRIDE_A
+  If vkCreateBuffer(dev, @bufci, 0, @bufA) <> #VK_SUCCESS : ProcedureReturn dlStop(21) : EndIf
+  vkGetBufferMemoryRequirements(dev, bufA, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memA) <> #VK_SUCCESS : ProcedureReturn dlStop(22) : EndIf
+  If vkBindBufferMemory(dev, bufA, memA, 0) <> #VK_SUCCESS : ProcedureReturn dlStop(23) : EndIf
+  bufci\size = 6 * #DL_STRIDE_P
+  If vkCreateBuffer(dev, @bufci, 0, @bufP) <> #VK_SUCCESS : ProcedureReturn dlStop(24) : EndIf
+  vkGetBufferMemoryRequirements(dev, bufP, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memP) <> #VK_SUCCESS : ProcedureReturn dlStop(25) : EndIf
+  If vkBindBufferMemory(dev, bufP, memP, 0) <> #VK_SUCCESS : ProcedureReturn dlStop(26) : EndIf
+  bufci\size = 3 * #DL_STRIDE_C
+  If vkCreateBuffer(dev, @bufci, 0, @bufC) <> #VK_SUCCESS : ProcedureReturn dlStop(27) : EndIf
+  vkGetBufferMemoryRequirements(dev, bufC, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @memC) <> #VK_SUCCESS : ProcedureReturn dlStop(28) : EndIf
+  If vkBindBufferMemory(dev, bufC, memC, 0) <> #VK_SUCCESS : ProcedureReturn dlStop(29) : EndIf
+
+  pipeA = dlSeedPipeline(dev, rp, 1, 1, #DL_STRIDE_A, 0)
+  pipeC = dlSeedPipeline(dev, rp, 2, 2, #DL_STRIDE_P, #DL_STRIDE_C)
+  PokeL(@dlClear[0] + 12, $3F800000)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #DL_W : rpbi\renderArea\extent\height = #DL_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @dlClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO : si\commandBufferCount = 1 : si\pCommandBuffers = @cbHandle
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : ProcedureReturn dlStop(30) : EndIf
+  fenceArray = fence
+
+  ; A bad tail must reject before every externally visible flight mutation.
+  vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = bufA : bufOffset = 0 : vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0) : vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd) : dlPut(3, vkEndCommandBuffer(cmd))
+  i = avkCmdSlot(cmd) : slot = avkRecordedDraw[avkCbDrawHead[i]]\next
+  avkRecordedDraw[slot]\pipeline = #VK_NULL_HANDLE
+  beforeSubmit = AnvilVkSubmitCount() : beforeComplete = AnvilVkCompleteCount()
+  beforeCalls = AnvilVkTestBackendCalls() : beforeDraws = AnvilVkTestBackendDraws()
+  vkResetFences(dev, 1, @fenceArray)
+  dlPut(4, vkQueueSubmit(queue, 1, @si, fence))
+  dlPut(5, AnvilVkSubmitCount() - beforeSubmit)
+  dlPut(6, AnvilVkCompleteCount() - beforeComplete)
+  dlPut(7, AnvilVkTestBackendCalls() - beforeCalls)
+  dlPut(8, AnvilVkTestBackendDraws() - beforeDraws)
+  dlPut(9, AnvilVkSubmissionOutstanding()) : dlPut(10, vkGetFenceStatus(dev, fence))
+  dlPut(11, avkPipeInFlight[1] + avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)] + avkBufInFlight[avkBufSlot(bufA)])
+  dlPut(12, avkFlightDrawCount) : dlPut(13, avkFlightLedgerCommitted)
+
+  ; Three immutable records prove O(1) append order, later-bind isolation and
+  ; additive aliases. Holding the backend exposes the committed ledger.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = bufA : bufOffset = 0 : vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  bufOffset = 24 : vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 2, 1, 0, 0)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeC)
+  twoBufs[0] = bufP : twoBufs[1] = bufC : twoOffsets[0] = 0 : twoOffsets[1] = 0
+  vkCmdBindVertexBuffers(cmd, 0, 2, @twoBufs[0], @twoOffsets[0])
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd) : dlPut(14, vkEndCommandBuffer(cmd))
+  i = avkCmdSlot(cmd) : dlPut(15, avkCbDrawCount[i])
+  beforeDraws = AnvilVkTestBackendDraws()
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
+  dlPut(16, vkQueueSubmit(queue, 1, @si, fence))
+  dlPut(17, AnvilVkTestBackendDraws() - beforeDraws)
+  *list = AnvilVkLastDrawList() : dlPut(18, *list\drawCount)
+  *d0 = *list\draws : *d1 = *list\draws + SizeOf(AnvilVkBackendDraw) : *d2 = *list\draws + (2 * SizeOf(AnvilVkBackendDraw))
+  *b0 = *d0\bindings : *b1 = *d1\bindings
+  dlPut(19, Bool(*d0\pipeline = 1 And *d1\pipeline = 1 And *d2\pipeline = 2 And *d2\bindingCount = 2))
+  dlPut(20, Bool(*d0\vertexCount = 3 And *d1\vertexCount = 2 And *d2\vertexCount = 3))
+  dlPut(21, Bool(*b1\base = *b0\base + 24 And *b0\stride = #DL_STRIDE_A And *b1\stride = #DL_STRIDE_A))
+  dlPut(22, Bool(avkPipeInFlight[1] = 2 And avkPipeInFlight[2] = 1))
+  dlPut(23, Bool(avkFbInFlight[avkFbSlot(fb)] = 3 And avkRpInFlight[avkRpSlot(rp)] = 3))
+  dlPut(24, Bool(avkBufInFlight[avkBufSlot(bufA)] = 2 And avkBufInFlight[avkBufSlot(bufP)] = 1 And avkBufInFlight[avkBufSlot(bufC)] = 1))
+  AnvilVkFaultClear() : vkDestroyPipeline(dev, pipeA, 0) : dlPut(25, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyRenderPass(dev, rp, 0) : dlPut(26, AnvilVkFaultCode())
+  AnvilVkFaultClear() : vkDestroyFramebuffer(dev, fb, 0) : dlPut(27, AnvilVkFaultCode())
+  AnvilVkTestBackendHold(0)
+  rc = vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000) : dlPut(28, rc)
+  dlPut(29, avkPipeInFlight[1] + avkPipeInFlight[2] + avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)] + avkBufInFlight[avkBufSlot(bufA)] + avkBufInFlight[avkBufSlot(bufP)] + avkBufInFlight[avkBufSlot(bufC)])
+  dlPut(30, avkFlightDrawCount) : dlPut(31, avkFlightLedgerCommitted)
+
+  ; Without DRAW_LIST the backend payload is the legacy single Draw record.
+  ; The test backend must dispatch by its advertised ABI instead of always
+  ; interpreting the first two Draw words as drawCount/draws.
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = bufA : bufOffset = 0 : vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0) : vkCmdEndRenderPass(cmd)
+  dlPut(32, vkEndCommandBuffer(cmd))
+  beforeDraws = AnvilVkTestBackendDraws() : vkResetFences(dev, 1, @fenceArray)
+  dlPut(33, vkQueueSubmit(queue, 1, @si, fence))
+  dlPut(34, AnvilVkTestBackendDraws() - beforeDraws)
+  dlPut(35, Bool(AnvilVkTestBackendLastVertexCount() = 3 And AnvilVkTestBackendLastBindingCount() = 1))
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST)
+
+  ; Preflight succeeds, but a signalled fence refuses before the closure is
+  ; retained. Destroy and recycle two dependency slots, then hold an unrelated
+  ; clear: no stale draw ledger may retain either recycled object or any of the
+  ; old framebuffer/render-pass dependencies.
+  fci\flags = #VK_FENCE_CREATE_SIGNALED_BIT
+  dlPut(36, vkCreateFence(dev, @fci, 0, @rejectFence)) : fci\flags = 0
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = bufA : bufOffset = 0 : vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0) : vkCmdEndRenderPass(cmd)
+  dlPut(37, vkEndCommandBuffer(cmd))
+  dlPut(38, vkQueueSubmit(queue, 1, @si, rejectFence))
+  dlPut(39, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And avkFlightDrawPreparedCb = 0 And avkFlightDrawOwnerCb = 0))
+  oldPipeSlot = avkPipeSlot(pipeA) : oldBufSlot = avkBufSlot(bufA)
+  vkDestroyPipeline(dev, pipeA, 0)
+  vkDestroyBuffer(dev, bufA, 0) : vkFreeMemory(dev, memA, 0)
+  pipeA = dlSeedPipeline(dev, rp, oldPipeSlot, 1, #DL_STRIDE_A, 0)
+  bufci\size = 6 * #DL_STRIDE_A
+  dlPut(40, vkCreateBuffer(dev, @bufci, 0, @bufA))
+  vkGetBufferMemoryRequirements(dev, bufA, @req) : mai\allocationSize = req\size
+  dlPut(41, vkAllocateMemory(dev, @mai, 0, @memA))
+  dlPut(42, vkBindBufferMemory(dev, bufA, memA, 0))
+  dlPut(43, Bool(avkPipeSlot(pipeA) = oldPipeSlot And avkBufSlot(bufA) = oldBufSlot))
+
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED : bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = img : bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT : range\levelCount = 1 : range\layerCount = 1
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @dlClear[0], 1, @range)
+  dlPut(44, vkEndCommandBuffer(cmd))
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
+  dlPut(45, vkQueueSubmit(queue, 1, @si, fence))
+  dlPut(46, AnvilVkSubmissionOutstanding())
+  dlPut(47, avkPipeInFlight[oldPipeSlot] + avkBufInFlight[oldBufSlot] + avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)])
+  dlPut(48, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And avkFlightDrawPreparedCb = 0 And avkFlightDrawOwnerCb = 0))
+  AnvilVkTestBackendHold(0)
+  dlPut(49, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; Dynamic-state vocabulary and viewport ownership before command recording.
+  dynState = #VK_DYNAMIC_STATE_SCISSOR
+  dyn\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+  dyn\dynamicStateCount = 1 : dyn\pDynamicStates = @dynState
+  dlPut(50, avkPipeDynamicState(@dyn, @dynViewOut, @dynOut)) : dlPut(51, dynOut)
+  PokeL(@dynView\width,$41800000) : PokeL(@dynView\height,$41800000)
+  PokeL(@dynView\maxDepth,$3F800000)
+  dynVp\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  dynVp\viewportCount = 1 : dynVp\pViewports = @dynView : dynVp\scissorCount = 1 : dynVp\pScissors = 0
+  dlPut(52, avkPipeViewport(oldPipeSlot, @dynVp, dynViewOut, dynOut))
+  dynState = #VK_DYNAMIC_STATE_VIEWPORT : AnvilVkFaultClear()
+  dlPut(53, avkPipeDynamicState(@dyn, @dynViewOut, @dynOut))
+  dynState = #VK_DYNAMIC_STATE_SCISSOR : AnvilVkFaultClear()
+  dynStates[0] = #VK_DYNAMIC_STATE_VIEWPORT : dynStates[1] = #VK_DYNAMIC_STATE_SCISSOR
+  dyn\dynamicStateCount = 2 : dyn\pDynamicStates = @dynStates[0]
+  dlPut(64, avkPipeDynamicState(@dyn, @dynViewOut, @dynOut))
+  dlPut(65, dynViewOut) : dlPut(66, dynOut)
+  dynVp\pViewports = 0 : dynVp\pScissors = 0
+  dlPut(67, avkPipeViewport(oldPipeSlot, @dynVp, dynViewOut, dynOut))
+
+  ; Reset makes dynamic state undefined. A real draw must set it; two later
+  ; draws then retain their own exact rectangles despite the state changing.
+  avkPipeDynamicViewport[oldPipeSlot] = 1 : avkPipeDynamicScissor[oldPipeSlot] = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle=bufA : bufOffset=0 : vkCmdBindVertexBuffers(cmd,0,1,@bufHandle,@bufOffset)
+  vkCmdDraw(cmd,3,1,0,0) : dlPut(61,avkCbDrawCount[avkCmdSlot(cmd)]) : dlPut(54,vkEndCommandBuffer(cmd))
+
+  vkResetCommandBuffer(cmd,0) : vkBeginCommandBuffer(cmd,@bi)
+  vkCmdBeginRenderPass(cmd,@rpbi,#VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd,#VK_PIPELINE_BIND_POINT_GRAPHICS,pipeA)
+  vkCmdBindVertexBuffers(cmd,0,1,@bufHandle,@bufOffset)
+  PokeL(@dynView\width,$41800000) : PokeL(@dynView\height,$41800000)
+  vkCmdSetViewport(cmd,0,1,@dynView)
+  scA\offset\x=2 : scA\offset\y=3 : scA\extent\width=4 : scA\extent\height=5
+  scB\offset\x=-2 : scB\offset\y=14 : scB\extent\width=5 : scB\extent\height=5
+  vkCmdSetScissor(cmd,0,1,@scA) : vkCmdDraw(cmd,3,1,0,0)
+  vkCmdSetScissor(cmd,0,1,@scB) : vkCmdDraw(cmd,3,1,0,0)
+  PokeL(@dynView\width,$41000000) : PokeL(@dynView\height,$41000000)
+  vkCmdSetViewport(cmd,0,1,@dynView) ; later state must not rewrite either snapshot
+  vkCmdEndRenderPass(cmd) : dlPut(55,vkEndCommandBuffer(cmd))
+  AnvilVkTestBackendHold(1) : vkResetFences(dev,1,@fenceArray)
+  dlPut(56,vkQueueSubmit(queue,1,@si,fence))
+  *list=AnvilVkLastDrawList() : *d0=*list\draws : *d1=*list\draws+SizeOf(AnvilVkBackendDraw)
+  dlPut(57,Bool(*d0\scissorX=2 And *d0\scissorY=3 And *d0\scissorW=4 And *d0\scissorH=5))
+  dlPut(58,Bool(*d1\scissorX=-2 And *d1\scissorY=14 And *d1\scissorW=5 And *d1\scissorH=5))
+  dlPut(62,Bool(*d0\viewportX=0 And *d0\viewportY=0 And *d0\viewportW=#DL_W And *d0\viewportH=#DL_H))
+  dlPut(63,Bool(*d1\viewportX=0 And *d1\viewportY=0 And *d1\viewportW=#DL_W And *d1\viewportH=#DL_H))
+  AnvilVkTestBackendHold(0) : dlPut(59,vkWaitForFences(dev,1,@fenceArray,1,1000000000))
+  vkResetCommandBuffer(cmd,0) : dlPut(60,avkCbScissorSet[avkCmdSlot(cmd)])
+  dlPut(61,avkCbViewportSet[avkCmdSlot(cmd)])
+  ProcedureReturn @dlReport[0]
+EndProcedure

@@ -1,0 +1,133 @@
+; Emitted guard for the fixed Pi 3 display render reserve.
+; Production map constants and range procedures are injected by
+; tools/pi3_render_reserve_check.py.
+
+Global pi3_ram_end.i
+Global pi3_dtb.i
+Global pi3_dtb_end.i
+Global gMonHitLo.i
+Global gMonHitHi.i
+Global gMonHitWhich.i
+Global gate_scanout.i
+Global gate_scanout_size.i
+
+Procedure.i Pi3FbScanoutBase()
+  ProcedureReturn gate_scanout
+EndProcedure
+Procedure.i Pi3FbSize()
+  ProcedureReturn gate_scanout_size
+EndProcedure
+Procedure.i HwMonLo()
+  ProcedureReturn $200000
+EndProcedure
+Procedure.i HwMonHi()
+  ProcedureReturn $2FFFFF
+EndProcedure
+
+; @@PRODUCTION_RENDER_MAP_CONSTANTS@@
+; @@PRODUCTION_RENDER_MAP_PROCEDURES@@
+
+Procedure.i Main()
+  ; The fixed reservation agrees with framebuffer.pbi and has adequate room.
+  If #MON_FB_RENDER_LO<>$3000000 Or #MON_FB_RENDER_HI-#MON_FB_RENDER_LO+1<>9216000
+    ProcedureReturn 1
+  EndIf
+  If #MON_FB_RENDER_LO<=#MON_STAGE_HI Or #MON_FB_RENDER_HI>=#MMU3_PERIPH_BASE
+    ProcedureReturn 2
+  EndIf
+  If HwMonRegions()<>9 : ProcedureReturn 3 : EndIf
+  If HwMonRegionLo(#MON_REGION_FB_RENDER)<>#MON_FB_RENDER_LO Or HwMonRegionHi(#MON_REGION_FB_RENDER)<>#MON_FB_RENDER_HI
+    ProcedureReturn 4
+  EndIf
+  ; The direct firmware entry supplies a variable DTB pointer. Once it is
+  ; validated, payload exclusion must follow that exact interval.
+  pi3_dtb=$01020000 : pi3_dtb_end=$01021000
+  If HwMonRegionLo(#MON_REGION_DTB)<>$01020000 Or HwMonRegionHi(#MON_REGION_DTB)<>$01020FFF
+    ProcedureReturn 20
+  EndIf
+  If InPayload($01020000,$0102000F)<>0
+    ProcedureReturn 21
+  EndIf
+  pi3_dtb=0 : pi3_dtb_end=0
+  If HwMonRegionLo(#MON_REGION_DTB)<>$01000000 Or HwMonRegionHi(#MON_REGION_DTB)<>$010FFFFF
+    ProcedureReturn 22
+  EndIf
+
+  ; Before firmware RAM discovery, keep the historical recovery ceiling.
+  pi3_ram_end=0 : gate_scanout=0 : gate_scanout_size=0
+  If HwPayWindows()<>2 Or HwPayHi(0)<>$02FFFFFF Or HwPayHi(1)<>#PAY0_HI_MAX
+    ProcedureReturn 5
+  EndIf
+
+  ; With a normal 1GiB Pi3 split, keep the original low staging target,
+  ; reserve the backbuffer and its complete 2MiB NC rounding, then offer
+  ; only the post-reserve window up to firmware's exclusive RAM end.
+  pi3_ram_end=$3B400000
+  If HwPayWindows()<>2 Or HwPayLo(0)<>$02E00000 Or HwPayHi(0)<>$02FFFFFF
+    ProcedureReturn 6
+  EndIf
+  If HwPayLo(1)<>$03A00000 Or HwPayHi(1)<>$3B3FFFFF
+    ProcedureReturn 7
+  EndIf
+  If InPayload($02E00000,$02E00000)=0 Or InPayload($02FFFFFF,$02FFFFFF)=0
+    ProcedureReturn 8
+  EndIf
+  If InPayload($02FFFFF0,$03000010)<>0 Or InPayload($03000000,$03000000)<>0
+    ProcedureReturn 9
+  EndIf
+  If InPayload($03900000,$039FFFFF)<>0 Or InPayload($039FFFFF,$03A00000)<>0
+    ProcedureReturn 10
+  EndIf
+  If InPayload($03A00000,$03A00000)=0 Or InPayload($3B400000,$3B400000)<>0
+    ProcedureReturn 11
+  EndIf
+
+  ; The ABI's initial stack area may sit immediately below the reserve or
+  ; in the high window, but cannot straddle the reserved/gap boundary.
+  If HwPmfStackAllowed($02FFFFF0,$02FFFFFF)<>1
+    ProcedureReturn 12
+  EndIf
+  If HwPmfStackAllowed($02FFFFF8,$03000007)<>0 Or HwPmfStackAllowed($03000000,$0300000F)<>0
+    ProcedureReturn 13
+  EndIf
+  If HwPmfStackAllowed($03A00010,$03A0001F)<>1 Or HwPmfStackAllowed($039FFFF8,$03A00007)<>0
+    ProcedureReturn 14
+  EndIf
+
+  ; The dynamic firmware scanout is a monitor-owned range too, even when
+  ; it falls inside the high payload window. PMF's stack check must see it.
+  gate_scanout=$3A200000 : gate_scanout_size=$10000
+  If HwMonRegionLo(#MON_REGION_FB_SCANOUT)<>$3A200000 Or HwMonRegionHi(#MON_REGION_FB_SCANOUT)<>$3A20FFFF
+    ProcedureReturn 15
+  EndIf
+  If InPayload($3A200000,$3A20000F)<>0
+    ProcedureReturn 25
+  EndIf
+  If HwPmfStackAllowed($3A200000,$3A20000F)<>0 Or HwPmfStackAllowed($3A1FFFF0,$3A1FFFFF)<>1
+    ProcedureReturn 16
+  EndIf
+
+  ; A known RAM limit below the high-window floor must not turn into an
+  ; unbounded fallback window. The low region remains usable.
+  pi3_ram_end=$03800000
+  If HwPayWindows()<>1 Or HwPayHi(1)>=HwPayLo(1)
+    ProcedureReturn 17
+  EndIf
+  If InPayload($02E00000,$02E0000F)=0 Or InPayload($03A00000,$03A0000F)<>0
+    ProcedureReturn 18
+  EndIf
+  If HwPmfStackAllowed($02FFFFF0,$02FFFFFF)<>1 Or HwPmfStackAllowed($03A00000,$03A0000F)<>0
+    ProcedureReturn 19
+  EndIf
+  ; A known RAM report below PAY0 offers no payload windows; a report
+  ; only slightly above PAY0 clips the low window to that RAM extent.
+  pi3_ram_end=$02E00000
+  If HwPayWindows()<>0 Or HwPayHi(0)>=HwPayLo(0) Or InPayload($02E00000,$02E00000)<>0
+    ProcedureReturn 23
+  EndIf
+  pi3_ram_end=$02E01000
+  If HwPayWindows()<>1 Or HwPayHi(0)<>$02E00FFF Or InPayload($02E00FF0,$02E00FFF)=0
+    ProcedureReturn 24
+  EndIf
+  ProcedureReturn 0
+EndProcedure

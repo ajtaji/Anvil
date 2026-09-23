@@ -1,0 +1,123 @@
+; ======================================================================
+;  Emitted gate: Vulkan core-1.0 procedure-address dispatch
+; ======================================================================
+; Runs on the AArch64 interpreter. The test backend supplies object handles
+; without touching hardware; this gate checks exact function addresses,
+; lookup domains, spelling, withheld names, and stale owner rejection.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
+
+#VKD_OUT = $06000000
+#VKD_ROWS = $06000100
+#VKD_MAGIC = $564B4450
+
+Global vkdChecks.i = 0
+Global vkdFails.i = 0
+
+Procedure Vkd(ok.i)
+  PokeN(#VKD_ROWS + vkdChecks * 8, ok)
+  vkdChecks = vkdChecks + 1
+  If ok = 0 : vkdFails = vkdFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define instance.i
+  Define physical.i
+  Define device.i
+  Define count.l
+
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
+  count = 1
+  Vkd(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
+  Vkd(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
+
+  ; Vulkan 1.0 null-instance lookup exposes only the audited global entry.
+  Vkd(vkGetInstanceProcAddr(0, "vkCreateInstance") = @vkCreateInstance)
+  Vkd(vkGetInstanceProcAddr(0, "vkGetInstanceProcAddr") = 0)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumeratePhysicalDevices") = 0)
+  Vkd(vkGetInstanceProcAddr(0, "vkDeviceWaitIdle") = 0)
+
+  ; Both resolver addresses have their exact non-null domains.
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetInstanceProcAddr") = @vkGetInstanceProcAddr)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetInstanceProcAddr") = 0)
+
+  ; Representative instance commands: exact address through GIPA and never GDPA.
+  Vkd(vkGetInstanceProcAddr(instance, "vkDestroyInstance") = @vkDestroyInstance)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices") = @vkEnumeratePhysicalDevices)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures") = @vkGetPhysicalDeviceFeatures)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFormatProperties") = @vkGetPhysicalDeviceFormatProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceImageFormatProperties") = @vkGetPhysicalDeviceImageFormatProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties") = @vkGetPhysicalDeviceMemoryProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateDevice") = @vkCreateDevice)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateDevice") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
+
+  ; Representative device commands resolve identically through valid GIPA/GDPA.
+  Vkd(vkGetInstanceProcAddr(instance, "vkAllocateMemory") = @vkAllocateMemory)
+  Vkd(vkGetDeviceProcAddr(device, "vkAllocateMemory") = @vkAllocateMemory)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateCommandPool") = @vkCreateCommandPool)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateCommandPool") = @vkCreateCommandPool)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdPipelineBarrier") = @vkCmdPipelineBarrier)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdPipelineBarrier") = @vkCmdPipelineBarrier)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdCopyBufferToImage") = @vkCmdCopyBufferToImage)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdCopyBufferToImage") = @vkCmdCopyBufferToImage)
+  Vkd(vkGetInstanceProcAddr(instance, "vkQueueSubmit") = @vkQueueSubmit)
+  Vkd(vkGetDeviceProcAddr(device, "vkQueueSubmit") = @vkQueueSubmit)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateGraphicsPipelines") = @vkCreateGraphicsPipelines)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateGraphicsPipelines") = @vkCreateGraphicsPipelines)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdDraw") = @vkCmdDraw)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdDraw") = @vkCmdDraw)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdBindIndexBuffer") = @vkCmdBindIndexBuffer)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdBindIndexBuffer") = @vkCmdBindIndexBuffer)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdDrawIndexed") = @vkCmdDrawIndexed)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdDrawIndexed") = @vkCmdDrawIndexed)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdSetScissor") = @vkCmdSetScissor)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdSetScissor") = @vkCmdSetScissor)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCmdSetViewport") = @vkCmdSetViewport)
+  Vkd(vkGetDeviceProcAddr(device, "vkCmdSetViewport") = @vkCmdSetViewport)
+  Vkd(vkGetInstanceProcAddr(instance, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
+
+  ; Public binary semaphore entry points have exact device domains.
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateSemaphore") = @vkCreateSemaphore)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateSemaphore") = @vkCreateSemaphore)
+  Vkd(vkGetInstanceProcAddr(instance, "vkDestroySemaphore") = @vkDestroySemaphore)
+  Vkd(vkGetDeviceProcAddr(device, "vkDestroySemaphore") = @vkDestroySemaphore)
+
+  ; Declared-but-withheld and missing names never leak through any domain.
+  Vkd(vkGetInstanceProcAddr(instance, "vkFreeDescriptorSets") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkFreeDescriptorSets") = 0)
+  Vkd(vkGetInstanceProcAddr(instance, "vkCreateEvent") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = 0)
+
+  ; Names are byte exact: no case folding, prefix matching, suffix guessing,
+  ; alias invention, or unterminated overlong match.
+  Vkd(vkGetDeviceProcAddr(device, "vkdevicewaitidle") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWait") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdleKHR") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "VKDeviceWaitIdle") = 0)
+  Vkd(vkGetDeviceProcAddr(device, 0) = 0)
+  Vkd(vkGetInstanceProcAddr(instance, 0) = 0)
+
+  ; Null, malformed, and stale generation-tagged owners disclose no address.
+  Vkd(vkGetDeviceProcAddr(0, "vkDeviceWaitIdle") = 0)
+  Vkd(vkGetInstanceProcAddr($12345678, "vkEnumeratePhysicalDevices") = 0)
+  Vkd(vkGetDeviceProcAddr($12345678, "vkDeviceWaitIdle") = 0)
+  Vkd(AnvilVkDeviceDestroy(device) = #VK_SUCCESS)
+  Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = 0)
+  Vkd(AnvilVkInstanceDestroy(instance) = #VK_SUCCESS)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices") = 0)
+
+  PokeN(#VKD_OUT + 0, #VKD_MAGIC)
+  PokeN(#VKD_OUT + 8, vkdChecks)
+  PokeN(#VKD_OUT + 16, vkdFails)
+  ProcedureReturn vkdFails
+EndProcedure
+
+Main()

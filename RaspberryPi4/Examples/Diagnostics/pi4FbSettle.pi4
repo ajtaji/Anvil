@@ -1,0 +1,105 @@
+; pi4FbSettle.pi4 - does the firmware's display mode settle if asked
+; again after a wait?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; Booted straight from the firmware, the first DisplayInit comes back
+; with a 2 x 2 surface while the physical mode is a perfectly good
+; 1920 x 1080. Under U-Boot the first answer is correct, because
+; something had already brought video up.
+;
+; The theory is that the firmware has not settled a mode at the instant
+; it is first asked. This tests exactly that and nothing else: ask, wait,
+; ask again, and print what each attempt returned. If the size is still
+; 2 x 2 on the tenth attempt the theory is wrong and the retry the
+; monitor now does is worthless.
+;
+; ======================================================================
+;  ANSWERED, 2026-08-26. THE THEORY WAS WRONG.
+; ======================================================================
+; All ten attempts came back 2 x 2, over 1.8 seconds. Waiting changes
+; nothing, and every retry written against the settling theory has been
+; taken out of display.pi4 and out of the monitor.
+;
+; THE REAL CAUSE was the SHAPE of the request, not its timing.
+; display.pi4 sent seven separate single-tag mailbox messages. The
+; firmware accumulates the framebuffer's requested state within ONE
+; property transaction and allocates against what that transaction
+; accumulated, so the allocate ran against a default and handed back a
+; placeholder. U-Boot sends one message carrying nine tags -
+; Datasheets/pi4/uboot/v2025.01_msg.c:35-47 and :159-204 - which is
+; exactly why the same code worked when U-Boot had booted the board and
+; failed when the firmware had.
+;
+; THIS FILE IS KEPT, and not out of sentiment. It is the experiment that
+; killed the wrong explanation, and a wrong explanation that dies
+; without a record gets proposed again by the next person who sees a
+; 2 x 2 screen. Run it after the rewrite and it should settle on attempt
+; 1; if it ever needs a second attempt again, something new is going on
+; and the answer is still not "wait longer".
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+; #DSP_DMA_LINKED - MANDATORY, and it must be defined BEFORE display.pi4.
+; 0 = the CPU drawing path and nothing else; every procedure that would
+; touch the blitter is skipped at the token level and never parsed, and
+; what display.pi4 still carries is ten accessors totalling 660 bytes so
+; that a program can ask whether the engine was linked and be told no.
+; 1 would additionally require RaspberryPi4/Lib/dma.pi4 to be included
+; ahead of display.pi4.
+; display.pi4's THE DMA SEAM section has the reasoning; there is no
+; default because a default in the library and a different value here
+; would be a hard "Constant already defined" error.
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+Procedure.i Main()
+  Define i.i
+  Define rc.i
+
+  PrintNl()
+  UartWriteStr("=== does the display mode settle? ===")
+  PrintNl()
+
+  If MailboxInit() = 0
+    UartWriteStr("!! mailbox")
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If DisplayStandardTags() = 0
+    UartWriteStr("!! tags")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+
+  For i = 0 To 9
+    rc = DisplayInit(1920, 1080, 32)
+    UartWriteStr("  attempt ")
+    PrintDec(i + 1)
+    UartWriteStr("  at t+")
+    PrintDec(i * 200)
+    UartWriteStr(" ms  rc ")
+    PrintDec(rc)
+    UartWriteStr("  ")
+    PrintDec(DisplayWidth())
+    UartWriteStr("x")
+    PrintDec(DisplayHeight())
+    UartWriteStr("  pitch ")
+    PrintDec(DisplayPitch())
+    PrintNl()
+    UartDrain()
+    If rc = 1 And DisplayWidth() >= 320
+      UartWriteStr("=== settled on attempt ")
+      PrintDec(i + 1)
+      UartWriteStr(" ===")
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    delay(200)
+  Next
+
+  UartWriteStr("=== never settled - the retry does not help ===")
+  PrintNl()
+  ProcedureReturn 3
+EndProcedure

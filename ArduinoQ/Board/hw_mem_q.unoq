@@ -1,0 +1,63 @@
+; ======================================================================
+;  hw_mem_q.unoq - the Arduino UNO Q's answer to "how much memory is
+;  fitted", which today is that it does not know.
+;
+;  The contract is the HwMemory* block in Anvil/Hal/hal.pbi: one total in
+;  BYTES, or -1 when the board honestly cannot know, and a fragment
+;  saying where the number came from or why there is not one.
+;
+; ----------------------------------------------------------------------
+;  WHY -1, WITH THE CONSTANTS IN THE NEXT FILE ALONG
+; ----------------------------------------------------------------------
+;  ArduinoQ/Board/memmap_q.unoq carries this board's DRAM extent, and
+;  every number in it is a confirmed silicon fact - three banks, base
+;  $40000000, top $140000000, read off the running board from
+;  /proc/iomem and /proc/device-tree. It is tempting to subtract two of
+;  them and call the difference the answer. THAT WOULD BE A DIFFERENT
+;  CLAIM FROM THE ONE THIS SEAM MAKES, in two ways that both matter:
+;
+;    * The extent is not the total. There is a firmware-reserved gap of
+;      38 MB between the first and second banks (hw_addr_q.unoq refuses
+;      it by name), so the span from base to top is larger than the
+;      memory in it, and a size that counts a hole is wrong by the size
+;      of the hole.
+;    * They were read from ONE board, by another operating system. The
+;      seam answers "how much memory is fitted to the machine this image
+;      is running on", and a constant compiled in from a different boot
+;      of a different kernel answers "how much was fitted to the board
+;      somebody measured". Those are the same sentence only until the
+;      second UNO Q is plugged in.
+;
+;  SO THIS BOARD SAYS IT DOES NOT KNOW, AND SAYS WHERE THE ANSWER IS.
+;  The firmware here is UEFI, and UEFI states the total in its memory
+;  map: GetMemoryMap() through the boot services table this image
+;  already holds (ArduinoQ/Board/qefi_q.unoq), summing the conventional
+;  and reclaimable descriptors. This image does not walk it. When it
+;  does, this file becomes the walk and nothing else in the tree
+;  changes - which is the whole point of the seam being a seam.
+;
+;  A BOARD MUST SUPPLY THE WHOLE SEAM, not the parts it happens to be
+;  able to answer. An absent procedure is a link error naming a symbol;
+;  a seam that is optional in places produces a board that builds and
+;  then behaves differently for a reason nobody can see. This file is
+;  two procedures long because that is what honest looks like here.
+;
+;  INCLUDE ORDER: after Anvil/Hal/hal.pbi (#HW_MEM_UNKNOWN). House rule
+;  10: this file includes nothing itself.
+; ======================================================================
+
+Procedure.i HwMemoryBytes()
+  ProcedureReturn #HW_MEM_UNKNOWN
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMemoryWhere() - why there is no number.
+;
+;  IT IS NEVER 0. A caller prints this fragment whenever the size is
+;  missing, and a caller that printed nothing would turn "this board
+;  cannot say" into a blank space, which reads as a monitor that failed
+;  to fill something in rather than as an answer.
+; ----------------------------------------------------------------------
+Procedure.i HwMemoryWhere()
+  ProcedureReturn "the total is in the UEFI memory map, which this image does not walk yet, and the map constants compiled into it describe one measured board rather than this one"
+EndProcedure

@@ -1,0 +1,201 @@
+; ======================================================================
+;  hw_id.pi4 - Raspberry Pi 4 HwId backend: WHAT THIS COMPUTER IS.
+;
+;  Forum 575. The shared core used to state this board's facts as literal
+;  prose - the banner said "the Raspberry Pi 4 serial monitor", named a
+;  PL011 and asserted "exception level 2" - so the SECOND board printed
+;  three claims that were all false about itself on the first line an
+;  operator ever reads. The workaround was a board-local banner and a
+;  board-local `version` on that target, which is a fork of the monitor's
+;  own product text and would have to be written a third time for a third
+;  board.
+;
+;  The cure is the rule every other family here already follows: the core
+;  names no chip, and asks the board. This file is this board's answer.
+;
+;  NOTHING HERE IS A CAPABILITY. A board with no GPIO is a real board and
+;  #CAP_GPIO says so; a board with no IDENTITY is not a thing, so there is
+;  no #CAP_ID and no RequireCap gate. Every board supplies this seam whole,
+;  the same way every board supplies HwAddr* (Anvil/Hal/hal.pbi).
+;
+;  INCLUDE ORDER: after Lib/mmu.pi4 (MmuEl), Board/memmap.pi4 (#MON_LO),
+;  Core/format.pi4 (PutAddr), Anvil/Storage/hwfile.pbi and Board/storage.pi4
+;  (gFatUp, HwFileOpen/HwFileSize/HwFileClose), and before
+;  Core/flow_cmd.pi4 and Core/help.pi4, which are the two callers.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The three names. Short fragments the core prints inside its own
+;  sentences, returned as addresses the same way HwAddrReason() and
+;  HwI2cSourceWhere() return theirs.
+;
+;  HwIdBoard() is the PRODUCT name a person would use for the computer in
+;  front of them, not a part number: the operator reading the banner is
+;  identifying the board on their bench. HwIdCpu() is the core, because
+;  the sentence it lands in is about the processor. HwIdTarget() is the
+;  word that follows `-t` on the compiler's command line, and it is the
+;  one that has to be exactly right - it is a checkable claim about how
+;  the image was produced, and
+;  somebody diagnosing a bad image goes where it points.
+; ----------------------------------------------------------------------
+Procedure.i HwIdBoard()
+  ProcedureReturn "Raspberry Pi 4"
+EndProcedure
+
+Procedure.i HwIdCpu()
+  ProcedureReturn "Cortex-A72"
+EndProcedure
+
+Procedure.i HwIdTarget()
+  ProcedureReturn "pi4"
+EndProcedure
+
+; PMFBOOT v2's compiler-owned target identity. Numeric because it is an
+; admission ABI rather than display text; 2711 is the append-only BCM2711
+; target code declared by the compiler and Anvil/Core/pmfboot.pbi.
+Procedure.i HwPmfTargetId()
+  ProcedureReturn 2711
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdEl() - the exception level, READ FROM THE PROCESSOR.
+;
+;  The banner used to print the digit 2 as prose. It happened to be right
+;  here and was wrong on the other board, and a number that is right by
+;  luck is the shape of confident-wrong-answer this monitor exists to
+;  refuse. MmuEl() (RaspberryPi4/Lib/mmu.pi4) decodes CurrentEL bits 3:2,
+;  so the banner now prints what the running processor says it is - which
+;  on this board is 2, because the armstub erets kernel8.img to EL2h, and
+;  which would change on its own if a future boot path handed us EL1.
+; ----------------------------------------------------------------------
+Procedure.i HwIdEl()
+  ProcedureReturn MmuEl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayConsole() - the console paragraph, PRINTED by the board.
+;
+;  A returned fragment would not do: what a console IS takes several
+;  sentences and one of them carries an address. HwAddrReport() and
+;  HwStorageReport() are the precedent - a board says its own multi-line
+;  facts and the core decides only where in the output they go.
+;
+;  #UART_BASE, not #UART_DR. This said #UART_DR until 2026-08-26 and was
+;  the right number for the wrong reason: the data register is at offset
+;  $00, so "the DR address" and "the block base" happened to be the same
+;  word. uart.pi4 keeps ONE base plus offsets now, so the register
+;  constant is $00 and the base is what this line means. The printed
+;  value does not change.
+; ----------------------------------------------------------------------
+Procedure HwIdSayConsole()
+  Print("The serial port is the PL011 at ")
+  PutAddr(#UART_BASE)
+  PrintN(", set up from cold to 115200 baud,")
+  PrintN("eight data bits, no parity, one stop bit.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayImage() - what KIND of image this is, printed inside `version`.
+;
+;  The other board's `version` had to explain that its image is an AArch64
+;  UEFI application entered with boot services up. That is a real fact and
+;  it is board knowledge, so it belongs behind this seam rather than in a
+;  second copy of the command. This board's answer is the other half of
+;  the same sentence, and it is worth saying out loud for the same reason:
+;  it tells somebody holding a file which loader is supposed to take it.
+; ----------------------------------------------------------------------
+Procedure HwIdSayImage()
+  PrintN("  This image is a kernel8.img. The firmware loads the whole file to")
+  Print("  ")
+  PutAddr(#MON_LO)
+  PrintN(" and enters it there, with no loader in between -")
+  PrintN("  which is why its size is not capped by anything: there is nothing")
+  PrintN("  above it in the boot path to make room for.")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdImageLen() - how many bytes this monitor's own image is, or 0.
+;
+;  Forum 586: two images could not be told apart at the prompt. The build
+;  number says WHICH build; this is what lets `version` say WHAT is in it,
+;  because with a length the monitor can run its own crc32 over its own
+;  code and hand back a number the host can compute independently.
+;
+;  THE LENGTH IS NOT A CONSTANT AND CANNOT BE ONE - the image grows with
+;  every commit. Until 2026-09-08 the only place on this board that knew
+;  it was the FILE the firmware booted, so this opened KERNEL8.IMG and
+;  read its size; the paragraph that used to be here explained why that
+;  was worth a directory lookup and what to type when the medium was not
+;  mounted yet.
+;
+;  IT NEEDS NO MEDIUM ANY MORE. The image carries the address of its own
+;  end (RaspberryPi4/EmitCore_A64.pbi emits __image_start__ /
+;  __image_end__, so that the monitor's extent can be the monitor rather
+;  than a two-megabyte constant), and HwMonBytes() in Board/memmap.pi4 is
+;  that measurement. So this answers from the running program: never 0,
+;  never the size of a DIFFERENT image somebody has since written to the
+;  stick, and no disk spun up to answer a question.
+; ----------------------------------------------------------------------
+Procedure.i HwIdImageBase()
+  ; THE RUNNING BASE, MEASURED - not #MON_LO. It was that constant until
+  ; 2026-09-08, on the argument that "the firmware always loads the boot
+  ; image to the first address and the build is linked for it, so nobody
+  ; else has a say". True of a boot from the stick and FALSE of a monitor
+  ; relocated with --load-addr for a live-bench swap, which is a
+  ; documented thing to do here - and the self-hash below would then have
+  ; been computed over an address range this image is not at.
+  ProcedureReturn HwMonLo()
+EndProcedure
+
+Procedure.i HwIdImageLen()
+  ; THE IMAGE ANSWERS THIS ITSELF NOW - 2026-09-08, and it is a straight
+  ; deletion rather than a repair.
+  ;
+  ; This used to mount the boot medium and read the length of
+  ; KERNEL8.IMG, because - as the note above this procedure said in as
+  ; many words - "nothing in the built image records its own size". That
+  ; stopped being true the day the toolchain started emitting
+  ; __image_start__ / __image_end__ so that the monitor could compute its
+  ; own extent instead of living inside a two-megabyte constant. The size
+  ; is the same measurement HwMonBytes() makes, and taking it here means:
+  ;
+  ;   it cannot be 0 any more     - there is no "the medium is not
+  ;                                 mounted yet, type ls first" answer to
+  ;                                 give, so `version` self-hashes on the
+  ;                                 first line an operator types.
+  ;   it cannot be the WRONG file - reading KERNEL8.IMG off the stick
+  ;                                 measured whatever is on the stick NOW,
+  ;                                 which after an `anvil_update.py` run
+  ;                                 is the NEXT monitor, not this one. The
+  ;                                 self-hash was over the running image
+  ;                                 and its length came from a different
+  ;                                 image, and nothing said so.
+  ;   it costs nothing            - two adrp/add pairs against a
+  ;                                 directory lookup.
+  ProcedureReturn HwMonBytes()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwIdSayImageWhere() - the PROVENANCE of the number above, or the
+;  reason there is not one. One procedure, two jobs, and the core calls
+;  it either way, because "where did that come from" and "why is that
+;  missing" are the same question asked of a board that may or may not be
+;  able to answer.
+;
+;  IT PRINTS RATHER THAN RETURNING A FRAGMENT, for the same reason
+;  HwIdSayConsole() does: the answer runs to more than one line on at
+;  least one board, and a returned fragment would arrive as a single
+;  line far past the width everything else here wraps at. It indents its
+;  own lines to two spaces, which is what every sub-line of `version`
+;  uses.
+;
+;  CALL IT AFTER HwIdImageLen(), not before - the same ordering rule
+;  HwI2cSourceWhere() carries, and for the same reason.
+; ----------------------------------------------------------------------
+Procedure HwIdSayImageWhere()
+  PrintN("  That extent is the RUNNING IMAGE's own: the compiler marks the end")
+  PrintN("  of the image with a symbol and this program reads it, so the length")
+  PrintN("  is of the code that is executing and not of a file on a disk that")
+  PrintN("  may since have been replaced. It is also why this monitor has no")
+  PrintN("  maximum size - type map.")
+EndProcedure

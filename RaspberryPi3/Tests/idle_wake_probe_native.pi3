@@ -1,0 +1,64 @@
+; Generated standalone returning PMF for a monitor-owned deadman test.
+; The checker injects the exact production scheduler globals/helpers.
+#CAP_NET = 0
+#CAP_TOUCH = 0
+#CAP_PWM = 0
+
+;@@SCHEDULER_GLOBALS@@
+Global nativeProbeEl.i = 0
+Global nativeProbeHz.i = 0
+Global nativeProbeOldControl.i = 0
+Global nativeProbeResult.i = 0
+Global nativeProbeRestoredControl.i = 0
+
+Procedure.i MmuEl()
+  Asm
+    mrs x0, currentel
+    lsr x0, x0, #2
+  EndAsm
+EndProcedure
+
+Procedure.i TickHz()
+  Asm
+    mrs x0, cntfrq_el0
+  EndAsm
+EndProcedure
+
+Procedure.i Ticks()
+  Asm
+    mrs x0, cntpct_el0
+  EndAsm
+EndProcedure
+
+;@@SCHEDULER_PROCS@@
+
+Procedure.i Main()
+  nativeProbeEl = MmuEl()
+  nativeProbeHz = TickHz()
+  nativeProbeOldControl = AnvilSchedulerReadControl()
+  If nativeProbeEl <> 3 Or nativeProbeHz < 1000000 Or nativeProbeHz > 1000000000
+    ProcedureReturn 1
+  EndIf
+
+  nativeProbeResult = AnvilSchedulerWakeProbe(32)
+  AnvilSchedulerWfeVerified(0)
+  AnvilSchedulerWriteControl(nativeProbeOldControl)
+  nativeProbeRestoredControl = AnvilSchedulerReadControl()
+
+  If nativeProbeResult <> 32 Or anvil_promptProbeSamples <> 32
+    ProcedureReturn 2
+  EndIf
+  If anvil_promptProbeMinTicks <= 0 Or anvil_promptProbeMaxTicks <= 0
+    ProcedureReturn 3
+  EndIf
+  If anvil_promptProbeMaxTicks > (nativeProbeHz / 500) + 1
+    ProcedureReturn 4
+  EndIf
+  If nativeProbeRestoredControl <> nativeProbeOldControl
+    ProcedureReturn 5
+  EndIf
+  If anvil_promptWfeEnabled <> 0 Or anvil_promptProbePassed <> 1
+    ProcedureReturn 6
+  EndIf
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,58 @@
+; No MMIO: execute the actual shared banner formatter and check byte strings.
+XIncludeFile "Anvil/Core/build_identity.pbi"
+
+Procedure.i BuildLabelEquals(*actual, *expected)
+  Define i.i
+  Define a.i
+  Define b.i
+  i = 0
+  While i < 64
+    a = PeekA(*actual + i)
+    b = PeekA(*expected + i)
+    If a <> b
+      ProcedureReturn 0
+    EndIf
+    If a = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  If BuildLabelEquals(AnvilBuildLabel(22, 20260909, 235414), "Build 22  |  2026-09-09 23:54:14") = 0
+    ProcedureReturn 1
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, 20260102, 5), "Build 1  |  2026-01-02 00:00:05") = 0
+    ProcedureReturn 2
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel($7FFFFFFFFFFFFFFF, 99991231, 235959), "Build 9223372036854775807  |  9999-12-31 23:59:59") = 0
+    ProcedureReturn 3
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(0, 0, 0), "Build 0  |  0000-00-00 00:00:00") = 0
+    ProcedureReturn 4
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(-1, 20260102, 5), "Build identity invalid") = 0
+    ProcedureReturn 5
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, -1, 5), "Build identity invalid") = 0
+    ProcedureReturn 6
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, 100000000, 5), "Build identity invalid") = 0
+    ProcedureReturn 7
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, 20260102, 126000), "Build identity invalid") = 0
+    ProcedureReturn 8
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, 20260102, 123060), "Build identity invalid") = 0
+    ProcedureReturn 9
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(1, 20260102, 240000), "Build identity invalid") = 0
+    ProcedureReturn 10
+  EndIf
+  If BuildLabelEquals(AnvilBuildLabel(23, 20260910, 10101), "Build 23  |  2026-09-10 01:01:01") = 0
+    ProcedureReturn 11
+  EndIf
+  ProcedureReturn 0
+EndProcedure

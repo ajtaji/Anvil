@@ -1,0 +1,105 @@
+; i2c_boot_trace_emitted_gate.pi4 - bounded RAM-only boot I2C trace gate.
+;
+; DIAGNOSTIC. Does not ship and does not target a physical board. The focused
+; Python gate executes this image against a register-level BSC model. The
+; entry returns so the host can inspect the trace globals without a reset.
+;
+; Mode is written into trace_fixture_mode by the off-board runner:
+;  -1 tracing left at its zero-BSS default
+;   0 tracing explicitly off
+;   1 trace the existing MCU identity and Goodix identity transactions
+;   2 as mode 1, then exercise saturation with snapshot-only fault records
+;
+; No mode adds an I2C transaction. Mode 2's extra Begin/Fault/End calls read
+; only C/S/DLEN/A and the architectural counter; they never read FIFO.
+
+LoadAddress  $00500000
+BssAddress   $00600000
+StackAddress $00800000
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2.pi4"
+XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
+
+Global trace_fixture_mode.i
+Global trace_fixture_done.i
+Global trace_fixture_mcu.i
+Global trace_fixture_goodix.i
+Global trace_fixture_count.i
+Global trace_fixture_overflow.i
+Global trace_fixture_digest.i
+
+; Read-only second entry used by the gate after Main has returned. It proves
+; that a dump can consume every retained field without another MMIO access.
+Procedure.i TraceFixtureReadback()
+  Define i.i
+  Define j.i
+  trace_fixture_digest = 0
+  i = 0
+  While i < trace_fixture_count
+    j = 0
+    While j < #I2C_TRACE_FIELDS
+      trace_fixture_digest = (trace_fixture_digest * 33) ! I2cTraceGet(i, j)
+      j = j + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn trace_fixture_digest
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define owned.i
+
+  trace_fixture_done = 0
+  If trace_fixture_mode = 0
+    I2cTraceEnable(0)
+  ElseIf trace_fixture_mode > 0
+    I2cTraceEnable(1)
+  EndIf
+
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  I2cUp()
+
+  ; These are the same three pointer-write/delay/one-byte-read pairs used by
+  ; ScreenUp's panel identification. The instrumentation is inside DsiV2Read.
+  trace_fixture_mcu = DsiV2Identify()
+
+  ; HwTouchUp brackets Gt9Begin with this exact window. Keep the fixture
+  ; below that board seam so the emitted test remains otherwise standalone.
+  I2cTraceGoodixWindow(1)
+  trace_fixture_goodix = Gt9Begin()
+  I2cTraceGoodixWindow(0)
+
+  If trace_fixture_mode = 2
+    ; More complete pairs than can fit. Saturation must preserve the original
+    ; boot history and set overflow, never wrap or leave an orphan BEGIN.
+    i = 0
+    While i < #I2C_TRACE_MAX
+      owned = I2cTraceBegin(#I2C_TRACE_MCU_SIZE_WRITE)
+      If owned <> 0
+        I2cTraceFault($1234, -99)
+      EndIf
+      I2cTraceEnd(owned, -99)
+      i = i + 1
+    Wend
+  EndIf
+
+  ; Disable retains RAM. Every getter below must remain a pure memory read.
+  If trace_fixture_mode >= 0
+    I2cTraceEnable(0)
+  EndIf
+  trace_fixture_count = I2cTraceCount()
+  trace_fixture_overflow = I2cTraceOverflow()
+  trace_fixture_digest = 0
+  trace_fixture_done = $49545243       ; "ITRC"
+  ; Keep the readback entry in emitted code without using it in the three
+  ; transaction modes. The Python gate calls it separately after Main returns.
+  If trace_fixture_mode = 3
+    TraceFixtureReadback()
+  EndIf
+  ProcedureReturn 0
+EndProcedure

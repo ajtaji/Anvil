@@ -1,0 +1,81 @@
+; Emitted contract fixture for the Pi 3 Wi-Fi-only HwLink backend.
+#HW_LINK_WIFI = 2
+#HW_LINK_SPEED_UNKNOWN = -1
+#HW_LINK_DUPLEX_UNKNOWN = -1
+
+Global pi3_wifi_radio_profile.i = 1
+Global gate_attached.i = 1, gate_keyed.i = 0
+Global gate_tx.i, gate_rx.i, gate_send_result.i, gate_rx_length.i
+Global gate_raw_calls.i, gate_raw_result.i, gate_udp_calls.i
+Global Dim gate_mac.a[6]
+Global Dim gate_txbuf.a[64]
+Global Dim gate_rxbuf.a[64]
+
+Procedure.i Pi3WifiMacValid(*mac)
+  If *mac = 0 Or (PeekA(*mac) & 1) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3WifiAssocKeyed() : ProcedureReturn gate_keyed : EndProcedure
+Procedure.i Cyw43Attached() : ProcedureReturn gate_attached : EndProcedure
+Procedure.i Cyw43DataMax() : ProcedureReturn 64 : EndProcedure
+Procedure.i Cyw43DataPtr() : ProcedureReturn @gate_txbuf[0] : EndProcedure
+Procedure.i Cyw43Send(n.i)
+  gate_tx = gate_tx + 1
+  If n < 14 Or n > 64 : ProcedureReturn -1 : EndIf
+  ProcedureReturn gate_send_result
+EndProcedure
+Procedure.i Cyw43Receive(ms.i) : gate_rx = gate_rx + 1 : ProcedureReturn gate_rx_length : EndProcedure
+Procedure.i Cyw43ReceivePtr() : ProcedureReturn @gate_rxbuf[0] : EndProcedure
+Procedure.i NetIfUsable(kind.i) : If kind = #HW_LINK_WIFI : ProcedureReturn 1 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i NetConsoleOfferUdp(*p, kind.i) : gate_udp_calls = gate_udp_calls + 1 : ProcedureReturn 2 : EndProcedure
+Procedure.i gateRaw(*p, n.i)
+  gate_raw_calls = gate_raw_calls + 1
+  If n = 14 And (PeekA(*p+12) & $FF) = $88 And (PeekA(*p+13) & $FF) = $8E : ProcedureReturn gate_raw_result : EndIf
+  ProcedureReturn -1
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Board/hw_link_wifi.pi3"
+
+Procedure.i Main()
+  Protected i.i, p.i, result.i
+  gate_attached=1 : gate_keyed=0
+  gate_mac[0]=$02 : gate_mac[1]=$11 : gate_mac[2]=$22 : gate_mac[3]=$33 : gate_mac[4]=$44 : gate_mac[5]=$55
+  If Pi3HwWifiSetMac(@gate_mac[0]) <> 1 Or HwLinkMacPtr(#HW_LINK_WIFI) = 0 : ProcedureReturn 1 : EndIf
+  If HwLinkReady(#HW_LINK_WIFI) <> 0 Or HwLinkSend(#HW_LINK_WIFI, @gate_rxbuf[0], 14, 0) <> 0 : ProcedureReturn 2 : EndIf
+  gate_keyed = 1
+  If HwLinkReady(#HW_LINK_WIFI) <> 0 : ProcedureReturn 3 : EndIf
+  Pi3HwWifiSetRawHandler(@gateRaw)
+  If p3HwWifiMacReady = 0 : ProcedureReturn 42 : EndIf
+  If p3HwWifiRawFn = 0 : ProcedureReturn 43 : EndIf
+  If Cyw43Attached() = 0 : ProcedureReturn 44 : EndIf
+  If Pi3WifiAssocKeyed() = 0 : ProcedureReturn 45 : EndIf
+  If HwLinkReady(#HW_LINK_WIFI) <> 1 : ProcedureReturn 41 : EndIf
+  If HwLinkTxMax(#HW_LINK_WIFI) <> 64 : ProcedureReturn 42 : EndIf
+  For i=0 To 31 : gate_rxbuf[i]=i : Next
+  If HwLinkSend(#HW_LINK_WIFI, @gate_rxbuf[0], 32, 0) <> 1 Or gate_tx <> 1 : ProcedureReturn 5 : EndIf
+  For i=0 To 31 : If gate_txbuf[i] <> gate_rxbuf[i] : ProcedureReturn 6 : EndIf : Next
+  gate_send_result = -1
+  If HwLinkSend(#HW_LINK_WIFI, @gate_rxbuf[0], 32, 0) <> 0 Or p3HwWifiTxFailure <> 1 : ProcedureReturn 7 : EndIf
+  gate_rx_length=32
+  result=HwLinkRecv(#HW_LINK_WIFI,0,64,0)
+  p=HwLinkRxPtr(#HW_LINK_WIFI)
+  If result <> 32 Or p <> @gate_rxbuf[0] Or p3HwWifiRxFrames <> 1 : ProcedureReturn 8 : EndIf
+  gate_rx_length=70
+  If HwLinkRecv(#HW_LINK_WIFI,0,64,0) <> 0 Or HwLinkRxPtr(#HW_LINK_WIFI) <> 0 Or p3HwWifiRxOversize <> 1 : ProcedureReturn 9 : EndIf
+  gate_rx_length=0
+  If HwLinkRecv(#HW_LINK_WIFI,0,64,0) <> 0 Or HwLinkRxPtr(#HW_LINK_WIFI) <> 0 : ProcedureReturn 10 : EndIf
+  gate_rxbuf[12]=$88 : gate_rxbuf[13]=$8E : gate_raw_result=1
+  If HwLinkOfferRaw(#HW_LINK_WIFI,@gate_rxbuf[0],14) <> 1 Or gate_raw_calls <> 1 : ProcedureReturn 11 : EndIf
+  If HwLinkOfferRaw(#HW_LINK_WIFI,@gate_rxbuf[0],13) <> 0 Or gate_raw_calls <> 1 : ProcedureReturn 12 : EndIf
+  If HwLinkOfferUdp(#HW_LINK_WIFI,@gate_rxbuf[0]) <> 2 Or gate_udp_calls <> 1 : ProcedureReturn 13 : EndIf
+  HwLinkAddressBound(#HW_LINK_WIFI, $C0A80164, $FFFFFF00, $C0A80101)
+  If p3HwWifiIp <> $C0A80164 Or p3HwWifiMask <> $FFFFFF00 Or p3HwWifiGateway <> $C0A80101 : ProcedureReturn 15 : EndIf
+  HwLinkConsoleArmed(#HW_LINK_WIFI, 1)
+  If p3HwWifiConsoleArmed <> 1 Or HwLinkReady(#HW_LINK_WIFI) <> 1 : ProcedureReturn 16 : EndIf
+  HwLinkAddressBound(#HW_LINK_WIFI, 0, 0, 0)
+  HwLinkConsoleArmed(#HW_LINK_WIFI, 0)
+  If p3HwWifiIp <> 0 Or p3HwWifiMask <> 0 Or p3HwWifiGateway <> 0 Or p3HwWifiConsoleArmed <> 0 : ProcedureReturn 17 : EndIf
+  gate_attached=0
+  If HwLinkReady(#HW_LINK_WIFI) <> 0 Or HwLinkSend(#HW_LINK_WIFI,@gate_rxbuf[0],32,0) <> 0 : ProcedureReturn 14 : EndIf
+  ProcedureReturn 0
+EndProcedure

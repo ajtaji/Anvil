@@ -1,0 +1,365 @@
+; pi4RtcProbe.pi4 - the wall clock in RaspberryPi4/Lib/rtc.pi4, put
+; through every conversion it owns so a harness can check the answers
+; against an independent calendar.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_rtc_check.py runs. Nothing here is
+; checked by this file agreeing with itself: the gate re-derives every
+; number below from Python's own calendar, which is a complete
+; independent implementation written by other people, and compares.
+;
+; WHAT IS WORTH CHECKING HERE, and it is not "does it compile":
+;
+;   1. THE CALENDAR, OVER A CORPUS RATHER THAN A HANDFUL. Section C
+;      walks a thousand instants spread across the whole accepted range,
+;      converts each to a date and back, and folds the result into one
+;      checksum. A gate that checked six dates would pass a file that
+;      was wrong about Februaries.
+;
+;   2. THE CENTURY AND THE LEAP DAY. 2000 was a leap year and 1900 was
+;      not; 2096 is and 2099 is not. Section D names them.
+;
+;   3. 2038 IS NOT A CLIFF. Section D converts 2038-01-19 03:14:08, one
+;      second past the 32-bit epoch overflow, because .i on this target
+;      is 64 bits and the whole file is meaningless if that is not
+;      true here.
+;
+;   4. IT REFUSES RATHER THAN FOLDS. 2026-02-29 and 31 April must fail,
+;      not roll into the next month. Section E.
+;
+;   5. AN UNSET CLOCK SAYS SO. Section A asks for the time before
+;      anything has set it, which must produce -1 and the words "clock
+;      not set" - never a plausible 1970 date.
+;
+;   6. A RESTORED TIME MUST NOT REACH A FILE. Section G sets the clock
+;      from the RESTORED source and checks that the FAT date and time
+;      words come back as zero, so fat.pi4's 1980-01-01 sentinel stays
+;      in place. That is the one behaviour in this file that is a
+;      judgement rather than arithmetic, so it is the one most worth
+;      pinning down.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4RtcProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o rtc.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/rtc.pi4"
+
+; How many instants the corpus walks, and how far apart. The stride is
+; a prime number of seconds so that the samples do not land on the same
+; hour, the same weekday or the same day of the month, which a round
+; stride would.
+#PROBE_SAMPLES = 1000
+#PROBE_STRIDE  = 3789367
+
+; The checksum modulus. A prime, and small enough that the running
+; value times 131 plus a packed date cannot approach 2^63 - see the
+; gate, which computes the identical fold in Python.
+#PROBE_MOD = 1000000007
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure Say(*name, *text)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  UartWriteStr(*text)
+  PrintNl()
+EndProcedure
+
+; One instant, printed as both stamps, for the gate to compare against
+; Python's formatting of the same epoch.
+Procedure ShowEpoch(*name, e.i)
+  RtcSet(e, #RTC_SRC_MANUAL)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(e)
+  UartWriteStr("  |")
+  UartWriteStr(RtcStampUtc())
+  UartWriteStr("|")
+  UartWriteStr(RtcStampLocal())
+  UartWriteStr("|")
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define e.i
+  Define back.i
+  Define chk.i
+  Define bad.i
+  Define packed.i
+  Define age0.i
+  Define age1.i
+
+  PrintNl()
+  UartWriteStr("=== rtc.pi4 ===")
+  PrintNl()
+
+  ; ==================================================================
+  ; A - BEFORE ANYTHING SETS IT. The most important section in the file.
+  ; ==================================================================
+  UartWriteStr("A: unset")
+  PrintNl()
+  Line("init            ", RtcInit())
+  Line("hz              ", RtcHz())
+  Line("has time (want 0)", RtcHasTime())
+  Line("trusted  (want 0)", RtcTrusted())
+  Line("source   (want 0)", RtcSource())
+  Line("now      (want -1)", RtcNow())
+  Line("local    (want -1)", RtcLocalNow())
+  Line("age      (want 0)", RtcAge())
+  Line("fat date (want 0)", RtcFatDate())
+  Line("fat time (want 0)", RtcFatTime())
+  Say("stamp utc       ", RtcStampUtc())
+  Say("stamp local     ", RtcStampLocal())
+  Say("line            ", RtcLine())
+  Say("source text     ", RtcSourceText())
+  PrintNl()
+
+  ; ==================================================================
+  ; B - THE COUNTER ITSELF. Uptime and age must move forward and only
+  ;     forward. The gate cannot check these against a wall clock -
+  ;     the interpreter's tick rate is its own - so what is checked is
+  ;     the ORDERING, which is the property that matters.
+  ; ==================================================================
+  UartWriteStr("B: monotonic")
+  PrintNl()
+  RtcSet(1767225600, #RTC_SRC_MANUAL)
+  age0 = RtcAge()
+  i = 0
+  While i < 20000
+    i = i + 1
+  Wend
+  age1 = RtcAge()
+  Line("age first       ", age0)
+  Line("age later       ", age1)
+  Line("uptime          ", RtcUptime())
+  Line("micros in range ", RtcMicros())
+
+  ; RtcMicros() IS A FRACTION OF A SECOND, NOT OF A MILLISECOND, and one
+  ; sample cannot tell the difference: a scale a thousand times too small
+  ; still produces a plausible small number, and a mutation that did
+  ; exactly that survived the first version of this gate. Twelve samples
+  ; spread across more than a second cannot ALL be under 1000 unless the
+  ; scale is wrong, so the gate takes the largest of them.
+  i = 0
+  While i < 12
+    Line("micros sample   ", RtcMicros())
+    i = i + 1
+  Wend
+  Line("drift 50ppm     ", RtcDriftSeconds(50))
+  Line("drift 0  (want 0)", RtcDriftSeconds(0))
+  Line("drift -1 (want 0)", RtcDriftSeconds(0 - 1))
+  PrintNl()
+  UartWriteStr("--- monotonic done ---")
+  PrintNl()
+  PrintNl()
+
+  ; ==================================================================
+  ; C - THE CORPUS. A thousand instants, converted both ways.
+  ;
+  ; The round trip is a self-consistency check and is the WEAKER half:
+  ; a calendar that is wrong in the same way in both directions would
+  ; pass it. The checksum is the strong half - the gate computes the
+  ; identical fold from Python's calendar, so a disagreement anywhere
+  ; in a thousand dates changes one number.
+  ; ==================================================================
+  UartWriteStr("C: corpus")
+  PrintNl()
+  chk = 0
+  bad = 0
+  i = 0
+  While i < #PROBE_SAMPLES
+    ; The stride is chosen so that #PROBE_SAMPLES steps of it stay
+    ; inside the accepted range - 999 * 3789367 is 3785577633 and the
+    ; range is 3786912000 - so there is no wrap here and no wrap
+    ; arithmetic to get wrong. The gate re-derives both numbers.
+    e = #RTC_EPOCH_MIN + i * #PROBE_STRIDE
+    If RtcToCivil(e) = 0
+      bad = bad + 1
+    Else
+      back = RtcToEpoch(RtcYear(), RtcMonth(), RtcDay(), RtcHour(), RtcMinute(), RtcSecond())
+      If back <> e
+        bad = bad + 1
+      EndIf
+      packed = ((((RtcYear() * 13 + RtcMonth()) * 32 + RtcDay()) * 24 + RtcHour()) * 60 + RtcMinute()) * 60 + RtcSecond()
+      chk = (chk * 131 + packed) % #PROBE_MOD
+    EndIf
+    i = i + 1
+  Wend
+  Line("samples         ", #PROBE_SAMPLES)
+  Line("stride          ", #PROBE_STRIDE)
+  Line("roundtrip bad (want 0)", bad)
+  Line("checksum        ", chk)
+  PrintNl()
+
+  ; ==================================================================
+  ; D - THE INSTANTS THAT CATCH CALENDAR BUGS
+  ; ==================================================================
+  UartWriteStr("D: named instants")
+  PrintNl()
+  ShowEpoch("epoch min       ", #RTC_EPOCH_MIN)
+  ShowEpoch("epoch max - 1   ", 4102444799)
+  ShowEpoch("2000 leap day   ", 951782400)
+  ShowEpoch("2096 leap day   ", 3981312000)
+  ShowEpoch("feb 28 2026 late", 1772323199)
+  ShowEpoch("mar 01 2026     ", 1772323200)
+  ShowEpoch("2038 rollover   ", 2147483648)
+  ShowEpoch("ntp era 0 end   ", 2085978496)
+  ShowEpoch("midnight        ", 1767225600)
+  ShowEpoch("noon            ", 1767268800)
+  ShowEpoch("one before noon ", 1767268799)
+  PrintNl()
+
+  ; ==================================================================
+  ; E - WHAT MUST BE REFUSED
+  ; ==================================================================
+  UartWriteStr("E: refusals")
+  PrintNl()
+  Line("2026-02-29  (want -1)", RtcToEpoch(2026, 2, 29, 0, 0, 0))
+  Line("2028-02-29  (want ok)", RtcToEpoch(2028, 2, 29, 0, 0, 0))
+  Line("2026-04-31  (want -1)", RtcToEpoch(2026, 4, 31, 0, 0, 0))
+  Line("2026-13-01  (want -1)", RtcToEpoch(2026, 13, 1, 0, 0, 0))
+  Line("2026-00-01  (want -1)", RtcToEpoch(2026, 0, 1, 0, 0, 0))
+  Line("1979-12-31  (want -1)", RtcToEpoch(1979, 12, 31, 0, 0, 0))
+  Line("2100-01-01  (want -1)", RtcToEpoch(2100, 1, 1, 0, 0, 0))
+  Line("hour 24     (want -1)", RtcToEpoch(2026, 1, 1, 24, 0, 0))
+  Line("minute 60   (want -1)", RtcToEpoch(2026, 1, 1, 0, 60, 0))
+  Line("second 60   (want -1)", RtcToEpoch(2026, 1, 1, 0, 0, 60))
+  Line("civil below (want 0) ", RtcToCivil(315532799))
+  Line("civil above (want 0) ", RtcToCivil(4102444800))
+  Line("set epoch 0 (want 0) ", RtcSet(0, #RTC_SRC_MANUAL))
+  Line("set src 0   (want 0) ", RtcSet(1767225600, #RTC_SRC_NONE))
+  Line("set src 9   (want 0) ", RtcSet(1767225600, 9))
+  Line("zone +1 day (want 0) ", RtcSetZone(86400))
+  PrintNl()
+
+  ; ==================================================================
+  ; F - LEAP YEARS AND MONTH LENGTHS, read out one at a time
+  ; ==================================================================
+  UartWriteStr("F: calendar")
+  PrintNl()
+  Line("leap 2000 (want 1)", RtcLeapYear(2000))
+  Line("leap 2100 (want 0)", RtcLeapYear(2100))
+  Line("leap 2024 (want 1)", RtcLeapYear(2024))
+  Line("leap 2026 (want 0)", RtcLeapYear(2026))
+  Line("feb 2024  (want 29)", RtcMonthDays(2024, 2))
+  Line("feb 2026  (want 28)", RtcMonthDays(2026, 2))
+  Line("feb 2000  (want 29)", RtcMonthDays(2000, 2))
+  Line("feb 2100  (want 28)", RtcMonthDays(2100, 2))
+  Line("month 0   (want 0) ", RtcMonthDays(2026, 0))
+  Line("month 13  (want 0) ", RtcMonthDays(2026, 13))
+  Line("year days 2024", RtcYearDays(2024))
+  Line("year days 2026", RtcYearDays(2026))
+  PrintNl()
+
+  ; ==================================================================
+  ; G - PROVENANCE, AND THE FAT SEAM THAT DEPENDS ON IT
+  ; ==================================================================
+  UartWriteStr("G: provenance")
+  PrintNl()
+
+  ; 2026-08-28 14:03:11 UTC, by hand.
+  Line("set manual (want 1)", RtcSetCivil(2026, 8, 28, 14, 3, 11, #RTC_SRC_MANUAL))
+  Line("trusted    (want 1)", RtcTrusted())
+  Line("source     (want 1)", RtcSource())
+  Line("fat date        ", RtcFatDate())
+  Line("fat time        ", RtcFatTime())
+  Say("line            ", RtcLine())
+
+  ; The same instant, restored from the boot medium. Same number, and
+  ; the FAT words must now be zero.
+  Line("set restored (want 1)", RtcSet(1787925791, #RTC_SRC_RESTORED))
+  Line("trusted    (want 0)", RtcTrusted())
+  Line("has time   (want 1)", RtcHasTime())
+  Line("now        (want 1787925791 or more)", RtcNow())
+  Line("fat date   (want 0)", RtcFatDate())
+  Line("fat time   (want 0)", RtcFatTime())
+  Say("source text     ", RtcSourceText())
+  Say("line            ", RtcLine())
+
+  ; And from the network, which is trusted again.
+  Line("set network (want 1)", RtcSet(1787925791, #RTC_SRC_NETWORK))
+  Line("trusted    (want 1)", RtcTrusted())
+  Line("set count       ", RtcSetCount())
+  PrintNl()
+
+  ; ==================================================================
+  ; H - THE STEP. What a correction says about the timestamps already
+  ;     written.
+  ; ==================================================================
+  UartWriteStr("H: correction")
+  PrintNl()
+  RtcClear()
+  Line("after clear now (want -1)", RtcNow())
+  Line("set 1767225600  (want 1)", RtcSet(1767225600, #RTC_SRC_MANUAL))
+  Line("step (want 0)   ", RtcLastStep())
+  Line("set +3600       (want 1)", RtcSet(1767229200, #RTC_SRC_NETWORK))
+  Line("step (want 3600 or a little less)", RtcLastStep())
+  Line("set -7200       (want 1)", RtcSet(1767222000, #RTC_SRC_NETWORK))
+  Line("step (want about -7200)", RtcLastStep())
+  PrintNl()
+
+  ; ==================================================================
+  ; I - THE ZONE. Display only, and it must not move UTC.
+  ; ==================================================================
+  UartWriteStr("I: zone")
+  PrintNl()
+  RtcSet(1767268800, #RTC_SRC_MANUAL)          ; 2026-01-01 12:00:00 UTC
+  Line("zone 0          ", RtcZone())
+  Say("utc  at zone 0  ", RtcStampUtc())
+  Say("local at zone 0 ", RtcStampLocal())
+  Line("set zone -18000 (want 1)", RtcSetZone(0 - 18000))
+  Say("utc  at EST     ", RtcStampUtc())
+  Say("local at EST    ", RtcStampLocal())
+  Line("now unchanged   ", RtcNow())
+  Line("local now       ", RtcLocalNow())
+  Line("fat date at EST ", RtcFatDate())
+  Line("fat time at EST ", RtcFatTime())
+  RtcSetZone(0)
+  PrintNl()
+
+  ; ==================================================================
+  ; J - NTP
+  ; ==================================================================
+  UartWriteStr("J: ntp")
+  PrintNl()
+  Line("ntp epoch const ", #RTC_NTP_EPOCH)
+  Line("ntp 3976914591  ", RtcNtpToEpoch(3976914591))
+  Line("ntp 0     (want -1)", RtcNtpToEpoch(0))
+  Line("ntp 1     (want -1)", RtcNtpToEpoch(1))
+  Line("ntp 2208988800 (want -1, that is 1970)", RtcNtpToEpoch(2208988800))
+  Line("to ntp 1767225600", RtcEpochToNtp(1767225600))
+  Line("to ntp 0  (want -1)", RtcEpochToNtp(0))
+  PrintNl()
+
+  ; ==================================================================
+  ; K - PERSISTENCE. The text that goes into SETTINGS.TXT.
+  ; ==================================================================
+  UartWriteStr("K: persistence")
+  PrintNl()
+  Say("key             ", RtcSettingsKey())
+  Say("encode 1767225600", RtcEncode(1767225600))
+  Line("decode round trip", RtcDecode(RtcEncode(1767225600)))
+  Line("decode spaces   ", RtcDecode("  1767225600  "))
+  Line("decode junk (want -1)", RtcDecode("2026-01-01"))
+  Line("decode empty (want -1)", RtcDecode(""))
+  Line("decode trail (want -1)", RtcDecode("1767225600x"))
+  Line("decode small (want -1)", RtcDecode("999"))
+  Line("decode huge (want -1)", RtcDecode("99999999999999999999"))
+  Say("error text now  ", RtcErrorText())
+  PrintNl()
+
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

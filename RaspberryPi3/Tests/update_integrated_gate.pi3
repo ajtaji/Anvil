@@ -1,0 +1,24 @@
+; Desk compile only: real SDHOST/FAT/SHA/update/serial composition, no hardware.
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Storage/ab_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/boot_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/update_ab.pbi"
+XIncludeFile "RaspberryPi3/Lib/update_watchdog.pbi"
+XIncludeFile "RaspberryPi3/Lib/update_transport.pbi"
+Procedure Main()
+  If Pi3UpdateError() = 99
+    Pi3SdInit(400000000, 0, $8000000)
+    Pi3UpdateConfigure($2000000, $100000, 0, $8000000, $1000000, $1000)
+    Pi3UpdateMount()
+    Pi3UpdateServe()
+  EndIf
+EndProcedure

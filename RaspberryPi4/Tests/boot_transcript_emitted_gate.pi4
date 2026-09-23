@@ -1,0 +1,88 @@
+; Executed-code gate for the chip-free bounded boot transcript seam.
+
+; @@PRODUCTION_BOOT_TRANSCRIPT@@
+
+Global Dim gateSeen.a[#BOOT_TRANSCRIPT_BYTES]
+Global gateWire.i
+Global gateGrid.i
+
+Procedure GateEmit(c.i)
+  ; The integration calls Put beside the existing output hub. The transcript
+  ; must never cause a second wire/network emission during replay.
+  gateWire = gateWire + 1
+  BootTranscriptPut(c)
+EndProcedure
+
+; The integration's replay, exactly: walk the retained prefix and hand each
+; byte to the rebuilt surface. No Print, UART or network path is entered and
+; no scratch copy of the transcript exists.
+Procedure.i GateReplayGrid()
+  Define i.i
+  Define c.i
+  gateGrid = 0
+  i = 0
+  While i < BootTranscriptCount()
+    c = BootTranscriptAt(i)
+    If c < 0
+      ProcedureReturn -1
+    EndIf
+    gateSeen[gateGrid] = c
+    gateGrid = gateGrid + 1
+    i = i + 1
+  Wend
+  ProcedureReturn gateGrid
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define n.i
+
+  BootTranscriptReset()
+  If BootTranscriptPut(65) <> 0 Or BootTranscriptCount() <> 0 : ProcedureReturn 1 : EndIf
+
+  BootTranscriptStart()
+  GateEmit(65) : GateEmit(0) : GateEmit(255) : GateEmit(10)
+  If BootTranscriptActive() <> 1 Or BootTranscriptCount() <> 4 Or BootTranscriptLost() <> 0 : ProcedureReturn 2 : EndIf
+  If BootTranscriptAt(0) <> 65 Or BootTranscriptAt(1) <> 0 Or BootTranscriptAt(2) <> 255 Or BootTranscriptAt(3) <> 10 : ProcedureReturn 3 : EndIf
+  If BootTranscriptAt(-1) <> -1 Or BootTranscriptAt(4) <> -1 : ProcedureReturn 4 : EndIf
+
+  ; Replay is repeatable and starts at byte zero every time, so a failed
+  ; reconstruction can clear its surface and walk again with no prefix lost
+  ; and none duplicated.
+  If GateReplayGrid() <> 4 : ProcedureReturn 5 : EndIf
+  If gateSeen[0] <> 65 Or gateSeen[1] <> 0 Or gateSeen[2] <> 255 Or gateSeen[3] <> 10 : ProcedureReturn 6 : EndIf
+  If GateReplayGrid() <> 4 Or gateSeen[0] <> 65 Or gateSeen[3] <> 10 : ProcedureReturn 7 : EndIf
+
+  ; Replay after capture stopped changes nothing, and the wire count proves
+  ; no replayed byte went back out through the producer.
+  BootTranscriptStop()
+  If BootTranscriptActive() <> 0 Or BootTranscriptPut(66) <> 0 Or BootTranscriptCount() <> 4 : ProcedureReturn 8 : EndIf
+  If GateReplayGrid() <> 4 Or gateWire <> 4 : ProcedureReturn 9 : EndIf
+
+  ; A fresh start is a new epoch, including a cleared overflow count.
+  BootTranscriptStart()
+  If BootTranscriptCount() <> 0 Or BootTranscriptLost() <> 0 : ProcedureReturn 10 : EndIf
+  For i = 0 To #BOOT_TRANSCRIPT_BYTES - 1
+    If BootTranscriptPut(i) = 0 : ProcedureReturn 11 : EndIf
+  Next
+  For i = 0 To 6
+    If BootTranscriptPut(200 + i) <> 0 : ProcedureReturn 12 : EndIf
+  Next
+  If BootTranscriptCount() <> #BOOT_TRANSCRIPT_BYTES Or BootTranscriptLost() <> 7 : ProcedureReturn 13 : EndIf
+  If BootTranscriptAt(0) <> 0 Or BootTranscriptAt(1) <> 1 Or BootTranscriptAt(#BOOT_TRANSCRIPT_BYTES - 1) <> 255 : ProcedureReturn 14 : EndIf
+
+  ; The saturated prefix replays whole and in order - the case where losing
+  ; a byte would be invisible on a screen full of text.
+  n = GateReplayGrid()
+  If n <> #BOOT_TRANSCRIPT_BYTES : ProcedureReturn 15 : EndIf
+  For i = 0 To #BOOT_TRANSCRIPT_BYTES - 1
+    If gateSeen[i] <> (i & $FF) : ProcedureReturn 16 : EndIf
+  Next
+
+  BootTranscriptStop()
+  If GateReplayGrid() <> #BOOT_TRANSCRIPT_BYTES Or BootTranscriptLost() <> 7 : ProcedureReturn 17 : EndIf
+  BootTranscriptStart()
+  GateEmit(90)
+  If BootTranscriptCount() <> 1 Or BootTranscriptAt(0) <> 90 Or BootTranscriptLost() <> 0 : ProcedureReturn 18 : EndIf
+  ProcedureReturn 0
+EndProcedure

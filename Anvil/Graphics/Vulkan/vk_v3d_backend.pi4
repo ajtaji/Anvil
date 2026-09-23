@@ -1,0 +1,1424 @@
+; ======================================================================
+;  The Raspberry Pi 4 V3D graphics backend for Anvil's Vulkan surface
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; This is the hardware half of the seam declared in vk_foundation.pbi. It
+; turns one closed, already validated colour clear into real V3D work and
+; it does nothing else. It is the ONLY file in the Vulkan tree that knows
+; what a render target, a control list or a tile is.
+;
+; THE EXECUTION PATH IS THE ONE THIS TREE ALREADY PROVES ON SILICON.
+; NeonRebindSurface transactionally points the engine at the image and its
+; geometry; NeonFrameBegin sets the clear colour and builds a bin list with no
+; draws; NeonFrameEnd cleans
+; the caches for what it produced, submits the bin job (V3dBinSubmit),
+; waits for it (V3dBinWait), submits the render job (V3dRenderSubmit) and
+; waits for it (V3dRenderWait). The tile clear and the tile store are
+; what write the image; V3dRenderWait performs the V3D cache clean and
+; the processor-side maintenance for the target. The console and
+; NeonArcade drive the same path at 1920x1080 on this board.
+;
+; THERE IS NO PROCESSOR-SIDE AND NO DMA FALLBACK. If the GPU does not do
+; it, this file reports a device loss and the image is left alone. A
+; fallback here would mean a green test could be a test of memcpy.
+;
+; WHAT THIS BACKEND CANNOT DO, and says so through
+; avkBackendClearSupported rather than by guessing:
+;   * an image whose width, height and row pitch do not fit the declared
+;     render capacity, mapped span and V3D packet fields. The same pure planner
+;     owns these limits for Neon rebind, Vulkan creation and the public image-
+;     format query. Every refusal occurs before live engine state is changed.
+;   * an image that is the framebuffer the display is scanning out. This
+;     backend is offscreen by contract; presentation stays with the
+;     display layer, which is where the page flip and the rotation live.
+;
+; PROVENANCE. Semantics come from the Vulkan specification:
+;   https://docs.vulkan.org/spec/latest/chapters/clears.html  (a colour
+;   clear outside a render pass, and the layouts it is permitted in)
+;   https://docs.vulkan.org/spec/latest/chapters/memory.html   (the heap
+;   and allocation contract this backend reports into)
+;
+; The hardware behaviour comes from THIS TREE'S OWN V3D driver, read for
+; what the engine does rather than re-derived:
+;   RaspberryPi4/Lib/v3d.pi4    blob 032047a96ec132a7d64a7535d0d4787eebc96afd
+;   RaspberryPi4/Lib/neon.pi4   blob 5116984292bf5840aae2d27d66cad80312b86cdb
+;   RaspberryPi4/Lib/v3dqpu.pi4 blob 9b493319fca51449e6ea49880804d42d5904b185
+; all three unchanged across Anvil main 887681a..73a7e01. Two findings in
+; them are load-bearing here and are quoted where they are used: that the
+; clear colour reaches memory verbatim because TILE_RENDERING_MODE_CFG
+; carries a packed word (v3d.pi4, V3dClTrmcClearColor1), and that the
+; display wants byte 0 to be blue (neon.pi4, the CHANNEL ORDER note,
+; measured on this board).
+;
+; Those files cite the Mesa sources and the V3D packet documentation they
+; were written against, next to each packet. Mesa was consulted for how
+; the hardware behaves and is NOT a runtime dependency; NO third-party
+; code is used here and nothing is copied from any implementation.
+; PROVENANCE.json therefore owes this file one `mesa-24.3.4: consulted`
+; row, the same classification vk_core_1_0.pbi carries for khronos-vulkan.
+
+; REQUIRES Anvil/Graphics/Vulkan/vk_v3d_shader.pi4, INCLUDED BEFORE THIS
+; FILE. That is the QPU emitter, and the three pipeline entries of the
+; seam below are thin wrappers over it. It is not included from here:
+; house rule 10 says a library does not include another library, so the
+; main source lists both and a build that forgets the emitter fails to
+; resolve AnvilVkV3dCompile by name rather than linking something odd.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+; The clear colour word this backend hands V3dRenderClear lands in the
+; target VERBATIM: TILE_RENDERING_MODE_CFG carries a packed word, not
+; four components, so nothing reorders it (RaspberryPi4/Lib/v3d.pi4,
+; V3dClTrmcClearColor1 and the CHANNEL ORDER note in neon.pi4 at Anvil
+; main 887681a, both measured on this board). The engine hands over
+; (A<<24)|(R<<16)|(G<<8)|B, whose little-endian bytes are B, G, R, A -
+; which is exactly VK_FORMAT_B8G8R8A8_UNORM storage order. Neon's
+; red/blue swap setting changes only SHADER colours and cannot reach a
+; clear, so this path does not depend on it.
+
+Global avkV3dWindowBase.i = 0
+Global avkV3dWindowBytes.i = 0
+Global avkV3dNative.i = 0
+Global avkV3dJobs.i = 0
+
+; Declare the offscreen window this backend may suballocate as Vulkan
+; device memory. It must already be inside the span NeonSurfaceMapSpan
+; covered before NeonInit built the V3D page table, because the GPU
+; reaches it through that identity mapping and an unmapped page is an
+; MMU fault rather than a wrong picture. Nothing here maps memory and
+; nothing here takes display ownership.
+Procedure.i AnvilVkV3dWindow(base.i, bytes.i)
+  If base <= 0 Or (base % 4096) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was given an offscreen window that is not page aligned (Anvil code -20001, invalid window); the V3D MMU maps 4096-byte pages, so the window base must be a multiple of 4096.")
+  EndIf
+  If bytes < 4096
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was given an offscreen window smaller than one page (Anvil code -20001, invalid window); reserve at least one whole screen of memory above the framebuffer and map it with NeonSurfaceMapSpan before NeonInit.")
+  EndIf
+  avkV3dWindowBase = base
+  avkV3dWindowBytes = bytes
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendCaps()
+  If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
+  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST
+EndProcedure
+
+Procedure.i avkBackendName()
+  ProcedureReturn "the Raspberry Pi 4 V3D 4.2 backend: colour clears are executed by the GPU through the bin and render control lists, and nothing is cleared on the processor"
+EndProcedure
+
+Procedure.i avkBackendPrepare()
+  If Neon_Ready() = 0
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateDevice found the Pi 4 graphics engine not initialised (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no device was created. Call NeonArena, NeonSurface, NeonSurfaceMapSpan and NeonInit, and check Neon_Error(), before creating a Vulkan device.")
+    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+  EndIf
+  If avkV3dWindowBase <= 0
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateDevice found no offscreen window declared for the Pi 4 Vulkan backend (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no device was created. Call AnvilVkV3dWindow with a page-aligned region that NeonSurfaceMapSpan already mapped.")
+    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendHeapBase()
+  ProcedureReturn avkV3dWindowBase
+EndProcedure
+
+Procedure.i avkBackendHeapBytes()
+  ProcedureReturn avkV3dWindowBytes
+EndProcedure
+
+; The processor and the GPU share DRAM on this part and the window is
+; identity mapped in the V3D page table. This backend reports HOST_COHERENT
+; because it implements that API promise: every GPU-read pipeline, uniform
+; and vertex range is cleaned before submission, and V3dRenderWait cleans
+; the GPU caches then cleans+invalidates the ARM view of the whole render
+; target before completion is reported. Hardware coherence is not assumed;
+; the mandatory maintenance at the host/device synchronization edges is
+; what supplies the observable coherent behavior.
+Procedure.i avkBackendMemoryTypeCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendMemoryTypeFlags(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+EndProcedure
+
+Procedure.i avkBackendMemoryTypeHeap(index.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendHeapCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendHeapSizeOf(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkV3dWindowBytes
+EndProcedure
+
+Procedure.i avkBackendHeapFlagsOf(index.i)
+  If index <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn #VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+EndProcedure
+
+; Page granular, because the V3D MMU is.
+Procedure.i avkBackendImageAlignment()
+  ProcedureReturn 4096
+EndProcedure
+
+; TFU raster input is cleaned and issued by cache-line. This requirement is
+; backend-owned so another Vulkan target can publish its own transfer engine's
+; alignment without inheriting a Pi 4 constant in the command layer.
+Procedure.i avkBackendImageCopySourceAlignment()
+  ProcedureReturn 64
+EndProcedure
+
+; Linear BGRA8 images use a tight four-byte row.  The transactional Neon
+; rebind installs this pitch in the V3D store packet; it is no longer copied
+; from the display surface.
+Procedure.i avkBackendRowPitchFor(width.i)
+  ProcedureReturn width * 4
+EndProcedure
+
+Procedure.i avkBackendMaxImageDimension2D()
+  Define n.i
+  n = Neon_CapacityPhysicalW()
+  If Neon_CapacityPhysicalH() < n : n = Neon_CapacityPhysicalH() : EndIf
+  ProcedureReturn n
+EndProcedure
+
+; This first real texture tranche accepts one texel only. For a one-texel
+; image the sole BGRA word at the linear image's base is also the sole useful
+; texel of V3D's LINEARTILE level; every coordinate clamps to it. Wider images
+; require an optimal-tiled representation and a transfer operation and remain
+; outside the advertised/queryable limit rather than being misread as tiled.
+Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
+  Define n.i
+  If tiling = #VK_IMAGE_TILING_LINEAR : ProcedureReturn 1 : EndIf
+  If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn 0 : EndIf
+  n = avkBackendMaxImageDimension2D()
+  If n > #ANVIL_V3D_TEXTURE_MAX_DIM : n = #ANVIL_V3D_TEXTURE_MAX_DIM : EndIf
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *plan.AnvilVkBackendImagePlan)
+  Define vp.AvkV3dTexturePlan
+  Define rc.i
+  If *plan = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  *plan\bytes = 0 : *plan\alignment = 0 : *plan\rowPitch = 0
+  *plan\backendLayout = 0 : *plan\paddedWidth = 0 : *plan\paddedHeight = 0
+  If format <> #VK_FORMAT_B8G8R8A8_UNORM : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If width < 1 Or height < 1 Or width > avkBackendMaxImageDimension2D() Or height > avkBackendMaxImageDimension2D()
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  *plan\alignment = avkBackendImageAlignment()
+  If tiling = #VK_IMAGE_TILING_LINEAR
+    *plan\rowPitch = avkBackendRowPitchFor(width)
+    *plan\bytes = *plan\rowPitch * height
+    *plan\paddedWidth = width : *plan\paddedHeight = height
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If usage = 0 Or (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
+    ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
+  EndIf
+  rc = AnvilVkV3dTexturePlanBuild(width, height, width * 4, @vp)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  *plan\bytes = vp\destinationBytes
+  *plan\backendLayout = vp\textureMemoryFormat
+  *plan\paddedWidth = vp\paddedWidth
+  *plan\paddedHeight = vp\paddedHeight
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+  Define t.AvkV3dTextureTransfer
+  Define p.AvkV3dTexturePlan
+  Define rc.i
+  avkV3dNative = 0
+  If *copy = 0 : avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn -1 : EndIf
+  If *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
+    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
+    ProcedureReturn -1
+  EndIf
+  t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
+  t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes
+  t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
+  t\width = *copy\width : t\height = *copy\height
+  t\sourcePitch = *copy\sourcePitch : t\timeoutUs = *copy\timeoutUs
+  rc = AnvilVkV3dTextureConvert(@t, @p)
+  If rc <> #ANVIL_V3D_TEXTURE_OK
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+  If p\textureMemoryFormat <> *copy\destinationLayout Or p\paddedWidth <> *copy\paddedWidth Or p\paddedHeight <> *copy\paddedHeight
+    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
+    ProcedureReturn -1
+  EndIf
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
+  If base <= 0 Or bytes <= 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ; Inside the declared window, written as differences so that a base
+  ; plus size which wraps cannot pass the check.
+  If base < avkV3dWindowBase Or bytes > avkV3dWindowBytes : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If (base - avkV3dWindowBase) > (avkV3dWindowBytes - bytes) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If w < 8 Or h < 8 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If w > Neon_CapacityPhysicalW() Or h > Neon_CapacityPhysicalH() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If pitch <> (w * 4) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  If bytes < (pitch * h) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ; This backend is offscreen. The buffer the engine is currently
+  ; targeting is the display's, and rendering into it from here would
+  ; take ownership the presentation layer holds.
+  If base = Neon_SurfaceBase() : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Run the clear. The engine's previous target is saved and restored even
+; when the frame fails, because leaving the console pointed at a Vulkan
+; image would be a far worse failure than the one that caused it.
+Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
+  Define rc.i
+  Define restoreRc.i
+  Define oldBase.i
+  Define oldBytes.i
+  Define oldW.i
+  Define oldH.i
+  Define oldPitch.i
+  Define oldFormat.i
+  Define oldRotation.i
+
+  avkV3dNative = 0
+  rc = avkBackendClearSupported(base, bytes, w, h, pitch)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+
+  oldBase = Neon_SurfaceBase()
+  oldBytes = Neon_SurfaceBytes()
+  oldW = Neon_SurfaceW()
+  oldH = Neon_SurfaceH()
+  oldPitch = Neon_SurfacePitch()
+  oldFormat = Neon_SurfaceFormat()
+  oldRotation = Neon_SurfaceRotation()
+
+  rc = NeonRebindSurface(base, w, h, pitch, bytes, #V3D_OFMT_RGBA8, 0)
+  If rc = #NEON_OK
+    rc = NeonFrameBegin(bgra)
+  EndIf
+  If rc = #NEON_OK
+    rc = NeonFrameEnd()
+  EndIf
+  If rc <> #NEON_OK : avkV3dNative = rc : EndIf
+
+  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  If restoreRc <> #NEON_OK And avkV3dNative = 0
+    avkV3dNative = restoreRc
+  EndIf
+  If rc <> #NEON_OK Or restoreRc <> #NEON_OK
+    ProcedureReturn -1
+  EndIf
+
+  avkV3dJobs = avkV3dJobs + 1
+  ; NeonFrameEnd already waited for both jobs and did the cache
+  ; maintenance, so the work is finished by the time this returns. That
+  ; is a real property of the current engine, not an assumption: the
+  ; waits are bounded inside V3dBinWait and V3dRenderWait, and a timeout
+  ; there comes back as a Neon error above rather than as a completion.
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendPoll()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendLastNativeError()
+  ProcedureReturn avkV3dNative
+EndProcedure
+
+Procedure.i avkBackendJobs()
+  ProcedureReturn avkV3dJobs
+EndProcedure
+
+; Microseconds from the architected generic timer, through the V3D
+; library's own reader. The guard is the one V3D and Neon already use:
+; CNTFRQ_EL0 is 54,000,000 on this part and zero on a part where nothing
+; set it, and dividing by zero in a wait loop is a board that stops
+; answering.
+Procedure.i avkBackendTicksUs()
+  Define hz.i
+  hz = V3dCounterHz() / 1000000
+  If hz < 1 : hz = 1 : EndIf
+  ProcedureReturn V3dTicks() / hz
+EndProcedure
+
+; ======================================================================
+;  THE GRAPHICS HALF: one render pass, one triangle list
+; ======================================================================
+;  It runs the SAME frame the clear already proves on silicon, with one
+;  draw added between the prologue and the submit:
+;
+;    NeonRebindSurface  point the engine at the colour attachment and geometry
+;    NeonFrameBegin     build the render list, set the clear colour and
+;                       write the frame prologue - clip window, clipper
+;                       scaling, viewport offset, write masks
+;    (this file)        undo the prologue's alpha blend, declare the
+;                       varyings' interpolation, clean the caches for
+;                       what the processor wrote, then emit GL_SHADER_
+;                       STATE and VERTEX_ARRAY_PRIMS
+;    NeonFrameEnd       submit the bin job, wait, submit the render job,
+;                       wait, and maintain the caches
+;    NeonRebindSurface  put the engine's complete previous surface back
+;
+;  THE PROLOGUE'S BLEND IS REPLACED HERE AND THAT IS DELIBERATE. The
+;  engine begins in SRC_ALPHA / INV_SRC_ALPHA source-over because every
+;  rectangle a user interface draws wants it. A closed Vulkan draw carries
+;  either DISABLED or that exact normalized equation. Both packets that carry
+;  the state are therefore re-emitted on every draw: CFG_BITS owns the master
+;  bit, BLEND_ENABLES owns RT0, and an enabled draw also emits BLEND_CFG.
+;
+;  THE VIEWPORT MUST BE THE RENDER GEOMETRY. NeonFrameBegin establishes the
+;  surface-wide clip window. This backend then re-emits the clipper scale and
+;  viewport offset from the compiled pipeline's exact u14.8 half extents, so
+;  odd dimensions retain their half pixel and the coordinate shader, clipper
+;  and rasteriser all consume the same value.
+
+; Neon's frame prologue writes CFG_BITS with both facings enabled, no
+; clockwise winding and depth function ALWAYS, and then ORs in the blend
+; enable at bit 19. These two constants are that same word without the
+; blend bit, and the empty render-target mask that goes with it.
+#AVK_V3D_CFG_FWD = 1
+#AVK_V3D_CFG_REV = 1
+#AVK_V3D_CFG_CW = 0
+#AVK_V3D_CFG_DEPTH_ALWAYS = 7
+
+Global avkV3dDraws.i = 0
+Global avkV3dLastRecord.i = 0
+Global avkV3dLastRecordBytes.i = 0
+#AVK_V3D_LAST_RECORD_BYTES = 320
+Global Dim avkV3dLastRecordCopy.a[#AVK_V3D_LAST_RECORD_BYTES]
+; Last successful list-submit observations. These are diagnostics only: they
+; describe the exact transaction which was committed, and are published only
+; after frame end and surface restoration both succeed.
+Global avkV3dLastListCount.i = 0
+Global avkV3dLastListPrimitives.i = 0
+Global avkV3dLastViewportTransitions.i = 0
+Global avkV3dLastScissorTransitions.i = 0
+Global avkV3dLastBlendTransitions.i = 0
+Global avkV3dLastVaryingTransitions.i = 0
+Global avkV3dLastSlotCacheRanges.i = 0
+Global avkV3dLastVertexCacheRanges.i = 0
+Global avkV3dLastResourceCacheRanges.i = 0
+Global avkV3dLastCacheInputRanges.i = 0
+Global avkV3dLastCacheMergedRanges.i = 0
+
+Structure AvkV3dNormalizedScissor Align #PB_Structure_AlignC
+  x.i
+  y.i
+  w.i
+  h.i
+EndStructure
+
+; A draw arena is deliberately transient. Diagnostics therefore receive a
+; bounded BSS snapshot, never an address whose allocation has already been
+; returned to the portable heap. Publish as soon as every slot is complete so
+; cache, frame, submit or restoration failures still leave the closed record
+; which was about to be consumed.
+Procedure avkV3dPublishLastRecord(source.i, bytes.i)
+  Define i.i
+  If source = 0 Or bytes < 1 Or bytes > #AVK_V3D_LAST_RECORD_BYTES
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < #AVK_V3D_LAST_RECORD_BYTES
+    avkV3dLastRecordCopy[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < bytes
+    avkV3dLastRecordCopy[i] = PeekA(source + i)
+    i = i + 1
+  Wend
+  avkV3dLastRecordBytes = bytes
+  avkV3dLastRecord = @avkV3dLastRecordCopy[0]
+EndProcedure
+
+; The three pipeline entries of the seam are thin: the emitter owns the
+; encoding and this file owns the hardware.
+Procedure.i avkBackendPipelineBytes()
+  ProcedureReturn AnvilVkV3dPipelineBytes()
+EndProcedure
+
+Procedure.i avkBackendPipelineBuild(*build.AnvilVkBackendPipelineBuildInfo)
+  Define rc.i
+  If *build = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *build\vertexIr = 0 Or *build\fragmentIr = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = AnvilVkV3dCompile(*build)
+  If rc = #VK_SUCCESS
+    ; The pipeline allocation is immutable after compile. Clean it once here;
+    ; every submit cleans only its private draw slots and dynamic resources.
+    V3dCacheRange(*build\base, *build\bytes)
+  EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure avkBackendPipelineRelease(pipe.i)
+  AnvilVkV3dRelease(pipe)
+EndProcedure
+
+Procedure.i avkBackendDrawSupported(base.i, bytes.i, w.i, h.i, pitch.i)
+  ; The rules are the clear's, in the same order and for the same
+  ; reasons: the render target is configured once at NeonInit and this
+  ; backend is offscreen by contract.
+  ProcedureReturn avkBackendClearSupported(base, bytes, w, h, pitch)
+EndProcedure
+
+Structure AvkV3dCacheInterval
+  firstByte.i
+  endByte.i
+EndStructure
+
+; One record contributes at most three slot spans, one UBO, one sampled image
+; and four bindings. Physical identity, not the Vulkan object which named a
+; byte, determines whether cache maintenance can be coalesced.
+#AVK_V3D_CACHE_INTERVALS_PER_DRAW = (#ANVIL_VK_MAX_BINDINGS + 5)
+Global Dim avkV3dCacheInterval.AvkV3dCacheInterval[(#ANVIL_VK_MAX_RECORDED_DRAWS * #AVK_V3D_CACHE_INTERVALS_PER_DRAW)]
+Global avkV3dCacheIntervalCount.i = 0
+
+Procedure.i avkV3dCacheIntervalAdd(firstByte.i, bytes.i)
+  If firstByte <= 0 Or bytes <= 0 Or firstByte > ($FFFFFFFF - (bytes - 1))
+    ProcedureReturn 0
+  EndIf
+  If avkV3dCacheIntervalCount >= (#ANVIL_VK_MAX_RECORDED_DRAWS * #AVK_V3D_CACHE_INTERVALS_PER_DRAW)
+    ProcedureReturn 0
+  EndIf
+  avkV3dCacheInterval[avkV3dCacheIntervalCount]\firstByte = firstByte
+  avkV3dCacheInterval[avkV3dCacheIntervalCount]\endByte = firstByte + bytes
+  avkV3dCacheIntervalCount = avkV3dCacheIntervalCount + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkV3dIntervalAfter(a.i, b.i)
+  ProcedureReturn Bool(avkV3dCacheInterval[a]\firstByte > avkV3dCacheInterval[b]\firstByte)
+EndProcedure
+
+Procedure avkV3dIntervalSwap(a.i, b.i)
+  Define t.AvkV3dCacheInterval
+  t\firstByte = avkV3dCacheInterval[a]\firstByte
+  t\endByte = avkV3dCacheInterval[a]\endByte
+  avkV3dCacheInterval[a]\firstByte = avkV3dCacheInterval[b]\firstByte
+  avkV3dCacheInterval[a]\endByte = avkV3dCacheInterval[b]\endByte
+  avkV3dCacheInterval[b]\firstByte = t\firstByte
+  avkV3dCacheInterval[b]\endByte = t\endByte
+EndProcedure
+
+Procedure avkV3dIntervalSift(root.i, count.i)
+  Define child.i
+  Define pick.i
+  While (root * 2 + 1) < count
+    child = root * 2 + 1
+    pick = root
+    If avkV3dIntervalAfter(child, pick) <> 0 : pick = child : EndIf
+    If child + 1 < count And avkV3dIntervalAfter(child + 1, pick) <> 0 : pick = child + 1 : EndIf
+    If pick = root
+      ProcedureReturn
+    EndIf
+    avkV3dIntervalSwap(root, pick)
+    root = pick
+  Wend
+EndProcedure
+
+Procedure avkV3dIntervalSort()
+  Define i.i
+  ; Command recording naturally produces monotonic vertex ranges for the
+  ; common contiguous-draw case, followed by monotonic arena slot spans. Skip
+  ; heapsort when the complete physical stream is already ordered; aliases
+  ; and interleaved resources still fall through to the general sort.
+  i = 1
+  While i < avkV3dCacheIntervalCount And avkV3dCacheInterval[i - 1]\firstByte <= avkV3dCacheInterval[i]\firstByte
+    i = i + 1
+  Wend
+  If i = avkV3dCacheIntervalCount
+    ProcedureReturn
+  EndIf
+  i = avkV3dCacheIntervalCount / 2
+  While i > 0
+    i = i - 1
+    avkV3dIntervalSift(i, avkV3dCacheIntervalCount)
+  Wend
+  i = avkV3dCacheIntervalCount
+  While i > 1
+    i = i - 1
+    avkV3dIntervalSwap(0, i)
+    avkV3dIntervalSift(0, i)
+  Wend
+EndProcedure
+
+; Validate one closed record without writing a draw slot, touching Neon or
+; publishing any observation. Vertex arithmetic is guarded by division before
+; multiplication, so hostile firstVertex/count/stride triples cannot wrap.
+; Scissor arithmetic never forms offset+extent. It subtracts a bounded cut
+; from an unsigned extent and then caps it to the remaining framebuffer span,
+; so INT32_MIN and UINT32_MAX are both deterministic rather than wraparound.
+Procedure.i avkV3dNormalizeScissor(*d.AnvilVkBackendDraw, *out.AvkV3dNormalizedScissor)
+  Define x.i
+  Define y.i
+  Define w.i
+  Define h.i
+  Define cut.i
+  Define remain.i
+  If *d = 0 Or *out = 0
+    ProcedureReturn 0
+  EndIf
+  If *d\width < 0 Or *d\height < 0 Or *d\scissorX < -2147483648 Or *d\scissorX > 2147483647 Or *d\scissorY < -2147483648 Or *d\scissorY > 2147483647 Or *d\scissorW < 0 Or *d\scissorW > $FFFFFFFF Or *d\scissorH < 0 Or *d\scissorH > $FFFFFFFF
+    ProcedureReturn 0
+  EndIf
+  x = *d\scissorX : y = *d\scissorY
+  w = *d\scissorW : h = *d\scissorH
+  If x < 0
+    cut = -x
+    If w <= cut : w = 0 : Else : w = w - cut : EndIf
+    x = 0
+  EndIf
+  If y < 0
+    cut = -y
+    If h <= cut : h = 0 : Else : h = h - cut : EndIf
+    y = 0
+  EndIf
+  If x >= *d\width
+    x = *d\width : w = 0
+  Else
+    remain = *d\width - x
+    If w > remain : w = remain : EndIf
+  EndIf
+  If y >= *d\height
+    y = *d\height : h = 0
+  Else
+    remain = *d\height - y
+    If h > remain : h = remain : EndIf
+  EndIf
+  *out\x = x : *out\y = y : *out\w = w : *out\h = h
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBackendDraw)
+  Define pipe.i
+  Define b.i
+  Define off.i
+  Define bytes.i
+  Define available.i
+  Define indexWidth.i
+  Define indexOffset.i
+  Define vertexBytes.i
+  Define *bind.AnvilVkBackendBinding
+  Define *sampled.AnvilVkBackendSampledImage
+  Define texturePlan.AvkV3dTexturePlan
+  Define sc.AvkV3dNormalizedScissor
+
+  If *d = 0 Or *first = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  pipe = *d\pipeline
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If AnvilVkV3dCodeBase(pipe) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *d\viewportX <> 0 Or *d\viewportY <> 0 Or *d\viewportW <> *d\width Or *d\viewportH <> *d\height Or *d\viewportW < 1 Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > 32767
+    ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+  EndIf
+  If AnvilVkPipelineDynamicViewport(pipe) = 0 And (AnvilVkPipelineViewportWidth(pipe) <> *d\viewportW Or AnvilVkPipelineViewportHeight(pipe) <> *d\viewportH)
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  If avkV3dNormalizeScissor(*d, @sc) = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkV3dVaryingComponents(pipe) < 0 Or AnvilVkV3dVaryingComponents(pipe) > 24 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *d\bindingCount < 1 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS Or *d\bindings = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *d\firstVertex < 0 Or *d\firstVertex > $FFFFFFFF Or *d\vertexCount < 1 Or *d\vertexCount > $FFFFFFFF Or *d\maxVertex < 0 Or *d\maxVertex > $FFFFFFFF
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *d\indexBase = 0
+    If *d\indexBytes <> 0 Or *d\indexType <> 0 Or (*d\vertexCount - 1) > ($FFFFFFFF - *d\firstVertex) Or *d\maxVertex <> (*d\firstVertex + *d\vertexCount - 1)
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+  Else
+    If *d\indexType = #VK_INDEX_TYPE_UINT16
+      indexWidth = 2
+    ElseIf *d\indexType = #VK_INDEX_TYPE_UINT32
+      indexWidth = 4
+    Else
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    If *d\indexBytes < indexWidth Or *d\indexBytes > $FFFFFFFF Or *d\indexBase < avkV3dWindowBase Or *d\indexBase > $FFFFFFFF Or *d\indexBase > ($FFFFFFFF - (*d\indexBytes - 1)) Or (*d\indexBase - avkV3dWindowBase) > (avkV3dWindowBytes - *d\indexBytes)
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+    If (*d\indexBase % indexWidth) <> 0 Or *d\firstVertex > (*d\indexBytes / indexWidth) Or *d\vertexCount > ((*d\indexBytes / indexWidth) - *d\firstVertex)
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    indexOffset = *d\firstVertex * indexWidth
+    bytes = *d\vertexCount * indexWidth
+    If bytes < 1 Or (*d\indexBase + indexOffset) > ($FFFFFFFF - (bytes - 1))
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+    If *d\sampleMask <> 0
+      If avkV3dCacheIntervalAdd(*d\indexBase + indexOffset, bytes) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    EndIf
+  EndIf
+  b = 0
+  While b < *d\bindingCount
+    *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
+    If *bind\stride <= 0 Or *bind\base < avkV3dWindowBase Or *bind\base > $FFFFFFFF
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+    available = avkV3dWindowBytes - (*bind\base - avkV3dWindowBase)
+    If *d\maxVertex > ((available / *bind\stride) - 1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+    If *d\indexBase = 0
+      off = *d\firstVertex * *bind\stride
+      bytes = *d\vertexCount * *bind\stride
+    Else
+      off = 0
+      vertexBytes = (*d\maxVertex + 1) * *bind\stride
+      bytes = vertexBytes
+    EndIf
+    If bytes < 1 Or (*bind\base + off) > ($FFFFFFFF - (bytes - 1)) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+    If *d\sampleMask <> 0
+      If avkV3dCacheIntervalAdd(*bind\base + off, bytes) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+    EndIf
+    b = b + 1
+  Wend
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0 And (*d\pushBase = 0 Or *d\pushBytes < 16)
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If *d\uniformBase = 0 Or *d\uniformBytes < 16 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+    If avkV3dWindowBytes < 16 Or *d\uniformBase < avkV3dWindowBase Or *d\uniformBase > $FFFFFFFF
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+    If (*d\uniformBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+  EndIf
+  *sampled = 0
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    *sampled = *d\sampledImage
+    If *sampled = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+    If *sampled\tiling = #VK_IMAGE_TILING_LINEAR
+      If *sampled\width <> 1 Or *sampled\height <> 1 Or *sampled\pitch <> 4 Or *sampled\bytes < 4
+        ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+      EndIf
+    ElseIf *sampled\tiling = #VK_IMAGE_TILING_OPTIMAL
+      If AnvilVkV3dTexturePlanBuild(*sampled\width, *sampled\height, *sampled\width * 4, @texturePlan) <> #ANVIL_V3D_TEXTURE_OK
+        ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+      EndIf
+      If *sampled\backendLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR Or *sampled\pitch <> 0 Or *sampled\bytes < texturePlan\destinationBytes Or *sampled\paddedWidth <> texturePlan\paddedWidth Or *sampled\paddedHeight <> texturePlan\paddedHeight
+        ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+      EndIf
+    Else
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+    If *sampled\format <> #VK_FORMAT_B8G8R8A8_UNORM Or *sampled\layout <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    If (*sampled\magFilter <> #VK_FILTER_NEAREST And *sampled\magFilter <> #VK_FILTER_LINEAR) Or (*sampled\minFilter <> #VK_FILTER_NEAREST And *sampled\minFilter <> #VK_FILTER_LINEAR)
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    If *sampled\bytes < 4 Or *sampled\bytes > avkV3dWindowBytes Or *sampled\base < avkV3dWindowBase Or *sampled\base > $FFFFFFFF Or (*sampled\base - avkV3dWindowBase) > (avkV3dWindowBytes - *sampled\bytes)
+      ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+    EndIf
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkV3dDrawViewportHalfWidthFine(*d.AnvilVkBackendDraw)
+  If *d = 0 Or *d\viewportW < 1 Or *d\viewportW > 32767 : ProcedureReturn 0 : EndIf
+  ProcedureReturn *d\viewportW * 128
+EndProcedure
+
+Procedure.i avkV3dDrawViewportHalfHeightFine(*d.AnvilVkBackendDraw)
+  If *d = 0 Or *d\viewportH < 1 Or *d\viewportH > 32767 : ProcedureReturn 0 : EndIf
+  ProcedureReturn *d\viewportH * 128
+EndProcedure
+
+Procedure.i avkV3dDrawViewportHalfWidthBits(*d.AnvilVkBackendDraw)
+  ProcedureReturn avkqF32FromInt(avkV3dDrawViewportHalfWidthFine(*d))
+EndProcedure
+
+Procedure.i avkV3dDrawViewportHalfHeightBits(*d.AnvilVkBackendDraw)
+  ProcedureReturn avkqF32FromInt(avkV3dDrawViewportHalfHeightFine(*d))
+EndProcedure
+
+; Exact BCL bytes added after Neon's prologue. Masked draws add none and do
+; not perturb transition state because they emit no fixed-function packets.
+Procedure.i avkV3dListPacketBytes(*list.AnvilVkBackendDrawList)
+  Define draw.i
+  Define bytes.i
+  Define pipe.i
+  Define blend.i = -1
+  Define vary.i = -1
+  Define halfW.i = -1
+  Define halfH.i = -1
+  Define fineW.i = -1
+  Define fineH.i = -1
+  Define clipX.i = 0
+  Define clipY.i = 0
+  Define clipW.i
+  Define clipH.i
+  Define sc.AvkV3dNormalizedScissor
+  Define *d.AnvilVkBackendDraw
+  If *list = 0 Or *list\drawCount < 1 Or *list\draws = 0 : ProcedureReturn -1 : EndIf
+  clipW = PeekI(*list\draws + OffsetOf(AnvilVkBackendDraw\width))
+  clipH = PeekI(*list\draws + OffsetOf(AnvilVkBackendDraw\height))
+  While draw < *list\drawCount
+    *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+    If *d\sampleMask <> 0
+      pipe = *d\pipeline
+      If avkV3dNormalizeScissor(*d, @sc) = 0 : ProcedureReturn -1 : EndIf
+      If sc\x <> clipX Or sc\y <> clipY Or sc\w <> clipW Or sc\h <> clipH
+        bytes = bytes + 9
+        clipX = sc\x : clipY = sc\y : clipW = sc\w : clipH = sc\h
+      EndIf
+      If halfW <> avkV3dDrawViewportHalfWidthBits(*d) Or halfH <> avkV3dDrawViewportHalfHeightBits(*d) Or fineW <> avkV3dDrawViewportHalfWidthFine(*d) Or fineH <> avkV3dDrawViewportHalfHeightFine(*d)
+        bytes = bytes + 18
+        halfW = avkV3dDrawViewportHalfWidthBits(*d) : halfH = avkV3dDrawViewportHalfHeightBits(*d)
+        fineW = avkV3dDrawViewportHalfWidthFine(*d) : fineH = avkV3dDrawViewportHalfHeightFine(*d)
+      EndIf
+      If blend <> *d\blendMode
+        bytes = bytes + 6
+        If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER : bytes = bytes + 5 : EndIf
+        blend = *d\blendMode
+      EndIf
+      If vary <> AnvilVkV3dVaryingComponents(pipe) : bytes = bytes + 5 : vary = AnvilVkV3dVaryingComponents(pipe) : EndIf
+      bytes = bytes + 15
+      If *d\indexBase <> 0 : bytes = bytes + 9 : EndIf
+    EndIf
+    draw = draw + 1
+  Wend
+  ProcedureReturn bytes
+EndProcedure
+
+Procedure.i avkV3dCleanCacheIntervals()
+  Define i.i
+  Define cleaned.i
+  Define batchRc.i
+  Define firstByte.i
+  Define endByte.i
+  If avkV3dCacheIntervalCount < 1
+    ProcedureReturn 0
+  EndIf
+  avkV3dIntervalSort()
+  If V3dCacheBatchBegin() = 0
+    ProcedureReturn -1
+  EndIf
+  firstByte = avkV3dCacheInterval[0]\firstByte : endByte = avkV3dCacheInterval[0]\endByte
+  i = 1
+  While i < avkV3dCacheIntervalCount
+    If avkV3dCacheInterval[i]\firstByte <= endByte
+      If avkV3dCacheInterval[i]\endByte > endByte : endByte = avkV3dCacheInterval[i]\endByte : EndIf
+    Else
+      If V3dCacheBatchRange(firstByte, endByte - firstByte) = 0
+        V3dCacheBatchEnd()
+        ProcedureReturn -1
+      EndIf
+      cleaned = cleaned + 1
+      firstByte = avkV3dCacheInterval[i]\firstByte : endByte = avkV3dCacheInterval[i]\endByte
+    EndIf
+    i = i + 1
+  Wend
+  If V3dCacheBatchRange(firstByte, endByte - firstByte) = 0
+    V3dCacheBatchEnd()
+    ProcedureReturn -1
+  EndIf
+  cleaned = cleaned + 1
+  batchRc = V3dCacheBatchEnd()
+  If batchRc <> cleaned
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn cleaned
+EndProcedure
+
+; Retained as a private compatibility implementation while the public backend
+; entry below consumes the list payload advertised by DRAW_LIST.
+Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
+  Define rc.i
+  Define restoreRc.i
+  Define oldBase.i
+  Define oldBytes.i
+  Define oldW.i
+  Define oldH.i
+  Define oldPitch.i
+  Define oldFormat.i
+  Define oldRotation.i
+  Define pipe.i
+  Define pbase.i
+  Define varyComps.i
+  Define lastVertex.i
+  Define vertexBytes.i
+  Define b.i
+  Define *bind.AnvilVkBackendBinding
+  Define *sampled.AnvilVkBackendSampledImage
+  Define texturePlan.AvkV3dTexturePlan
+
+  avkV3dNative = 0
+  If *d = 0
+    ProcedureReturn -1
+  EndIf
+  pipe = *d\pipeline
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw naming a pipeline slot it never compiled (Anvil code -20001, invalid pipeline); nothing was submitted.")
+    ProcedureReturn -1
+  EndIf
+  pbase = AnvilVkV3dCodeBase(pipe)
+  If pbase = 0
+    avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 Vulkan backend was handed a draw for a pipeline whose compiled shaders have been released (Anvil code -20004, pipeline not compiled); nothing was submitted. Create the pipeline again before drawing with it.")
+    ProcedureReturn -1
+  EndIf
+
+  rc = avkBackendDrawSupported(*d\targetBase, *d\targetBytes, *d\width, *d\height, *d\pitch)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    ProcedureReturn -1
+  EndIf
+  If AnvilVkPipelineViewportWidth(pipe) <> *d\width Or AnvilVkPipelineViewportHeight(pipe) <> *d\height
+    avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw whose viewport is not the framebuffer render geometry (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This tranche requires one whole-frame viewport, so the pipeline viewport and framebuffer must be the same rectangle.")
+    avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+    ProcedureReturn -1
+  EndIf
+  If *d\blendMode <> #ANVIL_VK_BLEND_DISABLED And *d\blendMode <> #ANVIL_VK_BLEND_SRC_OVER
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with an unknown normalized blend mode (Anvil code -20001, invalid closed draw); nothing was submitted. The portable pipeline layer must supply either disabled or straight source-over.")
+    ProcedureReturn -1
+  EndIf
+
+  ; EVERY vertex array must be inside the window the GPU can reach. The
+  ; portable layer has already checked each is inside its own VkBuffer;
+  ; this is the check that the buffer is inside the mapped span, which
+  ; only this file knows about, and it is made once per binding because
+  ; two bindings are two allocations that were placed separately.
+  lastVertex = *d\firstVertex + *d\vertexCount
+  If *d\bindingCount < 1 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS Or *d\bindings = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex input bindings, more than four, or no binding array at all (Anvil code -20001, invalid draw); nothing was submitted.")
+    ProcedureReturn -1
+  EndIf
+  b = 0
+  While b < *d\bindingCount
+    *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
+    vertexBytes = lastVertex * *bind\stride
+    If *bind\stride <= 0 Or vertexBytes <= 0
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw with no vertex stride on one of its bindings, or no vertices (Anvil code -20001, empty draw); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *bind\base < avkV3dWindowBase Or (*bind\base - avkV3dWindowBase) > (avkV3dWindowBytes - vertexBytes)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a draw one of whose vertex arrays is outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The vertex fetcher reaches memory through that mapping, and an unmapped page is an MMU fault rather than a wrong picture.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    b = b + 1
+  Wend
+
+  varyComps = avkqVaryComps[pipe]
+  ; Push constants, a UBO and a sampled image are independent resources in
+  ; typed IR. Validate each live resource on its own instead of selecting one
+  ; overloaded colour source; arithmetic shaders may consume combinations.
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0
+    If *d\pushBase = 0 Or *d\pushBytes < 16
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment shader reads push constants but no complete sixteen-byte block was supplied (Anvil code -20001, invalid push constants); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If *d\uniformBase = 0 Or *d\uniformBytes < 16
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a draw whose fragment colour comes from a uniform buffer with no address or a range shorter than sixteen bytes (Anvil code -20001, invalid descriptor); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If avkV3dWindowBytes < 16 Or *d\uniformBase < avkV3dWindowBase
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    If (*d\uniformBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a uniform-buffer descriptor outside the offscreen window the V3D page table maps (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A TMU general load reaches the descriptor through that mapping, and an unmapped page is an MMU fault rather than a wrong colour.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  *sampled = 0
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    *sampled = *d\sampledImage
+    If *sampled = 0
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled pipeline without its closed sampled-image record (Anvil code -20001, missing sampled image); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *sampled\tiling = #VK_IMAGE_TILING_LINEAR
+      If *sampled\width <> 1 Or *sampled\height <> 1 Or *sampled\pitch <> 4 Or *sampled\bytes < 4
+        avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a linear sampled image outside its one-texel contract (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Larger sampled images must use the optimal UIF layout produced by vkCmdCopyBufferToImage.")
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+    ElseIf *sampled\tiling = #VK_IMAGE_TILING_OPTIMAL
+      If AnvilVkV3dTexturePlanBuild(*sampled\width, *sampled\height, *sampled\width * 4, @texturePlan) <> #ANVIL_V3D_TEXTURE_OK
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+      If *sampled\backendLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR Or *sampled\pitch <> 0 Or *sampled\bytes < texturePlan\destinationBytes Or *sampled\paddedWidth <> texturePlan\paddedWidth Or *sampled\paddedHeight <> texturePlan\paddedHeight
+        avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed an optimal sampled image whose retained UIF plan is incomplete or inconsistent (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Recreate and fill it through the supported optimal-image copy path.")
+        avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+        ProcedureReturn -1
+      EndIf
+    Else
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled image with an unknown physical tiling (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+    If *sampled\format <> #VK_FORMAT_B8G8R8A8_UNORM Or *sampled\layout <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed a sampled image with the wrong format or layout (Anvil code -20001, invalid sampled state); nothing was submitted. This path accepts one B8G8R8A8_UNORM texel in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.")
+      ProcedureReturn -1
+    EndIf
+    If (*sampled\magFilter <> #VK_FILTER_NEAREST And *sampled\magFilter <> #VK_FILTER_LINEAR) Or (*sampled\minFilter <> #VK_FILTER_NEAREST And *sampled\minFilter <> #VK_FILTER_LINEAR)
+      avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed sampled filter state outside nearest or linear (Anvil code -20001, invalid sampler state); nothing was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *sampled\bytes < 4 Or *sampled\bytes > avkV3dWindowBytes Or *sampled\base < avkV3dWindowBase Or (*sampled\base - avkV3dWindowBase) > (avkV3dWindowBytes - *sampled\bytes)
+      avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 Vulkan backend was handed a sampled texel outside the offscreen window mapped by the V3D page table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. An unmapped texture request is an MMU fault, not a wrong pixel.")
+      avkV3dNative = #VK_ERROR_FEATURE_NOT_PRESENT
+      ProcedureReturn -1
+    EndIf
+  EndIf
+  rc = AnvilVkV3dFragmentUniforms(pipe, pbase, *d\pushBase, *d\uniformBase, *sampled)
+  If rc <> #VK_SUCCESS
+    avkV3dNative = rc
+    avkFault(rc, "the Pi 4 Vulkan backend refused inconsistent fragment uniform metadata or missing per-draw resources; no uniform word and no control list was submitted.")
+    ProcedureReturn -1
+  EndIf
+  rc = AnvilVkV3dBuildRecord(pipe, pbase, *d, lastVertex - 1, varyComps)
+  If rc <> #V3D_OK
+    avkV3dNative = rc
+    avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 Vulkan backend could not build this draw's GL shader state record (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); nothing was submitted. V3dError() carries the control-list builder's own code.")
+    ProcedureReturn -1
+  EndIf
+  avkV3dLastRecord = pbase + #AVKQ_OFF_SHREC
+
+  oldBase = Neon_SurfaceBase()
+  oldBytes = Neon_SurfaceBytes()
+  oldW = Neon_SurfaceW()
+  oldH = Neon_SurfaceH()
+  oldPitch = Neon_SurfacePitch()
+  oldFormat = Neon_SurfaceFormat()
+  oldRotation = Neon_SurfaceRotation()
+
+  rc = NeonRebindSurface(*d\targetBase, *d\width, *d\height, *d\pitch, *d\targetBytes, #V3D_OFMT_RGBA8, 0)
+  If rc = #NEON_OK
+    rc = NeonFrameBegin(*d\clearBgra)
+  EndIf
+  If rc = #NEON_OK
+    ; Replace Neon's integer-centred UI viewport with the pipeline's exact
+    ; centre. For an odd extent the low eight bits are $80; reusing Neon's
+    ; floor-centred value would shift every primitive by half a pixel.
+    V3dClClipperXyScaling(avkV3dDrawViewportHalfWidthBits(*d), avkV3dDrawViewportHalfHeightBits(*d))
+    V3dClViewportOffset(avkV3dDrawViewportHalfWidthFine(*d), 0, avkV3dDrawViewportHalfHeightFine(*d), 0)
+    ; NeonFrameBegin establishes its own source-over state. Replace it with
+    ; the CLOSED Vulkan pipeline state every draw carries: disabled must clear
+    ; both carriers, while source-over must reassert the master bit, RT0 mask
+    ; and the exact colour/alpha equation. Nothing here interprets a Vulkan
+    ; enum; the portable layer already normalized the supported equation.
+    If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER
+      V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
+      V3dClBlendEnables(1)
+      V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)
+    Else
+      V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
+      V3dClBlendEnables(0)
+    EndIf
+    ; The varyings this fragment shader reads with a plain add against
+    ; r5 are non-perspective ones. With every W equal to one the two
+    ; interpolations are the same number, and this is the shape the
+    ; engine's textured program already runs on this board.
+    If varyComps > 0
+      V3dClNonperspFlags((1 << varyComps) - 1)
+    EndIf
+    V3dCacheRange(pbase, #AVKQ_BYTES)
+    ; The QPU, not the processor, reads a descriptor-backed colour. Make
+    ; the sixteen bytes visible before the TMU is allowed to fetch them.
+    If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+      V3dCacheRange(*d\uniformBase, 16)
+    EndIf
+    ; The QPU's texture request reads the application's mapped texel directly.
+    ; Clean that exact range before the control list can launch the request.
+    If *sampled <> 0
+      V3dCacheRange(*sampled\base, *sampled\bytes)
+    EndIf
+    ; One cache maintenance per binding: the processor wrote each of
+    ; these buffers and the vertex fetcher reads all of them.
+    b = 0
+    While b < *d\bindingCount
+      *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
+      V3dCacheRange(*bind\base, lastVertex * *bind\stride)
+      b = b + 1
+    Wend
+    ; A null pSampleMask means all samples; with one sample, bit zero is
+    ; the complete fragment coverage. When it is clear the render pass
+    ; clear still executes, but no primitive may enter rasterisation.
+    If *d\sampleMask <> 0
+      V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
+      V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+    EndIf
+    If V3dClError() <> #V3D_OK
+      rc = #NEON_ERR_LIST
+    EndIf
+  EndIf
+  If rc = #NEON_OK
+    rc = NeonFrameEnd()
+  EndIf
+  If rc <> #NEON_OK : avkV3dNative = rc : EndIf
+
+  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  If restoreRc <> #NEON_OK And avkV3dNative = 0
+    avkV3dNative = restoreRc
+  EndIf
+  If rc <> #NEON_OK Or restoreRc <> #NEON_OK
+    ProcedureReturn -1
+  EndIf
+
+  avkV3dJobs = avkV3dJobs + 1
+  avkV3dDraws = avkV3dDraws + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+; Consume one portable closed list as one hardware transaction. The arena is
+; an ordinary internal heap allocation, so it is visible to the same overlap
+; tracker as application memory and is returned on every exit path.
+Procedure.i avkBackendSubmitDraw(*payload)
+  Define *list.AnvilVkBackendDrawList
+  Define *first.AnvilVkBackendDraw
+  Define *d.AnvilVkBackendDraw
+  Define *sampled.AnvilVkBackendSampledImage
+  Define draw.i
+  Define pipe.i
+  Define pbase.i
+  Define drawBase.i
+  Define arenaBytes.i
+  Define arenaMem.i
+  Define arenaBase.i
+  Define range.i
+  Define rangeCount.i
+  Define rc.i
+  Define endRc.i
+  Define restoreRc.i
+  Define began.i
+  Define oldBase.i
+  Define oldBytes.i
+  Define oldW.i
+  Define oldH.i
+  Define oldPitch.i
+  Define oldFormat.i
+  Define oldRotation.i
+  Define blend.i = -1
+  Define vary.i = -1
+  Define halfW.i = -1
+  Define halfH.i = -1
+  Define fineW.i = -1
+  Define fineH.i = -1
+  Define packetBytes.i
+  Define lastRecord.i = avkV3dLastRecord
+  Define liveDraws.i
+  Define viewportTransitions.i
+  Define scissorTransitions.i
+  Define blendTransitions.i
+  Define varyingTransitions.i
+  Define slotCacheRanges.i
+  Define vertexCacheRanges.i
+  Define resourceCacheRanges.i
+  Define cacheInputRanges.i
+  Define clipX.i
+  Define clipY.i
+  Define clipW.i
+  Define clipH.i
+  Define sc.AvkV3dNormalizedScissor
+
+  avkV3dNative = 0
+  avkV3dCacheIntervalCount = 0
+  If *payload = 0 : ProcedureReturn -1 : EndIf
+  *list = *payload
+  If *list\drawCount < 1 Or *list\drawCount > #ANVIL_VK_MAX_RECORDED_DRAWS Or *list\draws = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 Vulkan backend was handed an empty, oversized or missing closed draw list; nothing was submitted.")
+    ProcedureReturn -1
+  EndIf
+  *first = *list\draws
+  rc = avkBackendDrawSupported(*first\targetBase, *first\targetBytes, *first\width, *first\height, *first\pitch)
+  If rc <> #VK_SUCCESS : avkV3dNative = rc : ProcedureReturn -1 : EndIf
+
+  ; Atomic admission: every record and nested resource is checked before the
+  ; first live renderer state read, rebind or frame begin.
+  While draw < *list\drawCount
+    *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+    rc = avkV3dValidateClosedDraw(*d, *first)
+    If rc <> #VK_SUCCESS
+      avkV3dNative = rc
+      avkFault(rc, "the Pi 4 Vulkan backend refused a closed draw-list record during atomic preflight; no frame was begun and no primitive was submitted.")
+      ProcedureReturn -1
+    EndIf
+    If *d\sampleMask <> 0 : liveDraws = liveDraws + 1 : EndIf
+    draw = draw + 1
+  Wend
+  packetBytes = avkV3dListPacketBytes(*list)
+  If packetBytes < 0 Or Neon_BclBytes() <= 8192 Or packetBytes > (Neon_BclBytes() - 8192)
+    avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY
+    avkFault(#VK_ERROR_OUT_OF_DEVICE_MEMORY, "the Pi 4 Vulkan backend's bin control list cannot hold this draw list's exact state transitions and primitives; no frame was begun.")
+    ProcedureReturn -1
+  EndIf
+
+  arenaBytes = AnvilVkV3dDrawArenaBytes(*list\drawCount)
+  If arenaBytes = 0 Or avkHeapBind() <> #VK_SUCCESS
+    avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY
+    ProcedureReturn -1
+  EndIf
+  arenaMem = avkInternalAlloc(arenaBytes)
+  If arenaMem = 0
+    avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY
+    ProcedureReturn -1
+  EndIf
+  arenaBase = avkInternalBase(arenaMem)
+  If arenaBase = 0 Or AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, *list\drawCount - 1) = 0
+    avkInternalFree(arenaMem)
+    avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY
+    ProcedureReturn -1
+  EndIf
+
+  ; Prepare and build all private records before NeonFrameBegin. No mutable
+  ; draw state is ever patched back into an immutable pipeline allocation.
+  If liveDraws > 0
+    draw = 0
+    While draw < *list\drawCount
+      *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+      If *d\sampleMask <> 0
+        pipe = *d\pipeline
+        pbase = AnvilVkV3dCodeBase(pipe)
+        drawBase = AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, draw)
+        rc = AnvilVkV3dPrepareClosedDrawSlot(pipe, pbase, drawBase, *d)
+        If rc = #VK_SUCCESS
+          rc = AnvilVkV3dBuildDrawSlotRecord(pipe, pbase, drawBase, *d, *d\maxVertex, AnvilVkV3dVaryingComponents(pipe))
+        EndIf
+        If rc <> #V3D_OK
+          avkInternalFree(arenaMem)
+          avkV3dNative = rc
+          avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 Vulkan backend could not close every private draw slot; no frame was begun.")
+          ProcedureReturn -1
+        EndIf
+        lastRecord = drawBase + #AVKQ_DRAW_OFF_SHREC
+      EndIf
+      draw = draw + 1
+    Wend
+    ; `lastRecord` still names the live arena here. Snapshot it before any
+    ; later operation can fail and before the arena is ever released.
+    avkV3dPublishLastRecord(lastRecord, AnvilVkV3dDrawLiveRecordBytes(pipe))
+  EndIf
+
+  ; Collect every exact GPU-read span. One physical union follows after all
+  ; slots and resources are known, so aliases across object kinds are cleaned
+  ; once and V3dCacheRange supplies exactly one barrier per merged interval.
+  If liveDraws > 0
+    draw = 0
+    While draw < *list\drawCount
+      *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+      If *d\sampleMask <> 0
+        pipe = *d\pipeline
+        drawBase = AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, draw)
+        rangeCount = AnvilVkV3dDrawCacheRangeCount(pipe)
+        range = 0
+        While range < rangeCount
+          If avkV3dCacheIntervalAdd(drawBase + AnvilVkV3dDrawCacheRangeOffset(pipe, range), AnvilVkV3dDrawCacheRangeBytes(pipe, range)) = 0
+            avkInternalFree(arenaMem) : avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY : ProcedureReturn -1
+          EndIf
+          slotCacheRanges = slotCacheRanges + 1
+          range = range + 1
+        Wend
+        If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+          If avkV3dCacheIntervalAdd(*d\uniformBase, 16) = 0 : avkInternalFree(arenaMem) : avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY : ProcedureReturn -1 : EndIf
+          resourceCacheRanges = resourceCacheRanges + 1
+        EndIf
+        *sampled = *d\sampledImage
+        If *sampled <> 0
+          If avkV3dCacheIntervalAdd(*sampled\base, *sampled\bytes) = 0 : avkInternalFree(arenaMem) : avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY : ProcedureReturn -1 : EndIf
+          resourceCacheRanges = resourceCacheRanges + 1
+        EndIf
+        If *d\indexBase <> 0 : resourceCacheRanges = resourceCacheRanges + 1 : EndIf
+      EndIf
+      draw = draw + 1
+    Wend
+    cacheInputRanges = avkV3dCacheIntervalCount
+    vertexCacheRanges = avkV3dCleanCacheIntervals()
+    If vertexCacheRanges < 0
+      avkInternalFree(arenaMem)
+      avkV3dNative = #ANVIL_VK_ERR_STATE
+      avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 Vulkan backend could not complete its one cache-maintenance transaction (Anvil code -20004, cache batch ownership); no frame was begun.")
+      ProcedureReturn -1
+    EndIf
+  EndIf
+
+  oldBase = Neon_SurfaceBase()
+  oldBytes = Neon_SurfaceBytes()
+  oldW = Neon_SurfaceW()
+  oldH = Neon_SurfaceH()
+  oldPitch = Neon_SurfacePitch()
+  oldFormat = Neon_SurfaceFormat()
+  oldRotation = Neon_SurfaceRotation()
+
+  rc = NeonRebindSurface(*first\targetBase, *first\width, *first\height, *first\pitch, *first\targetBytes, #V3D_OFMT_RGBA8, 0)
+  If rc = #NEON_OK
+    rc = NeonFrameBegin(*first\clearBgra)
+    If rc = #NEON_OK : began = 1 : EndIf
+  EndIf
+  If rc = #NEON_OK And liveDraws > 0
+    ; NeonFrameBegin emitted the surface-wide clip. Track that exact initial
+    ; state so a static full-viewport draw emits no redundant packet.
+    clipX = 0 : clipY = 0 : clipW = *first\width : clipH = *first\height
+    draw = 0
+    While draw < *list\drawCount
+      *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+      ; A zero sample mask is still fully validated and owns a private slot,
+      ; but emits no state and no primitive.
+      If *d\sampleMask <> 0
+        pipe = *d\pipeline
+        drawBase = AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, draw)
+        If avkV3dNormalizeScissor(*d, @sc) = 0
+          rc = #NEON_ERR_LIST
+        ElseIf sc\x <> clipX Or sc\y <> clipY Or sc\w <> clipW Or sc\h <> clipH
+          V3dClClipWindow(sc\x, sc\y, sc\w, sc\h)
+          clipX = sc\x : clipY = sc\y : clipW = sc\w : clipH = sc\h
+          scissorTransitions = scissorTransitions + 1
+        EndIf
+        If halfW <> avkV3dDrawViewportHalfWidthBits(*d) Or halfH <> avkV3dDrawViewportHalfHeightBits(*d) Or fineW <> avkV3dDrawViewportHalfWidthFine(*d) Or fineH <> avkV3dDrawViewportHalfHeightFine(*d)
+          V3dClClipperXyScaling(avkV3dDrawViewportHalfWidthBits(*d), avkV3dDrawViewportHalfHeightBits(*d))
+          V3dClViewportOffset(avkV3dDrawViewportHalfWidthFine(*d), 0, avkV3dDrawViewportHalfHeightFine(*d), 0)
+          halfW = avkV3dDrawViewportHalfWidthBits(*d) : halfH = avkV3dDrawViewportHalfHeightBits(*d)
+          fineW = avkV3dDrawViewportHalfWidthFine(*d) : fineH = avkV3dDrawViewportHalfHeightFine(*d)
+          viewportTransitions = viewportTransitions + 1
+        EndIf
+        If blend <> *d\blendMode
+          If *d\blendMode = #ANVIL_VK_BLEND_SRC_OVER
+            V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))
+            V3dClBlendEnables(1)
+            V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)
+          Else
+            V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
+            V3dClBlendEnables(0)
+          EndIf
+          blend = *d\blendMode
+          blendTransitions = blendTransitions + 1
+        EndIf
+        If vary <> AnvilVkV3dVaryingComponents(pipe)
+          V3dClNonperspFlags((1 << AnvilVkV3dVaryingComponents(pipe)) - 1)
+          vary = AnvilVkV3dVaryingComponents(pipe)
+          varyingTransitions = varyingTransitions + 1
+        EndIf
+        V3dClGlShaderState(drawBase + #AVKQ_DRAW_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
+        If *d\indexBase <> 0
+          V3dClIndexBufferSetup(*d\indexBase, *d\indexBytes)
+          If *d\indexType = #VK_INDEX_TYPE_UINT16
+            V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, 1, *d\firstVertex * 2)
+          Else
+            V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, 2, *d\firstVertex * 4)
+          EndIf
+        Else
+          V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+        EndIf
+      EndIf
+      draw = draw + 1
+    Wend
+    If V3dClError() <> #V3D_OK : rc = #NEON_ERR_LIST : EndIf
+  EndIf
+  ; V3dBclFinish refuses an errored list before submit. Calling End after an
+  ; emitter error also clears Neon's in-frame latch so restoration is reliable.
+  If began <> 0
+    endRc = NeonFrameEnd()
+    If rc = #NEON_OK : rc = endRc : EndIf
+  EndIf
+  If rc <> #NEON_OK : avkV3dNative = rc : EndIf
+
+  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  If restoreRc <> #NEON_OK And avkV3dNative = 0 : avkV3dNative = restoreRc : EndIf
+  avkInternalFree(arenaMem)
+  If rc <> #NEON_OK Or restoreRc <> #NEON_OK : ProcedureReturn -1 : EndIf
+
+  avkV3dLastListCount = *list\drawCount
+  avkV3dLastListPrimitives = liveDraws
+  avkV3dLastViewportTransitions = viewportTransitions
+  avkV3dLastScissorTransitions = scissorTransitions
+  avkV3dLastBlendTransitions = blendTransitions
+  avkV3dLastVaryingTransitions = varyingTransitions
+  avkV3dLastSlotCacheRanges = slotCacheRanges
+  avkV3dLastVertexCacheRanges = vertexCacheRanges
+  avkV3dLastResourceCacheRanges = resourceCacheRanges
+  avkV3dLastCacheInputRanges = cacheInputRanges
+  avkV3dLastCacheMergedRanges = vertexCacheRanges
+  avkV3dJobs = avkV3dJobs + 1
+  avkV3dDraws = avkV3dDraws + *list\drawCount
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendDraws()
+  ProcedureReturn avkV3dDraws
+EndProcedure
+
+; Where the last draw's GL shader state record was built, so a board
+; diagnostic can read the bytes the GPU was pointed at.
+Procedure.i AnvilVkV3dLastShaderRecord()
+  ProcedureReturn avkV3dLastRecord
+EndProcedure
+
+Procedure.i AnvilVkV3dLastShaderRecordBytes()
+  ProcedureReturn avkV3dLastRecordBytes
+EndProcedure
+
+Procedure.i AnvilVkV3dLastListCount()
+  ProcedureReturn avkV3dLastListCount
+EndProcedure
+
+Procedure.i AnvilVkV3dLastListPrimitives()
+  ProcedureReturn avkV3dLastListPrimitives
+EndProcedure
+
+Procedure.i AnvilVkV3dLastViewportTransitionCount()
+  ProcedureReturn avkV3dLastViewportTransitions
+EndProcedure
+
+Procedure.i AnvilVkV3dLastScissorTransitionCount()
+  ProcedureReturn avkV3dLastScissorTransitions
+EndProcedure
+
+Procedure.i AnvilVkV3dLastBlendTransitionCount()
+  ProcedureReturn avkV3dLastBlendTransitions
+EndProcedure
+
+Procedure.i AnvilVkV3dLastVaryingTransitionCount()
+  ProcedureReturn avkV3dLastVaryingTransitions
+EndProcedure
+
+Procedure.i AnvilVkV3dLastSlotCacheRangeCount()
+  ProcedureReturn avkV3dLastSlotCacheRanges
+EndProcedure
+
+Procedure.i AnvilVkV3dLastVertexCacheRangeCount()
+  ProcedureReturn avkV3dLastVertexCacheRanges
+EndProcedure
+
+Procedure.i AnvilVkV3dLastResourceCacheRangeCount()
+  ProcedureReturn avkV3dLastResourceCacheRanges
+EndProcedure
+
+Procedure.i AnvilVkV3dLastCacheInputRangeCount()
+  ProcedureReturn avkV3dLastCacheInputRanges
+EndProcedure
+
+Procedure.i AnvilVkV3dLastCacheMergedRangeCount()
+  ProcedureReturn avkV3dLastCacheMergedRanges
+EndProcedure

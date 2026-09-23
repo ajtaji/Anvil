@@ -1,0 +1,104 @@
+; Emitted SPIR-V retained-record -> passive typed-IR seam gate.
+; Fixtures are supplied by the independent Python oracle.
+
+XIncludeFile "../vk_spirv.pbi"
+XIncludeFile "../vk_ir.pbi"
+XIncludeFile "../vk_spirv_ir_adapter.pbi"
+
+#AG_IN=$06000000
+#AG_MAGIC=$53504952
+#AG_CASES=40
+#AG_SLOTS=24
+#AG_MAX_RECORDS=128
+#AG_MAX_WORDS=1024
+
+Global Dim agStores.AvkSpirvIrStorage[#AG_CASES]
+Global Dim agRecords.AvkSpvRecord[#AG_CASES*#AG_MAX_RECORDS]
+Global Dim agWords.i[#AG_CASES*#AG_MAX_WORDS]
+Global Dim agReport.i[1024]
+
+Procedure.i Main()
+  Protected count.i=PeekI(#AG_IN)
+  Protected i.i
+  Protected j.i
+  Protected addr.i
+  Protected bytes.i
+  Protected walkRc.i
+  Protected adaptRc.i
+  Protected rawMagic.i
+  Protected records.i
+  Protected words.i
+  Protected valid.i
+  Protected readRc.i
+  Protected base.i
+  If count < 0 : count = 0 : EndIf
+  If count > #AG_CASES : count = #AG_CASES : EndIf
+  i=0
+  While i<count
+    addr=PeekI(#AG_IN+8+(i*16))
+    bytes=PeekI(#AG_IN+16+(i*16))
+    ; Poison each destination so a rejected walk/adaptation has to invalidate
+    ; observable state rather than benefiting from zero-filled BSS.
+    j=0
+    While j<SizeOf(AvkSpirvIrStorage)
+      PokeA(@agStores[i]+j,$A5)
+      j=j+1
+    Wend
+    walkRc=AnvilVkSpirvWalkIr(addr,bytes)
+    valid=AnvilVkSpirvRecordsValid()
+    rawMagic=0:records=AnvilVkSpirvRecordCount():words=AnvilVkSpirvRecordWordCount()
+    readRc=#ANVIL_VK_ERR_ARGS
+    ; Destroy caller-owned bytes before every retained read and adaptation.
+    ; A successful result therefore cannot borrow the caller's lifetime.
+    PokeL(addr,0)
+    If walkRc=0
+      readRc=AnvilVkSpirvRecordWordRead(0,@rawMagic)
+      If records<=#AG_MAX_RECORDS And words<=#AG_MAX_WORDS
+        j=0
+        While j<records
+          AnvilVkSpirvRecordRead(j,@agRecords[(i*#AG_MAX_RECORDS)+j])
+          j=j+1
+        Wend
+        j=0
+        While j<words
+          AnvilVkSpirvRecordWordRead(j,@agWords[(i*#AG_MAX_WORDS)+j])
+          j=j+1
+        Wend
+      Else
+        adaptRc=#ANVIL_SPV_IR_ERR_RANGE
+      EndIf
+    EndIf
+    ; Call the adapter after failures too. It must clear the poisoned output
+    ; and refuse an invalidated/partial retained stream.
+    adaptRc=AnvilVkSpirvIrAdapt(@agStores[i])
+    base=i*#AG_SLOTS
+    agReport[base+0]=walkRc
+    agReport[base+1]=valid
+    agReport[base+2]=rawMagic
+    agReport[base+3]=records
+    agReport[base+4]=adaptRc
+    agReport[base+5]=@agStores[i]\module
+    agReport[base+6]=@agRecords[i*#AG_MAX_RECORDS]
+    agReport[base+7]=AnvilVkSpirvIrLastCode()
+    agReport[base+8]=AnvilVkSpirvIrLastId()
+    agReport[base+9]=AnvilVkSpirvIrLastOpcode()
+    agReport[base+10]=AnvilVkSpirvIrLastIndex()
+    agReport[base+11]=words
+    agReport[base+12]=@agWords[i*#AG_MAX_WORDS]
+    agReport[base+13]=readRc
+    agReport[base+14]=agStores[i]\valid
+    agReport[base+15]=agStores[i]\module\sourceVersion
+    agReport[base+16]=@agStores[i]\types
+    agReport[base+17]=@agStores[i]\constants
+    agReport[base+18]=@agStores[i]\variables
+    agReport[base+19]=@agStores[i]\decorations
+    agReport[base+20]=@agStores[i]\blocks
+    agReport[base+21]=@agStores[i]\nodes
+    agReport[base+22]=@agStores[i]\interfaces
+    agReport[base+23]=agStores[i]\module\interfaceCount
+    i=i+1
+  Wend
+  agReport[1000]=#AG_MAGIC
+  agReport[1001]=count
+  ProcedureReturn @agReport[0]
+EndProcedure

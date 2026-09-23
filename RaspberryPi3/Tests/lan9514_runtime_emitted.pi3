@@ -1,0 +1,118 @@
+; Emitted-code fixture for Pi 3 LAN9514 runtime; no MMIO or board access.
+#P3_LAN_OWNER_NONE=0
+#P3_LAN_IO_PROGRESS=1
+#P3_LAN_IO_RETRY=2
+#P3_LAN_IO_WAIT=3
+#P3_LAN_IO_DONE=4
+#P3_USB_EP_BULK=2
+Global p3lan_io_owner.i
+Global p3lan_io_error.i
+Global p3lan_reg_value.i
+Global p3lan_phy_value.i
+Global p3lan_io_channel.i=3
+Global p3lan_io_timeout_us.i=50000
+Global p3usb_transfer_owner.i
+Global p3usb_transfer_actual.i
+Global p3usb_transfer_next_pid.i
+Global p3usb_enum_lan_address.i
+Global p3usb_lan_bulk_in.i
+Global p3usb_lan_bulk_out.i
+Global p3usb_lan_bulk_in_mps.i
+Global p3usb_lan_bulk_out_mps.i
+Global fixtureReg.i
+Global fixtureReading.i
+Global fixturePhyOperation.i
+Global fixturePhyIndex.i
+Global fixtureRxActual.i
+
+Procedure.i Pi3LanMacValid(address.i)
+  If address=0 Or (PeekA(address)&1)<>0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3LanRegisterBegin(reg.i,reading.i,value.i)
+  If p3lan_io_owner<>0 : p3lan_io_error=-42 : ProcedureReturn -42 : EndIf
+  p3lan_io_owner=1 : fixtureReg=reg : fixtureReading=reading : ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3LanRegisterStep()
+  p3lan_reg_value=0
+  If fixtureReading
+    If fixtureReg=0 : p3lan_reg_value=$EC001234 : EndIf
+  EndIf
+  p3lan_io_owner=0 : ProcedureReturn #P3_LAN_IO_DONE
+EndProcedure
+Procedure.i Pi3LanMacBegin(operation.i,address.i)
+  If operation<>2 Or Pi3LanMacValid(address)=0 : p3lan_io_error=-45 : ProcedureReturn -45 : EndIf
+  p3lan_io_owner=2 : ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3LanMacStep(address.i)
+  p3lan_io_owner=0 : ProcedureReturn #P3_LAN_IO_DONE
+EndProcedure
+Procedure.i Pi3LanPhyBegin(operation.i,phy.i,index.i,value.i,polls.i,delay.i)
+  If phy<>1 : p3lan_io_error=-46 : ProcedureReturn -46 : EndIf
+  p3lan_io_owner=3 : fixturePhyOperation=operation : fixturePhyIndex=index : ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3LanPhyStep(nowUs.i)
+  p3lan_phy_value=0
+  If fixturePhyOperation=1
+    If fixturePhyIndex=1 : p3lan_phy_value=$24 : EndIf
+    If fixturePhyIndex=31 : p3lan_phy_value=$18 : EndIf
+  EndIf
+  p3lan_io_owner=0 : ProcedureReturn #P3_LAN_IO_DONE
+EndProcedure
+Procedure.i Pi3UsbChannelTransfer(channel.i,device.i,endpoint.i,kind.i,mps.i,low.i,bus.i,length.i,pid.i,timeout.i)
+  p3usb_transfer_next_pid=2
+  If (endpoint & $80)<>0 And fixtureRxActual>0
+    p3usb_transfer_actual=fixtureRxActual
+  Else
+    p3usb_transfer_actual=length
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/lan9514_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/lan9514_runtime.pbi"
+
+Procedure FixtureAttach()
+  p3usb_enum_lan_address=2 : p3usb_lan_bulk_in=$81 : p3usb_lan_bulk_out=2
+  p3usb_lan_bulk_in_mps=512 : p3usb_lan_bulk_out_mps=512
+  Pi3LanRuntimeBuffers($02002000,$C2002000,2048,$02003000,$C2003000,4096)
+EndProcedure
+
+Procedure.i Main()
+  Protected operation.i=PeekI($06000000)
+  Protected result.i
+  Protected now.i
+  Protected wire.i
+  Protected n.i
+  FixtureAttach()
+  If operation=1
+    PokeA($02001000,2)
+    If Pi3LanRuntimeBegin($02001000,4,4,10000)<>1 : ProcedureReturn -1 : EndIf
+    For n=0 To 500
+      result=Pi3LanRuntimeStep(now)
+      If result=#P3_LAN_RUNTIME_WAIT : now=p3lan_runtime_wait_until : EndIf
+      If result=#P3_LAN_RUNTIME_READY : ProcedureReturn p3lan_runtime_speed_mbps+p3lan_runtime_full_duplex : EndIf
+      If result<0 : ProcedureReturn result : EndIf
+    Next
+    ProcedureReturn -2
+  EndIf
+  p3lan_runtime_state=100 : p3lan_runtime_ready=1 : p3lan_runtime_link=1
+  p3lan_runtime_device=2 : p3lan_runtime_bulk_in=$81 : p3lan_runtime_bulk_out=2
+  p3lan_runtime_bulk_in_mps=512 : p3lan_runtime_bulk_out_mps=512
+  If operation=2
+    For n=0 To 63 : PokeA($02004000+n,n) : Next
+    If Pi3LanBulkTxBegin($02004000,64,2)<>1 : ProcedureReturn -3 : EndIf
+    If Pi3LanBulkStep()<>#P3_LAN_RUNTIME_READY : ProcedureReturn -4 : EndIf
+    ProcedureReturn p3lan_bulk_actual
+  EndIf
+  If operation=3
+    wire=64
+    Pi3LanWriteLe32($02003000,wire<<16)
+    For n=0 To 59 : PokeA($02003006+n,n+7) : Next
+    fixtureRxActual=72
+    If Pi3LanBulkRxBegin(2)<>1 : ProcedureReturn -5 : EndIf
+    If Pi3LanBulkStep()<>#P3_LAN_RUNTIME_READY : ProcedureReturn -6 : EndIf
+    ProcedureReturn p3lan_bulk_frame_length
+  EndIf
+  ProcedureReturn -99
+EndProcedure

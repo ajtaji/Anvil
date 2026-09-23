@@ -1,0 +1,105 @@
+; Immutable first-stage SD loader. Not deployed; explicit counted target.
+; load0x80000 BSS0x180000 stack0x200000; slot entry0x200000.
+LoadAddress $80000
+BssAddress $180000
+StackAddress $200000
+#ANVIL_BUILD = 26 ; pmf:build
+#ANVIL_BUILD_DATE = 20260918 ; pmf:builddate
+#ANVIL_BUILD_TIME = 213441 ; pmf:buildtime
+XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+Procedure.i Pi3LoaderBootProgress()
+  Protected phase.i=pi3_up_boot_phase
+  Select phase
+    Case 1 : Pi3Say("L1: verify selected slot")
+    Case 2 : Pi3Say("L2: write and read back TRIED record")
+    Case 3 : Pi3Say("L3: reverify selected slot")
+    Case 4 : Pi3Say("L4: copy payload to entry address")
+    Default : ProcedureReturn 0
+  EndSelect
+  ; Alternating steady states preserve a visible last stage if serial is lost.
+  Pi3StatusLed(phase & 1)
+  ProcedureReturn 1
+EndProcedure
+; The explicit mount the recovery prompt offers. It is the same cold storage
+; owner the normal path runs, early watchdog and E0-E6 markers included, so a
+; card that cannot be mounted fails here exactly as it would have failed at
+; boot - with the difference that somebody asked for it and is watching.
+Procedure.i Pi3LoaderMount()
+  ProcedureReturn Pi3BootStorage(1)
+EndProcedure
+
+Procedure Main()
+  Protected start.i
+  Protected now.i
+  Protected key.i
+  Protected spin.i
+  Protected fallback.i
+  Protected recovery.i
+  Protected bytes.i
+  ASM
+    adrp x1, global_pi3_dtb
+    add x1, x1, #:lo12:global_pi3_dtb
+    str x0, [x1]
+  EndASM
+  ; THE WINDOW COMES BEFORE STORAGE. It used to be offered only after the cold
+  ; mount returned, so a card the mount could not get through locked the board
+  ; out completely: thirteen consecutive boots were observed resetting inside
+  ; the mount, and the recovery line never printed once. The choice needs the
+  ; port and the timer, both of which are up by the end of the begin phase, and
+  ; it needs nothing from the card at all.
+  If Pi3UpdateBootBegin(1) = 0 : Pi3Park() : EndIf
+  PokeI(#PI3_UPDATE_HANDOFF, 0)
+  Pi3Say("U: serial recovery; F: older confirmed slot; auto boot in 3 seconds")
+  start = Pi3Micros()
+  If start < 0 : Pi3Say("STOP: timer unavailable") : Pi3Park() : EndIf
+  For spin = 0 To 9999999
+    key = Pi3UartRead()
+    If key = 85 Or key = 117 : recovery = 1 : Break : EndIf
+    If key = 70 Or key = 102 : fallback = 1 : Break : EndIf
+    now = Pi3Micros()
+    If now < start
+      Pi3Say("STOP: the system timer moved backwards, so the boot-selection window cannot be timed. Nothing was read from the card.")
+      Pi3Park()
+    EndIf
+    If now - start >= 3000000 : Break : EndIf
+  Next
+  If spin > 9999999
+    Pi3Say("STOP: the system timer never advanced, so the boot-selection window could not be timed. Nothing was read from the card.")
+    Pi3Park()
+  EndIf
+  ; Recovery is served with storage UNMOUNTED and says so, on both the screen
+  ; and the port. `mount` brings the card up as an explicit command whose cost
+  ; and failure are visible, and the accepted A/B update path then works exactly
+  ; as before.
+  If recovery <> 0
+    If Pi3UpdateRegisterMount(@Pi3LoaderMount) = 0
+      Pi3Say("STOP: the recovery mount owner was refused, so recovery would have no way to reach the card.")
+      Pi3Park()
+    EndIf
+    Pi3Say("R0: serial recovery on the UART at 115200 8N1. The card is NOT mounted; type mount to bring it up, or power-cycle to boot normally. This screen does not update while recovery is running.")
+    Pi3UpdateServe()
+    Pi3Park()
+  EndIf
+  If Pi3BootStorage(1) = 0
+    Pi3Say("STOP: the card could not be prepared or mounted, so no slot can be booted. Reset with U held to reach serial recovery, which does not need the card.")
+    Pi3Park()
+  EndIf
+  Pi3Say("L0: arm 15-second pre-branch watchdog")
+  If Pi3UpdateBootProgressHandler(@Pi3LoaderBootProgress)=0 : Pi3Say("STOP: boot progress owner refused") : Pi3Park() : EndIf
+  If Pi3UpdateWatchdogArmWindow()=0 : Pi3Say("STOP: pre-branch watchdog could not be armed") : Pi3Park() : EndIf
+  Pi3BootWorkBegin()
+  Pi3UpdateMountProgressHandler(@Pi3BootMountProgress)
+  If fallback <> 0 : bytes = Pi3UpdateLoadFallback() : Else : bytes = Pi3UpdateLoad() : EndIf
+  If bytes = 0
+    Pi3BootWorkEnd()
+    Pi3Say("STOP: slot load/refallback refused; control records preserved")
+    Pi3Park()
+  EndIf
+  Pi3Say("L5: write handoff identity") : Pi3StatusLed(1)
+  If Pi3UpdatePrepareHandoff(pi3_dtb) = 0 : Pi3BootWorkEnd() : Pi3Say("STOP: boot identity refused") : Pi3Park() : EndIf
+  Pi3Say("L6: start fresh trial watchdog; branch to payload") : Pi3StatusLed(0)
+  Pi3BootWorkEnd()
+  If Pi3UpdateWatchdogBeginTrial()=0 : Pi3Say("STOP: trial watchdog transition refused") : Pi3Park() : EndIf
+  Pi3UpdateEnter()
+  Pi3Park()
+EndProcedure

@@ -1,0 +1,297 @@
+; pi4NeonGate.pi4 - the probe tools/a64/a64_neon_check.py runs.
+;
+; DIAGNOSTIC. Does not ship. It is not meant to be run on the board and
+; it would be a poor test if it were: it draws four things on a small
+; surface and checks nothing itself. THE GATE DOES THE CHECKING, out of
+; this program's memory, with an oracle this program does not contain.
+;
+; ======================================================================
+;  WHAT IT LEAVES BEHIND FOR THE GATE TO READ
+; ======================================================================
+;   * the BIN CONTROL LIST, complete, at Neon_BclAddr() for
+;     Neon_BclLen() bytes - decoded by the gate with field layouts
+;     PARSED OUT OF v3d_packet.xml, so no shift is typed on either side
+;   * the VERTEX ARRAY, which for a text run IS the glyph decomposition
+;     - the gate reads display.pi4's font blob out of the image and
+;     requires the rectangles to cover exactly the ink and nothing else
+;   * the SHADER STATE RECORDS and their attribute records
+;   * the FRAGMENT UNIFORM BLOCKS, four binary32 colour components each,
+;     which the gate checks against Python's own float division
+;
+; ======================================================================
+;  IT DOES NOT CALL DisplayInit AND THAT IS DELIBERATE
+; ======================================================================
+;  A mailbox transaction needs a VideoCore to answer it and there is
+;  none in the interpreter. So the surface is DECLARED rather than
+;  asked for: a fixed base, a fixed size, a fixed pitch. Nothing in
+;  neon.pi4 cares where the surface came from.
+;
+;  THE SURFACE IS SMALL AND LOW ON PURPOSE. 640 x 480 is 10 x 8 tiles -
+;  still multi-tile, so the tile arithmetic is exercised - and a
+;  framebuffer at $05000000 needs an 80 KB page table instead of the
+;  megabyte a real one at $3E2CB000 needs. THE MEGABYTE CASE IS PROVEN
+;  ON SILICON by pi4NeonBox.pi4 and is not this gate's job; making the
+;  interpreter fill a million table entries would cost minutes and
+;  prove nothing the board has not already proved.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonGate.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o neongate.img
+;   (tools/a64/a64_neon_check.py builds and runs it this way.)
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NG_ARENA       = $01000000
+#NG_ARENA_BYTES = $02000000
+
+; The declared surface. Low, so the page table is small; multi-tile, so
+; the tile arithmetic is not the identity.
+#NG_FB     = $05000000
+#NG_W      = 640
+#NG_H      = 480
+#NG_PITCH  = 2560
+
+; The four things drawn. The gate knows these numbers by PARSING THEM
+; OUT OF THIS FILE, so a change here cannot make the gate agree with
+; the wrong thing.
+#NG_BOXX = 40
+#NG_BOXY = 30
+#NG_BOXW = 120
+#NG_BOXH = 90
+#NG_BOXC_R = $12
+#NG_BOXC_G = $8A
+#NG_BOXC_B = $F3
+#NG_BOXC_A = $FF
+
+#NG_ALPHAX = 100
+#NG_ALPHAY = 70
+#NG_ALPHAW = 150
+#NG_ALPHAH = 110
+#NG_ALPHAC_R = $DE
+#NG_ALPHAC_G = $37
+#NG_ALPHAC_B = $91
+#NG_ALPHAC_A = $6C
+
+#NG_CLIPX = 300
+#NG_CLIPY = 200
+#NG_CLIPW = 90
+#NG_CLIPH = 60
+#NG_CLIPBOXX = 250
+#NG_CLIPBOXY = 150
+#NG_CLIPBOXW = 300
+#NG_CLIPBOXH = 250
+#NG_CLIPC_R = $04
+#NG_CLIPC_G = $B7
+#NG_CLIPC_B = $5E
+#NG_CLIPC_A = $FF
+
+#NG_TEXTX = 32
+#NG_TEXTY = 400
+#NG_TEXTC_R = $F0
+#NG_TEXTC_G = $2B
+#NG_TEXTC_B = $99
+#NG_TEXTC_A = $FF
+
+#NG_CLEAR_R = $21
+#NG_CLEAR_G = $43
+#NG_CLEAR_B = $65
+#NG_CLEAR_A = $FF
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr(" ")
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure RowH(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr(" ")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+; The string the text run draws. Built rather than written as a literal
+; so the gate can rebuild it from the same rule: ASCII 33 to 96, which
+; is 64 glyphs of real ink and no space to make a run boundary
+; ambiguous.
+Global Dim ngStr.a[80]
+Global ngLen.i = 0
+
+Procedure BuildString()
+  Define c.i
+  ngLen = 0
+  c = 33
+  While c <= 96
+    ngStr[ngLen] = c
+    ngLen = ngLen + 1
+    c = c + 1
+  Wend
+  ngStr[ngLen] = 0
+EndProcedure
+
+; ======================================================================
+;  WHERE EVERYTHING ENDED UP.
+;
+;  The gate finds these by symbol, so the probe has to keep them
+;  somewhere a symbol names. They are globals rather than printed
+;  numbers because a hex dump of a 100 KB vertex array over a 115200
+;  baud line is not a thing anybody wants.
+; ======================================================================
+Global ngBclAddr.i = 0
+Global ngBclLen.i = 0
+Global ngVerts.i = 0
+Global ngVertCount.i = 0
+Global ngShrec.i = 0
+Global ngUnif.i = 0
+Global ngDraws.i = 0
+Global ngGlyphs.i = 0
+Global ngRuns.i = 0
+Global ngTextFirst.i = 0
+Global ngTextCount.i = 0
+Global ngFontBits.i = 0
+Global ngRc.i = 0
+
+Procedure.i Body()
+  Define r.i
+
+  PutNl()
+  PutS("=== pi4NeonGate - the offline gate's probe ===")
+  PutNl()
+
+  r = NeonArena(#NG_ARENA, #NG_ARENA_BYTES)
+  If r <> #NEON_OK
+    ngRc = 1
+    PutS("ARENA")
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+  r = NeonSurface(#NG_FB, #NG_W, #NG_H, #NG_PITCH)
+  If r <> #NEON_OK
+    ngRc = 2
+    PutS("SURFACE")
+    PutNl()
+    ProcedureReturn 2
+  EndIf
+  r = NeonInit()
+  If r <> #NEON_OK
+    ngRc = 3
+    Row("NeonInit failed, error", r)
+    Row("V3dError", V3dError())
+    ProcedureReturn 3
+  EndIf
+
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  ngFontBits = ?dsp_font8x16
+  BuildString()
+
+  r = NeonFrameBegin(Neon_RGBA(#NG_CLEAR_R, #NG_CLEAR_G, #NG_CLEAR_B, #NG_CLEAR_A))
+  If r <> #NEON_OK
+    ngRc = 4
+    Row("NeonFrameBegin failed, error", r)
+    ProcedureReturn 4
+  EndIf
+
+  Neon_Box(#NG_BOXX, #NG_BOXY, #NG_BOXW, #NG_BOXH, Neon_RGBA(#NG_BOXC_R, #NG_BOXC_G, #NG_BOXC_B, #NG_BOXC_A))
+  Neon_Box(#NG_ALPHAX, #NG_ALPHAY, #NG_ALPHAW, #NG_ALPHAH, Neon_RGBA(#NG_ALPHAC_R, #NG_ALPHAC_G, #NG_ALPHAC_B, #NG_ALPHAC_A))
+
+  Neon_ScissorSet(#NG_CLIPX, #NG_CLIPY, #NG_CLIPW, #NG_CLIPH)
+  Neon_Box(#NG_CLIPBOXX, #NG_CLIPBOXY, #NG_CLIPBOXW, #NG_CLIPBOXH, Neon_RGBA(#NG_CLIPC_R, #NG_CLIPC_G, #NG_CLIPC_B, #NG_CLIPC_A))
+  Neon_ScissorClear()
+
+  ; The text run, LAST, so its vertices are the tail of the array and
+  ; the gate can find them with one index.
+  ngTextFirst = Neon_Verts()
+  Neon_Text(#NEON_FONT_UI, #NG_TEXTX, #NG_TEXTY, @ngStr[0], Neon_RGBA(#NG_TEXTC_R, #NG_TEXTC_G, #NG_TEXTC_B, #NG_TEXTC_A))
+  ngTextCount = Neon_Verts() - ngTextFirst
+
+  ; The bin list is captured BEFORE NeonFrameEnd caps it, because
+  ; V3dClAddr and V3dClLen are the writer's cursor and V3dBclFinish
+  ; hands the same numbers to V3dBclStartAddr / V3dBclBytes. Both are
+  ; read; the gate checks they agree.
+  ngBclAddr = V3dClAddr()
+
+  r = NeonFrameEnd()
+  ngRc = r
+  ngBclLen    = V3dBclBytes()
+  ngVerts     = Neon_VertsAddr()
+  ngVertCount = Neon_Verts()
+  ngShrec     = Neon_ShrecAddr()
+  ngUnif      = Neon_UnifAddr()
+  ngDraws     = Neon_Draws()
+  ngGlyphs    = Neon_Glyphs()
+  ngRuns      = Neon_Runs()
+
+  Row("NeonFrameEnd", r)
+  RowH("bin list at", ngBclAddr)
+  Row("bin list bytes", ngBclLen)
+  RowH("vertices at", ngVerts)
+  Row("vertex count", ngVertCount)
+  RowH("records at", ngShrec)
+  RowH("uniforms at", ngUnif)
+  Row("draw calls", ngDraws)
+  Row("glyphs", ngGlyphs)
+  Row("glyph rectangles", ngRuns)
+  Row("text first vertex", ngTextFirst)
+  Row("text vertex count", ngTextCount)
+  Row("Neon_Error", Neon_Error())
+  PutS("=== end ===")
+  PutNl()
+  ProcedureReturn ngDraws
+EndProcedure
+
+; ======================================================================
+;  THE WRAPPER THAT HANDS THE GPU BACK.
+;
+;  Main() is a wrapper and Body() is the program, for one reason:
+;  Body() has a dozen early returns and EVERY ONE of them has to put
+;  the V3D MMU back before the monitor gets control again. Measured on
+;  the board, 2026-08-28: a payload that left the MMU enabled with its
+;  own page table killed the VideoCore firmware's mailbox service, and
+;  the NEXT payload could not get a surface - MAIL1_STA $80000008,
+;  full of requests nobody was consuming, cleared only by a reset.
+;  See NeonShutdown() in neon.pi4 for the full note.
+;
+;  A cleanup that has to be repeated at a dozen returns is a cleanup
+;  that will be missed at one of them.
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

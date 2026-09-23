@@ -1,0 +1,128 @@
+; Emitted packet/extent gate for the Pi 3 VC4 clear RCL.
+#HW_ADDR_SAFE = 0
+#PI3_V3D_BASE = $3FC00000
+#PI3_V3D_IDENT0_EXPECTED = $02443356
+
+Global Dim vc4_gate_arena.a[16639]
+Global pi3_mon_deadman_owned.i
+Global pi3_v3d_domain_state.i
+
+Structure Pi3V3dIdentity
+  ident0.l
+EndStructure
+
+Procedure.i HwAddrCheck(lo.i, hi.i, write.i)
+  ProcedureReturn #HW_ADDR_SAFE
+EndProcedure
+Procedure.i Pi3Micros()
+  ProcedureReturn 1
+EndProcedure
+XIncludeFile "RaspberryPi3/Lib/vc4_render.pi3"
+
+Procedure.i vc4GateExpected(offset.i, color.i, targetBus.i)
+  Select offset
+    Case 0 : ProcedureReturn #PI3_VC4_PKT_CLEAR_COLORS
+    Case 1 : ProcedureReturn color & $FF
+    Case 2 : ProcedureReturn (color >> 8) & $FF
+    Case 3 : ProcedureReturn (color >> 16) & $FF
+    Case 4 : ProcedureReturn (color >> 24) & $FF
+    Case 5 : ProcedureReturn color & $FF
+    Case 6 : ProcedureReturn (color >> 8) & $FF
+    Case 7 : ProcedureReturn (color >> 16) & $FF
+    Case 8 : ProcedureReturn (color >> 24) & $FF
+    Case 9 : ProcedureReturn 0
+    Case 10 : ProcedureReturn 0
+    Case 11 : ProcedureReturn 0
+    Case 12 : ProcedureReturn 0
+    Case 13 : ProcedureReturn 0
+    Case 14 : ProcedureReturn #PI3_VC4_PKT_TILE_COORDINATES
+    Case 15 : ProcedureReturn 0
+    Case 16 : ProcedureReturn 0
+    Case 17 : ProcedureReturn #PI3_VC4_PKT_STORE_TILE_BUFFER_GENERAL
+    Case 18 : ProcedureReturn 0
+    Case 19 : ProcedureReturn 0
+    Case 20 : ProcedureReturn 0
+    Case 21 : ProcedureReturn 0
+    Case 22 : ProcedureReturn 0
+    Case 23 : ProcedureReturn 0
+    Case 24 : ProcedureReturn #PI3_VC4_PKT_TILE_RENDERING_MODE_CONFIG
+    Case 25 : ProcedureReturn targetBus & $FF
+    Case 26 : ProcedureReturn (targetBus >> 8) & $FF
+    Case 27 : ProcedureReturn (targetBus >> 16) & $FF
+    Case 28 : ProcedureReturn (targetBus >> 24) & $FF
+    Case 29 : ProcedureReturn #PI3_VC4_CLEAR_WIDTH
+    Case 30 : ProcedureReturn 0
+    Case 31 : ProcedureReturn #PI3_VC4_CLEAR_HEIGHT
+    Case 32 : ProcedureReturn 0
+    Case 33 : ProcedureReturn #PI3_VC4_TRMC_RGBA8888_LINEAR
+    Case 34 : ProcedureReturn 0
+    Case 35 : ProcedureReturn #PI3_VC4_PKT_TILE_COORDINATES
+    Case 36 : ProcedureReturn 0
+    Case 37 : ProcedureReturn 0
+    Case 38 : ProcedureReturn #PI3_VC4_PKT_STORE_MS_TILE_BUFFER_AND_EOF
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i Main()
+  Protected arenaLo.i
+  Protected arenaHi.i
+  Protected target.i
+  Protected rcl.i
+  Protected color.i
+  Protected targetBus.i
+  Protected rc.i
+  Protected i.i
+  arenaLo = @vc4_gate_arena[0]
+  arenaHi = @vc4_gate_arena[16638]
+  target = (arenaLo + 63) & (~63)
+  rcl = target + #PI3_VC4_CLEAR_BYTES
+  color = $FF204060
+  targetBus = target + #PI3_VC4_DMA_BASE
+
+  rc = Pi3Vc4BuildClearRcl(target, #PI3_VC4_CLEAR_BYTES, rcl, 39, arenaLo, arenaHi, color)
+  If rc <> 39 : ProcedureReturn 1 : EndIf
+  For i = 0 To 38
+    If PeekA(rcl + i) <> vc4GateExpected(i, color, targetBus)
+      ProcedureReturn 2
+    EndIf
+  Next
+  If Pi3Vc4ClassifyRenderStatus(#PI3_VC4_INT_OUTOMEM, 0) <> 0
+    ProcedureReturn 12
+  EndIf
+  If Pi3Vc4ClassifyRenderStatus(#PI3_VC4_INT_OUTOMEM | #PI3_VC4_INT_FRDONE, 0) <> 1
+    ProcedureReturn 13
+  EndIf
+  If Pi3Vc4ClassifyRenderStatus(0, #PI3_VC4_CS_CTERR) <> #PI3_VC4_ERR_GPU
+    ProcedureReturn 14
+  EndIf
+
+  ; Rejections happen before a single output byte is changed.
+  PokeA(rcl, $A5)
+  If Pi3Vc4BuildClearRcl(target, #PI3_VC4_CLEAR_BYTES, rcl, 38, arenaLo, arenaHi, color) <> #PI3_VC4_ERR_ARGS
+    ProcedureReturn 3
+  EndIf
+  If PeekA(rcl) <> $A5 : ProcedureReturn 4 : EndIf
+  If Pi3Vc4ValidateClearBuffers(target + 1, #PI3_VC4_CLEAR_BYTES, rcl, 39, arenaLo, arenaHi) <> #PI3_VC4_ERR_ALIGN
+    ProcedureReturn 5
+  EndIf
+  If Pi3Vc4ValidateClearBuffers(target + 16, #PI3_VC4_CLEAR_BYTES, rcl, 39, arenaLo, arenaHi) <> #PI3_VC4_ERR_ALIGN
+    ProcedureReturn 11
+  EndIf
+  If Pi3Vc4ValidateClearBuffers(target, #PI3_VC4_CLEAR_BYTES, rcl + 1, 39, arenaLo, arenaHi) <> #PI3_VC4_ERR_ALIGN
+    ProcedureReturn 6
+  EndIf
+  If Pi3Vc4ValidateClearBuffers(target, #PI3_VC4_CLEAR_BYTES, target + 64, 39, arenaLo, arenaHi) <> #PI3_VC4_ERR_OVERLAP
+    ProcedureReturn 7
+  EndIf
+  If Pi3Vc4ValidateClearBuffers(target, #PI3_VC4_CLEAR_BYTES, rcl, 39, arenaLo, rcl - 1) <> #PI3_VC4_ERR_EXTENT
+    ProcedureReturn 8
+  EndIf
+  If Pi3Vc4SpanInArena($3EFFC000, #PI3_VC4_CLEAR_BYTES, $3EFFC000, $3EFFFFFF) <> 1
+    ProcedureReturn 9
+  EndIf
+  If Pi3Vc4SpanInArena($3EFFC001, #PI3_VC4_CLEAR_BYTES, $3EFFC000, $3EFFFFFF) <> 0
+    ProcedureReturn 10
+  EndIf
+  ProcedureReturn 0
+EndProcedure

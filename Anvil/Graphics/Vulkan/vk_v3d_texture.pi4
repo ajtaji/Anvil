@@ -1,0 +1,241 @@
+; ======================================================================
+;  V3D 4.2 linear-staging to optimal-tiled texture transfer
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; An isolated hardware translation component. It is not included by the
+; Vulkan object engine yet and it does not advertise VK_IMAGE_TILING_OPTIMAL.
+; Its one job is narrower: plan and execute an exact copy of opaque four-byte
+; texels from a raster staging image into one V3D UIF_NO_XOR level-zero image.
+;
+; REQUIRES RaspberryPi4/Lib/v3d.pi4 before this file. House rule 10 keeps
+; libraries from including libraries, so an eventual Pi 4 integration must
+; list both. The five V3dTfu* calls below are the complete hardware seam.
+;
+; SOURCE CONTRACT (Mesa 24.3.4 files saved in the Pi 4 Reference vault):
+;   v3dx_tfu.c:57-77,92-156
+;     - TFU copies are exact: no scaling or pixel conversion;
+;     - a four-byte copy deliberately selects R32_FLOAT only to describe the
+;       texel width accepted by TFU;
+;     - raster IIS is byte pitch divided by cpp;
+;     - output cannot be raster; UIF_NO_XOR is output code 6;
+;     - level-zero UIF OPAD is extra padded-height blocks beyond align(h,8).
+;   v3d_tiling.h:29-63 and v3d_tiling.c:35-61,149-210
+;     - a 32-bit utile is 4x4 and 64 bytes;
+;     - a UIF block is 2x2 utiles: 8x8 and 256 bytes;
+;     - UIF blocks are grouped in four columns, hence width alignment 32.
+;   v3d_resource.c:575-698
+;     - a level-zero UIF slice aligns width to four UIF blocks and height to
+;       one UIF block, and its byte size is padded_width * cpp * padded_height.
+;
+; UIF_NO_XOR is one of Mesa's two normal UIF layouts, not a linear or UBLINEAR
+; shortcut. Fixing it here deliberately avoids Mesa's optional bank-placement
+; padding/XOR policy. Because paddedHeight is exactly align(height, 8), OPAD is
+; zero, matching the existing V3dTfuBegin encoder rather than leaving a hidden
+; resource-layout dependency.
+;
+; FORMAT OWNERSHIP. This file does NOT call the bytes BGRA8. R32_FLOAT=29 is
+; named RAW32_TTYPE because Mesa uses it for every exact four-byte copy and
+; states that no format conversion occurs. A later Vulkan owner must prove
+; that its VkFormat's byte representation is the one its sampler state names.
+;
+; CACHE OWNERSHIP. V3dTfuSubmit cleans the exact source and destination spans
+; before launch; V3dTfuWait invalidates the destination after the bounded wait.
+; Duplicating either operation here would create two owners that can drift.
+
+#ANVIL_V3D_TEXTURE_OK             = 0
+#ANVIL_V3D_TEXTURE_ERR_ARGS       = -23101
+#ANVIL_V3D_TEXTURE_ERR_RANGE      = -23102
+#ANVIL_V3D_TEXTURE_ERR_OVERLAP    = -23103
+
+#ANVIL_V3D_TEXTURE_TEXEL_BYTES    = 4
+#ANVIL_V3D_TEXTURE_UTILE_W        = 4
+#ANVIL_V3D_TEXTURE_UTILE_H        = 4
+#ANVIL_V3D_TEXTURE_UIF_BLOCK_W    = 8
+#ANVIL_V3D_TEXTURE_UIF_BLOCK_H    = 8
+#ANVIL_V3D_TEXTURE_UIF_COLUMNS    = 4
+#ANVIL_V3D_TEXTURE_WIDTH_ALIGN    = 32
+#ANVIL_V3D_TEXTURE_HEIGHT_ALIGN   = 8
+#ANVIL_V3D_TEXTURE_DEST_ALIGN     = 4096
+#ANVIL_V3D_TEXTURE_SOURCE_ALIGN   = 64
+#ANVIL_V3D_TEXTURE_MAX_DIM        = 4096
+#ANVIL_V3D_TEXTURE_MAX_TIMEOUT_US = 1000000
+#ANVIL_V3D_TEXTURE_GPU_LIMIT      = $100000000
+
+; V3D 4.2 packet values. These names state their role in this module rather
+; than pretending that an opaque raw-word copy has a Vulkan color format.
+#ANVIL_V3D_TEXTURE_RAW32_TTYPE    = 29
+#ANVIL_V3D_TEXTURE_TFU_UIF_NO_XOR = 6
+#ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR = 4
+
+Structure AvkV3dTexturePlan Align #PB_Structure_AlignC
+  width.i
+  height.i
+  sourcePitch.i
+  sourceStrideTexels.i
+  sourceReadBytes.i
+  paddedWidth.i
+  paddedHeight.i
+  destinationBytes.i
+  texelBytes.i
+  rawTextureType.i
+  tfuOutputFormat.i
+  textureMemoryFormat.i
+  outputPadBlocks.i
+EndStructure
+
+Structure AvkV3dTextureTransfer Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
+  sourcePitch.i
+  timeoutUs.i
+EndStructure
+
+Procedure avkV3dTexturePlanClear(*plan.AvkV3dTexturePlan)
+  If *plan = 0 : ProcedureReturn 0 : EndIf
+  *plan\width = 0
+  *plan\height = 0
+  *plan\sourcePitch = 0
+  *plan\sourceStrideTexels = 0
+  *plan\sourceReadBytes = 0
+  *plan\paddedWidth = 0
+  *plan\paddedHeight = 0
+  *plan\destinationBytes = 0
+  *plan\texelBytes = 0
+  *plan\rawTextureType = 0
+  *plan\tfuOutputFormat = 0
+  *plan\textureMemoryFormat = 0
+  *plan\outputPadBlocks = 0
+EndProcedure
+
+; Pure, side-effect-free layout planning. The 4096 bound is this component's
+; supported subset, not a claim that IOS's 16-bit dimensions are exhausted.
+; It also makes every multiplication below provably fit a signed 64-bit .i.
+Procedure.i AnvilVkV3dTexturePlanBuild(width.i, height.i, sourcePitch.i, *plan.AvkV3dTexturePlan)
+  Protected rowBytes.i
+  Protected paddedW.i
+  Protected paddedH.i
+  Protected readBytes.i
+  Protected dstBytes.i
+
+  If *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  avkV3dTexturePlanClear(*plan)
+
+  If width < 1 Or width > #ANVIL_V3D_TEXTURE_MAX_DIM
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If height < 1 Or height > #ANVIL_V3D_TEXTURE_MAX_DIM
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+
+  rowBytes = width * #ANVIL_V3D_TEXTURE_TEXEL_BYTES
+  If sourcePitch < rowBytes Or (sourcePitch % #ANVIL_V3D_TEXTURE_TEXEL_BYTES) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  ; IIS is one 32-bit register. Keeping the byte pitch below the 32-bit GPU
+  ; address-space limit prevents silent truncation before division by four.
+  If sourcePitch >= #ANVIL_V3D_TEXTURE_GPU_LIMIT
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+
+  paddedW = ((width + #ANVIL_V3D_TEXTURE_WIDTH_ALIGN - 1) / #ANVIL_V3D_TEXTURE_WIDTH_ALIGN) * #ANVIL_V3D_TEXTURE_WIDTH_ALIGN
+  paddedH = ((height + #ANVIL_V3D_TEXTURE_HEIGHT_ALIGN - 1) / #ANVIL_V3D_TEXTURE_HEIGHT_ALIGN) * #ANVIL_V3D_TEXTURE_HEIGHT_ALIGN
+  readBytes = (sourcePitch * (height - 1)) + rowBytes
+  dstBytes = paddedW * paddedH * #ANVIL_V3D_TEXTURE_TEXEL_BYTES
+
+  If readBytes < rowBytes Or readBytes >= #ANVIL_V3D_TEXTURE_GPU_LIMIT
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If dstBytes < rowBytes Or dstBytes >= #ANVIL_V3D_TEXTURE_GPU_LIMIT
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+
+  *plan\width = width
+  *plan\height = height
+  *plan\sourcePitch = sourcePitch
+  *plan\sourceStrideTexels = sourcePitch / #ANVIL_V3D_TEXTURE_TEXEL_BYTES
+  *plan\sourceReadBytes = readBytes
+  *plan\paddedWidth = paddedW
+  *plan\paddedHeight = paddedH
+  *plan\destinationBytes = dstBytes
+  *plan\texelBytes = #ANVIL_V3D_TEXTURE_TEXEL_BYTES
+  *plan\rawTextureType = #ANVIL_V3D_TEXTURE_RAW32_TTYPE
+  *plan\tfuOutputFormat = #ANVIL_V3D_TEXTURE_TFU_UIF_NO_XOR
+  *plan\textureMemoryFormat = #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
+  *plan\outputPadBlocks = 0
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
+; True only when [address, address+bytes) lies wholly in the declared mapped
+; GPU window. Written with differences, not unchecked end-address additions.
+Procedure.i avkV3dTextureRangeInWindow(windowBase.i, windowBytes.i, address.i, bytes.i)
+  If windowBase <= 0 Or (windowBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 : ProcedureReturn 0 : EndIf
+  If windowBytes < 1 Or windowBytes > (#ANVIL_V3D_TEXTURE_GPU_LIMIT - windowBase) : ProcedureReturn 0 : EndIf
+  If address < windowBase Or bytes < 1 Or bytes > windowBytes : ProcedureReturn 0 : EndIf
+  If (address - windowBase) > (windowBytes - bytes) : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Exact half-open overlap test, also expressed without end-address overflow.
+Procedure.i avkV3dTextureRangesOverlap(a.i, aBytes.i, b.i, bBytes.i)
+  If a <= b
+    If (b - a) < aBytes : ProcedureReturn 1 : EndIf
+  Else
+    If (a - b) < bBytes : ProcedureReturn 1 : EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Validate everything before changing the TFU descriptor, then issue the five
+; low-level operations in Mesa's job order. Any failure returns immediately;
+; no later operation can turn a refused or partially described job into work.
+Procedure.i AnvilVkV3dTextureConvert(*transfer.AvkV3dTextureTransfer, *plan.AvkV3dTexturePlan)
+  Protected rc.i
+
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *transfer = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+
+  rc = AnvilVkV3dTexturePlanBuild(*transfer\width, *transfer\height, *transfer\sourcePitch, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+
+  If *transfer\timeoutUs < 1 Or *transfer\timeoutUs > #ANVIL_V3D_TEXTURE_MAX_TIMEOUT_US
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*transfer\sourceBase % #ANVIL_V3D_TEXTURE_SOURCE_ALIGN) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*transfer\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If *transfer\sourceBytes < *plan\sourceReadBytes
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If *transfer\destinationBytes < *plan\destinationBytes
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangeInWindow(*transfer\windowBase, *transfer\windowBytes, *transfer\sourceBase, *plan\sourceReadBytes) = 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangeInWindow(*transfer\windowBase, *transfer\windowBytes, *transfer\destinationBase, *plan\destinationBytes) = 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangesOverlap(*transfer\sourceBase, *plan\sourceReadBytes, *transfer\destinationBase, *plan\destinationBytes) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP
+  EndIf
+
+  rc = V3dTfuBegin(*plan\width, *plan\height, *plan\rawTextureType)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = V3dTfuSourceRaster(*transfer\sourceBase, *plan\sourceStrideTexels, *plan\sourceReadBytes)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = V3dTfuDest(*transfer\destinationBase, *plan\tfuOutputFormat, *plan\destinationBytes)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = V3dTfuSubmit()
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  ProcedureReturn V3dTfuWait(*transfer\timeoutUs)
+EndProcedure

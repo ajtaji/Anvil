@@ -1,0 +1,1408 @@
+; ======================================================================
+;  x509.pi4 - minimal X.509 certificate-chain validation, ON THE
+;             RASPBERRY PI 4 (BCM2711, AArch64)
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2016 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "RaspberryPi4/Lib/x509.pi4"
+;
+;  This is the HOST half of the "minimal" X.509 engine. The parsing,
+;  chain-walk, OID matching, validity comparison ordering and extension
+;  handling all live in AHEAD-OF-TIME threaded bytecode (the x509_blob
+;  include, lifted from the engine's T0 source by tools/t0gen.py). This
+;  file supplies the native words that bytecode calls out to, plus a
+;  driver that feeds a chain through it and reads back a verdict.
+;
+;  X.509 IS PUBLIC DATA. Certificates travel on the wire in the clear, so
+;  nothing here is constant-time and nothing should be - there is no
+;  secret to leak while parsing a certificate. (There is NO certificate-
+;  transparency requirement in scope either; CT is a policy layer above
+;  chain validation and is out of this module.) The secret-bearing work -
+;  the modular exponent for RSA, the point multiply for ECDSA - is reached
+;  ONLY through the signature-verify seam below and carries its own
+;  constant-time discipline in its own module.
+;
+; ======================================================================
+;  THE VERDICT IS A CODE. IT IS NOT A FLAG AND IT IS NOT A MASK.
+; ----------------------------------------------------------------------
+;  #X509ERR_OK IS 32. Test the result of X509ValidateChain as
+;  `= #X509ERR_OK`, never as "non-zero" (32 is non-zero and so is 62),
+;  never as `= 1`, and never as `= $FFFFFFFF`.
+;
+;  THIS CRYPTO FAMILY NOW HAS THREE VERDICT CONVENTIONS ON THIS PART and
+;  mixing them is a trap, so all three are written here:
+;
+;      GcmDecrypt     a MASK      test `= $FFFFFFFF`
+;      EcP256Mul      a FLAG      test `= 1`
+;      EcdsaVrfy      a FLAG      1 ok / 0 bad / -1 not linked
+;      X509Validate*  a CODE      test `= #X509ERR_OK` (32)
+;
+;  The reason this matters more here than anywhere else is that a
+;  validator that answers the WRONG NON-OK CODE still looks like a
+;  working validator to a caller that only asks "did it fail". The gate
+;  for this file therefore checks the NAME of every refusal, not merely
+;  that a refusal happened - see tools/a64/a64_x509_check.py.
+;
+; ======================================================================
+;  THE PUBLIC API
+; ----------------------------------------------------------------------
+;    X509ResetAnchors()
+;        forget all configured trust anchors.
+;
+;    X509AddAnchorRSA(isCA, dnAddr, dnLen, nAddr, nLen, eAddr, eLen)
+;    X509AddAnchorEC (isCA, dnAddr, dnLen, curve, qAddr, qLen)
+;        register a trust anchor. isCA<>0 marks a CA anchor (used to sign
+;        the chain); isCA=0 marks a directly-trusted end-entity key (key
+;        pinning - matched by DN hash + public key, no signature needed).
+;
+;    X509ValidateChain(certsAddr, lensAddr, count, serverAddr, serverLen,
+;                      unixTime)
+;        Validate a chain of `count` DER certificates. certsAddr points at
+;        an array of `count` cell-sized addresses (EE first); lensAddr at a
+;        matching array of lengths. serverAddr/serverLen give the expected
+;        server name (serverLen<0 => no name check). unixTime is the
+;        seconds-since-1970 date to check validity against. Returns the
+;        engine verdict code in X509Err (see #X509ERR_*): #X509ERR_OK (32)
+;        means validated. On success the decoded end-entity public key is
+;        available through X509EePkeyType and the X509EePkey* globals.
+;
+;  > THE CALLER'S ARRAY-OF-CELLS CONTRACT, ON THIS PART.  certsAddr and
+;  > lensAddr point at arrays of `.i` CELLS - `Dim gC.i[n]` - and A CELL
+;  > IS EIGHT BYTES HERE.  The stride is #X_CELL and the read is PeekI,
+;  > which reads eight.  Do NOT hand this procedure a `.l` or `.n` array
+;  > and do not compute the addresses yourself: `@gC` is the base and the
+;  > library does the arithmetic.  This is the line the port got wrong -
+;  > see SHAPE 1 below.
+;
+;  THE SIGNATURE-VERIFY SEAM (module M9 ecdsa / M10 rsa wire in here).
+;  ----------------------------------------------------------------------
+;  Signature checks call two seam procedures. They are NOT implemented
+;  here (a library never includes another library). The MAIN program must
+;  define #X509_SIG_LINKED before including this file: 0 means the seam is
+;  stubbed here (the loud stubs below answer "not linked" with -1, and any
+;  chain that reaches a signature check ends with #X509ERR_SEAM (200) so the
+;  gap is impossible to miss); 1 means the main has already included the
+;  ecdsa and rsa modules - which define RsaVrfy / EcdsaVrfy - ahead of this
+;  file, so the stubs are compiled out and real verification runs.
+;
+;    RsaSetPubKey(nAddr, nLen, eAddr, eLen)
+;        install the public key the next RsaVrfy uses.
+;    RsaVrfy(sigAddr, sigLen, hashOidAddr, hashLen, outAddr)
+;                                        -> 1 ok / 0 bad / -1 unlinked
+;        PKCS#1 v1.5 verify: recover the signed hash into outAddr (hashLen
+;        bytes); the caller compares it against the computed TBS hash.
+;
+;    EcdsaVrfy(curve, hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;                                        -> 1 ok / 0 bad / -1 unlinked
+;        ECDSA verify of the DER signature over the hash at hashAddr.
+;
+;  > THE RSA SEAM IS SPLIT HERE, AND IT IS ARITY AND NOT WIDTH THAT DID
+;  > IT.  The 32-bit families declare ONE nine-argument RsaVrfy.  This
+;  > backend passes EIGHT and refuses a ninth with a FRONTEND FATAL
+;  > ERROR - not a warning, so the portable spelling does not compile on
+;  > this part at all, neither the declaration nor the call.  The four
+;  > public-key arguments therefore move into an added RsaSetPubKey,
+;  > which is EXACTLY the split RaspberryPi4/Lib/rsa.pi4 already made
+;  > against the same wall and already exports.  The payoff is that the
+;  > RSA half of the seam is LINKABLE on this part, where the .pico2
+;  > proof has to keep it stubbed.  One addition and one same-name
+;  > signature change, both declared in tools/check_tls_twins.py.
+;
+;  REQUIRES (the MAIN file lists these, in order, before this one):
+;    * t0vm      - the bytecode VM this engine runs on.
+;    * sha256    - the TBS hash and the DN hash are both SHA-256 here.
+;                  ON THIS PART THAT FILE IS Anvil/Core/sha256.pbi, not
+;                  RaspberryPi4/Lib/sha256.pi4: it moved into the shared
+;                  Anvil core when Anvil became a real bootloader and the
+;                  Arduino UNO Q includes it from there.
+;    * x509_blob - the lifted engine bytecode (defines T0LoadX509 and the
+;                  #T0N_* native ids serviced below).
+;    * ecdsa, rsa (optional) - the signature-verify seam. Absent => stub.
+;  It includes none of them itself (house rule: a library never includes a
+;  library). It also turns EnableExplicit on for your program.
+;
+;  ======================================================================
+;   .i IS 64 BITS HERE.  THE FOUR-SHAPE AUDIT, PLUS THE FIFTH
+;  ======================================================================
+;
+;  The ways a 32-bit portable core breaks on this part were measured in
+;  Anvil/Core/sha256.pbi, RaspberryPi4/Lib/gcm.pi4,
+;  RaspberryPi4/Lib/bignum.pi4 and RaspberryPi4/Lib/t0vm.pi4.  Every one
+;  was looked for here and the finding is recorded either way - "not
+;  present" is a result, not a silence.
+;
+;  SHAPE 1 - AN ARRAY ELEMENT IS EIGHT BYTES, NOT FOUR.
+;      PRESENT, AND IT IS THE ONE REAL DEFECT THIS PORT FOUND.  The
+;      distinction that matters is INDEXED ACCESS versus MANUAL ADDRESS
+;      ARITHMETIC, and this file has both.
+;
+;      SAFE - the compiler scales the index, so the eight-byte element
+;      costs memory and nothing else:
+;        * the eleven anchor tables `Dim xAnc*.i[#X_MAX_ANCHORS]` are
+;          only ever read as `xAncCA[u]`, `xAncDnAddr[u]` and so on.
+;          Eleven arrays x 6 entries x 8 bytes = 528 bytes here against
+;          264 on a Pico.  That is the whole cost.
+;        * every other array in the file - xRam, xTbsSnap, xDnSnap,
+;          xTbsHash, xHashByte, xTmpHash, xEePkey - is `.a`, ONE byte
+;          per element on every family, and `@xRam[#X_pkey_data + nlen]`
+;          / `@xEePkey[nlen]` are indexed address-of on a `.a` array and
+;          scale by one.
+;
+;      THE DEFECT - X509ValidateChain read the caller's certificate
+;      array with MANUAL arithmetic:
+;
+;          certAddr = PeekI(certsAddr + i * 4)   ; cell-sized array
+;          certLen  = PeekI(lensAddr + i * 4)    ; (32-bit targets)
+;
+;      and the comment says "32-bit targets" out loud.  BOTH HALVES ARE
+;      WRONG HERE AND THEY ARE WRONG SEPARATELY: PeekI reads EIGHT bytes
+;      on this part, and the stride 4 is half a cell.  Element 0 happens
+;      to come back right; from element 1 onwards the read straddles the
+;      high half of one cell and the low half of the next, so a
+;      TWO-CERTIFICATE CHAIN reads a garbage address and a garbage
+;      length for its issuer.  A one-certificate chain never notices,
+;      which is exactly why the gate for this file carries
+;      multi-certificate chains and why mutation M1 restores the stride
+;      and must die.
+;
+;      Fixed by naming the contract instead of hiding it: #X_CELL is the
+;      caller's cell size and the stride and the read width are both
+;      that.  The contract is written into the API block above, because
+;      the shape lands on the CALLER as much as on this file - a caller
+;      that declares `Dim gC.l[8]` compiles and is wrong.
+;
+;      THE CONTEXT-RAM OFFSETS ARE FINE, and every one was checked
+;      rather than assumed.  #X_key_usages(0) #X_cert_signer_key_type(1)
+;      #X_cert_sig_hash_len(2) #X_cert_sig_hash_oid(4) #X_cert_sig_len(6)
+;      #X_min_rsa_size(8) #X_cert_length(12) #X_num_certs(16)
+;      #X_current_dn_hash(32) #X_next_dn_hash(96) #X_saved_dn_hash(160)
+;      #X_pad(224) #X_pkey_data(480) #X_cert_sig(1000) are BYTE offsets
+;      into a `.a` array and are unchanged by the word size; the
+;      declared regions abut without overlapping (224+256=480,
+;      480+520=1000, 1000+512=1512) and the last ends inside
+;      #X_RAM_SIZE(2048).  They MUST also stay equal to the
+;      field=offset map t0gen.py was given when the blob was lifted, and
+;      that map is what the blob's own get/set words encode - so an
+;      "improvement" here silently rewrites the bytecode's idea of where
+;      the signature lives.
+;
+;  SHAPE 2 - PeekL SIGN-EXTENDS, AND SO DOES PeekB.
+;      NOT PRESENT.  There is no PeekL, no PeekB, no PokeL and no Read.b
+;      in this file.  DER PARSING IS ALL BYTE READS and every one of
+;      them is `PeekA(...) & 255` or a read of the `.a` context array;
+;      the 32-bit copies were already written that way, because a length
+;      byte of $80 read signed is not 128 on a Cortex-M0+ either.  The
+;      only Peek that is not a byte read is the PeekI of SHAPE 1, and it
+;      is deliberate: it reads a whole cell.
+;
+;  SHAPE 3 - `<<` DOES NOT DISCARD AT BIT 31.
+;      PRESENT IN EXACTLY ONE PLACE, Xr32's four-byte assembly:
+;
+;          (b0) | (b1 << 8) | (b2 << 16) | (b3 << 24)
+;
+;      On a 32-bit `.i` a top byte of $80 or more lands in the sign bit
+;      and the result is NEGATIVE; here it does not and the result is
+;      the positive value 0..$FFFFFFFF.  For the file's own use that is
+;      strictly better - #X_cert_length and #X_num_certs are unsigned
+;      quantities and Xr32 now returns them unsigned - and
+;      XrSet32/XrSet16/XrSet8 mask every byte on the way out, so a
+;      negative cell stores correctly either way.
+;
+;      IT IS NOT BETTER AT ONE PLACE: the boundary where a host value
+;      becomes a T0 CELL.  t0vm.pi4's contract is that a cell holds the
+;      SIGN-EXTENDED int32 value, so -1 is $FFFFFFFFFFFFFFFF and never
+;      $00000000FFFFFFFF, and a native word pushing something wider than
+;      31 bits must push T0Norm(v).  XnMem's get32 is the ONLY native in
+;      this file that can push such a value, so it is the only one
+;      wrapped - which is precisely what t0vm.pi4's own #T0OP_GET32 does
+;      one file over.  Every other push here is a byte, a small count, a
+;      verdict code, 0 or -1, and all of those are already canonical.
+;      Mutation M3 removes the wrapper and the gate drives XnMem
+;      directly to watch it die at full 64-bit width.
+;
+;  SHAPE 4 - A 32-BIT COUNTER NEVER WRAPS.
+;      NOT PRESENT.  The only counter in the file is X509RunOneCert's
+;      `guard`, an `.i` that is compared against a literal 20000000 and
+;      is not allowed to wrap by design - it exists to stop a runaway
+;      bytecode program, and a wider register makes it strictly harder
+;      to fool.  #X_num_certs is a u32 in the context RAM, but
+;      XrSet32 truncates to four bytes by construction and a chain has
+;      single digits of certificates in it.
+;
+;  ---- THE FIFTH, THE ONE THAT ACTUALLY BITES --------------------------
+;
+;  `>> 31` AS A SIGN TEST AND `x ! $FFFFFFFF` AS A LOGICAL NOT.
+;      NOT PRESENT, AND THAT IS A MEASUREMENT: the file contains NO `!`
+;      operator at all, no `$FFFFFFFF`, and no right shift other than
+;      the three `>> 8 / >> 16 / >> 24` inside XrSet32 that immediately
+;      mask with `& 255`.  Every decision in this engine is spelled as
+;      an ordinary `If`, and every verdict it produces is a small
+;      LITERAL CODE assigned to xErr - never a mask built out of a sign
+;      bit.  That is why the file that decides whether to trust a
+;      stranger's certificate needed no rewriting for the shape that
+;      made GcmDecrypt accept a forged tag.
+;
+;      SAYING SO IS NOT ENOUGH, because there is no diff for a reviewer
+;      to read.  tools/a64/a64_x509_check.py therefore PLANTS the shape:
+;      mutations M4 and M5 respell X509VerifySig's two "did the
+;      signature verify" tests and X509RunOneCert's terminal test in the
+;      GcmDecrypt form, and the sweep records what happens.  The audit
+;      is swept, not asserted.
+;
+;  ---- ONE MEASURED BEHAVIOURAL DIFFERENCE THAT IS NOT A SHAPE --------
+;
+;  THE VALIDITY DATE ARITHMETIC REACHES A DIFFERENT BRANCH HERE, and it
+;  is worth writing down because it means this part tests MORE than the
+;  32-bit families do rather than less.  The shared gate's "expired"
+;  case passes unixTime = 4070908800 (2099-01-01), which does not fit a
+;  signed 32-bit integer: on the Picos it arrives negative, the day
+;  number lands in 1963, and the case is refused by the notBefore branch
+;  of check-validity-range.  Here the literal is exact, the day number
+;  is 766645, and the case is refused by the notAfter branch - the one
+;  the case is named after.  Both answer #X509ERR_EXPIRED (54); only on
+;  this part do the "expired" and "notBefore" cases exercise the two
+;  different sides of the comparison.
+;
+;  ======================================================================
+;   WHAT IS *NOT* DIFFERENT
+;  ======================================================================
+;
+;  THE WHOLE 64-BIT DIFF IS TWO LINES AND A CONSTANT: the cell stride,
+;  the T0Norm at the get32 push, and #X_CELL naming the first.  Nothing
+;  else in this file changed for the word size, and the reason is where
+;  the width lives - this file is byte handling, `.a` array indexing and
+;  calls into t0vm and sha256, and the two modules that DO compute on
+;  32-bit words paid for the width once each in their own file.
+;
+;  The RSA seam split is the OTHER divergence and it is not a 64-bit
+;  question at all; it is the eight-argument calling convention, and it
+;  is argued in the seam block above.
+;
+;  x509_blob.pi4 is PURE DATA and is byte-identical, below its header,
+;  to RP2350/Lib/x509_blob.pico2. It is not written, it is lifted; see
+;  that file's header for how the .pi4 copy was produced and what gates
+;  it.
+;
+;  PROOF STATUS (Raspberry Pi 4 / Cortex-A72, AArch64): builds clean for
+;  pi4; runs the lifted engine bytecode on the landed t0vm.pi4 over the
+;  SAME real captured certificate chains the three 32-bit families run
+;  (tools/a64/a64_x509_check.py parses them out of tools/x509_proof_gen.py
+;  and tools/ecdsa_x509_gen.py rather than carrying a copy), under the
+;  A64 model.  EVERY POSITION OF THE SEAM SWITCH IS RUN:
+;    * MODE A, #X509_SIG_LINKED = 0.  Every non-signature verdict is
+;      produced BY NAME - direct-trust EC and RSA validate (32), expired
+;      (54), notBefore (54), bad server name (56), DN mismatch on a
+;      broken two-certificate chain (55), untrusted root (62), empty
+;      chain (35) - and both real CA chains stop at #X509ERR_SEAM (200),
+;      never at OK.
+;    * MODE B, #X509_SIG_LINKED = 1 with ecdsa.pi4 linked and the RSA
+;      half locally stubbed, which is exactly the image
+;      ecdsaX509Proof.pico2 builds.  The real EC chain that stopped at
+;      200 comes back #X509ERR_OK (32); a flipped signature byte on the
+;      end-entity, a flipped byte on the intermediate and a malformed
+;      signature encoding each come back #X509ERR_BAD_SIGNATURE (52);
+;      the RSA chain still reports 200.
+;    * MODE C, #X509_SIG_LINKED = 1 with BOTH ecdsa.pi4 and rsa.pi4
+;      linked - which no 32-bit family can build, because the split
+;      above is what makes the RSA seam satisfiable.  The RSA chain
+;      that answered 200 in modes A and B comes back #X509ERR_OK (32),
+;      and the same tamper applied to an RSA signature comes back 52.
+;  Mutation-swept under that gate's --mutate, and structurally twinned
+;  under tools/check_tls_twins.py --cross x509.
+;  NOTHING HERE HAS RUN ON SILICON.
+;
+;  ONLY SHA-256 signature/DN hashing is wired (the landed hash). A chain
+;  signed under SHA-1/384/512 is reported UNSUPPORTED, loudly, not guessed.
+;
+;  CONTEXT RAM IS BOUNDS-CHECKED HERE, NOT IN THE VM. This engine owns its
+;  own context array because it was lifted with --native-ram, which takes
+;  the six memory words out of the VM - and out of reach of the VM's own
+;  bounds guard. Every offset that arrives from the T0 data stack is
+;  width-checked by XrInRange below; out of range is #X509ERR_RAM_BOUNDS
+;  (900) and a halted machine, never a wrapped read or a neighbour write.
+;
+;  THE KEY BUFFER IS A SECOND BOUND, NOT THE SAME ONE. The decoded
+;  end-entity key is copied out of that array into xEePkey, which is a
+;  quarter of its size, and the copy's length is a stack value like any
+;  offset. XrInRange cannot see that write at all, so XkeyFits guards it
+;  (and the two verify natives that hand the same lengths out as a raw
+;  address) with its own named refusal, #X509ERR_KEY_BOUNDS (901).
+;
+;  THE GUARD'S FORM IS WHAT MAKES IT WIDTH-INDEPENDENT, and that is the
+;  reason this copy takes the 32-bit copies' spelling instead of a
+;  re-derivation of it. `n > SIZE - e` is correct at every width;
+;  `n + e > SIZE` is correct at none. The 32-bit probe's wrap case - two
+;  $7FFFFFFF halves whose naive sum lands at -2 - does NOT reproduce here,
+;  because `.i` is 64 bits and those two halves sum to 4,294,967,294 with
+;  room to spare. That is not the guard being unnecessary; it is the
+;  hostile pair having moved. The Pi 4 probe uses $7FFFFFFFFFFFFFFF, which
+;  wraps this part's arithmetic exactly as the 32-bit pair wraps theirs,
+;  and the naive test is run beside the real one so the report shows it
+;  answering "fits" on the line above the one that refuses.
+; ======================================================================
+
+EnableExplicit
+; ==== PORTABLE CORE A64 BEGIN ====
+
+; ----------------------------------------------------------------------
+;  Verdict codes (BearSSL BR_ERR_X509_*), plus three of our own.
+; ----------------------------------------------------------------------
+#X509ERR_OK                 = 32
+#X509ERR_UNSUPPORTED        = 49
+#X509ERR_WRONG_KEY_TYPE     = 51
+#X509ERR_BAD_SIGNATURE      = 52
+#X509ERR_TIME_UNKNOWN       = 53
+#X509ERR_EXPIRED            = 54
+#X509ERR_DN_MISMATCH        = 55
+#X509ERR_BAD_SERVER_NAME    = 56
+#X509ERR_NOT_CA             = 58
+#X509ERR_WEAK_PUBLIC_KEY    = 60
+#X509ERR_NOT_TRUSTED        = 62
+#X509ERR_EMPTY_CHAIN        = 35
+#X509ERR_SEAM               = 200   ; signature seam not linked (M9/M10)
+#X509ERR_GUARD              = 199   ; run guard tripped (should never fire)
+; Same number, same meaning, same shape as the t0vm refusal of the same
+; name: a context-RAM offset outside the region. Whichever engine owns the
+; array, a 900 in a log means exactly one thing.
+#X509ERR_RAM_BOUNDS         = 900   ; context-RAM offset out of range
+; A SECOND bound, over a DIFFERENT array. 900 is the context RAM; 901 is
+; the permanent end-entity key buffer, which is a quarter of its size and
+; is not covered by XrInRange at all. Two arrays, two numbers, so a log
+; line says which one was overrun.
+#X509ERR_KEY_BOUNDS         = 901   ; decoded key longer than xEePkey
+
+; ----------------------------------------------------------------------
+;  Context-RAM layout. These offsets MUST match the field=offset map given
+;  to tools/t0gen.py when x509_blob was lifted: the bytecode's get/set
+;  words and the native words below both address this one flat array, so a
+;  single layout serves both. The engine's key/signature/scratch buffers
+;  far exceed the t0vm's own small t0_ram, which is why the six memory ops
+;  were lifted as natives (--native-ram) onto this host-owned array.
+; ----------------------------------------------------------------------
+#X_key_usages           = 0     ; u8
+#X_cert_signer_key_type = 1     ; u8
+#X_cert_sig_hash_len    = 2     ; u8
+#X_cert_sig_hash_oid    = 4     ; u16 (offset into the DATA block)
+#X_cert_sig_len         = 6     ; u16
+#X_min_rsa_size         = 8     ; u16 (min modulus bytes, minus 128)
+#X_cert_length          = 12    ; u32
+#X_num_certs            = 16    ; u32
+#X_current_dn_hash      = 32    ; 32 bytes (subject DN hash)
+#X_next_dn_hash         = 96    ; 32 bytes (issuer DN hash, this cert)
+#X_saved_dn_hash        = 160   ; 32 bytes (issuer DN hash, carried)
+#X_pad                  = 224   ; 256 bytes (OID / name / value scratch)
+#X_pkey_data            = 480   ; 520 bytes (currently decoded key)
+#X_cert_sig             = 1000  ; 512 bytes (saved signature)
+#X_RAM_SIZE             = 2048
+
+#X_DNHASH_LEN = 32              ; SHA-256 digest length
+
+; THE CALLER'S ARRAY-OF-CELLS STRIDE.  X509ValidateChain is handed
+; two arrays of `.i` cells - `Dim gC.i[n]`, `@gC` as the base - and
+; ON THIS PART A CELL IS EIGHT BYTES.  The 32-bit copies hard-code 4
+; at the read site with the comment "32-bit targets"; naming it is
+; how the contract stops being a comment.  PeekI reads exactly this
+; many bytes here, so the stride and the access width are the same
+; number and cannot drift apart.  SizeOf(Integer) is not accepted in
+; a constant declaration by this compiler (measured: SYNTAX ERROR,
+; Invalid constant declaration), so it is written out.
+#X_CELL = 8
+
+Global Dim xRam.a[#X_RAM_SIZE]
+
+; ---- run state / verdict ----
+Global X509Err.i               ; verdict, read by the caller and the gate
+Global xErr.i                  ; engine err set by fail / trust natives
+
+; ---- input feed (the "hbuf/hlen" of the C driver) ----
+Global xHbuf.i
+Global xHlen.i
+
+; ---- hashing: two running SHA-256 kept as 104-byte snapshots so the TBS
+;      hash and the DN hash can both absorb the same byte stream through
+;      the one landed single-context hasher ----
+Global xDoMhash.i
+Global xDoDnhash.i
+Global Dim xTbsSnap.a[104]
+Global Dim xDnSnap.a[104]
+Global Dim xTbsHash.a[64]      ; finished TBS hash
+Global Dim xHashByte.a[4]      ; 1-byte feed scratch (for Sha256Update)
+Global Dim xTmpHash.a[64]      ; scratch for anchor DN hashing / recovered hash
+
+; ---- expected server name ----
+Global xServerAddr.i
+Global xServerLen.i            ; <0 means "no server name expected"
+
+; ---- validity date, in the engine's day/second epoch ----
+Global xValidDays.i
+Global xValidSecs.i
+
+; ---- decoded end-entity public key (result of a validated chain) ----
+Global X509EePkeyType.i        ; 1=RSA, 2=EC, 0=none
+Global X509EeNAddr.i
+Global X509EeNLen.i
+Global X509EeEAddr.i
+Global X509EeELen.i
+Global X509EeCurve.i
+Global X509EeQAddr.i
+Global X509EeQLen.i
+; The permanent EE key buffer, and its capacity as a NAMED constant so the
+; array and the bound that protects it are one fact and cannot drift. It
+; matches the 520-byte #X_pkey_data window on purpose - the copy below
+; moves one into the other - but they are separate arrays and each needs
+; its own guard. See XkeyFits.
+#X_EEPKEY_SIZE = 520
+Global Dim xEePkey.a[#X_EEPKEY_SIZE]   ; permanent EE key bytes
+
+; ---- currently-decoded key type (for direct trust / verify) ----
+Global xPkeyType.i
+
+; ---- trust anchors ----
+#X_MAX_ANCHORS = 6
+Global xNumAnchors.i
+Global Dim xAncCA.i[#X_MAX_ANCHORS]
+Global Dim xAncDnAddr.i[#X_MAX_ANCHORS]
+Global Dim xAncDnLen.i[#X_MAX_ANCHORS]
+Global Dim xAncType.i[#X_MAX_ANCHORS]
+Global Dim xAncNAddr.i[#X_MAX_ANCHORS]
+Global Dim xAncNLen.i[#X_MAX_ANCHORS]
+Global Dim xAncEAddr.i[#X_MAX_ANCHORS]
+Global Dim xAncELen.i[#X_MAX_ANCHORS]
+Global Dim xAncCurve.i[#X_MAX_ANCHORS]
+Global Dim xAncQAddr.i[#X_MAX_ANCHORS]
+Global Dim xAncQLen.i[#X_MAX_ANCHORS]
+
+; ----------------------------------------------------------------------
+;  CONTEXT-RAM BOUNDS - the one check that stands between a hostile input
+;  and the globals next door.
+;
+;  This engine was lifted with --native-ram, so the six context-memory
+;  words are NOT executed by the t0vm and never meet its T0RamInRange:
+;  they arrive here as native words, with the offset popped straight off
+;  the T0 data stack. A T0 program COMPUTES those offsets out of the bytes
+;  it is parsing, and the bytes THIS engine parses are certificates handed
+;  over by a stranger. A bare indexed access into xRam therefore lets a
+;  computed offset read - or WRITE - whatever global happens to sit beside
+;  the array, and answer as if nothing had happened. That is the
+;  silent-wrong failure this project refuses on principle.
+;
+;  So every xRam touch reached from the data stack goes through XrInRange
+;  first, and an offset outside the region is a LOUD, NAMED refusal:
+;  #X509ERR_RAM_BOUNDS lands in xErr and the machine halts (t0_ip = -1),
+;  so the driver's very next xErr test returns terminal and the caller
+;  sees the code instead of a wrong answer. Same guard, same shape and the
+;  same number as t0vm's, because it is the same hole - owning the array
+;  privately does not make the offsets trustworthy.
+;
+;  n is the access width in bytes (1, 2, 4, or a blob length). The highest
+;  byte touched is a + n - 1, so the last legal offset is #X_RAM_SIZE - n;
+;  a 32-bit access at #X_RAM_SIZE - 1 is rejected, not truncated.
+;
+;  SHAPE AUDIT ON THIS PART: a and n are .i and .i is 64 bits here, so the
+;  comparison is the same comparison the 32-bit copies make - there is no
+;  width to wrap and no sign bit at 31 to shift down. The guard is
+;  byte-for-byte the 32-bit spelling on purpose.
+; ----------------------------------------------------------------------
+Procedure.i XrInRange(a.i, n.i)
+  If a < 0 Or a > (#X_RAM_SIZE - n)
+    xErr = #X509ERR_RAM_BOUNDS
+    t0_ip = -1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Small context-RAM accessors (little-endian, as the engine's C uses).
+;  A refused read answers 0, but xErr is already set and the machine is
+;  already halted, so the 0 can never be mistaken for data.
+; ----------------------------------------------------------------------
+Procedure.i Xr8(a.i)
+  If XrInRange(a, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn xRam[a] & 255
+EndProcedure
+Procedure XrSet8(a.i, v.i)
+  If XrInRange(a, 1) = 0
+    ProcedureReturn
+  EndIf
+  xRam[a] = v & 255
+EndProcedure
+Procedure.i Xr16(a.i)
+  If XrInRange(a, 2) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (xRam[a] & 255) | ((xRam[a + 1] & 255) << 8)
+EndProcedure
+Procedure XrSet16(a.i, v.i)
+  If XrInRange(a, 2) = 0
+    ProcedureReturn
+  EndIf
+  xRam[a] = v & 255
+  xRam[a + 1] = (v >> 8) & 255
+EndProcedure
+Procedure.i Xr32(a.i)
+  If XrInRange(a, 4) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (xRam[a] & 255) | ((xRam[a + 1] & 255) << 8) | ((xRam[a + 2] & 255) << 16) | ((xRam[a + 3] & 255) << 24)
+EndProcedure
+Procedure XrSet32(a.i, v.i)
+  If XrInRange(a, 4) = 0
+    ProcedureReturn
+  EndIf
+  xRam[a] = v & 255
+  xRam[a + 1] = (v >> 8) & 255
+  xRam[a + 2] = (v >> 16) & 255
+  xRam[a + 3] = (v >> 24) & 255
+EndProcedure
+
+; A raw byte compare over the context RAM. Both ends are stack-supplied,
+; so both are ranged over the whole length before a single byte is read;
+; a refused compare answers "not equal" with xErr already set.
+Procedure.i XramEq(p1.i, p2.i, len.i)
+  Protected i.i
+  If XrInRange(p1, len) = 0
+    ProcedureReturn 0
+  EndIf
+  If XrInRange(p2, len) = 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < len
+    If xRam[p1 + i] <> xRam[p2 + i]
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SECOND BOUND - the permanent key buffer, which XrInRange does not
+;  cover and cannot.
+;
+;  When a chain validates, the end-entity key is copied OUT of the context
+;  RAM and INTO xEePkey so it outlives the parse. XrInRange guards the
+;  SOURCE of that copy; the DESTINATION is a different array, a quarter of
+;  the size, and the copy's length is popped off the T0 data stack exactly
+;  like an offset is - so it is derived from certificate bytes and gets
+;  the same treatment.
+;
+;  Reading the lifted bytecode says no certificate can drive the length
+;  past 520 today, and this was disassembled rather than assumed. One word
+;  pushes the key window as the literal pair (480, 520). The RSA path hands
+;  that pair to the integer reader, which spends one unit of capacity per
+;  byte it stores and refuses the moment the remaining capacity reaches
+;  zero; the exponent is then read into the same window with whatever the
+;  modulus left behind, so modulus + exponent sum to at most 520 by
+;  construction. The EC path is blunter - it compares the bit-string length
+;  against the same 520 before it copies a byte. Both refuse with the
+;  decoder's own "value too large" verdict, 50.
+;
+;  Note the array holds exactly #X_EEPKEY_SIZE bytes, indices 0 to
+;  #X_EEPKEY_SIZE - 1, so a pair summing to exactly the capacity fills it
+;  and writes nothing beyond. That is the last legal size and it is an
+;  ACCEPTANCE case in the probe, not a refusal.
+;
+;  That is not a reason to leave the copy unbounded. The cap lives in a
+;  GENERATED data blob marked "do not edit by hand, regenerate", and the
+;  window it caps at is a number that happens to equal #X_EEPKEY_SIZE -
+;  nothing ties the two together and neither file mentions the other. A
+;  blob regenerated from an upstream configured for larger keys (8192-bit
+;  RSA is 1024 bytes of modulus alone) would overrun this buffer in
+;  silence. And the native dispatch is a public entry point: whatever is
+;  on the stack when it is called is what these cases use.
+;
+;  So the destination gets its own named refusal, #X509ERR_KEY_BOUNDS
+;  (901), in XrInRange's shape - xErr set, machine halted with t0_ip = -1,
+;  so the driver's next check returns terminal. The source is then ranged
+;  by XrInRange as usual, which keeps the read side honest even if the
+;  layout constants ever move.
+;
+;  The two do-vrfy natives get the same check for the same reason: they
+;  take the SAME two stack lengths and turn them into a raw address into
+;  xRam that leaves this file entirely, inside a pointer the verifier will
+;  read. The key window at #X_pkey_data is itself #X_EEPKEY_SIZE bytes -
+;  that is what the layout above says - so one constant is the honest
+;  bound for all four sites; if either buffer is ever resized, this
+;  constant is the thing that has to change.
+;
+;  n and e are the two halves of an RSA key (modulus, exponent); an EC key
+;  passes its q length as n and 0 as e. Written as n > SIZE - e rather
+;  than n + e > SIZE so a hostile pair cannot wrap the addition past the
+;  test - the same reason XrInRange is written a > SIZE - n.
+;
+;  SHAPE AUDIT ON THIS PART: n and e are .i and .i is 64 bits here, so
+;  this is the 32-bit spelling unchanged, deliberately. The WIDTH moved
+;  and the FORM did not have to: the pair that wraps a 64-bit add is
+;  larger than the pair that wraps a 32-bit one, and `n > SIZE - e` is
+;  correct against both without knowing which register it is running in.
+;  That is the whole argument for porting the form rather than
+;  re-deriving the test.
+; ----------------------------------------------------------------------
+Procedure.i XkeyFits(n.i, e.i)
+  If n < 0 Or e < 0 Or n > (#X_EEPKEY_SIZE - e)
+    xErr = #X509ERR_KEY_BOUNDS
+    t0_ip = -1
+    ProcedureReturn 0
+  EndIf
+  If XrInRange(#X_pkey_data, n + e) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Hash feeding. Absorb one byte (read8-low) or a chunk (read-blob-inner)
+;  into whichever running hashes are active, snapshotting around each use
+;  of the one shared hasher.
+; ----------------------------------------------------------------------
+Procedure XfeedByte(b.i)
+  xHashByte[0] = b & 255
+  If xDoMhash
+    Sha256Restore(@xTbsSnap)
+    Sha256Update(@xHashByte, 1)
+    Sha256Snapshot(@xTbsSnap)
+  EndIf
+  If xDoDnhash
+    Sha256Restore(@xDnSnap)
+    Sha256Update(@xHashByte, 1)
+    Sha256Snapshot(@xDnSnap)
+  EndIf
+EndProcedure
+
+Procedure XfeedChunk(addr.i, len.i)
+  If len <= 0
+    ProcedureReturn
+  EndIf
+  If xDoMhash
+    Sha256Restore(@xTbsSnap)
+    Sha256Update(addr, len)
+    Sha256Snapshot(@xTbsSnap)
+  EndIf
+  If xDoDnhash
+    Sha256Restore(@xDnSnap)
+    Sha256Update(addr, len)
+    Sha256Snapshot(@xDnSnap)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SIGNATURE-VERIFY SEAM. verify_signature() decides key type then
+;  calls out through RsaVrfy / EcdsaVrfy. Those live in the ecdsa/rsa
+;  modules when linked; the loud stubs return -1 ("not linked") otherwise.
+; ----------------------------------------------------------------------
+CompilerIf #X509_SIG_LINKED = 0
+; THE NINTH ARGUMENT.  This backend passes EIGHT arguments and the
+; portable seam declares NINE, so the four public-key arguments move
+; into an added RsaSetPubKey - exactly the split
+; RaspberryPi4/Lib/rsa.pi4 already made, for the same reason and
+; against the same wall.  That module's five-argument RsaVrfy IS this
+; shape: its header calls itself "the CERTIFICATE SEAM entry point"
+; and promises never to return -1, so the -1 below stays
+; unambiguous.  THIS IS NOT A PREFERENCE - the refusal is a FRONTEND
+; FATAL ERROR, so the nine-argument spelling does not compile on this
+; part at all, neither the declaration nor the call.  The payoff is
+; that the RSA half of the seam is LINKABLE here, where the .pico2
+; proof has to keep it stubbed.
+Procedure RsaSetPubKey(nPtr.i, nLen.i, ePtr.i, eLen.i)
+  ; Not yet linked (module M10). Nothing to install; the loud answer
+  ; comes from RsaVrfy below.
+  nPtr = 0 : nLen = 0 : ePtr = 0 : eLen = 0
+EndProcedure
+Procedure.i RsaVrfy(sigAddr.i, sigLen.i, hashOidAddr.i, hashLen.i, outAddr.i)
+  ; Not yet linked (module M10). Loud: -1 => #X509ERR_SEAM at the caller.
+  ProcedureReturn -1
+EndProcedure
+Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  ; Not yet linked (module M9). Loud: -1 => #X509ERR_SEAM at the caller.
+  ProcedureReturn -1
+EndProcedure
+CompilerEndIf
+
+; verify_signature(pkType, nOrCurve, ...) against the saved TBS hash and
+; the saved signature. Returns 0 on success, or a non-zero verdict code.
+;   For RSA: keyN/keyNlen/keyE/keyElen give the modulus and exponent.
+;   For EC:  keyN=curve, keyE=q address, keyElen=q length.
+Procedure.i X509VerifySig(pkType.i, keyN.i, keyNlen.i, keyE.i, keyElen.i)
+  Protected r.i
+  Protected sigAddr.i
+  Protected sigLen.i
+  Protected hashLen.i
+  Protected hashOidAddr.i
+
+  If pkType <> Xr8(#X_cert_signer_key_type)
+    ProcedureReturn #X509ERR_WRONG_KEY_TYPE
+  EndIf
+
+  sigAddr = @xRam[#X_cert_sig]
+  sigLen  = Xr16(#X_cert_sig_len)
+  hashLen = Xr8(#X_cert_sig_hash_len)
+  hashOidAddr = t0_datap + Xr16(#X_cert_sig_hash_oid)
+
+  If pkType = 1                       ; RSA
+    ; THE NINTH ARGUMENT - install the key, then verify. See the seam
+    ; block above; rsa.pi4 exports exactly this pair.
+    RsaSetPubKey(keyN, keyNlen, keyE, keyElen)
+    r = RsaVrfy(sigAddr, sigLen, hashOidAddr, hashLen, @xTmpHash)
+    If r < 0
+      ProcedureReturn #X509ERR_SEAM
+    EndIf
+    If r = 0
+      ProcedureReturn #X509ERR_BAD_SIGNATURE
+    EndIf
+    ; recovered hash must equal the computed TBS hash
+    Protected i.i
+    i = 0
+    While i < hashLen
+      If (xTmpHash[i] & 255) <> (xTbsHash[i] & 255)
+        ProcedureReturn #X509ERR_BAD_SIGNATURE
+      EndIf
+      i = i + 1
+    Wend
+    ProcedureReturn 0
+  ElseIf pkType = 2                   ; EC
+    r = EcdsaVrfy(keyN, @xTbsHash, hashLen, keyE, keyElen, sigAddr, sigLen)
+    If r < 0
+      ProcedureReturn #X509ERR_SEAM
+    EndIf
+    If r = 0
+      ProcedureReturn #X509ERR_BAD_SIGNATURE
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #X509ERR_UNSUPPORTED
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Native-word groups. Split into small procedures so no dispatch branch
+;  reaches too far for the RA4M1 assembler's relaxation (the same reason
+;  t0vm splits its primitive groups).
+; ----------------------------------------------------------------------
+
+; get16/get32/set8/set16/set32 (the context memory ops lifted as natives).
+Procedure XnMem(nid.i)
+  Protected a.i
+  Protected v.i
+  Select nid
+    Case #T0N_set8
+      a = T0Pop()
+      v = T0Pop()
+      XrSet8(a, v)
+    Case #T0N_set16
+      a = T0Pop()
+      v = T0Pop()
+      XrSet16(a, v)
+    Case #T0N_set32
+      a = T0Pop()
+      v = T0Pop()
+      XrSet32(a, v)
+    Case #T0N_get16
+      a = T0Pop()
+      T0Push(Xr16(a))
+    Case #T0N_get32
+      a = T0Pop()
+      ; SHAPE 3 AT THE ONE PLACE IT MATTERS.  Xr32's `<< 24` does not
+      ; discard at bit 31 here, so a top byte of $80 or more comes
+      ; back as a POSITIVE value up to $FFFFFFFF.  That is the right
+      ; answer for this file's own use and the WRONG SHAPE for a T0
+      ; cell: t0vm.pi4 defines a cell as the SIGN-EXTENDED int32, so
+      ; -1 must be $FFFFFFFFFFFFFFFF and never $00000000FFFFFFFF, and
+      ; its contract says a native pushing more than 31 bits pushes
+      ; T0Norm(v).  t0vm.pi4's own #T0OP_GET32 wraps the identical
+      ; expression the identical way.  This is the ONLY push in this
+      ; file that can exceed 31 bits; every other one is a byte, a
+      ; small count, a verdict code, 0 or -1.
+      T0Push(T0Norm(Xr32(a)))
+  EndSelect
+EndProcedure
+
+; read8-low, read-blob-inner, fail, zero-server-name, dn-hash-length.
+Procedure XnIo(nid.i)
+  Protected b.i
+  Protected addr.i
+  Protected len.i
+  Protected clen.i
+  Protected i.i
+  Select nid
+    Case #T0N_read8_low
+      If xHlen = 0
+        T0Push(-1)
+      Else
+        b = PeekA(xHbuf) & 255
+        xHbuf = xHbuf + 1
+        xHlen = xHlen - 1
+        XfeedByte(b)
+        T0Push(b)
+      EndIf
+    Case #T0N_read_blob_inner
+      len = T0Pop()
+      addr = T0Pop()
+      clen = xHlen
+      If clen > len
+        clen = len
+      EndIf
+      If addr <> 0
+        ; A blob destination is as stack-supplied as a set8 offset, and
+        ; its length comes off the same stack. Range the WHOLE write.
+        If XrInRange(addr, clen) = 0
+          ProcedureReturn
+        EndIf
+        i = 0
+        While i < clen
+          xRam[addr + i] = PeekA(xHbuf + i) & 255
+          i = i + 1
+        Wend
+      EndIf
+      XfeedChunk(xHbuf, clen)
+      xHbuf = xHbuf + clen
+      xHlen = xHlen - clen
+      T0Push(addr + clen)
+      T0Push(len - clen)
+    Case #T0N_fail
+      xErr = T0Pop()
+    Case #T0N_zero_server_name
+      If xServerLen < 0
+        T0Push(-1)
+      Else
+        T0Push(0)
+      EndIf
+    Case #T0N_dn_hash_length
+      T0Push(#X_DNHASH_LEN)
+  EndSelect
+EndProcedure
+
+; start/stop-tbs-hash, start/compute-dn-hash, compute-tbs-hash.
+Procedure XnHash(nid.i)
+  Protected id.i
+  Select nid
+    Case #T0N_start_tbs_hash
+      Sha256Begin()
+      Sha256Snapshot(@xTbsSnap)
+      xDoMhash = 1
+    Case #T0N_stop_tbs_hash
+      xDoMhash = 0
+    Case #T0N_start_dn_hash
+      Sha256Begin()
+      Sha256Snapshot(@xDnSnap)
+      xDoDnhash = 1
+    Case #T0N_compute_dn_hash
+      Sha256Restore(@xDnSnap)
+      Sha256End(@xRam[#X_current_dn_hash])
+      xDoDnhash = 0
+    Case #T0N_compute_tbs_hash
+      id = T0Pop()
+      If id = 4                        ; only SHA-256 is wired
+        Sha256Restore(@xTbsSnap)
+        Sha256End(@xTbsHash)
+        T0Push(32)
+      Else
+        T0Push(0)                      ; unsupported hash -> engine faults loudly
+      EndIf
+  EndSelect
+EndProcedure
+
+; blobcopy, eqOID, eqblob, offset-name-element, copy-name-element,
+; copy-name-SAN. Name gathering is not configured in this build, so the
+; three name natives operate on an empty element set (faithful no-ops).
+Procedure XnBlob(nid.i)
+  Protected len.i
+  Protected src.i
+  Protected dst.i
+  Protected i.i
+  Protected oidAddr.i
+  Protected padLen.i
+  Protected r.i
+  Select nid
+    Case #T0N_blobcopy
+      len = T0Pop()
+      src = T0Pop()
+      dst = T0Pop()
+      ; Three stack values, two of them offsets into the array. Range both
+      ; over the full length before a byte moves.
+      If XrInRange(dst, len) = 0
+        ProcedureReturn
+      EndIf
+      If XrInRange(src, len) = 0
+        ProcedureReturn
+      EndIf
+      i = 0
+      While i < len
+        xRam[dst + i] = xRam[src + i]
+        i = i + 1
+      Wend
+    Case #T0N_eqOID
+      oidAddr = t0_datap + T0Pop()
+      padLen = xRam[#X_pad] & 255
+      r = 0
+      If padLen = (PeekA(oidAddr) & 255)
+        r = -1
+        i = 0
+        While i < padLen
+          If (xRam[#X_pad + 1 + i] & 255) <> (PeekA(oidAddr + 1 + i) & 255)
+            r = 0
+            Break
+          EndIf
+          i = i + 1
+        Wend
+      EndIf
+      T0Push(r)
+    Case #T0N_eqblob
+      len = T0Pop()
+      src = T0Pop()                    ; addr2
+      dst = T0Pop()                    ; addr1
+      If XramEq(dst, src, len)
+        T0Push(-1)
+      Else
+        T0Push(0)
+      EndIf
+    Case #T0N_offset_name_element
+      T0Pop()                          ; san flag - no elements configured
+      T0Push(-1)
+    Case #T0N_copy_name_element
+      T0Pop()                          ; offbuf
+      T0Pop()                          ; ok
+    Case #T0N_copy_name_SAN
+      T0Pop()                          ; tag
+      T0Pop()                          ; ok
+  EndSelect
+EndProcedure
+
+; check-validity-range, match-server-name.
+Procedure XnCheck(nid.i)
+  Protected nbs.i
+  Protected nbd.i
+  Protected nas.i
+  Protected nad.i
+  Protected r.i
+  Protected n1.i
+  Protected n2.i
+  Protected i.i
+  Protected u.i
+  Protected c1.i
+  Protected c2.i
+  Protected ok.i
+  Select nid
+    Case #T0N_check_validity_range
+      nbs = T0Pop()
+      nbd = T0Pop()
+      nas = T0Pop()
+      nad = T0Pop()
+      If xValidDays < nbd Or (xValidDays = nbd And xValidSecs < nbs)
+        r = -1
+      ElseIf xValidDays > nad Or (xValidDays = nad And xValidSecs > nas)
+        r = 1
+      Else
+        r = 0
+      EndIf
+      T0Push(r)
+    Case #T0N_match_server_name
+      If xServerLen < 0
+        T0Push(0)
+        ProcedureReturn
+      EndIf
+      n1 = xServerLen
+      n2 = xRam[#X_pad] & 255
+      ok = 0
+      If n1 = n2
+        ok = 1
+        i = 0
+        While i < n1
+          c1 = xRam[#X_pad + 1 + i] & 255
+          c2 = PeekA(xServerAddr + i) & 255
+          If c1 >= 65 And c1 <= 90
+            c1 = c1 + 32
+          EndIf
+          If c2 >= 65 And c2 <= 90
+            c2 = c2 + 32
+          EndIf
+          If c1 <> c2
+            ok = 0
+            Break
+          EndIf
+          i = i + 1
+        Wend
+      EndIf
+      If ok = 0 And n2 >= 2 And (xRam[#X_pad + 1] & 255) = 42 And (xRam[#X_pad + 2] & 255) = 46
+        ; wildcard "*." : match the tail after the first label of the name
+        u = 0
+        While u < n1 And (PeekA(xServerAddr + u) & 255) <> 46
+          u = u + 1
+        Wend
+        u = u + 1
+        n1 = n1 - u
+        If (n2 - 2) = n1
+          ok = 1
+          i = 0
+          While i < n1
+            c1 = xRam[#X_pad + 3 + i] & 255
+            c2 = PeekA(xServerAddr + u + i) & 255
+            If c1 >= 65 And c1 <= 90
+              c1 = c1 + 32
+            EndIf
+            If c2 >= 65 And c2 <= 90
+              c2 = c2 + 32
+            EndIf
+            If c1 <> c2
+              ok = 0
+              Break
+            EndIf
+            i = i + 1
+          Wend
+        EndIf
+      EndIf
+      If ok
+        T0Push(-1)
+      Else
+        T0Push(0)
+      EndIf
+  EndSelect
+EndProcedure
+
+; Big-integer equality over two host buffers, ignoring leading zero bytes
+; (unsigned big-endian, as RSA moduli/exponents are stored).
+Procedure.i XeqBigHost(p1.i, l1.i, p2.i, l2.i)
+  Protected i.i
+  While l1 > 0 And (PeekA(p1) & 255) = 0
+    p1 = p1 + 1
+    l1 = l1 - 1
+  Wend
+  While l2 > 0 And (PeekA(p2) & 255) = 0
+    p2 = p2 + 1
+    l2 = l2 - 1
+  Wend
+  If l1 <> l2
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < l1
+    If (PeekA(p1 + i) & 255) <> (PeekA(p2 + i) & 255)
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; copy-ee-rsa-pkey, copy-ee-ec-pkey, check-direct-trust,
+; check-trust-anchor-CA, do-rsa-vrfy, do-ecdsa-vrfy.
+Procedure XnKey(nid.i)
+  Protected nlen.i
+  Protected elen.i
+  Protected qlen.i
+  Protected curve.i
+  Protected u.i
+  Protected i.i
+  Protected kt.i
+  Protected match.i
+  Select nid
+    Case #T0N_copy_ee_rsa_pkey
+      elen = T0Pop()
+      nlen = T0Pop()
+      ; Both lengths came off the data stack, so both are certificate
+      ; bytes, and together they size a write into a fixed buffer.
+      If XkeyFits(nlen, elen) = 0
+        ProcedureReturn
+      EndIf
+      i = 0
+      While i < nlen + elen
+        xEePkey[i] = xRam[#X_pkey_data + i]
+        i = i + 1
+      Wend
+      xPkeyType = 1
+      X509EePkeyType = 1
+      X509EeNAddr = @xEePkey[0]
+      X509EeNLen = nlen
+      X509EeEAddr = @xEePkey[nlen]
+      X509EeELen = elen
+    Case #T0N_copy_ee_ec_pkey
+      qlen = T0Pop()
+      curve = T0Pop()
+      ; One length here, and the same rule: it is a stack value sizing a
+      ; write into the same fixed buffer.
+      If XkeyFits(qlen, 0) = 0
+        ProcedureReturn
+      EndIf
+      i = 0
+      While i < qlen
+        xEePkey[i] = xRam[#X_pkey_data + i]
+        i = i + 1
+      Wend
+      xPkeyType = 2
+      X509EePkeyType = 2
+      X509EeCurve = curve
+      X509EeQAddr = @xEePkey[0]
+      X509EeQLen = qlen
+    Case #T0N_check_direct_trust
+      u = 0
+      While u < xNumAnchors
+        If xAncCA[u] = 0
+          ; hash the anchor DN and compare with the EE subject DN hash
+          Sha256Of(xAncDnAddr[u], xAncDnLen[u], @xTmpHash)
+          match = 1
+          i = 0
+          While i < #X_DNHASH_LEN
+            If (xTmpHash[i] & 255) <> (xRam[#X_current_dn_hash + i] & 255)
+              match = 0
+              Break
+            EndIf
+            i = i + 1
+          Wend
+          If match <> 0 And xAncType[u] = xPkeyType
+            If xPkeyType = 1
+              If XeqBigHost(X509EeNAddr, X509EeNLen, xAncNAddr[u], xAncNLen[u]) <> 0 And XeqBigHost(X509EeEAddr, X509EeELen, xAncEAddr[u], xAncELen[u]) <> 0
+                xErr = #X509ERR_OK
+                ProcedureReturn
+              EndIf
+            ElseIf xPkeyType = 2
+              If X509EeCurve = xAncCurve[u] And X509EeQLen = xAncQLen[u]
+                match = 1
+                i = 0
+                While i < X509EeQLen
+                  If (PeekA(X509EeQAddr + i) & 255) <> (PeekA(xAncQAddr[u] + i) & 255)
+                    match = 0
+                    Break
+                  EndIf
+                  i = i + 1
+                Wend
+                If match
+                  xErr = #X509ERR_OK
+                  ProcedureReturn
+                EndIf
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+        u = u + 1
+      Wend
+    Case #T0N_check_trust_anchor_CA
+      u = 0
+      While u < xNumAnchors
+        If xAncCA[u] <> 0
+          Sha256Of(xAncDnAddr[u], xAncDnLen[u], @xTmpHash)
+          match = 1
+          i = 0
+          While i < #X_DNHASH_LEN
+            If (xTmpHash[i] & 255) <> (xRam[#X_saved_dn_hash + i] & 255)
+              match = 0
+              Break
+            EndIf
+            i = i + 1
+          Wend
+          If match
+            If xAncType[u] = 1
+              If X509VerifySig(1, xAncNAddr[u], xAncNLen[u], xAncEAddr[u], xAncELen[u]) = 0
+                xErr = #X509ERR_OK
+                ProcedureReturn
+              EndIf
+            ElseIf xAncType[u] = 2
+              If X509VerifySig(2, xAncCurve[u], 0, xAncQAddr[u], xAncQLen[u]) = 0
+                xErr = #X509ERR_OK
+                ProcedureReturn
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+        u = u + 1
+      Wend
+    Case #T0N_do_rsa_vrfy
+      elen = T0Pop()
+      nlen = T0Pop()
+      ; key just decoded into pkey_data: n at pkey_data, e at pkey_data+nlen
+      ; Same two stack lengths as the copy above, and here they become a
+      ; raw ADDRESS handed to the verifier - a wild length would send it
+      ; off the end of the array with no way to know. Ranged first.
+      If XkeyFits(nlen, elen) = 0
+        ProcedureReturn
+      EndIf
+      T0Push(X509VerifySig(1, @xRam[#X_pkey_data], nlen, @xRam[#X_pkey_data + nlen], elen))
+    Case #T0N_do_ecdsa_vrfy
+      qlen = T0Pop()
+      curve = T0Pop()
+      If XkeyFits(qlen, 0) = 0
+        ProcedureReturn
+      EndIf
+      T0Push(X509VerifySig(2, curve, 0, @xRam[#X_pkey_data], qlen))
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Native dispatcher: route each native id to its group.
+; ----------------------------------------------------------------------
+Procedure X509Native(nid.i)
+  If nid = #T0N_set8 Or nid = #T0N_set16 Or nid = #T0N_set32 Or nid = #T0N_get16 Or nid = #T0N_get32
+    XnMem(nid)
+  ElseIf nid = #T0N_read8_low Or nid = #T0N_read_blob_inner Or nid = #T0N_fail Or nid = #T0N_zero_server_name Or nid = #T0N_dn_hash_length
+    XnIo(nid)
+  ElseIf nid = #T0N_start_tbs_hash Or nid = #T0N_stop_tbs_hash Or nid = #T0N_start_dn_hash Or nid = #T0N_compute_dn_hash Or nid = #T0N_compute_tbs_hash
+    XnHash(nid)
+  ElseIf nid = #T0N_blobcopy Or nid = #T0N_eqOID Or nid = #T0N_eqblob Or nid = #T0N_offset_name_element Or nid = #T0N_copy_name_element Or nid = #T0N_copy_name_SAN
+    XnBlob(nid)
+  ElseIf nid = #T0N_check_validity_range Or nid = #T0N_match_server_name
+    XnCheck(nid)
+  ElseIf nid = #T0N_copy_ee_rsa_pkey Or nid = #T0N_copy_ee_ec_pkey Or nid = #T0N_check_direct_trust Or nid = #T0N_check_trust_anchor_CA Or nid = #T0N_do_rsa_vrfy Or nid = #T0N_do_ecdsa_vrfy
+    XnKey(nid)
+  Else
+    xErr = #X509ERR_GUARD
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Trust-anchor configuration.
+; ----------------------------------------------------------------------
+Procedure X509ResetAnchors()
+  xNumAnchors = 0
+EndProcedure
+
+Procedure X509AddAnchorRSA(isCA.i, dnAddr.i, dnLen.i, nAddr.i, nLen.i, eAddr.i, eLen.i)
+  Protected u.i
+  If xNumAnchors >= #X_MAX_ANCHORS
+    ProcedureReturn
+  EndIf
+  u = xNumAnchors
+  xAncCA[u] = isCA
+  xAncDnAddr[u] = dnAddr
+  xAncDnLen[u] = dnLen
+  xAncType[u] = 1
+  xAncNAddr[u] = nAddr
+  xAncNLen[u] = nLen
+  xAncEAddr[u] = eAddr
+  xAncELen[u] = eLen
+  xNumAnchors = u + 1
+EndProcedure
+
+Procedure X509AddAnchorEC(isCA.i, dnAddr.i, dnLen.i, curve.i, qAddr.i, qLen.i)
+  Protected u.i
+  If xNumAnchors >= #X_MAX_ANCHORS
+    ProcedureReturn
+  EndIf
+  u = xNumAnchors
+  xAncCA[u] = isCA
+  xAncDnAddr[u] = dnAddr
+  xAncDnLen[u] = dnLen
+  xAncType[u] = 2
+  xAncCurve[u] = curve
+  xAncQAddr[u] = qAddr
+  xAncQLen[u] = qLen
+  xNumAnchors = u + 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The driver. Feeds one cert through the running coroutine, servicing
+;  native words, until the cert is consumed (a benign yield with the input
+;  exhausted) or the engine reaches a terminal state (err set).
+;  Returns 1 if terminal (X509 err set), 0 if the cert was consumed.
+; ----------------------------------------------------------------------
+Procedure.i X509RunOneCert()
+  Protected st.i
+  Protected guard.i
+  guard = 0
+  Repeat
+    st = T0Run()
+    If st = #T0_NATIVE
+      X509Native(t0_native_id)
+      If xErr <> 0
+        ProcedureReturn 1
+      EndIf
+    ElseIf st = #T0_YIELD
+      If xErr <> 0
+        ProcedureReturn 1
+      EndIf
+      If xHlen <= 0
+        ProcedureReturn 0                 ; cert boundary - ready for next
+      EndIf
+    Else
+      ProcedureReturn 1                    ; HALT (unexpected for this engine)
+    EndIf
+    guard = guard + 1
+    If guard > 20000000
+      xErr = #X509ERR_GUARD
+      ProcedureReturn 1
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  X509ValidateChain - the public entry. See the header for the contract.
+; ----------------------------------------------------------------------
+Procedure.i X509ValidateChain(certsAddr.i, lensAddr.i, count.i, serverAddr.i, serverLen.i, unixTime.i)
+  Protected i.i
+  Protected certAddr.i
+  Protected certLen.i
+  Protected terminal.i
+
+  ; reset the whole context RAM and run state
+  i = 0
+  While i < #X_RAM_SIZE
+    xRam[i] = 0
+    i = i + 1
+  Wend
+  xErr = 0
+  X509Err = 0
+  xDoMhash = 0
+  xDoDnhash = 0
+  xPkeyType = 0
+  X509EePkeyType = 0
+  xServerAddr = serverAddr
+  xServerLen = serverLen
+
+  ; date, in the day/second epoch the engine's date decoder produces.
+  ; MEASURED DIFFERENCE, NOT A DEFECT: a unixTime past 2038 fits here
+  ; and does not fit a 32-bit `.i`.  The shared gate's "expired" case
+  ; passes 4070908800 (2099-01-01); on the Picos that arrives negative
+  ; and the case is refused by the notBefore side of
+  ; check-validity-range, while here it is refused by the notAfter
+  ; side - the one the case is named after.  Same verdict (54), and on
+  ; this part the two date cases really do cover both branches.
+  xValidDays = (unixTime / 86400) + 719528
+  xValidSecs = unixTime % 86400
+
+  If count <= 0
+    X509Err = #X509ERR_EMPTY_CHAIN
+    ProcedureReturn X509Err
+  EndIf
+
+  ; enter the engine at its main word
+  T0LoadX509()
+  T0Start()
+
+  i = 0
+  While i < count
+    ; A CELL IS EIGHT BYTES HERE AND PeekI READS EIGHT.  The 32-bit
+    ; copies say `i * 4` because on them a cell is four and PeekI
+    ; reads four; on this part BOTH halves of that line were wrong,
+    ; and separately.  Element 0 still came back right, so a
+    ; one-certificate chain validated and looked like proof; from
+    ; element 1 the read straddled the high half of one cell and the
+    ; low half of the next and the issuer certificate was garbage.
+    certAddr = PeekI(certsAddr + i * #X_CELL)
+    certLen  = PeekI(lensAddr + i * #X_CELL)
+    ; mirror start_cert: set the advertised certificate length
+    XrSet32(#X_cert_length, certLen)
+    ; mirror append: hand over the bytes
+    xHbuf = certAddr
+    xHlen = certLen
+    terminal = X509RunOneCert()
+    If terminal
+      Break
+    EndIf
+    ; mirror end_cert: count the processed certificate
+    XrSet32(#X_num_certs, Xr32(#X_num_certs) + 1)
+    i = i + 1
+  Wend
+
+  ; mirror end_chain
+  If xErr = #X509ERR_OK
+    X509Err = #X509ERR_OK
+  ElseIf xErr <> 0
+    X509Err = xErr
+  Else
+    X509Err = #X509ERR_NOT_TRUSTED
+  EndIf
+  ProcedureReturn X509Err
+EndProcedure
+; ==== PORTABLE CORE A64 END ====

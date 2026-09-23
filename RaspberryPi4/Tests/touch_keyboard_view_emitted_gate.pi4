@@ -1,0 +1,618 @@
+; ======================================================================
+;  touch_keyboard_view_emitted_gate.pi4
+;
+;  Executes the REAL touch keyboard view (Anvil/Graphics/
+;  touch_keyboard_view.pbi) and the REAL console core (RaspberryPi4/
+;  Board/console.pi4) on the A64 oracle.
+;
+;  IT RUNS THE REAL KEY MODEL TOO. The view used to carry a fenced
+;  placeholder model so that it could be laid out before Anvil/Core/
+;  touch_keyboard.pbi existed; the model has landed and the placeholder
+;  is gone, so this gate compiles the real one and lays out the real
+;  pages. The arrangement graded below is therefore the arrangement the
+;  monitor shows, and the key indices the hit test returns are the
+;  indices the model arms.
+;
+;  DIAGNOSTIC. No MMIO, no framebuffer, no GPU submission, no DMA and no
+;  cache operation occurs, and the harness arms a hard stop on any MMIO
+;  access - which is what makes running this off the board mean anything.
+;  The only leaves stubbed are the UART mirror ring, which console.pi4
+;  drains and which has nothing to do with geometry.
+;
+;  What it produces is a RECORD, not a verdict: the layout result, every
+;  key rectangle, and whole scan lines of TouchKeyboardHitKey answers
+;  across the band. The checker grades those independently - it does not
+;  re-implement the layout, it states properties the record must have.
+;  The in-image assertions below cover the things that are STATE rather
+;  than geometry: the viewport against the content, and the damage list.
+; ======================================================================
+
+#KV_MAGIC_AT = $06000000
+#KV_MAGIC    = $4B424456          ; "KBDV"
+#KV_CON      = $06000100
+#KV_DMG      = $06000800
+#KV_SCEN     = $06010000
+#KV_STRIDE   = $00010000
+#KV_BANNER   = 120
+
+; The console/viewport record, and the snapshot of the STORED grid taken
+; on either side of a show and a hide.
+#KV_CON_ROWS   = $06000100
+#KV_CON_VIEW0  = $06000108
+#KV_CON_VIEW1  = $06000110
+#KV_CON_TOP1   = $06000118
+#KV_CON_CUR1   = $06000120
+#KV_CON_VIEW2  = $06000128
+#KV_CON_TOP2   = $06000130
+#KV_CON_SCROLLN_RAW = $06000138
+#KV_CON_SCROLLN_VIEW = $06000140
+#KV_SNAP_BEFORE = $06000200       ; one byte per stored row
+#KV_SNAP_SHOWN  = $06000280
+#KV_SNAP_AFTER  = $06000300
+
+; The damage record for one changed key.
+#KV_DMG_ALLN    = $06000800
+#KV_DMG_CHGN    = $06000808
+#KV_DMG_X       = $06000810
+#KV_DMG_Y       = $06000818
+#KV_DMG_W       = $06000820
+#KV_DMG_H       = $06000828
+#KV_DMG_KEY     = $06000830
+#KV_DMG_OUTSIDE = $06000838        ; draw items outside the damage rect
+#KV_DMG_ITEMS   = $06000840
+
+; ---- the leaves console.pi4 needs and this gate does not exercise -----
+Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
+Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
+Procedure.i UartMirrorReadStyle() : ProcedureReturn 0 : EndProcedure
+
+; The key model first: the view asks it for its keys, its labels and
+; which of them is the hide chevron, and console.pi4 includes the view.
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+
+; The dispatcher's 40-byte routed contact record. Its first four fields
+; are the HAL's, in the HAL's order, which is why the model reads this
+; and the board's record through the same four offsets.
+#AIT_EVSZ  = 40
+#AIT_EV_X  = 0
+#AIT_EV_Y  = 4
+#AIT_EV_ID = 8
+#AIT_EV_ST = 12
+#AIT_DOWN  = 0
+
+Global Dim gKvRec.a[#AIT_EVSZ]
+Global gKvM.TouchKeyboardMetrics
+Global gKvPaintCalls.i = 0
+Global gKvOverlayCalls.i = 0
+Global gKvResetCalls.i = 0
+
+Procedure KvPaintStub()
+  gKvPaintCalls = gKvPaintCalls + 1
+EndProcedure
+Procedure KvOverlayStub()
+  gKvOverlayCalls = gKvOverlayCalls + 1
+EndProcedure
+Procedure KvResetStub()
+  gKvResetCalls = gKvResetCalls + 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One layout scenario: lay it out, dump it, then walk whole scan lines
+;  of the real hit test across the band and record every answer.
+;
+;  The scan lines are the point. A sampled corner test proves a corner; a
+;  scan line at one pixel a step across the WHOLE width proves every
+;  boundary between every key and every gutter on that line, and the
+;  checker grades it against the rectangle table without knowing how the
+;  rectangles were produced.
+; ----------------------------------------------------------------------
+Procedure KvSample(at.i, x.i, y.i)
+  PokeI(at, x)
+  PokeI(at + 8, y)
+  PokeI(at + 16, TouchKeyboardHitKey(x, y))
+EndProcedure
+
+Procedure.i KvScenario(slot.i, page.i, lw.i, lh.i, ppi.i, ds.i, fullScan.i)
+  Define b.i
+  Define i.i
+  Define r.i
+  Define x.i
+  Define y.i
+  Define ok.i
+  Define at.i
+  Define rows.i
+  Define keys.i
+  Define kx.i
+  Define ky.i
+  Define kw.i
+  Define kh.i
+
+  b = #KV_SCEN + slot * #KV_STRIDE
+  ; The REAL model's page, chosen the way the keyboard chooses it.
+  TouchKeyboardInit()
+  TkSetPage(page)
+  TouchKeyboardViewSetVisible(0)
+  gKvM\logicalW     = lw
+  gKvM\logicalH     = lh
+  gKvM\bannerH      = #KV_BANNER
+  gKvM\cellW        = 8 * ds
+  gKvM\cellH        = 16 * ds
+  gKvM\ppi          = ppi
+  gKvM\displayScale = ds
+
+  ok = TouchKeyboardLayout(@gKvM)
+  PokeI(b, ok)
+  PokeI(b + 8, lw)
+  PokeI(b + 16, lh)
+  PokeI(b + 24, #KV_BANNER)
+  PokeI(b + 32, 8 * ds)
+  PokeI(b + 40, 16 * ds)
+  PokeI(b + 48, ppi)
+  PokeI(b + 56, ds)
+  PokeI(b + 64, TouchKeyboardTargetMinPx())
+  PokeI(b + 72, TouchKeyboardTargetPrefPx())
+  PokeI(b + 80, TouchKeyboardGutter())
+  PokeI(b + 88, TouchKeyboardBandY())
+  PokeI(b + 96, TouchKeyboardBandH())
+  PokeI(b + 104, TouchKeyboardConsoleRows())
+  PokeI(b + 112, TouchKeyboardRows())
+  PokeI(b + 120, TouchKeyboardKeys())
+  PokeI(b + 128, TouchKeyboardDensityKnown())
+  PokeI(b + 136, TouchKeyboardHideX())
+  PokeI(b + 144, TouchKeyboardHideY())
+  PokeI(b + 152, TouchKeyboardHideW())
+  PokeI(b + 160, TouchKeyboardHideH())
+  PokeI(b + 200, TouchKeyboardRefusal())
+  PokeI(b + 208, TouchKeyboardSplitUtilityRow())
+  PokeI(b + 216, TouchKeyboardMaxKeysPerRow())
+  PokeI(b + 240, TouchKeyboardSizeAdjustment())
+  If ok = 0
+    PokeI(b + 224, 0)
+    ProcedureReturn 0
+  EndIf
+
+  TouchKeyboardViewSetVisible(1)
+  PokeI(b + 168, TouchKeyboardButtonX())
+  PokeI(b + 176, TouchKeyboardButtonY())
+  PokeI(b + 184, TouchKeyboardButtonW())
+  PokeI(b + 192, TouchKeyboardButtonH())
+
+  rows = TouchKeyboardRows()
+  keys = TouchKeyboardKeys()
+  i = 0
+  While i < keys
+    at = b + $400 + i * 48
+    PokeI(at,      TouchKeyboardKeyX(i))
+    PokeI(at + 8,  TouchKeyboardKeyY(i))
+    PokeI(at + 16, TouchKeyboardKeyW(i))
+    PokeI(at + 24, TouchKeyboardKeyH(i))
+    PokeI(at + 32, TouchKeyboardKeyRow(i))
+    PokeI(at + 40, TouchKeyboardKeyLabelScale(i))
+    i = i + 1
+  Wend
+
+  ; EVERY KEY'S OWN BOUNDARY, on every scenario: the four corners and the
+  ; centre must hit that key, and the pixel one step outside each edge
+  ; must not. Those nine are where an off-by-one lives.
+  PokeI(b + 256, keys * 9)
+  i = 0
+  While i < keys
+    kx = TouchKeyboardKeyX(i)
+    ky = TouchKeyboardKeyY(i)
+    kw = TouchKeyboardKeyW(i)
+    kh = TouchKeyboardKeyH(i)
+    at = b + $A000 + i * 9 * 24
+    KvSample(at,          kx,          ky)
+    KvSample(at + 24,     kx + kw - 1, ky)
+    KvSample(at + 48,     kx,          ky + kh - 1)
+    KvSample(at + 72,     kx + kw - 1, ky + kh - 1)
+    KvSample(at + 96,     kx + kw / 2, ky + kh / 2)
+    KvSample(at + 120,    kx - 1,      ky)
+    KvSample(at + 144,    kx + kw,     ky)
+    KvSample(at + 168,    kx,          ky - 1)
+    KvSample(at + 192,    kx,          ky + kh)
+    i = i + 1
+  Wend
+
+  PokeI(b + 248, fullScan)
+  If fullScan = 0
+    PokeI(b + 224, 0)
+    ProcedureReturn 0
+  EndIf
+
+  ; A horizontal scan line through the middle of every key row - every
+  ; pixel across the whole width, so every key/gutter boundary on that
+  ; line is proved rather than sampled.
+  PokeI(b + 224, rows)
+  r = 0
+  While r < rows
+    y = gTkbRowY[r] + gTkbRowH[r] / 2
+    at = b + $1000 + r * $1000
+    x = 0
+    While x < lw
+      PokeA(at + x, TouchKeyboardHitKey(x, y) + 1)
+      x = x + 1
+    Wend
+    r = r + 1
+  Wend
+
+  ; And one vertical scan from the bottom of the banner to the bottom of
+  ; the screen, through the first key of every row - so the console area
+  ; above the band, every inter-row gutter and every row boundary are all
+  ; on the same line.
+  x = TouchKeyboardGutter() + 1
+  PokeI(b + 232, x)
+  at = b + $9000
+  y = #KV_BANNER
+  While y < lh
+    PokeA(at + (y - #KV_BANNER), TouchKeyboardHitKey(x, y) + 1)
+    y = y + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DAMAGE. One changed key must damage that key's rectangle and nothing
+;  else, and every draw item of that pass must lie inside it.
+; ----------------------------------------------------------------------
+Procedure.i KvDamage()
+  Define n.i
+  Define i.i
+  Define outside.i
+  Define key.i
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+
+  ; The band is already laid out and visible from the last scenario.
+  If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn 201
+  EndIf
+  TouchKeyboardViewSetVisible(1)
+  TouchKeyboardMarkAll()
+  n = TouchKeyboardPaint(#TKB_RENDER_CPU, #TKB_DAMAGE_ALL)
+  PokeI(#KV_DMG_ALLN, TouchKeyboardDamageCount())
+  If n < 1
+    ProcedureReturn 202
+  EndIf
+  ; A whole pass damages THE BAND. One rectangle, never one per key - and
+  ; never two, because the keyboard button beside the prompt is not drawn
+  ; while the band is up: the chevron is the way out once it is open, and
+  ; a button drawn there that did nothing when tapped is the nonfunctional
+  ; button the design forbids.
+  If TouchKeyboardDamageCount() <> 1
+    ProcedureReturn 203
+  EndIf
+
+  ; ARM A KEY THE WAY A FINGER DOES. There is no setter for this on the
+  ; real model and there should not be one: a key is armed by a contact
+  ; going down on it, and routing one here proves that the index the
+  ; view's hit test returns is the index the model arms - which is the
+  ; single joint between these two files.
+  key = 5
+  TouchKeyboardShow(1, 1)
+  TouchKeyboardTick(1000)
+  TouchKeyboardTick(1000 + #TK_SLIDE_MS)
+  If TouchKeyboardState() <> #TK_STATE_VISIBLE
+    ProcedureReturn 211
+  EndIf
+  PokeL(@gKvRec[0] + #AIT_EV_X, TouchKeyboardKeyX(key) + TouchKeyboardKeyW(key) / 2)
+  PokeL(@gKvRec[0] + #AIT_EV_Y, TouchKeyboardKeyY(key) + TouchKeyboardKeyH(key) / 2)
+  PokeL(@gKvRec[0] + #AIT_EV_ID, 7)
+  PokeL(@gKvRec[0] + #AIT_EV_ST, #AIT_DOWN)
+  If TouchKeyboardRouteTouch(@gKvRec[0]) <> 1
+    ProcedureReturn 212
+  EndIf
+  If TouchKeyboardKeyIsArmed(key) = 0
+    ProcedureReturn 213
+  EndIf
+  TouchKeyboardMarkKey(key)
+  n = TouchKeyboardPaint(#TKB_RENDER_CPU, #TKB_DAMAGE_CHANGED)
+  PokeI(#KV_DMG_CHGN, TouchKeyboardDamageCount())
+  PokeI(#KV_DMG_KEY, key)
+  PokeI(#KV_DMG_ITEMS, n)
+  If TouchKeyboardDamageCount() <> 1
+    ProcedureReturn 204
+  EndIf
+  PokeI(#KV_DMG_X, TouchKeyboardDamageX(0))
+  PokeI(#KV_DMG_Y, TouchKeyboardDamageY(0))
+  PokeI(#KV_DMG_W, TouchKeyboardDamageW(0))
+  PokeI(#KV_DMG_H, TouchKeyboardDamageH(0))
+  If TouchKeyboardDamageX(0) <> TouchKeyboardKeyX(key)
+    ProcedureReturn 205
+  EndIf
+  If TouchKeyboardDamageY(0) <> TouchKeyboardKeyY(key)
+    ProcedureReturn 206
+  EndIf
+  If TouchKeyboardDamageW(0) <> TouchKeyboardKeyW(key)
+    ProcedureReturn 207
+  EndIf
+  If TouchKeyboardDamageH(0) <> TouchKeyboardKeyH(key)
+    ProcedureReturn 208
+  EndIf
+
+  x0 = TouchKeyboardDamageX(0)
+  y0 = TouchKeyboardDamageY(0)
+  x1 = x0 + TouchKeyboardDamageW(0)
+  y1 = y0 + TouchKeyboardDamageH(0)
+  outside = 0
+  i = 0
+  While i < n
+    If TouchKeyboardDrawX(i) < x0 Or TouchKeyboardDrawY(i) < y0
+      outside = outside + 1
+    ElseIf (TouchKeyboardDrawX(i) + TouchKeyboardDrawW(i)) > x1
+      outside = outside + 1
+    ElseIf (TouchKeyboardDrawY(i) + TouchKeyboardDrawH(i)) > y1
+      outside = outside + 1
+    EndIf
+    i = i + 1
+  Wend
+  PokeI(#KV_DMG_OUTSIDE, outside)
+  If outside <> 0
+    ProcedureReturn 209
+  EndIf
+  If TouchKeyboardDrawOverflowed() <> 0
+    ProcedureReturn 210
+  EndIf
+  TouchKeyboardCancelAll(#TK_CANCEL_CLIENT)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE VIEWPORT AGAINST THE CONTENT. The defect this whole separation
+;  exists to make impossible is "reserving space for the keyboard threw
+;  the session's output away", so the test is: put known text in the
+;  grid, reserve, release, and require every stored cell to be the byte
+;  it was - while the VISIBLE rows change and the prompt row stays on
+;  screen throughout.
+; ----------------------------------------------------------------------
+Procedure KvSnapshot(at.i)
+  Define r.i
+  r = 0
+  While r < ConContentRows()
+    PokeA(at + r, ConContentCell(r, 0))
+    r = r + 1
+  Wend
+EndProcedure
+
+Procedure.i KvSameSnapshot(a.i, b.i, n.i)
+  Define r.i
+  r = 0
+  While r < n
+    If PeekA(a + r) <> PeekA(b + r)
+      ProcedureReturn 0
+    EndIf
+    r = r + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i KvViewport()
+  Define r.i
+  Define rows.i
+
+  ConSetOverlay(@KvOverlayStub, @KvResetStub)
+  gKvResetCalls = 0
+  ConGridInit(80, 20)
+  ; ConGridInit resets whatever was laid out against the old geometry.
+  If gKvResetCalls <> 1
+    ProcedureReturn 301
+  EndIf
+  rows = ConContentRows()
+  If rows <> 20
+    ProcedureReturn 302
+  EndIf
+
+  ; One distinguishable character per row, cursor left on the last row.
+  r = 0
+  While r < 19
+    ConGridPutc(65 + r)
+    ConGridPutc(10)
+    r = r + 1
+  Wend
+  ConGridPutc(90)
+  If ConGridCurR() <> 19
+    ProcedureReturn 303
+  EndIf
+  KvSnapshot(#KV_SNAP_BEFORE)
+  PokeI(#KV_CON_ROWS, rows)
+  PokeI(#KV_CON_VIEW0, ConViewRows())
+  If ConViewRows() <> 20 Or ConViewTop() <> 0
+    ProcedureReturn 304
+  EndIf
+  If ConViewReserved() <> 0
+    ProcedureReturn 305
+  EndIf
+
+  ; ---- SHOW: reserve eight rows for a keyboard ------------------------
+  ConGridClearDirty()
+  ConSetViewRows(12)
+  PokeI(#KV_CON_VIEW1, ConViewRows())
+  PokeI(#KV_CON_TOP1, ConViewTop())
+  PokeI(#KV_CON_CUR1, ConViewCursorRow())
+  KvSnapshot(#KV_SNAP_SHOWN)
+  If ConContentRows() <> 20
+    ProcedureReturn 306
+  EndIf
+  If KvSameSnapshot(#KV_SNAP_BEFORE, #KV_SNAP_SHOWN, rows) = 0
+    ProcedureReturn 307
+  EndIf
+  If ConViewRows() <> 12
+    ProcedureReturn 308
+  EndIf
+  ; The window is pinned to the cursor, so the prompt row is the LAST
+  ; visible row and the row above it is still there.
+  If ConViewTop() <> 8
+    ProcedureReturn 309
+  EndIf
+  If ConViewCursorRow() <> 11
+    ProcedureReturn 310
+  EndIf
+  ; The revealed/covered region has to be repainted from retained content.
+  If ConGridFullClear() = 0
+    ProcedureReturn 311
+  EndIf
+  ; Renderer-facing accessors are the VIEWPORT's.
+  If ConGridRows() <> 12
+    ProcedureReturn 312
+  EndIf
+  If ConGridCell(0, 0) <> ConContentCell(8, 0)
+    ProcedureReturn 313
+  EndIf
+  If ConGridCell(11, 0) <> ConContentCell(19, 0)
+    ProcedureReturn 314
+  EndIf
+  If ConGridCell(0, 0) <> 73         ; 'I', stored row 8
+    ProcedureReturn 315
+  EndIf
+  If ConGridCell(11, 0) <> 90        ; 'Z', the prompt row
+    ProcedureReturn 316
+  EndIf
+
+  ; ---- HIDE: give the rows back --------------------------------------
+  ; Taken BEFORE anything is printed again, so "the content survived a
+  ; show and a hide" is a claim about the show and the hide and about
+  ; nothing else.
+  ConGridClearDirty()
+  ConViewRelease()
+  PokeI(#KV_CON_VIEW2, ConViewRows())
+  PokeI(#KV_CON_TOP2, ConViewTop())
+  KvSnapshot(#KV_SNAP_AFTER)
+  If ConViewRows() <> 20 Or ConViewTop() <> 0
+    ProcedureReturn 320
+  EndIf
+  If KvSameSnapshot(#KV_SNAP_BEFORE, #KV_SNAP_AFTER, rows) = 0
+    ProcedureReturn 321
+  EndIf
+  If ConGridFullClear() = 0
+    ProcedureReturn 322
+  EndIf
+  If ConViewReserved() <> 0
+    ProcedureReturn 323
+  EndIf
+  If ConGridCell(0, 0) <> 65
+    ProcedureReturn 324
+  EndIf
+
+  ; ---- the hardware scroll hint is withheld while reserved ------------
+  ConSetViewRows(12)
+  ConGridClearDirty()
+  ConGridPutc(10)                     ; the cursor is on the last row: scroll
+  PokeI(#KV_CON_SCROLLN_RAW, gConScrollN)
+  PokeI(#KV_CON_SCROLLN_VIEW, ConGridScrollN())
+  If gConScrollN <> 1
+    ProcedureReturn 325
+  EndIf
+  If ConGridScrollN() <> 0
+    ProcedureReturn 326
+  EndIf
+  r = 0
+  While r < ConViewRows()
+    If ConGridRowDirty(r) = 0
+      ProcedureReturn 327
+    EndIf
+    r = r + 1
+  Wend
+  ConViewRelease()
+
+  ; ---- a quiet repaint flag, and the ride it takes on a scroll --------
+  ; The UI layer leaves one on the rows its button covers. It must not
+  ; say the screen changed - that would repaint for ever - and it must
+  ; travel with the content, so that after a scroll it lands on the rows
+  ; the moved copy of the button landed on.
+  ConGridClearDirty()
+  ConMarkViewRowQuiet(5)
+  If ConGridDirty() <> 0
+    ProcedureReturn 333
+  EndIf
+  If ConGridRowDirty(5) = 0
+    ProcedureReturn 334
+  EndIf
+  ConGridPutc(10)
+  If ConGridRowDirty(4) = 0
+    ProcedureReturn 335
+  EndIf
+  If ConGridRowDirty(5) <> 0
+    ProcedureReturn 336
+  EndIf
+
+  ; ---- the overlay is composed after the renderer, never without one --
+  gKvPaintCalls = 0
+  gKvOverlayCalls = 0
+  ConSetRenderer(@KvPaintStub)
+  ConOverlayDamage()
+  ScreenPump()
+  If gKvPaintCalls <> 1 Or gKvOverlayCalls <> 1
+    ProcedureReturn 328
+  EndIf
+  gKvPaintCalls = 0
+  gKvOverlayCalls = 0
+  ConNoRenderer()
+  ConOverlayDamage()
+  ScreenPump()
+  If gKvPaintCalls <> 0 Or gKvOverlayCalls <> 0
+    ProcedureReturn 329
+  EndIf
+  ; A full clear under the layer is latched once and taken once.
+  ConSetRenderer(@KvPaintStub)
+  ConRepaint()
+  If ConOverlayTakeWhole() <> 1
+    ProcedureReturn 330
+  EndIf
+  If ConOverlayTakeWhole() <> 0
+    ProcedureReturn 331
+  EndIf
+  ; And the screen going away resets the layer before anything else.
+  gKvResetCalls = 0
+  ConGridStop()
+  If gKvResetCalls <> 1
+    ProcedureReturn 332
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+
+  PokeI(#KV_MAGIC_AT, #KV_MAGIC)
+
+  ; 0  landscape on the bench panel, the shipped default - FULL SCAN
+  rc = KvScenario(0, #TK_PAGE_ABC, 1280, 800, 149, 1, 1)
+  If rc <> 0 : ProcedureReturn 100 + rc : EndIf
+  ; 1  the panel's own portrait scan - FULL SCAN
+  rc = KvScenario(1, #TK_PAGE_ABC, 800, 1280, 149, 1, 1)
+  If rc <> 0 : ProcedureReturn 110 + rc : EndIf
+  ; 2  landscape at the large-text setting
+  rc = KvScenario(2, #TK_PAGE_ABC, 1280, 800, 149, 2, 0)
+  If rc <> 0 : ProcedureReturn 120 + rc : EndIf
+  ; 3  the smallest screen the shipped arrangement still fits - FULL SCAN
+  rc = KvScenario(3, #TK_PAGE_ABC, 640, 480, 149, 1, 1)
+  If rc <> 0 : ProcedureReturn 130 + rc : EndIf
+  ; 4  a screen too narrow for the arrangement it was given - REFUSAL
+  rc = KvScenario(4, #TK_PAGE_ABC, 480, 800, 149, 1, 0)
+  If rc <> 0 : ProcedureReturn 140 + rc : EndIf
+  ; 5  a screen too short for a safe key - REFUSAL
+  rc = KvScenario(5, #TK_PAGE_ABC, 400, 300, 149, 1, 0)
+  If rc <> 0 : ProcedureReturn 150 + rc : EndIf
+  ; 6  a screen that cannot say how big it is: the display-scale fallback
+  rc = KvScenario(6, #TK_PAGE_ABC, 1280, 800, 0, 1, 0)
+  If rc <> 0 : ProcedureReturn 160 + rc : EndIf
+  ; 8  the panel's portrait scan at the large-text setting
+  rc = KvScenario(8, #TK_PAGE_ABC, 800, 1280, 149, 2, 0)
+  If rc <> 0 : ProcedureReturn 180 + rc : EndIf
+  ; 7  the symbol page, landscape, so a second arrangement is laid out.
+  ; KvDamage below works on whatever was laid out LAST, so this one stays
+  ; last and the checker grades the damage against slot 7's key table.
+  rc = KvScenario(7, #TK_PAGE_SYM, 1280, 800, 149, 1, 0)
+  If rc <> 0 : ProcedureReturn 170 + rc : EndIf
+
+  rc = KvDamage()
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  rc = KvViewport()
+  If rc <> 0 : ProcedureReturn rc : EndIf
+
+  ProcedureReturn 0
+EndProcedure

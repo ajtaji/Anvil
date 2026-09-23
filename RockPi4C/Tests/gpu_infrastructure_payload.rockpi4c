@@ -1,0 +1,119 @@
+; First returning RK3399 GPU-infrastructure observation payload.
+; Linked for the live Anvil recovery stage.  It never accesses the Mali
+; aperture and never mutates PMU, CRU or GPU state.  The only MMIO write is a
+; 32-bit UART2 THR write after UART2 LSR reports THRE.
+;
+; Wire format, in fixed order:
+;   G0 <PWRDN_CON> <PWRDN_ST> <IDLE_REQ> <IDLE_ST> <IDLE_ACK>
+;      <CLKSEL13> <CLKGATE13> <CLKGATE30> <SOFTRST18> <REFUSAL> CR LF
+;
+; REFUSAL bits:
+;   0 PWRDN_CON[15], 1 PWRDN_ST[15], 2 IDLE_REQ[0],
+;   3 IDLE_ST[0], 4 IDLE_ACK[0], 5 CLKGATE13[0],
+;   6 CLKGATE30[8], 7 SOFTRST18[2:0], 8 CLKSEL13 parent > 4.
+; Zero means the later GPU-ID-only probe may be considered.  This payload
+; itself never reads GPU_ID or any address in 0xFF9A0000..0xFF9AFFFF.
+;
+; pmf:target rockpi4c
+; pmf:load $03A4BBD8
+; pmf:bss $10000000
+; pmf:stack $12000000
+
+#GPU_INFRA_UART2_THR = $FF1A0000
+#GPU_INFRA_UART2_LSR = $FF1A0014
+#GPU_INFRA_UART2_THRE = $20
+#GPU_INFRA_UART_SPINS = 1000000
+
+#GPU_INFRA_PWRDN_CON = $FF310014
+#GPU_INFRA_PWRDN_ST = $FF310018
+#GPU_INFRA_IDLE_REQ = $FF310060
+#GPU_INFRA_IDLE_ST = $FF310064
+#GPU_INFRA_IDLE_ACK = $FF310068
+#GPU_INFRA_CLKSEL13 = $FF760134
+#GPU_INFRA_CLKGATE13 = $FF760334
+#GPU_INFRA_CLKGATE30 = $FF760378
+#GPU_INFRA_SOFTRST18 = $FF760448
+
+Procedure.i GpuInfraTx(value.i)
+  Protected attempt.i
+  For attempt=0 To #GPU_INFRA_UART_SPINS-1
+    If (PeekL(#GPU_INFRA_UART2_LSR) & #GPU_INFRA_UART2_THRE)<>0
+      PokeL(#GPU_INFRA_UART2_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GpuInfraHex32(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      If GpuInfraTx(48+digit)=0 : ProcedureReturn 0 : EndIf
+    Else
+      If GpuInfraTx(55+digit)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GpuInfraWord(value.i)
+  If GpuInfraHex32(value)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn GpuInfraTx(32)
+EndProcedure
+
+Procedure.i Main()
+  Protected pwrdnCon.i
+  Protected pwrdnSt.i
+  Protected idleReq.i
+  Protected idleSt.i
+  Protected idleAck.i
+  Protected clksel13.i
+  Protected clkgate13.i
+  Protected clkgate30.i
+  Protected softrst18.i
+  Protected refusal.i
+
+  ; One inline marker precedes the first infrastructure read.  A watchdog
+  ; reset after G0 therefore identifies the first not-yet-returned MMIO read.
+  If GpuInfraTx(71)=0 : ProcedureReturn $E401 : EndIf
+  If GpuInfraTx(48)=0 : ProcedureReturn $E402 : EndIf
+  If GpuInfraTx(32)=0 : ProcedureReturn $E403 : EndIf
+
+  pwrdnCon=PeekL(#GPU_INFRA_PWRDN_CON) & $FFFFFFFF
+  If GpuInfraWord(pwrdnCon)=0 : ProcedureReturn $E404 : EndIf
+  pwrdnSt=PeekL(#GPU_INFRA_PWRDN_ST) & $FFFFFFFF
+  If GpuInfraWord(pwrdnSt)=0 : ProcedureReturn $E405 : EndIf
+  idleReq=PeekL(#GPU_INFRA_IDLE_REQ) & $FFFFFFFF
+  If GpuInfraWord(idleReq)=0 : ProcedureReturn $E406 : EndIf
+  idleSt=PeekL(#GPU_INFRA_IDLE_ST) & $FFFFFFFF
+  If GpuInfraWord(idleSt)=0 : ProcedureReturn $E407 : EndIf
+  idleAck=PeekL(#GPU_INFRA_IDLE_ACK) & $FFFFFFFF
+  If GpuInfraWord(idleAck)=0 : ProcedureReturn $E408 : EndIf
+  clksel13=PeekL(#GPU_INFRA_CLKSEL13) & $FFFFFFFF
+  If GpuInfraWord(clksel13)=0 : ProcedureReturn $E409 : EndIf
+  clkgate13=PeekL(#GPU_INFRA_CLKGATE13) & $FFFFFFFF
+  If GpuInfraWord(clkgate13)=0 : ProcedureReturn $E40A : EndIf
+  clkgate30=PeekL(#GPU_INFRA_CLKGATE30) & $FFFFFFFF
+  If GpuInfraWord(clkgate30)=0 : ProcedureReturn $E40B : EndIf
+  softrst18=PeekL(#GPU_INFRA_SOFTRST18) & $FFFFFFFF
+  If GpuInfraWord(softrst18)=0 : ProcedureReturn $E40C : EndIf
+
+  refusal=0
+  If (pwrdnCon & $00008000)<>0 : refusal=refusal | $001 : EndIf
+  If (pwrdnSt & $00008000)<>0 : refusal=refusal | $002 : EndIf
+  If (idleReq & $00000001)<>0 : refusal=refusal | $004 : EndIf
+  If (idleSt & $00000001)<>0 : refusal=refusal | $008 : EndIf
+  If (idleAck & $00000001)<>0 : refusal=refusal | $010 : EndIf
+  If (clkgate13 & $00000001)<>0 : refusal=refusal | $020 : EndIf
+  If (clkgate30 & $00000100)<>0 : refusal=refusal | $040 : EndIf
+  If (softrst18 & $00000007)<>0 : refusal=refusal | $080 : EndIf
+  If ((clksel13 >> 5) & 7)>4 : refusal=refusal | $100 : EndIf
+
+  If GpuInfraHex32(refusal)=0 : ProcedureReturn $E40D : EndIf
+  If GpuInfraTx(13)=0 : ProcedureReturn $E40E : EndIf
+  If GpuInfraTx(10)=0 : ProcedureReturn $E40F : EndIf
+  ProcedureReturn $47503000 | refusal
+EndProcedure

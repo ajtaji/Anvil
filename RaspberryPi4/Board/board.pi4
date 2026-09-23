@@ -1,0 +1,3046 @@
+; Anvil - a bare-metal serial monitor for the Raspberry Pi 4,
+; written in PureMetal Forge. Version 2.0.
+;
+; ---------------------------------------------------------------------
+; WHAT IT REPLACES
+; ---------------------------------------------------------------------
+; Everything anybody on this bench still opens U-Boot for:
+;
+;   a console            -> banner, prompt, line editor
+;   receive over serial  -> b   (raw block, OUR protocol - the fast path)
+;                           l   (Motorola S-records - the proven path)
+;   jump to it           -> g <addr>
+;   report the result    -> "## returned, x0 = ..."   after g
+;   look at memory       -> m <addr> <count>         (U-Boot's md, and
+;                           md.b / md.w / md.l group the same bytes as
+;                           8/16/32-bit values - the count stays bytes)
+;   change memory        -> w <addr> <value>
+;   fill a range         -> fill <addr> <value> [n]  (U-Boot's mw)
+;   copy a range         -> copy <src> <dst> <n>     (U-Boot's cp)
+;   compare two ranges   -> compare <a> <b> <n>      (U-Boot's cmp)
+;   checksum a range     -> crc32 <addr> <n>
+;   a crypto checksum    -> sha1sum / sha256sum <addr> <n>
+;   work out a value     -> setexpr <name> <v1> <op> <v2>   (into settings)
+;   a default address    -> base [addr]
+;   settings that stay   -> settings / wifi, AND the U-Boot names over
+;                           the same store: printenv, setenv <n> <v>,
+;                           saveenv, and env print/set/save/delete
+;   say something         -> echo [-n] <args>        (U-Boot's echo)
+;   wait a bit            -> sleep <seconds>          (interruptible)
+;   what version is this  -> version                  (U-Boot's version)
+;   fetch it over the    -> get <name> [addr]   (U-Boot's tftpboot)
+;   network              -> put <name> <addr> <len>  (tftpput)
+;                        -> net                  (its ipaddr, serverip,
+;                                                 netmask and gatewayip)
+;   what is this board   -> i        revision, temperature, every clock
+;   how fast is it       -> c [hz]   show or set the ARM clock
+;   run it on its own    -> a <addr> + the boot-delay banner (autoboot)
+;
+; THE BUILD LINE, AND IT IS NOW A PLAIN ONE:
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;       -o RaspberryPi4/Monitor/anvil.img
+;
+; It used to carry --load-addr 0x200000 --bss-addr 0x8200000 and it no
+; longer needs to: this file DECLARES its own placement, further down,
+; with LoadAddress / BssAddress / StackAddress. See WHERE THIS IMAGE RUNS
+; below. The flags still exist and still work; passing one that
+; DISAGREES with the source stops the build and names both values. The
+; reason for the change is the IDE, which embeds the compiler and cannot
+; pass a flag at all - so this program could not be built correctly from
+; it. Building it from the IDE and building it from a script now produce
+; the same bytes, and that was checked by producing both and comparing
+; them.
+;
+; THE SOURCE IS board.pi4 AND THE OUTPUT IS STILL anvil.img. This file is
+; the sole Pi 4 compile target; the old RaspberryPi4/Monitor/anvil.pi4 -
+; a byte-identical monolith mirror of this one - was RETIRED on
+; 2026-08-31. The output name is unchanged on purpose: the flash and
+; console tools default to RaspberryPi4/Monitor/anvil.img (tools/anvil.py,
+; anvil_update.py, anvil_wifi_update.py, monsession.py), so building here
+; with -o that path keeps every one of them working with no argument.
+;
+; --bss-addr IS NOT OPTIONAL AND IS NOT A TUNING KNOB. It is what puts
+; this program's variables outside the two-megabyte window its code has
+; to live in, and #MON_DATA_LO further down is the same number written
+; where the running program can see it. Build without it and the two
+; disagree: BSS goes back to $00280000, HitsMonitor() still refuses
+; writes to #MON_DATA_LO where nothing lives, and nothing refuses a write to
+; the variables that are now back inside the image window. See THE
+; CEILING AND WHERE IT WENT below, and the gate that checks the two
+; numbers against each other, tools/a64/a64_anvil_check.py.
+;
+; THIS IS kernel8.img. The header used to say "U-Boot STAYS UNDERNEATH
+; for now. This is NOT kernel8.img", with a paragraph about Ctrl-C
+; putting a working loader back in front of you. U-Boot is GONE from the
+; stick - Lib/safety.pi4:362-365 says so and says what it costs: there is
+; no recovery path on this board that does not involve physical access.
+; The firmware loads this image whole, off a USB stick, to $200000 -
+; Lib/mmu.pi4:84, "Anvil is loaded by the firmware as kernel8.img at
+; $200000" - and nothing else runs first. pi4Install.pi4 is what writes
+; the stick, and its CONFIG.TXT is the thing that names the address.
+;
+; =====================================================================
+;  2.0 - THIS FILE STOPPED OWNING THE HARDWARE - 2026-08-25
+; =====================================================================
+; Version 1.x hand-rolled a PL011 driver, an architectural-counter read,
+; a decimal printer and a set of BCM2711 register constants, because
+; when it was written none of those existed anywhere else. All four now
+; exist as libraries that are verified against the same silicon, and
+; every one of them has been DELETED from this file:
+;
+;   PutC/PutS/NL/GetC     -> Lib/uart.pi4    UartWrite / UartWriteStr /
+;                            PrintNl / UartRead, plus the Print router
+;                            so Print("...") and Print(n) work directly
+;   #UART_DR #UART_FR     -> Lib/uart.pi4 owns the register map. Two
+;   #FR_TXFF #FR_RXFE        spellings of one address is how they drift.
+;   Ticks() TickHz()      -> Lib/timer.pi4  (same mrs, one copy)
+;   PutDec()              -> Lib/uart.pi4   PrintDec()
+;   the 2-second timeout  -> still ours, but built on Lib/timer.pi4's
+;                            counter rather than a private one
+;
+; THE POINT IS NOT THE LINE COUNT, though it went down. It is that a
+; place where the monitor and a library disagreed about a register was a
+; bug waiting to be found on the bench, and there is now no such place.
+; The routing trap, the baud divisor, the mini-UART's opposite bit
+; senses, CNTFRQ_EL0's provenance: all of that is documented ONCE, in
+; uart.pi4 and timer.pi4, and this header no longer restates it.
+;
+; READ Lib/uart.pi4's HEADER BEFORE DEBUGGING SILENCE. Short version:
+; the PL011 only reaches header pins 8 and 10 with dtoverlay=disable-bt,
+; and writing to the UART that is not on the wire SUCCEEDS. Nothing
+; fails; nothing arrives.
+;
+; UartInit(), NOT UartAttach() - CHANGED when this became bootable.
+;
+; The old comment here said adoption was right because we arrive by "go"
+; from a loader that has already set up the port, and that "the day this
+; becomes kernel8.img, that one call changes". This is that day.
+;
+; Booted by the firmware there is no loader and nothing has touched the
+; PL011: no pin mux, no pulls, no divisor. Adopting an unconfigured port
+; writes no register and produces no output, and produces it silently -
+; the same non-failure the header warns about further down.
+;
+; UartInit is correct in BOTH cases. It muxes GPIO 14/15, sets the
+; pulls, and programs the divisor from scratch, so it does not care what
+; state the port was in. Under U-Boot it briefly disables a working port
+; and reprograms it to the same 115200 8N1; the cost is whatever U-Boot
+; had queued, which by this point is nothing.
+;
+; WHAT IS STILL HAND-WRITTEN HERE, AND WHY IT HAS TO BE:
+;
+;   PutHexN and friends   There is no 64-bit hex printer in any Pi 4
+;                         library. string.pi4's Hex() formats a .w - a
+;                         SIXTEEN-bit value - into a buffer, which is a
+;                         different job, and DisplayPrintHex() writes to
+;                         glass. Sixteen hex digits of x0 is the most
+;                         valuable line this program prints and it is
+;                         not going through a 16-bit formatter.
+;   CacheLine /           No library does I-cache maintenance, and none
+;   CacheFlushRange       should: display.pi4 uses "dc cvac" because its
+;                         reader is the display controller, which is the
+;                         DMA case. Ours is the self-modifying-code case
+;                         and wants "dc cvau" + "ic ivau". Same family,
+;                         different instruction, opposite mistake.
+;   CallAddr              A loader jumping into a payload and surviving
+;                         the return is this program's entire reason to
+;                         exist. Nothing generic can own it.
+;   Crc32                 Nothing else on this part needs one yet.
+;
+; ---------------------------------------------------------------------
+; THE MEMORY MAP THIS MONITOR IMPOSES, AND WHY IT HAS TWO WINDOWS
+; ---------------------------------------------------------------------
+; UNCHANGED IN 2.0 except for 256 bytes named below. If you are checking
+; whether a payload built for an older monitor still loads: it does.
+;
+; U-Boot's own bdinfo on THIS board (measured, not from a web page)
+; reports DRAM in two banks:
+;
+;     bank 0   $00000000 .. $3B2FFFFF        ~944 MiB
+;     bank 1   $40000000 .. $FBFFFFFF        ~3 GiB
+;
+; and U-Boot relocates itself to roughly $3B03C000, reserving upward
+; from there. The second bank was UNREACHABLE under the 32-bit model -
+; not because 3 GiB does not fit in 32 bits (it does; $FBFFFFFF is under
+; 4 GiB) but because every address the monitor compared was a SIGNED
+; .i, so anything from $80000000 up was negative and every range test
+; rejected it. Three quarters of the board's DRAM was invisible for a
+; reason that was entirely about the type.
+;
+;   $00000000..$00000FFF  firmware spin table and the secondary cores'
+;                         release mailboxes           DO NOT TOUCH
+;   $00001000..$000FFFFF  monitor stack, growing DOWN from $00100000
+;   $00100000             #MON_STACK  (monitor stack top)
+;   $001FF000..$001FFFFF  #AB_BASE - the autoboot record. MOVED HERE ON
+;                         2026-09-08, out of the image window, because
+;                         that window stopped having a top. A fixed page
+;                         BELOW the load address: no image size can
+;                         reach an address under its own base. See
+;                         AUTOBOOT below for why it cannot be a Global,
+;                         and THE MEMORY MAP in Board/memmap.pi4 for the
+;                         four properties that chose this page.
+;   $00200000..                   monitor image - CODE ONLY since
+;                         2026-08-28, and SINCE 2026-09-08 IT HAS NO
+;                         TOP. There is no second number on this line
+;                         because there is no constant: the image ends
+;                         where the image ends (__image_end__), the
+;                         monitor reserves the megabyte it ends in, and
+;                         `map` at the prompt prints both. Today's build
+;                         is 2,106,560 bytes and ends at $004024BF, so
+;                         today it reserves $00200000..$004FFFFF and the
+;                         low window starts at $00500000. THOSE ARE NOT
+;                         THE NUMBERS THE CONSTANTS USED TO CARRY, and
+;                         they stopped being them on the day the DSI
+;                         work merged - which is the whole argument for
+;                         deriving them. See THE CEILING AND WHERE IT
+;                         WENT below.
+;   ...      ..$07EFFFFF  the LOW payload window, #PAY0_HI at the top and
+;                         its bottom edge computed - HwPayLo(0). 123 MiB
+;                         with today's monitor
+;   $07F00000..$080FFFFF  the payload's own stack lives here - see below
+;   $08100000..$0817FFFF  #ETH_RX_BASE - the Ethernet receive ring, half
+;                         a megabyte of it. NEW, and it is inside the band
+;                         below that was already never offered to a
+;                         payload, so no window moved to make room. See
+;                         THE ETHERNET RECEIVE REGION under THE NETWORK.
+;   $08200000..$0BFFFFFF  named DSI framebuffer, module arena, V3D arena
+;                         and screenshot reservations (see memmap.pi4)
+;   $0C000000..$0CFFFFFF  monitor Vulkan device-memory heap
+;   $0D000000..$0DFFFFFF  #MON_DATA_LO..#MON_DATA_HI - 16 MiB monitor BSS
+;                         reservation, checked against the linker map.
+;                         It follows the Vulkan heap and is protected by
+;                         HitsMonitor().
+;   $0E000000..$3B2FFFFF  free, but DELIBERATELY NOT OFFERED - see below
+;   $3B03C000..$3B2FFFFF  U-Boot relocated, its heap, its stack, and the
+;                         code the three parked cores are spinning in.
+;                         HISTORICAL, and left in the map on purpose:
+;                         U-Boot is no longer on the stick (safety.pi4:
+;                         362-365), so nothing of it is up there now and
+;                         the parked cores are in the FIRMWARE's spin
+;                         table at $00000000..$00000FFF instead
+;                         (smp.pi4:361-364 names the four release
+;                         words). The line stays because the band is
+;                         still not offered and because a range that
+;                         silently disappears from a map gets re-used by
+;                         somebody who never knew it was claimed.
+;   $3B300000..$3FFFFFFF  not DRAM - the hole between the two banks
+;   $40000000..$FBFFFFFF  #PAY1_LO..#PAY1_HI  HIGH window, 3 GiB
+;   $FC000000..$FFFFFFFF  VideoCore and the peripheral aperture
+;
+; WHY THE LOW WINDOW STILL STOPS AT $07EFFFFF. Every image this compiler
+; emits sets sp to $08000000 unless it was built with --stack-addr, and
+; it grows DOWN from there. A payload loaded at $07F80000 would be eaten
+; by its own first push. One clear megabyte below the default stack top
+; is the same margin the proven monitor used and it is kept for the same
+; reason.
+;
+; ---------------------------------------------------------------------
+; THE CEILING AND WHERE IT WENT
+; ---------------------------------------------------------------------
+; MEASURED 2026-08-28, twice, because the number in circulation before
+; that date was wrong in a way that stopped work: it was believed that
+; this monitor sat about three kilobytes from a wall and therefore could
+; not host Wi-Fi. It does not, and it can. Everything below is a build
+; rather than an opinion, and the build lines are at the end of this
+; section so anybody can reproduce every number in it with no board.
+;
+; RE-MEASURE RATHER THAN TRUST A FIGURE WRITTEN HERE BEFORE 2026-08-28.
+; The A64 backend gained PruneUnreachedProcedures (IRCore_A64.pbi) that
+; morning and images are 8-37 percent smaller than any earlier figure.
+; Where an old number is still quoted below it is labelled as historical
+; and the current one is beside it.
+;
+; THERE WERE TWO NUMBERS AND ONLY ONE OF THEM WAS A CEILING. The soft one
+; is still here and still soft. The hard one has been removed - see THE
+; HARD ONE below, which is the long half of this section.
+;
+; THE SOFT ONE - the BSS floor at #MON_LO + 512 KiB. It is a NOTCH, not
+; a wall. A64Assembler.pbi runs a measuring pass before it assembles
+; (A64Assembler.pbi:1892-1919): pass 0 walks the whole listing to find
+; where the code really ends, throws the symbol table away, and places
+; the whole BSS on the NEXT 64 KiB BOUNDARY after it - never below
+; A64LoadBase + #A64_BSS_GAP (A64Assembler.pbi:31, $00080000), which is
+; a floor kept only so that a small program keeps the layout it has
+; always had. Code passing $00280000 therefore collides with nothing;
+; it moves BSS to $00290000 and the build carries on.
+;
+; THAT HAS ALREADY HAPPENED HERE. The image was 548,964 bytes on the
+; morning of 2026-08-28, which ends at $00286064 - twenty-four kilobytes
+; PAST the floor - and the .sym for that same build puts the first BSS
+; symbol at $00290000. The mechanism did its job, said nothing, and the
+; report that this file was three kilobytes from disaster was describing
+; a build that had already been superseded.
+;
+; THE NOTCH NO LONGER APPLIES TO THIS BUILD AT ALL, and the paragraphs
+; above are kept because they apply to every OTHER program on this
+; target - the diagnostics, the harnesses, anything built without
+; --bss-addr. This file's build line names a BSS base explicitly, so the
+; measuring pass still runs (the overlap refusal needs its answer) but
+; does not get to place anything. See A64SetBssBase in
+; RaspberryPi4/A64Assembler.pbi.
+;
+; WHAT MOVING THE NOTCH COSTS, since a bare claim that nothing breaks
+; deserves a list rather than a promise:
+;
+;   the stack refusal      still correct. A64Assembler.pbi:1978-1988
+;                          tests the stack top against the MEASURED end
+;                          of BSS, not against the floor, so it tracks
+;                          the notch by construction.
+;   the .sym contract      unchanged. BSS labels stay absolute and code
+;                          labels stay image-relative either way
+;                          (A64Assembler.pbi:1990-1999), so every gate
+;                          under tools/a64 reads the right addresses
+;                          without knowing where the notch landed.
+;   the native emulator    A64EmuCore.pbi:73-74 still computes its BSS
+;                          base as load + 512 KiB unconditionally, so
+;                          for an image LARGER than 512 KiB it disagrees
+;                          with the assembler. It does not misroute a
+;                          real BSS access - the model's RAM segment is
+;                          8 MiB and begins at the lower of the two, so
+;                          the true BSS is inside it - but in the band
+;                          where image and RAM overlap a read is served
+;                          from the image and a write goes to the RAM
+;                          array. Nothing in this monitor is exercised
+;                          there: the oracle that runs this file is
+;                          tools/a64/a64_interp.py, which has one flat
+;                          memory and no such seam. Recorded here as a
+;                          known divergence rather than repaired from a
+;                          file that cannot test the repair.
+;
+; THE HARD ONE - #AB_BASE - WAS THE CEILING, AND IT IS GONE. TWICE.
+; ------------------------------------------------------------------
+; 2026-08-28 TOOK HALF OF IT OUT AND THE NOTE OF THAT DATE SAID IT HAD
+; TAKEN ALL OF IT. Read the correction before anything else in this
+; section: what moved that day was the BSS, which stopped sharing the
+; window with the code (--bss-addr, #MON_DATA_LO). The CODE window
+; stayed exactly as it was - #MON_LO $00200000 to #MON_HI $003FFFFF,
+; with the autoboot record in its last 256 bytes, the payload window
+; starting at the constant $00400000 and every upload tool staging
+; there. So the budget for the program went from 2,096,896 bytes for
+; code AND BSS to 2,096,896 bytes for code alone. That is a bigger
+; allowance. It is not the absence of one, and it was reported as the
+; absence of one.
+;
+; ELEVEN DAYS LATER THE MONITOR WAS 2,083,268 BYTES. Sixteen thousand
+; eight hundred and seventy-two bytes of headroom - about one commit -
+; and the overrun would have been an image landing on the autoboot
+; record with nothing printed. The half that was left was the half that
+; mattered.
+;
+; THE RULING, 2026-09-08: "the bootloader is a kernel and can be as big
+; as it wants." That is not a bigger number. It is the removal of the
+; idea that there is a number.
+;
+; WHAT A CEILING ACTUALLY WAS, so the shape is recognisable next time.
+; It was never one constant. It was a MAP BUILT AROUND A CONSTANT: the
+; program's reserved region was typed rather than measured, and then
+; four other things - the autoboot record, the payload window, the
+; staging address in four host tools, the gate's layout check - were
+; each positioned against that typed number. Every one of them had to
+; be right about a fact none of them could see, and the program was the
+; only thing in the arrangement that knew how big it was.
+;
+; SO THE PROGRAM ANSWERS NOW. RaspberryPi4/EmitCore_A64.pbi emits
+; __image_start__ and __image_end__ on every A64 build - the pair costs
+; zero bytes, an image hashes identically before and after - and
+; Board/memmap.pi4 reads them with the same adrp/add pair _start uses
+; for __bss_start__. From that one measurement:
+;
+;   HwMonLo()/HwMonHi()   the running image, rounded up to a megabyte.
+;                         Not #MON_LO: a monitor relocated with
+;                         --load-addr now protects ITSELF, which the
+;                         constants got backwards in both directions -
+;                         see BUILDING THIS SOMEWHERE OTHER THAN
+;                         $200000 below, where that defect was recorded
+;                         as unfixable and no longer is.
+;   HwPayLo(0)            the megabyte above #MON_LO plus the image
+;                         size. The window is bounded below by the
+;                         monitor that will be resident after the next
+;                         reset, which is the one at the load address -
+;                         so a relocated copy still advertises the
+;                         window a payload was built for.
+;   HwStageAddr()         that same address, and it is what the four
+;                         upload tools now ASK the board for through
+;                         `map` instead of each carrying 0x400000.
+;   the region list       HwMonRegions()/HwMonRegionLo()/HwMonRegionHi()
+;                         - the code, the data window and the autoboot
+;                         page. HitsMonitor() walks it instead of
+;                         growing an If per board.
+;
+; THE GRAIN IS ONE MEGABYTE AND THAT IS THE ONLY GUARD. A payload
+; address stays valid until the monitor crosses a megabyte boundary,
+; and on the day it does the board says so in a full sentence with the
+; new window in it. The whole arithmetic is in Board/memmap.pi4 with
+; its reasoning; nothing here restates it, because a second copy of a
+; rule is the defect this removed.
+;
+; THE AUTOBOOT RECORD MOVED, and this paragraph supersedes THE THREE
+; OBVIOUS MOVES above. That list refused "move the autoboot record out"
+; on the grounds that it buys 256 bytes and that there is nowhere to
+; put it. Both were answers to a different question. It is not buying
+; space now - it is getting out of the way of a region with no top -
+; and "nowhere to put it" was about a WATCHDOG SCRATCH REGISTER that
+; survives a reset of the SoC, which this part genuinely does not have
+; and which the record never needed. It needs raw DRAM at a fixed
+; address that survives _start. $001FF000, the last page below the load
+; address, is that: the image grows UP from #MON_LO so no size reaches
+; it, the monitor's stack grows DOWN from $00100000 a megabyte below
+; it, and it is not BSS so the zeroing loop cannot touch it. The four
+; properties and the reasoning are in Board/memmap.pi4.
+;
+; THE OTHER TWO REFUSALS IN THAT LIST STAND AS WRITTEN. Growing the
+; window upward and growing it downward were both answers to "how do we
+; get a bigger allowance", and there is no allowance to enlarge.
+;
+; WHAT THIS COSTS, item by item, because a claim that nothing breaks
+; deserves a list rather than a promise:
+;
+;   today's map               MOVED, and that is measured rather than
+;                             predicted. When this lane began the image
+;                             was 2,083,268 bytes and its arithmetic
+;                             landed on $00200000..$003FFFFF with the
+;                             window at $00400000 - the exact two
+;                             constants this file used to carry, which
+;                             is why the proof gate below had to exist.
+;                             With main merged it is 2,106,560 bytes,
+;                             ending at $004024BF, so it reserves
+;                             $00200000..$004FFFFF and the window is at
+;                             $00500000. The constants were sixteen
+;                             kilobytes from wrong when the ruling was
+;                             made and they went wrong eleven hours
+;                             later, in somebody else's branch.
+;   a payload built last month  STILL RUNS, and does not need
+;                             rebuilding. The address in a build line
+;                             does not go into the image: the same
+;                             source built --load-addr 0x400000 and
+;                             --load-addr 0x1000000 is byte for byte
+;                             the same file, because A64 output is
+;                             position-independent - measured on six
+;                             diagnostics and gated whole-image by
+;                             a64_nosizecap_check case 9. What moves is
+;                             where it is STAGED, which the board says
+;                             and the tools ask. An address typed by
+;                             hand at the old window is refused loudly,
+;                             with the new one printed.
+;   the four upload tools     ask `map` and follow. tools/anvil.py's
+;                             stage_from_map is the single reader of
+;                             that answer; a monitor too old to have
+;                             `map` gets a full sentence and the run
+;                             stops rather than guessing.
+;   the gates                 tools/a64/a64_anvil_check.py computes the
+;                             map from #MON_LO, #MON_GRAIN and the
+;                             length of the built image, then runs the
+;                             monitor's own `map` and grades every
+;                             address against it - two statements of
+;                             one rule, one of them executed.
+;   the proof                 tools/a64/a64_nosizecap_check.py builds
+;                             this monitor with a megabyte of real
+;                             table added, gets an image half again the
+;                             size of the old ceiling, and shows the
+;                             map, the window, the staging address and
+;                             a run all moving with it while the
+;                             autoboot record stays where it is. That
+;                             gate exists because every number in the
+;                             other one is, today, also consistent with
+;                             a ceiling that never left.
+;   the command-line build    MaxROM is 0 for pi4 and unoq. It was a
+;                             64 MiB "soft image-size budget" on parts
+;                             with no ROM.
+;   the native emulator       no longer caps an image at 8 MiB, and its
+;                             BSS base follows --bss-addr. That
+;                             divergence was recorded as survivable
+;                             while images were small; at two megabytes
+;                             load + 512 KiB is inside the image and
+;                             the model would answer a read and a write
+;                             of one address from two places.
+;
+; WHAT IS STILL WORTH DOING, AND IT IS NOT URGENT ANY MORE
+; --------------------------------------------------------
+; HOW MANY SCRATCHPAD PAGES THE VL805 ACTUALLY ASKS FOR HAS NEVER BEEN
+; WRITTEN DOWN. It is a field of HCSPARAMS2 and xhci.pi4:1530 already
+; reads it into xh_scratch, so the board can answer the question the
+; moment somebody asks it. If the VL805 wants 32, #XHCI_MAX_SCRATCH = 32
+; hands 384 KiB back. That used to be the single largest saving
+; available anywhere in this program; it is now just tidiness, which is
+; the point of having done the layout work first.
+;
+; IT IS DELIBERATELY NOT CHANGED ON A GUESS. Handing a controller fewer
+; scratchpad buffers than it asks for is a DMA master writing into
+; memory that is not its own, and xhci.pi4:1984-1985 refuses loudly for
+; exactly that reason. Lowering the constant from a plausible number
+; would trade that loud refusal for silent corruption, which is the
+; wrong direction on a bench where the corruption would be blamed on
+; the USB stack for a week. Measure it, then change it.
+;
+; DOES WI-FI FIT. YES, and the question is now the wrong shape - the
+; whole-tree build above includes sdio.pi4 and cyw43.pi4 along with
+; twenty-eight others and lands at 59 percent of the OLD budget, which
+; is the budget for CODE ALONE now. The older answer here quoted 680,768
+; bytes for anvil-plus-those-two and called it a worst case "because
+; this backend does not yet drop procedures the program cannot reach".
+; It does now, so that sentence and its number are both retired; see the
+; whole-tree measurement above, which supersedes them.
+;
+; THE FIRMWARE BLOB IS NOT PART OF THIS ARITHMETIC. brcmfmac43455-sdio.bin
+; is 609,309 bytes and it stays a FILE on the boot stick that fat.pi4
+; reads at run time; it is never linked and never appears in the image.
+; It does need somewhere to land, and that somewhere must NOT be this
+; window - it is nearly a third of it. The payload low window has
+; 123 MiB (#PAY0_LO, $00400000) and is the obvious home. Whoever wires
+; the upload should name a constant for it down beside #ETH_RX_BASE
+; rather than taking the obvious next free address: two multicore
+; examples once did exactly that and silently overwrote a live string
+; that belonged to something else.
+;
+; IS THE IMAGE SIZE ITSELF A CONSTRAINT, separately from the layout? No,
+; and it is worth saying because the two get confused. 549 KB over `b`
+; at the measured 37 KB/s is about fifteen seconds, and 680 KB is about
+; nineteen. That is an annoyance, and the answer to it already exists
+; and is not a diet: `get` fetches over the Ethernet socket instead,
+; which is the whole reason the network went in - eleven kilobytes a
+; second was twenty-four seconds for a 260 KB image. The boot path does
+; not care either. The firmware loads KERNEL8.IMG whole, off a USB
+; stick rather than a wire.
+;
+; THE BUILD LINES, so every number above can be reproduced with no board:
+;
+;   the monitor as it ships - the placement comes from this file's own
+;   LoadAddress / BssAddress / StackAddress lines, so there is nothing
+;   to pass
+;     PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;         -o RaspberryPi4/Monitor/anvil.img
+;
+;   the same thing with BSS BACK INSIDE THE IMAGE, which is what the
+;   54-percent figure above describes and is the layout every earlier
+;   number in this file was measured in. It can no longer be produced
+;   by leaving a flag off, because the source now says where BSS goes:
+;   comment out the BssAddress line and build. (A --bss-addr flag will
+;   not do it either - one that disagrees with the source is refused.)
+;     PureMetalForge.exe --compile RaspberryPi4/Board/board.pi4 -t pi4
+;         -o anvil_contiguous.img
+;
+;   the whole-tree build, which is the 59-percent figure: add an
+;   XIncludeFile line for every .pi4 in RaspberryPi4/Lib except soc.pi4,
+;   then build a copy the same way. Vulkan viewport defaults are encoded as
+;   explicit IEEE-zero bit patterns and do not enable floating point.
+;
+; then read the size of the .img for the code, and the .sym with the
+; .sym.meta for the BSS: every symbol at or above the load address is a
+; BSS symbol at an ABSOLUTE address, and the .meta line of the same name
+; gives its size in bytes. The end of BSS is the largest address plus
+; size among those. Nothing here needs the board to be powered.
+;
+; THAT "AT OR ABOVE THE LOAD ADDRESS" RULE STILL HOLDS WITH --bss-addr,
+; and it is worth saying because it is the one thing about the .sym that
+; could have broken. Code labels are exported as offsets from the load
+; base and BSS labels as absolute addresses
+; (A64Assembler.pbi's ExportSymFile call); a BSS base ABOVE the load
+; address keeps the two sets far apart, which $0D000000 does by 206 MiB.
+; A BSS base BELOW the load address would make the rule ambiguous, and
+; that is a reason to keep this one above it rather than a defect.
+;
+; WHY $08100000..$3B2FFFFF IS LEFT OUT even though it is free. Both of
+; its edges MOVE. The bottom edge is wherever the payload's stack top
+; ends up, which --stack-addr can change at build time and the monitor
+; cannot discover. The top edge is U-Boot's relocation base, which moves
+; when U-Boot is updated or when the board's DRAM size changes - and it
+; is not just dead code up there: U-Boot leaves the PSCI / spin-table
+; trampoline that cores 1-3 are parked in, and those cores are still
+; executing it. A window whose edges move is a window that is wrong one
+; day without announcing it. The high window has no such edges.
+;
+; WHY THE HIGH WINDOW IS THE WHOLE OF BANK 1. Nothing of U-Boot's is in
+; bank 1 at all: it relocated into bank 0 and reserves upward within
+; bank 0, so there is no reservation in bank 1 to collide with, and no
+; number in this file that has to track U-Boot's size. 3 GiB, one
+; constant each end, both measured.
+;
+; A BLOCK MAY NOT STRADDLE THE GAP between the windows, and the range
+; check below refuses one that tries rather than writing the half that
+; happens to land. There is no DRAM at $3B300000..$3FFFFFFF; a store
+; there is not slow, it is wrong.
+;
+; ---------------------------------------------------------------------
+; BUILDING THIS SOMEWHERE OTHER THAN $200000 - READ BEFORE YOU DO
+; ---------------------------------------------------------------------
+; A RESIDENT MONITOR REFUSES A LOAD INTO $200000..$3FFFFF, which is its
+; own window, so it cannot be used to replace itself. That refusal is
+; correct and it is the whole point of HitsMonitor(). The two ways round
+; it, and they are not equal:
+;
+;   through U-Boot   reset, let U-Boot come up, load and "go 0x200000".
+;                    This is the canonical build and the one every
+;                    number in the map above describes. It costs a
+;                    power cycle or a reset.
+;
+;   somewhere else   a build with --load-addr 0x2000000 puts a second copy
+;                    in the LOW PAYLOAD WINDOW, where the resident
+;                    monitor is willing to write it, and "g 2000000"
+;                    hands over with no reset at all.
+;
+; THE PROTECTED REGION FOLLOWS THE RUNNING IMAGE SINCE 2026-09-08, and
+; this paragraph used to say the opposite. It said: "#MON_LO/#MON_HI are
+; constants and do not follow the image. A copy running at $2000000
+; still refuses loads at $200000..$3FFFFF - the window where nothing of
+; it lives - and does NOT refuse a load on top of itself" - and closed
+; with "making the window follow the image would need the running base
+; at run time, and this file does not know it".
+;
+; IT KNOWS IT NOW. __image_start__ and __image_end__ are emitted into
+; every A64 image and HwMonLo()/HwMonHi() read them, so a copy running
+; at $2000000 protects $2000000 and nothing else. Both halves of the old
+; defect are gone at once: it no longer guards a window it is not in,
+; and it no longer allows a payload on top of itself. The banner names
+; the running image for the same reason.
+;
+; THE PAYLOAD WINDOW IS DELIBERATELY NOT MOVED BY A RELOCATED COPY. It
+; is computed from #MON_LO plus the image's SIZE, not from where this
+; copy happens to be, because the window answers "where may a payload
+; live" and that band is bounded below by the monitor that will be
+; resident after the next reset. So a payload aimed at the window this
+; board advertises still works while a second monitor is running at
+; $2000000, and a load aimed at $2000000 is refused by name. The
+; reasoning is at HwPayLo() in Board/memmap.pi4. Type `map` for the
+; address rather than reading one off this page: on the build this
+; paragraph was last measured against it is $00500000, and the point of
+; the whole change is that the next build may say something else.
+;
+; A relocated copy is still a fine way to try a new monitor on a live
+; bench and still a bad thing to leave running: put the canonical build
+; back at $200000 at the next reset, and type `map` on whichever one is
+; answering to see which computer you are actually talking to.
+;
+; ---------------------------------------------------------------------
+; RUNNING A PAYLOAD IN THE HIGH WINDOW - what it needs from the build
+; ---------------------------------------------------------------------
+; NOTHING, unless it pins its BSS. The load address is not in the image:
+; code reaches its own code, data and variables PC-relative, so the same
+; source built --load-addr 0x400000 and --load-addr 0x40000000 is byte
+; for byte the same file, and a payload built for the low window runs
+; unchanged when it is staged in the high one (proved whole-image by
+; tools/a64/a64_nosizecap_check.py case 9, and entered at a staging
+; address it was not built for by case 8). An image built with an
+; explicit --bss-addr or BssAddress line IS pinned: its variables are at
+; that absolute address and the code finds them by distance, so that one
+; has to be built for the window it will run in:
+;
+;   PureMetalForge.exe --compile ... -t pi4 --load-addr 0x40000000
+;
+; ONE THING THE WINDOW CHECK DOES NOT COVER, and it is easy to miss: the
+; image's BSS is placed 512 KiB above its load base (#A64_BSS_GAP), and
+; the loader never writes a byte of it, so no range check here ever sees
+; it. A payload staged near the TOP of a window puts its BSS past the
+; end of that window at run time, and in the low window's case that is
+; the payload's own stack corridor. Leave room, or use the high window,
+; where there are three gigabytes of it.
+;
+; ---------------------------------------------------------------------
+; THE STACK COLLISION, AND WHY THIS FILE MOVES ITS OWN STACK
+; ---------------------------------------------------------------------
+; Every image the compiler emits starts with a prologue that sets sp to
+; a HARDCODED $08000000 - monitor and payload alike. Left alone, the
+; payload's very first push lands on the monitor's live frames and
+; returning from "g" walks off into the weeds.
+;
+; The first thing Main() does is therefore move the monitor's stack to
+; #MON_STACK with three instructions of inline asm. From that point on
+; every monitor frame lives near $00100000 and the payload is welcome
+; to own $08000000 undisturbed. This is why Main() MUST NEVER RETURN:
+; its own frame was allocated on the old stack and its epilogue would
+; reload a link register from the new one. Main() ends in an endless
+; command loop with no Break for exactly that reason.
+;
+; THE LINK-TIME STACK TOP IS NOW STATED IN THIS FILE, as StackAddress
+; $8000000 under WHERE THIS IMAGE RUNS below. That is the compiler
+; default and the value this file has always been built with, so nothing
+; moved; it is written out so the file states its whole layout in one
+; place instead of two thirds of it.
+;
+; IT IS NOT THE STACK THE MONITOR RUNS ON. The asm block below overrides
+; it a few instructions into Main(), which is the entire point of that
+; block - so StackAddress here is what a PAYLOAD inherits, not what the
+; monitor uses. Changing it (or passing --stack-addr, which must agree
+; with it or the build stops) does not move the monitor's stack; delete
+; the asm block if that is what you want.
+;
+; ---------------------------------------------------------------------
+; LANGUAGE FACTS THIS FILE IS WRITTEN AROUND (64-bit model)
+; ---------------------------------------------------------------------
+; * .i, pointers and every integer intermediate are 8 bytes, SIGNED,
+;   carried in X registers. Every physical address a BCM2711 can produce
+;   fits in 40 bits, so it is positive in a 64-bit .i and the signed
+;   comparisons in this file are correct for every address the hardware
+;   can present. That is a statement about the part, not a lucky
+;   accident of the type.
+; * A PEEK FOLLOWS ITS TYPE LETTER, ruled 2026-08-25, and this file was
+;   swept for it. PeekB/PeekW/PeekL name the SIGNED types and they
+;   SIGN-EXTEND; PeekA/PeekU/PeekN are the unsigned spellings. So:
+;     - a raw payload byte is PeekA, not "PeekB(...) & $FF". The mask
+;       gave the right answer and said the wrong thing.
+;     - a peripheral register is PeekN. The VideoCore's success code IS
+;       $80000000 and its FULL flag IS bit 31; read through PeekL those
+;       are negative numbers.
+;     - reading a .b ARRAY element (gLine[], gRec[]) is a .b read and
+;       still sign-extends, so those masks stay. The accessor changed;
+;       the type did not.
+; * A BARE Peek/Poke, and .i, ARE EIGHT BYTES on this target. PeekI /
+;   PokeI are the explicit spellings and the autoboot record uses them.
+; * >> IS ARITHMETIC on a signed .i. Every value shifted right in this
+;   file is provably positive at the point of the shift (a masked hex
+;   nibble, a revision bitfield, or a CRC accumulator held inside 32
+;   bits), and the sites that depend on it say so.
+; * Procedure locals are statically allocated, not stacked. Nothing here
+;   is reentrant and nothing recurses - both loaders, the command parser
+;   and the boot wait are iterative loops.
+; * OPERATOR PRECEDENCE IS NOT the desktop BASIC's. & | ! bind TIGHTER than
+;   << >>, so "v << 4 | d" would parse as "v << (4|d)" and
+;   "crc >> 1 ! POLY" would parse as "crc >> (1 ! POLY)". Written
+;   "(v << 4) | d" and "(crc >> 1) ! POLY" throughout. Parenthesise
+;   shifts, always.
+; * A CONSTANT INITIALISER TAKES A BARE LITERAL. "#K = 2 + 1" is
+;   refused, which is why the sizes below are written out.
+; * .q is accepted by this backend. THIS FILE DOES NOT USE IT. .i is
+;   already the 64-bit machine word here.
+;
+; =====================================================================
+;  THE TWO DOWNLOAD PATHS
+; =====================================================================
+;
+; ---------------------------------------------------------------------
+; b - THE FAST PATH. Our own protocol, because it can be.
+; ---------------------------------------------------------------------
+;   pmf> b <addr-hex> <len-hex> <crc32-hex>
+;   monitor:  rdy
+;   host:     <len> raw bytes, in chunks of 1024
+;   monitor:  one "+" after each chunk, including the last short one
+;   monitor:  ok        (verified)     or     crc     (did not verify)
+;
+; MEASURED 11.2 KB/s against S-records' 4.6. Nothing in the 2.0 rewrite
+; touches the protocol, and #BLK MUST KEEP MATCHING RAW_CHUNK in
+; tools/ubsend.py - they are one number written in two places because
+; the two programs cannot share a header.
+;
+; ASCII HEADER, BINARY BODY. The header stays human-readable so the
+; protocol is greppable in a terminal log and can be driven by hand from
+; a serial console. The body is raw, which is the entire point: an
+; S-record spends two hex characters plus per-line framing on every
+; byte.
+;
+; THE ADDRESS FIELD IS AS WIDE AS THE PARSER, which is 16 hex digits.
+; Every byte of DRAM on a 4 GiB Pi 4 is below $100000000, so an S3
+; record can already reach all of it; the width here is for an 8 GiB
+; part and for anything mapped high.
+;
+; PER-CHUNK ACK, AND NOT A BYTE MORE OF PROTOCOL. There is no flow
+; control on this wire and the PL011 has a 32-byte RX FIFO - about 2.7
+; ms of slack at 115200. One ack byte per kilobyte costs about a
+; millisecond against the ~89 ms that kilobyte takes to arrive, so the
+; insurance is free. It is still NOT a state machine with retries,
+; sequence numbers and per-chunk timeouts. A host that ignores the acks
+; entirely still transfers correctly; it just loses the backstop.
+;
+; CRC32 OVER THE WHOLE IMAGE, NOT PER CHUNK. A per-record checksum -
+; which is all an S-record has - cannot detect a MISSING record. A whole
+; image CRC catches truncation, reordering and corruption with one
+; number. Standard IEEE polynomial, reflected, $EDB88320, so the host
+; side is `zlib.crc32(data)` and nothing else.
+;
+; IT IS COMPUTED BY READING THE PAYLOAD BACK OUT OF MEMORY after the
+; transfer, not accumulated as bytes arrive. Two reasons and both are
+; real: it keeps the receive loop down to "poll, read, store", which is
+; the loop that has a deadline; and it verifies what the stores actually
+; produced rather than what we believed we received.
+;
+; ---------------------------------------------------------------------
+; l - THE PROVEN PATH. Kept, deliberately.
+; ---------------------------------------------------------------------
+; S3 data records and an S7 terminator. It is the path that got the
+; first image onto this board and the path that carried the
+; --entry-returns proof on 2026-08-25, and it is not being deleted. If
+; `b` turns out to have a timing problem on the real wire that no model
+; can show, the board still has a loader. If the two ever disagree about
+; the same image, that disagreement is information - dump the range with
+; `m` and believe the CRC.
+;
+; ---------------------------------------------------------------------
+; THE HOST SIDE
+; ---------------------------------------------------------------------
+; tools/ubsend.py drives both. Its prompt tuple already includes ours:
+;
+;   PROMPTS = (b"U-Boot> ", b"=> ", b"pmf> ")
+;
+; DO NOT CHANGE THE PROMPT STRING. The host waits for it. The S-record
+; mode needs nothing else, because it sends "loads", which this monitor
+; reads as the l command (the word after the first letter is ignored),
+; and "go 0x200000", which it reads as g with a 0x-prefixed argument.
+; That U-Boot compatibility is deliberate and it is cheap, so it stays -
+; and it is why the new commands are all single letters that no U-Boot
+; script would type by accident.
+;
+; =====================================================================
+;  WHAT 2.0 ADDS, AND WHY EACH ONE IS HERE
+; =====================================================================
+;
+; ---------------------------------------------------------------------
+; i - board info
+; ---------------------------------------------------------------------
+; Revision decoded, SoC temperature, and every clock's configured AND
+; measured rate. All of it is mailbox.pi4 talking to the VideoCore; none
+; of it is new work here.
+;
+; THE REVISION TABLE STOPS AT THE BCM2711 FAMILY on purpose. A decoder
+; that guesses a model it has never met is a confident wrong answer, and
+; the processor field is printed separately anyway, so a board this
+; table does not know still reports its SoC and its memory correctly and
+; says "board type $xx" for the part it cannot name. Extend the table
+; when a board is actually in front of you, not from a web page.
+;
+; TEMPERATURE IS FAHRENHEIT (house rule 20). The mailbox reports
+; THOUSANDTHS OF A DEGREE CELSIUS and mailbox.pi4 deliberately does not
+; convert - that is the documented unit and hiding it would make the
+; library unreadable against the firmware documentation. The conversion
+; happens once, for the whole tree, in Anvil/Hal/hal.pbi's
+; HwTempMilliF(); PutTempF() only formats it. Hz is left alone: hertz is
+; the American engineer's unit as much as anyone's, which is exactly the
+; exception rule 20 states.
+;
+; CONFIGURED AND MEASURED ARE DIFFERENT QUESTIONS. The configured rate
+; is what the firmware intends; the measured rate is what it observes.
+; They disagree whenever the on-demand governor has dropped the core for
+; thermal or undervoltage reasons. Printing only one of them would be
+; the kind of half-truth this project exists to stop.
+;
+; ---------------------------------------------------------------------
+; c [hz] - show or set the ARM clock
+; ---------------------------------------------------------------------
+; This board BOOTS AT 600 MHz while the compiler's board file says
+; 1500000000 - measured 2026-08-25, a factor of 2.5 with nothing
+; anywhere saying so. `c` is how you find out and `c 1500000000` is how
+; you fix it, through clocks.pi4.
+;
+; THE FIRMWARE CLAMPS A RATE IT DISLIKES AND REPORTS SUCCESS. Ask for
+; 2.5 GHz on a 1.5 GHz part and the response code is SUCCESS and the
+; rate you get is 1500000000. So this command prints what was ASKED,
+; what was APPLIED and what was then MEASURED, and never just "ok". If
+; applied differs from asked it says CLAMPED in as many words.
+;
+; ITS ARGUMENT IS DECIMAL, and it is the only decimal argument in this
+; monitor. Every address here is hex because addresses are read in hex;
+; a clock rate is read in decimal by every human and every datasheet,
+; and $59682F00 is not a number anyone types on purpose. A leading $ or
+; 0x still switches to hex if you want it. The help text says so.
+;
+; RAISING THE CLOCK DOES NOT SHORTEN ANY TIMEOUT IN THIS FILE. Every one
+; of them is counted in CNTPCT_EL0 ticks through timer.pi4, and that
+; counter is fixed at 54 MHz and independent of the CPU - MEASURED, not
+; assumed: the same delay at 600 MHz and at 1.5 GHz came back 10800007
+; against 10800003 ticks. That independence is the reason the receive
+; timeout is a tick count and not a spin count. uart.pi4's
+; UartReadWait() takes a spin count, which is the right shape for a
+; library that must not depend on a clock; it is the WRONG shape here,
+; because `c` can change the CPU speed underneath it by 2.5x and the
+; transfer timeout would silently change with it.
+;
+; ---------------------------------------------------------------------
+; w <addr> <value> - write one 32-bit word
+; ---------------------------------------------------------------------
+; The companion to `m`, and the thing you reach for when a peripheral
+; needs one bit poked to prove a theory. It refuses an address inside
+; the monitor, exactly as both loaders do, and it refuses an unaligned
+; one, because a 32-bit store to an odd address on a device aperture is
+; an alignment fault rather than a slow write.
+;
+; IT IS NOT WINDOW-CHECKED, for the same reason `m` is not: being able
+; to point it at a register is most of its value. Reading and writing an
+; address with no device behind it can hang the bus, and that risk is
+; accepted here as it is there.
+;
+; IT PRINTS THE READ-BACK, and the read-back is NOT a verdict. Half the
+; registers worth writing are write-only, write-one-to-clear, or latch
+; something other than what you wrote. What the line tells you is what
+; the device returns when asked, which is a fact; whether that equals
+; what you wrote is your call, not the monitor's.
+;
+; ---------------------------------------------------------------------
+; a <addr> and the boot delay - AUTOBOOT
+; ---------------------------------------------------------------------
+; This is the U-Boot habit people would otherwise keep U-Boot for: on
+; start, wait a couple of seconds, and if nobody objects, run the thing
+; that is meant to run.
+;
+; THE DEFAULT IS SAFE AND IT IS THE ONLY DEFAULT THAT CAN BE. Getting
+; the "no key pressed" path wrong strands a board that somebody has to
+; physically walk to. So:
+;
+;   nothing armed  ->  NO WAIT AT ALL, straight to the prompt. A
+;                      countdown that can only ever expire into "do
+;                      nothing" is two seconds of annoyance per boot and
+;                      teaches people to ignore it. U-Boot with an empty
+;                      bootcmd does the same.
+;   armed          ->  print the address, count down about two seconds
+;                      with a dot every quarter second, and stop dead on
+;                      any keypress. The key is CONSUMED, so it does not
+;                      become the first character of a command.
+;   armed at an    ->  refused at the prompt when you arm it, and
+;   address inside     refused again at boot time. The record lives in
+;   the monitor        DRAM and DRAM can be stale; a check that only
+;                      runs on the way in is a check that a power cycle
+;                      can walk around.
+;
+; THE RECORD CANNOT BE A Global, and this is the trap the whole project
+; keeps re-learning. A Global lives in BSS and _start ZEROES BSS four
+; instructions in, so an arming written before a restart would be erased
+; by the code meant to preserve it. Lib/safety.pi4 hit the identical
+; trap from the other side the same week and keeps its boot counter in
+; raw DRAM for the same reason. Generalised in the vault as: on this
+; backend, anything that must survive _start cannot be a Global.
+;
+; THAT PARAGRAPH IS NARROWER THAN IT READS, CORRECTED 2026-08-28. An
+; ORDINARY Global is zeroed by _start. A Global declared NoClear is not:
+; the emitter lays those out AFTER __bss_end__ and the zeroing loop stops
+; there (EmitCore_A64.pbi:861-910, and the addresses rather than the
+; section names are what tools/a64/a64_noclear_check.py proves). So "on
+; this backend, anything that must survive _start cannot be a Global" is
+; no longer true as stated, and somebody re-deriving it from this file
+; would build a worse thing than the language offers.
+;
+; THE RECORD STILL IS NOT ONE, and the reason is a different one than
+; the reason it was written for. A NoClear Global's ADDRESS is wherever
+; the compiler puts it, which moves whenever anything above it in the
+; layout changes size. That is fine for safety.pi4's boot counter, which
+; only ever has to be read by the same build that wrote it. It is wrong
+; for a record whose entire job is to be found after a reset by an image
+; that may have been rebuilt in between: a moved record is not a
+; corrupted record, it is an ABSENT one, and absent reads as "nothing
+; armed", which is the safe answer but also the silently wrong one.
+; #AB_BASE is a number that does not move.
+;
+; WHERE IT IS, AND WHY IT LEFT THE IMAGE WINDOW ON 2026-09-08. It was
+; $003FFF00, the last 256 bytes of a two-megabyte window - which made it
+; THE CEILING, because it was the first thing a growing image would land
+; on and the landing was silent. Once the window stopped having a top
+; there was no such place to keep it, so it went BELOW the load address
+; instead: $001FF000, the last page under #MON_LO. An image grows UP from
+; its base, so there is no number of bytes of code that arrives at an
+; address beneath it; the monitor's own stack grows DOWN from $00100000,
+; a megabyte the other way; and it is not BSS, so _start cannot reach it
+; either. Board/memmap.pi4 states all four properties beside the
+; constant.
+;
+; SO IT IS THREE WORDS OF RAW DRAM at #AB_BASE. It is no longer inside
+; the image window, so the loader refusal no longer protects it for
+; free - it is DECLARED instead, as one of the regions HwMonRegion*()
+; names and HitsMonitor() refuses, which is what stops `w` and `fill`
+; from quietly disarming an armed board:
+;
+;   +0   #AB_MAGIC          "PAYLOAD!" as a 64-bit literal
+;   +8   the entry address
+;   +16  entry ! #AB_MAGIC  the guard
+;
+; TWO WORDS WOULD NOT DO. Uninitialised DRAM is not random - it is
+; whatever was there before - and a magic alone can be met by a stale
+; copy of a record whose address field has since been overwritten. The
+; guard makes the pair have to agree, so a half-surviving record is
+; rejected instead of jumped to.
+;
+; AND IT IS CLEANED TO THE POINT OF COHERENCY, "dc civac", not the "dc
+; cvau" the payload flush uses. cvau cleans to the point of UNIFICATION,
+; which is what instruction fetch needs and is not what surviving a
+; reset needs. Two instructions in the same family, one letter apart,
+; and only one of them puts the bytes in DRAM.
+;
+; WHAT THIS CAN AND CANNOT BE TESTED WITHOUT A RESET, stated plainly:
+; the wait, the keypress, the refusals and the record's own read/write
+; are all exercisable from one prompt. Survival across a real reset is
+; not, and is the one part of item 4 that only silicon settles.
+;
+; ---------------------------------------------------------------------
+; get, put and net - THE NETWORK
+; ---------------------------------------------------------------------
+; The last thing anybody was still opening U-Boot for. Eleven kilobytes
+; a second down the serial line is twenty-four seconds for a 260 KB
+; image, every single time somebody changes one line; the same image
+; over this board's gigabit socket is well under a second.
+;
+;   get <name> [address]           fetch a file into memory
+;   put <name> <address> <length>  send memory back out as a file
+;   net ...                        the four addresses, and the wire
+;
+; It is TFTP, RFC 1350, which is what every board has been fetched over
+; since 1981 and what U-Boot itself uses, so anything that can serve a
+; file to a router can serve one to this.
+;
+; THE WHOLE OF THE REASONING IS IN THIS FILE, further down, under THE
+; NETWORK - get, put and net. It is there rather than here because it is
+; long and because it is about three libraries that live outside this
+; file. What belongs in this header is the four things that change the
+; shape of the monitor:
+;
+;   * THREE MORE LIBRARIES ARE INCLUDED and the image grew from about
+;     380 KB to about 520 KB because of it. That is 46 seconds to send
+;     over `b` rather than 34. It passed #MON_LO + 512 KiB shortly
+;     afterwards and NOTHING HAPPENED, which is the designed behaviour
+;     and not a near miss. THE CEILING AND WHERE IT WENT, in the memory
+;     map section above, has the arithmetic - and has it because the
+;     sentence that used to be here, that the image still fitted under
+;     the BSS floor with a few kilobytes to spare, was read by a later
+;     reader as a wall three kilobytes away and stopped work on the
+;     strength of it.
+;   * $08100000..$0817FFFF IS NOW SPOKEN FOR - the Ethernet receive
+;     ring. It is inside the band the memory map above already refuses
+;     to offer to a payload, so no window moved.
+;   * `run` NOW STOPS THE ETHERNET before it jumps. A payload must not
+;     share memory with a controller that is still writing into it.
+;   * THE ADDRESSES LIVE IN THE SETTINGS STORE, under net.address,
+;     net.netmask, net.gateway and net.server, exactly as the Wi-Fi keys
+;     do - so `settings save` keeps them and nothing loads them for you.
+;
+; NONE OF IT HAS MOVED A FRAME. The Ethernet cable was unplugged from
+; this board after transmit and receive were proven on 2026-08-26, and
+; every claim about the network in this file is a reading of genet.pi4,
+; net.pi4, tftp.pi4 and the nine RFCs in RaspberryPi4/Reference/. The
+; one part a dark port CAN demonstrate is the refusal, and it is written
+; to be demonstrated: five seconds of link wait, announced before it is
+; taken, then a whole sentence saying the cable is out.
+;
+; =====================================================================
+;  WHAT HAS ACTUALLY BEEN TESTED
+; =====================================================================
+; ON SILICON, 2026-08-25 morning, against version 1.x plus the
+; --entry-returns backend change:
+;
+;   PASSED  g 0x400000 into a compiled payload built --entry-returns,
+;           which RETURNED, and the prompt came back:
+;             ## returned, x0 = 0337F980
+;           $5A5A survived a 64-bit return, 0002 is CurrentEL>>2 (EL2),
+;           $0337F980 is 54,000,000 from CNTFRQ_EL0.
+;   PASSED  m 400000 64 afterwards, showing the epilogue in the Pi's own
+;           RAM: FE 07 40 F9 F2 03 40 F9 5F 02 00 91 C0 03 5F D6
+;   PASSED  the l S-record path carrying that payload in.
+;   NOTE    the monitor resident that morning was the PRE-REWRITE build.
+;           It answered "? unknown" to b and printed only EIGHT digits
+;           of x0. Neither limitation is in this file.
+;
+; AGAINST THE PROJECT'S OWN A64 ORACLE, version 2.0, 2026-08-25. The
+; image is EXECUTED - tools/a64/a64_interp.py with a PL011 and a
+; VideoCore property mailbox modelled on top of it, and MRS added
+; because the oracle does not decode it and timer.pi4 needs it. The
+; mailbox model CLAMPS a clock request the way the firmware does, or
+; the c command's three-number output would prove nothing.
+;
+;   122 assertions, all passing. What they cover:
+;     banner, prompt, help, unknown command, blank line, Ctrl-C,
+;     destructive backspace, and CRLF drawing one prompt not two
+;     m against the image's own bytes and against the high window
+;     w: the write, the read-back, the monitor refusal, the refusal of
+;        a word that ENDS inside the monitor, and the alignment refusal
+;     i: $00C03112 -> "Pi 4 Model B, BCM2711, 4 GB, rev 1.2", 48.732 C
+;        printed as 119.7 F, and all four clocks configured + measured
+;     c: bare report, a set that sticks, and a set that the firmware
+;        CLAMPS from 2.5 GHz to 1.5 GHz while reporting success
+;     a: arm, clear, report, the monitor refusal, a stale record aimed
+;        at the monitor being refused AT BOOT, and a record whose guard
+;        disagrees with its address being rejected
+;     the boot delay: eight dots, then the payload runs and its x0 is
+;        printed in sixteen digits; a keypress stops it and is consumed
+;     g: the sixteen digits, "go 0x400000" (U-Boot's spelling), the
+;        monitor refusal, and a 17-digit address refused not truncated
+;     b: rdy, the ack per chunk, ok, crc, and every refusal - monitor,
+;        both window edges, the gap between the banks, a 64-bit wrap,
+;        a missing CRC - plus a wire that dies mid-transfer
+;     l: records, bytes, range, entry, ok; a bad checksum; a record
+;        aimed inside the monitor leaving the code intact; the HIGH
+;        window; "loads"; and a silent host timing out
+;
+;   AND ONE FULL-SIZE TRANSFER, because a 512-byte test is not the same
+;   claim: this monitor's own 45784-byte image was sent over b, 45 acks
+;   came back, the CRC verified, and every one of the 45784 bytes was
+;   compared in memory afterwards.
+;
+; THE MODEL FOUND ONE REAL DEFECT, in the first build of this file, and
+; it is the kind that survives a code review: PutClockRow() took a
+; "*name" parameter and did Print(*name), and the i command printed
+; "2139496  configured 600000000" - the ADDRESS of the string, in
+; decimal, with no diagnostic. Print()'s router picks its formatter from
+; the argument's TYPE and an untyped pointer parameter is not a .s. The
+; fix and the warning are at PutClockRow().
+;
+; STILL UNTESTED, and only silicon can settle them:
+;   * the b protocol end to end, at 115200, against a real PL011 FIFO.
+;     This is the one the model cannot answer: the whole reason for the
+;     per-chunk ack is a timing risk a flat memory model does not have.
+;   * the cache maintenance actually being needed, or sufficient. The
+;     oracle has one flat memory and models dc/ic as no-ops, so the
+;     maintenance words are DECODED but their EFFECT is not. That covers
+;     the payload flush AND the autoboot record's civac.
+;   * writes into the HIGH window at all. bdinfo says bank 1 is there;
+;     that is a reading of a table, not a store that came back.
+;   * the autoboot record surviving a real reset.
+;   * whether U-Boot leaves anything at $00100000 that the monitor's
+;     stack then lands on.
+;   * EVERY PART OF get, put AND net THAT TOUCHES THE WIRE. The cable is
+;     out. tools/a64/a64_anvil_check.py executes the two PURE decisions
+;     in that work - the dotted-quad parser and the payload-window
+;     lookup, 41 cases - by calling them directly in the interpreter
+;     with no device model at all, because neither has any I/O. The
+;     pump, the ARP resolve, the link refusals and the settings keys are
+;     covered by nothing, and would need a modelled MAC, PHY, mailbox
+;     and TFTP server at once. The three libraries underneath have their
+;     own gates and all three pass.
+;   * the mailbox read of this board's own MAC address (tag $00010003).
+;     It has never been compared against the address printed on a real
+;     board, and the fallback that runs when it fails has never run
+;     either.
+
+; ======================================================================
+;  WHERE THIS IMAGE RUNS. THE FILE SAYS IT.                  2026-09-02
+; ======================================================================
+;  These three lines are the placement this program has always needed
+;  and could previously only be GIVEN, on the compiler's command line:
+;
+;    --load-addr 0x200000 --bss-addr 0x0D000000
+;
+;  That was fine for a build script and impossible for the IDE, which
+;  embeds the compiler and has no command line to put a flag on. An
+;  Anvil built from the IDE compiled perfectly and was linked for
+;  $80000 with its variables at $00280000 - inside the two-megabyte
+;  window this image's code has to live in - and nothing said so. Now
+;  the source states it, so the IDE build and the script build are the
+;  same build.
+;
+;  The image and stack addresses stay fixed; BSS has moved to $0D000000
+;  so the expanded monitor globals no longer exceed their protected range.
+;  Each placement is argued for further down:
+;
+;    LoadAddress  - the firmware loads this whole image off the USB
+;                   stick to $200000 as kernel8.img; CONFIG.TXT on the
+;                   stick names the same address, and Lib/mmu.pi4:84
+;                   says so. #MON_LO in Board/memmap.pi4 is this number
+;                   written where the running program can see it.
+;    BssAddress   - NOT OPTIONAL AND NOT A TUNING KNOB. See the section
+;                   below: it is what puts this program's variables
+;                   outside the window its code occupies, and
+;                   #MON_DATA_LO is the same number again for the
+;                   running program. Build without it and BSS returns
+;                   to $00280000, inside the image.
+;    StackAddress - the link-time initial stack top, which is the
+;                   compiler default this file has always been built
+;                   with. Main() then moves the monitor's own stack to
+;                   #MON_STACK with three instructions of inline asm,
+;                   for the reasons under THE STACK above - so this
+;                   number is what a payload gets, not what the monitor
+;                   runs on. It is written out rather than left implicit
+;                   so this file states its whole layout in one place.
+;
+;  A --load-addr / --bss-addr / --stack-addr flag may still be passed,
+;  and still wins where it is the only thing said. If a flag and one of
+;  these lines DISAGREE the build stops and names both values - it never
+;  quietly picks one.
+; ======================================================================
+LoadAddress  $200000
+BssAddress   $0D000000
+StackAddress $8000000
+
+; ======================================================================
+;  THE BUILD NUMBER (forum 586: `version` could not tell one build from
+;  another)
+; ----------------------------------------------------------------------
+;  #ANVIL_BUILD is an ordinary integer constant - CmdVersion() prints it
+;  and it costs no RAM. The trailing marker is what makes the tools treat
+;  it as THIS project's build number: a successful build in the IDE, or a
+;  a `--bump-build` on the command line, raises it by exactly one and
+;  writes that one line
+;  back, byte for byte identical everywhere else.
+;
+;  IT IS DECLARED HERE, IN THE BOARD FILE, and not in Anvil/Core. The core
+;  is shared by every board and a library that carried a build number
+;  would be bumped by every project that includes it, which is exactly
+;  what PMF-BLD-003 refuses. Each board file is its own project and counts
+;  its own builds - the same shape as #ANVIL_V3D_CONSOLE below. A board
+;  file that omits this line breaks the build at CmdVersion, loudly, which
+;  is the right failure.
+;
+;  IT DOES NOT REPLACE THE CONTENT STAMP, and the two answer different
+;  questions. The stamp (forum 621) says WHAT this image is - the digest
+;  of the sources it was built from, so two builds of the same tree are
+;  the same build. The number says WHICH build it is - it moves every time
+;  somebody presses Compile, so a person watching a board can say "that is
+;  not the one I just flashed" without hashing anything. `version` prints
+;  both.
+;
+;  Bumping can be frozen for a release by writing `off` after the marker:
+;      #ANVIL_BUILD = 1        ; pmf:build off
+;  The IDE's Compiler > Build Number... window writes that word for you.
+; ======================================================================
+#ANVIL_BUILD = 215        ; pmf:build
+
+;  The two optional siblings, written by the same successful build. They
+;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
+;  else in this language - a string build stamp is not expressible as a
+;  constant, and inventing one would be a language change nobody asked
+;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
+;  CmdVersion() prints them with their separators put back.
+#ANVIL_BUILD_DATE = 20260920   ; pmf:builddate
+#ANVIL_BUILD_TIME = 192912     ; pmf:buildtime
+
+; ======================================================================
+;  THE LIBRARIES. A library never includes a library - the main file
+;  lists what it needs, and the order matters where one calls another.
+;  clocks.pi4 calls mailbox.pi4, so mailbox comes first.
+; ======================================================================
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE CONTRACT AND THE SEAM REGISTRY, AS EARLY AS THEY CAN
+;  GO. All four are constants and one table; none of them reads hardware,
+;  prints at boot, or calls anything else in this program.
+;
+;  THEY ARE HERE AND NOT BESIDE THE LOADER because a driver that a module
+;  can REPLACE has to be able to ask, inside its own file, whether one
+;  has - RaspberryPi4/Lib/thermal.pi4 does exactly that further down. The
+;  alternative is a hook pointer bolted on beside each such driver and
+;  set from below, which is a second path around a contract rather than
+;  the contract.
+;
+;  seams.pbi is also the ONLY Anvil file a driver module includes: it is
+;  the published contract, it carries no monitor source, and
+;  RaspberryPi4/Modules/thermal_avs.pi4 is built against it alone.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/clocks.pi4"
+; safety.pi4 is here for its PM/watchdog half only - the boot-count
+; ladder is never called from this file. One overlap to know about:
+; #SAFETY_COUNT_ADDR is $00001000, which is inside the window this
+; monitor calls its stack ($1000..$FFFFF, growing DOWN from $100000).
+; They cannot actually meet - the monitor would have to burn a full
+; megabyte of stack to reach it - but the day someone calls
+; SafetyBoot() from here, that is the collision to remember.
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+; GPIO. The BCM2711 general-purpose I/O driver, wired in for the `gpio`
+; command through the HwGpio* seam (RaspberryPi4/Board/hw_gpio.pi4 over
+; this). It was in the tree, verified against the register tables, and no
+; image had ever included it until now (its header said so) - this is that
+; wiring. No dependencies; it includes no other library, so it can sit
+; anywhere its consumers come after it.
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+; The shared EDID parser has no hardware dependency. HDMI DDC below feeds
+; it bytes fetched directly from the BCM2711's dedicated HDMI controllers.
+XIncludeFile "Anvil/Graphics/edid.pbi"
+; I2C. The BCM2711 BSC (Broadcom Serial Control) master, wired in for the
+; `i2c` command through the HwI2c* seam (RaspberryPi4/Board/hw_i2c.pi4 over
+; this). It DEPENDS ON gpio.pi4 above - I2cInit() muxes GPIO 2/3 to ALT0
+; (SDA1/SCL1) through gpio.pi4's PinAlt rather than re-deriving the
+; out-of-order ALT table, so it must come AFTER gpio.pi4 (house rule 10: a
+; library never includes a library; the order is written here). Its header
+; carries the BSC register citations against BCM2711 ARM Peripherals ch.3.
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+; HDMI DDC is separate from GPIO BSC0/1: the firmware AUTOI2C handoff and
+; dedicated BSC2/BSC7 hardware are owned by this direct reader.
+XIncludeFile "RaspberryPi4/Lib/hdmi_ddc.pi4"
+; The Waveshare DSI panel's two I2C devices, both of which sit on the
+; display connector's bus - BSC0 on GPIO 44/45 - and both of which come
+; AFTER i2c.pi4 (house rule 10: a library never includes a library; the
+; order is written here). touch_goodix.pi4 is the Goodix GT9xx touch
+; controller, and it is the reason i2c.pi4 grew I2cWriteRead(): its
+; register pointer is sixteen bits and does not survive the STOP that the
+; two-transaction read path puts in the middle.
+;
+; WHICH PANEL MCU, AND WHY IT IS THE v2 ONE. Waveshare ship two
+; incompatible generations that both answer at $45. The panel on this
+; bench is the v2 board - the overlay line for it is
+; vc4-kms-dsi-waveshare-panel-v2,10_1_inch_a - whose MCU is a 16-bit GPIO
+; EXPANDER plus a PWM at registers $94..$99, so dsi_panel_v2.pi4 is what
+; is compiled in. Lib/dsi_panel.pi4, the v1 register file, is NOT: its
+; $AB and $AD are outside the v2 MCU's regmap and an out-of-range write
+; to a microcontroller is undocumented behaviour, not a no-op. The v1
+; library stays in the tree for a v1 board and is exercised by the desk
+; gate through Examples/Diagnostics/pi4TouchProbe.pi4.
+;
+; dsi_panel_v2.pi4 ALSO OWNS THE TOUCH CONTROLLER'S RESET. It is expander
+; bit 9 and no Pi GPIO reaches it, so the Goodix cannot answer until the
+; MCU has been written - which is why the `touch` command below powers
+; the MCU before it probes the touch address, and says so when it does.
+XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2.pi4"
+XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
+; The DSI1 HOST - the SoC's side of the ribbon. A different part from the
+; MCU above, reached over a different bus, and the two prove nothing
+; about each other: the MCU answered on 2026-09-06 with the glass still
+; dark, because nothing had ever been said to the panel itself.
+;
+; dsi_host.pi4 needs only timer.pi4. dsi_panel_v2_dcs.pi4 needs BOTH
+; lines above it AND dsi_host.pi4, because the panel's rails are switched
+; over I2C while its 200-command init table goes out over DSI.
+XIncludeFile "RaspberryPi4/Lib/dsi_host.pi4"
+XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2_dcs.pi4"
+; PWM, the SoC temperature, and the fan curve - the three halves of the
+; `fan` command, in dependency order.
+;
+; Lib/pwm.pi4 DEPENDS ON gpio.pi4 above (it muxes the pin through PinAlt
+; and drives the software channel through PinHigh/PinLow) and on
+; timer.pi4 (Micros() is the software channel's clock and the clock
+; manager's busy timeout). Both are already included further up.
+;
+; Lib/thermal.pi4 DEPENDS ON mailbox.pi4 above - the fallback reading and
+; the throttle temperature are firmware property tags. Its preferred path
+; is a plain register read and needs nothing.
+;
+; THE CURVE ITSELF IS NOT HERE. It is Anvil/Core/fan.pbi, included with
+; the other core files further down, because a ramp between two
+; temperatures is not a fact about a BCM2711 and the core command that
+; uses it is compiled for every board. Its own header carries the
+; reasoning. House rule 10 applies to the two below - neither includes
+; the other, so the order is stated here.
+XIncludeFile "RaspberryPi4/Lib/pwm.pi4"
+XIncludeFile "RaspberryPi4/Lib/thermal.pi4"
+; The MMU and caches. Compiled in for the runtime `cache` command; the
+; caches are OFF at boot and turned on only by hand, so the resident
+; monitor still enters the prompt with the stub's $30C50830 every time
+; and a bad enable is recovered by a power cycle, never a brick. See
+; CacheEnable/CacheDisable below and CmdCache.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+; The Hardware Video Scaler and pixel valve 1 - the path from a
+; framebuffer in DRAM to the DSI host. It DEPENDS ON clocks.pi4 above,
+; because the HVS runs on the VideoCore core clock and that clock is the
+; firmware's to hand out, not a CPRMAN register. It does not depend on
+; display.pi4 and is not part of the firmware framebuffer path: the
+; firmware owns no display on this board and the two never meet.
+XIncludeFile "RaspberryPi4/Lib/hvs.pi4"
+; #DSP_DMA_LINKED - MANDATORY, and it must be defined BEFORE display.pi4.
+; 0 = the CPU drawing path and nothing else; every procedure that would
+; touch the blitter is skipped at the token level and never parsed.
+; 1 additionally requires RaspberryPi4/Lib/dma.pi4 to be included AHEAD
+; of display.pi4, which is why dma.pi4 is on the line above and not down
+; with the storage libraries: definition order is the convention in this
+; dialect and display.pi4 names DmaCopy, DmaCopy2D, DmaFillPattern32,
+; DmaCacheRange and DmaSetBounds.
+; display.pi4's THE DMA SEAM section has the reasoning; there is no
+; default because a default in the library and a different value here
+; would be a hard "Constant already defined" error.
+;
+; ======================================================================
+;  IT WAS 0 UNTIL 2026-08-28, AND THE REPORT THAT CHANGED IT WAS
+;  "THERE IS NO ACCELERATION IN THE SCROLLING". THERE WAS NOT. THIS
+;  LINE IS WHY.
+; ======================================================================
+;  Measured on this board that day by
+;  RaspberryPi4/Examples/Diagnostics/pi4ScrollTime.pi4 - 1920 x 1080 at
+;  32bpp, pitch 7680, a 240 x 60 console under the banner, MMU off,
+;  which is exactly this program's configuration - ONE scroll of the
+;  default eight-row chunk:
+;
+;      CPU, this monitor as it stood              527.9 ms
+;      the same scroll through the engine         213.9 ms
+;      the engine's two transfers, alone           12.0 ms
+;
+;  Half a second, per scroll, on a console that scrolls once every
+;  eight printed lines. The board was not busy and the bus was not
+;  slow: a full-surface CPU clear of 8.29 MB measures 355.4 ms here,
+;  which agrees with the 356.9 ms dma.pi4's header already recorded, so
+;  the harness is believable and the number is the loop.
+;
+;  THE ENGINE IS NOT THE WHOLE STORY AND THIS COMMENT WILL NOT PRETEND
+;  IT IS. 213.9 of the 214 ms above is cache maintenance, not transfer -
+;  see THE SCROLL, AND WHY IT IS PRE-EMPTED at ScreenFastScroll() below
+;  for the measurement and for the one library defect that is left.
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+; ----------------------------------------------------------------------
+;  THE V3D / NeonArcade CONSOLE, behind #ANVIL_V3D_CONSOLE.
+;
+;  A second console backend that renders the HDMI text with the GPU
+;  instead of the DMA/CPU text grid, double-buffered with a vertical-blank
+;  page flip. It is OPT-IN at run time (`screen v3d`, back with `screen
+;  dma`) and the DMA console stays the default and the fallback, so a board
+;  with no V3D - or one where V3dInit fails - is unaffected. Set the flag to
+;  0 to compile the whole thing out (the three libraries below are then dead
+;  code and pruned, and the DMA console is all there is). The engine and its
+;  QPU assembler are the same three libraries the pi4Neon* diagnostics use.
+; ----------------------------------------------------------------------
+#ANVIL_V3D_CONSOLE = 1
+; The screen/cache policy reads this build choice before cache.pi4 is included.
+#ANVIL_VULKAN_CONSOLE = 1
+
+; ----------------------------------------------------------------------
+;  THE FAN IN THE BANNER, behind #ANVIL_BANNER_FAN.
+;
+;  The banner's identity row carries the part's temperature beside the
+;  clock on every board - every Pi 4 has the sensor. The fan's duty rides
+;  beside it only when this constant is 1 AND a fan pin is actually being
+;  driven (`fan pin`), so a board with no fan wired shows nothing about a
+;  fan. Most boards have no PWM fan; a board file that never will can set
+;  this to 0 and the fan half is not even compiled. Project ruling,
+;  2026-09-11: the duty is wanted in the banner where one is being
+;  driven, and most of these boards will never have a modulated fan, so
+;  the fan half is behind a switch rather than behind a run-time test
+;  alone.
+; ----------------------------------------------------------------------
+#ANVIL_BANNER_FAN = 1
+CompilerIf #ANVIL_V3D_CONSOLE = 1
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+CompilerEndIf
+; STORAGE, for the f command. emmc.pi4 gives block-level SD access and
+; fat.pi4 parses a filesystem on top of it - fat.pi4 deliberately does
+; NOT include emmc.pi4 itself; it takes its block reader by pointer, so
+; a USB mass-storage reader can replace the card later without it
+; changing. That indirection is why the FAT parser could be tested
+; against a fabricated volume with no card in the machine.
+; The USB path to a block device. Order matters: xhci.pi4 uses pcie.pi4
+; and usbmsc.pi4 uses xhci.pi4, and a library never includes a library,
+; so the main file lists them in dependency order.
+; THE USB PROTOCOL IS NOT THIS CHIP'S. Descriptor fetches, the walk over a
+; configuration descriptor, string descriptors and the class names are the
+; same over an xHCI controller here and a DWC2 on a Pi 3, so they live in
+; one shared driver and every board reaches them (rule 30). It carries no
+; hardware knowledge at all - the board hands it two control-transfer
+; procedures and nothing else - and it is listed FIRST because the
+; controller driver and the mass-storage driver above both use it.
+XIncludeFile "Anvil/Bus/usb_core.pbi"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
+; The mouse cursor on the screen. hid.pi4 rides on the xhci.pi4 already
+; linked above for the boot stick, so this costs one library and no new
+; hardware bring-up.
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
+XIncludeFile "RaspberryPi4/Lib/fat.pi4"
+; THE HAL FOUNDATION - the capability gate (RequireCap) and the portable
+; vocabularies the Hw* seams speak back to the core (#HW_GPIO_*, #HW_I2C_*,
+; #HW_USB_*, #HW_FILE_*). Core, chip-free, shared by every board. It sits
+; here rather than beside the #CAP_* block below because the storage
+; backend on the next line needs its #HW_FILE_* codes; it needs nothing
+; itself but uart.pi4, far above, and it still precedes every gated
+; command handler, which is the ordering rule that actually matters.
+XIncludeFile "Anvil/Hal/hal.pbi"
+; THE PI 4'S FILE-LEVEL STORAGE BACKEND - the HwFile* seam Anvil/Hal/hal.pbi
+; declares, implemented over fat.pi4 just above. It is HERE, high up and
+; well before Board/storage.pi4, for a mechanical reason its own header
+; sets out: the settings store on the next line calls HwFile*, so the
+; backend must precede it - while the medium BRING-UP cannot, because
+; StorageUp() calls UsbEnumerate() in Board/cursor_input.pi4, which needs
+; the display. The bring-up is therefore split off as HwStorageUp() at the
+; bottom of Board/storage.pi4, and only the file operations live here.
+XIncludeFile "Anvil/Storage/hwfile.pbi"
+; settings.pi4 is the KEY=VALUE store behind the `settings`, `wifi` and
+; `boot` commands. It reaches the medium ONLY through the HwFile* seam
+; above - which is why it lives in Anvil/Core and compiles unchanged for
+; the Arduino UNO Q, whose files come from UEFI and not from a FAT of
+; ours. It still never installs a block writer itself; hwfile.pbi arms
+; one around the single call that writes and disarms it on every path out.
+XIncludeFile "Anvil/Core/settings.pbi"
+; THE NETWORK, for get, put and net. Three libraries, none of which does
+; a byte of input or output on its own - see THE NETWORK further down for
+; what that costs this file and why it is worth it. The order is the one
+; the dependency runs in even though none of them includes another: the
+; MAC moves frames, net.pi4 puts IPv4 and UDP inside them, and tftp.pi4
+; puts TFTP inside that. A library never includes a library, so the order
+; here is the only place it is written down.
+XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+; ONE ADDRESS RECORD PER INTERFACE, and the one IP layer pointed at
+; whichever interface the frame in hand concerns. Every address this
+; board binds goes through it - see its header for the measurement that
+; made it necessary.
+;
+; STRAIGHT AFTER net.pi4, AND THE POSITION IS LOAD-BEARING. It declares
+; the #NET_ADDR_* codes, and RaspberryPi4/Lib/wifi.pi4 - compiled below -
+; names one of them when it binds the radio's own boot lease; a constant
+; may not be USED before it is DECLARED. Every PROCEDURE it calls
+; (HwLink*, LinkPin) is resolved forward, which is what lets it sit
+; above the two files that supply them.
+XIncludeFile "Anvil/Core/netif.pbi"
+XIncludeFile "RaspberryPi4/Lib/tftp.pi4"
+; dns.pi4 and dhcp.pi4 are two more payload codecs riding net.pi4's UDP,
+; the same way tftp.pi4 does - they build and parse the DNS and DHCP
+; messages and do no I/O. They come after net.pi4 because they use its
+; byte-order helpers, and before net_cmd.pi4, which runs their pump.
+XIncludeFile "RaspberryPi4/Lib/dns.pi4"
+XIncludeFile "Anvil/Network/dhcp.pbi"
+; THE DHCP SERVER, for a cable where nothing answered this board's own
+; discovers. After netif.pi4, because it takes the served address as an
+; interface ALIAS beside the link-local one; after dhcp.pi4, whose
+; constants and message layout it shares with the client so the two
+; halves of one protocol cannot drift apart. The console's pump feeds it.
+XIncludeFile "Anvil/Core/dhcpd.pbi"
+; THE RADIO. sdio.pi4 and cyw43.pi4 are the CYW43455 driver; wifi.pi4
+; is the monitor-side flow over them - read the firmware off the
+; stick, bring the radio up, scan, and match what is on the air
+; against the networks stored in the settings table.
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+XIncludeFile "Anvil/Net/wifi_join_policy.pbi"
+XIncludeFile "Anvil/Net/wifi_assoc.pbi"
+; The WPA2 host supplicant and the crypto it needs. The 43455 has no
+; firmware supplicant, so the four-way handshake runs here.
+XIncludeFile "Anvil/Crypto/sha1.pbi"
+; sha256.pi4 backs the sha256sum command (Anvil/Core/hash_cmd.pbi). It was
+; already in the tree, verified, but nothing built it in until now.
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/hmacsha1.pbi"
+XIncludeFile "Anvil/Crypto/pbkdf2.pbi"
+XIncludeFile "Anvil/Crypto/aes.pbi"
+XIncludeFile "Anvil/Crypto/keywrap.pbi"
+; hmac, hkdf, drbg and gcm - the TLS-side crypto. Every one of them was
+; written and gated in the MODEL (tools/a64/a64_gcm_check.py and the A64
+; cross gates in tools/check_tls_twins.py), and not one had ever been
+; built into a board image, so not one instruction of them had ever run
+; on the part. The `crypto` self-test below is what executes them, on
+; the same vectors, which is why they are here now.
+;
+; gcm.pi4's include was deliberately left out on the day it landed, on
+; the correct grounds that an unreachable module in a boot image is an
+; unrequested feature. It has a caller now.
+;
+; The ORDER here is the one drbg.pi4's own header states - sha256 (far
+; above), then hmac, then entropy, then drbg - because a library in this
+; tree names its dependencies in its header and does not include them
+; itself (house rule 10).
+XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
+XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
+XIncludeFile "RaspberryPi4/Lib/gcm.pi4"
+XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
+XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
+XIncludeFile "Anvil/Net/wpa2sup.pbi"
+XIncludeFile "RaspberryPi4/Lib/wifi.pi4"
+; THE LINK SEAM AND TCP. hw_link.pi4 is the BOARD's side of the HwLink*
+; seam and must come after BOTH drivers, because it is now the only file
+; in this build that names them; link.pi4 is portable policy over that
+; seam and must come after hw_link.pi4 and after net.pi4; tcp.pi4 must
+; come after link.pi4. http.pi4 is further down, after
+; Anvil/Core/rxbreak.pbi, because it asks the monitor for
+; NetBreakCheck().
+;
+; UNTIL 2026-09-04 link.pi4 named genet, cyw43 and wifi itself, and its
+; own header said a board without a radio could not include it. That one
+; sentence was what kept the whole portable stack above it - net, ping,
+; dns, dhcp, tcp, http - off every other board. See Anvil/Hal/hal.pbi
+; under HwLink*.
+XIncludeFile "RaspberryPi4/Board/hw_link.pi4"
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+XIncludeFile "Anvil/Core/netfmt.pbi"
+XIncludeFile "Anvil/Core/sntp_codec.pbi"
+XIncludeFile "Anvil/Core/ntp_service.pbi"
+; THE NETWORK CONSOLE - one console, on EVERY interface that holds an
+; address. It was inside wifi.pi4 until 2026-09-07 and was called the
+; wireless console; it named the radio in every line, so a board reachable
+; only over the Ethernet cable had no console at all. It is portable core
+; now: every wire access in it is HwLink*(kind, ...), so it comes after
+; hw_link.pi4, after net.pi4 and after uart.pi4, and it is the only file
+; that decides where a console listens.
+XIncludeFile "Anvil/Core/netconsole.pbi"
+XIncludeFile "RaspberryPi4/Lib/tcp.pi4"
+XIncludeFile "Anvil/Applications/Forum/http_head.pbi"
+XIncludeFile "Anvil/Services/Http/transport_tcp.pbi"
+XIncludeFile "Anvil/Services/Http/server.pbi"
+; The `net recv` RECEIVER - the state machine only, no console and no
+; parser. It goes here, immediately after tcp.pi4, because those two and
+; Sha256Of (Core/sha256.pi4, above) and millis() (Lib/timer.pi4, above)
+; are the whole of what it calls. Keeping its dependency list that short
+; is what lets tools/a64/a64_tcp_check.py compile it into the frame-exact
+; TCP harness and drive it with a scripted peer; its console half is
+; Anvil/Core/netrecv_cmd.pbi, much further down beside the other
+; commands.
+XIncludeFile "Anvil/Core/netrecv.pbi"
+
+; The banner anvil, as pixels. Generated by tools/gen_anvil_pic.py from
+; anvil_logo.png; #ANVIL_PIC_W/H and the anvilPix DataSection live here.
+XIncludeFile "RaspberryPi4/Monitor/anvil_logo.pi4"
+
+; The smooth banner fonts. Generated by tools/gen_anvil_fonts.py; three
+; DejaVu faces as anti-aliased coverage maps, drawn by DrawSmoothText.
+XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
+
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+
+; The resident secondary-core acceptance owner is deliberately assembled
+; before cache.pi4: RunAt and the cache command must be able to refuse a
+; machine-policy handoff while cores 1..3 own these rows, stacks and code.
+; Nothing here releases a core at boot; only the explicit `coretest run`
+; command does that.  core_accept selects the job-capable composition of the
+; same raw worker that the standalone emitted gates exercise.
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
+
+; ======================================================================
+;  THIS BOARD'S CAPABILITIES - what it offers Anvil's command families.
+;
+;  The per-board half of the capability model. Anvil/Hal/hal.pbi has the
+;  whole reasoning and the seam-group contract; this is the DECLARATION for
+;  the Pi 4, one line per group. 1 = this board offers the group and a
+;  command gated behind it may assume the board's Hw<group> backend works;
+;  0 = Anvil cannot reach the group here. These are read by RequireCap at
+;  the top of each gated command; nothing else consults them, and the core
+;  never asks which board this is.
+;
+;  This follows the #ANVIL_CACHE / #ANVIL_V3D_CONSOLE precedent already in
+;  this file: a compile-time truth about what the board includes, declared
+;  where the board is assembled and reviewable against it.
+;
+;  IT IS NOT KB-GATING. None of these is 0 to shrink the image (the U-Boot
+;  inventory S5.7 forbids that). A 0 here means one thing only: there is
+;  genuinely no backend in Anvil's reach on this board - no driver exists
+;  to include - never that one was left out to save space. #CAP_I2C was
+;  that 0 until 2026-09-01, when the BSC driver was written and it flipped
+;  to 1 with no other change (its own line below records that); as of that
+;  date nothing in this block is 0.
+; ======================================================================
+#CAP_STORAGE  = 1   ; a block medium + FAT filesystem. USB stick and SD
+                    ; card, driven by Lib/usbmsc + Lib/emmc under Lib/fat -
+                    ; load / save / mount work today.
+#CAP_NET      = 1   ; an IP-capable interface. Gigabit Ethernet via
+                    ; Lib/genet under Lib/net + Lib/tftp - get / put / net.
+#CAP_GPIO     = 1   ; general-purpose I/O. Lib/gpio over the HwGpio* seam
+                    ; (RaspberryPi4/Board/hw_gpio.pi4) - the `gpio` command.
+#CAP_I2C      = 1   ; the header I2C bus (BSC1 on GPIO 2/3), driven by
+                    ; Lib/i2c.pi4 under the HwI2c* seam
+                    ; (RaspberryPi4/Board/hw_i2c.pi4) - the `i2c` command.
+                    ; Flipped from 0 to 1 on 2026-09-01 when the BSC driver
+                    ; was written; the `i2c` command that refused before now
+                    ; works, with no other change - which is the whole point
+                    ; of the capability model.
+#CAP_TOUCH    = 1   ; a touch panel controller Anvil can reach. The Goodix
+                    ; GT9xx of the Waveshare DSI panel, driven by
+                    ; Lib/touch_goodix.pi4 with Lib/dsi_panel_v2.pi4 beside
+                    ; it for the panel's power MCU - the `touch` command.
+                    ; UNLIKE EVERY OTHER 1 IN THIS BLOCK, this one does not
+                    ; mean the hardware has been talked to: it means the
+                    ; driver is compiled in and the command exists. Nothing
+                    ; has answered on a wire, and `touch` says so in words
+                    ; when nothing does. The handler is this board's own
+                    ; (Board/touch_cmd.pi4) rather than Core's, because one
+                    ; board is not enough examples to shape an Hw* seam
+                    ; from; this constant exists so the SHARED help can
+                    ; mention the command only where it exists.
+#CAP_MMC      = 1   ; the SD/eMMC controller, present and driven by
+                    ; Lib/emmc. The raw `mmc` family will ride HwMmc* over
+                    ; it; the controller is here, so the capability is 1
+                    ; even though that command is not written yet.
+#CAP_USB      = 1   ; the PCIe + VL805 xHCI host, present and driven by
+                    ; Lib/pcie + Lib/xhci + Lib/usbmsc. The raw `usb` family
+                    ; will ride HwUsb* over it.
+#CAP_PWM      = 1   ; a modulated output AND the part's own temperature -
+                    ; the pair the `fan` command needs. Lib/pwm.pi4 drives
+                    ; the two BCM2711 PWM blocks (and a software toggle for
+                    ; a pin that has no PWM function), Lib/thermal.pi4
+                    ; reads the AVS monitor register with the firmware
+                    ; temperature tag as its fallback, and
+                    ; Board/hw_pwm.pi4 is the seam over both.
+                    ; IT IS 1 THOUGH NO FAN HAS EVER BEEN DRIVEN FROM IT.
+                    ; That is the right reading of this flag and it is
+                    ; worth being explicit: the capability says the BOARD
+                    ; offers the hardware group to Anvil and a backend
+                    ; exists, not that the wiring outside the connector has
+                    ; been proven. A 0 here would make `fan` refuse on a
+                    ; part that plainly has two PWM controllers and a
+                    ; thermal sensor, which would be a lie in the other
+                    ; direction. The honest not-yet lives in the command's
+                    ; own report and in the pin being unset until somebody
+                    ; types one.
+#CAP_BOOT_EL1 = 1   ; AArch64, and Anvil runs above EL1, so it can install
+                    ; an EL1 and drop to it - the arm64 Image / booti
+                    ; handoff is feasible on this SoC. HwBootToEl1 is
+                    ; written: Board/hw_boot.pi4 is this board's backend
+                    ; and Anvil/Core/boot_cmd.pbi calls it for booti and
+                    ; bootm. The refusal paths ran on the board on
+                    ; 2026-09-02; the EL2->EL1 handoff itself still owes a
+                    ; silicon run.
+                    ;
+                    ; IT STAYS 1 AT EL3, AND THE REFUSAL MOVED INSTEAD.
+                    ; This used to say "Anvil runs at EL2", which is true
+                    ; of one boot path and not the other. A capability is
+                    ; a fact about the BOARD - this one can host an EL1
+                    ; either way - and it is a compile-time constant, so it
+                    ; cannot answer a question whose answer is decided by
+                    ; which stub is on the card. HwBootToEl1 makes the EL3
+                    ; refusal itself, in a whole sentence, before it takes
+                    ; the machine apart. See its header for what an
+                    ; EL3-to-EL1 handover would need.
+
+; ----------------------------------------------------------------------
+;  THE SEVEN GROUPS THE PAYLOAD ABI ADDED, 2026-09-04.
+;
+;  Anvil/Hal/abi.pbi hands a payload a service table, and a payload is an
+;  APPLICATION rather than a diagnostic - so it needs classes of hardware
+;  the monitor's own command families never wanted. Each is declared here
+;  exactly like the seven above, and each has its Hw<GROUP>* contract in
+;  Anvil/Hal/hal.pbi's SEAM GROUPS section.
+;
+;  SIX OF THE SEVEN ARE 0 ON THIS BOARD TODAY, AND NOT ONE OF THEM IS 0 TO
+;  SAVE SPACE. The U-Boot inventory S5.7 forbids that and hal.pi4 repeats
+;  it. They are 0 because the backend does not exist yet, or because the
+;  hardware is genuinely not wired to this board - and from the payload's
+;  seat those are the same fact and the same honest refusal.
+; ----------------------------------------------------------------------
+#CAP_CONSOLE  = 1   ; A PIXEL SURFACE ANVIL CAN HAND TO A PAYLOAD, over the
+                    ; HwCon* seam (RaspberryPi4/Board/hw_con.pi4) on
+                    ; Lib/display.pi4's mailbox framebuffer and
+                    ; Board/display.pi4's rasteriser. Not the monitor's own
+                    ; terminal grid - that stays Anvil's.
+; #CAP_TOUCH IS DECLARED ONCE, FURTHER UP THIS BLOCK, AND IT IS 1.
+; It is not repeated here, and the reason is worth the four lines it
+; costs. This branch was written when no board in the tree could reach a
+; touch controller at all, so it declared #CAP_TOUCH = 0 in this second
+; block; while it was paused the Goodix GT9xx of the DSI panel landed on
+; the trunk with its own driver and its own `touch` command, and that
+; work declared #CAP_TOUCH = 1 above. Two declarations of one name is two
+; meanings of one name, which is the defect this merge could have left
+; behind, so there is one - the trunk's - and the payload ABI reads it.
+;
+; WHAT THE PAYLOAD SEES, and the two codes are different on purpose:
+; SvcCapGet(#SVCCAP_TOUCH) answers 1, because this board really does have
+; a touch controller Anvil can reach. The touch SLOTS answer #SVC_ENOSYS,
+; because the HwTouch* seam over that driver is not written - the slot is
+; not implemented in this Anvil, which is a different sentence from the
+; board not having the hardware, and a payload that can tell them apart
+; can say which one it is looking at. Phase A item 2c writes the seam and
+; the slots start answering; nothing here changes when it does.
+#CAP_GNSS     = 0   ; NO BACKEND YET, and no receiver on the bench. The UBX
+                    ; decoder exists as an AVR example and has to be lifted
+                    ; into a Lib; Phase A item 2b.
+#CAP_UART     = 0   ; NO BACKEND YET. The part has spare PL011s, but WHICH
+                    ; one is free depends on what else the board is using,
+                    ; and that decision belongs in a backend that also names
+                    ; the pins through HwGpioReservedReason() - or the next
+                    ; person to type `gpio` gets a surprise.
+#CAP_SPI      = 0   ; THERE IS NO SPI LIBRARY IN THIS TREE AT ALL. SPI0 is
+                    ; on GPIO 7-11 (ALT0) and nothing drives it. It stays on
+                    ; the critical path because LoRa is a module on SPI and
+                    ; LoRa is the vehicle link's second transport.
+#CAP_VEHLINK  = 0   ; NO BACKEND YET. This is the seam that REPLACED CAN on
+                    ; 2026-09-04: this product does not hook to the engine
+                    ; port at all. A separate device plugs into that port
+                    ; and reaches this board over Wi-Fi or LoRa, so what
+                    ; lands here is a radio link and not a bus. The Pi 4
+                    ; already has the Wi-Fi to carry it and
+                    ; Anvil already brings that radio up; what is missing is
+                    ; the wire format to the second unit, which is that
+                    ; unit's own design note. Phase A item 2a.
+#CAP_RTC      = 0   ; THIS PART HAS NO REAL-TIME CLOCK, and that is measured
+                    ; rather than assumed: grepping the four device trees
+                    ; for an rtc@ node gives five hits, all of them uartclk
+                    ; (Raspberry Pi 4/A wall clock and a task list
+                    ; 2026-08-28). 1 here would mean a DS3231 is wired to
+                    ; the header I2C bus, and none is - so every cold boot
+                    ; starts #HW_CLK_UNSET and says so.
+
+; The board's identity for the payload ABI, one of Anvil/Hal/abi.pbi's
+; #SVC_BOARD_* codes. INFORMATIONAL ONLY - a payload that branches on it
+; has re-forked the thing the capability model exists to prevent, and
+; tools/a64/a64_abi_check.py looks for exactly that.
+#SVC_BOARD_ID = 1   ; #SVC_BOARD_PI4
+
+; ----------------------------------------------------------------------
+;  THE HAL FOUNDATION IS INCLUDED FURTHER UP THIS FILE, next to fat.pi4
+;  and Anvil/Storage/hwfile.pbi, and this note is where it used to be so that
+;  nobody looks for it here and concludes it is missing.
+;
+;  IT MOVED BECAUSE THE STORAGE SEAM FORCED IT. Anvil/Storage/hwfile.pbi speaks
+;  the #HW_FILE_* vocabulary that hal.pi4 declares, and hwfile.pbi must
+;  come before Anvil/Core/settings.pbi, which is included right after
+;  fat.pi4 - so hal.pi4 has to be earlier than both.
+;
+;  NOTHING BREAKS BY MOVING IT EARLIER, and the reason is worth stating
+;  rather than trusting. hal.pi4 contains constant declarations and one
+;  procedure, RequireCap, which takes the capability BY VALUE - it never
+;  names a #CAP_ constant in code, only in its documentation. So it does
+;  not depend on the #CAP_* block below, and it needs nothing but uart.pi4
+;  for the sentence it prints. What still matters, and still holds, is
+;  that it comes before every gated command handler; all of those are
+;  further down than it now is.
+; ----------------------------------------------------------------------
+; The Pi 4 HwGpio* backend, thin wrappers over Lib/gpio.pi4 (included
+; above) returning the #HW_* codes hal.pi4 defines. This is the one file
+; that knows the BCM2711's GPIO encoding; the `gpio` command above it does
+; not.
+XIncludeFile "RaspberryPi4/Board/hw_gpio.pi4"
+; The Pi 4 HwI2c* backend, thin wrappers over Lib/i2c.pi4 (included above)
+; returning the #HW_I2C_* codes hal.pi4 defines. This is the one board file
+; that knows the BCM2711 has BSC1 on the header; the `i2c` command above it
+; knows only bus numbers and portable result codes.
+XIncludeFile "RaspberryPi4/Board/hw_i2c.pi4"
+; The Pi 4 HwPwm* and HwTemp* backend, thin wrappers over Lib/pwm.pi4 and
+; Lib/thermal.pi4 (both included above) returning the #HW_PWM_* and
+; #HW_TEMP_* codes hal.pi4 defines. IT MUST COME AFTER hw_gpio.pi4, and
+; not only after hal.pi4: it asks HwGpioReservedReason() and
+; HwGpioUserMax() rather than keeping a second copy of the reserved-pin
+; list, so that the pins `fan` refuses and the pins `gpio` refuses can
+; never drift apart.
+XIncludeFile "RaspberryPi4/Board/hw_pwm.pi4"
+
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "RaspberryPi4/Board/display_globals.pi4"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "RaspberryPi4/Board/banner_identity.pi4"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "RaspberryPi4/Lib/http.pi4"
+XIncludeFile "Anvil/Core/crc.pbi"
+; THE INPUT SEAM, AHEAD OF THE LINE READER THAT NOW SITS ON IT.
+; input_events.pbi normalizes every producer - serial, USB keyboard,
+; network console and the soft keyboard - into one queue with focus and
+; capture; text_edit.pbi is the single edited line and caret underneath
+; ReadLine. Both must follow state.pbi (gLine, #LINE_MAX) and
+; display_globals.pi4 (gLastCR), and both must precede parse.pbi.
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+; The touch keyboard's model - what the keys MEAN. It is portable Anvil
+; code with no coordinates in it, and it belongs HERE, beside the
+; dispatcher and the editor it feeds, rather than beside the screen. It
+; must precede console.pi4, which includes the keyboard's view: the view
+; asks the model for its keys, its labels and which of them is the hide
+; chevron, and the model asks the view exactly one question back.
+XIncludeFile "Anvil/Core/touch_keyboard.pbi"
+XIncludeFile "Anvil/Core/parse.pbi"
+; THE MESSAGE LOG. What background services say is kept here and never
+; written on the command line; the banner caption shows the newest and
+; `messages` prints them. The diversion itself is in RaspberryPi4/Lib/uart.pi4.
+XIncludeFile "Anvil/Core/messages.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+; HOW MUCH MEMORY THIS BOARD HAS. Decoded from the firmware's board
+; revision code, asked once and remembered. It comes FIRST because the
+; address-safety answer below is built on it: an address past the top of
+; memory is the one thing this board refuses. It needs mailbox.pi4
+; (asked lazily, and quietly - see the file), hal.pi4 for
+; #HW_MEM_UNKNOWN and format.pi4 for PrintDec, all included above.
+XIncludeFile "RaspberryPi4/Board/hw_mem.pi4"
+; THE ADDRESS-SAFETY SEAM. The board's answer first, then the core side
+; that asks it - the same backend-before-family order hw_gpio.pi4 and
+; gpio_cmd.pi4 have. hw_addr.pi4 needs hal.pi4 (the #HW_ADDR_* codes,
+; included above), format.pi4 (it prints a paragraph into `info`),
+; mmu.pi4 (#MMU_PERIPH_BASE, the boundary the memory arithmetic turns
+; on) and hw_mem.pi4 immediately above, and addrsafe.pi4 must precede
+; every command that takes an address from the operator - which is most
+; of what follows.
+XIncludeFile "RaspberryPi4/Board/hw_addr.pi4"
+XIncludeFile "Anvil/Core/addrsafe.pbi"
+; IS THE MONITOR TO KEEP THE PAYLOAD'S LAST FRAME? One boolean and a
+; sequence number, and they are core rather than board because the
+; question is the same everywhere and only the answer - which bytes the
+; panel is scanning, and where a copy fits - belongs to a board. It comes
+; in before cache.pi4, whose RunAt takes the arm on the way back from a
+; payload, and before bootfile_cmd.pbi, where `boot mem <addr> shot` sets
+; it.
+XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "RaspberryPi4/Board/runrecord.pi4"
+XIncludeFile "RaspberryPi4/Board/cache.pi4"
+; The retained boot-timing record. After cache.pi4 because it cleans its
+; own page to the point of coherency through CacheCleanRangePoc, and
+; after memmap.pi4 because its fixed address is the last page of the DSI
+; framebuffer window declared there. Before every file that marks - the
+; screen, the console, the GPU adapter and the two boot halves - which is
+; everything below this line.
+XIncludeFile "RaspberryPi4/Board/boot_timing.pi4"
+; The board's half of the driver-module contract: where a module may
+; live, how to make written bytes executable, what devices are here, and
+; which seams the core reaches without one. After cache.pi4 because it
+; calls CacheFlushRange, and before abi.pbi because SvcCapGet asks it.
+XIncludeFile "RaspberryPi4/Board/hw_mod.pi4"
+XIncludeFile "Anvil/Core/xfer.pbi"
+XIncludeFile "Anvil/Core/memcmd.pbi"
+; readback - bulk bytes OFF the board, base64 with a length and a crc32
+; line at the end. After memcmd because it is the same family of
+; commands, and after netconsole.pbi, crc.pbi, parse.pbi and addrsafe.pbi
+; because it reaches all four: it asks the network console whether the
+; peer typed this line, and sends the payload to whoever did.
+XIncludeFile "Anvil/Core/readback.pbi"
+XIncludeFile "RaspberryPi4/Board/mailbox_info.pi4"
+XIncludeFile "Anvil/Core/uptime.pbi"
+; i2c - the second family to ride the capability model. Core, chip-free; it
+; gates on #CAP_I2C through RequireCap and drives the bus through the HwI2c*
+; seam the board backend supplies. Comes after hal.pi4, hw_i2c.pi4,
+; state.pi4, parse.pi4, rxbreak.pi4 and format.pi4, all above.
+;
+; IT SITS HERE, ABOVE clock_info.pi4, AND NOT WITH THE OTHER COMMAND
+; FAMILIES. `info` (in clock_info.pi4) reports which pins the I2C bus is
+; on and what they are doing, and it does that by calling this file's
+; I2cSayPins() rather than by growing a second copy of the same prose that
+; could drift from what `i2c speed` says. A procedure has to be defined
+; before it is called, so this include has to come first. Moving it back
+; down breaks the build at CmdInfo - loudly, which is the right failure.
+XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+; Pi-specific DSI/MMIO commands follow the shared address/abort guards.
+; Touch's hardware backend follows screen geometry below, because input
+; and presentation must use the same rotation and physical coordinates.
+XIncludeFile "RaspberryPi4/Board/dsi_cmd.pi4"
+XIncludeFile "RaspberryPi4/Board/clock_info.pi4"
+XIncludeFile "Anvil/Core/auto.pbi"
+; THE DISPLAY SEAM, ahead of everything that reports on a screen or
+; draws on one. It is the whole of what the two kinds of screen on this
+; board have in common - HDMI, whose framebuffer the FIRMWARE allocates,
+; and the DSI panel, whose framebuffer THIS MONITOR allocates because
+; the firmware owns no DSI display and will not on a stock config.txt.
+; Board's display.pi4 asks it which screen the picture is on;
+; screen_cmd.pi4 drives it.
+; The seam's arithmetic first - the boot choice, the font rule, the
+; rotation map and the transpose. Its own file because every procedure
+; in it is a function of its arguments, which is what lets the emulator
+; gate execute the shipped image of it on a machine with no VideoCore.
+XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_source.pi4"
+XIncludeFile "RaspberryPi4/Board/hw_touch.pi4"
+XIncludeFile "RaspberryPi4/Board/banner_status.pi4"
+XIncludeFile "RaspberryPi4/Board/display.pi4"
+; THE ONE CONSOLE CORE - the shared terminal grid + the output hub
+; (ScreenPump). Every screen renderer below paints THIS grid; serial and
+; wifi are byte-stream endpoints off the same output. Included before the
+; renderers and the input loop that pump it.
+XIncludeFile "RaspberryPi4/Board/console.pi4"
+XIncludeFile "RaspberryPi4/Board/cursor_input.pi4"
+; The V3D/NeonArcade console backend, after the DMA console layer it draws
+; alongside (it reuses DrawBanner/DisplayConsole to hand the screen back)
+; and before screen_cmd.pi4, whose ScreenPump delegates to it and whose
+; CmdScreen switches between the two with `screen v3d` / `screen dma`.
+CompilerIf #ANVIL_V3D_CONSOLE = 1
+XIncludeFile "RaspberryPi4/Board/v3d_console.pi4"
+CompilerEndIf
+; THE VULKAN / TRUEType CONSOLE, behind #ANVIL_VULKAN_CONSOLE. It uses
+; the same V3D/Neon device backend plus the resident Chrome's single atlas;
+; the console module owns its Vulkan target and switches only on `screen
+; vulkan`. The caller still owns the default DMA console until selected.
+; This path requires the V3D/Neon libraries above; setting Vulkan on while
+; those dependencies are compiled out is an invalid board configuration.
+CompilerIf #ANVIL_VULKAN_CONSOLE = 1 And #ANVIL_V3D_CONSOLE = 0
+CompilerError "#ANVIL_VULKAN_CONSOLE requires #ANVIL_V3D_CONSOLE"
+CompilerEndIf
+CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster_neon.pbi"
+XIncludeFile "RaspberryPi4/Board/vulkan_console.pi4"
+CompilerEndIf
+XIncludeFile "RaspberryPi4/Board/banner_clock.pi4"
+XIncludeFile "RaspberryPi4/Board/screen_cmd.pi4"
+XIncludeFile "RaspberryPi4/Board/touch_visual_test.pi4"
+XIncludeFile "RaspberryPi4/Board/touch_cmd.pi4"
+XIncludeFile "RaspberryPi4/Board/power.pi4"
+XIncludeFile "RaspberryPi4/Board/storage.pi4"
+; hw_mmc - the Pi 4 HwMmc* backend for the raw `mmc` command, over
+; Lib/emmc.pi4 (included far above). Comes after hal.pi4 (the #HW_MMC_*
+; vocabulary), emmc.pi4, and storage.pi4 (whose gSdUp bring-up record it
+; shares, so the two never reset the card controller under each other).
+XIncludeFile "RaspberryPi4/Board/hw_mmc.pi4"
+; The Pi 4 HwUsb* backend, thin wrappers over Lib/pcie + Lib/xhci +
+; Lib/usbmsc and the UsbEnumerate walk in cursor_input.pi4 (all above),
+; returning the portable #HW_USB_* codes hal.pi4 defines. This is the one
+; file that knows the VL805 xHCI stack; the `usb` command above it does
+; not. After cursor_input.pi4 (UsbEnumerate) and storage.pi4.
+XIncludeFile "RaspberryPi4/Board/hw_usb.pi4"
+; data:/ paths and the data.path setting - pure, before the commands that
+; take storage paths.
+XIncludeFile "Anvil/Core/datapath.pbi"
+XIncludeFile "Anvil/Core/fs_cmd.pbi"
+XIncludeFile "Anvil/Core/argfmt.pbi"
+XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
+XIncludeFile "Anvil/Core/wifi_cmd.pbi"
+XIncludeFile "RaspberryPi4/Board/eth_globals.pi4"
+XIncludeFile "RaspberryPi4/Board/eth_mac.pi4"
+XIncludeFile "Anvil/Core/netcfg.pbi"
+; netll - RFC 3927 link-local, the THIRD way this board can hold an
+; address, after a lease and a saved one (Core, portable). AFTER
+; netcfg.pi4, whose NetAddressBound is the tail it ends in and whose
+; #NET_ADDR_LINKLOCAL it names; after netfmt.pi4 (PutIp, EthWhyNet) and
+; eth_globals.pi4 (gEthLlIp) just above; after link.pi4 and
+; netconsole.pi4 far above. BEFORE eth.pi4, whose EthBootWired calls it
+; as the third step of the boot's wired policy, and before boot.pi4,
+; which registers its surrender hook and calls it for the radio. Its
+; packets, its conflict test and every one of the RFC's numbers are in
+; RaspberryPi4/Lib/net.pi4.
+XIncludeFile "Anvil/Core/netll.pbi"
+XIncludeFile "RaspberryPi4/Board/eth.pi4"
+; The console half of `net recv`. Core, gated on #CAP_NET. It comes
+; BEFORE net_cmd.pi4 because CmdNet dispatches to CmdNetRecv, and AFTER
+; eth.pi4 because it calls LinkBringUp. Its other callees - the
+; NetRecv* engine (Core/netrecv.pi4, up with tcp.pi4), PayloadTop and
+; InPayload (Core/memrange.pi4), AddrAllowed (Core/addrsafe.pi4), PutIp
+; (Core/netfmt.pi4) and ArgWord (Core/argfmt.pi4) - are all above.
+XIncludeFile "Anvil/Core/netrecv_cmd.pbi"
+XIncludeFile "Anvil/Core/net_cmd.pbi"
+XIncludeFile "Anvil/Core/tcp_cmd.pbi"
+XIncludeFile "Anvil/Services/Http/monitor.pbi"
+; The Pi 4 HwBootEl1 backend (booti/bootm's EL2->EL1 handoff). Comes after
+; cache.pi4 (CacheDisable/gCacheOn) and eth.pi4 (EthDown), which it calls to
+; quiesce the machine before it hands over, and it declares gBootDtb which
+; Main() captures x0 into. The core boot_cmd.pi4 below rides its seam.
+XIncludeFile "RaspberryPi4/Board/hw_boot.pi4"
+; flow_cmd (echo, sleep, version) uses ArgWord from argfmt.pi4 and the
+; timer, so it comes after those and before the main loop that calls it.
+; hw_id - THIS BOARD'S IDENTITY (forum 575). The core's banner and
+; `version` no longer state any board's facts as prose; they ask the HwId*
+; seam, and this file is this board's answer. It comes after Lib/mmu.pi4
+; (MmuEl), Board/memmap.pi4 (#MON_LO), Core/format.pi4 (PutAddr) and
+; Board/storage.pi4 + Anvil/Storage/hwfile.pbi (the image length off the boot
+; medium), all above, and before flow_cmd.pi4 and help.pi4 which call it.
+XIncludeFile "RaspberryPi4/Board/hw_id.pi4"
+XIncludeFile "Anvil/Core/flow_cmd.pbi"
+; hash_cmd (sha1sum, sha256sum) rides Lib/sha1.pi4 and Lib/sha256.pi4,
+; both included far above, so it comes after them and before the loop.
+XIncludeFile "Anvil/Core/hash_cmd.pbi"
+; crypto - THE ON-BOARD KNOWN-ANSWER SELF-TEST for every crypto module,
+; on the same vectors the desktop gates use. The table comes first and
+; is GENERATED (tools/gen_pi4_crypto_selftest.py) - it is pure data, no
+; code, and the command file is declared from its #CRY_MAX_* constants,
+; so the two cannot be built from different trees without the board
+; saying so. Both come after every crypto library above, after
+; Lib/timer.pi4 for CNTPCT_EL0, after Core/format.pi4 for PutHex16 and
+; after Core/rxbreak.pi4 for the any-key stop.
+; ----------------------------------------------------------------------
+; THE PUBLIC-KEY HALF - part two of the crypto campaign. Nothing in the
+; monitor CALLED these until now, and an unreachable module in a boot
+; image is an unrequested feature; the `crypto` self-test below is what
+; makes them reachable, so they are here because something in the image
+; runs them, not in case something might.
+;
+; THE ORDER IS A DEPENDENCY ORDER, NOT A PREFERENCE. bignum first -
+; every other file here is built on the i15 core. ec256 and x25519 next;
+; ecdsa needs ec256, rsa needs bignum. t0vm and its bytecode blob before
+; x509, which drives that VM to walk a certificate. #X509_SIG_LINKED = 1
+; compiles out x509's own stubs for RsaSetPubKey, RsaVrfy and EcdsaVrfy,
+; and those three names are the ONLY collisions between this block and
+; the rest of the image - the stubs exist for a build that has no
+; signature modules, which this one is not.
+;
+; This is the configuration tools/a64/a64_x509_check.py calls MODE C:
+; the whole seam linked, nothing stubbed - an image no 32-bit family in
+; this tree can build, because their nine-argument RsaVrfy does not
+; compile on this backend at all. That refusal is what RsaSetPubKey
+; exists for and it is filed, not fixed.
+XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
+XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "RaspberryPi4/Lib/x25519.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
+XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
+XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
+XIncludeFile "RaspberryPi4/Lib/x509_blob.pi4"
+#X509_SIG_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/x509.pi4"
+XIncludeFile "Anvil/Core/cryptotest_vectors.pbi"
+XIncludeFile "Anvil/Core/crypto_cmd.pbi"
+; boot - THE BOOTLOADER. The payload container (.pmf), the `boot` command
+; family, and BootFileWait(), the persisted-boot-target countdown Main()
+; runs after BootWait(). Core and chip-free: storage through the HwFile*
+; seam, the jump through this board's RunAt(), the digest through
+; Anvil/Core/sha256.pbi, the target through the settings store. It comes
+; after hash_cmd.pi4 because it prints digests with that file's
+; PutHexLower2, and after Board/storage.pi4 because it calls HwStorageUp().
+; THE PAYLOAD ABI. Three files, in this order, and the order is forced:
+;
+;   hw_board.pi4  the board's own identity, reset and MMU-state answers.
+;                 After safety.pi4 (SafetyToFirmware), mmu.pi4
+;                 (MmuSctlrEl2) and cache.pi4, all far above.
+;   hw_con.pi4    the HwCon* pixel surface. After Lib/display.pi4,
+;                 Monitor/anvil_fonts.pi4 and Board/display.pi4, whose
+;                 DrawSmoothText and SmoothTextWidth it is thin over.
+;   abi.pi4       the service table itself. It calls both of the above and
+;                 every Hw* seam in this build, so it comes after all of
+;                 them - AND BEFORE pmfboot.pi4, which is the one caller
+;                 of BuildServiceTable(). A procedure has to be defined
+;                 before it is called in this language, so moving abi.pi4
+;                 below pmfboot.pi4 breaks the build at PmfEnter - loudly,
+;                 which is the right failure.
+XIncludeFile "RaspberryPi4/Board/hw_board.pi4"
+XIncludeFile "RaspberryPi4/Board/hw_con.pi4"
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Hal/abi.pbi"
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE LOADER. After pmfboot.pbi because the two are the
+;  same job on two container formats and this is the order a reader wants
+;  them in; after abi.pbi because a module is entered with the service
+;  table's address; after format.pbi, parse.pbi and argfmt.pbi because
+;  the console file uses all three.
+;
+;  The SEAM REGISTRY is not here - it is at the top of this file, with
+;  the contract, for the reason given there.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
+; ... and its console side: the `boot` command word, the four boot.*
+; settings, and BootFileWait(). Separate from the engine above so the
+; engine can be built - and gated - without a line editor.
+XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+; Text/reporting half of the explicit multicore acceptance command. Its
+; hardware owner was included above cache.pi4 so the payload and cache paths
+; can see the ownership boundary. This reporting half uses the console's real
+; PrintDec routine already included above; it defines no private formatter.
+XIncludeFile "RaspberryPi4/Board/core_accept_cmd.pi4"
+; fan - the temperature, the curve and the pulse width. Core, chip-free;
+; it gates on #CAP_PWM through RequireCap (Anvil/Hal/hal.pbi), drives the
+; pin through the HwPwm* seam and reads the part through HwTemp*. It comes
+; after bootfile_cmd.pi4 deliberately and not by accident: PmfDecOf and
+; PmfPutDec live there, and a second copy of "a decimal string, or the
+; documented default when it is not one" is a second chance to disagree
+; about what "30x" means.
+XIncludeFile "Anvil/Core/fan.pbi"
+XIncludeFile "Anvil/Core/fan_cmd.pbi"
+; gpio - the demonstrator of the capability model. Core, chip-free; it
+; gates on #CAP_GPIO through RequireCap (Anvil/Hal/hal.pbi) and reports the
+; pins through the HwGpio* seam the board backend supplies. Comes after
+; hal.pi4, hw_gpio.pi4, state.pi4, parse.pi4 and argfmt.pi4, all above.
+XIncludeFile "Anvil/Core/gpio_cmd.pbi"
+; booti / bootm - boot an OS from memory. Core, chip-free; they gate on
+; #CAP_BOOT_EL1 through RequireCap (Anvil/Hal/hal.pbi), validate the image,
+; choose the device tree, and hand off through the HwBootToEl1 seam the board
+; backend (hw_boot.pi4, above) supplies. Comes after hal.pi4, hw_boot.pi4,
+; state.pi4, parse.pi4, format.pi4 and memmap.pi4, all above.
+XIncludeFile "Anvil/Core/boot_cmd.pbi"
+; i2c IS NOT INCLUDED HERE ANY MORE. It moved up, above clock_info.pi4, so
+; that `info` can call its I2cSayPins() - the note is at the new include.
+; This signpost stays so nobody re-adds the line here and ends up with two
+; definitions of every procedure in that file.
+; mmc - the raw block command. Core, chip-free; it gates on #CAP_MMC
+; through RequireCap and works the card through the HwMmc* seam the board
+; backend (hw_mmc.pi4, above) supplies. Comes after hal.pi4, hw_mmc.pi4,
+; memrange.pi4 (HitsMonitor), parse.pi4 and format.pi4, all above.
+XIncludeFile "Anvil/Core/mmc_cmd.pbi"
+; usb - the USB diagnostics command. Core, chip-free; it gates on #CAP_USB
+; through RequireCap and reports the host, the devices and a raw block read
+; through the HwUsb* seam hw_usb.pi4 supplies. After hal.pi4, hw_usb.pi4,
+; memrange.pi4 (payload-window checks), parse.pi4 and format.pi4, all above.
+XIncludeFile "Anvil/Core/usb_cmd.pbi"
+; TrueType is a memory-only parser. The monitor's font command supplies a
+; bounded file read and resident-slot memory; graphics code only borrows the
+; selected face and never owns a filesystem handle.
+XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+XIncludeFile "Anvil/Core/font_cmd.pbi"
+XIncludeFile "Anvil/Core/help.pbi"
+XIncludeFile "RaspberryPi4/Board/boot.pi4"
+XIncludeFile "Anvil/Kernel/exceptions.pbi"
+XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+; Explicit only: neither the secure timer nor its controlled-fault acceptance
+; runs during boot.  `el3test` below is the sole production entry point.
+XIncludeFile "Anvil/Kernel/Scheduler/timer_el3.pbi"
+XIncludeFile "RaspberryPi4/Board/el3_acceptance.pi4"
+XIncludeFile "RaspberryPi4/Board/exception_support.pi4"
+
+Procedure Main()
+  Define c.i
+  Define hz.i
+
+  ASM
+    ; CAPTURE THE FIRMWARE DEVICE-TREE POINTER, FIRST, BEFORE ANYTHING
+    ; TOUCHES x0.
+    ;
+    ; The selected Raspberry Pi armstub enters kernel8.img with x0 = the
+    ; firmware's flattened-device-tree pointer and x1=x2=x3=0. The stock stub
+    ; enters EL2h; Anvil's optional checked stub retains EL3. Both use the same
+    ; handoff (Datasheets/pi4/armstub8.S:163-171: primary_cpu loads w0 from
+    ; dtb_ptr32, then br x4). Anvil is kernel8.img, so x0 is that DTB at
+    ; _start. Nothing between _start and here has touched it:
+    ; EmitCore_A64.pbi's preamble uses x9,x10,x16,x17,x18 for the stack,
+    ; BSS-zero and the FP gate; Main()'s prologue uses x29,x30; and this is
+    ; Main()'s FIRST statement. So x0 still holds the DTB, and booti reads
+    ; it back through HwFirmwareDtb() (RaspberryPi4/Board/hw_boot.pi4).
+    ;
+    ; x1 is a safe scratch: the stub set it to 0 at entry and nothing reads
+    ; it here. The store lands in DRAM because the caches are still off (the
+    ; selected stub's active SCTLR bank has C=0 and Anvil has not enabled the MMU yet), which
+    ; is why HwFirmwareDtb() reads the right value however the D-cache is set
+    ; later. global_gbootdtb is gBootDtb (hw_boot.pi4), already zeroed by the
+    ; BSS-zero pass that ran before Main; this overwrites that zero.
+    adrp x1, global_gbootdtb
+    add  x1, x1, #:lo12:global_gbootdtb
+    str  x0, [x1]
+
+    ; MOVE THE MONITOR'S STACK OFF $08000000.
+    ;
+    ; The emitted prologue put sp at a hardcoded $08000000 and every
+    ; payload's prologue will put its own sp at the same address. One
+    ; of us has to move, and it has to be us, because we are the one
+    ; that has to still be here afterwards. #MON_STACK = $00100000,
+    ; growing down through free DRAM and stopping well above the
+    ; firmware's spin table at $0..$FFF.
+    ;
+    ; Main()'s own frame is stranded on the old stack by this, which is
+    ; harmless ONLY because Main() never returns.
+    ;
+    ; movz zeroes the whole 64-bit register and movk writes one field
+    ; without disturbing the rest, so this is a full 64-bit constant
+    ; even though only one field is non-zero.
+    movz x16, #0
+    movk x16, #0x0010, lsl #16
+    mov  sp, x16
+  EndASM
+
+  ; ADOPT the port, do not initialise it. uart.pi4 offers both calls and
+  ; the wrong one here would disable the PL011, reprogram it and flush
+  ; whatever the loader had queued - see the header.
+  ; 115200 regardless of what the firmware or a loader left behind. The
+  ; baud command can raise it afterwards; coming up at anything else
+  ; would mean the first line out is unreadable to a host that has not
+  ; been told yet.
+  ; Capture synchronous failures from the earliest driver initialization.
+  ; This installs only the current EL's vectors; it never unmasks IRQs.
+  HwExceptionPrepare()
+  UartInit(115200)
+  If gExceptionReady = 0
+    Print("!! Processor exception installation failed with code ")
+    PrintDec(ExceptionError()) : PrintNl()
+    PrintN("   Processor exception vectors could not be installed. Check the")
+    PrintN("   primary-core EL2/EL3 boot configuration before using this image.")
+  EndIf
+  HwInterruptPrepare()
+  If gInterruptReady = 0
+    PrintN("!! The interrupt controller was not prepared; IRQs remain masked.")
+    PrintN("   Polling remains available. Check the GIC identity and vector setup.")
+  EndIf
+
+  ; THE ARM CLOCK, BEFORE ANYTHING THAT IS SLOW.
+  ;
+  ; The firmware hands a Pi 4 to its kernel at 600 MHz, not the 1500 MHz
+  ; the part is rated for. That is not a fault - it is the conservative
+  ; boot state, and every real kernel raises it. This monitor never did,
+  ; so for a long time every glyph drawn, every block copied and every
+  ; CRC computed here ran at 40 percent of the speed available, for
+  ; nothing.
+  ;
+  ; It was found the embarrassing way: the HDMI console was slow enough
+  ; to be reported as a fault from the bench, and `i` had been printing
+  ; "ARM configured 600000000" at the top of every session for weeks
+  ; while nobody read it. A 2.5x speedup was sitting in the output of a
+  ; command we ran constantly.
+  ;
+  ; ClockInit() asks the firmware for its OWN reported maximum rather
+  ; than naming a number here - see clocks.pi4:161. The firmware knows
+  ; what this board can do, raises the core voltage to match, and clamps
+  ; silently if it disagrees, which is why `c` prints APPLIED and then
+  ; MEASURED separately.
+  ;
+  ; IT IS NOT FATAL IF IT FAILS. A board running at 600 MHz is slow, not
+  ; broken, and refusing to boot the monitor over it would turn a
+  ; performance question into a dead board with no console.
+  If ClockInit() = 0
+    PrintN("!! the ARM clock could not be raised - running at the firmware's")
+    PrintN("   boot speed. Everything here still works, just slower. 'c' shows it.")
+  EndIf
+
+  ; TimerInit() does two things and only the second is worth calling
+  ; for: it caches CNTFRQ_EL0, which Micros()/millis() would do lazily
+  ; anyway, and it WATCHES THE COUNTER MOVE. Having a frequency and
+  ; having a running counter are different claims.
+  If TimerInit() = 0
+    PrintN("!! the architectural counter is not running - every timeout")
+    PrintN("   in this monitor is guesswork. Transfers may not time out.")
+  EndIf
+
+  ; SAMPLE THE BOOT TICK, and do it here rather than at the top of Main:
+  ; TimerInit() has just proved the counter is actually moving, and a
+  ; boot stamp taken from a frozen counter would make every later uptime
+  ; wrong in the one direction that matters - it would never appear to
+  ; reset. CNTPCT_EL0 is cleared by a reboot, so this is zero-based per
+  ; boot with nothing to subtract.
+  gBootTicks = Ticks()
+  WallClockInit()
+
+  ; Two seconds of silence ends a transfer. ubsend.py pauses 4 ms
+  ; between records in S-record mode and 600 ms after the command, and
+  ; in raw mode it waits on our own acks, so this is generous by two
+  ; orders of magnitude in both and still leaves a live prompt when the
+  ; host goes away.
+  hz = TickHz()
+  If hz <= 0 Or hz > 1000000000
+    hz = 54000000                ; the BCM2711's counter, as a fallback
+  EndIf
+  gToTicks = hz + hz
+
+  gBad = 0
+  gFail = 0
+  gHaveEntry = 0
+  gMbx = 0
+
+  ; THE TIMING RECORD, BEFORE THE FIRST THING WORTH TIMING. TimerInit()
+  ; above has just proved the counter is moving, which is the one
+  ; precondition a table of ticks has. See Board/boot_timing.pi4 - it is
+  ; at a fixed address in the display's own reserved window, it survives
+  ; the boot it describes, and `screen timing` reads it back.
+  BootTimingBegin(hz, ClockMeasuredHz(#MBX_CLK_ARM))
+
+  ScreenEarlyLogStart()
+  Banner()
+
+  ; ------------------------------------------------------------------
+  ;  THE SCREEN FIRST. THEN THE CONFIGURATION. THEN THE NETWORK.
+  ;
+  ;  THIS ORDER IS A CHANGE AND IT HAS TO ANSWER THE ONE THAT WAS HERE.
+  ;  BootConfigUp() - PCIe, the xHCI host, the USB devices, the boot
+  ;  medium and SETTINGS.TXT - used to run FIRST, and the argument was
+  ;  sound: the screen is configured hardware, so a screen brought up
+  ;  before the store existed could only come up in a default and would
+  ;  have to be TORN DOWN AND REBUILT when the real answer arrived,
+  ;  erasing the boot log it was brought up early to carry.
+  ;
+  ;  THE CONCLUSION FOLLOWED FROM TWO THINGS THAT ARE NO LONGER TRUE.
+  ;  A geometry change is no longer a teardown: ScrDsiReadoptBegin
+  ;  re-points the HVS at its other fixed display list and re-installs
+  ;  the drawing surface with the panel still scanning - no power, no
+  ;  reset, no DSI host, no pixel valve, no allocation. And the boot log
+  ;  no longer lives only on the glass: Anvil/Core/boot_transcript.pbi
+  ;  retains the byte stream the console was built from, so a grid
+  ;  rebuilt at a new geometry is restored from WHAT WAS SAID rather
+  ;  than from pixels that are the wrong shape.
+  ;
+  ;  WHAT IT BUYS, AND IT IS THE WHOLE POINT: the slow half of the boot
+  ;  now PRINTS ON THE PANEL AS IT HAPPENS. USB enumeration and the boot
+  ;  medium are the longest things before the radio and they were the
+  ;  lines nobody could see. The stated cost of the old order - "the USB
+  ;  and boot-medium lines now reach the wire before the glass exists,
+  ;  so they are not on the panel" - is paid back here.
+  ;
+  ;  AND THE COMMON CASE COSTS NOTHING AT ALL. SETTINGS.TXT on this
+  ;  bench names no rotation, so the stored answer IS the default and
+  ;  ScreenApplyStoredGeometry finds nothing to change.
+  ;
+  ;  THE NETWORK IS STILL LAST, which is what the original ordering
+  ;  really existed for: it is the long, hang-prone half, and a board
+  ;  that stalls in the radio says so on the glass.
+  ;
+  ;  ScreenUp() is never fatal and it CHOOSES: the DSI panel if one
+  ;  answered on the display connector, else an HDMI display if the
+  ;  firmware found one, else none - and it says which. The prompt
+  ;  arrives on the wire either way.
+  ;
+  ;  NOTHING IN ScreenUp() READS THE SETTINGS STORE FOR ANYTHING BUT
+  ;  GEOMETRY. The panel is found over I2C, the firmware is asked over
+  ;  the mailbox, and the framebuffers are at fixed addresses this
+  ;  monitor chose - so there is nothing here that needs the boot medium
+  ;  to have mounted. The two things the store can say, rotation and
+  ;  magnification, are exactly the two ScreenApplyStoredGeometry
+  ;  corrects below.
+  ; ------------------------------------------------------------------
+  ; Opt in only for the existing panel/touch boot transactions. Capture is
+  ; bounded RAM history, not extra probes; disable retains it for touch trace.
+  ScreenDsiEarlyCacheArm()
+  I2cTraceEnable(1)
+  ScreenUp()
+  TouchBoot()
+  I2cTraceEnable(0)
+  BootTimingMark(#BTM_TOUCH_END, 0, 0)
+  ; Paint whatever the pre-screen lines left queued the instant the glass
+  ; exists, so the banner is followed by the log rather than by a pause.
+  ScreenServiceTick()
+
+  ; The slow half, now with somewhere to print. Every line of it lands on
+  ; the panel as it is produced: StorageUp and UsbEnumerate call
+  ; ScreenServiceTick themselves (boot.pi4), so this is live progress and
+  ; not a buffer flushed at the end.
+  BootTimingMark(#BTM_CONFIG_BEGIN, 0, 0)
+  BootConfigUp()
+  BootTimingMark(#BTM_CONFIG_END, gFatUp, 0)
+
+  ; THE STORE EXISTS NOW. If it names a geometry the default bring-up did
+  ; not use, the console moves to it in place and the retained boot log is
+  ; replayed into the rebuilt grid. Returns without touching anything when
+  ; the stored answer and the default agree.
+  ScreenApplyStoredGeometry()
+  ScreenServiceTick()
+
+  TimeBoot()
+  NtpServiceBoot()
+  ; Switch the established surface to the preferred V3D renderer before the
+  ; long network bring-up paints its progress. ScreenUp's initial banner is
+  ; necessarily drawn once by the CPU/DMA tier because V3D needs that live
+  ; surface. Failure is non-fatal: V3dConAutoStart leaves the DMA/CPU
+  ; renderer active, which is a readable console and not a degraded one.
+  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  V3dConAutoStart()
+  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
+  CompilerElse
+  BootTimingMark(#BTM_V3D_END, 0, 0)
+  CompilerEndIf
+  ScreenEarlyLogFinish()
+  GenetSetProgressHook(@ScreenServiceTick)
+  NetWaitSetProgressHook(@ScreenServiceTick)
+  WifiSetProgressHook(@ScreenServiceTick)
+  ; Draw whatever is already waiting the instant the glass is up, so the
+  ; screen shows it immediately rather than holding it - with the whole
+  ; network bring-up behind it - until the first prompt.
+  ScreenServiceTick()
+  BootTimingMark(#BTM_NET_BEGIN, 0, 0)
+  BootNetUp()
+  BootTimingMark(#BTM_NET_END, 0, 0)
+
+  ; ------------------------------------------------------------------
+  ;  THE DRIVER MODULES, HERE, AND THE POSITION IS THE WHOLE ARGUMENT.
+  ;
+  ;  AFTER THE CONSOLE so that a refusal is seen. A module that will not
+  ;  load is exactly the thing an operator has to be told about, and a
+  ;  walk that ran before the glass and the wire were up would print its
+  ;  sentences into a buffer nobody reads.
+  ;
+  ;  BEFORE BootWait() so that a driver is in place before autoboot can
+  ;  hand the whole board to a payload. A payload entered with the
+  ;  service table is entitled to find the seams a loaded module fills;
+  ;  loading them afterwards would mean the same card produced two
+  ;  different machines depending on how fast somebody pressed a key.
+  ;
+  ;  BEFORE FanBoot() for the same reason one step smaller: the fan
+  ;  policy reads a temperature, and whether that reading comes off the
+  ;  part or out of the firmware is decided by whether THERMAL.MOD
+  ;  loaded. Running the walk afterwards would start the fan on the slow
+  ;  source and silently keep it there.
+  ;
+  ;  IT IS NEVER FATAL. No manifest, no module, or a refused module all
+  ;  reach the prompt: every seam a module would fill has a core answer
+  ;  or an honest refusal behind it.
+  ; ------------------------------------------------------------------
+  ModBoot()
+  ScreenServiceTick()
+
+  ; THE DRAM AUTOBOOT RECORD FIRST, THE PERSISTED BOOT TARGET SECOND, and
+  ; the order is the precedence. BootWait() takes `autoboot <addr>`, which
+  ; somebody typed at this prompt during THIS power cycle and which lives
+  ; in DRAM across a reset; it returns at once when nothing is armed.
+  ; BootFileWait() then takes `boot.file` out of the settings store, which
+  ; survives a power cycle. The deliberate, just-typed thing wins over the
+  ; standing configuration, and on a cold start the DRAM record correctly
+  ; fails its magic so the persisted target is what acts.
+  BootWait()
+  BootFileWait()
+
+  ; THE FAN, LAST, AND AFTER THE SETTINGS ARE IN. FanBoot() resets the
+  ; curve to its documented defaults, lets SETTINGS.TXT override what it
+  ; names, and starts driving the stored pin if there is one. It is here
+  ; rather than in BootBringUp() because the settings load happens in
+  ; there and this has to be after it, and because a fan that starts
+  ; while PCIe is still enumerating would be a fan running on a
+  ; temperature nobody has read yet. It prints one line when a fan is
+  ; configured and nothing at all when one is not.
+  FanBoot()
+  ScreenServiceTick()
+
+  ; THE BOOT LOG ENDS HERE, AND WITH IT THE LAST TIME A BACKGROUND SERVICE
+  ; MAY SPEAK ON THE CONSOLE. From the first prompt on, anything that is not
+  ; the answer to a typed command goes to the message log instead - see
+  ; Anvil/Core/messages.pbi. Everything above this line was the boot, and
+  ; stays on every console exactly as before.
+  MessagesStart()
+
+  Repeat
+    ; "pmf> " IS A PROTOCOL STRING - the five characters, the space
+    ; included, and no newline after them. FOUR host tools wait for it:
+    ;
+    ;   tools/anvil.py     prompt() and setbaud() grep for "pmf>"
+    ;   tools/ubsend.py    PROMPTS = (b"U-Boot> ", b"=> ", b"pmf> ") and
+    ;                      it matches with tail.endswith(), so THE
+    ;                      TRAILING SPACE IS LOAD BEARING - without it
+    ;                      the sender never believes it has a prompt and
+    ;                      every transfer fails at the first step
+    ;   tools/monsession.py waits for b"pmf>" before it types anything
+    ;   tools/ubfs.py      uses b"pmf>" to notice Anvil is up and reset
+    ;                      into U-Boot
+    ;
+    ; It is not prose and it is not swept. Do not spell it out, do not
+    ; capitalise it, and do not put a newline after it.
+    ; ONE ROW, THE FIRST TIME ONLY. The record has a fixed number of rows
+    ; and a prompt printed every command would fill it with the least
+    ; interesting event in the boot; BootTimingPromptOnce keeps the first.
+    BootTimingPromptOnce()
+    ; Screen colour is sideband metadata on the primary mirror only. The
+    ; five protocol bytes below still reach PL011 and the network tap
+    ; unchanged, so every host tool continues to match exact b"pmf> ".
+    UartScreenStyle(#UART_SCREEN_STYLE_PROMPT)
+    Print("pmf> ")
+    UartScreenStyle(#UART_SCREEN_STYLE_NORMAL)
+    ; ================================================================
+    ;  AND IT HAS TO REACH THE NETWORK CONSOLE TOO.  2026-09-07.
+    ;
+    ;  MEASURED ON SILICON tonight, over the cable: every command's
+    ;  OUTPUT arrived at the laptop and the prompt NEVER DID - not once,
+    ;  in any capture. The reason is one line in
+    ;  RaspberryPi4/Lib/uart.pi4 (uart_AuxPut): the tap that feeds the
+    ;  network console flushes ON A LINE BOUNDARY - `c = 10` - or when
+    ;  its ring is nearly full. That rule is right for everything else,
+    ;  because flushing per character would put one datagram on the wire
+    ;  for every byte of a screenful.
+    ;
+    ;  "pmf> " HAS NO NEWLINE. That is deliberate and it is stated
+    ;  directly above: four host tools match on those five characters
+    ;  INCLUDING THE TRAILING SPACE and with nothing after them. So the
+    ;  one string the tools wait for is the one string the per-line rule
+    ;  can never release, and a console that never delivers it is a
+    ;  console those tools cannot drive - `tools/pi4_upload.py --console
+    ;  net` gave up with "no Anvil prompt" against a board that was
+    ;  answering `version` on that same address in the same second.
+    ;
+    ;  ONE EXPLICIT FLUSH, HERE, WHERE THE PROTOCOL STRING IS EMITTED.
+    ;  Not a change to the per-line rule, which would cost a datagram
+    ;  per byte on every long print; and not a special case inside the
+    ;  UART, which has no business knowing what a prompt is. It costs
+    ;  one call per command line, it is a no-op when no console is armed
+    ;  and another when there is no peer, and it is re-entry guarded.
+    ; ================================================================
+    NetConsoleFlush()
+    ; Release only after the command's output and following prompt have
+    ; reached its owner; nested ReadLine subprompts retain that owner.
+    NetConsoleCommandDone()
+    ReadLine()
+    ; The line is taken; a command runs under its owner from here, and the
+    ; console is not handed to another host until it finishes (forum 888).
+    NetConsoleCommandBegin()
+    ; Armed AFTER the line is read, so the Enter that submitted it - and
+    ; anything typed ahead of it - cannot count as an abort of the
+    ; command it is about to start. See STOPPING A LONG PRINT.
+    OutBreakArm()
+    gPos = 0
+    SkipSpace()
+    gWordAt = gPos
+    c = gLine[gPos] & $FF
+    SkipWord()
+    gWordLen = gPos - gWordAt
+
+    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
+    ; Two call sites, both of them core, because the command chain below
+    ; is inline here and there is nothing for a wrapper to re-enter. When
+    ; the word moves, the single-letter character moves with it; a refusal
+    ; sets that character to zero, which the chain's first arm already
+    ; treats as an empty line and runs nothing for.
+    Define tmv.i
+    tmv = TimeArm()
+    If tmv = 1
+      c = gLine[gWordAt] & $FF
+    ElseIf tmv = 2
+      c = 0
+    EndIf
+
+    ; ================================================================
+    ;  THE WIDTH SUFFIX  -  U-Boot's .b / .w / .l on the command word.
+    ;
+    ;  U-Boot carries the object size ON THE COMMAND WORD - md.l, mw.w,
+    ;  cp.b - and reads it back off argv[0] (v2025.01_cmd_mem.c:143).
+    ;  This monitor matches whole words, so a word ending in .b/.w/.l
+    ;  would never match "md". Strip it ONCE here, record the width in
+    ;  gMemWidth for the handler that is about to run, and shorten
+    ;  gWordLen so WordIs sees the bare word. gMemWidth is RESET every
+    ;  command so a width cannot leak from one to the next.
+    ;
+    ;  Only the memory family reads gMemWidth; stripping a .b/.w/.l off
+    ;  any other word is harmless because no other command has that
+    ;  suffix and the width is simply ignored. A word that is only ".b"
+    ;  (gWordLen 2, nothing before the dot) is left alone - it is not a
+    ;  suffix on anything.
+    ; ================================================================
+    gMemWidth = 0
+    ; THE SAFETY OVERRIDE AGES HERE, FOR THE SAME REASON gMemWidth IS
+    ; RESET HERE: state that leaks from one command into the next is a
+    ; trap. `force <address>` arms one address for the NEXT command line
+    ; and this is what ends it - used or not, and whether or not the line
+    ; in between was even a command this monitor knows. See
+    ; Anvil/Core/addrsafe.pbi.
+    ForceAge()
+    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46   ; 46 = '.'
+      Define suf.i
+      suf = gLine[gWordAt + gWordLen - 1] & $FF
+      If suf = 98 Or suf = 66                                 ; b / B
+        gMemWidth = 1
+      ElseIf suf = 119 Or suf = 87                            ; w / W
+        gMemWidth = 2
+      ElseIf suf = 108 Or suf = 76                            ; l / L
+        gMemWidth = 4
+      EndIf
+      If gMemWidth <> 0
+        gWordLen = gWordLen - 2                               ; hide ".x"
+      EndIf
+    EndIf
+
+    ; THE WORD FIRST, THE LETTER SECOND. Both reach the same handler;
+    ; the word is what a reader of the transcript sees.
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+
+    ElseIf WordIs("receive") <> 0 Or LetterIs(98) <> 0   ; b
+      CmdBlock()
+
+    ; wb - the same, over the air. Two letters, so it cannot collide with
+    ; b (LetterIs matches only a one-letter word) and no U-Boot script
+    ; types it. The handler always exists; its body is what the radio flag
+    ; gates, so this line compiles on a target that has no Wi-Fi.
+    ElseIf WordIs("wb") <> 0
+      CmdWirelessBlock()
+
+    ; "loads" is what ubsend.py types at U-Boot, and it lands here.
+    ElseIf WordIs("srecord") <> 0 Or WordIs("loads") <> 0 Or LetterIs(108) <> 0   ; l
+      SrecLoad()
+
+    ; "go" likewise.
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0   ; g
+      CmdGo()
+
+    ; booti - boot an arm64 Linux Image. bootm - boot a container (a legacy
+    ; uImage single kernel, else a loud refusal). Both are whole words, so no
+    ; single-letter alias and no collision with run/go. Core handlers in
+    ; Anvil/Core/boot_cmd.pbi, gated on #CAP_BOOT_EL1.
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+
+    ; boot - THE BOOTLOADER COMMAND, and it is a different job from the
+    ; two above rather than a shorter spelling of them. booti and bootm
+    ; take an operating system already in memory at an address somebody
+    ; typed. `boot <name>` takes a PAYLOAD CONTAINER off the boot medium,
+    ; reads the load address, entry point and SHA-256 the compiler put in
+    ; it, places the image, proves it, and enters it - with no address
+    ; typed anywhere. Core handler in Anvil/Core/pmfboot.pbi, gated on
+    ; #CAP_STORAGE except for `boot mem`, which touches no medium.
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+
+    ; "md" IS U-BOOT'S NAME FOR THIS and it is dispatched. The help text
+    ; has said "coming from U-Boot: md is memory" for as long as the memory
+    ; family has existed, and mw, cmp and cp were all wired up as aliases -
+    ; md alone was not, so the one U-Boot spelling the help named FIRST was
+    ; the one that did not work. A transcript pasted out of a U-Boot session
+    ; got "? unknown command" on its first line.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0   ; m
+      CmdMem()
+
+    ; readback - the same range, for a MACHINE instead of a person. No
+    ; single-letter alias and no U-Boot spelling, because U-Boot has no
+    ; such command: it is base64 with a byte count and a crc32 on the
+    ; last line, and the payload goes to whichever console typed the
+    ; line rather than to all of them. See Anvil/Core/readback.pbi for
+    ; the measurement that produced it.
+    ElseIf WordIs("readback") <> 0
+      CmdReadback()
+
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0   ; w
+      CmdWrite()
+
+    ; THE MEMORY FAMILY, from RaspberryPi4/Reference/v2025.01_cmd_mem.c.
+    ; Anvil's word first and U-Boot's spelling as an alias, so a
+    ; transcript copied out of U-Boot still runs. None of these can
+    ; collide with the single letters above: LetterIs only matches a
+    ; word of length one.
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+
+    ; THE CRYPTOGRAPHIC CHECKSUMS, from U-Boot's hash family. Same job as
+    ; crc32 with a stronger function underneath - the digest a published
+    ; image is checked against - riding Lib/sha1.pi4 and Lib/sha256.pi4.
+    ElseIf WordIs("sha1sum") <> 0
+      CmdSha1sum()
+
+    ElseIf WordIs("sha256sum") <> 0
+      CmdSha256sum()
+
+    ; THE CRYPTO SELF-TEST. A whole word, no single-letter alias and no
+    ; abbreviation: it is the command that says whether this board's
+    ; cryptography is right, and a transcript of it is evidence, so the
+    ; word in the transcript should be the word. Core handler in
+    ; Anvil/Core/crypto_cmd.pbi; it gates on nothing at all, because
+    ; every module it drives is pure computation over .bss.
+    ElseIf WordIs("crypto") <> 0
+      CmdCrypto()
+
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+
+    ; mm / nm - interactive memory modify, U-Boot's own names (whole
+    ; words already, so no alias needed). mm auto-increments, nm holds.
+    ; Both honour the .b/.w/.l width the SUFFIX block set. See ModMem in
+    ; memcmd.pi4 for how the sub-prompt escapes.
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+
+    ; mtest - destructive RAM test. U-Boot's name. Requires an explicit
+    ; range inside a payload window and says so; see CmdMtest.
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+
+    ; force - arm one address the board refused, for the next command
+    ; line only. NO SINGLE-LETTER ALIAS and no abbreviation, deliberately:
+    ; this is the confirmation step for an access that can take a board
+    ; down, and a one-character way to type it would be exactly the
+    ; accident it exists to prevent. See Anvil/Core/addrsafe.pbi.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+
+    ; The settings store, and the two Wi-Fi keys over it. These are what
+    ; U-Boot's printenv / setenv / saveenv were for; they are NOT
+    ; accepted as aliases, because setenv's argument shape is different
+    ; enough that the alias would be a trap rather than a convenience.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+
+    ElseIf WordIs("wifi") <> 0
+      CmdWifi()
+
+    ; THE U-BOOT ENV NAMES over the same settings store. These ARE
+    ; accepted as aliases, unlike the memory family's setenv note that
+    ; used to live here: printenv/setenv/saveenv take the same
+    ; name-then-value shape settings set does, so a line pasted out of a
+    ; U-Boot session runs and does the right thing. The two places
+    ; U-Boot and Anvil differ - setenv-with-no-value, and secret masking
+    ; - are handled by SAYING SO inside the handlers, not by a surprise.
+    ; See CmdEnvSet / CmdEnvPrint in settings_cmd.pi4.
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+
+    ; The cursor sensitivity, live. See CmdMouse - it is a feel found at
+    ; the bench, so it is a command and not a rebuild.
+    ElseIf WordIs("mouse") <> 0
+      CmdMouse()
+
+    ; THE NETWORK. No U-Boot aliases here, and that is a ruling rather
+    ; than an omission: U-Boot's tftpboot and tftpput take the address
+    ; first and the filename second, and get and put take the name first
+    ; to match this monitor's own load and save. An alias that accepted a
+    ; U-Boot line and did something else with it would be a trap, which
+    ; is the same reason setenv is not accepted for settings set.
+    ElseIf WordIs("net") <> 0
+      CmdNet()
+
+    ElseIf WordIs("get") <> 0
+      CmdGet()
+
+    ElseIf WordIs("put") <> 0
+      CmdPut()
+
+    ; ping, dns and dhcp are Core (Anvil/Core/net_cmd.pbi) and gate on
+    ; #CAP_NET through RequireCap, so these three lines compile and
+    ; dispatch on every board and refuse cleanly on one with no network.
+    ; No reserved-word collision: `run` is go, and none of these is it.
+    ElseIf WordIs("ping") <> 0
+      CmdPing()
+
+    ElseIf WordIs("dns") <> 0
+      CmdDns()
+
+    ElseIf WordIs("dhcp") <> 0
+      CmdDhcp()
+
+    ; tcp and http get are Core too (Anvil/Core/tcp_cmd.pbi) and gate on
+    ; #CAP_NET the same way. `http get` is the smoke test for everything
+    ; underneath it: a real server, a real handshake, a real close.
+    ElseIf WordIs("tcp") <> 0
+      CmdTcp()
+
+    ElseIf WordIs("http") <> 0
+      CmdHttp()
+
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+
+    ; What background services reported. They never print on the command
+    ; line; this is where they are read (Anvil/Core/messages.pbi).
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+
+    ; THE PORTABLE CONSOLE/FLOW COMMANDS, from U-Boot. Hardware-agnostic,
+    ; so they live in Anvil/Core/flow_cmd.pbi and every board that builds
+    ; the core gets them. echo and version keep their U-Boot names; sleep
+    ; is interruptible here because this board's recovery story is that
+    ; the prompt stays reachable.
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+
+    ; setexpr - evaluate an expression into the settings store. The expr
+    ; corner of U-Boot's flow family; see CmdSetexpr in flow_cmd.pi4.
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+
+    ; map - the memory map as the running image measures it. Core, chip-free,
+    ; no capability: every board can say where it put itself. A whole word
+    ; only; m is the memory dump. See CmdMap in Anvil/Core/memcmd.pbi for
+    ; why it is a command of its own and not a section of `info`.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0   ; i
+      CmdInfo()
+
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("clock") <> 0 Or LetterIs(99) <> 0   ; c
+      CmdClock()
+
+    ElseIf WordIs("autoboot") <> 0 Or LetterIs(97) <> 0   ; a
+      CmdAuto()
+
+    ElseIf WordIs("mount") <> 0 Or WordIs("fatload") <> 0 Or WordIs("load") <> 0 Or LetterIs(102) <> 0   ; f
+      CmdFat()
+
+    ; fatls / ls - list the mounted FAT root directory. Core logic, gated
+    ; on #CAP_STORAGE through RequireCap (Anvil/Hal/hal.pbi), so this same
+    ; line compiles and dispatches on a board with no storage, where it
+    ; degrades to the honest "not available" refusal. ls is the generic
+    ; front-end name U-Boot uses; both land in the same handler.
+    ElseIf WordIs("fatls") <> 0 Or WordIs("ls") <> 0
+      CmdFatls()
+
+    ; cat - print a small text file off the boot medium without loading
+    ; it into a payload window. Core logic, gated on #CAP_STORAGE through
+    ; RequireCap like fatls above, and it reads and never writes. It
+    ; exists because reading four lines of configuration out of a hex
+    ; dump is how a character gets transcribed wrongly.
+    ElseIf WordIs("cat") <> 0
+      CmdCat()
+
+    ElseIf WordIs("baud") <> 0
+      CmdBaud()
+
+    ElseIf WordIs("save") <> 0
+      CmdSave()
+
+    ; mkdir / rm / rename - directory-level changes on the storage medium,
+    ; write-gated through the same seam as save. Whole words only: md is
+    ; the memory dump. See Anvil/Core/fs_cmd.pbi.
+    ElseIf WordIs("mkdir") <> 0
+      CmdMkdir()
+    ElseIf WordIs("rmdir") <> 0
+      CmdRmdir()
+    ElseIf WordIs("rm") <> 0 Or WordIs("del") <> 0
+      CmdRemove()
+    ElseIf WordIs("rename") <> 0 Or WordIs("mv") <> 0
+      CmdRename()
+
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0   ; r
+      CmdReset()
+
+    ; The D-cache switch. No single-letter alias - c is clock - so it is
+    ; a whole word only. Caches are off at boot; see CmdCache.
+    ElseIf WordIs("cache") <> 0
+      CmdCache()
+
+    ; gpio - report the pins. A whole word only, no single-letter alias -
+    ; g is go. The handler is Core and gates on #CAP_GPIO through
+    ; RequireCap, so this same line compiles and dispatches on a board with
+    ; no GPIO, where it degrades to the honest "not available" refusal.
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+
+    ; i2c - talk to devices on the header I2C bus. A whole word only, no
+    ; single-letter alias. Core and gates on #CAP_I2C through RequireCap, so
+    ; this line compiles and dispatches on a board with no I2C too, where it
+    ; degrades to the honest "not available" refusal.
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+
+    ; touch - the DSI panel's touch controller and its power MCU. A whole
+    ; word only; t is not free, and this family is not worth a letter
+    ; before it has answered a real panel once. The handler is this
+    ; board's own (Board/touch_cmd.pi4), so unlike every arm around it
+    ; there is no RequireCap: a board without the include does not have
+    ; the command at all.
+    ElseIf WordIs("touch") <> 0
+      CmdTouch()
+    ; dsi - the other half of the same ribbon: the SoC's DSI1 host, the
+    ; panel's own init table, and the HVS and pixel valve behind them.
+    ; A whole word only; d is dump. This board's own, so no RequireCap.
+    ElseIf WordIs("dsi") <> 0
+      CmdDsi()
+    ; mmio - ONE 32-bit load. It exists because `memory` reads BYTES and
+    ; the peripheral blocks on this part answer a sub-word read with a
+    ; block-identity string, so `memory.l` over MMIO returns a plausible
+    ; register dump that is not one. It reads and never writes.
+    ElseIf WordIs("mmio") <> 0
+      CmdMmio()
+    ; fan - the fan policy. A whole word only, no single-letter alias -
+    ; f is fatload. Core and gates on #CAP_PWM through RequireCap, so this
+    ; line compiles and dispatches on a board with no modulator and no
+    ; thermometer too, where it degrades to the honest refusal.
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+
+    ; mod - the driver-module loader. A whole word only and no
+    ; single-letter alias: m is memory and d is deadman, and a monitor
+    ; that guesses which destructive command a letter meant is not one
+    ; anybody should trust. The handler is Core; the board supplies the
+    ; arena, the cache maintenance and the device list.
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+
+    ; mmc - raw SD/eMMC block access. Core, gates on #CAP_MMC through
+    ; RequireCap, so this same line compiles and dispatches on a board with
+    ; no card controller, where it degrades to the honest refusal.
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+
+    ; usb - USB diagnostics. A whole word only, no single-letter alias.
+    ; The handler is Core and gates on #CAP_USB through RequireCap, so this
+    ; same line compiles and dispatches on a board with no USB host, where
+    ; it degrades to the honest "not available" refusal.
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+
+    ; `font` owns bounded file slots and reports/selects the active
+    ; TrueType face. The Vulkan and framebuffer renderers consume that same
+    ; selected memory face when their screen backend is active.
+    ElseIf WordIs("font") <> 0
+      CmdFont()
+
+    ; EL3 acceptance is never a boot side effect.  The whole word, exact
+    ; arity and explicit transcript make a timer interrupt or controlled BRK
+    ; impossible to trigger through an abbreviation or a mistyped tail.
+    ElseIf WordIs("el3test") <> 0
+      SkipSpace()
+      If gLine[gPos] <> 0
+        PrintN("? el3test takes no arguments; nothing was tested.")
+      Else
+        CmdEl3Accept()
+      EndIf
+
+    ; Resident multicore acceptance has an intentionally small grammar.
+    ; A bare word is read-only status. `run` owns cores 1..3 until restart;
+    ; `stop` parks them permanently and still retains that ownership.
+    ElseIf WordIs("coretest") <> 0
+      SkipSpace()
+      gWordAt = gPos
+      SkipWord()
+      gWordLen = gPos - gWordAt
+      If gWordLen = 0
+        CmdCoreAcceptStatus()
+      Else
+        SkipSpace()
+        If gLine[gPos] <> 0
+          PrintN("? coretest takes exactly run, stop, status, or no argument.")
+        ElseIf WordIs("run") <> 0
+          CmdCoreAcceptRun()
+        ElseIf WordIs("stop") <> 0
+          CmdCoreAcceptStop()
+        ElseIf WordIs("status") <> 0
+          CmdCoreAcceptStatus()
+        Else
+          PrintN("? coretest takes run, stop, status, or no argument.")
+        EndIf
+      EndIf
+
+    ElseIf WordIs("deadman") <> 0 Or LetterIs(100) <> 0   ; d
+      CmdDeadman()
+
+    ; last run - what happened to the last payload: returned and with what,
+    ; stopped at an exception, or reset underneath by the deadman. Two whole
+    ; words and no letter; a host whose return line was lost asks this.
+    ElseIf WordIs("last") <> 0
+      SkipSpace()
+      gWordAt = gPos
+      SkipWord()
+      gWordLen = gPos - gWordAt
+      SkipSpace()
+      If WordIs("run") <> 0 And gLine[gPos] = 0
+        CmdLastRun()
+      Else
+        PrintN("? last takes exactly one word: last run.")
+      EndIf
+
+    ; trail - the boot trail, this boot's and the previous one's, one step
+    ; per line with its millisecond (forum 880). A whole word, no letter.
+    ElseIf WordIs("trail") <> 0
+      CmdTrail()
+
+    ; shot - the KEPT picture: the capture area, not the live screen.
+    ; A whole word only and no single letter - s is screen and p is the
+    ; live screenshot, and a monitor that guesses which of three screen
+    ; commands a letter meant is not one anybody should trust. It comes
+    ; before pr and p for no reason but that the three belong together;
+    ; WordIs matches whole words, so the order does not decide anything.
+    ElseIf WordIs("shot") <> 0
+      CmdShot()
+
+    ; pr - the RELIABLE screenshot, for the wireless console: the same
+    ; picture as p, but as acknowledged binary datagrams with a CRC, so a
+    ; busy screen survives the air. tools/pmfshot_wifi.py speaks it.
+    ElseIf WordIs("pr") <> 0
+      CmdPicR()
+
+    ; screenshot BEFORE screen, and WordIs matches whole words anyway -
+    ; belt and braces, because getting this pair the wrong way round
+    ; would photograph the screen every time somebody turned it on.
+    ElseIf WordIs("screenshot") <> 0 Or LetterIs(112) <> 0   ; p
+      CmdPic()
+
+    ElseIf WordIs("screen") <> 0 Or LetterIs(115) <> 0   ; s
+      CmdScreen()
+
+    ; "?" IS DISPATCHED HERE, and this is the second time it has had to be
+    ; fixed. The help text advertised "[h, ?, commands]" while this line
+    ; read  Or LetterIs(104) <> 0   ; h Or c = 63  - the comment named the
+    ; question mark and the CONDITION never tested for it, so "?" fell
+    ; through to the unknown-command arm and answered "? unknown command
+    ; - type help. (?)". An earlier pass found the same drift and fixed it
+    ; by deleting the claim from the help; it came back, because "?" is
+    ; the first thing anybody types at an unfamiliar prompt.
+    ;
+    ; 63 is the question mark. This language has no character literals, so
+    ; the code is passed and the character is named in the comment - see
+    ; LetterIs(). LetterIs only matches a word of exactly one character,
+    ; so this cannot collide with anything else.
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0   ; h, ?
+      Help()
+      PrintNl()
+      PrintN("PI 4 EL3 ACCEPTANCE")
+      PrintN("  el3test              one bounded secure-timer IRQ, then one controlled BRK")
+      PrintN("  coretest status      resident secondary-core ownership and last result")
+      PrintN("  coretest run         16 coherent job rounds on cores 1, 2 and 3")
+      PrintN("  coretest stop        acknowledge and permanently park those workers")
+      PrintN("These are explicit diagnostics, never boot actions. After coretest run,")
+      PrintN("restart before changing cache policy or entering a payload.")
+
+    Else
+      ; ECHO WHAT WAS ACTUALLY TYPED. "unknown command" with no subject is
+      ; the least useful thing a prompt can say, and it is the one that
+      ; hides a line editor that dropped or mangled a character.
+      Define k.i
+      Print("? this monitor does not know the command ")
+      k = 0
+      While k < gWordLen And k < 24
+        UartWrite(gLine[gWordAt + k] & $FF)
+        k = k + 1
+      Wend
+      PrintN(", so nothing was done.")
+      PrintN("  Type help, or just a question mark, for the list of commands.")
+      PrintN("  Every command is a whole word; the old single letters still work.")
+    EndIf
+    ; What the command above cost, on this board's own counter, if the
+    ; line began with `measure`. Silent otherwise.
+    TimeReport()
+  ForEver
+EndProcedure
+
+Main()

@@ -1,0 +1,228 @@
+; clocks.pi4 - the Raspberry Pi 4 clock library
+;
+; THE PROBLEM THIS EXISTS TO SOLVE, measured on the board 2026-08-25:
+;
+;   the board file says   ClockSpeed = 1500000000
+;   the machine boots at            600000000
+;
+; A factor of 2.5, with nothing anywhere saying so. `pi4ClockProbe`
+; measured it, and this library is the other half of that finding.
+;
+; THE HOUSE CONVENTION, and this file follows it rather than inventing
+; one. On the RP2350 the compiler does NOT raise the clock in the emitted
+; startup - `clocks.pico2` provides `ClockInit()` and the PROGRAM calls
+; it. F_CPU is understood to be the speed AFTER that call, not the speed
+; out of reset. The Pi 4 was not an exception to that convention; it was
+; simply missing its half of it. Now it has one:
+;
+;     ClockInit()          ; ARM to its maximum, once, at the top of Main
+;
+; WHY NOT DO IT AUTOMATICALLY IN _start. Three reasons, and the third is
+; the one that decides it:
+;   1. it needs the mailbox, which needs DRAM and a buffer - a great deal
+;      of machinery to run before the programmer's first line;
+;   2. an image entered by something other than the usual firmware (a
+;      loader, another OS, a test harness) might have no working mailbox
+;      at all, and a startup that hangs there is unrecoverable;
+;   3. it would be a silent side effect. A program that draws 3x the
+;      current the moment it starts should say so in its own source.
+;
+; WHAT RAISING THE CLOCK DOES *NOT* AFFECT: delay(), Micros(), millis()
+; and every timeout in timer.pi4. Those run on CNTPCT_EL0, the
+; architectural counter, fixed at 54 MHz and deliberately independent of
+; the CPU. That independence was MEASURED, not assumed - pi4TimerProbe
+; ran the same delay at 600 MHz and at 1.5 GHz and got 10800007 against
+; 10800003 ticks, a difference of 74 nanoseconds across a 2.5x change.
+; So this library makes code run faster; it does not make delays shorter.
+;
+; WHAT IT DOES AFFECT: anything that counts instructions instead of
+; ticks. If you have hand-written a spin loop, this changes its duration
+; by 2.5x. Use timer.pi4 instead - that is what it is for.
+;
+; THE FIRMWARE CLAMPS RATHER THAN REFUSING, and every procedure here is
+; shaped around that. Ask for 2.5 GHz on a 1.5 GHz part and the response
+; code is SUCCESS, the tag is marked answered, and the rate you get is
+; 1500000000. So every setter here RETURNS THE RATE THE FIRMWARE APPLIED
+; and never a bare 1 for "worked". A wrapper that reported the rate it
+; ASKED for would be a confident wrong answer about the speed of the
+; machine, and every timing calculation downstream would inherit it.
+;
+; AND THE CEILING IS config.txt's, not the silicon's. `arm_freq` /
+; `arm_freq_max` bound what the firmware will allow; this tag cannot
+; exceed them. ClockMaxHz() reports what the firmware says it will give,
+; which is the only number worth asking for.
+;
+; THE GOVERNOR CAN UNDO THIS AT ANY MOMENT. The on-demand governor moves
+; the ARM clock between min and max by itself, for thermal and
+; undervoltage reasons, with no notification. That is why
+; ClockMeasuredHz() exists and why ClockInit() uses it to report success:
+; the CONFIGURED rate is an intention and only the MEASURED rate is an
+; observation.
+;
+; DEPENDS ON mailbox.pi4. Every clock on this part is the VideoCore's to
+; hand out - there is no PLL register here to poke the way there is on an
+; RP2040. Include mailbox.pi4 before this file.
+;
+; MEASURED ON THE BOARD, 2026-08-25, Pi 4 Model B rev 1.2, 4 GB:
+;
+;   clock  configured      min          max        measured
+;   ARM     600000000   600000000   1500000000    600169920
+;   CORE    200000000   200000000    500000000    200008304
+;   EMMC    250000000   250000000    250000000    250000496
+;   UART     48000000           0   1000000000     48001464
+;
+; The UART figure is worth keeping: it matches config.txt's
+; init_uart_clock=48000000 AND a console that is visibly working at
+; 115200, so the mailbox and the serial port corroborate each other.
+
+; ----------------------------------------------------------------------
+;  CLOCK IDS LIVE IN mailbox.pi4 AND ARE NOT REPEATED HERE.
+;
+;  The first draft of this file defined #CLK_ARM and friends as aliases
+;  of #MBX_CLK_ARM. The compiler refuses a constant defined from another
+;  constant, which turned out to be a favour: the alternative was
+;  re-typing the four numbers, and two spellings of one number is exactly
+;  how they drift apart. Use #MBX_CLK_ARM / _CORE / _EMMC / _UART
+;  directly - they are one definition, in the file that owns the tag that
+;  consumes them.
+; ----------------------------------------------------------------------
+
+Global clk_lastApplied.i
+Global clk_ready.i
+
+; ----------------------------------------------------------------------
+;  ClockHz(id)          the rate the firmware is CONFIGURED for
+;  ClockMeasuredHz(id)  the rate it OBSERVES - the honest one
+;  ClockMinHz / ClockMaxHz   the bounds config.txt allows
+;
+;  All four return 0 on a failed transaction; call MailboxError() for the
+;  reason.
+; ----------------------------------------------------------------------
+Procedure.i ClockHz(id.i)
+  ProcedureReturn MailboxClockRate(id)
+EndProcedure
+
+Procedure.i ClockMeasuredHz(id.i)
+  ProcedureReturn MailboxClockRateMeasured(id)
+EndProcedure
+
+Procedure.i ClockMinHz(id.i)
+  ProcedureReturn MailboxClockRateMin(id)
+EndProcedure
+
+Procedure.i ClockMaxHz(id.i)
+  ProcedureReturn MailboxClockRateMax(id)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ClockSetHz(id, hz) - ask for a rate, get told what you actually got.
+;
+;  RETURNS THE APPLIED RATE, or 0 if the transaction failed. It is never
+;  a boolean, for the clamping reason in the header: the difference
+;  between what you asked for and what you got is the only interesting
+;  part, and a boolean throws it away.
+; ----------------------------------------------------------------------
+Procedure.i ClockSetHz(id.i, hz.i)
+  Define applied.i
+  applied = MailboxClockRateSet(id, hz, 0)
+  clk_lastApplied = applied
+  ProcedureReturn applied
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ClockInit() - THE ONE EVERY PROGRAM SHOULD CALL.
+;
+;  Raises the ARM clock to whatever maximum the firmware reports, so that
+;  the machine actually runs at the speed the board file declares.
+;
+;  RETURNS THE MEASURED RATE IN Hz, and 0 if it could not be done. The
+;  measured rate rather than the applied one, deliberately: the governor
+;  can walk the clock back down between the two calls, and a program that
+;  cares enough to raise the clock is a program that should be told when
+;  the raise did not stick.
+;
+;  Safe to call more than once.
+;
+;  On the bench board this takes it from 600000000 to a measured
+;  1500345728.
+; ----------------------------------------------------------------------
+Procedure.i ClockInit()
+  Define mx.i
+  Define applied.i
+  Define got.i
+
+  clk_ready = 0
+  If MailboxReady() = 0
+    If MailboxInit() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  mx = MailboxClockRateMax(#MBX_CLK_ARM)
+  If mx = 0
+    ProcedureReturn 0
+  EndIf
+
+  applied = ClockSetHz(#MBX_CLK_ARM, mx)
+  If applied = 0
+    ProcedureReturn 0
+  EndIf
+
+  got = MailboxClockRateMeasured(#MBX_CLK_ARM)
+  If got > 0
+    clk_ready = 1
+  EndIf
+  ProcedureReturn got
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ClockInitHz(hz) - the same, but at a rate you name.
+;
+;  For a program that wants a KNOWN speed rather than the fastest one -
+;  a repeatable benchmark, or a thermal budget. Put the number in a
+;  constant in your own file so it is visible and adjustable:
+;
+;      #ARM_HZ = 1000000000
+;      ...
+;      ClockInitHz(#ARM_HZ)
+;
+;  Returns the measured rate. COMPARE IT WITH WHAT YOU ASKED FOR - the
+;  firmware clamps silently, so a return value below your request means
+;  config.txt's arm_freq_max is lower than you think, and a return value
+;  below the APPLIED rate means the governor moved it afterwards.
+; ----------------------------------------------------------------------
+Procedure.i ClockInitHz(hz.i)
+  Define applied.i
+
+  clk_ready = 0
+  If MailboxReady() = 0
+    If MailboxInit() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  applied = ClockSetHz(#MBX_CLK_ARM, hz)
+  If applied = 0
+    ProcedureReturn 0
+  EndIf
+  clk_ready = 1
+  ProcedureReturn MailboxClockRateMeasured(#MBX_CLK_ARM)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ClockApplied() - the rate the last ClockSetHz was given by the
+;  firmware, without another mailbox round trip. 0 if none has run.
+; ----------------------------------------------------------------------
+Procedure.i ClockApplied()
+  ProcedureReturn clk_lastApplied
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ClockReady() - 1 once a ClockInit/ClockInitHz has completed.
+;
+;  It does NOT mean the clock is still where it was put. Nothing can mean
+;  that on a part with an on-demand governor; ask ClockMeasuredHz().
+; ----------------------------------------------------------------------
+Procedure.i ClockReady()
+  ProcedureReturn clk_ready
+EndProcedure

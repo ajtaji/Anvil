@@ -1,0 +1,16 @@
+; Desk compile fixture only; do not boot: explicit fake output address.
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
+Procedure.i Main()
+  PokeI($06000000, Pi3Micros())
+  PokeI($06000008, Pi3DelayUs(1))
+  PokeI($06000010, Pi3UartInit(48000000,115200))
+  PokeI($06000018, Pi3UartWrite(65))
+  ; Asked BEFORE the read, so the read's own result proves it took nothing.
+  PokeI($06000038, Pi3UartReadReady())
+  PokeI($06000020, Pi3UartRead())
+  PokeI($06000028, Pi3ClockRate(2))
+  PokeI($06000030, Pi3ClockRate(2))
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,58 @@
+Procedure.i EthMacFetch()
+  Define i.i
+  Define v.i
+  Define zero.i
+  Define ones.i
+
+  If gEthMacKnown = 1
+    ProcedureReturn 1
+  EndIf
+
+  gEthMacFirmware = 0
+  If MbxUp() = 1
+    If MailboxBegin($00010003, 0, 6) = 1
+      If MailboxSend() = 1
+        If MailboxRespBytes() >= 6
+          v = MailboxBufferAddr() + #MBX_OFF_VALUE
+          i = 0
+          While i < 6
+            gEthMac[i] = PeekA(v + i)
+            i = i + 1
+          Wend
+          zero = 1
+          ones = 1
+          i = 0
+          While i < 6
+            If gEthMac[i] <> $00
+              zero = 0
+            EndIf
+            If gEthMac[i] <> $FF
+              ones = 0
+            EndIf
+            i = i + 1
+          Wend
+          ; Bit 0 of the first octet is the group bit. A station address
+          ; never has it set, and net.pi4 would refuse the address
+          ; anyway - it is checked here so the refusal names the
+          ; firmware rather than the network stack.
+          If zero = 0 And ones = 0
+            If (gEthMac[0] & $01) = 0
+              gEthMacFirmware = 1
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  EndIf
+
+  If gEthMacFirmware = 0
+    gEthMac[0] = $02
+    gEthMac[1] = $00
+    gEthMac[2] = $4D
+    gEthMac[3] = $46
+    gEthMac[4] = $00
+    gEthMac[5] = $01
+  EndIf
+  gEthMacKnown = 1
+  ProcedureReturn 1
+EndProcedure

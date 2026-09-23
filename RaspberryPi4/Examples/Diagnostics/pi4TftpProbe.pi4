@@ -1,0 +1,601 @@
+; pi4TftpProbe.pi4 - RaspberryPi4/Lib/tftp.pi4 walked from "does the
+; codec work with no server at all" through to a file actually pulled
+; onto this board over Ethernet, with every stage printing its reading
+; before the next stage depends on it.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4 -t pi4 \
+;            --load-addr 0x400000 --stack-addr 0x3000000 \
+;            --entry-returns -o tftp.img
+;
+; --entry-returns IS NOT OPTIONAL. Without it the payload runs off its
+; own end and the board hangs. Every diagnostic in this directory that
+; needs it says so in its own header, because the build line is the
+; thing people copy from the wrong file.
+;
+; ARM THE DEADMAN BEFORE RUNNING THIS: `deadman 60`. Stage 5 will sit
+; for up to thirty seconds waiting for a server that may not be there,
+; and a board that looks hung for thirty seconds is a board somebody
+; power-cycles at second twenty-five.
+;
+; ----------------------------------------------------------------------
+;  IT CANNOT DAMAGE ANYTHING, AND THAT IS ON PURPOSE
+; ----------------------------------------------------------------------
+;  A TFTP client writes bytes a stranger chose into memory this board
+;  owns. Nothing here can hurt the hardware; it can very easily hurt the
+;  BOOT IMAGE, and that costs pulling the stick out and rewriting it on
+;  another machine.
+;
+;  SO THIS PROBE USES TftpSetSinkNone(). The file is counted and thrown
+;  away. Nothing is written anywhere. That makes it the right thing to
+;  run FIRST on a bench, because a wrong server address, a wrong
+;  filename or a wrong anything else costs a printed line and not an
+;  afternoon.
+;
+;  To land the bytes somewhere, change #TP_SINK to 1 and read the two
+;  paragraphs beside #TP_DEST_BASE before you do. To put the file on the
+;  boot medium instead, use TftpSetSinkCaller() and hand
+;  TftpBlockData() / TftpBlockLen() to fat.pi4 in the pump loop - tftp.pi4
+;  cannot do that itself, because a library never includes a library.
+;
+; ----------------------------------------------------------------------
+;  WHAT THIS IS PROVING, AND IN WHAT ORDER
+; ----------------------------------------------------------------------
+;  tftp.pi4 sits on top of net.pi4, which sits on top of genet.pi4, and
+;  NONE of the three does its own input or output. So this probe is the
+;  pump, and the pump is the whole of the wiring:
+;
+;      GenetRecvWait -> NetInput -> TftpInput -> NetUdpBuild -> GenetSend
+;
+;  1. THE CODEC, WITH NO WIRE AND NO SERVER. A read request is built and
+;     its nineteen-odd octets are printed, and then a canned DATA packet
+;     held in this file as literal bytes is fed straight into
+;     TftpInput() and the acknowledgement is printed. If those two are
+;     right, the whole of the opcodes, the block numbering and the
+;     transfer-identifier rule are proven WITHOUT A CABLE, A SWITCH OR
+;     A SERVER. If they are wrong, nothing that follows is worth reading
+;     and the cause is in this tree rather than out on the bench.
+;
+;     THE GATE tools/a64/a64_tftp_check.py DOES THIS FAR MORE
+;     THOROUGHLY - 179 cases, byte-exact, twenty-one mutations. Run that
+;     first. This stage exists so that a person at the bench with a
+;     board that is misbehaving can see in two lines whether the problem
+;     is up here or down on the wire.
+;
+;  2. THE WIRE. genet.pi4's four readings, briefly. pi4GenetProbe.pi4 is
+;     the file for diagnosing layer 2.
+;
+;  3. THE ADDRESSES, printed as dotted quads so a human can compare them
+;     against what they typed on the server.
+;
+;  4. THE READ REQUEST GOES OUT, to port 69 - and the probe prints that
+;     it went to 69, because that is the one packet in a transfer that
+;     does.
+;
+;  5. THE PUMP RUNS until the transfer completes, fails, or thirty
+;     seconds pass. Every block is counted. THE SERVER'S TRANSFER
+;     IDENTIFIER IS PRINTED as soon as it is known, because a client
+;     that keeps talking to port 69 is the classic first-TFTP-client
+;     failure and this is the line that shows it did not.
+;
+;  6. THE TALLY. Blocks, bytes, duplicates, gaps, strangers,
+;     retransmissions - and, if it failed, the refusal in English and
+;     the server's own words.
+;
+; ----------------------------------------------------------------------
+;  WHAT TO POINT AT IT
+; ----------------------------------------------------------------------
+;  On Windows: tftpd64, with its TFTP server tab bound to the laptop's
+;  address on the direct cable and its base directory holding the file.
+;  On Linux:
+;      sudo dnsmasq --enable-tftp --tftp-root=/srv/tftp --port=0 -d
+;
+;  PUT A FILE OF EXACTLY 1024 BYTES THERE AND FETCH THAT FIRST:
+;      head -c 1024 /dev/urandom > /srv/tftp/exact1024.bin
+;  1024 is an exact multiple of 512, so the transfer can only end on a
+;  final DATA packet carrying ZERO bytes. That is the case a first TFTP
+;  client gets wrong, and the one worth proving on real silicon against
+;  a real server rather than only in the gate.
+; ----------------------------------------------------------------------
+
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/tftp.pi4"
+
+; ----------------------------------------------------------------------
+;  THE THINGS TO CHANGE BEFORE A RUN
+; ----------------------------------------------------------------------
+; All addresses as four octets, so nothing here depends on knowing which
+; end of a 32-bit number the first octet lives at.
+#TP_IP_A = 169
+#TP_IP_B = 254
+#TP_IP_C = 183
+#TP_IP_D = 50
+
+#TP_MASK_A = 255
+#TP_MASK_B = 255
+#TP_MASK_C = 0
+#TP_MASK_D = 0
+
+#TP_GW_A = 169
+#TP_GW_B = 254
+#TP_GW_C = 183
+#TP_GW_D = 67
+
+; The machine running the TFTP server. On a direct cable with two
+; machines on it, this is the laptop, and it is also the gateway,
+; because there is nothing else to nominate.
+#TP_SRV_A = 169
+#TP_SRV_B = 254
+#TP_SRV_C = 183
+#TP_SRV_D = 67
+
+; WHERE THE FILE GOES.
+;   0 = nowhere. Counted and discarded. THE SAFE DEFAULT, and the one to
+;       run first on any bench.
+;   1 = memory at #TP_DEST_BASE, at most #TP_DEST_BYTES of it.
+#TP_SINK = 0
+
+; If #TP_SINK is 1, this is where the bytes land. $05000000 is in the
+; low DRAM bank, above the GENET receive region at $04000000 and its
+; 512 KiB, and far above both the image at $00400000 and the stack top
+; at $03000000.
+;
+; CHECK THIS AGAINST WHAT ELSE IS IN MEMORY BEFORE YOU CHANGE IT. The
+; library bounds-checks against #TP_DEST_BYTES and refuses rather than
+; running past it, but it cannot know what is on the other side of the
+; base address, because nothing tells it.
+#TP_DEST_BASE  = $05000000
+#TP_DEST_BYTES = 4194304
+
+; The RX region genet.pi4 requires. 512 KiB - 256 descriptors of 2048
+; bytes - at $04000000.
+#TP_RX_REGION = $04000000
+#TP_RX_BYTES  = 524288
+
+#TP_LINK_MS = 2000         ; how long to wait for auto-negotiation
+#TP_TX_MS   = 100          ; how long to wait for one frame to leave
+
+; The pump. 250 ms per slice, 120 slices, so thirty seconds of real
+; listening. A DURATION, NOT A POLL COUNT - genet.pi4's GenetRecvWait()
+; header says why that distinction cost a hardware run.
+#TP_SLICE_MS = 250
+#TP_SLICES   = 120
+
+; The retransmit timer handed to tftp.pi4. Two seconds and eight tries
+; is sixteen seconds of patience, which fits inside the thirty above
+; with room to see it give up rather than being cut off mid-way.
+#TP_TIMEOUT_MS = 2000
+#TP_RETRIES    = 8
+
+Global Dim tpMac.a[6]
+Global Dim tpRx.a[1600]
+Global Dim tpData.a[36]        ; a canned DATA packet, byte for byte
+
+Global tpIp.i
+Global tpMask.i
+Global tpGw.i
+Global tpSrv.i
+Global tpPort.i
+
+Global tpFramesIn.i
+Global tpUdpIn.i
+Global tpSendFail.i
+Global tpTidPrinted.i
+
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+; An IPv4 address the way a person writes one. net.pi4 holds an address
+; with its FIRST OCTET IN THE MOST SIGNIFICANT BYTE, so this reads it
+; from the top down and there is nothing to reverse.
+Procedure DotLine(*name, ip.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec((ip >> 24) & $FF)
+  UartWrite(46)                    ; ASCII full stop
+  PrintDec((ip >> 16) & $FF)
+  UartWrite(46)
+  PrintDec((ip >> 8) & $FF)
+  UartWrite(46)
+  PrintDec(ip & $FF)
+  PrintNl()
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+EndProcedure
+
+; The staged packet, as hexadecimal. A TFTP packet is small enough to
+; read on a terminal and reading it is often the whole diagnosis.
+Procedure ShowStaged(*name)
+  Define i.i
+  Define n.i
+  n = TftpOutLen()
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(n)
+  UartWriteStr(" octets to ")
+  PrintDec((TftpOutIp() >> 24) & $FF)
+  UartWrite(46)
+  PrintDec((TftpOutIp() >> 16) & $FF)
+  UartWrite(46)
+  PrintDec((TftpOutIp() >> 8) & $FF)
+  UartWrite(46)
+  PrintDec(TftpOutIp() & $FF)
+  UartWriteStr(" port ")
+  PrintDec(TftpOutPort())
+  PrintNl()
+  UartWriteStr("    ")
+  i = 0
+  While i < n
+    PutHexN(PeekA(TftpOutBuf() + i), 2)
+    UartWrite(32)                  ; ASCII space
+    i = i + 1
+  Wend
+  PrintNl()
+EndProcedure
+
+; The last tftp.pi4 refusal, in words. Kept separate from WhyNet and
+; WhyGenet because the three libraries have three error variables, and
+; printing the wrong one while chasing a fault costs more time than the
+; three procedures cost.
+Procedure WhyTftp()
+  UartWriteStr("  -> ")
+  UartWriteStr(TftpErrorText())
+  PrintNl()
+EndProcedure
+
+Procedure WhyNet()
+  UartWriteStr("  -> ")
+  UartWriteStr(NetErrorText())
+  PrintNl()
+EndProcedure
+
+Procedure WhyGenet()
+  UartWriteStr("  -> ")
+  UartWriteStr(GenetErrorText())
+  PrintNl()
+EndProcedure
+
+; A canned DATA packet: opcode 3, block 1, thirty-two bytes of payload.
+; Held here as literal bytes so that stage 1 can prove the receive path
+; with nothing else in the room. It is SHORT - thirty-two is less than
+; 512 - so it must be recognised as the final block of a one-block file.
+Procedure TpLoadFrames()
+  Define i.i
+  tpData[0] = $00
+  tpData[1] = $03                  ; opcode 3, DATA
+  tpData[2] = $00
+  tpData[3] = $01                  ; block 1
+  For i = 0 To 31
+    tpData[4 + i] = 97 + (i % 23)  ; the letters a..w, as ping sends
+  Next
+EndProcedure
+
+; Send whatever tftp.pi4 has staged, through net.pi4 and genet.pi4.
+; THIS IS THE WHOLE OF THE WIRING and it is four lines: read the
+; destination out of tftp.pi4, wrap it in UDP, hand the frame to the
+; MAC.
+;
+; READ TftpOutIp() AND TftpOutPort() EVERY TIME. Nearly every packet
+; goes to the server and then one does not - the error sent to a
+; stranger who used the wrong transfer identifier goes to the stranger.
+Procedure.i TpSendStaged()
+  If TftpOutLen() = 0
+    ProcedureReturn 0
+  EndIf
+  If NetUdpBuild(#HW_LINK_WIRED, TftpOutIp(), TftpOutPort(), TftpLocalPort(), TftpOutBuf(), TftpOutLen()) = 0
+    WhyNet()
+    tpSendFail = tpSendFail + 1
+    ProcedureReturn 0
+  EndIf
+  If GenetSend(NetOutBuf(), NetOutLen(), #TP_TX_MS) <> 1
+    WhyGenet()
+    tpSendFail = tpSendFail + 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; One slice of the pump. Returns 1 if the transfer is over, either way.
+Procedure.i TpPump(ms.i)
+  Define n.i
+  Define r.i
+  Define t.i
+
+  n = GenetRecvWait(@tpRx[0], 1600, ms)
+  If n > 0
+    tpFramesIn = tpFramesIn + 1
+    r = NetInput(#HW_LINK_WIRED, @tpRx[0], n)
+    If r = #NET_IN_REPLY
+      ; An ARP request for us. Answer it - the server cannot send us a
+      ; single block until it knows our hardware address.
+      GenetSend(NetOutBuf(), NetOutLen(), #TP_TX_MS)
+    ElseIf r = #NET_IN_UDP
+      tpUdpIn = tpUdpIn + 1
+      t = TftpInput(NetUdpRxFrom(), NetUdpRxPort(), NetUdpRxDstPort(), NetUdpRxData(), NetUdpRxLen())
+      If tpTidPrinted = 0 And TftpTidLocked() = 1
+        tpTidPrinted = 1
+        Line("server TID     ", TftpServerPort())
+        Say("  (that is NOT 69, and it must not be - the reply comes from")
+        Say("   a new ephemeral port and everything after it goes there)")
+      EndIf
+      If t < 0
+        Line("TftpInput      ", t)
+        WhyTftp()
+      ElseIf t = #TFTP_IN_STRANGER
+        Say("  a stranger used the wrong transfer identifier; answering them")
+      EndIf
+      TpSendStaged()
+    EndIf
+  EndIf
+
+  ; OUR OWN TIMER, and it is not optional. A receiver that declines to
+  ; answer duplicates - which this one does, and must, or every packet
+  ; doubles for the rest of the transfer - hangs forever the first time
+  ; an acknowledgement is lost unless something re-sends on its own
+  ; schedule. This is that something.
+  t = TftpTick(millis())
+  If t = 1
+    Say("  timer fired - retransmitting")
+    TpSendStaged()
+  ElseIf t < 0
+    Line("TftpTick       ", t)
+    WhyTftp()
+  EndIf
+
+  If TftpComplete() = 1
+    ProcedureReturn 1
+  EndIf
+  If TftpFailed() = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+
+Procedure.i Main()
+  Define i.i
+  Define r.i
+  Define ok.i
+  Define phy.i
+  Define done.i
+
+  PrintNl()
+  Say("=== tftp.pi4 - RFC 1350 over UDP over IPv4 over GENET ===")
+  PrintNl()
+
+  tpMac[0] = $02
+  tpMac[1] = $00
+  tpMac[2] = $4D
+  tpMac[3] = $46
+  tpMac[4] = $00
+  tpMac[5] = $01
+  TpLoadFrames()
+  TimerInit()
+  NetInit()
+  TftpInit()
+
+  tpIp   = NetMakeIPv4(#TP_IP_A, #TP_IP_B, #TP_IP_C, #TP_IP_D)
+  tpMask = NetMakeIPv4(#TP_MASK_A, #TP_MASK_B, #TP_MASK_C, #TP_MASK_D)
+  tpGw   = NetMakeIPv4(#TP_GW_A, #TP_GW_B, #TP_GW_C, #TP_GW_D)
+  tpSrv  = NetMakeIPv4(#TP_SRV_A, #TP_SRV_B, #TP_SRV_C, #TP_SRV_D)
+
+  ; ==================================================================
+  ;  1. THE CODEC, WITH NO WIRE AND NO SERVER
+  ; ==================================================================
+  Say("1. codec self-test, off the wire")
+  Line("sink none      ", TftpSetSinkNone())
+  Line("begin read     ", TftpBeginRead(tpSrv, "selftest.bin", 2048))
+  If TftpOutLen() = 0
+    WhyTftp()
+    Say("  the codec is broken. Run tools/a64/a64_tftp_check.py.")
+    ProcedureReturn 1
+  EndIf
+  ShowStaged("read request ")
+  Say("  (opcode 0001, then the name, a zero, 'octet', a zero)")
+  Line("goes to port   ", TftpOutPort())
+  If TftpOutPort() <> 69
+    Say("  *** a read request must go to port 69 ***")
+  EndIf
+
+  ; Feed the canned DATA packet in as if it had arrived from port 5000.
+  r = TftpInput(tpSrv, 5000, 2048, @tpData[0], 36)
+  Line("canned DATA in ", r)
+  If r <> #TFTP_IN_LAST
+    WhyTftp()
+    Say("  a 32-byte block is SHORT, so it is the last block of the file")
+    Say("  and this should have been 2. Run the gate.")
+  EndIf
+  ShowStaged("acknowledgement")
+  Line("server TID now ", TftpServerPort())
+  If TftpServerPort() <> 5000
+    Say("  *** the transfer identifier was not adopted from the DATA ***")
+  EndIf
+  Line("bytes          ", TftpBytes())
+  PrintNl()
+
+  ; ==================================================================
+  ;  2. THE WIRE
+  ; ==================================================================
+  Say("2. the wire")
+  ok = GenetProbe()
+  HexLine("SYS_REV_CTRL   ", GenetRevision(), 8)
+  Line("probe ok       ", ok)
+  If ok <> 1
+    WhyGenet()
+    ProcedureReturn 1
+  EndIf
+  phy = GenetPhyScan()
+  Line("PHY address    ", phy)
+  If phy < 0
+    WhyGenet()
+    ProcedureReturn 1
+  EndIf
+  ok = GenetPhyWaitLink(#TP_LINK_MS)
+  Line("link up        ", ok)
+  If ok <> 1
+    WhyGenet()
+    Say("  no link. Check the cable is in, at both ends.")
+    ProcedureReturn 1
+  EndIf
+  If GenetPhyResolve() = 1
+    Line("speed Mbit/s   ", GenetSpeed())
+    Line("full duplex    ", GenetFullDuplex())
+  EndIf
+  Line("set mac        ", GenetSetMac(@tpMac[0]))
+  Line("set rx region  ", GenetSetRxRegion(#TP_RX_REGION, #TP_RX_BYTES))
+  ok = GenetStart(#TP_LINK_MS)
+  Line("genet start    ", ok)
+  If ok <> 1
+    WhyGenet()
+    ProcedureReturn 1
+  EndIf
+  PrintNl()
+
+  ; ==================================================================
+  ;  3. THE ADDRESSES
+  ; ==================================================================
+  Say("3. addresses")
+  NetInit()
+  Line("set mac        ", NetSetMac(#HW_LINK_WIRED, @tpMac[0]))
+  ok = NetSetIPv4(#HW_LINK_WIRED, tpIp, tpMask, tpGw)
+  Line("set addresses  ", ok)
+  If ok <> 1
+    WhyNet()
+    ProcedureReturn 1
+  EndIf
+  DotLine("board          ", NetIPv4(#HW_LINK_WIRED))
+  DotLine("netmask        ", NetMask(#HW_LINK_WIRED))
+  DotLine("gateway        ", NetGateway(#HW_LINK_WIRED))
+  DotLine("tftp server    ", tpSrv)
+  PrintNl()
+
+  ; ==================================================================
+  ;  4. THE READ REQUEST
+  ; ==================================================================
+  Say("4. the read request")
+  TftpInit()
+  If #TP_SINK = 1
+    Line("sink memory    ", TftpSetMemory(#TP_DEST_BASE, #TP_DEST_BYTES))
+    HexLine("destination    ", #TP_DEST_BASE, 8)
+    Line("capacity bytes ", #TP_DEST_BYTES)
+  Else
+    Line("sink none      ", TftpSetSinkNone())
+    Say("  (the file is counted and discarded. Nothing is written.)")
+  EndIf
+  Line("timer ms       ", #TP_TIMEOUT_MS)
+  Line("retries        ", TftpSetTimeout(#TP_TIMEOUT_MS, #TP_RETRIES))
+
+  ; Our own transfer identifier. U-Boot's arithmetic on a seed we have:
+  ; the millisecond clock. [v2025.01_net_tftp.c:924]
+  tpPort = TftpSuggestPort(millis())
+  Line("our TID        ", tpPort)
+  Line("udp bind       ", NetUdpBind(#HW_LINK_WIRED, tpPort))
+
+  ok = TftpBeginRead(tpSrv, "exact1024.bin", tpPort)
+  Line("begin read     ", ok)
+  If ok <> 1
+    WhyTftp()
+    ProcedureReturn 1
+  EndIf
+  ShowStaged("read request ")
+  Line("sent           ", TpSendStaged())
+  PrintNl()
+
+  ; ==================================================================
+  ;  5. THE PUMP
+  ; ==================================================================
+  Say("5. pumping, up to thirty seconds")
+  done = 0
+  For i = 1 To #TP_SLICES
+    If TpPump(#TP_SLICE_MS) = 1
+      done = 1
+      Break
+    EndIf
+  Next
+  If done = 0
+    Say("  thirty seconds passed and the transfer neither finished nor")
+    Say("  failed. That means nothing came back at all - check that the")
+    Say("  server is running, that its address is the one printed in")
+    Say("  stage 3, and that it is serving the filename asked for.")
+  EndIf
+  PrintNl()
+
+  ; ==================================================================
+  ;  6. THE TALLY
+  ; ==================================================================
+  Say("6. the tally")
+  Line("frames in      ", tpFramesIn)
+  Line("datagrams in   ", tpUdpIn)
+  Line("blocks         ", TftpBlocksDone())
+  Line("bytes          ", TftpBytes())
+  Line("wraps          ", TftpWraps())
+  Line("duplicates     ", TftpDupCount())
+  Line("gaps           ", TftpGapCount())
+  Line("strangers      ", TftpStrangerCount())
+  Line("retransmits    ", TftpRetransmitCount())
+  Line("ignored        ", TftpIgnoredCount())
+  Line("send failures  ", tpSendFail)
+  Line("server TID     ", TftpServerPort())
+  UartWriteStr("  state          ")
+  UartWriteStr(TftpStateText())
+  PrintNl()
+
+  If TftpComplete() = 1
+    Say("  COMPLETE.")
+    If #TP_SINK = 1
+      Say("  The file is in memory at the destination printed in stage 4.")
+    Else
+      Say("  Nothing was written, by design. Set #TP_SINK to 1 to land it.")
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  WhyTftp()
+  If TftpServerCode() <> 0 Or TftpServerMessageLen() > 0
+    UartWriteStr("  the server said  ")
+    UartWriteStr(TftpCodeText(TftpServerCode()))
+    PrintNl()
+    UartWriteStr("  in its own words ")
+    UartWriteStr(TftpServerMessage())
+    PrintNl()
+    Line("worth retrying ", TftpRetryWorthwhile())
+  EndIf
+  ProcedureReturn 1
+EndProcedure

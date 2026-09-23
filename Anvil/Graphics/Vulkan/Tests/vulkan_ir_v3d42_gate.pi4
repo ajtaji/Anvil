@@ -1,0 +1,945 @@
+; Emitted desk gate for the isolated typed-IR -> V3D 4.2 lowerer.
+; The fixtures populate AvkIrModule records directly; there is no parser,
+; Vulkan pipeline, MMIO, cache or GPU dependency in this proof.
+
+XIncludeFile "../vk_ir_v3d42.pi4"
+
+#LG_MAGIC = $49523432
+#LG_CASES = 32
+#LG_SAVED_CODE_BYTES = 1024
+#LG_SAVED_UNIFORM_WORDS = 64
+Global Dim lgTypes.AvkIrType[24]
+Global Dim lgConstants.AvkIrConstant[12]
+Global Dim lgVariables.AvkIrVariable[12]
+Global Dim lgDecorations.AvkIrDecoration[24]
+Global Dim lgBlocks.AvkIrBlock[2]
+Global Dim lgNodes.AvkIrNode[32]
+Global Dim lgInputs.AvkIrV3d42Io[4]
+Global Dim lgOutputs.AvkIrV3d42Io[4]
+Global Dim lgCode.i[4224]
+Global Dim lgUniform.l[2112]
+Global Dim lgSavedCode30.i[128]
+Global Dim lgSavedUniform30.l[64]
+Global Dim lgSavedCode31.i[128]
+Global Dim lgSavedUniform31.l[64]
+Global Dim lgReport.i[1024]
+Global lgChecks.i = 0
+Global lgFails.i = 0
+
+Procedure lgCheck(ok.i)
+  lgReport[256 + lgChecks] = ok
+  lgChecks = lgChecks + 1
+  If ok = 0 : lgFails = lgFails + 1 : EndIf
+EndProcedure
+
+Procedure.i lgSameBytes(a.i,b.i,bytes.i)
+  Protected i.i=0
+  While i<bytes
+    If PeekA(a+i)<>PeekA(b+i):ProcedureReturn 0:EndIf
+    i=i+1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i lgDisjoint(a.i,aBytes.i,b.i,bBytes.i)
+  ProcedureReturn Bool((a+aBytes)<=b Or (b+bBytes)<=a)
+EndProcedure
+
+Procedure lgFillTarget(*t.AvkIrV3d42Target)
+  Protected i.i=0
+  While i<*t\codeCapacity
+    PokeA(*t\codeBase+i,(i*29+$5A)&$FF)
+    i=i+1
+  Wend
+  i=0
+  While i<*t\uniformCapacity
+    PokeA(*t\uniformBase+i,(i*17+$A5)&$FF)
+    i=i+1
+  Wend
+EndProcedure
+
+Procedure.i lgTargetUntouched(*t.AvkIrV3d42Target)
+  Protected i.i=0
+  While i<*t\codeCapacity
+    If PeekA(*t\codeBase+i)<>((i*29+$5A)&$FF):ProcedureReturn 0:EndIf
+    i=i+1
+  Wend
+  i=0
+  While i<*t\uniformCapacity
+    If PeekA(*t\uniformBase+i)<>((i*17+$A5)&$FF):ProcedureReturn 0:EndIf
+    i=i+1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i lgMetadataEmpty(*r.AvkIrV3d42Result)
+  ProcedureReturn Bool(*r\codeBytes=0 And *r\uniformWords=0 And *r\pushFirstWord=-1 And *r\pushRWord=-1 And *r\pushGWord=-1 And *r\pushBWord=-1 And *r\pushAWord=-1 And *r\uniformAddressWord=-1 And *r\uniformConfigWord=-1 And *r\textureStateWord=-1 And *r\samplerStateWord=-1 And *r\tlbConfigWord=-1)
+EndProcedure
+
+Procedure lgZero()
+  Protected i.i
+  i=0:While i<SizeOf(AvkIrType)*24:PokeA(@lgTypes[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrConstant)*12:PokeA(@lgConstants[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrVariable)*12:PokeA(@lgVariables[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrDecoration)*24:PokeA(@lgDecorations[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrBlock)*2:PokeA(@lgBlocks[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrNode)*32:PokeA(@lgNodes[0]+i,0):i=i+1:Wend
+  i=0:While i<SizeOf(AvkIrV3d42Io)*4:PokeA(@lgInputs[0]+i,0):PokeA(@lgOutputs[0]+i,0):i=i+1:Wend
+EndProcedure
+
+Procedure lgType(index.i, sourceId.i, sourceOp.i, irKind.i)
+  lgTypes[index]\sourceId = sourceId
+  lgTypes[index]\sourceOpcode = sourceOp
+  lgTypes[index]\kind = irKind
+EndProcedure
+Procedure lgNode(index.i, sourceId.i, sourceOp.i, irKind.i, resultType.i, operandCount.i)
+  lgNodes[index]\sourceId = sourceId
+  lgNodes[index]\sourceOpcode = sourceOp
+  lgNodes[index]\kind = irKind
+  lgNodes[index]\resultType = resultType
+  lgNodes[index]\blockId = 21
+  lgNodes[index]\operandCount = operandCount
+EndProcedure
+Procedure lgBase(*m.AvkIrModule)
+  Protected clearOffset.i
+  clearOffset=0
+  While clearOffset<SizeOf(AvkIrModule)
+    PokeA(*m+clearOffset,0)
+    clearOffset=clearOffset+1
+  Wend
+  *m\idBound = 64
+  *m\stage = #ANVIL_IR_STAGE_FRAGMENT
+  *m\entryFunctionId = 20
+  *m\entryFunctionOpcode = 54
+  *m\functionTypeId = 6
+  *m\returnTypeId = 1
+  *m\entryBlockId = 21
+  *m\types = @lgTypes[0]
+  *m\constants = @lgConstants[0]
+  *m\variables = @lgVariables[0]
+  *m\decorations = @lgDecorations[0]
+  *m\blocks = @lgBlocks[0]
+  *m\nodes = @lgNodes[0]
+EndProcedure
+
+; vec4 Input -> vec4 Output, usable as VPM vertex or varying fragment.
+Procedure lgPass(*m.AvkIrModule, shaderStage.i)
+  lgZero()
+  lgBase(*m)
+  *m\stage = shaderStage
+  *m\typeCount=6:*m\variableCount=2:*m\decorationCount=2:*m\blockCount=1:*m\nodeCount=3
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=4
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1:lgTypes[3]\pointeeType=3
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3:lgTypes[4]\pointeeType=3
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=11:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=5:lgVariables[1]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1
+  lgDecorations[0]\kind=#ANVIL_IR_DEC_LOCATION
+  lgDecorations[1]\sourceId=11:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1
+  lgDecorations[1]\kind=#ANVIL_IR_DEC_LOCATION
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=3
+  lgNode(0,30,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[0]\operand0=10
+  lgNode(1,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[1]\operand0=11:lgNodes[1]\operand1=30
+  lgNode(2,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgBlock(*m.AvkIrModule, storageClass.i)
+  lgZero():lgBase(*m):*m\typeCount=9:*m\constantCount=1:*m\variableCount=2:*m\decorationCount=5:*m\blockCount=1:*m\nodeCount=4
+  lgType(0,1,19,1):lgType(1,2,22,3):lgTypes[1]\width=32
+  lgType(2,3,23,4):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=4
+  lgType(3,4,30,5):lgTypes[3]\memberCount=1:lgTypes[3]\member0=3
+  lgType(4,5,32,6)
+  lgTypes[4]\storageClass=storageClass
+  lgTypes[4]\pointeeType=4
+  lgType(5,6,32,6)
+  lgTypes[5]\storageClass=storageClass
+  lgTypes[5]\pointeeType=3
+  lgType(6,7,32,6):lgTypes[6]\storageClass=3:lgTypes[6]\pointeeType=3
+  lgType(7,8,21,2):lgTypes[7]\width=32:lgTypes[7]\signedness=1
+  lgType(8,9,33,7):lgTypes[8]\returnType=1:*m\functionTypeId=9
+  lgConstants[0]\sourceId=12:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=8:lgConstants[0]\wordCount=1
+  lgVariables[0]\sourceId=15:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=5
+  lgVariables[0]\storageClass=storageClass
+  lgVariables[1]\sourceId=16:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=7:lgVariables[1]\storageClass=3
+  lgDecorations[0]\sourceId=4:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=2
+  lgDecorations[1]\sourceId=4:lgDecorations[1]\sourceOpcode=72:lgDecorations[1]\member=0:lgDecorations[1]\kind=10
+  lgDecorations[2]\sourceId=16:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=7
+  lgDecorations[3]\sourceId=15:lgDecorations[3]\sourceOpcode=71:lgDecorations[3]\member=-1:lgDecorations[3]\kind=8
+  lgDecorations[4]\sourceId=15:lgDecorations[4]\sourceOpcode=71:lgDecorations[4]\member=-1:lgDecorations[4]\kind=9
+  If storageClass=9:*m\decorationCount=3:EndIf
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=4
+  lgNode(0,30,65,2,6,2):lgNodes[0]\operand0=15:lgNodes[0]\operand1=12
+  lgNode(1,31,61,1,3,1):lgNodes[1]\operand0=30
+  lgNode(2,0,62,6,0,2):lgNodes[2]\operand0=16:lgNodes[2]\operand1=31
+  lgNode(3,0,253,7,0,0)
+EndProcedure
+
+Procedure lgSample(*m.AvkIrModule)
+  lgZero():lgBase(*m):*m\typeCount=10:*m\functionTypeId=10:*m\variableCount=3:*m\decorationCount=4:*m\blockCount=1:*m\nodeCount=5
+  lgType(0,1,19,1):lgType(1,2,22,3):lgTypes[1]\width=32
+  lgType(2,3,23,4):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=2
+  lgType(3,4,23,4):lgTypes[3]\componentType=2:lgTypes[3]\componentCount=4
+  lgType(4,5,25,8):lgTypes[4]\componentType=2:lgTypes[4]\imageDim=1:lgTypes[4]\imageSampled=1
+  lgType(5,6,27,9):lgTypes[5]\componentType=5
+  lgType(6,7,32,6):lgTypes[6]\storageClass=0:lgTypes[6]\pointeeType=6
+  lgType(7,8,32,6):lgTypes[7]\storageClass=1:lgTypes[7]\pointeeType=3
+  lgType(8,9,32,6):lgTypes[8]\storageClass=3:lgTypes[8]\pointeeType=4
+  lgType(9,10,33,7):lgTypes[9]\returnType=1
+  lgVariables[0]\sourceId=15:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=7:lgVariables[0]\storageClass=0
+  lgVariables[1]\sourceId=16:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=8:lgVariables[1]\storageClass=1
+  lgVariables[2]\sourceId=17:lgVariables[2]\sourceOpcode=59:lgVariables[2]\pointerType=9:lgVariables[2]\storageClass=3
+  lgDecorations[0]\sourceId=15:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=8
+  lgDecorations[1]\sourceId=15:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=9
+  lgDecorations[2]\sourceId=16:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=7
+  lgDecorations[3]\sourceId=17:lgDecorations[3]\sourceOpcode=71:lgDecorations[3]\member=-1:lgDecorations[3]\kind=7
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=5
+  lgNode(0,30,61,1,6,1):lgNodes[0]\operand0=15
+  lgNode(1,31,61,1,3,1):lgNodes[1]\operand0=16
+  lgNode(2,32,87,5,4,2):lgNodes[2]\operand0=30:lgNodes[2]\operand1=31
+  lgNode(3,0,62,6,0,2):lgNodes[3]\operand0=17:lgNodes[3]\operand1=32
+  lgNode(4,0,253,7,0,0)
+EndProcedure
+
+Procedure lgDeadBlock(*m.AvkIrModule, storageClass.i)
+  lgBlock(*m,storageClass)
+  *m\nodeCount=6:lgBlocks[0]\nodeCount=6
+  lgNode(2,32,65,#ANVIL_IR_OP_ACCESS_CHAIN,6,2):lgNodes[2]\operand0=15:lgNodes[2]\operand1=12
+  lgNode(3,33,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[3]\operand0=32
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=16:lgNodes[4]\operand1=31
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgDeadSample(*m.AvkIrModule)
+  lgSample(*m)
+  *m\nodeCount=6:lgBlocks[0]\nodeCount=6
+  lgNode(3,33,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[3]\operand0=30:lgNodes[3]\operand1=31
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=17:lgNodes[4]\operand1=32
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgDuplicateInput(*m.AvkIrModule)
+  lgPass(*m,#ANVIL_IR_STAGE_FRAGMENT)
+  *m\nodeCount=5:lgBlocks[0]\nodeCount=5
+  lgNode(1,31,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[1]\operand0=10
+  lgNode(2,32,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[2]\operand0=30:lgNodes[2]\operand1=31
+  lgNode(3,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[3]\operand0=11:lgNodes[3]\operand1=32
+  lgNode(4,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgDoubleBlock(*m.AvkIrModule, storageClass.i)
+  lgBlock(*m,storageClass)
+  *m\nodeCount=6:lgBlocks[0]\nodeCount=6
+  lgNode(2,32,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[2]\operand0=30
+  lgNode(3,33,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[3]\operand0=31:lgNodes[3]\operand1=32
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=16:lgNodes[4]\operand1=33
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgDoubleSample(*m.AvkIrModule)
+  lgSample(*m)
+  *m\nodeCount=7:lgBlocks[0]\nodeCount=7
+  lgNode(3,33,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[3]\operand0=30:lgNodes[3]\operand1=31
+  lgNode(4,34,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2):lgNodes[4]\operand0=32:lgNodes[4]\operand1=33
+  lgNode(5,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[5]\operand0=17:lgNodes[5]\operand1=34
+  lgNode(6,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; One target-neutral fragment graph containing any live combination of push,
+; UBO and sampled-image values. `order=0` emits push, UBO, sample source
+; nodes; `order=1` reverses those source groups. IDs remain semantic and
+; stable so the checker can prove physical register sets never alias.
+Procedure lgResourceMix(*m.AvkIrModule, usePush.i, useUniform.i, useSample.i, order.i)
+  Protected n.i
+  Protected k.i
+  Protected firstValue.i
+  Protected secondValue.i
+  Protected thirdValue.i
+  Protected resultId.i
+  lgZero():lgBase(*m)
+  *m\idBound=128:*m\typeCount=17:*m\functionTypeId=16
+  *m\constantCount=1:*m\variableCount=5:*m\decorationCount=10:*m\blockCount=1
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=2
+  lgType(3,4,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[3]\componentType=2:lgTypes[3]\componentCount=4
+  lgType(4,5,30,#ANVIL_IR_TYPE_STRUCT):lgTypes[4]\memberCount=1:lgTypes[4]\member0=4
+  lgType(5,6,32,#ANVIL_IR_TYPE_POINTER):lgTypes[5]\storageClass=9:lgTypes[5]\pointeeType=5
+  lgType(6,7,32,#ANVIL_IR_TYPE_POINTER):lgTypes[6]\storageClass=9:lgTypes[6]\pointeeType=4
+  lgType(7,8,30,#ANVIL_IR_TYPE_STRUCT):lgTypes[7]\memberCount=1:lgTypes[7]\member0=4
+  lgType(8,9,32,#ANVIL_IR_TYPE_POINTER):lgTypes[8]\storageClass=2:lgTypes[8]\pointeeType=8
+  lgType(9,10,32,#ANVIL_IR_TYPE_POINTER):lgTypes[9]\storageClass=2:lgTypes[9]\pointeeType=4
+  lgType(10,11,25,#ANVIL_IR_TYPE_IMAGE):lgTypes[10]\componentType=2:lgTypes[10]\imageDim=1:lgTypes[10]\imageSampled=1
+  lgType(11,12,27,#ANVIL_IR_TYPE_SAMPLED_IMAGE):lgTypes[11]\componentType=11
+  lgType(12,13,32,#ANVIL_IR_TYPE_POINTER):lgTypes[12]\storageClass=0:lgTypes[12]\pointeeType=12
+  lgType(13,14,32,#ANVIL_IR_TYPE_POINTER):lgTypes[13]\storageClass=1:lgTypes[13]\pointeeType=3
+  lgType(14,15,32,#ANVIL_IR_TYPE_POINTER):lgTypes[14]\storageClass=3:lgTypes[14]\pointeeType=4
+  lgType(15,16,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[15]\returnType=1
+  lgType(16,17,21,#ANVIL_IR_TYPE_INT):lgTypes[16]\width=32:lgTypes[16]\signedness=1
+  lgConstants[0]\sourceId=30:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=17:lgConstants[0]\wordCount=1
+  lgVariables[0]\sourceId=20:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=6:lgVariables[0]\storageClass=9
+  lgVariables[1]\sourceId=21:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=9:lgVariables[1]\storageClass=2
+  lgVariables[2]\sourceId=22:lgVariables[2]\sourceOpcode=59:lgVariables[2]\pointerType=13:lgVariables[2]\storageClass=0
+  lgVariables[3]\sourceId=23:lgVariables[3]\sourceOpcode=59:lgVariables[3]\pointerType=14:lgVariables[3]\storageClass=1
+  lgVariables[4]\sourceId=24:lgVariables[4]\sourceOpcode=59:lgVariables[4]\pointerType=15:lgVariables[4]\storageClass=3
+  lgDecorations[0]\sourceId=5:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=#ANVIL_IR_DEC_BLOCK
+  lgDecorations[1]\sourceId=5:lgDecorations[1]\sourceOpcode=72:lgDecorations[1]\member=0:lgDecorations[1]\kind=#ANVIL_IR_DEC_OFFSET
+  lgDecorations[2]\sourceId=8:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=#ANVIL_IR_DEC_BLOCK
+  lgDecorations[3]\sourceId=8:lgDecorations[3]\sourceOpcode=72:lgDecorations[3]\member=0:lgDecorations[3]\kind=#ANVIL_IR_DEC_OFFSET
+  lgDecorations[4]\sourceId=21:lgDecorations[4]\sourceOpcode=71:lgDecorations[4]\member=-1:lgDecorations[4]\kind=#ANVIL_IR_DEC_DESCRIPTOR_SET
+  lgDecorations[5]\sourceId=21:lgDecorations[5]\sourceOpcode=71:lgDecorations[5]\member=-1:lgDecorations[5]\kind=#ANVIL_IR_DEC_BINDING
+  lgDecorations[6]\sourceId=22:lgDecorations[6]\sourceOpcode=71:lgDecorations[6]\member=-1:lgDecorations[6]\kind=#ANVIL_IR_DEC_DESCRIPTOR_SET
+  lgDecorations[7]\sourceId=22:lgDecorations[7]\sourceOpcode=71:lgDecorations[7]\member=-1:lgDecorations[7]\kind=#ANVIL_IR_DEC_BINDING : lgDecorations[7]\value=1
+  lgDecorations[8]\sourceId=23:lgDecorations[8]\sourceOpcode=71:lgDecorations[8]\member=-1:lgDecorations[8]\kind=#ANVIL_IR_DEC_LOCATION
+  lgDecorations[9]\sourceId=24:lgDecorations[9]\sourceOpcode=71:lgDecorations[9]\member=-1:lgDecorations[9]\kind=#ANVIL_IR_DEC_LOCATION
+  lgBlocks[0]\sourceId=101:lgBlocks[0]\sourceOpcode=248
+  *m\entryFunctionId=100:*m\entryBlockId=101
+
+  n=0
+  If order=0
+    If usePush<>0:lgNode(n,40,65,#ANVIL_IR_OP_ACCESS_CHAIN,7,2):lgNodes[n]\operand0=20:lgNodes[n]\operand1=30:n=n+1:lgNode(n,41,61,#ANVIL_IR_OP_LOAD,4,1):lgNodes[n]\operand0=40:n=n+1:EndIf
+    If useUniform<>0:lgNode(n,42,65,#ANVIL_IR_OP_ACCESS_CHAIN,10,2):lgNodes[n]\operand0=21:lgNodes[n]\operand1=30:n=n+1:lgNode(n,43,61,#ANVIL_IR_OP_LOAD,4,1):lgNodes[n]\operand0=42:n=n+1:EndIf
+    If useSample<>0:lgNode(n,44,61,#ANVIL_IR_OP_LOAD,12,1):lgNodes[n]\operand0=22:n=n+1:lgNode(n,45,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[n]\operand0=23:n=n+1:lgNode(n,46,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[n]\operand0=44:lgNodes[n]\operand1=45:n=n+1:EndIf
+  Else
+    If useSample<>0:lgNode(n,44,61,#ANVIL_IR_OP_LOAD,12,1):lgNodes[n]\operand0=22:n=n+1:lgNode(n,45,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[n]\operand0=23:n=n+1:lgNode(n,46,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[n]\operand0=44:lgNodes[n]\operand1=45:n=n+1:EndIf
+    If useUniform<>0:lgNode(n,42,65,#ANVIL_IR_OP_ACCESS_CHAIN,10,2):lgNodes[n]\operand0=21:lgNodes[n]\operand1=30:n=n+1:lgNode(n,43,61,#ANVIL_IR_OP_LOAD,4,1):lgNodes[n]\operand0=42:n=n+1:EndIf
+    If usePush<>0:lgNode(n,40,65,#ANVIL_IR_OP_ACCESS_CHAIN,7,2):lgNodes[n]\operand0=20:lgNodes[n]\operand1=30:n=n+1:lgNode(n,41,61,#ANVIL_IR_OP_LOAD,4,1):lgNodes[n]\operand0=40:n=n+1:EndIf
+  EndIf
+  If usePush<>0:firstValue=41:EndIf
+  If firstValue=0 And useUniform<>0:firstValue=43:EndIf
+  If firstValue=0 And useSample<>0:firstValue=46:EndIf
+  If firstValue<>41 And usePush<>0:secondValue=41:EndIf
+  If firstValue<>43 And useUniform<>0
+    If secondValue=0:secondValue=43:Else:thirdValue=43:EndIf
+  EndIf
+  If firstValue<>46 And useSample<>0
+    If secondValue=0:secondValue=46:Else:thirdValue=46:EndIf
+  EndIf
+  resultId=firstValue
+  If secondValue<>0
+    lgNode(n,70,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2)
+    lgNodes[n]\operand0=resultId
+    lgNodes[n]\operand1=secondValue
+    n=n+1
+    resultId=70
+  EndIf
+  If thirdValue<>0
+    lgNode(n,71,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2)
+    lgNodes[n]\operand0=resultId
+    lgNodes[n]\operand1=thirdValue
+    n=n+1
+    resultId=71
+  EndIf
+  lgNode(n,0,62,#ANVIL_IR_OP_STORE,0,2)
+  lgNodes[n]\operand0=24
+  lgNodes[n]\operand1=resultId
+  n=n+1
+  lgNode(n,0,253,#ANVIL_IR_OP_RETURN,0,0)
+  n=n+1
+  k=0
+  While k<n
+    lgNodes[k]\blockId=101
+    k=k+1
+  Wend
+  *m\nodeCount=n
+  lgBlocks[0]\nodeCount=n
+EndProcedure
+
+; Two live constant vectors and their FAdd are emitted before the sampled
+; image request.  With the sample reservation intact the early result starts
+; above rf13; weakening the reservation lets the later UV setup overwrite its
+; first two lanes before the final FAdd consumes them.
+Procedure lgLateSampleSpan(*m.AvkIrModule)
+  lgSample(*m)
+  *m\idBound=96:*m\constantCount=10:*m\nodeCount=7:lgBlocks[0]\nodeCount=7
+  lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2:lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3F000000
+  lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F100000
+  lgConstants[2]\sourceId=42:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$3F200000
+  lgConstants[3]\sourceId=43:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$3F300000
+  lgConstants[4]\sourceId=44:lgConstants[4]\sourceOpcode=43:lgConstants[4]\typeId=2:lgConstants[4]\wordCount=1:lgConstants[4]\word0=$3F400000
+  lgConstants[5]\sourceId=45:lgConstants[5]\sourceOpcode=43:lgConstants[5]\typeId=2:lgConstants[5]\wordCount=1:lgConstants[5]\word0=$3F500000
+  lgConstants[6]\sourceId=46:lgConstants[6]\sourceOpcode=43:lgConstants[6]\typeId=2:lgConstants[6]\wordCount=1:lgConstants[6]\word0=$3F600000
+  lgConstants[7]\sourceId=47:lgConstants[7]\sourceOpcode=43:lgConstants[7]\typeId=2:lgConstants[7]\wordCount=1:lgConstants[7]\word0=$3F700000
+  lgConstants[8]\sourceId=48:lgConstants[8]\sourceOpcode=44:lgConstants[8]\typeId=4:lgConstants[8]\componentCount=4
+  lgConstants[8]\component0=40:lgConstants[8]\component1=41:lgConstants[8]\component2=42:lgConstants[8]\component3=43
+  lgConstants[9]\sourceId=49:lgConstants[9]\sourceOpcode=44:lgConstants[9]\typeId=4:lgConstants[9]\componentCount=4
+  lgConstants[9]\component0=44:lgConstants[9]\component1=45:lgConstants[9]\component2=46:lgConstants[9]\component3=47
+  lgNode(0,50,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2):lgNodes[0]\operand0=48:lgNodes[0]\operand1=49
+  lgNode(1,30,61,#ANVIL_IR_OP_LOAD,6,1):lgNodes[1]\operand0=15
+  lgNode(2,31,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[2]\operand0=16
+  lgNode(3,32,87,#ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD,4,2):lgNodes[3]\operand0=30:lgNodes[3]\operand1=31
+  lgNode(4,51,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,4,2):lgNodes[4]\operand0=50:lgNodes[4]\operand1=32
+  lgNode(5,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[5]\operand0=17:lgNodes[5]\operand1=51
+  lgNode(6,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; A live arithmetic result is allocated before the UBO load and consumed
+; afterwards. Weakening the UBO reservation places that result in rf8..rf11;
+; the later address LDUNIFRF/TMUAU use of rf8 would then destroy its first lane.
+Procedure lgLateUboSpan(*m.AvkIrModule)
+  lgBlock(*m,2)
+  *m\idBound=96:*m\constantCount=6:*m\nodeCount=6:lgBlocks[0]\nodeCount=6
+  lgConstants[1]\sourceId=40:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F000000
+  lgConstants[2]\sourceId=41:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$3F100000
+  lgConstants[3]\sourceId=42:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$3F200000
+  lgConstants[4]\sourceId=43:lgConstants[4]\sourceOpcode=43:lgConstants[4]\typeId=2:lgConstants[4]\wordCount=1:lgConstants[4]\word0=$3F300000
+  lgConstants[5]\sourceId=48:lgConstants[5]\sourceOpcode=44:lgConstants[5]\typeId=3:lgConstants[5]\componentCount=4
+  lgConstants[5]\component0=40:lgConstants[5]\component1=41:lgConstants[5]\component2=42:lgConstants[5]\component3=43
+  lgNode(0,50,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[0]\operand0=48:lgNodes[0]\operand1=48
+  lgNode(1,30,65,#ANVIL_IR_OP_ACCESS_CHAIN,6,2):lgNodes[1]\operand0=15:lgNodes[1]\operand1=12
+  lgNode(2,31,61,#ANVIL_IR_OP_LOAD,3,1):lgNodes[2]\operand0=30
+  lgNode(3,51,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,3,2):lgNodes[3]\operand0=50:lgNodes[3]\operand1=31
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=16:lgNodes[4]\operand1=51
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; Two scalar VPM inputs -> vec2 construct -> extract lane one -> scalar VPM
+; output. This covers both composite operations and distinct IO mappings.
+Procedure lgComposite(*m.AvkIrModule)
+  lgZero():lgBase(*m)
+  *m\stage=#ANVIL_IR_STAGE_VERTEX
+  *m\typeCount=6:*m\functionTypeId=6
+  *m\variableCount=3:*m\decorationCount=3:*m\blockCount=1:*m\nodeCount=6
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=2
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1:lgTypes[3]\pointeeType=2
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3:lgTypes[4]\pointeeType=2
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=12:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=4:lgVariables[1]\storageClass=1
+  lgVariables[2]\sourceId=11:lgVariables[2]\sourceOpcode=59:lgVariables[2]\pointerType=5:lgVariables[2]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
+  lgDecorations[1]\sourceId=12:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=7:lgDecorations[1]\value=1
+  lgDecorations[2]\sourceId=11:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=7
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=6
+  lgNode(0,30,61,#ANVIL_IR_OP_LOAD,2,1):lgNodes[0]\operand0=10
+  lgNode(1,31,61,#ANVIL_IR_OP_LOAD,2,1):lgNodes[1]\operand0=12
+  lgNode(2,32,80,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,3,2):lgNodes[2]\operand0=30:lgNodes[2]\operand1=31
+  lgNode(3,33,81,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1):lgNodes[3]\operand0=32:lgNodes[3]\literalCount=1:lgNodes[3]\literal0=1
+  lgNode(4,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[4]\operand0=11:lgNodes[4]\operand1=33
+  lgNode(5,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; Two exact-width VPM inputs, one float32 arithmetic node, and one VPM output.
+Procedure lgArithmetic(*m.AvkIrModule, lanes.i, operation.i)
+  Protected resultType.i
+  Protected opcode.i
+  lgZero():lgBase(*m)
+  *m\stage=#ANVIL_IR_STAGE_VERTEX
+  *m\typeCount=6:*m\constantCount=0:*m\functionTypeId=6
+  *m\variableCount=3:*m\decorationCount=3:*m\blockCount=1:*m\nodeCount=5
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2
+  If lanes=1
+    lgTypes[2]\componentCount=2
+    resultType=2
+  Else
+    lgTypes[2]\componentCount=lanes
+    resultType=3
+  EndIf
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1
+  lgTypes[3]\pointeeType=resultType
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3
+  lgTypes[4]\pointeeType=resultType
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=12:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=4:lgVariables[1]\storageClass=1
+  lgVariables[2]\sourceId=15:lgVariables[2]\sourceOpcode=59:lgVariables[2]\pointerType=5:lgVariables[2]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
+  lgDecorations[1]\sourceId=12:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=7:lgDecorations[1]\value=1
+  lgDecorations[2]\sourceId=15:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=7
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=5
+  If operation=#ANVIL_IR_OP_FADD
+    opcode=#ANVIL_IR_SPV_FADD
+  Else
+    opcode=#ANVIL_IR_SPV_FMUL
+  EndIf
+  lgNode(0,30,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[0]\operand0=10
+  lgNode(1,31,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[1]\operand0=12
+  lgNode(2,32,opcode,operation,resultType,2):lgNodes[2]\operand0=30:lgNodes[2]\operand1=31
+  lgNode(3,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[3]\operand0=15:lgNodes[3]\operand1=32
+  lgNode(4,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+; Two exact constants are lowered before a deliberately consumed VPM load.
+; This makes the constant uniform destinations RF0 upward as the independent
+; vertex decoder requires, while the eight cases above separately prove the
+; complete LDVPM -> arithmetic -> STVPM path. Distinct scalar words prove both
+; uniform-stream order and the register each arithmetic lane consumes.
+Procedure lgArithmeticConstant(*m.AvkIrModule, lanes.i, operation.i)
+  Protected resultType.i
+  Protected opcode.i
+  Protected k.i
+  lgZero():lgBase(*m)
+  *m\stage=#ANVIL_IR_STAGE_VERTEX
+  *m\typeCount=6:*m\functionTypeId=6
+  *m\variableCount=2:*m\decorationCount=2:*m\blockCount=1:*m\nodeCount=4
+  lgType(0,1,19,#ANVIL_IR_TYPE_VOID)
+  lgType(1,2,22,#ANVIL_IR_TYPE_FLOAT):lgTypes[1]\width=32
+  lgType(2,3,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[2]\componentType=2:lgTypes[2]\componentCount=4
+  If lanes=1
+    resultType=2
+  Else
+    resultType=3
+  EndIf
+  lgType(3,4,32,#ANVIL_IR_TYPE_POINTER):lgTypes[3]\storageClass=1:lgTypes[3]\pointeeType=resultType
+  lgType(4,5,32,#ANVIL_IR_TYPE_POINTER):lgTypes[4]\storageClass=3:lgTypes[4]\pointeeType=resultType
+  lgType(5,6,33,#ANVIL_IR_TYPE_FUNCTION):lgTypes[5]\returnType=1
+  lgVariables[0]\sourceId=10:lgVariables[0]\sourceOpcode=59:lgVariables[0]\pointerType=4:lgVariables[0]\storageClass=1
+  lgVariables[1]\sourceId=15:lgVariables[1]\sourceOpcode=59:lgVariables[1]\pointerType=5:lgVariables[1]\storageClass=3
+  lgDecorations[0]\sourceId=10:lgDecorations[0]\sourceOpcode=71:lgDecorations[0]\member=-1:lgDecorations[0]\kind=7
+  lgDecorations[1]\sourceId=15:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=7
+  If lanes=1
+    *m\constantCount=2
+    lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2
+    lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3FC00000
+    lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2
+    lgConstants[1]\wordCount=1:lgConstants[1]\word0=$3F000000
+  Else
+    *m\constantCount=10
+    lgConstants[0]\sourceId=40:lgConstants[0]\sourceOpcode=43:lgConstants[0]\typeId=2:lgConstants[0]\wordCount=1:lgConstants[0]\word0=$3F800000
+    lgConstants[1]\sourceId=41:lgConstants[1]\sourceOpcode=43:lgConstants[1]\typeId=2:lgConstants[1]\wordCount=1:lgConstants[1]\word0=$40000000
+    lgConstants[2]\sourceId=42:lgConstants[2]\sourceOpcode=43:lgConstants[2]\typeId=2:lgConstants[2]\wordCount=1:lgConstants[2]\word0=$40800000
+    lgConstants[3]\sourceId=43:lgConstants[3]\sourceOpcode=43:lgConstants[3]\typeId=2:lgConstants[3]\wordCount=1:lgConstants[3]\word0=$41000000
+    lgConstants[4]\sourceId=44:lgConstants[4]\sourceOpcode=44:lgConstants[4]\typeId=3
+    lgConstants[4]\componentCount=4:lgConstants[4]\component0=40:lgConstants[4]\component1=41
+    lgConstants[4]\component2=42:lgConstants[4]\component3=43
+    lgConstants[5]\sourceId=45:lgConstants[5]\sourceOpcode=43:lgConstants[5]\typeId=2:lgConstants[5]\wordCount=1:lgConstants[5]\word0=$3F000000
+    lgConstants[6]\sourceId=46:lgConstants[6]\sourceOpcode=43:lgConstants[6]\typeId=2:lgConstants[6]\wordCount=1:lgConstants[6]\word0=$3E800000
+    lgConstants[7]\sourceId=47:lgConstants[7]\sourceOpcode=43:lgConstants[7]\typeId=2:lgConstants[7]\wordCount=1:lgConstants[7]\word0=$3E000000
+    lgConstants[8]\sourceId=48:lgConstants[8]\sourceOpcode=43:lgConstants[8]\typeId=2:lgConstants[8]\wordCount=1:lgConstants[8]\word0=$3D800000
+    lgConstants[9]\sourceId=49:lgConstants[9]\sourceOpcode=44:lgConstants[9]\typeId=3
+    lgConstants[9]\componentCount=4:lgConstants[9]\component0=45:lgConstants[9]\component1=46
+    lgConstants[9]\component2=47:lgConstants[9]\component3=48
+  EndIf
+  lgBlocks[0]\sourceId=21:lgBlocks[0]\sourceOpcode=248:lgBlocks[0]\nodeCount=4
+  If operation=#ANVIL_IR_OP_FADD
+    opcode=#ANVIL_IR_SPV_FADD
+  Else
+    opcode=#ANVIL_IR_SPV_FMUL
+  EndIf
+  lgNode(0,32,opcode,operation,resultType,2):lgNodes[0]\operand0=40
+  If lanes=1
+    lgNodes[0]\operand1=41
+  Else
+    lgNodes[0]\operand0=44:lgNodes[0]\operand1=49
+  EndIf
+  lgNode(1,30,61,#ANVIL_IR_OP_LOAD,resultType,1):lgNodes[1]\operand0=10
+  lgNode(2,0,62,#ANVIL_IR_OP_STORE,0,2):lgNodes[2]\operand0=15:lgNodes[2]\operand1=32
+  lgNode(3,0,253,#ANVIL_IR_OP_RETURN,0,0)
+EndProcedure
+
+Procedure lgTarget(*t.AvkIrV3d42Target, targetIndex.i, targetRole.i, inputId.i, inputComps.i, outputId.i, outputComps.i)
+  Protected clearOffset.i
+  clearOffset=0
+  While clearOffset<SizeOf(AvkIrV3d42Target)
+    PokeA(*t+clearOffset,0)
+    clearOffset=clearOffset+1
+  Wend
+  clearOffset=0
+  While clearOffset<SizeOf(AvkIrV3d42Io)*4
+    PokeA(@lgInputs[0]+clearOffset,0)
+    PokeA(@lgOutputs[0]+clearOffset,0)
+    clearOffset=clearOffset+1
+  Wend
+  *t\role=targetRole
+  *t\codeBase=@lgCode[targetIndex*128]
+  *t\codeCapacity=1024
+  *t\uniformBase=@lgUniform[targetIndex*64]
+  *t\uniformCapacity=256
+  *t\tlbConfig=$FFFFFFFF
+  *t\inputCount=Bool(inputId<>0)
+  *t\inputs=@lgInputs[0]
+  *t\outputCount=1
+  *t\outputs=@lgOutputs[0]
+  lgInputs[0]\variableId=inputId
+  lgInputs[0]\member=-1
+  lgInputs[0]\firstSlot=0
+  lgInputs[0]\components=inputComps
+  lgOutputs[0]\variableId=outputId
+  lgOutputs[0]\member=-1
+  lgOutputs[0]\firstSlot=0
+  lgOutputs[0]\components=outputComps
+EndProcedure
+
+Procedure lgRecord(targetIndex.i, resultCode.i, *r.AvkIrV3d42Result, *t.AvkIrV3d42Target)
+  Protected reportBase.i
+  Protected errorBase.i
+  reportBase=targetIndex*8
+  lgReport[reportBase]=resultCode
+  lgReport[reportBase+1]=*t\codeBase
+  lgReport[reportBase+2]=*r\codeBytes
+  lgReport[reportBase+3]=*t\uniformBase
+  lgReport[reportBase+4]=*r\uniformWords
+  lgReport[reportBase+5]=*r\uniformAddressWord
+  lgReport[reportBase+6]=*r\textureStateWord
+  lgReport[reportBase+7]=*r\tlbConfigWord
+  errorBase=900+(targetIndex*3)
+  lgReport[errorBase]=AnvilVkIrV3d42SourceId()
+  lgReport[errorBase+1]=AnvilVkIrV3d42SourceOpcode()
+  lgReport[errorBase+2]=AnvilVkIrV3d42Stage()
+  If targetIndex=22
+    lgReport[990]=AnvilVkIrLastError()
+    lgReport[991]=AnvilVkIrLastId()
+    lgReport[992]=AnvilVkIrLastOpcode()
+    lgReport[993]=AnvilVkIrLastIndex()
+  EndIf
+EndProcedure
+
+Procedure lgRecordFull(targetIndex.i, *r.AvkIrV3d42Result)
+  Protected b.i=600+(targetIndex*10)
+  lgReport[b+0]=*r\pushFirstWord
+  lgReport[b+1]=*r\pushRWord:lgReport[b+2]=*r\pushGWord
+  lgReport[b+3]=*r\pushBWord:lgReport[b+4]=*r\pushAWord
+  lgReport[b+5]=*r\uniformAddressWord:lgReport[b+6]=*r\uniformConfigWord
+  lgReport[b+7]=*r\textureStateWord:lgReport[b+8]=*r\samplerStateWord
+  lgReport[b+9]=*r\tlbConfigWord
+EndProcedure
+
+Procedure lgRecordRegs(targetIndex.i)
+  Protected b.i=400+(targetIndex*5)
+  lgReport[b+0]=avk42Reg[41*4]
+  lgReport[b+1]=avk42Reg[43*4]
+  lgReport[b+2]=avk42Reg[46*4]
+  lgReport[b+3]=avk42Reg[70*4]
+  lgReport[b+4]=avk42Reg[71*4]
+EndProcedure
+
+Procedure.i Main()
+  Protected m.AvkIrModule
+  Protected t.AvkIrV3d42Target
+  Protected r.AvkIrV3d42Result
+  Protected rc.i
+  Protected sentinel.i
+  Protected lanes.i
+  Protected operation.i
+  Protected caseIndex.i
+  Protected copyIndex.i
+
+  lgPass(@m,#ANVIL_IR_STAGE_VERTEX)
+  lgTarget(@t,0,1,10,4,11,4)
+  t\tlbConfig=0
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(0,rc,@r,@t)
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+  lgPass(@m,#ANVIL_IR_STAGE_FRAGMENT)
+  lgTarget(@t,1,2,10,4,11,4)
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(1,rc,@r,@t)
+  lgCheck(rc=0 And r\tlbConfigWord=0 And r\uniformWords=1)
+  lgBlock(@m,9)
+  lgTarget(@t,2,2,0,0,16,4)
+  t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(2,rc,@r,@t)
+  lgCheck(rc=0 And r\pushFirstWord=0 And r\uniformWords=5)
+  lgBlock(@m,2)
+  lgTarget(@t,3,2,0,0,16,4)
+  t\uniformBlockAddress=$00102000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(3,rc,@r,@t)
+  lgCheck(rc=0 And r\uniformAddressWord=0 And r\uniformConfigWord=1 And r\uniformWords=3)
+  lgSample(@m)
+  lgTarget(@t,4,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(4,rc,@r,@t)
+  lgCheck(rc=0 And r\textureStateWord=0 And r\samplerStateWord=1 And r\uniformWords=3)
+  lgComposite(@m)
+  lgTarget(@t,5,1,10,1,11,1)
+  t\inputCount=2
+  lgInputs[1]\variableId=12:lgInputs[1]\member=-1:lgInputs[1]\firstSlot=1:lgInputs[1]\components=1
+  t\tlbConfig=0
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgRecord(5,rc,@r,@t)
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+
+  ; Both exact arithmetic operations at every admitted scalar/vector width.
+  caseIndex=6
+  lanes=1
+  While lanes<=4
+    operation=#ANVIL_IR_OP_FADD
+    lgArithmetic(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes)
+    t\inputCount=2
+    lgInputs[1]\variableId=12:lgInputs[1]\member=-1
+    lgInputs[1]\firstSlot=lanes
+    lgInputs[1]\components=lanes
+    t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+    caseIndex=caseIndex+1
+    operation=#ANVIL_IR_OP_FMUL
+    lgArithmetic(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,10,lanes,15,lanes)
+    t\inputCount=2
+    lgInputs[1]\variableId=12:lgInputs[1]\member=-1
+    lgInputs[1]\firstSlot=lanes
+    lgInputs[1]\components=lanes
+    t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=0)
+    caseIndex=caseIndex+1
+    lanes=lanes+1
+  Wend
+
+  ; Constant operands: scalar and vec4, for both exact operations.
+  lanes=1
+  While lanes<=4
+    operation=#ANVIL_IR_OP_FADD
+    lgArithmeticConstant(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,0,0,15,lanes):t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=(lanes*2))
+    caseIndex=caseIndex+1
+    operation=#ANVIL_IR_OP_FMUL
+    lgArithmeticConstant(@m,lanes,operation)
+    lgTarget(@t,caseIndex,1,0,0,15,lanes):t\tlbConfig=0
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+    lgRecord(caseIndex,rc,@r,@t)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=(lanes*2))
+    caseIndex=caseIndex+1
+    lanes=lanes+3
+  Wend
+
+  ; Dead duplicate dynamic operations remain accepted and byte-identical to
+  ; the old direct families: liveness is rooted at the sole Store value.
+  lgDeadBlock(@m,9):lgTarget(@t,18,2,0,0,16,4)
+  t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(18,rc,@r,@t):lgRecordFull(18,@r)
+  lgCheck(rc=0 And r\codeBytes=lgReport[18] And r\uniformWords=lgReport[20])
+  lgCheck(lgSameBytes(t\codeBase,lgReport[17],r\codeBytes)<>0 And lgSameBytes(t\uniformBase,lgReport[19],r\uniformWords*4)<>0)
+  lgDeadBlock(@m,2):lgTarget(@t,19,2,0,0,16,4):t\uniformBlockAddress=$00102000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(19,rc,@r,@t):lgRecordFull(19,@r)
+  lgCheck(rc=0 And r\codeBytes=lgReport[26] And r\uniformWords=lgReport[28])
+  lgCheck(lgSameBytes(t\codeBase,lgReport[25],r\codeBytes)<>0 And lgSameBytes(t\uniformBase,lgReport[27],r\uniformWords*4)<>0)
+  lgDeadSample(@m):lgTarget(@t,20,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(20,rc,@r,@t):lgRecordFull(20,@r)
+  lgCheck(rc=0 And r\codeBytes=lgReport[34] And r\uniformWords=lgReport[36])
+  lgCheck(lgSameBytes(t\codeBase,lgReport[33],r\codeBytes)<>0 And lgSameBytes(t\uniformBase,lgReport[35],r\uniformWords*4)<>0)
+
+  ; Two live loads of the same varying are one invocation value. The second
+  ; SSA id must map to the first registers without consuming the FIFO again.
+  lgDuplicateInput(@m):lgTarget(@t,21,2,10,4,11,4)
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(21,rc,@r,@t):lgRecordFull(21,@r)
+  lanes=0
+  While lanes<4
+    lgReport[550+lanes]=avk42Reg[(30*4)+lanes]
+    lgReport[554+lanes]=avk42Reg[(31*4)+lanes]
+    lanes=lanes+1
+  Wend
+  lgCheck(rc=0 And avk42Reg[30*4]=avk42Reg[31*4] And avk42Reg[(30*4)+1]=avk42Reg[(31*4)+1] And avk42Reg[(30*4)+2]=avk42Reg[(31*4)+2] And avk42Reg[(30*4)+3]=avk42Reg[(31*4)+3] And avk42Count[30]=4 And avk42Count[31]=4)
+
+  ; Every pair and the full triple in both source-node orders. Resource
+  ; metadata and physical registers are recorded for independent decoding.
+  caseIndex=22
+  While caseIndex<30
+    If caseIndex<24
+      lgResourceMix(@m,1,1,0,caseIndex&1)
+      lgTarget(@t,caseIndex,2,0,0,24,4)
+      t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+      t\uniformBlockAddress=$00102000
+    ElseIf caseIndex<26
+      lgResourceMix(@m,1,0,1,caseIndex&1)
+      lgTarget(@t,caseIndex,2,23,2,24,4)
+      t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+      t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+    ElseIf caseIndex<28
+      lgResourceMix(@m,0,1,1,caseIndex&1)
+      lgTarget(@t,caseIndex,2,23,2,24,4)
+      t\uniformBlockAddress=$00102000:t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+    Else
+      lgResourceMix(@m,1,1,1,caseIndex&1)
+      lgTarget(@t,caseIndex,2,23,2,24,4)
+      t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+      t\uniformBlockAddress=$00102000:t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+    EndIf
+    rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(caseIndex,rc,@r,@t):lgRecordFull(caseIndex,@r):lgRecordRegs(caseIndex)
+    lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords>0)
+    caseIndex=caseIndex+1
+  Wend
+
+  ; Causal reservation witnesses.  These are ordered so ordinary live SSA
+  ; values exist before a later fixed-register resource operation and remain
+  ; operands afterwards; the host checker decodes the later arithmetic and
+  ; verifies that the resource setup could not have overwritten them.
+  lgLateSampleSpan(@m):lgTarget(@t,30,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(30,rc,@r,@t)
+  lgCheck(lgDisjoint(@lgSavedCode30[0],#LG_SAVED_CODE_BYTES,@lgSavedUniform30[0],#LG_SAVED_UNIFORM_WORDS*4)<>0)
+  If rc=0 And r\codeBytes<=#LG_SAVED_CODE_BYTES And r\uniformWords<=#LG_SAVED_UNIFORM_WORDS
+    copyIndex=0
+    While copyIndex<r\codeBytes
+      PokeA(@lgSavedCode30[0]+copyIndex,PeekA(t\codeBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    copyIndex=0
+    While copyIndex<(r\uniformWords*4)
+      PokeA(@lgSavedUniform30[0]+copyIndex,PeekA(t\uniformBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    lgReport[241]=@lgSavedCode30[0]:lgReport[243]=@lgSavedUniform30[0]
+  EndIf
+  lgReport[760]=avk42Reg[48*4]:lgReport[761]=avk42Reg[49*4]
+  lgReport[762]=avk42Reg[50*4]:lgReport[763]=avk42Reg[32*4]:lgReport[764]=avk42Reg[51*4]
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=11)
+
+  lgLateUboSpan(@m):lgTarget(@t,31,2,0,0,16,4)
+  t\uniformBlockAddress=$00102000
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r):lgRecord(31,rc,@r,@t)
+  lgCheck(lgDisjoint(@lgSavedCode31[0],#LG_SAVED_CODE_BYTES,@lgSavedUniform31[0],#LG_SAVED_UNIFORM_WORDS*4)<>0)
+  If rc=0 And r\codeBytes<=#LG_SAVED_CODE_BYTES And r\uniformWords<=#LG_SAVED_UNIFORM_WORDS
+    copyIndex=0
+    While copyIndex<r\codeBytes
+      PokeA(@lgSavedCode31[0]+copyIndex,PeekA(t\codeBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    copyIndex=0
+    While copyIndex<(r\uniformWords*4)
+      PokeA(@lgSavedUniform31[0]+copyIndex,PeekA(t\uniformBase+copyIndex))
+      copyIndex=copyIndex+1
+    Wend
+    lgReport[249]=@lgSavedCode31[0]:lgReport[251]=@lgSavedUniform31[0]
+  EndIf
+  lgReport[770]=avk42Reg[48*4]:lgReport[771]=avk42Reg[50*4]
+  lgReport[772]=avk42Reg[31*4]:lgReport[773]=avk42Reg[51*4]
+  lgCheck(rc=0 And r\codeBytes>0 And r\uniformWords=7)
+
+  ; Exact live resource block contract: Block, member zero, Offset zero and
+  ; float32 vec4. Each refusal is transactional and points at the Load stage.
+  lgBlock(@m,9):lgTypes[3]\memberCount=2:lgTypes[3]\member1=3:lgConstants[0]\word0=1
+  lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t)
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgBlock(@m,9):lgDecorations[0]\sourceId=4:lgDecorations[0]\sourceOpcode=72:lgDecorations[0]\member=0:lgDecorations[0]\kind=#ANVIL_IR_DEC_OFFSET
+  lgDecorations[1]\sourceId=16:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=#ANVIL_IR_DEC_LOCATION : m\decorationCount=2
+  lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgBlock(@m,9):lgDecorations[1]\sourceId=16:lgDecorations[1]\sourceOpcode=71:lgDecorations[1]\member=-1:lgDecorations[1]\kind=#ANVIL_IR_DEC_LOCATION : m\decorationCount=2
+  lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgBlock(@m,9):lgDecorations[1]\value=16
+  lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgBlock(@m,9):lgType(9,10,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[9]\componentType=2:lgTypes[9]\componentCount=3
+  lgType(10,11,32,#ANVIL_IR_TYPE_POINTER):lgTypes[10]\storageClass=9:lgTypes[10]\pointeeType=10
+  m\typeCount=11:lgTypes[3]\member0=10:lgTypes[5]\pointeeType=10:lgNodes[0]\resultType=11:lgNodes[1]\resultType=10
+  lgTypes[6]\pointeeType=10:lgVariables[1]\pointerType=7
+  lgTarget(@t,30,2,0,0,16,3):lgOutputs[0]\components=3:t\pushWordCount=3
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+
+  ; The UBO load has its own emission branch, so prove that the same exact
+  ; member-zero/offset-zero contract is enforced there before publication.
+  lgBlock(@m,2):lgDecorations[1]\value=16
+  lgTarget(@t,30,2,0,0,16,4):t\uniformBlockAddress=$00102000
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+
+  ; A verifier-valid vec4<int32> block must not slip through the lowerer's
+  ; exact float32 vec4 resource contract.
+  lgBlock(@m,9)
+  lgType(9,10,21,#ANVIL_IR_TYPE_INT):lgTypes[9]\width=32:lgTypes[9]\signedness=1
+  lgType(10,11,23,#ANVIL_IR_TYPE_VECTOR):lgTypes[10]\componentType=10:lgTypes[10]\componentCount=4
+  m\typeCount=11:lgTypes[3]\member0=11:lgTypes[5]\pointeeType=11:lgTypes[6]\pointeeType=11:lgNodes[1]\resultType=11
+  lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=15 And AnvilVkIrV3d42SourceOpcode()=61 And AnvilVkIrV3d42Stage()=5 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+
+  ; Multiple live dynamic occurrences are refused before emission until the
+  ; executable ABI can carry each one independently.
+  lgDoubleBlock(@m,9):lgTarget(@t,30,2,0,0,16,4):t\pushWordCount=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_UNSUPPORTED And AnvilVkIrV3d42SourceId()=20 And AnvilVkIrV3d42SourceOpcode()=#ANVIL_IR_SPV_LOAD And AnvilVkIrV3d42Stage()=4 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgDoubleBlock(@m,2):lgTarget(@t,30,2,0,0,16,4):t\uniformBlockAddress=$00102000
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_UNSUPPORTED And AnvilVkIrV3d42SourceId()=20 And AnvilVkIrV3d42SourceOpcode()=#ANVIL_IR_SPV_LOAD And AnvilVkIrV3d42Stage()=4 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgDoubleSample(@m):lgTarget(@t,30,2,16,2,17,4):t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_UNSUPPORTED And AnvilVkIrV3d42SourceId()=20 And AnvilVkIrV3d42SourceOpcode()=#ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD And AnvilVkIrV3d42Stage()=4 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+
+  ; Result metadata is published in the same all-or-nothing transaction as
+  ; caller code and uniforms, including refusals after successful emission.
+  lgBlock(@m,9):lgTarget(@t,30,2,0,0,16,4)
+  t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000:t\uniformBlockAddress=$00102000
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42Stage()=6 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgSample(@m):lgTarget(@t,30,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100:t\pushWordCount=4:t\push0=$3F800000
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42Stage()=6 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgBlock(@m,9):lgTarget(@t,30,2,0,0,16,4)
+  t\pushWordCount=4:t\push0=$3F800000:t\push1=$40000000:t\push2=$40400000:t\push3=$3F800000
+  lgFillTarget(@t):t\codeCapacity=8:rc=AnvilVkIrV3d42Lower(@m,@t,@r):t\codeCapacity=1024
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_RANGE And AnvilVkIrV3d42Stage()=7 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgSample(@m):lgTarget(@t,30,2,16,2,17,4)
+  t\textureStateAddress=$00200000:t\samplerStateAddress=$00200100
+  lgFillTarget(@t):t\uniformCapacity=4:rc=AnvilVkIrV3d42Lower(@m,@t,@r):t\uniformCapacity=256
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_RANGE And AnvilVkIrV3d42Stage()=7 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+
+  lgPass(@m,2):lgTarget(@t,5,1,10,4,11,4)
+  t\tlbConfig=0
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  m\decorationCount=3:lgDecorations[2]\sourceId=30:lgDecorations[2]\sourceOpcode=71:lgDecorations[2]\member=-1:lgDecorations[2]\kind=1
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_UNSUPPORTED And AnvilVkIrV3d42SourceId()=30)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\codeBase=t\codeBase+4
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_RANGE And r\codeBytes=0)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\codeCapacity=8
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_RANGE)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\codeBase=$7FFFFFFFFFFFFFF8
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_RANGE And r\codeBytes=0)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\uniformBase=t\codeBase+8
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_RANGE)
+  lgPass(@m,#ANVIL_IR_STAGE_FRAGMENT):lgTarget(@t,32,#ANVIL_IR_V3D42_ROLE_FRAGMENT,10,4,11,4)
+  t\inputCount=2:lgInputs[1]\variableId=10:lgInputs[1]\member=-1:lgInputs[1]\firstSlot=4:lgInputs[1]\components=4
+  lgFillTarget(@t):rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=10 And AnvilVkIrV3d42SourceOpcode()=#ANVIL_IR_SPV_VARIABLE And AnvilVkIrV3d42Stage()=2 And lgMetadataEmpty(@r)<>0 And lgTargetUntouched(@t)<>0)
+  lgComposite(@m):lgTarget(@t,5,1,10,1,11,1)
+  t\inputCount=2
+  lgInputs[1]\variableId=12:lgInputs[1]\member=-1:lgInputs[1]\firstSlot=0:lgInputs[1]\components=1
+  t\tlbConfig=0
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceId()=12)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  lgInputs[0]\components=3
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\uniformBlockAddress=$00102000
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42Stage()=6)
+  lgSample(@m):lgTarget(@t,5,2,16,2,17,4)
+  t\textureStateAddress=$100000000:t\samplerStateAddress=$200100
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT And AnvilVkIrV3d42SourceOpcode()=87)
+  lgSample(@m):lgTarget(@t,5,2,16,2,17,4)
+  t\textureStateAddress=$200004:t\samplerStateAddress=$200100
+  lgCheck(AnvilVkIrV3d42Lower(@m,@t,@r)=#ANVIL_IR_V3D42_ERR_LAYOUT)
+  lgPass(@m,2):lgTarget(@t,5,2,10,4,11,4)
+  t\codeBase=@lgCode[600]
+  sentinel=PeekI(t\codeBase)
+  PokeI(t\codeBase,$55AA55AA)
+  t\codeCapacity=8
+  rc=AnvilVkIrV3d42Lower(@m,@t,@r)
+  lgCheck(rc<>0 And PeekI(t\codeBase)=$55AA55AA)
+  PokeI(t\codeBase,sentinel)
+  lgCheck(AnvilVkIrV3d42Lower(0,@t,@r)=#ANVIL_IR_V3D42_ERR_ARGS)
+
+  lgReport[1000]=#LG_MAGIC
+  lgReport[1001]=lgChecks
+  lgReport[1002]=lgFails
+  ProcedureReturn @lgReport[0]
+EndProcedure

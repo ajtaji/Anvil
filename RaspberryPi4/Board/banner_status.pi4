@@ -1,0 +1,159 @@
+; ======================================================================
+;  THE BANNER'S STATUS CAPTION - the clock, the temperature, the fan, and
+;  the newest unread message.
+; ----------------------------------------------------------------------
+;  The identity row of the banner (the row the build label sits on) has
+;  carried the wall clock since the clock existed. This file composes the
+;  whole caption for that row: the clock's own caption first, then core
+;  0's scheduler-accounted busy percentage, then the part's temperature,
+;  then - behind #ANVIL_BANNER_FAN and only while a
+;  fan pin is being driven - the fan's duty. BannerClockTick copies it
+;  once a second and redraws only when the text changed, so a steady
+;  temperature costs nothing on the panel.
+;
+;  IT ASKS THE HARDWARE LAYER, NOT THE FAN POLICY. The banner is a
+;  statement about the board, not about the policy: the duty is
+;  HwPwmDutyNow() on whatever pin the modulator holds, which is the fan's
+;  pin once `fan pin` has claimed it and nothing at all before. "If it is
+;  being used" is HwPwmKind() not being NONE.
+;
+;  THE TEMPERATURE IS THE PUBLISHED SAMPLE, HwTempSampled(), AND NEVER
+;  THE SEAM. HwTempMilliC() is a call through a pointer out of the
+;  service table, so the compiler must treat it as a call to every
+;  procedure that table can hold - which includes the USB enumeration the
+;  boot walk reaches. This caption is composed from the screen service
+;  tick, and the screen service tick is reached from the boot walk, so a
+;  seam call here closes a loop that cannot happen at run time and the
+;  build is refused. It is refused correctly: taking a reading is
+;  touching hardware, and composing a caption is not the place for it.
+;  The periodic owner in Anvil/Core/fan_cmd.pbi takes the sample from the
+;  prompt spin - once a second, armed or not - and this reads the value.
+;  A loaded THERMAL.MOD is still what answered; it answered one tick ago.
+;
+;  FAHRENHEIT, WHOLE DEGREES, and the duty as a whole percent: this is a
+;  glance, not the `fan` report, which prints the millidegrees and the
+;  tenth of a percent beside it.
+;
+;  THE CONVERSIONS LIVE IN Anvil/Hal/hal.pbi (HwTempWholeF). Nothing
+;  here does arithmetic on a temperature.
+; ======================================================================
+
+#BANNER_STATUS_MAX = 127
+Global Dim gBannerStatusBuf.a[#BANNER_STATUS_MAX + 1]
+
+; Append a zero-terminated string at `p`, bounded. Returns the new end.
+Procedure.i BannerStatusPut(p.i, *s)
+  Define i.i
+  i = 0
+  While p < #BANNER_STATUS_MAX And PeekA(*s + i) <> 0
+    gBannerStatusBuf[p] = PeekA(*s + i)
+    p = p + 1
+    i = i + 1
+  Wend
+  gBannerStatusBuf[p] = 0
+  ProcedureReturn p
+EndProcedure
+
+; Append an integer in decimal. Returns the new end.
+Procedure.i BannerStatusPutDec(p.i, v.i)
+  Define d.i
+  Define n.i
+  If v < 0
+    p = BannerStatusPut(p, "-")
+    v = -v
+  EndIf
+  d = 1
+  While v / d >= 10
+    d = d * 10
+  Wend
+  While d > 0 And p < #BANNER_STATUS_MAX
+    n = (v / d) % 10
+    gBannerStatusBuf[p] = 48 + n
+    p = p + 1
+    d = d / 10
+  Wend
+  gBannerStatusBuf[p] = 0
+  ProcedureReturn p
+EndProcedure
+
+; Append a CPU utilization value stored as hundredths of a percent.
+Procedure.i BannerStatusPutPercent2(p.i, hundredths.i)
+  Define fraction.i
+  If hundredths < 0
+    ProcedureReturn BannerStatusPut(p, "--.--%")
+  EndIf
+  If hundredths > 10000 : hundredths = 10000 : EndIf
+  p = BannerStatusPutDec(p, hundredths / 100)
+  p = BannerStatusPut(p, ".")
+  fraction = hundredths % 100
+  If fraction < 10
+    p = BannerStatusPut(p, "0")
+  EndIf
+  p = BannerStatusPutDec(p, fraction)
+  ProcedureReturn BannerStatusPut(p, "%")
+EndProcedure
+
+; The caption as last composed - for a REPAINT, which must not compose.
+; DrawBanner is reached from the print path (a printed line drains the
+; mirror, pumps the screen, and a V3D console repaints its banner) and
+; from every geometry change, so it can run many times between two
+; seconds; the caption changes once a second at most. A repaint that
+; composed would ask the modulator what it is doing once per printed
+; line to arrive at the same string, and - worse - would put the clock's
+; own formatting on the print path. So a repaint draws what the last
+; service tick composed.
+; Before the first tick the buffer holds the clock alone.
+Procedure.i BannerCaptionLast()
+  If gBannerStatusBuf[0] = 0
+    BannerStatusPut(0, WallClockCaption())
+  EndIf
+  ProcedureReturn @gBannerStatusBuf[0]
+EndProcedure
+
+; The caption, freshly composed. Owns its buffer; callers copy it at
+; once, as they did the clock's. Called from BannerClockTick only.
+Procedure.i BannerCaption()
+  Define p.i
+  Define t.i
+  Define duty.i
+  Define n.i
+  Define cpu.i
+  p = BannerStatusPut(0, WallClockCaption())
+  ; Core 0's scheduler-accounted busy percentage; -1 means the first
+  ; complete one-second sample is not available yet.
+  p = BannerStatusPut(p, "    CPU0 ")
+  cpu = AnvilCpuUsageHundredths()
+  p = BannerStatusPutPercent2(p, cpu)
+  t = HwTempSampled()
+  If t <> #HW_TEMP_NONE
+    p = BannerStatusPut(p, "    ")
+    p = BannerStatusPutDec(p, HwTempWholeF(t))
+    p = BannerStatusPut(p, " F")
+  EndIf
+  CompilerIf #ANVIL_BANNER_FAN = 1
+  If HwPwmKind() <> #HW_PWM_KIND_NONE
+    duty = HwPwmDutyNow()
+    If duty >= 0
+      p = BannerStatusPut(p, "    fan ")
+      p = BannerStatusPutDec(p, (duty + 5) / 10)
+      p = BannerStatusPut(p, "%")
+    EndIf
+  EndIf
+  CompilerEndIf
+  ; THE NEWEST UNREAD MESSAGE, LAST. Background services never print on the
+  ; command line (Anvil/Core/messages.pbi); this row is where the screen
+  ; shows that one has spoken, and `messages` is where it is read in full.
+  ; Last, so a narrow surface loses the message before the clock, and it
+  ; goes as soon as `messages` has been run.
+  n = MessagesUnread()
+  If n > 0
+    p = BannerStatusPutDec(BannerStatusPut(p, "    "), n)
+    If n = 1
+      p = BannerStatusPut(p, " new message: ")
+    Else
+      p = BannerStatusPut(p, " new messages: ")
+    EndIf
+    p = BannerStatusPut(p, MessagesNewest())
+  EndIf
+  ProcedureReturn @gBannerStatusBuf[0]
+EndProcedure

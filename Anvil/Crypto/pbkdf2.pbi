@@ -1,0 +1,685 @@
+; ======================================================================
+;  pbkdf2.pbi - PBKDF2-HMAC-SHA1, AND THE WPA2 PASSPHRASE MAPPING
+; ======================================================================
+;
+;     XIncludeFile "RaspberryPi4/Lib/sha1.pi4"      ; REQUIRED, FIRST
+;     XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"  ; REQUIRED, SECOND
+;     XIncludeFile "Anvil/Crypto/pbkdf2.pbi"
+;
+;
+;  PBKDF2 as PKCS #5 v2.0 defines it, with HMAC-SHA1 as the PRF -
+;  RaspberryPi4/Reference/rfc2898.txt section 5.2, which is on this
+;  disk and which every line below cites:
+;
+;      DK      = T_1 || T_2 || ... || T_l           (rfc2898.txt:582)
+;      T_i     = F(P, S, c, i)                      (rfc2898.txt:549)
+;      F       = U_1 XOR U_2 XOR ... XOR U_c        (rfc2898.txt:567)
+;      U_1     = PRF(P, S || INT(i))                (rfc2898.txt:571)
+;      U_j     = PRF(P, U_{j-1})                    (rfc2898.txt:574)
+;      INT(i)  = four octets, most significant first(rfc2898.txt:576)
+;
+;  API:
+;    Pbkdf2Sha1(pw, pwlen, salt, saltlen, iters, dst, dklen)
+;        the general function; returns dklen, or 0 on a bad argument
+;    Wpa2Psk(passphrase, plen, ssid, ssidlen, dst)
+;        the WPA2 mapping: PBKDF2(passphrase, ssid, 4096, 32).
+;        Returns 32, or 0 if the arguments break IEEE 802.11's rules
+;    Pbkdf2StepBegin(...) / Pbkdf2Step(budget) / Pbkdf2StepWipe()
+;        a separate resumable engine. `budget` is complete PRFs, never
+;        wall time; each call finishes every HMAC it starts and invokes no
+;        callback. Wpa2PskStepBegin applies WPA2's argument/size mapping.
+;    Pbkdf2Wipe()
+;        zero the synchronous engine's U/T/counter buffers. It deliberately
+;        does not cancel the independent resumable engine; its owner uses
+;        Pbkdf2StepWipe() so an unrelated synchronous caller cannot destroy
+;        a recovery derivation between slices.
+;
+;  DEPENDENCIES: RaspberryPi4/Lib/sha1.pi4 and
+;  RaspberryPi4/Lib/hmacsha1.pi4, in that order, and NEITHER IS
+;  INCLUDED FROM HERE. House rule 10: a library never includes a
+;  library; the MAIN source file lists what it needs. A missing
+;  dependency fails the build on an undefined HmacSha1Key, which names
+;  the gap.
+;
+;  ======================================================================
+;   *** THE PASSPHRASE IS A SECRET AND IT IS NOT IN THIS FILE ***
+;  ======================================================================
+;
+;  THERE IS NO PASSPHRASE, NO SSID AND NO PMK ANYWHERE IN THIS SOURCE,
+;  IN ANY COMMENT, OR IN ANY TEST VECTOR ANYWHERE IN THIS TREE. The
+;  real credentials live in SETTINGS.TXT on the boot medium and are
+;  read at run time by Anvil/Core/settings.pbi. Every test vector
+;  used to gate this file is a PUBLISHED one - RFC 6070's, and IEEE
+;  802.11's own "password"/"IEEE" example - and they are published
+;  precisely so that nobody has to test with a real one.
+;
+;  THE OBVIOUS TEMPTATION IS TO PRINT THE PMK WHILE DEBUGGING A JOIN.
+;  Do not. A PMK is the passphrase for every practical purpose: it
+;  joins the network on its own, it never expires, and a console log is
+;  forever. If a join fails, print the SSID length, the passphrase
+;  LENGTH, and the first four bytes of the PMK at most - four bytes is
+;  enough to tell "the derivation ran and produced something stable"
+;  from "the derivation did not run", which is the only question a log
+;  needs to answer. Pbkdf2Wipe() exists so that the buffers do not
+;  outlive the derivation.
+;
+;  ======================================================================
+;   WHY THIS COSTS WHAT IT COSTS, AND WHY THAT IS THE POINT
+;  ======================================================================
+;
+;  A WPA2 PMK is 4096 iterations for each of two 20-byte output blocks:
+;  8192 HMAC-SHA1 operations, which with hmacsha1.pi4's cached pad
+;  states is 16,384 SHA-1 compressions. THAT SLOWNESS IS THE FEATURE.
+;  PBKDF2's entire purpose is to make a dictionary attack on the
+;  passphrase 4096 times more expensive than a single hash would, and
+;  an implementation that found a way to skip it would be broken rather
+;  than fast.
+;
+;  What is legitimate is not doing the work twice. The PMK depends only
+;  on the passphrase and the SSID, so a caller that joins the same
+;  network repeatedly should derive once and keep the PMK, not call
+;  this on every association. This file does not cache: a cache here
+;  would have to hold the passphrase or the PMK for the lifetime of the
+;  program, and where that lives is the caller's decision, not a
+;  library's.
+;
+;  ======================================================================
+;   WHAT WAS REJECTED
+;  ======================================================================
+;
+;  ONE: BUILDING "S || INT(i)" IN A BUFFER. The obvious implementation
+;  copies the salt and four counter bytes into scratch and MACs it in
+;  one call. That needs a buffer as long as the longest salt anyone
+;  will ever pass, which is a limit this file would then have to
+;  document, enforce, and be wrong about later. HMAC is a streaming
+;  construction, so the salt is absorbed straight from the caller's
+;  memory and the four counter bytes follow it in a second Update. No
+;  buffer, no limit, and the salt is never copied - which also means it
+;  is never left lying in a static array afterwards.
+;
+;  TWO: A 64-BIT COUNTER, OR A COUNTER THAT WRAPS. INT(i) is four
+;  octets and l is bounded by dklen; with dklen limited to
+;  #PBKDF2_MAXDK below, i never exceeds a small integer and the
+;  four-byte encoding cannot overflow. The alternative - allowing an
+;  unbounded dklen and reasoning about 2^32 blocks - buys nothing any
+;  caller in this tree wants and would make the bound invisible.
+;
+;  THREE: WRITING T DIRECTLY INTO THE CALLER'S BUFFER. Tempting for the
+;  full blocks, but the LAST block is usually partial, so the code
+;  would have two paths and the rarely-taken one would be the untested
+;  one. T is accumulated in a local buffer and copied out with one
+;  length-clamped loop that is the same code for every block.
+;
+;  FOUR: DERIVING THE PMK INSIDE cyw43.pi4. It was the shorter path and
+;  it would have put a passphrase, a PMK and a Wi-Fi driver in one
+;  374 KB file. Keeping the key schedule in a library with no hardware
+;  in it means this file can be gated entirely offline against
+;  published vectors, which is the only reason anything here can be
+;  believed before a board is switched on.
+;
+;  ======================================================================
+;   WHAT HAS BEEN PROVEN, AND WHAT HAS NOT - 2026-08-28
+;  ======================================================================
+;
+;  PROVEN by known-answer test under the project's A64 oracle
+;  tools/a64/a64_interp.py, on a real image built by pmfc.exe for
+;  -t pi4. The gate is tools/a64/a64_pbkdf2_check.py:
+;
+;    * RFC 6070's PBKDF2-HMAC-SHA1 test vectors, PARSED OUT OF
+;      RaspberryPi4/Reference/rfc6070.txt rather than transcribed.
+;      They cover c = 1, c = 2 and c = 4096; dkLen of 16, 20 and 25 -
+;      so a partial final block, an exact fit, and a two-block output;
+;      a 24-octet password with a 36-octet salt; and a password and
+;      salt that both CONTAIN A ZERO BYTE. That last one is the vector
+;      that catches any implementation which treats either as a C
+;      string, and it is the reason every length in this file is
+;      explicit.
+;    * THE ZERO-BYTE PROPERTY IS ALSO TESTED CHEAPLY, five more ways,
+;      at c = 1 and c = 2: a zero in the password, a zero in the salt,
+;      zeros in both across a two-block output, and a password and a
+;      salt that are nothing but zeros. RFC 6070 publishes its
+;      zero-byte case only at 4096 iterations, and "does it stop at a
+;      NUL" and "does it iterate 4096 times" are two independent
+;      properties; paying eight thousand compressions to ask the first
+;      one is how a gate becomes too slow to run.
+;    * 31 assertions in the cheap set, all passing, in 18 seconds.
+;    * The three IEEE 802.11i Annex H.4.2 passphrase-to-PSK vectors,
+;      including "password" with SSID "IEEE". See the gate's header
+;      for exactly how far the citation for those goes and where it
+;      stops - the standard is not on this disk, so the gate confirms
+;      its own transcription against an implementation outside this
+;      tree before using it.
+;    * The 16,777,216-iteration RFC 6070 vector is NOT run against this
+;      library. It is four thousand times the work of a WPA2 join
+;      against a Python model of the instruction set, which is a
+;      day-scale run. It IS used - it is one of the six vectors the
+;      gate makes OpenSSL reproduce before it will trust OpenSSL for
+;      anything, and that costs seconds on the host.
+;
+;  ALSO RUN AS PART OF THE JOIN DIAGNOSTIC. The same RFC 6070 c=1, c=2
+;  and c=4096 vectors and the Annex H.4 "password"/"IEEE" PSK are
+;  computed by
+;  RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4's CryptoSelfTest,
+;  which runs before the radio is powered. That whole image - the real
+;  one, built by pmfc.exe - was run under the oracle on 2026-08-28 and
+;  printed nine "ok" rows including the PSK. On a board it is the same
+;  code and the same vectors.
+;
+;  MUTATION-TESTED, IN TWO SWEEPS, AND THE SPLIT IS THE INTERESTING
+;  PART.
+;
+;  `--mutate` runs fourteen defects against the cheap vectors.
+;  Thirteen go red. One is recorded as expected-GREEN and stays:
+;  calling HmacSha1Key where HmacSha1Begin belongs is slower and not
+;  wrong, and a mutation that is not a defect is worth writing down
+;  rather than deleting. Two of the thirteen are caught by a STEP
+;  BUDGET rather than by a wrong value - removing an argument check in
+;  Wpa2Psk turns a refusal into a real 4096-iteration derivation, and
+;  "this refusal started doing PBKDF2" is a more direct reading of that
+;  bug than the output is.
+;
+;  `--mutate-wpa2` runs three more against a REAL Annex H.4
+;  derivation - 532 million model instructions for the clean run - and
+;  all three go red: a wrong iteration count (which comes back at
+;  exactly a quarter of the instructions, 133 million, because 1024 is
+;  a quarter of 4096), a wrong output length, and the passphrase and
+;  the SSID swapped.
+;
+;  THAT SECOND SWEEP EXISTS BECAUSE THE FIRST ONE HAD A HOLE AND SAID
+;  SO. #WPA2_PSK_ITERS appears only inside Wpa2Psk, so no vector that
+;  skips the 4096 iterations can see it change; the first sweep ran a
+;  deliberately wrong 1024 and went green. That was a hole in the GATE,
+;  not in this file, and the fix was a slower sweep rather than a
+;  quieter mutation.
+;
+;  NOT PROVEN: nothing here has run on silicon yet.
+; ======================================================================
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  #PBKDF2_HLEN is 20 because the PRF is HMAC-SHA1 and hLen in
+;  RaspberryPi4/Reference/rfc2898.txt:539 is the digest length of the
+;  underlying hash. It MUST equal #HMACSHA1_MAC in
+;  RaspberryPi4/Lib/hmacsha1.pi4; there is no compile-time way to
+;  assert that in this language, so it is said here: KEEP THEM EQUAL.
+;
+;  #PBKDF2_MAXDK is 64. It is a limit this file imposes, not one PKCS #5
+;  imposes - the standard's bound is (2^32 - 1) * hLen, which is 85 GB
+;  and is not a bound at all for anything running here. 64 is chosen
+;  because it is comfortably more than every derived key this project
+;  has a use for (a 32-byte PMK, a 32-byte PSK, a 48-byte PTK for
+;  CCMP), and because a stated maximum lets the caller's dst buffer be
+;  checked by inspection. RAISE IT IF SOMETHING NEEDS MORE - it costs a
+;  constant and nothing else - but do not remove it, because an
+;  unbounded dklen makes T_i's counter reasoning unbounded too.
+;
+;  #WPA2_PSK_ITERS is 4096 and #WPA2_PSK_LEN is 32. Both come from
+;  IEEE 802.11's Annex H.4 mapping, and the on-disk statement of them
+;  is RaspberryPi4/Reference/hostap_sha1-pbkdf2.c:71-72, whose comment
+;  reads "iterations is set to 4096 and buflen to 32. This function is
+;  described in IEEE Std 802.11-2004, Clause H.4."
+;
+;  #WPA2_PASS_MIN / #WPA2_PASS_MAX are 8 and 63. IEEE 802.11's
+;  passphrase mapping is defined for a passphrase of 8 to 63 characters;
+;  64 is deliberately excluded because a 64-character credential is the
+;  OTHER form - the PSK written out as 64 hex digits, which is not
+;  passed through this function at all. See Wpa2Psk's comment.
+;
+;  #WPA2_SSID_MAX is 32, the maximum length of an SSID element's body.
+; ----------------------------------------------------------------------
+#PBKDF2_HLEN    = 20
+#PBKDF2_MAXDK   = 64
+
+#WPA2_PSK_ITERS = 4096
+#WPA2_PSK_LEN   = 32
+#WPA2_PASS_MIN  = 8
+#WPA2_PASS_MAX  = 63
+#WPA2_SSID_MAX  = 32
+
+; Cooperative PBKDF2 status. The ordinary Pbkdf2Sha1/Wpa2Psk entry
+; points below remain synchronous for boot-time and diagnostic callers.
+; These values describe the separate resumable engine used by automatic
+; Wi-Fi recovery, where monopolising the prompt for a whole 4096-round
+; derivation would also stop the wired network service.
+#PBKDF2_STEP_IDLE    = 0
+#PBKDF2_STEP_RUNNING = 1
+#PBKDF2_STEP_DONE    = 2
+#PBKDF2_STEP_ERROR   = -1
+
+; ----------------------------------------------------------------------
+;  STATE - flat Global arrays, house style.
+;
+;  ALL THREE ARE KEY MATERIAL and the sec prefix says so. secPbkdf2T in
+;  particular holds a finished block of the derived key - which for
+;  WPA2 is twenty of the thirty-two bytes of the PMK - and it stays
+;  there until the next call or until Pbkdf2Wipe().
+;
+;  secPbkdf2Int is the four-byte big-endian block counter INT(i). It is
+;  not secret; it lives here rather than as a local because its address
+;  is taken and passed to HmacSha1Update, and a module-global array is
+;  the house spelling for that.
+; ----------------------------------------------------------------------
+Global Dim secPbkdf2U.a[20]         ; the running U_j
+Global Dim secPbkdf2T.a[20]         ; U_1 XOR U_2 XOR ... XOR U_j so far
+Global Dim secPbkdf2Int.a[4]        ; INT(i), four octets, big-endian
+
+; The resumable engine owns different U/T/counter storage from the
+; synchronous API. Its password and salt pointers remain caller-owned and
+; valid only while RUNNING. A Wi-Fi recovery copies its selected SSID into
+; stable storage and cancels this engine before credentials can change.
+; HMAC's cached pad state is shared, so EVERY Step call keys HMAC anew before
+; doing a complete, indivisible group of PRFs. Other HMAC users may therefore
+; run between Step calls without corrupting the derivation.
+Global Dim secPbkdf2StepU.a[20]
+Global Dim secPbkdf2StepT.a[20]
+Global Dim secPbkdf2StepInt.a[4]
+Global gPbkdf2StepState.i = #PBKDF2_STEP_IDLE
+Global pbkdf2StepPw.i = 0
+Global pbkdf2StepPwLen.i = 0
+Global pbkdf2StepSalt.i = 0
+Global pbkdf2StepSaltLen.i = 0
+Global pbkdf2StepIters.i = 0
+Global pbkdf2StepDst.i = 0
+Global pbkdf2StepDkLen.i = 0
+Global pbkdf2StepBlocks.i = 0
+Global pbkdf2StepBlock.i = 0
+Global pbkdf2StepIter.i = 0
+Global pbkdf2StepOff.i = 0
+
+; Optional cooperative progress boundary for long derivations. The library
+; does not know what the callback services and never prints from it. Setting a
+; callback returns the previous one so a caller can install it for exactly one
+; operation and restore the prior owner afterwards.
+Global *pbkdf2_progress = 0
+Procedure.i Pbkdf2SetProgress(*fn)
+  Protected *old
+  *old = *pbkdf2_progress
+  *pbkdf2_progress = *fn
+  ProcedureReturn *old
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pbkdf2Wipe() - zero the synchronous engine's private buffers.
+;
+;  NOT AUTOMATIC AT THE END OF Pbkdf2Sha1, and that is deliberate: the
+;  caller decides when the derived key stops being needed, and a
+;  library that wiped on the way out would be making that decision for
+;  a caller who might legitimately want to look at what it produced.
+;  Call it once the PMK has been installed.
+;
+;  IT DOES NOT CANCEL OR WIPE THE SEPARATE RESUMABLE ENGINE. That engine
+;  intentionally survives unrelated complete synchronous PBKDF/HMAC users
+;  between slices and is owned through Pbkdf2StepWipe().
+;
+;  IT DOES NOT WIPE hmacsha1.pi4's CACHED PAD STATES, which still hold
+;  a key-derived SHA-1 state after this runs. That is that file's
+;  business and it has no wipe of its own; the honest thing is to say
+;  so here rather than imply a clean-up this cannot deliver. Setting a
+;  new key overwrites them.
+; ----------------------------------------------------------------------
+Procedure Pbkdf2Wipe()
+  Protected i.i
+  i = 0
+  While i < #PBKDF2_HLEN
+    secPbkdf2U[i] = 0
+    secPbkdf2T[i] = 0
+    i = i + 1
+  Wend
+  i = 0
+  While i < 4
+    secPbkdf2Int[i] = 0
+    i = i + 1
+  Wend
+EndProcedure
+
+; Cancel and wipe only the cooperative engine. The caller's destination is
+; deliberately not wiped: after DONE it is the derived key the caller asked
+; for. During cancellation the Wi-Fi owner separately wipes its PMK buffer.
+Procedure Pbkdf2StepWipe()
+  Protected i.i
+  For i = 0 To #PBKDF2_HLEN - 1
+    secPbkdf2StepU[i] = 0
+    secPbkdf2StepT[i] = 0
+  Next
+  For i = 0 To 3
+    secPbkdf2StepInt[i] = 0
+  Next
+  gPbkdf2StepState = #PBKDF2_STEP_IDLE
+  pbkdf2StepPw = 0
+  pbkdf2StepPwLen = 0
+  pbkdf2StepSalt = 0
+  pbkdf2StepSaltLen = 0
+  pbkdf2StepIters = 0
+  pbkdf2StepDst = 0
+  pbkdf2StepDkLen = 0
+  pbkdf2StepBlocks = 0
+  pbkdf2StepBlock = 0
+  pbkdf2StepIter = 0
+  pbkdf2StepOff = 0
+EndProcedure
+
+; Begin a resumable PBKDF2-HMAC-SHA1 derivation. No PRF is executed here.
+; The pointer lifetimes and the one-active-operation rule are explicit: a
+; second begin is refused until the owner cancels or consumes completion.
+Procedure.i Pbkdf2StepBegin(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dklen.i)
+  If gPbkdf2StepState = #PBKDF2_STEP_RUNNING
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If dst = 0 Or pwlen < 0 Or saltlen < 0
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If (pw = 0 And pwlen > 0) Or (salt = 0 And saltlen > 0)
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If iters < 1 Or dklen < 1 Or dklen > #PBKDF2_MAXDK
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+
+  Pbkdf2StepWipe()
+  pbkdf2StepPw = pw
+  pbkdf2StepPwLen = pwlen
+  pbkdf2StepSalt = salt
+  pbkdf2StepSaltLen = saltlen
+  pbkdf2StepIters = iters
+  pbkdf2StepDst = dst
+  pbkdf2StepDkLen = dklen
+  pbkdf2StepBlocks = (dklen + #PBKDF2_HLEN - 1) / #PBKDF2_HLEN
+  pbkdf2StepBlock = 1
+  pbkdf2StepIter = 0
+  pbkdf2StepOff = 0
+  gPbkdf2StepState = #PBKDF2_STEP_RUNNING
+  ProcedureReturn gPbkdf2StepState
+EndProcedure
+
+; Execute at most `budget` complete PRFs. It never calls a progress or network
+; callback, and it never yields in the middle of HMAC begin/update/end. The
+; budget is a compute-work bound, not a wall-clock promise.
+Procedure.i Pbkdf2Step(budget.i)
+  Protected k.i
+  Protected want.i
+
+  If gPbkdf2StepState <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn gPbkdf2StepState
+  EndIf
+  If budget < 1
+    ProcedureReturn gPbkdf2StepState
+  EndIf
+
+  ; Restore our PRF key in case a complete HMAC user ran between slices.
+  HmacSha1Key(pbkdf2StepPw, pbkdf2StepPwLen)
+
+  While budget > 0 And pbkdf2StepBlock <= pbkdf2StepBlocks
+    If pbkdf2StepIter = 0
+      secPbkdf2StepInt[0] = (pbkdf2StepBlock >> 24) & 255
+      secPbkdf2StepInt[1] = (pbkdf2StepBlock >> 16) & 255
+      secPbkdf2StepInt[2] = (pbkdf2StepBlock >> 8) & 255
+      secPbkdf2StepInt[3] = pbkdf2StepBlock & 255
+      HmacSha1Begin()
+      If pbkdf2StepSaltLen > 0
+        HmacSha1Update(pbkdf2StepSalt, pbkdf2StepSaltLen)
+      EndIf
+      HmacSha1Update(@secPbkdf2StepInt[0], 4)
+      HmacSha1End(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      For k = 0 To #PBKDF2_HLEN - 1
+        secPbkdf2StepT[k] = secPbkdf2StepU[k]
+      Next
+      pbkdf2StepIter = 1
+    Else
+      HmacSha1Begin()
+      HmacSha1Update(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      HmacSha1End(@secPbkdf2StepU[0], #PBKDF2_HLEN)
+      For k = 0 To #PBKDF2_HLEN - 1
+        secPbkdf2StepT[k] = secPbkdf2StepT[k] ! secPbkdf2StepU[k]
+      Next
+      pbkdf2StepIter = pbkdf2StepIter + 1
+    EndIf
+    budget = budget - 1
+
+    If pbkdf2StepIter >= pbkdf2StepIters
+      want = pbkdf2StepDkLen - pbkdf2StepOff
+      If want > #PBKDF2_HLEN
+        want = #PBKDF2_HLEN
+      EndIf
+      For k = 0 To want - 1
+        PokeB(pbkdf2StepDst + pbkdf2StepOff + k, secPbkdf2StepT[k] & 255)
+      Next
+      pbkdf2StepOff = pbkdf2StepOff + want
+      pbkdf2StepBlock = pbkdf2StepBlock + 1
+      pbkdf2StepIter = 0
+    EndIf
+  Wend
+
+  If pbkdf2StepBlock > pbkdf2StepBlocks
+    ; Drop borrowed secret pointers AND wipe the private U/T/counter state at
+    ; completion. The requested bytes are already in the caller's destination;
+    ; retaining intermediate key material until a later explicit Wipe would
+    ; make completion and cancellation have different secret lifetimes.
+    For k = 0 To #PBKDF2_HLEN - 1
+      secPbkdf2StepU[k] = 0
+      secPbkdf2StepT[k] = 0
+    Next
+    For k = 0 To 3
+      secPbkdf2StepInt[k] = 0
+    Next
+    pbkdf2StepPw = 0
+    pbkdf2StepPwLen = 0
+    pbkdf2StepSalt = 0
+    pbkdf2StepSaltLen = 0
+    pbkdf2StepIters = 0
+    pbkdf2StepDst = 0
+    pbkdf2StepDkLen = 0
+    pbkdf2StepBlocks = 0
+    pbkdf2StepBlock = 0
+    pbkdf2StepIter = 0
+    pbkdf2StepOff = 0
+    gPbkdf2StepState = #PBKDF2_STEP_DONE
+  EndIf
+  ProcedureReturn gPbkdf2StepState
+EndProcedure
+
+Procedure.i Pbkdf2StepState()
+  ProcedureReturn gPbkdf2StepState
+EndProcedure
+
+; WPA2's argument contract around the generic resumable engine.
+Procedure.i Wpa2PskStepBegin(passphrase.i, plen.i, ssid.i, ssidlen.i, dst.i)
+  If plen < #WPA2_PASS_MIN Or plen > #WPA2_PASS_MAX
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  If ssidlen < 1 Or ssidlen > #WPA2_SSID_MAX
+    ProcedureReturn #PBKDF2_STEP_ERROR
+  EndIf
+  ProcedureReturn Pbkdf2StepBegin(passphrase, plen, ssid, ssidlen, #WPA2_PSK_ITERS, dst, #WPA2_PSK_LEN)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Pbkdf2Sha1(pw, pwlen, salt, saltlen, iters, dst, dklen)
+;
+;  PKCS #5 v2.0 section 5.2, RaspberryPi4/Reference/rfc2898.txt:497.
+;  Returns dklen on success and 0 on a rejected argument.
+;
+;  THE ARGUMENT CHECKS ARE REFUSALS, NOT CLAMPS. A caller that asks for
+;  0 iterations has a bug, and silently doing 1 would hide it; a caller
+;  that asks for 128 bytes into a 64-byte buffer has a worse bug, and
+;  silently writing 64 would hide that one. Every rejection returns 0
+;  and writes nothing at all.
+;
+;  ZERO-LENGTH PASSWORDS AND SALTS ARE ALLOWED, because PKCS #5 allows
+;  them; it is WPA2 that has the 8-to-63 rule, and that rule is
+;  enforced in Wpa2Psk where it belongs rather than here where it would
+;  make this function un-gateable against RFC 6070.
+;
+;  BYTES, NOT STRINGS. Every length is explicit and no buffer is
+;  scanned for a terminator. RFC 6070's fifth vector uses the password
+;  "pass\0word" and the salt "sa\0lt" for exactly this reason, and it
+;  is in the gate.
+;
+;  THE KEY IS SET ONCE. HmacSha1Key is called a single time, outside
+;  both loops, and every one of the 8192 MACs that follows starts from
+;  HmacSha1Begin's restore of the cached ipad state. Calling
+;  HmacSha1Of in the inner loop instead would double the work and is
+;  the single most likely "simplification" a future edit would make;
+;  hmacsha1.pi4's header says the same thing from the other side.
+;
+;  U IS UPDATED IN PLACE, and that is safe for one specific reason
+;  worth stating: HmacSha1End absorbs nothing - it finalises from state
+;  the Update calls already consumed and copies out of an internal
+;  buffer at the very end. So the U that was fed to Update has already
+;  been read by the time the new U is written over it. IF
+;  HmacSha1End EVER BECOMES STREAMING, this line breaks silently.
+; ----------------------------------------------------------------------
+Procedure.i Pbkdf2Sha1(pw.i, pwlen.i, salt.i, saltlen.i, iters.i, dst.i, dklen.i)
+  Protected blocks.i
+  Protected i.i
+  Protected j.i
+  Protected k.i
+  Protected off.i
+  Protected want.i
+
+  If iters < 1
+    ProcedureReturn 0
+  EndIf
+  If dklen < 1
+    ProcedureReturn 0
+  EndIf
+  If dklen > #PBKDF2_MAXDK
+    ProcedureReturn 0
+  EndIf
+  If pwlen < 0
+    ProcedureReturn 0
+  EndIf
+  If saltlen < 0
+    ProcedureReturn 0
+  EndIf
+
+  ; l = CEIL(dklen / hLen) - rfc2898.txt:558.
+  blocks = (dklen + #PBKDF2_HLEN - 1) / #PBKDF2_HLEN
+
+  HmacSha1Key(pw, pwlen)
+
+  off = 0
+  i = 1
+  While i <= blocks
+    ; ---- U_1 = PRF(P, S || INT(i)) - rfc2898.txt:571 ----------------
+    ; INT(i) is "a four-octet encoding of the integer i, most
+    ; significant octet first" - rfc2898.txt:576-577. The blocks bound
+    ; above keeps i small, so the top two octets are always zero here;
+    ; they are written out anyway because the encoding is four octets
+    ; wide by definition and a three-octet counter would be a different
+    ; function that happens to agree for small i.
+    secPbkdf2Int[0] = (i >> 24) & 255
+    secPbkdf2Int[1] = (i >> 16) & 255
+    secPbkdf2Int[2] = (i >> 8) & 255
+    secPbkdf2Int[3] = i & 255
+
+    HmacSha1Begin()
+    If saltlen > 0
+      HmacSha1Update(salt, saltlen)
+    EndIf
+    HmacSha1Update(@secPbkdf2Int[0], 4)
+    HmacSha1End(@secPbkdf2U[0], #PBKDF2_HLEN)
+
+    ; T starts as U_1 - rfc2898.txt:567, the XOR of one term.
+    k = 0
+    While k < #PBKDF2_HLEN
+      secPbkdf2T[k] = secPbkdf2U[k]
+      k = k + 1
+    Wend
+
+    ; ---- U_j = PRF(P, U_{j-1}), T = T XOR U_j, for j = 2..c ---------
+    ; The loop runs iters-1 times because U_1 is already done. An
+    ; off-by-one here is the classic PBKDF2 bug and it is invisible
+    ; without a vector at a SMALL iteration count, which is why RFC
+    ; 6070's c = 1 and c = 2 cases matter more than its c = 4096 one.
+    j = 1
+    While j < iters
+      HmacSha1Begin()
+      HmacSha1Update(@secPbkdf2U[0], #PBKDF2_HLEN)
+      HmacSha1End(@secPbkdf2U[0], #PBKDF2_HLEN)
+      k = 0
+      While k < #PBKDF2_HLEN
+        secPbkdf2T[k] = secPbkdf2T[k] ! secPbkdf2U[k]
+        k = k + 1
+      Wend
+      j = j + 1
+      ; 256 completed PRF iterations is a bounded, nonzero cadence. For the
+      ; WPA2 mapping this is sixteen callbacks per 4096-iteration block. The
+      ; callback is outside HMAC's begin/update/end sequence, so it cannot
+      ; observe a half-updated digest. A caller must still avoid re-entering
+      ; SHA/HMAC/PBKDF2 from the callback.
+      If *pbkdf2_progress <> 0 And (j & 255) = 0
+        pbkdf2_progress()
+      EndIf
+    Wend
+
+    ; ---- DK = T_1 || T_2 || ... , truncated - rfc2898.txt:582 -------
+    ; The final block is usually partial. One clamped loop handles
+    ; every block, full or not, so there is no rarely-taken path.
+    want = dklen - off
+    If want > #PBKDF2_HLEN
+      want = #PBKDF2_HLEN
+    EndIf
+    k = 0
+    While k < want
+      PokeB(dst + off + k, secPbkdf2T[k] & 255)
+      k = k + 1
+    Wend
+    off = off + want
+
+    i = i + 1
+  Wend
+
+  ProcedureReturn dklen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Wpa2Psk(passphrase, plen, ssid, ssidlen, dst) - the IEEE 802.11
+;  passphrase-to-PSK mapping. Writes 32 bytes at dst and returns 32, or
+;  returns 0 and writes nothing.
+;
+;      PSK = PBKDF2(passphrase, ssid, 4096, 256 bits)
+;
+;  The on-disk statement of the parameters is
+;  RaspberryPi4/Reference/hostap_sha1-pbkdf2.c:71-72: "iterations is
+;  set to 4096 and buflen to 32. This function is described in IEEE Std
+;  802.11-2004, Clause H.4."
+;
+;  THE SALT IS THE SSID, RAW, WITH NO LENGTH BYTE AND NO TERMINATOR.
+;  This is the part everybody gets wrong once: the SSID as it appears
+;  in the beacon's information element BODY, not the element with its
+;  id and length in front of it, and not a padded 32-byte field. An
+;  SSID may legally contain any byte including zero, so ssidlen is
+;  taken from the caller and the buffer is never scanned.
+;
+;  A 64-CHARACTER CREDENTIAL IS NOT A PASSPHRASE AND IS REFUSED HERE.
+;  IEEE 802.11 defines this mapping for 8 to 63 characters. The other
+;  way to configure WPA2 is to give the 256-bit PSK directly as 64 hex
+;  digits, and that value is NOT run through PBKDF2 - it is already the
+;  PSK. Accepting 64 characters here would silently derive a different
+;  key from someone's hex PSK and produce a join that fails with no
+;  clue why. A caller holding 64 hex digits decodes them and uses them
+;  as the PMK; it does not call this.
+;
+;  THE PMK AND THE PSK ARE THE SAME 32 BYTES IN WPA2-PSK. They have two
+;  names because in an enterprise network the PMK comes from the
+;  authentication server instead; with a pre-shared key the PSK is used
+;  directly as the PMK. Nothing downstream needs to care, but a reader
+;  comparing this file with IEEE 802.11 clause 12.7 will meet both
+;  words and should know they are one value here.
+; ----------------------------------------------------------------------
+Procedure.i Wpa2Psk(passphrase.i, plen.i, ssid.i, ssidlen.i, dst.i)
+  If plen < #WPA2_PASS_MIN
+    ProcedureReturn 0
+  EndIf
+  If plen > #WPA2_PASS_MAX
+    ProcedureReturn 0
+  EndIf
+  If ssidlen < 1
+    ProcedureReturn 0
+  EndIf
+  If ssidlen > #WPA2_SSID_MAX
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn Pbkdf2Sha1(passphrase, plen, ssid, ssidlen, #WPA2_PSK_ITERS, dst, #WPA2_PSK_LEN)
+EndProcedure

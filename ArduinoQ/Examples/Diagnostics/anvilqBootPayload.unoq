@@ -1,0 +1,182 @@
+; ======================================================================
+; anvilqBootPayload.unoq - the payload Anvil BOOTS on the Arduino UNO Q,
+; for the silicon proof of the bootloader.
+;
+; This is not a demonstration of anything the Q can do. It is the other
+; half of a two-part measurement, and its whole job is to leave EVIDENCE
+; that it ran which cannot be confused with anything else:
+;
+;   * it writes a signature word to a fixed address in DRAM, and
+;   * it returns a known value to the monitor that entered it.
+;
+; Anvil is then asked to dump that address, and the transcript on the ESP
+; carries the answer off the board. Without a payload that leaves a mark,
+; "the monitor said it entered it" is the monitor's own word for it - and
+; the entire point of this exercise is that the monitor's word is what is
+; under test.
+;
+; DIAGNOSTIC. Does not ship (rule 19).
+;
+; ----------------------------------------------------------------------
+; HOW IT IS BUILT, AND WHY EVERY FLAG IS THERE
+; ----------------------------------------------------------------------
+;   PureMetalForge.exe --compile ArduinoQ/Examples/Diagnostics/anvilqBootPayload.unoq -t unoq \
+;        --load-addr 0x64000000 --bss-addr 0x64100000 \
+;        --stack-addr 0x64F00000 --entry-returns \
+;        -o _work/APP.IMG
+;
+; and the file that is actually staged on the board is the one the compiler
+; writes BESIDE that: _work/APP.IMG.pmf, the payload container. It is the
+; container that carries the load address, the entry point, the BSS
+; extent and the SHA-256, which is why `boot APP.PMF` needs no address.
+;
+;   --load-addr 0x64000000  inside the Q's confirmed contiguous free DRAM
+;                           block (0x63900000..0x7D9FFFFF, read off the
+;                           running board from /proc/iomem), inside the
+;                           low payload window (0x40000000..0xFFFFFFFF),
+;                           and clear of the nominal monitor windows at
+;                           0x63900000..0x63AFFFFF that HitsMonitor()
+;                           refuses. All three constraints come from
+;                           ArduinoQ/Board/memmap_q.unoq.
+;   --bss-addr  0x64100000  a megabyte above the image, in the same free
+;                           block. It is stated EXPLICITLY rather than
+;                           left to the compiler's default so that the
+;                           container's BSS extent is a number a reader
+;                           can check against the memory map instead of
+;                           one that moves when the program grows.
+;   --stack-addr 0x64F00000 INSIDE the free block, above the BSS, growing
+;                           down towards it with fourteen megabytes of
+;                           room. This payload uses a handful of frames.
+;
+;                           IT WAS 0x63800000 AND THAT HUNG THE BOARD.
+;                           The reasoning was "below the image, so the
+;                           stack grows away from it" - true, and beside
+;                           the point: 0x63800000 is also below
+;                           0x63900000, where the confirmed free block
+;                           STARTS. Everything under that is Qualcomm
+;                           TZ/firmware/modem reserved aperture, read off
+;                           the running board from /proc/iomem.
+;
+;                           AND THE STACK SWITCH HAPPENS EVEN UNDER
+;                           --entry-returns, which is what makes it fatal
+;                           rather than merely untidy.
+;                           EmitCore_A64.pbi:335-341 says so in as many
+;                           words - "THE STACK SWITCH IS STILL
+;                           UNCONDITIONAL, and that is deliberate" - and
+;                           then pushes the loader's x30 and SP onto it.
+;                           So the first thing this payload did on silicon
+;                           was write sixteen bytes into a reserved
+;                           aperture, and the board stopped answering.
+;
+;                           THE LESSON, worth more than the fix: on this
+;                           board --stack-addr is not a hint. A payload
+;                           that RETURNS still moves SP, so a stack
+;                           address outside real DRAM is exactly as fatal
+;                           as a load address outside it - and unlike the
+;                           load address, nothing in the container
+;                           describes it and nothing in Anvil can check
+;                           it.
+;   --entry-returns         THE LOAD-BEARING ONE. It makes _start end in a
+;                           real epilogue, so this program RETURNS to
+;                           Anvil instead of spinning for ever. That is
+;                           what lets the same board run continue: Anvil
+;                           gets its prompt back, the staged script asks
+;                           it to dump the signature address, and the
+;                           transcript carries the evidence off the board.
+;                           Without it the session would end here and the
+;                           only thing provable would be that the board
+;                           stopped answering.
+;
+; ----------------------------------------------------------------------
+; THE BENCH RECIPE, AND WHY IT IS IN THIS ORDER
+; ----------------------------------------------------------------------
+; PROVE THE PROMPT-DRIVEN PATH BEFORE ARMING THE AUTOMATIC ONE. Anvil
+; flushes its transcript to the ESP after EVERY command, so a session
+; driven from \EFInvilnvil.in leaves evidence up to the last command
+; that completed - even if the next one wedges the board. The automatic
+; boot happens BEFORE the prompt exists, so if it wedges there is no
+; transcript at all and nothing to read afterwards. That is precisely
+; what happened on the first attempt here: the board went quiet and the
+; only thing recoverable was that it had gone quiet.
+;
+; So stage this in anvil.in first, with NO boot.file set:
+;
+;     load APP.PMF 64800000
+;     memory 64800000 20
+;     boot mem 64800000
+;     memory 64200000 20
+;     boot status
+;     exit
+;
+; `load` proves the file seam reaches the ESP. The first `memory` proves
+; the container arrived and shows its header. `boot mem` runs the whole
+; verify-place-enter path with a transcript already on disk behind it.
+; The second `memory` is the payload's signature, read back.
+;
+; ONLY THEN arm the automatic path - setenv boot.file APP.PMF, saveenv -
+; and reboot to watch the countdown do the same thing by itself.
+;
+; A HANG HERE COSTS A HUMAN. Debian is the default boot entry and the
+; systemd-boot one-shot is consumed before the image is launched, so a
+; power cycle always returns the board - but somebody has to walk over
+; and do it. That is the whole reason for the ordering above.
+;
+; ----------------------------------------------------------------------
+; IT PRINTS NOTHING, AND THAT IS NOT A LIMITATION OF THIS FILE
+; ----------------------------------------------------------------------
+; There is no UART on this bench that anybody can read - the GENI SE4 is
+; 1.8 V - and the console Anvil uses is a UEFI protocol reached through
+; the SystemTable pointer the firmware handed to ANVIL, not to this
+; program. A payload entered by RunAt() gets no arguments at all: the Q's
+; RunAt calls it with five zeroes.
+;
+; So this payload writes to memory, which needs nothing from anybody, and
+; Anvil reads that memory back afterwards. Passing the SystemTable through
+; to a payload would be a real and useful thing to build - it is how a
+; booted program on this board would ever say anything for itself - and it
+; is deliberately not built here, because inventing a calling convention
+; for payloads is a design decision and not a test fixture.
+; ======================================================================
+
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+
+; ----------------------------------------------------------------------
+;  THE EVIDENCE. Both numbers are stated here, in the deploy script that
+;  reads them back, and in the report - three places, so a transcript can
+;  be checked without running anything.
+;
+;  #QBP_MARK is where the signature goes. It is inside the low payload
+;  window and inside the confirmed free block, a megabyte clear of this
+;  program's own BSS at 0x64100000, so nothing this program does can
+;  write it by accident.
+;
+;  #QBP_SIG is a value that appears nowhere else in this system: not a
+;  zero, not an all-ones, not an address, not a length, and not a value
+;  any of Anvil's own structures hold. If it is at that address, this
+;  program put it there.
+; ----------------------------------------------------------------------
+#QBP_MARK = $64200000          ; where the signature is written
+#QBP_SIG  = $B007ED00600D      ; and what is written there
+#QBP_RC   = $600DB007          ; and what comes back in x0
+
+Procedure.i Main()
+  ; The signature. One 64-bit store, so it either happened or it did not -
+  ; there is no half-written state to misread.
+  PokeI(#QBP_MARK, #QBP_SIG)
+
+  ; A SECOND WORD, eight bytes on, holding the address this program
+  ; believes it is running at. It is not needed to prove the boot
+  ; happened, and it is here because it is the cheapest possible answer
+  ; to the question that follows: "was it placed where the container said
+  ; it would be?" If the monitor placed the image somewhere else, this
+  ; program would still have run - flat A64 code with no absolute
+  ; references mostly does - and this word is what would disagree.
+  PokeI(#QBP_MARK + 8, #QBP_MARK)
+
+  ; The value the monitor sees come back in x0. Distinct from the
+  ; signature so that "the payload ran" and "the payload returned
+  ; normally" are two separate observations and not one.
+  ProcedureReturn #QBP_RC
+EndProcedure
+
+Main()

@@ -1,0 +1,135 @@
+; Executable gate for the CYW43 function-2 FIFO transfer contract.
+; Main returns the first failed assertion number, or zero.
+
+Global Dim gate_buf.a[32768]
+Global gate_rdCalls.i
+Global gate_wrCalls.i
+Global gate_rdbCalls.i
+Global gate_wrbCalls.i
+Global gate_rdAddr.i
+Global gate_wrAddr.i
+Global gate_rdbAddr.i
+Global gate_wrbAddr.i
+Global gate_rdBytes.i
+Global gate_wrBytes.i
+Global gate_rdbBytes.i
+Global gate_wrbBytes.i
+Global gate_badFn.i
+Global gate_badIncr.i
+
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+
+Procedure GateResetCounts()
+  gate_rdCalls = 0 : gate_wrCalls = 0
+  gate_rdbCalls = 0 : gate_wrbCalls = 0
+  gate_rdAddr = -1 : gate_wrAddr = -1
+  gate_rdbAddr = -1 : gate_wrbAddr = -1
+  gate_rdBytes = 0 : gate_wrBytes = 0
+  gate_rdbBytes = 0 : gate_wrbBytes = 0
+  gate_badFn = 0 : gate_badIncr = 0
+  Cyw43InvalidateWindow()
+EndProcedure
+
+Procedure GateAddr(first.i, now.i)
+  If first >= 0 And first <> now
+    gate_badIncr = gate_badIncr + 1
+  EndIf
+EndProcedure
+
+Procedure.i GateRb(fn.i, addr.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GateWb(fn.i, addr.i, v.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateRd(fn.i, addr.i, *dst, n.i, incr.i)
+  If fn <> #CYW43_FN_WLAN : gate_badFn = gate_badFn + 1 : EndIf
+  If incr <> 0 : gate_badIncr = gate_badIncr + 1 : EndIf
+  GateAddr(gate_rdAddr, addr)
+  If gate_rdAddr < 0 : gate_rdAddr = addr : EndIf
+  gate_rdCalls = gate_rdCalls + 1
+  gate_rdBytes = gate_rdBytes + n
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWr(fn.i, addr.i, *src, n.i, incr.i)
+  If fn <> #CYW43_FN_WLAN : gate_badFn = gate_badFn + 1 : EndIf
+  If incr <> 0 : gate_badIncr = gate_badIncr + 1 : EndIf
+  GateAddr(gate_wrAddr, addr)
+  If gate_wrAddr < 0 : gate_wrAddr = addr : EndIf
+  gate_wrCalls = gate_wrCalls + 1
+  gate_wrBytes = gate_wrBytes + n
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateRdb(fn.i, addr.i, *dst, blockSize.i, blocks.i, incr.i)
+  If fn <> #CYW43_FN_WLAN : gate_badFn = gate_badFn + 1 : EndIf
+  If incr <> 0 : gate_badIncr = gate_badIncr + 1 : EndIf
+  GateAddr(gate_rdbAddr, addr)
+  If gate_rdbAddr < 0 : gate_rdbAddr = addr : EndIf
+  gate_rdbCalls = gate_rdbCalls + 1
+  gate_rdbBytes = gate_rdbBytes + (blockSize * blocks)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GateWrb(fn.i, addr.i, *src, blockSize.i, blocks.i, incr.i)
+  If fn <> #CYW43_FN_WLAN : gate_badFn = gate_badFn + 1 : EndIf
+  If incr <> 0 : gate_badIncr = gate_badIncr + 1 : EndIf
+  GateAddr(gate_wrbAddr, addr)
+  If gate_wrbAddr < 0 : gate_wrbAddr = addr : EndIf
+  gate_wrbCalls = gate_wrbCalls + 1
+  gate_wrbBytes = gate_wrbBytes + (blockSize * blocks)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define fifoAddr.i
+
+  If Cyw43SetIo(@GateRb, @GateWb, @GateRd, @GateWr) = 0 : ProcedureReturn 1 : EndIf
+  If Cyw43SetBlockIo(@GateRdb, @GateWrb) = 0 : ProcedureReturn 2 : EndIf
+  cyw43_f1Blk = 64
+  cyw43_f2Blk = 512
+  cyw43_f2ByteMax = 512
+  cyw43_multiBlock = 1
+  fifoAddr = (#CYW43_ENUM_BASE & #CYW43_SB_OFT_ADDR_MASK) | #CYW43_SB_ACCESS_2_4B
+
+  ; Byte mode may split a transfer, but every command addresses the same F2
+  ; FIFO and clears CMD53 OP_CODE/increment.
+  Cyw43SetBlockMode(0)
+  GateResetCounts()
+  If cyw43_F2Xfer(0, @gate_buf[0], 1536) = 0 : ProcedureReturn 3 : EndIf
+  If gate_rdCalls <> 3 Or gate_rdBytes <> 1536 Or gate_rdAddr <> fifoAddr : ProcedureReturn 4 : EndIf
+  If gate_badFn <> 0 Or gate_badIncr <> 0 : ProcedureReturn 5 : EndIf
+  GateResetCounts()
+  If cyw43_F2Xfer(1, @gate_buf[0], 1536) = 0 : ProcedureReturn 6 : EndIf
+  If gate_wrCalls <> 3 Or gate_wrBytes <> 1536 Or gate_wrAddr <> fifoAddr : ProcedureReturn 7 : EndIf
+  If gate_badFn <> 0 Or gate_badIncr <> 0 : ProcedureReturn 8 : EndIf
+
+  ; Reads accept the documented 32 KiB aggregate ceiling; writes remain bound
+  ; to one ordinary SDPCM frame.
+  GateResetCounts()
+  If cyw43_F2Xfer(0, @gate_buf[0], #CYW43_RXG_MAX_BYTES) = 0 : ProcedureReturn 9 : EndIf
+  If gate_rdCalls <> 64 Or gate_rdBytes <> #CYW43_RXG_MAX_BYTES : ProcedureReturn 10 : EndIf
+  GateResetCounts()
+  If cyw43_F2Xfer(0, @gate_buf[0], #CYW43_RXG_MAX_BYTES + 4) <> 0 : ProcedureReturn 11 : EndIf
+  If gate_rdCalls <> 0 Or gate_rdbCalls <> 0 : ProcedureReturn 12 : EndIf
+  If cyw43_F2Xfer(1, @gate_buf[0], #CYW43_MAX_FRAME + 4) <> 0 : ProcedureReturn 13 : EndIf
+  If gate_wrCalls <> 0 Or gate_wrbCalls <> 0 : ProcedureReturn 14 : EndIf
+
+  ; Block mode uses the same fixed FIFO address. A non-block tail follows the
+  ; block call without advancing it.
+  If Cyw43SetBlockMode(1) = 0 : ProcedureReturn 15 : EndIf
+  GateResetCounts()
+  If cyw43_F2Xfer(0, @gate_buf[0], 32764) = 0 : ProcedureReturn 16 : EndIf
+  If gate_rdbCalls <> 1 Or gate_rdbBytes <> 32256 Or gate_rdCalls <> 1 Or gate_rdBytes <> 508 : ProcedureReturn 17 : EndIf
+  If gate_rdbAddr <> fifoAddr Or gate_rdAddr <> fifoAddr Or gate_badFn <> 0 Or gate_badIncr <> 0 : ProcedureReturn 18 : EndIf
+  GateResetCounts()
+  If cyw43_F2Xfer(1, @gate_buf[0], 1536) = 0 : ProcedureReturn 19 : EndIf
+  If gate_wrbCalls <> 1 Or gate_wrbBytes <> 1536 Or gate_wrCalls <> 0 : ProcedureReturn 20 : EndIf
+  If gate_wrbAddr <> fifoAddr Or gate_badFn <> 0 Or gate_badIncr <> 0 : ProcedureReturn 21 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

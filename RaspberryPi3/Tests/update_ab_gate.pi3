@@ -1,0 +1,107 @@
+; Read/write calls are intercepted by the desk gate's sparse sector device.
+Procedure.i Pi3SdReadBlock(lba.i, buffer.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Pi3SdWriteBlock(lba.i, buffer.i)
+  ProcedureReturn 0
+EndProcedure
+; The production range loop, so the intercepted single-block calls still
+; carry every sector the filesystem reads.
+Procedure.i Pi3SdReadBlocks(lba.i, count.i, buffer.i)
+  Protected i.i
+  If count < 1 : ProcedureReturn 0 : EndIf
+  For i = 0 To count - 1
+    If Pi3SdReadBlock(lba + i, buffer + i * 512) = 0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3SdWriteBlocks(lba.i, count.i, buffer.i)
+  Protected i.i
+  If count < 1 : ProcedureReturn 0 : EndIf
+  For i = 0 To count - 1
+    If Pi3SdWriteBlock(lba + i, buffer + i * 512) = 0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3SdSetWriteWindow(first.i, count.i)
+  ProcedureReturn 1
+EndProcedure
+Global Dim pi3_test_mount_phases.a[32]
+Global pi3_test_mount_phase_count.i
+Procedure Pi3TestMountProgress()
+  If pi3_test_mount_phase_count < 32
+    pi3_test_mount_phases[pi3_test_mount_phase_count] = Pi3UpdateMountPhase()
+    pi3_test_mount_phase_count = pi3_test_mount_phase_count + 1
+  EndIf
+EndProcedure
+Procedure.i Pi3TestMountPhaseCount()
+  ProcedureReturn pi3_test_mount_phase_count
+EndProcedure
+Procedure.i Pi3TestMountPhaseAt(index.i)
+  If index < 0 Or index >= pi3_test_mount_phase_count : ProcedureReturn -1 : EndIf
+  ProcedureReturn pi3_test_mount_phases[index]
+EndProcedure
+Global Dim pi3_test_work_tokens.i[128]
+Global pi3_test_work_count.i
+Global pi3_test_work_fail.i
+Procedure.i Pi3TestWorkProgress(completed.i)
+  If pi3_test_work_count < 128
+    pi3_test_work_tokens[pi3_test_work_count] = completed
+    pi3_test_work_count = pi3_test_work_count + 1
+  EndIf
+  If pi3_test_work_fail <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3TestWorkCount()
+  ProcedureReturn pi3_test_work_count
+EndProcedure
+Procedure.i Pi3TestWorkTokenAt(index.i)
+  If index < 0 Or index >= pi3_test_work_count : ProcedureReturn -1 : EndIf
+  ProcedureReturn pi3_test_work_tokens[index]
+EndProcedure
+Procedure.i Pi3TestWorkFail(value.i)
+  pi3_test_work_fail = value
+  ProcedureReturn 1
+EndProcedure
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+XIncludeFile "Anvil/Storage/ab_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/boot_record.pbi"
+XIncludeFile "RaspberryPi3/Lib/update_ab.pbi"
+Procedure.i Main()
+  If Pi3UpdateError() = 99
+    Pi3UpdateConfigure($2000000, $100000, 0, $8000000, $1000000, $1000)
+    Pi3UpdateMount()
+    Pi3UpdateMountHandoff()
+    Pi3UpdateResetReady()
+    Pi3UpdateBegin(1024, $1800000)
+    Pi3UpdateChunk(0, $1800100, 512)
+    Pi3UpdateCommit()
+    Pi3UpdateAbort()
+    Pi3UpdateLoad()
+    Pi3UpdateLoadFallback()
+    Pi3UpdateConfirm(0, 1)
+    Pi3UpdatePrepareHandoff($1000000)
+    Pi3UpdateConfirmHandoff()
+    Pi3UpdateMountProgressHandler(@Pi3TestMountProgress)
+    Pi3UpdateWorkProgressHandler(@Pi3TestWorkProgress)
+    Pi3TestMountPhaseCount()
+    Pi3TestMountPhaseAt(0)
+    Pi3TestWorkCount()
+    Pi3TestWorkTokenAt(0)
+    Pi3UpdateWorkToken()
+    Pi3TestWorkFail(1)
+    Pi3UpdateWorkProgress(4096)
+    Pi3TestWorkFail(0)
+    Pi3UpdateWorkProgressHandler(0)
+    Pi3UpdateMountProgressHandler(0)
+    Pi3UpdateReceived()
+    Pi3UpdateSlot()
+    Pi3UpdateGeneration()
+  EndIf
+  ProcedureReturn 0
+EndProcedure

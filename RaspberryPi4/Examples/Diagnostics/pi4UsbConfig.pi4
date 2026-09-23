@@ -1,0 +1,433 @@
+; pi4UsbConfig.pi4 - what can the stick actually do?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; The device descriptor said class 0, which on a mass storage stick is
+; not evasion - it is correct. USB puts the class on the INTERFACE, and
+; the interface lives inside the configuration descriptor, which arrives
+; as a chain of variable-length records rather than a struct.
+;
+; So this walks that chain and reports what is in it. The answer decides
+; everything after it: which endpoints to configure, and whether the
+; SCSI Bulk-Only Transport is even the right protocol.
+;
+; WHAT WE ARE HOPING TO SEE, for a USB flash drive:
+;
+;     bInterfaceClass     $08   Mass Storage
+;     bInterfaceSubClass  $06   SCSI transparent command set
+;     bInterfaceProtocol  $50   Bulk-Only Transport
+;     two bulk endpoints, one IN and one OUT
+;
+; Anything else means a different driver, and finding that out from a
+; descriptor is cheaper than finding it out from a transfer that hangs.
+;
+; THE CHAIN FORMAT. Every descriptor starts with the same two bytes:
+;
+;     0  bLength           total size of THIS descriptor
+;     1  bDescriptorType   2 config, 4 interface, 5 endpoint, 11 IAD
+;
+; so it is walked by adding bLength, never by assuming a size. A zero
+; bLength would loop forever and is checked for - a malformed device is
+; a real thing and it must not be able to hang the bus master.
+;
+; THE TWO-STEP READ IS NOT OPTIONAL. The configuration descriptor's own
+; wTotalLength is only known after reading the first nine bytes, and
+; asking for more than the device has is a stall on some devices. So:
+; read nine, learn the length, read the whole thing.
+;
+;   pmfc pi4UsbConfig.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o usbcfg.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+#CFG_BUF = 512
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("    ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Num(*name, v.i)
+  UartWriteStr("    ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+; An endpoint address carries its direction in bit 7 and its number in
+; the low four bits. bmAttributes' low two bits are the type: 0 control,
+; 1 isochronous, 2 bulk, 3 interrupt.
+Procedure ShowEndpoint(*d)
+  Define addr.i
+  Define attr.i
+  Define mps.i
+
+  addr = PeekA(*d + 2)
+  attr = PeekA(*d + 3)
+  mps = PeekA(*d + 4) | (PeekA(*d + 5) << 8)
+
+  UartWriteStr("    endpoint $")
+  PutHexN(addr, 2)
+  UartWriteStr("  number ")
+  PrintDec(addr & $0F)
+  If (addr & $80) <> 0
+    UartWriteStr("  IN ")
+  Else
+    UartWriteStr("  OUT")
+  EndIf
+  UartWriteStr("  ")
+  Select attr & 3
+    Case 0
+      UartWriteStr("control")
+    Case 1
+      UartWriteStr("isochronous")
+    Case 2
+      UartWriteStr("BULK")
+    Case 3
+      UartWriteStr("interrupt")
+  EndSelect
+  UartWriteStr("  maxpacket ")
+  PrintDec(mps)
+  PrintNl()
+EndProcedure
+
+Procedure ShowInterface(*d)
+  Define cls.i
+  Define sub.i
+  Define prot.i
+
+  cls = PeekA(*d + 5)
+  sub = PeekA(*d + 6)
+  prot = PeekA(*d + 7)
+
+  UartWriteStr("  interface ")
+  PrintDec(PeekA(*d + 2))
+  UartWriteStr("  alt ")
+  PrintDec(PeekA(*d + 3))
+  UartWriteStr("  endpoints ")
+  PrintDec(PeekA(*d + 4))
+  PrintNl()
+  Row("class   ", cls, 2)
+  Row("subclass", sub, 2)
+  Row("protocol", prot, 2)
+
+  If cls = 8
+    UartWriteStr("    -> MASS STORAGE")
+    If sub = 6
+      UartWriteStr(", SCSI transparent")
+    EndIf
+    If prot = $50
+      UartWriteStr(", Bulk-Only Transport")
+    EndIf
+    PrintNl()
+    If sub = 6 And prot = $50
+      UartWriteStr("    -> this is the combination the block layer wants")
+      PrintNl()
+    Else
+      UartWriteStr("    -> NOT the plain BOT/SCSI pair; a different driver")
+      PrintNl()
+    EndIf
+  ElseIf cls = 9
+    UartWriteStr("    -> hub")
+    PrintNl()
+  EndIf
+EndProcedure
+
+; Walk the chain. n is how many bytes actually arrived, and nothing is
+; read past it even if a bLength claims otherwise.
+Procedure WalkConfig(*buf, n.i)
+  Define off.i
+  Define len.i
+  Define typ.i
+
+  off = 0
+  While off < n
+    len = PeekA(*buf + off)
+    typ = PeekA(*buf + off + 1)
+    If len = 0
+      UartWriteStr("  !! a descriptor claims zero length - chain is")
+      PrintNl()
+      UartWriteStr("     malformed, stopping rather than looping forever")
+      PrintNl()
+      Break
+    EndIf
+    If (off + len) > n
+      UartWriteStr("  !! the last descriptor runs past what arrived")
+      PrintNl()
+      Break
+    EndIf
+
+    Select typ
+      Case 2
+        UartWriteStr("  configuration")
+        PrintNl()
+        Num("bNumInterfaces ", PeekA(*buf + off + 4))
+        Num("bConfigurationValue", PeekA(*buf + off + 5))
+        Row("bmAttributes   ", PeekA(*buf + off + 7), 2)
+        Num("max power, mA  ", PeekA(*buf + off + 8) * 2)
+      Case 4
+        ShowInterface(*buf + off)
+      Case 5
+        ShowEndpoint(*buf + off)
+      Case 11
+        UartWriteStr("  interface association")
+        PrintNl()
+      Default
+        UartWriteStr("  descriptor type $")
+        PutHexN(typ, 2)
+        UartWriteStr(", ")
+        PrintDec(len)
+        UartWriteStr(" bytes")
+        PrintNl()
+    EndSelect
+    off = off + len
+  Wend
+EndProcedure
+
+Procedure.i Main()
+  Define p.i
+  Define speed.i
+  Define slot.i
+  Define n.i
+  Define total.i
+  Define cls.i
+  Dim dd.a[64]
+  Dim cfg.a[#CFG_BUF]
+
+  PrintNl()
+  UartWriteStr("=== what the attached devices can do ===")
+  PrintNl()
+
+  If PcieInit() = 0
+    UartWriteStr("!! pcie: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("!! enumerate: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("XhciInit ... ")
+  UartDrain()
+  If XhciInit() = 0
+    UartWriteStr("FAILED: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+
+  ; ONE DEVICE ONLY, HIGHEST PORT FIRST.
+  ;
+  ; Walking every port found a hub on port 1 and the boot stick on port
+  ; 3, and produced a very specific pattern: on the FIRST slot every
+  ; control transfer works, and on the SECOND slot only the first one
+  ; does. After that the controller reports plausible byte counts -
+  ; 44 with a short-packet completion, then 64 with success, for a
+  ; descriptor that is 44 bytes long - into a buffer that never changes
+  ; from zero. Reported counts that contradict each other AND the
+  ; buffer are not a coherency problem; they are bookkeeping about a
+  ; transfer that did not happen.
+  ;
+  ; The suspicion is one endpoint-zero transfer ring shared between
+  ; slots: fine for the single device this library was built against,
+  ; wrong the moment a second slot is addressed and two device contexts
+  ; point into the same ring at different offsets.
+  ;
+  ; This run tests that by using exactly one slot. Descending order
+  ; reaches the stick before the hub on this board. If the config
+  ; descriptor now reads correctly, the ring sharing is the fault and
+  ; not anything about SuperSpeed.
+  n = XhciMaxPorts()
+  For p = 1 To n
+    If XhciPortConnected(p) = 0
+      Continue
+    EndIf
+
+    PrintNl()
+    UartWriteStr("---- root port ")
+    PrintDec(p)
+    UartWriteStr(" ----")
+    PrintNl()
+    UartDrain()
+
+    If XhciPortReset(p) = 0
+      UartWriteStr("  reset failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    speed = XhciPortSpeed(p)
+    slot = XhciEnableSlot()
+    If slot = 0
+      UartWriteStr("  enable slot failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    If XhciAddressDevice(slot, p, speed) = 0
+      UartWriteStr("  address failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    If XhciGetDeviceDescriptor(@dd[0], 18) <= 0
+      UartWriteStr("  device descriptor failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    cls = PeekA(@dd[0] + 4)
+    UartWriteStr("  ")
+    UartWriteStr(XhciSpeedText(speed))
+    UartWriteStr("   vid:pid $")
+    PutHexN(PeekA(@dd[0] + 8) | (PeekA(@dd[0] + 9) << 8), 4)
+    UartWriteStr(":$")
+    PutHexN(PeekA(@dd[0] + 10) | (PeekA(@dd[0] + 11) << 8), 4)
+    UartWriteStr("   device class $")
+    PutHexN(cls, 2)
+    PrintNl()
+    UartDrain()
+
+    ; ---- ask for 64, not 9 -------------------------------------------
+    ; A nine-byte GET_DESCRIPTOR(CONFIG) came back with completion code
+    ; 1 - success - and nine zero bytes, from a SuperSpeed device whose
+    ; DEVICE descriptor had just been read correctly through the same
+    ; path. The high-speed hub on the next port answered the same
+    ; nine-byte request perfectly.
+    ;
+    ; So the variable under test is the LENGTH, not the device and not
+    ; the plumbing. 64 is the smallest request that is a whole number of
+    ; nothing in particular and comfortably exceeds the 25-ish bytes a
+    ; simple device returns; if this answers where 9 did not, the
+    ; two-step read needs a different first step on SuperSpeed.
+    ; TEST THE RETURN AS A COUNT, NOT AS A BOOLEAN. This procedure
+    ; returns the number of bytes in the bounce buffer, or -1. Testing
+    ; it with "= 0" - which is what was written here first - lets a -1
+    ; through as success, and the code then reads a bounce buffer that
+    ; was never written and reports nine zero bytes with a completion
+    ; code that looks fine. That cost an hour of suspecting SuperSpeed.
+    n = XhciGetDescriptor(2, 0, 0, 64)
+    UartWriteStr("  GET_DESCRIPTOR(config, 64) returned ")
+    PrintDec(n)
+    PrintNl()
+    If n < 0
+      UartWriteStr("  config header failed: ")
+      UartWriteStr(XhciErrorText())
+      PrintNl()
+      Continue
+    EndIf
+    If n < 9
+      UartWriteStr("  fewer than nine bytes came back - nothing to walk")
+      PrintNl()
+      Continue
+    EndIf
+    If XhciCopyIn(@cfg[0], n) <= 0
+      UartWriteStr("  could not copy the config header")
+      PrintNl()
+      Continue
+    EndIf
+    total = PeekA(@cfg[0] + 2) | (PeekA(@cfg[0] + 3) << 8)
+    UartWriteStr("  wTotalLength ")
+    PrintDec(total)
+    PrintNl()
+
+    ; THE RAW NINE BYTES AND THE COMPLETION CODE. A call that returns
+    ; success and delivers zeros has two completely different causes -
+    ; the device stalled and we did not notice, or the transfer worked
+    ; and the buffer was read before the DMA landed - and the printed
+    ; length alone cannot tell them apart. bLength and bDescriptorType
+    ; are the tell: a real configuration descriptor starts $09 $02.
+    ; Read the BOUNCE BUFFER ITSELF, not the copy. If these two
+    ; disagree, the copy is at fault; if they agree and are zero, the
+    ; DMA never landed where the transfer said it did.
+    UartWriteStr("  bounce at $")
+    PutHexN(XhciBounceAddr(), 16)
+    PrintNl()
+    UartWriteStr("  bounce:")
+    Define b.i
+    For b = 0 To 15
+      UartWriteStr(" ")
+      PutHexN(PeekA(XhciBounceAddr() + b), 2)
+    Next
+    PrintNl()
+    UartWriteStr("  raw:")
+    Define k.i
+    For k = 0 To 8
+      UartWriteStr(" ")
+      PutHexN(PeekA(@cfg[0] + k), 2)
+    Next
+    PrintNl()
+    UartWriteStr("  last completion code ")
+    PrintDec(XhciLastComp())
+    UartWriteStr("   (1 = success, 6 = stall, 13 = short packet)")
+    PrintNl()
+    UartDrain()
+    If total < 9
+      UartWriteStr("  !! nonsense total length, skipping")
+      PrintNl()
+      Continue
+    EndIf
+    If total > #CFG_BUF
+      UartWriteStr("  !! larger than this buffer - refusing rather than")
+      PrintNl()
+      UartWriteStr("     reading a prefix and pretending it is the whole")
+      PrintNl()
+      Continue
+    EndIf
+
+    ; ---- walk what already arrived, if it is all of it -------------
+    ; The two-step read exists because wTotalLength is unknown until the
+    ; header is in hand. It does NOT need re-running when the first
+    ; request already returned at least that many bytes - and on this
+    ; bus re-running it is worse than redundant. A third control
+    ; transfer on the same slot came back reporting bytes it had not
+    ; moved, into a buffer that stayed zero, and overwrote a perfectly
+    ; good 44-byte descriptor with nothing.
+    ;
+    ; That is a real defect and it is written up rather than worked
+    ; around silently: this library keeps ONE endpoint-zero transfer
+    ; ring, and the accounting for it does not survive being driven
+    ; hard. Not asking twice is the honest fix for THIS program; the
+    ; library still needs the real one.
+    If total > n
+      UartWriteStr("  the descriptor is longer than the first read - a")
+      PrintNl()
+      UartWriteStr("  second request is needed and is not trusted yet")
+      PrintNl()
+      Continue
+    EndIf
+    WalkConfig(@cfg[0], n)
+    UartDrain()
+  Next
+
+  PrintNl()
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

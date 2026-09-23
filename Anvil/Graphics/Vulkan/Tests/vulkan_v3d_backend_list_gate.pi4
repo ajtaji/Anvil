@@ -1,0 +1,389 @@
+; Desk-only emitted gate for the atomic V3D draw-list backend.
+; It links the production backend against deterministic Neon/V3D seams: no
+; MMIO, no board, and every cache range and BCL packet remains observable.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+
+#ANVIL_VK_MAX_PIPELINES = 4
+#ANVIL_VK_MAX_RECORDED_DRAWS = 4096
+#V3D_OK = 0
+#V3D_ERR_CL_ARGS = 27
+#NEON_OK = 0
+#NEON_ERR_LIST = 12
+#V3D_OFMT_RGBA8 = 1
+#V3D_BF_SRC_ALPHA = 6
+#V3D_BF_INV_SRC_ALPHA = 7
+#V3D_BM_ADD = 0
+#AVKQ_BYTES = 8192
+#AVKQ_DRAW_SLOT_BYTES = 896
+#AVKQ_DRAW_OFF_SHREC = 0
+#AVKQ_OFF_SHREC = 3840
+#AVKQ_PRIM_TRIANGLES = 4
+#GATE_STRESS_DRAWS = 3505
+
+Global Dim avkqVaryComps.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim gatePipeBase.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global gateReady.i = 1
+Global gateBclBytes.i = 1000000
+Global gateSurfaceBase.i = $01000000
+Global gateSurfaceBytes.i = $10000
+Global gateSurfaceW.i = 64
+Global gateSurfaceH.i = 64
+Global gateSurfacePitch.i = 256
+Global gateSurfaceFormat.i = #V3D_OFMT_RGBA8
+Global gateSurfaceRotation.i = 0
+Global gateArenaBase.i = $03000000
+Global gateArenaBytes.i
+Global gateAlloc.i
+Global gateFree.i
+Global gateRebind.i
+Global gateBegin.i
+Global gateEnd.i
+Global gateClError.i
+Global gateCache.i
+Global gateLastCacheAddr.i
+Global gateLastCacheBytes.i
+Global gateSlotCache.i
+Global gateVertexCache.i
+Global gateVertexFirst0.i
+Global gateVertexBytes0.i
+Global gateVertexFirst1.i
+Global gateVertexBytes1.i
+Global gateViewportScale.i
+Global gateViewportOffset.i
+Global gateClip.i
+Global gateClipX.i
+Global gateClipY.i
+Global gateClipW.i
+Global gateClipH.i
+Global gateCfg.i
+Global gateBlendEnable.i
+Global gateBlendCfg.i
+Global gateVary.i
+Global gateShader.i
+Global gatePrim.i
+Global gateIndexed.i
+Global gateIndexSetup.i
+Global gateIndexBase.i
+Global gateIndexBytes.i
+Global gateIndexType.i
+Global gateIndexOffset.i
+Global gateIndexCount.i
+Global gateBuildMax.i
+Global gatePrepare.i
+Global gateBuild.i
+Global Dim gateUseUbo.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim gateUseSample.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim gateCacheAddr.i[32]
+Global Dim gateCacheBytes.i[32]
+Global gateCacheBatchOpen.i
+Global gateCacheBatchRanges.i
+Global gateCacheBatchBarriers.i
+
+Procedure.i V3dTfuBegin(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTfuSourceRaster(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTfuDest(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTfuWait(a.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dError() : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dCounterHz() : ProcedureReturn 54000000 : EndProcedure
+Procedure.i V3dTicks() : ProcedureReturn 0 : EndProcedure
+
+Procedure GateCacheObserve(addr.i, bytes.i)
+  gateCache = gateCache + 1
+  If gateCache <= 32 : gateCacheAddr[gateCache-1]=addr : gateCacheBytes[gateCache-1]=bytes : EndIf
+  gateLastCacheAddr = addr : gateLastCacheBytes = bytes
+  If addr >= gateArenaBase And addr < gateArenaBase + gateArenaBytes
+    gateSlotCache = gateSlotCache + 1
+  ElseIf addr >= $02200000 And addr < $02300000
+    gateVertexCache = gateVertexCache + 1
+    If gateVertexCache = 1 : gateVertexFirst0 = addr : gateVertexBytes0 = bytes : EndIf
+    If gateVertexCache = 2 : gateVertexFirst1 = addr : gateVertexBytes1 = bytes : EndIf
+  EndIf
+EndProcedure
+
+Procedure V3dCacheRange(addr.i, bytes.i)
+  GateCacheObserve(addr, bytes)
+EndProcedure
+
+Procedure.i V3dCacheBatchBegin()
+  If gateCacheBatchOpen <> 0 : ProcedureReturn 0 : EndIf
+  gateCacheBatchOpen = 1 : gateCacheBatchRanges = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i V3dCacheBatchRange(addr.i, bytes.i)
+  If gateCacheBatchOpen = 0 Or bytes <= 0 : ProcedureReturn 0 : EndIf
+  GateCacheObserve(addr, bytes)
+  gateCacheBatchRanges = gateCacheBatchRanges + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i V3dCacheBatchEnd()
+  Define ranges.i
+  If gateCacheBatchOpen = 0 : ProcedureReturn -1 : EndIf
+  ranges = gateCacheBatchRanges
+  gateCacheBatchOpen = 0 : gateCacheBatchRanges = 0
+  If ranges > 0 : gateCacheBatchBarriers = gateCacheBatchBarriers + 1 : EndIf
+  ProcedureReturn ranges
+EndProcedure
+
+Procedure.i V3dCfgBitsWord(a.i,b.i,c.i,d.i) : ProcedureReturn 3 | (d << 12) : EndProcedure
+Procedure V3dClClipperXyScaling(a.i,b.i) : gateViewportScale = gateViewportScale + 1 : EndProcedure
+Procedure V3dClClipWindow(a.i,b.i,c.i,d.i)
+  gateClip=gateClip+1 : gateClipX=a : gateClipY=b : gateClipW=c : gateClipH=d
+EndProcedure
+Procedure V3dClViewportOffset(a.i,b.i,c.i,d.i) : gateViewportOffset = gateViewportOffset + 1 : EndProcedure
+Procedure V3dClCfgBits(a.i) : gateCfg = gateCfg + 1 : EndProcedure
+Procedure V3dClBlendEnables(a.i) : gateBlendEnable = gateBlendEnable + 1 : EndProcedure
+Procedure V3dClBlendCfg(a.i,b.i,c.i,d.i,e.i,f.i,g.i) : gateBlendCfg = gateBlendCfg + 1 : EndProcedure
+Procedure V3dClNonperspFlags(a.i) : gateVary = gateVary + 1 : EndProcedure
+Procedure V3dClGlShaderState(a.i,b.i) : gateShader = gateShader + 1 : EndProcedure
+Procedure V3dClVertexArrayPrims(a.i,b.i,c.i) : gatePrim = gatePrim + 1 : EndProcedure
+Procedure V3dClIndexBufferSetup(a.i,b.i)
+  gateIndexSetup=gateIndexSetup+1 : gateIndexBase=a : gateIndexBytes=b
+EndProcedure
+Procedure V3dClIndexedPrims(a.i,b.i,c.i,d.i)
+  gateIndexed=gateIndexed+1 : gateIndexCount=b : gateIndexType=c : gateIndexOffset=d
+EndProcedure
+Procedure.i V3dClError() : ProcedureReturn gateClError : EndProcedure
+
+Procedure.i Neon_Ready() : ProcedureReturn gateReady : EndProcedure
+Procedure.i Neon_Error() : ProcedureReturn 0 : EndProcedure
+Procedure.i Neon_BclBytes() : ProcedureReturn gateBclBytes : EndProcedure
+Procedure.i Neon_CapacityPhysicalW() : ProcedureReturn 4096 : EndProcedure
+Procedure.i Neon_CapacityPhysicalH() : ProcedureReturn 4096 : EndProcedure
+Procedure.i Neon_SurfaceBase() : ProcedureReturn gateSurfaceBase : EndProcedure
+Procedure.i Neon_SurfaceBytes() : ProcedureReturn gateSurfaceBytes : EndProcedure
+Procedure.i Neon_SurfaceW() : ProcedureReturn gateSurfaceW : EndProcedure
+Procedure.i Neon_SurfaceH() : ProcedureReturn gateSurfaceH : EndProcedure
+Procedure.i Neon_SurfacePitch() : ProcedureReturn gateSurfacePitch : EndProcedure
+Procedure.i Neon_SurfaceFormat() : ProcedureReturn gateSurfaceFormat : EndProcedure
+Procedure.i Neon_SurfaceRotation() : ProcedureReturn gateSurfaceRotation : EndProcedure
+Procedure.i NeonRebindSurface(base.i,w.i,h.i,pitch.i,bytes.i,fmt.i,rot.i)
+  gateRebind = gateRebind + 1
+  gateSurfaceBase=base : gateSurfaceW=w : gateSurfaceH=h : gateSurfacePitch=pitch
+  gateSurfaceBytes=bytes : gateSurfaceFormat=fmt : gateSurfaceRotation=rot
+  ProcedureReturn #NEON_OK
+EndProcedure
+Procedure.i NeonFrameBegin(c.i) : gateBegin = gateBegin + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NeonFrameEnd() : gateEnd = gateEnd + 1 : ProcedureReturn #NEON_OK : EndProcedure
+
+Procedure.i avkHeapBind() : ProcedureReturn #VK_SUCCESS : EndProcedure
+Procedure.i avkInternalAlloc(bytes.i)
+  gateAlloc = gateAlloc + 1 : gateArenaBytes = bytes : ProcedureReturn 1
+EndProcedure
+Procedure.i avkInternalBase(s.i) : ProcedureReturn gateArenaBase : EndProcedure
+Procedure avkInternalFree(s.i)
+  gateFree = gateFree + 1
+  ; A freed draw arena is immediately poisonous. The public diagnostic record
+  ; must remain intact because it is a stable backend-owned snapshot.
+  If gateArenaBytes >= #AVKQ_DRAW_SLOT_BYTES
+    PokeA(gateArenaBase + gateArenaBytes - #AVKQ_DRAW_SLOT_BYTES, $EE)
+    PokeA(gateArenaBase + gateArenaBytes - #AVKQ_DRAW_SLOT_BYTES + 63, $EE)
+  EndIf
+EndProcedure
+
+Procedure.i AnvilVkPipelineViewportWidth(p.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkPipelineViewportHeight(p.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkPipelineDynamicViewport(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i avkqF32FromInt(v.i) : If v=8192 : ProcedureReturn $46000000 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineUsesPushConstants(p.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineUsesUniformBuffer(p.i) : ProcedureReturn gateUseUbo[p] : EndProcedure
+Procedure.i AnvilVkPipelineUsesSampledImage(p.i) : ProcedureReturn gateUseSample[p] : EndProcedure
+Procedure.i AnvilVkV3dViewportHalfWidthBits(p.i) : ProcedureReturn $42000000 + p : EndProcedure
+Procedure.i AnvilVkV3dViewportHalfHeightBits(p.i) : ProcedureReturn $42000000 + p : EndProcedure
+Procedure.i AnvilVkV3dViewportHalfWidthFine(p.i) : ProcedureReturn $2000 + p : EndProcedure
+Procedure.i AnvilVkV3dViewportHalfHeightFine(p.i) : ProcedureReturn $2000 + p : EndProcedure
+Procedure.i AnvilVkV3dCodeBase(p.i) : ProcedureReturn gatePipeBase[p] : EndProcedure
+Procedure.i AnvilVkV3dRecordCount(p.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilVkV3dVaryingComponents(p.i) : ProcedureReturn avkqVaryComps[p] : EndProcedure
+Procedure.i AnvilVkV3dPipelineBytes() : ProcedureReturn #AVKQ_BYTES : EndProcedure
+Procedure.i AnvilVkV3dCompile(*b.AnvilVkBackendPipelineBuildInfo) : ProcedureReturn #VK_SUCCESS : EndProcedure
+Procedure AnvilVkV3dRelease(p.i) : EndProcedure
+Procedure.i AnvilVkV3dDrawArenaBytes(n.i)
+  If n < 1 Or n > 4096 : ProcedureReturn 0 : EndIf
+  ProcedureReturn n * #AVKQ_DRAW_SLOT_BYTES
+EndProcedure
+Procedure.i AnvilVkV3dDrawSlotBase(base.i, bytes.i, k.i)
+  If base <= 0 Or (base & 63) <> 0 Or k < 0 Or k >= (bytes / #AVKQ_DRAW_SLOT_BYTES) : ProcedureReturn 0 : EndIf
+  ProcedureReturn base + k * #AVKQ_DRAW_SLOT_BYTES
+EndProcedure
+Procedure.i AnvilVkV3dPrepareClosedDrawSlot(p.i,pb.i,db.i,*d.AnvilVkBackendDraw) : gatePrepare=gatePrepare+1 : ProcedureReturn #VK_SUCCESS : EndProcedure
+Procedure.i AnvilVkV3dBuildDrawSlotRecord(p.i,pb.i,db.i,*d.AnvilVkBackendDraw,m.i,v.i)
+  gateBuild=gateBuild+1 : gateBuildMax=m : PokeA(db,$A5) : PokeA(db+63,$5A) : ProcedureReturn #V3D_OK
+EndProcedure
+Procedure.i AnvilVkV3dDrawLiveRecordBytes(p.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkV3dDrawCacheRangeCount(p.i) : ProcedureReturn 2 : EndProcedure
+Procedure.i AnvilVkV3dDrawCacheRangeOffset(p.i,k.i) : If k=0 : ProcedureReturn 0 : EndIf : ProcedureReturn 320 : EndProcedure
+Procedure.i AnvilVkV3dDrawCacheRangeBytes(p.i,k.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkV3dFragmentUniforms(a.i,b.i,c.i,d.i,e.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkV3dBuildRecord(a.i,b.i,c.i,d.i,e.i) : ProcedureReturn 0 : EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#OUT = $07000000
+#MAGIC = $564C3344
+Global Dim draws.AnvilVkBackendDraw[4096]
+Global Dim binds.AnvilVkBackendBinding[4096]
+Global list.AnvilVkBackendDrawList
+Global atlas.AnvilVkBackendSampledImage
+
+Procedure Put(k.i,v.i) : PokeI(#OUT + k*8,v) : EndProcedure
+Procedure ResetObs()
+  gateAlloc=0 : gateFree=0 : gateRebind=0 : gateBegin=0 : gateEnd=0
+  gateCache=0 : gateSlotCache=0 : gateVertexCache=0
+  gateCacheBatchOpen=0 : gateCacheBatchRanges=0 : gateCacheBatchBarriers=0
+  gateViewportScale=0 : gateViewportOffset=0 : gateCfg=0 : gateBlendEnable=0
+  gateClip=0 : gateClipX=0 : gateClipY=0 : gateClipW=0 : gateClipH=0
+  gateBlendCfg=0 : gateVary=0 : gateShader=0 : gatePrim=0 : gateClError=0
+  gateIndexed=0 : gateIndexSetup=0 : gateIndexBase=0 : gateIndexBytes=0
+  gateIndexType=0 : gateIndexOffset=0 : gateIndexCount=0
+  gatePrepare=0 : gateBuild=0 : gateBuildMax=0
+EndProcedure
+Procedure Fill(n.i, mask.i)
+  Define i.i
+  While i<n
+    binds[i]\base=$02200000 : binds[i]\stride=16
+    draws[i]\pipeline=1 : draws[i]\targetBase=$02000000 : draws[i]\targetBytes=$10000
+    draws[i]\width=64 : draws[i]\height=64 : draws[i]\pitch=256 : draws[i]\clearBgra=$FF112233
+    draws[i]\viewportX=0 : draws[i]\viewportY=0 : draws[i]\viewportW=64 : draws[i]\viewportH=64
+    draws[i]\bindingCount=1 : draws[i]\bindings=@binds[i]
+    draws[i]\vertexCount=3 : draws[i]\firstVertex=i*3 : draws[i]\sampleMask=mask
+    draws[i]\indexBase=0 : draws[i]\indexBytes=0 : draws[i]\indexType=0
+    draws[i]\maxVertex=i*3+2
+    draws[i]\pushBase=0 : draws[i]\pushBytes=0
+    draws[i]\uniformBase=0 : draws[i]\uniformBytes=0 : draws[i]\sampledImage=0
+    draws[i]\blendMode=#ANVIL_VK_BLEND_DISABLED
+    draws[i]\scissorX=0 : draws[i]\scissorY=0 : draws[i]\scissorW=64 : draws[i]\scissorH=64
+    i=i+1
+  Wend
+  list\drawCount=n : list\draws=@draws[0]
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define b0.i
+  Define build.AnvilVkBackendPipelineBuildInfo
+  gatePipeBase[1]=$02400000 : gatePipeBase[2]=$02500000 : gatePipeBase[3]=$02600000
+  avkqVaryComps[1]=0 : avkqVaryComps[2]=2
+  AnvilVkV3dWindow($02000000,$02000000)
+  Put(0,#MAGIC) : Put(1,Bool((avkBackendCaps() & #ANVIL_VK_CAP_DRAW_LIST)<>0))
+  ResetObs() : build\pipeline=1 : build\base=$02400000 : build\bytes=#AVKQ_BYTES
+  build\vertexIr=1 : build\fragmentIr=1 : rc=avkBackendPipelineBuild(@build)
+  Put(50,rc) : Put(51,gateCache) : Put(52,gateLastCacheAddr) : Put(53,gateLastCacheBytes)
+
+  Fill(1,1) : ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(2,rc) : Put(3,gateBegin) : Put(4,gateEnd) : Put(5,gateRebind) : Put(6,gateAlloc) : Put(7,gateFree) : Put(8,gatePrim)
+  Put(97,gateCacheBatchBarriers)
+
+  Fill(3,1) : draws[0]\firstVertex=1 : draws[0]\vertexCount=2
+  draws[1]\firstVertex=3 : draws[1]\vertexCount=2 : draws[1]\maxVertex=4 : draws[1]\sampleMask=0 : draws[1]\pipeline=2 : draws[1]\blendMode=#ANVIL_VK_BLEND_SRC_OVER
+  draws[2]\firstVertex=3 : draws[2]\vertexCount=2 : draws[2]\maxVertex=4 : draws[2]\pipeline=2 : draws[2]\blendMode=#ANVIL_VK_BLEND_SRC_OVER
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(9,rc) : Put(10,gatePrim) : Put(11,gateShader) : Put(12,gateViewportScale)
+  Put(13,gateCfg) : Put(14,gateBlendEnable) : Put(15,gateBlendCfg) : Put(16,gateVary)
+  Put(17,gateSlotCache) : Put(18,gateVertexCache) : Put(19,gateVertexFirst0) : Put(20,gateVertexBytes0)
+  Put(21,gateVertexFirst1) : Put(22,gateVertexBytes1)
+
+  ; This is the acceleration stress, not admission-only: every draw closes a
+  ; slot, participates in the physical cache union and emits one primitive.
+  Fill(#GATE_STRESS_DRAWS,1) : ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(23,rc) : Put(24,gateArenaBytes) : Put(25,gatePrim) : Put(26,gateBegin) : Put(27,gateFree)
+  Put(71,gatePrepare) : Put(72,gateBuild) : Put(73,gateShader)
+  Put(74,gateCache) : Put(75,AnvilVkV3dLastCacheInputRangeCount()) : Put(76,AnvilVkV3dLastCacheMergedRangeCount())
+  Put(77,gateSlotCache) : Put(78,gateVertexCache) : Put(79,gateViewportScale)
+  Put(98,gateCacheBatchBarriers)
+
+  ; Full -> partial -> identical partial -> clipped negative/right-bottom.
+  ; Only real normalized changes emit CLIP_WINDOW.
+  Fill(4,1)
+  draws[1]\scissorX=10 : draws[1]\scissorY=11 : draws[1]\scissorW=20 : draws[1]\scissorH=21
+  draws[2]\scissorX=10 : draws[2]\scissorY=11 : draws[2]\scissorW=20 : draws[2]\scissorH=21
+  draws[3]\scissorX=-5 : draws[3]\scissorY=60 : draws[3]\scissorW=10 : draws[3]\scissorH=10
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(80,rc) : Put(81,gateClip) : Put(82,gateClipX) : Put(83,gateClipY) : Put(84,gateClipW) : Put(85,gateClipH)
+  Put(86,AnvilVkV3dLastScissorTransitionCount()) : Put(87,gatePrim)
+
+  ; Extreme legal registry fields are intersected without offset+extent wrap.
+  Fill(1,1) : draws[0]\scissorX=-2147483648 : draws[0]\scissorY=-2147483648
+  draws[0]\scissorW=$80000002 : draws[0]\scissorH=$80000003
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(88,rc) : Put(89,gateClip) : Put(90,gateClipX) : Put(91,gateClipY) : Put(92,gateClipW) : Put(93,gateClipH)
+
+  ; A value outside the registry field widths is a hostile seam record and
+  ; is refused atomically before allocation or frame begin.
+  Fill(1,1) : draws[0]\scissorW=$100000000
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(94,rc) : Put(95,gateBegin) : Put(96,gateAlloc)
+  Fill(4096,0) : ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(28,rc) : Put(29,gateArenaBytes) : Put(30,gatePrim) : Put(31,gateBegin) : Put(32,gateFree)
+  Put(48,avkBackendLastNativeError()) : Put(49,AnvilVkFaultCode())
+
+  Fill(3,1) : b0=gateBegin : draws[1]\pipeline=4 : ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(33,rc) : Put(34,gateBegin) : Put(35,gateAlloc)
+  Fill(1,1) : draws[0]\firstVertex=$FFFFFFFF : draws[0]\vertexCount=2
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(36,rc) : Put(37,gateBegin) : Put(38,gateAlloc)
+  Fill(1,1) : draws[0]\firstVertex=-1
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(54,rc) : Put(55,gateBegin) : Put(56,gateAlloc)
+  Fill(1,1) : gateBclBytes=8200 : ResetObs() : rc=avkBackendSubmitDraw(@list) : gateBclBytes=1000000
+  Put(39,rc) : Put(40,gateBegin) : Put(41,gateAlloc)
+  Fill(1,1) : ResetObs() : gateClError=27 : rc=avkBackendSubmitDraw(@list)
+  Put(42,rc) : Put(43,gateBegin) : Put(44,gateEnd) : Put(45,gateRebind) : Put(46,gateFree) : Put(47,avkBackendJobs())
+
+  ; Physical alias fixture. Three logically different bindings overlap into
+  ; [02200000,02200070); one shared UBO and one shared atlas are adjacent and
+  ; overlap across all records into [02201000,02201014). Six separated slot
+  ; spans remain distinct. Fifteen exact inputs therefore become eight calls.
+  Fill(3,1) : gateUseUbo[3]=1 : gateUseSample[3]=1
+  atlas\base=$02201010 : atlas\bytes=4 : atlas\width=1 : atlas\height=1 : atlas\pitch=4
+  atlas\format=#VK_FORMAT_B8G8R8A8_UNORM : atlas\tiling=#VK_IMAGE_TILING_LINEAR
+  atlas\layout=#VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  atlas\magFilter=#VK_FILTER_NEAREST : atlas\minFilter=#VK_FILTER_NEAREST
+  draws[0]\pipeline=3 : draws[0]\uniformBase=$02201000 : draws[0]\uniformBytes=16 : draws[0]\sampledImage=@atlas
+  draws[1]\pipeline=3 : draws[1]\uniformBase=$02201000 : draws[1]\uniformBytes=16 : draws[1]\sampledImage=@atlas
+  draws[2]\pipeline=3 : draws[2]\uniformBase=$02201000 : draws[2]\uniformBytes=16 : draws[2]\sampledImage=@atlas
+  binds[0]\base=$02200000 : binds[0]\stride=16 : draws[0]\firstVertex=0
+  binds[1]\base=$02200010 : binds[1]\stride=8 : draws[1]\firstVertex=4 : draws[1]\maxVertex=6
+  binds[2]\base=$02200040 : binds[2]\stride=16 : draws[2]\firstVertex=0 : draws[2]\maxVertex=2
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(61,rc) : Put(62,AnvilVkV3dLastCacheInputRangeCount()) : Put(63,AnvilVkV3dLastCacheMergedRangeCount())
+  Put(64,gateCache) : Put(65,gateCacheAddr[0]) : Put(66,gateCacheBytes[0])
+  Put(67,gateCacheAddr[1]) : Put(68,gateCacheBytes[1]) : Put(69,gateSlotCache)
+  Put(70,AnvilVkV3dLastResourceCacheRangeCount())
+  Put(99,gateCacheBatchBarriers)
+  Put(57,AnvilVkV3dLastShaderRecord()) : Put(58,AnvilVkV3dLastShaderRecordBytes())
+  Put(59,PeekA(AnvilVkV3dLastShaderRecord()) & $FF)
+  Put(60,PeekA(AnvilVkV3dLastShaderRecord()+63) & $FF)
+
+  ; Indexed closure: INDEX_BUFFER_SETUP owns the bind base and complete byte
+  ; bound. firstIndex appears exactly once as the byte offset in the indexed
+  ; primitive, and the independently scanned maxVertex bounds the draw slot
+  ; and vertex fetch/cache span.
+  Fill(1,1) : draws[0]\indexBase=$02202000 : draws[0]\indexBytes=32
+  draws[0]\indexType=#VK_INDEX_TYPE_UINT16 : draws[0]\firstVertex=2
+  draws[0]\vertexCount=3 : draws[0]\maxVertex=2
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(100,rc) : Put(101,gatePrim) : Put(102,gateIndexed) : Put(103,gateIndexSetup)
+  Put(104,gateIndexBase) : Put(105,gateIndexBytes) : Put(106,gateIndexType)
+  Put(107,gateIndexOffset) : Put(108,gateIndexCount) : Put(109,gateBuildMax)
+  Put(110,AnvilVkV3dLastCacheInputRangeCount())
+  Put(111,AnvilVkV3dLastResourceCacheRangeCount())
+  Put(118,gateCacheAddr[1]) : Put(119,gateCacheBytes[1])
+
+  ; A selected index range outside setup size and a scanned max vertex beyond
+  ; the mapped vertex window both refuse before allocation or frame begin.
+  Fill(1,1) : draws[0]\indexBase=$02202000 : draws[0]\indexBytes=32
+  draws[0]\indexType=#VK_INDEX_TYPE_UINT16 : draws[0]\firstVertex=15
+  draws[0]\vertexCount=3 : draws[0]\maxVertex=2
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(112,rc) : Put(113,gateBegin) : Put(114,gateAlloc)
+  Fill(1,1) : draws[0]\indexBase=$02202000 : draws[0]\indexBytes=32
+  draws[0]\indexType=#VK_INDEX_TYPE_UINT16 : draws[0]\firstVertex=0
+  draws[0]\vertexCount=3 : draws[0]\maxVertex=$200000
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(115,rc) : Put(116,gateBegin) : Put(117,gateAlloc)
+  ProcedureReturn #OUT
+EndProcedure

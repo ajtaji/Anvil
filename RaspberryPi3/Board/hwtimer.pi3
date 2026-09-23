@@ -1,0 +1,189 @@
+; ======================================================================
+;  hwtimer.pi3 - the Raspberry Pi 3's implementation of THE TIME seam.
+;
+;  The seam is declared in Anvil/Hal/hal.pbi under THE TIME: Ticks,
+;  TickHz, TimerInit, Micros, millis, delayMicroseconds, delay and
+;  HwMicros. Anvil/Core/wallclock.pbi anchors UTC to it,
+;  Anvil/Storage/hwfile.pbi stamps every file it writes with the result,
+;  Anvil/Core/netconsole.pbi paces its datagrams with it, and
+;  Anvil/Hal/abi.pbi hands a payload the microseconds. None of them names
+;  a chip.
+;
+;  IT IMPLEMENTS THE DECLARED SEAM AND ADDS NO CONVENTION OF ITS OWN.
+;  That is the whole reason this file exists rather than the board simply
+;  calling Pi3Micros() where it needs a time: the tree already had the
+;  same generic-timer read in twenty-odd private copies under twenty-odd
+;  private names, and they had begun to diverge. This board's own
+;  RaspberryPi3/Lib/timer.pbi is one of them - Pi3Micros and Pi3DelayUs -
+;  and it stays exactly as it is, because the immutable loader is built
+;  from it and it is proven on silicon. What changes is that nothing
+;  ABOVE this file has to know those names.
+;
+; ----------------------------------------------------------------------
+;  THIS IS THE ONE PLACE THE Pi 3 IS SIMPLER THAN EVERY OTHER BOARD
+; ----------------------------------------------------------------------
+;  The BCM2837's system timer is a free-running 64-bit counter at exactly
+;  1 MHz - the peripherals document says so rather than leaving it to be
+;  measured. So a tick IS a microsecond, TickHz() is a constant that
+;  happens to be true, and every conversion below is either nothing at
+;  all or a divide by a thousand.
+;
+;  The other boards read the AArch64 generic timer - 54 MHz on one part,
+;  19.2 MHz on another - and must convert, with the overflow the seam's
+;  declaration warns about: ticks * 1000000 overflows a signed 64-bit
+;  value after about fifteen minutes at 19.2 MHz, which is exactly long
+;  enough for a bench session to look fine. There is nothing here to get
+;  wrong and nothing to measure.
+;
+;  IT IS A CONSTANT AND NOT A MEASUREMENT, which is worth one sentence: if
+;  a future part in this family clocked its system timer differently, this
+;  number would be wrong and would look right. What guards against that is
+;  the target - this file only ever compiles for BCM2837 - and not a
+;  run-time check, because there is no register that reports the system
+;  timer's rate to check a constant against.
+;
+;  WHY NOT THE GENERIC TIMER, which this part also has. Two reasons and
+;  the second is the one that decides it. CNTFRQ_EL0 on a Pi 3 is whatever
+;  the firmware wrote into it and is a value this monitor would have to
+;  trust rather than know. And the system timer is ALREADY RUNNING AND
+;  ALREADY TRUSTED here: the immutable loader times its three-second
+;  recovery window on it, the SD host times its transfers on it, and the
+;  never-fed watchdog this monitor has fifteen seconds to release is
+;  measured against the same clock. Using a different counter for the
+;  monitor's own time than the one the boot chain used would put two
+;  clocks in one boot for no gain.
+;
+; ----------------------------------------------------------------------
+;  DEPENDENCIES: RaspberryPi3/Lib/timer.pbi (Pi3Micros) must be included
+;  before this file. House rule 10: this file includes nothing itself.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Ticks() - the raw monotonic count. Microseconds, here.
+;
+;  NEVER BACKWARDS AND NEVER NEGATIVE. Pi3Micros() reads the counter's
+;  high word twice and retries if it changed between them, so a read that
+;  straddles the low word wrapping is discarded rather than returned as a
+;  number that jumps by an hour. It answers -1 when eight attempts all
+;  straddled, which cannot happen with a running timer and would mean the
+;  timer has stopped; the seam says a reader that cannot get a coherent
+;  value answers 0, so that is what happens to the -1.
+; ----------------------------------------------------------------------
+Procedure.i Ticks()
+  Define t.i
+  t = Pi3Micros()
+  If t < 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; One tick is one microsecond on this part. See the header for why this
+; is a constant and what would make it a lie.
+Procedure.i TickHz()
+  ProcedureReturn 1000000
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TimerInit() - nothing to do, and saying so beats an empty procedure.
+;
+;  The system timer is running before the firmware hands the ARM over.
+;  Every early diagnostic in this tree reads it without preparing it, and
+;  the immutable loader's recovery window is timed by it before this
+;  monitor exists. There is no enable bit, no clock gate and no divisor
+;  to program, so the honest answer is 1 rather than a procedure that
+;  looks like it did something.
+; ----------------------------------------------------------------------
+Procedure.i TimerInit()
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Micros() - microseconds since the counter's origin.
+;
+;  NO CONVERSION AT ALL, because a tick is a microsecond here. On the
+;  other boards this is a divide with an overflow trap in it; here the
+;  only thing to get right is the stopped-clock case, and Ticks() has
+;  already turned that into a 0.
+; ----------------------------------------------------------------------
+Procedure.i Micros()
+  ProcedureReturn Ticks()
+EndProcedure
+
+; Milliseconds. One exact divide; 1000000 / 1000 leaves no remainder to
+; round away.
+Procedure.i millis()
+  ProcedureReturn Ticks() / 1000
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  delayMicroseconds(us) - wait, measured against the counter.
+;
+;  1 if the wait completed, 0 if it gave up because the counter was not
+;  advancing. A ZERO OR NEGATIVE ARGUMENT RETURNS 0, which is the seam's
+;  contract and not this board's opinion.
+;
+;  IT DOES NOT CALL Pi3DelayUs(), and that is deliberate rather than
+;  wasteful. That procedure refuses anything above one second, which is
+;  right for the early diagnostics it was written for and wrong for a
+;  general wait; wrapping it would mean a caller asking for two seconds
+;  getting an immediate 0 that looks like a stopped clock.
+;
+;  THE BOUND IS A REAL ONE AND IT IS NOT THE DEADLINE. The loop gives up
+;  after a fixed number of reads as well as at the deadline, so a counter
+;  that has stopped is detected by the count rather than by waiting for a
+;  deadline that can never arrive. A monitor that spun for ever inside a
+;  wait would be reset by the loader's watchdog with nothing printed.
+; ----------------------------------------------------------------------
+Procedure.i delayMicroseconds(us.i)
+  Define start.i
+  Define now.i
+  Define n.i
+
+  If us <= 0
+    ProcedureReturn 0
+  EndIf
+  start = Pi3Micros()
+  If start < 0
+    ProcedureReturn 0                  ; no clock - do not pretend to wait
+  EndIf
+  For n = 0 To 99999999
+    now = Pi3Micros()
+    If now < 0 Or now < start
+      ProcedureReturn 0                ; it stopped, or went backwards
+    EndIf
+    If now - start >= us
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  delay(ms) - milliseconds.
+;
+;  IT ANSWERS 1 FOR A ZERO ARGUMENT WHILE delayMicroseconds(0) ANSWERS 0.
+;  That reads like a defect and the seam's declaration says it is a
+;  CONTRACT: both names are called across the fleet and the pair behaves
+;  this way on every part that has them. Copied rather than tidied. Fix
+;  it in every implementation or in none.
+; ----------------------------------------------------------------------
+Procedure.i delay(ms.i)
+  If ms <= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn delayMicroseconds(ms * 1000)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwMicros() - the same microseconds, under the name the payload ABI
+;  asks a board for.
+;
+;  IT IS Micros() AND NOT A SECOND READ. Two entry points that each read
+;  the counter their own way is how a payload and the monitor end up
+;  disagreeing about what time it is; there is one source here and this
+;  is a name for it.
+; ----------------------------------------------------------------------
+Procedure.i HwMicros()
+  ProcedureReturn Micros()
+EndProcedure

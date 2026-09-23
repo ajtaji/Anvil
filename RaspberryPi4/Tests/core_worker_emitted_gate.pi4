@@ -1,0 +1,108 @@
+; Host-interpreted fixture for the inactive raw-secondary milestone.
+Procedure str_print_at(*text)
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/memmap.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu_secondary.pi4"
+XIncludeFile "RaspberryPi4/Lib/core_worker.pi4"
+
+#CORE_GATE_BOOT_POISON = $1122334455667788
+#CORE_GATE_ROW_POISON  = $2233445566778899
+#CORE_GATE_SPIN_POISON = $33445566778899AA
+
+Procedure.i Main()
+  ; No release or MMIO: force the primary-only API and raw entry into output.
+  If CoreRawBootBase() = CoreRawRowBase()
+    ProcedureReturn 1
+  EndIf
+  If CoreRawReleaseAddr(1) <> $E0
+    ProcedureReturn 2
+  EndIf
+  If HwCoreRawStackBase(1) <> $001FC000 Or HwCoreRawStackBase(2) <> $001FD000 Or HwCoreRawStackBase(3) <> $001FE000
+    ProcedureReturn 3
+  EndIf
+  If HwCoreRawStackBytes(1) <> $1000 Or HwCoreRawStackBytes(0) <> 0 Or HwCoreRawStackBase(4) <> 0
+    ProcedureReturn 4
+  EndIf
+  ; The reservation is region 4 of however many the map has: the count may grow (a
+  ; sixth region arrived with the driver-module arena), the reservation may not move.
+  If HwMonRegions() <= 4 Or HwMonRegionLo(4) <> $001FC000 Or HwMonRegionHi(4) <> $001FEFFF
+    ProcedureReturn 5
+  EndIf
+  If CoreRawStackOwned(1, $001FC000, $1000) = 0 Or CoreRawStackOwned(2, $001FD000, $1000) = 0 Or CoreRawStackOwned(3, $001FE000, $1000) = 0
+    ProcedureReturn 6
+  EndIf
+  If CoreRawStackOwned(1, $001FD000, $1000) <> 0
+    ProcedureReturn 7
+  EndIf
+  If CoreRawStackOwned(1, $001FC010, $0FF0) <> 0
+    ProcedureReturn 8
+  EndIf
+  If CoreRawStackOwned(1, $001FC000, $2000) <> 0
+    ProcedureReturn 9
+  EndIf
+  If CoreRawStackOwned(1, $01000000, $1000) <> 0
+    ProcedureReturn 10
+  EndIf
+
+  ; Execute the real prepare refusal before any record, row, cache or spin-slot
+  ; ownership can change. The fixture itself never releases a core.
+  If CoreRawPrepare(1, $001FD000, $1000, $1111) <> 0 Or CoreRawErr() <> #CORE_RAW_ERR_OWNERSHIP
+    ProcedureReturn 14
+  EndIf
+  If CoreRawPrepare(1, $001FC010, $0FF0, $2222) <> 0 Or CoreRawErr() <> #CORE_RAW_ERR_OWNERSHIP
+    ProcedureReturn 15
+  EndIf
+  If CoreRawPrepare(1, $001FC000, $2000, $3333) <> 0 Or CoreRawErr() <> #CORE_RAW_ERR_OWNERSHIP
+    ProcedureReturn 16
+  EndIf
+  If CoreRawPrepare(1, $01000000, $1000, $4444) <> 0 Or CoreRawErr() <> #CORE_RAW_ERR_OWNERSHIP
+    ProcedureReturn 17
+  EndIf
+  If core_raw_prepared[1] <> 0 Or core_raw_released[1] <> 0 Or core_raw_stacktop[1] <> 0
+    ProcedureReturn 18
+  EndIf
+  ; The host gate fills the complete record and row plus this spin slot with
+  ; nonzero sentinels immediately before Main. These comparisons therefore do
+  ; not mistake "a write of zero" for "untouched"; the host also traces every
+  ; store and cache-maintenance instruction across each refused call.
+  If PeekI(CoreRawBootAddr(1)) <> #CORE_GATE_BOOT_POISON Or PeekI(CoreRawRowAddr(1)) <> #CORE_GATE_ROW_POISON Or PeekI(CoreRawReleaseAddr(1)) <> #CORE_GATE_SPIN_POISON
+    ProcedureReturn 19
+  EndIf
+  ; Test setup only: a valid Prepare requires an empty firmware slot. This is
+  ; outside every refused call boundary traced by the host.
+  PokeI(CoreRawReleaseAddr(1), 0)
+  If PeekI(CoreRawReleaseAddr(1)) <> 0
+    ProcedureReturn 22
+  EndIf
+  ; The same fixture is also linked inside core 1's nominal page. There the
+  ; actual running monitor wins over fixed board ownership, and the refusal
+  ; must name a range collision before any cold-state/cache side effect.
+  If HwMonLo() <= $001FCFFF And HwMonHi() >= $001FC000
+    If CoreRawPrepare(1, HwCoreRawStackBase(1), HwCoreRawStackBytes(1), $5555) <> 0 Or CoreRawErr() <> #CORE_RAW_ERR_RANGE
+      ProcedureReturn 23
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If CoreRawPrepare(1, HwCoreRawStackBase(1), HwCoreRawStackBytes(1), $5555) = 0
+    ProcedureReturn 20
+  EndIf
+  If core_raw_stackbase[1] <> $001FC000 Or core_raw_stacktop[1] <> $001FD000 Or core_raw_released[1] <> 0
+    ProcedureReturn 21
+  EndIf
+  ; Runtime-false on BCM2711, but not a compile-time constant: retain every
+  ; managed primary procedure for emitted inspection without touching page 0.
+  If CoreRawId() = 99
+    If CoreRawPrepare(1, HwCoreRawStackBase(1), HwCoreRawStackBytes(1), $1234) = 0
+      ProcedureReturn 11
+    EndIf
+    If CoreRawRelease(1) = 0
+      ProcedureReturn 12
+    EndIf
+    If CoreRawWaitReady(1, 100) = 0
+      ProcedureReturn 13
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure

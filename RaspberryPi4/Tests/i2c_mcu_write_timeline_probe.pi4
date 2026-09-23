@@ -1,0 +1,168 @@
+; i2c_mcu_write_timeline_probe.pi4 - one read-only MCU pointer write, timed.
+;
+; DIAGNOSTIC ONLY. This returning payload starts exactly one transaction to
+; the panel-control MCU at 0x45 and offers it exactly one byte: register 0x97,
+; the documented read-only size-register pointer. It never reads the device,
+; writes a register value, touches Goodix, changes GPIO/panel power/reset, or
+; reads the side-effecting BSC FIFO.
+;
+; The probe refuses unless BSC0 is found in the exact enabled-idle state
+; C=I2CEN/S.TA=0. During the one write it records the first TA, TXW, TXD,
+; enqueue, DONE, ERR and CLKT observations as elapsed architectural-counter
+; ticks plus their full status words. A 20 ms no-progress deadline and finite
+; spin fallback bound the transaction. Production I2cRecover() runs only if
+; that transaction fails. The final seven-word I2cSnapshot is sequential,
+; non-FIFO evidence, not an atomic hardware snapshot.
+;
+; Build outside repository product directories with PMF_ROOT at this tree:
+;   PureMetalForge.exe --compile RaspberryPi4/Tests/i2c_mcu_write_timeline_probe.pi4 -t pi4 \
+;     --load-addr 0x00500000 --bss-addr 0x00600000 \
+;     --stack-addr 0x00800000 --entry-returns -o i2c-mcu-timeline.img
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+
+#PROBE_DONE_MAGIC = $49324D57       ; ASCII "I2MW"
+#PROBE_MCU_ADDR = $45
+#PROBE_MCU_REG = $97
+#PROBE_WAIT_US = 20000
+#PROBE_SPIN_MAX = 200000
+#PROBE_REFUSED = -10
+
+Global probe_done.i
+Global probe_result.i
+Global probe_recover_ok.i
+Global probe_before_c.i
+Global probe_before_s.i
+Global probe_hz.i
+Global probe_start_ticks.i
+Global probe_total_ticks.i
+Global probe_polls.i
+Global probe_last_s.i
+Global probe_enqueued.i
+
+Global probe_ta_ticks.i
+Global probe_ta_s.i
+Global probe_txw_ticks.i
+Global probe_txw_s.i
+Global probe_txd_ticks.i
+Global probe_txd_s.i
+Global probe_enqueue_ticks.i
+Global probe_enqueue_s.i
+Global probe_done_ticks.i
+Global probe_done_s.i
+Global probe_err_ticks.i
+Global probe_err_s.i
+Global probe_clkt_ticks.i
+Global probe_clkt_s.i
+
+Global Dim probe_after.l[7]
+
+Procedure.i Main()
+  Define s.i
+  Define now.i
+  Define spin.i
+  Define deadline.i
+  Define finished.i
+  Define allowed.i
+
+  probe_done = 0
+  probe_result = #PROBE_REFUSED
+  probe_recover_ok = -1
+  probe_polls = 0
+  probe_enqueued = 0
+
+  ; This selects only the library register base. It does not mux pins or touch
+  ; the controller until the two precondition reads below.
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  probe_before_c = I2cRd(#BSC_C_OFF)
+  probe_before_s = I2cRd(#BSC_S_OFF)
+  probe_hz = I2cCounterHz()
+  probe_start_ticks = I2cCounterTicks()
+
+  allowed = 0
+  If probe_before_c = #BSC_C_I2CEN
+    If (probe_before_s & #BSC_S_TA) = 0
+      allowed = 1
+    EndIf
+  EndIf
+  If allowed <> 0
+    ; Same one-frame setup as I2cXfer: discard old FIFO data as the new frame
+    ; starts, but do not write the side-effecting FIFO until TXD says it can
+    ; accept the sole pointer byte.
+    I2cWr(#BSC_S_OFF, #BSC_S_ERR | #BSC_S_CLKT | #BSC_S_DONE)
+    I2cWr(#BSC_A_OFF, #PROBE_MCU_ADDR)
+    I2cWr(#BSC_DLEN_OFF, 1)
+    spin = #PROBE_SPIN_MAX
+    deadline = I2cDeadlineUs(#PROBE_WAIT_US)
+    I2cWr(#BSC_C_OFF, #BSC_C_I2CEN | #BSC_C_CLEAR | #BSC_C_ST)
+    probe_result = #I2C_TIMEOUT
+    finished = 0
+
+    Repeat
+      s = I2cRd(#BSC_S_OFF)
+      now = I2cCounterTicks() - probe_start_ticks
+      probe_polls = probe_polls + 1
+      probe_last_s = s
+
+      If probe_ta_ticks = 0 And (s & #BSC_S_TA) <> 0
+        probe_ta_ticks = now : probe_ta_s = s
+      EndIf
+      If probe_txw_ticks = 0 And (s & #BSC_S_TXW) <> 0
+        probe_txw_ticks = now : probe_txw_s = s
+      EndIf
+      If probe_txd_ticks = 0 And (s & #BSC_S_TXD) <> 0
+        probe_txd_ticks = now : probe_txd_s = s
+      EndIf
+      If probe_done_ticks = 0 And (s & #BSC_S_DONE) <> 0
+        probe_done_ticks = now : probe_done_s = s
+      EndIf
+      If probe_err_ticks = 0 And (s & #BSC_S_ERR) <> 0
+        probe_err_ticks = now : probe_err_s = s
+      EndIf
+      If probe_clkt_ticks = 0 And (s & #BSC_S_CLKT) <> 0
+        probe_clkt_ticks = now : probe_clkt_s = s
+      EndIf
+
+      ; Preserve the driver's error priority when status bits coincide.
+      If (s & #BSC_S_ERR) <> 0
+        probe_result = #I2C_NACK : finished = 1
+      ElseIf (s & #BSC_S_CLKT) <> 0
+        probe_result = #I2C_CLKT : finished = 1
+      ElseIf probe_enqueued = 0 And (s & #BSC_S_TXD) <> 0
+        probe_enqueue_ticks = now
+        probe_enqueue_s = s
+        I2cWr(#BSC_FIFO_OFF, #PROBE_MCU_REG)
+        probe_enqueued = 1
+        spin = #PROBE_SPIN_MAX
+        deadline = I2cDeadlineUs(#PROBE_WAIT_US)
+      ElseIf (s & #BSC_S_DONE) <> 0
+        If probe_enqueued <> 0
+          probe_result = #I2C_OK
+        Else
+          probe_result = #I2C_TIMEOUT
+        EndIf
+        finished = 1
+      Else
+        spin = spin - 1
+        If spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+          probe_result = #I2C_TIMEOUT : finished = 1
+        EndIf
+      EndIf
+    Until finished <> 0
+
+    ; Recovery is intentionally conditional: a successful pointer write is
+    ; left as the controller completed it. Any failed frame is made idle by
+    ; the production bounded lifecycle before the final non-FIFO snapshot.
+    If probe_result <> #I2C_OK
+      probe_recover_ok = I2cRecover()
+    EndIf
+  EndIf
+
+  I2cSnapshot(@probe_after[0])
+  probe_total_ticks = I2cCounterTicks() - probe_start_ticks
+  probe_done = #PROBE_DONE_MAGIC
+  ProcedureReturn 0
+EndProcedure

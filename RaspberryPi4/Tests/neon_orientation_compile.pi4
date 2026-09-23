@@ -1,0 +1,175 @@
+; Executable emitted-code probe for the oriented Neon boundary.
+;
+; tools/display_pipeline_emitted_check.py compiles this file and runs the
+; resulting A64 image in the project's instruction interpreter. The probe
+; does not initialise V3D and does not submit a job: its only outputs are
+; vertex records and a CLIP_WINDOW packet in ordinary modelled DRAM.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#OG_W = 1280
+#OG_H = 800
+#OG_PITCH = 5120
+
+#OG_OUT = $06000000
+#OG_REC_BYTES = $00001000
+#OG_POINT_OFF = $000
+#OG_RECT_OFF = $100
+#OG_GLYPH_OFF = $300
+#OG_CLIP_OFF = $500
+
+#OG_XTAB = $06100000
+#OG_YTAB = $06200000
+#OG_TAB_BYTES = $00010000
+
+#OG_MAGIC = $4F524E54               ; "ORNT"
+#OG_U0 = $3E800000                  ; 0.25f
+#OG_U1 = $3F400000                  ; 0.75f
+#OG_V0 = $3E000000                  ; 0.125f
+#OG_V1 = $3F600000                  ; 0.875f
+
+; Populate only the table slots the correct emitted transform should read.
+; A wrong transform normally reads zero, and always produces the wrong Xs/Ys.
+; The host oracle supplies the independent geometry; these physical points are
+; not copied back out as expected answers.
+Procedure OgSeedPoint(px.i, py.i)
+  PokeN(neon_xcTab + ((px + neon_physW) * 4), neon_F32Ratio(px - neon_cx, neon_cx))
+  PokeN(neon_ycTab + ((py + neon_physH) * 4), neon_F32Ratio(py - neon_cy, neon_cy))
+EndProcedure
+
+Procedure OgSeedLogicalPoint(x.i, y.i, rot.i)
+  If rot = 90
+    OgSeedPoint(#OG_H - y, x)
+  ElseIf rot = 180
+    OgSeedPoint(#OG_W - x, #OG_H - y)
+  ElseIf rot = 270
+    OgSeedPoint(y, #OG_W - x)
+  Else
+    OgSeedPoint(x, y)
+  EndIf
+EndProcedure
+
+Procedure OgSeedLogicalRect(x.i, y.i, w.i, h.i, rot.i)
+  Define x0.i
+  Define y0.i
+  Define x1.i
+  Define y1.i
+  Define p.i
+
+  x0 = x
+  y0 = y
+  x1 = x + w
+  y1 = y + h
+  If rot = 90
+    p = x0
+    x0 = #OG_H - y1
+    y0 = p
+    p = x1
+    x1 = #OG_H - (y1 - h)
+    y1 = p
+  ElseIf rot = 180
+    p = x0
+    x0 = #OG_W - x1
+    x1 = #OG_W - p
+    p = y0
+    y0 = #OG_H - y1
+    y1 = #OG_H - p
+  ElseIf rot = 270
+    p = x0
+    x0 = y0
+    y0 = #OG_W - x1
+    x1 = y1
+    y1 = #OG_W - p
+  EndIf
+  OgSeedPoint(x0, y0)
+  OgSeedPoint(x1, y1)
+EndProcedure
+
+Procedure OgPoints(out.i)
+  gNeonVerts = out
+  neon_nVerts = 0
+  neon_Vertex(0, 0)
+  neon_Vertex(#OG_W, 0)
+  neon_Vertex(0, #OG_H)
+  neon_Vertex(#OG_W, #OG_H)
+  neon_Vertex(37, 61)
+EndProcedure
+
+Procedure OgRects(out.i)
+  gNeonVerts = out
+  neon_nVerts = 0
+  neon_Rect(10, 20, 30, 40)
+  neon_Rect(#OG_W - 19, #OG_H - 23, 19, 23)
+EndProcedure
+
+Procedure OgGlyph(out.i)
+  ; A scaled 8x16 font cell: 16x32 logical glyph geometry. The two
+  ; triangles carry all four UV corners through the real textured emitter.
+  neon_tverts = out
+  neon_TexVertex(0, 101, 203, #OG_U0, #OG_V0)
+  neon_TexVertex(1, 101, 235, #OG_U0, #OG_V1)
+  neon_TexVertex(2, 117, 203, #OG_U1, #OG_V0)
+  neon_TexVertex(3, 101, 235, #OG_U0, #OG_V1)
+  neon_TexVertex(4, 117, 235, #OG_U1, #OG_V1)
+  neon_TexVertex(5, 117, 203, #OG_U1, #OG_V0)
+EndProcedure
+
+Procedure.i OgRotation(slot.i, rot.i)
+  Define out.i
+  Define r.i
+
+  out = #OG_OUT + (slot * #OG_REC_BYTES)
+  r = NeonSurfaceOriented($05000000, #OG_W, #OG_H, #OG_PITCH, rot)
+  If r <> #NEON_OK
+    ProcedureReturn r
+  EndIf
+
+  neon_xcTab = #OG_XTAB + (slot * #OG_TAB_BYTES)
+  neon_ycTab = #OG_YTAB + (slot * #OG_TAB_BYTES)
+
+  OgSeedLogicalPoint(0, 0, rot)
+  OgSeedLogicalPoint(#OG_W, 0, rot)
+  OgSeedLogicalPoint(0, #OG_H, rot)
+  OgSeedLogicalPoint(#OG_W, #OG_H, rot)
+  OgSeedLogicalPoint(37, 61, rot)
+  OgSeedLogicalRect(10, 20, 30, 40, rot)
+  OgSeedLogicalRect(#OG_W - 19, #OG_H - 23, 19, 23, rot)
+  OgSeedLogicalRect(101, 203, 16, 32, rot)
+
+  OgPoints(out + #OG_POINT_OFF)
+  OgRects(out + #OG_RECT_OFF)
+  OgGlyph(out + #OG_GLYPH_OFF)
+
+  r = V3dClBegin(out + #OG_CLIP_OFF, 512)
+  If r <> #V3D_OK
+    ProcedureReturn r
+  EndIf
+  neon_emitClipX = -1
+  neon_emitClipY = -1
+  neon_emitClipW = -1
+  neon_emitClipH = -1
+  Neon_ScissorSet(-5, #OG_H - 10, 30, 20)
+  neon_SyncClip()
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  PokeN(#OG_OUT - 8, #OG_MAGIC)
+  r = OgRotation(0, 0)
+  If r <> 0 : ProcedureReturn r : EndIf
+  r = OgRotation(1, 90)
+  If r <> 0 : ProcedureReturn r : EndIf
+  r = OgRotation(2, 180)
+  If r <> 0 : ProcedureReturn r : EndIf
+  r = OgRotation(3, 270)
+  ProcedureReturn r
+EndProcedure

@@ -1,0 +1,28 @@
+; vulkanIndexedTriangleProof.pi4 - UINT16 indexed triangle on the Pi 4 V3D.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. This is the indexed variant of the two-pass
+; Vulkan triangle proof. Both public draws bind a 16-byte INDEX_BUFFER at byte
+; four and call vkCmdDrawIndexed(3, 1, 1, 0, 0), so the hardware must combine
+; the bind base with exactly one two-byte firstIndex offset. The selected
+; indices are 2,0,1; the independently scanned maximum is two.
+;
+; It shares the triangle proof's guard, job/fence, pixel, viewport, present and
+; teardown oracle. In addition, the second submitted BCL must contain the exact
+; V3D 4.2 INDEX_BUFFER_SETUP followed by INDEXED_PRIM_LIST: setup address is the
+; bound buffer address, size is the remaining byte bound, hardware index type
+; is one (UINT16), length is three, and byte offset is two.
+;
+; Desk build:
+;   PureMetalForge.exe --compile \
+;     RaspberryPi4/Examples/Diagnostics/vulkanIndexedTriangleProof.pi4 -t pi4 \
+;     --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;     -o vulkanIndexedTriangleProof.img
+;
+; No board action is implicit. For an authorized run, follow the same V3D
+; ownership and md.l <x0> 100 instructions as vulkanTriangleProof. Slots 1 and
+; 4 must be zero, slot 47 must be one, and both magic words must match.
+
+#VTP_BLEND_PROOF = 0
+#VTP_LIST_PROOF = 0
+#VTP_INDEXED_PROOF = 1
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanTriangleProofBody.pbi"

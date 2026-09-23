@@ -1,0 +1,638 @@
+; pi4GenetProbe.pi4 - the BCM2711 GENET v5 Ethernet controller, walked
+; from "is anything at $FD580000" through to a frame on the wire, with
+; every step printing what it actually saw.
+;
+; DIAGNOSTIC. Does not ship. (Project rule 19.)
+;
+; This is the artefact tools/a64/a64_genet_check.py builds and runs. It
+; is also the thing to run FIRST on a real Pi 4, because it is written
+; to be useful even when almost everything fails: each stage prints its
+; reading before the next stage depends on it, so a run that dies at
+; step 3 still tells you what steps 1 and 2 saw.
+;
+;   pmfc.exe RaspberryPi4/Examples/Diagnostics/pi4GenetProbe.pi4 -t pi4 \
+;            --load-addr 0x400000 --stack-addr 0x3000000 \
+;            --entry-returns -o genet.img
+;
+; ----------------------------------------------------------------------
+;  WHAT EACH STAGE IS ACTUALLY ASKING, AND WHY IN THIS ORDER
+; ----------------------------------------------------------------------
+;  1. SYS_REV_CTRL. One read of a hardwired identity register. It
+;     settles four assumptions at once - that the device-tree address
+;     arithmetic landed on the right place, that the block is powered,
+;     that it is clocked, and that it is the version the driver we
+;     copied was written for. Nothing else here is worth reading if
+;     this is wrong.
+;
+;  2. MDIO. The register at $E14 is reachable from the SYS block with
+;     no MAC configuration at all, so the PHY can be interrogated
+;     before anything is brought up. If the bus works, a scan finds a
+;     PHY; if it does not, the scan is 32 twenty-millisecond timeouts
+;     and returns a refusal instead of hanging.
+;
+;  3. THE PHY's registers, printed RAW. Six clause-22 registers before
+;     any interpretation is applied to them, because when the
+;     interpretation disagrees with reality the raw numbers are the
+;     only evidence left.
+;
+;  4. LINK AND SPEED, through the same AND-of-advertisements the
+;     generic driver uses. The MAC's own link bit is read here too and
+;     MUST be zero at this point - see the comment beside it.
+;
+;  5. BRING-UP. Reset, address, rings, DMA, and the speed into the MAC.
+;     Then SIX REGISTERS READ BACK OFF THE BUS, because "GenetStart()
+;     returned 1" is a claim about control flow and these are the
+;     hardware's own answer.
+;
+;  6. ONE FRAME OUT. A 60-byte broadcast with a made-up EtherType that
+;     nothing will answer, which is the point: a probe that provokes a
+;     reply has to be right about two things instead of one.
+;
+;  7. RECEIVE, LISTENED FOR A REAL NUMBER OF SECONDS. On a live network
+;     something arrives on its own within a second or two - an ARP, or a
+;     switch's spanning tree - so an empty result here after a
+;     successful bring-up is informative. THAT ONLY HOLDS IF THE STAGE
+;     ACTUALLY WAITS. It used to poll eight times with no delay, which
+;     is microseconds, and the empty result it produced on real
+;     hardware was read as a broken receive path. It was not. See the
+;     long note at the stage.
+;
+;  7b. EVERY REGISTER THAT MATTERS, READ BACK RAW WHILE THE MAC IS
+;     STILL RUNNING. This is the stage to look at first when something
+;     is wrong. It is placed before the refusal suite because that
+;     suite ends by stopping the interface, and a register read from a
+;     torn-down MAC answers nothing. It runs whether the bring-up
+;     succeeded or failed, because the registers of a failed bring-up
+;     are the more valuable of the two.
+;
+;  8. THE REFUSALS, exercised deliberately. Every documented refusal in
+;     the library is provoked and its code printed. THIS IS THE HALF
+;     OF THE PROBE THAT KEEPS ITS VALUE FOREVER: a refusal that stops
+;     firing is a refusal somebody deleted, and this is where that
+;     shows up.
+;
+; ----------------------------------------------------------------------
+;  UNITS
+; ----------------------------------------------------------------------
+;  Speeds are in Mbit/s and lengths in bytes. Both are the units an
+;  American engineer uses for a network - bits, bytes and hertz are SI
+;  and American at the same time - so there is nothing to convert here.
+;
+; ----------------------------------------------------------------------
+;  THE RX REGION - WHY THIS ADDRESS
+; ----------------------------------------------------------------------
+;  The controller needs 512 KiB of buffer (256 descriptors of 2048
+;  bytes) and genet.pi4 deliberately does not own it - see the header
+;  there for why half a megabyte of BSS is not imposed on every program
+;  that includes the file.
+;
+;  $04000000 is 64 MiB. The image loads at $00400000 and the stack sits
+;  at $03000000, so this is clear of both with a wide margin, and a
+;  Pi 4 has at least 1 GB. IT IS A DIAGNOSTIC'S CHOICE, NOT A FACT
+;  ABOUT THE BOARD: there is no allocator here and nothing checks that
+;  the firmware is not using it. On a machine that turns out to have
+;  something there, move it - but move it knowingly.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/genet.pi4"
+
+#GP_RX_REGION = $04000000
+#GP_RX_BYTES  = 524288
+
+#GP_LINK_MS = 2000        ; how long to wait for auto-negotiation
+#GP_TX_MS   = 100         ; how long to wait for one frame to leave
+; HOW LONG TO LISTEN, IN MILLISECONDS, AND NOT A POLL COUNT.
+; This was #GP_RX_POLLS = 8 - eight bare iterations of GenetRecv() with
+; no delay, which is microseconds of listening and was misread as a
+; broken receive path on the first silicon run. See step 7.
+#GP_RX_MS = 3000
+
+Global Dim gpMac.a[6]
+Global Dim gpFrame.a[64]
+Global Dim gpRx.a[1600]
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure HexLine(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  PrintNl()
+EndProcedure
+
+; The last refusal, in words. Printed after anything that failed, so a
+; run that stops early still says why in a sentence rather than a code.
+Procedure Why()
+  UartWriteStr("  -> ")
+  UartWriteStr(GenetErrorText())
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define v.i
+  Define n.i
+  Define phy.i
+  Define ok.i
+
+  PrintNl()
+  Say("=== BCM2711 GENET v5 ===")
+
+  ; --- the map, so a human can check it against the driver -----------
+  ; Printing the map is not decoration. Every one of these is a
+  ; precomputed literal in genet.pi4 whose sum lives in a comment, and
+  ; a comment cannot be executed. Printed, it can be compared - which
+  ; is exactly what the gate does with them.
+  Say("map")
+  HexLine("base            ", $FD580000, 8)
+  HexLine("SYS_REV_CTRL    ", $0000, 4)
+  HexLine("SYS_PORT_CTRL   ", $0004, 4)
+  HexLine("EXT_RGMII_OOB   ", $008C, 4)
+  HexLine("UMAC_CMD        ", $0808, 4)
+  HexLine("UMAC_MAC0       ", $080C, 4)
+  HexLine("MDIO_CMD        ", $0E14, 4)
+  HexLine("RX desc base    ", $2000, 4)
+  HexLine("RDMA ring base  ", $3000, 4)
+  HexLine("RDMA reg base   ", $3040, 4)
+  HexLine("TX desc base    ", $4000, 4)
+  HexLine("TDMA ring base  ", $5000, 4)
+  HexLine("TDMA reg base   ", $5040, 4)
+  PrintNl()
+
+  ; --- 1. the identity register --------------------------------------
+  Say("1. SYS_REV_CTRL")
+  ok = GenetProbe()
+  HexLine("raw             ", GenetRevision(), 8)
+  Line("major (want 6) ", (GenetRevision() >> 24) & $F)
+  Line("minor          ", GenetRevisionMinor())
+  Line("probe ok       ", ok)
+  If ok = 0
+    Why()
+    Say("=== stopping: nothing else here means anything ===")
+    ProcedureReturn 0
+  EndIf
+  PrintNl()
+
+  ; --- 2. MDIO and the PHY -------------------------------------------
+  Say("2. MDIO scan")
+  phy = GenetPhyScan()
+  Line("address        ", phy)
+  If phy < 0
+    Why()
+    Say("=== stopping: no PHY ===")
+    ProcedureReturn 0
+  EndIf
+  HexLine("PHY id         ", GenetPhyId(), 8)
+  ; OUI bits 3..18 live in PHYSID1 and the model in PHYSID2's top six.
+  ; Printed separately because a Broadcom part reads $600D or nearby in
+  ; the low half and that is the fastest eyeball check there is.
+  HexLine("PHYSID1        ", (GenetPhyId() >> 16) & $FFFF, 4)
+  HexLine("PHYSID2        ", GenetPhyId() & $FFFF, 4)
+  PrintNl()
+
+  ; --- 3. the raw clause-22 registers --------------------------------
+  Say("3. PHY registers, raw")
+  HexLine("BMCR      (00) ", GenetMdioRead(phy, $00), 4)
+  HexLine("BMSR      (01) ", GenetMdioRead(phy, $01), 4)
+  HexLine("ADVERTISE (04) ", GenetMdioRead(phy, $04), 4)
+  HexLine("LPA       (05) ", GenetMdioRead(phy, $05), 4)
+  HexLine("CTRL1000  (09) ", GenetMdioRead(phy, $09), 4)
+  HexLine("STAT1000  (0A) ", GenetMdioRead(phy, $0A), 4)
+  PrintNl()
+
+  ; --- 4. link and speed ---------------------------------------------
+  Say("4. link")
+  Line("link now       ", GenetPhyLinkUp())
+  ok = GenetPhyWaitLink(#GP_LINK_MS)
+  Line("wait ok        ", ok)
+  If ok = 0
+    Why()
+  EndIf
+  If GenetPhyResolve() = 1
+    Line("speed Mbit/s   ", GenetSpeed())
+    Line("full duplex    ", GenetFullDuplex())
+  Else
+    Why()
+  EndIf
+  ; THE MAC'S OWN OPINION OF THE LINK, READ BEFORE BRING-UP, AND IT
+  ; MUST READ ZERO HERE.
+  ;
+  ; This line used to be labelled "MAC-side link" and it caused a wasted
+  ; debugging session on 2026-08-26. On real silicon it printed 0 while
+  ; the PHY reported a perfectly good gigabit link, and that reads like
+  ; the MAC and the PHY disagreeing about the wire. They do not. Nothing
+  ; has configured the RGMII block yet. The reset state of
+  ; EXT_RGMII_OOB_CTRL has since been read off this very board and it is
+  ; $00F00000, in which RGMII_LINK - bit 4, v2025.01_bcmgenet.c:51 - is
+  ; clear. The MAC has not been told that a link exists, so it reports
+  ; that none exists, which is the truthful answer to the question that
+  ; was actually asked. Only GenetAdjustLink(), inside GenetStart(),
+  ; sets RGMII_LINK (v2025.01_bcmgenet.c:461-462).
+  ;
+  ; So the reading is kept - a zero here is a useful baseline, and it is
+  ; what proves the register is not simply stuck at one - but it is
+  ; labelled for what it is, and the reading that answers the question
+  ; people actually mean is taken again in step 5, after bring-up.
+  Line("MAC link pre   ", GenetMacLinkStatus())
+  PrintNl()
+
+  ; --- 5. bring-up ----------------------------------------------------
+  Say("5. bring-up")
+
+  ; A locally-administered unicast address. Bit 1 of the first byte set
+  ; means locally administered; bit 0 clear means unicast. This is NOT
+  ; the board's real address - genet.pi4 cannot fetch that, see THE MAC
+  ; ADDRESS in its header - and on a network with two of these boards
+  ; running this probe it would be a duplicate. That is acceptable for
+  ; a bench diagnostic and would not be acceptable in a shipped
+  ; program, which is one more reason this file lives in Diagnostics.
+  gpMac[0] = $02
+  gpMac[1] = $00
+  gpMac[2] = $4D
+  gpMac[3] = $46
+  gpMac[4] = $00
+  gpMac[5] = $01
+  Line("set mac        ", GenetSetMac(@gpMac[0]))
+  HexLine("UMAC_MAC0 image", GenetMac0(), 8)
+  HexLine("UMAC_MAC1 image", GenetMac1(), 8)
+
+  Line("set rx region  ", GenetSetRxRegion(#GP_RX_REGION, #GP_RX_BYTES))
+  HexLine("rx region      ", #GP_RX_REGION, 8)
+
+  ok = GenetStart(#GP_LINK_MS)
+  Line("start ok       ", ok)
+  If ok = 0
+    Why()
+    Say("=== stopping: the MAC is not up ===")
+    Say("=== the refusal checks below still run ===")
+  EndIf
+  Line("started        ", GenetStarted())
+
+  ; --- the PHY's LED sources, READ BACK OFF THE BUS ---------------------
+  ; Not "GenetPhyLeds() returned 1" - that only says three MDIO writes
+  ; were issued. The shadow window at register $1C is written blind and
+  ; a wrong selector lands in a different register while reporting
+  ; success, so the only honest check is to select LEDS1 again and read
+  ; what the PHY is actually holding.
+  ;
+  ; WANT $00AA: MULTICOLOR1 ($A) in the LED1 field at bits 3..0 and in
+  ; the LED3 field at bits 7..4. Anything else, and the jack's LEDs are
+  ; not under our control - see GenetPhyLeds in genet.pi4.
+  Line("leds programmed", GenetLedsSet())
+  HexLine("LEDS1 (want 00AA)", GenetPhyLedsRaw(), 4)
+
+  ; --- what the block ACTUALLY holds now -------------------------------
+  ; Six raw registers, read back off the bus rather than inferred from
+  ; "GenetStart() returned 1". They are here because the first silicon
+  ; run could not distinguish four completely different reasons for a
+  ; silent receive path, and each of these settles one of them. The
+  ; wanted value is printed in the comment, not in the label, so the
+  ; gate's declared-expectation scanner does not pick these up - these
+  ; are readings, not refusals.
+  ;
+  ;   MAC-side link   1         RGMII_LINK reached the MAC
+  ;   EXT_RGMII_OOB   ...50 with bit 16 set, and OOB_DISABLE ($20) CLEAR
+  ;   UMAC_CMD        $0000000B TX_EN | RX_EN | (SPEED_1000 << 2)
+  ;   RDMA_CTRL       $00020001 DMA_EN plus the ring-16 enable
+  ;   TDMA_CTRL       $00020001 the same, for transmit
+  ;   RX prod / cons  equal, and the discard count zero
+  ;
+  ; A zero discard count with an unmoving producer index means nothing
+  ; reached the ring. A NON-zero discard count means frames arrived and
+  ; the ring threw them away, which is a completely different fault and
+  ; is invisible without this line.
+  Line("MAC-side link  ", GenetMacLinkStatus())
+  HexLine("OOB raw        ", GenetOobCtrl(), 8)
+  HexLine("UMAC_CMD raw   ", GenetUmacCmd(), 8)
+  HexLine("RDMA_CTRL raw  ", GenetRdmaCtrl(), 8)
+  HexLine("TDMA_CTRL raw  ", GenetTdmaCtrl(), 8)
+  HexLine("RX prod raw    ", GenetRxProdIndex(), 8)
+  HexLine("RX cons raw    ", GenetRxConsIndex(), 8)
+  Line("RX cIndex ours ", GenetRxCIndex())
+  Line("RX discards    ", GenetRxDiscards())
+  PrintNl()
+
+  ; --- 6. one frame out ------------------------------------------------
+  If GenetStarted() = 1
+    Say("6. transmit")
+    ; A 60-byte frame: broadcast destination, our address as source,
+    ; EtherType $88B5 - which IEEE reserves for local experimental use,
+    ; so nothing on the network is entitled to care about it - and then
+    ; a recognisable pattern.
+    ;
+    ; SIXTY BYTES EXACTLY, because that is the shortest frame the
+    ; library accepts (the MAC appends the four-byte FCS, making 64 on
+    ; the wire). Asking for 59 is one of the refusals below.
+    For i = 0 To 5
+      gpFrame[i] = $FF
+    Next
+    For i = 0 To 5
+      gpFrame[6 + i] = gpMac[i]
+    Next
+    gpFrame[12] = $88
+    gpFrame[13] = $B5
+    For i = 14 To 59
+      gpFrame[i] = i & $FF
+    Next
+
+    ok = GenetSend(@gpFrame[0], 60, #GP_TX_MS)
+    Line("send 60 bytes  ", ok)
+    If ok = 0
+      Why()
+    EndIf
+    Line("tx count       ", GenetTxCount())
+    PrintNl()
+
+    ; --- 7. receive ---------------------------------------------------
+    ; THIS LOOP WAS THE BUG, AND IT WAS IN THE DIAGNOSTIC, NOT THE
+    ; DRIVER. It used to be:
+    ;
+    ;     i = 0
+    ;     While i < 8
+    ;       n = GenetRecv(@gpRx[0], 1600)
+    ;       If n <> 0 : Break : EndIf
+    ;       i = i + 1
+    ;     Wend
+    ;
+    ; with no delay anywhere in it. On 2026-08-26 that printed
+    ; "polls used 8, bytes 0, rx count 0" on a board plugged into a live
+    ; switch, and it was read - reasonably - as "receive does not work".
+    ;
+    ; It is not evidence of anything. Eight calls to GenetRecv() on an
+    ; empty ring is eight bounds checks and one 32-bit MMIO read each.
+    ; The whole loop is single-digit MICROSECONDS. The traffic this
+    ; stage is waiting for - an ARP for somebody, a spanning-tree hello -
+    ; arrives on the order of SECONDS. Concluding anything from that
+    ; loop is like concluding a road is empty from one camera frame.
+    ;
+    ; A LOOP COUNT IS NOT A DURATION. GenetRecvWait() takes
+    ; milliseconds and holds a real deadline off CNTPCT_EL0.
+    ;
+    ; #GP_RX_MS is three seconds because a switch running spanning tree
+    ; sends a hello every two, so three catches at least one with margin.
+    ; IT IS A GUESS ABOUT A NETWORK, NOT A FACT ABOUT THE HARDWARE, and
+    ; a port with STP disabled and nothing else on it can legitimately
+    ; stay silent forever - in which case zero here still means nothing
+    ; is wrong. THE LINE THAT SETTLES IT IS "RX discards" IN STEP 5: a
+    ; non-zero discard count is proof frames reached the MAC.
+    Say("7. receive")
+    Line("listen ms      ", #GP_RX_MS)
+    n = GenetRecvWait(@gpRx[0], 1600, #GP_RX_MS)
+    Line("bytes          ", n)
+    If n > 0
+      HexLine("dst[0]         ", gpRx[0], 2)
+      HexLine("ethertype      ", (gpRx[12] << 8) | gpRx[13], 4)
+    ElseIf n < 0
+      Why()
+    EndIf
+    Line("rx count       ", GenetRxCount())
+    PrintNl()
+  EndIf
+
+  ; --- 7b. the whole block, raw, while it is still running -------------
+  ;
+  ; THIS IS THE MOST IMPORTANT STAGE IN THE FILE WHEN SOMETHING IS
+  ; WRONG, AND IT IS PLACED WHERE IT IS FOR ONE REASON: nothing has
+  ; stopped the MAC yet.
+  ;
+  ; The refusal suite in step 8 finishes by calling GenetStop(), which
+  ; clears the two enable bits and shuts the DMA engines down. Anything
+  ; read after that describes a torn-down interface and answers no
+  ; question anybody has. Reading the block from a monitor prompt after
+  ; the program has returned has the same problem. So the readings are
+  ; taken here, at the moment the receive attempt has just finished,
+  ; whether it found a frame or not.
+  ;
+  ; This runs even when GenetStart() failed, because the registers of a
+  ; failed bring-up are worth more than the registers of a successful
+  ; one. It is outside the "did it start" test above for exactly that
+  ; reason.
+  ;
+  ; EVERY VALUE IS PRINTED RAW, IN HEXADECIMAL, WITH NO INTERPRETATION
+  ; APPLIED. That is this file's stated philosophy at its head and this
+  ; is the case it was written for: when the interpretation disagrees
+  ; with reality, the raw numbers are the only evidence left standing.
+  ; What each one ought to hold is written beside it in words, not
+  ; encoded into the label, so that a reading which disagrees with the
+  ; expectation is obvious to a person rather than to a parser.
+  Say("7b. every register that matters, read back while the MAC is up")
+  Say("    Nothing has been stopped yet. These are live values.")
+  PrintNl()
+
+  ; The port mode. Three means an external gigabit PHY, which is what a
+  ; Pi 4 has. This board reads zero here at reset, so a zero now would
+  ; mean the write never happened.
+  HexLine("port mode      ", GenetSysPortCtrl(), 8)
+
+  ; The RGMII out-of-band control register. This board's measured reset
+  ; value is $00F00000. After bring-up it should still carry those four
+  ; unnamed high bits, and should have gained bit 4 (the link
+  ; indication), bit 6 (the RGMII block enable) and bit 16 (the internal
+  ; delay disable), while bit 5 stays clear. So $00F10050 is the value
+  ; to hope for. If bit 4 is missing, the MAC believes the line is dead:
+  ; it will still transmit, and it will never receive.
+  HexLine("rgmii oob ctrl ", GenetOobCtrl(), 8)
+
+  ; The UniMAC command register. On a gigabit full-duplex link this
+  ; should read $0000000B - transmit enabled, receive enabled, and the
+  ; speed field holding the gigabit encoding. A nine means receive was
+  ; never enabled. A three means the enables landed but the speed field
+  ; was lost, which passes traffic badly instead of failing.
+  HexLine("umac command   ", GenetUmacCmd(), 8)
+
+  ; The station address as the hardware holds it, not as this program
+  ; believes it wrote it. All zeros here would mean the MAC accepts
+  ; nothing, and that alone would explain a silent receive path.
+  HexLine("station addr hi", GenetMac0Reg(), 8)
+  HexLine("station addr lo", GenetMac1Reg(), 8)
+
+  ; The receive buffer control register. Bit 1 must be set: it is what
+  ; makes the hardware insert the two alignment bytes that the receive
+  ; path then skips over.
+  HexLine("rbuf control   ", GenetRbufCtrl(), 8)
+
+  ; The receive side of the DMA engine. The ring configuration says
+  ; which rings exist and must read $00010000, meaning ring sixteen and
+  ; nothing else. The control word must read $00020001, which is the
+  ; engine enable together with the enable for that same ring sixteen.
+  ; An engine that is switched on with no ring configured has nowhere to
+  ; put an arriving frame, and that looks identical to a quiet wire.
+  HexLine("rx ring config ", GenetRdmaRingCfg(), 8)
+  HexLine("rx dma control ", GenetRdmaCtrl(), 8)
+
+  ; The receive ring's two indices, raw. The low sixteen bits of the
+  ; producer index are the index itself; the top sixteen bits are the
+  ; count of frames the ring threw away, which is a separate field
+  ; entirely and is broken out on its own line below.
+  HexLine("rx producer    ", GenetRxProdIndex(), 8)
+  HexLine("rx consumer    ", GenetRxConsIndex(), 8)
+  Line("rx cindex ours ", GenetRxCIndex())
+
+  ; THE SINGLE MOST INFORMATIVE NUMBER HERE WHEN RECEIVE IS SILENT.
+  ; Zero, with a producer index that never moved, means nothing ever
+  ; reached the receive ring at all. Non-zero means frames DID arrive
+  ; and the ring discarded every one of them, which is a completely
+  ; different fault with a completely different cause. Without this
+  ; line the two are indistinguishable.
+  Line("rx discarded   ", GenetRxDiscards())
+
+  ; The transmit side, for comparison. On this side the hardware owns
+  ; the consumer index and this program writes the producer index, which
+  ; is the opposite of the receive side. Equal values mean every frame
+  ; handed over has gone.
+  HexLine("tx ring config ", GenetTdmaRingCfg(), 8)
+  HexLine("tx dma control ", GenetTdmaCtrl(), 8)
+  HexLine("tx producer    ", GenetTxProdIndex(), 8)
+  HexLine("tx consumer    ", GenetTxConsIndex(), 8)
+
+  ; The MAC's own view of the link, for the THIRD time in this run, and
+  ; the third reading is the one that separates two different bugs.
+  ; Step 4 read it before bring-up and it should have been zero. Step 5
+  ; read it immediately after bring-up and it should have been one. If
+  ; this reading is zero, the link indication was set and then lost
+  ; somewhere between bring-up and now. If step 5 was also zero, it was
+  ; never set at all. Those are not the same problem and they have
+  ; different fixes.
+  HexLine("umac mode raw  ", GenetUmacMode(), 8)
+  Line("mac link now   ", GenetMacLinkStatus())
+  PrintNl()
+
+  ; --- 7c. THE MAC'S OWN COUNTERS -------------------------------------
+  ; Everything above this line is configuration - what was written, and
+  ; what read back. These are what the MAC COUNTED, and they exist
+  ; because of a day when there was nothing here to read.
+  ;
+  ; On 2026-09-08 this board was on a cable straight into a laptop while
+  ; a display bring-up ran, and the laptop's Ethernet card logged "reset
+  ; by tx hang" twelve times and was then stopped by Windows. The
+  ; leading explanation was that this board had been holding 802.3x
+  ; PAUSE asserted, and NOTHING ON THIS BOARD COULD SAY WHETHER IT HAD.
+  ; "tx pause frames" is that number. With genet.pi4 setting
+  ; CMD_TX_PAUSE_IGNORE on every link it must read ZERO, and a non-zero
+  ; reading is the one fault in that library that damages somebody
+  ; else's hardware rather than this board's own traffic.
+  ;
+  ; THE COUNTS ARE SINCE THIS INTERFACE CAME UP - GenetUmacReset()
+  ; zeroes the block at every bring-up. On a run that has sent one frame
+  ; and received one, the two packet counts are the only ones that
+  ; should be non-zero.
+  Say("7c. what the MAC counted, since bring-up")
+  Line("tx pause frames", GenetMibTxPause())
+  Line("rx pause frames", GenetMibRxPause())
+  Line("tx packets     ", GenetMibTxPackets())
+  Line("rx packets     ", GenetMibRxPackets())
+  Line("rx fcs errors  ", GenetMibRxFcsErrors())
+  Line("rx align errors", GenetMibRxAlignErrors())
+  Line("rx length errs ", GenetMibRxLengthErrors())
+  Line("rx oversize    ", GenetMibRxOversize())
+  Line("rx jabber      ", GenetMibRxJabber())
+  Line("tx fcs errors  ", GenetMibTxFcsErrors())
+  Line("tx oversize    ", GenetMibTxOversize())
+  Line("tx late coll   ", GenetMibTxLateColl())
+  Line("tx excess coll ", GenetMibTxExcessColl())
+  Line("rbuf overflows ", GenetRbufOverflows())
+  Line("rbuf errors    ", GenetRbufErrors())
+  Line("filter errors  ", GenetMdfErrors())
+  ; The software counters beside them, because a hardware counter that
+  ; is zero because the interface was rebuilt a moment ago says
+  ; something different from one that is zero because nothing happened.
+  Line("bring-ups      ", GenetStartCount())
+  Line("aneg restarts  ", GenetAnegRestarts())
+  Line("link drops seen", GenetLinkDrops())
+  HexLine("pause bits set ", GenetPauseApplied(), 8)
+  HexLine("phy advertise  ", GenetPauseAdvert(), 4)
+  HexLine("phy partner lpa", GenetPauseLpa(), 4)
+  PrintNl()
+
+  ; --- 8. the refusals -------------------------------------------------
+  ; Every one of these MUST come back with the code named beside it. A
+  ; zero or a success here means a guard has been removed, and a
+  ; removed guard is invisible in normal operation - which is precisely
+  ; why it is checked in a place that prints.
+  Say("8. refusals - each must be the code named")
+
+  Line("force speed    (want   0)", GenetForceSpeed(1000, 1))
+  Line("  err          (want -18)", GenetError())
+
+  Line("send 59 bytes  (want   0)", GenetSend(@gpFrame[0], 59, #GP_TX_MS))
+  Line("  err          (want  -1)", GenetError())
+
+  Line("send 2000 bytes(want   0)", GenetSend(@gpFrame[0], 2000, #GP_TX_MS))
+  Line("  err          (want  -1)", GenetError())
+
+  Line("send no timeout(want   0)", GenetSend(@gpFrame[0], 60, 0))
+  Line("  err          (want  -1)", GenetError())
+
+  ; A multicast source address - bit 0 of the first byte set. Refused,
+  ; because frames sent from one are dropped by conformant switches and
+  ; the failure happens somewhere else, silently.
+  gpMac[0] = $03
+  Line("multicast mac  (want   0)", GenetSetMac(@gpMac[0]))
+  Line("  err          (want  -1)", GenetError())
+  gpMac[0] = $02
+
+  Line("rx region 4 KiB(want   0)", GenetSetRxRegion(#GP_RX_REGION, 4096))
+  Line("  err          (want -13)", GenetError())
+
+  Line("rx region odd  (want   0)", GenetSetRxRegion(#GP_RX_REGION + 1, #GP_RX_BYTES))
+  Line("  err          (want -13)", GenetError())
+
+  Line("mdio phy 32    (want  -1)", GenetMdioRead(32, $01))
+  Line("mdio reg 32    (want  -1)", GenetMdioRead(1, 32))
+
+  ; And put the region back, because the two refused calls above left
+  ; the library's copy alone but a reader should not have to know that.
+  Line("rx region back ", GenetSetRxRegion(#GP_RX_REGION, #GP_RX_BYTES))
+
+  ; --- and the interface stopped ---------------------------------------
+  ; LAST, because it turns the MAC off and nothing after it can send.
+  ; Two things are being asked here. One, that GenetStop() clears only
+  ; the two enable bits and leaves the speed field alone - it is a
+  ; clrbits, not a write, and the difference is invisible until somebody
+  ; restarts the interface and finds it running at the 10 Mbit/s
+  ; encoding. Two, that a send on a stopped interface is REFUSED rather
+  ; than queued into a descriptor ring nothing is reading, which is a
+  ; frame that vanishes with no error anywhere.
+  Line("stop           (want   1)", GenetStop())
+  Line("started        (want   0)", GenetStarted())
+  Line("send stopped   (want   0)", GenetSend(@gpFrame[0], 60, #GP_TX_MS))
+  Line("  err          (want -14)", GenetError())
+  Line("recv stopped   (want -14)", GenetRecv(@gpRx[0], 1600))
+  PrintNl()
+
+  ; --- the canary ------------------------------------------------------
+  ; Not a hardware question. It asks whether this build can express an
+  ; address above 4 GiB at all, which decides whether a DMA buffer up
+  ; there would have been handed to the controller truncated.
+  Say("9. 64-bit canary")
+  Line("addr is wide   (want 1)  ", GenetAddrIsWide())
+  PrintNl()
+
+  Say("=== done ===")
+  ProcedureReturn 0
+EndProcedure

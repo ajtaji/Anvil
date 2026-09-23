@@ -1,0 +1,44 @@
+; Executable SDHCI/SDIO transport fixture. Host-only checker intercepts MMIO.
+; No board profile, power rail, or chip firmware is selected here.
+XIncludeFile "RaspberryPi3/Lib/sdio.pi3"
+
+Global Dim p3_sdio_gate_words.l[136]
+
+; Gate-only callback that records the exact production init ordering/ticks.
+; The host test replaces the property transport, not the reset callback seam.
+Procedure.i Pi3SdioGateReset(asserted.i)
+  If p3_sdio_gate_words[120] = 0
+    p3_sdio_gate_words[121] = asserted
+    p3_sdio_gate_words[122] = Pi3SdioTicks()
+  Else
+    p3_sdio_gate_words[123] = asserted
+    p3_sdio_gate_words[124] = Pi3SdioTicks()
+  EndIf
+  p3_sdio_gate_words[120] = p3_sdio_gate_words[120] + 1
+  If (p3_sdio_gate_words[134] = 1 And asserted = 1) Or (p3_sdio_gate_words[134] = 2 And asserted = 0)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioGateInit(baseClockHz.i, busWidth.i, wired.i)
+  Pi3SdioSetResetCallback(@Pi3SdioGateReset, wired)
+  ProcedureReturn Pi3SdioInit(baseClockHz, busWidth)
+EndProcedure
+
+Procedure.i Main()
+  Select p3_sdio_gate_words[135]
+    Case 1 : ProcedureReturn Pi3SdioTickHz()
+    Case 2 : ProcedureReturn Pi3SdioTicks()
+    Case 3 : ProcedureReturn Pi3SdioInit(250000000, 4)
+    Case 4 : ProcedureReturn Pi3SdioSetClock(400000)
+    Case 5 : ProcedureReturn Pi3SdioWaitIdle(0)
+    Case 6 : ProcedureReturn Pi3SdioCmd52Read(0, 7)
+    Case 7 : ProcedureReturn Pi3SdioCmd52Write(0, 7, 2)
+    Case 8 : ProcedureReturn Pi3SdioCmd53Read(1, 1, @p3_sdio_gate_words[1], 4, 0)
+    Case 9 : ProcedureReturn Pi3SdioCmd53Write(1, 1, @p3_sdio_gate_words[1], 4, 0)
+    Case 10 : ProcedureReturn Pi3SdioDiscover()
+    Case 11 : ProcedureReturn Pi3SdioGateInit(250000000, 4, p3_sdio_gate_words[133])
+  EndSelect
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,54 @@
+; Emitted contract gate for Neon's public GPU mapped-range query.
+; The gate drives the committed lifecycle/map state explicitly so it can test
+; the range predicate without starting V3D hardware or submitting work.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+Procedure.i Main()
+  ; No committed map exists before init, even if the optional heap is set.
+  If NeonGpuRangeMapped($00100000, 1) <> 0 : ProcedureReturn 1 : EndIf
+  If NeonGpuExtraMap($02000000, $2000) <> #NEON_OK : ProcedureReturn 2 : EndIf
+  If NeonGpuRangeMapped($02000000, $2000) <> 0 : ProcedureReturn 3 : EndIf
+
+  ; Invalid extra-map requests do not replace the prior valid configuration.
+  If NeonGpuExtraMap($02000001, $1000) = #NEON_OK : ProcedureReturn 4 : EndIf
+  If NeonGpuExtraMap($03000000, 2048) = #NEON_OK : ProcedureReturn 5 : EndIf
+  If NeonGpuExtraMap(0, 0) <> #NEON_OK : ProcedureReturn 6 : EndIf
+  If NeonGpuRangeMapped($02000000, $2000) <> 0 : ProcedureReturn 7 : EndIf
+  If NeonGpuExtraMap($02000000, $2000) <> #NEON_OK : ProcedureReturn 8 : EndIf
+
+  ; Model the committed-state inputs after successful MMU setup. This gate
+  ; covers the range predicate, not the full Neon lifecycle or shutdown path.
+  neon_mapBase = $00100000
+  neon_mapBytes = $5000
+  gNeonReady = 1
+  If NeonGpuRangeMapped($00100000, $5000) <> 1 : ProcedureReturn 9 : EndIf
+  If NeonGpuRangeMapped($00102000, $1000) <> 1 : ProcedureReturn 10 : EndIf
+  If NeonGpuRangeMapped($00104FFF, 1) <> 1 : ProcedureReturn 11 : EndIf
+  If NeonGpuRangeMapped($00104FFF, 2) <> 0 : ProcedureReturn 12 : EndIf
+  If NeonGpuRangeMapped($7FFFFFFFFFFFF000, $1000) <> 0 : ProcedureReturn 13 : EndIf
+  If NeonGpuRangeMapped($00105000, 1) <> 0 : ProcedureReturn 14 : EndIf
+  If NeonGpuRangeMapped($00104FF0, $1010) <> 0 : ProcedureReturn 15 : EndIf
+  If NeonGpuRangeMapped($00105000, $2000) <> 0 : ProcedureReturn 16 : EndIf
+  If NeonGpuRangeMapped($02000000, $2000) <> 1 : ProcedureReturn 17 : EndIf
+  If NeonGpuRangeMapped($02001FFF, 2) <> 0 : ProcedureReturn 18 : EndIf
+  If NeonGpuRangeMapped($01FFF000, $2000) <> 0 : ProcedureReturn 19 : EndIf
+  If NeonGpuRangeMapped($00100000, 0) <> 0 : ProcedureReturn 20 : EndIf
+  If NeonGpuRangeMapped(0, 1) <> 0 : ProcedureReturn 21 : EndIf
+
+  ; Not-ready state rejects both regions even while their descriptors remain
+  ; populated. Full NeonShutdown cleanup is outside this predicate gate.
+  gNeonReady = 0
+  neon_mapBase = 0 : neon_mapBytes = 0
+  If NeonGpuRangeMapped($00100000, 1) <> 0 : ProcedureReturn 22 : EndIf
+  If NeonGpuRangeMapped($02000000, 1) <> 0 : ProcedureReturn 23 : EndIf
+  ProcedureReturn 0
+EndProcedure

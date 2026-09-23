@@ -1,0 +1,988 @@
+; pi4V3dTfu.pi4 - stage 1 of the V3D bring-up. Does the GPU EXECUTE?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; WHAT THIS PROGRAM PROVES, AND WHAT IT REFUSES TO CLAIM.
+;
+;   pi4V3dIdent answers "is the block there". A register that reads
+;   $2124 proves the address derivation, the power domain, the clock,
+;   the reset and both bridges - and it proves nothing whatever about
+;   the engine DOING anything. Reading an ID register is something a
+;   dead block with a live bus interface does perfectly well.
+;
+;   This program hands the Texture Formatting Unit a 256-byte image in
+;   DRAM, asks it to rewrite that image into the GPU's tiled layout at
+;   a different address, and then CHECKS EVERY OUTPUT BYTE ON THE CPU
+;   against a layout computed here from first principles.
+;
+;   IT DOES NOT BELIEVE A STATUS BIT. TFU_CS's conversion counter
+;   moving is necessary and is nowhere near sufficient: a unit that
+;   incremented a counter and wrote nothing would look identical from
+;   the register side, and "the status said done and the buffer was
+;   untouched" is the exact shape of failure this project keeps
+;   finding. The pass criterion is 256 bytes in the right places, per
+;   job, three times.
+;
+; WHY THE TFU AND NOT THE GRAPHICS PIPELINE.
+;
+;   Because it is the smallest thing on this part that executes. It
+;   takes eleven register writes. It needs no control list, no binner,
+;   no tile state buffer, no tile allocation pool, no shader and no
+;   QPU assembler. The bin/render path needs all six of those and the
+;   minimum contents of its two command lists are not written down
+;   anywhere - v3d.pi4's WHY THERE IS STILL NO CONTROL LIST section
+;   works that through and it has not changed.
+;
+;   The CSD compute dispatcher is the other seven-write candidate and
+;   it is not here for one reason: its config registers point at a QPU
+;   PROGRAM, so it costs a QPU assembler before it costs anything
+;   else.
+;
+; THE THREE JOBS, AND WHY THERE ARE THREE.
+;
+;   All three convert a RASTER (plain linear) input into a LINEARTILE
+;   output, 32 bits per texel, so a microtile is 4x4 texels and 64
+;   bytes. All three move exactly 256 bytes. They differ in the ONE
+;   variable each is there to isolate.
+;
+;   J1  4 wide by 16 high.  THE OUTPUT MUST EQUAL THE INPUT, BYTE FOR
+;       BYTE. For an image only one microtile wide, the LINEARTILE
+;       address of a texel and its raster address are the same
+;       arithmetic - see THE LAYOUT below - so this job needs no
+;       tiling model at all to check. If J1 passes, bytes moved from
+;       one address to another because the GPU moved them. That is
+;       the claim in the title of this program and J1 alone settles
+;       it.
+;
+;   J2  16 wide by 4 high.  THE OUTPUT IS A PERMUTATION OF THE INPUT
+;       and the permutation is not the identity. Four microtiles side
+;       by side; texel (5,2) sits at raster offset $94 and at
+;       LINEARTILE offset $64. This job needs the layout model, and
+;       that is the point: J1 says the engine moved bytes, J2 says the
+;       engine FORMATTED them. If J1 passes and J2 fails, the fault is
+;       in the layout model or in the tiling encoding and not in the
+;       bring-up, which is a much smaller thing to go and look at.
+;
+;   J3  16 wide by 4 high again, and the ONLY difference from J2 is
+;       the texture format code: RGBA8 instead of R32F. Both are four
+;       bytes per texel and the TFU does no format conversion, so the
+;       output must be byte-identical to J2's. This is not padding:
+;       Mesa deliberately rewrites the format to a generic one of the
+;       same width for an exact copy (mesa-24.3.4_v3dx_tfu.c:66-77)
+;       and never says why it has to. "Should behave identically" is
+;       an inference; running both is a measurement. IF J2 AND J3
+;       DISAGREE THAT IS A FINDING, and nothing on this disk records
+;       it either way.
+;
+; THE LAYOUT, WHICH IS THE ONE PIECE OF ARITHMETIC THAT MATTERS.
+;
+;   From Mesa mesa-24.3.4, src/broadcom/common/v3d_tiling.c, fetched
+;   2026-08-27, which is the byte-level definition of every V3D
+;   tiling. Two functions, both quoted here because everything below
+;   depends on them being read right:
+;
+;     v3d_utile_width(4) = 4 and v3d_utile_height(4) = 4 (:37-66) - a
+;     microtile is always 64 bytes, so at four bytes per texel it is
+;     4x4 texels.
+;
+;     v3d_get_utile_pixel_offset (:70-82), the offset WITHIN a
+;     microtile: `x * cpp + y * utile_w * cpp`, i.e. plain raster
+;     order inside the tile. Its own comment: "Utiles are 64b blocks
+;     of pixels in raster order".
+;
+;     v3d_get_lt_pixel_offset (:84-102), LINEARTILE:
+;       64 * (utile_index_x + utile_index_y) + the offset within.
+;     with an assert that one of the two indices is always ZERO -
+;     "LINEARTILE is a single line of utiles in either the X or Y
+;     direction". Both jobs here are one microtile in one of the two
+;     directions, which is exactly the case LINEARTILE describes.
+;
+;   So, at four bytes per texel:
+;
+;     lt(x,y) = 64*((x/4) + (y/4)) + (x%4)*4 + (y%4)*16
+;
+;   For a 4-wide image (x/4 is always 0) that reduces to
+;   (y/4)*64 + (y%4)*16 + x*4, which is y*16 + x*4 - the raster
+;   offset. Hence J1's expectation. For a 16-wide, 4-high image (y/4
+;   is always 0) it is (x/4)*64 + (x%4)*4 + y*16, and raster is
+;   y*64 + x*4. Those differ for every texel outside the first
+;   microtile. Hence J2's.
+;
+;   AND LINEARTILE IS THE RIGHT DESTINATION FORMAT FOR THESE SIZES,
+;   not a convenient choice: mesa-24.3.4_v3d_resource.c:647-652 picks
+;   LINEARTILE for exactly the condition
+;   `level_width <= utile_w || level_height <= utile_h`. 4x16 and 16x4
+;   both satisfy it.
+;
+; THE PATTERN, AND WHY IT IS THE BYTE'S OWN OFFSET.
+;
+;   Input byte at offset k holds the value k. Two hundred and fifty
+;   six bytes, two hundred and fifty six distinct values, and a
+;   mismatch report can name the SOURCE offset of the byte that turned
+;   up in the wrong place instead of just saying the bytes differ. The
+;   output page is poisoned with $A5 first, all 4096 bytes of it, so
+;   "the unit wrote nothing" and "the unit wrote zeros" are different
+;   answers and both are distinguishable from a pass.
+;
+; THREE THINGS ARE CHECKED BEYOND THE 256 BYTES, all cheap and all
+; catching a class of encoding error that would otherwise look
+; plausible:
+;
+;   * THE INPUT IS UNCHANGED. The TFU must not write to its source.
+;   * THE OUTPUT PAGE BEYOND THE IMAGE IS STILL $A5. A wrong IOS or a
+;     wrong stride produces a correct-looking first tile and a spill
+;     past the end, and nothing in the image compare would see it.
+;   * THE PAGE TABLE ENTRIES READ BACK AS WRITTEN, so a failure can be
+;     attributed to the engine rather than to a table that was never
+;     really there.
+;
+; CACHE COHERENCY - WHICH REGIME THIS RUNS IN, STATED PLAINLY.
+;
+;   THE ARM MMU IS OFF. This program does not include mmu.pi4 and
+;   never calls MmuEnable(), so SCTLR_EL2.M is clear and ARMv8-A
+;   treats every data access as Device-nGnRnE. Nothing the CPU writes
+;   is ever in a cache and nothing the GPU writes is ever stale, so
+;   there is no coherency problem to have. That is deliberate: the
+;   question here is "did the engine move these bytes", and running it
+;   in the one regime where a cache cannot be the explanation is what
+;   makes a mismatch mean what it says.
+;
+;   THE LIBRARY STILL DOES THE MAINTENANCE. V3dTfuSubmit() takes the
+;   byte extent of both buffers and calls V3dCacheRange() over them
+;   before the job and over the output after it; with the MMU off
+;   those are `dc civac` on lines that were never allocated. They are
+;   there so the same code is correct when DRAM is cacheable, and
+;   because taking the extents as arguments makes the maintenance
+;   structural rather than remembered.
+;
+;   A GATE CANNOT CHECK ANY OF THAT. a64_v3d_check.py's memory is a
+;   flat dictionary of bytes with no caches in it, so it would pass
+;   with every cache operation in v3d.pi4 deleted. The cacheable-DRAM
+;   run is a BENCH experiment and it is owed; see the report.
+;
+; THE MEMORY MAP. Everything is inside the low payload window - up to
+; $07EFFFFF, its base is above the monitor and `map` prints it - the
+; same rule pi4DmaProbe.pi4:127-148 works from, and everything the GPU
+; touches is 4 KiB aligned because the
+; V3D page table has one entry per 4 KiB and no offset field.
+;
+;   $400000   this image. --load-addr.
+;   $480000   its BSS, 512 KiB above the load address.
+;   $640000   THE V3D PAGE TABLE, 16 KiB. Four bytes per 4 KiB of V3D
+;             virtual address space, so 4096 entries covering VA
+;             $000000..$FFFFFF. Zeroed by V3dMmuInit(), and only the
+;             two pages below are ever made valid - every other V3D
+;             address in that whole 16 MiB faults by construction.
+;   $648000   the MMU's illegal-address page. Where the hardware is
+;             told to send an access whose PTE is invalid
+;             (MMU_ILLEGAL_ADDR). Nothing reads it; it exists so that
+;             a fault has somewhere defined to go, on top of the abort.
+;   $650000   the TFU input page, 4 KiB. Image in the first 256 bytes.
+;   $651000   the TFU output page, 4 KiB. Poisoned with $A5.
+;
+;   THE MAPPING IS IDENTITY - V3D virtual $650000 is physical $650000.
+;   That is a choice and it is worth naming: it makes every address in
+;   the log mean one thing instead of two, and it costs nothing
+;   because the table is sparse either way. It does NOT mean the MMU
+;   is bypassed - there is no bypass here. Every one of those accesses
+;   is a real page table walk, and MMU_HIT / MMU_MISSES are printed
+;   afterwards to show that walks happened.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN. It is
+; sent to a resident monitor and RETURNS to it, so a wrong answer
+; costs a line of output rather than a power cycle:
+;
+;   pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dTfu.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o _work\v3dtfu.img
+;
+; ARM THE DEADMAN BEFORE RUNNING IT. `deadman 15`. This program starts
+; a DMA master with a page table. Every address it can reach is one of
+; two pages it mapped itself and everything else faults - but "cannot
+; reach" is a claim about this source, and the deadman is a claim
+; about nothing at all, which is what makes it worth having.
+;
+; IT ALSO UNMASKS TWO HUB INTERRUPT BITS, and puts them back. TFUC and
+; TFUF, around the jobs only, so that HUB_INT_STS.TFUF - the unit
+; reporting a failed conversion - is visible in the log.
+;
+;   WHY THAT IS SAFE HERE, checked rather than assumed: unmasking a V3D
+;   hub interrupt asserts VideoCore IRQ 10 towards the GIC
+;   (bcm2711-peripherals.txt:7963 is the one fact the vendor manual
+;   carries about V3D). Nothing takes it. This program contains no
+;   `enableinterrupts`, and neither does the resident monitor -
+;   RaspberryPi4/Monitor/anvil.pi4 has no interrupt enable and no GIC
+;   setup anywhere in it, and pmfc's own --entry-returns note says the
+;   loader's DAIF is left as it was. An asserted line with no enable
+;   and no handler is inert.
+;
+;   AND IT IS PUT BACK. The mask is restored before this program returns
+;   to the monitor, and the mask register is printed BEFORE and AFTER so
+;   that claim is checkable in the log rather than asserted in a
+;   comment. v3d.pi4 itself never unmasks anything; that is the
+;   caller's decision to make and this program is the caller.
+;
+; THE RETURN VALUE is the number of OUTPUT BYTES VERIFIED, so 768 -
+; $300 - on a clean run of all three jobs, and 0 if anything at all
+; went wrong. A partial number means some jobs passed and some did
+; not, and the log says which.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP, as constants. See the header.
+; ----------------------------------------------------------------------
+#TFU_PT       = $640000    ; V3D page table
+#TFU_PT_BYTES = 16384      ; 4096 entries, VA 0..$FFFFFF
+#TFU_ILLEGAL  = $648000    ; MMU illegal-address page
+#TFU_SRC      = $650000    ; input page
+#TFU_DST      = $651000    ; output page
+#TFU_PAGE     = 4096
+
+; The image. 32 bits per texel, so a microtile is 4x4 texels and 64
+; bytes (Mesa mesa-24.3.4 src/broadcom/common/v3d_tiling.c:37-66).
+#TFU_CPP        = 4
+#TFU_UTILE_W    = 4
+#TFU_UTILE_H    = 4
+#TFU_UTILE_BYTES = 64
+#TFU_IMG_BYTES  = 256      ; 64 texels either way round
+
+; J1 is one microtile wide, J2 and J3 are one microtile high.
+#TFU_J1_W = 4
+#TFU_J1_H = 16
+#TFU_J2_W = 16
+#TFU_J2_H = 4
+
+#TFU_POISON_BYTE = $A5     ; the same guard byte memory.pi4:1223 uses
+#TFU_POISON_WORD = $A5A5A5A5
+#TFU_SRC_FILLER  = $5A5A5A5A ; the input page beyond the image
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. PeekB names the SIGNED .b and sign-extends, so
+    ; a byte above 127 would come back negative and this loop would
+    ; never see its terminator.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+; 28 AND NOT 24. The longest label in this program, "bytes written past
+; image", is exactly twenty-four characters, so a 24-wide column printed
+; its value hard against the text with no space at all - unreadable at
+; the bench, and it also broke a gate check that was looking for the
+; label followed by a number.
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The error code, spelled out. A number alone sends the reader back
+;  to the library to look it up, and one run should be enough.
+; ----------------------------------------------------------------------
+Procedure PutErrName(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_BRIDGE_LEGACY
+      PutS("BRIDGE_LEGACY - $FE00A020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_BRIDGE_RPIVID
+      PutS("BRIDGE_RPIVID - $FEC11020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_PM_DEAD
+      PutS("PM_DEAD - PM_GRAFX read all-ones. PM base is wrong.")
+    Case #V3D_ERR_RESET
+      PutS("RESET - V3DRSTN did not stick. Password or offset.")
+    Case #V3D_ERR_ASB_MASTER
+      PutS("ASB_MASTER - master bridge ACK never cleared.")
+    Case #V3D_ERR_ASB_SLAVE
+      PutS("ASB_SLAVE - slave bridge ACK never cleared.")
+    Case #V3D_ERR_IDENT_ZERO
+      PutS("IDENT_ZERO - present but dark. Clock or reset.")
+    Case #V3D_ERR_IDENT_ONES
+      PutS("IDENT_ONES - nothing answers there. Mapping.")
+    Case #V3D_ERR_IDENT_VERSION
+      PutS("IDENT_VERSION - answering, and not V3D 4.2.")
+    Case #V3D_ERR_IDENT_CORES
+      PutS("IDENT_CORES - V3D 4.2, but NCORES is not 1.")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - stage 1 asked for before V3dInit() passed.")
+    Case #V3D_ERR_TFU_ABSENT
+      PutS("TFU_ABSENT - HUB_IDENT1.WITH_TFU is clear.")
+    Case #V3D_ERR_MMU_ABSENT
+      PutS("MMU_ABSENT - HUB_IDENT2.WITH_MMU is clear.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough.")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - a page is outside the table or is page 0.")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - TLB clear or MMUC flush never finished.")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - the V3D MMU is not on. No page table.")
+    Case #V3D_ERR_TFU_ARGS
+      PutS("TFU_ARGS - the job description cannot be encoded.")
+    Case #V3D_ERR_TFU_BUSY
+      PutS("TFU_BUSY - the unit was busy before submission.")
+    Case #V3D_ERR_TFU_TIMEOUT
+      PutS("TFU_TIMEOUT - CVTCT never moved. The unit did nothing.")
+    Case #V3D_ERR_TFU_FAIL
+      PutS("TFU_FAIL - HUB_INT_STS.TFUF. The unit said no.")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page table walk failed. See VIO_ADDR.")
+    Default
+      PutS("unknown code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  THE LAYOUT MODEL - the only arithmetic in this program that has to
+;  be right for the pass criterion to mean anything.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  UtileOffset - the byte offset of a texel WITHIN one 64-byte
+;  microtile, at four bytes per texel.
+;
+;  Mesa mesa-24.3.4 src/broadcom/common/v3d_tiling.c:70-82:
+;      return x * cpp + y * utile_w * cpp;
+;  with utile_w = 4 and cpp = 4, so x*4 + y*16. Raster order inside
+;  the tile, which is what its comment says: "Utiles are 64b blocks of
+;  pixels in raster order, with 32bpp being a 4x4 arrangement."
+;
+;  The two multiplications are written out rather than folded into
+;  shifts so that a reader can put this line beside that one.
+; ----------------------------------------------------------------------
+Procedure.i UtileOffset(x.i, y.i)
+  ProcedureReturn (x * #TFU_CPP) + (y * #TFU_UTILE_W * #TFU_CPP)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LtOffset - the byte offset of a texel in a LINEARTILE image.
+;
+;  Mesa mesa-24.3.4 src/broadcom/common/v3d_tiling.c:84-102:
+;      return (64 * (utile_index_x + utile_index_y) +
+;              v3d_get_utile_pixel_offset(cpp, x & (utile_w - 1),
+;                                              y & (utile_h - 1)));
+;
+;  THE ADDITION OF THE TWO INDICES IS NOT A TYPO AND IS NOT A
+;  MULTIPLY. The same file asserts one of them is always zero
+;  (:96) - "LINEARTILE is a single line of utiles in either the X or
+;  the Y direction" - so the sum is whichever one is non-zero. Both
+;  jobs here satisfy that; a caller who broke it would be outside the
+;  layout LINEARTILE describes and this procedure would quietly return
+;  a wrong answer, which is why the caller checks the shape first.
+;
+;  MODULO AND DIVIDE, NOT MASK AND SHIFT. The source masks with
+;  utile_w - 1 because it knows the width is a power of two. Writing
+;  the same thing as %4 and /4 here keeps this line readable next to
+;  the quoted one and costs nothing at this size; the values are small
+;  and positive so the two are exactly equivalent.
+; ----------------------------------------------------------------------
+Procedure.i LtOffset(x.i, y.i)
+  Define utileX.i
+  Define utileY.i
+  utileX = x / #TFU_UTILE_W
+  utileY = y / #TFU_UTILE_H
+  ProcedureReturn (#TFU_UTILE_BYTES * (utileX + utileY)) + UtileOffset(x % #TFU_UTILE_W, y % #TFU_UTILE_H)
+EndProcedure
+
+; The raster offset, for symmetry. Trivial, and written as a procedure
+; anyway so the two appear side by side in the source the way they do
+; in the comparison.
+Procedure.i RasterOffset(x.i, y.i, w.i)
+  ProcedureReturn ((y * w) + x) * #TFU_CPP
+EndProcedure
+
+; ======================================================================
+;  BUFFER SETUP AND VERIFICATION
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  FillSource - the image, then filler over the rest of the page.
+;
+;  Byte k of the image holds the value k. Two hundred and fifty six
+;  distinct bytes, so a byte found in the wrong place names its own
+;  source offset. Written a WORD at a time because PokeL is the
+;  32-bit store and a byte-at-a-time loop over Device memory with the
+;  MMU off is four times the bus traffic for no benefit.
+; ----------------------------------------------------------------------
+Procedure FillSource()
+  Define i.i
+  Define w.i
+  Define b.i
+  i = 0
+  While i < #TFU_IMG_BYTES
+    b = i
+    w = b | ((b + 1) << 8) | ((b + 2) << 16) | ((b + 3) << 24)
+    PokeL(#TFU_SRC + i, w)
+    i = i + 4
+  Wend
+  ; The rest of the page, so that a read past the image is visible as
+  ; filler rather than as whatever was there before.
+  While i < #TFU_PAGE
+    PokeL(#TFU_SRC + i, #TFU_SRC_FILLER)
+    i = i + 4
+  Wend
+EndProcedure
+
+; PoisonDest - all 4096 bytes, every time, before every job. Doing it
+; per job rather than once is what makes job N's result independent of
+; job N-1's: a unit that wrote nothing on the second job would
+; otherwise still show the first job's correct output.
+Procedure PoisonDest()
+  Define i.i
+  i = 0
+  While i < #TFU_PAGE
+    PokeL(#TFU_DST + i, #TFU_POISON_WORD)
+    i = i + 4
+  Wend
+EndProcedure
+
+; Results of the last verification, so the compare can report a
+; specific texel rather than a count.
+Global badCount.i  = 0
+Global badX.i      = -1
+Global badY.i      = -1
+Global badWant.i   = 0
+Global badGot.i    = 0
+Global badOffset.i = -1
+Global spillCount.i = 0
+Global srcChanged.i = 0
+
+; ----------------------------------------------------------------------
+;  VerifyImage - every texel of the output against the layout model.
+;
+;  FULL BYTE COVERAGE, and it is worth stating why rather than
+;  assuming it. Sixty-four texels at four bytes each is 256 bytes, and
+;  LtOffset is a bijection from those 64 texels onto the 256 byte
+;  offsets 0..255 for both of the shapes used here - four whole
+;  microtiles, no gaps, no overlap. So comparing texel by texel does
+;  compare every output byte, and no byte is checked twice or missed.
+;  If the shape changed so that the image did not exactly fill its
+;  microtiles, that would stop being true and this comment would be
+;  wrong; the shapes are constants at the top of the file for that
+;  reason.
+;
+;  Returns the number of texels that disagreed, and leaves the FIRST
+;  disagreement in the globals above.
+; ----------------------------------------------------------------------
+Procedure.i VerifyImage(w.i, h.i)
+  Define x.i
+  Define y.i
+  Define want.i
+  Define got.i
+  Define off.i
+
+  badCount  = 0
+  badX      = -1
+  badY      = -1
+  badWant   = 0
+  badGot    = 0
+  badOffset = -1
+
+  For y = 0 To h - 1
+    For x = 0 To w - 1
+      want = PeekN(#TFU_SRC + RasterOffset(x, y, w))
+      off  = LtOffset(x, y)
+      got  = PeekN(#TFU_DST + off)
+      If got <> want
+        If badCount = 0
+          badX      = x
+          badY      = y
+          badWant   = want
+          badGot    = got
+          badOffset = off
+        EndIf
+        badCount = badCount + 1
+      EndIf
+    Next
+  Next
+  ProcedureReturn badCount
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  VerifySpill - the output page beyond the image must still be
+;  poison.
+;
+;  A wrong IOS, a wrong stride or a wrong tiling code can produce a
+;  first microtile that looks perfect and a write that runs off the
+;  end of the image, and the texel compare above cannot see that at
+;  all. Checking the other 3840 bytes costs one loop.
+; ----------------------------------------------------------------------
+Procedure.i VerifySpill()
+  Define i.i
+  spillCount = 0
+  i = #TFU_IMG_BYTES
+  While i < #TFU_PAGE
+    If PeekN(#TFU_DST + i) <> #TFU_POISON_WORD
+      spillCount = spillCount + 1
+    EndIf
+    i = i + 4
+  Wend
+  ProcedureReturn spillCount
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  VerifySource - the input must be exactly as it was left.
+;
+;  The TFU reads its source and has no business writing it. A unit
+;  that wrote back over its input would still produce a passing image
+;  compare for J1, where input and output layouts happen to coincide.
+; ----------------------------------------------------------------------
+Procedure.i VerifySource()
+  Define i.i
+  Define b.i
+  Define w.i
+  srcChanged = 0
+  i = 0
+  While i < #TFU_IMG_BYTES
+    b = i
+    w = b | ((b + 1) << 8) | ((b + 2) << 16) | ((b + 3) << 24)
+    If PeekN(#TFU_SRC + i) <> w
+      srcChanged = srcChanged + 1
+    EndIf
+    i = i + 4
+  Wend
+  ProcedureReturn srcChanged
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Dump - sixteen bytes a line, for the bench log. Printed on a pass
+;  as well as on a failure: a correct dump is what the next person
+;  compares against when something changes.
+; ----------------------------------------------------------------------
+Procedure Dump(base.i, bytes.i)
+  Define i.i
+  Define j.i
+  Define b.i
+  i = 0
+  While i < bytes
+    PutS("    +")
+    PutHex(i, 3)
+    PutS("  ")
+    j = 0
+    While j < 16
+      b = PeekA(base + i + j)
+      PutHex(b, 2)
+      PutC(32)
+      j = j + 1
+    Wend
+    PutNl()
+    i = i + 16
+  Wend
+EndProcedure
+
+; ======================================================================
+;  ONE JOB, END TO END
+; ======================================================================
+
+Global jobBytesVerified.i = 0
+
+; ----------------------------------------------------------------------
+;  RunJob - describe it, submit it, wait, and check the bytes.
+;
+;  Returns the number of output bytes VERIFIED - 256 on a clean job
+;  and 0 on anything else. Not a boolean, because the caller adds them
+;  up and the total is this program's return value.
+;
+;  THE ORDER MATTERS. The destination is poisoned BEFORE the job and
+;  not after the previous one, so that a unit which did nothing at all
+;  leaves poison rather than the last job's answer.
+; ----------------------------------------------------------------------
+Procedure.i RunJob(*name, w.i, h.i, texType.i)
+  Define r.i
+  Define cs.i
+
+  PutS("-- ")
+  PutS(*name)
+  PutS(": ")
+  PutDec(w)
+  PutS(" x ")
+  PutDec(h)
+  PutS(" texels, RASTER in, LINEARTILE out, texture format ")
+  PutDec(texType)
+  PutNl()
+
+  PoisonDest()
+
+  r = V3dTfuBegin(w, h, texType)
+  If r <> #V3D_OK
+    PutS("   Begin refused: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  ; The stride of a tightly packed raster image is its width in
+  ; texels - iis = stride_bytes / cpp, and stride_bytes = w * cpp.
+  r = V3dTfuSourceRaster(#TFU_SRC, w, #TFU_IMG_BYTES)
+  If r <> #V3D_OK
+    PutS("   Source refused: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dTfuDest(#TFU_DST, #V3D_TFU_OFMT_LINEARTILE, #TFU_IMG_BYTES)
+  If r <> #V3D_OK
+    PutS("   Dest refused: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("   registers about to be written:")
+  PutNl()
+  RowHex("TFU_ICFG (plus IOC)", V3dTfuIcfgSent() | #V3D_TFU_ICFG_IOC)
+  RowHex("TFU_IIA", V3dTfuIiaSent())
+  RowDec("TFU_IIS, texels", V3dTfuIisSent())
+  RowHex("TFU_IOA", V3dTfuIoaSent())
+  RowHex("TFU_IOS", V3dTfuIosSent())
+
+  cs = V3dTfuCsNow()
+  RowHex("TFU_CS before", cs)
+  RowDec("  conversions so far", V3dTfuConversionsOf(cs))
+  RowDec("  free input slots", V3dTfuFreeSlotsOf(cs))
+  RowDec("  busy", V3dTfuBusyOf(cs))
+
+  r = V3dTfuSubmit()
+  If r <> #V3D_OK
+    PutS("   submit refused: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dTfuWait(#V3D_TFU_TIMEOUT_US)
+
+  PutS("   after the job:")
+  PutNl()
+  RowHex("TFU_CS after", V3dTfuCsAfter())
+  RowDec("  conversions before", V3dTfuConversionsBefore())
+  RowDec("  conversions after", V3dTfuConversionsAfter())
+  RowDec("  poll iterations", V3dTfuSpins())
+  RowHex("HUB_INT_STS", V3dTfuIntStsAtWait())
+  RowHex("MMU_CTL", V3dTfuMmuCtlAtWait())
+  RowHex("MMU_VIO_ADDR", V3dTfuVioAddrAtWait())
+  RowHex("MMU_VIO_ID", V3dTfuVioIdAtWait())
+  RowHex("CORE ERR_STAT", V3dErrStatNow())
+
+  If r <> #V3D_OK
+    PutS("   the unit did not report a conversion: ")
+    PutErrName(r)
+    PutNl()
+    PutS("   first 64 output bytes anyway - $A5 throughout means it")
+    PutNl()
+    PutS("   never wrote, anything else means it wrote and failed:")
+    PutNl()
+    Dump(#TFU_DST, 64)
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  AND NOW THE ONLY THING THAT COUNTS.
+  ; ------------------------------------------------------------------
+  VerifyImage(w, h)
+  VerifySpill()
+  VerifySource()
+
+  RowDec("texels wrong", badCount)
+  RowDec("bytes written past image", spillCount * 4)
+  RowDec("input texels changed", srcChanged)
+
+  If badCount <> 0
+    PutS("   FIRST MISMATCH at texel (")
+    PutDec(badX)
+    PutS(",")
+    PutDec(badY)
+    PutS("): output offset $")
+    PutHex(badOffset, 3)
+    PutS(" holds $")
+    PutHex(badGot, 8)
+    PutS(", expected $")
+    PutHex(badWant, 8)
+    PutNl()
+  EndIf
+
+  PutS("   output, first 64 bytes:")
+  PutNl()
+  Dump(#TFU_DST, 64)
+
+  If badCount <> 0
+    ProcedureReturn 0
+  EndIf
+  If spillCount <> 0
+    ProcedureReturn 0
+  EndIf
+  If srcChanged <> 0
+    ProcedureReturn 0
+  EndIf
+
+  PutS("   VERIFIED: all 256 output bytes are where the layout says.")
+  PutNl()
+  ProcedureReturn #TFU_IMG_BYTES
+EndProcedure
+
+
+Procedure Main()
+  Define r.i
+  Define verified.i
+  Define j1.i
+  Define j2.i
+  Define j3.i
+  Define maskBefore.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 1 - the TFU. Does the GPU EXECUTE? ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  Stage 0 first, and it is a precondition and not a formality.
+  ;  Nothing below may run against a block that has not identified
+  ;  itself: the TFU is a DMA master and V3D 7.1 puts a different
+  ;  register at $FEC00400.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0, from v3d.pi4: ")
+  PutErrName(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  RowDec("WITH_TFU", (V3dIdent1() >> 17) & 1)
+  RowDec("WITH_MMU", (V3dIdent2() >> 8) & 1)
+  RowHex("MMU_DEBUG_INFO", V3dMmuDebug())
+  RowDec("  MMU version", (V3dMmuDebug() >> 0) & $F)
+  RowDec("  VA width bits", (V3dMmuDebug() >> 4) & $F)
+  RowDec("  PA width bits", (V3dMmuDebug() >> 8) & $F)
+  RowDec("clock 5 MEASURED Hz", V3dClockMeasured())
+  PutNl()
+
+  If r <> #V3D_OK
+    PutS("STOPPED: ")
+    PutErrName(r)
+    PutNl()
+    PutS("Stage 1 needs a block that has identified itself. Run")
+    PutNl()
+    PutS("pi4V3dIdent first; its log says which step failed.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  1a. The V3D MMU. Its own page table, sparse on purpose.
+  ; ------------------------------------------------------------------
+  PutS("1a  the V3D MMU - the TFU's addresses are VIRTUAL")
+  PutNl()
+  PutS("    (v3d_submit.c:1054-1055, 'the TFU is behind the MMU')")
+  PutNl()
+
+  r = V3dMmuInit(#TFU_PT, #TFU_PT_BYTES, #TFU_ILLEGAL)
+  If r <> #V3D_OK
+    PutS("STOPPED: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dMmuMap(#TFU_SRC, #TFU_SRC, #TFU_PAGE)
+  If r <> #V3D_OK
+    PutS("STOPPED: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dMmuMap(#TFU_DST, #TFU_DST, #TFU_PAGE)
+  If r <> #V3D_OK
+    PutS("STOPPED: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  RowHex("page table at", V3dMmuPtBase())
+  RowDec("table bytes", #TFU_PT_BYTES)
+  RowDec("pages made valid", V3dMmuPagesMapped())
+  RowHex("MMU_CTL now", V3dMmuCtlNow())
+  RowHex("PTE for the input", V3dMmuEntry(#TFU_SRC))
+  RowHex("PTE for the output", V3dMmuEntry(#TFU_DST))
+  ; A PTE the CPU wrote and cannot read back is a table the engine
+  ; will not find either, and that failure would otherwise show up
+  ; only as a page fault with no explanation.
+  PutS("    (a PTE is $3")
+  PutS("0000000 or-ed with the physical page number, so the")
+  PutNl()
+  PutS("     two above should read $30000")
+  PutHex(#TFU_SRC >> 12, 3)
+  PutS(" and $30000")
+  PutHex(#TFU_DST >> 12, 3)
+  PutS(")")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  The GPU's own caches, once, before the first job. See
+  ;  V3dInvalidateCaches()'s header for why once and not per job.
+  ; ------------------------------------------------------------------
+  V3dInvalidateCaches()
+
+  ; TFUC and TFUF visible in HUB_INT_STS while the jobs run. Restored
+  ; before this program returns; both values are printed so the claim
+  ; is checkable.
+  maskBefore = V3dHubIntMaskNow()
+  V3dHubIntClear(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+  V3dHubIntUnmask(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+
+  ; ------------------------------------------------------------------
+  ;  1b. The three jobs.
+  ; ------------------------------------------------------------------
+  PutS("1b  the input image: 256 bytes at $")
+  PutHex(#TFU_SRC, 8)
+  PutS(", byte k holds k")
+  PutNl()
+  FillSource()
+  Dump(#TFU_SRC, 32)
+  PutNl()
+
+  j1 = RunJob("J1", #TFU_J1_W, #TFU_J1_H, #V3D_TEXFMT_R32F)
+  PutNl()
+  j2 = RunJob("J2", #TFU_J2_W, #TFU_J2_H, #V3D_TEXFMT_R32F)
+  PutNl()
+  j3 = RunJob("J3", #TFU_J2_W, #TFU_J2_H, #V3D_TEXFMT_RGBA8)
+  PutNl()
+
+  ; Put the interrupt mask back exactly as it was found.
+  V3dHubIntClear(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+  V3dHubIntMask(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+
+  ; ------------------------------------------------------------------
+  ;  What the whole run leaves behind.
+  ; ------------------------------------------------------------------
+  PutS("2   the block afterwards:")
+  PutNl()
+  RowDec("jobs submitted", V3dTfuJobs())
+  RowHex("TFU_CS", V3dTfuCsNow())
+  RowHex("HUB_INT_STS", V3dHubIntStsNow())
+  RowHex("HUB_INT_MSK before", maskBefore)
+  RowHex("HUB_INT_MSK now", V3dHubIntMaskNow())
+  RowHex("MMU_CTL", V3dMmuCtlNow())
+  RowHex("MMU_VIO_ADDR", V3dMmuVioAddrNow())
+  RowDec("MMU hits", V3dMmuHitsNow())
+  RowDec("MMU misses", V3dMmuMissesNow())
+  RowHex("CORE ERR_STAT", V3dErrStatNow())
+  RowHex("CTL_INT_STS", V3dCoreIntStsNow())
+  PutNl()
+
+  verified = j1 + j2 + j3
+  RowDec("bytes verified, J1", j1)
+  RowDec("bytes verified, J2", j2)
+  RowDec("bytes verified, J3", j3)
+  PutNl()
+
+  If verified <> (3 * #TFU_IMG_BYTES)
+    PutS("verdict: TFU_UNVERIFIED")
+    PutNl()
+    PutS("=== THE GPU DID NOT DEMONSTRABLY EXECUTE ANYTHING ===")
+    PutNl()
+    PutS("Read J1 first. If J1 passed and J2 did not, the engine ran")
+    PutNl()
+    PutS("and the tiling encoding or the layout model is wrong. If J1")
+    PutNl()
+    PutS("failed too, look at MMU_CTL and MMU_VIO_ADDR above before")
+    PutNl()
+    PutS("anything else.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("verdict: OK")
+  PutNl()
+  PutS("=== THE GPU EXECUTED. 768 OUTPUT BYTES VERIFIED ON THE CPU ===")
+  PutNl()
+  PutS("J1 moved bytes. J2 re-arranged them into microtiles. J3 says")
+  PutNl()
+  PutS("the texture format code did not change the bytes.")
+  PutNl()
+  ProcedureReturn verified
+EndProcedure

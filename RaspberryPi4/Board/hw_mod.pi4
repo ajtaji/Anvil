@@ -1,0 +1,208 @@
+; ======================================================================
+;  hw_mod.pi4 - THIS BOARD'S HALF OF THE DRIVER-MODULE CONTRACT
+; ----------------------------------------------------------------------
+;  REQUIRES, in this order, in the main file:
+;      RaspberryPi4/Board/memmap.pi4      #MOD_ARENA_* / #MOD_STAGE_*
+;      RaspberryPi4/Board/cache.pi4       CacheFlushRange
+;      Anvil/Hal/abi.pbi                  the #SVCCAP_* vocabulary
+;                                         (constants only; this file is
+;                                         included before the table)
+;
+;  FOUR THINGS THE CORE CANNOT KNOW AND THIS FILE ANSWERS:
+;
+;    WHERE A MODULE MAY LIVE. A window of DRAM that belongs to nothing
+;    else. The addresses and the five requirements that chose them are in
+;    memmap.pi4 beside every other window; this file only hands them out.
+;
+;    HOW TO MAKE WRITTEN BYTES EXECUTABLE. The loader writes a module as
+;    DATA and then branches into it, which on this architecture needs a
+;    clean to the point of unification and an instruction-cache
+;    invalidate over the code extent - unconditionally, whether or not a
+;    relocation patched a word.
+;
+;    WHAT DEVICES ARE HERE. A module says what it is FOR, in compatible
+;    ids covered by its digest; this board says what is PRESENT, with the
+;    handle a driver for it needs. Matching the two is core arithmetic.
+;    Nothing above this file learns an address from it.
+;
+;    WHICH SEAMS THE CORE ALREADY REACHES, and which this board could
+;    have at all. Those are two different questions with two different
+;    first things to check, and the capability model needs both.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE ARENA AND THE STAGING WINDOW.
+;
+;  Both sit inside #MOD_REGION_LO..#MOD_REGION_HI, which memmap.pi4
+;  declares as one of this monitor's reserved regions - so `w`, `fill`
+;  and `copy` already refuse them through HitsMonitor(), and a module is
+;  protected from an operator's typo the same way the monitor's own code
+;  is. They are two separate windows inside it because a container must
+;  be whole and verified somewhere OUTSIDE the arena before any of it is
+;  believed: the digest covers the header, and the relocation table and
+;  the compatible ids sit after the image, so nothing in the file can be
+;  trusted until all of it has been read.
+;
+;  ModArenaInit() CHECKS THIS AGAINST THE REST OF THE MAP rather than
+;  taking it on trust - it walks HwMonRegion*() and HwPay*() and refuses
+;  an arena overlapping any of them. HwModArenaRegion() below names the
+;  index of the region that IS the arena, so the check skips the one
+;  range that necessarily overlaps itself.
+; ----------------------------------------------------------------------
+Procedure.i HwModArenaBase()
+  ProcedureReturn #MOD_ARENA_LO
+EndProcedure
+
+Procedure.i HwModArenaBytes()
+  ProcedureReturn #MOD_ARENA_BYTES
+EndProcedure
+
+Procedure.i HwModArenaRegion()
+  ProcedureReturn #MON_REGION_MODULES
+EndProcedure
+
+Procedure.i HwModStageAddr()
+  ProcedureReturn #MOD_STAGE_LO
+EndProcedure
+
+Procedure.i HwModStageBytes()
+  ProcedureReturn #MOD_STAGE_BYTES
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwModCodeSync(base, bytes) - the bytes the loader wrote are about to
+;  be executed.
+;
+;  CacheFlushRange() is `dc cvau` + `ic ivau` per 64-byte line ending in
+;  dsb sy + isb, which is the sequence the Arm ARM gives for concurrent
+;  modification and execution of instructions (DDI 0487, B2.2.5, written
+;  out under B2.4.4). It takes a CLOSED range, so the last byte is
+;  base + bytes - 1 and not base + bytes; handing it the half-open end
+;  would clean one line past the module, which is harmless here and wrong
+;  everywhere else, so it is not done.
+;
+;  IT IS CALLED WHETHER OR NOT A RELOCATION PATCHED A WORD. The bytes
+;  arrived as a data copy; that they needed no patching afterwards says
+;  nothing about which cache they are sitting in.
+;
+;  pmfboot's payload path does NOT use this - it relies on the
+;  dsb sy / ic ialluis / dsb sy / isb inside CallAddr(), which is enough
+;  for an image entered once and never returned to. A module is called
+;  back into later, so it needs the per-line sequence over its own
+;  extent.
+; ----------------------------------------------------------------------
+Procedure.i HwModCodeSync(base.i, bytes.i)
+  If base <= 0 Or bytes <= 0
+    ProcedureReturn 0
+  EndIf
+  CacheFlushRange(base, base + bytes - 1)
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE DEVICES THIS BOARD IS WILLING TO HAND TO A DRIVER
+; ----------------------------------------------------------------------
+;  A device here is four facts: a compatible id a module can be built
+;  against, the seam group it belongs to, the handle a driver needs, and
+;  a phrase naming it for a person. Nothing else about it is published.
+;
+;  THE IDS ARE THE DEVICE TREE'S. `brcm,bcm2711-thermal` is the
+;  compatible string Linux's own bcm2711_thermal driver binds to
+;  (Datasheets/pi4/bcm2711.dtsi:68-77, the thermal node inside
+;  avs-monitor@7d5d2000). Reusing it rather than inventing a private name
+;  means a module written from the published driver documentation binds
+;  to the block that documentation describes, and that a second board
+;  carrying the same silicon can declare the same id without either side
+;  being renamed.
+;
+;  THE TOKEN IS THE BLOCK'S BASE ADDRESS, and handing it over is what
+;  removes the last hard-wired address from a converted driver. The
+;  translation to it is the device tree's own and is not the familiar
+;  one: bcm2711.dtsi:40-42 gives the soc node three ranges, and
+;  0x7d5d2000 falls in the SECOND (0x7c000000 -> 0xfc000000), so the
+;  processor address is $FD5D2000 and not $FE5D2000. Getting that wrong
+;  reads a different peripheral, and the validity bits in the register
+;  are what would catch it.
+; ======================================================================
+#HWDEV_AVS_MONITOR = $FD5D2000
+
+Procedure.i HwDevCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwDevIdAddr(i.i)
+  Select i
+    Case 0 : ProcedureReturn "brcm,bcm2711-thermal"
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevSeam(i.i)
+  Select i
+    Case 0 : ProcedureReturn #SVCCAP_THERMAL
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwDevToken(i.i)
+  Select i
+    Case 0 : ProcedureReturn #HWDEV_AVS_MONITOR
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; The board owns the prose about its own hardware and the core owns the
+; layout of the line - the same split HwMonRegionSay() and I2cSayPins()
+; are written under.
+Procedure HwDevSay(i.i)
+  Select i
+    Case 0
+      Print("the part's own temperature monitor")
+    Default
+      Print("a device this board does not have")
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  THE CAPABILITY QUESTIONS A MODULE MAKES NECESSARY
+; ----------------------------------------------------------------------
+;  HwSeamCore(id)     does the CORE reach this seam with no module at all
+;  HwSeamPossible(id) is the hardware here, whether or not anything
+;                     reaches it
+;
+;  THEY ARE SEPARATE BECAUSE A REFUSAL HAS TO TELL THREE STATES APART and
+;  they have three different first things to check:
+;
+;    no hardware here at all        "this board exposes no ... to Anvil"
+;    the core reaches it            no refusal; the command runs
+;    here, but nothing fills it     "... and no module is loaded that
+;                                   fills it. `mod` shows what is loaded."
+;
+;  #SVCCAP_THERMAL IS THE INTERESTING ONE AND IT ANSWERS 1 TO BOTH. The
+;  core still reaches a temperature through the firmware property
+;  interface with no module loaded, so the capability is 1 either way;
+;  what a loaded module changes is the SOURCE - a register read the fan
+;  policy can afford on every tick, instead of a mailbox round trip that
+;  a busy firmware can starve. A capability model that reported that as
+;  "gained a capability" would be lying in the operator's favour, which
+;  is the worst direction.
+;
+;  #SVCCAP_PWM is declared possible and not core-reachable: the hardware
+;  is on this part and the seam id is reserved, but no runtime slot block
+;  exists for it yet. That is a reservation, not an implementation, and
+;  saying so here is cheaper than two lanes discovering the id at once.
+; ======================================================================
+Procedure.i HwSeamCore(id.i)
+  Select id
+    Case #SVCCAP_THERMAL : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwSeamPossible(id.i)
+  Select id
+    Case #SVCCAP_THERMAL : ProcedureReturn 1
+    Case #SVCCAP_PWM     : ProcedureReturn 1
+  EndSelect
+  ProcedureReturn 0
+EndProcedure

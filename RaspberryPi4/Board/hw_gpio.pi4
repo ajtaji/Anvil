@@ -1,0 +1,233 @@
+; ======================================================================
+;  hw_gpio.pi4 - the Pi 4 HwGpio* backend. THE ONE FILE THAT KNOWS THE
+;  BCM2711'S GPIO ENCODING; the core above it knows only #HW_* codes.
+;
+;  This is the board side of the HwGpio* seam declared in Anvil/Hal/hal.pbi.
+;  Anvil/Core/gpio_cmd.pbi (the `gpio` command) calls these names and never
+;  touches a register or a raw FSEL code; this file is thin wrappers over
+;  RaspberryPi4/Lib/gpio.pi4, whose header carries the register-level
+;  reasoning (the $FE200000 base, the .l accesses, the BCM2711-only pull
+;  registers, and the out-of-order ALT4/ALT5 codes).
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * RaspberryPi4/Lib/gpio.pi4  BEFORE this file - it defines PinModeGet,
+;      DigitalRead, PinPullGet and the #PIN_*/#PULL_* raw codes this file
+;      translates. A library never includes a library (house rule 10), so
+;      board.pi4 lists both, gpio.pi4 first.
+;    * Anvil/Hal/hal.pbi          BEFORE this file - it defines the #HW_*
+;      vocabulary these wrappers return.
+;
+;  WHY TRANSLATE AT ALL, RATHER THAN RETURN THE RAW CODES. Because the raw
+;  codes are the part the core must not learn. Lib/gpio.pi4's FSEL numbers
+;  are the silicon's (Table 64): input is 000, output is 001, and the ALT
+;  codes are OUT OF ORDER - ALT4 is 3 and ALT5 is 2, not 8 and 9. A core
+;  that rendered a raw FSEL code would either carry that BCM2711 quirk
+;  (a chip fact in chip-free code) or render ALT4 and ALT5 wrong. So the
+;  ALT numbering is undone HERE, where the table is already documented, and
+;  the core is handed #HW_GPIO_ALT plus a plain alt number 0..5.
+;
+;  #CAP_GPIO IS 1 ON THIS BOARD, so this real backend is what runs. A board
+;  that declares #CAP_GPIO = 0 provides a stub hw_gpio (every wrapper
+;  returning the "bad"/-1 answer) and RequireCap in Anvil/Core/gpio_cmd.pbi
+;  refuses the command before any of these are reached - so these wrappers
+;  never have to defend against being called on a board with no GPIO.
+;
+;  NOT HARDWARE-VERIFIED. Lib/gpio.pi4's header says its procedures have
+;  never driven a real pin (checked 2026-08-27); wrapping them does not
+;  change that. The read path the `gpio` command uses (mode, level, pull)
+;  is read-only and safe to run on a live board; the write seam below
+;  (HwGpioMode/HwGpioWrite/HwGpioToggle) is provided for the fuller gpio
+;  family and inherits Lib/gpio.pi4's caveats about read-modify-write not
+;  being multi-core safe.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Extent.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioCount()
+  ; Every GPIO line the BCM2711 has - 58, banks 0..2 (Lib/gpio.pi4's
+  ; #PIN_COUNT, from BCM2711 ARM Peripherals section 5.1).
+  ProcedureReturn #PIN_COUNT
+EndProcedure
+
+Procedure.i HwGpioUserMax()
+  ; The highest pin that reaches the 40-pin header - GPIO0..27 are the
+  ; user pins (Pi 4 product datasheet section 5.1, "28x user GPIO");
+  ; 28..57 are real die lines used for on-board functions. The `gpio`
+  ; command reports up to here by default so it does not invite an
+  ; operator to poke a pin that is wired to the SD card or the PHY.
+  ProcedureReturn 27
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Mode - the pin's function, normalised to the #HW_GPIO_* vocabulary.
+;
+;  PinModeGet returns the raw 3-bit FSEL code (0..7) or -1 for a bad pin.
+;  0 is input, 1 is output, everything else is some alternate function.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioModeGet(pin.i)
+  Define m.i
+  m = PinModeGet(pin)
+  If m < 0
+    ProcedureReturn -1
+  EndIf
+  If m = #PIN_INPUT
+    ProcedureReturn #HW_GPIO_IN
+  EndIf
+  If m = #PIN_OUTPUT
+    ProcedureReturn #HW_GPIO_OUT
+  EndIf
+  ProcedureReturn #HW_GPIO_ALT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwGpioAltGet - the alternate-function NUMBER (0..5) for an ALT pin, or
+;  -1 for a bad pin or a pin that is a plain input/output.
+;
+;  THIS IS WHERE THE OUT-OF-ORDER TABLE IS UNDONE. Lib/gpio.pi4's
+;  #PIN_ALT0..#PIN_ALT5 are the raw codes 4,5,6,7,3,2 (Table 64, in that
+;  order on purpose). Mapping each back to its human ALT number is a
+;  Select over those six constants, so the mapping is one place and a
+;  reviewer checks six lines against the six constants - the same shape the
+;  library uses to hold the table in the first place.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioAltGet(pin.i)
+  Define m.i
+  m = PinModeGet(pin)
+  If m < 0
+    ProcedureReturn -1
+  EndIf
+  Select m
+    Case #PIN_ALT0
+      ProcedureReturn 0
+    Case #PIN_ALT1
+      ProcedureReturn 1
+    Case #PIN_ALT2
+      ProcedureReturn 2
+    Case #PIN_ALT3
+      ProcedureReturn 3
+    Case #PIN_ALT4
+      ProcedureReturn 4
+    Case #PIN_ALT5
+      ProcedureReturn 5
+  EndSelect
+  ; input or output - not an alternate function.
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Level and pull - already in the portable shape.
+;
+;  DigitalRead returns 0/1/-1 directly (#HW_ level codes ARE 0 and 1, and
+;  -1 is the shared bad-pin answer), so it needs no translation. PinPullGet
+;  returns #PULL_NONE/#PULL_UP/#PULL_DOWN whose values happen to equal the
+;  #HW_PULL_* codes, but they are mapped explicitly rather than passed
+;  through: the two enumerations are defined in different files for
+;  different reasons and a future divergence in either must not silently
+;  mislabel a pull. -1 (bad pin) and 3 (the reserved field value
+;  Lib/gpio.pi4 can report) both fall through to -1 here.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioLevelGet(pin.i)
+  ProcedureReturn DigitalRead(pin)
+EndProcedure
+
+Procedure.i HwGpioPullGet(pin.i)
+  Define p.i
+  p = PinPullGet(pin)
+  If p = #PULL_NONE
+    ProcedureReturn #HW_PULL_NONE
+  EndIf
+  If p = #PULL_UP
+    ProcedureReturn #HW_PULL_UP
+  EndIf
+  If p = #PULL_DOWN
+    ProcedureReturn #HW_PULL_DOWN
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The write seam - for the fuller gpio family (input/set/clear/toggle),
+;  not the read-only `gpio` status command wired today. Thin wrappers, so
+;  the family lands against the same seam the report already uses.
+;
+;  HwGpioMode takes a #HW_GPIO_* code and turns it into a Lib/gpio.pi4
+;  call. #HW_GPIO_ALT is refused here (returns 0): "make this pin some
+;  alternate function" is not a whole instruction - WHICH alternate is,
+;  and that is PinAlt(pin, n)'s job, which a later HwGpioAlt(pin, n) will
+;  expose. Refusing the ambiguous case rather than guessing an ALT is the
+;  same discipline PinMode uses when it refuses a mode outside 0..7.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioMode(pin.i, mode.i)
+  If mode = #HW_GPIO_IN
+    ProcedureReturn PinMode(pin, #PIN_INPUT)
+  EndIf
+  If mode = #HW_GPIO_OUT
+    ProcedureReturn PinMode(pin, #PIN_OUTPUT)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwGpioWrite(pin.i, level.i)
+  ProcedureReturn DigitalWrite(pin, level)
+EndProcedure
+
+Procedure.i HwGpioToggle(pin.i)
+  ProcedureReturn PinToggle(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwGpioReservedReason - the pins the BOARD ITSELF is using, that the
+;  `gpio` write subcommands must refuse to reconfigure.
+;
+;  Returns 0 for a pin that is free to drive, or the address of a
+;  lowercase fragment naming the on-board function that owns the pin. The
+;  fragment reads after "GPIO n is " and the core prints it with
+;  UartWriteStr, exactly as RequireCap prints its *reason - so the core
+;  never learns WHICH pins these are. This is the board's list because the
+;  wiring is the board's fact.
+;
+;  READING ANY PIN STAYS ALLOWED - this gates writes only. The status
+;  report deliberately reports these pins (that is how you SEE that the
+;  console is on ALT0 and the radio bus is up); what is refused is
+;  RE-configuring them out from under the running machine.
+;
+;  HOW THE LIST WAS DERIVED - from how the Pi 4's own drivers mux their
+;  pins, not from a web page:
+;
+;    GPIO 14, 15  the serial console. RaspberryPi4/Lib/uart.pi4's
+;                 uart_MuxPins() muxes exactly these two to ALT0 (TXD0/
+;                 RXD0); its header cites bcm2711-peripherals.pdf Table 171
+;                 and the device tree's uart0_gpio14 group. This is the pair
+;                 that carries this very prompt, so driving either one takes
+;                 the console down between one command and the next.
+;
+;    GPIO 34..39  the on-board Wi-Fi/Bluetooth radio. RaspberryPi4/Lib/
+;                 sdio.pi4 (header line 8, and sdio_MuxPins) drives the
+;                 CYW43455 - soldered down - over an SDIO bus muxed onto
+;                 these six lines, all in GPFSEL3. Reconfiguring one breaks
+;                 the radio's bus.
+;
+;    the micro-SD card  is NOT here, and that is a real finding rather than
+;                 an omission. RaspberryPi4/Lib/emmc.pi4 (the "EMMC2 NEEDS
+;                 NO PIN MUXING" note, its lines 202-206) records that the
+;                 Pi 4's card slot is EMMC2 on a DEDICATED socket with no
+;                 pinctrl and no BCM2711 GPIO behind it - so there are no
+;                 SD/eMMC pins on the 0..57 map to reserve. The legacy
+;                 SD0/SDIO on GPIO 48..53 that older Pis used for the card
+;                 is not the Pi 4's card path.
+;
+;  Bluetooth's UART on GPIO 30..33 is deliberately left OUT: bluetooth.pi4
+;  records that Anvil does not bring BT up and nothing here muxes 30..33,
+;  so refusing them would claim an in-use that is not true. Add them here
+;  the day a BT bring-up lands, next to the radio it belongs with.
+; ----------------------------------------------------------------------
+Procedure.i HwGpioReservedReason(pin.i)
+  If pin = 14 Or pin = 15
+    ProcedureReturn "the serial console this prompt is arriving on: the PL011 UART is muxed onto GPIO 14 and 15, and driving either would cut the console mid-command"
+  EndIf
+  If pin >= 34 And pin <= 39
+    ProcedureReturn "part of the on-board Wi-Fi and Bluetooth radio's SDIO bus: the CYW43455 is soldered down on GPIO 34 to 39"
+  EndIf
+  ProcedureReturn 0
+EndProcedure

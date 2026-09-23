@@ -1,0 +1,303 @@
+; ======================================================================
+;  thermal.pi4 - how hot the BCM2711 is, from a LOADED DRIVER and from
+;  the firmware, with the driver preferred and the firmware as the
+;  fallback.
+;
+;  THE REGISTER HALF OF THIS FILE BECAME A MODULE ON 2026-09-10.
+;
+;  It used to read the SoC's AVS ring-oscillator temperature monitor
+;  itself: an address, two validity bits and a straight-line conversion,
+;  all written down here. Those facts did not change and they did not go
+;  away - they moved, whole and with their citations, into
+;  RaspberryPi4/Modules/thermal_avs.pi4, which is compiled separately
+;  into THERMAL.MOD and loaded off the card at boot.
+;
+;  WHY, AND IT IS RULING 2 OF THE DRIVER-MODULE DESIGN: the core keeps
+;  only what reaches the card. Everyone is not going to have the same
+;  hardware, and a monitor that carries every part's temperature sensor
+;  compiled in is a monitor that grows one driver at a time forever. A
+;  temperature sensor is about as far from the boot path as a driver on
+;  this board gets - nothing that loads a module needs it - which is
+;  exactly why it went first.
+;
+;  TWO SOURCES, AND THEY ARE STILL NOT INTERCHANGEABLE
+;
+;    THE SEAM. A loaded driver publishes one function that answers the
+;    part's temperature in millidegrees Celsius. On this board that is a
+;    plain register read: no mailbox, no buffer, no cache maintenance,
+;    nothing that can be starved by a busy firmware. It answers in about
+;    the time a load takes, which is what makes a fan policy that runs on
+;    every tick affordable. WITH NO MODULE LOADED THE SEAM IS EMPTY and
+;    this file says so rather than pretending.
+;
+;    THE MAILBOX. GET_TEMPERATURE, which this tree has been asking the
+;    firmware since the `info` command existed. It costs a property-
+;    buffer round trip, it can be starved (see mailbox.pi4's notes on
+;    the framebuffer and the MBOX1 wedge), and it is the ONLY source for
+;    the throttle temperature - a temperature sensor reports what it
+;    measures and has no "and this is where I start slowing down" field.
+;    IT STAYS IN THE CORE. It is not a driver for a device; it is a
+;    question asked of the firmware that is already here for other
+;    reasons, and it is the fallback that makes the module optional.
+;
+;  SO: temperature comes from the seam when a driver fills it and answers,
+;  and from the mailbox when it does not. The maximum comes from the
+;  mailbox always. Which one answered is recorded and reported, because a
+;  board that has quietly fallen back to the mailbox is a board whose fan
+;  policy now costs a round trip per tick, and that should be visible
+;  rather than deduced. THAT REPORT IS NOW ALSO HOW AN OPERATOR SEES THAT
+;  A MODULE IS DOING SOMETHING: `fan` naming the direct source is the
+;  visible difference between THERMAL.MOD loaded and not.
+;
+;  THE FALLBACK IS WHY THIS CONVERSION IS SAFE TO DO WITHOUT A BOARD. A
+;  board with no THERMAL.MOD on its card behaves exactly as this tree did
+;  before the module existed, because the mailbox path is untouched and
+;  is what answered whenever the register was invalid anyway. The module
+;  can only restore the faster source, never remove the slower one.
+;
+;  EVERY NUMBER IN THIS FILE IS CELSIUS, AND NOTHING IN THIS FILE IS
+;  EVER PRINTED. Project ruling, 2026-09-07: every temperature a person
+;  reads is Fahrenheit. This library is the half of that rule that keeps
+;  its Celsius, and deliberately: the firmware answers GET_TEMPERATURE in
+;  millidegrees Celsius and the seam carries millidegrees Celsius, so a
+;  file rewritten into Fahrenheit could no longer be read line by line
+;  against the documents quoted in the driver. Convert at the edge, not
+;  in the maths.
+;
+;  THE CONVERSION IS Anvil/Hal/hal.pbi's HwTempMilliF()/HwTempWholeF(),
+;  once, for the whole tree.
+;
+;  REQUIRES, in this order, in the main file (house rule 10):
+;      Anvil/Hal/seams.pbi                            ; #SVCCAP_THERMAL
+;      Anvil/Hal/module_format.pbi
+;      Anvil/Hal/module_runtime.pbi                   ; #MOD_TEMP_NONE
+;      Anvil/Core/mod_registry.pbi                    ; the seam table
+;      RaspberryPi4/Lib/mailbox.pi4                   ; MailboxTemperature
+;      RaspberryPi4/Lib/thermal.pi4
+;
+;  HARDWARE-VERIFIED (2026-09-06, pi4-fan-silicon), and the measurement
+;  belongs to the driver that now carries it: `fan` on the board printed
+;  39 C (39920 millidegrees) sourced from "a sensor register the board
+;  reads directly", alongside the firmware's 85 C throttle point from the
+;  mailbox. The AVS address, the two validity bits and the negative slope
+;  are therefore measured and not only cited - in
+;  RaspberryPi4/Modules/thermal_avs.pi4, where they are now.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  SOURCES, and #THERM_NONE.
+;
+;  #THERM_NONE is not zero and not -1, and both of those matter. Zero is
+;  a real temperature (this part in a freezer) and -1 is a real
+;  temperature (colder still); a sentinel that collides with a reading
+;  is how a fan ends up off in a hot room. -273151 is a millidegree
+;  value below absolute zero, so it can never be a measurement, and it
+;  is far enough from every real reading that a caller comparing with
+;  the wrong operator gets an obviously absurd number rather than a
+;  nearly-right one.
+;
+;  IT IS THE SAME NUMBER AS #MOD_TEMP_NONE and they are still two
+;  definitions in two files, translated at the boundary below rather
+;  than shared - the same discipline #HW_TEMP_NONE is already under,
+;  and for the same reason: a future divergence becomes a compile-time
+;  question instead of a silent one.
+;
+;  #THERM_SRC_REGISTER KEPT ITS NAME AND ITS NUMBER through the module
+;  conversion, because it names what the OPERATOR sees - a reading that
+;  came straight off the part rather than through the firmware - and
+;  that did not change when the code that does it moved into a file of
+;  its own. Renaming it would have renamed a line in `fan`'s output for
+;  an internal reason.
+; ----------------------------------------------------------------------
+#THERM_NONE = -273151
+
+#THERM_SRC_NONE    = 0        ; nothing answered
+#THERM_SRC_REGISTER = 1       ; a driver reading the part directly
+#THERM_SRC_MAILBOX  = 2       ; the firmware property interface
+
+Global therm_source.i = #THERM_SRC_NONE
+Global therm_seamFails.i = 0  ; how many times the seam gave no reading
+Global therm_bind.i = -1      ; the binding held on the thermal seam
+
+; ----------------------------------------------------------------------
+;  ThermalSaySelf() - who is holding the seam, for `mod unload`'s refusal.
+;
+;  A printing procedure rather than a string because the core owns the
+;  layout of the refusal line and the consumer owns the words in it.
+; ----------------------------------------------------------------------
+Procedure ThermalSaySelf()
+  Print("the monitor's temperature readings")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ThermalSeamDetach() - give the seam back.
+;
+;  This is the other half of a binding and it is the half that makes a
+;  binding honest. A consumer that takes a service and offers no way to
+;  release it has not made `mod unload` refusable, it has made it
+;  impossible - and an unload that can never succeed is the same wrong
+;  answer as one that always does, wearing a safety label.
+;
+;  AFTER IT RUNS, TEMPERATURE STILL WORKS. The next read finds the seam
+;  empty and falls back to the firmware, which is exactly the state a
+;  board with no module on its card is in. Nothing anywhere has to be
+;  told; that is what the fallback is for.
+; ----------------------------------------------------------------------
+Procedure ThermalSeamDetach()
+  If therm_bind >= 0
+    ModSeamUnbind(therm_bind)
+    therm_bind = -1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ThermalSeamMilliC() - the loaded driver's answer, or #THERM_NONE.
+;
+;  THE CALL IS BRACKETED BY ModSeamEnter/ModSeamLeave. That pair is not a
+;  lock and is not reentrancy protection - this monitor runs one flow of
+;  control and the compiler gives a procedure static storage for its
+;  locals, so two calls into one driver at once would be wrong for
+;  reasons no counter could fix. What the depth catches is the case that
+;  CAN happen on one flow: a console command issued from inside a driver
+;  callback asking to unload the driver it is running in. `mod unload`
+;  refuses while the depth is non-zero, which is a return address into
+;  memory about to be abandoned.
+;
+;  THE BINDING IS TAKEN ON THE FIRST SUCCESSFUL READ and not when the
+;  module loads. Binding at load time would claim a service this file had
+;  not yet decided to use; binding on first use says exactly what is
+;  true, which is that the monitor's temperature readings now come from
+;  here and something has to release them before the driver goes away.
+; ----------------------------------------------------------------------
+Procedure.i ThermalSeamMilliC()
+  Define *fn
+  Define t.i
+  *fn = ModSeamFn(#SVCCAP_THERMAL, #SEAM_THERMAL_READ)
+  If *fn = 0
+    ProcedureReturn #THERM_NONE
+  EndIf
+  ModSeamEnter(#SVCCAP_THERMAL)
+  t = fn()
+  ModSeamLeave(#SVCCAP_THERMAL)
+  ; #MOD_TEMP_NONE and #THERM_NONE are the same number and are still
+  ; translated. Two definitions in two files, one boundary.
+  If t = #MOD_TEMP_NONE
+    therm_seamFails = therm_seamFails + 1
+    ProcedureReturn #THERM_NONE
+  EndIf
+  If therm_bind < 0
+    therm_bind = ModSeamBind(#SVCCAP_THERMAL, @ThermalSaySelf, @ThermalSeamDetach)
+    If therm_bind < 0
+      ; The registry is full of bindings. The READING IS STILL GOOD and
+      ; is returned; what is lost is the ability to refuse an unload
+      ; while this file is using it, which is a weaker guarantee and not
+      ; a reason to report a board as too hot to read.
+      therm_bind = -1
+    EndIf
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ThermalMailboxMilliC() - the firmware path.
+;
+;  MailboxTemperature() returns the firmware's millidegrees and 0 when
+;  the call failed - which is mailbox.pi4's convention and is fine there
+;  because 0 C from this tag has never been seen and the caller can ask
+;  MailboxError() why. It is NOT fine here, because this file's
+;  no-answer value has to be one that cannot collide with a reading, so
+;  a 0 from the mailbox is translated into #THERM_NONE.
+;
+;  THAT TRANSLATION LOSES A REAL 0 C READING and that is the right trade
+;  in this direction: a Pi 4 at exactly 0.000 C would be reported as "no
+;  answer" and the fan would fall back to the seam or to its own safe
+;  default, which is correct behaviour for a freezing board. The
+;  opposite trade - treating a failed call as 0 C - is a fan that never
+;  starts.
+; ----------------------------------------------------------------------
+Procedure.i ThermalMailboxMilliC()
+  Define t.i
+  t = MailboxTemperature()
+  If t = 0
+    ProcedureReturn #THERM_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; ThermalMaxMilliC() - the temperature at which the firmware starts
+; throttling. MAILBOX ONLY: a sensor reports what it measures and has no
+; field for what the firmware intends to do about it, so there is no
+; driver path to prefer here and none is pretended. It is also why this
+; half of the file could not have gone into the module: a driver for a
+; temperature block has nothing to say about it.
+Procedure.i ThermalMaxMilliC()
+  Define t.i
+  t = MailboxTemperatureMax()
+  If t = 0
+    ProcedureReturn #THERM_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ThermalMilliC() - THE ONE A CALLER WANTS. The loaded driver first, the
+;  mailbox second, #THERM_NONE if neither answered, and ThermalSource()
+;  says which it was.
+;
+;  THE SOURCE IS SET ON EVERY CALL, including the failing one. A stale
+;  source left over from the last successful read would report the direct
+;  path while the mailbox is quietly carrying the load - and now also
+;  while no module is loaded at all, which is the one thing an operator
+;  looking at `fan` needs this line to tell them.
+; ----------------------------------------------------------------------
+Procedure.i ThermalMilliC()
+  Define t.i
+  t = ThermalSeamMilliC()
+  If t <> #THERM_NONE
+    therm_source = #THERM_SRC_REGISTER
+    ProcedureReturn t
+  EndIf
+  t = ThermalMailboxMilliC()
+  If t <> #THERM_NONE
+    therm_source = #THERM_SRC_MAILBOX
+    ProcedureReturn t
+  EndIf
+  therm_source = #THERM_SRC_NONE
+  ProcedureReturn #THERM_NONE
+EndProcedure
+
+Procedure.i ThermalSource()
+  ProcedureReturn therm_source
+EndProcedure
+
+; How many times the loaded driver was asked and had no valid reading.
+; A rising count with a module loaded means the silicon is answering
+; invalid, not that the module is missing - `mod` tells those apart.
+Procedure.i ThermalRegisterFailures()
+  ProcedureReturn therm_seamFails
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ThermalWholeC(milli) - millidegrees to whole degrees, rounded to
+;  NEAREST and correct on both sides of zero.
+;
+;  Integer division truncates toward zero in this language, so
+;  (m + 500) / 1000 rounds correctly for positive m and wrongly for
+;  negative m: -1600 would give -1 where the nearest whole degree is -2.
+;  A Pi 4 below zero is unusual and not impossible - a board in an
+;  unheated workshop in winter is the case that eventually turns up -
+;  and a rounding rule that is only right in the common half is exactly
+;  the kind of thing that is never noticed and never right.
+;
+;  #THERM_NONE passes through unchanged so a caller can print the same
+;  sentinel test either side of the conversion.
+; ----------------------------------------------------------------------
+Procedure.i ThermalWholeC(milli.i)
+  If milli = #THERM_NONE
+    ProcedureReturn #THERM_NONE
+  EndIf
+  If milli >= 0
+    ProcedureReturn (milli + 500) / 1000
+  EndIf
+  ProcedureReturn -((-milli + 500) / 1000)
+EndProcedure

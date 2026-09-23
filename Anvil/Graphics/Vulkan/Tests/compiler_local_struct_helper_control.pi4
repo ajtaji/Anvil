@@ -1,0 +1,64 @@
+; Standalone reduced compiler control extracted from the V3D42 transaction.
+; Expected: report = {$4C535452, 112, 5, 2, 3, 4, 5, 8}.
+; This reduced control passes on the current A64 compiler. The larger V3D42
+; lowerer is still required to reproduce the vanished local-result fields.
+
+Structure LocalResult Align #PB_Structure_AlignC
+  codeBytes.i
+  uniformWords.i
+  pushFirstWord.i
+  pushRWord.i
+  pushGWord.i
+  pushBWord.i
+  pushAWord.i
+  tlbConfigWord.i
+EndStructure
+
+Global Dim localReport.i[8]
+
+Procedure ClearLocal(*r.LocalResult)
+  *r\codeBytes = 0
+  *r\uniformWords = 0
+  *r\pushFirstWord = -1
+  *r\pushRWord = -1
+  *r\pushGWord = -1
+  *r\pushBWord = -1
+  *r\pushAWord = -1
+  *r\tlbConfigWord = -1
+EndProcedure
+
+Procedure FillLocal(*r.LocalResult)
+  *r\pushFirstWord = 2
+  *r\pushRWord = 2
+  *r\pushGWord = 3
+  *r\pushBWord = 4
+  *r\pushAWord = 5
+  *r\tlbConfigWord = 8
+EndProcedure
+
+Procedure.i ValidateLocal(*r.LocalResult)
+  ProcedureReturn Bool(*r\pushFirstWord = 2 And *r\tlbConfigWord = 8)
+EndProcedure
+
+Procedure.i Main()
+  Protected rc.i
+  Protected codeBytes.i = 112
+  Protected uniformWords.i = 5
+  Protected pending.LocalResult
+  ClearLocal(@pending)
+  FillLocal(@pending)
+  rc = ValidateLocal(@pending)
+  If rc <> 0
+    pending\codeBytes = codeBytes
+    pending\uniformWords = uniformWords
+  EndIf
+  localReport[0] = $4C535452
+  localReport[1] = pending\codeBytes
+  localReport[2] = pending\uniformWords
+  localReport[3] = pending\pushFirstWord
+  localReport[4] = pending\pushGWord
+  localReport[5] = pending\pushBWord
+  localReport[6] = pending\pushAWord
+  localReport[7] = pending\tlbConfigWord
+  ProcedureReturn @localReport[0]
+EndProcedure

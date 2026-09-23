@@ -1,0 +1,469 @@
+; pi4ScrollFast.pi4 - IS THE CACHE MAINTENANCE THE SCROLL'S REAL COST,
+;                     AND IS IT SAFE TO SKIP WITH THE MMU OFF?
+;
+; DIAGNOSTIC. Does not ship. Runs as a PAYLOAD at $400000 under Anvil.
+;
+; ======================================================================
+;  WHERE THIS CAME FROM
+; ======================================================================
+; pi4ScrollTime.pi4 measured the monitor's console scroll on this board
+; on 2026-08-28, 1920 x 1080 x 32bpp, MMU off:
+;
+;   as the monitor scrolls today (CPU, chunk 8)      527.9 ms
+;   the same scroll through the DMA engine           213.9 ms
+;   the engine's copy of the block, on its own        10.4 ms
+;   the engine's fill of the vacated rows, on its own  1.6 ms
+;   one cache-maintenance walk over 7.37 MB          121.2 ms
+;
+; Twelve milliseconds of transfer inside a two-hundred-millisecond
+; operation. The rest is cache maintenance, and dma.pi4's own header
+; says of it: "WITH THE MMU OFF this is architecturally a no-op and
+; costs a few cycles per line." The first half of that sentence is true.
+; The second half is an estimate that was never measured, and the
+; measurement says 1.05 MICROSECONDS per line, not a few cycles.
+;
+; So there are two separate questions and this file answers both,
+; because getting them the wrong way round would produce a fast console
+; that is occasionally wrong:
+;
+;   1  IS IT SAFE? With the MMU off every access is Device memory, so
+;      nothing the CPU wrote is sitting in a cache and nothing the
+;      engine writes can be shadowed by a stale line. That is an
+;      ARGUMENT. Section 2 turns it into evidence: a known pattern is
+;      painted by the CPU, scrolled by the engine with NO maintenance at
+;      all, and every text row is read back and compared against what it
+;      must be.
+;
+;   2  IS IT WORTH IT? Section 3 times the same scroll with the
+;      maintenance and without it, in one image on one boot.
+;
+; Section 4 asks where the 1.05 us per line actually goes - the
+; instruction, or the loop around it - because "skip it" and "make it
+; fast" are different fixes and the MMU-ON case still needs the second.
+;
+; Section 5 prices the OTHER candidate: scrolling by moving the display
+; origin instead of moving pixels. One SET_VIRTUAL_OFFSET round trip is
+; 90 us, so a pan is nearly free - but this console has a fixed banner
+; band at the top that a pan drags off the screen with everything else,
+; so a pan owes a banner redraw. That redraw is what section 5 prices,
+; and it is the number that decides between the two mechanisms.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+#SF_SCRATCH = $700000
+#SF_SCRATCH_BYTES = 512
+#SF_BANNER = 120
+
+Global sfBad.i
+Global sfDma.i
+Global sfSink.i
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutMs(us.i)
+  PrintDec(us / 1000)
+  UartWriteStr(".")
+  PrintDec((us % 1000) / 100)
+  UartWriteStr(" ms")
+EndProcedure
+
+Procedure Report(*name, us.i, n.i)
+  Define per.i
+  If n < 1
+    n = 1
+  EndIf
+  per = us / n
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PutMs(per)
+  UartWriteStr("   (")
+  PrintDec(per)
+  UartWriteStr(" us)")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Pet()
+  SafetyWatchdogStart(15)
+EndProcedure
+
+; The empty half of section 4's comparison. It exists to be CALLED, so
+; that the loop it sits in pays exactly what the maintenance loop pays
+; for its call to DmaCacheLine() and differs only in the one
+; instruction being priced.
+Procedure NullCall()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE FAST SCROLL, IN FULL. Two engine transfers and nothing else.
+;
+;  This is DisplayScroll's contiguous branch with every DmaCacheRange
+;  taken out. It is NOT proposed as a replacement for the library's
+;  discipline in general - it is only correct because THIS surface is
+;  Device memory, which is only true because the MMU is off, which is
+;  only true because this is the monitor. Section 2 is what makes that
+;  a fact rather than a hope.
+; ----------------------------------------------------------------------
+Procedure.i FastScroll(top.i, rowsTotal.i, chgt.i, chunk.i, pitch.i, w.i, bg.i)
+  Define keep.i
+  Define dstA.i
+  Define srcA.i
+
+  keep = (rowsTotal - chunk) * chgt
+  dstA = DisplayBase() + (top * pitch)
+  srcA = dstA + (chunk * chgt * pitch)
+  If DmaCopy(dstA, srcA, keep * pitch) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaFill32(dstA + (keep * pitch), pitch, w, chunk * chgt, bg) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RowColour - a colour unique to a text row, and readable back.
+;
+;  The alpha byte is left alone: the surface is XRGB with alpha ignored,
+;  DisplayGetPixel returns the whole 32-bit word, and a colour built
+;  through DisplayRGB has $FF in the top byte. Building the oracle the
+;  same way DisplayRGB does means the comparison is against what the
+;  hardware will actually hold rather than against a number this file
+;  invented.
+; ----------------------------------------------------------------------
+Procedure.i RowColour(r.i)
+  ProcedureReturn DisplayRGB(16 + (r * 3), 40 + r, 200 - (r * 2))
+EndProcedure
+
+Procedure.i Main()
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define chgt.i
+  Define rows.i
+  Define bg.i
+  Define top.i
+  Define keepBytes.i
+  Define t0.i
+  Define us.i
+  Define i.i
+  Define r.i
+  Define c.i
+  Define want.i
+  Define got.i
+  Define x.i
+  Define n.i
+  Define a.i
+
+  PrintNl()
+  PutS("=== pi4ScrollFast - is the cache walk the cost, and may it go? ===")
+
+  If TimerInit() = 0
+    PutS("!! counter not running")
+    ProcedureReturn 1
+  EndIf
+  If MailboxInit() = 0
+    PutS("!! mailbox")
+    ProcedureReturn 2
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("!! display tags")
+    ProcedureReturn 3
+  EndIf
+  If DisplayInit(1920, 1080, 32) <> 1
+    PutS("!! DisplayInit")
+    ProcedureReturn 4
+  EndIf
+
+  w     = DisplayWidth()
+  h     = DisplayHeight()
+  pitch = DisplayPitch()
+  chgt  = DisplayCharHeight()
+  top   = #SF_BANNER
+
+  DisplayColour(DisplayRGB(226, 232, 240), DisplayRGB(0, 0, 40))
+  DisplayConsole(0, top, w, h - top)
+  DisplayAutoFlush(1)
+  rows = DisplayRows()
+  bg   = DisplayRGB(0, 0, 40)
+  keepBytes = (rows - 8) * chgt * pitch
+
+  UartWriteStr("  ")
+  PrintDec(w)
+  UartWriteStr("x")
+  PrintDec(h)
+  UartWriteStr(" pitch ")
+  PrintDec(pitch)
+  UartWriteStr("  console ")
+  PrintDec(DisplayCols())
+  UartWriteStr("x")
+  PrintDec(rows)
+  UartWriteStr(" at y=")
+  PrintDec(top)
+  PrintNl()
+  UartDrain()
+
+  If DmaSetScratch(#SF_SCRATCH, #SF_SCRATCH_BYTES) = 0
+    PutS("!! DmaSetScratch")
+    ProcedureReturn 5
+  EndIf
+  If DisplayDmaBind() = 0
+    PutS("!! DisplayDmaBind")
+    ProcedureReturn 6
+  EndIf
+  If DmaInit() = 0
+    UartWriteStr("!! DmaInit: ")
+    UartWriteStr(DmaErrorText())
+    PrintNl()
+    ProcedureReturn 7
+  EndIf
+  sfDma = 1
+  DisplayUseDma(0)
+  Pet()
+
+  ; ==================================================================
+  ;  1  THE BASELINE, AGAIN, IN THIS IMAGE
+  ; ==================================================================
+  ; Re-measured here rather than quoted from the other run, so the
+  ; before and the after are on one boot with one clock and cannot be
+  ; blamed on the two images differing.
+  PutS("")
+  PutS("1. THE BASELINE - one chunk-8 scroll exactly as the monitor does it")
+  t0 = Micros()
+  i = 0
+  While i < 3
+    DisplayScroll(8)
+    i = i + 1
+  Wend
+  us = (Micros() - t0) / 3
+  Report("CPU copy, auto-flush on", us, 1)
+  Pet()
+
+  ; ==================================================================
+  ;  2  CORRECTNESS FIRST. The picture, not the clock.
+  ; ==================================================================
+  ; Paint one flat colour per text row across the whole console, scroll
+  ; by eight rows with the engine and NO cache maintenance whatsoever,
+  ; then read every row back and demand exactly what a scroll owes:
+  ; rows 0..51 hold what rows 8..59 held, and rows 52..59 hold the
+  ; background.
+  ;
+  ; THREE COLUMNS PER ROW - the first pixel, the middle, and the last.
+  ; The first catches a transfer that started at the wrong address, the
+  ; last catches one that stopped short or lost its final partial burst,
+  ; and the middle catches nothing the other two would not - it is there
+  ; because a row that is right at both ends and wrong in between is the
+  ; one failure a two-column check would call a pass.
+  PutS("")
+  PutS("2. CORRECTNESS - engine scroll with NO cache maintenance at all")
+
+  r = 0
+  While r < rows
+    DspFillCell(0, top + (r * chgt), w, chgt, RowColour(r))
+    r = r + 1
+  Wend
+  Pet()
+
+  ; The paint above was CPU stores into Device memory. Nothing is
+  ; cleaned, on purpose: if a clean were needed, this is where its
+  ; absence would show up, and the whole question is whether it is.
+  If FastScroll(top, rows, chgt, 8, pitch, w, bg) = 0
+    UartWriteStr("!! the engine refused the scroll: ")
+    UartWriteStr(DmaErrorText())
+    PrintNl()
+    UartDrain()
+    sfBad = -1
+  Else
+    sfBad = 0
+    r = 0
+    While r < rows
+      If r < (rows - 8)
+        want = RowColour(r + 8)
+      Else
+        want = bg
+      EndIf
+      c = 0
+      While c < 3
+        If c = 0
+          x = 0
+        ElseIf c = 1
+          x = w / 2
+        Else
+          x = w - 1
+        EndIf
+        got = DisplayGetPixel(x, top + (r * chgt) + (chgt / 2))
+        If got <> want
+          If sfBad < 8
+            UartWriteStr("  ROW ")
+            PrintDec(r)
+            UartWriteStr(" COL ")
+            PrintDec(x)
+            UartWriteStr(" wanted ")
+            PrintDec(want)
+            UartWriteStr(" got ")
+            PrintDec(got)
+            PrintNl()
+            UartDrain()
+          EndIf
+          sfBad = sfBad + 1
+        EndIf
+        c = c + 1
+      Wend
+      r = r + 1
+    Wend
+    UartWriteStr("  ")
+    PrintDec(rows * 3)
+    UartWriteStr(" sample points checked, ")
+    PrintDec(sfBad)
+    UartWriteStr(" wrong")
+    PrintNl()
+    UartDrain()
+    If sfBad = 0
+      PutS("  PASS - the engine's scroll is byte-correct with no maintenance")
+    Else
+      PutS("  FAIL - the maintenance is NOT optional here; do not remove it")
+    EndIf
+  EndIf
+  Pet()
+
+  ; ==================================================================
+  ;  3  WHAT IT IS WORTH
+  ; ==================================================================
+  PutS("")
+  PutS("3. THE SAME SCROLL, TIMED")
+
+  ; The library's accelerated path, which pays for the maintenance.
+  DisplayUseDma(1)
+  t0 = Micros()
+  i = 0
+  While i < 3
+    DisplayScroll(8)
+    i = i + 1
+  Wend
+  us = (Micros() - t0) / 3
+  Report("engine, maintenance kept", us, 1)
+  DisplayUseDma(0)
+  Pet()
+
+  ; The same two transfers with nothing else in front of them.
+  t0 = Micros()
+  i = 0
+  While i < 5
+    FastScroll(top, rows, chgt, 8, pitch, w, bg)
+    i = i + 1
+  Wend
+  us = (Micros() - t0) / 5
+  Report("engine, no maintenance  ", us, 1)
+  Pet()
+
+  ; And one text row at a time, which is what a console that has not
+  ; been given a jump-scroll chunk would do.
+  t0 = Micros()
+  i = 0
+  While i < 5
+    FastScroll(top, rows, chgt, 1, pitch, w, bg)
+    i = i + 1
+  Wend
+  us = (Micros() - t0) / 5
+  Report("engine, chunk 1, no maint", us, 1)
+  Pet()
+
+  ; ==================================================================
+  ;  4  WHERE THE 1.05 us PER LINE GOES
+  ; ==================================================================
+  ; The maintenance walk is a Global store, a procedure call and a
+  ; "dc civac" per sixty-four bytes. Timing the walk gives the total;
+  ; timing the same iteration count with the call and the store but no
+  ; maintenance gives the overhead, and the difference is the
+  ; instruction. This matters even if the monitor stops calling it,
+  ; because a payload that turns the MMU on still has to.
+  PutS("")
+  PutS("4. WHAT THE MAINTENANCE WALK IS MADE OF")
+  n = keepBytes / 64
+
+  t0 = Micros()
+  DmaCacheRange(DisplayBase() + (top * pitch), keepBytes)
+  us = Micros() - t0
+  UartWriteStr("  DmaCacheRange over ")
+  PrintDec(keepBytes)
+  UartWriteStr(" bytes (")
+  PrintDec(n)
+  UartWriteStr(" lines)  ")
+  PutMs(us)
+  UartWriteStr("   ")
+  PrintDec((us * 1000) / n)
+  UartWriteStr(" ns per line")
+  PrintNl()
+  UartDrain()
+  Pet()
+
+  ; The same shape with no dc: a Global written and a procedure called
+  ; once per line. sfSink is a Global for the same reason
+  ; dma_flushaddr is one - so the store cannot be optimised out and the
+  ; call cannot be inlined away.
+  t0 = Micros()
+  i = 0
+  a = 0
+  While i < n
+    sfSink = a
+    NullCall()
+    a = a + 64
+    i = i + 1
+  Wend
+  us = Micros() - t0
+  UartWriteStr("  the same loop with no dc civac      ")
+  PutMs(us)
+  UartWriteStr("   ")
+  PrintDec((us * 1000) / n)
+  UartWriteStr(" ns per line")
+  PrintNl()
+  UartDrain()
+  Pet()
+
+  ; ==================================================================
+  ;  5  WHAT A PAN WOULD OWE THE BANNER
+  ; ==================================================================
+  ; Moving the display origin costs 90 us and moves no pixels, which
+  ; would beat everything above - except that this console does not own
+  ; the whole screen. The top 120 rows are a fixed banner, and a pan
+  ; drags it up with the text, so every pan owes a redraw of the band at
+  ; the window's new top. This prices that redraw the cheap way - an
+  ; engine fill of the band plus the banner's own text - and it is a
+  ; FLOOR, because the real banner also has a logo built from dozens of
+  ; small fills.
+  PutS("")
+  PutS("5. WHAT A HARDWARE PAN WOULD OWE THE BANNER, PER SCROLL")
+  DisplayAutoFlush(0)
+  t0 = Micros()
+  DmaFill32(DisplayBase(), pitch, w, #SF_BANNER, bg)
+  DisplayScale(3)
+  DisplayTextClear(28, 20, "PureMetal", DisplayRGB(226, 232, 240))
+  DisplayTextClear(28 + 3, 20 + 3, "Forge", DisplayRGB(0, 0, 16))
+  DisplayScale(1)
+  DisplayTextClear(28, 76, "bare-metal monitor   -   Raspberry Pi 4   -   BCM2711   -   AArch64 at EL2", DisplayRGB(120, 132, 150))
+  us = Micros() - t0
+  Report("band fill + banner text ", us, 1)
+  DisplayAutoFlush(1)
+  Pet()
+
+  PutS("")
+  If sfBad = 0
+    PutS("=== done - the no-maintenance engine scroll is proven correct here ===")
+  Else
+    PutS("=== done - CORRECTNESS FAILED, see section 2 ===")
+  EndIf
+  SafetyWatchdogStop()
+  ProcedureReturn 0
+EndProcedure

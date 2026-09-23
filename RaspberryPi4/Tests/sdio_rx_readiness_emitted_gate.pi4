@@ -1,0 +1,273 @@
+; Executable register-model gate for the optional SDIO receive-readiness
+; operation seam. Main returns the first failed assertion number, or zero.
+;
+; It drives the real production SdioInit generation guard, CMD52,
+; command/error cleanup, snapshot,
+; rollback, quiesce, pending and rearm procedures through modelled SDHCI and
+; CCCR registers supplied by tools/sdio_rx_readiness_emitted_check.py.
+
+; sdio.pi4 calls the public mailbox facade from procedures outside this
+; focused gate. Standalone stubs keep the library's compile closure honest;
+; no tested path calls them.
+Procedure.i MailboxReady()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MailboxBegin(tag.i, req.i, resp.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure MailboxSetWord(index.i, value.i)
+EndProcedure
+
+Procedure.i MailboxSend()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MailboxWord(index.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MailboxError()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MailboxRespBytes()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MailboxClockRateMeasured(id.i)
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+
+; Test-control registers intercepted by the emitted-code runner.
+#GATE_CTL             = $10000000
+#GATE_IOEX            = $00
+#GATE_IORX            = $04
+#GATE_IENX            = $08
+#GATE_HOST            = $0C
+#GATE_SIGNAL          = $10
+#GATE_CARD_PENDING    = $14
+#GATE_FAIL_IEN_WRITE  = $18
+#GATE_FAIL_HOST_MASK  = $1C
+#GATE_FAIL_COMMAND    = $20
+#GATE_CARD_W1C_WRITES = $24
+#GATE_SIGNAL_WRITES   = $28
+#GATE_LAST_INT_WRITE  = $2C
+#GATE_INT_WRITES      = $30
+#GATE_HOST_WRITES     = $34
+#GATE_DESTRUCTIVE     = $38
+#GATE_IEN_ARM_WRITES  = $3C
+
+Procedure GateSet(off.i, value.i)
+  PokeL(#GATE_CTL + off, value)
+EndProcedure
+
+Procedure.i GateGet(off.i)
+  ProcedureReturn PeekN(#GATE_CTL + off)
+EndProcedure
+
+Procedure GateModel(ioex.i, iorx.i, ien.i, host.i, signal.i)
+  GateSet(#GATE_IOEX, ioex)
+  GateSet(#GATE_IORX, iorx)
+  GateSet(#GATE_IENX, ien)
+  GateSet(#GATE_HOST, host)
+  GateSet(#GATE_SIGNAL, signal)
+  GateSet(#GATE_CARD_PENDING, 0)
+  GateSet(#GATE_FAIL_IEN_WRITE, 0)
+  GateSet(#GATE_FAIL_HOST_MASK, 0)
+  GateSet(#GATE_FAIL_COMMAND, 0)
+  GateSet(#GATE_CARD_W1C_WRITES, 0)
+  GateSet(#GATE_SIGNAL_WRITES, 0)
+  GateSet(#GATE_LAST_INT_WRITE, 0)
+  GateSet(#GATE_INT_WRITES, 0)
+  GateSet(#GATE_HOST_WRITES, 0)
+  GateSet(#GATE_DESTRUCTIVE, 0)
+  GateSet(#GATE_IEN_ARM_WRITES, 0)
+EndProcedure
+
+Procedure GateStateReset()
+  sdio_ready = 0
+  sdio_tickPerMs = 54000
+  sdio_err = #SDIO_ERR_NONE
+  sdio_lastCmd = $FF
+  sdio_lastIntr = 0
+  sdio_lastStat = 0
+  sdio_rxIrqArmed = 0
+  sdio_rxIrqSaved = 0
+  sdio_rxIrqSavedIen = 0
+  sdio_rxIrqSavedHost = 0
+  sdio_rxIrqLastError = #SDIO_RXIRQ_ERR_NONE
+  sdio_rxIrqArmCount = 0
+  sdio_rxIrqArmFailed = 0
+  sdio_rxIrqRestoreFailed = 0
+  sdio_rxIrqQuiesceFailed = 0
+  sdio_rxIrqRawChecks = 0
+  sdio_rxIrqRawPending = 0
+  sdio_rxIrqQuiesceCount = 0
+  sdio_rxIrqRearmCount = 0
+  sdio_rxIrqRearmPending = 0
+EndProcedure
+
+Procedure.i Main()
+  Define restores.i
+  Define quiesceFails.i
+  Define ops.i
+
+  GateModel(6, 6, $80, $00A00001, $12345678)
+  GateStateReset()
+
+  ; Default-off/unready operation is inert and reports why ARM refused.
+  If SdioRxIrqOp(#SDIO_RXIRQ_PENDING) <> -1 : ProcedureReturn 1 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_NOT_READY : ProcedureReturn 2 : EndIf
+
+  ; ARM requires both functions enabled in IOEx and ready in IORx. It
+  ; preserves unrelated card and host enable bits and never touches the
+  ; interrupt signal-enable register.
+  sdio_ready = 1
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 1 Or SdioRxIrqArmed() = 0 : ProcedureReturn 3 : EndIf
+  If GateGet(#GATE_IENX) <> $87 Or GateGet(#GATE_HOST) <> $00A00101 : ProcedureReturn 4 : EndIf
+  If GateGet(#GATE_SIGNAL) <> $12345678 Or GateGet(#GATE_SIGNAL_WRITES) <> 0 : ProcedureReturn 5 : EndIf
+  If SdioRxIrqArmCount() <> 1 Or SdioRxIrqArmFailures() <> 1 : ProcedureReturn 6 : EndIf
+
+  ; Raw level sampling, host quiesce, immediate rearm sampling and the quiet
+  ; rearm case are separate operations over the same snapshot.
+  If SdioRxIrqOp(#SDIO_RXIRQ_PENDING) <> 0 Or SdioRxIrqRawChecks() <> 1 : ProcedureReturn 7 : EndIf
+  GateSet(#GATE_CARD_PENDING, 1)
+  If SdioRxIrqOp(#SDIO_RXIRQ_PENDING) <> 1 Or SdioRxIrqRawPending() <> 1 : ProcedureReturn 8 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_QUIESCE) <> 1 Or (GateGet(#GATE_HOST) & #SDIO_INT_CARD_INT) <> 0 : ProcedureReturn 9 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_REARM) <> 1 Or SdioRxIrqRearmPending() <> 1 : ProcedureReturn 10 : EndIf
+  GateSet(#GATE_CARD_PENDING, 0)
+  If SdioRxIrqOp(#SDIO_RXIRQ_QUIESCE) <> 1 Or SdioRxIrqOp(#SDIO_RXIRQ_REARM) <> 0 : ProcedureReturn 11 : EndIf
+  If SdioRxIrqQuiesces() <> 2 Or SdioRxIrqRearms() <> 2 : ProcedureReturn 12 : EndIf
+
+  ; DISABLE restores the exact snapshots, not inferred defaults.
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 1 Or SdioRxIrqArmed() <> 0 : ProcedureReturn 13 : EndIf
+  If GateGet(#GATE_IENX) <> $80 Or GateGet(#GATE_HOST) <> $00A00001 : ProcedureReturn 14 : EndIf
+
+  ; IORx ready without IOEx enabled is not an operational function, nor is
+  ; IOEx enabled without IORx ready.
+  GateModel(2, 6, $40, $200001, $11111111)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_FUNCTIONS : ProcedureReturn 15 : EndIf
+  If GateGet(#GATE_IENX) <> $40 Or GateGet(#GATE_HOST) <> $200001 : ProcedureReturn 16 : EndIf
+  GateModel(6, 2, $40, $200001, $11111111)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_FUNCTIONS : ProcedureReturn 17 : EndIf
+
+  ; A failed IENx write rolls both snapshots back and retains the specific
+  ; arm error when that rollback was proved.
+  GateModel(6, 6, $90, $300001, $22222222)
+  GateSet(#GATE_FAIL_IEN_WRITE, 1)
+  restores = SdioRxIrqRestoreFailures()
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_IEN_WRITE : ProcedureReturn 18 : EndIf
+  If GateGet(#GATE_IENX) <> $90 Or GateGet(#GATE_HOST) <> $300001 : ProcedureReturn 19 : EndIf
+  If SdioRxIrqRestoreFailures() <> restores Or sdio_rxIrqSaved <> 0 : ProcedureReturn 20 : EndIf
+
+  ; A host-enable readback failure has the same exact rollback contract.
+  GateModel(6, 6, $A0, $400001, $33333333)
+  ; ARM performs a quiesce write, then the card-enable write: fail the second.
+  GateSet(#GATE_FAIL_HOST_MASK, 2)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_HOST_WRITE : ProcedureReturn 21 : EndIf
+  If GateGet(#GATE_IENX) <> $A0 Or GateGet(#GATE_HOST) <> $400001 Or sdio_rxIrqSaved <> 0 : ProcedureReturn 22 : EndIf
+
+  ; The first host quiesce is a verified transaction stage. If that write
+  ; does not land, ARM must not write the card's armed IENx value; it rolls
+  ; the untouched card snapshot and host snapshot back and retains the exact
+  ; host-stage diagnostic.
+  GateModel(6, 6, $A0, $410101, $34343434)
+  GateSet(#GATE_FAIL_HOST_MASK, 1)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_HOST_WRITE : ProcedureReturn 57 : EndIf
+  If GateGet(#GATE_IEN_ARM_WRITES) <> 0 Or GateGet(#GATE_IENX) <> $A0 : ProcedureReturn 58 : EndIf
+  If GateGet(#GATE_HOST) <> $410101 Or sdio_rxIrqSaved <> 0 Or SdioRxIrqArmed() <> 0 : ProcedureReturn 59 : EndIf
+
+  ; If exact DISABLE cannot restore the card, the snapshot stays retryable
+  ; and host CARD_INT remains verified quiesced until a later success.
+  GateModel(6, 6, $B0, $500001, $44444444)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 1 : ProcedureReturn 23 : EndIf
+  GateSet(#GATE_FAIL_IEN_WRITE, 1)
+  restores = SdioRxIrqRestoreFailures()
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_RESTORE : ProcedureReturn 24 : EndIf
+  If SdioRxIrqRestoreFailures() <> restores + 1 Or sdio_rxIrqSaved = 0 : ProcedureReturn 25 : EndIf
+  If (GateGet(#GATE_HOST) & #SDIO_INT_CARD_INT) <> 0 Or SdioRxIrqArmed() <> 0 : ProcedureReturn 26 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 1 Or GateGet(#GATE_IENX) <> $B0 Or GateGet(#GATE_HOST) <> $500001 : ProcedureReturn 27 : EndIf
+
+  ; If host writes themselves fail during rollback, do not claim CARD_INT is
+  ; quiesced. Report the unresolved state, retain the snapshot, then permit an
+  ; explicit retry to prove exact restoration.
+  GateModel(6, 6, $C0, $600001, $55555555)
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 1 : ProcedureReturn 28 : EndIf
+  GateSet(#GATE_HOST, $600101)
+  ; Fail restore's initial quiesce, exact restore, and best-effort quiesce.
+  GateSet(#GATE_FAIL_HOST_MASK, 7)
+  quiesceFails = SdioRxIrqQuiesceFailures()
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 0 Or sdio_rxIrqSaved = 0 : ProcedureReturn 29 : EndIf
+  If SdioRxIrqQuiesceFailures() <> quiesceFails + 1 Or (GateGet(#GATE_HOST) & #SDIO_INT_CARD_INT) = 0 : ProcedureReturn 30 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 1 Or GateGet(#GATE_HOST) <> $600001 Or GateGet(#GATE_IENX) <> $C0 : ProcedureReturn 31 : EndIf
+
+  ; Normal command completion and command-error cleanup preserve their old
+  ; response/error semantics while every broad W1C write excludes CARD_INT.
+  GateModel(6, 6, $D0, $700001, $66666666)
+  GateSet(#GATE_CARD_PENDING, 1)
+  If SdioCmd52Read(0, #SDIO_CCCR_IORx) <> 6 Or SdioLastCmd() <> 52 : ProcedureReturn 32 : EndIf
+  If GateGet(#GATE_CARD_W1C_WRITES) <> 0 Or (GateGet(#GATE_LAST_INT_WRITE) & #SDIO_INT_CARD_INT) <> 0 : ProcedureReturn 33 : EndIf
+  GateSet(#GATE_FAIL_COMMAND, 1)
+  If SdioCmd52Read(0, #SDIO_CCCR_IORx) <> -1 : ProcedureReturn 34 : EndIf
+  If SdioLastError() <> #SDIO_ERR_CMD_TIMEOUT Or (SdioLastIntr() & #SDIO_INT_TIMEOUT) = 0 : ProcedureReturn 35 : EndIf
+  If GateGet(#GATE_CARD_W1C_WRITES) <> 0 Or (GateGet(#GATE_LAST_INT_WRITE) & #SDIO_INT_CARD_INT) <> 0 : ProcedureReturn 36 : EndIf
+  If (PeekN(#SDIO_BASE + #SDIO_INT_STATUS) & #SDIO_INT_CARD_INT) = 0 : ProcedureReturn 37 : EndIf
+
+  If SdioRxIrqOp(99) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_BAD_OP : ProcedureReturn 38 : EndIf
+  If GateGet(#GATE_SIGNAL) <> $66666666 Or GateGet(#GATE_SIGNAL_WRITES) <> 0 : ProcedureReturn 39 : EndIf
+
+  ; A partial ARM whose internal rollback also fails retains the exact SDIO
+  ; snapshot. Another ARM is refused; an explicit later DISABLE can complete
+  ; restoration without replacing the owner.
+  GateModel(6, 6, $E0, $800001, $77777777)
+  ; First IEN write succeeds, rollback IEN write fails. The second host write
+  ; (CARD_INT enable) also fails and initiates rollback.
+  GateSet(#GATE_FAIL_IEN_WRITE, 2)
+  GateSet(#GATE_FAIL_HOST_MASK, 2)
+  restores = SdioRxIrqRestoreFailures()
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_RESTORE : ProcedureReturn 40 : EndIf
+  If sdio_rxIrqSaved = 0 Or SdioRxIrqRestoreFailures() <> restores + 1 : ProcedureReturn 41 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 0 Or SdioRxIrqLastError() <> #SDIO_RXIRQ_ERR_RESTORE : ProcedureReturn 42 : EndIf
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 1 Or sdio_rxIrqSaved <> 0 : ProcedureReturn 43 : EndIf
+  If GateGet(#GATE_IENX) <> $E0 Or GateGet(#GATE_HOST) <> $800001 : ProcedureReturn 44 : EndIf
+
+  ; SdioInit is a destructive transport-generation boundary. An active
+  ; readiness snapshot refuses before any GPIO, host or card operation and
+  ; before transport/snapshot state is reset. Repeated refusal is equally
+  ; inert; only the dedicated error result changes.
+  GateModel(6, 6, $F0, $900001, $88888888)
+  sdio_ready = 1
+  sdio_rca = $4567
+  sdio_cmd53Calls = 123
+  If SdioRxIrqOp(#SDIO_RXIRQ_ARM) <> 1 : ProcedureReturn 45 : EndIf
+  ops = GateGet(#GATE_DESTRUCTIVE)
+  If SdioInit() <> 0 Or SdioLastError() <> #SDIO_ERR_RXIRQ_OWNED : ProcedureReturn 46 : EndIf
+  If GateGet(#GATE_DESTRUCTIVE) <> ops Or GateGet(#GATE_IENX) <> $F7 Or GateGet(#GATE_HOST) <> $900101 : ProcedureReturn 47 : EndIf
+  If sdio_ready <> 1 Or sdio_rca <> $4567 Or sdio_cmd53Calls <> 123 Or sdio_rxIrqSavedIen <> $F0 Or sdio_rxIrqSavedHost <> $900001 : ProcedureReturn 48 : EndIf
+  If SdioInit() <> 0 Or GateGet(#GATE_DESTRUCTIVE) <> ops Or sdio_rxIrqSaved = 0 Or SdioRxIrqArmed() = 0 : ProcedureReturn 49 : EndIf
+
+  ; A failed exact restore changes ownership from active to restore-pending,
+  ; not to free. Repeated init attempts still issue no destructive operation
+  ; and retain the retryable old snapshots byte-for-byte.
+  GateSet(#GATE_FAIL_IEN_WRITE, 1)
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 0 Or sdio_rxIrqSaved = 0 Or SdioRxIrqArmed() <> 0 : ProcedureReturn 50 : EndIf
+  ops = GateGet(#GATE_DESTRUCTIVE)
+  If SdioInit() <> 0 Or SdioLastError() <> #SDIO_ERR_RXIRQ_OWNED : ProcedureReturn 51 : EndIf
+  If GateGet(#GATE_DESTRUCTIVE) <> ops Or sdio_rxIrqSavedIen <> $F0 Or sdio_rxIrqSavedHost <> $900001 Or sdio_ready <> 1 : ProcedureReturn 52 : EndIf
+  If SdioInit() <> 0 Or GateGet(#GATE_DESTRUCTIVE) <> ops Or sdio_rxIrqSaved = 0 : ProcedureReturn 53 : EndIf
+
+  ; Once DISABLE verifies both exact snapshots, SdioInit may enter a new
+  ; generation. This focused model deliberately identifies no controller, so
+  ; failure there proves the ownership guard was crossed without pretending a
+  ; complete hardware bootstrap; all old readiness latches are then clear.
+  If SdioRxIrqOp(#SDIO_RXIRQ_DISABLE) <> 1 Or GateGet(#GATE_IENX) <> $F0 Or GateGet(#GATE_HOST) <> $900001 : ProcedureReturn 54 : EndIf
+  ops = GateGet(#GATE_DESTRUCTIVE)
+  If SdioInit() <> 0 Or SdioLastError() <> #SDIO_ERR_NO_CONTROLLER Or GateGet(#GATE_DESTRUCTIVE) <= ops : ProcedureReturn 55 : EndIf
+  If sdio_rxIrqSaved <> 0 Or SdioRxIrqArmed() <> 0 Or sdio_rxIrqSavedIen <> 0 Or sdio_rxIrqSavedHost <> 0 Or sdio_ready <> 0 : ProcedureReturn 56 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

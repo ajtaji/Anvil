@@ -1,0 +1,29 @@
+; Deliberately unhealthy A/B trial candidate. IN-HOUSE INSTRUMENT, NEVER SHIPPED.
+;
+; The loader arms a 15-second trial watchdog at L0 and hands it to the payload
+; at L6. A healthy candidate confirms its generation and stops that watchdog;
+; this one enters, says exactly what it is, and then parks forever without
+; confirming anything. The hardware watchdog must therefore reset the board, and
+; the loader must see a TRIED record with no CONFIRMED and boot the previously
+; confirmed slot instead.
+;
+; It deliberately does NOT call Pi3UpdateBootStart: it must not mount storage,
+; touch a control record or write anything at all. Everything it needs - the
+; PL011 already configured by the loader - it was handed.
+;
+; Same placement as the real updater slot, because the loader copies a slot to
+; its recorded entry address and the P3SLOT wrapper checks it exactly.
+LoadAddress $200000
+BssAddress $1100000
+StackAddress $1F00000
+#ANVIL_BUILD = 0 ; pmf:build off
+#ANVIL_BUILD_DATE = 20260918 ; pmf:builddate
+#ANVIL_BUILD_TIME = 172500 ; pmf:buildtime
+XIncludeFile "RaspberryPi3/Board/update_boot_support.pbi"
+Procedure Main()
+  pi3_dtb = $1000000
+  pi3ut_WriteLine("C0: candidate Main entered")
+  pi3ut_WriteLine("WDT: unhealthy trial candidate; it will never confirm, so the 15-second trial watchdog must reset this board")
+  pi3ut_WriteLine("WDT: parking now; the next thing on this port should be the loader, booting the confirmed slot")
+  Pi3Park()
+EndProcedure

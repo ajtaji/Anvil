@@ -1,0 +1,248 @@
+; Emitted-code gate for DisplayBlit's native-format DMA seam.
+; The DMA entry points are deterministic recorders: no MMIO is touched.
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#DB_REPORT = $9000000
+#DB_SURFACE = $9010000
+#DB_SOURCE_A = $9020000
+#DB_SOURCE_B = $9030000
+
+Global dbCopyOk.i = 1
+Global dbCopyCalls.i = 0
+Global dbCopyDst.i = 0
+Global dbCopyDstPitch.i = 0
+Global dbCopySrc.i = 0
+Global dbCopySrcPitch.i = 0
+Global dbCopyBytes.i = 0
+Global dbCopyRows.i = 0
+Global dbCacheCalls.i = 0
+Global dbCacheAddr0.i = 0
+Global dbCachePitch0.i = 0
+Global dbCacheBytes0.i = 0
+Global dbCacheRows0.i = 0
+Global dbCacheAddr1.i = 0
+Global dbCachePitch1.i = 0
+Global dbCacheBytes1.i = 0
+Global dbCacheRows1.i = 0
+Global dbCacheAddr2.i = 0
+Global dbCachePitch2.i = 0
+Global dbCacheBytes2.i = 0
+Global dbCacheRows2.i = 0
+
+Procedure.i DmaQuarantined()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DmaReady()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DmaSetBounds(base.i, bytes.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure DmaCacheRect(addr.i, pitch.i, rowBytes.i, rows.i)
+  If dbCacheCalls = 0
+    dbCacheAddr0 = addr
+    dbCachePitch0 = pitch
+    dbCacheBytes0 = rowBytes
+    dbCacheRows0 = rows
+  ElseIf dbCacheCalls = 1
+    dbCacheAddr1 = addr
+    dbCachePitch1 = pitch
+    dbCacheBytes1 = rowBytes
+    dbCacheRows1 = rows
+  ElseIf dbCacheCalls = 2
+    dbCacheAddr2 = addr
+    dbCachePitch2 = pitch
+    dbCacheBytes2 = rowBytes
+    dbCacheRows2 = rows
+  EndIf
+  dbCacheCalls = dbCacheCalls + 1
+EndProcedure
+
+Procedure DmaCacheRange(addr.i, bytes.i)
+EndProcedure
+
+Procedure.i DmaFillPattern32(dst.i, pitch.i, rowBytes.i, rows.i, colour.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DmaCopy(dst.i, src.i, bytes.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DmaCopy2D(dst.i, dstPitch.i, src.i, srcPitch.i, rowBytes.i, rows.i)
+  Define row.i
+  Define col.i
+  dbCopyCalls = dbCopyCalls + 1
+  dbCopyDst = dst
+  dbCopyDstPitch = dstPitch
+  dbCopySrc = src
+  dbCopySrcPitch = srcPitch
+  dbCopyBytes = rowBytes
+  dbCopyRows = rows
+  If dbCopyOk = 0
+    ProcedureReturn 0
+  EndIf
+  row = 0
+  While row < rows
+    col = 0
+    While col < rowBytes
+      PokeA(dst + (row * dstPitch) + col, PeekA(src + (row * srcPitch) + col))
+      col = col + 1
+    Wend
+    row = row + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+Procedure DbPut(index.i, value.i)
+  PokeL(#DB_REPORT + (index * 4), value)
+EndProcedure
+
+Procedure DbResetTrace()
+  dbCopyCalls = 0
+  dbCacheCalls = 0
+  dbCopyDst = 0
+  dbCopyDstPitch = 0
+  dbCopySrc = 0
+  dbCopySrcPitch = 0
+  dbCopyBytes = 0
+  dbCopyRows = 0
+  dbCacheAddr0 = 0
+  dbCachePitch0 = 0
+  dbCacheBytes0 = 0
+  dbCacheRows0 = 0
+  dbCacheAddr1 = 0
+  dbCachePitch1 = 0
+  dbCacheBytes1 = 0
+  dbCacheRows1 = 0
+  dbCacheAddr2 = 0
+  dbCachePitch2 = 0
+  dbCacheBytes2 = 0
+  dbCacheRows2 = 0
+EndProcedure
+
+Procedure DbFill(addr.i, pitch.i, w.i, h.i, seed.i)
+  Define x.i
+  Define y.i
+  y = 0
+  While y < h
+    x = 0
+    While x < w
+      PokeL(addr + (y * pitch) + (x * 4), seed + (y * 16) + x)
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+Procedure Main()
+  Define before.i
+
+  dsp_ready = 1
+  dsp_base = #DB_SURFACE
+  dsp_size = 240
+  dsp_w = 8
+  dsp_h = 6
+  dsp_pitch = 40
+  dsp_depth = 32
+  dsp_bpp = 4
+  dsp_dmaOn = 1
+  dsp_dmaRead = 1
+  dsp_dmaMin = 0
+  dsp_auto = 1
+  DisplayDmaStatsReset()
+
+  DbFill(#DB_SOURCE_A, 24, 6, 6, $1000)
+  DbFill(#DB_SOURCE_B, 20, 5, 5, $2000)
+  DbFill(#DB_SURFACE, 40, 10, 6, $7000)
+
+  ; Clip two columns and one row from the source while the destination is
+  ; clipped to (0,0)-(3,3).  The DMA helper must see that exact rectangle.
+  DbResetTrace()
+  dbCopyOk = 1
+  dsp_flushaddr = $12345678
+  DisplayBlit(#DB_SOURCE_A, 24, -2, -1, 5, 4)
+  DbPut(0, dbCopyCalls)
+  DbPut(1, dbCopyDst)
+  DbPut(2, dbCopyDstPitch)
+  DbPut(3, dbCopySrc)
+  DbPut(4, dbCopySrcPitch)
+  DbPut(5, dbCopyBytes)
+  DbPut(6, dbCopyRows)
+  DbPut(7, dbCacheCalls)
+  DbPut(8, dbCacheAddr0)
+  DbPut(9, dbCachePitch0)
+  DbPut(10, dbCacheBytes0)
+  DbPut(11, dbCacheRows0)
+  DbPut(12, dbCacheAddr1)
+  DbPut(13, dbCachePitch1)
+  DbPut(14, dbCacheBytes1)
+  DbPut(15, dbCacheRows1)
+  DbPut(16, dbCacheAddr2)
+  DbPut(17, dbCachePitch2)
+  DbPut(18, dbCacheBytes2)
+  DbPut(19, dbCacheRows2)
+  DbPut(20, PeekL(#DB_SURFACE))
+  DbPut(21, PeekL(#DB_SURFACE + 8))
+  DbPut(22, PeekL(#DB_SURFACE + 40 + 4))
+  DbPut(23, PeekL(#DB_SURFACE + 12))
+  DbPut(24, dsp_flushaddr)
+  DbPut(25, DisplayDmaOps())
+  DbPut(26, DisplayDmaFallbacks())
+  DbPut(27, DisplayDmaRefusals())
+
+  ; The engine refuses.  Cache prepasses occur, the CPU loop still draws
+  ; the correct image, and DspTouched is now expected to run.
+  DbResetTrace()
+  dbCopyOk = 0
+  dsp_flushaddr = $55667788
+  DisplayBlit(#DB_SOURCE_B, 20, 2, 2, 3, 2)
+  DbPut(28, dbCopyCalls)
+  DbPut(29, dbCacheCalls)
+  DbPut(30, PeekL(#DB_SURFACE + (2 * 40) + 8))
+  DbPut(31, PeekL(#DB_SURFACE + (3 * 40) + 16))
+  DbPut(32, dsp_flushaddr)
+  DbPut(33, DisplayDmaOps())
+  DbPut(34, DisplayDmaFallbacks())
+  DbPut(35, DisplayDmaRefusals())
+
+  ; A policy fallback must not ask DMA or run cache maintenance.
+  DbResetTrace()
+  dbCopyOk = 1
+  dsp_dmaMin = 100
+  DisplayBlit(#DB_SOURCE_B, 20, 6, 4, 4, 4)
+  DbPut(36, dbCopyCalls)
+  DbPut(37, dbCacheCalls)
+  DbPut(38, PeekL(#DB_SURFACE + (4 * 40) + 24))
+  DbPut(39, PeekL(#DB_SURFACE + (5 * 40) + 28))
+  DbPut(40, DisplayDmaOps())
+  DbPut(41, DisplayDmaFallbacks())
+  DbPut(42, DisplayDmaRefusals())
+
+  ; Existing DisplayCopyRect still uses its own clipped DMA seam.
+  dsp_dmaMin = 0
+  dbCopyOk = 1
+  DbResetTrace()
+  before = PeekL(#DB_SURFACE + (4 * 40))
+  DisplayCopyRect(0, 4, 0, 0, 3, 2)
+  DbPut(43, dbCopyCalls)
+  DbPut(44, dbCopySrc)
+  DbPut(45, dbCopyDst)
+  DbPut(46, dbCopyBytes)
+  DbPut(47, dbCopyRows)
+  DbPut(48, PeekL(#DB_SURFACE))
+  DbPut(49, before)
+  DbPut(50, DisplayDmaOps())
+  DbPut(51, DisplayDmaFallbacks())
+  DbPut(52, DisplayDmaRefusals())
+
+  ProcedureReturn 0
+EndProcedure

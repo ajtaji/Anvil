@@ -1,0 +1,382 @@
+; ======================================================================
+; BCM2711 direct HDMI DDC reader.
+;
+; This talks to the SoC's dedicated HDMI I2C controllers directly. It does
+; not ask VideoCore firmware for EDID bytes and does not use GPIO BSC0/1.
+; The shared `Anvil/Graphics/edid.pbi` parser consumes the raw blocks.
+;
+; Device-tree provenance: raspberrypi/linux bcm2711.dtsi names these
+; controllers brcm,bcm2711-hdmi-i2c, at bus 0x7ef04500 / auto-i2c
+; 0x7ef00b00 (HDMI0), and 0x7ef09500 / 0x7ef05b00 (HDMI1). The SoC
+; `soc.ranges` translates 0x7e000000 to ARM 0xfe000000 in low-peripheral
+; mode, hence the CPU addresses below. Linux i2c-brcmstb releases the
+; firmware AUTOI2C engine with AUTOI2C_CTRL0.RELEASE_BSC then resets IIC.
+; It configures 4-byte data registers and 97.5 kHz for this controller.
+;
+; Each EDID block is fetched with the E-DDC segment pointer (0x30) when
+; needed, then the 0x50 offset write and a repeated-start read. The BSC
+; transfer window is eight 32-bit data registers, so the 128-byte read is
+; continued in four bounded 32-byte transfers without a STOP between them.
+; ======================================================================
+
+#PI4_DDC_PORT_HDMI0 = 0
+#PI4_DDC_PORT_HDMI1 = 1
+#PI4_DDC_MAX_BLOCKS = 8
+#PI4_DDC_BLOCK_BYTES = 128
+#PI4_DDC_CHUNK_BYTES = 32
+#PI4_DDC_SPIN_LIMIT = 1000000
+#PI4_DDC_TIMEOUT_US = 100000
+
+#PI4_DDC_OK = 0
+#PI4_DDC_E_ARGUMENT = -1
+#PI4_DDC_E_NOT_READY = -2
+#PI4_DDC_E_NACK = -3
+#PI4_DDC_E_TIMEOUT = -4
+
+#PI4_DDC_HDMI0_BSC = $FEF04500
+#PI4_DDC_HDMI0_AUTO = $FEF00B00
+#PI4_DDC_HDMI1_BSC = $FEF09500
+#PI4_DDC_HDMI1_AUTO = $FEF05B00
+#PI4_DDC_AUTO_CTRL0 = $26C
+#PI4_DDC_AUTO_RELEASE_BSC = $00000002
+
+; bcm2711 i2c-brcmstb's struct bsc_regs layout.
+#PI4_DDC_CHIP_ADDRESS = $00
+#PI4_DDC_DATA_IN0 = $04
+#PI4_DDC_CNT_REG = $24
+#PI4_DDC_CTL_REG = $28
+#PI4_DDC_IIC_ENABLE = $2C
+#PI4_DDC_DATA_OUT0 = $30
+#PI4_DDC_CTLHI_REG = $50
+
+#PI4_DDC_CTL_DTF_MASK = $00000003
+#PI4_DDC_CTL_DTF_READ = $00000001
+#PI4_DDC_CTL_SCL_390KHZ = $00000010
+#PI4_DDC_CTL_DIV_CLK = $00000080
+#PI4_DDC_CTL_97500HZ = #PI4_DDC_CTL_SCL_390KHZ | #PI4_DDC_CTL_DIV_CLK
+#PI4_DDC_IIC_ENABLE_BIT = $00000001
+#PI4_DDC_IIC_INTRP = $00000002
+#PI4_DDC_IIC_NOACK = $00000004
+#PI4_DDC_IIC_NOSTOP = $00000010
+#PI4_DDC_IIC_NOSTART = $00000020
+#PI4_DDC_IIC_RESTART = $00000040
+#PI4_DDC_IIC_CONDITION_MASK = $00000070
+#PI4_DDC_CTLHI_DATAREG_4BYTE = $00000040
+
+#PI4_DDC_ADDR_EDID = $50
+#PI4_DDC_ADDR_SEGMENT = $30
+
+Global pi4_ddc_ready.i
+Global pi4_ddc_port.i
+Global pi4_ddc_bsc.i
+Global pi4_ddc_auto.i
+Global pi4_ddc_last_segment.i
+Global pi4_ddc_error.i
+Global pi4_ddc_error_block.i
+Global pi4_ddc_received_blocks.i
+Global pi4_ddc_truncated.i
+; A persistent buffer is available for command/UI callers because the
+; common EDID parser retains the byte pointer after parsing.
+Global Dim pi4_ddc_edid_bytes.b[#PI4_DDC_MAX_BLOCKS * #PI4_DDC_BLOCK_BYTES]
+
+Procedure.i Pi4HdmiDdcError()
+  ProcedureReturn pi4_ddc_error
+EndProcedure
+
+Procedure.i Pi4HdmiDdcErrorBlock()
+  ProcedureReturn pi4_ddc_error_block
+EndProcedure
+
+Procedure.i Pi4HdmiDdcReady()
+  ProcedureReturn pi4_ddc_ready
+EndProcedure
+
+Procedure.i Pi4HdmiDdcReceivedBlocks()
+  ProcedureReturn pi4_ddc_received_blocks
+EndProcedure
+
+Procedure.i Pi4HdmiDdcTruncated()
+  ProcedureReturn pi4_ddc_truncated
+EndProcedure
+
+Procedure.i Pi4HdmiDdcEdidBuffer()
+  ProcedureReturn @pi4_ddc_edid_bytes[0]
+EndProcedure
+
+Procedure.i Pi4HdmiDdcSetError(error.i, block.i)
+  pi4_ddc_error = error
+  pi4_ddc_error_block = block
+  ProcedureReturn error
+EndProcedure
+
+Procedure.i Pi4HdmiDdcSelect(port.i)
+  If port = #PI4_DDC_PORT_HDMI0
+    pi4_ddc_bsc = #PI4_DDC_HDMI0_BSC
+    pi4_ddc_auto = #PI4_DDC_HDMI0_AUTO
+  ElseIf port = #PI4_DDC_PORT_HDMI1
+    pi4_ddc_bsc = #PI4_DDC_HDMI1_BSC
+    pi4_ddc_auto = #PI4_DDC_HDMI1_AUTO
+  Else
+    pi4_ddc_ready = 0
+    ProcedureReturn 0
+  EndIf
+  pi4_ddc_port = port
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi4HdmiDdcInit(port.i)
+  Protected spin.i
+  Protected deadline.i
+  Protected status.i
+  pi4_ddc_ready = 0
+  pi4_ddc_error = #PI4_DDC_OK
+  pi4_ddc_error_block = -1
+  If Pi4HdmiDdcSelect(port) = 0
+    ProcedureReturn Pi4HdmiDdcSetError(#PI4_DDC_E_ARGUMENT,-1)
+  EndIf
+
+  ; The HDMI DDC controller is shared with firmware's AUTOI2C block. Follow
+  ; Linux's BCM2711 release sequence before programming the BSC registers.
+  a64_barrier()
+  PokeL(pi4_ddc_auto + #PI4_DDC_AUTO_CTRL0, #PI4_DDC_AUTO_RELEASE_BSC)
+  a64_barrier()
+  PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, 0)
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CNT_REG, 0)
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CTLHI_REG, #PI4_DDC_CTLHI_DATAREG_4BYTE)
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CTL_REG, #PI4_DDC_CTL_97500HZ)
+  a64_barrier()
+
+  deadline = I2cDeadlineUs(#PI4_DDC_TIMEOUT_US)
+  spin = #PI4_DDC_SPIN_LIMIT
+  Repeat
+    status = PeekL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE) & $FFFFFFFF
+    If (status & #PI4_DDC_IIC_INTRP) = 0
+      pi4_ddc_ready = 1
+      pi4_ddc_last_segment = 0
+      ProcedureReturn #PI4_DDC_OK
+    EndIf
+    spin - 1
+  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+
+  a64_barrier()
+  ProcedureReturn Pi4HdmiDdcSetError(#PI4_DDC_E_TIMEOUT,-1)
+EndProcedure
+
+; One BSC data operation. The register packing and transfer conditions
+; mirror bcm2711's Linux i2c-brcmstb implementation. addrCondition applies
+; before the address phase; dataCondition applies to the data phase. A
+; NOSTART continuation deliberately leaves CHIP_ADDRESS untouched.
+Procedure.i pi4_ddc_Transfer(address.i, *bytes, length.i, read.i, addrCondition.i, dataCondition.i)
+  Protected i.i
+  Protected j.i
+  Protected at.i
+  Protected word.i
+  Protected reg.i
+  Protected value.i
+  Protected spin.i
+  Protected deadline.i
+  Protected status.i
+  Protected ctl.i
+
+  If pi4_ddc_ready = 0 Or length < 1 Or length > #PI4_DDC_CHUNK_BYTES Or *bytes < 1
+    ProcedureReturn #PI4_DDC_E_ARGUMENT
+  EndIf
+  If address < 0 Or address > $7F
+    ProcedureReturn #PI4_DDC_E_ARGUMENT
+  EndIf
+
+  ; Establish the message's START/RESTART/NOSTART policy before the address
+  ; register. For NOSTART chunks the previous address remains in hardware.
+  PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, addrCondition & #PI4_DDC_IIC_CONDITION_MASK)
+  If (addrCondition & #PI4_DDC_IIC_NOSTART) = 0
+    PokeL(pi4_ddc_bsc + #PI4_DDC_CHIP_ADDRESS, address)
+  EndIf
+  ctl = PeekL(pi4_ddc_bsc + #PI4_DDC_CTL_REG) & ($FFFFFFFF ! #PI4_DDC_CTL_DTF_MASK)
+  If read <> 0 : ctl = ctl | #PI4_DDC_CTL_DTF_READ : EndIf
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CTL_REG, ctl)
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CNT_REG, length & $3F)
+
+  If read = 0
+    ; Linux's four-byte DATA_IN packing is deliberately reproduced exactly:
+    ; full words end up byte0 in bits 7:0; short words are left-aligned.
+    For i = 0 To (length + 3) / 4 - 1
+      word = 0
+      For j = 0 To 3
+        word = word >> 8
+        at = i * 4 + j
+        If at < length
+          word = word | ((PeekA(*bytes + at) & $FF) << 24)
+        EndIf
+      Next
+      PokeL(pi4_ddc_bsc + #PI4_DDC_DATA_IN0 + i * 4, word & $FFFFFFFF)
+    Next
+  EndIf
+
+  ; As in the Linux driver, the controller's interrupt-pending bit is also
+  ; the polling completion indication; IRQ enable remains clear.
+  PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, (dataCondition & #PI4_DDC_IIC_CONDITION_MASK) | #PI4_DDC_IIC_ENABLE_BIT)
+  deadline = I2cDeadlineUs(#PI4_DDC_TIMEOUT_US)
+  spin = #PI4_DDC_SPIN_LIMIT
+  Repeat
+    status = PeekL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE) & $FFFFFFFF
+    If (status & #PI4_DDC_IIC_INTRP) <> 0
+      Break
+    EndIf
+    spin - 1
+  Until spin <= 0 Or I2cDeadlinePassed(deadline) <> 0
+
+  If (status & #PI4_DDC_IIC_INTRP) = 0
+    PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, 0)
+    PokeL(pi4_ddc_bsc + #PI4_DDC_CNT_REG, 0)
+    a64_barrier()
+    pi4_ddc_ready = 0
+    ProcedureReturn #PI4_DDC_E_TIMEOUT
+  EndIf
+  If (status & #PI4_DDC_IIC_NOACK) <> 0
+    PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, 0)
+    PokeL(pi4_ddc_bsc + #PI4_DDC_CNT_REG, 0)
+    a64_barrier()
+    ProcedureReturn #PI4_DDC_E_NACK
+  EndIf
+
+  If read <> 0
+    For i = 0 To (length + 3) / 4 - 1
+      word = PeekL(pi4_ddc_bsc + #PI4_DDC_DATA_OUT0 + i * 4) & $FFFFFFFF
+      For j = 0 To 3
+        at = i * 4 + j
+        If at < length
+          PokeA(*bytes + at, word & $FF)
+          word = word >> 8
+        EndIf
+      Next
+    Next
+  EndIf
+  PokeL(pi4_ddc_bsc + #PI4_DDC_IIC_ENABLE, 0)
+  PokeL(pi4_ddc_bsc + #PI4_DDC_CNT_REG, 0)
+  a64_barrier()
+  ProcedureReturn #PI4_DDC_OK
+EndProcedure
+
+Procedure.i pi4_ddc_WriteByte(address.i, value.i, addrCondition.i, dataCondition.i)
+  Protected b.i
+  Protected result.i
+  b = value & $FF
+  result = pi4_ddc_Transfer(address, @b, 1, 0, addrCondition, dataCondition)
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i Pi4HdmiDdcReadBlock(port.i, block.i, destination.i)
+  Protected segment.i
+  Protected offset.i
+  Protected result.i
+  Protected done.i
+  Protected addrCondition.i
+  Protected dataCondition.i
+  Protected take.i
+  Protected *out
+
+  pi4_ddc_error = #PI4_DDC_OK
+  pi4_ddc_error_block = block
+  If port <> pi4_ddc_port Or pi4_ddc_ready = 0 Or destination < 1 Or block < 0 Or block >= #PI4_DDC_MAX_BLOCKS
+    ProcedureReturn Pi4HdmiDdcSetError(#PI4_DDC_E_ARGUMENT,block)
+  EndIf
+  segment = block >> 1
+  offset = (block & 1) * 128
+
+  ; Segment zero is the E-DDC power-on state. Avoid requiring address 0x30
+  ; for displays with only a base block. Once a nonzero segment was written,
+  ; explicitly restore zero before returning to blocks 0/1.
+  If segment <> pi4_ddc_last_segment And (segment <> 0 Or pi4_ddc_last_segment <> 0)
+    result = pi4_ddc_Transfer(#PI4_DDC_ADDR_SEGMENT, @segment, 1, 0, 0, 0)
+    If result <> #PI4_DDC_OK
+      ProcedureReturn Pi4HdmiDdcSetError(result,block)
+    EndIf
+    pi4_ddc_last_segment = segment
+  EndIf
+
+  ; Offset write is the first message in a combined write/read transaction.
+  result = pi4_ddc_WriteByte(#PI4_DDC_ADDR_EDID, offset, #PI4_DDC_IIC_RESTART | #PI4_DDC_IIC_NOSTOP, #PI4_DDC_IIC_RESTART | #PI4_DDC_IIC_NOSTOP)
+  If result <> #PI4_DDC_OK
+    ProcedureReturn Pi4HdmiDdcSetError(result,block)
+  EndIf
+
+  *out = destination
+  done = 0
+  addrCondition = #PI4_DDC_IIC_RESTART | #PI4_DDC_IIC_NOSTOP
+  While done < #PI4_DDC_BLOCK_BYTES
+    take = #PI4_DDC_CHUNK_BYTES
+    If done = 0
+      dataCondition = #PI4_DDC_IIC_NOSTOP
+    ElseIf done + take >= #PI4_DDC_BLOCK_BYTES
+      dataCondition = #PI4_DDC_IIC_NOSTART
+    Else
+      dataCondition = #PI4_DDC_IIC_NOSTART | #PI4_DDC_IIC_NOSTOP
+    EndIf
+    result = pi4_ddc_Transfer(#PI4_DDC_ADDR_EDID, *out + done, take, 1, addrCondition, dataCondition)
+    If result <> #PI4_DDC_OK
+      ProcedureReturn Pi4HdmiDdcSetError(result,block)
+    EndIf
+    done + take
+    addrCondition = #PI4_DDC_IIC_NOSTART | #PI4_DDC_IIC_NOSTOP
+  Wend
+  ProcedureReturn #PI4_DDC_OK
+EndProcedure
+
+; Fetch direct hardware bytes, then pass the exact contiguous block prefix to
+; the common EDID parser. `maxBlocks` is the caller-owned buffer capacity and
+; cannot exceed the parser's explicit eight-block bound.
+Procedure.i Pi4HdmiDdcRead(port.i, blocks.i, maxBlocks.i, receivedOut.i, truncatedOut.i)
+  Protected result.i
+  Protected ext.i
+  Protected wanted.i
+  Protected received.i
+  Protected truncated.i
+  Protected block.i
+
+  If receivedOut > 0 : PokeI(receivedOut, 0) : EndIf
+  If truncatedOut > 0 : PokeI(truncatedOut, 0) : EndIf
+  pi4_ddc_received_blocks = 0
+  pi4_ddc_truncated = 0
+  AnvilEdidReset()
+  If blocks < 1 Or maxBlocks < 1 Or maxBlocks > #PI4_DDC_MAX_BLOCKS Or receivedOut < 1 Or truncatedOut < 1
+    ProcedureReturn Pi4HdmiDdcSetError(#PI4_DDC_E_ARGUMENT,-1)
+  EndIf
+  If Pi4HdmiDdcReady() = 0 Or pi4_ddc_port <> port
+    result = Pi4HdmiDdcInit(port)
+    If result <> #PI4_DDC_OK : ProcedureReturn result : EndIf
+  EndIf
+  If Pi4HdmiDdcReadBlock(port,0,blocks) <> #PI4_DDC_OK
+    AnvilEdidReset()
+    ProcedureReturn pi4_ddc_error
+  EndIf
+  received = 1
+  ext = PeekA(blocks + 126) & $FF
+  wanted = ext + 1
+  truncated = 0
+  If wanted > #PI4_DDC_MAX_BLOCKS : wanted = #PI4_DDC_MAX_BLOCKS : truncated = 1 : EndIf
+  If wanted > maxBlocks : wanted = maxBlocks : truncated = 1 : EndIf
+  For block = 1 To wanted - 1
+    If Pi4HdmiDdcReadBlock(port,block,blocks + block * #PI4_DDC_BLOCK_BYTES) <> #PI4_DDC_OK
+      truncated = 1
+      Break
+    EndIf
+    received + 1
+  Next
+  If received - 1 < ext : truncated = 1 : EndIf
+  PokeI(receivedOut,received)
+  PokeI(truncatedOut,truncated)
+  pi4_ddc_received_blocks = received
+  pi4_ddc_truncated = truncated
+  If AnvilEdidParse(blocks,received * #PI4_DDC_BLOCK_BYTES,received,truncated) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Safe convenience entry for resident commands: the parser's retained byte
+; pointer always refers to this persistent buffer, never stack memory.
+Procedure.i Pi4HdmiDdcReadAttached(port.i)
+  Protected received.i
+  Protected truncated.i
+  ProcedureReturn Pi4HdmiDdcRead(port,@pi4_ddc_edid_bytes[0],#PI4_DDC_MAX_BLOCKS,@received,@truncated)
+EndProcedure

@@ -1,0 +1,69 @@
+; The data:/ path form against the data.path setting's value. A diagnostic
+; fixture, not shipped product code; it touches no hardware and no medium.
+XIncludeFile "Anvil/Core/datapath.pbi"
+
+Global Dim gateOut.a[1023]
+
+Procedure.i GateEqual(*a, *b)
+  Define i.i
+  i = 0
+  While PeekA(*a + i) = PeekA(*b + i)
+    If PeekA(*a + i) = 0
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GateCase(*base, *path, *want)
+  Define n.i
+  n = DataPathJoin(*base, *path, @gateOut[0], 1024)
+  If n < 0
+    ProcedureReturn 0
+  EndIf
+  If GateEqual(@gateOut[0], *want) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  ; default: no data.path at all is the root of partition 1
+  If GateCase(0, ?dpModel, ?dpModelOut1) = 0 : ProcedureReturn 1 : EndIf
+  ; unset: an empty value means the same
+  If GateCase(?dpEmpty, ?dpModel, ?dpModelOut1) = 0 : ProcedureReturn 2 : EndIf
+  ; set: the data partition
+  If GateCase(?dpBase2, ?dpModel, ?dpModelOut2) = 0 : ProcedureReturn 3 : EndIf
+  ; exactly one separator however many either side carries
+  If GateCase(?dpBase2Bare, ?dpNoSlash, ?dpNoSlashOut) = 0 : ProcedureReturn 4 : EndIf
+  ; spaces and parentheses, a trailing double separator, upper-case prefix
+  If GateCase(?dpBaseSpaces, ?dpSpaces, ?dpSpacesOut) = 0 : ProcedureReturn 5 : EndIf
+  ; a path that is not data: passes through untouched, whatever data.path is
+  If GateCase(?dpBase2, ?dpKernel, ?dpKernel) = 0 : ProcedureReturn 6 : EndIf
+  If GateCase(?dpBase2, ?dpPart, ?dpPart) = 0 : ProcedureReturn 7 : EndIf
+  ; a location that names itself is refused
+  If DataPathJoin(?dpSelf, ?dpModel, @gateOut[0], 1024) <> -2 Or gateOut[0] <> 0 : ProcedureReturn 8 : EndIf
+  ; too long is refused, never truncated
+  If DataPathJoin(?dpBase2, ?dpLong, @gateOut[0], 8) <> -1 Or gateOut[0] <> 0 : ProcedureReturn 9 : EndIf
+  If DataPathIs(?dpKernel) <> 0 Or DataPathIs(?dpSpaces) = 0 Or DataPathIs(0) <> 0 : ProcedureReturn 10 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  dpModel: Data.a 100,97,116,97,58,47,109,111,100,101,108,115,47,77,79,68,69,76,46,80,77,87,0
+  dpModelOut1: Data.a 47,109,111,100,101,108,115,47,77,79,68,69,76,46,80,77,87,0
+  dpEmpty: Data.a 0
+  dpBase2: Data.a 50,58,47,0
+  dpModelOut2: Data.a 50,58,47,109,111,100,101,108,115,47,77,79,68,69,76,46,80,77,87,0
+  dpBase2Bare: Data.a 50,58,0
+  dpNoSlash: Data.a 100,97,116,97,58,109,111,100,101,108,115,47,120,0
+  dpNoSlashOut: Data.a 50,58,47,109,111,100,101,108,115,47,120,0
+  dpBaseSpaces: Data.a 50,58,47,109,121,32,100,97,116,97,47,47,0
+  dpSpaces: Data.a 68,65,84,65,58,47,75,111,107,111,114,111,32,119,101,105,103,104,116,115,32,40,70,80,51,50,41,46,112,109,119,0
+  dpSpacesOut: Data.a 50,58,47,109,121,32,100,97,116,97,47,75,111,107,111,114,111,32,119,101,105,103,104,116,115,32,40,70,80,51,50,41,46,112,109,119,0
+  dpKernel: Data.a 75,69,82,78,69,76,56,46,73,77,71,0
+  dpPart: Data.a 50,58,47,120,0
+  dpSelf: Data.a 100,97,116,97,58,47,120,0
+  dpLong: Data.a 100,97,116,97,58,47,97,98,99,100,101,102,103,104,0
+EndDataSection

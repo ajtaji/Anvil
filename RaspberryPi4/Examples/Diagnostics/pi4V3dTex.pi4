@@ -1,0 +1,1770 @@
+; pi4V3dTex.pi4 - V3D milestone 1: a TMU-SAMPLED TEXTURED triangle.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM CLAIMS, AND WHAT IT REFUSES TO CLAIM
+; ======================================================================
+;
+;  pi4V3dTri.pi4 drew ONE FLAT-COLOURED triangle: the colour came from
+;  a per-draw uniform, there were NO varyings and NO texture sampling.
+;  This program adds BOTH, which is the hardest part of a V3D driver:
+;
+;    * a COORDINATE and a VERTEX shader that, on top of the clip-space
+;      position pi4V3dTri emits, write U,V out as VARYINGS in the VPM
+;      varying segment (coord offset 6/7, vertex offset 4/5 -
+;      v3d_nir_lower_io.c:399-433);
+;    * a FRAGMENT shader that reads the two interpolated varyings with
+;      the LDVARY signal, writes S and T to the TMU, FIRES the sample
+;      by writing TMUS, takes the LDTMU signal to read the returned
+;      texel and writes it to the TLB;
+;    * a TEXTURE_SHADER_STATE record and a SAMPLER_STATE record built
+;      by hand from v3d_packet.xml:1493-1532 and :1584-1618 (there is
+;      no library helper for either);
+;    * a 4x4 RGBA8 checkerboard texture TFU-tiled to a T-format
+;      (LINEARTILE) texture the TMU can sample.
+;
+;  THE PASS CRITERION IS COUNTED PIXELS AND A COLOUR SPLIT, NOT A
+;  PICTURE. The 4x4 texture is RED in columns 0,1 and BLUE in columns
+;  2,3 - a pure VERTICAL split. The triangle's U coordinate is a linear
+;  function of screen X only (u = (x - 8) / 48, see below), so every
+;  pixel left of the split samples RED and every pixel right of it
+;  samples BLUE. The whole 64x64 buffer is read back on the CPU and:
+;
+;    * RED and BLUE pixels are counted and their X bounding boxes taken;
+;    * the pass demands nRed>0, nBlue>0 AND max-x(RED) < min-x(BLUE),
+;      i.e. EVERY red pixel is strictly left of EVERY blue pixel.
+;
+;  WHY THAT SHAPE. It proves three things at once and depends on NONE
+;  of the unknowns pi4V3dTri left open:
+;    - two DISTINCT texture colours appear, so the TMU sampled a
+;      texture rather than a flat uniform (a flat colour gives one
+;      colour and fails nRed>0 AND nBlue>0);
+;    - the split is a clean vertical line, so the U varying was
+;      INTERPOLATED across X (a constant varying gives one colour; a
+;      varying that leaked Y-dependence would put red and blue pixels
+;      at overlapping X and fail max-x(RED) < min-x(BLUE));
+;    - it is Y-CONVENTION INDEPENDENT. pi4V3dTri could not decide
+;      whether the stored row increases or decreases with Ys; here the
+;      colour depends on X ALONE, so the verdict does not care. The V
+;      varying is emitted and interpolated (both LDVARY paths run) but
+;      the texture is V-uniform on purpose, so a wrong V cannot decide
+;      the verdict.
+;
+;  THE COLOURS ARE 0x00/0xFF ONLY, ON PURPOSE. RED is $FF0000FF and
+;  BLUE is $FFFF0000 in the framebuffer's byte order (R low, A high -
+;  pi4V3dTri proved that order). The texel channels are 0.0 and 1.0,
+;  which round-trip f32 -> f16 -> unorm8 EXACTLY, so unlike pi4V3dTri
+;  this test has no rounding slop to reason about at all.
+;
+; ======================================================================
+;  THE U,V ARITHMETIC, WHY IT IS AFFINE, AND THE VARYING MODEL
+; ======================================================================
+;
+;  The three vertices carry (in pixels / UV): (8,8)/(0,0),
+;  (56,8)/(1,0), (8,56)/(0,1). Solving u = a*x + b*y + c through those
+;  three gives b = 0, a = 1/48, c = -8/48 - i.e. u = (x - 8) / 48,
+;  INDEPENDENT OF Y. The u=0.5 split lands at x=32, halfway across.
+;
+;  Wc IS 1.0 FOR ALL THREE VERTICES (as in pi4V3dTri), so 1/Wc = 1 and
+;  the varying is AFFINE. For that case perspective and no-perspective
+;  interpolation are numerically identical (dividing by w=1 is a
+;  no-op), so this program uses the SIMPLER no-perspective shader
+;  arithmetic - emit_noperspective_varying(), nir_to_vir.c:1027-1029:
+;
+;      result = vary_reg + r5
+;
+;  where the LDVARY signal delivers the interpolation value to the
+;  register named in its signal-address field (rf10/rf11 here) and
+;  loads the C coefficient into r5 with ONE cycle of delay
+;  (qpu_schedule.c:590-592 - r5 may not be read within one tick of an
+;  ldvary on 4.2). One filler instruction sits in that delay slot.
+;
+;  THE FLAGS PACKET MUST AGREE WITH THIS ARITHMETIC, and getting it
+;  wrong is what pinned every fragment's U at 0 on the first silicon
+;  run. The no-perspective form (vary + r5) requires the varying to be
+;  declared NO-PERSPECTIVE in the bin list; leaving the flags ZEROED
+;  (perspective) instead makes the hardware deliver the varying for the
+;  perspective form (vary * payload_w + r5), and reading that with
+;  vary + r5 returns the provoking-vertex value - which looks exactly
+;  like flat shading. So this program emits an explicit Non-perspective
+;  Flags packet with bits set for varyings 0 and 1 (EmitNonperspFlags).
+;  For an affine (Wc=1) quad screen-linear interpolation is the correct
+;  interpolation, so the no-perspective path is exact.
+;
+; ======================================================================
+;  THE FRAGMENT SHADER'S TMU SEQUENCE
+; ======================================================================
+;
+;  Config is pushed to the TMU config FIFO with the WRTMUC signal, one
+;  uniform per WRTMUC (vir_WRTMUC = a NOP carrying sig.wrtmuc and a
+;  uniform, v3d40_tex.c):
+;
+;    P0 = TEXTURE_SHADER_STATE address | return-words mask.
+;         The state is 16-byte aligned so its low 4 bits carry the
+;         mask; RGBA at 32-bit output is four words, mask $F
+;         (TMU Config Parameter 0, v3d_packet.xml:1435-1438;
+;         return_words = (1 << num_components) - 1).
+;    P1 = SAMPLER_STATE address | output-type-32-bit(bit0).
+;         8-byte aligned; bit0 makes the TMU return four f32 words so
+;         the TLB write below is byte-for-byte pi4V3dTri's
+;         (TMU Config Parameter 1, :1440-1445).
+;
+;  Then the coordinates: T to TMUT, S to TMUS. Writing TMUS FIRES the
+;  lookup (it is the trigger register for a sampler read). Four LDTMU
+;  signals read the four f32 channels R,G,B,A into rf0..rf3; the thread
+;  stalls on the first LDTMU until the TMU delivers. Finally, after the
+;  last THRSW, two VFPACKs pack (R,G) and (B,A) into 2xf16 and write
+;  TLBU then TLB - IDENTICAL to pi4V3dTri's colour write, only the
+;  source is the sampled texel instead of a uniform.
+;
+; ======================================================================
+;  UNPROVEN / GUESSED, FOR THE BENCH TO WATCH (also in the report)
+; ======================================================================
+;   * The TEXTURE_SHADER_STATE and SAMPLER_STATE BIT PACKING is built
+;     by hand from the packet layout - there is no encoder for it in
+;     v3d.pi4 and no offline oracle. If a swizzle, a dimension or the
+;     texture-type code is off, the texel is wrong or the TMU faults.
+;   * The LDVARY -> r5 one-cycle delay is from Mesa's SCHEDULER, not
+;     from any 4.2 doc, and v3dqpu.pi4's hazard checker does NOT police
+;     it. If the real latency is larger the varyings are garbage.
+;   * P2 (TMU Config Parameter 2) is NOT written - Mesa omits it for a
+;     plain nearest 2D sample. If this silicon needs it, the lookup
+;     misconfigures.
+;   * TMUS as the trigger and the T-before-S write order.
+;   * return-words = $F giving exactly four LDTMU words.
+;
+; ======================================================================
+;  MEMORY MAP - identity-mapped through the V3D MMU, VA = PA. The
+;  guard page at $65C000 is DELIBERATELY NOT MAPPED and sits right
+;  after the 16 KiB target.
+; ======================================================================
+;
+; BUILT WITH --entry-returns, so it returns to a resident monitor and a
+; wrong answer costs a line of output rather than a power cycle:
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4V3dTex.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o RaspberryPi4/Examples/Diagnostics/pi4V3dTex.img
+;
+; The load/bss/stack match pi4V3dTri.pi4 (its own build line uses
+; --load-addr 0x400000 --stack-addr 0x3000000). Flash and run: send the
+; payload to $400000 with the monitor's `b <addr> <len> <crc>` then
+; `go 0x400000`. Arm the deadman first: this starts the TFU and the
+; graphics pipeline, both bus masters behind their own page table.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Same base layout as pi4V3dTri, with the encoder
+;  corpus dropped and three texture pages put in its place.
+; ----------------------------------------------------------------------
+#TEX_PT        = $640000
+#TEX_PT_BYTES  = 16384
+#TEX_ILLEGAL   = $648000
+#TEX_BCL       = $650000
+#TEX_TILELIST  = $651000
+#TEX_RCL       = $652000
+#TEX_TSTATE    = $653000
+; The shader state record plus its ten attribute records.
+#TEX_SHREC     = $654000
+; The vertex data, and the default attribute values 256 bytes in.
+#TEX_VERTS     = $655000
+#TEX_DEFAULTS  = $655100
+; The three uniform streams, 64 bytes apart in one page.
+#TEX_UNIF_CS   = $656000
+#TEX_UNIF_VS   = $656040
+#TEX_UNIF_FS   = $656080
+; The three QPU programs, 512 bytes apart in one page.
+#TEX_CODE_CS   = $657000
+#TEX_CODE_VS   = $657200
+#TEX_CODE_FS   = $657400
+#TEX_CODE_SLOT = 512
+#TEX_TARGET    = $658000
+#TEX_GUARD     = $65C000
+; The texture pages. TEXSRC is the raster checkerboard the TFU reads;
+; TEX is the LINEARTILE texture the TFU writes and the TMU samples;
+; TEXSTATE holds the texture shader state at +0 and the sampler state
+; at +256 (both well inside one page, both aligned enough).
+#TEX_TEXSRC    = $65D000
+#TEX_TEX       = $65E000
+#TEX_TEXSTATE  = $65F000
+#TEX_SAMPSTATE = $65F100
+#TEX_TALLOC    = $660000
+#TEX_OVERFLOW  = $700000
+
+#TEX_PAGE          = 4096
+#TEX_BCL_BYTES     = 4096
+#TEX_TL_BYTES      = 4096
+#TEX_RCL_BYTES     = 4096
+#TEX_TSTATE_BYTES  = 4096
+#TEX_SHREC_BYTES   = 4096
+#TEX_VERTS_BYTES   = 4096
+#TEX_UNIF_BYTES    = 4096
+#TEX_CODE_BYTES    = 4096
+#TEX_TARGET_BYTES  = 16384
+#TEX_GUARD_BYTES   = 4096
+#TEX_TEX_BYTES     = 4096
+#TEX_TALLOC_BYTES  = $84000
+#TEX_OVERFLOW_BYTES = 262144
+
+#TEX_W      = 64
+#TEX_H      = 64
+#TEX_STRIDE = 256
+#TEX_PIXELS = 4096
+
+; The 4x4 texture: RGBA8, columns 0,1 red, columns 2,3 blue. Word order
+; is R low / A high, the order pi4V3dTri's clear proved.
+#TEX_TW     = 4
+#TEX_TH     = 4
+#TEX_TBYTES = 64                ; 4*4*4
+#TEX_RED    = $FF0000FF         ; R=FF G=00 B=00 A=FF
+#TEX_BLUE   = $FFFF0000         ; R=00 G=00 B=FF A=FF
+
+#TEX_CLEAR  = $44332211
+#TEX_POISON = $A5A5A5A5
+
+; ----------------------------------------------------------------------
+;  THE FRAGMENT-SHADER MODE. Three builds from one source.
+;
+;  #TEX_FS_MODE = 0  TEXTURED: read the two varyings, sample the TMU,
+;                    write the texel. The M1 goal.
+;  #TEX_FS_MODE = 1  SOLID: read and DISCARD both varyings, no TMU, write
+;                    a solid colour from four uniforms - pi4V3dTri's flat
+;                    shader shape. Isolates the TMU path from the render
+;                    CL and the varying path.
+;  #TEX_FS_MODE = 2  URAMP: read varying 0 (U) and write it to ALL FOUR
+;                    colour channels as a grayscale. NO TMU. This makes
+;                    the interpolated U value directly VISIBLE and
+;                    READABLE per pixel: framebuffer byte = round(U*255).
+;                    If U interpolates, the triangle is a left-to-right
+;                    gradient; if it is constant (the current bug), the
+;                    triangle is one flat grey and its level tells us the
+;                    exact stuck U value. This isolates the varying read
+;                    from the texture entirely.
+;
+;  In ALL THREE the coordinate and vertex shaders (which emit the
+;  varyings), the shader record (numVaryingsFs = 2), the VPM sizing and
+;  the render CL are identical - only the fragment shader and its uniform
+;  stream change.
+;
+;  Build: edit #TEX_FS_MODE, recompile. 0 -> pi4V3dTex.img,
+;  1 -> pi4V3dTexSolid.img, 2 -> pi4V3dTexRamp.img. All load at 0x400000,
+;  run with `go 0x400000`.
+; ----------------------------------------------------------------------
+#TEX_FS_MODE = 0
+
+#TEX_MODE_TEX    = 0
+#TEX_MODE_SOLID  = 1
+#TEX_MODE_RAMP   = 2
+; DIRECT: the U-ramp fragment shader, but the coordinate and vertex
+; shaders source varying0 = Xc and varying1 = Yc (the clip position,
+; a known-good per-vertex float) INSTEAD of the U,V attributes. This
+; bypasses the attribute->VPM plumbing: if this ramp shows a gradient,
+; the interpolator works and the bug is U-attribute-specific; if it is
+; still flat, the interpolation setup itself is broken.
+#TEX_MODE_DIRECT = 3
+
+; The solid colour for the bisection build: GREEN, $FF00FF00 in the
+; framebuffer's byte order (R=00 G=FF B=00 A=FF). Distinct from red,
+; blue, clear and poison. Channels are 0.0 and 1.0, exact through f16.
+#TEX_SOLID  = $FF00FF00
+#TEX_SF_R   = $00000000         ; 0.0
+#TEX_SF_G   = $3F800000         ; 1.0
+#TEX_SF_B   = $00000000         ; 0.0
+#TEX_SF_A   = $3F800000         ; 1.0
+
+#TEX_ZCLEAR = $3F800000
+
+#TEX_F_ZERO   = $00000000
+#TEX_F_ONE    = $3F800000
+#TEX_F_P75    = $3F400000
+#TEX_F_M75    = $BF400000
+#TEX_F_8192   = $46000000
+
+; The TLB configuration word the fragment shader's TLBU write pulls
+; from the uniform stream. $FFFFFFFF = normal vec4 f16 RT0, the same
+; value and the same reasoning as pi4V3dTri.
+#TEX_TLB_CONF = $FFFFFFFF
+
+; The three vertices, in PIXELS, and the viewport centre.
+#TEX_V0X = 8
+#TEX_V0Y = 8
+#TEX_V1X = 56
+#TEX_V1Y = 8
+#TEX_V2X = 8
+#TEX_V2Y = 56
+#TEX_CX  = 32
+#TEX_CY  = 32
+
+#TEX_WAIT_US = 100000
+
+; ======================================================================
+;  PRINTING - lifted unchanged from pi4V3dTri.
+; ======================================================================
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - V3dInit() has not passed")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - no V3D page table")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - outside the page table, or page 0")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - the TLB clear never finished")
+    Case #V3D_ERR_CACHE_TIMEOUT
+      PutS("CACHE_TIMEOUT - the L2T clean never finished")
+    Case #V3D_ERR_CL_ARGS
+      PutS("CL_ARGS - a field or a buffer will not do")
+    Case #V3D_ERR_CL_FULL
+      PutS("CL_FULL - the list ran out of room")
+    Case #V3D_ERR_CL_NOBUF
+      PutS("CL_NOBUF - a packet with no list open")
+    Case #V3D_ERR_BIN_TIMEOUT
+      PutS("BIN_TIMEOUT - CLE_BFC never moved")
+    Case #V3D_ERR_BIN_OOM
+      PutS("BIN_OOM - the tile allocation pool ran out")
+    Case #V3D_ERR_RENDER_TIMEOUT
+      PutS("RENDER_TIMEOUT - CLE_RFC never moved")
+    Case #V3D_ERR_JOB_BUSY
+      PutS("JOB_BUSY - the render was offered before the bin finished")
+    Case #V3D_ERR_TFU_ARGS
+      PutS("TFU_ARGS - the job description cannot be encoded")
+    Case #V3D_ERR_TFU_BUSY
+      PutS("TFU_BUSY - the unit was busy before submission")
+    Case #V3D_ERR_TFU_TIMEOUT
+      PutS("TFU_TIMEOUT - CVTCT never moved")
+    Case #V3D_ERR_TFU_FAIL
+      PutS("TFU_FAIL - HUB_INT_STS.TFUF. The unit said no.")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure PutQpuErr(e.i)
+  Select e
+    Case #V3DQ_OK
+      PutS("OK")
+    Case #V3DQ_ERR_ADD_OP
+      PutS("ADD_OP - that ADD operation is not encoded")
+    Case #V3DQ_ERR_SIG
+      PutS("SIG - no 4.2 code for that signal combination")
+    Case #V3DQ_ERR_RANGE
+      PutS("RANGE - a waddr, mux or raddr is out of its field")
+    Case #V3DQ_ERR_FULL
+      PutS("FULL - the program buffer has no room")
+    Case #V3DQ_ERR_NOBUF
+      PutS("NOBUF - V3dQpuProgramBegin() was never called")
+    Case #V3DQ_ERR_HAZARD
+      PutS("HAZARD - a p37 restriction, rule ")
+      PutDec(V3dQpuHazardName())
+    Case #V3DQ_ERR_VPM_DEST
+      PutS("VPM_DEST - a magic destination on a VPM load")
+    Case #V3DQ_ERR_PACK
+      PutS("PACK - an output pack this operation cannot take")
+    Case #V3DQ_ERR_UNPACK
+      PutS("UNPACK - an input unpack this operation cannot take")
+    Default
+      PutS("code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure DumpBytes(base.i, len.i)
+  Define i.i
+  i = 0
+  While i < len
+    If (i % 16) = 0
+      PutS("  ")
+      PutHex(base + i, 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekA(base + i), 2)
+    i = i + 1
+    If (i % 16) = 0
+      PutNl()
+    EndIf
+  Wend
+  If (len % 16) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+Procedure DumpProgram(base.i, count.i)
+  Define i.i
+  i = 0
+  While i < count
+    PutS("  Q ")
+    PutDec(i)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8) + 4), 8)
+    PutS(" ")
+    PutHex(PeekN(base + (i * 8)), 8)
+    PutNl()
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  THE THREE SHADERS
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE COORDINATE SHADER. Eight values in, eight values out.
+;
+;  It is pi4V3dTri's coordinate shader with the loop bound raised from
+;  six to eight. Inputs 0..5 are Xc Yc Zc Wc Xs Ys; inputs 6,7 are U,V
+;  (the coord-phase VPM input offsets for attributes 8 and 9 - see
+;  BuildRecords). Outputs 0..5 are the shaded-vertex position, outputs
+;  6,7 are the two VARYINGS (varyings_vpm_offset = 6 for the coord
+;  shader, v3d_nir_lower_io.c:414-430). in[k] -> out[k], a straight
+;  copy of eight values.
+; ----------------------------------------------------------------------
+Procedure.i BuildCoordShader()
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(#TEX_CODE_CS, #TEX_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; rf0..rf7 = the constants 0..7, the LDVPM offsets.
+  k = 0
+  While k < 8
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; rf8..rf15 = VPM input 0..7. (in[6]=U, in[7]=V in the coord phase.)
+  k = 0
+  While k < 8
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 8 + k, #V3DQ_MUX_A, k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; VPM output 0..5 = position (rf8..rf13).
+  k = 0
+  While k < 6
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 8 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; VPM output 6,7 = the two varyings.
+  If #TEX_FS_MODE = #TEX_MODE_DIRECT
+    ; DIRECT DATA-PATH TEST: varying0 = Xc (in[0]), varying1 = Yc (in[1]) -
+    ; a known-good float that varies per vertex, bypassing the U,V
+    ; attribute plumbing entirely.
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 6, 8)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 7, 9)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Else
+    ; NORMAL: varying0 = U (in[6]), varying1 = V (in[7]).
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 6, 14)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 7, 15)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  EndIf
+
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE VERTEX SHADER. Six values out of ten in.
+;
+;  Reads VPM input 4..9 - Xs Ys Zs 1/Wc U V - and writes VPM output
+;  0..5. Outputs 0..3 are the non-coord shaded vertex (Xs Ys Zs 1/Wc),
+;  outputs 4,5 are the two VARYINGS (varyings_vpm_offset = 4 for the
+;  vertex shader). out[k] = in[4+k], k = 0..5. pi4V3dTri's vertex
+;  shader with the input offset base kept at 4 and the count raised
+;  from four to six.
+; ----------------------------------------------------------------------
+Procedure.i BuildVertexShader()
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(#TEX_CODE_VS, #TEX_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; rf0..rf9 = the constants 0..9. rf[4+k] holds the input offset 4+k
+  ; and rf[k] holds the output slot index k.
+  k = 0
+  While k < 10
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; rf10..rf13 = VPM input 4..7 (Xs Ys Zs 1/Wc), the shaded position.
+  k = 0
+  While k < 4
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 10 + k, #V3DQ_MUX_A, 4 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; rf14,rf15 = the two varying sources.
+  If #TEX_FS_MODE = #TEX_MODE_DIRECT
+    ; DIRECT DATA-PATH TEST: varying0 = Xc (in[0]), varying1 = Yc (in[1]).
+    ; Offsets 0,1 come from rf0,rf1. Bypasses the U,V attribute plumbing.
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 14, #V3DQ_MUX_A, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 15, #V3DQ_MUX_A, 1)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Else
+    ; NORMAL: varying0 = U (in[8]), varying1 = V (in[9]).
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 14, #V3DQ_MUX_A, 8)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, 15, #V3DQ_MUX_A, 9)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  EndIf
+
+  ; VPM output 0..5 = rf10..rf15 (position at 0..3, varyings at 4,5).
+  k = 0
+  While k < 6
+    r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, k, 10 + k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE TEXTURED FRAGMENT SHADER (#TEX_FS_SOLID = 0). See the header.
+;
+;  Uniform stream, in program order: P0 (WRTMUC), P1 (WRTMUC), then the
+;  TLB config word (pulled by the TLBU write). No LDUNIFRF at all - the
+;  colour is the sampled texel.
+;
+;  Register use: rf10/rf11 the two varying interpolation values,
+;  rf12/rf13 the S and T coordinates, rf0..rf3 the four returned texel
+;  channels R,G,B,A. r5 is the LDVARY C coefficient, read one cycle
+;  after the filler nop.
+; ----------------------------------------------------------------------
+Procedure.i BuildTexturedFragmentShader()
+  Define r.i
+
+  r = V3dQpuProgramBeginSeg(#TEX_CODE_FS, #TEX_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- TMU config P0, P1 via WRTMUC, one uniform each ---
+  r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 0 (U -> S). LDVARY writes rf10, loads r5 = C delayed ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()                         ; r5 delay slot
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 1 (V -> T) ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()                         ; r5 delay slot
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- coordinate writes: T then S. Mov-via-OR in the ADD half, the
+  ;     way Mesa writes TMU coordinates (vir_MOV = OR src,src). Writing
+  ;     TMUS FIRES the lookup, so it is last. ---
+  r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- THE THREAD SWITCH THAT DELIVERS THE TMU RESULT. On a threaded
+  ;     fragment shader (fourWay = 1, as here and in pi4V3dTri) the
+  ;     texel is returned to the thread only ACROSS a thread switch:
+  ;     ntq_flush_tmu() emits vir_emit_thrsw() before the LDTMUs, and
+  ;     vir_emit_thrsw()'s comment is "Always thread switch after each
+  ;     texture operation" (nir_to_vir.c:266-271, :159). Without it the
+  ;     LDTMUs stall forever and the render never completes - which is
+  ;     exactly the RENDER_TIMEOUT this shader first produced. A THRSW
+  ;     has two delay slots (qpu_schedule.c:2075), so two nops fill them
+  ;     and the first LDTMU lands after the switch. This is a regular
+  ;     thread switch, NOT the last-THRSW marker; the marker pair is
+  ;     still emitted by V3dQpuLastThrsw() below. ---
+  r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- read the four texel channels R,G,B,A into rf0..rf3 ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 1, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 2, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, 3, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- the last-THRSW pair and its two delay slots ---
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- the TLB colour write, byte-for-byte pi4V3dTri's: TLBU carries
+  ;     the config word from the uniform stream, TLB the second half ---
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 3)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SOLID FRAGMENT SHADER (#TEX_FS_MODE = 1) - the bisection build.
+;
+;  Reads and DISCARDS the two varyings with the SAME LDVARY + r5 + FADD
+;  sequence as the textured shader, so the varying path is exercised
+;  end to end. Then NO TMU work: it loads four colour components from
+;  the uniform stream and writes them to the TLB the way pi4V3dTri's
+;  flat shader does. If this renders, the render CL and the varying
+;  setup are good and the hang is in the TMU path alone.
+;
+;  Uniform stream, in program order: R, G, B, A (four LDUNIFRF), then
+;  the TLB config word (the TLBU write). No WRTMUC, no P0/P1.
+; ----------------------------------------------------------------------
+Procedure.i BuildSolidFragmentShader()
+  Define r.i
+
+  r = V3dQpuProgramBeginSeg(#TEX_CODE_FS, #TEX_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 0, read and discarded ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 1, read and discarded ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- rf0..rf3 = the four solid colour components from uniforms ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 0, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 1, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 2, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 3, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 3)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE U-RAMP FRAGMENT SHADER (#TEX_FS_MODE = 2) - the varying probe.
+;
+;  Reads varying 0 (U) with the SAME LDVARY + r5 + FADD sequence as the
+;  textured shader (rf12 = U), reads and discards varying 1 (V) so the
+;  varying FIFO is drained exactly as in the textured build, then writes
+;  U to ALL FOUR channels: VFPACK(U,U) -> TLBU, VFPACK(U,U) -> TLB. The
+;  framebuffer pixel becomes (U,U,U,U) as unorm8, so each byte is
+;  round(U*255). NO TMU. The result makes the interpolated U directly
+;  visible and machine-readable.
+;
+;  Uniform stream: the TLB config word only (pulled by the TLBU write).
+; ----------------------------------------------------------------------
+Procedure.i BuildRampFragmentShader()
+  Define r.i
+
+  r = V3dQpuProgramBeginSeg(#TEX_CODE_FS, #TEX_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 0 (U) -> rf12 ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- varying 1 (V) read and discarded ---
+  r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; --- write U to all four channels: pack(U,U) twice ---
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; The dispatcher the rest of the program calls. Selected at compile time.
+; DIRECT uses the same U-ramp fragment shader as RAMP; only the geometry
+; shaders differ (they source the varyings from Xc,Yc).
+Procedure.i BuildFragmentShader()
+  If #TEX_FS_MODE = #TEX_MODE_RAMP Or #TEX_FS_MODE = #TEX_MODE_DIRECT
+    ProcedureReturn BuildRampFragmentShader()
+  EndIf
+  If #TEX_FS_MODE = #TEX_MODE_SOLID
+    ProcedureReturn BuildSolidFragmentShader()
+  EndIf
+  ProcedureReturn BuildTexturedFragmentShader()
+EndProcedure
+
+; ======================================================================
+;  THE DATA
+; ======================================================================
+
+; One vertex: ten 32-bit values in attribute order -
+; Xc Yc Zc Wc Xs Ys Zs 1/Wc U V. Stride 40.
+Procedure PutVertex(n.i, xc.i, yc.i, xs.i, ys.i, u.i, v.i)
+  Define b.i
+  b = #TEX_VERTS + (n * 40)
+  PokeN(b +  0, xc)
+  PokeN(b +  4, yc)
+  PokeN(b +  8, #TEX_F_ZERO)   ; Zc
+  PokeN(b + 12, #TEX_F_ONE)    ; Wc
+  PokeN(b + 16, xs)            ; Xs, an INTEGER in 1/256 pixel
+  PokeN(b + 20, ys)            ; Ys
+  PokeN(b + 24, #TEX_F_ZERO)   ; Zs
+  PokeN(b + 28, #TEX_F_ONE)    ; 1/Wc
+  PokeN(b + 32, u)             ; U, varying 0
+  PokeN(b + 36, v)             ; V, varying 1
+EndProcedure
+
+Procedure BuildVerts()
+  PutVertex(0, #TEX_F_M75, #TEX_F_M75, (#TEX_V0X - #TEX_CX) * 256, (#TEX_V0Y - #TEX_CY) * 256, #TEX_F_ZERO, #TEX_F_ZERO)
+  PutVertex(1, #TEX_F_P75, #TEX_F_M75, (#TEX_V1X - #TEX_CX) * 256, (#TEX_V1Y - #TEX_CY) * 256, #TEX_F_ONE,  #TEX_F_ZERO)
+  PutVertex(2, #TEX_F_M75, #TEX_F_P75, (#TEX_V2X - #TEX_CX) * 256, (#TEX_V2Y - #TEX_CY) * 256, #TEX_F_ZERO, #TEX_F_ONE)
+
+  PokeN(#TEX_DEFAULTS +  0, #TEX_F_ZERO)
+  PokeN(#TEX_DEFAULTS +  4, #TEX_F_ZERO)
+  PokeN(#TEX_DEFAULTS +  8, #TEX_F_ZERO)
+  PokeN(#TEX_DEFAULTS + 12, #TEX_F_ONE)
+EndProcedure
+
+Procedure BuildUniforms()
+  Define k.i
+  ; Coordinate shader: eight LDVPM offsets, constants 0..7.
+  k = 0
+  While k < 8
+    PokeN(#TEX_UNIF_CS + (k * 4), k)
+    k = k + 1
+  Wend
+  ; Vertex shader: constants 0..9.
+  k = 0
+  While k < 10
+    PokeN(#TEX_UNIF_VS + (k * 4), k)
+    k = k + 1
+  Wend
+  If #TEX_FS_MODE = #TEX_MODE_SOLID
+    ; Solid build: four colour components, then the TLB config word, in
+    ; the order the solid shader touches the stream (four LDUNIFRF, then
+    ; the TLBU write). No P0/P1.
+    PokeN(#TEX_UNIF_FS +  0, #TEX_SF_R)
+    PokeN(#TEX_UNIF_FS +  4, #TEX_SF_G)
+    PokeN(#TEX_UNIF_FS +  8, #TEX_SF_B)
+    PokeN(#TEX_UNIF_FS + 12, #TEX_SF_A)
+    PokeN(#TEX_UNIF_FS + 16, #TEX_TLB_CONF)
+  ElseIf #TEX_FS_MODE = #TEX_MODE_RAMP Or #TEX_FS_MODE = #TEX_MODE_DIRECT
+    ; U-ramp / direct build: only the TLB config word (pulled by the
+    ; TLBU write). No colour uniforms, no P0/P1 - the colour is varying 0.
+    PokeN(#TEX_UNIF_FS +  0, #TEX_TLB_CONF)
+  Else
+    ; Textured build: P0, P1, then the TLB config word, in the order the
+    ; shader touches the stream (two WRTMUC, then the TLBU write).
+    ;   P0 = texture state address | return-words mask ($F, four words).
+    ;   P1 = sampler state address | output-type-32-bit (bit 0).
+    PokeN(#TEX_UNIF_FS +  0, #TEX_TEXSTATE | $F)
+    PokeN(#TEX_UNIF_FS +  4, #TEX_SAMPSTATE | 1)
+    PokeN(#TEX_UNIF_FS +  8, #TEX_TLB_CONF)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildTexSrc - the 4x4 raster checkerboard, RGBA8. Columns 0,1 red,
+;  columns 2,3 blue. Texel (x,y) at raster offset (y*4 + x)*4.
+; ----------------------------------------------------------------------
+Procedure BuildTexSrc()
+  Define x.i
+  Define y.i
+  Define off.i
+  Define c.i
+  y = 0
+  While y < #TEX_TH
+    x = 0
+    While x < #TEX_TW
+      off = ((y * #TEX_TW) + x) * 4
+      If x < 2
+        c = #TEX_RED
+      Else
+        c = #TEX_BLUE
+      EndIf
+      PokeN(#TEX_TEXSRC + off, c)
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  BuildTexState - the TEXTURE_SHADER_STATE (24 bytes) and the
+;  SAMPLER_STATE (24 bytes), both packed by hand from v3d_packet.xml.
+;
+;  TEXTURE_SHADER_STATE, max_ver 42 (:1493-1532), by bit offset:
+;    word0 bits   0.. 31  Texture base pointer (64-byte aligned; the
+;                         low 6 bits hold the flip/sRGB flags, all 0).
+;    word1 bits  32.. 57  Array Stride/64 = 0 (no array)
+;          bits  58.. 71  Image Width  = 4  (low 6 bits -> word1<<26)
+;    word2 bits  64.. 71  Image Width high 8 bits = 0
+;          bits  72.. 85  Image Height = 4  (-> word2<<8)
+;          bits  86.. 99  Image Depth  = 1  (low 10 bits -> word2<<22)
+;    word3 bits  96.. 99  Image Depth high 4 bits = 0
+;          bits 100..106  Texture type = RGBA8 = 4        (<<4)
+;          bit  107       Extended = 0
+;          bits 108..110  Swizzle R = Red   (2)           (<<12)
+;          bits 111..113  Swizzle G = Green (3)           (<<15)
+;          bits 114..116  Swizzle B = Blue  (4)           (<<18)
+;          bits 117..119  Swizzle A = Alpha (5)           (<<21)
+;          bits 120..127  Max/Base Level = 0
+;    word4/word5           UB_PAD, XOR, strictly-UIF, pad - all 0
+;      (NOT UIF: a 4x4 RGBA8 texture is LINEARTILE - level_width <=
+;       utile_w picks it, v3d_resource.c:647-652 - so every UIF field
+;       stays clear.)
+;
+;  SAMPLER_STATE (:1584-1618):
+;    word0 bit 0  Mag filter Nearest = 1
+;          bit 1  Min filter Nearest = 1
+;          bit 7  sRGB Disable       = 1
+;          (mip nearest 0, LODs 0)
+;    word1 bits 48..50 Wrap S = CLAMP (1)  (-> word1<<16)
+;          bits 51..53 Wrap T = CLAMP (1)  (-> word1<<19)
+;    word2..word5  border colour 0
+; ----------------------------------------------------------------------
+Procedure BuildTexState()
+  ; Zero both records first (the pad and every unnamed flag).
+  Define i.i
+  i = 0
+  While i < 8
+    PokeN(#TEX_TEXSTATE  + (i * 4), 0)
+    PokeN(#TEX_SAMPSTATE + (i * 4), 0)
+    i = i + 1
+  Wend
+
+  ; TEXTURE_SHADER_STATE.
+  PokeN(#TEX_TEXSTATE +  0, #TEX_TEX)
+  PokeN(#TEX_TEXSTATE +  4, (4 << 26))
+  PokeN(#TEX_TEXSTATE +  8, (4 << 8) | (1 << 22))
+  PokeN(#TEX_TEXSTATE + 12, (4 << 4) | (2 << 12) | (3 << 15) | (4 << 18) | (5 << 21))
+
+  ; SAMPLER_STATE.
+  PokeN(#TEX_SAMPSTATE +  0, 1 | 2 | $80)
+  PokeN(#TEX_SAMPSTATE +  4, (1 << 16) | (1 << 19))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SHADER STATE RECORD AND TEN ATTRIBUTE RECORDS.
+;
+;  Ten attributes, one 32-bit value each, stride 40. cs (coordinate
+;  phase) reads attributes 0-5 and 8-9 (position + U,V); attributes 6-7
+;  (Zs, 1/Wc) are vertex-phase only. vs reads all ten. So the coord
+;  shader's VPM input has U,V at offsets 6,7 and the vertex shader's at
+;  8,9 - which is why BuildCoordShader reads 6,7 and BuildVertexShader
+;  reads 8,9.
+;
+;  numVaryingsFs = 2. Attributes 4,5 (Xs,Ys) are signed ints, as in
+;  pi4V3dTri.
+; ----------------------------------------------------------------------
+Procedure.i BuildRecords()
+  Define r.i
+  Define k.i
+  Define cs.i
+
+  r = V3dShaderRecordBegin(#TEX_SHREC, 10)
+  If r <> #V3D_OK : ProcedureReturn r : EndIf
+
+  V3dShaderRecordFlags(1, 0, 0, 0, 1, 2)
+  ; vsOutSeg = 2 WAS THE VARYING BUG. Segments are SHARED, so the OUTPUT
+  ; field carries MAX(output,input) in 8-value sectors (v3dx_draw.c:640-660,
+  ; vir.c:846-857). Vertex INPUT = 10 attribute values = 2 sectors, output =
+  ; 6 = 1, so MAX = 2. At 1 the shared segment held only 8 values, so vertex
+  ; VPM inputs 8,9 (U,V) overflowed and were delivered as 0 - the constant
+  ; varying. Coord MAX(8,8)=1 sector. VCM stays 4 (16 KiB VPM, half 16, /2-1).
+  V3dShaderRecordVpm(1, 0, 1, 1, 2, 0, 1, 1)
+  V3dShaderRecordDefaults(#TEX_DEFAULTS)
+  V3dShaderRecordFragment(#TEX_CODE_FS, #TEX_UNIF_FS, 1, 0, 1)
+  V3dShaderRecordVertex(#TEX_CODE_VS, #TEX_UNIF_VS, 1, 1, 1)
+  V3dShaderRecordCoord(#TEX_CODE_CS, #TEX_UNIF_CS, 1, 1, 1)
+
+  k = 0
+  While k < 10
+    cs = 1
+    If k = 6 Or k = 7
+      cs = 0
+    EndIf
+    V3dAttrRecord(k, #TEX_VERTS + (k * 4), 40, $FFFFFF, cs, 1)
+    k = k + 1
+  Wend
+  V3dAttrRecordType(4, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+  V3dAttrRecordType(5, 1, #V3D_ATTR_INT, 1, 0, 1, 0)
+
+  If V3dShaderRecordOk() = 0
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+
+Global nRed.i    = 0
+Global nBlue.i   = 0
+Global nSolid.i  = 0
+Global nClear.i  = 0
+Global nPoison.i = 0
+Global nOther.i  = 0
+Global firstOther.i = -1
+Global firstOtherVal.i = 0
+Global redMinX.i  = 9999
+Global redMaxX.i  = -1
+Global blueMinX.i = 9999
+Global blueMaxX.i = -1
+Global redMinY.i  = 9999
+Global redMaxY.i  = -1
+Global blueMinY.i = 9999
+Global blueMaxY.i = -1
+Global guardTouched.i = 0
+
+; U-ramp analysis: over drawn (non-clear, non-poison) pixels, the low
+; byte is round(U*255). Track its range and the x where the min and max
+; occur, so a gradient (min at small x, max at large x) is visible.
+Global grayMin.i  = 999
+Global grayMax.i  = -1
+Global grayMinX.i = -1
+Global grayMaxX.i = -1
+Global nGray.i    = 0
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(#TEX_TARGET + (y * #TEX_STRIDE) + (x * 4))
+EndProcedure
+
+Procedure Verify()
+  Define x.i
+  Define y.i
+  Define v.i
+  Define g.i
+
+  y = 0
+  While y < #TEX_H
+    x = 0
+    While x < #TEX_W
+      v = PixelAt(x, y)
+      If v = #TEX_RED
+        nRed = nRed + 1
+        If x < redMinX : redMinX = x : EndIf
+        If x > redMaxX : redMaxX = x : EndIf
+        If y < redMinY : redMinY = y : EndIf
+        If y > redMaxY : redMaxY = y : EndIf
+      ElseIf v = #TEX_BLUE
+        nBlue = nBlue + 1
+        If x < blueMinX : blueMinX = x : EndIf
+        If x > blueMaxX : blueMaxX = x : EndIf
+        If y < blueMinY : blueMinY = y : EndIf
+        If y > blueMaxY : blueMaxY = y : EndIf
+      ElseIf v = #TEX_SOLID
+        nSolid = nSolid + 1
+      ElseIf v = #TEX_CLEAR
+        nClear = nClear + 1
+      ElseIf v = #TEX_POISON
+        nPoison = nPoison + 1
+      Else
+        nOther = nOther + 1
+        If firstOther < 0
+          firstOther = (y * #TEX_W) + x
+          firstOtherVal = v
+        EndIf
+        ; A drawn pixel that is not one of the named colours. In the
+        ; U-ramp build every triangle pixel lands here; its low byte is
+        ; round(U*255). Track the range and where it occurs.
+        g = v & $FF
+        nGray = nGray + 1
+        If g < grayMin
+          grayMin = g
+          grayMinX = x
+        EndIf
+        If g > grayMax
+          grayMax = g
+          grayMaxX = x
+        EndIf
+      EndIf
+      x = x + 1
+    Wend
+    y = y + 1
+  Wend
+EndProcedure
+
+Procedure VerifyGuard()
+  Define i.i
+  Define n.i
+  i = 0
+  n = #TEX_GUARD_BYTES / 4
+  While i < n
+    If PeekN(#TEX_GUARD + (i * 4)) <> #TEX_POISON
+      guardTouched = guardTouched + 1
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ======================================================================
+;  EXPLICIT VARYING-FLAG PACKETS
+;
+;  THE ZERO_ALL SHORTCUT WAS THE VARYING BUG. On silicon, emitting
+;  Zero All Non-perspective Flags (code 99) left the fragment shader's
+;  two varyings PERSPECTIVE, while the fragment shader reads them with
+;  the NO-PERSPECTIVE arithmetic (vary + r5). The mismatch delivered the
+;  provoking-vertex value - every fragment's U came back as 0, the value
+;  at vertices 0 and 2 - which read as flat shading.
+;
+;  The flags packet and the fragment-shader arithmetic MUST AGREE. These
+;  emit the explicit packets so they do:
+;
+;    Flat Shade Flags     (v3d_packet.xml code 98)  - all bits 0: no
+;                         varying is flat, both are smooth.
+;    Non-perspective Flags (code 100)               - bits for varyings
+;                         0 and 1 SET: both are no-perspective, matching
+;                         the fragment shader. For an affine (Wc=1) quad
+;                         screen-linear interpolation is the correct
+;                         interpolation, so this is exact.
+;
+;  Packet layout (both), from the field offsets:
+;    byte 0  Varying offset V0 (bits 0-3) | action lower (4-5) |
+;            action higher (6-7). Offset 0, both actions ZEROED (=1) so
+;            every varying outside the explicit window is cleared: $50.
+;    bytes 1-3  the 24-bit flags for varyings 0..23, little-endian.
+;
+;  Emitted with v3d.pi4's low-level v3d_ClU8 into the open bin list, in
+;  the same position the Zero All calls held.
+; ======================================================================
+Procedure EmitFlatShadeFlags(flags.i)
+  v3d_ClU8(98)
+  v3d_ClU8($50)
+  v3d_ClU8(flags & $FF)
+  v3d_ClU8((flags >> 8) & $FF)
+  v3d_ClU8((flags >> 16) & $FF)
+EndProcedure
+
+Procedure EmitNonperspFlags(flags.i)
+  v3d_ClU8(100)
+  v3d_ClU8($50)
+  v3d_ClU8(flags & $FF)
+  v3d_ClU8((flags >> 8) & $FF)
+  v3d_ClU8((flags >> 16) & $FF)
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define csBytes.i
+  Define vsBytes.i
+  Define fsBytes.i
+  Define ok.i
+  Define sx.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D M1 - one TEXTURED triangle, TMU-sampled ===")
+  PutNl()
+  If #TEX_FS_MODE = #TEX_MODE_SOLID
+    PutS("    FRAGMENT SHADER: SOLID bisection build (no TMU)")
+  ElseIf #TEX_FS_MODE = #TEX_MODE_RAMP
+    PutS("    FRAGMENT SHADER: U-RAMP build (varying U as grayscale, no TMU)")
+  ElseIf #TEX_FS_MODE = #TEX_MODE_DIRECT
+    PutS("    FRAGMENT SHADER: DIRECT-Xc RAMP (varyings = Xc,Yc, no attribute, no TMU)")
+  Else
+    PutS("    FRAGMENT SHADER: TEXTURED build (TMU sample)")
+  EndIf
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. Stage 0.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0: ")
+  PutErr(r)
+  PutNl()
+  RowHex("HUB_IDENT1", V3dIdent1())
+  If r <> #V3D_OK
+    PutS("verdict: STAGE0")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. THE THREE QPU PROGRAMS, BUILT AND PRINTED FIRST.
+  ; ------------------------------------------------------------------
+  PutS("1   the shaders")
+  PutNl()
+
+  r = BuildCoordShader()
+  csBytes = V3dQpuProgramBytes()
+  PutS("    coordinate shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", csBytes / 8)
+  DumpProgram(#TEX_CODE_CS, csBytes / 8)
+
+  r = BuildVertexShader()
+  vsBytes = V3dQpuProgramBytes()
+  PutS("    vertex shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", vsBytes / 8)
+  DumpProgram(#TEX_CODE_VS, vsBytes / 8)
+
+  r = BuildFragmentShader()
+  fsBytes = V3dQpuProgramBytes()
+  PutS("    fragment shader: ")
+  PutQpuErr(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("verdict: SHADER")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", fsBytes / 8)
+  DumpProgram(#TEX_CODE_FS, fsBytes / 8)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. THE V3D MMU. Mapped BEFORE the TFU, which is a bus master and
+  ;     reaches everything through the same page table.
+  ; ------------------------------------------------------------------
+  PutS("2   the V3D MMU: ")
+  r = V3dMmuInit(#TEX_PT, #TEX_PT_BYTES, #TEX_ILLEGAL)
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dMmuMap(#TEX_BCL, #TEX_BCL, #TEX_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TILELIST, #TEX_TILELIST, #TEX_TL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_RCL, #TEX_RCL, #TEX_RCL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TSTATE, #TEX_TSTATE, #TEX_TSTATE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_SHREC, #TEX_SHREC, #TEX_SHREC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_VERTS, #TEX_VERTS, #TEX_VERTS_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_UNIF_CS, #TEX_UNIF_CS, #TEX_UNIF_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_CODE_CS, #TEX_CODE_CS, #TEX_CODE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TARGET, #TEX_TARGET, #TEX_TARGET_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TEXSRC, #TEX_TEXSRC, #TEX_PAGE)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TEX, #TEX_TEX, #TEX_TEX_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TEXSTATE, #TEX_TEXSTATE, #TEX_PAGE)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_TALLOC, #TEX_TALLOC, #TEX_TALLOC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#TEX_OVERFLOW, #TEX_OVERFLOW, #TEX_OVERFLOW_BYTES)
+  EndIf
+  If r <> #V3D_OK
+    PutS("    mapping: ") : PutErr(r) : PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("PTE for the texture", V3dMmuEntry(#TEX_TEX))
+  RowHex("PTE for the guard page", V3dMmuEntry(#TEX_GUARD))
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  3. THE TEXTURE. Build a raster checkerboard, TFU-tile it to the
+  ;     LINEARTILE texture the TMU will sample. For a 4x4 image
+  ;     LINEARTILE equals raster (one 64-byte microtile), so this is an
+  ;     identity re-tile - it exercises the real path at the size where
+  ;     its result is independently obvious.
+  ; ------------------------------------------------------------------
+  PutS("3   the texture")
+  PutNl()
+  ; Poison the tiled texture so a TFU that wrote nothing is visible.
+  i = 0
+  While i < (#TEX_TBYTES / 4)
+    PokeN(#TEX_TEX + (i * 4), #TEX_POISON)
+    i = i + 1
+  Wend
+  BuildTexSrc()
+  PutS("    source 4x4 RGBA8 (red cols 0-1, blue cols 2-3):")
+  PutNl()
+  DumpBytes(#TEX_TEXSRC, #TEX_TBYTES)
+
+  r = V3dTfuBegin(#TEX_TW, #TEX_TH, #V3D_TEXFMT_RGBA8)
+  If r = #V3D_OK
+    r = V3dTfuSourceRaster(#TEX_TEXSRC, #TEX_TW, #TEX_TBYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dTfuDest(#TEX_TEX, #V3D_TFU_OFMT_LINEARTILE, #TEX_TBYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dTfuSubmit()
+  EndIf
+  PutS("    TFU submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: TFU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dTfuWait(#V3D_TFU_TIMEOUT_US)
+  PutS("    TFU wait: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: TFU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutS("    tiled texture (LINEARTILE):")
+  PutNl()
+  DumpBytes(#TEX_TEX, #TEX_TBYTES)
+
+  ; The texture and sampler state records.
+  BuildTexState()
+  PutS("    texture shader state (24 bytes):")
+  PutNl()
+  DumpBytes(#TEX_TEXSTATE, 24)
+  PutS("    sampler state (24 bytes):")
+  PutNl()
+  DumpBytes(#TEX_SAMPSTATE, 24)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4. THE FRAME GEOMETRY.
+  ; ------------------------------------------------------------------
+  r = V3dRenderBegin(#TEX_W, #TEX_H, #V3D_OFMT_RGBA8)
+  PutS("4   the frame: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: GEOMETRY")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile alloc given", #TEX_TALLOC_BYTES)
+
+  r = V3dRenderTarget(#TEX_TARGET, #TEX_TARGET_BYTES, #V3D_MEMFMT_RASTER, #TEX_STRIDE, 0)
+  If r <> #V3D_OK
+    PutS("    the render target: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dRenderClear(#TEX_CLEAR, #TEX_ZCLEAR, 0)
+  r = V3dRenderPool(#TEX_TALLOC, #TEX_TALLOC_BYTES, #TEX_TSTATE, #TEX_TSTATE_BYTES)
+  If r <> #V3D_OK
+    PutS("    the pools: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinOverflow(#TEX_OVERFLOW, #TEX_OVERFLOW_BYTES)
+  If r <> #V3D_OK
+    PutS("    the overflow pool: ") : PutErr(r) : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  5. THE DATA, THE RECORDS, THE POISON.
+  ; ------------------------------------------------------------------
+  BuildVerts()
+  BuildUniforms()
+
+  i = 0
+  n = #TEX_PAGE / 4
+  While i < n
+    PokeN(#TEX_SHREC + (i * 4), #TEX_POISON)
+    i = i + 1
+  Wend
+
+  r = BuildRecords()
+  PutS("5   the shader state record: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RECORD")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("record", V3dShaderRecordAddr())
+  RowDec("record + attrs, bytes", V3dShaderRecordBytes())
+  DumpBytes(V3dShaderRecordAddr(), V3dShaderRecordBytes())
+  PutS("    the three vertices, ten words each:")
+  PutNl()
+  DumpBytes(#TEX_VERTS, 120)
+  PutNl()
+
+  ; Poison the target and the guard page.
+  i = 0
+  n = #TEX_TARGET_BYTES / 4
+  While i < n
+    PokeN(#TEX_TARGET + (i * 4), #TEX_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = #TEX_GUARD_BYTES / 4
+  While i < n
+    PokeN(#TEX_GUARD + (i * 4), #TEX_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = 4096 / 4
+  While i < n
+    PokeN(#TEX_TALLOC + (i * 4), #TEX_POISON)
+    PokeN(#TEX_TSTATE + (i * 4), #TEX_POISON)
+    i = i + 1
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  6. THE BIN LIST. Mesa's order, exactly as pi4V3dTri, EXCEPT the
+  ;     varying flags: the two varyings are declared NO-PERSPECTIVE with
+  ;     an explicit Non-perspective Flags packet so the flags agree with
+  ;     the fragment shader's (vary + r5) arithmetic. numVaryingsFs=2 is
+  ;     in the record (above). See EmitNonperspFlags for the argument.
+  ; ------------------------------------------------------------------
+  r = V3dBclBegin(#TEX_BCL, #TEX_BCL_BYTES)
+  If r = #V3D_OK
+    V3dClClipWindow(0, 0, #TEX_W, #TEX_H)
+    V3dClCfgBits(V3dCfgBitsWord(1, 1, 0, 7))
+    V3dClPointSize(#TEX_F_ONE)
+    V3dClLineWidth(#TEX_F_ONE)
+    V3dClClipperXyScaling(#TEX_F_8192, #TEX_F_8192)
+    V3dClClipperZScaleOffset(#TEX_F_ONE, #TEX_F_ZERO)
+    V3dClClipperZMinMax($BF800000, #TEX_F_ONE)
+    V3dClViewportOffset((#TEX_CX * 256), 0, (#TEX_CY * 256), 0)
+    V3dClColorWriteMasks(0)
+    EmitFlatShadeFlags(0)          ; explicit: no varying is flat (smooth)
+    EmitNonperspFlags($3)          ; explicit: varyings 0,1 no-perspective
+    V3dClZeroAllCentroidFlags()
+    V3dClOcclusionQueryCounter(0)
+    V3dClSampleState($3F80, $F)
+    V3dClVcmCacheSize(4, 4)
+    V3dClGlShaderState(V3dShaderRecordAddr(), 10)
+    V3dClVertexArrayPrims(#V3D_PRIM_TRIANGLES, 3, 0)
+    r = V3dBclFinish()
+  EndIf
+  PutS("6   the bin list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("bin list bytes", V3dBclBytes())
+  DumpBytes(V3dBclStartAddr(), V3dBclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE RENDER LIST.
+  ; ------------------------------------------------------------------
+  r = V3dRclBuild(#TEX_TILELIST, #TEX_TL_BYTES, #TEX_RCL, #TEX_RCL_BYTES)
+  PutS("7   the render list: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  8. CACHE MAINTENANCE and the GPU caches. The shader record, verts,
+  ;     uniforms, code, texture, and both state records are all reached
+  ;     through the record and the library never sees their extents.
+  ;     V3dInvalidateCaches() drops the TMU/L2T caches so the sample
+  ;     reads the TFU's fresh output rather than a stale line.
+  ; ------------------------------------------------------------------
+  V3dCacheRange(#TEX_SHREC, V3dShaderRecordBytes())
+  V3dCacheRange(#TEX_VERTS, 512)
+  V3dCacheRange(#TEX_UNIF_CS, 256)
+  V3dCacheRange(#TEX_CODE_CS, #TEX_CODE_SLOT * 3)
+  V3dCacheRange(#TEX_TEX, #TEX_TBYTES)
+  V3dCacheRange(#TEX_TEXSTATE, 512)
+  V3dBarrier()
+  V3dInvalidateCaches()
+
+  ; ------------------------------------------------------------------
+  ;  9. THE BIN JOB.
+  ; ------------------------------------------------------------------
+  r = V3dBinSubmit()
+  PutS("8   bin submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BINSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinWait(#TEX_WAIT_US)
+  PutS("    bin wait: ")
+  PutErr(r)
+  PutNl()
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowHex("CTL_INT_STS", V3dBinIntSts())
+  RowHex("ERR_STAT", V3dBinErrStat())
+  RowHex("MMU_VIO_ADDR", V3dBinVioAddr())
+  If r <> #V3D_OK
+    PutS("verdict: BIN")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  10. THE RENDER JOB.
+  ; ------------------------------------------------------------------
+  r = V3dRenderSubmit()
+  PutS("9   render submit: ")
+  PutErr(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RENDERSUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dRenderWait(#TEX_WAIT_US)
+  PutS("    render wait: ")
+  PutErr(r)
+  PutNl()
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowHex("CTL_INT_STS", V3dRenderIntSts())
+  RowHex("ERR_STAT", V3dRenderErrStat())
+  RowHex("MMU_VIO_ADDR", V3dRenderVioAddr())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  11. THE PIXELS. This is the whole test.
+  ; ------------------------------------------------------------------
+  Verify()
+  VerifyGuard()
+
+  PutS("10  the pixels")
+  PutNl()
+  RowDec("pixels total", #TEX_PIXELS)
+  RowHex("red texel colour", #TEX_RED)
+  RowDec("pixels red", nRed)
+  RowHex("blue texel colour", #TEX_BLUE)
+  RowDec("pixels blue", nBlue)
+  RowHex("solid colour (bisect)", #TEX_SOLID)
+  RowDec("pixels solid", nSolid)
+  RowHex("clear colour", #TEX_CLEAR)
+  RowDec("pixels clear colour", nClear)
+  RowDec("pixels still poison", nPoison)
+  RowDec("pixels some other value", nOther)
+  RowDec("first other, pixel index", firstOther)
+  RowHex("first other, value", firstOtherVal)
+  RowDec("red   min x", redMinX)
+  RowDec("red   max x", redMaxX)
+  RowDec("blue  min x", blueMinX)
+  RowDec("blue  max x", blueMaxX)
+  RowDec("red   y range min", redMinY)
+  RowDec("red   y range max", redMaxY)
+  RowDec("blue  y range min", blueMinY)
+  RowDec("blue  y range max", blueMaxY)
+  RowDec("guard words touched", guardTouched)
+  PutNl()
+
+  ; A few named probes for the log.
+  PutS("    probes (x,y) -> colour:")
+  PutNl()
+  RowHex("(16,20) expect red", PixelAt(16, 20))
+  RowHex("(20,30) expect red", PixelAt(20, 30))
+  RowHex("(40,12) expect blue", PixelAt(40, 12))
+  RowHex("(44,14) expect blue", PixelAt(44, 14))
+  PutNl()
+
+  ; U-ramp analysis: the gradient of varying0 along a scan line, plus range.
+  If #TEX_FS_MODE = #TEX_MODE_RAMP Or #TEX_FS_MODE = #TEX_MODE_DIRECT
+    PutS("    varying0 across the triangle (drawn-pixel low byte):")
+    PutNl()
+    RowDec("gray pixels", nGray)
+    RowDec("gray min (U8)", grayMin)
+    RowDec("  at x", grayMinX)
+    RowDec("gray max (U8)", grayMax)
+    RowDec("  at x", grayMaxX)
+    RowDec("gray spread max-min", grayMax - grayMin)
+    PutS("    scan y=20, x=10..55 step 5, R-channel byte:")
+    PutNl()
+    sx = 10
+    While sx <= 55
+      PutS("      x=")
+      PutDec(sx)
+      PutS(" -> ")
+      PutHex(PixelAt(sx, 20) & $FF, 2)
+      PutS("  (full ")
+      PutHex(PixelAt(sx, 20), 8)
+      PutS(")")
+      PutNl()
+      sx = sx + 5
+    Wend
+    PutNl()
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  THE VERDICT.
+  ;
+  ;  Textured build: a pass needs BOTH texture colours present, EVERY
+  ;  red pixel strictly left of EVERY blue pixel (the U varying
+  ;  interpolated across X and the TMU split the texture), nothing
+  ;  outside the known colours, no poison left, and the guard untouched.
+  ;  The colour depends on X alone, so no Y convention is assumed.
+  ;
+  ;  Solid bisection build: a pass only means THE RENDER RAN - the
+  ;  triangle area is the solid colour, no poison remains. It proves the
+  ;  render CL, the varying-emitting coord/vertex shaders and the shader
+  ;  record; it says nothing about the TMU.
+  ; ------------------------------------------------------------------
+  ok = 0
+  If #TEX_FS_MODE = #TEX_MODE_SOLID
+    If nSolid > 0
+      If nPoison = 0
+        If guardTouched = 0
+          ok = 1
+        EndIf
+      EndIf
+    EndIf
+    If ok = 1
+      PutS("verdict: SOLID-OK - render ran, tile filled. TMU NOT tested; bug is in the TMU path.")
+    Else
+      PutS("verdict: SOLID-FAIL - render did not fill the tile. Bug is in the varying setup or the render CL, NOT the TMU.")
+    EndIf
+  ElseIf #TEX_FS_MODE = #TEX_MODE_RAMP Or #TEX_FS_MODE = #TEX_MODE_DIRECT
+    ; varying0 interpolates iff the grey level spans a real range AND its
+    ; maximum is to the RIGHT of its minimum (it grows with x). A spread
+    ; under 8/255 is "flat". In DIRECT mode varying0 = Xc, which is
+    ; negative on the left half and clamps to 0 there, so the gradient is
+    ; on the right half - the max-right test still holds.
+    If nGray > 0
+      If (grayMax - grayMin) >= 8
+        If grayMaxX > grayMinX
+          ok = 1
+        EndIf
+      EndIf
+    EndIf
+    If ok = 1
+      PutS("verdict: RAMP-OK - varying0 interpolates left-to-right. The interpolator works.")
+    Else
+      PutS("verdict: RAMP-FLAT - varying0 is (near) constant. It is NOT interpolating.")
+    EndIf
+  Else
+    If nRed > 0
+      If nBlue > 0
+        If redMaxX < blueMinX
+          If nPoison = 0
+            If nOther = 0
+              If guardTouched = 0
+                ok = 1
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    If ok = 1
+      PutS("verdict: OK - TEXTURED TRIANGLE. red left of blue, TMU sampled.")
+    Else
+      PutS("verdict: NO TEXTURE")
+    EndIf
+  EndIf
+  PutNl()
+
+  ProcedureReturn nRed + nBlue + nSolid + nGray
+EndProcedure

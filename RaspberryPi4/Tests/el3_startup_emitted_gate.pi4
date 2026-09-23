@@ -1,0 +1,24 @@
+; Normal (non-returning) image entry, interpreter-only startup contract.
+EnableFloatingPoint
+Global gBootDtb.i
+Global gStartupZero.i
+Global gStartupFloat.f
+
+Procedure Main()
+  ASM
+    adrp x1, global_gbootdtb
+    add x1, x1, #:lo12:global_gbootdtb
+    str x0, [x1]
+    movz x2, #$0600, lsl #16
+    mrs x3, CurrentEL
+    str x3, [x2, #8]
+    mov x3, sp
+    str x3, [x2, #16]
+  EndASM
+  PokeI($06000000, gBootDtb)
+  PokeI($06000018, gStartupZero)
+  gStartupFloat = 1.25
+  gStartupFloat = gStartupFloat + 2.5
+  PokeI($06000028, PeekL(@gStartupFloat))
+  PokeI($06000020, $1234)
+EndProcedure

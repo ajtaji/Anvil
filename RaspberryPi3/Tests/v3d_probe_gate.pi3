@@ -1,0 +1,291 @@
+; Emitted Pi3 VC4/V3D gate using the production bring-up module and a
+; deterministic property-channel model. The fixture never performs real MMIO.
+#HW_ADDR_SAFE = 0
+#PI3_V3D_FDT_MAGIC = $D00DFEED
+#PI3_V3D_FDT_MAX_BYTES = $100000
+#PI3_V3D_FDT_MAX_DEPTH = 32
+
+Global Dim pi3_property.l[16]
+Global pi3_mailbox_outstanding.i
+Global gate_domain_supported.i
+Global gate_domain_state.i
+Global gate_revision.i
+Global gate_mbox_calls.i
+Global gate_domain_sets.i
+Global gate_set_reply.i
+Global gate_bad_get_echo.i
+Global Dim gate_dtb.a[2048]
+Global gate_cursor.i
+Global gate_strcur.i
+Global gate_strtab.i
+Global gate_off_compatible.i
+Global gate_off_reg.i
+Global gate_off_power_domains.i
+Global gate_off_phandle.i
+Global gate_off_power_cells.i
+Global gate_off_addr_cells.i
+Global gate_off_size_cells.i
+Global gate_off_ranges.i
+Global gate_dtb_variant.i
+
+Procedure p3gBeAt(p.i, value.i)
+  PokeA(p, (value >> 24) & $FF) : PokeA(p + 1, (value >> 16) & $FF)
+  PokeA(p + 2, (value >> 8) & $FF) : PokeA(p + 3, value & $FF)
+EndProcedure
+
+Procedure p3gWord(value.i)
+  p3gBeAt(@gate_dtb[0] + gate_cursor, value)
+  gate_cursor = gate_cursor + 4
+EndProcedure
+
+Procedure.i p3gStr(source.i, bytes.i)
+  Protected start.i, n.i
+  start = gate_strcur : n = 0
+  While n < bytes
+    PokeA(@gate_dtb[0] + gate_strcur, PeekA(source + n))
+    gate_strcur = gate_strcur + 1 : n = n + 1
+  Wend
+  PokeA(@gate_dtb[0] + gate_strcur, 0) : gate_strcur = gate_strcur + 1
+  ProcedureReturn start - gate_strtab
+EndProcedure
+
+Procedure p3gNode(source.i, bytes.i)
+  Protected n.i
+  p3gWord(1) : n = 0
+  While n < bytes
+    PokeA(@gate_dtb[0] + gate_cursor, PeekA(source + n))
+    gate_cursor = gate_cursor + 1 : n = n + 1
+  Wend
+  PokeA(@gate_dtb[0] + gate_cursor, 0) : gate_cursor = gate_cursor + 1
+  gate_cursor = (gate_cursor + 3) & $FFFFFFFC
+EndProcedure
+
+Procedure p3gData(source.i, bytes.i)
+  Protected n.i
+  n = 0
+  While n < bytes
+    PokeA(@gate_dtb[0] + gate_cursor, PeekA(source + n))
+    gate_cursor = gate_cursor + 1 : n = n + 1
+  Wend
+  PokeA(@gate_dtb[0] + gate_cursor, 0) : gate_cursor = gate_cursor + 1
+EndProcedure
+
+Procedure p3gPropHead(bytes.i, nameOffset.i)
+  p3gWord(3) : p3gWord(bytes) : p3gWord(nameOffset)
+EndProcedure
+
+Procedure p3gPadStruct()
+  gate_cursor = (gate_cursor + 3) & $FFFFFFFC
+EndProcedure
+
+Procedure.i p3gBuildDtb()
+  Protected total.i, structBytes.i, stringsBytes.i, i.i
+  For i = 0 To 2047 : PokeA(@gate_dtb[0] + i, 0) : Next
+  gate_strtab = 1500 : gate_strcur = gate_strtab
+  gate_off_compatible = p3gStr(?gstr_compatible, 10)
+  gate_off_reg = p3gStr(?gstr_reg, 3)
+  gate_off_power_domains = p3gStr(?gstr_power_domains, 13)
+  gate_off_phandle = p3gStr(?gstr_phandle, 7)
+  gate_off_power_cells = p3gStr(?gstr_power_cells, 19)
+  gate_off_addr_cells = p3gStr(?gstr_addr_cells, 14)
+  gate_off_size_cells = p3gStr(?gstr_size_cells, 11)
+  gate_off_ranges = p3gStr(?gstr_ranges, 6)
+
+  gate_cursor = 56
+  p3gWord(1) : PokeA(@gate_dtb[0] + gate_cursor, 0) : gate_cursor = gate_cursor + 1 : p3gPadStruct()
+  p3gPropHead(4, gate_off_addr_cells) : p3gWord(1)
+  p3gPropHead(4, gate_off_size_cells) : p3gWord(1)
+  p3gNode(?gnode_soc, 3)
+  p3gPropHead(4, gate_off_addr_cells) : p3gWord(1)
+  p3gPropHead(4, gate_off_size_cells) : p3gWord(1)
+  p3gPropHead(24, gate_off_ranges)
+  p3gWord($7E000000)
+  If gate_dtb_variant = 1 : p3gWord($3E000000) : Else : p3gWord($3F000000) : EndIf
+  p3gWord($01000000)
+  p3gWord($40000000) : p3gWord($40000000) : p3gWord($1000)
+  p3gNode(?gnode_v3d, 12)
+  p3gPropHead(17, gate_off_compatible)
+  p3gData(?gcompat_v3d, 16) : PokeA(@gate_dtb[0] + gate_cursor, 0) : gate_cursor = gate_cursor + 1 : p3gPadStruct()
+  p3gPropHead(8, gate_off_reg) : p3gWord($7EC00000) : p3gWord($1000)
+  p3gPropHead(8, gate_off_power_domains)
+  If gate_dtb_variant = 2 : p3gWord($1235) : Else : p3gWord($1234) : EndIf
+  p3gWord(10)
+  p3gWord(2)
+
+  p3gNode(?gnode_power, 5)
+  p3gPropHead(26, gate_off_compatible)
+  p3gData(?gcompat_power, 25) : PokeA(@gate_dtb[0] + gate_cursor, 0) : gate_cursor = gate_cursor + 1 : p3gPadStruct()
+  p3gPropHead(4, gate_off_power_cells) : p3gWord(1)
+  p3gPropHead(4, gate_off_phandle) : p3gWord($1234)
+  p3gWord(2) : p3gWord(2) : p3gWord(2) : p3gWord(9)
+
+  structBytes = gate_cursor - 56 : stringsBytes = gate_strcur - gate_strtab
+  total = gate_strcur
+  p3gBeAt(@gate_dtb[0], #PI3_V3D_FDT_MAGIC) : p3gBeAt(@gate_dtb[0] + 4, total)
+  p3gBeAt(@gate_dtb[0] + 8, 56) : p3gBeAt(@gate_dtb[0] + 12, gate_strtab)
+  p3gBeAt(@gate_dtb[0] + 16, 40) : p3gBeAt(@gate_dtb[0] + 20, 17)
+  p3gBeAt(@gate_dtb[0] + 24, 16) : p3gBeAt(@gate_dtb[0] + 28, 0)
+  p3gBeAt(@gate_dtb[0] + 32, stringsBytes) : p3gBeAt(@gate_dtb[0] + 36, structBytes)
+  ProcedureReturn total
+EndProcedure
+
+Procedure.i Pi3MailboxContextState()
+  ProcedureReturn 2
+EndProcedure
+Procedure.i Pi3MailboxBufferContext(buffer.i, bytes.i)
+  If buffer > 0 And bytes = 32 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i MmuAtEl3()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i MmuEnabled()
+  ProcedureReturn 1
+EndProcedure
+Procedure.i HwPmfTargetId()
+  ProcedureReturn 2837
+EndProcedure
+Procedure.i HwMemoryRevision()
+  ProcedureReturn gate_revision
+EndProcedure
+Procedure.i HwAddrCheck(lo.i, hi.i, write.i)
+  If lo = $3FC00000 And hi = $3FC00FFF And write = 0 : ProcedureReturn #HW_ADDR_SAFE : EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i Pi3MailboxCallTimeout(buffer.i, bytes.i, timeout.i)
+  Protected tag.i
+  Protected id.i
+  Protected input.i
+  Protected reply.i
+  gate_mbox_calls = gate_mbox_calls + 1
+  If bytes <> 32 Or timeout <> 250000 : ProcedureReturn 0 : EndIf
+  tag = PeekL(buffer + 8) : id = PeekL(buffer + 20) : input = PeekL(buffer + 24)
+  Select tag
+    Case $00030030 ; GET_DOMAIN_STATE
+      If id = 22
+        If gate_domain_supported = 0
+          reply = input ; Linux's unsupported-tag sentinel remains unchanged.
+        Else
+          reply = 1
+        EndIf
+      ElseIf id = 11
+        reply = gate_domain_state
+      Else
+        ProcedureReturn 0
+      EndIf
+    Case $00038030 ; SET_DOMAIN_STATE
+      If id <> 11 Or input <> 1 : ProcedureReturn 0 : EndIf
+      gate_domain_state = 1 : gate_domain_sets = gate_domain_sets + 1 : reply = gate_set_reply
+    Default
+      ProcedureReturn 0
+  EndSelect
+  PokeL(buffer + 4, $80000000)
+  PokeL(buffer + 16, $80000008)
+  If tag = $00038030
+    PokeL(buffer + 20, 0) ; observed firmware SET response has no stable ID echo
+  ElseIf tag = $00030030 And id = 11 And gate_bad_get_echo <> 0
+    PokeL(buffer + 20, 0) ; GET must still reject a mismatched ID
+  EndIf
+  PokeL(buffer + 24, reply)
+  ProcedureReturn 1
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/v3d.pi3"
+
+Procedure.i Main()
+  Protected id.Pi3V3dIdentity
+  Protected rc.i
+  Protected calls.i
+  Protected dtbBytes.i
+  Protected *dtbEnd
+
+  If Pi3V3dBoardRevisionSupported($A22082) = 0 : ProcedureReturn 14 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($08 << 4)) = 0 : ProcedureReturn 15 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($0A << 4)) = 0 : ProcedureReturn 16 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($0D << 4)) = 0 : ProcedureReturn 17 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($0E << 4)) = 0 : ProcedureReturn 18 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($10 << 4)) = 0 : ProcedureReturn 19 : EndIf
+  If Pi3V3dBoardRevisionSupported($800000 + ($0C << 4)) <> 0 Or Pi3V3dBoardRevisionSupported(0) <> 0
+    ProcedureReturn 20
+  EndIf
+
+  gate_dtb_variant = 0
+  dtbBytes = p3gBuildDtb()
+  *dtbEnd = @gate_dtb[0] + dtbBytes
+  If Pi3V3dDtbValid(@gate_dtb[0], *dtbEnd) = 0 : ProcedureReturn 100 + pi3_v3d_dtb_stage : EndIf
+  If Pi3V3dDtbValid(@gate_dtb[0], @gate_dtb[0] + 39) <> 0 : ProcedureReturn 13 : EndIf
+  gate_dtb_variant = 1 : dtbBytes = p3gBuildDtb() : *dtbEnd = @gate_dtb[0] + dtbBytes
+  If Pi3V3dDtbValid(@gate_dtb[0], *dtbEnd) <> 0 : ProcedureReturn 21 : EndIf
+  gate_dtb_variant = 2 : dtbBytes = p3gBuildDtb() : *dtbEnd = @gate_dtb[0] + dtbBytes
+  If Pi3V3dDtbValid(@gate_dtb[0], *dtbEnd) <> 0 : ProcedureReturn 22 : EndIf
+  gate_dtb_variant = 0 : dtbBytes = p3gBuildDtb() : *dtbEnd = @gate_dtb[0] + dtbBytes
+
+  ; Known supported Pi 3B revision, new power API, domain/clock initially off.
+  gate_revision = $A22082 : gate_domain_supported = 1
+  gate_domain_state = 0 : gate_set_reply = 1 : gate_bad_get_echo = 0
+  gate_mbox_calls = 0 : gate_domain_sets = 0
+  PokeL(#PI3_V3D_BASE, #PI3_V3D_IDENT0_EXPECTED)
+  PokeL(#PI3_V3D_BASE + 4, $10255212)
+  PokeL(#PI3_V3D_BASE + 8, $55AA33CC)
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> 1 Or pi3_v3d_error <> 0 : ProcedureReturn 1 : EndIf
+  If gate_domain_sets <> 1 : ProcedureReturn 2 : EndIf
+  If pi3_v3d_set_ack <> 1 Or pi3_v3d_domain_state_initial <> 0 Or pi3_v3d_domain_state <> 1 : ProcedureReturn 23 : EndIf
+  If pi3_v3d_set_mailbox_ok <> 1 Or pi3_v3d_set_tag_echo <> $00038030 Or pi3_v3d_set_size_echo <> 8 : ProcedureReturn 24 : EndIf
+  If pi3_v3d_set_response_size <> $80000008 Or pi3_v3d_set_domain_echo <> 0 Or pi3_v3d_set_state_reply <> 1 : ProcedureReturn 25 : EndIf
+  If id\ident0 <> #PI3_V3D_IDENT0_EXPECTED Or id\ident2 <> $55AA33CC : ProcedureReturn 3 : EndIf
+  If id\version <> 2 Or id\revision <> 2 Or id\slices <> 1 Or id\qpusPerSlice <> 2 Or id\tmusPerSlice <> 5 : ProcedureReturn 4 : EndIf
+
+  ; Already-powered repeat never toggles ownership or clocks.
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> 1 Or gate_domain_sets <> 1 : ProcedureReturn 5 : EndIf
+
+  ; A SET's zero domain word is tolerated, but a GET must echo its ID.
+  gate_bad_get_echo = 1
+  rc = Pi3V3dGetDomainState(@id\version)
+  gate_bad_get_echo = 0
+  If rc <> 0 : ProcedureReturn 26 : EndIf
+
+  ; Unknown power interface refuses before any V3D access or set request.
+  gate_domain_supported = 0 : gate_mbox_calls = 0
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> #PI3_V3D_ERR_DOMAIN_API Or gate_domain_sets <> 1 Or gate_mbox_calls <> 1 : ProcedureReturn 6 : EndIf
+
+  ; Unsupported board revision is refused before even asking firmware.
+  gate_domain_supported = 1 : gate_revision = $B03114 : gate_mbox_calls = 0
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> #PI3_V3D_ERR_BOARD Or gate_mbox_calls <> 0 : ProcedureReturn 7 : EndIf
+
+  ; Domain is already powered after the first call; Linux Pi3's V3D node
+  ; has no separate clock property, so no guessed clock mutation occurs.
+  gate_revision = $A22082 : gate_mbox_calls = 0
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> 1 Or gate_mbox_calls <> 3 : ProcedureReturn 8 : EndIf
+
+  ; Wrong implementation/version signature remains diagnostic, never success.
+  PokeL(#PI3_V3D_BASE, $FFFFFFFF)
+  rc = Pi3V3dProbeIdentity(@gate_dtb[0], *dtbEnd, @id, @pi3_property[0], @pi3_mailbox_outstanding)
+  If rc <> #PI3_V3D_ERR_IDENT Or pi3_v3d_ident0 <> $FFFFFFFF : ProcedureReturn 9 : EndIf
+
+  ; Pure decoders reject malformed status values and null output.
+  If Pi3V3dDomainStateValid(2) <> 0 : ProcedureReturn 10 : EndIf
+  If Pi3V3dDecodeIdentity(0, 0, 0, 0) <> #PI3_V3D_ERR_ARGS : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  gstr_compatible: Data.a 99,111,109,112,97,116,105,98,108,101
+  gstr_reg: Data.a 114,101,103
+  gstr_power_domains: Data.a 112,111,119,101,114,45,100,111,109,97,105,110,115
+  gstr_phandle: Data.a 112,104,97,110,100,108,101
+  gstr_power_cells: Data.a 35,112,111,119,101,114,45,100,111,109,97,105,110,45,99,101,108,108,115
+  gstr_addr_cells: Data.a 35,97,100,100,114,101,115,115,45,99,101,108,108,115
+  gstr_size_cells: Data.a 35,115,105,122,101,45,99,101,108,108,115
+  gstr_ranges: Data.a 114,97,110,103,101,115
+  gnode_soc: Data.a 115,111,99
+  gnode_v3d: Data.a 118,51,100,64,55,101,99,48,48,48,48,48
+  gnode_power: Data.a 112,111,119,101,114
+  gcompat_v3d: Data.a 98,114,99,109,44,98,99,109,50,56,51,53,45,118,51,100
+  gcompat_power: Data.a 114,97,115,112,98,101,114,114,121,112,105,44,98,99,109,50,56,51,53,45,112,111,119,101,114
+EndDataSection

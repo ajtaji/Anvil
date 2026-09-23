@@ -1,0 +1,169 @@
+; pi4HubWatch.pi4 - DOES A HUB PORT FILL IN LATER THAN WE LOOK?
+;
+; pi4HidKeys reported all four downstream ports of the VL805's internal
+; hub as status $0000 change $0000 while a wireless HID dongle was
+; physically plugged in. Two explanations fit that evidence equally
+; well, and they want opposite fixes:
+;
+;   1. Nothing is on the hub - the dongle is in another machine.
+;   2. WE LOOKED TOO EARLY. XhciHubInit powers the ports and waits
+;      max(100, bPwrOn2PwrGood*2) ms, which is the POWER-GOOD delay and
+;      nothing else. USB 2.0 section 7.1.7.3 wants a further 100 ms of
+;      CONNECT DEBOUNCE after a device signals attach, and a wireless
+;      receiver has to bring its radio up before it pulls a data line
+;      at all. One status read at t=100 ms cannot tell an empty port
+;      from a slow one, because BOTH READ $0000.
+;
+; A single sample cannot separate those. A SEQUENCE CAN: an empty port
+; reads $0000 forever, a merely-slow one changes. So this samples every
+; port every 100 ms for three seconds and prints the transitions, then
+; names which explanation the evidence actually supports.
+;
+; It never resets, powers or addresses anything, so it cannot wedge the
+; bus and it cannot disturb what it is measuring.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i, digits.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  PutHexN(v, digits)
+  PrintNl()
+EndProcedure
+
+Procedure Main()
+  Define p.i
+  Define st.i
+  Define tick.i
+  Define changes.i
+  Define everSeen.i
+  Define np.i
+  Dim last.i(8)
+
+  PrintNl()
+  UartWriteStr("=== hub port watch: 3 seconds, 100 ms apart ===")
+  PrintNl()
+
+  If XhciInit() = 0
+    UartWriteStr("XhciInit FAILED: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("XhciInit ... ok")
+  PrintNl()
+
+  ; HidFindAndAttachAll is what walks the root ports, spots the class-09
+  ; device and calls XhciHubAttach. XhciInit alone leaves xh_hubSlot at
+  ; zero, so the hub has to be brought up the same way pi4HidKeys brought
+  ; it up or this would be measuring a different machine state than the
+  ; run that raised the question.
+  HidFindAndAttachAll()
+
+  If XhciHubSlot() = 0
+    UartWriteStr("no internal hub enumerated - nothing to watch.")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+
+  np = XhciHubPorts()
+  UartWriteStr("hub on root port ")
+  PrintDec(XhciHubRootPort())
+  UartWriteStr(", downstream ports ")
+  PrintDec(np)
+  UartWriteStr(", power-good wait was ")
+  PrintDec(XhciHubPgood())
+  UartWriteStr(" ms")
+  PrintNl()
+
+  ; The baseline is printed in full, so "nothing changed" is still
+  ; evidence rather than an absence of output.
+  PrintNl()
+  UartWriteStr("-- t=0 baseline")
+  PrintNl()
+  For p = 1 To np
+    st = XhciHubPortStatus(p)
+    last(p) = st
+    If (st & 1) <> 0
+      everSeen = 1
+    EndIf
+    UartWriteStr("  port ")
+    PrintDec(p)
+    Row("  status", st, 8)
+  Next
+
+  changes = 0
+  For tick = 1 To 30
+    delay(100)
+    For p = 1 To np
+      st = XhciHubPortStatus(p)
+      If st <> last(p)
+        changes = changes + 1
+        UartWriteStr("  t=")
+        PrintDec(tick * 100)
+        UartWriteStr("ms  port ")
+        PrintDec(p)
+        UartWriteStr("   $")
+        PutHexN(last(p), 8)
+        UartWriteStr(" -> $")
+        PutHexN(st, 8)
+        If (st & 1) <> 0
+          UartWriteStr("   CONNECTED")
+          everSeen = 1
+        EndIf
+        PrintNl()
+        last(p) = st
+      EndIf
+    Next
+  Next
+
+  PrintNl()
+  UartWriteStr("-- verdict")
+  PrintNl()
+  UartWriteStr("transitions seen  ")
+  PrintDec(changes)
+  PrintNl()
+
+  If everSeen <> 0
+    UartWriteStr("A PORT REPORTED A DEVICE. If the baseline was $0000 and a")
+    PrintNl()
+    UartWriteStr("later sample was not, XhciHubInit's single read is too")
+    PrintNl()
+    UartWriteStr("early and wants a debounce poll. That is a LIBRARY BUG,")
+    PrintNl()
+    UartWriteStr("not a missing dongle.")
+    PrintNl()
+    ProcedureReturn 10
+  EndIf
+
+  UartWriteStr("NO PORT EVER REPORTED A DEVICE across three seconds.")
+  PrintNl()
+  UartWriteStr("Timing is now ruled out - a slow device would have")
+  PrintNl()
+  UartWriteStr("appeared well inside 3000 ms. The hub really is empty,")
+  PrintNl()
+  UartWriteStr("so the dongle is not in one of THIS board's sockets.")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

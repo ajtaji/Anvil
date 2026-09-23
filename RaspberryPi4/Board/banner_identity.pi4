@@ -1,0 +1,11 @@
+; Main-thread banner buffer. The displayed EL is measured, never inferred
+; from the selected image or firmware configuration. Maximum 70 bytes + NUL.
+Global Dim gBannerPlatformText.a[96]
+
+Procedure.i BannerPlatformText()
+  Define p.i
+  p = AnvilBuildCopy(@gBannerPlatformText, "bare-metal monitor   -   Raspberry Pi 4   -   BCM2711   -   AArch64 at EL")
+  p = AnvilBuildDec(p, MmuEl(), 1)
+  PokeA(p, 0)
+  ProcedureReturn @gBannerPlatformText
+EndProcedure

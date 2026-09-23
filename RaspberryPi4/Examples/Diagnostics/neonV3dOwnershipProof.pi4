@@ -1,0 +1,111 @@
+; neonV3dOwnershipProof.pi4 - bounded ownership handoff proof.
+; The payload deliberately uses the public Neon lifecycle. NeonInit drives
+; V3dInit/V3dOwnershipClaim/V3dOwnershipReset; NeonShutdown drives
+; V3dOwnershipRelease/V3dOwnershipReset. Two complete cycles are attempted.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NVP_MAGIC = $4E565033
+#NVP_VERSION = 1
+#NVP_CYCLES = 2
+#NVP_HEADER_WORDS = 16
+#NVP_RECORD_WORDS = 56
+#NVP_REPORT_WORDS = #NVP_HEADER_WORDS + (#NVP_CYCLES * #NVP_RECORD_WORDS)
+#NVP_SURFACE = $07000000
+#NVP_ARENA = $04000000
+#NVP_ARENA_BYTES = $01000000
+
+; Record words: cycle, stage, NeonInit, FrameBegin, Box, FrameEnd,
+; Shutdown, owner-before, generation-before, owner-after-init,
+; generation-after-init, owner-after-shutdown, generation-after-shutdown,
+; reset CT0CS/CA/EA/QBA/QEA before and after, reset CT1CS/CA/EA/QBA/QEA
+; before and after, reset BFC/INT before and after, targeted-reset,
+; bin BFC before/after, bin CT0CS/CA/EA/INT, MMU_CTL/PT_BASE after shutdown,
+; V3D/Neon error, draw/box counters, and a fixed schema marker.
+Global Dim nvpReport.l[#NVP_REPORT_WORDS]
+
+Procedure nvpWord(index.i, value.i)
+  If index >= 0 And index < #NVP_REPORT_WORDS
+    nvpReport[index] = value & $FFFFFFFF
+  EndIf
+EndProcedure
+
+Procedure nvpResetWords(base.i)
+  nvpWord(base + 13, v3d_resetCt0csBefore) : nvpWord(base + 14, v3d_resetCt0caBefore) : nvpWord(base + 15, v3d_resetCt0eaBefore)
+  nvpWord(base + 16, v3d_resetCt0qbaBefore) : nvpWord(base + 17, v3d_resetCt0qeaBefore)
+  nvpWord(base + 18, v3d_resetCt1csBefore) : nvpWord(base + 19, v3d_resetCt1caBefore) : nvpWord(base + 20, v3d_resetCt1eaBefore)
+  nvpWord(base + 21, v3d_resetCt1qbaBefore) : nvpWord(base + 22, v3d_resetCt1qeaBefore)
+  nvpWord(base + 23, v3d_resetBfcBefore) : nvpWord(base + 24, v3d_resetIntBefore)
+  nvpWord(base + 25, v3d_resetCt0csAfter) : nvpWord(base + 26, v3d_resetCt0caAfter) : nvpWord(base + 27, v3d_resetCt0eaAfter)
+  nvpWord(base + 28, v3d_resetCt0qbaAfter) : nvpWord(base + 29, v3d_resetCt0qeaAfter)
+  nvpWord(base + 30, v3d_resetCt1csAfter) : nvpWord(base + 31, v3d_resetCt1caAfter) : nvpWord(base + 32, v3d_resetCt1eaAfter)
+  nvpWord(base + 33, v3d_resetCt1qbaAfter) : nvpWord(base + 34, v3d_resetCt1qeaAfter)
+  nvpWord(base + 35, v3d_resetBfcAfter) : nvpWord(base + 36, v3d_resetIntAfter)
+  nvpWord(base + 37, v3d_targetedReset)
+EndProcedure
+
+Procedure.i nvpCycle(cycle.i)
+  Protected b.i, rInit.i, rBegin.i, rBox.i, rEnd.i, rStop.i, stage.i
+  b = #NVP_HEADER_WORDS + (cycle * #NVP_RECORD_WORDS)
+  nvpWord(b + 0, cycle) : nvpWord(b + 54, $4359434C) : stage = 1
+  nvpWord(b + 7, v3d_owner) : nvpWord(b + 8, v3d_generation)
+  rInit = NeonInit()
+  nvpWord(b + 2, rInit) : nvpWord(b + 9, v3d_owner) : nvpWord(b + 10, v3d_generation)
+  nvpResetWords(b)
+  If rInit = #NEON_OK
+    stage = 2
+    rBegin = NeonFrameBegin(Neon_RGBA(17, 33, 55, 255))
+    nvpWord(b + 3, rBegin)
+    If rBegin = #NEON_OK
+      stage = 3
+      rBox = Neon_Box(7 + cycle, 9, 23, 17, Neon_RGBA(210, 64, 122, 255))
+      nvpWord(b + 4, rBox)
+      rEnd = NeonFrameEnd()
+      nvpWord(b + 5, rEnd)
+      stage = 4
+    EndIf
+    rStop = NeonShutdown()
+    stage = 5
+  Else
+    rBegin = #NEON_ERR_V3D : rBox = #NEON_ERR_V3D : rEnd = #NEON_ERR_V3D : rStop = #NEON_ERR_V3D
+    nvpWord(b + 3, rBegin) : nvpWord(b + 4, rBox) : nvpWord(b + 5, rEnd)
+  EndIf
+  nvpWord(b + 6, rStop) : nvpWord(b + 1, stage)
+  nvpWord(b + 11, v3d_owner) : nvpWord(b + 12, v3d_generation)
+  nvpWord(b + 38, V3dBinBfcBefore()) : nvpWord(b + 39, V3dBinBfcAfter())
+  nvpWord(b + 40, V3dBinCt0cs()) : nvpWord(b + 41, V3dBinCt0ca()) : nvpWord(b + 42, V3dBinCt0ea()) : nvpWord(b + 43, V3dBinIntSts())
+  nvpWord(b + 44, V3dMmuCtlNow()) : nvpWord(b + 45, V3dMmuPtBase())
+  nvpWord(b + 46, V3dError()) : nvpWord(b + 47, Neon_Error())
+  nvpWord(b + 48, Neon_Draws()) : nvpWord(b + 49, Neon_Boxes())
+  nvpWord(b + 50, V3dBinSpins()) : nvpWord(b + 51, Neon_SurfaceBytes())
+  nvpWord(b + 52, cycle + 1) : nvpWord(b + 53, 64)
+  ProcedureReturn rStop
+EndProcedure
+
+Procedure.i Main()
+  Protected i.i, setup.i
+  For i = 0 To #NVP_REPORT_WORDS - 1 : nvpReport[i] = 0 : Next
+  nvpWord(0, #NVP_MAGIC) : nvpWord(1, #NVP_VERSION) : nvpWord(2, #NVP_CYCLES)
+  nvpWord(3, #NVP_HEADER_WORDS) : nvpWord(4, #NVP_RECORD_WORDS) : nvpWord(5, #NVP_REPORT_WORDS * 4)
+  nvpWord(6, #NVP_SURFACE) : nvpWord(7, 65536) : nvpWord(8, #NVP_ARENA) : nvpWord(9, #NVP_ARENA_BYTES)
+  nvpWord(10, 56) : nvpWord(11, $4359434C) : nvpWord(12, 256) : nvpWord(13, 64)
+  setup = 0
+  If TimerInit() = 0 : setup = -1 : EndIf
+  If setup = 0 And MailboxInit() = 0 : setup = -2 : EndIf
+  If setup = 0 And NeonArena(#NVP_ARENA, #NVP_ARENA_BYTES) <> #NEON_OK : setup = -3 : EndIf
+  If setup = 0 And NeonSurfaceOriented(#NVP_SURFACE, 64, 64, 256, 0) <> #NEON_OK : setup = -4 : EndIf
+  If setup = 0 : NeonSurfaceMapSpan(65536) : EndIf
+  nvpWord(14, setup) : nvpWord(15, $52455450)
+  If setup = 0
+    nvpCycle(0) : nvpCycle(1)
+  EndIf
+  ProcedureReturn @nvpReport[0]
+EndProcedure

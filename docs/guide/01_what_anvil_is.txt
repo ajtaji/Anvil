@@ -1,0 +1,334 @@
+; Chapter 1 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   README.md                   - what Anvil is, the target table, the
+;                                 deliberately-incomplete list.
+;   docs/ARCHITECTURE.md        - the layers, the resident role, runtime
+;                                 memory ownership.
+;   Anvil/Hal/abi.pbi           - the entry contract and the ABI's own
+;                                 statement of what a payload is.
+;   RaspberryPi4/Board/armstub8.asm - what the EL3 stub does and omits.
+;   docs/EL3_BOOT_ACCEPTANCE.md - what EL3 has and has not passed.
+;   RaspberryPi4/Board/memmap.pi4 - the four-plus reserved regions.
+;
+; TRANSCRIPT-SOURCED, AND SAID SO: the banner lines are the recorded
+; board session of 2026-09-05, an EL2 boot. There is no recorded EL3
+; banner anywhere in the repository or the vault; the chapter says which
+; digit changes and does not invent the line.
+;
+; THE ONE THING THIS CHAPTER MUST NOT GET WRONG: what runs at which
+; exception level, and that a payload must never hard-code it. A payload
+; that hard-coded EL2 refused to run the day the monitor moved to EL3,
+; having computed nothing. That story is in chapter 5 and is referenced
+; here.
+@CHAPTER What Anvil is
+@INTRO A monitor that stays resident while your program runs, owns the machine's physical services, and lends them back through a versioned table.
+
+@SECTION The one-sentence version
+
+Anvil is a bare-metal mini-kernel, bootloader and recovery monitor. It
+boots a board with no operating system underneath it, gives you a
+prompt, and can load and run your program while remaining in memory the
+whole time.
+
+It is MIT licensed, and the source is the whole of it - no vendor
+toolchain, no runtime library, no second hardware stack hiding
+underneath.
+
+@SECTION What "resident" means, and why it is the whole design
+
+The usual arrangement for a bare-metal program is that it owns
+everything. It brings up its own clocks, its own serial port, its own
+storage, its own network. Two such programs on one board have two copies
+of every driver, and neither can help you when the other one hangs.
+
+Anvil is the other arrangement. It **stays in memory while your program
+runs.** It owns storage, interrupt control, clocks, console paths,
+network links, display, DMA and watchdogs, and it exposes them through a
+versioned table of function pointers instead of making every program
+bring a second copy of the hardware.
+
+Your program - a **payload** - can therefore be pure computation, or
+computation plus a few service calls, and it does not have to know how
+any of the peripherals work.
+
+@NOTE The practical consequence is the one you will feel first. When
+your payload finishes, there is still a monitor there to tell you what
+happened, take a screenshot of the frame you left behind, and let you
+type the next command. When it hangs, there is still a watchdog to reset
+the board and a prompt waiting afterwards. You do not have to power
+cycle to iterate.
+
+@SECTION The three things Anvil is, at once
+
+**A monitor.** It gives you a prompt on a serial line and over the
+network: read and write memory, hash a region, list and load files, look
+at the memory map, drive GPIO and I2C, take a picture of the screen.
+Chapter 4 is the command set.
+
+**A bootloader.** It can load a program from the boot medium or from
+memory, verify it against its own digest, place it where it was built to
+run, and enter it - automatically at power-up if you ask it to, with a
+loop guard so a payload that keeps hanging cannot take the prompt away
+from you.
+
+**A mini-kernel.** It publishes services to a running payload through a
+table, and it takes the machine back afterwards - restoring the devices
+the payload did not claim, including rebuilding a network controller
+without losing its addresses or its unexpired lease.
+
+@SECTION The shape of the source
+
+One portable core, one hardware composition per target:
+
+@FRAG
+Anvil/Core/*.pbi        the portable monitor: command loop, parsing,
+                        settings, transfer and boot logic, hashes,
+                        network orchestration
+Anvil/Hal/*.pbi         the hardware contract and the versioned ABIs
+Anvil/Kernel/*.pbi      AArch64 architecture, not any chip: the
+                        exception vectors and the scheduler's contexts
+Anvil/Storage/*.pbi     FAT32, exFAT, the one path layer over them,
+                        the file seam any block-device board answers
+                        with, and the A/B boot-control record
+Anvil/Graphics/Vulkan/  an experimental Vulkan-compatible foundation
+RaspberryPi4/Board/     the BCM2711 memory map, boot order, console,
+                        storage, display, board policy
+RaspberryPi4/Lib/       the BCM2711 drivers
+ArduinoQ/, RaspberryPi3/, RockPi4C/    the other targets, the same way
+@ENDFRAG
+
+The core calls portable names. A board owns the choice of hardware and
+the implementation behind those names. Shared code uses `.pbi`, which
+carries no target identity; Pi 4 hardware code uses `.pi4`, and the
+other boards their own extensions.
+
+A LIBRARY EXISTS ONCE. Boards differ in the interface under it, not in
+a second copy of it. If a file has no chip in it, it belongs in a shared
+folder with a `.pbi` name, and every board includes the same one.
+
+Every one of those interfaces is declared in `Anvil/Hal/hal.pbi`,
+including the two that were real and undeclared until 2026-09-18: the
+console bytes a board prints and reads through, and the monotonic clock
+it counts in. A board that wants a prompt implements the first; a board
+that wants a timestamp implements the second; neither invents a name.
+
+@NOTE The extension is not a label, it is enforced. Including a `.pi4`
+file from a `-t pi3` build is refused by the compiler, by name, at the
+first cross-chip include: "If it is really for the BCM2837 (Raspberry Pi
+3 Model B): include that chip's own libraries instead." That refusal is
+right - it stops a board collapsing into dozens of undeclared-register
+errors inside a library nobody meant to include. It also means a file
+that is perfectly portable is UNREACHABLE from another board while it
+carries a board's extension. Architecture-neutral code therefore has to
+be moved and renamed to be shared at all; leaving it where it is
+guarantees the second board writes its own.
+
+@NOTE Target-specific names deliberately do not leak into the portable
+contract. That is not tidiness - it is what makes a new board a matter
+of writing one composition rather than forking a monitor.
+
+@SECTION Which boards, and how far each one has got
+
+@FRAG
+Raspberry Pi 4 / BCM2711 / Cortex-A72
+    the most mature target, and what this book is about. Booting with
+    caches enabled, HDMI and native DSI output, DMA-backed console
+    rendering, wired and Wi-Fi console access.
+
+Arduino UNO Q / QCM2290 / Cortex-A53
+    early. A UEFI application. Console, file access and GPIO exercised
+    on hardware; most native drivers, networking and display work
+    outstanding.
+
+Raspberry Pi 3 / BCM2837 / Cortex-A53
+    early. Direct firmware cold entry through a Pi 3 EL3 stub into the
+    complete kernel8.img monitor. USB host and USB Ethernet not brought up.
+
+ROCK Pi 4C / RK3399
+    early. MiniDP proven on hardware at 1024x768; the preferred 1080p
+    mode is not working. A UART recovery console is proven. No network
+    command service.
+@ENDFRAG
+
+@TRAP Read that table as a statement about **today**, and check the
+README before you plan around any row of it. This project's own habit is
+to write down the boundary rather than the achievement, and a status
+line in a book goes stale faster than one in a repository.
+
+@SECTION What runs where
+
+AArch64 processors have privilege levels numbered EL0 to EL3, with EL3
+the most privileged. What matters to you is a short list.
+
+**The firmware runs first**, before anything in this repository. It
+reads `config.txt`, sets up clocks and power domains, and loads
+`kernel8.img` to the address it was told to.
+
+**Without the firmware stub**, the firmware can drop the image to **EL2**.
+Anvil refuses that entry level; this is not a supported boot arrangement.
+
+**With the Pi 4 firmware stub installed**, its AArch64 `armstub8.bin`
+runs first at EL3, sets up the Pi 4 machine state and enters that monitor
+at EL3. The Pi 3 uses a separate stub: it starts at EL3, configures the
+BCM2837 timer and SMP state, parks the other cores, and branches to its
+complete `kernel8.img` while remaining at EL3. It passes the firmware DTB in
+x0. Both supported Pi boot paths keep Anvil at EL3.
+
+**A payload is entered at the same level Anvil is running at.** Anvil
+does not change the level to enter you and you must not change it either.
+
+@TRAP **Never hard-code the exception level in a payload.** Anvil requires
+EL3 on every supported monitor. A payload should still use the service table
+for hardware services instead of taking ownership of board registers.
+
+@NOTE The Pi 4 stub remains a separate boot artifact; the Pi 3 `pi3`
+target builds its own stub together with the direct monitor. Boot
+configuration and replacement procedures are board-specific; see
+chapters 3 and 12 before changing either one.
+
+@SECTION What a payload is
+
+A compiled image with two properties: it was built to **return**, and -
+if it wants services - it declared that it wants the service table.
+
+Anvil places it at the address it was linked for, verifies its SHA-256
+**at that address**, zeroes its BSS, switches to its stack, masks
+interrupts, and branches into it with the service table's address in
+`x0`. When it returns, Anvil prints all sixteen hex digits of `x0`.
+
+@FRAG
+Starting the payload at 00500000. Control leaves the monitor now, and
+anything printed below this line came from the payload, not from Anvil.
+@ENDFRAG
+
+@FRAG
+The payload returned to the monitor. Its x0 register held 000000000000000A,
+which is whatever it chose to return. A stock image never returns at
+all, so seeing this line means the payload was built to come back.
+@ENDFRAG
+
+The contract that goes with it is short. The payload may use its
+declared image, BSS and stack, the processor state it was handed, and
+devices it explicitly claims. It must preserve Anvil's image and BSS and
+must not reconfigure unrelated devices. Chapter 5 is that contract in
+full.
+
+@NOTE The service table is **call-and-return only**. Anvil never calls
+back into a payload: no callbacks, no handlers, no "register a function
+and I will call it". Where a service looks like it wants a callback it
+provides a **queue** instead - which is why touch and vehicle input are
+polls. The reason is that Anvil's drivers keep their state in globals
+with one writer and no lock, and a callback would re-enter them on top
+of a call already in progress.
+
+@SECTION What a module is
+
+A payload borrows the machine. A **module** extends the monitor.
+
+A module is a driver in a file - a `.MOD` container on the boot medium,
+verified against its own digest, placed in a reserved area, relocated,
+matched to a device the board declares, and asked to publish the service
+it implements. The point is that a board which does not have a
+particular piece of hardware should not be carrying its driver.
+
+@TRAP The published state of that work is **placement infrastructure
+only**: the container format and the relocator exist and have executable
+tests, and neither board activates the engine. Chapter 9 says exactly
+what exists and what does not, because this is the one part of Anvil
+where it would be easy to read a feature list and plan around something
+that is not there yet.
+
+@SECTION The memory map is measured, not declared
+
+Anvil reads its own image-extent symbols at run time. Its code
+reservation is the live image rounded up to a megabyte, and the first
+payload window begins at the next boundary above that.
+
+So **the addresses move when the monitor does.** The low payload window
+started at `00400000` on one build and `00500000` on the next, for no
+reason except that the image grew.
+
+@FRAG
+pmf> map
+THE MEMORY MAP, AS THIS IMAGE MEASURES IT
+  this image      00200000 to 004B144B   2823244 bytes, measured from the image itself
+  ...
+  stage a file at 00500000               which is what the upload tools ask for
+
+Where a payload may go:
+  the low window   00500000 to 07EFFFFF   (about 122 MB)
+  the high window  40000000 to FBFFFFFF   (about 3 GB)
+  Nothing in this map is a constant this program was told.
+@ENDFRAG
+
+@TRAP Every host tool asks the board for that address instead of
+carrying one. Four tools used to carry `0x400000` as a constant of their
+own - four copies of one number on the far side of a cable, none of
+which could find out it had changed. **Do not copy an address out of a
+note, an example, or this book.** Type `map`.
+
+The monitor also refuses writes into the regions it owns - its code, its
+variables, the autoboot record, the framebuffer, the secondary-core
+stacks, the module arena, the boot phase record, the screenshot area -
+so `write`, `fill` and `copy` cannot reach them by accident.
+
+@SECTION The first boot
+
+What you will see. These lines are from a recorded board session of
+2026-09-05, which was an EL2 boot:
+
+@FRAG
+PureMetal Forge - Anvil, the Raspberry Pi 4 monitor. Version 2.0,
+64-bit AArch64, running with no operating system underneath it.
+The serial port is the PL011 at FE201000, set up from cold to 115200 baud,
+eight data bits, no parity, one stop bit.
+The processor is a Cortex-A72 in AArch64 at exception level 2.
+This monitor occupies 00200000 onwards, with its stack growing down
+from 00100000 and its variables at 0D000000.
+A payload may be loaded into either of these:
+  the low window   00400000 to 07EFFFFF   (about 123 MB)
+  the high window  40000000 to FBFFFFFF   (about 3 GB)
+The tick counter every timeout here is measured on runs at 54000000 Hz.
+Type info to see what board this is, or help for the list of commands.
+@ENDFRAG
+
+@NOTE The exception level in that line is read from the processor, not
+printed as prose. This transcript is a historical EL2 session. Hardware
+records later confirm EL3 startup through the required firmware stub; verify
+the live board level with `info`.
+
+@SECTION What this book covers, and in what order
+
+@FRAG
+2   building it
+3   putting it on a Raspberry Pi 4
+4   the console
+5   writing a payload
+6   running payloads from a host machine
+7   using all four cores
+8   replacing the monitor in place
+9   driver modules
+10  how things are proven here
+11  a map of the engineering notes
+@ENDFRAG
+
+If you have a board in front of you and want a prompt today, read
+chapters 2 and 3 and stop. If you have a prompt already and want to run
+your own code, read 5 and 6.
+
+@SECTION One last thing, about how this project talks
+
+You will notice that the monitor's messages are long. A refusal is a
+complete sentence, it keeps the numeric code, it says what the state now
+is, and it names the first thing to check.
+
+That is deliberate and it is the project's whole philosophy in one line:
+**a loud error beats a silent wrong answer, always.** A program that
+refuses is fixable. One that quietly does the wrong thing costs somebody
+a week.
+
+You will also notice that the documentation says what has **not** been
+proven, in the same breath as what has. Chapter 11 is a map of seventy
+notes that mostly exist to mark a boundary. Trust that habit; it is the
+most useful thing in the repository.

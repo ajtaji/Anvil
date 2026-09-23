@@ -1,0 +1,66 @@
+; Emitted transaction gate. The checker replaces the production marker with the
+; exact resident adapter procedure, then runs refusal and rotation mutations.
+
+#VK_SUCCESS = 0
+#NEON_VK_CHROME_ERR_ARGS = -21201
+#NEON_VK_CHROME_ERR_STATE = -21202
+#NVC_MAX_GENERATION = $7FFFFFFFFFFFFFFF
+#NEON_VK_CHROME_VERTEX_BYTES = 24
+#NEON_VK_CHROME_F_ONE = $3F800000
+
+Global nvcReady.i, nvcInFrame.i, nvcTargetGeneration.i, nvcNextTargetGeneration.i
+Global nvcFramebuffer.i, nvcLogicalW.i, nvcLogicalH.i, nvcPhysicalW.i, nvcPhysicalH.i
+Global nvcPitch.i, nvcRotation.i, nvcWidth.i, nvcHeight.i, nvcError.i
+Global nvcClipX.i, nvcClipY.i, nvcClipW.i, nvcClipH.i
+Global nvdPending.i, nvdAttached.i
+Global nvcMapped.i
+Global Dim nvgWords.l[7]
+Global nvgXBits.i, nvgYBits.i
+
+Procedure.i nvcFail(code.i)
+  nvcError = code : ProcedureReturn code
+EndProcedure
+Procedure.i nvdPresentPending() : ProcedureReturn nvdPending : EndProcedure
+Procedure.i nvdWsiEnabled() : ProcedureReturn nvdAttached : EndProcedure
+
+Procedure.i nvcClipXBits(x.i) : nvgXBits = (x * 2) - nvcPhysicalW : ProcedureReturn nvgXBits : EndProcedure
+Procedure.i nvcClipYBits(y.i) : nvgYBits = (y * 2) - nvcPhysicalH : ProcedureReturn nvgYBits : EndProcedure
+
+@PRODUCTION_VERTEX@
+@PRODUCTION_SCISSOR@
+
+@PRODUCTION_REBIND@
+
+Procedure.i Main()
+  Define oldFb.i, oldTarget.i, oldLW.i, oldLH.i, oldPW.i, oldPH.i, oldPitch.i, oldRot.i
+  nvcReady = 1 : nvcTargetGeneration = 9 : nvcNextTargetGeneration = 9
+  nvcFramebuffer = $100 : nvcLogicalW = 640 : nvcLogicalH = 480
+  nvcPhysicalW = 640 : nvcPhysicalH = 480 : nvcPitch = 2560 : nvcRotation = 0
+  nvcWidth = 640 : nvcHeight = 480
+  oldFb = nvcFramebuffer : oldTarget = nvcTargetGeneration : oldLW = nvcLogicalW : oldLH = nvcLogicalH
+  oldPW = nvcPhysicalW : oldPH = nvcPhysicalH : oldPitch = nvcPitch : oldRot = nvcRotation
+  nvcInFrame = 1
+  If NeonVkChromeRebind($200, 640, 480, 640, 480, 2560, 0) <> #NEON_VK_CHROME_ERR_STATE : ProcedureReturn 1 : EndIf
+  nvcInFrame = 0 : nvdPending = 1
+  If NeonVkChromeRebind($200, 640, 480, 640, 480, 2560, 0) <> #NEON_VK_CHROME_ERR_STATE : ProcedureReturn 2 : EndIf
+  nvdPending = 0 : nvdAttached = 1
+  If NeonVkChromeRebind($200, 640, 480, 640, 480, 2560, 0) <> #NEON_VK_CHROME_ERR_STATE : ProcedureReturn 3 : EndIf
+  nvdAttached = 0
+  If nvcFramebuffer <> oldFb Or nvcTargetGeneration <> oldTarget Or nvcLogicalW <> oldLW Or nvcLogicalH <> oldLH Or nvcPhysicalW <> oldPW Or nvcPhysicalH <> oldPH Or nvcPitch <> oldPitch Or nvcRotation <> oldRot : ProcedureReturn 4 : EndIf
+  If NeonVkChromeRebind($200, 640, 480, 640, 480, 2559, 0) <> #NEON_VK_CHROME_ERR_ARGS : ProcedureReturn 5 : EndIf
+  If nvcFramebuffer <> oldFb Or nvcTargetGeneration <> oldTarget Or nvcPitch <> oldPitch : ProcedureReturn 6 : EndIf
+  If NeonVkChromeRebind($200, 640, 480, 480, 640, 2560, 90) <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  If nvcFramebuffer <> $200 Or nvcTargetGeneration <> 10 Or nvcLogicalW <> 640 Or nvcLogicalH <> 480 Or nvcPhysicalW <> 480 Or nvcPhysicalH <> 640 Or nvcWidth <> 640 Or nvcHeight <> 480 Or nvcRotation <> 90 : ProcedureReturn 8 : EndIf
+  If NeonVkChromeRebind($300, 640, 480, 640, 640, 2560, 90) <> #NEON_VK_CHROME_ERR_ARGS : ProcedureReturn 9 : EndIf
+  If nvcFramebuffer <> $200 Or nvcTargetGeneration <> 10 Or nvcPhysicalW <> 480 Or nvcPhysicalH <> 640 : ProcedureReturn 10 : EndIf
+  nvcMapped = @nvgWords[0]
+  nvcRotation = 90 : nvcVertex(0, 10, 20, 0, 0) : If nvgWords[0] <> 440 Or nvgWords[1] <> -620 : ProcedureReturn 11 : EndIf
+  NeonVkChromeScissorSet(10, 20, 100, 50) : If nvcClipX <> 410 Or nvcClipY <> 10 Or nvcClipW <> 50 Or nvcClipH <> 100 : ProcedureReturn 12 : EndIf
+  nvcRotation = 0 : nvcPhysicalW = 640 : nvcPhysicalH = 480 : nvcVertex(0, 10, 20, 0, 0) : If nvgWords[0] <> -620 Or nvgWords[1] <> -440 : ProcedureReturn 13 : EndIf
+  NeonVkChromeScissorSet(10, 20, 100, 50) : If nvcClipX <> 10 Or nvcClipY <> 20 Or nvcClipW <> 100 Or nvcClipH <> 50 : ProcedureReturn 14 : EndIf
+  nvcRotation = 180 : nvcPhysicalW = 640 : nvcPhysicalH = 480 : nvcVertex(0, 10, 20, 0, 0) : If nvgWords[0] <> 620 Or nvgWords[1] <> 440 : ProcedureReturn 15 : EndIf
+  NeonVkChromeScissorSet(10, 20, 100, 50) : If nvcClipX <> 530 Or nvcClipY <> 410 Or nvcClipW <> 100 Or nvcClipH <> 50 : ProcedureReturn 16 : EndIf
+  nvcRotation = 270 : nvcPhysicalW = 480 : nvcPhysicalH = 640 : nvcVertex(0, 10, 20, 0, 0) : If nvgWords[0] <> -440 Or nvgWords[1] <> 620 : ProcedureReturn 17 : EndIf
+  NeonVkChromeScissorSet(10, 20, 100, 50) : If nvcClipX <> 20 Or nvcClipY <> 530 Or nvcClipW <> 50 Or nvcClipH <> 100 : ProcedureReturn 18 : EndIf
+  ProcedureReturn 0
+EndProcedure

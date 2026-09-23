@@ -1,0 +1,170 @@
+; The checker inserts the exact production EL3 wake/config/account helpers
+; from Anvil/Core/parse.pbi at the marked location.
+#CAP_NET = 0
+#CAP_TOUCH = 0
+#CAP_PWM = 0
+
+Global gate_el.i = 3
+Global gate_hz.i = 19200000
+Global gate_ticks.i = 0
+Global gate_tickStep.i = 1000
+Global gate_kctl.i = $100
+Global gate_kctlWrites.i = 0
+Global gate_badReadback.i = 0
+Global gate_freezeCounter.i = 0
+Global gate_uartReady.i = 0
+Global gate_inputQueued.i = 0
+Global gate_wfeCount.i = 0
+
+;@@SCHEDULER_GLOBALS@@
+
+Procedure.i MmuEl()
+  ProcedureReturn gate_el
+EndProcedure
+
+Procedure.i TickHz()
+  ProcedureReturn 1000000
+EndProcedure
+
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + gate_tickStep
+  ProcedureReturn gate_ticks
+EndProcedure
+Procedure.i UartReadReady()
+  ProcedureReturn gate_uartReady
+EndProcedure
+Procedure.i InputEventsQueued()
+  ProcedureReturn gate_inputQueued
+EndProcedure
+
+Procedure UartMessageBegin()
+EndProcedure
+Procedure UartMessageEnd()
+EndProcedure
+Procedure MouseTick()
+EndProcedure
+Procedure TouchTick()
+EndProcedure
+Procedure ScreenServiceTick()
+EndProcedure
+Procedure WifiLinkTick()
+EndProcedure
+Procedure NetDhcpTick()
+EndProcedure
+Procedure NtpServiceTick()
+EndProcedure
+Procedure FanTick()
+EndProcedure
+Procedure HwTempSampleTick()
+EndProcedure
+Procedure NetConsoleRearm()
+EndProcedure
+Procedure NetConsolePump()
+EndProcedure
+Procedure NetConsoleLlTick()
+EndProcedure
+Procedure HttpServerPoll()
+EndProcedure
+Procedure TcpTick()
+EndProcedure
+
+;@@SCHEDULER_PROCS@@
+
+Procedure.i Main()
+  Define oldWfe.i
+  gate_el = 3
+  gate_hz = 19200000
+  gate_ticks = 0
+  gate_tickStep = 1000
+  gate_kctl = $100
+  gate_kctlWrites = 0
+  If AnvilSchedulerPrepareWfe() <> 8192 : ProcedureReturn 1 : EndIf
+  If gate_kctl <> $1C4 : ProcedureReturn 2 : EndIf
+  If anvil_promptWfeReady <> 1 Or anvil_promptWfePeriod <> 8192 : ProcedureReturn 3 : EndIf
+
+  anvil_promptWfeReady = 0
+  anvil_promptWfeEnabled = 0
+  anvil_promptProbePassed = 0
+  gate_ticks = 0
+  gate_tickStep = 1000
+  gate_kctl = $100
+  gate_kctlWrites = 0
+  If AnvilSchedulerWakeProbe(32) <> 32 : ProcedureReturn 4 : EndIf
+  If anvil_promptProbeSamples <> 32 Or anvil_promptProbeMinTicks <> 1000 Or anvil_promptProbeMaxTicks <> 1000 : ProcedureReturn 5 : EndIf
+  If anvil_promptProbeTotalTicks <> 32000 Or anvil_promptProbePassed <> 1 Or anvil_promptWfeEnabled <> 1 : ProcedureReturn 6 : EndIf
+
+  anvil_promptWfeReady = 0
+  gate_hz = 54000000
+  gate_kctl = $100
+  If AnvilSchedulerPrepareWfe() <> 16384 : ProcedureReturn 7 : EndIf
+  If gate_kctl <> $1D4 : ProcedureReturn 8 : EndIf
+
+  anvil_promptWfeReady = 0
+  gate_el = 2
+  gate_kctl = $123
+  If AnvilSchedulerPrepareWfe() <> 0 Or gate_kctl <> $123 : ProcedureReturn 9 : EndIf
+  gate_el = 3
+
+  anvil_promptWfeReady = 0
+  gate_hz = 1000
+  gate_kctl = $123
+  If AnvilSchedulerPrepareWfe() <> 0 Or gate_kctl <> $123 : ProcedureReturn 10 : EndIf
+
+  anvil_promptWfeReady = 0
+  gate_hz = 19200000
+  gate_kctl = $100
+  gate_badReadback = 1
+  gate_kctlWrites = 0
+  If AnvilSchedulerPrepareWfe() <> 0 Or gate_kctl <> $100 : ProcedureReturn 11 : EndIf
+  gate_badReadback = 0
+
+  anvil_promptWfeReady = 0
+  gate_kctl = $100
+  gate_freezeCounter = 1
+  If AnvilSchedulerPrepareWfe() <> 0 Or gate_kctl <> $100 : ProcedureReturn 12 : EndIf
+  gate_freezeCounter = 0
+
+  anvil_promptWfeReady = 0
+  gate_kctl = $100
+  gate_ticks = 0
+  gate_tickStep = 3000
+  If AnvilSchedulerWakeProbe(32) <> 0 Or gate_kctl <> $100 : ProcedureReturn 13 : EndIf
+  If anvil_promptWfeEnabled <> 0 Or anvil_promptProbePassed <> 0 : ProcedureReturn 14 : EndIf
+
+  ; The qualified Pi3 production hook performs setup/readback only: it must
+  ; not run a WFE loop during boot, and must refuse any different EL/frequency.
+  gate_el=3 : gate_hz=19200000 : gate_kctl=$100 : gate_kctlWrites=0
+  anvil_promptWfeReady=0 : anvil_promptProbePassed=0 : anvil_promptWfeEnabled=0
+  anvil_promptProbeSamples=0
+  If AnvilSchedulerQualifyPi3Wfe()<>1 : ProcedureReturn 15 : EndIf
+  If anvil_promptWfeReady<>1 Or anvil_promptProbePassed<>1 Or anvil_promptProbeSamples<>0 Or anvil_promptWfePeriod<>8192
+    ProcedureReturn 16
+  EndIf
+  If gate_wfeCount<>66 : ProcedureReturn 17 : EndIf
+
+  gate_el=3 : gate_hz=54000000 : gate_kctl=$123 : gate_kctlWrites=0
+  If AnvilSchedulerQualifyPi3Wfe()<>0 Or anvil_promptWfeEnabled<>0 Or anvil_promptWfeReady<>0 Or gate_kctl<>$123 Or gate_kctlWrites<>0
+    ProcedureReturn 18
+  EndIf
+  gate_el=2 : gate_hz=19200000 : gate_kctl=$123 : gate_kctlWrites=0
+  If AnvilSchedulerQualifyPi3Wfe()<>0 Or anvil_promptWfeEnabled<>0 Or anvil_promptWfeReady<>0 Or gate_kctl<>$123 Or gate_kctlWrites<>0
+    ProcedureReturn 19
+  EndIf
+
+  ; Scheduler sleep is suppressed while either serial RX or accepted editor
+  ; events remain, and permitted only after both are empty.
+  gate_el=3 : gate_hz=19200000 : gate_kctl=$100
+  If AnvilSchedulerQualifyPi3Wfe()<>1 : ProcedureReturn 23 : EndIf
+  gate_el=3 : gate_uartReady=1 : gate_inputQueued=0
+  oldWfe=gate_wfeCount
+  AnvilSchedulerIdleIfSafe()
+  If gate_wfeCount<>oldWfe : ProcedureReturn 20 : EndIf
+  gate_uartReady=0 : gate_inputQueued=1
+  AnvilSchedulerIdleIfSafe()
+  If gate_wfeCount<>oldWfe : ProcedureReturn 21 : EndIf
+  gate_inputQueued=0
+  AnvilSchedulerIdleIfSafe()
+  If gate_wfeCount<>oldWfe+1 : ProcedureReturn 22 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,145 @@
+; Appended to the real-stack scripted-link fixture by http_server_queued_check.
+XIncludeFile "Anvil/Applications/Forum/http_head.pbi"
+XIncludeFile "Anvil/Services/Http/transport_tcp.pbi"
+XIncludeFile "Anvil/Services/Http/server.pbi"
+Global Dim gate_ack.i[2]
+Procedure.i GateAppend(p.i, text.i)
+  Protected n.i
+  n = 0
+  While PeekA(text + n) <> 0
+    PokeA(p + n, PeekA(text + n))
+    n = n + 1
+  Wend
+  PokeA(p + n, 13)
+  PokeA(p + n + 1, 10)
+  ProcedureReturn n + 2
+EndProcedure
+Procedure.i GateHttpPayload(kind.i)
+  Protected p.i
+  Protected n.i
+  Protected sum.i
+  p = gate_rxPtr[kind]
+  n = GateAppend(p + 54, "GET /health HTTP/1.1")
+  n = n + GateAppend(p + 54 + n, "Host: test")
+  n = n + GateAppend(p + 54 + n, "Connection: close")
+  n = n + GateAppend(p + 54 + n, "")
+  GatePut16(p + 16, 40 + n)
+  GatePut16(p + 24, 0)
+  GatePut16(p + 24, GateFold(GateSum(p + 14, 20, 0)))
+  GatePut16(p + 50, 0)
+  sum = GateSum(p + 26, 8, 0) + 6 + 20 + n
+  sum = GateSum(p + 34, 20 + n, sum)
+  GatePut16(p + 50, GateFold(sum))
+  gate_rxLen[kind] = 54 + n
+  ProcedureReturn n
+EndProcedure
+Procedure.i Main()
+  Protected i.i
+  Protected request.i
+  Protected ack.i
+  Protected payload.i
+  Protected child.i
+  Protected found.i
+  Protected before.i
+  If #TCP_SOCKETS <> 16 : ProcedureReturn 1 : EndIf
+  For i = 0 To 5 : gate_mac[6 + i] = $20 + i : Next
+  gate_ready[1] = 1
+  NetInit()
+  NetSetMac(1, @gate_mac[6])
+  NetSetIPv4(1, $C0000201, $FFFFFF00, 0)
+  TcpInit()
+  LinkUseKind(1)
+  If HtStart(8080) <> 1 : ProcedureReturn 2 : EndIf
+  ; Fifteen independent client four-tuples. Earlier TIME-WAITs remain alive.
+  For request = 1 To 15
+    gate_wire_size = 0
+    GateQueueTcp(1, $C0000202, $C0000201, 40000 + request, 8080, 1000, 0, #TCP_SYN)
+    HtService(millis())
+    If gate_txLen < 54 Or (gate_tx[47] & #TCP_SYN) = 0 : ProcedureReturn 10 + request : EndIf
+    ack = GateGet32(@gate_tx[38]) + 1
+    GateQueueTcp(1, $C0000202, $C0000201, 40000 + request, 8080, 1001, ack, #TCP_ACK)
+    HtService(millis())
+    HsPoll(millis())
+    GateQueueTcp(1, $C0000202, $C0000201, 40000 + request, 8080, 1001, ack, #TCP_ACK | #TCP_PSH)
+    payload = GateHttpPayload(1)
+    HtService(millis())
+    HsPoll(millis())
+    HtService(millis())
+    HsPoll(millis())
+    If gate_wire_size < 20 : ProcedureReturn 30 + request : EndIf
+    If FhEqual(@gate_wire[0], 12, "HTTP/1.1 200", 0) = 0 : ProcedureReturn 50 + request : EndIf
+    ; Last emitted frame includes the queued FIN; ACK all bytes then peer FIN.
+    ack = GateGet32(@gate_tx[38]) + 1
+    GateQueueTcp(1, $C0000202, $C0000201, 40000 + request, 8080, 1001 + payload, ack, #TCP_ACK | #TCP_FIN)
+    HtService(millis())
+    found = 0
+    For child = 0 To 15
+      TcpUse(child)
+      If TcpPeerPort() = 40000 + request And TcpState() = #TCP_TIME_WAIT : found = found + 1 : EndIf
+    Next
+    TcpUse(ht_socket)
+    If found <> 1 : ProcedureReturn 70 + request : EndIf
+    If TcpState() <> #TCP_LISTEN : ProcedureReturn 90 + request : EndIf
+    gate_now = gate_now + 1000
+  Next
+  found = 0
+  For child = 0 To 15
+    TcpUse(child)
+    If TcpState() = #TCP_TIME_WAIT : found = found + 1 : EndIf
+  Next
+  If found <> 15 : ProcedureReturn 110 : EndIf
+  TcpUse(ht_socket)
+  GateResetCapture()
+  GateQueueTcp(1, $C0000202, $C0000201, 45000, 8080, 9000, 0, #TCP_SYN)
+  HtService(millis())
+  If TcpState() <> #TCP_LISTEN Or gate_txLen <> 0 : ProcedureReturn 111 : EndIf
+  HtStop()
+  found = 0
+  For child = 0 To 15
+    TcpUse(child)
+    If TcpState() = #TCP_TIME_WAIT : found = found + 1 : EndIf
+  Next
+  If found <> 15 : ProcedureReturn 112 : EndIf
+  ; Independent reset for simultaneous-client proof after TIME-WAIT proof.
+  TcpInit()
+  If HtStart(8080) <> 1 : ProcedureReturn 113 : EndIf
+  TcpUse(ht_socket)
+  before = TcpListenerGeneration()
+  If TcpListen(8080) <> #NET_TCP_E_BUSY : ProcedureReturn 119 : EndIf
+  If TcpListenerGeneration() <> before : ProcedureReturn 120 : EndIf
+  For request = 0 To 1
+    GateQueueTcp(1, $C0000202, $C0000201, 46000 + request, 8080, 1000, 0, #TCP_SYN)
+    HtService(millis())
+    gate_ack[request] = GateGet32(@gate_tx[38]) + 1
+    GateQueueTcp(1, $C0000202, $C0000201, 46000 + request, 8080, 1001, gate_ack[request], #TCP_ACK)
+    HtService(millis())
+    HsPoll(millis())
+  Next
+  If ht_live <> 2 : ProcedureReturn 114 : EndIf
+  For request = 0 To 1
+    gate_wire_size = 0
+    GateQueueTcp(1, $C0000202, $C0000201, 46000 + request, 8080, 1001, gate_ack[request], #TCP_ACK | #TCP_PSH)
+    GateHttpPayload(1)
+    HtService(millis())
+    HsPoll(millis())
+    HtService(millis())
+    HsPoll(millis())
+    If gate_wire_size < 20 : ProcedureReturn 115 + request : EndIf
+    If FhEqual(@gate_wire[0], 12, "HTTP/1.1 200", 0) = 0 : ProcedureReturn 117 + request : EndIf
+  Next
+  HtStop()
+  ; Queued listener abort cancels a half-open child and releases reservation.
+  If HtStart(8080) <> 1 : ProcedureReturn 121 : EndIf
+  GateQueueTcp(1, $C0000202, $C0000201, 47000, 8080, 1000, 0, #TCP_SYN)
+  HtService(millis())
+  TcpUse(ht_socket)
+  If TcpAbort() <> #NET_TCP_OK : ProcedureReturn 122 : EndIf
+  If TcpState() <> #TCP_CLOSED : ProcedureReturn 123 : EndIf
+  For child = 0 To 15
+    TcpUse(child)
+    If TcpState() = #TCP_SYN_RECEIVED : ProcedureReturn 124 : EndIf
+  Next
+  HtService(millis())
+  If ht_owned <> 0 : ProcedureReturn 125 : EndIf
+  ProcedureReturn 0
+EndProcedure

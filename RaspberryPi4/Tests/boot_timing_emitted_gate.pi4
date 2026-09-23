@@ -1,0 +1,183 @@
+; Executed-code gate for the retained boot-timing record.
+;
+; The DSI window constants are substituted from memmap.pi4 by the host check,
+; so the record's address is derived here exactly as it is in the product: if
+; the window ever moves or is resized, this gate follows it rather than
+; agreeing with a stale copy of the numbers.
+;
+; The cache clean and the counter are the only stubs. Everything about the
+; layout, the ordering of the writes, the guard and the refusals is the
+; shipped code.
+
+; @@MEMMAP@@
+
+Global gate_ticks.i
+Global gate_flushes.i
+Global gate_lastFlushLo.i
+Global gate_lastFlushHi.i
+Global gate_prevFlushLo.i
+Global gate_prints.i
+
+Procedure.i Ticks()
+  gate_ticks = gate_ticks + 54000       ; one model millisecond per call
+  ProcedureReturn gate_ticks
+EndProcedure
+
+Procedure CacheCleanRangePoc(lo.i, hi.i)
+  gate_prevFlushLo = gate_lastFlushLo
+  gate_lastFlushLo = lo
+  gate_lastFlushHi = hi
+  gate_flushes = gate_flushes + 1
+EndProcedure
+
+; Print()/PrintN() are resolved by the compiler BY NAME onto a console
+; library's own leaves. Supplying those leaves here rather than pulling in
+; uart.pi4 is what keeps the gate off the hardware: a UART write in the
+; interpreter spins on a status bit nothing ever clears.
+Procedure str_print_at(p.i)
+  gate_prints = gate_prints + 1
+EndProcedure
+
+Procedure UartWriteStr(s.i)
+  gate_prints = gate_prints + 1
+EndProcedure
+
+Procedure PrintDec(v.i)
+  gate_prints = gate_prints + 1
+EndProcedure
+
+Procedure PrintNl()
+  gate_prints = gate_prints + 1
+EndProcedure
+
+Procedure PutHexN(v.i, digits.i)
+  gate_prints = gate_prints + 1
+EndProcedure
+
+; @@BODY@@
+
+Procedure.i Main()
+  Define i.i
+  Define a.i
+  Define n.i
+
+  ; ---- 1. the address is inside the reserved window and clear of both
+  ;         scanout surfaces, computed from memmap.pi4's own constants.
+  If BootTimingClearOfSurfaces() <> 1 : ProcedureReturn 1 : EndIf
+  If #BTM_BASE < #MON_FB_LO Or BootTimingTop() > #MON_FB_HI : ProcedureReturn 2 : EndIf
+
+  ; ---- 2. a record that was never started is not a record. Stale DRAM
+  ;         under the magic must not become a measurement.
+  PokeI(#BTM_BASE + #BTM_OFF_MAGIC, $1122334455667788)
+  PokeI(#BTM_BASE + #BTM_OFF_COUNT, 9)
+  If BootTimingValid() <> 0 Or BootTimingCount() <> 0 : ProcedureReturn 3 : EndIf
+  gate_flushes = 0
+  BootTimingMark(99, 1, 2)
+  If gate_flushes <> 0 Or PeekI(#BTM_BASE + #BTM_OFF_COUNT) <> 9 : ProcedureReturn 4 : EndIf
+
+  ; ---- 3. the header, field by field, at the documented offsets.
+  gate_ticks = 0
+  BootTimingBegin(54000000, 1500000000)
+  If PeekI(#BTM_BASE + #BTM_OFF_MAGIC) <> #BTM_MAGIC : ProcedureReturn 5 : EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_VERSION) <> #BTM_VERSION : ProcedureReturn 6 : EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_HZ) <> 54000000 : ProcedureReturn 7 : EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_SLOTS) <> #BTM_SLOTS : ProcedureReturn 8 : EndIf
+  If PeekI(#BTM_BASE + #BTM_OFF_LOST) <> 0 : ProcedureReturn 9 : EndIf
+  If BootTimingValid() <> 1 : ProcedureReturn 10 : EndIf
+  ; Begin leaves exactly one row - the entry - and it carries the ARM rate.
+  If BootTimingCount() <> 1 : ProcedureReturn 11 : EndIf
+  If BootTimingField(0, #BTM_SLOT_ID) <> #BTM_ENTRY : ProcedureReturn 12 : EndIf
+  If BootTimingField(0, #BTM_SLOT_V1) <> 1500000000 : ProcedureReturn 13 : EndIf
+  If gate_prints <> 0 : ProcedureReturn 14 : EndIf
+
+  ; ---- 4. the row is at a fixed stride and its fields are where the
+  ;         host reader is told they are. Written literally rather than
+  ;         through BootTimingSlotAddr, so a changed stride reddens here.
+  BootTimingMark(#BTM_PRESENTED, 90, 1)
+  a = #BTM_BASE + 64 + 1 * 32
+  If PeekI(a + 0) <> #BTM_PRESENTED : ProcedureReturn 15 : EndIf
+  If PeekI(a + 16) <> 90 Or PeekI(a + 24) <> 1 : ProcedureReturn 16 : EndIf
+  If PeekI(a + 8) <> BootTimingField(1, #BTM_SLOT_TICKS) : ProcedureReturn 17 : EndIf
+  If BootTimingSlotAddr(1) <> a : ProcedureReturn 18 : EndIf
+
+  ; ---- 5. THE ROW REACHES DRAM BEFORE THE COUNT THAT NAMES IT. The two
+  ;         flushes of a mark are the row's 32 bytes and then the header;
+  ;         the other order publishes a count for bytes that are still in
+  ;         a cache, which a host reads as a row of stale DRAM.
+  If gate_prevFlushLo <> a : ProcedureReturn 19 : EndIf
+  If gate_lastFlushLo <> #BTM_BASE Or gate_lastFlushHi <> (#BTM_BASE + #BTM_HEADER - 1) : ProcedureReturn 20 : EndIf
+
+  ; ---- 6. the guard refuses every single-field corruption. A magic on
+  ;         its own is met by any DRAM that happens to hold eight bytes.
+  n = PeekI(#BTM_BASE + #BTM_OFF_COUNT)
+  PokeI(#BTM_BASE + #BTM_OFF_COUNT, n + 1)
+  If BootTimingValid() <> 0 : ProcedureReturn 21 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_COUNT, n)
+  If BootTimingValid() <> 1 : ProcedureReturn 22 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_HZ, 19200000)
+  If BootTimingValid() <> 0 : ProcedureReturn 23 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_HZ, 54000000)
+  PokeI(#BTM_BASE + #BTM_OFF_VERSION, #BTM_VERSION + 1)
+  If BootTimingValid() <> 0 : ProcedureReturn 24 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_VERSION, #BTM_VERSION)
+  PokeI(#BTM_BASE + #BTM_OFF_SLOTS, #BTM_SLOTS * 2)
+  If BootTimingValid() <> 0 : ProcedureReturn 25 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_SLOTS, #BTM_SLOTS)
+  PokeI(#BTM_BASE + #BTM_OFF_MAGIC, 0)
+  If BootTimingValid() <> 0 : ProcedureReturn 26 : EndIf
+  PokeI(#BTM_BASE + #BTM_OFF_MAGIC, #BTM_MAGIC)
+  If BootTimingValid() <> 1 Or BootTimingCount() <> 2 : ProcedureReturn 27 : EndIf
+
+  ; ---- 7. a row outside the count is not readable as data.
+  If BootTimingField(-1, #BTM_SLOT_ID) <> -1 : ProcedureReturn 28 : EndIf
+  If BootTimingField(2, #BTM_SLOT_ID) <> -1 : ProcedureReturn 29 : EndIf
+  If BootTimingMsAt(2) <> -1 : ProcedureReturn 30 : EndIf
+
+  ; ---- 8. milliseconds since the entry row, on the recorded frequency.
+  ;         The model counter advances one millisecond per Ticks() call.
+  If BootTimingMsAt(0) <> 0 : ProcedureReturn 31 : EndIf
+  If BootTimingMsAt(1) <> 1 : ProcedureReturn 32 : EndIf
+
+  ; ---- 9. the first prompt is recorded once and only once.
+  BootTimingPromptOnce()
+  BootTimingPromptOnce()
+  BootTimingPromptOnce()
+  If BootTimingCount() <> 3 : ProcedureReturn 33 : EndIf
+  If BootTimingField(2, #BTM_SLOT_ID) <> #BTM_PROMPT : ProcedureReturn 34 : EndIf
+
+  ; ---- 10. A FULL TABLE COUNTS WHAT IT REFUSED AND KEEPS THE BEGINNING.
+  ;          Wrapping would silently turn a table of a boot's first
+  ;          seconds into a table of its last, under the same header.
+  i = BootTimingCount()
+  While i < #BTM_SLOTS
+    BootTimingMark(#BTM_CONFIG_END, i, 0)
+    i = i + 1
+  Wend
+  If BootTimingCount() <> #BTM_SLOTS Or BootTimingLost() <> 0 : ProcedureReturn 35 : EndIf
+  i = 0
+  While i < 5
+    BootTimingMark(#BTM_NET_END, 777, 0)
+    i = i + 1
+  Wend
+  If BootTimingCount() <> #BTM_SLOTS : ProcedureReturn 36 : EndIf
+  If BootTimingLost() <> 5 : ProcedureReturn 37 : EndIf
+  If BootTimingValid() <> 1 : ProcedureReturn 38 : EndIf
+  ; The earliest rows are untouched and the last admitted row is not 777.
+  If BootTimingField(0, #BTM_SLOT_ID) <> #BTM_ENTRY : ProcedureReturn 39 : EndIf
+  If BootTimingField(1, #BTM_SLOT_ID) <> #BTM_PRESENTED : ProcedureReturn 40 : EndIf
+  If BootTimingField(#BTM_SLOTS - 1, #BTM_SLOT_V1) = 777 : ProcedureReturn 41 : EndIf
+  ; And the table never reached beyond its own last row.
+  If BootTimingTop() <> (#BTM_BASE + #BTM_HEADER + #BTM_SLOTS * #BTM_SLOT_BYTES - 1) : ProcedureReturn 42 : EndIf
+
+  ; ---- 11. a second boot is a fresh epoch: the count, the overflow and
+  ;          the base tick all restart, and no row of the old one is
+  ;          readable through the new header.
+  gate_prints = 0
+  BootTimingBegin(54000000, 600000000)
+  If BootTimingCount() <> 1 Or BootTimingLost() <> 0 : ProcedureReturn 43 : EndIf
+  If BootTimingField(0, #BTM_SLOT_V1) <> 600000000 : ProcedureReturn 44 : EndIf
+  If BootTimingMsAt(0) <> 0 : ProcedureReturn 45 : EndIf
+  If gate_prints <> 0 : ProcedureReturn 46 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

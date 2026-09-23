@@ -1,0 +1,475 @@
+; Emitted gate template for the production cooperative radio initializer.
+; tools/wifi_radio_init_emitted_check.py replaces the three marked blocks with
+; exact constants/globals/procedure bodies extracted from wifi.pi4.
+
+EnableExplicit
+
+#HW_LINK_WIFI = 2
+#CYW43_EVMASK_JOIN = 2
+#CYW43_PM_OFF = 0
+#WPA2_PASS_MAX = 63
+
+; @@PRODUCTION_CONSTANTS@@
+
+Global gate_ms.i
+Global gate_slots.i
+Global gate_calls.i
+Global gate_lastOp.i
+Global gate_failOp.i
+Global gate_cancelOp.i
+Global gate_restoreActive.i
+Global gate_restorePending.i
+Global gate_restoreRc.i
+Global gate_down.i
+Global gate_dhcpStarts.i
+Global gate_recCancels.i
+Global gate_wipes.i
+Global gate_serviceTurns.i
+Global gate_blockModeRc.i
+Global gate_settingsWrites.i
+Global gate_clockHz.i
+Global gate_rxCallback.i : Global gate_rxActive.i : Global gate_rxPending.i
+Global gate_rxEnableRc.i = 1 : Global gate_rxDisableRc.i = 1
+Global Dim gate_phaseForOp.i[24]
+
+; The association globals touched by the shared cancellation seam are present
+; in the product but are not owned by the new radio initializer.
+Global gWifiUp.i
+Global gWifiLinkOn.i
+Global gWifiHealOn.i
+Global gWifiHealPend.i
+Global gWifiKeyed.i
+Global gWifiSettingsRevisionSeen.i
+Global gWifiHaveIp.i
+Global gWifiSecDone.i
+Global gWifiBadReads.i
+Global gWifiTeardown.i
+Global gWifiVerify.i
+Global gWifiKaProbes.i
+Global gWifiKaLast.i
+Global Dim wifi_pmk.a[32]
+Global Dim wifi_snonce.a[32]
+Global gWifiHealLast.i
+
+; @@PRODUCTION_GLOBALS@@
+
+Procedure.i millis()
+  ProcedureReturn gate_ms
+EndProcedure
+
+Procedure str_print_at(p.i) : EndProcedure
+Procedure PrintNl() : EndProcedure
+Procedure PrintDec(v.i) : EndProcedure
+Procedure UartWriteStr(p.i) : EndProcedure
+Procedure wifi_Progress() : EndProcedure
+Procedure.i SdioErrorText() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ErrorText() : ProcedureReturn 0 : EndProcedure
+
+Procedure NetDhcpLinkDown(kind.i) : gate_down = gate_down + 1 : EndProcedure
+Procedure.i NetDhcpStart(kind.i, restart.i) : gate_dhcpStarts = gate_dhcpStarts + 1 : ProcedureReturn 1 : EndProcedure
+Procedure Pbkdf2StepWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
+Procedure Wpa2SupWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
+Procedure Cyw43KeyWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
+Procedure AesWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
+Procedure KwWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
+Procedure SettingsRemove(key.i) : gate_settingsWrites = gate_settingsWrites + 1 : EndProcedure
+
+Procedure.i SettingsWifiSlotCount()
+  ProcedureReturn gate_slots
+EndProcedure
+Procedure.i SettingsWifiRevision() : ProcedureReturn 0 : EndProcedure
+
+Procedure.i SdioLastError() : ProcedureReturn 701 : EndProcedure
+Procedure.i Cyw43LastError() : ProcedureReturn 702 : EndProcedure
+
+Procedure.i GateOp(op.i, good.i)
+  gate_calls = gate_calls + 1
+  gate_lastOp = op
+  If gate_cancelOp = op
+    WifiRadioInitCancel()
+  EndIf
+  If gate_failOp = op
+    If good = 0
+      ProcedureReturn -31
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn good
+EndProcedure
+
+Procedure.i Cyw43RxIrqActive() : ProcedureReturn gate_restoreActive : EndProcedure
+Procedure.i Cyw43RxIrqRestorePending() : ProcedureReturn gate_restorePending : EndProcedure
+Procedure.i Cyw43RxIrqTelemetry(on.i)
+  gate_calls = gate_calls + 1 : gate_lastOp = 23
+  If gate_cancelOp = 23 : WifiRadioInitCancel() : EndIf
+  If on<>0 And gate_restoreRc=0 : gate_restorePending=1 : EndIf
+  ProcedureReturn gate_restoreRc
+EndProcedure
+Procedure.i SdioRxIrqOp(op.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i Cyw43SetRxIrqIo(op.i)
+  If gate_rxActive<>0 Or gate_rxPending<>0 : ProcedureReturn 0 : EndIf
+  gate_rxCallback=op : ProcedureReturn 1
+EndProcedure
+Procedure.i Cyw43RxIrqRawReady() : ProcedureReturn 11 : EndProcedure
+Procedure.i Cyw43RxIrqFrameIndications() : ProcedureReturn 12 : EndProcedure
+Procedure.i Cyw43RxEmpty() : ProcedureReturn 13 : EndProcedure
+Procedure.i Cyw43RxFirstReads() : ProcedureReturn 14 : EndProcedure
+Procedure.i SdioCmd53Calls() : ProcedureReturn 15 : EndProcedure
+Procedure.i Cyw43RxIrqFirstPending() : ProcedureReturn 16 : EndProcedure
+Procedure.i Cyw43RxIrqFirstNoPending() : ProcedureReturn 17 : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyPending() : ProcedureReturn 18 : EndProcedure
+Procedure.i Cyw43RxIrqNonemptyNoPending() : ProcedureReturn 19 : EndProcedure
+Procedure.i Cyw43RxIrqEmptyPending() : ProcedureReturn 20 : EndProcedure
+Procedure.i Cyw43RxIrqEmptyNoPending() : ProcedureReturn 21 : EndProcedure
+Procedure.i Cyw43RxIrqFirstInherited() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqFirstNew() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietData() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietControl() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietEvent() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietGlom() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietUnknown() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietMalformed() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPrevNext() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqOk() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietSeqGap() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostPending() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostQuiet() : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43RxIrqQuietPostFail() : ProcedureReturn 0 : EndProcedure
+
+Procedure.i WifiLoadBlobs() : ProcedureReturn GateOp(1, 1) : EndProcedure
+Procedure.i MailboxInit() : ProcedureReturn GateOp(2, 1) : EndProcedure
+Procedure.i WifiClockHz()
+  If GateOp(3, 1) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 54000000
+EndProcedure
+Procedure.i MailboxClockRate(id.i)
+  If GateOp(3, 1) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn gate_clockHz
+EndProcedure
+Procedure SdioSetBaseClockKhz(khz.i) : GateOp(4, 1) : EndProcedure
+Procedure.i SdioAssertWlOn() : ProcedureReturn GateOp(5, 1) : EndProcedure
+Procedure.i SdioInit() : ProcedureReturn GateOp(6, 1) : EndProcedure
+Procedure.i SdioEnableFunction(fn.i)
+  If fn = 1 : ProcedureReturn GateOp(7, 1) : EndIf
+  ProcedureReturn GateOp(19, 1)
+EndProcedure
+Procedure.i SdioCmd52Read(fn.i, addr.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i SdioCmd52Write(fn.i, addr.i, val.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i SdioCmd53Read(fn.i, addr.i, p.i, n.i, incr.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i SdioCmd53Write(fn.i, addr.i, p.i, n.i, incr.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i SdioCmd53ReadBlocks(fn.i, addr.i, p.i, n.i, blocks.i, incr.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i SdioCmd53WriteBlocks(fn.i, addr.i, p.i, n.i, blocks.i, incr.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i Cyw43SetIo(a.i, b.i, c.i, d.i) : ProcedureReturn GateOp(8, 1) : EndProcedure
+Procedure.i Cyw43SetBlockIo(a.i, b.i) : ProcedureReturn GateOp(9, 1) : EndProcedure
+Procedure.i Cyw43Attach() : ProcedureReturn GateOp(10, 1) : EndProcedure
+Procedure.i Cyw43SetBlockMode(on.i)
+  gate_calls = gate_calls + 1 : gate_lastOp = 11
+  If gate_cancelOp = 11 : WifiRadioInitCancel() : EndIf
+  ProcedureReturn gate_blockModeRc
+EndProcedure
+Procedure.i Cyw43PrepareDownload() : ProcedureReturn GateOp(12, 1) : EndProcedure
+Procedure Cyw43SetVerify(mode.i) : GateOp(13, 1) : EndProcedure
+Procedure.i Cyw43UploadFirmware(a.i, n.i, s.i, sn.i) : ProcedureReturn GateOp(14, 1) : EndProcedure
+Procedure.i Cyw43UploadNvram(a.i, n.i, w.i, wn.i, s.i, sn.i) : ProcedureReturn GateOp(15, 1) : EndProcedure
+Procedure.i Cyw43Start() : ProcedureReturn GateOp(16, 1) : EndProcedure
+Procedure.i Cyw43HtClock() : ProcedureReturn GateOp(17, 1) : EndProcedure
+Procedure.i Cyw43AnnounceHost() : ProcedureReturn GateOp(18, 1) : EndProcedure
+Procedure.i Cyw43WifiUp(a.i, n.i, mask.i, ms.i) : ProcedureReturn GateOp(20, 0) : EndProcedure
+Procedure.i Cyw43SetRoamOff(on.i, ms.i) : ProcedureReturn GateOp(21, 0) : EndProcedure
+Procedure.i Cyw43SetPowerMode(mode.i, ms.i) : ProcedureReturn GateOp(22, 0) : EndProcedure
+
+; @@PRODUCTION_PROCEDURES@@
+
+; The real board's outer prompt loop owns wired/display/watchdog service. This
+; wrapper proves each radio phase returns to that owner before another phase is
+; entered; the radio primitive itself has no callback into the outer service.
+Procedure GateOuterTick()
+  WifiRadioInitTick()
+  gate_serviceTurns = gate_serviceTurns + 1
+EndProcedure
+
+Procedure GateReset()
+  gate_ms = 1000 : gate_slots = 1 : gate_calls = 0 : gate_lastOp = 0
+  gate_failOp = 0 : gate_cancelOp = 0
+  gate_restoreActive = 0 : gate_restorePending = 0 : gate_restoreRc = 1
+  gate_rxCallback=0 : gate_rxActive=0 : gate_rxPending=0
+  gate_down = 0 : gate_dhcpStarts = 0 : gate_recCancels = 0 : gate_wipes = 0
+  gate_settingsWrites = 0
+  gate_serviceTurns = 0 : gate_blockModeRc = 1 : gate_clockHz = 54000000
+  gWifiUp = 0 : gWifiLinkOn = 1 : gWifiHealOn = 1 : gWifiHealPend = 0
+  gWifiKeyed = 1 : gWifiHaveIp = 1 : gWifiSecDone = 1
+  gWifiRecPhase = #WIFI_REC_IDLE : gWifiRecGeneration = 0 : gWifiRecStepGeneration = 0
+  gWifiEapolRecover = 0 : gWifiEapolRecoverStage = #WIFI_EAPOL_FAIL_NONE : gWifiEapolRecoverRc = 0
+  gWifiRinitPhase = #WIFI_RINIT_IDLE : gWifiRinitGeneration = 10
+  gWifiRinitStepGeneration = 0 : gWifiRinitAt = 0 : gWifiRinitAttempts = 0
+  gWifiRinitClockHz = 0 : gWifiRinitAnnounce = 0
+  gWifiRinitClockTry = 0 : gWifiRinitClockAt = 0
+  gWifiRinitLastFailPhase = #WIFI_RINIT_IDLE : gWifiRinitLastFailRc = 0
+  gWifiRinitLastSdio = 0 : gWifiRinitLastCyw = 0
+  gWifiRinitRoamRc = 0 : gWifiRinitPowerRc = 0 : gWifiRinitFwCalls = 0
+  wifi_pmk[0] = 55 : wifi_snonce[0] = 66
+
+  gate_phaseForOp[1] = #WIFI_RINIT_BLOBS
+  gate_phaseForOp[2] = #WIFI_RINIT_MBX_INIT
+  gate_phaseForOp[3] = #WIFI_RINIT_CLOCK_TRY
+  gate_phaseForOp[4] = #WIFI_RINIT_CLOCK_SET
+  gate_phaseForOp[5] = #WIFI_RINIT_WLON
+  gate_phaseForOp[6] = #WIFI_RINIT_SDIO
+  gate_phaseForOp[7] = #WIFI_RINIT_F1
+  gate_phaseForOp[8] = #WIFI_RINIT_IO
+  gate_phaseForOp[9] = #WIFI_RINIT_BLOCK_IO
+  gate_phaseForOp[10] = #WIFI_RINIT_ATTACH
+  gate_phaseForOp[11] = #WIFI_RINIT_BLOCK_MODE
+  gate_phaseForOp[12] = #WIFI_RINIT_PREPARE
+  gate_phaseForOp[13] = #WIFI_RINIT_VERIFY_MODE
+  gate_phaseForOp[14] = #WIFI_RINIT_FW
+  gate_phaseForOp[15] = #WIFI_RINIT_NVRAM
+  gate_phaseForOp[16] = #WIFI_RINIT_START
+  gate_phaseForOp[17] = #WIFI_RINIT_HT
+  gate_phaseForOp[18] = #WIFI_RINIT_ANNOUNCE
+  gate_phaseForOp[19] = #WIFI_RINIT_F2
+  gate_phaseForOp[20] = #WIFI_RINIT_TRANSPORT
+  gate_phaseForOp[21] = #WIFI_RINIT_ROAM
+  gate_phaseForOp[22] = #WIFI_RINIT_POWER
+  gate_phaseForOp[23] = #WIFI_RINIT_RESTORE
+EndProcedure
+
+Procedure GateOwnPhase(phase.i)
+  gWifiRinitGeneration = 100
+  gWifiRinitStepGeneration = 100
+  gWifiRinitPhase = phase
+  gWifiUp = 0
+EndProcedure
+
+Procedure.i Main()
+  Define before.i
+  Define expected.i
+  Define op.i
+  Define gen.i
+
+  ; The synchronous compatibility owner shares the exact readiness boundary.
+  ; Active and restore-pending refusals return before blobs or destructive bus
+  ; work. Verified restoration then permits the existing complete owner.
+  GateReset() : gate_restoreActive = 1 : gate_restoreRc = 0
+  If WifiRadioUp() <> 0 : ProcedureReturn 32 : EndIf
+  If gate_calls <> 1 Or gate_lastOp <> 23 Or gWifiUp <> 0 : ProcedureReturn 32 : EndIf
+  GateReset() : gate_restorePending = 1 : gate_restoreRc = 0
+  If WifiRadioUp() <> 0 : ProcedureReturn 33 : EndIf
+  If gate_calls <> 1 Or gate_lastOp <> 23 Or gWifiUp <> 0 : ProcedureReturn 33 : EndIf
+  GateReset() : gate_restoreActive = 1 : gate_restoreRc = 1 : gate_blockModeRc = 0
+  If WifiRadioUp() = 0 : ProcedureReturn 34 : EndIf
+  If gate_calls <> 23 Or gWifiUp <> 1 : ProcedureReturn 34 : EndIf
+
+  ; Eligible initial failure arms radio retry, not association retry.
+  GateReset()
+  WifiRecoveryInitialJoinFailed()
+  If WifiRadioInitActive() = 0 Or gWifiRinitPhase <> #WIFI_RINIT_BACKOFF : ProcedureReturn 1 : EndIf
+  If gWifiRecPhase <> #WIFI_REC_IDLE Or gate_down <> 1 Or gWifiRecGeneration <> 1 : ProcedureReturn 2 : EndIf
+  If gWifiRinitGeneration <> 12 Or gWifiRinitStepGeneration <> 12 : ProcedureReturn 2 : EndIf
+  If gate_slots <> 1 Or gate_settingsWrites <> 0 Or wifi_pmk[0] <> 0 Or wifi_snonce[0] <> 0 : ProcedureReturn 3 : EndIf
+  If gWifiKeyed <> 0 Or gWifiHaveIp <> 0 Or gWifiSecDone <> 0 : ProcedureReturn 3 : EndIf
+
+  ; A wrapped deadline is inert one tick early and starts one generation at
+  ; exactly the unsigned deadline, with no hardware primitive on either tick.
+  gWifiRinitAt = $FFFFFF00
+  gate_ms = ($FFFFFF00 + #WIFI_HEAL_MS - 1) & $FFFFFFFF
+  GateOuterTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_BACKOFF Or gate_calls <> 0 : ProcedureReturn 4 : EndIf
+  gate_ms = ($FFFFFF00 + #WIFI_HEAL_MS) & $FFFFFFFF
+  GateOuterTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_RESTORE Or gWifiRinitAttempts <> 1 Or gate_calls <> 0 : ProcedureReturn 5 : EndIf
+
+  ; No old readiness owner: RESTORE advances without bus work. Thereafter each
+  ; tick performs exactly one primitive in the production order.
+  GateOuterTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_BLOBS Or gate_calls <> 0 : ProcedureReturn 6 : EndIf
+  For expected = 1 To 22
+    before = gate_calls
+    If expected = 3
+      GateOuterTick()
+      If gate_calls <> before Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 7 : EndIf
+    EndIf
+    GateOuterTick()
+    If gate_calls <> before + 1 Or gate_lastOp <> expected : ProcedureReturn 7 : EndIf
+    If expected = 14 And gWifiRinitFwCalls <> 1 : ProcedureReturn 8 : EndIf
+    If expected = 22 And gWifiUp <> 0 : ProcedureReturn 9 : EndIf
+  Next
+  If gWifiRinitPhase <> #WIFI_RINIT_READY Or gWifiRinitFwCalls <> 1 : ProcedureReturn 10 : EndIf
+  GateOuterTick()
+  If gWifiUp <> 1 Or WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_LEAVE : ProcedureReturn 11 : EndIf
+  If gate_serviceTurns <> 27 : ProcedureReturn 30 : EndIf
+
+  ; Explicit reconcile events choose exactly one owner from current truth.
+  GateReset() : gWifiKeyed = 0 : gWifiHaveIp = 0 : WifiRecoveryReconcile(0)
+  If WifiRadioInitActive() = 0 Or gWifiRecPhase <> #WIFI_REC_IDLE : ProcedureReturn 35 : EndIf
+  GateReset() : gWifiUp = 1 : gWifiKeyed = 0 : gWifiHaveIp = 0 : WifiRecoveryReconcile(0)
+  If WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_LEAVE : ProcedureReturn 36 : EndIf
+  GateReset() : gWifiUp = 1 : WifiRecoveryReconcile(1)
+  If WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_IDLE Or gate_down <> 0 : ProcedureReturn 37 : EndIf
+  GateReset() : gWifiKeyed = 0 : gWifiHealOn = 0 : WifiRecoveryReconcile(1)
+  If WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_IDLE : ProcedureReturn 38 : EndIf
+  GateReset() : gWifiKeyed = 0 : gate_slots = 0 : WifiRecoveryReconcile(1)
+  If WifiRadioInitActive() <> 0 Or gWifiRecPhase <> #WIFI_REC_IDLE : ProcedureReturn 38 : EndIf
+
+  ; Actual public policy/configuration seams cancel first and re-arm only from
+  ; an explicit ON/success event. OFF remains idle; current settings survive.
+  GateReset() : gWifiKeyed = 0 : WifiLinkSet(0) : WifiLinkSet(1)
+  If gWifiLinkOn = 0 Or WifiRadioInitActive() = 0 : ProcedureReturn 39 : EndIf
+  GateReset() : gWifiKeyed = 0 : WifiHealSet(0) : WifiHealSet(1)
+  If gWifiHealOn = 0 Or WifiRadioInitActive() = 0 : ProcedureReturn 40 : EndIf
+  GateReset() : gWifiKeyed = 0 : WifiConfigChanged()
+  If WifiRadioInitActive() = 0 Or gate_settingsWrites <> 0 : ProcedureReturn 41 : EndIf
+  ; Configuration cancellation after GTK publication must retain the live
+  ; keyed session and explicitly preserve common DHCP ownership.
+  GateReset() : gWifiUp = 1 : gWifiKeyed = 1 : gWifiHaveIp = 0 : WifiConfigChanged()
+  If gWifiKeyed = 0 Or gWifiRecPhase <> #WIFI_REC_IDLE Or gate_dhcpStarts <> 1 : ProcedureReturn 42 : EndIf
+
+  ; Cooperative clock retry owns one mailbox transaction per TRY. Failed
+  ; replies wait without bus work; the deadline is unsigned-wrap safe.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY) : gate_clockHz = 0
+  GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitClockTry <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 43 : EndIf
+  gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS - 1 : GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 44 : EndIf
+  gate_ms = gate_ms + 1 : GateOuterTick()
+  If gate_calls <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 45 : EndIf
+  gate_clockHz = 54000000 : GateOuterTick()
+  If gate_calls <> 2 Or gWifiRinitClockHz <> 54000000 Or gWifiRinitPhase <> #WIFI_RINIT_CLOCK_SET : ProcedureReturn 46 : EndIf
+  If gate_serviceTurns <> 4 : ProcedureReturn 46 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY) : gate_clockHz = 0
+  For expected = 1 To #WIFI_CLOCK_TRIES
+    WifiRadioInitTick()
+    If gate_calls <> expected : ProcedureReturn 47 : EndIf
+    If expected < #WIFI_CLOCK_TRIES
+      If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT : ProcedureReturn 47 : EndIf
+      gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS : WifiRadioInitTick()
+    EndIf
+  Next
+  If gWifiRinitPhase <> #WIFI_RINIT_BACKOFF Or gWifiRinitLastFailPhase <> #WIFI_RINIT_CLOCK_TRY : ProcedureReturn 48 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY)
+  gWifiRinitClockTry = #WIFI_CLOCK_TRIES - 1 : gate_clockHz = 54000000
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_SET Or gWifiRinitClockHz <> 54000000 Or gWifiRinitClockTry <> (#WIFI_CLOCK_TRIES - 1) : ProcedureReturn 52 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_WAIT)
+  gWifiRinitClockAt = $FFFFFF00
+  gate_ms = ($FFFFFF00 + #WIFI_CLOCK_GAP_MS - 1) & $FFFFFFFF : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_WAIT Or gate_calls <> 0 : ProcedureReturn 49 : EndIf
+  gate_ms = ($FFFFFF00 + #WIFI_CLOCK_GAP_MS) & $FFFFFFFF : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY Or gate_calls <> 0 : ProcedureReturn 49 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_TRY)
+  gate_cancelOp = 3 : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_IDLE Or gWifiRinitClockHz <> 0 Or gate_calls <> 1 : ProcedureReturn 50 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_BEGIN) : gWifiRinitClockTry = 7
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_CLOCK_TRY Or gWifiRinitClockTry <> 0 Or gate_calls <> 0 : ProcedureReturn 51 : EndIf
+
+  GateReset() : GateOwnPhase(#WIFI_RINIT_CLOCK_WAIT)
+  gWifiRinitClockAt = gate_ms : WifiRadioInitCancel()
+  gate_ms = gate_ms + #WIFI_CLOCK_GAP_MS : WifiRadioInitTick()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 53 : EndIf
+
+  ; Verified readiness restoration is a hard predecessor. Failure performs no
+  ; destructive primitive, records exact diagnostics and remains retryable.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_RESTORE)
+  gate_restoreActive = 1 : gate_restoreRc = 0
+  WifiRadioInitTick()
+  If gate_calls <> 1 Or gate_lastOp <> 23 Or gWifiRinitPhase <> #WIFI_RINIT_BACKOFF : ProcedureReturn 12 : EndIf
+  If gWifiRinitLastFailPhase <> #WIFI_RINIT_RESTORE Or gWifiRinitLastSdio <> 701 Or gWifiRinitLastCyw <> 702 : ProcedureReturn 13 : EndIf
+  gate_ms = gate_ms + #WIFI_HEAL_MS : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_RESTORE Or gWifiRinitAttempts <> 1 : ProcedureReturn 14 : EndIf
+  gate_restoreRc = 1 : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_BLOBS Or gate_calls <> 2 : ProcedureReturn 15 : EndIf
+
+  ; Every mandatory result-bearing phase fails closed before its successor.
+  ; CLOCK_SET/VERIFY_MODE are void; BLOCK_MODE returns the selected mode and
+  ; zero is the supported byte-mode result, so none is an error result row.
+  For op = 1 To 20
+    If op <> 3 And op <> 4 And op <> 11 And op <> 13
+      GateReset() : GateOwnPhase(gate_phaseForOp[op]) : gate_failOp = op
+      WifiRadioInitTick()
+      If gWifiRinitPhase <> #WIFI_RINIT_BACKOFF Or gWifiUp <> 0 : ProcedureReturn 16 : EndIf
+      If gate_calls <> 1 Or gate_lastOp <> op Or gWifiRinitLastFailPhase <> gate_phaseForOp[op] : ProcedureReturn 17 : EndIf
+    EndIf
+  Next
+
+  ; Block-mode zero is not a transport failure. It selects the existing byte
+  ; fallback and must continue to PREPARE without publishing readiness.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_BLOCK_MODE) : gate_blockModeRc = 0
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_PREPARE Or gWifiRinitBlockMode <> 0 : ProcedureReturn 31 : EndIf
+  If gate_calls <> 1 Or gate_lastOp <> 11 Or gWifiUp <> 0 : ProcedureReturn 31 : EndIf
+
+  ; Roam/power policy retains the existing nonfatal behavior, but its exact
+  ; result is recorded and readiness is not published early.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_ROAM) : gate_failOp = 21
+  WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_POWER Or gWifiRinitRoamRc <> -31 Or gWifiUp <> 0 : ProcedureReturn 18 : EndIf
+  gate_failOp = 22 : WifiRadioInitTick()
+  If gWifiRinitPhase <> #WIFI_RINIT_READY Or gWifiRinitPowerRc <> -31 Or gWifiUp <> 0 : ProcedureReturn 19 : EndIf
+
+  ; Cancellation from inside every primitive invalidates the captured
+  ; generation. No stale return may advance or publish it.
+  For op = 1 To 23
+    GateReset() : GateOwnPhase(gate_phaseForOp[op]) : gate_cancelOp = op
+    If op = 23 : gate_restoreActive = 1 : gate_restoreRc = 1 : EndIf
+    gen = gWifiRinitGeneration
+    WifiRadioInitTick()
+    If WifiRadioInitActive() <> 0 Or gWifiUp <> 0 : ProcedureReturn 20 : EndIf
+    If gWifiRinitGeneration = gen : ProcedureReturn 21 : EndIf
+  Next
+
+  ; Policy and credential removal cancel before any primitive. Direct foreground
+  ; cancellation has the same property and leaves saved configuration alone.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_BLOBS) : gWifiHealOn = 0
+  WifiRadioInitTick()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 22 : EndIf
+  GateReset() : GateOwnPhase(#WIFI_RINIT_BLOBS) : gate_slots = 0
+  WifiRadioInitTick()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 23 : EndIf
+  GateReset() : GateOwnPhase(#WIFI_RINIT_FW)
+  WifiRadioInitCancel() : WifiRadioInitTick()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 Or gWifiRinitFwCalls <> 0 : ProcedureReturn 24 : EndIf
+  If gate_slots <> 1 Or gate_settingsWrites <> 0 : ProcedureReturn 25 : EndIf
+
+  ; Firmware is invoked once in its generation; the following tick can only
+  ; invoke NVRAM. A failed firmware call returns to backoff and never starts it
+  ; again until a new attempt traverses the earlier phases.
+  GateReset() : GateOwnPhase(#WIFI_RINIT_FW)
+  WifiRadioInitTick() : WifiRadioInitTick()
+  If gWifiRinitFwCalls <> 1 Or gate_calls <> 2 Or gate_lastOp <> 15 : ProcedureReturn 26 : EndIf
+  GateReset() : GateOwnPhase(#WIFI_RINIT_FW) : gate_failOp = 14
+  WifiRadioInitTick() : WifiRadioInitTick()
+  If gWifiRinitFwCalls <> 1 Or gate_calls <> 1 Or gWifiRinitPhase <> #WIFI_RINIT_BACKOFF : ProcedureReturn 27 : EndIf
+
+  ; Policy-off and no-credential initial failures remain unarmed.
+  GateReset() : gWifiHealOn = 0 : WifiRecoveryInitialJoinFailed()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 28 : EndIf
+  GateReset() : gate_slots = 0 : WifiRecoveryInitialJoinFailed()
+  If WifiRadioInitActive() <> 0 Or gate_calls <> 0 : ProcedureReturn 29 : EndIf
+
+  ; The monitor session is default-off, binds the current generation, and
+  ; unregisters only after verified disable.
+  GateReset() : gWifiUp=1
+  If WifiRxReadyActive()<>0 Or WifiRxReadyArm()=0 : ProcedureReturn 40 : EndIf
+  If WifiRxReadyActive()=0 Or WifiRxReadyGenerationValid()=0 Or gate_rxCallback=0 : ProcedureReturn 41 : EndIf
+  If WifiRxReadyFirstDelta()<>0 Or WifiRxReadyEmptyDelta()<>0 : ProcedureReturn 42 : EndIf
+  gWifiRinitGeneration=gWifiRinitGeneration+1
+  If WifiRxReadyArm()<>0 Or WifiRxReadyGenerationValid()<>0 : ProcedureReturn 43 : EndIf
+  If WifiRxReadyDisable()=0 Or gate_rxCallback<>0 Or WifiRxReadyActive()<>0 : ProcedureReturn 44 : EndIf
+
+  ; Failed ARM rollback retains callback and old-generation ownership. Disable
+  ; remains available after a generation mismatch and clears only on success.
+  GateReset() : gWifiUp=1 : gate_restoreRc=0
+  If WifiRxReadyArm()<>0 Or gate_rxCallback=0 Or gWifiRxReadyArmed<>2 : ProcedureReturn 45 : EndIf
+  gWifiRinitGeneration=gWifiRinitGeneration+1
+  If WifiRxReadyDisable()<>0 Or gate_rxCallback=0 Or gWifiRxReadyArmed<>2 : ProcedureReturn 46 : EndIf
+  gate_restoreRc=1 : gate_restorePending=0
+  If WifiRxReadyDisable()=0 Or gate_rxCallback<>0 Or gWifiRxReadyArmed<>0 : ProcedureReturn 47 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

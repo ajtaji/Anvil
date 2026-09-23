@@ -1,0 +1,432 @@
+; vulkanDynamicGeometryProof.pi4 - transactional Vulkan render geometry on V3D.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. It is one returning RAM payload and never
+; replaces the resident monitor.  Run it only after `screen dma`, because the
+; payload temporarily owns the V3D MMU and the $0A000000 engine arena.
+;
+; It proves, through public Vulkan entry points, three linear BGRA8 images:
+;   800x1280  - the startup geometry
+;   640x360   - a smaller non-square geometry
+;   257x193   - partial tiles at the right and bottom edges
+; Every image is poisoned through vkMapMemory, cleared on V3D, fence-waited,
+; mapped again, and checked word-for-word.  Job counters must advance, fault
+; counters must not, and the complete original Neon surface must be restored
+; after every submission.  A 1281-wide image is then refused before a GPU job.
+; Finally an ordinary Neon frame is rendered through the restored startup
+; geometry and copied to the DSI scanout, making the success visible.
+;
+; The fixed 32-bit report is at $05900000.  `memory 05900000 100` reads all
+; 64 slots.  Slot 0 is $56444750 ("VDGP"), slot 1 is zero only on success.
+; Slots 4..8 hold maxImageDimension2D, linear format bits, image-format query
+; result, maxExtent.width and maxResourceSize.
+; Each successful geometry occupies twelve slots starting at 16, 28 and 40:
+; width, height, pitch, bytes, image address, bin delta, render delta,
+; fence-before, fence-after, mismatch count, first word, last word.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VDG_REPORT = $05900000
+#VDG_MAGIC = $56444750
+#VDG_ARENA = $0A000000
+#VDG_ARENA_BYTES = $01000000
+#VDG_SURFACE = $06000000
+#VDG_PANEL_W = 800
+#VDG_PANEL_H = 1280
+#VDG_PANEL_PITCH = 3200
+#VDG_SURFACE_BYTES = 4096000
+#VDG_CAPACITY = 1280
+#VDG_MAX_IMAGE_BYTES = 6553600
+#VDG_WINDOW = #VDG_SURFACE + #VDG_SURFACE_BYTES
+#VDG_MAP_BYTES = #VDG_SURFACE_BYTES + #VDG_MAX_IMAGE_BYTES
+#VDG_DSI_SCAN = $08A00000
+#VDG_POISON = $00CC55AA
+#VDG_EXPECT = $FF3380B2
+#VDG_RESTORE_EXPECT = $FF2060A0
+
+#VDG_OK = 0
+#VDG_ERR_NEON = 1
+#VDG_ERR_INSTANCE = 2
+#VDG_ERR_DEVICE = 3
+#VDG_ERR_OBJECT = 4
+#VDG_ERR_IMAGE = 5
+#VDG_ERR_MEMORY = 6
+#VDG_ERR_RECORD = 7
+#VDG_ERR_SUBMIT = 8
+#VDG_ERR_FENCE = 9
+#VDG_ERR_PIXELS = 10
+#VDG_ERR_JOBS = 11
+#VDG_ERR_FAULT = 12
+#VDG_ERR_RESTORE = 13
+#VDG_ERR_LIMIT = 14
+#VDG_ERR_FINAL_FRAME = 15
+#VDG_ERR_PRESENT = 16
+
+Global vdgDev.i
+Global vdgQueue.i
+Global vdgCmd.i
+Global vdgFence.i
+Global Dim vdgColour.l[4]
+
+Procedure vdgPut(slot.i, value.i)
+  If slot >= 0 And slot < 64
+    PokeL(#VDG_REPORT + (slot * 4), value)
+  EndIf
+EndProcedure
+
+Procedure vdgFill(base.i, bytes.i, value.i)
+  Define offset.i
+  offset = 0
+  While offset < bytes
+    PokeL(base + offset, value)
+    offset = offset + 4
+  Wend
+EndProcedure
+
+Procedure.i vdgSurfaceRestored()
+  If Neon_SurfaceBase() <> #VDG_SURFACE : ProcedureReturn 0 : EndIf
+  If Neon_SurfaceW() <> #VDG_PANEL_W Or Neon_SurfaceH() <> #VDG_PANEL_H : ProcedureReturn 0 : EndIf
+  If Neon_SurfacePhysicalW() <> #VDG_PANEL_W Or Neon_SurfacePhysicalH() <> #VDG_PANEL_H : ProcedureReturn 0 : EndIf
+  If Neon_SurfacePitch() <> #VDG_PANEL_PITCH : ProcedureReturn 0 : EndIf
+  If Neon_SurfaceBytes() <> #VDG_SURFACE_BYTES : ProcedureReturn 0 : EndIf
+  If Neon_SurfaceFormat() <> #V3D_OFMT_RGBA8 Or Neon_SurfaceRotation() <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i vdgRunOne(index.i, width.i, height.i)
+  Define report.i
+  Define rc.i
+  Define image.i
+  Define memory.i
+  Define mapped.i
+  Define imageBase.i
+  Define offset.i
+  Define bad.i
+  Define first.i
+  Define last.i
+  Define bin0.i
+  Define render0.i
+  Define fault0.i
+  Define oom0.i
+  Define commandHandle.i
+  Define fenceHandle.i
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define beginInfo.VkCommandBufferBeginInfo
+  Define barrier.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Define submit.VkSubmitInfo
+
+  report = 16 + (index * 12)
+  vdgPut(report + 0, width)
+  vdgPut(report + 1, height)
+
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = width
+  imgci\extent\height = height
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(vdgDev, @imgci, 0, @image)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_IMAGE : EndIf
+
+  vkGetImageMemoryRequirements(vdgDev, image, @req)
+  vdgPut(report + 2, AnvilVkImageRowPitch(image))
+  vdgPut(report + 3, req\size)
+  If AnvilVkImageRowPitch(image) <> (width * 4) Or req\size <> (width * height * 4)
+    vdgPut(2, AnvilVkImageRowPitch(image))
+    ProcedureReturn #VDG_ERR_IMAGE
+  EndIf
+
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(vdgDev, @mai, 0, @memory)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_MEMORY : EndIf
+  rc = vkBindImageMemory(vdgDev, image, memory, 0)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_MEMORY : EndIf
+  imageBase = AnvilVkImageAddress(image)
+  vdgPut(report + 4, imageBase)
+
+  rc = vkMapMemory(vdgDev, memory, 0, req\size, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> imageBase : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_MEMORY : EndIf
+  vdgFill(mapped, req\size, #VDG_POISON)
+  vkUnmapMemory(vdgDev, memory)
+
+  If vkResetCommandBuffer(vdgCmd, 0) <> #VK_SUCCESS : ProcedureReturn #VDG_ERR_RECORD : EndIf
+  fenceHandle = vdgFence
+  If vkResetFences(vdgDev, 1, @fenceHandle) <> #VK_SUCCESS : ProcedureReturn #VDG_ERR_FENCE : EndIf
+  vdgPut(report + 7, vkGetFenceStatus(vdgDev, vdgFence))
+
+  barrier\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  barrier\srcAccessMask = 0
+  barrier\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  barrier\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  barrier\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  barrier\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  barrier\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  barrier\image = image
+  barrier\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  barrier\subresourceRange\baseMipLevel = 0
+  barrier\subresourceRange\levelCount = 1
+  barrier\subresourceRange\baseArrayLayer = 0
+  barrier\subresourceRange\layerCount = 1
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\baseMipLevel = 0
+  range\levelCount = 1
+  range\baseArrayLayer = 0
+  range\layerCount = 1
+
+  beginInfo\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  beginInfo\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  If vkBeginCommandBuffer(vdgCmd, @beginInfo) <> #VK_SUCCESS : ProcedureReturn #VDG_ERR_RECORD : EndIf
+  vkCmdPipelineBarrier(vdgCmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @barrier)
+  vkCmdClearColorImage(vdgCmd, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @vdgColour[0], 1, @range)
+  rc = vkEndCommandBuffer(vdgCmd)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_RECORD : EndIf
+
+  bin0 = V3dBinJobs()
+  render0 = V3dRenderJobs()
+  fault0 = V3dMmuFaultsNow()
+  oom0 = V3dBinOomCount()
+  commandHandle = vdgCmd
+  submit\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  submit\commandBufferCount = 1
+  submit\pCommandBuffers = @commandHandle
+  rc = vkQueueSubmit(vdgQueue, 1, @submit, vdgFence)
+  vdgPut(2, rc)
+  vdgPut(3, AnvilVkBackendNativeError())
+  If rc <> #VK_SUCCESS : ProcedureReturn #VDG_ERR_SUBMIT : EndIf
+  fenceHandle = vdgFence
+  rc = vkWaitForFences(vdgDev, 1, @fenceHandle, 1, 2000000000)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_FENCE : EndIf
+
+  vdgPut(report + 5, V3dBinJobs() - bin0)
+  vdgPut(report + 6, V3dRenderJobs() - render0)
+  vdgPut(report + 8, vkGetFenceStatus(vdgDev, vdgFence))
+  If V3dBinJobs() <= bin0 Or V3dRenderJobs() <= render0 : ProcedureReturn #VDG_ERR_JOBS : EndIf
+  If V3dMmuFaultsNow() <> fault0 Or V3dBinOomCount() <> oom0 : ProcedureReturn #VDG_ERR_FAULT : EndIf
+  If vdgSurfaceRestored() = 0 : ProcedureReturn #VDG_ERR_RESTORE : EndIf
+
+  rc = vkMapMemory(vdgDev, memory, 0, req\size, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> imageBase : vdgPut(2, rc) : ProcedureReturn #VDG_ERR_MEMORY : EndIf
+  bad = 0
+  first = PeekL(mapped) & $FFFFFFFF
+  last = PeekL(mapped + req\size - 4) & $FFFFFFFF
+  offset = 0
+  While offset < req\size
+    If (PeekL(mapped + offset) & $FFFFFFFF) <> #VDG_EXPECT
+      bad = bad + 1
+    EndIf
+    offset = offset + 4
+  Wend
+  vkUnmapMemory(vdgDev, memory)
+  vdgPut(report + 9, bad)
+  vdgPut(report + 10, first)
+  vdgPut(report + 11, last)
+  If bad <> 0 : ProcedureReturn #VDG_ERR_PIXELS : EndIf
+
+  vkDestroyImage(vdgDev, image, 0)
+  vkFreeMemory(vdgDev, memory, 0)
+  ProcedureReturn #VDG_OK
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define count.i
+  Define pool.i
+  Define limitImage.i
+  Define bin0.i
+  Define render0.i
+  Define fault0.i
+  Define offset.i
+  Define bad.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define priority.l
+  Define poolInfo.VkCommandPoolCreateInfo
+  Define allocInfo.VkCommandBufferAllocateInfo
+  Define fenceInfo.VkFenceCreateInfo
+  Define limitInfo.VkImageCreateInfo
+  Define formatProps.VkFormatProperties
+  Define imageFormatProps.VkImageFormatProperties
+
+  vdgFill(#VDG_REPORT, 256, 0)
+  vdgPut(0, #VDG_MAGIC)
+  vdgPut(1, #VDG_ERR_NEON)
+  PokeL(@vdgColour[0] + 0, $3E4CCCCD)
+  PokeL(@vdgColour[0] + 4, $3F000000)
+  PokeL(@vdgColour[0] + 8, $3F333333)
+  PokeL(@vdgColour[0] + 12, $3F800000)
+
+  If NeonArena(#VDG_ARENA, #VDG_ARENA_BYTES) <> #NEON_OK : ProcedureReturn #VDG_ERR_NEON : EndIf
+  If NeonSurface(#VDG_SURFACE, #VDG_PANEL_W, #VDG_PANEL_H, #VDG_PANEL_PITCH) <> #NEON_OK : ProcedureReturn #VDG_ERR_NEON : EndIf
+  If NeonRenderCapacity(#VDG_CAPACITY, #VDG_CAPACITY) <> #NEON_OK : ProcedureReturn #VDG_ERR_NEON : EndIf
+  NeonSurfaceMapSpan(#VDG_MAP_BYTES)
+  If NeonInit() <> #NEON_OK
+    vdgPut(2, Neon_Error())
+    vdgPut(3, Neon_ArenaNeed())
+    ProcedureReturn #VDG_ERR_NEON
+  EndIf
+  If vdgSurfaceRestored() = 0 : NeonShutdown() : ProcedureReturn #VDG_ERR_RESTORE : EndIf
+  vdgPut(4, avkBackendMaxImageDimension2D())
+
+  rc = AnvilVkV3dWindow(#VDG_WINDOW, #VDG_MAX_IMAGE_BYTES)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_MEMORY : EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @inst)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_INSTANCE : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1 : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_INSTANCE : EndIf
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @formatProps)
+  vdgPut(5, formatProps\linearTilingFeatures)
+  rc = vkGetPhysicalDeviceImageFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, @imageFormatProps)
+  vdgPut(6, rc)
+  vdgPut(7, imageFormatProps\maxExtent\width)
+  vdgPut(8, imageFormatProps\maxResourceSize)
+  If rc <> #VK_SUCCESS Or imageFormatProps\maxExtent\width <> #VDG_CAPACITY Or imageFormatProps\maxExtent\height <> #VDG_CAPACITY Or imageFormatProps\maxExtent\depth <> 1
+    vdgPut(1, #VDG_ERR_LIMIT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_LIMIT
+  EndIf
+  If imageFormatProps\maxMipLevels <> 1 Or imageFormatProps\maxArrayLayers <> 1 Or imageFormatProps\sampleCounts <> #VK_SAMPLE_COUNT_1_BIT Or imageFormatProps\maxResourceSize <> #VDG_MAX_IMAGE_BYTES
+    vdgPut(1, #VDG_ERR_LIMIT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_LIMIT
+  EndIf
+
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @vdgDev)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_DEVICE : EndIf
+  vkGetDeviceQueue(vdgDev, 0, 0, @vdgQueue)
+  poolInfo\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  poolInfo\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(vdgDev, @poolInfo, 0, @pool)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_OBJECT : EndIf
+  allocInfo\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  allocInfo\commandPool = pool
+  allocInfo\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  allocInfo\commandBufferCount = 1
+  rc = vkAllocateCommandBuffers(vdgDev, @allocInfo, @vdgCmd)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_OBJECT : EndIf
+  fenceInfo\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  rc = vkCreateFence(vdgDev, @fenceInfo, 0, @vdgFence)
+  If rc <> #VK_SUCCESS : vdgPut(2, rc) : NeonShutdown() : ProcedureReturn #VDG_ERR_OBJECT : EndIf
+
+  rc = vdgRunOne(0, 800, 1280)
+  If rc = #VDG_OK : rc = vdgRunOne(1, 640, 360) : EndIf
+  If rc = #VDG_OK : rc = vdgRunOne(2, 257, 193) : EndIf
+  If rc <> #VDG_OK
+    vdgPut(1, rc)
+    vkDeviceWaitIdle(vdgDev)
+    NeonShutdown()
+    ProcedureReturn rc
+  EndIf
+
+  ; One pixel beyond the honestly advertised scalar maximum must be refused
+  ; by object creation, before any bin or render submission can move.
+  limitInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  limitInfo\imageType = #VK_IMAGE_TYPE_2D
+  limitInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  limitInfo\extent\width = #VDG_CAPACITY + 1
+  limitInfo\extent\height = 64
+  limitInfo\extent\depth = 1
+  limitInfo\mipLevels = 1
+  limitInfo\arrayLayers = 1
+  limitInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  limitInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  limitInfo\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  limitInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  limitInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bin0 = V3dBinJobs()
+  render0 = V3dRenderJobs()
+  rc = vkCreateImage(vdgDev, @limitInfo, 0, @limitImage)
+  vdgPut(9, rc)
+  vdgPut(10, V3dBinJobs() - bin0)
+  vdgPut(11, V3dRenderJobs() - render0)
+  If rc = #VK_SUCCESS Or V3dBinJobs() <> bin0 Or V3dRenderJobs() <> render0
+    vdgPut(1, #VDG_ERR_LIMIT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_LIMIT
+  EndIf
+
+  ; This frame is not a Vulkan image: it is an ordinary engine frame after
+  ; all three Vulkan rebind/restore transactions.  Exact pixels plus advancing
+  ; jobs prove that the old display geometry is operational, not merely copied
+  ; back into a set of bookkeeping variables.
+  vdgFill(#VDG_SURFACE, #VDG_SURFACE_BYTES, #VDG_POISON)
+  bin0 = V3dBinJobs()
+  render0 = V3dRenderJobs()
+  fault0 = V3dMmuFaultsNow()
+  rc = NeonFrameBegin(#VDG_RESTORE_EXPECT)
+  If rc = #NEON_OK : rc = NeonFrameEnd() : EndIf
+  vdgPut(12, rc)
+  vdgPut(13, V3dBinJobs() - bin0)
+  vdgPut(14, V3dRenderJobs() - render0)
+  If rc <> #NEON_OK Or V3dBinJobs() <= bin0 Or V3dRenderJobs() <= render0 Or V3dMmuFaultsNow() <> fault0
+    vdgPut(1, #VDG_ERR_FINAL_FRAME)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_FINAL_FRAME
+  EndIf
+  bad = 0
+  offset = 0
+  While offset < #VDG_SURFACE_BYTES
+    If (PeekL(#VDG_SURFACE + offset) & $FFFFFFFF) <> #VDG_RESTORE_EXPECT : bad = bad + 1 : EndIf
+    offset = offset + 4
+  Wend
+  If bad <> 0
+    vdgPut(2, bad)
+    vdgPut(1, #VDG_ERR_FINAL_FRAME)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_FINAL_FRAME
+  EndIf
+
+  rc = DisplayAdopt(#VDG_DSI_SCAN, #VDG_PANEL_PITCH, #VDG_PANEL_W, #VDG_PANEL_H, 32)
+  If rc <> #DSP_OK
+    vdgPut(2, DisplayLastError())
+    vdgPut(1, #VDG_ERR_PRESENT)
+    NeonShutdown()
+    ProcedureReturn #VDG_ERR_PRESENT
+  EndIf
+  DisplayBlit(#VDG_SURFACE, #VDG_PANEL_PITCH, 0, 0, #VDG_PANEL_W, #VDG_PANEL_H)
+  DisplayFlush()
+
+  vkDeviceWaitIdle(vdgDev)
+  vkDestroyFence(vdgDev, vdgFence, 0)
+  vkDestroyCommandPool(vdgDev, pool, 0)
+  vkDestroyDevice(vdgDev, 0)
+  vkDestroyInstance(inst, 0)
+  rc = NeonShutdown()
+  vdgPut(15, rc)
+  If rc <> #V3D_OK : vdgPut(1, #VDG_ERR_NEON) : ProcedureReturn #VDG_ERR_NEON : EndIf
+  vdgPut(1, #VDG_OK)
+  ProcedureReturn #VDG_OK
+EndProcedure

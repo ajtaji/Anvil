@@ -1,0 +1,889 @@
+; ======================================================================
+;  geni_i2c.pi4 - I2C over a QUPv3 GENI serial engine on the QCM2290.
+;
+;  This is NOT a BSC-alike. A GENI serial engine is a SOFT-PROGRAMMABLE
+;  SEQUENCER: the same block of silicon is an I2C master, a SPI master or
+;  a UART depending on which PROTOCOL FIRMWARE has been loaded into its
+;  instruction RAM. Everything below only works because that firmware is
+;  ALREADY THERE - see THE FIRMWARE QUESTION, which is the first thing
+;  anyone touching this file has to understand, and which was settled by
+;  measurement rather than by argument.
+;
+;  A QUICK EXAMPLE
+;
+;    XIncludeFile "ArduinoQ/Lib/geni_i2c.unoq"
+;
+;    Procedure Main()
+;      If GeniI2cPresent(1)
+;        GeniI2cInit(1, 100000)
+;        If GeniI2cProbe(1, $58) = #GENI_I2C_OK
+;          ; the DSI-to-DP bridge answered
+;        EndIf
+;      EndIf
+;    EndProcedure
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NO LIBRARY. House rule 10: a library never includes another library.
+;
+;  It DOES need one procedure from the board layer, and that dependency
+;  is deliberate and documented rather than hidden:
+;
+;    HwTimerUs()   ArduinoQ/Board/hwtimer_q.unoq - microseconds off
+;                  CNTPCT_EL0. Every wait in this file is bounded by it,
+;                  so a wedged bus times out instead of hanging a board
+;                  nobody can see. If hwtimer_q.pi4 is not included
+;                  first, this file fails LOUDLY at compile time as an
+;                  undefined procedure, which is the failure mode house
+;                  rule 10 wants.
+;
+;  ---- THE FIRMWARE QUESTION, AND HOW IT WAS ANSWERED ----------------
+;
+;  A GENI SE reports which protocol its firmware implements in a
+;  read-only register. include/linux/soc/qcom/geni-se.h:374-381:
+;
+;      static inline u32 geni_se_read_proto(struct geni_se *se)
+;      {
+;              val = readl_relaxed(se->base + GENI_FW_REVISION_RO);
+;              return (val & FW_REV_PROTOCOL_MSK) >> FW_REV_PROTOCOL_SHFT;
+;      }
+;
+;  with GENI_FW_REVISION_RO = 0x68 (geni-se.h:92) and the protocol in
+;  bits 15:8 (geni-se.h:179-181). The values (geni-se.h:33-41):
+;
+;      0 NONE   1 SPI   2 UART   3 I2C   4 I3C   5 SPI_SLAVE   255 INVALID
+;
+;  THE DANGER was that the firmware might not be loaded at all. Linux's
+;  i2c-qcom-geni.c:1049-1057 shows all three outcomes:
+;
+;      proto = geni_se_read_proto(&gi2c->se);
+;      if (proto == GENI_SE_INVALID_PROTO) {
+;              ret = geni_load_se_firmware(&gi2c->se, GENI_SE_I2C);
+;      } else if (proto != GENI_SE_I2C) {
+;              ret = dev_err_probe(..., -ENXIO, "Invalid proto %d\n", proto);
+;      }
+;
+;  and its loader needs a `firmware-name` blob (qcom-geni-se.c:1565-1570)
+;  that DOES NOT EXIST for the QCM2290 - linux-firmware ships
+;  qupv3fw.elf for sa8775p, qcm6490 and others, but never for this part.
+;  Which is the proof, by absence: mainline I2C works on this SoC, and it
+;  works WITHOUT a blob, so the BOOT CHAIN must load the SE firmware
+;  before any OS runs. Anvil, arriving later still as a UEFI application,
+;  inherits it.
+;
+;  MEASURED ON THIS BOARD, 2026-09-02, reading GENI_FW_REVISION_RO on all
+;  six engines from Linux over SSH (busybox devmem):
+;
+;      SE0  0x04A80068 = 0x00000303   proto 3  I2C
+;      SE1  0x04A84068 = 0x00000303   proto 3  I2C
+;      SE2  0x04A88068 = 0x00000204   proto 2  UART
+;      SE3  0x04A8C068 = 0x00000204   proto 2  UART
+;      SE4  0x04A90068 = 0x00000204   proto 2  UART   <- the console
+;      SE5  0x04A94068 = 0x00000102   proto 1  SPI
+;      wrapper QUPV3_HW_VER 0x04AC0004 = 0x30000000
+;
+;  So SE0 and SE1 ARE I2C ENGINES, ready to drive, and SE4 being UART is
+;  the same fact that makes the firmware console work. This file refuses
+;  any engine whose protocol is not 3, at the moment it is asked to
+;  initialise it, rather than writing I2C registers into a UART.
+;
+;  ***THAT MEASUREMENT WAS TAKEN UNDER LINUX, WHERE THE CLOCKS ARE ON.***
+;  It proves the FIRMWARE is loaded - firmware is in RAM inside the SE
+;  and survives - but it does NOT prove that SE0/SE1's core clocks are
+;  running under UEFI, which is a different question with a different
+;  answer. GeniI2cPresent() is written to be the honest test at run time:
+;  see THE CLOCK CAVEAT below.
+;
+;  ---- WHERE THE ADDRESSES COME FROM ---------------------------------
+;
+;  ArduinoQ/Reference/ , all cited by file:line:
+;
+;    agatti.dtsi          the QCM2290's device tree (qrb2210-rb1.dts:10
+;                         includes it, which is how we know agatti is
+;                         this part and sm6115.dtsi is the sibling)
+;    qcom-geni-se.c       the QUP wrapper driver - register offsets
+;    geni-se.h            the SE register map and every field mask
+;    i2c-qcom-geni.c      the I2C protocol layer - opcodes, SCL counter
+;                         tables, the transfer shape and the error decode
+;
+;    THE WRAPPER  agatti.dtsi:1178-1188, `geniqup@4ac0000`, one wrapper
+;                 only on this part (there is no QUP_1), common registers
+;                 at $04AC0000.
+;    THE ENGINES  SE n is at $04A80000 + n * $4000. Confirmed twice: the
+;                 DTS gives each node its reg (i2c@4a80000, i2c@4a84000,
+;                 ... serial@4a90000), and the LIVE board's own device
+;                 tree names 4a80000.i2c and 4a84000.i2c as the two
+;                 Geni-I2C adapters.
+;
+;  ---- WHICH ENGINE IS WHICH ON THE UNO Q ----------------------------
+;
+;  Read off the RUNNING board, not guessed - /sys/bus/i2c/devices:
+;
+;    SE0  $04A80000  i2c-0, an I2C engine with nothing enumerated on it
+;    SE1  $04A84000  i2c-1, THE BOARD'S REAL I2C BUS. Eight devices
+;                    answer on it, and one of them is identified in the
+;                    device tree: `anx7625` at $58, the MIPI-DSI to
+;                    DisplayPort bridge that drives the USB-C port. The
+;                    other seven enumerate as `dummy` (claimed by address
+;                    with no driver name): $2A $2C $38 $39 $3D $3F $42.
+;    SE4  $04A90000  the firmware console UART. NOT an I2C engine, and
+;                    the one this file must never touch - it is the wire
+;                    this session's transcript is travelling on.
+;
+;  ---- THE CLOCK CAVEAT. READ BEFORE ADDING A NEW ENGINE -------------
+;
+;  ***AN MMIO READ OF AN SE WHOSE CLOCK IS OFF DOES NOT RETURN A VALUE.
+;  IT HANGS OR ABORTS.*** On Qualcomm parts an AHB access to an unclocked
+;  NoC slave stalls the bus; it does not politely return $FFFFFFFF. So
+;  "read the register and see" is not free, and a hang here is a boot
+;  cycle lost on a board with no visible console.
+;
+;  Two things make this survivable rather than reckless:
+;
+;    1. The WRAPPER's AHB clocks are demonstrably on, because SE4 - an
+;       engine inside the same wrapper - is carrying the firmware console
+;       while Anvil runs. A wrapper whose s-ahb clock were off could not
+;       be printing this sentence.
+;    2. The per-engine core clock is the open question, and it is asked
+;       ONCE, cheaply, by reading GENI_FW_REVISION_RO - and the answer is
+;       self-checking. A dead read is all-zeros or all-ones; a live one
+;       carries a plausible protocol AND a non-zero firmware version in
+;       the low byte. GeniI2cPresent() requires BOTH, so "0x00000000" and
+;       "0xFFFFFFFF" are rejected as "clock off / not present" rather
+;       than being mistaken for protocol 0 and protocol 255.
+;
+;  This file therefore NEVER writes to an engine it has not first read a
+;  plausible protocol from.
+;
+;  ---- WHAT IS NOT DONE, AND THE ONE THAT MIGHT BITE -----------------
+;
+;  NO INTERCONNECT VOTE. Linux votes for bandwidth on three ICC paths
+;  before a transfer (qcom-geni-se.c:923-951, re-scaled at
+;  i2c-qcom-geni.c:1117-1118). The `qup-core` path is not really
+;  bandwidth at all - geni-se.h:350-353 says the vote "cause[s] the
+;  underlying Core 2X interconnect clock to run at the named frequency",
+;  so it is a clock enable wearing a bandwidth costume, and it is
+;  delivered by an RPM message over SMD, not by a register poke. Anvil
+;  has no RPM IPC and cannot make that vote.
+;
+;  ***IF THE BOOT CHAIN LEFT NO STANDING VOTE, A TRANSFER STALLS RATHER
+;  THAN FAILING.*** That is precisely why every wait below is bounded by
+;  HwTimerUs() and returns #GENI_I2C_TIMEOUT. A stall is reported as a
+;  timeout and the monitor stays alive; it is not allowed to become a
+;  hang. If probes time out uniformly while GeniI2cPresent() says the
+;  engine is there, THIS is the first suspect and it should be written up
+;  rather than worked around.
+;
+;  NO DMA. FIFO mode only. GENI_IF_DISABLE_RO bit 0 says whether the FIFO
+;  path is fused off (i2c-qcom-geni.c:1065); GeniI2cInit() checks it and
+;  refuses rather than programming a FIFO that is not there.
+;
+;  NO REPEATED START. Each call is one complete transaction ending in a
+;  STOP, the same deliberate limitation RaspberryPi4/Lib/i2c.pi4 has. A
+;  register read is composed by the caller as write-then-read. The
+;  hardware CAN do it - STOP_STRETCH (i2c-qcom-geni.c:41) held across a
+;  multi-message transfer is how Linux does it - and adding it later is a
+;  contained change.
+;
+;  NO CLOCK-STRETCH DISTINCTION. The GENI reports a stretch that outlasts
+;  the engine's own patience as a generic command failure, not as its own
+;  status bit, so #GENI_I2C_CLKT is never returned from a real transfer.
+;  It exists in the vocabulary because the seam above has it; claiming a
+;  stretch we cannot actually distinguish would be the silent-wrong-answer
+;  that vault rule 3 forbids.
+;
+;  ---- .n, NOT .i ----------------------------------------------------
+;
+;  Every register here is 32 bits and is touched with PeekN / PokeN. On
+;  this target .i is EIGHT bytes, and these registers are packed four
+;  bytes apart - SE_GENI_M_IRQ_STATUS at $610 sits next to M_IRQ_EN at
+;  $614 - so a 64-bit access would read or write two registers at once.
+;  See ArduinoQ/Lib/tlmm.unoq's header for the long version.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The map. agatti.dtsi:1178-1188 for the wrapper, and the per-engine
+;  reg values from the i2c@/spi@/serial@ nodes under it.
+; ----------------------------------------------------------------------
+#GENI_WRAP_BASE   = $04AC0000  ; QUPv3 wrapper common registers
+#GENI_WRAP_HW_VER = $04        ; QUPV3_HW_VER_REG - qcom-geni-se.c:184
+
+#GENI_SE0_BASE    = $04A80000  ; serial engine 0
+#GENI_SE_STRIDE   = $4000      ; each engine owns 16 KB
+#GENI_SE_MAX      = 5          ; six engines, 0..5
+
+; ----------------------------------------------------------------------
+;  SE register offsets - geni-se.h:83-160 unless noted.
+; ----------------------------------------------------------------------
+#GENI_FORCE_DEFAULT_REG   = $020
+#GENI_OUTPUT_CTRL         = $024
+#GENI_CGC_CTRL            = $028   ; qcom-geni-se.c:201
+#GENI_STATUS              = $040
+#GENI_SER_M_CLK_CFG       = $048
+#GENI_IF_DISABLE_RO       = $064
+#GENI_FW_REVISION_RO      = $068
+#GENI_CLK_SEL             = $07C
+#GENI_TX_PACKING_CFG0     = $260   ; qcom-geni-se.c:206
+#GENI_TX_PACKING_CFG1     = $264   ; qcom-geni-se.c:207
+#GENI_I2C_TX_TRANS_LEN    = $26C   ; i2c-qcom-geni.c:24
+#GENI_I2C_RX_TRANS_LEN    = $270   ; i2c-qcom-geni.c:25
+#GENI_I2C_SCL_COUNTERS    = $278   ; i2c-qcom-geni.c:26
+#GENI_RX_PACKING_CFG0     = $284   ; qcom-geni-se.c:208
+#GENI_RX_PACKING_CFG1     = $288   ; qcom-geni-se.c:209
+#GENI_DMA_MODE_EN         = $258
+#GENI_M_CMD0              = $600
+#GENI_M_CMD_CTRL_REG      = $604
+#GENI_M_IRQ_STATUS        = $610
+#GENI_M_IRQ_EN            = $614
+#GENI_M_IRQ_CLEAR         = $618
+#GENI_S_IRQ_CLEAR         = $648
+#GENI_TX_FIFO             = $700
+#GENI_RX_FIFO             = $780
+#GENI_TX_FIFO_STATUS      = $800
+#GENI_RX_FIFO_STATUS      = $804
+#GENI_TX_WATERMARK_REG    = $80C
+#GENI_RX_WATERMARK_REG    = $810
+#GENI_RX_RFR_WATERMARK    = $814
+#GENI_SE_IRQ_EN           = $E1C
+#GENI_DMA_GENERAL_CFG     = $E30
+#GENI_GSI_EVENT_EN        = $E18
+#GENI_DMA_TX_IRQ_CLR      = $C44
+#GENI_DMA_RX_IRQ_CLR      = $D44
+
+; ----------------------------------------------------------------------
+;  Field values.
+; ----------------------------------------------------------------------
+#GENI_FW_PROTO_SHIFT = 8       ; geni-se.h:181
+#GENI_FW_PROTO_MASK  = $FF     ; geni-se.h:180, GENMASK(15,8) >> 8
+#GENI_PROTO_I2C      = 3       ; geni-se.h:37
+#GENI_PROTO_UART     = 2       ; geni-se.h:36
+
+#GENI_SER_CLK_EN     = $1      ; geni-se.h, SER_CLK_EN  = BIT(0)
+#GENI_CLK_DIV_SHIFT  = 4       ; CLK_DIV_SHFT
+#GENI_DMA_MODE_BIT   = $1      ; GENI_DMA_MODE_EN = BIT(0)
+#GENI_FIFO_IF_DISABLE = $1     ; GENI_IF_DISABLE_RO bit 0
+
+; M_IRQ_STATUS bits - geni-se.h:212-238.
+#GENI_M_CMD_DONE     = $1        ; BIT(0)
+#GENI_M_CMD_OVERRUN  = $2        ; BIT(1)
+#GENI_M_ILLEGAL_CMD  = $4        ; BIT(2)
+#GENI_M_CMD_FAILURE  = $8        ; BIT(3)
+#GENI_M_CMD_ABORT    = $20       ; BIT(5)
+#GENI_M_GP_IRQ_0     = $200      ; BIT(9)  - unknown error
+#GENI_M_GP_IRQ_1     = $400      ; BIT(10) - NACK (address or data)
+#GENI_M_GP_IRQ_3     = $1000     ; BIT(12) - bus protocol error
+#GENI_M_GP_IRQ_4     = $2000     ; BIT(13) - arbitration lost
+#GENI_M_RX_FIFO_WM   = $4000000  ; BIT(26)
+#GENI_M_RX_FIFO_LAST = $8000000  ; BIT(27)
+#GENI_M_TX_FIFO_WM   = $40000000 ; BIT(30)
+
+#GENI_RX_FIFO_WC_MASK = $1FFFFFF ; geni-se.h, RX_FIFO_WC_MSK GENMASK(24,0)
+
+; M_CMD opcodes for I2C - i2c-qcom-geni.c:33-38.
+#GENI_I2C_OP_WRITE     = 1
+#GENI_I2C_OP_READ      = 2
+#GENI_I2C_OP_ADDR_ONLY = 4
+#GENI_M_OPCODE_SHIFT   = 27      ; geni-se.h, M_OPCODE_SHFT
+
+; M_CMD params - i2c-qcom-geni.c:40-49.
+#GENI_I2C_SLV_ADDR_SHIFT = 9     ; SLV_ADDR_SHFT
+
+; SCL counter field shifts - i2c-qcom-geni.c:51-54.
+#GENI_I2C_HIGH_CNT_SHIFT  = 20
+#GENI_I2C_LOW_CNT_SHIFT   = 10
+
+; ----------------------------------------------------------------------
+;  THE FIFO PACKING WORDS, and why they are constants rather than code.
+;
+;  Linux computes these in geni_se_config_packing() (qcom-geni-se.c:
+;  535-576) from (bpw = 8, pack_words = 4, msb_to_lsb = true) - the
+;  arguments i2c-qcom-geni.c:1092 passes. That routine is a loop over
+;  four 10-bit vectors, each
+;      (idx << 5) | (1 << 4) | (7 << 1)      [ +1 on the last, the stop ]
+;  with idx running 7, 15, 23, 31, packed two vectors per register at
+;  PACKING_VECTOR_SHIFT = 10 (qcom-geni-se.c:517-522).
+;
+;  For I2C the arguments never vary, so the loop has exactly one answer
+;  and it is worked out here once:
+;      vec0 = (7<<5)|16|14  = $0FE      vec1 = (15<<5)|16|14 = $1FE
+;      vec2 = (23<<5)|16|14 = $2FE      vec3 = (31<<5)|16|14|1 = $3FF
+;      CFG0 = vec0 | (vec1 << 10) = $7F8FE
+;      CFG1 = vec2 | (vec3 << 10) = $FFEFE
+;
+;  Writing the two answers, with the derivation above them, is clearer
+;  than porting a loop whose inputs are fixed - and a reviewer can check
+;  four multiplications instead of reading a bit-vector generator.
+;
+;  WHAT THEY MEAN: one 32-bit FIFO word carries four bytes, byte 0 in
+;  bits 7:0. i2c-qcom-geni.c:344-347 reads them back that way -
+;  `cur->buf[..] = val & 0xff; val >>= 8;` - which is the independent
+;  confirmation that the byte order is what this file assumes.
+; ----------------------------------------------------------------------
+#GENI_PACK_CFG0 = $7F8FE
+#GENI_PACK_CFG1 = $FFEFE
+
+; ----------------------------------------------------------------------
+;  This library's own result codes. The Board wrapper maps them onto
+;  Anvil's #HW_I2C_* vocabulary; they are separate so that a divergence
+;  in either enumeration fails at the seam instead of mislabelling a bus
+;  error - the same discipline RaspberryPi4/Board/hw_i2c.pi4 uses.
+; ----------------------------------------------------------------------
+#GENI_I2C_OK      =  0
+#GENI_I2C_NACK    = -2
+#GENI_I2C_CLKT    = -3
+#GENI_I2C_TIMEOUT = -4
+#GENI_I2C_ARG     = -5
+#GENI_I2C_NOBUS   = -6
+
+; How long any single transaction may take before it is declared wedged.
+; Generous: 100 kHz, 32 bytes, plus a slow slave stretching, is still
+; well under 50 ms. This bound is what stops a missing interconnect vote
+; from becoming a hung board - see WHAT IS NOT DONE in the header.
+#GENI_I2C_TIMEOUT_US = 50000
+
+; The speed each engine is currently set to, so GeniI2cGetSpeed() can
+; answer without re-deriving it from the counter register. Index is the
+; engine number 0..5.
+Global Dim geni_i2c_speed.i(#GENI_SE_MAX)
+
+; ----------------------------------------------------------------------
+;  GeniSeBase(se) - the MMIO base of serial engine `se`, or 0 if there is
+;  no such engine on this part.
+; ----------------------------------------------------------------------
+Procedure.i GeniSeBase(se.i)
+  If se < 0 Or se > #GENI_SE_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #GENI_SE0_BASE + (se * #GENI_SE_STRIDE)
+EndProcedure
+
+Procedure.i GeniReadReg(addr.i)
+  ProcedureReturn PeekN(addr) & $FFFFFFFF
+EndProcedure
+
+Procedure GeniWriteReg(addr.i, val.i)
+  PokeN(addr, val & $FFFFFFFF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniSeFwRevision(se) - the raw GENI_FW_REVISION_RO word, or -1 for a
+;  bad engine number. Exposed because a diagnostic wants to PRINT it: the
+;  difference between "0x0303" and "0x0000" is the difference between a
+;  live I2C engine and a dead read, and a caller that can only ask
+;  "is it I2C?" cannot tell a reader which of those it saw.
+; ----------------------------------------------------------------------
+Procedure.i GeniSeFwRevision(se.i)
+  Define b.i
+  b = GeniSeBase(se)
+  If b = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn GeniReadReg(b + #GENI_FW_REVISION_RO)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniSeProto(se) - the protocol number the engine's firmware
+;  implements, or -1 for a bad engine or an implausible read.
+;
+;  THE IMPLAUSIBILITY TEST IS THE POINT. A read from an engine whose
+;  clock is off comes back all-zeros or all-ones. Taken at face value
+;  those decode as protocol 0 (NONE) and protocol 255 (INVALID) - both
+;  legal-looking values that would send a caller down the wrong path.
+;  A real firmware revision word has a non-zero VERSION in its low byte
+;  as well as a protocol in bits 15:8 (the board reads 0x0303 and 0x0204,
+;  never 0x0300), so requiring the whole word to be neither 0 nor
+;  $FFFFFFFF distinguishes "clock off" from "no firmware", which are
+;  different problems with different fixes.
+; ----------------------------------------------------------------------
+Procedure.i GeniSeProto(se.i)
+  Define v.i
+  v = GeniSeFwRevision(se)
+  If v < 0
+    ProcedureReturn -1
+  EndIf
+  If v = 0 Or v = $FFFFFFFF
+    ProcedureReturn -1         ; dead read - clock off, not "no firmware"
+  EndIf
+  ProcedureReturn (v >> #GENI_FW_PROTO_SHIFT) & #GENI_FW_PROTO_MASK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cPresent(se) - 1 if this engine is a usable I2C master right
+;  now, 0 otherwise. The gate every entry point below goes through, and
+;  the reason no I2C register is ever written into a UART engine.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cPresent(se.i)
+  If GeniSeProto(se) = #GENI_PROTO_I2C
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniWrapperHwVer() - the wrapper's own version register. Non-zero
+;  means the wrapper AHB clocks are running, which is the precondition
+;  for every engine read. A diagnostic prints this FIRST, because if it
+;  is zero nothing else below can be believed.
+; ----------------------------------------------------------------------
+Procedure.i GeniWrapperHwVer()
+  ProcedureReturn GeniReadReg(#GENI_WRAP_BASE + #GENI_WRAP_HW_VER)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SCL COUNTERS.
+;
+;  i2c-qcom-geni.c:182-187 gives the table for a 19.2 MHz source clock,
+;  as {clk_freq_out, clk_div, t_high_cnt, t_low_cnt, t_cycle_cnt}:
+;
+;      100 kHz   div 7   high 10   low 12   cycle 26
+;      400 kHz   div 2   high  5   low 11   cycle 22
+;        1 MHz   div 1   high  2   low  8   cycle 18
+;
+;  and the arithmetic that justifies them (the comment at :175-181):
+;      clk_freq_out = source_clock / clk_div / t_cycle_cnt
+;  which checks out - 19.2e6 / 7 / 26 = 105.5 kHz for the first row.
+;
+;  ***THE 19.2 MHz TABLE IS THE RIGHT ONE ONLY IF THE SOURCE IS 19.2 MHz.***
+;  There is a second table for a 32 MHz source (:190-194) and Linux picks
+;  between them by asking the clock framework
+;  (geni_i2c_clk_map_idx(), :196-214). Anvil has no clock framework and
+;  cannot ask. It assumes 19.2 MHz, which is the QCM2290's XO and the
+;  default the DTS does not override - and if that assumption is wrong
+;  the consequence is bounded and visible: the bus runs at 0.6x the
+;  requested rate, transfers still work, and nothing is damaged. It is
+;  called out here because a bus measured at 60 kHz when 100 kHz was
+;  asked for is this line, not a fault.
+;
+;  Returns the packed SE_I2C_SCL_COUNTERS value, with the divider in the
+;  high bits of the return so one call yields both. -1 for an
+;  unsupported rate: only the three the table names are offered, because
+;  interpolating between them would be inventing timing the vendor did
+;  not characterise.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cClkDiv(hz.i)
+  If hz = 100000
+    ProcedureReturn 7
+  EndIf
+  If hz = 400000
+    ProcedureReturn 2
+  EndIf
+  If hz = 1000000
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i GeniI2cSclCounters(hz.i)
+  If hz = 100000
+    ProcedureReturn (10 << #GENI_I2C_HIGH_CNT_SHIFT) | (12 << #GENI_I2C_LOW_CNT_SHIFT) | 26
+  EndIf
+  If hz = 400000
+    ProcedureReturn (5 << #GENI_I2C_HIGH_CNT_SHIFT) | (11 << #GENI_I2C_LOW_CNT_SHIFT) | 22
+  EndIf
+  If hz = 1000000
+    ProcedureReturn (2 << #GENI_I2C_HIGH_CNT_SHIFT) | (8 << #GENI_I2C_LOW_CNT_SHIFT) | 18
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cIrqClear(base) - clear every latched interrupt status on the
+;  engine. qcom-geni-se.c:341-349 does exactly this set; we skip the
+;  SE_IRQ_EN write it ends with, because that ENABLES interrupt delivery
+;  and Anvil polls - there is no GIC path here and an SE raising a real
+;  interrupt line into a system with no handler is a hazard, not a help.
+; ----------------------------------------------------------------------
+Procedure GeniI2cIrqClear(base.i)
+  GeniWriteReg(base + #GENI_GSI_EVENT_EN, 0)
+  GeniWriteReg(base + #GENI_M_IRQ_CLEAR, $FFFFFFFF)
+  GeniWriteReg(base + #GENI_S_IRQ_CLEAR, $FFFFFFFF)
+  GeniWriteReg(base + #GENI_DMA_TX_IRQ_CLR, $FFFFFFFF)
+  GeniWriteReg(base + #GENI_DMA_RX_IRQ_CLR, $FFFFFFFF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cInit(se, hz) - bring an I2C engine up at `hz`. 1 on success,
+;  0 on refusal. Idempotent, so a caller may call it before every
+;  operation without tracking state.
+;
+;  REFUSES, loudly and early, rather than half-configuring:
+;    * an engine number that does not exist
+;    * an engine whose firmware is not I2C (a UART engine, notably SE4 -
+;      the console; writing I2C clock config into it would take the
+;      transcript down mid-session)
+;    * an engine with the FIFO interface fused off, since this driver has
+;      no DMA path to fall back to (i2c-qcom-geni.c:1065)
+;    * a speed outside the three the vendor table characterises
+;
+;  The write order follows qcom_geni_i2c_conf() (i2c-qcom-geni.c:216-235)
+;  and geni_se_init() (qcom-geni-se.c:360-378), minus the interrupt
+;  enables.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cInit(se.i, hz.i)
+  Define base.i
+  Define div.i
+  Define scl.i
+  Define v.i
+
+  base = GeniSeBase(se)
+  If base = 0
+    ProcedureReturn 0
+  EndIf
+  If GeniI2cPresent(se) = 0
+    ProcedureReturn 0          ; not an I2C engine, or the clock is off
+  EndIf
+
+  div = GeniI2cClkDiv(hz)
+  scl = GeniI2cSclCounters(hz)
+  If div < 0 Or scl < 0
+    ProcedureReturn 0
+  EndIf
+
+  If GeniReadReg(base + #GENI_IF_DISABLE_RO) & #GENI_FIFO_IF_DISABLE
+    ProcedureReturn 0          ; FIFO fused off; only DMA would work
+  EndIf
+
+  GeniI2cIrqClear(base)
+
+  ; geni_se_io_init - qcom-geni-se.c:324-339. DEFAULT_CGC_EN and
+  ; DEFAULT_IO_OUTPUT_CTRL_MSK are both GENMASK(6,0) = $7F
+  ; (qcom-geni-se.c:243, :255); the DMA_GENERAL_CFG bits are :270-273.
+  v = GeniReadReg(base + #GENI_CGC_CTRL)
+  GeniWriteReg(base + #GENI_CGC_CTRL, v | $7F)
+  v = GeniReadReg(base + #GENI_DMA_GENERAL_CFG)
+  GeniWriteReg(base + #GENI_DMA_GENERAL_CFG, v | $F)
+  GeniWriteReg(base + #GENI_OUTPUT_CTRL, $7F)
+  GeniWriteReg(base + #GENI_FORCE_DEFAULT_REG, 1)
+
+  ; FIFO mode, not DMA - clear GENI_DMA_MODE_EN (qcom-geni-se.c:398-401).
+  v = GeniReadReg(base + #GENI_DMA_MODE_EN)
+  GeniWriteReg(base + #GENI_DMA_MODE_EN, v & ~(#GENI_DMA_MODE_BIT))
+
+  ; Four bytes per FIFO word, both directions. See THE FIFO PACKING WORDS.
+  GeniWriteReg(base + #GENI_TX_PACKING_CFG0, #GENI_PACK_CFG0)
+  GeniWriteReg(base + #GENI_TX_PACKING_CFG1, #GENI_PACK_CFG1)
+  GeniWriteReg(base + #GENI_RX_PACKING_CFG0, #GENI_PACK_CFG0)
+  GeniWriteReg(base + #GENI_RX_PACKING_CFG1, #GENI_PACK_CFG1)
+
+  ; The clock. i2c-qcom-geni.c:221-228.
+  GeniWriteReg(base + #GENI_CLK_SEL, 0)
+  GeniWriteReg(base + #GENI_SER_M_CLK_CFG, (div << #GENI_CLK_DIV_SHIFT) | #GENI_SER_CLK_EN)
+  GeniWriteReg(base + #GENI_I2C_SCL_COUNTERS, scl)
+
+  ; Watermarks. TX 0 so nothing is requested until a transfer asks for
+  ; it; RX 0 so a single byte is visible immediately rather than waiting
+  ; for a fuller FIFO - this driver polls the word count directly.
+  GeniWriteReg(base + #GENI_TX_WATERMARK_REG, 0)
+  GeniWriteReg(base + #GENI_RX_WATERMARK_REG, 0)
+  GeniWriteReg(base + #GENI_RX_RFR_WATERMARK, 0)
+
+  geni_i2c_speed(se) = hz
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cMapStatus(st) - turn a latched M_IRQ_STATUS into a result code.
+;
+;  The decode follows the branch order of Linux's own handler
+;  (i2c-qcom-geni.c:317-330), which is the authority on which bit means
+;  what:
+;      M_GP_IRQ_1  -> a NACK, address or data (:317-318)
+;      M_GP_IRQ_3  -> bus protocol error, "noisy/unexpected start/stop"
+;      M_GP_IRQ_4  -> arbitration lost, "clock line undriveable"
+;      M_CMD_OVERRUN / M_ILLEGAL_CMD / M_CMD_ABORT -> engine-level faults
+;      M_GP_IRQ_0  -> the vendor's own "Unknown I2C err"
+;
+;  NACK IS TESTED FIRST because it is the ONLY one of these that is a
+;  normal, expected answer: a bus scan NACKs at every address where no
+;  device lives, and reporting that as a protocol error would make an
+;  empty address look like a broken bus.
+;
+;  Address-NACK and data-NACK share M_GP_IRQ_1 and Linux separates them
+;  by re-reading the transfer state (geni_i2c_check_addr_data_nack). Both
+;  map to #GENI_I2C_NACK here, so the distinction buys nothing and is not
+;  drawn - saying so explicitly because a reader who knows the Linux
+;  driver will look for it.
+;
+;  Arbitration-lost is mapped to #GENI_I2C_TIMEOUT rather than invented
+;  into the NACK bucket: on a single-master bus it means SCL or SDA is
+;  being held down by something, which is the wedged-bus condition, not
+;  an absent device.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cMapStatus(st.i)
+  If st & #GENI_M_GP_IRQ_1
+    ProcedureReturn #GENI_I2C_NACK
+  EndIf
+  If st & #GENI_M_GP_IRQ_4
+    ProcedureReturn #GENI_I2C_TIMEOUT   ; arbitration lost - bus held
+  EndIf
+  If st & #GENI_M_GP_IRQ_3
+    ProcedureReturn #GENI_I2C_TIMEOUT   ; bus protocol error
+  EndIf
+  If st & (#GENI_M_CMD_OVERRUN | #GENI_M_ILLEGAL_CMD | #GENI_M_CMD_ABORT | #GENI_M_CMD_FAILURE)
+    ProcedureReturn #GENI_I2C_TIMEOUT
+  EndIf
+  If st & #GENI_M_GP_IRQ_0
+    ProcedureReturn #GENI_I2C_TIMEOUT
+  EndIf
+  ProcedureReturn #GENI_I2C_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Every bit that means the command did not simply succeed. Written as
+;  one literal because a constant here may not carry an expression, so
+;  the sum is done by hand - and therefore shown, bit by bit, so it can
+;  be checked without re-deriving it:
+;
+;      $00000002  bit  1  M_CMD_OVERRUN
+;      $00000004  bit  2  M_ILLEGAL_CMD
+;      $00000008  bit  3  M_CMD_FAILURE
+;      $00000020  bit  5  M_CMD_ABORT
+;      $00000200  bit  9  M_GP_IRQ_0   vendor's "unknown I2C err"
+;      $00000400  bit 10  M_GP_IRQ_1   NACK
+;      $00001000  bit 12  M_GP_IRQ_3   bus protocol error
+;      $00002000  bit 13  M_GP_IRQ_4   arbitration lost
+;      ---------
+;      $0000362E
+;
+;  BIT 11 (M_GP_IRQ_2) IS DELIBERATELY ABSENT. It is not in Linux's
+;  SE_I2C_ERR set (i2c-qcom-geni.c:28-29) and its handler never decodes
+;  it, so folding it in would turn a bit nobody has characterised into a
+;  transfer failure. The first draft of this line had it, from writing
+;  $3E00 for "bits 9 to 13" instead of adding the four bits that are
+;  actually listed - which is exactly the kind of near-miss a spelled-out
+;  sum is here to prevent.
+; ----------------------------------------------------------------------
+#GENI_I2C_ERR_MASK = $362E
+
+; ----------------------------------------------------------------------
+;  GeniI2cStartCmd(base, op, addr) - launch a primary-sequencer command.
+;
+;  m_param carries the 7-bit slave address at bit 9 (SLV_ADDR_SHFT,
+;  i2c-qcom-geni.c:47-48) and NO STOP_STRETCH, because every transaction
+;  this driver issues is complete in itself and ends in a STOP - see NO
+;  REPEATED START in the header. The opcode goes in bits 31:27
+;  (geni-se.h:392-398).
+; ----------------------------------------------------------------------
+Procedure GeniI2cStartCmd(base.i, op.i, addr.i)
+  Define m.i
+  m = (op << #GENI_M_OPCODE_SHIFT) | ((addr << #GENI_I2C_SLV_ADDR_SHIFT) & $FE00)
+  GeniWriteReg(base + #GENI_M_CMD0, m)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cWaitDone(base) - poll M_IRQ_STATUS until the command completes
+;  or faults, bounded by #GENI_I2C_TIMEOUT_US. Returns the latched status
+;  word, or -1 if the bound was reached.
+;
+;  Polling rather than waiting on an interrupt is not a shortcut: there
+;  is no GIC bring-up on this board and no handler to run. The bound is
+;  what makes polling safe - see the interconnect note in the header for
+;  the specific failure it is defending against.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cWaitDone(base.i)
+  Define t0.i
+  Define st.i
+  t0 = HwTimerUs()
+  Repeat
+    st = GeniReadReg(base + #GENI_M_IRQ_STATUS)
+    If st & (#GENI_M_CMD_DONE | #GENI_I2C_ERR_MASK)
+      ProcedureReturn st
+    EndIf
+    If (HwTimerUs() - t0) > #GENI_I2C_TIMEOUT_US
+      ProcedureReturn -1
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cFinish(base, st) - clear the latched status and turn it into a
+;  result code. Called on every exit path so the next transaction starts
+;  from a clean status register; a stale NACK left latched would be read
+;  as this transaction's failure.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cFinish(base.i, st.i)
+  If st < 0
+    GeniWriteReg(base + #GENI_M_IRQ_CLEAR, $FFFFFFFF)
+    ProcedureReturn #GENI_I2C_TIMEOUT
+  EndIf
+  GeniWriteReg(base + #GENI_M_IRQ_CLEAR, st)
+  ProcedureReturn GeniI2cMapStatus(st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cProbe(se, addr) - is anything answering at this 7-bit address?
+;
+;  Uses I2C_ADDR_ONLY (opcode 4, i2c-qcom-geni.c:36), which drives START,
+;  the address byte and STOP and nothing else. THAT CHOICE MATTERS: the
+;  usual alternatives both have side effects. A one-byte write puts a
+;  stray byte into whatever register pointer the device happens to have,
+;  and a one-byte read advances some devices' internal pointer. On a bus
+;  carrying a display bridge and seven unidentified devices, a scan that
+;  writes is a scan that can reconfigure something. An address-only cycle
+;  cannot.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cProbe(se.i, addr.i)
+  Define base.i
+  Define st.i
+  If addr < 0 Or addr > $7F
+    ProcedureReturn #GENI_I2C_ARG
+  EndIf
+  base = GeniSeBase(se)
+  If base = 0 Or GeniI2cPresent(se) = 0
+    ProcedureReturn #GENI_I2C_NOBUS
+  EndIf
+
+  GeniWriteReg(base + #GENI_M_IRQ_CLEAR, $FFFFFFFF)
+  GeniI2cStartCmd(base, #GENI_I2C_OP_ADDR_ONLY, addr)
+  st = GeniI2cWaitDone(base)
+  ProcedureReturn GeniI2cFinish(base, st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cWrite(se, addr, *buf, n) - one transaction: START, address+W,
+;  n bytes, STOP.
+;
+;  The bytes go out four to a FIFO word, byte 0 in bits 7:0, which is the
+;  packing configured in GeniI2cInit and confirmed by the order Linux
+;  reads them back in (i2c-qcom-geni.c:344-347).
+;
+;  TX_TRANS_LEN is written BEFORE the command is launched
+;  (i2c-qcom-geni.c:541-542): the engine needs to know the length to
+;  decide when to put the STOP on the bus. Launching first and declaring
+;  the length afterwards produces a transaction of the wrong shape.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cWrite(se.i, addr.i, *buf, n.i)
+  Define base.i
+  Define st.i
+  Define i.i
+  Define w.i
+  Define k.i
+  Define t0.i
+
+  If addr < 0 Or addr > $7F Or n < 0
+    ProcedureReturn #GENI_I2C_ARG
+  EndIf
+  base = GeniSeBase(se)
+  If base = 0 Or GeniI2cPresent(se) = 0
+    ProcedureReturn #GENI_I2C_NOBUS
+  EndIf
+  If n = 0
+    ProcedureReturn GeniI2cProbe(se, addr)   ; a zero-byte write IS a probe
+  EndIf
+
+  GeniWriteReg(base + #GENI_M_IRQ_CLEAR, $FFFFFFFF)
+  GeniWriteReg(base + #GENI_I2C_TX_TRANS_LEN, n)
+  GeniI2cStartCmd(base, #GENI_I2C_OP_WRITE, addr)
+
+  i = 0
+  While i < n
+    ; Pack up to four bytes, low byte first.
+    w = 0
+    k = 0
+    While k < 4 And (i + k) < n
+      w = w | (PeekB(*buf + i + k) << (k * 8))
+      k = k + 1
+    Wend
+
+    ; Wait for room in the TX FIFO before pushing the word. A wedged bus
+    ; must not spin here for ever, so the same bound applies.
+    t0 = HwTimerUs()
+    Repeat
+      st = GeniReadReg(base + #GENI_M_IRQ_STATUS)
+      If st & #GENI_I2C_ERR_MASK
+        ProcedureReturn GeniI2cFinish(base, st)
+      EndIf
+      If (GeniReadReg(base + #GENI_TX_FIFO_STATUS) & $FFFFFFF) < 16
+        Break
+      EndIf
+      If (HwTimerUs() - t0) > #GENI_I2C_TIMEOUT_US
+        ProcedureReturn GeniI2cFinish(base, -1)
+      EndIf
+    ForEver
+
+    GeniWriteReg(base + #GENI_TX_FIFO, w)
+    i = i + k
+  Wend
+
+  st = GeniI2cWaitDone(base)
+  ProcedureReturn GeniI2cFinish(base, st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GeniI2cRead(se, addr, *buf, n) - one transaction: START, address+R,
+;  n bytes, STOP.
+;
+;  RX_TRANS_LEN before the command, for the same reason TX_TRANS_LEN is
+;  (i2c-qcom-geni.c:502-503): the engine places the NACK on the final
+;  byte and the STOP after it, and it can only do that if it knows how
+;  many bytes the transaction is.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cRead(se.i, addr.i, *buf, n.i)
+  Define base.i
+  Define st.i
+  Define got.i
+  Define w.i
+  Define k.i
+  Define wc.i
+  Define t0.i
+
+  If addr < 0 Or addr > $7F Or n <= 0
+    ProcedureReturn #GENI_I2C_ARG
+  EndIf
+  base = GeniSeBase(se)
+  If base = 0 Or GeniI2cPresent(se) = 0
+    ProcedureReturn #GENI_I2C_NOBUS
+  EndIf
+
+  GeniWriteReg(base + #GENI_M_IRQ_CLEAR, $FFFFFFFF)
+  GeniWriteReg(base + #GENI_I2C_RX_TRANS_LEN, n)
+  GeniI2cStartCmd(base, #GENI_I2C_OP_READ, addr)
+
+  got = 0
+  t0 = HwTimerUs()
+  While got < n
+    st = GeniReadReg(base + #GENI_M_IRQ_STATUS)
+    If st & #GENI_I2C_ERR_MASK
+      ProcedureReturn GeniI2cFinish(base, st)
+    EndIf
+
+    wc = GeniReadReg(base + #GENI_RX_FIFO_STATUS) & #GENI_RX_FIFO_WC_MASK
+    If wc > 0
+      w = GeniReadReg(base + #GENI_RX_FIFO)
+      k = 0
+      While k < 4 And got < n
+        PokeB(*buf + got, w & $FF)
+        w = w >> 8
+        got = got + 1
+        k = k + 1
+      Wend
+      t0 = HwTimerUs()         ; progress - restart the patience
+    Else
+      If (HwTimerUs() - t0) > #GENI_I2C_TIMEOUT_US
+        ProcedureReturn GeniI2cFinish(base, -1)
+      EndIf
+    EndIf
+  Wend
+
+  st = GeniI2cWaitDone(base)
+  ProcedureReturn GeniI2cFinish(base, st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Speed. GeniI2cSetSpeed re-runs the clock configuration; the achieved
+;  rate is returned so the caller can print what it actually got rather
+;  than what it asked for.
+; ----------------------------------------------------------------------
+Procedure.i GeniI2cSetSpeed(se.i, hz.i)
+  If GeniI2cInit(se, hz) = 0
+    ProcedureReturn #GENI_I2C_ARG
+  EndIf
+  ProcedureReturn hz
+EndProcedure
+
+Procedure.i GeniI2cGetSpeed(se.i)
+  If se < 0 Or se > #GENI_SE_MAX
+    ProcedureReturn #GENI_I2C_NOBUS
+  EndIf
+  ProcedureReturn geni_i2c_speed(se)
+EndProcedure

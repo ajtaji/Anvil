@@ -1,0 +1,830 @@
+; ======================================================================
+;  ecdsa.pi4 - ECDSA signature VERIFY on P-256, ON THE RASPBERRY PI 4
+;              (BCM2711, AArch64)
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2016-2017 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "RaspberryPi4/Lib/bignum.pi4"   ; REQUIRED, first
+;     XIncludeFile "RaspberryPi4/Lib/ec256.pi4"    ; REQUIRED, second
+;     XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
+;
+;  ECDSA signature verification on the NIST P-256 (secp256r1) curve, in
+;  both signature encodings a TLS client meets:
+;    * RAW  - r || s, two fixed-width big-endian integers (64 bytes for
+;             P-256).  Used by TLS 1.2's own signature format in some
+;             profiles and by the NIST CAVP vector files.
+;    * ASN.1 DER - SEQUENCE { INTEGER r, INTEGER s }.  This is what X.509
+;             certificates carry and what TLS 1.3 CertificateVerify uses,
+;             so it is the encoding the certificate path validator calls.
+;  Translated from the BearSSL "ecdsa_i15" verify path to the house
+;  dialect.  Reads-and-translates only: no C is linked, no foreign ABI is
+;  followed.  VERIFY ONLY - there is no private key, no signing, no
+;  nonce, and no random number generator anywhere in this file.
+;
+;  REQUIRES bignum.pi4 AND ec256.pi4, INCLUDED BEFORE THIS FILE, IN THAT
+;  ORDER.  A library never includes a library (house rule 10 - the MAIN
+;  file lists them, one per line, in order).  The modular arithmetic on
+;  the curve order rides bignum's i15 core (BnDecode, BnEncode, BnSub,
+;  BnZero, BnRshift, BnIsZero, BnNinv15, BnMontmul, BnFromMonty,
+;  BnModpow, BnNot, BnGw, BnSw); the point work rides ec256 (EcInit,
+;  EcPointDecode, EcPointMul, EcPointAdd, EcPointDouble, EcPointCcopy,
+;  EcPointEncode, EcCoord, EcGen, and the #EC_WORDS layout constant).  A
+;  missing dependency fails loudly at compile time with an
+;  undefined-procedure error, which names the gap.
+;
+;  API:
+;    EcdsaInit()
+;        Load the curve order and build the inversion exponent.  Also
+;        performs EcInit(), so a main that calls both is harmless.  Every
+;        entry point below self-initialises if this has not been called,
+;        because a verifier that answered from an uninitialised table
+;        would be the silent wrong answer, not a loud one.
+;
+;    EcdsaVrfyRaw(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;        -> 1 valid / 0 rejected.  Raw r||s signature of sigLen bytes
+;        (sigLen must be even; each half is one integer).  qAddr/qLen is
+;        the uncompressed public point 0x04||X||Y, 65 bytes.
+;
+;    EcdsaVrfyAsn1(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;        -> 1 valid / 0 rejected.  ASN.1 DER SEQUENCE{INTEGER r,
+;        INTEGER s}.  The caller's buffer is NOT modified: the signature
+;        is copied into module scratch before conversion.
+;
+;    EcdsaAsn1ToRaw(bufAddr, sigLen) -> raw length, or 0 if malformed
+;        In-place DER -> r||s conversion on the CALLER's buffer, for a
+;        caller that already owns a scratch copy.
+;
+;    EcdsaVrfy(curve, hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;        -> 1 valid / 0 rejected / -1 cannot answer
+;        THE CERTIFICATE-PATH SEAM.  This is the exact shape the X.509
+;        path validator calls; when this file is present ahead of it and
+;        the main defines #X509_SIG_LINKED = 1, the validator's stub is
+;        compiled out and its ECDSA verdicts go live.  curve is the named
+;        curve id: 23 = P-256 (implemented), 24 = P-384, 25 = P-521.
+;        The signature is ASN.1 DER, as it is in a certificate.
+;
+;    EcdsaLastErr - the reason for the last answer, for diagnosis only:
+;        0 valid, 1 signature rejected, 2 curve not supported,
+;        3 signature encoding malformed.
+;
+;  > THE VERDICT OF EcdsaVrfyRaw / EcdsaVrfyAsn1 IS 1 OR 0 AND MUST BE
+;  > TESTED AS `= 1`.  EcdsaVrfy adds -1.  These are FLAGS, not masks -
+;  > unlike GcmDecrypt's verdict, which is a mask and must be tested as
+;  > `= $FFFFFFFF`.  Three verdict conventions now live in one crypto
+;  > family on this part, so it is written here as well as there.  A
+;  > caller that tests an ECDSA verdict as "non-zero" ACCEPTS -1, which
+;  > means it treats "I cannot compute this curve" as "valid".
+;
+;  P-384 AND P-521 ARE NOT IMPLEMENTED, AND SAY SO.  A request for curve
+;  24 or 25 returns -1 with EcdsaLastErr = 2.  It never returns 0,
+;  because 0 means "this signature is bad" and answering that about a
+;  curve this module cannot compute would be a wrong answer wearing a
+;  verdict's clothes.  The path validator turns -1 into its loud
+;  "signature engine cannot answer" verdict rather than accepting or
+;  rejecting the chain.
+;
+;  NOT CONSTANT TIME, AND IT DOES NOT NEED TO BE.  Everything this file
+;  touches is public: the signature travelled in clear on the wire, the
+;  public key is published in the certificate, and the message hash is
+;  computed from data both peers hold.  There is no secret to leak, so
+;  the ASN.1 walk and the length checks use ordinary control flow.  The
+;  two scalar multiplies underneath are ec256's constant-time ladder
+;  anyway (it has one shape, and it is the safe one), and the order
+;  inversion rides bignum's constant-time Montgomery ladder for the same
+;  reason.  NEITHER THE PICO FAMILIES NOR THIS ONE CARRIES A CT GATE FOR
+;  THIS MODULE, and tools/a64/a64_ecdsa_check.py has no --timing for the
+;  same reason: inventing one here would be measuring a property nobody
+;  claims.
+;
+;  STRICTER THAN THE SOURCE ON DER, DELIBERATELY.  The reference
+;  conversion is documented as lenient - it accepts a few unambiguous
+;  deviations from DER (a long-form length where a short one would do, an
+;  INTEGER whose top bit is set and which therefore encodes a negative
+;  value).  Certificates and TLS 1.3 both mandate DER, and every real
+;  signer emits it, so this translation REFUSES those forms instead:
+;  non-minimal length encoding, the 0x80 indefinite-length marker, an
+;  empty INTEGER, an INTEGER with its high bit set (a negative value), a
+;  non-minimal leading zero byte, a truncated INTEGER, and any trailing
+;  byte after the second INTEGER.  A malformed encoding is refused as
+;  malformed rather than reinterpreted into a value the signer did not
+;  write.
+;
+;  THIS FILE RELIES ON EnableExplicit being ON (bignum.pi4 turns it on
+;  for the whole program).  Every variable below is declared before use.
+;
+;  The curve order lives in a DataSection and is read LONGHAND, one byte
+;  at a time - an untyped Read once stepped a fixed two bytes at every
+;  width, so the width is written out at every read.
+;
+;  ======================================================================
+;   .i IS 64 BITS HERE.  THE FOUR-SHAPE AUDIT, PLUS THE FIFTH
+;  ======================================================================
+;
+;  THE BODY BETWEEN THE MARKERS IS THE 32-BIT PORTABLE CORE, UNCHANGED,
+;  BYTE FOR BYTE.  That is the finding, not a shortcut: the audit came
+;  back clean at every one of the five shapes, and the reason is
+;  structural rather than lucky - see "WHY NOTHING CHANGED" below.  (The
+;  same is true of rsa.pi4, for the same structural reason; both sit on
+;  top of the file that paid for the width.)  The markers are renamed to
+;  A64 anyway, because the checker's rule is that a family which cannot
+;  promise byte-identity renames rather than quietly edits, and because
+;  the next person to touch this file must not be able to add a 32-bit
+;  idiom to it under a 32-bit marker.
+;
+;  Every shape was looked for line by line.  A silence is not a result,
+;  so each is recorded even where the answer is "not present".
+;
+;  SHAPE 1 - AN ARRAY ELEMENT IS EIGHT BYTES, NOT FOUR.
+;      LOOKED FOR, AND THE FILE WAS ALREADY SAFE - AND THE DECLARATIONS
+;      ARE LOAD-BEARING, exactly as they are in ec256.pi4.  There are
+;      fourteen arrays here and not one of them is `.i`: five are `.w`
+;      (16-bit) i15 buffers over the curve order, seven are `.a` (8-bit)
+;      byte buffers, and EcdsaPpt/EcdsaQpt are `.w` arrays of
+;      3 * #EC_WORDS.  `.w`, `.u`, `.a` and `.b` are the SAME width on
+;      this part as on a Pico; only `.i`, `.l` and `.n` change.
+;        * the five i15 buffers are handed to bignum.pi4, which addresses
+;          word i at base + i*2 through PeekU/PokeW.  bignum's header
+;          says in as many words that a caller must not declare them
+;          `.i`; this is that caller.
+;        * EcdsaPpt and EcdsaQpt are worse, because they are laid out by
+;          SOMEBODY ELSE's arithmetic: ec256's EcRegP computes a register
+;          address as `r * (#EC_WORDS << 1)`, which assumes a two-byte
+;          word.  A `.i` here would make every coordinate address wrong
+;          by a factor of four while still compiling cleanly.
+;      "TIDYING" ANY OF THESE TO `.i` IS THE BUG.  Mutation M1 in the
+;      gate is that tidy-up on EcdsaN and M2 is the same on EcdsaPpt, and
+;      the sweep watches both die.
+;
+;  SHAPE 2 - PeekL SIGN-EXTENDS.
+;      NOT PRESENT, AND THIS IS THE MODULE WHERE IT WOULD HAVE HURT MOST.
+;      ASN.1/DER parsing is nothing BUT byte reads, and a length byte of
+;      $80 read signed is -128, not 128 - which would turn "is this the
+;      indefinite-length marker" into a comparison that never fires.
+;      There are 23 byte reads in this file and EVERY ONE of them is
+;      PeekA (unsigned 8-bit, zero-extending on every backend since the
+;      2026-08-25 unsigned-ladder ruling), AND every one is additionally
+;      masked at the point of use with `& 255` or `& 128`.  There is no
+;      PeekL, no PeekB, no PeekW and no PeekN anywhere in the file.
+;        THE MASK IS THE BELT AND PeekA IS THE BRACES, and the sweep
+;        measured which of the two is actually holding the trousers up.
+;        Mutation M3 drops BOTH on EcdsaDecodeMod's byte read - the ONE
+;        place in the file where a byte's value flows into arithmetic
+;        rather than straight back out through a PokeB or into a masked
+;        comparison - and it dies on the first vector, because r's
+;        leading byte is $EF.  Mutation M4 drops both on the DER
+;        SEQUENCE length byte and SURVIVES, and the reason is worth more
+;        than the kill: a sign-extended length differs from an unsigned
+;        one only at $80 and above, and every encoding in that range
+;        that this table contains is one the strict parser must refuse
+;        anyway.  It changes WHICH line refuses them, not the verdict
+;        and not EcdsaLastErr.  Recorded, with the argument, in the
+;        gate's table.
+;      The one non-PeekA read is `Read.b bb` in EcdsaReadBytes, walking
+;      the curve-order DataSection; the byte is masked `& 255` at the
+;      PokeB it feeds, and PokeB truncates to eight bits regardless, so
+;      the width of the read cannot escape that statement.
+;
+;  SHAPE 3 - `<<` DOES NOT DISCARD AT BIT 31.
+;      NOT PRESENT, AND THE DER WALK IS WHY.  The dangerous site in any
+;      DER parser is the multi-byte length assembly, which shifts an
+;      accumulator left once per length byte; on a 64-bit `.i` that
+;      accumulator no longer wraps and a hostile 8-byte length is no
+;      longer folded into something small.  THIS PARSER HAS NO SUCH
+;      LOOP: it accepts the short form and the single long form 0x81 and
+;      refuses everything else outright (the strictness argued above),
+;      so the shift that would need the mask was never written.  The
+;      four left shifts that do exist are `mlen << 1` (at most 36),
+;      `bb << accLen` with bb <= 255 and accLen < 15 (at most 2^22),
+;      `len << 3` on a hash length, and `zlen << 1` on a DER integer
+;      width under 128.  None can reach bit 31, let alone pass it.
+;      MUTATION M5 PLANTS THE MISSING SITE rather than arguing about
+;      it: it gives the parser the lenient multi-byte length assembly
+;      the reference has, `zlen = (zlen << 8) | byte` in a loop, and the
+;      shared table's over-long-length and non-minimal-length records
+;      kill it immediately.  That is the shape the mask would have been
+;      needed for, and the reason it is absent is that the encoding it
+;      parses is refused.
+;
+;  SHAPE 4 - A 32-BIT COUNTER NEVER WRAPS.
+;      NOT PRESENT, AND THERE IS NOTHING HONEST TO PLANT.  Every counter
+;      here is a loop index over a public length bounded by
+;      #ECDSA_RAWMAX (300), 65 or 32.  Nothing counts messages, blocks
+;      or bytes across calls, and nothing in the file relies on a wrap
+;      for its correctness, so a "wrapping counter" mutation would be
+;      fiction written in order to be killed.  The nearest reachable
+;      relative is the bound the file DOES carry - EcdsaAsn1ToRaw's
+;      refusal to emit more than #ECDSA_RAWMAX bytes - and mutation M9
+;      removes it and is an EXPECTED SURVIVOR: the DER walk has already
+;      capped each integer at 127 bytes by refusing the long form, so
+;      254 is the most the converter can ever produce.  Reasoning, not
+;      a reproduction, and labelled as such in the gate.
+;
+;  ---- THE FIFTH SHAPE, WHICH IS THE ONE THAT ACTUALLY BITES -----------
+;
+;  `>> 31` AS A SIGN TEST AND `x ! $FFFFFFFF` AS A LOGICAL NOT.
+;      ZERO SITES OF EITHER, IN A VERDICT FUNCTION.  This is the shape
+;      that made GcmDecrypt hand back $FFFFFFFF00000000 for a FORGED TAG
+;      - not zero, so a caller asking "is it non-zero" accepted the
+;      forgery - and ECDSA verify is the verdict function of the whole
+;      certificate path, so it was searched for first and hardest.
+;        * `>> 31`: not once in the file.
+;        * `! $FFFFFFFF`: not once in the BODY.  The 32-bit copies'
+;          headers announce it as the house spelling of bitwise NOT, and
+;          then do not use it: every logical NOT in the core is bignum's
+;          BnNot(), which is width-correct here because bignum.pi4 fixed
+;          it.  Four sites - BnNot(over) in EcdsaDecodeMod, BnNot(t)
+;          and BnNot(z & t) in EcdsaMuladd, and BnNot(BnSub(...)) in
+;          EcdsaVrfyRaw.
+;        * the only XOR in the file is `borrow ! 1`, twice, in
+;          EcdsaVrfyRaw's conditional-subtraction pair.  borrow is
+;          BnSub's 0-or-1 return and 1 is one bit wide, so this is
+;          width-independent by construction, not by luck.  It is
+;          BnNot(borrow) written inline: BnNot IS `ctl ! 1`.
+;
+;      WHERE THIS SHAPE WOULD AND WOULD NOT BE FATAL HERE, MEASURED.
+;      The gate plants it three times and the three answers are not the
+;      same answer, which is the point of planting it three times.
+;        * M6 respells EcdsaVrfyRaw's FINAL verdict line,
+;          `res = res & BnNot(BnSub(...))`, as `! $FFFFFFFF` - the
+;          literal GcmDecrypt line, in the line that decides whether a
+;          signature is valid.  IT SURVIVES.  The reason is the operand
+;          on the LEFT: res is 0 or 1, so `res & $FFFFFFFF` is res and
+;          `res & $FFFFFFFE` is 0 - the same truth table BnNot gives,
+;          and the complement's high half is never read.  M7 is the same
+;          respelling on EcdsaMuladd's point-at-infinity guard and
+;          survives for the same reason.  This is the identical finding
+;          ec256.pi4 recorded for its two real sites.
+;        * M8 moves one line and the answer flips.  `borrow ! 1` becomes
+;          `borrow ! $FFFFFFFF`, and that value is not read as a bit-0
+;          flag - it is handed to BnSub as its ctl, which reaches
+;          BnMux(ctl,x,y) = `y ! ((0 - ctl) & (x ! y))`.  At ctl =
+;          $FFFFFFFE the negation is $FFFFFFFF00000002 and the mask
+;          selects bit 1 of the difference instead of all of it, so the
+;          hash's reduction mod n is silently corrupted and every
+;          signature fails.  IT DIES ON THE FIRST VECTOR.
+;      SO THE HONEST STATEMENT IS NOT "THIS SHAPE IS HARMLESS HERE".  It
+;      is that whether it is harmless depends entirely on what consumes
+;      the value, that the two cases are one line apart and look
+;      identical, and that this is exactly why the file must keep
+;      spelling it BnNot().
+;
+;  ---- WHY NOTHING CHANGED, WHICH IS WORTH SAYING PLAINLY -------------
+;
+;  Going up this stack the changes got smaller each time, for a reason
+;  that is structural.  bignum.pi4 paid for the width once, in six sign
+;  tests and a rewritten unsigned compare, because it is where the
+;  branchless masks live.  ec256.pi4 paid twice, for two complements it
+;  did not strictly have to rewrite.  This file
+;  computes almost nothing itself: it is an ASN.1 walk over bytes, a
+;  handful of length arithmetic on numbers under 300, and calls into
+;  those two.  Every quantity it owns is either an address, a byte, or a
+;  small public length, and none of the five shapes has anywhere to
+;  land.  THAT IS ALSO WHY THE MUTATION TABLE IS THE PROOF: with no diff
+;  to read, the only honest way to show the shapes were looked for is to
+;  plant them and watch the vectors kill them.
+;
+;  ======================================================================
+;
+;  PROVEN: builds clean for pi4 and passes tools/a64/a64_ecdsa_check.py
+;  on the SAME vectors as the three 32-bit families (the gate imports
+;  tools/gen_ecdsa_vectors.py rather than carrying a copy) - the
+;  published RFC 6979 A.2.5 P-256/SHA-256 signatures, two real
+;  certificate-chain signatures made by a different implementation,
+;  oracle-generated SigVer records in both encodings, the full CAVP
+;  failure taxonomy and fifteen malformed-DER shapes, driven exactly as
+;  RP2350/Examples/Diagnostics/ecdsaSelfTest.pico2 drives them and
+;  including its EcdsaLastErr agreement checks, its curve gate and its
+;  converter checks.  9 signatures must verify and 37 must be refused,
+;  and all 46 run.  The gate adds one thing no 32-bit copy checks: its
+;  first job is a COLD verify, with EcdsaReady still 0, which is the
+;  self-initialisation promise above.  Mutation-swept under --mutate,
+;  whose subset coverage is itself reported by --coverage, and
+;  structurally twinned under tools/check_tls_twins.py --cross ecdsa.
+;  There is no --timing and the paragraph above says why.
+;  NOTHING HERE HAS RUN ON SILICON.
+; ======================================================================
+; ==== PORTABLE CORE A64 BEGIN ====
+
+; Named curve ids (the registry values the certificate parser reports).
+#ECDSA_CURVE_P256 = 23
+#ECDSA_CURVE_P384 = 24
+#ECDSA_CURVE_P521 = 25
+
+; EcdsaLastErr values.
+#ECDSA_ERR_OK        = 0             ; the signature verified
+#ECDSA_ERR_BADSIG    = 1             ; the signature is not valid
+#ECDSA_ERR_CURVE     = 2             ; curve not implemented here
+#ECDSA_ERR_MALFORMED = 3             ; the encoding is not well formed
+
+; i15 buffers over the CURVE ORDER n (256 bits: word 0 plus 18 limbs plus
+; guard). 22 words is the announced 19 with room for the Montgomery
+; routines' one-word overhang.
+#ECDSA_NWORDS = 22
+
+; The largest DER signature accepted, and the raw buffer it converts
+; into. The conversion can expand: two 127-byte integers become 254 raw
+; bytes, so the buffer is sized for the worst case, not the P-256 case.
+#ECDSA_SIGMAX = 150
+#ECDSA_RAWMAX = 300
+
+Global Dim EcdsaN.w[#ECDSA_NWORDS]    ; the curve order n, i15
+Global Dim EcdsaR.w[#ECDSA_NWORDS]    ; signature r, reduced mod n
+Global Dim EcdsaS.w[#ECDSA_NWORDS]    ; signature s, then 1/s
+Global Dim EcdsaT1.w[#ECDSA_NWORDS]   ; scratch
+Global Dim EcdsaT2.w[#ECDSA_NWORDS]   ; scratch
+Global EcdsaN0i.i                     ; -1/n mod 2^15
+
+Global Dim EcdsaOrder.a[32]           ; n, 32 big-endian bytes
+Global Dim EcdsaExp.a[32]             ; n-2, the inversion exponent
+Global Dim EcdsaTx.a[32]              ; r/s, encoded for the scalar mul
+Global Dim EcdsaTy.a[32]              ; hash/s, encoded for the scalar mul
+Global Dim EcdsaU.a[65]               ; the working point 0x04||X||Y
+
+Global Dim EcdsaRsig.a[#ECDSA_RAWMAX] ; DER in, raw r||s out
+Global Dim EcdsaTmp.a[#ECDSA_RAWMAX]  ; conversion staging
+
+; Two Jacobian points in ec256's register layout (x, y, z each #EC_WORDS).
+Global Dim EcdsaPpt.w[3 * #EC_WORDS]
+Global Dim EcdsaQpt.w[3 * #EC_WORDS]
+
+Global EcdsaReady.i                   ; 0 until EcdsaInit has run
+Global EcdsaLastErr.i                 ; why the last call answered as it did
+
+; ----------------------------------------------------------------------
+;  Read n bytes from the Data cursor LONGHAND (one explicit .b per byte).
+; ----------------------------------------------------------------------
+Procedure EcdsaReadBytes(dst.i, n.i)
+  Protected i.i
+  Protected bb.i
+  i = 0
+  While i < n
+    Read.b bb
+    PokeB(dst + i, bb & 255)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaInit - load the curve order, derive the Montgomery constant and
+;  the inversion exponent n-2, and initialise the point layer.
+;
+;  n's least significant byte is 0x51 for P-256, so subtracting 2 to get
+;  the exponent cannot borrow - the same shortcut the source relies on.
+; ----------------------------------------------------------------------
+Procedure EcdsaInit()
+  Protected i.i
+  EcInit()
+  i = 0
+  While i < #ECDSA_NWORDS
+    BnSw(@EcdsaN, i, 0)
+    i = i + 1
+  Wend
+  Restore EcdsaDataOrder
+  EcdsaReadBytes(@EcdsaOrder, 32)
+  BnDecode(@EcdsaN, @EcdsaOrder, 32)
+  EcdsaN0i = BnNinv15(BnGw(@EcdsaN, 1))
+  i = 0
+  While i < 32
+    PokeB(@EcdsaExp + i, PeekA(@EcdsaOrder + i) & 255)
+    i = i + 1
+  Wend
+  PokeB(@EcdsaExp + 31, (PeekA(@EcdsaExp + 31) & 255) - 2)
+  EcdsaReady = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaEnsureInit - run EcdsaInit once if the caller has not. A verifier
+;  reached through the certificate seam may be the first thing to touch
+;  this module, and answering from an uninitialised order table would be
+;  a wrong answer with no noise attached.
+; ----------------------------------------------------------------------
+Procedure EcdsaEnsureInit()
+  If EcdsaReady = 0
+    EcdsaInit()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaDecodeMod(x, src, len, m) - decode len big-endian bytes at src
+;  into x, announced at m's length, and return 1 only if the value is
+;  strictly below m.
+;
+;  This is the source's decode-mod, which the big-integer core does not
+;  carry (a verify-only client needs it here and nowhere else). Bytes
+;  that land beyond the modulus width must be zero, so an over-long
+;  encoding is refused rather than silently truncated; the two extra
+;  virtual words at the end guarantee no accumulated partial word is
+;  left unexamined. Public data, so the compare is a plain subtraction.
+; ----------------------------------------------------------------------
+Procedure.i EcdsaDecodeMod(x.i, src.i, len.i, m.i)
+  Protected menc.i
+  Protected mlen.i
+  Protected tlen.i
+  Protected u.i
+  Protected v.i
+  Protected acc.i
+  Protected accLen.i
+  Protected bb.i
+  Protected xw.i
+  Protected over.i
+  Protected below.i
+
+  menc = BnGw(m, 0)
+  mlen = (menc + 15) >> 4
+  BnZero(x, menc)
+  over = 0
+  tlen = mlen << 1
+  If tlen < len
+    tlen = len
+  EndIf
+  tlen = tlen + 4
+
+  v = 1
+  acc = 0
+  accLen = 0
+  u = 0
+  While u < tlen
+    If u < len
+      bb = PeekA(src + len - 1 - u) & 255
+    Else
+      bb = 0
+    EndIf
+    acc = acc | (bb << accLen)
+    accLen = accLen + 8
+    If accLen >= 15
+      xw = acc & $7FFF
+      accLen = accLen - 15
+      acc = (bb >> (8 - accLen)) & 255
+      If v <= mlen
+        BnSw(x, v, xw)
+      Else
+        If xw <> 0
+          over = 1
+        EndIf
+      EndIf
+      v = v + 1
+    EndIf
+    u = u + 1
+  Wend
+
+  BnSw(x, 0, menc)
+  below = BnSub(x, m, 0)
+  ProcedureReturn below & BnNot(over)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaBits2Int(x, src, len, ebitlen) - the source's bits2int: take the
+;  leftmost bits of the hash, as many as the curve order announces, and
+;  place them in x announced at the order's length. A hash longer than
+;  the order is truncated on the RIGHT (the low bits are dropped), which
+;  is a shift, not a modular reduction.
+; ----------------------------------------------------------------------
+Procedure EcdsaBits2Int(x.i, src.i, len.i, ebitlen.i)
+  Protected bitlen.i
+  Protected hbitlen.i
+  Protected sc.i
+  bitlen = ebitlen - ((ebitlen >> 4) & $0FFFFFFF)
+  hbitlen = len << 3
+  sc = 0
+  If hbitlen > bitlen
+    len = (bitlen + 7) >> 3
+    sc = (hbitlen - bitlen) & 7
+  EndIf
+  BnZero(x, ebitlen)
+  BnDecode(x, src, len)
+  BnRshift(x, sc)
+  BnSw(x, 0, ebitlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaMuladd(ptAddr, ptLen, xs, xslen, ys, yslen)
+;    ptAddr = xs * ptAddr + ys * G, written back as 0x04||X||Y.
+;    Returns 1 if both input points decoded on-curve and the result is
+;    not the point at infinity, else 0.
+;
+;  Two independent ladders, exactly as the source does it. The two
+;  special cases the plain addition formula cannot express are handled
+;  the same way: if the addition produced a zero Z then either the two
+;  points were equal (use the doubling instead) or they were opposite
+;  (the sum is infinity - that is an error, and it is reported).
+; ----------------------------------------------------------------------
+Procedure.i EcdsaMuladd(ptAddr.i, ptLen.i, xs.i, xslen.i, ys.i, yslen.i)
+  Protected r.i
+  Protected t.i
+  Protected z.i
+  If ptLen <> 65
+    ProcedureReturn 0
+  EndIf
+  r = EcPointDecode(@EcdsaPpt, ptAddr, ptLen)
+  r = r & EcPointDecode(@EcdsaQpt, @EcGen, 65)
+  EcPointMul(@EcdsaPpt, xs, xslen)
+  EcPointMul(@EcdsaQpt, ys, yslen)
+  t = EcPointAdd(@EcdsaPpt, @EcdsaQpt)
+  EcPointDouble(@EcdsaQpt)
+  z = BnIsZero(EcCoord(@EcdsaPpt, 2))
+  EcPointCcopy(z & BnNot(t), @EcdsaPpt, @EcdsaQpt)
+  EcPointEncode(ptAddr, @EcdsaPpt)
+  ProcedureReturn r & BnNot(z & t)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaVrfyRaw(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;  -> 1 valid / 0 rejected.
+;
+;  The signature is r||s, two equal-width big-endian integers. Both must
+;  be below the curve order and s must not be zero; then the standard
+;  check is computed: with w = 1/s, the point w*(hash)*G + w*r*Q must
+;  have an X coordinate congruent to r modulo the order.
+;
+;  The reduction of the X coordinate modulo the order is a single
+;  conditional subtraction. That is only correct because the curve order
+;  is close to the field order (it is, for every prime-order NIST curve),
+;  which is why this file is P-256 only and says so rather than being
+;  pointed at a curve where the shortcut does not hold.
+; ----------------------------------------------------------------------
+Procedure.i EcdsaVrfyRaw(hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  Protected rlen.i
+  Protected res.i
+  Protected i.i
+  Protected borrow.i
+
+  EcdsaEnsureInit()
+  EcdsaLastErr = #ECDSA_ERR_BADSIG
+
+  If sigLen <= 0
+    ProcedureReturn 0
+  EndIf
+  If (sigLen & 1) <> 0
+    ProcedureReturn 0
+  EndIf
+  If qLen <> 65
+    ProcedureReturn 0
+  EndIf
+  rlen = sigLen >> 1
+
+  If EcdsaDecodeMod(@EcdsaR, sigAddr, rlen, @EcdsaN) = 0
+    ProcedureReturn 0
+  EndIf
+  If EcdsaDecodeMod(@EcdsaS, sigAddr + rlen, rlen, @EcdsaN) = 0
+    ProcedureReturn 0
+  EndIf
+  If BnIsZero(@EcdsaS) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  ; s := 1/s, held in Montgomery form. Leaving Montgomery form BEFORE the
+  ; inversion is what puts the result back in it: 1/(s/R) = R/s.
+  BnFromMonty(@EcdsaS, @EcdsaN, EcdsaN0i)
+  BnModpow(@EcdsaS, @EcdsaExp, 32, @EcdsaN, EcdsaN0i, @EcdsaT1, @EcdsaT2)
+
+  ; t1 := hash, truncated to the order's bit length, then reduced.
+  EcdsaBits2Int(@EcdsaT1, hashAddr, hashLen, BnGw(@EcdsaN, 0))
+  borrow = BnSub(@EcdsaT1, @EcdsaN, 0)
+  BnSub(@EcdsaT1, @EcdsaN, borrow ! 1)
+
+  ; ty := hash/s, tx := r/s.
+  BnMontmul(@EcdsaT2, @EcdsaT1, @EcdsaS, @EcdsaN, EcdsaN0i)
+  BnEncode(@EcdsaTy, 32, @EcdsaT2)
+  BnMontmul(@EcdsaT1, @EcdsaR, @EcdsaS, @EcdsaN, EcdsaN0i)
+  BnEncode(@EcdsaTx, 32, @EcdsaT1)
+
+  i = 0
+  While i < 65
+    PokeB(@EcdsaU + i, PeekA(qAddr + i) & 255)
+    i = i + 1
+  Wend
+  res = EcdsaMuladd(@EcdsaU, 65, @EcdsaTx, 32, @EcdsaTy, 32)
+
+  ; X coordinate of the result, reduced mod n, must equal r.
+  BnZero(@EcdsaT1, BnGw(@EcdsaN, 0))
+  BnDecode(@EcdsaT1, @EcdsaU + 1, 32)
+  BnSw(@EcdsaT1, 0, BnGw(@EcdsaN, 0))
+  borrow = BnSub(@EcdsaT1, @EcdsaN, 0)
+  BnSub(@EcdsaT1, @EcdsaN, borrow ! 1)
+  res = res & BnNot(BnSub(@EcdsaT1, @EcdsaR, 1))
+  res = res & BnIsZero(@EcdsaT1)
+
+  If res <> 0
+    EcdsaLastErr = #ECDSA_ERR_OK
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaAsn1ToRaw(bufAddr, sigLen) - convert a DER SEQUENCE{INTEGER r,
+;  INTEGER s} in place into r||s, and return the raw length (an even
+;  number), or 0 if the encoding is not well formed.
+;
+;  Strict where the reference is lenient - see the header. The two
+;  integers are re-emitted at a common width (the wider of the two after
+;  minimal leading zeros are dropped), left-padded with zeros, which is
+;  what the raw form means.
+; ----------------------------------------------------------------------
+Procedure.i EcdsaAsn1ToRaw(bufAddr.i, sigLen.i)
+  Protected zlen.i
+  Protected off.i
+  Protected rlen.i
+  Protected slen.i
+  Protected rp.i
+  Protected sp.i
+  Protected i.i
+  Protected outLen.i
+
+  EcdsaLastErr = #ECDSA_ERR_MALFORMED
+  If sigLen < 8
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(bufAddr) & 255) <> $30
+    ProcedureReturn 0
+  EndIf
+
+  ; SEQUENCE length: short form, or the single long form 0x81. Anything
+  ; else - a longer long form, the indefinite marker, or a long form
+  ; where a short one would do - is refused.
+  zlen = PeekA(bufAddr + 1) & 255
+  If zlen > $80
+    If zlen <> $81
+      ProcedureReturn 0
+    EndIf
+    zlen = PeekA(bufAddr + 2) & 255
+    If zlen < $80
+      ProcedureReturn 0
+    EndIf
+    If zlen <> sigLen - 3
+      ProcedureReturn 0
+    EndIf
+    off = 3
+  Else
+    If zlen = $80
+      ProcedureReturn 0
+    EndIf
+    If zlen <> sigLen - 2
+      ProcedureReturn 0
+    EndIf
+    off = 2
+  EndIf
+
+  ; First INTEGER (r).
+  If (PeekA(bufAddr + off) & 255) <> $02
+    ProcedureReturn 0
+  EndIf
+  off = off + 1
+  If off >= sigLen
+    ProcedureReturn 0
+  EndIf
+  rlen = PeekA(bufAddr + off) & 255
+  off = off + 1
+  If rlen >= $80
+    ProcedureReturn 0
+  EndIf
+  If rlen = 0
+    ProcedureReturn 0
+  EndIf
+  If off + rlen > sigLen
+    ProcedureReturn 0
+  EndIf
+  rp = bufAddr + off
+  If (PeekA(rp) & 128) <> 0
+    ProcedureReturn 0
+  EndIf
+  If rlen > 1
+    If (PeekA(rp) & 255) = 0
+      If (PeekA(rp + 1) & 128) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+  off = off + rlen
+
+  ; Second INTEGER (s); it must consume the rest exactly.
+  If off + 2 > sigLen
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(bufAddr + off) & 255) <> $02
+    ProcedureReturn 0
+  EndIf
+  off = off + 1
+  slen = PeekA(bufAddr + off) & 255
+  off = off + 1
+  If slen >= $80
+    ProcedureReturn 0
+  EndIf
+  If slen = 0
+    ProcedureReturn 0
+  EndIf
+  If slen <> sigLen - off
+    ProcedureReturn 0
+  EndIf
+  sp = bufAddr + off
+  If (PeekA(sp) & 128) <> 0
+    ProcedureReturn 0
+  EndIf
+  If slen > 1
+    If (PeekA(sp) & 255) = 0
+      If (PeekA(sp + 1) & 128) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+
+  ; Drop the minimal leading zero each integer may carry.
+  While rlen > 0 And (PeekA(rp) & 255) = 0
+    rlen = rlen - 1
+    rp = rp + 1
+  Wend
+  While slen > 0 And (PeekA(sp) & 255) = 0
+    slen = slen - 1
+    sp = sp + 1
+  Wend
+
+  zlen = rlen
+  If slen > zlen
+    zlen = slen
+  EndIf
+  outLen = zlen << 1
+  If outLen > #ECDSA_RAWMAX
+    ProcedureReturn 0
+  EndIf
+
+  i = 0
+  While i < outLen
+    PokeB(@EcdsaTmp + i, 0)
+    i = i + 1
+  Wend
+  i = 0
+  While i < rlen
+    PokeB(@EcdsaTmp + zlen - rlen + i, PeekA(rp + i) & 255)
+    i = i + 1
+  Wend
+  i = 0
+  While i < slen
+    PokeB(@EcdsaTmp + outLen - slen + i, PeekA(sp + i) & 255)
+    i = i + 1
+  Wend
+  i = 0
+  While i < outLen
+    PokeB(bufAddr + i, PeekA(@EcdsaTmp + i) & 255)
+    i = i + 1
+  Wend
+  EcdsaLastErr = #ECDSA_ERR_OK
+  ProcedureReturn outLen
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaVrfyAsn1(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;  -> 1 valid / 0 rejected. The caller's signature buffer is left alone:
+;  the DER is copied into module scratch, converted there, and verified.
+; ----------------------------------------------------------------------
+Procedure.i EcdsaVrfyAsn1(hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  Protected i.i
+  Protected rawLen.i
+  EcdsaEnsureInit()
+  EcdsaLastErr = #ECDSA_ERR_MALFORMED
+  If sigLen <= 0
+    ProcedureReturn 0
+  EndIf
+  If sigLen > #ECDSA_SIGMAX
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < sigLen
+    PokeB(@EcdsaRsig + i, PeekA(sigAddr + i) & 255)
+    i = i + 1
+  Wend
+  rawLen = EcdsaAsn1ToRaw(@EcdsaRsig, sigLen)
+  If rawLen = 0
+    EcdsaLastErr = #ECDSA_ERR_MALFORMED
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn EcdsaVrfyRaw(hashAddr, hashLen, qAddr, qLen, @EcdsaRsig, rawLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  EcdsaVrfy(curve, hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+;  -> 1 valid / 0 rejected / -1 cannot answer.
+;
+;  THE CERTIFICATE-PATH SEAM. Signature bytes are ASN.1 DER, as carried
+;  in a certificate. An unimplemented curve returns -1, never 0: "I
+;  cannot compute this" and "this signature is forged" are different
+;  answers and only one of them is true.
+; ----------------------------------------------------------------------
+Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
+  If curve <> #ECDSA_CURVE_P256
+    EcdsaLastErr = #ECDSA_ERR_CURVE
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn EcdsaVrfyAsn1(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The P-256 group order n, 32 big-endian bytes, read one byte at a time.
+; ----------------------------------------------------------------------
+DataSection
+EcdsaDataOrder:
+  Data.b $FF,$FF,$FF,$FF, $00,$00,$00,$00, $FF,$FF,$FF,$FF, $FF,$FF,$FF,$FF
+  Data.b $BC,$E6,$FA,$AD, $A7,$17,$9E,$84, $F3,$B9,$CA,$C2, $FC,$63,$25,$51
+EndDataSection
+; ==== PORTABLE CORE A64 END ====

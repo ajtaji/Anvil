@@ -1,0 +1,306 @@
+; Chapter 8 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   tools/anvil_update.py  - the sequence, the two stops, the reasons.
+;                            Its comments are the design record; there is
+;                            NO docs/PI4_SELF_UPDATE.md.
+;   tools/anvil.py         - stage_addr(), the one map parser.
+;   Anvil/Core/fs_cmd.pbi  - save's messages, including the partial-write
+;                            one.
+;   Anvil/Core/bootfile_cmd.pbi - the reboot-loop guard.
+;   RaspberryPi4/Board/power.pi4 - reset.
+;
+; TRANSCRIPT-SOURCED, AND SAID SO IN THE TEXT: the save/reset session is
+; the recorded board session of 2026-09-05 (vault: Raspberry Pi 4/
+; pi4-net-upload_serial-fallback-115200-2026-09-05.log), redacted only
+; for the network name. The flash-verification sequence is from the
+; recorded session of 2026-09-16 (vault: Anvil/Four-core service -
+; monitor flash package 2026-09-15.md).
+;
+; DO NOT CONFLATE WITH THE PI 3. docs/PI3_SELF_UPDATE.md describes a
+; completely different mechanism - an immutable first-stage loader with
+; A/B slots and generation counters. This chapter is the Pi 4 only.
+@CHAPTER Updating the monitor in place
+@INTRO The running monitor receives its own replacement, writes it to the file it boots from, and resets into it. Two moments in that sequence are the ones that can cost you the board.
+
+@SECTION The idea
+
+No second machine, no pulling the medium, no external programmer. The
+monitor that is running takes delivery of the next monitor, writes it
+over `KERNEL8.IMG`, and resets.
+
+That works because of one property: **between the save and the reset,
+the old monitor is still running and still has the console.** If
+anything is wrong, you are still talking to a working board. Everything
+in this chapter is built around protecting that window.
+
+@SECTION The sequence
+
+@FRAG
+1. confirm you have a prompt
+2. ask the board where to stage        map
+3. transfer the image                  receive <addr> <len> <crc>
+4. write it to the boot file           save KERNEL8.IMG <addr> <len>
+5. read the directory back             ls
+6. only then                           reset
+@ENDFRAG
+
+One command does all six:
+
+@FRAG
+python tools/anvil_update.py build/pi4/anvil.img
+@ENDFRAG
+
+It takes **one optional positional** - the image, defaulting to
+`build/pi4/anvil.img` - and **one option, `--fast`**. Anything else is
+refused before a byte is sent:
+
+@FRAG
+!! not an option this tool knows: --verbose
+@ENDFRAG
+
+@NOTE That strictness was earned. The fast flag used to be matched by
+scanning the whole argument list, so a typo like `--fst` was silently
+dropped and the write went ahead at the slow rate while the invocation
+looked like the fast one. Now anything starting with a hyphen that is
+not `--fast` stops the tool before it sends anything.
+
+@SECTION Step 2, and why it is step 2
+
+The staging address is asked for, not assumed - and it is asked
+**before** the transfer rather than after:
+
+@FRAG
+staging at 00500000, which is where this board said to put it
+@ENDFRAG
+
+@NOTE A monitor that will not say where to stage is a run that must not
+start. The alternative is sending two megabytes and then discovering
+there is nowhere to put them.
+
+@SECTION The baud rate is left alone
+
+By default the transfer runs at whatever rate the board booted at.
+`--fast` opts into 1.5 Mbaud, which is roughly a minute faster on a
+megabyte-and-a-half image.
+
+@TRAP The default is the slow one deliberately. Two saves in a row once
+died at "SAVE DID NOT COMPLETE" with the fast rate in the middle of
+them. The default is the rate that finishes.
+
+@SECTION What you will see
+
+From a recorded board session, redacted only for the network name:
+
+@FRAG
+RaspberryPi4/Monitor/anvil.img: 1625636 bytes
+115200 - the baud is not touched (pass --fast to change it)
+received 1625636 bytes in 153.8 s, CRC verified on the board
+
+save KERNEL8.IMG 400000 18CE24
+The file KERNEL8.IMG on the boot medium is 1809100 bytes long at the moment.
+It is being resized from 1809100 bytes to 1625636 bytes to match what
+you asked to write.
+Writing 1625636 bytes out of memory, starting at 00400000. This
+takes a moment and must not be interrupted.
+written.
+  The file on the boot medium now holds what was in memory, and the
+  block writer has been disarmed again so nothing else in this monitor
+  can reach the medium. Type reset to boot into it.
+
+resetting into the new build ...
+reset
+Resetting the board now. The firmware reloads this monitor from the boot
+medium and it starts again in a few seconds. Nothing in memory survives.
+@ENDFRAG
+
+and then the new monitor's banner, and a prompt.
+
+@NOTE The file is **resized to the image**, not padded into a fixed
+slot. The length is passed to `save`, so the boot file grows or shrinks
+to the exact image size and the filesystem does the resize in place.
+
+@SECTION Stop one: the save did not complete
+
+@FRAG
+SAVE DID NOT COMPLETE - not resetting.
+The file may be part old and part new; write it again
+before the board is reset, or it boots half an image.
+@ENDFRAG
+
+@TRAP **Do not reset to try again.** Write it again first. The old
+monitor is still running and still has the console; that is the whole
+asset here and a reset spends it. A boot file that is part of one image
+and part of another does not fail in any recognisable way.
+
+@SECTION Stop two: the directory disagrees
+
+After the save, the tool asks the **filesystem** what is there. Not the
+command that did the writing.
+
+If the file is not in the listing:
+
+@FRAG
+!! KERNEL8.IMG is not in the directory listing after the save, so
+   NOT resetting. The board is still running the old image
+   and the stick still has whatever it had. Type ls on the
+   console to see what is actually there.
+@ENDFRAG
+
+If it is there and the length is wrong:
+
+@FRAG
+!! KERNEL8.IMG is 1809100 bytes and the image sent was 1625636 bytes, so the file on
+   the stick is NOT the image that was just sent. NOT
+   resetting - write it again before the board is reset, or
+   it boots part of one image and part of another.
+@ENDFRAG
+
+@NOTE Why the readback exists at all: `save` saying `written.` is that
+command's own account of itself. The one question that actually matters
+afterwards - **is the file the firmware will load now the length of the
+image we sent** - is answered by the directory and by nothing else. It
+costs one command and one line of output, and the alternative is
+resetting into a file nobody has looked at.
+
+It was earned on a specific day. The tool crashed printing a non-ASCII
+byte out of the board's reply, **after** the save had landed and
+**before** the reset - and the operator could not tell which, because
+there was nothing on the screen but a traceback.
+
+@SECTION Prove it harder, when it matters
+
+For a monitor you care about, the directory length is the minimum. The
+stronger check reads the file **back off the medium into a different
+address** and hashes it there. This is a recorded board session from
+2026-09-16:
+
+@FRAG
+pmf> save KERNEL8.IMG 500000 2CB860
+written.
+pmf> ls
+  KERNEL8.IMG   2930784 bytes
+pmf> load KERNEL8.IMG 01000000
+pmf> sha256sum 01000000 2CB860
+The sha256sum is ec9abb8418344b38b3638b6d6980e0e7c0d81ba52eb967bbbb6b47c0a25ce439
+@ENDFRAG
+
+@NOTE Three things make that strong. It reads the **file**, not the
+staged copy. It reads it to a **different address**, so a stale buffer
+cannot answer for it. And the digest is computed by the board, which is
+something other than the tool that did the writing. The hash matched the
+host's before anything was reset.
+
+Then, and only then:
+
+@FRAG
+pmf> reset
+pmf> version
+build 142 date 20260915 time 220310
+@ENDFRAG
+
+@NOTE That `version` check is the whole reason the build number moves
+with every build. You asked for build 142; the board says 142. If it
+says something else, you have just learned something important while you
+still have a console.
+
+@SECTION Recovery, in the order to reach for it
+
+**1. Before the reset - just write it again.** Between `save` and
+`reset` the running monitor is still the old one. This is the cheapest
+recovery and it is why the two stops do not reset.
+
+**2. After a bad reset - the medium.** `KERNEL8.IMG` is an ordinary file
+in the FAT boot partition. A monitor that will not come up is recovered
+by putting the medium in another machine and copying the previous image
+back. **Which means: keep the outgoing image.** Before flashing, copy
+the board's current `KERNEL8.IMG` off, or keep the previously flashed
+artifact and its hash, so there is a known-good file to restore.
+
+**3. Better still, keep a spare on the medium itself** under its own
+name, so the recovery is three commands from the prompt rather than a
+trip with a screwdriver:
+
+@FRAG
+pmf> load SCALEOK.IMG 800000
+pmf> save KERNEL8.IMG 800000 20C940
+pmf> reset
+@ENDFRAG
+
+@TRAP Stage at `800000`, not at the default. `load` with no address goes
+to the staging address, and a large image there can land on the tail of
+the running monitor. And `save` takes a **length**, in hex, not an end
+address.
+
+@SECTION The guard that makes a boot loop impossible
+
+This one is automatic and it protects payloads rather than monitors, but
+it belongs here because it is the reason a bad automatic boot does not
+take the board away from you.
+
+Anvil counts failures in `boot.fails` against `boot.maxfails`, default
+3. **The counter is written to the medium BEFORE each attempt** - a
+counter written after a good boot is never written in the case it exists
+to catch. A payload that hangs lets the deadman fire; the failure is
+already recorded; and after the limit the prompt comes back naming the
+guard instead of booting the thing that hung:
+
+@FRAG
+!! NOT booting APP.PMF automatically, and this is the reboot-loop
+   guard rather than a fault with the file. It has been attempted 3
+   times in a row without anything ever confirming that the payload
+   reached a working state, and boot.maxfails is 3.
+   A payload that hangs or resets gets re-entered on every start, and
+   there is then never a prompt long enough to type the fix at. This is
+   that prompt.
+   Type boot ok to clear the counter once the payload is known good, or
+   boot clear to stop booting this file at all. boot status shows all
+   four settings.
+@ENDFRAG
+
+@NOTE "There is then never a prompt long enough to type the fix at. This
+is that prompt." That sentence is the design. A payload marks itself
+good by getting the counter back to zero - the operator types `boot ok`,
+or the payload calls the service that does it when it reaches its own
+steady state.
+
+@TRAP Do not call `boot ok` at the start of your payload. Saying it on
+every boot regardless turns the guard off, which is a decision rather
+than a habit worth falling into. Say it when the payload is actually
+working.
+
+@SECTION Why a payload cannot write the two counters
+
+The service a payload uses to persist a setting refuses `boot.fails` and
+`boot.maxfails`, and so does the one that deletes a setting: both answer
+`SVC_EPERM` and change nothing. A payload that could write those two
+could switch the guard off silently, so clearing the counter is a
+separate service of its own - the one `boot ok` also calls - and it is
+the only sanctioned way to do it. Everything else in the store, `boot.file`
+included, a payload may set freely; that is how a payload updates
+firmware.
+
+@NOTE Setting names are **case-insensitive** everywhere - the store folds
+every name to lower case before it writes one or looks one up, so
+`BOOT.FAILS` and `boot.fails` are one setting - and the refusal folds
+exactly the same way, through the store's own comparison rather than a
+second copy of the rule. Spelling either name in upper or mixed case gets
+the same `SVC_EPERM`, because it would otherwise reach the same stored
+setting by a name the guard did not recognise. Names that merely resemble
+the guarded ones - `boot.file`, `boot.fail`, `boot.maxfail` - are not
+guarded and stay writable.
+
+@SECTION What this chapter is not
+
+The Raspberry Pi 3 uses a **different** update mechanism: the firmware boots
+the complete monitor from `kernel8.img` after running a Pi 3-specific stub.
+Its staging, backup and direct-file replacement procedure is in
+`docs/PI3_SELF_UPDATE.md` and none of it applies here.
+
+@TRAP And the sharpest edge of all, which is not about updating but is
+about this file: **never enter a monitor image as a payload.** `boot mem`
+places an image at the address it was built for, and for a monitor that
+is `$00200000` - on top of the running monitor. Do that while a transfer
+is in flight and the board goes down with no console and no serial, and
+somebody has to pull the medium. It has been avoided once by the margin
+of a single command.

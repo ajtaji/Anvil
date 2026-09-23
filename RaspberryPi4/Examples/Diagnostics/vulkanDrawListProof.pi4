@@ -1,0 +1,22 @@
+; vulkanDrawListProof.pi4 - one accelerated V3D transaction, six Vulkan draws.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. Through public Vulkan calls this records one
+; render pass containing, in order: two overlapping opaque push-colour draws,
+; two exact source-over push-colour draws, one opaque varying-colour draw, and
+; one final opaque push-colour draw. The returned x0 names exactly 64 little-
+; endian 32-bit report words. tools/vulkan_draw_list_acceptance_check.py is the
+; independent report and raw BGRA screenshot oracle.
+;
+; Desk build:
+;   PureMetalForge.exe --compile \
+;     RaspberryPi4/Examples/Diagnostics/vulkanDrawListProof.pi4 -t pi4 \
+;     --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;     -o vulkanDrawListProof.img
+;
+; No board action is implicit. A future authorized run must first take the
+; accelerated console off V3D, exactly as documented by vulkanTriangleProof.
+
+#VTP_BLEND_PROOF = 0
+#VTP_LIST_PROOF = 1
+#VTP_INDEXED_PROOF = 0
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanTriangleProofBody.pbi"

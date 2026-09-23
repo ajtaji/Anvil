@@ -1,0 +1,82 @@
+;
+; Completed-frame record owned by the resident Neon Vulkan adapter.
+; The display owner consumes this record; this file performs no HDMI/DSI/DMA.
+;
+
+#NVD_PRESENT_FREE = 0
+#NVD_PRESENT_READY = 1
+
+Structure NeonVkPresentRecord
+  targetGeneration.i
+  framebuffer.i
+  frameSequence.q
+  wsiTicket.i
+  wsiSwapchain.i
+  wsiImageIndex.i
+  wsiImageKey.i
+  logicalW.i
+  logicalH.i
+  physicalW.i
+  physicalH.i
+  pitch.i
+  rotation.i
+  state.i
+EndStructure
+
+Global nvdPresent.NeonVkPresentRecord
+
+Procedure nvdPresentClear()
+  nvdPresent\targetGeneration = 0 : nvdPresent\framebuffer = 0
+  nvdPresent\frameSequence = 0 : nvdPresent\logicalW = 0 : nvdPresent\logicalH = 0
+  nvdPresent\wsiTicket = 0 : nvdPresent\wsiSwapchain = 0 : nvdPresent\wsiImageIndex = -1 : nvdPresent\wsiImageKey = 0
+  nvdPresent\physicalW = 0 : nvdPresent\physicalH = 0 : nvdPresent\pitch = 0
+  nvdPresent\rotation = 0 : nvdPresent\state = #NVD_PRESENT_FREE
+EndProcedure
+
+Procedure.i nvdPresentPublish(target.i, framebuffer.i, sequence.q, lw.i, lh.i, pw.i, ph.i, pitch.i, rotation.i)
+  If nvdPresent\state <> #NVD_PRESENT_FREE Or target < 1 Or framebuffer = 0 Or sequence < 1
+    ProcedureReturn 0
+  EndIf
+  If nvdWsiEnabled() <> 0
+    If nvdWsiState <> #NVD_WSI_COMMITTED Or nvdWsiTargetGeneration <> target : ProcedureReturn 0 : EndIf
+  EndIf
+  If lw < 1 Or lh < 1 Or pw < 1 Or ph < 1 Or pitch < pw * 4 : ProcedureReturn 0 : EndIf
+  nvdPresent\targetGeneration = target : nvdPresent\framebuffer = framebuffer
+  nvdPresent\frameSequence = sequence : nvdPresent\logicalW = lw : nvdPresent\logicalH = lh
+  nvdPresent\wsiTicket = nvdWsiTicket : nvdPresent\wsiSwapchain = nvdWsiSwapchain
+  nvdPresent\wsiImageIndex = nvdWsiImageIndex : nvdPresent\wsiImageKey = nvdWsiImageKey
+  nvdPresent\physicalW = pw : nvdPresent\physicalH = ph : nvdPresent\pitch = pitch
+  nvdPresent\rotation = rotation : nvdPresent\state = #NVD_PRESENT_READY
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvdPresentMatches(target.i, framebuffer.i)
+  If nvdPresent\state <> #NVD_PRESENT_READY : ProcedureReturn 0 : EndIf
+  If target <> nvdPresent\targetGeneration Or framebuffer <> nvdPresent\framebuffer : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvdPresentPending()
+  ProcedureReturn Bool(nvdPresent\state = #NVD_PRESENT_READY)
+EndProcedure
+
+Procedure.i nvdPresentConsume(target.i, framebuffer.i)
+  If nvdPresentMatches(target, framebuffer) = 0 : ProcedureReturn 0 : EndIf
+  If nvdWsiEnabled() <> 0
+    If nvdWsiComplete(1) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  EndIf
+  nvdPresentClear()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvdPresentInvalidate(target.i, framebuffer.i)
+  Define result.i
+  If nvdPresent\state = #NVD_PRESENT_FREE : ProcedureReturn 1 : EndIf
+  If target <> nvdPresent\targetGeneration Or framebuffer <> nvdPresent\framebuffer : ProcedureReturn 0 : EndIf
+  If nvdWsiEnabled() <> 0
+    result = nvdWsiRollback()
+    If result <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  EndIf
+  nvdPresentClear()
+  ProcedureReturn 1
+EndProcedure

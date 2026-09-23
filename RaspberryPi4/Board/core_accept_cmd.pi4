@@ -1,0 +1,52 @@
+; Include after core_accept.pi4 and console formatting.
+; Parser owns exact arity: coretest run | coretest stop | coretest status.
+Procedure CmdCoreAcceptStatus()
+  Define core.i
+  Define row.i
+  Define ack.i
+  Print("coretest started=") : PrintDec(core_accept_started)
+  Print(" stopped=") : PrintDec(core_accept_stopped)
+  Print(" runs=") : PrintDec(core_accept_runs)
+  Print(" nonce=") : PrintDec(core_accept_nonce)
+  Print(" error=") : PrintDec(core_accept_fault)
+  Print(" core=") : PrintDec(core_accept_failed_core) : PrintNl()
+  Print("  leases: secondary=") : PrintDec(accept_secondary_owner)
+  Print(" gic=") : PrintDec(accept_gic_owner)
+  Print(" watchdog=") : PrintDec(accept_watchdog_owner) : PrintNl()
+  If core_accept_started <> 0 And CoreAcceptContext() <> 0
+    For core = 1 To 3
+      row = CoreAcceptRow(core)
+      core_accept_addr = row + 8
+      ack = coreAcceptAcquire()
+      Print("  core=") : PrintDec(core)
+      Print(" ready=") : PrintDec(CoreRawState(core))
+      Print(" request=") : PrintDec(PeekI(row))
+      Print(" ack=") : PrintDec(ack)
+      If ack = PeekI(row) And ack <> 0
+        Print(" result=") : PrintDec(PeekI(row + 32))
+        Print(" status=") : PrintDec(PeekI(row + 48))
+      EndIf
+      PrintNl()
+    Next
+  EndIf
+  If core_accept_fault <> 0
+    PrintN("Failure latched. No re-release or warm rejoin. Try stop only after jobs finish.")
+    PrintN("If stop refuses, retain diagnostics; controlled restart required for recovery.")
+  EndIf
+EndProcedure
+Procedure CmdCoreAcceptRun()
+  If CoreAcceptRun() <> 0
+    PrintN("coretest PASS: 16 nonce rounds, three resident EL3 workers.")
+  Else
+    PrintN("coretest REFUSED/FAILED; see error and core below.")
+  EndIf
+  CmdCoreAcceptStatus()
+EndProcedure
+Procedure CmdCoreAcceptStop()
+  If CoreAcceptStop() <> 0
+    PrintN("coretest STOPPED: all three workers acknowledged permanent park.")
+  Else
+    PrintN("coretest stop refused or timed out; do not overwrite resident code or rows.")
+  EndIf
+  CmdCoreAcceptStatus()
+EndProcedure

@@ -1,0 +1,474 @@
+; pi4SchedProbe.pi4 - the cooperative task list in
+; RaspberryPi4/Lib/sched.pi4, driven through every path it has so a
+; harness can watch what ran, in what order, and how the accounting
+; came out.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; This is the artefact tools/a64/a64_sched_check.py runs.
+;
+; WHAT IS WORTH CHECKING HERE, and it is not "does it compile":
+;
+;   1. DISPATCH IS EXACT, NOT APPROXIMATE. An every-pass task must run
+;      once per pass - not "about" once. A task with a one-second period
+;      must run ZERO times in a run that lasts a fraction of a second.
+;      Both are counted here, and both are numbers a gate can insist on
+;      rather than eyeball.
+;
+;   2. THE ROTATION ROTATES. Section D records the ORDER tasks ran in,
+;      as letters, across several passes. A fixed order would leave the
+;      last slot with the leftovers of every pass forever, and nothing
+;      but a recorded order can tell the difference.
+;
+;   3. RE-ENTRANCY IS REFUSED. Section E has a task that calls
+;      SchedPoll() from inside itself - the exact mistake that would
+;      corrupt static locals on this backend, and the one the compiler's
+;      recursion check cannot see because the dispatch is indirect. It
+;      must come back -1 and be counted.
+;
+;   4. A FAULTING TASK IS ISOLATED, NOT FATAL. Section H installs an
+;      invoker that reports a fault for one task. That task must go
+;      FAILED and stop being called; every other task must carry on.
+;
+;   5. LATENESS AND MISSED PERIODS ARE MEASURED, NOT ASSUMED. Section G
+;      puts a deliberately slow task next to a fast periodic one and
+;      reads the damage off the counters. That is the honest cost of
+;      cooperative scheduling and this file's job is to report it.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4SchedProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o sched.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/sched.pi4"
+
+; One second in microseconds. Any task given this period must not run
+; during this program, which finishes in a fraction of a second under
+; the interpreter and on the board alike.
+#PROBE_NEVER = 1000000
+
+; How many passes the counted sections make.
+#PROBE_PASSES = 40
+
+Global aRuns.i = 0
+Global bRuns.i = 0
+Global cRuns.i = 0
+Global dRuns.i = 0
+Global slowRuns.i = 0
+Global reentryResult.i = 0
+Global reentryRuns.i = 0
+Global nestedDelay.i = 0
+
+; The order tasks ran in, as letters, so the rotation is visible.
+Global Dim orderBuf.a[128]
+Global orderN.i = 0
+Global orderOn.i = 0
+
+Procedure Note(letter.i)
+  If orderOn = 0
+    ProcedureReturn
+  EndIf
+  If orderN >= 120
+    ProcedureReturn
+  EndIf
+  PokeB(@orderBuf[0] + orderN, letter)
+  orderN = orderN + 1
+EndProcedure
+
+Procedure TaskA()
+  aRuns = aRuns + 1
+  Note(65)                              ; the letter A
+EndProcedure
+
+Procedure TaskB()
+  bRuns = bRuns + 1
+  Note(66)                              ; B
+EndProcedure
+
+Procedure TaskC()
+  cRuns = cRuns + 1
+  Note(67)                              ; C
+EndProcedure
+
+Procedure TaskD()
+  dRuns = dRuns + 1
+  Note(68)                              ; D
+EndProcedure
+
+; A task that takes real time, so that lateness and missed periods are
+; measured rather than hypothesised. The loop is a spin on purpose:
+; anything that waited on the counter would be measuring the model's
+; tick rate instead of the scheduler.
+Procedure SlowTask()
+  Define i.i
+  slowRuns = slowRuns + 1
+  i = 0
+  While i < 4000
+    i = i + 1
+  Wend
+EndProcedure
+
+; THE MISTAKE, ON PURPOSE. A task must never call the dispatcher.
+Procedure ReentrantTask()
+  reentryRuns = reentryRuns + 1
+  reentryResult = SchedPoll()
+  nestedDelay = SchedDelay(1000)
+EndProcedure
+
+; WHAT A FAULT REPORTER WOULD SEE. SchedCurrent() and
+; SchedCurrentName() are only worth anything if they are right WHILE a
+; task is running, so they are read from inside one. A mutation that
+; set the field after the call instead of before survived the first
+; version of this gate, because nothing looked at it from in here.
+Global seenId.i = 0
+Global seenName.i = 0
+Global selfRemove.i = 99
+
+Procedure WatcherTask()
+  seenId = SchedCurrent()
+  seenName = SchedCurrentName()
+  ; And a task must not be able to remove itself out from under the
+  ; dispatcher that is about to reschedule it.
+  selfRemove = SchedRemove(SchedCurrent())
+EndProcedure
+
+Procedure NeverTask()
+  ; A one-shot armed with a delay must not run before the delay.
+  cRuns = cRuns + 100
+EndProcedure
+
+; ---------------------------------------------------------------------
+;  The fault-guarding invoker seam, wired the way sched.pi4's header
+;  describes - except that there is no fault here to catch. This one
+;  REPORTS a fault for one chosen task and runs everything else, which
+;  is the scheduler's half of the contract and the only half a model
+;  without a vector table can exercise.
+; ---------------------------------------------------------------------
+Global *invokeCall
+Global failFn.i = 0
+Global invokeCount.i = 0
+
+Procedure.i Invoker(*fn)
+  invokeCount = invokeCount + 1
+  If failFn <> 0 And *fn = failFn
+    ProcedureReturn 0                   ; "that task faulted"
+  EndIf
+  *invokeCall = *fn
+  invokeCall()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Line(*name, v.i)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  PrintDec(v)
+  PrintNl()
+EndProcedure
+
+Procedure Say(*name, *text)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  ")
+  UartWriteStr(*text)
+  PrintNl()
+EndProcedure
+
+Procedure ShowOrder(*name)
+  PokeB(@orderBuf[0] + orderN, 0)
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  |")
+  UartWriteStr(@orderBuf[0])
+  UartWriteStr("|")
+  PrintNl()
+EndProcedure
+
+Procedure Spin(n.i)
+  Define i.i
+  i = 0
+  While i < n
+    SchedPoll()
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i Main()
+  Define id1.i
+  Define id2.i
+  Define id3.i
+  Define id4.i
+  Define i.i
+  Define n.i
+  Define before.i
+
+  PrintNl()
+  UartWriteStr("=== sched.pi4 ===")
+  PrintNl()
+
+  ; ==================================================================
+  ; A - AN EMPTY TABLE
+  ; ==================================================================
+  UartWriteStr("A: empty")
+  PrintNl()
+  Line("init      (want 1)", SchedInit())
+  Line("hz              ", SchedHz())
+  Line("slots           ", SchedSlots())
+  Line("count     (want 0)", SchedCount())
+  Line("passes    (want 0)", SchedPasses())
+  Line("poll ran  (want 0)", SchedPoll())
+  Line("current   (want 0)", SchedCurrent())
+  Say("current name    ", SchedCurrentName())
+  Line("state of 1 (want 0)", SchedState(1))
+  Line("state of 99 (want 0)", SchedState(99))
+  Line("runs of 1 (want 0)", SchedRuns(1))
+  Say("error after bad id", SchedErrorText())
+  PrintNl()
+
+  ; ==================================================================
+  ; B - REGISTRATION, AND WHAT IS REFUSED
+  ; ==================================================================
+  UartWriteStr("B: registration")
+  PrintNl()
+  Line("add null fn (want 0)", SchedAdd(0, "null", 0))
+  Say("error           ", SchedErrorText())
+  Line("add negative (want 0)", SchedAdd(@TaskA, "neg", 0 - 5))
+  Say("error           ", SchedErrorText())
+
+  id1 = SchedAdd(@TaskA, "a", 0)
+  id2 = SchedAdd(@TaskB, "b", #PROBE_NEVER)
+  Line("id1 (want 1)    ", id1)
+  Line("id2 (want 2)    ", id2)
+  Line("count (want 2)  ", SchedCount())
+  Line("state 1 (want 1)", SchedState(id1))
+  Say("name 1          ", SchedName(id1))
+  Say("name 2          ", SchedName(id2))
+  Line("period 1 (want 0)", SchedPeriod(id1))
+  Line("period 2        ", SchedPeriod(id2))
+  Line("due in 1 (want 0)", SchedDueIn(id1))
+  Line("due in 2 positive", SchedDueIn(id2))
+
+  ; Fill the rest of the table and then overflow it.
+  i = SchedCount()
+  While i < SchedSlots()
+    SchedAdd(@TaskC, "filler", #PROBE_NEVER)
+    i = i + 1
+  Wend
+  Line("count when full ", SchedCount())
+  Line("add when full (want 0)", SchedAdd(@TaskD, "over", 0))
+  Say("error           ", SchedErrorText())
+
+  ; And empty it again.
+  i = 1
+  While i <= SchedSlots()
+    SchedRemove(i)
+    i = i + 1
+  Wend
+  Line("count after purge (want 0)", SchedCount())
+  PrintNl()
+
+  ; ==================================================================
+  ; C - DISPATCH. The two counts a gate can insist on exactly.
+  ; ==================================================================
+  UartWriteStr("C: dispatch")
+  PrintNl()
+  SchedInit()
+  aRuns = 0
+  bRuns = 0
+  cRuns = 0
+  id1 = SchedAdd(@TaskA, "a", 0)                 ; every pass
+  id2 = SchedAdd(@TaskB, "b", #PROBE_NEVER)      ; not during this program
+  id3 = SchedAddOnce(@TaskC, "c", 0)             ; once, next pass
+  id4 = SchedAddOnce(@NeverTask, "never", #PROBE_NEVER)
+  Spin(#PROBE_PASSES)
+  Line("passes          ", SchedPasses())
+  Line("a runs (want passes)", aRuns)
+  Line("b runs (want 0)  ", bRuns)
+  ; NeverTask adds 100, so a c count of exactly 1 says two things at
+  ; once: the immediate one-shot ran once, and the DELAYED one-shot did
+  ; not run at all.
+  Line("c runs (want 1)  ", cRuns)
+  Line("c slot freed (want 0)", SchedState(id3))
+  Line("delayed one-shot still armed (want 1)", SchedState(id4))
+  Line("count (want 3)  ", SchedCount())
+  Line("a run count     ", SchedRuns(id1))
+  Line("b run count (want 0)", SchedRuns(id2))
+
+  ; Force the slow one to be due, and it must run exactly once more.
+  Line("due now (want 1)", SchedDueNow(id2))
+  SchedPoll()
+  Line("b runs after due now (want 1)", bRuns)
+  SchedPoll()
+  SchedPoll()
+  Line("b runs still (want 1)", bRuns)
+
+  ; Pause and resume.
+  before = aRuns
+  SchedPause(id1)
+  Line("state paused (want 2)", SchedState(id1))
+  Spin(5)
+  Line("a runs while paused (want same)", aRuns - before)
+  SchedResume(id1)
+  Line("state resumed (want 1)", SchedState(id1))
+  Spin(5)
+  Line("a runs after resume (want 5)", aRuns - before)
+  PrintNl()
+
+  ; ==================================================================
+  ; D - THE ROTATION
+  ; ==================================================================
+  UartWriteStr("D: rotation")
+  PrintNl()
+  SchedInit()
+  orderN = 0
+  orderOn = 1
+  SchedAdd(@TaskA, "a", 0)
+  SchedAdd(@TaskB, "b", 0)
+  SchedAdd(@TaskC, "c", 0)
+  Spin(4)
+  orderOn = 0
+  ShowOrder("order over 4 passes")
+  Line("passes (want 4) ", SchedPasses())
+  PrintNl()
+
+  ; ==================================================================
+  ; E - RE-ENTRANCY. The guard that the compiler cannot provide.
+  ; ==================================================================
+  UartWriteStr("E: re-entrancy")
+  PrintNl()
+  SchedInit()
+  aRuns = 0
+  reentryRuns = 0
+  reentryResult = 99
+  nestedDelay = 99
+  SchedAdd(@TaskA, "a", 0)
+  SchedAdd(@ReentrantTask, "bad", 0)
+  Spin(3)
+  Line("bad task ran (want 3)", reentryRuns)
+  Line("nested poll (want -1)", reentryResult)
+  Line("nested delay (want -1)", nestedDelay)
+  Line("reentries (want 6)", SchedReentries())
+  Line("a still ran (want 3)", aRuns)
+  Say("error           ", SchedErrorText())
+
+  ; WHAT A FAULT REPORTER WOULD SEE, read from inside a running task.
+  SchedInit()
+  seenId = 0
+  seenName = 0
+  selfRemove = 99
+  SchedAdd(@TaskA, "a", 0)
+  id2 = SchedAdd(@WatcherTask, "watcher", 0)
+  SchedPoll()
+  Line("watcher id      ", id2)
+  Line("current seen from inside (want the id)", seenId)
+  Say("current name seen from inside", seenName)
+  Line("self remove (want 0)", selfRemove)
+  Line("watcher survived (want 1)", SchedState(id2))
+  Line("current after the pass (want 0)", SchedCurrent())
+  PrintNl()
+
+  ; ==================================================================
+  ; F - SchedDelay KEEPS THE OTHERS RUNNING
+  ; ==================================================================
+  UartWriteStr("F: cooperative delay")
+  PrintNl()
+  SchedInit()
+  aRuns = 0
+  SchedAdd(@TaskA, "a", 0)
+  before = aRuns
+  Line("delay 2000 us (want 1)", SchedDelay(2000))
+  Line("a ran during the delay", aRuns - before)
+  Line("delay 0 (want 1)", SchedDelay(0))
+  Line("delay -1 (want 1)", SchedDelay(0 - 1))
+  PrintNl()
+
+  ; ==================================================================
+  ; G - WHAT A SLOW TASK COSTS EVERYBODY ELSE
+  ; ==================================================================
+  UartWriteStr("G: lateness")
+  PrintNl()
+  SchedInit()
+  slowRuns = 0
+  aRuns = 0
+  id1 = SchedAdd(@SlowTask, "slow", 0)
+  id2 = SchedAdd(@TaskA, "fast", 100)            ; every 100 us
+  SchedSetBudget(id1, 10)                        ; 10 us, which it will blow
+  Spin(20)
+  Line("slow runs (want 20)", slowRuns)
+  Line("slow max us     ", SchedMaxUs(id1))
+  Line("slow last us    ", SchedLastUs(id1))
+  Line("slow total us   ", SchedTotalUs(id1))
+  Line("slow budget     ", SchedBudget(id1))
+  Line("slow overruns   ", SchedOverruns(id1))
+  Line("fast runs       ", SchedRuns(id2))
+  Line("fast late us    ", SchedLateUs(id2))
+  Line("fast missed     ", SchedMissed(id2))
+  Line("max pass us     ", SchedMaxPassUs())
+  Line("faults (want 0) ", SchedFaults())
+  PrintNl()
+
+  ; ==================================================================
+  ; H - THE INVOKER SEAM. One task faults; the rest carry on.
+  ; ==================================================================
+  UartWriteStr("H: invoker")
+  PrintNl()
+  SchedInit()
+  aRuns = 0
+  bRuns = 0
+  invokeCount = 0
+  failFn = 0
+  SchedSetInvoker(@Invoker)
+  Line("invoker set     ", SchedInvoker() - @Invoker)
+  id1 = SchedAdd(@TaskA, "a", 0)
+  id2 = SchedAdd(@TaskB, "b", 0)
+  Spin(3)
+  Line("a runs (want 3) ", aRuns)
+  Line("b runs (want 3) ", bRuns)
+  Line("invoked (want 6)", invokeCount)
+  Line("faults (want 0) ", SchedFaults())
+
+  ; Now make B fault.
+  failFn = @TaskB
+  Spin(3)
+  Line("a runs (want 6) ", aRuns)
+  Line("b runs (want 3) ", bRuns)
+  Line("b state (want 3)", SchedState(id2))
+  Line("faults (want 1) ", SchedFaults())
+  Line("a state (want 1)", SchedState(id1))
+
+  ; A failed task comes back only when it is put back deliberately.
+  failFn = 0
+  Spin(2)
+  Line("b runs while failed (want 3)", bRuns)
+  Line("resume b (want 1)", SchedResume(id2))
+  Spin(2)
+  Line("b runs after resume (want 5)", bRuns)
+  SchedSetInvoker(0)
+  Line("invoker cleared (want 0)", SchedInvoker())
+  PrintNl()
+
+  ; ==================================================================
+  ; I - THE CONVERSIONS, and that a period survives a round trip
+  ; ==================================================================
+  UartWriteStr("I: conversions")
+  PrintNl()
+  SchedInit()
+  id1 = SchedAdd(@TaskA, "a", 250000)
+  Line("period back     ", SchedPeriod(id1))
+  Line("set period 1234 (want 1)", SchedSetPeriod(id1, 1234))
+  Line("period back     ", SchedPeriod(id1))
+  Line("set period -1 (want 0)", SchedSetPeriod(id1, 0 - 1))
+  Line("set budget -1 (want 0)", SchedSetBudget(id1, 0 - 1))
+  Line("bad id period (want -1)", SchedPeriod(77))
+  Line("bad id runs (want 0)", SchedRuns(77))
+  Say("name of bad id  ", SchedName(77))
+  Say("state text 0    ", SchedStateText(0))
+  Say("state text 1    ", SchedStateText(1))
+  Say("state text 2    ", SchedStateText(2))
+  Say("state text 3    ", SchedStateText(3))
+  PrintNl()
+
+  UartWriteStr("=== done ===")
+  PrintNl()
+  ProcedureReturn 0
+EndProcedure

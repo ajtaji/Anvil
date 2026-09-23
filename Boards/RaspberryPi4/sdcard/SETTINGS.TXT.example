@@ -1,0 +1,133 @@
+# Anvil settings - EXAMPLE. Rename to SETTINGS.TXT on the boot volume.
+#
+# THIS FILE IS OPTIONAL. The board boots to a prompt without it, and a
+# missing file is not a fault - the console says so in those words. Every
+# setting below has a defined behaviour when it is absent. Start with no
+# file at all, type what you want at the prompt, and `settings save`.
+#
+# NOTHING LOADS IT FOR YOU AFTER A RESET. Bringing the medium up is slow
+# and noisy, so it is not done unasked. Type `settings load`.
+#
+# THE COMMENTS IN THIS FILE ARE NOT KEPT. `settings save` rewrites the
+# whole file from the table in memory, so the first save deletes every
+# comment here and replaces them with Anvil's own nine-line banner. That
+# is why this is an example beside the source and not the file itself.
+#
+# SYNTAX
+#   key=value          one to a line; the FIRST '=' splits, later ones
+#                      are part of the value
+#   keys               lower case (case-insensitive on read, folded),
+#                      a-z 0-9 . - _ only, at most 31 bytes
+#   values             printable ASCII 32..126, at most 95 bytes, and
+#                      may NOT begin or end with a space - that is a
+#                      refusal, not a trim
+#   # or ;             a comment line
+#   blank lines        ignored
+#   line endings       LF is written; LF, CRLF and lone CR are all read
+#   limits             32 keys, 6144 bytes; a bad line STOPS the load,
+#                      names its line number, and blocks the next save
+#                      until you type `settings discard`
+#
+# Delete every line you do not want. An unknown key is not an error - it
+# is simply stored - so a typo becomes a new setting rather than a
+# complaint.
+
+# ---------------------------------------------------------------- network
+# Static addresses for the wired interface. All optional: with none of
+# them the board takes a DHCP lease, or a link-local address it has
+# ARP-probed, and its console is reachable either way.
+#
+# A DHCP lease is runtime state and is NEVER written over these.
+# net.server is the only one `get` and `put` (TFTP) need.
+net.address=192.168.1.50
+net.netmask=255.255.255.0
+net.gateway=192.168.1.1
+net.server=192.168.1.2
+net.dns=192.168.1.1
+
+# A 169.254.x address must NEVER appear in this file. If one is saved,
+# the next boot puts it on the wire without probing whether it is still
+# free. If you find one here, a tool put it there and it is a bug.
+
+# ------------------------------------------------------------------- wi-fi
+# Four networks, slots 1 to 4. THE SLOT NUMBER IS THE ORDER THEY ARE
+# TRIED IN - slot 1 first. Ethernet needs none of this.
+#
+# THE PASSPHRASE IS STORED IN PLAIN TEXT, deliberately: the radio needs
+# the passphrase itself, and hiding it on a disk whose reader also holds
+# the key would only look like protection. Anyone who can plug this
+# medium into a computer can read it. Use a guest network if that
+# matters to you.
+#
+# So the two secret-bearing lines are left commented out here. Prefer
+# typing them at the prompt and saving:
+#     wifi ssid 1 <name>
+#     wifi phrase 1 <passphrase>
+#     settings save
+#
+#wifi.1.ssid=<your network name>
+#wifi.1.password.plaintext=<your passphrase, 8 to 63 characters>
+#
+# A third key, wifi.1.pmk.secret, is written FOR you after a successful
+# handshake: 72 hex characters caching the derived key so the next boot
+# skips a ten-second derivation. Never copy one between boards or put one
+# in a file you share - it joins the network as well as the passphrase
+# does. Anything whose name contains "password", "passphrase" or
+# "secret" is masked by `settings` and printed only by the deliberate
+# `settings reveal <name>`.
+
+# -------------------------------------------------------------------- time
+# clock.utc is a decimal Unix epoch, used as a LOWER BOUND at boot - this
+# board has no battery-backed clock, and a time it cannot justify is
+# shown as unsynchronized rather than presented as real. Anvil writes
+# this itself; there is little reason to type one.
+#clock.utc=1757980800
+clock.zone=America/Chicago
+ntp.server=time.cloudflare.com
+# clock.zone also takes UTC, or fixed:-06:00 / fixed:+01:00.
+# ntp.server defaults to time.cloudflare.com when absent, and `time sync`
+# needs a network backend.
+
+# ------------------------------------------------------------------ autoboot
+# Run a PMF container off the medium at boot, after a countdown.
+# Absent: no autoboot at all.
+#
+# boot.fails is a REBOOT-LOOP GUARD, not a statistic. It is raised before
+# each attempt and `boot ok` puts it back to 0; once it reaches
+# boot.maxfails the autoboot is abandoned and you get a prompt instead of
+# a board that reboots forever. Leave it alone.
+#boot.file=APP.PMF
+#boot.delay=2
+#boot.maxfails=3
+#boot.fails=0
+
+# --------------------------------------------------------------------- fan
+# fan.pin absent means the board's own default pin: GPIO 18 on the Pi 4
+# (PWM0, a hardware modulator), and the boot log says the pin came from
+# the default rather than from this file. If your fan is on another pin,
+# set fan.pin; to leave the fan alone, set fan.mode=off. The default
+# exists so a boot with no settings medium still cools. A pin with a
+# real hardware modulator behind it is steady at any frequency; the rest
+# are driven by a software toggle, which is fine for a two-wire fan on a
+# transistor and coarse.
+#
+# THE TEMPERATURES ARE DEGREES FAHRENHEIT, and the unit is in the key
+# name on purpose. Older fan.low / fan.high / fan.hyst keys were Celsius;
+# they are read once to migrate and then removed. Do not add them.
+#fan.pin=14
+#fan.mode=auto
+#fan.lowF=113
+#fan.highF=158
+#fan.hystF=5
+#fan.hz=25000
+# fan.mode also takes off, on, or a bare percentage for a fixed duty.
+
+# ------------------------------------------------------------ screen / touch
+# DSI panel only for screen.rotate - HDMI ignores it. Absent means the
+# panel default, which is 90: landscape on a panel that scans portrait.
+#screen.rotate=90
+# Font magnification, 1 to 8. Absent means computed from panel density.
+#screen.scale=2
+# Touch axis correction, a bitmask: 1 swap X/Y, 2 invert X, 4 invert Y.
+# 0 is aligned. Get it from `touch axes` rather than by guessing.
+#touch.axes=0

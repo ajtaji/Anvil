@@ -1,0 +1,767 @@
+; Pi 3 SDIO host transport for the on-board wireless device.
+;
+; The Pi 3 uses the Arasan SDHCI controller at ARM physical 0x3F300000
+; for SDIO. The removable boot card remains on the separate custom
+; SDHOST controller at 0x3F202000; do not route or reset that controller
+; from this file. Board/revision selection, radio reset and chip-specific
+; firmware policy are supplied by the Pi3 Wi-Fi profile layer.
+;
+; Register layout and command encoding follow the SDHCI 3.00 register
+; model used by Raspberry Pi Linux rpi-6.12.y. BCM2835-specific pinmux
+; and pulls follow bcm283x-rpi-wifi-bt.dtsi plus pinctrl-bcm2835.c.
+
+#P3SDIO_BASE = $3F300000
+#P3SDIO_GPIO = $3F200000
+
+#P3SDIO_ARG2 = $00
+#P3SDIO_BLKSIZECNT = $04
+#P3SDIO_ARG1 = $08
+#P3SDIO_CMDTM = $0C
+#P3SDIO_RESP0 = $10
+#P3SDIO_RESP1 = $14
+#P3SDIO_RESP2 = $18
+#P3SDIO_RESP3 = $1C
+#P3SDIO_BUFFER = $20
+#P3SDIO_PRESENT = $24
+#P3SDIO_CONTROL0 = $28
+#P3SDIO_CONTROL1 = $2C
+#P3SDIO_INT_STATUS = $30
+#P3SDIO_INT_ENABLE_REG = $34
+#P3SDIO_SIG_ENABLE = $38
+#P3SDIO_CAPS0 = $40
+#P3SDIO_CAPS1 = $44
+#P3SDIO_HOSTVER = $FC
+
+#P3SDIO_CMD_INHIBIT = $00000001
+#P3SDIO_DAT_INHIBIT = $00000002
+#P3SDIO_SPACE = $00000400
+#P3SDIO_DATA = $00000800
+#P3SDIO_CLK_INT_EN = $00000001
+#P3SDIO_CLK_STABLE = $00000002
+#P3SDIO_CLK_CARD_EN = $00000004
+#P3SDIO_RESET_ALL = $01000000
+#P3SDIO_RESET_CMD = $02000000
+#P3SDIO_RESET_DATA = $04000000
+#P3SDIO_INT_RESPONSE = $00000001
+#P3SDIO_INT_DATA_END = $00000002
+#P3SDIO_INT_SPACE = $00000010
+#P3SDIO_INT_DATA = $00000020
+#P3SDIO_INT_ERROR_MASK = $FFFF8000
+#P3SDIO_INT_ERROR_DETAIL = $FFFF0000
+#P3SDIO_INT_CMD_ERROR_DETAIL = $000F0000
+#P3SDIO_INT_DATA_ERROR_DETAIL = $03F00000
+#P3SDIO_INT_W1C = $FFFFFEFF
+#P3SDIO_CMD_RSP_NONE = $00000000
+#P3SDIO_CMD_RSP_48 = $00020000
+#P3SDIO_CMD_RSP_48B = $00030000
+#P3SDIO_CMD_CRC = $00080000
+#P3SDIO_CMD_INDEX = $00100000
+#P3SDIO_CMD_DATA = $00200000
+#P3SDIO_CMD0 = $00000000
+#P3SDIO_CMD3 = $031A0000
+#P3SDIO_CMD5 = $05020000
+#P3SDIO_CMD7 = $071A0000
+#P3SDIO_CMD52 = $341A0000
+#P3SDIO_CMD53_READ = $353A0012
+#P3SDIO_CMD53_WRITE = $353A0002
+#P3SDIO_CMD53_READ_MULTI = $353A0032
+#P3SDIO_CMD53_WRITE_MULTI = $353A0022
+#P3SDIO_ARG_WRITE = $80000000
+#P3SDIO_ARG_RAW = $08000000
+#P3SDIO_ARG_BLOCK = $08000000
+#P3SDIO_ARG_INCR = $04000000
+#P3SDIO_R4_READY = $80000000
+#P3SDIO_R4_NFUNC = $70000000
+#P3SDIO_R4_MEMORY = $08000000
+#P3SDIO_R4_OCR = $00FFFFFF
+#P3SDIO_OCR_32_34 = $00300000
+#P3SDIO_R5_BAD = $0000CB00
+#P3SDIO_CCCR_ABORT = $06
+#P3SDIO_CCCR_IF = $07
+#P3SDIO_CCCR_CAPS = $08
+#P3SDIO_CCCR_IOEX = $02
+#P3SDIO_CCCR_IORX = $03
+#P3SDIO_CCCR_CIS = $09
+#P3SDIO_FBR1 = $100
+#P3SDIO_CIS_MANFID = $20
+#P3SDIO_CIS_END = $FF
+#P3SDIO_TMO_RESET_US = 100000
+#P3SDIO_TMO_CMD_US = 100000
+#P3SDIO_TMO_DATA_US = 250000
+#P3SDIO_TMO_CLOCK_US = 150000
+#P3SDIO_TMO_OPCOND_US = 1000000
+; Linux sdio_enable_func() defaults to one second when the function CIS
+; does not supply its optional enable-timeout field.
+#P3SDIO_TMO_FUNC_US = 1000000
+; Linux MMC host default power_delay_ms. The Pi 3 Wi-Fi DTS does not
+; override it, so match the downstream mmc_power_up sequencing around the
+; firmware-owned reset GPIO and identification clock.
+#P3SDIO_POWER_DELAY_US = 10000
+; Linux MMC_CMD_RETRIES: three retries in addition to the initial attempt.
+#P3SDIO_CMD_RETRIES = 3
+#P3SDIO_INT_ENABLE_MASK = $FFFFFEFF
+
+Global p3_sdio_ready.i
+Global *p3_sdio_reset_callback
+Global p3_sdio_reset_wired.i
+Global p3_sdio_reset_status.i
+Global p3_sdio_go_idle_status.i
+Global p3_sdio_card_selected.i
+Global p3_sdio_error.i
+Global p3_sdio_last_command.i
+Global p3_sdio_last_interrupt.i
+Global p3_sdio_last_present.i
+Global p3_sdio_last_r5.i
+Global p3_sdio_clock_hz.i
+Global p3_sdio_clock_now.i
+Global p3_sdio_host_version.i
+Global p3_sdio_capabilities.i
+Global p3_sdio_ocr.i
+Global p3_sdio_functions.i
+Global p3_sdio_rca.i
+Global p3_sdio_bus_width.i
+Global p3_sdio_resp0.i
+Global p3_sdio_resp1.i
+Global p3_sdio_resp2.i
+Global p3_sdio_resp3.i
+Global p3_sdio_cmd52_count.i
+Global p3_sdio_cmd53_count.i
+Global p3_sdio_bytes.i
+Global p3_sdio_cis_vendor.i
+Global p3_sdio_cis_device.i
+Global p3_sdio_func1_vendor.i
+Global p3_sdio_func1_device.i
+Global p3_sdio_cccr_revision.i
+Global p3_sdio_cccr_capabilities.i
+Global p3_sdio_fault_latched.i
+
+Procedure.i Pi3SdioReadReg(offset.i)
+  ProcedureReturn PeekN(#P3SDIO_BASE + offset)
+EndProcedure
+
+Procedure Pi3SdioWriteReg(offset.i, value.i)
+  PokeL(#P3SDIO_BASE + offset, value)
+  ; sdhci-iproc.c's BCM2835 32-bit-only writer delays four SD-clock
+  ; cycles after every write at identification speeds. At 400 kHz this
+  ; rounds up to 10 us; the delay is absent once the bus is faster.
+  If p3_sdio_clock_now <= 400000
+    If p3_sdio_clock_now > 0
+      Pi3SdioDelayUs((4000000 + p3_sdio_clock_now - 1) / p3_sdio_clock_now)
+    Else
+      Pi3SdioDelayUs(10)
+    EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Pi3SdioTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i Pi3SdioTickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i Pi3SdioExpired(start.i, microseconds.i)
+  ProcedureReturn ((Pi3SdioTicks() - start) * 1000000 / Pi3SdioTickHz()) >= microseconds
+EndProcedure
+
+; The board layer supplies its firmware-owned reset callback and whether
+; the selected Pi 3 DTS wires that line. The transport owns timing relative
+; to host power and the identification clock, matching MMC core sequencing.
+Procedure Pi3SdioSetResetCallback(*callback, wired.i)
+  *p3_sdio_reset_callback = *callback
+  p3_sdio_reset_wired = Bool(wired <> 0)
+EndProcedure
+
+Procedure Pi3SdioDelayUs(microseconds.i)
+  Protected start.i
+  start = Pi3SdioTicks()
+  While Pi3SdioExpired(start, microseconds) = 0
+  Wend
+EndProcedure
+
+Procedure.i Pi3SdioFail(code.i)
+  If p3_sdio_fault_latched = 0
+    p3_sdio_error = code
+    p3_sdio_last_interrupt = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+    p3_sdio_last_present = Pi3SdioReadReg(#P3SDIO_PRESENT)
+    p3_sdio_fault_latched = 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3SdioFailSnapshot(code.i, interrupt.i, present.i)
+  If p3_sdio_fault_latched = 0
+    p3_sdio_error = code
+    p3_sdio_last_interrupt = interrupt & $FFFFFFFF
+    p3_sdio_last_present = present & $FFFFFFFF
+    p3_sdio_fault_latched = 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3SdioResetLines(mask.i)
+  Protected start.i
+  Pi3SdioWriteReg(#P3SDIO_CONTROL1, Pi3SdioReadReg(#P3SDIO_CONTROL1) | mask)
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_CONTROL1) & mask) <> 0
+    If Pi3SdioExpired(start, #P3SDIO_TMO_RESET_US) <> 0 : ProcedureReturn 0 : EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; Apply the exact GPIO group from bcm283x-rpi-wifi-bt.dtsi: pins 34..39,
+; ALT3; no pull on clock and pull-up on command/data. BCM2837 uses the
+; legacy GPPUD/GPPUDCLK sequence, unlike BCM2711's PUP_PDN registers.
+Procedure.i Pi3SdioMuxPins()
+  Protected fsel.i
+  Protected i.i
+  For i = 0 To 5
+    fsel = PeekN(#P3SDIO_GPIO + $0C)
+    fsel = fsel & (~(7 << (12 + i * 3)))
+    ; The BCM2835 pinctrl implementation passes through GPIO input when
+    ; moving between two alternate functions, then selects the new mux.
+    ; This prevents a transient driven level during handoff.
+    PokeL(#P3SDIO_GPIO + $0C, fsel)
+    fsel = fsel | (7 << (12 + i * 3))
+    PokeL(#P3SDIO_GPIO + $0C, fsel)
+  Next
+  PokeL(#P3SDIO_GPIO + $94, 0)
+  Pi3SdioDelayUs(1)
+  PokeL(#P3SDIO_GPIO + $9C, $00000004)
+  Pi3SdioDelayUs(1)
+  PokeL(#P3SDIO_GPIO + $9C, 0)
+  PokeL(#P3SDIO_GPIO + $94, 2)
+  Pi3SdioDelayUs(1)
+  PokeL(#P3SDIO_GPIO + $9C, $000000F8)
+  Pi3SdioDelayUs(1)
+  PokeL(#P3SDIO_GPIO + $9C, 0)
+  PokeL(#P3SDIO_GPIO + $94, 0)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioSetClock(wantHz.i)
+  Protected baseHz.i
+  Protected divisor.i
+  Protected encodedDivisor.i
+  Protected clockWord.i
+  Protected start.i
+  Protected nextHz.i
+  If wantHz <= 0 Or p3_sdio_clock_hz <= 0 : ProcedureReturn Pi3SdioFail(2) : EndIf
+  baseHz = p3_sdio_clock_hz
+  If p3_sdio_host_version >= 2
+    ; SDHCI 3.00+: divisor is 1 or an even value. The register stores
+    ; divisor/2 in its 10-bit field (Linux sdhci_calc_clk).
+    If baseHz <= wantHz
+      divisor = 1
+    Else
+      divisor = 2
+      While divisor <= 2046 And (baseHz / divisor) > wantHz
+        divisor = divisor + 2
+      Wend
+    EndIf
+    If divisor > 2046 Or (baseHz / divisor) > wantHz : ProcedureReturn Pi3SdioFail(2) : EndIf
+    encodedDivisor = divisor >> 1
+  Else
+    ; SDHCI 1.00/2.00: only power-of-two divisors through 256 exist.
+    divisor = 1
+    While divisor <= 256 And (baseHz / divisor) > wantHz
+      divisor = divisor << 1
+    Wend
+    If divisor > 256 Or (baseHz / divisor) > wantHz : ProcedureReturn Pi3SdioFail(2) : EndIf
+    encodedDivisor = divisor >> 1
+  EndIf
+  nextHz = baseHz / divisor
+  Pi3SdioWriteReg(#P3SDIO_CONTROL1, Pi3SdioReadReg(#P3SDIO_CONTROL1) & (~#P3SDIO_CLK_CARD_EN))
+  clockWord = $000E0000 | ((encodedDivisor & $FF) << 8) | (((encodedDivisor >> 8) & 3) << 6) | #P3SDIO_CLK_INT_EN
+  Pi3SdioWriteReg(#P3SDIO_CONTROL1, clockWord)
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_CONTROL1) & #P3SDIO_CLK_STABLE) = 0
+    If Pi3SdioExpired(start, #P3SDIO_TMO_CLOCK_US) <> 0 : ProcedureReturn Pi3SdioFail(3) : EndIf
+  Wend
+  Pi3SdioWriteReg(#P3SDIO_CONTROL1, clockWord | #P3SDIO_CLK_CARD_EN)
+  p3_sdio_clock_now = nextHz
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioWaitIdle(data.i)
+  Protected mask.i
+  Protected start.i
+  mask = #P3SDIO_CMD_INHIBIT
+  If data <> 0 : mask = mask | #P3SDIO_DAT_INHIBIT : EndIf
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_PRESENT) & mask) <> 0
+    If Pi3SdioExpired(start, #P3SDIO_TMO_CMD_US) <> 0
+      Pi3SdioFailSnapshot(4, Pi3SdioReadReg(#P3SDIO_INT_STATUS), Pi3SdioReadReg(#P3SDIO_PRESENT))
+      If data <> 0
+        Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      Else
+        Pi3SdioResetLines(#P3SDIO_RESET_CMD)
+      EndIf
+      ProcedureReturn Pi3SdioFail(4)
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioCommand(cmdtm.i, argument.i, timeoutOk.i)
+  Protected start.i
+  Protected status.i
+  Protected responseKind.i
+  Protected waitData.i
+  p3_sdio_last_command = (cmdtm >> 24) & $3F
+  responseKind = cmdtm & $00030000
+  waitData = 0
+  p3_sdio_fault_latched = 0
+  p3_sdio_error = 0
+  If responseKind = $00030000 Or (cmdtm & #P3SDIO_CMD_DATA) <> 0 : waitData = 1 : EndIf
+  If Pi3SdioWaitIdle(waitData) = 0 : ProcedureReturn 0 : EndIf
+  Pi3SdioWriteReg(#P3SDIO_INT_STATUS, #P3SDIO_INT_W1C)
+  Pi3SdioWriteReg(#P3SDIO_ARG1, argument)
+  Pi3SdioWriteReg(#P3SDIO_CMDTM, cmdtm)
+  start = Pi3SdioTicks()
+  Repeat
+    status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+    If (status & (#P3SDIO_INT_RESPONSE | #P3SDIO_INT_ERROR_MASK)) <> 0 : Break : EndIf
+    If Pi3SdioExpired(start, #P3SDIO_TMO_CMD_US) <> 0
+      Pi3SdioFailSnapshot(5, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+      Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      ProcedureReturn Pi3SdioFail(5)
+    EndIf
+  ForEver
+  If (status & #P3SDIO_INT_ERROR_MASK) <> 0
+    Pi3SdioFailSnapshot(6, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+    Pi3SdioWriteReg(#P3SDIO_INT_STATUS, status & #P3SDIO_INT_W1C)
+    ; This is the synchronous equivalent of Linux's REQUEST_ERROR path:
+    ; sdhci_reset_for_reason() resets CMD then DATA. DATA_ONLY is a separate
+    ; concurrent-request recovery reason and does not apply here.
+    If Pi3SdioResetLines(#P3SDIO_RESET_CMD) = 0 : ProcedureReturn Pi3SdioFail(6) : EndIf
+    If Pi3SdioResetLines(#P3SDIO_RESET_DATA) = 0 : ProcedureReturn Pi3SdioFail(6) : EndIf
+    If (status & #P3SDIO_INT_ERROR_DETAIL) = $00010000 And timeoutOk <> 0
+      ProcedureReturn -1
+    EndIf
+    ProcedureReturn Pi3SdioFail(6)
+  EndIf
+  Pi3SdioWriteReg(#P3SDIO_INT_STATUS, #P3SDIO_INT_RESPONSE)
+  p3_sdio_resp0 = Pi3SdioReadReg(#P3SDIO_RESP0)
+  p3_sdio_resp1 = 0 : p3_sdio_resp2 = 0 : p3_sdio_resp3 = 0
+  If responseKind <> #P3SDIO_CMD_RSP_NONE
+    If responseKind = $00010000
+      p3_sdio_resp1 = Pi3SdioReadReg(#P3SDIO_RESP1)
+      p3_sdio_resp2 = Pi3SdioReadReg(#P3SDIO_RESP2)
+      p3_sdio_resp3 = Pi3SdioReadReg(#P3SDIO_RESP3)
+    EndIf
+  EndIf
+  If responseKind = #P3SDIO_CMD_RSP_48B
+    start = Pi3SdioTicks()
+    Repeat
+      status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+      If (status & #P3SDIO_INT_DATA_END) <> 0
+        Pi3SdioWriteReg(#P3SDIO_INT_STATUS, #P3SDIO_INT_DATA_END)
+        Break
+      EndIf
+      If (Pi3SdioReadReg(#P3SDIO_PRESENT) & #P3SDIO_DAT_INHIBIT) = 0 : Break : EndIf
+      If Pi3SdioExpired(start, #P3SDIO_TMO_DATA_US) <> 0
+        Pi3SdioFailSnapshot(7, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+        Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+        ProcedureReturn Pi3SdioFail(7)
+      EndIf
+    ForEver
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Linux mmc_wait_for_cmd()'s retry count is three retries after the first
+; attempt. A response-level R1/R5 error is still interpreted by the caller.
+Procedure.i Pi3SdioCommandRetry(cmdtm.i, argument.i, timeoutOk.i)
+  Protected attempt.i
+  Protected result.i
+  For attempt = 0 To #P3SDIO_CMD_RETRIES
+    result = Pi3SdioCommand(cmdtm, argument, timeoutOk)
+    If result = 1 : ProcedureReturn 1 : EndIf
+  Next
+  ProcedureReturn result
+EndProcedure
+
+; Linux sdio_reset(): read CCCR_ABORT through function-zero CMD52, set RES,
+; then write it back with RAW clear (the Linux call passes no readback ptr).
+; If the read fails, it writes 0x08. The rescan caller ignores reset's
+; return and still proceeds to GO_IDLE, so this operation is best effort.
+Procedure Pi3SdioResetCard()
+  Protected result.i
+  Protected abortValue.i
+  abortValue = 8
+  result = Pi3SdioCommand(#P3SDIO_CMD52, #P3SDIO_CCCR_ABORT << 9, 0)
+  If result = 1
+    p3_sdio_last_r5 = p3_sdio_resp0 & $FFFF
+    If (p3_sdio_last_r5 & #P3SDIO_R5_BAD) = 0
+      abortValue = (p3_sdio_resp0 & $FF) | 8
+      p3_sdio_reset_status = 1
+    Else
+      p3_sdio_reset_status = 2
+    EndIf
+  Else
+    p3_sdio_reset_status = 2
+  EndIf
+  result = Pi3SdioCommand(#P3SDIO_CMD52, #P3SDIO_ARG_WRITE | (#P3SDIO_CCCR_ABORT << 9) | abortValue, 0)
+  If result = 1
+    p3_sdio_last_r5 = p3_sdio_resp0 & $FFFF
+    If (p3_sdio_last_r5 & #P3SDIO_R5_BAD) <> 0
+      p3_sdio_reset_status = 3
+    ElseIf p3_sdio_reset_status = 1
+      p3_sdio_reset_status = 1
+    EndIf
+  Else
+    p3_sdio_reset_status = 3
+  EndIf
+  ; A failed optional reset is not the final enumeration error. Keep its
+  ; latched interrupt/present snapshot, clear only the error code/latch.
+  p3_sdio_error = 0
+  p3_sdio_fault_latched = 0
+EndProcedure
+
+; mmc_go_idle(): native SDHCI has no SPI chip-select register, so the two
+; set_ios(CS_HIGH/CS_DONTCARE) calls are no-ops; retain Linux's three 1 ms
+; settling intervals around CMD0.
+Procedure Pi3SdioGoIdle()
+  Pi3SdioDelayUs(1000)
+  p3_sdio_go_idle_status = Pi3SdioCommand(#P3SDIO_CMD0, 0, 0)
+  Pi3SdioDelayUs(1000)
+  Pi3SdioDelayUs(1000)
+  ; mmc_rescan_try_freq() intentionally ignores mmc_go_idle()'s return.
+  ; Preserve its snapshot but let the required CMD5 status own p3_sdio_error.
+  p3_sdio_error = 0
+  p3_sdio_fault_latched = 0
+EndProcedure
+
+Procedure.i Pi3SdioCmd52Read(fn.i, address.i)
+  Protected argument.i
+  If p3_sdio_card_selected = 0 Or fn < 0 Or fn > 7 Or address < 0 Or address > $1FFFF : ProcedureReturn -1 : EndIf
+  argument = (fn << 28) | (address << 9)
+  If Pi3SdioCommand(#P3SDIO_CMD52, argument, 0) <> 1 : ProcedureReturn -1 : EndIf
+  p3_sdio_last_r5 = p3_sdio_resp0 & $FFFF
+  If (p3_sdio_last_r5 & #P3SDIO_R5_BAD) <> 0 : ProcedureReturn -1 : EndIf
+  p3_sdio_cmd52_count + 1
+  ProcedureReturn p3_sdio_resp0 & $FF
+EndProcedure
+
+Procedure.i Pi3SdioCmd52Write(fn.i, address.i, value.i)
+  Protected argument.i
+  If p3_sdio_card_selected = 0 Or fn < 0 Or fn > 7 Or address < 0 Or address > $1FFFF : ProcedureReturn 0 : EndIf
+  argument = #P3SDIO_ARG_WRITE | #P3SDIO_ARG_RAW | (fn << 28) | (address << 9) | (value & $FF)
+  If Pi3SdioCommand(#P3SDIO_CMD52, argument, 0) <> 1 : ProcedureReturn 0 : EndIf
+  p3_sdio_last_r5 = p3_sdio_resp0 & $FFFF
+  If (p3_sdio_last_r5 & #P3SDIO_R5_BAD) <> 0 : ProcedureReturn 0 : EndIf
+  p3_sdio_cmd52_count + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioCmd53(dir.i, fn.i, address.i, *buffer, bytes.i, increment.i)
+  Protected argument.i
+  Protected command.i
+  Protected mode.i
+  Protected words.i
+  Protected i.i
+  Protected status.i
+  Protected start.i
+  Protected p.i
+  If p3_sdio_ready = 0 Or *buffer = 0 Or (*buffer & 3) <> 0 Or fn < 0 Or fn > 7 Or address < 0 Or address > $1FFFF Or bytes < 4 Or bytes > 512 Or (bytes & 3) <> 0 : ProcedureReturn 0 : EndIf
+  If increment <> 0 And bytes - 1 > $1FFFF - address : ProcedureReturn 0 : EndIf
+  ; SDIO byte-mode count is nine bits; zero represents 512 bytes.
+  argument = (fn << 28) | (address << 9) | (bytes & $1FF)
+  mode = 2
+  If increment <> 0 : argument = argument | #P3SDIO_ARG_INCR : EndIf
+  If dir <> 0
+    command = #P3SDIO_CMD53_READ
+    mode = mode | $10
+  Else
+    command = #P3SDIO_CMD53_WRITE
+    argument = argument | #P3SDIO_ARG_WRITE
+  EndIf
+  Pi3SdioWriteReg(#P3SDIO_BLKSIZECNT, $00010000 | bytes)
+  If Pi3SdioCommand(command | mode, argument, 0) <> 1 : ProcedureReturn 0 : EndIf
+  p3_sdio_last_r5 = p3_sdio_resp0 & $FFFF
+  If (p3_sdio_last_r5 & #P3SDIO_R5_BAD) <> 0
+    Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+    ProcedureReturn 0
+  EndIf
+  words = bytes / 4
+  p = *buffer
+  If dir <> 0 : status = #P3SDIO_INT_DATA : Else : status = #P3SDIO_INT_SPACE : EndIf
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_INT_STATUS) & status) = 0
+    If (Pi3SdioReadReg(#P3SDIO_INT_STATUS) & #P3SDIO_INT_ERROR_MASK) <> 0
+      status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+      Pi3SdioFailSnapshot(8, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+      Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      ProcedureReturn Pi3SdioFail(8)
+    EndIf
+    If Pi3SdioExpired(start, #P3SDIO_TMO_DATA_US) <> 0
+      status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+      Pi3SdioFailSnapshot(8, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+      Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      ProcedureReturn Pi3SdioFail(8)
+    EndIf
+  Wend
+  Pi3SdioWriteReg(#P3SDIO_INT_STATUS, status)
+  For i = 0 To words - 1
+    If dir <> 0
+      PokeL(p, Pi3SdioReadReg(#P3SDIO_BUFFER))
+    Else
+      Pi3SdioWriteReg(#P3SDIO_BUFFER, PeekN(p))
+    EndIf
+    p = p + 4
+  Next
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_INT_STATUS) & #P3SDIO_INT_DATA_END) = 0
+    If (Pi3SdioReadReg(#P3SDIO_INT_STATUS) & #P3SDIO_INT_ERROR_MASK) <> 0
+      status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+      Pi3SdioFailSnapshot(9, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+      Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      ProcedureReturn Pi3SdioFail(9)
+    EndIf
+    If Pi3SdioExpired(start, #P3SDIO_TMO_DATA_US) <> 0
+      status = Pi3SdioReadReg(#P3SDIO_INT_STATUS)
+      Pi3SdioFailSnapshot(9, status, Pi3SdioReadReg(#P3SDIO_PRESENT))
+      Pi3SdioResetLines(#P3SDIO_RESET_CMD | #P3SDIO_RESET_DATA)
+      ProcedureReturn Pi3SdioFail(9)
+    EndIf
+  Wend
+  Pi3SdioWriteReg(#P3SDIO_INT_STATUS, #P3SDIO_INT_DATA_END)
+  p3_sdio_cmd53_count + 1
+  p3_sdio_bytes = p3_sdio_bytes + bytes
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioCmd53Read(fn.i, address.i, *buffer, bytes.i, increment.i)
+  ProcedureReturn Pi3SdioCmd53(1, fn, address, *buffer, bytes, increment)
+EndProcedure
+
+Procedure.i Pi3SdioCmd53Write(fn.i, address.i, *buffer, bytes.i, increment.i)
+  ProcedureReturn Pi3SdioCmd53(0, fn, address, *buffer, bytes, increment)
+EndProcedure
+
+; Read a CIS tuple chain through CMD52. Linux sdio_cis.c uses this same
+; byte-addressed tuple format for both the common CIS and a function CIS.
+; Every pointer, tuple length and traversal is bounded before another bus
+; access; unknown tuples are skipped rather than interpreted as identity.
+Procedure.i Pi3SdioCisManfid(pointer.i, *vendor, *device)
+  Protected tuple.i
+  Protected length.i
+  Protected value.i
+  Protected vendorValue.i
+  Protected deviceValue.i
+  Protected walk.i
+  Protected i.i
+  If pointer < 1 Or pointer > $1FFFF Or *vendor = 0 Or *device = 0
+    ProcedureReturn 0
+  EndIf
+  vendorValue = 0 : deviceValue = 0
+  walk = pointer
+  For i = 0 To 127
+    tuple = Pi3SdioCmd52Read(0, walk)
+    If tuple < 0 : ProcedureReturn 0 : EndIf
+    If tuple = #P3SDIO_CIS_END : ProcedureReturn 2 : EndIf
+    If tuple = 0
+      walk = walk + 1
+    Else
+      If walk >= $1FFFF : ProcedureReturn 0 : EndIf
+      length = Pi3SdioCmd52Read(0, walk + 1)
+      If length < 0 Or length > $1FD Or walk + 2 + length > $1FFFF : ProcedureReturn 0 : EndIf
+      ; Linux sdio_cis.c treats a 0xFF link length as end-of-chain too.
+      If length = $FF : ProcedureReturn 2 : EndIf
+      If tuple = #P3SDIO_CIS_MANFID And length >= 4
+        value = Pi3SdioCmd52Read(0, walk + 2)
+        If value < 0 : ProcedureReturn 0 : EndIf
+        vendorValue = value
+        value = Pi3SdioCmd52Read(0, walk + 3)
+        If value < 0 : ProcedureReturn 0 : EndIf
+        vendorValue = vendorValue | (value << 8)
+        value = Pi3SdioCmd52Read(0, walk + 4)
+        If value < 0 : ProcedureReturn 0 : EndIf
+        deviceValue = value
+        value = Pi3SdioCmd52Read(0, walk + 5)
+        If value < 0 : ProcedureReturn 0 : EndIf
+        deviceValue = deviceValue | (value << 8)
+        PokeL(*vendor, vendorValue) : PokeL(*device, deviceValue)
+        ProcedureReturn 1
+      EndIf
+      walk = walk + 2 + length
+    EndIf
+    If walk > $1FFFF : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3SdioCisPointer(base.i)
+  Protected b0.i
+  Protected b1.i
+  Protected b2.i
+  ; Both CCCR_CIS and FBR_CIS pointers are read via function zero.
+  b0 = Pi3SdioCmd52Read(0, base)
+  b1 = Pi3SdioCmd52Read(0, base + 1)
+  b2 = Pi3SdioCmd52Read(0, base + 2)
+  If b0 < 0 Or b1 < 0 Or b2 < 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn b0 | (b1 << 8) | (b2 << 16)
+EndProcedure
+
+; Discover only standardized SDIO identifiers. This does not enable a
+; function, touch the Broadcom backplane, select firmware, or write radio
+; registers. A later driver step must read the actual silicon chip/revision
+; before calling Pi3WifiResolveProfile().
+Procedure.i Pi3SdioDiscover()
+  Protected pointer.i
+  p3_sdio_cis_vendor = 0 : p3_sdio_cis_device = 0
+  p3_sdio_func1_vendor = 0 : p3_sdio_func1_device = 0
+  p3_sdio_cccr_revision = Pi3SdioCmd52Read(0, 0)
+  p3_sdio_cccr_capabilities = Pi3SdioCmd52Read(0, #P3SDIO_CCCR_CAPS)
+  If p3_sdio_cccr_revision < 0 Or p3_sdio_cccr_capabilities < 0 : ProcedureReturn 0 : EndIf
+  pointer = Pi3SdioCisPointer(#P3SDIO_CCCR_CIS)
+  If pointer = 0 : ProcedureReturn 0 : EndIf
+  If Pi3SdioCisManfid(pointer, @p3_sdio_cis_vendor, @p3_sdio_cis_device) = 0 : ProcedureReturn 0 : EndIf
+  If p3_sdio_functions < 1 : ProcedureReturn 1 : EndIf
+  pointer = Pi3SdioCisPointer(#P3SDIO_FBR1 + #P3SDIO_CCCR_CIS)
+  If pointer = 0 : ProcedureReturn 0 : EndIf
+  If Pi3SdioCisManfid(pointer, @p3_sdio_func1_vendor, @p3_sdio_func1_device) = 0
+    ProcedureReturn 0
+  EndIf
+  ; Function MANFID is optional in Linux's SDIO core; inherit the card ID.
+  If p3_sdio_func1_vendor = 0
+    p3_sdio_func1_vendor = p3_sdio_cis_vendor
+    p3_sdio_func1_device = p3_sdio_cis_device
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Linux's sdio_enable_func() reads IOEx, sets one bit and polls IORx with
+; the function's CIS enable timeout (one second when absent). This first
+; transport milestone uses that documented default and only functions 1/2.
+Procedure.i Pi3SdioEnableFunction(fn.i)
+  Protected ioex.i
+  Protected start.i
+  Protected iorx.i
+  If p3_sdio_ready = 0 Or fn < 1 Or fn > p3_sdio_functions Or fn > 7
+    ProcedureReturn 0
+  EndIf
+  ioex = Pi3SdioCmd52Read(0, #P3SDIO_CCCR_IOEX)
+  If ioex < 0 : ProcedureReturn 0 : EndIf
+  If (ioex & (1 << fn)) = 0
+    If Pi3SdioCmd52Write(0, #P3SDIO_CCCR_IOEX, ioex | (1 << fn)) = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  start = Pi3SdioTicks()
+  Repeat
+    iorx = Pi3SdioCmd52Read(0, #P3SDIO_CCCR_IORX)
+    If iorx < 0 : ProcedureReturn 0 : EndIf
+    If (iorx & (1 << fn)) <> 0 : ProcedureReturn 1 : EndIf
+    If Pi3SdioExpired(start, #P3SDIO_TMO_FUNC_US) <> 0 : ProcedureReturn 0 : EndIf
+  ForEver
+EndProcedure
+
+; The caller has selected a validated Pi3 board profile and passed its
+; measured host source clock. Reset is asserted before host power-up,
+; released after Linux's default power delay, then the identification clock
+; is enabled and allowed another power-delay interval before CMD0/CMD5.
+; This never resets boot SDHOST or chooses radio firmware.
+Procedure.i Pi3SdioInit(baseClockHz.i, busWidth.i)
+  Protected start.i
+  Protected r.i
+  Protected ocr.i
+  Protected control.i
+  p3_sdio_ready = 0 : p3_sdio_error = 0 : p3_sdio_fault_latched = 0
+  p3_sdio_reset_status = 0 : p3_sdio_go_idle_status = 0
+  p3_sdio_card_selected = 0
+  p3_sdio_clock_hz = baseClockHz : p3_sdio_clock_now = 0
+  p3_sdio_ocr = 0 : p3_sdio_functions = 0 : p3_sdio_rca = 0
+  p3_sdio_bus_width = 1 : p3_sdio_cis_vendor = 0 : p3_sdio_cis_device = 0
+  If Pi3SdioTickHz() < 1000000 Or Pi3SdioTickHz() > 1000000000 Or baseClockHz < 1000000 Or busWidth <> 4 : ProcedureReturn Pi3SdioFail(1) : EndIf
+  Pi3SdioMuxPins()
+  p3_sdio_host_version = (Pi3SdioReadReg(#P3SDIO_HOSTVER) >> 16) & $FF
+  p3_sdio_capabilities = Pi3SdioReadReg(#P3SDIO_CAPS0)
+  If p3_sdio_host_version > 3 : ProcedureReturn Pi3SdioFail(10) : EndIf
+  Pi3SdioWriteReg(#P3SDIO_CONTROL1, #P3SDIO_RESET_ALL)
+  start = Pi3SdioTicks()
+  While (Pi3SdioReadReg(#P3SDIO_CONTROL1) & #P3SDIO_RESET_ALL) <> 0
+    If Pi3SdioExpired(start, #P3SDIO_TMO_RESET_US) <> 0 : ProcedureReturn Pi3SdioFail(11) : EndIf
+  Wend
+  If p3_sdio_reset_wired <> 0
+    If *p3_sdio_reset_callback = 0 : ProcedureReturn Pi3SdioFail(22) : EndIf
+    If p3_sdio_reset_callback(1) = 0 : ProcedureReturn Pi3SdioFail(22) : EndIf
+  EndIf
+  Pi3SdioWriteReg(#P3SDIO_CONTROL0, $00000F00)
+  Pi3SdioDelayUs(#P3SDIO_POWER_DELAY_US)
+  If p3_sdio_reset_wired <> 0
+    If p3_sdio_reset_callback(0) = 0 : ProcedureReturn Pi3SdioFail(23) : EndIf
+  EndIf
+  If Pi3SdioSetClock(400000) = 0 : ProcedureReturn 0 : EndIf
+  Pi3SdioDelayUs(#P3SDIO_POWER_DELAY_US)
+  Pi3SdioWriteReg(#P3SDIO_INT_ENABLE_REG, #P3SDIO_INT_ENABLE_MASK)
+  Pi3SdioWriteReg(#P3SDIO_SIG_ENABLE, 0)
+  Pi3SdioWriteReg(#P3SDIO_INT_STATUS, #P3SDIO_INT_W1C)
+  Pi3SdioResetCard()
+  Pi3SdioGoIdle()
+  r = Pi3SdioCommandRetry(#P3SDIO_CMD5, 0, 1)
+  If r = -1 : ProcedureReturn Pi3SdioFail(13) : EndIf
+  If r <> 1 : ProcedureReturn 0 : EndIf
+  p3_sdio_functions = (p3_sdio_resp0 & #P3SDIO_R4_NFUNC) >> 28
+  If p3_sdio_functions < 1 : ProcedureReturn Pi3SdioFail(14) : EndIf
+  ocr = p3_sdio_resp0 & #P3SDIO_R4_OCR
+  ocr = ocr & #P3SDIO_OCR_32_34
+  If ocr = 0 : ProcedureReturn Pi3SdioFail(15) : EndIf
+  start = Pi3SdioTicks()
+  Repeat
+    r = Pi3SdioCommandRetry(#P3SDIO_CMD5, ocr, 0)
+    If r <> 1 : ProcedureReturn 0 : EndIf
+    If (p3_sdio_resp0 & #P3SDIO_R4_READY) <> 0 : Break : EndIf
+    If Pi3SdioExpired(start, #P3SDIO_TMO_OPCOND_US) <> 0 : ProcedureReturn Pi3SdioFail(16) : EndIf
+    Pi3SdioDelayUs(10000)
+  ForEver
+  p3_sdio_ocr = p3_sdio_resp0
+  If Pi3SdioCommandRetry(#P3SDIO_CMD3, 0, 0) <> 1 : ProcedureReturn Pi3SdioFail(17) : EndIf
+  If (p3_sdio_resp0 & $0000E000) <> 0 : ProcedureReturn Pi3SdioFail(17) : EndIf
+  p3_sdio_rca = (p3_sdio_resp0 >> 16) & $FFFF
+  If p3_sdio_rca = 0 : ProcedureReturn Pi3SdioFail(18) : EndIf
+  If Pi3SdioCommandRetry(#P3SDIO_CMD7, p3_sdio_rca << 16, 0) <> 1 : ProcedureReturn Pi3SdioFail(19) : EndIf
+  If (p3_sdio_resp0 & $FFF9A080) <> 0 : ProcedureReturn Pi3SdioFail(19) : EndIf
+  p3_sdio_card_selected = 1
+  If Pi3SdioSetClock(25000000) = 0 : ProcedureReturn 0 : EndIf
+  control = Pi3SdioCmd52Read(0, #P3SDIO_CCCR_IF)
+  If control < 0 : ProcedureReturn Pi3SdioFail(20) : EndIf
+  control = (control & $FC) | 2
+  If Pi3SdioCmd52Write(0, #P3SDIO_CCCR_IF, control) = 0 : ProcedureReturn Pi3SdioFail(21) : EndIf
+  control = Pi3SdioReadReg(#P3SDIO_CONTROL0) & (~2)
+  Pi3SdioWriteReg(#P3SDIO_CONTROL0, control | 2)
+  p3_sdio_bus_width = 4
+  p3_sdio_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3SdioReady() : ProcedureReturn p3_sdio_ready : EndProcedure
+Procedure.i Pi3SdioError() : ProcedureReturn p3_sdio_error : EndProcedure
+Procedure.i Pi3SdioResetStatus() : ProcedureReturn p3_sdio_reset_status : EndProcedure
+Procedure.i Pi3SdioGoIdleStatus() : ProcedureReturn p3_sdio_go_idle_status : EndProcedure
+Procedure.i Pi3SdioLastCommand() : ProcedureReturn p3_sdio_last_command : EndProcedure
+Procedure.i Pi3SdioLastInterrupt() : ProcedureReturn p3_sdio_last_interrupt : EndProcedure
+Procedure.i Pi3SdioLastPresent() : ProcedureReturn p3_sdio_last_present : EndProcedure
+Procedure.i Pi3SdioLastR5() : ProcedureReturn p3_sdio_last_r5 : EndProcedure
+Procedure.i Pi3SdioHostVersion() : ProcedureReturn p3_sdio_host_version : EndProcedure
+Procedure.i Pi3SdioCapabilities() : ProcedureReturn p3_sdio_capabilities : EndProcedure
+Procedure.i Pi3SdioOcr() : ProcedureReturn p3_sdio_ocr : EndProcedure
+Procedure.i Pi3SdioFunctionCount() : ProcedureReturn p3_sdio_functions : EndProcedure
+Procedure.i Pi3SdioRca() : ProcedureReturn p3_sdio_rca : EndProcedure
+Procedure.i Pi3SdioClockHz() : ProcedureReturn p3_sdio_clock_now : EndProcedure
+Procedure.i Pi3SdioBusWidth() : ProcedureReturn p3_sdio_bus_width : EndProcedure
+Procedure.i Pi3SdioCmd52Count() : ProcedureReturn p3_sdio_cmd52_count : EndProcedure
+Procedure.i Pi3SdioCmd53Count() : ProcedureReturn p3_sdio_cmd53_count : EndProcedure
+Procedure.i Pi3SdioBytesMoved() : ProcedureReturn p3_sdio_bytes : EndProcedure
+Procedure.i Pi3SdioCisVendor() : ProcedureReturn p3_sdio_cis_vendor : EndProcedure
+Procedure.i Pi3SdioCisDevice() : ProcedureReturn p3_sdio_cis_device : EndProcedure
+Procedure.i Pi3SdioFunc1Vendor() : ProcedureReturn p3_sdio_func1_vendor : EndProcedure
+Procedure.i Pi3SdioFunc1Device() : ProcedureReturn p3_sdio_func1_device : EndProcedure
+Procedure.i Pi3SdioCccrRevision() : ProcedureReturn p3_sdio_cccr_revision : EndProcedure
+Procedure.i Pi3SdioCccrCapabilities() : ProcedureReturn p3_sdio_cccr_capabilities : EndProcedure

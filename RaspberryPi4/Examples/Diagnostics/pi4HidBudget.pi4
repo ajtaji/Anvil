@@ -1,0 +1,144 @@
+; ======================================================================
+; pi4HidBudget.pi4 - HOW MUCH OF THE WATCHDOG BUDGET IS GONE BEFORE THE
+; USB STACK EVEN STARTS.
+; ----------------------------------------------------------------------
+; The BCM2711 watchdog cannot be armed past PM_WDOG_MAX_TICKS $000FFFFF,
+; about 15.999 s - safety.pi4:434 - so a bare-metal program has a FIXED
+; sixteen-second life and no way to ask for more. Everything spent
+; before HID enumeration begins is spent out of that.
+;
+; This exists because of a measurement nobody expected. Three separate
+; runs of a probe that called PcieInit() as its VERY FIRST PCIe access
+; reported the same number to the millisecond:
+;
+;     +10907 ms  PcieInit  took 10902 ms
+;
+; and the same probe with a handful of milliseconds of printing in front
+; of that call reported 0 ms, on the same board, in the same session.
+; 10902 ms is 68% of the whole budget, and it is spent before the USB
+; controller has been touched.
+;
+; SO THE ORDER HERE IS DELIBERATE AND MUST NOT BE TIDIED. PcieInit() is
+; called before ANYTHING is printed, because printing is exactly the
+; variable that made the number go away. The banner comes afterwards.
+; A version of this file that prints first measures nothing.
+;
+; PcieAdopted() is what says which path was taken: 1 means PcieInit
+; found the link already trained and returned immediately, 0 means it
+; asserted PERST and brought the link up itself. Only the second path
+; has any delays in it at all, and its own delay() calls add up to
+; about 202 ms - so a 10902 ms cold path is not the delays either.
+;
+; NOTE THIS IS NOT A HID PROBLEM AND NOT A hid.pi4 OR xhci.pi4 PROBLEM.
+; It is measured here because it is what eats the budget that the HID
+; work was accused of eating, and because a number this large should
+; not live only in somebody's session transcript.
+;
+; DIAGNOSTIC - RULES.md rule 19. Never shipped.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+Global g_hz.i = 0
+Global g_run.i = 0
+
+Procedure Stamp(*label, t0.i)
+  Define now.i
+  Define took.i
+  now = 0
+  took = 0
+  If g_hz > 0
+    now  = ((Ticks() - g_run) * 1000) / g_hz
+    took = ((Ticks() - t0) * 1000) / g_hz
+  EndIf
+  UartWriteStr("  +")
+  PrintDec(now)
+  UartWriteStr(" ms  ")
+  UartWriteStr(*label)
+  UartWriteStr("  took ")
+  PrintDec(took)
+  UartWriteStr(" ms")
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Note(*label, v.i)
+  UartWriteStr("           ")
+  UartWriteStr(*label)
+  PrintDec(v)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure Main()
+  Define t.i
+  Define ok.i
+  Define tPcie.i
+  Define okPcie.i
+  Define adopted.i
+  Define st1.i
+
+  ; ---- MEASURE FIRST, PRINT AFTERWARDS. See the header.
+  If TimerInit() <> 0
+    g_hz = TickHz()
+  EndIf
+  g_run = Ticks()
+  t = Ticks()
+  okPcie = PcieInit()
+  tPcie = Ticks() - t
+  adopted = PcieAdopted()
+  st1 = PcieRcPeek(#PCIE_MISC_PCIE_STATUS)
+
+  PrintNl()
+  UartWriteStr("=== pi4HidBudget - the cost before USB ===")
+  PrintNl()
+  UartDrain()
+  Note("tick hz              ", g_hz)
+  UartWriteStr("  PcieInit took ")
+  If g_hz > 0
+    PrintDec((tPcie * 1000) / g_hz)
+  Else
+    PrintDec(0)
+  EndIf
+  UartWriteStr(" ms, returned ")
+  PrintDec(okPcie)
+  PrintNl()
+  UartDrain()
+  Note("adopted a trained link ", adopted)
+  Note("PCIE_STATUS afterwards ", st1)
+  If okPcie = 0
+    UartWriteStr("  pcie: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; The control. If this is not about 100, nothing above is trustworthy.
+  t = Ticks()
+  delay(100)
+  Stamp("delay(100) control", t)
+
+  t = Ticks()
+  ok = PcieEnumerate()
+  Stamp("PcieEnumerate", t)
+  Note("returned  ", ok)
+
+  t = Ticks()
+  ok = XhciInit()
+  Stamp("XhciInit", t)
+  Note("returned  ", ok)
+  If ok = 0
+    UartWriteStr("           ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    UartDrain()
+  EndIf
+
+  ProcedureReturn 0
+EndProcedure
+
+Main()

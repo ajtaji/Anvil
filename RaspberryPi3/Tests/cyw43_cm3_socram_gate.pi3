@@ -1,0 +1,256 @@
+; Harness for the production Cyw43ReadRamInfo procedure. The checker
+; replaces the marker below with that exact procedure body from Anvil/Net.
+; All backplane reads/writes are modeled and their order/data are asserted.
+
+#CYW43_CHIP_43430 = $A9A6
+#CYW43_CHIP_4345 = $4345
+#CYW43_CORE_INTERNAL_MEM = $80E
+#CYW43_CORE_ARM_CM3 = $82A
+#CYW43_CORE_ARM_CR4 = $83E
+#CYW43_CORE_80211 = $812
+#CYW43_CORE_SDIO_DEV = $829
+#CYW43_ARMCR4_CAP = $04
+#CYW43_ARMCR4_BANKIDX = $40
+#CYW43_ARMCR4_BANKINFO = $44
+#CYW43_ARMCR4_TCBANB_MASK = $000F
+#CYW43_ARMCR4_TCBANB_S = 0
+#CYW43_ARMCR4_TCBBNB_MASK = $00F0
+#CYW43_ARMCR4_TCBBNB_S = 4
+#CYW43_ARMCR4_BSZ_MASK = $007F
+#CYW43_ARMCR4_BSZ_MULT = 8192
+#CYW43_ARMCR4_BLK_1K = $0200
+#CYW43_RAMBASE_4345 = $00198000
+#CYW43_SOCRAM_COREINFO = $00
+#CYW43_SOCRAM_BANKIDX = $10
+#CYW43_SOCRAM_BANKINFO = $40
+#CYW43_SOCRAM_BANKPDA = $44
+#CYW43_SD_INTSTATUS_OFF = $20
+#CYW43_D11_PHYRESET = $8
+#CYW43_D11_PHYCLOCKEN = $4
+#CYW43_SOCRAM_BANKINFO_SZMASK = $7F
+#CYW43_SOCRAM_BANKINFO_SZBASE = 8192
+#CYW43_SOCRAM_BANKIDX_MEMTYPE_RAM = 0
+#CYW43_SOCRAM_BANKIDX_MEMTYPE_SHIFT = 8
+#CYW43_SRCI_SRNB_MASK = $F0
+#CYW43_SRCI_SRNB_MASK_EXT = $100
+#CYW43_SRCI_SRNB_SHIFT = 4
+#CYW43_SRCI_SRBSZ_MASK = $F
+#CYW43_SRCI_LSS_MASK = $00F00000
+#CYW43_SRCI_LSS_SHIFT = 20
+#CYW43_SR_BSZ_BASE = 14
+#CYW43_MAX_MEMSIZE = 4194304
+#CYW43_ERR_NONE = 0
+#CYW43_ERR_RAMINFO = 22
+#CYW43_ERR_NOT_ATTACHED = 16
+#CYW43_ERR_NO_WRAPPER = 21
+#CYW43_ERR_CORE_RESET = 23
+#CYW43_ERR_NOT_LOADED = 30
+#CYW43_BCMA_IOCTL = $0408
+#CYW43_ARMCR4_CPUHALT = $0020
+#CYW43_ERR_NO_CORE = 20
+#CYW43_ERR_RXIRQ_OWNED = 31
+
+Global cyw43_err.i
+Global cyw43_chip.i
+Global cyw43_rambase.i
+Global cyw43_ramsize.i
+Global cyw43_rstvec.i
+Global Dim cyw43_word.l[1]
+Global cyw43_ncores.i
+Global Dim cyw43_coreId.i[16]
+Global Dim cyw43_coreRev.i[16]
+Global Dim cyw43_coreBase.i[16]
+Global Dim cyw43_coreWrap.i[16]
+
+Global gate_coreinfo.i
+Global gate_bankidx.i
+Global Dim gate_bankinfo.i[32]
+Global gate_bankwrites.i
+Global gate_lastwrite.i
+Global gate_resets.i
+Global gate_reads.i
+Global gate_failio.i
+Global cyw43_attached.i
+Global cyw43_fwLoaded.i
+Global cyw43_nvLoaded.i
+Global gate_disable_calls.i
+Global gate_disabled_core.i
+Global gate_reset_calls.i
+Global Dim gate_reset_core.i[8]
+Global Dim gate_reset_pre.i[8]
+Global Dim gate_reset_value.i[8]
+Global Dim gate_reset_post.i[8]
+Global gate_memwrites.i
+Global Dim gate_write_addr.i[8]
+Global Dim gate_write_value.i[8]
+
+Procedure.i cyw43_RxIrqGenerationOwned()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i cyw43_Fail(code.i)
+  cyw43_err = code
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Cyw43FindCore(id.i)
+  Define i.i
+  For i = 0 To cyw43_ncores - 1
+    If cyw43_coreId[i] = id : ProcedureReturn i : EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i Cyw43CoreIsUp(idx.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Cyw43WriteMem(addr.i, *src, length.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i cyw43_CoreReset(idx.i, pre.i, reset.i, post.i)
+  gate_reset_core[gate_reset_calls] = idx
+  gate_reset_pre[gate_reset_calls] = pre
+  gate_reset_value[gate_reset_calls] = reset
+  gate_reset_post[gate_reset_calls] = post
+  gate_reset_calls = gate_reset_calls + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Cyw43_CoreDisable(idx.i, pre.i, reset.i)
+  gate_disable_calls = gate_disable_calls + 1
+  gate_disabled_core = idx
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Cyw43Write32(addr.i, value.i)
+  If gate_failio <> 0 : ProcedureReturn 0 : EndIf
+  If gate_memwrites < 8
+    gate_write_addr[gate_memwrites] = addr
+    gate_write_value[gate_memwrites] = value
+  EndIf
+  gate_memwrites = gate_memwrites + 1
+  gate_lastwrite = value
+  If addr = cyw43_coreBase[0] + #CYW43_SOCRAM_BANKIDX
+    gate_bankidx = value & $FF
+    gate_bankwrites = gate_bankwrites + 1
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Cyw43InvalidateWindow()
+EndProcedure
+
+Procedure.i cyw43_Read32Raw(addr.i, *ok)
+  If gate_failio <> 0
+    PokeL(*ok, 0)
+    ProcedureReturn 0
+  EndIf
+  PokeL(*ok, 1)
+  gate_reads = gate_reads + 1
+  If addr = cyw43_coreBase[0] + #CYW43_SOCRAM_COREINFO
+    ProcedureReturn gate_coreinfo
+  EndIf
+  If addr = cyw43_coreBase[0] + #CYW43_SOCRAM_BANKINFO
+    ProcedureReturn gate_bankinfo[gate_bankidx & $1F]
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; @@PRODUCTION_CYW43_READRAMINFO@@
+
+; @@PRODUCTION_CYW43_PREPAREDOWNLOAD@@
+
+; @@PRODUCTION_CYW43_START@@
+
+Procedure.i GateSetup(chip.i, memrev.i, cores.i)
+  Define i.i
+  cyw43_err = 0 : cyw43_chip = chip
+  cyw43_attached = 1 : cyw43_fwLoaded = 1 : cyw43_nvLoaded = 1
+  cyw43_rambase = $1234 : cyw43_ramsize = $5678
+  cyw43_ncores = cores
+  gate_coreinfo = 0 : gate_bankidx = 0 : gate_bankwrites = 0
+  gate_lastwrite = 0 : gate_resets = 0 : gate_reads = 0 : gate_failio = 0
+  gate_disable_calls = 0 : gate_disabled_core = -1 : gate_reset_calls = 0 : gate_memwrites = 0
+  For i = 0 To 15
+    cyw43_coreId[i] = 0 : cyw43_coreRev[i] = 0
+    cyw43_coreBase[i] = 0 : cyw43_coreWrap[i] = 0
+  Next
+  For i = 0 To 31 : gate_bankinfo[i] = 0 : Next
+  If cores > 0
+    cyw43_coreId[0] = #CYW43_CORE_INTERNAL_MEM
+    cyw43_coreRev[0] = memrev
+    cyw43_coreBase[0] = $18000000
+  EndIf
+  If cores > 1 : cyw43_coreId[1] = #CYW43_CORE_ARM_CM3 : EndIf
+  If cores > 2 : cyw43_coreId[2] = #CYW43_CORE_80211 : cyw43_coreBase[2] = $18001000 : EndIf
+  If cores > 3 : cyw43_coreId[3] = #CYW43_CORE_SDIO_DEV : cyw43_coreBase[3] = $18002000 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define i.i
+
+  ; SOCSRAM revisions 4..7 use coreinfo's uniform banks.
+  GateSetup(#CYW43_CHIP_43430, 4, 2)
+  gate_coreinfo = (3 << #CYW43_SRCI_SRNB_SHIFT) | 1
+  rc = Cyw43ReadRamInfo()
+  If rc <> 1 Or cyw43_err <> 0 Or cyw43_rambase <> 0 Or cyw43_ramsize <> 98304 : ProcedureReturn 1 : EndIf
+  If gate_bankwrites <> 0 : ProcedureReturn 2 : EndIf
+
+  ; Rev 12 uses the separately-sized last bank field.
+  GateSetup(#CYW43_CHIP_43430, 12, 2)
+  gate_coreinfo = (4 << #CYW43_SRCI_SRNB_SHIFT) | 2 | (1 << #CYW43_SRCI_LSS_SHIFT)
+  rc = Cyw43ReadRamInfo()
+  If rc <> 1 Or cyw43_rambase <> 0 Or cyw43_ramsize <> 212992 : ProcedureReturn 3 : EndIf
+  If gate_bankwrites <> 0 : ProcedureReturn 4 : EndIf
+
+  ; Rev 23+ selects each RAM bank using MEMTYPE_RAM and the bank index.
+  GateSetup(#CYW43_CHIP_43430, 23, 2)
+  gate_coreinfo = (2 << #CYW43_SRCI_SRNB_SHIFT) | #CYW43_SRCI_SRNB_MASK_EXT
+  gate_bankinfo[0] = 3 : gate_bankinfo[1] = 7
+  rc = Cyw43ReadRamInfo()
+  If rc <> 1 Or cyw43_rambase <> 0 Or cyw43_ramsize <> 229376 : ProcedureReturn 5 : EndIf
+  If gate_bankwrites <> 18 : ProcedureReturn 60 : EndIf
+  If gate_bankidx <> 17 : ProcedureReturn 61 : EndIf
+  If gate_lastwrite <> 17 : ProcedureReturn 62 : EndIf
+
+  ; Impossible/oversized geometry, missing core, and wrong chip all fail closed.
+  GateSetup(#CYW43_CHIP_43430, 23, 2)
+  gate_coreinfo = 0
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_ramsize <> 0 Or cyw43_err <> #CYW43_ERR_RAMINFO : ProcedureReturn 7 : EndIf
+  GateSetup(#CYW43_CHIP_43430, 23, 2)
+  gate_coreinfo = (5 << #CYW43_SRCI_SRNB_SHIFT)
+  For i = 0 To 4 : gate_bankinfo[i] = 127 : Next
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_ramsize <> 0 Or cyw43_err <> #CYW43_ERR_RAMINFO : ProcedureReturn 8 : EndIf
+  GateSetup(#CYW43_CHIP_43430, 23, 1)
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_err <> #CYW43_ERR_NO_CORE Or gate_reads <> 0 : ProcedureReturn 9 : EndIf
+  GateSetup(#CYW43_CHIP_4345, 23, 2)
+  If Cyw43ReadRamInfo() <> 0 Or cyw43_err <> #CYW43_ERR_RAMINFO Or gate_reads <> 0 : ProcedureReturn 10 : EndIf
+
+  ; CM3 passive sequencing must disable CM3, park D11 with the Linux
+  ; PHY reset/clock arguments, disable internal-memory remap, then size
+  ; SOCSRAM. It must not execute the CR4 bank-register path.
+  GateSetup(#CYW43_CHIP_43430, 4, 3)
+  gate_coreinfo = (3 << #CYW43_SRCI_SRNB_SHIFT) | 1
+  rc = Cyw43PrepareDownload()
+  If rc <> 1 Or cyw43_err <> 0 Or cyw43_rambase <> 0 Or cyw43_ramsize <> 98304 : ProcedureReturn 11 : EndIf
+  If gate_disable_calls <> 1 Or gate_disabled_core <> 1 : ProcedureReturn 12 : EndIf
+  If gate_reset_calls <> 2 : ProcedureReturn 13 : EndIf
+  If gate_reset_core[0] <> 2 Or gate_reset_pre[0] <> (#CYW43_D11_PHYRESET | #CYW43_D11_PHYCLOCKEN) Or gate_reset_value[0] <> #CYW43_D11_PHYCLOCKEN Or gate_reset_post[0] <> #CYW43_D11_PHYCLOCKEN : ProcedureReturn 14 : EndIf
+  If gate_reset_core[1] <> 0 Or gate_reset_pre[1] <> 0 Or gate_reset_value[1] <> 0 Or gate_reset_post[1] <> 0 : ProcedureReturn 15 : EndIf
+  If gate_memwrites <> 2 Or gate_write_addr[0] <> $18000010 Or gate_write_value[0] <> 3 Or gate_write_addr[1] <> $18000044 Or gate_write_value[1] <> 0 : ProcedureReturn 16 : EndIf
+
+  ; Active release clears SDIO interrupt status and releases the CM3
+  ; from SOCSRAM reset vector zero. It must not write address zero as the
+  ; CR4 startup-vector path does.
+  GateSetup(#CYW43_CHIP_43430, 4, 4)
+  cyw43_rstvec = $12345678
+  If Cyw43Start() <> 1 Or cyw43_err <> 0 : ProcedureReturn 17 : EndIf
+  If gate_memwrites <> 1 Or gate_write_addr[0] <> $18002020 Or gate_write_value[0] <> $FFFFFFFF : ProcedureReturn 18 : EndIf
+  If gate_reset_calls <> 1 Or gate_reset_core[0] <> 1 Or gate_reset_pre[0] <> 0 Or gate_reset_value[0] <> 0 Or gate_reset_post[0] <> 0 : ProcedureReturn 19 : EndIf
+  If cyw43_rstvec <> $12345678 : ProcedureReturn 20 : EndIf
+  ProcedureReturn 0
+EndProcedure

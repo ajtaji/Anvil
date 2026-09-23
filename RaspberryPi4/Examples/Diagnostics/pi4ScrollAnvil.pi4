@@ -1,0 +1,401 @@
+; pi4ScrollAnvil.pi4 - THE MONITOR'S NEW SCROLL, PROVED AS A PAYLOAD
+;                      BEFORE IT IS PUT IN THE MONITOR.
+;
+; DIAGNOSTIC. Does not ship. Runs as a PAYLOAD at $400000 under Anvil.
+;
+; ======================================================================
+;  WHY THIS FILE EXISTS AND NOT JUST A REBUILT MONITOR
+; ======================================================================
+; anvil.pi4 IS the monitor. A broken one does not report that it is
+; broken; it stops answering, and the board then needs its USB stick
+; re-imaged by hand. So the console change goes on the board as a
+; PAYLOAD first, against the real framebuffer, and only afterwards into
+; the program that has to survive.
+;
+; ======================================================================
+;  WHAT IS BEING PROVED, AND THE ONLY KIND OF PROOF THAT COUNTS HERE
+; ======================================================================
+; The change pre-empts one call. When a line feed arrives with the
+; cursor already on the last console row, the monitor now scrolls with
+; the DMA engine directly instead of letting display.pi4's
+; DisplayScroll() do it - because DisplayScroll() wraps two 12 ms
+; transfers in 204 ms of cache maintenance that maintains nothing with
+; the MMU off (pi4ScrollFast.pi4, 2026-08-28).
+;
+; A FASTER SCROLL THAT DRAWS A DIFFERENT SCREEN IS NOT A FASTER SCROLL.
+; So the test is not "is it quick", it is "is it the same picture", and
+; it is answered by running the IDENTICAL character stream three ways
+; and hashing the console rectangle afterwards:
+;
+;     A  the processor, as the monitor was before today
+;     B  display.pi4's own accelerated path
+;     C  the pre-empt, which is what the monitor now does
+;
+; Three hashes that agree mean the three paths are indistinguishable on
+; the glass. Two that do not mean the change is wrong, and the timings
+; below it are worthless.
+;
+; THE HASH SAMPLES RATHER THAN READS EVERY PIXEL, and the sampling is
+; the interesting decision. Two million CPU reads of Device memory is
+; several seconds and would not fit in the deadman. Every eighth pixel
+; across and every fourth row is 57,600 samples - and, more to the
+; point, the horizontal step is 8 and the character cell is 8 wide, so
+; every sample lands on the same column of its cell and a picture
+; shifted by one pixel cannot alias into a matching hash. The vertical
+; step of 4 puts four samples in every 16-pixel row, so a scroll off by
+; a single text row cannot hide either.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+
+#SA_SCRATCH = $700000
+#SA_SCRATCH_BYTES = 512
+#SA_BANNER = 120
+#SA_LINES = 100
+
+Global saDma.i                 ; the monitor's gDma
+Global saBg.i                  ; the monitor's gScreenBg
+Global saScrolls.i             ; scrolls the last stream caused
+Global Dim saLine.a[96]
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutMs(us.i)
+  PrintDec(us / 1000)
+  UartWriteStr(".")
+  PrintDec((us % 1000) / 100)
+  UartWriteStr(" ms")
+EndProcedure
+
+Procedure Pet()
+  SafetyWatchdogStart(15)
+EndProcedure
+
+; ======================================================================
+;  ScreenFastScroll - TRANSCRIBED FROM anvil.pi4, AND THE TRANSCRIPTION
+;  IS THE WEAK POINT OF THIS FILE, SO IT IS NAMED HERE.
+;
+;  Three substitutions and nothing else: LogoHeight() is the constant
+;  #SA_BANNER, gScreenBg is saBg, gDma is saDma. If the monitor's copy
+;  ever diverges from this one, this file stops proving anything about
+;  the monitor - which is the standing cost of proving a monitor with a
+;  payload, and is why the monitor's copy carries a comment pointing
+;  back here.
+; ======================================================================
+Procedure.i ScreenFastScroll(n.i)
+  Define pitch.i
+  Define chgt.i
+  Define rows.i
+  Define keep.i
+  Define dst.i
+  Define src.i
+
+  If saDma = 0 Or n < 1
+    ProcedureReturn 0
+  EndIf
+  rows = DisplayRows()
+  If n >= rows
+    ProcedureReturn 0
+  EndIf
+  pitch = DisplayPitch()
+  chgt  = DisplayCharHeight()
+  keep  = (rows - n) * chgt
+
+  If DisplayCharWidth() * DisplayCols() * DisplayBytesPerPixel() <> pitch
+    ProcedureReturn 0
+  EndIf
+
+  dst = DisplayBase() + (#SA_BANNER * pitch)
+  src = dst + (n * chgt * pitch)
+
+  If DmaCopy(dst, src, keep * pitch) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaFill32(dst + (keep * pitch), pitch, DisplayWidth(), n * chgt, saBg) = 0
+    DisplayFillRect(0, #SA_BANNER + keep, DisplayWidth(), n * chgt, saBg)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  Feed - one character onto the screen, with the monitor's pre-empt.
+;  This is the body of ScreenPump()'s draining loop, transcribed.
+; ======================================================================
+Procedure Feed(c.i, chunk.i, rows.i)
+  ; COUNTED HERE AND NOT WORKED OUT ON PAPER. This condition is exactly
+  ; when a scroll happens, whichever of the three paths performs it -
+  ; the pre-empt tests it below, and DisplayNewLine() tests the same
+  ; thing one call deeper. An arithmetic prediction of the count was
+  ; wrong by one on the first attempt, which is reason enough.
+  If c = 10 And DisplayCursorRow() >= (rows - 1)
+    saScrolls = saScrolls + 1
+  EndIf
+  If saDma = 1 And c = 10 And DisplayCursorRow() >= (rows - 1)
+    If ScreenFastScroll(chunk) = 1
+      DisplayLocate(0, rows - chunk)
+    Else
+      DisplayPutC(c)
+    EndIf
+  Else
+    DisplayPutC(c)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The stream. Deterministic, and every line looks different from every
+;  other line so that a scroll off by one row changes the picture.
+;
+;  60 characters and a line feed. Well inside the console's 240 columns,
+;  because a WRAPPED line takes a route through DspPutGlyph() that the
+;  pre-empt deliberately does not intercept - see the note at its call
+;  site in the monitor - and a stream that wrapped would be testing that
+;  route instead of this one.
+; ----------------------------------------------------------------------
+Procedure BuildLine(k.i)
+  Define i.i
+  Define c.i
+  i = 0
+  While i < 60
+    ; A rotating printable byte that depends on both the line number and
+    ; the column, so no two lines share a picture.
+    c = 33 + ((i * 7 + k * 13) % 90)
+    saLine[i] = c
+    i = i + 1
+  Wend
+  saLine[60] = 0
+EndProcedure
+
+Procedure.i RunStream(chunk.i, rows.i)
+  Define k.i
+  Define i.i
+  Define t0.i
+
+  DisplayCls()
+  DisplayLocate(0, 0)
+  saScrolls = 0
+  t0 = Micros()
+  k = 0
+  While k < #SA_LINES
+    BuildLine(k)
+    i = 0
+    While i < 60
+      Feed(saLine[i], chunk, rows)
+      i = i + 1
+    Wend
+    Feed(10, chunk, rows)
+    k = k + 1
+  Wend
+  ProcedureReturn Micros() - t0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Hash the console rectangle. See the header for why it samples.
+; ----------------------------------------------------------------------
+Procedure.i ScreenHash(rows.i, chgt.i, pitch.i)
+  Define y.i
+  Define x.i
+  Define row.i
+  Define hsh.i
+  Define hi.i
+
+  hsh = 5381
+  hi = #SA_BANNER + (rows * chgt)
+  y = #SA_BANNER
+  While y < hi
+    row = DisplayBase() + (y * pitch)
+    x = 0
+    While x < DisplayWidth()
+      hsh = ((hsh * 31) + (PeekN(row + (x * 4)) & $FFFFFFFF)) & $3FFFFFFF
+      x = x + 8
+    Wend
+    y = y + 4
+  Wend
+  ProcedureReturn hsh
+EndProcedure
+
+Procedure.i Main()
+  Define w.i
+  Define pitch.i
+  Define chgt.i
+  Define rows.i
+  Define chunk.i
+  Define usA.i
+  Define usB.i
+  Define usC.i
+  Define hA.i
+  Define hB.i
+  Define hC.i
+  Define scrolls.i
+
+  PrintNl()
+  PutS("=== pi4ScrollAnvil - same stream, three scroll paths, one picture? ===")
+
+  If TimerInit() = 0
+    PutS("!! counter")
+    ProcedureReturn 1
+  EndIf
+  If MailboxInit() = 0
+    PutS("!! mailbox")
+    ProcedureReturn 2
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("!! tags")
+    ProcedureReturn 3
+  EndIf
+  If DisplayInit(1920, 1080, 32) <> 1
+    PutS("!! DisplayInit")
+    ProcedureReturn 4
+  EndIf
+
+  w     = DisplayWidth()
+  pitch = DisplayPitch()
+  chgt  = DisplayCharHeight()
+  saBg  = DisplayRGB(0, 0, 40)
+
+  DisplayColour(DisplayRGB(226, 232, 240), saBg)
+  DisplayConsole(0, #SA_BANNER, w, DisplayHeight() - #SA_BANNER)
+  DisplayAutoFlush(1)
+  rows = DisplayRows()
+
+  chunk = DisplayScrollChunkGet()
+  If chunk < 1
+    chunk = 1
+  EndIf
+  If chunk > (rows / 2)
+    chunk = rows / 2
+  EndIf
+  If chunk < 1
+    chunk = 1
+  EndIf
+
+  UartWriteStr("  console ")
+  PrintDec(DisplayCols())
+  UartWriteStr("x")
+  PrintDec(rows)
+  UartWriteStr("  chunk ")
+  PrintDec(chunk)
+  UartWriteStr("  ")
+  PrintDec(#SA_LINES)
+  UartWriteStr(" lines per run")
+  PrintNl()
+  UartDrain()
+
+  If DmaSetScratch(#SA_SCRATCH, #SA_SCRATCH_BYTES) = 0
+    PutS("!! DmaSetScratch")
+    ProcedureReturn 5
+  EndIf
+  If DisplayDmaBind() = 0
+    PutS("!! DisplayDmaBind")
+    ProcedureReturn 6
+  EndIf
+  If DmaInit() = 0
+    UartWriteStr("!! DmaInit: ")
+    UartWriteStr(DmaErrorText())
+    PrintNl()
+    ProcedureReturn 7
+  EndIf
+  Pet()
+
+  ; --- A: the processor, as the monitor was ---------------------------
+  saDma = 0
+  DisplayUseDma(0)
+  usA = RunStream(chunk, rows)
+  scrolls = saScrolls
+  hA = ScreenHash(rows, chgt, pitch)
+  Pet()
+
+  ; --- B: display.pi4's accelerated path ------------------------------
+  saDma = 0
+  DisplayUseDma(1)
+  usB = RunStream(chunk, rows)
+  hB = ScreenHash(rows, chgt, pitch)
+  Pet()
+
+  ; --- C: the pre-empt, which is what the monitor now does ------------
+  saDma = 1
+  DisplayUseDma(1)
+  usC = RunStream(chunk, rows)
+  hC = ScreenHash(rows, chgt, pitch)
+  Pet()
+
+  PutS("")
+  PutS("THE PICTURE")
+  UartWriteStr("  A  processor        hash ")
+  PrintDec(hA)
+  PrintNl()
+  UartWriteStr("  B  library + engine hash ")
+  PrintDec(hB)
+  PrintNl()
+  UartWriteStr("  C  the pre-empt     hash ")
+  PrintDec(hC)
+  PrintNl()
+  UartDrain()
+  If hA = hB And hB = hC
+    PutS("  PASS - all three paths leave the same screen")
+  Else
+    PutS("  FAIL - the paths do not agree; the timings below mean nothing")
+  EndIf
+
+  PutS("")
+  PutS("THE CLOCK - whole stream, and the scroll on its own")
+  UartWriteStr("  each run printed ")
+  PrintDec(#SA_LINES)
+  UartWriteStr(" lines and scrolled ")
+  PrintDec(scrolls)
+  UartWriteStr(" times")
+  PrintNl()
+  UartDrain()
+  If scrolls < 1
+    scrolls = 1
+  EndIf
+  UartWriteStr("  A  processor         ")
+  PutMs(usA)
+  UartWriteStr("   per scroll ")
+  PutMs((usA - usC) / scrolls)
+  UartWriteStr(" more than C")
+  PrintNl()
+  UartWriteStr("  B  library + engine  ")
+  PutMs(usB)
+  UartWriteStr("   per scroll ")
+  PutMs((usB - usC) / scrolls)
+  UartWriteStr(" more than C")
+  PrintNl()
+  UartWriteStr("  C  the pre-empt      ")
+  PutMs(usC)
+  PrintNl()
+  UartDrain()
+
+  ; The C run's own scroll cost cannot be got by subtraction from
+  ; itself, so it is measured directly: the same transfer, five times,
+  ; with nothing else in the loop.
+  usC = Micros()
+  scrolls = 0
+  While scrolls < 5
+    ScreenFastScroll(chunk)
+    scrolls = scrolls + 1
+  Wend
+  usC = (Micros() - usC) / 5
+  UartWriteStr("  C's scroll, measured alone  ")
+  PutMs(usC)
+  PrintNl()
+  UartDrain()
+
+  PutS("")
+  If hA = hB And hB = hC
+    PutS("=== done - PASS ===")
+  Else
+    PutS("=== done - FAIL ===")
+  EndIf
+  SafetyWatchdogStop()
+  ProcedureReturn 0
+EndProcedure

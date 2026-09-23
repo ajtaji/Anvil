@@ -1,0 +1,150 @@
+; Emitted desk gate for the production Neon-to-Vulkan geometry lowering.
+; tools/neon_vk_chrome_acceptance_check.py replaces the marker below with the
+; exact current production procedure bodies. The spies own no Vulkan objects,
+; framebuffer or MMIO: they retain the logical triangle-list writes and draws.
+
+#NEON_VK_CHROME_OK              = 0
+#NEON_VK_CHROME_ERR_STATE       = -21202
+#NEON_VK_CHROME_ERR_CAPACITY    = -21203
+#NEON_VK_CHROME_MAX_PATH_POINTS = 4096
+
+#NVC_PATH_NONE  = 0
+#NVC_PATH_FAN   = 1
+#NVC_PATH_LINES = 2
+
+Global nvcInFrame.i
+Global nvcMaxQuads.i
+Global nvcVertices.i
+Global nvcDrawCount.i
+Global nvcError.i
+Global nvcPathKind.i
+Global nvcPathCount.i
+Global nvcPathError.i
+Global Dim nvcPathX.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
+Global Dim nvcPathY.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
+
+Global Dim nvgX.i[63]
+Global Dim nvgY.i[63]
+Global Dim nvgDrawFirst.i[7]
+Global Dim nvgDrawCount.i[7]
+
+Procedure.i nvcFail(code.i)
+  nvcError = code
+  ProcedureReturn code
+EndProcedure
+
+Procedure nvcVertex(index.i, x.i, y.i, u.i, v.i)
+  nvgX[index] = x : nvgY[index] = y
+EndProcedure
+
+Procedure.i nvcDraw(first.i, count.i, colour.i)
+  nvgDrawFirst[nvcDrawCount] = first
+  nvgDrawCount[nvcDrawCount] = count
+  nvcDrawCount = nvcDrawCount + 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; @PRODUCTION_GEOMETRY@
+
+Procedure NvgReset(maxQuads.i)
+  nvcInFrame = 1 : nvcMaxQuads = maxQuads
+  nvcVertices = 0 : nvcDrawCount = 0 : nvcError = 0
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+EndProcedure
+
+Procedure.i NvgVertexIs(index.i, x.i, y.i)
+  ProcedureReturn Bool(nvgX[index] = x And nvgY[index] = y)
+EndProcedure
+
+Procedure.i Main()
+  Protected rc.i
+  Protected beforeVertices.i
+  Protected beforeDraws.i
+
+  ; A convex four-point fan first emits a closed outline. Outline must retain
+  ; the exact cursor so the native outline-then-fill ordering can reuse it.
+  NvgReset(16)
+  If NeonVkChromeFanBegin() <> 0 : ProcedureReturn 1 : EndIf
+  NeonVkChromeFanPoint(10, 10) : NeonVkChromeFanPoint(30, 10)
+  NeonVkChromeFanPoint(30, 30) : NeonVkChromeFanPoint(10, 30)
+  If NeonVkChromeFanOutline($FF010203) <> 0 : ProcedureReturn 2 : EndIf
+  If nvcVertices <> 24 Or nvcDrawCount <> 1 : ProcedureReturn 3 : EndIf
+  If nvgDrawFirst[0] <> 0 Or nvgDrawCount[0] <> 24 : ProcedureReturn 4 : EndIf
+  If nvcPathKind <> #NVC_PATH_FAN Or nvcPathCount <> 4 : ProcedureReturn 5 : EndIf
+  ; First horizontal edge and the final closing vertical edge.
+  If NvgVertexIs(0, 10, 10) = 0 Or NvgVertexIs(1, 30, 10) = 0 Or NvgVertexIs(2, 30, 11) = 0 : ProcedureReturn 6 : EndIf
+  If NvgVertexIs(3, 10, 10) = 0 Or NvgVertexIs(4, 30, 11) = 0 Or NvgVertexIs(5, 10, 11) = 0 : ProcedureReturn 7 : EndIf
+  If NvgVertexIs(18, 10, 30) = 0 Or NvgVertexIs(19, 10, 10) = 0 Or NvgVertexIs(20, 11, 10) = 0 : ProcedureReturn 8 : EndIf
+  If NvgVertexIs(21, 10, 30) = 0 Or NvgVertexIs(22, 11, 10) = 0 Or NvgVertexIs(23, 11, 30) = 0 : ProcedureReturn 9 : EndIf
+
+  If NeonVkChromeFanEnd($FF040506) <> 0 : ProcedureReturn 10 : EndIf
+  If nvcVertices <> 30 Or nvcDrawCount <> 2 : ProcedureReturn 11 : EndIf
+  If nvgDrawFirst[1] <> 24 Or nvgDrawCount[1] <> 6 : ProcedureReturn 12 : EndIf
+  If NvgVertexIs(24, 10, 10) = 0 Or NvgVertexIs(25, 30, 10) = 0 Or NvgVertexIs(26, 30, 30) = 0 : ProcedureReturn 13 : EndIf
+  If NvgVertexIs(27, 10, 10) = 0 Or NvgVertexIs(28, 30, 30) = 0 Or NvgVertexIs(29, 10, 30) = 0 : ProcedureReturn 14 : EndIf
+  If nvcPathKind <> #NVC_PATH_NONE Or nvcPathCount <> 0 Or nvcPathError <> 0 : ProcedureReturn 15 : EndIf
+
+  ; Horizontal, vertical, diagonal and zero-length lines each become one
+  ; deterministic six-vertex quad within a single ordered draw.
+  NvgReset(8)
+  If NeonVkChromeLinesBegin() <> 0 : ProcedureReturn 16 : EndIf
+  NeonVkChromeLine(2, 3, 8, 3)
+  NeonVkChromeLine(4, 5, 4, 11)
+  NeonVkChromeLine(1, 1, 5, 5)
+  NeonVkChromeLine(7, 9, 7, 9)
+  If NeonVkChromeLinesEnd($FF070809) <> 0 : ProcedureReturn 17 : EndIf
+  If nvcVertices <> 24 Or nvcDrawCount <> 1 Or nvgDrawFirst[0] <> 0 Or nvgDrawCount[0] <> 24 : ProcedureReturn 18 : EndIf
+  If NvgVertexIs(0, 2, 3) = 0 Or NvgVertexIs(1, 8, 3) = 0 Or NvgVertexIs(2, 8, 4) = 0 Or NvgVertexIs(5, 2, 4) = 0 : ProcedureReturn 19 : EndIf
+  If NvgVertexIs(6, 4, 5) = 0 Or NvgVertexIs(7, 4, 11) = 0 Or NvgVertexIs(8, 5, 11) = 0 Or NvgVertexIs(11, 5, 5) = 0 : ProcedureReturn 20 : EndIf
+  If NvgVertexIs(12, 1, 1) = 0 Or NvgVertexIs(13, 5, 5) = 0 Or NvgVertexIs(14, 5, 6) = 0 Or NvgVertexIs(17, 1, 2) = 0 : ProcedureReturn 21 : EndIf
+  If NvgVertexIs(18, 7, 9) = 0 Or NvgVertexIs(19, 8, 9) = 0 Or NvgVertexIs(20, 8, 10) = 0 Or NvgVertexIs(23, 7, 10) = 0 : ProcedureReturn 22 : EndIf
+  If nvcPathKind <> #NVC_PATH_NONE Or nvcPathCount <> 0 Or nvcPathError <> 0 : ProcedureReturn 23 : EndIf
+
+  ; Whole-primitive preflight is atomic. A refused outline leaves both cursors
+  ; unchanged and preserves the fan so it can still be filled and closed.
+  NvgReset(1)
+  If NeonVkChromeFanBegin() <> 0 : ProcedureReturn 24 : EndIf
+  NeonVkChromeFanPoint(0, 0) : NeonVkChromeFanPoint(8, 0)
+  NeonVkChromeFanPoint(8, 8) : NeonVkChromeFanPoint(0, 8)
+  beforeVertices = nvcVertices : beforeDraws = nvcDrawCount
+  rc = NeonVkChromeFanOutline($FFFFFFFF)
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 25 : EndIf
+  If nvcVertices <> beforeVertices Or nvcDrawCount <> beforeDraws : ProcedureReturn 26 : EndIf
+  If nvcPathKind <> #NVC_PATH_FAN Or nvcPathCount <> 4 : ProcedureReturn 27 : EndIf
+  If NeonVkChromeFanEnd($FFFFFFFF) <> 0 : ProcedureReturn 28 : EndIf
+  If nvcVertices <> 6 Or nvcDrawCount <> 1 Or nvcPathKind <> #NVC_PATH_NONE : ProcedureReturn 29 : EndIf
+
+  ; Vertex-capacity refusal of a fill also leaves both ordered cursors intact
+  ; and closes the builder. A fresh builder can start immediately afterwards.
+  NvgReset(1) : nvcVertices = 4
+  If NeonVkChromeFanBegin() <> 0 : ProcedureReturn 30 : EndIf
+  NeonVkChromeFanPoint(0, 0) : NeonVkChromeFanPoint(4, 0) : NeonVkChromeFanPoint(0, 4)
+  beforeVertices = nvcVertices : beforeDraws = nvcDrawCount
+  rc = NeonVkChromeFanEnd($FFFFFFFF)
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 31 : EndIf
+  If nvcVertices <> beforeVertices Or nvcDrawCount <> beforeDraws : ProcedureReturn 32 : EndIf
+  If nvcPathKind <> #NVC_PATH_NONE Or nvcPathCount <> 0 Or nvcPathError <> 0 : ProcedureReturn 33 : EndIf
+  If NeonVkChromeLinesBegin() <> 0 : ProcedureReturn 34 : EndIf
+  NeonVkChromeLine(0, 0, 1, 0)
+  rc = NeonVkChromeLinesEnd($FFFFFFFF)
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 35 : EndIf
+  If nvcVertices <> beforeVertices Or nvcDrawCount <> beforeDraws : ProcedureReturn 36 : EndIf
+  If nvcPathKind <> #NVC_PATH_NONE Or nvcPathCount <> 0 Or nvcPathError <> 0 : ProcedureReturn 37 : EndIf
+
+  ; A staged-point overflow poisons no vertex/draw cursor. End returns the
+  ; retained error and always closes/reset the builder for safe reuse.
+  NvgReset(8)
+  If NeonVkChromeFanBegin() <> 0 : ProcedureReturn 38 : EndIf
+  nvcPathCount = #NEON_VK_CHROME_MAX_PATH_POINTS
+  NeonVkChromeFanPoint(99, 99)
+  If nvcPathError <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 39 : EndIf
+  If NeonVkChromeFanEnd($FFFFFFFF) <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 40 : EndIf
+  If nvcVertices <> 0 Or nvcDrawCount <> 0 : ProcedureReturn 41 : EndIf
+  If nvcPathKind <> #NVC_PATH_NONE Or nvcPathCount <> 0 Or nvcPathError <> 0 : ProcedureReturn 42 : EndIf
+  If NeonVkChromeFanBegin() <> 0 : ProcedureReturn 43 : EndIf
+  NeonVkChromeFanPoint(0, 0) : NeonVkChromeFanPoint(2, 0) : NeonVkChromeFanPoint(0, 2)
+  If NeonVkChromeFanEnd($FFFFFFFF) <> 0 : ProcedureReturn 44 : EndIf
+  If nvcVertices <> 3 Or nvcDrawCount <> 1 : ProcedureReturn 45 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,68 @@
+; Compile/emitted fixture for the renderer-neutral Neon lifecycle seam.
+; The callbacks stand in for a prepared Vulkan owner; they never call Neon
+; lifecycle procedures recursively and never claim native V3D ownership.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+Global lcInit.i
+Global lcBegin.i
+Global lcEnd.i
+Global lcShutdown.i
+
+Procedure.i LifecycleBox(x.i, y.i, w.i, h.i, colour.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i LifecycleText(font.i, x.i, y.i, *s, colour.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure LifecycleScissorSet(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure LifecycleScissorClear() : EndProcedure
+Procedure.i LifecycleFanBegin() : ProcedureReturn #NEON_OK : EndProcedure
+Procedure LifecycleFanPoint(x.i, y.i) : EndProcedure
+Procedure.i LifecycleFanEnd(colour.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i LifecycleFanOutline(colour.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i LifecycleLinesBegin() : ProcedureReturn #NEON_OK : EndProcedure
+Procedure LifecycleLine(x0.i, y0.i, x1.i, y1.i) : EndProcedure
+Procedure.i LifecycleLinesEnd(colour.i) : ProcedureReturn #NEON_OK : EndProcedure
+
+Procedure.i LifecycleInit()
+  lcInit = lcInit + 1
+  ProcedureReturn NeonDrawBackendInstall(@LifecycleBox, @LifecycleText, @LifecycleScissorSet, @LifecycleScissorClear, @LifecycleFanBegin, @LifecycleFanPoint, @LifecycleFanEnd, @LifecycleFanOutline, @LifecycleLinesBegin, @LifecycleLine, @LifecycleLinesEnd)
+EndProcedure
+
+Procedure.i LifecycleBegin(colour.i)
+  lcBegin = lcBegin + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i LifecycleEnd()
+  lcEnd = lcEnd + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i LifecycleShutdown()
+  lcShutdown = lcShutdown + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonLifecycleDispatchCompile()
+  Protected r.i
+  If NeonLifecycleBackend() <> #NEON_BACKEND_NATIVE : ProcedureReturn 1 : EndIf
+  If NeonLifecycleInstall(@LifecycleInit, @LifecycleBegin, @LifecycleEnd, @LifecycleShutdown) <> #NEON_OK : ProcedureReturn 2 : EndIf
+  If NeonLifecycleBackend() <> #NEON_BACKEND_EXTERNAL : ProcedureReturn 3 : EndIf
+  If NeonInit() <> #NEON_OK Or lcInit <> 1 Or Neon_Ready() = 0 : ProcedureReturn 4 : EndIf
+  If NeonLifecycleInstall(@LifecycleInit, @LifecycleBegin, @LifecycleEnd, @LifecycleShutdown) <> #NEON_ERR_BACKEND : ProcedureReturn 5 : EndIf
+  If NeonFrameBegin($FF010203) <> #NEON_OK Or lcBegin <> 1 : ProcedureReturn 6 : EndIf
+  If NeonFrameEnd() <> #NEON_OK Or lcEnd <> 1 : ProcedureReturn 7 : EndIf
+  If NeonShutdown() <> #NEON_OK Or lcShutdown <> 1 Or Neon_Ready() <> 0 : ProcedureReturn 8 : EndIf
+  If NeonDrawBackendActive() <> 0 : ProcedureReturn 9 : EndIf
+  If NeonLifecycleUseNative() <> #NEON_OK Or NeonLifecycleBackend() <> #NEON_BACKEND_NATIVE : ProcedureReturn 10 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Main()
+  ProcedureReturn NeonLifecycleDispatchCompile()
+EndProcedure

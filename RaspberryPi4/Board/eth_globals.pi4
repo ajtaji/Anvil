@@ -1,0 +1,338 @@
+
+; ======================================================================
+;  THE NETWORK - net, get and put
+; ======================================================================
+;  This is the caller half of three libraries that deliberately do no
+;  input and no output of their own:
+;
+;    RaspberryPi4/Lib/genet.pi4  the Ethernet MAC. Proven on silicon on
+;                                2026-08-26 up to and including receive
+;                                at 1000 Mbit/s full duplex.
+;    RaspberryPi4/Lib/net.pi4    ARP, IPv4, ICMP and UDP. It builds and
+;                                parses frames and never touches a
+;                                register.
+;    RaspberryPi4/Lib/tftp.pi4   RFC 1350, client side. It builds and
+;                                parses TFTP payloads and does not know
+;                                that the other two exist.
+;
+;  Each of them states the same contract in its own header - net.pi4:18
+;  and tftp.pi4:27 - and the reason is worth restating once here,
+;  because this file is where the cost of that contract is paid. A
+;  library that did its own I/O could not be gated: tools/a64/
+;  a64_tftp_check.py feeds byte-exact payloads in and reads byte-exact
+;  payloads out with no device model underneath, and that is only
+;  possible because there is nothing underneath. The price is that
+;  somebody has to run the pump, and Anvil is that somebody.
+;
+;  THE PUMP, IN ONE LINE, and it is the same one tftp.pi4:66-104 sets
+;  out:
+;
+;      GenetRecvWait -> NetInput -> TftpInput -> NetUdpBuild -> GenetSend
+;
+;  EthPump() below is that line with the counters and the refusals
+;  attached, and EthRun() is the loop around it.
+;
+; ----------------------------------------------------------------------
+;  WHAT ARRIVES BEFORE THE FIRST BLOCK DOES, AND WHY IT IS HERE
+; ----------------------------------------------------------------------
+;  RaspberryPi4/Examples/Diagnostics/pi4TftpProbe.pi4 sends its read
+;  request the instant TftpBeginRead() has staged it. On a bench where
+;  the server has already ARPed the board that works, and on a bench
+;  where it has not, NetUdpBuild() refuses with #NET_E_NO_ARP
+;  (net.pi4:469-471, raised at net.pi4:1308) and the probe prints a send
+;  failure it cannot explain.
+;
+;  A UDP DATAGRAM CANNOT BE BUILT UNTIL THE NEXT HOP'S HARDWARE ADDRESS
+;  IS KNOWN. net.pi4 does not resolve one for you and it is right not
+;  to: resolving means sending, waiting and receiving, which is I/O, and
+;  I/O is the caller's. So EthResolve() below does it - one ARP request
+;  to the address NetNextHop() names, then listen, then ask the cache
+;  again - before either transfer command builds anything.
+;
+;  AND THE ENTRY CAN DIE MID-CONVERSATION. net.pi4 gained
+;  net_ConfirmNeighbour() (net.pi4:1391), called from net_RecvIp
+;  (net.pi4:2106), for exactly that reason: until 2026-08-26 an ARP
+;  entry expired on a fixed twenty-second timer no matter how recently
+;  the neighbour had been heard from, so a transfer longer than the
+;  lifetime lost its next hop halfway through. Every frame this pump
+;  hands to NetInput() therefore pushes the deadline out as a side
+;  effect, which is why the pump must keep calling NetInput() even for
+;  frames it has no interest in. Do not "optimise" that away.
+;
+; ----------------------------------------------------------------------
+;  THE THREE RULES FROM RFC 1350 AND RFC 1123 THAT THIS LOOP MUST OBEY
+; ----------------------------------------------------------------------
+;  tftp.pi4 implements all three. They are restated here because the
+;  pump can break every one of them from the outside.
+;
+;  1. THE TRANSFER IDENTIFIER. The read request goes to port 69 and the
+;     answer DOES NOT COME FROM PORT 69: "the response to the request,
+;     under normal operation, uses a TID chosen by the server as its
+;     source TID" [Reference/rfc1350.txt:197-210, and the worked example
+;     at :487-491]. tftp.pi4 adopts the source port of the first DATA
+;     packet and sends everything afterwards there. The pump breaks this
+;     by CACHING a destination: it must read TftpOutIp() and
+;     TftpOutPort() on every single send, because the one packet that
+;     does not go to the server is the ERROR 5 sent to a stranger who
+;     used the wrong identifier [rfc1350.txt:239-246], and sending that
+;     to the server would tell the server its own transfer had failed.
+;     EthSendStaged() reads both, every time, and that is not an
+;     accident of style.
+;
+;  2. THE SORCERER'S APPRENTICE. "Implementations MUST contain the fix
+;     for this problem: the sender ... must never resend the current
+;     DATA packet on receipt of a duplicate ACK"
+;     [Reference/rfc1123.txt:2589-2603]. tftp.pi4 stages NOTHING for a
+;     duplicate, in both directions. The pump breaks this by sending
+;     something anyway - which is what "send the staging buffer after
+;     every packet" would do if the buffer were not cleared. It is
+;     cleared, by TftpInput() and by TftpTick() both, and
+;     EthSendStaged() returns immediately when TftpOutLen() is zero. A
+;     pump that ignored that length would put every packet on the wire
+;     twice for the rest of the transfer.
+;
+;  3. AND THEREFORE THE TIMER IS NOT OPTIONAL. A receiver that is silent
+;     on duplicates and has no retransmit timer hangs forever the first
+;     time an acknowledgement is lost - both ends being polite at each
+;     other until the server gives up. TftpTick() is the other half of
+;     rule 2 and deleting it from this loop is not a simplification, it
+;     is the reintroduction of a hang. tftp.pi4:1916 and its header at
+;     :360-372 say the same at more length, and the library's gate has a
+;     mutation for it.
+;
+; ----------------------------------------------------------------------
+;  THE ETHERNET RECEIVE REGION - HALF A MEGABYTE THAT IS NOT A GLOBAL
+; ----------------------------------------------------------------------
+;  genet.pi4 requires a receive region of #GENET_RX_TOTAL_BYTES, which
+;  is 524288 - 256 descriptors of 2048 bytes [genet.pi4:1013, from
+;  U-Boot's driver at U:181]. It has to be real DRAM, 64-byte aligned
+;  [genet.pi4:2196], and the MAC writes into it by DMA whenever the
+;  engine is running.
+;
+;  IT IS NOT A Global Dim, AND THE ARGUMENT THAT CHOSE THAT IS NO LONGER
+;  TRUE. It is recorded here in full rather than deleted, because the
+;  next question "why is this not just an array" deserves the real
+;  history and not a decision with nothing behind it.
+;
+;  WHAT IT SAID, when it was written: a 512 KiB array would land in this
+;  image's BSS, BSS sat inside #MON_LO..#MON_HI - the two-megabyte window
+;  the monitor reserved for itself - and it ran to about $310000 against
+;  an autoboot record at $3FFF00. So the array would fit, with roughly
+;  half a megabyte to spare, and then one day it would not, and the first
+;  thing it would overwrite is the autoboot record, silently.
+;
+;  BOTH HALVES OF THAT WENT AWAY. On 2026-08-28 BSS left the image window
+;  for its own region. The original 8 MiB BSS range later proved too small
+;  after graphics integration, so current BssAddress/#MON_DATA reserve
+;  $0D000000..$0DFFFFFF (16 MiB). The emitted map gate checks that globals
+;  fit the reservation as graphics integrations change. On 2026-09-08 the
+;  window itself went: the
+;  monitor has no maximum size and the autoboot record moved to #AB_BASE
+;  $001FF000, BELOW the load address, where neither the image nor BSS can
+;  reach it at any size. The silent failure this paragraph was avoiding
+;  cannot happen any more, from either direction.
+;
+;  SO WHY IS IT STILL A FIXED ADDRESS? Because moving a live DMA region is
+;  a change, and there is no longer a reason FOR one either way - which is
+;  a fair answer for today and not a good one to leave standing. What is
+;  still true of #ETH_RX_BASE ($08100000) is written below and is worth
+;  keeping: it is outside both payload windows, so no image the monitor
+;  can be asked to load can be aimed at it. A Global Dim would land in
+;  #MON_DATA_LO..#MON_DATA_HI, which HitsMonitor() also refuses, so that
+;  property is not unique to it. If this file is open for another reason,
+;  this is the paragraph to settle.
+;
+;  SO IT IS A FIXED ADDRESS IN THE BAND THE MEMORY MAP ALREADY REFUSES
+;  TO OFFER. $08100000 is the first byte above the payload stack
+;  corridor ($07F00000..$080FFFFF) and it is nowhere near either payload
+;  window - #PAY0_HI is $07EFFFFF - so no image the monitor will load
+;  can be aimed at it and no range check has to be taught about it.
+;  Bank 0 runs to $3B2FFFFF, so there is real DRAM there.
+;
+;  IT IS NOT PROTECTED FROM A PAYLOAD, and cannot be: a payload can
+;  write anywhere. What IS done is that the DMA engine is stopped before
+;  control leaves the monitor - see the EthPayloadQuiesce() call in
+;  RunAt() - so a running payload is never sharing memory with a live
+;  bus master.
+;
+; ----------------------------------------------------------------------
+;  THE FOUR ADDRESSES LIVE IN THE SETTINGS STORE
+; ----------------------------------------------------------------------
+;  U-Boot keeps ipaddr, netmask, gatewayip and serverip in its
+;  environment [Reference/v2025.01_cmd_net.c:215-243], and the reason is
+;  the same one that applies here: nobody wants to retype four addresses
+;  after every reset. Anvil already has an environment - the KEY=VALUE
+;  store behind `settings` - so these go in it, under net.address,
+;  net.netmask, net.gateway and net.server.
+;
+;  THE NAMES ARE NOT U-BOOT'S. Anvil's store namespaces its keys with a
+;  dot (wifi.network, wifi.password.plaintext) and a flat `ipaddr`
+;  sitting beside those would be the odd one out. The help text names
+;  U-Boot's spellings so a person coming from U-Boot can find them.
+;
+;  NOTHING LOADS THE STORE FOR YOU. `settings load` reads it and
+;  `settings save` writes it, exactly as for the Wi-Fi keys, and `net`
+;  says so rather than letting an operator discover after a reset that
+;  the addresses went away.
+;
+; ----------------------------------------------------------------------
+;  WHAT HAS NOT BEEN PROVED, SAID BEFORE IT IS DISCOVERED
+; ----------------------------------------------------------------------
+;  THE ETHERNET CABLE IS NOT IN THE BOARD. It was unplugged after
+;  transmit and receive were proven on 2026-08-26 and nothing in this
+;  section has moved a single frame. Every claim here is a reading of
+;  the three libraries and of the RFCs beside them, and not a bench
+;  claim. What that means in practice:
+;
+;    * no end-to-end transfer has happened, in either direction;
+;    * the ARP resolve has never had a reply to parse;
+;    * the retransmit path has never had a packet to lose;
+;    * the mailbox MAC-address read has never been compared against the
+;      address printed on a real board.
+;
+;  The one thing that IS covered without a cable is the refusal: with no
+;  link, GenetPhyWaitLink() returns #GENET_ERR_NO_LINK inside
+;  #ETH_LINK_MS and EthUp() says so in a whole sentence rather than
+;  sitting there. That was the requirement and it is the only part of
+;  this that a dark port can demonstrate.
+; ======================================================================
+
+; --- the receive region. See THE ETHERNET RECEIVE REGION above. -------
+#ETH_RX_BASE  = $08100000      ; 64-byte aligned, as genet.pi4:2196
+                               ; requires, and outside both payload
+                               ; windows on purpose
+#ETH_RX_BYTES = 524288         ; #GENET_RX_TOTAL_BYTES, genet.pi4:1013
+
+; The largest frame the pump will accept into its own buffer.
+; genet.pi4 copies at most #GENET_RX_BUF_LENGTH - #GENET_RX_BUF_OFFSET
+; bytes, which is 2046 [genet.pi4:1010-1011], and refuses with
+; #GENET_ERR_RX_LONG rather than truncating if the capacity is smaller
+; than the descriptor's length. 2048 is therefore the number that can
+; never produce that refusal.
+#ETH_FRAME_MAX = 2048
+
+; How long to wait for auto-negotiation. THERE IS NO CITABLE NUMBER for
+; this and genet.pi4:1888-1897 says so at length - U-Boot's own value
+; lives in a Kconfig this project has no copy of. What that note does
+; give is a measurement: "gigabit auto-negotiation takes on the order of
+; two to four seconds from a cold link, and rather longer if the far end
+; is an old switch that does parallel detection". Five seconds covers
+; the stated range with a second of margin, and it is short enough that
+; a dark port answers while somebody is still looking at the terminal.
+#ETH_LINK_MS = 5000
+
+; How long one frame may take to leave. genet.pi4's GenetSend() takes a
+; real deadline rather than a spin count for the reason its header
+; records; 100 ms is four orders of magnitude more than a 1518-byte
+; frame needs at a gigabit and is a stuck-engine detector, not a flow
+; control.
+#ETH_TX_MS = 100
+
+; One slice of the pump. Short enough that a keypress is noticed
+; promptly - OutBreak() is only asked once per slice - and long enough
+; that the loop is not spinning on an empty ring. A DURATION AND NOT A
+; POLL COUNT, which is the mistake genet.pi4:3060-3078 records costing a
+; hardware run: eight calls to GenetRecv() on an empty ring is a few
+; microseconds and reads exactly like a receive path that does not work.
+#ETH_SLICE_MS = 200
+
+; The ARP resolve: eight tries, half a second of listening each, so four
+; seconds before it gives up. A neighbour that has not answered in four
+; seconds is not going to.
+#ETH_ARP_MS    = 500
+#ETH_ARP_TRIES = 8
+
+; The TFTP retransmit timer handed to TftpSetTimeout(). Two seconds and
+; eight tries is sixteen seconds of patience before the library fails
+; the transfer itself with #TFTP_E_TIMEOUT. The library's own defaults
+; are 5000 and 10 [tftp.pi4:628-629]; these are shorter because there is
+; a person watching the prompt.
+#ETH_RETRY_MS = 2000
+#ETH_RETRIES  = 8
+
+; The absolute ceiling on one transfer, and it is a backstop rather than
+; a policy. The retransmit budget above ends a DEAD transfer in sixteen
+; seconds; this ends a transfer that is somehow making just enough
+; progress to keep resetting that budget and never finishing. Ten
+; minutes is far longer than any legitimate transfer this board can be
+; asked for - 512-byte blocks at a gigabit move a four-megabyte file in
+; seconds - and a keypress stops it long before this does.
+#ETH_MAX_MS = 600000
+
+; A dot on the terminal every this many blocks, so a long transfer looks
+; alive. 64 blocks is 32768 bytes, which is a dot roughly every ten
+; lines' worth of a 260 KB image - enough to see it moving, few enough
+; that the HDMI console is not being repainted for a progress indicator.
+#ETH_DOT_BLOCKS = 64
+
+Global Dim gEthMac.a[6]        ; this board's hardware address
+Global Dim gEthPeer.a[6]       ; whatever NetArpLookup last resolved
+Global Dim gEthRx.a[2048]      ; #ETH_FRAME_MAX. One frame at a time -
+                               ; the ring itself is at #ETH_RX_BASE and
+                               ; genet.pi4 copies out of it into here.
+
+Global gEthIp.i                ; the four addresses, parsed out of the
+Global gEthMask.i              ; settings store by EthConfig()
+Global gEthGw.i
+Global gEthSrv.i
+
+; WHERE THE ADDRESS THE LINK IS ACTUALLY CARRYING CAME FROM. One of the
+; #NET_ADDR_* codes in Anvil/Core/netcfg.pbi, written only by
+; NetAddressBound and read by `net` and `net link`.
+;
+; IT IS NOT COSMETIC. A lease and a stored address behave identically
+; afterwards - the same three numbers in the same IP layer, the same
+; console on the same port, arrived at by the same path - and that
+; sameness is the whole design of 2026-09-07. But they FAIL differently,
+; and an operator looking at a board that has stopped answering needs to
+; know which one this is: a lease that stopped renewing is a question
+; about a server, and a stored address nobody else on the segment agrees
+; about is a question about the settings. A monitor that printed
+; 192.168.137.2 for both would be no help with either.
+Global gEthAddrFrom.i
+
+; ----------------------------------------------------------------------
+;  THE WIRED LINK-LOCAL ADDRESS - 0 when there is none.  2026-09-07.
+;
+;  WHY IT IS A SEPARATE WORD AND NOT JUST gEthIp. The three addresses
+;  above are RE-READ OUT OF THE SETTINGS STORE by EthHasIpConfig()
+;  before every interface choice, deliberately - see the reasoning in
+;  HwLinkOpen, and it is right: an operator who retypes `net server`
+;  between two transfers must not be ignored. A link-local address is
+;  the one address on this board that is NOT in the settings store and
+;  MUST NOT BE PUT THERE:
+;
+;    * it is not a saved static address. It was never agreed by anyone,
+;      it belongs to one segment on one evening, and writing it into
+;      SETTINGS.TXT would make the next boot treat it as the operator's
+;      considered choice - which would then WIN over the link-local
+;      machinery and be re-used without a single probe. An address taken
+;      on the strength of a probe that was never run is exactly the
+;      collision RFC 3927 exists to prevent.
+;    * it would silently displace a real static address somebody had set
+;      for a different network.
+;
+;  So it lives here, in memory only, and EthHasIpConfig() falls back to
+;  it when the settings store has nothing. That one fallback is what
+;  makes every path downstream - the interface preference order, the
+;  console arming, `net`, `net link` - treat a link-local address
+;  exactly like any other, which is the rule of
+;  Memories\the-console-is-networking-not-a-driver-feature.
+; ----------------------------------------------------------------------
+Global gEthLlIp.i
+
+Global gEthUp.i                ; 1 once GenetStart() has succeeded and
+                               ; net.pi4 has been told who we are
+Global gEthMacKnown.i          ; 1 once gEthMac holds something
+Global gEthMacFirmware.i       ; 1 if the firmware gave us the address,
+                               ; 0 if we fell back to a made-up one
+
+Global gEthFrames.i            ; the tally, reset at the start of every
+Global gEthUdp.i               ; transfer
+Global gEthArpOut.i
+Global gEthSendFail.i
+
+; ----------------------------------------------------------------------
+;  The four settings keys, spelled once each. See THE FOUR ADDRESSES
+;  above for why they are not called ipaddr and serverip.
+; ----------------------------------------------------------------------

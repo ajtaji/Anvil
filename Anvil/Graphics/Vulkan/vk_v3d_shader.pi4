@@ -1,0 +1,1744 @@
+; ======================================================================
+;  The V3D 4.2 QPU emitter for Anvil's SPIR-V front end
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; This file turns ONE lowered SPIR-V plan into the three QPU programs,
+; the uniform streams, the default attribute values and the GL shader
+; state record that the V3D 4.2 hardware executes. It is the only file
+; in the Vulkan tree that knows what a QPU instruction or a VPM slot is.
+;
+; IT IS AN EMITTER AND IT IS NOT A COMPILER. There is no register
+; allocator, no scheduler and no instruction selection: the plan says
+; which input feeds which output, and the register numbers below are
+; assigned by counting. That is enough for the shapes vk_spirv.pbi
+; accepts and it is nothing like enough for a general shader, which is
+; exactly why the front end refuses everything else by name.
+;
+; ======================================================================
+;  WHAT IT EMITS
+; ======================================================================
+;  A COORDINATE SHADER writing the shaded-coordinate vertex:
+;      slot 0..3   Xc Yc Zc Wc   clip space, Zc = 0.0 and Wc = 1.0
+;      slot 4,5    Xs Ys         viewport space, signed 1/256 pixel
+;      slot 6..    the varyings, one component per slot
+;  A VERTEX SHADER writing the shaded vertex:
+;      slot 0,1    Xs Ys
+;      slot 2      Zs = 0.0
+;      slot 3      1/Wc = 1.0
+;      slot 4..    the varyings
+;  A FRAGMENT SHADER writing one packed colour to the tile buffer, from
+;  either the uniform stream (a push-constant or a constant colour), a
+;  uniform buffer fetched by the TMU, or four interpolated varyings.
+;
+; ======================================================================
+;  THE VIEWPORT TRANSFORM IS THE ONE PIECE OF ARITHMETIC
+; ======================================================================
+;  Xs = round(Xc * halfWidthInEighthPixels), and the same for Y. The
+;  clipper's CLIPPER_XY_SCALING packet carries that same half width, so
+;  the clipper and the rasteriser cannot disagree: they are computed
+;  from one number. That is two instructions - an FMUL on the multiply
+;  pipe and an FTOIN on the add pipe - and they are the only arithmetic
+;  any emitted program performs.
+;
+;  THE ENGINE'S OWN SHADERS PRE-TRANSFORM ON THE PROCESSOR and feed Xs
+;  and Ys as integer attributes, which is right for a 2D user interface
+;  and wrong here: a Vulkan vertex shader produces a clip position and
+;  the viewport transform belongs after it. So this emitter does the one
+;  thing RaspberryPi4/Lib/neon.pi4 deliberately does not.
+;
+; ======================================================================
+;  PROVENANCE
+; ======================================================================
+;  The V3D 4.2 instruction encoding, the hazard rules and the packet
+;  layouts are this tree's own, in RaspberryPi4/Lib/v3dqpu.pi4 and
+;  RaspberryPi4/Lib/v3d.pi4, which cite the Mesa sources and the V3D
+;  packet documentation they were written against next to each packet.
+;  Mesa was CONSULTED for how the hardware behaves - the shaded-vertex
+;  layout, the VPM segment sizing rule, the requirement that VPM writes
+;  complete before a thread end, and the position of the last thread
+;  switch before a tile-buffer write - and is NOT a runtime dependency.
+;  NO third-party code is used here and nothing is copied from any
+;  implementation. The program shapes below are derived from the three
+;  flat and three textured programs this tree already proves on silicon
+;  in RaspberryPi4/Lib/neon.pi4, and the arithmetic is new.
+;
+;  Vulkan semantics come from the specification:
+;    https://docs.vulkan.org/spec/latest/chapters/vertexpostproc.html
+;      (the viewport transform, and that it follows the vertex shader)
+;    https://docs.vulkan.org/spec/latest/chapters/primsrast.html
+;      (triangle rasterisation and the fragment output)
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_ir_v3d42.pi4"
+
+; ----------------------------------------------------------------------
+;  THE PIPELINE'S DEVICE MEMORY. One page of code and one of everything
+;  else, so every address in it is naturally aligned for what lives
+;  there and a reader can find any of it by adding a constant.
+; ----------------------------------------------------------------------
+#AVKQ_CODE_SLOT = 1024
+#AVKQ_OFF_CS_CODE = 0
+#AVKQ_OFF_VS_CODE = 1024
+#AVKQ_OFF_FS_CODE = 2048
+#AVKQ_OFF_UNIF_CS = 3072
+#AVKQ_OFF_UNIF_VS = 3328
+#AVKQ_OFF_UNIF_FS = 3584
+#AVKQ_OFF_DEFAULTS = 3840
+; 32-byte aligned, which V3dClGlShaderState requires: its address field
+; is 27 bits at bit 5 and the low five bits are not stored.
+#AVKQ_OFF_SHREC = 4096
+; Per-draw texture and sampler state. The largest shader record is 292 bytes,
+; so these 256-byte-aligned blocks cannot overlap it.
+#AVKQ_OFF_TEX_STATE = 4608
+#AVKQ_OFF_SAMP_STATE = 4864
+#AVKQ_BYTES = 8192
+
+; ----------------------------------------------------------------------
+;  THE MULTI-DRAW ABI. Pipeline memory above remains the immutable source
+;  of code, CS/VS uniforms, the fragment-uniform template and defaults.
+;  Every recorded draw receives one separate, cache-line-aligned 896-byte
+;  slot. Nothing in one slot is shared with, or patched for, another draw.
+;
+;    0..319    GL shader state record + all 16 attribute records
+;              (the hardware maximum used here is 36 + 16*16 = 292)
+;    320..575  private clone of the pipeline's FS-uniform template
+;    576..607  private texture state
+;    608..639  private sampler state
+;    640..767  private CS uniforms when viewport is dynamic
+;    768..895  private VS uniforms when viewport is dynamic
+;
+;  896 is fourteen Cortex-A72 cache lines, so neighbouring slots never share a
+;  partial line. Cache maintenance is narrower than the reservation: close
+;  metadata exposes only the live record/template, resource and dynamic
+;  vertex-uniform lines. The list backend consumes those exact spans.
+; ----------------------------------------------------------------------
+#AVKQ_DRAW_OFF_SHREC = 0
+#AVKQ_DRAW_SHREC_BYTES = 320
+#AVKQ_DRAW_OFF_UNIF_FS = 320
+#AVKQ_DRAW_UNIF_FS_BYTES = 256
+#AVKQ_DRAW_OFF_TEX_STATE = 576
+#AVKQ_DRAW_TEX_STATE_BYTES = 32
+#AVKQ_DRAW_OFF_SAMP_STATE = 608
+#AVKQ_DRAW_SAMP_STATE_BYTES = 32
+#AVKQ_DRAW_OFF_UNIF_CS = 640
+#AVKQ_DRAW_UNIF_CS_BYTES = 128
+#AVKQ_DRAW_OFF_UNIF_VS = 768
+#AVKQ_DRAW_UNIF_VS_BYTES = 128
+#AVKQ_DRAW_SLOT_BYTES = 896
+#AVKQ_DRAW_SLOT_ALIGN = 64
+#AVKQ_MAX_DRAW_SLOTS = 4096
+
+; The most attribute records one pipeline can have: four attributes of
+; four components, one record per component, the way this tree's engine
+; already lays them out.
+#AVKQ_MAX_RECORDS = 16
+
+; IEEE-754 binary32 bit patterns for the two constants every emitted
+; program carries.
+#AVKQ_F_ZERO = $00000000
+#AVKQ_F_ONE = $3F800000
+
+; The tile-buffer configuration word the fragment shader's TLBU write
+; pulls out of the uniform stream. It is the value this tree's engine
+; already writes for a single 8-bit render target with no masking; see
+; the uniform-stream note in RaspberryPi4/Lib/neon.pi4.
+#AVKQ_TLB_CONF = $FFFFFFFF
+
+; V3D 4.2's TMU general-load configuration for one vec4 of 32-bit
+; values, one lookup per fragment quad:
+;   $FFFFFF00 | regular-load(15 << 3) | per-quad(0 << 7) | vec4(4)
+; Mesa's ntq_emit_tmu_general() selects this $7C low byte for fragment
+; loads which include helper invocations. TMUAU consumes this word from
+; the uniform stream itself.
+; Omitting the regular-operation field ($78) leaves a different TMU
+; operation selected and can leave the render job waiting forever.
+#AVKQ_TMU_LOAD_VEC4 = $FFFFFF7C
+
+; V3D primitive mode 4 is a triangle list, which is the one topology
+; vkCreateGraphicsPipelines accepts.
+#AVKQ_PRIM_TRIANGLES = 4
+
+; Per-pipeline state, indexed by the backend's own pipeline slot.
+Global Dim avkqBase.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqRecords.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqInSlots.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqVaryComps.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqPosSlot.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqHalfWidthFine.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqHalfHeightFine.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqColourSrc.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqCsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqVsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqCsUniformWords.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqVsUniformWords.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformWords.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushFirst.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushR.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushG.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushB.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsPushA.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformAddress.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsUniformConfig.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsTextureState.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsSamplerState.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqFsTlbConfig.i[#ANVIL_VK_MAX_PIPELINES + 1]
+; Closed once at pipeline creation. The multi-draw submit path consumes these
+; values without re-walking typed-IR patch metadata or portable pipeline
+; flags for every draw.
+Global Dim avkqDrawTemplateReady.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawTemplateBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawRecordBytes.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawUsesPush.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawUsesUniform.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawUsesSample.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawUsesDynamicViewport.a[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawCacheCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkqDrawCacheOffset.i[(#ANVIL_VK_MAX_PIPELINES + 1) * 4]
+Global Dim avkqDrawCacheBytes.i[(#ANVIL_VK_MAX_PIPELINES + 1) * 4]
+Global Dim avkqIrLive.a[193]
+Global avkqError.i = 0
+Global avkqStage.i = 0
+
+Procedure.i AnvilVkV3dShaderError()
+  ProcedureReturn avkqError
+EndProcedure
+
+; Which of the eleven emission steps failed, so a refusal names a step
+; and not just a number.
+Procedure.i AnvilVkV3dShaderStage()
+  ProcedureReturn avkqStage
+EndProcedure
+
+Procedure.i avkqIrDecoration(*m.AvkIrModule, id.i, kind.i)
+  Define i.i
+  Define *d.AvkIrDecoration
+  i = 0
+  While i < *m\decorationCount
+    *d = avkIrDecorationAt(*m, i)
+    If *d\sourceId = id And *d\member = -1 And *d\kind = kind
+      ProcedureReturn *d\value
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avkqIrVariableComponents(*m.AvkIrModule, *v.AvkIrVariable)
+  Define *p.AvkIrType
+  If *v = 0 : ProcedureReturn 0 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 Or *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkIrFloatLanes(*m, *p\pointeeType)
+EndProcedure
+
+; Reconstruct Store-root SSA liveness from the pipeline's immutable typed IR.
+; This is deliberately private to the backend: it must not depend on mutable
+; scratch from shader-module summary, and dead declarations are not executable
+; fragment inputs.
+Procedure avkqIrBuildLive(*m.AvkIrModule, rootId.i)
+  Define i.i
+  Define k.i
+  Define changed.i
+  Define id.i
+  Define *n.AvkIrNode
+  i=0
+  While i<193:avkqIrLive[i]=0:i=i+1:Wend
+  If rootId>0 And rootId<193:avkqIrLive[rootId]=1:EndIf
+  changed=1
+  While changed<>0
+    changed=0:i=0
+    While i<*m\nodeCount
+      *n=avkIrNodeAt(*m,i)
+      If *n\sourceId>0 And *n\sourceId<193 And avkqIrLive[*n\sourceId]<>0
+        k=0
+        While k<*n\operandCount
+          id=avkIrOperand(*n,k)
+          If id>0 And id<193 And avkqIrLive[id]=0
+            avkqIrLive[id]=1:changed=1
+          EndIf
+          k=k+1
+        Wend
+      EndIf
+      i=i+1
+    Wend
+  Wend
+EndProcedure
+
+Procedure avkqClearFragmentMetadata(pipe.i)
+  avkqFsUniformWords[pipe] = 0
+  avkqFsPushFirst[pipe] = -1
+  avkqFsPushR[pipe] = -1 : avkqFsPushG[pipe] = -1
+  avkqFsPushB[pipe] = -1 : avkqFsPushA[pipe] = -1
+  avkqFsUniformAddress[pipe] = -1 : avkqFsUniformConfig[pipe] = -1
+  avkqFsTextureState[pipe] = -1 : avkqFsSamplerState[pipe] = -1
+  avkqFsTlbConfig[pipe] = -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  An exact whole number as a binary32 bit pattern.
+;
+;  Only the values this emitter needs: 0 and the positive integers below
+;  2^24, which every one of them is (a half viewport in eighths of a
+;  pixel is at most 4096 * 128). Exact by construction, and done on the
+;  bit pattern so no floating-point unit has to be enabled to build a
+;  shader.
+; ----------------------------------------------------------------------
+Procedure.i avkqF32FromInt(n.i)
+  Define e.i
+  Define m.i
+  If n <= 0 : ProcedureReturn #AVKQ_F_ZERO : EndIf
+  If n >= 16777216 : ProcedureReturn 0 : EndIf
+  e = 0
+  m = n
+  While m > 1
+    m = m >> 1
+    e = e + 1
+  Wend
+  ; n is in [2^e, 2^(e+1)); the mantissa is n with its leading one
+  ; removed, left justified into 23 bits.
+  m = (n << (23 - e)) & $7FFFFF
+  ProcedureReturn ((e + 127) << 23) | m
+EndProcedure
+
+Procedure avkqPoke32(addr.i, v.i)
+  PokeA(addr, v & $FF)
+  PokeA(addr + 1, (v >> 8) & $FF)
+  PokeA(addr + 2, (v >> 16) & $FF)
+  PokeA(addr + 3, (v >> 24) & $FF)
+EndProcedure
+
+; The VPM input slot the first component of attribute `a` lands in. One
+; attribute record per component, in location order, which is the layout
+; the attribute records below are written in.
+Procedure.i avkqInSlotOf(pipe.i, a.i)
+  Define k.i
+  Define n.i
+  n = 0
+  k = 0
+  While k < a
+    n = n + AnvilVkPipelineAttrComponents(pipe, k)
+    k = k + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i avkqTotalComponents(pipe.i)
+  ProcedureReturn avkqInSlotOf(pipe, AnvilVkPipelineAttrCount(pipe))
+EndProcedure
+
+Procedure.i avkqVaryingComponents(pipe.i)
+  Define k.i
+  Define n.i
+  n = 0
+  k = 0
+  While k < AnvilVkPipelineVaryingCount(pipe)
+    n = n + AnvilVkPipelineVaryingComponents(pipe, k)
+    k = k + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE VPM OUTPUT SEGMENT SIZE.
+;
+;  The documented rule is align(n, 8) / 8 sectors of eight rows. The one
+;  shape in this tree that carries varyings and is proven on silicon -
+;  the textured vertex shader, six outputs - uses TWO where that rule
+;  gives one, so this adds a sector whenever there are varyings rather
+;  than emitting a smaller segment than the one shape anybody has
+;  actually run. Over-declaring a segment costs VPM space and therefore
+;  vertices in flight; under-declaring one corrupts vertices, and the
+;  two are not symmetric.
+;
+;  It is the one number in this file that a board run settles rather
+;  than a desk gate, and it is written down here so that is findable.
+; ----------------------------------------------------------------------
+Procedure.i avkqOutSeg(slots.i, varyComps.i)
+  Define n.i
+  n = (slots + 7) / 8
+  If n < 1 : n = 1 : EndIf
+  If varyComps > 0 : n = n + 1 : EndIf
+  If n > 15 : n = 15 : EndIf
+  ProcedureReturn n
+EndProcedure
+
+; ======================================================================
+;  THE COORDINATE SHADER
+; ======================================================================
+;  rf0..rf(K-1)  the integers 0..K-1, used both as LDVPM input offsets
+;                and as STVPM output slot indices
+;  rfK, rfK+1    0.0 and 1.0
+;  rfK+2, rfK+3  the viewport half width and half height, in eighths of
+;                a pixel, as binary32
+;  rfB..         one register per VPM input, B = K + 4
+;  rfT, rfT+1    Xs and Ys, T = B + inSlots
+;
+;  The uniform stream is read in PROGRAM ORDER, so it is laid out in
+;  exactly the order the LDUNIFRFs above appear and nowhere else.
+; ======================================================================
+Procedure.i avkqEmitCoord(pipe.i, base.i, inSlots.i, varyComps.i, halfW.i, halfH.i)
+  Define r.i
+  Define k.i
+  Define c.i
+  Define v.i
+  Define outSlots.i
+  Define kcount.i
+  Define b.i
+  Define t.i
+  Define xIn.i
+  Define yIn.i
+  Define src.i
+  Define slot.i
+
+  outSlots = 6 + varyComps
+  kcount = outSlots
+  If inSlots > kcount : kcount = inSlots : EndIf
+  b = kcount + 4
+  t = b + inSlots
+  xIn = avkqInSlotOf(pipe, AnvilVkPipelinePositionAttr(pipe))
+  yIn = xIn + 1
+
+  r = V3dQpuProgramBeginSeg(base + #AVKQ_OFF_CS_CODE, #AVKQ_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; The whole uniform block, into rf0..rf(K+3).
+  k = 0
+  While k < (kcount + 4)
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; Every attribute component, one VPM row each.
+  k = 0
+  While k < inSlots
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, b + k, #V3DQ_MUX_A, k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  ; The viewport transform, on the multiply pipe.
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, t, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(b + xIn, kcount + 2)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, t + 1, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(b + yIn, kcount + 3)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Round to nearest, in place. FTOIN is the one instruction in this
+  ; emitter that neither of the engine's proven programs uses.
+  r = V3dQpuAdd1(#V3DQ_A_FTOIN, t, 0, #V3DQ_MUX_A, t)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd1(#V3DQ_A_FTOIN, t + 1, 0, #V3DQ_MUX_A, t + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; Xc, Yc, Zc = 0.0, Wc = 1.0, Xs, Ys.
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, b + xIn)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 1, b + yIn)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, kcount)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 3, kcount + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 4, t)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 5, t + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; The varyings, in plan order.
+  slot = 6
+  v = 0
+  While v < AnvilVkPipelineVaryingCount(pipe)
+    src = avkqInSlotOf(pipe, AnvilVkPipelineVaryingSource(pipe, v))
+    c = 0
+    While c < AnvilVkPipelineVaryingComponents(pipe, v)
+      r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot, b + src + c)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      slot = slot + 1
+      c = c + 1
+    Wend
+    v = v + 1
+  Wend
+
+  ; GFXH-1684: VPM writes must be complete before the thread ends.
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+;  THE VERTEX SHADER. The same inputs, four fewer output slots.
+; ======================================================================
+Procedure.i avkqEmitVertex(pipe.i, base.i, inSlots.i, varyComps.i)
+  Define r.i
+  Define k.i
+  Define c.i
+  Define v.i
+  Define outSlots.i
+  Define kcount.i
+  Define b.i
+  Define t.i
+  Define xIn.i
+  Define yIn.i
+  Define src.i
+  Define slot.i
+
+  outSlots = 4 + varyComps
+  kcount = outSlots
+  If inSlots > kcount : kcount = inSlots : EndIf
+  b = kcount + 4
+  t = b + inSlots
+  xIn = avkqInSlotOf(pipe, AnvilVkPipelinePositionAttr(pipe))
+  yIn = xIn + 1
+
+  r = V3dQpuProgramBeginSeg(base + #AVKQ_OFF_VS_CODE, #AVKQ_CODE_SLOT, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  k = 0
+  While k < (kcount + 4)
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  k = 0
+  While k < inSlots
+    r = V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, b + k, #V3DQ_MUX_A, k)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, t, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(b + xIn, kcount + 2)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuReset()
+  V3dQpuMul(#V3DQ_M_FMUL, t + 1, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+  V3dQpuRaddr(b + yIn, kcount + 3)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd1(#V3DQ_A_FTOIN, t, 0, #V3DQ_MUX_A, t)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd1(#V3DQ_A_FTOIN, t + 1, 0, #V3DQ_MUX_A, t + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  ; Xs, Ys, Zs = 0.0, 1/Wc = 1.0.
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, t)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 1, t + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, kcount)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, 3, kcount + 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  slot = 4
+  v = 0
+  While v < AnvilVkPipelineVaryingCount(pipe)
+    src = avkqInSlotOf(pipe, AnvilVkPipelineVaryingSource(pipe, v))
+    c = 0
+    While c < AnvilVkPipelineVaryingComponents(pipe, v)
+      r = V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot, b + src + c)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      slot = slot + 1
+      c = c + 1
+    Wend
+    v = v + 1
+  Wend
+
+  r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+;  THE FRAGMENT SHADER
+; ======================================================================
+;  THREE SHAPES, and which one is emitted is the plan's own answer.
+;
+;  A FLAT colour - a push constant or a compile-time constant - is four
+;  uniform words and two VFPACKs, which is byte for byte the shape this
+;  tree's engine already runs on every rectangle it draws.
+;
+;  An INTERPOLATED colour is four (LDVARY, delay, FADD with r5) triples
+;  and the same two VFPACKs. That is the shape the engine's textured
+;  program uses for its two texture coordinates, with the texture unit
+;  taken out.
+;
+;  A DESCRIPTOR colour keeps the descriptor's ADDRESS in the fragment
+;  uniform stream. LDUNIFRF puts that address in rf8, then a write of rf8
+;  to TMUAU starts the lookup. TMUAU's `U` sideband consumes the general-load
+;  configuration word from the uniform stream itself; adding WRTMUC to that
+;  instruction would consume a second word and leave the later TLBU write
+;  reading beyond its three-word stream.
+;  THRSW plus its two delay slots delivers four LDTMU results in shader
+;  component order. Mesa 24.3.4's emit_tmu_general_address_write() and
+;  ntq_emit_tmu_general() are the source for that protocol. py-videocore6's
+;  working general-memory programs independently use the same plain TMUAU
+;  launch: no WRTMUC signal accompanies it.
+;
+;  THE COMPONENT ORDER IS NOT THE SHADER'S. The shader produces red,
+;  green, blue and alpha, in that order, because that is what a Vulkan
+;  fragment output is. The render target is VK_FORMAT_B8G8R8A8_UNORM,
+;  whose first byte is blue, and the tile store writes shader component
+;  0 into that first byte. So the pack below is (blue, green) then
+;  (red, alpha), and the uniform stream for the flat shape is written in
+;  the same order. Getting this wrong produces a picture that is right
+;  in every way except that it is the wrong colour, which is the kind of
+;  failure that gets blamed on the shader for a whole evening.
+;
+;  THE TLB WRITES COME AFTER THE LAST THREAD SWITCH. The tile buffer is
+;  shared and the final thread section is where the scoreboard lock is,
+;  so this program is NOT single segment and the shader record's bit
+;  says the same thing.
+; ======================================================================
+Procedure.i avkqEmitFragment(pipe.i, base.i, colourSrc.i)
+  Define r.i
+  Define k.i
+
+  r = V3dQpuProgramBeginSeg(base + #AVKQ_OFF_FS_CODE, #AVKQ_CODE_SLOT, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+  If colourSrc = #ANVIL_SPV_COLOUR_VARYING
+    ; rf0..rf3 take the four interpolated components in the order the
+    ; vertex shader wrote them: red, green, blue, alpha.
+    k = 0
+    While k < 4
+      r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      r = V3dQpuNop()
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      r = V3dQpuAdd2(#V3DQ_A_FADD, 4 + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      k = k + 1
+    Wend
+    r = V3dQpuLastThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; (blue, green) then (red, alpha) - see the note above.
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 6, 5)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 4, 7)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuProgramEndThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ProcedureReturn V3dQpuProgramEnd()
+  EndIf
+
+  If colourSrc = #ANVIL_SPV_COLOUR_UNIFORM
+    ; The descriptor address is the first stream word. Keep it in the
+    ; register file, not an accumulator: THRSW invalidates accumulators.
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; TMUAU consumes #AVKQ_TMU_LOAD_VEC4 from the stream while the ADD-side
+    ; OR-move writes rf8 and starts the general lookup. The launch itself
+    ; carries THRSW, matching py-videocore6's silicon-tested general-vector
+    ; read; delaying the switch to a separate following instruction can leave
+    ; the render job waiting. Do not add WRTMUC here: that is a second
+    ; sideband-uniform consumer, not part of this launch.
+    V3dQpuReset()
+    r = V3dQpuSig(#V3DQ_SIG_THRSW)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
+    V3dQpuRaddr(8, 0)
+    r = V3dQpuEmit()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; The two following instructions are THRSW's architectural delay slots,
+    ; not padding.
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    k = 0
+    While k < 4
+      r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      k = k + 1
+    Wend
+
+    r = V3dQpuLastThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; The TMU returns red, green, blue, alpha in rf0..rf3. The target
+    ; stores B8G8R8A8, so pack blue/green and then red/alpha.
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 1)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 3)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuProgramEndThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ProcedureReturn V3dQpuProgramEnd()
+  EndIf
+
+  If colourSrc = #ANVIL_SPV_COLOUR_SAMPLED
+    ; P0 and P1 point at the texture and sampler state. WRTMUC consumes one
+    ; uniform for each, exactly as the already silicon-proven Neon texture
+    ; program does.
+    r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; Location zero is a vec2. V3D supplies the interpolation correction in
+    ; r5; each coordinate must add it before the texture request is launched.
+    r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_FADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 11, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_FADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 11, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    ; T is written first; writing S fires the request.
+    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 13, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, 12, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+
+    r = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuNop()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = 0
+    While k < 4
+      r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, k, 0)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+      k = k + 1
+    Wend
+    r = V3dQpuLastThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ; The TMU returns shader RGBA. The target stores B8G8R8A8.
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 1)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 3)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    r = V3dQpuProgramEndThrsw()
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    ProcedureReturn V3dQpuProgramEnd()
+  EndIf
+
+  ; The flat shape. The uniform stream is already in the target's byte
+  ; order, so rf0..rf3 are blue, green, red and alpha and the packs are
+  ; in register order.
+  k = 0
+  While k < 4
+    r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    k = k + 1
+  Wend
+  r = V3dQpuLastThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; The TLBU write pulls the configuration word out of the stream by
+  ; itself, with no LDUNIFRF, which is why the stream has five words.
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 1)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, 2, 3)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEndThrsw()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The uniform streams, in the order the programs read them.
+; ----------------------------------------------------------------------
+Procedure avkqWriteVertexUniforms(addr.i, kcount.i, halfW.i, halfH.i)
+  Define k.i
+  k = 0
+  While k < kcount
+    avkqPoke32(addr + (k * 4), k)
+    k = k + 1
+  Wend
+  avkqPoke32(addr + (kcount * 4), #AVKQ_F_ZERO)
+  avkqPoke32(addr + ((kcount + 1) * 4), #AVKQ_F_ONE)
+  avkqPoke32(addr + ((kcount + 2) * 4), avkqF32FromInt(halfW))
+  avkqPoke32(addr + ((kcount + 3) * 4), avkqF32FromInt(halfH))
+EndProcedure
+
+; ======================================================================
+;  THE EMITTER'S PUBLIC FACE
+; ======================================================================
+;  These are NOT the backend seam. The seam lives in vk_v3d_backend.pi4
+;  and calls them, and they are separate so that a desk gate can compile
+;  a real pipeline and build a real shader record - which is arithmetic
+;  and memory writes and nothing else - without linking a backend that
+;  owns hardware. A gate that had to bring V3D up to check an encoding
+;  would be a gate nobody could run.
+
+; How much device memory one compiled pipeline needs.
+Procedure.i AnvilVkV3dPipelineBytes()
+  ProcedureReturn #AVKQ_BYTES
+EndProcedure
+
+; The per-draw arena is deliberately a separate allocation from every
+; pipeline. These pure helpers are shared by the later backend wiring and by
+; the desk gate, so the 4096-draw ceiling and all overflow checks have one
+; owner rather than being repeated as pointer arithmetic at call sites.
+Procedure.i AnvilVkV3dDrawSlotBytes()
+  ProcedureReturn #AVKQ_DRAW_SLOT_BYTES
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawRecordBytes()
+  ProcedureReturn #AVKQ_DRAW_SHREC_BYTES
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawUniformOffset()
+  ProcedureReturn #AVKQ_DRAW_OFF_UNIF_FS
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawTextureOffset()
+  ProcedureReturn #AVKQ_DRAW_OFF_TEX_STATE
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawSamplerOffset()
+  ProcedureReturn #AVKQ_DRAW_OFF_SAMP_STATE
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawCoordinateUniformOffset()
+  ProcedureReturn #AVKQ_DRAW_OFF_UNIF_CS
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawVertexUniformOffset()
+  ProcedureReturn #AVKQ_DRAW_OFF_UNIF_VS
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawArenaBytes(drawCount.i)
+  If drawCount < 1 Or drawCount > #AVKQ_MAX_DRAW_SLOTS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn drawCount * #AVKQ_DRAW_SLOT_BYTES
+EndProcedure
+
+; Return the zero-based draw slot only when the entire 896-byte record lies
+; in both the caller's arena and V3D's 32-bit address space. The division
+; form of the range check is intentional: it never adds an untrusted count
+; or index before proving that multiplication is bounded.
+Procedure.i AnvilVkV3dDrawSlotBase(arenaBase.i, arenaBytes.i, drawIndex.i)
+  Define off.i
+  If arenaBase <= 0 Or (arenaBase & (#AVKQ_DRAW_SLOT_ALIGN - 1)) <> 0
+    ProcedureReturn 0
+  EndIf
+  If arenaBytes < #AVKQ_DRAW_SLOT_BYTES Or arenaBytes > AnvilVkV3dDrawArenaBytes(#AVKQ_MAX_DRAW_SLOTS) Or (arenaBytes % #AVKQ_DRAW_SLOT_BYTES) <> 0
+    ProcedureReturn 0
+  EndIf
+  If drawIndex < 0 Or drawIndex > ((arenaBytes - #AVKQ_DRAW_SLOT_BYTES) / #AVKQ_DRAW_SLOT_BYTES)
+    ProcedureReturn 0
+  EndIf
+  off = drawIndex * #AVKQ_DRAW_SLOT_BYTES
+  If arenaBase > ($FFFFFFFF - off - (#AVKQ_DRAW_SLOT_BYTES - 1))
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn arenaBase + off
+EndProcedure
+
+; Allocation guard only. Cache maintenance must consume the close-time live
+; ranges below; this helper intentionally exposes no fixed 896-byte clean.
+Procedure.i avkqDrawSlotAddressValid(drawBase.i)
+  If drawBase <= 0 Or (drawBase & (#AVKQ_DRAW_SLOT_ALIGN - 1)) <> 0 Or drawBase > ($FFFFFFFF - (#AVKQ_DRAW_SLOT_BYTES - 1))
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawLiveRecordBytes(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqDrawRecordBytes[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawLiveUniformBytes(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqDrawTemplateBytes[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawCacheRangeCount(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqDrawCacheCount[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawCacheRangeOffset(pipe.i, index.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 : ProcedureReturn -1 : EndIf
+  If index < 0 Or index >= avkqDrawCacheCount[pipe] : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqDrawCacheOffset[(pipe * 4) + index]
+EndProcedure
+
+Procedure.i AnvilVkV3dDrawCacheRangeBytes(pipe.i, index.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 : ProcedureReturn 0 : EndIf
+  If index < 0 Or index >= avkqDrawCacheCount[pipe] : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqDrawCacheBytes[(pipe * 4) + index]
+EndProcedure
+
+; Compile pipeline `pipe` into `base`. Everything that does not depend on
+; the draw is built here: the three programs, the two vertex uniform
+; streams, the fragment-uniform TEMPLATE and the default attribute values.
+; A private shader record is built per draw and the template is cloned into
+; that draw's slot before dynamic resource addresses or push words are
+; patched, because neither belongs to the immutable pipeline.
+;
+; NOTHING HERE TOUCHES THE GRAPHICS ENGINE. It encodes instructions and
+; writes memory; the engine is not consulted and no register is read.
+; Whether a device exists at all was settled by avkBackendPrepare long
+; before any pipeline could be created.
+Procedure.i AnvilVkV3dCompile(*build.AnvilVkBackendPipelineBuildInfo)
+  Define r.i
+  Define pipe.i
+  Define base.i
+  Define bytes.i
+  Define inSlots.i
+  Define varyComps.i
+  Define i.i
+  Define location.i
+  Define components.i
+  Define firstSlot.i
+  Define inputCount.i
+  Define outputCount.i
+  Define valueId.i
+  Define outputVariableId.i
+  Define outputMember.i
+  Define positionLocation.i
+  Define positionSlot.i
+  Define *vertexIr.AvkIrModule
+  Define *ir.AvkIrModule
+  Define *variable.AvkIrVariable
+  Define *node.AvkIrNode
+  Define *vertexVarying.AvkIrV3d42VertexVarying
+  Define target.AvkIrV3d42Target
+  Define result.AvkIrV3d42Result
+  Define vertexPlan.AvkIrV3d42VertexPlan
+  Define vertexTarget.AvkIrV3d42VertexPairTarget
+  Define vertexResult.AvkIrV3d42VertexPairResult
+  Dim vertexInputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
+  Dim inputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
+  Dim outputs.AvkIrV3d42Io[#ANVIL_IR_V3D42_MAX_IO]
+
+  avkqError = 0
+  avkqStage = 0
+  If *build = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  pipe = *build\pipeline
+  base = *build\base
+  bytes = *build\bytes
+  *vertexIr = *build\vertexIr
+  *ir = *build\fragmentIr
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If base <= 0 Or (base % 4096) <> 0 Or bytes < #AVKQ_BYTES
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *vertexIr = 0 Or *vertexIr\stage <> #ANVIL_IR_STAGE_VERTEX Or *ir = 0 Or *ir\stage <> #ANVIL_IR_STAGE_FRAGMENT
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "the Pi 4 QPU compiler was not given both verified vertex and fragment typed IR modules from the current synchronous pipeline-build transaction (Anvil code -20001, invalid shader transaction); no pipeline was created.")
+  EndIf
+  avkqClearFragmentMetadata(pipe)
+  avkqDrawUsesDynamicViewport[pipe] = Bool(*build\dynamicViewport <> 0)
+
+  ; The canonical typed plan is the authority.  The portable summaries still
+  ; feed Vulkan interface checks and attribute records, so prove every one of
+  ; their vertex facts against the plan before emitting a byte.
+  avkqStage = 1
+  r = AnvilVkIrV3d42PlanVertex(*vertexIr, @vertexPlan)
+  If r <> #ANVIL_IR_V3D42_OK
+    avkqError = r
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not form a canonical plan from the verified vertex typed IR (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation or layout.")
+  EndIf
+  inputCount = 0
+  i = 0
+  While i < *vertexIr\variableCount
+    *variable = avkIrVariableAt(*vertexIr, i)
+    location = avkqIrDecoration(*vertexIr, *variable\sourceId, #ANVIL_IR_DEC_LOCATION)
+    If *variable\storageClass = #ANVIL_IR_STORAGE_INPUT And location >= 0
+      components = avkqIrVariableComponents(*vertexIr, *variable)
+      If location >= #ANVIL_IR_V3D42_MAX_IO Or components < 1 Or vertexInputs[location]\components <> 0
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not map the vertex typed-IR inputs into the bounded attribute table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created.")
+      EndIf
+      vertexInputs[location]\variableId = *variable\sourceId
+      vertexInputs[location]\member = -1
+      vertexInputs[location]\firstSlot = avkqInSlotOf(pipe, location)
+      vertexInputs[location]\components = components
+      If inputCount < location + 1 : inputCount = location + 1 : EndIf
+    EndIf
+    i = i + 1
+  Wend
+  positionLocation = avkqIrDecoration(*vertexIr, vertexPlan\positionInputVariableId, #ANVIL_IR_DEC_LOCATION)
+  If inputCount <> AnvilVkPipelineAttrCount(pipe) Or positionLocation <> AnvilVkPipelinePositionAttr(pipe) Or vertexPlan\varyingCount <> AnvilVkPipelineVaryingCount(pipe)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that the portable vertex summary disagrees with the canonical typed-IR plan (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
+  EndIf
+  positionSlot = avkqInSlotOf(pipe, positionLocation)
+  i = 0
+  While i < vertexPlan\varyingCount
+    *vertexVarying = @vertexPlan + OffsetOf(AvkIrV3d42VertexPlan\varyings) + i * SizeOf(AvkIrV3d42VertexVarying)
+    location = avkqIrDecoration(*vertexIr, *vertexVarying\sourceVariableId, #ANVIL_IR_DEC_LOCATION)
+    If *vertexVarying\location <> i Or *vertexVarying\components <> AnvilVkPipelineVaryingComponents(pipe, i) Or location <> AnvilVkPipelineVaryingSource(pipe, i)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that a portable varying summary disagrees with the canonical typed-IR plan (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
+    EndIf
+    i = i + 1
+  Wend
+
+  inSlots = avkqTotalComponents(pipe)
+  varyComps = avkqVaryingComponents(pipe)
+  If inSlots < 2 Or inSlots > #AVKQ_MAX_RECORDS
+    avkqStage = 1
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given a vertex layout of fewer than two or more than sixteen attribute components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. One attribute record is emitted per component and the shader state record holds sixteen.")
+  EndIf
+  If varyComps <> 0 And varyComps <> 2 And varyComps <> 4
+    avkqStage = 2
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU emitter was given other than zero, two or four varying components (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. Flat colour uses none, a sampled image uses one vec2 and interpolated colour uses one vec4.")
+  EndIf
+  If varyComps > 0 And AnvilVkPipelineUsesVarying(pipe) = 0
+    avkqStage = 3
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a pipeline whose vertex shader writes a varying its fragment shader does not read (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. An interpolated varying that nothing consumes would be written into the VPM and thrown away.")
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0 And varyComps <> 2
+    avkqStage = 3
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a sampled-image fragment graph without exactly one vec2 varying coordinate (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. This bounded texture path consumes one whole two-component input.")
+  EndIf
+
+  ; VIEWPORT_OFFSET's fine field is unsigned u14.8.  Origin-zero extents up
+  ; to 32767 fit exactly, including odd dimensions; 32768 would overflow the
+  ; field rather than merely make a larger picture.
+  If AnvilVkPipelineViewportWidth(pipe) > 32767 Or AnvilVkPipelineViewportHeight(pipe) > 32767
+    avkqStage = 4
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler was given a viewport wider or taller than 32767 pixels (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created because V3D 4.2's origin-zero fine viewport offset is an unsigned u14.8 field.")
+  EndIf
+
+  vertexTarget\coordinateCodeBase = base + #AVKQ_OFF_CS_CODE
+  vertexTarget\coordinateCodeCapacity = #AVKQ_CODE_SLOT
+  vertexTarget\vertexCodeBase = base + #AVKQ_OFF_VS_CODE
+  vertexTarget\vertexCodeCapacity = #AVKQ_CODE_SLOT
+  vertexTarget\coordinateUniformBase = base + #AVKQ_OFF_UNIF_CS
+  vertexTarget\coordinateUniformCapacity = #AVKQ_OFF_UNIF_VS - #AVKQ_OFF_UNIF_CS
+  vertexTarget\vertexUniformBase = base + #AVKQ_OFF_UNIF_VS
+  vertexTarget\vertexUniformCapacity = #AVKQ_OFF_UNIF_FS - #AVKQ_OFF_UNIF_VS
+  vertexTarget\viewportWidth = AnvilVkPipelineViewportWidth(pipe)
+  vertexTarget\viewportHeight = AnvilVkPipelineViewportHeight(pipe)
+  vertexTarget\inputCount = inputCount
+  vertexTarget\inputs = @vertexInputs[0]
+  avkqStage = 5
+  r = AnvilVkIrV3d42LowerVertexPair(*vertexIr, @vertexTarget, @vertexResult)
+  If r <> #ANVIL_IR_V3D42_OK
+    avkqError = r
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not lower the verified vertex typed IR into an exact transactional coordinate/vertex pair (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation, layout or encoder step.")
+  EndIf
+  If vertexResult\inputSlots <> inSlots Or vertexResult\varyingComponents <> varyComps
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 QPU compiler found that the emitted typed vertex pair disagrees with the validated pipeline layout (Anvil code -20004, inconsistent pipeline state); no pipeline was created.")
+  EndIf
+  avkqCsBytes[pipe] = vertexResult\coordinateCodeBytes
+  avkqVsBytes[pipe] = vertexResult\vertexCodeBytes
+  avkqCsUniformWords[pipe] = vertexResult\coordinateUniformWords
+  avkqVsUniformWords[pipe] = vertexResult\vertexUniformWords
+  avkqStage = 7
+  inputCount = 0
+  i=0:valueId=0:outputVariableId=0
+  While i<*ir\nodeCount
+    *node=avkIrNodeAt(*ir,i)
+    If *node\kind=#ANVIL_IR_OP_STORE
+      valueId=*node\operand1
+      outputMember=-1
+      avk42PointerSelection(*ir,*node\operand0,@outputVariableId,@outputMember)
+    EndIf
+    i=i+1
+  Wend
+  avkqIrBuildLive(*ir,valueId)
+  i = 0
+  While i < *ir\variableCount
+    *variable = avkIrVariableAt(*ir, i)
+    location = avkqIrDecoration(*ir, *variable\sourceId, #ANVIL_IR_DEC_LOCATION)
+    If location >= 0
+      components = avkqIrVariableComponents(*ir, *variable)
+      If components < 1 Or location >= #ANVIL_IR_V3D42_MAX_IO
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not map a fragment interface variable into its bounded typed-IR input/output table (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created.")
+      EndIf
+      If *variable\storageClass = #ANVIL_IR_STORAGE_INPUT And avkqIrLive[*variable\sourceId] <> 0
+        inputs[location]\variableId = *variable\sourceId
+        inputs[location]\member = -1
+        inputs[location]\components = components
+        If inputCount < location + 1 : inputCount = location + 1 : EndIf
+      ElseIf *variable\storageClass = #ANVIL_IR_STORAGE_OUTPUT And *variable\sourceId = outputVariableId
+        outputs[location]\variableId = *variable\sourceId
+        outputs[location]\member = -1
+        outputs[location]\components = components
+        If outputCount < location + 1 : outputCount = location + 1 : EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  firstSlot = 0 : i = 0
+  While i < inputCount
+    inputs[i]\firstSlot = firstSlot
+    firstSlot = firstSlot + inputs[i]\components
+    i = i + 1
+  Wend
+  outputs[0]\firstSlot = 0
+  target\role = #ANVIL_IR_V3D42_ROLE_FRAGMENT
+  target\codeBase = base + #AVKQ_OFF_FS_CODE
+  target\codeCapacity = #AVKQ_CODE_SLOT
+  target\uniformBase = base + #AVKQ_OFF_UNIF_FS
+  target\uniformCapacity = #AVKQ_OFF_DEFAULTS - #AVKQ_OFF_UNIF_FS
+  target\inputCount = inputCount
+  If inputCount > 0 : target\inputs = @inputs[0] : EndIf
+  target\outputCount = outputCount
+  If outputCount > 0 : target\outputs = @outputs[0] : EndIf
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0 : target\pushWordCount = 4 : EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 : target\uniformBlockAddress = 4 : EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    target\textureStateAddress = base + #AVKQ_OFF_TEX_STATE
+    target\samplerStateAddress = base + #AVKQ_OFF_SAMP_STATE
+  EndIf
+  target\tlbConfig = #AVKQ_TLB_CONF
+  r = AnvilVkIrV3d42Lower(*ir, @target, @result)
+  avkqFsBytes[pipe] = result\codeBytes
+  If r <> #ANVIL_IR_V3D42_OK
+    avkqError = r
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the Pi 4 QPU compiler could not lower the verified fragment typed IR into an exact V3D 4.2 program (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); no pipeline was created. AnvilVkIrV3d42Error(), SourceId(), SourceOpcode() and Stage() identify the unsupported semantic operation or layout.")
+  EndIf
+  avkqFsUniformWords[pipe] = result\uniformWords
+  avkqFsPushFirst[pipe] = result\pushFirstWord
+  avkqFsPushR[pipe] = result\pushRWord : avkqFsPushG[pipe] = result\pushGWord
+  avkqFsPushB[pipe] = result\pushBWord : avkqFsPushA[pipe] = result\pushAWord
+  avkqFsUniformAddress[pipe] = result\uniformAddressWord
+  avkqFsUniformConfig[pipe] = result\uniformConfigWord
+  avkqFsTextureState[pipe] = result\textureStateWord
+  avkqFsSamplerState[pipe] = result\samplerStateWord
+  avkqFsTlbConfig[pipe] = result\tlbConfigWord
+  If avkqFragmentMetadataValid(pipe) = 0
+    avkqError = #ANVIL_IR_V3D42_ERR_LAYOUT
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU compiler returned an inconsistent fragment uniform layout (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created. Every required patch index must be distinct and inside the retained stream, and absent resources must own no patch index.")
+  EndIf
+
+  ; The default attribute values, read for any component a shader asks
+  ; for that an attribute record does not supply. Nothing in an emitted
+  ; program does, but the record's field is not optional.
+  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 0, #AVKQ_F_ZERO)
+  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 4, #AVKQ_F_ZERO)
+  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 8, #AVKQ_F_ZERO)
+  avkqPoke32(base + #AVKQ_OFF_DEFAULTS + 12, #AVKQ_F_ONE)
+
+  avkqBase[pipe] = base
+  avkqRecords[pipe] = inSlots
+  avkqInSlots[pipe] = inSlots
+  avkqVaryComps[pipe] = varyComps
+  avkqPosSlot[pipe] = positionSlot
+  avkqHalfWidthFine[pipe] = vertexResult\halfWidthEighths
+  avkqHalfHeightFine[pipe] = vertexResult\halfHeightEighths
+  avkqColourSrc[pipe] = AnvilVkPipelineColourSource(pipe)
+  r = avkqCloseDrawTemplate(pipe)
+  If r <> #VK_SUCCESS
+    avkqBase[pipe] = 0
+    avkqRecords[pipe] = 0
+    ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "the Pi 4 QPU compiler could not close the immutable fragment template and exact per-draw cache plan (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no pipeline was created.")
+  EndIf
+  avkqStage = 0
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure AnvilVkV3dRelease(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn
+  EndIf
+  avkqBase[pipe] = 0
+  avkqRecords[pipe] = 0
+  avkqCsUniformWords[pipe] = 0
+  avkqVsUniformWords[pipe] = 0
+  avkqHalfWidthFine[pipe] = 0
+  avkqHalfHeightFine[pipe] = 0
+  avkqDrawTemplateReady[pipe] = 0
+  avkqDrawTemplateBytes[pipe] = 0
+  avkqDrawRecordBytes[pipe] = 0
+  avkqDrawUsesPush[pipe] = 0
+  avkqDrawUsesUniform[pipe] = 0
+  avkqDrawUsesSample[pipe] = 0
+  avkqDrawUsesDynamicViewport[pipe] = 0
+  avkqDrawCacheCount[pipe] = 0
+  avkqClearFragmentMetadata(pipe)
+EndProcedure
+
+; Where a compiled pipeline's memory is, how many attribute records it
+; has, and how many varying components it carries. A gate reads these
+; and so does the backend.
+Procedure.i AnvilVkV3dCodeBase(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn avkqBase[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dRecordCount(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn avkqRecords[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dVaryingComponents(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn avkqVaryComps[pipe]
+EndProcedure
+
+; Exact origin-zero viewport centre in the V3D VIEWPORT_OFFSET fine field's
+; u14.8 units. Odd dimensions retain their half pixel as 128, not zero.
+Procedure.i AnvilVkV3dViewportHalfWidthFine(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqHalfWidthFine[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dViewportHalfHeightFine(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqHalfHeightFine[pipe]
+EndProcedure
+
+; V3D 4.2 CLIPPER_XY_SCALING is a binary32 value expressed in 1/256-pixel
+; units, exactly like the u14.8 VIEWPORT_OFFSET fields. Keep the two packet
+; encodings in the same unit: converting the retained fine integer directly
+; to binary32 preserves odd extents and avoids a 256x clipper/shader mismatch.
+Procedure.i AnvilVkV3dViewportHalfWidthBits(pipe.i)
+  ProcedureReturn avkqF32FromInt(AnvilVkV3dViewportHalfWidthFine(pipe))
+EndProcedure
+
+Procedure.i AnvilVkV3dViewportHalfHeightBits(pipe.i)
+  ProcedureReturn avkqF32FromInt(AnvilVkV3dViewportHalfHeightFine(pipe))
+EndProcedure
+
+Procedure.i AnvilVkV3dShaderRecordOffset()
+  ProcedureReturn #AVKQ_OFF_SHREC
+EndProcedure
+
+; How long each emitted program is, in bytes. A gate computes the same
+; three numbers from the plan and the emission rule in this file's
+; header, and a program that grew or shrank is a program somebody
+; changed without saying so.
+Procedure.i AnvilVkV3dProgramBytes(pipe.i, which.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES
+    ProcedureReturn 0
+  EndIf
+  If which = 0 : ProcedureReturn avkqCsBytes[pipe] : EndIf
+  If which = 1 : ProcedureReturn avkqVsBytes[pipe] : EndIf
+  If which = 2 : ProcedureReturn avkqFsBytes[pipe] : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentUniformWords(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn avkqFsUniformWords[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushFirstWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushFirst[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushRWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushR[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushGWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushG[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushBWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushB[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentPushAWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsPushA[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentUniformAddressWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsUniformAddress[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentUniformConfigWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsUniformConfig[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentTextureStateWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsTextureState[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentSamplerStateWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsSamplerState[pipe]
+EndProcedure
+
+Procedure.i AnvilVkV3dFragmentTlbConfigWord(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkqFsTlbConfig[pipe]
+EndProcedure
+
+; Validate the entire lowerer-returned stream ABI before changing one draw
+; word. Required features own exact, distinct in-range indices; absent
+; features own none. Stale or corrupted metadata is therefore a refusal.
+Procedure.i avkqFragmentMetadataValid(pipe.i)
+  Define words.i
+  Define count.i
+  Define i.i
+  Define k.i
+  Dim index.i[8]
+  words = avkqFsUniformWords[pipe]
+  If words < 1 Or words > ((#AVKQ_OFF_DEFAULTS - #AVKQ_OFF_UNIF_FS) / 4)
+    ProcedureReturn 0
+  EndIf
+  If avkqFsTlbConfig[pipe] < 0 : ProcedureReturn 0 : EndIf
+  index[count] = avkqFsTlbConfig[pipe]
+  count = count + 1
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0
+    If avkqFsPushFirst[pipe] < 0 Or avkqFsPushR[pipe] < 0 Or avkqFsPushG[pipe] < 0 Or avkqFsPushB[pipe] < 0 Or avkqFsPushA[pipe] < 0 : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] >= words : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] > avkqFsPushR[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushG[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushB[pipe] Or avkqFsPushFirst[pipe] > avkqFsPushA[pipe] : ProcedureReturn 0 : EndIf
+    If avkqFsPushFirst[pipe] <> avkqFsPushR[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushG[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushB[pipe] And avkqFsPushFirst[pipe] <> avkqFsPushA[pipe] : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsPushR[pipe]
+    count = count + 1
+    index[count] = avkqFsPushG[pipe]
+    count = count + 1
+    index[count] = avkqFsPushB[pipe]
+    count = count + 1
+    index[count] = avkqFsPushA[pipe]
+    count = count + 1
+  ElseIf avkqFsPushFirst[pipe] <> -1 Or avkqFsPushR[pipe] <> -1 Or avkqFsPushG[pipe] <> -1 Or avkqFsPushB[pipe] <> -1 Or avkqFsPushA[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0
+    If avkqFsUniformAddress[pipe] < 0 Or avkqFsUniformConfig[pipe] < 0 : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsUniformAddress[pipe]
+    count = count + 1
+    index[count] = avkqFsUniformConfig[pipe]
+    count = count + 1
+  ElseIf avkqFsUniformAddress[pipe] <> -1 Or avkqFsUniformConfig[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0
+    If avkqFsTextureState[pipe] < 0 Or avkqFsSamplerState[pipe] < 0 : ProcedureReturn 0 : EndIf
+    index[count] = avkqFsTextureState[pipe]
+    count = count + 1
+    index[count] = avkqFsSamplerState[pipe]
+    count = count + 1
+  ElseIf avkqFsTextureState[pipe] <> -1 Or avkqFsSamplerState[pipe] <> -1
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < count
+    If index[i] < 0 Or index[i] >= words : ProcedureReturn 0 : EndIf
+    k = i + 1
+    While k < count
+      If index[i] = index[k] : ProcedureReturn 0 : EndIf
+      k = k + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure avkqDrawCacheAppend(pipe.i, offset.i, bytes.i)
+  Define count.i
+  Define index.i
+  If bytes <= 0
+    ProcedureReturn
+  EndIf
+  count = avkqDrawCacheCount[pipe]
+  If count > 0
+    index = (pipe * 4) + count - 1
+    If avkqDrawCacheOffset[index] + avkqDrawCacheBytes[index] = offset
+      avkqDrawCacheBytes[index] = avkqDrawCacheBytes[index] + bytes
+      ProcedureReturn
+    EndIf
+  EndIf
+  If count >= 4
+    ProcedureReturn
+  EndIf
+  index = (pipe * 4) + count
+  avkqDrawCacheOffset[index] = offset
+  avkqDrawCacheBytes[index] = bytes
+  avkqDrawCacheCount[pipe] = count + 1
+EndProcedure
+
+; Freeze every invariant the draw-slot path needs exactly once, after the
+; typed lowerer and the pipeline-plan checks have both succeeded. Cache spans
+; are cache-line exact and adjacent spans are coalesced; an untouched gap is
+; never hidden inside a larger clean.
+Procedure.i avkqCloseDrawTemplate(pipe.i)
+  Define i.i
+  Define recordBytes.i
+  Define templateBytes.i
+  Define csBytes.i
+  Define vsBytes.i
+  Define rounded.i
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  avkqDrawTemplateReady[pipe] = 0
+  avkqDrawCacheCount[pipe] = 0
+  i = 0
+  While i < 4
+    avkqDrawCacheOffset[(pipe * 4) + i] = 0
+    avkqDrawCacheBytes[(pipe * 4) + i] = 0
+    i = i + 1
+  Wend
+  If avkqRecords[pipe] < 1 Or avkqRecords[pipe] > #AVKQ_MAX_RECORDS : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkqFragmentMetadataValid(pipe) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  recordBytes = 36 + (avkqRecords[pipe] * 16)
+  templateBytes = avkqFsUniformWords[pipe] * 4
+  csBytes = avkqCsUniformWords[pipe] * 4
+  vsBytes = avkqVsUniformWords[pipe] * 4
+  If recordBytes > #AVKQ_DRAW_SHREC_BYTES Or templateBytes < 4 Or templateBytes > #AVKQ_DRAW_UNIF_FS_BYTES Or csBytes < 16 Or csBytes > #AVKQ_DRAW_UNIF_CS_BYTES Or vsBytes < 16 Or vsBytes > #AVKQ_DRAW_UNIF_VS_BYTES
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  avkqDrawRecordBytes[pipe] = recordBytes
+  avkqDrawTemplateBytes[pipe] = templateBytes
+  avkqDrawUsesPush[pipe] = Bool(AnvilVkPipelineUsesPushConstants(pipe) <> 0)
+  avkqDrawUsesUniform[pipe] = Bool(AnvilVkPipelineUsesUniformBuffer(pipe) <> 0)
+  avkqDrawUsesSample[pipe] = Bool(AnvilVkPipelineUsesSampledImage(pipe) <> 0)
+  ; The portable pipeline owner publishes this bit before close. Keeping the
+  ; closed flag here avoids a later draw re-querying mutable pipeline state.
+  avkqDrawUsesDynamicViewport[pipe] = Bool(avkqDrawUsesDynamicViewport[pipe] <> 0)
+
+  rounded = (recordBytes + (#AVKQ_DRAW_SLOT_ALIGN - 1)) & (0 - #AVKQ_DRAW_SLOT_ALIGN)
+  avkqDrawCacheAppend(pipe, #AVKQ_DRAW_OFF_SHREC, rounded)
+  rounded = (templateBytes + (#AVKQ_DRAW_SLOT_ALIGN - 1)) & (0 - #AVKQ_DRAW_SLOT_ALIGN)
+  avkqDrawCacheAppend(pipe, #AVKQ_DRAW_OFF_UNIF_FS, rounded)
+  If avkqDrawUsesSample[pipe] <> 0
+    avkqDrawCacheAppend(pipe, #AVKQ_DRAW_OFF_TEX_STATE, #AVKQ_DRAW_TEX_STATE_BYTES + #AVKQ_DRAW_SAMP_STATE_BYTES)
+  EndIf
+  If avkqDrawUsesDynamicViewport[pipe] <> 0
+    rounded = (csBytes + (#AVKQ_DRAW_SLOT_ALIGN - 1)) & (0 - #AVKQ_DRAW_SLOT_ALIGN)
+    avkqDrawCacheAppend(pipe, #AVKQ_DRAW_OFF_UNIF_CS, rounded)
+    rounded = (vsBytes + (#AVKQ_DRAW_SLOT_ALIGN - 1)) & (0 - #AVKQ_DRAW_SLOT_ALIGN)
+    avkqDrawCacheAppend(pipe, #AVKQ_DRAW_OFF_UNIF_VS, rounded)
+  EndIf
+  If avkqDrawCacheCount[pipe] < 1 Or avkqDrawCacheCount[pipe] > 4 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  avkqDrawTemplateReady[pipe] = 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Validate every required dynamic input before any clone or patch changes a
+; byte. Combined shaders must never patch push words and then discover that a
+; later UBO or sampled-image argument was absent.
+Procedure.i avkqFragmentArgumentsValid(pipe.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
+  If avkqFragmentMetadataValid(pipe) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If AnvilVkPipelineUsesPushConstants(pipe) <> 0 And *push = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If AnvilVkPipelineUsesUniformBuffer(pipe) <> 0 And uniformBase <= 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If AnvilVkPipelineUsesSampledImage(pipe) <> 0 And *sampled = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Patch one already-private fragment stream and its private texture/sampler
+; records. The addresses are explicit rather than reconstructed from a common
+; base, which is the property the split pipeline/draw ABI needs.
+Procedure.i avkqPatchClosedFragmentUniforms(pipe.i, fragmentBase.i, textureBase.i, samplerBase.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
+  Define r.i
+  Define g.i
+  Define b.i
+  Define a.i
+  Define k.i
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 Or fragmentBase <= 0 Or (fragmentBase & 7) <> 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If avkqDrawUsesPush[pipe] <> 0
+    r = PeekL(*push) & $FFFFFFFF
+    g = PeekL(*push + 4) & $FFFFFFFF
+    b = PeekL(*push + 8) & $FFFFFFFF
+    a = PeekL(*push + 12) & $FFFFFFFF
+    avkqPoke32(fragmentBase + (avkqFsPushR[pipe] * 4), r)
+    avkqPoke32(fragmentBase + (avkqFsPushG[pipe] * 4), g)
+    avkqPoke32(fragmentBase + (avkqFsPushB[pipe] * 4), b)
+    avkqPoke32(fragmentBase + (avkqFsPushA[pipe] * 4), a)
+  EndIf
+  If avkqDrawUsesUniform[pipe] <> 0
+    avkqPoke32(fragmentBase + (avkqFsUniformAddress[pipe] * 4), uniformBase & $FFFFFFFF)
+  EndIf
+  If avkqDrawUsesSample[pipe] <> 0
+    ; Clear the whole state records before writing the bounded fields. This is
+    ; per-draw state: no byte from a previous sampler can survive a rebinding.
+    k = 0
+    While k < 8
+      avkqPoke32(textureBase + (k * 4), 0)
+      avkqPoke32(samplerBase + (k * 4), 0)
+      k = k + 1
+    Wend
+    avkqPoke32(textureBase + 0, *sampled\base & $FFFFFFFF)
+    ; Image Width is 14 bits split across words 1 and 2: the low six
+    ; bits occupy word1[31:26], while the remaining eight occupy word2[7:0].
+    ; Omitting the high part aliases widths 64..16383 to a narrow texture.
+    avkqPoke32(textureBase + 4, ((*sampled\width & $3F) << 26) & $FFFFFFFF)
+    avkqPoke32(textureBase + 8, (((*sampled\width >> 6) & $FF) | ((*sampled\height << 8) & $003FFF00) | (1 << 22)) & $FFFFFFFF)
+    ; The hardware texture type is RGBA8, but Vulkan B8G8R8A8's logical
+    ; channels are Z,Y,X,W relative to those stored bytes. Mesa 24.3.4's
+    ; v3dx_format_table.c:62 owns that format contract, and
+    ; v3d_translate_pipe_swizzle() maps Z,Y,X,W to hardware selectors
+    ; 4,3,2,5. XYZW here is not an equivalent byte-order choice: silicon
+    ; returns B,G,R,A to the shader and reverses red and blue.
+    k = (4 << 4) | (4 << 12) | (3 << 15) | (2 << 18) | (5 << 21)
+    If *sampled\tiling = #VK_IMAGE_TILING_OPTIMAL
+      ; V3D 4.2 Texture Shader State: Extended is bit 107 (word 3,
+      ; bit 11), Level 0 is strictly UIF is bit 134 (word 4, bit 6).
+      ; UIF_NO_XOR keeps Level 0 XOR enable clear. This is the exact state
+      ; paired with the TFU destination layout, not a heuristic based on size.
+      k = k | (1 << 11)
+      avkqPoke32(textureBase + 16, (1 << 6))
+    EndIf
+    avkqPoke32(textureBase + 12, k)
+    ; V3D filter bits are one for nearest and zero for linear. Mip filtering
+    ; is fixed at level zero by the accepted VkSampler contract.
+    k = $80
+    If *sampled\magFilter = #VK_FILTER_NEAREST : k = k | 1 : EndIf
+    If *sampled\minFilter = #VK_FILTER_NEAREST : k = k | 2 : EndIf
+    avkqPoke32(samplerBase + 0, k)
+    avkqPoke32(samplerBase + 4, (1 << 16) | (1 << 19))
+    avkqPoke32(fragmentBase + (avkqFsTextureState[pipe] * 4), textureBase | $F)
+    avkqPoke32(fragmentBase + (avkqFsSamplerState[pipe] * 4), samplerBase | 1)
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Compatibility/diagnostic entry: validate caller-owned dynamic resources,
+; then execute the same closed fast patcher. Production multi-draw submit
+; already preflights the closed list and calls the fast path below directly.
+Procedure.i avkqPatchFragmentUniforms(pipe.i, fragmentBase.i, textureBase.i, samplerBase.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
+  Define rc.i
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or fragmentBase <= 0 Or (fragmentBase & 7) <> 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  rc = avkqFragmentArgumentsValid(pipe, *push, uniformBase, *sampled)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If avkqDrawUsesSample[pipe] <> 0 And (textureBase <= 0 Or samplerBase <= 0 Or (textureBase & 31) <> 0 Or (samplerBase & 31) <> 0)
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  ProcedureReturn avkqPatchClosedFragmentUniforms(pipe, fragmentBase, textureBase, samplerBase, *push, uniformBase, *sampled)
+EndProcedure
+
+; The current single-draw backend still supplies one legacy pipeline base.
+; Keep that API exact while all new multi-draw code uses the split helper
+; below; no production caller is switched in this foundation tranche.
+Procedure.i AnvilVkV3dFragmentUniforms(pipe.i, base.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
+  If base <= 0 Or (base & 7) <> 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  ProcedureReturn avkqPatchFragmentUniforms(pipe, base + #AVKQ_OFF_UNIF_FS, base + #AVKQ_OFF_TEX_STATE, base + #AVKQ_OFF_SAMP_STATE, *push, uniformBase, *sampled)
+EndProcedure
+
+; Copy only the live immutable FS-uniform words. The rest of the reserved
+; 256-byte region remains untouched, which makes the close-time byte count
+; authoritative and avoids 228 bytes of needless traffic for the common
+; seven-word template.
+Procedure avkqCloneLiveFragmentTemplate(pipe.i, pipelineBase.i, drawBase.i)
+  Define i.i
+  i = 0
+  While i < avkqDrawTemplateBytes[pipe]
+    avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_FS + i, PeekL(pipelineBase + #AVKQ_OFF_UNIF_FS + i) & $FFFFFFFF)
+    i = i + 4
+  Wend
+EndProcedure
+
+; Dynamic viewport scale is consumed by both vertex programs. Clone only the
+; live words and patch the final two half-extent words in each private stream;
+; validation precedes every write so a refused viewport leaves the slot byte
+; for byte unchanged.
+Procedure.i avkqCloneDynamicViewportUniforms(pipe.i, pipelineBase.i, drawBase.i, width.i, height.i)
+  Define i.i
+  Define csBytes.i
+  Define vsBytes.i
+  Define halfW.i
+  Define halfH.i
+  Define halfWBits.i
+  Define halfHBits.i
+  If avkqDrawUsesDynamicViewport[pipe] = 0 : ProcedureReturn #VK_SUCCESS : EndIf
+  csBytes = avkqCsUniformWords[pipe] * 4
+  vsBytes = avkqVsUniformWords[pipe] * 4
+  If width < 1 Or width > 32767 Or height < 1 Or height > 32767 Or csBytes < 16 Or csBytes > #AVKQ_DRAW_UNIF_CS_BYTES Or vsBytes < 16 Or vsBytes > #AVKQ_DRAW_UNIF_VS_BYTES
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  halfW = width * 128 : halfH = height * 128
+  halfWBits = avkqF32FromInt(halfW) : halfHBits = avkqF32FromInt(halfH)
+  i = 0
+  While i < csBytes
+    avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_CS + i, PeekL(pipelineBase + #AVKQ_OFF_UNIF_CS + i) & $FFFFFFFF)
+    i = i + 4
+  Wend
+  i = 0
+  While i < vsBytes
+    avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_VS + i, PeekL(pipelineBase + #AVKQ_OFF_UNIF_VS + i) & $FFFFFFFF)
+    i = i + 4
+  Wend
+  avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_CS + csBytes - 8, halfWBits)
+  avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_CS + csBytes - 4, halfHBits)
+  avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_VS + vsBytes - 8, halfWBits)
+  avkqPoke32(drawBase + #AVKQ_DRAW_OFF_UNIF_VS + vsBytes - 4, halfHBits)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Clone the live immutable FS template into one private draw slot and patch
+; only that clone. The source pipeline is required to be the pipeline retained
+; for `pipe`, and overlap between its 8 KiB allocation and the draw slot is
+; rejected before the first write.
+Procedure.i AnvilVkV3dPrepareDrawSlot(pipe.i, pipelineBase.i, drawBase.i, *push, uniformBase.i, *sampled.AnvilVkBackendSampledImage)
+  Define rc.i
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 Or pipelineBase <= 0 Or (pipelineBase & 4095) <> 0 Or pipelineBase <> avkqBase[pipe]
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If avkqDrawSlotAddressValid(drawBase) = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If drawBase <= (pipelineBase + #AVKQ_BYTES - 1) And (drawBase + #AVKQ_DRAW_SLOT_BYTES - 1) >= pipelineBase
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  rc = avkqFragmentArgumentsValid(pipe, *push, uniformBase, *sampled)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  rc = avkqCloneDynamicViewportUniforms(pipe, pipelineBase, drawBase, AnvilVkPipelineViewportWidth(pipe), AnvilVkPipelineViewportHeight(pipe))
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  avkqCloneLiveFragmentTemplate(pipe, pipelineBase, drawBase)
+  ProcedureReturn avkqPatchClosedFragmentUniforms(pipe, drawBase + #AVKQ_DRAW_OFF_UNIF_FS, drawBase + #AVKQ_DRAW_OFF_TEX_STATE, drawBase + #AVKQ_DRAW_OFF_SAMP_STATE, *push, uniformBase, *sampled)
+EndProcedure
+
+; Fast multi-draw entry. The portable list preflight has already closed all
+; resource pointers and lengths in *d, so repeating semantic validation here
+; would turn one list check into 4096 identical checks. Allocation identity,
+; alignment and non-overlap remain local invariants and are still enforced.
+Procedure.i AnvilVkV3dPrepareClosedDrawSlot(pipe.i, pipelineBase.i, drawBase.i, *d.AnvilVkBackendDraw)
+  Define rc.i
+  If *d = 0 Or pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If pipelineBase <= 0 Or (pipelineBase & 4095) <> 0 Or pipelineBase <> avkqBase[pipe]
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If avkqDrawSlotAddressValid(drawBase) = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If drawBase <= (pipelineBase + #AVKQ_BYTES - 1) And (drawBase + #AVKQ_DRAW_SLOT_BYTES - 1) >= pipelineBase
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  rc = avkqCloneDynamicViewportUniforms(pipe, pipelineBase, drawBase, *d\viewportW, *d\viewportH)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  avkqCloneLiveFragmentTemplate(pipe, pipelineBase, drawBase)
+  ProcedureReturn avkqPatchClosedFragmentUniforms(pipe, drawBase + #AVKQ_DRAW_OFF_UNIF_FS, drawBase + #AVKQ_DRAW_OFF_TEX_STATE, drawBase + #AVKQ_DRAW_OFF_SAMP_STATE, *d\pushBase, *d\uniformBase, *d\sampledImage)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The GL shader state record and its attribute records, for one draw.
+;
+;  ONE ATTRIBUTE RECORD PER COMPONENT. Every record carries an address,
+;  a stride and a maximum index OF ITS OWN, which is why a pipeline with
+;  two vertex buffers needs nothing new from the hardware at all: the
+;  record for a position component is written against binding zero's
+;  buffer and stride, and the record for a colour component against
+;  binding one's. The draw record says which binding each attribute
+;  reads, and this procedure looks the address and the stride up per
+;  attribute rather than taking one of each.
+;
+;  BOTH PHASES READ EVERY RECORD. GFXH-930 requires at least one record
+;  read by both the coordinate and the vertex shader; reading all of
+;  them costs a VPM row each and makes the input slot of a component the
+;  same number in both programs, which is the property the emitter's
+;  register assignment is built on.
+; ----------------------------------------------------------------------
+Procedure.i avkqBuildRecordAt(pipe.i, pipelineBase.i, recordBase.i, coordinateUniformBase.i, vertexUniformBase.i, fragmentUniformBase.i, *d.AnvilVkBackendDraw, maxIndex.i, varyComps.i)
+  Define r.i
+  Define k.i
+  Define a.i
+  Define c.i
+  Define n.i
+  Define bidx.i
+  Define vbase.i
+  Define stride.i
+  Define singleSegFs.i
+  Define *bind.AnvilVkBackendBinding
+
+  If *d = 0 Or *d\bindings = 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+
+  r = V3dShaderRecordBegin(recordBase, avkqRecords[pipe])
+  If r <> #V3D_OK : ProcedureReturn r : EndIf
+
+  ; enable clipping, no fragment Z writes, do not turn off early Z, no
+  ; scoreboard wait on the first thread switch, no implicit point and
+  ; line varyings, and the number of varying COMPONENTS the fragment
+  ; shader reads.
+  V3dShaderRecordFlags(1, 0, 0, 0, 1, varyComps)
+  V3dShaderRecordVpm(avkqOutSeg(6 + varyComps, varyComps), 0, 1, 1, avkqOutSeg(4 + varyComps, varyComps), 0, 1, 1)
+  V3dShaderRecordDefaults(pipelineBase + #AVKQ_OFF_DEFAULTS)
+  ; The fragment program switches threads before its tile-buffer writes,
+  ; so it is NOT single segment; the other two are. The record's bit and
+  ; V3dQpuProgramBeginSeg's argument must agree and neither can see the
+  ; other, which is why both are written from the same two constants.
+  singleSegFs = 0
+  V3dShaderRecordFragment(pipelineBase + #AVKQ_OFF_FS_CODE, fragmentUniformBase, 1, singleSegFs, 1)
+  V3dShaderRecordVertex(pipelineBase + #AVKQ_OFF_VS_CODE, vertexUniformBase, 1, 1, 1)
+  V3dShaderRecordCoord(pipelineBase + #AVKQ_OFF_CS_CODE, coordinateUniformBase, 1, 1, 1)
+
+  n = 0
+  a = 0
+  While a < AnvilVkPipelineAttrCount(pipe)
+    bidx = AnvilVkPipelineAttrBinding(pipe, a)
+    If bidx < 0 Or bidx >= *d\bindingCount : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+    *bind = *d\bindings + (bidx * SizeOf(AnvilVkBackendBinding))
+    vbase = *bind\base
+    stride = *bind\stride
+    If vbase = 0 Or stride <= 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+    c = 0
+    While c < AnvilVkPipelineAttrComponents(pipe, a)
+      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)
+      n = n + 1
+      c = c + 1
+    Wend
+    a = a + 1
+  Wend
+
+  If V3dShaderRecordOk() = 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; Legacy single-draw wrapper. It intentionally keeps today's addresses until
+; the backend submit path changes as one separate, reviewable transaction.
+Procedure.i AnvilVkV3dBuildRecord(pipe.i, base.i, *d.AnvilVkBackendDraw, maxIndex.i, varyComps.i)
+  If base <= 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+  ProcedureReturn avkqBuildRecordAt(pipe, base, base + #AVKQ_OFF_SHREC, base + #AVKQ_OFF_UNIF_CS, base + #AVKQ_OFF_UNIF_VS, base + #AVKQ_OFF_UNIF_FS, *d, maxIndex, varyComps)
+EndProcedure
+
+; Split immutable-pipeline/private-draw record builder. A prepared slot is
+; required: the record points at the pipeline's immutable programs/defaults
+; and at this draw's cloned fragment stream. The maximum 16-component layout
+; occupies 292 bytes and therefore cannot reach the uniform clone at +320.
+Procedure.i AnvilVkV3dBuildDrawSlotRecord(pipe.i, pipelineBase.i, drawBase.i, *d.AnvilVkBackendDraw, maxIndex.i, varyComps.i)
+  Define coordinateUniformBase.i
+  Define vertexUniformBase.i
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES Or avkqDrawTemplateReady[pipe] = 0 Or pipelineBase <= 0 Or (pipelineBase & 4095) <> 0 Or pipelineBase <> avkqBase[pipe]
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If avkqDrawSlotAddressValid(drawBase) = 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+  If drawBase <= (pipelineBase + #AVKQ_BYTES - 1) And (drawBase + #AVKQ_DRAW_SLOT_BYTES - 1) >= pipelineBase
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  If avkqDrawRecordBytes[pipe] < 52 Or avkqDrawRecordBytes[pipe] > #AVKQ_DRAW_SHREC_BYTES
+    ProcedureReturn #V3D_ERR_CL_ARGS
+  EndIf
+  coordinateUniformBase = pipelineBase + #AVKQ_OFF_UNIF_CS
+  vertexUniformBase = pipelineBase + #AVKQ_OFF_UNIF_VS
+  If avkqDrawUsesDynamicViewport[pipe] <> 0
+    coordinateUniformBase = drawBase + #AVKQ_DRAW_OFF_UNIF_CS
+    vertexUniformBase = drawBase + #AVKQ_DRAW_OFF_UNIF_VS
+  EndIf
+  ProcedureReturn avkqBuildRecordAt(pipe, pipelineBase, drawBase + #AVKQ_DRAW_OFF_SHREC, coordinateUniformBase, vertexUniformBase, drawBase + #AVKQ_DRAW_OFF_UNIF_FS, *d, maxIndex, varyComps)
+EndProcedure

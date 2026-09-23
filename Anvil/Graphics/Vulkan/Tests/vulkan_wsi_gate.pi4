@@ -1,0 +1,304 @@
+; ======================================================================
+;  Emitted gate: unintegrated target-neutral Vulkan KHR WSI state
+; ======================================================================
+; No display, GPU, DMA, CPU pixel copy, or public extension entry point is
+; reached.  Provider completions are explicit test inputs.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_wsi.pbi"
+
+#VKW_OUT = $06200000
+#VKW_ROWS = $06200100
+#VKW_MAGIC = $564B5753
+
+Global vkwChecks.i = 0
+Global vkwFails.i = 0
+
+Procedure Vkw(ok.i)
+  PokeN(#VKW_ROWS + vkwChecks * 8, ok)
+  vkwChecks = vkwChecks + 1
+  If ok = 0 : vkwFails = vkwFails + 1 : EndIf
+EndProcedure
+
+Procedure VkwInfo(*ci.AnvilVkWsiSwapchainInfo, surface.i, old.i, width.i, height.i, count.i, *images)
+  *ci\surface = surface
+  *ci\minImageCount = 2
+  *ci\imageFormat = #VK_FORMAT_B8G8R8A8_UNORM
+  *ci\imageColorSpace = #VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+  *ci\imageWidth = width
+  *ci\imageHeight = height
+  *ci\imageArrayLayers = 1
+  *ci\imageUsage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+  *ci\imageSharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  *ci\preTransform = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  *ci\compositeAlpha = #VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+  *ci\presentMode = #VK_PRESENT_MODE_FIFO_KHR
+  *ci\clipped = 1
+  *ci\oldSwapchain = old
+  *ci\providerImageCount = count
+  *ci\providerImages = *images
+EndProcedure
+
+Procedure.i Main()
+  Define instance1.i
+  Define instance2.i
+  Define physical1.i
+  Define physical2.i
+  Define device1.i
+  Define device2.i
+  Define reusedDevice.i
+  Define count.l
+  Define provider.i
+  Define provider2.i
+  Define staleProvider.i
+  Define surface.i
+  Define surface2.i
+  Define staleSurface.i
+  Define swap1.i
+  Define swap2.i
+  Define swap3.i
+  Define staleSwap.i
+  Define leakedSwap.i
+  Define ticket.i
+  Define staleTicket.i
+  Define swapSlot.i
+  Define savedGen.i
+  Define index.l
+  Define index2.l
+  Define mode.i
+  Define bad.i
+  Define result.i
+  Define caps.AnvilVkWsiCapabilities
+  Define fmt.AnvilVkWsiFormat
+  Define info.AnvilVkWsiProviderInfo
+  Define ci.AnvilVkWsiSwapchainInfo
+  Define Dim formats.AnvilVkWsiFormat[2]
+  Define Dim modes.i[2]
+  Define Dim images1.i[3]
+  Define Dim images2.i[3]
+  Define Dim images3.i[3]
+  Define Dim badImages.i[2]
+  Define Dim items.AnvilVkWsiPresentItem[2]
+
+  AnvilVkTestBackendHeap($07000000, $00100000)
+  Vkw(AnvilVkInstanceCreate(@instance1) = #VK_SUCCESS)
+  count = 1 : Vkw(AnvilVkPhysicalEnumerate(instance1, @count, @physical1) = #VK_SUCCESS)
+  Vkw(AnvilVkDeviceCreate(physical1, @device1) = #VK_SUCCESS)
+  Vkw(AnvilVkInstanceCreate(@instance2) = #VK_SUCCESS)
+  count = 1 : Vkw(AnvilVkPhysicalEnumerate(instance2, @count, @physical2) = #VK_SUCCESS)
+  Vkw(AnvilVkDeviceCreate(physical2, @device2) = #VK_SUCCESS)
+
+  formats[0]\format = #VK_FORMAT_B8G8R8A8_UNORM
+  formats[0]\colorSpace = #VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+  formats[1]\format = #VK_FORMAT_B8G8R8A8_UNORM
+  formats[1]\colorSpace = 7
+  modes[0] = #VK_PRESENT_MODE_FIFO_KHR
+  modes[1] = #VK_PRESENT_MODE_MAILBOX_KHR
+  info\cookie = $48444D49
+  info\capabilities\minImageCount = 2
+  info\capabilities\maxImageCount = 3
+  info\capabilities\currentWidth = 640
+  info\capabilities\currentHeight = 480
+  info\capabilities\minWidth = 320
+  info\capabilities\minHeight = 240
+  info\capabilities\maxWidth = 1920
+  info\capabilities\maxHeight = 1080
+  info\capabilities\maxImageArrayLayers = 1
+  info\capabilities\supportedTransforms = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  info\capabilities\currentTransform = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+  info\capabilities\supportedCompositeAlpha = #VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+  info\capabilities\supportedUsageFlags = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  info\formatCount = 2
+  info\formats = @formats[0]
+  info\presentModeCount = 2
+  info\presentModes = @modes[0]
+
+  bad = $11223344
+  info\formatCount = 0
+  result = avkWsiProviderRegister(@info, @bad)
+  Vkw(result = #ANVIL_VK_ERR_ARGS)
+  Vkw(bad = #VK_NULL_HANDLE)
+  If result = #VK_SUCCESS : avkWsiProviderDestroy(bad) : EndIf
+  info\formatCount = 2
+  modes[0] = #VK_PRESENT_MODE_MAILBOX_KHR : modes[1] = #VK_PRESENT_MODE_IMMEDIATE_KHR
+  result = avkWsiProviderRegister(@info, @bad)
+  Vkw(result = #ANVIL_VK_ERR_ARGS)
+  Vkw(bad = #VK_NULL_HANDLE)
+  If result = #VK_SUCCESS : avkWsiProviderDestroy(bad) : EndIf
+  modes[0] = #VK_PRESENT_MODE_FIFO_KHR : modes[1] = #VK_PRESENT_MODE_MAILBOX_KHR
+  Vkw(avkWsiProviderRegister(@info, @provider) = #VK_SUCCESS)
+  Vkw(avkWsiSurfaceCreate(instance1, provider, $1111, @surface) = #VK_SUCCESS)
+  Vkw(avkWsiSurfaceCreate(instance2, provider, $1111, @bad) = #VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
+  Vkw(avkWsiSurfaceCreate(instance2, provider, $2222, @surface2) = #VK_SUCCESS)
+  Vkw(avkWsiSurfaceProvider(instance1, surface) <> 0)
+  Vkw(avkWsiSurfaceProvider(instance2, surface) = 0)
+  Vkw(avkWsiSurfaceCapabilities(instance1, surface, @caps) = #VK_SUCCESS)
+  Vkw(caps\currentWidth = 640 And caps\currentHeight = 480 And caps\minImageCount = 2)
+  Vkw(avkWsiSurfaceFormatCount(instance1, surface) = 2)
+  Vkw(avkWsiSurfaceFormatAt(instance1, surface, 1, @fmt) = #VK_SUCCESS)
+  Vkw(fmt\format = #VK_FORMAT_B8G8R8A8_UNORM And fmt\colorSpace = 7)
+  Vkw(avkWsiSurfacePresentModeCount(instance1, surface) = 2)
+  Vkw(avkWsiSurfacePresentModeAt(instance1, surface, 1, @mode) = #VK_SUCCESS)
+  Vkw(mode = #VK_PRESENT_MODE_MAILBOX_KHR)
+
+  images1[0] = $100000 : images1[1] = $110000 : images1[2] = $120000
+  VkwInfo(@ci, surface, #VK_NULL_HANDLE, 640, 480, 3, @images1[0])
+  ci\preTransform = #VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | 2
+  result = avkWsiSwapchainCreate(device1, @ci, @bad)
+  Vkw(result = #ANVIL_VK_ERR_ARGS)
+  If result = #VK_SUCCESS : avkWsiSwapchainDestroy(device1, bad) : EndIf
+  VkwInfo(@ci, surface, #VK_NULL_HANDLE, 640, 480, 3, @images1[0])
+  result = avkWsiSwapchainCreate(device2, @ci, @bad)
+  Vkw(result = #ANVIL_VK_ERR_OWNER)
+  If result = #VK_SUCCESS : avkWsiSwapchainDestroy(device2, bad) : EndIf
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @swap1) = #VK_SUCCESS)
+  Vkw(avkWsiImageKey(device1, swap1, 0) = images1[0])
+  Vkw(avkWsiImageKey(device2, swap1, 0) = 0)
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @bad) = #VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)
+
+  ; A bad replacement must not retire the old chain.
+  badImages[0] = $200000 : badImages[1] = $200000
+  VkwInfo(@ci, surface, swap1, 640, 480, 2, @badImages[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @bad) = #ANVIL_VK_ERR_ARGS)
+  index = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS)
+  Vkw(index = 0)
+  Vkw(avkWsiReleaseImage(device1, swap1, index) = #VK_SUCCESS)
+
+  ; Immediate acquisition rotates and never invents a blocking wait.
+  index = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS And index = 1)
+  index2 = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @index2) = #VK_SUCCESS And index2 = 2)
+  bad = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @bad) = #VK_SUCCESS And bad = 0)
+  index = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_NOT_READY)
+  Vkw(index = $FFFFFFFF)
+  Vkw(avkWsiAcquire(device1, swap1, 1000, @index) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vkw(avkWsiReleaseImage(device1, swap1, 1) = #VK_SUCCESS)
+  Vkw(avkWsiReleaseImage(device1, swap1, 2) = #VK_SUCCESS)
+  Vkw(avkWsiReleaseImage(device1, swap1, 0) = #VK_SUCCESS)
+
+  ; Present is a reserve/commit/provider-complete transaction. Failure puts
+  ; the image back in render-ready ownership and never claims presentation.
+  Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS)
+  Vkw(avkWsiMarkRenderReady(device1, swap1, index) = #VK_SUCCESS)
+  items[0]\swapchain = swap1 : items[0]\imageIndex = index
+  Vkw(avkWsiPresentReserve(device1, 1, @items[0], @ticket) = #VK_SUCCESS)
+  staleTicket = ticket
+  Vkw(avkWsiReleaseImage(device1, swap1, index) = #ANVIL_VK_ERR_STATE)
+  Vkw(avkWsiPresentReserve(device1, 1, @items[0], @bad) = #ANVIL_VK_ERR_STATE)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  ; A reserved transaction retains the exact swapchain generation, not only
+  ; its array slot.  Simulate slot reuse without letting it publish state.
+  swapSlot = avkWsiSwapchainSlot(swap1) : savedGen = avkWsiSwapGen[swapSlot]
+  avkWsiSwapGen[swapSlot] = avkNextGen(savedGen)
+  Vkw(avkWsiPresentCommit(ticket) = #ANVIL_VK_ERR_STATE)
+  Vkw(avkWsiSwapImageState[avkWsiImageIndex(swapSlot, index)] = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  avkWsiSwapGen[swapSlot] = savedGen
+  Vkw(avkWsiPresentCommit(ticket) = #VK_SUCCESS)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_PRESENT_PENDING)
+  Vkw(avkWsiSwapchainDestroy(device1, swap1) = #ANVIL_VK_ERR_STATE)
+  Vkw(avkWsiPresentComplete(ticket, 0) = #VK_SUCCESS)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  Vkw(avkWsiPresentCommit(staleTicket) = #ANVIL_VK_ERR_HANDLE)
+  Vkw(avkWsiPresentReserve(device1, 1, @items[0], @ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentCommit(ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentComplete(ticket, 1) = #VK_SUCCESS)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_AVAILABLE)
+
+  ; A bad second member refuses the whole batch without touching the first.
+  Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS)
+  Vkw(avkWsiAcquire(device1, swap1, 0, @index2) = #VK_SUCCESS)
+  Vkw(avkWsiMarkRenderReady(device1, swap1, index) = #VK_SUCCESS)
+  Vkw(avkWsiMarkRenderReady(device1, swap1, index2) = #VK_SUCCESS)
+  items[0]\swapchain = swap1 : items[0]\imageIndex = index
+  items[1]\swapchain = swap1 : items[1]\imageIndex = 99
+  Vkw(avkWsiPresentReserve(device1, 2, @items[0], @ticket) = #ANVIL_VK_ERR_ARGS)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  Vkw(avkWsiImageState(device1, swap1, index2) = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  items[1]\imageIndex = index2
+  Vkw(avkWsiPresentReserve(device1, 2, @items[0], @ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentCommit(ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentComplete(ticket, 1) = #VK_SUCCESS)
+
+  ; An image acquired before replacement may still be presented afterwards;
+  ; only new acquisition from the retired chain is refused.
+  Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS)
+  Vkw(avkWsiMarkRenderReady(device1, swap1, index) = #VK_SUCCESS)
+  images2[0] = $200000 : images2[1] = $210000 : images2[2] = $220000
+  VkwInfo(@ci, surface, swap1, 641, 480, 3, @images2[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @bad) = #VK_ERROR_OUT_OF_DATE_KHR)
+  items[0]\swapchain = swap1 : items[0]\imageIndex = index
+  Vkw(avkWsiPresentReserve(device1, 1, @items[0], @ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentRollback(ticket) = #VK_SUCCESS)
+  VkwInfo(@ci, surface, swap1, 640, 480, 3, @images2[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @swap2) = #VK_SUCCESS)
+  bad = 99 : Vkw(avkWsiAcquire(device1, swap1, 0, @bad) = #VK_ERROR_OUT_OF_DATE_KHR)
+  Vkw(avkWsiPresentReserve(device1, 1, @items[0], @ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentCommit(ticket) = #VK_SUCCESS)
+  Vkw(avkWsiPresentComplete(ticket, 1) = #VK_SUCCESS)
+
+  ; Resize invalidates the chain and a correctly sized replacement recovers.
+  Vkw(avkWsiProviderResize(provider, 800, 600) = #VK_SUCCESS)
+  Vkw(avkWsiAcquire(device1, swap2, 0, @index) = #VK_ERROR_OUT_OF_DATE_KHR)
+  Vkw(avkWsiSurfaceCapabilities(instance1, surface, @caps) = #VK_SUCCESS)
+  Vkw(caps\currentWidth = 800 And caps\currentHeight = 600)
+  images3[0] = $300000 : images3[1] = $310000 : images3[2] = $320000
+  VkwInfo(@ci, surface, swap2, 800, 600, 3, @images3[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @swap3) = #VK_SUCCESS)
+  Vkw(avkWsiAcquire(device1, swap3, 0, @index) = #VK_SUCCESS)
+  Vkw(avkWsiMarkRenderReady(device1, swap3, index) = #VK_SUCCESS)
+  Vkw(avkWsiProviderLose(provider) = #VK_SUCCESS)
+  Vkw(avkWsiAcquire(device1, swap3, 0, @index2) = #VK_ERROR_SURFACE_LOST_KHR)
+  items[0]\swapchain = swap3 : items[0]\imageIndex = index
+  result = avkWsiPresentReserve(device1, 1, @items[0], @ticket)
+  Vkw(result = #VK_ERROR_SURFACE_LOST_KHR)
+  If result = #VK_SUCCESS : avkWsiPresentRollback(ticket) : EndIf
+  Vkw(avkWsiImageState(device1, swap3, index) = #ANVIL_VK_WSI_IMAGE_RENDER_READY)
+  Vkw(avkWsiReleaseImage(device1, swap3, index) = #VK_SUCCESS)
+
+  Vkw(avkWsiSwapchainDestroy(device1, swap1) = #VK_SUCCESS)
+  Vkw(avkWsiSwapchainDestroy(device1, swap2) = #VK_SUCCESS)
+  Vkw(avkWsiSwapchainDestroy(device1, swap3) = #VK_SUCCESS)
+  staleSurface = surface
+  Vkw(avkWsiSurfaceDestroy(instance1, surface) = #VK_SUCCESS)
+  Vkw(avkWsiSurfaceDestroy(instance2, surface2) = #VK_SUCCESS)
+  staleProvider = provider
+  Vkw(avkWsiProviderDestroy(provider) = #VK_SUCCESS)
+  Vkw(avkWsiProviderRegister(@info, @provider2) = #VK_SUCCESS)
+  Vkw(provider2 <> staleProvider)
+  Vkw(avkWsiSurfaceCreate(instance1, staleProvider, $3333, @bad) = #ANVIL_VK_ERR_HANDLE)
+  Vkw(avkWsiSurfaceCreate(instance1, provider2, $3333, @surface) = #VK_SUCCESS)
+  Vkw(surface <> staleSurface)
+
+  ; Swapchain handle generation and device generation both survive slot reuse.
+  info\capabilities\currentWidth = 640 : info\capabilities\currentHeight = 480
+  VkwInfo(@ci, surface, #VK_NULL_HANDLE, 640, 480, 3, @images1[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @swap1) = #VK_SUCCESS)
+  staleSwap = swap1
+  Vkw(avkWsiSwapchainDestroy(device1, swap1) = #VK_SUCCESS)
+  VkwInfo(@ci, surface, #VK_NULL_HANDLE, 640, 480, 3, @images2[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @swap1) = #VK_SUCCESS)
+  Vkw(swap1 <> staleSwap)
+  Vkw(avkWsiImageKey(device1, staleSwap, 0) = 0)
+  Vkw(avkWsiAcquire(device1, swap1, 0, @index) = #VK_SUCCESS)
+  Vkw(avkWsiResetDevice(device1) = #ANVIL_VK_ERR_STATE)
+  Vkw(avkWsiImageState(device1, swap1, index) = #ANVIL_VK_WSI_IMAGE_ACQUIRED)
+  Vkw(avkWsiReleaseImage(device1, swap1, index) = #VK_SUCCESS)
+  Vkw(avkWsiResetDevice(device1) = #VK_SUCCESS)
+  Vkw(avkWsiImageKey(device1, swap1, 0) = 0)
+
+  VkwInfo(@ci, surface, #VK_NULL_HANDLE, 640, 480, 3, @images3[0])
+  Vkw(avkWsiSwapchainCreate(device1, @ci, @leakedSwap) = #VK_SUCCESS)
+  Vkw(AnvilVkDeviceDestroy(device1) = #VK_SUCCESS)
+  Vkw(AnvilVkDeviceCreate(physical1, @reusedDevice) = #VK_SUCCESS)
+  Vkw(avkTokenSlot(reusedDevice) = avkTokenSlot(device1))
+  Vkw(avkTokenGen(reusedDevice) <> avkTokenGen(device1))
+  Vkw(avkWsiAcquire(reusedDevice, leakedSwap, 0, @index) = #ANVIL_VK_ERR_OWNER)
+  Vkw(avkWsiResetDevice(reusedDevice) = #VK_SUCCESS)
+
+  PokeN(#VKW_OUT + 0, #VKW_MAGIC)
+  PokeN(#VKW_OUT + 8, vkwChecks)
+  PokeN(#VKW_OUT + 16, vkwFails)
+  ProcedureReturn vkwFails
+EndProcedure
+
+Main()

@@ -1,0 +1,212 @@
+; Pi 3 board and CYW43 radio profile selection.
+;
+; These procedures are pure. Board selection authorizes transport setup;
+; radio selection happens only after SDIO safely reads the silicon ID. A
+; zero result means stop before core reset, firmware/NVRAM/CLM loading, or
+; radio-specific register writes.
+
+#PI3_WIFI_BOARD_B     = 1
+#PI3_WIFI_BOARD_BPLUS = 2
+#PI3_WIFI_BOARD_APLUS = 3
+
+#PI3_WIFI_RADIO_43430_A0 = 1
+#PI3_WIFI_RADIO_43430_A1 = 2
+#PI3_WIFI_RADIO_43430_B0 = 3
+#PI3_WIFI_RADIO_43455    = 4
+#PI3_WIFI_RADIO_43456    = 5
+
+#PI3_WIFI_CORE_CM3 = 1
+#PI3_WIFI_CORE_CR4 = 2
+
+#PI3_WIFI_CHIP_43430 = $A9A6
+#PI3_WIFI_CHIP_4345  = $4345
+
+#PI3_WIFI_REVMASK_43430_A0 = $00000001
+#PI3_WIFI_REVMASK_43430_A1 = $00000002
+#PI3_WIFI_REVMASK_43430_B0 = $FFFFFFFC
+#PI3_WIFI_REVMASK_43455    = $FFFFFDC0
+#PI3_WIFI_REVMASK_43456    = $00000200
+
+Global pi3_wifi_board_profile.i
+Global pi3_wifi_board_type.i
+Global pi3_wifi_board_reset_line.i
+Global pi3_wifi_board_reset_active_low.i
+Global pi3_wifi_board_reset_wired.i
+Global pi3_wifi_board_reset_output_configured.i
+Global pi3_wifi_radio_profile.i
+Global pi3_wifi_radio_core_family.i
+
+; New-style firmware revision bits 4..11 identify the board type.
+; Pi 3B, 3B+, and 3A+ DTS all enable SDHCI on GPIO34..39 at four bits.
+; B and B+ explicitly wire wifi_pwrseq to firmware expander line 1,
+; active-low. The 3A+ DTS does not specify reset-gpios, so this profile
+; never pulses that line as a reset.
+Procedure.i Pi3WifiBoardProfile(boardRevision.i)
+  Define boardType.i
+
+  pi3_wifi_board_profile = 0
+  pi3_wifi_board_type = 0
+  pi3_wifi_board_reset_line = -1
+  pi3_wifi_board_reset_active_low = 0
+  pi3_wifi_board_reset_wired = 0
+  pi3_wifi_board_reset_output_configured = 0
+
+  If (boardRevision & $00800000) = 0
+    ProcedureReturn 0
+  EndIf
+  boardType = (boardRevision >> 4) & $FF
+  pi3_wifi_board_type = boardType
+
+  Select boardType
+    Case 8
+      pi3_wifi_board_profile = #PI3_WIFI_BOARD_B
+      pi3_wifi_board_reset_line = 1
+      pi3_wifi_board_reset_active_low = 1
+      pi3_wifi_board_reset_wired = 1
+    Case 13
+      pi3_wifi_board_profile = #PI3_WIFI_BOARD_BPLUS
+      pi3_wifi_board_reset_line = 1
+      pi3_wifi_board_reset_active_low = 1
+      pi3_wifi_board_reset_wired = 1
+    Case 14
+      pi3_wifi_board_profile = #PI3_WIFI_BOARD_APLUS
+    Default
+      ProcedureReturn 0
+  EndSelect
+
+  ProcedureReturn pi3_wifi_board_profile
+EndProcedure
+
+Procedure.i Pi3WifiBoardSdioBase()
+  If pi3_wifi_board_profile = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn $3F300000
+EndProcedure
+
+Procedure.i Pi3WifiBoardBusWidth()
+  If pi3_wifi_board_profile = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 4
+EndProcedure
+
+Procedure.i Pi3WifiBoardClockId()
+  If pi3_wifi_board_profile = 0
+    ProcedureReturn 0
+  EndIf
+  ; BCM2835_CLOCK_EMMC from the shared Pi 3 Wi-Fi SDHCI DTS binding.
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Pi3WifiBoardResetLine()
+  ProcedureReturn pi3_wifi_board_reset_line
+EndProcedure
+
+Procedure.i Pi3WifiBoardResetActiveLow()
+  ProcedureReturn pi3_wifi_board_reset_active_low
+EndProcedure
+
+Procedure.i Pi3WifiBoardResetWired()
+  ProcedureReturn pi3_wifi_board_reset_wired
+EndProcedure
+
+; asserted=1 means logical reset asserted; asserted=0 releases the radio.
+; The mailbox API writes the physical firmware GPIO level, so active-low
+; boards invert this state here. Timing/power sequencing belongs to caller.
+Procedure.i Pi3WifiBoardSetReset(asserted.i)
+  Define physical.i
+  If pi3_wifi_board_profile = 0 Or pi3_wifi_board_reset_wired = 0
+    ProcedureReturn 0
+  EndIf
+  If asserted < 0 Or asserted > 1
+    ProcedureReturn 0
+  EndIf
+  physical = asserted
+  If pi3_wifi_board_reset_active_low <> 0
+    physical = 1 - asserted
+  EndIf
+  If pi3_wifi_board_reset_output_configured = 0
+    If Pi3FirmwareGpioConfigureOutput(128 + pi3_wifi_board_reset_line, physical) = 0
+      ProcedureReturn 0
+    EndIf
+    pi3_wifi_board_reset_output_configured = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn Pi3FirmwareGpioSetState(128 + pi3_wifi_board_reset_line, physical)
+EndProcedure
+
+; brcmfmac's firmware table uses an ID plus a BITMASK over revision numbers.
+; The exact masks below are from raspberrypi/linux rpi-6.12.y sdio.c's
+; brcmf_firmware_mapping table, not numeric range guesses.
+Procedure.i Pi3WifiResolveProfile(boardRevision.i, chipId.i, chipRev.i)
+  Define board.i
+
+  pi3_wifi_radio_profile = 0
+  pi3_wifi_radio_core_family = 0
+  board = Pi3WifiBoardProfile(boardRevision)
+  If board = 0 Or chipRev < 0 Or chipRev > 31
+    ProcedureReturn 0
+  EndIf
+
+  If board = #PI3_WIFI_BOARD_B
+    If chipId <> #PI3_WIFI_CHIP_43430
+      ProcedureReturn 0
+    EndIf
+    If ((#PI3_WIFI_REVMASK_43430_A0 >> chipRev) & 1) <> 0
+      pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_A0
+      pi3_wifi_radio_core_family = #PI3_WIFI_CORE_CM3
+    ElseIf ((#PI3_WIFI_REVMASK_43430_A1 >> chipRev) & 1) <> 0
+      pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_A1
+      pi3_wifi_radio_core_family = #PI3_WIFI_CORE_CM3
+    ElseIf ((#PI3_WIFI_REVMASK_43430_B0 >> chipRev) & 1) <> 0
+      pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_B0
+      pi3_wifi_radio_core_family = #PI3_WIFI_CORE_CM3
+    EndIf
+  ElseIf board = #PI3_WIFI_BOARD_BPLUS Or board = #PI3_WIFI_BOARD_APLUS
+    If chipId <> #PI3_WIFI_CHIP_4345
+      ProcedureReturn 0
+    EndIf
+    If ((#PI3_WIFI_REVMASK_43456 >> chipRev) & 1) <> 0
+      pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43456
+      pi3_wifi_radio_core_family = #PI3_WIFI_CORE_CR4
+    ElseIf ((#PI3_WIFI_REVMASK_43455 >> chipRev) & 1) <> 0
+      pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43455
+      pi3_wifi_radio_core_family = #PI3_WIFI_CORE_CR4
+    EndIf
+  EndIf
+
+  ProcedureReturn pi3_wifi_radio_profile
+EndProcedure
+
+Procedure.i Pi3WifiRadioCoreFamily()
+  ProcedureReturn pi3_wifi_radio_core_family
+EndProcedure
+
+Procedure.i Pi3WifiRadioFirmwareStem()
+  Select pi3_wifi_radio_profile
+    Case #PI3_WIFI_RADIO_43430_A0
+      ProcedureReturn "brcmfmac43430a0-sdio"
+    Case #PI3_WIFI_RADIO_43430_A1
+      ProcedureReturn "brcmfmac43430-sdio"
+    Case #PI3_WIFI_RADIO_43430_B0
+      ProcedureReturn "brcmfmac43430b0-sdio"
+    Case #PI3_WIFI_RADIO_43455
+      ProcedureReturn "brcmfmac43455-sdio"
+    Case #PI3_WIFI_RADIO_43456
+      ProcedureReturn "brcmfmac43456-sdio"
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3WifiRadioNvramBoardSuffix()
+  Select pi3_wifi_board_profile
+    Case #PI3_WIFI_BOARD_B
+      ProcedureReturn "raspberrypi,3-model-b"
+    Case #PI3_WIFI_BOARD_BPLUS
+      ProcedureReturn "raspberrypi,3-model-b-plus"
+    Case #PI3_WIFI_BOARD_APLUS
+      ProcedureReturn "raspberrypi,3-model-a-plus"
+  EndSelect
+  ProcedureReturn 0
+EndProcedure

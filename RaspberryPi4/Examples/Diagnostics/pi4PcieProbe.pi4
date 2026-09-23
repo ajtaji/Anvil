@@ -1,0 +1,145 @@
+; pi4PcieProbe.pi4 - bring the PCIe link up and ask the VL805 who it is.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; THE MILESTONE THIS EXISTS FOR.
+;
+; The Pi 4 boots from USB, and its USB-A ports are behind a VIA VL805
+; XHCI controller on the far side of PCIe. Nothing in this project has
+; ever spoken to that controller, because the BCM2711 PCIe registers are
+; in no Broadcom document - the peripherals PDF mentions PCIe on 8 of
+; 166 pages and gives not one register. pcie.pi4 was written READ-ONLY
+; for that reason and said so.
+;
+; U-Boot has them. Its sources are on disk now, version-matched to the
+; 2025.01 build actually running on this board, so pcie.pi4 has a
+; bring-up sequence and a config-space accessor. This is the program
+; that finds out whether any of it is right.
+;
+; ONE NUMBER DECIDES IT: the vendor:device word at bus 1, device 0,
+; function 0. $34831106 is VIA Labs $1106 with VL805 $3483. Anything
+; else and the chain is not working, and the three outcomes are worth
+; distinguishing:
+;
+;   link never trained    the reset or the PHY sequence is wrong
+;   link up, ID $FFFFFFFF the link works and nothing answered - the
+;                         config-space index/data pair is wrong, or the
+;                         device is not where we think it is
+;   link up, ID $34831106 the whole chain works
+;
+; BUILT WITH --entry-returns, so a wrong answer costs a line of output
+; and not a power cycle:
+;
+;   PureMetalForge.exe --compile pi4PcieProbe.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+
+Procedure PutHex8(v.i)
+  Define i.i
+  Define n.i
+  For i = 7 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, off.i)
+  Define v.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  UartWriteStr("  $")
+  v = PcieRcPeek(off)
+  If v < 0
+    UartWriteStr("REFUSED (offset out of range or unaligned)")
+  Else
+    PutHex8(v)
+  EndIf
+  PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define id.i
+  Define st.i
+
+  PrintNl()
+  UartWriteStr("=== Pi 4 PCIe probe - can we see the VL805? ===")
+  PrintNl()
+
+  ; The block is readable before any of this - the registers answer even
+  ; with the link down, which is what makes a before/after possible.
+  UartWriteStr("before PcieInit:")
+  PrintNl()
+  Row("STATUS      ", #PCIE_MISC_PCIE_STATUS)
+  Row("HARD_DEBUG  ", #PCIE_MISC_HARD_PCIE_HARD_DEBUG)
+  Row("MISC_CTRL   ", #PCIE_MISC_MISC_CTRL)
+
+  PrintNl()
+  UartWriteStr("PcieInit ... ")
+  If PcieInit() = 0
+    UartWriteStr("FAILED")
+    PrintNl()
+    UartWriteStr("  ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ; Report the status word anyway - "link down" and "link half up"
+    ; are different diagnoses and only this tells them apart.
+    Row("STATUS      ", #PCIE_MISC_PCIE_STATUS)
+    ProcedureReturn 1
+  EndIf
+  UartWriteStr("ok")
+  PrintNl()
+
+  Row("STATUS      ", #PCIE_MISC_PCIE_STATUS)
+  st = PcieRcPeek(#PCIE_MISC_PCIE_STATUS)
+  UartWriteStr("  PHYLINKUP   ")
+  If (st & #PCIE_STATUS_PHYLINKUP_MASK) <> 0
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+  UartWriteStr("  DL_ACTIVE   ")
+  If (st & #PCIE_STATUS_DL_ACTIVE_MASK) <> 0
+    UartWriteStr("yes")
+  Else
+    UartWriteStr("no")
+  EndIf
+  PrintNl()
+
+  ; The root complex answers on bus 0 device 0 without the index/data
+  ; pair. If THIS is wrong, config space is broken in a way that has
+  ; nothing to do with the VL805, and knowing that first saves an hour.
+  PrintNl()
+  UartWriteStr("root complex 00:00.0 vendor:device  $")
+  PutHex8(PcieCfgRead32(0, 0, 0, 0))
+  PrintNl()
+
+  UartWriteStr("VL805        01:00.0 vendor:device  $")
+  id = PcieVl805Id()
+  PutHex8(id)
+  PrintNl()
+
+  PrintNl()
+  If id = #PCIE_VL805_ID_EXPECTED
+    UartWriteStr("=== IT IS THERE. VIA VL805, and the whole chain works. ===")
+  ElseIf id = -1
+    UartWriteStr("=== link is up and nothing answered at 01:00.0 ===")
+    PrintNl()
+    UartWriteStr("    all-ones is PCI for 'no device'. The link trained, so")
+    PrintNl()
+    UartWriteStr("    suspect the config index/data pair or the bus number.")
+  Else
+    UartWriteStr("=== something answered, but it is not the VL805 ===")
+  EndIf
+  PrintNl()
+
+  ProcedureReturn 0
+EndProcedure

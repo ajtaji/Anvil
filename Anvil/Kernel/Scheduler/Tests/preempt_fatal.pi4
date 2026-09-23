@@ -1,0 +1,34 @@
+XIncludeFile "Anvil/Kernel/Scheduler/scheduler.pbi"
+XIncludeFile "Anvil/Kernel/Scheduler/preempt_a64.pbi"
+Procedure HwExceptionText(text.i)
+  PokeI($6000020, PeekI($6000020) + 1)
+EndProcedure
+Procedure HwExceptionByte(value.i)
+  PokeI($6000028, PeekI($6000028) + 1)
+EndProcedure
+Procedure HwExceptionHex(value.i)
+  PokeI($6000030, PeekI($6000030) + 1)
+EndProcedure
+XIncludeFile "Anvil/Kernel/Scheduler/report_pi4.pbi"
+Procedure FatalReporter()
+  ApPi4FatalReport()
+  PokeI($6000000, PeekI($6000000) + 1)
+  PokeI($6000008, ap_fatal_record[2])
+  ; Deliberate recursive stop must preserve the first record and park once.
+  ApFatal()
+EndProcedure
+Procedure.i Stub()
+  ProcedureReturn 1
+EndProcedure
+ProcedureNaked BreakStack()
+  ASM
+    movz x9, #3
+    mov sp, x9
+    b apfatal
+  ENDASM
+EndProcedure
+Procedure Main()
+  PokeI($6000010, ApInstall($8000, @Stub, @Stub, @Stub, $400000, $200000))
+  PokeI($6000018, ApSetFatalReporter(@FatalReporter))
+  BreakStack()
+EndProcedure

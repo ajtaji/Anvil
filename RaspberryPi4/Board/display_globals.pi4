@@ -1,0 +1,179 @@
+#CUR_W = 8
+#CUR_H = 14
+#CUR_COLOUR = $00FFFFFF   ; white, opaque
+; Mouse sensitivity as a PERCENT GAIN: 100 is 1:1 with the raw HID
+; counts, 200 is twice as fast, 50 half. Runtime-settable with the
+; 'mouse' command so it can be dialled in at the bench without a
+; reflash. The remainder is carried between ticks so a slow drag still
+; eventually steps a pixel. (The old fixed #MOUSE_DIV was replaced when
+; 1:1 turned out to be the runaway-accumulator bug, not real 1:1.)
+#MOUSE_PCT = 100
+
+; The mouse cursor and USB keyboard. DECLARED HERE, with the other
+; globals, because RxByte() reads them and is defined long before the
+; cursor code itself.
+Global gMouseMiss.i = 0        ; consecutive failed polls
+Global gMouseTried.i = 0
+Global gKbdH.i = 0
+Global gMouseOk.i = 0
+Global gMouseH.i = 0
+Global gCurX.i = 0
+Global gCurY.i = 0
+Global gCurShown.i = 0
+Global gCurTick.i = 0
+Global gMousePct.i = #MOUSE_PCT   ; sensitivity, percent of 1:1
+Global gCurAx.i = 0            ; leftover mouse counts, x, not yet a pixel
+Global gCurAy.i = 0            ; and y
+; 8 wide, 14 tall - one row per entry, bit 7 is the leftmost pixel.
+Global Dim gCurSave.i[#CUR_W * #CUR_H]
+Global Dim gCurMask.i[#CUR_H]
+
+; ----------------------------------------------------------------------
+;  THE POINTER IS ONE THING AND TWO DEVICES DRIVE IT.
+;
+;  gCurX / gCurY above used to belong to the mouse. They do not any
+;  more: a finger on the DSI panel moves the same arrow, and a UI asking
+;  "where is the pointer and is it pressed" must get one answer whichever
+;  device the operator's hand is on. Two positions and two buttons would
+;  be two cursors on one screen, which is what a UI with a hover state
+;  that never clears looks like from the outside.
+;
+;  The two buttons are kept apart and ORed by PointerDown(), because a
+;  mouse button held while a finger lifts must not release, and neither
+;  device can clear the other's state.
+; ----------------------------------------------------------------------
+Global gPtrBtnMouse.i = 0      ; the mouse's button bits, as HID reports
+Global gPtrBtnTouch.i = 0      ; 1 while at least one contact is down
+Global gTouchTried.i = 0       ; the one-time attach, like gMouseTried
+Global gTouchOk.i = 0          ; 1 once the controller answered
+Global gTouchMiss.i = 0        ; consecutive failed reads
+Global gTouchPrimaryId.i = -1  ; stable cursor contact while several fingers are down
+Global gPtrPlaced.i = 0        ; 1 once the arrow has a position somebody
+                               ; chose - see PointerHome
+
+Global gScreen.i               ; 1 once the HDMI console is up and being
+                               ; fed. 0 means serial only.
+Global gScreenBg.i             ; the console's background colour, as the
+                               ; packed word DisplayRGB() produced. Kept
+                               ; here because display.pi4 has no getter
+                               ; for it and ScreenFastScroll() has to
+                               ; fill the vacated rows with the same
+                               ; value the library would have used. Set
+                               ; in ScreenUpOn(), beside the
+                               ; DisplayColour() call it must agree with.
+Global gDma.i                  ; 1 once the DMA engine is up AND bound to
+                               ; this surface. Every accelerated path in
+                               ; this file tests it and does exactly what
+                               ; the monitor did before when it is 0, so
+                               ; an engine that refuses to start costs
+                               ; speed and nothing else.
+
+; THE DMA SCRATCH BLOCK. dma.pi4 builds its control block and its
+; 256-byte fill pattern here and reads them with the engine; nothing
+; else may touch it.
+;
+; IT IS A GLOBAL AND NOT AN ADDRESS CONSTANT, AND THAT IS THE POINT.
+; The engine needs it 256-byte aligned, inside the low gigabyte the
+; thirty-bit engines can reach, and OUTSIDE both payload windows - and
+; a hand-picked constant satisfying all three is a number that has to
+; stay true every time the memory map moves. A Global lands in
+; #MON_DATA_LO..#MON_DATA_HI, which is inside the low gigabyte, is
+; already refused to `w`, `g`, `a`, `fill` and `copy` by
+; HitsMonitor(), and is already outside both payload windows because
+; InPayload() says so. The one property the map does not give is the
+; alignment, so 255 spare bytes are declared and the base is rounded up
+; at run time in ScreenDmaUp().
+;
+; 512 IS dma.pi4's OWN MINIMUM and not a round number picked here: 32
+; bytes of control block, 224 reserved for a chained one, and a
+; 256-byte fill pattern that has to be that long because a 32-byte one
+; turned out to be shorter than a single read burst and the engine
+; filled the tail of a long row with whatever lay behind it
+; (dma.pi4:2349). DmaSetScratch() refuses anything smaller.
+#MON_DMA_SCRATCH = 512
+Global Dim gDmaScratch.a[#MON_DMA_SCRATCH + 255]
+Global gScreenIndex.i = -1     ; the display INDEX the running screen was
+                               ; brought up on, or -1 for "the firmware's
+                               ; own choice stands". Only meaningful while
+                               ; gScreen is 1. ScreenUpOn() compares
+                               ; against it to tell "already up on the
+                               ; display you asked for" from "up on a
+                               ; different one, so move it".
+
+; ----------------------------------------------------------------------
+;  A RETRY-SUPPRESSION FLAG LIVED HERE. IT WAS DELETED ON PURPOSE, AND
+;  NOT BECAUSE NOBODY GOT ROUND TO FINISHING IT.
+;
+;  gScreenTried sat on this line, commented "so a failed bring-up is not
+;  retried on every prompt". It had exactly two occurrences in the tree:
+;  this declaration and one "gScreenTried = 1" in ScreenUpOn(). NOTHING
+;  EVER READ IT, so the suppression it described has never once
+;  happened. The choice was to implement the read or remove the flag,
+;  and removing it was a ruling rather than tidying. Three reasons, in
+;  the order that decided it:
+;
+;  1. IMPLEMENTING IT WOULD REBUILD THE BUG THIS FILE WAS JUST FIXED
+;     FOR. "Do not retry a failed bring-up" means the operator's second
+;     "screen on" does nothing at all. A whole afternoon went into
+;     THE SILENT "screen on" REGRESSION below - a command that returned
+;     success having printed nothing, which no one at the bench could
+;     tell from a command that was not understood. A path that
+;     deliberately declines to act on something just typed is that same
+;     defect with a justification attached.
+;
+;  2. NOTHING WAS EVER OBSERVED TO BE WRONG WITH RETRYING. A repeated
+;     bring-up costs one mailbox round trip. And the five-line "the
+;     firmware would not give this monitor a framebuffer" explanation is
+;     worth REPRINTING rather than suppressing: the operator's next move
+;     is a power cycle, and they need telling every time they ask, not
+;     once per boot.
+;
+;  3. THE ONE LINE THAT EXISTED WAS ALREADY IN THE WRONG PLACE. The
+;     assignment ran BEFORE the tag-table and display-index checks, so a
+;     rejected "screen on 5" would have counted as a failed bring-up and
+;     poisoned every later attempt. A flag whose only implementation is
+;     misplaced is a leftover, not a feature waiting to be finished.
+;
+;  If the cost of retrying ever does show up on the bench, the fix is a
+;  message that says the attempt is being repeated - not a silent one
+;  that isn't.
+; ----------------------------------------------------------------------
+; gName MOVED TO Anvil/Core/state.pbi on the bootloader pass. Its only
+; user is CmdSave in Anvil/Core/fs_cmd.pbi, which is core and now
+; compiles for the Arduino UNO Q too - and the Q does not include this
+; file. A scratch buffer owned by a core command belongs with the core's
+; other scratch buffers, next to gHashOut and gNumBuf.
+; THE TICK COUNT WHEN THIS MONITOR STARTED. The whole point is that a
+; RESET IS OTHERWISE INVISIBLE TO A SCRIPT: the board comes back, prints
+; the same banner and offers the same prompt, so a tool driving it over
+; the wire cannot tell "still running" from "died and rebooted" - and a
+; payload that wedges the board looks exactly like one that finished.
+; Uptime going BACKWARDS is the proof, and it needs nothing but two
+; reads. CNTPCT_EL0 is reset by a reboot and runs at a fixed 54 MHz
+; regardless of what the cores are clocked at, so it is the honest
+; source; gBootTicks is sampled once, as early as Main() can.
+Global gBootTicks.i
+
+Global gDead.i                 ; deadman timeout in SECONDS for the next
+                               ; payload; 0 = off. See CmdDeadman.
+
+Global gFlushAddr.i            ; one cache line for CacheLine/AutoFlush
+Global gLastCR.i               ; so a CRLF pair is one line, not two
+Global gMbx.i                  ; 0 not tried, 1 up, -1 tried and failed
+
+; ----------------------------------------------------------------------
+;  gBase - the default address added to the address arguments of the
+;  memory family. U-Boot's `base` command, and it starts at ZERO
+;  (base_address, RaspberryPi4/Reference/v2025.01_cmd_mem.c:53), so an
+;  Anvil that never touches it behaves exactly as it always did.
+;
+;  WHICH COMMANDS ADD IT is copied from the real source rather than
+;  guessed: md, mw, cmp (both addresses), cp (both) and mtest all do
+;  `addr += base_address` (cmd_mem.c:94, :149, :263, :266, :326, :329,
+;  :1176). crc32 does NOT - do_mem_crc (cmd_mem.c:1244-1265) hands its
+;  arguments straight to hash_command and never adds it. Anvil matches
+;  that, INCLUDING the exemption, and says so out loud whenever gBase is
+;  non-zero, because a default that applies to four commands and not the
+;  fifth is otherwise a trap rather than a convenience.
+; ----------------------------------------------------------------------
+Global gBase.i                 ; U-Boot's base_address. 0 = off.

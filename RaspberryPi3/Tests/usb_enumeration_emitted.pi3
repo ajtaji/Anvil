@@ -1,0 +1,63 @@
+; Desk-only A64 emission fixture.  The transfer procedure below is a bounded
+; mock: it performs no MMIO and exists only to exercise generated state code.
+Global emittedCalls.i
+Global emittedMode.i
+Global emittedSetupBus.i=$C0200000
+Global emittedDataBus.i=$C0201000
+Global p3usb_transfer_actual.i
+Global p3usb_transfer_next_pid.i
+
+Procedure.i Pi3UsbChannelTransfer(channel.i,deviceAddress.i,endpointAddress.i,endpointType.i,maxPacket.i,lowSpeed.i,dmaBusAddress.i,byteCount.i,pid.i,timeoutUs.i)
+  emittedCalls+1 : p3usb_transfer_actual=0 : p3usb_transfer_next_pid=pid
+  If emittedMode=1 : ProcedureReturn 0 : EndIf
+  If emittedMode=2 : ProcedureReturn -12 : EndIf
+  If emittedCalls=1
+    If endpointAddress<>0 Or dmaBusAddress<>emittedSetupBus Or byteCount<>8 Or pid<>3 : ProcedureReturn -90 : EndIf
+    p3usb_transfer_actual=8 : ProcedureReturn 1
+  ElseIf emittedCalls=2
+    If endpointAddress<>$80 Or dmaBusAddress<>emittedDataBus Or byteCount<>8 Or pid<>2 : ProcedureReturn -91 : EndIf
+    PokeA($02001000,18) : PokeA($02001001,1) : PokeA($02001007,64)
+    p3usb_transfer_actual=8 : ProcedureReturn 1
+  ElseIf emittedCalls=3
+    If endpointAddress<>0 Or dmaBusAddress<>0 Or byteCount<>0 Or pid<>2 : ProcedureReturn -92 : EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn -93
+EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/usb_protocol.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_control.pbi"
+XIncludeFile "RaspberryPi3/Lib/usb_enumeration.pbi"
+
+Procedure.i Main()
+  Protected operation.i=PeekI($06000000)
+  emittedCalls=0 : emittedMode=0
+  Pi3UsbGetDescriptorSetup($02000000,#P3_USB_DESC_DEVICE,0,8)
+  If operation=1
+    If Pi3UsbControlBegin(2,0,8,0,$02000000,emittedSetupBus,$02001000,emittedDataBus,2,50000)<>1 : ProcedureReturn -1 : EndIf
+    If Pi3UsbControlStep()<>#P3_USB_CONTROL_PROGRESS : ProcedureReturn -2 : EndIf
+    If Pi3UsbControlStep()<>#P3_USB_CONTROL_PROGRESS : ProcedureReturn -3 : EndIf
+    If Pi3UsbControlStep()<>#P3_USB_CONTROL_DONE : ProcedureReturn -4 : EndIf
+    If emittedCalls<>3 Or p3usb_control_actual<>8 : ProcedureReturn -5 : EndIf
+    ProcedureReturn 1
+  ElseIf operation=2
+    emittedMode=1
+    If Pi3UsbControlBegin(2,0,8,0,$02000000,emittedSetupBus,$02001000,emittedDataBus,1,50000)<>1 : ProcedureReturn -6 : EndIf
+    If Pi3UsbControlStep()<>#P3_USB_CONTROL_RETRY : ProcedureReturn -7 : EndIf
+    If emittedCalls<>1 Or p3usb_control_retries_left<>0 : ProcedureReturn -8 : EndIf
+    If Pi3UsbControlStep()<>-21 Or emittedCalls<>2 : ProcedureReturn -9 : EndIf
+    ProcedureReturn 2
+  ElseIf operation=3
+    emittedMode=2
+    If Pi3UsbControlBegin(2,0,8,0,$02000000,emittedSetupBus,$02001000,emittedDataBus,2,50000)<>1 : ProcedureReturn -10 : EndIf
+    If Pi3UsbControlStep()<>-12 Or emittedCalls<>1 : ProcedureReturn -11 : EndIf
+    ProcedureReturn 3
+  ElseIf operation=4
+    ; Root status is validated without touching the transport.
+    If Pi3UsbEnumerationBegin($0101,2,$02000000,emittedSetupBus,$02001000,emittedDataBus,512,2,5,50000)<>-30 : ProcedureReturn -12 : EndIf
+    If emittedCalls<>0 Or p3usb_lan_bulk_in<>0 : ProcedureReturn -13 : EndIf
+    ProcedureReturn 4
+  EndIf
+  ProcedureReturn -99
+EndProcedure
+

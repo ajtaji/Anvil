@@ -1,0 +1,264 @@
+; Executable emitted-code gate for the two recorded misleading-status
+; defects, build 41, 2026-09-10:
+;
+;   "LinkWhy says no cable is plugged in while Wi-Fi is pinned"
+;   "a wired link-local explanation is printed for selected Wi-Fi"
+;
+; tools/link_status_truth_emitted_check.py replaces the markers below with
+; the reason codes, LinkSelect and LinkWhyText from RaspberryPi4/Lib/link.pi4
+; and NetAddrFromText from Anvil/Core/netcfg.pbi, all extracted verbatim.
+;
+; NEITHER DEFECT WAS A WORDING MISTAKE, which is why this gate asserts on
+; the stored reason code and on the identity of the sentence returned
+; rather than on prose. Both sentences were correct readings of a fact that
+; had been falsified one layer up: the pin was expressed by hiding the
+; cable's facts from the policy, and the address provenance was read out of
+; two wired-only compatibility globals under whichever link was selected.
+;
+; So the wired globals below are set ADVERSARIALLY in every address case -
+; they hold a link-local 169.254 address throughout - and the Wi-Fi answers
+; must be unaffected by them.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+#NETIF_KINDS   = 3
+
+#NET_ADDR_NONE      = 0
+#NET_ADDR_LEASE     = 1
+#NET_ADDR_SAVED     = 2
+#NET_ADDR_LINKLOCAL = 3
+
+; @@PRODUCTION_LINK_WHY_CODES@@
+
+Global gLinkKind.i
+Global gLinkWhy.i
+Global gLinkSwaps.i
+Global gLinkSince.i
+Global gate_ms.i
+
+; The wired compatibility globals. NetAddrFromText read these until
+; 2026-09-10; nothing in the fixed procedure may.
+Global gEthAddrFrom.i
+Global gEthIp.i
+
+Global Dim gate_src.i[#NETIF_KINDS]
+Global Dim gate_ip.i[#NETIF_KINDS]
+
+Procedure.i millis()
+  gate_ms = gate_ms + 3
+  ProcedureReturn gate_ms
+EndProcedure
+
+Procedure.i NetIfSrc(kind.i)
+  ProcedureReturn gate_src[kind]
+EndProcedure
+
+Procedure.i NetIPv4(kind.i)
+  ProcedureReturn gate_ip[kind]
+EndProcedure
+
+; 169.254.0.0/16, the one address test this sentence makes.
+Procedure.i NetIsLinkLocal(ip.i)
+  If (ip & $FFFF0000) = $A9FE0000
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure GateClear()
+  Define k.i
+  For k = 0 To #NETIF_KINDS - 1
+    gate_src[k] = #NET_ADDR_NONE
+    gate_ip[k] = 0
+  Next
+  gLinkKind = #HW_LINK_NONE
+  gLinkWhy = #LINK_WHY_UNSET
+  gLinkSwaps = 0
+  ; The adversarial pair: a wired link-local address, always present.
+  gEthAddrFrom = #NET_ADDR_LINKLOCAL
+  gEthIp = $A9FEAAFA
+EndProcedure
+
+; @@PRODUCTION_LINK_SELECT@@
+
+; @@PRODUCTION_LINK_WHY_TEXT@@
+
+; @@PRODUCTION_NET_ADDR_FROM_TEXT@@
+
+Procedure.i Main()
+  Define k.i
+  Define noCable.i
+  Define pinnedText.i
+  Define leaseWifi.i
+  Define leaseWired.i
+  Define llWired.i
+  Define savedLl.i
+  Define savedPlain.i
+
+  ; ------------------------------------------------------------------
+  ; FIRST, THE SENTENCE THE DEFECT PRODUCED, so the gate knows what it
+  ; is refusing. A genuine no-cable case: the radio is joined and has an
+  ; address, the Ethernet socket is empty, nothing is pinned.
+  ; ------------------------------------------------------------------
+  GateClear()
+  k = LinkSelect(#HW_LINK_NONE, 0, 0, 1, 1)
+  If k <> #HW_LINK_WIFI : ProcedureReturn 1 : EndIf
+  If gLinkWhy <> #LINK_WHY_WIFI_NOCBL : ProcedureReturn 2 : EndIf
+  noCable = LinkWhyText()
+  If noCable = 0 : ProcedureReturn 3 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 1. THE RECORDED DEFECT. Wi-Fi is PINNED. The cable is in, the port
+  ;    negotiated, and the wired side holds an address. The board must
+  ;    not answer that there is nothing plugged into the Ethernet
+  ;    socket - that is a statement about hardware, and the hardware
+  ;    says the opposite.
+  ; ------------------------------------------------------------------
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIFI, 1, 1, 1, 1)
+  If k <> #HW_LINK_WIFI : ProcedureReturn 4 : EndIf
+  If gLinkWhy <> #LINK_WHY_PINNED : ProcedureReturn 5 : EndIf
+  pinnedText = LinkWhyText()
+  If pinnedText = 0 : ProcedureReturn 6 : EndIf
+  If pinnedText = noCable : ProcedureReturn 7 : EndIf
+
+  ; 2. The same pin with the cable genuinely out gives the SAME answer,
+  ;    because under a pin the other interface is not part of the
+  ;    question at all. A reason that changed with the cable would be a
+  ;    reason that was still about the cable.
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIFI, 0, 0, 1, 1)
+  If k <> #HW_LINK_WIFI : ProcedureReturn 8 : EndIf
+  If gLinkWhy <> #LINK_WHY_PINNED : ProcedureReturn 9 : EndIf
+  If LinkWhyText() <> pinnedText : ProcedureReturn 10 : EndIf
+
+  ; 3. The cable pinned while the radio is joined and addressed: the
+  ;    mirror image, and the same rule.
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIRED, 1, 1, 1, 1)
+  If k <> #HW_LINK_WIRED : ProcedureReturn 11 : EndIf
+  If gLinkWhy <> #LINK_WHY_PINNED : ProcedureReturn 12 : EndIf
+  If LinkWhyText() <> pinnedText : ProcedureReturn 13 : EndIf
+
+  ; 4. Pinned, up, and holding no address yet. That is a real state -
+  ;    `net link wired` then `dhcp` - and it is its own reason, not the
+  ;    bare-wired fallback, because a pin refuses instead of falling
+  ;    back.
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIRED, 1, 0, 1, 1)
+  If k <> #HW_LINK_WIRED : ProcedureReturn 14 : EndIf
+  If gLinkWhy <> #LINK_WHY_PIN_BARE : ProcedureReturn 15 : EndIf
+  If LinkWhyText() = pinnedText : ProcedureReturn 16 : EndIf
+
+  ; 5. Pinned to an interface that is not up. A pin REFUSES; it must not
+  ;    quietly hand the traffic to the other interface, which is up and
+  ;    addressed in this case.
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIFI, 1, 1, 0, 0)
+  If k <> #HW_LINK_NONE : ProcedureReturn 17 : EndIf
+  If gLinkWhy <> #LINK_WHY_PIN_DOWN : ProcedureReturn 18 : EndIf
+
+  GateClear()
+  k = LinkSelect(#HW_LINK_WIRED, 0, 0, 1, 1)
+  If k <> #HW_LINK_NONE : ProcedureReturn 19 : EndIf
+  If gLinkWhy <> #LINK_WHY_PIN_DOWN : ProcedureReturn 20 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 6. THE AUTOMATIC POLICY IS UNCHANGED. Every arm of it, including the
+  ;    genuine no-cable answer, still reads exactly as it did - fixing a
+  ;    lie must not cost the truths beside it.
+  ; ------------------------------------------------------------------
+  GateClear()
+  If LinkSelect(#HW_LINK_NONE, 1, 1, 1, 1) <> #HW_LINK_WIRED : ProcedureReturn 21 : EndIf
+  If gLinkWhy <> #LINK_WHY_WIRED_BOTH : ProcedureReturn 22 : EndIf
+  GateClear()
+  If LinkSelect(#HW_LINK_NONE, 1, 1, 0, 0) <> #HW_LINK_WIRED : ProcedureReturn 23 : EndIf
+  If gLinkWhy <> #LINK_WHY_WIRED_ONLY : ProcedureReturn 24 : EndIf
+  GateClear()
+  If LinkSelect(#HW_LINK_NONE, 1, 0, 0, 0) <> #HW_LINK_WIRED : ProcedureReturn 25 : EndIf
+  If gLinkWhy <> #LINK_WHY_WIRED_BARE : ProcedureReturn 26 : EndIf
+  GateClear()
+  If LinkSelect(#HW_LINK_NONE, 1, 0, 1, 1) <> #HW_LINK_WIFI : ProcedureReturn 27 : EndIf
+  If gLinkWhy <> #LINK_WHY_WIFI_NOIP : ProcedureReturn 28 : EndIf
+  GateClear()
+  If LinkSelect(#HW_LINK_NONE, 0, 0, 0, 0) <> #HW_LINK_NONE : ProcedureReturn 29 : EndIf
+  If gLinkWhy <> #LINK_WHY_NONE_AT_ALL : ProcedureReturn 30 : EndIf
+
+  ; 7. A change of selection is still counted once, and no change does
+  ;    not count. The pin arm returns early, so this is the property a
+  ;    second exit point is most likely to lose.
+  GateClear()
+  LinkSelect(#HW_LINK_NONE, 0, 0, 1, 1)
+  If gLinkSwaps <> 1 : ProcedureReturn 31 : EndIf
+  LinkSelect(#HW_LINK_WIFI, 1, 1, 1, 1)
+  If gLinkSwaps <> 1 : ProcedureReturn 32 : EndIf
+  LinkSelect(#HW_LINK_WIRED, 1, 1, 1, 1)
+  If gLinkSwaps <> 2 : ProcedureReturn 33 : EndIf
+  LinkSelect(#HW_LINK_WIFI, 0, 0, 0, 0)
+  If gLinkSwaps <> 3 Or gLinkKind <> #HW_LINK_NONE : ProcedureReturn 34 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 8. THE ADDRESS SENTENCE FOLLOWS THE INTERFACE. The bench's shape: a
+  ;    self-assigned address on the cable, a house lease on the radio,
+  ;    and the wired compatibility globals saying "link-local" the whole
+  ;    time. `net` prints this line directly under LinkSay(), which
+  ;    names the SELECTED interface, so an answer read out of the wired
+  ;    globals describes an interface the line above just said was not
+  ;    carrying anything.
+  ; ------------------------------------------------------------------
+  GateClear()
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_LINKLOCAL
+  gate_ip[#HW_LINK_WIRED] = $A9FEAAFA
+  gate_src[#HW_LINK_WIFI] = #NET_ADDR_LEASE
+  gate_ip[#HW_LINK_WIFI] = $C0A80114
+  llWired = NetAddrFromText(#HW_LINK_WIRED)
+  leaseWifi = NetAddrFromText(#HW_LINK_WIFI)
+  If llWired = 0 Or leaseWifi = 0 : ProcedureReturn 35 : EndIf
+  If llWired = leaseWifi : ProcedureReturn 36 : EndIf
+
+  ; The same provenance on the OTHER interface gives the same sentence:
+  ; this is a function of the row, not of the kind and not of gEth*.
+  GateClear()
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_LEASE
+  gate_ip[#HW_LINK_WIRED] = $C0A88902
+  leaseWired = NetAddrFromText(#HW_LINK_WIRED)
+  If leaseWired <> leaseWifi : ProcedureReturn 37 : EndIf
+
+  ; An interface holding nothing says nothing, whatever the wired
+  ; globals hold.
+  GateClear()
+  If NetAddrFromText(#HW_LINK_WIFI) = llWired : ProcedureReturn 38 : EndIf
+  If NetAddrFromText(#HW_LINK_WIFI) = leaseWifi : ProcedureReturn 39 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 9. THE SHARPER SAVED WARNING IS ABOUT THIS INTERFACE'S ADDRESS. A
+  ;    stored address inside 169.254/16 gets its own paragraph, and the
+  ;    test that selects it must read NetIPv4(kind). gEthIp is a
+  ;    169.254 address throughout, so a procedure reading it would give
+  ;    the link-local warning for the radio's ordinary stored address.
+  ; ------------------------------------------------------------------
+  GateClear()
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_SAVED
+  gate_ip[#HW_LINK_WIRED] = $A9FE0105
+  gate_src[#HW_LINK_WIFI] = #NET_ADDR_SAVED
+  gate_ip[#HW_LINK_WIFI] = $C0A80114
+  savedLl = NetAddrFromText(#HW_LINK_WIRED)
+  savedPlain = NetAddrFromText(#HW_LINK_WIFI)
+  If savedLl = 0 Or savedPlain = 0 : ProcedureReturn 40 : EndIf
+  If savedLl = savedPlain : ProcedureReturn 41 : EndIf
+  If savedLl = llWired Or savedPlain = leaseWifi : ProcedureReturn 42 : EndIf
+
+  ; And the reverse assignment, so the answer tracks the address and not
+  ; the interface number: the same two provenances with the addresses
+  ; swapped swap the two sentences.
+  GateClear()
+  gate_src[#HW_LINK_WIRED] = #NET_ADDR_SAVED
+  gate_ip[#HW_LINK_WIRED] = $C0A80114
+  gate_src[#HW_LINK_WIFI] = #NET_ADDR_SAVED
+  gate_ip[#HW_LINK_WIFI] = $A9FE0105
+  If NetAddrFromText(#HW_LINK_WIRED) <> savedPlain : ProcedureReturn 43 : EndIf
+  If NetAddrFromText(#HW_LINK_WIFI) <> savedLl : ProcedureReturn 44 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,563 @@
+; pi4GicTimer.pi4 - ONE INTERRUPT, END TO END. THE DANGEROUS ONE.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicTimer.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -s -o _work/gictimer.img
+;
+; ----------------------------------------------------------------------
+; RUN pi4GicProbe.pi4 FIRST. ARM THE DEADMAN. THIS ONE CAN HANG.
+; ----------------------------------------------------------------------
+; `deadman 15` before `run`, without exception. This is the first
+; program in the history of this tree that clears PSTATE.I, and the
+; failure modes of getting an interrupt wrong are hangs rather than
+; wrong numbers:
+;
+;   an unquieted level interrupt   re-fires the instant the handler
+;                                  returns, forever, with no output
+;   a vector table that is wrong   branches somewhere and stops
+;   an eret that does not restore  never comes back
+;   a handler that faults          fault.pi4 reports it and parks,
+;                                  which is the good outcome
+;
+; Every one of those is a silent board. The deadman is the only way
+; back and there is no U-Boot any more.
+;
+; ----------------------------------------------------------------------
+; WHAT THIS ANSWERS THAT NO MODEL CAN
+; ----------------------------------------------------------------------
+;   1. Does an IRQ actually arrive at VBAR_EL2 + $280, and does the
+;      vector entry there record slot 5?
+;   2. Does the CNTHP comparator's output actually reach the GIC as
+;      PPI 10 / INTID 26 on this silicon? The device tree says it does
+;      (bcm2711.dtsi:444-453). The device tree describes the
+;      configuration LINUX sets up, and armstub8.S:92-102 programs the
+;      BCM2711's OTHER local-interrupt block on the way past. Only the
+;      board can settle it.
+;   3. Does GICC_IAR return 26, and does GICC_EOIR end it, so that a
+;      SECOND interrupt can be taken?
+;   4. Does `eret` out of an IRQ restore DAIF such that interrupts are
+;      still enabled afterwards?
+;   5. Does the tick keep time - is the measured interval anywhere
+;      near the requested one?
+;
+; ----------------------------------------------------------------------
+; THE TWO NEGATIVE CONTROLS, AND WHY THIS FILE IS MOSTLY THEM
+; ----------------------------------------------------------------------
+; A probe made only of positive cases cannot tell "the interrupt
+; works" from "something calls my callback". Both controls are timed
+; waits over the SAME number of periods as the positive case, so
+; "nothing happened" means "nothing happened in a window where
+; something demonstrably does happen", not "nothing happened yet".
+;
+;   CONTROL A - ARMED BUT MASKED.
+;       The timer is started and the GIC line is claimed and enabled,
+;       and PSTATE.I is STILL SET. Wait ten periods. THE TICK COUNT
+;       MUST BE ZERO.
+;
+;       This is the control that separates a real interrupt from a
+;       fixture. In a model that "delivers an interrupt because you
+;       told it to", the callback runs here. On hardware, and in a
+;       model that implements PSTATE.I, it does not - the interrupt is
+;       pending in the distributor the whole time and the core is
+;       simply not taking it. Step 6 then proves it was pending, by
+;       reading it back out of GICD_ISPENDR before the unmask.
+;
+;   CONTROL B - STOPPED.
+;       After the positive case, GicTickStop() disables the timer and
+;       releases the line, WITHOUT re-masking the core. Wait ten more
+;       periods. THE TICK COUNT MUST NOT MOVE.
+;
+;       Interrupts are still enabled here on purpose. If the count
+;       moves, either the source was never really the timer or the
+;       line was never really released, and either way the positive
+;       result above means less than it looks.
+;
+; ----------------------------------------------------------------------
+; THE THREE COUNTERS THAT MUST AGREE
+; ----------------------------------------------------------------------
+; They are kept by three different pieces of code that do not read
+; each other, so agreement is evidence and disagreement names the
+; layer that is wrong:
+;
+;   FaultIrqCount()   fault.pi4    exceptions taken in an IRQ slot
+;   GicIrqCount()     gic.pi4      IARs dispatched to a handler
+;   ticks             this file    times the callback ran
+;
+; FaultIrqCount() larger than GicIrqCount() means interrupts are
+; arriving that the GIC has no handler for - check
+; GicUnclaimedCount() and GicSpuriousCount(). GicIrqCount() larger
+; than ticks means the tick ISR saw ISTATUS clear and declined, which
+; means something other than the comparator is asserting INTID 26.
+;
+; AND FaultCount() MUST BE ZERO. That is fault.pi4's count of real
+; exceptions - aborts, undefined instructions, traps. A non-zero value
+; means something faulted inside the handler and the run is void
+; whatever the tick count says.
+;
+; ----------------------------------------------------------------------
+; IF IT HANGS, WHERE IT STOPPED IS THE ANSWER
+; ----------------------------------------------------------------------
+; Every step announces itself and drains the UART before attempting
+; anything, the pattern pi4FaultProbe.pi4 settled on.
+;
+;   stops after "unmask"        The first interrupt arrived and did
+;                               not come back. Either the vector slot
+;                               is wrong, or the eret is, or the tick
+;                               ISR is not quieting the comparator and
+;                               the board is in the storm.
+;   stops after "armed, masked" GicTickStart or GicClaim touched
+;                               something that faulted, with no vector
+;                               installed to say what. Unlikely - the
+;                               vectors go in before this.
+;   prints a FAULT line         fault.pi4 caught it. Read the ESR
+;                               against fault.pi4's header. This is
+;                               the design working.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/fault.pi4"
+XIncludeFile "RaspberryPi4/Lib/gic.pi4"
+
+#PR_MAX = 80
+Global Dim pr_val.i[#PR_MAX]
+Global pr_n.i
+
+; The period. 1000 microseconds is a 1 kHz tick - fast enough that ten
+; periods is ten milliseconds and the whole probe is imperceptible,
+; slow enough that fifty-four thousand counter ticks separate them and
+; a handler taking a few hundred cycles cannot overrun.
+#TICK_US    = 1000
+#WAIT_TICKS = 10
+
+; Set by the interrupt. A Global because that is the only thing a
+; handler and a main program can share, and because a local would let
+; the compiler decide the loop below has no side effects.
+Global pr_ticks.i
+Global pr_firstAt.i
+Global pr_lastAt.i
+
+; The tick number pr_lastAt belongs to, written by the SAME interrupt
+; that wrote pr_lastAt.
+;
+; IT IS NOT pr_ticks READ AFTERWARDS, AND THE DIFFERENCE IS A REAL BUG
+; THIS PROBE HAD. The first version divided the deadline span by
+; (pr_ticks - 1) where pr_ticks had been sampled a dozen UART rows
+; earlier - and interrupts keep arriving while a row is being printed,
+; so the numerator and the denominator came from different moments and
+; the answer was 48413 counter ticks per period instead of 54000. It
+; looked exactly like a drifting comparator. Two values that are
+; divided by each other have to be sampled together, and the only
+; place they can be is inside the handler.
+Global pr_lastN.i
+
+; THE CALLBACK. Deliberately tiny. It runs on fault.pi4's 1 KiB
+; private handler stack with the machine mid-interrupt, so it does the
+; least that is still useful and prints NOTHING - a UART write from an
+; ISR at 1 kHz would be its own experiment.
+;
+; It timestamps the first and last tick so that the interval can be
+; checked afterwards, on the ordinary stack, at leisure.
+Procedure Tick()
+  pr_ticks = pr_ticks + 1
+  If pr_ticks = 1
+    pr_firstAt = GicTickNext()
+  EndIf
+  pr_lastAt = GicTickNext()
+  pr_lastN  = pr_ticks
+EndProcedure
+
+; The reporter fault.pi4 calls if anything goes wrong. It should never
+; run. If it does, its output is the finding and everything below it
+; is void.
+Procedure FaultReport()
+  UartWriteStr("   [FAULT slot ")
+  UartWrite(48 + (FaultSlot() / 10))
+  UartWrite(48 + (FaultSlot() - (FaultSlot() / 10) * 10))
+  UartWriteStr(" esr ")
+  UartWriteStr(FaultClassText(FaultEc()))
+  UartWriteStr("]")
+  UartWriteNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Rec(*label, v.i)
+  If pr_n < #PR_MAX
+    pr_val[pr_n] = v
+    pr_n = pr_n + 1
+  EndIf
+  UartWriteStr(*label)
+  UartWrite(36)
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Say(*label)
+  UartWriteStr("-- ")
+  UartWriteStr(*label)
+  UartWriteNl()
+  UartDrain()
+EndProcedure
+
+; Spin for n tick periods, measured on the architectural counter.
+;
+; IT DOES NOT USE delay(). timer.pi4 would do, and this file does not
+; include it: a library never includes a library and this is a
+; program, so it could - but the wait has to be readable next to the
+; thing it is waiting for, and GicTickDelta() is already the exact
+; number of counter ticks in one period. Using the same number for the
+; wait and for the timer means "ten periods" cannot drift away from
+; what the timer thinks a period is.
+;
+; SUBTRACT, NEVER COMPARE AGAINST A DEADLINE. Style on this target
+; rather than a hazard - .i is 64 bits and the counter wraps in 292000
+; years - but the habit is the fleet's and it costs nothing.
+Procedure SpinPeriods(n.i)
+  Define t0.i
+  Define want.i
+  t0 = GicReadCntpct()
+  want = GicTickDelta() * n
+  While (GicReadCntpct() - t0) < want
+  Wend
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define before.i
+  Define pendingWhileMasked.i
+  Define span.i
+  Define bIMasked.i
+  Define bTicks.i
+  Define bFaultIrq.i
+  Define bGicIrq.i
+  Define bTickCount.i
+  Define bLastId.i
+  Define bLastIar.i
+  Define bOverruns.i
+  Define bSpurious.i
+  Define bUnclaimed.i
+  Define bFaults.i
+  Define bNested.i
+  Define bFirst.i
+  Define bLast.i
+  Define bLastN.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4GicTimer - one interrupt, end to end")
+  UartWriteNl()
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. VECTORS FIRST. ALWAYS.
+  ;
+  ;  Nothing below may run without a vector table, and the ORDER is
+  ;  the contract: vectors, then the seam, then the controller, then
+  ;  the unmask. gic.pi4's GicEnableInterrupts() refuses if VBAR_EL2
+  ;  does not hold one, so getting this wrong is a refusal rather than
+  ;  a hang - but the refusal is a backstop, not the plan.
+  ; ------------------------------------------------------------------
+  Say("install vectors")
+  FaultSetReporter(@FaultReport)
+  Rec("fault install   ", FaultInstall())
+  Rec("fault err       ", FaultError())
+  Rec("VBAR            ", GicVbar())
+  Rec("VBAR and 2047   ", GicVbar() & 2047)
+
+  If FaultInstalled() = 0
+    UartWriteStr("REFUSED: ")
+    UartWriteStr(FaultErrorText())
+    UartWriteNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  2. THE SEAM. One line, and it is the whole of the wiring between
+  ;     the two libraries - neither includes the other.
+  ; ------------------------------------------------------------------
+  Say("seam")
+  FaultSetIrqHandler(@GicIrqEntry)
+  Rec("irq handler set ", FaultIrqHandler())
+
+  ; Mask, whatever the loader left. Everything from here to the unmask
+  ; depends on it and the compiler's --entry-returns startup does not
+  ; do it for us (EmitCore_A64.pbi:230-234).
+  GicDisableInterrupts()
+  Rec("I masked        ", (GicDaif() >> 7) & 1)
+
+  ; ------------------------------------------------------------------
+  ;  3. THE CONTROLLER
+  ; ------------------------------------------------------------------
+  Say("GicInit")
+  rc = GicInit()
+  Rec("init rc         ", rc)
+  Rec("init err        ", GicError())
+  Rec("dist IIDR       ", GicDistIidr())
+  Rec("cpu IIDR        ", GicCpuIidr())
+  If rc = 0
+    UartWriteStr("REFUSED: ")
+    UartWriteStr(GicErrorText())
+    UartWriteNl()
+    UartWriteStr("Run pi4GicProbe.pi4 - it explains every refusal row.")
+    UartWriteNl()
+    FaultUninstall()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  ; The group witness, before anything is armed. If this fails there
+  ; is no point going on: the line is invisible to us and the timer
+  ; would tick into a controller that cannot forward it.
+  Say("group witness")
+  Rec("witness rc      ", GicGroupWitness(GicTickIntId()))
+  Rec("HPPIR saw       ", GicGroupWitnessSaw())
+
+  ; ------------------------------------------------------------------
+  ;  4. ARM THE TIMER - STILL MASKED
+  ; ------------------------------------------------------------------
+  Say("armed, masked")
+  Rec("tick start      ", GicTickStart(#TICK_US, @Tick))
+  Rec("tick err        ", GicError())
+  Rec("CNTFRQ          ", GicTickHz())
+  Rec("ticks per period", GicTickDelta())
+  Rec("CNTHP_CTL       ", GicTickCtl())
+  Rec("line enabled    ", GicLineEnabled(GicTickIntId()))
+
+  ; ------------------------------------------------------------------
+  ;  5. CONTROL A - the count MUST stay zero while I is set
+  ;
+  ;  Read THE TWO NEGATIVE CONTROLS in the header. This is the row
+  ;  that separates a real interrupt from a fixture calling a
+  ;  callback, and it is the reason this file is worth running rather
+  ;  than reasoning about.
+  ; ------------------------------------------------------------------
+  Say("control A - masked wait")
+  SpinPeriods(#WAIT_TICKS)
+  Rec("A ticks         ", pr_ticks)
+  Rec("A fault irqs    ", FaultIrqCount())
+  Rec("A gic irqs      ", GicIrqCount())
+
+  ; ------------------------------------------------------------------
+  ;  6. AND IT WAS PENDING THE WHOLE TIME
+  ;
+  ;  Without this row, control A is ambiguous: "no interrupt arrived"
+  ;  would be equally consistent with "the timer never fired at all",
+  ;  which would make the positive case below prove nothing about
+  ;  masking. GICD_ISPENDR says the distributor is holding it.
+  ;
+  ;  ISTATUS in CNTHP_CTL is the same fact read from the other end -
+  ;  the comparator saying its condition is met - so the two together
+  ;  span the whole path from the timer to the distributor with the
+  ;  core still deaf.
+  ; ------------------------------------------------------------------
+  pendingWhileMasked = GicLinePending(GicTickIntId())
+  Rec("A line pending  ", pendingWhileMasked)
+  Rec("A CNTHP ISTATUS ", (GicTickCtl() >> 2) & 1)
+  Rec("A HPPIR         ", GicHighestPending())
+
+  ; ------------------------------------------------------------------
+  ;  7. THE POSITIVE CASE
+  ; ------------------------------------------------------------------
+  Say("unmask")
+  Rec("enable rc       ", GicEnableInterrupts())
+  Rec("enable err      ", GicError())
+  Rec("I masked after  ", (GicDaif() >> 7) & 1)
+
+  SpinPeriods(#WAIT_TICKS)
+
+  ; STILL ENABLED? Question 4 in the header, and it is read FIRST,
+  ; before the snapshot below masks anything. If the eret did not
+  ; restore PSTATE.I from SPSR we would have taken exactly one
+  ; interrupt and then gone deaf, so this row and "B ticks" together
+  ; answer it. Reading it after a deliberate mask/unmask would only
+  ; prove that GicEnableInterrupts() works, which is a different
+  ; question and one that is already answered by "enable rc".
+  bIMasked = (GicDaif() >> 7) & 1
+
+  ; ------------------------------------------------------------------
+  ;  THE SNAPSHOT, AND WHY IT IS TAKEN WITH INTERRUPTS OFF
+  ;
+  ;  ***THIS WAS A REAL BUG IN THIS PROBE AND IT IS WORTH THE
+  ;  PARAGRAPH.*** The first version simply printed each counter as it
+  ;  went. Printing a row over the UART takes long enough for another
+  ;  interrupt to arrive, so by the time "gic irqs" was read it was
+  ;  larger than the "ticks" printed two rows above - and the gate
+  ;  reported that three counters which MUST agree did not. They did
+  ;  agree; they were just never looked at together.
+  ;
+  ;  The same defect made the tick interval come out at 43714 counter
+  ;  ticks instead of 54000, because the span and the tick number it
+  ;  was divided by were sampled six rows apart. That number looked
+  ;  exactly like a drifting comparator.
+  ;
+  ;  Any set of counters that will be COMPARED WITH EACH OTHER has to
+  ;  be read in one go, with the thing that changes them held off.
+  ;  That is what GicDisableInterrupts() is for, and this is the
+  ;  smallest honest critical section in the tree.
+  ; ------------------------------------------------------------------
+  GicDisableInterrupts()
+  bTicks     = pr_ticks
+  bFaultIrq  = FaultIrqCount()
+  bGicIrq    = GicIrqCount()
+  bTickCount = GicTickCount()
+  bLastId    = GicLastIntId()
+  bLastIar   = GicLastIar()
+  bOverruns  = GicTickOverruns()
+  bSpurious  = GicSpuriousCount()
+  bUnclaimed = GicUnclaimedCount()
+  bFaults    = FaultCount()
+  bNested    = FaultIrqNested()
+  bFirst     = pr_firstAt
+  bLast      = pr_lastAt
+  bLastN     = pr_lastN
+  GicEnableInterrupts()
+
+  Say("after the wait")
+  Rec("B ticks         ", bTicks)
+  Rec("B fault irqs    ", bFaultIrq)
+  Rec("B gic irqs      ", bGicIrq)
+  Rec("B gic tickcount ", bTickCount)
+  Rec("B last INTID    ", bLastId)
+  Rec("B last IAR      ", bLastIar)
+  Rec("B overruns      ", bOverruns)
+  Rec("B spurious      ", bSpurious)
+  Rec("B unclaimed     ", bUnclaimed)
+  Rec("B faults        ", bFaults)
+  Rec("B irq nested    ", bNested)
+  Rec("B I masked      ", bIMasked)
+
+  ; The measured interval, in counter ticks, between the first tick's
+  ; deadline and the last one's. It is (lastN-1) * delta EXACTLY,
+  ; because the ISR advances the deadline arithmetically rather than
+  ; from the counter - which makes this a check on the ARITHMETIC, not
+  ; on the part's timekeeping. Real drift would show up as overruns.
+  span = bLast - bFirst
+  Rec("B first deadline", bFirst)
+  Rec("B last deadline ", bLast)
+  Rec("B last tick no  ", bLastN)
+  Rec("B span          ", span)
+  If bLastN > 1
+    Rec("B span per tick ", span / (bLastN - 1))
+  Else
+    Rec("B span per tick ", 0)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  8. THE STORM GUARD - fire a line that has no handler
+  ;
+  ;  Read gic.pi4's section WHY AN UNCLAIMED LINE IS DISABLED. An
+  ;  interrupt with nobody to service it is the classic way to hang a
+  ;  board, and the guard against it is one write that nothing else in
+  ;  this probe exercises. A guard that is never tested is a guard
+  ;  nobody knows is broken.
+  ;
+  ;  INTID 27 is the virtual timer's PPI (bcm2711.dtsi:450-451). It is
+  ;  not claimed, nothing arms the virtual timer, and this is the only
+  ;  place in the tree that touches it.
+  ;
+  ;  THE TICK IS STILL RUNNING FOR THIS STEP, ON PURPOSE. If the
+  ;  unclaimed path failed to write GICC_EOIR, the CPU interface would
+  ;  keep INTID 27's priority as the running priority and NO FURTHER
+  ;  INTERRUPT WOULD EVER BE SIGNALLED - the tick would simply stop.
+  ;  So "S ticks moved" is how this step proves the EOI happened,
+  ;  without needing a second unclaimed interrupt to prove it with.
+  ;
+  ;  A software-pended interrupt is edge-like - IAR clears the pending
+  ;  bit and nothing re-asserts it - so this cannot produce an actual
+  ;  storm. What it proves is that the line is counted, named and
+  ;  DISABLED, which is the part of the guard that stops a real one.
+  ; ------------------------------------------------------------------
+  Say("storm guard")
+  before = pr_ticks
+  Rec("S 27 enabled    ", GicEnableLine(27))
+  Rec("S pend rc       ", GicSetPending(27))
+  SpinPeriods(2)
+  Rec("S unclaimed     ", GicUnclaimedCount())
+  Rec("S last unclaimed", GicLastUnclaimed())
+  Rec("S 27 still en   ", GicLineEnabled(27))
+  Rec("S 27 pending    ", GicLinePending(27))
+  Rec("S 27 active     ", GicLineActive(27))
+  If pr_ticks > before
+    Rec("S ticks moved   ", 1)
+  Else
+    Rec("S ticks moved   ", 0)
+  EndIf
+  Rec("S faults        ", FaultCount())
+
+  ; ------------------------------------------------------------------
+  ;  9. CONTROL B - stopped, but STILL UNMASKED
+  ; ------------------------------------------------------------------
+  Say("control B - stopped wait")
+  GicTickStop()
+  before = pr_ticks
+  Rec("C ticks at stop ", before)
+  Rec("C line enabled  ", GicLineEnabled(GicTickIntId()))
+  Rec("C CNTHP_CTL     ", GicTickCtl())
+  Rec("C I masked      ", (GicDaif() >> 7) & 1)
+
+  SpinPeriods(#WAIT_TICKS)
+
+  Rec("C ticks after   ", pr_ticks)
+  Rec("C delta         ", pr_ticks - before)
+  Rec("C unclaimed     ", GicUnclaimedCount())
+  Rec("C spurious      ", GicSpuriousCount())
+
+  ; ------------------------------------------------------------------
+  ; 10. HAND THE BOARD BACK, IN THE REVERSE ORDER
+  ; ------------------------------------------------------------------
+  Say("shutdown")
+  GicDisableInterrupts()
+  GicShutdown()
+  FaultSetIrqHandler(0)
+  FaultUninstall()
+
+  Rec("gic ready       ", GicReady())
+  Rec("fault installed ", FaultInstalled())
+  Rec("irq handler     ", FaultIrqHandler())
+  Rec("exit I masked   ", (GicDaif() >> 7) & 1)
+  Rec("total faults    ", FaultCount())
+  Rec("results         ", pr_n)
+
+  UartWriteNl()
+  UartWriteStr("PASS looks like: A ticks $0, A line pending $1,")
+  UartWriteNl()
+  UartWriteStr("B ticks $A or more, B last INTID $1A, B I masked $0,")
+  UartWriteNl()
+  UartWriteStr("B span per tick $D2F0, S unclaimed $1, S 27 still en $0,")
+  UartWriteNl()
+  UartWriteStr("S ticks moved $1, C delta $0, total faults $0.")
+  UartWriteNl()
+  UartWriteStr("B overruns $1 IS EXPECTED and is not a defect: control A")
+  UartWriteNl()
+  UartWriteStr("deliberately held the tick masked for ten periods, so the")
+  UartWriteNl()
+  UartWriteStr("first one taken after the unmask is ten periods late and")
+  UartWriteNl()
+  UartWriteStr("the ISR resynchronises rather than trying to catch up.")
+  UartWriteNl()
+  UartWriteStr("Anything else, read the header - every row has a paragraph.")
+  UartWriteNl()
+
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

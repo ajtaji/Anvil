@@ -1,0 +1,424 @@
+; pi4HdmiAudioProbe.pi4 - what did the firmware leave the HDMI
+; transmitter in, and will this sink take audio at all?
+;
+; DIAGNOSTIC. Does not ship. MAKES NO SOUND, on purpose.
+;
+; hdmiaudio.pi4 was written on 2026-08-25 and had never been attached to
+; a monitor. Every claim in it was reasoned from the Linux vc4 driver,
+; which is a good source and not a substitute for the part. This program
+; is the first half of settling that: everything that can be READ,
+; without writing a single audio register and without asking anybody to
+; listen to anything.
+;
+; IT WRITES NOTHING AT ALL. HdmiAudioProbe() and HdmiAudioEdidRead() are
+; the only library calls here that touch hardware, and both only read -
+; the first snapshots registers, the second sends a mailbox property
+; request. HdmiAudioStart() is deliberately not called. That is why this
+; is safe to run on a machine with a picture on the screen: the worst
+; case is a wrong number in the log.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY IT IS SAFE TO RUN. It is sent
+; to a resident Anvil and RETURNS to it, so a wrong answer costs a line
+; of output rather than a power cycle:
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4HdmiAudioProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o probe.img
+;
+; ----------------------------------------------------------------------
+;  THE STANDING FINDING THIS PROGRAM IS BUILT AROUND
+; ----------------------------------------------------------------------
+;  On this platform a power or clock state bit means "SOME CLIENT HAS
+;  CLAIMED THIS", not "the hardware is running". It was earned the hard
+;  way: GET_CLOCK_STATE reported a clock OFF while GET_CLOCK_MEASURED
+;  returned 250000496 Hz for the same clock. So the rule is ASK, RECORD,
+;  AND DO NOT BELIEVE - and measure wherever a measurement exists.
+;
+;  APPLIED TO HDMI AUDIO, THAT RULE HAS AN AWKWARD ANSWER, and it is
+;  worth stating plainly rather than quietly skipping:
+;
+;  THERE IS NO MAILBOX CLOCK TO ASK ABOUT. The 108 MHz MAI clock is not
+;  one of the firmware's clocks. bcm2711-rpi.dtsi:42 gives hdmi0 the
+;  clock list <&firmware_clocks 13>, <&firmware_clocks 14>, <&dvp 0>,
+;  <&clk_27MHz> for the names "hdmi", "bvb", "audio", "cec" - so the
+;  state-machine and pixel clocks are firmware clocks and THE AUDIO ONE
+;  IS NOT. It is clock 0 of clock@7ef00000 (bcm2711.dtsi:313-319), a
+;  plain gate on a fixed 108 MHz oscillator (bcm2711.dtsi:27-32). None
+;  of the twelve firmware clock ids is this clock. GET_CLOCK_STATE
+;  cannot be asked about it and GET_CLOCK_MEASURED cannot measure it.
+;
+;  So the only thing available at this stage is the gate bit itself, and
+;  a gate bit is EXACTLY the kind of evidence the standing finding says
+;  not to trust: it says somebody ungated the clock, not that 108 MHz is
+;  oscillating. This program therefore RECORDS it and says so, and does
+;  not dress it up as proof.
+;
+;  THE MEASUREMENT DOES EXIST - it is just downstream. Feed the MAI FIFO
+;  and time how fast it drains: at 48 kHz stereo it must consume 96000
+;  words per second, and that number is 108000000 divided by the value
+;  in MAI_SMP and multiplied by the channel count. If the drain rate is
+;  right, the 108 MHz clock is real and the divider is right, and no
+;  status bit had to be believed to establish it. That is
+;  pi4HdmiAudioTone.pi4's first job, and it is deliberately in the other
+;  program because it is the one that writes registers.
+;
+;  There IS one real measurement here, and it is worth having: the frame
+;  counter. HdmiAudioRefreshMilliHz() watches FRAME_COUNT against
+;  CNTPCT_EL0. That does not measure the audio clock, but it proves the
+;  pixel-clock domain is alive and that the block answers reads - and
+;  audio rides in the blanking intervals of exactly those frames, so a
+;  frame counter that does not advance makes everything after it moot.
+;
+; ----------------------------------------------------------------------
+;  WHAT TO DO WITH THE RESULT
+; ----------------------------------------------------------------------
+;  1. WHICH SOCKET IS WHICH is settled by this program and a cable. It
+;     probes BOTH ports and prints hotplug for each. Whichever reports
+;     connected is the one the cable is in. Move the cable, run again,
+;     and the physical mapping is closed for good. Nothing in the device
+;     tree or the driver names a connector position, so this is the only
+;     way to find out. It matters because the two ports are not
+;     interchangeable - hdmi0 is the 4Kp60 one (vc4_hdmi.c:3343) and
+;     hdmi1 is capped at HDMI 1.4 TMDS rates (:3372).
+;
+;  2. A snapshot of all zeroes, or of all $FFFFFFFF, means THE BLOCK DID
+;     NOT ANSWER and nothing below it in the log is worth reading.
+;
+;  3. HTOTAL and VTOTAL should read 2200 and 1125 for the 1080p60 the
+;     video path drives today. If they read something absurd then the
+;     VC5 field layout in hdmiaudio.pi4 is wrong and every derived
+;     number is wrong with it.
+
+XIncludeFile "RaspberryPi4/Lib/hdmiaudio.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. PeekB names the SIGNED .b and sign-extends, so
+    ; a byte above 127 would come back negative and this loop would
+    ; never see its terminator. PeekA is the raw-byte accessor.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ") : PutPad(*name, 24) : PutS("$") : PutHex(v, 8) : PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ") : PutPad(*name, 24) : PutDec(v) : PutNl()
+EndProcedure
+
+; A yes/no row. The word "claimed" rather than "on" is deliberate for
+; the clock gate - see the standing finding in the header.
+Procedure RowFlag(*name, v.i, *yes, *no)
+  PutS("  ") : PutPad(*name, 24)
+  If v <> 0
+    PutS(*yes)
+  Else
+    PutS(*no)
+  EndIf
+  PutNl()
+EndProcedure
+
+; "  name .......... 12   (predicted 34)   MISMATCH"
+Procedure RowWant(*name, got.i, want.i)
+  PutS("  ") : PutPad(*name, 24) : PutDec(got)
+  PutS("   (predicted ") : PutDec(want) : PutS(")")
+  If got <> want
+    PutS("   MISMATCH")
+  EndIf
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Probe one port and print everything it will say. Returns 1 if this
+;  port reports a connected sink.
+; ----------------------------------------------------------------------
+Procedure.i ProbePort(port.i)
+  Define connected.i
+
+  PutS("--- port ") : PutDec(port) : PutS(" ---") : PutNl()
+
+  If HdmiAudioInit(port) = 0
+    PutS("  init failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  RowHex("MAI_DATA (ARM)", HdmiAudioMaiDataAddr())
+  RowHex("MAI_DATA (bus, for DMA)", HdmiAudioMaiDataBus())
+  RowDec("DREQ", HdmiAudioDreq())
+
+  HdmiAudioProbe()
+
+  ; ALL-ZERO OR ALL-ONES MEANS THE BLOCK IS NOT THERE. Checked before
+  ; anything is decoded, because decoding $FFFFFFFF produces confident
+  ; nonsense and a reader who skims will believe it.
+  If HdmiAudioSnapScheduler() = $FFFFFFFF
+    PutS("  SCHEDULER_CONTROL reads all ones - THE BLOCK DID NOT ANSWER.")
+    PutNl()
+    PutS("  Nothing below this line is meaningful. Stop here.") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  connected = HdmiAudioHotplug()
+  RowFlag("hotplug", connected, "CONNECTED", "nothing plugged in")
+
+  PutNl()
+  PutS("  raw snapshot:") : PutNl()
+  RowHex("HOTPLUG", HdmiAudioSnapHotplug())
+  RowHex("SCHEDULER_CONTROL", HdmiAudioSnapScheduler())
+  RowHex("RAM_PACKET_CONFIG", HdmiAudioSnapRamPktCfg())
+  RowHex("RAM_PACKET_STATUS", HdmiAudioSnapRamPktSts())
+  RowHex("VID_CTL", HdmiAudioSnapVidCtl())
+  RowHex("MAI_CTL", HdmiAudioSnapMaiCtl())
+  RowHex("MAI_SMP", HdmiAudioSnapMaiSmp())
+  RowHex("MAI_FMT", HdmiAudioSnapMaiFmt())
+  RowHex("MAI_CONFIG", HdmiAudioSnapMaiConfig())
+  RowHex("AUDIO_PACKET_CONFIG", HdmiAudioSnapAudioPkt())
+  RowHex("CRP_CFG", HdmiAudioSnapCrpCfg())
+  RowHex("TX_PHY_POWERDOWN_CTL", HdmiAudioSnapPhyPwrdn())
+  RowHex("DVP MISC_CONFIG", HdmiAudioSnapClockGate())
+
+  PutNl()
+  PutS("  the four preconditions audio needs:") : PutNl()
+  RowFlag("link is HDMI not DVI", HdmiAudioHdmiMode(), "yes", "NO - DVI carries no audio")
+  RowFlag("transmitter active", HdmiAudioHdmiActive(), "yes", "NO - no blanking intervals")
+  RowFlag("packet RAM enabled", HdmiAudioPacketRamOn(), "yes", "NO - no infoframe can be stored")
+  RowFlag("AVI infoframe running", HdmiAudioPacketEnabled(2), "yes", "no")
+
+  ; THE ONE THE STANDING FINDING IS ABOUT. Worded as a claim, not as a
+  ; fact, because that is all a gate bit can support.
+  RowFlag("108 MHz gate", HdmiAudioClockOn(), "CLAIMED UNGATED (not proof - see header)", "gated off")
+
+  PutNl()
+  RowFlag("HdmiAudioLinkReady()", HdmiAudioLinkReady(), "READY", "not ready")
+  If HdmiAudioLinkReady() = 0
+    PutS("  reason: ") : PutS(HdmiAudioErrorText()) : PutNl()
+  EndIf
+
+  ProcedureReturn connected
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The mode the firmware chose, and the one real measurement available
+;  at this stage.
+; ----------------------------------------------------------------------
+Procedure ReportMode()
+  Define mhz.i
+  Define px.i
+
+  PutNl()
+  PutS("--- the mode the firmware put up ---") : PutNl()
+  RowWant("htotal", HdmiAudioHTotal(), 2200)
+  RowWant("vtotal", HdmiAudioVTotal(), 1125)
+  RowDec("hactive", HdmiAudioHActive())
+  RowDec("vactive", HdmiAudioVActive())
+  RowDec("pixel repetition", HdmiAudioPixelRep())
+  RowFlag("scrambling", HdmiAudioScrambling(), "on", "off")
+
+  PutNl()
+  PutS("--- MEASURED, not asked: the frame counter ---") : PutNl()
+  RowHex("FRAME_COUNT now", HdmiAudioFrameCount())
+  mhz = HdmiAudioRefreshMilliHz(1000)
+  RowWant("refresh, milliHz", mhz, 60000)
+  If mhz = 0
+    PutS("  FRAME_COUNT DID NOT ADVANCE in a whole second.") : PutNl()
+    PutS("  Either the counter does not run, or it is not at the offset") : PutNl()
+    PutS("  the driver says. Audio rides in the blanking intervals of") : PutNl()
+    PutS("  these frames, so there is no point going further.") : PutNl()
+    ProcedureReturn
+  EndIf
+  px = HdmiAudioPixelClock(mhz)
+  RowWant("derived pixel clock", px, 148500000)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  What the sink says about itself. Needs only a monitor - no picture
+;  and no library above this one.
+; ----------------------------------------------------------------------
+Procedure ReportEdid()
+  Define n.i
+  Define i.i
+  Define rates.i
+  Dim name.a(20)
+
+  PutNl()
+  PutS("--- EDID ---") : PutNl()
+
+  If HdmiAudioEdidRead(0) = 0
+    PutS("  block 0 failed: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    RowHex("EDID status word", HdmiAudioEdidStatus())
+    ProcedureReturn
+  EndIf
+
+  n = HdmiAudioEdidName(@name(0), 20)
+  PutS("  monitor name            ")
+  If n > 0
+    PutS(@name(0))
+  Else
+    PutS("(no name descriptor)")
+  EndIf
+  PutNl()
+  RowDec("extension blocks", HdmiAudioEdidExtensions())
+
+  If HdmiAudioCeaRead() = 0
+    PutS("  CEA block: ") : PutS(HdmiAudioErrorText()) : PutNl()
+    ProcedureReturn
+  EndIf
+
+  RowFlag("basic audio", HdmiAudioBasicAudio(), "SUPPORTED", "not declared")
+  RowDec("short audio descriptors", HdmiAudioSadCount())
+
+  i = 0
+  While i < HdmiAudioSadCount()
+    PutS("    SAD ") : PutDec(i)
+    PutS(": format ") : PutDec(HdmiAudioSadFormat(i))
+    PutS(", ") : PutDec(HdmiAudioSadChannels(i)) : PutS(" channels, rates $")
+    PutHex(HdmiAudioSadRates(i), 2)
+    PutNl()
+    i = i + 1
+  Wend
+
+  ; The rate the tone program will use, asked of the sink directly.
+  ; 48000 and not 44100: hdmiaudio.pi4 refuses the 44.1 kHz family
+  ; because 128*44100/1000 truncates to 5644, which is not the multiple
+  ; of 128 that EXTERNAL_CTS_EN requires.
+  PutNl()
+  RowFlag("will it take 48 kHz PCM", HdmiAudioAcceptsPcm(48000), "YES", "NO")
+  RowFlag("will it take 32 kHz PCM", HdmiAudioAcceptsPcm(32000), "yes", "no")
+  RowFlag("will it take 96 kHz PCM", HdmiAudioAcceptsPcm(96000), "yes", "no")
+EndProcedure
+
+Procedure Main()
+  Define c0.i
+  Define c1.i
+  Define st.i
+
+  PutNl()
+  PutS("=== pi4HdmiAudioProbe - reads only, makes no sound ===") : PutNl()
+  PutNl()
+
+  ; The pure-arithmetic self-test first. It touches no register, so if
+  ; it fails there is a transcription error in the library and nothing
+  ; measured afterwards can be trusted to mean what it says.
+  st = HdmiAudioSelfTest()
+  If st <> 0
+    PutS("HdmiAudioSelfTest() FAILED at check ") : PutDec(st) : PutNl()
+    PutS("That is arithmetic, not hardware. Fix the library first.") : PutNl()
+    ProcedureReturn st
+  EndIf
+  PutS("HdmiAudioSelfTest() ... 0, all checks pass") : PutNl()
+  PutNl()
+
+  c0 = ProbePort(0)
+  PutNl()
+  c1 = ProbePort(1)
+
+  PutNl()
+  PutS("--- which socket is the cable in ---") : PutNl()
+  If c0 <> 0 And c1 <> 0
+    PutS("  BOTH ports report a sink. Two cables, or hotplug is stuck.") : PutNl()
+  EndIf
+  If c0 <> 0 And c1 = 0
+    PutS("  port 0 - the 4Kp60-capable one (vc4_hdmi.c:3343).") : PutNl()
+  EndIf
+  If c0 = 0 And c1 <> 0
+    PutS("  port 1 - the HDMI 1.4-capped one (vc4_hdmi.c:3372).") : PutNl()
+  EndIf
+  If c0 = 0 And c1 = 0
+    PutS("  NEITHER port reports a sink. If there is a picture on the") : PutNl()
+    PutS("  screen then the hotplug bit is not where we think it is.") : PutNl()
+  EndIf
+
+  ; Settle on the connected port for the detail. Port 0 if both, since
+  ; that is the one the video path is most likely driving.
+  If c0 <> 0
+    HdmiAudioInit(0)
+  Else
+    HdmiAudioInit(1)
+  EndIf
+  HdmiAudioProbe()
+
+  ReportMode()
+  ReportEdid()
+
+  PutNl()
+  PutS("=== end of probe ===") : PutNl()
+  PutS("Nothing above proves the 108 MHz audio clock is oscillating.") : PutNl()
+  PutS("Only the drain rate can, and that is pi4HdmiAudioTone.pi4.") : PutNl()
+  ProcedureReturn 0
+EndProcedure

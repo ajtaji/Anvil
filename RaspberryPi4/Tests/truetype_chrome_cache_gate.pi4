@@ -1,0 +1,191 @@
+; Emitted CPU-only cache test. The checker inserts exact production procedures
+; nvcTTCacheFind, nvcTTAddGlyph, nvcTTCacheClear, warm, reset and nvcFail.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_kern.pbi"
+XIncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+XIncludeFile "Anvil/Graphics/truetype_raster.pbi"
+XIncludeFile "Anvil/Graphics/truetype_slots.pbi"
+
+#NEON_VK_CHROME_OK = 0
+#NEON_VK_CHROME_ERR_STATE = -21202
+#NEON_VK_CHROME_ERR_CAPACITY = -21203
+#NEON_VK_CHROME_ERR_ATLAS = -21204
+#NEON_VK_CHROME_ERR_VULKAN = -21205
+#NEON_VK_CHROME_TT_CACHE_MAX = 512
+#NEON_VK_CHROME_TT_COVERAGE = 1048576
+#NEON_VK_CHROME_ATLAS_PAD = 64
+#VK_SUCCESS = 0
+#VK_ERROR_DEVICE_LOST = -4
+#TC_META = $0F000000
+#TC_BASE = $10000000
+#TC_MAGIC = $54534C54
+
+Global nvcReady.i=1, nvcInFrame.i, nvcError.i
+Global nvcTTDirty.i, nvcTTCacheHits.i, nvcTTCacheMisses.i
+Global nvcTTNextX.i=32, nvcTTNextY.i=1, nvcTTRowH.i, nvcTTCount.i
+Global nvcAtlasW.i=128, nvcAtlasH.i=64, nvcAtlasUploadMapped.i
+Global nvcStubUploadCount.i, nvcStubUploadFail.i
+Global Dim nvcTTSlot.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTGen.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTHeight.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTGlyph.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTX.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTY.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTW.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTH.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTBearingX.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTBearingY.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTAdvance.i[#NEON_VK_CHROME_TT_CACHE_MAX]
+Global Dim nvcTTCoverage.a[#NEON_VK_CHROME_TT_COVERAGE]
+Global Dim nvcTTDecoded.i[#NEON_VK_CHROME_TT_CACHE_MAX*8]
+Global Dim tcAtlas.a[32832]
+Global Dim tcSaved.l[4096]
+Global Dim tcTextA.a[2]
+Global Dim tcTextEmpty.a[1]
+Global Dim tcTextBad.a[2]
+Global tcChecks.i, tcFails.i, tcFirstFailure.i
+
+Procedure.i nvcAtlasUploadWarm()
+  nvcStubUploadCount+1
+  If nvcStubUploadFail<>0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+;@@NVC_CACHE_PROCS@@
+
+Procedure tcCheck(ok.i)
+  tcChecks+1
+  If ok=0
+    tcFails+1
+    If tcFirstFailure=0 : tcFirstFailure=tcChecks : EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i, glyph.i, generation.i, raster0.i, uploads.i, misses.i
+  Protected width.i, height.i, stride.i, bearingX.i, bearingY.i, advance.i
+  Protected entry0.i, entry1.i, entry2.i, entry3.i, x.i, y.i, row.i, col.i, savePos.i, sourcePos.i
+  nvcReady=1 : nvcInFrame=0 : nvcError=0
+  nvcAtlasW=128 : nvcAtlasH=64 : nvcTTNextX=32 : nvcTTNextY=1
+  nvcTTCount=0 : nvcTTDirty=0 : nvcTTCacheHits=0 : nvcTTCacheMisses=0
+  If PeekL(#TC_META)<>#TC_MAGIC : ProcedureReturn 90 : EndIf
+  bytes=PeekL(#TC_META+4)
+  If bytes<1 Or bytes>#ANVIL_TTS_MAX_BYTES : ProcedureReturn 91 : EndIf
+  nvcAtlasUploadMapped=@tcAtlas[0]
+  tcTextA[0]=73 : tcTextA[1]=0 ; ASCII I
+  tcTextEmpty[0]=0
+  tcTextBad[0]=$C0 : tcTextBad[1]=0
+  If AnvilTrueTypeSlotLoad(0,#TC_BASE,bytes)=0 : ProcedureReturn 92 : EndIf
+  If AnvilTrueTypeSlotSelect(0)=0 : ProcedureReturn 93 : EndIf
+  glyph=AnvilTrueTypeGlyphForCodepoint(73)
+  generation=AnvilTrueTypeSlotGeneration(0)
+  If glyph<1 Or generation<1 : ProcedureReturn 94 : EndIf
+
+  raster0=AnvilTrueTypeRasterCount()
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=1 And nvcTTCacheMisses=1 And nvcTTCacheHits=0)
+  tcCheck(AnvilTrueTypeRasterCount()=raster0+1 And nvcStubUploadCount=1 And nvcTTDirty=0)
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=1 And nvcTTCacheMisses=1 And nvcTTCacheHits=1)
+  tcCheck(AnvilTrueTypeRasterCount()=raster0+1 And nvcStubUploadCount=1)
+  tcCheck(NeonVkChromeWarmTrueTypeText(25,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=2 And nvcTTCacheMisses=2 And nvcStubUploadCount=2)
+
+  ; Slot identity is part of the key even when both slots borrow equal bytes.
+  If AnvilTrueTypeSlotLoad(1,#TC_BASE,bytes)=0 : ProcedureReturn 95 : EndIf
+  If AnvilTrueTypeSlotSelect(1)=0 : ProcedureReturn 96 : EndIf
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=3 And nvcTTCacheMisses=3 And nvcStubUploadCount=3)
+
+  ; Reusing the same slot and glyph after unload/reload must miss on generation.
+  If AnvilTrueTypeSlotDeselect()=0 : ProcedureReturn 97 : EndIf
+  If AnvilTrueTypeSlotUnload(0)=0 : ProcedureReturn 98 : EndIf
+  If AnvilTrueTypeSlotLoad(0,#TC_BASE,bytes)=0 : ProcedureReturn 99 : EndIf
+  If AnvilTrueTypeSlotSelect(0)=0 : ProcedureReturn 100 : EndIf
+  tcCheck(AnvilTrueTypeSlotGeneration(0)>generation)
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=4 And nvcTTCacheMisses=4 And nvcStubUploadCount=4)
+
+  ; A UTF-8 empty run is a successful zero; malformed input refuses cleanly.
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextEmpty[0])=0)
+  uploads=nvcStubUploadCount : misses=nvcTTCacheMisses
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextBad[0])=#NEON_VK_CHROME_ERR_ATLAS)
+  tcCheck(nvcTTCount=4 And nvcTTCacheMisses=misses And nvcStubUploadCount=uploads)
+
+  ; Full-cache miss refuses before rasterization or publishing a partial row.
+  nvcTTCount=#NEON_VK_CHROME_TT_CACHE_MAX
+  tcTextA[0]=66 ; B has no matching cached key
+  raster0=AnvilTrueTypeRasterCount() : uploads=nvcStubUploadCount : misses=nvcTTCacheMisses
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=#NEON_VK_CHROME_ERR_CAPACITY)
+  tcCheck(nvcTTCount=#NEON_VK_CHROME_TT_CACHE_MAX And nvcTTCacheMisses=misses)
+  tcCheck(AnvilTrueTypeRasterCount()=raster0 And nvcStubUploadCount=uploads)
+
+  ; Reset refuses inside a frame, succeeds between frames, then the next warm
+  ; inserts and uploads its glyph set once; a repeated warm stays a cache hit.
+  nvcInFrame=1
+  tcCheck(NeonVkChromeTTCacheReset()=#NEON_VK_CHROME_ERR_STATE)
+  tcCheck(nvcTTCount=#NEON_VK_CHROME_TT_CACHE_MAX)
+  nvcInFrame=0
+  tcCheck(NeonVkChromeTTCacheReset()=#NEON_VK_CHROME_OK)
+  tcCheck(nvcTTCount=0 And nvcTTDirty=1 And nvcStubUploadCount=uploads)
+  tcTextA[0]=73 : raster0=AnvilTrueTypeRasterCount()
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=1 And nvcTTDirty=0 And nvcStubUploadCount=uploads+1)
+  tcCheck(AnvilTrueTypeRasterCount()=raster0+1)
+  tcCheck(NeonVkChromeWarmTrueTypeText(24,@tcTextA[0])=1)
+  tcCheck(nvcTTCount=1 And nvcStubUploadCount=uploads+1 And nvcTTCacheHits=2)
+
+  ; A narrow shelf forces one wrap after two identical glyph allocations.
+  ; Two more allocations must stay on that new shelf and preserve old pixels.
+  If NeonVkChromeTTCacheReset()<>#NEON_VK_CHROME_OK : ProcedureReturn 101 : EndIf
+  glyph=AnvilTrueTypeGlyphForCodepoint(73)
+  If AnvilTrueTypeRasterizeGlyph(glyph,24,@nvcTTCoverage[0],#NEON_VK_CHROME_TT_COVERAGE,@width,@height,@stride,@bearingX,@bearingY,@advance)=0
+    ProcedureReturn 102
+  EndIf
+  If width<1 Or height<1 Or stride<width Or width+2<1 : ProcedureReturn 103 : EndIf
+  nvcAtlasW=32+2*(width+2) : nvcAtlasH=64
+  nvcTTNextX=32 : nvcTTNextY=1 : nvcTTRowH=0 : nvcTTCount=0
+  entry0=nvcTTAddGlyph(0,generation,24,glyph)
+  entry1=nvcTTAddGlyph(0,generation,24,glyph)
+  If entry0<>0 Or entry1<>1 : ProcedureReturn 104 : EndIf
+  If nvcTTNextX<>nvcAtlasW Or nvcTTNextY<>1 : ProcedureReturn 105 : EndIf
+  savePos=0
+  For row=0 To height-1
+    For col=0 To width-1
+      sourcePos=#NEON_VK_CHROME_ATLAS_PAD+(((nvcTTY[entry0]+row)*nvcAtlasW+nvcTTX[entry0]+col)*4)
+      tcSaved[savePos]=PeekL(nvcAtlasUploadMapped+sourcePos) : savePos+1
+      sourcePos=#NEON_VK_CHROME_ATLAS_PAD+(((nvcTTY[entry1]+row)*nvcAtlasW+nvcTTX[entry1]+col)*4)
+      tcSaved[savePos]=PeekL(nvcAtlasUploadMapped+sourcePos) : savePos+1
+    Next
+  Next
+  entry2=nvcTTAddGlyph(0,generation,24,glyph)
+  If entry2<>2 : ProcedureReturn 106 : EndIf
+  tcCheck(nvcTTY[entry2]>nvcTTY[entry1])
+  tcCheck(nvcTTNextY=nvcTTY[entry2]-1)
+  entry3=nvcTTAddGlyph(0,generation,24,glyph)
+  If entry3<>3 : ProcedureReturn 107 : EndIf
+  tcCheck(nvcTTY[entry3]=nvcTTY[entry2])
+  tcCheck(nvcTTX[entry3]+nvcTTW[entry3]<=nvcAtlasW-1)
+  tcCheck(nvcTTY[entry3]+nvcTTH[entry3]<=nvcAtlasH-1)
+  ; All four allocated rectangles must be disjoint.
+  For x=0 To 3
+    For y=x+1 To 3
+      tcCheck(nvcTTX[x]+nvcTTW[x]<=nvcTTX[y] Or nvcTTX[y]+nvcTTW[y]<=nvcTTX[x] Or nvcTTY[x]+nvcTTH[x]<=nvcTTY[y] Or nvcTTY[y]+nvcTTH[y]<=nvcTTY[x])
+    Next
+  Next
+  savePos=0
+  For row=0 To height-1
+    For col=0 To width-1
+      sourcePos=#NEON_VK_CHROME_ATLAS_PAD+(((nvcTTY[entry0]+row)*nvcAtlasW+nvcTTX[entry0]+col)*4)
+      tcCheck(PeekL(nvcAtlasUploadMapped+sourcePos)=tcSaved[savePos]) : savePos+1
+      sourcePos=#NEON_VK_CHROME_ATLAS_PAD+(((nvcTTY[entry1]+row)*nvcAtlasW+nvcTTX[entry1]+col)*4)
+      tcCheck(PeekL(nvcAtlasUploadMapped+sourcePos)=tcSaved[savePos]) : savePos+1
+    Next
+  Next
+
+  If tcFails<>0 : ProcedureReturn tcFirstFailure : EndIf
+  ProcedureReturn 0
+EndProcedure

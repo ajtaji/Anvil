@@ -1,0 +1,1220 @@
+; pi4V3dClear.pi4 - stage 3a of the V3D bring-up. DID THE BINNER AND
+;                   THE RENDERER RUN, AND ARE ALL 4096 PIXELS RIGHT?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM PROVES, AND WHAT IT REFUSES TO CLAIM
+; ======================================================================
+;
+;  pi4V3dIdent answered "is the block there". pi4V3dTfu answered "does
+;  it move bytes" - three jobs, 768 bytes verified. pi4V3dCsd answered
+;  "does a QPU execute a program we wrote" - sixteen lanes, sixteen
+;  distinct values, verified byte for byte.
+;
+;  NONE OF THEM TOUCHED THE GRAPHICS PIPELINE. The TFU is a
+;  fixed-function tiler in the hub; the CSD is a compute dispatcher
+;  that needs no control list, no binner, no tile state and no
+;  rasteriser. This program is the first thing here that submits a
+;  CONTROL LIST, and it submits two: a bin list that bins nothing and
+;  a render list that clears a tile and stores it.
+;
+;  IT RENDERS INTO A 64 x 64 BUFFER IN PLAIN DRAM AND NOT INTO THE
+;  FRAMEBUFFER, and that is the whole design of the test.
+;
+;    A wrong control list aimed at a live 1920x1080 HDMI surface gives
+;    a corrupted screen and no information at all - no address, no
+;    count, no way to tell "nothing ran" from "everything ran and
+;    stored to the wrong place". A 64x64 target is 4096 words the CPU
+;    reads one at a time.
+;
+;    AND 64 x 64 IS NOT AN ARBITRARY SMALL NUMBER. It is EXACTLY ONE
+;    TILE. One 32-bpp render target with no MSAA and no double-buffer
+;    selects tile-size index 0, which is 64 x 64
+;    (Reference/mesa-24.3.4_v3d_util.c:122-130 and :172-191). So
+;    draw_tiles_x, draw_tiles_y, the supertile width, the supertile
+;    height and the frame size in supertiles are all 1, and every
+;    piece of tile arithmetic in the library collapses to the
+;    identity. If this fails, it is not the tile arithmetic - and
+;    knowing that in advance is worth more than a bigger test.
+;
+;  THE PASS CRITERION IS 4096 PIXELS AND A COUNT, NOT A HEX DUMP.
+;  Every word must equal the clear colour, no word may still hold
+;  poison, and the page after the target - which is deliberately NOT
+;  mapped into the V3D page table - must be untouched. A dump of the
+;  first sixteen words would look identical for a render that filled
+;  the buffer and one that filled sixteen words, which is exactly the
+;  mistake this project keeps refusing to make.
+;
+; ======================================================================
+;  THE CLEAR COLOUR, AND WHY IT HAS FOUR DIFFERENT BYTES
+; ======================================================================
+;
+;  $44332211. R = $11, G = $22, B = $33, A = $44.
+;
+;  A colour like white or black proves the clear happened. Four
+;  distinct bytes prove the CHANNEL ORDER as well, in the same read,
+;  and that matters because there are two independent places it could
+;  come out reversed: the clear value is packed as R8G8B8A8 into the
+;  tile buffer (v3dx_draw.c:1733-1736, `util_pack_color(...,
+;  PIPE_FORMAT_R8G8B8A8_UNORM, ...)`), and the store has an R/B swap
+;  bit of its own (v3d_packet.xml:401) that this program leaves clear.
+;  If the bytes come back as $44112233 the swap bit is set somewhere;
+;  if they come back reversed end to end the endianness assumption is
+;  wrong. Both are one-glance diagnoses with this value and invisible
+;  with grey.
+;
+;  It is also not $A5A5A5A5, so "wrote nothing" stays distinguishable
+;  from "wrote the wrong thing", and not zero, so "wrote nothing but
+;  zeroed it" is a third distinguishable answer.
+;
+; ======================================================================
+;  WHAT IS IN THE TWO LISTS, AND WHY THAT SUBSET
+; ======================================================================
+;
+;  Read v3d.pi4's STAGE 3 header for the full argument. In one
+;  paragraph: this is not a subset somebody chose, it is the packet
+;  sequence Mesa itself submits for glClear() on a fresh framebuffer
+;  with no draw calls after it. v3d_clear calls v3d_tlb_clear
+;  (v3dx_draw.c:1671-1791), which calls v3d_start_draw and adds no
+;  geometry; v3d_job_submit then emits the render list and caps the
+;  bin list with a single FLUSH. Six packets in the bin list, twenty
+;  or so in the render list, nine in the generic tile list, and each
+;  one carries the Mesa line that emits it in a comment beside its
+;  encoder.
+;
+;  THE BINNER HAS TO RUN EVEN THOUGH IT BINS NOTHING. The render
+;  list's BRANCH_TO_IMPLICIT_TILE_LIST (v3dx_rcl.c:347) branches into
+;  a per-tile command list that only the PTB produces. With no
+;  primitives that list is empty, but it has to EXIST. That is why
+;  this program submits two jobs and waits twice, and why
+;  V3dRenderSubmit() refuses if CLE_BFC has not moved.
+;
+; ======================================================================
+;  CACHE COHERENCY - THE REGIME, STATED
+; ======================================================================
+;
+;  THIS PROBE RUNS WITH THE ARM MMU OFF, deliberately, exactly as
+;  pi4V3dTfu.pi4 and pi4V3dCsd.pi4 do. It does not include mmu.pi4 and
+;  never calls MmuEnable(), so every ARM access is Device-nGnRnE and
+;  there is no ARM-side coherency question to have. A wrong pixel
+;  means a wrong pixel.
+;
+;  THE GPU'S OWN CACHES ARE A DIFFERENT QUESTION AND STAGE 2 GOT IT
+;  WRONG ONCE. A TMU write sits in the core's write combiner and L2T
+;  until something cleans it; the first CSD run completed cleanly and
+;  left every poison word in place for exactly that reason.
+;
+;  THE TILE-BUFFER STORE IS A DIFFERENT WRITE PATH AND IT IS
+;  DOCUMENTED. v3d_drm.h:143-149: "The TLB writes are guaranteed to
+;  have been flushed by the time the render done IRQ happens... Any
+;  dirtying of cachelines by the job (only possible using TMU writes)
+;  must be flushed by the caller". Nothing here does a TMU write. So
+;  the clean should not be needed - and V3dRenderWait() does it anyway
+;  because FLM_CLEAN cannot lose data and the guarantee is worded
+;  against the IRQ while this file polls RFC. The clean's result is
+;  printed so the run says whether it ran and whether it mattered.
+;
+; ======================================================================
+;  RUNNING IT
+; ======================================================================
+;
+;    pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dIdent.pi4 -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o _work\v3dident.img
+;    pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dClear.pi4 -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o _work\v3dclear.img
+;
+;  `deadman 15` then `run <stage>`, always, where <stage> is the
+;  address `map` prints - above whatever the monitor turned out to
+;  be, and not a constant any more.
+;
+;  DRIVE IT WITH A LONG FIXED CAPTURE. tools/anvil.py run grabs four
+;  seconds per command and silently loses the tail of a long probe,
+;  which reads exactly like a hang. This one prints two full control
+;  lists in hex; use a 25-second capture.
+;
+;  RESET THE BOARD AFTERWARDS, BEFORE ANY NON-V3D WORK. Measured on
+;  2026-08-27: running a V3D probe disturbs the EMMC clock, and the
+;  next payload fails at "the firmware would not report the EMMC
+;  clock" until the board is power-cycled. Bench fact, not theory.
+;
+; ======================================================================
+;  WHAT THE BOARD HAS TO ANSWER
+; ======================================================================
+;
+;    the lists encoded              `bin list OK` and `render list OK`
+;    the binner ran                 `BFC after` differs from before
+;    the renderer ran               `RFC after` differs from before
+;    THE PIXELS ARE RIGHT           `verdict: OK` and x0 = 4096
+;    nothing was left behind        `poison words 0`
+;    nothing overran the target     `guard words touched 0`
+;
+;  A BIN_TIMEOUT with MMU_CTL clean and OUTOMEM clear is a binner that
+;  never started - look at CT0CA against CT0EA, both printed: if CT0CA
+;  never left the base the CLE did not fetch, and if it stopped in the
+;  middle a packet in the list is malformed.
+;  A BIN_TIMEOUT with OUTOMEM set is the pool, and the pool size is
+;  printed beside the computed minimum.
+;  A RENDER_TIMEOUT after a clean bin is the render list, and CT1CA
+;  names the packet it stopped on.
+;  A RENDER that COMPLETES and leaves poison is the store, and it is
+;  the same shape of failure the CSD hit - read the clean result and
+;  the store packet's bytes in the dump.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Identity-mapped through the V3D MMU: VA equals PA,
+;  which is what pi4V3dTfu.pi4 and pi4V3dCsd.pi4 did and for the same
+;  reason - an address printed in a failure is then an address a
+;  reader can compare against this list with no translation step.
+;
+;  The page table covers VA $000000..$FFFFFF - 4096 entries, 16 KB -
+;  and every page in it is INVALID until mapped. Page 0 is never
+;  mapped, so a register that was never written faults instead of
+;  pointing at something real.
+;
+;  THE GUARD PAGE AT $65C000 IS DELIBERATELY NOT MAPPED. It sits
+;  immediately after the target. If the store overruns the surface,
+;  the write faults and MMU_VIO_ADDR names it, AND the CPU sees the
+;  poison intact - two independent witnesses to the same mistake.
+; ----------------------------------------------------------------------
+#CLR_PT        = $640000    ; V3D page table
+#CLR_PT_BYTES  = 16384      ; 4096 entries
+#CLR_ILLEGAL   = $648000    ; MMU illegal-address page
+#CLR_BCL       = $650000    ; the bin control list
+#CLR_TILELIST  = $651000    ; the generic tile list
+#CLR_RCL       = $652000    ; the render control list
+#CLR_TSTATE    = $653000    ; the tile state buffer
+; THE ENCODER CORPUS AND ITS TINY TWIN. Neither is ever submitted and
+; NEITHER IS MAPPED INTO THE V3D PAGE TABLE, on purpose: they exist
+; only so that the CPU can read back packets the render path never
+; produces, and a buffer the GPU can reach is a buffer the GPU can be
+; pointed at by mistake. See THE ENCODER CORPUS below for why it is
+; here at all.
+#CLR_CORPUS    = $654000
+#CLR_TINY      = $655000
+; THE REFUSAL CASES GET THEIR OWN PAGE AND THAT IS NOT TIDINESS.
+; They were sharing #CLR_CORPUS and each one that was ACCEPTED - the
+; deliberate "one below the limit must work" halves - rebuilt the list
+; over the top of the corpus, so by the time anything read $654000 it
+; held the last accepted case and thirteen bytes of it at that. The
+; gate decoded that as a packet stream and stopped on a byte of a
+; leftover address. Found by the gate, which is what it is for.
+#CLR_SCRATCH   = $656000
+#CLR_TARGET    = $658000    ; 64 x 64 x 4 = 16384 bytes
+#CLR_GUARD     = $65C000    ; NOT mapped. See above.
+#CLR_TALLOC    = $660000    ; the binner's tile allocation pool
+#CLR_OVERFLOW  = $700000    ; the OOM overflow pool
+#CLR_PAGE      = 4096
+
+#CLR_BCL_BYTES     = 4096
+#CLR_TL_BYTES      = 4096
+#CLR_RCL_BYTES     = 4096
+#CLR_TSTATE_BYTES  = 4096
+#CLR_TARGET_BYTES  = 16384
+#CLR_GUARD_BYTES   = 4096
+#CLR_CORPUS_BYTES  = 4096
+#CLR_SCRATCH_BYTES = 4096
+; DELIBERATELY SMALL, AND 300 IS NOT A ROUND NUMBER BY ACCIDENT. The
+; CLE readahead is 256 bytes, so a 300-byte buffer has 44 usable and
+; the corpus below overruns it. That is the only way to reach
+; V3dClFinish()'s readahead refusal at all: the real lists are a
+; hundred bytes in four-kilobyte pages and the check can never fire
+; there. A guard nothing crosses is a guard nothing tests.
+#CLR_TINY_BYTES    = 300
+; 0x84000 = 540672, comfortably above the 536576 that
+; V3dTileAllocBytesFor(1,1,1) computes. Printed and checked at run
+; time rather than trusted.
+#CLR_TALLOC_BYTES  = $84000
+; The kernel's own overflow chunk size, v3d_irq.c:43.
+#CLR_OVERFLOW_BYTES = 262144
+
+#CLR_W      = 64
+#CLR_H      = 64
+#CLR_BPP    = 4
+#CLR_STRIDE = 256           ; 64 pixels x 4 bytes. A BYTE stride - see
+                            ; V3dClStoreTileBufferGeneral()'s comment
+                            ; about the TFU's opposite convention.
+#CLR_PIXELS = 4096
+
+; R=$11 G=$22 B=$33 A=$44 in a little-endian word. See the header.
+#CLR_COLOR  = $44332211
+
+#CLR_POISON = $A5A5A5A5     ; the guard word memory.pi4:1223 uses
+
+; 1.0f. There is no depth buffer, so this is written into
+; ZS_CLEAR_VALUES and never read; it is 1.0 rather than 0 because that
+; is the value a depth clear would want and a zero here would be a
+; trap for whoever adds one.
+#CLR_ZCLEAR = $3F800000
+
+; 100 ms each, the kernel's own order of magnitude for a V3D wait
+; (wait_for(..., 100) throughout v3d_gem.c).
+#CLR_WAIT_US = 100000
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA and not PeekB. PeekB names the SIGNED .b and sign-extends,
+    ; so a byte above 127 would come back negative and this loop would
+    ; never see its terminator.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+; 28 wide, for pi4V3dTfu.pi4's reason: a 24-wide column printed its
+; longest label hard against the value with no space at all.
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The error codes, spelled out. A number alone sends the reader back
+;  to the library to look it up, and one run should be enough.
+; ----------------------------------------------------------------------
+Procedure PutErrName(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_BRIDGE_LEGACY
+      PutS("BRIDGE_LEGACY - $FE00A020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_BRIDGE_RPIVID
+      PutS("BRIDGE_RPIVID - $FEC11020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_PM_DEAD
+      PutS("PM_DEAD - PM_GRAFX read all-ones. PM base is wrong.")
+    Case #V3D_ERR_RESET
+      PutS("RESET - V3DRSTN did not stick. Password or offset.")
+    Case #V3D_ERR_ASB_MASTER
+      PutS("ASB_MASTER - master bridge ACK never cleared.")
+    Case #V3D_ERR_ASB_SLAVE
+      PutS("ASB_SLAVE - slave bridge ACK never cleared.")
+    Case #V3D_ERR_IDENT_ZERO
+      PutS("IDENT_ZERO - present but dark. Clock or reset.")
+    Case #V3D_ERR_IDENT_ONES
+      PutS("IDENT_ONES - nothing answers there. Mapping.")
+    Case #V3D_ERR_IDENT_VERSION
+      PutS("IDENT_VERSION - answering, and not V3D 4.2.")
+    Case #V3D_ERR_IDENT_CORES
+      PutS("IDENT_CORES - V3D 4.2, but NCORES is not 1.")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - stage 3 asked for before V3dInit() passed.")
+    Case #V3D_ERR_MMU_ABSENT
+      PutS("MMU_ABSENT - HUB_IDENT2.WITH_MMU is clear.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough.")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - a page is outside the table or is page 0.")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - TLB clear or MMUC flush never finished.")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - the V3D MMU is not on. No page table.")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page table walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_CACHE_TIMEOUT
+      PutS("CACHE_TIMEOUT - TMUWCF or the L2T clean never finished.")
+    Case #V3D_ERR_CL_ARGS
+      PutS("CL_ARGS - a packet field or a buffer will not do.")
+    Case #V3D_ERR_CL_FULL
+      PutS("CL_FULL - the list ran out of room, readahead included.")
+    Case #V3D_ERR_CL_NOBUF
+      PutS("CL_NOBUF - a packet was emitted with no list open.")
+    Case #V3D_ERR_BIN_TIMEOUT
+      PutS("BIN_TIMEOUT - CLE_BFC never moved. The binner did not finish.")
+    Case #V3D_ERR_BIN_OOM
+      PutS("BIN_OOM - the binner ran out of tile allocation pool.")
+    Case #V3D_ERR_RENDER_TIMEOUT
+      PutS("RENDER_TIMEOUT - CLE_RFC never moved.")
+    Case #V3D_ERR_JOB_BUSY
+      PutS("JOB_BUSY - the render was offered before the bin completed.")
+    Default
+      PutS("unknown code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DumpCl - a control list as bytes, sixteen to a line.
+;
+;  PRINTED IN FULL, BOTH LISTS, EVERY RUN. It is the only evidence
+;  that survives a hang: if the board stops in V3dBinWait() the lists
+;  are already on the wire, and a reader can decode them against
+;  v3d_packet.xml by hand. It is also what a gate compares against,
+;  and what makes a claim about "what the lists contain" checkable by
+;  somebody who was not here.
+; ----------------------------------------------------------------------
+Procedure DumpCl(base.i, len.i)
+  Define i.i
+  i = 0
+  While i < len
+    If (i % 16) = 0
+      PutS("  ")
+      PutHex(base + i, 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekA(base + i), 2)
+    If (i % 16) = 15
+      PutNl()
+    EndIf
+    i = i + 1
+  Wend
+  If (len % 16) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+Procedure DumpWords(base.i, words.i)
+  Define i.i
+  i = 0
+  While i < words
+    If (i % 4) = 0
+      PutS("  ")
+      PutHex(base + (i * 4), 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekN(base + (i * 4)), 8)
+    If (i % 4) = 3
+      PutNl()
+    EndIf
+    i = i + 1
+  Wend
+  If (words % 4) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE ENCODER CORPUS
+; ======================================================================
+;
+;  WHY A CORPUS EXISTS AT ALL WHEN THE PROGRAM ALREADY BUILDS TWO REAL
+;  LISTS, AND IT IS THE MUTATION TESTING THAT PUT IT HERE.
+;
+;    a64_v3d_rcl_check.py --mutate injects one deliberate fault into
+;    v3d.pi4 at a time and requires the gate to go red for each. Three
+;    survived the first run and all three had the same shape:
+;
+;      * `(stride & $F) << 28` narrowed to `& 7` - INVISIBLE, because
+;        the only stride the clear uses is 256 and its low nibble is
+;        zero either way.
+;      * TILE_COORDINATES's row field shifted by 16 instead of 12 -
+;        INVISIBLE, because every TILE_COORDINATES the render path
+;        emits is (0, 0), which encodes the same at any shift.
+;      * V3dClFinish()'s readahead refusal deleted - INVISIBLE,
+;        because the real lists are a hundred bytes in four-kilobyte
+;        pages and the check can never fire.
+;
+;    That is stage 2's lesson arriving again in a different file: A
+;    GUARD IS ONLY PINNED DOWN BY A CASE ON EACH SIDE OF IT, and a
+;    field is only pinned down by a value whose bits are not all zero.
+;    The QPU assembler answered it with a corpus - 156 entries printed
+;    and compared - and this is the same answer.
+;
+;  EVERY VALUE BELOW IS CHOSEN SO THAT A WRONG SHIFT MOVES IT.
+;  Where a field is n bits wide the value has bits set near BOTH ends
+;  of it and differs from its neighbours, so a field that borrowed a
+;  bit from the one beside it, or landed one nibble over, comes back
+;  as a different number rather than as the same zero.
+;
+;  NOTHING HERE IS SUBMITTED. The corpus list is built in a page the
+;  V3D MMU does not map and no register is ever pointed at it.
+; ----------------------------------------------------------------------
+
+Procedure.i BuildCorpus()
+  ; Twelve-bit fields, both non-zero and different from each other, so
+  ; a row shifted by 16 rather than 12 cannot come back right.
+  V3dClTileCoordinates(4095, 2731)
+  ; Eight-bit fields, likewise.
+  V3dClSupertileCoordinates(255, 170)
+  ; THE STRIDE IS $ABCDE: every nibble different and the low one
+  ; non-zero, which is what makes the twenty-bit field's split across
+  ; the 32-bit boundary at bit 28 observable. A LINEARTILE store to
+  ; render target 1 with R/B swap and clear-after-store set, so five
+  ; more fields that the clear path leaves at zero are non-zero here.
+  ; UIF_XOR is 5, the LARGEST memory format the enum has, and it is
+  ; chosen for that: LINEARTILE is 1 and fits in two bits, so a memory
+  ; format field narrowed from three bits to two would encode it
+  ; correctly and the mutation would survive. It did, on the first run.
+  V3dClStoreTileBufferGeneral(1, $12345670, #V3D_OFMT_BGR565, #V3D_MEMFMT_UIF_XOR, $ABCDE, 1, 1)
+  ; A 1920x1080 four-target 128-bpp frame. The minus_one fields are
+  ; then 1919, 1079 and 3, none of which is a fixed point of the
+  ; encoding, and the two block-size fields differ from each other.
+  V3dClTileBinningModeCfg(1920, 1080, 4, 2, 1, 2)
+  ; Early-Z NOT disabled and a non-zero internal depth type, which is
+  ; the opposite of every value the clear path uses.
+  V3dClTrmcCommon(1920, 1080, 4, 2, 0, 3)
+  V3dClTrmcColor(2, 10, 3)
+  V3dClTrmcClearColor1(7, $12345678, $ABCDEF)
+  V3dClTrmcZsClear($3F800000, $5A)
+  V3dClMulticoreSupertileCfg(3, 5, 30, 17, 4000, 3000, 4)
+  ; A 64-byte-aligned address with bits set well above the field's
+  ; base, and a non-zero set number in the low nibble underneath it.
+  V3dClMulticoreTileListSetBase($01234C00, 9)
+  ; A 32-byte-aligned record address and seventeen attribute arrays,
+  ; which is not a power of two and fills the five-bit field oddly.
+  V3dClGlShaderState($02468A00, 17)
+  V3dClVertexArrayPrims(#V3D_PRIM_TRIANGLES, 3, 7)
+  V3dClClipWindow(11, 22, 33, 44)
+  V3dClVcmCacheSize(3, 12)
+  V3dClTileListInitialBlockSize(1, 2)
+  V3dClNumberOfLayers(200)
+  V3dClPrimListFormat(#V3D_PLF_LINES, 1)
+  V3dClBranchToImplicitTileList(200)
+  V3dClSetInstanceId($DEADBEEF)
+  V3dClStartAddressOfGenericTileList($11112220, $33334440)
+  V3dClCfgBits(V3dCfgBitsWord(1, 1, 1, 5))
+  V3dClClipperXyScaling($44000000, $45000000)
+  V3dClClipperZScaleOffset($3F000000, $BF800000)
+  V3dClClipperZMinMax($00000000, $3F800000)
+  V3dClViewportOffset($001234, 200, $005678, 300)
+  V3dClSampleState($1234, 15)
+  V3dClPointSize($40000000)
+  V3dClLineWidth($40400000)
+  V3dClOcclusionQueryCounter($07654320)
+  V3dClBranch($0ABCDEF0)
+  V3dClClearTileBuffers(1, 0)
+  ProcedureReturn V3dClFinish()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE REFUSALS. Each case is one crafted argument that cannot be
+;  encoded, and each must come back #V3D_ERR_CL_ARGS or
+;  #V3D_ERR_CL_FULL rather than a truncated packet.
+;
+;  A TRUNCATED PACKET IS THE FAILURE THIS EXISTS TO PREVENT. Masking a
+;  too-large field produces a control list the hardware accepts and
+;  that draws the wrong thing, with no status bit anywhere that says
+;  so. Every one of these is a value a caller could plausibly compute -
+;  a tile column from a frame one tile too wide, a shader record from
+;  an allocator with the wrong alignment.
+; ----------------------------------------------------------------------
+Global refuseCount.i = 0
+Global refuseWrong.i = -1
+
+Procedure CheckRefusal(idx.i, got.i, want.i)
+  If got = want
+    refuseCount = refuseCount + 1
+  Else
+    If refuseWrong < 0
+      refuseWrong = idx
+    EndIf
+  EndIf
+  PutS("    case ")
+  PutDec(idx)
+  PutS(": ")
+  PutErrName(got)
+  PutNl()
+EndProcedure
+
+Procedure.i RunRefusals()
+  Define r.i
+
+  refuseCount = 0
+  refuseWrong = -1
+
+  ; 0. A tile column one past the twelve-bit field.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClTileCoordinates(4096, 0)
+  CheckRefusal(0, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 1. And the value one BELOW it must be ACCEPTED. Without this the
+  ;    refusal above is satisfied by a check that refuses everything.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClTileCoordinates(4095, 4095)
+  CheckRefusal(1, V3dClFinish(), #V3D_OK)
+
+  ; 2. A shader state record that is not 32-byte aligned.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClGlShaderState($02468A10, 1)
+  CheckRefusal(2, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 3. The same address made legal, for case 1's reason.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClGlShaderState($02468A20, 1)
+  CheckRefusal(3, V3dClFinish(), #V3D_OK)
+
+  ; 4. A tile list base that is not 64-byte aligned.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClMulticoreTileListSetBase($01234C20, 0)
+  CheckRefusal(4, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 5. A store stride past the twenty-bit field.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClStoreTileBufferGeneral(0, $10000, #V3D_OFMT_RGBA8, #V3D_MEMFMT_RASTER, $100000, 0, 0)
+  CheckRefusal(5, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 6. And one bit below it accepted.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClStoreTileBufferGeneral(0, $10000, #V3D_OFMT_RGBA8, #V3D_MEMFMT_RASTER, $FFFFF, 0, 0)
+  CheckRefusal(6, V3dClFinish(), #V3D_OK)
+
+  ; 7. THE READAHEAD. A 300-byte buffer has 44 usable bytes after the
+  ;    256 the CLE reads past the end, and the corpus is far longer.
+  V3dClBegin(#CLR_TINY, #CLR_TINY_BYTES)
+  r = BuildCorpus()
+  CheckRefusal(7, r, #V3D_ERR_CL_FULL)
+
+  ; 8. A buffer smaller than the readahead cannot hold any list at all
+  ;    and must be refused at V3dClBegin() rather than at Finish.
+  CheckRefusal(8, V3dClBegin(#CLR_TINY, 256), #V3D_ERR_CL_ARGS)
+
+  ; 9. Zero workgroups of layers - the minus_one field cannot express
+  ;    it and 256 layers would encode as zero at the other end.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClNumberOfLayers(257)
+  CheckRefusal(9, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 10. A supertile of zero tiles. minus_one again, from below.
+  V3dClBegin(#CLR_SCRATCH, #CLR_SCRATCH_BYTES)
+  V3dClMulticoreSupertileCfg(0, 1, 1, 1, 1, 1, 1)
+  CheckRefusal(10, V3dClFinish(), #V3D_ERR_CL_ARGS)
+
+  ; 11. A geometry the tile arithmetic cannot express.
+  CheckRefusal(11, V3dRenderBegin(0, 64, #V3D_OFMT_RGBA8), #V3D_ERR_CL_ARGS)
+
+  ; 12. An output format with no row in the internal-type table.
+  CheckRefusal(12, V3dRenderBegin(64, 64, 63), #V3D_ERR_CL_ARGS)
+
+  ProcedureReturn refuseCount
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+
+Global okCount.i     = 0
+Global poisonCount.i = 0
+Global otherCount.i  = 0
+Global firstBadIdx.i = -1
+Global firstBadVal.i = 0
+Global guardTouched.i = 0
+
+; ----------------------------------------------------------------------
+;  VerifyTarget - all 4096 words, sorted into three buckets.
+;
+;  THREE BUCKETS AND NOT A PASS/FAIL, because the three mean three
+;  different things and the difference is the whole diagnosis:
+;    still poison  - the renderer did not write that pixel at all
+;    the colour    - it did, and correctly
+;    anything else - it wrote, and the value is wrong, which is a
+;                    format or a swap or a clear-value problem and not
+;                    a control-list problem
+;
+;  Returns the number of correct words.
+; ----------------------------------------------------------------------
+Procedure.i VerifyTarget()
+  Define i.i
+  Define got.i
+
+  okCount     = 0
+  poisonCount = 0
+  otherCount  = 0
+  firstBadIdx = -1
+  firstBadVal = 0
+
+  i = 0
+  While i < #CLR_PIXELS
+    got = PeekN(#CLR_TARGET + (i * 4))
+    If got = #CLR_COLOR
+      okCount = okCount + 1
+    Else
+      If got = #CLR_POISON
+        poisonCount = poisonCount + 1
+      Else
+        otherCount = otherCount + 1
+      EndIf
+      If firstBadIdx < 0
+        firstBadIdx = i
+        firstBadVal = got
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+
+  ProcedureReturn okCount
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  VerifyGuard - the unmapped page after the target must be untouched.
+;
+;  A store whose stride or height was wrong by one row would pass the
+;  4096-word check on the words it did reach and scribble past the
+;  end. Without this "the target is right" would mean "the target is
+;  right AND nothing else was examined".
+; ----------------------------------------------------------------------
+Procedure.i VerifyGuard()
+  Define i.i
+  Define n.i
+  guardTouched = 0
+  i = 0
+  n = #CLR_GUARD_BYTES / 4
+  While i < n
+    If PeekN(#CLR_GUARD + (i * 4)) <> #CLR_POISON
+      guardTouched = guardTouched + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn guardTouched
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PixelAt - the word at (x, y), by the stride the store was given.
+;
+;  Deliberately computed from #CLR_STRIDE and not from #CLR_W, so that
+;  a coordinate check is testing the same arithmetic the hardware was
+;  handed rather than a second private copy of it.
+; ----------------------------------------------------------------------
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(#CLR_TARGET + (y * #CLR_STRIDE) + (x * 4))
+EndProcedure
+
+Procedure CheckPixel(*label, x.i, y.i)
+  Define v.i
+  v = PixelAt(x, y)
+  PutS("  ")
+  PutPad(*label, 20)
+  PutS("(")
+  PutDec(x)
+  PutS(",")
+  PutDec(y)
+  PutS(") = $")
+  PutHex(v, 8)
+  If v = #CLR_COLOR
+    PutS("  ok")
+  Else
+    PutS("  WRONG")
+  EndIf
+  PutNl()
+EndProcedure
+
+; ======================================================================
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define ok.i
+  Define pages.i
+  Define va.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 3a - the binner and the renderer, 64x64 ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. Stage 0 first, and it is a precondition and not a formality.
+  ;     Nothing below may run against a block that has not identified
+  ;     itself: the CLE is a bus master and V3D 7.1 puts different
+  ;     registers at these offsets.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0, from v3d.pi4: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    RowHex("HUB_IDENT1", V3dIdent1())
+    PutNl()
+    PutS("verdict: STAGE0")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("HUB_IDENT1", V3dIdent1())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. THE ENCODER CORPUS AND THE REFUSALS.
+  ;
+  ;     FIRST, BEFORE ANY JOB STATE EXISTS, for two reasons. The
+  ;     refusal cases call V3dRenderBegin() with arguments that must be
+  ;     rejected, and a rejected V3dRenderBegin() clears the geometry -
+  ;     so running them after the real one would silently unbuild the
+  ;     frame. And a corpus printed before the first submission is
+  ;     still on the wire if the board stops later.
+  ;
+  ;     NEITHER BUFFER IS MAPPED INTO THE V3D PAGE TABLE. Nothing here
+  ;     is submitted and nothing here should be reachable by the GPU.
+  ; ------------------------------------------------------------------
+  r = V3dClBegin(#CLR_CORPUS, #CLR_CORPUS_BYTES)
+  If r = #V3D_OK
+    r = BuildCorpus()
+  EndIf
+  PutS("1   the encoder corpus: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: CORPUS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("corpus bytes", V3dClLen())
+  DumpCl(#CLR_CORPUS, V3dClLen())
+  PutNl()
+  PutS("    the refusals:")
+  PutNl()
+  n = RunRefusals()
+  RowDec("refusal cases correct", n)
+  RowDec("first wrong case", refuseWrong)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. The geometry. Printed BEFORE anything is built, because every
+  ;     number below is derived from it and a wrong tile count is the
+  ;     failure that looks most like a wrong control list.
+  ; ------------------------------------------------------------------
+  r = V3dRenderBegin(#CLR_W, #CLR_H, #V3D_OFMT_RGBA8)
+  PutS("2   the frame: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: GEOMETRY")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("width", #CLR_W)
+  RowDec("height", #CLR_H)
+  RowDec("tile width", V3dTileW())
+  RowDec("tile height", V3dTileH())
+  RowDec("tiles across", V3dTilesX())
+  RowDec("tiles down", V3dTilesY())
+  RowDec("supertile w in tiles", V3dSupertileW())
+  RowDec("supertile h in tiles", V3dSupertileH())
+  RowDec("frame w in supertiles", V3dFrameStW())
+  RowDec("frame h in supertiles", V3dFrameStH())
+  RowDec("RT internal type", V3dRtInternalType())
+  RowDec("RT internal bpp", V3dRtInternalBpp())
+  RowDec("RT clamp", V3dRtClamp())
+  RowDec("tile alloc needed", V3dTileAllocNeeded())
+  RowDec("tile alloc given", #CLR_TALLOC_BYTES)
+  RowDec("tile state needed", V3dTileStateNeeded())
+  RowDec("tile state given", #CLR_TSTATE_BYTES)
+  PutNl()
+
+  r = V3dRenderTarget(#CLR_TARGET, #CLR_TARGET_BYTES, #V3D_MEMFMT_RASTER, #CLR_STRIDE, 0)
+  If r <> #V3D_OK
+    PutS("    the render target: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dRenderClear(#CLR_COLOR, #CLR_ZCLEAR, 0)
+  r = V3dRenderPool(#CLR_TALLOC, #CLR_TALLOC_BYTES, #CLR_TSTATE, #CLR_TSTATE_BYTES)
+  If r <> #V3D_OK
+    PutS("    the pools: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dBinOverflow(#CLR_OVERFLOW, #CLR_OVERFLOW_BYTES)
+  If r <> #V3D_OK
+    PutS("    the overflow pool: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  3. POISON THE TARGET AND THE GUARD PAGE.
+  ;
+  ;     Poisoning the whole target and not only checking for the
+  ;     colour is what makes "wrote nothing", "wrote zeros" and "wrote
+  ;     part of it" three distinguishable answers instead of one.
+  ;     Poisoning the tile allocation pool as well is worth the
+  ;     milliseconds: it means the binner's own output can be seen to
+  ;     be non-empty in the dump, which distinguishes "the binner ran
+  ;     and wrote a tile list" from "BFC moved and nothing happened".
+  ; ------------------------------------------------------------------
+  i = 0
+  n = #CLR_TARGET_BYTES / 4
+  While i < n
+    PokeN(#CLR_TARGET + (i * 4), #CLR_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = #CLR_GUARD_BYTES / 4
+  While i < n
+    PokeN(#CLR_GUARD + (i * 4), #CLR_POISON)
+    i = i + 1
+  Wend
+  i = 0
+  n = 4096 / 4
+  While i < n
+    PokeN(#CLR_TALLOC + (i * 4), #CLR_POISON)
+    PokeN(#CLR_TSTATE + (i * 4), #CLR_POISON)
+    i = i + 1
+  Wend
+
+  PutS("3   the buffers:")
+  PutNl()
+  RowHex("bin control list", #CLR_BCL)
+  RowHex("generic tile list", #CLR_TILELIST)
+  RowHex("render control list", #CLR_RCL)
+  RowHex("tile state", #CLR_TSTATE)
+  RowHex("tile allocation pool", #CLR_TALLOC)
+  RowHex("overflow pool", #CLR_OVERFLOW)
+  RowHex("target", #CLR_TARGET)
+  RowHex("guard (NOT mapped)", #CLR_GUARD)
+  RowHex("clear colour", #CLR_COLOR)
+  RowHex("poison", #CLR_POISON)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4. The V3D MMU. Every address the CLE, the PTB and the TLB touch
+  ;     is virtual.
+  ; ------------------------------------------------------------------
+  PutS("4   the V3D MMU: ")
+  r = V3dMmuInit(#CLR_PT, #CLR_PT_BYTES, #CLR_ILLEGAL)
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    RowHex("MMU_CTL", V3dMmuCtlNow())
+    PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dMmuMap(#CLR_BCL, #CLR_BCL, #CLR_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_TILELIST, #CLR_TILELIST, #CLR_TL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_RCL, #CLR_RCL, #CLR_RCL_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_TSTATE, #CLR_TSTATE, #CLR_TSTATE_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_TARGET, #CLR_TARGET, #CLR_TARGET_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_TALLOC, #CLR_TALLOC, #CLR_TALLOC_BYTES)
+  EndIf
+  If r = #V3D_OK
+    r = V3dMmuMap(#CLR_OVERFLOW, #CLR_OVERFLOW, #CLR_OVERFLOW_BYTES)
+  EndIf
+  If r <> #V3D_OK
+    PutS("    mapping: ")
+    PutErrName(r)
+    PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("MMU_CTL", V3dMmuCtlNow())
+  ; The guard page must NOT be in the table. Checked rather than
+  ; assumed, because the whole overrun test rests on it.
+  RowHex("PTE for the guard page", V3dMmuEntry(#CLR_GUARD))
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  5. THE BIN LIST. Six packets and no primitives.
+  ; ------------------------------------------------------------------
+  r = V3dBclBegin(#CLR_BCL, #CLR_BCL_BYTES)
+  If r = #V3D_OK
+    r = V3dBclFinish()
+  EndIf
+  PutS("5   bin list: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("start", V3dBclStartAddr())
+  RowHex("end", V3dBclEndAddr())
+  RowDec("bytes", V3dBclBytes())
+  DumpCl(V3dBclStartAddr(), V3dBclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  6. THE GENERIC TILE LIST AND THE RENDER LIST.
+  ; ------------------------------------------------------------------
+  r = V3dRclBuild(#CLR_TILELIST, #CLR_TL_BYTES, #CLR_RCL, #CLR_RCL_BYTES)
+  PutS("6   render list: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RCL")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("tile list start", V3dTileListStartAddr())
+  RowHex("tile list end", V3dTileListEndAddr())
+  RowDec("tile list bytes", V3dTileListBytes())
+  DumpCl(V3dTileListStartAddr(), V3dTileListBytes())
+  RowHex("render list start", V3dRclStartAddr())
+  RowHex("render list end", V3dRclEndAddr())
+  RowDec("render list bytes", V3dRclBytes())
+  DumpCl(V3dRclStartAddr(), V3dRclBytes())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE BINNER.
+  ; ------------------------------------------------------------------
+  r = V3dBinSubmit()
+  PutS("7   bin submit: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: BIN_SUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dBinWait(#CLR_WAIT_US)
+  PutS("    bin wait: ")
+  PutErrName(r)
+  PutNl()
+  RowHex("CLE_BFC before", V3dBinBfcBefore())
+  RowHex("CLE_BFC after", V3dBinBfcAfter())
+  RowDec("spins", V3dBinSpins())
+  RowDec("OOM events", V3dBinOomCount())
+  RowHex("CLE_CT0CS", V3dBinCt0cs())
+  RowHex("CLE_CT0CA", V3dBinCt0ca())
+  RowHex("CLE_CT0EA", V3dBinCt0ea())
+  RowHex("CLE_PCS", V3dBinPcs())
+  RowHex("PTB_BPCA", V3dBinBpca())
+  RowHex("PTB_BPCS", V3dBinBpcs())
+  RowHex("CTL_INT_STS", V3dBinIntSts())
+  RowHex("CORE ERR_STAT", V3dBinErrStat())
+  RowHex("MMU_CTL", V3dBinMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dBinVioAddr())
+  RowHex("MMU_VIO_ID", V3dBinVioId())
+  PutNl()
+  ; THE BINNER'S OWN OUTPUT. The first thirty-two words of the tile
+  ; allocation pool were poisoned before submission, so anything other
+  ; than $A5A5A5A5 here is the PTB's tile list - which is the only
+  ; direct evidence that the binner did work rather than merely
+  ; incrementing a counter.
+  PutS("    the tile allocation pool, first 32 words:")
+  PutNl()
+  DumpWords(#CLR_TALLOC, 32)
+  PutS("    the tile state buffer, first 16 words:")
+  PutNl()
+  DumpWords(#CLR_TSTATE, 16)
+  PutNl()
+
+  If r <> #V3D_OK
+    PutS("verdict: BIN")
+    PutNl()
+    PutS("=== THE BINNER DID NOT FINISH, SO NO RENDER WAS SUBMITTED ===")
+    PutNl()
+    PutS("CT0CA against CT0EA says how far the CLE got. Equal to the")
+    PutNl()
+    PutS("base means it never fetched; between means a packet in the")
+    PutNl()
+    PutS("bin list above is malformed and the dump names its offset.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  8. THE RENDERER.
+  ; ------------------------------------------------------------------
+  r = V3dRenderSubmit()
+  PutS("8   render submit: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: RENDER_SUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dRenderWait(#CLR_WAIT_US)
+  PutS("    render wait: ")
+  PutErrName(r)
+  PutNl()
+  RowHex("CLE_RFC before", V3dRenderRfcBefore())
+  RowHex("CLE_RFC after", V3dRenderRfcAfter())
+  RowDec("spins", V3dRenderSpins())
+  RowDec("cache clean result", V3dRenderCleanResult())
+  RowDec("cache clean spins", V3dCleanSpins())
+  RowHex("CLE_CT1CS", V3dRenderCt1cs())
+  RowHex("CLE_CT1CA", V3dRenderCt1ca())
+  RowHex("CLE_CT1EA", V3dRenderCt1ea())
+  RowHex("CLE_PCS", V3dRenderPcs())
+  RowHex("CTL_INT_STS", V3dRenderIntSts())
+  RowHex("CORE ERR_STAT", V3dRenderErrStat())
+  RowHex("MMU_CTL", V3dRenderMmuCtl())
+  RowHex("MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowHex("MMU_VIO_ID", V3dRenderVioId())
+  ; Printed and NOT believed. Stage 1 saw both read zero on a run
+  ; where translation demonstrably happened.
+  RowDec("MMU hits (NOT TRUSTED)", V3dMmuHitsNow())
+  RowDec("MMU misses (NOT TRUSTED)", V3dMmuMissesNow())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  9. THE PIXELS. Printed and counted whether or not the wait
+  ;     succeeded, because a timeout with the right pixels in memory
+  ;     would be the single most useful thing this program could
+  ;     discover and stopping early would hide it.
+  ; ------------------------------------------------------------------
+  PutS("9   the first sixteen words of the target:")
+  PutNl()
+  DumpWords(#CLR_TARGET, 16)
+  PutS("    the last four words of the target:")
+  PutNl()
+  DumpWords(#CLR_TARGET + #CLR_TARGET_BYTES - 16, 4)
+  PutNl()
+
+  ok = VerifyTarget()
+  VerifyGuard()
+
+  RowDec("pixels total", #CLR_PIXELS)
+  RowDec("pixels correct", ok)
+  RowDec("pixels still poison", poisonCount)
+  RowDec("pixels some other value", otherCount)
+  RowDec("guard words touched", guardTouched)
+  If firstBadIdx >= 0
+    RowDec("first wrong pixel index", firstBadIdx)
+    RowHex("  its value", firstBadVal)
+  EndIf
+  PutNl()
+
+  ; THE COORDINATES, NAMED. A count alone cannot distinguish a target
+  ; filled in the right order from one filled transposed, and the
+  ; corners are where a stride mistake shows first.
+  PutS("    named coordinates:")
+  PutNl()
+  CheckPixel("top left", 0, 0)
+  CheckPixel("top right", 63, 0)
+  CheckPixel("bottom left", 0, 63)
+  CheckPixel("bottom right", 63, 63)
+  CheckPixel("centre", 32, 32)
+  CheckPixel("row 1 col 0", 0, 1)
+  PutNl()
+
+  If r <> #V3D_OK
+    PutS("verdict: RENDER_UNVERIFIED")
+    PutNl()
+    PutS("=== THE RENDER DID NOT COMPLETE ===")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  If ok <> #CLR_PIXELS
+    PutS("verdict: PIXELS")
+    PutNl()
+    PutS("=== THE RENDER COMPLETED AND THE PIXELS ARE WRONG ===")
+    PutNl()
+    If poisonCount = #CLR_PIXELS
+      PutS("Every word is still poison: nothing was stored at all.")
+      PutNl()
+      PutS("Read the clean result above, then the store packet in the")
+      PutNl()
+      PutS("tile list dump - buffer, format, memory format, stride.")
+      PutNl()
+    EndIf
+    If otherCount = #CLR_PIXELS
+      PutS("Every word was written and every one is wrong: that is the")
+      PutNl()
+      PutS("clear value or the channel order, not the control list.")
+      PutNl()
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  If guardTouched <> 0
+    PutS("verdict: OVERRUN")
+    PutNl()
+    PutS("=== ALL 4096 PIXELS ARE RIGHT AND THE STORE WENT PAST THEM ===")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("verdict: OK")
+  PutNl()
+  PutS("=== THE GPU BINNED, RENDERED, CLEARED AND STORED 4096 PIXELS ===")
+  PutNl()
+  ProcedureReturn #CLR_PIXELS
+EndProcedure

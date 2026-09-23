@@ -1,0 +1,1924 @@
+; ======================================================================
+; math.pi4 - the desktop BASIC maths functions, in 32-bit binary float,
+;            ON THE RASPBERRY PI 4
+; ----------------------------------------------------------------------
+;
+;     EnableFloatingPoint                       ; REQUIRED - see below
+;     XIncludeFile "RaspberryPi4/Lib/math.pi4"
+;
+;     Procedure Main()
+;       Protected h.f
+;       h = Sqr(25.0)                           ; 5.0
+;       h = Sin(Radian(30.0))                   ; 0.5
+;       h = ATan2(1.0, 1.0)                     ; 0.7853982  (45 degrees)
+;       h = Pow(2.0, 10.0)                      ; 1024.0
+;     EndProcedure
+;
+; Sqr Pow Sin Cos Tan ATan2 Log Exp Int Degree Radian Sign, plus the four
+; special-value helpers NaN Infinity IsNaN IsInfinity that the domain
+; answers below are stated in terms of.
+;
+; ======================================================================
+; 2026-08-26: THE PREMISE OF THIS FILE CHANGED. READ THIS BEFORE THE
+;             SECTION BELOW IT, WHICH IS NOW PARTLY HISTORY.
+; ======================================================================
+; THE BACKEND LEARNED HARDWARE FLOATING POINT. `a.f * b.f` now compiles
+; to one `fmul s0, s0, s1` on the Cortex-A72's FPU. The refusal this
+; whole library was written around is gone, and the section immediately
+; below - "THIS TARGET HAS NO FLOATING-POINT ARITHMETIC" - describes the
+; world as it was until that day. It is kept, not deleted, because it is
+; the argument for why the software core exists and that argument is
+; still load-bearing for the paragraph after next.
+;
+; WHAT HAS *NOT* HAPPENED YET, so nobody assumes it has: the bodies below
+; still call MathFAdd, MathFMul and the rest rather than using operators.
+; They are correct and they still build; they are simply slower than they
+; need to be now. Converting them is the mechanical change the next
+; section describes, and it is a separate piece of work from making
+; floats work at all.
+;
+; ======================================================================
+; > DO NOT DELETE THE *B CORE. IT IS NOW A TEST ORACLE.
+; ======================================================================
+; The next section says that the day the backend learns `.f`, everything
+; under THE SOFT BINARY32 CORE should be deleted. THAT INSTRUCTION IS NOW
+; HALF WRONG, and the half that is wrong matters more than the half that
+; is right.
+;
+; Still right: the `.f`-facing WRAPPERS (MathFAdd, MathFSub, MathFMul,
+; MathFDiv, MathFLt and the rest) and the call sites in the polynomials
+; should go back to plain operators.
+;
+; NOW WRONG: the bit-pattern core underneath them - MathFAddB, MathFMulB,
+; MathFDivB, MathFCmpB, MathFRound, MathFFromIntB, MathFToIntB - MUST
+; STAY. It is correctly rounded, it takes and returns raw patterns as
+; integers, and it therefore contains no `.f` at all, which makes it an
+; INDEPENDENT IMPLEMENTATION of the same specification that the hardware
+; now implements. That is what
+; RaspberryPi4/Examples/Diagnostics/pi4FpGate.pi4 checks the silicon
+; against, on the board, bit for bit, over signed zeros, subnormals,
+; infinities, NaNs, ties to even and a random sweep.
+;
+; Deleting the reference implementation in the same change that
+; introduces the thing it is meant to check is how a project ends up
+; unable to tell which of the two halves is wrong. The core costs some
+; ROM in a program that includes this file and nothing at all in one that
+; does not.
+;
+; ONE BUG WAS FOUND IN THAT CORE while the gate was being written, before
+; any hardware ran: MathFFromIntB(-9223372036854775808) did not return a
+; wrong number, it HUNG - see the long note at that procedure. Fixed the
+; same day. It is the clearest possible argument for keeping the oracle
+; and for writing down what should happen before measuring what does.
+;
+; ======================================================================
+; READ THIS SECOND: WHY THIS FILE IS NOT A COPY OF ANY OTHER MATH
+; LIBRARY HERE. THIS DESCRIBES THE TARGET AS IT WAS BEFORE 2026-08-26.
+; ======================================================================
+; The Pi 4 backend refuses every floating-point IR node. Measured on
+; 2026-08-25 on the shipped pmfc.exe, one line per probe:
+;
+;     a.f + b.f     A64 ASSEMBLER FATAL: floating-point IR reached the
+;     a.f - b.f     Raspberry Pi 4 phase-1 emitter; .f is not
+;     a.f * b.f     implemented yet
+;     a.f / b.f
+;     If a.f < b.f  ... the same message. Even the COMPARISON.
+;     r.f = n.l     ... and the CONVERSIONS, both directions. This is
+;     r.l = f.f     why MathFFromInt and MathFToInt exist below: `nf = n`
+;                   in the RP2350 source is an I2F node and does not
+;                   build here either.
+;
+; So `h = Sqr(3.0 * 3.0 + 4.0 * 4.0)`, the first line of the RP2350
+; file's own usage example, does not build on this part. The example at
+; the top of this file passes 25.0 instead, and that difference is the
+; whole subject of this header.
+;
+; WHAT IS *NOT* REFUSED, and it is what makes this file possible: .f
+; STORAGE. A .f local, a .f parameter, a .f array element, a .f return
+; value and a fractional LITERAL all compile and all hold correct
+; IEEE-754 binary32. Probed: storing 2.5 and -1.0 into a `Dim F.f[]` and
+; reading the bytes back gives $40200000 and $BF800000, at a stride of
+; four bytes, which is exactly right. The type exists. Only the ALU for
+; it is missing.
+;
+; SO EVERY ARITHMETIC OPERATION IN THIS FILE IS DONE IN INTEGERS, on the
+; bit pattern, by the MathF* core below - a software binary32 written in
+; ordinary 64-bit integer code. The public API is unchanged: you pass
+; .f, you get .f, and the function names, argument order and domain
+; answers are the desktop BASIC's exactly as in the file this was ported
+; from. What changed is one layer underneath, where
+;
+;     r = x - nf * 0.693359375
+;
+; became
+;
+;     r = MathFSub(x, MathFMul(nf, 0.693359375))
+;
+; and nothing else. The polynomials, the range reductions, the split
+; constants and the domain table are the RP2350 file's, unaltered.
+;
+; ======================================================================
+; THE SOFT CORE IS A STOPGAP AND SHOULD BE DELETED, NOT MAINTAINED
+; ======================================================================
+; This is worth being blunt about, because a library carrying its own
+; floating-point runtime is a smell and it should not be allowed to
+; become the norm. FLOAT LOWERING BELONGS IN THE EMITTER. On the RP2040
+; and RP2350 it lives in the compiler's ARM float helpers, where the
+; register allocator and the width analysis can see it; on this target
+; it does not exist yet, and putting the whole desktop maths surface out
+; of reach until it does was the worse of the two available answers.
+;
+; THE DAY THE BACKEND LEARNS .f, THE CHANGE HERE IS MECHANICAL AND THE
+; FILE GETS SHORTER:
+;
+;   1. Delete everything under THE SOFT BINARY32 CORE except FloatBits
+;      and FloatFromBits, which are public API and stay.
+;   2. Rewrite each call back into an operator - MathFAdd(a, b) -> a + b,
+;      MathFMul -> *, MathFSub -> -, MathFDiv -> /, MathFLt(a,b) ->
+;      a < b, and so on. Every call site is one of those six shapes and
+;      nothing else.
+;   3. Re-measure. The answers should not move: the core below is
+;      CORRECTLY ROUNDED (see PROVEN), so it computes the same binary32
+;      an IEEE-754 unit would.
+;
+; Nothing else in this file knows the core exists. That is the point of
+; keeping it behind the .f-facing wrappers instead of open-coding bit
+; patterns through the polynomials.
+;
+; THE FILE NEXT DOOR TOOK THE OPPOSITE DECISION, and both are defensible,
+; so the difference is recorded rather than smoothed over.
+; string_f32.pi4 hit the same wall and did NOT write StrF/ValF: it ships
+; the integer helpers, refuses by not defining the two routines, and says
+; the build error naming them is the correct outcome. That is the right
+; call THERE, because a number formatter has no correct answer to give
+; and a plausible wrong one is the worst possible failure in an
+; instrument. It is the wrong call HERE, because Sqr and Sin DO have
+; correct answers that integer arithmetic can produce, and a maths
+; library that refuses every function is not a library.
+;
+; WORTH KNOWING IF YOU ARE FINISHING string_f32.pi4: MathFAdd, MathFSub,
+; MathFMul, MathFDiv, MathFFromInt, MathFToInt and the five relational
+; wrappers below are public and correctly rounded, and StrF/ValF can be
+; written on them today. That would make string_f32.pi4 depend on this
+; file, which the house rule forbids a LIBRARY from arranging for itself
+; - the MAIN file has to list both - so it is a decision for whoever owns
+; that file, not something to be done from this one.
+;
+; WHAT IT COSTS TODAY, counted rather than guessed - instructions
+; actually executed in the interpreter, with the 832-instruction program
+; prologue subtracted:
+;
+;     one MathFMul(3.0, 7.0)      1751 instructions
+;     one Sqr(25.0)              17354 instructions
+;
+; against ONE `fmul s` and ONE `fsqrt s` on the silicon. Roughly three
+; orders of magnitude, and a large part of it is the call overhead of
+; going through MathBitsOf/MathFromBits on every operand - which is the
+; price of keeping the core behind an .f-shaped door so that it can be
+; deleted cleanly later.
+;
+; IN ROM: a program with none of this is 104 bytes; including this file
+; takes it to 28376, and calling Sqr as well to 28428. READ THE SECOND
+; NUMBER CAREFULLY - the include costs the whole library whether you call
+; one function or all of them, because this backend does not dead-strip
+; unreferenced procedures. On a part with gigabytes that is a different
+; kind of number than it was on a Pico, but it is still worth knowing.
+;
+; This is not a fast maths library and it is not pretending to be; it is
+; a correct one on a part whose float unit the compiler cannot yet reach.
+;
+; ======================================================================
+; REQUIRES
+; ======================================================================
+;   EnableFloatingPoint, in YOUR file, ABOVE the XIncludeFile line.
+;
+;   Includes no other file (house rule: a library never includes a
+;   library - the MAIN file lists them). It needs none.
+;
+;   The pragma is not optional and the error you get without it does not
+;   say so at first glance. This file contains about ninety fractional
+;   literals. Without the pragma each one is typed as Q32.32 FIXED-POINT
+;   - that is the default - and the build stops with a message about a
+;   .f that names a line INSIDE THIS LIBRARY and mentions nothing you
+;   wrote. Measured on this target: the message is "Using a .f float
+;   requires EnableFloatingPoint", pointing at math.pi4.
+;
+;   .fx, .d and .dec are refused outright on this target as well, so a
+;   missing pragma here is even more likely to produce a complaint about
+;   a type you never asked for.
+;
+;   NO SYMBOL IN THIS FILE COLLIDES with anything else in
+;   RaspberryPi4/Lib. Checked mechanically: every Procedure name, every #
+;   constant and every file-level Global across all nineteen .pi4 files
+;   present on 2026-08-25, diffed - zero collisions in all three
+;   categories. The internals are all Math*-prefixed; the public names
+;   are the desktop BASIC's; this file declares no file-level global.
+;
+;   That check matters more here than usual because this backend gives
+;   every PROCEDURE LOCAL a static BSS symbol named `<procedure>_<local>`
+;   - `sqr_y`, `exp_nf`, `mathfround_mm`. Two files defining a procedure
+;   of the same name would therefore collide in their locals as well as
+;   their entry points. The directory is being added to by other hands,
+;   so repeat the check if you add a file.
+;
+; ======================================================================
+; WHY THIS IS A SEPARATE FILE AND NOT PART OF A WIRING LIBRARY
+; ======================================================================
+; Everything here is binary32 and needs EnableFloatingPoint, and on this
+; target it also drags in a software float runtime. A blink sketch that
+; only wanted constrain() should not pay for either.
+;
+; It is also a different NAMESPACE with different rules. These are the
+; desktop BASIC's names and the desktop BASIC's exact semantics, argument
+; order included - ATan2 takes x FIRST, which is the reverse of the C
+; function of the same name and is the single most likely thing to be
+; got wrong here.
+;
+; ======================================================================
+; Abs IS DELIBERATELY ABSENT
+; ======================================================================
+; Identifiers fold case, so an Abs(x.f) here would collide with the
+; abs(v.i) that the wiring libraries define, for one function that is two
+; lines to write inline:
+;
+;     If v < 0.0 : v = 0.0 - v : EndIf
+;
+; ... except that on THIS target those two lines do not compile either,
+; because they are a float comparison and a float subtraction. Write
+;
+;     If MathFLt(v, 0.0) = 1 : v = MathFSub(0.0, v) : EndIf
+;
+; or, better, `v = MathFAbs(v)`, which is below and is exact: it clears
+; one bit and touches nothing else.
+;
+; ======================================================================
+; SINGLE PRECISION ONLY, AND WHAT THAT COSTS YOU
+; ======================================================================
+; The desktop BASIC computes these in DOUBLE and offers a .d overload.
+; This language has .f and no .d on this target, so every function is
+; binary32 in and binary32 out. binary32 carries about 7 significant
+; decimal digits. A result that agrees with the desktop to 7 digits is
+; agreeing as closely as the type can.
+;
+; Where a function CANNOT match the desktop it is written down here and
+; in that function's own comment, never left to be discovered:
+;
+;   Int()    returns a 32-bit value; the desktop returns the machine's
+;            native integer. Magnitudes above 2147483647 saturate here.
+;            NOTE that .i on THIS target is 64-bit and could hold the
+;            wider answer - Int() still returns .l and still saturates
+;            at the 32-bit bound, deliberately, because changing the
+;            range of a documented function during a port is how a
+;            program that moved between two chips starts disagreeing
+;            with itself. MathFToInt() below is the unclamped 64-bit
+;            spelling for anyone who wants the wider answer here.
+;   Sin Cos  refuse an argument beyond 12867 radians instead of returning
+;   Tan      a plausible number. The desktop keeps answering; its answers
+;            out there are wrong too, just quietly. See TRIG below.
+;   Pow      for a non-integer exponent is exp(y*log(x)) and carries that
+;            composition's error. An INTEGER exponent up to +/-64 takes a
+;            repeated-squaring path instead. A NEGATIVE base is refused
+;            past that bound - see Pow().
+;
+; ======================================================================
+; DOMAIN ERRORS - EVERY ONE HAS A DEFINED, DOCUMENTED ANSWER
+; ======================================================================
+; These match the desktop BASIC, which was RUN to establish them rather
+; than read out of a manual, and every row below was RE-RUN on this
+; target - see PROVEN:
+;
+;     Sqr(-1)          NaN            Log(0)        -Infinity
+;     Sqr(-0.0)        -0.0           Log(-1)       NaN
+;     Sqr(+Inf)        +Infinity      Log(+Inf)     +Infinity
+;     Exp(1000)        +Infinity      Exp(-1000)    0.0
+;     Pow(0, 0)        1.0            Pow(0, -1)    +Infinity
+;     Pow(-2, 3)       -8.0           Pow(-2, 0.5)  NaN
+;     Pow(x, 0)        1.0 always     ATan2(0, 0)   0.0
+;     Sign(NaN)        0              anything(NaN) NaN
+;
+; The two places this file DIFFERS from the desktop, both deliberate and
+; both inherited from the RP2350 file rather than introduced here:
+;
+;   Int(NaN) is 0. The desktop returns the CPU's "integer indefinite"
+;   (-9223372036854775808), which is a plausible-looking number that is
+;   not an answer. 0 is not an answer either, but it is not a number
+;   anyone will mistake for one.
+;
+;   Sin/Cos/Tan return NaN beyond 12867 radians. See TRIG.
+;
+; ======================================================================
+; TRIG: THE RANGE LIMIT IS A REFUSAL, AND IT IS THE POINT
+; ======================================================================
+; Reducing an angle modulo pi/2 is where a float trig function actually
+; goes wrong. pi/2 is carried here in THREE pieces so that each product
+; n*piece is exact:
+;
+;     A = 1.5703125                    = 201 * 2^-7,  8 significant bits
+;     B = 0.0004837512969970703125     11 significant bits
+;     C = 0.0000000754979012640433     the remainder
+;
+; n*A stays exact while 201*|n| < 2^24 and n*B while 2029*|n| < 2^24. The
+; second is the binding one: |n| < 8267, i.e. |x| < about 12986 radians.
+; Past that the reduction quietly loses bits and the error grows with no
+; outward sign at all, so beyond 12867 radians (2048 whole turns) these
+; return NaN. A NaN propagates and can be tested for; a sine that is
+; wrong in the fourth digit cannot.
+;
+; If you are accumulating an angle in a loop, wrap it as you go rather
+; than letting it grow.
+;
+; ======================================================================
+; NO FILE-LEVEL GLOBALS - AND WHAT THAT DOES *NOT* BUY ON THIS BACKEND
+; ======================================================================
+; Every value lives in a Protected local, as in the file this came from.
+; THE RP2350 FILE GOES ON TO CLAIM THAT THIS MAKES THESE FUNCTIONS
+; REENTRANT, so a square root can be taken inside an interrupt handler
+; while the foreground is inside one. THAT CLAIM IS FALSE HERE AND IS
+; WITHDRAWN RATHER THAN CARRIED OVER.
+;
+; Measured, by reading the emitted symbol table: this backend gives every
+; parameter and every Protected local a FIXED STATIC ADDRESS in BSS -
+; `sqr_y`, `mathfround_mm`, `exp_nf` and the rest are all real symbols in
+; the .sym file - and the only thing that goes on the stack is x30. A
+; Protected local here IS a global; it merely has a name nobody else can
+; spell.
+;
+; Recursion is a LOUD refusal and not a wrong answer: the frontend stops
+; with "Recursion is not supported on this backend... it does not crash,
+; it returns a plausible wrong number", confirmed on a two-line probe.
+; Nothing in this file recurses. But DO NOT CALL THESE FROM AN INTERRUPT
+; HANDLER while the foreground may be inside one; nothing checks it and
+; the result is a wrong number in both. That is a property of the
+; backend, not of this file, and it applies to every .pi4 library here.
+;
+; ======================================================================
+; PROVEN - 2026-08-25
+; ======================================================================
+; Builds clean for -t pi4 (--load-addr 0x200000, -S), and then EXECUTED
+; in the project's own A64 interpreter, tools/a64/a64_interp.py.
+;
+; THE SOFT CORE IS CORRECTLY ROUNDED, and that is asserted rather than
+; hoped for. 1700 operand pairs - 400 of them every combination of
+; twenty special patterns (+/-0, +/-Inf, +/-NaN, the smallest and
+; largest subnormals, the smallest and largest normals, 1.0, pi, ...),
+; 600 uniformly random 32-bit patterns, 300 pairs with exponents within
+; three of each other where cancellation is worst, and 400 subnormal-
+; heavy - run through add, subtract, multiply, divide, compare, integer-
+; to-float and float-to-integer and compared against numpy's float32:
+;
+;     11900 assertions, 0 failures, 15218554 interpreter steps.
+;
+; Every result is BIT-IDENTICAL to the IEEE-754 answer, subnormals and
+; signed zeros included. NaN payloads are canonicalised before comparing,
+; which is the one thing not promised. Random patterns alone would not
+; have been enough: the pairs with near-equal exponents are the ones
+; that exercise the cancellation path in MathFAddB, and the subnormal-
+; heavy sets are the only ones that reach the gradual-underflow loop in
+; MathFRound at all.
+;
+; THE FUNCTIONS THEMSELVES were then checked two ways at once, which is
+; the part that matters:
+;
+;   1. AGAINST A MODEL OF THE SAME ALGORITHM. A Python transcription of
+;      each function, doing the identical sequence of float32 operations
+;      in the identical order, must produce the IDENTICAL BIT PATTERN.
+;      This is what proves the TRANSLITERATION - that MathFSub(a, b)
+;      landed where `a - b` was and not where `b - a` was, that no
+;      operand pair got swapped, that no Horner step went missing. A
+;      single misplaced call shows up as a wrong bit pattern immediately,
+;      on almost every argument, which is why this and not the ULP figure
+;      is the check that actually guards the port.
+;
+;        1465 bit-identity assertions, 0 failures, 46559256 steps.
+;
+;      Per function, and every set includes +/-0, +/-Infinity, NaN, the
+;      smallest and largest subnormals, the smallest and largest normals
+;      and +/-pi as well as the random arguments:
+;
+;        Sqr 169   Exp 165   Log 168   Sin 164   Cos 161   Tan 124
+;        ATan2 131 pairs     Pow 154 pairs       Int 99
+;        Degree 42   Radian 43   Sign 15   IsNaN 15   IsInfinity 15
+;
+;   2. AGAINST THE TRUE VALUE, in ULP, using the host's double-precision
+;      library as the reference.
+;
+; ----------------------------------------------------------------------
+;  MEASURED ACCURACY ON THIS TARGET - worst-case ULP against the true
+;  value, over exactly the arguments above. Produced by the gate; NOT
+;  copied from the RP2350 file, whose figures are close but not the same
+;  and which measured a different argument set.
+; ----------------------------------------------------------------------
+;      Sqr      0.75 ULP    1e-30 .. 1e+30, log-uniform
+;      Exp      1.00 ULP    -87 <= x <= 88
+;      Log      1.02 ULP    1e-30 .. 1e+30, log-uniform
+;      Sin      1.12 ULP    |x| <= 6.3
+;      Cos      1.05 ULP    |x| <= 6.3
+;      Tan      1.54 ULP    |x| <= 1.4, excluding |cos x| < 0.01
+;      ATan2    1.98 ULP    magnitudes to 1e6, all four quadrants
+;      Pow      6.06 ULP    whole-number exponent, |y| <= 20
+;               39.99 ULP   general path, base 0.01..50, |y| <= 20
+;
+;  A correctly rounded result is at most 0.5 ULP from the truth, so
+;  everything at or near 1 ULP above is one rounding step of accumulated
+;  polynomial error and nothing more. Pow's general path is the
+;  composition Exp(y*Log(x)) and its error is dominated by y multiplying
+;  Log's - see Pow(), where that is the whole reason the whole-number
+;  path exists.
+;
+; THE DOMAIN-ERROR TABLE ABOVE WAS RE-RUN ON THIS TARGET, every row, plus
+; the cases that are easy to get wrong and are not in it: Sqr and Log of
+; the smallest subnormal (3.7433921e-23 and -103.27893, both through the
+; 2^40 scaling path), Exp(-90) = 8.194009e-40 rather than 0, FloatBits
+; staying signed, and Int() saturating at both ends.
+;
+;     62 domain assertions, 0 failures.
+;
+; THE EMITTED ASSEMBLY WAS READ for the three things that had to be true
+; of an integer float library on a 64-bit part:
+;   * NO FLOATING-POINT INSTRUCTION IN THE IMAGE AT ALL - zero fadd,
+;     fmul, fdiv, fcmp, scvtf, fcvtzs or `ldr s`. The build would have
+;     failed if one had crept in, but the count is worth having.
+;   * THE SIGNIFICAND PRODUCT IS A FULL 64-BIT MULTIPLY: `mul x13, x11,
+;     x12`. A `mul w` there would have thrown away the top of every
+;     24x24 product, and the results would have been wrong in their low
+;     bits with nothing to announce it.
+;   * THE QUOTIENT AND REMAINDER ARE `sdiv x` and `msub x`, not their W
+;     forms, so the 54-bit pre-shifted numerator survives the divide.
+;   The only W registers in the whole image are the one `ldr w` in
+;   MathBitsOf, the one `str w` in MathFromBits - the 32-bit accesses
+;   that SHOULD be narrow - and sixteen `sxtw` belonging to the .l locals
+;   and returns, which is the signed 32-bit type behaving as documented.
+;
+; NOTHING IN THIS FILE HAS RUN ON SILICON. Two independent instruction
+; models agreeing, plus a reference implementation agreeing bit for bit,
+; is the strongest evidence it has. It is not the same thing as a board.
+;
+; RE-CHECKED 2026-08-27 AND STILL TRUE OF THIS FILE, and dated twice on
+; purpose: an undated "nothing has run" reads as present tense for ever.
+; One caller EXISTS now and has not been run -
+; RaspberryPi4/Examples/Diagnostics/pi4FpGate.pi4 includes this file
+; specifically to race the soft binary32 core here against the hardware
+; FPU, bit pattern for bit pattern, on the board. No bench record of
+; that program running has been found in the vault or the git history.
+; IF SOMEBODY RUNS pi4FpGate, THIS PARAGRAPH IS THE ONE TO COME BACK
+; AND CHANGE - and note that pi4FpState must be run first, because a
+; closed CPTR_EL2.TFP trap turns the first `fmul` into a silent board.
+;
+; ~~No image from this compiler has booted a Pi 4.~~ FALSE, and already
+; false when it was written. First light was 2026-08-24; since
+; 2026-08-26 the firmware loads KERNEL8.IMG and the monitor is
+; self-hosting with HDMI, PCIe, USB storage, FAT32, gigabit Ethernet,
+; the MMU and a Wi-Fi radio. The identical clause was pasted into
+; bits.pi4 and sort.pi4 as well and went stale in all three at once -
+; see bits.pi4's header for why a file should only make claims about
+; itself and leave project-wide status to the vault.
+;
+; ONE THING THIS FILE SAYS ABOUT THE COMPILER HAS MOVED. The block below
+; opens "Everything in this block exists only because the emitter cannot
+; do float arithmetic yet." FLOAT SUPPORT LANDED IN THE COMPILER ON
+; 2026-08-26. The soft core is not therefore dead - it became the ORACLE
+; the hardware path is checked against, which is a better job than the
+; one it was written for, and pi4FpGate exists to use it that way. Read
+; "cannot do float arithmetic yet" below as history, not as status.
+; ======================================================================
+
+
+; ======================================================================
+;  THE SOFT BINARY32 CORE
+; ----------------------------------------------------------------------
+;  Everything in this block exists only because the emitter cannot do
+;  float arithmetic yet. See the header: when it can, this block goes
+;  and the call sites become operators again.
+;
+;  THE REPRESENTATION. A "bits" value is an .i holding the 32-bit
+;  IEEE-754 binary32 pattern, UNSIGNED, 0..4294967295. It is unsigned on
+;  purpose and it is why PeekN exists in MathBitsOf: the sign bit of a
+;  float is DATA to this code, not a sign, and every classification below
+;  is a range test that would break if bit 31 arrived as a minus.
+;
+;  THE INTERNAL EXPONENT CONVENTION, used by every routine here: a value
+;  is (-1)^s * m * 2^(e-23), where m is the significand as an INTEGER.
+;  For a normal number m is in [2^23, 2^24). Subnormals are NORMALISED on
+;  unpacking - shifted up until m reaches 2^23, with e decremented to
+;  match - so that every nonzero input reaching the arithmetic has the
+;  same shape. That single decision is what keeps the multiply and the
+;  divide free of subnormal special cases: without it a subnormal divisor
+;  makes the quotient loop produce a zero with a sticky bit, which is the
+;  one case the rounder cannot recover.
+;
+;  WHY 64-BIT INTEGERS MAKE THIS EASY, and it is the one place where this
+;  target's word size is a gift rather than a hazard: a 24x24 significand
+;  product is 48 bits and fits EXACTLY, with no splitting; a division can
+;  afford a 30-bit pre-shift and still leave room; and the addition can
+;  align both operands in a 57-bit field and lose nothing. On a 32-bit
+;  part every one of those needs a double-word helper. This file would be
+;  three times its length on a Pico.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  MathBitsOf(x) - the bit pattern of x, UNSIGNED, 0..4294967295.
+;
+;  PeekN and not PeekL. PeekL SIGN-EXTENDS on this target as of
+;  2026-08-25, when .n arrived and retired PeekL's one-day exemption from
+;  the Peek family's signedness rule, so PeekL(@t) of any NEGATIVE float
+;  would arrive here as a negative .i and every `>= 2147483648` test in
+;  this file would be false. FloatBits() below is the signed spelling and
+;  is public; this one is the raw pattern and is internal.
+; ----------------------------------------------------------------------
+Procedure.i MathBitsOf(x.f)
+  Protected t.f
+  t = x
+  ProcedureReturn PeekN(@t)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFromBits(b) - the binary32 whose pattern is b. The mask means a
+;  caller may hand this either spelling of the same pattern: 4286578688
+;  and -8388608 are the same four bytes and both give -Infinity.
+; ----------------------------------------------------------------------
+Procedure.f MathFromBits(b.i)
+  Protected t.f
+  PokeN(@t, b & $FFFFFFFF)
+  ProcedureReturn t
+EndProcedure
+
+; --- classification, on a pattern ------------------------------------
+Procedure.i MathFIsNaNB(b.i)
+  If ((b >> 23) & 255) <> 255
+    ProcedureReturn 0
+  EndIf
+  If (b & 8388607) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MathFIsInfB(b.i)
+  If ((b >> 23) & 255) <> 255
+    ProcedureReturn 0
+  EndIf
+  If (b & 8388607) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i MathFIsZeroB(b.i)
+  If (b & 2147483647) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MathFSignB(b.i)
+  ProcedureReturn (b >> 31) & 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFMantB / MathFExpB - the significand and the exponent, under the
+;  convention at the top of this block. Subnormals are normalised here so
+;  that nothing downstream has to know they existed. Zero gives 0 and 0,
+;  and every caller tests for zero before asking.
+; ----------------------------------------------------------------------
+Procedure.i MathFMantB(b.i)
+  Protected e.i
+  Protected m.i
+  e = (b >> 23) & 255
+  m = b & 8388607
+  If e <> 0
+    ProcedureReturn m | 8388608
+  EndIf
+  If m = 0
+    ProcedureReturn 0
+  EndIf
+  While m < 8388608
+    m = m << 1
+  Wend
+  ProcedureReturn m
+EndProcedure
+
+Procedure.i MathFExpB(b.i)
+  Protected e.i
+  Protected m.i
+  Protected k.i
+  e = (b >> 23) & 255
+  m = b & 8388607
+  If e <> 0
+    ProcedureReturn e - 127
+  EndIf
+  If m = 0
+    ProcedureReturn 0
+  EndIf
+  k = -126
+  While m < 8388608
+    m = m << 1
+    k = k - 1
+  Wend
+  ProcedureReturn k
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFRound(s, e, m, sticky) - pack (-1)^s * m * 2^(e-23) into a
+;  binary32, ROUNDED TO NEAREST WITH TIES TO EVEN. This is the only place
+;  in the file that rounds, which is why it is the only place that has to
+;  be got exactly right.
+;
+;  `sticky` says "there is more nonzero value below m that you were not
+;  given". The multiply never sets it (a 24x24 product is exact); the
+;  divide sets it from a nonzero remainder; the add sets it from operand
+;  bits shifted out during alignment.
+;
+;  PRECONDITION: m MUST NOT BE NEGATIVE. The sign is carried in `s`; `m`
+;  is a magnitude. Written down here as of 2026-08-26 because it was
+;  previously only implied, and one caller violated it: MathFFromIntB
+;  took `0 - n` of the one 64-bit value whose negation wraps, handed the
+;  negative result in here, and this procedure HUNG. The `up` loop is
+;  where it happens - `mm < 8388608` is true for every negative value,
+;  and `mm << 1` on a negative power of two reaches exactly zero, after
+;  which the loop can never make progress and the exponent runs away.
+;
+;  It is deliberately NOT guarded here with a test and a substituted
+;  answer. There is no correct binary32 to return for "a mantissa that
+;  cannot exist", so a guard could only invent one, and an invented
+;  answer in a rounder is worse than a hang: the hang is at least
+;  visible. The precondition belongs to the four call sites, all of
+;  which are in this file, and all of which now provably satisfy it.
+;
+;  THE THREE LOOPS, in the order they must run:
+;    down   - while m >= 2^24, halve it. The bit falling off becomes the
+;             guard; the PREVIOUS guard falls into sticky. Losing that
+;             ordering is the classic double-rounding bug.
+;    up     - while m < 2^23, double it, pulling the guard bit back in on
+;             the first step. Only cancellation in the adder gets here,
+;             and cancellation never leaves a sticky.
+;    denorm - while the exponent is below -126, halve again. This is what
+;             produces gradual underflow instead of flushing to zero, and
+;             it is why Exp(-90) is 8.2e-40 here rather than 0.
+;
+;  Then one rounding decision, one possible carry out of it, and the
+;  overflow test AFTER the carry - because rounding 0x1.fffffep127 up is
+;  exactly how a finite input becomes an infinity.
+; ----------------------------------------------------------------------
+Procedure.i MathFRound(s.i, e.i, m.i, sticky.i)
+  Protected g.i
+  Protected st.i
+  Protected ee.i
+  Protected mm.i
+  st = sticky
+  ee = e
+  mm = m
+  g = 0
+  If mm = 0
+    If st = 0
+      ProcedureReturn s << 31
+    EndIf
+    ProcedureReturn (s << 31) | 1
+  EndIf
+  While mm >= 16777216
+    st = st | g
+    g = mm & 1
+    mm = mm >> 1
+    ee = ee + 1
+  Wend
+  While mm < 8388608
+    mm = (mm << 1) | g
+    g = 0
+    ee = ee - 1
+  Wend
+  While ee < -126
+    st = st | g
+    g = mm & 1
+    mm = mm >> 1
+    ee = ee + 1
+  Wend
+  If g = 1
+    If st = 1
+      mm = mm + 1
+    Else
+      If (mm & 1) = 1
+        mm = mm + 1
+      EndIf
+    EndIf
+  EndIf
+  If mm >= 16777216
+    mm = mm >> 1
+    ee = ee + 1
+  EndIf
+  If ee > 127
+    ProcedureReturn (s << 31) | 2139095040
+  EndIf
+  If mm >= 8388608
+    ProcedureReturn (s << 31) | ((ee + 127) << 23) | (mm - 8388608)
+  EndIf
+  ProcedureReturn (s << 31) | mm
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFAddB(ba, bb) - binary32 addition, correctly rounded.
+;
+;  THE ALIGNMENT IS DONE IN A 57-BIT FIELD: both significands are shifted
+;  LEFT by 32 before the smaller is shifted right by the exponent
+;  difference. That is what makes the analysis below true, and the
+;  analysis is what lets the subtraction be exact without a wider type:
+;
+;    d <= 32   nothing is lost. mb << 32 has 32 zero bits underneath, so
+;              shifting right by at most 32 cannot drop a set bit, and
+;              sticky is always 0 in this range.
+;    33..56    bits can be lost, so sticky can be set - but then the
+;              aligned operand is below 2^23 while the larger one is at
+;              least 2^55, so they can never be equal.
+;    >= 57     the aligned operand is nothing but sticky.
+;
+;  Therefore `pa = pb` with a sticky set is unreachable, which is the one
+;  case a naive subtract-with-sticky gets wrong. And when sticky IS set
+;  during a subtraction the true result lies strictly between pa-pb-1 and
+;  pa-pb, so subtracting the extra 1 and keeping the sticky flag is exact
+;  for rounding purposes - the retained bits are then M's own and the
+;  remainder is known nonzero.
+; ----------------------------------------------------------------------
+Procedure.i MathFAddB(ba.i, bb.i)
+  Protected sa.i
+  Protected sb.i
+  Protected ea.i
+  Protected eb.i
+  Protected ma.i
+  Protected mb.i
+  Protected pa.i
+  Protected pb.i
+  Protected d.i
+  Protected st.i
+  Protected s.i
+  Protected mv.i
+  Protected t.i
+  If MathFIsNaNB(ba) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  If MathFIsNaNB(bb) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  sa = MathFSignB(ba)
+  sb = MathFSignB(bb)
+  If MathFIsInfB(ba) = 1
+    If MathFIsInfB(bb) = 1
+      If sa <> sb
+        ProcedureReturn 2143289344      ; (+Inf) + (-Inf)
+      EndIf
+    EndIf
+    ProcedureReturn ba
+  EndIf
+  If MathFIsInfB(bb) = 1
+    ProcedureReturn bb
+  EndIf
+  If MathFIsZeroB(ba) = 1
+    If MathFIsZeroB(bb) = 1
+      If sa = sb
+        ProcedureReturn ba              ; (-0) + (-0) is -0
+      EndIf
+      ProcedureReturn 0                 ; (+0) + (-0) is +0
+    EndIf
+    ProcedureReturn bb
+  EndIf
+  If MathFIsZeroB(bb) = 1
+    ProcedureReturn ba
+  EndIf
+  ea = MathFExpB(ba)
+  eb = MathFExpB(bb)
+  ma = MathFMantB(ba)
+  mb = MathFMantB(bb)
+  If ea < eb
+    t = ea
+    ea = eb
+    eb = t
+    t = ma
+    ma = mb
+    mb = t
+    t = sa
+    sa = sb
+    sb = t
+  EndIf
+  d = ea - eb
+  pa = ma << 32
+  st = 0
+  If d >= 57
+    pb = 0
+    st = 1
+  Else
+    t = mb << 32
+    pb = t >> d
+    If (pb << d) <> t
+      st = 1
+    EndIf
+  EndIf
+  If sa = sb
+    mv = pa + pb
+    s = sa
+  Else
+    If pa > pb
+      mv = pa - pb
+      s = sa
+      If st = 1
+        mv = mv - 1
+      EndIf
+    Else
+      If pa < pb
+        mv = pb - pa
+        s = sb
+        st = 0
+      Else
+        If st = 0
+          ProcedureReturn 0             ; exact cancellation is +0
+        EndIf
+        mv = 0
+        s = sb
+      EndIf
+    EndIf
+  EndIf
+  ProcedureReturn MathFRound(s, ea - 32, mv, st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFMulB(ba, bb) - binary32 multiplication, correctly rounded.
+;  The 24x24 product is 48 bits and therefore EXACT in a 64-bit integer,
+;  so there is no sticky and no error before the rounder.
+; ----------------------------------------------------------------------
+Procedure.i MathFMulB(ba.i, bb.i)
+  Protected s.i
+  If MathFIsNaNB(ba) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  If MathFIsNaNB(bb) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  s = MathFSignB(ba) ! MathFSignB(bb)
+  If MathFIsInfB(ba) = 1
+    If MathFIsZeroB(bb) = 1
+      ProcedureReturn 2143289344        ; Inf * 0
+    EndIf
+    ProcedureReturn (s << 31) | 2139095040
+  EndIf
+  If MathFIsInfB(bb) = 1
+    If MathFIsZeroB(ba) = 1
+      ProcedureReturn 2143289344
+    EndIf
+    ProcedureReturn (s << 31) | 2139095040
+  EndIf
+  If MathFIsZeroB(ba) = 1
+    ProcedureReturn s << 31
+  EndIf
+  If MathFIsZeroB(bb) = 1
+    ProcedureReturn s << 31
+  EndIf
+  ProcedureReturn MathFRound(s, MathFExpB(ba) + MathFExpB(bb) - 23, MathFMantB(ba) * MathFMantB(bb), 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFDivB(ba, bb) - binary32 division, correctly rounded.
+;  The numerator is pre-shifted by 30 so the quotient carries at least 30
+;  significant bits whatever the operands, and the REMAINDER is the
+;  sticky - which is exactly the information the rounder needs and the
+;  reason this is a single divide rather than a bit loop.
+; ----------------------------------------------------------------------
+Procedure.i MathFDivB(ba.i, bb.i)
+  Protected s.i
+  Protected n.i
+  Protected q.i
+  Protected r.i
+  Protected st.i
+  If MathFIsNaNB(ba) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  If MathFIsNaNB(bb) = 1
+    ProcedureReturn 2143289344
+  EndIf
+  s = MathFSignB(ba) ! MathFSignB(bb)
+  If MathFIsInfB(ba) = 1
+    If MathFIsInfB(bb) = 1
+      ProcedureReturn 2143289344        ; Inf / Inf
+    EndIf
+    ProcedureReturn (s << 31) | 2139095040
+  EndIf
+  If MathFIsInfB(bb) = 1
+    ProcedureReturn s << 31
+  EndIf
+  If MathFIsZeroB(bb) = 1
+    If MathFIsZeroB(ba) = 1
+      ProcedureReturn 2143289344        ; 0 / 0
+    EndIf
+    ProcedureReturn (s << 31) | 2139095040
+  EndIf
+  If MathFIsZeroB(ba) = 1
+    ProcedureReturn s << 31
+  EndIf
+  n = MathFMantB(ba) << 30
+  q = n / MathFMantB(bb)
+  r = n % MathFMantB(bb)
+  st = 0
+  If r <> 0
+    st = 1
+  EndIf
+  ProcedureReturn MathFRound(s, MathFExpB(ba) - MathFExpB(bb) - 7, q, st)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFCmpB(ba, bb) - -1, 0 or 1, and -2 for UNORDERED (either is NaN).
+;
+;  -2 rather than a fourth procedure, because every caller has to handle
+;  the NaN case explicitly and a boolean answer would let it be ignored.
+;  Note that -2 is also "less than", so do not write `If MathFCmpB(...)
+;  < 0` and mean it - use the MathFLt/MathFGt wrappers below, which
+;  answer 0 for unordered.
+;
+;  The ordering trick is the same one sort.pi4 uses on float bit
+;  patterns: a positive float's pattern already sorts correctly as an
+;  integer, and a negative one is mapped to the negation of its
+;  magnitude bits, which puts -0.0 and +0.0 both at 0.
+; ----------------------------------------------------------------------
+Procedure.i MathFCmpB(ba.i, bb.i)
+  Protected ka.i
+  Protected kb.i
+  If MathFIsNaNB(ba) = 1
+    ProcedureReturn -2
+  EndIf
+  If MathFIsNaNB(bb) = 1
+    ProcedureReturn -2
+  EndIf
+  ka = ba
+  If (ka >> 31) = 1
+    ka = 0 - (ka & 2147483647)
+  EndIf
+  kb = bb
+  If (kb >> 31) = 1
+    kb = 0 - (kb & 2147483647)
+  EndIf
+  If ka < kb
+    ProcedureReturn -1
+  EndIf
+  If ka > kb
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  MathFFromIntB / MathFToIntB - the conversions the backend would
+;  normally emit for `nf = n` and `n = u`.
+;
+;  FromInt rounds to nearest even, which is what every hardware
+;  conversion does and what the reductions in Exp() and Log() assume.
+;  ToInt TRUNCATES TOWARD ZERO, which is the language's rule, and
+;  saturates at +/-(2^63-1) rather than wrapping - a wrapped answer looks
+;  like a real one.
+; ----------------------------------------------------------------------
+Procedure.i MathFFromIntB(n.i)
+  If n = 0
+    ProcedureReturn 0
+  EndIf
+  ; ------------------------------------------------------------------
+  ;  THE ONE INPUT THAT HAS NO NEGATION, AND WHAT IT USED TO DO
+  ; ------------------------------------------------------------------
+  ;  BUG FOUND 2026-08-26, by the differential gate's vector list before
+  ;  the gate was ever run on hardware. This procedure took the
+  ;  magnitude of a negative operand with `0 - n`, and there is exactly
+  ;  one 64-bit value for which that does not produce a positive number:
+  ;  -9223372036854775808, whose magnitude 2^63 is not representable.
+  ;  `0 - n` wraps straight back to n, still negative.
+  ;
+  ;  IT DID NOT RETURN A WRONG NUMBER. IT DID NOT RETURN AT ALL.
+  ;  MathFRound below received a negative mantissa, skipped its `down`
+  ;  loop (the test is `mm >= 16777216`), entered its `up` loop
+  ;  (`mm < 8388608`, true for anything negative), and on the first
+  ;  iteration `mm << 1` overflowed a negative power of two to exactly
+  ;  zero. Zero is still less than 8388608, and shifting zero left
+  ;  produces zero, so the loop spins forever with the exponent
+  ;  decrementing into nothing. A hang, in a maths library, from one
+  ;  legal argument.
+  ;
+  ;  Nothing had ever called it with that value. That is the whole
+  ;  reason a differential gate is worth building: the value went into
+  ;  the vector table because it is an obvious boundary, and the bug was
+  ;  found by writing down what SHOULD happen, before any hardware ran.
+  ;
+  ;  THE ANSWER IS EXACT, which is worth saying because it looks like a
+  ;  special case being fudged. 2^63 is a power of two, so it is exactly
+  ;  representable in binary32: significand 2^23 with an exponent of 63,
+  ;  which is what MathFRound is handed below. The result is $DF000000
+  ;  and there is no rounding involved at all.
+  ;
+  ;  MathFRound's PRECONDITION is now stated in its own header: the
+  ;  mantissa must be positive. This is the only call site in the file
+  ;  that could ever have violated it - the adder's operand is a sum of
+  ;  two values below 2^56, the multiplier's is a product of two values
+  ;  below 2^24, and the divider's is a quotient of a value below 2^54.
+  If n = -9223372036854775808
+    ProcedureReturn MathFRound(1, 63, 8388608, 0)
+  EndIf
+  If n < 0
+    ProcedureReturn MathFRound(1, 23, 0 - n, 0)
+  EndIf
+  ProcedureReturn MathFRound(0, 23, n, 0)
+EndProcedure
+
+Procedure.i MathFToIntB(b.i)
+  Protected e.i
+  Protected m.i
+  Protected v.i
+  If MathFIsNaNB(b) = 1
+    ProcedureReturn 0
+  EndIf
+  If MathFIsZeroB(b) = 1
+    ProcedureReturn 0
+  EndIf
+  e = MathFExpB(b)
+  m = MathFMantB(b)
+  If MathFIsInfB(b) = 1
+    e = 200
+  EndIf
+  If e < 0
+    ProcedureReturn 0
+  EndIf
+  If e > 62
+    If MathFSignB(b) = 1
+      ProcedureReturn -9223372036854775807
+    EndIf
+    ProcedureReturn 9223372036854775807
+  EndIf
+  If e >= 23
+    v = m << (e - 23)
+  Else
+    v = m >> (23 - e)
+  EndIf
+  If MathFSignB(b) = 1
+    ProcedureReturn 0 - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ======================================================================
+;  THE .f-FACING WRAPPERS
+;
+;  These exist so that the ported bodies below read as close to the
+;  originals as this target allows, and so that the day the emitter can
+;  do floats there is exactly one kind of edit to make. They are PUBLIC:
+;  a caller who needs to add two floats on this part needs them too,
+;  because `a + b` does not build.
+; ======================================================================
+Procedure.f MathFAdd(a.f, b.f)
+  ProcedureReturn MathFromBits(MathFAddB(MathBitsOf(a), MathBitsOf(b)))
+EndProcedure
+
+Procedure.f MathFSub(a.f, b.f)
+  ; Subtraction is addition with the subtrahend's sign bit flipped, which
+  ; is exact and also correct for a NaN (a NaN with either sign is still
+  ; a NaN and MathFAddB canonicalises it).
+  ProcedureReturn MathFromBits(MathFAddB(MathBitsOf(a), MathBitsOf(b) ! 2147483648))
+EndProcedure
+
+Procedure.f MathFMul(a.f, b.f)
+  ProcedureReturn MathFromBits(MathFMulB(MathBitsOf(a), MathBitsOf(b)))
+EndProcedure
+
+Procedure.f MathFDiv(a.f, b.f)
+  ProcedureReturn MathFromBits(MathFDivB(MathBitsOf(a), MathBitsOf(b)))
+EndProcedure
+
+; MathFAbs(x) - |x|, by clearing one bit. Exact for every input
+; including NaN and the infinities, and the reason Abs() is still absent
+; from the public namespace: this one cannot collide with wiring's abs().
+Procedure.f MathFAbs(x.f)
+  ProcedureReturn MathFromBits(MathBitsOf(x) & 2147483647)
+EndProcedure
+
+Procedure.f MathFNeg(x.f)
+  ProcedureReturn MathFromBits(MathBitsOf(x) ! 2147483648)
+EndProcedure
+
+; The relational wrappers. Each answers 0 for an unordered comparison, so
+; `If MathFLt(x, 0.0) = 1` is false for a NaN - which is what the IEEE
+; relation means and what every ported body below relies on.
+Procedure.i MathFCmp(a.f, b.f)
+  ProcedureReturn MathFCmpB(MathBitsOf(a), MathBitsOf(b))
+EndProcedure
+
+Procedure.i MathFLt(a.f, b.f)
+  If MathFCmpB(MathBitsOf(a), MathBitsOf(b)) = -1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MathFGt(a.f, b.f)
+  If MathFCmpB(MathBitsOf(a), MathBitsOf(b)) = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MathFEq(a.f, b.f)
+  If MathFCmpB(MathBitsOf(a), MathBitsOf(b)) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MathFLe(a.f, b.f)
+  Protected c.i
+  c = MathFCmpB(MathBitsOf(a), MathBitsOf(b))
+  If c = -1
+    ProcedureReturn 1
+  EndIf
+  If c = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i MathFGe(a.f, b.f)
+  Protected c.i
+  c = MathFCmpB(MathBitsOf(a), MathBitsOf(b))
+  If c = 1
+    ProcedureReturn 1
+  EndIf
+  If c = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; MathFFromInt / MathFToInt - the .f-facing conversions. MathFToInt is
+; the UNCLAMPED 64-bit float-to-integer; Int() below is the documented
+; 32-bit one that saturates, and they are deliberately two functions.
+Procedure.f MathFFromInt(n.i)
+  ProcedureReturn MathFromBits(MathFFromIntB(n))
+EndProcedure
+
+Procedure.i MathFToInt(x.f)
+  ProcedureReturn MathFToIntB(MathBitsOf(x))
+EndProcedure
+
+
+; ======================================================================
+;  THE PUBLIC MATHS SURFACE - the desktop BASIC's names and semantics
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; FloatBits(x) - the raw IEEE-754 binary32 bit pattern of x, as a SIGNED
+; 32-bit value. Nothing is converted: FloatBits(1.5) is 1069547520, not 1.
+; This is how every classification in this file is done - a NaN or an
+; infinity has to be recognised from its bits, because arithmetic on one
+; produces another one and tells you nothing.
+;
+; IT STAYS SIGNED, and on a 64-bit target that is now a visible choice
+; rather than a consequence. FloatBits(-1.0) is -1082130432 here exactly
+; as it is on the Picos, so a program moved between them keeps working
+; and IsInfinity()'s `b = -8388608` still reads the same. The sign
+; extension is written out by hand below rather than left to the return
+; type, so it does not depend on how the backend narrows a .l return.
+; If you want the unsigned pattern, mask with $FFFFFFFF - or use
+; MathBitsOf(), which is the internal spelling and returns 0..4294967295.
+; ----------------------------------------------------------------------
+Procedure.l FloatBits(x.f)
+  Protected b.i
+  b = MathBitsOf(x)
+  If b >= 2147483648
+    ProcedureReturn b - 4294967296
+  EndIf
+  ProcedureReturn b
+EndProcedure
+
+; ----------------------------------------------------------------------
+; FloatFromBits(b) - the binary32 value whose bit pattern is b. The exact
+; inverse of FloatBits, and again nothing is converted: FloatFromBits(1)
+; is the smallest subnormal, not 1.0. Either spelling of a pattern works
+; - -8388608 and 4286578688 are the same four bytes.
+; ----------------------------------------------------------------------
+Procedure.f FloatFromBits(b.i)
+  ProcedureReturn MathFromBits(b)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Infinity() - positive infinity, 0x7F800000. Negate it for the other one.
+; ----------------------------------------------------------------------
+Procedure.f Infinity()
+  ProcedureReturn MathFromBits(2139095040)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; NaN() - a quiet Not-a-Number. Every domain error in this file returns
+; this one bit pattern, 0x7FC00000.
+; ----------------------------------------------------------------------
+Procedure.f NaN()
+  ProcedureReturn MathFromBits(2143289344)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; IsNaN(x) - 1 if x is Not-a-Number, else 0.
+;
+; The RP2350 file writes this as `If x <> x`, using the property that a
+; NaN compares unequal to itself. THAT DOES NOT COMPILE HERE - a float
+; comparison is refused by the emitter - so it is a bit test instead,
+; which is what the `x <> x` was standing in for anyway. Do NOT test for
+; a NaN with '=' in your own code either, on this target or any other.
+; ----------------------------------------------------------------------
+Procedure.l IsNaN(x.f)
+  ProcedureReturn MathFIsNaNB(MathBitsOf(x))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; IsInfinity(x) - 1 for +Infinity, -1 for -Infinity, 0 for anything else
+; including NaN. The desktop BASIC only promises "nonzero", so a program
+; that just tests truth is portable; the sign is extra.
+; ----------------------------------------------------------------------
+Procedure.l IsInfinity(x.f)
+  Protected b.i
+  b = MathBitsOf(x)
+  If b = 2139095040
+    ProcedureReturn 1
+  EndIf
+  If b = 4286578688                 ; 0xFF800000
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sign(x) - -1 if x is negative, +1 if positive, 0 if zero.
+; Returns an INTEGER, as the desktop's does. Sign(-0.0) is 0 and
+; Sign(NaN) is 0; both were checked against the desktop rather than
+; assumed. Done on the bits because the float comparisons the source used
+; are refused on this target - and it is exact either way.
+; ----------------------------------------------------------------------
+Procedure.l Sign(x.f)
+  Protected b.i
+  b = MathBitsOf(x)
+  If MathFIsNaNB(b) = 1             ; not positive, not negative
+    ProcedureReturn 0
+  EndIf
+  If (b & 2147483647) = 0           ; +0.0 and -0.0 alike
+    ProcedureReturn 0
+  EndIf
+  If (b >> 31) = 1
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Int(x) - the integer part of x, TRUNCATED toward zero. Int(10.565) is
+; 10 and Int(-10.565) is -10, which is the desktop's rule and NOT the
+; older BASIC floor() rule that would give -11. There is no rounding.
+;
+; TWO DIFFERENCES FROM THE DESKTOP, both inherited from the RP2350 file:
+;   - the result is 32-bit. A magnitude beyond 2147483647 saturates at
+;     +/-2147483647 rather than wrapping, because a wrapped answer looks
+;     like a real one.
+;   - Int(NaN) is 0, where the desktop hands back the CPU's
+;     integer-indefinite value.
+;
+; THE 32-BIT BOUND IS KEPT ON PURPOSE HERE, even though .i on this target
+; is 64 bits and would hold the wider answer. Widening a documented
+; function's range during a port makes the same source disagree with
+; itself between two chips, silently, for arguments in between. If you
+; want the wider answer on this part, MathFToInt(x) is unclamped and
+; returns .i.
+; ----------------------------------------------------------------------
+Procedure.l Int(x.f)
+  Protected v.i
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn 0
+  EndIf
+  v = MathFToIntB(MathBitsOf(x))
+  If v > 2147483647
+    ProcedureReturn 2147483647
+  EndIf
+  If v < -2147483647
+    ProcedureReturn -2147483647
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Degree(x) - an angle in radians converted to degrees. Degree(#PI/4) is
+; 45.0. There is NO normalisation: an input above 2*pi gives a result
+; above 360, and a negative input gives a negative result, exactly as the
+; desktop does.
+; ----------------------------------------------------------------------
+Procedure.f Degree(x.f)
+  ProcedureReturn MathFMul(x, 57.29577951308232)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Radian(x) - an angle in degrees converted to radians. Radian(90) is
+; 1.5707964. No normalisation, same as Degree().
+; ----------------------------------------------------------------------
+Procedure.f Radian(x.f)
+  ProcedureReturn MathFMul(x, 0.017453292519943295)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathNearestInt(t) - t rounded to the NEAREST integer, halves away from
+; zero. Used by the range reductions below, where an off-by-one quadrant
+; is a sign error rather than a rounding error.
+; ----------------------------------------------------------------------
+Procedure.l MathNearestInt(t.f)
+  Protected u.f
+  If MathFGe(t, 0.0) = 1
+    u = MathFAdd(t, 0.5)
+  Else
+    u = MathFSub(t, 0.5)
+  EndIf
+  ProcedureReturn MathFToIntB(MathBitsOf(u))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathPow2i(n) - 2 raised to an INTEGER power, built directly from the
+; exponent field rather than by multiplying. Exact for -126 <= n <= 127;
+; 0.0 below that and +Infinity above. Exp() and Sqr() use it to apply a
+; power-of-two scaling, which is the one scaling that costs no accuracy
+; at all - and on this target it is also the one that costs no soft-float
+; call, since it is pure integer work.
+; ----------------------------------------------------------------------
+Procedure.f MathPow2i(n.l)
+  If n > 127
+    ProcedureReturn MathFromBits(2139095040)
+  EndIf
+  If n < -126
+    ProcedureReturn 0.0
+  EndIf
+  ProcedureReturn MathFromBits((n + 127) << 23)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sqr(x) - the square root of x.
+;
+;     Sqr(-1)     NaN          Sqr(0.0)     0.0
+;     Sqr(-0.0)   -0.0         Sqr(+Inf)    +Infinity
+;
+; METHOD. A first estimate is read straight out of the exponent field:
+; halving a float's bit pattern halves its exponent, which is most of a
+; square root already, and the additive constant 532487669 is the offset
+; that minimises the leading error of what is left (about 3.5%). Three
+; Newton-Raphson steps y = (y + x/y)/2 follow, each roughly doubling the
+; correct digits: 3.5% -> 6e-4 -> 2e-7 -> below one ULP. A fourth step
+; would change nothing a binary32 can hold.
+;
+; A SUBNORMAL INPUT IS SCALED FIRST. Below 1.18e-38 the exponent field is
+; 0 and the bit trick has nothing to halve, so the estimate is garbage
+; and Newton converges to garbage - silently, because every step still
+; looks like it is converging. Multiplying by 2^40 first and the result
+; by 2^-20 is exact both ways (powers of two) and puts the value back in
+; the range the estimate was fitted for.
+;
+; THREE DIVISIONS is what this costs, and on this target a division is
+; the most expensive thing the soft core does. It is still the right
+; algorithm: a division-free Newton on the reciprocal square root needs
+; more steps to reach the same ULP and the extra multiplies cost more
+; than the divisions saved.
+; ----------------------------------------------------------------------
+Procedure.f Sqr(x.f)
+  Protected b.i
+  Protected v.f
+  Protected y.f
+  Protected q.f
+  Protected scale.f
+  If MathFIsNaNB(MathBitsOf(x)) = 1   ; NaN in, NaN out
+    ProcedureReturn x
+  EndIf
+  If MathFLt(x, 0.0) = 1
+    ProcedureReturn MathFromBits(2143289344)
+  EndIf
+  If MathFEq(x, 0.0) = 1                  ; returns x, so -0.0 stays -0.0
+    ProcedureReturn x
+  EndIf
+  b = MathBitsOf(x)
+  If b = 2139095040                   ; +Infinity
+    ProcedureReturn x
+  EndIf
+  v = x
+  scale = 1.0
+  If b < 8388608                      ; subnormal - see the note above
+    v = MathFMul(v, 1099511627776.0)  ; 2^40
+    scale = 0.00000095367431640625    ; 2^-20
+    b = MathBitsOf(v)
+  EndIf
+  y = MathFromBits((b >> 1) + 532487669)
+  q = MathFDiv(v, y)
+  y = MathFMul(MathFAdd(y, q), 0.5)
+  q = MathFDiv(v, y)
+  y = MathFMul(MathFAdd(y, q), 0.5)
+  q = MathFDiv(v, y)
+  y = MathFMul(MathFAdd(y, q), 0.5)
+  ProcedureReturn MathFMul(y, scale)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Exp(x) - e raised to the power x. The inverse of Log().
+;
+;     Exp(0)      1.0          Exp(1000)    +Infinity
+;     Exp(-1000)  0.0          Exp(NaN)     NaN
+;
+; METHOD. x is split as x = n*ln2 + r with n whole and |r| <= ln2/2, so
+; e^x = 2^n * e^r and only the small factor needs a polynomial. ln2 is
+; carried in two pieces - 0.693359375 is 355/512, nine significant bits,
+; so n*it is EXACT for every n that can occur here, and the tiny
+; correction 0.00021219444005469057 restores the rest. Subtracting one
+; exact product loses nothing; subtracting a single rounded ln2 would
+; lose about a bit per unit of |x|, which is the usual way this function
+; is got wrong.
+;
+; e^r on |r| <= 0.3466 is a degree-7 minimax polynomial evaluated as
+; 1 + r + p(r)*r^2, where p is the degree-5 Horner chain below - which
+; keeps the two dominant terms exact and lets the polynomial carry only
+; the small remainder.
+;
+; The 2^n factor is applied last with MathPow2i, one exact multiply. When
+; n is below -126 the answer is subnormal and 2^n is not representable,
+; so the scaling is done in two steps rather than flushed to zero -
+; without that, exp(-90) would come out as 0 instead of 8.2e-40.
+; ----------------------------------------------------------------------
+Procedure.f Exp(x.f)
+  Protected n.l
+  Protected t.f
+  Protected nf.f
+  Protected r.f
+  Protected z.f
+  Protected p.f
+  Protected v.f
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn x
+  EndIf
+  If MathFGt(x, 88.72283) = 1             ; the largest x with a finite e^x
+    ProcedureReturn MathFromBits(2139095040)
+  EndIf
+  If MathFLt(x, -103.9721) = 1            ; below the smallest subnormal
+    ProcedureReturn 0.0
+  EndIf
+  t = MathFMul(x, 1.4426950408889634) ; x / ln2
+  n = MathNearestInt(t)
+  nf = MathFFromInt(n)
+  r = MathFSub(x, MathFMul(nf, 0.693359375))          ; exact: 355/512
+  r = MathFAdd(r, MathFMul(nf, 0.00021219444005469057))
+  p = 0.000198756915
+  p = MathFAdd(MathFMul(p, r), 0.0013981999507)
+  p = MathFAdd(MathFMul(p, r), 0.0083334519073)
+  p = MathFAdd(MathFMul(p, r), 0.041665795894)
+  p = MathFAdd(MathFMul(p, r), 0.16666665459)
+  p = MathFAdd(MathFMul(p, r), 0.50000001201)
+  z = MathFMul(r, r)
+  v = MathFAdd(1.0, r)
+  v = MathFAdd(v, MathFMul(p, z))
+  If n < -126
+    v = MathFMul(v, MathPow2i(n + 60))
+    ProcedureReturn MathFMul(v, MathPow2i(-60))
+  EndIf
+  ProcedureReturn MathFMul(v, MathPow2i(n))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Log(x) - the natural logarithm (base e) of x. The inverse of Exp().
+;
+;     Log(1)      0.0          Log(0)       -Infinity
+;     Log(-1)     NaN          Log(+Inf)    +Infinity
+;
+; METHOD. x is split into m * 2^e with m in [sqrt(1/2), sqrt(2)) - the
+; exponent comes straight out of the bit pattern, so that half is exact -
+; and log(x) = e*ln2 + log(m). log(m) is then evaluated as the atanh
+; series in s = (m-1)/(m+1):
+;
+;     log(m) = 2s * (1 + s^2/3 + s^4/5 + s^6/7 + s^8/9)
+;
+; which is used instead of a series in (m-1) because |s| <= 0.1716 while
+; |m-1| can reach 0.414 - the terms fall away about six times faster, so
+; five of them reach 7e-10 where a direct series would need fifteen.
+; Centring m on 1 rather than leaving it in [1,2) is what buys that; it
+; costs one comparison and one exact halving.
+;
+; A SUBNORMAL INPUT is scaled up by 2^40 first and 40*ln2 subtracted from
+; the exponent term afterwards, for the same reason as in Sqr(): a
+; subnormal has no exponent field to read.
+; ----------------------------------------------------------------------
+Procedure.f Log(x.f)
+  Protected b.i
+  Protected e.l
+  Protected v.f
+  Protected m.f
+  Protected s.f
+  Protected z.f
+  Protected p.f
+  Protected ef.f
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn x
+  EndIf
+  If MathFLt(x, 0.0) = 1
+    ProcedureReturn MathFromBits(2143289344)
+  EndIf
+  If MathFEq(x, 0.0) = 1
+    ProcedureReturn MathFromBits(4286578688)          ; -Infinity
+  EndIf
+  b = MathBitsOf(x)
+  If b = 2139095040
+    ProcedureReturn x
+  EndIf
+  v = x
+  e = 0
+  If b < 8388608                      ; subnormal - see the note above
+    v = MathFMul(v, 1099511627776.0)  ; 2^40
+    e = -40
+    b = MathBitsOf(v)
+  EndIf
+  e = e + ((b >> 23) & 255) - 127
+  m = MathFromBits((b & 8388607) | 1065353216)   ; mantissa, exponent 0
+  If MathFGt(m, 1.4142135623730951) = 1
+    m = MathFMul(m, 0.5)
+    e = e + 1
+  EndIf
+  s = MathFDiv(MathFSub(m, 1.0), MathFAdd(m, 1.0))
+  z = MathFMul(s, s)
+  p = 0.1111111111111111
+  p = MathFAdd(MathFMul(p, z), 0.14285714285714285)
+  p = MathFAdd(MathFMul(p, z), 0.2)
+  p = MathFAdd(MathFMul(p, z), 0.3333333333333333)
+  p = MathFAdd(MathFMul(p, z), 1.0)
+  ef = MathFFromInt(e)
+  ProcedureReturn MathFAdd(MathFMul(ef, 0.6931471805599453), MathFMul(MathFMul(2.0, s), p))
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathSinCos(x, wantCos) - the shared core of Sin() and Cos().
+; wantCos of 0 gives sin(x), anything else gives cos(x).
+;
+; Both are one function because the argument reduction IS the function -
+; the polynomial afterwards is a few instructions and the reduction is
+; everything that decides whether the answer is right. Two copies of it
+; would be two things to keep in step, and the one that drifts would go
+; wrong only at large arguments, which is exactly where nobody looks.
+;
+; A cosine is a sine one quadrant along, so wantCos simply adds 1 to the
+; quadrant count. The quadrant then selects sin(r) or cos(r) of the
+; reduced argument and whether to negate it.
+;
+; `n & 3` ON A 64-BIT SIGNED n. Checked, because the brief for this port
+; said to be suspicious of exactly this shape: n is negative for negative
+; arguments and `-1 & 3` is 3 in two's complement at every width, so the
+; quadrant selection is unaffected by .i having grown. A mask that keeps
+; only low bits is one of the few bit operations that does not care.
+; ----------------------------------------------------------------------
+Procedure.f MathSinCos(x.f, wantCos.l)
+  Protected a.f
+  Protected t.f
+  Protected nf.f
+  Protected r.f
+  Protected z.f
+  Protected p.f
+  Protected v.f
+  Protected n.l
+  Protected q.l
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn x
+  EndIf
+  a = MathFAbs(x)
+  If MathFGt(a, 12867.0) = 1              ; reduction stops being exact
+    ProcedureReturn MathFromBits(2143289344)
+  EndIf
+  t = MathFMul(x, 0.6366197723675814) ; x * 2/pi - which quadrant
+  n = MathNearestInt(t)
+  nf = MathFFromInt(n)
+  r = MathFSub(x, MathFMul(nf, 1.5703125))    ; pi/2 in three exact pieces
+  r = MathFSub(r, MathFMul(nf, 0.0004837512969970703125))
+  r = MathFSub(r, MathFMul(nf, 0.0000000754979012640433))
+  q = n & 3
+  If wantCos <> 0
+    q = (q + 1) & 3
+  EndIf
+  z = MathFMul(r, r)
+  If q = 1 Or q = 3
+    ; cos(r) = 1 - r^2/2 + r^4/24 - ... , Taylor to r^10; the truncated
+    ; term is (pi/4)^12/479001600, about 1.2e-10, well under one ULP.
+    p = -0.0000002755731922398589
+    p = MathFAdd(MathFMul(p, z), 0.0000248015873015873)
+    p = MathFAdd(MathFMul(p, z), -0.001388888888888889)
+    p = MathFAdd(MathFMul(p, z), 0.041666666666666664)
+    p = MathFAdd(MathFMul(p, z), -0.5)
+    v = MathFAdd(1.0, MathFMul(p, z))
+  Else
+    ; sin(r) = r - r^3/6 + r^5/120 - ... , Taylor to r^9; the truncated
+    ; term is (pi/4)^11/39916800, about 1.9e-09.
+    p = 0.0000027557319223985893
+    p = MathFAdd(MathFMul(p, z), -0.0001984126984126984)
+    p = MathFAdd(MathFMul(p, z), 0.008333333333333333)
+    p = MathFAdd(MathFMul(p, z), -0.16666666666666666)
+    v = MathFAdd(r, MathFMul(r, MathFMul(p, z)))
+  EndIf
+  If q >= 2
+    ProcedureReturn MathFSub(0.0, v)
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Sin(x) - the sine of an angle given in RADIANS. Use Radian() to convert
+; from degrees. The result is between -1.0 and 1.0.
+;
+;     Sin(0)          0.0
+;     Sin(Radian(30)) 0.5
+;     Sin(NaN)        NaN
+;     |x| > 12867     NaN     - a refusal, not a failure. See TRIG above.
+;
+; Within 0.001 radians of a multiple of pi the ABSOLUTE error is about
+; 1.4e-10 and the ULP count is meaningless: the answer is near zero, so
+; one ULP of it is an enormous number of steps. If you are testing sin(x)
+; for a zero crossing, compare against a small absolute tolerance and not
+; against 0.0 - which is true of every implementation of these functions
+; and not a property of this one.
+; ----------------------------------------------------------------------
+Procedure.f Sin(x.f)
+  ProcedureReturn MathSinCos(x, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Cos(x) - the cosine of an angle given in RADIANS. Result -1.0 to 1.0.
+; Same accuracy, same 12867-radian refusal and same reasoning as Sin().
+; ----------------------------------------------------------------------
+Procedure.f Cos(x.f)
+  ProcedureReturn MathSinCos(x, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Tan(x) - the tangent of an angle given in RADIANS.
+;
+; Computed as Sin(x)/Cos(x), and the consequences of that are worth
+; stating rather than hiding. Near a pole (an odd multiple of pi/2) the
+; cosine is tiny and its few remaining significant bits decide the whole
+; answer, so accuracy degrades steadily as you approach one - away from a
+; pole this is about 3 ULP, at 1e-4 radians from a pole it is nearer 1e-3
+; relative. That is the identity's arithmetic, not a defect, and the
+; desktop BASIC behaves the same way.
+;
+; Cos(x) can never be exactly 0 for a representable x, since pi/2 is not
+; representable - but if it ever were, the answer would be the correctly
+; signed Infinity, which is also right.
+;
+;     Tan(0)       0.0        |x| > 12867   NaN
+; ----------------------------------------------------------------------
+Procedure.f Tan(x.f)
+  Protected s.f
+  Protected c.f
+  s = MathSinCos(x, 0)
+  c = MathSinCos(x, 1)
+  ProcedureReturn MathFDiv(s, c)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathATan(t) - arctangent of t, in radians, over the whole real line.
+; Result between -pi/2 and +pi/2. Internal; ATan2() is the public one.
+;
+; The argument is folded twice before the polynomial so that it only ever
+; has to cover |z| <= tan(pi/8) = 0.4142:
+;
+;     |t| > 2.4142   z = -1/t      and add pi/2   (atan t = pi/2 - atan 1/t)
+;     |t| > 0.4142   z = (t-1)/(t+1) and add pi/4
+;
+; Both identities are exact rearrangements, and folding twice is what
+; makes a four-coefficient minimax fit enough. Without it the series near
+; |t| = 1 converges so slowly that fifteen terms would not do.
+; ----------------------------------------------------------------------
+Procedure.f MathATan(t.f)
+  Protected a.f
+  Protected z.f
+  Protected w.f
+  Protected p.f
+  Protected y0.f
+  Protected v.f
+  Protected neg.l
+  neg = 0
+  a = t
+  If MathFLt(a, 0.0) = 1
+    a = MathFSub(0.0, a)
+    neg = 1
+  EndIf
+  If MathFGt(a, 2.414213562373095) = 1
+    z = MathFDiv(-1.0, a)
+    y0 = 1.5707963267948966
+  ElseIf MathFGt(a, 0.4142135623730950) = 1
+    z = MathFDiv(MathFSub(a, 1.0), MathFAdd(a, 1.0))
+    y0 = 0.7853981633974483
+  Else
+    z = a
+    y0 = 0.0
+  EndIf
+  w = MathFMul(z, z)
+  p = 0.0805374449538
+  p = MathFAdd(MathFMul(p, w), -0.138776856032)
+  p = MathFAdd(MathFMul(p, w), 0.199777106478)
+  p = MathFAdd(MathFMul(p, w), -0.333329491539)
+  v = MathFAdd(y0, MathFAdd(z, MathFMul(z, MathFMul(p, w))))
+  If neg <> 0
+    ProcedureReturn MathFSub(0.0, v)
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ATan2(x, y) - the angle in radians between the x axis and the direction
+; (x, y). Result between -pi and +pi.
+;
+; ================ THE X COMES FIRST. READ THIS TWICE. =================
+; The desktop BASIC spells this ATan2(x, y) and computes the arctangent
+; of y/x. Every C library, and everything that copies C, spells the same
+; function atan2(y, x) - the arguments the other way round. This file
+; follows the desktop, because that is the language these names come
+; from. Swapping them does not fail; it silently reflects every angle
+; about the 45-degree line, which is a bug people find on a robot rather
+; than on a bench.
+;
+;     ATan2(1, 0)   0.0            ATan2(0, 1)    +pi/2
+;     ATan2(-1, 0)  +pi            ATan2(0, -1)   -pi/2
+;     ATan2(10, 10) +pi/4          ATan2(0, 0)    0.0
+;
+; ATan2(0, 0) is 0.0, which is a DEFINITION, not a computation - the
+; direction of a zero-length vector is not a question with an answer, and
+; 0.0 is the answer the desktop gives, so it is the answer given here.
+;
+; Infinite arguments are handled explicitly rather than left to fall out
+; of the division: y/x with both infinite is a NaN, and a NaN there would
+; be a wrong answer for a direction that is perfectly well defined.
+; ----------------------------------------------------------------------
+Procedure.f ATan2(x.f, y.f)
+  Protected ix.l
+  Protected iy.l
+  Protected r.f
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn x
+  EndIf
+  If MathFIsNaNB(MathBitsOf(y)) = 1
+    ProcedureReturn y
+  EndIf
+  ix = IsInfinity(x)
+  iy = IsInfinity(y)
+  If ix <> 0 Or iy <> 0
+    If ix > 0 And iy = 0
+      ProcedureReturn 0.0
+    EndIf
+    If ix < 0 And iy = 0
+      If MathFLt(y, 0.0) = 1
+        ProcedureReturn -3.141592653589793
+      EndIf
+      ProcedureReturn 3.141592653589793
+    EndIf
+    If ix = 0 And iy > 0
+      ProcedureReturn 1.5707963267948966
+    EndIf
+    If ix = 0 And iy < 0
+      ProcedureReturn -1.5707963267948966
+    EndIf
+    ; both infinite: the direction is one of the four diagonals
+    If ix > 0 And iy > 0
+      ProcedureReturn 0.7853981633974483
+    EndIf
+    If ix > 0 And iy < 0
+      ProcedureReturn -0.7853981633974483
+    EndIf
+    If ix < 0 And iy > 0
+      ProcedureReturn 2.356194490192345
+    EndIf
+    ProcedureReturn -2.356194490192345
+  EndIf
+  If MathFEq(x, 0.0) = 1
+    If MathFGt(y, 0.0) = 1
+      ProcedureReturn 1.5707963267948966
+    EndIf
+    If MathFLt(y, 0.0) = 1
+      ProcedureReturn -1.5707963267948966
+    EndIf
+    ProcedureReturn 0.0               ; ATan2(0, 0) - defined as 0.0
+  EndIf
+  r = MathATan(MathFDiv(y, x))
+  If MathFGt(x, 0.0) = 1
+    ProcedureReturn r
+  EndIf
+  If MathFLt(y, 0.0) = 1
+    ProcedureReturn MathFSub(r, 3.141592653589793)
+  EndIf
+  ProcedureReturn MathFAdd(r, 3.141592653589793)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; MathPowInt(x, k) - x raised to a whole number power, by repeated
+; squaring. Internal; Pow() routes to it whenever it can.
+; k may be negative; k of 0 gives 1.0.
+;
+; `e >> 1` on a 64-bit .i: e is made non-negative on the line above, and
+; an arithmetic right shift of a non-negative value is a logical one, so
+; the loop terminates exactly as it did at 32 bits. Named because ">> on
+; a value that might be negative" is one of the shapes this port was told
+; to hunt, and this is the one place in the file it appears.
+; ----------------------------------------------------------------------
+Procedure.f MathPowInt(x.f, k.l)
+  Protected base.f
+  Protected acc.f
+  Protected e.l
+  acc = 1.0
+  base = x
+  e = k
+  If e < 0
+    e = 0 - e
+  EndIf
+  While e > 0
+    If (e & 1) <> 0
+      acc = MathFMul(acc, base)
+    EndIf
+    base = MathFMul(base, base)
+    e = e >> 1
+  Wend
+  If k < 0
+    ProcedureReturn MathFDiv(1.0, acc)
+  EndIf
+  ProcedureReturn acc
+EndProcedure
+
+; ----------------------------------------------------------------------
+; Pow(x, y) - x raised to the power y. There is no '^' operator in this
+; language, which is what this function is for.
+;
+;     Pow(2, 10)    1024.0       Pow(0, 0)     1.0
+;     Pow(-2, 3)    -8.0         Pow(0, -1)    +Infinity
+;     Pow(-2, 0.5)  NaN          Pow(x, 0)     1.0, always
+;     Pow(27, 0.3333333) about 3.0
+;     Pow(-2, 100)  NaN          - NOT 1.27e30. See THE BOUND below.
+;
+; A NEGATIVE BASE NEEDS A WHOLE-NUMBER EXPONENT. Pow(-8, 1/3) is NaN
+; here and NaN on the desktop: (-8)^(1/3) has no real value, and the cube
+; root a reader is thinking of is a different function. This is a
+; refusal, not a limitation.
+;
+; TWO PATHS, and which one you get changes the accuracy:
+;
+;   y is a whole number with |y| <= 64  ->  repeated squaring. Exact
+;     where the answer is exact, and 6.06 ULP worst case otherwise
+;     (measured here, |y| <= 20). This is where a negative base is
+;     allowed. Pow(2,10) is exactly 1024.0.
+;
+;   otherwise  ->  Exp(y * Log(x)), which is the only general method
+;     available and carries the error of the composition: 39.99 ULP
+;     worst case, measured here over base 0.01..50 and |y| <= 20, which
+;     is about 2.4e-06 relative and roughly forty times the type's own
+;     resolution. That is inherent - a 1-ULP error in Log(x) is
+;     multiplied by y before Exp() ever sees it - and the whole-number
+;     path exists precisely because it is the case where that price need
+;     not be paid.
+;
+; THE BOUND. For a POSITIVE base, |y| <= 64 is only a cost decision:
+; x^64 already overflows binary32 for any base of 4 or more.
+;
+; FOR A NEGATIVE BASE IT IS A CORRECTNESS BOUND, and that is the sharp
+; edge in this function. Past |y| = 64 a negative base falls through to
+; the general path, which refuses it - so Pow(-2, 100) is NaN even
+; though the true answer, 1.2676506e30, is an ordinary representable
+; binary32. Asserted on this target, not inherited. If you need a
+; negative base with a large whole exponent, call MathPowInt(x, k)
+; directly: it has no bound and is what the short path uses.
+; ----------------------------------------------------------------------
+Procedure.f Pow(x.f, y.f)
+  Protected k.l
+  Protected kf.f
+  Protected a.f
+  Protected r.f
+  If MathFEq(y, 0.0) = 1                  ; even Pow(NaN, 0) is 1.0
+    ProcedureReturn 1.0
+  EndIf
+  If MathFIsNaNB(MathBitsOf(x)) = 1
+    ProcedureReturn x
+  EndIf
+  If MathFIsNaNB(MathBitsOf(y)) = 1
+    ProcedureReturn y
+  EndIf
+  If MathFEq(x, 1.0) = 1
+    ProcedureReturn 1.0
+  EndIf
+  ; a whole-number exponent small enough to reach by squaring
+  If MathFGe(y, -64.0) = 1 And MathFLe(y, 64.0) = 1
+    k = Int(y)
+    kf = MathFFromInt(k)
+    If MathFEq(kf, y) = 1
+      If MathFEq(x, 0.0) = 1
+        If k < 0
+          ProcedureReturn MathFromBits(2139095040)    ; +Infinity
+        EndIf
+        ProcedureReturn 0.0
+      EndIf
+      ProcedureReturn MathPowInt(x, k)
+    EndIf
+  EndIf
+  If MathFEq(x, 0.0) = 1
+    If MathFLt(y, 0.0) = 1
+      ProcedureReturn MathFromBits(2139095040)
+    EndIf
+    ProcedureReturn 0.0
+  EndIf
+  If MathFLt(x, 0.0) = 1
+    ; a negative base with a fractional exponent has no real value
+    ProcedureReturn MathFromBits(2143289344)
+  EndIf
+  a = Log(x)
+  r = MathFMul(y, a)
+  ProcedureReturn Exp(r)
+EndProcedure

@@ -1,0 +1,740 @@
+; pi4FanSelfTest.pi4 - the fan stack, measured rather than believed.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; It has TWO jobs and they are the same program on purpose.
+;
+;   AT THE DESK it is the payload tools/a64/a64_fan_check.py drives under
+;   the AArch64 model, with a modelled PWM block, clock manager, thermal
+;   register and property mailbox behind it. Everything it prints is a
+;   labelled line the gate parses and checks against numbers computed
+;   independently from the datasheet and the device tree.
+;
+;   ON THE BENCH it is what says whether any of that was true. The same
+;   labels, the same order, on a real BCM2711 - and two sections only it
+;   can answer: whether the AVS register and the firmware agree about the
+;   temperature, and whether a fan actually turns.
+;
+; BUILT WITH --entry-returns, WHICH IS WHY IT IS SAFE TO RUN ON THE BOARD.
+; It is sent to a resident Anvil and RETURNS to it, so a wrong answer
+; costs a line of output rather than a walk to the plug:
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4FanSelfTest.pi4 \
+;        -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o fanself.img
+;
+; IT DRIVES NO PIN UNLESS ONE IS NAMED IN #FAN_TEST_PIN. That default is
+; -1 and every section below that would touch a pad is skipped, so the
+; program is safe to run on a board with nothing wired and on a board
+; whose header is carrying something else. Set it to the pin the fan is
+; actually on, rebuild, and sections G and H drive it.
+;
+; THE RETURN VALUE is the number of internal disagreements - checks this
+; program can make against itself without any outside knowledge. Zero
+; does NOT mean the numbers are right; that is what the gate is for.
+
+; THE SEAM REGISTRY COMES BEFORE thermal.pi4 ON ANVIL MAIN. The register
+; half of the temperature library became a driver module
+; (RaspberryPi4/Modules/thermal_avs.pi4, built into THERMAL.MOD), and
+; thermal.pi4 now reads the part through the thermal seam and falls back to
+; the firmware when nothing fills it - so the consumer needs the registry
+; it asks.
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pwm.pi4"
+; Print() in the registry and in thermal.pi4 lands in str_print_at. This
+; program has no string library, so the one it needs is the same eight
+; lines PutS below is: wait for room in the PL011 FIFO, write a byte.
+Procedure str_print_at(p.i)
+  Define c.i
+  Repeat
+    c = PeekA(p)
+    If c = 0 : Break : EndIf
+    Repeat
+    Until (PeekN($FE201018) & 32) = 0
+    PokeL($FE201000, c)
+    p = p + 1
+  ForEver
+EndProcedure
+
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "RaspberryPi4/Lib/thermal.pi4"
+XIncludeFile "Anvil/Core/fan.pbi"
+
+; ----------------------------------------------------------------------
+;  THE REGISTER DRIVER, AND WHY IT IS NOT INCLUDED HERE BY DEFAULT.
+;
+;  RaspberryPi4/Modules/thermal_avs.pi4 is a MODULE source: its `Module`
+;  declaration makes any build that includes it a position-independent
+;  module build, which this program is not. So as committed this program
+;  builds with #FAN_AVS_DRIVER = 0 and no driver: sections A and B's
+;  register half say they were skipped, and B reads the seam EMPTY - the
+;  state of a board with no THERMAL.MOD on its card - and falls back to the
+;  firmware, which is itself a behaviour worth seeing.
+;
+;  tools/a64/a64_fan_check.py builds a copy with #FAN_AVS_DRIVER = 1, the
+;  line below replaced by an include of the driver's own source with its
+;  four module declaration lines removed (nothing else touched), and
+;  #FAN_AVS_DEVICE set to the handle RaspberryPi4/Board/hw_mod.pi4 gives
+;  the driver. The loader's part - allow the seam, open the fill window,
+;  call ModuleInit with a service table whose fill slot is ModSeamFill -
+;  is done by section B below, in the same order the loader does it.
+; ----------------------------------------------------------------------
+#FAN_AVS_DRIVER = 0
+#FAN_AVS_DEVICE = 0
+; FAN-AVS-DRIVER-INCLUDE
+
+; THE PIN. -1 means "drive nothing", which is the default and the only
+; safe one until somebody says what is wired where. 18 is the usual
+; four-wire fan choice on this header and is a hardware PWM channel; any
+; other user pin gets the software toggle.
+#FAN_TEST_PIN = -1
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+Global fails.i
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; One labelled value. Every parsed line in this program goes through
+; here or through Row2/Row3, so the gate has three shapes to match and
+; not thirty.
+Procedure Row(*name, v.i)
+  PutS(*name)
+  PutC(32)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+Procedure Row2(*name, a.i, b.i)
+  PutS(*name)
+  PutC(32)
+  PutDec(a)
+  PutC(32)
+  PutDec(b)
+  PutNl()
+EndProcedure
+
+Procedure Row4(*name, a.i, b.i, c.i, d.i)
+  PutS(*name)
+  PutC(32)
+  PutDec(a)
+  PutC(32)
+  PutDec(b)
+  PutC(32)
+  PutDec(c)
+  PutC(32)
+  PutDec(d)
+  PutNl()
+EndProcedure
+
+; An internal disagreement - something this program can check against
+; itself. Counted and named; the gate reads the count too, so a self-
+; check that starts failing is visible even in a run nobody watched.
+Procedure Claim(*what, got.i, want.i)
+  If got = want
+    ProcedureReturn
+  EndIf
+  fails = fails + 1
+  PutS("!! ")
+  PutS(*what)
+  PutS(" gave ")
+  PutDec(got)
+  PutS(" and this program expected ")
+  PutDec(want)
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  A - THE TEMPERATURE CONVERSION
+;
+;  AvsCodeToMilliC, in the THERMAL.MOD driver, is a pure line and this
+;  walks it. The named codes are the ones worth being able to point at; the
+;  fold is every code the ten-bit field can hold, so a conversion that is
+;  right at eight points and wrong in between is caught. Without the driver
+;  linked (see #FAN_AVS_DRIVER) only the consumer's rounding is walked.
+; ======================================================================
+Procedure SectionA()
+  Define i.i
+  Define chk.i
+  PutS("=== A conversion ===")
+  PutNl()
+  CompilerIf #FAN_AVS_DRIVER = 1
+  Row2("A code", 0, AvsCodeToMilliC(0))
+  Row2("A code", 1, AvsCodeToMilliC(1))
+  Row2("A code", 512, AvsCodeToMilliC(512))
+  Row2("A code", 698, AvsCodeToMilliC(698))
+  Row2("A code", 739, AvsCodeToMilliC(739))
+  Row2("A code", 842, AvsCodeToMilliC(842))
+  Row2("A code", 843, AvsCodeToMilliC(843))
+  Row2("A code", 1023, AvsCodeToMilliC(1023))
+
+  ; THE FIELD IS MASKED, so a code with rubbish above bit 9 converts as
+  ; if that rubbish were not there. Checked here rather than assumed,
+  ; because the raw status word HAS bits above the field and one of them
+  ; is a validity bit.
+  Claim("the data mask", AvsCodeToMilliC($10400 + 739), AvsCodeToMilliC(739))
+
+  ; A BIGGER CODE MUST BE A COLDER PART. The slope is negative and that
+  ; is the single most likely thing for a reader to get backwards, so it
+  ; is a claim and not a comment.
+  If AvsCodeToMilliC(700) > AvsCodeToMilliC(699)
+    fails = fails + 1
+    PutS("!! the conversion is monotonically INCREASING in the code, and the")
+    PutNl()
+    PutS("   sensor's slope is negative - a bigger code is a colder part.")
+    PutNl()
+  EndIf
+
+  chk = 0
+  i = 0
+  While i < 1024
+    ; Offset before folding so a negative millidegree value does not
+    ; turn the running checksum negative and diverge from a host that
+    ; folds it as an unsigned quantity.
+    chk = (chk * 131 + (AvsCodeToMilliC(i) + 1000000)) % 1000000007
+    i = i + 1
+  Wend
+  Row("A fold", chk)
+
+  ; The validity bits, as a pure predicate over constructed words. Both
+  ; must be set; either alone is not a reading the vendor's own driver
+  ; would use.
+  Row2("A validof", $10400, AvsValid($10400))
+  Row2("A validof", $10000, AvsValid($10000))
+  Row2("A validof", $00400, AvsValid($00400))
+  Row2("A validof", $00000, AvsValid($00000))
+  Row2("A validof", $FFFFFFFF, AvsValid($FFFFFFFF))
+
+  CompilerElse
+  PutS("A skipped - no register driver is linked into this build, so only the")
+  PutNl()
+  PutS("  rounding below is walked.")
+  PutNl()
+  CompilerEndIf
+
+  ; Whole degrees, rounded to nearest, on both sides of zero.
+  Row2("A whole", 52341, ThermalWholeC(52341))
+  Row2("A whole", 52500, ThermalWholeC(52500))
+  Row2("A whole", 52499, ThermalWholeC(52499))
+  Row2("A whole", 0, ThermalWholeC(0))
+  Row2("A whole", 499, ThermalWholeC(499))
+  Row2("A whole", 500, ThermalWholeC(500))
+  Row2("A whole", -499, ThermalWholeC(-499))
+  Row2("A whole", -500, ThermalWholeC(-500))
+  Row2("A whole", -1600, ThermalWholeC(-1600))
+  Row("A whole none", ThermalWholeC(#THERM_NONE))
+EndProcedure
+
+; ======================================================================
+;  B - THE TWO SOURCES
+;
+;  What the driver says, what the firmware says, which one the library
+;  chose, and - the line only a real board can answer - whether the two
+;  agree.
+;
+;  THE LOADER'S STEPS, IN THE LOADER'S ORDER. Anvil/Core/mod_lifecycle.pbi
+;  allows a module's declared seams, opens the fill window for exactly one
+;  init call, and closes it; ModuleInit publishes through the service
+;  table's fill slot. That is repeated here with the registry's own
+;  procedures and a two-slot-deep table, so the call the driver makes is
+;  the call it makes on the board.
+; ======================================================================
+Global Dim fanSvc.i[#SVC_SEAM_HDR_BYTES / 8 + #SVC_SEAM_SLOT_GET + 1]
+
+Procedure SectionB()
+  Define raw.i
+  Define reg.i
+  Define mbx.i
+  Define pick.i
+  Define diff.i
+
+  PutS("=== B sources ===")
+  PutNl()
+  ModSeamReset()
+
+  CompilerIf #FAN_AVS_DRIVER = 1
+  raw = AvsStatus(#FAN_AVS_DEVICE)
+  PutS("B raw ")
+  PutHex(raw, 8)
+  PutNl()
+  Row("B valid", AvsValid(raw))
+  Row("B probe", ModuleProbe(0, #FAN_AVS_DEVICE))
+  fanSvc[#SVC_SEAM_HDR_BYTES / 8 + #SVC_SEAM_SLOT_FILL] = @ModSeamFill
+  Row("B allow", ModSeamAllow(0, #SVCCAP_THERMAL))
+  ModSeamFillOpen(0)
+  Row("B init", ModuleInit(@fanSvc[0], #FAN_AVS_DEVICE))
+  Row("B fills", ModSeamFillClose())
+  CompilerElse
+  PutS("B driver none - no register driver is linked into this build, so the")
+  PutNl()
+  PutS("  thermal seam is empty and the firmware has to answer.")
+  PutNl()
+  CompilerEndIf
+
+  reg = ThermalSeamMilliC()
+  Row("B regmilli", reg)
+
+  If MailboxInit() = 0
+    Row("B mbxinit", 0)
+  Else
+    Row("B mbxinit", 1)
+  EndIf
+  mbx = ThermalMailboxMilliC()
+  Row("B mbxmilli", mbx)
+  Row("B maxmilli", ThermalMaxMilliC())
+
+  pick = ThermalMilliC()
+  Row("B milli", pick)
+  Row("B source", ThermalSource())
+  Row("B regfails", ThermalRegisterFailures())
+  ; THE BINDING. thermal.pi4 binds the seam on its first good read, so an
+  ; unload can be refused while the readings depend on the driver. One
+  ; binding after a good read; none when the driver never answered.
+  Row("B bound", ModSeamBindCount(#SVCCAP_THERMAL))
+
+  ; THE LINE ONLY SILICON CAN WRITE. Two independent thermometers on one
+  ; die should not disagree by much; what "much" is has never been
+  ; measured on this part, so the difference is REPORTED and not judged.
+  ; A gate cannot check this - it invented both numbers.
+  If reg <> #THERM_NONE And mbx <> #THERM_NONE
+    diff = reg - mbx
+    Row("B agree", diff)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  C - THE CURVE, walked
+; ======================================================================
+Procedure SectionC()
+  Define t.i
+  Define chk.i
+
+  PutS("=== C curve ===")
+  PutNl()
+  ; EVERY NUMBER IN THIS SECTION IS MILLI-FAHRENHEIT. The curve has been
+  ; Fahrenheit throughout since the 2026-09-07 ruling; the knees are at
+  ; 113000 and 158000 where they used to be at 45000 and 70000, and they
+  ; are the same two temperatures.
+  FanPolicyReset()
+  Row2("C low", FanLowF(), FanHighF())
+  Row("C hyst", FanHysteresisF())
+
+  Row2("C ramp", 0, FanRampDuty(0))
+  Row2("C ramp", 112999, FanRampDuty(112999))
+  Row2("C ramp", 113000, FanRampDuty(113000))
+  Row2("C ramp", 113001, FanRampDuty(113001))
+  Row2("C ramp", 122000, FanRampDuty(122000))
+  Row2("C ramp", 135500, FanRampDuty(135500))
+  Row2("C ramp", 157999, FanRampDuty(157999))
+  Row2("C ramp", 158000, FanRampDuty(158000))
+  Row2("C ramp", 158001, FanRampDuty(158001))
+  Row2("C ramp", 248000, FanRampDuty(248000))
+
+  ; MONOTONIC, and this is the property a wrong interpolation breaks
+  ; while still looking plausible at the two ends.
+  t = 104000
+  chk = -1
+  While t <= 167000
+    If FanRampDuty(t) < chk
+      fails = fails + 1
+      PutS("!! the ramp went DOWN as the part got hotter, at ")
+      PutDec(t)
+      PutNl()
+      Break
+    EndIf
+    chk = FanRampDuty(t)
+    t = t + 100
+  Wend
+
+  chk = 0
+  t = 104000
+  While t <= 167000
+    chk = (chk * 131 + FanRampDuty(t)) % 1000000007
+    t = t + 100
+  Wend
+  Row("C fold", chk)
+
+  ; THE NARROWEST LEGAL CURVE. One degree of span, which the setter
+  ; allows and which is the closest this policy comes to a thermostat.
+  ; 30 F and 31 F - the numbers did not have to change when the unit
+  ; did, because they are inside the legal band in either scale.
+  Row("C setnarrow", FanSetCurve(30, 31))
+  Row2("C narrow", 30000, FanRampDuty(30000))
+  Row2("C narrow", 30500, FanRampDuty(30500))
+  Row2("C narrow", 31000, FanRampDuty(31000))
+  FanPolicyReset()
+EndProcedure
+
+; ======================================================================
+;  D - HYSTERESIS AND THE SPIN-UP KICK, as a scripted walk
+;
+;  The time is PASSED IN rather than read, so this sequence is exactly
+;  reproducible and the gate can predict every duty in it. That is the
+;  whole reason FanDutyFor takes a clock instead of reading one.
+; ======================================================================
+Procedure DStep(milli.i, ms.i)
+  Define d.i
+  d = FanDutyFor(milli, 1, ms)
+  Row4("D step", milli, ms, d, FanIsRunning())
+EndProcedure
+
+Procedure SectionD()
+  PutS("=== D hysteresis ===")
+  PutNl()
+  FanPolicyReset()
+
+  ; MILLI-FAHRENHEIT, like section C and like the policy itself.
+  ; Cold, and it stays off.
+  DStep(68000, 1000)
+  DStep(112999, 1100)
+  ; The start threshold is the low point ITSELF, not above it, and the
+  ; kick fires with it.
+  DStep(113000, 1200)
+  ; Still inside the 400 ms kick.
+  DStep(114000, 1300)
+  DStep(122000, 1599)
+  ; Past it - the ramp takes over.
+  DStep(122000, 1600)
+  DStep(122000, 2000)
+  ; Cooling. 113 - 5 = 108, and the stop is STRICTLY below that, so
+  ; 108000 exactly is still running and 107999 is not.
+  DStep(109000, 2500)
+  DStep(108000, 3000)
+  DStep(107999, 3500)
+  ; Stopped. And starting again re-arms the kick.
+  DStep(107999, 4000)
+  DStep(113000, 4500)
+  DStep(113000, 4600)
+  DStep(113000, 5000)
+  Row2("D starts", FanStarts(), FanStops())
+
+  ; NO THERMOMETER MEANS FULL. The one behaviour that has to be right
+  ; when everything else has gone wrong.
+  Row("D blind", FanDutyFor(0, 0, 6000))
+  Row("D blindticks", FanBlindTicks())
+
+  ; The modes, and the precedence: OFF outranks the failsafe. 194000 is
+  ; 194 F, which is hotter than the curve's high point by a wide margin.
+  FanSetMode(#FAN_MODE_OFF)
+  Row("D off", FanDutyFor(194000, 1, 7000))
+  Row("D offblind", FanDutyFor(0, 0, 7100))
+  FanSetMode(#FAN_MODE_ON)
+  Row("D on", FanDutyFor(0, 1, 7200))
+  FanSetMode(#FAN_MODE_FIXED)
+  FanSetFixed(370)
+  Row("D fixed", FanDutyFor(194000, 1, 7300))
+  FanSetMode(#FAN_MODE_AUTO)
+  ; A mode change clears the running bit, so this is a fresh start and
+  ; carries a kick.
+  Row("D reauto", FanDutyFor(122000, 1, 7400))
+  FanPolicyReset()
+EndProcedure
+
+; ======================================================================
+;  E - WHAT MUST BE REFUSED
+; ======================================================================
+Procedure SectionE()
+  PutS("=== E refusals ===")
+  PutNl()
+
+  ; Before any begin, so the state refusal is reached rather than a
+  ; write landing on a channel nobody started.
+  Row("E dutynostate", PwmDuty(500))
+  Row("E endnostate", PwmEnd())
+  Row("E softdutynostate", PwmSoftDuty(500))
+
+  ; A pin with no PWM function. 4 and 17 are ordinary header pins; 2 is
+  ; the I2C data line and equally not a PWM pin.
+  Row("E pin4", PwmBegin(4, 25000))
+  Row("E pin17", PwmBegin(17, 25000))
+  Row("E pin2", PwmBegin(2, 25000))
+  Row("E pinneg", PwmBegin(-1, 25000))
+  Row("E pin99", PwmBegin(99, 25000))
+
+  ; Frequencies the clock cannot make. The top of the envelope is the
+  ; oscillator over the smallest legal range, so one hertz past it has
+  ; no range left.
+  Row("E hz0", PwmBegin(18, 0))
+  Row("E hzneg", PwmBegin(18, -1))
+  Row("E hztoohigh", PwmBegin(18, 27000001))
+  Row("E hzway", PwmBegin(18, 100000000))
+
+  ; The software channel's own envelope.
+  Row("E softhz0", PwmSoftBegin(5, 0, 1))
+  Row("E softhzhigh", PwmSoftBegin(5, 1001, 1))
+  Row("E softpin", PwmSoftBegin(99, 100, 1))
+
+  ; The curve's setters.
+  Row("E curveinvert", FanSetCurve(70, 45))
+  Row("E curveequal", FanSetCurve(50, 50))
+  Row("E curvelow", FanSetCurve(-100, 70))
+  Row("E curvehigh", FanSetCurve(45, 500))
+  Row("E hystbig", FanSetHysteresis(50))
+  Row("E hystneg", FanSetHysteresis(-1))
+  Row("E hystzero", FanSetHysteresis(0))
+  Row("E modebad", FanSetMode(9))
+  Row("E modeneg", FanSetMode(-1))
+  Row("E fixedbig", FanSetFixed(1001))
+  Row("E fixedneg", FanSetFixed(-1))
+  FanPolicyReset()
+EndProcedure
+
+; ======================================================================
+;  F - THE DIVISOR ARITHMETIC
+;
+;  No register is touched here; these are the three pure functions that
+;  decide what will be written. Printing them separately means a wrong
+;  divisor is a wrong NUMBER in the transcript rather than a wrong
+;  waveform nobody can see.
+; ======================================================================
+Procedure FRow(hz.i)
+  Row4("F hz", hz, PwmDivisorFor(hz), PwmRangeFor(hz), PwmActualHzFor(hz))
+EndProcedure
+
+Procedure SectionF()
+  PutS("=== F divisors ===")
+  PutNl()
+  FRow(25000)
+  FRow(1000)
+  FRow(100)
+  FRow(50)
+  FRow(10)
+  FRow(2)
+  FRow(1)
+  FRow(27000000)
+  FRow(13500000)
+  FRow(27000001)
+  FRow(0)
+
+  ; The duty arithmetic, at the two rails and either side of a rounding
+  ; boundary. A range of 4 is where truncation and rounding to nearest
+  ; give visibly different answers.
+  Row2("F duty2160", 0, PwmDutyCounts(2160, 0))
+  Row2("F duty2160", 1, PwmDutyCounts(2160, 1))
+  Row2("F duty2160", 500, PwmDutyCounts(2160, 500))
+  Row2("F duty2160", 999, PwmDutyCounts(2160, 999))
+  Row2("F duty2160", 1000, PwmDutyCounts(2160, 1000))
+  Row2("F duty4", 125, PwmDutyCounts(4, 125))
+  Row2("F duty4", 749, PwmDutyCounts(4, 749))
+  Row2("F duty4", 750, PwmDutyCounts(4, 750))
+EndProcedure
+
+; ======================================================================
+;  G - THE PIN TABLE, and then the registers
+; ======================================================================
+Procedure GRow(pin.i)
+  Row4("G pin", pin, PwmPinBlock(pin), PwmPinChannel(pin), PwmPinAlt(pin))
+EndProcedure
+
+Procedure SectionG()
+  PutS("=== G pins ===")
+  PutNl()
+  GRow(12)
+  GRow(13)
+  GRow(18)
+  GRow(19)
+  GRow(40)
+  GRow(41)
+  GRow(45)
+  GRow(52)
+  GRow(53)
+  GRow(4)
+  GRow(14)
+  GRow(0)
+EndProcedure
+
+; ======================================================================
+;  H - PROGRAMMING A REAL CHANNEL
+;
+;  SKIPPED unless #FAN_TEST_PIN names a pin, because this one puts a
+;  waveform on a pad. Under the model the gate compiles a copy with the
+;  pin set and checks every register write byte for byte; on the bench
+;  it is what makes a fan turn.
+; ======================================================================
+Procedure SectionH()
+  Define rc.i
+  PutS("=== H hardware ===")
+  PutNl()
+  If #FAN_TEST_PIN < 0
+    PutS("H skipped - no pin is configured, so nothing was driven.")
+    PutNl()
+    ProcedureReturn
+  EndIf
+  If PwmPinIsCapable(#FAN_TEST_PIN) = 0
+    PutS("H skipped - the configured pin has no PWM channel; section J is the")
+    PutNl()
+    PutS("  software one.")
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  rc = PwmBegin(#FAN_TEST_PIN, 25000)
+  Row("H begin", rc)
+  If rc <> #PWM_OK
+    ProcedureReturn
+  EndIf
+  Row4("H state", PwmPin(), PwmRange(), PwmDivisor(), PwmHz())
+  Row("H kind", PwmKind())
+  Row("H clockhz", PwmClockHz())
+
+  Row("H duty0", PwmDuty(0))
+  Row("H read0", PwmDutyNow())
+  Row("H duty500", PwmDuty(500))
+  Row("H read500", PwmDutyNow())
+  Row("H duty1000", PwmDuty(1000))
+  Row("H read1000", PwmDutyNow())
+  Row("H dutybad", PwmDuty(1001))
+  Row("H dutyneg", PwmDuty(-1))
+  ; The refused ones must not have moved anything.
+  Row("H readafterbad", PwmDutyNow())
+
+  Row("H end", PwmEnd())
+  Row("H kindafter", PwmKind())
+  ; The pad is handed back as an INPUT, which is the safe end for both
+  ; kinds of fan wiring - see PwmEnd's note.
+  Row("H mode", PinModeGet(#FAN_TEST_PIN))
+EndProcedure
+
+; ======================================================================
+;  J - THE SOFTWARE CHANNEL
+;
+;  Also skipped without a pin. The cadence samples are the point: each
+;  line is one service call, the microsecond clock it saw, and the level
+;  it drove. The gate reconstructs the waveform from the same period and
+;  duty and checks every sample.
+; ======================================================================
+Procedure SectionJ()
+  Define rc.i
+  Define i.i
+  Define t0.i
+
+  PutS("=== J software ===")
+  PutNl()
+  If #FAN_TEST_PIN < 0
+    PutS("J skipped - no pin is configured, so nothing was driven.")
+    PutNl()
+    ProcedureReturn
+  EndIf
+
+  rc = PwmSoftBegin(#FAN_TEST_PIN, 100, 1)
+  Row("J begin", rc)
+  If rc <> #PWM_OK
+    ProcedureReturn
+  EndIf
+  Row("J kind", PwmKind())
+  Row("J hz", PwmHz())
+  Row("J duty", PwmSoftDuty(250))
+
+  ; 240 service calls. At a hundred hertz and this model's clock that
+  ; covers several whole periods, which is what makes the ratio below
+  ; mean anything.
+  i = 0
+  While i < 240
+    PwmSoftService()
+    Row2("J svc", Micros(), PwmSoftLevel())
+    i = i + 1
+  Wend
+  Row2("J edges", PwmSoftEdges(), PwmSoftStalls())
+
+  ; THE STALL RULE. Nothing is serviced for longer than two periods and
+  ; the pin must end up parked at the idle level with the event counted.
+  t0 = Micros()
+  While Micros() - t0 < 30000
+  Wend
+  PwmSoftService()
+  Row2("J stall", PwmSoftStalls(), PwmSoftLevel())
+
+  Row("J end", PwmSoftEnd())
+  Row("J mode", PinModeGet(#FAN_TEST_PIN))
+EndProcedure
+
+Procedure.i Main()
+  fails = 0
+  PutNl()
+  PutS("=== Pi 4 fan self-test - PWM, the SoC temperature, and the curve ===")
+  PutNl()
+  Row("PIN", #FAN_TEST_PIN)
+
+  TimerInit()
+
+  SectionA()
+  SectionB()
+  SectionC()
+  SectionD()
+  SectionE()
+  SectionF()
+  SectionG()
+  SectionH()
+  SectionJ()
+
+  PutS("=== ")
+  PutDec(fails)
+  PutS(" internal disagreements ===")
+  PutNl()
+  ProcedureReturn fails
+EndProcedure

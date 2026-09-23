@@ -1,0 +1,445 @@
+; ======================================================================
+;  hkdf.pi4 - HKDF (RFC 5869) AND THE TLS 1.3 KEY SCHEDULE, ON THE PI 4
+; ======================================================================
+;
+;  Translated from BearSSL (c) 2018 Thomas Pornin - MIT licence.
+;  The notice ships as licenses/BearSSL-LICENSE.txt (release condition).
+;
+;     XIncludeFile "Anvil/Core/sha256.pbi"   ; REQUIRED, include first
+;     XIncludeFile "RaspberryPi4/Lib/hmac.pi4"     ; REQUIRED, include second
+;     XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
+;
+;
+;  HKDF (RFC 5869) - HkdfExtract / HkdfExpand - translated from the
+;  BearSSL small-KDF core (src/kdf/hkdf.c), plus the TLS 1.3 key-schedule
+;  wrappers HkdfExpandLabel and DeriveSecret (RFC 8446 section 7.1). The
+;  1.3 wrappers are NOT in BearSSL (it tops out at 1.2); they are
+;  own-written against the RFC.
+;
+;  API:
+;    HkdfExtract(salt, saltlen, ikm, ikmlen, dst)
+;                                  PRK = HMAC(salt, IKM), 32 bytes at dst.
+;                                  saltlen <= 0 means the RFC 5869 no-salt
+;                                  salt (32 zero bytes).
+;    HkdfExpand(prk, prklen, info, infolen, dst, outlen)
+;                                  expand PRK over info into outlen bytes at
+;                                  dst; returns bytes produced (< outlen only
+;                                  at the public 255-block ceiling).
+;    HkdfExpandLabel(secret, seclen, label, labellen, context, ctxlen,
+;                    dst, outlen)  RFC 8446 HKDF-Expand-Label - prepends the
+;                                  "tls13 " prefix and frames the HkdfLabel.
+;                                  Returns bytes produced, or a negative
+;                                  #HKDF_ERR_* if the structure will not
+;                                  encode. See the REFUSALS section below.
+;    DeriveSecret(secret, seclen, label, labellen, thash, thlen, dst)
+;                                  RFC 8446 Derive-Secret: ExpandLabel with
+;                                  the (already computed) transcript hash as
+;                                  context and a 32-byte output.
+;
+;  REQUIRES sha256.pi4 and hmac.pi4, INCLUDED BEFORE THIS FILE IN THAT
+;  ORDER: HKDF is built entirely on HmacKey/HmacBegin/HmacUpdate/HmacEnd.
+;  A library never includes a library (house rule) - the MAIN file lists
+;  sha256, then hmac, then this file. If either is missing, this file
+;  fails loudly at compile time with the undefined procedures named,
+;  which is the house rule working. There is deliberately no stub.
+;
+;  sha256 turns EnableExplicit on for the whole program; every variable
+;  here is declared, as that pragma requires.
+;
+;  ======================================================================
+;   THE 64-BIT .i CHANGES NOTHING HERE EITHER, AND HERE IS WHY
+;  ======================================================================
+;
+;  Like hmac.pi4, this file contains no 32-bit word arithmetic at all.
+;  HKDF is byte plumbing over HMAC: concatenate, key, absorb, emit. The
+;  only numbers are LENGTHS (which want to be machine-width and are) and
+;  BYTES (which cannot overflow). There is no addition modulo 2^32, no
+;  rotate and no 32-bit shift, so #SHA256_W32 has nothing to be applied
+;  to and is not applied.
+;
+;  THE ONE SHIFT IN THE FILE is (outlen >> 8) & 255, writing the high
+;  byte of HkdfLabel's uint16 length. outlen is a small positive count -
+;  and it is now RANGE-CHECKED before that line runs, see below - so the
+;  arithmetic right shift on this target brings in zeros. It is a
+;  16-bit field, not a 32-bit word, and it is not part of the family of
+;  problems sha256.pi4's header describes.
+;
+;  RAW BYTES ARE READ WITH PeekA (ruling of 2026-08-25). The label and
+;  context bytes copied into HkdfLabelBuf are ordinary data and go
+;  through PeekA; PeekB would sign-extend anything from $80 up. A TLS
+;  1.3 context IS a transcript hash, which is 32 bytes of uniformly
+;  random-looking data - so on average HALF of them have bit 7 set, and
+;  this is not a corner case, it is the normal case.
+;
+;  ======================================================================
+;   REFUSALS - TWO DEFECTS FIXED HERE THAT THE OTHER FAMILIES STILL HAVE
+;  ======================================================================
+;
+;  THIS IS A DELIBERATE DIVERGENCE FROM RP2350/Lib/hkdf.pico2 AND IT
+;  SHOULD BE PORTED BACK. Two problems were found while reading that
+;  file's HkdfExpandLabel closely enough to port it:
+;
+;  1. THE BUFFER IS TWO BYTES TOO SMALL. RFC 8446 section 7.1 declares
+;
+;        opaque label<7..255>;
+;        opaque context<0..255>;
+;
+;     so the largest legal HkdfLabel is 2 (the uint16 length) + 1 + 255
+;     (the label and its length byte) + 1 + 255 (the context and its
+;     length byte) = 514 BYTES. The other copies declare a 512-byte
+;     buffer. A caller passing a maximal label and a maximal context
+;     writes two bytes past the end of a Global array, into whatever the
+;     linker put next. Nothing faults and nothing announces it.
+;
+;     Here the buffer is #HKDF_LABEL_MAX = 514, sized from the RFC
+;     rather than from a round number.
+;
+;  2. AN OVER-LONG LABEL WAS SILENTLY TRUNCATED, WHICH IS WORSE THAN THE
+;     OVERFLOW. The length byte is written as (6 + labellen) & 255. A
+;     label of 250 bytes gives 6 + 250 = 256, and "& 255" makes that
+;     ZERO - so the structure encodes as a zero-length label followed by
+;     256 bytes of stray text, the peer derives a different key, and the
+;     handshake fails somewhere else entirely with nothing pointing
+;     back here.
+;
+;     Here the two lengths are CHECKED and the procedure REFUSES:
+;
+;        #HKDF_ERR_LABEL    the label will not fit the <7..255> field
+;                           (i.e. labellen > 249, or negative)
+;        #HKDF_ERR_CONTEXT  the context will not fit <0..255>
+;        #HKDF_ERR_OUTLEN   outlen will not fit the uint16 length field
+;
+;     All three are NEGATIVE, and HkdfExpand's success value is a byte
+;     count which is never negative, so a caller can tell them apart
+;     with one comparison. A refusal writes NOTHING at dst.
+;
+;     None of the three can be triggered by a conforming TLS 1.3 peer -
+;     the longest label in RFC 8446 is "client application traffic
+;     secret" at 33 characters and a context is a 32-byte hash. That is
+;     the point: these refuse the cases that would otherwise be silent,
+;     and they are unreachable in normal operation.
+;
+;  ======================================================================
+;   CONSTANT TIME
+;  ======================================================================
+;
+;  Every loop bound and branch here is driven by a LENGTH - saltlen,
+;  ikmlen, infolen, outlen, labellen, ctxlen, the block counter - all
+;  public in every TLS use. THE THREE REFUSALS ABOVE ARE ALSO
+;  LENGTH-DRIVEN and therefore add no secret-dependent branch: they test
+;  labellen and ctxlen and outlen, never a byte of the secret.
+;
+;  Secret bytes (the PRK, the secret input, the running T block) flow
+;  only through HMAC-SHA-256, which is straight-line; they are never
+;  branched on and never used as an index. Secret-carrying buffers are
+;  named with a sec prefix so a reviewer can grep the taint.
+;
+;  As in hmac.pi4, THIS CLAIM IS STRUCTURAL AND NOT MEASURED - there is
+;  no cycle-counting harness for this backend today.
+;
+;  ======================================================================
+;   WHAT HAS BEEN PROVEN, AND WHAT HAS NOT - 2026-08-25
+;  ======================================================================
+;
+;  PROVEN, by known-answer test under the project's own A64 oracle
+;  (tools/a64/a64_interp.py) on a real image built by pmfc.exe for
+;  -t pi4 at $200000:
+;
+;    * RFC 5869 Appendix A, all three SHA-256 cases:
+;        A.1  basic, 22-byte IKM, 13-byte salt, 10-byte info, L=42
+;        A.2  longer inputs, 80/80/80, L=82 - THREE expansion blocks,
+;             so the T(i-1) feedback and the counter both get exercised
+;        A.3  zero-length salt and info, L=42 - the no-salt path
+;      BOTH HALVES of each case are checked: the PRK out of
+;      HkdfExtract, and the OKM out of HkdfExpand.
+;
+;        A.1 PRK 077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5
+;        A.1 OKM 3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf
+;                34007208d5b887185865
+;        A.2 PRK 06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244
+;        A.3 PRK 19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04
+;        A.3 OKM 8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d
+;                9d201395faa4b61a96c8
+;
+;    * A.1's INFO IS TEN BYTES, f0..f9, NOT EIGHT. This is noted because
+;      an eight-byte info gives the published PRK and a WRONG OKM - the
+;      extract half still passes and only the expand half moves, which
+;      is exactly the shape of error that gets waved through. It cost
+;      time here before the project's own vector file settled it.
+;    * Twenty further RFC 5869 random cases from the same authoritative
+;      file. 23 of 23.
+;    * TLS 1.3: ALL ELEVEN of the RFC 8448 "Simple 1-RTT Handshake"
+;      key-schedule operations the other three families are gated on -
+;      the early / handshake / master extracts, both "derived" steps,
+;      the client and server handshake traffic secrets, the server
+;      handshake key and iv, and the client and server application
+;      traffic secrets. 11 of 11. Between them they exercise
+;      HkdfExtract, HkdfExpandLabel and DeriveSecret, the "tls13 "
+;      framing, a 32-byte context and a zero-length context, and
+;      outputs of 12, 16 and 32 bytes.
+;
+;        early secret     33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a
+;        derived          6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba
+;        handshake secret 1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac
+;        c hs traffic     b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21
+;        s hs traffic     b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38
+;        server hs key    3fce516009c21727d0f2e4e86ee403bc
+;        server hs iv     5d313eb2671276ee13000b30
+;        master secret    18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919
+;        c ap traffic     9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5
+;        s ap traffic     a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643
+;
+;      Each op's RETURN VALUE was checked too, not only its output, so a
+;      refusal that happened to leave the right bytes in place could not
+;      pass as a success.
+;
+;  NOT PROVEN:
+;    * NOTHING HERE HAS RUN ON SILICON. RE-CHECKED 2026-08-27 AND
+;      STILL TRUE: nothing under RaspberryPi4/ includes this file, so
+;      no image that has booted contains a line of it. Dated on purpose
+;      - an undated "nothing has run" reads as present tense for ever,
+;      and an audit on that date found nine banners in this directory
+;      that had gone false exactly that way.
+;    * The three refusals above are checked by reading, not by a
+;      negative test in the gate. They are unreachable from the vector
+;      set by construction, since no legal TLS 1.3 label or context is
+;      long enough to trip one.
+;    * The constant-time claim is structural, not measured.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  THE HkdfLabel STRUCTURE'S OWN LIMITS, taken from RFC 8446 s7.1 rather
+;  than from a round number.
+;
+;    struct {
+;        uint16 length = outlen;              <- #HKDF_OUT_MAX
+;        opaque label<7..255>   = "tls13 " + label;
+;        opaque context<0..255> = context;
+;    } HkdfLabel;
+;
+;  #HKDF_LABEL_PREFIX is the 6 bytes of "tls13 " that every TLS 1.3
+;  label carries, so the caller's own label can be at most 255 - 6.
+; ----------------------------------------------------------------------
+;  THE ARITHMETIC IS IN THE COMMENTS, NOT IN THE EXPRESSIONS. A constant
+;  initialiser here takes at most one binary operator - "2 + 1 + 255 + 1
+;  + 255" is refused with "Cannot parse expression starting with '+'" -
+;  so each of these is written as the number it works out to with the
+;  sum beside it. Do not "tidy" one back into an expression; it will not
+;  build, and the failure is at the include site rather than here.
+; ==== PORTABLE CORE A64 BEGIN ====
+#HKDF_LABEL_PREFIX = 6                ; "tls13 "
+#HKDF_LABEL_TEXT_MAX = 249            ; 255 - 6, the caller's own label
+#HKDF_CTX_MAX = 255                   ; opaque context<0..255>
+#HKDF_OUT_MAX = 65535                 ; the uint16 length field
+#HKDF_LABEL_MAX = 514                 ; 2 + (1+255) + (1+255): worst legal case
+
+#HKDF_ERR_LABEL   = -1
+#HKDF_ERR_CONTEXT = -2
+#HKDF_ERR_OUTLEN  = -3
+
+; ----------------------------------------------------------------------
+;  STATE - flat Global arrays, house style. Secret-derived buffers carry a
+;  sec prefix so a reviewer can grep the taint.
+;
+;  HkdfZeroSalt is 32 zero bytes - the "no salt" salt of RFC 5869 (HashLen
+;  zeros). It is public, but it feeds the salt slot of a keyed HMAC so it is
+;  kept beside the secret state. secHkdfT holds the running T(i) block of
+;  HKDF-Expand (secret key material). HkdfCtr is the one counter byte fed
+;  to each block. HkdfLabelBuf assembles the RFC 8446 HkdfLabel structure -
+;  it holds only PUBLIC bytes (a length, the label text, and a transcript
+;  hash of public handshake messages), so it is not sec-named.
+;
+;  HkdfZeroSalt IS NEVER WRITTEN. It relies on .bss being zeroed before
+;  main() runs, which on this target is the __a64_bss_zero loop in the
+;  standard prologue - read out of the emitted assembly, not assumed.
+;  RaspberryPi4/Lib/safety.pi4's header documents the same fact from the
+;  other direction, where a Global that had to SURVIVE that loop could
+;  not be a Global at all.
+; ----------------------------------------------------------------------
+Global Dim HkdfZeroSalt.a[32]              ; 32 zero bytes: the RFC 5869 no-salt salt
+Global Dim secHkdfT.a[32]                  ; running T(i) block, secret key material
+Global Dim HkdfCtr.a[1]                    ; the single HKDF-Expand counter byte
+Global Dim HkdfLabelBuf.a[#HKDF_LABEL_MAX] ; RFC 8446 HkdfLabel: all public bytes
+
+; ----------------------------------------------------------------------
+;  HkdfExtract(salt, saltlen, ikm, ikmlen, dst) - RFC 5869 section 2.2.
+;
+;  PRK = HMAC-SHA-256(salt, IKM). A salt length <= 0 means "no salt": RFC
+;  5869 then uses a string of HashLen (32) zero bytes, which is what
+;  HkdfZeroSalt provides. Writes the 32-byte PRK at dst. Only the LENGTHS
+;  drive control here; salt and ikm bytes are never branched on or indexed.
+; ----------------------------------------------------------------------
+Procedure HkdfExtract(salt.i, saltlen.i, ikm.i, ikmlen.i, dst.i)
+  If saltlen <= 0
+    HmacKey(@HkdfZeroSalt[0], 32)
+  Else
+    HmacKey(salt, saltlen)
+  EndIf
+  HmacUpdate(ikm, ikmlen)
+  HmacEnd(dst, 32)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HkdfExpand(prk, prklen, info, infolen, dst, outlen) - RFC 5869 s2.3.
+;
+;    T(0) = empty
+;    T(i) = HMAC(PRK, T(i-1) | info | i)      i a single byte, 1..255
+;    OKM  = first outlen bytes of T(1) | T(2) | ...
+;
+;  The key (PRK) is set once with HmacKey; each block reuses it via
+;  HmacBegin, so no pad is re-hashed per block. Returns the bytes produced
+;  (outlen, or less only if the 255-block ceiling is hit - a public bound
+;  driven by outlen, never by secret data). The counter, offset and
+;  remainder are all length-driven; the secret flows only through the HMAC,
+;  which is straight-line. secHkdfT is the sole secret-carrying scratch.
+;
+;  THE COUNTER IS A BYTE AND THE CEILING IS RFC 5869'S OWN. "L <= 255 *
+;  HashLen", section 2.3 - 8160 bytes for SHA-256. On a 64-bit .i the
+;  counter variable is of course wider than a byte, which is why the
+;  ceiling is tested explicitly against 256 rather than left to a wrap
+;  that would never happen.
+; ----------------------------------------------------------------------
+Procedure.i HkdfExpand(prk.i, prklen.i, info.i, infolen.i, dst.i, outlen.i)
+  Protected i.i
+  Protected n.i
+  Protected off.i
+  Protected rem.i
+  Protected ctr.i
+  Protected first.i
+
+  If outlen <= 0
+    ProcedureReturn 0
+  EndIf
+
+  HmacKey(prk, prklen)
+
+  off = 0
+  rem = outlen
+  ctr = 0
+  first = 1
+  Repeat
+    ctr = ctr + 1
+    If ctr = 256
+      ProcedureReturn off
+    EndIf
+
+    HmacBegin()
+    If first = 0
+      HmacUpdate(@secHkdfT[0], 32)
+    EndIf
+    HmacUpdate(info, infolen)
+    HkdfCtr[0] = ctr & 255
+    HmacUpdate(@HkdfCtr[0], 1)
+    HmacEnd(@secHkdfT[0], 32)
+    first = 0
+
+    n = 32
+    If n > rem
+      n = rem
+    EndIf
+    i = 0
+    While i < n
+      PokeB(dst + off + i, secHkdfT[i] & 255)
+      i = i + 1
+    Wend
+    off = off + n
+    rem = rem - n
+    If rem = 0
+      ProcedureReturn outlen
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HkdfExpandLabel(secret, seclen, label, labellen, context, ctxlen,
+;                  dst, outlen) - RFC 8446 section 7.1.
+;
+;  HKDF-Expand(secret, HkdfLabel, outlen), where HkdfLabel is:
+;      struct {
+;          uint16 length = outlen;
+;          opaque label<7..255>   = "tls13 " + label;
+;          opaque context<0..255> = context;
+;      }
+;
+;  The 6-byte prefix "tls13 " is prepended to the caller's label. The whole
+;  HkdfLabel is public (a length, ASCII label text, and a transcript hash of
+;  public handshake bytes), so HkdfLabelBuf carries no secret; the secret is
+;  only the key handed to HkdfExpand. Lengths are the only control input.
+;
+;  THE THREE GUARDS AT THE TOP ARE NOT DEFENSIVE PROGRAMMING, they are
+;  the fix for a silent-truncation defect. See the REFUSALS section in
+;  the header before deleting one as unreachable - "unreachable" is
+;  exactly what a conforming peer guarantees and exactly what an
+;  attacker is not obliged to be.
+; ----------------------------------------------------------------------
+Procedure.i HkdfExpandLabel(secret.i, seclen.i, label.i, labellen.i, context.i, ctxlen.i, dst.i, outlen.i)
+  Protected i.i
+  Protected pos.i
+  Protected fulllen.i
+
+  If labellen < 0 Or labellen > #HKDF_LABEL_TEXT_MAX
+    ProcedureReturn #HKDF_ERR_LABEL
+  EndIf
+  If ctxlen < 0 Or ctxlen > #HKDF_CTX_MAX
+    ProcedureReturn #HKDF_ERR_CONTEXT
+  EndIf
+  If outlen < 0 Or outlen > #HKDF_OUT_MAX
+    ProcedureReturn #HKDF_ERR_OUTLEN
+  EndIf
+
+  HkdfLabelBuf[0] = (outlen >> 8) & 255
+  HkdfLabelBuf[1] = outlen & 255
+
+  ; The label's own length byte. fulllen cannot exceed 255 now - the
+  ; guard above is what makes that true, and the "& 255" below is
+  ; therefore a no-op kept for symmetry with the other byte stores.
+  fulllen = #HKDF_LABEL_PREFIX + labellen
+  HkdfLabelBuf[2] = fulllen & 255
+
+  ; "tls13 " - the RFC 8446 label prefix, six bytes
+  HkdfLabelBuf[3] = $74             ; t
+  HkdfLabelBuf[4] = $6C             ; l
+  HkdfLabelBuf[5] = $73             ; s
+  HkdfLabelBuf[6] = $31             ; 1
+  HkdfLabelBuf[7] = $33             ; 3
+  HkdfLabelBuf[8] = $20             ; (space)
+  pos = 9
+  i = 0
+  While i < labellen
+    HkdfLabelBuf[pos] = PeekA(label + i) & 255
+    pos = pos + 1
+    i = i + 1
+  Wend
+
+  HkdfLabelBuf[pos] = ctxlen & 255
+  pos = pos + 1
+  i = 0
+  While i < ctxlen
+    HkdfLabelBuf[pos] = PeekA(context + i) & 255
+    pos = pos + 1
+    i = i + 1
+  Wend
+
+  ProcedureReturn HkdfExpand(secret, seclen, @HkdfLabelBuf[0], pos, dst, outlen)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DeriveSecret(secret, seclen, label, labellen, thash, thlen, dst)
+;  - RFC 8446 section 7.1.
+;
+;    Derive-Secret(Secret, Label, Messages) =
+;        HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages),
+;                          Hash.length)
+;
+;  Hash.length is 32 for SHA-256, so this writes 32 bytes at dst. The
+;  Transcript-Hash is maintained by the caller with the sha256 snapshot pair
+;  (that pair exists for exactly this) and passed in already computed as
+;  thash/thlen - this routine never re-hashes messages. A thlen of 0 with a
+;  null thash is the empty-context form used by the "derived" step.
+;
+;  Returns 32, or one of HkdfExpandLabel's negative refusals.
+; ----------------------------------------------------------------------
+Procedure.i DeriveSecret(secret.i, seclen.i, label.i, labellen.i, thash.i, thlen.i, dst.i)
+  ProcedureReturn HkdfExpandLabel(secret, seclen, label, labellen, thash, thlen, dst, 32)
+EndProcedure
+; ==== PORTABLE CORE A64 END ====

@@ -1,0 +1,345 @@
+; Executable emitted-code gate for "Anvil knows how much memory it has",
+; 2026-09-17, for the instruction "I think anvil should be smart enough to
+; know how much ram its working with."
+;
+; tools/hw_memory_emitted_check.py replaces the markers below with, taken
+; verbatim from the production sources:
+;
+;   HwMemFromRevision      RaspberryPi4/Board/hw_mem.pi4
+;   #MMU_PERIPH_BASE       RaspberryPi4/Lib/mmu.pi4
+;   the mapped-span edges  RaspberryPi4/Board/hw_addr.pi4
+;   PiAddrHit              RaspberryPi4/Board/hw_addr.pi4
+;   PiMemTooHighWhy        RaspberryPi4/Board/hw_addr.pi4
+;   HwAddrCheck            RaspberryPi4/Board/hw_addr.pi4
+;
+; TWO THINGS ARE MODELLED AND NOTHING ELSE IS. HwMemoryBytes() is the
+; seam - on the board it asks the VideoCore firmware - so it is a global
+; here that the gate sets to each size a Pi 4 is sold with. And the
+; printing is absent, because printing means a console. Everything that
+; DECIDES is the production code, compiled from the production file.
+;
+; WHY THE REVISION CODES BELOW ARE REAL ONES. $00A03111, $00B03111,
+; $00C03111 and $00D03115 are the Raspberry Pi 4 Model B's own published
+; revision codes for 1, 2, 4 and 8 GB. A decode that passes on synthetic
+; words built by shifting a counter into place proves only that the gate
+; and the decoder shift alike; these are what the firmware actually
+; returns.
+;
+; WHAT THE ASSERTION NUMBERS MEAN:
+;    1..19   the decode: every MEMSIZE code, and the words with no field
+;   20..39   a 1 GB board's map, where most of the low window is absent
+;   40..49   a 2 GB board's map
+;   50..69   a 4 GB board's map, including the 64 MB above four gigabytes
+;   70..79   an 8 GB board's map
+;   80..89   the two smallest sizes
+;   90..99   a board that does not know: nothing is refused
+;  100..119  the sentences - one per size, all different, and cleared
+;            after an answer that was SAFE
+;  120..149  WHAT THIS MONITOR CANNOT REACH. Its page tables map the
+;            low four gigabytes and the PCI Express window and
+;            nothing else; an access anywhere between them is a
+;            translation fault that stops the board. Build 183
+;            stopped on $103FFFFC0 - real memory on a 4 GB board,
+;            called SAFE by this seam and unmapped by those tables -
+;            and these are the cases that came out of it.
+
+#HW_ADDR_SAFE      = 0
+#HW_ADDR_UNCLOCKED = 1
+#HW_ADDR_UNKNOWN   = 2
+#HW_ADDR_ABSENT    = 3
+#HW_MEM_UNKNOWN    = -1
+
+; @@PRODUCTION_PERIPH_BASE@@
+
+; @@PRODUCTION_DRAM_EDGES@@
+
+; The three globals RaspberryPi4/Board/hw_addr.pi4 declares. They are
+; named here rather than extracted so that the extracted procedures are
+; procedures and nothing else; a rename in the production file does not
+; slip past, it fails to compile.
+Global gPiAddrLo.i
+Global gPiAddrHi.i
+Global *gPiAddrWhy
+
+; THE SEAM, MODELLED. On the board this asks the firmware once and
+; remembers (RaspberryPi4/Board/hw_mem.pi4); here it is whatever the
+; case under test set, which is how one image exercises every board
+; this monitor is sold on.
+Global gateMemBytes.i
+
+Procedure.i HwMemoryBytes()
+  ProcedureReturn gateMemBytes
+EndProcedure
+
+; @@PRODUCTION_HW_MEM_FROM_REVISION@@
+
+; @@PRODUCTION_PI_ADDR_HIT@@
+
+; @@PRODUCTION_PI_MEM_TOO_HIGH_WHY@@
+
+; @@PRODUCTION_HW_ADDR_CHECK@@
+
+Procedure.i Main()
+  Define pcieLo.i
+  Define pcieHi.i
+  Define w256.i
+  Define w512.i
+  Define w1g.i
+  Define w2g.i
+  Define w4g.i
+  Define w8g.i
+
+  ; ------------------------------------------------------------------
+  ; 1..19  THE DECODE. Every code the MEMSIZE field can hold, then the
+  ; words that carry no field at all.
+  ; ------------------------------------------------------------------
+  If HwMemFromRevision($00800000) <> $10000000 : ProcedureReturn 1 : EndIf
+  If HwMemFromRevision($00900000) <> $20000000 : ProcedureReturn 2 : EndIf
+  If HwMemFromRevision($00A00000) <> $40000000 : ProcedureReturn 3 : EndIf
+  If HwMemFromRevision($00B00000) <> $80000000 : ProcedureReturn 4 : EndIf
+  If HwMemFromRevision($00C00000) <> $100000000 : ProcedureReturn 5 : EndIf
+  If HwMemFromRevision($00D00000) <> $200000000 : ProcedureReturn 6 : EndIf
+  If HwMemFromRevision($00E00000) <> $400000000 : ProcedureReturn 7 : EndIf
+  If HwMemFromRevision($00F00000) <> $800000000 : ProcedureReturn 8 : EndIf
+
+  ; The four codes a Pi 4 Model B is actually shipped with, exactly as
+  ; the firmware reports them.
+  If HwMemFromRevision($00A03111) <> $40000000 : ProcedureReturn 9 : EndIf
+  If HwMemFromRevision($00B03111) <> $80000000 : ProcedureReturn 10 : EndIf
+  If HwMemFromRevision($00C03111) <> $100000000 : ProcedureReturn 11 : EndIf
+  If HwMemFromRevision($00D03115) <> $200000000 : ProcedureReturn 12 : EndIf
+
+  ; OLD-STYLE CODES HAVE NO MEMORY FIELD AND MUST NOT PRODUCE A SIZE.
+  ; Bit 23 clear is the whole test. The low bits of the first two would
+  ; land in the memory field's position if the scheme bit were ignored,
+  ; which is exactly the mistake being refused.
+  If HwMemFromRevision($00300000) <> #HW_MEM_UNKNOWN : ProcedureReturn 13 : EndIf
+  If HwMemFromRevision($00700000) <> #HW_MEM_UNKNOWN : ProcedureReturn 14 : EndIf
+  If HwMemFromRevision($00000002) <> #HW_MEM_UNKNOWN : ProcedureReturn 15 : EndIf
+  If HwMemFromRevision($0000000E) <> #HW_MEM_UNKNOWN : ProcedureReturn 16 : EndIf
+  If HwMemFromRevision(0) <> #HW_MEM_UNKNOWN : ProcedureReturn 17 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 20..39  A 1 GB BOARD. Everything from a gigabyte to the peripheral
+  ; aperture is absent, the aperture itself is not, and there is no
+  ; memory above four gigabytes at all.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $40000000
+  If HwAddrCheck(0, $F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 20 : EndIf
+  If HwAddrCheck($3FFFFFFC, $3FFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 21 : EndIf
+  If HwAddrCheck($40000000, $40000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 22 : EndIf
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 23 : EndIf
+  If HwAddrCheck($FBFFFFFC, $FBFFFFFF, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 24 : EndIf
+  ; The peripherals are not memory and were never claimed to be. They
+  ; answered SAFE before this work and they still do - reading the PL011
+  ; at FE201000 is in this monitor's own history as the thing that
+  ; cornered the mini-UART routing bug.
+  If HwAddrCheck($FC000000, $FC000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 25 : EndIf
+  If HwAddrCheck($FE201000, $FE20101F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 26 : EndIf
+  If HwAddrCheck($FF841000, $FF841003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 27 : EndIf
+  If HwAddrCheck($FFFFFFFC, $FFFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 28 : EndIf
+  ; Above four gigabytes, where a bigger board's memory resumes - and
+  ; where this monitor's page tables map nothing at all. UNCLOCKED, not
+  ; ABSENT, and it would be UNCLOCKED on a board with memory there too:
+  ; the answer is about the tables, not about the silicon.
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 29 : EndIf
+  If HwAddrCheck($3FFFFFFFC, $3FFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 30 : EndIf
+  If HwAddrCheck($400000000, $400000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 31 : EndIf
+  ; The PCI Express outbound window is the one thing up there that IS
+  ; mapped, and it must stay reachable.
+  If HwAddrCheck($600000000, $600000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 32 : EndIf
+  ; A RANGE THAT STRADDLES THE TOP. The bytes that are not there are the
+  ; ones inside, so any overlap refuses the whole range.
+  If HwAddrCheck($3FFFFFF0, $4000000F, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 33 : EndIf
+  ; A WRITE is refused exactly as a read is - there is nothing there to
+  ; write to either.
+  If HwAddrCheck($40000000, $40000003, 1) <> #HW_ADDR_ABSENT : ProcedureReturn 34 : EndIf
+  ; The refusal names the space it is in, and the space contains the
+  ; address.
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 35 : EndIf
+  If gPiAddrLo <> $40000000 : ProcedureReturn 36 : EndIf
+  If gPiAddrHi <> $FBFFFFFF : ProcedureReturn 37 : EndIf
+  If HwAddrCheck($200000000, $200000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 38 : EndIf
+  If gPiAddrLo <> $100000000 : ProcedureReturn 39 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 40..49  A 2 GB BOARD.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $80000000
+  If HwAddrCheck($7FFFFFFC, $7FFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 40 : EndIf
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 41 : EndIf
+  If HwAddrCheck($FBFFFFFC, $FBFFFFFF, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 42 : EndIf
+  If HwAddrCheck($FE201000, $FE20101F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 43 : EndIf
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 44 : EndIf
+  If HwAddrCheck($40000000, $40000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 45 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 50..69  A 4 GB BOARD. The low run reaches the aperture, so nothing
+  ; below it is refused - and the 64 MB the aperture displaced is real
+  ; memory sitting above four gigabytes. A check that only knew about
+  ; one run would get this board wrong in both directions.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $100000000
+  If HwAddrCheck($40000000, $40000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 50 : EndIf
+  If HwAddrCheck($FBFFFFFC, $FBFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 51 : EndIf
+  If HwAddrCheck($FC000000, $FC000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 52 : EndIf
+  ; THE 64 MB THIS BOARD HAS ABOVE FOUR GIGABYTES IS REAL AND UNREACHABLE.
+  ; $103FFFFC0 is inside it and it is the address build 183 stopped on.
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 53 : EndIf
+  If HwAddrCheck($103FFFFFC, $103FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 54 : EndIf
+  If HwAddrCheck($104000000, $104000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 55 : EndIf
+  ; The span reported is the page tables' unmapped run, not the memory's.
+  If gPiAddrLo <> $100000000 : ProcedureReturn 56 : EndIf
+  If gPiAddrHi <> $5FFFFFFFF : ProcedureReturn 57 : EndIf
+  If HwAddrCheck($3FFFFFFFC, $3FFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 58 : EndIf
+  If HwAddrCheck($400000000, $400000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 59 : EndIf
+  If HwAddrCheck($103FFFFF0, $10400000F, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 60 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 70..79  AN 8 GB BOARD. The second run is 4 GB and 64 MB long.
+  ; ------------------------------------------------------------------
+  ; An 8 GB board has FOUR gigabytes and 64 MB up there, all of it out of
+  ; this monitor's reach, and the low run below the aperture is whole.
+  gateMemBytes = $200000000
+  If HwAddrCheck($FBFFFFFC, $FBFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 70 : EndIf
+  If HwAddrCheck($200000000, $200000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 71 : EndIf
+  If HwAddrCheck($203FFFFFC, $203FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 72 : EndIf
+  If HwAddrCheck($204000000, $204000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 73 : EndIf
+  If HwAddrCheck($3FFFFFFFC, $3FFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 74 : EndIf
+  If HwAddrCheck($400000000, $400000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 75 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 80..89  THE TWO SMALLEST SIZES. No Pi 4 ships with them; the field
+  ; can carry them and the decoder answers them, so the map arithmetic
+  ; is asked about them too rather than being tested only where it is
+  ; comfortable.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $10000000
+  If HwAddrCheck($FFFFFFC, $FFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 80 : EndIf
+  If HwAddrCheck($10000000, $10000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 81 : EndIf
+  gateMemBytes = $20000000
+  If HwAddrCheck($1FFFFFFC, $1FFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 82 : EndIf
+  If HwAddrCheck($20000000, $20000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 83 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 90..99  A BOARD THAT DOES NOT KNOW. The answer to "I cannot tell
+  ; where memory ends" is the behaviour this board had before it could
+  ; tell - not a guess in either direction. Nothing is refused, and
+  ; nothing is claimed in the reason.
+  ; ------------------------------------------------------------------
+  gateMemBytes = #HW_MEM_UNKNOWN
+  If HwAddrCheck(0, $F, 0) <> #HW_ADDR_SAFE : ProcedureReturn 90 : EndIf
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 91 : EndIf
+  If HwAddrCheck($FBFFFFFC, $FBFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 92 : EndIf
+  ; The unmapped refusal is NOT relaxed by not knowing the size. It never
+  ; asked: a translation fault does not care what is fitted.
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 93 : EndIf
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 94 : EndIf
+  If *gPiAddrWhy <> 0 : ProcedureReturn 95 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 100..119  THE SENTENCES. Each size gets its own, they are all
+  ; different, and the refusal returns the one belonging to the size
+  ; the board has. Compared as ADDRESSES, so this proves the selection
+  ; without the gate carrying a copy of the prose.
+  ; ------------------------------------------------------------------
+  w256 = PiMemTooHighWhy($10000000)
+  w512 = PiMemTooHighWhy($20000000)
+  w1g  = PiMemTooHighWhy($40000000)
+  w2g  = PiMemTooHighWhy($80000000)
+  w4g  = PiMemTooHighWhy($100000000)
+  w8g  = PiMemTooHighWhy($200000000)
+  If w256 = 0 Or w512 = 0 Or w1g = 0 Or w2g = 0 Or w4g = 0 Or w8g = 0 : ProcedureReturn 100 : EndIf
+  If w256 = w512 Or w512 = w1g Or w1g = w2g Or w2g = w4g Or w4g = w8g : ProcedureReturn 101 : EndIf
+  If w256 = w1g Or w256 = w2g Or w256 = w4g Or w256 = w8g : ProcedureReturn 102 : EndIf
+  If w512 = w2g Or w512 = w4g Or w512 = w8g : ProcedureReturn 103 : EndIf
+  If w1g = w4g Or w1g = w8g Or w2g = w8g : ProcedureReturn 104 : EndIf
+  ; A size with no words of its own still refuses and still says
+  ; something - it must not answer 0, which would print as nothing.
+  If PiMemTooHighWhy($400000000) = 0 : ProcedureReturn 105 : EndIf
+
+  gateMemBytes = $40000000
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 106 : EndIf
+  If *gPiAddrWhy <> w1g : ProcedureReturn 107 : EndIf
+  gateMemBytes = $80000000
+  If HwAddrCheck($90000000, $90000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 108 : EndIf
+  If *gPiAddrWhy <> w2g : ProcedureReturn 109 : EndIf
+  ; A 4 GB and an 8 GB board have nothing ABSENT below the aperture - the
+  ; low run reaches it - so the two smallest sizes carry these two, and
+  ; w4g and w8g are proved distinct above rather than by a refusal.
+  gateMemBytes = $10000000
+  If HwAddrCheck($10000000, $10000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 110 : EndIf
+  If *gPiAddrWhy <> w256 : ProcedureReturn 111 : EndIf
+  gateMemBytes = $20000000
+  If HwAddrCheck($20000000, $20000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 112 : EndIf
+  If *gPiAddrWhy <> w512 : ProcedureReturn 113 : EndIf
+
+  ; ------------------------------------------------------------------
+  ; 120..149  THE UNMAPPED SPANS, on a board that knows its size and on
+  ; one that does not - the fault does not care, so neither may the
+  ; refusal. UNCLOCKED and not ABSENT: the prose the core prints for
+  ; UNCLOCKED is "the access never completes, the processor stops on it,
+  ; and the board has to have its power removed by hand", which is
+  ; exactly what build 183 did.
+  ; ------------------------------------------------------------------
+  gateMemBytes = $100000000
+  ; The address that stopped build 183, and its neighbours.
+  If HwAddrCheck($103FFFFC0, $103FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 120 : EndIf
+  If HwAddrCheck($100000000, $100000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 121 : EndIf
+  If HwAddrCheck($104000000, $104000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 122 : EndIf
+  If HwAddrCheck($5FFFFFFFC, $5FFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 123 : EndIf
+  ; The last mapped byte below it, and the PCI Express window, are not.
+  If HwAddrCheck($FFFFFFFC, $FFFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 124 : EndIf
+  If HwAddrCheck($600000000, $600000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 125 : EndIf
+  If HwAddrCheck($7FFFFFFFC, $7FFFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 126 : EndIf
+  ; Above the window, and past the top of what the tables span at all.
+  If HwAddrCheck($800000000, $800000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 127 : EndIf
+  If HwAddrCheck($FFFFFFFFC, $FFFFFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 128 : EndIf
+  If HwAddrCheck($1000000000, $1000000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 129 : EndIf
+  ; A RANGE THAT STRADDLES THE LAST MAPPED BYTE. Any overlap refuses the
+  ; whole range: the byte that faults is the one inside.
+  If HwAddrCheck($FFFFFFF0, $10000000F, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 130 : EndIf
+  ; And one that straddles the bottom of the PCI Express window.
+  If HwAddrCheck($5FFFFFFF0, $60000000F, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 131 : EndIf
+  ; A WRITE is refused exactly as a read is.
+  If HwAddrCheck($103FFFFC0, $103FFFFFF, 1) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 132 : EndIf
+  ; The refusal names something, and the span it reports contains the
+  ; address - the core prints "That block runs X to Y" from these two.
+  If HwAddrCheck($103FFFFC0, $103FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 133 : EndIf
+  If *gPiAddrWhy = 0 : ProcedureReturn 134 : EndIf
+  If gPiAddrLo > $103FFFFC0 Or gPiAddrHi < $103FFFFFF : ProcedureReturn 135 : EndIf
+  ; THE SPAN IS THE PAGE TABLES' OWN. The unmapped run must start where
+  ; the low mapped span ends and stop where the PCI Express window
+  ; begins - recomputed here from mmu.pi4's slot numbers, never read out
+  ; of the file under test.
+  pcieLo = #MMU_PCIE_SLOT_LO << 30
+  pcieHi = ((#MMU_PCIE_SLOT_HI + 1) << 30) - 1
+  If gPiAddrLo <> $100000000 : ProcedureReturn 136 : EndIf
+  If gPiAddrHi <> pcieLo - 1 : ProcedureReturn 137 : EndIf
+  If HwAddrCheck(pcieLo, pcieLo + 3, 0) <> #HW_ADDR_SAFE : ProcedureReturn 138 : EndIf
+  If HwAddrCheck(pcieHi - 3, pcieHi, 0) <> #HW_ADDR_SAFE : ProcedureReturn 139 : EndIf
+  If HwAddrCheck(pcieHi + 1, pcieHi + 4, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 140 : EndIf
+  ; AND IT DOES NOT ASK THE SIZE. A board that could not say still must
+  ; not be allowed to fault: arm 1 runs before HwMemoryBytes is called.
+  gateMemBytes = #HW_MEM_UNKNOWN
+  If HwAddrCheck($103FFFFC0, $103FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 141 : EndIf
+  If HwAddrCheck($800000000, $800000003, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 142 : EndIf
+  If HwAddrCheck($FFFFFFFC, $FFFFFFFF, 0) <> #HW_ADDR_SAFE : ProcedureReturn 143 : EndIf
+  gateMemBytes = $40000000
+  If HwAddrCheck($103FFFFC0, $103FFFFFF, 0) <> #HW_ADDR_UNCLOCKED : ProcedureReturn 144 : EndIf
+  ; A 1 GB board's low refusal is still ABSENT, not a fault - that run IS
+  ; mapped, and reading it gives a plausible value rather than stopping.
+  If HwAddrCheck($80000000, $80000003, 0) <> #HW_ADDR_ABSENT : ProcedureReturn 145 : EndIf
+  gateMemBytes = $100000000
+
+  ; AND IT IS CLEARED BY THE NEXT ANSWER. The contract in
+  ; Anvil/Hal/hal.pbi says these three are valid only immediately after
+  ; a check that was not SAFE; a stale sentence left standing would be
+  ; read as belonging to whatever asked next.
+  gateMemBytes = $100000000
+  If HwAddrCheck($40000000, $40000003, 0) <> #HW_ADDR_SAFE : ProcedureReturn 114 : EndIf
+  If *gPiAddrWhy <> 0 : ProcedureReturn 115 : EndIf
+  If gPiAddrLo <> 0 Or gPiAddrHi <> 0 : ProcedureReturn 116 : EndIf
+
+  ProcedureReturn 0
+EndProcedure

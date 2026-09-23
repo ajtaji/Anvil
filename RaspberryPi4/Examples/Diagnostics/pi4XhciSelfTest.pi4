@@ -1,0 +1,301 @@
+; ======================================================================
+; pi4XhciSelfTest - the modelled-controller gate for
+; RaspberryPi4/Lib/xhci.pi4
+; ----------------------------------------------------------------------
+; THERE IS NO USB STACK AND NO ACCESS TO THE BOARD. This program is the
+; answer to that: it runs the real driver against a MODEL of an xHCI
+; host controller that lives inside the project's A64 oracle
+; (tools/a64/a64_xhci_check.py). The model implements the capability
+; registers, a USBSTS whose Controller Not Ready bit clears only after
+; several reads, a self-clearing HCRST, a command ring that consumes
+; TRBs and posts completion events, a root port that answers a reset,
+; and a device that answers GET_DESCRIPTOR.
+;
+; NOTHING HERE IS A CLAIM ABOUT SILICON. It is a test of the driver's
+; state machine: the ORDER of the reset sequence, the alignment of
+; every structure the controller is given, the cycle-bit arithmetic,
+; and the shape of the TRBs.
+;
+; THE PCIe SEAM. pcie.pi4 is not included. The four entry points
+; xhci.pi4 needs are stubbed here, over a fake configuration window the
+; harness intercepts, so that the harness owns config space as well as
+; the register block. When pcie.pi4 carries the real PcieCfgRead32 and
+; PcieCfgWrite32, delete these four and include it instead - the
+; signatures are the same.
+;
+; Every check appends to res[]. The harness compares the whole array
+; against a list of expected values it holds independently, so a check
+; that silently stops running is a length mismatch, not a pass.
+; ======================================================================
+
+; The fake ECAM window. The harness decodes
+;   #XT_CFG + (bus << 20) + (dev << 15) + (fn << 12) + off
+; and answers as a PCI configuration space.
+#XT_CFG = $700000000
+
+; The outbound window, the same two numbers pcie.pi4 uses.
+#XT_OUT_CPU  = $600000000
+#XT_OUT_BUS  = $F8000000
+#XT_OUT_SIZE = $04000000
+#XT_DMA_LIMIT = $C0000000
+
+Procedure.i PcieCfgRead32(bus.i, dev.i, fn.i, off.i)
+  ProcedureReturn PeekN(#XT_CFG + (bus << 20) + (dev << 15) + (fn << 12) + off)
+EndProcedure
+
+Procedure PcieCfgWrite32(bus.i, dev.i, fn.i, off.i, v.i)
+  PokeN(#XT_CFG + (bus << 20) + (dev << 15) + (fn << 12) + off, v)
+EndProcedure
+
+Procedure.i PcieCpuFromBus(busAddr.i)
+  If busAddr < #XT_OUT_BUS
+    ProcedureReturn -1
+  EndIf
+  If busAddr >= (#XT_OUT_BUS + #XT_OUT_SIZE)
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn #XT_OUT_CPU + (busAddr - #XT_OUT_BUS)
+EndProcedure
+
+Procedure.i PcieDmaOk(addr.i, len.i)
+  If len <= 0
+    ProcedureReturn 0
+  EndIf
+  If addr <= 0
+    ProcedureReturn 0
+  EndIf
+  If (addr + len) > #XT_DMA_LIMIT
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The ownership seam xhci.pi4 now calls into pcie.pi4 for. This model is a
+; cold controller that nothing adopted from firmware, so there is nothing
+; to take over. PcieEnableDma is the real body from pcie.pi4 minus its
+; "has PcieEnumerate run" guard: set PCI_CMD_BUS_MASTER read-modify-write
+; with the status half masked, and report the read-back. The harness sees
+; the write through the fake configuration window, so a driver that never
+; asks for bus mastering still rings a doorbell with it disabled.
+Procedure.i PcieNeedsTakeover()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieAdoptCpu()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieAdoptHalted()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieEnableDma()
+  Define cmd.i
+  cmd = PcieCfgRead32(1, 0, 0, $04) & $FFFF
+  PcieCfgWrite32(1, 0, 0, $04, cmd | $0004)
+  ProcedureReturn Bool((PcieCfgRead32(1, 0, 0, $04) & $0004) <> 0)
+EndProcedure
+
+; THE INBOUND OFFSET, WHICH THIS MODEL DOES NOT HAVE ONE OF. xhci.pi4
+; asks for it before it writes a single address into a TRB, because the
+; bare ARM physical addresses it hands the controller are the right
+; numbers only while the root complex adds nothing on the way in - the
+; one time that register was read on silicon it held an offset of
+; $4_0000_0000 left by the firmware. There is no root-complex block in
+; this harness to read it from: the harness delivers every DMA address
+; the driver writes to exactly that address in its own flat memory, so
+; the modelled inbound window IS an identity map and zero is a statement
+; about the harness rather than a convenient value. A harness that ever
+; starts translating has to change this line in the same commit, or the
+; driver's own check stops describing it.
+Procedure.i PcieDmaOffset()
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+#RES_MAX = 128
+
+Global Dim res.i[#RES_MAX]
+Global nres.i = 0
+Global Dim desc.a[64]
+Global Dim desc8.a[16]
+
+Procedure Chk(v.i)
+  If nres < #RES_MAX
+    res[nres] = v
+  EndIf
+  nres = nres + 1
+EndProcedure
+
+Procedure Main()
+  Define n.i
+  Define slot.i
+  Define i.i
+  Define good.i
+
+  ; ---- 1. bring the controller up ------------------------------------
+  Chk(XhciInit())
+  Chk(XhciLastError())
+  Chk(XhciReady())
+
+  ; ---- 2. the capability registers, as read --------------------------
+  Chk(XhciCapLength())
+  Chk(XhciVersion())
+  Chk(XhciMaxSlots())
+  Chk(XhciMaxIntrs())
+  Chk(XhciMaxPorts())
+  Chk(XhciErstMax())
+  Chk(XhciScratchpads())
+  Chk(XhciContextSize())
+  Chk(XhciAc64())
+  Chk(XhciPageSize())
+  Chk(XhciDeviceId())
+
+  ; ---- 3. the derived block addresses --------------------------------
+  Chk(XhciOpBase() - XhciCapBase())
+  Chk(XhciDbBase() - XhciCapBase())
+  Chk(XhciRtBase() - XhciCapBase())
+
+  ; ---- 4. every structure the controller reads is 64-byte aligned ----
+  Chk(XhciArenaBase() & 63)
+  Chk(XhciDcbaa() & 63)
+  Chk(XhciCmdRing() & 63)
+  Chk(XhciEventRing() & 63)
+  Chk(XhciErst() & 63)
+  ; ... and every one of them is inside the arena that PcieDmaOk passed
+  Chk(PcieDmaOk(XhciDcbaa(), 2056))
+  Chk(PcieDmaOk(XhciCmdRing(), 1024))
+  Chk(PcieDmaOk(XhciEventRing(), 1024))
+
+  ; ---- 5. the command ring and the event ring, end to end ------------
+  Chk(XhciNoOp())
+  Chk(XhciLastComp())
+  Chk(XhciSkippedEvents())
+  ; twice, because the second one uses the next TRB slot and the next
+  ; event slot - a cycle-bit mistake usually survives the first
+  Chk(XhciNoOp())
+  Chk(XhciLastComp())
+
+  ; ---- 5b. wrap BOTH rings -------------------------------------------
+  ; The command ring holds 63 usable TRBs and then a Link TRB; the event
+  ; ring holds 64 and has none. Seventy No-Ops takes both round at least
+  ; once, which is the only way the Link TRB's Toggle Cycle bit and the
+  ; event ring's dequeue wrap are ever executed. Two No-Ops prove
+  ; nothing about either.
+  i = 0
+  good = 0
+  While i < 70
+    If XhciNoOp() <> 0
+      good = good + 1
+    EndIf
+    i = i + 1
+  Wend
+  Chk(good)
+  Chk(XhciLastComp())
+  Chk(XhciSkippedEvents())
+
+  ; ---- 6. ports ------------------------------------------------------
+  ; Port 4 is a SuperSpeed port that trained itself; port 2 is a USB 2
+  ; port that is not even powered yet; port 1 is powered and empty.
+  Chk(XhciFirstConnectedPort())
+  Chk(XhciPortConnected(1))
+  Chk(XhciPortConnected(4))
+  Chk(XhciPortEnabled(4))
+  Chk(XhciPortSpeed(4))
+  Chk(XhciPortReset(4))          ; already enabled - returns without
+                                 ; touching the port
+  Chk(XhciPortSpeed(4))
+
+  Chk(XhciPortConnected(2))      ; unpowered, so nothing there yet
+  Chk(XhciPortSpeed(2))
+  Chk(XhciPortReset(2))          ; powers it, then resets it
+  Chk(XhciPortEnabled(2))
+  Chk(XhciPortSpeed(2))
+
+  Chk(XhciPortReset(1))          ; powered and empty
+  Chk(XhciLastError())
+  Chk(XhciPortReset(9))          ; out of range
+  Chk(XhciLastError())
+
+  ; ---- 7. a device slot ----------------------------------------------
+  slot = XhciEnableSlot()
+  Chk(slot)
+  Chk(XhciAddressDevice(slot, 2, 3))     ; port 2, high speed
+  Chk(XhciSlot())
+  Chk(XhciMaxPacket())
+  Chk(XhciDeviceAddress())
+  Chk(XhciSlotState())
+
+  ; ---- 8. the device descriptor --------------------------------------
+  n = XhciGetDeviceDescriptor(@desc[0], 64)
+  Chk(n)
+  Chk(XhciLastComp())
+  Chk(XhciLastResidual())
+  ; The two bytes that prove PeekA and not PeekB. idProduct is $90A5,
+  ; so byte 10 is $A5 and byte 11 is $90 - both above 127, and both
+  ; would come back negative through a PeekB.
+  Chk(desc[10])
+  Chk(desc[11])
+  Chk(desc[0])                   ; bLength
+  Chk(desc[1])                   ; bDescriptorType
+  Chk(desc[7])                   ; bMaxPacketSize0
+
+  ; ---- 9. eight bytes, and then a short read -------------------------
+  ; Asking for exactly eight is the full-speed idiom - read
+  ; bMaxPacketSize0 out of byte 7 before trusting a longer read. Eight
+  ; asked for and eight delivered is a plain Success.
+  n = XhciGetDescriptor(1, 0, 0, 8)
+  Chk(n)
+  Chk(XhciLastComp())
+  Chk(XhciLastResidual())
+  Chk(XhciCopyIn(@desc8[0], 8))
+  Chk(desc8[7])
+
+  ; Asking for more than the descriptor holds is a SHORT PACKET, which
+  ; is a success with a residual and not a failure. A driver that treats
+  ; completion code 13 as an error cannot read any descriptor whose
+  ; length it does not already know.
+  n = XhciGetDescriptor(1, 0, 0, 64)
+  Chk(n)
+  Chk(XhciLastComp())            ; 13 = Short Packet
+  Chk(XhciLastResidual())        ; 64 - 18
+
+  ; ---- 9b. wrap the endpoint-0 ring ----------------------------------
+  ; Three TRBs per control transfer, 63 usable slots: thirty transfers
+  ; takes the transfer ring past its Link TRB twice. A transfer that
+  ; straddles the Link TRB has its first TRB on the far side of a cycle
+  ; toggle from its last, which is what xh_RingRoom() exists to prevent -
+  ; and nothing shorter than this loop ever reaches that slot.
+  i = 0
+  good = 0
+  While i < 30
+    If XhciGetDescriptor(1, 0, 0, 8) = 8
+      good = good + 1
+    EndIf
+    i = i + 1
+  Wend
+  Chk(good)
+  Chk(XhciLastComp())
+
+  ; ---- 10. a request the device refuses ------------------------------
+  ; Descriptor type 99 does not exist. The model stalls it, which is
+  ; what a real device does, and the driver must report the stall
+  ; rather than a transaction error.
+  Chk(XhciGetDescriptor(99, 0, 0, 8))
+  Chk(XhciLastComp())
+  Chk(XhciLastError())
+
+  ; ---- 11. argument refusals -----------------------------------------
+  Chk(XhciGetDeviceDescriptor(0, 18))
+  Chk(XhciLastError())
+  Chk(XhciControlIn($80, 6, $0100, 0, 9999))
+  Chk(XhciLastError())
+
+  ; ---- 12. the arena did not overflow --------------------------------
+  Chk(XhciArenaUsed())
+
+  Chk(nres)
+EndProcedure
+
+Main()

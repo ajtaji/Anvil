@@ -1,0 +1,341 @@
+; pi4FaultProbe.pi4 - PROVE THE EXCEPTION VECTOR TABLE ON SILICON.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4FaultProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -s -o _work/faultprobe.img
+;
+; ----------------------------------------------------------------------
+; WHAT THIS ANSWERS
+; ----------------------------------------------------------------------
+; RaspberryPi4/Lib/fault.pi4 installs the first exception vector table
+; this tree has ever had. Everything about it can be checked offline
+; except four things, and all four need the part:
+;
+;   1. Is VBAR_EL2 writable at EL2 on this board at all?
+;   2. Does an exception actually arrive at VBAR + the offset the
+;      manual says, in the group the manual says?
+;   3. Does TPIDR_EL2 survive an exception entry, so the one-register
+;      stash the handler depends on is real?
+;   4. Does `eret` out of the handler resume the program correctly?
+;
+; This probe answers all four by DELIBERATELY FAULTING and surviving.
+; It is the only program in this directory that tries to break the
+; machine on purpose, and every deliberate fault is inside a
+; FaultTry() guard so that the probe recovers rather than parking.
+;
+; ----------------------------------------------------------------------
+; IF IT HANGS, THE HANG IS THE RESULT - READ THIS FIRST
+; ----------------------------------------------------------------------
+; A hang here is not a mystery, it is one of four answers, and WHERE it
+; stops tells you which. Every step prints BEFORE it is attempted and
+; the UART is drained between the announcement and the attempt, which
+; is the pattern cyw43.pi4's trace seam settled on for exactly this
+; reason (vault: "Unaligned access with the MMU off 2026-08-27").
+;
+;   stops after "install"      VBAR_EL2 is trapped or unwritable here.
+;                              The MSR itself faulted, into the table
+;                              it was in the middle of installing.
+;
+;   stops after "unaligned w"  The fault was taken and the handler did
+;                              not survive it. Most likely the save
+;                              area is not 8-aligned, or TPIDR_EL2 is
+;                              not ours, or the vector arrived in a
+;                              slot whose entry is wrong. Nothing can
+;                              be printed from inside that, by
+;                              construction.
+;
+;   stops after "skip"         ELR+4 is wrong and the board is looping
+;                              on the same instruction. Two-instruction
+;                              loop, no output, deadman resets it.
+;
+;   stops after "uninstall"    The restore wrote a bad VBAR and the
+;                              next fault went nowhere. Unlikely; the
+;                              value came from the register itself.
+;
+; ARM THE DEADMAN. `deadman 15` before running this, without exception.
+; This probe faults on purpose three times; it is precisely the payload
+; the rule was written for.
+;
+; ----------------------------------------------------------------------
+; THE NEGATIVE CONTROL, AND WHY IT IS THE MOST IMPORTANT LINE HERE
+; ----------------------------------------------------------------------
+; Step 5 does an ALIGNED store to the same buffer and asserts that the
+; fault count DID NOT CHANGE.
+;
+; Without it, a board that faulted on every access - or a model that
+; delivered an exception for everything - would pass every other check
+; in this file, because every other check is "did it fault, and was the
+; report right". A probe made only of positive cases cannot tell
+; "the alignment rule works" from "nothing works".
+;
+; ----------------------------------------------------------------------
+; WHAT THE OUTPUT MEANS
+; ----------------------------------------------------------------------
+; Each row is "<name> $<hex>". The last line is the verdict. The gate
+; tools/a64/a64_fault_check.py runs this same source through the A64
+; interpreter with a model that delivers exceptions the way
+; AArch64_TakeException does, and asserts against the SAME recorded
+; values - so a disagreement between the model and the board is a
+; disagreement about the part, not about the probe.
+;
+; THE TWO NUMBERS TO CHECK BY EYE, and how they are built:
+;
+;   $96000061  the unaligned WRITE
+;   $96000021  the unaligned READ
+;
+; ESR is iss2 :: ec[5:0] :: il :: iss (AArch64_ReportException,
+; arm-a64-instruction-set.txt:479263-479267), so
+;
+;   EC   = $25 << 26 = $94000000   data abort, same EL      (:479220)
+;   IL   = 1   << 25 = $02000000   every A64 instruction is 32-bit
+;   WnR  = 1   <<  6 = $00000040   write, ISS bit 6         (:480461)
+;   DFSC = $21       = $00000021   alignment                (:501526)
+;
+; $94000000 + $02000000 + $40 + $21 = $96000061 for the write, and the
+; same without the $40 is $96000021 for the read. Both are recorded
+; RAW rather than as a decoded boolean, so that a part which disagrees
+; says so in full instead of through somebody's Select.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/fault.pi4"
+
+; The results, in order, for the gate to read out of memory. Printed as
+; well, so that the bench and the gate are looking at one list rather
+; than at two lists that have to be kept in step.
+#PR_MAX = 48
+Global Dim pr_val.i[#PR_MAX]
+Global pr_n.i
+
+; The buffer the deliberate faults are aimed at. A QUAD array, so its
+; base is 8-aligned and "base + 2" is reliably 2 past a 4-byte
+; boundary. A byte array would have given an unknown starting
+; alignment, and "unaligned" would then have been a hope.
+Global Dim pr_buf.i[8]
+
+; Where the unaligned load's value lands. A Global rather than a local
+; so that no optimiser can decide the load is dead and delete the
+; instruction this probe exists to execute.
+Global pr_loaded.i
+
+; Set by the reporter, so the probe can prove the reporter ran.
+Global pr_reports.i
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; Record AND print. One call site so the two can never diverge.
+Procedure Rec(*label, v.i)
+  If pr_n < #PR_MAX
+    pr_val[pr_n] = v
+    pr_n = pr_n + 1
+  EndIf
+  UartWriteStr(*label)
+  UartWrite(36)
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+; Announce a step, then drain, so that if the step kills the board the
+; announcement has already left the UART FIFO. UartDrain() is the whole
+; point of this procedure.
+Procedure Say(*label)
+  UartWriteStr("-- ")
+  UartWriteStr(*label)
+  UartWriteNl()
+  UartDrain()
+EndProcedure
+
+; The reporter fault.pi4 calls. Deliberately TINY: it runs on the
+; handler's 1 KiB stack with the machine in an unknown state, so it
+; does the least that is still useful. The full decode is printed
+; afterwards by the main program, from the globals, on the ordinary
+; stack.
+Procedure FaultReport()
+  pr_reports = pr_reports + 1
+  UartWriteStr("   [fault ")
+  PutHex16(FaultEsr())
+  UartWriteStr(" at ")
+  PutHex16(FaultElr())
+  UartWriteStr("]")
+  UartWriteNl()
+EndProcedure
+
+; Read VBAR_EL2 back. The probe has to be able to say what is in the
+; register rather than what fault.pi4 believes is in it - a library
+; that reported its own intentions would pass an uninstall test that
+; wrote nothing.
+Global pr_vbar.i
+Procedure.i ReadVbar()
+  ASM
+    mrs  x9, vbar_el2
+    adrp x10, global_pr_vbar
+    add  x10, x10, #:lo12:global_pr_vbar
+    str  x9, [x10]
+  EndASM
+  ProcedureReturn pr_vbar
+EndProcedure
+
+Procedure.i Main()
+  Define base.i
+  Define vbar0.i
+  Define before.i
+  Define took.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4FaultProbe - the vector table, on purpose")
+  UartWriteNl()
+  UartWriteNl()
+
+  base = @pr_buf[0]
+  Rec("buf             ", base)
+  Rec("buf and 7       ", base & 7)
+
+  vbar0 = ReadVbar()
+  Rec("VBAR_EL2 entry  ", vbar0)
+
+  ; ------------------------------------------------------------------
+  ;  1. INSTALL
+  ; ------------------------------------------------------------------
+  Say("install")
+  Rec("install rc      ", FaultInstall())
+  Rec("install err     ", FaultError())
+  Rec("installed       ", FaultInstalled())
+  Rec("prev VBAR saved ", FaultPrevVbar())
+  Rec("VBAR now        ", ReadVbar())
+  Rec("VBAR and 2047   ", ReadVbar() & 2047)
+
+  FaultSetReporter(@FaultReport)
+
+  ; ------------------------------------------------------------------
+  ;  2. AN UNALIGNED 32-BIT STORE - the defect that cost a session
+  ;
+  ;  base + 2 is two past a 4-byte boundary, which is exactly where
+  ;  Cyw43SetEventMask wrote (offset 18 after a 17-character name and a
+  ;  NUL). The guard means we come back.
+  ; ------------------------------------------------------------------
+  Say("unaligned w")
+  took = 0
+  If FaultTry() = 1
+    PokeL(base + 2, $A5A5A5A5)
+    FaultTryEnd()
+  Else
+    took = 1
+  EndIf
+  Rec("w faulted       ", took)
+  Rec("w count         ", FaultCount())
+  Rec("w slot          ", FaultSlot())
+  Rec("w ESR           ", FaultEsr())
+  Rec("w EC            ", FaultEc())
+  Rec("w DFSC          ", FaultDfsc())
+  Rec("w FAR           ", FaultFar())
+  Rec("w FAR-base      ", FaultFar() - base)
+  Rec("w is write      ", FaultIsWrite())
+  Rec("w FAR valid     ", FaultFarValid())
+  Rec("w SPSR          ", FaultSpsr())
+  Rec("w reports       ", pr_reports)
+  Rec("w nested        ", FaultNested())
+
+  ; ------------------------------------------------------------------
+  ;  3. AN UNALIGNED 32-BIT LOAD - the same fault, other direction
+  ; ------------------------------------------------------------------
+  Say("unaligned r")
+  took = 0
+  If FaultTry() = 1
+    pr_loaded = PeekL(base + 2)
+    FaultTryEnd()
+  Else
+    took = 1
+  EndIf
+  Rec("r faulted       ", took)
+  Rec("r count         ", FaultCount())
+  Rec("r slot          ", FaultSlot())
+  Rec("r ESR           ", FaultEsr())
+  Rec("r DFSC          ", FaultDfsc())
+  Rec("r is write      ", FaultIsWrite())
+  Rec("r FAR-base      ", FaultFar() - base)
+
+  ; ------------------------------------------------------------------
+  ;  4. THE NEGATIVE CONTROL - an ALIGNED store must NOT fault.
+  ;
+  ;  Read the section at the top of this file before deleting this.
+  ; ------------------------------------------------------------------
+  Say("aligned w")
+  before = FaultCount()
+  took = 0
+  If FaultTry() = 1
+    PokeL(base + 4, $5A5A5A5A)
+    FaultTryEnd()
+  Else
+    took = 1
+  EndIf
+  Rec("ok faulted      ", took)
+  Rec("ok count delta  ", FaultCount() - before)
+  Rec("ok stored       ", PeekL(base + 4))
+
+  ; ------------------------------------------------------------------
+  ;  5. #FAULT_SKIP - report and step over. Proves ELR+4.
+  ;
+  ;  No guard: the whole point is that execution continues from the
+  ;  instruction AFTER the one that faulted, with no landing pad
+  ;  involved. If ELR+4 is wrong this is where the board stops, and
+  ;  the announcement above has already been drained.
+  ; ------------------------------------------------------------------
+  Say("skip")
+  before = FaultCount()
+  FaultSetPolicy(#FAULT_SKIP)
+  PokeL(base + 6, $DEADBEEF)
+  FaultSetPolicy(#FAULT_PARK)
+  Rec("skip count delta", FaultCount() - before)
+  Rec("skip survived   ", 1)
+  Rec("skip DFSC       ", FaultDfsc())
+  Rec("skip nested     ", FaultNested())
+
+  ; ------------------------------------------------------------------
+  ;  6. UNINSTALL - hand the board back
+  ; ------------------------------------------------------------------
+  Say("uninstall")
+  FaultUninstall()
+  Rec("installed after ", FaultInstalled())
+  Rec("VBAR restored   ", ReadVbar())
+    If ReadVbar() = vbar0
+    Rec("VBAR matches    ", 1)
+  Else
+    Rec("VBAR matches    ", 0)
+  EndIf
+
+  Rec("total faults    ", FaultCount())
+  Rec("results         ", pr_n)
+
+  UartWriteNl()
+  UartWriteStr("If every step above printed and this line is here,")
+  UartWriteNl()
+  UartWriteStr("the vector table works on this part. Compare the raw")
+  UartWriteNl()
+  UartWriteStr("ESR values against the header before believing a PASS.")
+  UartWriteNl()
+
+  UartDrain()
+
+  ; The monitor prints the return value. Zero is the boring answer; the
+  ; finding is the list above.
+  ProcedureReturn 0
+EndProcedure
+
+Main()

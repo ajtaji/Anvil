@@ -1,0 +1,41 @@
+; Host gate inserts the real exception_support source at the marker below.
+; Only the normal console mirror names are redirected to these test counters.
+Global gate_mirror.i
+Procedure GatePrint(p.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure GatePrintN(p.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure PrintNl() : gate_mirror = gate_mirror + 1 : EndProcedure
+Procedure PutHex16(v.i) : gate_mirror = gate_mirror + 1 : EndProcedure
+; The message context (forum 791): the report leaves it before the mirror.
+Global gate_abandoned.i
+Procedure UartMessageAbandon() : gate_abandoned = gate_abandoned + 1 : EndProcedure
+Procedure.i ExceptionEl() : ProcedureReturn 3 : EndProcedure
+Procedure.i ExceptionSlot() : ProcedureReturn 4 : EndProcedure
+Procedure.i ExceptionEsr() : ProcedureReturn $96000021 : EndProcedure
+Procedure.i ExceptionPc() : ProcedureReturn $FEDCBA9876543210 : EndProcedure
+Procedure.i ExceptionFar() : ProcedureReturn $123456789ABCDEF0 : EndProcedure
+Procedure.i ExceptionSp() : ProcedureReturn $100000 : EndProcedure
+Procedure ExceptionSetReporter(p.i) : EndProcedure
+Procedure ExceptionSetIrqHandler(p.i) : EndProcedure
+Procedure.i ExceptionInstall() : ProcedureReturn 3 : EndProcedure
+Procedure.i ExceptionVbar() : ProcedureReturn $80000 : EndProcedure
+Procedure.i InterruptInit(p.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i InterruptDispatch() : ProcedureReturn 1 : EndProcedure
+; The run record's exception hook (RaspberryPi4/Board/runrecord.pi4, which has
+; its own executed gate). Here: the report hands it exactly the registers it
+; prints, once. A missing or wrong call adds 1000 to the mirror count.
+Global gate_record.i
+Procedure RunRecordException(esr.i, pc.i, far.i)
+  If esr = $96000021 And pc = $FEDCBA9876543210 And far = $123456789ABCDEF0
+    gate_record = gate_record + 1
+  Else
+    gate_record = gate_record + 100
+  EndIf
+EndProcedure
+; @SUPPORT@
+Procedure.i Main()
+  HwExceptionReport()
+  If gate_record <> 1
+    ProcedureReturn gate_mirror + 1000
+  EndIf
+  ProcedureReturn gate_mirror
+EndProcedure

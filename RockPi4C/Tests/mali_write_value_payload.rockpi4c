@@ -1,0 +1,401 @@
+; Returning RK3399 Mali-T860 guarded write-value job proof. It rechecks the
+; PMU/CRU admission state, follows Linux Panfrost's reset and power sequence,
+; configures AS0, and submits one Mesa v5 WRITE_VALUE job to private memory.
+; The resident payload command arms Anvil's physical deadman before entry.
+; No framebuffer or filesystem memory is a job target. The load address below
+; is build 121's stage; relink to the current `map` stage before each use.
+;
+; Wire format when infrastructure is admitted:
+;   G1 <PWRDN_CON> <PWRDN_ST> <IDLE_REQ> <IDLE_ST> <IDLE_ACK>
+;      <CLKSEL13> <CLKGATE13> <CLKGATE30> <SOFTRST18> <INFRA_REFUSAL>
+;      <GPU_ID> <MMU_FEATURES> <AS_PRESENT> <JS_PRESENT> <GPU_STATUS>
+;      <JOB_INT_JS_STATE> <MMU_INT_STAT> <GPU_REFUSAL> CR LF
+;
+; If INFRA_REFUSAL is nonzero, that word is followed immediately by CR LF
+; and return.  No address in 0xFF9A0000..0xFF9AFFFF is then accessed.
+;
+; INFRA_REFUSAL bits:
+;   0 PWRDN_CON[15], 1 PWRDN_ST[15], 2 IDLE_REQ[0],
+;   3 IDLE_ST[0], 4 IDLE_ACK[0], 5 CLKGATE13[0],
+;   6 CLKGATE30[8], 7 SOFTRST18[2:0], 8 CLKSEL13 parent > 4.
+; GPU_REFUSAL bits:
+;   0 GPU_ID product is not 0x0860, 1 MMU VA/PA width is zero,
+;   2 AS_PRESENT is zero, 3 JS_PRESENT is zero.
+; R2 is reset IRQ and poll count; P0/P1/P2 are L2/shader/tiler present/ready.
+; M0 is AS0 TRANSTAB, MEMATTR, STATUS. J0 is job interrupt, target low word,
+; header exception, JS1 status, AS0 fault. Success returns 0x47513000.
+;
+; pmf:target rockpi4c
+; pmf:load $03A78088
+; pmf:bss $10000000
+; pmf:stack $12000000
+
+#GPU_REACH_UART2_THR = $FF1A0000
+#GPU_REACH_UART2_LSR = $FF1A0014
+#GPU_REACH_UART2_THRE = $20
+#GPU_REACH_UART_SPINS = 1000000
+
+#GPU_REACH_PWRDN_CON = $FF310014
+#GPU_REACH_PWRDN_ST = $FF310018
+#GPU_REACH_IDLE_REQ = $FF310060
+#GPU_REACH_IDLE_ST = $FF310064
+#GPU_REACH_IDLE_ACK = $FF310068
+#GPU_REACH_CLKSEL13 = $FF760134
+#GPU_REACH_CLKGATE13 = $FF760334
+#GPU_REACH_CLKGATE30 = $FF760378
+#GPU_REACH_SOFTRST18 = $FF760448
+
+#GPU_REACH_GPU_ID = $FF9A0000
+#GPU_REACH_MMU_FEATURES = $FF9A0014
+#GPU_REACH_AS_PRESENT = $FF9A0018
+#GPU_REACH_JS_PRESENT = $FF9A001C
+#GPU_REACH_GPU_STATUS = $FF9A0034
+#GPU_REACH_JOB_INT_JS_STATE = $FF9A1010
+#GPU_REACH_MMU_INT_STAT = $FF9A200C
+#GPU_REACH_INT_RAWSTAT = $FF9A0020
+#GPU_REACH_INT_CLEAR = $FF9A0024
+#GPU_REACH_INT_MASK = $FF9A0028
+#GPU_REACH_CMD = $FF9A0030
+#GPU_REACH_WDT_CRR = $FF84800C
+#GPU_REACH_SHADER_PRESENT = $FF9A0100
+#GPU_REACH_TILER_PRESENT = $FF9A0110
+#GPU_REACH_L2_PRESENT = $FF9A0120
+#GPU_REACH_SHADER_READY = $FF9A0140
+#GPU_REACH_TILER_READY = $FF9A0150
+#GPU_REACH_L2_READY = $FF9A0160
+#GPU_REACH_SHADER_PWRON = $FF9A0180
+#GPU_REACH_TILER_PWRON = $FF9A0190
+#GPU_REACH_L2_PWRON = $FF9A01A0
+#GPU_REACH_JM_CONFIG = $FF9A0F00
+#GPU_REACH_SHADER_CONFIG = $FF9A0F04
+#GPU_REACH_TILER_CONFIG = $FF9A0F08
+#GPU_REACH_AS0_TRANSTAB_LO = $FF9A2400
+#GPU_REACH_AS0_TRANSTAB_HI = $FF9A2404
+#GPU_REACH_AS0_MEMATTR_LO = $FF9A2408
+#GPU_REACH_AS0_MEMATTR_HI = $FF9A240C
+#GPU_REACH_AS0_COMMAND = $FF9A2418
+#GPU_REACH_AS0_FAULTSTATUS = $FF9A241C
+#GPU_REACH_AS0_STATUS = $FF9A2428
+#GPU_REACH_JOB_INT_RAWSTAT = $FF9A1000
+#GPU_REACH_JOB_INT_CLEAR = $FF9A1004
+#GPU_REACH_JS1_HEAD_NEXT_LO = $FF9A18C0
+#GPU_REACH_JS1_HEAD_NEXT_HI = $FF9A18C4
+#GPU_REACH_JS1_AFFINITY_NEXT_LO = $FF9A18D0
+#GPU_REACH_JS1_AFFINITY_NEXT_HI = $FF9A18D4
+#GPU_REACH_JS1_CONFIG_NEXT = $FF9A18D8
+#GPU_REACH_JS1_COMMAND_NEXT = $FF9A18E0
+#GPU_REACH_JS1_STATUS = $FF9A18A4
+
+Global Dim gpu_l0.a[8192]
+Global Dim gpu_l1.a[8192]
+Global Dim gpu_job.a[128]
+Global Dim gpu_result.l[8]
+
+Procedure.i GpuReachTx(value.i)
+  Protected attempt.i
+  For attempt=0 To #GPU_REACH_UART_SPINS-1
+    If (PeekL(#GPU_REACH_UART2_LSR) & #GPU_REACH_UART2_THRE)<>0
+      PokeL(#GPU_REACH_UART2_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i GpuReachHex32(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      If GpuReachTx(48+digit)=0 : ProcedureReturn 0 : EndIf
+    Else
+      If GpuReachTx(55+digit)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GpuReachWord(value.i)
+  If GpuReachHex32(value)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn GpuReachTx(32)
+EndProcedure
+
+Procedure.i GpuReachNewline()
+  If GpuReachTx(13)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn GpuReachTx(10)
+EndProcedure
+
+Procedure.i Main()
+  Protected pwrdnCon.i
+  Protected pwrdnSt.i
+  Protected idleReq.i
+  Protected idleSt.i
+  Protected idleAck.i
+  Protected clksel13.i
+  Protected clkgate13.i
+  Protected clkgate30.i
+  Protected softrst18.i
+  Protected infraRefusal.i
+  Protected gpuId.i
+  Protected mmuFeatures.i
+  Protected asPresent.i
+  Protected jsPresent.i
+  Protected gpuStatus.i
+  Protected jobIntJsState.i
+  Protected mmuIntStat.i
+  Protected gpuRefusal.i
+  Protected resetRaw.i
+  Protected resetAttempt.i
+  Protected l2Present.i
+  Protected shaderPresent.i
+  Protected tilerPresent.i
+  Protected coreMask.i
+  Protected expected.i
+  Protected ready.i
+  Protected phase.i
+  Protected root.i
+  Protected level1.i
+  Protected job.i
+  Protected target.i
+  Protected jobRaw.i
+  Protected jobAttempt.i
+
+  If GpuReachTx(71)=0 : ProcedureReturn $E501 : EndIf
+  If GpuReachTx(49)=0 : ProcedureReturn $E502 : EndIf
+  If GpuReachTx(32)=0 : ProcedureReturn $E503 : EndIf
+
+  pwrdnCon=PeekL(#GPU_REACH_PWRDN_CON) & $FFFFFFFF
+  If GpuReachWord(pwrdnCon)=0 : ProcedureReturn $E504 : EndIf
+  pwrdnSt=PeekL(#GPU_REACH_PWRDN_ST) & $FFFFFFFF
+  If GpuReachWord(pwrdnSt)=0 : ProcedureReturn $E505 : EndIf
+  idleReq=PeekL(#GPU_REACH_IDLE_REQ) & $FFFFFFFF
+  If GpuReachWord(idleReq)=0 : ProcedureReturn $E506 : EndIf
+  idleSt=PeekL(#GPU_REACH_IDLE_ST) & $FFFFFFFF
+  If GpuReachWord(idleSt)=0 : ProcedureReturn $E507 : EndIf
+  idleAck=PeekL(#GPU_REACH_IDLE_ACK) & $FFFFFFFF
+  If GpuReachWord(idleAck)=0 : ProcedureReturn $E508 : EndIf
+  clksel13=PeekL(#GPU_REACH_CLKSEL13) & $FFFFFFFF
+  If GpuReachWord(clksel13)=0 : ProcedureReturn $E509 : EndIf
+  clkgate13=PeekL(#GPU_REACH_CLKGATE13) & $FFFFFFFF
+  If GpuReachWord(clkgate13)=0 : ProcedureReturn $E50A : EndIf
+  clkgate30=PeekL(#GPU_REACH_CLKGATE30) & $FFFFFFFF
+  If GpuReachWord(clkgate30)=0 : ProcedureReturn $E50B : EndIf
+  softrst18=PeekL(#GPU_REACH_SOFTRST18) & $FFFFFFFF
+  If GpuReachWord(softrst18)=0 : ProcedureReturn $E50C : EndIf
+
+  infraRefusal=0
+  If (pwrdnCon & $00008000)<>0 : infraRefusal=infraRefusal | $001 : EndIf
+  If (pwrdnSt & $00008000)<>0 : infraRefusal=infraRefusal | $002 : EndIf
+  If (idleReq & $00000001)<>0 : infraRefusal=infraRefusal | $004 : EndIf
+  If (idleSt & $00000001)<>0 : infraRefusal=infraRefusal | $008 : EndIf
+  If (idleAck & $00000001)<>0 : infraRefusal=infraRefusal | $010 : EndIf
+  If (clkgate13 & $00000001)<>0 : infraRefusal=infraRefusal | $020 : EndIf
+  If (clkgate30 & $00000100)<>0 : infraRefusal=infraRefusal | $040 : EndIf
+  If (softrst18 & $00000007)<>0 : infraRefusal=infraRefusal | $080 : EndIf
+  If ((clksel13 >> 5) & 7)>4 : infraRefusal=infraRefusal | $100 : EndIf
+
+  If infraRefusal<>0
+    If GpuReachHex32(infraRefusal)=0 : ProcedureReturn $E50D : EndIf
+    If GpuReachNewline()=0 : ProcedureReturn $E50E : EndIf
+    ProcedureReturn $47511000 | infraRefusal
+  EndIf
+  If GpuReachWord(infraRefusal)=0 : ProcedureReturn $E50F : EndIf
+
+  ASM
+    dsb sy
+  ENDASM
+  gpuId=PeekL(#GPU_REACH_GPU_ID) & $FFFFFFFF
+  If GpuReachWord(gpuId)=0 : ProcedureReturn $E510 : EndIf
+  mmuFeatures=PeekL(#GPU_REACH_MMU_FEATURES) & $FFFFFFFF
+  If GpuReachWord(mmuFeatures)=0 : ProcedureReturn $E511 : EndIf
+  asPresent=PeekL(#GPU_REACH_AS_PRESENT) & $FFFFFFFF
+  If GpuReachWord(asPresent)=0 : ProcedureReturn $E512 : EndIf
+  jsPresent=PeekL(#GPU_REACH_JS_PRESENT) & $FFFFFFFF
+  If GpuReachWord(jsPresent)=0 : ProcedureReturn $E513 : EndIf
+  gpuStatus=PeekL(#GPU_REACH_GPU_STATUS) & $FFFFFFFF
+  If GpuReachWord(gpuStatus)=0 : ProcedureReturn $E514 : EndIf
+  jobIntJsState=PeekL(#GPU_REACH_JOB_INT_JS_STATE) & $FFFFFFFF
+  If GpuReachWord(jobIntJsState)=0 : ProcedureReturn $E515 : EndIf
+  mmuIntStat=PeekL(#GPU_REACH_MMU_INT_STAT) & $FFFFFFFF
+  If GpuReachWord(mmuIntStat)=0 : ProcedureReturn $E516 : EndIf
+
+  gpuRefusal=0
+  If ((gpuId >> 16) & $FFFF)<>$0860 : gpuRefusal=gpuRefusal | $1 : EndIf
+  If (mmuFeatures & $FF)=0 Or ((mmuFeatures >> 8) & $FF)=0
+    gpuRefusal=gpuRefusal | $2
+  EndIf
+  If asPresent=0 : gpuRefusal=gpuRefusal | $4 : EndIf
+  If jsPresent=0 : gpuRefusal=gpuRefusal | $8 : EndIf
+  If GpuReachHex32(gpuRefusal)=0 : ProcedureReturn $E517 : EndIf
+  If GpuReachNewline()=0 : ProcedureReturn $E518 : EndIf
+  If gpuRefusal<>0 : ProcedureReturn $47512000 | gpuRefusal : EndIf
+
+  ; Linux panfrost_gpu_soft_reset(): mask IRQs, clear the reset-complete
+  ; status, request SOFT_RESET, then poll RAWSTAT for bit 8. This proof stops
+  ; before powering cores, configuring an address space or submitting a job.
+  PokeL(#GPU_REACH_WDT_CRR,$76)
+  PokeL(#GPU_REACH_INT_MASK,0)
+  PokeL(#GPU_REACH_INT_CLEAR,$100)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#GPU_REACH_CMD,1)
+  resetRaw=0
+  For resetAttempt=0 To 999999
+    resetRaw=PeekL(#GPU_REACH_INT_RAWSTAT) & $FFFFFFFF
+    If (resetRaw & $100)<>0 : Break : EndIf
+    If (resetAttempt & $FFF)=0 : PokeL(#GPU_REACH_WDT_CRR,$76) : EndIf
+  Next
+  If GpuReachTx(82)=0 : ProcedureReturn $E519 : EndIf
+  If GpuReachTx(50)=0 : ProcedureReturn $E51A : EndIf
+  If GpuReachTx(32)=0 : ProcedureReturn $E51B : EndIf
+  If GpuReachWord(resetRaw)=0 : ProcedureReturn $E51C : EndIf
+  If GpuReachHex32(resetAttempt)=0 : ProcedureReturn $E51D : EndIf
+  If GpuReachNewline()=0 : ProcedureReturn $E51E : EndIf
+  If (resetRaw & $100)=0 : ProcedureReturn $47513001 : EndIf
+  ; Linux clears all known GPU status bits and re-enables fault reporting.
+  PokeL(#GPU_REACH_INT_CLEAR,$30781)
+  PokeL(#GPU_REACH_INT_MASK,$30081)
+  ASM
+    dsb sy
+  ENDASM
+  ; T860-r2p0 quirks and power order from panfrost_gpu_init_quirks()
+  ; and panfrost_gpu_power_on(). No MMU or job registers are written.
+  PokeL(#GPU_REACH_SHADER_CONFIG,$00010000)
+  PokeL(#GPU_REACH_TILER_CONFIG,(PeekL(#GPU_REACH_TILER_CONFIG) & $FFFFFFFF) | 1)
+  PokeL(#GPU_REACH_JM_CONFIG,$000001F8)
+  l2Present=PeekL(#GPU_REACH_L2_PRESENT) & $FFFFFFFF
+  shaderPresent=PeekL(#GPU_REACH_SHADER_PRESENT) & $FFFFFFFF
+  tilerPresent=PeekL(#GPU_REACH_TILER_PRESENT) & $FFFFFFFF
+  If l2Present=0 Or shaderPresent=0 Or tilerPresent=0 : ProcedureReturn $47513002 : EndIf
+  coreMask=$FFFFFFFF
+  If l2Present<>1
+    coreMask=(~(l2Present-1)) & (l2Present-2) & $FFFFFFFF
+  EndIf
+  For phase=0 To 2
+    Select phase
+      Case 0
+        expected=l2Present & coreMask
+        PokeL(#GPU_REACH_L2_PWRON,expected)
+      Case 1
+        expected=shaderPresent & coreMask
+        PokeL(#GPU_REACH_SHADER_PWRON,expected)
+      Case 2
+        expected=tilerPresent
+        PokeL(#GPU_REACH_TILER_PWRON,expected)
+    EndSelect
+    ready=0
+    For resetAttempt=0 To 199999
+      Select phase
+        Case 0 : ready=PeekL(#GPU_REACH_L2_READY) & $FFFFFFFF
+        Case 1 : ready=PeekL(#GPU_REACH_SHADER_READY) & $FFFFFFFF
+        Case 2 : ready=PeekL(#GPU_REACH_TILER_READY) & $FFFFFFFF
+      EndSelect
+      If ready=expected : Break : EndIf
+      If (resetAttempt & $FFF)=0 : PokeL(#GPU_REACH_WDT_CRR,$76) : EndIf
+    Next
+    If GpuReachTx(80)=0 : ProcedureReturn $E51F : EndIf
+    If GpuReachTx(48+phase)=0 : ProcedureReturn $E520 : EndIf
+    If GpuReachTx(32)=0 : ProcedureReturn $E521 : EndIf
+    If GpuReachWord(expected)=0 : ProcedureReturn $E522 : EndIf
+    If GpuReachHex32(ready)=0 : ProcedureReturn $E523 : EndIf
+    If GpuReachNewline()=0 : ProcedureReturn $E524 : EndIf
+    If ready<>expected : ProcedureReturn $47513010 | phase : EndIf
+  Next
+  ; io-pgtable-arm.c ARM_MALI_LPAE: full L0, L1 1-GiB identity block,
+  ; outer-shareable read/write noncached data, execute-never. CPU cache is off.
+  root=(@gpu_l0[0]+4095) & ~$FFF
+  level1=(@gpu_l1[0]+4095) & ~$FFF
+  job=(@gpu_job[0]+63) & ~$3F
+  target=@gpu_result[2]
+  If root<0 Or level1<0 Or job<0 Or target<0 Or root>$FFFFFFFF Or level1>$FFFFFFFF Or job>$FFFFFFFF Or target>$FFFFFFFF
+    ProcedureReturn $47513020
+  EndIf
+  PokeL(root,level1 | 3)
+  PokeL(root+4,0)
+  PokeL(level1,$000002C1)
+  PokeL(level1+4,$00600000)
+  PokeL(target-4,$11223344)
+  PokeL(target,$A5A5A5A5)
+  PokeL(target+4,$A5A5A5A5)
+  PokeL(target+8,$55667788)
+  ASM
+    dsb sy
+  ENDASM
+  ; Linux panfrost_mmu_enable(): flush, publish TRANSTAB/MEMATTR, UPDATE.
+  If (PeekL(#GPU_REACH_AS0_STATUS) & 1)<>0 : ProcedureReturn $47513021 : EndIf
+  PokeL(#GPU_REACH_AS0_COMMAND,5)
+  For resetAttempt=0 To 99999
+    If (PeekL(#GPU_REACH_AS0_STATUS) & 1)=0 : Break : EndIf
+    If (resetAttempt & $FFF)=0 : PokeL(#GPU_REACH_WDT_CRR,$76) : EndIf
+  Next
+  If (PeekL(#GPU_REACH_AS0_STATUS) & 1)<>0 : ProcedureReturn $47513022 : EndIf
+  PokeL(#GPU_REACH_AS0_TRANSTAB_LO,root | 7)
+  PokeL(#GPU_REACH_AS0_TRANSTAB_HI,0)
+  PokeL(#GPU_REACH_AS0_MEMATTR_LO,$00888D88)
+  PokeL(#GPU_REACH_AS0_MEMATTR_HI,0)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#GPU_REACH_AS0_COMMAND,1)
+  For resetAttempt=0 To 99999
+    If (PeekL(#GPU_REACH_AS0_STATUS) & 1)=0 : Break : EndIf
+    If (resetAttempt & $FFF)=0 : PokeL(#GPU_REACH_WDT_CRR,$76) : EndIf
+  Next
+  If GpuReachTx(77)=0 : ProcedureReturn $E525 : EndIf
+  If GpuReachTx(48)=0 : ProcedureReturn $E526 : EndIf
+  If GpuReachTx(32)=0 : ProcedureReturn $E527 : EndIf
+  If GpuReachWord(PeekL(#GPU_REACH_AS0_TRANSTAB_LO))=0 : ProcedureReturn $E528 : EndIf
+  If GpuReachWord(PeekL(#GPU_REACH_AS0_MEMATTR_LO))=0 : ProcedureReturn $E529 : EndIf
+  If GpuReachHex32(PeekL(#GPU_REACH_AS0_STATUS))=0 : ProcedureReturn $E52A : EndIf
+  If GpuReachNewline()=0 : ProcedureReturn $E52B : EndIf
+  If (PeekL(#GPU_REACH_AS0_STATUS) & 1)<>0 Or (PeekL(#GPU_REACH_AS0_FAULTSTATUS) & $FFFFFFFF)<>0
+    ProcedureReturn $47513023
+  EndIf
+
+  ; Mesa panfrost/genxml/v5.xml: 32-byte header, Write Value payload at 32.
+  ; The v5 ZERO job writes a private guarded 64-bit word. Linux job_hw_submit()
+  ; uses JS1 for non-fragment work, AS0, priority 8 and start/end cache flush.
+  PokeL(job+16,$00010005)
+  PokeL(job+32,target)
+  PokeL(job+36,0)
+  PokeL(job+40,3)
+  ASM
+    dsb sy
+  ENDASM
+  If (PeekL(#GPU_REACH_JS1_COMMAND_NEXT) & $FFFFFFFF)<>0 : ProcedureReturn $47513024 : EndIf
+  PokeL(#GPU_REACH_JOB_INT_CLEAR,$00020002)
+  PokeL(#GPU_REACH_JS1_HEAD_NEXT_LO,job)
+  PokeL(#GPU_REACH_JS1_HEAD_NEXT_HI,0)
+  PokeL(#GPU_REACH_JS1_AFFINITY_NEXT_LO,shaderPresent)
+  PokeL(#GPU_REACH_JS1_AFFINITY_NEXT_HI,0)
+  PokeL(#GPU_REACH_JS1_CONFIG_NEXT,$00083300)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#GPU_REACH_JS1_COMMAND_NEXT,1)
+  jobRaw=0
+  For jobAttempt=0 To 999999
+    jobRaw=PeekL(#GPU_REACH_JOB_INT_RAWSTAT) & $FFFFFFFF
+    If (jobRaw & $00020002)<>0 : Break : EndIf
+    If (jobAttempt & $FFF)=0 : PokeL(#GPU_REACH_WDT_CRR,$76) : EndIf
+  Next
+  If GpuReachTx(74)=0 : ProcedureReturn $E52C : EndIf
+  If GpuReachTx(48)=0 : ProcedureReturn $E52D : EndIf
+  If GpuReachTx(32)=0 : ProcedureReturn $E52E : EndIf
+  If GpuReachWord(jobRaw)=0 : ProcedureReturn $E52F : EndIf
+  If GpuReachWord(PeekL(target))=0 : ProcedureReturn $E530 : EndIf
+  If GpuReachWord(PeekL(job))=0 : ProcedureReturn $E531 : EndIf
+  If GpuReachWord(PeekL(#GPU_REACH_JS1_STATUS))=0 : ProcedureReturn $E532 : EndIf
+  If GpuReachHex32(PeekL(#GPU_REACH_AS0_FAULTSTATUS))=0 : ProcedureReturn $E533 : EndIf
+  If GpuReachNewline()=0 : ProcedureReturn $E534 : EndIf
+  If (jobRaw & 2)=0 Or (jobRaw & $00020000)<>0 Or PeekL(target)<>0 Or PeekL(target+4)<>0
+    ProcedureReturn $47513025
+  EndIf
+  If PeekL(target-4)<>$11223344 Or PeekL(target+8)<>$55667788
+    ProcedureReturn $47513026
+  EndIf
+  ProcedureReturn $47513000
+EndProcedure
+

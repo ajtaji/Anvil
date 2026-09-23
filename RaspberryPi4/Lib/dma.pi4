@@ -1,0 +1,2473 @@
+; ======================================================================
+; dma.pi4 - THE SoC's 2D BLITTER. Pixels moved by hardware, not by the
+;           CPU, using the legacy DMA engine's 2D mode at $FE007000.
+; ----------------------------------------------------------------------
+; This file exists because of one measured number.
+;
+;   1920 x 1080 x 32bpp, on this board, 2026-08-26, from
+;   RaspberryPi4/Examples/Diagnostics/pi4NeonLiar.pi4:
+;
+;                           MMU off      MMU on, DRAM cacheable
+;       clear, stores only  356.9 ms          266.4 ms
+;       blend, best of two 2718.8 ms         2172.0 ms
+;
+;   against a 25 ms frame budget. 266.4 ms to store 8.29 MB is 48
+;   cycles per byte - 194 cycles to write one four-byte pixel, where a
+;   store loop should cost one or two. Turning the caches on bought
+;   1.3x and could not buy more, because a compositor STREAMS: every
+;   line is touched once per frame, so there is no reuse for a cache to
+;   exploit (the same argument is written up at damage.pi4's head).
+;
+; The cleanest way around a slow CPU loop is to not use the CPU. This
+; file is that: a hardware rectangle fill and a hardware rectangle copy
+; that the ARM starts and then does not participate in.
+;
+; ======================================================================
+; USE - in the MAIN file. Libraries do not include libraries (project
+; ruling, 2026-07-30, house rule 10):
+;
+;     XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+;
+; THIS FILE INCLUDES NOTHING. It reads CNTPCT_EL0 and CNTFRQ_EL0
+; directly for its timeouts - the same choice mailbox.pi4 made and for
+; the same reason (mailbox.pi4:33-40) - so it has no dependency to
+; declare, no include order to get wrong, and can be the first thing a
+; program calls. Its counter helpers are DmaTicks() and DmaCounterHz()
+; rather than Ticks() and TickHz() precisely because timer.pi4 owns
+; those two names and reads the same two registers.
+;
+; The shortest correct sequence:
+;
+;     DmaSetScratch($700000, 512)              ; 256-byte aligned, low 1 GiB
+;     DmaSetBounds(DisplayBase(), DisplaySize()) ; the ONLY writable window
+;     If DmaInit() = 0
+;       ... DmaErrorText() says why ...
+;     EndIf
+;     DmaFill32(DisplayBase(), DisplayPitch(), 1920, 1080, colour)
+;
+; ======================================================================
+; THREE HAZARDS. EACH ONE LOOKS LIKE ONE OF THE OTHERS AT THE BENCH.
+; ======================================================================
+;
+; HAZARD 1 - THE LEGACY ENGINES CANNOT SEE ABOVE ARM PHYSICAL
+;            $40000000, AND THAT IS NOT THE $C0000000 LIMIT EVERYONE
+;            QUOTES.
+;
+;   Two different caps are in circulation on this board and they are
+;   not the same cap:
+;
+;     * $C0000000 is the PCIe controller's inbound window
+;       (pcie.pi4:472, #PCIE_DMA_LIMIT, from bcm2711.dtsi's pcie node).
+;       PcieDmaOk() is the check, and it is the right check for xHCI
+;       and for anything else hanging off the root complex.
+;
+;     * $40000000 - ONE GIGABYTE - is what THIS engine can reach, and
+;       it is three quarters tighter. Datasheets/pi4/bcm2711.dtsi:45:
+;
+;           dma-ranges = <0xc0000000  0x0 0x00000000  0x40000000>;
+;
+;       Read as <bus, parent-hi, parent-lo, size>: bus $C0000000 is ARM
+;       physical $00000000 for $40000000 bytes, and there is no second
+;       range. The vendor PDF says the same thing from the hardware
+;       side - the ENABLE register's PAGE field
+;       (bcm2711-peripherals.txt:4994-5002) exists to "set the 1G SDRAM
+;       ram page that the 30-bit DMA engines (DMA0-6) will access when
+;       addressing the 1G uncached range C000_0000->ffff_ffff", which
+;       is only necessary because the engines are THIRTY-BIT.
+;
+;   So a buffer at $80000000 is DMA-poison for this engine even though
+;   PcieDmaOk() would wave it through. DmaAddrOk() is the check that
+;   belongs to this file, and every entry point calls it.
+;
+;   THIS FILE DELIBERATELY DOES NOT TOUCH THE PAGE FIELD. Moving the
+;   window would move it for DMA0-6 as a whole, including any channel
+;   the firmware is using, and the failure would land somewhere with no
+;   visible connection to graphics. If a buffer above 1 GiB has to be
+;   reached, the answer is a DMA4 channel (see the last section), not a
+;   page flip behind the firmware's back.
+;
+;   THE FRAMEBUFFER IS SAFE. display.pi4:2053 computes
+;   dsp_base = bus & $3FFFFFFF, so the surface is in the low gigabyte
+;   by construction and this engine can always reach it.
+;
+; HAZARD 2 - THE CACHES ARE ON NOW, AND A MISSING CLEAN LOOKS EXACTLY
+;            LIKE HAZARD 1.
+;
+;   As of 2026-08-26 DRAM maps Normal Write-Back Cacheable while a
+;   payload has the MMU on (#MMU_DRAM_ATTR = $711 in mmu.pi4). So:
+;
+;     * a control block the CPU just wrote is in a dirty cache line and
+;       the engine reads DRAM. It must be CLEANED first.
+;     * a fill pattern the CPU just wrote is in the same position.
+;     * pixels the engine just wrote are in DRAM and the CPU may hold
+;       stale lines over them. They must be INVALIDATED first.
+;
+;   This file cleans its own control block and its own pattern on every
+;   transfer - the caller cannot be expected to know they exist. It
+;   does NOT clean the caller's source rectangle or invalidate the
+;   caller's destination, because it does not know what else the caller
+;   has touched or is about to touch; DmaCacheRange() is public for
+;   exactly that, and the discipline is stated at each entry point.
+;
+;   The reason to labour this: a buffer above the 1 GiB cap produces a
+;   device that accepts everything and completes nothing, and a missing
+;   cache clean produces a transfer that copies stale bytes. At the
+;   bench, with a screen full of wrong pixels, those are hard to tell
+;   apart. CHECK THE ADDRESS FIRST - it is a comparison, and the cache
+;   question is not. mmu.pi4:310-319 makes the same point.
+;
+; HAZARD 3 - A RUNAWAY DESTINATION IS THE ONE FAULT THAT NEEDS A POWER
+;            CYCLE.
+;
+;   Nothing here can damage hardware. But this engine writes to
+;   PHYSICAL addresses with no MMU in its path, so a wrong destination
+;   is a bus master scribbling over the monitor's code, a parked core's
+;   spin table, or a payload - and the symptom is a board that stops
+;   answering rather than a bad picture.
+;
+;   THEREFORE DmaSetBounds() IS MANDATORY AND EVERY TRANSFER IS
+;   REFUSED UNTIL IT HAS BEEN CALLED. The caller declares one window
+;   that this file may write into - normally the framebuffer - and any
+;   rectangle whose last byte falls outside it is refused with
+;   #DMA_ERR_BOUNDS before a single register is written.
+;
+;   That is stricter than most libraries here are, and it is on
+;   purpose. genet.pi4 can afford to check only the size of a region
+;   it was handed because the device writes inside a ring it owns. A
+;   blitter takes a fresh destination on every call, from arithmetic
+;   the caller did, and an off-by-one in that arithmetic is a store
+;   into whatever follows the surface.
+;
+; ======================================================================
+; WHY THE LEGACY ENGINE AND NOT V3D
+; ======================================================================
+; From "Raspberry Pi 4/NeonArcade port plan 2026-08-26.md" section 9.3,
+; which is agreeing with Datasheets/pi4/v3d/v3d-feasibility.md:527-543:
+; the 2D mode of the legacy DMA controller is "the best value in the
+; whole note... the only item here that does not depend on a single
+; line of reverse engineering". Every register, bit and field this file
+; touches is in the vendor PDF, cited by line below.
+;
+; It is also squarely BELOW the graphics seam. This file knows about
+; bytes, rows, pitches and one pixel size; it does not know what a
+; window is, does not clip, does not blend, and does not include
+; display.pi4. A compositor calls it; it never calls a compositor.
+;
+; WHAT IT CANNOT DO, said plainly so nobody plans around a capability
+; that is not here: IT DOES NOT BLEND. It is a copy engine. It
+; accelerates opaque fills, rectangle copies, scrolling, and pushing a
+; shadow buffer to the framebuffer. The alpha composite still costs
+; what it costs, and the way to make that cheaper is to do less of it
+; (damage.pi4) or to do it on the QPUs (V3D), not here.
+;
+; ======================================================================
+; THE HARDWARE, AND WHERE EVERY NUMBER IN THIS FILE COMES FROM
+; ======================================================================
+; Source of truth: Datasheets/bcm2711-peripherals.pdf, chapter 4 "DMA
+; Controller", and the extracted bcm2711-peripherals.txt beside it.
+; Line numbers below are the .txt; PDF page numbers are in the
+; extracted footers, chapter 4 running from document page 30 to 64.
+;
+;   :2292-2293  "DMA Channel 0 is located at the address of 0x7e007000,
+;               Channel 1 at 0x7e007100 ... adjacent DMA Channels are
+;               offset by 0x100."
+;   :2293-2294  Channel 15 is at 0x7ee05000 and is "exclusively used by
+;               the VPU". This file will not go near it.
+;   :2351-2380  Table 34, the Control Block: eight 32-bit words, in the
+;               order TI, SOURCE_AD, DEST_AD, TXFR_LEN, STRIDE,
+;               NEXTCONBK, and two reserved words that must be zero.
+;   :2342-2345  Only CS, CONBLK_AD and DEBUG are directly writeable.
+;               Everything else is loaded from the CB.
+;   :2442-2450  Start by writing the CB address into CONBLK_AD and then
+;               setting ACTIVE. The engine stops and clears ACTIVE when
+;               it loads a NEXTCONBK of zero.
+;   :3023-3210  Table 38, the CS register, bit by bit.
+;   :3226-3234  CONBLK_AD. "The address must be 256-bit aligned, so the
+;               bottom 5 bits of the address must be zero."
+;   :3241-3410  Table 40, the TI register, bit by bit.
+;   :3411-3490  Table 43, TXFR_LEN: YLENGTH in 29:16, XLENGTH in 15:0.
+;   :3491-3515  Table 44, STRIDE: D_STRIDE in 31:16, S_STRIDE in 15:0,
+;               both SIGNED 16-bit.
+;   :3537-3620  Table 46, DEBUG, including the three sticky error bits.
+;   :3017-3021  INT_STATUS at 0xfe0, ENABLE at 0xff0.
+;   :4970-5100  Table 62, ENABLE: PAGELITE 31:28, PAGE 27:24, EN14..EN0
+;               in 14:0, all reset to 1.
+;   :5230-5246  Section 4.3, AXI Bursts. Channel 0 and channel 15 are
+;               the two with an external 128-bit 8-word read FIFO,
+;               which is what makes memory-to-memory efficient.
+;   :5247-5258  Section 4.4, Error Handling.
+;   :5262-5272  Section 4.5, the LITE engines: channels 7-10 have NO 2D
+;               MODE AT ALL - "The TDMODE, S_STRIDE, D_STRIDE and
+;               YLENGTH registers will all be removed. Setting these
+;               registers will have no effect." That is why this file
+;               refuses channels 7-10 rather than quietly producing a
+;               linear transfer of the wrong length.
+;   :5277-5283  Section 4.6, the DMA4 engines: channels 11-14, 40 address
+;               bits, write bursts, and they "bypass the paging
+;               registers". The last section of this header says what
+;               that would buy and why it is not what this file is.
+;
+; WHICH CHANNELS ARE FREE, and the citation is the device tree because
+; the PDF does not say. Datasheets/pi4/bcm2711.dtsi:106:
+;
+;     brcm,dma-channel-mask = <0x07f5>;
+;
+; $07F5 is 0000 0111 1111 0101 - channels 0, 2, 4, 5, 6, 7, 8, 9, 10.
+; Bits 1 and 3 are clear, so CHANNELS 1 AND 3 BELONG TO THE FIRMWARE
+; and nothing here may take them. Of what is left, only 0, 2, 4, 5 and
+; 6 are full engines with 2D mode; 7-10 are LITE. Channel 0 is the
+; default here because it is one of the two with the read FIFO
+; (:5236-5238).
+;
+; THE DEFAULT IS A CHOICE AND IT COULD BE WRONG. The mask above is what
+; the Linux device tree claims, not what the running firmware has
+; promised. The firmware will also answer the question directly, via
+; mailbox tag $00060001 GET_DMA_CHANNELS, and a program that has
+; mailbox.pi4 in its include list should ASK and then call
+; DmaSetChannel() with a channel the firmware admits to. This file
+; cannot ask; it has no mailbox and, by house rule 10, may not acquire
+; one. RaspberryPi4/Examples/Diagnostics/pi4DmaProbe.pi4 does ask, and
+; prints both answers side by side.
+;
+; ======================================================================
+; THE ONE THING THE VENDOR PDF LEAVES AMBIGUOUS, AND WHAT THIS FILE
+; DOES ABOUT IT
+; ======================================================================
+; Is YLENGTH the NUMBER of rows, or the number of rows MINUS ONE?
+;
+; The DMA4 table is explicit (:4778-4779): "In 2D mode a value of 0
+; will result in a single XLENGTH transfer and a value of 1 will result
+; in 2 XLENGTH transfers." That is N-1.
+;
+; The LEGACY table, Table 43 at :3477-3480, describes the same field in
+; the same words - "indicating how many xlength transfers are
+; performed" - AND OMITS THAT SENTENCE ENTIRELY. So the legacy engine
+; is either N or N-1 and the document does not say which.
+;
+; This is not a difference that can be split. Guess N when the part
+; wants N-1 and every fill writes one row too many, off the bottom of
+; the rectangle and, on the last rectangle, off the end of the surface.
+; Guess N-1 when the part wants N and every fill leaves the bottom row
+; of every rectangle unpainted, which reads as a tearing artefact and
+; gets blamed on the pitch.
+;
+; SO THIS FILE MEASURES IT. DmaInit() runs a 2-row, 8-byte 2D transfer
+; into the scratch block, counts how many rows actually changed, and
+; sets an internal bias of 0 or 1 that every later transfer applies.
+; It also checks a 64-byte guard band after the calibration target and
+; refuses to initialise if anything landed in it. DmaYLengthBias()
+; reports what was found, so the answer gets written down once and for
+; all the first time this runs on silicon.
+;
+; The calibration is cheap - 16 bytes moved - and it doubles as proof
+; that 2D mode works at all on the chosen channel BEFORE anything is
+; aimed at the framebuffer. That ordering is the point.
+;
+; ======================================================================
+; WHY WAIT_FOR_OUTSTANDING_WRITES AND NOT WAIT_RESP
+; ======================================================================
+; Two bits promise something about writes having landed and they cost
+; very different amounts.
+;
+;   TI bit 3, WAIT_RESP (:3375-3388), makes the engine wait for the AXI
+;   write response FOR EACH WRITE. That serialises the whole transfer
+;   on bus round trips and throws away the reason for using DMA.
+;
+;   CS bit 28, WAIT_FOR_OUTSTANDING_WRITES (:3050-3070), keeps a tally
+;   instead: writes stream out freely, and at the very end of the
+;   transfer the engine clears ACTIVE but defers setting END until
+;   the last write response has come back. END is the completion witness.
+;
+; The second is what a blitter wants: full speed, and a completion flag
+; that means the pixels are actually in memory rather than in flight.
+; This file sets CS.WAIT_FOR_OUTSTANDING_WRITES on every start and
+; leaves TI.WAIT_RESP clear. The PDF notes the engine will pause if it
+; has more than 13 outstanding writes, which is a throttle, not a
+; correctness problem.
+;
+; ======================================================================
+; WHAT IS DELIBERATELY NOT HERE
+; ======================================================================
+;   * NO INTERRUPTS. TI.INTEN stays clear and every transfer is
+;     completion-polled. There is no interrupt controller layer in this
+;     tree for a library to hook, and a blocking blitter that is ten
+;     times faster than the CPU loop is already the whole win. The
+;     asynchronous door is left open on purpose: DmaBusy() and
+;     DmaWait() are public, so an overlapped variant is a small
+;     addition and not a rewrite.
+;   * NO CHAINED CONTROL BLOCKS. One CB per call, NEXTCONBK zero. A
+;     chain is how a scatter of rectangles becomes one submission, and
+;     that belongs with the damage tracker that knows what the
+;     rectangles are - not here, and not before there is a caller.
+;   * NO PERIPHERAL PACING. PERMAP stays 0, "continuous un-paced
+;     transfer" (:3285-3292). This file moves memory to memory.
+;   * NO BLEND. Said above; said again because it is the capability
+;     people assume a blitter has.
+;
+; ======================================================================
+; THE NEXT RUNG, NAMED SO IT DOES NOT HAVE TO BE REDISCOVERED
+; ======================================================================
+; The DMA4 engines - channels 11 to 14, at $FE007B00 and 0x100 apart -
+; are strictly better hardware for this job on three counts, all from
+; :5277-5283 and the register map at :2836-2900:
+;
+;   1. FORTY ADDRESS BITS. No 1 GiB cap, no bus alias, no PAGE field.
+;      A shadow buffer could live anywhere in the 4 GiB.
+;   2. WRITE BURSTS. The legacy engines do not do them except as
+;      2-beat wide writes; DMA4 does, and a fill is all writes.
+;   3. UNCOUPLED READ AND WRITE paths.
+;
+; What it costs is a second control-block format: DMA4's CB is eight
+; words in the order TI, SRC, SRCI, DEST, DESTI, LEN, NEXT_CB, DEBUG2,
+; with the top address bits and the per-side burst and width fields
+; living in the SRCI and DESTI words (:2836-2900, and the field tables
+; at :4400-4800). Channel 11 is taken - the firmware uses it for VCHIQ,
+; per the comment at rpi-linux/rpi-6.12.y_bcm2711-rpi-ds.dtsi:168 - so
+; 12, 13 and 14 are the candidates.
+;
+; That is a separate day's work with its own bring-up, and it is not
+; what "1-2 days, vendor-documented, no reverse engineering" was
+; scoped for. It is written down here so the choice is a choice.
+; ======================================================================
+
+
+; ======================================================================
+;  ADDRESSES AND REGISTER OFFSETS
+; ======================================================================
+
+; Bus $7E007000 -> ARM $FE007000 through the soc node's ranges,
+; bcm2711.dtsi:40. The node itself is bcm2711.dtsi:79-81,
+; dma-controller@7e007000 with reg = <0x7e007000 0xb00>. Note the 0xb00
+; span: the device tree stops before the DMA4 channels because it
+; describes them as a separate node.
+#DMA_BASE     = $FE007000
+#DMA_CHAN_STEP = $100          ; :2292-2293
+
+; Per-channel registers, all offsets from the channel base. :2460-2503
+#DMA_CS        = $00
+#DMA_CONBLK_AD = $04
+#DMA_TI        = $08
+#DMA_SOURCE_AD = $0C
+#DMA_DEST_AD   = $10
+#DMA_TXFR_LEN  = $14
+#DMA_STRIDE    = $18
+#DMA_NEXTCONBK = $1C
+#DMA_DEBUG     = $20
+
+; Global registers, offsets from #DMA_BASE. :3017-3021
+#DMA_INT_STATUS = $FE0
+#DMA_ENABLE     = $FF0
+
+; CS bits. Table 38, :3023-3210.
+#DMA_CS_RESET       = $80000000   ; bit 31, W1SC, :3035-3040
+#DMA_CS_ABORT       = $40000000   ; bit 30, W1SC, :3042-3048
+#DMA_CS_DISDEBUG    = $20000000   ; bit 29,       :3029-3034
+#DMA_CS_WAIT_WRITES = $10000000   ; bit 28,       :3050-3070
+#DMA_CS_ERROR       = $00000100   ; bit  8, RO,   :3113-3122
+#DMA_CS_WAITING     = $00000040   ; bit  6, RO,   :3130-3140
+#DMA_CS_DREQ_STOPS  = $00000020   ; bit  5, RO,   :3142-3152
+#DMA_CS_PAUSED      = $00000010   ; bit  4, RO,   :3154-3168
+#DMA_CS_DREQ        = $00000008   ; bit  3, RO,   :3172-3184
+#DMA_CS_INT         = $00000004   ; bit  2, W1C,  :3185-3193
+#DMA_CS_END         = $00000002   ; bit  1, W1C,  :3194-3200
+#DMA_CS_ACTIVE      = $00000001   ; bit  0, RW,   :3201-3210
+
+; PRIORITY is 19:16 and PANIC_PRIORITY is 23:20, :3090-3112. Zero is
+; the LOWEST priority, and a blitter competing with the display
+; controller's own fetches should not be at the bottom of the arbiter.
+; 8 of a possible 15 is a deliberate middle: high enough that a
+; full-surface fill is not starved, low enough that it cannot outrank a
+; peripheral that panics because its FIFO is about to underrun.
+#DMA_PRIORITY_SHIFT       = 16
+#DMA_PANIC_PRIORITY_SHIFT = 20
+#DMA_DEFAULT_PRIORITY     = 8
+
+; TI bits. Table 40, :3241-3410.
+#DMA_TI_NO_WIDE_BURSTS = $04000000  ; bit 26,     :3267-3275
+#DMA_TI_WAITS_SHIFT    = 21         ; bits 25:21, :3276-3284
+#DMA_TI_PERMAP_SHIFT   = 16         ; bits 20:16, :3285-3293
+#DMA_TI_BURST_SHIFT    = 12         ; bits 15:12, :3294-3302
+#DMA_TI_SRC_IGNORE     = $00000800  ; bit 11,     :3303-3311
+#DMA_TI_SRC_DREQ       = $00000400  ; bit 10,     :3312-3319
+#DMA_TI_SRC_WIDTH      = $00000200  ; bit  9,     :3320-3326
+#DMA_TI_SRC_INC        = $00000100  ; bit  8,     :3327-3335
+#DMA_TI_DEST_IGNORE    = $00000080  ; bit  7,     :3336-3342
+#DMA_TI_DEST_DREQ      = $00000040  ; bit  6,     :3343-3349
+#DMA_TI_DEST_WIDTH     = $00000020  ; bit  5,     :3350-3356
+#DMA_TI_DEST_INC       = $00000010  ; bit  4,     :3367-3374
+#DMA_TI_WAIT_RESP      = $00000008  ; bit  3,     :3375-3388
+#DMA_TI_TDMODE         = $00000002  ; bit  1,     :3391-3400
+#DMA_TI_INTEN          = $00000001  ; bit  0,     :3401-3410
+
+; DEBUG bits. Table 46, :3537-3620. The three at the bottom are the
+; sticky error latches and all three are write-1-to-clear.
+#DMA_DEBUG_LITE           = $10000000  ; bit 28, RO
+#DMA_DEBUG_READ_ERROR     = $00000004  ; bit  2, W1C, :3604-3610
+#DMA_DEBUG_FIFO_ERROR     = $00000002  ; bit  1, W1C, :3611-3616
+#DMA_DEBUG_READ_LAST_ERR  = $00000001  ; bit  0, W1C, :3617-3622
+#DMA_DEBUG_ERROR_MASK     = $00000007  ; all three, cleared together
+#DMA_DEBUG_WRITES         = $000000F0  ; Table 45: outstanding write responses
+
+; Field limits, from the register widths themselves.
+;   XLENGTH is 15:0        -> at most 65535 bytes in one row
+;   YLENGTH is 29:16       -> at most 16383 rows
+;   D_STRIDE / S_STRIDE    -> SIGNED 16-bit, so -32768 .. +32767
+; A 1920-pixel 32bpp row is 7680 bytes and a 1080-row surface is well
+; inside all three, but a caller with a wider surface is not, and the
+; failure of an overflowed XLENGTH is a fill of the wrong width rather
+; than a refusal. Hence the checks.
+#DMA_MAX_ROW_BYTES = 65535
+#DMA_MAX_ROWS      = 16383
+#DMA_STRIDE_MAX    =  32767
+; Nothing in this file produces a negative stride, because DmaGeomOk()
+; refuses a pitch smaller than the row - see the note there on why a
+; case with no caller is a case with an unexercised sign bug. The
+; constant is here because the FIELD is signed and the next person to
+; add a bottom-up surface or an overlapping-row layout needs to know
+; that the hardware allows it and this file simply does not use it.
+#DMA_STRIDE_MIN    = -32768
+
+; THE REACH OF THE 30-BIT ENGINES. bcm2711.dtsi:45 and the PAGE field
+; at bcm2711-peripherals.txt:4994-5002. See HAZARD 1 in the header.
+#DMA_LIMIT     = $40000000
+#DMA_BUS_ALIAS = $C0000000     ; the uncached view the engines address
+#DMA_BUS_MASK  = $3FFFFFFF     ; the 30 bits that are actually decoded
+
+; The Cortex-A72 cache line, the same constant display.pi4 and
+; genet.pi4 use.
+#DMA_CACHE_LINE = 64
+
+; The control block is eight words and must start on a 32-byte
+; boundary, :3232-3234.
+;
+; #DMA_CB_ALIGN IS NOT WHAT DmaSetScratch() CHECKS ANY MORE - it checks
+; #DMA_SCRATCH_ALIGN, which is 256 and therefore satisfies this as a
+; side effect. The constant stays because it is the hardware's actual
+; requirement for CONBLK_AD and the next person to lay out the scratch
+; block differently needs to know that 32 is the real floor and 256 is
+; a choice the fill pattern forced.
+#DMA_CB_BYTES  = 32
+#DMA_CB_ALIGN  = 32
+
+; ======================================================================
+;  THE SCRATCH BLOCK - what it is for and why the caller owns it
+; ======================================================================
+;  This file needs a small piece of memory that BOTH the CPU and the
+;  DMA engine can see: somewhere to build the control block, somewhere
+;  to keep the repeating pattern a solid fill reads from, and a target
+;  for the one-off calibration described in the header.
+;
+;  IT IS NOT A `Global Dim` HERE, for genet.pi4's reason
+;  (genet.pi4:2169-2176) and one more of its own:
+;
+;    * BSS is imposed on every program that so much as includes this
+;      file, and this backend does not dead-strip - math.pi4:127-132
+;      records that including a library costs its whole size.
+;
+;    * AND THE ADDRESS WOULD BE WRONG HALF THE TIME. A payload's BSS
+;      sits 512 KiB above its load address (#A64_BSS_GAP in
+;      A64Assembler.pbi), so a program loaded into the HIGH window at
+;      $40000000 and upward - which memory.pi4 recommends for anything
+;      large - would have its BSS above the 1 GiB cap and every
+;      transfer would fail. A caller who is told to supply the memory
+;      is a caller who has been made to think about where it is.
+;
+;  THE LAYOUT, all offsets from the base the caller gives:
+;
+;      +0   .. +31    the control block. 32 bytes, 32-byte aligned.
+;      +32  .. +255   reserved, and nothing writes here today. It is
+;                     claimed because the chained multi-rectangle
+;                     submission the damage tracker will eventually
+;                     want needs a SECOND control block, and enlarging
+;                     the required size later would silently break
+;                     every caller that had sized its block exactly.
+;      +256 .. +511   the fill pattern. TWO HUNDRED AND FIFTY-SIX bytes
+;                     of the colour repeated, read over and over with
+;                     SRC_INC clear. The size is not arbitrary and the
+;                     next section is entirely about why.
+;
+;  THE CALIBRATION WRITES NOTHING AT ALL. It is a reads-only transfer
+;  with TI.DEST_IGNORE set, and it counts rows by reading back the
+;  engine's own SOURCE_AD register afterwards. That is a deliberate
+;  design constraint and DmaCalibrate() explains why the obvious
+;  alternative - fill a target and count what changed - was rejected.
+;
+; ======================================================================
+;  WHY THE PATTERN IS 256 BYTES. THIS WAS A BUG, IT REACHED SILICON,
+;  AND THE FIX IS THE SIZE OF THIS NUMBER.
+; ======================================================================
+;  IT WAS 32 BYTES UNTIL 2026-08-26 AND THAT WAS WRONG. The reasoning
+;  that produced 32 is left here because it is exactly the reasoning
+;  that has to be replaced rather than patched:
+;
+;    "The engine reads 128 bits at a time (TI.SRC_WIDTH) and does not
+;     advance the source (TI.SRC_INC clear), so it re-reads the same
+;     wide word forever. 16 bytes covers a 128-bit read; the PDF's
+;     description of SRC_INC says the address 'will increment by 4, if
+;     SRC_WIDTH=0 else by 32' (:3327-3335), so the internal register is
+;     256 bits; 32 bytes covers both readings."
+;
+;  Every sentence of that is true and the conclusion is still wrong,
+;  because it reasons about the WIDTH of one access and the transfer is
+;  not made of one access. IT IS MADE OF BURSTS, AND A BURST READS
+;  CONSECUTIVE ADDRESSES. TI.SRC_INC governs whether the engine's
+;  source POINTER advances between transfers; it does not and cannot
+;  make the beats within a single AXI burst target one address.
+;
+;  ---- WHAT THE BENCH SAW, 2026-08-26 -----------------------------
+;  RaspberryPi4/Examples/Diagnostics/pi4DmaGate.pi4, 59 of 60 cases
+;  agreeing with the CPU, and one group A case not:
+;
+;    FAIL fill w=1024 h=8 dp=2048 off=0
+;         first bad byte at +32:  cpu $0D  dma $00   INSIDE the rectangle
+;
+;  ---- THE ONE FACT THAT DECIDES IT -------------------------------
+;  THE GATE SEEDS BOTH BUFFERS WITH $3C BEFORE EVERY CASE, NOT WITH
+;  ZERO, and it does that precisely so this question can be answered.
+;  So the byte at +32 is $00 and not $3C, which means THE ENGINE WROTE
+;  THERE. It did not stop early, it did not fall short, and it was not
+;  refused. It wrote, and what it wrote was zero.
+;
+;  That single comparison eliminates the two suspects a short fill
+;  normally has:
+;
+;    * A TRUNCATED XLENGTH would leave the tail of the row untouched,
+;      so the bench would have read $3C. It read $00. Not this.
+;      (And 1024 is $400, nowhere near the 16-bit field's edge.)
+;    * A WRONG D_STRIDE puts correct data in the wrong PLACE. The
+;      damage here is 32 bytes into row ZERO, before any stride has
+;      been applied even once. Not this either - and the bracketing
+;      case in group A2 with pitch = rowBytes proves it independently
+;      by removing the stride from the picture altogether.
+;
+;  What is left has to explain where ZEROS came from, and there is only
+;  one source of data in a fill: the pattern. The engine read past the
+;  end of a 32-byte pattern into the reserved area behind it, which
+;  nothing had written, and faithfully stored what it found.
+;
+;  The boundary fits the mechanism. Channel 0 is one of the two "fitted
+;  with an external 128-bit 8 word read FIFO... This enables efficient
+;  memory to memory transfers to be performed" (:5236-5238). Eight
+;  words of 128 bits is 128 BYTES. Bursts are "only produced for
+;  specific conditions" (:3298-3302), and a long row is evidently one
+;  of them: every case at 256 bytes a row and below passed, the single
+;  case at 1024 did not, and the good data stopped at exactly the
+;  length of the pattern rather than at any multiple of the row, the
+;  pitch or the stride.
+;
+;  ---- THE FIX, AND WHY THIS SIZE AND NOT 128 ---------------------
+;  The source region must be at least as large as the largest read
+;  burst the engine can issue. Section 4.3 opens with the ceiling:
+;  "The DMA supports bursts under specific conditions. Up to 16 beat
+;  bursts can be accommodated." (:5231). Sixteen beats of 128 bits is
+;  256 BYTES.
+;
+;  So 256, not 128. 128 would cover channel 0's FIFO and would be
+;  sized to a mechanism rather than to a limit - and the whole reason
+;  this bug exists is that 32 was sized to a mechanism. The limit is
+;  the thing to size to, it is stated in one sentence in the vendor
+;  PDF, and the cost of being generous is 224 bytes of the caller's
+;  scratch.
+;
+;  It also means DmaSetBurst() cannot reintroduce the fault at any
+;  legal value: the field is four bits, its maximum is 15, and 16 beats
+;  is already covered.
+;
+;  ---- WHY THE COPY PATH WAS NEVER AFFECTED -----------------------
+;  Because SRC_INC is SET there, so the source is a real region that
+;  the caller sized, and reading forward is the entire point. Group C
+;  passed on all fourteen cases including the 1024-byte rows, which is
+;  the control that isolates this to the fill.
+; ======================================================================
+#DMA_SCRATCH_CB       = 0
+#DMA_SCRATCH_RESERVED = 32
+#DMA_SCRATCH_PATTERN  = 256
+#DMA_SCRATCH_BYTES    = 512    ; the minimum, and what to ask for
+#DMA_PATTERN_BYTES    = 256
+
+; The scratch base must be 256-byte aligned, not merely 32. The control
+; block needs 32 (CONBLK_AD is 256-BIT aligned, :3232-3234); the
+; PATTERN wants 256 so that the one maximal burst the engine may issue
+; from its base cannot straddle a 4 KiB boundary, which is the one
+; place an AXI burst is architecturally required to break. Asking for
+; the larger of the two once is simpler than carrying two rules.
+#DMA_SCRATCH_ALIGN = 256
+
+; The calibration transfer. FOUR bytes in one row, ONE in the YLENGTH
+; field, 32-bit reads and no burst, so the source address advances by
+; exactly four per row performed and the answer is unambiguous.
+#DMA_CALIB_XLEN = 4
+#DMA_CALIB_YLEN = 1
+
+
+; ======================================================================
+;  ERROR CODES
+;
+;  Negative, so a procedure that returns a count can return an error in
+;  the same slot and a caller can test for less than zero. DmaError()
+;  holds the last one and DmaErrorText() puts it in words.
+; ======================================================================
+#DMA_ERR_NONE      =  0
+#DMA_ERR_NOSCRATCH = -1   ; DmaSetScratch() was never called, or refused
+#DMA_ERR_ALIGN     = -2   ; the scratch block is not 32-byte aligned
+#DMA_ERR_SMALL     = -3   ; the scratch block is shorter than the minimum
+#DMA_ERR_REACH     = -4   ; an address is at or above the 1 GiB cap
+#DMA_ERR_CHANNEL   = -5   ; not a channel this file may drive
+#DMA_ERR_LITE      = -6   ; a LITE channel was asked for, and it has no 2D
+#DMA_ERR_DISABLED  = -7   ; the channel's bit in the global ENABLE is clear
+#DMA_ERR_BUSY      = -8   ; the channel was already ACTIVE when we arrived
+#DMA_ERR_TIMEOUT   = -9   ; the transfer did not finish inside the deadline
+#DMA_ERR_HW        = -10  ; CS.ERROR, or a sticky bit in DEBUG
+#DMA_ERR_ARGS      = -11  ; width, height, pitch or colour out of range
+#DMA_ERR_STRIDE    = -12  ; the stride does not fit in a signed 16-bit field
+#DMA_ERR_BOUNDS    = -13  ; the destination is outside the declared window
+#DMA_ERR_NOBOUNDS  = -14  ; DmaSetBounds() was never called
+#DMA_ERR_NOTREADY  = -15  ; DmaInit() has not run, or refused
+#DMA_ERR_CALIB     = -16  ; the 2D calibration produced a result that is
+                          ; neither of the two readings of YLENGTH
+#DMA_ERR_OVERLAP   = -17  ; a copy whose source and destination overlap
+#DMA_ERR_ROWLIMIT  = -18  ; a fill row longer than #DMA_FILL_MAX_ROW_BYTES
+#DMA_ERR_BURST     = -19  ; a burst length at or above the bus-locking one
+#DMA_ERR_UNSAFE    = -20  ; channel quiescence could not be established
+
+
+; ======================================================================
+;  THE FILL ROW LIMIT, AND THE ONE LINE TO CHANGE IF THE NEXT BENCH RUN
+;  STILL FAILS
+; ======================================================================
+;  A fill row is capped separately from a copy row, and today the cap
+;  is the same as the register field allows - so this refuses nothing
+;  and costs one comparison.
+;
+;  IT EXISTS BECAUSE OF WHAT A SHORT FILL LOOKS LIKE. The 2026-08-26
+;  failure wrote 32 correct bytes and then garbage, on a framebuffer
+;  that would be a partially drawn frame, and a partially drawn frame
+;  reads as a rendering bug three layers up. The diagnosis says the
+;  cause was the pattern size and the pattern is now 256 bytes; if the
+;  bracketing cases in the gate's group A2 come back and the limit is
+;  STILL there at some row length, then it is a property of the part
+;  and not of this file, and the honest response is a refusal with a
+;  name rather than a comment nobody reads.
+;
+;  IN THAT CASE: set #DMA_FILL_MAX_ROW_BYTES to the largest row length
+;  that group A2 reported as passing, and write the bench date and the
+;  measured boundary beside it. Nothing else has to change - the check
+;  is already wired into DmaFillPattern32() and #DMA_ERR_ROWLIMIT
+;  already has its sentence in DmaErrorText().
+#DMA_FILL_MAX_ROW_BYTES = 65535   ; = #DMA_MAX_ROW_BYTES: no restriction
+
+
+; ======================================================================
+;  THE BURST CEILING. THIS ONE IS NOT A PRECAUTION - IT IS MEASURED,
+;  AND WHAT IT PREVENTS IS A BOARD THAT STOPS ANSWERING.
+; ======================================================================
+;  Section 4.3 warns about it in one sentence (:5238-5240): "if a read
+;  burst is selected that is too large, the AXI read bus will be
+;  stalled until the DMA has written out the data. This may lead to
+;  inefficient system operation, and possibly AXI lock up if it causes
+;  a circular dependency."
+;
+;  ON 2026-08-26 THAT SENTENCE CAME TRUE ON THIS BOARD. pi4DmaGate.pi4
+;  group F swept the burst length above 8 and the board stopped dead:
+;  nothing more on the wire, and the next thing seen was Anvil's cold
+;  banner after the deadman reset it at 15 s. Not a wrong picture, not
+;  a timeout, not an error flag - a hang. DmaWait()'s two-second
+;  deadline never fired, because the poll is itself an access over the
+;  fabric that had locked.
+;
+;  WHICH burst length did it is not yet known - group F printed only
+;  failures, so the rung that hung left no trace. That is fixed in the
+;  gate, and until a run comes back with the number:
+;
+;    * 8 IS PROVEN. Every case in groups A, A2, B, C, D and E ran at 8
+;      on 2026-08-26 and all of them agreed with the CPU, including
+;      rows of 4096 bytes.
+;    * 9 TO 15 ARE UNPROVEN AND ONE OF THEM LOCKS THE BUS.
+;
+;  So the cap is 8, and DmaSetBurst() REFUSES above it. This is not the
+;  same kind of guard as #DMA_FILL_MAX_ROW_BYTES, which is inert until
+;  somebody measures a limit; this one is live now, because the failure
+;  it prevents is not a bad frame, it is hands on the board.
+;
+;  WHEN THE GATE REPORTS THE HANGING RUNG: set this to one below it and
+;  write the bench date beside it. If the hang turns out to be at 9,
+;  this stays at 8 and the ladder was only ever going to confirm it.
+#DMA_BURST_MAX_SAFE = 8
+
+
+; ======================================================================
+;  STATE
+; ======================================================================
+Global dma_scratch.i  = 0      ; base of the caller's scratch block
+Global dma_scratchN.i = 0      ; its length in bytes
+Global dma_bounds.i   = 0      ; base of the one writable window
+Global dma_boundsN.i  = 0      ; its length in bytes
+Global dma_haveBounds.i = 0    ; 1 once DmaSetBounds() has been obeyed
+Global dma_chan.i     = 0      ; the channel this file drives
+Global dma_ready.i    = 0      ; 1 once DmaInit() has succeeded
+Global dma_quarantined.i = 0   ; selected channel failed verified quiescence
+Global dma_err.i      = 0      ; the last error, one of #DMA_ERR_*
+; MEASURED ON SILICON, 2026-08-26, by pi4DmaGate.pi4 on a BCM2711: the
+; probe's source pointer advanced EIGHT bytes for a one-row request, so
+; the legacy engine follows the same rule the DMA4 table states and the
+; legacy table omits - YLENGTH IS ROWS MINUS ONE.
+;
+; That is why this starts at 1 rather than at -1 and why DmaInit() does
+; not probe by default any more: the answer is known for this part, and
+; a bring-up should not pay for a measurement whose result is already
+; written down. DmaSetYLengthBias(-1) puts it back to "unknown", which
+; makes DmaInit() measure it again - both diagnostics do exactly that,
+; so every bench run still re-derives the number and prints it, and a
+; different part would be caught the first time it ran.
+#DMA_YLENGTH_BIAS_BCM2711 = 1
+Global dma_ybias.i    = 1      ; 0 if YLENGTH is a count, 1 if it is N-1.
+                               ; -1 means "unknown, measure it".
+Global dma_burst.i    = 8      ; TI.BURST_LENGTH. See DmaSetBurst().
+Global dma_flushaddr.i = 0     ; the one line DmaCacheLine() maintains
+; The bounds DmaCacheLines()'s walk reads. They are FILE-SCOPE and not the
+; procedure's own locals, and that changed on 2026-09-11 when the compiler
+; stopped giving automatic storage a fixed address: a local now lives in the
+; invocation's frame, so inline assembly naming one as an absolute symbol is
+; refused, and rightly - the name would have meant a different place on every
+; call. The walk still has to see the bounds from assembly, so the bounds
+; move to the layer that can honestly own an address, beside dma_flushaddr,
+; which this file has always carried for exactly the same reason.
+; THEY ARE THIS FILE'S SCRATCH AND HAVE THE SAME ONE-CALLER-AT-A-TIME
+; CONTRACT dma_flushaddr has: the pair is written and consumed inside one
+; call and means nothing between calls.
+Global dma_walklo.i = 0        ; first line of the walk, rounded down
+Global dma_walkhi.i = 0        ; exclusive end of the walk
+Global dma_lastTicks.i = 0     ; CNTPCT_EL0 elapsed over the last wait
+Global dma_lastCs.i   = 0      ; CS as it read at the end of the last wait
+Global dma_lastDebug.i = 0     ; DEBUG likewise
+
+
+; ======================================================================
+;  THE ARCHITECTURAL COUNTER
+;
+;  Read directly, for mailbox.pi4's reason (mailbox.pi4:925-933):
+;  CNTPCT_EL0 and CNTFRQ_EL0 need no setup and no trap at the exception
+;  levels a loader hands a program, which makes them the cheapest
+;  honest clock a library with no dependencies can have. armstub8.S
+;  sets CNTFRQ_EL0 from OSC_FREQ, 54000000 on BCM2711
+;  (Datasheets/pi4/armstub8.S:54 and :110-112).
+;
+;  A program that arrived some other way may find CNTFRQ_EL0 zero. That
+;  is handled rather than divided by: DmaWait() falls back to a bounded
+;  spin count, so an engine that never answers is a refusal with a code
+;  and not a hang with no message.
+;
+;  THE NAMES ARE DmaTicks() AND DmaCounterHz() ON PURPOSE. timer.pi4
+;  owns Ticks() and TickHz() and reads the same two registers; a
+;  program that includes both files must not find two definitions of
+;  one name.
+; ======================================================================
+Procedure.i DmaTicks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i DmaCounterHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+
+; ======================================================================
+;  CACHE MAINTENANCE
+;
+;  The shape is genet.pi4:1300-1345's and mailbox.pi4:948-970's, and
+;  the operation is the same one for the same reason: the other party
+;  is a bus master beyond the point of coherency, so a line must be
+;  pushed OUT and then DROPPED. That is "dc civac", not "dc cvac" and
+;  not "dc cvau".
+;
+;    dc cvac   cleans only. Right when the reader is a device and the
+;              CPU will not read the bytes back - display.pi4's case.
+;    dc civac  cleans AND invalidates. Right here, because this file
+;              maintains buffers that travel in BOTH directions: the
+;              control block and the pattern go out to the engine, the
+;              calibration result comes back from it, and a caller's
+;              destination rectangle comes back from it too.
+;    dc ivac   would be the literal "invalidate", and it is wrong twice
+;              over: it is an EL1-or-above operation, and it DISCARDS a
+;              dirty line, which would lose a control block the CPU had
+;              just written. xhci.pi4:295-303 works through the same
+;              choice at length.
+;
+;  ENCODING, from the family table at anvil.pi4:1428-1429:
+;    dc civac, x9   op1=3 CRn=7 CRm=14 op2=1 Rt=9  -> $D50B7E29
+;
+;  "ldr x9", NOT "ldr w9". dma_flushaddr is a .i and a .i is EIGHT
+;  bytes on this target. ldr w9 assembles cleanly, uses the right
+;  register, and silently drops the top half of the address. Every
+;  file in this tree that hand-writes this sequence says so, because it
+;  is the shape of bug the widening creates.
+;
+;  This library does not infer whether maintenance can be skipped from
+;  the caller's current MMU state. Anvil can enable cached execution,
+;  and a payload can use the library under its own mappings. Preserve
+;  the explicit maintenance contract in either case.
+; ======================================================================
+Procedure DmaCacheLine()
+  ASM
+    adrp x9, global_dma_flushaddr
+    add  x9, x9, #:lo12:global_dma_flushaddr
+    ldr  x9, [x9]
+    dc civac, x9
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaCacheRange - clean and invalidate every line the range touches,
+; then one barrier for the whole range.
+;
+; PUBLIC, and the caller needs it. This file maintains its own control
+; block and its own pattern and nothing else; a caller who has just
+; written a source rectangle with the CPU must clean it before asking
+; for a copy, and a caller who is about to READ pixels the engine wrote
+; must invalidate them first. Both are this one call.
+;
+; The start is rounded DOWN and the end UP, which is what U-Boot's
+; cache_v8.c does and for the same reason: a partial line still has to
+; be maintained. Rounding out can only touch a neighbouring line, and
+; clean-and-invalidate of a neighbour costs a refill and loses nothing,
+; because civac writes back dirty data before dropping the line.
+;
+; ROUNDED DOWN BY DIVIDE-AND-MULTIPLY, NOT BY MASKING. A mask written
+; as "addr & $FFFFFFC0" is a 32-bit literal and would clear the top
+; half of a 64-bit address along with the low six bits. The addresses
+; here are physical and therefore positive, so the divide is exact.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+; DmaCacheLines - the same walk WITHOUT the barrier.
+;
+; Internal, and split out on 2026-08-27 when DmaCacheRect below needed to
+; maintain many rows and pay for ONE barrier rather than one per row.
+;
+; NOTHING OUTSIDE THIS FILE MAY CALL IT. A maintenance sequence with no
+; barrier after it is not finished: the dc operations are not guaranteed
+; complete, so a transfer started immediately afterwards can race them.
+; That is the whole reason DmaCacheRange keeps the barrier inside itself
+; rather than making every caller remember - and it is why this one is
+; named for the operation rather than for the range.
+; ----------------------------------------------------------------------
+Procedure DmaCacheLines(addr.i, len.i)
+  Protected a.i
+  Protected e.i
+  If len <= 0
+    ProcedureReturn
+  EndIf
+  a = (addr / #DMA_CACHE_LINE) * #DMA_CACHE_LINE
+  e = addr + len
+  ; Hand the bounds to the walk through this file's own storage. The walk
+  ; reads them from assembly and an automatic local has no address assembly
+  ; can name - it lives in the frame of one invocation - so the two values
+  ; are written to dma_walklo/dma_walkhi here, one store each, before the
+  ; loop starts.
+  dma_walklo = a
+  dma_walkhi = e
+  ; Load the full-width bounds once. The hot loop has no procedure call or
+  ; shared scratch store per cache line; maintenance still uses CIVAC and
+  ; the public range/rectangle caller still owns its final barrier. These
+  ; are positive physical addresses with a non-overflowing exclusive end,
+  ; exactly the existing range contract. BCM2711's D-cache line is 64 bytes.
+  ASM
+    adrp x9, global_dma_walklo
+    add  x9, x9, #:lo12:global_dma_walklo
+    ldr  x9, [x9]
+    adrp x10, global_dma_walkhi
+    add  x10, x10, #:lo12:global_dma_walkhi
+    ldr  x10, [x10]
+    cmp  x9, x10
+    b.ge dmaCacheWalkDone
+  dmaCacheWalkNext:
+    dc   civac, x9
+    add  x9, x9, #64
+    cmp  x9, x10
+    b.lt dmaCacheWalkNext
+  dmaCacheWalkDone:
+  EndASM
+EndProcedure
+
+; ONE BEHAVIOUR CHANGED IN THE 2026-08-27 SPLIT AND IT IS NAMED HERE
+; RATHER THAN LEFT TO BE NOTICED. The zero-length early return now lives
+; in DmaCacheLines, so DmaCacheRange(addr, 0) issues a barrier where
+; before it returned having issued nothing. That is strictly the safer
+; direction - a dsb with no maintenance in front of it costs cycles and
+; can never be wrong - and it is left that way rather than testing the
+; length twice. Nothing in this tree calls it with zero.
+Procedure DmaCacheRange(addr.i, len.i)
+  DmaCacheLines(addr, len)
+  a64_barrier()                  ; dsb sy + isb, from the intrinsics
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaCacheRect - maintain a RECTANGLE: rows runs of rowBytes, pitch
+; apart, with ONE barrier for the whole thing.
+;
+; PUBLIC, and it is the call a compositor actually needs. A rectangle is
+; not contiguous in memory, so DmaCacheRange over "the first byte to the
+; last byte" would also maintain everything to the left and right of the
+; rectangle on every row - correct, and on a narrow column many times
+; the work. display.pi4:2249-2291 makes the same argument from the CPU
+; side and walks its rows the same way.
+;
+; ONE BARRIER, NOT ONE PER ROW, and that is the reason this exists at all
+; rather than the caller looping over DmaCacheRange. A 1080-row surface
+; would otherwise pay 1080 "dsb sy; isb" pairs for one region, and a dsb
+; on this part waits for every outstanding memory operation in the
+; machine, not just the ones this loop issued.
+;
+; THE CONTIGUOUS CASE IS COLLAPSED, and the condition is exact: when the
+; pitch EQUALS the row there is no gap between one row and the next, so
+; the whole rectangle is one run and walking it as rows would re-derive
+; the same addresses in a slower loop. This is the same special case
+; display.pi4's DspFlushSpan carves out and it carries the same warning:
+; it is correct ONLY when the region really is contiguous, which for a
+; surface means whole rows AND pitch = width * bpp.
+;
+; IT DOES NOT CHECK REACHABILITY and it must not. Cache maintenance is a
+; CPU operation on CPU addresses; the 1 GiB cap is a property of the
+; ENGINE's address bus and has nothing to say about which lines the CPU
+; may clean. A caller staging through a buffer above the cap still has to
+; maintain it before copying it down.
+; ----------------------------------------------------------------------
+Procedure DmaCacheRect(addr.i, pitch.i, rowBytes.i, rows.i)
+  Protected r.i
+  If rowBytes <= 0
+    ProcedureReturn
+  EndIf
+  If rows <= 0
+    ProcedureReturn
+  EndIf
+
+  If pitch = rowBytes
+    DmaCacheLines(addr, rowBytes * rows)
+  Else
+    r = 0
+    While r < rows
+      DmaCacheLines(addr + (r * pitch), rowBytes)
+      r = r + 1
+    Wend
+  EndIf
+
+  a64_barrier()
+EndProcedure
+
+
+; ======================================================================
+;  REGISTER ACCESS
+;
+;  Peripheral registers are 32 bits and every access here says so.
+;  PeekN is the unsigned 32-bit read - the .n type exists precisely so
+;  a register with bit 31 set does not arrive as a negative 64-bit
+;  value - and PokeL is the 32-bit write. A bare Peek or Poke would be
+;  EIGHT bytes on this target and would take the neighbouring register
+;  with it; genet.pi4:1247-1279 and gpio.pi4:64-66 both record that
+;  trap.
+;
+;  There is no offset validation here of the kind genet_Peek() does,
+;  and the reason is that no offset in this file comes from a caller.
+;  Every one is a named constant from the table above. The values that
+;  DO come from a caller - addresses, widths, strides - are checked
+;  where they arrive, which is the entry points.
+; ======================================================================
+
+; The base of the channel currently selected.
+Procedure.i DmaChanBase()
+  ProcedureReturn #DMA_BASE + (dma_chan * #DMA_CHAN_STEP)
+EndProcedure
+
+Procedure.i DmaRegRead(off.i)
+  ProcedureReturn PeekN(DmaChanBase() + off)
+EndProcedure
+
+Procedure DmaRegWrite(off.i, value.i)
+  PokeL(DmaChanBase() + off, value & $FFFFFFFF)
+EndProcedure
+
+Procedure.i DmaGlobalRead(off.i)
+  ProcedureReturn PeekN(#DMA_BASE + off)
+EndProcedure
+
+
+; ======================================================================
+;  TIMEOUTS
+;
+;  Two deadlines, both checked, for mailbox.pi4's reason
+;  (mailbox.pi4:839-843): the tick deadline is the real one, and the
+;  spin limit is the backstop for a board where CNTFRQ_EL0 reads zero
+;  because nothing set it. An unbounded spin on a device that never
+;  answers is a hang with no message, which is the one outcome a
+;  library in this tree refuses to have.
+;
+;  TWO SECONDS is far outside any legitimate transfer on this part: the
+;  CPU itself clears the whole 8.29 MB surface in 266 ms, and the whole
+;  reason this file exists is to be several times faster than that. A
+;  transfer still running after two seconds is not slow, it is stuck.
+; ======================================================================
+#DMA_TIMEOUT_US  = 2000000
+#DMA_SPIN_LIMIT  = 200000000
+
+; How long to spin after writing CS.RESET before believing the channel
+; is quiescent. RESET "cannot be read, and will self clear"
+; (:3035-3040), so there is nothing to poll; the reset is a handful of
+; cycles of internal state and this is generous by orders of magnitude.
+#DMA_RESET_SPINS = 10000
+
+
+; ======================================================================
+;  SIMPLE ACCESSORS
+; ======================================================================
+
+Procedure.i DmaError()
+  ProcedureReturn dma_err
+EndProcedure
+
+Procedure.i DmaReady()
+  ProcedureReturn dma_ready
+EndProcedure
+
+Procedure.i DmaChannel()
+  ProcedureReturn dma_chan
+EndProcedure
+
+; The one gigabyte the 30-bit engines can reach. See HAZARD 1.
+Procedure.i DmaLimit()
+  ProcedureReturn #DMA_LIMIT
+EndProcedure
+
+; 0 if YLENGTH turned out to be a plain row count, 1 if it turned out
+; to be rows minus one, -1 if DmaInit() has not measured it yet. The
+; vendor PDF does not say which; see the header section on it.
+Procedure.i DmaYLengthBias()
+  ProcedureReturn dma_ybias
+EndProcedure
+
+Procedure.i DmaMaxRowBytes()
+  ProcedureReturn #DMA_MAX_ROW_BYTES
+EndProcedure
+
+Procedure.i DmaMaxRows()
+  ProcedureReturn #DMA_MAX_ROWS
+EndProcedure
+
+; Raw register values as they read at the end of the last DmaWait().
+; For a diagnostic to print, and for nothing else - a caller that
+; decides what to do next by reading CS itself has reached around this
+; file rather than through it.
+Procedure.i DmaLastCs()
+  ProcedureReturn dma_lastCs
+EndProcedure
+
+Procedure.i DmaLastDebug()
+  ProcedureReturn dma_lastDebug
+EndProcedure
+
+; CNTPCT_EL0 ticks the last transfer spent between ACTIVE going up and
+; ACTIVE coming down. Divide by DmaCounterHz() for seconds. This is the
+; number the comparison against the CPU's 266 ms is made from, and it
+; is measured INSIDE this file so that the caller's own timing does not
+; have to include the control-block setup - though it should, and the
+; diagnostic times both.
+Procedure.i DmaLastTicks()
+  ProcedureReturn dma_lastTicks
+EndProcedure
+
+
+; ======================================================================
+;  REACHABILITY - the check that belongs to this file
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaAddrOk - may THIS engine read or write these bytes?
+;
+; This is not PcieDmaOk(). That one answers a different question about
+; a different bus master and its cap is $C0000000; this one is
+; $40000000 and it is the tighter of the two by three quarters of the
+; address space. HAZARD 1 in the header sets out why there are two.
+;
+; A zero or negative length is refused rather than waved through, on
+; pcie.pi4:675's reasoning: a zero-length transfer is a caller that
+; computed a size wrongly, and answering "yes, fine" to it hides the
+; arithmetic error one call earlier.
+;
+; The end is checked as well as the start, so a buffer that BEGINS
+; below the cap and RUNS OVER it is refused. That case is not
+; hypothetical here - a full-surface framebuffer is megabytes long.
+; ----------------------------------------------------------------------
+Procedure.i DmaAddrOk(addr.i, len.i)
+  If len <= 0
+    ProcedureReturn 0
+  EndIf
+  If addr <= 0
+    ProcedureReturn 0
+  EndIf
+  If addr >= #DMA_LIMIT
+    ProcedureReturn 0
+  EndIf
+  If (addr + len) > #DMA_LIMIT
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaBusAddr - the ARM physical address, as the engine must be told it.
+;
+; The engines address DRAM through the VideoCore's UNCACHED alias at
+; $C0000000, which is the "1G uncached range C000_0000->ffff_ffff" the
+; ENABLE register's PAGE field talks about (:4994-5002) and the bus
+; side of bcm2711.dtsi:45's dma-ranges. The low 30 bits are the offset
+; into DRAM; the top two select the VPU's cache behaviour, and uncached
+; is the one a bus master wants - it is the whole point of doing the
+; cache maintenance on the ARM side instead.
+;
+; This is the mirror of display.pi4:2053's "arm = bus & $3FFFFFFF",
+; running the other way.
+;
+; It does NOT check reachability. DmaAddrOk() does that, and every
+; entry point calls it first; keeping the two apart means a diagnostic
+; can print the bus address of an unreachable buffer and see what the
+; engine would have been told.
+; ----------------------------------------------------------------------
+Procedure.i DmaBusAddr(physAddr.i)
+  ProcedureReturn #DMA_BUS_ALIAS | (physAddr & #DMA_BUS_MASK)
+EndProcedure
+
+
+; ======================================================================
+;  SETUP
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaSetScratch - hand this file the small block it works in.
+;
+; 256-BYTE ALIGNED, 512 BYTES LONG, and both numbers grew on
+; 2026-08-26 when the 32-byte fill pattern turned out to be smaller
+; than one read burst - the long section above the constants is the
+; whole story. A caller that was passing 128 bytes will now be refused
+; with #DMA_ERR_SMALL, which is the correct outcome: silently working
+; with a block too small for the pattern is exactly the bug that
+; reached silicon.
+;
+; Below the 1 GiB cap because the engine reads the control block and
+; the pattern out of it.
+;
+; Calling this again clears the ready flag. The scratch block belongs
+; to the caller and this file has no way to know it has not been
+; handed somewhere else in between, so a library that stayed "ready"
+; while pointing at memory the caller may have reused would be
+; asserting something it cannot know.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetScratch(base.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  dma_err = #DMA_ERR_NONE
+
+  If base <= 0
+    dma_err = #DMA_ERR_NOSCRATCH
+    ProcedureReturn 0
+  EndIf
+  If (base & (#DMA_SCRATCH_ALIGN - 1)) <> 0
+    dma_err = #DMA_ERR_ALIGN
+    ProcedureReturn 0
+  EndIf
+  If bytes < #DMA_SCRATCH_BYTES
+    dma_err = #DMA_ERR_SMALL
+    ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(base, bytes) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+
+  dma_scratch  = base
+  dma_scratchN = bytes
+  dma_ready    = 0
+  ; dma_ybias is deliberately NOT reset here. Which way YLENGTH counts
+  ; is a property of the PART, not of the memory the control block
+  ; happens to live in, and throwing the answer away because somebody
+  ; moved the scratch block would make a caller pay for a measurement
+  ; twice for no reason.
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaSetBounds - declare the ONE window this file may write into.
+;
+; MANDATORY. HAZARD 3 in the header says why at length; the short form
+; is that this engine writes physical addresses with nothing in the
+; path to stop it, and the failure mode of a wrong destination is a
+; board that stops answering rather than a picture that looks wrong.
+;
+; Normally the framebuffer:
+;
+;     DmaSetBounds(DisplayBase(), DisplaySize())
+;
+; A caller that legitimately blits into two places - a shadow buffer
+; and the surface - calls this again between the two. It does not
+; clear the ready flag, because nothing about the channel or the
+; calibration depends on where the pixels are going.
+;
+; The window must itself be reachable, because a destination inside an
+; unreachable window is unreachable. Refusing here rather than at the
+; first transfer puts the error next to the mistake.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetBounds(base.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  dma_err = #DMA_ERR_NONE
+
+  If base <= 0
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If bytes <= 0
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(base, bytes) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+
+  dma_bounds     = base
+  dma_boundsN    = bytes
+  dma_haveBounds = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaSetChannel - drive a different channel.
+;
+; The default is 0 and there is a reason for it: channel 0 is one of
+; the two fitted with an external 128-bit 8-word read FIFO, which the
+; PDF says is what "enables efficient memory to memory transfers to be
+; performed" (:5236-5238). The other one is channel 15 and that belongs
+; to the VPU (:2293-2294).
+;
+; WHAT IS REFUSED, AND WHY EACH:
+;
+;   1 and 3   Clear in brcm,dma-channel-mask = <0x07f5>
+;             (Datasheets/pi4/bcm2711.dtsi:106), which means the
+;             firmware has them. Taking one is the kind of fault that
+;             shows up as an unrelated peripheral misbehaving.
+;   7 to 10   LITE engines. "The Lite engine does not support 2D
+;             transfers. The TDMODE, S_STRIDE, D_STRIDE and YLENGTH
+;             registers will all be removed. Setting these registers
+;             will have no effect." (:5269-5271). Refused with a
+;             DIFFERENT code from the others, because the mistake is a
+;             different mistake: the channel exists and is available,
+;             it simply cannot do the one thing this file does. A
+;             silently-ignored TDMODE would produce a LINEAR transfer
+;             whose length is {YLENGTH, XLENGTH} - millions of bytes
+;             written straight through the surface and out the far
+;             side.
+;   11 to 14  DMA4. Real hardware, better hardware, completely
+;             different control-block format. See the last section of
+;             the header.
+;   15        The VPU's.
+;
+; So 0, 2, 4, 5 and 6 are the five this file will accept.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetChannel(ch.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  dma_err = #DMA_ERR_NONE
+
+  If ch < 0
+    dma_err = #DMA_ERR_CHANNEL
+    ProcedureReturn 0
+  EndIf
+  If ch > 6
+    If ch < 11
+      dma_err = #DMA_ERR_LITE          ; 7..10, the LITE engines
+    Else
+      dma_err = #DMA_ERR_CHANNEL       ; 11..14 DMA4, 15 the VPU's
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  If ch = 1
+    dma_err = #DMA_ERR_CHANNEL         ; the firmware's, per the mask
+    ProcedureReturn 0
+  EndIf
+  If ch = 3
+    dma_err = #DMA_ERR_CHANNEL         ; the firmware's, per the mask
+    ProcedureReturn 0
+  EndIf
+
+  dma_chan  = ch
+  dma_ready = 0
+  ; Nor here, and for the same reason: channels 0, 2, 4, 5 and 6 are
+  ; the same engine design on the same die. If a part ever turned up
+  ; where they were not, DmaSetYLengthBias(-1) is how to say so.
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaSetBurst - TI.BURST_LENGTH, bits 15:12 (:3294-3302).
+;
+; "The DMA will attempt to transfer data as bursts of this number of
+; words. A value of zero will produce a single transfer."
+;
+; This knob exists because it is the ONE parameter that materially
+; changes throughput and the whole deliverable here is a measurement
+; against the CPU's 266 ms. A diagnostic that cannot sweep it cannot
+; say whether the default was a good default.
+;
+; THE DEFAULT IS 8 AND THAT IS NOT ARBITRARY. Section 4.3 (:5230-5240)
+; says up to 16 beats can be accommodated, that channel 0's external
+; FIFO allows "a 128-bit wide read burst of 9", and - the sentence that
+; sets the ceiling - "if a read burst is selected that is too large,
+; the AXI read bus will be stalled until the DMA has written out the
+; data. This may lead to inefficient system operation, and possibly AXI
+; lock up if it causes a circular dependency." Eight is inside what the
+; FIFO can absorb on channel 0 and inside what a channel without one
+; can absorb on a 256-bit internal register.
+;
+; IT IS CAPPED AT #DMA_BURST_MAX_SAFE AND THE CAP IS NOT ADVISORY.
+; The long note beside that constant has the bench evidence; the short
+; form is that a burst length above 8 locked the AXI bus on this board
+; on 2026-08-26 and the deadman had to reset it. A value that hangs the
+; machine is not a performance choice a caller gets to make, so this
+; refuses it with #DMA_ERR_BURST rather than clamping silently - a
+; silent clamp would leave a caller believing it had asked for
+; something it had not, which is how a performance regression becomes
+; unexplainable.
+;
+; THE INSTRUMENT THAT HAS TO EXCEED THE CAP USES DmaSetBurstProbe(),
+; below. Earlier this procedure accepted up to 15 with a comment saying
+; "a sweep that cannot reach the bad values cannot find the edge" -
+; that reasoning is still right and it now belongs to the one caller it
+; was ever true for, instead of to everybody.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetBurst(n.i)
+  dma_err = #DMA_ERR_NONE
+  If n < 0
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If n > #DMA_BURST_MAX_SAFE
+    dma_err = #DMA_ERR_BURST
+    ProcedureReturn 0
+  EndIf
+  dma_burst = n
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaSetBurstProbe - THE SAME KNOB WITH THE SAFETY OFF. One caller.
+;
+; This exists for RaspberryPi4/Examples/Diagnostics/pi4DmaGate.pi4's
+; group F and for nothing else, because a ladder that cannot climb past
+; the cap cannot discover where the cap should be. It accepts the full
+; four-bit field, 0 to 15.
+;
+; IF YOU ARE ABOUT TO CALL THIS FROM ANYTHING THAT DRAWS, DO NOT. The
+; failure mode is not a bad rectangle. It is the AXI read bus stalling
+; with no way back: no error flag, no timeout - DmaWait()'s own poll is
+; an access over the same fabric - and no software recovery. The board
+; needs a reset. Anything aimed at a framebuffer should be inside
+; DmaSetBurst()'s cap, which is what that cap is for.
+;
+; ARM THE DEADMAN BEFORE RUNNING ANYTHING THAT CALLS THIS. `deadman 15`
+; at the Anvil prompt, then `run`. It is the difference between a
+; fifteen-second reset and hands on the board.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetBurstProbe(n.i)
+  dma_err = #DMA_ERR_NONE
+  If n < 0
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If n > 15
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  dma_burst = n
+  ProcedureReturn 1
+EndProcedure
+
+; The cap, so a diagnostic can derive its sweep ceiling from the
+; library rather than hardcoding a number that then drifts away from
+; it. pi4DmaProbe.pi4's burst sweep stops here for exactly that reason.
+Procedure.i DmaBurstMaxSafe()
+  ProcedureReturn #DMA_BURST_MAX_SAFE
+EndProcedure
+
+Procedure.i DmaBurst()
+  ProcedureReturn dma_burst
+EndProcedure
+
+
+; ======================================================================
+;  THE ENGINE
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaBusy - is the channel still moving data?
+;
+; CS bit 0 ACTIVE, which "is automatically cleared at the end of the
+; complete DMA transfer, i.e. after a NEXTCONBK = 0x0000_0000 has been
+; loaded" (:3201-3210). Every control block this file builds has a zero
+; NEXTCONBK, but ACTIVE going low is NOT the completion signal.
+;
+; Table 38 explicitly permits ACTIVE=0 while final writes are outstanding.
+; DmaWait requires END and drained writes; this reader includes outstanding
+; responses as busy. Do not reuse memory merely because ACTIVE cleared.
+; ----------------------------------------------------------------------
+Procedure.i DmaBusy()
+  ProcedureReturn Bool(DmaQuiescent() = 0)
+EndProcedure
+
+Procedure.i DmaQuarantined()
+  ProcedureReturn dma_quarantined
+EndProcedure
+
+; Table 38: ACTIVE clears before the last write response; Table 45 counts
+; those responses. This is only the selected legacy channel, never DMA4.
+Procedure.i DmaQuiescent()
+  If (DmaRegRead(#DMA_CS) & (#DMA_CS_ACTIVE | #DMA_CS_WAITING)) <> 0 : ProcedureReturn 0 : EndIf
+  If (DmaRegRead(#DMA_DEBUG) & #DMA_DEBUG_WRITES) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DmaQuarantine()
+  dma_quarantined = 1
+  dma_ready = 0
+  dma_err = #DMA_ERR_UNSAFE
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaAbort - stop a channel that is not going to finish.
+;
+; Internal checked recovery shared by timeout and hardware-error paths.
+; Pause and drain precede RESET; failed drain quarantines the channel.
+;
+; ABORT alone can load the next CB, so it is not a quiescence proof.
+; ----------------------------------------------------------------------
+Procedure.i DmaAbort()
+  ProcedureReturn DmaChannelReset()
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaChannelReset - put the channel into a known state.
+;
+; Writing 1 to CS bit 31 resets the channel. The bit "cannot be read,
+; and will self clear" (:3035-3040), so there is nothing to poll for
+; the reset itself; what CAN be polled is the consequence, which is
+; ACTIVE and outstanding writes clear, and those are checked before RESET
+; as well as afterward. Only an explicit successful reset clears quarantine.
+;
+; The DEBUG write clears the three sticky error latches. They are
+; write-1-to-clear and they survive a reset, so a stale READ_ERROR from
+; a previous program would otherwise be read as ours the first time
+; anything checked CS.ERROR - the error bits "are logically OR-ed
+; together and presented as a general ERROR bit in the CS register"
+; (:5257-5258).
+;
+; The final CS write clears END and INT, which are also W1C. Writing
+; only those two bits is deliberate: a lazy "write zero to CS" would be
+; harmless, but a lazy "write $FFFFFFFF to clear everything" would set
+; RESET and ABORT again, and that habit is how a clear-the-flags line
+; turns into an intermittent.
+; ----------------------------------------------------------------------
+Procedure.i DmaChannelReset()
+  Protected i.i
+  Protected cs.i
+  Protected start.i
+  Protected hz.i
+  Protected limit.i
+
+  ; Pause before reset. RESET clears DEBUG's outstanding-write count, so
+  ; polling only after RESET would discard the very evidence we need.
+  ; Table38/Table45; Linux bcm2835_dma_abort corroborates pause/drain order.
+  hz = DmaCounterHz()
+  If hz < 0 Or hz > $FFFFFFFF : hz = 0 : EndIf
+  limit = (hz * 20000 + 999999) / 1000000
+  start = DmaTicks()
+  DmaRegWrite(#DMA_CS, #DMA_CS_WAIT_WRITES)
+  a64_barrier()
+  i = #DMA_RESET_SPINS
+  While DmaQuiescent() = 0
+    i = i - 1
+    If hz > 0
+      If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
+    Else
+      If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
+    EndIf
+  Wend
+  DmaRegWrite(#DMA_CS, #DMA_CS_RESET)
+  a64_barrier()
+
+  start = DmaTicks()
+  i = #DMA_RESET_SPINS
+  While DmaQuiescent() = 0
+    i = i - 1
+    If hz > 0
+      If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
+    Else
+      If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
+    EndIf
+  Wend
+
+  DmaRegWrite(#DMA_DEBUG, #DMA_DEBUG_ERROR_MASK)
+  DmaRegWrite(#DMA_CS, #DMA_CS_END | #DMA_CS_INT)
+  a64_barrier()
+
+  dma_quarantined = 0
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaWait - block until the channel finishes, or refuse.
+;
+; TWO DEADLINES, both checked every pass, exactly as mailbox.pi4 does
+; (mailbox.pi4:1000-1030). The tick deadline is the real one. The spin
+; count is the backstop for a board where CNTFRQ_EL0 reads zero because
+; nothing set it, and it is what turns "the engine never answered" from
+; a silent hang into a code and a message.
+;
+; ON TIMEOUT THE CHANNEL IS ABORTED. That is not tidiness. A transfer
+; that has not finished in two seconds is a bus master still writing
+; somewhere, and returning to the caller while it does that is how a
+; diagnostic's next screenful gets overwritten by the previous one.
+;
+; THE POLL IS A TIGHT LOOP ON A DEVICE REGISTER and that is a real cost
+; the measurement should know about: every read is an uncached round
+; trip to the peripheral bus and it competes for the same fabric the
+; engine is using. It is not enough to change the answer at these
+; sizes - a full-surface fill is milliseconds and a CS read is
+; nanoseconds - but on a small rectangle the poll can dominate, which
+; is one more reason the asynchronous door is left open.
+; ----------------------------------------------------------------------
+Procedure.i DmaWait(timeoutUs.i)
+  Protected hz.i
+  Protected t0.i
+  Protected limit.i
+  Protected spins.i
+  Protected cs.i
+  Protected dbg.i
+  Protected waiting.i
+  Protected rc.i
+
+  hz = DmaCounterHz()
+  ; Public API: reject invalid/overflowing durations, but still account for
+  ; the outstanding transfer before returning. CNTFRQ is a 32-bit field.
+  If timeoutUs < 1 Or timeoutUs > $7FFFFFFF Or hz < 0 Or hz > $FFFFFFFF
+    If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  t0 = DmaTicks()
+
+  limit = 0
+  If hz > 0
+    limit = (hz * timeoutUs + 999999) / 1000000
+  EndIf
+
+  rc      = 1
+  waiting = 1
+  spins   = 0
+  cs      = DmaRegRead(#DMA_CS)
+
+  While waiting = 1
+    cs = DmaRegRead(#DMA_CS)
+    dbg = DmaRegRead(#DMA_DEBUG)
+    If (cs & #DMA_CS_ERROR) <> 0 Or (dbg & #DMA_DEBUG_ERROR_MASK) <> 0
+      dma_err = #DMA_ERR_HW
+      rc = 0
+      waiting = 0
+    ElseIf (cs & (#DMA_CS_ACTIVE | #DMA_CS_WAITING | #DMA_CS_END)) = #DMA_CS_END And (dbg & #DMA_DEBUG_WRITES) = 0
+      waiting = 0
+    Else
+      spins = spins + 1
+      If hz <= 0 And spins > #DMA_SPIN_LIMIT
+        waiting = 0
+        rc      = 0
+        dma_err = #DMA_ERR_TIMEOUT
+      Else
+        If limit > 0
+          If (DmaTicks() - t0) > limit
+            waiting = 0
+            rc      = 0
+            dma_err = #DMA_ERR_TIMEOUT
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+  Wend
+
+  dma_lastTicks = DmaTicks() - t0
+  dma_lastCs    = cs
+  dbg           = DmaRegRead(#DMA_DEBUG)
+  dma_lastDebug = dbg
+
+  If rc = 0
+    If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
+    ProcedureReturn 0
+  EndIf
+
+  ; CS.ERROR is the OR of the three DEBUG latches (:5257-5258). Both are
+  ; checked, and separately, because a DEBUG latch left over from an
+  ; earlier transfer that this file did not clear would show in DEBUG
+  ; and not in CS - and the reverse ordering of that discovery is worth
+  ; making impossible.
+  If (cs & #DMA_CS_ERROR) <> 0
+    dma_err = #DMA_ERR_HW
+    ProcedureReturn 0
+  EndIf
+  If (dbg & #DMA_DEBUG_ERROR_MASK) <> 0
+    dma_err = #DMA_ERR_HW
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaSubmit - write the control block, start the channel, wait.
+;
+; Internal. Every public operation funnels through here, which is the
+; point: there is exactly ONE place in this file that writes CONBLK_AD
+; and sets ACTIVE, so there is exactly one place where the cache
+; discipline and the start ordering can be wrong.
+;
+; THE CONTROL BLOCK IS EIGHT WORDS AND THE LAST TWO ARE NOT OPTIONAL.
+; Table 34 (:2351-2380) lists words 6 and 7 as "Reserved - set to
+; zero." They are written every time rather than once at init, because
+; the scratch block belongs to the caller and this file has no way to
+; know it has not been used for something else in between.
+;
+; THE ORDER OF THE LAST FOUR STEPS IS THE PDF'S (:2442-2448) AND EACH
+; ONE MATTERS:
+;
+;   1. clear the sticky flags, so END means THIS transfer's end
+;   2. clean the control block out of the D-cache, so the engine reads
+;      what the CPU wrote and not what DRAM last saw. HAZARD 2.
+;   3. write CONBLK_AD with the BUS address of the block
+;   4. barrier, then set ACTIVE
+;
+; Steps 2 and 3 cannot be swapped. The engine begins fetching the block
+; the moment ACTIVE goes up, and a clean that arrived after that is a
+; race that will work on a small transfer and fail on a busy one.
+; ----------------------------------------------------------------------
+Procedure.i DmaSubmit(ti.i, srcBus.i, dstBus.i, lenWord.i, strideWord.i)
+  Protected cb.i
+  Protected cs.i
+
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  cb = dma_scratch + #DMA_SCRATCH_CB
+
+  PokeL(cb +  0, ti)
+  PokeL(cb +  4, srcBus)
+  PokeL(cb +  8, dstBus)
+  PokeL(cb + 12, lenWord)
+  PokeL(cb + 16, strideWord)
+  PokeL(cb + 20, 0)              ; NEXTCONBK. One block, no chain.
+  PokeL(cb + 24, 0)              ; reserved - "set to zero", :2377
+  PokeL(cb + 28, 0)              ; reserved - "set to zero", :2377
+
+  ; Clean the control block AND the fill pattern in one range. They are
+  ; 64 contiguous bytes at the base of the scratch block, so this is one
+  ; or two cache lines and one barrier, and the barrier is the part that
+  ; matters: it is what orders the writes above ahead of the ACTIVE
+  ; below.
+  DmaCacheRange(dma_scratch, #DMA_SCRATCH_PATTERN + #DMA_PATTERN_BYTES)
+  ; That is the whole 512 bytes - control block, the reserved gap, and
+  ; all 256 bytes of the pattern. Cleaning the gap costs three cache
+  ; lines nobody needed and removes a question: after 2026-08-26 the
+  ; rule in this file is that everything the engine can possibly read
+  ; out of the scratch block is cleaned, not everything this file
+  ; believes it will read.
+
+  DmaRegWrite(#DMA_DEBUG, #DMA_DEBUG_ERROR_MASK)
+  DmaRegWrite(#DMA_CS, #DMA_CS_END | #DMA_CS_INT)
+  DmaRegWrite(#DMA_CONBLK_AD, DmaBusAddr(cb))
+  a64_barrier()
+
+  cs = #DMA_CS_ACTIVE
+  cs = cs | #DMA_CS_WAIT_WRITES
+  cs = cs | (#DMA_DEFAULT_PRIORITY << #DMA_PRIORITY_SHIFT)
+  cs = cs | (#DMA_DEFAULT_PRIORITY << #DMA_PANIC_PRIORITY_SHIFT)
+  DmaRegWrite(#DMA_CS, cs)
+
+  ProcedureReturn DmaWait(#DMA_TIMEOUT_US)
+EndProcedure
+
+
+; ======================================================================
+;  THE YLENGTH CALIBRATION
+; ======================================================================
+; The question, restated because it is the one unresolved thing in the
+; vendor documentation for this engine: in 2D mode, is TXFR_LEN's
+; YLENGTH field the NUMBER of rows, or the number of rows MINUS ONE?
+;
+;   Legacy, Table 43, :3477-3480 - "indicating how many xlength
+;   transfers are performed", and nothing else.
+;   DMA4, Table 60, :4773-4779 - the same sentence, followed by "In 2D
+;   mode a value of 0 will result in a single XLENGTH transfer and a
+;   value of 1 will result in 2 XLENGTH transfers."
+;
+; The DMA4 table is explicit and the legacy table is silent, so the
+; legacy engine is either convention and the document does not say.
+;
+; ----------------------------------------------------------------------
+; WHY THIS DOES NOT FILL A BUFFER AND COUNT WHAT CHANGED
+; ----------------------------------------------------------------------
+; That was the first design and it was thrown away, because of what it
+; does when the answer is neither of the two expected ones.
+;
+; A calibration that WRITES has to ask for at least one row, and asking
+; for one row means putting a non-zero value in YLENGTH. If TDMODE were
+; ignored for any reason, TXFR_LEN reverts to a single linear transfer
+; of {YLENGTH, XLENGTH} bytes - and YLENGTH occupies bits 29:16, so the
+; smallest non-zero value there is SIXTY-FIVE THOUSAND FIVE HUNDRED AND
+; THIRTY-SIX BYTES. A probe meant to move sixteen bytes would move 64
+; KiB, through the scratch block and into whatever the caller put after
+; it. There is no value of XLENGTH that bounds that, because the
+; overflow is in the other field.
+;
+; TI.DEST_IGNORE removes the problem completely: "1 = Do not perform
+; destination writes" (:3336-3342). The probe reads and writes nothing,
+; so the worst case of every wrong answer is a few kilobytes of
+; pointless READS out of the scratch block - which cost nothing and
+; corrupt nothing.
+;
+; ----------------------------------------------------------------------
+; HOW IT COUNTS ROWS WITH NOTHING WRITTEN
+; ----------------------------------------------------------------------
+; By asking the engine. SOURCE_AD is documented as "Source address for
+; the DMA operation. Updated by the DMA engine as the transfer
+; progresses." (:3520-3527) - it is a read-only mirror of the CB word
+; that the hardware advances, and it is still there to be read when the
+; channel stops.
+;
+; So: one row of four bytes, YLENGTH = 1, SRC_INC set, SRC_WIDTH clear
+; (32-bit reads, so the address moves in fours), BURST_LENGTH zero (so
+; the engine cannot read ahead past what was asked for), S_STRIDE zero.
+; Afterwards SOURCE_AD has advanced by four bytes per row performed:
+;
+;     advance 4   -> YLENGTH is a plain count. bias = 0.
+;     advance 8   -> YLENGTH is rows minus one. bias = 1.
+;     advance 65540 -> TDMODE was ignored and the transfer went linear.
+;                      That should be impossible on channels 0/2/4/5/6
+;                      and DmaInit() has already checked DEBUG.LITE, so
+;                      it is reported as a calibration failure rather
+;                      than quietly handled.
+;     anything else -> the assumption that SOURCE_AD reads back is
+;                      wrong on this part. Also a calibration failure,
+;                      and DmaSetYLengthBias() is the way past it.
+;
+; ----------------------------------------------------------------------
+; DmaSetYLengthBias - declare the answer instead of measuring it.
+;
+; For two cases. The first is the ordinary one: once the probe has run
+; on silicon and the answer is written down, a program can state it and
+; skip the probe. The second is the escape hatch: if SOURCE_AD does not
+; read back the way the PDF says it does, the probe cannot work and
+; this is how a bench operator supplies the answer by hand after
+; observing which way a test rectangle came out.
+;
+; Call it BEFORE DmaInit(), which will then leave it alone.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetYLengthBias(b.i)
+  dma_err = #DMA_ERR_NONE
+  If b < -1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If b > 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  dma_ybias = b
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaCalibrate - run the probe. Returns 1 and sets dma_ybias, or 0.
+;
+; Public, so a diagnostic can re-run it and print what it found without
+; going through DmaInit() again. It needs the scratch block and a
+; channel and nothing else; in particular it does NOT need bounds,
+; because it does not write.
+; ----------------------------------------------------------------------
+Procedure.i DmaCalibrate()
+  Protected ti.i
+  Protected srcBus.i
+  Protected lenWord.i
+  Protected endBus.i
+  Protected advance.i
+
+  dma_err = #DMA_ERR_NONE
+
+  If dma_scratch = 0
+    dma_err = #DMA_ERR_NOSCRATCH
+    ProcedureReturn 0
+  EndIf
+
+  srcBus = DmaBusAddr(dma_scratch + #DMA_SCRATCH_PATTERN)
+
+  ; TDMODE, because that is what is being measured. SRC_INC so the
+  ; address moves. DEST_IGNORE so nothing is written. No SRC_WIDTH, so
+  ; the step is four bytes and not thirty-two. No burst, so the engine
+  ; does not read further than it was asked to. No DEST_INC and no
+  ; DEST_WIDTH, because there are no writes for them to describe.
+  ti = 0
+  ti = ti | #DMA_TI_TDMODE
+  ti = ti | #DMA_TI_SRC_INC
+  ti = ti | #DMA_TI_DEST_IGNORE
+
+  lenWord = ((#DMA_CALIB_YLEN & $3FFF) << 16) | (#DMA_CALIB_XLEN & $FFFF)
+
+  ; Destination is the pattern area too. It is ignored, but a control
+  ; block with a zero destination is a control block that would write
+  ; to bus $C0000000 - physical zero, the firmware spin table - if
+  ; DEST_IGNORE ever failed to take. Pointing it somewhere harmless
+  ; costs nothing and removes the worst outcome from the table.
+  If DmaSubmit(ti, srcBus, srcBus, lenWord, 0) = 0
+    ProcedureReturn 0
+  EndIf
+
+  endBus  = DmaRegRead(#DMA_SOURCE_AD)
+  advance = endBus - srcBus
+
+  If advance = #DMA_CALIB_XLEN
+    dma_ybias = 0
+    ProcedureReturn 1
+  EndIf
+  If advance = (#DMA_CALIB_XLEN * 2)
+    dma_ybias = 1
+    ProcedureReturn 1
+  EndIf
+
+  dma_ybias = -1
+  dma_err   = #DMA_ERR_CALIB
+  ProcedureReturn 0
+EndProcedure
+
+; What the probe last saw the source pointer advance by. For a
+; diagnostic to print when DmaCalibrate() refuses - the number is the
+; whole diagnosis, and 65540 in particular says "TDMODE was ignored".
+Procedure.i DmaCalibrateAdvance()
+  ProcedureReturn DmaRegRead(#DMA_SOURCE_AD) - DmaBusAddr(dma_scratch + #DMA_SCRATCH_PATTERN)
+EndProcedure
+
+
+; ======================================================================
+;  BRING-UP
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaInit - claim the channel, check the world, measure YLENGTH.
+;
+; Returns 1 on success. Returns 0 and leaves DmaError() set otherwise,
+; and DmaErrorText() puts every one of those codes into a sentence.
+;
+; WHAT IT CHECKS, IN THIS ORDER, AND WHY EACH CHECK EARNS ITS PLACE:
+;
+;   1. THE SCRATCH BLOCK EXISTS. Without it there is nowhere to build a
+;      control block and nothing can happen.
+;
+;   2. THE BOUNDS HAVE BEEN DECLARED. Not needed by anything in
+;      DmaInit() itself - the calibration writes nothing - and required
+;      here anyway, so that a program cannot reach the state of being
+;      "ready" while still one forgotten call away from a transfer that
+;      would be refused. HAZARD 3.
+;
+;   3. THE ENABLE REGISTER'S **PAGE** FIELD IS ZERO. This is the check
+;      nobody thinks of and it invalidates every address in this file
+;      if it fails. Bits 27:24 of ENABLE "set the 1G SDRAM ram page
+;      that the 30-bit DMA engines (DMA0-6) will access when addressing
+;      the 1G uncached range C000_0000->ffff_ffff... setting this to 1
+;      will mean that when the DMA writes to C000_0000 (uncached) the
+;      final address in SDRAM will be 4000_0000" (:4994-5002).
+;
+;      So a non-zero PAGE means every bus address DmaBusAddr() produces
+;      lands one or more gigabytes away from where the caller meant. A
+;      full-surface fill would go to $40000000 instead of the
+;      framebuffer - into the HIGH payload window, silently, with a
+;      black screen as the only symptom. The reset value is 0 and this
+;      file never writes the field; if it is not 0, something else on
+;      this board moved it and this file must not proceed.
+;
+;   4. THE CHANNEL'S ENABLE BIT IS SET. Bits 14:0 of the same register,
+;      all reset to 1 (:5030-5100). A clear bit means somebody
+;      deliberately powered the channel down. This file REFUSES rather
+;      than sets it, because the same register's description warns
+;      "Disabling whilst the DMA is operating will be fatal" - a
+;      register that dangerous is not one to write speculatively, and a
+;      cleared bit is information about the system, not an obstacle.
+;
+;   5. THE CHANNEL IS NOT ALREADY ACTIVE. If it is, somebody else has
+;      it: the firmware on a channel the device tree said was free, or
+;      a previous run of this program that left a transfer in flight.
+;      Resetting a channel out from under a live transfer is how a
+;      graphics experiment corrupts an unrelated driver.
+;
+;   6. THE CHANNEL RESETS CLEANLY, which also clears the three sticky
+;      DEBUG error latches so a stale one from a previous program is
+;      not read as ours.
+;
+;   7. DEBUG.LITE IS CLEAR. Bit 28, read-only, "Set if the DMA is a
+;      reduced performance LITE engine." The channel whitelist in
+;      DmaSetChannel() already excludes 7-10 on the strength of the
+;      PDF; this asks the silicon the same question and is the check
+;      that would catch a part where the classification differs. It
+;      matters more than it looks: a LITE engine silently ignores
+;      TDMODE, and a silently-ignored TDMODE turns a 1920x1080 fill
+;      into a linear transfer of {YLENGTH, XLENGTH} = seventy million
+;      bytes.
+;
+;   8. THE YLENGTH CONVENTION. On a BCM2711 it is ALREADY KNOWN and
+;      nothing is measured: the bias starts at
+;      #DMA_YLENGTH_BIAS_BCM2711 = 1, measured on silicon on
+;      2026-08-26, and DmaInit() takes it as given. The probe runs only
+;      if a caller has said DmaSetYLengthBias(-1) - "forget it, measure
+;      it again" - which is what both diagnostics do, so every bench
+;      run still re-derives the number and prints it and a different
+;      part would be caught the first time it ran.
+; ----------------------------------------------------------------------
+Procedure.i DmaInit()
+  Protected en.i
+  Protected page.i
+  Protected dbg.i
+  Protected cs.i
+
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  dma_err   = #DMA_ERR_NONE
+  dma_ready = 0
+
+  If dma_scratch = 0
+    dma_err = #DMA_ERR_NOSCRATCH
+    ProcedureReturn 0
+  EndIf
+  If dma_haveBounds = 0
+    dma_err = #DMA_ERR_NOBOUNDS
+    ProcedureReturn 0
+  EndIf
+
+  en   = DmaGlobalRead(#DMA_ENABLE)
+  page = (en >> 24) & $F
+  If page <> 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+  If ((en >> dma_chan) & 1) = 0
+    dma_err = #DMA_ERR_DISABLED
+    ProcedureReturn 0
+  EndIf
+
+  cs = DmaRegRead(#DMA_CS)
+  If (cs & #DMA_CS_ACTIVE) <> 0
+    dma_err = #DMA_ERR_BUSY
+    ProcedureReturn 0
+  EndIf
+
+  If DmaChannelReset() = 0
+    dma_err = #DMA_ERR_BUSY
+    ProcedureReturn 0
+  EndIf
+
+  dbg = DmaRegRead(#DMA_DEBUG)
+  If (dbg & #DMA_DEBUG_LITE) <> 0
+    dma_err = #DMA_ERR_LITE
+    ProcedureReturn 0
+  EndIf
+
+  If dma_ybias < 0
+    If DmaCalibrate() = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  dma_ready = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The raw ENABLE register, for a diagnostic to print. The PAGE and
+; PAGELITE fields in the top byte are the interesting part and the
+; reason this is exposed at all.
+Procedure.i DmaEnableRaw()
+  ProcedureReturn DmaGlobalRead(#DMA_ENABLE)
+EndProcedure
+
+Procedure.i DmaScratchBase()
+  ProcedureReturn dma_scratch
+EndProcedure
+
+
+; ======================================================================
+;  ARGUMENT CHECKING - one place, so the entry points stay readable
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaGeomOk - do these dimensions fit the register fields at all?
+;
+; XLENGTH is sixteen bits and YLENGTH is fourteen, so a row longer than
+; 65535 bytes or a rectangle taller than 16383 rows cannot be expressed
+; and would be TRUNCATED rather than refused if this did not check. A
+; truncated XLENGTH is a fill of the wrong width, which on a
+; framebuffer reads as a diagonal shear and gets blamed on the pitch -
+; display.pi4:313-331 documents that exact misdiagnosis from the CPU
+; side.
+;
+; The stride is a SIGNED sixteen-bit field, so the gap between one row
+; and the next cannot exceed 32767 bytes. A 1920-pixel 32bpp surface
+; has a pitch of 7680 and a gap of zero on a full-width fill, so this
+; is generous today and will not be on a 4K surface: 3840 pixels is
+; 15360 bytes a row, still inside XLENGTH, but a narrow column near the
+; right edge of such a surface has a stride approaching 15360 and a
+; 8K surface would exceed the field. Refused, not truncated.
+;
+; A PITCH SMALLER THAN THE ROW IS REFUSED rather than handled. It would
+; mean either overlapping rows or a bottom-up surface with a negative
+; stride, and both are legal for the hardware; neither has a caller
+; here, and supporting a case with no caller is how the extent
+; arithmetic in DmaDestOk() below acquires a sign bug nobody exercises.
+; ----------------------------------------------------------------------
+Procedure.i DmaGeomOk(pitch.i, rowBytes.i, rows.i)
+  If rowBytes < 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If rows < 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If rowBytes > #DMA_MAX_ROW_BYTES
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If rows > #DMA_MAX_ROWS
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If pitch < rowBytes
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If (pitch - rowBytes) > #DMA_STRIDE_MAX
+    dma_err = #DMA_ERR_STRIDE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The number of bytes a rectangle spans from its first byte to its
+; last, inclusive - NOT rowBytes * rows, which is the area. The last
+; row starts (rows-1)*pitch in and runs rowBytes long, and everything
+; between the rows belongs to the surface too as far as "could this
+; write escape the window" is concerned.
+Procedure.i DmaRectSpan(pitch.i, rowBytes.i, rows.i)
+  ProcedureReturn ((rows - 1) * pitch) + rowBytes
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaDestOk - is it safe to let the engine write here?
+;
+; Two separate questions and both have to be yes:
+;
+;   * IS IT INSIDE THE DECLARED WINDOW. HAZARD 3. The caller named one
+;     region this file may write into and every byte of the rectangle
+;     has to be in it.
+;   * CAN THE ENGINE REACH IT. HAZARD 1. Inside the window is not the
+;     same as inside the low gigabyte - a caller could declare a window
+;     that DmaSetBounds() accepted and then hand over a rectangle at
+;     the far end of it, and although DmaSetBounds() checks the whole
+;     window this check costs nothing and does not depend on that.
+; ----------------------------------------------------------------------
+Procedure.i DmaDestOk(dst.i, pitch.i, rowBytes.i, rows.i)
+  Protected span.i
+  Protected last.i
+
+  If dma_haveBounds = 0
+    dma_err = #DMA_ERR_NOBOUNDS
+    ProcedureReturn 0
+  EndIf
+
+  span = DmaRectSpan(pitch, rowBytes, rows)
+  last = (dst + span) - 1
+
+  If dst < dma_bounds
+    dma_err = #DMA_ERR_BOUNDS
+    ProcedureReturn 0
+  EndIf
+  If last > ((dma_bounds + dma_boundsN) - 1)
+    dma_err = #DMA_ERR_BOUNDS
+    ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(dst, span) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+
+; ======================================================================
+;  THE OPERATIONS
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; DmaFillPattern32 - fill a rectangle with a repeating 32-bit word.
+;
+;   dst       byte address of the rectangle's first byte
+;   pitch     bytes from the start of one row to the start of the next
+;   rowBytes  bytes to write on each row
+;   rows      how many rows
+;   pattern   the 32-bit word, repeated
+;
+; BYTES, NOT PIXELS, on purpose. This is the primitive and it is below
+; the graphics seam: it does not know what a pixel is, which is what
+; lets DmaFill32() sit on top of it for 32bpp and lets a 16bpp caller
+; use it by passing a doubled half-word and rowBytes = width * 2.
+;
+; HOW A COPY ENGINE FILLS. There is no fill mode. The engine is pointed
+; at a 32-byte pattern in the scratch block with TI.SRC_INC CLEAR, so
+; the source address never advances and it reads the same wide word for
+; the whole transfer; TI.DEST_INC is set, so the destination walks.
+; TI.SRC_IGNORE, which sounds like it should be involved, is not: it
+; "zero all the write strobes" (:3303-3311) and exists for cache fills,
+; so it would write nothing.
+;
+; THE CACHE, AND WHAT THE CALLER STILL OWES. This call cleans its own
+; control block and its own pattern - HAZARD 2 - and does NOT touch the
+; destination. If the CPU is going to READ these pixels afterwards it
+; must invalidate them first, with DmaCacheRange(dst, span). If the
+; only reader is the display controller, nothing more is needed: the
+; engine wrote through to memory and the scan-out never looks at the
+; ARM's caches.
+;
+; AND THE CALLER MUST NOT HAVE DIRTY LINES OVER THE DESTINATION. If the
+; CPU drew into this rectangle earlier with the caches on and those
+; lines are still dirty, they can be evicted AFTER the engine's writes
+; land and overwrite them. That is a genuine hazard of mixing the two
+; paths on one surface, it is invisible until it is not, and the fix is
+; one DmaCacheRange() over the rectangle before the fill. It is the
+; caller's because only the caller knows whether the CPU touched it.
+; ----------------------------------------------------------------------
+Procedure.i DmaFillPattern32(dst.i, pitch.i, rowBytes.i, rows.i, pattern.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  Protected ti.i
+  Protected i.i
+  Protected p.i
+  Protected ylen.i
+  Protected lenWord.i
+  Protected strideWord.i
+
+  dma_err = #DMA_ERR_NONE
+
+  If dma_ready = 0
+    dma_err = #DMA_ERR_NOTREADY
+    ProcedureReturn 0
+  EndIf
+  If DmaGeomOk(pitch, rowBytes, rows) = 0
+    ProcedureReturn 0
+  EndIf
+  ; The fill's own row cap, separate from the copy's. It refuses
+  ; nothing today - see the long note beside #DMA_FILL_MAX_ROW_BYTES -
+  ; and it is wired in now so that if the gate's bracketing cases find
+  ; a real limit on this part, turning it into a refusal is one
+  ; constant and not a code change.
+  If rowBytes > #DMA_FILL_MAX_ROW_BYTES
+    dma_err = #DMA_ERR_ROWLIMIT
+    ProcedureReturn 0
+  EndIf
+  If DmaDestOk(dst, pitch, rowBytes, rows) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Lay the pattern down - all 256 bytes of it, every time.
+  ;
+  ; PokeL, thirty-two bits at a time: a bare Poke would be eight bytes
+  ; and would write two pattern words at once, which happens to be
+  ; right here and would be wrong the moment anybody made the pattern
+  ; something other than a repeated word.
+  ;
+  ; SIXTY-FOUR STORES PER FILL LOOKS LIKE WASTE AND IS NOT. It is a
+  ; fixed cost of about two hundred instructions against a transfer
+  ; that moves megabytes, it is four cache lines rather than one, and
+  ; the alternative - remember the last colour and skip the loop when
+  ; it has not changed - would leave the pattern buffer holding a
+  ; value this file believes is there rather than one it just wrote.
+  ; That is precisely the class of assumption the 2026-08-26 failure
+  ; came out of, and it is not worth 200 instructions to reintroduce.
+  p = dma_scratch + #DMA_SCRATCH_PATTERN
+  i = 0
+  While i < #DMA_PATTERN_BYTES
+    PokeL(p + i, pattern & $FFFFFFFF)
+    i = i + 4
+  Wend
+
+  ti = 0
+  ti = ti | #DMA_TI_TDMODE
+  ti = ti | #DMA_TI_SRC_WIDTH        ; 128-bit reads of the pattern
+  ti = ti | #DMA_TI_DEST_WIDTH       ; 128-bit writes
+  ti = ti | #DMA_TI_DEST_INC
+  ti = ti | ((dma_burst & $F) << #DMA_TI_BURST_SHIFT)
+  ; SRC_INC is deliberately CLEAR. That is the whole trick.
+
+  ylen       = rows - dma_ybias
+  lenWord    = ((ylen & $3FFF) << 16) | (rowBytes & $FFFF)
+  strideWord = (((pitch - rowBytes) & $FFFF) << 16) | 0
+
+  ProcedureReturn DmaSubmit(ti, DmaBusAddr(p), DmaBusAddr(dst), lenWord, strideWord)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaFill32 - the same thing in pixels, for a 32bpp surface.
+;
+; THE ONE TO COMPARE AGAINST THE CPU. display.pi4's DspRowFill32 is the
+; loop this replaces, and its own header (display.pi4:2372-2410)
+; records what it costs: a thirty-instruction body per pixel unrolled
+; down to about 1.4 instructions per byte, which measured 266.4 ms over
+; the full surface with the caches on.
+;
+;     DmaFill32(DisplayBase(), DisplayPitch(), DisplayWidth(),
+;               DisplayHeight(), colour)
+;
+; is the same rectangle, and RaspberryPi4/Examples/Diagnostics/
+; pi4DmaProbe.pi4 times both in one run so the comparison is direct
+; rather than across two sessions.
+; ----------------------------------------------------------------------
+Procedure.i DmaFill32(dst.i, pitch.i, widthPixels.i, rows.i, colour.i)
+  If widthPixels < 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DmaFillPattern32(dst, pitch, widthPixels * 4, rows, colour & $FFFFFFFF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaCopy2D - copy a rectangle from one surface to another.
+;
+;   dst, dstPitch   where it goes, and that surface's row spacing
+;   src, srcPitch   where it comes from, and that surface's row spacing
+;   rowBytes        how many bytes on each row
+;   rows            how many rows
+;
+; This is the sprite blit, the shadow-buffer present, and the scroll.
+; It is a straight copy - THERE IS NO BLEND AND THERE IS NO FORMAT
+; CONVERSION. Both surfaces must already be in the same pixel format,
+; which is the caller's business and not something a byte-shaped
+; primitive can check.
+;
+; THE CALLER OWES TWO CACHE OPERATIONS AND THIS ONE DOES NEITHER:
+;   * CLEAN THE SOURCE before the call, if the CPU wrote it -
+;     DmaCacheRange(src, span). Without it the engine copies whatever
+;     DRAM last saw, which on a freshly composed shadow buffer is
+;     usually nothing at all.
+;   * INVALIDATE THE DESTINATION after the call, if the CPU will read
+;     it back.
+; DmaFillPattern32's note on dirty lines over the destination applies
+; here too, and for the same reason.
+;
+; OVERLAP. A copy whose destination starts ABOVE its source is refused,
+; and one whose destination starts BELOW its source is allowed. The
+; asymmetry is the engine's address order: SRC_INC and DEST_INC both
+; increment (:3327-3374), so a row is copied low-to-high and the rows
+; are visited in the order the strides walk them. A downward copy - the
+; scroll a console does - therefore reads each byte before the write
+; that would have clobbered it, and an upward copy does not.
+;
+;   THAT IS AN ASSUMPTION, AND IT IS MARKED AS ONE. The PDF states the
+;   increments but does not state that reads and writes retire in
+;   address order under bursting, and it does not have to for the
+;   hardware to be correct. pi4DmaProbe.pi4 tests it explicitly with an
+;   overlapping downward copy of a known pattern; if that test fails,
+;   the fix is to refuse overlap in BOTH directions here and let the
+;   caller stage through a temporary.
+; ----------------------------------------------------------------------
+Procedure.i DmaCopy2D(dst.i, dstPitch.i, src.i, srcPitch.i, rowBytes.i, rows.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  Protected ti.i
+  Protected ylen.i
+  Protected lenWord.i
+  Protected strideWord.i
+  Protected dstSpan.i
+  Protected srcSpan.i
+
+  dma_err = #DMA_ERR_NONE
+
+  If dma_ready = 0
+    dma_err = #DMA_ERR_NOTREADY
+    ProcedureReturn 0
+  EndIf
+  If DmaGeomOk(dstPitch, rowBytes, rows) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaGeomOk(srcPitch, rowBytes, rows) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaDestOk(dst, dstPitch, rowBytes, rows) = 0
+    ProcedureReturn 0
+  EndIf
+
+  dstSpan = DmaRectSpan(dstPitch, rowBytes, rows)
+  srcSpan = DmaRectSpan(srcPitch, rowBytes, rows)
+
+  ; The SOURCE is not bounds-checked against the write window - it is a
+  ; read, and a read cannot corrupt anything - but it IS reach-checked,
+  ; because a source above the cap is the silent-failure case HAZARD 1
+  ; exists for.
+  If DmaAddrOk(src, srcSpan) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+
+  If dst < (src + srcSpan)
+    If src < (dst + dstSpan)
+      If dst > src
+        dma_err = #DMA_ERR_OVERLAP
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+
+  ti = 0
+  ti = ti | #DMA_TI_TDMODE
+  ti = ti | #DMA_TI_SRC_WIDTH
+  ti = ti | #DMA_TI_SRC_INC
+  ti = ti | #DMA_TI_DEST_WIDTH
+  ti = ti | #DMA_TI_DEST_INC
+  ti = ti | ((dma_burst & $F) << #DMA_TI_BURST_SHIFT)
+
+  ylen       = rows - dma_ybias
+  lenWord    = ((ylen & $3FFF) << 16) | (rowBytes & $FFFF)
+  strideWord = (((dstPitch - rowBytes) & $FFFF) << 16) | ((srcPitch - rowBytes) & $FFFF)
+
+  ProcedureReturn DmaSubmit(ti, DmaBusAddr(src), DmaBusAddr(dst), lenWord, strideWord)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; DmaCopy - one contiguous run of bytes. LINEAR, not 2D.
+;
+; TDMODE clear, so TXFR_LEN is read as a single transfer of the full
+; thirty-bit length {YLENGTH, XLENGTH} (:3391-3400) - up to a gigabyte
+; in one control block, with no 65535-byte row limit and no stride
+; arithmetic to get wrong.
+;
+; THIS IS THE PRESENT PATH and it is why the linear case is a separate
+; entry point rather than "DmaCopy2D with one row". Pushing a whole
+; shadow buffer to a framebuffer whose pitch equals width*bpp is one
+; contiguous 8.29 MB run; expressing it as 1080 rows of 7680 bytes
+; would ask the engine to re-evaluate a stride 1080 times for no
+; reason. display.pi4's DspFlushSpan (:2316-2331) carves out the same
+; special case on the cache side, for the same reason and with the same
+; warning: this is ONLY correct when the region really is contiguous,
+; which for a surface means whole rows AND pitch = width * bpp.
+;
+; The overlap rule is DmaCopy2D's.
+; ----------------------------------------------------------------------
+Procedure.i DmaCopy(dst.i, src.i, bytes.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  Protected ti.i
+
+  dma_err = #DMA_ERR_NONE
+
+  If dma_ready = 0
+    dma_err = #DMA_ERR_NOTREADY
+    ProcedureReturn 0
+  EndIf
+  If bytes < 1
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  ; The whole of TXFR_LEN is thirty bits when TDMODE is clear.
+  If bytes > $3FFFFFFF
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  If DmaDestOk(dst, bytes, bytes, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  If DmaAddrOk(src, bytes) = 0
+    dma_err = #DMA_ERR_REACH
+    ProcedureReturn 0
+  EndIf
+
+  If dst < (src + bytes)
+    If src < (dst + bytes)
+      If dst > src
+        dma_err = #DMA_ERR_OVERLAP
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  EndIf
+
+  ti = 0
+  ti = ti | #DMA_TI_SRC_WIDTH
+  ti = ti | #DMA_TI_SRC_INC
+  ti = ti | #DMA_TI_DEST_WIDTH
+  ti = ti | #DMA_TI_DEST_INC
+  ti = ti | ((dma_burst & $F) << #DMA_TI_BURST_SHIFT)
+  ; TDMODE deliberately CLEAR, and the STRIDE word therefore unused.
+
+  ProcedureReturn DmaSubmit(ti, DmaBusAddr(src), DmaBusAddr(dst), bytes & $3FFFFFFF, 0)
+EndProcedure
+
+
+; ======================================================================
+;  ERRORS IN WORDS
+;
+;  Every message names the check that failed AND what to do about it,
+;  because the audience is somebody at a bench with a board that is not
+;  doing what they expected and no debugger.
+; ======================================================================
+Procedure.i DmaErrorText()
+  If dma_quarantined <> 0
+    ProcedureReturn "DMA error -20: the channel has not stopped safely. Its buffers must not be reused; check the channel and bus before explicit recovery."
+  EndIf
+  Select dma_err
+    Case #DMA_ERR_NONE
+      ProcedureReturn "dma: ok"
+    Case #DMA_ERR_NOSCRATCH
+      ProcedureReturn "dma: no scratch block - call DmaSetScratch() with 512 bytes, 256-byte aligned, below $40000000"
+    Case #DMA_ERR_ALIGN
+      ProcedureReturn "dma: the scratch block is not 256-byte aligned. The control block needs 32 (CONBLK_AD is 256-BIT aligned) and the 256-byte fill pattern wants 256 so that one maximal read burst from its base cannot straddle a 4 KiB boundary"
+    Case #DMA_ERR_SMALL
+      ProcedureReturn "dma: the scratch block is shorter than 512 bytes - it holds a 32-byte control block, 224 bytes reserved for a chained block, and a 256-byte fill pattern. It was 128 until 2026-08-26, when a 32-byte pattern turned out to be smaller than one read burst and the engine filled the tail of a long row with whatever lay behind it"
+    Case #DMA_ERR_REACH
+      ProcedureReturn "dma: an address is at or above $40000000 - the legacy engines are thirty-bit and cannot see the rest of DRAM. This is NOT the $C0000000 PCIe cap; it is three quarters tighter. If this came from DmaInit(), the ENABLE register's PAGE field is non-zero and something else on this board has moved the whole one-gigabyte window"
+    Case #DMA_ERR_CHANNEL
+      ProcedureReturn "dma: not a channel this file may drive - 1 and 3 belong to the firmware per brcm,dma-channel-mask, 11 to 14 are DMA4 with a different control block, 15 is the VPU's. Use 0, 2, 4, 5 or 6"
+    Case #DMA_ERR_LITE
+      ProcedureReturn "dma: that is a LITE engine and LITE engines have no 2D mode at all - TDMODE, the strides and YLENGTH are simply absent, so a rectangle would become a linear transfer of tens of millions of bytes"
+    Case #DMA_ERR_DISABLED
+      ProcedureReturn "dma: the channel's bit in the global ENABLE register is clear, so it is powered down. The reset value is 1, so somebody cleared it deliberately; this file will not set it, because that register also warns that disabling a running channel is fatal"
+    Case #DMA_ERR_BUSY
+      ProcedureReturn "dma: the channel was already ACTIVE - somebody else is using it, or a previous transfer is still in flight. Nothing here will reset a channel out from under a live transfer"
+    Case #DMA_ERR_TIMEOUT
+      ProcedureReturn "dma: the transfer did not finish inside two seconds and the channel has been aborted and reset. Check the source and destination addresses first - a buffer above $40000000 produces a device that accepts everything and completes nothing, which is indistinguishable at the bench from a missing cache clean"
+    Case #DMA_ERR_HW
+      ProcedureReturn "dma: the engine reported an error - CS.ERROR, or one of READ_ERROR, FIFO_ERROR, READ_LAST_NOT_SET_ERROR in the DEBUG register. DmaLastDebug() has the raw value"
+    Case #DMA_ERR_ARGS
+      ProcedureReturn "dma: width, height or pitch out of range - a row cannot exceed 65535 bytes, a rectangle cannot exceed 16383 rows, and the pitch may not be smaller than the row"
+    Case #DMA_ERR_STRIDE
+      ProcedureReturn "dma: the gap between rows does not fit the signed sixteen-bit stride field, so it may not exceed 32767 bytes"
+    Case #DMA_ERR_BOUNDS
+      ProcedureReturn "dma: the destination is outside the window DmaSetBounds() declared. This is the check that stops a runaway bus master writing over the monitor; widen the window deliberately or fix the rectangle"
+    Case #DMA_ERR_NOBOUNDS
+      ProcedureReturn "dma: DmaSetBounds() has never been called, and it is mandatory - this engine writes physical addresses with nothing in the path to stop it, so it is told once and explicitly where it may write"
+    Case #DMA_ERR_NOTREADY
+      ProcedureReturn "dma: DmaInit() has not run, or it refused. Call it and read DmaErrorText() again"
+    Case #DMA_ERR_CALIB
+      ProcedureReturn "dma: the YLENGTH calibration gave an answer that is neither convention. DmaCalibrateAdvance() has the source-pointer advance: 4 means a plain row count, 8 means rows minus one, 65540 means TDMODE was ignored and the transfer went linear, anything else means SOURCE_AD does not read back the way the datasheet says. DmaSetYLengthBias() is how to supply the answer by hand"
+    Case #DMA_ERR_OVERLAP
+      ProcedureReturn "dma: source and destination overlap with the destination above the source, which a forward copy would corrupt. A downward copy - the scroll case - is allowed"
+    Case #DMA_ERR_BURST
+      ProcedureReturn "dma: that burst length is at or above the one that locked the AXI read bus on this board on 2026-08-26 - the board hung and the deadman reset it. The cap is #DMA_BURST_MAX_SAFE and it is deliberately a refusal rather than a silent clamp. Only pi4DmaGate.pi4's group F may exceed it, through DmaSetBurstProbe(), and only with the deadman armed"
+    Case #DMA_ERR_ROWLIMIT
+      ProcedureReturn "dma: the fill row is longer than #DMA_FILL_MAX_ROW_BYTES. That constant is the largest row a fill on this part is known to complete correctly; if you are seeing this, somebody measured a hardware limit with the gate's group A2 and wrote it down. Split the rectangle, or use DmaCopy2D from a prepared row"
+  EndSelect
+  ProcedureReturn "dma: unknown error"
+EndProcedure

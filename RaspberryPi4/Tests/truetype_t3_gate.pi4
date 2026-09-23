@@ -1,0 +1,122 @@
+; T3 emitted outline gate: simple glyph, signed XY args and transformed point attachment.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+
+#T3_HEAD=$68656164 : #T3_MAXP=$6D617870 : #T3_HHEA=$68686561
+#T3_HMTX=$686D7478 : #T3_LOCA=$6C6F6361 : #T3_GLYF=$676C7966
+#T3_REAL_META=$0F000000 : #T3_REAL_BASE=$10000000 : #T3_REAL_MAGIC=$54543352
+Global Dim t3Font.a[1024]
+Global Dim t3Tag.i[6]
+Global Dim t3Len.i[6]
+Global Dim t3Off.i[6]
+Global Dim t3Points.a[24576]
+Global Dim t3Contours.i[2048]
+
+Procedure.i tt3RealFont()
+  Protected bytes.i,glyph.i,points.i,contours.i,n.i,at.i,pc.i=0,cc.i=0
+  If PeekL(#T3_REAL_META)<>#T3_REAL_MAGIC : ProcedureReturn 0 : EndIf
+  bytes=PeekL(#T3_REAL_META+4) : glyph=PeekL(#T3_REAL_META+8)
+  points=PeekL(#T3_REAL_META+12) : contours=PeekL(#T3_REAL_META+16)
+  If points>2048 Or contours>1024 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeOpen(#T3_REAL_BASE,bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeOutlinesOpen()=0 : ProcedureReturn 2 : EndIf
+  If AnvilTrueTypeGlyphOutline(glyph,@t3Points[0],2048,@t3Contours[0],1024,@pc,@cc)=0 : ProcedureReturn 3 : EndIf
+  If pc<>points Or cc<>contours : ProcedureReturn 4 : EndIf
+  at=#T3_REAL_META+20
+  For n=0 To points-1
+    If PeekL(@t3Points[n*12])<>PeekL(at) Or PeekL(@t3Points[n*12+4])<>PeekL(at+4) Or (PeekL(@t3Points[n*12+8])&1)<>PeekL(at+8) : ProcedureReturn 5 : EndIf
+    at+12
+  Next
+  For n=0 To contours-1
+    If PeekL(@t3Contours[0]+n*4)<>PeekL(at) : ProcedureReturn 6 : EndIf
+    at+4
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure t3BE16(at.i,v.i)
+  PokeA(@t3Font[at],(v>>8)&$FF) : PokeA(@t3Font[at+1],v&$FF)
+EndProcedure
+Procedure t3BE32(at.i,v.i)
+  PokeA(@t3Font[at],(v>>24)&$FF) : PokeA(@t3Font[at+1],(v>>16)&$FF)
+  PokeA(@t3Font[at+2],(v>>8)&$FF) : PokeA(@t3Font[at+3],v&$FF)
+EndProcedure
+Procedure.i t3Checksum(offset.i,length.i,head.i)
+  Protected sum.i=0,word.i,pos.i,n.i,j.i
+  For n=0 To (length+3)/4-1
+    word=0
+    For j=0 To 3
+      pos=n*4+j : word=word<<8
+      If pos<length And (head=0 Or pos<8 Or pos>=12) : word=word|(PeekA(@t3Font[offset+pos])&$FF) : EndIf
+    Next
+    sum=(sum+word)&$FFFFFFFF
+  Next
+  ProcedureReturn sum
+EndProcedure
+Procedure.i t3Build()
+  Protected cursor.i,n.i,rec.i,check.i,base.i
+  For n=0 To 1023 : PokeA(@t3Font[n],0) : Next
+  t3Tag[0]=#T3_HEAD : t3Len[0]=54 : t3Tag[1]=#T3_MAXP : t3Len[1]=32
+  t3Tag[2]=#T3_HHEA : t3Len[2]=36 : t3Tag[3]=#T3_HMTX : t3Len[3]=24
+  t3Tag[4]=#T3_LOCA : t3Len[4]=14 : t3Tag[5]=#T3_GLYF : t3Len[5]=100
+  t3BE32(0,$00010000) : t3BE16(4,6) : t3BE16(6,96) : t3BE16(8,3)
+  cursor=108
+  For n=0 To 5 : t3Off[n]=cursor : cursor+t3Len[n] : Next
+  t3BE32(t3Off[0],$00010000) : t3BE32(t3Off[0]+12,$5F0F3CF5) : t3BE16(t3Off[0]+18,1000) : t3BE16(t3Off[0]+50,0)
+  t3BE32(t3Off[1],$00010000) : t3BE16(t3Off[1]+4,6)
+  t3BE32(t3Off[2],$00010000) : t3BE16(t3Off[2]+34,6)
+  For n=0 To 5 : t3BE16(t3Off[3]+n*4,500) : Next
+  ; Six short-loca offsets are big-endian half-offsets.
+  t3BE16(t3Off[4],0) : t3BE16(t3Off[4]+2,0) : t3BE16(t3Off[4]+4,15)
+  t3BE16(t3Off[4]+6,23) : t3BE16(t3Off[4]+8,35) : t3BE16(t3Off[4]+10,43) : t3BE16(t3Off[4]+12,50)
+  base=t3Off[5]
+  ; Glyph 1: simple triangle (three on-curve points), 30 bytes incl pad.
+  t3BE16(base,1) : t3BE16(base+2,0) : t3BE16(base+4,0) : t3BE16(base+6,100) : t3BE16(base+8,100)
+  t3BE16(base+10,2) : t3BE16(base+12,0)
+  PokeA(@t3Font[base+14],1) : PokeA(@t3Font[base+15],1) : PokeA(@t3Font[base+16],1)
+  t3BE16(base+17,0) : t3BE16(base+19,100) : t3BE16(base+21,-100)
+  t3BE16(base+23,0) : t3BE16(base+25,0) : t3BE16(base+27,100)
+  ; Glyph 2: byte XY offsets -5,+7 to glyph 1.
+  base=t3Off[5]+30 : t3BE16(base,$FFFF) : t3BE16(base+2,-5) : t3BE16(base+4,7)
+  t3BE16(base+10,2) : t3BE16(base+12,1) : PokeA(@t3Font[base+14],$FB) : PokeA(@t3Font[base+15],7)
+  ; Glyph 3: first component at (10,20), then glyph 1 scaled by 1/2 and
+  ; attached child point 1 to already-emitted parent point 0.
+  base=t3Off[5]+46 : t3BE16(base,$FFFF) : t3BE16(base+10,$22) : t3BE16(base+12,1)
+  PokeA(@t3Font[base+14],10) : PokeA(@t3Font[base+15],20)
+  t3BE16(base+16,8) : t3BE16(base+18,1) : PokeA(@t3Font[base+20],0) : PokeA(@t3Font[base+21],1)
+  t3BE16(base+22,$2000)
+  ; Glyph 4: direct recursive cycle, which must fail boundedly.
+  base=t3Off[5]+70 : t3BE16(base,$FFFF) : t3BE16(base+10,2) : t3BE16(base+12,4)
+  PokeA(@t3Font[base+14],0) : PokeA(@t3Font[base+15],0)
+  ; Glyph 5: mutually conflicting transform flags must be refused.
+  base=t3Off[5]+86 : t3BE16(base,$FFFF) : t3BE16(base+10,$C8) : t3BE16(base+12,1)
+  PokeA(@t3Font[base+14],0) : PokeA(@t3Font[base+15],0) : t3BE16(base+16,$4000) : t3BE16(base+18,$4000)
+  For n=0 To 5
+    rec=12+n*16 : check=t3Checksum(t3Off[n],t3Len[n],Bool(t3Tag[n]=#T3_HEAD))
+    t3BE32(rec,t3Tag[n]) : t3BE32(rec+4,check) : t3BE32(rec+8,t3Off[n]) : t3BE32(rec+12,t3Len[n])
+  Next
+  ProcedureReturn cursor
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i,pc.i=0,cc.i=0,n.i,realResult.i
+  bytes=t3Build()
+  If AnvilTrueTypeOpen(@t3Font[0],bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeOutlinesOpen()=0 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeGlyphOutline(1,@t3Points[0],32,@t3Contours[0],8,@pc,@cc)=0 : ProcedureReturn 2 : EndIf
+  If pc<>3 Or cc<>1 Or PeekL(@t3Contours[0])<>2 : ProcedureReturn 3 : EndIf
+  If PeekL(@t3Points[0])<>0 Or PeekL(@t3Points[4])<>0 Or PeekL(@t3Points[12])<>100 Or PeekL(@t3Points[16])<>0 Or PeekL(@t3Points[24])<>0 Or PeekL(@t3Points[28])<>100 : ProcedureReturn 4 : EndIf
+  If AnvilTrueTypeGlyphOutline(2,@t3Points[0],32,@t3Contours[0],8,@pc,@cc)=0 : ProcedureReturn 5 : EndIf
+  If pc<>3 Or PeekL(@t3Points[0])<>-5 Or PeekL(@t3Points[4])<>7 Or PeekL(@t3Points[12])<>95 : ProcedureReturn 6 : EndIf
+  If AnvilTrueTypeGlyphOutline(3,@t3Points[0],32,@t3Contours[0],8,@pc,@cc)=0 : ProcedureReturn 7 : EndIf
+  If pc<>6 Or cc<>2 Or PeekL(@t3Points[0])<>10 Or PeekL(@t3Points[4])<>20 : ProcedureReturn 8 : EndIf
+  ; Child point 1 (index 4) is attached to parent point 0; transformed
+  ; child points 0 and 2 remain at (-40,20) and (-40,70).
+  If PeekL(@t3Points[36])<>-40 Or PeekL(@t3Points[40])<>20 : ProcedureReturn 91 : EndIf
+  If PeekL(@t3Points[48])<>10 Or PeekL(@t3Points[52])<>20 : ProcedureReturn 92 : EndIf
+  If PeekL(@t3Points[60])<>-40 Or PeekL(@t3Points[64])<>70 : ProcedureReturn 93 : EndIf
+  If AnvilTrueTypeGlyphOutline(4,@t3Points[0],32,@t3Contours[0],8,@pc,@cc)<>0 Or AnvilTrueTypeOutlinesError()<>#ANVIL_TTO_E_FORMAT : ProcedureReturn 10 : EndIf
+  If AnvilTrueTypeGlyphOutline(5,@t3Points[0],32,@t3Contours[0],8,@pc,@cc)<>0 Or AnvilTrueTypeOutlinesError()<>#ANVIL_TTO_E_FORMAT : ProcedureReturn 11 : EndIf
+  If AnvilTrueTypeGlyphOutline(1,@t3Points[0],2,@t3Contours[0],8,@pc,@cc)<>0 Or AnvilTrueTypeOutlinesError()<>#ANVIL_TTO_E_CAPACITY : ProcedureReturn 12 : EndIf
+  realResult=tt3RealFont() : If realResult<>0 : ProcedureReturn 20+realResult : EndIf
+  ProcedureReturn 0
+EndProcedure

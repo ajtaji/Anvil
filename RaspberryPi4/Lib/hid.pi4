@@ -1,0 +1,2410 @@
+; ======================================================================
+; hid.pi4 - USB HID BOOT PROTOCOL keyboard and mouse, POLLED OVER THE
+; CONTROL PIPE, on top of RaspberryPi4/Lib/xhci.pi4.
+; ----------------------------------------------------------------------
+; WHAT THIS IS FOR. An engine with no input device is a picture. This is
+; the smallest thing that turns a Raspberry Pi 4 running bare metal into
+; a machine somebody can type at, and it deliberately adds NO new
+; transfer type to the USB stack: everything here is a control transfer
+; of a shape xhci.pi4 has been performing on silicon since 2026-08-26.
+;
+; THAT DESIGN DECISION HAS NOW BEEN TESTED ON THE BENCH AND IT HOLDS.
+; 2026-08-28, a wireless keyboard-and-mouse receiver on hub port 1 of
+; the VL805's internal hub, both interfaces at full speed behind the
+; hub's transaction translator:
+;
+;     interface 0, keyboard   GET_REPORT returned 8 bytes in 2 ms
+;     interface 1, mouse      GET_REPORT returned 4 bytes in 0 ms
+;
+; with no key pressed and nobody touching the mouse - which is the
+; answer the header below predicts and the reason it predicts it: a
+; boot report is a STATE, so an idle device still has one to hand over.
+; The measurement that this file said had to be taken has been taken;
+; see THE MEASUREMENT below for what it said and what it did not.
+;
+; IT DID NOT WORK THE FIRST TIME, AND THE REASON WAS NOT HERE. Every
+; poll came back "no event of the expected type arrived" after the full
+; control timeout, on both interfaces, and that was very nearly read as
+; proof that the control pipe does not deliver on real hardware. It was
+; a missing Reset Endpoint in xhci.pi4: the mouse interface legally
+; stalls SET_IDLE, a stall HALTS endpoint 0, and a halted endpoint runs
+; nothing at all until it is reset. Endpoint zero belongs to the DEVICE,
+; so one optional request that one interface is allowed to refuse took
+; down every interface on it. See xh_ClearHalt() in xhci.pi4, and see
+; SET_IDLE below.
+;
+; ======================================================================
+;  THE ONE DESIGN DECISION, AND THE SPECIFICATION SENTENCE IT RESTS ON
+; ======================================================================
+;  A USB keyboard's natural channel is an INTERRUPT IN endpoint: the
+;  device is polled by the host controller every few milliseconds and
+;  posts an 8-byte report when something changes. xhci.pi4 has no
+;  interrupt endpoints, and adding them is a real piece of work -
+;  another Configure Endpoint path, another ring, and an interval
+;  encoding.
+;
+;  It is not needed to read a keyboard, and that is not a guess. HID
+;  1.11 Appendix C, "Keyboard Implementation", page 62, lists the design
+;  requirements for a USB keyboard, and the third one is:
+;
+;    "The keyboard must send data reports at the Idle rate or when
+;     receiving a Get_Report request, even when there are no new key
+;     events."
+;
+;  and the request itself is mandatory - HID 1.11 section 7.2, page 51,
+;  marks GET_REPORT ($01) with footnote 1, "This request is mandatory
+;  and must be supported by all devices". So a GET_REPORT on the default
+;  control pipe returns the CURRENT key state of any HID device at all,
+;  and the boot keyboard is required to answer it whether or not
+;  anything has changed. Polling it is architecturally guaranteed to
+;  work.
+;
+;  THE SPECIFICATION ALSO SAYS NOT TO DO THIS, AND IT IS QUOTED HERE
+;  RATHER THAN LEFT OUT. HID 1.11 section 7.2.1, page 51, remarks on
+;  Get_Report:
+;
+;    "This request is useful at initialization time for absolute items
+;     and for determining the state of feature items. This request is
+;     not intended to be used for polling the device state on a regular
+;     basis. The Interrupt In pipe should be used for recurring Input
+;     reports."
+;
+;  That is a real caveat and this file is on the wrong side of it. The
+;  case for doing it anyway:
+;
+;    * it is CORRECT. "Not intended for" is a statement about bus
+;      efficiency, not about the answer being wrong. The report returned
+;      over the control pipe "has the same format as the reports from
+;      Interrupt pipe" - same page, same paragraph.
+;    * it is REACHABLE TODAY. The alternative is a driver that does not
+;      exist yet against a stack that has never scheduled a periodic
+;      endpoint on this silicon.
+;    * the thing it costs is LATENCY, and latency is measurable. See
+;      THE MEASUREMENT below. Nothing here argues that polling is fast
+;      enough; there is an instrument that answers it.
+;    * lost keystrokes are the real risk, not lag, and the boot report
+;      is a STATE not an EVENT - see WHY A STATE PROTOCOL FORGIVES A
+;      SLOW POLL below. That is the property that makes this viable and
+;      it is worth understanding before trusting it.
+;
+;  IF THE MEASUREMENT COMES BACK BAD, the fix is interrupt endpoints in
+;  xhci.pi4 and NOT a cleverer poll in here. Every decoder below takes
+;  an 8-byte report and does not care where it came from, so that change
+;  replaces one procedure - HidPoll - and nothing else.
+;
+;  THE MEASUREMENT CAME BACK GOOD - 2026-08-28, and the numbers are in
+;  THE MEASUREMENT below. The escape hatch above is left standing
+;  because it is still the right escape hatch, not because it is owed.
+;
+; ======================================================================
+;  WHY A STATE PROTOCOL FORGIVES A SLOW POLL
+; ======================================================================
+;  HID 1.11 Appendix C, first requirement: "Non-modifier keys must be
+;  reported in Input (Array, Absolute) items. Reports must contain a
+;  list of keys currently pressed and not make/break codes (relative
+;  data)."
+;
+;  So every report is the WHOLE current state of the keyboard, not a
+;  delta. A poll that arrives late does not lose the keys that are still
+;  down; it only loses a key that went down AND came back up entirely
+;  between two polls. At a 50 ms poll that is a keypress shorter than
+;  50 ms, which is faster than a person can type but is not impossible -
+;  and it is exactly the failure to look for when the measurement comes
+;  back.
+;
+;  A protocol with make/break codes would have no such property, and a
+;  polled driver for one would drop characters constantly. This is the
+;  whole reason a polled boot keyboard is a reasonable thing to build
+;  and a polled PS/2 keyboard would not be.
+;
+; ======================================================================
+;  THE MEASUREMENT THAT DECIDED IT - TAKEN 2026-08-28, ON THE BOARD
+; ======================================================================
+;  WHAT WAS MEASURED. A wireless keyboard-and-mouse receiver, hub port 1
+;  of the VL805's internal hub, full speed behind the hub's TT. Keyboard
+;  on interface 0, endpoint $81, mps 8, bInterval 8; mouse on interface
+;  1, endpoint $82, mps 8, bInterval 2.
+;
+;      GET_REPORT, keyboard interface   8 bytes, 2 ms
+;      GET_REPORT, mouse interface      4 bytes, 0 ms
+;      GET_REPORT, keyboard, again      8 bytes, 3 ms
+;      GET_REPORT, mouse, again         4 bytes, 3 ms
+;
+;  The whole bring-up around them - PcieInit, PcieEnumerate, XhciInit,
+;  the root-port walk, the hub, the settle, addressing the device behind
+;  the hub, and both HidAttach calls - was 445 ms, and the four polls
+;  above took it to 495 ms in total.
+;
+;  AND THEN A SOAK, the same day, with pi4HidKeys.pi4 - both interfaces
+;  polled in rotation for eight seconds of wall clock, which is what
+;  fits inside the watchdog:
+;
+;      total polls                       10642
+;      MEAN                                721 us
+;      WORST SINGLE TRANSFER              1251 us
+;      dropped key events                    0
+;      the keyboard's own bInterval          8 ms
+;      the mouse's own bInterval             2 ms
+;
+;  WHAT THAT SETTLES, and it settles it decisively. THE WORST CASE IS
+;  THE NUMBER THAT MATTERS - a mean of 721 us with an occasional 200 ms
+;  stall would be a keyboard that feels broken, and the mean alone would
+;  call that fine. The worst single transfer over ten thousand of them
+;  was 1.25 ms: FASTER than the 2 ms the mouse's own endpoint descriptor
+;  asks to be polled at, and six times inside the keyboard's 8 ms. The
+;  control pipe is not merely adequate here, it is quicker than the
+;  interrupt endpoint it is standing in for was configured to be.
+;
+;  THE INTERRUPT ENDPOINT IS THEREFORE NOT BEING BUILT. Not deferred for
+;  want of time - measured unnecessary, on this hardware, with the
+;  instrument this file already carried.
+;
+;  WHAT IT STILL DOES NOT SETTLE, and the honesty matters more than the
+;  result:
+;
+;    * NO KEY WAS PRESSED AND THE MOUSE DID NOT MOVE. There is nobody
+;      at the bench. Every one of those 10642 reports is an idle one,
+;      which is the property being tested - a state protocol answers
+;      when nothing has happened - but it is not a test under load, and
+;      a device that has real data to send may answer differently.
+;    * ONE DEVICE, ONE RECEIVER, EIGHT SECONDS. A different keyboard
+;      may answer GET_REPORT more slowly, and HID 1.11 section 7.2.1 is
+;      explicit that the interrupt pipe is what the request is not
+;      meant to replace. This measurement says the control pipe is
+;      adequate HERE; it does not say the caveat above is wrong.
+;    * NOTHING ELSE WAS ON THE BUS. Ten thousand control transfers a
+;      second is bus time somebody else may want, and the cost of that
+;      is exactly the bus-efficiency argument section 7.2.1 makes. The
+;      moment a mass-storage device is streaming at the same time, this
+;      number needs taking again.
+;
+;  THE INSTRUMENT. HidPollTicks() and HidPollCount() are what produced
+;  the numbers above, and they stay for the next device and the next
+;  bus. Every HidPoll() adds the elapsed CNTPCT_EL0 ticks of the control
+;  transfer to a running total, so
+;
+;      HidPollTicks() / HidPollCount() / (CNTFRQ / 1000)
+;
+;  is the mean milliseconds per poll, on the real bus, with the real
+;  hub in the path. RaspberryPi4/Examples/Diagnostics/pi4HidKeys.pi4
+;  prints it. The number that matters is not the mean but the WORST
+;  case, so HidPollWorst() keeps the largest single transfer as well -
+;  a mean of 2 ms with an occasional 200 ms stall is a keyboard that
+;  feels broken, and the mean alone would call that fine.
+;
+;  WHAT NUMBER IS "INADEQUATE" IS NOT DECIDED HERE, because it depends
+;  on what the engine does with the input, and inventing a threshold
+;  from a desk is the thing this project refuses. What can be said from
+;  the specification: a boot keyboard's interrupt endpoint typically
+;  asks for a 10 ms interval (bInterval, and HidInterval() reports the
+;  real one off the endpoint descriptor), so a poll loop slower than
+;  that is strictly worse than the hardware was designed for.
+;
+;  THAT IS THE COMPARISON pi4HidKeys.pi4 PRINTS - worst case beside
+;  bInterval, on the same line - and on 2026-08-28 it read
+;  "WORST 1251 us vs bInterval 8 ms". The device asked to be polled
+;  eight times less often than it was actually reached.
+;
+; ======================================================================
+;  BOOT PROTOCOL IS NOT THE DEFAULT. SET_PROTOCOL IS MANDATORY.
+; ======================================================================
+;  This was an open question in the vault - "whether a keyboard defaults
+;  to boot protocol without SET_PROTOCOL" - and it is settled, in the
+;  specification, in one sentence. HID 1.11 section 7.2.6, page 54:
+;
+;    "When initialized, all devices default to report protocol. However
+;     the host should not make any assumptions about the device's state
+;     and should set the desired protocol whenever initializing a
+;     device."
+;
+;  REPORT protocol, not boot protocol. So a driver that skips
+;  SET_PROTOCOL gets whatever the device's own report descriptor says,
+;  which for a plain keyboard is very often byte-identical to the boot
+;  report and therefore APPEARS TO WORK - and for a keyboard with media
+;  keys, a fingerprint reader, or any vendor extension, is a report with
+;  a Report ID byte in front of it, or a different length, or both. That
+;  is a bug that passes on the keyboard on the bench and fails on the
+;  one the user owns.
+;
+;  HidAttach() therefore always issues SET_PROTOCOL(0). It is a
+;  zero-length control transfer and it cannot be skipped as an
+;  optimisation.
+;
+;  SET_IDLE(0) is issued too, and for a different reason. HID 1.11
+;  section 7.2.4: Set_Idle "silences a particular report on the
+;  Interrupt In pipe until a new event occurs or the specified amount of
+;  time passes". Duration 0 means "only on change", which is what the
+;  interrupt pipe wants and which this file does not use at all - but
+;  leaving a device at its power-on idle rate means it is spending bus
+;  time posting reports to an interrupt endpoint nobody is reading.
+;  Devices that do not implement Set_Idle STALL it, so the failure is
+;  IGNORED rather than fatal: Appendix G marks it optional for
+;  non-keyboards, and a mouse that stalls it is a working mouse.
+;
+;  ======================================================================
+;   IGNORING THAT STALL WAS ONCE THE MOST EXPENSIVE LINE IN THIS FILE,
+;   AND THE REASON IS WORTH KNOWING BEFORE ANYONE ADDS ANOTHER REQUEST
+;   THAT IS "ALLOWED TO FAIL".
+;  ======================================================================
+;  A stall does not only fail its own transfer. xHCI 1.1 section 4.8.3
+;  puts the endpoint into the HALTED state, and the controller then
+;  accepts that endpoint's doorbell and runs NOTHING - no event is ever
+;  posted, so the next transfer does not fail, it TIMES OUT. And
+;  endpoint zero belongs to the DEVICE, not to an interface.
+;
+;  Measured here on 2026-08-28, before xhci.pi4 learned to clear it: the
+;  receiver's mouse interface stalled SET_IDLE during its HidAttach, and
+;  from that instant the keyboard interface - which had answered
+;  GET_REPORT in 2 ms one transfer earlier - timed out too. Three
+;  five-second timeouts, which is the whole of a BCM2711 watchdog budget
+;  (safety.pi4:434, about 15.999 s), so the board rebooted with nothing
+;  printed and it looked like enumeration was too slow. Enumeration was
+;  445 ms.
+;
+;  THE FIX IS IN xhci.pi4, NOT HERE, and that is the right place for it:
+;  xh_ClearHalt() issues the Reset Endpoint and Set TR Dequeue Pointer
+;  that rpi-6.12.y_xhci_ring.c:2345-2360 says a stall owes, so a stall
+;  is once again just a device saying no. This file ignores the refusal
+;  exactly as it always did.
+;
+;  WHAT TO CARRY AWAY: "the failure is IGNORED rather than fatal" is a
+;  statement about THIS DRIVER's reaction, and it is only safe because
+;  the layer underneath puts the pipe back. A survivable error is not
+;  survivable on its own say-so.
+;
+; ======================================================================
+;  LAYOUTS OTHER THAN US - what this file does, said plainly
+; ======================================================================
+;  THE TABLES BELOW ARE US ENGLISH ONLY. Nothing here reads a layout
+;  from anywhere, and there is no way to select another one at run time.
+;  A UK keyboard on this machine will type a US layout: its " gives @,
+;  its @ gives ", its # key gives \ or nothing useful, and the pound
+;  sign is unreachable.
+;
+;  THIS IS NOT A LIMITATION OF THE DRIVER, IT IS THE STRUCTURE OF USB
+;  HID, and it is worth being precise about because the obvious fix is
+;  the wrong one. The HID Usage Tables 1.21 section 10, page 82, says:
+;
+;    "Due to the variation of keyboards from language to language, it is
+;     not feasible to specify exact key mappings for every language.
+;     Where this list is not specific for a key function in a language,
+;     the closest equivalent key position should be used, so that a
+;     keyboard may be modified for a different language by simply
+;     printing different keycaps. One example is the Y key on a North
+;     American keyboard. In Germany this is typically Z. Rather than
+;     changing the keyboard firmware to put the Z Usage into that place
+;     in the descriptor list, the vendor should use the Y Usage on both
+;     the North American and German keyboards."
+;
+;  So a German keyboard sends usage $1C - "Keyboard y and Y" - when the
+;  Z key is pressed. THE DEVICE DOES NOT KNOW WHAT LAYOUT IT IS. The
+;  usage codes name PHYSICAL KEY POSITIONS on a US keyboard, and the
+;  layout lives entirely in the host. There is nothing to interrogate:
+;  no descriptor field, no string, no request. bCountryCode in the HID
+;  descriptor exists and is a red herring - it describes the physical
+;  keycap standard the hardware was built to, most keyboards report 0
+;  ("not supported"), and it does not tell you what is printed on the
+;  keys.
+;
+;  WHAT WOULD BE HONEST, and is the shape of the job if it is ever
+;  wanted: one table per layout, selected by the OWNER of the machine
+;  through a setting, exactly as every operating system does it. The
+;  seam is already here and is one procedure wide - HidKeyChar() is a
+;  PURE FUNCTION of (usage, modifiers, locks) and reads nothing but the
+;  two tables. A second layout is a second pair of Data.b rows and a
+;  selector; it is not a change to anything else in this file.
+;
+;  WHAT WOULD BE DISHONEST is guessing. A driver that inspects
+;  bCountryCode and switches layout on it will get it wrong for the
+;  overwhelming majority of keyboards, which report 0, and the failure -
+;  a few punctuation keys in the wrong place - is subtle enough to
+;  survive testing.
+;
+;  HidKeyUsage() gives the raw usage code for every event, so a program
+;  that wants its own layout can ignore HidKeyChar() entirely and never
+;  touch this file.
+;
+; ======================================================================
+;  WHAT IS ON THE OTHER SIDE OF THE WIRE - the report formats
+; ======================================================================
+;  KEYBOARD, HID 1.11 Appendix B.1, page 60. Eight bytes:
+;
+;      0  modifier keys, one bit each
+;      1  reserved, "for OEM use"; the BIOS "should ignore this field"
+;      2  keycode 1        the usages of the keys CURRENTLY DOWN,
+;      3  keycode 2        in NO PARTICULAR ORDER
+;      4  keycode 3
+;      5  keycode 4
+;      6  keycode 5
+;      7  keycode 6
+;
+;  and Appendix B says a device "may append additional data to these
+;  boot reports, but the first 8 bytes of keyboard reports ... must
+;  conform". So reading exactly eight and ignoring the rest is correct
+;  by construction, not by luck.
+;
+;  The modifier bits are usages $E0..$E7 collapsed into a byte - HUT
+;  1.21 page 88 and HID 1.11 Appendix B.1's "Usage Minimum (224), Usage
+;  Maximum (231)":
+;
+;      bit 0  Left Control     bit 4  Right Control
+;      bit 1  Left Shift       bit 5  Right Shift
+;      bit 2  Left Alt         bit 6  Right Alt
+;      bit 3  Left GUI         bit 7  Right GUI
+;
+;  THREE THINGS ABOUT THE KEYCODE ARRAY THAT A NAIVE DECODER GETS WRONG,
+;  all of them stated in HID 1.11 Appendix C, page 62:
+;
+;   1. "The order of keycodes in array fields has no significance. Order
+;      determination is done by the host software comparing the contents
+;      of the previous report to the current report." So a decoder that
+;      watches slot 2 for "the key" is wrong; the whole array has to be
+;      diffed against the whole previous array. hid_KeyWasDown() does
+;      that and there is no other way to do it.
+;
+;   2. THE PHANTOM STATE. "The keyboard must report a phantom state
+;      indexing Usage(ErrorRollOver) in all array fields whenever the
+;      number of keys pressed exceeds the Report Count." ErrorRollOver
+;      is usage $01. A report of six $01s means "too many keys are down
+;      to tell you which" - it does NOT mean six copies of a key, and it
+;      absolutely does not mean the previous keys were released. A
+;      decoder that diffs it normally emits six key-up events for keys
+;      that are still held. hid_IsPhantom() detects it and the report is
+;      DISCARDED, leaving the previous state standing, which is the only
+;      answer that is not a lie.
+;
+;   3. Modifiers survive the phantom state - the worked example on page
+;      63 shows "01000000 01 01 01" with the modifier byte intact - so
+;      discarding the report loses a modifier change. That is accepted
+;      and is the lesser error: a missed modifier corrects itself on the
+;      next report, an invented key-up does not.
+;
+;  MOUSE, HID 1.11 Appendix B.2, page 61. THREE bytes, not four:
+;
+;      0  bit 0 button 1, bit 1 button 2, bit 2 button 3,
+;         bits 4..7 "device specific"
+;      1  X displacement, SIGNED, logical range -127..127
+;      2  Y displacement, SIGNED
+;      3..n "device specific (optional)"
+;
+;  THERE IS NO WHEEL IN THE BOOT MOUSE PROTOCOL. The task that
+;  commissioned this file asked for "buttons, dx, dy, and wheel if
+;  present", and the honest answer is that the boot report descriptor in
+;  Appendix B.2 defines exactly three bytes and none of them is a wheel.
+;  Byte 3 is where a wheel lands on the overwhelming majority of real
+;  mice - it is what every PC BIOS reads - but it is "device specific"
+;  and NOT guaranteed by anything. This file therefore:
+;
+;    * always decodes bytes 0..2, which are architectural;
+;    * reads byte 3 as a signed wheel delta ONLY IF the device returned
+;      at least four bytes, and reports through HidMouseHasWheel()
+;      whether it did;
+;    * never invents a zero. A mouse that returns three bytes has
+;      HidMouseHasWheel() = 0 and HidMouseWheel() = 0, and those are two
+;      different statements from the caller's point of view.
+;
+;  Y IS POSITIVE DOWNWARDS. That is not in Appendix B - it is the
+;  Generic Desktop convention that every mouse follows and every
+;  windowing system assumes. It is called out because a renderer whose
+;  screen Y also grows downwards needs no sign flip, and half of the
+;  people who write this code expect to need one.
+;
+; ======================================================================
+;  THIS FILE NAMES NO OTHER FILE - house rule: a library never includes
+;  a library. It CALLS INTO xhci.pi4 and will not link without it. The
+;  MAIN program lists what it needs and the ORDER MATTERS:
+;
+;      XIncludeFile "RaspberryPi4/Lib/uart.pi4"   ; only to PRINT
+;      XIncludeFile "RaspberryPi4/Lib/timer.pi4"  ; pcie.pi4 needs delay
+;      XIncludeFile "RaspberryPi4/Lib/pcie.pi4"   ; before xhci.pi4
+;      XIncludeFile "RaspberryPi4/Lib/xhci.pi4"   ; before this file
+;      XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+;
+;  Put this file first and every Xhci* call in it is an undefined
+;  reference, which names the gap at build time - which is the point of
+;  the rule.
+;
+;  AND THE MAIN PROGRAM MUST CALL PcieInit() AND PcieEnumerate() BEFORE
+;  XhciInit(), in that order. Including pcie.pi4 is not the same as
+;  running it, and this is not a formality that a program can skip on a
+;  board where the firmware already trained the link:
+;
+;      If PcieInit() = 0      : ProcedureReturn 1 : EndIf
+;      If PcieEnumerate() = 0 : ProcedureReturn 1 : EndIf
+;      If XhciInit() = 0      : ProcedureReturn 1 : EndIf
+;
+;  PcieInit's adopt path is what ZEROES the inbound RC_BAR2 offset that
+;  U-Boot leaves at $4_0000_0000. Every DMA address this stack hands the
+;  controller is a plain system address, so while that offset stands the
+;  controller cannot reach our memory - pcie.pi4's own comment records
+;  it arriving as USBSTS $15, Host System Error, and costing a night.
+;
+;  WHY LEAVING THEM OUT DOES NOT RELIABLY FAIL, WHICH IS WORSE THAN
+;  FAILING. The registers are HARDWARE and the monitor does not reset
+;  them between programs, so a payload that skips PcieInit runs on
+;  whatever the LAST payload left behind. On a bench where something
+;  else ran first it works perfectly; on a cold board it does not, and
+;  the difference is invisible from inside the program. A probe written
+;  on 2026-08-28 left both calls out, ran green on a warm board, and its
+;  result was very nearly published as evidence about this file's
+;  design. See pi4HidOneShot.pi4, which now makes both calls.
+;
+;  THE CALLER BRINGS THE DEVICE. This file does not enumerate. Something
+;  has to reset a port, Enable Slot, Address Device and SET_CONFIGURATION
+;  before HidAttach() is called, and on this board that something has to
+;  walk the VL805's internal hub to find a keyboard at all - see THE
+;  TOPOLOGY in xhci.pi4's header. HidFindAndAttachAll() does the whole
+;  sequence and is the one to call unless a program has a reason not to.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  CONSTANTS
+; ----------------------------------------------------------------------
+
+; Interface class/subclass/protocol. USB Device Class Definition for HID
+; 1.11: section 4.1 fixes bInterfaceClass to 3, section 4.2 (page 8)
+; gives the subclass codes - 0 none, 1 "Boot Interface Subclass" - and
+; section 4.3 the protocol codes. Also staged as USB_CLASS_HID in
+; RaspberryPi4/Reference/v2025.01_usb_defs.h.
+#HID_CLASS            = 3
+#HID_SUBCLASS_BOOT    = 1
+#HID_PROTO_NONE       = 0
+#HID_PROTO_KEYBOARD   = 1
+#HID_PROTO_MOUSE      = 2
+
+; Class-specific requests. HID 1.11 section 7.2, page 51, and
+; usb_defs.h:173-178.
+#HID_REQ_GET_REPORT   = $01
+#HID_REQ_GET_IDLE     = $02
+#HID_REQ_GET_PROTOCOL = $03
+#HID_REQ_SET_REPORT   = $09
+#HID_REQ_SET_IDLE     = $0A
+#HID_REQ_SET_PROTOCOL = $0B
+
+; Request types. HID 1.11 section 7.2, page 50: "Valid values are
+; 10100001 or 00100001 only" - class, recipient INTERFACE, and the top
+; bit is the direction. $A1 and $21.
+#HID_RT_IN  = $A1
+#HID_RT_OUT = $21
+
+; Report types, HID 1.11 section 7.2.1, page 51: 01 Input, 02 Output,
+; 03 Feature. They ride in the HIGH byte of wValue, with the Report ID
+; in the low byte - and the low byte is 0 here because a BOOT report
+; has no Report ID. HID 1.11 Appendix B's boot descriptors contain no
+; Report ID item at all, which is precisely what makes an 8-byte report
+; an 8-byte report and not a 9-byte one.
+#HID_REPORT_INPUT   = 1
+#HID_REPORT_OUTPUT  = 2
+#HID_REPORT_FEATURE = 3
+
+; Protocol selector for SET_PROTOCOL. HID 1.11 section 7.2.6, page 54:
+; "wValue 0 = Boot Protocol, 1 = Report Protocol".
+#HID_PROTOCOL_BOOT   = 0
+#HID_PROTOCOL_REPORT = 1
+
+; Standard requests this file issues directly. usb_defs.h:160-168.
+#HID_REQ_GET_DESCRIPTOR   = $06
+#HID_REQ_SET_CONFIGURATION = $09
+#HID_DT_DEVICE    = $01
+#HID_DT_CONFIG    = $02
+#HID_DT_INTERFACE = $04
+#HID_DT_ENDPOINT  = $05
+
+; Endpoint descriptor fields. usb_defs.h:132-135. bmAttributes low two
+; bits are the transfer type; 3 is interrupt.
+#HID_EP_DIR_IN     = $80
+#HID_EP_XFER_MASK  = $03
+#HID_EP_XFER_INTR  = 3
+
+; Report sizes. HID 1.11 Appendix B: the keyboard boot report is eight
+; bytes and "may not exceed 8 bytes in length"; the mouse boot report is
+; three, with an optional device-specific tail.
+#HID_KBD_REPORT_BYTES = 8
+#HID_MOUSE_MIN_BYTES  = 3
+; What is ASKED FOR on a mouse GET_REPORT. Four, not three: byte 3 is
+; where a wheel lands on a real mouse and asking for it costs nothing -
+; a device with only three bytes answers three with a Short Packet
+; completion, which xhci.pi4 reports as a success with a residual. A
+; driver that asks for exactly three can never discover a wheel.
+#HID_MOUSE_ASK_BYTES  = 4
+
+; How many times the FIRST configuration-descriptor request is allowed
+; to come back short before the device is given up on, and how long to
+; wait between attempts. Three and one millisecond: the count follows
+; Linux's GET_MAXPACKET0_TRIES (rpi-6.12.y_usb_core_hub.c), the delay
+; follows U-Boot's mdelay(1) in usb_setup_descriptor()
+; (v2025.01_uboot_usb.c:1028), which is one USB 1.x microframe and so is
+; long enough at every speed.
+#HID_DESC_TRIES       = 3
+#HID_DESC_RETRY_MS    = 1
+; The largest report this file will hold. Eight covers the keyboard
+; exactly and leaves the mouse four spare bytes.
+#HID_REPORT_MAX = 8
+
+; Modifier bits, byte 0 of the keyboard report. HID 1.11 Appendix B.1
+; ("Usage Minimum (224), Usage Maximum (231)") and HUT 1.21 page 88,
+; usages $E0 Left Control through $E7 Right GUI.
+#HID_MOD_LCTRL  = $01
+#HID_MOD_LSHIFT = $02
+#HID_MOD_LALT   = $04
+#HID_MOD_LGUI   = $08
+#HID_MOD_RCTRL  = $10
+#HID_MOD_RSHIFT = $20
+#HID_MOD_RALT   = $40
+#HID_MOD_RGUI   = $80
+; The two either-side masks, written out so no call site has to OR them
+; and get one of the pair wrong.
+#HID_MOD_SHIFT  = $22   ; LSHIFT | RSHIFT
+#HID_MOD_CTRL   = $11   ; LCTRL  | RCTRL
+#HID_MOD_ALT    = $44   ; LALT   | RALT
+#HID_MOD_GUI    = $88   ; LGUI   | RGUI
+
+; Usages this file acts on rather than merely translating. HUT 1.21
+; section 10, pages 82-86.
+#HID_USAGE_NONE        = $00   ; "Reserved (no event indicated)"
+#HID_USAGE_ROLLOVER    = $01   ; "Keyboard ErrorRollOver" - the phantom
+#HID_USAGE_POSTFAIL    = $02
+#HID_USAGE_UNDEFINED   = $03
+#HID_USAGE_CAPSLOCK    = $39
+#HID_USAGE_NUMLOCK     = $53
+#HID_USAGE_SCROLLLOCK  = $47
+; The highest usage the character tables cover. $67 is "Keypad =", the
+; last entry with a printable meaning; everything above it is F13 and up
+; and has no character.
+#HID_USAGE_MAX_CHAR    = $67
+
+; LED bits for SET_REPORT(Output). HID 1.11 Appendix B.1, page 60, "the
+; keyboard output report (1 byte)": bit 0 NUM LOCK, 1 CAPS LOCK,
+; 2 SCROLL LOCK, 3 COMPOSE, 4 KANA, 5..7 constant.
+#HID_LED_NUMLOCK    = $01
+#HID_LED_CAPSLOCK   = $02
+#HID_LED_SCROLLLOCK = $04
+#HID_LED_COMPOSE    = $08
+#HID_LED_KANA       = $10
+
+; How many HID devices this file tracks. Two is a keyboard and a mouse,
+; which is the case that exists; four leaves room for a second of either
+; without any of the arrays below needing to move. It is bounded by
+; xhci.pi4's #XHCI_MAX_DEVS in practice, since every one of these needs
+; a device slot.
+#HID_MAX_DEVS = 4
+
+; How many key events one HidKeyboardPoll() may produce. Six keys can be
+; released and six pressed between two reports - the array is six long -
+; so twelve is the true bound and sixteen is that with slack. Overflow
+; is REFUSED and counted (HidKeyOverflows), not wrapped: a dropped key
+; event that nobody counts is a keyboard that "sometimes misses keys".
+#HID_EVENTS_MAX = 16
+
+; Errors. Negative, in the shape usbmsc.pi4 uses, so that a procedure
+; returning a count can return a code in the same register.
+#HID_ERR_NONE       =  0
+#HID_ERR_NOT_READY  = -1   ; HidAttach was never called, or the handle
+                           ; is not one it returned
+#HID_ERR_NO_HID     = -2   ; the configuration descriptor has no boot
+                           ; HID interface in it
+#HID_ERR_DESC       = -3   ; a descriptor was short, malformed, or
+                           ; disagreed with its own length byte
+#HID_ERR_CONFIG     = -4   ; SET_CONFIGURATION failed
+#HID_ERR_PROTOCOL   = -5   ; SET_PROTOCOL(boot) failed - this one is
+                           ; fatal, unlike SET_IDLE
+#HID_ERR_REPORT     = -6   ; GET_REPORT returned fewer bytes than the
+                           ; protocol defines
+#HID_ERR_FULL       = -7   ; more HID devices than #HID_MAX_DEVS
+#HID_ERR_ARG        = -8   ; a caller mistake - bad handle, null buffer
+#HID_ERR_SLOT       = -9   ; XhciUseSlot refused the recorded slot
+#HID_ERR_LEDS       = -10  ; SET_REPORT(Output) failed
+
+; ----------------------------------------------------------------------
+;  STATE
+;
+;  Per device, in parallel arrays indexed 1..#HID_MAX_DEVS. Parallel
+;  arrays rather than a structure because every other library in this
+;  tree does it that way and because the backend's structure support is
+;  not something this file should be the first to lean on. The literal
+;  5 is #HID_MAX_DEVS + 1 written out; a Dim bound takes a bare literal.
+;  KEEP IT IN STEP with #HID_MAX_DEVS.
+; ----------------------------------------------------------------------
+Global hid_err.i   = #HID_ERR_NONE
+Global hid_count.i = 0            ; how many handles are live
+; Slots the enumeration walk ADDRESSED but that were not HID - the
+; boot stick is the one that matters. hid.pi4 does not know what a
+; mass-storage device is and does not try to; it records the slot so a
+; storage-aware caller (see HidOtherCount/HidOtherSlot) can offer it to
+; MscSetupCurrent WITHOUT a second controller bring-up. This is the
+; hinge the mouse, the keyboard and the stick all turn on.
+Global hid_otherCount.i = 0
+Global Dim hid_otherSlot.i[16]
+
+; ======================================================================
+;  THE WALK WITNESS - one row per port the enumeration walk stopped at,
+;  and WHY it stopped there.
+;
+;  WHY THIS EXISTS. HidFindAndAttachAll is deliberately written so that
+;  no failure along the walk is fatal, and that is correct: the device
+;  that fails to enumerate is very often not the one being looked for,
+;  and a walk that gives up at the first refusal finds nothing on a bus
+;  with one sick device on it. The COST of that design was that every
+;  refusal was discarded - port reset, Enable Slot, Address Device and
+;  the descriptor read each returned 0 into an `If` with no `Else` - so a
+;  board that addressed NOTHING printed exactly what a board with nothing
+;  plugged in printed.
+;
+;  Two root ports reporting CONNECT with zero devices addressed left no
+;  way to tell from the console whether the port reset failed, the
+;  controller refused a slot, Address Device came back with a completion
+;  code, or the device answered a short descriptor. Four different
+;  faults, one sentence.
+;
+;  So the walk still does not stop, and it now REMEMBERS. Each row keeps
+;  the PORTSC word as it was read, how far the port got, the driver's
+;  own error code and the last completion code the controller posted.
+;  `usb tree` prints them.
+;
+;  This is a diagnostic, not a policy: nothing here changes what the walk
+;  does or what it returns.
+; ======================================================================
+#HID_WALK_MAX = 24
+
+; How far a port got. The numbers are ordered, so "the highest step any
+; port reached" is a useful one-line summary on its own.
+#HID_STEP_CONNECT  = 0   ; connected, and the reset was not attempted
+#HID_STEP_RESET    = 1   ; XhciPortReset refused
+#HID_STEP_SLOT     = 2   ; Enable Slot returned no slot
+#HID_STEP_ADDRESS  = 3   ; Address Device refused
+#HID_STEP_DESC     = 4   ; the 8-byte device descriptor came back short
+#HID_STEP_SETCONF  = 5   ; Set Configuration refused (hubs only)
+#HID_STEP_HUBATTACH = 6  ; the hub answered but would not attach
+#HID_STEP_OK       = 7   ; addressed, and offered to HidAttach
+
+Global hid_walkN.i = 0
+Global Dim hid_walkPort.i[#HID_WALK_MAX]    ; root port number, or the
+                                            ; hub port number if _hub is 1
+Global Dim hid_walkHub.i[#HID_WALK_MAX]     ; 1 if this row is a port on
+                                            ; the VL805's internal hub
+Global Dim hid_walkPortsc.i[#HID_WALK_MAX]  ; PORTSC as the walk read it,
+                                            ; -1 for a hub port (a hub
+                                            ; port has no PORTSC; its
+                                            ; status came from a class
+                                            ; request)
+Global Dim hid_walkStep.i[#HID_WALK_MAX]    ; one of #HID_STEP_*
+Global Dim hid_walkErr.i[#HID_WALK_MAX]     ; XhciLastError() at the stop
+Global Dim hid_walkComp.i[#HID_WALK_MAX]    ; XhciLastComp() at the stop
+Global Dim hid_walkSlot.i[#HID_WALK_MAX]    ; the slot, or 0
+Global Dim hid_walkSpeed.i[#HID_WALK_MAX]   ; XhciPortSpeed, or -1
+
+; The controller's own status, sampled ONCE at the end of the walk. A
+; walk in which every port failed at Address Device and a walk in which
+; the controller had stopped answering look the same port by port;
+; USBSTS tells them apart, and it is the first thing to read when every
+; row says the same thing.
+Global hid_walkSts.i = 0    ; USBSTS after the walk
+Global hid_walkCmd.i = 0    ; USBCMD after the walk
+
+Global Dim hid_slot.i[5]          ; the xHCI device slot
+Global Dim hid_iface.i[5]         ; bInterfaceNumber - wIndex of every
+                                  ; class request below
+Global Dim hid_proto.i[5]         ; #HID_PROTO_KEYBOARD or _MOUSE
+Global Dim hid_epAddr.i[5]        ; the interrupt IN endpoint, RECORDED
+                                  ; AND NOT USED - see below
+Global Dim hid_epMps.i[5]
+Global Dim hid_epIntv.i[5]        ; bInterval, in frames
+Global Dim hid_cfgValue.i[5]      ; bConfigurationValue that was set
+Global Dim hid_idle.i[5]          ; 1 if SET_IDLE was accepted
+
+; The report buffers. One current and one previous per device, eight
+; bytes each, flattened into one array because a two-dimensional Dim is
+; not something this file should be the first to rely on either.
+; Offset for device h is (h * #HID_REPORT_MAX).
+Global Dim hid_cur.a[40]          ; (4 + 1) * 8
+Global Dim hid_prev.a[40]
+Global Dim hid_curLen.i[5]        ; bytes GET_REPORT actually returned
+Global Dim hid_haveprev.i[5]      ; 0 until the first successful poll
+
+; Keyboard-wide state. The lock keys are HOST state, not device state -
+; HID 1.11 Appendix C: "Synchronization between LED states and CAPS
+; LOCK, NUM LOCK, SCROLL LOCK, COMPOSE, and KANA events is maintained by
+; the host and NOT the keyboard." The keyboard reports the KEY going
+; down; whether that means the lock is now on is this file's business.
+Global hid_capsLock.i   = 0
+Global hid_numLock.i    = 0
+Global hid_scrollLock.i = 0
+Global hid_leds.i       = 0       ; what was last sent to the device
+Global Dim hid_ledBuf.a[8]        ; the one byte SET_REPORT sends. See
+                                  ; HidSetLeds for why it is a global.
+
+; The event list produced by the last HidKeyboardPoll().
+Global Dim hid_evUsage.i[16]
+Global Dim hid_evDown.i[16]
+Global Dim hid_evChar.i[16]
+Global Dim hid_evMods.i[16]
+Global hid_evCount.i     = 0
+Global hid_evOverflow.i  = 0      ; events that did not fit, ever
+
+; Mouse accumulation. Deltas are RELATIVE and each report's are new, so
+; a caller that polls faster than it reads would lose motion; these
+; accumulate until read.
+Global hid_mouseBtn.i    = 0
+Global hid_mouseDx.i     = 0
+Global hid_mouseDy.i     = 0
+Global hid_mouseWheel.i  = 0
+Global hid_mouseHasWheel.i = 0
+
+; The measurement. Ticks are CNTPCT_EL0, whose frequency is CNTFRQ_EL0 -
+; 54 MHz on this part, but read rather than assumed, because a hard-coded
+; timebase is how a latency number becomes a work of fiction.
+Global hid_pollCount.i = 0
+Global hid_pollTicks.i = 0
+Global hid_pollWorst.i = 0
+
+; ----------------------------------------------------------------------
+;  THE CLOCK. Two lines of assembly and no dependency on any other file,
+;  exactly as xhci.pi4 and emmc.pi4 do it and for the same reason:
+;  CNTPCT_EL0 and CNTFRQ_EL0 are readable with no trap and no setup at
+;  the exception level a loader leaves us in. Duplicating four
+;  instructions is the price of house rule 10, and it is a fair one -
+;  the alternative is this file including timer.pi4.
+; ----------------------------------------------------------------------
+Procedure.i hid_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i hid_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; Spin for approximately ms milliseconds, on the same counter
+; hid_Ticks() reads. A dead or unreadable counter returns without
+; waiting rather than hanging - the callers use this for a settling
+; delay, never as a substitute for polling a status bit, so proceeding
+; early is recoverable and spinning forever is not.
+Procedure hid_DelayMs(ms.i)
+  Define hz.i
+  Define target.i
+  hz = hid_TickHz()
+  If hz <= 0
+    ProcedureReturn
+  EndIf
+  target = hid_Ticks() + ((hz / 1000) * ms)
+  While hid_Ticks() < target
+  Wend
+EndProcedure
+
+Procedure.i hid_Fail(code.i)
+  hid_err = code
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HidLastError() : ProcedureReturn hid_err : EndProcedure
+Procedure.i HidCount()     : ProcedureReturn hid_count : EndProcedure
+Procedure.i HidOtherCount() : ProcedureReturn hid_otherCount : EndProcedure
+Procedure.i HidOtherSlot(i.i)
+  If i < 0 Or i >= hid_otherCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_otherSlot[i]
+EndProcedure
+; Record a non-HID slot, if there is room. Deduplicated so a device
+; offered twice does not fill the table.
+Procedure hid_NoteOther(slot.i)
+  Define i.i
+  If slot = 0
+    ProcedureReturn
+  EndIf
+  For i = 0 To hid_otherCount - 1
+    If hid_otherSlot[i] = slot
+      ProcedureReturn
+    EndIf
+  Next
+  If hid_otherCount < 16
+    hid_otherSlot[hid_otherCount] = slot
+    hid_otherCount = hid_otherCount + 1
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  hid_WalkNote - record one port's outcome. Called at EVERY stop in the
+;  walk, including the successful one, so that "port 3 reached OK" and
+;  "port 3 is not in the table at all" are different statements - the
+;  second one means the port never reported a connection.
+;
+;  The error and completion codes are read HERE, at the stop, and not
+;  later: XhciLastError() and XhciLastComp() are overwritten by the next
+;  port's attempt, so a report assembled at the end of the walk would
+;  attribute the last port's failure to all of them.
+; ----------------------------------------------------------------------
+Procedure hid_WalkNote(port.i, isHub.i, portsc.i, step.i, slot.i, speed.i)
+  If hid_walkN >= #HID_WALK_MAX
+    ProcedureReturn
+  EndIf
+  hid_walkPort[hid_walkN]   = port
+  hid_walkHub[hid_walkN]    = isHub
+  hid_walkPortsc[hid_walkN] = portsc
+  hid_walkStep[hid_walkN]   = step
+  hid_walkErr[hid_walkN]    = XhciLastError()
+  hid_walkComp[hid_walkN]   = XhciLastComp()
+  hid_walkSlot[hid_walkN]   = slot
+  hid_walkSpeed[hid_walkN]  = speed
+  hid_walkN = hid_walkN + 1
+EndProcedure
+
+; ---- the walk witness, read back -------------------------------------
+Procedure.i HidWalkCount()        : ProcedureReturn hid_walkN : EndProcedure
+Procedure.i HidWalkPort(i.i)      : If i < 0 Or i >= hid_walkN : ProcedureReturn -1 : EndIf : ProcedureReturn hid_walkPort[i]   : EndProcedure
+Procedure.i HidWalkIsHub(i.i)     : If i < 0 Or i >= hid_walkN : ProcedureReturn 0  : EndIf : ProcedureReturn hid_walkHub[i]    : EndProcedure
+Procedure.i HidWalkPortsc(i.i)    : If i < 0 Or i >= hid_walkN : ProcedureReturn -1 : EndIf : ProcedureReturn hid_walkPortsc[i] : EndProcedure
+Procedure.i HidWalkStep(i.i)      : If i < 0 Or i >= hid_walkN : ProcedureReturn -1 : EndIf : ProcedureReturn hid_walkStep[i]   : EndProcedure
+Procedure.i HidWalkErr(i.i)       : If i < 0 Or i >= hid_walkN : ProcedureReturn 0  : EndIf : ProcedureReturn hid_walkErr[i]    : EndProcedure
+Procedure.i HidWalkComp(i.i)      : If i < 0 Or i >= hid_walkN : ProcedureReturn 0  : EndIf : ProcedureReturn hid_walkComp[i]   : EndProcedure
+Procedure.i HidWalkSlot(i.i)      : If i < 0 Or i >= hid_walkN : ProcedureReturn 0  : EndIf : ProcedureReturn hid_walkSlot[i]   : EndProcedure
+Procedure.i HidWalkSpeed(i.i)     : If i < 0 Or i >= hid_walkN : ProcedureReturn -1 : EndIf : ProcedureReturn hid_walkSpeed[i]  : EndProcedure
+Procedure.i HidWalkUsbSts()       : ProcedureReturn hid_walkSts : EndProcedure
+Procedure.i HidWalkUsbCmd()       : ProcedureReturn hid_walkCmd : EndProcedure
+
+; The step names, as sentences rather than as numbers. Each one says
+; what was attempted and what to look at next, because a step number in
+; a log is only meaningful with this file open beside it.
+Procedure.i HidWalkStepText(step.i)
+  Select step
+    Case #HID_STEP_CONNECT
+      ProcedureReturn "the port reports a device attached and the walk did not get as far as resetting it"
+    Case #HID_STEP_RESET
+      ProcedureReturn "PORT RESET REFUSED - the port never came back enabled, so nothing was addressed; check PORTSC's PR and PED bits below"
+    Case #HID_STEP_SLOT
+      ProcedureReturn "ENABLE SLOT gave no slot - the port is fine and the CONTROLLER refused; a completion code other than 1 names why, and 9 means it has no slots left"
+    Case #HID_STEP_ADDRESS
+      ProcedureReturn "ADDRESS DEVICE refused - the port reset and a slot was granted, so this is the device context or the command ring, not the wire"
+    Case #HID_STEP_DESC
+      ProcedureReturn "the device was addressed and its first descriptor read came back SHORT - the pipe exists and the device is not answering it properly"
+    Case #HID_STEP_SETCONF
+      ProcedureReturn "SET CONFIGURATION refused on a hub - it addressed and then would not configure, so its ports were never walked"
+    Case #HID_STEP_HUBATTACH
+      ProcedureReturn "the hub configured and would not attach - its descriptor or port count did not read back"
+    Case #HID_STEP_OK
+      ProcedureReturn "addressed, and offered to the class drivers"
+  EndSelect
+  ProcedureReturn "an unrecorded step - this is a defect in the witness, not a fact about the board"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  US ENGLISH CHARACTER TABLES
+;
+;  Two rows of 104 bytes, usage $00 through $67. Row one is the
+;  unshifted character, row two is the shifted one; 0 in either means
+;  "this key produces no character" and the caller should use the usage
+;  code instead.
+;
+;  EVERY ENTRY IS A DECIMAL ASCII NUMBER AND NOT A CHARACTER LITERAL.
+;  That is a project rule and it is also a mercy here: 'a' and '\'' and
+;  '\\' in one table is exactly where an off-by-one creeps in
+;  unnoticed. The vendor tables these were checked against -
+;  RaspberryPi4/Reference/v2025.01_usb_kbd.c:77-92, usb_kbd_numkey,
+;  usb_kbd_numkey_shifted and usb_kbd_num_keypad - ARE written with
+;  character literals, so the check was done by decoding theirs rather
+;  than by eye.
+;
+;  The usage numbers themselves come from the HID Usage Tables 1.21,
+;  section 10 "Keyboard/Keypad Page (0x07)", pages 82-86, staged at
+;  RaspberryPi4/Reference/usbif_hut_1_21.pdf.
+;
+;  THE ROWS ARE COMMENTED WITH THE USAGE RANGE THEY COVER, one row of
+;  sixteen per line, because a 104-element table with no landmarks
+;  cannot be checked against anything.
+; ----------------------------------------------------------------------
+DataSection
+  HidUsToChar:
+  ; $00-$03  reserved, ErrorRollOver, POSTFail, ErrorUndefined
+  Data.b   0,   0,   0,   0
+  ; $04-$1D  a b c d e f g h i j k l m n o p q r s t u v w x y z
+  Data.b  97,  98,  99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109
+  Data.b 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122
+  ; $1E-$27  1 2 3 4 5 6 7 8 9 0
+  Data.b  49,  50,  51,  52,  53,  54,  55,  56,  57,  48
+  ; $28-$2C  Return, Escape, Backspace, Tab, Space
+  Data.b  13,  27,   8,   9,  32
+  ; $2D-$31  - = [ ] backslash
+  Data.b  45,  61,  91,  93,  92
+  ; $32      Non-US # and ~. NOT PRESENT ON A US KEYBOARD; a UK keyboard
+  ;          sends it for the # key next to Return.
+  Data.b  35
+  ; $33-$38  ; ' ` , . /
+  Data.b  59,  39,  96,  44,  46,  47
+  ; $39      Caps Lock - a lock key, no character
+  Data.b   0
+  ; $3A-$45  F1..F12
+  Data.b   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+  ; $46-$4B  PrintScreen ScrollLock Pause Insert Home PageUp
+  Data.b   0,   0,   0,   0,   0,   0
+  ; $4C      Delete Forward -> ASCII DEL. See the note below the table.
+  Data.b 127
+  ; $4D-$52  End PageDown Right Left Down Up
+  Data.b   0,   0,   0,   0,   0,   0
+  ; $53      Num Lock - a lock key, no character
+  Data.b   0
+  ; $54-$58  Keypad / * - + Enter
+  Data.b  47,  42,  45,  43,  13
+  ; $59-$62  Keypad 1..9 then 0. GATED ON NUM LOCK - see HidKeyChar.
+  Data.b  49,  50,  51,  52,  53,  54,  55,  56,  57,  48
+  ; $63      Keypad .  - also gated on Num Lock
+  Data.b  46
+  ; $64      Non-US backslash and |
+  Data.b  92
+  ; $65-$66  Application, Power
+  Data.b   0,   0
+  ; $67      Keypad =
+  Data.b  61
+
+  HidUsToShift:
+  ; $00-$03
+  Data.b   0,   0,   0,   0
+  ; $04-$1D  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+  Data.b  65,  66,  67,  68,  69,  70,  71,  72,  73,  74,  75,  76,  77
+  Data.b  78,  79,  80,  81,  82,  83,  84,  85,  86,  87,  88,  89,  90
+  ; $1E-$27  ! @ # $ % ^ & * ( )
+  Data.b  33,  64,  35,  36,  37,  94,  38,  42,  40,  41
+  ; $28-$2C  Return, Escape, Backspace, Tab, Space - shift changes none
+  Data.b  13,  27,   8,   9,  32
+  ; $2D-$31  _ + { } |
+  Data.b  95,  43, 123, 125, 124
+  ; $32      Non-US # and ~ -> ~
+  Data.b 126
+  ; $33-$38  : " ~ < > ?
+  Data.b  58,  34, 126,  60,  62,  63
+  ; $39      Caps Lock
+  Data.b   0
+  ; $3A-$45  F1..F12
+  Data.b   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0
+  ; $46-$4B
+  Data.b   0,   0,   0,   0,   0,   0
+  ; $4C      Delete Forward
+  Data.b 127
+  ; $4D-$52
+  Data.b   0,   0,   0,   0,   0,   0
+  ; $53      Num Lock
+  Data.b   0
+  ; $54-$58  Keypad / * - + Enter - shift changes none of them
+  Data.b  47,  42,  45,  43,  13
+  ; $59-$62  Keypad digits. Shift does NOT change a keypad digit on a
+  ;          real PC either; the keypad's second function is Num Lock's
+  ;          business, not Shift's.
+  Data.b  49,  50,  51,  52,  53,  54,  55,  56,  57,  48
+  ; $63      Keypad .
+  Data.b  46
+  ; $64      Non-US backslash -> |
+  Data.b 124
+  ; $65-$66
+  Data.b   0,   0
+  ; $67      Keypad =
+  Data.b  61
+EndDataSection
+
+; ----------------------------------------------------------------------
+; TWO DELIBERATE DIVERGENCES FROM v2025.01_usb_kbd.c, recorded because a
+; reader comparing the two will find them and should not have to guess:
+;
+;  1. DELETE FORWARD ($4C) IS 127 HERE AND IS NOT A CHARACTER THERE.
+;     U-Boot routes it through usb_special_keys as an ANSI escape
+;     sequence, because its consumer is a terminal. This file's consumer
+;     is a text field in a UI kit, ASCII 127 is DEL, and a text field
+;     that receives it can delete forward. A caller that wants the
+;     terminal behaviour has the usage code.
+;
+;  2. THE KEYPAD IS GATED ON NUM LOCK HERE AND IS NOT THERE.
+;     usb_kbd.c:227-229 maps $54..$67 to digits unconditionally, so its
+;     Num Lock only drives the lamp. HUT names those usages "Keypad 1
+;     and End", "Keypad 2 and Down Arrow" and so on - they are dual
+;     function keys and Num Lock is which function. Ignoring it makes
+;     the arrow half of the keypad unreachable, which is a real loss on
+;     a keyboard being used to drive a UI. HidKeyChar() returns 0 for a
+;     keypad digit with Num Lock off, and the caller reads the usage.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+; HidKeyChar - one usage code and the modifier byte to one ASCII
+; character, or 0 for "no character".
+;
+; A PURE FUNCTION. It reads the two tables and its three arguments and
+; nothing else - no device, no global, no transfer. That is what makes
+; it testable without a keyboard, and it is the seam a second layout
+; would replace. The lock states are passed IN rather than read from the
+; globals for the same reason.
+;
+; CAPS LOCK APPLIES TO LETTERS ONLY, AND IT XORS WITH SHIFT. On a US
+; keyboard Caps Lock + 1 is 1, not !, and Caps Lock + Shift + a is a,
+; not A. That is not a detail anybody remembers correctly; it is copied
+; from usb_kbd.c:203-216, which handles exactly this and comments the
+; second half "Handle CAPSLock + Shift pressed simultaneously".
+;
+; The letter range is tested by USAGE ($04..$1D) and not by looking at
+; the resulting character, because "is this a letter" asked of the table
+; would also be true of the shifted punctuation.
+;
+; CONTROL IS NOT FOLDED IN. usb_kbd.c:231-232 does `keycode = scancode -
+; 0x3` when Control is held, which turns Ctrl+A into 1 and is what a
+; terminal wants. This file returns the plain character and reports the
+; modifier byte alongside it, because a UI kit wants to know that
+; Control was down - Ctrl+C is a command, not the character $03 - and a
+; caller that wants the terminal folding can do it in one line and
+; cannot undo it if this file does it first.
+; ----------------------------------------------------------------------
+Procedure.i HidKeyChar(usage.i, mods.i, capsLock.i, numLock.i)
+  Define c.i
+  Define shifted.i
+
+  If usage < 0 Or usage > #HID_USAGE_MAX_CHAR
+    ProcedureReturn 0
+  EndIf
+
+  shifted = 0
+  If (mods & #HID_MOD_SHIFT) <> 0
+    shifted = 1
+  EndIf
+
+  ; Letters: Caps Lock inverts the shift state, so that Caps+Shift is
+  ; lower case again.
+  If usage >= $04 And usage <= $1D
+    If capsLock <> 0
+      shifted = shifted ! 1
+    EndIf
+  EndIf
+
+  ; The keypad's digits and decimal point are the SECOND function of
+  ; those keys and Num Lock selects it. With Num Lock off they are Home,
+  ; End, the arrows and Delete, none of which is a character.
+  If usage >= $59 And usage <= $63
+    If numLock = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  If shifted <> 0
+    c = PeekA(?HidUsToShift + usage)
+  Else
+    c = PeekA(?HidUsToChar + usage)
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HANDLES
+; ----------------------------------------------------------------------
+Procedure.i hid_Valid(h.i)
+  If h < 1 Or h > #HID_MAX_DEVS
+    ProcedureReturn 0
+  EndIf
+  If hid_slot[h] = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Make this device's slot the one xhci.pi4 will talk to. EVERY procedure
+; below that issues a transfer calls this first, and none of them
+; assumes the previous call left the right slot selected. With a
+; keyboard and a mouse both attached, alternate polls go to different
+; slots, and a missing select sends a keyboard's GET_REPORT to the
+; mouse - which answers it, with three bytes, and the decoder reads
+; three bytes of mouse as a key state.
+Procedure.i hid_Select(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn hid_Fail(#HID_ERR_ARG)
+  EndIf
+  If XhciUseSlot(hid_slot[h]) = 0
+    ProcedureReturn hid_Fail(#HID_ERR_SLOT)
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Does any attached handle hold this slot's interface? For a listing that
+; says which driver claimed what - "no driver" against a device that IS
+; being driven is exactly the wrong answer to give somebody writing one.
+Procedure.i HidClaimsInterface(slot.i, ifnum.i)
+  Define h.i
+  h = 1
+  While h <= #HID_MAX_DEVS
+    If hid_slot[h] = slot And hid_iface[h] = ifnum
+      ProcedureReturn 1
+    EndIf
+    h = h + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HidSlot(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_slot[h]
+EndProcedure
+
+Procedure.i HidProtocol(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn #HID_PROTO_NONE
+  EndIf
+  ProcedureReturn hid_proto[h]
+EndProcedure
+
+Procedure.i HidInterface(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn hid_iface[h]
+EndProcedure
+
+; The interrupt IN endpoint this device declared. RECORDED AND NOT USED.
+; It is reported because it is the evidence for the decision at the top
+; of this file: bInterval says how often the device EXPECTED to be
+; polled, and comparing HidPollMeanTicks() against it is how the "is
+; polling adequate" question gets an answer instead of an opinion. It is
+; also the first thing an interrupt-endpoint implementation will need.
+Procedure.i HidEndpoint(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_epAddr[h]
+EndProcedure
+
+Procedure.i HidEndpointMps(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_epMps[h]
+EndProcedure
+
+Procedure.i HidInterval(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_epIntv[h]
+EndProcedure
+
+Procedure.i HidIdleAccepted(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_idle[h]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE MEASUREMENT
+; ----------------------------------------------------------------------
+Procedure.i HidPollCount() : ProcedureReturn hid_pollCount : EndProcedure
+Procedure.i HidPollTicks() : ProcedureReturn hid_pollTicks : EndProcedure
+Procedure.i HidPollWorst() : ProcedureReturn hid_pollWorst : EndProcedure
+Procedure.i HidTickHz()    : ProcedureReturn hid_TickHz()  : EndProcedure
+
+Procedure HidPollResetStats()
+  hid_pollCount = 0
+  hid_pollTicks = 0
+  hid_pollWorst = 0
+EndProcedure
+
+; Mean microseconds per poll. Integer arithmetic, and the multiply comes
+; BEFORE the divide so that a mean under one microsecond does not become
+; zero. Ticks are 54 MHz here, so a 2 ms transfer is 108000 ticks and
+; the product with 1000000 is 1.08e11 - comfortable in 64 bits, and the
+; overflow bound is worth stating: at 54 MHz this overflows a signed
+; 64-bit value after about 2.8 hours of ACCUMULATED transfer time, not
+; wall-clock time, which no bench session will reach.
+Procedure.i HidPollMeanUs()
+  Define hz.i
+  If hid_pollCount = 0
+    ProcedureReturn 0
+  EndIf
+  hz = hid_TickHz()
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (hid_pollTicks * 1000000) / (hz * hid_pollCount)
+EndProcedure
+
+Procedure.i HidPollWorstUs()
+  Define hz.i
+  hz = hid_TickHz()
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (hid_pollWorst * 1000000) / hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DESCRIPTOR WALKING
+;
+;  A configuration descriptor is a CONCATENATION of variable-length
+;  descriptors, each starting with { bLength, bDescriptorType }. The
+;  walk is therefore a loop over bLength, and the ONE way to get it
+;  wrong that matters is a bLength of zero - which is an infinite loop,
+;  and a device can send one. hid_NextDesc() refuses it.
+; ----------------------------------------------------------------------
+
+; The bounce buffer is xhci.pi4's and is where every control transfer
+; lands. Reading it directly rather than copying it out is deliberate:
+; the walk is read-only, it happens once per device, and a copy would
+; need a second 512-byte buffer for no gain. It DOES mean no transfer
+; may happen in the middle of a walk, which is why the walk below
+; extracts everything it needs in one pass before issuing anything.
+Procedure.i hid_Desc(off.i)
+  ProcedureReturn XhciBounceAddr() + off
+EndProcedure
+
+; ----------------------------------------------------------------------
+; hid_ScanConfig - find a boot HID interface in the configuration
+; descriptor that is currently sitting in the bounce buffer.
+;
+; Returns the byte offset of the INTERFACE descriptor, or -1.
+;
+; The rules, from HID 1.11 section 4.2 (page 8) and 4.3:
+;   bInterfaceClass    3   (HID)
+;   bInterfaceSubClass 1   (Boot Interface Subclass) - and this is the
+;                          one that matters. Subclass 0 means the device
+;                          has no boot protocol at all and SET_PROTOCOL
+;                          on it is meaningless; its reports are
+;                          whatever its report descriptor says, which
+;                          this file cannot parse.
+;   bInterfaceProtocol 1 keyboard, 2 mouse
+;
+; `want` selects which protocol, or 0 for "either". A composite device -
+; a keyboard with a built-in trackpad, or one of the wireless receivers
+; that presents both from one dongle - has two such interfaces on ONE
+; device address, and HidAttachAll() calls this twice with different
+; `want` values rather than assuming the first one found is the one
+; wanted.
+;
+; `after` is the offset to start past, so that a second call finds a
+; second interface. Zero on the first call.
+; ----------------------------------------------------------------------
+Procedure.i hid_ScanConfig(total.i, want.i, after.i)
+  Define off.i
+  Define blen.i
+  Define btype.i
+
+  ; The configuration descriptor's own length is byte 0; the walk starts
+  ; after it. Starting at 0 would find the config descriptor itself and
+  ; read its bNumInterfaces as a bInterfaceClass.
+  off = PeekA(hid_Desc(0))
+  If off < 9 Or off > total
+    ProcedureReturn -1
+  EndIf
+  If after >= off
+    off = after
+  EndIf
+
+  While off + 2 <= total
+    blen  = PeekA(hid_Desc(off + 0))
+    btype = PeekA(hid_Desc(off + 1))
+    ; A zero bLength cannot be walked past and a length that runs off
+    ; the end of what was fetched cannot be trusted. Both are a
+    ; malformed descriptor, and both are an infinite loop if ignored.
+    If blen < 2
+      ProcedureReturn -1
+    EndIf
+    If off + blen > total
+      ProcedureReturn -1
+    EndIf
+
+    If btype = #HID_DT_INTERFACE
+      ; Interface descriptor, USB 2.0 table 9-12:
+      ;   0 bLength  1 bDescriptorType  2 bInterfaceNumber
+      ;   3 bAlternateSetting  4 bNumEndpoints  5 bInterfaceClass
+      ;   6 bInterfaceSubClass  7 bInterfaceProtocol  8 iInterface
+      If blen >= 9
+        If PeekA(hid_Desc(off + 5)) = #HID_CLASS
+          If PeekA(hid_Desc(off + 6)) = #HID_SUBCLASS_BOOT
+            ; ALTERNATE SETTINGS ARE SKIPPED. Only bAlternateSetting 0
+            ; is active without a SET_INTERFACE, and this file issues
+            ; none; matching an alternate would record an endpoint the
+            ; device has not switched on.
+            If PeekA(hid_Desc(off + 3)) = 0
+              If want = 0
+                ProcedureReturn off
+              EndIf
+              If PeekA(hid_Desc(off + 7)) = want
+                ProcedureReturn off
+              EndIf
+            EndIf
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+
+    off = off + blen
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; hid_ScanEndpoint - the first interrupt IN endpoint AFTER an interface
+; descriptor and BEFORE the next one.
+;
+; "Before the next one" is the part that has to be right. Endpoint
+; descriptors belong to the interface they follow, and on a composite
+; device the keyboard's endpoint and the mouse's endpoint are both in
+; the same buffer a few bytes apart. Walking to the end of the
+; configuration would happily return the mouse's endpoint for the
+; keyboard's interface.
+;
+; Returns the offset of the endpoint descriptor, or -1 if the interface
+; declares none. A HID interface with no interrupt IN endpoint is
+; unusual but not illegal, and it is not fatal HERE because this file
+; does not use the endpoint - it is recorded for the measurement and for
+; whoever implements interrupt transfers later.
+; ----------------------------------------------------------------------
+Procedure.i hid_ScanEndpoint(total.i, ifaceOff.i)
+  Define off.i
+  Define blen.i
+  Define btype.i
+  Define attr.i
+
+  off = ifaceOff + PeekA(hid_Desc(ifaceOff + 0))
+  While off + 2 <= total
+    blen  = PeekA(hid_Desc(off + 0))
+    btype = PeekA(hid_Desc(off + 1))
+    If blen < 2
+      ProcedureReturn -1
+    EndIf
+    If off + blen > total
+      ProcedureReturn -1
+    EndIf
+    If btype = #HID_DT_INTERFACE
+      ; The next interface starts here; this one had no interrupt IN.
+      ProcedureReturn -1
+    EndIf
+    If btype = #HID_DT_ENDPOINT
+      ; Endpoint descriptor, USB 2.0 table 9-13:
+      ;   0 bLength  1 bDescriptorType  2 bEndpointAddress
+      ;   3 bmAttributes  4-5 wMaxPacketSize  6 bInterval
+      If blen >= 7
+        attr = PeekA(hid_Desc(off + 3))
+        If (attr & #HID_EP_XFER_MASK) = #HID_EP_XFER_INTR
+          If (PeekA(hid_Desc(off + 2)) & #HID_EP_DIR_IN) <> 0
+            ProcedureReturn off
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    off = off + blen
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidAttach - claim one boot HID interface on the device in `slot`.
+;
+; THE CALLER HAS ALREADY DONE ENABLE SLOT AND ADDRESS DEVICE. This
+; procedure does the rest: read the configuration descriptor, find a
+; boot interface, SET_CONFIGURATION, SET_PROTOCOL(boot), SET_IDLE(0).
+;
+; `want` is #HID_PROTO_KEYBOARD, #HID_PROTO_MOUSE, or 0 for either.
+; `skipIface` is a bInterfaceNumber to step past, so that a composite
+; device's second interface can be claimed after its first; pass -1 to
+; take the first match.
+;
+; Returns a handle 1..#HID_MAX_DEVS, or 0 with HidLastError set.
+;
+; SET_CONFIGURATION IS ISSUED EVERY TIME, INCLUDING FOR THE SECOND
+; INTERFACE OF A COMPOSITE DEVICE, and that is safe: USB 2.0 section
+; 9.4.7 makes SET_CONFIGURATION to the value already in force a no-op
+; that does not disturb the device. Tracking whether it has already been
+; done would be a second piece of state to get wrong, and the failure
+; mode of getting it wrong - an unconfigured interface that stalls
+; everything - is worse than one redundant control transfer.
+; ----------------------------------------------------------------------
+Procedure.i HidAttach(slot.i, want.i, skipIface.i)
+  Define n.i
+  Define total.i
+  Define ifaceOff.i
+  Define epOff.i
+  Define h.i
+  Define cfgVal.i
+  Define iface.i
+  Define after.i
+  Define ask.i
+
+  hid_err = #HID_ERR_NONE
+
+  ; A free handle first, so that a device is not half-configured before
+  ; discovering there is nowhere to record it.
+  h = 1
+  While h <= #HID_MAX_DEVS
+    If hid_slot[h] = 0
+      Break
+    EndIf
+    h = h + 1
+  Wend
+  If h > #HID_MAX_DEVS
+    ProcedureReturn hid_Fail(#HID_ERR_FULL)
+  EndIf
+
+  If XhciUseSlot(slot) = 0
+    ProcedureReturn hid_Fail(#HID_ERR_SLOT)
+  EndIf
+
+  ; ---- endpoint 0's real packet size, BEFORE anything long is read.
+  ;
+  ; A full-speed device is addressed with a GUESSED bMaxPacketSize0 of
+  ; 64 (xh_MaxPacketFor). The real value is byte 7 of the device
+  ; descriptor and may be 8, 16, 32 or 64, and while the guess stands,
+  ; any control transfer longer than one real packet comes back short.
+  ; rpi-6.12.y_xhci.c:1446-1451 is explicit that the fix is an Evaluate
+  ; Context command once the first eight bytes have been read.
+  ;
+  ; Eight bytes is the safe read here and the reason is the same one
+  ; U-Boot gives in v2025.01_uboot_usb.c:999-1014: before the maxpacket
+  ; is known the controller may accept only a single packet, and the
+  ; smallest legal packet is eight. Bytes 0..7 are all that is wanted -
+  ; bMaxPacketSize0 is the last of them.
+  ;
+  ; A failure here is NOT fatal. A device that will not answer eight
+  ; bytes will fail the configuration read below and be reported there,
+  ; with an error that says more than this one could.
+  n = XhciGetDescriptor(#HID_DT_DEVICE, 0, 0, 8)
+  If n >= 8
+    XhciSetEp0MaxPacket(PeekA(XhciBounceAddr() + 7))
+  EndIf
+
+  ; ---- the configuration descriptor, in two reads.
+  ; Nine bytes first, because wTotalLength is inside the descriptor and
+  ; there is no other way to learn how much to ask for. USB 2.0 table
+  ; 9-10:
+  ;   0 bLength  1 bDescriptorType  2-3 wTotalLength
+  ;   4 bNumInterfaces  5 bConfigurationValue  6 iConfiguration
+  ;   7 bmAttributes  8 bMaxPower
+  ;
+  ; THE FIRST DESCRIPTOR REQUEST TO A FRESHLY ADDRESSED DEVICE IS
+  ; ALLOWED TO FAIL, AND ON A WIRELESS RECEIVER IT USUALLY DOES.
+  ; v2025.01_uboot_usb.c:1019-1028, in usb_setup_descriptor(), names the
+  ; exact part: "Logitech Unifying Receiver 046d:c52b bcdDevice 12.10
+  ; seems sensitive about the first Get Descriptor request. If there are
+  ; any other requests in the same microframe, the device reports bogus
+  ; data, first of the descriptor parts is not sent to the host. Wait
+  ; over one microframe duration here (1mS for USB 1.x , 125uS for USB
+  ; 2.0) to avoid triggering the issue."
+  ;
+  ; Linux does not treat one failure as fatal either -
+  ; rpi-6.12.y_usb_core_hub.c defines GET_DESCRIPTOR_TRIES 2 and
+  ; GET_MAXPACKET0_TRIES 3 and loops.
+  ;
+  ; So: up to three attempts, with a whole millisecond between them,
+  ; which is the USB 1.x microframe the comment asks for and is
+  ; therefore safe at every speed. Measured on silicon 2026-08-28: a
+  ; keyboard-and-mouse receiver on the VL805's internal hub failed here
+  ; every single time on the first attempt, and the whole stack reported
+  ; "no keyboard and no mouse found" with the device sitting enumerated
+  ; on hub port 1.
+  Protected tries.i = 0
+  n = 0
+  While tries < #HID_DESC_TRIES And n < 9
+    If tries > 0
+      hid_DelayMs(#HID_DESC_RETRY_MS)
+    EndIf
+    n = XhciGetDescriptor(#HID_DT_CONFIG, 0, 0, 9)
+    tries = tries + 1
+  Wend
+  If n < 9
+    ProcedureReturn hid_Fail(#HID_ERR_DESC)
+  EndIf
+  total  = PeekA(hid_Desc(2)) | (PeekA(hid_Desc(3)) << 8)
+  cfgVal = PeekA(hid_Desc(5))
+  If total < 9
+    ProcedureReturn hid_Fail(#HID_ERR_DESC)
+  EndIf
+
+  ; The bounce buffer is the ceiling. A configuration descriptor longer
+  ; than it is TRUNCATED rather than refused, and the walk below simply
+  ; will not see interfaces past the cut - which is honest, because a
+  ; keyboard's whole configuration is well under a hundred bytes and
+  ; anything that is not is a composite device whose later interfaces
+  ; are not what this file is looking for. What is NOT done is asking
+  ; for more than the buffer holds, which xhci.pi4 refuses outright.
+  ask = total
+  If ask > 512
+    ask = 512
+  EndIf
+  n = XhciGetDescriptor(#HID_DT_CONFIG, 0, 0, ask)
+  If n < 9
+    ProcedureReturn hid_Fail(#HID_ERR_DESC)
+  EndIf
+  ; The device may return fewer bytes than it promised - a Short Packet,
+  ; which xhci.pi4 reports as a success. Walk what ARRIVED, not what was
+  ; claimed, or the walk reads whatever was in the buffer before.
+  If n < ask
+    total = n
+  Else
+    total = ask
+  EndIf
+
+  ; ---- find the interface.
+  after = 0
+  ifaceOff = hid_ScanConfig(total, want, after)
+  While ifaceOff >= 0
+    iface = PeekA(hid_Desc(ifaceOff + 2))
+    If iface <> skipIface
+      Break
+    EndIf
+    after = ifaceOff + PeekA(hid_Desc(ifaceOff + 0))
+    ifaceOff = hid_ScanConfig(total, want, after)
+  Wend
+  If ifaceOff < 0
+    ProcedureReturn hid_Fail(#HID_ERR_NO_HID)
+  EndIf
+  iface = PeekA(hid_Desc(ifaceOff + 2))
+
+  ; ---- the endpoint, for the record only.
+  epOff = hid_ScanEndpoint(total, ifaceOff)
+
+  ; Everything read out of the bounce buffer must be extracted BEFORE
+  ; the next control transfer, which overwrites it.
+  hid_slot[h]   = slot
+  hid_iface[h]  = iface
+  hid_proto[h]  = PeekA(hid_Desc(ifaceOff + 7))
+  hid_cfgValue[h] = cfgVal
+  If epOff >= 0
+    hid_epAddr[h] = PeekA(hid_Desc(epOff + 2))
+    hid_epMps[h]  = PeekA(hid_Desc(epOff + 4)) | (PeekA(hid_Desc(epOff + 5)) << 8)
+    hid_epIntv[h] = PeekA(hid_Desc(epOff + 6))
+  Else
+    hid_epAddr[h] = 0
+    hid_epMps[h]  = 0
+    hid_epIntv[h] = 0
+  EndIf
+  hid_curLen[h]   = 0
+  hid_haveprev[h] = 0
+  hid_idle[h]     = 0
+
+  ; ---- SET_CONFIGURATION. Without it the device is in the ADDRESS
+  ; state, where USB 2.0 section 9.4 says interface requests are not
+  ; valid - so SET_PROTOCOL would stall and the failure would name the
+  ; wrong thing.
+  If XhciSetConfiguration(cfgVal) = 0
+    hid_slot[h] = 0
+    ProcedureReturn hid_Fail(#HID_ERR_CONFIG)
+  EndIf
+
+  ; ---- SET_PROTOCOL(boot). MANDATORY - see the header. wValue 0 is
+  ; boot protocol, wIndex is the interface, no data stage.
+  If XhciControlIn(#HID_RT_OUT, #HID_REQ_SET_PROTOCOL, #HID_PROTOCOL_BOOT, iface, 0) < 0
+    hid_slot[h] = 0
+    ProcedureReturn hid_Fail(#HID_ERR_PROTOCOL)
+  EndIf
+
+  ; ---- SET_IDLE(0). Duration 0, Report ID 0, both in wValue - HID 1.11
+  ; section 7.2.4, "wValue Duration and Report ID", duration in the high
+  ; byte. A STALL HERE IS NOT AN ERROR: Appendix G makes Set_Idle
+  ; required for keyboards and optional otherwise, and a mouse that
+  ; refuses it is a working mouse. The outcome is RECORDED rather than
+  ; discarded, because "the keyboard refused Set_Idle" is a fact worth
+  ; having when a keyboard misbehaves later - Appendix C lists Set_Idle
+  ; support as a keyboard design requirement, so a keyboard that stalls
+  ; it is out of specification and that is worth knowing.
+  If XhciControlIn(#HID_RT_OUT, #HID_REQ_SET_IDLE, 0, iface, 0) >= 0
+    hid_idle[h] = 1
+  EndIf
+
+  hid_count = hid_count + 1
+  ProcedureReturn h
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidDetach - forget a device. Does not talk to it; a device that has
+; been unplugged cannot be talked to and this is what a caller reaches
+; for when that has happened.
+; ----------------------------------------------------------------------
+Procedure HidDetach(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn
+  EndIf
+  hid_slot[h] = 0
+  hid_haveprev[h] = 0
+  hid_count = hid_count - 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidPoll - one GET_REPORT into this device's report buffer.
+;
+; HID 1.11 section 7.2.1, page 51:
+;   bmRequestType  10100001   ($A1 - in, class, interface)
+;   bRequest       GET_REPORT ($01)
+;   wValue         Report Type in the HIGH byte, Report ID in the low
+;   wIndex         Interface
+;   wLength        Report Length
+;
+; Report ID 0 because a boot report has none - see #HID_REPORT_INPUT.
+;
+; Returns the number of bytes read, or a negative #HID_ERR_*. A SHORT
+; READ IS NOT AUTOMATICALLY AN ERROR: a mouse asked for four bytes and
+; answering three is a mouse without a wheel, which is fine. A keyboard
+; answering fewer than eight is not fine, because Appendix B fixes the
+; boot keyboard report at eight bytes. The caller-visible rule is
+; enforced by HidKeyboardPoll and HidMousePoll, not here; this procedure
+; reports what arrived.
+;
+; THE TIMING IS TAKEN AROUND THE TRANSFER ONLY, not around the decode.
+; What is being measured is the bus and the controller, which is what an
+; interrupt endpoint would change; the decode below runs at CPU speed
+; and would be identical either way. Including it would flatter the
+; comparison.
+; ----------------------------------------------------------------------
+Procedure.i HidPoll(h.i)
+  Define n.i
+  Define want.i
+  Define base.i
+  Define i.i
+  Define t0.i
+  Define dt.i
+
+  If hid_Select(h) = 0
+    ProcedureReturn #HID_ERR_ARG
+  EndIf
+
+  If hid_proto[h] = #HID_PROTO_KEYBOARD
+    want = #HID_KBD_REPORT_BYTES
+  Else
+    want = #HID_MOUSE_ASK_BYTES
+  EndIf
+
+  t0 = hid_Ticks()
+  n = XhciControlIn(#HID_RT_IN, #HID_REQ_GET_REPORT, (#HID_REPORT_INPUT << 8), hid_iface[h], want)
+  dt = hid_Ticks() - t0
+
+  ; A tick counter that went backwards is a broken timebase, not a
+  ; negative duration. Discard the sample rather than poisoning the
+  ; total with it; the count is only incremented for samples that are
+  ; kept, so the mean stays honest.
+  If dt >= 0
+    hid_pollCount = hid_pollCount + 1
+    hid_pollTicks = hid_pollTicks + dt
+    If dt > hid_pollWorst
+      hid_pollWorst = dt
+    EndIf
+  EndIf
+
+  If n < 0
+    hid_curLen[h] = 0
+    ProcedureReturn #HID_ERR_REPORT
+  EndIf
+
+  base = h * #HID_REPORT_MAX
+  ; Copy out of the shared bounce buffer IMMEDIATELY. The next transfer
+  ; from any device overwrites it, and with two devices being polled in
+  ; turn the next transfer is very close.
+  i = 0
+  While i < #HID_REPORT_MAX
+    If i < n
+      hid_cur[base + i] = PeekA(XhciBounceAddr() + i)
+    Else
+      ; Bytes the device did not send are zeroed rather than left as the
+      ; previous report's. A stale byte that happens to be a valid
+      ; keycode is a key that appears to be held down forever.
+      hid_cur[base + i] = 0
+    EndIf
+    i = i + 1
+  Wend
+  hid_curLen[h] = n
+  ProcedureReturn n
+EndProcedure
+
+; Raw access to the last report, for a diagnostic that wants to print
+; the bytes exactly as they arrived. This is the answer to "what did the
+; keyboard actually send" and it is exported because every decode below
+; is an interpretation and interpretations can be wrong.
+Procedure.i HidReportByte(h.i, i.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  If i < 0 Or i >= #HID_REPORT_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_cur[(h * #HID_REPORT_MAX) + i]
+EndProcedure
+
+Procedure.i HidReportLength(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_curLen[h]
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  KEYBOARD DECODE
+; ----------------------------------------------------------------------
+
+; Is `usage` in the six-slot array of the report at `base`?
+; Bytes 2..7, per HID 1.11 Appendix B.1's table.
+Procedure.i hid_InArray(base.i, usage.i, isPrev.i)
+  Define i.i
+  Define v.i
+  i = 2
+  While i < 8
+    If isPrev = 0
+      v = hid_cur[base + i]
+    Else
+      v = hid_prev[base + i]
+    EndIf
+    If v = usage
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; The phantom state. HID 1.11 Appendix C: ErrorRollOver "in all array
+; fields". All six, not one - a single $01 in an otherwise normal report
+; is not the phantom condition and must not be treated as one.
+Procedure.i hid_IsPhantom(base.i)
+  Define i.i
+  i = 2
+  While i < 8
+    If hid_cur[base + i] <> #HID_USAGE_ROLLOVER
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure hid_PushEvent(usage.i, down.i, mods.i)
+  If hid_evCount >= #HID_EVENTS_MAX
+    hid_evOverflow = hid_evOverflow + 1
+    ProcedureReturn
+  EndIf
+  hid_evUsage[hid_evCount] = usage
+  hid_evDown[hid_evCount]  = down
+  hid_evMods[hid_evCount]  = mods
+  If down <> 0
+    hid_evChar[hid_evCount] = HidKeyChar(usage, mods, hid_capsLock, hid_numLock)
+  Else
+    ; A key-up carries no character. Not because it could not be
+    ; computed, but because a caller that appends every event's char to
+    ; a text field would then get every letter twice, and that bug is
+    ; invisible in a demo where keys are tapped one at a time.
+    hid_evChar[hid_evCount] = 0
+  EndIf
+  hid_evCount = hid_evCount + 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidKeyboardPoll - poll a keyboard and turn the difference between this
+; report and the last one into key-down and key-up events.
+;
+; Returns the number of events produced, 0 for "nothing changed", or a
+; negative #HID_ERR_*.
+;
+; THE FIRST REPORT PRODUCES KEY-DOWN EVENTS FOR WHATEVER IS ALREADY
+; HELD, and that is deliberate. A key held while the program starts is
+; genuinely down, and reporting it is the truthful answer; the
+; alternative - swallowing the first report to establish a baseline -
+; loses a key the user is pressing right now, which is worse and much
+; harder to explain.
+;
+; THE MODIFIER BYTE IS NOT DIFFED INTO EVENTS. Shift going down is not a
+; key event in this model; it is a state that every subsequent event
+; carries in its own hid_evMods entry. That is the right shape for a
+; consumer - "was Shift down when A was pressed" is the question anybody
+; actually asks - and diffing it as well would double-report every
+; capital letter. HidModifiers() reports the current byte for a caller
+; that wants to draw a Shift indicator.
+; ----------------------------------------------------------------------
+Procedure.i HidKeyboardPoll(h.i)
+  Define n.i
+  Define base.i
+  Define i.i
+  Define usage.i
+  Define mods.i
+
+  hid_evCount = 0
+  If hid_Valid(h) = 0
+    ProcedureReturn #HID_ERR_ARG
+  EndIf
+  If hid_proto[h] <> #HID_PROTO_KEYBOARD
+    ProcedureReturn #HID_ERR_ARG
+  EndIf
+
+  n = HidPoll(h)
+  If n < 0
+    ProcedureReturn n
+  EndIf
+  ; Appendix B.1 fixes the boot keyboard report at eight bytes. Fewer
+  ; means the device is not in boot protocol, which means SET_PROTOCOL
+  ; did not take - and decoding a shorter report would produce plausible
+  ; keys out of the wrong offsets.
+  If n < #HID_KBD_REPORT_BYTES
+    ProcedureReturn #HID_ERR_REPORT
+  EndIf
+
+  base = h * #HID_REPORT_MAX
+
+  ; The phantom state. Discard the whole report and keep the previous
+  ; state standing - see the header. Note that hid_prev is deliberately
+  ; NOT updated, so the next real report is diffed against the last real
+  ; one and no key-up is invented for a key that was held throughout.
+  If hid_IsPhantom(base) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  mods = hid_cur[base + 0]
+
+  If hid_haveprev[h] = 0
+    ; No previous report: everything currently down is new.
+    i = 2
+    While i < 8
+      usage = hid_cur[base + i]
+      If usage > #HID_USAGE_UNDEFINED
+        hid_PushEvent(usage, 1, mods)
+      EndIf
+      i = i + 1
+    Wend
+  Else
+    ; RELEASES FIRST, THEN PRESSES. The order matters to a consumer that
+    ; tracks a set of held keys: a key released in the same report as
+    ; another is pressed should leave the set correct either way, but a
+    ; consumer doing its own bookkeeping is much easier to write when
+    ; removals precede additions.
+    i = 2
+    While i < 8
+      usage = hid_prev[base + i]
+      If usage > #HID_USAGE_UNDEFINED
+        If hid_InArray(base, usage, 0) = 0
+          hid_PushEvent(usage, 0, mods)
+        EndIf
+      EndIf
+      i = i + 1
+    Wend
+    i = 2
+    While i < 8
+      usage = hid_cur[base + i]
+      If usage > #HID_USAGE_UNDEFINED
+        If hid_InArray(base, usage, 1) = 0
+          hid_PushEvent(usage, 1, mods)
+        EndIf
+      EndIf
+      i = i + 1
+    Wend
+  EndIf
+
+  ; The lock keys toggle on the DOWN edge, which is why this runs over
+  ; the event list rather than over the report: the report says the key
+  ; is held, and a key held for half a second would otherwise toggle
+  ; Caps Lock on every poll. The characters in the event list were
+  ; already computed with the OLD lock state, which is correct - the
+  ; Caps Lock keypress itself produces no character, and the next key
+  ; is the first one affected.
+  i = 0
+  While i < hid_evCount
+    If hid_evDown[i] <> 0
+      If hid_evUsage[i] = #HID_USAGE_CAPSLOCK
+        hid_capsLock = hid_capsLock ! 1
+      EndIf
+      If hid_evUsage[i] = #HID_USAGE_NUMLOCK
+        hid_numLock = hid_numLock ! 1
+      EndIf
+      If hid_evUsage[i] = #HID_USAGE_SCROLLLOCK
+        hid_scrollLock = hid_scrollLock ! 1
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+
+  ; This report becomes the baseline for the next one.
+  i = 0
+  While i < #HID_REPORT_MAX
+    hid_prev[base + i] = hid_cur[base + i]
+    i = i + 1
+  Wend
+  hid_haveprev[h] = 1
+
+  ProcedureReturn hid_evCount
+EndProcedure
+
+Procedure.i HidKeyEventCount() : ProcedureReturn hid_evCount : EndProcedure
+Procedure.i HidKeyOverflows()  : ProcedureReturn hid_evOverflow : EndProcedure
+
+Procedure.i HidKeyUsage(i.i)
+  If i < 0 Or i >= hid_evCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_evUsage[i]
+EndProcedure
+
+Procedure.i HidKeyDown(i.i)
+  If i < 0 Or i >= hid_evCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_evDown[i]
+EndProcedure
+
+; The ASCII character for this event, or 0 if the key has none. Zero is
+; not an error and not a failure to decode - most of a keyboard has no
+; character, and a caller that treats 0 as a bug will report one every
+; time somebody presses an arrow key.
+Procedure.i HidKeyCharAt(i.i)
+  If i < 0 Or i >= hid_evCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_evChar[i]
+EndProcedure
+
+Procedure.i HidKeyMods(i.i)
+  If i < 0 Or i >= hid_evCount
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_evMods[i]
+EndProcedure
+
+Procedure.i HidModifiers(h.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_cur[(h * #HID_REPORT_MAX) + 0]
+EndProcedure
+
+Procedure.i HidCapsLock()   : ProcedureReturn hid_capsLock : EndProcedure
+Procedure.i HidNumLock()    : ProcedureReturn hid_numLock : EndProcedure
+Procedure.i HidScrollLock() : ProcedureReturn hid_scrollLock : EndProcedure
+
+; How many keys are currently held. Counts the array, so it is 0..6 and
+; excludes modifiers - which is what "how many keys are down" means to
+; a caller checking for a chord.
+Procedure.i HidKeysHeld(h.i)
+  Define base.i
+  Define i.i
+  Define n.i
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  base = h * #HID_REPORT_MAX
+  n = 0
+  i = 2
+  While i < 8
+    If hid_cur[base + i] > #HID_USAGE_UNDEFINED
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; Is this exact usage down right now? For a caller that wants a game's
+; "is W held" rather than an event stream.
+Procedure.i HidKeyIsHeld(h.i, usage.i)
+  If hid_Valid(h) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn hid_InArray(h * #HID_REPORT_MAX, usage, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidSetLeds - drive the lock lamps.
+;
+; HID 1.11 Appendix C: "If using the keyboard descriptor in Appendix B,
+; LED states are set by sending a 5-bit absolute report to the keyboard
+; via a Set_Report(Output) request", and Appendix B.1's note: "The LEDs
+; are absolute output items. This means that the state of each LED must
+; be included in output reports (0 = off, 1 = on)."
+;
+; ABSOLUTE, so this sends the whole byte every time and there is no
+; "turn on Caps Lock" call. A relative interface would be a lie about
+; what the wire carries.
+;
+; SET_REPORT is not mandatory - HID 1.11 section 7.2's table gives the
+; mandatory footnote to GET_REPORT alone - so a failure is reported and
+; is not fatal. A keyboard whose lamp does not light still types.
+; ----------------------------------------------------------------------
+Procedure.i HidSetLeds(h.i, mask.i)
+  Define b.i
+  If hid_Select(h) = 0
+    ProcedureReturn 0
+  EndIf
+  If hid_proto[h] <> #HID_PROTO_KEYBOARD
+    ProcedureReturn hid_Fail(#HID_ERR_ARG)
+  EndIf
+  ; The report is five bits wide and the top three are constant - the
+  ; mask is trimmed here rather than trusted, because a caller passing
+  ; a modifier byte by mistake would otherwise set the Compose and Kana
+  ; bits on a keyboard that has neither.
+  b = mask & $1F
+  ; A GLOBAL one-byte buffer, not a local. XhciControlOut takes an
+  ; ADDRESS and reads through it, and the address of a local is a
+  ; compiler-chosen stack slot; xhci.pi4's own header records the same
+  ; caution about naming a parameter's home. A global also outlives the
+  ; call, which matters not at all here - the copy into the bounce
+  ; buffer is synchronous - but costs one byte and removes the question.
+  hid_ledBuf[0] = b
+  If XhciControlOut(#HID_RT_OUT, #HID_REQ_SET_REPORT, (#HID_REPORT_OUTPUT << 8), hid_iface[h], @hid_ledBuf[0], 1) < 0
+    ProcedureReturn hid_Fail(#HID_ERR_LEDS)
+  EndIf
+  hid_leds = b
+  ProcedureReturn 1
+EndProcedure
+
+; Push the three lock states this file tracks out to the lamps. The
+; usual call after HidKeyboardPoll returns a non-zero count.
+Procedure.i HidSyncLeds(h.i)
+  Define m.i
+  m = 0
+  If hid_numLock <> 0
+    m = m | #HID_LED_NUMLOCK
+  EndIf
+  If hid_capsLock <> 0
+    m = m | #HID_LED_CAPSLOCK
+  EndIf
+  If hid_scrollLock <> 0
+    m = m | #HID_LED_SCROLLLOCK
+  EndIf
+  ; Nothing to do if the lamps already say this. One skipped control
+  ; transfer per poll is worth having when the poll IS the bottleneck -
+  ; see the measurement discussion in the header.
+  If m = hid_leds
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn HidSetLeds(h, m)
+EndProcedure
+
+Procedure.i HidLeds() : ProcedureReturn hid_leds : EndProcedure
+
+; ----------------------------------------------------------------------
+;  MOUSE DECODE
+; ----------------------------------------------------------------------
+
+; A signed 8-bit value out of an unsigned byte. HID 1.11 Appendix B.2
+; gives X and Y a logical range of -127..127, so byte values above 127
+; are negative. PeekA returns 0..255 - which is why it is used
+; throughout this file in preference to PeekB - so the sign extension is
+; explicit here, once, rather than being an accident of which Peek
+; somebody reached for.
+Procedure.i hid_S8(v.i)
+  If v > 127
+    ProcedureReturn v - 256
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidMousePoll - poll a mouse and ACCUMULATE its motion.
+;
+; Returns 1 if a report was read, 0 if nothing moved and no button
+; changed, or a negative #HID_ERR_*.
+;
+; MOTION ACCUMULATES AND BUTTONS DO NOT, and the asymmetry is the whole
+; design. dx and dy are RELATIVE - each report's are new displacement
+; since the last one - so two polls between two reads must add, or the
+; pointer moves at half speed. Buttons are ABSOLUTE state, so the latest
+; report simply replaces the previous one.
+;
+; HidMouseTake() reads and clears the accumulators in one go; reading
+; them without clearing would apply the same movement every frame.
+; ----------------------------------------------------------------------
+Procedure.i HidMousePoll(h.i)
+  Define n.i
+  Define base.i
+  Define dx.i
+  Define dy.i
+  Define w.i
+  Define btn.i
+  Define moved.i
+
+  If hid_Valid(h) = 0
+    ProcedureReturn #HID_ERR_ARG
+  EndIf
+  If hid_proto[h] <> #HID_PROTO_MOUSE
+    ProcedureReturn #HID_ERR_ARG
+  EndIf
+
+  n = HidPoll(h)
+  If n < 0
+    ProcedureReturn n
+  EndIf
+  If n < #HID_MOUSE_MIN_BYTES
+    ProcedureReturn #HID_ERR_REPORT
+  EndIf
+
+  base = h * #HID_REPORT_MAX
+  ; Only the low three bits are architectural - Appendix B.2 marks bits
+  ; 4..7 "Device-specific". They are masked off rather than passed on,
+  ; because a caller testing "any button down" against the whole byte
+  ; would see a device-specific bit as a click.
+  btn = hid_cur[base + 0] & $07
+  dx  = hid_S8(hid_cur[base + 1])
+  dy  = hid_S8(hid_cur[base + 2])
+
+  w = 0
+  If n >= 4
+    hid_mouseHasWheel = 1
+    w = hid_S8(hid_cur[base + 3])
+  EndIf
+
+  moved = 0
+  If dx <> 0 Or dy <> 0
+    moved = 1
+  EndIf
+  If w <> 0
+    moved = 1
+  EndIf
+  If btn <> hid_mouseBtn
+    moved = 1
+  EndIf
+
+  hid_mouseBtn = btn
+  hid_mouseDx = hid_mouseDx + dx
+  hid_mouseDy = hid_mouseDy + dy
+  hid_mouseWheel = hid_mouseWheel + w
+
+  ProcedureReturn moved
+EndProcedure
+
+Procedure.i HidMouseButtons() : ProcedureReturn hid_mouseBtn : EndProcedure
+Procedure.i HidMouseDx()      : ProcedureReturn hid_mouseDx : EndProcedure
+Procedure.i HidMouseDy()      : ProcedureReturn hid_mouseDy : EndProcedure
+Procedure.i HidMouseWheel()   : ProcedureReturn hid_mouseWheel : EndProcedure
+
+; 1 only if a mouse has actually returned a fourth byte. Not "this mouse
+; probably has a wheel" - the boot protocol has no way to ask. See the
+; header.
+Procedure.i HidMouseHasWheel() : ProcedureReturn hid_mouseHasWheel : EndProcedure
+
+; Clear the motion accumulators. Buttons are NOT cleared: they are state
+; and the caller wants them to persist between frames.
+Procedure HidMouseTake()
+  hid_mouseDx = 0
+  hid_mouseDy = 0
+  hid_mouseWheel = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+; HidFindAndAttachAll - the whole thing, from a running controller to
+; attached keyboards and mice, in one call.
+;
+; This is the procedure that knows about THIS BOARD's topology, and it
+; is the only one in this file that does. Everything above works on any
+; xHCI host; this one encodes the fact recorded in xhci.pi4's header -
+; that on a Raspberry Pi 4 the low- and full-speed devices are behind
+; the VL805's soldered-on internal hub, and a driver that only walks
+; root ports will never find a keyboard.
+;
+; THE SEQUENCE:
+;   1. walk the ROOT ports. Anything connected is reset and addressed.
+;   2. for each root-port device, read the device descriptor.
+;      * class 09 is a HUB. Configure it, attach it, and walk ITS ports.
+;      * anything else is offered to HidAttach directly, because a
+;        SuperSpeed HID device would appear here - none exists, but the
+;        code path costs three lines and its absence would be a silent
+;        assumption.
+;   3. for each hub port with something on it, address the device and
+;      offer it to HidAttach.
+;
+; A COMPOSITE DEVICE IS TRIED TWICE. A single dongle presenting both a
+; keyboard and a mouse is the commonest wireless arrangement there is,
+; and one HidAttach on it would claim the keyboard and silently lose the
+; mouse. The second call passes the first interface's number as
+; `skipIface`.
+;
+; Returns the number of HID interfaces attached. Errors along the way
+; are NOT fatal - a device that fails to enumerate must not stop the
+; walk, because the one that fails is very often not the one being
+; looked for. HidLastError() holds the last failure for a diagnostic to
+; print.
+; ----------------------------------------------------------------------
+Procedure.i HidFindAndAttachAll()
+  Define port.i
+  Define slot.i
+  Define speed.i
+  Define n.i
+  Define cls.i
+  Define proto.i
+  Define found.i
+  Define h.i
+  Define h2.i
+  Define hubRoot.i
+  Define hubSlot.i
+  Define hp.i
+  Define maxPorts.i
+
+  found = 0
+  hubRoot = 0
+  hubSlot = 0
+  hid_otherCount = 0
+  hid_walkN = 0
+  hid_walkSts = 0
+  hid_walkCmd = 0
+
+  If XhciReady() = 0
+    ProcedureReturn 0
+  EndIf
+  maxPorts = XhciMaxPorts()
+
+  ; ---- 1 and 2: the root ports.
+  port = 1
+  While port <= maxPorts
+    If XhciPortConnected(port) <> 0
+      If XhciPortReset(port) <> 0
+        speed = XhciPortSpeed(port)
+        slot = XhciEnableSlot()
+        If slot <> 0
+          If XhciAddressDevice(slot, port, speed) <> 0
+            ; The device descriptor's class byte is at offset 4 - USB
+            ; 2.0 table 9-8: bLength, bDescriptorType, bcdUSB(2),
+            ; bDeviceClass, bDeviceSubClass, bDeviceProtocol. Eight
+            ; bytes is enough to reach bDeviceProtocol at offset 6 and
+            ; is the read that is safe at every speed - see
+            ; XhciGetDeviceDescriptor's note about the guessed
+            ; full-speed max packet.
+            n = XhciGetDescriptor(#HID_DT_DEVICE, 0, 0, 8)
+            If n >= 8
+              cls   = PeekA(XhciBounceAddr() + 4)
+              proto = PeekA(XhciBounceAddr() + 6)
+              If cls = 9
+                ; A HUB. It has to be CONFIGURED before its port
+                ; requests are valid - USB 2.0 section 9.4 - and
+                ; XhciHubAttach's header says the same thing at more
+                ; length. Configuration value 1 is what every hub in
+                ; existence uses and what a hub with one configuration
+                ; must use; reading it out of the configuration
+                ; descriptor would cost a transfer to learn a constant.
+                If XhciSetConfiguration(1) <> 0
+                  If XhciHubAttach(slot, port, proto) <> 0
+                    hubRoot = port
+                    hubSlot = slot
+                    hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_OK, slot, speed)
+                  Else
+                    hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_HUBATTACH, slot, speed)
+                  EndIf
+                Else
+                  hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_SETCONF, slot, speed)
+                EndIf
+              Else
+                ; Not a hub. Offer it; HidAttach refuses anything
+                ; without a boot HID interface, which is the common
+                ; case here - the boot stick lands in this branch.
+                h = HidAttach(slot, 0, -1)
+                If h <> 0
+                  found = found + 1
+                  h2 = HidAttach(slot, 0, hid_iface[h])
+                  If h2 <> 0
+                    found = found + 1
+                  EndIf
+                Else
+                  ; Not HID. The boot stick lands here; remember the slot
+                  ; so the caller can set it up as storage.
+                  hid_NoteOther(slot)
+                EndIf
+                ; Either way this port was ADDRESSED, which is the thing
+                ; the report is about. Whether it turned out to be a
+                ; keyboard is the class drivers' business.
+                hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_OK, slot, speed)
+              EndIf
+            Else
+              hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_DESC, slot, speed)
+            EndIf
+          Else
+            hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_ADDRESS, slot, speed)
+          EndIf
+        Else
+          hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_SLOT, 0, speed)
+        EndIf
+      Else
+        hid_WalkNote(port, 0, XhciPortSc(port), #HID_STEP_RESET, 0, -1)
+      EndIf
+    EndIf
+    port = port + 1
+  Wend
+
+  ; ---- 3: the hub's downstream ports.
+  If hubSlot <> 0
+    ; The hub's ports do not mean anything yet. XhciHubSettle waits for
+    ; PORT_POWER to actually assert and then debounces - without it the
+    ; scan below reads $0000 on every port and reports "no keyboard and
+    ; no mouse found" with a mouse plugged in. Measured on silicon
+    ; 2026-08-28; the numbers are in XhciHubSettle's header.
+    XhciHubSettle()
+    hp = 1
+    While hp <= XhciHubPorts()
+      If XhciHubPortConnected(hp) = 1
+        slot = XhciAddressBehindHub(hp)
+        If slot <> 0
+          h = HidAttach(slot, 0, -1)
+          If h <> 0
+            found = found + 1
+            ; The second interface of a composite device.
+            h2 = HidAttach(slot, 0, hid_iface[h])
+            If h2 <> 0
+              found = found + 1
+            EndIf
+          Else
+            hid_NoteOther(slot)
+          EndIf
+          ; A hub port has no PORTSC of its own - its status came from a
+          ; GET_PORT_STATUS class request - so -1 is recorded rather than
+          ; a register that does not exist for it.
+          hid_WalkNote(hp, 1, -1, #HID_STEP_OK, slot, XhciHubPortSpeed(hp))
+        Else
+          hid_WalkNote(hp, 1, -1, #HID_STEP_ADDRESS, 0, XhciHubPortSpeed(hp))
+        EndIf
+      EndIf
+      hp = hp + 1
+    Wend
+  EndIf
+
+  ; The controller's own state, sampled once now that the walk is over.
+  ; See the note over hid_walkSts: a walk where every port failed and a
+  ; walk where the controller stopped answering look identical row by
+  ; row, and USBSTS is what separates them.
+  hid_walkSts = XhciUsbSts()
+  hid_walkCmd = XhciUsbCmd()
+
+  ProcedureReturn found
+EndProcedure
+
+; The first attached device of a given protocol, or 0. Saves every
+; caller writing the same three-line loop, and more importantly stops
+; them assuming handle 1 is the keyboard - which it is only if the
+; keyboard happened to be found first.
+Procedure.i HidFind(proto.i)
+  Define h.i
+  h = 1
+  While h <= #HID_MAX_DEVS
+    If hid_slot[h] <> 0
+      If hid_proto[h] = proto
+        ProcedureReturn h
+      EndIf
+    EndIf
+    h = h + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ERROR TEXT. One string per code, in the shape xhci.pi4 and emmc.pi4
+;  use. The text names the STAGE, because "HidAttach returned 0" is not
+;  something anybody can act on.
+; ----------------------------------------------------------------------
+Procedure.i HidErrorText()
+  Select hid_err
+    Case #HID_ERR_NONE
+      ProcedureReturn "hid: ok"
+    Case #HID_ERR_NOT_READY
+      ProcedureReturn "hid: no device is attached on that handle"
+    Case #HID_ERR_NO_HID
+      ProcedureReturn "hid: this device's configuration has no boot-protocol HID interface - subclass 1, class 3"
+    Case #HID_ERR_DESC
+      ProcedureReturn "hid: a descriptor was short or disagreed with its own length byte"
+    Case #HID_ERR_CONFIG
+      ProcedureReturn "hid: SET_CONFIGURATION failed - the device stays in the address state and every interface request will stall"
+    Case #HID_ERR_PROTOCOL
+      ProcedureReturn "hid: SET_PROTOCOL(boot) failed - reports will be in the device's own report protocol, which this driver cannot parse"
+    Case #HID_ERR_REPORT
+      ProcedureReturn "hid: GET_REPORT returned fewer bytes than the boot protocol defines"
+    Case #HID_ERR_FULL
+      ProcedureReturn "hid: more HID interfaces than HID_MAX_DEVS - the extra ones are refused, not dropped silently"
+    Case #HID_ERR_ARG
+      ProcedureReturn "hid: a caller argument is refused - an unknown handle, or the wrong device kind for that call"
+    Case #HID_ERR_SLOT
+      ProcedureReturn "hid: the xHCI slot recorded for this device is no longer usable"
+    Case #HID_ERR_LEDS
+      ProcedureReturn "hid: SET_REPORT(Output) failed - the lock lamps cannot be driven; the keyboard still types"
+  EndSelect
+  ProcedureReturn "hid: unknown error code"
+EndProcedure

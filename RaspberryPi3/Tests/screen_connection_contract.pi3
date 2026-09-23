@@ -1,0 +1,15 @@
+; Desk-only emitted contract for the hardware-free shared display lifecycle.
+XIncludeFile "Anvil/Core/screen_connection.pbi"
+
+Procedure.i Main()
+  Select PeekI($06000000)
+    Case 1 : ProcedureReturn ScreenConnectionRegister(PeekI($06000008))
+    Case 2 : ProcedureReturn ScreenConnectionNextAction(PeekI($06000008))
+    Case 3 : ProcedureReturn ScreenConnectionComplete(PeekI($06000008),PeekI($06000010),PeekI($06000018))
+    Case 4 : ProcedureReturn ScreenConnectionState()
+    Case 5 : ProcedureReturn ScreenConnectionGeneration()
+    Case 6 : ProcedureReturn ScreenConnectionError()
+    Case 7 : ProcedureReturn ScreenConnectionDisable()
+  EndSelect
+  ProcedureReturn -1
+EndProcedure

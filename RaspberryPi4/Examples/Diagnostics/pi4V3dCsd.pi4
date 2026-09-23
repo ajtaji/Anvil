@@ -1,0 +1,1018 @@
+; pi4V3dCsd.pi4 - stage 2 of the V3D bring-up. DID A QPU RUN A PROGRAM?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROGRAM PROVES, AND WHAT IT REFUSES TO CLAIM
+; ======================================================================
+;
+;  pi4V3dIdent answered "is the block there". pi4V3dTfu answered "does
+;  the block move bytes" - and it does: three jobs, 768 output bytes
+;  verified on the CPU, on this silicon.
+;
+;  NEITHER OF THEM RAN AN INSTRUCTION. The TFU is a fixed-function
+;  tiler in the hub; it has no QPUs in it. Everything above a
+;  whole-surface clear needs a QPU program - Mesa implements even a
+;  scissored glClear "by drawing a pair of triangles"
+;  (v3dx_draw.c:1641-1642), and the shader state record's three code
+;  addresses have NO ENABLE BIT, so there is no encoding for "this
+;  draw has no shader".
+;
+;  This program hands the Compute Shader Dispatcher a seventeen-
+;  instruction QPU program built by RaspberryPi4/Lib/v3dqpu.pi4, and
+;  then CHECKS EVERY OUTPUT BYTE ON THE CPU.
+;
+;  IT DOES NOT BELIEVE A STATUS BIT. CSD_STATUS.NUM_COMPLETED moving
+;  is necessary and nowhere near sufficient: a dispatcher that
+;  incremented a counter and ran nothing would look identical from the
+;  register side. The pass criterion is sixty-four bytes in the right
+;  places with the right contents, plus 4032 bytes of poison still
+;  intact after them.
+;
+; ======================================================================
+;  THE PROGRAM, AND WHY EACH INSTRUCTION IS THERE
+; ======================================================================
+;
+;    nop   sig=ldunifrf(rf0)   ; rf0 = the output base address
+;    nop   sig=ldunifrf(rf1)   ; rf1 = the pattern seed
+;    eidx  r0                  ; r0 = 0..15, THE LANE INDEX
+;    shl   r1, r0, 2           ; r1 = lane * 4
+;    add   r1, r1, rf0         ; r1 = base + lane * 4
+;    bor   r2, r0, rf1         ; r2 = seed | lane
+;    mov   tmud, r2            ; the datum
+;    mov   tmua, r1            ; the address - WRITING THIS FIRES IT
+;    tmuwt                     ; wait for the write to be accepted
+;    <the eight-instruction thread end>
+;
+;  THERE IS NO STORE INSTRUCTION ON THIS MACHINE. A QPU writes memory
+;  by putting the value in TMUD and then the address in TMUA; the
+;  write to TMUA is the store. TMUWT then waits for it, because a
+;  thread that ends with a write still in flight is a race with the
+;  CPU's read.
+;
+;  WHY THE DATUM IS SEED-OR-LANE AND NOT A CONSTANT.
+;
+;    A constant pattern proves something wrote. `seed | lane` proves
+;    SIXTEEN LANES each wrote, each to its own address, each with its
+;    own value. Those are different claims and the second is the one
+;    worth having: "the QPU is a 16-lane SIMD machine" is the entire
+;    reason this file exists, and a program that only demonstrated
+;    lane zero would have demonstrated a very slow CPU.
+;
+;    It also makes four failures distinguishable rather than one:
+;      the poison $A5A5A5A5 still there  - nothing wrote
+;      zeros                             - something wrote nothing
+;      the same word sixteen times       - one lane, or a broadcast
+;      the right words in wrong places   - the address arithmetic
+;
+;  WHY THE SEED COMES FROM A UNIFORM AND NOT A SMALL IMMEDIATE.
+;
+;    The forty-eight small immediates are 0..15, -16..-1 and sixteen
+;    powers of two (qpu_pack.c:239-264). $A5C30000 is none of them.
+;    Fetching it through the uniform stream also exercises CFG6 and
+;    the LDUNIFRF signal, which a draw will need anyway.
+;
+;  THE THREAD END IS EIGHT INSTRUCTIONS AND NOT SEVEN. See
+;  V3dQpuThreadEnd() in v3dqpu.pi4. Cutting any of them leaves a
+;  thread the dispatcher never sees finish, which is a hang and not a
+;  wrong answer.
+;
+; ======================================================================
+;  THE DISPATCH, AND THE TWO NUMBERS THAT LOOK LIKE EACH OTHER'S TYPO
+; ======================================================================
+;
+;  One workgroup of sixteen invocations, sixteen workgroups per
+;  supergroup. That is py-videocore6's own configuration
+;  (driver.py:318-337 with local_invocation=(16,1,1)) and it is
+;  chosen for exactly that reason: it is the shape somebody else has
+;  already run on real Pi 4s.
+;
+;  CFG3 comes out $0000F010 and CFG4 comes out 0. BATCHES_PER_SG_M1 is
+;  15 and the dispatch's own batch count minus one is 0, and those are
+;  different quantities: the first is how many batches ONE SUPERGROUP
+;  holds, the second is how many batches THE WHOLE DISPATCH will run.
+;  Mesa computes them at v3dx_draw.c:1518-1538 and py-videocore6 at
+;  driver.py:164 and :167 by a completely different route - `thread -
+;  1` rather than a batch count - and the two arrive at the same pair.
+;  v3d.pi4 follows Mesa's arithmetic; the agreement is a check.
+;
+;  CFG5's three low bits are flags and not address, so the program
+;  must be eight-byte aligned. Both v3dqpu.pi4 and v3d.pi4 refuse a
+;  misaligned one, in different files, on purpose.
+;
+; ======================================================================
+;  CACHE COHERENCY - THE REGIME, STATED
+; ======================================================================
+;
+;  THIS PROBE RUNS WITH THE ARM MMU OFF, deliberately and for the same
+;  reason pi4V3dTfu.pi4 does. It does not include mmu.pi4 and never
+;  calls MmuEnable(), so every access is Device-nGnRnE and there is no
+;  coherency question to have. The question being asked is "did a QPU
+;  execute this program", and the one regime where a cache cannot be
+;  the explanation for a wrong byte is the one that makes a mismatch
+;  mean what it says.
+;
+;  THE GPU'S OWN CACHES ARE A DIFFERENT QUESTION AND THE ARM MMU DOES
+;  NOT TOUCH IT. That is the lesson of this program's first run and it
+;  is worth the space.
+;
+;    On 2026-08-27 this probe dispatched, the dispatch COMPLETED -
+;    NUM_COMPLETED 1 to 2, CTL_INT_STS.CSDDONE set, MMU_CTL clean, no
+;    fault of any kind - and the output page still held every one of
+;    its 1024 poison words. With the ARM MMU off and every access
+;    Device-nGnRnE, the ARM side could not possibly have been the
+;    explanation, and that is exactly why the discipline was worth
+;    keeping: it left only one suspect.
+;
+;    A TMU WRITE LANDS IN THE CORE'S WRITE COMBINER AND ITS L2T CACHE.
+;    Nothing had told the core to write back. V3dCleanCaches() -
+;    v3d_gem.c:188-215, two steps, TMUWCF then an L2T CLEAN, both
+;    waited on - was added to v3d.pi4 and called from V3dCsdWait(),
+;    and the second run produced all sixteen words. The clean is
+;    structural now: a caller cannot forget it.
+;
+;    V3dInvalidateCaches() could never have fixed it and would have
+;    made it worse. It uses FLM_FLUSH, which INVALIDATES; the only
+;    copy of the output was in the cache it would have thrown away.
+;    FLUSH, CLEAR and CLEAN are three different operations with names
+;    that invite exactly this mistake - v3d_regs.h:255-261.
+;
+;  WHAT STILL CHANGES WITH THE ARM MMU ON AND DRAM CACHEABLE, which is
+;  a run that is owed and has never happened:
+;
+;    1. The QPU program and the uniform stream are written by the CPU
+;       and read by the GPU. They would sit in the CPU's caches and
+;       the GPU would fetch stale DRAM. V3dCsdSubmit() already cleans
+;       both by extent - V3dCacheRange over the code and the uniforms
+;       - so this direction is covered by construction.
+;    2. The OUTPUT is written by the GPU and read by the CPU. The
+;       CPU's caches may hold the poison this program wrote a moment
+;       earlier, and a read after the dispatch could return it - a
+;       perfect "the GPU wrote nothing" that would look identical to
+;       the failure above and have a completely different cause.
+;       V3dCsdSubmit() cleans the output range BEFORE the job; what a
+;       cacheable run additionally needs is an ARM-side INVALIDATE
+;       AFTER it, and there is no call for that yet.
+;
+;  So: the GPU-side clean is done and is proven on silicon. The
+;  ARM-side invalidate is NOT written and cannot be tested until there
+;  is a cacheable-DRAM run to test it in. Written here rather than
+;  discovered later, again.
+;
+; ======================================================================
+;  RUNNING IT
+; ======================================================================
+;
+;    pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dIdent.pi4 -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o _work\v3dident.img
+;    pmfc RaspberryPi4\Examples\Diagnostics\pi4V3dCsd.pi4   -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o _work\v3dcsd.img
+;
+;  `deadman 15` then `run <stage>`, always, where <stage> is the
+;  address `map` prints. Run the IDENT one first -
+;  this probe refuses to do anything if stage 0 has not passed, but
+;  its log will be harder to read than the one written for the
+;  purpose.
+;
+;  RESET THE BOARD AFTERWARDS, BEFORE ANY NON-V3D WORK. Measured on
+;  2026-08-27: running a V3D probe disturbs the EMMC clock, and a
+;  Wi-Fi payload run afterwards failed at "the firmware would not
+;  report the EMMC clock" until the board was power-cycled. That is a
+;  bench fact and not a theory.
+;
+; ======================================================================
+;  WHAT THE BOARD HAS TO ANSWER
+; ======================================================================
+;
+;    the QPU assembler built a program   `build OK` and 17 instructions
+;    the dispatcher accepted it          `submit OK`
+;    the dispatch completed              `completed` differs from before
+;    A QPU EXECUTED THE PROGRAM          `verdict: OK` and x0 = 64
+;    sixteen lanes each ran              all sixteen words differ
+;    the address arithmetic is right     each word is at its own offset
+;    nothing scribbled past the output   spill 0
+;
+;  A CSD_TIMEOUT with MMU_CTL clean is a dispatcher that did not
+;  start - look at CFG3 and CFG4 first, they are printed. A
+;  CSD_TIMEOUT with PT_INVALID set is a page table problem and
+;  MMU_VIO_ADDR names the address. A dispatch that COMPLETES and
+;  leaves the output as poison means the program ran and its TMU
+;  writes did not land, which is a different morning's work from
+;  either.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; ----------------------------------------------------------------------
+;  THE MEMORY MAP. Identity-mapped through the V3D MMU: VA equals PA,
+;  which is what pi4V3dTfu.pi4 did and for the same reason - the
+;  addresses printed in a failure are then the addresses a reader can
+;  compare against this list without a translation step.
+;
+;  The page table covers VA $000000..$FFFFFF (4096 entries) and every
+;  page in it is INVALID until mapped. Page 0 is never mapped, so an
+;  address register that was never written faults instead of pointing
+;  at something real.
+; ----------------------------------------------------------------------
+#CSD_PT       = $640000    ; V3D page table
+#CSD_PT_BYTES = 16384      ; 4096 entries
+#CSD_ILLEGAL  = $648000    ; MMU illegal-address page
+#CSD_CODE     = $650000    ; the QPU program
+#CSD_UNIF     = $651000    ; the uniform stream
+#CSD_OUT      = $652000    ; where the shader writes
+#CSD_PAGE     = 4096
+
+; Sixteen lanes, one 32-bit word each.
+#CSD_LANES     = 16
+#CSD_OUT_BYTES = 64
+
+; THE SEED. Not a small immediate - see the header. The low four bits
+; are zero so that `seed | lane` is unambiguous, and the top bits are
+; recognisable in a hex dump.
+#CSD_SEED = $A5C30000
+
+#CSD_POISON_WORD = $A5A5A5A5 ; the guard word memory.pi4:1223 uses
+
+; The dispatch shape. py-videocore6's own, see the header.
+#CSD_WG_X      = 1
+#CSD_WG_Y      = 1
+#CSD_WG_Z      = 1
+#CSD_WG_SIZE   = 16
+#CSD_WGS_PER_SG = 16
+
+; 100 ms, the kernel's own order of magnitude for a V3D wait.
+#CSD_WAIT_US = 100000
+
+; Magic write addresses, spelled out so a reader can follow the shader
+; without a second file open. qpu_instr.h:90-137.
+#MW_R0   = 0
+#MW_R1   = 1
+#MW_R2   = 2
+#MW_NULL = 6
+#MW_TMUD = 11
+#MW_TMUA = 12
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA and not PeekB. PeekB names the SIGNED .b and sign-extends,
+    ; so a byte above 127 would come back negative and this loop would
+    ; never see its terminator.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    c = PeekA(*name + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+  While i < width
+    PutC(32)
+    i = i + 1
+  Wend
+EndProcedure
+
+; 28 wide, for pi4V3dTfu.pi4's reason: a 24-wide column printed its
+; longest label hard against the value with no space at all.
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutS("$")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutS("  ")
+  PutPad(*name, 28)
+  PutDec(v)
+  PutNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The error codes, spelled out. A number alone sends the reader back
+;  to the library to look it up, and one run should be enough.
+; ----------------------------------------------------------------------
+Procedure PutErrName(e.i)
+  Select e
+    Case #V3D_OK
+      PutS("OK")
+    Case #V3D_ERR_BRIDGE_LEGACY
+      PutS("BRIDGE_LEGACY - $FE00A020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_BRIDGE_RPIVID
+      PutS("BRIDGE_RPIVID - $FEC11020 is not 'brdg'. MAPPING.")
+    Case #V3D_ERR_PM_DEAD
+      PutS("PM_DEAD - PM_GRAFX read all-ones. PM base is wrong.")
+    Case #V3D_ERR_RESET
+      PutS("RESET - V3DRSTN did not stick. Password or offset.")
+    Case #V3D_ERR_ASB_MASTER
+      PutS("ASB_MASTER - master bridge ACK never cleared.")
+    Case #V3D_ERR_ASB_SLAVE
+      PutS("ASB_SLAVE - slave bridge ACK never cleared.")
+    Case #V3D_ERR_IDENT_ZERO
+      PutS("IDENT_ZERO - present but dark. Clock or reset.")
+    Case #V3D_ERR_IDENT_ONES
+      PutS("IDENT_ONES - nothing answers there. Mapping.")
+    Case #V3D_ERR_IDENT_VERSION
+      PutS("IDENT_VERSION - answering, and not V3D 4.2.")
+    Case #V3D_ERR_IDENT_CORES
+      PutS("IDENT_CORES - V3D 4.2, but NCORES is not 1.")
+    Case #V3D_ERR_NOINIT
+      PutS("NOINIT - stage 2 asked for before V3dInit() passed.")
+    Case #V3D_ERR_MMU_ABSENT
+      PutS("MMU_ABSENT - HUB_IDENT2.WITH_MMU is clear.")
+    Case #V3D_ERR_MMU_ALIGN
+      PutS("MMU_ALIGN - an address is not aligned enough.")
+    Case #V3D_ERR_MMU_RANGE
+      PutS("MMU_RANGE - a page is outside the table or is page 0.")
+    Case #V3D_ERR_MMU_FLUSH
+      PutS("MMU_FLUSH - TLB clear or MMUC flush never finished.")
+    Case #V3D_ERR_MMU_OFF
+      PutS("MMU_OFF - the V3D MMU is not on. No page table.")
+    Case #V3D_ERR_MMU_FAULT
+      PutS("MMU_FAULT - a page table walk failed. See VIO_ADDR.")
+    Case #V3D_ERR_CSD_ARGS
+      PutS("CSD_ARGS - the dispatch cannot be encoded.")
+    Case #V3D_ERR_CSD_BUSY
+      PutS("CSD_BUSY - a dispatch was current or queued already.")
+    Case #V3D_ERR_CSD_TIMEOUT
+      PutS("CSD_TIMEOUT - NUM_COMPLETED never moved. Nothing ran.")
+    Case #V3D_ERR_CACHE_TIMEOUT
+      PutS("CACHE_TIMEOUT - TMUWCF or the L2T clean never finished.")
+    Default
+      PutS("unknown code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure PutQpuErrName(e.i)
+  Select e
+    Case #V3DQ_OK
+      PutS("OK")
+    Case #V3DQ_ERR_ADD_OP
+      PutS("ADD_OP - that ADD operation is not encoded.")
+    Case #V3DQ_ERR_MUL_OP
+      PutS("MUL_OP - that MUL operation is not encoded.")
+    Case #V3DQ_ERR_SIG
+      PutS("SIG - no 4.2 code for that combination of signals.")
+    Case #V3DQ_ERR_SIG_LDVPM
+      PutS("SIG_LDVPM - LDVPM has no 4.2 encoding at all.")
+    Case #V3DQ_ERR_FLAGS
+      PutS("FLAGS - that combination of conditions cannot pack.")
+    Case #V3DQ_ERR_FLAGS_SIG
+      PutS("FLAGS_SIG - flags asked for beside a loading signal.")
+    Case #V3DQ_ERR_PACK
+      PutS("PACK - output pack not legal for that operation.")
+    Case #V3DQ_ERR_UNPACK
+      PutS("UNPACK - input unpack not legal for that operation.")
+    Case #V3DQ_ERR_SMALLIMM
+      PutS("SMALLIMM - not one of the forty-eight.")
+    Case #V3DQ_ERR_RANGE
+      PutS("RANGE - a waddr, mux or raddr is out of its field.")
+    Case #V3DQ_ERR_FULL
+      PutS("FULL - the program buffer has no room.")
+    Case #V3DQ_ERR_NOBUF
+      PutS("NOBUF - V3dQpuProgramBegin() was never called.")
+    Case #V3DQ_ERR_BRANCH
+      PutS("BRANCH - a branch field is out of range.")
+    Case #V3DQ_ERR_HAZARD
+      PutS("HAZARD - the sequence breaks a p37 restriction.")
+    Case #V3DQ_ERR_SMIMM_CLASH
+      PutS("SMIMM_CLASH - immediate and a mux-7 register read.")
+    Default
+      PutS("unknown code ")
+      PutDec(e)
+  EndSelect
+EndProcedure
+
+Procedure PutHazardName(h.i)
+  Select h
+    Case #V3DQ_HZ_NONE
+      PutS("none")
+    Case #V3DQ_HZ_UNITS
+      PutS("UNITS - more than one of TMU/SFU/TSY/TLB/VPM")
+    Case #V3DQ_HZ_SFU_SFU
+      PutS("SFU_SFU - an SFU write too soon after another")
+    Case #V3DQ_HZ_SFU_R4
+      PutS("SFU_R4 - r4 touched within two of an SFU write")
+    Case #V3DQ_HZ_THRSW_NEAR
+      PutS("THRSW_NEAR - two thread switches too close")
+    Case #V3DQ_HZ_THRSW_BR
+      PutS("THRSW_BR - a thread switch in a branch delay slot")
+    Case #V3DQ_HZ_RF_THREND
+      PutS("RF_THREND - a register file write after THREND")
+    Case #V3DQ_HZ_BR_BR
+      PutS("BR_BR - a branch in a branch delay slot")
+    Case #V3DQ_HZ_BR_THRSW
+      PutS("BR_THRSW - a branch in a thread switch delay slot")
+    Case #V3DQ_HZ_UNIF_VARY
+      PutS("UNIF_VARY - an LDUNIF straight after an LDVARY")
+    Case #V3DQ_HZ_NO_THREND
+      PutS("NO_THREND - the program never ends")
+    Case #V3DQ_HZ_TWO_LAST
+      PutS("TWO_LAST - two last-THRSW markers")
+    Default
+      PutS("unknown ")
+      PutDec(h)
+  EndSelect
+EndProcedure
+
+; ======================================================================
+;  THE SHADER
+; ======================================================================
+;
+;  Returns #V3DQ_OK or the first refusal. V3dQpuHazardName() carries
+;  the reason if it was a hazard.
+; ----------------------------------------------------------------------
+Procedure.i BuildShader()
+  Define r.i
+
+  r = V3dQpuProgramBegin(#CSD_CODE, #CSD_PAGE)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; The two uniforms, in the order the stream holds them. Each is a
+  ; NOP carrying the LDUNIFRF signal, whose destination lives in the
+  ; condition field - which is why an instruction with one of these
+  ; may not also carry a condition.
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 0, 0)    ; rf0 = output base
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 1, 0)    ; rf1 = seed
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; eidx r0. Zero-source: BOTH mux fields carry the operation's
+  ; identity, so the values passed are ignored and substituted.
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, #MW_R0, 1)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; shl r1, r0, 2. The 2 is small immediate index 2, on mux 7.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, #MW_R1, 1, #V3DQ_MUX_R0, 0, 2)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; add r1, r1, rf0. Mux 6 is raddr_a, which holds 0 - rf0.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_ADD, #MW_R1, 1, #V3DQ_MUX_R1, #V3DQ_MUX_A)
+  V3dQpuRaddr(0, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; bor r2, r0, rf1. The ADD half's OR; raddr_a is now 1 - rf1.
+  V3dQpuReset()
+  V3dQpuAdd(#V3DQ_A_OR, #MW_R2, 1, #V3DQ_MUX_R0, #V3DQ_MUX_A)
+  V3dQpuRaddr(1, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; mov tmud, r2 - the data register. Nothing happens yet.
+  r = V3dQpuMov(#MW_TMUD, 1, #V3DQ_MUX_R2, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; mov tmua, r1 - WRITING THE ADDRESS REGISTER IS THE STORE.
+  r = V3dQpuMov(#MW_TMUA, 1, #V3DQ_MUX_R1, 0)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ; tmuwt. Without it the thread can end with the store in flight.
+  r = V3dQpuAdd0(#V3DQ_A_TMUWT, #MW_NULL, 1)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+; ======================================================================
+;  VERIFICATION
+; ======================================================================
+
+Global badCount.i   = 0
+Global badLane.i    = -1
+Global badWant.i    = 0
+Global badGot.i     = 0
+Global distinct.i   = 0
+Global spillCount.i = 0
+
+; ----------------------------------------------------------------------
+;  VerifyOutput - all sixteen words, and the reason each is checked.
+;
+;  Word `i` must be exactly #CSD_SEED | i, at offset i*4. That single
+;  equation covers three separate claims at once and they are worth
+;  naming, because a partial pass says which one broke:
+;    - the seed arrived through the uniform stream;
+;    - the lane index arrived from EIDX and differed per lane;
+;    - the address arithmetic put each lane's word at its own offset.
+;
+;  Returns the number of words that were right.
+; ----------------------------------------------------------------------
+Procedure.i VerifyOutput()
+  Define i.i
+  Define want.i
+  Define got.i
+  Define ok.i
+  Define j.i
+  Define same.i
+
+  badCount = 0
+  badLane  = -1
+  badWant  = 0
+  badGot   = 0
+  ok       = 0
+
+  i = 0
+  While i < #CSD_LANES
+    want = #CSD_SEED | i
+    got  = PeekN(#CSD_OUT + (i * 4))
+    If got = want
+      ok = ok + 1
+    Else
+      badCount = badCount + 1
+      If badLane < 0
+        badLane = i
+        badWant = want
+        badGot  = got
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+
+  ; HOW MANY DISTINCT VALUES CAME BACK, counted separately from
+  ; whether they are the right ones. Sixteen identical words is a
+  ; completely different finding from sixteen wrong ones: the first
+  ; says one lane ran or the result was broadcast, the second says
+  ; the arithmetic is wrong. Counted by comparing each word against
+  ; all the earlier ones, which at sixteen is 120 comparisons and
+  ; needs no sort.
+  distinct = 0
+  i = 0
+  While i < #CSD_LANES
+    got  = PeekN(#CSD_OUT + (i * 4))
+    same = 0
+    j = 0
+    While j < i
+      If PeekN(#CSD_OUT + (j * 4)) = got
+        same = 1
+      EndIf
+      j = j + 1
+    Wend
+    If same = 0
+      distinct = distinct + 1
+    EndIf
+    i = i + 1
+  Wend
+
+  ProcedureReturn ok
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  VerifySpill - the rest of the page must still be poison.
+;
+;  A shader whose address arithmetic overflowed by one lane, or whose
+;  TMU wrote a whole cache line, would pass the sixteen-word check and
+;  fail this one. Without it "the output is right" would mean "the
+;  first sixty-four bytes are right", which is a weaker claim than it
+;  reads as.
+;
+;  Returns the number of words that were NOT poison.
+; ----------------------------------------------------------------------
+Procedure.i VerifySpill()
+  Define i.i
+  Define n.i
+  spillCount = 0
+  i = #CSD_OUT_BYTES / 4
+  n = #CSD_PAGE / 4
+  While i < n
+    If PeekN(#CSD_OUT + (i * 4)) <> #CSD_POISON_WORD
+      spillCount = spillCount + 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn spillCount
+EndProcedure
+
+Procedure Dump(base.i, words.i)
+  Define i.i
+  i = 0
+  While i < words
+    If (i % 4) = 0
+      PutS("  ")
+      PutHex(base + (i * 4), 8)
+      PutS(":")
+    EndIf
+    PutS(" ")
+    PutHex(PeekN(base + (i * 4)), 8)
+    If (i % 4) = 3
+      PutNl()
+    EndIf
+    i = i + 1
+  Wend
+  If (words % 4) <> 0
+    PutNl()
+  EndIf
+EndProcedure
+
+; ======================================================================
+Procedure Main()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define ok.i
+  Define spill.i
+
+  PutNl()
+  PutS("=== Pi 4 V3D stage 2 - the CSD. Did a QPU run a program? ===")
+  PutNl()
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. Stage 0 first, and it is a precondition and not a formality.
+  ;     Nothing below may run against a block that has not identified
+  ;     itself: the CSD is a bus master and V3D 7.1 puts a different
+  ;     register at $FEC04904.
+  ; ------------------------------------------------------------------
+  r = V3dInit()
+  PutS("0   stage 0, from v3d.pi4: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    RowHex("HUB_IDENT1", V3dIdent1())
+    PutNl()
+    PutS("verdict: STAGE0")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowHex("HUB_IDENT1", V3dIdent1())
+  RowDec("QPUs", V3dSlicesOf(V3dCoreIdent1()) * V3dQpusPerSliceOf(V3dCoreIdent1()))
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  1. The QPU program.
+  ; ------------------------------------------------------------------
+  PutS("1   the QPU program: ")
+  r = BuildShader()
+  PutQpuErrName(r)
+  PutNl()
+  If r <> #V3DQ_OK
+    PutS("    hazard: ")
+    PutHazardName(V3dQpuHazardName())
+    PutNl()
+    RowDec("instructions built", V3dQpuCount())
+    PutNl()
+    PutS("verdict: ASSEMBLER")
+    PutNl()
+    PutS("=== NO PROGRAM WAS BUILT, SO NOTHING WAS DISPATCHED ===")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("instructions", V3dQpuCount())
+  RowDec("bytes", V3dQpuProgramBytes())
+  RowHex("code address", V3dQpuProgramAddr())
+  PutNl()
+  PutS("    the program, hi then lo:")
+  PutNl()
+  n = V3dQpuProgramBytes() / 8
+  i = 0
+  While i < n
+    PutS("    ")
+    If i < 10
+      PutS(" ")
+    EndIf
+    PutDec(i)
+    PutS("  ")
+    PutHex(PeekN(#CSD_CODE + (i * 8) + 4), 8)
+    PutS(" ")
+    PutHex(PeekN(#CSD_CODE + (i * 8)), 8)
+    PutNl()
+    i = i + 1
+  Wend
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  2. The uniform stream and the output page.
+  ; ------------------------------------------------------------------
+  PokeN(#CSD_UNIF, #CSD_OUT)
+  PokeN(#CSD_UNIF + 4, #CSD_SEED)
+
+  ; POISON THE WHOLE OUTPUT PAGE, not just the sixty-four bytes the
+  ; shader should touch. "Wrote nothing", "wrote zeros" and "wrote
+  ; past the end" are then three distinguishable answers instead of
+  ; one ambiguous one.
+  i = 0
+  n = #CSD_PAGE / 4
+  While i < n
+    PokeN(#CSD_OUT + (i * 4), #CSD_POISON_WORD)
+    i = i + 1
+  Wend
+
+  PutS("2   the buffers:")
+  PutNl()
+  RowHex("uniform stream", #CSD_UNIF)
+  RowHex("  unif[0] = out base", PeekN(#CSD_UNIF))
+  RowHex("  unif[1] = seed", PeekN(#CSD_UNIF + 4))
+  RowHex("output page", #CSD_OUT)
+  RowHex("output poisoned with", #CSD_POISON_WORD)
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  3. The V3D MMU. The CSD's addresses are virtual - see the
+  ;     library's stage 2 header, and note that for the CSD this is
+  ;     an inference rather than a quotation.
+  ; ------------------------------------------------------------------
+  PutS("3   the V3D MMU: ")
+  r = V3dMmuInit(#CSD_PT, #CSD_PT_BYTES, #CSD_ILLEGAL)
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    RowHex("MMU_CTL", V3dMmuCtlNow())
+    PutNl()
+    PutS("verdict: MMU")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dMmuMap(#CSD_CODE, #CSD_CODE, #CSD_PAGE)
+  If r <> #V3D_OK
+    PutS("    mapping the code page: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dMmuMap(#CSD_UNIF, #CSD_UNIF, #CSD_PAGE)
+  If r <> #V3D_OK
+    PutS("    mapping the uniform page: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dMmuMap(#CSD_OUT, #CSD_OUT, #CSD_PAGE)
+  If r <> #V3D_OK
+    PutS("    mapping the output page: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("pages mapped", V3dMmuPagesMapped())
+  RowHex("MMU_CTL", V3dMmuCtlNow())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  4. The dispatch.
+  ; ------------------------------------------------------------------
+  r = V3dCsdBegin(#CSD_WG_X, #CSD_WG_Y, #CSD_WG_Z, #CSD_WG_SIZE, #CSD_WGS_PER_SG)
+  PutS("4   the dispatch: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    PutS("verdict: CSD_ARGS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; No flags. py-videocore6 dispatches its own kernels with all three
+  ; clear (driver.py:147-149) and this program is integer-only, so
+  ; PROPAGATE_NANS - which Mesa sets unconditionally on 4.2 - cannot
+  ; change a byte here. THREADING must be clear: V3dQpuThreadEnd()
+  ; builds a one-thread program.
+  r = V3dCsdCode(#CSD_CODE, V3dQpuProgramBytes(), 0)
+  If r <> #V3D_OK
+    PutS("    the code word: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = V3dCsdUniforms(#CSD_UNIF, 8)
+  If r <> #V3D_OK
+    PutS("    the uniform word: ")
+    PutErrName(r)
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  V3dCsdOutput(#CSD_OUT, #CSD_PAGE)
+
+  ; THE SEVEN CONFIGURATION WORDS, PRINTED BEFORE SUBMISSION. A
+  ; dispatch that does nothing is nearly always a wrong CFG3, and
+  ; reading the register back afterwards reads what the hardware kept
+  ; rather than what was asked for.
+  i = 0
+  While i < 7
+    PutS("    CFG")
+    PutDec(i)
+    PutS("  $")
+    PutHex(V3dCsdCfg(i), 8)
+    PutNl()
+    i = i + 1
+  Wend
+  PutNl()
+
+  RowHex("CSD_STATUS before", V3dCsdStatusNow())
+
+  r = V3dCsdSubmit()
+  PutS("5   submit: ")
+  PutErrName(r)
+  PutNl()
+  If r <> #V3D_OK
+    RowHex("CSD_STATUS", V3dCsdStatusNow())
+    RowHex("MMU_CTL", V3dMmuCtlNow())
+    PutNl()
+    PutS("verdict: SUBMIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = V3dCsdWait(#CSD_WAIT_US)
+  PutS("6   wait: ")
+  PutErrName(r)
+  PutNl()
+  RowDec("completed before", V3dCsdDoneBefore())
+  RowDec("completed after", V3dCsdDoneAfter())
+  RowDec("spins", V3dCsdSpins())
+  ; THE CACHE CLEAN, and it is printed because its absence was the
+  ; whole of the first run's failure. A TMU write lands in the core's
+  ; write combiner and L2T; without the clean the CPU reads DRAM that
+  ; the GPU has not reached yet, and every symptom points at the
+  ; dispatcher instead.
+  RowDec("clean result", V3dCsdCleanResult())
+  RowDec("clean spins", V3dCleanSpins())
+  RowHex("CSD_STATUS after", V3dCsdStatusAfter())
+  RowHex("CTL_INT_STS", V3dCsdIntStsAfter())
+  RowHex("CORE ERR_STAT", V3dCsdErrStatAfter())
+  RowHex("MMU_CTL", V3dCsdMmuCtlAfter())
+  RowHex("MMU_VIO_ADDR", V3dCsdVioAddrAfter())
+  RowHex("MMU_VIO_ID", V3dCsdVioIdAfter())
+  ; MMU hits and misses are printed and NOT believed. Stage 1 saw
+  ; both read zero on a run where translation demonstrably happened,
+  ; so these two counters are not what this project assumed they were.
+  RowDec("MMU hits (NOT TRUSTED)", V3dMmuHitsNow())
+  RowDec("MMU misses (NOT TRUSTED)", V3dMmuMissesNow())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  7. THE BYTES. Printed whether or not the wait succeeded, because
+  ;     a timeout with the right bytes in memory would be the single
+  ;     most useful thing this program could ever discover and
+  ;     stopping early would hide it.
+  ; ------------------------------------------------------------------
+  PutS("7   the output, sixteen words:")
+  PutNl()
+  Dump(#CSD_OUT, #CSD_LANES)
+  PutNl()
+
+  ok    = VerifyOutput()
+  spill = VerifySpill()
+
+  RowDec("words correct", ok)
+  RowDec("words wrong", badCount)
+  RowDec("distinct values", distinct)
+  RowDec("words past the output", spill)
+  If badLane >= 0
+    RowDec("first wrong lane", badLane)
+    RowHex("  wanted", badWant)
+    RowHex("  got", badGot)
+  EndIf
+  PutNl()
+
+  If r <> #V3D_OK
+    PutS("verdict: CSD_UNVERIFIED")
+    PutNl()
+    PutS("=== THE DISPATCH DID NOT COMPLETE ===")
+    PutNl()
+    PutS("Read MMU_CTL first. Clean means the dispatcher never")
+    PutNl()
+    PutS("started - check CFG3 and CFG4 above. PT_INVALID set means")
+    PutNl()
+    PutS("a page table problem and MMU_VIO_ADDR names the address.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  If ok <> #CSD_LANES
+    PutS("verdict: CSD_UNVERIFIED")
+    PutNl()
+    PutS("=== THE DISPATCH COMPLETED AND THE BYTES ARE WRONG ===")
+    PutNl()
+    If distinct = 1
+      PutS("One distinct value in sixteen slots: either one lane ran")
+      PutNl()
+      PutS("or the result was broadcast. That is not a SIMD machine.")
+      PutNl()
+    EndIf
+    ProcedureReturn 0
+  EndIf
+
+  If spill <> 0
+    PutS("verdict: CSD_SPILL")
+    PutNl()
+    PutS("=== SIXTEEN WORDS ARE RIGHT AND SOMETHING WROTE PAST THEM ===")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  If distinct <> #CSD_LANES
+    PutS("verdict: CSD_LANES")
+    PutNl()
+    PutS("=== THE WORDS ARE RIGHT AND NOT ALL DISTINCT ===")
+    PutNl()
+    PutS("That cannot happen with seed|lane and is a bug in this")
+    PutNl()
+    PutS("program's own counting, not in the GPU.")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("verdict: OK")
+  PutNl()
+  PutS("=== A QPU EXECUTED A PROGRAM. 64 BYTES VERIFIED ON THE CPU ===")
+  PutNl()
+  PutS("Sixteen lanes, sixteen distinct values, each at its own")
+  PutNl()
+  PutS("offset, and 4032 bytes of poison after them untouched.")
+  PutNl()
+  PutS("The assembler, the dispatcher and the TMU write path all")
+  PutNl()
+  PutS("work. RESET THE BOARD BEFORE ANY NON-V3D PAYLOAD.")
+  PutNl()
+  ProcedureReturn #CSD_OUT_BYTES
+EndProcedure

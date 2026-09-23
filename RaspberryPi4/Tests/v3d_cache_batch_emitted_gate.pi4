@@ -1,0 +1,55 @@
+; ======================================================================
+;  Pi 4 V3D cache-range batch emitted gate
+; ======================================================================
+; Desk-only. The host checker runs this image in the A64 interpreter and
+; observes DC CIVAC plus DSB/ISB. It performs no MMIO and makes no board
+; claim. The production V3D library is included, not copied.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+Global Dim vcbResult.i[19]
+
+Procedure.i Main()
+  ; Three accepted disjoint extents, including an unaligned two-line span,
+  ; must finish with one and only one barrier pair.
+  vcbResult[0] = V3dCacheBatchBegin()
+  vcbResult[1] = V3dCacheBatchRange($0010003F, 2)
+  vcbResult[2] = V3dCacheBatchRange($00100100, 64)
+  vcbResult[3] = V3dCacheBatchRange($100000040, 64)
+  vcbResult[4] = V3dCacheBatchEnd()
+
+  ; A wrapped exclusive end poisons the transaction and emits no cache
+  ; operation or barrier when no earlier range was accepted.
+  vcbResult[5] = V3dCacheBatchBegin()
+  vcbResult[6] = V3dCacheBatchRange($7FFFFFFFFFFFFFC0, 128)
+  vcbResult[7] = V3dCacheBatchEnd()
+
+  ; Address zero is a valid physical address for cache maintenance; this
+  ; owner layer deliberately does not impose the engine's bus aperture.
+  vcbResult[8] = V3dCacheBatchBegin()
+  vcbResult[9] = V3dCacheBatchRange(0, 1)
+  vcbResult[10] = V3dCacheBatchEnd()
+
+  ; The legacy one-range API keeps its independent one-barrier behaviour.
+  V3dCacheRange($00100201, 64)
+  V3dCacheRange($00100400, 0)
+
+  ; Misuse stays observable rather than opening or closing hidden state.
+  vcbResult[11] = V3dCacheBatchRange($00100400, 64)
+  vcbResult[12] = V3dCacheBatchEnd()
+
+  ; Signed-negative addresses and zero-byte intervals are rejected before
+  ; either can reach the line walk, and both poison their transaction.
+  vcbResult[13] = V3dCacheBatchBegin()
+  vcbResult[14] = V3dCacheBatchRange(-1, 1)
+  vcbResult[15] = V3dCacheBatchEnd()
+  vcbResult[16] = V3dCacheBatchBegin()
+  vcbResult[17] = V3dCacheBatchRange($00100400, 0)
+  vcbResult[18] = V3dCacheBatchEnd()
+  ProcedureReturn @vcbResult[0]
+EndProcedure

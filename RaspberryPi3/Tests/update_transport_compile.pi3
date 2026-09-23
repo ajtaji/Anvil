@@ -1,0 +1,69 @@
+; Compile/emission fixture for the Pi 3 serial update transport.  The updater
+; functions are deterministic stubs here; storage and slot behavior have their
+; own gate.  This fixture proves the real parser/framer builds on the Pi3 A64
+; target without changing the monitor build counter.
+XIncludeFile "RaspberryPi3/Lib/timer.pbi"
+XIncludeFile "RaspberryPi3/Lib/uart.pbi"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+
+Global gate_received.i
+Global gate_error.i
+Global gate_slot.i
+Global gate_generation.i
+#PI3_UPDATE_SOURCE_SERIAL = 1
+Procedure.i Pi3UpdateResetReady() : ProcedureReturn 0 : EndProcedure
+Procedure.i Pi3UpdateResetNow() : ProcedureReturn 0 : EndProcedure
+Global gate_pending_slot.i = -1
+Global gate_pending_generation.i
+
+Procedure.i Pi3UpdateBegin(length.i, digest.i)
+  If length <= 0 Or digest = 0 : gate_error = 1 : ProcedureReturn 0 : EndIf
+  gate_received = 0 : gate_error = 0
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3UpdateBeginFrom(owner.i,length.i,digest.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateBegin(length,digest)
+EndProcedure
+Procedure.i Pi3UpdateChunk(offset.i, source.i, length.i)
+  If offset <> gate_received Or source = 0 Or length < 1 Or length > 1024
+    gate_error = 2 : ProcedureReturn 0
+  EndIf
+  gate_received = gate_received + length
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3UpdateChunkFrom(owner.i,offset.i,source.i,length.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateChunk(offset,source,length)
+EndProcedure
+Procedure.i Pi3UpdateCommit()
+  If gate_error <> 0 Or gate_received = 0 : ProcedureReturn 0 : EndIf
+  gate_pending_slot = 1 : gate_pending_generation = 2
+  ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3UpdateCommitFrom(owner.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Pi3UpdateCommit()
+EndProcedure
+Procedure Pi3UpdateAbort() : gate_received = 0 : EndProcedure
+Procedure.i Pi3UpdateAbortFrom(owner.i)
+  If owner<>#PI3_UPDATE_SOURCE_SERIAL : gate_error=18 : ProcedureReturn 0 : EndIf
+  Pi3UpdateAbort() : ProcedureReturn 1
+EndProcedure
+Procedure.i Pi3UpdateReceived() : ProcedureReturn gate_received : EndProcedure
+Procedure.i Pi3UpdateError() : ProcedureReturn gate_error : EndProcedure
+Procedure.i Pi3UpdateSlot() : ProcedureReturn gate_slot : EndProcedure
+Procedure.i Pi3UpdateGeneration() : ProcedureReturn gate_generation : EndProcedure
+Procedure.i Pi3UpdatePendingSlot() : ProcedureReturn gate_pending_slot : EndProcedure
+Procedure.i Pi3UpdatePendingGeneration() : ProcedureReturn gate_pending_generation : EndProcedure
+
+XIncludeFile "RaspberryPi3/Lib/update_transport.pbi"
+
+Procedure Main()
+  ; Reach parser, framing and output without entering the infinite live loop.
+  pi3_ut_line[0] = 104 : pi3_ut_line[1] = 101 : pi3_ut_line[2] = 108
+  pi3_ut_line[3] = 112 : pi3_ut_line_len = 4
+  pi3ut_Command()
+  pi3ut_Ack(1024, 0)
+EndProcedure

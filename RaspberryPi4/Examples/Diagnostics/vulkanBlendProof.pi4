@@ -1,0 +1,38 @@
+; vulkanBlendProof.pi4 - exact Vulkan source-over acceptance scene.
+;
+; DIAGNOSTIC. IT DOES NOT SHIP. This is the blend-enabled variant of the
+; two-pass Vulkan triangle proof. It uses only public Vulkan entry points and
+; asks for exactly the one blend equation Anvil accepts:
+;
+;   color/alpha op: ADD
+;   source factor:  SRC_ALPHA
+;   dest factor:    ONE_MINUS_SRC_ALPHA
+;   write mask:     RGBA
+;   logic op:       disabled
+;
+; Both passes clear to opaque blue. Pass one draws half-alpha red and must
+; read back purple ($BF80007F); pass two draws half-alpha green after its own
+; clear and must read back teal ($BF00807F). These are V3D's complementary
+; 128/255 and 127/255 UNORM factors. Outside samples must remain blue
+; ($FF0000FF). Thus disabled blending, swapped factors, a missing master bit,
+; or an inherited disabled-path blend mask cannot satisfy the pixel oracle.
+;
+; The normal triangle proof remains the disabled-blend control. This wrapper
+; deliberately shares its full guard, V3D-job, BCL-viewport, fence, pixel and
+; teardown oracle instead of growing a second copy that could drift.
+;
+; Desk build:
+;   PureMetalForge.exe --compile \
+;       RaspberryPi4/Examples/Diagnostics/vulkanBlendProof.pi4 -t pi4 \
+;       --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;       -o vulkanBlendProof.img
+;
+; Visual acceptance on a future explicitly authorized board run: a solid
+; teal triangle on blue, held for six seconds. The returned 64-word report is
+; laid out exactly as vulkanTriangleProof.pi4; slots 1 and 4 must both be zero,
+; slots 14..16 must be FF0000FF, BF80007F, BF00807F, and slot 47 must be one.
+
+#VTP_BLEND_PROOF = 1
+#VTP_LIST_PROOF = 0
+#VTP_INDEXED_PROOF = 0
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanTriangleProofBody.pbi"

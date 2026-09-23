@@ -1,0 +1,156 @@
+; Executed-code gate for portable wall-clock anchoring and SNTP validation.
+
+Global gate_ticks.i
+Procedure.i Ticks()
+  ProcedureReturn gate_ticks
+EndProcedure
+Procedure.i TickHz()
+  ProcedureReturn 1000
+EndProcedure
+
+XIncludeFile "Anvil/Core/wallclock.pbi"
+XIncludeFile "Anvil/Core/sntp_codec.pbi"
+
+#GATE_SERVER_IP = $0100000A
+#GATE_LOCAL_PORT = 49191
+#GATE_NONCE_SEC = $12345678
+#GATE_NONCE_FRAC = $9ABCDEF0
+
+Global Dim gate_pkt.a[64]
+
+Procedure gate_Put32(pos.i, v.i)
+  PokeB(@gate_pkt[0] + pos, (v >> 24) & $FF)
+  PokeB(@gate_pkt[0] + pos + 1, (v >> 16) & $FF)
+  PokeB(@gate_pkt[0] + pos + 2, (v >> 8) & $FF)
+  PokeB(@gate_pkt[0] + pos + 3, v & $FF)
+EndProcedure
+
+Procedure GateGoodReply(ntpSeconds.i, fraction.i)
+  Define i.i
+  i = 0
+  While i < 64
+    gate_pkt[i] = 0
+    i = i + 1
+  Wend
+  gate_pkt[0] = (#SNTP_VERSION << 3) | #SNTP_MODE_SERVER
+  gate_pkt[1] = 2
+  gate_Put32(24, #GATE_NONCE_SEC)
+  gate_Put32(28, #GATE_NONCE_FRAC)
+  gate_Put32(40, ntpSeconds)
+  gate_Put32(44, fraction)
+EndProcedure
+
+Procedure.i GateParse(n.i, srcIp.i, srcPort.i, dstPort.i)
+  ProcedureReturn SntpParseReply(@gate_pkt[0], n, srcIp, srcPort, dstPort, #GATE_SERVER_IP, #GATE_LOCAL_PORT)
+EndProcedure
+
+Procedure.i GateStarts(*s, *want)
+  Define i.i
+  Define a.i
+  Define b.i
+  i = 0
+  b = PeekB(*want) & $FF
+  While b <> 0
+    a = PeekB(*s + i) & $FF
+    If a <> b
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+    b = PeekB(*want + i) & $FF
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+
+  ; Request is exactly 48 zero-initialized bytes except the v4/client header
+  ; and opaque transmit timestamp used as the response nonce.
+  If SntpBuildRequest(@gate_pkt[0], 47, #GATE_NONCE_SEC, #GATE_NONCE_FRAC) <> 0 : ProcedureReturn 1 : EndIf
+  If SntpBuildRequest(@gate_pkt[0], 64, 0, 0) <> 0 : ProcedureReturn 2 : EndIf
+  If SntpBuildRequest(@gate_pkt[0], 64, #GATE_NONCE_SEC, #GATE_NONCE_FRAC) <> 48 : ProcedureReturn 3 : EndIf
+  If (PeekB(@gate_pkt[0]) & $FF) <> $23 : ProcedureReturn 4 : EndIf
+  If sntp_Get32(@gate_pkt[40]) <> #GATE_NONCE_SEC Or sntp_Get32(@gate_pkt[44]) <> #GATE_NONCE_FRAC : ProcedureReturn 5 : EndIf
+  i = 1
+  While i < 40
+    If gate_pkt[i] <> 0 : ProcedureReturn 6 : EndIf
+    i = i + 1
+  Wend
+
+  ; A valid pre-rollover response is accepted and decoded.
+  GateGoodReply(3997900800, $80000000)
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 1 : ProcedureReturn 7 : EndIf
+  If SntpReplyEpoch() <> 1788912000 Or SntpReplyFraction() <> $80000000 Or SntpReplyStratum() <> 2 : ProcedureReturn 8 : EndIf
+
+  ; Era 1 after the 2036 rollover is selected by the accepted civil range.
+  GateGoodReply(123010304, 1)
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 1 : ProcedureReturn 9 : EndIf
+  If SntpReplyEpoch() <> 2208988800 : ProcedureReturn 10 : EndIf
+
+  ; Exact packet and endpoint ownership checks.
+  GateGoodReply(3997900800, 1)
+  If GateParse(47, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_SHORT : ProcedureReturn 11 : EndIf
+  If GateParse(48, #GATE_SERVER_IP + 1, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_TUPLE : ProcedureReturn 12 : EndIf
+  If GateParse(48, #GATE_SERVER_IP, 124, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_TUPLE : ProcedureReturn 13 : EndIf
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT + 1) <> 0 Or SntpLastError() <> #SNTP_ERR_TUPLE : ProcedureReturn 14 : EndIf
+
+  gate_pkt[0] = (3 << 3) | #SNTP_MODE_SERVER
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_VERSION : ProcedureReturn 15 : EndIf
+  gate_pkt[0] = (#SNTP_VERSION << 3) | 5
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_MODE : ProcedureReturn 16 : EndIf
+  gate_pkt[0] = (3 << 6) | (#SNTP_VERSION << 3) | #SNTP_MODE_SERVER
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_UNSYNC : ProcedureReturn 17 : EndIf
+  gate_pkt[0] = (#SNTP_VERSION << 3) | #SNTP_MODE_SERVER
+
+  gate_pkt[1] = 0
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_STRATUM : ProcedureReturn 18 : EndIf
+  gate_pkt[1] = 16
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_STRATUM : ProcedureReturn 19 : EndIf
+  gate_pkt[1] = 2
+
+  gate_Put32(28, #GATE_NONCE_FRAC + 1)
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_NONCE : ProcedureReturn 20 : EndIf
+  gate_Put32(28, #GATE_NONCE_FRAC)
+  gate_Put32(40, 0)
+  gate_Put32(44, 0)
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_ZERO_TIME : ProcedureReturn 21 : EndIf
+  gate_Put32(40, 2100000000)
+  If GateParse(48, #GATE_SERVER_IP, #SNTP_PORT, #GATE_LOCAL_PORT) <> 0 Or SntpLastError() <> #SNTP_ERR_ERA : ProcedureReturn 22 : EndIf
+  If SntpReplyEpoch() <> #WALLCLOCK_UNKNOWN : ProcedureReturn 23 : EndIf
+
+  ; Fractional anchoring, provenance, age, and UTC-default caption.
+  gate_ticks = 10000
+  If WallClockSetNtp(1788912000, $80000000) = 0 : ProcedureReturn 24 : EndIf
+  If WallClockValid() = 0 Or WallClockTrusted() = 0 Or WallClockSource() <> #WALLCLOCK_SRC_SNTP : ProcedureReturn 25 : EndIf
+  If WallClockNow() <> 1788912000 Or WallClockMicros() <> 500000 : ProcedureReturn 26 : EndIf
+  gate_ticks = gate_ticks + 500
+  If WallClockNow() <> 1788912001 Or WallClockAge() <> 1 : ProcedureReturn 27 : EndIf
+  If GateStarts(WallClockCaption(), "09/09/2026 12:00:01 AM UTC") = 0 : ProcedureReturn 28 : EndIf
+
+  If WallClockSetZone(0 - 18000) = 0 : ProcedureReturn 29 : EndIf
+  If GateStarts(WallClockCaption(), "09/08/2026 07:00:01 PM UTC-05:00") = 0 : ProcedureReturn 30 : EndIf
+
+  ; Named Central time follows the US rule changes and labels CST/CDT.
+  If WallClockSetZoneName("America/Chicago") = 0 : ProcedureReturn 31 : EndIf
+  If GateStarts(WallClockZoneName(), "America/Chicago") = 0 : ProcedureReturn 32 : EndIf
+  If WallClockOffsetAt(1768435200) <> -21600 Or WallClockOffsetAt(1784073600) <> -18000 : ProcedureReturn 33 : EndIf
+  If WallClockOffsetAt(1772956799) <> -21600 Or WallClockOffsetAt(1772956800) <> -18000 : ProcedureReturn 34 : EndIf
+  If WallClockOffsetAt(1793516399) <> -18000 Or WallClockOffsetAt(1793516400) <> -21600 : ProcedureReturn 35 : EndIf
+  gate_ticks = 20000
+  If WallClockSet(1784073600, #WALLCLOCK_SRC_SNTP) = 0 : ProcedureReturn 36 : EndIf
+  If GateStarts(WallClockCaption(), "07/14/2026 07:00:00 PM CDT") = 0 : ProcedureReturn 37 : EndIf
+  If WallClockSetZoneName("America/Nowhere") <> 0 Or WallClockLastError() <> #WALLCLOCK_ERR_ZONE : ProcedureReturn 38 : EndIf
+  If WallClockSetCivilLocal(2026, 3, 8, 2, 30, 0, #WALLCLOCK_SRC_MANUAL) <> 0 : ProcedureReturn 39 : EndIf
+  If WallClockSetCivilLocal(2026, 11, 1, 1, 30, 0, #WALLCLOCK_SRC_MANUAL) <> 0 : ProcedureReturn 40 : EndIf
+
+  ; Restored state is a usable floor, not trusted evidence or a FAT stamp.
+  If WallClockSet(1788912000, #WALLCLOCK_SRC_RESTORED) = 0 : ProcedureReturn 41 : EndIf
+  If WallClockValid() = 0 Or WallClockTrusted() <> 0 : ProcedureReturn 42 : EndIf
+  If WallClockFatDate() <> 0 Or WallClockFatTime() <> 0 : ProcedureReturn 43 : EndIf
+  If GateStarts(WallClockCaption(), "Time not synchronized") = 0 : ProcedureReturn 44 : EndIf
+  WallClockUseUtcDefault()
+  If WallClockZoneConfigured() <> 0 : ProcedureReturn 45 : EndIf
+  If WallClockSet(1788912000, #WALLCLOCK_SRC_MANUAL) = 0 : ProcedureReturn 46 : EndIf
+  If GateStarts(WallClockCaption(), "Manual: 09/09/2026 12:00:00 AM UTC") = 0 : ProcedureReturn 47 : EndIf
+  ProcedureReturn 0
+EndProcedure

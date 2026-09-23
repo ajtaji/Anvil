@@ -1,0 +1,285 @@
+; pi4MmuIdentity.pi4 - STAGE 1. Build identity page tables, dump them,
+;                      turn the MMU on, prove the board still works,
+;                      turn it off again and hand the monitor back.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   pmfc pi4MmuIdentity.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o mmuid.img
+;
+; ----------------------------------------------------------------------
+; WHAT THIS IS FOR
+; ----------------------------------------------------------------------
+; Stage 1's goal is a NON-EVENT. Nothing is cached before and nothing is
+; cached after; every address means what it meant; every driver's DMA
+; coherency is untouched. If the console is still alive on the far side
+; of the enabling instruction, then the descriptor format, the TCR and
+; MAIR programming, the table walk and the enable sequence are all
+; correct - and stages 2, 3 and 4 become changes of attribute bits on a
+; mechanism that has been proven rather than a leap.
+;
+; See RaspberryPi4/Lib/mmu.pi4's STAGE 1 section for the map, the
+; geometry and the citation behind every constant.
+;
+; ----------------------------------------------------------------------
+; THE ORDER OF OPERATIONS, WHICH IS THE ENTIRE SAFETY DESIGN
+; ----------------------------------------------------------------------
+; A hang with the MMU half-enabled gives no console and no clue. So
+; EVERYTHING THAT CAN BE CHECKED IS CHECKED AND PRINTED BEFORE THE
+; SWITCH, and the switch is the last thing that happens:
+;
+;   1. print the pre-state, so a failure later has a baseline
+;   2. build the tables - this only writes DRAM and is perfectly safe
+;   3. DUMP THE TABLES and let a human read them against the map
+;   4. re-arm the deadman, so the full ~15.999 s covers the switch
+;   5. enable
+;   6. print a marker - if this appears, the map is right
+;   7. read SCTLR_EL2 back and confirm bit 0 is now set
+;   8. disable
+;   9. print the post-state and return to the monitor, MMU off
+;
+; Step 3 is the one that earns its place. The table builder is ordinary
+; code writing ordinary memory, and its output is completely inspectable
+; with the MMU still off. Every bug that would hang the board at step 5
+; is visible at step 3 to anyone willing to read sixteen hex digits.
+;
+; ----------------------------------------------------------------------
+; WHERE THE TABLES GO, AND WHY THERE
+; ----------------------------------------------------------------------
+; $00600000 - six megabytes, inside the monitor's LOW payload window
+; (up to $07EFFFFF; its base is above the monitor and `map` prints it),
+; clear of this payload's own image wherever it was staged, and far below
+; the payload stack top this is built with. It is 2 MiB aligned and
+; therefore certainly 4 KiB
+; aligned, which MmuBuildTables() requires and checks.
+;
+; It is a constant here rather than inside the library on purpose: where
+; the tables live is a POLICY decision belonging to whoever owns the
+; memory map, and a library that hard-coded it would be wrong the first
+; time somebody wanted them somewhere else.
+#TABLES = $00600000
+
+; ----------------------------------------------------------------------
+; THE BENCH PROCEDURE, AND WHAT EACH OUTCOME MEANS
+; ----------------------------------------------------------------------
+;   pmf> deadman 15
+;   pmf> map              <- it prints `stage a file at <stage>`. The
+;                            --load-addr above does not pin the image.
+;   pmf> receive <stage> <len> <crc>
+;   pmf> run <stage>
+;
+; ARM THE DEADMAN. It is the difference between a fifteen-second delay
+; and somebody walking to the bench. The monitor's deadman covers the
+; whole payload including the switch; this probe ALSO re-arms it
+; immediately before the enable so that the full ~15.999 s ceiling is
+; ahead of the dangerous instruction rather than partly spent on the
+; table dump. Both are the same PM watchdog, and it is already counting
+; before the MMU changes, so a bad map cannot stop it firing.
+;
+; OUTCOME A - everything prints, "MMU OFF AGAIN" appears, prompt returns.
+;   STAGE 1 PASSES. The tables, the attributes and the enable sequence
+;   are all correct. Report the SCTLR_EL2 values from steps 1, 7 and 9.
+;
+; OUTCOME B - output stops exactly after "ENABLING NOW".
+;   The map or the enable sequence is wrong. This is the expected shape
+;   of a stage 1 failure and it is not alarming: the deadman fires
+;   within ~16 s, the board resets, the firmware reloads kernel8.img,
+;   and Anvil comes back with the MMU off because the stub enters it
+;   that way. NOTHING TO REVERT - this is a payload; anvil.img was never
+;   touched. Report the last line printed and the table dump above it.
+;
+; OUTCOME C - output stops during the table dump, before "ENABLING NOW".
+;   Nothing to do with the MMU. That is ordinary code writing ordinary
+;   DRAM with the MMU still off, so it is a UART or transfer problem,
+;   or #TABLES is somewhere it should not be.
+;
+; OUTCOME D - "THIS BUILD CANNOT ENABLE" appears and the probe stops
+;   before the switch. Not a hardware result. The image was built while
+;   #MMU_HAVE_EL2_REGS was still 0, i.e. before the A64 assembler
+;   learned TTBR0_EL2, TCR_EL2 and MAIR_EL2. Rebuild once it has.
+;
+; OUTCOME E - the board does not come back at all after ~20 s.
+;   The deadman did not fire. POWER-CYCLE IT. That is the full cost -
+;   the board is not damaged and nothing needs reverting or reflashing.
+;   Worth reporting, because a deadman that failed to fire is a separate
+;   and more interesting bug than a bad page table.
+;
+; WHAT WOULD TELL YOU IT WENT SUBTLY WRONG RATHER THAN LOUDLY WRONG:
+; the probe completes but SCTLR_EL2 at step 7 does NOT have bit 0 set.
+; That means the enable sequence ran and the MMU did not come on, which
+; is worse than a hang because it looks like a pass. The probe checks
+; this itself and says so rather than leaving it to the reader.
+;
+; AND ONE THING THAT IS NOT A FAULT: the console may get FASTER. DRAM is
+; Normal Non-Cacheable after the switch rather than Device, so writes
+; can be gathered. That is a correct result. See ONE DELIBERATE
+; DEPARTURE in RaspberryPi4/Lib/mmu.pi4 for why DRAM is Normal NC and
+; not Device.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*label, v.i)
+  UartWriteStr(*label)
+  UartWrite(36)                 ; the dollar sign that marks hex here
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Say(*s)
+  UartWriteStr(*s)
+  UartWriteNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DumpTables - the whole point of step 3.
+;
+;  Prints every level-1 slot that is not a fault, and the three level-2
+;  slots that matter: the last DRAM slot, the first peripheral slot, and
+;  the slot holding the ARM-local window. Printing all 512 level-2 slots
+;  would be minutes of console and would bury the four numbers that
+;  actually decide whether this works.
+;
+;  READ THESE AGAINST THE MAP in RaspberryPi4/Lib/mmu.pi4. What each
+;  should be:
+;
+;    L1 slot 0   $0000000000000<70D>   Normal NC at PA 0
+;    L1 slot 1   $000000004000070D     Normal NC at PA $40000000
+;    L1 slot 2   $000000008000070D     Normal NC at PA $80000000
+;    L1 slot 3   $0000000000601003     TABLE, pointing at #TABLES+4096
+;    L1 slot 24  $0000000600000401     Device at PA $600000000
+;    L1 slot 31  $00000007C0000401     Device at PA $7C0000000
+;    L2 slot 479 $00000000FBE0070D     Normal NC, the top of DRAM
+;    L2 slot 480 $00000000FC000401     Device, the peripheral aperture
+;    L2 slot 508 $00000000FF800401     Device, the ARM-local window
+;
+;  THE TWO THAT MATTER MOST are L1 slot 24 - if that is zero, USB dies
+;  the moment anything touches the VL805 - and L2 slot 508, because
+;  without it core 1 can never be released.
+; ----------------------------------------------------------------------
+Procedure DumpTables()
+  Define i.i
+
+  Say("level 1, the slots that are mapped:")
+  For i = 0 To #MMU_L1_ENTRIES - 1
+    If MmuDescriptor(#TABLES, i) <> 0
+      UartWriteStr("  L1 slot ")
+      PrintDec(i)
+      UartWriteStr("  ")
+      UartWrite(36)
+      PutHex16(MmuDescriptor(#TABLES, i))
+      UartWriteNl()
+    EndIf
+  Next
+
+  Say("level 2, the three boundaries that decide it:")
+  Row("  L2 slot 479 top of DRAM   ", MmuDescriptorL2(#TABLES, 479))
+  Row("  L2 slot 480 peripherals   ", MmuDescriptorL2(#TABLES, 480))
+  Row("  L2 slot 508 ARM-local     ", MmuDescriptorL2(#TABLES, 508))
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define before.i
+  Define during.i
+  Define after.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  Say("pi4MmuIdentity - stage 1, identity map, nothing cached")
+  UartWriteNl()
+
+  ; ---- 1. the pre-state --------------------------------------------
+  before = MmuSctlrEl2()
+  Row("SCTLR_EL2 before  ", before)
+  Row("exception level   ", MmuEl())
+  Row("MMU on before     ", MmuEnabled())
+  UartWriteNl()
+
+  ; ---- 2. build ------------------------------------------------------
+  Row("tables at         ", #TABLES)
+  rc = MmuBuildTables(#TABLES)
+  Row("build returned    ", rc)
+  If rc <> 0
+    Say("REFUSED. See #MMU_ERR_* in RaspberryPi4/Lib/mmu.pi4.")
+    Say("Nothing was enabled. The board is untouched.")
+    UartDrain()
+    ProcedureReturn rc
+  EndIf
+  UartWriteNl()
+
+  ; ---- 3. dump -------------------------------------------------------
+  DumpTables()
+  UartWriteNl()
+
+  ; ---- 4. can this build even do it? --------------------------------
+  If MmuBuildable() = 0
+    Say("THIS BUILD CANNOT ENABLE - #MMU_HAVE_EL2_REGS is 0, so the")
+    Say("A64 assembler had no encoding for TTBR0_EL2 / TCR_EL2 /")
+    Say("MAIR_EL2 when this image was built. The tables above are")
+    Say("real and were checked; the switch was NOT attempted.")
+    Say("Rebuild once the assembler has them. Outcome D.")
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 5. the switch -------------------------------------------------
+  ; Re-arm so the whole ceiling is ahead of the dangerous instruction
+  ; rather than partly spent printing the dump above.
+  SafetyWatchdogStart(15)
+
+  Say("ENABLING NOW - if this is the last line you see, outcome B:")
+  Say("the deadman resets the board in ~16 s and Anvil returns with")
+  Say("the MMU off. Nothing to revert.")
+  UartDrain()
+
+  MmuEnable()
+
+  ; ---- 6. we are alive on the other side ----------------------------
+  Say("ALIVE - the console works with the MMU ON.")
+  during = MmuSctlrEl2()
+  Row("SCTLR_EL2 during  ", during)
+  Row("MMU on during     ", MmuEnabled())
+
+  ; ---- 7. the silent-failure check ----------------------------------
+  If MmuEnabled() = 0
+    Say("WRONG: the enable sequence ran and bit 0 is still clear.")
+    Say("The MMU did NOT come on. This looks like a pass and is not.")
+  EndIf
+  UartWriteNl()
+  UartDrain()
+
+  ; ---- 8. put it back ------------------------------------------------
+  MmuDisable()
+
+  ; ---- 9. the post-state ---------------------------------------------
+  after = MmuSctlrEl2()
+  Row("SCTLR_EL2 after   ", after)
+  Row("MMU on after      ", MmuEnabled())
+  If after = before
+    Say("MMU OFF AGAIN - SCTLR_EL2 is byte for byte what it was.")
+    Say("STAGE 1 PASSES. Outcome A.")
+  Else
+    Say("MMU off, but SCTLR_EL2 did not return to its entry value.")
+    Say("Report both numbers - something other than bit 0 moved.")
+  EndIf
+
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure

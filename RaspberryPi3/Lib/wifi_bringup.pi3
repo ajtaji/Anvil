@@ -1,0 +1,520 @@
+; Pi 3 Wi-Fi board-data helpers.
+;
+; This file has no controller or radio writes. It resolves the MAC address
+; from the firmware-provided flattened device tree and substitutes that
+; address into a board NVRAM text file before the CYW43 NVRAM cooker runs.
+
+#PI3_WIFI_FDT_MAGIC = $D00DFEED
+#PI3_WIFI_FDT_MAX_BYTES = $100000
+#PI3_WIFI_FDT_MAX_DEPTH = 32
+#PI3_WIFI_NVRAM_MAX_BYTES = 16384
+#PI3_WIFI_FW_BYTES = 399344
+#PI3_WIFI_CLM_BYTES = 4733
+#PI3_WIFI_READ_CHUNK = 4096
+#PI3_WIFI_UPLOAD_SCRATCH_BYTES = 2048
+
+Global pi3_wifi_bringup_stage.i
+Global pi3_wifi_bringup_profile.i
+Global pi3_wifi_mac_override.i
+Global pi3_wifi_mac_result.i
+Global Dim pi3_wifi_selected_mac.a[6]
+
+Procedure.i p3wfBe32(p.i)
+  ProcedureReturn (((PeekA(p) & $FF) << 24) | ((PeekA(p + 1) & $FF) << 16) | ((PeekA(p + 2) & $FF) << 8) | (PeekA(p + 3) & $FF)) & $FFFFFFFF
+EndProcedure
+
+Procedure.i p3wfEqual(p.i, limit.i, text.i)
+  Protected n.i
+  For n = 0 To 255
+    If p + n >= limit : ProcedureReturn 0 : EndIf
+    If (PeekA(p + n) & $FF) <> (PeekA(text + n) & $FF) : ProcedureReturn 0 : EndIf
+    If PeekA(text + n) = 0 : ProcedureReturn 1 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i p3wfListHas(p.i, bytes.i, text.i)
+  Protected at.i, n.i, e.i, equal.i
+  at = 0
+  While at < bytes
+    n = 0
+    While at + n < bytes And PeekA(p + at + n) <> 0 : n = n + 1 : Wend
+    If at + n >= bytes : ProcedureReturn 0 : EndIf
+    e = 0
+    While PeekA(text + e) <> 0 : e = e + 1 : Wend
+    equal = (e = n)
+    If equal <> 0
+      For e = 0 To n - 1
+        If (PeekA(p + at + e) & $FF) <> (PeekA(text + e) & $FF) : equal = 0 : Break : EndIf
+      Next
+    EndIf
+    at = at + n + 1
+    If equal <> 0 : ProcedureReturn 1 : EndIf
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i p3wfPrefix(p.i, bytes.i, text.i)
+  Protected n.i
+  n = 0
+  While PeekA(text + n) <> 0
+    If n >= bytes Or (PeekA(p + n) & $FF) <> (PeekA(text + n) & $FF) : ProcedureReturn 0 : EndIf
+    n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i Pi3WifiMacValid(*mac)
+  Protected i.i
+  Protected allZero.i = 1
+  Protected allFF.i = 1
+  If *mac = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To 5
+    If (PeekA(*mac + i) & $FF) <> 0 : allZero = 0 : EndIf
+    If (PeekA(*mac + i) & $FF) <> $FF : allFF = 0 : EndIf
+  Next
+  If allZero <> 0 Or allFF <> 0 Or (PeekA(*mac) & 1) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Extract only /soc/<SDHCI-compatible node at 0x7e300000>/wifi@1 identity.
+; Match the host by its Device Tree compatible list and reg address, as Linux
+; does, rather than depending on the firmware's node spelling (the pinned Pi 3
+; Model B DTB calls it mmcnr@7e300000). The child must carry
+; brcm,bcm4329-fmac and reg=<1>; Ethernet and Bluetooth properties elsewhere
+; in the DTB are never considered.
+Procedure.i Pi3WifiReadLocalMacFromDtb(*dtb, *dtbEnd, *outMac)
+  Protected total.i, structOff.i, stringsOff.i, reserveOff.i
+  Protected structBytes.i, stringsBytes.i, struct.i, structEnd.i
+  Protected strings.i, stringsEnd.i, token.i, depth.i, nameLen.i
+  Protected propLen.i, nameOff.i, propName.i, scan.i, idx.i
+  Protected hostReg.i, hostCompat.i, targetName.i, targetCompat.i, targetReg.i
+  Protected host.i, candidate.i, found.i, selected.i
+  Protected macPtr.i, localPtr.i, addressPtr.i, macLen.i
+  Protected rootCells.i, value.i
+  Protected Dim nodeHost.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeSoc.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeHostCandidate.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeHostReg.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeHostCompat.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeTarget.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeTargetName.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeTargetCompat.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeTargetReg.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeMac.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeLocal.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeAddress.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeMacLen.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeLocalLen.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  Protected Dim nodeAddressLen.i[#PI3_WIFI_FDT_MAX_DEPTH]
+  If *dtb = 0 Or *dtbEnd <= *dtb Or *outMac = 0 : ProcedureReturn 0 : EndIf
+  If *dtbEnd - *dtb < 40 Or p3wfBe32(*dtb) <> #PI3_WIFI_FDT_MAGIC : ProcedureReturn 0 : EndIf
+  total = p3wfBe32(*dtb + 4)
+  If total < 40 Or total > #PI3_WIFI_FDT_MAX_BYTES Or total > *dtbEnd - *dtb : ProcedureReturn 0 : EndIf
+  If p3wfBe32(*dtb + 20) < 17 Or p3wfBe32(*dtb + 24) > 17 : ProcedureReturn 0 : EndIf
+  structOff = p3wfBe32(*dtb + 8) : stringsOff = p3wfBe32(*dtb + 12) : reserveOff = p3wfBe32(*dtb + 16)
+  stringsBytes = p3wfBe32(*dtb + 32) : structBytes = p3wfBe32(*dtb + 36)
+  If reserveOff < 40 Or (reserveOff & 7) <> 0 Or reserveOff > total - 16 : ProcedureReturn 0 : EndIf
+  If structOff < 40 Or (structOff & 3) <> 0 Or structBytes < 4 Or structOff > total - structBytes : ProcedureReturn 0 : EndIf
+  If stringsOff < 40 Or stringsBytes < 1 Or stringsOff > total - stringsBytes : ProcedureReturn 0 : EndIf
+  If structOff < stringsOff + stringsBytes And stringsOff < structOff + structBytes : ProcedureReturn 0 : EndIf
+  struct = *dtb + structOff : structEnd = struct + structBytes
+  strings = *dtb + stringsOff : stringsEnd = strings + stringsBytes
+  depth = 0 : found = 0
+  While struct <= structEnd - 4
+    token = p3wfBe32(struct) : struct = struct + 4
+    Select token
+      Case 1
+        If depth >= #PI3_WIFI_FDT_MAX_DEPTH : ProcedureReturn 0 : EndIf
+        scan = struct : nameLen = 0
+        While scan < structEnd And PeekA(scan) <> 0 And nameLen < 256
+          scan = scan + 1 : nameLen = nameLen + 1
+        Wend
+        If scan >= structEnd Or nameLen = 256 : ProcedureReturn 0 : EndIf
+        idx = depth
+        nodeHost[idx] = 0 : nodeSoc[idx] = 0 : nodeHostCandidate[idx] = 0
+        nodeHostReg[idx] = 0 : nodeHostCompat[idx] = 0
+        nodeTarget[idx] = 0 : nodeTargetName[idx] = 0 : nodeTargetCompat[idx] = 0 : nodeTargetReg[idx] = 0
+        nodeMac[idx] = 0 : nodeLocal[idx] = 0 : nodeAddress[idx] = 0
+        nodeMacLen[idx] = 0 : nodeLocalLen[idx] = 0 : nodeAddressLen[idx] = 0
+        If depth = 1 And nameLen = 3 And p3wfEqual(struct, struct + nameLen + 1, "soc") <> 0
+          nodeSoc[idx] = 1
+        EndIf
+        If depth = 2 And nodeSoc[depth - 1] <> 0
+          nodeHostCandidate[idx] = 1
+        EndIf
+        If depth > 0 And nodeHost[depth - 1] <> 0 : nodeTarget[idx] = 1 : EndIf
+        If nodeTarget[idx] <> 0 And nameLen = 6 And p3wfEqual(struct, struct + nameLen + 1, "wifi@1") <> 0
+          nodeTargetName[idx] = 1
+        EndIf
+        struct = (scan + 4) & $FFFFFFFFFFFFFFFC
+        depth = depth + 1
+      Case 2
+        If depth < 1 : ProcedureReturn 0 : EndIf
+        idx = depth - 1
+        If nodeHostCandidate[idx] <> 0 And nodeHostReg[idx] <> 0 And nodeHostCompat[idx] <> 0
+          nodeHost[idx] = 1
+        EndIf
+        If nodeTarget[idx] <> 0 And nodeTargetName[idx] <> 0 And nodeTargetCompat[idx] <> 0 And nodeTargetReg[idx] <> 0
+          candidate = 0
+          macPtr = 0 : macLen = 0
+          If nodeMac[idx] <> 0 And nodeMacLen[idx] = 6 And Pi3WifiMacValid(nodeMac[idx]) <> 0
+            macPtr = nodeMac[idx] : macLen = nodeMacLen[idx] : candidate = 1
+          ElseIf nodeLocal[idx] <> 0 And nodeLocalLen[idx] = 6 And Pi3WifiMacValid(nodeLocal[idx]) <> 0
+            macPtr = nodeLocal[idx] : macLen = nodeLocalLen[idx] : candidate = 1
+          ElseIf nodeAddress[idx] <> 0 And nodeAddressLen[idx] = 6 And Pi3WifiMacValid(nodeAddress[idx]) <> 0
+            macPtr = nodeAddress[idx] : macLen = nodeAddressLen[idx] : candidate = 1
+          EndIf
+          If candidate <> 0
+            found = found + 1
+            If found > 1 : ProcedureReturn 0 : EndIf
+            For scan = 0 To 5 : PokeA(*outMac + scan, PeekA(macPtr + scan)) : Next
+          EndIf
+        EndIf
+        depth = depth - 1
+      Case 3
+        If depth < 1 Or struct > structEnd - 8 : ProcedureReturn 0 : EndIf
+        propLen = p3wfBe32(struct) : nameOff = p3wfBe32(struct + 4) : struct = struct + 8
+        If propLen > structEnd - struct Or nameOff >= stringsBytes : ProcedureReturn 0 : EndIf
+        propName = strings + nameOff : scan = propName
+        While scan < stringsEnd And PeekA(scan) <> 0 And scan - propName < 256 : scan = scan + 1 : Wend
+        If scan >= stringsEnd Or scan - propName >= 256 : ProcedureReturn 0 : EndIf
+        idx = depth - 1
+        If nodeHostCandidate[idx] <> 0
+          If p3wfEqual(propName, stringsEnd, "compatible") <> 0
+            If p3wfListHas(struct, propLen, "brcm,bcm2835-sdhci") <> 0 : nodeHostCompat[idx] = 1 : EndIf
+          ElseIf p3wfEqual(propName, stringsEnd, "reg") <> 0 And propLen >= 4
+            If p3wfBe32(struct) = $7E300000 : nodeHostReg[idx] = 1 : EndIf
+          EndIf
+          If nodeHostCompat[idx] <> 0 And nodeHostReg[idx] <> 0 : nodeHost[idx] = 1 : EndIf
+        ElseIf nodeTarget[idx] <> 0 And nodeTargetName[idx] <> 0
+          If p3wfEqual(propName, stringsEnd, "compatible") <> 0
+            If p3wfListHas(struct, propLen, "brcm,bcm4329-fmac") <> 0 : nodeTargetCompat[idx] = 1 : EndIf
+          ElseIf p3wfEqual(propName, stringsEnd, "reg") <> 0 And propLen = 4
+            If p3wfBe32(struct) = 1 : nodeTargetReg[idx] = 1 : EndIf
+          ElseIf p3wfEqual(propName, stringsEnd, "mac-address") <> 0
+            nodeMac[idx] = struct : nodeMacLen[idx] = propLen
+          ElseIf p3wfEqual(propName, stringsEnd, "local-mac-address") <> 0
+            nodeLocal[idx] = struct : nodeLocalLen[idx] = propLen
+          ElseIf p3wfEqual(propName, stringsEnd, "address") <> 0
+            nodeAddress[idx] = struct : nodeAddressLen[idx] = propLen
+          EndIf
+        EndIf
+        struct = (struct + propLen + 3) & $FFFFFFFFFFFFFFFC
+      Case 4
+        ; NOP.
+      Case 9
+        If depth <> 0 Or struct <> structEnd : ProcedureReturn 0 : EndIf
+        ProcedureReturn found = 1
+      Default
+        ProcedureReturn 0
+    EndSelect
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i p3wfWrite(*dst, capacity.i, *src, bytes.i, *written)
+  Protected at.i, i.i
+  at = PeekL(*written)
+  If bytes < 0 Or at < 0 Or bytes > capacity - at : ProcedureReturn 0 : EndIf
+  For i = 0 To bytes - 1 : PokeA(*dst + at + i, PeekA(*src + i)) : Next
+  PokeL(*written, at + bytes)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i p3wfWriteMac(*dst, capacity.i, *written, *mac)
+  Protected i.i, v.i, digit.i, at.i
+  at = PeekL(*written)
+  For i = 0 To 5
+    v = PeekA(*mac + i) & $FF
+    If at + 2 > capacity : ProcedureReturn 0 : EndIf
+    digit = v >> 4 : If digit < 10 : digit = digit + 48 : Else : digit = digit + 87 : EndIf
+    PokeA(*dst + at, digit) : at = at + 1
+    digit = v & 15 : If digit < 10 : digit = digit + 48 : Else : digit = digit + 87 : EndIf
+    PokeA(*dst + at, digit) : at = at + 1
+    If i < 5
+      If at >= capacity : ProcedureReturn 0 : EndIf
+      PokeA(*dst + at, $3A) : at = at + 1
+    EndIf
+  Next
+  PokeL(*written, at)
+  ProcedureReturn 1
+EndProcedure
+
+; Match brcmfmac's preinit address policy. A DT address is set on the running
+; firmware before CLM/event/WLC_UP; absent DT data leaves the packaged NVRAM
+; untouched, then reads the firmware's cur_etheraddr. Only the exact known
+; placeholder is replaced, using the hardware RNG and readback verification.
+#PI3_WIFI_CURETHER_NAMELEN = 13
+#PI3_WIFI_MAC_RNG_TIMEOUT_US = 1000000
+Procedure.i Pi3WifiFinalizeMac()
+  Protected Dim current.a[6]
+  Protected Dim randomBytes.a[8]
+  Protected Dim desired.a[6]
+  Protected i.i, same.i, needsSet.i
+  pi3_wifi_mac_result = 0
+  If pi3_wifi_mac_override <> 0
+    ; Like brcmfmac's valid platform-address branch, a valid DTB address is
+    ; authoritative; firmware's prior cur_etheraddr is not a prerequisite.
+    For i = 0 To 5 : desired[i] = pi3_wifi_selected_mac[i] : Next
+    needsSet = 1
+    pi3_wifi_mac_result = 2
+  Else
+    If Cyw43MacAddress(@current[0], 2000) <> #CYW43_IO_OK
+      pi3_wifi_mac_result = 10
+      ProcedureReturn 0
+    EndIf
+    If Pi3WifiMacValid(@current[0]) = 0
+      pi3_wifi_mac_result = 11
+      ProcedureReturn 0
+    EndIf
+    same = 1
+    If (current[0] & $FF) <> $00 Or (current[1] & $FF) <> $90 Or (current[2] & $FF) <> $4C Or (current[3] & $FF) <> $C5 Or (current[4] & $FF) <> $12 Or (current[5] & $FF) <> $38
+      same = 0
+    EndIf
+    If same <> 0
+      If Pi3WifiRngBytes(@randomBytes[0], 8, #PI3_WIFI_MAC_RNG_TIMEOUT_US) <> 8
+        pi3_wifi_mac_result = 12
+        ProcedureReturn 0
+      EndIf
+      For i = 0 To 5 : desired[i] = randomBytes[i] : Next
+      desired[0] = (desired[0] & $FE) | $02
+      If Pi3WifiMacValid(@desired[0]) = 0
+        pi3_wifi_mac_result = 13
+        ProcedureReturn 0
+      EndIf
+      needsSet = 1
+      pi3_wifi_mac_result = 3
+    Else
+      For i = 0 To 5 : desired[i] = current[i] : Next
+      pi3_wifi_mac_result = 1
+    EndIf
+  EndIf
+  If needsSet <> 0
+    If Cyw43SetIovarData(?p3wf_cur_etheraddr, #PI3_WIFI_CURETHER_NAMELEN, @desired[0], 6, 2000) <> #CYW43_IO_OK
+      pi3_wifi_mac_result = 14
+      ProcedureReturn 0
+    EndIf
+    If Cyw43MacAddress(@current[0], 2000) <> #CYW43_IO_OK
+      pi3_wifi_mac_result = 15
+      ProcedureReturn 0
+    EndIf
+    For i = 0 To 5
+      If current[i] <> desired[i]
+        pi3_wifi_mac_result = 16
+        ProcedureReturn 0
+      EndIf
+    Next
+  EndIf
+  For i = 0 To 5 : pi3_wifi_selected_mac[i] = desired[i] : Next
+  ProcedureReturn 1
+EndProcedure
+
+; Return output byte count, or zero on invalid MAC, bounds, or capacity.
+; Every existing macaddr/il0macaddr assignment is rewritten. If either is
+; absent, a runtime value is appended so a sample NVRAM MAC is never used.
+Procedure.i Pi3WifiNvramWithMac(*src, length.i, *mac, *dst, capacity.i)
+  Protected at.i, lineEnd.i, bodyEnd.i, keyLen.i, written.i
+  Protected haveMac.i, haveIl0.i, newline.i
+  If *src = 0 Or *dst = 0 Or *src = *dst Or length < 1 Or length > #PI3_WIFI_NVRAM_MAX_BYTES Or capacity < 1
+    ProcedureReturn 0
+  EndIf
+  If Pi3WifiMacValid(*mac) = 0 : ProcedureReturn 0 : EndIf
+  at = 0 : written = 0 : haveMac = 0 : haveIl0 = 0
+  While at < length
+    lineEnd = at
+    While lineEnd < length And PeekA(*src + lineEnd) <> 10 : lineEnd = lineEnd + 1 : Wend
+    bodyEnd = lineEnd
+    If bodyEnd > at And PeekA(*src + bodyEnd - 1) = 13 : bodyEnd = bodyEnd - 1 : EndIf
+    keyLen = p3wfPrefix(*src + at, bodyEnd - at, "macaddr=")
+    If keyLen = 8
+      If p3wfWrite(*dst, capacity, *src + at, 8, @written) = 0 Or p3wfWriteMac(*dst, capacity, @written, *mac) = 0 : ProcedureReturn 0 : EndIf
+      haveMac = 1
+    Else
+      keyLen = p3wfPrefix(*src + at, bodyEnd - at, "il0macaddr=")
+      If keyLen = 11
+        If p3wfWrite(*dst, capacity, *src + at, 11, @written) = 0 Or p3wfWriteMac(*dst, capacity, @written, *mac) = 0 : ProcedureReturn 0 : EndIf
+        haveIl0 = 1
+      Else
+        If p3wfWrite(*dst, capacity, *src + at, bodyEnd - at, @written) = 0 : ProcedureReturn 0 : EndIf
+      EndIf
+    EndIf
+    If bodyEnd < lineEnd
+      If p3wfWrite(*dst, capacity, *src + bodyEnd, 1, @written) = 0 : ProcedureReturn 0 : EndIf
+    EndIf
+    If lineEnd < length
+      If p3wfWrite(*dst, capacity, *src + lineEnd, 1, @written) = 0 : ProcedureReturn 0 : EndIf
+    EndIf
+    at = lineEnd + 1
+  Wend
+  If haveMac = 0 Or haveIl0 = 0
+    If written > 0 And PeekA(*dst + written - 1) <> 10
+      If written >= capacity : ProcedureReturn 0 : EndIf
+      PokeA(*dst + written, 10) : written = written + 1
+    EndIf
+    If haveMac = 0
+      If p3wfWrite(*dst, capacity, "macaddr=", 8, @written) = 0 Or p3wfWriteMac(*dst, capacity, @written, *mac) = 0 : ProcedureReturn 0 : EndIf
+      If written >= capacity : ProcedureReturn 0 : EndIf
+      PokeA(*dst + written, 10) : written = written + 1
+    EndIf
+    If haveIl0 = 0
+      If p3wfWrite(*dst, capacity, "il0macaddr=", 11, @written) = 0 Or p3wfWriteMac(*dst, capacity, @written, *mac) = 0 : ProcedureReturn 0 : EndIf
+      If written >= capacity : ProcedureReturn 0 : EndIf
+      PokeA(*dst + written, 10) : written = written + 1
+    EndIf
+  EndIf
+  ProcedureReturn written
+EndProcedure
+
+; The data package intentionally exposes only the exact Model B 43430 A1
+; set currently pinned in RaspberryPi3/Data/wifi. Other board/chip
+; profiles remain unsupported until their matching upstream assets and
+; license notices are packaged; never fall back to a nearby firmware.
+Procedure.i Pi3WifiFirmwarePath()
+  If pi3_wifi_board_profile = #PI3_WIFI_BOARD_B And pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_A1
+    ProcedureReturn "2:/wifi/brcmfmac43430-sdio.bin"
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3WifiNvramPath()
+  If pi3_wifi_board_profile = #PI3_WIFI_BOARD_B And pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_A1
+    ProcedureReturn "2:/wifi/brcmfmac43430-sdio.raspberrypi,3-model-b.txt"
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Pi3WifiClmPath()
+  If pi3_wifi_board_profile = #PI3_WIFI_BOARD_B And pi3_wifi_radio_profile = #PI3_WIFI_RADIO_43430_A1
+    ProcedureReturn "2:/wifi/brcmfmac43430-sdio.clm_blob"
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; One file is open at a time. Every read is capped at 4 KiB and the open
+; handle is closed on every exit; exact lengths reject truncation or a
+; mismatched profile asset before the radio core can be reset.
+Procedure.i p3wfLoadExact(*path, *dst, capacity.i, exactBytes.i)
+  Protected length.i, offset.i, take.i, got.i
+  If *path = 0 Or *dst = 0 Or capacity < exactBytes Or exactBytes < 1
+    ProcedureReturn 0
+  EndIf
+  If HwStorageUp() = 0 : ProcedureReturn 0 : EndIf
+  If HwFileOpen(*path) = 0 : ProcedureReturn 0 : EndIf
+  length = HwFileSize()
+  If length <> exactBytes
+    HwFileClose()
+    ProcedureReturn 0
+  EndIf
+  offset = 0
+  While offset < length
+    take = length - offset
+    If take > #PI3_WIFI_READ_CHUNK : take = #PI3_WIFI_READ_CHUNK : EndIf
+    got = HwFileReadAt(offset, *dst + offset, take)
+    If got <> take
+      HwFileClose()
+      ProcedureReturn 0
+    EndIf
+    offset = offset + got
+  Wend
+  HwFileClose()
+  ProcedureReturn length
+EndProcedure
+
+; Preflight and load only after Cyw43Attach has produced an actual chip ID
+; and revision. This phase reads no radio registers and resets no core.
+; Returns selected profile (or zero), placing lengths in the caller's
+; output slots. Caller owns suitably aligned buffers: firmware 399344 B,
+; CLM 4733 B, source/runtime NVRAM 16384 B each.
+Procedure.i Pi3WifiPrepareSelectedAssets(boardRevision.i, *dtb, *dtbEnd, *firmware, firmwareCapacity.i, *firmwareBytes, *clm, clmCapacity.i, *clmBytes, *nvramText, nvramCapacity.i, *nvramRuntime, nvramRuntimeCapacity.i, *nvramBytes)
+  Protected profile.i, textBytes.i, runtimeBytes.i, i.i
+  Protected Dim mac.a[6]
+  Protected fwPath.i, nvPath.i, clmPath.i
+  pi3_wifi_bringup_stage = 1
+  pi3_wifi_bringup_profile = 0
+  pi3_wifi_mac_override = 0
+  pi3_wifi_mac_result = 0
+  For i = 0 To 5 : pi3_wifi_selected_mac[i] = 0 : Next
+  If Cyw43Attached() = 0 : ProcedureReturn 0 : EndIf
+  profile = Pi3WifiResolveProfile(boardRevision, Cyw43ChipId(), Cyw43ChipRev())
+  If profile = 0 : ProcedureReturn 0 : EndIf
+  fwPath = Pi3WifiFirmwarePath() : nvPath = Pi3WifiNvramPath() : clmPath = Pi3WifiClmPath()
+  If fwPath = 0 Or nvPath = 0 Or clmPath = 0 : ProcedureReturn 0 : EndIf
+  If *firmwareBytes = 0 Or *clmBytes = 0 Or *nvramBytes = 0 : ProcedureReturn 0 : EndIf
+  If firmwareCapacity < #PI3_WIFI_FW_BYTES Or clmCapacity < #PI3_WIFI_CLM_BYTES
+    ProcedureReturn 0
+  EndIf
+  If nvramCapacity < #PI3_WIFI_NVRAM_MAX_BYTES Or nvramRuntimeCapacity < #PI3_WIFI_NVRAM_MAX_BYTES
+    ProcedureReturn 0
+  EndIf
+  pi3_wifi_mac_override = Pi3WifiReadLocalMacFromDtb(*dtb, *dtbEnd, @mac[0])
+  If pi3_wifi_mac_override <> 0
+    For i = 0 To 5 : pi3_wifi_selected_mac[i] = mac[i] : Next
+  EndIf
+  pi3_wifi_bringup_stage = 2
+  If p3wfLoadExact(fwPath, *firmware, firmwareCapacity, #PI3_WIFI_FW_BYTES) <> #PI3_WIFI_FW_BYTES : ProcedureReturn 0 : EndIf
+  PokeL(*firmwareBytes, #PI3_WIFI_FW_BYTES)
+  pi3_wifi_bringup_stage = 3
+  If p3wfLoadExact(clmPath, *clm, clmCapacity, #PI3_WIFI_CLM_BYTES) <> #PI3_WIFI_CLM_BYTES : ProcedureReturn 0 : EndIf
+  PokeL(*clmBytes, #PI3_WIFI_CLM_BYTES)
+  pi3_wifi_bringup_stage = 4
+  textBytes = p3wfLoadExact(nvPath, *nvramText, nvramCapacity, 1121)
+  If textBytes <> 1121 : ProcedureReturn 0 : EndIf
+  If pi3_wifi_mac_override <> 0
+    runtimeBytes = Pi3WifiNvramWithMac(*nvramText, textBytes, @mac[0], *nvramRuntime, nvramRuntimeCapacity)
+    If runtimeBytes = 0 : ProcedureReturn 0 : EndIf
+  Else
+    If textBytes > nvramRuntimeCapacity : ProcedureReturn 0 : EndIf
+    For i = 0 To textBytes - 1 : PokeA(*nvramRuntime + i, PeekA(*nvramText + i)) : Next
+    runtimeBytes = textBytes
+  EndIf
+  PokeL(*nvramBytes, runtimeBytes)
+  pi3_wifi_bringup_profile = profile
+  pi3_wifi_bringup_stage = 5
+  ProcedureReturn profile
+EndProcedure
+
+; Execute the Linux-derived CYW43 sequence after all selected assets and
+; the validated per-device NVRAM have been prepared. Function 2 is enabled
+; only after firmware start, HT clock, and host protocol announcement.
+; Returns 1 only after WifiUp (CLM verify, event mask, WLC_UP) succeeds.
+Procedure.i Pi3WifiStartSelectedRadio(profile.i, *firmware, firmwareBytes.i, *nvram, nvramBytes.i, *nvramWork, nvramWorkCapacity.i, *clm, clmBytes.i, *scratch, scratchBytes.i)
+  If profile = 0 Or profile <> pi3_wifi_bringup_profile Or firmwareBytes <> #PI3_WIFI_FW_BYTES Or clmBytes <> #PI3_WIFI_CLM_BYTES
+    ProcedureReturn 0
+  EndIf
+  If *firmware = 0 Or *nvram = 0 Or *nvramWork = 0 Or *clm = 0 Or *scratch = 0
+    ProcedureReturn 0
+  EndIf
+  If (*firmware & 3) <> 0 Or (*nvramWork & 3) <> 0 Or (*scratch & 3) <> 0
+    ProcedureReturn 0
+  EndIf
+  pi3_wifi_bringup_stage = 6
+  If Cyw43PrepareDownload() = 0 : ProcedureReturn 0 : EndIf
+  Cyw43SetVerify(2)
+  pi3_wifi_bringup_stage = 7
+  If Cyw43UploadFirmware(*firmware, firmwareBytes, *scratch, scratchBytes) = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 8
+  If Cyw43UploadNvram(*nvram, nvramBytes, *nvramWork, nvramWorkCapacity, *scratch, scratchBytes) = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 9
+  If Cyw43Start() = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 10
+  If Cyw43HtClock() = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 11
+  If Cyw43AnnounceHost() = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 12
+  If Pi3SdioEnableFunction(2) = 0 : ProcedureReturn 0 : EndIf
+  ; Establish SDPCM/BCDC generation exactly once before cur_etheraddr
+  ; preinit commands. WifiUpAfterTransportReset continues this generation.
+  If Cyw43WifiUpBegin() <> #CYW43_IO_OK : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 13
+  If Pi3WifiFinalizeMac() = 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 14
+  If Cyw43WifiUpAfterTransportReset(*clm, clmBytes, #CYW43_EVMASK_JOIN, 2000) <> 0 : ProcedureReturn 0 : EndIf
+  pi3_wifi_bringup_stage = 15
+  ProcedureReturn 1
+EndProcedure
+
+DataSection
+  p3wf_cur_etheraddr:
+    Data.b 99,117,114,95,101,116,104,101,114,97,100,100,114
+EndDataSection

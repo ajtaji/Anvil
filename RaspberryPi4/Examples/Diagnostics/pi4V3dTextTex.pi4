@@ -1,0 +1,698 @@
+; pi4V3dTextTex.pi4 - M3: TEXTURED TEXT in the real engine (neon.pi4).
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT THIS PROVES
+; ======================================================================
+;  M1 (pi4V3dTex) put a textured triangle on the screen through the TMU.
+;  M2 (pi4V3dAtlas) packed the font into a 16x1024 UBLINEAR_2 atlas and
+;  sampled five glyphs from it. M3 folds that path INTO neon.pi4 as
+;  Neon_TextTex(font,x,y,*s,colour): each printable character becomes
+;  ONE atlas-sampled quad (two triangles) instead of the ~7 blended
+;  rectangles Neon_Text/neon_GlyphRects emit, and the sampled coverage
+;  is modulated by the caller's colour so text draws in that colour -
+;  matching what the flat path produces, solid `colour` where the glyph
+;  has ink.
+;
+;  This file:
+;    1. builds the atlas from the engine's CURRENT font (dsp_font8x16),
+;    2. draws a known string with Neon_TextTex and VERIFIES it pixel by
+;       pixel against an INDEPENDENT read of the font blob - ink pixels
+;       must be the text colour, background pixels the ground - exactly
+;       the way pi4NeonText checks the flat path,
+;    3. names five SPECIFIC glyph probe coordinates and their expected
+;       colours, pi4V3dAtlas style, and
+;    4. BENCHMARKS bin+render microseconds and glyph/vertex/draw counts
+;       for a SHORT string and a FULL screen of text, for BOTH the
+;       textured path and the flat Neon_Text path, so the per-glyph and
+;       fixed-overhead costs of each are visible side by side.
+;
+; ======================================================================
+;  RUN
+; ======================================================================
+;  Built with --entry-returns, so it returns to the resident monitor.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4V3dTextTex.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o RaspberryPi4/Examples/Diagnostics/pi4V3dTextTex.img
+;
+;  Then from the monitor: load the .img at 0x400000 and 'go' / 'b' to
+;  its entry. ONE clean run per boot - a hung render wedges V3D, and the
+;  board is rebooted between runs.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#TT_ARENA       = $04000000
+#TT_ARENA_BYTES = $01000000
+#TT_POISON      = $A5A5A5A5
+
+; Ground and ink, four distinct bytes in each (as pi4NeonText).
+#TT_GR = $11
+#TT_GG = $33
+#TT_GB = $55
+#TT_IR = $EE
+#TT_IG = $C4
+#TT_IB = $7A
+
+; The verified string's origin. 95 printable characters, the whole
+; table, so the probe covers every glyph the font has.
+#TT_TX = 64
+#TT_TY = 120
+
+; The full-screen block: rows top to bottom, capped so the FLAT path's
+; rectangle decomposition stays inside #NEON_MAX_VERTS.
+#TT_FULL_X       = 8
+#TT_FULL_Y0      = 8
+#TT_FULL_STEP    = 16
+#TT_FULL_COLS    = 95
+; Capped so the FLAT comparison's rectangle decomposition (up to ~10
+; rects * 6 verts a glyph for the ink-heavy ASCII set) stays inside
+; #NEON_MAX_VERTS (262144). 3000 glyphs is ~31 rows, the top half of a
+; 1080-tall surface - many glyphs, and the same block for both paths.
+#TT_FULL_MAXGLY  = 3000
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  n = 0
+  i = 0
+  While PeekA(*name + i) <> 0
+    n = n + 1
+    i = i + 1
+  Wend
+  While n < width
+    UartWrite(32)
+    n = n + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutPad(*name, 30)
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutErr(e.i)
+  If e = 0
+    PutS("OK")
+  Else
+    PutS("error ")
+    PrintDec(e)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE STRING - ASCII 32..126, built at run time.
+; ======================================================================
+Global Dim ttStr.a[128]
+Global ttLen.i = 0
+
+Procedure BuildString()
+  Define c.i
+  ttLen = 0
+  c = 32
+  While c <= 126
+    ttStr[ttLen] = c
+    ttLen = ttLen + 1
+    c = c + 1
+  Wend
+  ttStr[ttLen] = 0
+EndProcedure
+
+; ======================================================================
+;  THE INDEPENDENT READ OF THE FONT BLOB. Nothing here is shared with
+;  neon.pi4's atlas build or its quad layout: is the surface pixel at
+;  (px,py) ink, for the string drawn at (#TT_TX,#TT_TY) at scale 1?
+; ======================================================================
+Procedure.i InkAt(px.i, py.i)
+  Define col.i
+  Define row.i
+  Define idx.i
+  Define ch.i
+  Define b.i
+
+  If py < #TT_TY
+    ProcedureReturn 0
+  EndIf
+  row = py - #TT_TY
+  If row >= 16
+    ProcedureReturn 0
+  EndIf
+  If px < #TT_TX
+    ProcedureReturn 0
+  EndIf
+  col = px - #TT_TX
+  idx = col / 8
+  If idx >= ttLen
+    ProcedureReturn 0
+  EndIf
+  ch = ttStr[idx]
+  If ch < 32 Or ch > 126
+    ProcedureReturn 0
+  EndIf
+  b = PeekA(?dsp_font8x16 + (((ch - 32) * 16) + row))
+  If (b & (128 >> (col - (idx * 8)))) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  COUNTERS AND STATE
+; ======================================================================
+Global nInk.i = 0
+Global nInkOk.i = 0
+Global nBg.i = 0
+Global nBgOk.i = 0
+Global firstBadX.i = -1
+Global firstBadY.i = -1
+Global firstBadGot.i = 0
+Global firstBadWant.i = 0
+
+Global groundCol.i
+Global inkCol.i
+
+; The five named glyph probes: character, its column in the string.
+Global Dim prbCh.i[5]
+Global Dim prbIdx.i[5]
+Global Dim prbInkX.i[5]
+Global Dim prbInkY.i[5]
+Global Dim prbBgX.i[5]
+Global Dim prbBgY.i[5]
+Global Dim prbInkOk.i[5]
+Global Dim prbBgOk.i[5]
+
+; Benchmark rows: glyphs, verts, draws, the CPU build time (the text
+; calls themselves - the vertex build the four engine counters do NOT
+; see) and the four engine microsecond counters.
+Global Dim bmGly.i[6]
+Global Dim bmVerts.i[6]
+Global Dim bmDraws.i[6]
+Global Dim bmBuild.i[6]
+Global Dim bmBegin.i[6]
+Global Dim bmClean.i[6]
+Global Dim bmBin.i[6]
+Global Dim bmRender.i[6]
+Global Dim bmErr.i[6]
+
+; The architectural counter's ticks-per-microsecond, as the engine
+; computes it, so the CPU build time is in the same units as usBin etc.
+Global bmHz.i = 1
+
+Procedure BmHzInit()
+  bmHz = V3dCounterHz() / 1000000
+  If bmHz < 1
+    bmHz = 1
+  EndIf
+EndProcedure
+
+Procedure.i BmUs(t0.i)
+  ProcedureReturn (V3dTicks() - t0) / bmHz
+EndProcedure
+
+Procedure.i PixelAt(x.i, y.i)
+  ProcedureReturn PeekN(Neon_SurfaceBase() + (y * Neon_SurfacePitch()) + (x * 4))
+EndProcedure
+
+Procedure RecordFrame(slot.i, r.i)
+  bmErr[slot]    = r
+  bmBegin[slot]  = Neon_UsBegin()
+  bmClean[slot]  = Neon_UsClean()
+  bmBin[slot]    = Neon_UsBin()
+  bmRender[slot] = Neon_UsRender()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Verify the textured string, every pixel of its rectangle.
+; ----------------------------------------------------------------------
+Procedure VerifyText()
+  Define px.i
+  Define py.i
+  Define v.i
+  Define want.i
+  Define x1.i
+
+  x1 = #TT_TX + (ttLen * 8)
+  py = #TT_TY
+  While py < (#TT_TY + 16)
+    px = #TT_TX
+    While px < x1
+      v = PixelAt(px, py)
+      If InkAt(px, py) <> 0
+        want = inkCol
+        nInk = nInk + 1
+        If v = want
+          nInkOk = nInkOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = want
+        EndIf
+      Else
+        want = groundCol
+        nBg = nBg + 1
+        If v = want
+          nBgOk = nBgOk + 1
+        ElseIf firstBadX < 0
+          firstBadX = px
+          firstBadY = py
+          firstBadGot = v
+          firstBadWant = want
+        EndIf
+      EndIf
+      px = px + 1
+    Wend
+    py = py + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Five named glyph probes. For each, find one ink texel and one blank
+;  texel inside the cell, and demand the text colour and the ground
+;  respectively at the pixel centre.
+; ----------------------------------------------------------------------
+Procedure SetupProbes()
+  ; 'A'(65) 'H'(72) 'i'(105) '.'(46) 'T'(84), and their columns in the
+  ; ASCII string (ch - 32).
+  prbCh[0] = 65  : prbIdx[0] = 65 - 32
+  prbCh[1] = 72  : prbIdx[1] = 72 - 32
+  prbCh[2] = 105 : prbIdx[2] = 105 - 32
+  prbCh[3] = 46  : prbIdx[3] = 46 - 32
+  prbCh[4] = 84  : prbIdx[4] = 84 - 32
+EndProcedure
+
+Procedure RunProbes()
+  Define i.i
+  Define ch.i
+  Define gx0.i
+  Define gy0.i
+  Define tx.i
+  Define ty.i
+  Define b.i
+  Define foundInk.i
+  Define foundBg.i
+
+  i = 0
+  While i < 5
+    ch  = prbCh[i]
+    gx0 = #TT_TX + (prbIdx[i] * 8)
+    gy0 = #TT_TY
+    foundInk = 0
+    foundBg  = 0
+    prbInkOk[i] = 0
+    prbBgOk[i]  = 0
+    prbInkX[i]  = -1
+    prbBgX[i]   = -1
+    ; Walk the cell for the first ink texel and the first blank one.
+    ty = 0
+    While ty < 16
+      b = PeekA(?dsp_font8x16 + (((ch - 32) * 16) + ty))
+      tx = 0
+      While tx < 8
+        If (b & (128 >> tx)) <> 0
+          If foundInk = 0
+            foundInk = 1
+            prbInkX[i] = gx0 + tx
+            prbInkY[i] = gy0 + ty
+          EndIf
+        Else
+          If foundBg = 0
+            foundBg = 1
+            prbBgX[i] = gx0 + tx
+            prbBgY[i] = gy0 + ty
+          EndIf
+        EndIf
+        tx = tx + 1
+      Wend
+      ty = ty + 1
+    Wend
+    If foundInk <> 0
+      If PixelAt(prbInkX[i], prbInkY[i]) = inkCol
+        prbInkOk[i] = 1
+      EndIf
+    EndIf
+    If foundBg <> 0
+      If PixelAt(prbBgX[i], prbBgY[i]) = groundCol
+        prbBgOk[i] = 1
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Draw the full-screen block of text with either path. kind 0 =
+;  textured (Neon_TextTex), kind 1 = flat (Neon_Text). Returns 0 on the
+;  first engine error, else the number of rows drawn.
+; ----------------------------------------------------------------------
+Procedure.i DrawFullScreen(kind.i, colour.i)
+  Define y.i
+  Define rows.i
+  Define gly.i
+  Define r.i
+
+  y    = #TT_FULL_Y0
+  rows = 0
+  gly  = 0
+  r    = #NEON_OK
+  While (y + 16) <= Neon_SurfaceH() And gly < #TT_FULL_MAXGLY
+    If kind = 0
+      r = Neon_TextTex(#NEON_FONT_UI, #TT_FULL_X, y, @ttStr[0], colour)
+    Else
+      r = Neon_Text(#NEON_FONT_UI, #TT_FULL_X, y, @ttStr[0], colour)
+    EndIf
+    If r <> #NEON_OK
+      ProcedureReturn 0
+    EndIf
+    gly  = gly + #TT_FULL_COLS
+    rows = rows + 1
+    y    = y + #TT_FULL_STEP
+  Wend
+  ProcedureReturn rows
+EndProcedure
+
+; ======================================================================
+;  MAIN BODY
+; ======================================================================
+Procedure.i Body()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define rows.i
+  Define accentCol.i
+  Define t0.i
+
+  PutNl()
+  PutS("=== pi4V3dTextTex - TEXTURED TEXT in neon.pi4 (M3) ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running")
+    PutNl()
+  EndIf
+  BmHzInit()
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("verdict: NO TAGS") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  If r <> 1
+    PutS("    DisplayInit rc ") : PrintDec(r) : PutNl()
+    PutS("verdict: NO SURFACE") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  r = NeonArena(#TT_ARENA, #TT_ARENA_BYTES)
+  If r <> #NEON_OK
+    PutS("verdict: ARENA") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  If r <> #NEON_OK
+    PutS("verdict: SURFACE") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonInit()
+  PutPad("NeonInit", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: NEONINIT") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("arena bytes needed", Neon_ArenaNeed())
+  RowDec("arena bytes given", #TT_ARENA_BYTES)
+
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  BuildString()
+  SetupProbes()
+
+  groundCol = Neon_RGBA(#TT_GR, #TT_GG, #TT_GB, 255)
+  inkCol    = Neon_RGBA(#TT_IR, #TT_IG, #TT_IB, 255)
+  accentCol = Neon_C_Acc
+
+  ; ------------------------------------------------------------------
+  ;  Build the atlas ONCE, outside any frame, so the TFU runs clear of
+  ;  the render.
+  ; ------------------------------------------------------------------
+  r = Neon_TexAtlasBuild()
+  PutPad("Neon_TexAtlasBuild", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: ATLAS") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("atlas width", Neon_AtlasW())
+  RowDec("atlas height", Neon_AtlasH())
+  RowHex("atlas tiled base", Neon_AtlasBase())
+  RowHex("ground", groundCol)
+  RowHex("ink", inkCol)
+  RowDec("string chars", ttLen)
+  PutNl()
+
+  ; Poison the surface so an un-drawn pixel is visibly poison.
+  n = Neon_SurfaceH()
+  i = 0
+  While i < n
+    DspRowFill32(Neon_SurfaceBase() + (i * Neon_SurfacePitch()), Neon_SurfaceW(), #TT_POISON)
+    i = i + 1
+  Wend
+
+  ; ==================================================================
+  ;  FRAME 1 - the verified textured string (SHORT), plus a flat line
+  ;  above it so the flat path is proven still alive in the same frame.
+  ; ==================================================================
+  r = NeonFrameBegin(groundCol)
+  If r <> #NEON_OK
+    PutS("verdict: FRAMEBEGIN") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  Neon_Text(#NEON_FONT_UI, #TT_TX, #TT_TY - 40, "flat Neon_Text (chrome kit) still works:", accentCol)
+  t0 = V3dTicks()
+  Neon_TextTex(#NEON_FONT_UI, #TT_TX, #TT_TY, @ttStr[0], inkCol)
+  bmBuild[0] = BmUs(t0)
+  bmGly[0]   = Neon_TexGlyphs()
+  bmVerts[0] = Neon_TexVerts()
+  bmDraws[0] = Neon_TexDraws()
+  r = NeonFrameEnd()
+  RecordFrame(0, r)
+  PutPad("frame 1 (textured short)", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    PutS("verdict: FRAME1") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  VerifyText()
+  RunProbes()
+
+  ; ==================================================================
+  ;  FRAME 2 - the SHORT string with the FLAT path, same text and
+  ;  colour, for the per-string overhead comparison.
+  ; ==================================================================
+  r = NeonFrameBegin(groundCol)
+  If r <> #NEON_OK
+    PutS("verdict: FRAMEBEGIN 2") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  t0 = V3dTicks()
+  Neon_Text(#NEON_FONT_UI, #TT_TX, #TT_TY, @ttStr[0], inkCol)
+  bmBuild[1] = BmUs(t0)
+  bmGly[1]   = Neon_Glyphs()
+  bmVerts[1] = Neon_Verts()
+  bmDraws[1] = Neon_Draws()
+  r = NeonFrameEnd()
+  RecordFrame(1, r)
+  PutPad("frame 2 (flat short)", 30) : PutErr(r) : PutNl()
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    PutS("verdict: FRAME2") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ==================================================================
+  ;  FRAME 3 - a FULL screen of text with the FLAT path.
+  ; ==================================================================
+  r = NeonFrameBegin(groundCol)
+  If r <> #NEON_OK
+    PutS("verdict: FRAMEBEGIN 3") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  t0 = V3dTicks()
+  rows = DrawFullScreen(1, inkCol)
+  bmBuild[2] = BmUs(t0)
+  bmGly[2]   = Neon_Glyphs()
+  bmVerts[2] = Neon_Verts()
+  bmDraws[2] = Neon_Draws()
+  r = NeonFrameEnd()
+  RecordFrame(2, r)
+  PutPad("frame 3 (flat full)", 30) : PutErr(r) : PutNl()
+  RowDec("flat full rows", rows)
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    PutS("verdict: FRAME3") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; ==================================================================
+  ;  FRAME 4 - a FULL screen of text with the TEXTURED path. Drawn
+  ;  last so the visible surface is the textured result.
+  ; ==================================================================
+  r = NeonFrameBegin(groundCol)
+  If r <> #NEON_OK
+    PutS("verdict: FRAMEBEGIN 4") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  t0 = V3dTicks()
+  rows = DrawFullScreen(0, inkCol)
+  bmBuild[3] = BmUs(t0)
+  bmGly[3]   = Neon_TexGlyphs()
+  bmVerts[3] = Neon_TexVerts()
+  bmDraws[3] = Neon_TexDraws()
+  r = NeonFrameEnd()
+  RecordFrame(3, r)
+  PutPad("frame 4 (textured full)", 30) : PutErr(r) : PutNl()
+  RowDec("textured full rows", rows)
+  If r <> #NEON_OK
+    RowDec("Neon_Error", Neon_Error())
+    PutS("verdict: FRAME4") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutNl()
+
+  ; ==================================================================
+  ;  THE PIXEL VERIFICATION
+  ; ==================================================================
+  PutS("textured string, every pixel of its rectangle") : PutNl()
+  RowDec("ink pixels wanted", nInk)
+  RowDec("ink pixels right", nInkOk)
+  RowDec("ground pixels wanted", nBg)
+  RowDec("ground pixels right", nBgOk)
+  RowDec("first bad x", firstBadX)
+  RowDec("first bad y", firstBadY)
+  RowHex("first bad, found", firstBadGot)
+  RowHex("first bad, wanted", firstBadWant)
+  PutNl()
+
+  PutS("five named glyph probes (ink -> text colour, blank -> ground)") : PutNl()
+  i = 0
+  While i < 5
+    PutPad("  glyph", 10)
+    UartWrite(prbCh[i])
+    PutS("  ink(")
+    PrintDec(prbInkX[i]) : PutS(",") : PrintDec(prbInkY[i]) : PutS(")=")
+    If prbInkOk[i] <> 0 : PutS("OK") : Else : PutS("BAD") : EndIf
+    PutS("  blank(")
+    PrintDec(prbBgX[i]) : PutS(",") : PrintDec(prbBgY[i]) : PutS(")=")
+    If prbBgOk[i] <> 0 : PutS("OK") : Else : PutS("BAD") : EndIf
+    PutNl()
+    i = i + 1
+  Wend
+  PutNl()
+
+  ; ==================================================================
+  ;  THE BENCHMARK TABLE
+  ; ==================================================================
+  PutS("benchmark: glyphs/verts/draws, us build(CPU) begin clean bin render") : PutNl()
+  PutS("  [0] textured short") : PutNl()
+  RowDec("    glyphs", bmGly[0]) : RowDec("    verts", bmVerts[0]) : RowDec("    draws", bmDraws[0])
+  RowDec("    us build (CPU)", bmBuild[0])
+  RowDec("    us begin", bmBegin[0]) : RowDec("    us clean", bmClean[0])
+  RowDec("    us bin", bmBin[0]) : RowDec("    us render", bmRender[0])
+  PutS("  [1] flat short") : PutNl()
+  RowDec("    glyphs", bmGly[1]) : RowDec("    verts", bmVerts[1]) : RowDec("    draws", bmDraws[1])
+  RowDec("    us build (CPU)", bmBuild[1])
+  RowDec("    us begin", bmBegin[1]) : RowDec("    us clean", bmClean[1])
+  RowDec("    us bin", bmBin[1]) : RowDec("    us render", bmRender[1])
+  PutS("  [2] flat full") : PutNl()
+  RowDec("    glyphs", bmGly[2]) : RowDec("    verts", bmVerts[2]) : RowDec("    draws", bmDraws[2])
+  RowDec("    us build (CPU)", bmBuild[2])
+  RowDec("    us begin", bmBegin[2]) : RowDec("    us clean", bmClean[2])
+  RowDec("    us bin", bmBin[2]) : RowDec("    us render", bmRender[2])
+  PutS("  [3] textured full") : PutNl()
+  RowDec("    glyphs", bmGly[3]) : RowDec("    verts", bmVerts[3]) : RowDec("    draws", bmDraws[3])
+  RowDec("    us build (CPU)", bmBuild[3])
+  RowDec("    us begin", bmBegin[3]) : RowDec("    us clean", bmClean[3])
+  RowDec("    us bin", bmBin[3]) : RowDec("    us render", bmRender[3])
+  PutNl()
+
+  ; ==================================================================
+  ;  THE VERDICT
+  ; ==================================================================
+  n = 0
+  i = 0
+  While i < 5
+    If prbInkOk[i] = 0 Or prbBgOk[i] = 0
+      n = n + 1
+    EndIf
+    i = i + 1
+  Wend
+
+  If nInkOk <> nInk Or nBgOk <> nBg
+    PutS("verdict: TEXTURED TEXT WRONG - pixels do not match the font") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  If n <> 0
+    PutS("verdict: PROBE WRONG") : PutNl()
+    ProcedureReturn 0
+  EndIf
+  PutS("verdict: OK - textured text pixel-exact, coloured, benchmarked") : PutNl()
+  ProcedureReturn nInkOk
+EndProcedure
+
+; ======================================================================
+;  WRAPPER - hand the V3D MMU back at every exit (see pi4NeonText).
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

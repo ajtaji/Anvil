@@ -1,0 +1,216 @@
+; ======================================================================
+; pi4FloatPtrSelfTest.pi4 - A TYPED FLOATING-POINT POINTER STORE KEEPS
+;                            THE BITS, ON A CORTEX-A72.
+; ======================================================================
+;
+;     * destination.f = 16.0
+;
+; The dereference carries the type. Until 2026-09-05 the assignment
+; classifier did not read it, so this compiled as an INTEGER assignment
+; fed by a floating-point value: the value was CONVERTED on the way in
+; and 16.0 was written as $00000010 instead of the IEEE-754 encoding
+; $41800000. No crash, no refusal - a small plausible number sitting in
+; a float. Bug tracker topic 656. The defect was on every float-capable
+; target; this file is the witness for the two 64-bit ones.
+;
+; WHY THERE IS NO FLOATING-POINT ARITHMETIC ANYWHERE BELOW, and it is
+; not squeamishness. The correct lowering of a float store is a plain
+; store of the ENCODING, so a correct compiler emits no FP instruction
+; for this program at all - which means the whole test also runs in the
+; A64 emulator, which has no floating-point model. It also lets the
+; values be the ones arithmetic is worst at: the smallest subnormal,
+; negative zero, an infinity, and a NaN whose PAYLOAD must survive. A
+; conversion through an integer destroys every one of them, and destroys
+; them differently, so a failing line names which pattern was lost.
+;
+; A SECOND CONSEQUENCE WORTH KNOWING BEFORE RUNNING IT. Because no FP
+; instruction is emitted, the generator does not open the EL2 floating-
+; point gate for this image either - there is no "msr cptr_el2" in the
+; prologue. That is correct, and it is also what makes this program
+; runnable in the emulator: the model has neither CPTR_EL2 nor FPCR, so
+; ANY image whose prologue opens the gate stops four instructions in,
+; before Main. A pre-fix build of this very file is such an image.
+;
+; WHAT EACH CHECK IS FOR
+;   1-4  literals through a typed dereference, including the promotion
+;        of a bare integer literal ("* p.f = 5" means 5.0).
+;   5    a RUNTIME float value, which the literal promotion cannot cover.
+;   6    the typed LOAD and back out through the typed store - the load
+;        side was always right and must stay right.
+;   7-10 the four bit patterns above, placed through the INTEGER
+;        dereference and copied through the FLOAT one.
+;   11   the second wrong shape: a typed store reached by POINTER
+;        ARITHMETIC into a float array.
+;   12   THE CONTROL - an integer dereference still stores an integer.
+;        Without it, a compiler that treated every store as a bit copy
+;        would pass everything above.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile pi4FloatPtrSelfTest.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o fptr.img
+;
+; Loaded into RAM and run from the monitor; it returns to the prompt.
+; The deadman is armed anyway - the habit is the thing being maintained.
+; "VERD 0  PASS" is the only pass.
+; ======================================================================
+
+EnableFloatingPoint(32)
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+
+Global Checks.i
+Global Passes.i
+Global Fails.i
+
+Global Slot.f
+Global Src.f
+Global Dst.f
+Global Dim Arr.f(4)
+
+Procedure PutHex8(v.i)
+  Define i.i
+  Define n.i
+  For i = 7 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; ITERATIVE, not recursive: parameters live in globals on this backend,
+; so a recursive digit printer returns a plausible wrong number rather
+; than crashing. Digits are produced least-significant first into a
+; small array and replayed backwards.
+Procedure PutDec(v.i)
+  Define i.i
+  Define n.i
+  Define Dim dig.a(24)
+  n = 0
+  If v = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  While v > 0 And n < 20
+    dig(n) = 48 + (v % 10)
+    v = v / 10
+    n = n + 1
+  Wend
+  For i = n - 1 To 0 Step -1
+    UartWrite(dig(i))
+  Next
+EndProcedure
+
+Procedure Record(got.l, want.l)
+  Checks = Checks + 1
+  SafetyWatchdogPet()
+  UartWriteStr("check ")
+  PutDec(Checks)
+  UartWriteStr("  got ")
+  PutHex8(got & $FFFFFFFF)
+  UartWriteStr("  want ")
+  PutHex8(want & $FFFFFFFF)
+  If got = want
+    Passes = Passes + 1
+    UartWriteStr("  ok")
+  Else
+    Fails = Fails + 1
+    UartWriteStr("  FAIL")
+  EndIf
+  UartWriteNl()
+EndProcedure
+
+; Place a bit pattern through the INTEGER dereference, copy it through
+; the FLOAT one, and hand back what came out. The copy is the shape
+; under test; the placement and the read-back are the integer path,
+; which was never in doubt and is what this leans on.
+Procedure.l ThroughFloat(pattern.l)
+  Define s.i
+  Define d.i
+  s = @Src
+  d = @Dst
+  * s.l = pattern
+  * d.f = * s.f
+  ProcedureReturn * d.l
+EndProcedure
+
+Procedure.i Main()
+  Define p.i
+  Define b.i
+  Define d.i
+  Define v.f
+  Define w.f
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("TYPED FLOAT POINTER STORE - Cortex-A72, on silicon")
+  UartWriteNl()
+
+  Checks = 0
+  Passes = 0
+  Fails = 0
+
+  p = @Slot
+  b = @Arr
+  d = @Dst
+
+  ; 1. the reported case
+  * p.f = 16.0
+  Record(* p.l, $41800000)
+
+  ; 2. a negative literal - the sign bit, and a conversion answers -1
+  * p.f = -1.5
+  Record(* p.l, $BFC00000)
+
+  ; 3. zero, the one value a conversion gets right
+  * p.f = 0.0
+  Record(* p.l, 0)
+
+  ; 4. a bare integer literal is promoted to the float
+  * p.f = 5
+  Record(* p.l, $40A00000)
+
+  ; 5. a runtime float value
+  v = 16.0
+  * p.f = v
+  Record(* p.l, $41800000)
+
+  ; 6. typed load, then back out through the typed store
+  w = * p.f
+  * d.f = w
+  Record(* d.l, $41800000)
+
+  ; 7-10. the patterns arithmetic cannot carry
+  Record(ThroughFloat(1), 1)                       ; smallest subnormal
+  Record(ThroughFloat($80000000), $80000000)       ; negative zero
+  Record(ThroughFloat($7F800000), $7F800000)       ; +infinity
+  Record(ThroughFloat($7FA55555), $7FA55555)       ; NaN, payload intact
+
+  ; 11. pointer arithmetic into a float array
+  * (b + 4).f = -1.5
+  Record(* (b + 4).l, $BFC00000)
+
+  ; 12. the control - an integer dereference is unchanged
+  * p.l = 16
+  Record(* p.l, 16)
+
+  UartWriteStr("checks ") : PutDec(Checks) : UartWriteNl()
+  UartWriteStr("passes ") : PutDec(Passes) : UartWriteNl()
+  UartWriteStr("fails  ") : PutDec(Fails) : UartWriteNl()
+
+  If Fails = 0 And Checks = 12
+    UartWriteStr("VERD 0  PASS")
+  Else
+    UartWriteStr("VERD 1  FAIL")
+  EndIf
+  UartWriteNl()
+
+  SafetyWatchdogStop()
+  ProcedureReturn Fails
+EndProcedure

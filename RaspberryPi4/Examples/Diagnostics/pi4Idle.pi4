@@ -1,0 +1,28 @@
+; pi4Idle.pi4 - the smallest Anvil diagnostic: it does nothing, on purpose.
+;
+; DIAGNOSTIC. Does not ship, and no board file includes it.
+;
+; It counts to a fixed bound and returns, touching no peripheral and no
+; memory outside its own two locals. Sent to a resident Anvil built with
+; --entry-returns it proves the load-and-return path costs nothing: if the
+; prompt does not come back, the fault is in the transfer, not here.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4Idle.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o idle.img
+
+#IDLE_SPINS = 1000
+
+Procedure.i IdleSpin(n.i)
+  Define i.i
+  i = 0
+  While i < n
+    i = i + 1
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+Procedure Main()
+  IdleSpin(#IDLE_SPINS)
+EndProcedure
+
+Main()

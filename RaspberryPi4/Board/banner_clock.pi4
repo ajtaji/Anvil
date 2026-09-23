@@ -1,0 +1,1213 @@
+; ======================================================================
+;  banner_clock.pi4 - live banner clock and bounded display service.
+;
+;  Include after console.pi4, cursor_input.pi4 and (when enabled)
+;  v3d_console.pi4. display.pi4 owns the layout and logical draw routine;
+;  this file owns the once-per-second presented update and boot/prompt pump.
+;
+;  No procedure here prints, polls a network, or waits. ScreenServiceTick
+;  may therefore be called after a boot progress line, but never from the
+;  UART producer callback. Its re-entry guard protects shared caption and
+;  renderer scratch if a future service path is accidentally nested.
+; ======================================================================
+
+Global gScreenServiceBusy.i = 0
+Structure PresentedOverlayRect
+  x.i
+  y.i
+  w.i
+  h.i
+EndStructure
+Global gPresentedOverlayRect.PresentedOverlayRect
+
+Procedure.i BannerClockIntersectsCursor()
+  If gCurShown = 0
+    ProcedureReturn 0
+  EndIf
+  If gCurX >= (gBannerClockX + gBannerClockW) Or (gCurX + #CUR_W) <= gBannerClockX
+    ProcedureReturn 0
+  EndIf
+  If gCurY >= (#BANNER_CLOCK_Y + #BANNER_CLOCK_H) Or (gCurY + #CUR_H) <= #BANNER_CLOCK_Y
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Write one logical overlay pixel into a snapshotted presented raster.
+; Cache maintenance is deliberately absent here; PresentedOverlaySyncRect
+; batches it by physical row once the complete rectangle has been written.
+Procedure PresentedOverlayPixel(base.i, pitch.i, rot.i, panelW.i, panelH.i, x.i, y.i, colour.i)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  Define px.i
+  Define py.i
+  If x < 0 Or y < 0 Or x >= ScrLogicalW(rot, panelW, panelH) Or y >= ScrLogicalH(rot, panelW, panelH)
+    ProcedureReturn
+  EndIf
+  px = ScrMapX(rot, x, y, panelW, panelH)
+  py = ScrMapY(rot, x, y, panelW, panelH)
+  PokeL(base + py * pitch + px * 4, colour)
+EndProcedure
+
+; Clean the physical bounding rectangle corresponding to one logical rect.
+; A sideways logical strip becomes a narrow physical column: one clean per
+; physical row, never one clean per pixel and never a whole-frame clean.
+; The rectangle is an explicit context pointer so the call stays under the
+; compiler's eight-argument ABI without a hidden set-then-call contract.
+Procedure PresentedOverlaySyncRect(base.i, pitch.i, rot.i, panelW.i, panelH.i, *rect.PresentedOverlayRect)
+  If DisplayMemorySafe() = 0
+    ProcedureReturn
+  EndIf
+  Define ax.i
+  Define ay.i
+  Define bx.i
+  Define by.i
+  Define cx.i
+  Define cy.i
+  Define dx.i
+  Define dy.i
+  Define loX.i
+  Define hiX.i
+  Define loY.i
+  Define hiY.i
+  Define row.i
+  If *rect = 0 Or *rect\w < 1 Or *rect\h < 1
+    ProcedureReturn
+  EndIf
+  ax = ScrMapX(rot, *rect\x, *rect\y, panelW, panelH)
+  ay = ScrMapY(rot, *rect\x, *rect\y, panelW, panelH)
+  bx = ScrMapX(rot, *rect\x + *rect\w - 1, *rect\y, panelW, panelH)
+  by = ScrMapY(rot, *rect\x + *rect\w - 1, *rect\y, panelW, panelH)
+  cx = ScrMapX(rot, *rect\x, *rect\y + *rect\h - 1, panelW, panelH)
+  cy = ScrMapY(rot, *rect\x, *rect\y + *rect\h - 1, panelW, panelH)
+  dx = ScrMapX(rot, *rect\x + *rect\w - 1, *rect\y + *rect\h - 1, panelW, panelH)
+  dy = ScrMapY(rot, *rect\x + *rect\w - 1, *rect\y + *rect\h - 1, panelW, panelH)
+  loX = ax : hiX = ax : loY = ay : hiY = ay
+  If bx < loX : loX = bx : EndIf : If bx > hiX : hiX = bx : EndIf
+  If cx < loX : loX = cx : EndIf : If cx > hiX : hiX = cx : EndIf
+  If dx < loX : loX = dx : EndIf : If dx > hiX : hiX = dx : EndIf
+  If by < loY : loY = by : EndIf : If by > hiY : hiY = by : EndIf
+  If cy < loY : loY = cy : EndIf : If cy > hiY : hiY = cy : EndIf
+  If dy < loY : loY = dy : EndIf : If dy > hiY : hiY = dy : EndIf
+  row = loY
+  While row <= hiY
+    MmuCleanRange(base + row * pitch + loX * 4, (hiX - loX + 1) * 4)
+    row = row + 1
+  Wend
+  a64_barrier()
+EndProcedure
+
+Procedure PresentedOverlayClock(base.i, pitch.i, rot.i, panelW.i, panelH.i, *caption)
+  Define r.i
+  Define c.i
+  Define i.i
+  Define ch.i
+  Define bits.i
+  Define colour.i
+  Define fg.i
+  Define bg.i
+  bg = gScreenBg
+  fg = DisplayRGB(120, 132, 150)
+  r = 0
+  While r < #BANNER_CLOCK_H
+    c = 0
+    While c < gBannerClockW
+      PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gBannerClockX + c, #BANNER_CLOCK_Y + r, bg)
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+  i = 0
+  While i < gBannerClockChars
+    ch = PeekA(*caption + i)
+    If ch = 0
+      Break
+    EndIf
+    If ch >= 32 And ch <= 126
+      r = 0
+      While r < 16
+        bits = PeekA(?dsp_font8x16 + (ch - 32) * 16 + r)
+        c = 0
+        While c < 8
+          colour = bg
+          If (bits & (128 >> c)) <> 0
+            colour = fg
+          EndIf
+          PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gBannerClockX + i * 8 + c, #BANNER_CLOCK_Y + r, colour)
+          c = c + 1
+        Wend
+        r = r + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; The GPU cursor has no CPU save-under. When it intersects the clock, redraw
+; its mask after the clock so the time advances underneath a visible cursor.
+Procedure PresentedOverlayCursor(base.i, pitch.i, rot.i, panelW.i, panelH.i)
+  Define r.i
+  Define c.i
+  Define bits.i
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  r = 0
+  While r < #CUR_H
+    bits = gCurMask[r]
+    c = 0
+    While c < #CUR_W
+      If (bits & (128 >> c)) <> 0
+        PresentedOverlayPixel(base, pitch, rot, panelW, panelH, gCurX + c, gCurY + r, #CUR_COLOUR)
+      EndIf
+      c = c + 1
+    Wend
+    r = r + 1
+  Wend
+EndProcedure
+
+Procedure BannerClockTick()
+  Define now.i
+  Define overlap.i
+  Define base.i
+  Define lw.i
+  Define lh.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+  Define y0.i
+  Define y1.i
+
+  If gScreen = 0 Or gBannerClockW < 8
+    ProcedureReturn
+  EndIf
+  now = millis()
+  If (now - gBannerClockMs) < 1000
+    ProcedureReturn
+  EndIf
+  BannerClockCopy(@gBannerClockNext[0], BannerCaption(), gBannerClockChars)
+  gBannerClockMs = now
+  If BannerClockSame(@gBannerClockNext[0], @gBannerClockText[0]) <> 0
+    ProcedureReturn
+  EndIf
+  BannerClockCopy(@gBannerClockText[0], @gBannerClockNext[0], gBannerClockChars)
+  overlap = BannerClockIntersectsCursor()
+
+  If gCursorGpuOwned = 0
+    y0 = #BANNER_CLOCK_Y
+    y1 = #BANNER_CLOCK_Y + #BANNER_CLOCK_H - 1
+    If overlap <> 0
+      CursorRestore(gCurX, gCurY)
+      If gCurY < y0 : y0 = gCurY : EndIf
+      If (gCurY + #CUR_H - 1) > y1 : y1 = gCurY + #CUR_H - 1 : EndIf
+    EndIf
+    BannerClockDrawLogical(@gBannerClockText[0])
+    If overlap <> 0
+      CursorSave(gCurX, gCurY)
+      CursorDraw(gCurX, gCurY)
+      DisplayFlushRect(gCurX, gCurY, #CUR_W, #CUR_H)
+    EndIf
+    ScrPresent(y0, y1)
+    ProcedureReturn
+  EndIf
+
+  ; V3D owns a physical render target, so snapshot and update the actual
+  ; scan surface rather than interpreting that target as a logical raster.
+  If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn
+  EndIf
+  PresentedOverlayClock(base, pitch, rot, panelW, panelH, @gBannerClockText[0])
+  If overlap <> 0
+    PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
+  EndIf
+  gPresentedOverlayRect\x = gBannerClockX
+  gPresentedOverlayRect\y = #BANNER_CLOCK_Y
+  gPresentedOverlayRect\w = gBannerClockW
+  gPresentedOverlayRect\h = #BANNER_CLOCK_H
+  PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+  If overlap <> 0
+    gPresentedOverlayRect\x = gCurX
+    gPresentedOverlayRect\y = gCurY
+    gPresentedOverlayRect\w = #CUR_W
+    gPresentedOverlayRect\h = #CUR_H
+    PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE TOUCH KEYBOARD, COMPOSED INTO THE FRAMEBUFFER RENDERER'S FRAME.
+;
+;  This is the CPU/DMA tier's half of the keyboard. The V3D tier's half
+;  is inside its GPU frame (v3d_console.pi4, TouchKeyboardComposeNeon);
+;  there is one layout result and one draw list behind both, so the two
+;  tiers draw the same keyboard at the same pixels and a finger cannot
+;  land on geometry only one of them used.
+;
+;  WHY IT IS HERE. This file is already where a presented overlay is
+;  composed - the banner clock is one - and it is included after both
+;  renderers, so it can see whichever one is active. It adds no second
+;  poll, no second queue and no second presentation path.
+;
+;  WHO OWNS THE FRAME, AND THE ONE TEST THAT DECIDES IT. gCursorGpuOwned
+;  is 1 exactly when V3D is compositing the frame itself, and that is the
+;  same discriminator BannerClockTick uses above. When it is set, this
+;  pass writes NOTHING: the layer is already inside the GPU's frame and a
+;  CPU write here would race a render and a DMA copy.
+; ======================================================================
+Global gTkbMetrics.TouchKeyboardMetrics
+Global gTkbCpuDamage.i   = #TKB_DAMAGE_ALL
+Global gTkbOverlayBound.i = 0
+Global gTkbTried.i = 0
+
+; NOTHING IS DRAWN UNTIL SOMETHING CAN USE IT. The design says in as many
+; words: do not add nonfunctional buttons. Until the input dispatcher
+; routes a contact to this layer and the key model drives show and hide,
+; a keyboard button beside the prompt would be a picture of a feature -
+; it would appear on the glass, be tapped, and do nothing. So the layer
+; lays nothing out and draws nothing until its owner turns it on, once.
+Global gTkbEnabled.i = 0
+
+; ANVIL-TOUCH-KEYBOARD-STATE-BEGIN
+; What the dispatcher currently holds as this layer's ONE rectangle:
+; 0 nothing, 1 the prompt line and the keyboard button, 2 the band.
+Global gTkbRegion.i = 0
+; The view layout generation that rectangle was taken from. A change
+; means the rectangle in the dispatcher describes a band that has moved.
+Global gTkbLayoutGen.i = -1
+; And the generation CANCELLATION is judged against, which is a different
+; question with a different answer: a layout this layer asked for is not
+; the surface going away underneath a finger, and only the second one
+; releases contacts. Two numbers because they are two facts; one number
+; would have to mean both and would be wrong about one of them.
+Global gTkbCancelGen.i = -1
+; A fold over everything the band's PICTURE depends on, so a repaint is
+; asked for when something actually changed and not once a frame.
+Global gTkbSig.i = -1
+; Layouts this surface refused since the last one it accepted. A refusal
+; is a whole sentence waiting in TouchKeyboardRefusal(); this is how many
+; times it has been produced, so a silent non-appearing keyboard is not
+; silent.
+Global gTkbShowRefused.i = 0
+; Set while a payload owns the processor. Nothing in this layer may run,
+; and the flag is what stops the attach path turning it back on under a
+; payload that is still executing.
+Global gTkbSuspended.i = 0
+; ANVIL-TOUCH-KEYBOARD-STATE-END
+
+Procedure TouchKeyboardScreenEnable(on.i)
+  gTkbEnabled = Bool(on <> 0)
+  gTkbTried = 0
+EndProcedure
+
+Procedure.i TouchKeyboardScreenEnabled()
+  ProcedureReturn gTkbEnabled
+EndProcedure
+
+; The console core's geometry stopped meaning anything - a new console
+; size, or the screen going away. Everything the view laid out against it
+; is refused from here until it is laid out again, which is what stops a
+; contact being tested against rectangles describing a screen that is no
+; longer being drawn on.
+Procedure TouchKeyboardOverlayReset()
+  TouchKeyboardLayoutInvalidate()
+  gTkbCpuDamage = #TKB_DAMAGE_ALL
+  gTkbTried = 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE POINTER, ON A TIER WHERE IT HAS NO SAVE-UNDER.
+;
+;  While V3D composes the frame the pointer is drawn INSIDE it, by
+;  V3dConRenderCursor, and there is no CPU save-under to lift and put
+;  back - that is what gCursorGpuOwned says. A band composed after that
+;  frame was presented therefore lands ON TOP of the pointer, and the
+;  design's layer order is the other way round.
+;
+;  So the mask is written again, into the surface that is actually being
+;  scanned, through the one logical-to-physical map - which is exactly
+;  what BannerClockTick does when the clock advances underneath a
+;  pointer, and it is the same two calls. NOTHING about the save-under
+;  mechanism changes here, because on this tier there is not one.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPresentedCursor(y0.i, y1.i)
+  Define base.i
+  Define lw.i
+  Define lh.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define bpp.i
+
+  If gCurShown = 0
+    ProcedureReturn
+  EndIf
+  If gCurY > y1 Or (gCurY + #CUR_H - 1) < y0
+    ProcedureReturn
+  EndIf
+  If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
+    ProcedureReturn
+  EndIf
+  PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
+  gPresentedOverlayRect\x = gCurX
+  gPresentedOverlayRect\y = gCurY
+  gPresentedOverlayRect\w = #CUR_W
+  gPresentedOverlayRect\h = #CUR_H
+  PresentedOverlaySyncRect(base, pitch, rot, panelW, panelH, @gPresentedOverlayRect)
+EndProcedure
+
+; ANVIL-TOUCH-KEYBOARD-COMPOSE-BEGIN
+; THIS PROCEDURE IS LIFTED VERBATIM by tools/keyboard_face_emitted_check.py
+; and by tools/keyboard_gpu_face_emitted_check.py, and compiled into
+; RaspberryPi4/Tests/keyboard_face_emitted_gate.pi4 and
+; RaspberryPi4/Tests/keyboard_gpu_face_emitted_gate.pi4, where it runs over
+; the real key model and the real view with the board's drawing leaves
+; recorded instead of performed - the first over the framebuffer tier, the
+; second over the V3D tier's target buffer. Nothing is copied and nothing is
+; paraphrased: the gates go red if the fences move, and what they execute is
+; this text. Keep the fences where they are.
+;
+; ONE COMPOSER, BOTH TIERS. It used to return at once when the GPU owned the
+; frame, and the V3D tier drew its own keyboard with the engine's cell face -
+; which is the face that was called blocky, on the panel this monitor is
+; actually used on. The band is now composed HERE for both tiers and reaches
+; the panel the way the banner's smooth title already does: drawn in logical
+; coordinates, presented through ScrPresent's transpose, and carried through
+; every later GPU frame by ScrGpuKeepLogicalBand. See the header of
+; TouchKeyboardComposeNeon in RaspberryPi4/Board/v3d_console.pi4.
+Procedure TouchKeyboardComposeCpu()
+  Define n.i
+  Define gpu.i
+  Define i.i
+  Define k.i
+  Define col.i
+  Define fg.i
+  Define bg.i
+  Define s.i
+  Define savedScale.i
+  Define x.i
+  Define y.i
+  Define w.i
+  Define h.i
+  Define p.i
+  Define c.i
+  Define len.i
+  Define sw.i
+  Define drawn.i
+  Define hadCur.i
+  Define y0.i
+  Define y1.i
+
+  If gScreen = 0 Or DisplayBase() = 0
+    ProcedureReturn
+  EndIf
+  If TouchKeyboardLayoutOk() = 0
+    ProcedureReturn
+  EndIf
+  ; WHICH TIER IS UNDERNEATH, ASKED ONCE. gCursorGpuOwned is 1 exactly
+  ; while V3D is compositing the frame itself, and it is the same
+  ; discriminator BannerClockTick uses.
+  gpu = Bool(gCursorGpuOwned <> 0)
+  If gpu <> 0 And TouchKeyboardViewVisible() = 0
+    ; NOTHING OUTSIDE THE BAND IS THIS PASS'S ON THAT TIER. The button
+    ; beside the prompt sits inside the console rectangle, which the GPU
+    ; repaints wholesale every frame; it is drawn there, and a CPU pass
+    ; over those rows would have to be presented with them and would
+    ; carry the frame's other pixels with it.
+    ProcedureReturn
+  EndIf
+
+  ; A renderer that cleared the whole console rectangle erased the band,
+  ; so this pass has to draw itself whole. The latch is the only way to
+  ; know: the renderer clears its own full-clear flag before this runs.
+  If ConOverlayTakeWhole() <> 0
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  EndIf
+  ; AND ON THE GPU TIER IT IS ALWAYS WHOLE. What the presentation seam
+  ; moves is a range of LOGICAL ROWS, and underneath those rows on a
+  ; turned panel lies the GPU's PHYSICAL frame - so every pixel in them
+  ; has to have been painted by this pass or the transpose carries the
+  ; last frame's bytes onto the glass. A whole-band paint per picture
+  ; change is also less work than the tier already does: it used to
+  ; redraw all ~180 keys inside every console frame.
+  If gpu <> 0
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  EndIf
+  ; The button beside the prompt sits inside the console rectangle, which
+  ; the renderer hardware-scrolls and repaints row by row, so it is
+  ; redrawn every pass rather than tracked. It is a dozen small fills.
+  If TouchKeyboardViewVisible() = 0
+    TouchKeyboardMarkButton()
+  EndIf
+
+  n = TouchKeyboardPaint(#TKB_RENDER_CPU, gTkbCpuDamage)
+  gTkbCpuDamage = #TKB_DAMAGE_CHANGED
+  If n < 1
+    ProcedureReturn
+  EndIf
+
+  ; Lift the pointer, exactly as the framebuffer renderer does, so the
+  ; keyboard is drawn UNDER it and its save-under never keeps keyboard
+  ; pixels. This is the established pointer mechanism; the keyboard
+  ; itself saves nothing under anything.
+  hadCur = gCurShown
+  If gpu <> 0
+    ; THERE IS NO SAVE-UNDER TO LIFT ON THIS TIER - the pointer is inside
+    ; the GPU's frame. It is written again over the finished band below,
+    ; through the presented-overlay seam, and this pass leaves the
+    ; pointer mechanism exactly as it found it.
+    hadCur = 0
+  EndIf
+  If hadCur <> 0
+    CursorRestore(gCurX, gCurY)
+    gCurShown = 0
+  EndIf
+
+  ; Whatever magnification the library was on, not whatever the screen
+  ; settings say it should be - those two can differ while a command is
+  ; part way through changing one, and this pass must put back exactly
+  ; what it found.
+  savedScale = dsp_scale
+  s = 0
+  i = 0
+  While i < n
+    k   = TouchKeyboardDrawKind(i)
+    col = TouchKeyboardDrawFg(i)
+    fg  = DisplayRGB((col >> 16) & $FF, (col >> 8) & $FF, col & $FF)
+    If k = #TKB_DRAW_RECT
+      DisplayFillRect(TouchKeyboardDrawX(i), TouchKeyboardDrawY(i), TouchKeyboardDrawW(i), TouchKeyboardDrawH(i), fg)
+    ElseIf k = #TKB_DRAW_TEXT
+      ; A TEXT ITEM IS A LABEL CENTRED IN A BOX. The box is the key's
+      ; face inside its padding; the renderer picks the face and centres
+      ; what it draws, so the view never has to know a font's metrics.
+      col = TouchKeyboardDrawBg(i)
+      bg  = DisplayRGB((col >> 16) & $FF, (col >> 8) & $FF, col & $FF)
+      x = TouchKeyboardDrawX(i)
+      y = TouchKeyboardDrawY(i)
+      w = TouchKeyboardDrawW(i)
+      h = TouchKeyboardDrawH(i)
+      p = TouchKeyboardDrawText(i)
+      drawn = 0
+      ; THE SMOOTH FACE FIRST - the 30 px anti-aliased sans (font 3),
+      ; the same renderer that draws "PureMetal Forge" in the banner,
+      ; blended onto the key's own face colour - whenever the box has
+      ; room for its line height and the label's real width. Project
+      ; ruling, 2026-09-11: the cell font magnified was called blocky and
+      ; the key labels are to be set in the same kind of face the banner
+      ; title is.
+      If h >= #FONT_keys_LINEH
+        sw = SmoothTextWidth(p, 3)
+        If sw <= w
+          DrawSmoothText(x + (w - sw) / 2, y + (h - #FONT_keys_LINEH) / 2 + #FONT_keys_ASC, p, 3, fg, bg)
+          drawn = 1
+        EndIf
+      EndIf
+      If drawn = 0
+        ; THE BITMAP FONT AT INTEGER MAGNIFICATION, for a box the smooth
+        ; face does not fit: a whole number of pixels per glyph pixel,
+        ; never a filtered enlargement of a finished bitmap - a filtered
+        ; 1-bit glyph is a blurred glyph.
+        If TouchKeyboardDrawScale(i) <> s
+          s = TouchKeyboardDrawScale(i)
+          DisplayScale(s)
+        EndIf
+        len = 0
+        While PeekA(p + len) <> 0
+          len = len + 1
+        Wend
+        x = x + (w - len * DisplayCharWidth()) / 2
+        y = y + (h - DisplayCharHeight()) / 2
+        c = PeekA(p) & $FF
+        While c <> 0
+          DisplayChar(x, y, c, fg, bg)
+          x = x + DisplayCharWidth()
+          p = p + 1
+          c = PeekA(p) & $FF
+        Wend
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  DisplayScale(savedScale)
+
+  If hadCur <> 0
+    CursorSave(gCurX, gCurY)
+    CursorDraw(gCurX, gCurY)
+    gCurShown = 1
+    DisplayFlushRect(gCurX, gCurY, #CUR_W, #CUR_H)
+  EndIf
+
+  ; THE BUTTON IS INSIDE THE ROWS THE RENDERER HARDWARE-SCROLLS. Leave a
+  ; quiet repaint flag on them: when the console scrolls, the flag travels
+  ; with the picture to wherever the moved copy of the button landed, the
+  ; renderer repaints those rows from the grid, and this pass draws the
+  ; button again. That is what stops a trail of buttons walking up the
+  ; screen, and it costs three row repaints rather than the scroll itself.
+  ; ONLY WHILE THE BUTTON IS ON THE GLASS. It is not drawn once the band
+  ; is up - the chevron is the affordance then - and marking rows for a
+  ; picture that is not being painted would repaint three console rows on
+  ; every pass for nothing.
+  If TouchKeyboardViewVisible() = 0
+    y0 = (TouchKeyboardButtonY() - LogoHeight()) / DisplayCharHeight()
+    y1 = (TouchKeyboardButtonY() + TouchKeyboardButtonH() - 1 - LogoHeight()) / DisplayCharHeight()
+    If y0 < 0
+      y0 = 0
+    EndIf
+    While y0 <= y1
+      ConMarkViewRowQuiet(y0)
+      y0 = y0 + 1
+    Wend
+  EndIf
+
+  ; THE SEAM. On HDMI and on the panel at 0 and 180 this is a comparison
+  ; and a return; on a turned panel it is the one pass that puts these
+  ; rows on the glass, and it covers the damage and nothing else.
+  y0 = TouchKeyboardDamageTop()
+  y1 = TouchKeyboardDamageBottom()
+  If y0 < 0 Or y1 < y0
+    ProcedureReturn
+  EndIf
+  If hadCur <> 0
+    If gCurY < y0
+      y0 = gCurY
+    EndIf
+    If (gCurY + #CUR_H - 1) > y1
+      y1 = gCurY + #CUR_H - 1
+    EndIf
+  EndIf
+  If gpu <> 0
+    ; THE DRAIN BEFORE THE COPY, and it is the same statement
+    ; V3dConBlitBanner makes for the banner it has just drawn: with the
+    ; framebuffer mapped Normal Non-Cacheable these writes go through a
+    ; store buffer that may gather and reorder them, so the transpose -
+    ; and the DMA copy that carries this band through the next GPU frame
+    ; - could read the band before its glyphs have reached DRAM. dsb sy
+    ; makes them complete to the point of coherency first. Harmless with
+    ; caches off, where the writes were already Device-ordered.
+    a64_barrier()
+  EndIf
+  ScrPresent(y0, y1)
+  If gpu <> 0
+    TouchKeyboardPresentedCursor(y0, y1)
+  EndIf
+EndProcedure
+; ANVIL-TOUCH-KEYBOARD-COMPOSE-END
+
+; ----------------------------------------------------------------------
+;  The surface measurements the layout is computed from, read from the
+;  display and screen seams and from nowhere else.
+;
+;  THE DENSITY IS A READING OR IT IS NOTHING. ScrDiagMeasured() is 1 only
+;  when the screen actually said how big it is - the DSI panel's own
+;  microcontroller does, over I2C. HDMI's 24 inch figure is a stated
+;  assumption, and an assumption is not a measurement to size a finger
+;  target from, so this hands the view 0 and the view falls back to the
+;  existing explicit display scale. Nothing here asserts a guessed inch.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardScreenMetrics()
+  gTkbMetrics\logicalW     = DisplayWidth()
+  gTkbMetrics\logicalH     = DisplayHeight()
+  gTkbMetrics\bannerH      = LogoHeight()
+  gTkbMetrics\cellW        = DisplayCharWidth()
+  gTkbMetrics\cellH        = DisplayCharHeight()
+  gTkbMetrics\displayScale = gScrScale
+  If ScrDiagMeasured(gScrSrc) <> 0
+    gTkbMetrics\ppi = ScrPpi(gScrSrc)
+  Else
+    gTkbMetrics\ppi = 0
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchKeyboardScreenAttach - register the layer, and lay it out ONCE so
+;  the button beside the prompt exists before anybody asks for a keyboard.
+;
+;  ONLY ON A BOARD THAT CAN BE TOUCHED. A button an operator cannot tap is
+;  worse than no button: it says this monitor has a touch keyboard on a
+;  screen that has no touch controller. HwTouchReady() is the whole test,
+;  and on a board without one nothing here draws at all.
+;
+;  Tried ONCE per geometry, not once per service tick. A refusal is a fact
+;  about this screen and re-deriving it sixty times a second would only
+;  spend the tick budget to reach the same sentence.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardScreenAttach()
+  If gTkbOverlayBound = 0
+    ConSetOverlay(@TouchKeyboardComposeCpu, @TouchKeyboardOverlayReset)
+    gTkbOverlayBound = 1
+  EndIf
+  ; THE LAYER TURNS ITSELF ON THE MOMENT THERE IS A FINGER THAT CAN REACH
+  ; IT. The flag above was written while the model and the dispatcher did
+  ; not exist yet and a button beside the prompt would have been a picture
+  ; of a feature. Both exist now: a tap on that button opens a keyboard
+  ; that types into the same editor a serial byte does. So the test is the
+  ; one the flag's own comment named - can this board be touched at all -
+  ; and on a board with no touch controller HwTouchReady() is 0 and
+  ; nothing here draws, exactly as before.
+  If gTkbEnabled = 0 And gTkbSuspended = 0 And HwTouchReady() <> 0
+    gTkbEnabled = 1
+  EndIf
+  If gTkbEnabled = 0 Or gTkbTried <> 0 Or gScreen = 0 Or ConGridReady() = 0
+    ProcedureReturn
+  EndIf
+  If HwTouchReady() = 0
+    ProcedureReturn
+  EndIf
+  gTkbTried = 1
+  TouchKeyboardScreenMetrics()
+  If TouchKeyboardLayout(@gTkbMetrics) <> 0
+    TouchKeyboardViewSetVisible(0)
+    gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+    ConOverlayDamage()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Show the keyboard: lay it out against the live surface and RESERVE the
+;  bottom of the console for it. Returns 1, or 0 with a whole-sentence
+;  refusal waiting in TouchKeyboardRefusal() for the caller to print -
+;  nothing in this file prints, because it runs from the service tick.
+;
+;  NOT ONE STORED CELL IS TOUCHED. ConSetViewRows changes how much of the
+;  grid is painted and nothing else; the history, the scroll position and
+;  the text cursor are exactly where they were.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardScreenShow()
+  If gScreen = 0 Or ConGridReady() = 0
+    ProcedureReturn 0
+  EndIf
+  ; Being asked to show it IS the statement that something can use it.
+  gTkbEnabled = 1
+  TouchKeyboardScreenAttach()
+  TouchKeyboardScreenMetrics()
+  If TouchKeyboardLayout(@gTkbMetrics) = 0
+    ProcedureReturn 0
+  EndIf
+  TouchKeyboardViewSetVisible(1)
+  ConSetViewRows(TouchKeyboardConsoleRows())
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  ConOverlayDamage()
+  ProcedureReturn 1
+EndProcedure
+
+; Hide it. The revealed rows are repainted FROM THE RETAINED CONTENT -
+; there is nothing to reconstruct, because nothing was ever taken out.
+Procedure TouchKeyboardScreenHide()
+  TouchKeyboardViewSetVisible(0)
+  ConViewRelease()
+  TouchKeyboardMarkAll()
+  gTkbCpuDamage = #TKB_DAMAGE_TRANSITION
+  ConOverlayDamage()
+EndProcedure
+
+; ANVIL-TOUCH-KEYBOARD-INTEGRATION-BEGIN
+; ======================================================================
+;  THE KEYBOARD'S SERVICE - WHERE THE MODEL, THE VIEW AND THE ONE
+;  DISPATCHER ARE ACTUALLY JOINED
+; ======================================================================
+;  THE TWO FENCED SECTIONS OF THIS FILE - the layer's state above and
+;  everything down to the matching END comment below - ARE LIFTED
+;  VERBATIM by tools/touch_keyboard_integration_emitted_check.py and
+;  compiled into RaspberryPi4/Tests/touch_keyboard_integration_emitted_
+;  gate.pi4, where they run against the real model, the real view, the
+;  real dispatcher and the real editor with the board's leaves stubbed.
+;  Nothing is copied and nothing is paraphrased: the gate goes red if the
+;  fences move, and what it executes is this text. Keep the section free
+;  of anything that needs a register, and keep the fences where they are.
+; ======================================================================
+;  Three files were built to be provable on their own and none of them
+;  reaches for another: the model (Anvil/Core/touch_keyboard.pbi) asks
+;  the view one question and emits into its own ring; the view
+;  (Anvil/Graphics/touch_keyboard_view.pbi) is integer arithmetic over
+;  one layout result; the dispatcher (Anvil/Core/input_events.pbi) routes
+;  contacts and carries the one input queue. This is the board adapter
+;  that joins them, and it is the only place that knows all three exist.
+;
+;  IT RUNS FROM THE PROMPT'S SPIN AND FROM NOWHERE ELSE. Anvil/Core/
+;  parse.pbi's ReadLine calls it immediately after TouchTick(), which is
+;  the one drain of the hardware ring. That ordering is the whole design:
+;  the hardware is drained once, the dispatcher decides who owns each
+;  contact, and then each owner empties its OWN lane inside the same
+;  pass. There is no second poll of anything here.
+;
+;  AND IT RUNS AT THE PROMPT AND NOT DURING A COMMAND. A keystroke
+;  serviced while a payload, an upload or a long boot step owns the
+;  processor would sit in the input queue and be applied to the next
+;  line - which is the design's "queued touches cannot execute a command
+;  after upload", and it is prevented by not servicing them at all
+;  rather than by filtering them afterwards.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  ONE RECTANGLE PER OWNER, AND THIS LAYER'S CHANGES WITH ITS STATE.
+;
+;  The dispatcher holds exactly one hit rectangle for each owner and
+;  decides ownership once, at the DOWN. While the band is up, this
+;  layer's rectangle IS the band - so a contact that starts on a key
+;  belongs to the keyboard until it ends, even dragged outside, and can
+;  never click the console underneath. While the band is down, the
+;  rectangle is the editable prompt line together with the keyboard
+;  button, because a deliberate tap on either is how the keyboard is
+;  asked for - and asking for it through the SAME dispatcher is what
+;  stops this being a second poll of the touch stream.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardRegionInstall(which.i)
+  If which = 2
+    InputRegionSet(#AIO_KEYBOARD, TouchKeyboardBandX(), TouchKeyboardBandY(), TouchKeyboardBandW(), TouchKeyboardBandH())
+  ElseIf which = 1
+    InputRegionSet(#AIO_KEYBOARD, TouchKeyboardIdleX(), TouchKeyboardIdleY(), TouchKeyboardIdleW(), TouchKeyboardIdleH())
+  Else
+    InputRegionClear(#AIO_KEYBOARD)
+  EndIf
+  gTkbRegion = which
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A LAYOUT GENERATION CHANGE CANCELS EVERYTHING IN FLIGHT.
+;
+;  "Rotation, screen switch, resizing, renderer reset or loss of focused
+;  client cancels all active contacts/modifiers/repeat state before new
+;  hit geometry is installed. Retain typed text." The view bumps its
+;  generation on every layout and every invalidation, so that number is
+;  the one thing that has to be watched - not five separate events, each
+;  of which somebody has to remember to hook.
+;
+;  IT CANCELS ONLY WHAT IS ACTUALLY HELD. Showing and hiding the keyboard
+;  lays it out again, so an unconditional cancel here would bump the
+;  focus generation every time the band moved and send the editor a
+;  cancellation notice for a finger nobody had on the glass.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardGenerationTick()
+  Define gen.i
+  gen = TouchKeyboardLayoutGeneration()
+  If gen = gTkbCancelGen
+    ProcedureReturn 0
+  EndIf
+  gTkbCancelGen = gen
+  If TouchKeyboardContactCount() > 0
+    TouchKeyboardCancelAll(#TK_CANCEL_VIEW)
+  EndIf
+  If InputCaptureCount() > 0
+    InputCancelAll(#AIC_LAYOUT_CHANGE)
+  EndIf
+  gTkbSig = -1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE BAND FOLLOWS THE MODEL'S INTENT, AND THE MODEL IS ITS ONLY WRITER.
+;
+;  TouchKeyboardShow and TouchKeyboardHide in the model write INTENT, not
+;  state; this reads that intent and makes the screen and the dispatcher
+;  agree with it. Reading the DESIRED state rather than the current one
+;  is deliberate: the model's own state machine only advances on its
+;  tick, and a chevron tapped half way through a drain has to stop taking
+;  keystrokes in that same pass rather than one pass later.
+;
+;  THERE IS NO SLIDE. The design allows one and equally allows presenting
+;  the final layout directly; this monitor composes the band into the
+;  console's own frame, so an interpolated band would be an extra full
+;  repaint per frame for a 110 ms decoration. The model still carries the
+;  transition, and TouchKeyboardSlidePermille is still the seam a
+;  renderer with frames to spare would read.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardLayerReconcile()
+  Define want.i
+  Define asked.i
+
+  want = 0
+  asked = 0
+  If gTkbEnabled <> 0 And gTkbSuspended = 0 And TouchKeyboardLayoutOk() <> 0
+    want = 1
+    If TouchKeyboardDesiredState() <> #TK_STATE_HIDDEN
+      want = 2
+    EndIf
+    If want = 2 And TouchKeyboardViewVisible() = 0
+      asked = 1
+      If TouchKeyboardScreenShow() = 0
+        ; THE SURFACE REFUSED IT, IN A WHOLE SENTENCE. Put the model back
+        ; where it was rather than leave it believing it is open with no
+        ; band on the glass, and count the refusal so a keyboard that never
+        ; appears is not a keyboard that failed in silence.
+        gTkbShowRefused = gTkbShowRefused + 1
+        TouchKeyboardHide()
+        want = 1
+      EndIf
+    ElseIf want = 1 And TouchKeyboardViewVisible() <> 0
+      asked = 1
+      TouchKeyboardScreenHide()
+    EndIf
+  ElseIf TouchKeyboardViewVisible() <> 0
+    ; The layer may not exist any more - it was suspended for a payload,
+    ; or the geometry it was laid out against has been invalidated - and a
+    ; band left on the glass over a console that is not reserving rows for
+    ; it is the stale overlay the design forbids.
+    asked = 1
+    TouchKeyboardScreenHide()
+  EndIf
+
+  ; A LAYOUT THIS LAYER ASKED FOR IS NOT THE SURFACE GOING AWAY. Showing
+  ; and hiding both lay the keyboard out again and both move the view's
+  ; generation, and treating that as "the world changed underneath a
+  ; finger" would cancel the very contact that tapped the prompt line to
+  ; open the keyboard. Adopt it instead, and leave the cancellation for
+  ; the generation changes this layer did NOT cause: a rotation, a screen
+  ; switch, a renderer reset, a console geometry change.
+  If asked <> 0
+    gTkbCancelGen = TouchKeyboardLayoutGeneration()
+  EndIf
+  TouchKeyboardGenerationTick()
+
+  If want <> gTkbRegion Or TouchKeyboardLayoutGeneration() <> gTkbLayoutGen
+    TouchKeyboardRegionInstall(want)
+    gTkbLayoutGen = TouchKeyboardLayoutGeneration()
+  EndIf
+EndProcedure
+
+Procedure.i TouchKeyboardRefusedCount()
+  ProcedureReturn gTkbShowRefused
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHY THE KEYBOARD CANCELLED, SAID IN THE DISPATCHER'S OWN VOCABULARY.
+;
+;  The model's reasons and the dispatcher's reasons are two different
+;  lists that happen to start at 1, and handing one to the other would
+;  print a correct-looking sentence about the wrong event. They are
+;  translated here, by name, once - so a new reason on either side is a
+;  hole in this Select and not a wrong sentence on a screen.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardCancelReasonFor(tk.i)
+  Select tk
+    Case #TK_CANCEL_TOUCH
+      ProcedureReturn #AIC_TOUCH_LOST
+    Case #TK_CANCEL_HIDDEN
+      ProcedureReturn #AIC_FOCUS_CHANGE
+    Case #TK_CANCEL_GENERATION
+      ProcedureReturn #AIC_FOCUS_CHANGE
+    Case #TK_CANCEL_OVERFLOW
+      ProcedureReturn #AIC_QUEUE_FULL
+    Case #TK_CANCEL_CONTACTS
+      ProcedureReturn #AIC_CONTACT_LOST
+    Case #TK_CANCEL_CLIENT
+      ProcedureReturn #AIC_PAYLOAD
+    Case #TK_CANCEL_VIEW
+      ProcedureReturn #AIC_LAYOUT_CHANGE
+  EndSelect
+  ProcedureReturn #AIC_CONTACT_LOST
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ONE ROUTED CONTACT EVENT. The record is the dispatcher's 40-byte one
+;  and its first four fields are the HAL's, in the HAL's order, which is
+;  why the model can be handed the same pointer without a translation.
+;
+;  THE ORDER OF THE THREE QUESTIONS IS THE BEHAVIOUR:
+;
+;    a CANCEL always reaches the model, whatever is on screen, because a
+;    lost contact that nobody releases is a stuck Shift;
+;
+;    with the band down, a DOWN on the prompt line or on the keyboard
+;    button OPENS it and nothing else happens - no key is armed, because
+;    there are no keys on the glass to arm;
+;
+;    with the band up, a DOWN on the chevron HIDES IT AND EMITS NOTHING.
+;    It is asked first, so the contact is never armed and the editor
+;    never sees a keystroke: putting the keyboard away is not typing.
+;    The model carries the same rule as its own hide key, which is what
+;    its own gate proves; the view answers first, so in the monitor that
+;    path is not the one taken.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardRouteOne(*rev)
+  Define st.i
+  Define x.i
+  Define y.i
+
+  st = PeekL(*rev + #AIT_EV_ST)
+  x  = PeekL(*rev + #AIT_EV_X)
+  y  = PeekL(*rev + #AIT_EV_Y)
+
+  If st = #AIT_CANCEL
+    TouchKeyboardRouteTouch(*rev)
+    ProcedureReturn
+  EndIf
+
+  If TouchKeyboardViewVisible() = 0
+    If st <> #AIT_DOWN
+      ProcedureReturn
+    EndIf
+    If TouchKeyboardButtonHit(x, y) <> 0 Or TouchKeyboardPromptHit(x, y) <> 0
+      TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc)
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  If st = #AIT_DOWN
+    If TouchKeyboardHideHit(x, y) <> 0
+      TouchKeyboardHide()
+      ProcedureReturn
+    EndIf
+  EndIf
+
+  TouchKeyboardRouteTouch(*rev)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PICTURE FOLLOWS THE MODEL, AND ONLY WHEN THE MODEL MOVED.
+;
+;  A key's face changes when it is armed, when a modifier latches and
+;  when the page switches, and nothing else about the band changes at
+;  all. This folds those three into one number and repaints when it
+;  differs - so a finger sliding across the glass at the controller's
+;  full rate costs one repaint per key it crosses instead of one per
+;  report, and a finger resting still costs none.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPictureTick()
+  Define sig.i
+  Define i.i
+  Define n.i
+  sig = TouchKeyboardShiftState() + 8 * TouchKeyboardCtrlState() + 64 * TouchKeyboardPage()
+  n = TouchKeyboardKeyCount()
+  i = 0
+  While i < n
+    If TouchKeyboardKeyIsArmed(i) <> 0
+      sig = sig + (i + 1) * 1024
+    EndIf
+    i = i + 1
+  Wend
+  If sig = gTkbSig
+    ProcedureReturn
+  EndIf
+  gTkbSig = sig
+  TouchKeyboardMarkAll()
+  ConOverlayDamage()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchKeyboardServiceTick - the whole join, in the order it has to be
+;  in.
+;
+;  1  THE CLOCK FIRST. The model is told the time once per pass and every
+;     timing rule in it is arithmetic on that number; its own header says
+;     the service loop must tick before it drains touch, because routing
+;     uses the last value tick was given.
+;  2  THE FOCUS GENERATION. The dispatcher owns it; the model is handed
+;     it and cancels itself if it moved underneath.
+;  3  RECONCILE, so the rectangle the dispatcher is about to be asked
+;     about is the one that matches what is on the glass.
+;  4  DRAIN THIS LAYER'S OWN LANE. One pop at a time, routed once.
+;  5  RECONCILE AGAIN, because a chevron or a prompt tap inside that
+;     drain changed what should be on the glass.
+;  6  HAND THE MODEL'S EVENTS TO THE ONE INPUT QUEUE, in the order it
+;     produced them, so a soft keystroke and a serial byte that arrived
+;     in the same pass reach the editor in the order they happened.
+;  7  REPAINT, if the picture changed.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardServiceTick()
+  Define k.i
+  Define rc.i
+  Dim rev.a[#AIT_EVSZ]
+  Dim ev.a[#AIE_EVSZ]
+
+  If gTkbEnabled = 0 Or gTkbSuspended <> 0
+    ProcedureReturn
+  EndIf
+
+  TouchKeyboardTick(millis())
+  TouchKeyboardSetGeneration(InputFocusGeneration())
+  TouchKeyboardLayerReconcile()
+
+  While InputTouchPop(#AIO_KEYBOARD, @rev[0]) = 1
+    TouchKeyboardRouteOne(@rev[0])
+  Wend
+
+  TouchKeyboardLayerReconcile()
+
+  While TouchKeyboardPop() <> 0
+    k = TouchKeyboardEventKind()
+    If k = #AIE_CANCEL
+      rc = InputEventInit(@ev[0], #AIE_CANCEL, TouchKeyboardEventSource(), TouchKeyboardCancelReasonFor(TouchKeyboardEventCode()), 0)
+    Else
+      rc = InputEventInit(@ev[0], k, TouchKeyboardEventSource(), TouchKeyboardEventCode(), TouchKeyboardEventModifiers())
+    EndIf
+    If rc = #AIE_OK
+      rc = InputEventsPush(@ev[0])
+    EndIf
+    If rc <> #AIE_OK
+      ; THE QUEUE REFUSED A KEYSTROKE AND SAID SO. On saturation it has
+      ; already cancelled everything it owns and bumped the generation;
+      ; the keyboard's own contacts, modifiers and repeats have to go the
+      ; same way, or a finger would still be holding a key in a world
+      ; that has been reset underneath it.
+      TouchKeyboardCancelAll(#TK_CANCEL_OVERFLOW)
+      Break
+    EndIf
+  Wend
+
+  If TouchKeyboardViewVisible() <> 0
+    TouchKeyboardPictureTick()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE OPERATOR'S OWN HAND, ON THE PATH A FINGER USES AND NOT BESIDE IT.
+;
+;  `screen keyboard show` and `screen keyboard hide` exist because until
+;  now the ONLY way to put the band on the glass was to touch it, so
+;  every proof of what the keyboard looks like needed somebody standing
+;  at the bench - and a monitor whose console can do everything except
+;  the one thing that is on the screen is a monitor with a hole in it.
+;
+;  IT IS THE SAME PATH, NOT A SECOND ONE. TouchKeyboardRouteOne calls
+;  TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc) when a finger lands on
+;  the button or the prompt line, and TouchKeyboardHide() when it lands
+;  on the chevron; this writes the SAME intent into the SAME model and
+;  then runs the SAME service tick, so the focus generation, the
+;  viewport move, the dispatcher's rectangle, the refusal counter and the
+;  repaint all happen exactly as they do for a tap. A command that
+;  reached past the model into TouchKeyboardScreenShow would be a test
+;  hook wearing a command's name, and the first thing it would fail to
+;  reproduce is the one that matters - what a finger actually does.
+;
+;  want: 1 show, 0 hide, -1 ask only.
+;  Returns 1 when the band is up afterwards and 0 when it is down.
+; ----------------------------------------------------------------------
+Procedure.i TouchKeyboardRequest(want.i)
+  If want = 1
+    If gTkbSuspended <> 0
+      ProcedureReturn 0
+    EndIf
+    ; BEING ASKED FOR IT IS THE STATEMENT THAT SOMETHING CAN USE IT, the
+    ; same sentence TouchKeyboardScreenShow makes for a tap.
+    gTkbEnabled = 1
+    TouchKeyboardShow(#AIF_COMMAND_LINE, gScrSrc)
+  ElseIf want = 0
+    TouchKeyboardHide()
+  EndIf
+  TouchKeyboardServiceTick()
+  ProcedureReturn Bool(TouchKeyboardViewVisible() <> 0)
+EndProcedure
+
+; What the layer currently holds, for a report that does not have to
+; guess: 0 nothing, 1 the prompt line and the button, 2 the band.
+Procedure.i TouchKeyboardLayerRegion()
+  ProcedureReturn gTkbRegion
+EndProcedure
+
+; 1 while a payload owns the processor and this layer may not exist.
+Procedure.i TouchKeyboardLayerSuspended()
+  ProcedureReturn gTkbSuspended
+EndProcedure
+
+; 1 once something has turned the layer on - a touch controller answering
+; at attach, a tap, or the command above.
+Procedure.i TouchKeyboardLayerEnabled()
+  ProcedureReturn gTkbEnabled
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PAYLOAD HANDOVER. Called from RunAt, on both sides of the jump.
+;
+;  "At raw upload or exclusive payload execution, disable/hide keyboard
+;  and cancel held events before handoff. Restore it only after the
+;  monitor regains valid ownership."
+;
+;  EVERYTHING GOES, IN THE ORDER THAT LEAVES NOTHING BEHIND: the model's
+;  contacts and modifiers first, then its intent, then the band and the
+;  console rows it reserved, then this layer's rectangle in the
+;  dispatcher, and last the dispatcher's own captures and queue. Typed
+;  text is NOT touched - InputCancelAll is explicit that a cancellation
+;  is about contacts and modifiers, and the half-typed command belongs to
+;  whoever typed it.
+;
+;  THE SUSPENDED FLAG IS WHAT MAKES IT STICK. Without it the next
+;  TouchKeyboardScreenAttach would turn the layer straight back on,
+;  because the board still has a touch controller - and the point is not
+;  that touch is gone, it is that this monitor is not the thing running.
+; ----------------------------------------------------------------------
+Procedure TouchKeyboardPayloadSuspend()
+  TouchKeyboardCancelAll(#TK_CANCEL_CLIENT)
+  TouchKeyboardHide()
+  If TouchKeyboardViewVisible() <> 0
+    TouchKeyboardScreenHide()
+  EndIf
+  TouchKeyboardRegionInstall(0)
+  gTkbSuspended = 1
+  gTkbEnabled = 0
+  gTkbSig = -1
+  InputCancelAll(#AIC_PAYLOAD)
+EndProcedure
+
+; The monitor has its caches, its console and its DMA channel back. The
+; layer is allowed to exist again - and it starts from nothing, because
+; the surface it was laid out against was in the payload's hands and
+; every rectangle derived from it is now a guess.
+Procedure TouchKeyboardPayloadResume()
+  gTkbSuspended = 0
+  TouchKeyboardOverlayReset()
+EndProcedure
+; ANVIL-TOUCH-KEYBOARD-INTEGRATION-END
+
+; Safe boot/prompt service boundary. Call after a meaningful progress line
+; or driver phase tick, never for every character and never from UartWrite.
+Global gScreenMemoryFault.i
+Procedure ScreenServiceTick()
+  If DisplayMemorySafe() = 0
+    If gScreenMemoryFault = 0
+      gScreenMemoryFault = 1
+      UartMirror(0)
+      PrintN("DMA error -20: screen memory is quarantined because DMA has not stopped safely.")
+      PrintN("Drawing is suspended; diagnose the channel before explicitly recovering it.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If gScreenServiceBusy <> 0
+    ProcedureReturn
+  EndIf
+  gScreenServiceBusy = 1
+  TouchKeyboardScreenAttach()
+  ScreenPump()
+  BannerClockTick()
+  ScreenBannerTick()
+  gScreenServiceBusy = 0
+EndProcedure
+
+; Begin mirroring before a surface exists. ConDrainRing refuses while the
+; grid is uninitialised, so the handful of bytes printed before ScreenUp
+; remain queued and are painted the moment the panel starts scanning. This
+; is retained history for those few lines only - it is NOT a claim that a
+; dark, pre-scan panel displayed its own bring-up live, and it is not the
+; boot log: the screen now comes up before the slow half of the boot, so
+; everything after it paints as it is printed.
+;
+; IT ALSO ARMS THE BOOT TRANSCRIPT, which is a different buffer for a
+; different job. The mirror ring is a few kilobytes of bytes not yet
+; consumed; the transcript is the bytes that WERE consumed, kept so a grid
+; rebuilt at a geometry the settings store named can be restored from what
+; was said rather than from pixels of the wrong shape. The tap is in
+; ConDrainRing (console.pi4).
+Procedure ScreenEarlyLogStart()
+  BootTranscriptStart()
+  ; PAINT EVERY BOOT LINE AS IT IS PRINTED. See ConMirrorDrain: outside
+  ; this window the drain is the pure one it has always been.
+  ConSetLiveBoot(1)
+  UartMirror(1)
+EndProcedure
+
+; The boot log is finished. Freeze the transcript here: after this line the
+; console is the operator's, and retaining their session would cost the
+; buffer the boot log is the valuable half of - and would replay their
+; typing back at them if the geometry ever moved again.
+Procedure ScreenEarlyLogFinish()
+  BootTranscriptStop()
+  ConSetLiveBoot(0)
+  If gScreen = 0
+    UartMirror(0)
+    ProcedureReturn
+  EndIf
+  ScreenServiceTick()
+EndProcedure

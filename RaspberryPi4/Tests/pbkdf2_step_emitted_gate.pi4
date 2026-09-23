@@ -1,0 +1,107 @@
+; Executed-code gate for resumable PBKDF2-HMAC-SHA1.
+; DIAGNOSTIC. The strings are published RFC/IEEE test vectors, never a
+; credential from a board or settings file.
+
+XIncludeFile "RaspberryPi4/Lib/sha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/hmacsha1.pi4"
+XIncludeFile "RaspberryPi4/Lib/pbkdf2.pi4"
+
+Global Dim stepOut.a[32]
+Global Dim stepNoise.a[20]
+; Non-secret progress witnesses read by the emitted runner if a bounded
+; execution ceiling is reached. They never contain password/PMK bytes.
+Global stepGatePhase.i
+Global stepGateCalls.i
+
+Procedure.i SameBytes(a.i, b.i, n.i)
+  Define i.i
+  For i = 0 To n - 1
+    If PeekA(a + i) <> PeekA(b + i)
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define calls.i
+  Define state.i
+  Define i.i
+
+  ; RFC 6070's password/salt shape at c=257, independently known here.
+  stepGatePhase = 1 : stepGateCalls = 0
+  If Pbkdf2StepBegin(?stepPassword, 8, ?stepSalt, 4, 257, @stepOut[0], 20) <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn 1
+  EndIf
+  calls = 0
+  Repeat
+    state = Pbkdf2Step(16)
+    calls = calls + 1
+    stepGateCalls = calls
+    ; Deliberately replace HMAC's cached key between every slice. Step must
+    ; restore its own PRF key and produce exactly the same derivation.
+    HmacSha1Of(?stepNoiseKey, 5, ?stepNoiseMsg, 7, @stepNoise[0])
+  Until state <> #PBKDF2_STEP_RUNNING
+  If state <> #PBKDF2_STEP_DONE : ProcedureReturn 2 : EndIf
+  If calls <> 17 : ProcedureReturn 3 : EndIf
+  If SameBytes(@stepOut[0], ?stepExpected257, 20) = 0 : ProcedureReturn 4 : EndIf
+  For i = 0 To 19
+    If secPbkdf2StepU[i] <> 0 Or secPbkdf2StepT[i] <> 0 : ProcedureReturn 13 : EndIf
+  Next
+
+  ; Wpa2PskStepBegin must be the IEEE Annex-H.4 mapping: 4096 PRFs for
+  ; each of two output blocks, 32 bytes total. Sixteen PRFs per call means
+  ; exactly 512 service opportunities, independent of CPU clock.
+  Pbkdf2StepWipe()
+  stepGatePhase = 2 : stepGateCalls = 0
+  If Wpa2PskStepBegin(?stepPassword, 8, ?stepIeee, 4, @stepOut[0]) <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn 5
+  EndIf
+  calls = 0
+  Repeat
+    state = Pbkdf2Step(16)
+    calls = calls + 1
+    stepGateCalls = calls
+  Until state <> #PBKDF2_STEP_RUNNING
+  If state <> #PBKDF2_STEP_DONE : ProcedureReturn 6 : EndIf
+  If calls <> 512 : ProcedureReturn 7 : EndIf
+  If SameBytes(@stepOut[0], ?stepExpectedWpa2, 32) = 0 : ProcedureReturn 8 : EndIf
+
+  ; Cancellation owns and wipes the private U/T state, and a second begin
+  ; cannot silently replace a live derivation.
+  Pbkdf2StepWipe()
+  stepGatePhase = 3 : stepGateCalls = 0
+  If Pbkdf2StepState() <> #PBKDF2_STEP_IDLE : ProcedureReturn 9 : EndIf
+  If Pbkdf2StepBegin(?stepPassword, 8, ?stepSalt, 4, 257, @stepOut[0], 20) <> #PBKDF2_STEP_RUNNING
+    ProcedureReturn 10
+  EndIf
+  If Pbkdf2StepBegin(?stepPassword, 8, ?stepSalt, 4, 2, @stepOut[0], 20) <> #PBKDF2_STEP_ERROR
+    ProcedureReturn 11
+  EndIf
+  Pbkdf2Step(1)
+  Pbkdf2StepWipe()
+  If Pbkdf2StepState() <> #PBKDF2_STEP_IDLE : ProcedureReturn 12 : EndIf
+  For i = 0 To 19
+    If secPbkdf2StepU[i] <> 0 Or secPbkdf2StepT[i] <> 0 : ProcedureReturn 14 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+DataSection
+  stepPassword:
+  Data.a 112,97,115,115,119,111,114,100       ; "password"
+  stepSalt:
+  Data.a 115,97,108,116                       ; "salt"
+  stepIeee:
+  Data.a 73,69,69,69                          ; "IEEE"
+  stepNoiseKey:
+  Data.a 110,111,105,115,101                  ; "noise"
+  stepNoiseMsg:
+  Data.a 109,101,115,115,97,103,101           ; "message"
+  stepExpected257:
+  Data.a $26,$C1,$B1,$19,$69,$DC,$5F,$88,$40,$91
+  Data.a $E5,$1D,$34,$37,$1C,$D6,$EB,$55,$03,$E9
+  stepExpectedWpa2:
+  Data.a $F4,$2C,$6F,$C5,$2D,$F0,$EB,$EF,$9E,$BB,$4B,$90,$B3,$8A,$5F,$90
+  Data.a $2E,$83,$FE,$1B,$13,$5A,$70,$E2,$3A,$ED,$76,$2E,$97,$10,$A1,$2E
+EndDataSection

@@ -1,0 +1,156 @@
+; Executable emitted-code gate for the payload run record and `last run`.
+;
+; The REAL RaspberryPi4/Board/runrecord.pi4 and Anvil/Core/format.pbi are
+; compiled for the Pi 4 and executed under the A64 interpreter. Only the
+; board's clock, its boot counter and the UART are stubbed, and the record
+; page is moved into the gate's writable stack band. Every character
+; `last run` prints lands in gate_out; tools/runrecord_emitted_check.py reads
+; it back and checks the machine line and the sentence of each outcome.
+;
+; Main returns 0 when every in-program assertion held, else the number of
+; the first that failed.
+
+#MON_PHASE_LO = $02F00000
+
+Global gate_boots.i
+Global gate_ticks.i
+Global Dim gate_out.a[16384]
+Global gate_outLen.i
+
+Procedure.i MonPhaseBoots()
+  ProcedureReturn gate_boots
+EndProcedure
+Procedure.i Ticks()
+  ProcedureReturn gate_ticks
+EndProcedure
+Procedure.i TickHz()
+  ProcedureReturn 54000000
+EndProcedure
+
+Procedure UartWrite(c.i)
+  If gate_outLen < 16383
+    gate_out[gate_outLen] = c & $FF
+    gate_outLen = gate_outLen + 1
+  EndIf
+EndProcedure
+; Print()/PrintN() are compiler keywords routed BY NAME to these leaves.
+Procedure str_print_at(p.i)
+  Define i.i
+  Define c.i
+  i = 0
+  c = PeekB(p) & $FF
+  While c <> 0 And i < 400
+    UartWrite(c)
+    i = i + 1
+    c = PeekB(p + i) & $FF
+  Wend
+EndProcedure
+Procedure PrintNl()
+  UartWrite(13)
+  UartWrite(10)
+EndProcedure
+Global Dim gate_digits.a[24]
+Procedure PrintDec(v.i)
+  Define n.i
+  If v < 0
+    UartWrite(45)
+    v = 0 - v
+  EndIf
+  n = 0
+  Repeat
+    gate_digits[n] = 48 + (v % 10)
+    v = v / 10
+    n = n + 1
+  Until v = 0 Or n >= 20
+  While n > 0
+    n = n - 1
+    UartWrite(gate_digits[n])
+  Wend
+EndProcedure
+
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "RaspberryPi4/Board/runrecord.pi4"
+
+; A separator the check splits the transcript on, one per scenario.
+Procedure Mark(n.i)
+  UartWrite(35) : UartWrite(35) : UartWrite(48 + n) : PrintNl()
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  ; Nothing in the record: DRAM as a power cut leaves it.
+  For i = 0 To 255
+    PokeB(#MON_PHASE_LO + i, 0)
+  Next
+  gate_boots = 7
+  gate_ticks = 1000000
+
+  ; 0 - empty record
+  Mark(0)
+  CmdLastRun()
+  If RunRecordState() <> #RUNREC_NONE : ProcedureReturn 1 : EndIf
+
+  ; 1 - entered, returned x0 after 300 s, same boot
+  RunRecordEnter($700000, 15)
+  If RunRecordState() <> #RUNREC_ENTERED : ProcedureReturn 2 : EndIf
+  If RunRecordRun() <> 1 : ProcedureReturn 3 : EndIf
+  gate_ticks = gate_ticks + 300 * 54000000
+  RunRecordReturn($12C)
+  If RunRecordState() <> #RUNREC_RETURNED : ProcedureReturn 4 : EndIf
+  ; A second return report for the same run must not rewrite it.
+  RunRecordReturn($DEAD)
+  If PeekI(#RUNREC_BASE + #RUNREC_OFF_X0) <> $12C : ProcedureReturn 5 : EndIf
+  ; And an exception in the monitor after the return is not the payload's.
+  RunRecordException($96000004, $500000, $FFFFFFFFFFF00000)
+  If RunRecordState() <> #RUNREC_RETURNED : ProcedureReturn 6 : EndIf
+  Mark(1)
+  CmdLastRun()
+
+  ; 2 - entered, then the board restarted underneath it (deadman armed)
+  RunRecordEnter($700000, 15)
+  If RunRecordRun() <> 2 : ProcedureReturn 7 : EndIf
+  gate_boots = gate_boots + 1
+  gate_ticks = 5000
+  Mark(2)
+  CmdLastRun()
+  If RunRecordState() <> #RUNREC_ENTERED : ProcedureReturn 8 : EndIf
+
+  ; 3 - entered, stopped at a processor exception, then reset
+  RunRecordEnter($700000, 15)
+  If RunRecordRun() <> 3 : ProcedureReturn 9 : EndIf
+  gate_ticks = gate_ticks + 2 * 54000000
+  RunRecordException($96000004, $701234, $FFFFFFFFFFF00000)
+  If RunRecordState() <> #RUNREC_EXCEPTION : ProcedureReturn 10 : EndIf
+  ; A return reported after the exception cannot turn it into a return.
+  RunRecordReturn(0)
+  If RunRecordState() <> #RUNREC_EXCEPTION : ProcedureReturn 11 : EndIf
+  gate_boots = gate_boots + 1
+  Mark(3)
+  CmdLastRun()
+
+  ; 4 - entered with no deadman, restarted from outside
+  RunRecordEnter($40000000, 0)
+  gate_boots = gate_boots + 1
+  Mark(4)
+  CmdLastRun()
+
+  ; 5 - an exception recorded against a record a previous boot entered is
+  ;     not this boot's payload and must not be written
+  RunRecordException($1, $2, $3)
+  If RunRecordState() <> #RUNREC_ENTERED : ProcedureReturn 12 : EndIf
+  Mark(5)
+  CmdLastRun()
+
+  ; 6 - a torn magic reads as no record, and the next entry starts at 1
+  PokeI(#RUNREC_BASE + #RUNREC_OFF_MAGIC, 0)
+  If RunRecordState() <> #RUNREC_NONE : ProcedureReturn 13 : EndIf
+  RunRecordEnter($700000, 5)
+  If RunRecordRun() <> 1 : ProcedureReturn 14 : EndIf
+  ; The phase record's own line (+0..+63) is not this file's to touch.
+  For i = 0 To 63
+    If PeekA(#MON_PHASE_LO + i) <> 0 : ProcedureReturn 15 : EndIf
+  Next
+  Mark(6)
+  CmdLastRun()
+  ProcedureReturn 0
+EndProcedure

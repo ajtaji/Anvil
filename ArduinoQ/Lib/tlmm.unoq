@@ -1,0 +1,635 @@
+; ======================================================================
+;  tlmm.pi4 - QCM2290 TLMM (Top Level Mode Multiplexer) general-purpose
+;  I/O, in readable code.
+;
+;  THE FIRST ARDUINO UNO Q LIBRARY. ArduinoQ/Lib/README.md said this
+;  directory would stay empty until "a register has actually been read on
+;  the board, not before", and that the split from Board/ arrives "with
+;  the first driver big enough to need it". A 127-pin pin controller with
+;  a mux field, a pull field, a drive-strength field, an output enable
+;  and an eGPIO ownership bit is that driver.
+;
+;  A QUICK EXAMPLE
+;
+;    XIncludeFile "ArduinoQ/Lib/tlmm.unoq"
+;
+;    Procedure Main()
+;      TlmmModeSet(90, #TLMM_OUTPUT)
+;      TlmmWrite(90, 1)
+;      x = TlmmRead(90)
+;    EndProcedure
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE. This file includes no other library. House rule 10 (vault
+;  RULES.md): a library never includes another library; the MAIN file
+;  lists what it needs and a missing dependency fails loudly at compile
+;  time as an undefined procedure.
+;
+;  It uses no delays, so it needs no timer. The TLMM's pull mechanism is
+;  a plain field in a config register - unlike the BCM2835's GPPUD, it
+;  needs no clock-and-latch sequence and therefore no wait. See THE PULL
+;  FIELD below, because that difference is exactly the kind of thing a
+;  porter assumes carries over and it does not.
+;
+;  ---- WHERE EVERY NUMBER COMES FROM ---------------------------------
+;
+;  Nothing here is remembered or guessed (vault RULES.md rule 21). Four
+;  files, all on disk under ArduinoQ/Reference/ :
+;
+;    agatti.dtsi          - the QCM2290's own device tree. THE BASE.
+;    qrb2210-rb1.dts      - includes agatti.dtsi (line 10); this is how
+;                           we know agatti IS the QCM2290 and not a
+;                           sibling.
+;    pinctrl-qcm2290.c    - Linux's pin controller for THIS part. THE
+;                           REGISTER LAYOUT and the field bit positions.
+;    pinctrl-msm.c        - the shared MSM pinctrl core. THE FIELD
+;                           SEMANTICS: how each field is masked, what the
+;                           pull encoding means, and the ORDER a
+;                           direction change must be written in.
+;
+;  THE BASE ADDRESS, cited and not remembered:
+;
+;    agatti.dtsi:468-473
+;        tlmm: pinctrl@500000 {
+;                compatible = "qcom,qcm2290-tlmm";
+;                reg = <0x0 0x00500000 0x0 0x300000>;
+;                gpio-controller;
+;                gpio-ranges = <&tlmm 0 0 127>;
+;
+;    so the TLMM is at $00500000, spans $300000, and has 127 GPIO lines
+;    numbered 0..126. pinctrl-qcm2290.c:1089 states the count a second
+;    time and independently: `.ngpios = 127`.
+;
+;  ---- THE QCM2290 HAS NO TILES. THE ONE THAT BITES A PORTER ----------
+;
+;  ***DO NOT COPY TILE ARITHMETIC FROM AN SM6115 DRIVER.*** The SM6115 is
+;  the QCM2290's near sibling and it is the file a search engine hands
+;  you first, but its TLMM is split into THREE separately-mapped tiles:
+;
+;    sm6115.dtsi:629-632
+;        reg = <0x0 0x00500000 0x0 0x400000>,
+;              <0x0 0x00900000 0x0 0x400000>,
+;              <0x0 0x00d00000 0x0 0x400000>;
+;        reg-names = "west", "south", "east";
+;
+;  and its driver resolves a pin's tile by name (pinctrl-sm6115.c:894,
+;  `.tiles = sm6115_tiles`, `.ntiles = 3`). An address computed with that
+;  scheme lands in the wrong aperture on this part for most pins.
+;
+;  The QCM2290 has ONE region (agatti.dtsi:470, a single reg entry) and
+;  its driver sets neither `.tiles` nor `.ntiles` (pinctrl-qcm2290.c:
+;  1082-1093), so pinctrl-msm.c:1622 takes the single-region path and
+;  every `g->tile` is 0. The arithmetic is therefore flat, and that is
+;  the whole of it.
+;
+;  ---- THE REGISTER LAYOUT -------------------------------------------
+;
+;  pinctrl-qcm2290.c:12       #define REG_SIZE 0x1000
+;  pinctrl-qcm2290.c:32-35    the PINGROUP macro body:
+;        .ctl_reg         = REG_SIZE * id,
+;        .io_reg          = 0x4 + REG_SIZE * id,
+;        .intr_cfg_reg    = 0x8 + REG_SIZE * id,
+;        .intr_status_reg = 0xc + REG_SIZE * id,
+;
+;  So each GPIO owns a 4 KB block, and within it:
+;
+;      +$00  GPIO_CFG          mux / pull / drive / output-enable
+;      +$04  GPIO_IN_OUT       the pin's input level and output level
+;      +$08  GPIO_INTR_CFG     (not used here - Anvil polls, no IRQs)
+;      +$0C  GPIO_INTR_STATUS  (not used here)
+;
+;      GPIO_CFG(n)    = $00500000 + (n * $1000)
+;      GPIO_IN_OUT(n) = $00500000 + (n * $1000) + 4
+;
+;  A 4 KB stride for a 16-byte block is not a mistake in the reading: the
+;  TLMM genuinely spends a whole page per pin, which is why the region is
+;  $300000 wide for 127 pins.
+;
+;  ---- THE GPIO_CFG FIELDS -------------------------------------------
+;
+;  pinctrl-qcm2290.c:36-43, the same PINGROUP macro:
+;        .mux_bit = 2,  .pull_bit = 0,  .drv_bit = 6,
+;        .egpio_enable = 12,  .egpio_present = 11,
+;        .oe_bit = 9,   .in_bit = 0,    .out_bit = 1,
+;
+;  and the widths come from pinctrl-msm.c, which is where the masks live:
+;
+;    bits  1:0   PULL       mask 3        (pinctrl-msm.c:300-301)
+;    bits  5:2   FUNC/mux   4 bits wide   (pinctrl-msm.c:185)
+;    bits  8:6   DRIVE      mask 7        (pinctrl-msm.c:310-311)
+;    bit     9   OE         mask 1        (pinctrl-msm.c:316-317)
+;    bit    11   EGPIO_PRESENT  read-only (pinctrl-qcm2290.c:40)
+;    bit    12   EGPIO_ENABLE             (pinctrl-qcm2290.c:39)
+;
+;  THE MUX FIELD IS FOUR BITS, and that width is derived rather than
+;  stated. pinctrl-msm.c:185 builds the mask as
+;      GENMASK(mux_bit + order_base_2(nfuncs) - 1, mux_bit)
+;  and pinctrl-qcm2290.c:31 gives every group ten functions, so
+;  order_base_2(10) = 4 and the mask is GENMASK(5,2) - bits 5:2.
+;
+;  FUNCTION 0 IS PLAIN GPIO. pinctrl-qcm2290.c:20 puts `msm_mux_gpio` at
+;  index 0 of every group's function list, pinctrl-msm.c:237 writes the
+;  index itself into the field (`val |= i << g->mux_bit`), and
+;  `.gpio_func` is never set in qcm2290_pinctrl (pinctrl-qcm2290.c:
+;  1082-1093) so it defaults to 0. Three independent ways of saying the
+;  same thing: mux = 0 means the pin is a plain GPIO.
+;
+;  ---- THE GPIO_IN_OUT FIELDS ----------------------------------------
+;
+;    bit 0   IN   the level at the pad. READ ONLY in effect - writing it
+;                 does nothing. pinctrl-msm.c:625-626:
+;                     return !!(val & BIT(g->in_bit));
+;    bit 1   OUT  the level to drive when OE is set. pinctrl-msm.c:589:
+;                     val |= BIT(g->out_bit);
+;
+;  ***READING A PIN'S LEVEL READS BIT 0, NOT BIT 1.*** They are different
+;  bits of the same register and they mean different things: bit 1 is
+;  what you asked for, bit 0 is what the pad actually is. On an input,
+;  bit 1 is meaningless. On an output driving into a short, they differ -
+;  and that difference is diagnostic information worth not throwing away.
+;  TlmmRead() therefore returns bit 0 always, for inputs and outputs
+;  alike, which is what a scope would show you.
+;
+;  ---- THE PULL FIELD, AND THE VALUE THAT IS NOT A PULL --------------
+;
+;  pinctrl-msm.c:326-330 defines the two-bit encoding:
+;        #define MSM_NO_PULL           0
+;        #define MSM_PULL_DOWN         1
+;        #define MSM_KEEPER            2
+;        #define MSM_PULL_UP_NO_KEEPER 2
+;        #define MSM_PULL_UP           3
+;
+;  ***2 IS A BUS KEEPER ON THIS PART, NOT A PULL-UP.*** Both names are
+;  defined for the value 2 because on SOME MSM parts the keeper slot is
+;  reused as pull-up; which one applies is decided by a per-SoC flag,
+;  `pull_no_keeper`. qcm2290_pinctrl does not set it (pinctrl-qcm2290.c:
+;  1082-1093), so on the QCM2290 the value 2 is a KEEPER - a weak
+;  bus-hold that latches the last level, not a resistor to a rail.
+;  Reporting it as a pull-up would be a lie about the electrical state of
+;  the pin, so TlmmPullGet() reports it as its own thing, #TLMM_KEEPER,
+;  and the Hw* wrapper above translates that to "no pull" - because the
+;  portable vocabulary in Anvil/Hal/hal.pbi has only NONE/UP/DOWN, and of
+;  those three "none" is the only honest answer for a keeper.
+;
+;  ---- eGPIO: THE PIN MAY NOT BE OURS TO DRIVE -----------------------
+;
+;  GPIOs 107..126 on this part are declared with an `egpio` function
+;  (pinctrl-qcm2290.c:1055-1062) and `.egpio_func = 9` (:1092). An eGPIO
+;  is a pin the APSS SHARES with another subsystem: bit 11 of GPIO_CFG
+;  reads 1 if the pin has the feature, and bit 12 says who currently owns
+;  it. pinctrl-msm.c:239-240 shows the ownership write - claiming the pin
+;  for the APSS means SETTING bit 12, and releasing it to the other
+;  subsystem means clearing it.
+;
+;  TlmmEgpioPresent() and TlmmEgpioMine() expose that state so the layer
+;  above can report it, and TlmmModeSet() CLAIMS the pin (sets bit 12)
+;  when it is configuring an eGPIO-capable pin as a plain GPIO - because
+;  muxing a pin to function 0 while leaving it owned by the other
+;  subsystem configures nothing you can then drive.
+;
+;  ---- .n, NOT .i. THE ONE THAT SILENTLY MISCOMPILES ------------------
+;
+;  ***EVERY REGISTER BELOW IS 32 BITS WIDE AND IS TOUCHED WITH PeekN /
+;  PokeN.*** On this target .i and a bare pointer are EIGHT bytes. A
+;  PeekI of GPIO_CFG(n) would be a 64-bit read spanning GPIO_CFG and
+;  GPIO_IN_OUT, and a PokeI of GPIO_CFG would write GPIO_IN_OUT as well -
+;  changing the level of a pin you never named, with nothing faulting to
+;  tell you. This is the same trap RaspberryPi4/Lib/gpio.pi4's header
+;  documents for PeekL on the BCM2711; here the two registers are
+;  adjacent 32-bit words, so the accident is not merely possible, it is
+;  guaranteed on the first access.
+;
+;  `.n` (unsigned 32-bit) exists on this target only because a compiler
+;  defect was fixed on 2026-09-02 - PMTargetSupportsUnsigned32() gated it
+;  on a chip key that is empty for the Q. See the vault note "Anvil runs
+;  on the Q - the UEFI console". Every read here goes through
+;  TlmmReadReg(), which masks with $FFFFFFFF so a register with bit 31
+;  set can never come back negative and poison a later shift or compare.
+;
+;  ---- MMIO REACHABILITY - MEASURED, NOT ASSUMED ---------------------
+;
+;  Anvil runs on the Q as a UEFI application at EL1 with boot services
+;  UP. Whether a plain load/store to $00500000 reaches the TLMM at all
+;  depends on the page tables the firmware left installed, and the vault
+;  note for this board is explicit that such things are to be MEASURED
+;  before they are assumed - which is how the ConOut/GOP question was
+;  settled.
+;
+;  It was measured the same way here, and with no new code: Anvil's own
+;  `memory` command reads arbitrary addresses, so `memory 500000 20`
+;  reads GPIO_CFG(0) and its neighbours on the running board. The board
+;  transcript in the vault note for this campaign records what came back.
+;  Nothing in this file is reached until that read has succeeded.
+;
+;  ---- WHAT THIS FILE DOES NOT DO ------------------------------------
+;
+;  No interrupts. GPIO_INTR_CFG (+$08) and GPIO_INTR_STATUS (+$0C) are
+;  named above for the map's sake and are never touched: Anvil polls, and
+;  a TLMM interrupt would need the MPM wakeup parent (agatti.dtsi:474,
+;  `wakeup-parent = <&mpm>`) and a GIC path that does not exist here.
+;
+;  No read-modify-write safety across cores. Every field change below is
+;  a read, a mask, a write. Another core touching the SAME pin's CFG in
+;  between would be lost - the identical caveat RaspberryPi4/Lib/gpio.pi4
+;  carries. Anvil is single-threaded on one core, and Debian is not
+;  running while this image is, so the window is theoretical here; it is
+;  written down because it stops being theoretical the day something
+;  else runs alongside.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  The map.
+; ----------------------------------------------------------------------
+#TLMM_BASE       = $00500000   ; agatti.dtsi:470
+#TLMM_PIN_STRIDE = $1000       ; pinctrl-qcm2290.c:12, REG_SIZE
+#TLMM_OFF_CFG    = 0           ; pinctrl-qcm2290.c:32, ctl_reg
+#TLMM_OFF_IO     = 4           ; pinctrl-qcm2290.c:33, io_reg
+
+#TLMM_PIN_COUNT  = 127         ; agatti.dtsi:473 / pinctrl-qcm2290.c:1089
+#TLMM_PIN_MAX    = 126         ; the highest valid pin number
+
+; ----------------------------------------------------------------------
+;  The GPIO_CFG fields. Shifts and masks, one per field, so that no
+;  procedure below contains a bare number.
+;  pinctrl-qcm2290.c:36-43 for the positions, pinctrl-msm.c for the
+;  widths (see the header).
+; ----------------------------------------------------------------------
+#TLMM_PULL_SHIFT = 0
+#TLMM_PULL_MASK  = $3          ; bits 1:0   - pinctrl-msm.c:300-301
+#TLMM_FUNC_SHIFT = 2
+#TLMM_FUNC_MASK  = $F          ; bits 5:2   - pinctrl-msm.c:185
+#TLMM_DRV_SHIFT  = 6
+#TLMM_DRV_MASK   = $7          ; bits 8:6   - pinctrl-msm.c:310-311
+#TLMM_OE_BIT     = $200        ; bit 9      - pinctrl-msm.c:316-317
+#TLMM_EGPIO_PRESENT_BIT = $800  ; bit 11    - pinctrl-qcm2290.c:40
+#TLMM_EGPIO_ENABLE_BIT  = $1000 ; bit 12    - pinctrl-qcm2290.c:39
+
+; The GPIO_IN_OUT bits. pinctrl-qcm2290.c:42-43.
+#TLMM_IN_BIT     = $1          ; bit 0 - the level AT THE PAD
+#TLMM_OUT_BIT    = $2          ; bit 1 - the level to DRIVE
+
+; ----------------------------------------------------------------------
+;  The pull encoding, as the silicon writes it. pinctrl-msm.c:326-330.
+;  #TLMM_KEEPER is a bus-hold, NOT a pull-up - see the header.
+; ----------------------------------------------------------------------
+#TLMM_PULL_NONE  = 0
+#TLMM_PULL_DOWN  = 1
+#TLMM_KEEPER     = 2
+#TLMM_PULL_UP    = 3
+
+; ----------------------------------------------------------------------
+;  The mode vocabulary this library speaks. Deliberately NOT the same
+;  names as Anvil's #HW_GPIO_* codes: this is the silicon's own idea of a
+;  pin's state, and the Board wrapper translates. #TLMM_ALT is not a
+;  value the hardware holds - it is what a non-zero mux field MEANS.
+; ----------------------------------------------------------------------
+#TLMM_INPUT      = 0
+#TLMM_OUTPUT     = 1
+#TLMM_ALT        = 2
+
+; The function value that means "plain GPIO" - pinctrl-qcm2290.c:20,
+; pinctrl-msm.c:237, and .gpio_func defaulting to 0 (:1082-1093).
+#TLMM_FUNC_GPIO  = 0
+
+; ----------------------------------------------------------------------
+;  Diagnostic counters. The same instrument RaspberryPi4/Lib/gpio.pi4
+;  carries: a bad pin number is a caller bug, and a silent -1 hides it.
+;  Counting them means a session can ask "did anything ask for a pin that
+;  does not exist?" without every call site having to check.
+; ----------------------------------------------------------------------
+Global tlmm_bad_pins.i = 0
+
+Procedure.i TlmmBadPins()
+  ProcedureReturn tlmm_bad_pins
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmPinValid(pin) - 1 if the pin exists on this part, 0 otherwise
+;  (and counted). 0..126, from agatti.dtsi:473.
+; ----------------------------------------------------------------------
+Procedure.i TlmmPinValid(pin.i)
+  If pin < 0 Or pin > #TLMM_PIN_MAX
+    tlmm_bad_pins = tlmm_bad_pins + 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Addresses. Flat arithmetic - no tiles on this part (see the header).
+; ----------------------------------------------------------------------
+Procedure.i TlmmCfgAddr(pin.i)
+  ProcedureReturn #TLMM_BASE + (pin * #TLMM_PIN_STRIDE) + #TLMM_OFF_CFG
+EndProcedure
+
+Procedure.i TlmmIoAddr(pin.i)
+  ProcedureReturn #TLMM_BASE + (pin * #TLMM_PIN_STRIDE) + #TLMM_OFF_IO
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The two raw accessors every other procedure goes through. The mask on
+;  the read is not decoration - see the .n note in the header.
+; ----------------------------------------------------------------------
+Procedure.i TlmmReadReg(addr.i)
+  ProcedureReturn PeekN(addr) & $FFFFFFFF
+EndProcedure
+
+Procedure TlmmWriteReg(addr.i, val.i)
+  PokeN(addr, val & $FFFFFFFF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Whole-register reads, for a caller that wants to print the raw value.
+;  -1 for a bad pin: no real CFG value is negative once masked, so -1
+;  cannot be mistaken for a reading.
+; ----------------------------------------------------------------------
+Procedure.i TlmmCfgGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn TlmmReadReg(TlmmCfgAddr(pin))
+EndProcedure
+
+Procedure.i TlmmIoGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn TlmmReadReg(TlmmIoAddr(pin))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  FUNC - the mux field, bits 5:2. 0 is plain GPIO; 1..15 are the part's
+;  alternate functions and WHICH one depends on the pin (each pin has its
+;  own ten-entry function list in pinctrl-qcm2290.c). This library
+;  reports the number and does not pretend to name it: naming would mean
+;  carrying a 127 x 10 table of Qualcomm function names, and the number
+;  is what a reader checks against the DTS pinmux node anyway.
+; ----------------------------------------------------------------------
+Procedure.i TlmmFuncGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (TlmmReadReg(TlmmCfgAddr(pin)) >> #TLMM_FUNC_SHIFT) & #TLMM_FUNC_MASK
+EndProcedure
+
+Procedure.i TlmmFuncSet(pin.i, func.i)
+  Define a.i
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If func < 0 Or func > #TLMM_FUNC_MASK
+    ProcedureReturn 0          ; a mux value the 4-bit field cannot hold
+  EndIf
+  a = TlmmCfgAddr(pin)
+  v = TlmmReadReg(a)
+  v = v & ~(#TLMM_FUNC_MASK << #TLMM_FUNC_SHIFT)
+  v = v | (func << #TLMM_FUNC_SHIFT)
+  TlmmWriteReg(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  OE - the output enable, bit 9. This is the ONLY thing that decides
+;  whether a pin is an input or an output; the mux field decides whether
+;  it is a GPIO at all.
+; ----------------------------------------------------------------------
+Procedure.i TlmmOeGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If TlmmReadReg(TlmmCfgAddr(pin)) & #TLMM_OE_BIT
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  eGPIO - is this pin shared with another subsystem, and is it ours?
+;  Bit 11 is the feature (read-only), bit 12 is the ownership.
+;  pinctrl-qcm2290.c:39-40, pinctrl-msm.c:239-240.
+; ----------------------------------------------------------------------
+Procedure.i TlmmEgpioPresent(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If TlmmReadReg(TlmmCfgAddr(pin)) & #TLMM_EGPIO_PRESENT_BIT
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i TlmmEgpioMine(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If TlmmReadReg(TlmmCfgAddr(pin)) & #TLMM_EGPIO_ENABLE_BIT
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmModeGet(pin) - what the pin IS: #TLMM_INPUT, #TLMM_OUTPUT or
+;  #TLMM_ALT, or -1 for a bad pin.
+;
+;  The order of the two tests is the whole logic and it is worth stating.
+;  A non-zero mux means the pad is wired to a peripheral, and OE is then
+;  that peripheral's business - so mux is asked FIRST and a pin on an
+;  alternate function is #TLMM_ALT whatever its OE bit happens to say.
+;  Only when the mux is 0 - a plain GPIO - does OE decide the direction.
+; ----------------------------------------------------------------------
+Procedure.i TlmmModeGet(pin.i)
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  v = TlmmReadReg(TlmmCfgAddr(pin))
+  If ((v >> #TLMM_FUNC_SHIFT) & #TLMM_FUNC_MASK) <> #TLMM_FUNC_GPIO
+    ProcedureReturn #TLMM_ALT
+  EndIf
+  If v & #TLMM_OE_BIT
+    ProcedureReturn #TLMM_OUTPUT
+  EndIf
+  ProcedureReturn #TLMM_INPUT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmModeSet(pin, mode) - make the pin a plain input or a plain output.
+;  1 on success, 0 for a bad pin or a mode this does not handle.
+;
+;  ***THE ORDER OF WRITES IS NOT ARBITRARY AND IT IS NOT STYLE.***
+;  pinctrl-msm.c:587-596 sets the OUTPUT LEVEL in GPIO_IN_OUT first, and
+;  only then sets OE in GPIO_CFG. Doing it the other way round enables
+;  the driver while the out bit still holds whatever the last owner left
+;  there, so the pin drives a glitch of the wrong level for the few
+;  cycles between the two stores. On a pin wired to a reset line or an
+;  enable, that glitch is not cosmetic.
+;
+;  So: going to OUTPUT, this preserves the existing out bit rather than
+;  inventing a level - the caller says which level with TlmmWrite(), and
+;  a caller that wants a defined level before the pin ever drives calls
+;  TlmmWrite() BEFORE TlmmModeSet(). Going to INPUT, only OE is cleared
+;  (pinctrl-msm.c:567-569); the out bit is left alone because it means
+;  nothing on an input and clearing it would lose the level the pin would
+;  return to.
+;
+;  eGPIO: a pin with bit 11 set is shared, and configuring it as a GPIO
+;  without also CLAIMING it (bit 12) mutes the write - the other
+;  subsystem still owns the pad. pinctrl-msm.c:239-240.
+; ----------------------------------------------------------------------
+Procedure.i TlmmModeSet(pin.i, mode.i)
+  Define a.i
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If mode <> #TLMM_INPUT And mode <> #TLMM_OUTPUT
+    ProcedureReturn 0          ; #TLMM_ALT is not a whole instruction -
+  EndIf                        ; WHICH alt is, and that is TlmmFuncSet's
+
+  a = TlmmCfgAddr(pin)
+  v = TlmmReadReg(a)
+
+  ; Plain GPIO: mux to function 0.
+  v = v & ~(#TLMM_FUNC_MASK << #TLMM_FUNC_SHIFT)
+  v = v | (#TLMM_FUNC_GPIO << #TLMM_FUNC_SHIFT)
+
+  ; Claim a shared pad for the APSS, or the mux above changes nothing.
+  If v & #TLMM_EGPIO_PRESENT_BIT
+    v = v | #TLMM_EGPIO_ENABLE_BIT
+  EndIf
+
+  If mode = #TLMM_OUTPUT
+    v = v | #TLMM_OE_BIT
+  Else
+    v = v & ~(#TLMM_OE_BIT)
+  EndIf
+
+  TlmmWriteReg(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmRead(pin) - the level AT THE PAD, bit 0 of GPIO_IN_OUT. 0, 1, or
+;  -1 for a bad pin. Works on inputs and outputs alike - see the header
+;  for why this is bit 0 and never bit 1.
+; ----------------------------------------------------------------------
+Procedure.i TlmmRead(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If TlmmReadReg(TlmmIoAddr(pin)) & #TLMM_IN_BIT
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmOutGet(pin) - the level the pin is ASKING to drive, bit 1. This is
+;  the intent, not the measurement. Reported alongside TlmmRead() it is
+;  how you see a pin that is being held against its driver.
+; ----------------------------------------------------------------------
+Procedure.i TlmmOutGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If TlmmReadReg(TlmmIoAddr(pin)) & #TLMM_OUT_BIT
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmWrite(pin, level) - set the level the pin drives, bit 1 of
+;  GPIO_IN_OUT. 1 on success, 0 for a bad pin.
+;
+;  This does NOT touch OE, so it is safe to call before TlmmModeSet() to
+;  choose the level the pin will take the instant it starts driving -
+;  which is the glitch-free sequence described on TlmmModeSet().
+; ----------------------------------------------------------------------
+Procedure.i TlmmWrite(pin.i, level.i)
+  Define a.i
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  a = TlmmIoAddr(pin)
+  v = TlmmReadReg(a)
+  If level = 0
+    v = v & ~(#TLMM_OUT_BIT)
+  Else
+    v = v | #TLMM_OUT_BIT
+  EndIf
+  TlmmWriteReg(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TlmmToggle(pin) - invert the driven level. Read-modify-write on the
+;  same register TlmmWrite uses, so it inherits the same caveat.
+; ----------------------------------------------------------------------
+Procedure.i TlmmToggle(pin.i)
+  Define a.i
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  a = TlmmIoAddr(pin)
+  v = TlmmReadReg(a)
+  If v & #TLMM_OUT_BIT
+    v = v & ~(#TLMM_OUT_BIT)
+  Else
+    v = v | #TLMM_OUT_BIT
+  EndIf
+  TlmmWriteReg(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PULL - bits 1:0. Returns the RAW silicon encoding (#TLMM_PULL_NONE /
+;  _DOWN / #TLMM_KEEPER / #TLMM_PULL_UP), or -1 for a bad pin. The
+;  translation to Anvil's three-value portable vocabulary happens in the
+;  Board wrapper, not here, because the keeper has no portable name and
+;  losing it should be a deliberate act at the seam rather than a silent
+;  one in the driver.
+; ----------------------------------------------------------------------
+Procedure.i TlmmPullGet(pin.i)
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (TlmmReadReg(TlmmCfgAddr(pin)) >> #TLMM_PULL_SHIFT) & #TLMM_PULL_MASK
+EndProcedure
+
+Procedure.i TlmmPullSet(pin.i, pull.i)
+  Define a.i
+  Define v.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If pull < 0 Or pull > #TLMM_PULL_MASK
+    ProcedureReturn 0
+  EndIf
+  a = TlmmCfgAddr(pin)
+  v = TlmmReadReg(a)
+  v = v & ~(#TLMM_PULL_MASK << #TLMM_PULL_SHIFT)
+  v = v | (pull << #TLMM_PULL_SHIFT)
+  TlmmWriteReg(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DRIVE STRENGTH - bits 8:6, reported in milliamps rather than as a
+;  field value, because the field is an index and the mA is the fact.
+;  pinctrl-msm.c:333-335: `return (val + 1) * 2;` - so 0 is 2 mA and 7 is
+;  16 mA. -1 for a bad pin.
+; ----------------------------------------------------------------------
+Procedure.i TlmmDriveGet(pin.i)
+  Define f.i
+  If TlmmPinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  f = (TlmmReadReg(TlmmCfgAddr(pin)) >> #TLMM_DRV_SHIFT) & #TLMM_DRV_MASK
+  ProcedureReturn (f + 1) * 2
+EndProcedure

@@ -1,0 +1,606 @@
+; ======================================================================
+;  anvilqslipbench.unoq - Arduino UNO Q: THE FIRST BYTES ON THE WIRE.
+;
+;  THIS IS THE PROGRAM FOR THE DAY THE 1.8 V ADAPTER ARRIVES, and it is
+;  the only Q image that drives serial engine 4's registers itself. It
+;  takes the debug UART on the JCTL header away from the firmware, runs
+;  SLIP over it, pings a host on the other end of the two-wire link, and
+;  gives the port back.
+;
+;  ***BEFORE YOU PLUG ANYTHING IN, READ THE PIN TABLE.*** JCTL pin 4 is
+;  the SoC's transmit pad and pin 6 is its receive pad, at 1.8 V, with no
+;  series resistor, no buffer and no level shifter anywhere between the
+;  header pin and the ball. A 3.3 V or 5 V adapter on either of them can
+;  permanently damage the QRB2210. Pin 2 forces the chip into download
+;  mode, pin 8 resets the power-management chip and pin 10 kills the
+;  USB power path, so an off-by-one on the pin-1 end does not merely fail
+;  to print. The full table, the wiring recipe and the two safe adapter
+;  options are in the vault note
+;  `Arduino UNO Q\UNO Q console UART - the SE4 header pins`.
+;
+;  THE HOST END IS tools/q_slip_host.py. Start it BEFORE deploying this
+;  image, because this image pings and then gives up:
+;
+;      python tools/q_slip_host.py --list-ports
+;      python tools/q_slip_host.py --port COM<n> --baud 115200 --dump bench.cap
+;
+;  ---- WHAT THIS PROGRAM DOES, IN ORDER -------------------------------
+;
+;   1. Reports the engine's IDENTITY before touching anything else: the
+;      firmware revision word, the protocol it decodes to, the clock
+;      divider the boot chain left and the rate that implies, and the
+;      FIFO geometry the engine reports about itself. IF ANYTHING GOES
+;      WRONG ON THE WIRE, THIS BLOCK IS THE FIRST THING TO READ - a
+;      divider implying 9,600 or 921,600 explains a garbled capture
+;      immediately, and a firmware word of 0000 or FFFF says the engine
+;      never answered at all.
+;   2. Surveys the HwLink* backend, so the board says for itself which
+;      kinds of wire it has now that the register transport is in.
+;   3. Brings the IP stack up at 10.0.0.2/30 with the peer at 10.0.0.1 -
+;      the same two addresses tools/q_slip_host.py uses by default.
+;   4. Sends four echo requests through RaspberryPi4/Lib/link.pi4, the
+;      SAME portable policy layer the Raspberry Pi 4 runs, and reports
+;      each answer with its round-trip time.
+;   5. GIVES THE PORT BACK, and says whether it did.
+;   6. Writes the transcript to the EFI System Partition and to the UEFI
+;      variable sink, then resets back to Debian.
+;
+;  ---- WHY THE TRANSCRIPT DOES NOT GO TO THE CONSOLE ------------------
+;
+;  ***BECAUSE THE CONSOLE IS THE WIRE.*** The firmware's own text output
+;  lands on serial engine 4, which is the port this program takes over.
+;  Printing progress through the firmware while holding the port would
+;  interleave console text with SLIP frames on the same two wires, and
+;  the host would see a stream that is neither. So every line goes to
+;  \EFI\anvil\qslipbench.log on the ESP and to the AnvilQTxt variable,
+;  which are the two channels proven on this board, and the operator
+;  reads it after the run.
+;
+;  A short line does go to the firmware console BEFORE the port is taken
+;  and AFTER it is given back. Those two are safe by construction and
+;  they are the only ones.
+;
+;  ---- THE RISK, STATED HERE AS WELL AS IN THE DRIVER ------------------
+;
+;  ArduinoQ/Board/hw_addr_q.unoq classifies serial engine 4's window as
+;  #HW_ADDR_UNKNOWN: the engine is reported clocked because the console
+;  rides it, and that is the same reasoning that stalled this board once
+;  on the QUP wrapper. On this SoC a read of a block whose clock is gated
+;  does not fault - IT STALLS THE BUS, and the recovery is the power
+;  switch. This image accepts that risk deliberately, once, inside
+;  QGeniUartTake(). If the board goes silent and the ESP log is empty, the
+;  read did not return; power-cycle and say so in the note rather than
+;  trying again with the same image.
+;
+;  BUILD:  bash tools/build_unoq_slipbench.sh
+;  GATES:  python tools/a64/a64_qgeniuart_check.py
+;          python tools/a64/a64_qslipgeni_check.py
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first: they define the seams the rest needs ----
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+; timer.pi4 is the Pi 4's file, included UNCHANGED: it reads the counter
+; frequency at run time rather than baking 54 MHz, so it is correct on
+; this part's 19.2 MHz. It is here for Micros() and millis(), which
+; link.pi4 asks for.
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Hal/hal.pbi"
+; ---- THE REGISTER TRANSPORT. This image includes qgeniuart.pi4 and
+; ---- hw_serial_q.pi4 and NOT qserial_q.pi4: the two answer the same
+; ---- four names and are alternatives, never layers.
+XIncludeFile "ArduinoQ/Lib/qgeniuart.pi4"
+XIncludeFile "ArduinoQ/Board/hw_serial_q.pi4"
+XIncludeFile "ArduinoQ/Lib/qslip.pi4"
+XIncludeFile "ArduinoQ/Lib/qnetfile.pi4"
+XIncludeFile "ArduinoQ/Board/hw_link_q.pi4"
+; The six HwLink* names the command layer needs. They need no driver
+; under them, which is why they are a second file - see its header.
+XIncludeFile "ArduinoQ/Board/hw_net_q.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+XIncludeFile "RaspberryPi4/Lib/link.pi4"
+
+; EFI_VARIABLE_NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS, the
+; three attributes every other Q probe sets on AnvilQTxt so that one
+; reader tool finds every transcript.
+#EFI_ATTR = $7
+
+; The two-host subnet. tools/q_slip_host.py defaults to exactly these and
+; both ends carry them; if they ever disagree, every reply comes back
+; addressed to a host that is not listening, which the host program says
+; out loud rather than counting as a silent zero.
+#SB_IP   = $0A000002       ; 10.0.0.2, this board
+#SB_MASK = $FFFFFFFC       ; 255.255.255.252
+#SB_PEER = $0A000001       ; 10.0.0.1, the host
+
+; Four echoes. Enough that a link which works once and then stops is
+; visible, few enough that the whole run is under a second of wire time.
+#SB_PINGS = 4
+; How long to wait for one echo reply. At 115200 a 60-byte exchange is
+; about 10 milliseconds on the wire, so 500 is generous by fifty times -
+; and it is a BOUND, which is what stops a dead wire becoming a hung
+; board with no console to interrupt.
+#SB_WAIT_MS = 500
+; ONE PUMP SLICE, AND IT IS SIZED FROM THE WIRE RATHER THAN PICKED.
+; At 115200 a byte is 87 microseconds, so a 60-octet echo reply is 5.4
+; milliseconds of wire and a full-size datagram is over 130. A SLICE
+; SHORTER THAN A FRAME RETURNS EMPTY-HANDED IN THE MIDDLE OF ONE however
+; healthy the link is - and on a link where nothing else is a candidate,
+; that reads as loss. Measured on silicon 2026-09-07: with a 10 ms slice
+; the echoes came back between four and eight times out of eight, run to
+; run, and a 576-octet TCP segment - 50 milliseconds of wire - came back
+; NEVER, 0 for 4 across four runs. With 200 it was 8 of 8 and a kilobyte
+; each way byte for byte. 200 is longer than any frame either end sends
+; here, and it is still a BOUND.
+#SB_SLICE_MS = 200
+
+Global gSbSent.i
+Global gSbHeard.i
+Global gSbWorstMs.i
+Global Dim gSbPeerMac.b[8]     ; where NetArpLookup puts the answer
+Global Dim gVarName.b[24]      ; UTF-16LE "AnvilQTxt", 0
+Global Dim gVarGuid.b[16]
+
+; ----------------------------------------------------------------------
+;  PutDotted - an IPv4 address the way a person reads one.
+; ----------------------------------------------------------------------
+Procedure PutDotted(v.i)
+  PrintDec((v >> 24) & $FF)
+  Print(".")
+  PrintDec((v >> 16) & $FF)
+  Print(".")
+  PrintDec((v >> 8) & $FF)
+  Print(".")
+  PrintDec(v & $FF)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Identity - the engine, before anything is asked of the wire.
+;
+;  THIS BLOCK IS THE INSTRUMENT. Everything after it can only say whether
+;  bytes crossed; only this can say WHY they did not.
+; ----------------------------------------------------------------------
+Procedure Identity()
+  PrintN("-- serial engine 4 at 04A90000, as it answered --")
+  ; PutHex8, not PutHex16: these are 32-bit registers and eight leading
+  ; zeroes on every line is eight characters an operator has to read past
+  ; to reach the two digits that matter.
+  Print("  firmware revision word  ")
+  PutHex8(QGeniUartFwRev())
+  Print("   protocol ")
+  PrintDec(QGeniUartProto())
+  PrintN("  (2 is a UART; this board measured 0204 under Debian)")
+
+  Print("  clock configuration     ")
+  PutHex8(QGeniUartClkCfg())
+  Print("   divider ")
+  PrintDec(QSerialClkDiv())
+  PrintNl()
+  PrintN("  (THE DIVIDER IS THE FACT. The rate is not, because the engine")
+  PrintN("   publishes no clock-source register and the boot chain picks its")
+  PrintN("   source from a table to hit the rate exactly. Divider 4 measured")
+  PrintN("   here on 2026-09-07 is 115,200 EXACTLY on the 7.3728 MHz root at")
+  PrintN("   16x, and 115,200 exactly on 14.7456 MHz at 32x; the console, the")
+  PrintN("   boot log and Debian all read cleanly at 115,200 in the same")
+  PrintN("   capture. Debian later runs the same wire on divider 10 off the")
+  PrintN("   19.2 MHz crystal, so THE TWO BOOT STAGES DISAGREE ABOUT THE")
+  PrintN("   DIVIDER AND AGREE ABOUT THE WIRE. Do not change the host's baud")
+  PrintN("   because this number moved.)")
+  Print("  the same divider on the 19.2 MHz crystal would be ")
+  PrintDec(QSerialBaud())
+  PrintN(" baud")
+  PrintN("  (printed next to its assumption, never as the rate - that claim")
+  PrintN("   was measured wrong on this board and cost the first deploy's")
+  PrintN("   identity block its meaning.)")
+
+  Print("  transmit FIFO           ")
+  PrintDec(QGeniUartTxDepth())
+  Print(" words of ")
+  PrintDec(QGeniUartTxWidth())
+  PrintN(" bits")
+  PrintNl()
+EndProcedure
+
+Procedure SurveyKind(kind.i, *label)
+  Print("  ")
+  UartWriteStr(*label)
+  Print("  ")
+  If HwLinkHas(kind) <> 0
+    Print("YES ")
+  Else
+    Print("no  ")
+  EndIf
+  Print(" txmax=")
+  PrintDec(HwLinkTxMax(kind))
+  Print("  ")
+  UartWriteStr(HwLinkName(kind))
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Survey - the board answering for itself, with the register transport
+;  in the image. The serial row is the one that changed tonight.
+; ----------------------------------------------------------------------
+Procedure Survey()
+  PrintN("-- what this board can carry a frame on, asked of the board --")
+  SurveyKind(#HW_LINK_WIRED, "wired   ")
+  SurveyKind(#HW_LINK_WIFI, "wifi    ")
+  SurveyKind(#HW_LINK_SERIAL, "serial  ")
+  SurveyKind(#HW_LINK_FIRMWARE, "firmware")
+  SurveyKind(#HW_LINK_FILE, "file    ")
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Resolve - put the peer in the address cache BEFORE the first echo.
+;
+;  WITHOUT THIS THE WHOLE BENCH REFUSES AND NEVER PUTS A BYTE ON THE
+;  WIRE. NetPingBuild() calls NetRouteMac(), which answers -118 - "the
+;  destination hardware address is not known" - until the next hop has a
+;  cache entry, and nothing here creates one: this image configures an
+;  address and then asks for an echo. Every one of the four requests
+;  would have failed at the build, printed a net error, and reported a
+;  dead link on a wire that was never used. Added 2026-09-06, on the
+;  bench, before the first deploy; the gate harness in
+;  tools/a64/a64_qslipgeni_check.py had always done this dance itself,
+;  which is exactly why no green run ever showed the hole.
+;
+;  ON THIS LINK THE ANSWER COMES FROM US. A SLIP wire carries datagrams
+;  and has no hardware addresses at all, so ArduinoQ/Lib/qslip.pi4
+;  intercepts an outgoing address request and synthesises the reply the
+;  peer would have sent rather than transmitting it - QSlipArpsAnswered()
+;  counts them. So the request never reaches the host program and a host
+;  that is not listening cannot make this step fail; the pump collects
+;  the synthetic reply on the next call.
+;
+;  BOUNDED, because a resolution that never completes is a hung board on
+;  a port with no console to interrupt it.
+; ----------------------------------------------------------------------
+Procedure.i Resolve()
+  Define k.i
+  Define hop.i
+  hop = NetNextHop(#SB_PEER)
+  k = 0
+  While k < 4
+    If NetArpLookup(hop, @gSbPeerMac[0]) = 1
+      ProcedureReturn 1
+    EndIf
+    If NetArpRequest(hop) <> 0
+      LinkTxStaged()
+    EndIf
+    LinkPumpNet(#SB_SLICE_MS)
+    k = k + 1
+  Wend
+  ProcedureReturn NetArpLookup(hop, @gSbPeerMac[0])
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Echoes - the point of the whole evening.
+;
+;  Each request goes out through link.pi4's staged transmit, and the pump
+;  is called until either a reply comes back or the bound is reached. The
+;  round trip is measured with millis() rather than reasoned about: on a
+;  115200 line a small echo is about ten milliseconds, and a number wildly
+;  away from that is worth as much as the pass itself.
+; ----------------------------------------------------------------------
+Procedure Echoes()
+  Define i.i
+  Define t0.i
+  Define dt.i
+  Define ident.i
+  Define seq.i
+  Define got.i
+
+  PrintN("-- echo requests to the host at 10.0.0.1 --")
+  i = 0
+  While i < #SB_PINGS
+    ident = $5100 + i
+    seq = i + 1
+    got = 0
+    If NetPingBuild(#SB_PEER, ident, seq, 32) <> 1
+      Print("  request ")
+      PrintDec(seq)
+      Print(" could not be built, net error ")
+      PrintDec(NetError())
+      PrintN("; the address configuration above is the first thing to check")
+      i = i + 1
+      Continue
+    EndIf
+    If LinkTxStaged() <> 1
+      Print("  request ")
+      PrintDec(seq)
+      PrintN(" would not go on the wire; the link is present but refused it")
+      gSbSent = gSbSent + 1
+      i = i + 1
+      Continue
+    EndIf
+    gSbSent = gSbSent + 1
+
+    t0 = millis()
+    Repeat
+      LinkPumpNet(#SB_SLICE_MS)
+      If NetPongBytes() > 0
+        If NetPongIdent() = ident
+          If NetPongSeq() = seq
+            got = 1
+            Break
+          EndIf
+        EndIf
+      EndIf
+      dt = millis() - t0
+      If dt > #SB_WAIT_MS
+        Break
+      EndIf
+    ForEver
+    dt = millis() - t0
+
+    Print("  request ")
+    PrintDec(seq)
+    If got = 1
+      gSbHeard = gSbHeard + 1
+      If dt > gSbWorstMs
+        gSbWorstMs = dt
+      EndIf
+      Print("  reply from ")
+      PutDotted(NetPongFrom())
+      Print("  ")
+      PrintDec(NetPongBytes())
+      Print(" bytes  ")
+      PrintDec(dt)
+      PrintN(" ms")
+    Else
+      Print("  NO REPLY within ")
+      PrintDec(#SB_WAIT_MS)
+      PrintN(" ms")
+    EndIf
+    i = i + 1
+  Wend
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Tally - the numbers, and the driver's own counters beside them.
+;
+;  The driver's byte counts are printed next to the framing layer's
+;  because they are INDEPENDENT measurements of the same traffic: if the
+;  framing layer says it sent four datagrams and the driver says it wrote
+;  no bytes, the fault is between them and the two numbers say so
+;  immediately.
+; ----------------------------------------------------------------------
+Procedure Tally()
+  PrintN("-- the numbers --")
+  Print("  echoes sent ")
+  PrintDec(gSbSent)
+  Print("   answered ")
+  PrintDec(gSbHeard)
+  Print("   worst round trip ")
+  PrintDec(gSbWorstMs)
+  PrintN(" ms")
+
+  Print("  framing: datagrams out ")
+  PrintDec(QSlipTxDatagrams())
+  Print("  in ")
+  PrintDec(QSlipRxDatagrams())
+  Print("  address requests answered here ")
+  PrintDec(QSlipArpsAnswered())
+  PrintNl()
+
+  Print("  framing refusals: over the maximum ")
+  PrintDec(QSlipRefusedLong())
+  Print("  wrong ethertype ")
+  PrintDec(QSlipRefusedType())
+  Print("  receive overruns ")
+  PrintDec(QSlipOverruns())
+  Print("  bad escapes ")
+  PrintDec(QSlipBadEscapes())
+  PrintNl()
+
+  Print("  driver: bytes out ")
+  PrintDec(QSerTxBytes())
+  Print("  in ")
+  PrintDec(QSerRxBytes())
+  Print("  command timeouts ")
+  PrintDec(QGeniUartTxTimeouts())
+  Print("  aborts ")
+  PrintDec(QGeniUartTxAborts())
+  Print("  watermark timeouts ")
+  PrintDec(QGeniUartTxWmTimeouts())
+  Print("  receive command re-posted ")
+  PrintDec(QGeniUartRxRestarts())
+  PrintNl()
+  PrintN("  (A GENI CAPTURES NOTHING WHILE ITS SECONDARY SEQUENCER IS IDLE,")
+  PrintN("   and the command posted at take does not run for ever. Nothing")
+  PrintN("   latches when it ends - the port just goes deaf and reads like a")
+  PrintN("   quiet peer. A large number here is normal and is the driver")
+  PrintN("   keeping the port open; a zero beside lost frames would mean the")
+  PrintN("   deafness is somewhere else.)")
+  PrintNl()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Honesty - what this run did and did not establish. Printed every time,
+;  because the half that is not proven has to travel with the half that
+;  is.
+; ----------------------------------------------------------------------
+Procedure Honesty()
+  PrintN("-- what this run is and is not evidence of --")
+  PrintN("  IT IS: bytes across serial engine 4's own FIFOs on this")
+  PrintN("  silicon, at a real rate, over two real wires, with the whole IP")
+  PrintN("  stack above them - and the port handed back afterwards.")
+  PrintN("  IT IS NOT: anything about throughput at scale, about a lossy")
+  PrintN("  line, or about the wireless and wired links this board does not")
+  PrintN("  have. A SLIP link at 115200 is 11,520 bytes a second before")
+  PrintN("  framing overhead. It is a link for ping, name lookup, address")
+  PrintN("  configuration and a small fetch. It is not a link for an image.")
+EndProcedure
+
+Procedure EmitReport()
+  PrintN("== Anvil on the Arduino UNO Q - SLIP over the debug UART ==")
+  PrintNl()
+
+  If QSerialUp() = 0
+    PrintN("THE PORT WAS NOT TAKEN, and the driver's reason follows.")
+    PrintNl()
+    Print("  ")
+    UartWriteStr(QGeniUartWhy())
+    PrintNl()
+    PrintNl()
+    PrintN("Nothing was written to any register. Read the firmware revision")
+    PrintN("word in that sentence before anything else: 0000 and FFFFFFFF are")
+    PrintN("a dead read, and a protocol that is not 2 is not a UART.")
+    ProcedureReturn
+  EndIf
+
+  Identity()
+  Survey()
+
+  ; ---- COMPARE AGAINST THE KIND, NOT AGAINST 1 ------------------------
+  ; LinkUseKind() answers WHICH KIND IS IN USE, or #HW_LINK_NONE. It
+  ; never answers 1 for a serial line, because 1 is #HW_LINK_WIRED and
+  ; #HW_LINK_SERIAL is 3. This test used to read `<> 1`, so it took the
+  ; policy layer's SUCCESS for a refusal, gave the port straight back and
+  ; ended the run before a single frame was framed - on the first silicon
+  ; deploy, 2026-09-07.
+  ;
+  ; THE SENTENCE IT PRINTED IS WHAT GIVES IT AWAY, and it is worth
+  ; keeping the shape in mind: the "refusal" quoted LinkWhyText() saying
+  ; "this board has exactly one interface Anvil can reach ... there is
+  ; nothing to prefer it over", which is the stored reason for a link
+  ; that was ACCEPTED. A refusal path that prints a success reason is
+  ; reporting on a call that succeeded.
+  If LinkUseKind(#HW_LINK_SERIAL) <> #HW_LINK_SERIAL
+    PrintN("the link policy refused the serial kind, and it should not have:")
+    Print("  ")
+    UartWriteStr(LinkWhyText())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+
+  If NetSetMac(HwLinkMacPtr(#HW_LINK_SERIAL)) <> 1
+    PrintN("the address the link offered was refused by the IP layer")
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  If NetSetIPv4(#SB_IP, #SB_MASK, #SB_PEER) <> 1
+    Print("the IP configuration was refused, net error ")
+    PrintDec(NetError())
+    PrintNl()
+    QSerialGive()
+    ProcedureReturn
+  EndIf
+  Print("  this board is ")
+  PutDotted(#SB_IP)
+  Print(" and the host is ")
+  PutDotted(#SB_PEER)
+  PrintNl()
+  PrintNl()
+
+  If Resolve() <> 1
+    PrintN("  the peer could not be put in the address cache, so no echo can")
+    PrintN("  even be BUILT. On this link that reply is synthesised by the")
+    PrintN("  framing layer and never leaves the board, so this is a fault")
+    PrintN("  inside the image and NOT a silent host or a dead wire. The")
+    PrintN("  echo section below will say so again on every request.")
+    PrintNl()
+  EndIf
+
+  Echoes()
+  Tally()
+
+  QSerialGive()
+  Print("-- the port was handed back: present now reads ")
+  PrintDec(QSerialPresent())
+  PrintN(" --")
+  PrintN("  The firmware console owns serial engine 4 again. If the shell on")
+  PrintN("  the other end of this wire is now garbled, that is a defect in")
+  PrintN("  the give-back and it belongs on the forum before anything else.")
+  PrintNl()
+
+  Honesty()
+
+  PrintNl()
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of run ==")
+EndProcedure
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  ; a1b2c3d4-5566-7788-99aa-bbccddeeff00 - the same vendor GUID every
+  ; other Q transcript uses, so one reader tool finds them all. UEFI 2.10
+  ; appendix A: the first three fields are little-endian on the wire and
+  ; the last two are not, which is why the digits below are not the text
+  ; read left to right.
+  b = @gVarGuid[0]
+  QPb(b, 0,$D4):QPb(b, 1,$C3):QPb(b, 2,$B2):QPb(b, 3,$A1)
+  QPb(b, 4,$66):QPb(b, 5,$55)
+  QPb(b, 6,$88):QPb(b, 7,$77)
+  QPb(b, 8,$99):QPb(b, 9,$AA):QPb(b,10,$BB):QPb(b,11,$CC)
+  QPb(b,12,$DD):QPb(b,13,$EE):QPb(b,14,$FF):QPb(b,15,$00)
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ; Nothing here is safe to touch, and there is no channel to say so on.
+    ProcedureReturn 0
+  EndIf
+
+  If TimerInit() = 0
+    ; Every bounded wait in the driver is bounded by the counter. A
+    ; stopped counter would make each one either instant or eternal, and
+    ; both are worse than refusing - on a port whose other user is the
+    ; console, an eternal wait is a board nobody can reach.
+    QEfiOutStr("the architectural counter reads as stopped - refusing to take the console UART")
+    QEfiReset()
+    ProcedureReturn 0
+  EndIf
+
+  QSlipInit()
+  BuildSinkNames()
+
+  ; The LAST line the firmware console prints before the port changes
+  ; hands. After this the console and this program would be two writers
+  ; on one engine, which is why nothing else is sent that way.
+  QEfiOutStr("Anvil UNO Q - taking serial engine 4 for SLIP; output goes to the ESP log")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qslipbench.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("run complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

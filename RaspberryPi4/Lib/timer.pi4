@@ -1,0 +1,481 @@
+; ======================================================================
+;  timer.pi4 - microseconds and milliseconds on the Raspberry Pi 4,
+;              from the ARM architectural counter
+; ======================================================================
+;
+;  A QUICK EXAMPLE
+;
+;    XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+;
+;    Procedure Main()
+;      If TimerInit() = 0
+;        ; the counter is not moving - say so, do not carry on. Every
+;        ; bounded wait in this family is bounded by Micros().
+;      EndIf
+;
+;      t0.i = Micros()
+;      ; ... the thing you want to time ...
+;      elapsed.i = Micros() - t0
+;      delay(250)                 ; milliseconds
+;    EndProcedure
+;
+;  ---- DEPENDENCIES ---------------------------------------------------
+;
+;  NONE. This file includes no other library and needs none, which is
+;  the point of using CNTPCT_EL0 (below) instead of a peripheral: there
+;  is no clock to bring up, no reset to release and no tick generator to
+;  start, so there is nothing for a clocks library to own.
+;
+;  House rule 10 (vault RULES.md, 2026-07-30) - a library never
+;  includes another library; the MAIN file lists what it needs, one per
+;  line, and a dependency is DOCUMENTED HERE instead. This file has the
+;  easiest possible time obeying it.
+;
+;  ---- WHY THE ARCHITECTURAL COUNTER AND NOT THE SYSTEM TIMER --------
+;
+;  The BCM2711 does have a 1 MHz free-running MMIO counter: the System
+;  Timer at legacy $7E003000 -> ARM $FE003000, CLO at offset 0x04 and
+;  CHI at offset 0x08 (BCM2711 ARM Peripherals, Table 166, section 10.2,
+;  p.142). It is not used here, and that is a choice, not an oversight:
+;
+;    * CNTPCT_EL0 is a SYSTEM REGISTER. One `mrs`. No peripheral bus
+;      access at all, so none of the AXI ordering precautions of section
+;      1.3 apply to it, and no memory barrier is needed around a reading.
+;    * CLO and CHI are two separate 32-bit reads of one 64-bit counter,
+;      so a correct read needs the hi/lo/hi retry dance. CNTPCT_EL0 is
+;      one atomic 64-bit read and the retry loop simply does not exist.
+;    * `cntpct_el0` and `cntfrq_el0` are already in this assembler's
+;      system-register table, so ASM ... EndASM reaches them today.
+;
+;  anvil.pi4 has read CNTPCT_EL0 on this board, at EL2, arriving
+;  through U-Boot's `go`, with no trap and no setup - see its Ticks()
+;  and the header note above it. That is the silicon evidence this file
+;  rests on.
+;
+;  ---- THE FREQUENCY IS 54 MHz, AND IT IS READ, NOT ASSUMED ----------
+;
+;  ***THIS IS THE NUMBER THAT GETS GUESSED WRONG.*** The two plausible
+;  guesses are both wrong on this part:
+;
+;    1 MHz     - that is the SYSTEM TIMER's rate (bcm283x.dtsi,
+;                timer@7e003000, `clock-frequency = <1000000>`), a
+;                different counter entirely.
+;    the CPU clock - the architectural counter is not the core clock and
+;                does not move when the firmware scales the core.
+;
+;  The real value is 54 MHz, and it is set by Raspberry Pi's own boot
+;  stub before any of our code runs. armstub8.S, on disk at
+;  RaspberryPi4/Reference/armstub8.S:
+;
+;      #if BCM2711
+;      #define OSC_FREQ  54000000        <- line 54
+;      ...
+;      /* Set up CNTFRQ_EL0 */
+;      ldr x0, =OSC_FREQ                 <- line 111
+;      msr CNTFRQ_EL0, x0
+;
+;  Measured on silicon 2026-08-24 and it agreed.
+;
+;  SO WHY DOES THIS FILE STILL READ CNTFRQ_EL0 RATHER THAN HARDCODING
+;  54000000? Because the 54 MHz above is a property of the STUB, not of
+;  the silicon - the same file compiles to 19.2 MHz for a non-BCM2711
+;  part, and a different loader, a firmware update, or a future board
+;  revision is free to program CNTFRQ_EL0 with something else. A
+;  hardcoded 54 would then be wrong by a factor nobody would see: every
+;  delay would simply be the wrong length, with no error anywhere. The
+;  register is the authority; the number above is why we expect it to
+;  say 54000000 and a reason to be suspicious if it does not.
+;
+;  ---- WHAT THE 64-BIT MODEL DELETED FROM THE RP2350 ORIGINAL --------
+;
+;  This mirrors RP2350/Lib/timer.pico2's API by name on purpose -
+;  TimerInit, Micros, millis, delay, delayMicroseconds are called BY
+;  NAME from other libraries across the fleet. Three things in the
+;  original existed only because a Pico has no 64-bit integer type, and
+;  on this target .i IS 64 bits (see anvil.pi4's header), so they
+;  are gone rather than ported:
+;
+;    * TimerReadUs64() and the timer_us_hi global. A procedure could not
+;      return a 64-bit microsecond count there. Micros() returns one
+;      here.
+;    * millis()'s "2^32 = 4294967*1000 + 296" decomposition, which
+;      existed solely to divide a 64-bit number using 32-bit arithmetic.
+;      millis() below is one divide.
+;    * delay()'s split into one-second pieces, which existed because
+;      ms*1000 overflowed a signed 32-bit microsecond count above 2147
+;      seconds. It overflows a signed 64-bit one after 292 million
+;      years.
+;
+;  AND THE WRAP WARNING GOES WITH THEM. On the RP2350 the rule was
+;  "SUBTRACT, never compare against a deadline, and keep the span under
+;  35 minutes". Micros() here is a 64-bit count of microseconds since
+;  the counter started, so it turns negative after 2^63 us - about
+;  292,000 years. Subtracting is still the better habit and still what
+;  the examples do, but on this target it is style, not a hazard, and
+;  saying otherwise would teach a rule for a machine this is not.
+;
+;  ---- STATUS ---------------------------------------------------------
+;
+;  DELAY IS MEASURED ON THIS BOARD AND IT IS CLOCK-INDEPENDENT.
+;
+;  pi4TimerProbe ran the SAME delay at two CPU frequencies on 2026-08-25
+;  and counted the architectural ticks each took:
+;
+;      at  600 MHz     10800007 ticks
+;      at 1500 MHz     10800003 ticks
+;
+;  Four ticks apart across a 2.5x change in the core clock - about 74
+;  nanoseconds. That is the whole claim this file makes about itself,
+;  and it is now a measurement rather than an argument: CNTPCT_EL0 does
+;  not move with the core, so delay(), Micros(), millis() and every
+;  timeout built on them keep their length when a program calls
+;  ClockInit(). RaspberryPi4/Lib/clocks.pi4's header carries the same
+;  numbers from the other side of the experiment.
+;
+;  CNTFRQ_EL0 READS 54000000 ON THIS BOARD, measured 2026-08-24, which
+;  agrees with armstub8.S:54 - so the value this file refuses to
+;  hardcode is the value it finds. See THE FREQUENCY IS 54 MHz above for
+;  why it is still read rather than assumed.
+;
+;  AND THE ARITHMETIC IS EXERCISED CONTINUOUSLY, not just in a probe.
+;  RaspberryPi4/Monitor/anvil.pi4 includes this file, and every bounded
+;  wait in the tree is bounded by Micros() - PCIe's 100 us and 100 ms
+;  waits during link adoption, GENET's MDIO and link timeouts, the SDIO
+;  command bounds, the 3-second Ethernet listen. A wrong conversion here
+;  would show up as timeouts that fire early or never; none has.
+;
+;  NOT MEASURED: nothing here has been timed against a scope or an
+;  external frequency reference. The evidence above is the board's own
+;  counter checked against itself under a changed variable, which is
+;  strong for INDEPENDENCE and says nothing about ABSOLUTE accuracy. If
+;  a delay ever has to be right against the outside world rather than
+;  against this board, that measurement still has to be made.
+;
+;  ---- SUPERSEDED: THE 32-BIT .i WARNING ------------------------------
+;
+;  A large block here used to open "***READ THIS BEFORE TRUSTING A
+;  READING TODAY***" and warn that every caller of Ticks() truncated to
+;  32 bits, that TimerScale() emitted `mov w11, w0`, that TimerConvert()
+;  divided in `sdiv w`, and that Micros() therefore WRAPPED AT 79.5
+;  SECONDS. It ended "until this note can be deleted".
+;
+;  THE WIDENING LANDED THE SAME DAY THE NOTE WAS WRITTEN - 2026-08-24 at
+;  about 20:58, by another worker - and the note was not deleted. It sat
+;  here for three days telling readers not to trust a value over about a
+;  minute, on a target where .i has been eight bytes the whole time.
+;  That is the same failure as the "nothing has run on silicon" banners
+;  audited out of this directory, wearing different clothes: A NOTE
+;  WHOSE OWN EXIT CONDITION IS SOMEBODY ELSE'S COMMIT WILL NOT NOTICE
+;  THAT COMMIT.
+;
+;  It is recorded rather than deleted for two reasons. The defect was
+;  real and cost real debugging; and the DECISION taken here was the
+;  right one and is worth keeping - the procedures were NOT respelled
+;  `.q` to work around it, because that would have made the file wrong
+;  on the day the widening landed and would have hidden the defect
+;  meanwhile.
+;
+;  IF YOU ARE CHASING A TRUNCATION TODAY, check what the compiler
+;  actually emits before believing any comment, this one included: the
+;  test is one `-S` build and a grep for `mov w11, w0` behind a `bl
+;  ticks`.
+; ======================================================================
+
+EnableExplicit
+
+; How long TimerInit() is willing to wait for the counter to show its
+; first movement. At 54 MHz a tick is 18.5 ns and this loop is a handful
+; of instructions, so 200000 passes is far more than one tick even on a
+; core running slowly. A counter that has not moved by then is not slow,
+; it is stopped. Same constant and same reasoning as the RP2350's.
+#TIMER_MOVE_LIMIT = 200000
+
+; How often delayMicroseconds() checks that the clock it is waiting on
+; is still alive. See the procedure.
+#TIMER_DEAD_CHECK = 20000
+
+; CNTFRQ_EL0 as read at init, in Hz. Zero means "not read yet"; the BSS
+; is zeroed by the image prologue, so that test is safe on a cold start.
+Global timer_hz.i
+
+; timer_hz / 1000000 when the frequency is an exact multiple of a
+; megahertz, 0 when it is not. 54 MHz gives 54, so Micros() is a single
+; divide on this part. The general path exists for the frequency that
+; is not a round number of MHz - see TimerScale().
+Global timer_us_div.i
+
+; timer_hz / 1000 on the same terms. 54 MHz gives 54000.
+Global timer_ms_div.i
+
+; ----------------------------------------------------------------------
+;  Ticks() - the raw 64-bit architectural counter, CNTPCT_EL0.
+;
+;  The whole counter, in counter ticks, not microseconds. Use this when
+;  you want the finest resolution the part offers (18.5 ns at 54 MHz)
+;  and are going to do your own arithmetic; use Micros() otherwise.
+;
+;  Same ASM block as anvil.pi4's Ticks(): one mrs, the result left
+;  in x0, which is where a .i return value goes.
+; ----------------------------------------------------------------------
+Procedure.i Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TickHz() - CNTFRQ_EL0, the rate Ticks() advances at, in Hz.
+;
+;  Expected to be 54000000 on a Pi 4 - see the header for why that is an
+;  expectation and not an assumption.
+; ----------------------------------------------------------------------
+Procedure.i TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TimerScale() - fill in the cached frequency and the two divisors.
+;
+;  Internal. Called by TimerInit(), and also by Micros()/millis() if
+;  they find timer_hz still zero, so that a program which forgot to call
+;  TimerInit() gets the RIGHT ANSWER rather than a divide by zero. What
+;  it does not get is TimerInit()'s proof that the counter is moving -
+;  that is the part worth calling explicitly.
+;
+;  Returns the frequency, or 0 if CNTFRQ_EL0 reads as zero or negative,
+;  which would mean no loader ever programmed it.
+; ----------------------------------------------------------------------
+Procedure.i TimerScale()
+  Define hz.i
+  hz = TickHz()
+  If hz <= 0
+    timer_hz = 0
+    timer_us_div = 0
+    timer_ms_div = 0
+    ProcedureReturn 0
+  EndIf
+  timer_hz = hz
+
+  ; The fast path is only taken when the division is EXACT. 54000000 is
+  ; 54 * 1000000, so it is; a hypothetical 19.2 MHz would not be, and
+  ; would silently lose 200 kHz if this were a plain divide.
+  timer_us_div = hz / 1000000
+  If timer_us_div * 1000000 <> hz
+    timer_us_div = 0
+  EndIf
+
+  timer_ms_div = hz / 1000
+  If timer_ms_div * 1000 <> hz
+    timer_ms_div = 0
+  EndIf
+
+  ProcedureReturn hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TimerConvert(t, unitsPerSecond, fastDiv) - t ticks in the given unit.
+;
+;  Internal. Two paths, and the slow one is the interesting half.
+;
+;  FAST: when fastDiv is non-zero the counter frequency is an exact
+;  multiple of the unit, so it is one divide and exact.
+;
+;  GENERAL: otherwise, t * unitsPerSecond / timer_hz would be right and
+;  would OVERFLOW - at 54 MHz, t * 1000000 passes 2^63 after about two
+;  days of uptime, and the result would silently go negative. So it is
+;  split into whole seconds and a remainder:
+;
+;      s = t / hz                 whole seconds
+;      r = t - s * hz             leftover ticks, 0 <= r < hz
+;      result = s * units + (r * units) / hz
+;
+;  r * units is bounded by hz * units, which for any sane frequency and
+;  a microsecond unit is under 10^14 - nowhere near 2^63. The identity
+;  is exact for integers, so the general path loses nothing but speed.
+; ----------------------------------------------------------------------
+Procedure.i TimerConvert(t.i, unitsPerSecond.i, fastDiv.i)
+  Define s.i
+  Define r.i
+  If fastDiv <> 0
+    ProcedureReturn t / fastDiv
+  EndIf
+  If timer_hz <= 0
+    ProcedureReturn 0
+  EndIf
+  s = t / timer_hz
+  r = t - s * timer_hz
+  ProcedureReturn s * unitsPerSecond + (r * unitsPerSecond) / timer_hz
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TimerInit() - cache the counter frequency and PROVE the counter is
+;  moving. Returns 1 on success, 0 on either failure, which are worth
+;  telling apart on the bench:
+;
+;    CNTFRQ_EL0 reads 0  - no loader programmed it. Everything this file
+;                          computes would be meaningless, so nothing is
+;                          computed: Micros() returns 0 rather than
+;                          dividing by zero.
+;    the counter never moved - CNTPCT_EL0 is not advancing.
+;
+;  KEEPING THE MOVE CHECK IS DELIBERATE, and the reason is inherited
+;  straight from RP2350/Lib/timer.pico2: every bounded wait in this
+;  library family is bounded by Micros(), so a counter that never
+;  advances turns every one of them into an infinite loop. A frozen
+;  timer is not merely useless, it strands the board.
+;
+;  IT IS ALSO A WEAKER CHECK HERE, AND SAYING SO IS THE POINT. On the
+;  RP2350 a stopped tick generator is the DEFAULT state, so the check
+;  catches the ordinary case. On the BCM2711 the architectural counter
+;  is started by the boot stub before anything of ours runs, so this is
+;  expected to pass every time. It is kept because "expected to pass"
+;  is not "cannot fail" - the counter is documented as stopping when the
+;  processor is halted in debug mode - and because a check that costs
+;  microseconds at startup is not worth arguing about.
+; ----------------------------------------------------------------------
+Procedure.i TimerInit()
+  Define t0.i
+  Define n.i
+  Define ok.i
+
+  If TimerScale() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; AND NOW WATCH IT MOVE. Having a frequency and having a running
+  ; counter are different claims, and only the second is worth
+  ; returning.
+  t0 = Ticks()
+  ok = 0
+  n = 0
+  While n < #TIMER_MOVE_LIMIT
+    If Ticks() <> t0
+      ok = 1
+      n = #TIMER_MOVE_LIMIT
+    Else
+      n = n + 1
+    EndIf
+  Wend
+  ProcedureReturn ok
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Micros() - microseconds since the counter started, as a full 64-bit
+;  count.
+;
+;  Resolution is one counter tick, 18.5 ns at 54 MHz, so consecutive
+;  readings can be equal - this is a microsecond UNIT, not a microsecond
+;  granularity.
+;
+;  Returns 0, always, if CNTFRQ_EL0 reads zero. That is a stopped clock
+;  reported as a stopped clock; it is not a plausible-looking small
+;  number.
+; ----------------------------------------------------------------------
+Procedure.i Micros()
+  If timer_hz = 0
+    TimerScale()
+  EndIf
+  ProcedureReturn TimerConvert(Ticks(), 1000000, timer_us_div)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  millis() - milliseconds since the counter started.
+;
+;  One divide by 54000 on this part. The RP2350 version needed a
+;  four-term decomposition of a 64-bit divide into 32-bit pieces; see
+;  the header for why that is gone rather than ported.
+; ----------------------------------------------------------------------
+Procedure.i millis()
+  If timer_hz = 0
+    TimerScale()
+  EndIf
+  ProcedureReturn TimerConvert(Ticks(), 1000, timer_ms_div)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  delayMicroseconds(us) - wait, measured against the counter.
+;
+;  Returns 1 if the wait completed, 0 if it gave up because THE COUNTER
+;  IS NOT RUNNING. Every #TIMER_DEAD_CHECK passes it asks whether the
+;  counter has moved AT ALL since it started; if it has not, it returns
+;  rather than hanging the board.
+;
+;  That backstop is less likely to fire here than on an RP2350, where a
+;  stopped tick is the reset state. It is kept because the cost is one
+;  compare per pass and the alternative failure is a board that never
+;  comes back.
+;
+;  WAITS IN TICKS, NOT IN MICROSECONDS. The deadline is converted to
+;  counter ticks once, up front, and the loop then does one `mrs` and
+;  one 64-bit subtract per pass - no divide inside the loop. A short
+;  delay is therefore genuinely short: calling Micros() every pass would
+;  have put a divide in the tightest loop in the library and made
+;  delayMicroseconds(1) cost several microseconds of its own.
+;
+;  A zero or negative argument returns immediately, with 0, matching
+;  RP2350/Lib/timer.pico2.
+; ----------------------------------------------------------------------
+Procedure.i delayMicroseconds(us.i)
+  Define t0.i
+  Define n.i
+  Define want.i
+  Define secs.i
+  Define rest.i
+
+  If us <= 0
+    ProcedureReturn 0
+  EndIf
+  If timer_hz = 0
+    TimerScale()
+  EndIf
+  If timer_hz <= 0
+    ProcedureReturn 0                 ; no clock - do not pretend to wait
+  EndIf
+
+  ; us * timer_hz would overflow for a large us: at 54 MHz it passes
+  ; 2^63 at about 170000 seconds of requested delay, which delay() below
+  ; can genuinely ask for. Split it the same way TimerConvert() does -
+  ; whole seconds exactly, and the sub-second remainder scaled.
+  secs = us / 1000000
+  rest = us - secs * 1000000
+  want = secs * timer_hz + (rest * timer_hz) / 1000000
+
+  t0 = Ticks()
+  n = 0
+  While (Ticks() - t0) < want
+    n = n + 1
+    If n >= #TIMER_DEAD_CHECK
+      If Ticks() = t0
+        ProcedureReturn 0             ; counter frozen - do not hang
+      EndIf
+      n = 0
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  delay(ms) - the same, in milliseconds.
+;
+;  One call. The RP2350 version split this into one-second pieces to
+;  keep ms*1000 inside a signed 32-bit microsecond count; .i is 64 bits
+;  here, so the product is safe to 292 million years and the loop was
+;  deleted rather than carried over.
+;
+;  Returns 1 normally and 0 if the counter is not running.
+;
+;  delay(0) returns 1 while delayMicroseconds(0) returns 0, which reads
+;  like a bug and is not one: it is exactly what RP2350/Lib/timer.pico2
+;  does, because there the zero case falls out of a `While left > 0`
+;  loop that never runs and then returns 1. These two names are called
+;  across the fleet, so the contract is COPIED rather than tidied. Fix
+;  it in both places or in neither.
+; ----------------------------------------------------------------------
+Procedure.i delay(ms.i)
+  If ms <= 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn delayMicroseconds(ms * 1000)
+EndProcedure

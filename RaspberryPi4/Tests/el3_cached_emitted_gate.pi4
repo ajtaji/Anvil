@@ -1,0 +1,17 @@
+; Interpreter-only: witness addresses are NOT valid page tables. Never deploy.
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Procedure.i Main()
+  mmu_ttbr = $07000000
+  mmu_tcr = #MMU_TCR_EL2
+  mmu_mair = #MMU_MAIR_EL2
+  Select PeekI($06000000)
+    Case 0
+      MmuEnableCached()
+    Case 1
+      MmuDisableCached()
+    Case 2
+      MmuDisableCachedFlushed()
+  EndSelect
+  ProcedureReturn 0
+EndProcedure

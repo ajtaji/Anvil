@@ -1,0 +1,105 @@
+#NET_TCP_OK = 0
+#TCP_SOCKETS = 4
+#TCP_CLOSED = 0
+#TCP_LISTEN = 1
+#TCP_ESTABLISHED = 4
+#TCP_CLOSE_WAIT = 7
+#TCP_TIME_WAIT = 10
+Global current.i
+Global listener.i
+Global lease.i
+Global pending.i = -1
+Global queued.i
+Global aborts.i
+Global closes.i
+Global checks.i
+Global failures.i
+Global Dim state.i[4]
+Global Dim epoch.i[4]
+Procedure.i TcpCurrent() : ProcedureReturn current : EndProcedure
+Procedure.i TcpUse(s.i) : current = s : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpAlloc() : current = 0 : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpListenQueued(p.i) : listener = p : state[0] = 1 : epoch[0] = epoch[0] + 1 : lease = lease + 1 : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpAccept(s.i)
+  Protected result.i
+  result = pending : pending = -1 : ProcedureReturn result
+EndProcedure
+Procedure.i TcpUnlisten() : listener = 0 : state[0] = 0 : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpGeneration() : ProcedureReturn epoch[current] : EndProcedure
+Procedure.i TcpListenerGeneration() : ProcedureReturn lease : EndProcedure
+Procedure.i TcpListeningPort() : ProcedureReturn listener : EndProcedure
+Procedure.i TcpState() : ProcedureReturn state[current] : EndProcedure
+Procedure.i TcpAvailable() : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpRead(p.i, n.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpSend(p.i, n.i) : queued = queued + n : ProcedureReturn n : EndProcedure
+Procedure.i TcpPoll(n.i) : ProcedureReturn state[current] : EndProcedure
+Procedure.i TcpClose() : closes = closes + 1 : ProcedureReturn 0 : EndProcedure
+Procedure.i TcpAbort() : aborts = aborts + 1 : state[current] = 0 : epoch[current] = epoch[current] + 1 : ProcedureReturn 0 : EndProcedure
+XIncludeFile "Anvil/Services/Http/transport_tcp.pbi"
+Procedure Check(a.i, b.i)
+  checks = checks + 1
+  If a <> b : failures = failures + 1 : EndIf
+EndProcedure
+Procedure Main()
+  Protected old.i
+  Protected fresh.i
+  current = 3
+  Check(HtStart(8080), 1)
+  Check(current, 3)
+  Check(HtAccept(), 0)
+  state[1] = 4 : epoch[1] = 1 : pending = 1
+  old = HtAccept()
+  Check(old, 1)
+  Check(current, 3)
+  Check(HtWrite(old, 1, 20), 20)
+  Check(current, 3)
+  HtClose(old)
+  Check(queued, 20)
+  Check(aborts, 0)
+  Check(closes, 1)
+  Check(current, 3)
+  HtService(9999)
+  Check(aborts, 0)
+  state[1] = 10
+  HtService(10000)
+  Check(aborts, 0)
+  Check(HtAccept(), 0)
+  state[2] = 4 : epoch[2] = 1 : pending = 2
+  fresh = HtAccept()
+  Check(fresh, 2)
+  Check(HtRead(old, 1, 4), -1)
+  Check(HtWrite(old, 1, 4), -1)
+  HtClose(old)
+  Check(closes, 1)
+  epoch[2] = 2
+  HtService(10001)
+  Check(ht_live, 0)
+  pending = 2
+  old = HtAccept()
+  Check(old, 3)
+  Check(HtWrite(fresh, 1, 4), -1)
+  HtClose(fresh)
+  Check(closes, 1)
+  Check(ht_live, 1)
+  listener = 9090 : lease = lease + 1
+  HtService(10002)
+  Check(ht_owned, 0)
+  Check(HtWrite(old, 1, 4), 4)
+  HtClose(old)
+  HtService(20002)
+  Check(aborts, 1)
+  Check(current, 3)
+  HtStop()
+  Check(listener, 9090)
+  Check(state[1], 10)
+  Check(aborts, 1)
+  Check(current, 3)
+  Check(HtStart(8080), 1)
+  lease = lease + 1
+  HtStop()
+  Check(listener, 8080)
+  Check(aborts, 1)
+  Check(ht_live, 0)
+  PokeI($6000000, checks)
+  PokeI($6000008, failures)
+EndProcedure

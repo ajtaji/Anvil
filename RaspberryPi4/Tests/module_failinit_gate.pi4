@@ -1,0 +1,71 @@
+; ======================================================================
+;  FAILINIT.MOD - A DRIVER THAT PUBLISHES A SERVICE AND THEN GIVES UP
+; ----------------------------------------------------------------------
+;  BUILT BY tools/module_pipeline_check.py, never shipped, never loaded
+;  on a board. It exists to make one negative case REAL rather than
+;  simulated: a module whose init succeeds far enough to publish a
+;  function into a seam and then answers a failure code.
+;
+;  THAT ORDER IS THE WHOLE POINT. A module that fails before publishing
+;  anything needs no unwind; the interesting failure is the one that
+;  leaves a live function pointer in the registry and a driver that has
+;  declared itself unfit. If the loader's unwind is wrong, the seam keeps
+;  answering, the consumer keeps calling a driver that said it could not
+;  run, and nothing anywhere reports a fault.
+;
+;  IT DECLARES THE SAME COMPATIBLE ID AND THE SAME SEAM as the real
+;  thermal driver, so it travels the identical match/probe/init path and
+;  the only difference between the two runs is the code init returns.
+;
+;  77 IS AN ARBITRARY NON-ZERO and the gate checks for exactly it, so a
+;  loader that reported "some failure" instead of the driver's own answer
+;  would be caught. A module's refusal code is the module's, and the
+;  loader's job is to carry it, not to summarise it.
+; ======================================================================
+
+Module "test.failinit"
+ModuleABI 1, 1
+ModuleMatch "brcm,bcm2711-thermal"
+
+XIncludeFile "Anvil/Hal/seams.pbi"
+
+Seam #SVCCAP_THERMAL
+
+#FAILINIT_CODE = 77
+
+; The function it publishes. It must be a real, callable procedure - the
+; registry refuses a null - and it must never be reached, because the
+; unwind removes it. If a gate ever sees this value, the unwind failed.
+Procedure.i FailInitRead()
+  ProcedureReturn #MOD_TEMP_NONE
+EndProcedure
+
+; The probe accepts, so the failure lands squarely on init and not on a
+; step before it.
+Procedure.i ModuleProbe(services.i, device.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ModuleInit(services.i, device.i)
+  Define *fill
+  If services = 0
+    ProcedureReturn -1
+  EndIf
+  *fill = PeekI(services + #SVC_SEAM_HDR_BYTES + #SVC_SEAM_SLOT_FILL * 8)
+  If *fill = 0
+    ProcedureReturn -2
+  EndIf
+  ; Publish first - the fill is expected to SUCCEED here - and only then
+  ; refuse. Anything the loader does after this point is the unwind.
+  If fill(#SVCCAP_THERMAL, #SEAM_THERMAL_READ, @FailInitRead) <> 0
+    ProcedureReturn -3
+  EndIf
+  ProcedureReturn #FAILINIT_CODE
+EndProcedure
+
+; Never called: a module that failed to initialise is not active, and
+; quiesce is the ACTIVE record's teardown. It exists so the container
+; carries a quiesce entry like the real driver does.
+Procedure.i ModuleQuiesce(services.i, device.i)
+  ProcedureReturn 0
+EndProcedure

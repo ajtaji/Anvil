@@ -1,0 +1,279 @@
+; pi4NeonMbx.pi4 - WHICH STEP OF A V3D FRAME KILLS THE FIRMWARE'S
+; MAILBOX?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT IS KNOWN, MEASURED, 2026-08-28
+; ======================================================================
+;  pi4NeonBox.pi4 ran a complete V3D frame onto the HDMI surface and
+;  verified all 2,073,600 pixels. IT RETURNED CLEANLY. The next payload
+;  could not get a surface at all: DisplayInit came back -19, and
+;  pi4NeonSurface.pi4 then read the mailbox registers directly:
+;
+;      MAIL0_STA $40000000    EMPTY - nothing to read, correct
+;      MAIL1_STA $80000008    FULL, eight requests queued
+;
+;  So the ARM-to-VideoCore mailbox is full of requests the firmware is
+;  no longer consuming. Every transaction from then on ends in
+;  #MBX_ERR_TXTIMEOUT because the write side never drains. A board
+;  RESET clears it and nothing else tried did - uptime went 1684 back
+;  to 20 and the next run was healthy.
+;
+;  THE FIRST GUESS IS THE V3D MMU. The VPU is not asleep while a
+;  payload runs: it owns the display pipeline and it answers the
+;  mailbox, and it reaches memory through the same MMU this engine
+;  enables with its own page table and PT_INVALID_ABORT set.
+;
+;  THAT IS A GUESS AND THIS PROGRAM IS HOW IT STOPS BEING ONE.
+;
+; ======================================================================
+;  THE LADDER
+; ======================================================================
+;  Six rungs, and after every one the SAME two questions: what do the
+;  mailbox status registers say, and can DisplayInit still get a
+;  surface? The first rung that answers no is the culprit, by name.
+;
+;    0  nothing yet                  DisplayInit must WORK on a fresh board
+;    1  V3dInit                      power, clock, IDENT - mailbox traffic
+;                                    of its own, so it is its own rung
+;    2  NeonInit                     the V3D MMU goes ON here
+;    3  one complete frame           bin and render jobs actually run
+;    4  NeonShutdown                 the MMU goes OFF again
+;    5  a second complete frame      after a shutdown and a re-init, to
+;                                    prove the cycle is repeatable
+;
+;  ANNOUNCE THEN DRAIN AT EVERY RUNG. A mailbox that never answers
+;  costs 1000 ms per transaction (#MBX_TIMEOUT_MS) and the deadman is
+;  ~15.999 s, so a rung that goes bad late can still take the board
+;  down. Every line is flushed before the thing that might not return,
+;  and THE RUNG NUMBER IS PRINTED BEFORE THE RUNG IS ATTEMPTED, so a
+;  reset says which one died.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonMbx.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o _work/neonmbx.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NM_ARENA       = $04000000
+#NM_ARENA_BYTES = $01000000
+
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; The two questions, asked the same way every time.
+Procedure.i Rung(n.i, *what)
+  Define rc.i
+  UartWriteStr("rung ")
+  PrintDec(n)
+  UartWriteStr("  after ")
+  UartWriteStr(*what)
+  PutNl()
+  UartWriteStr("    MAIL0_STA ")
+  PutHex(PeekN(#MBX_STATUS0) & $FFFFFFFF, 8)
+  UartWriteStr("  MAIL1_STA ")
+  PutHex(PeekN(#MBX_STATUS1) & $FFFFFFFF, 8)
+  UartWriteStr("  MMU_CTL ")
+  PutHex(V3dMmuCtlNow() & $FFFFFFFF, 8)
+  PutNl()
+  UartDrain()
+  ; The tags have to be re-armed for every DisplayInit; the list is
+  ; consumed by a send.
+  DisplayStandardTags()
+  rc = DisplayInit(1920, 1080, 32)
+  UartWriteStr("    DisplayInit rc ")
+  PrintDec(rc)
+  UartWriteStr("  MailboxError ")
+  PrintDec(MailboxError())
+  If rc = 1
+    UartWriteStr("   base ")
+    PutHex(DisplayBase(), 8)
+    UartWriteStr("  ")
+    PrintDec(DisplayWidth())
+    UartWrite(120)
+    PrintDec(DisplayHeight())
+    UartWriteStr("   SURFACE OK")
+  Else
+    UartWriteStr("   NO SURFACE")
+  EndIf
+  PutNl()
+  PutNl()
+  UartDrain()
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i OneFrame()
+  Define r.i
+  r = NeonFrameBegin(Neon_RGBA($21, $43, $65, 255))
+  If r <> #NEON_OK
+    ProcedureReturn r
+  EndIf
+  Neon_Box(100, 100, 300, 200, Neon_RGBA($12, $8A, $F3, 255))
+  Neon_Box(250, 200, 300, 200, Neon_RGBA($DE, $37, $91, $80))
+  Neon_Text(#NEON_FONT_UI, 120, 420, "NeonArcade on V3D", Neon_RGBA($F0, $2B, $99, 255))
+  ProcedureReturn NeonFrameEnd()
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define rc.i
+
+  PutNl()
+  PutS("=== pi4NeonMbx - which rung kills the mailbox? ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running")
+    PutNl()
+  EndIf
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX AT ALL")
+    PutNl()
+    ProcedureReturn 1
+  EndIf
+
+  ; ---- rung 0 ---------------------------------------------------------
+  rc = Rung(0, "nothing at all")
+  If rc <> 1
+    PutS("verdict: THE BOARD WAS ALREADY WEDGED BEFORE THIS RAN.")
+    PutNl()
+    PutS("         Reset it and run this again - rung 0 must pass or")
+    PutNl()
+    PutS("         nothing below it means anything.")
+    PutNl()
+    ProcedureReturn 2
+  EndIf
+
+  ; ---- rung 1 - V3dInit ----------------------------------------------
+  PutS("  ... V3dInit")
+  PutNl()
+  UartDrain()
+  r = V3dInit()
+  UartWriteStr("      V3dInit rc ")
+  PrintDec(r)
+  UartWriteStr("  HUB_IDENT1 ")
+  PutHex(V3dIdent1(), 8)
+  PutNl()
+  UartDrain()
+  If r <> #V3D_OK
+    PutS("verdict: V3DINIT")
+    PutNl()
+    ProcedureReturn 3
+  EndIf
+  rc = Rung(1, "V3dInit")
+
+  ; ---- rung 2 - NeonInit, the MMU goes on ------------------------------
+  PutS("  ... NeonArena, NeonSurface, NeonInit")
+  PutNl()
+  UartDrain()
+  NeonArena(#NM_ARENA, #NM_ARENA_BYTES)
+  NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  r = NeonInit()
+  UartWriteStr("      NeonInit rc ")
+  PrintDec(r)
+  UartWriteStr("  page table bytes ")
+  PrintDec(Neon_PtBytes())
+  PutNl()
+  UartDrain()
+  If r <> #NEON_OK
+    PutS("verdict: NEONINIT")
+    PutNl()
+    ProcedureReturn 4
+  EndIf
+  NeonPalette()
+  NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  rc = Rung(2, "NeonInit - the V3D MMU is now ON")
+
+  ; ---- rung 3 - a whole frame -----------------------------------------
+  PutS("  ... one complete frame, bin and render")
+  PutNl()
+  UartDrain()
+  r = OneFrame()
+  UartWriteStr("      frame rc ")
+  PrintDec(r)
+  UartWriteStr("  draws ")
+  PrintDec(Neon_Draws())
+  UartWriteStr("  us bin ")
+  PrintDec(Neon_UsBin())
+  UartWriteStr("  us render ")
+  PrintDec(Neon_UsRender())
+  PutNl()
+  UartDrain()
+  rc = Rung(3, "one complete frame")
+
+  ; ---- rung 4 - the MMU goes off --------------------------------------
+  PutS("  ... NeonShutdown")
+  PutNl()
+  UartDrain()
+  r = NeonShutdown()
+  UartWriteStr("      NeonShutdown rc ")
+  PrintDec(r)
+  PutNl()
+  UartDrain()
+  rc = Rung(4, "NeonShutdown - the V3D MMU is now OFF")
+
+  ; ---- rung 5 - go round again ----------------------------------------
+  PutS("  ... NeonInit and a second frame")
+  PutNl()
+  UartDrain()
+  NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  r = NeonInit()
+  UartWriteStr("      NeonInit rc ")
+  PrintDec(r)
+  PutNl()
+  UartDrain()
+  If r = #NEON_OK
+    NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+    r = OneFrame()
+    UartWriteStr("      second frame rc ")
+    PrintDec(r)
+    PutNl()
+    UartDrain()
+  EndIf
+  rc = Rung(5, "a second init and a second frame")
+
+  ; ---- and leave the board the way it should be left -------------------
+  PutS("  ... NeonShutdown before returning")
+  PutNl()
+  NeonShutdown()
+  UartWriteStr("      MMU_CTL now ")
+  PutHex(V3dMmuCtlNow() & $FFFFFFFF, 8)
+  PutNl()
+  UartDrain()
+
+  PutS("=== done. Read the rungs: the first NO SURFACE names the cause. ===")
+  PutNl()
+  UartDrain()
+  ProcedureReturn rc
+EndProcedure

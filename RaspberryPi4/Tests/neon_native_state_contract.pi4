@@ -1,0 +1,87 @@
+; Active native Neon state contract. This fixture never calls NeonInit or submits
+; a V3D job: it exercises refusal/culling/capacity logic over BSS and installs
+; no-op callbacks only for accepted public operation/counter observations.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+; CONTRACT error codes: NOFRAME=10 INFRAME=11 VERTS=7 RECORDS=8 LIST=9
+; CONTRACT counters: flat draws=draw calls, boxes=accepted boxes, glyphs=accepted glyphs.
+; CONTRACT culling: empty, alpha-zero, off-surface and clipped primitives commit no geometry.
+; CONTRACT box vertex-capacity preflight atomicity: Neon_Box's first flat
+; vertex-capacity refusal leaves counters and prior work intact. This fixture
+; does not claim record or flat/textured text overflow atomicity.
+
+Global Dim nscX.i[4096]
+Global Dim nscY.i[4096]
+Global nscBoxCount.i
+Global nscTextCount.i
+Global nscScissorCount.i
+Global nscFanCount.i
+Global nscLineCount.i
+
+Procedure.i NscBox(x.i, y.i, w.i, h.i, c.i) : nscBoxCount = nscBoxCount + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NscText(f.i, x.i, y.i, *s, c.i) : nscTextCount = nscTextCount + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure NscScissor(x.i, y.i, w.i, h.i) : nscScissorCount = nscScissorCount + 1 : EndProcedure
+Procedure NscScissorClear() : EndProcedure
+Procedure.i NscFanBegin() : nscFanCount = nscFanCount + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure NscFanPoint(x.i, y.i) : EndProcedure
+Procedure.i NscFanEnd(c.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NscFanOutline(c.i) : ProcedureReturn #NEON_OK : EndProcedure
+Procedure.i NscLinesBegin() : nscLineCount = nscLineCount + 1 : ProcedureReturn #NEON_OK : EndProcedure
+Procedure NscLine(x0.i, y0.i, x1.i, y1.i) : EndProcedure
+Procedure.i NscLinesEnd(c.i) : ProcedureReturn #NEON_OK : EndProcedure
+
+Procedure.i NscRun()
+  Protected rc.i
+  Protected *s
+  ; 1: no-frame refusal for flat and textured operations.
+  neon_inFrame = 0 : gNeonBackendActive = 0 : neon_nClipped = 0
+  If Neon_Box(1, 1, 2, 2, $FFFFFFFF) <> #NEON_ERR_NOFRAME : ProcedureReturn 1 : EndIf
+  If Neon_TextTex(0, 1, 1, *s, $FFFFFFFF) <> #NEON_ERR_NOFRAME : ProcedureReturn 2 : EndIf
+
+  ; Safe native state for culling and capacity checks; no V3D entry is reached.
+  neon_inFrame = 1 : neon_w = 64 : neon_h = 64 : neon_physW = 64 : neon_physH = 64
+  neon_cx = 32 : neon_cy = 32 : neon_xcTab = @nscX[0] : neon_ycTab = @nscY[0]
+  neon_nVerts = 0 : neon_nBoxes = 0 : neon_nGlyphs = 0 : neon_nRuns = 0
+  If Neon_Box(1, 1, 0, 2, $FFFFFFFF) <> #NEON_OK : ProcedureReturn 3 : EndIf
+  If Neon_Clipped() <> 0 : ProcedureReturn 4 : EndIf
+  If Neon_Box(200, 1, 2, 2, $FFFFFFFF) <> #NEON_OK : ProcedureReturn 5 : EndIf
+  If Neon_Clipped() <> 1 : ProcedureReturn 6 : EndIf
+  If Neon_Box(1, 1, 2, 2, $00FFFFFF) <> #NEON_OK : ProcedureReturn 7 : EndIf
+  If Neon_Clipped() <> 2 : ProcedureReturn 8 : EndIf
+
+  ; Neon_Box flat vertex-capacity preflight is atomic: no box/draw/vertex
+  ; counter advances. Record and text overflow are outside this contract.
+  neon_nVerts = #NEON_MAX_VERTS - 5 : neon_nBoxes = 0 : neon_nDraws = 0
+  rc = Neon_Box(1, 1, 2, 2, $FFFFFFFF)
+  If rc <> #NEON_ERR_VERTS : ProcedureReturn 9 : EndIf
+  If neon_nVerts <> (#NEON_MAX_VERTS - 5) Or neon_nBoxes <> 0 Or neon_nDraws <> 0 : ProcedureReturn 10 : EndIf
+
+  ; Accepted public operation family through an all-or-none callback seam.
+  neon_nVerts = 0 : neon_err = #NEON_OK
+  rc = NeonDrawBackendInstall(@NscBox, @NscText, @NscScissor, @NscScissorClear, @NscFanBegin, @NscFanPoint, @NscFanEnd, @NscFanOutline, @NscLinesBegin, @NscLine, @NscLinesEnd)
+  If rc <> #NEON_OK : ProcedureReturn 11 : EndIf
+  If Neon_Box(1, 1, 2, 2, $FFFFFFFF) <> #NEON_OK Or nscBoxCount <> 1 : ProcedureReturn 12 : EndIf
+  If Neon_Text(0, 1, 1, *s, $FFFFFFFF) <> #NEON_OK Or nscTextCount <> 1 : ProcedureReturn 13 : EndIf
+  Neon_ScissorSet(0, 0, 8, 8) : Neon_ScissorClear()
+  If nscScissorCount <> 1 : ProcedureReturn 14 : EndIf
+  If NeonFanBegin() <> #NEON_OK : ProcedureReturn 15 : EndIf
+  NeonFanPoint(1, 1) : NeonFanPoint(2, 2)
+  If NeonFanEnd($FFFFFFFF) <> #NEON_OK Or nscFanCount <> 1 : ProcedureReturn 16 : EndIf
+  If NeonLinesBegin() <> #NEON_OK : ProcedureReturn 17 : EndIf
+  NeonLine(1, 1, 2, 2)
+  If NeonLinesEnd($FFFFFFFF) <> #NEON_OK Or nscLineCount <> 1 : ProcedureReturn 18 : EndIf
+  NeonDrawBackendClear()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  ProcedureReturn NscRun()
+EndProcedure

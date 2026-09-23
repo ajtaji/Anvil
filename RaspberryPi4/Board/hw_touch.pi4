@@ -1,0 +1,788 @@
+; ======================================================================
+;  hw_touch.pi4 - THE BOARD SIDE OF THE HwTouch* SEAM declared in
+;  Anvil/Hal/hal.pi4, over RaspberryPi4/Lib/touch_goodix.pi4.
+;
+;  The seam's whole vocabulary is a queue of 32-byte events carrying
+;  SCREEN pixels. Everything between the controller's own grid and those
+;  pixels happens here, because every one of those steps is board
+;  knowledge: which bus the panel is on, which micro holds the touch
+;  controller's reset, which way up the panel is bolted, and how big the
+;  console's surface is.
+;
+;  REQUIRES, and board.pi4 lists them all in order ahead of this file:
+;    RaspberryPi4/Lib/gpio.pi4        i2c.pi4 muxes through it
+;    RaspberryPi4/Lib/i2c.pi4         the two BSC masters
+;    RaspberryPi4/Lib/timer.pi4       Ticks(), millis()
+;    RaspberryPi4/Lib/display.pi4     the surface the finger lands on
+;    RaspberryPi4/Lib/dsi_panel_v2.pi4  the micro that holds the reset
+;    RaspberryPi4/Lib/touch_goodix.pi4  the controller
+;    Anvil/Hal/hal.pi4                #HW_TOUCH_* and the record layout
+;    Anvil/Core/settings.pi4          the stored axis correction
+;    RaspberryPi4/Board/screen_geom.pi4   ScrTouchX / ScrTouchY
+;    RaspberryPi4/Board/screen_source.pi4 gScrSrc, gScrRot, ScrRotWanted
+;
+; ======================================================================
+;  A QUEUE AND NOT A STATE, WHICH IS THE SEAM'S OWN WORDING
+; ======================================================================
+;  hal.pi4: "A QUEUE AND NOT A STATE, deliberately: a tap that begins and
+;  ends between two UI frames must still be seen, and a state-polling
+;  seam loses it." The controller reports at about 60 Hz and a fast tap
+;  is two or three frames, so a UI drawing at 30 Hz would miss half the
+;  taps on the glass if it only ever asked "is anything down now".
+;
+;  So HwTouchTick() reads the controller and turns each frame into
+;  DOWN / MOVE / UP events by comparing it with the frame before, and
+;  they wait in a ring until somebody takes them.
+;
+;  THE CONTACT COUNT IS ALSO OFFERED, AND IT IS NOT A DUPLICATE OF THE
+;  QUEUE. A pointer that derived "the button is down" from the events
+;  alone would be wrong for as long as a queue overflow or a
+;  HwTouchFlush() lasted - a DOWN delivered with its UP thrown away is a
+;  button that never comes back up. HwTouchContacts() is the truth about
+;  NOW, the queue is the record of WHAT HAPPENED, and a caller that uses
+;  the first for the button and the second for the position cannot get
+;  stuck in either direction.
+;
+; ======================================================================
+;  THE ORDER ON A v2 PANEL, AND IT IS THE THING THAT LOOKS LIKE A DEAD BUS
+; ======================================================================
+;  The Goodix's reset line is bit 9 of the GPIO expander inside the
+;  panel's own micro at $45. No Pi GPIO reaches it. Until that micro has
+;  been written the controller is held in reset and answers nothing, so
+;  a touch probe that runs first reports a dead bus on a perfectly good
+;  panel.
+;
+;  HwTouchUp() therefore writes the micro before it probes - BUT ONLY IF
+;  NOBODY HAS. DsiV2Begin() rewrites the whole sixteen-bit expander
+;  shadow to the probe state, which CLEARS the backlight enable and the
+;  panel's own rails; calling it on a panel that is already lit and
+;  scanning would blank the screen. So it is guarded by DsiV2Ready(),
+;  and on the boot path the screen's own bring-up has already done it.
+;
+; ======================================================================
+;  THE BUS IS PUT BACK, EVERY TIME
+; ======================================================================
+;  The selected bus is a global inside i2c.pi4 and the core `i2c` command
+;  shares it. A touch tick that walked away leaving BSC0 selected would
+;  make the next `i2c scan` report the display connector's devices under
+;  a heading naming GPIO 2 and 3 - a true sentence about the wrong
+;  question. Every entry point here that touches the wire goes in through
+;  TouchBusEnter() and out through TouchBusLeave(), and there is no path
+;  between them that returns.
+; ======================================================================
+
+; How often the controller is read. goodix.c:51 polls at 17 ms and calls
+; it 60 fps in the comment beside it; a finger is slower than that and
+; always will be. Each tick is up to three I2C transactions, so a caller
+; that ignored this and looped would spend nearly all of its time here.
+#HW_TOUCH_TICK_MS = 17
+
+; The event ring. Ten contacts can each produce a DOWN, a MOVE and an UP
+; inside three frames, so sixty-four records is several frames of the
+; busiest thing ten fingers can do. Overflow is COUNTED and the OLDEST
+; is dropped - see HwTouchPush.
+#HW_TOUCH_QMAX  = 64
+#HW_TOUCH_EVSZ  = 32
+
+; The record's fields, by byte offset. hal.pi4 owns this layout and
+; calls it part of the portable vocabulary, so the names are here and
+; the numbers are written once.
+#HW_TOUCH_EV_X    = 0
+#HW_TOUCH_EV_Y    = 4
+#HW_TOUCH_EV_ID   = 8
+#HW_TOUCH_EV_ST   = 12
+#HW_TOUCH_EV_TICK = 16
+#HW_TOUCH_EV_PRES = 24
+#HW_TOUCH_EV_RSVD = 28
+
+Global gTouchUp.i = 0             ; 1 once a controller answered
+Global gTouchErr.i = 0            ; a whole sentence, or 0
+Global gTouchFlip.i = #SCR_TOUCH_ALIGNED   ; the axis correction in use
+Global gTouchTick.i = 0           ; Ticks() at the last controller read
+Global gTouchTicked.i = 0         ; 1 once gTouchTick means anything
+Global gTouchPollSeq.i = 0        ; increments only when a bus poll is attempted
+
+Global Dim gTouchQ.a[#HW_TOUCH_QMAX * #HW_TOUCH_EVSZ]
+Global gTouchHead.i = 0           ; where the next push goes
+Global gTouchTail.i = 0           ; where the next poll comes from
+Global gTouchCount.i = 0          ; how many are waiting
+Global gTouchLost.i = 0           ; records dropped for a full ring
+
+; The frame before this one, in SCREEN pixels, so an UP can be reported
+; where the finger actually was rather than where it is not any more.
+Global gTouchPrevN.i = 0
+Global Dim gTouchPrevId.i[#GT9_MAX_POINTS]
+Global Dim gTouchPrevX.i[#GT9_MAX_POINTS]
+Global Dim gTouchPrevY.i[#GT9_MAX_POINTS]
+; The controller's own numbers for the same contacts, KEPT BESIDE THE
+; MAPPED ONES rather than read back out of the driver when they are
+; wanted. A contact the mapping refuses is dropped from this frame, so
+; the driver's index and this frame's index are not the same index, and
+; `touch points` printing Gt9RawX(i) beside HwTouchPointX(i) would be
+; pairing two different fingers - which reads as a mapping that is
+; wrong by a finger's width and is not.
+Global Dim gTouchPrevRx.i[#GT9_MAX_POINTS]
+Global Dim gTouchPrevRy.i[#GT9_MAX_POINTS]
+Global Dim gTouchPrevSz.i[#GT9_MAX_POINTS]
+
+; This frame, mapped, kept so `touch points` can print a whole frame
+; without consuming the queue the pointer is reading.
+Global gTouchNowN.i = 0
+Global Dim gTouchNowId.i[#GT9_MAX_POINTS]
+Global Dim gTouchNowX.i[#GT9_MAX_POINTS]
+Global Dim gTouchNowY.i[#GT9_MAX_POINTS]
+Global Dim gTouchNowP.i[#GT9_MAX_POINTS]
+Global Dim gTouchNowRx.i[#GT9_MAX_POINTS]
+Global Dim gTouchNowRy.i[#GT9_MAX_POINTS]
+
+; Counters, so a report can say what happened rather than what should
+; have.
+Global gTouchDowns.i = 0
+Global gTouchMoves.i = 0
+Global gTouchUps.i = 0
+Global gTouchUnmapped.i = 0       ; frames the mapping refused
+
+; ----------------------------------------------------------------------
+;  TouchAxesKey / TouchFlipStored / TouchFlipWanted - the stored axis
+;  correction, the same three-procedure shape screen_source.pi4 uses for
+;  the rotation, and for the same reason: the ARITHMETIC of the choice is
+;  in screen_geom.pi4 where a gate can execute it, and the only part that
+;  is here is reading a string out of the settings store.
+; ----------------------------------------------------------------------
+Procedure.i TouchAxesKey()
+  ProcedureReturn "touch.axes"
+EndProcedure
+
+Procedure.i TouchFlipStored()
+  ProcedureReturn PmfDecOf(SettingsGet(TouchAxesKey()), #SCR_TOUCH_UNSET)
+EndProcedure
+
+Procedure.i TouchFlipWanted()
+  ProcedureReturn ScrTouchFlipPick(TouchFlipStored())
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Which way up, and how big, the finger is landing on.
+;
+;  THE PANEL IS THE TOUCH SURFACE AND HDMI IS NOT. If the console has
+;  been moved to an HDMI display the finger is still on the panel, so
+;  the coordinates it produces are the panel's console coordinates -
+;  the rotation the panel WOULD come up at, over the panel's own
+;  geometry. Reporting them in the HDMI display's pixels would be a
+;  number about a screen the finger is nowhere near.
+;
+;  WHEN THE CONSOLE IS ON THE PANEL, THE SURFACE IS ASKED RATHER THAN
+;  COMPUTED, and that is the whole of how a scale reaches the touch
+;  path: DisplayWidth() and DisplayHeight() are whatever the display
+;  layer adopted, so a surface that is not the panel's pixel count maps
+;  correctly here with no change to this file.
+; ----------------------------------------------------------------------
+Procedure.i TouchRotation()
+  If gScrSrc = #SCR_SRC_DSI
+    ProcedureReturn gScrRot
+  EndIf
+  ProcedureReturn ScrRotWanted(#SCR_SRC_DSI)
+EndProcedure
+
+Procedure.i TouchSurfaceW()
+  If gScrSrc = #SCR_SRC_DSI And DisplayReady() <> 0
+    ProcedureReturn DisplayWidth()
+  EndIf
+  ProcedureReturn ScrLogicalW(TouchRotation(), #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+EndProcedure
+
+Procedure.i TouchSurfaceH()
+  If gScrSrc = #SCR_SRC_DSI And DisplayReady() <> 0
+    ProcedureReturn DisplayHeight()
+  EndIf
+  ProcedureReturn ScrLogicalH(TouchRotation(), #MON_FB_PANEL_W, #MON_FB_PANEL_H)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHICH BUS THE PANEL IS ON. The DISPLAY connector's - BSC0 on GPIO
+;  44/45 at ALT1 - because that is where a panel plugs in, and no
+;  jumpers are needed.
+;
+;  IT IS A VARIABLE AND NOT A CONSTANT because the overlay itself
+;  documents the other case: its `i2c1` override is for a panel wired
+;  with jumper wires from the touch pins to header pins 3 and 5, which
+;  is the cheapest way to prove a touch controller with no DSI link at
+;  all. `touch bus header` moves it. It is a bench setting and is not
+;  remembered across a reset - unlike the axis correction, which is a
+;  fact about the panel rather than about how it is temporarily wired.
+;
+;  IT LIVES HERE AND NOT IN THE COMMAND because every transfer in this
+;  file goes through it, and a command-owned copy would mean the boot
+;  path and the operator disagreeing about which pair of pins the panel
+;  is on.
+; ----------------------------------------------------------------------
+Global gTouchBus.i = #I2C_BUS_DISPLAY
+
+; ----------------------------------------------------------------------
+;  TouchBusEnter / TouchBusLeave - the panel's bus, and the header bus
+;  put back afterwards. See the header.
+; ----------------------------------------------------------------------
+Procedure.i TouchBusEnter()
+  I2cSelectBus(gTouchBus)
+  ProcedureReturn I2cUp()
+EndProcedure
+
+Procedure TouchBusLeave()
+  I2cSelectBus(#I2C_BUS_HEADER)
+EndProcedure
+
+; ======================================================================
+;  THE RING
+; ======================================================================
+
+Procedure.i HwTouchQueued()
+  ProcedureReturn gTouchCount
+EndProcedure
+
+; HwTouchFlush - discard what is waiting AND forget which contacts were
+; down. hal.pi4: "CALLED ON EVERY SCREEN CHANGE - a stale tap that lands
+; on the new screen is the bug that makes a driver change duty status by
+; accident."
+;
+; THE TRACKED CONTACTS GO TOO, and that is not extra tidying: a queue
+; emptied while a finger was still down would deliver that finger's UP
+; against the new screen, or - if the finger lifted during the change -
+; never deliver it at all. Forgetting the frame means the next one is
+; read as a fresh set of contacts, which is what it is.
+Procedure HwTouchFlush()
+  gTouchHead = 0
+  gTouchTail = 0
+  gTouchCount = 0
+  gTouchPrevN = 0
+  gTouchNowN = 0
+  ; A flush also invalidates the console pointer's view of the frame.
+  ; Clear both pieces together so screen changes, ABI flushes and a
+  ; failed manual restart cannot leave a synthetic left button held.
+  gPtrBtnTouch = 0
+  gTouchPrimaryId = -1
+EndProcedure
+
+; HwTouchPush - one event into the ring.
+;
+; A FULL RING DROPS THE OLDEST AND COUNTS IT. The alternative - refusing
+; the newest - keeps a UI looking at a stale finger forever, which is
+; the worse failure of the two: the newest event is the one that says
+; where the finger is now. The count is printed by `touch`, so a ring
+; that is too small says so instead of being discovered.
+Procedure HwTouchPush(x.i, y.i, id.i, state.i, pressure.i)
+  Define *e
+  If gTouchCount >= #HW_TOUCH_QMAX
+    gTouchTail = (gTouchTail + 1) % #HW_TOUCH_QMAX
+    gTouchCount = gTouchCount - 1
+    gTouchLost = gTouchLost + 1
+  EndIf
+  *e = @gTouchQ[0] + gTouchHead * #HW_TOUCH_EVSZ
+  PokeL(*e + #HW_TOUCH_EV_X, x)
+  PokeL(*e + #HW_TOUCH_EV_Y, y)
+  PokeL(*e + #HW_TOUCH_EV_ID, id)
+  PokeL(*e + #HW_TOUCH_EV_ST, state)
+  ; +16 is SIXTY-FOUR BITS and PokeI writes eight bytes on this part.
+  ; The tick count passes 2^32 about eighty seconds after a reset at
+  ; 54 MHz, so a 32-bit field here would wrap inside a working session
+  ; and a long-press measurement would come out negative.
+  PokeI(*e + #HW_TOUCH_EV_TICK, Ticks())
+  PokeL(*e + #HW_TOUCH_EV_PRES, pressure)
+  PokeL(*e + #HW_TOUCH_EV_RSVD, 0)
+  gTouchHead = (gTouchHead + 1) % #HW_TOUCH_QMAX
+  gTouchCount = gTouchCount + 1
+EndProcedure
+
+; HwTouchPoll(*ev) - dequeue ONE event into the caller's 32 bytes.
+; 1 got one, 0 the queue is empty, negative on error.
+Procedure.i HwTouchPoll(*ev)
+  Define *e
+  Define i.i
+  If *ev = 0
+    ProcedureReturn -1
+  EndIf
+  If gTouchCount = 0
+    ProcedureReturn 0
+  EndIf
+  *e = @gTouchQ[0] + gTouchTail * #HW_TOUCH_EVSZ
+  i = 0
+  While i < #HW_TOUCH_EVSZ
+    PokeA(*ev + i, PeekA(*e + i))
+    i = i + 1
+  Wend
+  gTouchTail = (gTouchTail + 1) % #HW_TOUCH_QMAX
+  gTouchCount = gTouchCount - 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  BRINGING IT UP
+; ======================================================================
+
+Procedure.i HwTouchErrText()
+  ProcedureReturn gTouchErr
+EndProcedure
+
+; HwTouchMaxPoints - what the CONTROLLER said, not what the part could
+; do. Its config block declares how many contact slots it is programmed
+; for and goodix.c refuses any frame claiming more (goodix.c:280); this
+; is that number, and it is 0 before HwTouchUp has run because nothing
+; has asked yet.
+Procedure.i HwTouchMaxPoints()
+  If gTouchUp = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Gt9MaxPoints()
+EndProcedure
+
+; HwTouchUp - bring the controller up. 1 ready, 0 with a reason already
+; available from HwTouchErrText(). Idempotent: a second call on a
+; controller that is already answering returns 1 and touches nothing.
+Procedure.i HwTouchUp()
+  Define a.i
+
+  If gTouchUp <> 0
+    ProcedureReturn 1
+  EndIf
+
+  gTouchErr = 0
+  If TouchBusEnter() = 0
+    TouchBusLeave()
+    gTouchErr = "the display connector's I2C bus would not come up, so nothing on the panel - not the touch controller and not its power micro - can be reached; check that GPIO 44 and 45 are free with `gpio status 44`."
+    ProcedureReturn 0
+  EndIf
+
+  ; The micro that holds the touch controller's reset. GUARDED - see the
+  ; header: DsiV2Begin rewrites the whole expander shadow and would
+  ; blank a panel that is already lit.
+  If DsiV2Ready() = 0
+    If DsiV2Begin() = 0
+      TouchBusLeave()
+      gTouchErr = "the panel's power micro at $45 did not acknowledge, so the touch controller is still held in reset by expander bit 9 and cannot answer; run `touch` for the bus codes and check the flat cable is seated."
+      ProcedureReturn 0
+    EndIf
+  EndIf
+
+  ; Name only Gt9Begin's first identity transaction at each legal address.
+  ; With tracing disabled these calls perform no MMIO and do not alter the
+  ; bus sequence; with it enabled i2c.pi4 retains the pre-clear state and
+  ; the real result of the existing I2cWriteRead.
+  I2cTraceGoodixWindow(1)
+  a = Gt9Begin()
+  I2cTraceGoodixWindow(0)
+  TouchBusLeave()
+  If a = 0
+    gTouchErr = "no Goodix identity read completed at $5D or $14 on the display connector's bus, although the panel's micro answered earlier. That records which transactions failed; it does not establish whether the cause is controller state, reset ownership, wiring or the fitted part. `touch` prints each address's bus code."
+    ProcedureReturn 0
+  EndIf
+
+  If Gt9XMax() < 1 Or Gt9YMax() < 1
+    gTouchErr = "the touch controller answered and named itself, but its config block reports a coordinate range of zero in at least one axis, so there is no number to scale a finger by; `touch` prints the block's version and the two ranges."
+    ; NOT FATAL TO THE SEAM ITSELF. The controller is up, the identity is
+    ; readable, `touch` can report it and the counters run - what cannot
+    ; happen is a MAPPED coordinate, and TouchMapFrame refuses those one
+    ; by one and counts the refusals. A driver that refused to start over
+    ; this would hide the identity that says which part is misbehaving.
+  EndIf
+
+  gTouchFlip = TouchFlipWanted()
+  gTouchUp = 1
+  gTouchTicked = 0
+  HwTouchFlush()
+  ; AND THE CURSOR'S OWN FLAGS, HERE, BECAUSE THERE IS ONE BRING-UP.
+  ; cursor_input.pi4's lazy attach and the `touch` command both come
+  ; through this procedure; if either kept its own idea of whether the
+  ; controller is up, a `touch` that revived a chip would leave the
+  ; finger still not moving the arrow, and the operator would have
+  ; proved the hardware and fixed nothing.
+  gTouchOk = 1
+  gTouchMiss = 0
+  gTouchTried = 1
+  ProcedureReturn 1
+EndProcedure
+
+; HwTouchRestart - probe again from cold, whatever this file currently
+; believes. What `touch` runs, and what a controller that was pulled and
+; plugged back in needs.
+;
+; ONE BRING-UP PATH AND NOT TWO. The obvious alternative - letting the
+; command call Gt9Begin() itself - is a second way in that would leave
+; the seam's own state, the event queue and the cursor's flags saying
+; something different from the wire.
+Procedure.i HwTouchRestart()
+  gTouchUp = 0
+  gTouchOk = 0
+  gTouchMiss = 0
+  HwTouchFlush()
+  ProcedureReturn HwTouchUp()
+EndProcedure
+
+; ======================================================================
+;  ONE FRAME
+; ======================================================================
+
+; TouchPrevIndex - where in the previous frame this contact id was, or
+; -1. A linear walk of at most ten, ten times: a hundred compares at
+; 60 Hz, which is nothing, and a map would be more code than the thing
+; it indexes.
+Procedure.i TouchPrevIndex(id.i)
+  Define j.i
+  j = 0
+  While j < gTouchPrevN
+    If gTouchPrevId[j] = id
+      ProcedureReturn j
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i TouchNowIndex(id.i)
+  Define j.i
+  j = 0
+  While j < gTouchNowN
+    If gTouchNowId[j] = id
+      ProcedureReturn j
+    EndIf
+    j = j + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchMapFrame - turn the controller's frame into screen pixels.
+;
+;  A contact the mapping refuses is DROPPED FROM THE FRAME and counted,
+;  not passed on as a zero: (0, 0) is the top left corner of the screen
+;  and it is exactly where a UI puts something worth not pressing by
+;  accident.
+; ----------------------------------------------------------------------
+Procedure TouchMapFrame()
+  Define n.i
+  Define i.i
+  Define deg.i
+  Define lw.i
+  Define lh.i
+  Define xm.i
+  Define ym.i
+  Define px.i
+  Define py.i
+  Define pr.i
+
+  gTouchNowN = 0
+  n = Gt9Count()
+  deg = TouchRotation()
+  lw = TouchSurfaceW()
+  lh = TouchSurfaceH()
+  xm = Gt9XMax()
+  ym = Gt9YMax()
+
+  i = 0
+  While i < n
+    px = ScrTouchX(deg, gTouchFlip, Gt9RawX(i), Gt9RawY(i), xm, ym, lw, lh)
+    py = ScrTouchY(deg, gTouchFlip, Gt9RawX(i), Gt9RawY(i), xm, ym, lw, lh)
+    If px < 0 Or py < 0
+      gTouchUnmapped = gTouchUnmapped + 1
+    Else
+      ; The contact patch is a sixteen-bit width, and the seam's field
+      ; is 0..255 or -1. Clamping rather than scaling: the number is
+      ; "roughly how hard" and nothing in this tree uses it for
+      ; arithmetic, so a wider patch reading 255 is honest and a scaled
+      ; one would imply a calibration nobody has done.
+      pr = Gt9Size(i)
+      If pr < 0
+        pr = -1
+      ElseIf pr > 255
+        pr = 255
+      EndIf
+      gTouchNowId[gTouchNowN] = Gt9Id(i)
+      gTouchNowX[gTouchNowN] = px
+      gTouchNowY[gTouchNowN] = py
+      gTouchNowP[gTouchNowN] = pr
+      gTouchNowRx[gTouchNowN] = Gt9RawX(i)
+      gTouchNowRy[gTouchNowN] = Gt9RawY(i)
+      gTouchNowN = gTouchNowN + 1
+    EndIf
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchEmitFrame - the difference between this frame and the last one,
+;  as events.
+;
+;  A MOVE IS ONLY EMITTED WHEN THE PIXEL CHANGED. A finger resting still
+;  produces a frame every 17 ms and every one of them carries the same
+;  coordinates; enqueuing all of them would fill the ring in a second
+;  and drop the UP at the end of the press, which is the one event that
+;  must not be lost. The controller's own jitter is below a pixel after
+;  the scale, so a still finger is genuinely still here.
+; ----------------------------------------------------------------------
+Procedure TouchEmitFrame()
+  Define i.i
+  Define j.i
+
+  ; Gone since last time: an UP, at the last place it was seen.
+  j = 0
+  While j < gTouchPrevN
+    If TouchNowIndex(gTouchPrevId[j]) < 0
+      HwTouchPush(gTouchPrevX[j], gTouchPrevY[j], gTouchPrevId[j], #HW_TOUCH_UP, -1)
+      gTouchUps = gTouchUps + 1
+    EndIf
+    j = j + 1
+  Wend
+
+  ; New, or moved.
+  i = 0
+  While i < gTouchNowN
+    j = TouchPrevIndex(gTouchNowId[i])
+    If j < 0
+      HwTouchPush(gTouchNowX[i], gTouchNowY[i], gTouchNowId[i], #HW_TOUCH_DOWN, gTouchNowP[i])
+      gTouchDowns = gTouchDowns + 1
+    ElseIf gTouchPrevX[j] <> gTouchNowX[i] Or gTouchPrevY[j] <> gTouchNowY[i]
+      HwTouchPush(gTouchNowX[i], gTouchNowY[i], gTouchNowId[i], #HW_TOUCH_MOVE, gTouchNowP[i])
+      gTouchMoves = gTouchMoves + 1
+    EndIf
+    i = i + 1
+  Wend
+
+  ; This frame becomes the previous one.
+  gTouchPrevN = gTouchNowN
+  i = 0
+  While i < gTouchNowN
+    gTouchPrevId[i] = gTouchNowId[i]
+    gTouchPrevX[i] = gTouchNowX[i]
+    gTouchPrevY[i] = gTouchNowY[i]
+    gTouchPrevRx[i] = gTouchNowRx[i]
+    gTouchPrevRy[i] = gTouchNowRy[i]
+    gTouchPrevSz[i] = gTouchNowP[i]
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwTouchTick - read the controller if it is time to, and turn what it
+;  said into events. Returns the number of contacts now down, or a
+;  negative #GT9_E* code, or 0 when it was not time yet.
+;
+;  RATE LIMITED HERE AND NOT AT THE CALL SITE, because there are three
+;  callers - the prompt's spin, `touch points`, and any UI - and a limit
+;  each would be three different cadences against one controller.
+; ----------------------------------------------------------------------
+Procedure.i HwTouchTick()
+  Define n.i
+  Define lim.i
+
+  If gTouchUp = 0
+    ProcedureReturn #GT9_ENODEV
+  EndIf
+
+  lim = (TickHz() / 1000) * #HW_TOUCH_TICK_MS
+  If gTouchTicked <> 0
+    If (Ticks() - gTouchTick) < lim
+      ProcedureReturn gTouchPrevN
+    EndIf
+  EndIf
+  gTouchTick = Ticks()
+  gTouchTicked = 1
+  gTouchPollSeq = gTouchPollSeq + 1
+
+  If TouchBusEnter() = 0
+    ProcedureReturn #GT9_EBUS
+  EndIf
+  n = Gt9Poll()
+  TouchBusLeave()
+
+  If n = #GT9_ENOTREADY
+    ; The commonest return there is: the buffer-ready bit lags the touch
+    ; by about ten milliseconds. Nothing happened and nothing is wrong.
+    ProcedureReturn gTouchPrevN
+  EndIf
+  If n = #GT9_EPROTO
+    ; A FRAME CLAIMING MORE CONTACTS THAN THE PART HAS SLOTS IS ONE BAD
+    ; READ, NOT A DEAD CONTROLLER, and the difference matters because
+    ; the caller stands the touch down after three negatives in a row.
+    ; The driver has already counted it (Gt9BadFrames) and already
+    ; released the buffer flag, so the controller is free to build the
+    ; next frame; standing the whole surface down over one corrupt burst
+    ; would take the finger off a working panel. The contacts that were
+    ; down stay down until a frame that is believable says otherwise.
+    ProcedureReturn gTouchPrevN
+  EndIf
+  If n < 0
+    ProcedureReturn n
+  EndIf
+
+  TouchMapFrame()
+  TouchEmitFrame()
+  ProcedureReturn gTouchPrevN
+EndProcedure
+
+; ======================================================================
+;  THE BOARD'S OWN ADDITIONS TO THE SEAM, AND WHY THEY ARE HERE
+;
+;  hal.pi4 names six entry points. These four are extra, they are named
+;  in the same family so they read as one surface, and each exists
+;  because the six alone cannot answer a question something already
+;  asks:
+;
+;    HwTouchContacts()    how many are down NOW. The button state, and
+;                         the reason a pointer cannot get stuck - see
+;                         the second block of this file's header.
+;    HwTouchPointX/Y(i)   where the i-th one is, in the frame just read.
+;                         `touch points` prints a whole frame, and doing
+;                         that through the queue would consume the
+;                         events the cursor is reading.
+;    HwTouchPointId(i)
+;
+;  They are NOT in hal.pi4's contract, because that contract is meant to
+;  be designed from two boards and there is still one. When the second
+;  board grows a panel these are the first candidates to go in.
+; ======================================================================
+Procedure.i HwTouchContacts()
+  ProcedureReturn gTouchPrevN
+EndProcedure
+
+Procedure.i HwTouchPointX(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevX[i]
+EndProcedure
+
+Procedure.i HwTouchPointY(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevY[i]
+EndProcedure
+
+Procedure.i HwTouchPointId(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevId[i]
+EndProcedure
+
+; The controller's own numbers for the same contact. FOR THE REPORT AND
+; FOR NOTHING ELSE - a UI is given screen pixels and must never see
+; these, or it learns the panel's orientation and the seam has failed.
+Procedure.i HwTouchPointRawX(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevRx[i]
+EndProcedure
+
+Procedure.i HwTouchPointRawY(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevRy[i]
+EndProcedure
+
+Procedure.i HwTouchPointSize(i.i)
+  If i < 0 Or i >= gTouchPrevN
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn gTouchPrevSz[i]
+EndProcedure
+
+; Readers for the report. Nothing here transfers.
+Procedure.i HwTouchReady()
+  ProcedureReturn gTouchUp
+EndProcedure
+
+Procedure.i HwTouchFlip()
+  ProcedureReturn gTouchFlip
+EndProcedure
+
+Procedure.i HwTouchSetFlip(f.i)
+  If ScrTouchFlipOk(f) = 0
+    ProcedureReturn 0
+  EndIf
+  gTouchFlip = f
+  ; The tracked frame was mapped with the OLD correction, so keeping it
+  ; would emit one MOVE per contact jumping across the screen the
+  ; instant the axes changed.
+  HwTouchFlush()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwTouchLost()
+  ProcedureReturn gTouchLost
+EndProcedure
+
+Procedure.i HwTouchUnmapped()
+  ProcedureReturn gTouchUnmapped
+EndProcedure
+
+Procedure.i HwTouchDowns()
+  ProcedureReturn gTouchDowns
+EndProcedure
+
+Procedure.i HwTouchMoves()
+  ProcedureReturn gTouchMoves
+EndProcedure
+
+Procedure.i HwTouchUps()
+  ProcedureReturn gTouchUps
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  TouchBoot - bring the touch up at boot, print ONE line, and never be
+;  fatal.
+;
+;  IT RUNS AFTER THE SCREEN AND ONLY WHEN THE SCREEN IS THE PANEL. The
+;  touch controller lives on the panel: on a board with no panel
+;  plugged in there is nothing to bring up, and probing for it would
+;  spend two failed transfers at every boot to print a line saying so.
+;  `touch` still probes on demand and still explains, which is the right
+;  place for the question "is there one".
+;
+;  The line it prints is the same shape as the fan's and the storage's:
+;  what was found, in one sentence, so a boot log says whether a finger
+;  will work before anybody puts one on the glass.
+; ----------------------------------------------------------------------
+Procedure TouchBoot()
+  Define *idp
+  Define i.i
+  Define c.i
+
+  If gScrSrc <> #SCR_SRC_DSI
+    ProcedureReturn
+  EndIf
+
+  If HwTouchUp() = 0
+    PrintN("The panel is up but its touch controller did not answer, so there")
+    PrintN("is no finger input. `touch` says why.")
+    ProcedureReturn
+  EndIf
+
+  Print("Touch: a Goodix at $")
+  PutHex2(Gt9Addr())
+  Print(" answering as ")
+  *idp = Gt9ProdId()
+  If *idp <> 0
+    i = 0
+    While i < 4
+      c = PeekA(*idp + i) & $FF
+      If c >= 32 And c < 127
+        UartWrite(c)
+      EndIf
+      i = i + 1
+    Wend
+  EndIf
+  Print(", ")
+  PrintDec(Gt9MaxPoints())
+  Print(" points, ")
+  PrintDec(Gt9XMax())
+  Print(" by ")
+  PrintDec(Gt9YMax())
+  Print(" of its own, mapped onto ")
+  PrintDec(TouchSurfaceW())
+  Print(" by ")
+  PrintDec(TouchSurfaceH())
+  Print(" turned ")
+  PrintDec(TouchRotation())
+  PrintN(" degrees.")
+EndProcedure

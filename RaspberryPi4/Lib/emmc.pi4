@@ -1,0 +1,2371 @@
+; ======================================================================
+; SD / SDHC / SDXC BLOCK ACCESS for the Raspberry Pi 4, over the BCM2711
+; EMMC2 controller - library, not a compiler builtin.
+; ----------------------------------------------------------------------
+; Polled PIO, one 512-byte block at a time, no filesystem and no DMA.
+; FAT is a separate job and does not belong in here.
+;
+; USE - this file names no other file (house rule: a library never
+; includes a library). The MAIN program lists what it needs:
+;
+;     XIncludeFile "RaspberryPi4/Lib/uart.pi4"    ; ONLY if you want to
+;                                                 ; PRINT the diagnosis
+;     XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
+;
+;     If SdInit() = 0
+;       PutS(SdErrorText()) : PutS(" cmd=") : PutHex2(SdLastCmd())
+;       PutS(" intr=")      : PutHex8(SdLastIntr())
+;       PutS(" state=")     : PutHex8(SdLastStatus())
+;     Else
+;       SdReadBlock(0, @sector[0])          ; the MBR
+;     EndIf
+;
+; ----------------------------------------------------------------------
+; WHAT THIS FILE NEEDS FROM ITS CALLER, AND WHAT IT DELIBERATELY DOES NOT
+; ----------------------------------------------------------------------
+; timer.pi4      NOT NEEDED, and that is a decision, not an omission.
+;                Every timeout in this file is measured against
+;                CNTPCT_EL0 / CNTFRQ_EL0, read with two lines of inline
+;                asm in sd_Ticks() / sd_TickHz() - exactly the idiom
+;                RaspberryPi4/Monitor/anvil.pi4 uses for its receive
+;                timeout, and for the same reason: those registers are
+;                readable with no trap and no setup, so a driver that has
+;                to bound every wait can do it without owing anything to
+;                another file. A spin count would have had to be
+;                calibrated against a CPU frequency the firmware is free
+;                to change underneath us.
+;
+;                SdInit() REFUSES with #SD_ERR_NO_CNTFRQ if CNTFRQ_EL0
+;                reads back as zero or absurd, because a clock that is
+;                lying makes every "bounded" wait below unbounded again.
+;
+; uart.pi4       NOT INCLUDED. This file never prints. It records the
+;                failing command, the raw INTERRUPT word and the raw
+;                Present State word, and hands them to the caller through
+;                SdLastCmd() / SdLastIntr() / SdLastStatus(), plus a
+;                fixed English string from SdErrorText(). The MAIN file
+;                includes a UART library and prints them. That is the
+;                same split every other driver in this project uses and
+;                it is what lets this one be linked into something with
+;                no console at all.
+;
+; mailbox.pi4    NOT INCLUDED, and there are two things this file
+;                therefore CANNOT do. Both are real limits, not
+;                laziness - see "TWO THINGS THIS DRIVER CANNOT DO" below.
+;                A MAIN file that includes mailbox.pi4 as well can hand
+;                the missing piece in through SdSetBaseClockKhz() - see
+;                the base-clock section for the exact three lines.
+;
+; ======================================================================
+; THIS CODE RUNS AT EVERY BOOT AND HAS NEVER SEEN A CARD. Read this
+; before you believe any of it - in EITHER direction.
+; ======================================================================
+; The old heading here said "NOTHING HERE HAS EVER RUN". It has been
+; false since 2026-08-25, and the distinction it lost is the whole point
+; of this block: THE CODE HAS EXECUTED ON SILICON; THE HARDWARE IT TALKS
+; TO HAS NEVER ANSWERED. Those are two different claims and one sentence
+; cannot carry both.
+;
+; ---- WHAT HAS EXECUTED ON THE BOARD ---------------------------------
+;
+;   * SdInit() RUNS AT EVERY BOOT. RaspberryPi4/Monitor/anvil.pi4
+;     includes this file, and its `f` command calls SdInit() and
+;     SdBlockCount(). On 2026-08-25 that path printed, on the console,
+;     from this file's own SdErrorText():
+;
+;         sd: no card answered - the slot is empty, or the card is at
+;         1.8V and cannot be reset from here.
+;
+;     That is a correct refusal reached by executing the real reset
+;     sequence against the real base address, and it is worth more than
+;     it looks. Four things have to be right for it to appear at all:
+;     $FE340000 decodes, the register writes land, the timeout bounds
+;     terminate instead of spinning, and the error text reaches a human.
+;     A driver that hangs, faults, or prints a pointer fails one of
+;     those - and an earlier build of that call site DID print a pointer
+;     ("!! no card: 25246364"), because Print picks its formatter by
+;     argument type and SdErrorText returns an address. It reads
+;     properly now because the call site was moved to UartWriteStr.
+;
+;   * THE BASE CLOCK IS SUPPLIED AND ACCEPTED. SdSetBaseClockKhz() is
+;     called with 250000, measured off the mailbox on 2026-08-25:
+;     EMMC configured 250000000, min 250000000, max 250000000, MEASURED
+;     250000496. Before that number existed this file refused with
+;     #SD_ERR_BASECLK rather than guess a megahertz - see THE BASE CLOCK
+;     IS THE WEAKEST POINT below. The refusal was right, and it has been
+;     SATISFIED rather than removed.
+;
+; ---- WHAT HAS NEVER HAPPENED, and it is the entire card side --------
+;
+;   THERE HAS NEVER BEEN AN SD CARD IN THIS MACHINE. The bench boots
+;   from a USB stick and always has. So none of the following has been
+;   observed even once: a card answering CMD0, an ACMD41 busy loop
+;   terminating, an RCA being assigned, CSD or CID contents, a byte of
+;   sector data crossing the Buffer Data Port at $20, or a write
+;   completing.
+;
+;   AND DO NOT READ THE SDIO WORK ACROSS. RaspberryPi4/Lib/sdio.pi4
+;   drives a DIFFERENT SDHCI instance - $FE300000, the CYW43455 radio -
+;   and that one has moved 609 KB on silicon, block mode and all. Same
+;   specification, same code shape, different block, different card,
+;   nothing transfers. A proven neighbour is exactly the thing that
+;   makes a reader relax about this file, so it is said here rather than
+;   left to be assumed.
+;
+; WHAT WAS CHECKED BEFORE ANY OF IT RAN, and it is still only this:
+;
+;   * It compiles.  pmfc <harness>.pi4 -t pi4 --load-addr 0x200000 -s
+;   * The emitted A64 was read back. sd_Rd/sd_Wr materialise the base as
+;     "movz x11, #0 / movk x11, #65076, lsl #16" - 65076 is $FE34, so
+;     the base is $FE340000, and the accesses are "ldr w" and "str w",
+;     i.e. THIRTY-TWO BIT, which is the whole point of PeekL/PokeL here.
+;   * Every register offset and every command word was read out of the
+;     assembly and compared with what this file intends. Spot list:
+;     $04 BLKSIZECNT with $00010200, $08 ARG1, $0C CMDTM, $10/$14/$18/
+;     $1C RESP0-3, $20 DATA, $24 STATUS, $28 CONTROL0, $2C CONTROL1,
+;     $30 INTERRUPT, $34 IRPT_MASK, $38 IRPT_EN, $40/$44 CAPS,
+;     $FC SLOTISR_VER; and CMD17 = $113A0012, CMD24 = $183A0002,
+;     CMD8 = $081A0000, CMD2 = $020A0000, CMD3 = $031A0000,
+;     CMD7 = $071B0000, CMD9 = $090A0000, CMD16 = $101A0000,
+;     ACMD41 = $29020000. All matched.
+;   * a64_barrier() emits "dsb sy / isb" at every public entry and exit.
+;
+; That is a long way short of working, and the list of things never
+; observed is above rather than repeated here. Treat every sentence
+; below that sounds confident as a statement about what the
+; SPECIFICATIONS say, not about what this board did.
+;
+; AND A NOTE ON THE COMPILER, because it moved WHILE this was written.
+; The first probe build of this session emitted "str w0" for an .i
+; parameter and ".space 4" for an .i global - the old 32-bit model. Two
+; hours later pmfc.exe had been rebuilt underneath and the same
+; constructs came out "str x0" and 64-bit throughout. So this file was
+; verified against the 64-BIT backend, which is the model its header is
+; written for, but that backend is days old. If something here behaves
+; oddly, check what the compiler is emitting before you rewrite the
+; driver.
+;
+; ======================================================================
+; THE BASE ADDRESS, AND WHY IT IS $FE340000 - three independent sources
+; ======================================================================
+; This is the number that, if wrong, produces the failure this project
+; keeps paying for: a store to a real, powered, idle peripheral that
+; produces no output and no error because it is simply the wrong device.
+; So it is not asserted from one place.
+;
+; 1. THE DEVICE TREE, RaspberryPi4/Reference/bcm2711.dtsi.
+;    The controller is
+;
+;        emmc2: mmc@7e340000 {
+;            compatible = "brcm,bcm2711-emmc2";
+;            reg = <0x0 0x7e340000 0x100>;
+;
+;    inside a bus node whose translation is
+;
+;        emmc2bus: emmc2bus {
+;            ranges = <0x0 0x7e000000  0x0 0xfe000000  0x01800000>;
+;
+;    so bus $7E340000 -> ARM $FE340000, and $340000 is inside the
+;    $01800000 window. The parent soc node carries the identical
+;    translation, <0x7e000000 0x0 0xfe000000 0x01800000>, so the two
+;    agree.
+;
+;    The SAME reg property also gives the WINDOW SIZE: $100 bytes. Every
+;    offset in this file is checked against that ceiling by hand, and
+;    the highest one used is $FC.
+;
+; 2. THE PERIPHERALS DOCUMENT, Datasheets\bcm2711-peripherals.txt,
+;    1.2.4 "Legacy master addresses", printed p. 6, verbatim:
+;
+;      "So a peripheral described in this document as being at legacy
+;       address 0x7Enn_nnnn is available in the 35-bit address space at
+;       0x4_7Enn_nnnn, and visible to the ARM at 0x0_FEnn_nnnn if Low
+;       Peripheral mode is enabled."
+;
+;    Note the condition. $FE340000 is the right answer ONLY in Low
+;    Peripheral mode. Without it the controller is at $4_7E340000, which
+;    is a 35-bit address this compiler can materialise but which nothing
+;    else in this project uses.
+;
+; 3. THE BOARD, EMPIRICALLY. Low Peripheral mode is on, on this bench,
+;    today: pi4Hello.pi4 and anvil.pi4 both reach the PL011 at
+;    $FE201000 and both have printed on silicon. $FE201000 is the same
+;    translation of the same window applied to $7E201000. If the PL011
+;    is where the low-peripheral map says it is, so is EMMC2.
+;
+;    THIS IS THE ONE PIECE OF EVIDENCE THAT IS NOT JUST A DOCUMENT, and
+;    it is worth knowing that it is inherited rather than measured here.
+;    If somebody ever turns Low Peripheral mode off in config.txt, this
+;    file and the monitor break together, which at least makes it
+;    obvious.
+;
+; EMMC2 NEEDS NO PIN MUXING. Unlike the older emmc/sdhost blocks, the
+; emmc2 node in bcm2711.dtsi carries no pinctrl property at all, and
+; bcm2711-rpi-4-b.dts comments the node "/* EMMC2 is used to drive the
+; SD card */". It is wired to the dedicated micro-SD socket, not to the
+; 40-pin header, so this file touches no GPIO and no pad register.
+;
+; ======================================================================
+; WHERE THE REGISTER MAP CAME FROM. IT IS NOT ON THIS DISK.
+; ======================================================================
+; BE EXACT ABOUT THIS, because the brief for this file said "if you
+; cannot cite an offset or a bit, do not write it", and the honest
+; position is in between.
+;
+; WHAT IS ON DISK: Datasheets\bcm2711-peripherals.txt was searched for
+; "emmc", "sdhci", "arasan", "BLKSIZECNT", "CMDTM", "SLOTISR_VER" and
+; for the literal "7e34". THE ONLY HIT IN THE WHOLE 14,627-LINE
+; DOCUMENT is one cell of the interrupt table, "EMMC & EMMC2", in
+; chapter 6. Broadcom did not document this block's registers.
+; raspberry-pi-4-datasheet.pdf is the four-page product datasheet; its
+; entire coverage is section 5.1.4, "The Pi4B has a dedicated SD card
+; socket which supports 1.8V, DDR50 mode". There is no sdhci driver
+; source in Datasheets\ either - only dwc2, mailbox, 8250 and firmware.
+;
+; WHAT IS NOT ON DISK, and is therefore cited from OUTSIDE this repo:
+;
+;   [SDHCI]  SD Host Controller Simplified Specification, Version 3.00
+;            (SD Association). Section 2.2 and Table 2-1 give the slot
+;            register map; sections 2.2.x give the bit layouts. EVERY
+;            REGISTER OFFSET AND EVERY CONTROLLER BIT BELOW COMES FROM
+;            THIS DOCUMENT AND THIS DOCUMENT IS NOT IN THIS REPOSITORY.
+;
+;   [PHYS]   SD Physical Layer Simplified Specification (SD Association).
+;            Every CMDn / ACMDn number, the OCR layout, the R1/R2/R3/R6/
+;            R7 response shapes and the CSD field positions come from
+;            this document, and it is not in this repository either.
+;
+; WHY THE FILE WAS WRITTEN ANYWAY, rather than stopping at "cannot
+; cite": the alternative was no driver. What has been done instead is to
+; make the uncited numbers CHECKABLE AT RUN TIME rather than merely
+; asserted - see sd_ControllerPlausible() - and to list, at the bottom
+; of this header, every single thing left out because it could not be
+; pinned down.
+;
+; THERE IS ONE REAL CROSS-CHECK AVAILABLE and it is worth stating. The
+; BCM2711's EMMC2 is an SDHCI-class part, and the older BCM283x
+; "External Mass Media Controller" chapter - which Broadcom DID publish
+; for the Pi 1/2/3, though not in any file on this disk - names the same
+; registers as 32-bit aggregates of the SDHCI 16-bit pairs: ARG2 $00,
+; BLKSIZECNT $04, ARG1 $08, CMDTM $0C, RESP0-3 $10-$1C, DATA $20,
+; STATUS $24, CONTROL0 $28, CONTROL1 $2C, INTERRUPT $30, IRPT_MASK $34,
+; IRPT_EN $38, CONTROL2 $3C, SLOTISR_VER $FC. Those are byte-for-byte
+; the SDHCI offsets. Two independently-written maps agreeing is not
+; proof, but it is more than one assertion.
+;
+; ONE CONSEQUENCE OF THE 32-BIT AGGREGATION, and it matters: SDHCI
+; specifies several of these as 16-bit or 8-bit registers - Block Size
+; $04 and Block Count $06, Transfer Mode $0C and Command $0E, Host
+; Control 1 $28 / Power Control $29 / Block Gap $2A / Wakeup $2B, Clock
+; Control $2C / Timeout Control $2E / Software Reset $2F, Normal
+; Interrupt Status $30 / Error Interrupt Status $32. THIS FILE ALWAYS
+; ACCESSES THEM AS THE 32-BIT AGGREGATE, because that is what the
+; BCM283x map documents and because a narrow store to a 32-bit-only
+; peripheral is its own silent failure. Where a write would otherwise
+; disturb the neighbouring half, the whole word is composed
+; deliberately - see sd_SetClock(), which rebuilds all of CONTROL1.
+;
+; ======================================================================
+; .i IS EIGHT BYTES ON THIS TARGET. EVERY REGISTER HERE IS FOUR.
+; ======================================================================
+; From the Anvil header, and it is the single easiest way to write
+; a file like this one that compiles perfectly and does the wrong thing:
+;
+;   "A BARE Peek/Poke, and .i, ARE EIGHT BYTES on this target now. They
+;    were four."
+;
+; Every EMMC2 register is 32 bits wide. So THERE IS NOT ONE BARE Peek OR
+; Poke IN THIS FILE. Peripheral registers are PeekL/PokeL, without
+; exception, and the sector buffer is PeekL/PokeL too because the
+; Buffer Data Port is a 32-bit port. If you add a register access to
+; this file and spell it Peek, you have just done a 64-bit access to a
+; 32-bit device.
+;
+; PeekL SIGN-EXTENDS into the X register (the emitter appends sxtw), so
+; any register whose bit 31 is set comes back NEGATIVE in a 64-bit .i.
+; That is not hypothetical here: OCR bit 31 is the ACMD41 "power up
+; busy" flag and it is the bit the initialisation loop waits on. Every
+; register read in this file therefore goes through sd_Rd(), which
+; masks with $FFFFFFFF before the value is used for anything. Do not
+; add a raw PeekL.
+;
+; OPERATOR PRECEDENCE IS NOT THE HOST'S: & | ! bind TIGHTER than << >>.
+; So "1 << 16 | 512" parses as "1 << (16 | 512)", which is not what
+; anybody means. Every shift in this file is parenthesised and every
+; multi-bit constant is written as a literal rather than as a shift
+; expression, for the same reason.
+;
+; ======================================================================
+; TWO THINGS THIS DRIVER CANNOT DO, because they need the mailbox
+; ======================================================================
+; Both come out of bcm2711-rpi-4-b.dts, which wires the card's two
+; supplies to a firmware-owned GPIO expander, not to anything on the
+; peripheral bus:
+;
+;     sd_vcc_reg:    regulator-fixed, 3.3V, gpio = <&expgpio 6 ...>
+;     sd_io_1v8_reg: regulator-gpio,  gpios = <&expgpio 4 ...>,
+;                    states = <1800000 0x1>, <3300000 0x0>
+;
+;     &emmc2 { vqmmc-supply = <&sd_io_1v8_reg>;
+;              vmmc-supply  = <&sd_vcc_reg>; ... }
+;
+; and bcm2711-rpi.dtsi defines expgpio as
+;
+;     expgpio: gpio { compatible = "raspberrypi,firmware-gpio"; ... }
+;
+; a child of the firmware node - i.e. it is reached over the VideoCore
+; mailbox and by nothing else.
+;
+;   1. THIS DRIVER CANNOT POWER-CYCLE THE CARD. The SDHCI Power Control
+;      register ($29, inside CONTROL0) is written anyway, because that
+;      is what the spec says to write and it costs nothing, but on this
+;      board the card's 3.3V rail is expgpio 6 and the host controller
+;      does not own it. A card that has wedged itself stays wedged until
+;      somebody pulls the plug.
+;
+;   2. THIS DRIVER CANNOT CHANGE THE I/O VOLTAGE, and that is the
+;      nastier one. Card I/O voltage is expgpio 4: 0 -> 3.3V,
+;      1 -> 1.8V. This file stays at 3.3V throughout and never asks for
+;      1.8V signalling (ACMD41 is sent with S18R clear - see
+;      #SD_ACMD41_ARG_BASE). So it never needs to change the rail.
+;
+;      THE RISK RUNS THE OTHER WAY. If the boot firmware has already
+;      taken the card to 1.8V DDR50 - which section 5.1.4 of the product
+;      datasheet says this board supports - then the card is signalling
+;      at a voltage this driver cannot return to 3.3V, because the rail
+;      is behind the mailbox. Per [PHYS] a card that has completed a
+;      voltage switch returns to 3.3V signalling only on a POWER CYCLE;
+;      CMD0 does not undo it. So on a board that just booted from the
+;      card, SdInit() may fail at CMD0 or CMD8 for a reason that is not
+;      a bug in this file and that this file cannot fix.
+;
+;      IT WILL AT LEAST SAY SO RATHER THAN HANG. The failure presents as
+;      #SD_ERR_CMD0 or #SD_ERR_NOCARD with the raw INTERRUPT word
+;      available. If you are chasing that, the fix is a mailbox library
+;      that sets expgpio 4 low and expgpio 6 off/on - and that belongs
+;      in mailbox.pi4, not here.
+;
+; ======================================================================
+; CARD DETECT IS BROKEN ON THIS BOARD AND THE DEVICE TREE SAYS SO
+; ======================================================================
+; bcm2711-rpi-4-b.dts, on the emmc2 node:  broken-cd;
+;
+; That property means exactly what this file has to cope with: the card
+; detect signal reaching the controller is not trustworthy. So:
+;
+;   * SdInit() DOES NOT GATE ON Present State bit 16 (Card Inserted).
+;     Refusing to try because a broken pin says "empty" would be a
+;     driver that never works on a board that works.
+;
+;   * It records the raw bits before touching anything -
+;     SdCardDetectBit() is Present State bit 16 as found, and
+;     SdCardPinLevel() is bit 18, the physical pin level - so the bench
+;     can see what the hardware actually claimed. NEITHER IS A
+;     DIAGNOSIS. They are there so nobody has to guess what the silicon
+;     said.
+;
+;   * It then FORCES the controller's internal view to "inserted" using
+;     the two bits SDHCI provides for precisely this, Host Control 1
+;     bit 7 (Card Detect Signal Selection = use the test level) and
+;     bit 6 (Card Detect Test Level = 1). Without that, an SDHCI
+;     controller is entitled to refuse to supply SDCLK. After this
+;     write Present State bit 16 reflects the test level and is
+;     meaningless, which is why the raw values are captured first.
+;
+;   * THE ONLY HONEST CARD DETECT IS THEREFORE A CONVERSATION. If CMD0
+;     and CMD8 and ACMD41 all time out, there is no card, and SdInit()
+;     returns #SD_ERR_NOCARD. That answer takes about a second and it
+;     is an answer, which is the whole point: a missing card is the
+;     NORMAL case on this bench and it must never be a hang.
+;
+; ======================================================================
+; EVERY WAIT IN THIS FILE IS BOUNDED. THERE ARE NO EXCEPTIONS.
+; ======================================================================
+; Grep the file for Repeat and While: every loop that spins on hardware
+; carries a deadline built from sd_Ticks(), and every one of them has a
+; distinct #SD_ERR_ code so the report says WHICH wait expired rather
+; than "SdInit failed". The budgets are at #SD_TMO_* below with the
+; reasoning for each number.
+;
+; This is not defensive decoration. An unbounded spin on a card that
+; never answers is a wedged board with no message on a bench that is
+; shared, and the most likely single state of this bench is "no card in
+; the slot".
+;
+; ======================================================================
+; SDHC BLOCK ADDRESSING versus SDSC BYTE ADDRESSING
+; ======================================================================
+; Getting this wrong reads the sector 512 times too far in or too far
+; out and looks like corruption rather than like a bug, so it is worth
+; being explicit about where the answer comes from.
+;
+; [PHYS]: the OCR returned by ACMD41 has bit 30 CCS, Card Capacity
+; Status, and it is only valid once bit 31 (power-up busy) has gone to
+; 1. CCS = 1 means SDHC or SDXC, which are BLOCK addressed: the argument
+; of CMD17/CMD24 is the LBA itself. CCS = 0 means SDSC, which is BYTE
+; addressed: the argument is lba * 512.
+;
+; CCS is only meaningful for a card that answered CMD8, because a v1.x
+; card predates the bit. This file therefore only believes CCS when
+; gSdV2 is set, and treats every non-v2 card as byte addressed - which
+; is correct, since a v1.x card cannot be high capacity.
+;
+; sd_Lba2Arg() is the ONE place that conversion happens. Both
+; SdReadBlock and SdWriteBlock go through it. There is deliberately no
+; second copy of that multiply anywhere in this file.
+;
+; SdIsSdhc() reports which way it went, so a caller that gets nonsense
+; back can check the addressing mode first.
+;
+; ======================================================================
+; DELIBERATELY LEFT OUT - the full list, so nobody assumes
+; ======================================================================
+;  * DMA and ADMA2. The brief said polled PIO and polled PIO is what
+;    this is. Every transfer moves 128 words through the Buffer Data
+;    Port at $20 with the CPU.
+;  * 4-BIT BUS WIDTH. ACMD6 and Host Control 1 bit 1 would roughly
+;    quadruple throughput and are three lines of code, and they are NOT
+;    HERE because NO CARD HAS EVER ANSWERED THIS FILE and a 1-bit bus is
+;    the mode that needs the fewest things to be right. (This used to
+;    read "nothing in this file has been on silicon yet", which stopped
+;    being true on 2026-08-25 when SdInit began running at every boot -
+;    see the top of this header. The REASON is unchanged, so only the
+;    wording moved: the gate on adding 4-bit is a card, not a board.)
+;    Add it after the 1-bit path has read sector 0 on a real card.
+;  * HIGH SPEED (CMD6 / SWITCH_FUNC) and anything above 25 MHz. The
+;    clock is left at Default Speed.
+;  * 1.8V SIGNALLING, DDR50, SDR50, SDR104, and therefore CMD11 and
+;    Host Control 2. See "TWO THINGS THIS DRIVER CANNOT DO" - the rail
+;    is behind the mailbox, so this could not be finished here even if
+;    it were wanted.
+;  * TUNING. Only needed above Default Speed.
+;  * MULTI-BLOCK transfers (CMD18/CMD25), Auto CMD12 and Auto CMD23.
+;    One block per call. A multi-block path is the obvious next speed-up
+;    and it needs the Block Count field this file already sets to 1.
+;  * INTERRUPTS. IRPT_MASK ($34, the Status Enable register) is
+;    programmed so the status bits actually latch, but IRPT_EN ($38,
+;    the Signal Enable register) is left at zero so NOTHING is routed to
+;    the GIC. This driver is polled and must not start firing interrupts
+;    at a system that has no handler.
+;  * CARD REMOVAL / RE-INSERTION. There is no hotplug handling; call
+;    SdInit() again.
+;  * WRITE PROTECT. Present State bit 19 is not consulted. The micro-SD
+;    form factor has no write-protect notch, so the bit means nothing
+;    on this board.
+;  * MMC / eMMC cards. CMD1 is not sent. This is an SD driver.
+;  * CMD42 lock/unlock, ACMD13 SD status, ACMD51 SCR, CMD6 function
+;    query - none of them are needed for block access.
+;  * THE EMMC2 CLOCK'S ACTUAL FREQUENCY IS NOT DISCOVERED HERE. See the
+;    next section, which is the biggest single hole in this file.
+;
+; ======================================================================
+; THE BASE CLOCK IS THE WEAKEST POINT. READ THIS BEFORE TRUSTING SdClockKhz()
+; ======================================================================
+; bcm2711.dtsi says the block is fed by  clocks = <&clocks
+; BCM2711_CLOCK_EMMC2>  - a firmware-managed clock. NOTHING ON THIS DISK
+; GIVES ITS FREQUENCY, and nothing on this disk gives the mailbox clock
+; id that would let this file ask. raspberrypi-firmware.c in
+; Datasheets\pi4\ was checked: it has no clock-id table.
+;
+; So this file does not invent a number. It does this instead:
+;
+;   1. If the caller has set one with SdSetBaseClockKhz(), that is used
+;      and nothing is guessed. THIS IS THE PREFERRED PATH, and as of
+;      2026-08-24 there is a concrete way to take it:
+;      RaspberryPi4/Lib/mailbox.pi4 landed alongside this file and
+;      exposes MailboxClockRate(clockId), documenting EMMC2 as clock
+;      id 12. So a MAIN file can do
+;
+;          XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+;          XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
+;          MailboxInit()
+;          SdSetBaseClockKhz(MailboxClockRate(12) / 1000)
+;          SdInit()
+;
+;      THIS FILE STILL DOES NOT INCLUDE THAT ONE - libraries do not
+;      include libraries - and it has NOT been checked that clock id 12
+;      is EMMC2: that number comes from mailbox.pi4's own comment, not
+;      from anything in Datasheets\. Verify it before trusting the
+;      result, and compare it against what SdBaseClockKhz() reports from
+;      the Capabilities register when both are available.
+;
+;   2. Otherwise the Base Clock Frequency field of the Capabilities
+;      register at $40 is read. [SDHCI] puts it at bits 15:8 for a
+;      version 3.00 controller and bits 13:8 for versions 1.00 and 2.00,
+;      in MHz - so the field width is chosen from the Host Controller
+;      Version at $FE, not assumed.
+;
+;   3. If that field reads zero - which [SDHCI] explicitly permits, and
+;      which means "the base clock is not obtainable from this register,
+;      get it elsewhere" - SdInit() REFUSES with #SD_ERR_BASECLK rather
+;      than picking a plausible-looking megahertz. A wrong base clock
+;      does not fail cleanly: it makes every divisor wrong, so the bus
+;      runs at some other speed and the symptom is intermittent CRC
+;      errors that look like a bad card.
+;
+; SdBaseClockKhz() reports what was used and SdClockKhz() reports what
+; was actually programmed after division. Believe those two numbers over
+; anything in this comment.
+;
+; ======================================================================
+; MEMORY ORDERING
+; ======================================================================
+; bcm2711-peripherals.txt, 1.3 "Peripheral access precautions for
+; correct memory ordering", printed p. 6:
+;
+;   "Accesses to the same peripheral will always arrive and return
+;    in-order. It is only when switching from one peripheral to another
+;    that data can arrive out-of-order... You should place: a memory
+;    write barrier before the first write to a peripheral; a memory read
+;    barrier after the last read of a peripheral."
+;
+; Every public entry point in this file therefore opens and closes with
+; a64_barrier() (dsb sy; isb - from RaspberryPi4/Intrinsics/
+; bcm2711_hardware.def). Inside a procedure there are no barriers,
+; because everything inside touches only EMMC2 and the quote above says
+; same-peripheral accesses are already ordered.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+; The controller. $100 bytes, per the dtsi reg property.
+; ----------------------------------------------------------------------
+#SD_BASE = $FE340000
+
+; ----------------------------------------------------------------------
+; Register offsets. [SDHCI] Table 2-1, as 32-bit aggregates - see the
+; header for why every access here is a full word.
+;
+; The comment on each line names the SDHCI register(s) that share the
+; word and the width [SDHCI] gives them, so the packing below can be
+; checked without the spec in front of you.
+; ----------------------------------------------------------------------
+#SD_ARG2       = $00   ; SDMA System Address / Argument 2      (32)
+#SD_BLKSIZECNT = $04   ; Block Size (16) @$04 + Block Count (16) @$06
+#SD_ARG1       = $08   ; Argument 1                            (32)
+#SD_CMDTM      = $0C   ; Transfer Mode (16) @$0C + Command (16) @$0E
+#SD_RESP0      = $10   ; Response [31:0]
+#SD_RESP1      = $14   ; Response [63:32]
+#SD_RESP2      = $18   ; Response [95:64]
+#SD_RESP3      = $1C   ; Response [127:96]
+#SD_DATA       = $20   ; Buffer Data Port                      (32)
+#SD_STATUS     = $24   ; Present State                         (32)
+#SD_CONTROL0   = $28   ; Host Control 1 (8) @$28 + Power Control (8) @$29
+                       ;   + Block Gap Control (8) @$2A + Wakeup (8) @$2B
+#SD_CONTROL1   = $2C   ; Clock Control (16) @$2C + Timeout Control (8)
+                       ;   @$2E + Software Reset (8) @$2F
+#SD_INTERRUPT  = $30   ; Normal Int Status (16) @$30 + Error Int Status
+                       ;   (16) @$32
+#SD_IRPT_MASK  = $34   ; Normal Int Status Enable (16) @$34 + Error Int
+                       ;   Status Enable (16) @$36   - "does the bit latch"
+#SD_IRPT_EN    = $38   ; Normal Int Signal Enable (16) @$38 + Error Int
+                       ;   Signal Enable (16) @$3A   - "does the IRQ fire"
+#SD_CONTROL2   = $3C   ; Auto CMD Error Status (16) @$3C + Host Control 2
+                       ;   (16) @$3E
+#SD_CAPS0      = $40   ; Capabilities [31:0]
+#SD_CAPS1      = $44   ; Capabilities [63:32]
+#SD_SLOTISR_VER= $FC   ; Slot Interrupt Status (16) @$FC + Host
+                       ;   Controller Version (16) @$FE
+
+; ----------------------------------------------------------------------
+; Present State ($24). [SDHCI] 2.2.9.
+; ----------------------------------------------------------------------
+#SD_ST_CMD_INHIBIT  = $00000001  ; bit  0  Command Inhibit (CMD)
+#SD_ST_DAT_INHIBIT  = $00000002  ; bit  1  Command Inhibit (DAT) - "busy"
+#SD_ST_DAT_ACTIVE   = $00000004  ; bit  2  DAT Line Active
+#SD_ST_WRITE_ACTIVE = $00000100  ; bit  8  Write Transfer Active
+#SD_ST_READ_ACTIVE  = $00000200  ; bit  9  Read Transfer Active
+#SD_ST_BUF_WRITE_EN = $00000400  ; bit 10  Buffer Write Enable
+#SD_ST_BUF_READ_EN  = $00000800  ; bit 11  Buffer Read Enable
+#SD_ST_CARD_INSERT  = $00010000  ; bit 16  Card Inserted
+#SD_ST_CARD_STABLE  = $00020000  ; bit 17  Card State Stable
+#SD_ST_CARD_PIN     = $00040000  ; bit 18  Card Detect Pin Level
+#SD_ST_WRITE_PROT   = $00080000  ; bit 19  Write Protect Switch Pin Level
+
+; ----------------------------------------------------------------------
+; CONTROL0 ($28) - Host Control 1 in the low byte, Power Control in the
+; second. [SDHCI] 2.2.11 and 2.2.12.
+; ----------------------------------------------------------------------
+#SD_C0_LED          = $00000001  ; HC1 bit 0  LED Control
+#SD_C0_DWIDTH_4     = $00000002  ; HC1 bit 1  Data Transfer Width, 1 = 4-bit
+#SD_C0_HIGH_SPEED   = $00000004  ; HC1 bit 2  High Speed Enable
+#SD_C0_DWIDTH_8     = $00000020  ; HC1 bit 5  Extended Data Transfer Width
+#SD_C0_CD_TEST_LVL  = $00000040  ; HC1 bit 6  Card Detect Test Level
+#SD_C0_CD_TEST_SEL  = $00000080  ; HC1 bit 7  Card Detect Signal Selection
+#SD_C0_BUS_POWER    = $00000100  ; PWR bit 0  SD Bus Power
+; PWR bits 3:1, SD Bus Voltage Select: 7 = 3.3V, 6 = 3.0V, 5 = 1.8V.
+; Field occupies bits 11:9 of the 32-bit word, so 7 << 9 = $E00.
+#SD_C0_VOLT_3V3     = $00000E00
+#SD_C0_VOLT_MASK    = $00000E00
+
+; ----------------------------------------------------------------------
+; CONTROL1 ($2C) - Clock Control (16) then Timeout Control (8) then
+; Software Reset (8). [SDHCI] 2.2.14, 2.2.15, 2.2.16.
+; ----------------------------------------------------------------------
+#SD_C1_CLK_INTLEN   = $00000001  ; CLK bit 0  Internal Clock Enable
+#SD_C1_CLK_STABLE   = $00000002  ; CLK bit 1  Internal Clock Stable (RO)
+#SD_C1_CLK_EN       = $00000004  ; CLK bit 2  SD Clock Enable
+#SD_C1_CLK_GENSEL   = $00000020  ; CLK bit 5  Clock Generator Select
+                                 ;            0 = divided, 1 = programmable
+; SDCLK Frequency Select, 10-bit Divided Clock Mode:
+;   CLK bits 15:8 = N[7:0]  -> word bits 15:8
+;   CLK bits  7:6 = N[9:8]  -> word bits  7:6
+; and SDCLK = base / (2 * N), with N = 0 meaning "base clock, undivided".
+#SD_C1_TOUNIT_MASK  = $000F0000  ; Timeout Control bits 3:0, word 19:16
+#SD_C1_TOUNIT_MAX   = $000E0000  ; value $E - see #SD_TIMEOUT_EXP
+#SD_C1_SRST_HC      = $01000000  ; SoftReset bit 0  Software Reset For All
+#SD_C1_SRST_CMD     = $02000000  ; SoftReset bit 1  Reset CMD line
+#SD_C1_SRST_DATA    = $04000000  ; SoftReset bit 2  Reset DAT line
+#SD_C1_SRST_ANY     = $07000000
+
+; Data Timeout Counter Value. [SDHCI] 2.2.15: the interval is
+; TMCLK * 2^(13 + value), and $F is RESERVED, so $E is the longest legal
+; setting. This driver wants the longest one there is - it has its own
+; software deadlines and does not want the controller giving up first
+; for a reason that is harder to report.
+#SD_TIMEOUT_EXP     = $E
+
+; ----------------------------------------------------------------------
+; INTERRUPT ($30) - Normal Interrupt Status in the low half, Error
+; Interrupt Status in the high half. [SDHCI] 2.2.17 and 2.2.18.
+;
+; All of these are write-1-to-clear.
+; ----------------------------------------------------------------------
+#SD_INT_CMD_DONE    = $00000001  ; N bit  0  Command Complete
+#SD_INT_DATA_DONE   = $00000002  ; N bit  1  Transfer Complete
+#SD_INT_BLOCK_GAP   = $00000004  ; N bit  2  Block Gap Event
+#SD_INT_DMA         = $00000008  ; N bit  3  DMA Interrupt
+#SD_INT_WRITE_RDY   = $00000010  ; N bit  4  Buffer Write Ready
+#SD_INT_READ_RDY    = $00000020  ; N bit  5  Buffer Read Ready
+#SD_INT_CARD_INSERT = $00000040  ; N bit  6  Card Insertion
+#SD_INT_CARD_REMOVE = $00000080  ; N bit  7  Card Removal
+#SD_INT_CARD        = $00000100  ; N bit  8  Card Interrupt
+#SD_INT_ERR         = $00008000  ; N bit 15  Error Interrupt (read-only
+                                 ;           summary of the high half)
+#SD_INT_CTO_ERR     = $00010000  ; E bit  0  Command Timeout
+#SD_INT_CCRC_ERR    = $00020000  ; E bit  1  Command CRC
+#SD_INT_CEND_ERR    = $00040000  ; E bit  2  Command End Bit
+#SD_INT_CBAD_ERR    = $00080000  ; E bit  3  Command Index
+#SD_INT_DTO_ERR     = $00100000  ; E bit  4  Data Timeout
+#SD_INT_DCRC_ERR    = $00200000  ; E bit  5  Data CRC
+#SD_INT_DEND_ERR    = $00400000  ; E bit  6  Data End Bit
+#SD_INT_ILIMIT_ERR  = $00800000  ; E bit  7  Current Limit
+#SD_INT_ACMD_ERR    = $01000000  ; E bit  8  Auto CMD
+#SD_INT_ADMA_ERR    = $02000000  ; E bit  9  ADMA
+#SD_INT_TUNE_ERR    = $04000000  ; E bit 10  Tuning
+
+; Every error bit, i.e. the whole Error Interrupt Status half. The vendor
+; field is bits 12:15 of that register (word bits 28:31) and is included:
+; an unknown vendor error is still an error and must not be read as
+; success.
+#SD_INT_ANY_ERR     = $FFFF0000
+; A command timeout ALONE. This is the one "error" that is sometimes the
+; expected answer - CMD8 to a v1.x card, and every command to an empty
+; slot - so it is separated out and handled rather than shouted about.
+#SD_INT_CMD_TIMEOUT = $00010000
+
+; What to enable in IRPT_MASK ($34) so the status bits actually latch:
+; everything. IRPT_EN ($38) stays zero so none of it reaches the GIC.
+#SD_IRPT_MASK_ALL   = $FFFFFFFF
+; And the value written to INTERRUPT to clear everything pending.
+#SD_INT_CLEAR_ALL   = $FFFFFFFF
+
+; ----------------------------------------------------------------------
+; CMDTM ($0C) - Transfer Mode (16) in the low half, Command (16) in the
+; high half. [SDHCI] 2.2.5 and 2.2.6.
+;
+; Transfer Mode, low half:
+; ----------------------------------------------------------------------
+#SD_TM_DMA_EN       = $00000001  ; TM bit 0  DMA Enable          (unused)
+#SD_TM_BLKCNT_EN    = $00000002  ; TM bit 1  Block Count Enable
+#SD_TM_AUTO_CMD12   = $00000004  ; TM bits 3:2 = 01              (unused)
+#SD_TM_AUTO_CMD23   = $00000008  ; TM bits 3:2 = 10              (unused)
+#SD_TM_READ         = $00000010  ; TM bit 4  1 = card to host
+#SD_TM_MULTI_BLOCK  = $00000020  ; TM bit 5  Multi/Single Block  (unused)
+
+; Command, high half. The Command register's own bit n is word bit n+16.
+;   bits 13:8 Command Index    -> word bits 29:24
+;   bits  7:6 Command Type     -> word bits 23:22
+;   bit     5 Data Present     -> word bit  21
+;   bit     4 Index Check      -> word bit  20
+;   bit     3 CRC Check        -> word bit  19
+;   bits  1:0 Response Type    -> word bits 17:16
+#SD_CMD_RSP_NONE    = $00000000  ; 00  no response
+#SD_CMD_RSP_136     = $00010000  ; 01  R2
+#SD_CMD_RSP_48      = $00020000  ; 10  R1 / R3 / R6 / R7
+#SD_CMD_RSP_48B     = $00030000  ; 11  R1b - 48 bits then check busy
+#SD_CMD_CRCCHK      = $00080000  ; Command CRC Check Enable
+#SD_CMD_IXCHK       = $00100000  ; Command Index Check Enable
+#SD_CMD_ISDATA      = $00200000  ; Data Present Select
+#SD_CMD_TYPE_ABORT  = $00C00000  ; Command Type = 11              (unused)
+; Command Index n occupies word bits 29:24, so the index is  n * $1000000.
+; Written as a multiply rather than a shift because & | ! bind tighter
+; than << >> in this language and an unparenthesised shift here would be
+; a silent disaster.
+#SD_CMD_INDEX_STEP  = $01000000
+
+; ----------------------------------------------------------------------
+; Capabilities ($40). [SDHCI] 2.2.24.
+; ----------------------------------------------------------------------
+#SD_CAP_MAXBLK_MASK = $00030000  ; bits 17:16  0=512 1=1024 2=2048
+#SD_CAP_HIGH_SPEED  = $00200000  ; bit 21      High Speed Support
+#SD_CAP_V33         = $01000000  ; bit 24      Voltage Support 3.3V
+#SD_CAP_V30         = $02000000  ; bit 25      Voltage Support 3.0V
+#SD_CAP_V18         = $04000000  ; bit 26      Voltage Support 1.8V
+
+; ----------------------------------------------------------------------
+; SD card commands. [PHYS].
+;
+; Each one is the full CMDTM word: index, response shape and the checks
+; that response shape allows. THE CHECK FLAGS ARE NOT DECORATION -
+; getting them wrong makes a good response look like an error:
+;
+;   R2 (CMD2, CMD9) is 136 bits and carries a CRC but NO command index,
+;      so CRC check yes, index check NO.
+;   R3 (ACMD41) is the OCR, and [PHYS] specifies it with NO CRC and a
+;      reserved index field, so BOTH checks off. Leave CRC check on here
+;      and every single ACMD41 comes back as a CRC error.
+;   R7 (CMD8), R6 (CMD3) and R1 are ordinary 48-bit responses that echo
+;      the index and carry a real CRC, so both checks on.
+;   R1b (CMD7) is R1 plus a busy period on DAT0.
+; ----------------------------------------------------------------------
+; CMD0  GO_IDLE_STATE       arg 0            no response
+#SD_CMD0  = $00000000
+; CMD2  ALL_SEND_CID        arg 0            R2
+#SD_CMD2  = $020A0000
+; CMD3  SEND_RELATIVE_ADDR  arg 0            R6
+#SD_CMD3  = $031A0000
+; CMD7  SELECT_CARD         arg RCA<<16      R1b
+#SD_CMD7  = $071B0000
+; CMD8  SEND_IF_COND        arg $1AA         R7
+#SD_CMD8  = $081A0000
+; CMD9  SEND_CSD            arg RCA<<16      R2
+#SD_CMD9  = $090A0000
+; CMD13 SEND_STATUS         arg RCA<<16      R1
+#SD_CMD13 = $0D1A0000
+; CMD16 SET_BLOCKLEN        arg 512          R1
+#SD_CMD16 = $101A0000
+; CMD17 READ_SINGLE_BLOCK   arg addr         R1, data card->host
+#SD_CMD17 = $113A0012
+; CMD24 WRITE_BLOCK         arg addr         R1, data host->card
+#SD_CMD24 = $183A0002
+; CMD55 APP_CMD             arg RCA<<16      R1
+#SD_CMD55 = $371A0000
+; ACMD41 SD_SEND_OP_COND    arg OCR request  R3  (no CRC, no index check)
+#SD_ACMD41 = $29020000
+;
+; Those hex words are assembled by hand from the fields above, and they
+; are the numbers most worth re-deriving if something misbehaves. Two
+; worked examples:
+;
+;   CMD17 = index 17 ($11) * $1000000        = $11000000
+;         | #SD_CMD_ISDATA                     $00200000
+;         | #SD_CMD_IXCHK                      $00100000
+;         | #SD_CMD_CRCCHK                     $00080000
+;         | #SD_CMD_RSP_48                     $00020000
+;         | #SD_TM_READ                        $00000010
+;         | #SD_TM_BLKCNT_EN                   $00000002
+;         = $113A0012                                     ok
+;
+;   ACMD41 = index 41 ($29) * $1000000       = $29000000
+;          | #SD_CMD_RSP_48                    $00020000
+;          (no IXCHK, no CRCCHK - see above)
+;          = $29020000                                    ok
+
+; ACMD41's argument, [PHYS]:
+;   bit 31    reserved / busy in the RESPONSE, must be 0 in the argument
+;   bit 30    HCS, Host Capacity Support - set only if CMD8 succeeded
+;   bit 28    XPC, SDXC Power Control - not set, this is a 3.3V bus
+;   bit 24    S18R, Switching to 1.8V Request - NOT SET. See "TWO THINGS
+;             THIS DRIVER CANNOT DO": the 1.8V rail is behind the
+;             mailbox, so asking for a switch this driver cannot
+;             complete would strand the card.
+;   bits 23:15  OCR voltage window. All nine bits set is 2.7V-3.6V,
+;               which is $00FF8000.
+#SD_ACMD41_ARG_BASE = $00FF8000
+#SD_ACMD41_HCS      = $40000000
+
+; OCR bits in the ACMD41 response, [PHYS]:
+#SD_OCR_BUSY = $80000000   ; bit 31, 1 = initialisation COMPLETE
+#SD_OCR_CCS  = $40000000   ; bit 30, 1 = SDHC/SDXC, block addressed
+
+; ----------------------------------------------------------------------
+; Speeds and geometry.
+; ----------------------------------------------------------------------
+; [PHYS]: identification must happen at 400 kHz or below.
+#SD_CLK_IDENT_KHZ = 400
+; [PHYS]: Default Speed is 25 MHz. High Speed (50 MHz) needs CMD6 and is
+; deliberately not implemented - see the left-out list.
+#SD_CLK_XFER_KHZ  = 25000
+; The only block size this driver uses. SDHC/SDXC are fixed at 512 and
+; CMD16 sets SDSC to match, so every path is 512 and nothing else.
+#SD_BLOCK_SIZE = 512
+#SD_BLOCK_WORDS = 128
+
+; ----------------------------------------------------------------------
+; TIMEOUT BUDGETS, in milliseconds, and why each one is the number it is.
+;
+; These bound SOFTWARE spins. They are deliberately longer than the
+; hardware's own timeouts, so that when something goes wrong the report
+; comes from the controller's error bits - which say WHAT went wrong -
+; rather than from a stopwatch here, which can only say "gave up".
+; ----------------------------------------------------------------------
+; A Software Reset For All is an internal state machine reset. It should
+; take microseconds; 100 ms is "the block is not there".
+#SD_TMO_RESET_MS   = 100
+; Internal Clock Stable after programming the divisor. Same reasoning.
+#SD_TMO_CLOCK_MS   = 100
+; Waiting for Command Inhibit (CMD) and (DAT) to clear before issuing a
+; command. DAT inhibit is the card's programmed-busy after a write, and
+; [PHYS] allows a write to take a long time - 500 ms is generous for a
+; single block and still fast enough to be an answer rather than a hang.
+#SD_TMO_INHIBIT_MS = 500
+; Command Complete. The controller raises its own Command Timeout error
+; long before this if the card does not answer, so reaching this deadline
+; means the CONTROLLER is stuck, not the card.
+#SD_TMO_CMD_MS     = 200
+; Buffer Read Ready / Buffer Write Ready, and Transfer Complete.
+#SD_TMO_DATA_MS    = 500
+; [PHYS] gives the card one second to finish its power-up. This is that
+; second, and it is the wait that a missing card spends before SdInit()
+; reports #SD_ERR_NOCARD.
+#SD_TMO_ACMD41_MS  = 1000
+
+; ----------------------------------------------------------------------
+; Why SdInit(), SdReadBlock() or SdWriteBlock() refused.
+; SdLastError() returns one of these; SdErrorText() spells it out.
+; ----------------------------------------------------------------------
+#SD_ERR_NONE        =  0
+#SD_ERR_NO_CNTFRQ   =  1  ; CNTFRQ_EL0 read back 0 or absurd - no clock
+                          ; to build timeouts from, so nothing below can
+                          ; be bounded and nothing is attempted
+#SD_ERR_NO_CONTROLLER = 2 ; SLOTISR_VER at $FE3400FC read all-zero or
+                          ; all-ones. Nothing is answering at this
+                          ; address, or it is not an SDHCI controller
+#SD_ERR_BAD_VERSION =  3  ; the Host Controller Version field is not a
+                          ; value [SDHCI] defines
+#SD_ERR_NO_CAPS     =  4  ; the Capabilities register read all-zero or
+                          ; all-ones
+#SD_ERR_BASECLK     =  5  ; base clock unknown - Capabilities says 0 and
+                          ; the caller did not call SdSetBaseClockKhz()
+#SD_ERR_RESET       =  6  ; Software Reset For All never self-cleared
+#SD_ERR_CLOCK       =  7  ; Internal Clock Stable never came up
+#SD_ERR_INHIBIT     =  8  ; Command Inhibit never cleared - the previous
+                          ; command or the card's busy never ended
+#SD_ERR_CMD_TIMEOUT =  9  ; the controller reported Command Timeout
+#SD_ERR_CMD_ERROR   = 10  ; the controller reported a command CRC, end
+                          ; bit or index error - see SdLastIntr()
+#SD_ERR_CMD_STUCK   = 11  ; no Command Complete AND no error bit inside
+                          ; #SD_TMO_CMD_MS. The controller is wedged
+#SD_ERR_NOCARD      = 12  ; nothing answered CMD0/CMD8/ACMD41. On this
+                          ; board this is the ordinary "the slot is
+                          ; empty" answer - see the card-detect note
+#SD_ERR_CMD8_ECHO   = 13  ; CMD8 answered but the check pattern or the
+                          ; voltage field came back wrong. The card is
+                          ; there and is not talking sense
+#SD_ERR_ACMD41_TMO  = 14  ; the ACMD41 busy loop never saw OCR bit 31.
+                          ; SdOcr() holds the last OCR seen
+#SD_ERR_CMD2        = 15  ; CMD2 ALL_SEND_CID failed
+#SD_ERR_CMD3        = 16  ; CMD3 SEND_RELATIVE_ADDR failed
+#SD_ERR_BAD_RCA     = 17  ; CMD3 succeeded but returned RCA 0, which
+                          ; [PHYS] reserves for the card-identification
+                          ; state and which cannot address a card
+#SD_ERR_CMD9        = 18  ; CMD9 SEND_CSD failed
+#SD_ERR_CMD7        = 19  ; CMD7 SELECT_CARD failed
+#SD_ERR_CMD16       = 20  ; CMD16 SET_BLOCKLEN failed
+#SD_ERR_NOT_READY   = 21  ; a read or write was attempted before a
+                          ; successful SdInit()
+#SD_ERR_ALIGN       = 22  ; the caller's buffer is not 4-byte aligned.
+                          ; The Buffer Data Port is a 32-bit port and
+                          ; this driver moves whole words
+#SD_ERR_NULL_BUF    = 23  ; the caller passed a null buffer
+#SD_ERR_DATA_TMO    = 24  ; Buffer Read/Write Ready never arrived
+#SD_ERR_DATA_ERROR  = 25  ; the controller reported a data CRC, end bit
+                          ; or timeout error during the transfer
+#SD_ERR_XFER_TMO    = 26  ; Transfer Complete never arrived after the
+                          ; last word crossed the Buffer Data Port
+#SD_ERR_BUSY_TMO    = 27  ; after a write, the card's programmed-busy
+                          ; never ended
+#SD_ERR_CMD0        = 28  ; the controller would not even accept CMD0.
+                          ; CMD0 has no response, so this is never the
+                          ; card - it is the controller or the clock
+
+; ----------------------------------------------------------------------
+; State. All of it is readable through an accessor; none of it is meant
+; to be poked at from outside.
+; ----------------------------------------------------------------------
+Global sd_ready.i     = 0    ; a full SdInit() completed
+Global sd_err.i       = #SD_ERR_NONE
+Global sd_lastCmd.i   = -1   ; command INDEX of the last command issued
+Global sd_lastIntr.i  = 0    ; INTERRUPT as it stood when it went wrong
+Global sd_lastStat.i  = 0    ; Present State likewise
+
+Global sd_hz.i        = 0    ; CNTFRQ_EL0
+Global sd_tickPerMs.i = 0    ; CNTFRQ_EL0 / 1000
+
+Global sd_baseKhz.i   = 0    ; base clock actually used
+Global sd_userBase.i  = 0    ; base clock forced by SdSetBaseClockKhz()
+Global sd_clkKhz.i    = 0    ; SD clock actually programmed
+Global sd_divisor.i   = 0    ; the N that produced it
+
+Global sd_ver.i       = 0    ; Host Controller Version, spec field
+Global sd_vendor.i    = 0    ; Host Controller Version, vendor field
+Global sd_caps0.i     = 0
+Global sd_caps1.i     = 0
+
+Global sd_cdBit.i     = 0    ; Present State bit 16, AS FOUND
+Global sd_cdPin.i     = 0    ; Present State bit 18, AS FOUND
+
+Global sd_v2.i        = 0    ; the card answered CMD8
+Global sd_sdhc.i      = 0    ; OCR CCS - block addressed
+Global sd_ocr.i       = 0
+Global sd_rca.i       = 0
+Global sd_blocks.i    = 0    ; capacity in 512-byte blocks, 0 = unknown
+
+Global sd_cid0.i = 0
+Global sd_cid1.i = 0
+Global sd_cid2.i = 0
+Global sd_cid3.i = 0
+Global sd_csd0.i = 0
+Global sd_csd1.i = 0
+Global sd_csd2.i = 0
+Global sd_csd3.i = 0
+
+Global sd_resp0.i = 0        ; the last command's response words
+Global sd_resp1.i = 0
+Global sd_resp2.i = 0
+Global sd_resp3.i = 0
+
+; ======================================================================
+;  The clock. Two lines of asm, no dependency on any other file.
+;
+;  CNTPCT_EL0 and CNTFRQ_EL0 are readable with no trap and no setup at
+;  the exception level a loader leaves us in - the same reasoning
+;  anvil.pi4 gives for using them for its receive timeout.
+; ======================================================================
+
+Procedure.i sd_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i sd_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; Spin for approximately n microseconds. Used only in the two places
+; [PHYS] requires a settling delay; it is not a substitute for a status
+; poll anywhere in this file.
+Procedure sd_DelayUs(us.i)
+  Define t0.i
+  Define want.i
+  If sd_hz <= 0
+    ProcedureReturn
+  EndIf
+  want = (sd_hz / 1000000) * us
+  If want < 1
+    want = 1
+  EndIf
+  t0 = sd_Ticks()
+  While (sd_Ticks() - t0) < want
+  Wend
+EndProcedure
+
+; ======================================================================
+;  Register access. EVERY read goes through sd_Rd so that PeekL's sign
+;  extension is masked off exactly once, in one place. See the header:
+;  OCR bit 31 is the ACMD41 busy flag and it WILL make a raw PeekL
+;  negative.
+; ======================================================================
+
+Procedure.i sd_Rd(off.i)
+  ProcedureReturn PeekN(#SD_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure sd_Wr(off.i, v.i)
+  PokeL(#SD_BASE + off, v)
+EndProcedure
+
+; ======================================================================
+;  Failure bookkeeping. One place, so every refusal captures the same
+;  three things: which error, what the controller's INTERRUPT word said,
+;  and what its Present State said. A report that names only the error
+;  code sends somebody to look at the wiring when the answer was in the
+;  status bits.
+; ======================================================================
+
+Procedure.i sd_Fail(code.i)
+  sd_err     = code
+  sd_lastIntr = sd_Rd(#SD_INTERRUPT)
+  sd_lastStat = sd_Rd(#SD_STATUS)
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  sd_ControllerPlausible - is there an SDHCI controller at #SD_BASE?
+;
+;  THIS IS THE ANSWER TO THE 2026-08-24 FAILURE, as far as one is
+;  available here. That case was a store to a real, powered, idle
+;  peripheral that produced no output and no error, because it was the
+;  wrong device. RP2350/Lib/i2c.pico2 closes the same hole with
+;  i2c_MapAgrees(), which checks every offset against the part's own
+;  register table - but THERE IS NO SUCH TABLE FOR THE BCM2711.
+;  RaspberryPi4/Intrinsics/bcm2711_hardware.def contains three CPU
+;  intrinsics and no peripheral registers at all, and the peripherals
+;  document does not describe this block. So the offsets cannot be
+;  checked the way i2c.pico2 checks its.
+;
+;  What CAN be checked is that the thing answering at this address looks
+;  like an SDHCI controller rather than like something else, and that is
+;  what this does. It is weaker than i2c_MapAgrees() and it is honest
+;  about being weaker.
+;
+;    * SLOTISR_VER all-zero or all-ones means nothing is decoding here.
+;    * The Specification Version field is defined by [SDHCI] as 0 = 1.00,
+;      1 = 2.00, 2 = 3.00, with 3 and 4 added by later versions of the
+;      spec. Anything above 4 is not a version number, so it is not this
+;      register, so this is not the controller.
+;    * Capabilities all-zero or all-ones is the same argument again, from
+;      a different register at a different offset - which is the part
+;      that makes it worth doing twice.
+;
+;  A wrong-but-plausible base address could still get past all three.
+;  Nothing available on this disk can rule that out; the three
+;  independent derivations in the header are the defence against it.
+;
+;  Returns 1 if it looks like a controller, 0 with sd_err set otherwise.
+; ======================================================================
+Procedure.i sd_ControllerPlausible()
+  Define v.i
+  Define c.i
+
+  v = sd_Rd(#SD_SLOTISR_VER)
+  If v = 0 Or v = $FFFFFFFF
+    ProcedureReturn sd_Fail(#SD_ERR_NO_CONTROLLER)
+  EndIf
+  sd_ver    = (v >> 16) & $FF
+  sd_vendor = (v >> 24) & $FF
+  If sd_ver > 4
+    ProcedureReturn sd_Fail(#SD_ERR_BAD_VERSION)
+  EndIf
+
+  c = sd_Rd(#SD_CAPS0)
+  If c = 0 Or c = $FFFFFFFF
+    ProcedureReturn sd_Fail(#SD_ERR_NO_CAPS)
+  EndIf
+  sd_caps0 = c
+  sd_caps1 = sd_Rd(#SD_CAPS1)
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  The base clock. See the long note in the header - this is the weakest
+;  number in the file and the one place it is allowed to say "I do not
+;  know" instead of guessing.
+;
+;  [SDHCI] 2.2.24: Base Clock Frequency For SD Clock is bits 15:8 of the
+;  Capabilities register on a 3.00 controller and bits 13:8 on 1.00 and
+;  2.00, in MHz, and the value zero means "not obtainable from here".
+;
+;  Returns the base clock in kHz, or 0 if it is unknown.
+; ======================================================================
+Procedure.i sd_BaseClockKhz()
+  Define mhz.i
+
+  If sd_userBase > 0
+    ProcedureReturn sd_userBase
+  EndIf
+
+  If sd_ver >= 2
+    mhz = (sd_caps0 >> 8) & $FF     ; 3.00 and later: 8-bit field
+  Else
+    mhz = (sd_caps0 >> 8) & $3F     ; 1.00 / 2.00: 6-bit field
+  EndIf
+
+  If mhz = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn mhz * 1000
+EndProcedure
+
+; ======================================================================
+;  sd_DivisorFor - the N that CONTROL1 wants.
+;
+;  [SDHCI] 2.2.14, 10-bit Divided Clock Mode: SDCLK = base / (2 * N),
+;  and N = 0 selects the base clock undivided. N is ten bits, so the
+;  slowest this mode reaches is base / 2046.
+;
+;  Rounds N UP, always, because rounding down would overshoot the
+;  requested frequency and the two frequencies this file asks for are
+;  both ceilings: 400 kHz is [PHYS]'s identification limit and 25 MHz is
+;  Default Speed. A bus that is a little slow works; a bus that is a
+;  little fast is out of spec.
+; ======================================================================
+Procedure.i sd_DivisorFor(baseKhz.i, wantKhz.i)
+  Define n.i
+  Define twice.i
+  If wantKhz <= 0
+    ProcedureReturn 1023
+  EndIf
+  If baseKhz <= wantKhz
+    ProcedureReturn 0
+  EndIf
+  twice = 2 * wantKhz
+  n = (baseKhz + twice - 1) / twice
+  If n < 1
+    n = 1
+  EndIf
+  If n > 1023
+    n = 1023
+  EndIf
+  ProcedureReturn n
+EndProcedure
+
+; ======================================================================
+;  sd_SetClock - stop the SD clock, program a divisor, start it again.
+;
+;  CONTROL1 IS REBUILT WHOLE rather than read-modify-written, and that
+;  is deliberate. The word carries three [SDHCI] registers - Clock
+;  Control, Timeout Control and Software Reset - and a read-modify-write
+;  would carry whatever happened to be in the Software Reset byte back
+;  into the register. Composing it from scratch means the bits that go
+;  in are exactly the bits named here.
+;
+;  ORDER MATTERS and it is [SDHCI] 3.2.1's:
+;    1. clear SD Clock Enable        (never change the divisor while the
+;                                     clock is running)
+;    2. write divisor + Internal Clock Enable
+;    3. wait for Internal Clock Stable
+;    4. set SD Clock Enable
+;
+;  Returns 1, or 0 with sd_err set if the clock never stabilised.
+; ======================================================================
+Procedure.i sd_SetClock(wantKhz.i)
+  Define n.i
+  Define c1.i
+  Define lo.i
+  Define hi.i
+  Define t0.i
+  Define budget.i
+
+  n = sd_DivisorFor(sd_baseKhz, wantKhz)
+  sd_divisor = n
+  If n = 0
+    sd_clkKhz = sd_baseKhz
+  Else
+    sd_clkKhz = sd_baseKhz / (2 * n)
+  EndIf
+
+  ; 1 - stop the SD clock, keeping the internal clock and the timeout.
+  c1 = sd_Rd(#SD_CONTROL1) & $FFFFFFFB      ; clear bit 2 only
+  sd_Wr(#SD_CONTROL1, c1)
+
+  ; 2 - divisor, timeout, internal clock enable. Clock Generator Select
+  ;     stays 0: Divided Clock Mode, which is the mode the arithmetic in
+  ;     sd_DivisorFor assumes.
+  lo = (n & $FF) * 256                       ; N[7:0]  -> word bits 15:8
+  hi = ((n >> 8) & 3) * 64                   ; N[9:8]  -> word bits  7:6
+  c1 = #SD_C1_TOUNIT_MAX | lo | hi | #SD_C1_CLK_INTLEN
+  sd_Wr(#SD_CONTROL1, c1)
+
+  ; 3 - wait for the internal clock to lock.
+  budget = #SD_TMO_CLOCK_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  While (sd_Rd(#SD_CONTROL1) & #SD_C1_CLK_STABLE) = 0
+    If (sd_Ticks() - t0) > budget
+      ProcedureReturn sd_Fail(#SD_ERR_CLOCK)
+    EndIf
+  Wend
+
+  ; 4 - and let it out to the card.
+  c1 = sd_Rd(#SD_CONTROL1) | #SD_C1_CLK_EN
+  sd_Wr(#SD_CONTROL1, c1)
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  sd_WaitInhibit - do not issue a command into a busy controller.
+;
+;  [SDHCI] 2.2.9: Command Inhibit (CMD), Present State bit 0, is set
+;  while the CMD line is in use. Command Inhibit (DAT), bit 1, is set
+;  while the DAT line is in use OR while the card is signalling
+;  programmed-busy after a write. A command issued while either is set
+;  is not queued, it is lost.
+;
+;  needDat = 1 for anything that uses the data line or has an R1b
+;  response, 0 otherwise.
+; ======================================================================
+Procedure.i sd_WaitInhibit(needDat.i)
+  Define mask.i
+  Define t0.i
+  Define budget.i
+  mask = #SD_ST_CMD_INHIBIT
+  If needDat <> 0
+    mask = mask | #SD_ST_DAT_INHIBIT
+  EndIf
+  budget = #SD_TMO_INHIBIT_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  While (sd_Rd(#SD_STATUS) & mask) <> 0
+    If (sd_Ticks() - t0) > budget
+      ProcedureReturn sd_Fail(#SD_ERR_INHIBIT)
+    EndIf
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  sd_ResetLine - recover the CMD line (and optionally DAT) after an
+;  error, so one bad command does not poison every command after it.
+;
+;  [SDHCI] 2.2.16: Software Reset For CMD Line and For DAT Line are
+;  self-clearing bits in the Software Reset register at $2F. They reset
+;  the relevant part of the controller WITHOUT disturbing the clock
+;  setup, which is why an error path uses these two rather than
+;  Software Reset For All.
+;
+;  Bounded like everything else, but its failure is not reported
+;  separately: it is already running inside a failure path, and
+;  replacing the caller's error code with a second one would hide the
+;  original problem. The deadline is here so it cannot hang.
+; ======================================================================
+Procedure sd_ResetLine(alsoData.i)
+  Define bits.i
+  Define t0.i
+  Define budget.i
+  bits = #SD_C1_SRST_CMD
+  If alsoData <> 0
+    bits = bits | #SD_C1_SRST_DATA
+  EndIf
+  sd_Wr(#SD_CONTROL1, sd_Rd(#SD_CONTROL1) | bits)
+  budget = #SD_TMO_RESET_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  While (sd_Rd(#SD_CONTROL1) & bits) <> 0
+    If (sd_Ticks() - t0) > budget
+      Break
+    EndIf
+  Wend
+EndProcedure
+
+; ======================================================================
+;  sd_Command - issue one command and collect its response.
+;
+;  cmdtm       one of the #SD_CMDn words above, complete
+;  arg         the 32-bit argument
+;  tmoIsOk     1 if a Command Timeout is an EXPECTED answer here rather
+;              than a failure. Two callers need that and they are the
+;              reason this parameter exists at all:
+;                CMD8 to a v1.x card times out BY DEFINITION - that is
+;                how you detect a v1.x card;
+;                CMD55 to an empty slot times out, and that is how this
+;                driver discovers there is no card.
+;              Shouting about either would turn a normal outcome into a
+;              reported fault.
+;
+;  Returns  1  command completed, sd_resp0..3 valid
+;           0  it failed and sd_err says how
+;          -1  it timed out and tmoIsOk was set. sd_err is NOT set: the
+;              caller asked for this outcome and is expected to handle
+;              it. -1 rather than 0 so that a caller which ignores the
+;              distinction still sees "not success".
+;
+;  WHY THE RESPONSE IS READ THE WAY IT IS. [SDHCI] 2.2.8: for a 136-bit
+;  response the controller strips the card's 7-bit CRC and its end bit
+;  and left-justifies the remaining 120 bits, so RESP0 holds card bits
+;  39:8, RESP1 holds 71:40, RESP2 holds 103:72 and RESP3 holds 127:104.
+;  Every CID and CSD field position in this file is stated in CARD bit
+;  numbers and then shifted by that 8, in one place - see
+;  sd_DecodeCsd(). For a 48-bit response only RESP0 is meaningful.
+; ======================================================================
+Procedure.i sd_Command(cmdtm.i, arg.i, tmoIsOk.i)
+  Define intr.i
+  Define t0.i
+  Define budget.i
+  Define needDat.i
+  Define rsp.i
+
+  sd_lastCmd = (cmdtm >> 24) & $3F
+
+  ; An R1b response (11) or a data-bearing command uses the DAT line, so
+  ; the DAT inhibit has to be clear as well as the CMD inhibit.
+  needDat = 0
+  rsp = cmdtm & $00030000
+  If rsp = #SD_CMD_RSP_48B
+    needDat = 1
+  EndIf
+  If (cmdtm & #SD_CMD_ISDATA) <> 0
+    needDat = 1
+  EndIf
+
+  If sd_WaitInhibit(needDat) = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; Clear anything left over, so the poll below cannot see a stale bit
+  ; from the previous command and call it success.
+  sd_Wr(#SD_INTERRUPT, #SD_INT_CLEAR_ALL)
+
+  sd_Wr(#SD_ARG1, arg)
+  sd_Wr(#SD_CMDTM, cmdtm)
+
+  budget = #SD_TMO_CMD_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  Repeat
+    intr = sd_Rd(#SD_INTERRUPT)
+    If (intr & (#SD_INT_CMD_DONE | #SD_INT_ANY_ERR)) <> 0
+      Break
+    EndIf
+    If (sd_Ticks() - t0) > budget
+      sd_lastIntr = intr
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      sd_err = #SD_ERR_CMD_STUCK
+      sd_ResetLine(1)
+      ProcedureReturn 0
+    EndIf
+  ForEver
+
+  If (intr & #SD_INT_ANY_ERR) <> 0
+    sd_lastIntr = intr
+    sd_lastStat = sd_Rd(#SD_STATUS)
+    sd_Wr(#SD_INTERRUPT, intr)          ; write-1-to-clear what we saw
+    sd_ResetLine(1)
+    ; A bare Command Timeout with no other error bit is the "no answer"
+    ; case, and it is the one some callers expect.
+    If (intr & #SD_INT_ANY_ERR) = #SD_INT_CMD_TIMEOUT
+      If tmoIsOk <> 0
+        ProcedureReturn -1
+      EndIf
+      sd_err = #SD_ERR_CMD_TIMEOUT
+      ProcedureReturn 0
+    EndIf
+    sd_err = #SD_ERR_CMD_ERROR
+    ProcedureReturn 0
+  EndIf
+
+  ; Command Complete only. Clear it and read the response out.
+  sd_Wr(#SD_INTERRUPT, #SD_INT_CMD_DONE)
+
+  sd_resp0 = 0
+  sd_resp1 = 0
+  sd_resp2 = 0
+  sd_resp3 = 0
+  If rsp <> #SD_CMD_RSP_NONE
+    sd_resp0 = sd_Rd(#SD_RESP0)
+    If rsp = #SD_CMD_RSP_136
+      sd_resp1 = sd_Rd(#SD_RESP1)
+      sd_resp2 = sd_Rd(#SD_RESP2)
+      sd_resp3 = sd_Rd(#SD_RESP3)
+    EndIf
+  EndIf
+
+  ; For an R1b the busy period follows the response on DAT0. [SDHCI]
+  ; signals its end with Transfer Complete, not with Command Complete,
+  ; so waiting only for Command Complete here would let the next command
+  ; be issued into a card that is still busy.
+  If rsp = #SD_CMD_RSP_48B
+    budget = #SD_TMO_DATA_MS * sd_tickPerMs
+    t0 = sd_Ticks()
+    Repeat
+      intr = sd_Rd(#SD_INTERRUPT)
+      If (intr & #SD_INT_DATA_DONE) <> 0
+        sd_Wr(#SD_INTERRUPT, #SD_INT_DATA_DONE)
+        Break
+      EndIf
+      If (intr & #SD_INT_ANY_ERR) <> 0
+        sd_lastIntr = intr
+        sd_lastStat = sd_Rd(#SD_STATUS)
+        sd_Wr(#SD_INTERRUPT, intr)
+        sd_ResetLine(1)
+        sd_err = #SD_ERR_CMD_ERROR
+        ProcedureReturn 0
+      EndIf
+      ; Some controllers end an R1b busy by dropping the DAT inhibit
+      ; without ever raising Transfer Complete. Accept that too rather
+      ; than time out on a card that is, observably, no longer busy.
+      If (sd_Rd(#SD_STATUS) & #SD_ST_DAT_INHIBIT) = 0
+        Break
+      EndIf
+      If (sd_Ticks() - t0) > budget
+        sd_lastIntr = intr
+        sd_lastStat = sd_Rd(#SD_STATUS)
+        sd_err = #SD_ERR_BUSY_TMO
+        ProcedureReturn 0
+      EndIf
+    ForEver
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  sd_AppCommand - CMD55 then the ACMD.
+;
+;  [PHYS]: an application command is a pair. CMD55 tells the card the
+;  next command is application-specific; the ACMD immediately follows.
+;  During identification the RCA is not yet assigned and CMD55 carries
+;  argument 0.
+;
+;  Returns what sd_Command returns, and passes tmoIsOk through to BOTH
+;  halves - because to an empty slot it is the CMD55 that times out, not
+;  the ACMD.
+; ======================================================================
+Procedure.i sd_AppCommand(cmdtm.i, arg.i, rca.i, tmoIsOk.i)
+  Define r.i
+  r = sd_Command(#SD_CMD55, rca * $10000, tmoIsOk)
+  If r <> 1
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn sd_Command(cmdtm, arg, tmoIsOk)
+EndProcedure
+
+; ======================================================================
+;  sd_DecodeCsd - capacity, in 512-byte blocks, out of the CSD.
+;
+;  Sets sd_blocks, or leaves it 0 for "unknown". A zero here is NOT an
+;  error and does not stop anything: this driver never needs the
+;  capacity to read or write a block, and a caller that wants bounds
+;  checking can ask for it and decide what to do if it is unavailable.
+;
+;  THE BIT POSITIONS. [PHYS] numbers CSD fields by their position in the
+;  128-bit CSD register. [SDHCI] 2.2.8 delivers a 136-bit response with
+;  the low 8 bits (CRC and end bit) removed, so response bit b holds CSD
+;  bit b+8. Writing S for the 120-bit response value:
+;
+;      S = RESP3:RESP2:RESP1:RESP0     S[i] = CSD[i+8]
+;      RESP0 = S[31:0]   RESP1 = S[63:32]
+;      RESP2 = S[95:64]  RESP3 = S[127:96]   (RESP3[31:24] undefined)
+;
+;  CSD_STRUCTURE = CSD[127:126] = S[119:118] = RESP3 bits 23:22.
+;
+;  CSD VERSION 2.0 - SDHC and SDXC:
+;      C_SIZE = CSD[69:48] = S[61:40] = RESP1 bits 29:8, 22 bits wide,
+;      and capacity = (C_SIZE + 1) * 512 KB, so
+;      blocks = (C_SIZE + 1) * 1024.
+;
+;  CSD VERSION 1.0 - SDSC:
+;      READ_BL_LEN  = CSD[83:80] = S[75:72] = RESP2 bits 11:8
+;      C_SIZE       = CSD[73:62] = S[65:54] = RESP2 bits 1:0 (high two)
+;                                             joined to RESP1 bits 31:22
+;      C_SIZE_MULT  = CSD[49:47] = S[41:39] = RESP1 bits 9:7
+;      blocknr  = (C_SIZE + 1) * 2^(C_SIZE_MULT + 2)
+;      blocklen = 2^READ_BL_LEN
+;      blocks   = blocknr * blocklen / 512
+;
+;  BOTH DECODES ARE UNVERIFIED, and the version 1.0 one is the riskier
+;  of the two: it spans a word boundary, it is the path no SD card sold
+;  this decade takes, and [PHYS] is not on this disk to check it
+;  against. If SdBlockCount() ever returns something absurd for an old
+;  small card, suspect this procedure before you suspect the card.
+; ======================================================================
+Procedure sd_DecodeCsd()
+  Define csdVer.i
+  Define csize.i
+  Define mult.i
+  Define blen.i
+  Define nr.i
+
+  sd_blocks = 0
+  csdVer = (sd_csd3 >> 22) & 3
+
+  If csdVer = 1
+    ; --- CSD version 2.0, high capacity ---
+    csize = (sd_csd1 >> 8) & $3FFFFF
+    sd_blocks = (csize + 1) * 1024
+    ProcedureReturn
+  EndIf
+
+  If csdVer = 0
+    ; --- CSD version 1.0, standard capacity ---
+    blen  = (sd_csd2 >> 8) & $0F
+    csize = (((sd_csd2 & 3) * 1024) | ((sd_csd1 >> 22) & $3FF)) & $FFF
+    mult  = (sd_csd1 >> 7) & 7
+    ; 2^(mult+2) and 2^blen, built by shifting 1 rather than by a power
+    ; routine. Both exponents are small and bounded by their field
+    ; widths, so neither shift can run away.
+    nr = (csize + 1) * (1 << (mult + 2))
+    If blen >= 9
+      sd_blocks = nr * (1 << (blen - 9))
+    Else
+      sd_blocks = nr / (1 << (9 - blen))
+    EndIf
+    ProcedureReturn
+  EndIf
+
+  ; CSD_STRUCTURE 2 is SDUC and 3 is reserved. Neither is decoded here,
+  ; and saying "unknown" is better than pretending.
+EndProcedure
+
+; ======================================================================
+;  sd_Lba2Arg - THE ONLY PLACE THE ADDRESSING MODE IS APPLIED.
+;
+;  See the header. SDHC/SDXC take the LBA directly; SDSC takes a byte
+;  offset. There is deliberately no second copy of this multiply in the
+;  file, because a driver with two of them is a driver where one of them
+;  is eventually wrong and the symptom looks like corruption.
+; ======================================================================
+Procedure.i sd_Lba2Arg(lba.i)
+  If sd_sdhc <> 0
+    ProcedureReturn lba
+  EndIf
+  ProcedureReturn lba * #SD_BLOCK_SIZE
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - configuration
+; ======================================================================
+
+; Force the controller's base clock, in kHz, instead of reading it out of
+; the Capabilities register. Call this BEFORE SdInit().
+;
+; This is the hook for a mailbox library: ask the firmware for the EMMC2
+; clock rate and pass it in. Passing 0 restores "read Capabilities".
+; See the base-clock section of the header for why this exists.
+Procedure SdSetBaseClockKhz(khz.i)
+  If khz < 0
+    khz = 0
+  EndIf
+  sd_userBase = khz
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - SdInit
+;
+;  Brings the controller up and takes the card through [PHYS]'s
+;  identification sequence:
+;
+;    CMD0    GO_IDLE_STATE        every card, idle state
+;    CMD8    SEND_IF_COND         is this a v2.00+ card, and does it
+;                                 accept our voltage? A timeout here is
+;                                 an ANSWER: v1.x
+;    ACMD41  SD_SEND_OP_COND      the busy loop. Ends when OCR bit 31
+;                                 goes high; OCR bit 30 then says
+;                                 whether the card is block addressed
+;    CMD2    ALL_SEND_CID         card -> identification state
+;    CMD3    SEND_RELATIVE_ADDR   the card picks its RCA
+;    CMD9    SEND_CSD             capacity (optional, never fatal to
+;                                 the transfer path)
+;    CMD7    SELECT_CARD          -> transfer state
+;    CMD16   SET_BLOCKLEN 512     matters for SDSC, harmless for SDHC
+;
+;  Then the clock goes from 400 kHz to 25 MHz.
+;
+;  Returns 1 on success, 0 on refusal with SdLastError() set.
+; ======================================================================
+Procedure.i SdInit()
+  Define t0.i
+  Define budget.i
+  Define c1.i
+  Define c0.i
+  Define st.i
+  Define r.i
+  Define arg.i
+
+  a64_barrier()
+
+  sd_ready   = 0
+  sd_err     = #SD_ERR_NONE
+  sd_lastCmd = -1
+  sd_v2      = 0
+  sd_sdhc    = 0
+  sd_ocr     = 0
+  sd_rca     = 0
+  sd_blocks  = 0
+
+  ; --- the clock this file measures its own timeouts with ------------
+  ; Everything below depends on this, so it is checked first and it is
+  ; a hard refusal. A CNTFRQ of zero would make every "bounded" wait in
+  ; this file a spin with a deadline of zero ticks, which is worse than
+  ; unbounded: it would fail instantly and blame the card.
+  sd_hz = sd_TickHz()
+  If sd_hz < 1000000 Or sd_hz > 1000000000
+    sd_err = #SD_ERR_NO_CNTFRQ
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  sd_tickPerMs = sd_hz / 1000
+
+  ; --- is anything there at all? -------------------------------------
+  If sd_ControllerPlausible() = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- what the card detect claimed, BEFORE it gets overridden -------
+  ; See the card-detect section of the header. These are recorded for
+  ; the bench, not acted on: bcm2711-rpi-4-b.dts marks this controller
+  ; broken-cd.
+  st = sd_Rd(#SD_STATUS)
+  sd_cdBit = 0
+  sd_cdPin = 0
+  If (st & #SD_ST_CARD_INSERT) <> 0
+    sd_cdBit = 1
+  EndIf
+  If (st & #SD_ST_CARD_PIN) <> 0
+    sd_cdPin = 1
+  EndIf
+
+  ; --- Software Reset For All ----------------------------------------
+  ; [SDHCI] 2.2.16. Self-clearing. This also clears the clock setup and
+  ; the interrupt enables, which is why both are programmed after it and
+  ; not before.
+  sd_Wr(#SD_CONTROL1, #SD_C1_SRST_HC)
+  budget = #SD_TMO_RESET_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  While (sd_Rd(#SD_CONTROL1) & #SD_C1_SRST_ANY) <> 0
+    If (sd_Ticks() - t0) > budget
+      sd_Fail(#SD_ERR_RESET)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+  Wend
+
+  ; --- the base clock, and the refusal if it is unknown --------------
+  sd_baseKhz = sd_BaseClockKhz()
+  If sd_baseKhz <= 0
+    sd_Fail(#SD_ERR_BASECLK)
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- power -----------------------------------------------------------
+  ; [SDHCI] 2.2.12: select the bus voltage, then turn the bus power on.
+  ; On this board the card's actual 3.3V rail is expgpio 6, behind the
+  ; mailbox, so this write may well do nothing - see the header. It is
+  ; done anyway because it is what the specification asks for and
+  ; because a controller that DOES implement it needs it. Its result is
+  ; deliberately not checked: a readback of zero here would mean "not
+  ; implemented", which is not a failure.
+  c0 = sd_Rd(#SD_CONTROL0) & $FFFFF0FF     ; clear the power byte
+  c0 = c0 | #SD_C0_VOLT_3V3 | #SD_C0_BUS_POWER
+  ; And force the controller's card-detect view to "inserted", using the
+  ; two bits [SDHCI] 2.2.11 provides for it. Without this an SDHCI
+  ; controller may refuse to supply SDCLK, and on this board the card
+  ; detect it would otherwise believe is the one the device tree calls
+  ; broken.
+  c0 = c0 | #SD_C0_CD_TEST_SEL | #SD_C0_CD_TEST_LVL
+  ; 1-bit bus. 4-bit is on the deliberately-left-out list.
+  c0 = c0 & $FFFFFFFD
+  sd_Wr(#SD_CONTROL0, c0)
+  ; [PHYS] asks for a settling time after the supply is enabled. 1 ms is
+  ; far more than the ramp of a rail that, on this board, was already up.
+  sd_DelayUs(1000)
+
+  ; --- interrupts: latch every status bit, route none of them --------
+  ; [SDHCI] 2.2.19 and 2.2.20. THE STATUS ENABLE REGISTER IS NOT
+  ; OPTIONAL FOR A POLLED DRIVER: with a bit clear in $34 the
+  ; corresponding bit in $30 never sets, so the poll loops below would
+  ; wait for something that can never happen. $38 stays zero so nothing
+  ; is signalled to the GIC.
+  sd_Wr(#SD_IRPT_EN,   0)
+  sd_Wr(#SD_IRPT_MASK, #SD_IRPT_MASK_ALL)
+  sd_Wr(#SD_INTERRUPT, #SD_INT_CLEAR_ALL)
+
+  ; --- identification clock ------------------------------------------
+  If sd_SetClock(#SD_CLK_IDENT_KHZ) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  ; [PHYS] requires at least 74 clock cycles on SDCLK before the first
+  ; command. At 400 kHz, 1 ms is 400 cycles.
+  sd_DelayUs(1000)
+
+  ; --- CMD0 ------------------------------------------------------------
+  ; No response, so there is nothing to check except that the controller
+  ; accepted it. A card that is not there cannot fail this, which is
+  ; exactly why CMD0 is not the card-detect test.
+  If sd_Command(#SD_CMD0, 0, 0) <> 1
+    sd_err = #SD_ERR_CMD0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  sd_DelayUs(1000)
+
+  ; --- CMD8 ------------------------------------------------------------
+  ; [PHYS]: argument $1AA is VHS = 1 (2.7V-3.6V) in bits 11:8 and the
+  ; recommended check pattern $AA in bits 7:0. The R7 response echoes
+  ; both back. A TIMEOUT IS NOT A FAILURE HERE - it means the card
+  ; predates version 2.00, and such a card is by definition standard
+  ; capacity and byte addressed.
+  r = sd_Command(#SD_CMD8, $000001AA, 1)
+  If r = 1
+    If (sd_resp0 & $FF) <> $AA
+      sd_Fail(#SD_ERR_CMD8_ECHO)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+    If ((sd_resp0 >> 8) & $0F) <> 1
+      sd_Fail(#SD_ERR_CMD8_ECHO)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+    sd_v2 = 1
+  ElseIf r = 0
+    ; A real error, not a timeout.
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- ACMD41, the busy loop -------------------------------------------
+  ; [PHYS] gives the card one second to leave the busy state. HCS is set
+  ; only if CMD8 succeeded: telling a v1.x card that the host supports
+  ; high capacity is meaningless and [PHYS] says not to.
+  arg = #SD_ACMD41_ARG_BASE
+  If sd_v2 <> 0
+    arg = arg | #SD_ACMD41_HCS
+  EndIf
+
+  sd_ocr = 0
+  budget = #SD_TMO_ACMD41_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  Repeat
+    r = sd_AppCommand(#SD_ACMD41, arg, 0, 1)
+    If r = -1
+      ; Nothing answered CMD55. On this board that is the empty slot,
+      ; and it is the normal case on this bench. Report it as such
+      ; immediately rather than spending the whole second on it: an
+      ; empty slot will not start answering.
+      sd_err = #SD_ERR_NOCARD
+      sd_lastIntr = sd_Rd(#SD_INTERRUPT)
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+    If r = 0
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+    sd_ocr = sd_resp0
+    If (sd_ocr & #SD_OCR_BUSY) <> 0
+      Break
+    EndIf
+    If (sd_Ticks() - t0) > budget
+      sd_Fail(#SD_ERR_ACMD41_TMO)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+    ; [PHYS] suggests polling no faster than about once a millisecond.
+    sd_DelayUs(1000)
+  ForEver
+
+  ; THE ONE BIT THAT DECIDES read/write ADDRESSING FOR THE WHOLE DRIVER.
+  ; Only meaningful for a v2.00+ card; a v1.x card cannot be high
+  ; capacity, so leaving sd_sdhc at 0 for it is correct, not a fallback.
+  sd_sdhc = 0
+  If sd_v2 <> 0
+    If (sd_ocr & #SD_OCR_CCS) <> 0
+      sd_sdhc = 1
+    EndIf
+  EndIf
+
+  ; --- CMD2, CID ---------------------------------------------------------
+  If sd_Command(#SD_CMD2, 0, 0) <> 1
+    sd_err = #SD_ERR_CMD2
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  sd_cid0 = sd_resp0
+  sd_cid1 = sd_resp1
+  sd_cid2 = sd_resp2
+  sd_cid3 = sd_resp3
+
+  ; --- CMD3, RCA ---------------------------------------------------------
+  ; [PHYS]: R6 carries the newly published RCA in bits 31:16.
+  If sd_Command(#SD_CMD3, 0, 0) <> 1
+    sd_err = #SD_ERR_CMD3
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  sd_rca = (sd_resp0 >> 16) & $FFFF
+  If sd_rca = 0
+    ; [PHYS] reserves RCA 0 to address "the card in identification
+    ; state". A card that published 0 cannot then be selected, so this
+    ; is a refusal and not something to paper over.
+    sd_Fail(#SD_ERR_BAD_RCA)
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- CMD9, CSD ---------------------------------------------------------
+  ; Must happen BEFORE CMD7: [PHYS] allows SEND_CSD only in the stand-by
+  ; state, and CMD7 moves the card to transfer.
+  If sd_Command(#SD_CMD9, sd_rca * $10000, 0) <> 1
+    sd_err = #SD_ERR_CMD9
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+  sd_csd0 = sd_resp0
+  sd_csd1 = sd_resp1
+  sd_csd2 = sd_resp2
+  sd_csd3 = sd_resp3
+  sd_DecodeCsd()
+
+  ; --- CMD7, select ------------------------------------------------------
+  If sd_Command(#SD_CMD7, sd_rca * $10000, 0) <> 1
+    sd_err = #SD_ERR_CMD7
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- CMD16, block length ----------------------------------------------
+  ; SDHC/SDXC ignore this - their block length is fixed at 512 - but an
+  ; SDSC card powers up with a block length taken from the CSD and it
+  ; may not be 512. Sending it unconditionally costs one command and
+  ; removes a whole class of "the SDSC card reads garbage" bug.
+  If sd_Command(#SD_CMD16, #SD_BLOCK_SIZE, 0) <> 1
+    sd_err = #SD_ERR_CMD16
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; --- up to Default Speed ----------------------------------------------
+  If sd_SetClock(#SD_CLK_XFER_KHZ) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  sd_ready = 1
+  sd_err   = #SD_ERR_NONE
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  sd_CheckBuffer - the caller's buffer, refused loudly if it cannot be
+;  used.
+;
+;  The Buffer Data Port at $20 is a 32-bit port and this driver moves
+;  whole words, so the buffer must be 4-byte aligned. An unaligned
+;  buffer is refused rather than worked around: silently falling back to
+;  byte access would quadruple the load on the poll loop and hide a
+;  caller bug that will bite somewhere else.
+; ======================================================================
+Procedure.i sd_CheckBuffer(*buf)
+  If *buf = 0
+    sd_err = #SD_ERR_NULL_BUF
+    ProcedureReturn 0
+  EndIf
+  If (*buf & 3) <> 0
+    sd_err = #SD_ERR_ALIGN
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  sd_WaitData - wait for one of the buffer-ready bits, or an error.
+;
+;  want is #SD_INT_READ_RDY or #SD_INT_WRITE_RDY. Returns 1, or 0 with
+;  sd_err set.
+; ======================================================================
+Procedure.i sd_WaitData(want.i)
+  Define intr.i
+  Define t0.i
+  Define budget.i
+  budget = #SD_TMO_DATA_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  Repeat
+    intr = sd_Rd(#SD_INTERRUPT)
+    If (intr & #SD_INT_ANY_ERR) <> 0
+      sd_lastIntr = intr
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      sd_Wr(#SD_INTERRUPT, intr)
+      sd_ResetLine(1)
+      sd_err = #SD_ERR_DATA_ERROR
+      ProcedureReturn 0
+    EndIf
+    If (intr & want) <> 0
+      sd_Wr(#SD_INTERRUPT, want)
+      ProcedureReturn 1
+    EndIf
+    If (sd_Ticks() - t0) > budget
+      sd_lastIntr = intr
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      sd_ResetLine(1)
+      sd_err = #SD_ERR_DATA_TMO
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+
+; ======================================================================
+;  sd_WaitTransfer - wait for Transfer Complete after the last word.
+; ======================================================================
+Procedure.i sd_WaitTransfer()
+  Define intr.i
+  Define t0.i
+  Define budget.i
+  budget = #SD_TMO_DATA_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  Repeat
+    intr = sd_Rd(#SD_INTERRUPT)
+    If (intr & #SD_INT_ANY_ERR) <> 0
+      sd_lastIntr = intr
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      sd_Wr(#SD_INTERRUPT, intr)
+      sd_ResetLine(1)
+      sd_err = #SD_ERR_DATA_ERROR
+      ProcedureReturn 0
+    EndIf
+    If (intr & #SD_INT_DATA_DONE) <> 0
+      sd_Wr(#SD_INTERRUPT, #SD_INT_DATA_DONE)
+      ProcedureReturn 1
+    EndIf
+    If (sd_Ticks() - t0) > budget
+      sd_lastIntr = intr
+      sd_lastStat = sd_Rd(#SD_STATUS)
+      sd_ResetLine(1)
+      sd_err = #SD_ERR_XFER_TMO
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - SdReadBlock(lba, *buf)
+;
+;  Reads one 512-byte block into *buf, which must be 4-byte aligned and
+;  at least 512 bytes long. Returns 1, or 0 with SdLastError() set.
+;
+;  THE BUFFER IS NOT TOUCHED UNLESS THE READ GETS AS FAR AS DATA. A
+;  refusal for a bad LBA, an unaligned buffer or a failed CMD17 leaves
+;  the caller's memory exactly as it was, so a caller that checks the
+;  return value cannot mistake a stale buffer for fresh data.
+; ======================================================================
+Procedure.i SdReadBlock(lba.i, *buf)
+  Define i.i
+  Define w.i
+  Define arg.i
+
+  If sd_ready = 0
+    sd_err = #SD_ERR_NOT_READY
+    ProcedureReturn 0
+  EndIf
+  If sd_CheckBuffer(*buf) = 0
+    ProcedureReturn 0
+  EndIf
+
+  a64_barrier()
+  sd_err = #SD_ERR_NONE
+
+  ; Block Size in bits 11:0 and Block Count in bits 31:16 - one block of
+  ; 512. $00010200 written as a literal, since & | ! bind tighter than
+  ; << >> here and building it from shifts invites the wrong number.
+  ; The inhibit wait happens HERE as well as inside sd_Command, because
+  ; BLKSIZECNT is written BEFORE the command and writing it while a
+  ; previous transfer is still running would change the geometry
+  ; underneath that transfer. It costs nothing when the bus is idle,
+  ; which is its normal state between calls.
+  If sd_WaitInhibit(1) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  sd_Wr(#SD_BLKSIZECNT, $00010200)
+
+  arg = sd_Lba2Arg(lba)
+  If sd_Command(#SD_CMD17, arg, 0) <> 1
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  If sd_WaitData(#SD_INT_READ_RDY) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; 128 words out of the 32-bit Buffer Data Port. [SDHCI] 2.2.3: the
+  ; first byte the card sent is in bits 7:0, and the ARM is little
+  ; endian, so one 32-bit store puts the four bytes down in order.
+  i = 0
+  While i < #SD_BLOCK_WORDS
+    w = sd_Rd(#SD_DATA)
+    PokeL(*buf + (i * 4), w)
+    i = i + 1
+  Wend
+
+  If sd_WaitTransfer() = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - SdWriteBlock(lba, *buf)
+;
+;  Writes one 512-byte block from *buf. Same alignment rule as the read.
+;  Returns 1, or 0 with SdLastError() set.
+;
+;  IT WAITS FOR THE CARD TO FINISH PROGRAMMING before returning. [PHYS]:
+;  after the last data block the card pulls DAT0 low while it programs,
+;  which the controller shows as Command Inhibit (DAT) in Present State.
+;  Returning while that is still set would mean the next call spends its
+;  inhibit budget on the previous write, and a caller that pulled the
+;  power on the strength of "the write returned" would lose the block.
+; ======================================================================
+Procedure.i SdWriteBlock(lba.i, *buf)
+  Define i.i
+  Define w.i
+  Define arg.i
+  Define t0.i
+  Define budget.i
+
+  If sd_ready = 0
+    sd_err = #SD_ERR_NOT_READY
+    ProcedureReturn 0
+  EndIf
+  If sd_CheckBuffer(*buf) = 0
+    ProcedureReturn 0
+  EndIf
+
+  a64_barrier()
+  sd_err = #SD_ERR_NONE
+
+  ; Same reason as in SdReadBlock: BLKSIZECNT goes down before the
+  ; command, so the bus has to be idle before it is written.
+  If sd_WaitInhibit(1) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  sd_Wr(#SD_BLKSIZECNT, $00010200)
+
+  arg = sd_Lba2Arg(lba)
+  If sd_Command(#SD_CMD24, arg, 0) <> 1
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  If sd_WaitData(#SD_INT_WRITE_RDY) = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  i = 0
+  While i < #SD_BLOCK_WORDS
+    w = PeekN(*buf + (i * 4)) & $FFFFFFFF
+    sd_Wr(#SD_DATA, w)
+    i = i + 1
+  Wend
+
+  If sd_WaitTransfer() = 0
+    a64_barrier()
+    ProcedureReturn 0
+  EndIf
+
+  ; The programming busy. Bounded like everything else.
+  budget = #SD_TMO_INHIBIT_MS * sd_tickPerMs
+  t0 = sd_Ticks()
+  While (sd_Rd(#SD_STATUS) & #SD_ST_DAT_INHIBIT) <> 0
+    If (sd_Ticks() - t0) > budget
+      sd_Fail(#SD_ERR_BUSY_TMO)
+      a64_barrier()
+      ProcedureReturn 0
+    EndIf
+  Wend
+
+  a64_barrier()
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - SdReadBlocks(lba, count, *buf) / SdWriteBlocks(lba, count, *buf)
+;
+;  THE FILESYSTEMS' BLOCK-RANGE SEAM, for the card: count 512-byte blocks
+;  starting at lba, into or out of *buf at ANY address. Returns 1 when
+;  every block moved, or 0 with SdLastError() set at the first that did
+;  not. A null buffer or a count below one is #SD_ERR_NULL_BUF.
+;
+;  The seam took one block per call until 2026-09-17 and the USB driver
+;  showed what that shape costs: a READ (10) per block held a SuperSpeed
+;  stick to 3 MB/s (forum 895). This file still moves one block per
+;  command (CMD17 / CMD24, PIO), so a range is that loop, here, behind the
+;  range contract - the card's own multi-block commands (CMD18 / CMD25)
+;  are the next step on this path and are not written yet.
+;
+;  ALIGNMENT IS THIS FILE'S BUSINESS NOW, not the caller's: the Buffer
+;  Data Port is moved 32 bits at a time and SdReadBlock refuses a buffer
+;  that is not 4-byte aligned, so a block bound for an odd address is
+;  bounced through sd_rangeBuf.
+; ======================================================================
+Global Dim sd_rangeBuf.l[128]
+
+Procedure.i SdReadBlocks(lba.i, count.i, *buf)
+  Define i.i
+  Define j.i
+  Define *at
+  If *buf = 0 Or count < 1
+    sd_err = #SD_ERR_NULL_BUF
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < count
+    *at = *buf + i * 512
+    If (*at & 3) = 0
+      If SdReadBlock(lba + i, *at) = 0
+        ProcedureReturn 0
+      EndIf
+    Else
+      If SdReadBlock(lba + i, @sd_rangeBuf[0]) = 0
+        ProcedureReturn 0
+      EndIf
+      j = 0
+      While j < 512
+        PokeA(*at + j, PeekA(@sd_rangeBuf[0] + j))
+        j = j + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i SdWriteBlocks(lba.i, count.i, *buf)
+  Define i.i
+  Define j.i
+  Define *at
+  If *buf = 0 Or count < 1
+    sd_err = #SD_ERR_NULL_BUF
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < count
+    *at = *buf + i * 512
+    If (*at & 3) = 0
+      If SdWriteBlock(lba + i, *at) = 0
+        ProcedureReturn 0
+      EndIf
+    Else
+      j = 0
+      While j < 512
+        PokeA(@sd_rangeBuf[0] + j, PeekA(*at + j))
+        j = j + 1
+      Wend
+      If SdWriteBlock(lba + i, @sd_rangeBuf[0]) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  PUBLIC - status and diagnosis
+;
+;  This is the whole of the "report failures loudly and specifically"
+;  side of the contract. The library cannot print - it includes no UART
+;  - so it hands over everything a caller needs to print a report that
+;  names the command and the bits.
+; ======================================================================
+
+Procedure.i SdReady()
+  ProcedureReturn sd_ready
+EndProcedure
+
+Procedure.i SdLastError()
+  ProcedureReturn sd_err
+EndProcedure
+
+; The command INDEX of the last command issued, or -1 if none has been.
+; Paired with SdLastIntr() this is the "which command, which status
+; bits" the report needs.
+Procedure.i SdLastCmd()
+  ProcedureReturn sd_lastCmd
+EndProcedure
+
+; The raw 32-bit INTERRUPT register as it stood when things went wrong -
+; Normal Interrupt Status in the low half, Error Interrupt Status in the
+; high half. The #SD_INT_* constants above name every bit.
+Procedure.i SdLastIntr()
+  ProcedureReturn sd_lastIntr
+EndProcedure
+
+; The raw 32-bit Present State register at the same moment. The
+; #SD_ST_* constants name every bit.
+Procedure.i SdLastStatus()
+  ProcedureReturn sd_lastStat
+EndProcedure
+
+; Present State bit 16 (Card Inserted) AS FOUND at the start of SdInit,
+; before this driver overrode the controller's card-detect view.
+; NOT A DIAGNOSIS - the device tree marks this controller broken-cd.
+; See the card-detect section of the header.
+Procedure.i SdCardDetectBit()
+  ProcedureReturn sd_cdBit
+EndProcedure
+
+; Present State bit 18 (Card Detect Pin Level) AS FOUND, same caveat.
+Procedure.i SdCardPinLevel()
+  ProcedureReturn sd_cdPin
+EndProcedure
+
+; 1 if the card is block addressed (SDHC/SDXC), 0 if byte addressed
+; (SDSC). Only meaningful after a successful SdInit().
+Procedure.i SdIsSdhc()
+  ProcedureReturn sd_sdhc
+EndProcedure
+
+; 1 if the card answered CMD8, i.e. it is version 2.00 or later.
+Procedure.i SdIsV2()
+  ProcedureReturn sd_v2
+EndProcedure
+
+Procedure.i SdOcr()
+  ProcedureReturn sd_ocr
+EndProcedure
+
+Procedure.i SdRca()
+  ProcedureReturn sd_rca
+EndProcedure
+
+; Capacity in 512-byte blocks, or 0 for "not decoded" - see
+; sd_DecodeCsd. Zero is not an error and does not stop a read.
+Procedure.i SdBlockCount()
+  ProcedureReturn sd_blocks
+EndProcedure
+
+; The Host Controller Version spec field: 0 = 1.00, 1 = 2.00, 2 = 3.00.
+Procedure.i SdHostVersion()
+  ProcedureReturn sd_ver
+EndProcedure
+
+Procedure.i SdHostVendor()
+  ProcedureReturn sd_vendor
+EndProcedure
+
+Procedure.i SdCaps0()
+  ProcedureReturn sd_caps0
+EndProcedure
+
+Procedure.i SdCaps1()
+  ProcedureReturn sd_caps1
+EndProcedure
+
+; The base clock actually used, in kHz - from SdSetBaseClockKhz if the
+; caller supplied one, otherwise out of the Capabilities register.
+Procedure.i SdBaseClockKhz()
+  ProcedureReturn sd_baseKhz
+EndProcedure
+
+; The SD bus clock actually programmed, in kHz. THIS IS THE ONLY HONEST
+; NUMBER for what the bus is running at; the constants above are what
+; was asked for.
+Procedure.i SdClockKhz()
+  ProcedureReturn sd_clkKhz
+EndProcedure
+
+; The divisor N currently in CONTROL1.
+Procedure.i SdDivisor()
+  ProcedureReturn sd_divisor
+EndProcedure
+
+; The CID and CSD, word by word, as the controller delivered them -
+; i.e. card bits [b+8] in response bit [b], see sd_Command. n is 0..3.
+Procedure.i SdCid(n.i)
+  Select n
+    Case 0
+      ProcedureReturn sd_cid0
+    Case 1
+      ProcedureReturn sd_cid1
+    Case 2
+      ProcedureReturn sd_cid2
+    Case 3
+      ProcedureReturn sd_cid3
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i SdCsd(n.i)
+  Select n
+    Case 0
+      ProcedureReturn sd_csd0
+    Case 1
+      ProcedureReturn sd_csd1
+    Case 2
+      ProcedureReturn sd_csd2
+    Case 3
+      ProcedureReturn sd_csd3
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  SdErrorText - the address of a NUL-terminated English sentence for
+;  SdLastError().
+;
+;  Print it with whatever PutS the MAIN file's UART library provides.
+;  The text names the STAGE, not the fix - the fix needs SdLastIntr()
+;  as well, and a driver that guessed at causes in a string would be
+;  wrong out loud.
+; ======================================================================
+Procedure.i SdErrorText()
+  Select sd_err
+    Case #SD_ERR_NONE
+      ProcedureReturn "sd: ok"
+    Case #SD_ERR_NO_CNTFRQ
+      ProcedureReturn "sd: CNTFRQ_EL0 is not a usable frequency - cannot bound any wait, nothing attempted"
+    Case #SD_ERR_NO_CONTROLLER
+      ProcedureReturn "sd: nothing answering as SDHCI at $FE340000 (SLOTISR_VER all-zero or all-ones)"
+    Case #SD_ERR_BAD_VERSION
+      ProcedureReturn "sd: host controller version field is not a defined SDHCI version - wrong device?"
+    Case #SD_ERR_NO_CAPS
+      ProcedureReturn "sd: Capabilities register all-zero or all-ones - wrong device?"
+    Case #SD_ERR_BASECLK
+      ProcedureReturn "sd: base clock unknown - Capabilities says 0, call SdSetBaseClockKhz first"
+    Case #SD_ERR_RESET
+      ProcedureReturn "sd: Software Reset For All never self-cleared"
+    Case #SD_ERR_CLOCK
+      ProcedureReturn "sd: Internal Clock Stable never came up"
+    Case #SD_ERR_INHIBIT
+      ProcedureReturn "sd: Command Inhibit never cleared - controller or card still busy"
+    Case #SD_ERR_CMD_TIMEOUT
+      ProcedureReturn "sd: command timed out - no response from the card"
+    Case #SD_ERR_CMD_ERROR
+      ProcedureReturn "sd: command error - see SdLastIntr for CRC / end bit / index"
+    Case #SD_ERR_CMD_STUCK
+      ProcedureReturn "sd: no Command Complete and no error bit - the controller is wedged"
+    Case #SD_ERR_NOCARD
+      ProcedureReturn "sd: no card answered - the slot is empty, or the card is at 1.8V and cannot be reset from here"
+    Case #SD_ERR_CMD8_ECHO
+      ProcedureReturn "sd: CMD8 answered but the check pattern or voltage field is wrong"
+    Case #SD_ERR_ACMD41_TMO
+      ProcedureReturn "sd: ACMD41 never reported power-up complete - see SdOcr"
+    Case #SD_ERR_CMD2
+      ProcedureReturn "sd: CMD2 ALL_SEND_CID failed"
+    Case #SD_ERR_CMD3
+      ProcedureReturn "sd: CMD3 SEND_RELATIVE_ADDR failed"
+    Case #SD_ERR_BAD_RCA
+      ProcedureReturn "sd: card published RCA 0, which cannot be selected"
+    Case #SD_ERR_CMD9
+      ProcedureReturn "sd: CMD9 SEND_CSD failed"
+    Case #SD_ERR_CMD7
+      ProcedureReturn "sd: CMD7 SELECT_CARD failed"
+    Case #SD_ERR_CMD16
+      ProcedureReturn "sd: CMD16 SET_BLOCKLEN failed"
+    Case #SD_ERR_NOT_READY
+      ProcedureReturn "sd: not initialised - SdInit did not succeed"
+    Case #SD_ERR_ALIGN
+      ProcedureReturn "sd: buffer is not 4-byte aligned"
+    Case #SD_ERR_NULL_BUF
+      ProcedureReturn "sd: null buffer"
+    Case #SD_ERR_DATA_TMO
+      ProcedureReturn "sd: buffer ready never arrived"
+    Case #SD_ERR_DATA_ERROR
+      ProcedureReturn "sd: data error - see SdLastIntr for CRC / end bit / data timeout"
+    Case #SD_ERR_XFER_TMO
+      ProcedureReturn "sd: Transfer Complete never arrived"
+    Case #SD_ERR_BUSY_TMO
+      ProcedureReturn "sd: the card's programming busy never ended"
+    Case #SD_ERR_CMD0
+      ProcedureReturn "sd: the controller would not accept CMD0 - controller or clock, not the card"
+  EndSelect
+  ProcedureReturn "sd: unknown error code"
+EndProcedure

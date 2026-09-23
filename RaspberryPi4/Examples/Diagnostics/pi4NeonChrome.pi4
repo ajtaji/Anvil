@@ -1,0 +1,701 @@
+; pi4NeonChrome.pi4 - THE WHOLE NEONARCADE CHROME KIT, ON THE HDMI
+; SCREEN, DRAWN BY V3D.
+;
+; DIAGNOSTIC. Does not ship.
+;
+; ======================================================================
+;  WHAT IS ON THE MONITOR
+; ======================================================================
+;  A menu bar with six roots and one of them OPEN, showing a drop-down
+;  with items, shortcuts, a check mark, a separator and a submenu; a
+;  tab strip with close boxes; a panel with a scrolled list and its
+;  scrollbar; a text field with a caret; a row of buttons, one of them
+;  hovered so its Neon_Glow halo is drawn; a horizontal scrollbar; a
+;  status strip; and - only because the engine has them and the brief
+;  is the whole engine - a convex fan and a line list in the corner.
+;
+;  EVERY PIXEL OF IT IS PUT THERE BY THE GPU. The A72 builds a control
+;  list and the V3D rasterises and blends it. display.pi4 is linked for
+;  the SURFACE ONLY: DisplayInit, DisplayBase, DisplayWidth. Not one
+;  pixel comes from it.
+;
+; ======================================================================
+;  THE MOUSE IS SYNTHETIC AND THAT IS THE POINT
+; ======================================================================
+;  There is no HID in this build. The pointer is placed by this program
+;  at a fixed position over the FILE menu's third row and the menu is
+;  opened by a synthetic click on the first frame, so the drop-down,
+;  the row hover, the submenu and the button glow are all EXERCISED
+;  DETERMINISTICALLY and come out the same on every run. A screen that
+;  needed somebody to wiggle a mouse to prove the hover path would not
+;  be a diagnostic.
+;
+; ======================================================================
+;  WHY THREE FRAMES
+; ======================================================================
+;  The menu is immediate mode with one frame of memory: a drop-down's
+;  width and height are MEASURED by the items that draw inside it and
+;  used to lay it out on the NEXT frame (GlUIChrome.pbi:739-770). So
+;  the first frame lays the panel out at a default size, the second at
+;  the measured one, and the third is identical to the second. All
+;  three are timed; the third is what is left on the screen, and the
+;  difference between the second and third times is how much of the
+;  frame is the menu settling.
+;
+;  The hover animations settle over the same three frames because
+;  Neon_Animate is frame-rate independent and dt is handed in.
+;
+; ======================================================================
+;  WHAT IS CHECKED, BECAUSE A PHOTOGRAPH IS NOT EVIDENCE
+; ======================================================================
+;  Six probe pixels at positions this program computes from the
+;  layout, each with the value the composition says it must hold:
+;  the ground, a panel body, a panel border line, a menu-bar ground, an
+;  open tab's accent underline, and a pixel INSIDE A GLYPH. Plus the
+;  primitive counts, the frame times, and the guard page.
+;
+;  THE GLYPH PIXEL IS THE INTERESTING ONE. It is the top-left set pixel
+;  of a capital "F" drawn at a known origin, and it must hold the text
+;  colour exactly. If text were being drawn but in the wrong place, or
+;  at the wrong scale, that pixel would hold the panel colour instead.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4NeonChrome.pi4 -t pi4 \
+;       --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;       -o _work/neonchrome.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#NC_ARENA       = $04000000
+#NC_ARENA_BYTES = $01000000
+#NC_POISON      = $A5A5A5A5
+
+; The synthetic pointer. Over the third row of the open FILE menu.
+#NC_MX = 120
+#NC_MY = 108
+
+; The layout.
+#NC_BARH   = 28
+#NC_TABY   = 28
+#NC_TABH   = 30
+#NC_LEFTX  = 12
+#NC_LEFTY  = 70
+#NC_LEFTW  = 380
+#NC_LEFTH  = 700
+#NC_MAINX  = 404
+#NC_MAINY  = 70
+#NC_MAINW  = 1100
+#NC_MAINH  = 700
+#NC_RIGHTX = 1516
+#NC_RIGHTY = 70
+#NC_RIGHTW = 392
+#NC_RIGHTH = 700
+
+#NC_LISTX  = 24
+#NC_LISTY  = 108
+#NC_LISTW  = 356
+#NC_LISTH  = 640
+#NC_ROWH   = 22
+
+#NC_BTNY   = 800
+#NC_BTNW   = 150
+#NC_BTNH   = 34
+#NC_BTNSTEP = 166
+
+; ======================================================================
+;  OUTPUT
+; ======================================================================
+Procedure PutS(*s)
+  UartWriteStr(*s)
+EndProcedure
+
+Procedure PutNl()
+  PrintNl()
+  UartDrain()
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  UartWrite(36)
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutPad(*name, width.i)
+  Define i.i
+  Define n.i
+  UartWriteStr("  ")
+  UartWriteStr(*name)
+  n = 0
+  i = 0
+  While PeekA(*name + i) <> 0
+    n = n + 1
+    i = i + 1
+  Wend
+  While n < width
+    UartWrite(32)
+    n = n + 1
+  Wend
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutPad(*name, 30)
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+Procedure RowDec(*name, v.i)
+  PutPad(*name, 30)
+  PrintDec(v)
+  PutNl()
+EndProcedure
+
+Procedure PutMs(us.i)
+  Define w.i
+  Define f.i
+  w = us / 1000
+  f = us - (w * 1000)
+  PrintDec(w)
+  UartWrite(46)
+  UartWrite(48 + (f / 100))
+  UartWrite(48 + ((f / 10) - ((f / 100) * 10)))
+  UartWrite(48 + (f - ((f / 10) * 10)))
+  UartWriteStr(" ms")
+EndProcedure
+
+Procedure PutErr(e.i)
+  If e = 0
+    PutS("OK")
+  Else
+    PutS("error ")
+    PrintDec(e)
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  THE PROBES
+; ======================================================================
+Global nProbe.i = 0
+Global nProbeOk.i = 0
+
+Procedure Probe(*name, x.i, y.i, want.i)
+  Define got.i
+  got = PeekN(Neon_SurfaceBase() + (y * Neon_SurfacePitch()) + (x * 4))
+  nProbe = nProbe + 1
+  PutPad(*name, 30)
+  PutHex(got, 8)
+  If got = want
+    nProbeOk = nProbeOk + 1
+    PutS("   OK")
+  Else
+    PutS("   WANTED ")
+    PutHex(want, 8)
+  EndIf
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  THE TEXT INPUT'S BUFFER. A caller-owned, zero terminated byte array.
+; ======================================================================
+Global Dim ncField.a[128]
+
+Procedure SetField(*s)
+  Define i.i
+  i = 0
+  While PeekA(*s + i) <> 0
+    ncField[i] = PeekA(*s + i)
+    i = i + 1
+    If i >= 127
+      Break
+    EndIf
+  Wend
+  ncField[i] = 0
+EndProcedure
+
+; ======================================================================
+;  THE SCREEN
+;
+;  A literal transcription of the composition the chrome kit produces.
+;  Nothing here reaches past Neon_*.
+; ======================================================================
+Global ncListSel.i = 6
+
+Procedure DrawScreen()
+  Define i.i
+  Define y.i
+  Define x.i
+  Define w.i
+  Define tab.i
+
+  ; ---- the ground ---------------------------------------------------
+  ; The engine has no glClear anywhere; the chrome paints a full
+  ; surface box (section 1.2 of the requirement note). Here the GPU's
+  ; own tile clear has already laid the ground colour down, and this
+  ; box is drawn ANYWAY so the composition is the engine's rather than
+  ; an optimisation of it.
+  Neon_Box(0, 0, Neon_SurfaceW(), Neon_SurfaceH(), Neon_C_Bg)
+
+  ; ---- the three panels ----------------------------------------------
+  Neon_Panel(#NC_LEFTX,  #NC_LEFTY,  #NC_LEFTW,  #NC_LEFTH,  "PROJECT",  Neon_C_Acc, 26)
+  Neon_Panel(#NC_MAINX,  #NC_MAINY,  #NC_MAINW,  #NC_MAINH,  "SOURCE",   Neon_C_Amb, 26)
+  Neon_Panel(#NC_RIGHTX, #NC_RIGHTY, #NC_RIGHTW, #NC_RIGHTH, "INSPECTOR", Neon_C_Grn, 26)
+
+  ; ---- the project list ----------------------------------------------
+  Neon_ListBegin(1, #NC_LISTX, #NC_LISTY, #NC_LISTW, #NC_LISTH, #NC_ROWH)
+  Neon_ListItem("RaspberryPi4", 0, 0, 1, "")
+  Neon_ListItem("Lib", 1, 0, 1, "")
+  Neon_ListItem("neon.pi4", 2, 0, 0, "4658")
+  Neon_ListItem("v3d.pi4", 2, 0, 0, "7355")
+  Neon_ListItem("v3dqpu.pi4", 2, 0, 0, "3421")
+  Neon_ListItem("display.pi4", 2, 0, 0, "4530")
+  Neon_ListItem("damage.pi4", 2, 1, 0, "1290")
+  Neon_ListItem("dma.pi4", 2, 0, 0, "2340")
+  Neon_ListItem("mailbox.pi4", 2, 0, 0, "1900")
+  Neon_ListItem("Examples", 1, 0, 1, "")
+  Neon_ListItem("Diagnostics", 2, 0, 1, "")
+  Neon_ListItem("pi4NeonBox.pi4", 3, 0, 0, "new")
+  Neon_ListItem("pi4NeonChrome.pi4", 3, 0, 0, "new")
+  Neon_ListItem("pi4V3dTri.pi4", 3, 0, 0, "1467")
+  Neon_ListItem("pi4V3dClear.pi4", 3, 0, 0, "1218")
+  Neon_ListItem("pi4NeonLiar.pi4", 3, 0, 0, "2560")
+  Neon_ListItem("01_GettingStarted", 2, 0, 1, "")
+  Neon_ListItem("blink.pi4", 3, 0, 0, "42")
+  Neon_ListItem("hello.pi4", 3, 0, 0, "31")
+  Neon_ListItem("04_Display", 2, 0, 1, "")
+  Neon_ListItem("chrome.pi4", 3, 0, 0, "512")
+  Neon_ListItem("Monitor", 1, 0, 1, "")
+  Neon_ListItem("anvil.pi4", 2, 0, 0, "1512")
+  Neon_ListItem("Reference", 1, 0, 1, "")
+  Neon_ListItem("v3d_packet.xml", 2, 0, 0, "1735")
+  Neon_ListItem("qpu_pack.c", 2, 0, 0, "2700")
+  Neon_ListItem("nir_to_vir.c", 2, 0, 0, "4990")
+  Neon_ListItem("v3dx_rcl.c", 2, 0, 0, "860")
+  Neon_ListItem("v3dx_emit.c", 2, 0, 0, "690")
+  Neon_ListItem("v3d_regs.h", 2, 0, 0, "520")
+  Neon_ListItem("Boards", 1, 0, 1, "")
+  Neon_ListItem("Raspberry_Pi_4.board", 2, 0, 0, "18")
+  Neon_ListEnd()
+
+  ; ---- the source panel ----------------------------------------------
+  y = #NC_MAINY + 40
+  Neon_ScissorSet(#NC_MAINX + 8, y, #NC_MAINW - 16, 420)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y,       "; neon.pi4 - the NeonArcade engine, rasterised by V3D", Neon_C_Faint)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 20,  "Procedure.i Neon_Box(x.i, y.i, w.i, h.i, colour.i)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 40,  "  first = neon_nVerts", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 60,  "  neon_Vertex(x,     y)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 80,  "  neon_Vertex(x,     y + h)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 100, "  neon_Vertex(x + w, y)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 120, "  neon_Vertex(x,     y + h)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 140, "  neon_Vertex(x + w, y + h)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 160, "  neon_Vertex(x + w, y)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 180, "  ProcedureReturn neon_Draw(4, first, 6, colour)", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 200, "EndProcedure", Neon_C_Text)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 240, "; SRC_ALPHA = 6, INV_SRC_ALPHA = 7, packet 84.", Neon_C_Amb)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 260, "; The blend is fixed function in the tile buffer and", Neon_C_Amb)
+  Neon_Text(#NEON_FONT_MONO, #NC_MAINX + 16, y + 280, "; the overdraw never reaches DRAM.", Neon_C_Amb)
+  Neon_ScissorClear()
+
+  ; the text field
+  Neon_Text(#NEON_FONT_SMALL, #NC_MAINX + 16, #NC_MAINY + 520, "FIND", Neon_C_Dim)
+  Neon_TextInput(2, #NC_MAINX + 16, #NC_MAINY + 540, 600, 30, @ncField[0], 128, "search this file")
+
+  ; the buttons. Number 2 is under the synthetic pointer only if the
+  ; pointer is over it; it is not, so its glow comes from the hover
+  ; animation being driven to 1 by the deliberate hover below.
+  x = #NC_MAINX + 16
+  Neon_Button(x,                     #NC_BTNY, #NC_BTNW, #NC_BTNH, "BUILD",   1, 1)
+  Neon_Button(x + #NC_BTNSTEP,       #NC_BTNY, #NC_BTNW, #NC_BTNH, "RUN",     0, 1)
+  Neon_Button(x + (#NC_BTNSTEP * 2), #NC_BTNY, #NC_BTNW, #NC_BTNH, "STEP",    0, 1)
+  Neon_Button(x + (#NC_BTNSTEP * 3), #NC_BTNY, #NC_BTNW, #NC_BTNH, "STOP",    0, 0)
+  Neon_Button(x + (#NC_BTNSTEP * 4), #NC_BTNY, #NC_BTNW, #NC_BTNH, "UPLOAD",  0, 1)
+  Neon_Button(x + (#NC_BTNSTEP * 5), #NC_BTNY, #NC_BTNW, #NC_BTNH, "MONITOR", 0, 1)
+
+  ; a horizontal scrollbar under the source
+  Neon_ScrollBarH(3, #NC_MAINX + 8, #NC_MAINY + 680, #NC_MAINW - 16, 12, 400, 120)
+
+  ; ---- the inspector -------------------------------------------------
+  y = #NC_RIGHTY + 40
+  Neon_Text(#NEON_FONT_SMALL, #NC_RIGHTX + 16, y,      "SURFACE", Neon_C_Dim)
+  Neon_Text(#NEON_FONT_UI,    #NC_RIGHTX + 16, y + 22, "1920 x 1080, 32 bpp", Neon_C_Text)
+  Neon_Text(#NEON_FONT_SMALL, #NC_RIGHTX + 16, y + 56, "RASTERISER", Neon_C_Dim)
+  Neon_Text(#NEON_FONT_UI,    #NC_RIGHTX + 16, y + 78, "V3D 4.2, 510 tiles", Neon_C_Text)
+  Neon_Text(#NEON_FONT_SMALL, #NC_RIGHTX + 16, y + 112, "BLEND", Neon_C_Dim)
+  Neon_Text(#NEON_FONT_UI,    #NC_RIGHTX + 16, y + 134, "SRC_ALPHA / INV_SRC_ALPHA", Neon_C_Grn)
+  Neon_Text(#NEON_FONT_SMALL, #NC_RIGHTX + 16, y + 168, "DRAW CALLS THIS FRAME", Neon_C_Dim)
+
+  ; A convex fan and a line list. Neither is used by the IDE - GlUI.pbi
+  ; draws DIP LEDs and a cursor with them - and both are here because
+  ; the brief is the whole engine.
+  NeonFanBegin()
+  NeonFanPoint(#NC_RIGHTX + 200, y + 240)
+  NeonFanPoint(#NC_RIGHTX + 260, y + 220)
+  NeonFanPoint(#NC_RIGHTX + 300, y + 260)
+  NeonFanPoint(#NC_RIGHTX + 280, y + 320)
+  NeonFanPoint(#NC_RIGHTX + 220, y + 330)
+  NeonFanPoint(#NC_RIGHTX + 180, y + 290)
+  NeonFanEnd(Neon_C_Vio)
+
+  NeonLinesBegin()
+  i = 0
+  While i < 8
+    NeonLine(#NC_RIGHTX + 20, y + 240 + (i * 12), #NC_RIGHTX + 150, y + 250 + (i * 8))
+    i = i + 1
+  Wend
+  NeonLinesEnd(Neon_C_Red)
+
+  ; ---- the status strip ----------------------------------------------
+  Neon_Box(0, Neon_SurfaceH() - 26, Neon_SurfaceW(), 26, Neon_C_Head)
+  Neon_Box(0, Neon_SurfaceH() - 26, Neon_SurfaceW(), 1, Neon_C_Line)
+  Neon_Text(#NEON_FONT_SMALL, 12, Neon_SurfaceH() - 21, "V3D 4.2  -  every pixel on this screen was rasterised and blended by the GPU", Neon_C_Dim)
+  Neon_TextRight(#NEON_FONT_SMALL, Neon_SurfaceW() - 12, Neon_SurfaceH() - 21, "PureMetal Forge", Neon_C_Acc)
+
+  ; ---- the tab strip -------------------------------------------------
+  tab = Neon_TabStrip(4, 0, #NC_TABY, Neon_SurfaceW(), #NC_TABH, "neon.pi4|v3d.pi4|v3dqpu.pi4|pi4NeonChrome.pi4|display.pi4", 0, 1)
+
+  ; ---- the menu bar, LAST, so its drop-down is on top -----------------
+  Neon_MenuBarBegin(0, 0, Neon_SurfaceW(), #NC_BARH)
+
+  If Neon_MenuBegin("FILE") <> 0
+    Neon_MenuItem("New",          "Ctrl+N",       1, 0)
+    Neon_MenuItem("Open...",      "Ctrl+O",       1, 0)
+    Neon_MenuItem("Save",         "Ctrl+S",       1, 0)
+    Neon_MenuItem("Save As...",   "Ctrl+Shift+S", 1, 0)
+    Neon_MenuSeparator()
+    Neon_MenuItem("Word Wrap",    "",             1, 1)
+    Neon_MenuItem("Line Numbers", "",             1, 1)
+    Neon_MenuSeparator()
+    If Neon_SubMenuBegin("Recent") <> 0
+      Neon_MenuItem("neon.pi4",         "", 1, 0)
+      Neon_MenuItem("v3d.pi4",          "", 1, 0)
+      Neon_MenuItem("v3dqpu.pi4",       "", 1, 0)
+      Neon_MenuItem("pi4V3dTri.pi4",    "", 1, 0)
+      Neon_MenuItem("pi4NeonLiar.pi4",  "", 1, 0)
+    EndIf
+    Neon_SubMenuEnd()
+    Neon_MenuSeparator()
+    Neon_MenuItem("Close",        "Ctrl+W",       1, 0)
+    Neon_MenuItem("Exit",         "Alt+F4",       0, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  If Neon_MenuBegin("EDIT") <> 0
+    Neon_MenuItem("Undo", "Ctrl+Z", 1, 0)
+    Neon_MenuItem("Redo", "Ctrl+Y", 1, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  If Neon_MenuBegin("VIEW") <> 0
+    Neon_MenuItem("Zoom In",  "Ctrl++", 1, 0)
+    Neon_MenuItem("Zoom Out", "Ctrl+-", 1, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  If Neon_MenuBegin("BUILD") <> 0
+    Neon_MenuItem("Compile", "F7", 1, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  If Neon_MenuBegin("TOOLS") <> 0
+    Neon_MenuItem("Options", "", 1, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  If Neon_MenuBegin("HELP") <> 0
+    Neon_MenuItem("About", "", 1, 0)
+  EndIf
+  Neon_MenuEnd()
+
+  Neon_MenuBarEnd()
+EndProcedure
+
+; ======================================================================
+;  MAIN
+; ======================================================================
+Procedure.i Body()
+  Define r.i
+  Define i.i
+  Define n.i
+  Define t0.i
+  Define f1.i
+  Define f2.i
+  Define f3.i
+  Define guard.i
+
+  PutNl()
+  PutS("=== pi4NeonChrome - the NeonArcade chrome kit on V3D ===")
+  PutNl()
+  PutNl()
+
+  If TimerInit() = 0
+    PutS("!! the architectural counter is not running - times read 0")
+    PutNl()
+  EndIf
+
+  If MailboxInit() = 0
+    PutS("verdict: NO MAILBOX")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If DisplayStandardTags() = 0
+    PutS("verdict: NO TAGS")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = DisplayInit(1920, 1080, 32)
+  If r <> 1
+    PutS("    DisplayInit rc ")
+    PrintDec(r)
+    PutS("  MailboxError ")
+    PrintDec(MailboxError())
+    PutNl()
+    PutS("verdict: NO SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("width", DisplayWidth())
+  RowDec("height", DisplayHeight())
+  RowHex("base", DisplayBase())
+  RowDec("pitch", DisplayPitch())
+
+  r = NeonArena(#NC_ARENA, #NC_ARENA_BYTES)
+  If r <> #NEON_OK
+    PutS("verdict: ARENA")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonSurface(DisplayBase(), DisplayWidth(), DisplayHeight(), DisplayPitch())
+  If r <> #NEON_OK
+    PutS("verdict: SURFACE")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  r = NeonInit()
+  PutPad("NeonInit", 30)
+  PutErr(r)
+  PutNl()
+  If r <> #NEON_OK
+    RowDec("V3dError", V3dError())
+    PutS("verdict: NEONINIT")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  RowDec("tiles", V3dTilesX() * V3dTilesY())
+  RowDec("arena used", Neon_ArenaNeed())
+
+  NeonPalette()
+  NeonFontDefaults()
+  ; The chrome's UI face at scale 1 is display.pi4's 8 x 16 cell; the
+  ; source view uses the same cell and is called mono because the
+  ; engine's is. Bold is the same cell ORed with itself shifted one.
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  SetField("Neon_Box")
+  NeonAnimReset()
+  NeonStateReset()
+  PutNl()
+
+  ; The guard.
+  i = 0
+  While i < 1024
+    PokeN(Neon_GuardAddr() + (i * 4), #NC_POISON)
+    i = i + 1
+  Wend
+
+  ; Poison the surface so a frame that draws nothing is obvious.
+  n = Neon_SurfaceH()
+  i = 0
+  While i < n
+    DspRowFill32(Neon_SurfaceBase() + (i * Neon_SurfacePitch()), Neon_SurfaceW(), #NC_POISON)
+    i = i + 1
+  Wend
+
+  ; ------------------------------------------------------------------
+  ;  THREE FRAMES.
+  ;
+  ;  Frame 1 opens the menu with a synthetic click and measures the
+  ;  drop-down. Frames 2 and 3 lay it out at the measured size. dt is
+  ;  handed in as 16 ms so the hover animations advance the way they
+  ;  would at 60 frames a second.
+  ; ------------------------------------------------------------------
+  PutS("the frames")
+  PutNl()
+  UartDrain()
+
+  ; Frame 1 - the click that opens FILE. The pointer is on the menu bar
+  ; over the first root while the click happens.
+  t0 = Micros()
+  NeonFrameBegin(Neon_C_Bg)
+  Neon_ChromeBeginFrame(40, 14, 1, 0, 0, 0, 16)
+  DrawScreen()
+  Neon_ChromeEndFrame()
+  NeonFrameEnd()
+  f1 = Micros() - t0
+
+  ; Frame 2 - the pointer moves down into the drop-down, no button.
+  t0 = Micros()
+  NeonFrameBegin(Neon_C_Bg)
+  Neon_ChromeBeginFrame(#NC_MX, #NC_MY, 0, 0, 0, 0, 16)
+  DrawScreen()
+  Neon_ChromeEndFrame()
+  NeonFrameEnd()
+  f2 = Micros() - t0
+
+  ; Frame 3 - identical to frame 2. This is what stays on the screen.
+  t0 = Micros()
+  NeonFrameBegin(Neon_C_Bg)
+  Neon_ChromeBeginFrame(#NC_MX, #NC_MY, 0, 0, 0, 0, 16)
+  DrawScreen()
+  Neon_ChromeEndFrame()
+  NeonFrameEnd()
+  f3 = Micros() - t0
+
+  PutPad("frame 1, measuring", 30)
+  PutMs(f1)
+  PutNl()
+  PutPad("frame 2, laid out", 30)
+  PutMs(f2)
+  PutNl()
+  PutPad("frame 3, steady state", 30)
+  PutMs(f3)
+  PutNl()
+  RowDec("draw calls", Neon_Draws())
+  RowDec("boxes", Neon_Boxes())
+  RowDec("glyphs", Neon_Glyphs())
+  RowDec("glyph rectangles", Neon_Runs())
+  RowDec("vertices", Neon_Verts())
+  RowDec("primitives the clip dropped", Neon_Clipped())
+  RowDec("bin list bytes", V3dClLen())
+  RowDec("us in FrameBegin", Neon_UsBegin())
+  RowDec("us in the cache clean", Neon_UsClean())
+  RowDec("us in the binner", Neon_UsBin())
+  RowDec("us in the renderer", Neon_UsRender())
+  RowDec("V3D clock, applied", V3dClockApplied())
+  RowDec("V3D clock, measured", V3dClockMeasured())
+  RowDec("Neon_Error", Neon_Error())
+  RowDec("state table overflowed", Neon_StateFull())
+  RowHex("bin ERR_STAT", V3dBinErrStat())
+  RowHex("render ERR_STAT", V3dRenderErrStat())
+  RowHex("bin MMU_VIO_ADDR", V3dBinVioAddr())
+  RowHex("render MMU_VIO_ADDR", V3dRenderVioAddr())
+  RowDec("OOM events", V3dBinOomCount())
+  PutNl()
+
+  ; ------------------------------------------------------------------
+  ;  THE PROBE PIXELS
+  ; ------------------------------------------------------------------
+  PutS("probe pixels")
+  PutNl()
+  ; The ground, in a corner nothing else touches.
+  Probe("ground at (4, 1040)", 4, 1040, Neon_C_Bg)
+  ; The left panel's body, below its header and inside its border.
+  Probe("panel body", #NC_LEFTX + 200, #NC_LEFTY + 690, Neon_C_Panel)
+  ; The left panel's left border line.
+  Probe("panel border", #NC_LEFTX, #NC_LEFTY + 400, Neon_C_Line)
+  ; The menu bar's ground, to the right of every root tab.
+  Probe("menu bar ground", 1400, 6, Neon_C_Head)
+  ; The status strip.
+  Probe("status strip", 900, 1070, Neon_C_Head)
+  ; THE LIST WELL, AND THE FIRST VERSION OF THIS PROBE WAS WRONG.
+  ; It asked at (#NC_LISTX + 2, #NC_LISTY + 2) and read $FF193543 where
+  ; it wanted the list ground. That pixel is UNDER THE OPEN FILE
+  ; DROP-DOWN, which starts at y = 28 and is about four hundred pixels
+  ; tall, and $FF193543 is exactly Neon_Mul3(Neon_C_Acc, 28, 28, 32) -
+  ; (25, 53, 67) - the hovered menu row's accent wash, to the unit.
+  ; The composition was right and the probe was wrong.
+  ;
+  ; So it is now TWO probes, and the pair is worth more than the one
+  ; was: the row wash where the drop-down covers the list, which proves
+  ; a derived palette product and the drop-down's compositing at once,
+  ; and the list ground BELOW the drop-down, which is what the original
+  ; probe meant to ask.
+  Probe("hovered menu row over the list", #NC_LISTX + 2, #NC_LISTY + 2, Neon_Mul3(Neon_C_Acc, 28, 28, 32))
+  Probe("list well, below the drop-down", #NC_LISTX + 2, #NC_LISTY + #NC_LISTH - 6, Neon_C_ListBg)
+
+  ; GLYPH PIXELS, AND THE EXPECTATIONS ARE READ OUT OF THE FONT BLOB
+  ; RATHER THAN GUESSED. The status strip's first character is "V",
+  ; drawn at x = 12, y = height - 21, and display.pi4:4588 gives its
+  ; sixteen rows:
+  ;
+  ;   row 0-2  $00 $00 $00                blank
+  ;   row 3    $C2  1100 0010             columns 0, 1, 6
+  ;   row 4    $42  0100 0010             columns 1, 6
+  ;   row 5    $46  0100 0110             columns 1, 5, 6
+  ;   row 6    $64  0110 0100             columns 1, 2, 5
+  ;   row 7-8  $24  0010 0100             columns 2, 5
+  ;   row 9    $3C  0011 1100             columns 2, 3, 4, 5
+  ;   row 10-11 $18 0001 1000             columns 3, 4
+  ;   row 12-15 $00                       blank
+  ;
+  ; So five probes: two that must be ink, two that must be the strip's
+  ; own ground because they are inside the glyph's cell and NOT set,
+  ; and one on the blank top row - which is the one that catches a
+  ; decomposition that painted whole cells instead of runs.
+  Probe("glyph V row3 col1, ink", 13, Neon_SurfaceH() - 18, Neon_C_Dim)
+  Probe("glyph V row9 col3, ink", 15, Neon_SurfaceH() - 12, Neon_C_Dim)
+  Probe("glyph V row3 col3, hollow", 15, Neon_SurfaceH() - 18, Neon_C_Head)
+  Probe("glyph V row11 col0, hollow", 12, Neon_SurfaceH() - 10, Neon_C_Head)
+  Probe("glyph V row0 col1, blank", 13, Neon_SurfaceH() - 21, Neon_C_Head)
+  PutNl()
+
+  guard = 0
+  i = 0
+  While i < 1024
+    If PeekN(Neon_GuardAddr() + (i * 4)) <> #NC_POISON
+      guard = guard + 1
+    EndIf
+    i = i + 1
+  Wend
+  RowDec("probe pixels", nProbe)
+  RowDec("probe pixels right", nProbeOk)
+  RowDec("guard words touched", guard)
+  PutNl()
+
+  If guard <> 0
+    PutS("verdict: GUARD TOUCHED")
+    PutNl()
+    ProcedureReturn 0
+  EndIf
+  If nProbeOk <> nProbe
+    PutS("verdict: A PROBE PIXEL IS WRONG - look at the WANTED lines")
+    PutNl()
+    ProcedureReturn nProbeOk
+  EndIf
+  PutS("verdict: OK - the chrome kit is on the screen, drawn by V3D")
+  PutNl()
+  ProcedureReturn Neon_Draws()
+EndProcedure
+
+; ======================================================================
+;  THE WRAPPER THAT HANDS THE GPU BACK.
+;
+;  Main() is a wrapper and Body() is the program, for one reason:
+;  Body() has a dozen early returns and EVERY ONE of them has to put
+;  the V3D MMU back before the monitor gets control again. Measured on
+;  the board, 2026-08-28: a payload that left the MMU enabled with its
+;  own page table killed the VideoCore firmware's mailbox service, and
+;  the NEXT payload could not get a surface - MAIL1_STA $80000008,
+;  full of requests nobody was consuming, cleared only by a reset.
+;  See NeonShutdown() in neon.pi4 for the full note.
+;
+;  A cleanup that has to be repeated at a dozen returns is a cleanup
+;  that will be missed at one of them.
+; ======================================================================
+Procedure.i Main()
+  Define rc.i
+  rc = Body()
+  NeonShutdown()
+  ProcedureReturn rc
+EndProcedure

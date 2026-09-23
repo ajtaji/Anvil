@@ -1,0 +1,1015 @@
+; ======================================================================
+;  qstubs_q.pi4 - Arduino UNO Q: the seams the Q does not have yet.
+;
+;  WHAT THIS FILE IS, AND WHAT IT IS NOT.
+;
+;  Anvil's capability model (Anvil/Hal/hal.pbi) is a RUN-TIME gate, not a
+;  compile-time one, and that is deliberate: there is no CompilerIf on a
+;  chip name anywhere in the core, and a command is compiled once for
+;  every board and degrades through RequireCap(). The consequence for a
+;  board that lacks a hardware group is exact and unavoidable: setting
+;  #CAP_USB = 0 makes the `usb` command refuse in a whole sentence, but
+;  the file Anvil/Core/usb_cmd.pbi still NAMES thirty-odd HwUsb*
+;  procedures, and an undefined call is a hard compile error. So the
+;  procedures must exist to link, even though the gate means not one of
+;  them will ever be reached.
+;
+;  That is what this file is. Every procedure below is the honest
+;  "absent" answer for a group the Q has no backend for, using the
+;  portable vocabulary hal.pi4 fixes: -1 is a getter's bad-argument /
+;  unavailable answer, 0 is a count or a false, and the error-text
+;  procedures return a whole sentence rather than an empty string.
+;
+;  IT IS NOT A PRETEND BACKEND. None of these touches a register, none
+;  claims a device, and every family they belong to is gated 0 in
+;  board.pi4, so the operator gets RequireCap's refusal and never one of
+;  these values. If a stub is ever reached it means a capability was
+;  declared 1 without a backend behind it, which is the bug this
+;  arrangement is designed to make loud rather than silent - so the
+;  reachable ones say so in their answer.
+;
+;  WHEN A REAL BACKEND ARRIVES it replaces the matching block here and
+;  the board's #CAP_ flag goes to 1 in the same commit. Nothing else
+;  changes; that is the whole point of the seam.
+;
+;  This file also carries the SMALL PORTABLE PIECES the core needs that
+;  happen to live in Pi-4 files today - the architectural timer wrappers,
+;  and the screen/keyboard/wifi no-ops the shared line editor calls.
+;  Those are marked separately below, because they are a different kind
+;  of thing from a missing driver.
+;
+;  REQUIRES: qefi_q.pi4, qcon_q.pi4, memmap_q.pi4, hwtimer_q.pi4 first.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Constants the shared core expects a board to name.
+; ----------------------------------------------------------------------
+
+; #MON_STACK MOVED TO memmap_q.pi4 ON 2026-09-08. It is a memory-map
+; constant and it belongs with the memory map; it was here only because
+; this file was where the board's answers to the core lived. What forced
+; the move is that HwMonStack() became part of the map seam - the core
+; asks the board for the stack top the same way it asks for the monitor's
+; extent - and the two Q proof harnesses (tools/qcore_emu_check.pi4 and
+; ArduinoQ/Examples/Diagnostics/anvilqcoreproof.pi4) include memmap_q.pi4
+; and NOT this file, so a map constant living here could not be answered
+; by them. This signpost stays so nobody re-adds the line and ends up
+; with two definitions.
+
+; Banner() prints the console's base address. There is no MMIO UART in
+; this console - it is the firmware's EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL -
+; so this names the protocol's own base instead, resolved at run time.
+; Zero at compile time; Banner reads the live value through gQConOut.
+#UART_BASE   = 0
+
+; uptime.pi4 reads a boot-count cell that RaspberryPi4/Lib/safety.pi4
+; maintains across resets. The Q has no such cell (its resets go through
+; UEFI ResetSystem and its DRAM is not preserved), so the magic can never
+; match and uptime.pi4 reports "not available" rather than a wrong number.
+#SAFETY_COUNT_ADDR = $63AF0000     ; inside the nominal monitor data window
+#SAFETY_MAGIC      = $00000000     ; can never match - the count is absent
+
+; ----------------------------------------------------------------------
+;  Globals the shared line editor and commands read, which live in
+;  RaspberryPi4/Board/display_globals.pi4 on the Pi 4.
+; ----------------------------------------------------------------------
+Global gMouseTried.i = 1     ; 1 = "already tried", so ReadLine never asks
+Global gKbdH.i = 0           ; no USB HID keyboard handle on this board
+Global gScreen.i = 0         ; no framebuffer: the probe found no GOP
+Global gLastCR.i = 0         ; the line editor's CR/LF de-duplication state
+Global gBootTicks.i = 0      ; CNTPCT at entry, set by Main()
+Global gBase.i = 0           ; the `base` command's address base
+Global gMbx.i = 0            ; no VideoCore mailbox on a Qualcomm part
+
+; ======================================================================
+;  PORTABLE PIECES - not stubs. Real implementations that happen to live
+;  in Pi-4 files today.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Ticks / TickHz / TimerInit - the ARMv8 architectural timer.
+;
+;  This is genuinely architectural, not Pi-4 hardware: CNTPCT_EL0 and
+;  CNTFRQ_EL0 are ARMv8-A system registers and the A53 has them exactly
+;  as the A72 does. hwtimer_q.pi4 already reads them (RdCntpct/RdCntfrq)
+;  and the core wants them under these three names, so these are three
+;  one-line renames, not a reimplementation.
+;
+;  CNTFRQ on this board is 19.2 MHz, read at run time rather than baked -
+;  confirmed on silicon by anvilqcoreproof.pi4, against the Pi 4's 54 MHz.
+;  A board that baked the constant would be wrong here by a factor of 2.8.
+; ----------------------------------------------------------------------
+Procedure.i Ticks()
+  ProcedureReturn RdCntpct()
+EndProcedure
+
+Procedure.i TickHz()
+  ProcedureReturn RdCntfrq()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  millis() - milliseconds since the counter's zero, under the name the
+;  core uses.
+;
+;  A FOURTH ONE-LINE RENAME, and it arrived with the `fan` command's
+;  tick, which needs a millisecond clock and must not name a board's
+;  library to get one. HwUptimeMs() in hwtimer_q.pi4 already computes
+;  exactly this and its own header says it is "the seam name the core
+;  asks for"; the core in fact asks for `millis`, which is what
+;  RaspberryPi4/Lib/timer.pi4 calls it, so this is the bridge between
+;  the two spellings and there is still only one division.
+;
+;  ITS BEHAVIOUR ON A STOPPED COUNTER MATCHES THE PI 4's: zero, always,
+;  rather than a plausible small number. Both sides of the seam
+;  returning a constant means a fan tick on a dead clock never fires
+;  rather than firing on every spin, which is the safe direction - the
+;  duty simply stops being re-evaluated and the last one stands.
+; ----------------------------------------------------------------------
+Procedure.i millis()
+  ProcedureReturn HwUptimeMs()
+EndProcedure
+
+Procedure.i TimerInit()
+  ; The architectural counter is always running on an ARMv8-A core and
+  ; UEFI has already been using it, so there is nothing to start. Report
+  ; failure only if it reads back as stopped, which would make every
+  ; timeout in the monitor meaningless and must not pass quietly.
+  If RdCntfrq() <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The line editor's polled hooks. Anvil/Core/parse.pbi's ReadLine()
+;  calls these on its inner spin so that a Pi 4 can service
+;  a framebuffer console, a USB keyboard and a Wi-Fi console while it
+;  waits for a byte. The Q has none of those three: the probe found no
+;  GOP, no HID is bound to ConIn, and there is no radio backend. They are
+;  no-ops here, and the two that RETURN a value return the "nothing"
+;  answer the editor requires - 0 and -1 respectively. Returning anything
+;  else feeds the line editor phantom keystrokes.
+; ----------------------------------------------------------------------
+Procedure ScreenPump()
+EndProcedure
+
+Procedure MouseTryAttach()
+EndProcedure
+
+Procedure MouseTick()
+EndProcedure
+
+; No touch surface is present on this board. The shared line editor calls
+; the service hook unconditionally; the honest board-specific answer is a
+; no-op, while #CAP_TOUCH remains zero and the ABI returns #SVC_ENOCAP.
+Procedure TouchTick()
+EndProcedure
+
+Procedure.i KeyboardChar()
+  ProcedureReturn 0            ; 0 = no character (parse.pbi:51)
+EndProcedure
+
+Procedure NetConsolePump()
+EndProcedure
+
+; A local byte cannot contend with a network-console session here: this
+; board has no network backend and therefore no remote owner to release.
+Procedure NetConsoleClaimLocal()
+EndProcedure
+
+; The prompt re-arms the network console's bound UDP port on every spin
+; (parse.pi4) so that a network command which bound a port of its own
+; does not leave the console deaf. There is no radio here.
+Procedure NetConsoleRearm()
+EndProcedure
+
+; The prompt also asks, on every spin, whether a link-local address this
+; board gave ITSELF has had to be surrendered - RFC 3927 section 2.5, a
+; SECOND conflicting ARP inside ten seconds, which must end in the
+; address being dropped rather than defended again. This board has no
+; network backend at all, so it can never have taken one; the NAME still
+; has to resolve, for the same reason TcpTick below does.
+Procedure NetConsoleLlTick()
+EndProcedure
+
+; DHCP has no interface or lease to service while #CAP_NET remains zero.
+Procedure NetDhcpTick()
+EndProcedure
+
+; The prompt also gives TCP a zero-slice poll on every spin, so a
+; connection opened by `tcp connect` finishes its handshake and its
+; retransmission timer runs while nobody is typing. This board has no
+; network backend at all (#CAP_NET = 0 in its board file), so there is
+; nothing to poll and the whole of TCP is compiled out of it - but the
+; NAME still has to resolve, because Anvil's core is one set of bytes
+; for every board and parse.pi4 is core.
+Procedure TcpTick()
+EndProcedure
+
+; There is no framebuffer/banner on this board, so the shared prompt's
+; animation service hook is an honest no-op.
+Procedure ScreenBannerTick()
+EndProcedure
+
+; The portable prompt calls one display service boundary. The Q console
+; has no animated banner, but still receives its normal pending output.
+Procedure ScreenServiceTick()
+  ScreenPump()
+EndProcedure
+
+Procedure.i NetConsoleGetc()
+  ProcedureReturn -1           ; <0 = idle (parse.pi4:60)
+EndProcedure
+
+Procedure WifiLinkTick()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Cache maintenance. memcmd.pi4 flushes a range before running code that
+;  was just written into it, so the instruction fetch sees the new bytes.
+;
+;  This is NOT a no-op and must not become one: it is a correctness
+;  requirement, and it is architectural AArch64 (dc cvau / ic ivau /
+;  the barriers), not BCM2711. Anvil enters at EL1 on the Q with UEFI's
+;  MMU and caches already on, and EL1 may execute these by default
+;  (SCTLR_EL1.UCI); the loop is written the way the architecture's
+;  cache-maintenance example is, reading the line size from CTR_EL0
+;  rather than assuming 64 bytes.
+; ----------------------------------------------------------------------
+;  TWO THINGS HERE ARE COPIED DELIBERATELY FROM THE PI 4'S VERSION
+;  (RaspberryPi4/Board/cache.pi4:48) BECAUSE BOTH ARE TRAPS ITS AUTHOR
+;  ALREADY FELL INTO AND DOCUMENTED:
+;
+;    * The address crosses into the ASM block in a GLOBAL, never a local.
+;      Inline assembly in this tree can only name `global_<lowercase>`;
+;      there is no local-variable symbol to reference, and every ASM block
+;      in RaspberryPi4/ and ArduinoQ/ does it this way.
+;    * The line is rounded down with a SHIFT, not `lo & $FFFFFFC0`. That
+;      mask is correct for a 32-bit address and silently catastrophic for
+;      a 64-bit one - it clears the whole top half too, so a flush of
+;      anything above 4 GB cleans lines four gigabytes away and looks
+;      entirely normal in a listing. The Q has DRAM up to 0x13FFFFFFF, so
+;      this is not hypothetical here the way it nearly was on the Pi 4.
+;
+;  64 bytes is the line size on the A53 for both L1I and L1D, the same as
+;  the A72's, so the Pi 4's constant carries over unchanged.
+Global gQFlushAddr.i
+
+Procedure QCacheLine()
+  ASM
+    adrp x9, global_gqflushaddr
+    add  x9, x9, #:lo12:global_gqflushaddr
+    ldr  x9, [x9]
+    dc cvau, x9
+    ic ivau, x9
+  EndASM
+EndProcedure
+
+Procedure CacheFlushRange(lo.i, hi.i)
+  Define a.i
+  If hi < lo
+    ProcedureReturn
+  EndIf
+  a = (lo >> 6) << 6
+  While a <= hi
+    gQFlushAddr = a
+    QCacheLine()
+    a = a + 64
+  Wend
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; ======================================================================
+;  ABSENT SEAMS - the honest "not on this board" answers.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  Autoboot. RaspberryPi4/Board/cache.pi4 keeps an autoboot entry point in
+;  a preserved memory cell. The Q has no preserved cell across a UEFI
+;  cold reset, so there is no autoboot address to remember and Banner()
+;  correctly reports none.
+; ----------------------------------------------------------------------
+Procedure.i AutoEntry()
+  ProcedureReturn 0            ; 0 = no autoboot entry armed
+EndProcedure
+
+Procedure AutoSet(a.i)
+  ; Nothing to store: there is nowhere on this board that survives the
+  ; reset. Silence here would be the wrong answer, so the command that
+  ; calls this says so - see CmdAuto's gate in board.pi4.
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RunAt(a) - branch to a loaded payload. This one is REAL and it works:
+;  the address is called through the same indirect-call shape every UEFI
+;  call in this port uses. It does not come back unless the payload
+;  returns, which is the Pi 4's contract too.
+;
+;  IT STANDS THE INPUT DISPATCHER DOWN FIRST, for the same reason
+;  RaspberryPi4/Board/cache.pi4's RunAt does: a payload takes the whole
+;  machine, and anything Anvil/Core/input_events.pbi is still holding
+;  when it goes - a byte already queued, a key-down whose release will
+;  never arrive - would be delivered to a line editor that is not
+;  running and could execute a command the moment the payload handed the
+;  prompt back. InputPayloadSuspend() cancels the queue and the captures
+;  and bumps the focus generation, so an event produced before the jump
+;  can no longer be popped after it.
+;
+;  THE TOUCH HALF OF THE PI 4's HANDOVER HAS NO COUNTERPART HERE and
+;  none is faked. That board calls TouchKeyboardPayloadSuspend(), which
+;  puts a soft keyboard away, gives back the console rows it reserved
+;  and withdraws its hit rectangle before ending in the same
+;  cancellation. The Q has no touch controller and no soft keyboard -
+;  TouchTick() above is a no-op and #CAP_TOUCH is 0 - so there is no
+;  layer to put away, and only the dispatcher itself is stood down.
+;
+;  AND NOTHING IS RESTORED AFTERWARDS, because nothing was suspended:
+;  the cancellation is a one-shot that leaves a #AIE_CANCEL in the ring
+;  and a new generation behind it. The Pi 4 has a Resume twin only
+;  because its keyboard layer carries a sticky flag; this board has no
+;  such flag to clear, and adding one to look symmetrical would be a
+;  state nothing reads.
+;
+;  THE ETHERNET HALF HAS NO COUNTERPART EITHER: the Pi 4 quiesces GENET
+;  around the jump because its receive DMA is a bus master writing into
+;  DRAM on its own schedule. Anvil drives no network hardware on the Q
+;  (#CAP_NET is 0 and the console pumps above are no-ops), so there is
+;  no bus master of Anvil's to stop.
+; ----------------------------------------------------------------------
+Procedure RunAt(a.i)
+  If a = 0
+    ProcedureReturn
+  EndIf
+  InputPayloadSuspend()
+  QCall(a, 0, 0, 0, 0, 0)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Settings. THESE STUBS ARE GONE, and their absence is the change.
+;
+;  This file used to carry a SettingsSet that always returned 0 and a
+;  SettingsSayWhyNot that said "this board has no settings store: Anvil
+;  reaches no writable medium on the Arduino UNO Q yet". Both were true
+;  and both are now false: the board builds Anvil/Core/settings.pbi, the
+;  real store, over the HwFile* seam in ArduinoQ/Board/hw_file_q.unoq,
+;  which reaches the EFI System Partition through the firmware's own file
+;  service. SETTINGS.TXT lives at \EFInvil\SETTINGS.TXT and survives a
+;  power cycle, which is what makes a persisted boot target possible here.
+;
+;  Left as a note rather than deleted, because a reader who remembers the
+;  stubs should find out what replaced them rather than conclude the
+;  settings support was lost in a merge.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  GPIO and I2C are NOT stubbed here any more.
+;
+;  Both groups now have REAL backends on this board and their #CAP_ flags
+;  are 1 (board.pi4):
+;      ArduinoQ/Lib/tlmm.unoq      + ArduinoQ/Board/hw_gpio_q.unoq
+;      ArduinoQ/Lib/geni_i2c.unoq  + ArduinoQ/Board/hw_i2c_q.unoq
+;
+;  The stubs that used to sit here returned -1 from every getter and said
+;  the Q had no pins at all. That was true of Anvil, and it was never true
+;  of the silicon: the QCM2290 TLMM has 127 GPIO lines at $00500000 and
+;  two of the six QUP serial engines are I2C masters with their protocol
+;  firmware already loaded by the boot chain. Both are reachable by plain
+;  MMIO from a UEFI application at EL1, which was measured rather than
+;  assumed.
+;
+;  They are deleted rather than left behind an #If, because two
+;  definitions of HwGpioCount() in one image is a duplicate-symbol error
+;  waiting to be resolved in whichever order the includes happen to land.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  MMC - #CAP_MMC = 0. The Q boots from eMMC through SDHCI-MSM v5 at
+;  mmc@4744000, and Anvil has no driver for it. HwMmcCanWrite() is the
+;  write gate hal.pi4 describes, and 0 here means `mmc write` refuses
+;  loudly instead of pretending.
+; ----------------------------------------------------------------------
+Procedure.i HwMmcUp()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcInfo()
+  ProcedureReturn 0            ; 0 = no card brought up
+EndProcedure
+Procedure.i HwMmcBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcBlockCount()
+  ProcedureReturn 0            ; 0 = unknown capacity
+EndProcedure
+Procedure.i HwMmcType()
+  ProcedureReturn #HW_MMC_UNKNOWN
+EndProcedure
+Procedure.i HwMmcReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcCanWrite()
+  ProcedureReturn 0            ; the write gate: refuse, never pretend
+EndProcedure
+Procedure.i HwMmcWriteBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwMmcErrorText()
+  ProcedureReturn "no SD or eMMC controller is driven on this board: the UNO Q's eMMC is behind a Qualcomm SDHCI-MSM controller Anvil has no driver for"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  USB host - #CAP_USB = 0. The Q's controller is a Synopsys DWC3
+;  (qcom,qcm2290-dwc3 at usb@4ef8800), not the Pi 4's PCIe + VL805 xHCI.
+;  DWC3's host side is xHCI-register-compatible so parts of the Pi 4
+;  stack may transfer later, but nothing is driven today. Speeds and
+;  kinds answer with hal.pi4's UNKNOWN/OTHER codes.
+; ----------------------------------------------------------------------
+Procedure.i HwUsbEnumerate()
+  ProcedureReturn 0            ; 0 = the host would not start
+EndProcedure
+Procedure.i HwUsbTree()
+  ProcedureReturn -1           ; -1 = the host is not up
+EndProcedure
+Procedure.i HwUsbHostPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHostVid()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostPid()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostLinkSpeed()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostLinkWidth()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostLinkSsc()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostFirmware()
+  ProcedureReturn -1
+EndProcedure
+; The raw link registers behind `usb link`. This board's USB host is a
+; DWC3 on an internal bus, not a PCI Express endpoint, so there is no link
+; to publish and no register to name. Zero rows is the honest answer and
+; the command prints the sentence that says so - it is not an error, and a
+; row count of zero must never be reported as a failure to read.
+Procedure.i HwUsbLinkRegCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkRegName(r.i)
+  ProcedureReturn "no such register on this board"
+EndProcedure
+Procedure.i HwUsbLinkRegNote(r.i)
+  ProcedureReturn ""
+EndProcedure
+Procedure.i HwUsbLinkRegValue(r.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbLinkFieldCount(r.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbLinkFieldName(r.i, f.i)
+  ProcedureReturn "no such field on this board"
+EndProcedure
+Procedure.i HwUsbLinkFieldValue(r.i, f.i)
+  ProcedureReturn -1
+EndProcedure
+; What is left of the device-listing seam after the USB protocol moved
+; into Anvil/Bus/usb_core.pbi: choosing WHICH device, and naming the
+; driver that holds an interface. This board drives no USB host this
+; monitor can reach, so a load always fails and no interface is claimed.
+; A listing handed that prints the sentence about an empty bus, which is
+; the truth here and not a failure to read.
+Procedure.i HwUsbDescLoad(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDescLoaded()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevRootPort(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevParent(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevIfaceDriver(i.i, ifnum.i)
+  ProcedureReturn "no driver"
+EndProcedure
+; The wait ledger behind `usb timing`. This board's USB host is not driven
+; by the xHCI stack that keeps the ledger, so there are no rows. Zero is
+; the honest answer and the command prints the sentence that says so; a row
+; count of zero is never reported as a failure to read.
+Procedure.i HwUsbWaitCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitName(i.i)
+  ProcedureReturn "no such wait on this board"
+EndProcedure
+Procedure.i HwUsbWaitVisits(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitTotalUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitWorstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitFirstUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitLastUs(i.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbWaitBytes()
+  ProcedureReturn 0
+EndProcedure
+Procedure HwUsbWaitLedgerReset()
+EndProcedure
+Procedure.i HwUsbStorageUas()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageConfigLen()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageProtocol()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbBurstOut()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbBurstIn()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbPortLinkState(p.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbPortPowerTimeouts(p.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHostVersion()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbPortCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbPortSpeed(p.i)
+  ProcedureReturn #HW_USB_SPEED_UNKNOWN
+EndProcedure
+Procedure.i HwUsbHubPresent()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubRootPort()
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbHubPorts()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortConnected(p.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbHubPortSpeed(p.i)
+  ProcedureReturn #HW_USB_SPEED_UNKNOWN
+EndProcedure
+Procedure.i HwUsbDevCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbDevSlot(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevKind(i.i)
+  ProcedureReturn #HW_USB_KIND_OTHER
+EndProcedure
+Procedure.i HwUsbDevSpeed(i.i)
+  ProcedureReturn #HW_USB_SPEED_UNKNOWN
+EndProcedure
+Procedure.i HwUsbDevRoute(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevAddress(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevVid(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevPid(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbDevClass(i.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i HwUsbStorageReady()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageVendor()
+  ProcedureReturn ""
+EndProcedure
+Procedure.i HwUsbStorageProduct()
+  ProcedureReturn ""
+EndProcedure
+Procedure.i HwUsbStorageBlockSize()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageBlockCount()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbStorageError()
+  ProcedureReturn "no USB host is driven on this board: the UNO Q's controller is a Synopsys DWC3, and Anvil has no backend for it yet"
+EndProcedure
+Procedure.i HwUsbReadAvailable()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlock(lba.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwUsbReadBlocks(lba.i, count.i, *buf)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Boot handoff - #CAP_BOOT_EL1 = 0.
+;
+;  This one is absent for a reason worth writing down rather than a
+;  missing driver. anvilqcoreproof.pi4 read CurrentEL on the board and
+;  got EL1 - UEFI runs this application at EL1, not EL2. Dropping a
+;  kernel to EL1 requires being AT EL2 to install one. On the Pi 4 Anvil
+;  runs at EL2 and can; here it cannot, and no amount of code fixes that
+;  from inside the image. #CAP_BOOT_EL1 = 0 is a statement about the
+;  execution context, not about unwritten work.
+;
+;  HwFirmwareDtb has no answer either: UEFI passes the device tree as a
+;  configuration table, not in x0, so the Pi 4's "the firmware put it in
+;  x0 at entry" does not hold. Reading it out of the configuration table
+;  is real future work; claiming a pointer we did not verify would be a
+;  silent wrong answer, so this returns 0 and the command says so.
+; ----------------------------------------------------------------------
+Procedure.i HwFirmwareDtb()
+  ProcedureReturn 0            ; 0 = no device tree pointer known
+EndProcedure
+
+Procedure HwBootToEl1(entry.i, dtb.i)
+  ; Unreachable: #CAP_BOOT_EL1 = 0 gates every caller. If it is ever
+  ; reached, a capability was declared without a backend, and saying so
+  ; is far better than branching somewhere with the wrong exception level.
+  PrintN("!! HwBootToEl1 was reached on a board that declares #CAP_BOOT_EL1 = 0.")
+  PrintN("   That is a bug in this board's capability declaration, not in the")
+  PrintN("   command. Nothing was done - Anvil runs at EL1 here (UEFI put it")
+  PrintN("   there), so it has no EL2 from which to install an EL1 for a kernel.")
+EndProcedure
+
+; ======================================================================
+;  HwMonLo() / HwMonHi() - where THIS monitor's image actually is.
+;
+;  THE CONSTANTS ABOVE ARE NOT THE ANSWER ON THIS BOARD, and the comment
+;  on them has always said so: #MON_LO/#MON_HI name "a 1 MB
+;  reserved-by-convention region" chosen so that a phase-1 proof could
+;  exercise HitsMonitor() and get a host-predictable result. That was
+;  honest for a run-and-report probe. It is not good enough for a
+;  BOOTLOADER, because HitsMonitor() is the test that stops a payload
+;  being placed on top of the running monitor - and against an invented
+;  region it would have refused an address the monitor is not at, and
+;  allowed the one it is.
+;
+;  UEFI knows. EFI_LOADED_IMAGE_PROTOCOL carries ImageBase and ImageSize
+;  for this very image, and ArduinoQ/Board/qefi_q.unoq reads them off the
+;  same structure it already resolves to reach the ESP.
+;
+;  WHEN THE FIRMWARE WILL NOT SAY, THE WHOLE OF DRAM IS REFUSED. That is
+;  deliberate and it is the safe direction. A monitor that cannot find
+;  out where it lives cannot prove a payload will miss it, and the
+;  choices are to refuse everything or to allow everything. Refusing
+;  everything makes `boot` stop working and say so; allowing everything
+;  makes it work right up until it places an image over the monitor and
+;  the board goes quiet. This project's whole philosophy picks the first.
+;  It has never been observed - the protocol resolved on the first board
+;  run - and the branch is here because "never observed" is not "cannot
+;  happen".
+; ======================================================================
+Procedure.i HwMonLo()
+  If QEfiImageKnown() <> 1
+    ProcedureReturn #Q_DRAM_BASE
+  EndIf
+  ProcedureReturn QEfiImageBase()
+EndProcedure
+
+Procedure.i HwMonHi()
+  If QEfiImageKnown() <> 1
+    ProcedureReturn #Q_DRAM_TOP - 1
+  EndIf
+  ProcedureReturn QEfiImageBase() + QEfiImageSize() - 1
+EndProcedure
+
+; ======================================================================
+;  HwPwm* / HwTemp* - #CAP_PWM IS 0 HERE, AND THIS IS WHY THERE IS NO
+;  BACKEND RATHER THAN A WEAK ONE.
+;
+;  THE MODULATOR. The QCM2290 has PWM, and Anvil cannot reach it. The
+;  general-purpose PWM on this part lives behind the same QUPv3 wrapper
+;  that made #CAP_I2C zero - and that wrapper is the MEASURED hang: an
+;  MMIO read of $04AC0004 stalled the interconnect and needed a physical
+;  power cycle (board.pi4's #CAP_I2C note, 2026-09-02). The LPG/PWM in
+;  the PMIC is further away still: it is reached over SPMI, and Anvil
+;  has no SPMI controller. What is left is TLMM, which ArduinoQ/Lib/
+;  tlmm.pi4 does drive - so a SOFTWARE toggle on a TLMM line would in
+;  fact work. It is not offered, and that is a deliberate refusal rather
+;  than an omission: this board's Arduino header belongs to the STM32U585
+;  and not to the QCM2290 (see #CAP_GPIO), so the pins a fan could
+;  plausibly be wired to are not the ones this software can reach, and
+;  offering a modulator on thirty on-board control lines would be
+;  offering to drive something soldered down.
+;
+;  THE THERMOMETER. The QCM2290 has a TSENS block. Anvil has no driver
+;  for it, and unlike the modulator that is a plain missing driver
+;  rather than a wall: TSENS is outside the QUP aperture and could be
+;  brought up. It has not been.
+;
+;  So the pair the `fan` command needs is absent in both halves and the
+;  capability is 0. THE DAY EITHER ARRIVES, this block is deleted, a
+;  real backend replaces it and the flag goes to 1 in the same commit -
+;  which is the whole point of the seam.
+;
+;  Every procedure below is the honest "absent" answer. None of them is
+;  reachable while #CAP_PWM is 0: RequireCap refuses `fan` before the
+;  first one, and FanBoot()'s own CompilerIf returns before the rest.
+;  They exist so the image LINKS, which is the price of compiling one
+;  command for every board instead of forking it - see the note at the
+;  top of this file.
+; ======================================================================
+Procedure.i HwPwmPinCount()
+  ProcedureReturn 0            ; no pin here is offered for a fan
+EndProcedure
+
+Procedure.i HwPwmPinAt(i.i)
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmPinIsHard(pin.i)
+  ProcedureReturn -1           ; not a pin this board will modulate
+EndProcedure
+
+Procedure.i HwPwmDefaultPin()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmHzDefault()
+  ; A frequency, not a zero, because FanBoot() reads this BEFORE its
+  ; capability check and stores it as the frequency a future pin would
+  ; use. Zero there would be a stored setting of zero hertz on a board
+  ; that later grows a modulator. 25000 is the four-wire fan standard
+  ; and is as good a placeholder as exists.
+  ProcedureReturn 25000
+EndProcedure
+
+Procedure.i HwPwmHzMin(pin.i)
+  ProcedureReturn 0            ; 0 from both bounds means "no range"
+EndProcedure
+
+Procedure.i HwPwmHzMax(pin.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPwmReservedReason(pin.i)
+  ; 0 means "not reserved", which is true and is also not the reason
+  ; `fan` refuses here - #CAP_PWM is. Answering with a sentence about
+  ; the QUP wrapper would put a pin-specific excuse in front of a
+  ; board-wide absence.
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPwmBegin(pin.i, hz.i)
+  ProcedureReturn #HW_PWM_PIN
+EndProcedure
+
+Procedure.i HwPwmDuty(permille.i)
+  ProcedureReturn #HW_PWM_STATE
+EndProcedure
+
+Procedure.i HwPwmEnd()
+  ProcedureReturn #HW_PWM_STATE
+EndProcedure
+
+Procedure HwPwmService()
+  ; Reached on EVERY spin of the prompt through FanTick, and it must
+  ; therefore be free. It is: FanTick returns on gFanArmed before
+  ; getting here, and gFanArmed can only be set by a command RequireCap
+  ; refuses. This body is the belt to that braces.
+EndProcedure
+
+Procedure.i HwPwmKind()
+  ProcedureReturn #HW_PWM_KIND_NONE
+EndProcedure
+
+Procedure.i HwPwmPin()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmHz()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwPwmDetail(which.i)
+  ProcedureReturn -1           ; -1 is "this board has no such number"
+EndProcedure
+
+Procedure.i HwTempMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+
+Procedure.i HwTempMaxMilliC()
+  ProcedureReturn #HW_TEMP_NONE
+EndProcedure
+
+Procedure.i HwTempSource()
+  ProcedureReturn #HW_TEMP_SRC_NONE
+EndProcedure
+
+; ======================================================================
+;  THE MAP SEAM - HwMonBytes / HwMonStack / HwMonRegion* / HwPay* /
+;  HwStageAddr. NEW 2026-09-08.
+; ----------------------------------------------------------------------
+;  The core stopped reading #PAY0_LO, #MON_DATA_LO, #MON_STACK and the
+;  rest out of a board file that day, and it stopped because of the Pi 4:
+;  the ruling is that Anvil is a kernel and may be any size, so the Pi 4's
+;  low payload window begins above whatever the image turned out to be
+;  and there is no constant to read. Once one board's map is arithmetic,
+;  every board has to be asked rather than read - which is the same
+;  argument that moved HwMonLo()/HwMonHi() here in the first place, and
+;  this board is the one that made THAT argument, because UEFI puts this
+;  image wherever it likes.
+;
+;  THE Q'S ANSWERS ARE MOSTLY THE CONSTANTS ABOVE, and that is fine: a
+;  seam exists so each board can answer however it can, not so that every
+;  board has to compute something. What matters is that the core asks.
+; ======================================================================
+
+; HOW BIG THIS IMAGE IS. UEFI knows exactly - ImageSize on the loaded-image
+; protocol - and qefi_q.pi4 already reads it for HwMonHi(). When the
+; protocol did not resolve, HwMonLo()/HwMonHi() refuse the whole of DRAM
+; (see their note above); the size that pair implies is reported here
+; unchanged rather than second-guessed, because a monitor that cannot say
+; where it is should not claim to know how big it is either.
+Procedure.i HwMonBytes()
+  ProcedureReturn HwMonHi() - HwMonLo() + 1
+EndProcedure
+
+Procedure.i HwMonStack()
+  ProcedureReturn #MON_STACK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The regions this monitor owns. TWO here, against the Pi 4's three: the
+;  image (from the firmware) and the nominal data window. There is no
+;  autoboot record on this board - autoboot is armed in raw DRAM that
+;  survives a reset, and this board's DRAM does not survive UEFI's
+;  ResetSystem (see #SAFETY_MAGIC above, which is zero for the same
+;  reason).
+; ----------------------------------------------------------------------
+Procedure.i HwMonRegions()
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwMonRegionLo(i.i)
+  Select i
+    Case 0 : ProcedureReturn HwMonLo()
+    Case 1 : ProcedureReturn #MON_DATA_LO
+  EndSelect
+  ; An index this board does not have: an empty range, which matches
+  ; nothing. See the same answer in RaspberryPi4/Board/memmap.pi4.
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwMonRegionHi(i.i)
+  Select i
+    Case 0 : ProcedureReturn HwMonHi()
+    Case 1 : ProcedureReturn #MON_DATA_HI
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwMonRegionSay(i.i)
+  Select i
+    Case 0
+      Print("this monitor's image, as the firmware placed it")
+    Case 1
+      Print("the nominal data window")
+    Default
+      Print("a region this board does not have")
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The payload windows. Constants on this board, and the reasoning is in
+;  memmap_q.pi4 beside them: a UEFI application's buffers are placed by
+;  the firmware anywhere in DRAM, so the windows span the whole confirmed
+;  DRAM extent and the running image is carved back out of them by
+;  HitsMonitor() through the region list above.
+; ----------------------------------------------------------------------
+Declare.i HwAddrCheck(lo.i, hi.i, forWrite.i)
+
+Procedure.i HwPayWindows()
+  ProcedureReturn 2
+EndProcedure
+
+Procedure.i HwPayLo(i.i)
+  Select i
+    Case 0 : ProcedureReturn #PAY0_LO
+    Case 1 : ProcedureReturn #PAY1_LO
+  EndSelect
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPayHi(i.i)
+  Select i
+    Case 0 : ProcedureReturn #PAY0_HI
+    Case 1 : ProcedureReturn #PAY1_HI
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+; Validate a PMF's complete initial stack area against this board's own
+; DRAM payload windows and reject overlap with the loaded UEFI image. The
+; Q has no Pi 4-style dedicated monitor stack corridor.
+Procedure.i HwPmfStackAllowed(lo.i, hi.i)
+  Define i.i
+  Define j.i
+  If lo > hi
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < HwPayWindows()
+    If lo >= HwPayLo(i) And hi <= HwPayHi(i)
+      ; Windows state reachable DRAM; the board address seam also refuses
+      ; known gaps and blocked ranges. A PMF initial stack is writable.
+      If HwAddrCheck(lo, hi, 1) <> #HW_ADDR_SAFE
+        ProcedureReturn 0
+      EndIf
+      j = 0
+      While j < HwMonRegions()
+        If lo <= HwMonRegionHi(j) And hi >= HwMonRegionLo(j)
+          ProcedureReturn 0
+        EndIf
+        j = j + 1
+      Wend
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Where a host should stage a file it is sending.
+;
+;  NOT #PAY0_LO, which is the base of DRAM and belongs to the firmware.
+;  #Q_FREE_LO is the confirmed contiguous free block, measured off the
+;  running board from /proc/iomem, and it is the only address on this
+;  part this project can hand a host without guessing.
+;
+;  IF THE IMAGE ITSELF IS IN THAT BLOCK - UEFI is free to put it there -
+;  the staging address moves above it, rounded up to a megabyte, for the
+;  same reason and by the same arithmetic the Pi 4 uses. It is not a
+;  special case bolted on: on both boards the staging address is the
+;  first megabyte-aligned address that is clear of the running monitor.
+; ----------------------------------------------------------------------
+Procedure.i HwStageAddr()
+  Define a.i
+  a = #Q_FREE_LO
+  If HwMonHi() >= a And HwMonLo() <= #Q_FREE_HI
+    a = ((HwMonHi() + 1 + $000FFFFF) / $00100000) * $00100000
+  EndIf
+  ProcedureReturn a
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE ENUMERATION WALK'S WITNESS - no walk on this board, so no rows.
+;
+;  `usb tree`'s failure report asks for the row count first and prints
+;  nothing at all when it is zero, so these stubs make the shared command
+;  compile and stay silent rather than needing a CompilerIf around it.
+;  The day a USB host is driven here, this is the seam that grows a real
+;  answer.
+; ----------------------------------------------------------------------
+Procedure.i HwUsbWalkCount()       : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkPort(i.i)     : ProcedureReturn -1 : EndProcedure
+Procedure.i HwUsbWalkIsHub(i.i)    : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkPortsc(i.i)   : ProcedureReturn -1 : EndProcedure
+Procedure.i HwUsbWalkStep(i.i)     : ProcedureReturn -1 : EndProcedure
+Procedure.i HwUsbWalkReached(i.i)  : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkErr(i.i)      : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkComp(i.i)     : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkSlot(i.i)     : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkUsbSts()      : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkUsbCmd()      : ProcedureReturn 0  : EndProcedure
+Procedure.i HwUsbWalkStepText(s.i) : ProcedureReturn "there is no enumeration walk on this board" : EndProcedure
+Procedure.i HwUsbWalkErrText(c.i)  : ProcedureReturn "there is no USB host driver on this board"  : EndProcedure

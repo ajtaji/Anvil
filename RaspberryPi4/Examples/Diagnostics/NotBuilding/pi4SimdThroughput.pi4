@@ -1,0 +1,296 @@
+; pi4SimdThroughput.pi4 - what the instructions this part HAS are
+;                          actually worth, against their scalar twins,
+;                          over 64 KB.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4SimdThroughput.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o simdthru.img
+;
+;   pmf> deadman 15
+;   pmf> map              <- it prints `stage a file at <stage>`. The
+;                            --load-addr above does not pin the image.
+;   pmf> b <stage> <len> <crc>
+;   pmf> run <stage>
+;
+; ----------------------------------------------------------------------
+; THIS IS A SEPARATE PROGRAM FROM pi4SimdSelfTest, AND THAT IS THE POINT
+; ----------------------------------------------------------------------
+; The self-test answers "are the two routines the same?" and can be run
+; anywhere, including in the reference interpreter, where its whole
+; transcript is meaningful. This one answers "how much faster?" and can
+; only be run on the part.
+;
+; It is not the same program with a flag, because a flag would put a
+; section into the self-test whose output is MEANINGLESS on the machine
+; the desk gate runs it on - and a transcript that is half evidence and
+; half noise is one somebody eventually quotes the wrong half of.
+;
+; IT ALSO CANNOT RUN UNDER THE REFERENCE INTERPRETER AT ALL, and that is
+; a fact rather than a choice: that model has no system registers, so
+; the `mrs` that reads the counter stops it with "unsupported A64 word".
+; The native model does decode `mrs`, but a tick count from a model that
+; does not model time is not a measurement of anything.
+;
+; ----------------------------------------------------------------------
+; WHAT IS MEASURED, AND THE TWO WAYS A NUMBER LIKE THIS MISLEADS
+; ----------------------------------------------------------------------
+; 16,384 elements - 65,536 bytes - which is big enough that the loop
+; dominates the call and the two counter reads, and small enough that
+; both buffers fit in the A72's 1 MB L2. So the ratio is about the
+; INSTRUCTION STREAM. Run it against DRAM instead and both routines wait
+; on the same memory, the ratio collapses towards one, and the honest
+; conclusion would be "this buffer does not fit in cache" rather than
+; anything about the vector unit.
+;
+; THE VECTOR PASS RUNS FIRST AND WARMS THE BUFFER. The scalar pass then
+; runs against the same warm cache. Running each cold would measure the
+; misses twice and attribute them to whichever routine paid.
+;
+; A WARM-UP PASS RUNS BEFORE EITHER IS TIMED, for the same reason.
+;
+; No verdict is printed and nothing here PASSES or FAILS. A speed-up is
+; not a correctness property, and giving it a threshold would mean
+; choosing a number somebody then has to keep true across two parts, two
+; cache states and every future change to the code generator.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/simd.pi4"
+
+; 8192 `.i` is 65,536 bytes is 16,384 32-bit elements.
+#SD_BENCH = 16384
+#SD_BENCH_B = 65536
+Global Dim th_a.i[8192]
+Global Dim th_b.i[8192]
+
+Procedure PutDec(v.i)
+  Define digits.i
+  Define i.i
+  Define n.i
+  Dim buf.i[24]
+  n = v
+  If n = 0
+    UartWrite(48)
+    ProcedureReturn
+  EndIf
+  If n < 0
+    UartWrite(45)
+    n = -n
+  EndIf
+  digits = 0
+  While n > 0
+    buf[digits] = n % 10
+    n = n / 10
+    digits = digits + 1
+  Wend
+  i = digits - 1
+  While i >= 0
+    UartWrite(48 + buf[i])
+    i = i - 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  One row. The ratio is printed to two decimal places, computed with
+;  integers, because a bare pair of tick counts is a division the reader
+;  has to do and will do wrong once.
+;
+;  THE FAST SIDE IS NAMED PER ROW AND NOT CALLED "VECTOR" THROUGHOUT.
+;  Three of these four rows really are Advanced SIMD against scalar
+;  code; the CRC row is a SCALAR instruction from the CRC32 extension
+;  against a software loop, and a column header that called it a vector
+;  would be the transcript telling its reader something untrue. The
+;  words are arguments for that reason.
+;
+;  BYTES PER SECOND IS PRINTED BESIDE THE TICKS because a tick count is
+;  only meaningful next to CNTFRQ, which is printed once at the top and
+;  then forgotten by anybody reading a row. The payload is #SD_BENCH_B
+;  bytes for every row - a blit touches that much in EACH of two
+;  buffers and a dot product reads that much from each, so this is the
+;  size of the operation and not the traffic it generates.
+; ----------------------------------------------------------------------
+Procedure Rate(bytes.i, ticks.i, hz.i)
+  ; bytes * hz / ticks, in 64-bit integers, printed as whole KB/s.
+  ; 65,536 * 54,000,000 is about 3.5e12 and .i is 64-bit here, so the
+  ; multiply cannot overflow; doing the divide first would throw away
+  ; every significant digit.
+  If ticks <= 0
+    UartWriteStr("--")
+    ProcedureReturn
+  EndIf
+  PutDec((bytes * hz) / (ticks * 1024))
+  UartWriteStr(" KB/s")
+EndProcedure
+
+Procedure Row(*label, *fastWord, *slowWord, which.i, hz.i)
+  Define t0.i
+  Define tv.i
+  Define ts.i
+  Define ratio.i
+
+  ; The warm-up. Not timed, and it is what makes the two timed passes
+  ; comparable rather than the first one paying for every cache miss.
+  If which = 1
+    SimdFill32(@th_a[0], $01020304, #SD_BENCH)
+  ElseIf which = 2
+    SimdBlit32(@th_a[0], @th_b[0], #SD_BENCH)
+  ElseIf which = 3
+    SimdDotF32B(@th_a[0], @th_b[0], #SD_BENCH)
+  Else
+    SimdCrc32(@th_a[0], #SD_BENCH * 4)
+  EndIf
+
+  t0 = Ticks()
+  If which = 1
+    SimdFill32(@th_a[0], $01020304, #SD_BENCH)
+  ElseIf which = 2
+    SimdBlit32(@th_a[0], @th_b[0], #SD_BENCH)
+  ElseIf which = 3
+    SimdDotF32B(@th_a[0], @th_b[0], #SD_BENCH)
+  Else
+    SimdCrc32(@th_a[0], #SD_BENCH * 4)
+  EndIf
+  tv = Ticks() - t0
+
+  t0 = Ticks()
+  If which = 1
+    SimdFill32Scalar(@th_a[0], $01020304, #SD_BENCH)
+  ElseIf which = 2
+    SimdBlit32Scalar(@th_a[0], @th_b[0], #SD_BENCH)
+  ElseIf which = 3
+    SimdDotF32ScalarB(@th_a[0], @th_b[0], #SD_BENCH)
+  Else
+    SimdCrc32Scalar(@th_a[0], #SD_BENCH * 4)
+  EndIf
+  ts = Ticks() - t0
+
+  UartWriteStr("  ")
+  UartWriteStr(*label)
+  UartWriteStr("  ")
+  UartWriteStr(*fastWord)
+  UartWriteStr(" ")
+  PutDec(tv)
+  UartWriteStr(" ticks (")
+  Rate(#SD_BENCH_B, tv, hz)
+  UartWriteStr("), ")
+  UartWriteStr(*slowWord)
+  UartWriteStr(" ")
+  PutDec(ts)
+  UartWriteStr(" ticks (")
+  Rate(#SD_BENCH_B, ts, hz)
+  UartWriteStr(")")
+  If tv > 0
+    ratio = (ts * 100) / tv
+    UartWriteStr(", speed-up ")
+    PutDec(ratio / 100)
+    UartWriteStr(".")
+    If (ratio % 100) < 10
+      UartWriteStr("0")
+    EndIf
+    PutDec(ratio % 100)
+    UartWriteStr("x")
+  Else
+    ; ZERO IS NOT AN INFINITE SPEED-UP, it is a counter that did not
+    ; move - either because the run was too short to resolve at this
+    ; tick rate or because there is no counter here at all. Say which
+    ; rather than printing a number.
+    UartWriteStr(". NO RATIO at tick 0: the vector pass took less than one tick, so this")
+    UartWriteNl()
+    UartWriteStr("          run is too short to resolve at this counter rate - raise #SD_BENCH.")
+  EndIf
+  UartWriteNl()
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define hz.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  ; THE BANNER NAMES ALL FOUR ROWS AND DOES NOT SAY "SIMD" FOR THEM ALL.
+  ; Three of the four are Advanced SIMD against scalar code; the CRC row
+  ; is a SCALAR instruction from the CRC32 extension against a software
+  ; loop, and a banner that called the whole table SIMD would be the
+  ; transcript's first line telling its reader something untrue.
+  UartWriteStr("pi4SimdThroughput - the instructions this part HAS, against their twins")
+  UartWriteNl()
+  UartWriteNl()
+
+  hz = TickHz()
+  UartWriteStr("CNTFRQ_EL0 reads ")
+  PutDec(hz)
+  UartWriteStr(" Hz")
+  If hz <> 54000000
+    ; The expected value, and why a difference matters: every tick count
+    ; below is in units of this, so a different rate silently rescales
+    ; the whole table. The RATIOS survive it; the tick counts do not.
+    UartWriteStr(" - NOT the 54000000 recorded for this board on 2026-08-24. The RATIOS")
+    UartWriteNl()
+    UartWriteStr("  below are unaffected, but every tick count is in units of this number.")
+  EndIf
+  UartWriteNl()
+
+  ; Fill both buffers with something. The dot product reads them as
+  ; binary32, and 1.0 is chosen so that no lane can overflow to infinity
+  ; over 16,384 accumulations - the number being measured is throughput,
+  ; and an infinity would make it a measurement of the special-case
+  ; paths instead.
+  i = 0
+  While i < #SD_BENCH
+    PokeL(@th_a[0] + i * 4, $3F800000)
+    PokeL(@th_b[0] + i * 4, $3F800000)
+    i = i + 1
+  Wend
+
+  UartWriteStr("16384 elements, 65536 bytes, both buffers inside the 1 MB L2:")
+  UartWriteNl()
+  Row("fill", "vector", "scalar", 1, hz)
+  Row("blit", "vector", "scalar", 2, hz)
+  Row("dot ", "vector", "scalar", 3, hz)
+  Row("crc ", "crc32 ", "bitwis", 4, hz)
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  WHAT THE CRC ROW IS AND IS NOT A MEASUREMENT OF.
+  ;
+  ;  It is the CRC32 instruction against the software CRC THIS TREE
+  ;  ACTUALLY USES - Anvil/Core/crc.pbi walks the reflected polynomial
+  ;  one bit at a time and builds no table, deliberately, for the
+  ;  reasons its own header gives. So the number answers "what would
+  ;  adopting the instruction buy the code we have".
+  ;
+  ;  IT IS NOT the instruction against the best possible software CRC.
+  ;  A 256-entry table consumes a byte in one lookup instead of eight
+  ;  iterations, so a table-driven CRC would be several times faster
+  ;  than this twin and the ratio against it would be correspondingly
+  ;  smaller. Nothing in this tree has one; writing one purely so our
+  ;  own ratio would look smaller would be measuring a program nobody
+  ;  runs, and leaving the caveat off would be quoting a ratio against
+  ;  the slowest reasonable baseline without saying so.
+  ; ------------------------------------------------------------------
+  UartWriteStr("The crc row is the instruction against THIS TREE'S software CRC, which is")
+  UartWriteNl()
+  UartWriteStr("bitwise and builds no table. A table-driven CRC would be several times")
+  UartWriteNl()
+  UartWriteStr("faster than that twin, so read the crc ratio as what the instruction saves")
+  UartWriteNl()
+  UartWriteStr("the code we have, not as a comparison against the best software possible.")
+  UartWriteNl()
+  UartWriteNl()
+
+  UartWriteStr("The caches are in whatever state the loader left them. A run with the")
+  UartWriteNl()
+  UartWriteStr("MMU and caches OFF measures a different machine, and the ratio there is")
+  UartWriteNl()
+  UartWriteStr("the one that matters for a payload that runs before mmu.pi4 does.")
+  UartWriteNl()
+  UartWriteStr("pi4SimdThroughput done.")
+  UartWriteNl()
+  ProcedureReturn 0
+EndProcedure

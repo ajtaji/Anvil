@@ -1,0 +1,271 @@
+; ======================================================================
+; pi4HidOneShot.pi4 - ONE GET_REPORT ON EACH INTERFACE, AND NOTHING ELSE.
+; ----------------------------------------------------------------------
+; THE QUESTION THIS ANSWERS, and it is a design question rather than a
+; bug: hid.pi4's header says the file "deliberately adds NO new transfer
+; type to the USB stack: everything here is a control transfer", and
+; polls reports with GET_REPORT on the default control pipe. HID 1.11
+; makes GET_REPORT mandatory, which is what justified that. Linux and
+; U-Boot both read HID through the INTERRUPT IN endpoint instead. So:
+; does GET_REPORT actually deliver a report on real hardware, or does
+; this stack need an interrupt endpoint it does not have?
+;
+; ANSWERED ON 2026-08-28: IT DELIVERS. On the wireless receiver on hub
+; port 1 of the VL805's internal hub - keyboard interface 8 bytes in
+; 2 ms, mouse interface 4 bytes in 0 ms - with nothing pressed and
+; nobody touching the mouse. No interrupt endpoint was built, because
+; the measurement said one was not needed.
+;
+; ======================================================================
+;  WHAT THIS FILE GOT WRONG THE FIRST TIME, KEPT BECAUSE IT IS THE
+;  INTERESTING PART
+; ======================================================================
+;  The first version of this probe reported the opposite: GET_REPORT
+;  timed out for the full five seconds, and the verdict it printed said
+;  in so many words that hid.pi4's design "does not hold on this
+;  hardware". That verdict was wrong, and it was wrong for TWO separate
+;  reasons that both produce a timeout and neither of which is the
+;  device.
+;
+;  1. IT NEVER CALLED PcieInit() OR PcieEnumerate(). Including pcie.pi4
+;     is not the same as running it. PcieInit's adopt path is what
+;     zeroes the inbound RC_BAR2 offset U-Boot leaves at $4_0000_0000,
+;     and while that stands the controller cannot reach our memory.
+;     The probe appeared to work anyway, because those are HARDWARE
+;     registers and the monitor does not reset them between payloads -
+;     so it was running on whatever the previous program had set up. A
+;     test whose result depends on what ran before it is not a test.
+;
+;  2. THE REAL FAULT, and the probe was measuring it without knowing:
+;     the receiver's MOUSE interface stalls SET_IDLE - legal, HID 1.11
+;     Appendix G makes it optional for non-keyboards - and a stall puts
+;     endpoint 0 into the xHCI HALTED state. A halted endpoint does not
+;     fail transfers, it does not RUN them: the doorbell is taken, the
+;     ring is never walked, no event is posted, and the caller spends
+;     its whole timeout. Endpoint zero belongs to the DEVICE, so this
+;     killed the keyboard interface too, which had answered correctly
+;     one transfer earlier. xhci.pi4 now issues the Reset Endpoint and
+;     Set TR Dequeue Pointer that clears it - xh_ClearHalt().
+;
+;  BOTH INTERFACES ARE POLLED HERE, in that order, for that reason: the
+;  keyboard first, then the mouse whose SET_IDLE stalls, then the
+;  KEYBOARD AGAIN. The third poll is the one that matters. It is the
+;  transfer that used to time out, and if it ever times out again the
+;  halt recovery has regressed.
+;
+;  THE MOUSE IS NOT MOVED AND NO KEY IS PRESSED. There is nobody at the
+;  bench. That is not a limitation of the test - it is the property
+;  being tested. HID 1.11 Appendix C requires a device to answer
+;  Get_Report "even when there are no new key events", and a boot report
+;  is a STATE rather than an event, so an all-zero report is a complete
+;  pass. There is also no keyboard paired to this receiver, so what is
+;  being checked is that the keyboard interface ANSWERS, not what it
+;  says.
+;
+; No polling loop, no retries, no LEDs - so the sixteen-second watchdog
+; ceiling (safety.pi4:434) is never a factor and the answer always
+; reaches the screen.
+;
+; DIAGNOSTIC - RULES.md rule 19. Never shipped.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+
+Global g_hz.i = 0
+
+Procedure PutHexN(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+; One GET_REPORT, timed, with the endpoint state printed either side.
+;
+; THE TIMING IS THE EVIDENCE. A transfer that fails FAST was refused by
+; the device; one that runs the whole control timeout was never answered
+; - and, now that the endpoint state is printed beside it, one that runs
+; the whole timeout with ep0 state 2 was never even SENT.
+;
+; Returns 1 if a report arrived.
+; ----------------------------------------------------------------------
+Procedure.i AskOnce(h.i, *label)
+  Define n.i
+  Define t0.i
+  Define ms.i
+  Define i.i
+
+  If h = 0
+    UartWriteStr(*label)
+    UartWriteStr(": no such handle")
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  UartWriteStr(*label)
+  UartWriteStr(" (interface ")
+  PrintDec(HidInterface(h))
+  UartWriteStr(", ep0 state ")
+  PrintDec(XhciEpState(1))
+  UartWriteStr(") asking...")
+  UartDrain()
+
+  t0 = Ticks()
+  n = HidPoll(h)
+  ms = 0
+  If g_hz > 0
+    ms = ((Ticks() - t0) * 1000) / g_hz
+  EndIf
+
+  UartWriteStr(" returned ")
+  PrintDec(n)
+  UartWriteStr(" after ")
+  PrintDec(ms)
+  UartWriteStr(" ms, ep0 state ")
+  PrintDec(XhciEpState(1))
+  PrintNl()
+
+  If n < 0
+    UartWriteStr("    hid:  ")
+    UartWriteStr(HidErrorText())
+    PrintNl()
+    UartWriteStr("    xhci: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    UartWriteStr("    skipped events ")
+    PrintDec(XhciSkippedEvents())
+    PrintNl()
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  UartWriteStr("    report")
+  i = 0
+  While i < n
+    UartWriteStr(" $")
+    PutHexN(HidReportByte(h, i), 2)
+    i = i + 1
+  Wend
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define mouse.i
+  Define kbd.i
+  Define got.i
+  Define want.i
+
+  PrintNl()
+  UartWriteStr("=== one GET_REPORT per interface ===")
+  PrintNl()
+  UartDrain()
+
+  If TimerInit() <> 0
+    g_hz = TickHz()
+  EndIf
+
+  ; PcieInit AND PcieEnumerate, both, before XhciInit. See this file's
+  ; header - leaving them out is how the first version of this probe
+  ; produced a wrong verdict about hid.pi4's whole design.
+  If PcieInit() = 0
+    UartWriteStr("PcieInit FAILED: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If PcieEnumerate() = 0
+    UartWriteStr("PcieEnumerate FAILED: ")
+    UartWriteStr(PcieErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+  If XhciInit() = 0
+    UartWriteStr("XhciInit FAILED: ")
+    UartWriteStr(XhciErrorText())
+    PrintNl()
+    ProcedureReturn 1
+  EndIf
+
+  HidFindAndAttachAll()
+  kbd   = HidFind(#HID_PROTO_KEYBOARD)
+  mouse = HidFind(#HID_PROTO_MOUSE)
+
+  UartWriteStr("attached ")
+  PrintDec(HidCount())
+  UartWriteStr("  keyboard handle ")
+  PrintDec(kbd)
+  UartWriteStr("  mouse handle ")
+  PrintDec(mouse)
+  PrintNl()
+  UartDrain()
+
+  If kbd = 0 And mouse = 0
+    UartWriteStr("no HID interface attached - nothing to ask.")
+    PrintNl()
+    ProcedureReturn 2
+  EndIf
+
+  got  = 0
+  want = 0
+
+  If kbd <> 0
+    want = want + 1
+    got = got + AskOnce(kbd, "keyboard")
+  EndIf
+  If mouse <> 0
+    want = want + 1
+    got = got + AskOnce(mouse, "mouse   ")
+  EndIf
+  ; THE THIRD POLL IS THE WHOLE REGRESSION TEST. The mouse's SET_IDLE
+  ; stalls and halts endpoint 0; this asks the keyboard again on that
+  ; same, shared, pipe. Before xh_ClearHalt() existed it timed out.
+  If kbd <> 0
+    want = want + 1
+    got = got + AskOnce(kbd, "keyboard again")
+  EndIf
+
+  PrintNl()
+  UartWriteStr("  ")
+  PrintDec(got)
+  UartWriteStr(" of ")
+  PrintDec(want)
+  UartWriteStr(" polls returned a report")
+  PrintNl()
+  If got = want
+    UartWriteStr("VERDICT: THE CONTROL PIPE DELIVERS. GET_REPORT works,")
+    PrintNl()
+    UartWriteStr("and it still works after a stall on the shared pipe.")
+    PrintNl()
+    ProcedureReturn 0
+  EndIf
+
+  UartWriteStr("VERDICT: the control pipe did not deliver on every")
+  PrintNl()
+  UartWriteStr("interface. Read the ep0 state printed above FIRST: a 2")
+  PrintNl()
+  UartWriteStr("means the endpoint was HALTED and the transfer was never")
+  PrintNl()
+  UartWriteStr("sent, which is a stall that was not cleared and not a")
+  PrintNl()
+  UartWriteStr("statement about GET_REPORT. Only a full-timeout failure")
+  PrintNl()
+  UartWriteStr("with ep0 state 1 is evidence the device never answered.")
+  PrintNl()
+  ProcedureReturn 3
+EndProcedure
+
+Main()

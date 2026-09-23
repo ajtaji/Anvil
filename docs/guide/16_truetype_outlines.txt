@@ -1,0 +1,20 @@
+@CHAPTER TrueType outlines
+@INTRO T3 reads bounded `loca` and `glyf` data into caller-owned font-unit points and inclusive contour endpoints, including transformed composite components.
+
+@SECTION The outline contract
+
+Open T0 and T1, then call `AnvilTrueTypeOutlinesOpen()`. `AnvilTrueTypeGlyphOutline(glyph, points, pointCapacity, contours, contourCapacity, pointCountOut, contourCountOut)` expands a simple or composite TrueType glyph. Each point uses three 32-bit fields: signed x, signed y and flags, where bit zero is the on-curve flag. Each contour entry is its inclusive final point index in the combined output.
+
+The module validates `loca` length and monotonic offsets against `glyf`. Short `loca` values are big-endian half-offsets. Simple glyph flags and coordinate deltas are bounded before use. Composite arguments distinguish signed XY offsets from unsigned point indices; scale and matrix transforms are applied before point attachment. The decoder rejects recursive cycles, conflicting transform flags, invalid indices, output-capacity overflow and coordinates outside signed 32-bit range. An explicit bounded stack handles nested components because this compiler does not support recursive procedures.
+
+Instructions are not executed, and hinting is not applied. The module handles the TrueType `glyf` outline format; CFF/CFF2 outlines are outside this reader.
+
+@SECTION Emitted and independent proof
+
+The small emitted fixture exercises big-endian short `loca`, a simple triangle, negative byte-sized XY component offsets, a nonidentity scaled component attached by point index, cycle and conflicting-transform refusal, and output capacity. A source mutant reads short `loca` values as little-endian and must fail.
+
+The emitted fixture compares a multi-contour Abel exclamation mark and Bangers Aacute against `fontTools` resolved coordinates. Bangers Aacute exercises a larger composite outline: 76 points across three contours. The complete gate also rejects a little-endian short-`loca` source mutant. This proof covers outline decoding; it does not prove raster coverage, atlas caching, shaping or drawing.
+
+@SECTION Format references
+
+The [OpenType `loca` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/loca) defines short and long locations. The [OpenType `glyf` specification](https://learn.microsoft.com/en-us/typography/opentype/spec/glyf) defines simple points, composite component arguments, flags and transforms.

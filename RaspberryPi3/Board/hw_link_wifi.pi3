@@ -1,0 +1,180 @@
+; Pi 3 Wi-Fi-only HwLink backend.
+;
+; The common IP/link policy consumes HwLink* calls, while this file owns
+; only the board-specific frame-buffer and ready-state seam. It is included
+; by board.pi3; readiness requires attached radio, keyed association, valid
+; MAC, and the EAPOL raw handler before IP traffic is admitted.
+
+Global Dim p3HwWifiMac.a[6]
+Global p3HwWifiMacReady.i
+Global p3HwWifiRxPtr.i
+Global *p3HwWifiRawFn = 0
+Global p3HwWifiRxOversize.i
+Global p3HwWifiTxFailure.i
+Global p3HwWifiRxFrames.i
+Global p3HwWifiIp.i
+Global p3HwWifiMask.i
+Global p3HwWifiGateway.i
+Global p3HwWifiConsoleArmed.i
+
+Procedure.i Pi3HwWifiSetMac(*mac)
+  Protected i.i
+  p3HwWifiMacReady = 0
+  If *mac = 0 Or Pi3WifiMacValid(*mac) = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To 5 : p3HwWifiMac[i] = PeekA(*mac + i) : Next
+  p3HwWifiMacReady = 1
+  ProcedureReturn 1
+EndProcedure
+
+; Optional board-independent EAPOL rekey handler. No callback means the
+; radio link is not ready for IP traffic; unknown EAPOL is never claimed.
+Procedure Pi3HwWifiSetRawHandler(*fn)
+  p3HwWifiRawFn = *fn
+EndProcedure
+
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIFI And pi3_wifi_radio_profile <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwLinkReady(kind.i)
+  If kind <> #HW_LINK_WIFI Or p3HwWifiMacReady = 0
+    ProcedureReturn 0
+  EndIf
+  If Cyw43Attached() = 0 Or Pi3WifiAssocKeyed() = 0 Or p3HwWifiRawFn = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwLinkName(kind.i)
+  If kind = #HW_LINK_WIFI : ProcedureReturn "the Wi-Fi radio" : EndIf
+  ProcedureReturn "an interface this board does not have"
+EndProcedure
+
+Procedure.i HwLinkTxMax(kind.i)
+  If kind <> #HW_LINK_WIFI Or HwLinkReady(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Cyw43DataMax()
+EndProcedure
+
+; Shared NTP/link-local code stages its reply in NetOutBuf. This is the
+; board's equivalent of the Pi 4 LinkTxStagedOn seam, restricted to the
+; single Wi-Fi interface actually implemented here.
+Procedure.i LinkTxMaxOn(kind.i)
+  ProcedureReturn HwLinkTxMax(kind)
+EndProcedure
+Procedure.i LinkTxStagedOn(kind.i)
+  Protected n.i
+  n = NetOutLen()
+  If n <= 0 Or n > LinkTxMaxOn(kind) : ProcedureReturn 0 : EndIf
+  ProcedureReturn HwLinkSend(kind, NetOutBuf(), n, 100)
+EndProcedure
+Procedure.i LinkTxStaged()
+  ProcedureReturn LinkTxStagedOn(NetIfPreferred())
+EndProcedure
+
+Procedure.i HwLinkSpeed(kind.i)
+  ProcedureReturn #HW_LINK_SPEED_UNKNOWN
+EndProcedure
+
+Procedure.i HwLinkDuplex(kind.i)
+  ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
+EndProcedure
+
+Procedure.i HwLinkWhyText(kind.i)
+  ProcedureReturn ""
+EndProcedure
+
+; CYW43's send API consumes the bytes already staged in its data buffer and
+; returns zero on success. Normalize that to the HwLink 1/0 convention.
+Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
+  Protected dst.i, i.i
+  If kind <> #HW_LINK_WIFI Or HwLinkReady(kind) = 0 Or buf = 0 Or n < 14
+    ProcedureReturn 0
+  EndIf
+  If n > Cyw43DataMax() : ProcedureReturn 0 : EndIf
+  dst = Cyw43DataPtr()
+  If dst = 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To n - 1 : PokeA(dst + i, PeekA(buf + i)) : Next
+  If Cyw43Send(n) <> 0
+    p3HwWifiTxFailure = p3HwWifiTxFailure + 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The CYW43 driver owns its receive buffer. HwLinkRxPtr reports that pointer;
+; the generic link layer must consume/copy the frame before the next receive.
+Procedure.i HwLinkRecv(kind.i, buf.i, max.i, ms.i)
+  Protected n.i
+  p3HwWifiRxPtr = 0
+  If kind <> #HW_LINK_WIFI Or HwLinkReady(kind) = 0 Or max < 14
+    ProcedureReturn 0
+  EndIf
+  n = Cyw43Receive(ms)
+  If n <= 0 : ProcedureReturn n : EndIf
+  p3HwWifiRxPtr = Cyw43ReceivePtr()
+  If p3HwWifiRxPtr = 0 Or n > max
+    p3HwWifiRxPtr = 0
+    p3HwWifiRxOversize = p3HwWifiRxOversize + 1
+    ProcedureReturn 0
+  EndIf
+  p3HwWifiRxFrames = p3HwWifiRxFrames + 1
+  ProcedureReturn n
+EndProcedure
+
+Procedure.i HwLinkRxPtr(kind.i)
+  If kind <> #HW_LINK_WIFI : ProcedureReturn 0 : EndIf
+  ProcedureReturn p3HwWifiRxPtr
+EndProcedure
+
+Procedure.i HwLinkMacPtr(kind.i)
+  If kind <> #HW_LINK_WIFI Or p3HwWifiMacReady = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn @p3HwWifiMac[0]
+EndProcedure
+
+; EAPOL (0x888E) must be handled before IPv4 parsing; other raw frames are
+; left for NetInput. Without the registered tested security callback, return
+; zero and keep HwLinkReady false rather than pretend a rekey was serviced.
+Procedure.i HwLinkOfferRaw(kind.i, p.i, n.i)
+  If kind <> #HW_LINK_WIFI Or p = 0 Or n < 14 Or p3HwWifiRawFn = 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(p + 12) & $FF) = $88 And (PeekA(p + 13) & $FF) = $8E
+    ProcedureReturn p3HwWifiRawFn(p, n)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; NetConsole's shared UDP dispatcher is linked only when CAP_NET is enabled.
+Procedure.i HwLinkOfferUdp(kind.i, p.i)
+  If kind <> #HW_LINK_WIFI Or HwLinkReady(kind) = 0 Or p = 0
+    ProcedureReturn 0
+  EndIf
+  If NetIfUsable(kind) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn NetConsoleOfferUdp(p, kind)
+EndProcedure
+
+Procedure HwLinkNoteRx(kind.i, result.i)
+EndProcedure
+
+; Shared netcfg/notifier callbacks. Address configuration is authoritative
+; in Anvil's per-interface NetIf table; these copies are diagnostic state only
+; and never change link readiness or the selected radio profile.
+Procedure HwLinkAddressBound(kind.i, ip.i, mask.i, gw.i)
+  If kind <> #HW_LINK_WIFI
+    ProcedureReturn
+  EndIf
+  p3HwWifiIp = ip
+  p3HwWifiMask = mask
+  p3HwWifiGateway = gw
+EndProcedure
+
+Procedure HwLinkConsoleArmed(kind.i, armed.i)
+  If kind <> #HW_LINK_WIFI
+    ProcedureReturn
+  EndIf
+  p3HwWifiConsoleArmed = armed & 1
+EndProcedure

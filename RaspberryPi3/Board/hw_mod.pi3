@@ -1,0 +1,128 @@
+; ======================================================================
+;  hw_mod.pi3 - THE Pi 3's HALF OF THE DRIVER-MODULE CONTRACT.
+;
+;  REQUIRES, in this order, in the board file:
+;      Anvil/Hal/seams.pbi                 the #SVCCAP_* vocabulary
+;      RaspberryPi3/Board/memmap.pi3       the region enumeration
+;
+;  THIS BOARD DECLARES NO MODULE ARENA, AND SAYS SO RATHER THAN INVENTING
+;  ONE. That is the whole content of this file and it is a deliberate
+;  answer, not a stub left behind.
+;
+;  WHY NOT SIMPLY CARVE ONE. There is room - the payload window on a
+;  stock 1 GB board is most of a gigabyte - and that is exactly why it
+;  would be easy to get wrong. An arena is a region the monitor must
+;  refuse writes to for ever after (memmap.pi3 would grow an eighth
+;  region), it must be cache-synchronised before anything branches into
+;  it, and the synchronisation must be PROVEN rather than assumed. This
+;  monitor has just turned its own caches on for the first time on this
+;  part; the maintenance instructions a module loader needs have never
+;  run here in this tree. Declaring an arena now would mean the first
+;  thing ever executed from it is also the first test of the cache
+;  maintenance that made it safe, with no way to tell which of the two
+;  failed.
+;
+;  WHAT THE REAL ANSWER IS, so the next lane does not have to derive it:
+;  a fixed window above the A/B staging arena and below the payload
+;  window's floor, declared in memmap.pi3 as an eighth region so that
+;  HitsMonitor() refuses it; HwModCodeSync() implemented as a data-cache
+;  clean by virtual address to the point of unification followed by an
+;  instruction-cache invalidate over the same range; and a probe that
+;  writes a known sequence, syncs it, branches into it and reports what
+;  it found, run on silicon, BEFORE the loader is allowed to.
+;
+;  UNTIL THEN: HwModArenaBase() answers 0, ModArenaInit() refuses with
+;  #MOD_ERR_NOARENA, the boot walk stays silent about it, and `mod` says
+;  in one sentence that this board declares no arena. Everything else in
+;  the loader - the container reader, the validator, the relocator, the
+;  registry, the lifecycle and the console - compiles and links here
+;  identically to the other boards, which is the build-closure claim this
+;  file exists to keep true.
+; ======================================================================
+
+Procedure.i HwModArenaBase()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwModArenaBytes()
+  ProcedureReturn 0
+EndProcedure
+
+; No region of this board's map is the arena, so there is no index for
+; ModArenaInit() to skip. -1 matches no region.
+Procedure.i HwModArenaRegion()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwModStageAddr()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwModStageBytes()
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwModCodeSync(base, bytes) - REFUSES, and refusing is the correct
+;  answer rather than a placeholder.
+;
+;  The loader calls this after it has written a module's bytes and before
+;  anything branches into them, and it treats a non-1 answer as
+;  #MOD_ERR_SYNC: the module is NOT initialised and the arena bytes are
+;  cleared again. Answering 1 without performing the maintenance would
+;  make the loader believe a cache state nobody established, which is the
+;  one failure in this whole path that produces no message at all - a
+;  branch into stale instruction lines.
+;
+;  This is where the argument in the header lands as code: there is no
+;  arena, so nothing can be written into one, so this can never honestly
+;  be reached - and if it is, the safe answer is the one that stops the
+;  branch.
+; ----------------------------------------------------------------------
+Procedure.i HwModCodeSync(base.i, bytes.i)
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE DEVICES. None are declared, and that is the truth rather than an
+;  omission: nothing on this part has been enumerated to the point where
+;  a driver could be handed a block and told it is safe to read. The
+;  hardware this board HAS that a module might one day own - the SD host,
+;  the USB controller, the Ethernet adapter behind it, the radio - is
+;  either compiled in or not yet written, and in neither case is there a
+;  device record for a module to bind to.
+; ----------------------------------------------------------------------
+Procedure.i HwDevCount()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevIdAddr(i.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwDevSeam(i.i)
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwDevToken(i.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwDevSay(i.i)
+  Print("a device this board does not declare")
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CAPABILITY QUESTIONS. Both answer 0 for every id: this board
+;  reaches no seam from the core through a module, and no piece of its
+;  hardware has been established as present in a form a module could bind
+;  to. A board that claimed otherwise would send an operator looking for
+;  a module to load that could never bind to anything.
+; ----------------------------------------------------------------------
+Procedure.i HwSeamCore(id.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwSeamPossible(id.i)
+  ProcedureReturn 0
+EndProcedure

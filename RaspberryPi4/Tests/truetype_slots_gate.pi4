@@ -1,0 +1,81 @@
+; Emitted lifecycle gate for real resident TrueType slots.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_kern.pbi"
+XIncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+XIncludeFile "Anvil/Graphics/truetype_slots.pbi"
+
+#TTS_META = $0F000000
+#TTS_BASE = $10000000
+#TTS_MAGIC = $54534C54
+
+Global ttsChecks.i, ttsFailures.i, ttsFirstFailure.i
+
+Procedure ttsCheck(ok.i)
+  ttsChecks + 1
+  If ok = 0
+    ttsFailures + 1
+    If ttsFirstFailure = 0 : ttsFirstFailure = ttsChecks : EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i, bad.i, generation.i, units.i, glyph.i, n.i, expectedUnits.i
+  If PeekL(#TTS_META) <> #TTS_MAGIC : ProcedureReturn 90 : EndIf
+  bytes = PeekL(#TTS_META + 4)
+  expectedUnits = PeekL(#TTS_META + 8)
+  bad = #TTS_BASE + bytes + 16
+  If bytes < 1 Or bytes > #ANVIL_TTS_MAX_BYTES : ProcedureReturn 91 : EndIf
+  ttsCheck(AnvilTrueTypePixelHeight()=16)
+  ttsCheck(AnvilTrueTypeDefaultSlot()=-1)
+  ttsCheck(AnvilTrueTypeSetPixelHeight(24)=1 And AnvilTrueTypePixelHeight()=24)
+  ttsCheck(AnvilTrueTypeSetPixelHeight(0)=0 And AnvilTrueTypePixelHeight()=24)
+  ttsCheck(AnvilTrueTypeSetPixelHeight(513)=0 And AnvilTrueTypePixelHeight()=24)
+  ttsCheck(AnvilTrueTypeSetDefaultSlot(2)=1 And AnvilTrueTypeDefaultSlot()=2)
+  ttsCheck(AnvilTrueTypeSetDefaultSlot(4)=0 And AnvilTrueTypeDefaultSlot()=2)
+  AnvilTrueTypeSetDefaultSlot(-1) : AnvilTrueTypeSetPixelHeight(16)
+  ; Candidate is valid Abel Regular; corrupt copy has an invalid sfnt signature.
+  For n = 0 To bytes - 1 : PokeA(bad+n,PeekA(#TTS_BASE+n)) : Next
+  PokeA(bad, $FF)
+  ttsCheck(AnvilTrueTypeSlotLoad(0, #TTS_BASE, bytes) = 1)
+  ttsCheck(AnvilTrueTypeSlotGeneration(0) = 1)
+  ttsCheck(AnvilTrueTypeSlotSelect(0) = 1)
+  ttsCheck(AnvilTrueTypeSlotParserBound() = 1)
+  units = AnvilTrueTypeUnitsPerEm()
+  glyph = AnvilTrueTypeGlyphForCodepoint($41)
+  ttsCheck(units = expectedUnits And glyph > 0)
+
+  ; A bad candidate must leave current selection and parser state intact.
+  generation = AnvilTrueTypeSlotGeneration(1)
+  ttsCheck(AnvilTrueTypeSlotValidate(bad, bytes) = 0)
+  ttsCheck(AnvilTrueTypeSlotSelected() = 0 And AnvilTrueTypeSlotParserBound() = 1)
+  ttsCheck(AnvilTrueTypeUnitsPerEm() = units And AnvilTrueTypeSlotGeneration(1) = generation)
+  ttsCheck(AnvilTrueTypeSlotLoad(1, bad, bytes) = 0)
+  ttsCheck(AnvilTrueTypeSlotSelected() = 0 And AnvilTrueTypeSlotParserBound() = 1)
+  ttsCheck(AnvilTrueTypeSlotGeneration(1) = generation)
+
+  ; Closing one parser stage invalidates the bound predicate. Selecting the
+  ; same slot must reopen it rather than accepting stale slot identity.
+  AnvilTrueTypeCmapClose()
+  ttsCheck(AnvilTrueTypeSlotParserBound() = 0)
+  ttsCheck(AnvilTrueTypeSlotSelect(0) = 1 And AnvilTrueTypeSlotParserBound() = 1)
+  ttsCheck(AnvilTrueTypeGlyphForCodepoint($41) = glyph)
+
+  ; Active storage cannot be replaced or unloaded. Deselect permits unload;
+  ; unload and replacement each advance the cache identity generation.
+  ttsCheck(AnvilTrueTypeSlotLoad(0, #TTS_BASE, bytes) = 0)
+  ttsCheck(AnvilTrueTypeSlotUnload(0) = 0 And AnvilTrueTypeSlotGeneration(0) = 1)
+  ttsCheck(AnvilTrueTypeSlotDeselect() = 1 And AnvilTrueTypeSlotParserBound() = 0)
+  ttsCheck(AnvilTrueTypeSlotUnload(0) = 1)
+  ttsCheck(AnvilTrueTypeSlotBytes(0) = 0 And AnvilTrueTypeSlotGeneration(0) = 2)
+  ttsCheck(AnvilTrueTypeSlotSelect(0) = 0)
+  ttsCheck(AnvilTrueTypeSlotLoad(0, #TTS_BASE, bytes) = 1)
+  ttsCheck(AnvilTrueTypeSlotGeneration(0) = 3)
+  ttsCheck(AnvilTrueTypeSlotSelect(0) = 1 And AnvilTrueTypeSlotParserBound() = 1)
+  ttsCheck(AnvilTrueTypeSlotDeselect() = 1)
+  ttsCheck(AnvilTrueTypeSlotUnload(0) = 1 And AnvilTrueTypeSlotGeneration(0) = 4)
+  If ttsFailures <> 0 : ProcedureReturn ttsFirstFailure : EndIf
+  ProcedureReturn 0
+EndProcedure

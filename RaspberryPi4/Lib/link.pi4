@@ -1,0 +1,1010 @@
+; ======================================================================
+; link.pi4 - ONE IP LAYER, WHICHEVER LINK IS UP.
+; ======================================================================
+;
+; WHY THIS FILE EXISTS, in the words of the ruling that ordered it.
+; ----------------------------------------------------------------------
+; Ruling, 2026-09-02 (vault: Anvil/Rulings 2026-09-02 - memory safety
+; seam, net over any link), forum topic 591 on the Anvil todo list:
+;
+;   "Today the net/ping/dns IP layer is Ethernet-only and separate from
+;    the Wi-Fi console's stack, so with no cable on the bench dns and
+;    ping were untestable while the board held a valid Wi-Fi lease.
+;    Ruling: merge to one IP layer that rides whichever link is up
+;    (Ethernet preferred when both)."
+;
+; THAT IS THE WHOLE OF THIS FILE'S JOB and it is worth being precise
+; about what was actually wrong, because "there were two IP stacks" is
+; the popular version and it is not quite true. There was always ONE
+; IP layer - RaspberryPi4/Lib/net.pi4 - and the wireless console already
+; drove it: WifiConsolePump feeds every received frame to NetInput and
+; sends back whatever it stages. What was Ethernet-only was the
+; COMMANDS: ping, dns, dhcp, get and put each called GenetRecvWait and
+; GenetSend by name, seventeen call sites between them, so with no cable
+; in the socket they had nothing to talk through even while the radio
+; held a lease and answered pings.
+;
+; So the fix is not a new stack. It is a seam with four procedures in it
+; and seventeen call sites changed to use them.
+;
+;   LinkPumpNet(ms)   one frame in, through NetInput, reply out
+;   LinkTxStaged()    whatever net.pi4 has staged, onto the wire
+;   LinkTxMax()       the largest 802.3 frame THIS link will carry
+;   LinkUp()          is anything carrying traffic at all
+;
+; WHAT USES IT: net, ping, dns, dhcp, get, put, tcp and http get. All of
+; them, which is the point - a seam that half the commands bypass is not
+; a seam, it is a second stack with extra steps.
+;
+; ======================================================================
+; THE PREFERENCE, AND WHY IT IS NOT SIMPLY "WIRED WINS"
+; ======================================================================
+; The ruling says Ethernet preferred when both. Both WHAT, though? A
+; cable in the socket is not the same thing as an interface that can
+; carry a conversation, and on this bench the difference is routine: the
+; board is normally on Wi-Fi with a DHCP lease and no cable at all, and
+; the moment somebody plugs one in for a test the wired side has a link
+; and NO ADDRESS until dhcp is run again.
+;
+; Preferring the wired side at that moment would take a working stack
+; away and replace it with one that cannot send anything - and the
+; symptom would be that plugging a cable in breaks the network, which is
+; the single most confusing thing a monitor could do.
+;
+; So the order is, and LinkSelect implements exactly this:
+;
+;   1. WIRED, if the PHY says the link is up AND the wired side has an
+;      address. This is the ruling's case and it wins outright.
+;   2. WI-FI, if it is joined and has an address.
+;   3. WIRED, if the PHY link is up but it has no address yet. Nothing
+;      else is available, and dhcp has to run over SOMETHING.
+;   4. NOTHING, and every command that needs a link says so in a full
+;      sentence naming both interfaces and what is missing from each.
+;
+; THE FACTS COME FROM THE BOARD, NOT FROM HERE. This file does not read
+; the settings store and does not know what a lease is; LinkSelect takes
+; four numbers and applies the policy. The policy is here because it is
+; ONE decision that must not be made differently in two places; the
+; facts are the board's because that is where they live.
+;
+; ======================================================================
+; WHAT `net` PRINTS, AND WHY THE REASON IS STORED RATHER THAN DERIVED
+; ======================================================================
+; The brief asks that `net` print which link carries traffic AND WHY.
+; The why is a stored code, set at the moment the choice was made, and
+; not something recomputed when the operator asks - because by then the
+; facts may have changed and the answer would describe a decision that
+; was never taken. A board that says "wired, because Wi-Fi is not
+; joined" while Wi-Fi is plainly joined has told the operator a lie
+; about its own history. LinkWhyText() returns the sentence that was
+; true when the link was chosen; LinkSelect is the only thing that
+; writes it.
+;
+; ======================================================================
+; THIS FILE NAMES NO CHIP. IT DID, UNTIL 2026-09-04.
+; ======================================================================
+; The paragraph that used to stand here said, correctly and at the time
+; unavoidably:
+;
+;   "A TARGET WITHOUT A RADIO drops cyw43.pi4 and wifi.pi4 and cannot
+;    include this file as it stands ... the seam is two-link because this
+;    board is."
+;
+; That was true and it was the thing standing between the Arduino UNO Q
+; and a network. Every layer ABOVE this file - net.pi4, tcp.pi4,
+; http.pi4, dns, dhcp, tftp - already builds for `-t unoq` unchanged, at
+; the Q's own load and stack addresses, and passes its gate built that
+; way. The only file in the whole stack that could not cross to a second
+; board was the one that was supposed to be the seam.
+;
+; So the eleven chip-specific names this file used to call - Cyw43Send,
+; Cyw43Receive, Cyw43ReceivePtr, Cyw43DataPtr, Cyw43DataMax, GenetSend,
+; GenetRecvWait, WifiConsoleOn, WifiConsoleTakeUdp, WifiNoteRxProof and
+; WifiServiceEapolFrame - moved behind the board, exactly the way
+; HwGpio* already is. The full seam contract is written out in
+; Anvil/Hal/hal.pbi under HwLink*; the summary is:
+;
+;     HwLinkHas(kind)                does this board have one at all
+;     HwLinkTxMax(kind)              its largest frame
+;     HwLinkSend(kind, buf, n, ms)   one frame out
+;     HwLinkRecv(kind, buf, max, ms) one frame in
+;     HwLinkRxPtr(kind)              where that frame actually landed
+;     HwLinkMacPtr(kind)             the six bytes it leaves with, or 0
+;     HwLinkName(kind)               a lowercase noun phrase
+;     HwLinkOfferRaw(kind, p, n)     the board's first refusal on a frame
+;     HwLinkOfferUdp(kind, p)        the same, once it is known to be UDP
+;     HwLinkNoteRx(kind, r)          what the IP layer made of it
+;
+; WHAT THIS DID NOT CHANGE. The policy is the same policy, the preference
+; order is the same order, and every sentence LinkWhyText() prints is the
+; sentence it printed before. Moving the wire out from under a decision
+; is not the same as changing the decision, and this pass deliberately
+; did only the first.
+;
+; ======================================================================
+; REQUIRES - the main program includes these BEFORE this file
+; ======================================================================
+;     Anvil/Hal/hal.pbi             the #HW_LINK_* kinds
+;     RaspberryPi4/Lib/net.pi4      the IP layer
+;     the board's HwLink* backend   (RaspberryPi4/Board/hw_link.pi4 on the
+;                                    Pi 4, ArduinoQ/Board/hw_link_q.pi4 on
+;                                    the UNO Q)
+;
+; House rule 10: a library never includes a library. The names this file
+; calls and does not define are the HwLink* seam above, plus:
+;
+;     NetInput()  NetOutBuf()  NetOutLen()
+;     millis()
+;
+; ======================================================================
+; WHAT ARRIVED HERE ON 2026-09-05, AND WHY IT IS HERE AND NOT IN A BOARD
+; ======================================================================
+; The 2026-09-04 pass moved the WIRE behind the seam and this file
+; stopped naming a chip. The COMMAND layer did not: Anvil/Core/net_cmd.pbi
+; still called EthUp, EthUpIp, EthLinkUp, EthDown, EthResolve, EthRun and
+; EthSendStaged in RaspberryPi4/Board/eth.pi4, so a shared core that
+; "names no chip" was nonetheless unbuildable without one board's network
+; file underneath it. Anvil/Hal/hal.pbi now carries six more HwLink*
+; names for that, and three things came here rather than staying in a
+; board because they are DECISIONS AND NOT FACTS:
+;
+;   THE PIN. `net link wired` / `net link wifi` / `net link auto` is the
+;   operator overriding the preference order, and the preference order is
+;   in this file. It used to be #LINK_PREF_AUTO / _WIRED / _WIFI and a
+;   gLinkPref in the Pi 4's eth.pi4, which put half of one decision in a
+;   board file and gave the seam a SECOND vocabulary for a thing the
+;   #HW_LINK_* kinds already name. It is now one kind, or #HW_LINK_NONE
+;   for "choose each time", so a board with a serial link and no radio
+;   can be pinned to it without a constant being invented for it.
+;
+;   THE HARDWARE ADDRESS IN USE. LinkMacPtr() was in the Pi 4's board
+;   file and read one of two board globals; it is HwLinkMacPtr of the
+;   kind that won, which is the same answer with nothing board-shaped
+;   left in it.
+;
+;   WHAT THE LINK CAN SAY ABOUT ITSELF. LinkSpeed, LinkDuplex and
+;   LinkWhyLink ask the board about the SELECTED kind, so that a command
+;   printing a status line never has to know which kind that is. They
+;   answer #HW_LINK_SPEED_UNKNOWN / #HW_LINK_DUPLEX_UNKNOWN / an empty
+;   string when there is no selection at all, which is the same answer a
+;   board with nothing to say gives, and the caller prints nothing either
+;   way rather than a zero.
+;
+; WHAT DID NOT COME HERE, and the line is worth stating because it is
+; the one somebody will want to cross. The ARP resolve, the TFTP pump
+; and every sentence they print stayed in Anvil/Core/net_cmd.pbi. They
+; are portable - they name only net.pi4, tftp.pi4 and this file - but
+; they PRINT, and they ask OutBreak() whether the operator has pressed a
+; key. A library that printed could not be driven by a gate with no
+; console in it, which is the property tools/a64/a64_netpump_check.py
+; depends on to run this file's pump against a fixture link.
+; ======================================================================
+
+; The kinds themselves live in Anvil/Hal/hal.pbi as #HW_LINK_*, because
+; the board backends and this policy layer both have to agree on them.
+
+; Why the current link was chosen. Every one of these has a sentence in
+; LinkWhyText(). On a board with two interfaces the sentence names BOTH,
+; because "why did it pick that one" is always really "and what is wrong
+; with the other"; on a board with one it says which one and whether it
+; is carrying anything.
+#LINK_WHY_UNSET      = 0
+#LINK_WHY_WIRED_BOTH = 1   ; wired, and Wi-Fi was also available
+#LINK_WHY_WIRED_ONLY = 2   ; wired, and Wi-Fi had nothing to offer
+#LINK_WHY_WIRED_BARE = 3   ; wired with no address yet, nothing else at all
+#LINK_WHY_WIFI_NOCBL = 4   ; Wi-Fi, because there is no cable
+#LINK_WHY_WIFI_NOIP  = 5   ; Wi-Fi, because the wired side has no address
+#LINK_WHY_NONE_AT_ALL = 6  ; neither
+#LINK_WHY_ONLY_ONE   = 7   ; this board has exactly one link and it is it
+#LINK_WHY_NOT_HERE   = 8   ; the kind asked for is not on this board
+; ----------------------------------------------------------------------
+;  THE OPERATOR'S PIN IS A REASON IN ITS OWN RIGHT - 2026-09-10.
+;
+;  There was no code for it, so HwLinkOpen expressed the pin by HIDING
+;  the other interface's facts from LinkSelect: `net link wifi` passed
+;  wiredLink = 0 and wiredIp = 0. LinkSelect then reached its "Wi-Fi and
+;  the cable is out" arm and STAMPED #LINK_WHY_WIFI_NOCBL, so `net` on a
+;  board with a cable plugged in, negotiated and holding two addresses
+;  answered "there is nothing plugged into the Ethernet socket". That is
+;  the recorded misleading-status defect, and it was not a wording
+;  mistake: the sentence was a correct reading of a fact that had been
+;  falsified one layer up to express something else.
+;
+;  A pin is not a fact about a cable. It gets its own codes, LinkSelect
+;  is told the pin instead of being lied to about the hardware, and the
+;  sentences below say nothing about the other interface - because when
+;  an interface is pinned, what the other one is doing is exactly what
+;  the operator asked the board to stop considering.
+; ----------------------------------------------------------------------
+#LINK_WHY_PINNED     = 9   ; pinned, up, and holding an address
+#LINK_WHY_PIN_BARE   = 10  ; pinned and up, but holding no address yet
+#LINK_WHY_PIN_DOWN   = 11  ; pinned to an interface that is not up
+
+; The largest 802.3 frame this file will hand to either driver. 1514 is
+; the classic Ethernet maximum without the FCS. The RADIO's own limit is
+; smaller and is asked for at run time rather than written down here,
+; because it is a property of that driver's transmit buffer and would go
+; stale the day the buffer changes size.
+#LINK_ETH_MAX = 1514
+
+; The receive staging buffer for the WIRED path. The radio hands back a
+; pointer into its own single receive buffer and needs none of this; the
+; wired driver fills a buffer the caller supplies, so somebody has to own
+; one, and it is owned here rather than asked of every caller for the
+; same reason net.pi4 owns its transmit staging buffer: 1536 bytes of BSS
+; against a buffer in each of eight command implementations.
+;
+; 1536 IS THE MAC'S OWN CEILING (#GENET_MAX_FRAME), not a guess, so a
+; frame the controller was willing to receive can never be too large for
+; the buffer it lands in.
+#LINK_FRAME_MAX = 1536
+
+; What LinkPumpNet returns when nothing arrived. It is -1 rather than
+; #NET_IN_IGNORED because those are different facts and a caller that
+; counts frames needs to tell them apart: IGNORED means a frame came in
+; and was somebody else's, NONE means the slice expired in silence. Every
+; #NET_E_* is at or below -100, so -1 collides with nothing.
+#LINK_RX_NONE = -1
+
+Global gLinkKind.i = #HW_LINK_NONE
+Global gLinkWhy.i  = #LINK_WHY_UNSET
+; WHICH KIND THE OPERATOR HAS PINNED IT TO, or #HW_LINK_NONE for "choose
+; each time". A pin is not a selection: it narrows what the board offers
+; the policy, and the policy still has to find that kind usable. See the
+; note at the top of this file for why this is one kind rather than the
+; three #LINK_PREF_* constants it replaced.
+Global gLinkPin.i  = #HW_LINK_NONE
+Global gLinkSince.i                ; millis() when the choice was made
+Global gLinkSwaps.i                ; how many times the choice has changed
+Global gLinkTxOk.i
+Global gLinkTxFail.i
+Global gLinkRxFrames.i
+Global gLinkEapol.i                ; frames handed to the supplicant
+Global gLinkConsole.i              ; datagrams handed to the console
+Global Dim gLinkRx.a[#LINK_FRAME_MAX]
+Global gLinkRxLen.i
+Global gLinkRxPtr.i
+; The next addressed interface LinkPumpAllNet checks first. This is a
+; fairness cursor, not route selection: listening must not mutate the
+; operator's outbound preference merely because a frame arrived.
+Global gLinkPumpNext.i = 1
+
+; ----------------------------------------------------------------------
+;  LinkSelect - apply the preference. The four facts are the board's.
+;
+;    wiredLink  the PHY says a cable is in and the port negotiated
+;    wiredIp    the wired side has an IPv4 address to send from
+;    wifiUp     the radio is joined to a network
+;    wifiIp     the radio's side has an IPv4 address
+;
+;  Returns the kind chosen. It does NOT configure net.pi4 - the caller
+;  does that, because the address to apply is the caller's to know and
+;  applying the wrong one silently is exactly what this seam exists to
+;  stop.
+;
+;  THE PIN IS THE FIFTH FACT AND IT IS PASSED IN - 2026-09-10. It used
+;  to be applied by the caller zeroing the other interface's two facts
+;  before calling, which produced a stored reason that described
+;  hardware rather than the instruction that was actually given. See the
+;  #LINK_WHY_PIN* block above for what that printed. Every fact this
+;  procedure is given is now true, and the pin is one of them.
+; ----------------------------------------------------------------------
+Procedure.i LinkSelect(pin.i, wiredLink.i, wiredIp.i, wifiUp.i, wifiIp.i)
+  Define k.i
+  Define w.i
+  Define up.i
+  Define ip.i
+  k = #HW_LINK_NONE
+  w = #LINK_WHY_NONE_AT_ALL
+
+  ; ---- PINNED: one interface, its own two facts, and no opinion about
+  ; ---- the other one. "Use the cable" and "use whatever works" are
+  ; ---- different instructions and only one of them was given.
+  If pin <> #HW_LINK_NONE
+    up = 0
+    ip = 0
+    If pin = #HW_LINK_WIRED
+      up = wiredLink
+      ip = wiredIp
+    ElseIf pin = #HW_LINK_WIFI
+      up = wifiUp
+      ip = wifiIp
+    EndIf
+    If up = 0
+      k = #HW_LINK_NONE
+      w = #LINK_WHY_PIN_DOWN
+    ElseIf ip = 0
+      k = pin
+      w = #LINK_WHY_PIN_BARE
+    Else
+      k = pin
+      w = #LINK_WHY_PINNED
+    EndIf
+    If k <> gLinkKind
+      gLinkSwaps = gLinkSwaps + 1
+      gLinkSince = millis()
+    EndIf
+    gLinkKind = k
+    gLinkWhy = w
+    ProcedureReturn k
+  EndIf
+
+  If wiredLink <> 0 And wiredIp <> 0
+    k = #HW_LINK_WIRED
+    If wifiUp <> 0 And wifiIp <> 0
+      w = #LINK_WHY_WIRED_BOTH
+    Else
+      w = #LINK_WHY_WIRED_ONLY
+    EndIf
+  ElseIf wifiUp <> 0 And wifiIp <> 0
+    k = #HW_LINK_WIFI
+    If wiredLink = 0
+      w = #LINK_WHY_WIFI_NOCBL
+    Else
+      w = #LINK_WHY_WIFI_NOIP
+    EndIf
+  ElseIf wiredLink <> 0
+    k = #HW_LINK_WIRED
+    w = #LINK_WHY_WIRED_BARE
+  EndIf
+
+  If k <> gLinkKind
+    gLinkSwaps = gLinkSwaps + 1
+    gLinkSince = millis()
+  EndIf
+  gLinkKind = k
+  gLinkWhy = w
+  ProcedureReturn k
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LinkUseKind - the one-link board's version of LinkSelect.
+;
+;  A board with exactly one interface has no preference to apply, and
+;  making it call LinkSelect with two of the four facts hard-wired to
+;  zero would produce a stored reason ("Wi-Fi is not joined") about a
+;  radio that does not exist. That is precisely the lie the stored-reason
+;  design exists to prevent - see the note at the top of this file.
+;
+;  So it says which kind it is using and the board is asked whether it
+;  actually has one. A kind the board does not have is REFUSED here
+;  rather than accepted and then found empty at the first Send: nothing
+;  further can go right after that point, and the failure would present
+;  as a network that silently drops everything.
+;
+;  Returns the kind in use, or #HW_LINK_NONE.
+; ----------------------------------------------------------------------
+Procedure.i LinkUseKind(kind.i)
+  Define k.i
+  k = #HW_LINK_NONE
+  If kind <> #HW_LINK_NONE
+    If HwLinkHas(kind) <> 0
+      k = kind
+    EndIf
+  EndIf
+  If k <> gLinkKind
+    gLinkSwaps = gLinkSwaps + 1
+    gLinkSince = millis()
+  EndIf
+  gLinkKind = k
+  If k = #HW_LINK_NONE
+    gLinkWhy = #LINK_WHY_NOT_HERE
+  Else
+    gLinkWhy = #LINK_WHY_ONLY_ONE
+  EndIf
+  ProcedureReturn k
+EndProcedure
+
+Procedure LinkForget()
+  gLinkKind = #HW_LINK_NONE
+  gLinkWhy = #LINK_WHY_UNSET
+EndProcedure
+
+Procedure.i LinkKind()
+  ProcedureReturn gLinkKind
+EndProcedure
+
+Procedure.i LinkUp()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i LinkWhy()
+  ProcedureReturn gLinkWhy
+EndProcedure
+
+; THE BOARD NAMES ITS OWN INTERFACES. This used to be two literals here,
+; which is how "the wired Ethernet" would have ended up describing a
+; serial line on the next board.
+Procedure.i LinkName()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn "no interface"
+  EndIf
+  ProcedureReturn HwLinkName(gLinkKind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PIN - the operator's override of the preference order.
+;
+;  LinkSetPin FORGETS THE CURRENT CHOICE, always, and that is not tidying
+;  up. A pin that left the previous selection in place would be obeyed on
+;  the NEXT command and not on this one, so `net link wired` followed by
+;  `net` would report the radio and there would be nothing on the
+;  terminal to explain it. The next command re-chooses, under the new
+;  pin, and says which and why.
+; ----------------------------------------------------------------------
+Procedure.i LinkPin()
+  ProcedureReturn gLinkPin
+EndProcedure
+
+Procedure LinkSetPin(kind.i)
+  gLinkPin = kind
+  LinkForget()
+EndProcedure
+
+; The six bytes frames actually leave with, for the kind that won. DHCP
+; puts this in the packet as the client hardware address (RFC 2131
+; chaddr) and the server addresses its reply to it, so handing over the
+; wired card's six bytes while a radio carries the conversation produces
+; an OFFER broadcast to a MAC nobody answers to, and no error anywhere.
+; That happened on silicon on 2026-09-04.
+Procedure.i LinkMacPtr()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn HwLinkMacPtr(gLinkKind)
+EndProcedure
+
+; How fast the link in use is running, in megabits per second, or
+; #HW_LINK_SPEED_UNKNOWN. NO SELECTION IS UNKNOWN AND NOT ZERO: zero is
+; a measurement of a link running at no speed, which is a different
+; claim from having nothing to measure.
+Procedure.i LinkSpeed()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn #HW_LINK_SPEED_UNKNOWN
+  EndIf
+  ProcedureReturn HwLinkSpeed(gLinkKind)
+EndProcedure
+
+Procedure.i LinkDuplex()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
+  EndIf
+  ProcedureReturn HwLinkDuplex(gLinkKind)
+EndProcedure
+
+; What the DRIVER under the link in use last had to say, as the address
+; of a lowercase phrase. Empty when there is nothing to say - which is
+; the ordinary answer, and the caller prints no line at all for it
+; rather than an empty one.
+Procedure.i LinkWhyLink()
+  If gLinkKind = #HW_LINK_NONE
+    ProcedureReturn ""
+  EndIf
+  ProcedureReturn HwLinkWhyText(gLinkKind)
+EndProcedure
+
+; The sentence `net` prints. Both interfaces are named in every one of
+; them: the operator's real question is never "which one" on its own.
+Procedure.i LinkWhyText()
+  Select gLinkWhy
+    Case #LINK_WHY_WIRED_BOTH
+      ProcedureReturn "the cable is in, the port negotiated and this board has an address for it - and the wired side is preferred when both are usable"
+    Case #LINK_WHY_WIRED_ONLY
+      ProcedureReturn "the cable is in and this board has an address for it, and the radio is not joined to a network with an address of its own"
+    Case #LINK_WHY_WIRED_BARE
+      ProcedureReturn "the cable is in but no address is set for it yet, and the radio has nothing either - so traffic goes out of the wired port because dhcp has to run over something"
+    Case #LINK_WHY_WIFI_NOCBL
+      ProcedureReturn "the radio is joined and has an address, and there is nothing plugged into the Ethernet socket"
+    Case #LINK_WHY_WIFI_NOIP
+      ProcedureReturn "the radio is joined and has an address, and the cable is in but no address is set for the wired side - run dhcp with a cable in to move traffic onto it"
+    Case #LINK_WHY_NONE_AT_ALL
+      ProcedureReturn "nothing is plugged into the Ethernet socket and the radio is not joined to a network, so there is no interface to carry anything"
+    Case #LINK_WHY_ONLY_ONE
+      ProcedureReturn "this board has exactly one interface Anvil can reach, and that is the one carrying traffic - there is nothing to prefer it over"
+    Case #LINK_WHY_NOT_HERE
+      ProcedureReturn "the interface this board was asked to use is not one it has, so nothing is carrying traffic - check which link the board file declares in HwLinkHas"
+    Case #LINK_WHY_PINNED
+      ProcedureReturn "the operator pinned this interface with net link and it is up and holds an address, so nothing else is considered at all - whatever the other interface is doing is deliberately not part of this answer"
+    Case #LINK_WHY_PIN_BARE
+      ProcedureReturn "the operator pinned this interface with net link and it is up, but no address is set for it yet - run dhcp, or set one with net address, and nothing else will be tried in the meantime because a pin refuses rather than falls back"
+    Case #LINK_WHY_PIN_DOWN
+      ProcedureReturn "the operator pinned an interface with net link and that interface is not up, so nothing is carrying traffic - a pin REFUSES rather than falling back to the other interface, and net link auto undoes it"
+    Default
+      ProcedureReturn "no link has been chosen yet - run net, ping, dhcp or any other network command and one will be"
+  EndSelect
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LinkTxMax - the largest 802.3 frame the CURRENT link will carry.
+;
+;  THIS IS THE NUMBER THAT MAKES TCP's SEND CEILING A RUN-TIME QUESTION
+;  ON THIS BOARD, and the reason is not the network, it is the radio's
+;  transmit buffer: cyw43.pi4 builds a frame in place inside a buffer
+;  that also has to hold the SDPCM and BDC headers, and Cyw43Send
+;  REFUSES anything longer rather than truncating it. A truncated TCP
+;  segment is not a shorter message, it is a corrupt one, so the refusal
+;  is right and the ceiling has to be respected upstream.
+;
+;  Asked of the driver rather than written down, so that the day
+;  #CYW43_TXBUF changes this answer changes with it.
+; ----------------------------------------------------------------------
+Procedure.i LinkTxMaxOn(kind.i)
+  Define m.i
+  If kind = #HW_LINK_NONE
+    ProcedureReturn 0
+  EndIf
+  m = HwLinkTxMax(kind)
+  ; THE 1514 CEILING IS APPLIED HERE, NOT LEFT TO EACH BACKEND. A board
+  ; that answered larger would be inviting tcp.pi4 to build a segment no
+  ; classic Ethernet peer will accept, and a bug of that shape appears as
+  ; a transfer that works on the bench and fails through one switch.
+  If m > #LINK_ETH_MAX
+    m = #LINK_ETH_MAX
+  EndIf
+  If m < 0
+    m = 0
+  EndIf
+  ProcedureReturn m
+EndProcedure
+
+; Compatibility wrapper for command paths whose endpoint really is the
+; currently selected outbound interface.
+Procedure.i LinkTxMax()
+  ProcedureReturn LinkTxMaxOn(gLinkKind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LinkTxStaged - put whatever net.pi4 has staged onto the wire. 1 if it
+;  went, 0 if it did not, and the counters say which way.
+;
+;  ZERO LENGTH IS NOT AN ERROR AND IS NOT SENT. "Nothing staged" is the
+;  normal answer after a NetInput that had no reply to make, and sending
+;  an empty frame instead would be the kind of unforced packet that
+;  fills a switch's counters and nothing else.
+;
+;  WHICH DRIVERS COPY AND WHICH DO NOT IS NO LONGER THIS FILE'S BUSINESS.
+;  It used to be: the wired MAC reads from wherever it is pointed, while
+;  the radio transmits out of its own buffer and so needed the frame
+;  copied in first, and that copy was written out here with a comment
+;  explaining which board it was for. It now happens inside the backend
+;  that needs it (RaspberryPi4/Board/hw_link.pi4), where the buffer it
+;  copies into is actually declared.
+;
+;  A FRAME LONGER THAN THE LINK WILL CARRY IS REFUSED, NOT TRUNCATED. A
+;  truncated TCP segment is not a shorter message, it is a corrupt one.
+;  The check is here as well as in the backend because the ceiling is
+;  the seam's promise and the seam is what upstream reads.
+; ----------------------------------------------------------------------
+Procedure.i LinkTxStagedOn(kind.i)
+  Define n.i
+  n = NetOutLen()
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  If kind = #HW_LINK_NONE
+    gLinkTxFail = gLinkTxFail + 1
+    ProcedureReturn 0
+  EndIf
+  If n > LinkTxMaxOn(kind)
+    gLinkTxFail = gLinkTxFail + 1
+    ProcedureReturn 0
+  EndIf
+  If HwLinkSend(kind, NetOutBuf(), n, 100) <> 1
+    gLinkTxFail = gLinkTxFail + 1
+    ProcedureReturn 0
+  EndIf
+  gLinkTxOk = gLinkTxOk + 1
+  ProcedureReturn 1
+EndProcedure
+
+; Compatibility wrapper for command-owned packets built on LinkKind().
+Procedure.i LinkTxStaged()
+  ProcedureReturn LinkTxStagedOn(gLinkKind)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LinkPumpNet - one slice of the pump, whichever link is up.
+;
+;  This is the line every caller used to write out by hand, seventeen
+;  times, against one driver:
+;
+;      a frame in       GenetRecvWait / Cyw43Receive
+;      what is it       NetInput
+;      its reply out    LinkTxStaged, if one was staged
+;
+;  and two things that only SOME links need, which is why they are asked
+;  of the board rather than written out here:
+;
+;  1. AN EAPOL FRAME IS NOT IP AND MUST NOT REACH NetInput. Ethertype
+;     $888E is a mid-session WPA2 rekey. NetInput does not know that
+;     ethertype and drops it, which is correct of NetInput and fatal in
+;     context: the access point rekeys every so often, and a board that
+;     ignores it keeps transmitting under a key nobody will decrypt any
+;     more. The link then dies silently in the middle of whatever was
+;     running. That is the disturbance the brief asks a TCP transfer to
+;     survive, and it survives it because the board gets first refusal on
+;     every frame through HwLinkOfferRaw.
+;  2. A CONSOLE DATAGRAM IS TAKEN, NOT RETURNED. Over Wi-Fi the operator
+;     is typing INTO the same interface the command is using. Handing
+;     the console's UDP back to a command that is looking for TCP would
+;     drop the keystrokes, and the console going deaf for the duration
+;     of a long command is exactly the complaint that produced the
+;     escape hatch in the first place. That is HwLinkOfferUdp.
+;
+;  BOTH ARE ASKED ON EVERY LINK, AND THAT IS CHEAPER THAN IT LOOKS. A
+;  board with nothing to say answers 0 and the frame carries on. Making
+;  them conditional on the kind would put a list of which kinds need
+;  which hook back into this file, which is the knowledge that was just
+;  moved out of it.
+;
+;  ***THE SLICE MUST BE LONGER THAN ONE FRAME'S TIME ON THE WIRE, AND ON
+;  A SLOW LINK THAT IS NOT A SMALL NUMBER.*** This procedure asks the
+;  backend for a frame and gives it `ms` to produce one. On a MAC or a
+;  radio the frame is already assembled in a buffer, so any slice works
+;  and the habit of passing 5 or 10 grew up there. ON A SERIAL LINK THE
+;  FRAME IS STILL ARRIVING: at 115200 a byte is 87 microseconds, a
+;  60-octet echo reply is 5.4 milliseconds and a full-size datagram is
+;  over 130. A slice shorter than that returns empty-handed in the middle
+;  of a perfectly good frame.
+;
+;  IT DOES NOT PRESENT AS A TIMEOUT. It presents as LOSS, and selective
+;  loss at that - the short frames mostly get through and the long ones
+;  never do, which reads exactly like a link that cannot carry a big
+;  packet. Measured on the UNO Q's SLIP link, 2026-09-07: with a 10
+;  millisecond slice, echo replies came back between four and eight times
+;  out of eight run to run and a 576-octet TCP segment came back NEVER -
+;  0 for 4 across four runs, while the driver's byte counter accounted
+;  for every single byte the host had sent. With a 200 millisecond slice,
+;  the same image on the same wire got 8 of 8 echoes and a kilobyte each
+;  way byte for byte, at 7,613 bytes a second.
+;
+;  So a caller on a slow link sizes its slice from the wire. The number
+;  belongs to the caller because only the caller knows the largest frame
+;  it expects; what belongs here is the warning that a small one is not
+;  merely inefficient, it is wrong.
+;
+;  EVERY FRAME GOES TO NetInput EVEN WHEN IT IS NOT OURS, and this must
+;  not be optimised away: an ARP request from a neighbour is answered
+;  there, a ping is answered there, and any frame at all from a
+;  neighbour pushes that neighbour's cache entry forward through
+;  net_ConfirmNeighbour. That last one is why a long transfer no longer
+;  loses its next hop halfway through, and it happens as a SIDE EFFECT
+;  of calling NetInput.
+; ----------------------------------------------------------------------
+Procedure.i LinkPumpKind(kind.i, ms.i)
+  Define n.i
+  Define r.i
+  Define p.i
+  Define o.i
+
+  gLinkRxLen = 0
+  gLinkRxPtr = 0
+
+  If kind = #HW_LINK_NONE
+    ProcedureReturn #LINK_RX_NONE
+  EndIf
+
+  n = HwLinkRecv(kind, @gLinkRx[0], #LINK_FRAME_MAX, ms)
+  If n < 14
+    ; Shorter than an Ethernet header is not a frame. The wired driver
+    ; already refuses those; a radio hands back the runts it was given.
+    ProcedureReturn #LINK_RX_NONE
+  EndIf
+
+  ; WHERE IT ACTUALLY IS. A backend that filled our buffer says so by
+  ; handing that address back; one with its own buffer hands back its
+  ; own and nothing is copied. A backend that answers 0 has not
+  ; implemented the seam, and rather than read from address zero this
+  ; falls back to the buffer that WAS offered - which is either right or
+  ; empty, and empty is a dropped frame rather than a fault.
+  p = HwLinkRxPtr(kind)
+  If p = 0
+    p = @gLinkRx[0]
+  EndIf
+
+  ; The board's first refusal, before the IP layer sees anything. On the
+  ; Pi 4's radio this is the WPA2 rekey.
+  If HwLinkOfferRaw(kind, p, n) <> 0
+    gLinkEapol = gLinkEapol + 1
+    gLinkRxLen = n
+    gLinkRxPtr = p
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+
+  gLinkRxFrames = gLinkRxFrames + 1
+  gLinkRxLen = n
+  gLinkRxPtr = p
+
+  ; ==================================================================
+  ;  POINT THE ONE IP LAYER AT THE INTERFACE THIS FRAME ARRIVED ON,
+  ;  BEFORE IT IS PARSED. MEASURED ON SILICON 2026-09-07, build 14.
+  ; ==================================================================
+  ;  THIS FILE IS THE SECOND CONSUMER OF THE WIRE AND IT WAS THE ONE
+  ;  NOBODY HAD TAUGHT. Anvil/Core/netconsole.pbi's pump learned it when
+  ;  the per-interface table was written; this one is reached from
+  ;  TcpTick() on EVERY spin of the prompt, so at an idle prompt the two
+  ;  RACE for each frame - and when this one won, the frame was judged
+  ;  against whatever address the stack happened to be holding.
+  ;
+  ;  WHAT THAT COST, and it took an hour to corner because every part
+  ;  of it reads as working: the board came up holding
+  ;  a link-local address on the cable and a private lease on the radio, `net`
+  ;  reported both, the console announced both, and the radio answered
+  ;  from the laptop. The cable answered NOTHING - not the console, not
+  ;  even ARP - so the laptop could not resolve the board's hardware
+  ;  address and its datagrams never left the machine. The moment the
+  ;  board ran a command with a pump of its own the cable came alive,
+  ;  which made it look like a timing fault. It was not: an ARP request
+  ;  for the cable's address, evaluated while the stack held the
+  ;  radio's, is somebody else's conversation and is correctly ignored.
+  ;
+  ;  A BOARD THAT DOES NOT ANSWER ARP CANNOT BE SPOKEN TO AT ALL, and
+  ;  nothing anywhere reports it: the asker gets silence, and the board
+  ;  never saw a datagram to log. That is the whole class of fault this
+  ;  work exists to end, so the rule belongs at EVERY point that hands
+  ;  a frame to NetInput - which is here and in the console's pump, and
+  ;  there is no third.
+  ;
+  ;  IT IS ONE ARGUMENT NOW AND IT WAS TWO LINES. Until 2026-09-08 the
+  ;  IP layer had ONE identity and this read
+  ;  `NetIfActivate(gLinkKind)` followed by `NetInput(p, n)` - point the
+  ;  stack at this link, then parse. Two statements in a required order
+  ;  is a rule a reader has to know; net.pi4 now holds a row per
+  ;  interface and the link is simply the first argument, so the frame
+  ;  cannot be parsed as anybody but the interface it arrived on.
+  ; ==================================================================
+  r = NetInput(kind, p, n)
+
+  ; A REPLY WE ASKED FOR IS THE ONLY THING THAT PROVES A LINK IS ALIVE IN
+  ; BOTH DIRECTIONS. A radio firmware will happily go on claiming an
+  ; association while nothing we transmit reaches anybody, and the
+  ; detector that notices reads one clock, which the console pump used
+  ; to be the only thing to wind. Now that this file consumes frames
+  ; too, it winds it as well. Getting this wrong made the self-heal fire
+  ; in the middle of the very first `http get` on silicon, on a link
+  ; that was working. The board decides what, if anything, to do with
+  ; the verdict.
+  HwLinkNoteRx(kind, r)
+
+  ; One automatic dispatcher owns ARP/ICMP replies, established TCP,
+  ; DHCP service and console UDP regardless of which hardware pump won
+  ; the frame. Command-owned UDP is left visible to the caller.
+  o = NetServiceInput(kind, p, r)
+  If o <> 0
+    gLinkConsole = gLinkConsole + 1
+    ProcedureReturn #NET_IN_IGNORED
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; The legacy selected-link pump remains the right primitive for a command
+; that owns one outbound route. It is deliberately only a wrapper now.
+Procedure.i LinkPumpNet(ms.i)
+  ProcedureReturn LinkPumpKind(gLinkKind, ms)
+EndProcedure
+
+; Poll every usable addressed interface without changing LinkKind(). A
+; passive TCP open is a wildcard local endpoint, and established sockets
+; may coexist on different interfaces, so route preference is not a
+; receive policy. At most one frame is returned: NetInput's receive
+; coordinates and the driver's zero-copy buffer remain valid until the
+; caller finishes handling that frame.
+Procedure.i LinkPumpAllNet(ms.i)
+  Define off.i
+  Define kind.i
+  Define n.i
+  Define first.i
+  Define usable.i
+  Define only.i
+
+  first = gLinkPumpNext
+  If first < 1 Or first >= #NET_IF_KINDS
+    first = 1
+  EndIf
+  usable = 0
+
+  ; Count first. A one-interface board gets the caller's entire slice in
+  ; one receive call; this preserves slow serial framing, where a zero-ms
+  ; probe can be shorter than the time needed to assemble one frame.
+  For kind = 1 To #NET_IF_KINDS - 1
+    If NetIfUsable(kind) <> 0
+      usable = usable + 1
+      only = kind
+    EndIf
+  Next
+  If usable = 0
+    ProcedureReturn #LINK_RX_NONE
+  EndIf
+  If usable = 1
+    ProcedureReturn LinkPumpKind(only, ms)
+  EndIf
+
+  ; With multiple MAC/radio interfaces, first take anything already
+  ; assembled without waiting. This prevents a quiet first interface from
+  ; imposing its whole slice on a busy second one. If all are idle, wait
+  ; once on the rotating first interface.
+  For off = 0 To #NET_IF_KINDS - 2
+    kind = 1 + ((first - 1 + off) % (#NET_IF_KINDS - 1))
+    If NetIfUsable(kind) <> 0
+      n = LinkPumpKind(kind, 0)
+      If n <> #LINK_RX_NONE
+        gLinkPumpNext = kind + 1
+        If gLinkPumpNext >= #NET_IF_KINDS
+          gLinkPumpNext = 1
+        EndIf
+        ProcedureReturn n
+      EndIf
+    EndIf
+  Next
+
+  If ms > 0
+    kind = first
+    While kind < #NET_IF_KINDS And NetIfUsable(kind) = 0
+      kind = kind + 1
+    Wend
+    If kind >= #NET_IF_KINDS
+      kind = 1
+      While kind < first And NetIfUsable(kind) = 0
+        kind = kind + 1
+      Wend
+    EndIf
+    If kind < #NET_IF_KINDS And NetIfUsable(kind) <> 0
+      n = LinkPumpKind(kind, ms)
+      If n <> #LINK_RX_NONE
+        gLinkPumpNext = kind + 1
+        If gLinkPumpNext >= #NET_IF_KINDS
+          gLinkPumpNext = 1
+        EndIf
+        ProcedureReturn n
+      EndIf
+    EndIf
+  EndIf
+
+  ; Rotate even across an idle slice. With two quiet interfaces this keeps
+  ; a blocking wait from always favouring the same wire.
+  gLinkPumpNext = first + 1
+  If gLinkPumpNext >= #NET_IF_KINDS
+    gLinkPumpNext = 1
+  EndIf
+  ProcedureReturn #LINK_RX_NONE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  LinkPumpAllNetPrefer - listen on every usable interface, but SPEND THE
+;  SLICE on the one the answer is coming back on.
+;
+;  THE RULE: A STOP-AND-WAIT TRANSFER'S BLOCKING WAIT BELONGS ON THE WIRE
+;  ITS ANSWERS ARRIVE ON. Everything else is still listened to; it is
+;  only the WAITING that is owned by one interface.
+;
+;  WHAT IT IS FOR. LinkPumpAllNet above is a FAIR pump: it polls
+;  everything at zero, then blocks its whole slice on the rotating
+;  gLinkPumpNext. Fairness is right for a listener with no expectation -
+;  a passive TCP open, an idle prompt - because no interface is more
+;  likely than another to hold the next frame. It is exactly wrong for a
+;  caller that has just SENT something and knows which wire the reply is
+;  coming back over.
+;
+;  THE MEASURED SYMPTOM, 2026-09-16. This board holds the cable
+;  (169.254.170.250 and the served alias 192.168.137.1) AND a lease on
+;  the radio (192.168.1.22), so both interfaces are usable and the fair
+;  pump's blocking branch is live. TFTP is stop-and-wait: the board sends
+;  DATA n and the host acknowledges in about a millisecond. Follow the
+;  cursor through one block with two usable kinds:
+;
+;    turn 1  the sweep takes ACK n off the cable and sets the cursor to
+;            WIRED+1, which is the radio; the next block goes out
+;    turn 2  the sweep runs microseconds later and the host has not
+;            answered yet, so nothing is anywhere - and the slice is
+;            spent BLOCKED ON THE RADIO. ACK n+1 lands on the cable a
+;            millisecond in and sits there for the remaining 199
+;    turn 3  the sweep finds it at zero wait, and it all happens again
+;
+;  So it is not "half the time" and the rotation never rescues it: every
+;  single block costs one whole #ETH_SLICE_MS. 512 bytes per 200 ms is
+;  about 2.5 KB/s, which made a 98,304-byte put take about forty seconds
+;  and a 1,812,000-byte one about twelve minutes - past #ETH_MAX_MS, so
+;  the monitor would have refused it even if the host tool had waited.
+;  The transfer was killed at 500 s on 2026-09-16 06:21 and the lane fell
+;  back to reading the waveform over the console at 1.7 KB/s.
+;
+;  THE SWEEP IS STILL EVERY INTERFACE, and that is not politeness. The
+;  other wire carries ARP requests this board must answer, ICMP, the DHCP
+;  service it runs on the cable, and console keystrokes - including the
+;  one that cancels this transfer. A pump that listened only to the
+;  preferred kind would make the board deaf on the other one for the
+;  length of a transfer, which is the defect NetIfClaimRx was written to
+;  end and not a licence to recreate it one layer down.
+;
+;  THE ROTATION STATE IS NOT TOUCHED. gLinkPumpNext belongs to
+;  LinkPumpAllNet's fairness and this procedure has no opinion about it,
+;  so tcp.pi4 and every other caller of the fair pump are unchanged by
+;  the existence of this one.
+;
+;  #ETH_SLICE_MS STAYS AT 200 AND THAT IS DELIBERATE. A deadline is a
+;  CEILING, not a cost: HwLinkRecv's waiting form returns the instant a
+;  frame arrives (RaspberryPi4/Board/hw_link.pi4 -> GenetRecvWait), so
+;  once the wait is on the right wire a block costs the host's round trip
+;  - one or two milliseconds - and the 200 only decides how long a DEAD
+;  transfer sits between its own retransmissions. Shrinking it would buy
+;  nothing here and would cost the thing link.pi4's own header warns
+;  about: a slice shorter than the time a slow link needs to assemble one
+;  frame turns a working transfer into a stream of runts.
+;
+;  A CALLER WITH NOTHING TO PREFER GETS THE FAIR PUMP. prefer is
+;  XferKind()'s routed interface; before a transfer has routed, or if
+;  that interface has gone away underneath it, there is no wire that is
+;  more likely than the others and blocking on an absent one would be a
+;  slice spent on nothing at all.
+; ----------------------------------------------------------------------
+Procedure.i LinkPumpAllNetPrefer(prefer.i, ms.i)
+  Define off.i
+  Define kind.i
+  Define n.i
+
+  If prefer < 1 Or prefer >= #NET_IF_KINDS
+    ProcedureReturn LinkPumpAllNet(ms)
+  EndIf
+  If NetIfUsable(prefer) = 0
+    ProcedureReturn LinkPumpAllNet(ms)
+  EndIf
+
+  ; Everything already assembled, everywhere, without waiting anywhere.
+  ; The preferred interface is asked FIRST so that the common case - the
+  ; reply is already in the ring - costs one call.
+  For off = 0 To #NET_IF_KINDS - 2
+    kind = 1 + ((prefer - 1 + off) % (#NET_IF_KINDS - 1))
+    If NetIfUsable(kind) <> 0
+      n = LinkPumpKind(kind, 0)
+      If n <> #LINK_RX_NONE
+        ProcedureReturn n
+      EndIf
+    EndIf
+  Next
+
+  ; Nothing was waiting anywhere, so the slice goes where the answer is
+  ; coming from. It ends early the moment that answer arrives.
+  If ms > 0
+    ProcedureReturn LinkPumpKind(prefer, ms)
+  EndIf
+  ProcedureReturn #LINK_RX_NONE
+EndProcedure
+
+Procedure.i LinkRxPtr()
+  ProcedureReturn gLinkRxPtr
+EndProcedure
+
+Procedure.i LinkRxLen()
+  ProcedureReturn gLinkRxLen
+EndProcedure
+
+Procedure.i LinkRxFrames()
+  ProcedureReturn gLinkRxFrames
+EndProcedure
+
+Procedure.i LinkTxCount()
+  ProcedureReturn gLinkTxOk
+EndProcedure
+
+Procedure.i LinkTxFails()
+  ProcedureReturn gLinkTxFail
+EndProcedure
+
+Procedure.i LinkEapolCount()
+  ProcedureReturn gLinkEapol
+EndProcedure
+
+Procedure.i LinkConsoleCount()
+  ProcedureReturn gLinkConsole
+EndProcedure
+
+Procedure.i LinkSwaps()
+  ProcedureReturn gLinkSwaps
+EndProcedure
+
+Procedure.i LinkSince()
+  ProcedureReturn gLinkSince
+EndProcedure

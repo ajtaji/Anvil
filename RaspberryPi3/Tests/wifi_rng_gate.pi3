@@ -1,0 +1,95 @@
+; Emitted model for the exact Pi 3 Wi-Fi RNG start/read procedures.
+; @@RNG_DEFS@@
+
+Global mock_rng_ctrl.i
+Global mock_rng_fifo.i
+Global mock_rng_index.i
+Global mock_rng_time.i
+Global mock_rng_warmup_writes.i
+Global mock_rng_enable_writes.i
+Global mock_rng_read_error.i
+Global mock_rng_write_error.i
+Global Dim mock_rng_data.l[8]
+
+Procedure.i Pi3WifiRngReadReg(offset.i)
+  If mock_rng_read_error <> 0
+    ProcedureReturn -1
+  EndIf
+  If offset = #PI3_WIFI_RNG_CTRL
+    ProcedureReturn mock_rng_ctrl
+  EndIf
+  If offset = #PI3_WIFI_RNG_STATUS
+    ProcedureReturn (mock_rng_fifo << 24) & $FF000000
+  EndIf
+  If offset = #PI3_WIFI_RNG_DATA
+    If mock_rng_fifo < 1 Or mock_rng_index >= 8
+      ProcedureReturn -1
+    EndIf
+    mock_rng_fifo = mock_rng_fifo - 1
+    mock_rng_index = mock_rng_index + 1
+    ProcedureReturn mock_rng_data[mock_rng_index - 1]
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure Pi3WifiRngWriteReg(offset.i, value.i)
+  If mock_rng_write_error <> 0
+    ProcedureReturn
+  EndIf
+  If offset = #PI3_WIFI_RNG_STATUS And value = #PI3_WIFI_RNG_WARMUP
+    mock_rng_warmup_writes = mock_rng_warmup_writes + 1
+  EndIf
+  If offset = #PI3_WIFI_RNG_CTRL And value = #PI3_WIFI_RNG_RBGEN
+    mock_rng_enable_writes = mock_rng_enable_writes + 1
+    mock_rng_ctrl = value
+  EndIf
+EndProcedure
+
+Procedure.i Pi3Micros()
+  mock_rng_time = mock_rng_time + 1
+  ProcedureReturn mock_rng_time
+EndProcedure
+
+Procedure.i Pi3DelayUs(us.i)
+  mock_rng_time = mock_rng_time + us
+  ProcedureReturn 1
+EndProcedure
+
+; @@RNG_PROCS@@
+
+Procedure.i Main()
+  Protected r.i, i.i
+  Protected Dim out.a[32]
+
+  mock_rng_ctrl = 0 : mock_rng_fifo = 0 : mock_rng_index = 0 : mock_rng_time = 0
+  mock_rng_warmup_writes = 0 : mock_rng_enable_writes = 0
+  If Pi3WifiRngStart() <> #PI3_WIFI_RNG_READY : ProcedureReturn 1 : EndIf
+  If mock_rng_warmup_writes <> 1 Or mock_rng_enable_writes <> 1 Or mock_rng_ctrl <> 1 : ProcedureReturn 2 : EndIf
+  If Pi3WifiRngStart() <> #PI3_WIFI_RNG_READY Or mock_rng_warmup_writes <> 1 : ProcedureReturn 3 : EndIf
+
+  For i = 0 To 7
+    mock_rng_data[i] = $10203040 + i
+  Next
+  mock_rng_fifo = 8 : mock_rng_index = 0
+  r = Pi3WifiRngBytes(@out[0], 32, 1000000)
+  If r <> 32 Or mock_rng_index <> 8 Or mock_rng_fifo <> 0 : ProcedureReturn 4 : EndIf
+  For i = 0 To 7
+    If PeekL(@out[0] + i * 4) <> ($10203040 + i) : ProcedureReturn 5 : EndIf
+  Next
+
+  ; No-data timeout must fail closed and erase partial nonce bytes.
+  For i = 0 To 31 : out[i] = $5A : Next
+  mock_rng_fifo = 0 : mock_rng_time = 0
+  r = Pi3WifiRngBytes(@out[0], 32, 68)
+  If r <> 0 Or Pi3WifiRngError() <> 7 : ProcedureReturn 6 : EndIf
+  For i = 0 To 31
+    If out[i] <> 0 : ProcedureReturn 7 : EndIf
+  Next
+  If Pi3WifiRngBytes(@out[0], 30, 1000) <> 0 Or Pi3WifiRngError() <> 3 : ProcedureReturn 8 : EndIf
+
+  ; Readback failure after a fresh enable refuses the RNG rather than using
+  ; timer values or stale FIFO words as entropy.
+  mock_rng_ctrl = 0 : mock_rng_read_error = 1 : mock_rng_warmup_writes = 0
+  If Pi3WifiRngStart() <> #PI3_WIFI_RNG_ERROR Or Pi3WifiRngError() <> 1 : ProcedureReturn 9 : EndIf
+  ProcedureReturn 0
+EndProcedure

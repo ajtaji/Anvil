@@ -1,0 +1,466 @@
+; ======================================================================
+;  anvilqdrbg.unoq - Arduino UNO Q (QCM2290): PROVE THE HMAC-DRBG ON THIS
+;                   BOARD, AND SEED IT FROM THE FIRMWARE'S RNG.
+;
+;  WHY THIS EXISTS. "A real entropy source" has been the top owed item
+;  in this project since 2026-08-23 and it is the only thing that has
+;  kept drbg.pi4 off the Arduino UNO Q. On 2026-09-05 the UEFI protocol
+;  database walk (anvilqefiprobe.unoq) ran on this board and found
+;  EFI_RNG_PROTOCOL PRESENT, answering GetRNG with 32 non-zero bytes.
+;  ArduinoQ/Lib/qentropy_q.pi4 wires that into the seam drbg.pi4 already
+;  had. This program is the proof that the wiring works ON SILICON.
+;
+;  IT ASKS TWO SEPARATE QUESTIONS AND KEEPS THEM SEPARATE, because they
+;  fail for entirely different reasons and a single verdict would hide
+;  which one broke:
+;
+;    PART 1 - THE KNOWN-ANSWER TEST. 22 vectors, case 0 a real NIST CAVP
+;      HMAC_DRBG SHA-256 known-answer vector with reseed, case 1 a
+;      no-reseed variant, then 20 random cases whose expected outputs
+;      come from an independent Python reimplementation of SP 800-90A
+;      anchored to that NIST vector. Every case is the CAVP shape:
+;      Instantiate, optional Reseed, Generate twice, keep the second.
+;      This uses NO entropy at all - the seeds are in the vector file -
+;      so it proves the algorithm on A64 silicon and nothing else. If
+;      this fails, the arithmetic is wrong and the entropy question does
+;      not arise.
+;
+;    PART 2 - THE ENTROPY PATH. EntropyBegin, EntropyWarmupWait,
+;      EntropyBytes through EFI_RNG_PROTOCOL, then DrbgAutoSeed() -
+;      which gathers 48 bytes, refuses a constant seed by name
+;      (DrbgSeedUsable), and instantiates. Then DrbgGenerate twice, and
+;      the two outputs are compared: A DRBG THAT PRODUCES THE SAME BYTES
+;      TWICE IS BROKEN, and that is a check worth making explicitly
+;      because a stuck generator passes every other test here.
+;      It also takes two independent 32-byte reads straight from the
+;      firmware and compares those, which separates "the DRBG is stuck"
+;      from "the firmware's RNG is stuck".
+;
+;  NO REGISTER IS TOUCHED. Like the protocol walk, every address this
+;  program dereferences was handed to it by the firmware. It cannot hang
+;  the bus.
+;
+;  It reports through both proven channels - the UEFI variable sink
+;  (qsink.pi4 -> AnvilQTxt) and \EFI\anvil\qdrbg.log on the ESP - then
+;  resets back to Debian, which is the default boot entry, so the board
+;  always comes back.
+;
+;  BUILD:  bash tools/build_unoq_drbg.sh
+;  GATE:   python tools/a64/a64_qdrbg_check.py
+; ======================================================================
+
+EnableExplicit
+
+; ---- Q-local backends first (they define the seams the core needs) ---
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+XIncludeFile "ArduinoQ/Board/qsink.pi4"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwinfo_q.unoq"
+; ---- the board's own UEFI plumbing: QCall, QEfiInit, QEspWrite, reset --
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+; ---- portable core, reused unchanged --------------------------------
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
+; ---- the Q's entropy backend, then the SHARED drbg above it ----------
+XIncludeFile "ArduinoQ/Lib/qentropy_q.pi4"
+XIncludeFile "RaspberryPi4/Lib/drbg.pi4"
+; ---- the known-answer vectors ---------------------------------------
+XIncludeFile "ArduinoQ/Examples/Diagnostics/qdrbgVectors.unoq"
+
+#EFI_ATTR = $7
+
+Global LibChecks.i
+Global LibPasses.i
+Global LibFails.i
+Global LibFirstFail.i
+Global LibFirstGot.i
+Global LibFirstWant.i
+Global LibFirstCase.i
+
+Global Dim MetaSeedLen.i[#DRBG_VEC_COUNT]
+Global Dim MetaReseedLen.i[#DRBG_VEC_COUNT]
+Global Dim MetaGenLen.i[#DRBG_VEC_COUNT]
+Global Dim Seed.a[128]
+Global Dim Reseed.a[128]
+Global Dim Exp.a[256]
+Global Dim Got.a[256]
+Global Dim Discard.a[256]
+
+; two independent draws, kept apart so they can be compared
+Global Dim GenA.a[32]
+Global Dim GenB.a[32]
+Global Dim RawA.a[32]
+Global Dim RawB.a[32]
+
+Global gCaseNow.i
+
+; ----------------------------------------------------------------------
+;  Record(ok, got, want) - one graded check.
+; ----------------------------------------------------------------------
+Procedure.i Record(ok.i, got.i, want.i)
+  LibChecks = LibChecks + 1
+  If ok <> 0
+    LibPasses = LibPasses + 1
+    ProcedureReturn 1
+  EndIf
+  If LibFirstFail = 0
+    LibFirstFail = LibChecks
+    LibFirstGot = got
+    LibFirstWant = want
+    LibFirstCase = gCaseNow
+  EndIf
+  LibFails = LibFails + 1
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i CmpGot(n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    If (Got[i] & $FF) <> (Exp[i] & $FF)
+      ProcedureReturn Record(0, Got[i] & $FF, Exp[i] & $FF)
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn Record(1, 0, 0)
+EndProcedure
+
+Procedure PutHexBytes(p.i, n.i)
+  Protected i.i
+  i = 0
+  While i < n
+    PutHex2(PeekB(p + i) & $FF)
+    i = i + 1
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PART 1 - the known-answer test. No entropy is used anywhere in here.
+; ----------------------------------------------------------------------
+Procedure RunKat()
+  Protected i.i
+  Protected j.i
+  Protected v.i
+  Protected bb.i
+  Protected sl.i
+  Protected rl.i
+  Protected gl.i
+
+  PrintN("-- PART 1: HMAC-DRBG SHA-256 known-answer test (no entropy is used here) --")
+  Print("   vectors = ")
+  PrintDec(#DRBG_VEC_COUNT)
+  PrintN("   (case 0 is a real NIST CAVP vector with reseed; case 1 the no-reseed variant; 20 random cases anchored to it)")
+
+  Sha256Begin()
+
+  Restore DrbgVecMeta
+  i = 0
+  While i < #DRBG_VEC_COUNT
+    Read.l v : MetaSeedLen[i] = v
+    Read.l v : MetaReseedLen[i] = v
+    Read.l v : MetaGenLen[i] = v
+    i = i + 1
+  Wend
+
+  Restore DrbgVecData
+  i = 0
+  While i < #DRBG_VEC_COUNT
+    gCaseNow = i
+    sl = MetaSeedLen[i]
+    rl = MetaReseedLen[i]
+    gl = MetaGenLen[i]
+    j = 0
+    While j < sl
+      Read.b bb : Seed[j] = bb
+      j = j + 1
+    Wend
+    j = 0
+    While j < rl
+      Read.b bb : Reseed[j] = bb
+      j = j + 1
+    Wend
+    j = 0
+    While j < gl
+      Read.b bb : Exp[j] = bb
+      j = j + 1
+    Wend
+
+    DrbgInit(@Seed[0], sl)
+    If rl > 0
+      DrbgReseed(@Reseed[0], rl)
+    EndIf
+    DrbgGenerate(@Discard[0], gl)
+    DrbgGenerate(@Got[0], gl)
+    CmpGot(gl)
+
+    i = i + 1
+  Wend
+  gCaseNow = -1
+
+  Print("   checks ")
+  PrintDec(LibChecks)
+  Print("   passes ")
+  PrintDec(LibPasses)
+  Print("   FAILURES ")
+  PrintDec(LibFails)
+  PrintNl()
+  If LibFails > 0
+    Print("   !! first failure was check ")
+    PrintDec(LibFirstFail)
+    Print(" in vector case ")
+    PrintDec(LibFirstCase)
+    Print(": the DRBG produced byte $")
+    PutHex2(LibFirstGot)
+    Print(" where the known answer says $")
+    PutHex2(LibFirstWant)
+    PrintN(". The arithmetic is wrong on this target; the entropy result below is not worth reading until this is green.")
+  Else
+    PrintN("   the HMAC-DRBG is correct on this silicon, byte for byte, against the NIST-anchored answers.")
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PART 2 - the entropy path, one stage at a time.
+; ----------------------------------------------------------------------
+Procedure RunEntropy()
+  Protected st.i
+  Protected n.i
+  Protected i.i
+  Protected same.i
+
+  PrintNl()
+  PrintN("-- PART 2: the entropy path, EFI_RNG_PROTOCOL -> qentropy_q.pi4 -> drbg.pi4 --")
+
+  ; ---- stage 1: is the protocol there at all ------------------------
+  st = EntropyBegin()
+  Print("   EntropyBegin()      -> ")
+  EntropyExplain(st)
+  If st < 0
+    PrintN("   STOPPING HERE. Without the protocol there is nothing to seed from, and every later line would be reporting the same one fact a second time.")
+    ProcedureReturn
+  EndIf
+  Print("   EFI_RNG_PROTOCOL interface at ")
+  PutAddr(EntropyInterface())
+  PrintNl()
+
+  st = EntropyWarmupWait(#ENTROPY_SPINS)
+  Print("   EntropyWarmupWait() -> ")
+  EntropyExplain(st)
+
+  ; ---- stage 2: two raw draws, compared -----------------------------
+  n = EntropyBytes(@RawA[0], 32, #ENTROPY_SPINS)
+  Print("   EntropyBytes(32) #1 -> ")
+  PrintDec(n)
+  Print("  ")
+  If n = 32
+    PutHexBytes(@RawA[0], 32)
+  EndIf
+  PrintNl()
+  If n <> 32
+    EntropyExplain(n)
+    PrintN("   STOPPING HERE: the firmware would not produce 32 bytes, so there is no seed to instantiate from.")
+    ProcedureReturn
+  EndIf
+
+  n = EntropyBytes(@RawB[0], 32, #ENTROPY_SPINS)
+  Print("   EntropyBytes(32) #2 -> ")
+  PrintDec(n)
+  Print("  ")
+  If n = 32
+    PutHexBytes(@RawB[0], 32)
+  EndIf
+  PrintNl()
+  If n <> 32
+    EntropyExplain(n)
+    ProcedureReturn
+  EndIf
+
+  same = 1
+  i = 0
+  While i < 32
+    If (RawA[i] & $FF) <> (RawB[i] & $FF)
+      same = 0
+    EndIf
+    i = i + 1
+  Wend
+  gCaseNow = -1
+  If Record(1 - same, same, 0) = 0
+    PrintN("   !! THE TWO RAW DRAWS ARE IDENTICAL. The firmware's RNG is stuck, or GetRNG is not writing the buffer. Nothing above this line is evidence of entropy; check EntropyLastStatus() and whether the destination is memory the firmware can write.")
+  Else
+    PrintN("   the two independent 32-byte draws differ, so the firmware's source is not stuck.")
+  EndIf
+
+  ; ---- stage 3: DrbgAutoSeed through the same path ------------------
+  Print("   DrbgEntropyAvailable() = ")
+  PrintDec(DrbgEntropyAvailable())
+  PrintNl()
+
+  st = DrbgAutoSeed()
+  Print("   DrbgAutoSeed()      -> ")
+  PrintDec(st)
+  If st = #DRBG_OK
+    Print("  (DRBG_OK)")
+  ElseIf st = #DRBG_ERR_ENTROPY
+    Print("  (DRBG_ERR_ENTROPY: the hardware source never produced the 48 bytes)")
+  ElseIf st = #DRBG_ERR_CONSTSEED
+    Print("  (DRBG_ERR_CONSTSEED: the 48 bytes gathered were a constant, which is a dead source, and DrbgSeedUsable refused them BEFORE anything was instantiated)")
+  ElseIf st = #DRBG_ERR_NOSEED
+    Print("  (DRBG_ERR_NOSEED)")
+  Else
+    Print("  (an unexpected refusal; see the #DRBG_ERR_* table in drbg.pi4)")
+  EndIf
+  PrintNl()
+  Print("   DrbgEntropyStatus() -> ")
+  PrintDec(DrbgEntropyStatus())
+  PrintNl()
+  If Record(st = #DRBG_OK, st, #DRBG_OK) = 0
+    PrintN("   !! the DRBG was NOT instantiated from the firmware's RNG. The entropy question is not settled on this board until this line says DRBG_OK.")
+    ProcedureReturn
+  EndIf
+
+  Print("   DrbgSeeded() = ")
+  PrintDec(DrbgSeeded())
+  Print("   DrbgSeedBytes() = ")
+  PrintDec(DrbgSeedBytes())
+  PrintNl()
+  Record(DrbgSeeded() <> 0, DrbgSeeded(), 1)
+  Record(DrbgSeedBytes() = 48, DrbgSeedBytes(), 48)
+
+  ; ---- stage 4: two generates, compared -----------------------------
+  DrbgGenerate(@GenA[0], 32)
+  DrbgGenerate(@GenB[0], 32)
+  Print("   DrbgGenerate #1 = ")
+  PutHexBytes(@GenA[0], 32)
+  PrintNl()
+  Print("   DrbgGenerate #2 = ")
+  PutHexBytes(@GenB[0], 32)
+  PrintNl()
+
+  same = 1
+  i = 0
+  While i < 32
+    If (GenA[i] & $FF) <> (GenB[i] & $FF)
+      same = 0
+    EndIf
+    i = i + 1
+  Wend
+  If Record(1 - same, same, 0) = 0
+    PrintN("   !! TWO SUCCESSIVE GENERATES RETURNED THE SAME 32 BYTES. The generator is stuck; the KAT above cannot see this because every KAT case re-instantiates.")
+  Else
+    PrintN("   two successive generates differ, so the instantiated generator is advancing.")
+  EndIf
+
+  ; ---- stage 5: reseed ----------------------------------------------
+  st = DrbgAutoReseed()
+  Print("   DrbgAutoReseed()    -> ")
+  PrintDec(st)
+  PrintNl()
+  Record(st = #DRBG_OK, st, #DRBG_OK)
+
+  Print("   GetRNG calls = ")
+  PrintDec(EntropyCalls())
+  Print("   bytes taken = ")
+  PrintDec(EntropyBytesRead())
+  Print("   all-zero chunks = ")
+  PrintDec(EntropyZeroChunks())
+  PrintNl()
+
+  EntropyWipe()
+EndProcedure
+
+; ======================================================================
+Global Dim gVarName.b[24]      ; UTF-16LE "AnvilQTxt", 0
+Global Dim gVarGuid.b[16]
+
+Procedure BuildSinkNames()
+  Define b.i
+  b = @gVarName[0]
+  QPb(b,0,65) :QPb(b,1,0) : QPb(b,2,110):QPb(b,3,0)
+  QPb(b,4,118):QPb(b,5,0) : QPb(b,6,105):QPb(b,7,0)
+  QPb(b,8,108):QPb(b,9,0) : QPb(b,10,81):QPb(b,11,0)
+  QPb(b,12,84):QPb(b,13,0): QPb(b,14,120):QPb(b,15,0)
+  QPb(b,16,116):QPb(b,17,0):QPb(b,18,0):QPb(b,19,0)
+  ; the same vendor GUID the core proof, the console probe and the
+  ; protocol walk use: a1b2c3d4-5566-7788-99aa-bbccddeeff00, in
+  ; EFI_GUID memory order (Data1/2/3 little-endian, Data4 big-endian).
+  gVarGuid[0]  = $D4 : gVarGuid[1]  = $C3 : gVarGuid[2]  = $B2 : gVarGuid[3]  = $A1
+  gVarGuid[4]  = $66 : gVarGuid[5]  = $55
+  gVarGuid[6]  = $88 : gVarGuid[7]  = $77
+  gVarGuid[8]  = $99 : gVarGuid[9]  = $AA
+  gVarGuid[10] = $BB : gVarGuid[11] = $CC : gVarGuid[12] = $DD
+  gVarGuid[13] = $EE : gVarGuid[14] = $FF : gVarGuid[15] = $00
+EndProcedure
+
+Procedure EmitReport()
+  PrintN("== Anvil UNO Q  HMAC-DRBG ON SILICON, SEEDED FROM EFI_RNG_PROTOCOL ==")
+  PrintN("   read-only: no register is written and no peripheral is read anywhere in this program")
+  PrintNl()
+  Print("SystemTable = ")
+  PutAddr(gQSt)
+  Print("   BootServices = ")
+  PutAddr(gQBs)
+  PrintNl()
+  PrintNl()
+
+  RunKat()
+  RunEntropy()
+
+  PrintNl()
+  Print("TOTAL checks ")
+  PrintDec(LibChecks)
+  Print("   passes ")
+  PrintDec(LibPasses)
+  Print("   FAILURES ")
+  PrintDec(LibFails)
+  PrintNl()
+  If LibFails = 0
+    PrintN("VERDICT: PASS - the HMAC-DRBG is correct on this board and it is seeded from the firmware's own random number generator.")
+  Else
+    PrintN("VERDICT: FAIL - read the first-failure line above; f=0 is the only acceptable result.")
+  EndIf
+  PrintNl()
+  Print("transcript used ")
+  PrintDec(gQOutLen)
+  Print(" of ")
+  PrintDec(#Q_OUT_MAX)
+  Print(" bytes, dropped ")
+  PrintDec(gQTrunc)
+  PrintNl()
+  PrintN("== end of run ==")
+EndProcedure
+
+Procedure.i Main()
+  Define ih.i
+  Define st.i
+
+  ; ---- CAPTURE x0/x1 FIRST (UEFI ImageHandle / SystemTable) ----------
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+
+  ih = gQIh
+  st = gQSt
+  If QEfiInit(ih, st) = 0
+    ; Nothing here is safe to touch, and there is no channel to say so on.
+    ProcedureReturn 0
+  EndIf
+
+  BuildSinkNames()
+
+  QEfiOutStr("Anvil UNO Q - HMAC-DRBG known-answer test and firmware entropy...")
+
+  EmitReport()
+
+  QEspWrite("\EFI\anvil\qdrbg.log", @gQOut[0], gQOutLen)
+  QCall(PeekI(gQRt + #QRT_SETVARIABLE), @gVarName[0], @gVarGuid[0], #EFI_ATTR, gQOutLen, @gQOut[0])
+
+  QEfiOutStr("drbg run complete - resetting back to Debian")
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure

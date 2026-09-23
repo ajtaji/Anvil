@@ -1,0 +1,1407 @@
+; ======================================================================
+;  Verified typed IR -> V3D 4.2 straight-line lowering (isolated tranche)
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; This module is not connected to Vulkan pipeline creation. It consumes an
+; already populated AvkIrModule, verifies it, validates an explicit target
+; layout, emits into private scratch space, and publishes code and uniforms
+; only after every check and encoder step succeeds. Nothing is inferred from
+; SPIR-V result-id numbers. See IR_V3D42_CONTRACT.md.
+
+XIncludeFile "vk_ir.pbi"
+XIncludeFile "../../../RaspberryPi4/Lib/v3dqpu.pi4"
+
+#ANVIL_IR_V3D42_OK              = 0
+#ANVIL_IR_V3D42_ERR_ARGS        = -23401
+#ANVIL_IR_V3D42_ERR_IR          = -23402
+#ANVIL_IR_V3D42_ERR_UNSUPPORTED = -23403
+#ANVIL_IR_V3D42_ERR_LAYOUT      = -23404
+#ANVIL_IR_V3D42_ERR_RANGE       = -23405
+#ANVIL_IR_V3D42_ERR_ENCODE      = -23406
+
+#ANVIL_IR_V3D42_ROLE_VERTEX   = 1 ; generic single-segment VPM producer
+#ANVIL_IR_V3D42_ROLE_FRAGMENT = 2 ; varying/TMU input, one RGBA TLB output
+
+#ANVIL_IR_V3D42_MAX_IO       = 4
+#ANVIL_IR_V3D42_MAX_SLOT     = 15
+#ANVIL_IR_V3D42_MAX_REG      = 63
+#ANVIL_IR_V3D42_CODE_BYTES   = 1024
+#ANVIL_IR_V3D42_UNIFORM_WORDS = 64
+#ANVIL_IR_V3D42_TMU_VEC4     = $FFFFFF7C
+
+Structure AvkIrV3d42Io Align #PB_Structure_AlignC
+  variableId.i
+  member.i                 ; -1 for the variable pointee, else struct member
+  firstSlot.i              ; explicit VPM/varying slot, never an SPIR-V id
+  components.i
+EndStructure
+
+Structure AvkIrV3d42Target Align #PB_Structure_AlignC
+  role.i
+  codeBase.i
+  codeCapacity.i
+  uniformBase.i
+  uniformCapacity.i        ; bytes
+  inputCount.i
+  inputs.i                 ; AvkIrV3d42Io array
+  outputCount.i
+  outputs.i                ; AvkIrV3d42Io array
+  pushWordCount.i
+  push0.i
+  push1.i
+  push2.i
+  push3.i
+  uniformBlockAddress.i    ; V3D bus address, zero when unused
+  textureStateAddress.i    ; V3D bus address, zero when unused
+  samplerStateAddress.i    ; V3D bus address, zero when unused
+  tlbConfig.i              ; exact TLBU configuration word
+EndStructure
+
+Structure AvkIrV3d42Result Align #PB_Structure_AlignC
+  codeBytes.i
+  uniformWords.i
+  pushFirstWord.i
+  pushRWord.i
+  pushGWord.i
+  pushBWord.i
+  pushAWord.i
+  uniformAddressWord.i
+  uniformConfigWord.i
+  textureStateWord.i
+  samplerStateWord.i
+  tlbConfigWord.i
+EndStructure
+
+; Canonical vertex semantics, independent of SPIR-V declaration, Store and
+; result-id order.  Location records are published at their semantic Location
+; index, so the pair emitter never rediscovers ordering from source records.
+Structure AvkIrV3d42VertexVarying Align #PB_Structure_AlignC
+  location.i
+  outputVariableId.i
+  outputMember.i
+  sourceVariableId.i
+  sourceMember.i
+  sourceLoadId.i
+  components.i
+EndStructure
+
+Structure AvkIrV3d42VertexPlan Align #PB_Structure_AlignC
+  positionOutputVariableId.i
+  positionOutputMember.i
+  positionInputVariableId.i
+  positionInputMember.i
+  positionLoadId.i
+  varyingCount.i
+  varyingComponents.i
+  varyings.AvkIrV3d42VertexVarying[#ANVIL_IR_V3D42_MAX_IO]
+EndStructure
+
+Structure AvkIrV3d42VertexPairTarget Align #PB_Structure_AlignC
+  coordinateCodeBase.i
+  coordinateCodeCapacity.i
+  vertexCodeBase.i
+  vertexCodeCapacity.i
+  coordinateUniformBase.i
+  coordinateUniformCapacity.i
+  vertexUniformBase.i
+  vertexUniformCapacity.i
+  viewportWidth.i
+  viewportHeight.i
+  inputCount.i
+  inputs.i
+EndStructure
+
+Structure AvkIrV3d42VertexPairResult Align #PB_Structure_AlignC
+  coordinateCodeBytes.i
+  vertexCodeBytes.i
+  coordinateUniformWords.i
+  vertexUniformWords.i
+  inputSlots.i
+  varyingComponents.i
+  halfWidthEighths.i
+  halfHeightEighths.i
+EndStructure
+
+; Lowering already owns the module-level instruction, uniform and SSA scratch
+; arrays below, so it is deliberately serialized.  Keep the not-yet-published
+; result in the same scratch domain.  The current A64 gate observed that fields
+; written through a helper into a procedure-local structure were not retained
+; at publication; the compiler cause and other targets remain unproven.  The
+; caller still observes an all-or-nothing result because this record is copied
+; only after every semantic and destination validation has succeeded.
+Global avk42PendingResult.AvkIrV3d42Result
+Global avk42VertexPlanPending.AvkIrV3d42VertexPlan
+Global avk42VertexPairPending.AvkIrV3d42VertexPairResult
+Global Dim avk42VertexCsScratch.i[128]
+Global Dim avk42VertexVsScratch.i[128]
+Global Dim avk42VertexCsUniform.l[#ANVIL_IR_V3D42_UNIFORM_WORDS]
+Global Dim avk42VertexVsUniform.l[#ANVIL_IR_V3D42_UNIFORM_WORDS]
+
+Global avk42Error.i = 0
+Global avk42SourceId.i = 0
+Global avk42SourceOpcode.i = 0
+Global avk42Stage.i = 0
+Global Dim avk42CodeScratch.i[128]
+Global Dim avk42UniformScratch.l[#ANVIL_IR_V3D42_UNIFORM_WORDS]
+Global Dim avk42Reg.i[772]       ; (id 0..192) x four lanes
+Global Dim avk42Count.i[193]
+Global Dim avk42InputUsed.i[#ANVIL_IR_V3D42_MAX_IO]
+Global Dim avk42InputValueId.i[#ANVIL_IR_V3D42_MAX_IO]
+Global Dim avk42Live.a[193]
+Global avk42NextReg.i = 0
+Global avk42UniformCount.i = 0
+Global avk42StoreNode.i = -1
+Global avk42StoreVariable.i = 0
+Global avk42StoreMember.i = -1
+Global avk42HasSample.i = 0
+Global avk42DirectValue.i = 0
+Global avk42DirectKind.i = 0
+
+#ANVIL_IR_V3D42_DIRECT_NONE    = 0
+#ANVIL_IR_V3D42_DIRECT_VARYING = 1
+#ANVIL_IR_V3D42_DIRECT_PUSH    = 2
+#ANVIL_IR_V3D42_DIRECT_CONST   = 3
+
+Procedure.i AnvilVkIrV3d42Error() : ProcedureReturn avk42Error : EndProcedure
+Procedure.i AnvilVkIrV3d42SourceId() : ProcedureReturn avk42SourceId : EndProcedure
+Procedure.i AnvilVkIrV3d42SourceOpcode() : ProcedureReturn avk42SourceOpcode : EndProcedure
+Procedure.i AnvilVkIrV3d42Stage() : ProcedureReturn avk42Stage : EndProcedure
+
+Procedure.i avk42Fail(code.i, id.i, opcode.i, stage.i)
+  avk42Error = code : avk42SourceId = id : avk42SourceOpcode = opcode : avk42Stage = stage
+  ProcedureReturn code
+EndProcedure
+
+Procedure avk42ClearResult(*r.AvkIrV3d42Result)
+  If *r = 0 : ProcedureReturn 0 : EndIf
+  *r\codeBytes = 0 : *r\uniformWords = 0 : *r\pushFirstWord = -1
+  *r\pushRWord = -1 : *r\pushGWord = -1 : *r\pushBWord = -1 : *r\pushAWord = -1
+  *r\uniformAddressWord = -1 : *r\uniformConfigWord = -1
+  *r\textureStateWord = -1 : *r\samplerStateWord = -1 : *r\tlbConfigWord = -1
+EndProcedure
+
+Procedure.i avk42IoAt(base.i, index.i)
+  ProcedureReturn base + (index * SizeOf(AvkIrV3d42Io))
+EndProcedure
+
+Procedure.i avk42Components(*m.AvkIrModule, typeId.i)
+  Protected *t.AvkIrType = avkIrFindType(*m, typeId)
+  If *t = 0 : ProcedureReturn 0 : EndIf
+  If *t\kind = #ANVIL_IR_TYPE_FLOAT : ProcedureReturn 1 : EndIf
+  If *t\kind = #ANVIL_IR_TYPE_VECTOR : ProcedureReturn *t\componentCount : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42Decoration(*m.AvkIrModule, id.i, member.i, kind.i)
+  Protected i.i
+  Protected *d.AvkIrDecoration
+  i = 0
+  While i < *m\decorationCount
+    *d = avkIrDecorationAt(*m, i)
+    If *d\sourceId = id And *d\member = member And *d\kind = kind
+      ProcedureReturn *d\value
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i avk42BlockSelectionValid(*m.AvkIrModule, variableId.i, member.i)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Protected *pointer.AvkIrType
+  Protected *block.AvkIrType
+  Protected *memberType.AvkIrType
+  Protected *scalar.AvkIrType
+  Protected typeId.i
+  If *v = 0 Or member <> 0 : ProcedureReturn 0 : EndIf
+  *pointer = avkIrFindType(*m, *v\pointerType)
+  If *pointer = 0 Or *pointer\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  *block = avkIrFindType(*m, *pointer\pointeeType)
+  If *block = 0 Or *block\kind <> #ANVIL_IR_TYPE_STRUCT Or *block\memberCount < 1 : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *block\sourceId, -1, #ANVIL_IR_DEC_BLOCK) < 0 : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *block\sourceId, 0, #ANVIL_IR_DEC_OFFSET) <> 0 : ProcedureReturn 0 : EndIf
+  typeId = avkIrMemberType(*block, 0)
+  *memberType = avkIrFindType(*m, typeId)
+  If *memberType = 0 Or *memberType\kind <> #ANVIL_IR_TYPE_VECTOR Or *memberType\componentCount <> 4 : ProcedureReturn 0 : EndIf
+  *scalar = avkIrFindType(*m, *memberType\componentType)
+  If *scalar = 0 Or *scalar\kind <> #ANVIL_IR_TYPE_FLOAT Or *scalar\width <> 32 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avk42PointerSelection(*m.AvkIrModule, pointerId.i, *varOut, *memberOut)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, pointerId)
+  Protected *n.AvkIrNode
+  Protected *c.AvkIrConstant
+  If *v <> 0
+    PokeI(*varOut, *v\sourceId) : PokeI(*memberOut, -1)
+    ProcedureReturn *v\pointerType
+  EndIf
+  *n = avkIrFindNode(*m, pointerId)
+  If *n = 0 : ProcedureReturn 0 : EndIf
+  If *n\kind <> #ANVIL_IR_OP_ACCESS_CHAIN : ProcedureReturn 0 : EndIf
+  *v = avkIrFindVariable(*m, *n\operand0)
+  *c = avkIrFindConstant(*m, *n\operand1)
+  If *v = 0 Or *c = 0 : ProcedureReturn 0 : EndIf
+  PokeI(*varOut, *v\sourceId) : PokeI(*memberOut, *c\word0)
+  ProcedureReturn *n\resultType
+EndProcedure
+
+Procedure.i avk42SelectionComponents(*m.AvkIrModule, variableId.i, member.i)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Protected *p.AvkIrType
+  Protected *s.AvkIrType
+  Protected typeId.i
+  If *v = 0 : ProcedureReturn 0 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 : ProcedureReturn 0 : EndIf
+  If *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  typeId = *p\pointeeType
+  If member >= 0
+    *s = avkIrFindType(*m, typeId)
+    If *s = 0 : ProcedureReturn 0 : EndIf
+    If *s\kind <> #ANVIL_IR_TYPE_STRUCT Or member >= *s\memberCount : ProcedureReturn 0 : EndIf
+    typeId = avkIrMemberType(*s, member)
+  EndIf
+  ProcedureReturn avk42Components(*m, typeId)
+EndProcedure
+
+Procedure.i avk42FindIo(base.i, count.i, variableId.i, member.i)
+  Protected i.i
+  Protected *io.AvkIrV3d42Io
+  i = 0
+  While i < count
+    *io = avk42IoAt(base, i)
+    If *io\variableId = variableId And *io\member = member : ProcedureReturn *io : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42ValidateIoStage(*m.AvkIrModule, base.i, count.i, storage.i, isOutput.i, stage.i)
+  Protected i.i
+  Protected j.i
+  Protected comps.i
+  Protected *io.AvkIrV3d42Io
+  Protected *other.AvkIrV3d42Io
+  Protected *v.AvkIrVariable
+  If count < 0 Or count > #ANVIL_IR_V3D42_MAX_IO : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, 0, 0, stage) : EndIf
+  If count > 0 And (base = 0 Or (base & 7) <> 0) : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, 0, 0, stage) : EndIf
+  i = 0
+  While i < count
+    *io = avk42IoAt(base, i)
+    *v = avkIrFindVariable(*m, *io\variableId)
+    If *v = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, #ANVIL_IR_SPV_VARIABLE, stage) : EndIf
+    If *v\storageClass <> storage : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, *v\sourceOpcode, stage) : EndIf
+    comps = avk42SelectionComponents(*m, *io\variableId, *io\member)
+    If comps < 1 Or comps <> *io\components : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, *v\sourceOpcode, stage) : EndIf
+    If *io\firstSlot < 0 Or (*io\firstSlot + comps - 1) > #ANVIL_IR_V3D42_MAX_SLOT : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, *io\variableId, *v\sourceOpcode, stage) : EndIf
+    j = 0
+    While j < i
+      *other = avk42IoAt(base, j)
+      If *other\variableId = *io\variableId : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, *v\sourceOpcode, stage) : EndIf
+      If *io\firstSlot < (*other\firstSlot + *other\components) And *other\firstSlot < (*io\firstSlot + *io\components)
+        ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, *v\sourceOpcode, stage)
+      EndIf
+      j = j + 1
+    Wend
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; Preserve the original fragment-lowerer contract and stage-2 provenance.
+Procedure.i avk42ValidateIo(*m.AvkIrModule, base.i, count.i, storage.i, isOutput.i)
+  ProcedureReturn avk42ValidateIoStage(*m, base, count, storage, isOutput, 2)
+EndProcedure
+
+Procedure.i avk42RangeEnd(base.i, bytes.i)
+  If base <= 0 Or bytes <= 0 Or base > ($7FFFFFFFFFFFFFFF - bytes) : ProcedureReturn 0 : EndIf
+  ProcedureReturn base + bytes
+EndProcedure
+
+Procedure.i avk42RangesOverlap(a.i, an.i, b.i, bn.i)
+  Protected ae.i = avk42RangeEnd(a, an)
+  Protected be.i = avk42RangeEnd(b, bn)
+  If ae = 0 Or be = 0 : ProcedureReturn -1 : EndIf
+  If a < be And b < ae : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42ValidateResourceUse(*m.AvkIrModule, *t.AvkIrV3d42Target, *r.AvkIrV3d42Result)
+  Protected usesPush.i = Bool(*r\pushFirstWord >= 0)
+  Protected usesUniform.i = Bool(*r\uniformAddressWord >= 0)
+  Protected usesTexture.i = Bool(*r\textureStateWord >= 0)
+  ; These are independent. Arithmetic may combine one push load with one UBO
+  ; load or one sample, and each stream occurrence has its own returned word
+  ; metadata. Unsupported multiplicity is refused from live SSA before emit.
+  If usesPush = 0
+    If *t\pushWordCount <> 0 Or *t\push0 <> 0 Or *t\push1 <> 0 Or *t\push2 <> 0 Or *t\push3 <> 0
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 6)
+    EndIf
+  EndIf
+  If usesUniform = 0 And *t\uniformBlockAddress <> 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 6)
+  EndIf
+  If usesTexture = 0 And (*t\textureStateAddress <> 0 Or *t\samplerStateAddress <> 0)
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 6)
+  EndIf
+  If *t\role = #ANVIL_IR_V3D42_ROLE_VERTEX And *t\tlbConfig <> 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 6)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42AppendUniform(value.i)
+  If avk42UniformCount >= #ANVIL_IR_V3D42_UNIFORM_WORDS : ProcedureReturn -1 : EndIf
+  avk42UniformScratch[avk42UniformCount] = value & $FFFFFFFF
+  avk42UniformCount = avk42UniformCount + 1
+  ProcedureReturn avk42UniformCount - 1
+EndProcedure
+
+Procedure.i avk42Alloc(comps.i, id.i, opcode.i)
+  Protected first.i = avk42NextReg
+  If comps < 1 Or comps > 4 Or (first + comps - 1) > #ANVIL_IR_V3D42_MAX_REG
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, opcode, 4)
+  EndIf
+  avk42NextReg = first + comps
+  ProcedureReturn first
+EndProcedure
+
+Procedure avk42SetRegs(id.i, count.i, r0.i, r1.i, r2.i, r3.i)
+  avk42Count[id] = count
+  avk42Reg[(id * 4)] = r0 : avk42Reg[(id * 4) + 1] = r1
+  avk42Reg[(id * 4) + 2] = r2 : avk42Reg[(id * 4) + 3] = r3
+EndProcedure
+
+Procedure.i avk42EmitScalarConstant(*m.AvkIrModule, id.i)
+  Protected *c.AvkIrConstant = avkIrFindConstant(*m, id)
+  Protected *t.AvkIrType
+  Protected first.i
+  Protected r.i
+  If avk42Count[id] > 0 : ProcedureReturn 0 : EndIf
+  If *c = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, 0, 5) : EndIf
+  *t = avkIrFindType(*m, *c\typeId)
+  If *t = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, *c\sourceOpcode, 5) : EndIf
+  If *t\kind <> #ANVIL_IR_TYPE_FLOAT : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, *c\sourceOpcode, 5) : EndIf
+  first = avk42Alloc(1, id, *c\sourceOpcode) : If first < 0 : ProcedureReturn first : EndIf
+  If avk42AppendUniform(*c\word0) < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *c\sourceOpcode, 5) : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first, 0) : If r <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, id, *c\sourceOpcode, 5) : EndIf
+  avk42SetRegs(id, 1, first, 0, 0, 0)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42EmitConstant(*m.AvkIrModule, id.i)
+  Protected *c.AvkIrConstant = avkIrFindConstant(*m, id)
+  Protected *t.AvkIrType
+  Protected k.i
+  Protected cid.i
+  Protected r.i
+  If avk42Count[id] > 0 : ProcedureReturn 0 : EndIf
+  If *c = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, 0, 5) : EndIf
+  *t = avkIrFindType(*m, *c\typeId)
+  If *t\kind = #ANVIL_IR_TYPE_FLOAT : ProcedureReturn avk42EmitScalarConstant(*m, id) : EndIf
+  If *t\kind <> #ANVIL_IR_TYPE_VECTOR : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, *c\sourceOpcode, 5) : EndIf
+  k = 0
+  While k < *c\componentCount
+    cid = avkIrConstantComponent(*c, k)
+    r = avk42EmitScalarConstant(*m, cid) : If r <> 0 : ProcedureReturn r : EndIf
+    avk42Reg[(id * 4) + k] = avk42Reg[cid * 4]
+    k = k + 1
+  Wend
+  avk42Count[id] = *c\componentCount
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42EmitLdvpm(slot.i, reg.i)
+  ProcedureReturn V3dQpuLdvpm(#V3DQ_A_LDVPMV_IN, reg, #V3DQ_MUX_A, slot)
+EndProcedure
+
+Procedure.i avk42EmitStvpm(slot.i, reg.i)
+  ProcedureReturn V3dQpuStvpm(#V3DQ_A_STVPMV, #V3DQ_MUX_A, #V3DQ_MUX_B, slot, reg)
+EndProcedure
+
+Procedure.i avk42EmitLoad(*m.AvkIrModule, *t.AvkIrV3d42Target, *n.AvkIrNode, *r.AvkIrV3d42Result)
+  Protected variableId.i
+  Protected member.i
+  Protected pointerType.i
+  Protected comps.i
+  Protected first.i
+  Protected k.i
+  Protected rc.i
+  Protected pos.i
+  Protected ioIndex.i
+  Protected priorId.i
+  Protected *v.AvkIrVariable
+  Protected *io.AvkIrV3d42Io
+  pointerType = avk42PointerSelection(*m, *n\operand0, @variableId, @member)
+  If pointerType = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  comps = avk42Components(*m, *n\resultType)
+  *v = avkIrFindVariable(*m, variableId)
+  If *v\storageClass = #ANVIL_IR_STORAGE_UNIFORM_CONSTANT
+    ; The combined image handle is semantic only. ImageSample emits the TMU.
+    avk42Count[*n\sourceId] = 0
+    ProcedureReturn 0
+  EndIf
+  If *v\storageClass = #ANVIL_IR_STORAGE_INPUT
+    *io = avk42FindIo(*t\inputs, *t\inputCount, variableId, member)
+    If *io = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5) : EndIf
+    ioIndex = (*io - *t\inputs) / SizeOf(AvkIrV3d42Io)
+    avk42InputUsed[ioIndex] = 1
+    priorId = avk42InputValueId[ioIndex]
+    If priorId > 0
+      ; OpLoad of the same input variable is the same semantic value for this
+      ; invocation. Reuse its assigned registers; issuing LDVARY again would
+      ; consume the next FIFO positions and silently change the shader.
+      avk42SetRegs(*n\sourceId, avk42Count[priorId], avk42Reg[priorId * 4], avk42Reg[(priorId * 4) + 1], avk42Reg[(priorId * 4) + 2], avk42Reg[(priorId * 4) + 3])
+      ProcedureReturn 0
+    EndIf
+    If *t\role = #ANVIL_IR_V3D42_ROLE_FRAGMENT And avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_VARYING And *n\sourceId = avk42DirectValue
+      ; Preserve the silicon-proven direct pass-through program byte for byte:
+      ; the varying signal writes rf0..rf3 and interpolation correction writes
+      ; rf4..rf7. Computed graphs use the generic allocator below.
+      If comps <> 4 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      k = 0 : rc = 0
+      While k < 4 And rc = 0
+        rc = V3dQpuNopSig(#V3DQ_SIG_LDVARY, k, 0)
+        If rc = 0 : rc = V3dQpuNop() : EndIf
+        If rc = 0 : rc = V3dQpuAdd2(#V3DQ_A_FADD, 4 + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, k, 0) : EndIf
+        k = k + 1
+      Wend
+      If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      avk42SetRegs(*n\sourceId, 4, 4, 5, 6, 7)
+      avk42InputValueId[ioIndex] = *n\sourceId
+      If avk42NextReg < 8 : avk42NextReg = 8 : EndIf
+      ProcedureReturn 0
+    EndIf
+    If *t\role = #ANVIL_IR_V3D42_ROLE_FRAGMENT And avk42HasSample <> 0
+      If comps <> 2 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      k = 0 : rc = 0
+      While k < 2 And rc = 0
+        rc = V3dQpuNopSig(#V3DQ_SIG_LDVARY, 10 + k, 0)
+        If rc = 0 : rc = V3dQpuNop() : EndIf
+        If rc = 0 : rc = V3dQpuAdd2(#V3DQ_A_FADD, 12 + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, 10 + k, 0) : EndIf
+        k = k + 1
+      Wend
+      If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      avk42SetRegs(*n\sourceId, 2, 12, 13, 0, 0)
+      avk42InputValueId[ioIndex] = *n\sourceId
+      If avk42NextReg < 14 : avk42NextReg = 14 : EndIf
+      ProcedureReturn 0
+    EndIf
+    first = avk42Alloc(comps, *n\sourceId, *n\sourceOpcode) : If first < 0 : ProcedureReturn first : EndIf
+    k = 0
+    While k < comps
+      If *t\role = #ANVIL_IR_V3D42_ROLE_VERTEX
+        rc = avk42EmitLdvpm(*io\firstSlot + k, first + k)
+      Else
+        rc = V3dQpuNopSig(#V3DQ_SIG_LDVARY, first + k, 0)
+        If rc = 0 : rc = V3dQpuNop() : EndIf
+        If rc = 0 : rc = V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_R5, first + k, 0) : EndIf
+      EndIf
+      If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      k = k + 1
+    Wend
+  ElseIf *v\storageClass = #ANVIL_IR_STORAGE_PUSH_CONSTANT
+    If avk42BlockSelectionValid(*m, variableId, member) = 0
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5)
+    EndIf
+    If *t\pushWordCount <> comps Or comps <> 4 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5) : EndIf
+    *r\pushFirstWord = avk42UniformCount
+    If avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_PUSH And *n\sourceId = avk42DirectValue
+      ; Legacy direct flat output consumes B,G,R,A. Publish every semantic
+      ; component's exact word so the draw path never rediscovers this order.
+      first = avk42Alloc(comps, *n\sourceId, *n\sourceOpcode) : If first < 0 : ProcedureReturn first : EndIf
+      *r\pushBWord = avk42AppendUniform(*t\push2)
+      *r\pushGWord = avk42AppendUniform(*t\push1)
+      *r\pushRWord = avk42AppendUniform(*t\push0)
+      *r\pushAWord = avk42AppendUniform(*t\push3)
+      If *r\pushBWord < 0 Or *r\pushGWord < 0 Or *r\pushRWord < 0 Or *r\pushAWord < 0
+        ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, *n\sourceId, *n\sourceOpcode, 5)
+      EndIf
+      k = 0 : rc = 0
+      While k < 4 And rc = 0
+        rc = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first + k, 0)
+        k = k + 1
+      Wend
+      If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      avk42SetRegs(*n\sourceId, 4, first + 2, first + 1, first, first + 3)
+      ProcedureReturn 0
+    EndIf
+    first = avk42Alloc(comps, *n\sourceId, *n\sourceOpcode) : If first < 0 : ProcedureReturn first : EndIf
+    k = 0
+    While k < comps
+      If k = 0 : pos = avk42AppendUniform(*t\push0) : EndIf
+      If k = 1 : pos = avk42AppendUniform(*t\push1) : EndIf
+      If k = 2 : pos = avk42AppendUniform(*t\push2) : EndIf
+      If k = 3 : pos = avk42AppendUniform(*t\push3) : EndIf
+      If k = 0 : *r\pushRWord = pos : EndIf
+      If k = 1 : *r\pushGWord = pos : EndIf
+      If k = 2 : *r\pushBWord = pos : EndIf
+      If k = 3 : *r\pushAWord = pos : EndIf
+      rc = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first + k, 0)
+      If pos < 0 Or rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+      k = k + 1
+    Wend
+  ElseIf *v\storageClass = #ANVIL_IR_STORAGE_UNIFORM
+    If avk42BlockSelectionValid(*m, variableId, member) = 0
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5)
+    EndIf
+    If comps <> 4 Or *t\uniformBlockAddress <= 0 Or *t\uniformBlockAddress > $FFFFFFFF Or (*t\uniformBlockAddress & 3) <> 0
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5)
+    EndIf
+    first = 0
+    If avk42HasSample <> 0
+      ; A sample result owns rf0..3. A combined UBO+sample arithmetic graph
+      ; therefore needs a distinct TMU result allocation; direct UBO remains
+      ; at rf0..3 and preserves its established executable bytes exactly.
+      first = avk42Alloc(4, *n\sourceId, *n\sourceOpcode)
+      If first < 0 : ProcedureReturn first : EndIf
+    ElseIf avk42NextReg < 9
+      avk42NextReg = 9
+    EndIf
+    *r\uniformAddressWord = avk42AppendUniform(*t\uniformBlockAddress)
+    If *r\uniformAddressWord < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+    rc = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0) : If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+    *r\uniformConfigWord = avk42AppendUniform(#ANVIL_IR_V3D42_TMU_VEC4)
+    If *r\uniformConfigWord < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+    V3dQpuReset() : rc = V3dQpuSig(#V3DQ_SIG_THRSW)
+    If rc = 0
+      V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A) : V3dQpuRaddr(8, 0) : rc = V3dQpuEmit()
+    EndIf
+    If rc = 0 : rc = V3dQpuNop() : EndIf : If rc = 0 : rc = V3dQpuNop() : EndIf
+    k = 0
+    While k < 4 And rc = 0 : rc = V3dQpuNopSig(#V3DQ_SIG_LDTMU, first + k, 0) : k = k + 1 : Wend
+    If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  Else
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, variableId, *n\sourceOpcode, 5)
+  EndIf
+  avk42SetRegs(*n\sourceId, comps, first, first + 1, first + 2, first + 3)
+  If *v\storageClass = #ANVIL_IR_STORAGE_INPUT : avk42InputValueId[ioIndex] = *n\sourceId : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Mark only the SSA values that feed the final fragment/vertex store. The
+; legacy front end accepted dead declarations and dead loads; walking every
+; node would both regress that contract and waste QPU instructions. This is
+; dependency selection at the lowering site, not an after-the-fact peephole.
+Procedure avk42BuildLive(*m.AvkIrModule, rootId.i)
+  Define i.i
+  Define k.i
+  Define changed.i
+  Define id.i
+  Define *n.AvkIrNode
+  i = 0
+  While i < 193 : avk42Live[i] = 0 : i = i + 1 : Wend
+  If rootId > 0 And rootId < 193 : avk42Live[rootId] = 1 : EndIf
+  changed = 1
+  While changed <> 0
+    changed = 0
+    i = 0
+    While i < *m\nodeCount
+      *n = avkIrNodeAt(*m, i)
+      If *n\sourceId > 0 And *n\sourceId < 193 And avk42Live[*n\sourceId] <> 0
+        k = 0
+        While k < *n\operandCount
+          id = avkIrOperand(*n, k)
+          If id > 0 And id < 193 And avk42Live[id] = 0
+            avk42Live[id] = 1
+            changed = 1
+          EndIf
+          k = k + 1
+        Wend
+      EndIf
+      i = i + 1
+    Wend
+  Wend
+EndProcedure
+
+Procedure.i avk42EmitDirectConstant(*m.AvkIrModule, id.i)
+  Define *c.AvkIrConstant = avkIrFindConstant(*m, id)
+  Define *lane.AvkIrConstant
+  Define cid.i
+  Define rc.i
+  Define k.i
+  Define first.i
+  Define pos.i
+  If *c = 0 Or *c\componentCount <> 4
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, id, 0, 5)
+  EndIf
+  ; Emit B,G,R,A exactly like the previous direct fragment emitter, then map
+  ; those physical registers back to the IR's semantic R,G,B,A lanes. Each
+  ; lane is emitted independently even when two lanes name the same SPIR-V
+  ; constant id: the legacy program consumes four stream words and performs
+  ; four LDUNIFRF instructions, and id-based constant deduplication must not
+  ; silently shorten that executable ABI.
+  first = avk42Alloc(4, id, *c\sourceOpcode)
+  If first < 0 : ProcedureReturn first : EndIf
+  k = 0
+  While k < 4
+    If k = 0 : cid = avkIrConstantComponent(*c, 2) : EndIf
+    If k = 1 : cid = avkIrConstantComponent(*c, 1) : EndIf
+    If k = 2 : cid = avkIrConstantComponent(*c, 0) : EndIf
+    If k = 3 : cid = avkIrConstantComponent(*c, 3) : EndIf
+    *lane = avkIrFindConstant(*m, cid)
+    If *lane = 0 Or *lane\wordCount <> 1
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, cid, *c\sourceOpcode, 5)
+    EndIf
+    pos = avk42AppendUniform(*lane\word0)
+    rc = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, first + k, 0)
+    If pos < 0 Or rc <> 0
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, cid, *c\sourceOpcode, 5)
+    EndIf
+    k = k + 1
+  Wend
+  avk42SetRegs(id, 4, first + 2, first + 1, first, first + 3)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42EmitSample(*m.AvkIrModule, *t.AvkIrV3d42Target, *n.AvkIrNode, *r.AvkIrV3d42Result)
+  Protected first.i
+  Protected k.i
+  Protected rc.i
+  Protected coord.i = *n\operand1
+  If avk42Count[coord] <> 2 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, coord, *n\sourceOpcode, 5) : EndIf
+  If *t\textureStateAddress <= 0 Or *t\textureStateAddress > $FFFFFFFF Or (*t\textureStateAddress & 31) <> 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *n\sourceId, *n\sourceOpcode, 5)
+  EndIf
+  If *t\samplerStateAddress <= 0 Or *t\samplerStateAddress > $FFFFFFFF Or (*t\samplerStateAddress & 31) <> 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *n\sourceId, *n\sourceOpcode, 5)
+  EndIf
+  rc = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUT, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, avk42Reg[(coord * 4) + 1], 0)
+  If rc = 0 : rc = V3dQpuAdd2(#V3DQ_A_OR, #V3DQ_WADDR_TMUS, 1, #V3DQ_MUX_A, #V3DQ_MUX_A, avk42Reg[coord * 4], 0) : EndIf
+  If rc = 0 : rc = V3dQpuNopSig(#V3DQ_SIG_THRSW, 0, 0) : EndIf
+  If rc = 0 : rc = V3dQpuNop() : EndIf : If rc = 0 : rc = V3dQpuNop() : EndIf
+  first = 0
+  If avk42NextReg < 14 : avk42NextReg = 14 : EndIf
+  k = 0 : While k < 4 And rc = 0 : rc = V3dQpuNopSig(#V3DQ_SIG_LDTMU, first + k, 0) : k = k + 1 : Wend
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  avk42SetRegs(*n\sourceId, 4, first, first + 1, first + 2, first + 3)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42EmitArithmetic(*m.AvkIrModule, *n.AvkIrNode)
+  Protected lanes.i = avkIrFloatLanes(*m, *n\resultType)
+  Protected leftId.i = *n\operand0
+  Protected rightId.i = *n\operand1
+  Protected first.i
+  Protected k.i
+  Protected rc.i
+  If lanes < 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  If avk42Count[leftId] = 0 : rc = avk42EmitConstant(*m, leftId) : If rc <> 0 : ProcedureReturn rc : EndIf : EndIf
+  If avk42Count[rightId] = 0 : rc = avk42EmitConstant(*m, rightId) : If rc <> 0 : ProcedureReturn rc : EndIf : EndIf
+  If avk42Count[leftId] <> lanes Or avk42Count[rightId] <> lanes
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5)
+  EndIf
+  first = avk42Alloc(lanes, *n\sourceId, *n\sourceOpcode)
+  If first < 0 : ProcedureReturn first : EndIf
+  k = 0 : rc = 0
+  While k < lanes And rc = 0
+    If *n\kind = #ANVIL_IR_OP_FADD
+      rc = V3dQpuAdd2(#V3DQ_A_FADD, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, avk42Reg[(leftId * 4) + k], avk42Reg[(rightId * 4) + k])
+    ElseIf *n\kind = #ANVIL_IR_OP_FMUL
+      V3dQpuReset()
+      V3dQpuMul(#V3DQ_M_FMUL, first + k, 0, #V3DQ_MUX_A, #V3DQ_MUX_B)
+      V3dQpuRaddr(avk42Reg[(leftId * 4) + k], avk42Reg[(rightId * 4) + k])
+      rc = V3dQpuEmit()
+    Else
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5)
+    EndIf
+    k = k + 1
+  Wend
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, *n\sourceId, *n\sourceOpcode, 5) : EndIf
+  avk42SetRegs(*n\sourceId, lanes, first, first + 1, first + 2, first + 3)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42PrepareAndEmit(*m.AvkIrModule, *t.AvkIrV3d42Target, *r.AvkIrV3d42Result)
+  Protected i.i
+  Protected k.i
+  Protected rc.i
+  Protected first.i
+  Protected variableId.i
+  Protected member.i
+  Protected pointerType.i
+  Protected valueId.i
+  Protected *n.AvkIrNode
+  Protected *io.AvkIrV3d42Io
+  Define *direct.AvkIrNode
+  Define *directVar.AvkIrVariable
+  Define *directConst.AvkIrConstant
+  Define dynamicVariable.i
+  Define dynamicMember.i
+  Define pushLoads.i = 0
+  Define uniformLoads.i = 0
+  Define liveSamples.i = 0
+  avk42NextReg = 0 : avk42UniformCount = 0 : avk42StoreNode = -1 : avk42HasSample = 0
+  avk42DirectValue = 0 : avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_NONE
+  i = 0 : While i < #ANVIL_IR_V3D42_MAX_IO : avk42InputUsed[i] = 0 : avk42InputValueId[i] = 0 : i = i + 1 : Wend
+  i = 0
+  While i < 193 : avk42Count[i] = 0 : k = 0 : While k < 4 : avk42Reg[(i * 4) + k] = -1 : k = k + 1 : Wend : i = i + 1 : Wend
+  i = 0 : While i < #ANVIL_IR_V3D42_UNIFORM_WORDS : avk42UniformScratch[i] = 0 : i = i + 1 : Wend
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\kind = #ANVIL_IR_OP_STORE
+      avk42DirectValue = *n\operand1
+    EndIf
+    i = i + 1
+  Wend
+  avk42BuildLive(*m, avk42DirectValue)
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\sourceId > 0 And avk42Live[*n\sourceId] <> 0
+      If *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD : avk42HasSample = 1 : liveSamples = liveSamples + 1 : EndIf
+      If *n\kind = #ANVIL_IR_OP_LOAD
+        dynamicVariable = 0 : dynamicMember = -1
+        If avk42PointerSelection(*m, *n\operand0, @dynamicVariable, @dynamicMember) <> 0
+          *directVar = avkIrFindVariable(*m, dynamicVariable)
+          If *directVar <> 0 And *directVar\storageClass = #ANVIL_IR_STORAGE_PUSH_CONSTANT : pushLoads = pushLoads + 1 : EndIf
+          If *directVar <> 0 And *directVar\storageClass = #ANVIL_IR_STORAGE_UNIFORM : uniformLoads = uniformLoads + 1 : EndIf
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If pushLoads > 1
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_LOAD, 4)
+  EndIf
+  If uniformLoads > 1
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_LOAD, 4)
+  EndIf
+  If liveSamples > 1
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD, 4)
+  EndIf
+  ; TMU resource paths own fixed physical registers. Reserve them before
+  ; emitting any live SSA node, regardless of source order, so an earlier
+  ; push or constant cannot be allocated into registers a later load writes.
+  If liveSamples > 0
+    avk42NextReg = 14       ; sample rf0..3 and UV rf12..13
+  ElseIf uniformLoads > 0
+    avk42NextReg = 9        ; UBO result rf0..3 and address rf8
+  EndIf
+  rc = V3dQpuProgramBeginSeg(@avk42CodeScratch[0], #ANVIL_IR_V3D42_CODE_BYTES, Bool(*t\role = #ANVIL_IR_V3D42_ROLE_VERTEX))
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, 0, 0, 4) : EndIf
+  If *t\role = #ANVIL_IR_V3D42_ROLE_FRAGMENT And avk42DirectValue <> 0
+    *direct = avkIrFindNode(*m, avk42DirectValue)
+    If *direct <> 0 And *direct\kind = #ANVIL_IR_OP_LOAD
+      variableId = 0 : member = -1
+      If avk42PointerSelection(*m, *direct\operand0, @variableId, @member) <> 0
+        *directVar = avkIrFindVariable(*m, variableId)
+        If *directVar <> 0 And *directVar\storageClass = #ANVIL_IR_STORAGE_INPUT And avk42HasSample = 0
+          avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_VARYING
+        ElseIf *directVar <> 0 And *directVar\storageClass = #ANVIL_IR_STORAGE_PUSH_CONSTANT
+          avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_PUSH
+        EndIf
+      EndIf
+    Else
+      *directConst = avkIrFindConstant(*m, avk42DirectValue)
+      If *directConst <> 0 And *directConst\componentCount = 4
+        avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_CONST
+      EndIf
+    EndIf
+  EndIf
+  If avk42HasSample <> 0
+    *r\textureStateWord = avk42AppendUniform(*t\textureStateAddress)
+    If *r\textureStateWord < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD, 4) : EndIf
+    rc = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0)
+    *r\samplerStateWord = avk42AppendUniform(*t\samplerStateAddress)
+    If *r\samplerStateWord < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD, 4) : EndIf
+    If rc = 0 : rc = V3dQpuNopSig(#V3DQ_SIG_WRTMUC, 0, 0) : EndIf
+    If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, 0, #ANVIL_IR_SPV_IMAGE_SAMPLE_IMPLICIT_LOD, 4) : EndIf
+  EndIf
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\sourceId > 0 And avk42Live[*n\sourceId] = 0
+      rc = 0
+    ElseIf *n\kind = #ANVIL_IR_OP_LOAD
+      rc = avk42EmitLoad(*m, *t, *n, *r)
+    ElseIf *n\kind = #ANVIL_IR_OP_ACCESS_CHAIN
+      rc = 0
+    ElseIf *n\kind = #ANVIL_IR_OP_COMPOSITE_EXTRACT
+      valueId = *n\operand0
+      If avk42Count[valueId] <= *n\literal0 : rc = avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5) : Else : avk42SetRegs(*n\sourceId, 1, avk42Reg[(valueId * 4) + *n\literal0], 0, 0, 0) : rc = 0 : EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_COMPOSITE_CONSTRUCT
+      k = 0 : rc = 0
+      While k < *n\operandCount And rc = 0
+        valueId = avkIrOperand(*n, k)
+        If avk42Count[valueId] = 0 : rc = avk42EmitConstant(*m, valueId) : EndIf
+        If rc = 0 And avk42Count[valueId] <> 1 : rc = avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, valueId, *n\sourceOpcode, 5) : EndIf
+        If rc = 0 : avk42Reg[(*n\sourceId * 4) + k] = avk42Reg[valueId * 4] : EndIf
+        k = k + 1
+      Wend
+      avk42Count[*n\sourceId] = *n\operandCount
+    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+      rc = avk42EmitArithmetic(*m, *n)
+    ElseIf *n\kind = #ANVIL_IR_OP_IMAGE_SAMPLE_IMPLICIT_LOD
+      rc = avk42EmitSample(*m, *t, *n, *r)
+    ElseIf *n\kind = #ANVIL_IR_OP_STORE
+      If avk42StoreNode >= 0 : rc = avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand0, *n\sourceOpcode, 5) : Else : avk42StoreNode = i : rc = 0 : EndIf
+    ElseIf *n\kind = #ANVIL_IR_OP_RETURN
+      rc = 0
+    Else
+      rc = avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\sourceId, *n\sourceOpcode, 5)
+    EndIf
+    If rc <> 0 : ProcedureReturn rc : EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < *t\inputCount
+    If avk42InputUsed[i] = 0
+      *io = avk42IoAt(*t\inputs, i)
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *io\variableId, #ANVIL_IR_SPV_LOAD, 5)
+    EndIf
+    i = i + 1
+  Wend
+  If avk42StoreNode < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, 0, #ANVIL_IR_SPV_STORE, 5) : EndIf
+  *n = avkIrNodeAt(*m, avk42StoreNode)
+  pointerType = avk42PointerSelection(*m, *n\operand0, @variableId, @member)
+  *io = avk42FindIo(*t\outputs, *t\outputCount, variableId, member)
+  If pointerType = 0 Or *io = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5) : EndIf
+  valueId = *n\operand1
+  If avk42Count[valueId] = 0
+    If avk42DirectKind = #ANVIL_IR_V3D42_DIRECT_CONST And valueId = avk42DirectValue
+      rc = avk42EmitDirectConstant(*m, valueId)
+    Else
+      rc = avk42EmitConstant(*m, valueId)
+    EndIf
+    If rc <> 0 : ProcedureReturn rc : EndIf
+  EndIf
+  If avk42Count[valueId] <> *io\components : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, valueId, *n\sourceOpcode, 5) : EndIf
+  If *t\role = #ANVIL_IR_V3D42_ROLE_VERTEX
+    k = 0 : rc = 0
+    While k < *io\components And rc = 0 : rc = avk42EmitStvpm(*io\firstSlot + k, avk42Reg[(valueId * 4) + k]) : k = k + 1 : Wend
+    If rc = 0 : rc = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1) : EndIf
+    If rc = 0 : rc = V3dQpuProgramEndThrsw() : EndIf
+  Else
+    If *io\components <> 4 Or *t\outputCount <> 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 5) : EndIf
+    rc = V3dQpuLastThrsw()
+    *r\tlbConfigWord = avk42AppendUniform(*t\tlbConfig)
+    If *r\tlbConfigWord < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, variableId, *n\sourceOpcode, 6) : EndIf
+    If rc = 0 : rc = V3dQpuVfpack(#V3DQ_WADDR_TLBU, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, avk42Reg[(valueId * 4) + 2], avk42Reg[(valueId * 4) + 1]) : EndIf
+    If rc = 0 : rc = V3dQpuVfpack(#V3DQ_WADDR_TLB, 1, #V3DQ_MUX_A, #V3DQ_MUX_B, avk42Reg[valueId * 4], avk42Reg[(valueId * 4) + 3]) : EndIf
+    If rc = 0 : rc = V3dQpuProgramEndThrsw() : EndIf
+  EndIf
+  If rc <> 0 Or V3dQpuProgramEnd() <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, variableId, *n\sourceOpcode, 6) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkIrV3d42Lower(*m.AvkIrModule, *t.AvkIrV3d42Target, *r.AvkIrV3d42Result)
+  Protected rc.i
+  Protected codeBytes.i
+  Protected uniformBytes.i
+  Protected overlap.i
+  Protected i.i
+  avk42Error = 0 : avk42SourceId = 0 : avk42SourceOpcode = 0 : avk42Stage = 0
+  If *r = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  avk42ClearResult(*r)
+  avk42ClearResult(@avk42PendingResult)
+  If *m = 0 Or *t = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  rc = AnvilVkIrVerify(*m)
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_IR, AnvilVkIrLastId(), AnvilVkIrLastOpcode(), 1) : EndIf
+  If *t\role <> #ANVIL_IR_V3D42_ROLE_VERTEX And *t\role <> #ANVIL_IR_V3D42_ROLE_FRAGMENT : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, 0, 0, 2) : EndIf
+  If (*m\stage = #ANVIL_IR_STAGE_VERTEX) <> Bool(*t\role = #ANVIL_IR_V3D42_ROLE_VERTEX) : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 2) : EndIf
+  If *t\outputCount <> 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 2) : EndIf
+  rc = avk42ValidateIo(*m, *t\inputs, *t\inputCount, #ANVIL_IR_STORAGE_INPUT, 0) : If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = avk42ValidateIo(*m, *t\outputs, *t\outputCount, #ANVIL_IR_STORAGE_OUTPUT, 1) : If rc <> 0 : ProcedureReturn rc : EndIf
+  ; RelaxedPrecision changes arithmetic precision, which this exact-binary32
+  ; tranche does not lower. Base verification has already refused every other
+  ; unrepresented decoration/type/control-flow shape.
+  i = 0
+  While i < *m\decorationCount
+    Protected *d.AvkIrDecoration = avkIrDecorationAt(*m, i)
+    If *d\kind = #ANVIL_IR_DEC_RELAXED_PRECISION : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *d\sourceId, *d\sourceOpcode, 3) : EndIf
+    i = i + 1
+  Wend
+  ; Metadata is part of the same transaction as code and uniforms. Keep it in
+  ; the lowerer's private module scratch until every semantic, destination-
+  ; range and overlap check has passed; a refusal therefore leaves the
+  ; caller's cleared result intact.
+  rc = avk42PrepareAndEmit(*m, *t, @avk42PendingResult) : If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = avk42ValidateResourceUse(*m, *t, @avk42PendingResult) : If rc <> 0 : ProcedureReturn rc : EndIf
+  codeBytes = V3dQpuProgramBytes() : uniformBytes = avk42UniformCount * 4
+  If *t\codeBase = 0 Or (*t\codeBase & 7) <> 0 Or *t\codeCapacity < codeBytes Or *t\uniformBase = 0 Or (*t\uniformBase & 3) <> 0 Or *t\uniformCapacity < uniformBytes
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 7)
+  EndIf
+  If avk42RangeEnd(*t\codeBase, codeBytes) = 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 7)
+  EndIf
+  If uniformBytes > 0 And avk42RangeEnd(*t\uniformBase, uniformBytes) = 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 7)
+  EndIf
+  overlap = 0
+  If uniformBytes > 0 : overlap = avk42RangesOverlap(*t\codeBase, codeBytes, *t\uniformBase, uniformBytes) : EndIf
+  If overlap <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 7) : EndIf
+  i = 0 : While i < codeBytes : PokeA(*t\codeBase + i, PeekA(@avk42CodeScratch[0] + i)) : i = i + 1 : Wend
+  i = 0 : While i < uniformBytes : PokeA(*t\uniformBase + i, PeekA(@avk42UniformScratch[0] + i)) : i = i + 1 : Wend
+  avk42PendingResult\codeBytes = codeBytes
+  avk42PendingResult\uniformWords = avk42UniformCount
+  *r\codeBytes = avk42PendingResult\codeBytes
+  *r\uniformWords = avk42PendingResult\uniformWords
+  *r\pushFirstWord = avk42PendingResult\pushFirstWord
+  *r\pushRWord = avk42PendingResult\pushRWord
+  *r\pushGWord = avk42PendingResult\pushGWord
+  *r\pushBWord = avk42PendingResult\pushBWord
+  *r\pushAWord = avk42PendingResult\pushAWord
+  *r\uniformAddressWord = avk42PendingResult\uniformAddressWord
+  *r\uniformConfigWord = avk42PendingResult\uniformConfigWord
+  *r\textureStateWord = avk42PendingResult\textureStateWord
+  *r\samplerStateWord = avk42PendingResult\samplerStateWord
+  *r\tlbConfigWord = avk42PendingResult\tlbConfigWord
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  Canonical typed vertex plan and transactional CS/VS pair lowering
+; ======================================================================
+
+Procedure avk42ClearVertexPlan(*p.AvkIrV3d42VertexPlan)
+  Protected i.i
+  If *p = 0 : ProcedureReturn 0 : EndIf
+  i = 0 : While i < SizeOf(AvkIrV3d42VertexPlan) : PokeA(*p + i, 0) : i = i + 1 : Wend
+  *p\positionOutputMember = -1 : *p\positionInputMember = -1
+  i = 0
+  While i < #ANVIL_IR_V3D42_MAX_IO
+    *p\varyings[i]\location = -1
+    *p\varyings[i]\outputMember = -1
+    *p\varyings[i]\sourceMember = -1
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure avk42ClearVertexPairResult(*r.AvkIrV3d42VertexPairResult)
+  Protected i.i
+  If *r = 0 : ProcedureReturn 0 : EndIf
+  i = 0 : While i < SizeOf(AvkIrV3d42VertexPairResult) : PokeA(*r + i, 0) : i = i + 1 : Wend
+EndProcedure
+
+Procedure.i avk42VertexSelectionType(*m.AvkIrModule, variableId.i, member.i)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Protected *p.AvkIrType
+  Protected *s.AvkIrType
+  Protected typeId.i
+  If *v = 0 : ProcedureReturn 0 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 Or *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn 0 : EndIf
+  typeId = *p\pointeeType
+  If member >= 0
+    *s = avkIrFindType(*m, typeId)
+    If *s = 0 Or *s\kind <> #ANVIL_IR_TYPE_STRUCT Or member >= *s\memberCount : ProcedureReturn 0 : EndIf
+    typeId = avkIrMemberType(*s, member)
+  EndIf
+  ProcedureReturn typeId
+EndProcedure
+
+Procedure.i avk42VertexMemberDecoration(*m.AvkIrModule, variableId.i, member.i, kind.i)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Protected *p.AvkIrType
+  If *v = 0 Or member < 0 : ProcedureReturn -1 : EndIf
+  *p = avkIrFindType(*m, *v\pointerType)
+  If *p = 0 Or *p\kind <> #ANVIL_IR_TYPE_POINTER : ProcedureReturn -1 : EndIf
+  ProcedureReturn avk42Decoration(*m, *p\pointeeType, member, kind)
+EndProcedure
+
+Procedure.i avk42VertexFloatShape(*m.AvkIrModule, typeId.i, lanes.i)
+  ProcedureReturn Bool(avkIrFloatLanes(*m, typeId) = lanes)
+EndProcedure
+
+Procedure.i avk42VertexPositionMemberValid(*m.AvkIrModule, pointerId.i, variableId.i, member.i)
+  Protected *v.AvkIrVariable = avkIrFindVariable(*m, variableId)
+  Protected *basePointer.AvkIrType
+  Protected *block.AvkIrType
+  Protected *chain.AvkIrNode = avkIrFindNode(*m, pointerId)
+  Protected *memberPointer.AvkIrType
+  Protected memberType.i
+  If *v = 0 Or *v\storageClass <> #ANVIL_IR_STORAGE_OUTPUT Or member < 0 Or *chain = 0 Or *chain\kind <> #ANVIL_IR_OP_ACCESS_CHAIN : ProcedureReturn 0 : EndIf
+  *basePointer = avkIrFindType(*m, *v\pointerType)
+  If *basePointer = 0 Or *basePointer\kind <> #ANVIL_IR_TYPE_POINTER Or *basePointer\storageClass <> #ANVIL_IR_STORAGE_OUTPUT : ProcedureReturn 0 : EndIf
+  *block = avkIrFindType(*m, *basePointer\pointeeType)
+  If *block = 0 Or *block\kind <> #ANVIL_IR_TYPE_STRUCT Or member >= *block\memberCount : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *block\sourceId, -1, #ANVIL_IR_DEC_BLOCK) < 0 : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *block\sourceId, member, #ANVIL_IR_DEC_BUILTIN) <> #ANVIL_IR_BUILTIN_POSITION : ProcedureReturn 0 : EndIf
+  memberType = avkIrMemberType(*block, member)
+  If avk42VertexFloatShape(*m, memberType, 4) = 0 : ProcedureReturn 0 : EndIf
+  *memberPointer = avkIrFindType(*m, *chain\resultType)
+  If *memberPointer = 0 Or *memberPointer\kind <> #ANVIL_IR_TYPE_POINTER Or *memberPointer\storageClass <> #ANVIL_IR_STORAGE_OUTPUT Or *memberPointer\pointeeType <> memberType : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avk42VertexScalarBits(*m.AvkIrModule, id.i, bits.i)
+  Protected *c.AvkIrConstant = avkIrFindConstant(*m, id)
+  Protected *t.AvkIrType
+  If *c = 0 Or *c\wordCount <> 1 Or *c\componentCount <> 0 Or (*c\word0 & $FFFFFFFF) <> (bits & $FFFFFFFF) : ProcedureReturn 0 : EndIf
+  *t = avkIrFindType(*m, *c\typeId)
+  If *t = 0 Or *t\kind <> #ANVIL_IR_TYPE_FLOAT Or *t\width <> 32 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avk42VertexWholeInputLoad(*m.AvkIrModule, valueId.i, lanes.i, *variableOut)
+  Protected *n.AvkIrNode = avkIrFindNode(*m, valueId)
+  Protected *v.AvkIrVariable
+  If *n = 0 Or *n\kind <> #ANVIL_IR_OP_LOAD Or *n\operandCount <> 1 : ProcedureReturn 0 : EndIf
+  *v = avkIrFindVariable(*m, *n\operand0)
+  If *v = 0 Or *v\storageClass <> #ANVIL_IR_STORAGE_INPUT : ProcedureReturn 0 : EndIf
+  If avk42VertexFloatShape(*m, *n\resultType, lanes) = 0 : ProcedureReturn 0 : EndIf
+  If *n\resultType <> avk42VertexSelectionType(*m, *v\sourceId, -1) : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *v\sourceId, -1, #ANVIL_IR_DEC_LOCATION) < 0 : ProcedureReturn 0 : EndIf
+  If avk42Decoration(*m, *v\sourceId, -1, #ANVIL_IR_DEC_BUILTIN) >= 0 : ProcedureReturn 0 : EndIf
+  PokeI(*variableOut, *v\sourceId)
+  ProcedureReturn *n\sourceId
+EndProcedure
+
+Procedure.i avk42VertexPositionValue(*m.AvkIrModule, valueId.i, outputType.i, *loadOut, *variableOut)
+  Protected *construct.AvkIrNode = avkIrFindNode(*m, valueId)
+  Protected *x.AvkIrNode
+  Protected *y.AvkIrNode
+  Protected loadId.i
+  Protected variableId.i
+  If *construct = 0 Or *construct\kind <> #ANVIL_IR_OP_COMPOSITE_CONSTRUCT Or *construct\operandCount <> 4 Or *construct\resultType <> outputType
+    ProcedureReturn 0
+  EndIf
+  *x = avkIrFindNode(*m, *construct\operand0)
+  *y = avkIrFindNode(*m, *construct\operand1)
+  If *x = 0 Or *y = 0 Or *x\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT Or *y\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT
+    ProcedureReturn 0
+  EndIf
+  If *x\operandCount <> 1 Or *y\operandCount <> 1 Or *x\literalCount <> 1 Or *y\literalCount <> 1 Or *x\literal0 <> 0 Or *y\literal0 <> 1 Or *x\operand0 <> *y\operand0
+    ProcedureReturn 0
+  EndIf
+  If avk42VertexFloatShape(*m, *x\resultType, 1) = 0 Or *y\resultType <> *x\resultType : ProcedureReturn 0 : EndIf
+  loadId = avk42VertexWholeInputLoad(*m, *x\operand0, 2, @variableId)
+  If loadId = 0 : ProcedureReturn 0 : EndIf
+  If avk42VertexScalarBits(*m, *construct\operand2, $00000000) = 0 Or avk42VertexScalarBits(*m, *construct\operand3, $3F800000) = 0
+    ProcedureReturn 0
+  EndIf
+  PokeI(*loadOut, loadId) : PokeI(*variableOut, variableId)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
+  Protected i.i
+  Protected location.i
+  Protected builtIn.i
+  Protected varLocation.i
+  Protected varBuiltIn.i
+  Protected memberLocation.i
+  Protected memberBuiltIn.i
+  Protected variableId.i
+  Protected member.i
+  Protected outputType.i
+  Protected sourceVariable.i
+  Protected sourceLoad.i
+  Protected count.i
+  Protected total.i
+  Protected *n.AvkIrNode
+  Protected *v.AvkIrVariable
+  Protected *vary.AvkIrV3d42VertexVarying
+  avk42ClearVertexPlan(*p)
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i)
+    If *n\kind = #ANVIL_IR_OP_STORE
+      variableId = 0 : member = -1
+      If avk42PointerSelection(*m, *n\operand0, @variableId, @member) = 0
+        ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand0, *n\sourceOpcode, 2)
+      EndIf
+      *v = avkIrFindVariable(*m, variableId)
+      If *v = 0 Or *v\storageClass <> #ANVIL_IR_STORAGE_OUTPUT
+        ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+      EndIf
+      varLocation = avk42Decoration(*m, variableId, -1, #ANVIL_IR_DEC_LOCATION)
+      varBuiltIn = avk42Decoration(*m, variableId, -1, #ANVIL_IR_DEC_BUILTIN)
+      memberLocation = avk42VertexMemberDecoration(*m, variableId, member, #ANVIL_IR_DEC_LOCATION)
+      memberBuiltIn = avk42VertexMemberDecoration(*m, variableId, member, #ANVIL_IR_DEC_BUILTIN)
+      If member >= 0
+        If varLocation >= 0 Or varBuiltIn >= 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+        EndIf
+        location = memberLocation : builtIn = memberBuiltIn
+      Else
+        If memberLocation >= 0 Or memberBuiltIn >= 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+        EndIf
+        location = varLocation : builtIn = varBuiltIn
+      EndIf
+      If (location >= 0 And builtIn >= 0) Or (location < 0 And builtIn < 0)
+        ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+      EndIf
+      outputType = avk42VertexSelectionType(*m, variableId, member)
+      If builtIn >= 0
+        If builtIn <> #ANVIL_IR_BUILTIN_POSITION Or *p\positionOutputVariableId <> 0 Or avk42VertexFloatShape(*m, outputType, 4) = 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, variableId, *n\sourceOpcode, 2)
+        EndIf
+        If member >= 0 And avk42VertexPositionMemberValid(*m, *n\operand0, variableId, member) = 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+        EndIf
+        sourceLoad = 0 : sourceVariable = 0
+        If avk42VertexPositionValue(*m, *n\operand1, outputType, @sourceLoad, @sourceVariable) = 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+        EndIf
+        *p\positionOutputVariableId = variableId : *p\positionOutputMember = member
+        *p\positionInputVariableId = sourceVariable : *p\positionInputMember = -1 : *p\positionLoadId = sourceLoad
+      Else
+        If member >= 0 Or location < 0 Or location >= #ANVIL_IR_V3D42_MAX_IO
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, variableId, *n\sourceOpcode, 2)
+        EndIf
+        *vary = *p + OffsetOf(AvkIrV3d42VertexPlan\varyings) + location * SizeOf(AvkIrV3d42VertexVarying)
+        If *vary\components <> 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
+        EndIf
+        *vary\components = avkIrFloatLanes(*m, outputType)
+        If *vary\components <> 2 And *vary\components <> 4
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, variableId, *n\sourceOpcode, 2)
+        EndIf
+        sourceVariable = 0
+        sourceLoad = avk42VertexWholeInputLoad(*m, *n\operand1, *vary\components, @sourceVariable)
+        If sourceLoad = 0 Or avk42VertexSelectionType(*m, sourceVariable, -1) <> outputType
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+        EndIf
+        *vary\location = location : *vary\outputVariableId = variableId : *vary\outputMember = -1
+        *vary\sourceVariableId = sourceVariable : *vary\sourceMember = -1 : *vary\sourceLoadId = sourceLoad
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If *p\positionOutputVariableId = 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_STORE, 2)
+  EndIf
+  count = 0 : total = 0
+  While count < #ANVIL_IR_V3D42_MAX_IO And *p\varyings[count]\components > 0
+    total = total + *p\varyings[count]\components : count = count + 1
+  Wend
+  i = count
+  While i < #ANVIL_IR_V3D42_MAX_IO
+    If *p\varyings[i]\components <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\varyings[i]\outputVariableId, #ANVIL_IR_SPV_STORE, 2) : EndIf
+    i = i + 1
+  Wend
+  If total <> 0 And total <> 2 And total <> 4 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_STORE, 2) : EndIf
+  If count = 2 And (*p\varyings[0]\components <> 2 Or *p\varyings[1]\components <> 2) : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_STORE, 2) : EndIf
+  If count > 2 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *m\entryFunctionId, #ANVIL_IR_SPV_STORE, 2) : EndIf
+  *p\varyingCount = count : *p\varyingComponents = total
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i AnvilVkIrV3d42PlanVertex(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
+  Protected rc.i
+  Protected i.i
+  avk42Error = 0 : avk42SourceId = 0 : avk42SourceOpcode = 0 : avk42Stage = 0
+  If *p = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  ; Planning is transactional too: a rejected module cannot partially replace
+  ; a caller-owned canonical plan.
+  avk42ClearVertexPlan(@avk42VertexPlanPending)
+  If *m = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  rc = AnvilVkIrVerify(*m)
+  If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_IR, AnvilVkIrLastId(), AnvilVkIrLastOpcode(), 1) : EndIf
+  If *m\stage <> #ANVIL_IR_STAGE_VERTEX : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 1) : EndIf
+  rc = avk42BuildVertexPlan(*m, @avk42VertexPlanPending)
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  i = 0 : While i < SizeOf(AvkIrV3d42VertexPlan) : PokeA(*p + i, PeekA(@avk42VertexPlanPending + i)) : i = i + 1 : Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42VertexValidateInputs(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexPairTarget, *slotsOut)
+  Protected i.i
+  Protected j.i
+  Protected count.i
+  Protected location.i
+  Protected expectedSlot.i
+  Protected comps.i
+  Protected *v.AvkIrVariable
+  Protected *io.AvkIrV3d42Io
+  Protected *found.AvkIrV3d42Io
+  Protected *vary.AvkIrV3d42VertexVarying
+  If avk42ValidateIoStage(*m, *t\inputs, *t\inputCount, #ANVIL_IR_STORAGE_INPUT, 0, 3) <> 0 : ProcedureReturn avk42Error : EndIf
+  count = 0
+  i = 0
+  While i < *m\variableCount
+    *v = avkIrVariableAt(*m, i)
+    If *v\storageClass = #ANVIL_IR_STORAGE_INPUT
+      location = avk42Decoration(*m, *v\sourceId, -1, #ANVIL_IR_DEC_LOCATION)
+      If location >= 0 : If location + 1 > count : count = location + 1 : EndIf : EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If count <> *t\inputCount Or count < 1 Or count > #ANVIL_IR_V3D42_MAX_IO
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *m\entryFunctionId, *m\entryFunctionOpcode, 3)
+  EndIf
+  expectedSlot = 0 : location = 0
+  While location < count
+    *found = 0 : i = 0
+    While i < *t\inputCount
+      *io = avk42IoAt(*t\inputs, i)
+      If *io\member = -1 And avk42Decoration(*m, *io\variableId, -1, #ANVIL_IR_DEC_LOCATION) = location : *found = *io : EndIf
+      i = i + 1
+    Wend
+    If *found = 0 Or *found\firstSlot <> expectedSlot : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, location, #ANVIL_IR_SPV_VARIABLE, 3) : EndIf
+    expectedSlot = expectedSlot + *found\components : location = location + 1
+  Wend
+  If expectedSlot < 2 Or expectedSlot > #ANVIL_IR_V3D42_MAX_SLOT + 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, expectedSlot, 0, 3) : EndIf
+  *found = avk42FindIo(*t\inputs, *t\inputCount, *p\positionInputVariableId, -1)
+  If *found = 0 Or *found\components <> 2
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3)
+  EndIf
+  i = 0
+  While i < *p\varyingCount
+    *vary = *p + OffsetOf(AvkIrV3d42VertexPlan\varyings) + i * SizeOf(AvkIrV3d42VertexVarying)
+    *found = avk42FindIo(*t\inputs, *t\inputCount, *vary\sourceVariableId, -1)
+    If *found = 0 Or *found\components <> *vary\components
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *vary\sourceVariableId, #ANVIL_IR_SPV_LOAD, 3)
+    EndIf
+    i = i + 1
+  Wend
+  PokeI(*slotsOut, expectedSlot)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42VertexF32FromInt(n.i)
+  Protected e.i
+  Protected m.i
+  If n <= 0 Or n >= 16777216 : ProcedureReturn 0 : EndIf
+  e = 0 : m = n
+  While m > 1 : m = m >> 1 : e = e + 1 : Wend
+  m = (n << (23 - e)) & $7FFFFF
+  ProcedureReturn ((e + 127) << 23) | m
+EndProcedure
+
+Procedure avk42VertexFillUniform(base.i, words.i, halfW.i, halfH.i)
+  Protected i.i = 0
+  While i < words - 4 : PokeL(base + (i * 4), i) : i = i + 1 : Wend
+  PokeL(base + (i * 4), $00000000) : PokeL(base + ((i + 1) * 4), $3F800000)
+  PokeL(base + ((i + 2) * 4), avk42VertexF32FromInt(halfW))
+  PokeL(base + ((i + 3) * 4), avk42VertexF32FromInt(halfH))
+EndProcedure
+
+Procedure.i avk42EmitVertexProgram(*p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexPairTarget, inputSlots.i, halfW.i, halfH.i, coordinate.i)
+  Protected r.i
+  Protected k.i
+  Protected c.i
+  Protected outSlots.i
+  Protected kcount.i
+  Protected b.i
+  Protected temp.i
+  Protected slot.i
+  Protected code.i
+  Protected *pos.AvkIrV3d42Io
+  Protected *src.AvkIrV3d42Io
+  Protected *vary.AvkIrV3d42VertexVarying
+  If coordinate <> 0 : outSlots = 6 + *p\varyingComponents : code = @avk42VertexCsScratch[0] : Else : outSlots = 4 + *p\varyingComponents : code = @avk42VertexVsScratch[0] : EndIf
+  kcount = outSlots : If inputSlots > kcount : kcount = inputSlots : EndIf
+  b = kcount + 4 : temp = b + inputSlots
+  *pos = avk42FindIo(*t\inputs, *t\inputCount, *p\positionInputVariableId, -1)
+  If *pos = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3) : EndIf
+  r = V3dQpuProgramBeginSeg(code, #ANVIL_IR_V3D42_CODE_BYTES, 1)
+  If r <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, 0, 0, 4 + Bool(coordinate = 0)) : EndIf
+  k = 0
+  While k < kcount + 4 And r = 0 : r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0) : k = k + 1 : Wend
+  k = 0
+  While k < inputSlots And r = 0 : r = avk42EmitLdvpm(k, b + k) : k = k + 1 : Wend
+  If r = 0
+    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(b + *pos\firstSlot, kcount + 2) : r = V3dQpuEmit()
+  EndIf
+  If r = 0
+    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 1, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(b + *pos\firstSlot + 1, kcount + 3) : r = V3dQpuEmit()
+  EndIf
+  If r = 0 : r = V3dQpuNop() : EndIf
+  If r = 0 : r = V3dQpuAdd1(#V3DQ_A_FTOIN, temp, 0, #V3DQ_MUX_A, temp) : EndIf
+  If r = 0 : r = V3dQpuAdd1(#V3DQ_A_FTOIN, temp + 1, 0, #V3DQ_MUX_A, temp + 1) : EndIf
+  If coordinate <> 0
+    If r = 0 : r = avk42EmitStvpm(0, b + *pos\firstSlot) : EndIf
+    If r = 0 : r = avk42EmitStvpm(1, b + *pos\firstSlot + 1) : EndIf
+    If r = 0 : r = avk42EmitStvpm(2, kcount) : EndIf
+    If r = 0 : r = avk42EmitStvpm(3, kcount + 1) : EndIf
+    If r = 0 : r = avk42EmitStvpm(4, temp) : EndIf
+    If r = 0 : r = avk42EmitStvpm(5, temp + 1) : EndIf
+    slot = 6
+  Else
+    If r = 0 : r = avk42EmitStvpm(0, temp) : EndIf
+    If r = 0 : r = avk42EmitStvpm(1, temp + 1) : EndIf
+    If r = 0 : r = avk42EmitStvpm(2, kcount) : EndIf
+    If r = 0 : r = avk42EmitStvpm(3, kcount + 1) : EndIf
+    slot = 4
+  EndIf
+  k = 0
+  While k < *p\varyingCount And r = 0
+    *vary = *p + OffsetOf(AvkIrV3d42VertexPlan\varyings) + k * SizeOf(AvkIrV3d42VertexVarying)
+    *src = avk42FindIo(*t\inputs, *t\inputCount, *vary\sourceVariableId, -1)
+    c = 0
+    While c < *vary\components And r = 0
+      r = avk42EmitStvpm(slot, b + *src\firstSlot + c) : slot = slot + 1 : c = c + 1
+    Wend
+    k = k + 1
+  Wend
+  If r = 0 : r = V3dQpuAdd0(#V3DQ_A_VPMWT, #V3DQ_WADDR_NOP, 1) : EndIf
+  If r = 0 : r = V3dQpuProgramEndThrsw() : EndIf
+  If r = 0 : r = V3dQpuProgramEnd() : EndIf
+  If r <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, 0, 0, 4 + Bool(coordinate = 0)) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42VertexSpanOk(base.i, capacity.i, bytes.i, alignment.i)
+  If base = 0 Or (base & (alignment - 1)) <> 0 Or capacity < bytes : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bool(avk42RangeEnd(base, bytes) <> 0)
+EndProcedure
+
+Procedure.i AnvilVkIrV3d42LowerVertexPair(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, *r.AvkIrV3d42VertexPairResult)
+  Protected rc.i
+  Protected inputSlots.i
+  Protected csK.i
+  Protected vsK.i
+  Protected halfW.i
+  Protected halfH.i
+  Protected i.i
+  Protected j.i
+  Dim bases.i[4]
+  Dim sizes.i[4]
+  avk42Error = 0 : avk42SourceId = 0 : avk42SourceOpcode = 0 : avk42Stage = 0
+  If *r = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  ; The caller's result is part of the same four-span transaction.  Preserve
+  ; it on every refusal and clear only private pending state.
+  avk42ClearVertexPairResult(@avk42VertexPairPending)
+  If *m = 0 Or *t = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
+  rc = AnvilVkIrV3d42PlanVertex(*m, @avk42VertexPlanPending) : If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = avk42VertexValidateInputs(*m, @avk42VertexPlanPending, *t, @inputSlots) : If rc <> 0 : ProcedureReturn rc : EndIf
+  ; Public viewport decoding admits exact whole-pixel extents 1..65535.
+  ; Multiplication by 128 is therefore checked by that same bound, cannot
+  ; overflow, and remains below 2^23 so the binary32 stream word is exact.
+  If *t\viewportWidth <= 0 Or *t\viewportHeight <= 0 Or *t\viewportWidth > 65535 Or *t\viewportHeight > 65535
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 3)
+  EndIf
+  halfW = *t\viewportWidth * 128 : halfH = *t\viewportHeight * 128
+  rc = avk42EmitVertexProgram(@avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 1) : If rc <> 0 : ProcedureReturn rc : EndIf
+  avk42VertexPairPending\coordinateCodeBytes = V3dQpuProgramBytes()
+  csK = 6 + avk42VertexPlanPending\varyingComponents : If inputSlots > csK : csK = inputSlots : EndIf
+  avk42VertexPairPending\coordinateUniformWords = csK + 4
+  avk42VertexFillUniform(@avk42VertexCsUniform[0], avk42VertexPairPending\coordinateUniformWords, halfW, halfH)
+  rc = avk42EmitVertexProgram(@avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 0) : If rc <> 0 : ProcedureReturn rc : EndIf
+  avk42VertexPairPending\vertexCodeBytes = V3dQpuProgramBytes()
+  vsK = 4 + avk42VertexPlanPending\varyingComponents : If inputSlots > vsK : vsK = inputSlots : EndIf
+  avk42VertexPairPending\vertexUniformWords = vsK + 4
+  avk42VertexFillUniform(@avk42VertexVsUniform[0], avk42VertexPairPending\vertexUniformWords, halfW, halfH)
+  avk42VertexPairPending\inputSlots = inputSlots
+  avk42VertexPairPending\varyingComponents = avk42VertexPlanPending\varyingComponents
+  avk42VertexPairPending\halfWidthEighths = halfW : avk42VertexPairPending\halfHeightEighths = halfH
+  bases[0] = *t\coordinateCodeBase : sizes[0] = avk42VertexPairPending\coordinateCodeBytes
+  bases[1] = *t\vertexCodeBase : sizes[1] = avk42VertexPairPending\vertexCodeBytes
+  bases[2] = *t\coordinateUniformBase : sizes[2] = avk42VertexPairPending\coordinateUniformWords * 4
+  bases[3] = *t\vertexUniformBase : sizes[3] = avk42VertexPairPending\vertexUniformWords * 4
+  If avk42VertexSpanOk(bases[0], *t\coordinateCodeCapacity, sizes[0], 8) = 0 Or avk42VertexSpanOk(bases[1], *t\vertexCodeCapacity, sizes[1], 8) = 0 Or avk42VertexSpanOk(bases[2], *t\coordinateUniformCapacity, sizes[2], 4) = 0 Or avk42VertexSpanOk(bases[3], *t\vertexUniformCapacity, sizes[3], 4) = 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 6)
+  EndIf
+  i = 0
+  While i < 4
+    j = i + 1
+    While j < 4
+      If avk42RangesOverlap(bases[i], sizes[i], bases[j], sizes[j]) <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 6) : EndIf
+      j = j + 1
+    Wend
+    i = i + 1
+  Wend
+  i = 0 : While i < sizes[0] : PokeA(bases[0] + i, PeekA(@avk42VertexCsScratch[0] + i)) : i = i + 1 : Wend
+  i = 0 : While i < sizes[1] : PokeA(bases[1] + i, PeekA(@avk42VertexVsScratch[0] + i)) : i = i + 1 : Wend
+  i = 0 : While i < sizes[2] : PokeA(bases[2] + i, PeekA(@avk42VertexCsUniform[0] + i)) : i = i + 1 : Wend
+  i = 0 : While i < sizes[3] : PokeA(bases[3] + i, PeekA(@avk42VertexVsUniform[0] + i)) : i = i + 1 : Wend
+  i = 0 : While i < SizeOf(AvkIrV3d42VertexPairResult) : PokeA(*r + i, PeekA(@avk42VertexPairPending + i)) : i = i + 1 : Wend
+  ProcedureReturn 0
+EndProcedure

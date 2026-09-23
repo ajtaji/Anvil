@@ -1,0 +1,438 @@
+; pi4GicProbe.pi4 - THE GIC-400 IDENTITY READ. THE SAFE ONE.
+;
+; DIAGNOSTIC. Does not ship.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/NotBuilding/pi4GicProbe.pi4 -t pi4 \
+;        --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -s -o _work/gicprobe.img
+;
+; ----------------------------------------------------------------------
+; RUN THIS BEFORE pi4GicTimer.pi4. IT CANNOT HANG THE BOARD.
+; ----------------------------------------------------------------------
+; This probe NEVER clears PSTATE.I and NEVER installs a vector table.
+; Not once, not conditionally. Every interrupt in the machine stays
+; masked at the core for the whole run, so the worst thing that can
+; happen is that a read from $FF841000 does not come back - and even
+; that is a data abort, not a wedge, because nothing here is inside a
+; loop that waits for hardware.
+;
+; It exists to answer ONE question, and it is the question every other
+; piece of GIC work rests on:
+;
+;     IS THERE A GIC-400 AT $FF841000, AND CAN NON-SECURE EL2 SEE IT?
+;
+; That is the "SYS_REV_CTRL moment" for this block - the single read
+; that settles the base address, the peripheral mode, the power state
+; and the reachability of the ARM-local window all at once, the same
+; way GENET's SYS_REV_CTRL and V3D's HUB_IDENT1 did for theirs.
+;
+; ----------------------------------------------------------------------
+; THE TWO NUMBERS TO CHECK BY EYE
+; ----------------------------------------------------------------------
+;   dist IIDR   $0200143B     GIC-400 distributor, ARM, r0p1
+;   cpu  IIDR   $0202143B     GIC-400 CPU interface, GICv2, ARM, r0p1
+;
+; Both are RESET VALUES printed in the GIC-400 TRM's own register
+; summaries - RaspberryPi4/Reference/arm-gic400-DDI0471.txt:1205 and
+; :1588 - and they sit in DIFFERENT 4 KiB pages, so getting both right
+; checks the base arithmetic twice rather than once.
+;
+; The third number worth reading is TYPER:
+;
+;   TYPER       $0000FC66     LSPI 31, SecurityExtn 1, 4 CPUs,
+;                             ITLinesNumber 6 -> 224 interrupt IDs
+;
+; derived, not transcribed, from NUM_SPIS=192 / NUM_CPUS=4
+; (Datasheets/bcm2711-peripherals.txt:8402) through the TRM's field
+; rules at arm-gic400-DDI0471.txt:1288-1300. A DIFFERENT TYPER IS NOT
+; A FAILURE - it means this part is configured differently and the
+; library narrows to what it reports - but it is a finding and it
+; should be written down.
+;
+; ----------------------------------------------------------------------
+; WHAT A FAILURE MEANS, ROW BY ROW
+; ----------------------------------------------------------------------
+;   dist IIDR reads $00000000
+;       The ARM-local window is not answering, or the GIC has no
+;       clock. Nothing in this tree has ever read $FF8xxxxx before, so
+;       this would be a first.
+;
+;   dist IIDR reads something else entirely
+;       Wrong base. Check whether the board is in HIGH peripheral mode
+;       - armstub8.S:45-51 puts the GIC at $4_C004_1000 there - which
+;       would also mean every other driver in this tree is at the
+;       wrong address, so it is unlikely and it would explain a lot.
+;
+;   dist IIDR right, cpu IIDR wrong
+;       The base is right and the $1000 stride is not. Read
+;       Datasheets/pi4/bcm2711.dtsi:56-62, which gives the two regions
+;       explicitly.
+;
+;   PMR readback $00
+;       GICC_PMR is RAZ/WI to Non-secure accesses because a Secure
+;       write left it below $80 (GICv2 spec :6492-6498). No interrupt
+;       can ever reach us. This is a FIRMWARE finding - the stub on
+;       the SD card is not doing what armstub8.S:226-227 does - and
+;       nothing in our software can fix it.
+;
+;   group witness fails, HPPIR saw $3FF
+;       The claimed line is Group 0, therefore invisible from
+;       Non-secure state (GICv2 spec Table 4-38, :7249-7258), which
+;       means setup_gic did NOT run, which means the boot stub is
+;       armstub8.bin and not armstub8-gic.bin. THIS IS THE MOST
+;       INTERESTING FAILURE THIS PROBE CAN PRODUCE, because the whole
+;       argument that the GIC is usable from EL2 rests on that stub
+;       having run, and the argument is an inference from CNTFRQ_EL0
+;       reading 54 MHz rather than a measurement. See gic.pi4's
+;       section THE ONE THING THAT MAKES THIS WORK AT ALL.
+;
+; ----------------------------------------------------------------------
+; THE PRIORITY READBACK IS A MEASUREMENT, NOT A CHECK
+; ----------------------------------------------------------------------
+; The row "prio readback" is what came back after writing $FF to a
+; priority field from Non-secure state. The GIC-400 TRM says this part
+; has 16 Non-secure priority levels (:966-967), which is four
+; implemented bits, so the expected value is $F0. $F8 would mean 32
+; levels and is fine. $00 would mean the write was ignored.
+;
+; This is the GICv2 spec's OWN recommended way to discover the number
+; of priority bits (:1922-1924). It is recorded rather than asserted
+; because the answer is implementation defined and a library that
+; refused an unexpected-but-legal value would be wrong.
+;
+; ----------------------------------------------------------------------
+; WHICH ROWS ARE PASS CRITERIA AND WHICH ARE FINDINGS
+; ----------------------------------------------------------------------
+; PASS CRITERIA - these have one right answer and it was written down
+; before the probe was ever run:
+;
+;   dist IIDR   $0200143B     cpu IIDR   $0202143B
+;   TYPER       $0000FC66     int IDs    $E0 (224)
+;   PMR         $F0           HPPIR idle $3FF
+;   novec enable rc $0        novec err  $9
+;   claim rc    $1            prio now   $A0
+;   reclaim rc  $0            reclaim err $C
+;   witness rc  $1            HPPIR saw  $1A
+;   27 pending  $0            27 enabled $0
+;   never ran   $0            I masked exit $1
+;
+; FINDINGS - nobody knows what these will say and that is why they are
+; printed. NONE OF THEM IS A FAILURE:
+;
+;   DAIF entry / I masked entry
+;       What the boot chain and the monitor left. With --entry-returns
+;       the compiler's startup does not mask anything
+;       (EmitCore_A64.pbi:230-234), so this is the first time anything
+;       in this tree has looked. $3C0 means all four masked, which is
+;       what armstub8.S:74-80 erets with.
+;
+;   VBAR entry
+;       Reset leaves VBAR_EL2 architecturally UNKNOWN. Zero is what is
+;       expected and anything else is worth knowing, because
+;       GicEnableInterrupts()'s refusal is built on it.
+;
+;   27 / 26 / 128 was enabled
+;       WHAT THE FIRMWARE LEFT ENABLED IN THE GIC, out of the copy
+;       GicInit() saved before its clean slate. Nothing in this tree
+;       has ever asked. All three reading 0 is the tidy answer; a 1 on
+;       INTID 128 - SPI 96, the PL011's - would mean the boot chain
+;       left the UART's interrupt armed, which is a real thing to know
+;       before unmasking anything.
+;
+;   prio readback
+;       See below. $F0 is expected, $F8 is legal, $00 is a lockout.
+;
+;   RPR
+;       $FE or $FF. Idle is the lowest priority; whether the
+;       Non-secure shift is applied to this register on this part is
+;       spec-derived (GICv2 :2439-2443) and has never been measured.
+;
+; ARM THE DEADMAN ANYWAY. `deadman 15` before running this. It costs
+; nothing and the habit is cheaper than the exception.
+; ----------------------------------------------------------------------
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/gic.pi4"
+
+#PR_MAX = 64
+Global Dim pr_val.i[#PR_MAX]
+Global pr_n.i
+
+; A handler that is never reached. GicClaim() refuses a null handler -
+; correctly - and this probe needs a claim in order to exercise the
+; priority write and the group witness. It cannot run: PSTATE.I is set
+; for the whole probe and the CNTHP comparator is never armed.
+;
+; It increments a counter anyway, so that "0" printed at the end is
+; evidence rather than an assumption.
+Global pr_neverRan.i
+Procedure NeverRuns()
+  pr_neverRan = pr_neverRan + 1
+EndProcedure
+
+Procedure PutHex16(v.i)
+  Define i.i
+  Define n.i
+  For i = 15 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      UartWrite(48 + n)
+    Else
+      UartWrite(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Rec(*label, v.i)
+  If pr_n < #PR_MAX
+    pr_val[pr_n] = v
+    pr_n = pr_n + 1
+  EndIf
+  UartWriteStr(*label)
+  UartWrite(36)
+  PutHex16(v)
+  UartWriteNl()
+EndProcedure
+
+Procedure Say(*label)
+  UartWriteStr("-- ")
+  UartWriteStr(*label)
+  UartWriteNl()
+  UartDrain()
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define daif0.i
+
+  UartInit(115200)
+  SafetyWatchdogStart(15)
+
+  UartWriteNl()
+  UartWriteStr("pi4GicProbe - is there a GIC-400 here, and can we see it")
+  UartWriteNl()
+  UartWriteNl()
+
+  ; ------------------------------------------------------------------
+  ;  0. THE MACHINE AS WE FOUND IT
+  ;
+  ;  DAIF matters more than it looks. With --entry-returns the
+  ;  compiler's startup does NOT mask anything - EmitCore_A64.pbi:230-234,
+  ;  "DAIF is the loader's - not masked, not touched" - so the state
+  ;  here is whatever anvil and the boot chain left, and nothing in
+  ;  this tree has ever recorded what that is. If bit 7 is clear,
+  ;  interrupts are ALREADY enabled and have been all along, which is
+  ;  a finding on its own.
+  ; ------------------------------------------------------------------
+  Say("state on entry")
+  daif0 = GicDaif()
+  Rec("DAIF entry      ", daif0)
+  Rec("I masked entry  ", (daif0 >> 7) & 1)
+  Rec("VBAR entry      ", GicVbar())
+
+  ; Whatever it was, mask now. Everything below assumes it. This is a
+  ; write to PSTATE and not to the GIC, so it is safe with no vector
+  ; table installed - masking can never cause an exception.
+  GicDisableInterrupts()
+  Rec("I masked now    ", (GicDaif() >> 7) & 1)
+
+  ; ------------------------------------------------------------------
+  ;  1. THE IDENTITY READ
+  ; ------------------------------------------------------------------
+  Say("GicInit")
+  rc = GicInit()
+  Rec("init rc         ", rc)
+  Rec("init err        ", GicError())
+  Rec("dist IIDR       ", GicDistIidr())
+  Rec("cpu IIDR        ", GicCpuIidr())
+
+  If rc = 0
+    UartWriteNl()
+    UartWriteStr("REFUSED: ")
+    UartWriteStr(GicErrorText())
+    UartWriteNl()
+    UartWriteStr("Nothing was written. The two IIDR rows above are the")
+    UartWriteNl()
+    UartWriteStr("whole of the finding - read them against the header.")
+    UartWriteNl()
+    Rec("results         ", pr_n)
+    UartDrain()
+    ProcedureReturn 0
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  2. WHAT THE IDENTITY DECODES TO
+  ; ------------------------------------------------------------------
+  Rec("dist product    ", GicIidrProduct(GicDistIidr()))
+  Rec("dist variant    ", GicIidrVariant(GicDistIidr()))
+  Rec("dist revision   ", GicIidrRevision(GicDistIidr()))
+  Rec("dist implement  ", GicIidrImplementer(GicDistIidr()))
+  Rec("cpu implement   ", GicIidrImplementer(GicCpuIidr()))
+
+  Rec("TYPER           ", GicTyper())
+  Rec("int IDs         ", GicIntIdCount())
+  Rec("CPU interfaces  ", GicCpuCount())
+  Rec("SecurityExtn    ", GicSecurityExtn())
+
+  ; ------------------------------------------------------------------
+  ;  3. THE STATE GicInit LEFT
+  ; ------------------------------------------------------------------
+  Say("controller state")
+  ; WHAT THE FIRMWARE LEFT ENABLED, out of the copy GicInit() saved
+  ; before its clean slate. Read the note on GicWasEnabled(): nothing
+  ; in this tree has ever looked, and an SPI that arrives on the first
+  ; unmask from a peripheral this program never touched is exactly the
+  ; surprise the storm guard exists for.
+  ;
+  ; INTID 27 is the virtual timer's PPI (bcm2711.dtsi:450-451).
+  Rec("27 was enabled  ", GicWasEnabled(27))
+  Rec("26 was enabled  ", GicWasEnabled(GicTickIntId()))
+  Rec("128 was enabled ", GicWasEnabled(128))
+
+  Rec("PMR             ", GicPriorityMask())
+  Rec("RPR             ", GicRunningPriority())
+  Rec("HPPIR idle      ", GicHighestPending())
+
+  ; ------------------------------------------------------------------
+  ;  3b. THE REFUSAL. GicEnableInterrupts() MUST SAY NO HERE.
+  ;
+  ;  This probe never installs a vector table, so unmasking would be
+  ;  the exact thing gic.pi4's THE VECTOR CHECK exists to prevent: an
+  ;  interrupt branching into whatever reset left in VBAR_EL2.
+  ;
+  ;  Testing a refusal is worth as much as testing an acceptance and
+  ;  it is tested far less often. A guard that has never been seen to
+  ;  fire is a guard nobody knows is wired up, and this one is the
+  ;  last thing standing between a half-built GIC and a board that
+  ;  stops answering.
+  ;
+  ;  IT IS SAFE TO ATTEMPT. Everything is disabled at the distributor
+  ;  by GicInit()'s clean slate, no line is claimed yet and no timer
+  ;  is armed, so even if the refusal wrongly let the unmask through
+  ;  there is nothing that could be delivered. The very next line
+  ;  masks again regardless of what happened.
+  ;
+  ;  WHAT A "1" IN "novec enable rc" MEANS: either VBAR_EL2 holds
+  ;  something that looks like a table - reset leaves it UNKNOWN, so
+  ;  that is possible on a part we have not measured - or the check is
+  ;  not working. "VBAR entry" at the top of this listing is the
+  ;  evidence that tells the two apart.
+  ; ------------------------------------------------------------------
+  Say("refusal - no vectors")
+  Rec("novec enable rc ", GicEnableInterrupts())
+  Rec("novec err       ", GicError())
+  GicDisableInterrupts()
+  Rec("novec I masked  ", (GicDaif() >> 7) & 1)
+
+  ; ------------------------------------------------------------------
+  ;  4. CLAIM THE TIMER LINE - no timer, no unmask, nothing fires
+  ;
+  ;  This exercises the priority write path and gives the group
+  ;  witness something legitimate to test. The line is enabled at the
+  ;  distributor by the claim, which is harmless: CNTHP is not armed
+  ;  so nothing asserts it, and PSTATE.I is set so nothing could be
+  ;  taken if it did.
+  ; ------------------------------------------------------------------
+  Say("claim INTID 26")
+  Rec("claim rc        ", GicClaim(GicTickIntId(), $A0, @NeverRuns))
+  Rec("claim err       ", GicError())
+  Rec("intid           ", GicTickIntId())
+  Rec("prio readback   ", GicPriorityReadback())
+  Rec("prio now        ", GicLinePriority(GicTickIntId()))
+  Rec("line enabled    ", GicLineEnabled(GicTickIntId()))
+  Rec("line pending    ", GicLinePending(GicTickIntId()))
+  Rec("line active     ", GicLineActive(GicTickIntId()))
+
+  ; A SECOND CLAIM ON AN OWNED LINE MUST BE REFUSED, not honoured.
+  ;
+  ; Two drivers wired to one interrupt is the shape where the second
+  ; one works, the first one mysteriously stops, and nothing anywhere
+  ; says why - the registration table has one slot per ID and a silent
+  ; overwrite loses the first owner without a trace. GicRelease() is
+  ; how a line changes hands, and this row is the proof that the
+  ; refusal exists rather than being described in a comment.
+  Rec("reclaim rc      ", GicClaim(GicTickIntId(), $A0, @NeverRuns))
+  Rec("reclaim err     ", GicError())
+  Rec("owner intact    ", GicLineEnabled(GicTickIntId()))
+
+  ; ------------------------------------------------------------------
+  ;  5. THE GROUP WITNESS - the only measurement that can tell us the
+  ;     boot stub configured the GIC for Non-secure use
+  ;
+  ;  Read gic.pi4's GicGroupWitness() comment. It pends the interrupt
+  ;  by hand, reads GICC_HPPIR - which has no side effects and works
+  ;  even with the group disabled - and clears the pending bit again.
+  ; ------------------------------------------------------------------
+  Say("group witness")
+  Rec("witness rc      ", GicGroupWitness(GicTickIntId()))
+  Rec("witness err     ", GicError())
+  Rec("HPPIR saw       ", GicGroupWitnessSaw())
+  Rec("pending after   ", GicLinePending(GicTickIntId()))
+
+  ; ------------------------------------------------------------------
+  ;  6. THE NEGATIVE CONTROL, AND IT IS THE MOST IMPORTANT ROW HERE
+  ;
+  ;  A witness on an interrupt that is NOT pending must NOT name it.
+  ;  Without this row, a GICC_HPPIR that was stuck returning the last
+  ;  ID it saw - or a model that returned whatever it was asked about
+  ;  - would pass step 5 and prove nothing at all. Every other check
+  ;  in this probe is "did the right number come back"; this one is
+  ;  the only one that can tell "the register works" from "the
+  ;  register agrees with me".
+  ;
+  ;  INTID 27 is the virtual timer's PPI (bcm2711.dtsi:450-451,
+  ;  GIC_PPI 11). Nothing in this tree arms the virtual timer and
+  ;  nothing claims the line, so it cannot be pending.
+  ; ------------------------------------------------------------------
+  Say("negative control")
+  Rec("HPPIR before    ", GicHighestPending())
+  Rec("27 pending      ", GicLinePending(27))
+  Rec("27 enabled      ", GicLineEnabled(27))
+
+  ; ------------------------------------------------------------------
+  ;  7. HAND THE BOARD BACK
+  ; ------------------------------------------------------------------
+  Say("shutdown")
+  GicRelease(GicTickIntId())
+  Rec("released enabled", GicLineEnabled(GicTickIntId()))
+  GicShutdown()
+  Rec("ready after     ", GicReady())
+
+  ; DID THE MACHINE COME BACK THE WAY WE FOUND IT?
+  ;
+  ; GicInit() disables every line so that whatever the firmware left
+  ; enabled cannot fire the instant the CPU interface comes up, and it
+  ; SAVES the enables first so that GicShutdown() can put them back.
+  ; That is the same contract as fault.pi4's VBAR save and restore and
+  ; it exists for the same reason: the monitor is about to load
+  ; somebody else's payload and it should not inherit our clean slate.
+  ;
+  ; This row reads back one line the firmware may have owned. What it
+  ; SHOULD say is whatever "27 enabled" said at the top of this
+  ; listing, before GicInit() touched anything - if the two disagree,
+  ; the save/restore pair is not a pair.
+  Rec("27 restored     ", GicLineEnabled(27))
+  Rec("never ran       ", pr_neverRan)
+  Rec("I masked exit   ", (GicDaif() >> 7) & 1)
+  Rec("results         ", pr_n)
+
+  UartWriteNl()
+  UartWriteStr("If dist IIDR is $0200143B and cpu IIDR is $0202143B,")
+  UartWriteNl()
+  UartWriteStr("there is a GIC-400 here and Non-secure EL2 can read it.")
+  UartWriteNl()
+  UartWriteStr("If witness rc is 1 as well, the boot stub put the")
+  UartWriteNl()
+  UartWriteStr("interrupts in Group 1 and pi4GicTimer.pi4 is worth")
+  UartWriteNl()
+  UartWriteStr("running. If it is 0, read the header - that is a")
+  UartWriteNl()
+  UartWriteStr("firmware finding and no amount of our code fixes it.")
+  UartWriteNl()
+
+  UartDrain()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

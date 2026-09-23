@@ -1,0 +1,342 @@
+; ======================================================================
+;  hw_i2c.pi4 - the Pi 4 HwI2c* backend. THE BOARD SIDE OF THE HwI2c* SEAM
+;  declared in Anvil/Hal/hal.pbi; the `i2c` command above it (Core,
+;  Anvil/Core/i2c_cmd.pbi) knows only bus numbers, 7-bit addresses, byte
+;  buffers and the portable #HW_I2C_* result codes - never a BSC register.
+;
+;  It is thin wrappers over RaspberryPi4/Lib/i2c.pi4, whose header carries
+;  all the register-level reasoning (the $FE804000 BSC1 base, the 32-bit
+;  accesses, the transaction shape, the NACK/CLKT/timeout model, and the
+;  deliberate absence of repeated start).
+;
+;  INCLUDE ORDER, and it is not arbitrary:
+;    * RaspberryPi4/Lib/gpio.pi4  BEFORE Lib/i2c.pi4 - i2c.pi4 muxes the
+;      header pins through gpio.pi4's PinAlt (house rule 10: a library
+;      never includes a library, so board.pi4 lists both).
+;    * RaspberryPi4/Lib/i2c.pi4   BEFORE this file - it defines I2cInit,
+;      I2cProbe, I2cRead, I2cWrite, I2cSetSpeed and the #I2C_* codes these
+;      wrappers translate.
+;    * Anvil/Hal/hal.pbi          BEFORE this file - it defines the
+;      #HW_I2C_* vocabulary and the #HW_I2C bus contract these return.
+;
+;  WHY MAP THE CODES EXPLICITLY when Lib/i2c.pi4's #I2C_* happen to equal
+;  hal.pi4's #HW_I2C_*. Same reason hw_gpio.pi4 maps the pull codes by hand
+;  rather than passing them through: the two enumerations live in different
+;  files for different reasons, and a future divergence in either must fail
+;  to compile here, not silently mislabel a bus error. The translation is
+;  one Select, reviewable line by line.
+;
+;  WHICH BUSES THIS BOARD HAS. The 40-pin header I2C is BSC1 (GPIO 2/3),
+;  and that is the one Lib/i2c.pi4 drives, so this backend offers exactly
+;  bus 1 - matching Linux's i2c1 numbering, so `i2c` addresses on the Pi 4
+;  line up with what i2cdetect -y 1 shows. BSC0 exists (GPIO 0/1) but is
+;  used by the firmware/HAT ID EEPROM and is not brought out for general
+;  use here; the BSC3-6 masters are on non-header pins. A request for any
+;  bus other than 1 gets the honest #HW_I2C_NOBUS refusal, not a guess.
+;
+;  #CAP_I2C IS 1 ON THIS BOARD (board.pi4), so this real backend runs. A
+;  board that declares #CAP_I2C = 0 provides no HwI2c backend and RequireCap
+;  in the `i2c` command refuses before any of these is reached.
+;
+;  THE PIN SEAM, added 2026-09-03 for forum 584. The four HwI2cPin* /
+;  HwI2cPadLevel wrappers at the bottom exist because the core has to be
+;  able to say two things it previously guessed at: WHICH pins the bus is
+;  on and what function they are in (so `i2c speed` and `info` can be
+;  checked against `gpio status 2`), and WHAT THE PADS ARE READING when a
+;  transfer does not complete (so a wedged-bus verdict is a measurement
+;  and not a stock sentence). Both answers are the board's - the core does
+;  not know this part has GPIO 2 and 3, or that its I2C function is called
+;  ALT0 - which is why they are wrappers here and not constants up there.
+;
+;  HARDWARE-VERIFIED 2026-09-03, on a Pi 4 over the console: the pins read
+;  ALT0 after `i2c speed`, and `i2c probe` with nothing on the header scans
+;  0x08..0x77 and reports an empty bus. Before that date this file said NOT
+;  HARDWARE-VERIFIED, and it was right to: the bus had never worked.
+; ======================================================================
+
+; The header I2C bus on this board. Named so the core can ask "what is the
+; default bus here?" without hard-coding 1 - a different board answers with
+; its own number and the command is unchanged.
+#PI4_I2C_HEADER_BUS = 1
+
+; ----------------------------------------------------------------------
+;  I2cMapCode - Lib/i2c.pi4's #I2C_* result into hal.pi4's #HW_I2C_*.
+; ----------------------------------------------------------------------
+Procedure.i I2cMapCode(c.i)
+  Select c
+    Case #I2C_OK
+      ProcedureReturn #HW_I2C_OK
+    Case #I2C_NACK
+      ProcedureReturn #HW_I2C_NACK
+    Case #I2C_CLKT
+      ProcedureReturn #HW_I2C_CLKT
+    Case #I2C_TIMEOUT
+      ProcedureReturn #HW_I2C_TIMEOUT
+    Case #I2C_ARG
+      ProcedureReturn #HW_I2C_ARG
+    Case #I2C_RANGE
+      ProcedureReturn #HW_I2C_RANGE
+  EndSelect
+  ; An unmapped value is a backend bug, not a bus fault - surface it as a
+  ; timeout (the "something is wrong we cannot name" code) rather than
+  ; letting an unknown negative pass as if it were success.
+  ProcedureReturn #HW_I2C_TIMEOUT
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cDefaultBus() - the bus the `i2c` command uses when none is named.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cDefaultBus()
+  ProcedureReturn #PI4_I2C_HEADER_BUS
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cBusValid(bus) - 1 if this board drives that I2C bus, else 0.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cBusValid(bus.i)
+  If bus = #PI4_I2C_HEADER_BUS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cUp(bus) - bring the bus up (mux the pins, set 100 kHz, enable the
+;  controller) IF IT IS NOT ALREADY UP. Returns 1 on success, 0 for a bus
+;  this board does not have. The core calls it once per command line, so
+;  it has to be safe to call repeatedly - and "safe" has to include not
+;  undoing what the operator asked for.
+;
+;  IT CALLS I2cUp, NOT I2cInit, AND THAT IS THE WHOLE POINT. I2cInit
+;  programs the 100 kHz default divider; running it before every command
+;  therefore discarded any rate set since. Measured on silicon
+;  2026-09-03: `i2c speed 400000` put a real 400 kHz on the wire, and the
+;  next `i2c` line silently put it back to 100 kHz. I2cUp leaves a bus
+;  that is already up completely alone - the same choice the Arduino UNO
+;  Q's backend had already made, in as many words, for the same reason.
+;
+;  IT ALSO SELECTS THE BUS, WHICH IS NEW AND IS NOT A TIDY-UP. Lib/i2c.pi4
+;  drives two controllers now - BSC1 on the header and BSC0 on the display
+;  connector - and which one it is pointed at is a global. This board's own
+;  `touch` command points it at the display bus. Without the select below,
+;  an operator who ran `touch` and then `i2c scan` would be scanning BSC0
+;  while every line of the answer said GPIO 2 and 3. That is not a wrong
+;  result, it is a right result attributed to the wrong wires, which is
+;  worse - it survives being written down. So this seam names its bus and
+;  then makes it true, every time, for the cost of four stores.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cUp(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  ProcedureReturn I2cUp()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cProbe(bus, addr) - is a device answering at this 7-bit address?
+;  #HW_I2C_OK present, #HW_I2C_NACK absent, #HW_I2C_CLKT / _TIMEOUT bus
+;  fault, #HW_I2C_NOBUS for a bus this board does not have.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cProbe(bus.i, addr.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(I2cProbe(addr))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cWrite(bus, addr, *buf, n) - write n bytes. One transaction
+;  (START, address+W, bytes, STOP). Returns a #HW_I2C_* code.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cWrite(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(I2cWrite(addr, *buf, n))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cRead(bus, addr, *buf, n) - read n bytes. One transaction
+;  (START, address+R, n bytes, STOP). Returns a #HW_I2C_* code.
+;
+;  A REGISTER READ (write a pointer, then read) is composed by the CALLER
+;  from HwI2cWrite then HwI2cRead, which puts a STOP between the two - this
+;  backend offers no repeated-start combined read, deliberately, for the
+;  reason Lib/i2c.pi4's REPEATED START note gives.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cRead(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(I2cRead(addr, *buf, n))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cSetSpeed(bus, hz) - set the SCL. Returns the achieved rate in Hz
+;  (a positive number, derived from the clock the divider is MEASURABLY
+;  fed by - see Lib/i2c.pi4's THE CLOCK), or a negative #HW_I2C_* code.
+;
+;  A RATE THE DIVIDER CANNOT REACH COMES BACK AS #HW_I2C_RANGE and the
+;  divider is not touched. It used to be clamped in silence, so asking
+;  this bus for 2 kHz set it to its slowest and told you it had done what
+;  you asked. The core names the reachable range from HwI2cRateMin and
+;  HwI2cRateMax, which are computed from the same clock in the same way.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cSetSpeed(bus.i, hz.i)
+  Define r.i
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  r = I2cSetSpeed(hz)
+  If r <= 0
+    ProcedureReturn I2cMapCode(r)
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cGetSpeed(bus) - the SCL the bus is set to, in Hz, or a negative
+;  #HW_I2C_* code. Computed from the source clock as it is NOW, so two
+;  readings can differ without the divider having been touched.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cGetSpeed(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cGetSpeed()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE CLOCK SEAM. Which clock feeds the divider, how this board knows,
+;  and what the divider can reach from it.
+;
+;  WHICH CLOCK, AND HOW IT WAS ESTABLISHED. Not from the datasheet's
+;  "nominally 150 MHz" - that constant is what forum 622 was filed about,
+;  and it is wrong on this part by more than a factor of three. The BSC
+;  divider is fed by the VideoCore/core clock, and that was settled by
+;  MEASURING SCL on GPIO 3 at six known dividers and multiplying back up;
+;  the instrument is RaspberryPi4/Examples/Diagnostics/pi4I2cScl.pi4.
+;
+;  ASKED FOR EVERY TIME. The firmware's governor moves the core clock for
+;  thermal and load reasons and tells nobody, so a value cached at boot
+;  would be wrong exactly when the board is working hardest. Lib/i2c.pi4's
+;  I2cSourceHz() does one mailbox round trip per call, which costs a
+;  fraction of a millisecond in a command that is about to drive a bus.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cSourceHz(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn I2cSourceHz()
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cSourceWhere(bus) - the address of a short fragment naming where
+;  the number above came from, for the core to print inside a sentence.
+;
+;  IT MUST BE ASKED AFTER HwI2cSourceHz, not before: the library records
+;  which of its three answers it took as it takes it. Calling this first
+;  would report the PREVIOUS call's provenance, which is the exact shape
+;  of quiet wrongness this whole topic is about, so the core's one caller
+;  takes the rate first and this second, on the next line.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cSourceWhere(bus.i)
+  Define f.i
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  f = I2cSourceFrom()
+  If f = #I2C_SRC_MEASURED
+    ProcedureReturn "the VideoCore core clock, measured by the firmware just now"
+  EndIf
+  If f = #I2C_SRC_CONFIGURED
+    ProcedureReturn "the VideoCore core clock the firmware has CONFIGURED, not measured"
+  EndIf
+  ProcedureReturn "the datasheet's nominal figure - the firmware would not answer"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cRateMin(bus) / HwI2cRateMax(bus) - the slowest and fastest SCL
+;  this bus can produce right now, in Hz. Both move with the source.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cRateMin(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn I2cRateMin(I2cSourceHz())
+EndProcedure
+
+Procedure.i HwI2cRateMax(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn I2cRateMax(I2cSourceHz())
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE PIN SEAM. Which pins, what function, and what the pads read.
+;
+;  #HW_I2C_SDA and #HW_I2C_SCL are the CORE's names for the two lines
+;  (hal.pi4); #I2C_PIN_SDA and #I2C_PIN_SCL are the pin numbers this part
+;  puts them on (Lib/i2c.pi4). Translating between them is this file's
+;  entire job, exactly as I2cMapCode translates the result codes, and for
+;  the same reason: a future divergence has to fail here rather than
+;  silently report the clock line's level as the data line's.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  HwI2cPin(bus, which) - the GPIO number carrying that line, or -1.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cPin(bus.i, which.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn -1
+  EndIf
+  If which = #HW_I2C_SDA
+    ProcedureReturn #I2C_PIN_SDA
+  EndIf
+  If which = #HW_I2C_SCL
+    ProcedureReturn #I2C_PIN_SCL
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cPinFunc(bus) - the address of the name of the pin function the
+;  controller needs, for the core to print. Lowercase and short, so it
+;  reads inside a sentence, and spelled the way the `gpio` command spells
+;  it - an operator who is told the pins should be on "alt0" has to be
+;  able to type `gpio status 2` and see the same word back.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cPinFunc(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn "alt0"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cPinReady(bus, which) - is that pin on the I2C function right now?
+;  1 yes, 0 no, -1 if it cannot be told.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cPinReady(bus.i, which.i)
+  Define pin.i
+  pin = HwI2cPin(bus, which)
+  If pin < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn I2cPinMuxed(pin)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwI2cPadLevel(bus, which) - 1 the pad reads high, 0 it reads low, -1
+;  it cannot be read. THE MEASUREMENT THE WEDGED VERDICT RESTS ON.
+; ----------------------------------------------------------------------
+Procedure.i HwI2cPadLevel(bus.i, which.i)
+  Define pin.i
+  pin = HwI2cPin(bus, which)
+  If pin < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn I2cPadLevel(pin)
+EndProcedure

@@ -1,0 +1,74 @@
+# unoq_icc_addrs.txt - the 11ae diff list.
+#
+# One 32-bit physical address per line, "0xADDRESS  NAME  # citation".
+# The SAME list is read from Debian (tools/unoq_icc_capture.sh) and from
+# the bare-metal probe, so that the two captures diff line for line.
+#
+# EVERY address here has been read on this silicon already, from one world
+# or both.  Nothing is added to this file on the strength of a register
+# map alone: on 2026-09-06 three separate SoC resets were caused by
+# reading addresses that a register map said existed, including one inside
+# a window whose first word read back fine.  A sweep is not allowed and a
+# guess is not allowed.
+#
+# NEVER ADD: 0x04480000 (bimc), 0x01880000 (system_noc), 0x01900000
+# (config_noc), or anything inside 0x04690000+0x1000 past offset 0.  The
+# first two reset the board on a single read; the third reset it during a
+# sweep.  See the header of tools/unoq_icc_capture.sh.
+
+# ---- GCC: the clock branches the GPU node names in qcm2290.dtsi:1725 ----
+0x01436004  GCC_GPU_CFG_AHB_CBCR      # gcc-qcm2290.c:2853
+0x0143600C  GCC_GPU_MEMNOC_GFX_CBCR   # gcc-qcm2290.c:1952  "alt_mem_iface"
+0x01436018  GCC_GPU_SNOC_DVM_CBCR     # gcc-qcm2290.c:1967
+0x01471154  GCC_BIMC_GPU_AXI_CBCR     # gcc-qcm2290.c:1340  "mem_iface"
+0x01479004  GCC_APCS_VOTE_79004       # GPLL0 taps, bits 15 and 16
+0x01400000  GCC_GPLL0_MODE            # gcc-qcm2290.c:57
+0x01400004  GCC_GPLL0_L_VAL
+0x01400018  GCC_GPLL0_USER_CTL
+
+# ---- GPUCC ----
+0x05990000  GPUCC_PLL0_MODE           # gpucc-qcm2290.c:58
+0x05990004  GPUCC_PLL0_L_VAL
+0x0599000C  GPUCC_PLL0_USER_CTL
+0x05990038  GPUCC_PLL0_STATUS
+0x0599100C  GPUCC_GX_GDSCR            # gpucc-qcm2290.c:308
+0x05991010  GPUCC_GX_CFG_GDSCR
+0x0599101C  GPUCC_GFX3D_CMD_RCGR      # gpucc-qcm2290.c:148
+0x05991020  GPUCC_GFX3D_CFG_RCGR
+0x05991054  GPUCC_GX_GFX3D_CBCR       # "core"
+0x05991060  GPUCC_GX_CXO_CBCR
+0x0599106C  GPUCC_CX_GDSCR            # gpucc-qcm2290.c:295
+0x05991078  GPUCC_AHB_CBCR            # "iface"
+0x05991098  GPUCC_CX_GMU_CBCR         # "gmu"
+0x0599109C  GPUCC_CXO_CBCR            # "xo"
+0x05991508  GPUCC_GX_CLAMP_IO         # gpucc-qcm2290.c:309
+0x05991540  GPUCC_CX_GDS_HW_CTRL      # gpucc-qcm2290.c:296, CX status
+
+# ---- rpm-stats: offset 0 only.  A sweep of this window reset the board;
+#      offset 0 alone returns 0x000000DC and is left in as the one word
+#      that is known good.
+0x04690000  RPM_STATS_WORD0           # qcm2290.dtsi:1149 qcom,rpm-stats
+
+# ---- The graphics window.  GATED: these are read only when the GPU
+#      domain is powered.  On the Debian side the caller must have put
+#      5900000.gpu into power/control=on and seen runtime_status=active;
+#      on the bare-metal side the probe's own clock ladder gates them.
+@gated
+0x05900840  GPU_RBBM_STATUS           # a6xx.xml:553
+0x05900844  GPU_RBBM_STATUS1
+0x05900848  GPU_RBBM_STATUS2
+0x0590084C  GPU_RBBM_STATUS3
+0x05900804  GPU_RBBM_INT_0_STATUS
+0x059002B8  GPU_RBBM_CLOCK_CNTL       # a6xx.xml:815
+0x05902020  GPU_CP_SQE_CNTL
+0x05902018  GPU_CP_RB_RPTR
+0x0590201C  GPU_CP_RB_WPTR
+
+# ---- Added after the first pass, when the Anvil-side transcript turned out
+#      to have a reading for these and the Debian side did not.  Still
+#      gated on the domain being powered.
+0x0593D000  GPU_RBBM_SECVID_TRUST_CNTL # a6xx.xml:774, dword 0x0f400
+0x0593E00C  GPU_SECVID_TSB_CNTL
+0x059020C0  GPU_CP_SQE_INSTR_BASE_LO   # 64-bit pair
+0x059020C4  GPU_CP_SQE_INSTR_BASE_HI
+0x05995000  GPUCC_HLOS1_VOTE_SMMU      # gpucc-qcm2290.c:288, offset 0x5000

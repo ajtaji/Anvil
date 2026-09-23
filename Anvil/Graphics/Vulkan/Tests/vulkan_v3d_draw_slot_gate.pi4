@@ -1,0 +1,255 @@
+; ======================================================================
+;  V3D immutable-pipeline / private-draw-slot desk gate
+; ======================================================================
+; SPDX-License-Identifier: MIT
+;
+; No MMIO and no board. This supplies the emitter a deliberately synthetic
+; but complete pipeline plan, then proves the memory ABI that the multi-draw
+; backend will consume: 4096 separately-addressed 640-byte slots, cloned FS
+; templates, private push/texture/sampler patches, the maximum shader-record
+; boundary and exact live cache-maintenance ranges.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_none.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv.pbi"
+
+; Production owns this bounded table in vk_pipeline.pbi. The isolated gate
+; deliberately does not link that state machine, so it repeats the public
+; bound before including the emitter that dimensions its private metadata.
+#ANVIL_VK_MAX_PIPELINES = 4
+#ANVIL_SPV_COLOUR_IR = 5
+
+; Minimal pipeline-plan owner. This gate tests the V3D emitter in isolation;
+; the public Vulkan/pipeline gates own handle parsing and create-info state.
+Global Dim vdsgAttrComp.i[4]
+Global Dim vdsgAttrOff.i[4]
+Global Dim vdsgUses.a[4]
+
+Procedure.i AnvilVkPipelineAttrCount(pipe.i) : ProcedureReturn 4 : EndProcedure
+Procedure.i AnvilVkPipelineAttrComponents(pipe.i, k.i) : ProcedureReturn vdsgAttrComp[k] : EndProcedure
+Procedure.i AnvilVkPipelineAttrOffset(pipe.i, k.i) : ProcedureReturn vdsgAttrOff[k] : EndProcedure
+Procedure.i AnvilVkPipelineAttrBinding(pipe.i, k.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelinePositionAttr(pipe.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineVaryingCount(pipe.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineVaryingComponents(pipe.i, k.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineVaryingSource(pipe.i, k.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i AnvilVkPipelineColourSource(pipe.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineUsesPushConstants(pipe.i) : ProcedureReturn vdsgUses[0] : EndProcedure
+Procedure.i AnvilVkPipelineUsesUniformBuffer(pipe.i) : ProcedureReturn vdsgUses[1] : EndProcedure
+Procedure.i AnvilVkPipelineUsesSampledImage(pipe.i) : ProcedureReturn vdsgUses[2] : EndProcedure
+Procedure.i AnvilVkPipelineUsesVarying(pipe.i) : ProcedureReturn vdsgUses[3] : EndProcedure
+Procedure.i AnvilVkPipelineViewportWidth(pipe.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkPipelineViewportHeight(pipe.i) : ProcedureReturn 64 : EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+
+#VDSG_PIPE = $07000000
+#VDSG_ARENA = $07100000
+#VDSG_OUT = $07400000
+#VDSG_MAGIC = $56445347              ; "VDSG"
+
+Global Dim vdsgPush1.l[4]
+Global Dim vdsgPush2.l[4]
+Global Dim vdsgBinding.AnvilVkBackendBinding[1]
+Global vdsgSample1.AnvilVkBackendSampledImage
+Global vdsgSample2.AnvilVkBackendSampledImage
+Global vdsgDraw.AnvilVkBackendDraw
+
+Procedure.i vdsgHash(base.i, bytes.i)
+  Define h.i = $811C9DC5
+  Define i.i
+  While i < bytes
+    h = (h ! PeekA(base + i)) & $FFFFFFFF
+    h = (h * $01000193) & $FFFFFFFF
+    i = i + 1
+  Wend
+  ProcedureReturn h
+EndProcedure
+
+Procedure vdsgPut(slot.i, value.i)
+  PokeI(#VDSG_OUT + (slot * 8), value)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define d0.i
+  Define d1.i
+  Define templateHash.i
+  Define firstHash.i
+  Define firstHashAfter.i
+  Define refusedHash.i
+  Define d2.i
+  Define rc.i
+  Define closeRc.i
+
+  vdsgAttrComp[0] = 4 : vdsgAttrComp[1] = 4
+  vdsgAttrComp[2] = 4 : vdsgAttrComp[3] = 4
+  vdsgAttrOff[0] = 0 : vdsgAttrOff[1] = 16
+  vdsgAttrOff[2] = 32 : vdsgAttrOff[3] = 48
+  vdsgUses[0] = 1 : vdsgUses[1] = 0 : vdsgUses[2] = 1 : vdsgUses[3] = 0
+
+  ; One synthetic immutable pipeline with exact, distinct patch metadata.
+  avkqBase[1] = #VDSG_PIPE
+  avkqRecords[1] = 16
+  avkqVaryComps[1] = 0
+  avkqCsUniformWords[1] = 10
+  avkqVsUniformWords[1] = 8
+  avkqDrawUsesDynamicViewport[1] = 1
+  avkqFsUniformWords[1] = 7
+  avkqFsPushFirst[1] = 0
+  avkqFsPushR[1] = 0 : avkqFsPushG[1] = 1
+  avkqFsPushB[1] = 2 : avkqFsPushA[1] = 3
+  avkqFsUniformAddress[1] = -1 : avkqFsUniformConfig[1] = -1
+  avkqFsTextureState[1] = 4 : avkqFsSamplerState[1] = 5
+  avkqFsTlbConfig[1] = 6
+  i = 0
+  While i < #AVKQ_DRAW_UNIF_FS_BYTES
+    PokeA(#VDSG_PIPE + #AVKQ_OFF_UNIF_FS + i, (i * 29 + 7) & $FF)
+    i = i + 1
+  Wend
+  i = 0
+  While i < #AVKQ_DRAW_UNIF_CS_BYTES
+    PokeA(#VDSG_PIPE + #AVKQ_OFF_UNIF_CS + i, (i * 31 + 11) & $FF)
+    i = i + 1
+  Wend
+  i = 0
+  While i < #AVKQ_DRAW_UNIF_VS_BYTES
+    PokeA(#VDSG_PIPE + #AVKQ_OFF_UNIF_VS + i, (i * 37 + 13) & $FF)
+    i = i + 1
+  Wend
+  templateHash = vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_FS, #AVKQ_DRAW_UNIF_FS_BYTES)
+  closeRc = avkqCloseDrawTemplate(1)
+
+  vdsgPush1[0] = $3F800000 : vdsgPush1[1] = $3F000000
+  vdsgPush1[2] = $3E800000 : vdsgPush1[3] = $3F400000
+  vdsgPush2[0] = $3DCCCCCD : vdsgPush2[1] = $3E4CCCCD
+  vdsgPush2[2] = $3E99999A : vdsgPush2[3] = $3F800000
+  vdsgSample1\base = $02000000 : vdsgSample1\width = 1 : vdsgSample1\height = 1
+  vdsgSample1\tiling = #VK_IMAGE_TILING_LINEAR
+  vdsgSample1\magFilter = #VK_FILTER_NEAREST : vdsgSample1\minFilter = #VK_FILTER_LINEAR
+  ; Exercise both halves of the 14-bit width: 513 encodes low bits=1 and
+  ; high bits=8. A width of 64 or less would not catch a missing word2 field.
+  vdsgSample2\base = $02100000 : vdsgSample2\width = 513 : vdsgSample2\height = 1024
+  vdsgSample2\tiling = #VK_IMAGE_TILING_OPTIMAL
+  vdsgSample2\magFilter = #VK_FILTER_LINEAR : vdsgSample2\minFilter = #VK_FILTER_NEAREST
+
+  d0 = AnvilVkV3dDrawSlotBase(#VDSG_ARENA, AnvilVkV3dDrawArenaBytes(4096), 0)
+  d1 = AnvilVkV3dDrawSlotBase(#VDSG_ARENA, AnvilVkV3dDrawArenaBytes(4096), 1)
+  i = 0
+  While i < (#AVKQ_DRAW_SLOT_BYTES * 2)
+    PokeA(d0 + i, $A5)
+    i = i + 1
+  Wend
+  vdsgBinding[0]\base = $02200000 : vdsgBinding[0]\stride = 64
+  vdsgDraw\bindingCount = 1 : vdsgDraw\bindings = @vdsgBinding[0]
+  vdsgDraw\viewportX = 0 : vdsgDraw\viewportY = 0
+  vdsgPut(0, #VDSG_MAGIC)
+  vdsgPut(1, AnvilVkV3dDrawSlotBytes())
+  vdsgPut(2, AnvilVkV3dDrawRecordBytes())
+  vdsgPut(3, AnvilVkV3dDrawUniformOffset())
+  vdsgPut(4, AnvilVkV3dDrawTextureOffset())
+  vdsgPut(5, AnvilVkV3dDrawSamplerOffset())
+  vdsgPut(6, AnvilVkV3dDrawArenaBytes(4096))
+  vdsgPut(7, AnvilVkV3dDrawArenaBytes(0))
+  vdsgPut(8, AnvilVkV3dDrawArenaBytes(4097))
+  vdsgPut(9, d0) : vdsgPut(10, d1)
+  vdsgPut(11, AnvilVkV3dDrawSlotBase(#VDSG_ARENA, AnvilVkV3dDrawArenaBytes(4096), 4095))
+  vdsgPut(12, AnvilVkV3dDrawSlotBase(#VDSG_ARENA, AnvilVkV3dDrawArenaBytes(4096), 4096))
+  vdsgPut(13, AnvilVkV3dDrawSlotBase($FFC80000, AnvilVkV3dDrawArenaBytes(4096), 4095))
+  vdsgPut(14, AnvilVkV3dDrawSlotBase($FFC80040, AnvilVkV3dDrawArenaBytes(4096), 4095))
+  vdsgPut(15, avkqDrawSlotAddressValid(d0))
+  vdsgPut(16, avkqDrawSlotAddressValid(d0 + 1))
+  vdsgPut(17, avkqDrawSlotAddressValid($FFFFFFC0))
+
+  ; Close-time metadata is authoritative. Change the portable flag stubs after
+  ; closing; the fast path must neither re-query them nor revalidate resources.
+  vdsgUses[0] = 0 : vdsgUses[2] = 0
+  vdsgDraw\pushBase = @vdsgPush1[0] : vdsgDraw\sampledImage = @vdsgSample1
+  vdsgDraw\viewportW = 9 : vdsgDraw\viewportH = 11
+  rc = AnvilVkV3dPrepareClosedDrawSlot(1, #VDSG_PIPE, d0, @vdsgDraw)
+  vdsgPut(18, rc)
+  firstHash = vdsgHash(d0, #AVKQ_DRAW_SLOT_BYTES)
+  vdsgDraw\pushBase = @vdsgPush2[0] : vdsgDraw\sampledImage = @vdsgSample2
+  vdsgDraw\viewportW = 64 : vdsgDraw\viewportH = 32
+  rc = AnvilVkV3dPrepareClosedDrawSlot(1, #VDSG_PIPE, d1, @vdsgDraw)
+  vdsgPut(19, rc)
+  firstHashAfter = vdsgHash(d0, #AVKQ_DRAW_SLOT_BYTES)
+  vdsgPut(20, templateHash)
+  vdsgPut(21, vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_FS, #AVKQ_DRAW_UNIF_FS_BYTES))
+  vdsgPut(22, firstHash)
+  vdsgPut(23, firstHashAfter)
+  vdsgPut(24, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 0) & $FFFFFFFF)
+  vdsgPut(25, PeekL(d1 + #AVKQ_DRAW_OFF_UNIF_FS + 0) & $FFFFFFFF)
+  vdsgPut(26, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 16) & $FFFFFFFF)
+  vdsgPut(27, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 20) & $FFFFFFFF)
+  vdsgPut(28, PeekL(d1 + #AVKQ_DRAW_OFF_UNIF_FS + 16) & $FFFFFFFF)
+  vdsgPut(29, PeekL(d1 + #AVKQ_DRAW_OFF_UNIF_FS + 20) & $FFFFFFFF)
+
+  rc = AnvilVkV3dBuildDrawSlotRecord(1, #VDSG_PIPE, d0, @vdsgDraw, 15, 0)
+  vdsgPut(30, rc)
+  vdsgPut(31, V3dShaderRecordBytes())
+  vdsgPut(32, PeekL(d0 + 16) & $FFFFFFFF) ; private FS-uniform address
+  vdsgPut(33, PeekL(d0 + 24) & $FFFFFFFF) ; immutable VS-uniform address
+  vdsgPut(34, PeekL(d0 + 32) & $FFFFFFFF) ; immutable CS-uniform address
+  vdsgPut(35, vdsgHash(d0 + 292, 28))     ; record padding remains poison
+  vdsgPut(36, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 0) & $FFFFFFFF)
+  vdsgPut(37, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 16) & $FFFFFFFF)
+  vdsgPut(38, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_FS + 20) & $FFFFFFFF)
+  vdsgPut(39, vdsgHash(d1, #AVKQ_DRAW_SLOT_BYTES))
+  vdsgPut(40, vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_FS, #AVKQ_DRAW_UNIF_FS_BYTES))
+  ; Immutable and mutable allocations may never alias. A missing required
+  ; sampled image is also refused transactionally before clearing the slot.
+  vdsgUses[0] = 1 : vdsgUses[2] = 1
+  vdsgPut(41, AnvilVkV3dPrepareDrawSlot(1, #VDSG_PIPE, #VDSG_PIPE + 4096, @vdsgPush1[0], 0, @vdsgSample1))
+  vdsgPut(42, AnvilVkV3dBuildDrawSlotRecord(1, #VDSG_PIPE, #VDSG_PIPE + 4096, @vdsgDraw, 15, 0))
+  d2 = AnvilVkV3dDrawSlotBase(#VDSG_ARENA, AnvilVkV3dDrawArenaBytes(4096), 2)
+  i = 0
+  While i < #AVKQ_DRAW_SLOT_BYTES
+    PokeA(d2 + i, $A5)
+    i = i + 1
+  Wend
+  refusedHash = vdsgHash(d2, #AVKQ_DRAW_SLOT_BYTES)
+  vdsgPut(43, AnvilVkV3dPrepareDrawSlot(1, #VDSG_PIPE, d2, @vdsgPush1[0], 0, 0))
+  vdsgPut(44, refusedHash)
+  vdsgPut(45, vdsgHash(d2, #AVKQ_DRAW_SLOT_BYTES))
+  vdsgPut(46, vdsgHash(d0 + #AVKQ_DRAW_OFF_UNIF_FS, AnvilVkV3dDrawLiveUniformBytes(1)))
+  vdsgPut(47, vdsgHash(d1 + #AVKQ_DRAW_OFF_UNIF_FS, AnvilVkV3dDrawLiveUniformBytes(1)))
+  vdsgPut(48, PeekA(d0 + #AVKQ_DRAW_OFF_UNIF_FS + AnvilVkV3dDrawLiveUniformBytes(1)))
+  vdsgPut(49, PeekA(d1 + #AVKQ_DRAW_OFF_UNIF_FS + #AVKQ_DRAW_UNIF_FS_BYTES - 1))
+  vdsgPut(50, closeRc)
+  vdsgPut(51, AnvilVkV3dDrawLiveRecordBytes(1))
+  vdsgPut(52, AnvilVkV3dDrawLiveUniformBytes(1))
+  vdsgPut(53, AnvilVkV3dDrawCacheRangeCount(1))
+  vdsgPut(54, AnvilVkV3dDrawCacheRangeOffset(1, 0))
+  vdsgPut(55, AnvilVkV3dDrawCacheRangeBytes(1, 0))
+  vdsgPut(56, AnvilVkV3dDrawCacheRangeOffset(1, 1))
+  vdsgPut(57, AnvilVkV3dDrawCacheRangeBytes(1, 1))
+  vdsgPut(58, AnvilVkV3dDrawCacheRangeOffset(1, 2))
+  vdsgPut(59, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_CS + (avkqCsUniformWords[1] * 4) - 8) & $FFFFFFFF)
+  vdsgPut(60, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_CS + (avkqCsUniformWords[1] * 4) - 4) & $FFFFFFFF)
+  vdsgPut(61, PeekL(d0 + #AVKQ_DRAW_OFF_UNIF_VS + (avkqVsUniformWords[1] * 4) - 8) & $FFFFFFFF)
+  vdsgPut(62, PeekL(d1 + #AVKQ_DRAW_OFF_UNIF_CS + (avkqCsUniformWords[1] * 4) - 8) & $FFFFFFFF)
+  vdsgPut(63, PeekL(d1 + #AVKQ_DRAW_OFF_UNIF_CS + (avkqCsUniformWords[1] * 4) - 4) & $FFFFFFFF)
+  vdsgPut(64, PeekL(d0 + 24) & $FFFFFFFF)
+  vdsgPut(65, PeekL(d0 + 32) & $FFFFFFFF)
+  i = 0 : While i < #AVKQ_DRAW_SLOT_BYTES : PokeA(d2 + i, $A5) : i = i + 1 : Wend
+  refusedHash = vdsgHash(d2, #AVKQ_DRAW_SLOT_BYTES)
+  vdsgDraw\viewportW = 32768 : vdsgDraw\viewportH = 64
+  vdsgDraw\pushBase = @vdsgPush1[0] : vdsgDraw\sampledImage = @vdsgSample1
+  vdsgPut(66, AnvilVkV3dPrepareClosedDrawSlot(1, #VDSG_PIPE, d2, @vdsgDraw))
+  vdsgPut(67, refusedHash)
+  vdsgPut(68, vdsgHash(d2, #AVKQ_DRAW_SLOT_BYTES))
+  vdsgPut(69, vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_CS, #AVKQ_DRAW_UNIF_CS_BYTES))
+  vdsgPut(70, vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_VS, #AVKQ_DRAW_UNIF_VS_BYTES))
+  vdsgPut(71, PeekL(d1 + #AVKQ_DRAW_OFF_TEX_STATE + 4) & $FFFFFFFF)
+  vdsgPut(72, PeekL(d1 + #AVKQ_DRAW_OFF_TEX_STATE + 8) & $FFFFFFFF)
+  ProcedureReturn #VDSG_OUT
+EndProcedure

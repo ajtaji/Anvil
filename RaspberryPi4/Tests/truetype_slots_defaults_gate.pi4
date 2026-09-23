@@ -1,0 +1,33 @@
+; Fast emitted gate for renderer-neutral font setting initialization.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+XIncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+XIncludeFile "Anvil/Graphics/truetype_kern.pbi"
+XIncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+XIncludeFile "Anvil/Graphics/truetype_slots.pbi"
+
+Global tsdChecks.i, tsdFailures.i
+
+Procedure tsdCheck(ok.i)
+  tsdChecks + 1
+  If ok = 0 : tsdFailures + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  tsdCheck(AnvilTrueTypePixelHeight() = 16)
+  tsdCheck(AnvilTrueTypeDefaultSlot() = -1)
+  tsdCheck(AnvilTrueTypeSetPixelHeight(24) = 1)
+  tsdCheck(AnvilTrueTypeSetDefaultSlot(2) = 1)
+  tsdCheck(AnvilTrueTypePixelHeight() = 24)
+  tsdCheck(AnvilTrueTypeDefaultSlot() = 2)
+  AnvilTrueTypeSlotsInit()
+  tsdCheck(AnvilTrueTypePixelHeight() = 24)
+  tsdCheck(AnvilTrueTypeDefaultSlot() = 2)
+  tsdCheck(AnvilTrueTypeSetPixelHeight(513) = 0)
+  tsdCheck(AnvilTrueTypePixelHeight() = 24)
+  tsdCheck(AnvilTrueTypeSetDefaultSlot(4) = 0)
+  tsdCheck(AnvilTrueTypeDefaultSlot() = 2)
+  If tsdFailures <> 0 : ProcedureReturn tsdFailures : EndIf
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,137 @@
+; T2 emitted gate: format 4/12 maps and strict UTF-8 decoding.
+XIncludeFile "Anvil/Graphics/truetype.pbi"
+XIncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+XIncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+
+#T2_HEAD=$68656164
+#T2_MAXP=$6D617870
+#T2_HHEA=$68686561
+#T2_HMTX=$686D7478
+#T2_CMAP=$636D6170
+#T2_REAL_META=$0F000000
+#T2_REAL_BASE=$10000000
+#T2_REAL_MAGIC=$54543252
+Global Dim t2Font.a[512]
+Global Dim t2Tag.i[5]
+Global Dim t2Len.i[5]
+Global Dim t2Off.i[5]
+Global Dim t2Out.i[3]
+Global Dim t2Text.a[8]
+
+Procedure.i tt2RealFont()
+  Protected bytes.i, count.i, n.i
+  If PeekL(#T2_REAL_META)<>#T2_REAL_MAGIC : ProcedureReturn 0 : EndIf
+  bytes=PeekL(#T2_REAL_META+4) : count=PeekL(#T2_REAL_META+8)
+  If count<1 Or count>8 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeOpen(#T2_REAL_BASE,bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeCmapOpen()=0 : ProcedureReturn 2 : EndIf
+  For n=0 To count-1
+    If AnvilTrueTypeGlyphForCodepoint(PeekL(#T2_REAL_META+12+n*8))<>PeekL(#T2_REAL_META+16+n*8) : ProcedureReturn 3+n : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure t2BE16(at.i,v.i)
+  PokeA(@t2Font[at],(v>>8)&$FF) : PokeA(@t2Font[at+1],v&$FF)
+EndProcedure
+Procedure t2BE32(at.i,v.i)
+  PokeA(@t2Font[at],(v>>24)&$FF) : PokeA(@t2Font[at+1],(v>>16)&$FF)
+  PokeA(@t2Font[at+2],(v>>8)&$FF) : PokeA(@t2Font[at+3],v&$FF)
+EndProcedure
+Procedure.i t2Checksum(offset.i,length.i,head.i)
+  Protected sum.i=0, word.i, pos.i, n.i, j.i
+  For n=0 To (length+3)/4-1
+    word=0
+    For j=0 To 3
+      pos=n*4+j : word=word<<8
+      If pos<length And (head=0 Or pos<8 Or pos>=12) : word=word|(PeekA(@t2Font[offset+pos])&$FF) : EndIf
+    Next
+    sum=(sum+word)&$FFFFFFFF
+  Next
+  ProcedureReturn sum
+EndProcedure
+Procedure.i t2Build()
+  Protected cursor.i, n.i, rec.i, check.i
+  For n=0 To 511 : PokeA(@t2Font[n],0) : Next
+  t2Tag[0]=#T2_HEAD : t2Len[0]=54
+  t2Tag[1]=#T2_MAXP : t2Len[1]=32
+  t2Tag[2]=#T2_HHEA : t2Len[2]=36
+  t2Tag[3]=#T2_HMTX : t2Len[3]=16
+  t2Tag[4]=#T2_CMAP : t2Len[4]=92
+  t2BE32(0,$00010000) : t2BE16(4,5) : t2BE16(6,80) : t2BE16(8,2)
+  cursor=92
+  For n=0 To 4 : t2Off[n]=cursor : cursor+t2Len[n] : Next
+  t2BE32(t2Off[0],$00010000) : t2BE32(t2Off[0]+12,$5F0F3CF5)
+  t2BE16(t2Off[0]+18,1000) : t2BE16(t2Off[0]+50,0)
+  t2BE32(t2Off[1],$00010000) : t2BE16(t2Off[1]+4,4)
+  t2BE32(t2Off[2],$00010000) : t2BE16(t2Off[2]+34,4)
+  For n=0 To 3 : t2BE16(t2Off[3]+n*4,500+n*10) : t2BE16(t2Off[3]+n*4+2,0) : Next
+  ; cmap header: format 4 at offset 20, format 12 at offset 52
+  t2BE16(t2Off[4],0) : t2BE16(t2Off[4]+2,2)
+  t2BE16(t2Off[4]+4,3) : t2BE16(t2Off[4]+6,1) : t2BE32(t2Off[4]+8,20)
+  t2BE16(t2Off[4]+12,3) : t2BE16(t2Off[4]+14,10) : t2BE32(t2Off[4]+16,52)
+  ; Format 4 maps U+0041 to glyph 2, followed by the required sentinel.
+  t2BE16(t2Off[4]+20,4) : t2BE16(t2Off[4]+22,32) : t2BE16(t2Off[4]+26,4)
+  t2BE16(t2Off[4]+28,4) : t2BE16(t2Off[4]+30,1)
+  t2BE16(t2Off[4]+34,$41) : t2BE16(t2Off[4]+36,$FFFF) : t2BE16(t2Off[4]+38,0)
+  t2BE16(t2Off[4]+40,$41) : t2BE16(t2Off[4]+42,$FFFF)
+  t2BE16(t2Off[4]+44,-63) : t2BE16(t2Off[4]+46,1)
+  t2BE16(t2Off[4]+48,0) : t2BE16(t2Off[4]+50,0)
+  ; Format 12 maps U+0041 and U+1F600.
+  t2BE16(t2Off[4]+52,12) : t2BE32(t2Off[4]+56,40) : t2BE32(t2Off[4]+64,2)
+  t2BE32(t2Off[4]+68,$41) : t2BE32(t2Off[4]+72,$41) : t2BE32(t2Off[4]+76,2)
+  t2BE32(t2Off[4]+80,$1F600) : t2BE32(t2Off[4]+84,$1F600) : t2BE32(t2Off[4]+88,3)
+  For n=0 To 4
+    rec=12+n*16 : check=t2Checksum(t2Off[n],t2Len[n],Bool(t2Tag[n]=#T2_HEAD))
+    t2BE32(rec,t2Tag[n]) : t2BE32(rec+4,check) : t2BE32(rec+8,t2Off[n]) : t2BE32(rec+12,t2Len[n])
+  Next
+  ProcedureReturn cursor
+EndProcedure
+
+Procedure.i Main()
+  Protected bytes.i, glyph.i, decoded.i
+  bytes=t2Build()
+  If AnvilTrueTypeOpen(@t2Font[0],bytes)=0 : ProcedureReturn 1 : EndIf
+  If AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeCmapOpen()=0 : ProcedureReturn 2 : EndIf
+  glyph=AnvilTrueTypeGlyphForCodepoint($41)
+  If glyph<>2 : ProcedureReturn 30+glyph : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($1F600)<>3 : ProcedureReturn 4 : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($42)<>0 : ProcedureReturn 5 : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($D800)<>0 Or AnvilTrueTypeCmapError()<>#ANVIL_TTC_E_CODEPOINT : ProcedureReturn 6 : EndIf
+  ; A + U+1F600, valid empty, capacity atomicity, overlong and surrogate UTF-8.
+  PokeA(@t2Text[0],$41) : PokeA(@t2Text[1],$F0) : PokeA(@t2Text[2],$9F) : PokeA(@t2Text[3],$98) : PokeA(@t2Text[4],$80)
+  decoded=AnvilTrueTypeDecodeUtf8(@t2Text[0],5,@t2Out[0],3)
+  If decoded<>2 Or t2Out[0]<>2 Or t2Out[1]<>3 : ProcedureReturn 7 : EndIf
+  If AnvilTrueTypeDecodeUtf8(@t2Text[0],0,0,0)<>0 : ProcedureReturn 8 : EndIf
+  t2Out[0]=777 : If AnvilTrueTypeDecodeUtf8(@t2Text[0],5,@t2Out[0],1)<>-1 Or t2Out[0]<>777 : ProcedureReturn 9 : EndIf
+  PokeA(@t2Text[0],$C0) : PokeA(@t2Text[1],$AF)
+  If AnvilTrueTypeDecodeUtf8(@t2Text[0],2,@t2Out[0],3)<>-1 : ProcedureReturn 10 : EndIf
+  PokeA(@t2Text[0],$ED) : PokeA(@t2Text[1],$A0) : PokeA(@t2Text[2],$80)
+  If AnvilTrueTypeDecodeUtf8(@t2Text[0],3,@t2Out[0],3)<>-1 : ProcedureReturn 11 : EndIf
+  AnvilTrueTypeCmapClose() : AnvilTrueTypeMetricsClose() : AnvilTrueTypeClose()
+  ; Reopen with only the format 4 encoding record to exercise that path alone.
+  t2BE16(t2Off[4]+2,1)
+  t2BE32(12+4*16+4,t2Checksum(t2Off[4],t2Len[4],0))
+  If AnvilTrueTypeOpen(@t2Font[0],bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 Or AnvilTrueTypeCmapOpen()=0 : ProcedureReturn 12 : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($41)<>2 : ProcedureReturn 13 : EndIf
+  If AnvilTrueTypeGlyphForCodepoint($1F600)<>0 : ProcedureReturn 14 : EndIf
+  AnvilTrueTypeCmapClose() : AnvilTrueTypeMetricsClose() : AnvilTrueTypeClose()
+  ; Reserved-pad corruption is rejected with the format-4 subtable present.
+  bytes=t2Build() : t2BE16(t2Off[4]+38,1)
+  t2BE32(12+4*16+4,t2Checksum(t2Off[4],t2Len[4],0))
+  If AnvilTrueTypeOpen(@t2Font[0],bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 : ProcedureReturn 15 : EndIf
+  If AnvilTrueTypeCmapOpen()<>0 Or AnvilTrueTypeCmapError()<>#ANVIL_TTC_E_FORMAT : ProcedureReturn 16 : EndIf
+  AnvilTrueTypeMetricsClose() : AnvilTrueTypeClose()
+  ; Out-of-subtable idRangeOffset must not permit a read past format 4.
+  bytes=t2Build() : t2BE16(t2Off[4]+48,$FFFE)
+  t2BE32(12+4*16+4,t2Checksum(t2Off[4],t2Len[4],0))
+  If AnvilTrueTypeOpen(@t2Font[0],bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 : ProcedureReturn 17 : EndIf
+  If AnvilTrueTypeCmapOpen()<>0 Or AnvilTrueTypeCmapError()<>#ANVIL_TTC_E_FORMAT : ProcedureReturn 18 : EndIf
+  AnvilTrueTypeMetricsClose() : AnvilTrueTypeClose()
+  ; Format 12 groups must be strictly ordered and non-overlapping.
+  bytes=t2Build() : t2BE32(t2Off[4]+80,$40)
+  t2BE32(12+4*16+4,t2Checksum(t2Off[4],t2Len[4],0))
+  If AnvilTrueTypeOpen(@t2Font[0],bytes)=0 Or AnvilTrueTypeMetricsOpen()=0 : ProcedureReturn 19 : EndIf
+  If AnvilTrueTypeCmapOpen()<>0 Or AnvilTrueTypeCmapError()<>#ANVIL_TTC_E_FORMAT : ProcedureReturn 20 : EndIf
+  If tt2RealFont()<>0 : ProcedureReturn 20 : EndIf
+  ProcedureReturn 0
+EndProcedure

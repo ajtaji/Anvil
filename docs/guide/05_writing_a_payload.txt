@@ -1,0 +1,566 @@
+; Chapter 5 of THE ANVIL GUIDE.
+;
+; SOURCES OF TRUTH:
+;   Anvil/Hal/abi.pbi          - THE specification. There is no doc that
+;                                specifies the service table; this file is
+;                                it. Header layout :205-222, entry contract
+;                                :52-113, re-entrancy :130-188, groups
+;                                :397-429, error set :338-357.
+;   Anvil/Hal/abi_version.pbi  - #SVC_ABI_MAJOR/MINOR, #SVC_SLOT_COUNT.
+;   Anvil/Hal/seams.pbi        - capability ids, #SVC_SEAM_HDR_BYTES.
+;   Anvil/Core/pmfboot.pbi     - the container fields and the flags.
+;   RaspberryPi4/Board/cache.pi4      - RunAt, the entry and return lines.
+;   RaspberryPi4/Board/memmap.pi4     - the windows and why they move.
+;   RaspberryPi4/Lib/safety.pi4       - the watchdog numbers.
+;   docs/PAYLOAD_LIFECYCLE.md         - the ownership contract.
+;   RaspberryPi4/Examples/Diagnostics/pi4SlowSpin.pi4  - the example.
+;
+; DESK RUN BEHIND THIS CHAPTER (2026-09-16): the @CODE block was compiled
+; on a desk machine with the exact command line printed beside it, and
+; the compiler output quoted in "what you will see" is that run's, word
+; for word. Nothing was run on a board; the board was in another lane's
+; hands. Every board line quoted is labelled as a recorded session.
+;
+; DELIBERATELY CORRECTED HERE: the header is a PMFBOOT **v2** container,
+; 128 bytes, not the 96-byte v1 several older notes describe. The desk
+; run says v2 and the size arithmetic confirms it.
+;
+; DELIBERATELY SAID: there is NO message printed when the deadman kills a
+; payload, and no watchdog expiry has ever been observed on this board.
+@CHAPTER Writing a payload
+@INTRO A payload is an ordinary program that borrows the whole machine for a while and gives it back. This chapter is the contract.
+
+@SECTION What a payload is
+
+It is a compiled image. Anvil places it, verifies it, and branches into
+it with the processor entirely its own. When it returns, Anvil takes the
+machine back and prints what the payload put in `x0`.
+
+What makes it a payload rather than a boot image is two build switches
+and the promise that goes with them: it comes back, and it does not
+touch what it did not claim.
+
+@SECTION The three addresses
+
+Every image this compiler produces needs three addresses, and you will
+have to think about all three.
+
+@FRAG
+--load-addr <addr>    where the image is linked; unless --bss-addr is
+                      also given, its bytes do not depend on it
+--bss-addr  <addr>    where its variables go
+--stack-addr <addr>   where its stack starts, growing down
+@ENDFRAG
+
+@NOTE **The load address is not baked into the image.** The code reaches
+its own code, data and variables relative to where it is running, so the
+same source built `--load-addr 0x400000` and `--load-addr 0x1000000` is
+byte for byte the same file, and it runs wherever it is staged.
+`tools/a64/a64_nosizecap_check.py` proves both: it
+compares those two builds whole, and enters the `0x400000` one at a
+different staging address and gets its return value back. So do not
+rebuild when the monitor grows - stage at the address `map` prints.
+
+@TRAP **`--bss-addr` pins an image to its load address.** Give an
+explicit BSS address (or a `BssAddress` line) and the variables are at
+that absolute address while the code still finds them by distance, so
+the image then runs only at the address it was built for.
+
+@TRAP **The BSS is not covered by any range check the loader makes.**
+Leave `--bss-addr` off and the variables go 512 KiB above wherever the
+image is running. The loader never writes a byte of them, so no window
+check ever sees them. A payload staged near the top of a window puts its
+variables past the end of that window at run time - and
+in the low window's case, that is the payload's own stack corridor.
+Leave room, or use the high window, where there are three gigabytes of
+it.
+
+@TRAP **The compiler's default stack top is a hardcoded `$08000000`**,
+for monitor and payload alike. Leave `--stack-addr` off and your
+payload's very first push lands on the monitor's live frames, and
+returning walks off into the weeds. That is also why the low payload
+window stops at `$07EFFFFF`: one clear megabyte below that default.
+
+@NOTE You can put all three in the source instead of on the command
+line:
+
+@FRAG
+LoadAddress  $400000
+BssAddress   $480000
+StackAddress $3000000
+@ENDFRAG
+
+A flag still wins where it is the only thing said. If a flag and a
+source line **disagree**, the build stops and names both values. It
+never quietly picks one.
+
+@SECTION The two switches
+
+@FRAG
+--entry-returns     make the entry point return instead of trapping
+--wants-services    ask for the service table in x0
+@ENDFRAG
+
+A stock image's entry point traps forever after calling `Main()`.
+`--entry-returns` turns that trap into a real epilogue, so a payload
+that ends in a return comes back to the monitor - and the monitor can
+report your `x0`.
+
+`--wants-services` sets a flag in the container header. That flag is the
+only thing that makes Anvil build its service table and hand you its
+address.
+
+@TRAP `--wants-services` and `--wants-dtb` are mutually exclusive, and
+the pair is refused before a byte of the container is read. Pick one.
+
+@SECTION What you may assume at your first instruction
+
+Everything in this list is guaranteed. **Nothing else is.**
+
+@FRAG
+x0        the address of the service table. Never 0 for a payload that
+          declared --wants-services.
+x1..x7    ZERO. Not "unspecified" - zero.
+x8..x30   unspecified. You own them.
+SP        your own stack, at the address --stack-addr declared, ALREADY
+          SWITCHED.
+IRQs      masked. Anvil's fault vectors are installed and stay installed.
+image     placed at your load address, digest-verified AT THAT ADDRESS,
+          BSS zeroed - all before entry.
+cores 1-3 parked.
+deadman   armed if the operator armed it. YOU pet it, in your own loop.
+@ENDFRAG
+
+@TRAP **The exception level and the cache state are not in that list, on
+purpose.** You run at the same level Anvil runs at, whatever that is -
+and you must not hard-code a number. `SvcMmuState()` answers the cache
+question: bit 0 MMU on, bit 1 D-cache, bit 2 I-cache.
+
+This is not theoretical. A payload that hard-coded "we must be at EL2"
+refused to run at all - correctly, having computed nothing - the day the
+monitor started booting at EL3 through the firmware stub. The refusal
+was right. The check was wrong. Ask.
+
+@SECTION The service table
+
+`x0` points at a table. Sixteen bytes of header, then one 8-byte pointer
+per slot:
+
+@FRAG
++0   u32  magic        'ANVS'
++4   u32  abi_major
++8   u32  abi_minor
++12  u32  entry_count
++16  ptr  slot 0
++24  ptr  slot 1
+     ...  entry_count pointers, 8 bytes each
+@ENDFRAG
+
+At ABI 1.3 that is 16 + 192*8 = 1552 bytes. A slot's address is
+`table + 16 + n * 8`.
+
+@TRAP Read those four header fields **a byte at a time**. The fields at
+`+4` and `+12` are not 8-byte aligned, and with the MMU off all of DRAM
+behaves as device memory where an unaligned wide load **faults** - into
+an exception vector your payload does not install. That is a silent
+hang from a single read. The slots themselves are 8-aligned and read
+normally.
+
+**Every slot is filled.** An unimplemented one points at a procedure
+that returns `SVC_ENOSYS`. There are no null pointers in the table, so
+you never have to check one.
+
+@SECTION The version gate, and it is not optional
+
+@FRAG
+major differs   DO NOT CALL A SINGLE SLOT. The only thing guaranteed
+                across a major version is the sixteen header bytes.
+minor older     you may call slots, but refuse with SVC_EABI naming
+                both versions, so somebody can act on it.
+minor newer     NOT an error. A newer table is fine.
+@ENDFRAG
+
+The numbering rule behind that: a slot's meaning is fixed for the life
+of a major version. New services are appended inside their group's
+reserved block and the minor rises. A group that fills its block gets a
+**new block at the end**, never a renumbering.
+
+@SECTION The groups
+
+@FRAG
+base  group                  reserved   state today
+   0  Core and lifecycle        16      all 16 live
+  16  Clock                      8      5 live; there is NO clock setter
+  24  Console                   16      14 live, where the board has one
+  40  Touch                      8      4, or ENOCAP
+  48  File and storage          16      14 live
+  64  Settings                   8      4 live
+  72  Net                       24      EMPTY. Every slot answers ENOSYS
+  96  USB                       12      6; the block writer is ENOSYS
+ 108  GPIO                       8      6 live
+ 116  I2C                       12      8 live
+ 128  SPI                        8      5, all ENOSYS today
+ 136  UART                       8      6, all ENOSYS today
+ 144  Vehicle link              12      11, all ENOCAP today
+ 156  GNSS                      12      7, all ENOCAP today
+ 168  Crypto and entropy        16      ONE live: SvcSha256
+ 184  Parallel execution         8      3 live - new at 1.3
+@ENDFRAG
+
+@NOTE The net group being empty is deliberate and documented as such in
+the source rather than left to be discovered. Read that table as the
+state of this build, not as a promise about the next one - and check
+`SvcAbiMinor()` rather than this book.
+
+@SECTION The lifecycle slots you will actually use
+
+@FRAG
+slot 4   SvcCapGet(cap)                does this board have that group
+slot 5   SvcRequireCap(cap, name, why) the gate - returns 1 or 0
+slot 6   SvcPet()                      feed the deadman
+slot 7   SvcBootOk()                   "I came up" - clears the loop guard
+slot 10  SvcMmuState()                 MMU and cache bits
+slot 11  SvcUptimeUs()
+slot 12  SvcErrText(code)              the whole sentence for a code
+slot 13  SvcErrDetail()                the fragment for the LAST failure
+@ENDFRAG
+
+@SECTION SvcRequireCap returns the sentence; it does not print it
+
+This is the one place the payload ABI deliberately differs from the
+monitor's own internal gate, and the reason is worth understanding.
+
+Inside the monitor, the capability gate prints its refusal, because the
+monitor owns the console. Here, **you** own the console. A sentence
+printed by Anvil would land on a framebuffer you are half-way through
+composing, or on a serial line nobody is watching in a truck.
+
+So on a refusal it returns 0, sets the detail fragment to the reason
+string you passed in, and you render it. The wording is the monitor's
+wording minus the "type help" tail, which means nothing on a
+touchscreen.
+
+@SECTION Errors are sentences, and you compose them
+
+`SvcErrText(code)` returns a **pointer** to a complete sentence that
+keeps the number in it:
+
+@FRAG
+SVC_OK        0    the operation completed at code 0 (SVC_OK)
+SVC_ENOSYS  -100   this monitor has no code for that service at all...
+SVC_ENOCAP  -101   this board does not offer that hardware group...
+SVC_EARG    -102   one of the arguments was not usable at code -102 (SVC_EARG)
+SVC_EBUSY   -103   the resource is already in use at code -103 (SVC_EBUSY)
+SVC_ETIMEOUT -104  the operation did not finish in its time bound...
+SVC_EIO     -105   the hardware answered, and answered badly...
+SVC_EPERM   -106   this monitor refused on purpose at code -106...
+SVC_EFLAG   -107   the payload's container did not declare the flag...
+SVC_ESTATE  -108   this service was called in the wrong order...
+SVC_EABI    -109   this monitor's service table is older than the
+                   payload was built against...
+@ENDFRAG
+
+@NOTE The number stays inside the text on purpose, so that an old forum
+thread, an old log line and an old screenshot still match a message
+printed today.
+
+The house shape for the sentence you print:
+
+@FRAG
+<what it was doing> failed at <code> (<name>): <SvcErrText>.
+<SvcErrDetail>. Check <first thing>, <second thing>.
+@ENDFRAG
+
+@TRAP `SvcErrDetail()` is **not latched**. It is valid immediately after
+the call that failed, and not one call later. Read it before you do
+anything else.
+
+@SECTION The deadman
+
+The operator arms it with `deadman <seconds>` before entering you.
+You keep it fed:
+
+@FRAG
+SvcPet()        slot 6
+@ENDFRAG
+
+@TRAP **Anvil never pets it for you**, and that is the whole point. A
+monitor that petted a watchdog on behalf of a program it is not running
+has disarmed the one thing between a hung payload and a board that needs
+hands.
+
+The numbers: the counter is 20 bits at 65536 ticks a second, so the
+ceiling is **about 16 seconds**. A request of 1 to 15 seconds is taken
+as given; anything larger is clamped and **reported as the clamped
+value**, because a deadman that fires earlier than it said it would is
+worse than none.
+
+@TRAP If your payload includes the safety library and calls its
+`SafetyPet()`, that is **not** the same thing and it does **not** feed
+this hardware counter. A long-running payload that pets the wrong one is
+reset while perfectly healthy. Call `SvcPet()`.
+
+@NOTE There is **no message printed when the deadman fires.** There
+cannot be: the reset arrives at an arbitrary instruction while your
+payload owns the machine, and nothing is running that could print. What
+you see is the board restarting.
+
+And an honest one: arming and stopping the watchdog are proven on this
+board. **Expiry has never been observed to fire.** The experiment that
+would settle it is written down in the safety library's own header.
+
+@SECTION What a payload must not do
+
+**Ownership.** You may use your declared image, BSS and stack ranges,
+the processor state handed to you, and devices you explicitly claim. You
+must preserve Anvil's image and BSS, and you must not reconfigure
+unrelated devices. A payload that overwrites the resident monitor cannot
+be recovered by copying a few variables back, and Anvil does not pretend
+otherwise.
+
+**No callbacks, ever.** The ABI is call-and-return only. Anvil never
+calls back into the payload. Where a future service looks like it wants
+a callback, it wants a **queue** instead - which is exactly why the
+touch and vehicle services are polls.
+
+**No slot from an interrupt handler.** The handler would re-enter Anvil's
+code on top of a call the main line is already inside, and Anvil's
+drivers keep their state in globals with one writer and no lock.
+Interrupts are masked at entry and you have no reason to unmask them.
+
+**No slot from any core but the one you were entered on.** At every
+version of this ABI. From 1.3 you may run your own procedures on the
+other three cores - chapter 7 - but a service call from core 2 is not
+allowed at any version.
+
+**Do not include Anvil's ABI source file.** That file is Anvil's half:
+it declares the table, the procedures and the builder, all of which
+would be compiled into your image as a second, dead copy. What crosses
+the seam is the **numbers**, and a payload restates the ones it uses -
+exactly as a program written against any other ABI does.
+
+**Do not branch on the board id.** `SvcBoardId()` exists so a diagnostic
+can print what it is talking to. A payload that changes behaviour based
+on it has broken the entire point of a portable service table, and there
+is a check that looks for exactly that.
+
+@NOTE One thing that is **not** forbidden, despite what you might
+expect: a `DataSection`. Payloads in this tree use them. The only real
+constraint is the alignment one above - the emitter aligns the section,
+and a wide load off an unaligned address with the MMU off faults
+silently.
+
+@SECTION Returning a value
+
+Make `Main()` return a value and build with `--entry-returns`. It arrives
+in `x0`, and the monitor prints all sixteen digits of it:
+
+@FRAG
+The payload returned to the monitor. Its x0 register held 000000000000000A,
+which is whatever it chose to return. A stock image never returns at
+all, so seeing this line means the payload was built to come back.
+@ENDFRAG
+
+@NOTE Sixteen digits, not eight. `x0` is a 64-bit register and always
+was; eight digits is the low half of it, and printing half a register is
+how a return value that differs only above bit 31 reads as a success.
+
+The host runner treats a non-zero `x0` as a failed run by default, so
+the useful convention is: **zero means content**, anything else is your
+own status code.
+
+@TRAP `SvcReturn()` exists in the table and **does not work** in ABI 1.x.
+It refuses, and the refusal tells you what to do instead:
+
+@FRAG
+this monitor cannot unwind out of a payload from inside a service call; return from the payload's own entry point instead, which is what the returns-to-monitor flag is for
+@ENDFRAG
+
+@SECTION Where your payload may go
+
+Type `map` on the board. Do not copy an address from anywhere else,
+including this book.
+
+The low window's bottom edge is the monitor's own extent rounded up to a
+megabyte, so it moves every time the monitor grows. It was `00400000` on
+one build and `00500000` on the next. The high window starts at
+`40000000` and runs to `FBFFFFFF`.
+
+@NOTE The high window is the right answer more often than people expect.
+Three gigabytes means you stop having to think about where your BSS
+lands, and an image linked there cannot collide with the monitor no
+matter how large the monitor becomes.
+
+@SECTION Staging assets at addresses
+
+Large data - a model, a font, a texture, a recording - does not have to
+go inside your image. Put it in memory at a known address and have your
+payload read it from there.
+
+Two routes. Over the network, into memory:
+
+@FRAG
+pmf> net recv 5001 40000000
+@ENDFRAG
+
+and check what landed with the board's own digest:
+
+@FRAG
+pmf> sha256sum 40000000 <length in hex>
+@ENDFRAG
+
+Or off the boot medium, which is much faster the second time:
+
+@FRAG
+pmf> load MODEL.PMW 40000000
+pmf> sha256sum 40000000 <length in hex>
+@ENDFRAG
+
+@NOTE That second form is worth setting up for anything large. In one
+recorded board session a 324 MB asset was uploaded once, written to the
+medium, and thereafter read back with `load` in a fraction of the time -
+and the board's own `sha256sum` confirmed it was the same file,
+**checked by something other than the tool that wrote it**.
+
+@TRAP Check the size before you check the hash. In that same session the
+file on the medium was 324,635,776 bytes where the payload expected
+324,621,440. The size alone settled it and no hash was needed. Size is
+cheap; a 324 MB digest is not.
+
+@SECTION A complete payload
+
+This is a real diagnostic from this repository. It spins for ten seconds
+on the hardware counter and returns 10.
+
+@CODE pi4
+; pi4SlowSpin.pi4 - looks like a hang, but gives up on its own.
+;
+; Armed with a SHORTER deadman, the two outcomes are distinguishable and
+; only one of them can go wrong:
+;
+;   deadman fires   -> the board resets partway through. PROVEN.
+;   deadman broken  -> this returns to the prompt. Board still healthy,
+;                      and the failure is reported rather than wedging.
+;
+; The wait is on the architected counter via timer.pi4, not a spin
+; count, so it is the same ten seconds at 600 MHz and at 1.5 GHz.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+
+Procedure.i Main()
+  Define i.i
+
+  PrintNl()
+  UartWriteStr("=== spinning for 10 s. a shorter deadman should cut this short. ===")
+  PrintNl()
+  UartDrain()
+
+  ; One line a second, so the transcript shows exactly WHEN it stopped
+  ; rather than only that it did.
+  For i = 1 To 10
+    Delay(1000)
+    UartWriteStr("  t+")
+    PrintDec(i)
+    UartWriteStr(" s")
+    PrintNl()
+    UartDrain()
+  Next
+
+  UartWriteStr("=== reached the end. THE DEADMAN DID NOT FIRE. ===")
+  PrintNl()
+  UartDrain()
+  ProcedureReturn 10
+EndProcedure
+@ENDCODE
+
+@NOTE Notice what the comment block is doing. This program exists to
+prove the deadman works, and it is built so that **if the deadman does
+not work, the board is still healthy and the failure is reported.** A
+test whose failure mode is "everything is fine, and you know" is worth
+more than a purer one that has to be supervised.
+
+@SECTION Building it
+
+This exact command was run on a desk machine while this chapter was
+written:
+
+@FRAG
+PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4SlowSpin.pi4 -t pi4 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns -o slow.img
+@ENDFRAG
+
+What you will see - this is that run's output, word for word:
+
+@FRAG
+pmfc: BCM2711 --entry-returns; Main()'s value comes back in x0, the loader's stack and DAIF are left as they were
+pmfc: RaspberryPi4/Examples/Diagnostics/pi4SlowSpin.pi4  ->  BCM2711
+> Intrinsics for BCM2711: bcm2711_hardware.def
+> Loaded Hardware Intrinsics from bcm2711_hardware.def
+pmfc: pin aliases from Boards/Raspberry_Pi_4.board
+pmfc: 1423 lines of assembly
+pmfc: wrote slow.img.pmf - a PMFBOOT v2 container, 5068 bytes
+      load $400000  entry $400000  bss $480000..$48609F  sha256 95cd1f698a999a3afa9f56c894851ef996cf131038039afa7b025cd11335b189
+      architecture AArch64  target BCM2711  stack $3000000
+pmfc: wrote slow.img
+pmfc: image 4940 bytes, occupying $400000..$40134B - no maximum;
+      the board computes its map from this
+pmfc: OK
+@ENDFRAG
+
+Read the container line. It tells you the load address, the entry point,
+**where the BSS actually landed** - `$480000..$48609F`, which you did
+not ask for and now know - the digest, and the stack. That is the line
+to check against `map` before you send anything anywhere.
+
+The container is 5,068 bytes and the image is 4,940, so the header is
+128 bytes. Its fields:
+
+@FRAG
++0   magic 'PMFBOOT' and a NUL
++8   version
++12  header length
++16  load address
++24  entry address
++32  image length
++40  BSS base
++48  BSS length
++56  flags   bit 0 entry-returns, bit 1 expects-DTB,
+             bit 2 wants-services
++64  sha256 of the image bytes
++104 stack address
+@ENDFRAG
+
+@NOTE The digest is taken **at the load address, after placement** - not
+in flight. A container whose bytes were damaged between the host and
+the board's DRAM fails the check with the target cell untouched, and
+nothing is entered.
+
+@SECTION Running it
+
+@FRAG
+pmf> deadman 15
+pmf> boot mem 400000
+@ENDFRAG
+
+or, from the host, the whole thing in one command:
+
+@FRAG
+python tools/board_run.py slow.img.pmf --console-ip <board-ip> --deadman 15 --expect-x0 10
+@ENDFRAG
+
+Chapter 6 is that tool in full.
+
+@SECTION A checklist before your first run
+
+@FRAG
+1. map on the board. Write down the staging address and both windows.
+2. Does your BSS land inside the window you chose? The compiler's
+   container line tells you where it went.
+3. Is --stack-addr set, and is it somewhere you own?
+4. Both switches: --entry-returns, and --wants-services if you call
+   a single slot.
+5. Does Main() return a value, and is zero your success?
+6. Do you pet with SvcPet() in every loop and every wait?
+7. Did you ask SvcMmuState() rather than assuming the cache state?
+8. Arm a deadman. Every time.
+@ENDFRAG

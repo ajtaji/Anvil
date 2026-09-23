@@ -1,0 +1,2681 @@
+; ======================================================================
+; BCM2711 PCIe - the ADDRESSING FOUNDATION and a bench instrument for an
+; UNDOCUMENTED register block. Library, not a builtin.
+; ----------------------------------------------------------------------
+; USE:
+;     XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+;
+;     If PcieAddrIsWide() = 0
+;       ; the compiler truncated the window address - see THE CANARY
+;       ; below. Stop. Do not touch the hardware.
+;     EndIf
+;     v = PcieRcPeek($0000)          ; bounded read of the root complex
+;     v = PcieWinPeek($0000)         ; bounded read of the outbound window
+;
+; DEPENDENCIES - none in code. A library includes no library here
+; (project ruling, 2026-07-30), so this file names no other .pi4 and
+; computes nothing from one. What it EXPECTS of the caller:
+;
+;   * a console, if you want to see anything. Every procedure here
+;     RETURNS a value; nothing in this file prints.
+;   * RaspberryPi4/Lib/mailbox.pi4 IS A LIKELY PREREQUISITE for anything
+;     past this file. See THE FIRMWARE DEPENDENCY, below - it is not a
+;     maybe, the board's own device tree asserts it.
+;
+; ======================================================================
+;  READ THIS BEFORE YOU READ ANYTHING ELSE IN THIS FILE
+; ======================================================================
+; THIS FILE DOES NOT BRING UP THE PCIe LINK. It cannot, and the reason
+; is not effort or time - it is that THERE IS NO CITABLE SOURCE FOR A
+; SINGLE REGISTER OF THE BLOCK AT $FD500000 ANYWHERE ON THIS DISK.
+;
+; That was checked, not assumed. `bcm2711-peripherals.pdf` is 166 pages
+; and mentions PCIe on eight of them. Every one of those eight was read:
+;
+;   p. 4   contents - lists "6.2.5. ETH_PCIe interrupts" and nothing else
+;   p. 5   "BCM2711 contains the following peripherals which may safely
+;          be accessed by the ARM" - the list does NOT include PCIe
+;   p. 6   Figure 1, the address map. THIS IS THE USEFUL ONE - see below
+;   p. 65  "DMA channel 11 is additionally able to access the PCIe
+;          interface"
+;   p. 86  the interrupt overview block diagram, ETH_PCIe as a source
+;   p. 88  IRQ table - "58  OR of all ETH_PCIe L2"
+;   p. 89  the five names PCIE_0_INTA/B/C/D and PCIE_0_MSI
+;
+; The address map, the DMA note and the interrupt lines. NOT ONE
+; REGISTER. Not a reset bit, not a link-status bit, not the config-space
+; index/data pair, not an inbound-window descriptor. The same document
+; says on p. 5 that peripherals "intended to be controlled by the GPU
+; ... are omitted from this datasheet. Accessing these peripherals from
+; the ARM is not recommended."
+;
+; So a `PcieBringUp()` in this file would have been ten to twenty
+; hand-typed register offsets with no provenance. On this project that
+; is not a shortcut, it is the exact failure already on the record for
+; today: a store to a real, powered, idle peripheral that produced no
+; output and no error, because it was simply the wrong device. A PCIe
+; root complex is a worse place to do it than a UART, because there is
+; nothing to notice: a write to a wrong offset in an undocumented block
+; faults nothing, prints nothing, and leaves you reading a link-status
+; bit that is actually somebody else's scratch register.
+;
+; WHAT THIS FILE IS INSTEAD, and it is deliberately a smaller thing:
+;
+;   1. THE ADDRESSING. Every number needed to reach the far side of the
+;      PCIe bus, each one cited twice where two sources exist, and the
+;      conversions between the CPU view and the PCI-bus view - which are
+;      NOT the same address and are the classic silent mistake here.
+;   2. THE INBOUND ERRATUM, as a predicate a caller can actually call
+;      rather than a comment nobody reads.
+;   3. THE CANARY. A runtime check that the 64-bit address survived the
+;      compiler. Not paranoia - it was failing this morning, silently,
+;      and the failure address was $0. See below.
+;   4. A BOUNDED, READ-ONLY BENCH INSTRUMENT for the undocumented block,
+;      so that the missing citations can be PRODUCED on the bench
+;      instead of guessed at here.
+;
+; It writes nothing to any PCIe register. Not one PokeL in this file.
+;
+; ======================================================================
+;  THE CANARY - AND WHY IT SURVIVES ITS OWN GOOD NEWS (2026-08-24)
+; ======================================================================
+; The whole reason PCIe became approachable is that the Pi 4 backend has
+; gone 64-bit: the outbound window is at CPU $6_0000_0000, above 4 GB,
+; so with 32-bit pointers the controller was literally unaddressable.
+;
+; THE WIDENING LANDED WHILE THIS FILE WAS BEING WRITTEN, and both states
+; were measured, hours apart, on the same source. Compiling
+; `v = PeekL($600000000)`:
+;
+;   pmfc.exe, 20:18   ->   movz w11, #0
+;                          ldr  w12, [x11]
+;   pmfc.exe, 20:58   ->   movz x11, #0
+;                          movk x11, #6, lsl #32
+;                          ldr  w12, [x11]
+;
+; THE CURRENT pmfc.exe IS CORRECT and this file builds clean against it.
+; The first line is not history for its own sake - it is the failure the
+; canary exists for, and it is worth knowing exactly how bad it was.
+;
+; $6_0000_0000 truncated to 32 bits is EXACTLY ZERO, so the read became
+; a read of address $0 - the firmware spin table and the secondary
+; cores' release mailboxes. There was NO WARNING. The build exited 0 and
+; said "pmfc: OK". A poke through the same path would have written the
+; spin table, on a board with three cores parked in it.
+;
+; So the canary is NOT dead code now that the compiler is fixed. It
+; guards a property that was false this morning, that no compile-time
+; check caught, and that an image already built and sitting on a boot
+; stick still has. It costs three comparisons, once.
+;
+; That is why PcieAddrIsWide() exists and why it should be the FIRST
+; thing any caller of this file calls. It is a runtime test, because for
+; the bare-expression case a compile-time one does not exist.
+;
+; The 64-bit backend is CORRECT on both counts that matter here: the
+; movz/movk pair above is the right answer, and .i globals come out
+; .space 8 rather than .space 4.
+;
+; --- ONE GOOD SURPRISE, AND IT CHANGES A DESIGN CHOICE HERE ---------
+; THIS WHOLE FILE WAS REFUSED BY THE OLD COMPILER, LOUDLY. Built against
+; the 20:18 pmfc.exe, the scratch test main did not produce a wrong
+; image; it stopped:
+;
+;   COMPILER ERROR: 'ProcedureReturn 25769803776' in pcieoutcpu() -
+;                   the value does not fit the procedure's return width.
+;                   ... Every caller would receive 25769803776 silently
+;                   WRAPPED to that width - a branch comparing against
+;                   it could never be true, with no diagnostic.
+;   pmfc: semantic analysis failed
+;   pmfc: BUILD FAILED - no output produced.
+;
+; That is the ProcedureReturn width refusal doing exactly its job, and
+; it is a much better outcome than the canary catching it at run time.
+;
+; NOTE WHY IT FIRED, BECAUSE IT IS THE ARGUMENT FOR A DESIGN CHOICE THAT
+; OTHERWISE LOOKS LIKE PADDING. It fired on PcieOutCpu() - a procedure
+; that only returns a constant. The bare expression `PeekL($600000000)`
+; is NOT caught: that is the case measured above, which compiles clean
+; and reads address zero. So wrapping the map in trivial accessors,
+; which reads like ceremony, is what converts a silent wrong address
+; into a build failure on a compiler that cannot do the job. Keep them,
+; and prefer PcieOutCpu() over #PCIE_OUT_CPU in code that a 32-bit build
+; might ever see.
+;
+; The canary stays anyway. The refusal protected against building with a
+; 32-bit compiler; the canary protects against everything else.
+;
+; ======================================================================
+;  THE ADDRESS MAP - every number below is cited
+; ======================================================================
+;
+; --- THE ROOT COMPLEX'S OWN REGISTERS -------------------------------
+; `bcm2711.dtsi` line 553:
+;     pcie0: pcie@7d500000 { compatible = "brcm,bcm2711-pcie";
+;                            reg = <0x0 0x7d500000 0x9310>; ... }
+;
+; That $7D500000 is a LEGACY/VC bus address, not an ARM one. The `soc`
+; node's ranges translate it - `bcm2711.dtsi` lines 41-43:
+;     ranges = <0x7e000000  0x0 0xfe000000  0x01800000>,
+;              <0x7c000000  0x0 0xfc000000  0x02000000>,
+;              <0x40000000  0x0 0xff800000  0x00800000>;
+;
+; $7D500000 falls in the second range: $7D500000 - $7C000000 = $1500000,
+; and $FC000000 + $1500000 = $FD500000. So the block is at ARM
+; $FD500000 and it is $9310 bytes long.
+;
+; The same arithmetic is what puts the PL011 at $FE201000 (from
+; uart0@7e201000 through the FIRST range), and that one is PROVEN on
+; silicon - the monitor talks through it. So the translation rule is not
+; being taken on trust; it has a working witness on the same chip.
+;
+; --- THE OUTBOUND WINDOW - CPU $6_0000_0000 -------------------------
+; `bcm2711.dtsi` lines 575-576, inside pcie0:
+;     ranges = <0x02000000 0x0 0xf8000000  0x6 0x00000000
+;               0x0 0x04000000>;
+;
+; pcie0 has #address-cells = <3> (a PCI address), its parent `scb` has
+; #address-cells = <2>, and #size-cells = <2>. So the seven cells split:
+;
+;     child  (3 cells)   0x02000000 0x0 0xf8000000
+;     parent (2 cells)   0x6 0x00000000
+;     size   (2 cells)   0x0 0x04000000
+;
+; CONFIRMED, and this is the reading that was asked for: the window is
+; 64 MiB ($0400_0000) at CPU address $6_0000_0000.
+;
+; ONE THING THAT READING LEAVES OUT, AND IT IS THE DANGEROUS HALF.
+; The child cells are not decoration. $02000000 in phys.hi is the PCI
+; space code for 32-bit NON-PREFETCHABLE MEMORY, and the two cells after
+; it are the address ON THE PCI BUS: $F8000000.
+;
+;     PCI bus $F800_0000 .. $FBFF_FFFF   <-->   CPU $6_0000_0000 ..
+;                                                   $6_03FF_FFFF
+;
+; A BAR read out of the VL805 will contain a number near $F8000000. That
+; number is NOT an address this CPU can load from. Dereferencing a BAR
+; value directly lands at $F8000000, which on the ARM side is inside the
+; peripheral aperture, not on the PCI bus at all - another store to a
+; real, powered, wrong device. PcieCpuFromBus() below is the conversion,
+; and it is the reason it exists.
+;
+; --- CORROBORATION FROM BROADCOM'S OWN DOCUMENT ---------------------
+; `bcm2711-peripherals.pdf` p. 6, Figure 1 "BCM2711 Address Maps", the
+; "Full 35-bit Address Map" column, lists a region labelled PCIe running
+; from 0x6_0000_0000 to 0x7_FFFF_FFFF. p. 5 says in words: "The PCIe
+; address range covers 8GB, but the Main peripherals address range only
+; covers 64MB."
+;
+; So $6_0000_0000 is confirmed by two independent sources. Note the
+; sizes disagree, and they are not in conflict - they describe different
+; things, so all three are recorded here rather than one being picked:
+;
+;     8 GiB    the SoC's PCIe REGION           peripherals PDF, Fig. 1
+;     1 GiB    what the `scb` bus passes       bcm2711.dtsi line 551:
+;              through, identity-mapped        <0x6 0x00000000
+;                                               0x6 0x00000000
+;                                               0x40000000>
+;    64 MiB    what pcie0 actually maps        bcm2711.dtsi line 575
+;
+; 64 MiB IS THE ONE THIS FILE USES, because it is the innermost and the
+; smallest, and a window is only as wide as its narrowest translation.
+;
+; --- THE INBOUND WINDOW, AND THE ERRATUM ----------------------------
+; The hardware fact, in our own words; the reference below is a pointer
+; to where it can be checked, not a passage carried across. Inside the
+; pcie0 node, `bcm2711.dtsi` lines 577-583 record the erratum and size
+; the window it forces: the wrapper around the PCIe block cannot reach
+; past the first 3 GiB of memory, so that node's inbound translation is
+; declared over PCI memory space as bus $0000_0000 to CPU $0000_0000
+; with a length of $C000_0000.
+;
+; Split the same way: PCI bus $0000_0000 maps to CPU $0000_0000, for
+; $C000_0000 = 3 GiB. So inbound DMA is IDENTITY-MAPPED and CAPPED at
+; 3 GiB. CONFIRMED as read.
+;
+; THIS IS A HARDWARE ERRATUM AND IT IS THE MOST EXPENSIVE FACT IN THIS
+; FILE, because of how it fails. Every XHCI data structure - the device
+; context base array, the command ring, every transfer ring, every event
+; ring, every data buffer - is memory the CONTROLLER reads, not the CPU.
+; Put one at or above $C000_0000 on a 4 GB or 8 GB Pi 4 and the CPU can
+; see it perfectly while the controller cannot reach it. The symptom is
+; a controller that accepts everything and completes nothing.
+;
+; This board has 4 GB and its DRAM runs to $FBFFFFFF (measured, U-Boot
+; bdinfo - see anvil.pi4's MEMORY MAP). So the top ~940 MiB of
+; installed RAM is DMA-POISON for this device, and it is exactly the
+; region the monitor's HIGH payload window sits in. A future xhci.pi4
+; that allocates its rings "somewhere in the high window" because that
+; is where there is room would be wrong in a way no CPU-side test can
+; detect. PcieDmaOk() exists to be called before any such allocation is
+; handed to the controller.
+;
+; ======================================================================
+;  THE FIRMWARE DEPENDENCY - the mailbox is probably not optional
+; ======================================================================
+; This was flagged as a possibility. The board's own device tree turns
+; it into an assertion. `bcm2711-rpi-4-b.dts` lines 209-223:
+;
+;     &pcie0 {
+;         pci@0,0 {
+;             device_type = "pci";
+;             ...
+;             usb@0,0 {
+;                 reg = <0 0 0 0 0>;
+;                 resets = <&reset RASPBERRYPI_FIRMWARE_RESET_ID_USB>;
+;             };
+;         };
+;     };
+;
+; Read what that says. The VL805 - `usb@0,0`, the only child of the only
+; port - takes its reset FROM THE RASPBERRY PI FIRMWARE, by a firmware
+; reset ID, not from any GPIO, register or PCIe mechanism. The provider
+; is the VideoCore, and the only channel to the VideoCore is the mailbox.
+;
+; So on a board revision that needs it, the order is:
+;
+;     mailbox -> VideoCore loads/resets the VL805 -> the device
+;     enumerates -> config space answers
+;
+; and skipping the first step gives a link that trains to a port with
+; nothing behind it. On newer boards the VL805 firmware lives in a SPI
+; EEPROM and this step is not needed - so the SAME CODE works on one
+; board and not on another, which is the worst version of this problem
+; to debug. Do not conclude "no device" from a config read of all-ones
+; until the mailbox path has been tried on that specific board.
+;
+; `RaspberryPi4/Lib/mailbox.pi4` LANDED WHILE THIS WAS BEING WRITTEN, so
+; the dependency is no longer hypothetical and the pieces can be named.
+; This file does not include it and must not; when the time comes it is
+; the MAIN file that lists both. What is already there:
+;
+;   MailboxBegin(tag, reqBytes, respBytes) / MailboxSetWord /
+;   MailboxSend / MailboxWord   - the generic tag transport, so the
+;   VL805 reset is a tag number away rather than a new mechanism.
+;
+;   MailboxBoardRevision()      - and this is the one that matters,
+;   because it is how you tell WHICH board you are on, and therefore
+;   whether the VideoCore has to load the VL805 firmware at all or
+;   whether it comes from the SPI EEPROM. Do not write that decision as
+;   a constant; ask the board.
+;
+; The tag number for the firmware USB reset is NOT recorded here,
+; because it is not on this disk. `bcm2711-rpi-4-b.dts` names the
+; symbol - RASPBERRYPI_FIRMWARE_RESET_ID_USB - but the header that
+; gives it a value is not present, and neither is the tag that carries
+; it. That is one more item for the shopping list below.
+;
+; ======================================================================
+;  WHAT IS MISSING, PRECISELY - the shopping list for whoever is next
+; ======================================================================
+; Not "PCIe is hard". These specific things, none of which are on this
+; disk, and all of which are in Linux's drivers/pci/controller/pcie-
+; brcmstb.c (which is NOT on this disk either - it was looked for):
+;
+;   1. The BRIDGE RESET / soft-reset control. Which offset, which bit,
+;      which polarity, and how long to hold it.
+;   2. The PHY / SERDES enable, and `brcm,enable-ssc` (bcm2711.dtsi line
+;      584) - spread-spectrum clocking, which is a register write
+;      somewhere in this block. The property is citable; the register
+;      behind it is not.
+;   3. LINK STATUS. Which offset holds "link up", and which bits give
+;      the negotiated width and speed. Without this there is nothing to
+;      time out ON - a bounded wait needs a thing to wait for, and this
+;      is the missing thing.
+;   4. The OUTBOUND WINDOW registers. The dtsi says what the mapping
+;      SHOULD be; the hardware has to be told, and those descriptor
+;      registers are undocumented.
+;   5. The INBOUND WINDOW registers, same problem, plus whatever encodes
+;      the 3 GiB cap.
+;   6. THE CONFIG-SPACE ACCESS MECHANISM. This is the one that blocks
+;      the stated milestone outright. There is no ECAM aperture in the
+;      device tree - no `reg-names = "config"`, no second `reg` entry -
+;      so config space is reached through an index/data register pair
+;      inside the $FD500000 block, and neither offset is known. Config
+;      space cannot be read at all until this is.
+;
+; Items 1-5 are needed for a link. Item 6 is needed to read the ID.
+;
+; ======================================================================
+;  THE MILESTONE, AND THE NUMBER TO CHECK IT AGAINST
+; ======================================================================
+; The first real milestone was correctly identified as reading back the
+; VL805's vendor/device ID, because it proves the link, the windows and
+; the 64-bit addressing all at once. This file cannot reach it (item 6
+; above), but the constants for the CHECK are here so that whoever gets
+; config space working has them.
+;
+; The PCI configuration header layout below is ARCHITECTURAL - PCI Local
+; Bus / PCI Express base specification, identical on every PCI device
+; ever made, and not Broadcom-specific. It is safe to write down without
+; a Broadcom citation because Broadcom does not get a say in it.
+;
+; THE VL805's ACTUAL ID IS A DIFFERENT MATTER AND IS FLAGGED AS SUCH at
+; #PCIE_VL805_ID_EXPECTED below. Read that comment before trusting it.
+;
+; ======================================================================
+;  HOST MODE vs DEVICE MODE - why this file exists at all, given that
+; ======================================================================
+; The question of whether the XHCI host controller behind PCIe is the
+; right FIRST USB target on this board deserves an answer in the file
+; rather than only in a report, because the answer is "probably not" and
+; somebody will otherwise redo this reasoning.
+;
+; The Pi 4 has a second, completely separate USB controller: `usb@
+; 7e980000` in `bcm283x.dtsi` line 467, compatible "brcm,bcm2835-usb",
+; which is a Synopsys DesignWare dwc2 on the USB-C port, and it is
+; device-capable. By the same soc-ranges arithmetic as above it is at
+; ARM $FE980000, $10000 long.
+;
+; THE DECIDING DIFFERENCE IS NOT DIFFICULTY, IT IS EVIDENCE. The full
+; Linux dwc2 driver is sitting on this disk at Datasheets/pi4/dwc2/ -
+; core.c, core.h, gadget.c, hw.h, params.c, platform.c. `hw.h` is a
+; complete register map with every offset and every bit field named:
+; GOTGCTL $000, GAHBCFG $008, GUSBCFG $00C, GRSTCTL $010, GINTSTS $014,
+; GSNPSID $040, GHWCFG1 $044, DCFG $800, DCTL $804, DSTS $808.
+;
+; And it has the SAME KIND of first milestone, reachable on day one:
+; GSNPSID at $040 is the Synopsys core ID, and core.c's
+; dwc2_is_controller_alive() is literally "GSNPSID == 0xffffffff means
+; no". One PeekL of $FE980040, on-chip, no PCIe bus, no link training,
+; no windows, no VideoCore firmware dependency, and no undocumented
+; registers - against a milestone here that needs six unciteable things
+; to line up first.
+;
+; So: dwc2 device mode is the better first USB target on this board, on
+; evidence rather than on preference. It is a smaller job AND it is the
+; one that can be written entirely from citations. That is a
+; recommendation, not a decision - nothing has been written for it,
+; because it was not what was asked for.
+;
+; What this file is still worth if that recommendation is taken: the
+; addressing, the erratum predicate and the canary are about the PCIe
+; BUS, not about XHCI, and they are unchanged by which USB controller
+; gets driven first. Nothing here is wasted by that choice.
+;
+; ======================================================================
+;  STATUS - PROVEN ON SILICON 2026-08-25, and load-bearing at every boot
+; ======================================================================
+; THE VL805 ANSWERED. From the board, `pi4PcieProbe`, 2026-08-25:
+;
+;     root complex 00:00.0  vendor:device   $271114E4
+;     VL805        01:00.0  vendor:device   $34831106
+;
+; $14E4/$2711 is Broadcom answering as the root complex, which proves
+; config space works BEFORE the VL805 read is even attempted; $1106/$3483
+; is VIA Labs / VL805 - to the digit, the value #PCIE_VL805_ID_EXPECTED
+; has carried since this file was written, as a constant nothing could
+; go and check. Two devices, one bus walk.
+;
+; CORROBORATION WORTH KEEPING: the three addresses this file derived
+; from the DEVICE TREE alone - $FD500000, $6_0000_0000, $F8000000 -
+; appear in U-Boot's own header as PCIE_REG_BASE, PCIE_CPU_MMIO_WINDOW
+; and PCIE_TOP_OF_MEM_WIN, to the digit. Two independent sources
+; agreeing, which means the read-only half of this file was right all
+; along and the silicon run confirmed rather than discovered it.
+;
+; AND THIS FILE IS NOW LOAD-BEARING AT EVERY BOOT. The bench boots from
+; a USB stick, the stick is behind the VL805, and the VL805 is behind
+; this file: PcieInit -> PcieEnumerate -> xhci.pi4 -> usbmsc.pi4 ->
+; fat.pi4 is how Anvil reaches KERNEL8.IMG, CONFIG.TXT, its settings
+; store and the 609,309-byte CYW43455 firmware image. If anything here
+; were wrong the board would not get as far as printing.
+;
+; MEASURED THE SAME AFTERNOON, once the controller was reachable:
+;
+;     HCIVERSION $0100   CAPLENGTH 32   maxports 5   maxslots 32
+;     HCSPARAMS1 $05000420
+;
+; Every figure agrees with what U-Boot independently printed for the
+; same silicon minutes earlier - "USB XHCI 1.00", "NbrPorts 5",
+; "Register 5000420". Not a plausible number; the right one.
+;
+; TWO FAULTS IN THIS FILE'S OWN CONTRACT WERE FOUND GETTING THERE, and
+; each hid the next:
+;
+;   1. PcieInit asserts PERST, which resets the endpoint and DISCARDS
+;      the BAR the FIRMWARE assigned while booting from USB. Nothing
+;      re-enumerated, so the caller dereferenced zero and the CPU reset.
+;      Fixed by PcieEnumerate - size the BAR, place it, enable memory
+;      space and bus master.
+;   2. $DEADDEAD came back from the outbound window. Not garbage and not
+;      a crash: it is the root complex's own AXI read-error pattern from
+;      the register at $4170. The RC is a PCI-TO-PCI BRIDGE and forwards
+;      only what falls inside the MEMORY_BASE/LIMIT pair in its own
+;      config header - measured at $C000C000, the firmware's old range,
+;      while the new BAR sat at $F8000000. THE OUTBOUND WINDOW IS THE
+;      CPU SIDE, THE BRIDGE WINDOW IS THE BUS SIDE, AND BOTH ARE
+;      REQUIRED. A controller that returns a self-identifying poison
+;      value rather than aborting turned a reboot-per-attempt loop into
+;      ordinary debugging.
+;
+;   The page tables took the blame twice and were innocent both times,
+;   because they were the most exotic option available and the ordinary
+;   ones had not been checked.
+;
+; AND PcieInit NO LONGER RESETS A LINK THAT IS ALREADY UP. The firmware
+; trains this link on a USB-booting board and the loader arrives through
+; it, so resetting it reset the controller out from under a live system.
+; It ADOPTS a trained link - the same reasoning uart.pi4 gives for
+; UartAttach over UartInit.
+;
+; ---- WHAT IS STILL NOT PROVEN. The first one is structural. ---------
+;
+;   * THE COLD RESET SEQUENCE HAS NEVER TRAINED A LINK. STATUS read
+;     $000000B0 BEFORE PcieInit as well as after, because the firmware
+;     had already trained it on a USB-booting board. So the register map
+;     and config-space access are proven and THE RESET PATH IS NOT.
+;     Settling it needs a boot where the firmware has not already done
+;     the work - an SD-card or network boot - which this bench has not
+;     run.
+;   * THE VL805 FIRMWARE RESET PATH is written and has never executed,
+;     for the same reason: the device was already out of reset. The
+;     mailbox tag it needs, RPI_FIRMWARE_NOTIFY_XHCI_RESET = $00030058,
+;     IS on disk - it arrived in the firmware header downloaded for the
+;     framebuffer tags, and mailbox.pi4 recorded it as "not on disk"
+;     for a while afterwards because nobody re-checked once the file
+;     landed. That note has since been removed. WORTH REMEMBERING AS A
+;     SHAPE: a gap can close without the note about the gap changing,
+;     which is the same defect class as this status block was.
+;   * PcieDmaOk()'s $C0000000 BOUND IS THE PCIe INBOUND WINDOW AND
+;     NOTHING ELSE. It is right for this controller and it is NOT a
+;     general "safe for DMA" test on this part: the legacy DMA engines
+;     are thirty-bit and stop at $40000000, three quarters tighter
+;     (bcm2711.dtsi:45, `dma-ranges = <0xc0000000 0x0 0x0 0x40000000>`).
+;     A buffer this predicate waves through can still be invisible to
+;     the 2D blitter. Measured on silicon 2026-08-26; see the vault note
+;     "DMA 2D blitter and the V3D linear question 2026-08-26".
+;
+; ---- SUPERSEDED, kept rather than deleted ---------------------------
+;
+;   ~~STATUS - 2026-08-24: NOTHING IN THIS FILE HAS TOUCHED SILICON.~~
+;
+; True when written and false about thirty hours later, and it stayed in
+; the file for three days while the board booted through this code
+; several hundred times. The same header also declared the VL805
+; milestone unreachable - "NOT ONE SINGLE REGISTER OF THE BLOCK AT
+; $FD500000 ANYWHERE ON THIS DISK" - and that half was a CORRECT refusal
+; to invent reset sequencing, link training and the config index/data
+; pair. It was closed not by difficulty but by fetching U-Boot's
+; version-matched sources. Both halves are worth remembering: refusing
+; to guess was right, and the status line that shipped beside it went
+; stale with nothing in the tree able to notice.
+;
+; WHAT WAS DONE BEFORE ANY OF IT RAN, so the next reader can weigh it:
+;
+;   BUILT     from a scratch test main, clean, with the current
+;             pmfc.exe:
+;               pmfc.exe <test>.pi4 -t pi4 --load-addr 0x200000
+;                        -o test.img -s      ->  pmfc: OK
+;             20 BSS slots, every one .space 8, none .space 4.
+;   REFUSED   by the PREVIOUS pmfc.exe, at semantic analysis, quoted
+;             above. Both results are correct and both were wanted.
+;   READ      the emitted assembly. $6_0000_0000 materialises as
+;             `movz x11, #0` + `movk x11, #6, lsl #32` at all eleven
+;             sites; $FD500000 as `movk x11, #64848, lsl #16`;
+;             $C0000000 as `movk x11, #49152, lsl #16`, positive in an
+;             X register; `(a >> 32)` as `asr x13, x12, x11` with 32 in
+;             x11; and the two `mrs` blocks are present.
+;
+; THE TEST MAIN IS NOT IN THE REPO. It was scratch, it printed the map
+; and the self-check over the PL011, and it is not a deliverable -
+; anything permanent should live under RaspberryPi4/Examples/ and be
+; asked for, not a file that appeared unasked.
+;
+; THIS FILE REQUIRES THE 64-BIT BACKEND and will not build without it -
+; by design, per the refusal above. pmfc.exe carried the 64-bit build
+; from 20:58 on 2026-08-24. It was NOT rebuilt by this work; another
+; worker landed it, and the before/after measurements above happened to
+; straddle that moment.
+;
+; ~~Specifically NOT verified: that $FD500000 answers a read at all,~~
+; ~~that the outbound window answers before the link is trained (it~~
+; ~~almost certainly does not - expect all-ones or an abort), and every~~
+; ~~number in the address map as seen by the actual bus rather than by~~
+; ~~the device tree.~~
+;
+; ALL THREE OF THOSE WERE SETTLED ON 2026-08-25 and the answers are at
+; the top of this block. $FD500000 answers. The address map matches
+; U-Boot's own constants. And the middle one turned out to be the wrong
+; question on this bench, because the firmware trains the link before
+; our first instruction executes - which is exactly why the cold path
+; is still the one thing here that has never run.
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+; The root complex register block. bcm2711.dtsi line 555 gives
+; reg = <0x0 0x7d500000 0x9310>, translated to the ARM view through the
+; soc ranges at lines 41-43. See THE ADDRESS MAP in the header.
+;
+; THE SIZE IS LOAD-BEARING, not documentation. It is the only bound this
+; file has on an undocumented block, and PcieRcPeek() enforces it.
+; ----------------------------------------------------------------------
+#PCIE_RC_BASE = $FD500000
+#PCIE_RC_SIZE = $9310
+
+; ----------------------------------------------------------------------
+; The outbound window, both ends of it. bcm2711.dtsi line 575.
+;
+; CPU side and PCI-BUS side are DIFFERENT ADDRESSES. Read the header if
+; that sentence looks like pedantry; it is the mistake this file most
+; expects the next person to make.
+; ----------------------------------------------------------------------
+#PCIE_OUT_CPU  = $600000000     ; CPU sees the window here - above 4 GB
+#PCIE_OUT_SIZE = $04000000      ; 64 MiB
+#PCIE_OUT_BUS  = $F8000000      ; the same window's address ON the bus
+
+; ----------------------------------------------------------------------
+; Inbound DMA. bcm2711.dtsi lines 577-583 - identity-mapped, capped at
+; 3 GiB, and the cap is a documented WRAPPER BUG, not a design choice.
+; Anything at or above this that is handed to the controller is
+; unreachable BY THE CONTROLLER while looking perfectly fine to the CPU.
+; ----------------------------------------------------------------------
+#PCIE_DMA_LIMIT = $C0000000
+
+; ----------------------------------------------------------------------
+; THE INBOUND WINDOW THIS FILE PROGRAMS, and what it covers (forum 916).
+;
+; PcieResetAndTrain writes RC_BAR2 and the SCB0 size from
+; #PCIE_INBOUND_SIZE_CODE, identity mapped (offset 0). The code is
+; log2(size) - 15, so 17 is a 4 GiB window: U-Boot's brcm_pcie_probe()
+; (v2025.01_pcie_brcmstb.c:393-409) rounds the 3 GiB dma-ranges region up
+; to the next power of two the same way. #PCIE_INBOUND_BYTES MUST be
+; 1 << (#PCIE_INBOUND_SIZE_CODE + 15) - a constant initialiser here takes
+; no arithmetic, so tools/usb_dma_window_emitted_check.py checks it, and it
+; also runs the programming against PcieDmaOk.
+;
+; UNTIL 2026-09-17 THE CODE WAS 15 - A 1 GiB WINDOW - while PcieDmaOk
+; answered from the 3 GiB erratum alone. Every DMA buffer anything had used
+; lay under 150 MB, so nothing noticed. Build 173 sent USB transfers
+; straight into memory at $40000000 and $60000000: PcieDmaOk said yes, the
+; buffers were outside the window, the controller's reads never reached
+; memory while every transfer completed with good status, and a write out
+; of that memory hung the stick. PcieDmaOk now answers from the smaller of
+; the two limits, so the check and the window cannot disagree again.
+; PcieResetAndTrain also READS BOTH REGISTERS BACK now, the way the
+; outbound window has always been read back, so a window that does not
+; take the size it was given is a loud failure instead of a silent one.
+;
+; WHAT THE DRIVERS ACTUALLY DO, AND WHAT THIS ONE NOW DOES TOO. Linux and
+; U-Boot size this window from the memory controller: the code is
+; ilog2(memc_size) - 15, so a 1 GB board gets 15, a 2 GB board 16, and a
+; 4 or 8 GB board 17. This file used to say that Anvil could not do the
+; same because it did not know how much DRAM was fitted, and that the day
+; it learned its own memory size was the day this line should start
+; deriving the code from it. THAT DAY WAS 2026-09-17. The monitor now
+; asks its board (HwMemoryBytes, Anvil/Hal/hal.pbi), the board is TOLD
+; the answer through PcieSetMemoryBytes below, and PcieInboundSizeCode()
+; returns the smallest code whose window covers the memory:
+;
+;     256 MB -> 13    512 MB -> 14    1 GB -> 15
+;     2 GB   -> 16    4 GB   -> 17    8 GB -> 17
+;
+; EIGHT GIGABYTES IS 17 AND NOT 18, and that is a cap rather than an
+; approximation. An 18 would be a 8 GiB window, and not one byte of the
+; second four gigabytes is reachable anyway: the wrapper erratum stops
+; inbound DMA dead at 3 GiB (#PCIE_DMA_LIMIT), so every code above 17
+; describes address space no transfer can use. Linux and U-Boot land on
+; 17 for an 8 GB board for the same reason.
+;
+; WHY THE DRIVER IS TOLD AND DOES NOT ASK. This is a library and the
+; memory size is a board fact; RaspberryPi4/Lib is not allowed to call
+; into RaspberryPi4/Board, and the include order settles it anyway -
+; this file is compiled long before hal.pi4 and the board's memory
+; backend. It is the shape PcieSetPhaseHook already uses a few hundred
+; lines down. THE DEFAULT IS THE OLD BEHAVIOUR: a build that never calls
+; the setter - every diagnostic in RaspberryPi4/Examples that includes
+; this library on its own - gets #PCIE_INBOUND_SIZE_CODE exactly as
+; before, and nothing about those probes changes.
+;
+; #PCIE_INBOUND_SIZE_CODE IS NOW TWO THINGS AT ONCE, and they are the
+; same number for a stated reason rather than by coincidence. It is the
+; CAP, because of the erratum above; and it is the FALLBACK used when
+; nobody has said how much memory there is, because not knowing where
+; memory ends is a reason to program the largest window the part can
+; use, never a smaller one. A window LARGER than the memory behind it
+; costs nothing - addresses past the end of DRAM are unreachable from
+; either side and PcieDmaOk refuses them - while a window SMALLER than
+; the memory in use is exactly what forum 916 was.
+; ----------------------------------------------------------------------
+#PCIE_INBOUND_SIZE_CODE = 17
+
+; ----------------------------------------------------------------------
+; THE LINK, AND ITS CLOCK. U-Boot v2025.01 pcie_brcmstb.c: the defines at
+; 28-50, brcm_pcie_mdio_* at 188-249, brcm_pcie_set_ssc() at 257-287, and
+; the link report at 476-489. Linux rpi-6.12.y pcie-brcmstb.c does the same
+; (brcm_pcie_set_ssc 572-605, called at 1816-1829) and gives the offsets at
+; 39 and 58-60. bcm2711.dtsi:584 asks for SSC on this controller
+; (`brcm,enable-ssc`). Both drivers turn it on right after link-up and
+; print the trained speed and width. Until 2026-09-17 Anvil did neither.
+; ----------------------------------------------------------------------
+#PCIE_RC_DL_MDIO_ADDR    = $1100
+#PCIE_RC_DL_MDIO_WR_DATA = $1104
+#PCIE_RC_DL_MDIO_RD_DATA = $1108
+#PCIE_MDIO_DATA_DONE     = $80000000
+#PCIE_MDIO_DATA_MASK     = $7FFFFFFF
+#PCIE_MDIO_CMD_READ      = 1
+#PCIE_MDIO_CMD_WRITE     = 0
+#PCIE_MDIO_SET_ADDR      = $1F
+#PCIE_SSC_REGS_ADDR      = $1100
+#PCIE_SSC_CNTL           = $02
+#PCIE_SSC_CNTL_OVRD      = $C000      ; OVRD_EN | OVRD_VAL
+#PCIE_SSC_STATUS         = $01
+#PCIE_SSC_STATUS_SSC     = $0400
+#PCIE_SSC_STATUS_PLL     = $0800
+#PCIE_CAP_LNKSTA_WORD    = $BC        ; BRCM_PCIE_CAP_REGS $AC + LNKSTA $12, top half
+#PCIE_CAP_LNKCAP_WORD    = $B8        ; the same block + LNKCAP $0C, a whole word
+#PCIE_INBOUND_BYTES     = $100000000
+
+; The architected capability block sits at $AC (BRCM_PCIE_CAP_REGS, Linux
+; rpi-6.12.y pcie-brcmstb.c:38-39), so LNKCAP $0C lands on $B8 and the
+; halfword pair LNKCTL $10 / LNKSTA $12 lands on $BC - one aligned word
+; carrying BOTH, LNKCTL in bits 15:0 and LNKSTA in bits 31:16. That is why
+; #PCIE_CAP_LNKSTA_WORD reads what it reads: the shifts below take the top
+; half. Reading the pair as one word is not a trick, it is the only aligned
+; way to reach a halfword register through a 32-bit accessor.
+#PCIE_LNKCTL_ASPM_MASK   = $0003      ; LNKCTL 1:0  ASPM control, 0 = disabled
+#PCIE_LNKCTL_COMMON_CLK  = $0040      ; LNKCTL 6    common clock configuration
+#PCIE_LNKCTL_RETRAIN     = $0020      ; LNKCTL 5    retrain link (write-only)
+#PCIE_LNKSTA_TRAINING    = $0800      ; LNKSTA 11   link training in progress
+
+; ----------------------------------------------------------------------
+; PCI configuration header offsets. ARCHITECTURAL - PCI/PCIe base
+; specification, every device, every vendor. Not Broadcom's, so not
+; subject to the missing-manual problem that stops everything else here.
+;
+; These are OFFSETS INTO CONFIG SPACE. They are useless until somebody
+; finds the index/data pair that reaches config space at all (item 6 in
+; the header's shopping list). They are written down now so that the
+; hour that mechanism is found, the read is one line away.
+; ----------------------------------------------------------------------
+#PCI_CFG_VENDOR_ID   = $00      ; 16 bits
+#PCI_CFG_DEVICE_ID   = $02      ; 16 bits - and $00 as a 32-bit read
+                                ; gives (device << 16) | vendor
+#PCI_CFG_COMMAND     = $04
+#PCI_CFG_STATUS      = $06
+#PCI_CFG_REVISION    = $08
+#PCI_CFG_CLASS_CODE  = $09      ; 24 bits: prog-if, subclass, class
+#PCI_CFG_HEADER_TYPE = $0E
+#PCI_CFG_BAR0        = $10
+#PCI_CFG_BAR1        = $14
+#PCI_CFG_BAR2        = $18
+#PCI_CFG_BAR3        = $1C
+#PCI_CFG_BAR4        = $20
+#PCI_CFG_BAR5        = $24
+
+; COMMAND register bits - architectural, same source.
+#PCI_CMD_IO_SPACE     = $0001
+#PCI_CMD_MEM_SPACE    = $0002
+#PCI_CMD_BUS_MASTER   = $0004
+
+; BAR decoding - architectural. Bit 0 selects the space; for a memory
+; BAR, bits 2:1 give the type and 64-bit BARs occupy TWO slots.
+#PCI_BAR_SPACE_IO     = $0001   ; bit 0 set = I/O, clear = memory
+#PCI_BAR_TYPE_MASK    = $0006   ; bits 2:1
+#PCI_BAR_TYPE_64      = $0004   ; bits 2:1 = 10b - a 64-bit memory BAR
+#PCI_BAR_MEM_MASK     = $FFFFFFF0
+#PCI_BAR_IO_MASK      = $FFFFFFFC
+
+; ----------------------------------------------------------------------
+; THE VL805's EXPECTED ID - AND ITS PROVENANCE IS WEAK. READ THIS.
+;
+; The value below is (device << 16) | vendor as a 32-bit read of config
+; offset $00: VIA Labs Inc. vendor $1106, device $3483.
+;
+; THIS IS NOT CITABLE FROM ANYTHING ON THIS DISK. It is not in the
+; peripherals PDF, not in the datasheet PDF, and not in any device tree
+; here - `bcm2711-rpi-4-b.dts` calls the node `usb@0,0` and gives it
+; `reg = <0 0 0 0 0>`, which encodes bus 0 / device 0 / function 0 and
+; NO vendor or device ID at all. It is recalled knowledge, written down
+; because the milestone needs something to compare against and an
+; unverifiable expectation that is LABELLED is more useful than none.
+;
+; Treat a match as encouraging and a mismatch as INFORMATION, not as a
+; failure - print whatever was actually read, always. Nothing in this
+; file compares against this constant; that is deliberate.
+; ----------------------------------------------------------------------
+#PCIE_VL805_ID_EXPECTED = $34831106
+
+; ----------------------------------------------------------------------
+; Return codes. Distinct negatives, because "it returned -1" sends you
+; to look at the bus when the answer was "your offset was odd".
+;
+; NOT zero and not -1 for everything: a config read can legitimately
+; return $FFFFFFFF (that IS the "nobody home" answer on PCI), so a
+; refusal has to be distinguishable from a successful read of all-ones.
+; ----------------------------------------------------------------------
+#PCIE_ERR_RANGE   = -1          ; offset outside the block/window
+#PCIE_ERR_ALIGN   = -2          ; offset not 4-byte aligned
+#PCIE_ERR_NARROW  = -3          ; the compiler truncated the address -
+                                ; see PcieAddrIsWide(). THE BAD ONE.
+
+; ======================================================================
+;  THE CANARY
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; PcieAddrIsWide - did a 64-bit address survive the compiler?
+;
+; CALL THIS FIRST. Returns 1 if #PCIE_OUT_CPU is intact at run time, 0 if
+; it was truncated.
+;
+; WHY A RUNTIME CHECK FOR A COMPILE-TIME PROPERTY. Because the
+; compile-time check is the thing that is missing. Built with a 32-bit
+; pmfc, `$600000000` becomes `movz w11, #0` with no diagnostic - the
+; build says "pmfc: OK" - and $6_0000_0000 truncated to 32 bits is not a
+; wrong-but-harmless address, it is EXACTLY ZERO. A read there hits the
+; firmware spin table; a write there hits the release mailboxes of three
+; cores that are still spinning in it.
+;
+; The three tests are not redundant. The first catches total truncation
+; (today's actual failure), the second catches a hypothetical 32-bit
+; carry into the high word, the third catches anything else at all.
+;
+; This procedure does not touch hardware and is safe to call anywhere.
+; ----------------------------------------------------------------------
+Procedure.i PcieAddrIsWide()
+  Protected a.i
+  a = #PCIE_OUT_CPU
+  If a = 0
+    ProcedureReturn 0
+  EndIf
+  ; ">>" is arithmetic on a signed .i. `a` is provably positive here -
+  ; it is at most 35 bits - so this is a logical shift in effect.
+  If (a >> 32) <> 6
+    ProcedureReturn 0
+  EndIf
+  If a <> #PCIE_OUT_CPU
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE MAP, as procedures
+; ======================================================================
+; These exist as procedures rather than only as constants so a caller
+; can print the map it is actually running with, and so a test can
+; compare the two. A constant that is wrong is invisible; a constant
+; that is printed is not.
+
+Procedure.i PcieRcBase()
+  ProcedureReturn #PCIE_RC_BASE
+EndProcedure
+
+Procedure.i PcieRcSize()
+  ProcedureReturn #PCIE_RC_SIZE
+EndProcedure
+
+Procedure.i PcieOutCpu()
+  ProcedureReturn #PCIE_OUT_CPU
+EndProcedure
+
+Procedure.i PcieOutBus()
+  ProcedureReturn #PCIE_OUT_BUS
+EndProcedure
+
+Procedure.i PcieOutSize()
+  ProcedureReturn #PCIE_OUT_SIZE
+EndProcedure
+
+Procedure.i PcieDmaLimit()
+  ProcedureReturn #PCIE_DMA_LIMIT
+EndProcedure
+
+; ======================================================================
+;  HOW MUCH MEMORY IS BEHIND THE WINDOW
+; ======================================================================
+; 0 means NOBODY HAS SAID, which is the state every build that does not
+; call the setter stays in - see THE INBOUND WINDOW THIS FILE PROGRAMS.
+; A board that asked and could not find out passes -1 through from
+; HwMemoryBytes() and lands in the same arm, deliberately: "never asked"
+; and "asked and was not told" are the same thing to this driver, which
+; can only act on a number it has.
+;
+; It is BYTES, matching the seam it comes from, because the one thing
+; this driver does with it is compare it against addresses.
+Global pcie_memBytes.i
+
+; ----------------------------------------------------------------------
+; PcieSetMemoryBytes - the board tells this driver how much DRAM there is.
+;
+; CALL IT BEFORE PcieInit(). Afterwards it is too late to matter: the
+; window is programmed inside PcieResetAndTrain and the size code is
+; read out of this value at that moment. Calling it later changes what
+; PcieDmaOk answers without changing the window, which is precisely the
+; disagreement forum 916 was, so a caller that arrives late makes things
+; worse rather than better.
+; ----------------------------------------------------------------------
+Procedure PcieSetMemoryBytes(bytes.i)
+  pcie_memBytes = bytes
+EndProcedure
+
+Procedure.i PcieMemoryBytes()
+  ProcedureReturn pcie_memBytes
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieInboundSizeCode - the size code this driver will program, or has.
+;
+; The smallest code whose window covers the memory, capped at
+; #PCIE_INBOUND_SIZE_CODE and falling back to it when nobody has said.
+; log2(size) - 15, by search rather than by a table: the search is four
+; comparisons and it cannot go stale when a board ships a size nobody
+; here has seen, which is the same reasoning the memory-size decode in
+; RaspberryPi4/Board/hw_mem.pi4 carries.
+;
+; THE SHIFT IS BUILT UP RATHER THAN WRITTEN AS A CONSTANT because a
+; constant initialiser in this compiler takes no arithmetic - the note
+; on #PCIE_INBOUND_BYTES says the same thing about the same expression.
+;
+; IT IS A PROCEDURE AND NOT A GLOBAL SET ONCE, so that the value the
+; programming writes, the value the readback compares against and the
+; value PcieDmaOk answers from are one expression evaluated three times
+; rather than three copies of a number that can drift apart. That drift
+; IS forum 916.
+; ----------------------------------------------------------------------
+Procedure.i PcieInboundSizeCode()
+  Define code.i
+  If pcie_memBytes <= 0
+    ProcedureReturn #PCIE_INBOUND_SIZE_CODE
+  EndIf
+  code = 0
+  While code < #PCIE_INBOUND_SIZE_CODE And (1 << (code + 15)) < pcie_memBytes
+    code = code + 1
+  Wend
+  ProcedureReturn code
+EndProcedure
+
+Procedure.i PcieInboundBytes()
+  ProcedureReturn 1 << (PcieInboundSizeCode() + 15)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieDmaTop - the first address the controller cannot reach.
+;
+; THE SMALLEST OF THREE, and each of them has put a board wrong on its
+; own:
+;
+;   the wrapper erratum   #PCIE_DMA_LIMIT, 3 GiB, a documented bug
+;   the inbound window    what this driver actually programmed - forum
+;                         916, where a check that ignored it approved
+;                         buffers the controller never reached
+;   the memory fitted     added 2026-09-17. A 1 GB board's window is
+;                         1 GiB and its memory is 1 GiB, so this changes
+;                         nothing there; it is the board with a window
+;                         rounded UP past its memory - and the fallback
+;                         window on a board that could not say - where
+;                         the third limit is the only one left standing.
+;                         An address past the end of DRAM is not reachable
+;                         by the controller whatever the window says.
+; ----------------------------------------------------------------------
+Procedure.i PcieDmaTop()
+  Define limit.i
+  limit = #PCIE_DMA_LIMIT
+  If PcieInboundBytes() < limit
+    limit = PcieInboundBytes()
+  EndIf
+  If pcie_memBytes > 0 And pcie_memBytes < limit
+    limit = pcie_memBytes
+  EndIf
+  ProcedureReturn limit
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieCpuFromBus - turn a PCI bus address into one this CPU can load.
+;
+; THIS IS THE CONVERSION A BAR NEEDS. A BAR programmed into the VL805
+; holds a PCI bus address in $F8000000..$FBFFFFFF; the CPU reaches the
+; same location at $6_0000_0000 + (bus - $F8000000).
+;
+; Returns #PCIE_ERR_RANGE if the bus address is outside the window this
+; root complex actually maps. It REFUSES rather than returning a
+; plausible number, because the plausible number - the bus address used
+; directly - lands at $F8000000 on the ARM side, which is inside the
+; peripheral aperture. That is a real, powered, completely unrelated
+; device, and this project has a case from today of exactly that
+; producing no output and no error.
+; ----------------------------------------------------------------------
+Procedure.i PcieCpuFromBus(busAddr.i)
+  If busAddr < #PCIE_OUT_BUS
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  If busAddr >= (#PCIE_OUT_BUS + #PCIE_OUT_SIZE)
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  ProcedureReturn #PCIE_OUT_CPU + (busAddr - #PCIE_OUT_BUS)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieBusFromCpu - the inverse. Given a CPU address inside the outbound
+; window, what does the device see? Needed when telling a device where
+; something is. Refuses anything outside the window.
+; ----------------------------------------------------------------------
+Procedure.i PcieBusFromCpu(cpuAddr.i)
+  If cpuAddr < #PCIE_OUT_CPU
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  If cpuAddr >= (#PCIE_OUT_CPU + #PCIE_OUT_SIZE)
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  ProcedureReturn #PCIE_OUT_BUS + (cpuAddr - #PCIE_OUT_CPU)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieDmaOk - may the CONTROLLER read/write this buffer?
+;
+; THE ERRATUM, AS A CALLABLE PREDICATE. bcm2711.dtsi lines 577-583: the
+; PCIe wrapper "has a bug preventing it from accessing beyond the first
+; 3GB of memory", and dma-ranges caps inbound at $C0000000.
+;
+; Returns 1 if the WHOLE buffer is below the cap, 0 otherwise. The whole
+; buffer, not its base - a ring that starts at $BFFFF000 and runs 8 KiB
+; is half unreachable, and the half that works is the half that makes it
+; look like it is working.
+;
+; Call this before handing ANY address to the controller: the DCBAA, the
+; command ring, every transfer ring, every event ring, every data
+; buffer. A CPU-side test cannot detect the failure this prevents,
+; because from the CPU the memory is completely fine.
+;
+; len <= 0 is refused rather than waved through. A zero-length DMA
+; buffer is a caller bug, and returning 1 for it would mean "yes, that
+; is fine" about something that is not.
+; ----------------------------------------------------------------------
+Procedure.i PcieDmaOk(addr.i, len.i)
+  Define limit.i
+  If len <= 0
+    ProcedureReturn 0
+  EndIf
+  If addr < 0
+    ProcedureReturn 0
+  EndIf
+  ; THE SMALLEST OF THE ERRATUM, THE WINDOW ACTUALLY PROGRAMMED AND THE
+  ; MEMORY ACTUALLY FITTED. See PcieDmaTop: a check that answers from one
+  ; of them approves a buffer another one drops (forum 916).
+  limit = PcieDmaTop()
+  If addr >= limit
+    ProcedureReturn 0
+  EndIf
+  If (addr + len) > limit
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE BENCH INSTRUMENT
+; ======================================================================
+; Read-only, bounded, and deliberately dumb. This is the tool for
+; producing the citations the header says are missing - dump the block,
+; power-cycle, dump it again, and see what moves. That is how an
+; undocumented register map actually gets mapped, and it is a great deal
+; safer than writing to offsets on a hunch.
+;
+; NOTHING HERE WRITES. There is not one PokeL in this file. A write to a
+; guessed offset in an undocumented block is the single most expensive
+; mistake available on this hardware and it will not be made from here.
+
+; ----------------------------------------------------------------------
+; PcieRcPeek - read one 32-bit register from the root complex block.
+;
+; `off` is a byte offset from $FD500000 and is checked against the $9310
+; length the device tree gives. Returns the value, or one of the
+; #PCIE_ERR_* codes.
+;
+; PeekL, NOT Peek. Every register in this block is 32 bits wide, and a
+; bare Peek is EIGHT bytes on this target now.
+;
+; THE RETURNED VALUE IS ZERO-EXTENDED, AND THAT WAS CHECKED RATHER THAN
+; ASSUMED, because the answer decides whether the #PCIE_ERR_* codes are
+; safe. anvil.pi4's header says PeekL sign-extends and that "the
+; emitter appends sxtw". That is true, but only on ONE of three paths.
+; Compiled with the 64-bit pmfc.exe and read out of the assembly:
+;
+;   ProcedureReturn PeekL(a)     ldr w12, [x11] / mov x0, x12     ZERO
+;   v.i = PeekL(a)               ldr w12, [x11]                   ZERO
+;   v.l = PeekL(a)               ldr w12, [x11] / sxtw x12, w12   SIGN
+;
+; The sxtw comes from the assignment to a .l, not from PeekL. This
+; procedure returns the read DIRECTLY, so a register with bit 31 set
+; comes back as a positive value in 0..$FFFFFFFF, not as a negative.
+;
+; THAT IS WHY THE ERROR CODES ARE SMALL NEGATIVES AND IT IS NOT LUCK: no
+; 32-bit register value can ever be negative on this path, so a refusal
+; is unambiguously distinguishable from data - including from the
+; all-ones that PCI returns for "nobody home". Do not "tidy" this into a
+; .l local; that would sign-extend the value and put real register
+; readings into the same range as the refusals.
+;
+; THIS DOES NOT KNOW WHETHER THE BLOCK IS POWERED OR CLOCKED. If it is
+; not, this either returns rubbish or hangs the bus, and there is no
+; citable way from here to find out which. First call on a cold board is
+; a real experiment, not a formality - which is the honest reason it is
+; a bench instrument and not part of a bring-up sequence.
+;
+; PI 4 USB BOOT HANG, 2026-09-12: raw PCIe MMIO was one half of an
+; intermittently unordered handover to the VL805. The failing image could
+; reach the xHCI capability registers, then stalled on its first operational
+; status read after bus mastering. Keep device ordering in this owning
+; accessor; a delay, watchdog, call-site patch, or emitter peephole does not
+; repair the MMIO contract. The paired xHCI accessors carry the same rule.
+; ----------------------------------------------------------------------
+Procedure.i PcieRcPeek(off.i)
+  Define v.i
+  If off < 0
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  If (off & 3) <> 0
+    ProcedureReturn #PCIE_ERR_ALIGN
+  EndIf
+  If (off + 4) > #PCIE_RC_SIZE
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  v = PeekN(#PCIE_RC_BASE + off)
+  ; Linux readl() and U-Boot readl() both apply the Arm I/O read barrier.
+  ; Raw PeekN alone does not. Complete this device read before any code
+  ; acts on the value it returned.
+  a64_barrier()
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieWinPeek - read one 32-bit word through the outbound window.
+;
+; `off` is a byte offset from CPU $6_0000_0000, bounded by the 64 MiB
+; the window maps.
+;
+; THIS IS THE ONE THAT NEEDS THE CANARY, so it calls it. Built by a
+; 32-bit compiler the base address is zero and this would quietly read
+; the firmware spin table instead of the PCIe bus; #PCIE_ERR_NARROW is
+; returned instead, which is the loud error the project's philosophy
+; asks for in place of a silently wrong number.
+;
+; EXPECT THIS TO RETURN ALL-ONES OR TO ABORT until the link is trained
+; and the window is programmed - neither of which this file can do. A
+; successful read here is not proof of anything on its own; a read of
+; $FFFFFFFF is the normal "no device / no link" answer on PCI and should
+; be read that way rather than as a fault.
+; ----------------------------------------------------------------------
+Procedure.i PcieWinPeek(off.i)
+  If PcieAddrIsWide() = 0
+    ProcedureReturn #PCIE_ERR_NARROW
+  EndIf
+  If off < 0
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  If (off & 3) <> 0
+    ProcedureReturn #PCIE_ERR_ALIGN
+  EndIf
+  If (off + 4) > #PCIE_OUT_SIZE
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  ProcedureReturn PeekN(#PCIE_OUT_CPU + off)
+EndProcedure
+
+; ======================================================================
+;  BOUNDED WAITING
+; ======================================================================
+; Every wait is bounded by a timeout - project rule, and the right one:
+; a link that never trains must be REPORTED, not spun on.
+;
+; THERE IS NOTHING TO WAIT FOR YET. Link training needs a link-status
+; bit and that offset is item 3 on the missing list, so the wait itself
+; cannot be written. What CAN be written now is the CLOCK it will be
+; bounded by, and it is here so that the eventual wait has no excuse to
+; be a bare spin count.
+;
+; RaspberryPi4/Lib/timer.pi4 has landed alongside this file and offers
+; the same two readings (mailbox.pi4 has its own MbxTicks() too). A library includes no library
+; here, so these two tiny readers are duplicated on purpose rather than
+; creating a dependency. If timer.pi4 lands with an equivalent, a MAIN
+; file may use either; they read the same two registers.
+
+; ----------------------------------------------------------------------
+; pcie_Ticks - the ARM architectural counter, all 64 bits of it.
+;
+; CNTPCT_EL0 is readable at EL2 with no trap and no setup, which makes
+; it the cheapest honest clock available to a program a loader started.
+; A spin count would have to be calibrated against a CPU frequency the
+; firmware is free to change underneath us.
+;
+; INLINE ASM, AND THIS IS THE "GENUINELY IMPOSSIBLE" CASE the libraries-
+; never-intrinsics rule allows for: `mrs` reads a system register and
+; the language has no equivalent for it. It is two instructions, it is
+; the same pair anvil.pi4 uses, and there is no other way to ask
+; the question.
+; ----------------------------------------------------------------------
+Procedure.i pcie_Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+; pcie_TickHz - the counter's frequency, from CNTFRQ_EL0.
+;
+; CNTFRQ_EL0 is whatever firmware wrote there, so it can be zero or
+; nonsense on a board whose firmware never set it. Callers must sanity-
+; check it; PcieTimeoutTicks() below does.
+; ----------------------------------------------------------------------
+Procedure.i pcie_TickHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieTimeoutTicks - how many ticks is `ms` milliseconds?
+;
+; Falls back to 54000000 if CNTFRQ_EL0 is implausible. That is the
+; BCM2711's counter frequency as recorded in anvil.pi4, which uses
+; the identical fallback for the identical reason - and note that even
+; there it is listed under STILL UNTESTED: "the architectural counter's
+; real frequency". So this is a documented assumption, not a measured
+; fact, and a timeout built on it may be out by whatever that is out by.
+; Being out by a factor is survivable for a timeout; being unbounded is
+; not, which is why the fallback exists rather than a refusal.
+;
+; Refuses ms <= 0 by returning 0, so a caller that passes garbage gets a
+; timeout that fires immediately rather than one that never fires.
+; ----------------------------------------------------------------------
+Procedure.i PcieTimeoutTicks(ms.i)
+  Protected hz.i
+  If ms <= 0
+    ProcedureReturn 0
+  EndIf
+  hz = pcie_TickHz()
+  If hz <= 0 Or hz > 1000000000
+    hz = 54000000
+  EndIf
+  ProcedureReturn (hz / 1000) * ms
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PcieElapsed - ticks since `start`. Wraps correctly for any interval
+; short enough to matter: CNTPCT_EL0 is 64 bits and at 54 MHz it takes
+; over ten thousand years to wrap, so the subtraction is honest.
+; ----------------------------------------------------------------------
+Procedure.i PcieElapsed(start.i)
+  ProcedureReturn pcie_Ticks() - start
+EndProcedure
+
+; ======================================================================
+;  SELF-CHECK
+; ======================================================================
+
+; ----------------------------------------------------------------------
+; PcieSelfCheck - does this file's arithmetic agree with itself?
+;
+; Returns 1 if every internal relationship holds, 0 otherwise. Touches
+; no hardware; safe anywhere, including before the canary passes.
+;
+; WHY THIS IS NOT CEREMONY. The window conversions are the part of this
+; file most likely to be edited by somebody adjusting a constant, and an
+; off-by-one there produces an address that is wrong by a little - which
+; is far worse than one wrong by a lot, because it still lands somewhere
+; and still returns a number.
+; ----------------------------------------------------------------------
+Procedure.i PcieSelfCheck()
+  ; The window round-trips, at both ends and one past the top.
+  If PcieCpuFromBus(#PCIE_OUT_BUS) <> #PCIE_OUT_CPU
+    ProcedureReturn 0
+  EndIf
+  If PcieBusFromCpu(#PCIE_OUT_CPU) <> #PCIE_OUT_BUS
+    ProcedureReturn 0
+  EndIf
+  If PcieCpuFromBus(#PCIE_OUT_BUS + #PCIE_OUT_SIZE - 4) <> (#PCIE_OUT_CPU + #PCIE_OUT_SIZE - 4)
+    ProcedureReturn 0
+  EndIf
+  If PcieCpuFromBus(#PCIE_OUT_BUS + #PCIE_OUT_SIZE) <> #PCIE_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  If PcieCpuFromBus(#PCIE_OUT_BUS - 4) <> #PCIE_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+
+  ; The DMA predicate, on both sides of the cap. IT ASKS PcieDmaTop AND
+  ; NOT #PCIE_DMA_LIMIT: the cap is the smallest of the erratum, the
+  ; window and the memory fitted, so on a 1 GB board it is a gigabyte
+  ; and a self-check written against the 3 GiB erratum alone would fail
+  ; on a board that is behaving perfectly.
+  If PcieDmaOk(PcieDmaTop() - 4096, 4096) <> 1
+    ProcedureReturn 0
+  EndIf
+  If PcieDmaOk(PcieDmaTop() - 2048, 4096) <> 0    ; straddles the cap
+    ProcedureReturn 0
+  EndIf
+  If PcieDmaOk(PcieDmaTop(), 4) <> 0
+    ProcedureReturn 0
+  EndIf
+  If PcieDmaOk($40000000, 0) <> 0
+    ProcedureReturn 0
+  EndIf
+
+  ; The bounds on the two readers. Offsets, not hardware - these do not
+  ; reach the bus, they are refused before they get there.
+  If PcieRcPeek(-4) <> #PCIE_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  If PcieRcPeek(2) <> #PCIE_ERR_ALIGN
+    ProcedureReturn 0
+  EndIf
+  If PcieRcPeek(#PCIE_RC_SIZE) <> #PCIE_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  BRING-UP - added 2026-08-25, and the reason it could not exist before
+; ======================================================================
+;  Everything above this line is READ-ONLY on purpose. The header says,
+;  in as many words, that there is NOT ONE SINGLE REGISTER OF THE BLOCK
+;  AT $FD500000 ANYWHERE ON THIS DISK, and that reset sequencing, link
+;  training, the window descriptors and the config-space index/data pair
+;  would all have to be invented. So they were not written.
+;
+;  THAT SENTENCE IS NOW FALSE, and this is the correction. U-Boot does
+;  all of this and its sources say how. They are on disk now, and
+;  VERSION-MATCHED to the build actually running on this board - the
+;  console reports U-Boot 2025.01-3+deb13u1, and master's PCIe driver
+;  DIFFERS from 2025.01, which was checked rather than assumed:
+;
+;    Datasheets/pi4/uboot/bcm2711_acpi.h            61 register defines
+;    Datasheets/pi4/uboot/v2025.01_pcie_brcmstb.c   brcm_pcie_probe()
+;
+;  EVERY REGISTER BELOW IS CITED to that header by name. None is
+;  inferred and none is guessed.
+;
+;  CORROBORATION, worth recording. The three addresses this file had
+;  already derived from the DEVICE TREE alone - the block at $FD500000,
+;  the CPU window at $6_0000_0000, the bus window at $F8000000 - appear
+;  in that header as PCIE_REG_BASE, PCIE_CPU_MMIO_WINDOW and
+;  PCIE_TOP_OF_MEM_WIN, to the digit. Two independent sources agreeing
+;  is a far better position than either alone, and it means the
+;  read-only half above was right all along.
+;
+;  DEPENDS ON timer.pi4 for delay(). Include it before this file.
+; ----------------------------------------------------------------------
+
+; ---- registers, every one from bcm2711_acpi.h ------------------------
+#PCIE_RGR1_SW_INIT_1              = $9210
+#PCIE_SW_INIT_1_INIT_MASK         = 2
+#PCIE_SW_INIT_1_PERST_MASK        = 1
+#PCIE_MISC_MISC_CTRL              = $4008
+#PCIE_MISC_CTRL_SCB_ACCESS_EN     = $1000
+#PCIE_MISC_CTRL_CFG_READ_UR_MODE  = $2000
+#PCIE_MISC_CTRL_RCB_64B_MODE      = $80
+#PCIE_MISC_CTRL_RCB_MPS_MODE      = $400
+#PCIE_MISC_CTRL_MAX_BURST_MASK    = $300000
+; SCB_MAX_BURST_SIZE IS A CHOICE, NOT A LEFTOVER, AND THE ENCODING IS NOT
+; THE SAME ON EVERY PART. On the generic Broadcom chips the two-bit field
+; reads 0 = 128 bytes, 1 = 256, 2 = 512, 3 = reserved; on the BCM7278 the
+; same field reads 0 = reserved, 1 = 128, 2 = 256, 3 = 512. Linux picks the
+; value per part (rpi-6.12.y pcie-brcmstb.c:1409-1421) and the BCM2711 gets
+; `burst = 0x0; /* 128 bytes */` at 1416; U-Boot spells the same number
+; MISC_CTRL_MAX_BURST_SIZE_128 and defines it as 0x0 (bcm2711_acpi.h:56),
+; setting it at v2025.01 pcie_brcmstb.c:385-390.
+;
+; So 128 bytes is right here and zero is how 128 is spelled - which is
+; exactly why it gets a NAME. This file used to clear the field and set
+; nothing, which produces the correct register on this board and leaves no
+; way for a reader to tell a decision from an omission. On a part where 0
+; means reserved the same code would be silently wrong.
+#PCIE_MISC_CTRL_MAX_BURST_128     = 0
+#PCIE_MISC_CTRL_SCB0_SIZE_MASK    = $F8000000
+#PCIE_MISC_RC_BAR1_CONFIG_LO      = $402C
+#PCIE_MISC_RC_BAR2_CONFIG_LO      = $4034
+#PCIE_MISC_RC_BAR2_CONFIG_HI      = $4038
+#PCIE_MISC_RC_BAR3_CONFIG_LO      = $403C
+#PCIE_RC_BAR_SIZE_MASK            = $1F
+#PCIE_MISC_PCIE_STATUS            = $4068
+#PCIE_STATUS_PHYLINKUP_MASK       = $10
+#PCIE_STATUS_DL_ACTIVE_MASK       = $20
+#PCIE_STATUS_PORT_RC_MASK          = $80
+#PCIE_MISC_HARD_PCIE_HARD_DEBUG   = $4204
+#PCIE_HARD_DEBUG_SERDES_IDDQ      = $08000000
+#PCIE_HARD_DEBUG_CLKREQ_MASK       = $310002
+#PCIE_HARD_DEBUG_REFCLK_OVRD_ENABLE = $10000
+#PCIE_HARD_DEBUG_REFCLK_OVRD_OUT   = $100000
+#PCIE_HARD_DEBUG_CLKREQ_SAFE       = $110000
+#PCIE_MSI_INTR2_CLR               = $4508
+#PCIE_MSI_INTR2_MASK_SET          = $4510
+#PCIE_MISC_WIN0_LO                = $400C
+#PCIE_MISC_WIN0_HI                = $4010
+#PCIE_MISC_WIN0_BASE_LIMIT        = $4070
+#PCIE_MISC_WIN0_BASE_HI           = $4080
+#PCIE_MISC_WIN0_LIMIT_HI          = $4084
+#PCIE_RC_CFG_PRIV1_ID_VAL3        = $043C
+#PCIE_ID_VAL3_CLASS_CODE_MASK     = $FFFFFF
+#PCIE_CLASS_BRIDGE_PCI            = $060400
+#PCIE_RC_CFG_VENDOR_REG1          = $0188
+#PCIE_VENDOR_REG1_ENDIAN_MASK     = $C
+#PCIE_RC_CFG_PRIV1_LINK_CAPABILITY = $04DC
+#PCIE_LINK_CAPABILITY_ASPM_SUPPORT_MASK = $0C00
+#PCIE_MISC_REVISION               = $406C
+; THE OTHER HALF OF THE "safe" CLKREQ POLICY. Linux writes L1SS_MODE = 2
+; into this field whenever it drives refclk and CLKREQ# unconditionally,
+; and it says why in the code: "Un-advertise L1ss as configuring an EP to
+; enter L1.x with CLKREQ# physically unconnected will result in a dead
+; link" (rpi-6.12.y pcie-brcmstb.c:1611-1616, and the same write in the
+; no-l1ss branch at 1584-1586). The field is bits 7:3, so the value 2
+; lands as $10.
+#PCIE_RC_CFG_PRIV1_ROOT_CAP       = $04F8
+#PCIE_ROOT_CAP_L1SS_MODE_MASK     = $F8
+#PCIE_ROOT_CAP_L1SS_UNADVERTISED  = $10
+
+; THE CONFIG-SPACE INDEX/DATA PAIR. These two numbers are the whole
+; reason this file was blocked: there is no ECAM aperture in the device
+; tree, so config space is unreachable without them, and they appear in
+; no Broadcom document. brcm_pcie_config_address() writes the index,
+; then accesses DATA + (offset & $FFF).
+#PCIE_EXT_CFG_INDEX               = $9000
+#PCIE_EXT_CFG_DATA                = $8000
+
+#PCIE_ERR_LINK      = -4        ; the link never came up
+#PCIE_ERR_EP_MODE   = -5        ; controller is in endpoint, not root
+#PCIE_ERR_CFG_BDF   = -6        ; bus/device/function or offset bad
+#PCIE_ERR_VL805_FIRMWARE = -15
+; Declared HERE and not with the enumeration codes below, because a
+; constant has to exist before the line that uses it and PcieInit is
+; above them. Putting it there parsed as 'Expected EndProcedure' on
+; the ProcedureReturn underneath the unknown name, which points at a
+; line that is perfectly fine.
+#PCIE_ERR_DMA_OFFSET = -10      ; the inbound DMA offset would not
+                                ; zero, so the endpoint cannot reach
+                                ; system memory at all
+#PCIE_ERR_INBOUND   = -16       ; the inbound window did not read back
+                                ; the size that was just written to it
+
+; The inbound size code lives beside #PCIE_DMA_LIMIT, as
+; #PCIE_INBOUND_SIZE_CODE, so that PcieDmaOk and the programming read the
+; same number. It was #PCIE_BAR2_SIZE_1G = 15 here until forum 916.
+
+Global pcie_up.i
+Global pcie_err.i
+Global pcie_linkSpeed.i = -1   ; LNKSTA Current Link Speed: 1 = 2.5, 2 = 5.0 GT/s
+Global pcie_linkWidth.i = -1   ; LNKSTA Negotiated Link Width
+Global pcie_sscOk.i     = -1   ; 1 spread-spectrum on and PLL locked, 0 not, -1 never tried
+
+; ----------------------------------------------------------------------
+;  THE RAW WORDS BEHIND THAT ONE-WORD ANSWER.
+;
+;  pcie_sscOk is a verdict, and a verdict is not evidence. "spread-spectrum
+;  clocking on" printed from a boolean cannot be told apart from the same
+;  words printed from a constant, and it does not say whether this driver
+;  turned SSC on or merely found it on. These two hold the PHY's own
+;  registers, kept at the moment they were read so that the readout shows
+;  what the silicon said rather than asking it again later:
+;
+;    pcie_sscCntlRaw   SSC_CNTL (block $1100 register $02) READ BACK AFTER
+;                      the override was written - so OVRD_EN bit 15 and
+;                      OVRD_VAL bit 14 standing in it are the proof the
+;                      write took, not the proof that it was attempted.
+;    pcie_sscStatusRaw SSC_STATUS (register $01) one millisecond later -
+;                      SSC bit 10 and PLL lock bit 11.
+;
+;  -1 means the MDIO bus never answered, which is a different fact from a
+;  register that answered zero, and the two must never print alike.
+; ----------------------------------------------------------------------
+Global pcie_sscCntlRaw.i   = -1
+Global pcie_sscStatusRaw.i = -1
+
+; ----------------------------------------------------------------------
+;  pcie_Poke / pcie_Modify - the write side, bounded like the read side.
+;
+;  The read accessors above refuse an out-of-range or unaligned offset
+;  rather than trusting the caller, and a WRITE has strictly more reason
+;  to: a stray poke into a controller block does not hand back a wrong
+;  number you might notice, it changes how the machine behaves some time
+;  later.
+; ----------------------------------------------------------------------
+Procedure pcie_Poke(off.i, v.i)
+  If off < 0 Or (off & 3) <> 0 Or (off + 4) > #PCIE_RC_SIZE
+    ProcedureReturn
+  EndIf
+  ; Match the ordered writel() used by both upstream drivers. The first
+  ; barrier orders prior normal-memory work before the device write; the
+  ; second makes reset/config transitions complete before a following
+  ; timer or transaction can overtake them.
+  a64_barrier()
+  PokeN(#PCIE_RC_BASE + off, v)
+  a64_barrier()
+EndProcedure
+
+Procedure pcie_Modify(off.i, clearMask.i, setMask.i)
+  Define v.i
+  v = PcieRcPeek(off)
+  If v < 0
+    ProcedureReturn
+  EndIf
+  v = (v & (~clearMask)) | setMask
+  pcie_Poke(off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieLinkUp - is the link trained?
+;
+;  BOTH BITS, not either. brcm_pcie_link_up() requires PHYLINKUP and
+;  DL_ACTIVE together: the physical layer can be up while the data link
+;  is not, and a driver that accepts the first alone goes on to talk to
+;  a link that cannot carry a transaction.
+; ----------------------------------------------------------------------
+Procedure.i PcieLinkUp()
+  Define v.i
+  v = PcieRcPeek(#PCIE_MISC_PCIE_STATUS)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If (v & #PCIE_STATUS_PHYLINKUP_MASK) = 0
+    ProcedureReturn 0
+  EndIf
+  If (v & #PCIE_STATUS_DL_ACTIVE_MASK) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieCfgRead32 / PcieCfgWrite32 - PCI configuration space.
+;
+;  bus 0 device 0 is the root complex itself and is reached directly;
+;  anything else goes through the index/data pair. That split is
+;  brcm_pcie_config_address(), not an invention.
+;
+;  A READ OF $FFFFFFFF IS THE NORMAL "nothing there" ANSWER on PCI and
+;  must not be treated as a fault. An absent device is an absence, not
+;  an error, and every bus scan depends on telling the two apart. Step 3
+;  of PcieInit sets CFG_READ_UR_MODE precisely so an empty slot answers
+;  all-ones instead of aborting.
+; ----------------------------------------------------------------------
+Procedure.i pcie_CfgIndex(bus.i, dev.i, fn.i)
+  ProcedureReturn (bus << 20) | (dev << 15) | (fn << 12)
+EndProcedure
+
+Procedure.i PcieCfgRead32(bus.i, dev.i, fn.i, off.i)
+  If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+    ProcedureReturn #PCIE_ERR_CFG_BDF
+  EndIf
+  If bus = 0 And dev = 0
+    ProcedureReturn PcieRcPeek(off & $FFF)
+  EndIf
+  pcie_Poke(#PCIE_EXT_CFG_INDEX, pcie_CfgIndex(bus, dev, fn))
+  ProcedureReturn PcieRcPeek(#PCIE_EXT_CFG_DATA + (off & $FFF))
+EndProcedure
+
+Procedure PcieCfgWrite32(bus.i, dev.i, fn.i, off.i, v.i)
+  If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+    ProcedureReturn
+  EndIf
+  If bus = 0 And dev = 0
+    pcie_Poke(off & $FFF, v)
+    ProcedureReturn
+  EndIf
+  pcie_Poke(#PCIE_EXT_CFG_INDEX, pcie_CfgIndex(bus, dev, fn))
+  pcie_Poke(#PCIE_EXT_CFG_DATA + (off & $FFF), v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieInit - reset the controller, train the link, map the window.
+;
+;  The order is brcm_pcie_probe()'s and it is not negotiable. Returns 1,
+;  or 0 with PcieError()/PcieErrorText() set. Safe to call twice.
+;
+;  TIMING IS ON THE ARCHITECTURAL COUNTER, not a spin loop. This
+;  sequence has real 100 microsecond and 100 millisecond waits in it,
+;  and delay() in timer.pi4 was MEASURED clock-independent to 0 parts
+;  per thousand across a 2.5x CPU clock change. A calibrated spin would
+;  be wrong by that factor the moment somebody calls ClockInit() - which
+;  the monitor now does.
+; ----------------------------------------------------------------------
+Global pcie_adopted.i
+Global pcie_adoptCpu.i
+Global pcie_adoptHalted.i
+Global pcie_enumerated.i
+Global pcie_vl805Ready.i
+Global pcie_resetStarted.i       ; Anvil crossed the fundamental-reset boundary
+Global pcie_barBus.i            ; where the BAR is placed, on the PCI bus
+Global pcie_barCpu.i            ; the same BAR as the CPU sees it
+Global pcie_barSize.i
+Global pcie_dmaOff.i            ; bus = physical address + this offset
+Global pcie_dmaOffRead.i
+#PCIE_ERR_TAKEOVER = -11
+
+; Existing trained-link ownership is separate from the new DMA mapping.
+; PcieEnumerate may not relocate anything until xHCI has proved halted.
+Procedure.i PcieAdoptCpu()
+  ProcedureReturn pcie_adoptCpu
+EndProcedure
+
+Procedure.i PcieNeedsTakeover()
+  ProcedureReturn (pcie_adopted <> 0) And (pcie_adoptHalted = 0)
+EndProcedure
+
+; Called only after the xHCI layer has observed HCHalted (xHCI 4.21.2).
+Procedure.i PcieAdoptHalted()
+  Define cmd.i
+  If pcie_adoptCpu = 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd & (~#PCI_CMD_BUS_MASTER))
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_BUS_MASTER) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  pcie_adoptHalted = 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  WHICH PART OF THE BRING-UP IS RUNNING - added 2026-09-11.
+;
+;  THE SAME REASONING xhci.pi4 CARRIES, and here it buys more, because
+;  this file has TWO paths and a board only ever takes one of them. A
+;  monitor entered from a running monitor finds the link already trained
+;  and ADOPTS it: three register writes and out. A monitor the firmware
+;  entered from power-on may take the COLD path - PERST, the SerDes out
+;  of IDDQ, the control registers, the inbound BAR, MSI masked, PERST
+;  released and up to 100 ms of link polling. Everything in that second
+;  list is reached on a cold flash boot and on nothing else, so a fault
+;  in it cannot be reproduced by entering a second monitor into RAM, and
+;  the only instrument that can tell the two paths apart from a panel is
+;  a marker that says which one was taken.
+;
+;  The hook takes no argument and the phase is read back through
+;  PciePhase(), which is genet.pi4's shape and the one this tree has run
+;  on silicon. The marker is file-scope storage because automatic storage
+;  lives in the invocation's frame as of 2026-09-11 and a marker whose
+;  job is to outlive the call that set it cannot live there.
+; ======================================================================
+#PCIE_PH_IDLE     = 0
+#PCIE_PH_CANARY   = 1    ; the 64-bit window-base canary
+#PCIE_PH_PROBE    = 2    ; asking whether the link is already up
+#PCIE_PH_ADOPT    = 3    ; adopt: the outbound window
+#PCIE_PH_INBOUND  = 4    ; adopt: the RC_BAR2 offset, and its readback
+#PCIE_PH_PERST    = 5    ; cold: INIT and PERST asserted
+#PCIE_PH_SERDES   = 6    ; cold: the SerDes out of IDDQ
+#PCIE_PH_CTRL     = 7    ; cold: burst size, SCB, inbound BAR, MSI masked
+#PCIE_PH_TRAIN    = 8    ; cold: PERST released, waiting for the link
+#PCIE_PH_WINDOW   = 9    ; cold: the outbound window
+#PCIE_PH_UP       = 10   ; the link is up either way
+#PCIE_PH_BUSNUM   = 11   ; the bridge's secondary/subordinate numbers
+#PCIE_PH_ENUM     = 12   ; the endpoint's id, BAR and command register
+#PCIE_PH_DONE     = 13
+
+Global pcie_phaseAt.i = #PCIE_PH_IDLE
+Global *pcie_phaseHook = 0
+
+Procedure.i PciePhase() : ProcedureReturn pcie_phaseAt : EndProcedure
+
+Procedure.i PciePhaseText(p.i)
+  Select p
+    Case #PCIE_PH_CANARY  : ProcedureReturn "canary"
+    Case #PCIE_PH_PROBE   : ProcedureReturn "probe"
+    Case #PCIE_PH_ADOPT   : ProcedureReturn "adopt"
+    Case #PCIE_PH_INBOUND : ProcedureReturn "inbound"
+    Case #PCIE_PH_PERST   : ProcedureReturn "perst"
+    Case #PCIE_PH_SERDES  : ProcedureReturn "serdes"
+    Case #PCIE_PH_CTRL    : ProcedureReturn "control"
+    Case #PCIE_PH_TRAIN   : ProcedureReturn "train"
+    Case #PCIE_PH_WINDOW  : ProcedureReturn "window"
+    Case #PCIE_PH_UP      : ProcedureReturn "up"
+    Case #PCIE_PH_BUSNUM  : ProcedureReturn "busnum"
+    Case #PCIE_PH_ENUM    : ProcedureReturn "endpoint"
+    Case #PCIE_PH_DONE    : ProcedureReturn "ok"
+  EndSelect
+  ProcedureReturn "idle"
+EndProcedure
+
+Procedure.i PcieSetPhaseHook(*fn)
+  Define old.i
+  old = *pcie_phaseHook
+  *pcie_phaseHook = *fn
+  ProcedureReturn old
+EndProcedure
+
+Procedure pcie_Phase(p.i)
+  pcie_phaseAt = p
+  If *pcie_phaseHook <> 0
+    pcie_phaseHook()
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieProgramWindow - point the outbound window at our bus range.
+;
+;  Factored out because BOTH paths through PcieInit need it: a cold
+;  link after training, and an already-trained link we are adopting.
+;  The firmware sets this up for its own use and nothing says its
+;  choice matches ours.
+; ----------------------------------------------------------------------
+Procedure.i PcieProgramWindow()
+  Define v.i
+  Define lim.i
+  ; the outbound window: CPU $6_0000_0000 -> bus $F8000000, 64 MiB.
+  ;    LO/HI take the BUS address. BASE_LIMIT and the two HI registers
+  ;    take the CPU address in 1 MiB units, which is why everything is
+  ;    shifted right by 20.
+  lim = #PCIE_OUT_CPU + #PCIE_OUT_SIZE - 1
+  pcie_Poke(#PCIE_MISC_WIN0_LO, #PCIE_OUT_BUS)
+  pcie_Poke(#PCIE_MISC_WIN0_HI, 0)
+  v = ((#PCIE_OUT_CPU >> 20) & $FFF) << 4
+  v = v | (((lim >> 20) & $FFF) << 20)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_LIMIT, v)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_HI, (#PCIE_OUT_CPU >> 32) & $FF)
+  pcie_Poke(#PCIE_MISC_WIN0_LIMIT_HI, (lim >> 32) & $FF)
+  If PcieRcPeek(#PCIE_MISC_WIN0_LO) <> #PCIE_OUT_BUS Or PcieRcPeek(#PCIE_MISC_WIN0_HI) <> 0 Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_LIMIT) <> v Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_HI) <> ((#PCIE_OUT_CPU >> 32) & $FF) Or PcieRcPeek(#PCIE_MISC_WIN0_LIMIT_HI) <> ((lim >> 32) & $FF)
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Only config-space and RC accesses until routing is validated. No BAR
+; sizing or relocation while the previous controller owner can DMA.
+Procedure.i PciePrepareAdoption()
+  Define bar.i
+  Define buses.i
+  Define win.i
+  Define first.i
+  Define last.i
+  Define base.i
+  Define lim.i
+  Define v.i
+  pcie_err = #PCIE_ERR_TAKEOVER
+  pcie_adoptCpu = 0
+  buses = PcieCfgRead32(0, 0, 0, $18)
+  If ((buses >> 8) & $FF) <> 1 Or ((buses >> 16) & $FF) < 1
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_MEM_SPACE) = 0
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, $08) >> 8) <> $0C0330
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_MEM_SPACE) = 0
+    ProcedureReturn 0
+  EndIf
+  bar = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  If (bar & 1) <> 0 Or (bar & 6) = 2 Or (bar & 6) = 6
+    ProcedureReturn 0
+  EndIf
+  If (bar & 6) = 4 And PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR1) <> 0
+    ProcedureReturn 0
+  EndIf
+  bar = bar & $FFFFFFF0
+  If bar = 0 Or bar > $FFFFFE00 Or (bar & $3FFFFFF) > $3FFFE00
+    ProcedureReturn 0
+  EndIf
+  win = PcieCfgRead32(0, 0, 0, $20)
+  first = (win & $FFF0) << 16
+  last = (win & $FFF00000) | $FFFFF
+  If first > last Or bar < first Or bar + 511 > last
+    ProcedureReturn 0
+  EndIf
+  base = bar & $FC000000
+  lim = #PCIE_OUT_CPU + #PCIE_OUT_SIZE - 1
+  pcie_Poke(#PCIE_MISC_WIN0_LO, base)
+  pcie_Poke(#PCIE_MISC_WIN0_HI, 0)
+  v = ((#PCIE_OUT_CPU >> 20) & $FFF) << 4
+  v = v | (((lim >> 20) & $FFF) << 20)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_LIMIT, v)
+  pcie_Poke(#PCIE_MISC_WIN0_BASE_HI, (#PCIE_OUT_CPU >> 32) & $FF)
+  pcie_Poke(#PCIE_MISC_WIN0_LIMIT_HI, (lim >> 32) & $FF)
+  If PcieRcPeek(#PCIE_MISC_WIN0_LO) <> base Or PcieRcPeek(#PCIE_MISC_WIN0_HI) <> 0
+    ProcedureReturn 0
+  EndIf
+  If PcieRcPeek(#PCIE_MISC_WIN0_BASE_LIMIT) <> v Or PcieRcPeek(#PCIE_MISC_WIN0_BASE_HI) <> ((#PCIE_OUT_CPU >> 32) & $FF) Or PcieRcPeek(#PCIE_MISC_WIN0_LIMIT_HI) <> ((lim >> 32) & $FF)
+    ProcedureReturn 0
+  EndIf
+  pcie_adoptCpu = #PCIE_OUT_CPU + bar - base
+  pcie_err = 0
+  ProcedureReturn 1
+EndProcedure
+
+; Establish a controller/link configuration owned entirely by Anvil.
+;
+; This is the BCM2711 reset and train sequence used by the Raspberry Pi
+; Linux and U-Boot brcmstb PCIe drivers. The already-trained path in
+; PcieInit deliberately does not call it: that path still belongs to the
+; firmware and must first be stopped by XhciQuiesceAdopted. Once that
+; routine has observed HCHalted and read back BME clear, PcieEnumerate
+; calls this procedure before touching the endpoint again.
+; The internal MDIO bus to the PHY. brcm_pcie_mdio_form_pkt / _read / _write:
+; port 0, a 16-bit register address, the command in the top bits; the read
+; and write complete when DATA_DONE is set (read) or clear (write), polled
+; at most 100 times a microsecond apart. -1 on a timeout.
+Procedure.i pcie_MdioRead(regad.i)
+  Define v.i
+  Define i.i
+  pcie_Poke(#PCIE_RC_DL_MDIO_ADDR, (regad & $FFFF) | (#PCIE_MDIO_CMD_READ << 20))
+  PcieRcPeek(#PCIE_RC_DL_MDIO_ADDR)
+  i = 0
+  While i < 100
+    v = PcieRcPeek(#PCIE_RC_DL_MDIO_RD_DATA)
+    If v >= 0 And (v & #PCIE_MDIO_DATA_DONE) <> 0
+      ProcedureReturn v & #PCIE_MDIO_DATA_MASK
+    EndIf
+    delayMicroseconds(1)
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i pcie_MdioWrite(regad.i, v.i)
+  Define r.i
+  Define i.i
+  pcie_Poke(#PCIE_RC_DL_MDIO_ADDR, (regad & $FFFF) | (#PCIE_MDIO_CMD_WRITE << 20))
+  PcieRcPeek(#PCIE_RC_DL_MDIO_ADDR)
+  pcie_Poke(#PCIE_RC_DL_MDIO_WR_DATA, #PCIE_MDIO_DATA_DONE | (v & $FFFF))
+  i = 0
+  While i < 100
+    r = PcieRcPeek(#PCIE_RC_DL_MDIO_WR_DATA)
+    If r >= 0 And (r & #PCIE_MDIO_DATA_DONE) = 0
+      ProcedureReturn 1
+    EndIf
+    delayMicroseconds(1)
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; brcm_pcie_set_ssc(): select the SSC register block, set the override enable
+; and value, give the PLL a millisecond, then require both SSC and PLL lock.
+;
+; AND KEEP THE WORDS. Both reads are stored raw before anything is decided
+; from them, because the verdict this returns is the thing nobody can check
+; and the words are the thing anybody can. The SSC_CNTL kept here is
+; deliberately the one read BACK after the override write, not the one read
+; before it: the register as it stands now is what the link is running on.
+Procedure.i pcie_SetSsc()
+  Define v.i
+  If pcie_MdioWrite(#PCIE_MDIO_SET_ADDR, #PCIE_SSC_REGS_ADDR) = 0
+    ProcedureReturn 0
+  EndIf
+  v = pcie_MdioRead(#PCIE_SSC_CNTL)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If pcie_MdioWrite(#PCIE_SSC_CNTL, v | #PCIE_SSC_CNTL_OVRD) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(1)
+  pcie_sscCntlRaw = pcie_MdioRead(#PCIE_SSC_CNTL)
+  v = pcie_MdioRead(#PCIE_SSC_STATUS)
+  pcie_sscStatusRaw = v
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If (v & #PCIE_SSC_STATUS_SSC) <> 0 And (v & #PCIE_SSC_STATUS_PLL) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieSscCntlRaw()   : ProcedureReturn pcie_sscCntlRaw   : EndProcedure
+Procedure.i PcieSscStatusRaw() : ProcedureReturn pcie_sscStatusRaw : EndProcedure
+
+Procedure pcie_ReadLinkStatus()
+  Define v.i
+  v = PcieRcPeek(#PCIE_CAP_LNKSTA_WORD)
+  If v < 0
+    ProcedureReturn
+  EndIf
+  pcie_linkSpeed = (v >> 16) & $0F
+  pcie_linkWidth = (v >> 20) & $3F
+EndProcedure
+
+Procedure.i PcieLinkSpeed() : ProcedureReturn pcie_linkSpeed : EndProcedure
+Procedure.i PcieLinkWidth() : ProcedureReturn pcie_linkWidth : EndProcedure
+Procedure.i PcieSscOk()     : ProcedureReturn pcie_sscOk     : EndProcedure
+
+Procedure.i PcieResetAndTrain()
+  Define i.i
+  Define code.i
+
+  ; A fundamental reset invalidates every cached mapping derived from the
+  ; old link. Publish none of it until retraining and enumeration succeed.
+  pcie_resetStarted = 1
+  pcie_up = 0
+  pcie_enumerated = 0
+  pcie_adopted = 0
+  pcie_adoptCpu = 0
+  pcie_adoptHalted = 0
+  pcie_barBus = 0
+  pcie_barCpu = 0
+  pcie_barSize = 0
+  pcie_dmaOff = 0
+  pcie_dmaOffRead = 0
+  pcie_vl805Ready = 0
+
+  ; AND THE FACTS ABOUT THE OLD LINK ITSELF. These four are derived from a
+  ; link that is about to be torn down, and they are the ones a person
+  ; reads: the trained speed, the width, whether spread-spectrum took, and
+  ; the PHY registers behind that answer. Left standing across a reset they
+  ; survive a retrain that FAILS - the first attempt trains and publishes
+  ; 5.0 GT/s x1 with SSC on, a second attempt finds the link down and
+  ; returns early, and the readout goes on reporting the first attempt's
+  ; link as though it were still there. -1 is already this file's word for
+  ; "never asked", so putting them back to -1 is the honest state: the
+  ; question has been re-opened and not yet answered.
+  pcie_linkSpeed = -1
+  pcie_linkWidth = -1
+  pcie_sscOk = -1
+  pcie_sscCntlRaw = -1
+  pcie_sscStatusRaw = -1
+
+  ; Assert bridge software reset and endpoint PERST together, then bring
+  ; the bridge back while keeping the endpoint in fundamental reset.
+  pcie_Phase(#PCIE_PH_PERST)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, 0, #PCIE_SW_INIT_1_INIT_MASK | #PCIE_SW_INIT_1_PERST_MASK)
+  ; U-Boot calls this delay "a safety precaution to preclude the reset
+  ; signal from looking like a glitch" and spends 100 us (v2025.01
+  ; pcie_brcmstb.c:369-374); Linux spends the same (1392). A millisecond is
+  ; ten times that, in the direction that cannot hurt, and it is 1 ms of a
+  ; boot whose USB half alone costs 13.4 seconds.
+  delay(1)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_INIT_MASK, 0)
+
+  ; Power the SerDes and select Linux's explicit "safe" CLKREQ policy:
+  ; no L1 power saving, with refclk and CLKREQ driven unconditionally.
+  ; This prevents inherited firmware power-state policy from surviving
+  ; across the ownership boundary.
+  ;
+  ; THE ORDER HERE IS NOT THE REFERENCE'S, AND THAT IS DELIBERATE. Linux
+  ; clears the whole CLKREQ group before releasing PERST and re-applies the
+  ; chosen policy only after link-up (rpi-6.12.y pcie-brcmstb.c:1765-1767
+  ; then 1814). The two bits this file sets - REFCLK_OVRD_ENABLE and
+  ; REFCLK_OVRD_OUT - force the reference clock out unconditionally, which
+  ; is the state Linux goes to extra trouble to reach EARLY on the boards
+  ; that need it: its tperst_clk_ms path exists to hold PERST# low while
+  ; the internal reset is released "so the PLL generates stable refclk
+  ; output further in advance of PERST# deassertion" (1773-1785). The bits
+  ; that must NOT be set while a link trains - CLKREQ_DEBUG_ENABLE and
+  ; L1SS_ENABLE - are in the cleared mask and are clear here.
+  pcie_Phase(#PCIE_PH_SERDES)
+  pcie_Modify(#PCIE_MISC_HARD_PCIE_HARD_DEBUG, #PCIE_HARD_DEBUG_SERDES_IDDQ | #PCIE_HARD_DEBUG_CLKREQ_MASK, #PCIE_HARD_DEBUG_CLKREQ_SAFE)
+  ; "Wait for SerDes to be stable" - both references spend 100 us here
+  ; (Linux 1405-1406, U-Boot 382-383). This is a whole millisecond, ten
+  ; times longer and in the safe direction; the counter it rides was
+  ; measured against real time on 2026-09-18 and is honest to about one
+  ; part in ten thousand, so a millisecond here is a millisecond.
+  delay(1)
+
+  ; AND THE OTHER HALF OF "safe", WHICH WAS MISSING. Driving refclk and
+  ; CLKREQ# from the root complex while still ADVERTISING L1 substates is
+  ; the one combination Linux refuses to leave standing, in both branches
+  ; that drive the clock (1584-1586 and 1611-1616): an endpoint configured
+  ; into L1.x behind a CLKREQ# the root complex is holding gets a dead
+  ; link. Anvil has no power management and will never ask for L1.x, but
+  ; the advertisement is what an OS or a payload READS, and a capability
+  ; register that describes a mode this driver has disabled underneath it
+  ; is a wrong answer sitting there waiting to be believed.
+  pcie_Modify(#PCIE_RC_CFG_PRIV1_ROOT_CAP, #PCIE_ROOT_CAP_L1SS_MODE_MASK, #PCIE_ROOT_CAP_L1SS_UNADVERTISED)
+
+  ; Linux sets SCB_ACCESS_EN, CFG_READ_UR_MODE, the burst size and BOTH RCB
+  ; mode bits on the BCM2711 (rpi-6.12.y pcie-brcmstb.c:1423-1432). U-Boot
+  ; v2025.01 sets only the first three - it has no RCB define at all
+  ; (bcm2711_acpi.h:52-57, written at pcie_brcmstb.c:385-390) - so where
+  ; the two disagree this file follows Linux, which is the driver that runs
+  ; this part in service. The burst is named rather than cleared to zero;
+  ; see #PCIE_MISC_CTRL_MAX_BURST_128 for why the name is the whole point.
+  ; Preserve unrelated fields while normalizing all fields owned by this
+  ; driver.
+  pcie_Phase(#PCIE_PH_CTRL)
+  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_MAX_BURST_MASK | #PCIE_MISC_CTRL_RCB_64B_MODE | #PCIE_MISC_CTRL_RCB_MPS_MODE, #PCIE_MISC_CTRL_SCB_ACCESS_EN | #PCIE_MISC_CTRL_CFG_READ_UR_MODE | #PCIE_MISC_CTRL_MAX_BURST_128 | #PCIE_MISC_CTRL_RCB_64B_MODE | #PCIE_MISC_CTRL_RCB_MPS_MODE)
+
+  ; Identity-mapped inbound DMA aperture, sized to the memory this board
+  ; has - PcieInboundSizeCode(), which is #PCIE_INBOUND_SIZE_CODE when
+  ; nobody has said how much that is. PcieDmaOk answers from the smallest
+  ; of this window, the erratum and the memory (forum 916). BAR1/BAR3 and
+  ; MSI stay disabled until a consumer explicitly implements them.
+  ;
+  ; THE CODE IS TAKEN ONCE, INTO A LOCAL, and the same local is written
+  ; to both registers and compared against both readbacks below. Calling
+  ; PcieInboundSizeCode() four times would be four chances for the
+  ; window to be programmed one size and checked against another, which
+  ; is the failure this whole readback exists to catch.
+  code = PcieInboundSizeCode()
+  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, code)
+  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_HI, 0)
+  pcie_Modify(#PCIE_MISC_MISC_CTRL, #PCIE_MISC_CTRL_SCB0_SIZE_MASK, code << 27)
+  pcie_Modify(#PCIE_MISC_RC_BAR1_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
+  pcie_Modify(#PCIE_MISC_RC_BAR3_CONFIG_LO, #PCIE_RC_BAR_SIZE_MASK, 0)
+  pcie_Poke(#PCIE_MSI_INTR2_MASK_SET, $FFFFFFFF)
+  pcie_Poke(#PCIE_MSI_INTR2_CLR, $FFFFFFFF)
+
+  ; ------------------------------------------------------------------
+  ; READ THE INBOUND WINDOW BACK. The outbound window has always done
+  ; this - PcieProgramWindow writes five registers and then compares all
+  ; five - and the inbound pair was the one group in this file written
+  ; blind. That is how forum 916 stayed hidden: a window programmed one
+  ; size and checked against another looks exactly like a correct one
+  ; from inside the driver, and only says otherwise when a transfer
+  ; lands outside it and completes with good status.
+  ;
+  ; Both halves are checked, because they are two registers that must
+  ; agree: RC_BAR2's low five bits are the BAR size the endpoint sees,
+  ; MISC_CTRL bits 31:27 are the SCB0 size the wrapper enforces, and a
+  ; window is only as large as the smaller of them.
+  ;
+  ; BOTH COMPARE AGAINST `code` - THE VALUE ACTUALLY CHOSEN - and not
+  ; against #PCIE_INBOUND_SIZE_CODE. Once the size is derived from the
+  ; memory fitted, a readback checked against the constant would pass on
+  ; a 4 GB board and be meaningless on every other one: on a 1 GB board
+  ; it would compare a register correctly holding 15 against 17 and
+  ; report a failure, and if the write had genuinely been ignored and
+  ; left 17 standing it would report success. It would be checking the
+  ; wrong number in both directions at once.
+  ; ------------------------------------------------------------------
+  pcie_Phase(#PCIE_PH_INBOUND)
+  If (PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $1F) <> code
+    pcie_err = #PCIE_ERR_INBOUND
+    ProcedureReturn 0
+  EndIf
+  If ((PcieRcPeek(#PCIE_MISC_MISC_CTRL) >> 27) & $1F) <> code
+    pcie_err = #PCIE_ERR_INBOUND
+    ProcedureReturn 0
+  EndIf
+  ; And the offset half of the same pair. Everything downstream - every
+  ; TRB pointer, every DMA buffer address - is handed to the controller
+  ; unmodified, which is only correct while this is an identity map.
+  If (PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $FFFFFFE0) <> 0 Or PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_HI) <> 0
+    pcie_err = #PCIE_ERR_DMA_OFFSET
+    ProcedureReturn 0
+  EndIf
+  ; Drop the cached offset. PcieDmaOffset reads on demand, so the next
+  ; reader now gets the registers this procedure has just verified rather
+  ; than whatever the firmware left before the reset.
+  pcie_dmaOff = 0
+  pcie_dmaOffRead = 0
+
+  ; Release PERST and use the upstream 100 ms mandatory settle followed
+  ; by bounded link polling. No config-space or BAR access is permitted
+  ; before both PHYLINKUP and DL_ACTIVE are observed.
+  ;
+  ; THE 100 ms IS THE SPECIFIED ONE and the poll after it is not. PCIe CEM
+  ; 2.2 and PCIe base r5.0 6.6.1 require 100 ms after PERST# deassertion
+  ; before the first configuration request, and both references spend
+  ; exactly that (Linux 1796-1799, U-Boot 433-436) and then poll for at
+  ; most another 100 ms in 5 ms steps (Linux 1806-1807, U-Boot 441-442).
+  ; That total of 200 ms is SHORTER than the 1.0 second the base
+  ; specification allows before software may conclude a device is broken.
+  ; This file keeps the references' budget rather than the specification's,
+  ; because the endpoint here is a VL805 soldered to the board that trains
+  ; in a small fraction of it, and a boot that waits a second for a
+  ; failure that has never happened is a second every boot pays. The
+  ; refusal below therefore SAYS what budget it used, so that a board
+  ; which genuinely needs longer reports a budget rather than a verdict.
+  ;
+  ; The first config access is later still - PcieEnumerate's read of the
+  ; bridge's bus numbers - so the specified wait is met with margin, and
+  ; the margin is not relied on: the 100 ms is spent here regardless.
+  pcie_Phase(#PCIE_PH_TRAIN)
+  pcie_Modify(#PCIE_RGR1_SW_INIT_1, #PCIE_SW_INIT_1_PERST_MASK, 0)
+  delay(100)
+  i = 0
+  While i < 100
+    If PcieLinkUp() <> 0
+      Break
+    EndIf
+    delay(5)
+    i = i + 5
+  Wend
+  If PcieLinkUp() = 0
+    pcie_err = #PCIE_ERR_LINK
+    ProcedureReturn 0
+  EndIf
+  If (PcieRcPeek(#PCIE_MISC_PCIE_STATUS) & #PCIE_STATUS_PORT_RC_MASK) = 0
+    pcie_err = #PCIE_ERR_EP_MODE
+    ProcedureReturn 0
+  EndIf
+
+  pcie_Phase(#PCIE_PH_WINDOW)
+  If PcieProgramWindow() = 0
+    ProcedureReturn 0
+  EndIf
+
+  pcie_Modify(#PCIE_RC_CFG_PRIV1_ID_VAL3, #PCIE_ID_VAL3_CLASS_CODE_MASK, #PCIE_CLASS_BRIDGE_PCI)
+  pcie_Modify(#PCIE_RC_CFG_VENDOR_REG1, #PCIE_VENDOR_REG1_ENDIAN_MASK, 0)
+
+  ; ASPM: ADVERTISE NOTHING, AND THIS IS THIS FILE'S OWN DECISION.
+  ;
+  ; The line above used to say it matched U-Boot's policy. It does not, and
+  ; neither does it match Linux's - the audit of 2026-09-18 went and looked:
+  ;   * U-Boot v2025.01 never writes this register at all. Its policy is to
+  ;     leave whatever the hardware powers up advertising.
+  ;   * Linux ALWAYS advertises L1, and L0s too unless the device tree says
+  ;     `aspm-no-l0s` (rpi-6.12.y pcie-brcmstb.c:1472-1480); bcm2711.dtsi
+  ;     does not say it, so on this board Linux advertises both.
+  ; Zero is therefore narrower than either reference, and it is correct for
+  ; what this monitor is: a link state nobody manages must not be offered,
+  ; because the only thing that could accept the offer is software that
+  ; then waits for a power transition this driver will never perform. It
+  ; also matches the CLKREQ policy chosen above, which drives the reference
+  ; clock unconditionally - advertising a low-power state while holding the
+  ; clock on is the contradiction the ROOT_CAP write already closes for the
+  ; substates. Say which it is; do not borrow a justification from a driver
+  ; that does something else.
+  pcie_Modify(#PCIE_RC_CFG_PRIV1_LINK_CAPABILITY, #PCIE_LINK_CAPABILITY_ASPM_SUPPORT_MASK, 0)
+
+  ; SPREAD-SPECTRUM CLOCKING, then what the link trained at - U-Boot's order
+  ; (brcm_pcie_probe, 476-489). A failure to enter SSC is reported, not fatal,
+  ; exactly as there.
+  pcie_sscOk = pcie_SetSsc()
+  pcie_ReadLinkStatus()
+
+  pcie_up = 1
+  pcie_Phase(#PCIE_PH_UP)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i PcieInit()
+  pcie_err = 0
+  If pcie_up <> 0
+    ProcedureReturn 1
+  EndIf
+
+  ; The canary first. Built by a 32-bit compiler the window base
+  ; truncates to zero and every access below would land on the firmware
+  ; spin table instead of the bus.
+  pcie_Phase(#PCIE_PH_CANARY)
+  If PcieAddrIsWide() = 0
+    pcie_err = #PCIE_ERR_NARROW
+    ProcedureReturn 0
+  EndIf
+
+  ; A previous reset attempt means the firmware owner no longer exists,
+  ; even if the link happened to retrain before that attempt failed. Retry
+  ; our reset sequence; never mistake the half-owned link for adoptable
+  ; firmware state.
+  If pcie_resetStarted <> 0
+    ProcedureReturn PcieResetAndTrain()
+  EndIf
+
+  ; If firmware left a trained link, adopt it only long enough to find and
+  ; stop the live xHCI controller. Resetting here would destroy its BAR
+  ; before XhciQuiesceAdopted can clear Run/Stop and BME. The reset and
+  ; retrain occurs later, in PcieEnumerate, after that ownership proof.
+  pcie_Phase(#PCIE_PH_PROBE)
+  If PcieLinkUp() <> 0
+    pcie_adopted = 1
+    pcie_Phase(#PCIE_PH_ADOPT)
+    ; A trained link can still have firmware DMA in flight. Map its
+    ; existing register BAR for takeover, but keep the inbound offset.
+    If PciePrepareAdoption() = 0
+      ProcedureReturn 0
+    EndIf
+
+    pcie_up = 1
+    pcie_Phase(#PCIE_PH_UP)
+    ProcedureReturn 1
+  EndIf
+
+  ProcedureReturn PcieResetAndTrain()
+EndProcedure
+
+; 1 if PcieInit ADOPTED an already-trained link rather than resetting it.
+Procedure.i PcieAdopted()
+  ProcedureReturn pcie_adopted
+EndProcedure
+
+Procedure.i PcieError()
+  ProcedureReturn pcie_err
+EndProcedure
+
+Procedure.i PcieErrorText()
+  Select pcie_err
+    Case #PCIE_ERR_VL805_FIRMWARE
+      ProcedureReturn "PCIe error -15: VL805 firmware notification or startup timing failed. Check MailboxError and the architectural counter before retrying cold initialization."
+    Case 0
+      ProcedureReturn "pcie: ok"
+    Case #PCIE_ERR_NARROW
+      ProcedureReturn "pcie: window base truncated to 32 bits - built by a 32-bit compiler"
+    Case #PCIE_ERR_TAKEOVER
+      ProcedureReturn "pcie: firmware BAR routing or halted DMA ownership could not be verified; remapping refused"
+    Case #PCIE_ERR_DMA_OFFSET
+      ProcedureReturn "pcie: the inbound DMA offset would not zero - the endpoint cannot reach system memory, and any DMA it attempts will report a host system error"
+    Case #PCIE_ERR_INBOUND
+      ProcedureReturn "pcie error -16: the inbound DMA window did not read back the size just written to it. Check RC_BAR2_CONFIG_LO bits 4:0 and MISC_CTRL bits 31:27 against the inbound size code; a window smaller than the driver believes lets a transfer complete with good status into memory the controller never reached."
+    Case #PCIE_ERR_LINK
+      ProcedureReturn "pcie error -4: the link never came up. PHYLINKUP and DL_ACTIVE are both required and one or both stayed clear through 100 ms of mandatory settle after PERST was released plus 100 ms of polling in 5 ms steps - the same budget the upstream drivers use, and less than the 1.0 second the base specification allows. Check that the endpoint has power and that PERST actually released."
+    Case #PCIE_ERR_EP_MODE
+      ProcedureReturn "pcie: controller is in endpoint mode, not root complex"
+    Case #PCIE_ERR_CFG_BDF
+      ProcedureReturn "pcie: bad bus/device/function, or unaligned config offset"
+  EndSelect
+  ProcedureReturn "pcie: unknown error"
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieVl805Id - THE MILESTONE.
+;
+;  vendor:device from bus 1 device 0 function 0. Expect $34831106 - VIA
+;  Labs $1106, VL805 $3483 - which #PCIE_VL805_ID_EXPECTED has carried
+;  since this file was written read-only, as a number nothing could yet
+;  go and check.
+;
+;  $FFFFFFFF means the link IS up and nothing answered at that address.
+;  That is a different failure from a link that never trained, and is
+;  worth reporting as itself.
+; ----------------------------------------------------------------------
+Procedure.i PcieVl805Id()
+  ProcedureReturn PcieCfgRead32(1, 0, 0, 0)
+EndProcedure
+
+; ======================================================================
+;  ENUMERATION - assign the endpoint a BAR and switch it on
+; ======================================================================
+;  ADDED 2026-08-25, AFTER THIS LIBRARY CRASHED THE BOARD.
+;
+;  pi4XhciSelfTest took a data abort and reset the CPU. The predicted
+;  cause was the loader's page tables not mapping the outbound window.
+;  It was not that. A diagnostic that read config space and deliberately
+;  did NOT dereference anything found:
+;
+;      command/stat   $00100000     memory space DISABLED
+;      BAR0 raw       $00000004     type bits only - NO ADDRESS
+;
+;  THE ENDPOINT HAD NO BAR, AND THIS FILE IS WHY. PcieInit asserts PERST,
+;  which resets the device and discards the configuration the FIRMWARE
+;  had given it while booting from USB. U-Boot saw three USB devices
+;  because U-Boot had enumerated the bus; we reset the device and then
+;  never did. XHCI dereferenced a zero base and the CPU aborted.
+;
+;  Bringing a link up is therefore only half the job. A PCI device out of
+;  reset answers config space and NOTHING ELSE: its registers are
+;  unreachable until software decides where they live, writes that
+;  address into a BAR, and sets the memory-space enable. That is
+;  enumeration, and it is what U-Boot's auto-configuration pass does.
+;
+;  DELIBERATELY MINIMAL. This assigns ONE 64-bit memory BAR to ONE
+;  endpoint at bus 1, which is the whole population of this bus - the
+;  root complex has exactly one child and it is soldered to the board.
+;  No recursive scan, no bridges behind bridges, no I/O space, no
+;  expansion ROM. Those are real parts of PCI and none of them exists
+;  here; writing them would be inventing a general enumerator to run
+;  against a fixed single device.
+; ----------------------------------------------------------------------
+
+; THE PCI HEADER CONSTANTS ARE ALREADY AT THE TOP OF THIS FILE -
+; #PCI_CFG_COMMAND, #PCI_CFG_BAR0/1, #PCI_CMD_MEM_SPACE,
+; #PCI_CMD_BUS_MASTER, #PCI_BAR_TYPE_MASK, #PCI_BAR_TYPE_64. The first
+; draft of this section redefined all six, and the compiler refused the
+; build naming the one whose VALUE differed: #PCI_BAR_TYPE_MASK as 6
+; against 15. Worth recording, because five of the six were identical
+; and would have merged silently under a compiler that allowed it - and
+; the sixth is the mask that decides whether a BAR is read as 64-bit.
+
+#PCIE_ERR_NO_ENDPOINT = -7      ; nothing answered at bus 1
+#PCIE_ERR_BAR_SIZE    = -8      ; the BAR reported an impossible size
+#PCIE_ERR_BAR_SPACE   = -9      ; it will not fit the outbound window
+
+; ----------------------------------------------------------------------
+;  PcieBarSize - how much space does this BAR want?
+;
+;  The standard probe, and it is destructive by design: write all-ones,
+;  read back, and the device returns its own address-decoder mask - the
+;  low bits it does NOT decode read back as zero. Size is that mask
+;  inverted, plus one.
+;
+;  THE ORIGINAL VALUE MUST BE PUT BACK by the caller. On a device that
+;  has already been assigned an address, leaving all-ones in the BAR
+;  aims its decoder at the top of memory. Here the BAR is zero anyway,
+;  but a routine that only works because its input happened to be
+;  useless is a trap for whoever calls it next.
+; ----------------------------------------------------------------------
+Procedure.i PcieBarSize(bus.i, dev.i, fn.i, off.i)
+  Define orig.i
+  Define mask.i
+  orig = PcieCfgRead32(bus, dev, fn, off)
+  PcieCfgWrite32(bus, dev, fn, off, $FFFFFFFF)
+  mask = PcieCfgRead32(bus, dev, fn, off)
+  PcieCfgWrite32(bus, dev, fn, off, orig)
+  If mask = 0 Or mask = -1
+    ProcedureReturn 0
+  EndIf
+  mask = mask & $FFFFFFF0
+  ; ~mask + 1 over the low 32 bits. Masked back to 32 because .i is 64
+  ; bits here and the inversion would otherwise set every high bit.
+  ProcedureReturn ((~mask) + 1) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieEnumerate - give the endpoint an address and turn it on.
+;
+;  Returns 1, or 0 with PcieError() set. Call after PcieInit. Idempotent:
+;  a second call re-reads what it wrote and returns the same answer.
+;
+;  THE ADDRESS IS A BUS ADDRESS, NOT A CPU ADDRESS, and getting that
+;  backwards is the classic error this library was built around. The BAR
+;  is decoded by the DEVICE, which lives on the PCI bus and has never
+;  heard of $6_0000_0000. It goes at the bottom of the outbound window's
+;  BUS view - $F8000000 - and the window hardware translates. The CPU
+;  reaches the same registers at PcieCpuFromBus() of that.
+; ----------------------------------------------------------------------
+; Requires mailbox.pi4 before this library.  The historical name says "Cold",
+; but the operation is required once per Anvil boot after both a newly trained
+; and an adopted PCIe handover.  U-Boot guards it with a process-local `done`
+; flag rather than link state; Linux invokes its reset provider at xHCI probe.
+; Both send the same notification before xHCI setup. U-Boot waits 200 us and
+; Linux waits 200-1000 us.
+Procedure.i PcieColdFirmwareReady()
+  Define hz.i
+  Define started.i
+  Define spins.i
+  Define ticks.i
+  If pcie_vl805Ready <> 0 : ProcedureReturn 1 : EndIf
+  hz = pcie_TickHz()
+  If hz < 1000000 Or hz > 1000000000
+    pcie_err = #PCIE_ERR_VL805_FIRMWARE
+    ProcedureReturn 0
+  EndIf
+  If MailboxNotifyVl805Reset() = 0
+    pcie_err = #PCIE_ERR_VL805_FIRMWARE
+    ProcedureReturn 0
+  EndIf
+  ticks = (hz + 4999) / 5000
+  started = pcie_Ticks()
+  For spins = 0 To 999999
+    If pcie_Ticks() - started >= ticks
+      pcie_vl805Ready = 1
+      ProcedureReturn 1
+    EndIf
+  Next
+  pcie_err = #PCIE_ERR_VL805_FIRMWARE
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i PcieEnumerate()
+  Define id.i
+  Define sz.i
+  Define cmd.i
+  Define lo.i
+  Define is64.i
+
+  pcie_err = 0
+  If pcie_enumerated <> 0
+    ProcedureReturn 1
+  EndIf
+  If pcie_up = 0
+    pcie_err = #PCIE_ERR_LINK
+    ProcedureReturn 0
+  EndIf
+  If PcieNeedsTakeover() <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+
+  ; The firmware-owned controller is halted and BME is now read back
+  ; clear. Cross the ownership boundary exactly as the upstream drivers
+  ; do: fundamental reset, bridge setup, PERST release and retrain before
+  ; any new endpoint transaction. Initial adoption existed only so the
+  ; old controller could be stopped safely.
+  If pcie_adopted <> 0
+    If pcie_adoptHalted = 0
+      pcie_err = #PCIE_ERR_TAKEOVER
+      ProcedureReturn 0
+    EndIf
+    If PcieResetAndTrain() = 0
+      ProcedureReturn 0
+    EndIf
+    pcie_adopted = 0
+    pcie_adoptCpu = 0
+    pcie_adoptHalted = 0
+  EndIf
+  pcie_Phase(#PCIE_PH_BUSNUM)
+
+  ; ---- THE BRIDGE'S BUS NUMBERS, BEFORE ANYTHING ON BUS 1 IS READ ----
+  ; A PCI-to-PCI bridge only forwards a configuration cycle downstream
+  ; if the target bus is inside its SECONDARY..SUBORDINATE range. Out of
+  ; reset that range is 0..0, which contains no bus at all, so every
+  ; read of bus 1 goes nowhere and comes back as all-ones.
+  ;
+  ; ADDED 2026-08-26, WHEN ANVIL BECAME THE BOOT IMAGE. This never
+  ; showed up before because the board always came up under U-Boot,
+  ; which had already written $00010100 here - primary 0, secondary 1,
+  ; subordinate 1 - and PcieInit's adopt path inherited it. Booted
+  ; straight from the firmware, PcieInit takes its own cold path, the
+  ; link trains correctly, and then the very first config read of the
+  ; endpoint returns $FFFFFFFF because nothing was ever told that bus 1
+  ; exists.
+  ;
+  ; Offset $18 on a bridge header: primary in bits 7:0, secondary in
+  ; 15:8, subordinate in 23:16. One device, one bus behind us, so
+  ; secondary and subordinate are both 1.
+  Define busno.i
+  busno = PcieCfgRead32(0, 0, 0, $18)
+  If ((busno >> 8) & $FF) = 0
+    PcieCfgWrite32(0, 0, 0, $18, (busno & $FF000000) | $00010100)
+  EndIf
+
+  id = PcieCfgRead32(1, 0, 0, 0)
+  If id = $FFFFFFFF Or id = 0
+    pcie_err = #PCIE_ERR_NO_ENDPOINT
+    ProcedureReturn 0
+  EndIf
+
+  ; Disable endpoint decode and DMA before BAR sizing/relocation. An
+  ; adopted controller has already reached HCHalted before this point.
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd & (~6))
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & 6) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  pcie_Phase(#PCIE_PH_ENUM)
+  lo = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  is64 = 0
+  If (lo & #PCI_BAR_TYPE_MASK) = #PCI_BAR_TYPE_64
+    is64 = 1
+  EndIf
+
+  sz = PcieBarSize(1, 0, 0, #PCI_CFG_BAR0)
+  If sz = 0
+    pcie_err = #PCIE_ERR_BAR_SIZE
+    ProcedureReturn 0
+  EndIf
+  If sz > #PCIE_OUT_SIZE
+    pcie_err = #PCIE_ERR_BAR_SPACE
+    ProcedureReturn 0
+  EndIf
+  pcie_barSize = sz
+
+  ; The bottom of the window. A BAR must be naturally aligned and the
+  ; window base is 64 MiB-aligned already, so any size up to the window
+  ; is aligned there for free - asserted rather than assumed, because
+  ; the day the window moves this stops being true silently.
+  pcie_barBus = #PCIE_OUT_BUS
+  If (pcie_barBus & (sz - 1)) <> 0
+    pcie_err = #PCIE_ERR_BAR_SPACE
+    ProcedureReturn 0
+  EndIf
+
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_BAR0, pcie_barBus & $FFFFFFF0)
+  If is64 <> 0
+    ; The high half. Zero here: the window's bus view is below 4 GB even
+    ; though the CPU reaches it above. Two different address spaces, and
+    ; this register belongs to the bus one.
+    PcieCfgWrite32(1, 0, 0, #PCI_CFG_BAR1, 0)
+  EndIf
+
+  ; Enable register decode only. The xHCI layer enables bus mastering
+  ; after reading the capability header and before its halt/reset path,
+  ; matching the U-Boot PCI xHCI probe ordering.
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  cmd = (cmd | #PCI_CMD_MEM_SPACE) & (~#PCI_CMD_BUS_MASTER)
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd)
+
+  ; --- AND THE BRIDGE HAS TO AGREE TO CARRY IT ------------------------
+  ; TWO MISCONFIGURATIONS STACKED HERE AND EACH HID THE NEXT. With the
+  ; endpoint enumerated but this step missing, a read of the BAR came
+  ; back $DEADDEAD - the root complex's own AXI read-error pattern, not
+  ; a crash and not a bus float. The CPU access reached the RC; the RC
+  ; declined to complete it.
+  ;
+  ; The root complex is a PCI-TO-PCI BRIDGE, and a bridge forwards a
+  ; memory transaction downstream only if it lands inside the
+  ; MEMORY_BASE/LIMIT pair in its own config header. Programming the
+  ; outbound window told the CPU side where to translate. Nothing told
+  ; the bridge to carry it. Both are required, they live in different
+  ; address spaces, and having one without the other looks exactly like
+  ; a missing page-table entry - which is what it was blamed on twice.
+  ;
+  ; MEASURED before the fix: base/limit read $C000C000, a leftover from
+  ; the firmware pointing at $C0000000, while the BAR had just been put
+  ; at $F8000000. The bridge was doing its job correctly.
+  ;
+  ; Format: two 16-bit fields at $20, each carrying address bits 31:20 in
+  ; its top 12 bits. The limit is INCLUSIVE - it names the last megabyte
+  ; in the range, not the first one past it.
+  Define memwin.i
+  Define lastB.i
+  lastB = pcie_barBus + #PCIE_OUT_SIZE - 1
+  memwin = ((pcie_barBus >> 16) & $FFF0) | ((((lastB) >> 16) & $FFF0) << 16)
+  PcieCfgWrite32(0, 0, 0, $20, memwin)
+
+  ; And the bridge itself must be enabled - the same two COMMAND bits,
+  ; on the bridge this time rather than on the endpoint.
+  Define bcmd.i
+  bcmd = PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(0, 0, 0, #PCI_CFG_COMMAND, bcmd | #PCI_CMD_MEM_SPACE | #PCI_CMD_BUS_MASTER)
+
+  ; Configuration writes are not ownership proof until read back.
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0) & $FFFFFFF0) <> pcie_barBus Or PcieCfgRead32(0, 0, 0, $20) <> memwin
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  If is64 <> 0 And PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR1) <> 0
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+  If (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & 6) <> #PCI_CMD_MEM_SPACE Or (PcieCfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & 6) <> 6
+    pcie_err = #PCIE_ERR_TAKEOVER
+    ProcedureReturn 0
+  EndIf
+
+  pcie_barCpu = PcieCpuFromBus(pcie_barBus)
+  If PcieColdFirmwareReady() = 0 : ProcedureReturn 0 : EndIf
+  pcie_enumerated = 1
+  pcie_Phase(#PCIE_PH_DONE)
+  ProcedureReturn 1
+EndProcedure
+
+; After ownership/remapping and a verified halt, before host reset.
+Procedure.i PcieEnableDma()
+  Define cmd.i
+  If pcie_enumerated = 0
+    ProcedureReturn 0
+  EndIf
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+  PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd | #PCI_CMD_BUS_MASTER)
+  ProcedureReturn (PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_BUS_MASTER) <> 0
+EndProcedure
+
+; Where the endpoint's registers ended up. 0 before PcieEnumerate.
+Procedure.i PcieBarBus()
+  ProcedureReturn pcie_barBus
+EndProcedure
+
+Procedure.i PcieBarCpu()
+  ProcedureReturn pcie_barCpu
+EndProcedure
+
+Procedure.i PcieBarBytes()
+  ProcedureReturn pcie_barSize
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieEndpointReady - is it safe to dereference the BAR yet?
+;
+;  Exists because the alternative to asking is a data abort and a
+;  reboot, and that is a slow way to learn. Checks the two things that
+;  were wrong when this library crashed the board: a BAR with an actual
+;  address in it, and the memory-space bit set.
+;
+;  It CANNOT tell you the loader mapped the outbound window - nothing
+;  reachable through config space can. That question is still open and
+;  is answered only by trying.
+; ----------------------------------------------------------------------
+Procedure.i PcieEndpointReady()
+  Define cmd.i
+  Define bar.i
+  If pcie_up = 0
+    ProcedureReturn 0
+  EndIf
+  bar = PcieCfgRead32(1, 0, 0, #PCI_CFG_BAR0)
+  If bar < 0
+    ProcedureReturn 0
+  EndIf
+  If (bar & $FFFFFFF0) = 0
+    ProcedureReturn 0
+  EndIf
+  cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
+  If cmd < 0
+    ProcedureReturn 0
+  EndIf
+  If (cmd & #PCI_CMD_MEM_SPACE) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE INBOUND OFFSET - and why assuming it was zero cost a night
+; ======================================================================
+;  ADDED 2026-08-25, after XhciInit reached Run/Stop and came back with
+;  USBSTS $15: HCHalted, PORT CHANGE, and HOST SYSTEM ERROR.
+;
+;  HSE is the controller reporting that its OWN bus access failed. The
+;  first thing an xHC does after Run/Stop is fetch the Device Context
+;  Base Address Array out of host memory - so the complaint was about
+;  the INBOUND direction, the endpoint reading us, at a moment when
+;  reading the endpoint had been working perfectly for hours.
+;
+;  THE ROOT COMPLEX'S INBOUND REGISTER HOLDS AN OFFSET, NOT A BASE, and
+;  the difference is the whole bug. From
+;  Datasheets/pi4/uboot/v2025.01_pcie_brcmstb.c, brcm_pcie_probe():
+;
+;      rc_bar2_offset = region.bus_start - region.phys_start;
+;      tmp = lower_32_bits(rc_bar2_offset);
+;      u32p_replace_bits(&tmp, brcm_pcie_encode_ibar_size(rc_bar2_size),
+;                        RC_BAR2_CONFIG_LO_SIZE_MASK);
+;      writel(tmp, base + PCIE_MISC_RC_BAR2_CONFIG_LO);
+;      writel(upper_32_bits(rc_bar2_offset),
+;             base + PCIE_MISC_RC_BAR2_CONFIG_HI);
+;
+;  So the pair is: LOW 5 bits of LO are a SIZE CODE, the remaining bits
+;  of LO plus all of HI are the OFFSET that gets ADDED to a system
+;  address to produce the PCI bus address the device must be given.
+;
+;  WHAT THE FIRMWARE LEFT HERE, read off the silicon before Anvil reset
+;  the link itself:
+;
+;      RC_BAR2_CONFIG_LO  $00000011     size code 17, offset bits 0
+;      RC_BAR2_CONFIG_HI  $00000004     offset bits 63:32 = 4
+;
+;  Offset $4_0000_0000. Size code 17 is log2 - 15, so 1 << 32 - a 4 GiB
+;  window. A buffer at ARM physical $480120 was reachable by the device
+;  only as bus address $4_0048_0120, and handing it the bare $480120
+;  put the read outside the window entirely. That is the register pair
+;  this whole comment block was written from, and it is why PcieDmaBus()
+;  exists.
+;
+;  WHAT IS THERE NOW, AND WHY IT IS DIFFERENT - 2026-09-17, read off a
+;  running build 165 at the prompt:
+;
+;      RC_BAR2_CONFIG_LO  $0000000F     size code 15, offset bits 0
+;      RC_BAR2_CONFIG_HI  $00000000     offset bits 63:32 = 0
+;      MISC_CTRL          $78003480     SCB0 size code 15
+;
+;  Offset ZERO on this board, on the path it actually takes. The adopt
+;  path only maps BAR0; the link reset happens AFTER XhciQuiesceAdopted,
+;  inside PcieEnumerate, and PcieResetAndTrain then programs this pair
+;  itself - identity mapped, at whatever #PCIE_INBOUND_SIZE_CODE says.
+;  The firmware's $4_0000_0000 above is overwritten before any driver
+;  DMAs anything, so it is history, not the live configuration.
+;
+;  This block used to end by saying the offset is WHOEVER SET IT UP -
+;  here U-Boot - and is not zero. That was true of the design it was
+;  written under and is false now; the readback above is what settled it.
+;  The size code of 15 is a separate defect and is forum 916: a 1 GiB
+;  window with PcieDmaOk approving anything under 3 GiB. Both registers
+;  now take #PCIE_INBOUND_SIZE_CODE = 17.
+;
+;  SO: READ IT, DO NOT ASSUME IT. PcieDmaBus() below is the conversion
+;  every DMA address must go through, on either path. It is deliberately
+;  a different procedure from PcieBusFromCpu(), which converts in the
+;  OUTBOUND direction for BAR programming and has nothing to do with
+;  this - confusing the two is exactly the sort of thing that produces a
+;  plausible number and a dead controller.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  PcieReadDmaOffset - pull the inbound offset out of the root complex.
+;  Called by PcieInit on BOTH paths. Safe to call again.
+; ----------------------------------------------------------------------
+Procedure PcieReadDmaOffset()
+  Define lo.i
+  Define hi.i
+  lo = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $FFFFFFFF
+  hi = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_HI) & $FFFFFFFF
+  ; The low five bits are the size code and are NOT part of the offset.
+  pcie_dmaOff = ((hi << 32) | (lo & $FFFFFFE0))
+  pcie_dmaOffRead = 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieDmaOffset - what gets added to a system address for the device.
+;  Zero is a legitimate answer; it means the window is identity-mapped.
+; ----------------------------------------------------------------------
+Procedure.i PcieDmaOffset()
+  ; Lazy, because PcieInit sits ABOVE this in the file and the host
+  ; will not call forward. Reading on demand also means the value is
+  ; whatever the register says NOW, which matters on the adopt path
+  ; where somebody else configured it.
+  If pcie_dmaOffRead = 0
+    PcieReadDmaOffset()
+  EndIf
+  ProcedureReturn pcie_dmaOff
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieDmaWindowSize - how much memory the inbound window covers, from
+;  the size code. 0 means the window is DISABLED and no DMA can work.
+;
+;  The encoding is brcm_pcie_encode_ibar_size() run backwards:
+;      codes $1C..$1F  ->  4 KiB .. 32 KiB   (code - $1C + 12)
+;      codes 1..22     ->  64 KiB .. 32 GiB  (code + 15)
+;      code 0          ->  disabled
+; ----------------------------------------------------------------------
+Procedure.i PcieDmaWindowSize()
+  Define code.i
+  code = PcieRcPeek(#PCIE_MISC_RC_BAR2_CONFIG_LO) & $1F
+  If code = 0
+    ProcedureReturn 0
+  EndIf
+  If code >= $1C
+    ProcedureReturn 1 << ((code - $1C) + 12)
+  EndIf
+  If code <= 22
+    ProcedureReturn 1 << (code + 15)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PcieDmaBus - THE conversion. Give it a system address, get the bus
+;  address the device must be told about.
+;
+;  REFUSES with #PCIE_ERR_RANGE rather than returning a plausible
+;  number, on the same principle as PcieCpuFromBus: a DMA address that
+;  is quietly wrong produces a controller that reports a Host System
+;  Error hours later, with nothing to connect it back to here.
+;
+;  Call PcieDmaOk() as well - they answer different questions. This one
+;  asks "what address does the device use", that one asks "is the
+;  device allowed to reach it at all", and the 3 GiB erratum means the
+;  answer to the second can be no even when the first succeeds.
+; ----------------------------------------------------------------------
+Procedure.i PcieDmaBus(physAddr.i)
+  If pcie_dmaOffRead = 0
+    PcieReadDmaOffset()
+  EndIf
+  If physAddr < 0
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  ; A window size of zero means the inbound path is switched off. Any
+  ; address at all is wrong in that state, so refuse rather than hand
+  ; back an address that cannot possibly be serviced.
+  If PcieDmaWindowSize() = 0
+    ProcedureReturn #PCIE_ERR_RANGE
+  EndIf
+  ProcedureReturn physAddr + pcie_dmaOff
+EndProcedure

@@ -1,0 +1,238 @@
+; ======================================================================
+;  hw_addr.pi3 - the Raspberry Pi 3's answer to "is this address safe to
+;                touch".
+;
+;  The core asks HwAddrCheck() before every command that takes an address
+;  from the operator (Anvil/Core/addrsafe.pbi, contract in
+;  Anvil/Hal/hal.pbi). This board's answer is short, because this board's
+;  map is short: two windows answer and everything else is refused.
+;
+; ----------------------------------------------------------------------
+;  THE REFUSAL IS ABOUT THE PAGE TABLES, AND IT SAYS SO
+; ----------------------------------------------------------------------
+;  This is the lesson the Pi 4 lane paid for on silicon on 2026-09-18 and
+;  it is written into this file from the first line rather than added
+;  after an incident here. On that board `memory 103FFFFC0` answered SAFE
+;  because there IS memory at that address on a 4 GB Pi 4 - and the
+;  monitor's page tables did not map it, so the access was a level-1
+;  translation fault, the console went with it, and the board had to have
+;  its power removed by hand.
+;
+;  The lesson is not "be careful about memory sizes". It is that A GUARD
+;  DERIVED INDEPENDENTLY OF THE TABLES WILL EVENTUALLY DISAGREE WITH
+;  THEM, and the disagreement is discovered by faulting. So this file
+;  does not have its own opinion about what is where: it asks
+;  MmuAttrFor() in RaspberryPi3/Lib/mmu.pi3, which is the same procedure
+;  MmuBuildTables() asks when it writes the descriptors. One statement of
+;  the map, two readers.
+;
+;  WHERE THEY DELIBERATELY DIFFER, AND IT IS ONE PLACE. The ARM-local
+;  peripheral window is 4 KB ($40000000..$40000FFF, from
+;  arch/arm/boot/dts/broadcom/bcm2837.dtsi line 9). The finest thing
+;  these tables can express is a 2 MB block, so the tables map
+;  $40000000..$401FFFFF as Device and this guard refuses above
+;  $40000FFF. THE GUARD IS TIGHTER THAN THE TABLES HERE. That direction
+;  is safe - a refusal is a refusal and the board stays at its prompt -
+;  and the other direction is the one that costs a power cycle. It is
+;  written down in both files so that neither is "corrected" to match the
+;  other.
+;
+; ----------------------------------------------------------------------
+;  THE THREE ANSWERS THIS BOARD GIVES
+; ----------------------------------------------------------------------
+;  #HW_ADDR_SAFE       DRAM the ARM was actually given, and the two
+;                      peripheral windows. Every block in the $3F000000
+;                      aperture is clocked by the firmware before Anvil
+;                      is entered - `memory 3F003000` reading the system
+;                      timer is how half this tree was debugged.
+;
+;  #HW_ADDR_ABSENT     DRAM that is fitted but that the ARM cannot have:
+;                      above what the firmware gave us (the gpu_mem
+;                      split), and the top 16 MB of the gigabyte that
+;                      the peripheral aperture covers. The board KNOWS
+;                      there is nothing there for it, which is what
+;                      ABSENT means, as against being afraid of it.
+;
+;  #HW_ADDR_UNCLOCKED  everything the page tables leave at FAULT, which
+;                      on this part is one span: above the processor-local
+;                      window. The
+;                      name is the seam's and it is the closest of the
+;                      four to the truth here: an access does not return
+;                      a wrong number, it STOPS THE MONITOR. The
+;                      distinction that matters to an operator is
+;                      "refused and you still have a prompt" versus "the
+;                      board is gone", and this is the arm that keeps the
+;                      first one.
+;
+;  ALL THREE ARE OVERRIDABLE BY `force`, like every other refusal in this
+;  monitor, because a debugger that cannot be pointed at an address its
+;  board calls empty cannot prove the board wrong. `force` on an
+;  UNCLOCKED range on this part will fault, and that is the operator's
+;  choice to make with the sentence in front of them.
+;
+; ----------------------------------------------------------------------
+;  THIS BOARD DOES NOT STALL, AND THAT IS MEASURED, NOT ASSUMED
+; ----------------------------------------------------------------------
+;  The seam exists because on the Arduino UNO Q's QCM2290 an MMIO access
+;  to a clock-gated block stalls the interconnect and the board needs its
+;  power removing. The BCM2837 behaves like the BCM2711 and not like
+;  that: every peripheral in the $3F000000 window is behind clocks the
+;  firmware starts before entry, and this tree's own drivers read the
+;  system timer, the PL011, the GPIO block, the mailbox, the PM watchdog
+;  and the SDHOST at this exception level with no preparation beyond what
+;  those drivers do. The register windows answer.
+;
+;  So the narrow claim is true: no address on this board is known to
+;  stall the bus. It is NOT the claim that every address holds something
+;  useful, and it is NOT the claim that a write anywhere is a good idea -
+;  the monitor's own window refusals (HitsMonitor, InPayload) are
+;  unchanged and still run, because they answer a completely different
+;  question: not "will this access complete" but "will it destroy the
+;  thing that is running".
+;
+;  INCLUDE ORDER: after RaspberryPi3/Lib/mmu.pi3 (MmuAttrFor,
+;  #MMU3_DESC_FAULT, #MMU3_PERIPH_BASE, #MMU3_LOCAL_*), after
+;  RaspberryPi3/Board/hw_mem.pi3 (HwMemoryBytes) and after
+;  Anvil/Hal/hal.pbi (#HW_ADDR_*). House rule 10: this file includes
+;  nothing itself.
+; ======================================================================
+
+Global *gPiAddrWhy
+Global gPiAddrLo.i
+Global gPiAddrHi.i
+
+; Do the inclusive ranges lo..hi and blo..bhi overlap at all?
+Procedure.i pi3AddrHit(lo.i, hi.i, blo.i, bhi.i)
+  If lo > bhi Or hi < blo
+    ProcedureReturn 0
+  EndIf
+  gPiAddrLo = blo
+  gPiAddrHi = bhi
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  pi3AddrArmTop() - one past the last byte of DRAM the ARM may touch.
+;
+;  THE SMALLER OF TWO TRUTHS, and taking the smaller is the whole point.
+;  The firmware tells us how much of the first gigabyte the ARM was given
+;  (pi3_ram_end, from the "get ARM memory" tag during boot); the hardware
+;  puts the peripheral aperture at $3F000000 whatever the firmware says.
+;  A guard that used only the first would allow the aperture to be read
+;  as though it were memory on a board with gpu_mem set low; one that
+;  used only the second would allow the VideoCore's share to be written.
+;
+;  WHEN THE FIRMWARE WAS NEVER ASKED, pi3_ram_end is 0 and the aperture
+;  base is the answer. That is the larger of the two, which is the less
+;  strict direction - and it is right here: an unasked firmware means
+;  boot has not finished, and refusing all of DRAM during boot would make
+;  the recovery path refuse the upload that was going to fix the board.
+; ----------------------------------------------------------------------
+Procedure.i pi3AddrArmTop()
+  If pi3_ram_end > 0 And pi3_ram_end < #MMU3_PERIPH_BASE
+    ProcedureReturn pi3_ram_end
+  EndIf
+  ProcedureReturn #MMU3_PERIPH_BASE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrCheck(lo, hi, forWrite) - the answer for the WHOLE inclusive
+;  range. Any overlap with a refused span refuses all of it: a command
+;  that walked into a fault two thirds of the way through would have
+;  already printed two thirds of a plausible dump.
+;
+;  forWrite is not consulted on this board. Every span that is safe to
+;  read is safe to write - there is no read-only aperture here, and the
+;  windows that must not be WRITTEN (the monitor's own code, its tables,
+;  the device tree) are refused by Anvil/Core/memrange.pbi's
+;  HitsMonitor(), which is a different question asked by a different
+;  seam. Saying that here is better than a silent unused parameter.
+; ----------------------------------------------------------------------
+Procedure.i HwAddrCheck(lo.i, hi.i, forWrite.i)
+  Define armTop.i
+
+  *gPiAddrWhy = 0
+  gPiAddrLo = 0
+  gPiAddrHi = 0
+
+  ; ------------------------------------------------------------------
+  ;  1. NEGATIVE, OR ABOVE THE TRANSLATION REGIME ALTOGETHER.
+  ;
+  ;     This monitor runs with a 32-bit input address (T0SZ = 32, see
+  ;     RaspberryPi3/Lib/mmu.pi3's GEOMETRY), so anything at or above
+  ;     four gigabytes is not merely unmapped - it is outside what the
+  ;     tables describe at all. There is nothing up there on this part:
+  ;     the BCM2837 has no second run of DRAM and no outbound window.
+  ; ------------------------------------------------------------------
+  If lo < 0 Or hi < 0 Or lo > $FFFFFFFF Or hi > $FFFFFFFF
+    *gPiAddrWhy = "outside the four gigabytes this monitor translates at all on this part, which has no memory or window above that line: an access there is a fault and Anvil stops on it"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  2. MAPPED BY NOTHING.
+  ;
+  ;     THERE IS ONLY ONE SUCH SPAN AND IT IS THE TOP. The peripheral
+  ;     aperture and the processor-local window are ADJACENT on this
+  ;     part - $3FFFFFFF + 1 is $40000000 - so there is no gap between
+  ;     them to refuse. An earlier version of this procedure refused one
+  ;     anyway, with a sentence about a span whose low edge was above
+  ;     its high edge; tools/pi3_memory_guard_check.py caught it as dead
+  ;     code on its first run. It is gone rather than corrected, because
+  ;     the correction was to delete it.
+  ; ------------------------------------------------------------------
+  If pi3AddrHit(lo, hi, #MMU3_LOCAL_TOP + 1, $FFFFFFFF) <> 0
+    *gPiAddrWhy = "above the processor-local peripheral window, where this monitor's page tables map nothing at all: an access there is a translation fault that Anvil stops on"
+    ProcedureReturn #HW_ADDR_UNCLOCKED
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  3. MAPPED, BUT THERE IS NO MEMORY BEHIND IT FOR THE PROCESSOR.
+  ;
+  ;     Between the top of what the ARM was given and the peripheral
+  ;     aperture. A read there does not fault - the tables map it as
+  ;     ordinary DRAM - it returns whatever the controller leaves on the
+  ;     wire, printed in a plausible dump under a heading that says it is
+  ;     the contents of memory. That is the worst failure this monitor
+  ;     has: not a hang, which announces itself, but a wrong answer that
+  ;     looks exactly like a right one.
+  ; ------------------------------------------------------------------
+  armTop = pi3AddrArmTop()
+  If armTop < #MMU3_PERIPH_BASE
+    If pi3AddrHit(lo, hi, armTop, #MMU3_PERIPH_BASE - 1) <> 0
+      *gPiAddrWhy = "above the memory the firmware gave the processor: what is there belongs to the VideoCore, or is the part of the gigabyte the peripheral window covers, and reading it returns whatever the controller leaves on the wire rather than data"
+      ProcedureReturn #HW_ADDR_ABSENT
+    EndIf
+  EndIf
+
+  ProcedureReturn #HW_ADDR_SAFE
+EndProcedure
+
+Procedure.i HwAddrReason()
+  ProcedureReturn *gPiAddrWhy
+EndProcedure
+
+Procedure.i HwAddrBlockLo()
+  ProcedureReturn gPiAddrLo
+EndProcedure
+
+Procedure.i HwAddrBlockHi()
+  ProcedureReturn gPiAddrHi
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwAddrReport() - the paragraph `help` prints about this board's
+;  address policy. The core owns the heading; the board owns the prose,
+;  because the prose is entirely about this chip.
+; ----------------------------------------------------------------------
+Procedure HwAddrReport()
+  PrintN("  On this board three spans answer and everything else is refused:")
+  PrintN("  the memory the firmware gave the processor, the peripherals at")
+  PrintN("  $3F000000, and the processor-local window at $40000000. The refusals")
+  PrintN("  come from the same description of the map that built the page tables,")
+  PrintN("  so an address this monitor calls unmapped really is unmapped - it will")
+  PrintN("  say so and leave you at the prompt rather than stopping on a fault.")
+  PrintN("  Nothing on this part stalls the bus, so a refusal here is never fear;")
+  PrintN("  it is either a translation fault waiting to happen or memory this")
+  PrintN("  processor was not given. force overrides any of them.")
+EndProcedure

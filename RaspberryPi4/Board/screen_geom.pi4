@@ -1,0 +1,938 @@
+; ======================================================================
+;  screen_geom.pi4 - THE DISPLAY SEAM'S ARITHMETIC, AND NOTHING ELSE.
+;
+;  Which screen the board comes up on, how big the font is, which way up
+;  the console sits on the panel, and where a pixel drawn at (x, y) has
+;  to end up in the buffer the panel scans.
+;
+;  ---- WHY IT IS ITS OWN FILE ------------------------------------------
+;
+;  EVERY PROCEDURE HERE IS A FUNCTION OF ITS ARGUMENTS. Nothing in this
+;  file reads a register, sends a mailbox message, touches I2C or asks
+;  the settings store anything. The two that move memory move only the
+;  memory they are handed the address of.
+;
+;  That is what lets tools/a64/a64_dsiscreen_check.py EXECUTE all of it,
+;  on a machine with no VideoCore in it, against the same image the
+;  board runs - including the transpose, pixel by pixel, checked against
+;  the corner map. Keeping it in screen_source.pi4 beside the DSI
+;  bring-up would have meant a gate that could only re-implement this
+;  arithmetic in Python and compare two guesses.
+;
+;  So the rule for this file is one line: IF A PROCEDURE HERE EVER NEEDS
+;  A REGISTER, IT DOES NOT BELONG HERE. Move it to screen_source.pi4 and
+;  the gate keeps working; leave it here and the gate quietly stops
+;  being a test of the thing that ships.
+;
+;  ---- INCLUDE ORDER ---------------------------------------------------
+;  Anywhere before screen_source.pi4. It needs nothing but PeekN/PokeN.
+; ======================================================================
+
+; #SCR_SRC_AUTO IS A REQUEST, NOT A SCREEN. It is what the boot path and
+; a bare "screen on" ask for, and ScreenUpOn turns it into one of the
+; three below before anything else happens. It is negative so it can
+; never be confused with a real source in a comparison somebody writes
+; later.
+#SCR_SRC_AUTO = -1
+#SCR_SRC_NONE = 0
+#SCR_SRC_HDMI = 1
+#SCR_SRC_DSI  = 2
+
+; ======================================================================
+;  THE FONT SIZE IS COMPUTED FROM HOW BIG THE GLASS IS. IT IS NOT
+;  COMPUTED FROM HOW MANY PIXELS ARE ACROSS IT.
+;
+;  ---- WHAT THIS REPLACED, AND WHY IT WAS WRONG -----------------------
+;
+;  The rule here used to be floor(width / 640) - "at least eighty
+;  columns, and the largest whole magnification that keeps it so". It
+;  scaled the type with the console's PIXEL WIDTH.
+;
+;  Turning a panel round does not change how big the panel is. So a
+;  width-driven rule cannot help but change the PHYSICAL size of the
+;  type when the console is turned: the Waveshare 10.1 is 800 pixels
+;  across when the console runs with the panel's own scan and 1280
+;  across when it is turned landscape, on the same piece of glass, and
+;  the old rule answered scale 1 for the first and scale 2 for the
+;  second. Twice the type, same screen, because the picture was turned.
+;
+;  That is exactly what was reported from the bench on 2026-09-08:
+;  "everything scaled correctly portrait, too big landscape still."
+;  Portrait was never fixed - portrait was ACCIDENTALLY RIGHT, because
+;  at 800 pixels the wrong rule happens to land on the scale this
+;  panel's density actually wants. Landscape is the same rule giving
+;  precisely twice it.
+;
+;  ---- THE RULE NOW ----------------------------------------------------
+;
+;  A GLYPH IS A PHYSICAL SIZE, so it is computed from physical things:
+;
+;    1. the screen's diagonal in PIXELS      - sqrt(w*w + h*h)
+;    2. the screen's diagonal in INCHES      - what the hardware says
+;    3. pixels to the inch is (1) over (2)
+;    4. the wanted cell height in pixels is the target height in inches
+;       times (3), and the scale is that over the font's 16 rows,
+;       rounded to the NEAREST whole number
+;
+;  Steps 1 and 2 describe THE GLASS. Neither of them changes when the
+;  console is turned, so the answer cannot change either, and that is
+;  the whole of the fix. Both orientations hand this their own logical
+;  width and get the same physical glyph height back.
+;
+;  ---- THE TARGET HEIGHT, AND WHERE THE NUMBER CAME FROM --------------
+;
+;  #SCR_GLYPH_THOU is 110 thousandths of an inch - 0.110 inch - of CELL
+;  height, which is the line pitch and not the letter: the capital in an
+;  8 x 16 cell occupies about ten of the sixteen rows, so 0.110 inch of
+;  cell is about 0.069 inch of capital.
+;
+;  THE SOURCE IS THE BENCH, and it is the best one available because it
+;  is the only measurement that is about this glass and the person
+;  reading it. This panel at scale 1 draws a 16-pixel cell at 149 pixels
+;  to the inch, which is 0.107 inch, and that was graded correct on the
+;  bench on 2026-09-08 with the console running at the panel's own scan.
+;  110 is that reading, rounded to a number a person can hold in their
+;  head.
+;
+;  THE BRACKET, SAID HONESTLY, because 0.110 inch is at the SMALL end of
+;  what a desktop would use and somebody should know that before moving
+;  it: a desktop terminal at 96 pixels to the inch is nearer 0.135 inch
+;  (xterm's 6 x 13 default) to 0.167 inch (a 12 point console font), and
+;  those are read at arm's length rather than at a bench. Ergonomic
+;  standards state the letter rather than the cell and ask for at least
+;  16 minutes of arc: 0.069 inch of capital is 17 minutes at 14 inches
+;  and only 12 at 20, so this figure IS a close-bench figure and it is
+;  not pretending otherwise. `screen scale <n>` exists for the bench
+;  that disagrees, and it saves.
+;
+;  THE CHOICE IS NOT DELICATE, which is worth knowing before anybody
+;  argues about the third digit. On this panel every target from 0.054
+;  to 0.160 inch rounds to scale 1; it takes a target above 0.160 to ask
+;  for scale 2 again. The number decides a bucket, not a pixel.
+;
+;  ---- THE EIGHTY COLUMNS ARE STILL HERE, AS A CAP --------------------
+;
+;  Eighty is not nostalgia: it is the width this monitor's own text is
+;  written to. Every error message, every help block and every table in
+;  Anvil is laid out inside eighty columns, and a console narrower than
+;  that wraps all of them - which is worse to read than smaller type.
+;
+;  So the density picks the size and the eighty columns CAP it. On a
+;  small dense screen - a four inch 720 x 720 panel is 255 pixels to the
+;  inch and would ask for scale 2, which is 45 columns - the cap wins
+;  and the type comes out smaller than ideal, on purpose. On every
+;  screen this board is likely to meet the cap is not binding and the
+;  density decides alone.
+;
+;  ---- WHAT IT GIVES, WORKED THROUGH ----------------------------------
+;
+;  The Waveshare 10.1 is 800 x 1280 and its own microcontroller reports
+;  a size of $65 = 101, which is the diagonal in TENTHS OF AN INCH, so
+;  10.1 inches. Measured on this board on 2026-09-06.
+;
+;    diagonal in pixels   sqrt(800*800 + 1280*1280) = 1509
+;    pixels to the inch   1509 / 10.1               = 149
+;    wanted cell height   0.110 * 149               = 16.4 pixels
+;    scale                round(16.4 / 16)          = 1
+;
+;  CROSS-CHECKED AGAINST A SECOND SOURCE that knows nothing about the
+;  size byte: the panel driver's own mode entry for this exact panel,
+;  Reference/rpi-6.12.y_panel-waveshare-dsi-v2.c:1812-1824
+;  (ws_panel_10_1_a_mode - 800 x 1280 at a 70 MHz pixel clock, which is
+;  the mode this monitor sends), gives width_mm 135 and height_mm 216.
+;  That is 150.5 pixels to the inch, and it agrees with the 149 above to
+;  within 0.7 percent. Two independent statements of how big the glass
+;  is, from a byte on an I2C bus and from a driver in a kernel tree.
+;
+;    LANDSCAPE (the default)  1280 x 800   scale 1, 8 x 16 cells
+;                             160 columns, 42 lines under the banner
+;    the panel's own scan      800 x 1280  scale 1, 8 x 16 cells
+;                             100 columns, 72 lines under the banner
+;
+;  SAME SCALE, SAME CELL, SAME 0.107 INCH OF TYPE EITHER WAY. The two
+;  consoles differ in how much text fits, which is a fact about the
+;  shape of the screen, and in nothing else. That is the property the
+;  gate asserts directly.
+; ======================================================================
+#SCR_FONT_W   = 8              ; the built-in font, before magnification
+#SCR_FONT_H   = 16
+#SCR_MIN_COLS = 80             ; the width this monitor's own text is written to
+
+; The wanted CELL height, in thousandths of an inch. See THE TARGET
+; HEIGHT above for where 110 comes from and how wide the bucket is.
+#SCR_GLYPH_THOU = 110
+
+; The largest magnification this will ever choose or accept. An 8 x 16
+; font at 8 is a 64 x 128 cell and ten columns on this panel; past that
+; a number is far more likely to be a typo than an instruction, and a
+; refusal that says so is worth more than obeying it.
+#SCR_SCALE_MAX = 8
+
+; ----------------------------------------------------------------------
+;  ScrISqrt - floor(sqrt(n)), in integers, because this file has no
+;  floating point and does not want any: every number here is a count of
+;  pixels or of thousandths of an inch.
+;
+;  Newton's method on integers, which terminates because the sequence is
+;  strictly decreasing until it reaches the floor. Runs about twenty
+;  times per screen bring-up, once, and never again.
+; ----------------------------------------------------------------------
+Procedure.i ScrISqrt(n.i)
+  Define x.i
+  Define y.i
+
+  If n <= 0
+    ProcedureReturn 0
+  EndIf
+  x = n
+  y = (x + 1) / 2
+  While y < x
+    x = y
+    y = (x + n / x) / 2
+  Wend
+  ProcedureReturn x
+EndProcedure
+
+; The screen's diagonal in pixels. THE PANEL'S OWN GEOMETRY GOES IN HERE
+; AND NOT THE CONSOLE'S, because this is a fact about the glass; feeding
+; it a rotated console's width and height gives the same answer anyway,
+; which is a useful property rather than an excuse to be careless.
+Procedure.i ScrDiagPixels(w.i, h.i)
+  ProcedureReturn ScrISqrt(w * w + h * h)
+EndProcedure
+
+; Pixels to the inch, given the diagonal in TENTHS of an inch - the unit
+; the panel's microcontroller reports its size in. This is the number
+; the boot log and `screen` print; the scale below does not use it,
+; because rounding a density and then rounding a scale derived from it
+; rounds twice.
+Procedure.i ScrPixelsPerInch(w.i, h.i, diagTenths.i)
+  If diagTenths < 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (ScrDiagPixels(w, h) * 10) / diagTenths
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrScaleIdeal - the magnification the screen's density asks for,
+;  BEFORE the eighty-column cap. Rounded to the NEAREST whole number and
+;  not floored: the scale wanted is the one whose glyph is closest to
+;  the target height, and flooring would always pick the smaller of two
+;  and be systematically half a step small.
+;
+;  round(a/b) in integers is (2a + b) / (2b).
+;
+;  A screen that cannot say how big it is answers 1 rather than a guess
+;  that looks computed. The caller is the one that knows whether the
+;  size was read or assumed, and it says which.
+; ----------------------------------------------------------------------
+Procedure.i ScrScaleIdeal(w.i, h.i, diagTenths.i)
+  Define num.i
+  Define den.i
+  Define s.i
+
+  If diagTenths < 1
+    ProcedureReturn 1
+  EndIf
+  num = #SCR_GLYPH_THOU * ScrDiagPixels(w, h)
+  den = diagTenths * 100 * #SCR_FONT_H
+  s = (2 * num + den) / (2 * den)
+  If s < 1
+    s = 1
+  EndIf
+  If s > #SCR_SCALE_MAX
+    s = #SCR_SCALE_MAX
+  EndIf
+  ProcedureReturn s
+EndProcedure
+
+; ScrScaleCap - the largest magnification that still leaves #SCR_MIN_COLS
+; columns across a console this wide. Never below 1: a screen too narrow
+; for eighty columns still has to show something.
+Procedure.i ScrScaleCap(logicalW.i)
+  Define c.i
+  c = logicalW / (#SCR_FONT_W * #SCR_MIN_COLS)
+  If c < 1
+    c = 1
+  EndIf
+  ProcedureReturn c
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrScaleFor - THE WHOLE RULE, IN ONE FUNCTION OF FOUR ARGUMENTS.
+;
+;  w, h          the SCREEN's own pixel geometry - the panel's scan, not
+;                the console's. It does not change with rotation.
+;  diagTenths    how big the screen is, diagonally, in tenths of an inch
+;  logicalW      how wide the CONSOLE is - 1280 landscape, 800 portrait.
+;                It is used for one thing only: the eighty-column cap.
+;
+;  The separation of the last two arguments IS the fix. The size of the
+;  type comes from the first three; the console's own width can only
+;  ever make it smaller, never larger.
+; ----------------------------------------------------------------------
+Procedure.i ScrScaleFor(w.i, h.i, diagTenths.i, logicalW.i)
+  Define s.i
+  Define c.i
+
+  s = ScrScaleIdeal(w, h, diagTenths)
+  c = ScrScaleCap(logicalW)
+  If s > c
+    s = c
+  EndIf
+  ProcedureReturn s
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHAT THE ANSWER MEANS, IN THE UNITS A PERSON READS.
+;
+;  ScrGlyphThou is the height of one line of text on the glass, in
+;  thousandths of an inch. THE GATE ASSERTS THIS IS EQUAL IN BOTH
+;  ORIENTATIONS, which is the single number that says the bug is fixed -
+;  columns and rows differ between the two because the screen is not
+;  square, and only this one is supposed to be the same.
+; ----------------------------------------------------------------------
+Procedure.i ScrGlyphThou(scale.i, ppi.i)
+  If ppi < 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (#SCR_FONT_H * scale * 1000) / ppi
+EndProcedure
+
+; The console's size in cells. Both are here so that the boot log, the
+; `screen` report, the `screen rotate` preview and the gate cannot each
+; write the division out and drift.
+Procedure.i ScrColsFor(logicalW.i, scale.i)
+  If scale < 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn logicalW / (#SCR_FONT_W * scale)
+EndProcedure
+
+Procedure.i ScrRowsFor(logicalH.i, bannerH.i, scale.i)
+  If scale < 1
+    ProcedureReturn 0
+  EndIf
+  If logicalH <= bannerH
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (logicalH - bannerH) / (#SCR_FONT_H * scale)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE OVERRIDE. `screen scale <n>` writes `screen.scale` and this is
+;  how it beats the calculation.
+;
+;  #SCR_SCALE_UNSET is what an absent or unreadable setting reads as. It
+;  is negative so it can never collide with a magnification, and
+;  ScrScalePick treats it exactly like any other value that is not one
+;  this can do - there is no separate "absent" path, because a store
+;  holding nothing and a store holding rubbish want the same answer.
+;
+;  A STORED VALUE IS NOT CLAMPED INTO RANGE. A stored 40 does not become
+;  8; it falls back to the computed scale and stays visible as wrong in
+;  `screen scale`, the same rule `screen.rotate` is under. Silently
+;  obeying half of what somebody typed is how a setting stops meaning
+;  what it says.
+; ----------------------------------------------------------------------
+#SCR_SCALE_UNSET = -1
+
+Procedure.i ScrScaleOk(n.i)
+  If n >= 1 And n <= #SCR_SCALE_MAX
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i ScrScalePick(stored.i, computed.i)
+  If ScrScaleOk(stored) <> 0
+    ProcedureReturn stored
+  EndIf
+  ProcedureReturn computed
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SIZE OF A SCREEN THAT CANNOT SAY HOW BIG IT IS.
+;
+;  The DSI panel can: its microcontroller answers register $97 with the
+;  diagonal in tenths of an inch, and this board reads $65 = 10.1 in.
+;
+;  AN HDMI DISPLAY CANNOT, AND THAT IS A FINDING RATHER THAN AN
+;  OVERSIGHT. The VideoCore property interface has a tag whose name
+;  promises otherwise - GET_PHYSICAL_WIDTH_HEIGHT - and it answers in
+;  PIXELS, not in millimetres; it is the framebuffer's size and nothing
+;  about the glass. The real answer is in the monitor's EDID, whose
+;  bytes 21 and 22 are the image size in centimetres and which the
+;  firmware will hand over block by block (tag $00030020). Reading and
+;  trusting an EDID is its own piece of work - the block has a checksum,
+;  a 0,0 that means "not stated", and monitors that lie about it - so
+;  until that exists this is a STATED ASSUMPTION and every report that
+;  uses it says out loud that it is one.
+;
+;  240 tenths is a 24 inch desktop monitor. At 1920 x 1080 that is 92
+;  pixels to the inch and this rule answers scale 1, which is exactly
+;  what an HDMI console draws at today - so an HDMI monitor does not
+;  change when this lands, which is the point.
+; ----------------------------------------------------------------------
+#SCR_HDMI_DIAG_TENTHS = 240
+
+; The size code the panel micro is expected to answer with, used only
+; when the byte did not read. NOT a substitute for asking: this monitor
+; sends one DSI mode, the 800 x 1280 at 70 MHz that
+; Reference/rpi-6.12.y_panel-waveshare-dsi-v2.c:1812-1824 calls
+; ws_panel_10_1_a_mode, so a panel it has lit is a 10.1 inch one.
+#SCR_DSI_DIAG_TENTHS = 101
+
+; ScrDiagUsable - 1 if a size code read off a panel is worth believing.
+; Under an inch is a byte that did not arrive; $FF is an undriven bus
+; with its pull-ups. Neither is a panel and neither may be divided by.
+Procedure.i ScrDiagUsable(tenths.i)
+  If tenths >= 10 And tenths <= 254
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ScrRotOk - 1 if this is one of the four rotations, else 0. There is no
+; rounding to the nearest legal value: a number nobody meant is a
+; refusal, not a guess at what they meant.
+Procedure.i ScrRotOk(deg.i)
+  If deg = 0 Or deg = 90 Or deg = 180 Or deg = 270
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  WHICH WAY UP THE CONSOLE COMES UP, WITH NOTHING TYPED.
+;
+;  THE RULING, 2026-09-08: the panel on this bench is used LANDSCAPE,
+;  because that is how it fits there. That is the whole of why this is
+;  90 and not 0, and it is not a preference about pixels - it is where
+;  the panel is bolted.
+;
+;  THE ROTATION IS A PROPERTY OF THE SCREEN, NOT OF THE FILE, WHICH IS
+;  WHY THIS TAKES A SOURCE. The two screens are not the same question:
+;
+;    HDMI  the firmware hands over a landscape framebuffer already the
+;          right way up, and this monitor does not turn it. Its
+;          rotation is 0 and there is nothing to store.
+;    DSI   the panel SCANS 800 across by 1280 down - portrait, and no
+;          setting changes that - but it is MOUNTED long edge across.
+;          So the console is 1280 x 800 and the renderer turns it, and
+;          the default has to be one of the two sideways ones.
+;
+;  90 OR 270 IS A QUESTION ABOUT A CABLE, and no amount of reading
+;  answers it: which end of a portrait panel is the top depends on which
+;  way the flat cable leaves the board and which way round the panel is
+;  screwed to the frame. 90 is the default because a default has to be
+;  one of them. IF THE FIRST PICTURE IS UPSIDE DOWN THE FIX IS
+;  `screen rotate 270`, TYPED ONCE - it is saved, and the panel comes up
+;  that way afterwards with nothing typed. It is not a rebuild, and a
+;  worker who rebuilds for it has misread this paragraph.
+; ----------------------------------------------------------------------
+Procedure.i ScrRotDefault(src.i)
+  If src = #SCR_SRC_DSI
+    ProcedureReturn 90
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; #SCR_ROT_UNSET is what a stored rotation reads as when SETTINGS.TXT
+; has no `screen.rotate` in it, or has one that is not a number. It is
+; negative so it can never collide with a rotation, and ScrRotPick
+; treats it exactly like any other value that is not one of the four -
+; there is no separate "absent" path, because a store holding garbage
+; and a store holding nothing want the same answer.
+#SCR_ROT_UNSET = -1
+
+; ----------------------------------------------------------------------
+;  ScrRotPick - THE ROTATION THAT WILL BE USED, given the screen and
+;  whatever the settings store had in it.
+;
+;  This is the whole resolution in one function of two arguments, which
+;  is what lets the gate execute it rather than re-describe it. A stored
+;  value that is not one of the four is NOT rounded to the nearest and
+;  is NOT an error that stops the boot: it falls back to the default and
+;  stays visible as wrong in `screen rotate`, the same rule every other
+;  setting this monitor reads is under.
+; ----------------------------------------------------------------------
+Procedure.i ScrRotPick(src.i, stored.i)
+  If src <> #SCR_SRC_DSI
+    ProcedureReturn 0
+  EndIf
+  If ScrRotOk(stored) = 0
+    ProcedureReturn ScrRotDefault(src)
+  EndIf
+  ProcedureReturn stored
+EndProcedure
+
+
+; ScrSideways - 1 when the console's width and height are the panel's
+; the other way round, which is the whole of what 90 and 270 mean here.
+Procedure.i ScrSideways(deg.i)
+  If deg = 90 Or deg = 270
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The console's own width and height at a rotation, given the panel's.
+Procedure.i ScrLogicalW(deg.i, panelW.i, panelH.i)
+  If ScrSideways(deg) <> 0
+    ProcedureReturn panelH
+  EndIf
+  ProcedureReturn panelW
+EndProcedure
+
+Procedure.i ScrLogicalH(deg.i, panelW.i, panelH.i)
+  If ScrSideways(deg) <> 0
+    ProcedureReturn panelW
+  EndIf
+  ProcedureReturn panelH
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrMapX / ScrMapY - where a pixel the console drew at (x, y) has to
+;  END UP in the buffer the panel scans. THE REFERENCE MAP: one pixel,
+;  no loop, no addresses. ScrTranspose below moves whole rows and is
+;  checked against this.
+;
+;  The panel is panelW across and panelH down and that never changes.
+;  The console is ScrLogicalW by ScrLogicalH.
+;
+;    0    the two are the same buffer; the map is the identity
+;    180  the two are the same buffer AND THE MAP IS STILL THE IDENTITY,
+;         because the scaler's two mirror bits do it during scan-out.
+;         This is the one place where "the map is the identity" does not
+;         mean "nothing is turned round" - the turn happens after this
+;         file, in the display list.
+;    90   the console is turned CLOCKWISE onto the panel:
+;             sx = (logicalH - 1) - y        sy = x
+;    270  and counter-clockwise:
+;             sx = y                         sy = (logicalW - 1) - x
+;
+;  An off-by-one in a rotation does not look like an error. It looks
+;  like a picture one pixel to the left, on a panel nobody at the desk
+;  can see, which is why the gate checks every corner of both.
+; ----------------------------------------------------------------------
+Procedure.i ScrMapX(deg.i, x.i, y.i, panelW.i, panelH.i)
+  If deg = 90
+    ProcedureReturn ScrLogicalH(deg, panelW, panelH) - 1 - y
+  EndIf
+  If deg = 270
+    ProcedureReturn y
+  EndIf
+  ProcedureReturn x
+EndProcedure
+
+Procedure.i ScrMapY(deg.i, x.i, y.i, panelW.i, panelH.i)
+  If deg = 90
+    ProcedureReturn x
+  EndIf
+  If deg = 270
+    ProcedureReturn ScrLogicalW(deg, panelW, panelH) - 1 - x
+  EndIf
+  ProcedureReturn y
+EndProcedure
+
+; Read one pixel from a PHYSICAL presented raster using LOGICAL console
+; coordinates. This is the inverse-looking half of capture: ScrMapX/Y name
+; where the renderer put a logical pixel, so sampling that same address
+; recovers the logical picture without a second rotation convention. At 180
+; the map deliberately remains identity because the HVS mirrors at scan-out.
+; That yields the intended upright logical image rather than double-mirroring
+; bytes which are already consumed through the HVS mirror bits.
+Procedure.i ScrCapturePixel(fb.i, pitch.i, deg.i, panelW.i, panelH.i, x.i, y.i)
+  Define px.i
+  Define py.i
+  px = ScrMapX(deg, x, y, panelW, panelH)
+  py = ScrMapY(deg, x, y, panelW, panelH)
+  ProcedureReturn PeekN(fb + py * pitch + px * 4) & $FFFFFFFF
+EndProcedure
+
+; ======================================================================
+;  A FINGER, GOING THE OTHER WAY - ScrTouchX / ScrTouchY
+; ======================================================================
+;  ScrMapX/ScrMapY above take a pixel the console drew and say where on
+;  the panel it lands. THESE TWO ARE THAT MAP RUN BACKWARDS, from a
+;  contact the touch controller reported to the console pixel the finger
+;  is sitting on - and they are here, in this file, for exactly the
+;  reason the forward map is: there is ONE display layer and it owns the
+;  rotation and the scale. A touch path with a rotation of its own would
+;  be a second opinion about which way up the panel is, and the two
+;  would disagree the first time somebody typed `screen rotate`.
+;
+;  They are functions of their arguments, like everything else here, so
+;  the gate executes them at every rotation and every corner.
+;
+;  ---- THE THREE STEPS, AND WHY EACH ONE EXISTS ------------------------
+;
+;  1. THE CONTROLLER'S AXES TO THE PANEL'S. A touch controller is a
+;     separate part glued to the back of the glass and it is not obliged
+;     to count the same way the panel scans. The device tree says so
+;     panel by panel: the Waveshare v2 overlay gives
+;     touchscreen-inverted-x to the 9.0 inch b, touchscreen-inverted-y to
+;     the 10.1 inch b, and swapped-x-y plus inverted-y to the 12.3 inch -
+;     and gives the 10.1 inch a, the panel on this bench, NOTHING, which
+;     is the statement that its axes already agree. So the default here
+;     is ALIGNED and the correction is a stored per-panel fact, the same
+;     shape the overlay uses.
+;
+;     IT IS DONE FIRST, AND AGAINST THE CONTROLLER'S OWN RANGES. Swap
+;     then invert; inverting before the swap inverts against the wrong
+;     axis length, which is invisible on a square panel and half a
+;     screen out on this one.
+;
+;  2. THE PANEL TO THE CONSOLE. The inverse of ScrMapX/ScrMapY, with one
+;     case that is NOT the inverse of anything in this file:
+;
+;       0    identity
+;       90   the console was turned clockwise onto the panel, so a
+;            finger goes back anticlockwise
+;       270  and the other way
+;       180  THE MAP ABOVE IS THE IDENTITY AND THIS ONE IS NOT.
+;            At 180 the console draws straight into the scanned buffer
+;            and the SCALER's two mirror bits turn the picture over
+;            during scan-out (screen_source.pi4 sets them). The glass
+;            therefore shows pixel (x, y) at the far corner from where
+;            it is stored - so a finger on that pixel reports the far
+;            corner's coordinates and both axes have to be turned back
+;            here. Nothing in the forward map records that, because the
+;            forward map never has to: the mirror happens after it. This
+;            is the one place the two directions are not mirror images
+;            of each other, and it is the case that would be got wrong.
+;
+;  3. THE SCALE, WHICH IS THE SAME STEP AS 2 AND NOT A FOURTH ONE. The
+;     controller's grid and the console's are two different sizes -
+;     always, because the controller reports in its own configured
+;     resolution, and again whenever the display layer gives the console
+;     a surface that is not the panel's pixel count. So the arithmetic
+;     is done as "this far along that axis, out of that many", against
+;     the LOGICAL surface the caller passes in, and a change of scale in
+;     the display layer needs no change here at all.
+;
+;  ---- WHAT AN UNANSWERABLE MAP RETURNS -------------------------------
+;  -1, from both. A controller that would not say what its resolution is
+;  answers 0 to Gt9XMax() rather than a plausible number, and scaling by
+;  zero is not a coordinate - it is a divide the caller must not make.
+;  A refusal the caller has to notice beats a 0 that looks like the top
+;  left corner of the screen.
+; ======================================================================
+
+; The axis correction, as one small code so it stores and prints as a
+; single number. Bit for bit the three properties the device tree names.
+#SCR_TOUCH_SWAP    = 1        ; touchscreen-swapped-x-y
+#SCR_TOUCH_INVX    = 2        ; touchscreen-inverted-x
+#SCR_TOUCH_INVY    = 4        ; touchscreen-inverted-y
+#SCR_TOUCH_ALIGNED = 0        ; what the 10.1 inch a overlay says
+
+; What a stored correction reads as when SETTINGS.TXT has no
+; `touch.axes` in it, or has one that is not a number. Negative so it
+; can never collide with a code, and handled exactly like any other
+; value that is not one of the eight - a store holding garbage and a
+; store holding nothing want the same answer.
+#SCR_TOUCH_UNSET = -1
+
+Procedure.i ScrTouchFlipOk(f.i)
+  If f >= 0 And f <= 7
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ScrTouchFlipPick - the correction that will be used, given whatever
+; the settings store had in it. Same rule as ScrRotPick: a value that is
+; not one of the legal ones falls back to the default and stays visible
+; as wrong in `touch`, rather than stopping anything.
+Procedure.i ScrTouchFlipPick(stored.i)
+  If ScrTouchFlipOk(stored) = 0
+    ProcedureReturn #SCR_TOUCH_ALIGNED
+  EndIf
+  ProcedureReturn stored
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Step 1, as four procedures rather than two, because the SWAP moves
+;  the ranges as well as the values and a caller that scaled a swapped
+;  coordinate by the unswapped range would be out by the aspect ratio -
+;  which on this panel is a factor of 1.6 and looks like a badly
+;  calibrated screen rather than like a bug.
+; ----------------------------------------------------------------------
+Procedure.i ScrTouchPanelXMax(flip.i, txMax.i, tyMax.i)
+  If (flip & #SCR_TOUCH_SWAP) <> 0
+    ProcedureReturn tyMax
+  EndIf
+  ProcedureReturn txMax
+EndProcedure
+
+Procedure.i ScrTouchPanelYMax(flip.i, txMax.i, tyMax.i)
+  If (flip & #SCR_TOUCH_SWAP) <> 0
+    ProcedureReturn txMax
+  EndIf
+  ProcedureReturn tyMax
+EndProcedure
+
+Procedure.i ScrTouchPanelX(flip.i, tx.i, ty.i, txMax.i, tyMax.i)
+  Define v.i
+  Define m.i
+  If (flip & #SCR_TOUCH_SWAP) <> 0
+    v = ty
+  Else
+    v = tx
+  EndIf
+  If (flip & #SCR_TOUCH_INVX) <> 0
+    m = ScrTouchPanelXMax(flip, txMax, tyMax)
+    v = (m - 1) - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure.i ScrTouchPanelY(flip.i, tx.i, ty.i, txMax.i, tyMax.i)
+  Define v.i
+  Define m.i
+  If (flip & #SCR_TOUCH_SWAP) <> 0
+    v = tx
+  Else
+    v = ty
+  EndIf
+  If (flip & #SCR_TOUCH_INVY) <> 0
+    m = ScrTouchPanelYMax(flip, txMax, tyMax)
+    v = (m - 1) - v
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrTouchScale - v out of vMax, expressed out of outMax, clamped.
+;
+;  THE CLAMP IS NOT DEFENSIVE TIDYING. A controller reports the value
+;  its own config block promised and no more, most of the time - but a
+;  contact right on the bezel has been seen to read one count past the
+;  end on parts of this family, and one count past the end here is a
+;  write one pixel outside the surface. Clamping is cheaper than every
+;  caller remembering.
+; ----------------------------------------------------------------------
+Procedure.i ScrTouchScale(v.i, vMax.i, outMax.i)
+  Define r.i
+  If vMax < 1 Or outMax < 1
+    ProcedureReturn -1
+  EndIf
+  If v < 0
+    v = 0
+  EndIf
+  If v > vMax - 1
+    v = vMax - 1
+  EndIf
+  r = (v * outMax) / vMax
+  If r > outMax - 1
+    r = outMax - 1
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrTouchX / ScrTouchY - the whole map, in one function of its
+;  arguments.
+;
+;    deg           the rotation the console is at on this panel
+;    flip          the stored axis correction, 0..7
+;    tx, ty        what the controller reported
+;    txMax, tyMax  the controller's own ranges, out of its config block
+;    lw, lh        the LOGICAL surface - the console's own width and
+;                  height, which already carry whatever scale the
+;                  display layer chose
+;
+;  Returns a pixel inside the logical surface, or -1 if the controller
+;  would not say what its ranges are.
+; ----------------------------------------------------------------------
+Procedure.i ScrTouchX(deg.i, flip.i, tx.i, ty.i, txMax.i, tyMax.i, lw.i, lh.i)
+  Define a.i
+  Define b.i
+  Define aMax.i
+  Define bMax.i
+  Define v.i
+
+  If txMax < 1 Or tyMax < 1 Or lw < 1 Or lh < 1
+    ProcedureReturn -1
+  EndIf
+
+  aMax = ScrTouchPanelXMax(flip, txMax, tyMax)
+  bMax = ScrTouchPanelYMax(flip, txMax, tyMax)
+  a = ScrTouchPanelX(flip, tx, ty, txMax, tyMax)
+  b = ScrTouchPanelY(flip, tx, ty, txMax, tyMax)
+
+  If deg = 90
+    ; The console was turned clockwise onto the panel, so its x came
+    ; from the panel's y.
+    ProcedureReturn ScrTouchScale(b, bMax, lw)
+  EndIf
+  If deg = 270
+    v = ScrTouchScale(b, bMax, lw)
+    ProcedureReturn (lw - 1) - v
+  EndIf
+  If deg = 180
+    ; THE SCALER'S MIRROR, NOT THE BUFFER'S. See the header.
+    v = ScrTouchScale(a, aMax, lw)
+    ProcedureReturn (lw - 1) - v
+  EndIf
+  ProcedureReturn ScrTouchScale(a, aMax, lw)
+EndProcedure
+
+Procedure.i ScrTouchY(deg.i, flip.i, tx.i, ty.i, txMax.i, tyMax.i, lw.i, lh.i)
+  Define a.i
+  Define b.i
+  Define aMax.i
+  Define bMax.i
+  Define v.i
+
+  If txMax < 1 Or tyMax < 1 Or lw < 1 Or lh < 1
+    ProcedureReturn -1
+  EndIf
+
+  aMax = ScrTouchPanelXMax(flip, txMax, tyMax)
+  bMax = ScrTouchPanelYMax(flip, txMax, tyMax)
+  a = ScrTouchPanelX(flip, tx, ty, txMax, tyMax)
+  b = ScrTouchPanelY(flip, tx, ty, txMax, tyMax)
+
+  If deg = 90
+    v = ScrTouchScale(a, aMax, lh)
+    ProcedureReturn (lh - 1) - v
+  EndIf
+  If deg = 270
+    ProcedureReturn ScrTouchScale(a, aMax, lh)
+  EndIf
+  If deg = 180
+    v = ScrTouchScale(b, bMax, lh)
+    ProcedureReturn (lh - 1) - v
+  EndIf
+  ProcedureReturn ScrTouchScale(b, bMax, lh)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrChoose - WHICH SCREEN THE BOARD COMES UP ON, with nothing typed.
+;
+;  THE PANEL THAT IS PLUGGED IN WINS. If the panel's own micro answers
+;  on the display connector's I2C bus, somebody has physically attached
+;  a DSI panel to this board, and that is a far stronger statement of
+;  intent than a firmware default. Otherwise the firmware's HDMI display
+;  if it found one, and otherwise no screen at all - which is not a
+;  failure, because the serial line and the network console ARE the
+;  console and the screen is one optional endpoint of it.
+;
+;  dsiSeen is -1 when nobody has looked, AND -1 MUST NOT BE READ AS YES.
+;  That is the whole reason this is a procedure with a gate case on it
+;  rather than two lines at the call site.
+; ----------------------------------------------------------------------
+Procedure.i ScrChoose(dsiSeen.i, hdmiCount.i)
+  If dsiSeen = 1
+    ProcedureReturn #SCR_SRC_DSI
+  EndIf
+  If hdmiCount > 0
+    ProcedureReturn #SCR_SRC_HDMI
+  EndIf
+  ProcedureReturn #SCR_SRC_NONE
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE SCANNED-ROW RUN - ONE PIECE OF ADDRESS ARITHMETIC, TWO USERS.
+;
+;  A band of logical rows y0..y1 becomes, in the buffer the panel scans,
+;  a short CONTIGUOUS RUN inside every one of its rows. Both the
+;  transpose and the cache maintenance that follows it need to know
+;  where that run starts and how long it is, and a second copy of this
+;  arithmetic beside the first is how a clean ends up covering bytes the
+;  transpose did not write.
+;
+;    at 90   the console's row y is the panel's column (logicalH - 1 - y),
+;            so the band occupies columns (lh-1-y1) .. (lh-1-y0)
+;    at 270  it occupies columns y0 .. y1 directly
+;
+;  scanFb is the base of the scanned buffer and panelW its width in
+;  pixels; the depth is 32 bits everywhere on this path.
+; ----------------------------------------------------------------------
+Procedure.i ScrRunAddr(deg.i, scanFb.i, panelW.i, lh.i, y0.i, y1.i, sy.i)
+  If deg = 90
+    ProcedureReturn scanFb + sy * panelW * 4 + (lh - 1 - y1) * 4
+  EndIf
+  ProcedureReturn scanFb + sy * panelW * 4 + y0 * 4
+EndProcedure
+
+Procedure.i ScrRunBytes(y0.i, y1.i)
+  ProcedureReturn (y1 - y0 + 1) * 4
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  ScrTranspose - THE ROTATION, AS PIXELS.
+;
+;  Moves logical rows y0..y1 of the drawing buffer into the buffer the
+;  panel scans, turned. Does nothing at a rotation that is not sideways,
+;  because at 0 and 180 the two buffers are the same one.
+;
+;  THE LOOP ORDER IS THE POINT AND IT IS NOT AN OPTIMISATION DETAIL. A
+;  logical row is a COLUMN of the scanned picture, so one of the two
+;  sides has to be walked with a stride whatever happens. The scanned
+;  buffer's rows are on the OUTSIDE and a short contiguous run of each
+;  is written on the inside, because a strided READ wastes most of a
+;  cache line while a strided WRITE wastes all of one in a
+;  read-modify-write - and because the cache maintenance the scaler then
+;  needs is one clean per contiguous run rather than one per pixel.
+;
+;  IT DOES NO CACHE MAINTENANCE ITSELF. That belongs to the caller,
+;  which knows whether the caches are on and owns the barrier; keeping
+;  it out is also what keeps this file executable by the gate.
+; ----------------------------------------------------------------------
+Procedure ScrTranspose(deg.i, drawFb.i, scanFb.i, panelW.i, panelH.i, y0.i, y1.i)
+  Define sy.i
+  Define y.i
+  Define x.i
+  Define lw.i
+  Define lh.i
+  Define dpitch.i
+  Define dst.i
+
+  If ScrSideways(deg) = 0
+    ProcedureReturn
+  EndIf
+
+  lw = ScrLogicalW(deg, panelW, panelH)
+  lh = ScrLogicalH(deg, panelW, panelH)
+  dpitch = lw * 4
+
+  If y0 < 0
+    y0 = 0
+  EndIf
+  If y1 > lh - 1
+    y1 = lh - 1
+  EndIf
+  If y1 < y0
+    ProcedureReturn
+  EndIf
+
+  sy = 0
+  While sy < panelH
+    ; The logical column this scanned row is made of. At 90 the panel's
+    ; row sy is the console's column sy; at 270 it is the column counted
+    ; from the other end.
+    If deg = 90
+      x = sy
+    Else
+      x = lw - 1 - sy
+    EndIf
+
+    dst = ScrRunAddr(deg, scanFb, panelW, lh, y0, y1, sy)
+
+    y = y0
+    While y <= y1
+      If deg = 90
+        ; The band's rows land in the run BACKWARDS at 90, because the
+        ; column index runs the opposite way to y.
+        PokeN(dst + (y1 - y) * 4, PeekN(drawFb + y * dpitch + x * 4) & $FFFFFFFF)
+      Else
+        PokeN(dst + (y - y0) * 4, PeekN(drawFb + y * dpitch + x * 4) & $FFFFFFFF)
+      EndIf
+      y = y + 1
+    Wend
+    sy = sy + 1
+  Wend
+EndProcedure

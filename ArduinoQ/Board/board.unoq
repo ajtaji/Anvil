@@ -1,0 +1,1116 @@
+; ======================================================================
+;  board.pi4 - THE ARDUINO UNO Q COMPILE TARGET.
+;
+;      PureMetalForge.exe --compile ArduinoQ/Board/board.unoq -t unoq \
+;           --entry-returns -o anvil-q.img
+;      python tools/unoq_efi_wrap.py anvil-q.img anvil-q.efi \
+;           --load-addr 0x70000000
+;
+;  The compile line used to carry --load-addr 0x70000000 --stack-addr
+;  0x68000000 as well. It no longer needs to: this file DECLARES its
+;  placement, at section 0 below, so the IDE - which embeds the compiler
+;  and has no command line - builds the same bytes a script does.
+;  unoq_efi_wrap.py still takes the load address, because it is a
+;  separate program wrapping a finished image and has no way to read a
+;  compiler statement out of the source.
+;
+;  This is the file Anvil/ARCHITECTURE.md names as the Q's counterpart to
+;  RaspberryPi4/Board/board.pi4: it includes the Q's hardware backends and
+;  the shared Anvil core, declares what this board can and cannot do, and
+;  holds Main(). Same core bytes as the Pi 4. Different hardware. No fork.
+;
+; ----------------------------------------------------------------------
+;  WHAT CHANGED SINCE Board/README.md SAID THIS COULD NOT BE WRITTEN
+; ----------------------------------------------------------------------
+;  That note listed three blockers, and it was right about all three at
+;  the time. Two are now cleared and the third is answered honestly:
+;
+;   1. "An interactive console ... there is no UartRead, no RxReady, and
+;      no way to type at the board. The GENI SE4 UART is 1.8 V ... a
+;      hardware blocker, not an afternoon's typing."
+;      CLEARED, and not by getting a level shifter. Anvil runs on the Q as
+;      a UEFI application with BOOT SERVICES STILL UP, so the firmware
+;      publishes a console for us: ConOut and ConIn. The probe
+;      (Examples/Diagnostics/anvilqconprobe.pi4, on the board 2026-09-02)
+;      measured both alive. ArduinoQ/Board/qcon_q.unoq is the seam.
+;   2. "The console/state globals ... none of it is reachable without (1)."
+;      CLEARED by (1). Anvil/Core/state.pbi is included below, unchanged.
+;   3. "Every capability backend ... on the Q every one of them is 0 today
+;      ... the monitor it produced would refuse every hardware command it
+;      has. That is a legitimate Anvil state and an honest one, but it is
+;      not worth shipping ahead of a console to type into."
+;      STILL TRUE, and now it IS worth shipping, because (1) means there
+;      is a console to type into. Every #CAP_ below is 0 and the refusals
+;      are the point: this is what the capability model is FOR.
+;
+; ----------------------------------------------------------------------
+;  THE EXECUTION CONTEXT, MEASURED - this is what shapes the whole file
+; ----------------------------------------------------------------------
+;  From anvilqcoreproof.pi4 and anvilqconprobe.pi4, both run on the board:
+;
+;    * A UEFI APPLICATION, boot services UP. Launched by systemd-boot
+;      under U-Boot's EFI implementation as a one-shot entry; Debian stays
+;      the DEFAULT, so the board always comes back. We never call
+;      ExitBootServices, so the firmware's protocols stay legal all the
+;      way to the reset.
+;    * EL1. CurrentEL read back 0x4. Not EL2 - that single fact is why
+;      #CAP_BOOT_EL1 is 0 and cannot be anything else from in here.
+;    * The stack is UEFI's and MUST NOT BE MOVED. The Pi 4's Main() opens
+;      by slamming SP to #MON_STACK because the firmware's boot stack is
+;      in the way. Doing that here would destroy the stack the boot
+;      manager expects back. This Main() therefore does NOT touch SP -
+;      the single biggest structural difference from the Pi 4's Main().
+;    * NO FRAMEBUFFER. LocateProtocol for EFI_GRAPHICS_OUTPUT_PROTOCOL
+;      returns EFI_NOT_FOUND. There is no GOP, no screen command, no
+;      screenshot, and ConOut's text goes to the firmware's serial stdout
+;      (the 1.8 V SE4 UART) where nobody on this bench can read it.
+;    * THE ESP IS WRITABLE. LoadedImage -> SimpleFileSystem -> Open ->
+;      Write all return EFI_SUCCESS. That is the observable channel: the
+;      session transcript lands at \EFI\anvil\anvil.log and is read over
+;      SSH, and commands can be staged into \EFI\anvil\anvil.in the same
+;      way. Those files are the Q's terminal.
+; ======================================================================
+
+; ----------------------------------------------------------------------
+;  0. WHERE THIS IMAGE RUNS. THE FILE SAYS IT.              2026-09-02
+; ----------------------------------------------------------------------
+;  Until now these were command-line flags and nothing else:
+;
+;    --load-addr 0x70000000 --stack-addr 0x68000000
+;
+;  which the IDE cannot pass, because it embeds the compiler and has no
+;  command line. The source states them instead, so a Q build from the
+;  IDE and a Q build from tools/build_unoq_anvil.sh are the same build.
+;
+;    LoadAddress  - inside the Q's confirmed-free low-bank DRAM block
+;                   ($63900000-$7D9FFFFF). This image is position
+;                   independent and UEFI may load it anywhere it likes;
+;                   the number only has to be a real, usable address and
+;                   to pass the target's load-base check.
+;    BssAddress   - load + 8 MiB, inside the same confirmed-free block.
+;                   IT WAS load + 512 KiB UNTIL 2026-09-08, which was
+;                   the compiler's own default for this load address and
+;                   was written out rather than left implicit. That
+;                   number was a size cap on this program with 56,632
+;                   bytes left in it: the image was 467,656 bytes and
+;                   the next half-megabyte of code would have run into
+;                   its own variables. The build would have refused,
+;                   loudly, naming both ranges - which is better than
+;                   the silent version the Pi 4 had, and is still a cap,
+;                   and the ruling of that day is that this program has
+;                   none. Eight megabytes is not a bigger cap being
+;                   defended: CODE has to be contiguous with the load
+;                   address and BSS does not, so the only thing this
+;                   number has to be is far enough away that the size of
+;                   the code is never the reason it moves. The Pi 4 made
+;                   the same move to $08200000 on 2026-08-28 for the
+;                   same reason.
+;    StackAddress - a LINK-TIME value only. Anvil's Main() on the Q does
+;                   NOT install it: the stack belongs to UEFI and this
+;                   image has to return into the boot manager with that
+;                   stack intact. See THE EXECUTION CONTEXT above.
+;
+;  --entry-returns is NOT one of these and stays a flag: it is not a
+;  placement, it is a different contract with whatever launched the
+;  image, and tools/build_unoq_anvil.sh still passes it.
+; ----------------------------------------------------------------------
+LoadAddress  $70000000
+BssAddress   $70800000
+StackAddress $68000000
+
+; ----------------------------------------------------------------------
+;  THE BUILD NUMBER (forum 586). An ordinary constant that CmdVersion()
+;  prints; the trailing marker is what makes a successful build - from the
+;  editor or with `--bump-build` on the command line - raise it by one,
+;  writing back that one line and nothing else.
+;
+;  THE Q COUNTS ITS OWN BUILDS. This board file is its own project, so it
+;  carries its own number and the Pi 4's number does not move when this
+;  one is built. The shared core in Anvil/Core carries no marker at all -
+;  a library bumped by every project that includes it would be counting
+;  nothing, which is what PMF-BLD-003 refuses by name.
+;
+;  Full write-up: the vault's Environment/Build number note, and the
+;  header of BuildNumber.pbi in the compiler tree.
+; ----------------------------------------------------------------------
+#ANVIL_BUILD = 83        ; pmf:build
+#ANVIL_BUILD_DATE = 20260920   ; pmf:builddate
+#ANVIL_BUILD_TIME = 185904     ; pmf:buildtime
+
+; ----------------------------------------------------------------------
+;  1. THE Q'S HARDWARE BACKENDS.
+;     Order matters: qefi_q defines the firmware plumbing every other Q
+;     file calls; qcon_q defines the console name set (UartWrite and the
+;     print router) that everything above it prints through; the timer and
+;     info backends come before qstubs_q, which wraps the timer under the
+;     names the core wants.
+; ----------------------------------------------------------------------
+XIncludeFile "ArduinoQ/Board/memmap_q.unoq"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE CONTRACT AND THE SEAM REGISTRY, AS EARLY AS THEY CAN
+;  GO - the same four files, in the same order, as the Pi 4 composition.
+;  All four are constants and one table; none reads hardware or calls
+;  anything else in this program. They are here rather than beside the
+;  loader because a driver that a module can replace has to be able to
+;  ask, inside its own file, whether one has.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "ArduinoQ/Board/qefi_q.unoq"
+XIncludeFile "ArduinoQ/Board/qcon_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwtimer_q.unoq"
+XIncludeFile "ArduinoQ/Board/hwinfo_q.unoq"
+
+; ----------------------------------------------------------------------
+;  2. THIS BOARD'S CAPABILITIES - what it offers Anvil's command families.
+;
+;  Every one is 0, and every one is 0 for a stated reason. Anvil/Hal/hal.pbi
+;  is explicit that 0 covers both "the board has no such hardware" and "no
+;  backend has been written for it yet", because from the operator's seat
+;  those are the same fact and the same honest refusal.
+;
+;  This is NOT feature-gating to save space - hal.pi4 forbids that in as
+;  many words, and nothing here is hidden that works. Each line says which
+;  it is, so the next person knows whether they are writing a driver or
+;  fighting the platform.
+;
+;  They must be declared BEFORE Anvil/Hal/hal.pbi and before every gated
+;  command file, because that is where RequireCap reads them.
+; ----------------------------------------------------------------------
+#CAP_STORAGE  = 1   ; YES, AND NOT THROUGH THE eMMC. Anvil still has no
+                    ; driver for the Qualcomm SDHCI-MSM v5 controller
+                    ; (mmc@4744000) and is not getting one here - but
+                    ; #CAP_STORAGE does not ask for a block device, it
+                    ; asks whether the core can reach FILES. It can:
+                    ; Anvil runs as a UEFI application with boot services
+                    ; up, so the firmware's own
+                    ; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL opens files by name
+                    ; on the EFI System Partition this image was loaded
+                    ; from. ArduinoQ/Board/hw_file_q.unoq is that backend.
+                    ; load, save, settings, saveenv and boot all work.
+                    ; fatls does NOT - enumerating a directory over that
+                    ; protocol is a separate piece of work and is not
+                    ; written, so HwFileCanList() answers 0 and the
+                    ; command refuses in a sentence. #CAP_MMC stays 0
+                    ; below: that family reads SECTORS, and there are
+                    ; none of those to read here at all.
+#CAP_NET      = 0   ; NO BACKEND. Wi-Fi is a WCBN3536A over SDIO and
+                    ; there is no wired MAC Anvil reaches. The portable
+                    ; IP/UDP/ARP stack has nothing to ride on.
+#CAP_GPIO     = 1   ; REAL BACKEND. ArduinoQ/Lib/tlmm.unoq over the
+                    ; QCM2290's TLMM at $00500000 - 127 lines, 0..126,
+                    ; read and written by plain MMIO from here at EL1.
+                    ; This line used to be 0 and read "NOT REACHABLE ...
+                    ; Anvil has no pins here at all", which welded two
+                    ; claims together, one true and one false.
+                    ; TRUE, and it survives: the Arduino headers do NOT
+                    ; reach the QCM2290 - they belong to the STM32U585 -
+                    ; so HwGpioUserMax() returns -1 and `gpio` says so
+                    ; rather than offering a header that is not there.
+                    ; FALSE: that the SoC's own TLMM was out of reach. It
+                    ; is not, and thirty of its lines carry on-board
+                    ; functions the reserved list now names one by one.
+#CAP_I2C      = 0   ; THE BACKEND IS WRITTEN AND THE BLOCK IS UNREACHABLE.
+                    ; Not a missing driver: ArduinoQ/Lib/geni_i2c.unoq and
+                    ; Board/hw_i2c_q.pi4 are complete, compiled into this
+                    ; image, and gated off by this 0. What stops them is
+                    ; the silicon's state under UEFI, and it was MEASURED
+                    ; the hard way - see THE HANG below.
+                    ;
+                    ; The firmware question, which came first, is SETTLED
+                    ; AND POSITIVE. A GENI engine is a programmable
+                    ; sequencer and is an I2C master only if I2C protocol
+                    ; firmware is loaded. Read from Linux over SSH,
+                    ; GENI_FW_REVISION_RO says protocol 3 (I2C) on engines
+                    ; 0 and 1, 2 (UART) on 2/3/4 and 1 (SPI) on 5. The
+                    ; boot chain loads it and it lives in RAM inside the
+                    ; engine. So the engines ARE I2C masters.
+                    ;
+                    ; THE HANG, 2026-09-02. A scripted session read the
+                    ; QUPV3 wrapper's own version register at $04AC0004
+                    ; with the `memory` command. The board did not fault
+                    ; and did not reset - it STALLED, and needed a
+                    ; physical power cycle. The transcript is flushed
+                    ; after every command, so the log names the boundary
+                    ; exactly: `version` completed, and nothing after it.
+                    ;
+                    ; On this SoC an MMIO access to a block whose clock is
+                    ; off stalls the bus rather than returning $FFFFFFFF.
+                    ; The wrapper is the FIRST thing in that aperture, so
+                    ; it is not one engine that is gated - the whole QUP
+                    ; wrapper is unclocked while Anvil runs. The
+                    ; assumption that carrying the firmware console on
+                    ; engine 4 must mean the wrapper is clocked was wrong.
+                    ;
+                    ; WHAT IT WOULD TAKE, in order: a GCC clock driver
+                    ; (GCC is at $01400000) to ungate GCC_QUPV3_WRAP0_CORE
+                    ; _CLK, _CORE_2X_CLK, _S0/_S1_CLK and the two AHB
+                    ; clocks - which is reachable, it is register work.
+                    ; Then the harder half: the QUP core clock is voted
+                    ; for over the RPM interconnect, an SMD message to a
+                    ; co-processor, and Anvil has no RPM IPC at all. Until
+                    ; both exist this stays 0, and the driver waits.
+#CAP_TOUCH    = 0   ; no touch panel controller in Anvil's reach on this
+                    ; board. A 0 here is the capability model working: the
+                    ; `touch` command's handler is a Raspberry Pi 4 board
+                    ; file, so this build does not carry it at all, and the
+                    ; shared help does not offer it.
+#CAP_MMC      = 0   ; NO BACKEND. Same controller as #CAP_STORAGE; the
+                    ; raw `mmc` family needs the same driver.
+#CAP_USB      = 0   ; NO BACKEND. The host is a Synopsys DWC3
+                    ; (qcom,qcm2290-dwc3, usb@4ef8800), not PCIe + VL805.
+                    ; DWC3's host side is xHCI-register-compatible so some
+                    ; of Lib/xhci may transfer later; none of it runs yet.
+#CAP_PWM      = 0   ; NEITHER HALF IS REACHABLE. The group is a
+                    ; modulated output AND the part's own temperature,
+                    ; because the `fan` command needs both or neither.
+                    ; The general-purpose PWM is behind the SAME QUPv3
+                    ; wrapper that made #CAP_I2C zero above - the
+                    ; measured hang, not a missing driver - and the
+                    ; PMIC's LPG is over SPMI, which Anvil has no
+                    ; controller for. The TSENS thermal block IS
+                    ; reachable and simply has no driver. A software
+                    ; toggle on a TLMM line would work and is
+                    ; deliberately not offered: this board's Arduino
+                    ; header belongs to the STM32U585 (see #CAP_GPIO), so
+                    ; every line Anvil can drive here is an on-board
+                    ; function and none of them is where a fan would be
+                    ; wired. ArduinoQ/Board/qstubs_q.unoq carries the
+                    ; absent answers; the reasoning is written out there
+                    ; at greater length.
+#CAP_BOOT_EL1 = 0   ; NOT POSSIBLE FROM HERE, and this one is not a
+                    ; missing driver. UEFI runs this application at EL1 -
+                    ; CurrentEL read 0x4 on the board. Installing an EL1
+                    ; for a kernel requires being at EL2. On the Pi 4
+                    ; Anvil runs at EL2 and can; here it cannot, and no
+                    ; code inside the image changes that.
+
+; ----------------------------------------------------------------------
+;  THE SEVEN GROUPS THE PAYLOAD ABI ADDED, 2026-09-04. ALL SEVEN ARE 0
+;  HERE, HONESTLY.
+;
+;  Anvil/Hal/abi.pbi hands a payload a service table, and a payload is an
+;  APPLICATION rather than a diagnostic - so it needs classes of hardware
+;  the monitor's own command families never wanted. The Q has none of them
+;  reachable from inside a UEFI application today, and saying so in seven
+;  lines is what lets the SAME service table exist on both boards with the
+;  same slot numbers, refusing where it must.
+;
+;  THAT IS THE POINT OF DECLARING THEM AT ALL rather than leaving them
+;  undefined. A payload built for the Pi 4 and run here does not fault; it
+;  asks SvcCapGet, is told 0, and renders a whole-sentence refusal. Which
+;  is the capability model doing exactly what it was written for.
+; ----------------------------------------------------------------------
+#CAP_CONSOLE  = 0   ; NO PIXEL SURFACE. The console here is qcon_q.pi4 - a
+                    ; UEFI text protocol, characters and not pixels. There
+                    ; is a framebuffer behind UEFI's GOP and no backend
+                    ; reaches it, and the Adreno 702 is desk-only pending
+                    ; a decision on the SMMU stream table.
+; #CAP_TOUCH is declared once, further up this block, and it is 0 - no
+; touch panel controller is in Anvil's reach on this board and there is
+; no USB host to hang one off either (see #CAP_USB above). It is not
+; repeated here; see the note in the Raspberry Pi 4 board file for why
+; one name gets one declaration.
+#CAP_GNSS     = 0   ; NO BACKEND and no receiver.
+#CAP_UART     = 0   ; NO BACKEND. The QUP serial engines are there; the
+                    ; console is the only one brought up, and it is UEFI's.
+#CAP_SPI      = 0   ; NO BACKEND. SPI would be another QUP GENI mode on the
+                    ; same wrapper geni_i2c.pi4 drives, and the QUP wrapper
+                    ; at 0x04AC0000 is the PROVEN-UNCLOCKED block this
+                    ; board's address-safety seam refuses by name.
+#CAP_VEHLINK  = 0   ; NO BACKEND. This is the seam that replaced CAN on
+                    ; 2026-09-04, when the engine port was given to a second
+                    ; unit talking over Wi-Fi or LoRa. Carrying it here
+                    ; needs a radio, and #CAP_NET is 0 on this board.
+#CAP_RTC      = 0   ; NO BACKEND. UEFI has a runtime-services time protocol
+                    ; and nothing in this image calls it.
+#CAP_PARALLEL = 0   ; NO SECONDARY-CORE OWNER ON THIS BOARD. The part has
+                    ; four Cortex-A53s and UEFI is still holding them; this
+                    ; image reserves no per-core stack, has no spin-table
+                    ; contract it has proven, and nothing here has ever run
+                    ; an instruction on a core other than the one it booted
+                    ; on. Anvil/Hal/abi.pbi compiles the #SVC_ENOSYS arm of
+                    ; group 15 against this, so a payload asking for four
+                    ; cores here is told there is one rather than finding
+                    ; out by way of a core that never answers.
+
+; The board's identity for the payload ABI, one of Anvil/Hal/abi.pbi's
+; #SVC_BOARD_* codes. INFORMATIONAL ONLY - a payload that branches on it
+; has re-forked the thing the capability model exists to prevent.
+#SVC_BOARD_ID = 2   ; #SVC_BOARD_UNOQ
+
+; ----------------------------------------------------------------------
+;  3. THE HAL SEAM, then this board's REAL backends, then the stubs for
+;     the groups still declared 0 above.
+;
+;     hal.pi4 must precede every gated command handler, and it must
+;     precede the two hw_*_q backends as well: they return #HW_GPIO_* and
+;     #HW_I2C_* codes that hal.pi4 defines.
+;
+;     Each driver library comes immediately before the backend that wraps
+;     it, because a library never includes a library (house rule 10) - so
+;     the MAIN file is the one place the order is stated:
+;
+;       Lib/tlmm.pi4      the QCM2290 pin controller  -> hw_gpio_q.pi4
+;       Lib/geni_i2c.pi4  the QUP GENI I2C master     -> hw_i2c_q.pi4
+;
+;     geni_i2c.pi4 additionally needs HwTimerUs() from hwtimer_q.pi4,
+;     which is already included in section 1 above - every wait in that
+;     driver is bounded by it, so a bus with no interconnect vote times
+;     out instead of hanging a board with no visible console.
+;
+;     qstubs_q.pi4 comes LAST of the three and no longer defines any
+;     HwGpio* or HwI2c* name; two definitions of HwGpioCount() in one
+;     image is a duplicate-symbol error waiting to be resolved in
+;     whichever order the includes happen to land.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "ArduinoQ/Lib/tlmm.unoq"
+XIncludeFile "ArduinoQ/Board/hw_gpio_q.unoq"
+XIncludeFile "ArduinoQ/Lib/geni_i2c.unoq"
+XIncludeFile "ArduinoQ/Board/hw_i2c_q.unoq"
+; The Q's HwFile* backend - the file-level storage seam over UEFI's
+; EFI_SIMPLE_FILE_SYSTEM_PROTOCOL. It is what makes #CAP_STORAGE = 1 above
+; true, and it must precede Anvil/Core/settings.pbi, which calls it.
+XIncludeFile "ArduinoQ/Board/hw_file_q.unoq"
+XIncludeFile "ArduinoQ/Board/qstubs_q.unoq"
+XIncludeFile "Anvil/Core/wallclock.pbi"
+; The Q's HwBoard* answers - identity, reset and MMU state - and then the
+; payload ABI itself. abi.pi4 is CORE and unedited for this board: it
+; names no chip, and the three groups the Q cannot back (console, net,
+; crypto beyond SHA-256) are compiled out by their own #CAP_ declarations
+; above, leaving those slots pointing at SvcUnimplemented.
+;
+; IT MUST COME BEFORE Anvil/Core/pmfboot.pbi, which is the one caller of
+; BuildServiceTable().
+XIncludeFile "ArduinoQ/Board/hw_board_q.unoq"
+; This board's half of the driver-module contract. Before abi.pbi because
+; SvcCapGet asks it whether the core reaches the two new seams.
+XIncludeFile "ArduinoQ/Board/hw_mod_q.unoq"
+XIncludeFile "Anvil/Hal/abi_version.pbi"
+XIncludeFile "Anvil/Hal/abi.pbi"
+
+; ----------------------------------------------------------------------
+;  4. THE SHARED ANVIL CORE, included unchanged. Not one of these files
+;     is edited for the Q, and that is the whole point of the split.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/state.pbi"
+XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/build_identity.pbi"
+XIncludeFile "Anvil/Core/rxbreak.pbi"
+XIncludeFile "Anvil/Core/crc.pbi"
+; THE INPUT SEAM, AHEAD OF THE LINE READER THAT NOW SITS ON IT. Both are
+; portable core and neither is edited for this board: this one has no
+; touch surface, so the dispatcher's contact side is simply never fed,
+; while the byte side carries the serial console exactly as before.
+; They must follow state.pbi (gLine, #LINE_MAX) and qstubs_q.unoq
+; (gLastCR), and must precede parse.pbi.
+XIncludeFile "Anvil/Core/input_events.pbi"
+XIncludeFile "Anvil/Core/text_edit.pbi"
+XIncludeFile "Anvil/Core/parse.pbi"
+; The message log: background output kept off the command line and read
+; with `messages`. The diversion is qcon_q.unoq's, as uart.pi4's is the Pi 4's.
+XIncludeFile "Anvil/Core/messages.pbi"
+XIncludeFile "Anvil/Core/memrange.pbi"
+; THE ADDRESS-SAFETY SEAM - the reason this board needed one, and the
+; only board so far with a table to declare. The backend comes first and
+; the core side that asks it second, the same order hw_gpio_q.pi4 and
+; gpio_cmd.pi4 have. hw_addr_q.pi4 needs three things already included
+; above: memmap_q.pi4 for the DRAM extent, hal.pi4 for the #HW_ADDR_*
+; codes, and format.pi4 because it prints this board's table into `info`.
+; HOW MUCH MEMORY THIS BOARD HAS - which on this board is "it cannot say
+; yet", stated in the seam rather than left out of it. It needs nothing
+; but hal.pi4 for #HW_MEM_UNKNOWN, and it sits beside the address seam
+; because that is what asks it on the other board.
+XIncludeFile "ArduinoQ/Board/hw_mem_q.unoq"
+XIncludeFile "ArduinoQ/Board/hw_addr_q.unoq"
+XIncludeFile "Anvil/Core/addrsafe.pbi"
+XIncludeFile "Anvil/Core/argfmt.pbi"
+; THE SETTINGS STORE, and the file commands over it. All four of these are
+; new to this board and none of them is edited for it - they reach the
+; medium only through the HwFile* seam above, which is the whole point of
+; Anvil/ARCHITECTURE.md's split. settings.pi4 must follow hw_file_q.pi4;
+; settings_cmd.pi4 and fs_cmd.pi4 must follow settings.pi4 and memrange.pi4.
+XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "Anvil/Core/memcmd.pbi"
+XIncludeFile "Anvil/Core/uptime.pbi"
+; hw_id_q - THIS BOARD'S IDENTITY (forum 575). The core's banner and
+; `version` ask the HwId* seam what board this is, what processor it has,
+; what its console is, what compiler target built it and where its own image
+; lives; this file is the answer. After qefi_q.pi4 (the loaded-image
+; record), hwinfo_q.pi4 (HwInfoEl) and format.pi4 (PutAddr), all above,
+; and before the two files that call it.
+XIncludeFile "ArduinoQ/Board/hw_id_q.unoq"
+XIncludeFile "Anvil/Core/flow_cmd.pbi"
+XIncludeFile "Anvil/Core/gpio_cmd.pbi"
+XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+XIncludeFile "Anvil/Core/mmc_cmd.pbi"
+; The shared USB protocol, before the command that prints what it decodes.
+; This board drives no USB host yet, so nothing binds its control-transfer
+; seam and every reader answers honestly empty - which is the truth here
+; and not a failure.
+XIncludeFile "Anvil/Bus/usb_core.pbi"
+XIncludeFile "Anvil/Core/usb_cmd.pbi"
+XIncludeFile "Anvil/Core/boot_cmd.pbi"
+XIncludeFile "Anvil/Core/datapath.pbi"
+XIncludeFile "Anvil/Core/fs_cmd.pbi"
+XIncludeFile "Anvil/Core/settings_cmd.pbi"
+XIncludeFile "Anvil/Core/time_cmd.pbi"
+; sha256.pi4 is pure computation with no chip in it at all, which is why
+; it lives in Anvil/Core rather than under a board. The bootloader below
+; needs it: the hash check before a payload is entered is mandatory.
+XIncludeFile "Anvil/Core/sha256.pbi"
+; THE BOOTLOADER - the payload container, the `boot` family, and the
+; persisted-boot-target countdown Main() runs before the prompt.
+XIncludeFile "Anvil/Core/pmfboot.pbi"
+; ----------------------------------------------------------------------
+;  THE DRIVER-MODULE LOADER, IDENTICAL TO THE Pi 4's. Every file here is
+;  portable core: the container reader, the validator, the relocator, the
+;  arena, the lifecycle, the manifest reader and the console. What this
+;  board supplies differently is hw_mod_q.unoq above, which today says
+;  there is no arena - so the whole of this compiles and links, `mod`
+;  answers honestly, and nothing is executed from memory nobody reserved.
+;
+;  THAT IS THE BUILD-CLOSURE CLAIM AND ITS EXACT LIMIT: this proves the
+;  core has no board-specific fork, and it does not prove a module loads
+;  on Q silicon, which needs a Q.
+; ----------------------------------------------------------------------
+XIncludeFile "Anvil/Core/mod_container.pbi"
+XIncludeFile "Anvil/Core/mod_arena.pbi"
+XIncludeFile "Anvil/Core/mod_lifecycle.pbi"
+XIncludeFile "Anvil/Core/mod_manifest.pbi"
+XIncludeFile "Anvil/Core/mod_cmd.pbi"
+; ... and its console side: the `boot` command word, the four boot.*
+; settings, and BootFileWait(). Separate from the engine above so the
+; engine can be built - and gated - without a line editor.
+; bootfile_cmd arms a capture of the payload's last frame with ShotArm; the
+; arm state lives in shotarm.pbi, which has no screen of its own to need.
+XIncludeFile "Anvil/Core/shotarm.pbi"
+XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+; The fan curve and the `fan` command. Both Core and both compiled here
+; even though #CAP_PWM is 0: one command for every board, degrading
+; through RequireCap, is the model - there is no second copy and no
+; CompilerIf on a board name. fan.pi4 is pure arithmetic and needs
+; nothing; fan_cmd.pi4 needs hal.pi4, the HwPwm*/HwTemp* answers in
+; qstubs_q.pi4, settings.pi4 and bootfile_cmd.pi4 above it.
+XIncludeFile "Anvil/Core/fan.pbi"
+XIncludeFile "Anvil/Core/fan_cmd.pbi"
+XIncludeFile "Anvil/Core/help.pbi"
+
+; ======================================================================
+;  CmdQInfo - the Q's `info`.
+;
+;  `info` is a per-board command on every Anvil target (the Pi 4's lives
+;  in Board/mailbox_info.pi4 and asks the VideoCore mailbox). The Q has no
+;  mailbox; its identity comes from architectural system registers, which
+;  hwinfo_q.pi4 already reads, plus what the firmware told us.
+; ======================================================================
+Procedure CmdQInfo()
+  PrintN("Arduino UNO Q - Qualcomm Dragonwing QRB2210 (QCM2290)")
+  Print("  MIDR_EL1     ")
+  PutHex16(RdMidr())
+  If HwInfoIsQ() <> 0
+    PrintN("   Qualcomm, Cortex-A53")
+  Else
+    PrintN("   (does not decode as a QCM2290 A53)")
+  EndIf
+  Print("  exception    EL")
+  PrintDec(HwInfoEl())
+  PrintN("   (UEFI runs this application here)")
+  Print("  arch timer   ")
+  PrintDec(TickHz())
+  PrintN(" Hz")
+  Print("  DRAM         ")
+  PutAddr(HwInfoDramBase())
+  Print(" to ")
+  PutAddr(HwInfoDramTop() - 1)
+  PrintNl()
+  Print("  uptime       ")
+  PrintDec(HwUptimeMs())
+  PrintN(" ms since this image started")
+  PrintN("  console      UEFI EFI_SIMPLE_TEXT_OUTPUT/INPUT_PROTOCOL")
+  Print("    ConOut     ")
+  PutHex16(gQConOut)
+  Print("   ConIn ")
+  PutHex16(gQConIn)
+  PrintNl()
+  Print("    keys read  ")
+  PrintDec(gQKeysSeen)
+  If gQInUsed <> 0
+    Print("   staged script bytes ")
+    PrintDec(gQInLen)
+  Else
+    Print("   no staged script")
+  EndIf
+  PrintNl()
+  ; WHERE THE FIRMWARE PUT US. Printed because it is the number the
+  ; monitor-overlap guard is built on: HitsMonitor() asks HwMonLo/HwMonHi,
+  ; and on this board those are this extent. When it reads "not known",
+  ; `boot` refuses every payload on purpose - so an operator meeting that
+  ; refusal needs to be able to see WHY without reading source.
+  Print("  image at     ")
+  If QEfiImageKnown() = 1
+    PutHex16(QEfiImageBase())
+    Print(" .. ")
+    PutHex16(QEfiImageBase() + QEfiImageSize() - 1)
+    Print("   (")
+    PrintDec(QEfiImageSize())
+    PrintN(" bytes, from LoadedImage)")
+  Else
+    PrintN("not known - the firmware would not say where it loaded this")
+    PrintN("               image, so boot refuses every payload rather than risk")
+    PrintN("               placing one over the running monitor.")
+  EndIf
+  PrintN("  framebuffer  none - this firmware publishes no GOP, so there is")
+  PrintN("               no screen on this board and no screenshot command.")
+  ; AND NO DSI EITHER, SAID OUT LOUD RATHER THAN LEFT TO BE INFERRED.
+  ; The Pi 4 gained a SECOND kind of screen on 2026-09-08: a DSI panel
+  ; the monitor lights itself, out of its own memory, because that
+  ; board's firmware owns no DSI display and never brings the block up.
+  ; That is a Pi 4 seam and it does not come here - nothing on this part
+  ; publishes a display controller, a display list or a pixel valve, and
+  ; there is no connector to plug a panel into. A reader who saw "no
+  ; GOP" above and knew about the panel would otherwise be left
+  ; wondering whether it applied, and a seam that leaves that question
+  ; open gets it answered wrongly one day.
+  PrintN("               There is no DSI panel here either. This board has no")
+  PrintN("               display controller of any kind, so the screen commands")
+  PrintN("               are absent rather than refusing.")
+  ; WHAT THIS BOARD SAYS ABOUT ADDRESSES. It goes in `info` because every
+  ; refusal the address guard prints ends by sending the operator here,
+  ; and because on this board it is the most useful thing the command
+  ; says: it is the difference between "the monitor is being awkward" and
+  ; "that block stalled this board on 2026-09-02 and here is the range".
+  HwAddrReport()
+  Print("  transcript   ")
+  PrintDec(gQLogLen)
+  PrintN(" bytes, flushed to \EFI\anvil\anvil.log on the ESP")
+  If gQLogLost <> 0
+    Print("  !! transcript overflowed - ")
+    PrintDec(gQLogLost)
+    PrintN(" bytes were dropped, so the log is incomplete.")
+  EndIf
+EndProcedure
+
+; ======================================================================
+;  QBanner AND CmdQVersion ARE GONE, and their absence is the fix for
+;  forum 575.
+;
+;  This board used to carry its own banner and its own `version`, because
+;  the shared core stated the OTHER board's facts as literal prose. Run
+;  unchanged here the core printed, on the first board run of this
+;  monitor:
+;
+;      "PureMetal Forge - Anvil, the Raspberry Pi 4 serial monitor."
+;      "The serial port is the PL011 at 00000000"
+;      "The processor is in AArch64 at exception level 2."
+;      "Built by PureMetal Forge for target pi4."
+;
+;  Four claims, all false here: this is not a Pi 4, there is no PL011
+;  (the console is a UEFI protocol, and 00000000 is #UART_BASE having no
+;  meaningful value to give it), the processor is at EL1 not EL2 -
+;  measured, CurrentEL reads 0x4 - and this image was built `-t unoq`.
+;  The last is the worst of the four: it is not vague branding but a
+;  specific, checkable claim about how the image was produced, and
+;  somebody diagnosing a bad image would go looking where it points.
+;
+;  The board-local copies made this board right and left the defect in
+;  place, which the note here said out loud at the time: the core hard-
+;  coding one board's facts is a real defect in the core, and a third
+;  board would have inherited the same wrong identity again.
+;
+;  IT IS FIXED IN THE CORE NOW. The banner and `version` ask the board
+;  through the HwId* seam (Anvil/Hal/hal.pbi), this board answers in
+;  ArduinoQ/Board/hw_id_q.unoq, and there is exactly ONE banner and ONE
+;  version command in the tree again. Main() calls Banner() and the
+;  dispatcher calls CmdVersion(), the same two the Pi 4 calls.
+;
+;  DO NOT RE-ADD A BOARD-LOCAL BANNER. If a board needs to say something
+;  the core does not print, that is a row in the HwId* seam - which is
+;  what HwIdSayConsole() and HwIdSayImage() already are.
+; ======================================================================
+
+; ======================================================================
+;  CmdQReset - the Q's `reset`.
+;
+;  On the Pi 4 this is a hardware reset through the watchdog. Here the
+;  right thing is a UEFI cold reset, which returns the board to Debian
+;  (the default boot entry). The transcript is flushed FIRST: a reset that
+;  discarded the session record would make the one observable channel on
+;  this board useless exactly when it matters.
+; ======================================================================
+Procedure CmdQReset()
+  PrintN("resetting: handing the board back to Debian (the default boot entry).")
+  UartDrain()
+  QLogFlush()
+  QEfiReset()
+  ; ResetSystem does not return. If it somehow does, say so rather than
+  ; carrying on as though the command worked.
+  PrintN("!! ResetSystem returned, which it is not supposed to do. The board")
+  PrintN("   is still here and still running Anvil. Nothing else was changed.")
+EndProcedure
+
+; ======================================================================
+;  CmdQExit - leave Anvil cleanly.
+;
+;  This command exists on the Q and on no other board, and it is not a
+;  convenience. Anvil is a ONE-SHOT UEFI boot entry here: the operator has
+;  to be able to end the session and get Debian back, and a staged script
+;  needs a way to say "that is all". Without it the only exit is the idle
+;  deadman in qcon_q.pi4 or pulling the power.
+; ======================================================================
+Procedure CmdQExit()
+  gQExitWanted = 1
+  gQExitReason = 3
+EndProcedure
+
+; ======================================================================
+;  Main() - the Q's entry point.
+;
+;  UEFI enters at x0 = ImageHandle, x1 = SystemTable, which the
+;  --entry-returns _start preserves into Main(). Those two registers are
+;  captured in the FIRST instructions, before anything can clobber them.
+;
+;  The boot order is the shared one Anvil/ARCHITECTURE.md fixes -
+;  banner -> devices -> prompt - with "devices" honestly empty on this
+;  board. It does NOT move the stack: see the header.
+; ======================================================================
+Procedure Main()
+  Define c.i
+  Define hz.i
+  Define ih.i
+  Define st.i
+  Define ndev.i
+  Define nabs.i
+  Define promptAttr.i
+
+  ; ---- capture x0/x1 before anything else runs -----------------------
+  ASM
+    adrp x9, global_gqih
+    add  x9, x9, #:lo12:global_gqih
+    str  x0, [x9]
+    adrp x9, global_gqst
+    add  x9, x9, #:lo12:global_gqst
+    str  x1, [x9]
+  EndASM
+  ih = gQIh
+  st = gQSt
+
+  ; ---- bring the firmware up. If the SystemTable is not valid there is
+  ;      no console, no ESP and nowhere to complain to, so the only
+  ;      correct action is to return to the boot manager, which boots
+  ;      Debian. Returning 1 marks it as a failure for anything watching.
+  If QEfiInit(ih, st) = 0
+    ProcedureReturn 1
+  EndIf
+  QConInit()
+
+  UartInit(115200)
+
+  If TimerInit() = 0
+    PrintN("!! the architectural counter is not running - every timeout in")
+    PrintN("   this monitor is guesswork. Transfers may not time out.")
+  EndIf
+  gBootTicks = Ticks()
+  WallClockInit()
+
+  hz = TickHz()
+  If hz <= 0 Or hz > 1000000000
+    hz = 19200000                ; the QCM2290's counter, as a fallback
+  EndIf
+  gToTicks = hz + hz
+
+  gBad = 0
+  gFail = 0
+  gHaveEntry = 0
+  gMbx = 0
+
+  Banner()
+
+  ; ---- devices. The shared boot order calls for bringing the board's
+  ;      buses up here. Saying once at boot which groups exist is better
+  ;      than letting the operator discover it one refused command at a
+  ;      time.
+  ;
+  ;      ***DERIVED FROM THE #CAP_ FLAGS, NEVER RESTATED AS PROSE.*** This
+  ;      used to be three hardcoded sentences asserting every group was 0,
+  ;      and on 2026-09-02 it went on asserting it after the GPIO backend
+  ;      landed and #CAP_GPIO became 1. The board printed "Every hardware
+  ;      group on this board is declared 0 - storage, net, gpio, i2c, ..."
+  ;      from an image whose gpio backend was real.
+  ;
+  ;      That is exactly what vault rule 3 exists to stop: a specific,
+  ;      checkable claim about the machine, stated confidently, and wrong.
+  ;      A diagnostician reading that banner stops looking. The flags are
+  ;      the truth, so the flags are what is printed - there is only one
+  ;      statement of it now, so the two cannot drift apart again.
+  Print("devices:")
+  ndev = 0
+  If #CAP_STORAGE
+    Print(" storage")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_NET
+    Print(" net")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_GPIO
+    Print(" gpio")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_I2C
+    Print(" i2c")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_MMC
+    Print(" mmc")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_USB
+    Print(" usb")
+    ndev = ndev + 1
+  EndIf
+  If #CAP_BOOT_EL1
+    Print(" booti")
+    ndev = ndev + 1
+  EndIf
+  If ndev = 0
+    Print(" none")
+  EndIf
+  PrintN(".")
+
+  Print("absent:")
+  nabs = 0
+  If #CAP_STORAGE = 0
+    Print(" storage")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_NET = 0
+    Print(" net")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_GPIO = 0
+    Print(" gpio")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_I2C = 0
+    Print(" i2c")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_MMC = 0
+    Print(" mmc")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_USB = 0
+    Print(" usb")
+    nabs = nabs + 1
+  EndIf
+  If #CAP_BOOT_EL1 = 0
+    Print(" booti")
+    nabs = nabs + 1
+  EndIf
+  If nabs = 0
+    Print(" nothing")
+  EndIf
+  PrintN(".")
+  PrintN("  Type help for what works, or info for why an absent one is absent.")
+  PrintNl()
+
+  ; THE DRIVER MODULES, before the boot countdown, for the Pi 4's reason:
+  ; a payload entered with the service table is entitled to find the seams
+  ; a loaded module fills, so loading them afterwards would make the same
+  ; medium produce two different machines depending on timing. On this
+  ; board it currently does nothing and prints nothing - hw_mod_q.unoq
+  ; declares no arena - and `mod` says so in one sentence when asked.
+  ModBoot()
+
+  ; THE PERSISTED BOOT TARGET. Anvil/Core/pmfboot.pbi's BootFileWait()
+  ; reads boot.file out of SETTINGS.TXT on the ESP, counts down, and boots
+  ; the container it names - or returns at once when nothing is armed.
+  ;
+  ; THERE IS NO BootWait() CALL BEFORE IT, and that is the one difference
+  ; from the Pi 4's Main(). BootWait takes the DRAM autoboot record, and
+  ; this board has nowhere that survives a reset to keep one - AutoEntry()
+  ; in qstubs_q.pi4 correctly answers 0 always. The persisted target is
+  ; therefore the only automatic boot here, which is also why it matters
+  ; more here: a settings file on the ESP is the only memory this board
+  ; has across a power cycle.
+  ;
+  ; IT RUNS BEFORE THE STAGED SCRIPT IS ANNOUNCED, deliberately, so that
+  ; the order an operator reads in the transcript is the order things
+  ; happened in: devices, then the boot countdown, then the prompt and
+  ; whatever is typed at it.
+  BootFileWait()
+  TimeBoot()
+
+  ; THE FAN POLICY, after the settings and before the prompt - the same
+  ; place and the same reason as on the Pi 4. On this board #CAP_PWM is
+  ; 0, so FanBoot() resets the curve to its defaults and returns without
+  ; touching a pin or printing a line; it is called anyway so that the
+  ; two boards' Main() differ in what the HARDWARE can do and not in
+  ; which core routines they remember to call.
+  FanBoot()
+
+  ; From the first prompt on, background output is a message, not console
+  ; output (Anvil/Core/messages.pbi). The boot above stays on the console.
+  MessagesStart()
+
+  If gQInUsed <> 0
+    Print("input: a staged command script was found on the ESP, ")
+    PrintDec(gQInLen)
+    PrintN(" bytes.")
+    PrintN("  It is being fed to this prompt as if typed. Keystrokes from the")
+    PrintN("  firmware console are still accepted and take effect immediately.")
+    PrintNl()
+  EndIf
+
+  ; ====================================================================
+  ;  THE COMMAND LOOP.
+  ;
+  ;  This is the Pi 4's loop (RaspberryPi4/Board/board.pi4:1504) with the
+  ;  handlers this board actually includes, and nothing else. It is
+  ;  written out rather than called because there is no CommandLoop() in
+  ;  the core to call - on every Anvil board the loop lives inline in the
+  ;  board's Main(), and the Pi 4's is the reference.
+  ;
+  ;  "pmf> " is load-bearing: five characters, trailing space, no newline.
+  ;  Host tools match on it. Do not tidy it.
+  ; ====================================================================
+  Repeat
+    ; The UEFI colour is sideband display state: raw transcript bytes stay
+    ; exactly "pmf> ". Flush while green because qcon batches a line until
+    ; UartDrain(), then restore the firmware's own attribute before ReadLine
+    ; echoes the user's input.
+    promptAttr=QEfiConAttribute()
+    QEfiSetConAttribute(#QTXT_LIGHTGREEN)
+    Print("pmf> ")
+    UartDrain()
+    QEfiSetConAttribute(promptAttr)
+
+    ; gQTyping brackets the line editor and NOTHING else. Outside these
+    ; two lines the staged script is invisible to UartReadReady(), which
+    ; is what stops Anvil/Core/rxbreak.pbi's break detector from reading
+    ; the next queued command as "the operator pressed a key" and
+    ; aborting every command that prints. See the long note on gQTyping
+    ; in ArduinoQ/Board/qcon_q.unoq - this cost a board run to find.
+    gQTyping = 1
+    ReadLine()
+    gQTyping = 0
+
+    ; The deadman in qcon_q.pi4, or the `exit` command, ends the session.
+    ; It is checked BEFORE the line is dispatched so a line the deadman
+    ; completed with a synthetic CR is not run as a command.
+    If gQExitWanted <> 0
+      Break
+    EndIf
+
+    OutBreakArm()
+    gPos = 0
+    SkipSpace()
+    gWordAt = gPos
+    c = gLine[gPos] & $FF
+    SkipWord()
+    gWordLen = gPos - gWordAt
+
+    ; `measure <command line>` - see MEASURE A COMMAND in Core/parse.pbi.
+    ; Two call sites, both of them core, because the command chain below
+    ; is inline here and there is nothing for a wrapper to re-enter. When
+    ; the word moves, the single-letter character moves with it; a refusal
+    ; sets that character to zero, which the chain's empty-line arm
+    ; already runs nothing for.
+    Define tmv.i
+    tmv = TimeArm()
+    If tmv = 1
+      c = gLine[gWordAt] & $FF
+    ElseIf tmv = 2
+      c = 0
+    EndIf
+
+    gMemWidth = 0
+    ; THE SAFETY OVERRIDE AGES HERE, beside the gMemWidth reset and for
+    ; the same stated reason: state must not leak from one command into
+    ; the next. `force <address>` arms one address for the NEXT command
+    ; line and this ends it - used or not. On THIS board that is not a
+    ; nicety: the thing being armed is an access that stalls the
+    ; processor. See Anvil/Core/addrsafe.pbi.
+    ForceAge()
+    If gWordLen >= 3 And gLine[gWordAt + gWordLen - 2] = 46      ; 46 = '.'
+      Define suf.i
+      suf = gLine[gWordAt + gWordLen - 1] & $FF
+      If suf = 98 Or suf = 66                                    ; b / B
+        gMemWidth = 1
+      ElseIf suf = 119 Or suf = 87                               ; w / W
+        gMemWidth = 2
+      ElseIf suf = 108 Or suf = 76                               ; l / L
+        gMemWidth = 4
+      EndIf
+      If gMemWidth <> 0
+        gWordLen = gWordLen - 2                                  ; hide ".x"
+      EndIf
+    EndIf
+
+    If c = 0
+      ; An empty line reprints the prompt and does nothing else.
+    ElseIf WordIs("memory") <> 0 Or WordIs("dump") <> 0 Or WordIs("md") <> 0 Or LetterIs(109) <> 0
+      CmdMem()
+    ElseIf WordIs("write") <> 0 Or WordIs("poke") <> 0 Or LetterIs(119) <> 0
+      CmdWrite()
+    ElseIf WordIs("compare") <> 0 Or WordIs("cmp") <> 0
+      CmdCompare()
+    ElseIf WordIs("copy") <> 0 Or WordIs("cp") <> 0
+      CmdCopy()
+    ElseIf WordIs("crc32") <> 0 Or WordIs("checksum") <> 0
+      CmdCrc32()
+    ElseIf WordIs("fill") <> 0 Or WordIs("mw") <> 0
+      CmdFill()
+    ElseIf WordIs("mm") <> 0
+      CmdMm()
+    ElseIf WordIs("nm") <> 0
+      CmdNm()
+    ElseIf WordIs("mtest") <> 0
+      CmdMtest()
+    ElseIf WordIs("base") <> 0
+      CmdBase()
+    ; force - arm one address this board refused, for the next command
+    ; line only. Whole word, no alias and no abbreviation: it is the
+    ; confirmation for an access that can stall this processor, and a
+    ; short way to type it would be the accident it exists to prevent.
+    ElseIf WordIs("force") <> 0
+      CmdForce()
+    ElseIf WordIs("run") <> 0 Or WordIs("go") <> 0 Or LetterIs(103) <> 0
+      CmdGo()
+    ElseIf WordIs("booti") <> 0
+      CmdBooti()
+    ElseIf WordIs("bootm") <> 0
+      CmdBootm()
+    ; boot - THE BOOTLOADER. `boot <name>` reads a payload container off
+    ; the ESP, takes the load address, entry point and SHA-256 out of it,
+    ; places the image, proves it and enters it, with no address typed.
+    ; `boot mem <addr>` does the same for one already in DRAM.
+    ElseIf WordIs("boot") <> 0
+      CmdBoot()
+    ; THE FILE COMMANDS. New on this board and unedited for it: load and
+    ; save ride the HwFile* seam over UEFI, and fatls refuses in a
+    ; sentence because this board cannot enumerate a directory.
+    ElseIf WordIs("load") <> 0 Or WordIs("fatload") <> 0 Or LetterIs(102) <> 0
+      CmdFat()
+    ElseIf WordIs("save") <> 0
+      CmdSave()
+    ElseIf WordIs("mkdir") <> 0
+      CmdMkdir()
+    ElseIf WordIs("rmdir") <> 0
+      CmdRmdir()
+    ElseIf WordIs("rm") <> 0 Or WordIs("del") <> 0
+      CmdRemove()
+    ElseIf WordIs("rename") <> 0 Or WordIs("mv") <> 0
+      CmdRename()
+    ElseIf WordIs("fatls") <> 0 Or WordIs("ls") <> 0 Or WordIs("dir") <> 0
+      CmdFatls()
+    ; THE SETTINGS STORE and U-Boot's names for it. SETTINGS.TXT lives at
+    ; \EFInvil on the ESP and survives a power cycle, which is what a
+    ; persisted boot target needs.
+    ElseIf WordIs("settings") <> 0
+      CmdSettings()
+    ElseIf WordIs("printenv") <> 0
+      CmdEnvPrint()
+    ElseIf WordIs("setenv") <> 0
+      CmdEnvSet()
+    ElseIf WordIs("saveenv") <> 0
+      CmdSettingsSave()
+    ElseIf WordIs("env") <> 0
+      CmdEnv()
+    ElseIf WordIs("time") <> 0
+      CmdTime()
+    ElseIf WordIs("uptime") <> 0 Or WordIs("up") <> 0
+      CmdUptime()
+    ElseIf WordIs("messages") <> 0
+      CmdMessages()
+    ElseIf WordIs("echo") <> 0
+      CmdEcho()
+    ElseIf WordIs("sleep") <> 0
+      CmdSleep()
+    ElseIf WordIs("version") <> 0 Or WordIs("ver") <> 0
+      CmdVersion()
+    ElseIf WordIs("setexpr") <> 0
+      CmdSetexpr()
+    ElseIf WordIs("gpio") <> 0
+      CmdGpio()
+    ElseIf WordIs("i2c") <> 0
+      CmdI2c()
+    ElseIf WordIs("fan") <> 0
+      CmdFan()
+    ; mod - the driver-module loader. Portable core; this board's own
+    ; hw_mod_q.unoq is what says whether an arena exists here yet.
+    ElseIf WordIs("mod") <> 0
+      CmdMod()
+
+    ElseIf WordIs("mmc") <> 0
+      CmdMmc()
+    ElseIf WordIs("usb") <> 0
+      CmdUsb()
+    ; map - the memory map as the running image measures it. Core, chip-free,
+    ; no capability: every board can say where it put itself. A whole word
+    ; only; m is the memory dump. See CmdMap in Anvil/Core/memcmd.pbi for
+    ; why it is a command of its own and not a section of `info`.
+    ElseIf WordIs("map") <> 0
+      CmdMap()
+
+    ElseIf WordIs("info") <> 0 Or WordIs("board") <> 0 Or LetterIs(105) <> 0
+      CmdQInfo()
+    ElseIf WordIs("reset") <> 0 Or WordIs("reboot") <> 0 Or LetterIs(114) <> 0
+      CmdQReset()
+    ElseIf WordIs("exit") <> 0 Or WordIs("quit") <> 0
+      CmdQExit()
+    ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0
+      Help()
+    Else
+      Define k.i
+      Print("? this monitor does not know the command ")
+      k = 0
+      While k < gWordLen And k < 24
+        UartWrite(gLine[gWordAt + k] & $FF)
+        k = k + 1
+      Wend
+      PrintN(", so nothing was done.")
+      PrintN("  Type help, or just a question mark, for the list of commands.")
+      PrintN("  Every command is a whole word; the old single letters still work.")
+    EndIf
+    ; What the command above cost, on this board's own counter, if the
+    ; line began with `measure`. Silent otherwise.
+    TimeReport()
+
+    ; The transcript is flushed after EVERY command, not once at the end.
+    ; This is the only channel anyone on this bench can read, and a
+    ; session that ends in a hang or a fault must still leave everything
+    ; up to the last completed command on disk.
+    QLogFlush()
+
+    If gQExitWanted <> 0
+      Break
+    EndIf
+  ForEver
+
+  ; ---- shutdown ------------------------------------------------------
+  PrintNl()
+  If gQExitReason = 2
+    PrintN("no input for 45 seconds and no console attached, so Anvil is")
+    PrintN("standing down rather than hanging a board nobody can see.")
+  ElseIf gQExitReason = 3
+    PrintN("exit: closing the session.")
+  Else
+    PrintN("the staged command script ended.")
+  EndIf
+  Print("transcript: ")
+  PrintDec(gQLogLen)
+  PrintN(" bytes at \EFI\anvil\anvil.log")
+  PrintN("handing the board back to Debian.")
+  UartDrain()
+  QLogFlush()
+
+  QEfiReset()
+  ProcedureReturn 0
+EndProcedure
+
+Main()

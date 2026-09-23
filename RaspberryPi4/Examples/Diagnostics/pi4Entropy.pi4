@@ -1,0 +1,289 @@
+; pi4Entropy.pi4 - does the BCM2711's RNG200 actually produce anything?
+;
+; DIAGNOSTIC. Does not ship.
+;
+; RaspberryPi4/Lib/entropy.pi4 was written against the register map of
+; three vendor drivers - Linux v6.12 and raspberrypi rpi-6.12.y
+; iproc-rng200.c, and U-Boot v2025.01 iproc_rng200.c, consulted and not
+; copied. Every register offset is a
+; citation with a line number and NOT ONE OF THEM HAS EVER BEEN READ ON
+; SILICON. This is the program that finds out, and it is the dependency
+; the whole TLS stack is waiting on: no entropy, no nonce, no WPA2
+; four-way handshake that is safe to run twice.
+;
+; ======================================================================
+;  READ THIS BEFORE QUOTING WHAT IT PRINTS
+; ======================================================================
+;
+; THE VERDICT LINE IS A DEAD-BLOCK VERDICT. IT IS NOT A RANDOMNESS TEST
+; AND MUST NOT BE REPORTED AS ONE.
+;
+; What a PASS establishes: the block is running, the FIFO is advancing,
+; the data lines are not tied, the output is not one value repeated or
+; a short cycle, and it is not grossly biased toward ones or zeros.
+;
+; What a PASS does NOT establish, and this list is not padding:
+;   * NOT that the output is random. A 32-bit counter passes all three
+;     checks. So does AES in counter mode under a key an attacker chose.
+;   * NOT that it is unpredictable. Nothing here looks for structure
+;     beyond a period of 64 words.
+;   * NOT an entropy rate. It cannot tell 32 bits per word from 1.
+;   * NOT NIST SP 800-90B health testing. The block's own NIST_FAIL bit
+;     is such a test, in hardware, and it is reported SEPARATELY below
+;     rather than folded into the verdict.
+;
+; The bias band is deliberately far too wide to be a statistical test -
+; 49.0% to 51.0%, about seven standard deviations at this sample size -
+; because a self-test that cries wolf gets disabled. It will therefore
+; MISS a source that is merely bad. entropy.pi4's header argues that
+; trade at length.
+;
+; THERE IS NO ORACLE FOR THIS PROGRAM. Every other diagnostic in this
+; folder has an expected answer. A hardware entropy source does not, by
+; definition, so nothing here or anywhere can say the numbers were
+; right. What the numbers are good for is the four register readings
+; printed beside them, which say whether the block is alive at all.
+;
+; ======================================================================
+;  BUILT WITH --entry-returns, WHICH IS WHY THIS IS SAFE TO RUN.
+; ======================================================================
+; It is sent to a resident Anvil and RETURNS to it, so a wrong answer
+; costs a line of output rather than a power cycle. Build it exactly
+; like this:
+;
+;   pmfc pi4Entropy.pi4 -t pi4 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o probe.img
+;
+; The stack is deliberately NOT the monitor's. --entry-returns saves and
+; restores whatever it was handed, so the payload may own its own stack
+; and still come back.
+;
+; IT PRINTS EVERYTHING ITSELF rather than only returning a value. The
+; return value is a compact verdict for the monitor's own line - 0 for
+; a clean run, otherwise the stuck-detector bitmask, or a negative
+; entropy error - and the detail goes over the UART.
+;
+; IT CAN HANG NOTHING. Every wait in entropy.pi4 is bounded by a spin
+; budget, so a block that is dead reports a timeout instead of freezing
+; the board. That is the whole reason the budget exists.
+;
+; WHAT TO DO WITH THE RESULT: record the four register readings and the
+; verdict with the board's other bench readings. If it is NOT alive, the
+; numbers printed here
+; are the diagnosis - a CTRL of zero after EntropyBegin means the write
+; did not take, a FIFO count that never leaves zero with TOTAL_BITS
+; moving means the block generates but does not fill, and TOTAL_BITS
+; stuck at zero means it never started.
+
+XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
+
+#UART_DR = $FE201000
+#UART_FR = $FE201018
+
+; How many words the stuck detector looks at. 4096 words is 131072
+; bits, which at the block's documented 1 MHz sample rate is about an
+; eighth of a second of sampling - long enough to be worth doing and
+; short enough that nobody watching the console thinks it hung.
+#PROBE_WORDS = 4096
+
+Global Dim probeBuf.a[16384]         ; #PROBE_WORDS * 4
+
+Procedure PutC(c.i)
+  Define f.i
+  Repeat
+    f = PeekN(#UART_FR)
+  Until (f & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define i.i
+  Define c.i
+  i = 0
+  Repeat
+    ; PeekA, not PeekB. PeekB names the SIGNED .b and sign-extends on
+    ; every backend now, so a byte above 127 would come back negative
+    ; and this loop would never see its terminator.
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Define i.i
+  Define n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The four registers worth printing, and what each answers.
+; ----------------------------------------------------------------------
+Procedure ShowRegs()
+  PutS("  RNG_CTRL   $") : PutHex(EntropyCtrl(), 8)
+  PutS("   (enable field non-zero = running)") : PutNl()
+  PutS("  INT_STATUS $") : PutHex(EntropyIntStatus(), 8)
+  PutS("   (bit 31 master-fail, bit 5 NIST-fail, bit 17 startup-met)")
+  PutNl()
+  PutS("  TOTAL_BITS ") : PutDec(EntropyTotalBits())
+  PutS("   (a running count; stuck at 0 = never started)") : PutNl()
+  PutS("  FIFO_COUNT ") : PutDec(EntropyFifoCount())
+  PutS("   (words waiting, 0..255)") : PutNl()
+EndProcedure
+
+Procedure.i Main()
+  Define st.i
+  Define verdict.i
+  Define got.i
+  Define i.i
+
+  PutNl()
+  PutS("=== pi4Entropy - BCM2711 RNG200 at $FE104000 ===") : PutNl()
+  PutS("THE VERDICT IS A DEAD-BLOCK CHECK, NOT A RANDOMNESS TEST.")
+  PutNl() : PutNl()
+
+  PutS("before EntropyBegin:") : PutNl()
+  ShowRegs()
+
+  st = EntropyBegin()
+  PutS("EntropyBegin returned ") : PutDec(st)
+  If st = #ENTROPY_ALREADY
+    PutS("  = ALREADY ENABLED. Somebody else started this block, so")
+    PutNl()
+    PutS("      the documented warm-up threshold at offset $10 is NOT")
+    PutNl()
+    PutS("      known to have been programmed. Call EntropyRestart() if")
+    PutNl()
+    PutS("      that matters. Continuing.")
+  ElseIf st = #ENTROPY_OK
+    PutS("  = programmed and enabled by this run")
+  EndIf
+  PutNl()
+  ShowRegs()
+
+  st = EntropyWarmupWait(#ENTROPY_SPINS)
+  PutS("EntropyWarmupWait returned ") : PutDec(st)
+  If st = #ENTROPY_ERR_TIMEOUT
+    PutS("  = TIMEOUT. TOTAL_BITS never passed 16. The block is not")
+    PutNl()
+    PutS("      generating. Nothing below this line means anything.")
+    PutNl()
+    ShowRegs()
+    ProcedureReturn st
+  EndIf
+  If st < 0
+    PutS("  = refused") : PutNl()
+    ShowRegs()
+    ProcedureReturn st
+  EndIf
+  PutS("  = warm-up elapsed") : PutNl()
+  ShowRegs()
+
+  PutS("collecting ") : PutDec(#PROBE_WORDS) : PutS(" words ...") : PutNl()
+  got = EntropyWords(@probeBuf[0], #PROBE_WORDS, #ENTROPY_SPINS)
+  PutS("EntropyWords returned ") : PutDec(got) : PutNl()
+  If got < 0
+    If got = #ENTROPY_ERR_HEALTH
+      PutS("  = the block CONDEMNED ITS OWN OUTPUT (master-fail or")
+      PutNl()
+      PutS("      NIST-fail in INT_STATUS). That is a hardware health")
+      PutNl()
+      PutS("      test failing, and it is a real result - it is not this")
+      PutNl()
+      PutS("      program deciding anything. Try EntropyRestart().")
+      PutNl()
+    EndIf
+    ShowRegs()
+    ProcedureReturn got
+  EndIf
+
+  ; The first eight words, printed. They prove nothing statistically
+  ; and they are the fastest way for a human to see that the block is
+  ; not handing back the same number over and over.
+  PutS("  first eight words:") : PutNl()
+  i = 0
+  While i < 8
+    PutS("    $") : PutHex(PeekN(@probeBuf[0] + (i * 4)), 8) : PutNl()
+    i = i + 1
+  Wend
+
+  verdict = EntropyStuckCheck(@probeBuf[0], #PROBE_WORDS)
+
+  PutS("  words looked at   ") : PutDec(EntropyStuckWords()) : PutNl()
+  PutS("  set bits          ") : PutDec(EntropyStuckOnes())
+  PutS(" of ") : PutDec(EntropyStuckBits())
+  PutS("   (half would be ") : PutDec(EntropyStuckBits() / 2) : PutS(")")
+  PutNl()
+  PutS("  words = $00000000 ") : PutDec(EntropyStuckZeroWords()) : PutNl()
+  PutS("  words = $FFFFFFFF ") : PutDec(EntropyStuckOnesWords()) : PutNl()
+  PutS("  repeating period  ") : PutDec(EntropyStuckPeriod())
+  PutS("   (0 = none found up to 64)") : PutNl()
+  PutS("  timeouts          ") : PutDec(EntropyTimeouts()) : PutNl()
+  PutS("  health stops      ") : PutDec(EntropyHealthStops()) : PutNl()
+  ShowRegs()
+
+  PutS("=== ")
+  If verdict = #ENTROPY_STUCK_OK
+    PutS("NOT STUCK. The block is alive and its output is not a")
+    PutNl()
+    PutS("    constant, not a short cycle and not grossly biased.")
+    PutNl()
+    PutS("    THIS IS NOT A STATEMENT THAT THE OUTPUT IS RANDOM.")
+  Else
+    PutS("STUCK - verdict bitmask ") : PutDec(verdict) : PutNl()
+    If (verdict & #ENTROPY_STUCK_ALLEQUAL) <> 0
+      PutS("    1  every word identical") : PutNl()
+    EndIf
+    If (verdict & #ENTROPY_STUCK_CYCLE) <> 0
+      PutS("    2  repeats with period ") : PutDec(EntropyStuckPeriod())
+      PutNl()
+    EndIf
+    If (verdict & #ENTROPY_STUCK_BIAS) <> 0
+      PutS("    4  ones/zeros outside 49.0%..51.0%") : PutNl()
+    EndIf
+    If (verdict & #ENTROPY_STUCK_SHORT) <> 0
+      PutS("    8  too few words to say anything") : PutNl()
+    EndIf
+    PutS("    DO NOT SEED A DRBG FROM THIS BLOCK")
+  EndIf
+  PutS(" ===")
+  PutNl()
+
+  ProcedureReturn verdict
+EndProcedure
