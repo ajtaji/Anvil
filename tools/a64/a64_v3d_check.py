@@ -2297,14 +2297,14 @@ def _main() -> int:
 
     # -- the mailbox side actually happened -----------------------------
     tags_seen = {t for t, _ in fw.seen}
-    # SET_POWER_STATE IS A FALLBACK, NOT A REQUIREMENT.  v3d.pi4:1600-1613
+    # SET_POWER_STATE IS A FALLBACK, NOT A REQUIREMENT.  v3d.pi4:1778-1782
     # sends the old tag only when SET_DOMAIN_STATE did not answer 1, after
     # the board showed the redundant old tag wedging the property channel.
     # This model's firmware answers 1, so the old tag must be ABSENT here
     # and PRESENT, with device 10, under N9 below, where nothing answers.
     expect(k["tags"]["SET_POWER_STATE"] not in {t for t, _ in fw.seen},
            "the library sent SET_POWER_STATE although SET_DOMAIN_STATE "
-           "answered 1.  v3d.pi4:1600-1613 makes the old tag a fallback "
+           "answered 1.  v3d.pi4:1778-1782 makes the old tag a fallback "
            "because sending it after the new one stopped the property "
            "channel answering on the board.")
     for want_name in ("GET_DOMAIN_STATE", "SET_DOMAIN_STATE",
@@ -2485,11 +2485,11 @@ def _main() -> int:
     fw = Firmware(k["tags"], k["clock_id"], k["domain_new"], k["power_old"],
                   answer_tags=False)
     negative("firmware answers nothing", bd, fw, "OK")
-    # And the fallback fires, to the OLD device number (v3d.pi4:1611-1613).
+    # And the fallback fires, to the OLD device number (v3d.pi4:1780-1781).
     sent_old = [w for t, w in fw.seen if t == k["tags"]["SET_POWER_STATE"]]
     expect(bool(sent_old) and all(w[0] == k["power_old"] for w in sent_old),
            "with no tag answered, SET_POWER_STATE was sent with ids %r; "
-           "v3d.pi4:1611-1613 falls back to it, with device %d, when "
+           "v3d.pi4:1780-1781 falls back to it, with device %d, when "
            "SET_DOMAIN_STATE does not answer 1"
            % ([w[0] for w in sent_old], k["power_old"]))
     print("   fallback SET_POWER_STATE sent with device %d when nothing answered"
