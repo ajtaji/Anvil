@@ -3,10 +3,12 @@ import argparse,os,pathlib,struct,subprocess,sys,tempfile,zlib
 from collections import deque
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=base.ROOT
 def frame(off,data,crc=None):return b'P3D1'+struct.pack('<IHI',off,len(data),zlib.crc32(data) if crc is None else crc)+data
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     with tempfile.TemporaryDirectory(prefix='pi3-frames-') as tmp:
         image=pathlib.Path(tmp)/'frames.img';env=os.environ.copy();env['PMF_ROOT']=str(ROOT)
         r=subprocess.run([a.compiler,'--compile','RaspberryPi3/Tests/update_integrated_gate.pi3','-t','pi3','--entry-returns','--load-addr',hex(base.LOAD),'--stack-addr',hex(base.STACK),'-s','-o',str(image)],cwd=ROOT,env=env,capture_output=True,text=True)

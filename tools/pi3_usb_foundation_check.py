@@ -11,6 +11,8 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HOST_TEST = ROOT / "RaspberryPi3" / "Tests" / "usb_foundation_host.pb"
@@ -76,7 +78,7 @@ def main() -> int:
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--purebasic", default=os.environ.get("PB_COMPILER") or
                         str(pathlib.Path.home() / "AppData/Local/Programs/PureBasic/Compilers/pbcompiler.exe"))
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("Pi 3 USB foundation gate: pass --compiler or set PMF_COMPILER.")
     compiler = require(args.compiler, "unified IDE compiler")

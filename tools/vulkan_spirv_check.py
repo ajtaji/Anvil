@@ -32,6 +32,8 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 GATE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / "vulkan_spirv_gate.pi4"
 FRONTEND = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_spirv.pbi"
 
@@ -1032,18 +1034,16 @@ def locate_compiler(explicit) -> pathlib.Path:
     `PMF_COMPILER` is the name the toolchain uses now that PureMetalForge
     builds from the command line and pmfc is retired; `PMFC` is still
     accepted so a transcript written before the rename runs unchanged.
+    Whatever was named is routed through the shared, validating resolver
+    (tools/pmf_compiler.py); the bare repo-root fallback below is
+    unchanged (forum 977).
     """
-    choices = []
-    if explicit:
-        choices.append(pathlib.Path(explicit))
-    for name in ("PMF_COMPILER", "PMFC"):
-        value = os.environ.get(name)
-        if value:
-            choices.append(pathlib.Path(value))
-    choices.append(ROOT / "PureMetalForge.exe")
-    for path in choices:
-        if path.is_file():
-            return path.resolve()
+    requested = explicit or os.environ.get("PMF_COMPILER") or os.environ.get("PMFC")
+    if requested:
+        return pathlib.Path(_pmf_resolve_compiler(requested))
+    fallback = ROOT / "PureMetalForge.exe"
+    if fallback.is_file():
+        return fallback.resolve()
     raise SystemExit("set PMF_COMPILER to PureMetalForge.exe, or pass --compiler")
 
 

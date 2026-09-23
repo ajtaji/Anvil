@@ -2,9 +2,11 @@
 import argparse, importlib.util, os, subprocess, sys, tempfile
 from pathlib import Path
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     spec=importlib.util.spec_from_file_location('context_a64',ROOT/'tools/a64/a64_interp.py')
     m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
     source=ROOT/'Anvil/Kernel/Scheduler/Tests/context.pi4'

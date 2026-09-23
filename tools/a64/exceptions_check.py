@@ -10,6 +10,10 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 LOAD = 0x400000
@@ -26,7 +30,7 @@ def main():
     p.add_argument('--compiler', required=True)
     p.add_argument('--mutant', choices=('simd', 'return', 'nested'), help=argparse.SUPPRESS)
     p.add_argument('--self-test', action='store_true')
-    args = p.parse_args()
+    args = p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     spec = importlib.util.spec_from_file_location('exception_a64', ROOT / 'tools/a64/a64_interp.py')
     a64 = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = a64

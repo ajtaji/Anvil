@@ -54,6 +54,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from a64_interp import A64, attach_symbols                       # noqa: E402
 import build_count                                               # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 SOURCE = ROOT / "RaspberryPi4" / "Board" / "board.pi4"
 MAP = ROOT / "RaspberryPi4" / "Board" / "memmap.pi4"
@@ -3224,7 +3228,7 @@ def main() -> int:
     ap.add_argument("--work", default=None,
                     help="directory for the two images (default: a temporary "
                          "directory removed afterwards)")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         print("a64_anvil_check: no compiler was named. Pass --compiler with "
               "the path of PureMetalForge.exe, or set PMF_COMPILER.")

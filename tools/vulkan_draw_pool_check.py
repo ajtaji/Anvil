@@ -16,6 +16,8 @@ import pathlib
 import sys
 import tempfile
 import time
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -205,7 +207,7 @@ def main() -> int:
     parser.add_argument("--interp")
     parser.add_argument("--registry")
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 
     compiler = locate(args.compiler, "PMF_COMPILER", DEFAULT_COMPILER)
     registry = locate(args.registry, "VULKAN_REGISTRY", DEFAULT_REGISTRY)

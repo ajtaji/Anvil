@@ -58,6 +58,8 @@ ROOT = HERE.parent
 
 sys.path.insert(0, str(HERE))
 import build_count  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 GATE = ROOT / "RaspberryPi4" / "Tests" / "touch_keyboard_integration_emitted_gate.pi4"
 ADAPTER = ROOT / "RaspberryPi4" / "Board" / "banner_clock.pi4"
@@ -476,7 +478,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = locate("PMF_COMPILER", args.compiler, [ROOT / "PureMetalForge.exe", ROOT / "compiler"])
     a64 = load_interpreter(locate("PMF_A64_INTERP", args.interp,
                                   [ROOT / "tools" / "a64" / "a64_interp.py"]))

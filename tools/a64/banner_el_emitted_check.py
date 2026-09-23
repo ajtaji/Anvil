@@ -9,6 +9,9 @@ import hashlib
 import pathlib
 import tempfile
 import el3_runtime_emitted_check as base
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 
 def execute(a64, data, el):
@@ -40,7 +43,7 @@ def main():
     parser.add_argument('--compiler', required=True)
     parser.add_argument('--interp', default=str(base.INTERP))
     args = parser.parse_args()
-    compiler = base.required_path(args.compiler, 'compiler')
+    compiler = pathlib.Path(resolve_compiler(args.compiler))
     a64 = base.load_interpreter(base.required_path(args.interp, 'interp'))
     base.PROBE = base.ROOT / 'RaspberryPi4/Tests/banner_el_emitted_gate.pi4'
     with tempfile.TemporaryDirectory(prefix='anvil-banner-el-') as temp:

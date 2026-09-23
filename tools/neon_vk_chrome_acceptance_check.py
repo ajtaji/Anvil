@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -592,7 +594,7 @@ def main() -> int:
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     parser.add_argument("--oracle-only", action="store_true", help="prove the independent emitted oracle even before the adapter lands")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         compiler = locate(args.compiler, DEFAULT_COMPILER, "PureMetalForge.exe")
         interp = locate(args.interp, DEFAULT_INTERP, "A64 interpreter")

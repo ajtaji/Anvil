@@ -12,6 +12,8 @@ import sys
 import tempfile
 
 import pi3_gate_build
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "Anvil" / "Net" / "cyw43.pbi"
@@ -107,7 +109,7 @@ def execute(a64, blob: bytes, symbols: dict[str, int]) -> tuple[int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

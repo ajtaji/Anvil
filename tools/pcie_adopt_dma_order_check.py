@@ -6,7 +6,9 @@ not that this board's firmware actually left an active xHC.
 import argparse,pathlib,re,tempfile,subprocess,os,sys,hashlib
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as base
-p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
+p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 text=subprocess.check_output(['git','show','f3d6ebb:RaspberryPi4/Lib/pcie.pi4'],cwd=base.ROOT,text=True)
 bodies='\n'.join(re.search(r'(?ms)^Procedure(?:\.i)? '+n+r'\(\).*?^EndProcedure',text).group() for n in ('PcieProgramWindow','PcieInit'))
 definitions={m.group(1):m.group(0) for m in re.finditer(r'(?m)^#(\w+)\s*=.*$',text)}

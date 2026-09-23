@@ -13,6 +13,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_t1_check import compile_gate, ROOT, LOAD, STACK  # noqa: E402
 import a64_core_worker_check as base  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 GATE = ROOT / "RaspberryPi4/Tests/truetype_t4_gate.pi4"
 META, FONT_BASE, MAGIC = 0x0F000000, 0x10000000, 0x54543452
@@ -217,7 +219,7 @@ def mutant_rejected(compiler,temp,font):
     result,_,_=run_image(symbols,blob,fixture_memory(font)); return result!=0
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument("--compiler",required=True); parser.add_argument("--work-dir",type=Path); parser.add_argument("--reuse-image",action="store_true"); parser.add_argument("--skip-mutant",action="store_true"); parser.add_argument("--mutant-only",action="store_true"); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--compiler",required=True); parser.add_argument("--work-dir",type=Path); parser.add_argument("--reuse-image",action="store_true"); parser.add_argument("--skip-mutant",action="store_true"); parser.add_argument("--mutant-only",action="store_true"); args=parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler=Path(args.compiler).expanduser().resolve(); font=font_bytes()
     if args.work_dir:
         args.work_dir.mkdir(parents=True,exist_ok=True)

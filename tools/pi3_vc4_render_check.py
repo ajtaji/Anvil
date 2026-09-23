@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi3" / "Tests" / "vc4_render_gate.pi3"
@@ -110,7 +112,7 @@ def main() -> int:
             r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe",
         )),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     with tempfile.TemporaryDirectory(prefix="pi3-vc4-render-") as temporary:
         image, symbols = build(args.compiler, Path(temporary))
         result, steps = execute(load_interpreter(), image, symbols)

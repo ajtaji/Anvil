@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -209,7 +211,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", default=str(DEFAULT_COMPILER))
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = pathlib.Path(args.compiler).resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

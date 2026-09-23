@@ -2,6 +2,8 @@ from __future__ import annotations
 import argparse, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 import tcp_multiif_emitted_check as emitted
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "Anvil" / "Core" / "boot_transcript.pbi"
@@ -30,7 +32,7 @@ def mutate_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new, 1)
 
 def main() -> int:
-    p=argparse.ArgumentParser(); p.add_argument("--compiler",default=os.environ.get("PMF_COMPILER")); p.add_argument("--interp",default=os.environ.get("PMF_A64_INTERP")); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument("--compiler",default=os.environ.get("PMF_COMPILER")); p.add_argument("--interp",default=os.environ.get("PMF_A64_INTERP")); a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     compiler=emitted.required_path(a.compiler,"PMF_COMPILER"); interp=emitted.required_path(a.interp,"PMF_A64_INTERP"); a64=emitted.load_interpreter(interp)
     core=CORE.read_text(encoding="utf-8")
     mutations=(

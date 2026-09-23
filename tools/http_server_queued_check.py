@@ -8,9 +8,11 @@ import subprocess
 import sys
 import tempfile
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);args=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     prefix=(ROOT/'RaspberryPi4/Tests/tcp_multiif_emitted_gate.pi4').read_text().split('; mode0:')[0]
     prefix=prefix.replace('XIncludeFile "Anvil/Core/sha256.pbi"','').replace('XIncludeFile "Anvil/Core/netrecv.pbi"','')
     prefix='Global Dim gate_wire.a[4096]\nGlobal gate_wire_size.i\n'+prefix

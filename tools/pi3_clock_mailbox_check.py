@@ -5,6 +5,8 @@ import argparse, pathlib, re, subprocess, tempfile
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -80,7 +82,7 @@ EndProcedure
 '''
 
 def main() -> int:
-    ap = argparse.ArgumentParser(); ap.add_argument("--compiler", required=True); args = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--compiler", required=True); args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     with tempfile.TemporaryDirectory(prefix="pi3-clock-gate-") as td:
         src = pathlib.Path(td) / "clock.pi3"; image = pathlib.Path(td) / "clock.img"
         src.write_text(fixture(), encoding="utf-8")

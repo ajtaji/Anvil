@@ -57,6 +57,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools" / "a64"))
 from a64_interp import A64, attach_symbols  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LOAD = 0x200000
 SEC = 512
@@ -1446,7 +1450,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="PureMetalForge.exe (default: $PMF_COMPILER)")
     ap.add_argument("--mutate", action="store_true",
                     help="prove the gate can fail, by breaking the library")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         ap.error("No compiler was named. Pass --compiler with the path to "
                  "PureMetalForge.exe, or set PMF_COMPILER.")

@@ -16,6 +16,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_t1_check import base  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "_work/truetype-neon-native-20260919"
@@ -91,7 +93,7 @@ def main() -> int:
     ap.add_argument("--compiler", required=True, type=Path)
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT,
                     help=f"output directory (default: {DEFAULT_OUT})")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     out = args.out.expanduser().resolve()
     export = out / "clean-export"

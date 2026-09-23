@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/tests/module_pipeline"
@@ -337,9 +338,11 @@ def execute(a64) -> tuple[int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", type=Path, default=os.environ.get("PMF_COMPILER"))
-    parser.parse_args()
+    args = parser.parse_args()
 
-    compiler = locate_required("PMF_COMPILER", "PureMetalForge.exe")
+    _compiler_named = args.compiler or os.environ.get("PMF_COMPILER")
+    compiler = (Path(resolve_compiler(_compiler_named)) if _compiler_named
+                else locate_required("PMF_COMPILER", "PureMetalForge.exe"))
     interpreter = locate_required("PMF_A64_INTERP", "tools/a64/a64_interp.py")
     notes = check_vocabulary()
 

@@ -13,7 +13,9 @@ Both are spec-derived models; neither behaviour has been observed on silicon.
 import pathlib,re,sys,tempfile,subprocess,os,argparse,hashlib
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as base
-p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
+p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 source=(base.ROOT/'RaspberryPi4/Lib/xhci.pi4').read_text()
 names='USBSTS USBCMD STS_HALT STS_CNR STS_EINT STS_HCE IMAN CMD_RUN CMD_RESET CMD_EIE CMD_HSEIE CMD_EWE ERR_NONE ERR_HALT ERR_RESET ERR_CNR ERR_GONE ERR_HCE TMO_HALT_MS TMO_RESET_MS TMO_RESET_LONG_MS'.split()
 constants='\n'.join(re.search(r'(?m)^#XHCI_'+n+r'\s*=.*$',source).group() for n in names)

@@ -2,12 +2,14 @@
 import argparse, importlib.util, os, subprocess, sys, tempfile
 from pathlib import Path
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 LOAD=0x400000
 RETURN=0x7000000
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     spec=importlib.util.spec_from_file_location('accept_a64',ROOT/'tools/a64/a64_interp.py')
     m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
     with tempfile.TemporaryDirectory(prefix='el3-accept-') as tmp:

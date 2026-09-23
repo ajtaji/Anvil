@@ -678,9 +678,16 @@ def mutate(args) -> int:
 
 
 def resolve_compiler(requested):
-    """Resolve the PureMetal compiler the way tools/build.py does."""
+    """Resolve the PureMetal compiler. A named compiler (explicit or
+    PMF_COMPILER) is routed through the shared, validating resolver
+    (tools/pmf_compiler.py): refuses a missing, retired, or
+    untracked/stale executable (forum 977). With nothing named, this
+    falls back to tools/build.py's bare-PATH search, unchanged."""
     sys.path.insert(0, str(ROOT / "tools"))
     import build as anvil_build  # noqa: E402
+    if requested or os.environ.get("PMF_COMPILER"):
+        from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
+        return _pmf_resolve_compiler(requested)
     return anvil_build.find_compiler(requested)
 
 

@@ -17,6 +17,8 @@ import tempfile
 
 import fileops_check as harness
 import fs_reference as reference
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -159,7 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', type=Path, required=True)
     parser.add_argument('--mutate', action='store_true')
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     for fs in ('fat32', 'exfat'):
         with tempfile.TemporaryDirectory(prefix='fs-extent-') as tmp:

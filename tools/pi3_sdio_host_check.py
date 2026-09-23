@@ -19,6 +19,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = base.ROOT
 PROBE = ROOT / "RaspberryPi3" / "Tests" / "sdio_gate.pi3"
@@ -872,7 +874,7 @@ def sdio_power_sequence_checks(host_factory) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     image, sym, blob, temp = compile_gate(args.compiler.resolve())
     a64 = base.load_interp(base.INTERP)
     checks = 0

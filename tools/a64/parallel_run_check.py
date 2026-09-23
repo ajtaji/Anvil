@@ -40,6 +40,10 @@ import tempfile
 import capstone
 
 import a64_core_worker_check as base
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ROOT = base.ROOT
 FIXTURE = ROOT / "RaspberryPi4/Tests/parallel_run_emitted_gate.pi4"
@@ -610,7 +614,7 @@ def main() -> None:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--limits", action="store_true",
                         help="print what a PASS here does not cover, and stop")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(); arguments.compiler = _pmfpath.Path(resolve_compiler(arguments.compiler)) if arguments.compiler else arguments.compiler
     if arguments.limits:
         print(__doc__)
         return

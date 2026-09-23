@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "RaspberryPi4/Tests/v3d_cache_batch_emitted_gate.pi4"
@@ -184,7 +186,7 @@ def main() -> int:
     parser.add_argument("--compiler", type=Path, default=Path(os.environ.get("PMF_COMPILER", r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")))
     parser.add_argument("--interpreter", type=Path, default=ROOT / "tools/a64/a64_interp.py")
     parser.add_argument("--no-mutate", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     core = CORE.read_text(encoding="utf-8-sig")
     a64 = load_interpreter(args.interpreter)
     checks = 0

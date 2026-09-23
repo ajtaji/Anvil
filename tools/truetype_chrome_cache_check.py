@@ -11,6 +11,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_slots_check import compile_gate, font_memory, run_entry, ROOT  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 GATE = ROOT / "RaspberryPi4/Tests/truetype_chrome_cache_gate.pi4"
 CHROME = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
@@ -84,7 +86,7 @@ def main() -> int:
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--font", type=Path,
                         default=ROOT / "_work/truetype-fonts-20260918/abel/Abel-Regular.ttf")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).expanduser().resolve()
     font = args.font.expanduser().resolve()
     if not compiler.is_file():

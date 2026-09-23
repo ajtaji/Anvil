@@ -2,7 +2,9 @@
 import pathlib,re,sys,tempfile,subprocess,os,argparse
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as base
-p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
+p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 source=(base.ROOT/'RaspberryPi4/Board/cursor_input.pi4').read_text()
 body=re.search(r'(?ms)^Procedure UsbPhaseWord\(\).*?^EndProcedure',source).group()
 constants='\n'.join(re.findall(r'(?m)^#BPH_XHCI.*$',source))

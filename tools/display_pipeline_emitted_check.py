@@ -20,6 +20,8 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "neon_orientation_compile.pi4"
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -73,13 +75,14 @@ def load_interpreter(path: pathlib.Path):
 
 
 def locate_compiler() -> pathlib.Path:
-    choices = []
+    """Resolve through the shared, validating resolver (tools/pmf_compiler.py)
+    when PMF_COMPILER is set; otherwise fall back to a copy in the repo
+    root, unchanged from before (forum 977)."""
     if os.environ.get("PMF_COMPILER"):
-        choices.append(pathlib.Path(os.environ["PMF_COMPILER"]))
-    choices.append(ROOT / "PureMetalForge.exe")
-    for path in choices:
-        if path.is_file():
-            return path
+        return pathlib.Path(_pmf_resolve_compiler(os.environ["PMF_COMPILER"]))
+    fallback = ROOT / "PureMetalForge.exe"
+    if fallback.is_file():
+        return fallback
     raise SystemExit("display emitted gate: PureMetalForge.exe was not found; set PMF_COMPILER")
 
 

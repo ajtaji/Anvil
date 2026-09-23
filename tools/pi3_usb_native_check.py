@@ -8,12 +8,14 @@ import tempfile
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parent/'a64'))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--compiler',required=True)
     p.add_argument('--purebasic',default=str(Path.home()/'AppData/Local/Programs/PureBasic/Compilers/pbcompiler.exe'))
-    args=p.parse_args();env=dict(os.environ,PMF_ROOT=str(ROOT));checks=0
+    args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler;env=dict(os.environ,PMF_ROOT=str(ROOT));checks=0
     def run(command):
         r=subprocess.run(command,cwd=ROOT,env=env,capture_output=True,text=True,timeout=90)
         assert r.returncode==0,r.stdout+r.stderr

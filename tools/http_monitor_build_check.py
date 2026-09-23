@@ -6,6 +6,8 @@ import os
 import tempfile
 import build_count
 from build import staged_compiler
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -13,7 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', required=True)
     parser.add_argument('--output', required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).resolve()
     if compiler.name.lower().startswith('pmfc'):
         raise SystemExit('Use the IDE application with --compile, not the retired compiler.')

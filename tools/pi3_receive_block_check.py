@@ -13,6 +13,8 @@ import tempfile
 import zlib
 
 import pi3_gate_build
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 BOARD = ROOT / "RaspberryPi3" / "Board" / "board.pi3"
@@ -193,7 +195,7 @@ def emitted_cases(a64, image, symbols) -> tuple[int, int]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", type=Path, required=True)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

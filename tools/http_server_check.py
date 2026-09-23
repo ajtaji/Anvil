@@ -10,6 +10,8 @@ import sys
 import tempfile
 import threading
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT=Path(__file__).resolve().parents[1]
 BASE,STACK,RETURN=0x400000,0x3000000,0x7000000
@@ -17,7 +19,7 @@ BASE,STACK,RETURN=0x400000,0x3000000,0x7000000
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler',required=True)
-    args=parser.parse_args()
+    args=parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     spec=importlib.util.spec_from_file_location('http_a64',ROOT/'tools/a64/a64_interp.py')
     mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod; spec.loader.exec_module(mod)
     with tempfile.TemporaryDirectory(prefix='anvil-http-') as td:

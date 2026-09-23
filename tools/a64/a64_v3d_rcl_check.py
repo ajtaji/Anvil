@@ -80,6 +80,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 
 from a64_interp import A64, AlignmentFault   # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LIB = ROOT / "RaspberryPi4" / "Lib" / "v3d.pi4"
 PROBE = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4V3dClear.pi4"
@@ -1677,7 +1681,7 @@ def main() -> int:
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
                     help="the PureMetalForge executable (default: PMF_COMPILER)")
     ap.add_argument("--mutate", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     if not a.compiler:
         raise SystemExit("No compiler was named. Pass --compiler or set "
                          "PMF_COMPILER to the PureMetalForge executable.")

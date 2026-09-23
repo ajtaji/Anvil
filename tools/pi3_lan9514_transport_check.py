@@ -3,6 +3,8 @@
 from __future__ import annotations
 import argparse, hashlib, os, pathlib, re, subprocess, tempfile
 from pi3_usb_enumeration_check import execute, load_interpreter, require
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 HOST=ROOT/"RaspberryPi3"/"Tests"/"lan9514_transport_host.pb"
@@ -19,7 +21,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler",default=os.environ.get("PMF_COMPILER") or r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
     parser.add_argument("--purebasic",default=os.environ.get("PB_COMPILER") or str(pathlib.Path.home()/"AppData/Local/Programs/PureBasic/Compilers/pbcompiler.exe"))
-    args=parser.parse_args(); compiler=require(pathlib.Path(args.compiler),"unified IDE compiler"); pb=require(pathlib.Path(args.purebasic),"host PureBasic compiler")
+    args=parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler; compiler=require(pathlib.Path(args.compiler),"unified IDE compiler"); pb=require(pathlib.Path(args.purebasic),"host PureBasic compiler")
     text=SOURCE.read_text(encoding="utf-8")
     for name in ("Pi3LanRegisterStep","Pi3LanMacStep","Pi3LanPhyStep"):
         match=re.search(rf"Procedure(?:\.i)?\s+{name}\([^\n]*\)(.*?)EndProcedure",text,re.I|re.S)

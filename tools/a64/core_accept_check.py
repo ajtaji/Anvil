@@ -6,6 +6,10 @@ from pathlib import Path
 import tempfile
 import shutil
 import a64_core_worker_check as base
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ROOT = base.ROOT
 FIXTURE = ROOT / 'RaspberryPi4/Tests/core_accept_emitted_gate.pi4'
@@ -13,7 +17,7 @@ FIXTURE = ROOT / 'RaspberryPi4/Tests/core_accept_emitted_gate.pi4'
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--compiler', required=True)
-    args = p.parse_args()
+    args = p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     with tempfile.TemporaryDirectory(prefix='core-accept-') as tmp:
         image, asm = base.build(args.compiler, Path(tmp), FIXTURE, 'accept')
         sym = base.parse_symbols(image)

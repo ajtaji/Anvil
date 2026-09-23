@@ -3,6 +3,8 @@ import argparse,hashlib,os,pathlib,struct,subprocess,sys,tempfile
 import capstone
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=base.ROOT
 
 def dtb(reserve=(),fixed=None):
@@ -23,7 +25,7 @@ def dtb(reserve=(),fixed=None):
     return header+reservations+tree+names
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     with tempfile.TemporaryDirectory(prefix='pi3-update-boot-') as tmp:
         image=pathlib.Path(tmp)/'gate.img';env=os.environ.copy();env['PMF_ROOT']=str(ROOT)
         r=subprocess.run([args.compiler,'--compile','RaspberryPi3/Tests/update_boot_gate.pi3','-t','pi3','--entry-returns','--load-addr',hex(base.LOAD),'--stack-addr',hex(base.STACK),'-s','-o',str(image)],cwd=ROOT,env=env,capture_output=True,text=True)

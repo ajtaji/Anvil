@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "pbkdf2_step_emitted_gate.pi4"
@@ -118,7 +119,7 @@ def main() -> int:
     parser.add_argument("--calibrate-only", action="store_true",
                         help="measure one 16-PRF slice and print the derived full-run ceiling")
     args = parser.parse_args()
-    compiler = required_path(args.compiler, "PMF_COMPILER")
+    compiler = pathlib.Path(resolve_compiler(args.compiler))
     a64 = load_interpreter(required_path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-pbkdf2-step-") as temporary:

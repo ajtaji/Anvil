@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 
 import dsi_diag_read_safety_check as emitted
+from pmf_compiler import resolve_compiler
 
 
 MASK = (1 << 64) - 1
@@ -622,7 +624,10 @@ def main() -> int:
     else:
         with tempfile.TemporaryDirectory(prefix="anvil-eth-hwup-") as name:
             image = emitted.build(
-                emitted.anvil_build.find_compiler(args.compiler), Path(name))
+                (resolve_compiler(args.compiler)
+                 if (args.compiler or os.environ.get("PMF_COMPILER"))
+                 else emitted.anvil_build.find_compiler(args.compiler)),
+                Path(name))
             check(a64, image)
     return 0
 

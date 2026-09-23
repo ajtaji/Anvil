@@ -12,6 +12,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import vulkan_truetype_proof_build as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 OUT = ROOT / "_work/vulkan-truetype-grid-diff-cap1024-20260919"
 
@@ -202,7 +204,7 @@ def main() -> int:
     ap.add_argument("--load-addr", default="0x600000")
     ap.add_argument("--out", type=Path, required=True,
                     help="new, unused output directory; existing paths are never overwritten")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     load_addr = int(args.load_addr, 0)
     OUT = args.out if args.out.is_absolute() else ROOT / args.out
     if OUT.exists():

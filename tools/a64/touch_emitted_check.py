@@ -72,6 +72,10 @@ sys.path.insert(0, str(HERE))
 
 from a64_interp import A64, attach_symbols            # noqa: E402
 from a64_target import TARGETS                        # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
 
@@ -2055,7 +2059,7 @@ def main():
     ap.add_argument(
         "--model-only", action="store_true",
         help="run only the BSC receive-state self-checks (no compiler)")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 
     fails = []
     model_cases = run_bsc_receive_model_checks(fails)

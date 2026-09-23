@@ -12,6 +12,8 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tools"))
+from pmf_compiler import resolve_compiler  # noqa: E402
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "pbkdf2_progress_emitted_gate.pi4"
 INTERP = ROOT / "tools" / "a64" / "a64_interp.py"
 LOAD = 0x00400000
@@ -46,7 +48,7 @@ def main() -> int:
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP")
                         or str(INTERP))
     args = parser.parse_args()
-    compiler = required_path(args.compiler, "PMF_COMPILER")
+    compiler = pathlib.Path(resolve_compiler(args.compiler))
     a64 = load_interpreter(required_path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-pbkdf2-progress-") as temporary:

@@ -12,6 +12,8 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pi3_gate_build  # noqa: E402
 import truetype_slots_check as slots  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "RaspberryPi3/Tests/pi3_ttf_adapter_gate.pi3"
@@ -93,7 +95,7 @@ def main() -> int:
     parser.add_argument("--compiler", required=True, type=Path)
     parser.add_argument("--font", type=Path,
                         default=ROOT / "RaspberryPi3/Data/fonts/CourierPrime-Regular.ttf")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     font = args.font.expanduser().resolve()
     if not compiler.is_file() or not font.is_file():

@@ -53,6 +53,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "a64"))
 import fs_reference as fr  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 SEC = 512
 LOAD = 0x400000
@@ -1043,7 +1045,7 @@ def main() -> int:
     ap.add_argument("--fsck-host")
     ap.add_argument("--cuts-every", type=int, default=1)
     ap.add_argument("--show", choices=("fat32", "exfat"))
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if args.show:
         print(generate(args.show))
         return 0

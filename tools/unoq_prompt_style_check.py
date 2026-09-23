@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +88,7 @@ def compile_fixture(compiler: Path) -> tuple[str, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

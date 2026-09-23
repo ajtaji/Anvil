@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse, os, re, shutil, sys, tempfile
 from pathlib import Path
 import tcp_multiif_emitted_check as emitted
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT=Path(__file__).resolve().parents[1]
 WIFI=ROOT/'RaspberryPi4/Lib/wifi.pi4'
@@ -18,7 +20,7 @@ def proc(src,name):
     return m.group(0)
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--compiler',default=os.environ.get('PMF_COMPILER')); ap.add_argument('--interp',default=os.environ.get('PMF_A64_INTERP')); a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('--compiler',default=os.environ.get('PMF_COMPILER')); ap.add_argument('--interp',default=os.environ.get('PMF_A64_INTERP')); a=ap.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     compiler=emitted.required_path(a.compiler,'PMF_COMPILER'); interp=emitted.required_path(a.interp,'PMF_A64_INTERP'); a64=emitted.load_interpreter(interp)
     ws=WIFI.read_text(encoding='utf-8'); cs=CMD.read_text(encoding='utf-8'); out=FIX.read_text(encoding='utf-8')
     gl='\n'.join(x for x in ws.splitlines() if x.startswith('Global gWifiRxReady'))+'\nGlobal gWifiRinitGeneration.i'

@@ -11,13 +11,14 @@ import tempfile
 
 import build
 import build_count
+from pmf_compiler import resolve_compiler
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True)
     args = parser.parse_args()
-    compiler = build.find_compiler(args.compiler)
+    compiler = resolve_compiler(args.compiler)
     root = build.ROOT
     board = root / "RockPi4C/Board/board.rockpi4c"
     directory = root / "build/rockpi4c-isolation"

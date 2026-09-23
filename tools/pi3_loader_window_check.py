@@ -15,6 +15,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as a64_base
 import pi3_gate_build
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOADER = ROOT / "RaspberryPi3/Board/loader.pi3"
@@ -460,7 +462,7 @@ def main() -> int:
                         help="use an already-built loader image; requires --updater-image")
     parser.add_argument("--updater-image", type=pathlib.Path,
                         help="use an already-built updater image; requires --loader-image")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if (args.loader_image is None) != (args.updater_image is None):
         parser.error("--loader-image and --updater-image must be supplied together")
     if args.source_only and (args.loader_image is not None or args.updater_image is not None):

@@ -12,7 +12,9 @@ mutant below moves the call up to prove that catch is live.
 import pathlib,re,sys,tempfile,subprocess,os,argparse
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as b
-p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
+p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
 s=(b.ROOT/'RaspberryPi4/Lib/pcie.pi4').read_text()
 def proc(n):return re.search(r'(?ms)^Procedure(?:\.i)? '+n+r'\([^\n]*\).*?^EndProcedure',s).group()
 reset=proc('PcieResetAndTrain')

@@ -16,6 +16,7 @@ import sys
 
 import build as anvil_build
 import build_count
+from pmf_compiler import resolve_compiler
 import verify_export
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +33,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="new directory; existing paths are refused")
     args = parser.parse_args()
-    compiler = Path(anvil_build.find_compiler(args.compiler))
+    compiler = Path(resolve_compiler(args.compiler))
     paths = verify_export.closure(ENTRY)
     paths.update(PurePosixPath(p.relative_to(ROOT).as_posix())
                  for p in (ROOT / "Boards").glob("*.board"))

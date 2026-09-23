@@ -140,6 +140,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 from a64_interp import A64, attach_symbols  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LOAD = 0x200000
 SRC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4HidSelfTest.pi4"
@@ -1944,7 +1948,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--no-breaks", action="store_true",
                     help="run the healthy driver only, skip the negative "
                          "controls")
-    args = ap.parse_args(argv[1:])
+    args = ap.parse_args(argv[1:]); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         ap.error("No compiler was given. Pass --compiler <path to "
                  "PureMetalForge.exe> or set the PMF_COMPILER environment "

@@ -139,6 +139,10 @@ sys.path.insert(0, str(HERE))
 from a64_interp import A64, attach_symbols  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 import build_count  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ABI = ROOT / "Anvil" / "Hal" / "abi.pbi"
 ABI_VERSION = ROOT / "Anvil" / "Hal" / "abi_version.pbi"
@@ -1507,7 +1511,7 @@ def main() -> int:
                          "BUILD NUMBER, which is not always allowed while another "
                          "image is waiting to be flashed. Running one part proves "
                          "one part - say which.")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("No compiler was named. Pass --compiler with the path "
                          "to PureMetalForge.exe, or set PMF_COMPILER.")

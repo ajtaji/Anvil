@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 import tcp_multiif_emitted_check as emitted
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]; PRODUCT=ROOT/'RaspberryPi4/Board/touch_visual_test.pi4'; FIX=ROOT/'RaspberryPi4/Tests/touch_visual_emitted_gate.pi4'
 def proc(s,n):
  m=re.search(rf'(?ms)^Procedure(?:\.i)? {n}\([^\n]*\).*?^EndProcedure\s*$',s)
@@ -16,7 +18,7 @@ def run(a64,compiler,text,stem):
   if r.returncode or 'pmfc: OK' not in r.stdout: raise SystemExit('touch visual gate: compile failed\n'+r.stdout)
   return emitted.execute(a64,img)
 def main():
- p=argparse.ArgumentParser(); p.add_argument('--compiler',default=os.environ.get('PMF_COMPILER')); p.add_argument('--interp',default=os.environ.get('PMF_A64_INTERP')); a=p.parse_args()
+ p=argparse.ArgumentParser(); p.add_argument('--compiler',default=os.environ.get('PMF_COMPILER')); p.add_argument('--interp',default=os.environ.get('PMF_A64_INTERP')); a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
  compiler=emitted.required_path(a.compiler,'PMF_COMPILER'); a64=emitted.load_interpreter(emitted.required_path(a.interp,'PMF_A64_INTERP'))
  s=PRODUCT.read_text(encoding='utf-8'); f=FIX.read_text(encoding='utf-8')
  const='\n'.join(x for x in s.splitlines() if x.startswith('#TOUCH_VISUAL_'))

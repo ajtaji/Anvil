@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse, pathlib, re, subprocess, tempfile, sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -107,7 +109,7 @@ def run_case(compiler: str, source_text: str, root: pathlib.Path) -> int:
         return cpu.x[0]
 
 def main() -> int:
-    ap=argparse.ArgumentParser(); ap.add_argument("--compiler", required=True); args=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument("--compiler", required=True); args=ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         result = run_case(args.compiler, fixture(), ROOT)
         if result != 0: raise SystemExit(f"watchdog gate FAIL: case {result}")

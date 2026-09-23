@@ -11,6 +11,10 @@ import sys
 import tempfile
 
 import touch_emitted_check as touch
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOAD, BSS, STACK = 0x500000, 0x600000, 0x800000
@@ -84,7 +88,7 @@ def main():
     # for the option and nothing else, which made it the single gate a sweep
     # could not run.
     ap.add_argument('--compiler', default=os.environ.get('PMF_COMPILER'))
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit('i2c MCU read timeline gate: pass --compiler or set '
                          'PMF_COMPILER')

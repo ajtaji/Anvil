@@ -79,6 +79,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 from a64_interp import A64, attach_symbols  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LIB = ROOT / "RaspberryPi4" / "Lib" / "display.pi4"
 MBXLIB = ROOT / "RaspberryPi4" / "Lib" / "mailbox.pi4"
@@ -986,7 +990,7 @@ def main() -> int:
     ap.add_argument("--mutate", action="store_true",
                     help="break a copy of the library on purpose; every one must go RED")
     ap.add_argument("--limit", type=int, default=40_000_000)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("No compiler was named. Pass --compiler or set "
                          "PMF_COMPILER to the PureMetalForge executable.")

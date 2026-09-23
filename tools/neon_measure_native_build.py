@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tools" / "a64"))
 import a64_core_worker_check as a64  # noqa: E402
 import neon_measure_backend_check as measure  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 LOAD = 0x00600000
 STACK = 0x03000000
@@ -114,7 +116,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     out = args.out.expanduser().resolve()
     if not compiler.is_file():

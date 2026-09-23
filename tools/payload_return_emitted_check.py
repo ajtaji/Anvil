@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, replace
 import hashlib
+import os
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
 
 import dsi_diag_read_safety_check as emitted
+from pmf_compiler import resolve_compiler
 
 
 MASK = (1 << 64) - 1
@@ -550,7 +552,10 @@ def main():
         check(a64, args.image.resolve(), args.image_sha256, args.symbols_sha256)
     else:
         with tempfile.TemporaryDirectory(prefix="anvil-payload-control-") as name:
-            check(a64, emitted.build(emitted.anvil_build.find_compiler(args.compiler), Path(name)))
+            compiler = (resolve_compiler(args.compiler)
+                        if (args.compiler or os.environ.get("PMF_COMPILER"))
+                        else emitted.anvil_build.find_compiler(args.compiler))
+            check(a64, emitted.build(compiler, Path(name)))
     return 0
 
 

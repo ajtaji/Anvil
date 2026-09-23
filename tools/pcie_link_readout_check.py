@@ -49,10 +49,12 @@ import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "a64"))
 import el3_runtime_emitted_check as b  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--compiler", required=True)
-args = ap.parse_args()
+args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 
 SRC = (b.ROOT / "RaspberryPi4/Board/hw_usb.pi4").read_text()
 

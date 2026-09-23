@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "build/tests/module_engine"
@@ -456,7 +457,9 @@ def main() -> int:
         help="optional PMFMOD produced by the independent compiler writer",
     )
     args = parser.parse_args()
-    compiler = locate_required("PMF_COMPILER", "PureMetalForge.exe")
+    _compiler_named = os.environ.get("PMF_COMPILER")
+    compiler = (Path(resolve_compiler(_compiler_named)) if _compiler_named
+                else locate_required("PMF_COMPILER", "PureMetalForge.exe"))
     interpreter = locate_required("PMF_A64_INTERP", "tools/a64/a64_interp.py")
     fixture = None
     if args.writer_fixture is not None:

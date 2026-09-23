@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 import types
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -1153,7 +1155,7 @@ def main() -> int:
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--mutate-interface", action="store_true")
     parser.add_argument("--self-test-infra", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = locate(args.compiler, "PMF_COMPILER",
                       [EXPECTED_COMPILER])
     if compiler != EXPECTED_COMPILER.resolve():

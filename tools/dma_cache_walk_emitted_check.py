@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 
 import tcp_multiif_emitted_check as emitted
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi4/Lib/dma.pi4"
@@ -229,7 +230,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     args = parser.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     a64 = emitted.load_interpreter(ROOT / "tools/a64/a64_interp.py")
     source = SOURCE.read_text(encoding="utf-8")
     fixed = proc(source, "DmaCacheLines")
