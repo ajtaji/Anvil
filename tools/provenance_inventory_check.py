@@ -317,6 +317,61 @@ def check_citations(third_party: dict, report: Report) -> tuple[list[str], list[
     return files, uncited
 
 
+def check_device_tree_pattern_selftest(third_party: dict, report: Report) -> None:
+    """Self-test (forum 967): a device-tree citation is attributed by the
+    vendor file it actually names, never by a generic '*.dtsi' wildcard.
+
+    linux-dt-bcm2711's citation_pattern used to include a bare
+    `[A-Za-z0-9_.-]*\\.dtsi\\b` alternative, so ANY vendor's device-tree
+    filename counted as a citation of the Raspberry Pi 4's Broadcom device
+    tree. That miscounted RockPi4C/Lib/dma_pl330.pbi, gpu_probe.pbi and
+    hdmi.pbi (which cite Rockchip's rk3399.dtsi/rk3399-base.dtsi) and
+    ArduinoQ/Board/hwtimer_q.unoq (which cites Qualcomm's agatti.dtsi). This
+    runs every time so that wildcard cannot come back unnoticed.
+    """
+    sources = third_party["sources"]
+    bcm = sources.get("linux-dt-bcm2711", {})
+    pattern = bcm.get("citation_pattern")
+    if not pattern:
+        report.fail("linux-dt-bcm2711 has no citation_pattern to self-test")
+        return
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as error:
+        report.fail(f"linux-dt-bcm2711 citation_pattern is unusable: {error}")
+        return
+
+    must_not_match = {
+        "rk3399.dtsi": "a Rockchip RK3399 device tree, not Broadcom's",
+        "rk3399-base.dtsi": "a Rockchip RK3399 device tree, not Broadcom's",
+        "agatti.dtsi": "a Qualcomm QCM2290 device tree, not Broadcom's",
+        "sm6115.dtsi": "a Qualcomm SM6115 device tree, not Broadcom's",
+    }
+    for text, why in must_not_match.items():
+        if rx.search(text):
+            report.fail(
+                f"self-test: linux-dt-bcm2711's citation_pattern matches '{text}', which "
+                f"names {why}. The forum 967 generic-*.dtsi wildcard bug is back."
+            )
+        else:
+            report.ok()
+
+    must_match = {
+        "bcm2711.dtsi": "the Raspberry Pi 4 device tree",
+        "bcm2711-rpi-4-b.dts": "the Raspberry Pi 4 board device tree",
+        "bcm283x-rpi-smsc9514.dtsi": "the Raspberry Pi 3 USB device-tree fragment",
+        "bcm2837.dtsi": "the Raspberry Pi 3 device tree",
+    }
+    for text, why in must_match.items():
+        if not rx.search(text):
+            report.fail(
+                f"self-test: linux-dt-bcm2711's citation_pattern no longer matches "
+                f"'{text}' ({why}). Tightening the pattern must not lose a real citation."
+            )
+        else:
+            report.ok()
+
+
 def check_document(third_party: dict, report: Report) -> None:
     """3. The Markdown table and the JSON must describe the same tree."""
     if not INVENTORY.exists():
@@ -397,6 +452,7 @@ def main() -> int:
     check_classes(third_party, report)
     files, uncited = check_citations(third_party, report)
     check_document(third_party, report)
+    check_device_tree_pattern_selftest(third_party, report)
 
     review = manifest.get("publication_review", {})
     held = review.get("status") == "held"
