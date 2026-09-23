@@ -227,6 +227,8 @@ WORKDIR: pathlib.Path | None = None
 
 sys.path.insert(0, str(HERE))
 from a64_interp import A64  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools"))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LOAD = 0x400000
 STACK = 0x3000000
@@ -2819,13 +2821,10 @@ def _main() -> int:
 def main() -> int:
     global COMPILER, WORKDIR
     ap = argparse.ArgumentParser(description="Executable gate for RaspberryPi4/Lib/v3d.pi4.")
-    ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
-                    help="the PureMetalForge compiler executable")
+    ap.add_argument("--compiler", default=None,
+                    help="the PureMetalForge compiler executable (default: $PMF_COMPILER)")
     args = ap.parse_args()
-    if not args.compiler:
-        ap.error("No compiler was named.  Pass --compiler or set PMF_COMPILER to the "
-                 "PureMetalForge executable.")
-    COMPILER = args.compiler
+    COMPILER = resolve_compiler(args.compiler)
     with tempfile.TemporaryDirectory(prefix="v3d-check-") as td:
         WORKDIR = pathlib.Path(td)
         return _main()
