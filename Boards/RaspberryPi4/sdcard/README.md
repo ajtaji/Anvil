@@ -168,6 +168,13 @@ see [`docs/LICENSING.md`](../../../docs/LICENSING.md) and
 [`Firmware/CYW43455/README.txt`](../../../Firmware/CYW43455/README.txt) for the
 redistribution terms on all three.
 
+[`SHA256SUMS`](SHA256SUMS) here checksums both radio firmware files above,
+alongside the monitor image, the stub and the config, so `sha256sum -c
+SHA256SUMS` verifies everything this repository ships for the medium in one
+command (forum 926). `BRCMNV.TXT` has no line of its own — it is
+board-specific and not part of this repository, so there is nothing to pin a
+hash against.
+
 Ethernet needs none of this. Nothing in the list above is required to reach the
 board over a cable.
 

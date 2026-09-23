@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
@@ -13,6 +14,26 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "PROVENANCE.json"
+SHA256SUMS_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})[ \t]([* ])(.+)$")
+# Board SHA256SUMS files this check walks. Scoped to the Pi 4's (forum 925/926)
+# rather than every board's: the other boards' checksum files are a separate,
+# currently-unaudited surface and are not this lane's to gate red or green.
+CHECKSUM_FILES_TO_VERIFY: frozenset[str] = frozenset(
+    {"Boards/RaspberryPi4/sdcard/SHA256SUMS"}
+)
+# A board's shipped SHA256SUMS checks the files its own build produces, but
+# some boards tell an operator to add further files from elsewhere in this
+# repository (forum 926: the Pi 4's radio firmware). Each such file is named
+# here, relative to the SHA256SUMS file itself, so a checksum line for it
+# cannot be silently dropped again.
+REQUIRED_ADDITIONAL_CHECKSUMS: dict[str, frozenset[str]] = {
+    "Boards/RaspberryPi4/sdcard/SHA256SUMS": frozenset(
+        {
+            "../../../Firmware/CYW43455/brcmfmac43455-sdio.bin",
+            "../../../Firmware/CYW43455/brcmfmac43455-sdio.clm_blob",
+        }
+    ),
+}
 INCLUDE_RE = re.compile(r'^\s*(?:XIncludeFile|IncludeFile)\s+"([^"]+)"')
 WINDOWS_ABSOLUTE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 PRIVATE_PATH_RE = re.compile(
@@ -134,6 +155,170 @@ def closure(entry: PurePosixPath) -> set[PurePosixPath]:
                 ) from error
             pending.append(child)
     return seen
+
+
+def check_provenance_history(
+    manifest: dict, selected: set[PurePosixPath], failures: list[str]
+) -> None:
+    """historical_migration_files / historical_standalone_files name files
+    that the record claims are, or became, part of this tree. Nothing else
+    checks that claim, so a stale or invented row sits there indefinitely
+    (forum 925: two CYW43455 licence-file rows that were never part of any
+    tracked tree). This checks that each record's destination exists and is
+    tracked, for every destination the same manifest's own current_tree
+    policy declares as belonging inside this repository.
+
+    A destination outside every allowed_prefix and allowed_root_file (for
+    example "keywords.def", named by historical_selection as compiler data
+    the historical export pulled in from outside this repository) is not
+    claimed as part of THIS tree by the manifest's own boundary, so it is
+    not something this check can call phantom; it is left alone rather than
+    guessed at.
+
+    This deliberately does NOT recompute and compare the recorded sha256
+    values against current file content: historical_exported_utc marks the
+    whole block as a record of one past export, and files named in it have
+    legitimately changed since. A hash field here documents what the export
+    produced, not what the file must still hash to.
+    """
+    entries = list(manifest.get("historical_migration_files", ())) + list(
+        manifest.get("historical_standalone_files", ())
+    )
+    if not entries:
+        failures.append(
+            "PROVENANCE.json has no historical_migration_files/"
+            "historical_standalone_files records to verify"
+        )
+        return
+
+    policy = manifest.get("current_tree", {})
+    allowed_prefixes = tuple(policy.get("allowed_prefixes", ()))
+    allowed_root_files = set(policy.get("allowed_root_files", ()))
+
+    for entry in entries:
+        destination = entry.get("destination") if isinstance(entry, dict) else None
+        if not destination:
+            failures.append(
+                f"a PROVENANCE.json history entry has no 'destination': {entry}"
+            )
+            continue
+        try:
+            relative = safe_relative(
+                destination, "PROVENANCE.json historical file record"
+            )
+        except RuntimeError as error:
+            failures.append(str(error))
+            continue
+        name = relative.as_posix()
+        if name not in allowed_root_files and not name.startswith(allowed_prefixes):
+            continue
+        if relative not in selected:
+            failures.append(
+                f"PROVENANCE.json lists '{relative.as_posix()}' as a provenance "
+                "record destination inside this repository's own declared "
+                "tree, and it is not part of the tracked tree"
+            )
+
+
+def parse_sha256sums(path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line_number, raw in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        line = raw.strip("\n")
+        if not line.strip():
+            continue
+        match = SHA256SUMS_LINE_RE.match(line)
+        if not match:
+            raise RuntimeError(
+                f"{path}:{line_number}: not a recognisable sha256sum line: {raw!r}"
+            )
+        digest, _mode, name = match.groups()
+        entries.append((digest.lower(), name))
+    return entries
+
+
+def resolve_checksum_target(sums_relative: PurePosixPath, name: str) -> PurePosixPath:
+    base_dir = ROOT.joinpath(*sums_relative.parts).parent
+    candidate = (base_dir / name.replace("\\", "/")).resolve()
+    root_resolved = ROOT.resolve()
+    try:
+        relative = candidate.relative_to(root_resolved)
+    except ValueError as error:
+        raise RuntimeError(
+            f"{sums_relative.as_posix()}: checksum target escapes the "
+            f"repository: {name}"
+        ) from error
+    return PurePosixPath(relative.as_posix())
+
+
+def check_board_checksums(selected: set[PurePosixPath], failures: list[str]) -> None:
+    """CHECKSUM_FILES_TO_VERIFY is walked and each one's lines are proven
+    against the files they name: a tampered file or a stale checksum both
+    fail here. A board that tells its operator to add further files from
+    elsewhere in the repository (forum 926: the Pi 4's radio firmware) must
+    also checksum those files, checked against REQUIRED_ADDITIONAL_CHECKSUMS
+    so a missing row cannot silently return.
+    """
+    sums_files = sorted(
+        (
+            path
+            for path in selected
+            if path.as_posix() in CHECKSUM_FILES_TO_VERIFY
+        ),
+        key=lambda item: item.as_posix(),
+    )
+    missing = CHECKSUM_FILES_TO_VERIFY - {path.as_posix() for path in sums_files}
+    for name in sorted(missing):
+        failures.append(f"{name}: is not part of the tracked tree")
+    if not sums_files:
+        return
+
+    for sums_path in sums_files:
+        full = ROOT.joinpath(*sums_path.parts)
+        try:
+            entries = parse_sha256sums(full)
+        except RuntimeError as error:
+            failures.append(str(error))
+            continue
+        if not entries:
+            failures.append(f"{sums_path.as_posix()}: has no checksum lines")
+            continue
+
+        covered: set[PurePosixPath] = set()
+        for digest, name in entries:
+            try:
+                target = resolve_checksum_target(sums_path, name)
+            except RuntimeError as error:
+                failures.append(str(error))
+                continue
+            covered.add(target)
+            target_path = ROOT.joinpath(*target.parts)
+            if not target_path.is_file():
+                failures.append(
+                    f"{sums_path.as_posix()}: checksummed file is missing: {name}"
+                )
+                continue
+            actual = hashlib.sha256(target_path.read_bytes()).hexdigest()
+            if actual != digest:
+                failures.append(
+                    f"{sums_path.as_posix()}: checksum for {name} does not match "
+                    f"its contents (listed {digest}, actual {actual})"
+                )
+
+        for required_name in REQUIRED_ADDITIONAL_CHECKSUMS.get(
+            sums_path.as_posix(), frozenset()
+        ):
+            try:
+                required_target = resolve_checksum_target(sums_path, required_name)
+            except RuntimeError as error:
+                failures.append(str(error))
+                continue
+            if required_target not in covered:
+                failures.append(
+                    f"{sums_path.as_posix()}: does not checksum a file its own "
+                    f"board README requires an operator to add: {required_name}"
+                )
 
 
 def public_selection(working_tree: bool) -> tuple[set[PurePosixPath], list[str]]:
@@ -269,6 +454,9 @@ def main() -> int:
         if required not in selected:
             failures.append(f"required public file is not selected: {required.as_posix()}")
 
+    check_provenance_history(manifest, selected, failures)
+    check_board_checksums(selected, failures)
+
     closure_counts: list[tuple[str, int]] = []
     for raw in policy.get("entrypoints", ()):
         try:
@@ -296,7 +484,8 @@ def main() -> int:
     print(
         f"Public-tree verification passed: {mode}, {len(selected)} files; "
         f"include closures complete ({counts}); file boundaries checked and "
-        "required notice files present."
+        "required notice files present; provenance history destinations and "
+        "every SHA256SUMS checksum verified against the tracked tree."
     )
     print(
         f"Publication review: {review_status}. Packaging checks do not determine "

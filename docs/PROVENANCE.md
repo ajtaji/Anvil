@@ -11,6 +11,39 @@ closure counts, and source/export SHA-256 pairs. These values are immutable
 history. A later edit to an imported file does not rewrite history and is not a
 hash failure.
 
+Immutable is not the same as unchecked. `tools/verify_export.py` walks every
+`historical_migration_files`/`historical_standalone_files` record and confirms
+its `destination` exists and is tracked, for every destination that record's
+own `current_tree` boundary (`allowed_prefixes`/`allowed_root_files`) claims as
+part of this repository. A destination outside that boundary (for example
+`keywords.def`, named by `historical_selection` as compiler data the export
+pulled in from outside this repository) is not this repository's to have gone
+missing, so it is left alone rather than guessed at. It does not re-verify the
+recorded `sha256` fields, for the reason above. This closes the gap that let
+`PROVENANCE.json` name two `Firmware/CYW43455/LICENSE*.txt` rows that had never
+been part of any tracked tree, with nothing checking the claim (forum 925).
+
+## Boot-medium checksum verification
+
+A board's shipped `SHA256SUMS` is a separate, install-facing record: it lets
+an operator verify the files they are about to put on a boot medium, and it is
+not derived from `current_tree` at all. `tools/verify_export.py` now also
+walks `CHECKSUM_FILES_TO_VERIFY` (currently `Boards/RaspberryPi4/sdcard/SHA256SUMS`)
+and, for every line, recomputes the named file's SHA-256 and fails on any
+mismatch — a tampered file and a stale checksum both fail the same way. It
+also checks `REQUIRED_ADDITIONAL_CHECKSUMS`: files a board's own README tells
+an operator to add from elsewhere in the repository, so that a required row
+cannot be silently dropped again. This is how forum 926 was found:
+`Boards/RaspberryPi4/sdcard/SHA256SUMS` checksummed only the three files
+`tools/build.py` produces (`kernel8.img`, `armstub8.bin`, `config.txt`) and
+said nothing about the two CYW43455 radio-firmware files
+(`Firmware/CYW43455/brcmfmac43455-sdio.bin`,
+`Firmware/CYW43455/brcmfmac43455-sdio.clm_blob`) the same board's README tells
+an operator to copy onto the medium. The board-appropriate NVRAM file
+(`BRCMNV.TXT`) is deliberately not part of this repository — it carries
+per-board calibration and identity data — so it has no canonical hash to check
+and is intentionally outside this list.
+
 ## Current public manifest
 
 Git is the content-addressed manifest for the current tree. The
