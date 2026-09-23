@@ -15,11 +15,19 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "PROVENANCE.json"
 SHA256SUMS_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})[ \t]([* ])(.+)$")
-# Board SHA256SUMS files this check walks. Scoped to the Pi 4's (forum 925/926)
-# rather than every board's: the other boards' checksum files are a separate,
-# currently-unaudited surface and are not this lane's to gate red or green.
+# Board SHA256SUMS files this check walks. Every board that ships an
+# "sdcard/SHA256SUMS" boot-medium manifest is listed here (forum 925/926,
+# extended to the Pi 3 after a stale config.txt line was found in it): a
+# checksum file left off this set can drift silently, exactly as the Pi 3's
+# did. ROCK Pi 4C's own artifact manifests ("direct-sd/SHA256SUMS" and
+# "uboot/SHA256SUMS") and the UNO Q's ("uefi/SHA256SUMS") are not boot-medium
+# "sdcard" manifests and are a separate, currently-unaudited surface; they are
+# not this lane's to gate red or green.
 CHECKSUM_FILES_TO_VERIFY: frozenset[str] = frozenset(
-    {"Boards/RaspberryPi4/sdcard/SHA256SUMS"}
+    {
+        "Boards/RaspberryPi4/sdcard/SHA256SUMS",
+        "Boards/RaspberryPi3/sdcard/SHA256SUMS",
+    }
 )
 # A board's shipped SHA256SUMS checks the files its own build produces, but
 # some boards tell an operator to add further files from elsewhere in this
