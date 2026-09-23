@@ -97,6 +97,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build_count as reference  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 REAL_BOARDS = tuple(ROOT / path for path in reference.BOARDS.values())
 
@@ -917,7 +919,7 @@ def main() -> int:
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--fast", action="store_true",
                         help="skip the real 70-second monitor compile")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(); arguments.compiler = _pmfpath.Path(resolve_compiler(arguments.compiler)) if arguments.compiler else arguments.compiler
 
     checks = Checks()
     # THE REAL BOARD FILES MOVE ONLY FOR A REAL BUILD, and it is checked rather

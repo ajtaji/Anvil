@@ -18,6 +18,8 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -247,7 +249,7 @@ def main() -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 
     compiler = locate("PMF_COMPILER", args.compiler, [
         ROOT / "PureMetalForge.exe",

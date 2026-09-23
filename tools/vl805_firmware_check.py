@@ -3,10 +3,12 @@ import argparse,hashlib,os,pathlib,re,subprocess,sys,tempfile
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as b
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 def proc(text,name):
     return re.search(r'(?ms)^Procedure(?:\.i)? '+name+r'\([^\n]*\).*?^EndProcedure',text).group()
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     compiler=pathlib.Path(a.compiler);digest=hashlib.sha256(compiler.read_bytes()).hexdigest()
     pc=(b.ROOT/'RaspberryPi4/Lib/pcie.pi4').read_text()
     mb=(b.ROOT/'RaspberryPi4/Lib/mailbox.pi4').read_text()

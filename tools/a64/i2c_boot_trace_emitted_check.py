@@ -20,6 +20,10 @@ ROOT = pathlib.Path(os.environ.get("PMF_REPO") or HERE.parents[1]).resolve()
 sys.path.insert(0, str(HERE))
 
 import touch_emitted_check as touch  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "i2c_boot_trace_emitted_gate.pi4"
 I2C = ROOT / "RaspberryPi4" / "Lib" / "i2c.pi4"
@@ -159,7 +163,7 @@ def main():
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
                     help="external PureMetal compiler (or set PMF_COMPILER)")
     ap.add_argument("--skip-mutations", action="store_true", help=argparse.SUPPRESS)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("pass --compiler or set PMF_COMPILER")
     compiler = pathlib.Path(args.compiler).expanduser().resolve()

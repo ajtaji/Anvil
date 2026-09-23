@@ -8,6 +8,8 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi4/Examples/Diagnostics/neonV3dOwnershipProof.pi4"
@@ -76,7 +78,7 @@ def main(argv=None) -> int:
     ap.add_argument('--mutate', action='store_true')
     ap.add_argument('--compiler', type=Path,
                     default=Path(os.environ.get('PMF_COMPILER', DEFAULT_COMPILER)))
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     source, v3d, neon = SOURCE.read_text(), V3D.read_text(), NEON.read_text()
     if not args.mutate:
         checks = check(source, v3d, neon)

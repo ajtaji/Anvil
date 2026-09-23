@@ -39,6 +39,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 WITNESS = Path("RaspberryPi4/Examples/Diagnostics/pi4CoreWitness.pi4")
 TIMER = Path("RaspberryPi4/Lib/timer.pi4")
@@ -410,7 +411,9 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true",
                         help="print which check killed each mutant")
     args = parser.parse_args()
-    compiler = anvil_build.find_compiler(args.compiler)
+    compiler = (resolve_compiler(args.compiler)
+                if (args.compiler or os.environ.get("PMF_COMPILER"))
+                else anvil_build.find_compiler(args.compiler))
 
     c = Checks()
     a64 = load_interp(ROOT / "tools" / "a64" / "a64_interp.py")

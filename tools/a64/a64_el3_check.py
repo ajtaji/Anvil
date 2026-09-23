@@ -77,6 +77,8 @@ ROOT = Path(os.environ.get("PMF_REPO")
 print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from a64_interp import A64, MASK64  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools"))
+from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 
 STUB_SRC = "RaspberryPi4/Board/armstub8.asm"
 
@@ -195,13 +197,12 @@ def run(args: list[str], *, expect: int = 0) -> subprocess.CompletedProcess[str]
 
 
 def locate_compiler(explicit: str | None) -> Path:
-    """Find the external compiler without embedding a developer-machine path."""
+    """Find the external compiler through the shared, validating resolver
+    (tools/pmf_compiler.py) when one was named; otherwise fall back to a
+    bare PATH search, unchanged from before (forum 977)."""
     requested = explicit or os.environ.get("PMF_COMPILER")
     if requested:
-        path = Path(requested).expanduser().resolve()
-        if path.is_file():
-            return path
-        raise SystemExit("EL3 gate: compiler not found: %s" % path)
+        return Path(_pmf_resolve_compiler(requested))
     found = (shutil.which("PureMetalForge.exe") or
              shutil.which("PureMetalForge.linux") or
              shutil.which("PureMetalForge"))

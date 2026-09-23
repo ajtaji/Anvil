@@ -12,6 +12,8 @@ MAGIC=0x49523432; STEP_LIMIT=40_000_000
 
 sys.path.insert(0,str(HERE))
 from v3d42_qpu_decode import ProgramContract, decode_program, verify_program, uniform_consumption
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 MUTANTS=(
  ('refusal writes caller code','i = 0 : While i < codeBytes : PokeA(*t\\codeBase + i, PeekA(@avk42CodeScratch[0] + i))','i = 0 : While i < codeBytes : PokeA(*t\\codeBase + i, 0)'),
@@ -408,7 +410,7 @@ def campaign(a,compiler,a64,compiler_hash,snapshot,snapshot_hash):
   shared_source_unchanged()
   if manifest_hash(snapshot)!=snapshot_hash:raise RuntimeError('frozen input snapshot changed before cleanup')
 def main():
- ap=argparse.ArgumentParser();ap.add_argument('--compiler');ap.add_argument('--interp');ap.add_argument('--mutate',action='store_true');ap.add_argument('--only-mutation',action='append',default=[]);ap.add_argument('--self-test-infra',action='store_true');a=ap.parse_args()
+ ap=argparse.ArgumentParser();ap.add_argument('--compiler');ap.add_argument('--interp');ap.add_argument('--mutate',action='store_true');ap.add_argument('--only-mutation',action='append',default=[]);ap.add_argument('--self-test-infra',action='store_true');a=ap.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
  compiler=locate(a.compiler,'PMF_COMPILER',pathlib.Path(r'C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe'))
  if a.self_test_infra:return infra_self_test(compiler)
  interp=locate(a.interp,'PMF_A64_INTERP',ROOT/'tools/a64/a64_interp.py');a64=loadmod('ir42_a64',interp)

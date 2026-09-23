@@ -35,6 +35,8 @@ import zlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as base  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = base.ROOT
 SIG = b"\x55\xaa"
@@ -312,7 +314,7 @@ def hash_cost(a64, sym, blob, slot, image_bytes):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--compiler', required=True)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     checks = 0
 
     with tempfile.TemporaryDirectory(prefix='pi3-budget-') as tmp:

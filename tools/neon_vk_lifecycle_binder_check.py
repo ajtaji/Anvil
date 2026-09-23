@@ -8,9 +8,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+from pmf_compiler import resolve_compiler
+
 ROOT = Path(__file__).resolve().parents[1]
 BINDER = ROOT / "Anvil/Graphics/Vulkan/neon_vk_lifecycle.pi4"
 FIXTURE = ROOT / "RaspberryPi4/Tests/neon_vk_lifecycle_binder_gate.pi4"
+# The raw, unvalidated path; resolved through the shared, validating
+# resolver (forum 977) lazily in compile_and_run(), not at import time, so
+# --self-test (which never compiles) still runs without a compiler present.
 COMPILER = Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
 INTERP = ROOT / "tools/a64/a64_interp.py"
 LOAD = 0x00400000
@@ -57,10 +62,11 @@ def validate(binder: str, fixture: str) -> None:
         require(fixture, token)
 
 def compile_and_run() -> int:
+    compiler = resolve_compiler(str(COMPILER))
     with tempfile.TemporaryDirectory(prefix="neon_vk_lifecycle_") as td:
         work = Path(td)
         image = work / "gate.img"
-        run = subprocess.run([str(COMPILER), "--compile", str(FIXTURE), "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK), "--entry-returns", "-o", str(image), "-s"], cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)}, capture_output=True, text=True, timeout=120)
+        run = subprocess.run([compiler, "--compile", str(FIXTURE), "-t", "pi4", "--load-addr", hex(LOAD), "--stack-addr", hex(STACK), "--entry-returns", "-o", str(image), "-s"], cwd=ROOT, env={**os.environ, "PMF_ROOT": str(ROOT)}, capture_output=True, text=True, timeout=120)
         if run.returncode or not image.is_file():
             raise GateError("fixture compile failed\n" + run.stdout + run.stderr)
         dbg = Path(str(image) + ".dbg")

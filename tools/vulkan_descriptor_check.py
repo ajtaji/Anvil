@@ -14,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -741,7 +743,7 @@ def main() -> int:
     parser.add_argument("--mutate", action="store_true")
     parser.add_argument("--only-mutation", action="append", default=[])
     parser.add_argument("--self-test-infra", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = locate(args.compiler, "PMF_COMPILER", pathlib.Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe"))
     if args.self_test_infra:
         return infra_self_test(compiler)

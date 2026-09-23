@@ -4,6 +4,8 @@ import argparse
 from pathlib import Path
 import tempfile
 import pi3_framebuffer_contract_check as fb
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'RaspberryPi3/Tests/screen_connection_contract.pi3'
@@ -101,7 +103,7 @@ def run(compiler:Path):
   return 82,steps
 
 def main():
-  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',type=Path,required=True);a=p.parse_args()
+  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',type=Path,required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
   if not a.compiler.is_file(): raise SystemExit(f'compiler not found: {a.compiler}')
   checks,steps=run(a.compiler.resolve())
   print(f'PASS: {checks} shared screen-connection assertions; {steps:,} emitted A64 instructions')

@@ -18,6 +18,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -350,7 +352,7 @@ def symbols(image: Path) -> dict[str, int]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     source_text = PMFBOOT.read_text(encoding="utf-8")
     pi4_map_text = (ROOT / "RaspberryPi4" / "Board" / "memmap.pi4").read_text(encoding="utf-8")
     pi3_map_text = (ROOT / "RaspberryPi3" / "Board" / "memmap.pi3").read_text(encoding="utf-8")

@@ -10,6 +10,10 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "banner_clock_emitted_gate.pi4"
@@ -69,7 +73,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP") or str(INTERP))
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler, a64 = path(args.compiler, "PMF_COMPILER"), module(path(args.interp, "PMF_A64_INTERP"))
 
     with tempfile.TemporaryDirectory(prefix="anvil-banner-clock-") as temporary:

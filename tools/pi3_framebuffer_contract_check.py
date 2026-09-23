@@ -20,6 +20,8 @@ import tempfile
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pi3_gate_build
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1725,7 +1727,7 @@ def main():
                         help="unified PureMetal Forge IDE executable for the isolated fixture")
     parser.add_argument("--fixture-only", action="store_true",
                         help="compatibility no-op; the gate is always hardware-free")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

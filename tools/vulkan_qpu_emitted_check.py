@@ -21,6 +21,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 from v3d42_qpu_decode import (DecodeError, ProgramContract, VerifyError,
                               decode_program, verify_program)  # noqa: E402
 
@@ -233,7 +235,7 @@ def main() -> int:
     parser.add_argument("--image", type=pathlib.Path,
                         help="execute this previously built canonical gate image")
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
 
     harness = load_pipeline_harness()
     a64_path = harness.locate("PMF_A64_INTERP", args.interp,

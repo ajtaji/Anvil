@@ -34,6 +34,8 @@ import os
 import re
 import subprocess
 import sys
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -147,7 +149,7 @@ def main():
                     help="run just this control number")
     ap.add_argument("--keep-going", action="store_true",
                     help="do not stop at the first control that did not bite")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         print("buildnumber_sabotage: no compiler was named. Pass --compiler "
               "with the path of PureMetalForge.exe, or set PMF_COMPILER.")

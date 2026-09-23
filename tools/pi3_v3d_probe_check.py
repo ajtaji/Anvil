@@ -6,6 +6,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pi3_gate_build
 import truetype_slots_check as slots
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "RaspberryPi3/Tests/v3d_probe_gate.pi3"
 LOAD, STACK, LIMIT = 0x00400000, 0x03000000, 2_000_000
@@ -27,7 +29,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", required=True, type=Path)
     ap.add_argument("--dtb", type=Path, default=ROOT / "_work/pi3-build35-font-boot-stage/bcm2710-rpi-3-b.dtb")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     if not compiler.is_file(): raise SystemExit("compiler does not exist")
     source_text = GATE.read_text(encoding="utf-8")

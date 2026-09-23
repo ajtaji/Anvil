@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,7 +99,7 @@ def compile_harness(compiler: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     source = SOURCE.read_text(encoding="utf-8")
     recovery = RECOVERY.read_text(encoding="utf-8")
     board = BOARD.read_text(encoding="utf-8")

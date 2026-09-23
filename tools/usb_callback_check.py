@@ -16,6 +16,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "Anvil" / "Bus" / "usb_core.pbi"
@@ -163,7 +165,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"), required=False)
     ap.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"), required=False)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler or not args.interp:
         raise SystemExit("usb callback gate: set PMF_COMPILER and PMF_A64_INTERP")
     compiler, interpreter = Path(args.compiler).resolve(), Path(args.interp).resolve()

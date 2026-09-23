@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse, contextlib, importlib.util, os, pathlib, subprocess, sys, tempfile, time
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/vulkan_v3d_backend_list_gate.pi4"
@@ -131,7 +133,7 @@ def grade(cpu, rc, stress_n=3505, admission_n=4096):
     return bad
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument("--compiler"); ap.add_argument("--interp"); ap.add_argument("--mutate",action="store_true"); ap.add_argument("--mutations-only",action="store_true"); ap.add_argument("--mutation"); args=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument("--compiler"); ap.add_argument("--interp"); ap.add_argument("--mutate",action="store_true"); ap.add_argument("--mutations-only",action="store_true"); ap.add_argument("--mutation"); args=ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler=pathlib.Path(args.compiler) if args.compiler else COMPILER
     interp=pathlib.Path(args.interp) if args.interp else ROOT/"tools/a64/a64_interp.py"
     src=BACKEND.read_text(encoding="utf-8")

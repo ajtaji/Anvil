@@ -6,6 +6,8 @@ No firmware, peripheral electrical timing, or board access is simulated.
 import argparse, hashlib, pathlib, sys, tempfile, subprocess, os
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import el3_runtime_emitted_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 def run(a64,data,mode,el=2):
     class Machine(a64.A64):
@@ -60,7 +62,7 @@ def run(a64,data,mode,el=2):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--compiler',required=True);p.add_argument('--target',choices=['pi3','pi4'],default='pi3')
-    args=p.parse_args(); compiler=pathlib.Path(args.compiler).resolve()
+    args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler; compiler=pathlib.Path(args.compiler).resolve()
     a64=base.load_interpreter(base.INTERP)
     with tempfile.TemporaryDirectory(prefix='anvil-pi3-') as tmp:
         image=pathlib.Path(tmp)/'early.img'

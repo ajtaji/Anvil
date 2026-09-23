@@ -10,6 +10,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import neon_vk_chrome_acceptance_check as chrome  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 PIPELINE = ROOT / "Anvil/Graphics/Vulkan/vk_pipeline.pbi"
@@ -62,7 +64,7 @@ def build_and_run(compiler: Path, work: Path, name: str, source: str,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", required=True, type=Path)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     pipeline = PIPELINE.read_text(encoding="utf-8-sig")
     production = chrome.procedure_body(pipeline, "avkPipeDynamicState")
     checks = 0

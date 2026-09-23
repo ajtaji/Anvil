@@ -5,10 +5,12 @@ import build_count
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools/a64'))
 from a64_interp import A64
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 LOAD,STACK,RETURN=0x400000,0x3000000,0x7000000
 BOARD=ROOT/'RaspberryPi4/Board'
 def main():
- p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
  base=shot.FIXTURE.read_text().split('; @@BODY@@')[0]
  extra='''
 Global gate_denied.i

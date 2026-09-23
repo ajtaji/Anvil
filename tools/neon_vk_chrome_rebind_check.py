@@ -3,6 +3,8 @@
 from __future__ import annotations
 import argparse, os, re, subprocess, tempfile, sys
 from pathlib import Path
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
@@ -42,7 +44,7 @@ def run(compiler: Path, source: str, work: Path, name: str) -> int:
     raise AssertionError("fixture did not return")
 
 def main() -> int:
-    ap = argparse.ArgumentParser(); ap.add_argument("--compiler", type=Path, default=DEFAULT); ap.add_argument("--mutate", action="store_true"); a = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--compiler", type=Path, default=DEFAULT); ap.add_argument("--mutate", action="store_true"); a = ap.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     if not a.compiler.is_file(): raise AssertionError(f"compiler not found: {a.compiler}")
     production = SOURCE.read_text(encoding="utf-8")
     gate = GATE.read_text(encoding="utf-8")

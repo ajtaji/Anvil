@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
 import build_count  # noqa: E402
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 SOURCE = ROOT / "Anvil" / "Core" / "memcmd.pbi"
 TARGETS = (
@@ -234,7 +235,9 @@ def main() -> int:
         source_checks(checks, text)
         mutation_checks(checks, text)
         model_checks(checks)
-        compiler = anvil_build.find_compiler(args.compiler)
+        compiler = (resolve_compiler(args.compiler)
+                    if (args.compiler or os.environ.get("PMF_COMPILER"))
+                    else anvil_build.find_compiler(args.compiler))
         with tempfile.TemporaryDirectory(prefix="anvil-memcmd-width-") as name:
             for target, source, extra in TARGETS:
                 emitted_checks(

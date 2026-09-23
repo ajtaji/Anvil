@@ -45,6 +45,8 @@ import struct
 import subprocess
 import sys
 import zlib
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROBE = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4SvcProbe.pi4"
@@ -97,7 +99,7 @@ def main() -> int:
                     help="the PureMetalForge compiler (default: $PMF_COMPILER)")
     ap.add_argument("--out", type=pathlib.Path, default=ROOT / "_work" / "svcprobe",
                     help="where the containers are written (default _work/svcprobe)")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         sys.exit("No compiler was named. Pass --compiler with the path to "
                  "PureMetalForge.exe, or set PMF_COMPILER.")

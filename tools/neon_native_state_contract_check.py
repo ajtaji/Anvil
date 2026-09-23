@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 NEON = ROOT / "RaspberryPi4/Lib/neon.pi4"
@@ -214,7 +215,7 @@ def main() -> int:
     if args.self_test and (not args.compiler or not args.interp):
         print(f"neon_native_state_contract_check: PASS - {source_checks} source checks, {fixture_checks} fixture checks, {mutations} hostile source mutations rejected; emitted run not requested")
         return 0
-    compiler = required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     interp = required_path(args.interp, "PMF_A64_INTERP")
     a64 = load_interpreter(interp)
     with tempfile.TemporaryDirectory(prefix="anvil-neon-state-") as tmp:

@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 
 from pi3_usb_enumeration_check import execute, load_interpreter, require
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HOST = ROOT / "RaspberryPi3" / "Tests" / "lan9514_runtime_host.pb"
@@ -83,7 +85,7 @@ def main() -> int:
                         r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
     parser.add_argument("--purebasic", default=os.environ.get("PB_COMPILER") or
                         str(pathlib.Path.home() / "AppData/Local/Programs/PureBasic/Compilers/pbcompiler.exe"))
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = require(pathlib.Path(args.compiler), "unified IDE compiler")
     purebasic = require(pathlib.Path(args.purebasic), "host PureBasic compiler")
     static_contract()

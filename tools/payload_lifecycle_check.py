@@ -20,6 +20,7 @@ import tempfile
 
 import build as anvil_build
 import build_count
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -525,7 +526,9 @@ def main() -> int:
         if args.assembly:
             assembly = Path(args.assembly).read_text(encoding="utf-8")
         else:
-            compiler = anvil_build.find_compiler(args.compiler)
+            compiler = (resolve_compiler(args.compiler)
+                        if (args.compiler or os.environ.get("PMF_COMPILER"))
+                        else anvil_build.find_compiler(args.compiler))
             with tempfile.TemporaryDirectory(prefix="anvil-payload-lifecycle-") as name:
                 assembly = compile_assembly(compiler, Path(name))
         emitted_checks(checks, assembly)

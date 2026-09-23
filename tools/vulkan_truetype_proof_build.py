@@ -21,6 +21,8 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_t1_check import compile_gate  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetProof.pi4"
@@ -436,7 +438,7 @@ def main() -> int:
     ap.add_argument("--compiler", required=True, type=Path)
     ap.add_argument("--clean-export", action="store_true")
     ap.add_argument("--load-addr", default="0x600000", help="link address; use a free map window")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         load_addr = int(args.load_addr, 0)
     except ValueError:

@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import types
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -538,7 +540,7 @@ def infra_self_test(compiler: pathlib.Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("--compiler", default=str(COMPILER)); parser.add_argument("--self-test-infra", action="store_true"); parser.add_argument("--mutate", action="store_true"); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument("--compiler", default=str(COMPILER)); parser.add_argument("--self-test-infra", action="store_true"); parser.add_argument("--mutate", action="store_true"); args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = pathlib.Path(args.compiler).resolve()
     if compiler != COMPILER.resolve() or sha(compiler) != COMPILER_SHA: raise RuntimeError("pinned compiler mismatch")
     if sha(INTERPRETER) != INTERPRETER_SHA: raise RuntimeError("pinned interpreter mismatch")

@@ -76,6 +76,10 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 from a64_interp import A64  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LIB = ROOT / "RaspberryPi4" / "Lib" / "entropy.pi4"
 COMPILER: str = ""
@@ -1104,7 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
                     help="PureMetalForge.exe (default: $PMF_COMPILER)")
     ap.add_argument("--mutate", action="store_true")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         ap.error("No compiler was named. Pass --compiler with the path to "
                  "PureMetalForge.exe, or set PMF_COMPILER.")

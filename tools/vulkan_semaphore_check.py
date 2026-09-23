@@ -16,6 +16,8 @@ import pathlib
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_semaphore.pbi"
@@ -340,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         with checker_lock():
             checks = registry_contract(args.registry)

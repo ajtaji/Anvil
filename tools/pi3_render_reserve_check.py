@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 
 import tcp_multiif_emitted_check as emitted
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 MAP = ROOT / "RaspberryPi3" / "Board" / "memmap.pi3"
@@ -132,7 +133,7 @@ def main() -> int:
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     ap.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = ap.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     interp = emitted.required_path(args.interp or str(ROOT / "tools" / "a64" / "a64_interp.py"), "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
     parts = production_parts()

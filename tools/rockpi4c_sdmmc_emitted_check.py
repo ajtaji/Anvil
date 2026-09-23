@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "RockPi4C" / "Tests" / "sdmmc_emitted.rockpi4c"
@@ -260,7 +262,7 @@ def cases(a64, blob, symbols):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

@@ -17,6 +17,7 @@ import tcp_multiif_emitted_check as emitted
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_count  # noqa: E402
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi4/Board/screen_cmd.pi4"
@@ -114,7 +115,7 @@ def main() -> int:
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     ap.add_argument("--interp", type=Path, default=ROOT / "tools/a64/a64_interp.py")
     args = ap.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     a64 = emitted.load_interpreter(args.interp)
     text = SOURCE.read_text(encoding="utf-8")
     validate_order(text)

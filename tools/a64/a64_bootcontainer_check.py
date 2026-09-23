@@ -102,6 +102,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 from a64_interp import A64, attach_symbols  # noqa: E402
 import gatecheck  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 CORE = ROOT / "Anvil" / "Core" / "pmfboot.pbi"
 CORE_INCLUDE = 'XIncludeFile "Anvil/Core/pmfboot.pbi"'
@@ -496,7 +500,7 @@ def main() -> int:
                     help="the PureMetalForge compiler (default: $PMF_COMPILER)")
     ap.add_argument("--mutate", action="store_true",
                     help="damage copies of the bootloader and require each defect to be caught")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("No compiler was named. Pass --compiler with the path "
                          "to PureMetalForge.exe, or set PMF_COMPILER.")

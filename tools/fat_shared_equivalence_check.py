@@ -1,8 +1,10 @@
 """Prove the Pi4 compatibility include changes no emitted FAT code."""
 import argparse, hashlib, os, pathlib, subprocess, tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=pathlib.Path(__file__).resolve().parents[1]
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     main='''
 Procedure.i Main()
   FatSetRangeReader(0)

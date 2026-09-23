@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 from rockpi4c_image import (
     BRANCH_TO_PAYLOAD, CODE_BASE, CODE_LIMIT, DTB_ADDRESS, FLAGS,
     HEADER_BYTES, IMAGE_BASE, ImageError, validate, wrap,
@@ -135,7 +137,7 @@ def main() -> int:
     parser.add_argument("--compiler", type=Path)
     parser.add_argument("--output", type=Path,
                         help="keep the successful flat Anvil payload at this path")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     static_contract()
     image_contract()
     if args.compiler:

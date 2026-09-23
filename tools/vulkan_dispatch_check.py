@@ -14,6 +14,8 @@ import pathlib
 import re
 import sys
 
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 from vulkan_dispatch_inventory import (InventoryError, classify,
                                        pinned_registry_bytes, public_procedures,
                                        registry_commands)
@@ -139,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compiler")
     parser.add_argument("--interp")
     parser.add_argument("--mutate", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     try:
         data, transport = pinned_registry_bytes(args.registry)
         commands = classify(registry_commands(data), public_procedures())

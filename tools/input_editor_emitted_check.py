@@ -28,6 +28,7 @@ import tcp_multiif_emitted_check as emitted
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import build_count  # noqa: E402
+from pmf_compiler import resolve_compiler
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -564,7 +565,7 @@ def main() -> int:
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
 
     fails = source_checks()

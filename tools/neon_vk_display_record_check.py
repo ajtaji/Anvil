@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 ADAPTER = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
@@ -108,7 +110,7 @@ def main() -> int:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", type=Path, default=Path(os.environ.get("PMF_COMPILER", DEFAULT_COMPILER)))
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler.is_file():
         raise AssertionError(f"compiler not found: {args.compiler}")
     adapter = ADAPTER.read_text(encoding="utf-8")

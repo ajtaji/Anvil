@@ -11,6 +11,9 @@ import pathlib
 import tempfile
 
 import el3_runtime_emitted_check as base
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 SCTLR = {2: base.SCTLR_EL2, 3: base.SCTLR_EL3}
 TLBI = {2: 0xD50C871F, 3: 0xD50E871F}
@@ -102,7 +105,7 @@ def main():
     parser.add_argument('--interp', default=str(base.INTERP))
     args = parser.parse_args()
     assert [clz32(v) for v in (0,1,2,0x80000000,0xFFFFFFFF,0x100000000)] == [32,31,30,0,0,32]
-    compiler = base.required_path(args.compiler, 'compiler')
+    compiler = pathlib.Path(resolve_compiler(args.compiler))
     a64 = base.load_interpreter(base.required_path(args.interp, 'interp'))
     base.PROBE = base.ROOT / 'RaspberryPi4/Tests/el3_cached_emitted_gate.pi4'
     with tempfile.TemporaryDirectory(prefix='anvil-el3-cached-') as temp:

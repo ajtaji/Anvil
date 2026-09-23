@@ -12,6 +12,9 @@ import pathlib
 import subprocess
 import tempfile
 import el3_runtime_emitted_check as base
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 CPTR2, CPTR3 = 0xD51C1140, 0xD51E1140
 DTB = 0x12345000
@@ -54,7 +57,7 @@ def main():
     parser.add_argument('--compiler',required=True)
     parser.add_argument('--interp',default=str(base.INTERP))
     args = parser.parse_args()
-    compiler = base.required_path(args.compiler,'compiler')
+    compiler = pathlib.Path(resolve_compiler(args.compiler))
     a64 = base.load_interpreter(base.required_path(args.interp,'interp'))
     with tempfile.TemporaryDirectory(prefix='anvil-el3-startup-') as temp:
         image = pathlib.Path(temp)/'startup.img'

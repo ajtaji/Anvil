@@ -13,6 +13,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "a64"))
 import a64_core_worker_check as base  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "RaspberryPi4/Tests/truetype_t1_gate.pi4"
@@ -120,7 +122,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--font", action="append", default=[])
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).expanduser().resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

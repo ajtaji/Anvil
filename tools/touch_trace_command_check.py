@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Execute the real touch trace dispatcher/viewer without permitting MMIO."""
 import argparse
+import os
 from pathlib import Path
 import re
 import tempfile
 
 import dsi_diag_read_safety_check as emitted
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / 'RaspberryPi4/Board/touch_cmd.pi4'
@@ -217,7 +219,10 @@ def main():
         check(args.image.resolve(), a64)
     else:
         with tempfile.TemporaryDirectory(prefix='anvil-touch-trace-command-') as td:
-            check(emitted.build(emitted.anvil_build.find_compiler(args.compiler), Path(td)), a64)
+            compiler = (resolve_compiler(args.compiler)
+                        if (args.compiler or os.environ.get("PMF_COMPILER"))
+                        else emitted.anvil_build.find_compiler(args.compiler))
+            check(emitted.build(compiler, Path(td)), a64)
     return 0
 
 

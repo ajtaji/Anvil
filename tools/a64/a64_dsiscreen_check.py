@@ -59,6 +59,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
 
 from a64_interp import A64, attach_symbols            # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 SRC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi4DsiScreenProbe.pi4"
 
@@ -460,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
                     help="PureMetalForge.exe (default: $PMF_COMPILER)")
-    args = ap.parse_args(argv)
+    args = ap.parse_args(argv); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         ap.error("No compiler was named. Pass --compiler with the path to "
                  "PureMetalForge.exe, or set PMF_COMPILER.")

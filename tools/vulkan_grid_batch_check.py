@@ -14,6 +14,8 @@ CHROME = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 TEMPLATE = ROOT / "RaspberryPi4/Tests/vulkan_grid_batch_gate.pi4"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_slots_check import compile_gate, run_entry  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 PROCEDURES = (
     "NeonVkChromeGridBatchBegin",
@@ -74,7 +76,7 @@ def compile_and_run(compiler: Path, stage: Path, image: Path, mutant: str | None
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

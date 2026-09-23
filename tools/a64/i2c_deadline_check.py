@@ -9,11 +9,15 @@ from a64_interp import A64
 ROOT=Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT/'tools'))
 import build_count
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 LOAD,STACK,RETURN=0x400000,0x3000000,0x7000000
 BASE=0xfe804000
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     with tempfile.TemporaryDirectory(prefix='i2c-deadline-') as td:
         td=Path(td)
         def build(source,name):

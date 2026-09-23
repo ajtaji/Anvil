@@ -15,6 +15,8 @@ import zlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from pmf_compiler import resolve_compiler  # noqa: E402
 PROBE = ROOT / "RaspberryPi4" / "Tests" / "screen_capture_console_compile.pi4"
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -239,7 +241,9 @@ def check_source_contract() -> None:
 
 def main() -> int:
     check_source_contract()
-    compiler = locate("PMF_COMPILER", ROOT / "PureMetalForge.exe")
+    _compiler_named = os.environ.get("PMF_COMPILER")
+    compiler = (pathlib.Path(resolve_compiler(_compiler_named)) if _compiler_named
+                else locate("PMF_COMPILER", ROOT / "PureMetalForge.exe"))
     interp = locate("PMF_A64_INTERP", ROOT / "tools" / "a64" / "a64_interp.py")
     image = build(compiler)
     cpu, rc, steps = execute(load_interpreter(interp), image)

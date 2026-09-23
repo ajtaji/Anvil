@@ -94,7 +94,8 @@ from concurrent.futures import ThreadPoolExecutor
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-import build  # noqa: E402  (find_compiler and staged_compiler)
+import build  # noqa: E402  (staged_compiler)
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 PI4_DIAGS = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics"
 Q_DIAGS = ROOT / "ArduinoQ" / "Examples" / "Diagnostics"
@@ -306,7 +307,9 @@ def main() -> int:
     args = parser.parse_args()
 
     print(f"[gate] tree under test: {ROOT}", file=sys.stderr)
-    compiler = build.find_compiler(args.compiler)
+    compiler = (resolve_compiler(args.compiler)
+                if (args.compiler or os.environ.get("PMF_COMPILER"))
+                else build.find_compiler(args.compiler))
     with tempfile.TemporaryDirectory(prefix="anvil-diag-build-") as temporary:
         workdir = pathlib.Path(temporary)
         (workdir / "compiler").mkdir()

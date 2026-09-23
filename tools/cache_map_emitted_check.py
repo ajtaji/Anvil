@@ -16,6 +16,7 @@ import tempfile
 
 import build as anvil_build
 import tcp_multiif_emitted_check as emitted
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = ROOT / "RaspberryPi4/Board/cache.pi4"
@@ -228,7 +229,7 @@ def main():
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", type=Path, default=ROOT / "tools/a64/a64_interp.py")
     args = parser.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     a64 = emitted.load_interpreter(args.interp)
     source = CACHE.read_text(encoding="utf-8")
     with tempfile.TemporaryDirectory(prefix="anvil-cache-map-") as temp:

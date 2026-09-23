@@ -7,6 +7,8 @@ execute emitted code. Not an SDHOST hardware/timing/durability proof.
 import argparse, hashlib, os, pathlib, struct, subprocess, sys, tempfile, zlib
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent/'a64'))
 import a64_core_worker_check as base
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT=base.ROOT
 DATA=2048+32+1024
@@ -89,7 +91,7 @@ def nested_tree(disk,file_first=41,file_size=512,dot_self=40,dot_parent=2,
     return DATA+40-2
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);args=p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     with tempfile.TemporaryDirectory(prefix='pi3-update-') as tmp:
         image=pathlib.Path(tmp)/'update.img'
         env=os.environ.copy();env['PMF_ROOT']=str(ROOT)

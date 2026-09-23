@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "RaspberryPi4" / "Tests" / "hdmi_ddc_gate.pi4"
@@ -313,7 +315,7 @@ def cases(a64, blob, symbols):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", required=True, type=Path)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

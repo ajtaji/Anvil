@@ -11,6 +11,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "Anvil" / "Core" / "parse.pbi"
@@ -228,7 +230,7 @@ def main() -> int:
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--native-output", type=Path,
                         help="also emit a small real-counter, real-WFE returning probe PMF here")
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.resolve()
     require(compiler.is_file(), f"compiler not found: {compiler}")
     a64 = load_interpreter()

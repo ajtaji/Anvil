@@ -131,6 +131,10 @@ R = _load("a64_v3d_rcl_check", HERE / "a64_v3d_rcl_check.py")
 Q = _load("a64_v3d_qpu_check", HERE / "a64_v3d_qpu_check.py")
 sys.path.insert(0, str(ROOT / "tools"))
 import v3d42_qpu_decode as QD  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 # =====================================================================
 #  PINNED REFERENCE DATA
@@ -1033,7 +1037,7 @@ def main() -> int:
                          "v3dqpu.pi4 and require the gate to catch every one")
     ap.add_argument("--only", action="append",
                     help="with --mutate, run only the named mutant (repeatable)")
-    a = ap.parse_args()
+    a = ap.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     if not a.compiler:
         ap.error("No compiler was named.  Pass --compiler or set PMF_COMPILER to the "
                  "PureMetalForge executable.")

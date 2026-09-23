@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 import build as anvil_build  # noqa: E402
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 CORE = ROOT / "RaspberryPi4" / "Lib" / "core_worker_impl.pi4"
 MMUSEC = ROOT / "RaspberryPi4" / "Lib" / "mmu_secondary.pi4"
@@ -858,7 +859,9 @@ def main() -> int:
         source_checks(checks, core, mmu, memmap)
         model_checks(checks)
         mutation_checks(checks, core, mmu, memmap)
-        compiler = anvil_build.find_compiler(args.compiler)
+        compiler = (resolve_compiler(args.compiler)
+                    if (args.compiler or os.environ.get("PMF_COMPILER"))
+                    else anvil_build.find_compiler(args.compiler))
         with tempfile.TemporaryDirectory(prefix="anvil-core-worker-") as name:
             work = Path(name)
             image, asm = build(compiler, work / "real")

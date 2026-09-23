@@ -10,6 +10,8 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from truetype_t1_check import compile_gate, run_entry, ROOT  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 GATE = ROOT / "RaspberryPi4/Tests/truetype_t2_gate.pi4"
 REAL_META = 0x0F000000
@@ -63,7 +65,7 @@ def source_mutant(compiler: Path, tmp: Path) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = Path(args.compiler).expanduser().resolve()
     if not compiler.is_file():
         raise SystemExit(f"compiler not found: {compiler}")

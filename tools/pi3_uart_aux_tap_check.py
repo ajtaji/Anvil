@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import pi3_gate_build  # noqa: E402
 import truetype_slots_check as slots  # noqa: E402
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 CONSOLE = ROOT / "RaspberryPi3/Lib/pl011_console.pi3"
 GATE = ROOT / "RaspberryPi3/Tests/uart_aux_tap_gate.pi3"
@@ -51,7 +53,7 @@ def production_body(source: str, name: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     compiler = args.compiler.expanduser().resolve()
     if not compiler.is_file():
         raise SystemExit("compiler does not exist")

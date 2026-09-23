@@ -30,6 +30,8 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from pmf_compiler import resolve_compiler as _pmf_resolve_compiler  # noqa: E402
 CHECKER_REL = pathlib.Path("tools/vulkan_pipeline_check.py")
 SNAPSHOT_ITEMS = (
     pathlib.Path("Anvil"),
@@ -134,17 +136,17 @@ def input_manifest(root: pathlib.Path) -> str:
 
 
 def locate_compiler(value: str | None) -> pathlib.Path:
-    candidates = []
-    if value:
-        candidates.append(pathlib.Path(value))
-    if os.environ.get("PMF_COMPILER"):
-        candidates.append(pathlib.Path(os.environ["PMF_COMPILER"]))
-    candidates.append(pathlib.Path(
+    """Resolve through the shared, validating resolver (tools/pmf_compiler.py)
+    when a compiler was named (value or PMF_COMPILER); otherwise fall back
+    to the compiler repository's own tree, unchanged (forum 977)."""
+    requested = value or os.environ.get("PMF_COMPILER")
+    if requested:
+        return pathlib.Path(_pmf_resolve_compiler(requested))
+    fallback = pathlib.Path(
         r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe"
-    ))
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
+    )
+    if fallback.is_file():
+        return fallback.resolve()
     raise RuntimeError("PureMetalForge.exe was not found; pass --compiler")
 
 

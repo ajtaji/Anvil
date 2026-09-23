@@ -146,6 +146,10 @@ sys.path.insert(0, str(HERE))
 from a64_interp import A64  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 import v3d42_qpu_decode as QD  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LOAD = 0x400000
 STACK = 0x3000000
@@ -1694,7 +1698,7 @@ def main() -> int:
                          "require the gate to catch every one")
     ap.add_argument("--only", action="append",
                     help="with --mutate, run only the named mutant (repeatable)")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         ap.error("No compiler was named.  Pass --compiler or set PMF_COMPILER to the "
                  "PureMetalForge executable.")

@@ -4,10 +4,12 @@ ROOT=pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools/a64'))
 from a64_interp import A64
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 LOAD,BSS,STACK,RETURN=0x400000,0x800000,0x3000000,0x7000000
 BASE=0xfe007000
 def main():
- p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
  with tempfile.TemporaryDirectory(prefix='dma-quiescence-') as td:
   image=pathlib.Path(td)/'gate.img';src=ROOT/'RaspberryPi4/Tests/dma_quiescence.pi4'
   r=subprocess.run([a.compiler,'--compile',str(src),'-t','pi4','--entry-returns','--load-addr',hex(LOAD),'--bss-addr',hex(BSS),'--stack-addr',hex(STACK),'-s','-o',str(image)],cwd=ROOT,env=dict(os.environ,PMF_ROOT=str(ROOT)),capture_output=True,text=True)

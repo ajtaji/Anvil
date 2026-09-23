@@ -35,6 +35,7 @@ import tempfile
 from pathlib import Path
 
 import tcp_multiif_emitted_check as emitted
+from pmf_compiler import resolve_compiler
 
 GATE = emitted.ROOT / "RaspberryPi4" / "Tests" / "runrecord_emitted_gate.pi4"
 RECORD = emitted.ROOT / "RaspberryPi4" / "Board" / "runrecord.pi4"
@@ -174,7 +175,7 @@ def main() -> int:
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     parser.add_argument("--interp", default=os.environ.get("PMF_A64_INTERP"))
     args = parser.parse_args()
-    compiler = emitted.required_path(args.compiler, "PMF_COMPILER")
+    compiler = Path(resolve_compiler(args.compiler))
     interp = emitted.required_path(args.interp, "PMF_A64_INTERP")
     a64 = emitted.load_interpreter(interp)
 

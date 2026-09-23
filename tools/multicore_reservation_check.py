@@ -47,6 +47,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import build as anvil_build  # noqa: E402
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 FIXTURE = Path("RaspberryPi4/Tests/multicore_reservation_emitted_gate.pi4")
 CORE = Path("RaspberryPi4/Lib/core_worker_impl.pi4")
@@ -659,7 +660,9 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true",
                         help="keep the scratch build tree for inspection")
     args = parser.parse_args()
-    compiler = anvil_build.find_compiler(args.compiler)
+    compiler = (resolve_compiler(args.compiler)
+                if (args.compiler or os.environ.get("PMF_COMPILER"))
+                else anvil_build.find_compiler(args.compiler))
 
     c = Checks()
     a64 = load_interp(ROOT / "tools" / "a64" / "a64_interp.py")

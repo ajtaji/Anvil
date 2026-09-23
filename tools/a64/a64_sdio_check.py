@@ -127,6 +127,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 HERE = ROOT / "tools" / "a64"
 sys.path.insert(0, str(HERE))
 from a64_interp import A64, AlignmentFault, attach_symbols  # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 # The CYW43455 firmware image and CLM blob Anvil ships for the Raspberry
 # Pi 4's radio.  The scan gate loads these exact bytes into DRAM, where
@@ -3577,7 +3581,7 @@ def main() -> int:
     ap.add_argument("--nvram", default=None,
                     help="with --scan, a board NVRAM text file to upload "
                          "instead of the synthetic one")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         print("a64_sdio_check needs the PureMetal compiler: pass --compiler "
               "or set PMF_COMPILER.", file=sys.stderr)

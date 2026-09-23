@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 LOAD, STACK, RETURN, OUT = 0x400000, 0x3000000, 0x7000000, 0x6000000
@@ -15,7 +17,7 @@ LOAD, STACK, RETURN, OUT = 0x400000, 0x3000000, 0x7000000, 0x6000000
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--compiler', required=True)
-    args = p.parse_args()
+    args = p.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     spec = importlib.util.spec_from_file_location('reg_a64', ROOT/'tools/a64/a64_interp.py')
     mod = importlib.util.module_from_spec(spec); sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)

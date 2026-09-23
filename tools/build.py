@@ -288,22 +288,18 @@ def refuse_retired(path: Path) -> None:
 
 
 def find_compiler(explicit: str | None) -> str:
-    """Resolve the one PureMetal application that also compiles."""
+    """Resolve the one PureMetal application that also compiles.
+
+    A named compiler (explicit or PMF_COMPILER) is routed through the
+    shared, validating resolver (tools/pmf_compiler.py resolve_compiler()):
+    it refuses a missing, retired, or untracked/stale executable the same
+    way every other Anvil tool now does (forum 977). The bare-PATH search
+    below, used only when nothing was named, is unchanged.
+    """
     requested = explicit or os.environ.get("PMF_COMPILER")
     if requested:
-        candidate = Path(requested).expanduser()
-        if candidate.is_file():
-            resolved_path = candidate.resolve()
-            refuse_retired(resolved_path)
-            return str(resolved_path)
-        resolved = shutil.which(requested)
-        if resolved:
-            refuse_retired(Path(resolved))
-            return resolved
-        raise SystemExit(
-            f"The requested PureMetal compiler was not found: {requested}. "
-            "Check --compiler or PMF_COMPILER."
-        )
+        from pmf_compiler import resolve_compiler  # noqa: E402
+        return resolve_compiler(requested)
 
     for name in COMPILER_NAMES:
         resolved = shutil.which(name)

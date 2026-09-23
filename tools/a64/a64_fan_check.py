@@ -96,6 +96,10 @@ PROBE = DIAG / "pi4FanSelfTest.pi4"
 sys.path.insert(0, str(HERE))
 from a64_interp import A64, attach_symbols            # noqa: E402
 import a64_mutate_pool as pool                        # noqa: E402
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 LOAD = 0x400000
 LOADER_SP = 0x3000000
@@ -1830,7 +1834,7 @@ def main() -> int:
     ap.add_argument("--mutate-one", type=int, default=None)
     ap.add_argument("--mutate-dir", default=None)
     ap.add_argument("--jobs", type=int, default=None)
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     if not args.compiler:
         raise SystemExit("No compiler was named. Pass --compiler with the path "
                          "to PureMetalForge.exe, or set PMF_COMPILER.")

@@ -42,6 +42,10 @@ import os
 import re
 import subprocess
 import sys
+import sys as _pmfsys
+import pathlib as _pmfpath
+_pmfsys.path.insert(0, str(_pmfpath.Path(__file__).resolve().parents[1]))
+from pmf_compiler import resolve_compiler  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -338,7 +342,7 @@ def main() -> int:
                     help="run just these control numbers, e.g. 5 or 5,9")
     ap.add_argument("--keep-going", action="store_true",
                     help="do not stop at the first control that did not bite")
-    args = ap.parse_args()
+    args = ap.parse_args(); args.compiler = _pmfpath.Path(resolve_compiler(args.compiler)) if args.compiler else args.compiler
     only = {int(x) for x in args.only.split(",") if x.strip()}
     if not args.compiler:
         print("anvil_identity_sabotage: no compiler was named. Pass --compiler "

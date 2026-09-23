@@ -2,10 +2,12 @@
 import argparse,hashlib,importlib.util,os,subprocess,sys,tempfile
 from pathlib import Path
 import build_count
+import pathlib as _pmfpath
+from pmf_compiler import resolve_compiler
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools/a64'))
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--compiler',required=True);a=p.parse_args(); a.compiler = _pmfpath.Path(resolve_compiler(a.compiler)) if a.compiler else a.compiler
     compiler=Path(a.compiler);digest=hashlib.sha256(compiler.read_bytes()).hexdigest()
     spec=importlib.util.spec_from_file_location('binding_model',ROOT/'tools/a64/a64_interp.py')
     m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
