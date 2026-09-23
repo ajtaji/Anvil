@@ -6684,17 +6684,32 @@ Procedure.i V3dOwnershipHardwareReset()
   g = V3dPmRead(#V3D_PM_GRAFX)
   If (g & #V3D_PM_V3DRSTN) <> 0
     v3d_err = #V3D_ERR_RESET
+    ; The clear write above did not take (readback still shows the rail
+    ; up), so this is a no-op in practice - but the restore is issued
+    ; unconditionally on every path after the clear, so no path here
+    ; ever depends on which case this was.
+    V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+    V3dBarrier()
     ProcedureReturn #V3D_ERR_OWNER_RESET
   EndIf
   clk = v3d_MbxIdState(#V3D_TAG_SET_CLOCK_STATE, #V3D_CLOCK_ID, #V3D_MBX_STATE_ON, 1)
   If clk <> #V3D_MBX_STATE_ON
     v3d_err = #V3D_ERR_OWNER_RESET
+    ; The rail was cleared above (line 6681) and this refusal used to
+    ; return with it left that way - a bounded reset with no bound on
+    ; one of its own error paths. Best-effort restore before leaving:
+    ; the write does not depend on the clock state that just refused.
+    V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+    V3dBarrier()
     ProcedureReturn #V3D_ERR_OWNER_RESET
   EndIf
   V3dDelayUs(#V3D_RESET_SETTLE_US)
   clk = v3d_MbxIdState(#V3D_TAG_SET_CLOCK_STATE, #V3D_CLOCK_ID, #V3D_MBX_STATE_OFF, 1)
   If clk <> #V3D_MBX_STATE_OFF
     v3d_err = #V3D_ERR_OWNER_RESET
+    ; Same gap as above: the rail is still cleared here too.
+    V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+    V3dBarrier()
     ProcedureReturn #V3D_ERR_OWNER_RESET
   EndIf
   V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)

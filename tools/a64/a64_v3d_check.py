@@ -460,6 +460,131 @@ def lib_has_no(pattern: str) -> bool:
     return re.search(pattern, _text(LIB), re.MULTILINE) is None
 
 
+# ---------------------------------------------------------------------
+#  THE V3DRSTN STRUCTURAL RULE.
+#
+#  A blanket "this bit is never cleared" refusal cannot tell a power-off
+#  from a bounded reset used for ownership handoff (modelled on
+#  bcm2835-power.c's own reset authority): both clear the bit, and only
+#  one of them is legitimate. The rule that actually matters is
+#  structural: a clearing write may exist only inside a procedure that
+#  re-asserts the bit again before EVERY one of its return paths, and
+#  nothing outside such a procedure may clear it at all. A clear with no
+#  matching re-set anywhere in its procedure is exactly a power-off path
+#  and is refused the same as before.
+#
+#  This is source-text analysis, not emulation: procedures in this
+#  language are straight-line code with early `ProcedureReturn`s and no
+#  gotos or backward jumps, so text order is execution order and a
+#  region between a clear and the next re-set can be scanned for a
+#  return the way a human reader would.
+# ---------------------------------------------------------------------
+
+_V3DRSTN_CLEAR_RE = re.compile(r"~\s*#V3D_PM_V3DRSTN")
+_V3DRSTN_SET_RE = re.compile(r"\|\s*#V3D_PM_V3DRSTN")
+_PROCEDURE_RE = re.compile(
+    r"Procedure(?:\.\w+)?\s+(\w+)\s*\([^)]*\)(.*?)EndProcedure", re.S)
+_PROCEDURE_RETURN_RE = re.compile(r"\bProcedureReturn\b")
+
+
+def v3drstn_violations(code: str) -> list[str]:
+    """Every #V3D_PM_V3DRSTN clear must live in a procedure that
+    re-asserts it before every return that follows the clear; a clear
+    that is never followed by a re-set anywhere in its procedure, or
+    one that sits outside any procedure at all, is a violation too.
+    `code` is the library source with comments already stripped."""
+    violations: list[str] = []
+    procedures = list(_PROCEDURE_RE.finditer(code))
+
+    def owner(pos: int):
+        for m in procedures:
+            if m.start() <= pos < m.end():
+                return m
+        return None
+
+    for clear in _V3DRSTN_CLEAR_RE.finditer(code):
+        proc = owner(clear.start())
+        if proc is None:
+            line_no = code.count("\n", 0, clear.start()) + 1
+            violations.append(
+                "line %d clears V3DRSTN outside any procedure - a bounded "
+                "reset must be a single named procedure, not loose code."
+                % line_no)
+            continue
+        name = proc.group(1)
+        rel_clear = clear.start() - proc.start()
+        body = proc.group(0)
+        sets_after = [m.start() for m in _V3DRSTN_SET_RE.finditer(body)
+                      if m.start() > rel_clear]
+        if not sets_after:
+            violations.append(
+                "%s() clears V3DRSTN but never re-asserts it anywhere in "
+                "the same procedure - that is a power-off path, not a "
+                "bounded reset." % name)
+            continue
+        restore_at = min(sets_after)
+        for ret in _PROCEDURE_RETURN_RE.finditer(body):
+            if rel_clear < ret.start() < restore_at:
+                line_no = code.count("\n", 0, proc.start() + ret.start()) + 1
+                violations.append(
+                    "%s() returns at line %d after clearing V3DRSTN and "
+                    "before re-asserting it - that path leaves the rail "
+                    "down." % (name, line_no))
+    return violations
+
+
+# A self-test of the rule above, run against two small fixtures rather
+# than the real library, so a change to the rule itself is proven
+# before it is trusted to grade v3d.pi4.  The two procedure bodies are
+# the real V3dOwnershipHardwareReset() shape cut down to its clear/set
+# skeleton: POSITIVE restores on both its paths; NEGATIVE is the exact
+# defect this rule exists to catch - one refusal that returns between
+# the clear and the re-set, matching the pre-fix v3d.pi4.
+_V3DRSTN_SELFTEST_POSITIVE = """
+Procedure.i FixtureBoundedResetGood()
+  Protected g.i
+  Protected clk.i
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  V3dPmWrite(#V3D_PM_GRAFX, g & (~#V3D_PM_V3DRSTN))
+  clk = v3d_MbxIdState(#V3D_TAG_SET_CLOCK_STATE, #V3D_CLOCK_ID, #V3D_MBX_STATE_ON, 1)
+  If clk <> #V3D_MBX_STATE_ON
+    V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+    ProcedureReturn #V3D_ERR_OWNER_RESET
+  EndIf
+  V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+  ProcedureReturn #V3D_OK
+EndProcedure
+"""
+
+_V3DRSTN_SELFTEST_NEGATIVE = """
+Procedure.i FixtureBoundedResetMissingRestore()
+  Protected g.i
+  Protected clk.i
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  V3dPmWrite(#V3D_PM_GRAFX, g & (~#V3D_PM_V3DRSTN))
+  clk = v3d_MbxIdState(#V3D_TAG_SET_CLOCK_STATE, #V3D_CLOCK_ID, #V3D_MBX_STATE_ON, 1)
+  If clk <> #V3D_MBX_STATE_ON
+    ProcedureReturn #V3D_ERR_OWNER_RESET
+  EndIf
+  V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_V3DRSTN)
+  ProcedureReturn #V3D_OK
+EndProcedure
+"""
+
+
+def v3drstn_selftest(expect) -> None:
+    good = v3drstn_violations(_V3DRSTN_SELFTEST_POSITIVE)
+    expect(good == [],
+           "the V3DRSTN structural rule false-flagged a fixture where "
+           "every return after the clear is preceded by the re-set: %r"
+           % good)
+    bad = v3drstn_violations(_V3DRSTN_SELFTEST_NEGATIVE)
+    expect(len(bad) == 1,
+           "the V3DRSTN structural rule did not catch a fixture with one "
+           "early return between the clear and the re-set (this must go "
+           "red): %r" % bad)
+
+
 # bcm2711-peripherals.txt:330, section 1.2.4: a peripheral at legacy
 # 0x7Enn_nnnn "is visible to the ARM at 0x0_FEnn_nnnn if Low Peripheral
 # mode is enabled", and :322 gives that window as 0xFC00_0000 to
@@ -2574,12 +2699,18 @@ def _main() -> int:
     expect(re.search(r"'.'", code) is None,
            "there is a character literal in v3d.pi4")
 
-    # And no power-off path.  Turning a rail off with no consumer of it
-    # is how a board stops working; mailbox.pi4:245-247 makes the same
-    # ruling about the power-domain tags.
-    expect(re.search(r"~\s*#V3D_PM_V3DRSTN", code) is None,
-           "something in v3d.pi4 clears V3DRSTN.  There is no power-off "
-           "path in this file and there must not be one.")
+    # No unbounded power-off path.  Turning a rail off with no consumer
+    # of it is how a board stops working; mailbox.pi4:245-247 makes the
+    # same ruling about the power-domain tags.  But a blanket "never
+    # cleared" refusal cannot tell that ruling apart from a BOUNDED
+    # reset used for ownership handoff (modelled on bcm2835-power.c's
+    # own reset authority), which also clears the bit - on purpose, and
+    # only long enough to re-assert it before returning.  The rule below
+    # is structural instead: prove the self-test first, so a defect in
+    # the rule itself is caught before it is trusted to grade the file.
+    v3drstn_selftest(expect)
+    for msg in v3drstn_violations(code):
+        expect(False, msg)
 
     # -- stage 1's structural rules -----------------------------------
     #
