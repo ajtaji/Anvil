@@ -101,6 +101,33 @@ throughout `RaspberryPi4/`, most consequentially in `RaspberryPi4/Lib/pcie.pi4`,
 where the erratum and the inbound window it forces are stated in Anvil's own
 words with the device-tree lines named as the place to check them.
 
+## RK3399 device tree
+
+`rk3399.dtsi` and `rk3399-base.dtsi`, from `arch/arm64/boot/dts/rockchip/` in
+mainline Linux, are the ROCK Pi 4C's own description of itself: block
+addresses, clock/reset lines and interrupt numbers for the PL330 DMA
+controller, the Mali-T860 GPU and the DesignWare HDMI transmitter. That
+material is hardware description and is cited by file and line in
+`RockPi4C/Lib/dma_pl330.pbi`, `gpu_probe.pbi` and `hdmi.pbi`. It was
+previously miscounted as a citation of the Raspberry Pi 4's BCM2711 device
+tree by a citation pattern that matched any vendor's `.dtsi` filename; that
+pattern is now scoped to Broadcom/Raspberry Pi filenames only, and this
+Rockchip material has its own record (forum 967).
+
+## QCM2290 device tree
+
+`agatti.dtsi` (formerly named `qcm2290.dtsi`), from `arch/arm64/boot/dts/qcom/`
+in mainline Linux and included by `qrb2210-rb1.dts`, is the Arduino UNO Q's
+own description of itself: the TLMM pin controller's range and interrupt
+routing, the GENI I2C wrapper and per-engine addresses, the architectural
+timer, and the GPU/IOMMU register windows. That material is hardware
+description and is cited by file and line throughout `ArduinoQ/Board/` and
+`ArduinoQ/Lib/` (`hw_addr_q.unoq`, `hw_gpio_q.unoq`, `hwtimer_q.unoq`,
+`geni_i2c.unoq`, `tlmm.unoq`, and the GPU bring-up diagnostic). It was
+previously miscounted as a citation of the Raspberry Pi 4's BCM2711 device
+tree by the same over-broad `.dtsi` pattern; this Qualcomm material now has
+its own record (forum 967).
+
 ## Mesa V3D backend
 
 `RaspberryPi4/Lib/v3d.pi4`, `RaspberryPi4/Lib/v3dqpu.pi4` and

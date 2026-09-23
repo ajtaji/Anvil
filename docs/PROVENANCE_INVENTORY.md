@@ -582,6 +582,96 @@ checker would be recording a false citation, so it is reported here instead: the
 pattern needs a real fix (scoped to Broadcom/Raspberry Pi filenames) that also
 re-examines `hwtimer_q.unoq`, in its own change.
 
+### Forum 967 — the device-tree pattern fix, and the older-import backlog (2026-09-22)
+
+This is that "own change." `linux-dt-bcm2711`'s citation pattern carried a
+generic `[A-Za-z0-9_.-]*\.dtsi\b` alternative that matched any vendor's
+device-tree filename, not only Broadcom's. It is now three explicit
+Broadcom/Raspberry Pi alternatives (`bcm2711*.dtsi`, `bcm283x*.dtsi`,
+`bcm270x.dtsi`, `bcm271x*.dtsi`, `bcm2837*.dtsi`, plus the existing
+`bcm2711-rpi-4-b.dts` and `vc4-kms-dsi-*.dts` literals and the bare `device
+tree` phrase) instead of the wildcard. `tools/provenance_inventory_check.py`
+now also runs a standing self-test on every check: `rk3399.dtsi`,
+`rk3399-base.dtsi`, `agatti.dtsi` and `sm6115*.dtsi` must NOT count as a
+`linux-dt-bcm2711` citation, and `bcm2711.dtsi`, `bcm2711-rpi-4-b.dts`,
+`bcm283x-rpi-smsc9514.dtsi` and `bcm2837.dtsi` still must.
+
+A device-tree citation is now attributed by the vendor file it actually
+names. Two upstreams were added to record that attribution properly, both
+real mainline `torvalds/linux` files read for hardware facts, neither with
+any material copied:
+
+- **`linux-dt-rk3399`** — Rockchip's `arch/arm64/boot/dts/rockchip/rk3399.dtsi`
+  and `rk3399-base.dtsi`. This is what `RockPi4C/Lib/dma_pl330.pbi`,
+  `gpu_probe.pbi` and `hdmi.pbi` actually cite; their `linux-dt-bcm2711` false
+  positive is gone now that the pattern no longer matches Rockchip filenames,
+  and all three carry a proper `linux-dt-rk3399` row instead (alongside their
+  existing `linux-v6.12`/`uboot-v2025.01` rows, unchanged).
+- **`linux-dt-qcm2290`** — Qualcomm's `arch/arm64/boot/dts/qcom/agatti.dtsi`
+  (the QCM2290 SoC's device tree, formerly named `qcm2290.dtsi`, included by
+  `qrb2210-rb1.dts`) and `sm6115*.dtsi`. `ArduinoQ/Board/hwtimer_q.unoq`'s
+  `linux-dt-bcm2711` row was wrong the same way — it cites `agatti.dtsi`, not
+  a Broadcom file — and now carries `linux-dt-qcm2290` instead. Five more
+  ArduinoQ files already citing `agatti.dtsi`/`sm6115.dtsi`
+  (`hw_addr_q.unoq`, `hw_gpio_q.unoq`, `anvilqgpuprobe.unoq`, `geni_i2c.unoq`,
+  `tlmm.unoq`) also cite the QCM2290 device tree by name, over and above the
+  generic `device tree` phrase that still legitimately keeps their existing
+  `linux-dt-bcm2711` row alive (`ArduinoQ/Lib/tlmm.unoq` itself explains why:
+  `qrb2210-rb1.dts` includes `agatti.dtsi`, which is how the file identifies
+  the chip). Adding `linux-dt-qcm2290` as a real source made those five
+  citations checkable, so they are classified here too — not because forum
+  967 named them, but because leaving a source in `PROVENANCE.json` that a
+  tracked file demonstrably cites, unclassified, is exactly the drift this
+  checker exists to catch.
+
+Separately, the 69 failures left after the CYW43455/ROCK Pi 4C pass were
+worked through file by file — the older unclassified citations from the
+original import (cryptography, USB, DNS, framebuffer/mailbox/SD-host facts,
+Vulkan/V3D, and more):
+
+- **Ten files had become compatibility includes** for a shared library under
+  rule 30 (every library exists once) without their provenance rows moving
+  with them: `RaspberryPi4/Lib/{aes,hmacsha1,keywrap,pbkdf2,sha1}.pi4` now
+  include `Anvil/Crypto/{aes,hmacsha1,keywrap,pbkdf2,sha1}.pbi`; `dns.pi4`
+  includes `Anvil/Network/dns_codec.pbi`; `fat.pi4` includes
+  `Anvil/Storage/fat32.pbi` (and `exfat.pbi`/`filesystem.pbi`); `wpa2sup.pi4`
+  includes `Anvil/Net/wpa2sup.pbi`; and `core_worker.pi4` now includes
+  `RaspberryPi4/Lib/core_worker_impl.pi4`, which carries the `rpi-armstub8`
+  citation directly. Each row moved to its new path in `PROVENANCE.json`
+  under `third_party.relocations`, with the classification unchanged — no
+  citation was added, removed or restated by the move itself.
+- **`vulkanTriangleProof.pi4` was split**, one-to-many, into
+  `vulkanTriangleProofBody.pbi` (the diagnostic and its acceptance oracle)
+  and a second proof, `vulkanTripleResourceProof.pi4`, that shares them. Both
+  carry the `khronos-vulkan` row the original file carried; the original is
+  now a thin driver with no citation of its own.
+- **`Anvil/Storage/filesystem.pbi`** separately picked up its own new
+  `uboot-v2025.01` citation (U-Boot's `usb 0:N` MBR slot numbering) — not
+  part of the `fat.pi4` move, classified on its own.
+- **`RaspberryPi4/Lib/usbmsc.pi4`** no longer cites U-Boot but now cites
+  Linux's USB mass-storage reset/retry behaviour (`usb_stor_reset_common`,
+  the CSW retry), so the stale `uboot-v2025.01` row was removed and a
+  `consulted`/`linux-v6.12` row added.
+- **Two stale rows were removed outright**: `Anvil/Core/parse.pbi` no longer
+  cites an RFC (its U-Boot console-grammar citation is untouched), and
+  `RaspberryPi3/Lib/lan9514_transport.pbi` no longer cites `linux-v6.12` at
+  all (the fact lives in `RaspberryPi3/Lib/lan9514_protocol.pbi`, classified
+  below as part of this same pass).
+- **Everything else was a plain missing row** — a real citation the original
+  import never classified: `Anvil/Bus/usb_core.pbi` (xHCI, `vendor-spec`),
+  `Anvil/Core/readback.pbi` (RFC 4648 base64 and U-Boot's console shape),
+  `Anvil/Graphics/Vulkan/vk_ir.pbi` and `vk_v3d_texture.pi4` (Khronos SPIR-V
+  and Mesa), `vk_v3d_shader.pi4`'s additional `py-videocore6` reference
+  (alongside its existing Mesa row), `RaspberryPi3/Lib/{framebuffer,
+  lan9514_protocol,mailbox,sdhost,update_watchdog,usb_protocol}.pbi`,
+  `RaspberryPi4/Board/{hw_mem,hw_usb}.pi4`, `RaspberryPi4/Lib/{core_accept,
+  hdmi_ddc,mailbox}.pi4`, and `RaspberryPi4/Tests/cyw43_rx_readiness_emitted_gate.pi4`.
+
+`python tools/provenance_inventory_check.py` now passes: all 69 failures left
+after the CYW43455/ROCK Pi 4C pass are resolved, and the five further
+ArduinoQ files the new `linux-dt-qcm2290` source made checkable are
+classified as well.
+
 ## Proven versus reasoned
 
 **Proven** — by reading the current source, the pinned upstream headers on disk,
@@ -634,7 +724,7 @@ and by running the checks:
 
 ## Complete file inventory
 
-One row per file/source pair, 312 rows, generated from `PROVENANCE.json`
+One row per file/source pair, 535 rows, generated from `PROVENANCE.json`
 `third_party.classified_files` and checked against the sources by
 `tools/provenance_inventory_check.py`. The 75 files that carry no citation at
 all are `original` and are not listed; `--list-original` enumerates them.
@@ -669,7 +759,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Graphics/Vulkan/vk_spirv.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | SPIR-V specification and the Vulkan environment appendix read for the binary layout, the opcode numbers and the enumerants; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | SPIR-V specification read for the module layout the hand-assembled fixtures follow; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_v3d_shader.pi4` | consulted | mesa-24.3.4 | MIT | reference read for the shaded-vertex layout, the VPM segment rule and the thread-end ordering; cite; no code taken |
-| `RaspberryPi4/Examples/Diagnostics/vulkanTriangleProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_descriptor.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification and registry read for the descriptor set layout, pool, allocation and update rules and for the structure members, their order and their widths; cite; no code taken |
 | `Anvil/Graphics/Vulkan/vk_interp_expect.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the single-sample fragment sample position and for VK_FORMAT_B8G8R8A8_UNORM's byte order; cite; no code taken |
 | `RaspberryPi4/Examples/Diagnostics/vulkanVaryingProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
@@ -690,7 +779,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Core/netconsole.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/netif.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/netll.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `Anvil/Core/parse.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `Anvil/Core/parse.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Core/pmfboot.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `Anvil/Core/pmfboot.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
@@ -727,7 +815,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `ArduinoQ/Board/hw_i2c_q.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `ArduinoQ/Board/hw_i2c_q.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `ArduinoQ/Board/hw_id_q.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `ArduinoQ/Board/hwtimer_q.unoq` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `ArduinoQ/Board/hwtimer_q.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `ArduinoQ/Board/memmap_q.unoq` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `ArduinoQ/Board/qcon_q.unoq` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
@@ -794,7 +881,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | Pi 3 topology, identities, descriptor/status and hub sequencing facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | pinned Raspberry Pi USB topology facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/usb_enumeration.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | power-good, address-settle and reset timing facts consulted; no implementation copied |
-| `RaspberryPi3/Lib/lan9514_transport.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | SMSC95xx register, MAC and MII transaction facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/lan9514_runtime.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | SMSC9514 reset/configuration, link latch and bulk framing facts consulted; no implementation copied |
 | `RaspberryPi3/Lib/lan9514_runtime.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | generic MII autonegotiation and link-status facts consulted; no implementation copied |
 | `Anvil/Kernel/Scheduler/timer_el3.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
@@ -821,11 +907,11 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Examples/Diagnostics/pi4FpState.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4FpState.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4FpState.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/aes.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
-| `RaspberryPi4/Lib/aes.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/aes.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Crypto/aes.pbi` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
+| `Anvil/Crypto/aes.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Crypto/aes.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/bignum.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
-| `RaspberryPi4/Lib/core_worker.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/core_worker_impl.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `Anvil/Net/cyw43.pbi` | consulted | broadcom-brcmfmac | ISC | cite the source; no notice obligation; `licenses/Broadcom-brcmfmac-ISC.txt` retained as an acknowledgment |
 | `Anvil/Net/cyw43.pbi` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `Anvil/Net/cyw43.pbi` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
@@ -844,7 +930,7 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/dma.pi4` | hardware-facts | rpi-armstub8 | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/dma.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/dma.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/dns.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Network/dns_codec.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/drbg.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/drbg.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/drbg.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
@@ -865,10 +951,10 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/entropy.pi4` | consulted | linux-v6.12 | GPL-2.0 (per file) | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/entropy.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/entropy.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/fat.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/fat.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/fat.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/fat.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Storage/fat32.pbi` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `Anvil/Storage/fat32.pbi` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `Anvil/Storage/fat32.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `Anvil/Storage/fat32.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/gcm.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/genet.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/genet.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
@@ -883,16 +969,16 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/hkdf.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/hmac.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/hmac.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/hmacsha1.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/hmacsha1.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Crypto/hmacsha1.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Crypto/hmacsha1.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/http.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/hvs.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/hvs.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/i2c.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/i2c.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/i2c.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/keywrap.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/keywrap.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Crypto/keywrap.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Crypto/keywrap.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/link.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mailbox.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/mailbox.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
@@ -914,9 +1000,9 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `Anvil/Network/net.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `Anvil/Network/net.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `Anvil/Network/net.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/pbkdf2.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/pbkdf2.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/pbkdf2.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Crypto/pbkdf2.pbi` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
+| `Anvil/Crypto/pbkdf2.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Crypto/pbkdf2.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/pcie.pi4` | consulted | linux-dt-bcm2711 | GPL-2.0 | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/pcie.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/pcie.pi4` | consulted | uboot-v2025.01 | GPL-2.0-or-later | cite the source; no notice obligation |
@@ -935,8 +1021,8 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/sdio.pi4` | consulted | linux-v6.12 | GPL-2.0 (per file) | cite the source; no notice obligation |
 | `RaspberryPi4/Lib/sdio.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/sdio.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/sha1.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/sha1.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Crypto/sha1.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Crypto/sha1.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/t0vm.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/tcp.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/tftp.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
@@ -953,7 +1039,6 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Lib/uart.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/uart.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/uart.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/usbmsc.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/usbmsc.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3d.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/v3d.pi4` | consulted | linux-v6.12 | GPL-2.0 (per file) | cite the source; no notice obligation |
@@ -1010,21 +1095,21 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RaspberryPi4/Examples/Diagnostics/pi4V3dTri.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wifi.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/wifi.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiUp.pi4` | reference-only | cypress-fw | binary-redist-Cypress | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiJoin.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
 | `RaspberryPi4/Examples/Diagnostics/pi4WifiKey.pi4` | reference-only | hostap | BSD-3-Clause | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
-| `RaspberryPi4/Lib/wpa2sup.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `Anvil/Net/wpa2sup.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/x25519.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
 | `RaspberryPi4/Lib/x25519.pi4` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
 | `RaspberryPi4/Lib/x509.pi4` | consulted | bearssl | MIT | cite the source; no notice obligation; `licenses/BearSSL-LICENSE.txt` retained as an acknowledgment |
@@ -1145,3 +1230,39 @@ all are `original` and are not listed; `--list-original` enumerates them.
 | `RockPi4C/Lib/vop.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
 | `RockPi4C/Lib/watchdog.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
 | `RockPi4C/Lib/watchdog.pbi` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Examples/Diagnostics/vulkanTriangleProofBody.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
+| `RaspberryPi4/Examples/Diagnostics/vulkanTripleResourceProof.pi4` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification read for the SPIR-V and Vulkan semantics the diagnostic exercises; cite; no code taken |
+| `RockPi4C/Lib/dma_pl330.pbi` | hardware-facts | linux-dt-rk3399 | GPL-2.0-or-later OR MIT | cite the document; no notice obligation |
+| `RockPi4C/Lib/gpu_probe.pbi` | hardware-facts | linux-dt-rk3399 | GPL-2.0-or-later OR MIT | cite the document; no notice obligation |
+| `RockPi4C/Lib/hdmi.pbi` | hardware-facts | linux-dt-rk3399 | GPL-2.0-or-later OR MIT | cite the document; no notice obligation |
+| `ArduinoQ/Board/hwtimer_q.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `ArduinoQ/Board/hw_addr_q.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `ArduinoQ/Board/hw_gpio_q.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `ArduinoQ/Examples/Diagnostics/NotBuilding/anvilqgpuprobe.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `ArduinoQ/Lib/geni_i2c.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `ArduinoQ/Lib/tlmm.unoq` | hardware-facts | linux-dt-qcm2290 | GPL-2.0-only OR BSD-2-Clause | cite the document; no notice obligation |
+| `Anvil/Bus/usb_core.pbi` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `Anvil/Core/readback.pbi` | protocol-facts | ietf-rfc | IETF specification | cite the document; no notice obligation |
+| `Anvil/Core/readback.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `Anvil/Graphics/Vulkan/vk_ir.pbi` | consulted | khronos-vulkan | Apache-2.0 OR MIT (registry) | specification and registry read for SPIR-V physical layout, opcode values and enumerants; cite; no code taken |
+| `Anvil/Graphics/Vulkan/vk_v3d_shader.pi4` | reference-only | py-videocore6 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `Anvil/Graphics/Vulkan/vk_v3d_texture.pi4` | consulted | mesa-24.3.4 | MIT | cite the source; no notice obligation; `licenses/Mesa-MIT.txt` retained as an acknowledgment |
+| `Anvil/Storage/filesystem.pbi` | interface-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/framebuffer.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/lan9514_protocol.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/lan9514_protocol.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/mailbox.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/mailbox.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/sdhost.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/update_watchdog.pbi` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi3/Lib/usb_protocol.pbi` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_mem.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_mem.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_usb.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Board/hw_usb.pi4` | hardware-facts | uboot-v2025.01 | GPL-2.0-or-later | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/core_accept.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/hdmi_ddc.pi4` | hardware-facts | linux-dt-bcm2711 | GPL-2.0 | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/hdmi_ddc.pi4` | hardware-facts | linux-v6.12 | GPL-2.0 (per file) | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/mailbox.pi4` | hardware-facts | vendor-spec | vendor/standards document | cite the document; no notice obligation |
+| `RaspberryPi4/Lib/usbmsc.pi4` | consulted | linux-v6.12 | GPL-2.0 (per file) | Linux's usb-storage reset/retry behaviour (usb_stor_reset_common, CSW retry) read and implemented independently; cite; no code taken |
+| `RaspberryPi4/Tests/cyw43_rx_readiness_emitted_gate.pi4` | hardware-facts | broadcom-brcmfmac | ISC | cite the document; no notice obligation |
