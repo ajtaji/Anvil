@@ -1,7 +1,7 @@
 ; ROCK Pi 4C PCB revision 1.2 (not 4C+). Include-only port identity.
 ; The current direct SD entry owns the EL3 handoff, UART2, EL3 exceptions,
-; and architectural timer. EL3 GIC and automatic display startup remain off.
-; HDMI can be attempted once from the serial recovery prompt. Display
+; and architectural timer. EL3 GIC and MiniDP startup remain off. HDMI starts
+; once at boot (bounded) and can be attempted from serial recovery. Display
 ; capability remains withheld until physical output is verified. It does not
 ; claim any
 ; Raspberry Pi mailbox, V3D, GENET or local-interrupt-controller service.
@@ -29,7 +29,8 @@
 #CAP_DISPLAY = 0
 #ROCK_DIRECTSD_GIC_ENABLED = 0
 #ROCK_DIRECTSD_DISPLAY_ENABLED = 0
-; The HDMI path is available for an explicit first silicon attempt only.
-; Automatic mode remains disabled until physical output is verified.
+; HDMI (VOPB, 30-bit AAAA) was verified on the physical monitor on
+; 2026-09-23: correct colours, clean logo, sharp text. Boot brings it up once,
+; bounded, and falls through to serial recovery if it cannot.
 #ROCK_DIRECTSD_HDMI_ENABLED = 1
-#ROCK_DIRECTSD_HDMI_AUTO = 0
+#ROCK_DIRECTSD_HDMI_AUTO = 1

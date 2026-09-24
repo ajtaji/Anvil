@@ -41,8 +41,11 @@ def static_contract() -> None:
         "cntpct_el0", "vbar_el3", "sctlr_el3", "currentel",
         "rock_timer_frequency_expected = 24000000", "global_rock_entry_sp",
         "rock_directsd_gic_enabled = 0", "rock_directsd_display_enabled = 0",
-        "rock_directsd_hdmi_enabled = 1", "rock_directsd_hdmi_auto = 0",
-        "serial2:1500000n8", "type hdmi; vopb; auto off",
+        "rock_directsd_hdmi_enabled = 1", "rock_directsd_hdmi_auto = 1",
+        "serial2:1500000n8", "el3 ready; hdmi vopb; auto on",
+        # Boot HDMI never retries after a watchdog reset and never parks.
+        "resetstatus=peekl(#rock_cru+$514) & $3f", "hdmi auto skipped: last reset was watchdog",
+        "hdmi auto init failed; recovery continues",
     )
     for token in required:
         require(token.lower() in joined, f"missing contract token: {token}")
