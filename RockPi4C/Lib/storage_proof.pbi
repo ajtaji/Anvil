@@ -298,6 +298,7 @@ EndProcedure
 Procedure.i RockStoragePutFile(*path, length.i, expectedCrc.i)
   Define partition.i
   Define got.i
+  Define emmc.i
   If *path = 0 Or length > #ROCK_STORAGE_STAGE_BYTES : ProcedureReturn 0 : EndIf
   If HwStorageUp() = 0
     RockUartLine("STORAGE MOUNT FAILED")
@@ -305,20 +306,35 @@ Procedure.i RockStoragePutFile(*path, length.i, expectedCrc.i)
     RockStorageDiagnostics()
     ProcedureReturn 0
   EndIf
+  If RockWatchdogArm() = 0
+    RockUartLine("FILE WRITE REFUSED: DEADMAN NOT ARMED")
+    ProcedureReturn 0
+  EndIf
   If RockStorageReceive(length, expectedCrc) = 0 : ProcedureReturn 0 : EndIf
 
-  ; This is the only generic path that arms filesystem writes. HwFileWriteAll
-  ; flushes and disarms internally; both outcomes are forced read-only again.
-  gHwFileWriter = @RockSdWriteBlocks
+  ; The full transfer checksum passes before either medium's writer is armed.
+  ; Recheck eMMC's live partition selector so boot0/boot1 remain inaccessible.
+  emmc = RockStorageIsEmmc()
+  If emmc<>0
+    If RockEmmcArmWrites()=0
+      RockUartText("EMMC WRITE REFUSED: ") : RockUartLine(RockEmmcErrorText())
+      ProcedureReturn 0
+    EndIf
+    gHwFileWriter = @RockEmmcWriteBlocks
+  Else
+    gHwFileWriter = @RockSdWriteBlocks
+  EndIf
   gHwFileWritable = 1
   If HwFileWriteAll(*path, @rock_storage_stage[0], length) = 0
     gHwFileWriter = 0 : gHwFileWritable = 0 : FsSetRangeWriter(0)
+    RockEmmcDisarmWrites()
     RockUartLine("FILE WRITE FAILED")
     RockUartLine(HwFileErrorText())
     RockStorageDiagnostics()
     ProcedureReturn 0
   EndIf
   gHwFileWriter = 0 : gHwFileWritable = 0 : FsSetRangeWriter(0)
+  RockEmmcDisarmWrites()
   partition = rock_storage_partition
   If FsUnmount() = 0
     RockUartLine("FILE WRITE FLUSHED; REMOUNT FOR READBACK FAILED")
@@ -550,6 +566,10 @@ Procedure.i RockStorageTrustUpdate(expectedCrc.i)
   Define partitionStart.i
   Define mounted.i
   bothVerified = 0
+  If RockStorageIsEmmc()<>0
+    RockUartLine("TRUST UPDATE REFUSED: SELECT SD")
+    ProcedureReturn 0
+  EndIf
   If HwStorageUp() = 0
     ; A filesystem parser failure must not strand the monitor on an old
     ; image. Reuse exFAT's CRC-checked GPT selector to prove the first Basic
@@ -685,6 +705,11 @@ EndProcedure
 
 Procedure.i RockStorageProofWriteRead()
   Define index.i
+
+  If RockStorageIsEmmc()<>0
+    RockUartLine("STORAGE WRITE PROOF REFUSED: EMMC IS READ ONLY; SELECT SD")
+    ProcedureReturn 0
+  EndIf
 
   If rock_storage_proof_attempted <> 0
     RockUartLine("STORAGE PROOF ALREADY ATTEMPTED; REBOOT TO RETRY")

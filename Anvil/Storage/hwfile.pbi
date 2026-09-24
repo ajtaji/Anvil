@@ -580,7 +580,7 @@ Procedure.i HwFileErrorText()
     ProcedureReturn "that name is not one this medium can express - a path is at most 1023 UTF-8 bytes of folder and file names, each at most 255 characters"
   EndIf
   If gHwFileErr = #HW_FILE_READONLY
-    ProcedureReturn "nothing writable is mounted - writing on this board is implemented for the USB medium and not for the SD card"
+    ProcedureReturn "no writable storage medium is mounted or this board has not enabled its writer for this operation"
   EndIf
   If gHwFileErr = #HW_FILE_UNNAMED
     ProcedureReturn "file error 9: the filesystem refused and named no reason, which is a defect in this monitor and not an answer from the medium. Nothing was reported as wrong because nothing was recorded; check the last storage command's own error and sense with usb storage, and treat the medium as untouched by this operation."

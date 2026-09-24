@@ -161,7 +161,7 @@ class Recovery:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             line = self.line(deadline)
-            print(line.decode("utf-8", "replace"))
+            print(line.decode("ascii", "backslashreplace"))
             if matcher(line):
                 return line
         raise TimeoutError("recovery did not send the expected status")
@@ -206,7 +206,7 @@ class Recovery:
         while time.monotonic() < deadline:
             line = self.line(deadline)
             if line:
-                print(line.decode("utf-8", "replace"))
+                print(line.decode("ascii", "backslashreplace"))
             if line.startswith(success_prefix):
                 return True
             if line.startswith((b"XFER ERROR", b"FILE WRITE FAILED", b"FILE WRITE FLUSHED", b"STORAGE MOUNT FAILED", b"STORAGE LIST FAILED", b"TRUST FORMAT", b"BACKUP COPY FAILED", b"PRIMARY COPY FAILED", b"TRUST UPDATE REFUSED", b"FILESYSTEM REMOUNT FAILED", b"PAYLOAD REFUSED", b"PAYLOAD RETURN REFUSED")):
@@ -309,7 +309,7 @@ class Recovery:
         while time.monotonic() < deadline:
             line = self.line(deadline)
             if line:
-                print(line.decode("utf-8", "replace"))
+                print(line.decode("ascii", "backslashreplace"))
             if line == expected:
                 return
             if line.startswith((b"FILE ", b"XFER ERROR", b"STORAGE MOUNT FAILED")):

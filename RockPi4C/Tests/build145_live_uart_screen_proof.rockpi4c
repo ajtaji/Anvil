@@ -1,0 +1,171 @@
+; Returning build-145 UART proof while resident console and CPU field run.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+#LIVE_POLL = $000DED08
+#LIVE_SCREEN = $000DA35C
+#LIVE_UART_BYTE = $00042260
+#LIVE_RECOVERY_LENGTH = 68778224
+#LIVE_RECOVERY_DISCARD = 69023640
+#LIVE_RECOVERY_ERROR = 45323880
+#LIVE_UART_ERROR = 68398472
+#LIVE_RX_MAX_GAP = 44490344
+#LIVE_RX_LAST_END = 62789832
+#LIVE_RX_CONTEXT = 68365008
+#LIVE_RX_MAX_CONTEXT = 68774080
+#LIVE_SCREEN_HEAD = 68398456
+#LIVE_SCREEN_TAIL = 44835864
+#LIVE_SCREEN_SCROLL = 44125072
+#LIVE_SCREEN_ROW_DIRTY = 64099144
+#LIVE_CPU_DIRTY = 45324544
+#LIVE_CPU_HUNDREDTHS = 44490352
+#LIVE_SCREEN_FAULT = 62388040
+#LIVE_FONT_READY = 43793656
+
+Global live_target.i
+
+ProcedureNaked.i LiveTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LiveKctl()
+  ASM
+    mrs x0, cntkctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveWait()
+  ASM
+    .long $D50320BF ; SEVL
+    wfe
+    wfe
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LiveCall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    adrp x9, global_live_target
+    add x9, x9, #:lo12:global_live_target
+    ldr x9, [x9]
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveMarker()
+  ASM
+    stp x19, x30, [sp, #-16]!
+    movz x19, #0x2260
+    movk x19, #0x0004, lsl #16
+    movz x0, #82
+    blr x19
+    movz x0, #88
+    blr x19
+    movz x0, #82
+    blr x19
+    movz x0, #69
+    blr x19
+    movz x0, #65
+    blr x19
+    movz x0, #68
+    blr x19
+    movz x0, #89
+    blr x19
+    movz x0, #10
+    blr x19
+    ldp x19, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected firstLength.i
+  Protected firstRecoveryError.i
+  Protected firstUartError.i
+  Protected cpuUsage.i
+  Protected start.i
+  Protected now.i
+  Protected consumed.i
+  Protected maxGap.i
+  Protected activeMaxGap.i
+  Protected activeBefore.i
+  Protected activeContext.i
+  Protected delta.i
+  Protected failure.i
+  If (LiveKctl() & $FC) <> $C4 : ProcedureReturn $4C52455200000001 : EndIf
+  firstLength = PeekI(#LIVE_RECOVERY_LENGTH)
+  firstRecoveryError = PeekI(#LIVE_RECOVERY_ERROR)
+  firstUartError = PeekI(#LIVE_UART_ERROR)
+  If PeekI(#LIVE_RECOVERY_DISCARD) <> 0 : ProcedureReturn $4C52455200000002 : EndIf
+  If PeekI(#LIVE_FONT_READY) = 0 Or PeekI(#LIVE_SCREEN_FAULT) <> 0 : ProcedureReturn $4C5245520000000B : EndIf
+  cpuUsage = PeekI(#LIVE_CPU_HUNDREDTHS)
+  PokeI(#LIVE_RX_MAX_GAP, 0)
+  PokeI(#LIVE_RX_LAST_END, 0)
+  LiveMarker()
+  start = LiveTicks()
+  Repeat
+    live_target = #LIVE_POLL
+    LiveCall()
+    If PeekI(#LIVE_RECOVERY_LENGTH) > firstLength : Break : EndIf
+    now = LiveTicks()
+    If now < start Or now - start > 24000000 * 2
+      failure = 3
+      Break
+    EndIf
+  ForEver
+  If failure = 0
+    ; Publish the already-computed live CPU percentage while the incoming
+    ; stream is active; the marker and payload-entry lines also fill the ring.
+    PokeI(#LIVE_RX_MAX_GAP, 0)
+    PokeI(#LIVE_RX_LAST_END, 0)
+    PokeI(#LIVE_RX_MAX_CONTEXT, 0)
+    PokeI(#LIVE_CPU_DIRTY, 1)
+    start = LiveTicks()
+    Repeat
+      now = LiveTicks()
+      If now < start Or now - start > 24000000 * 2
+        failure = 4
+        Break
+      EndIf
+      If now - start >= 24000000 : Break : EndIf
+      activeBefore = Bool(PeekI(#LIVE_RECOVERY_LENGTH) < firstLength + 400)
+      PokeI(#LIVE_RX_CONTEXT, 60)
+      live_target = #LIVE_POLL
+      consumed = LiveCall()
+      If PeekI(#LIVE_SCREEN_HEAD) <> PeekI(#LIVE_SCREEN_TAIL) Or PeekI(#LIVE_SCREEN_SCROLL) <> 0 Or PeekI(#LIVE_CPU_DIRTY) <> 0 Or PeekI(#LIVE_SCREEN_ROW_DIRTY) <> 0
+        PokeI(#LIVE_RX_CONTEXT, 61)
+        live_target = #LIVE_SCREEN
+        LiveCall()
+      EndIf
+      If activeBefore <> 0
+        activeMaxGap = PeekI(#LIVE_RX_MAX_GAP)
+        activeContext = PeekI(#LIVE_RX_MAX_CONTEXT)
+      EndIf
+      If consumed = 0
+        PokeI(#LIVE_RX_CONTEXT, 62)
+        LiveWait()
+      EndIf
+    ForEver
+  EndIf
+  delta = PeekI(#LIVE_RECOVERY_LENGTH) - firstLength
+  maxGap = activeMaxGap
+  If delta <> 400 : failure = 5 : EndIf
+  If PeekI(#LIVE_RECOVERY_DISCARD) <> 0 : failure = 6 : EndIf
+  If PeekI(#LIVE_RECOVERY_ERROR) <> firstRecoveryError : failure = 7 : EndIf
+  If PeekI(#LIVE_UART_ERROR) <> firstUartError : failure = 8 : EndIf
+  If PeekI(#LIVE_CPU_DIRTY) <> 0 Or PeekI(#LIVE_SCREEN_FAULT) <> 0 : failure = 10 : EndIf
+  If maxGap >= 10240 : failure = 9 : EndIf
+  If failure = 9 : failure = 100 + (activeContext & 127) : EndIf
+  If failure <> 0
+    ProcedureReturn $4C52455200000000 | ((maxGap & $FFFF) << 16) | ((delta & $FF) << 8) | failure
+  EndIf
+  ProcedureReturn $4C52000000000000 | ((maxGap & $FFFF) << 32) | ((delta & $FFFF) << 16) | (cpuUsage & $FFFF)
+EndProcedure

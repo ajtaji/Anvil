@@ -1,0 +1,111 @@
+; Bounded, read-only RK3399 eMMC controller admission probe.
+; Link at the live Anvil payload stage with a private stack. The resident
+; payload command arms the physical deadman before this code executes.
+; pmf:target rockpi4c
+
+#EMMC_PROBE_UART_THR = $FF1A0000
+#EMMC_PROBE_UART_LSR = $FF1A0014
+#EMMC_PROBE_UART_THRE = $20
+#EMMC_PROBE_PMU = $FF310000
+#EMMC_PROBE_CRU = $FF760000
+#EMMC_PROBE_HOST = $FE330000
+#EMMC_PROBE_SPINS = 1000000
+
+Procedure.i EmmcProbeTx(value.i)
+  Protected attempt.i
+  For attempt=0 To #EMMC_PROBE_SPINS-1
+    If (PeekL(#EMMC_PROBE_UART_LSR) & #EMMC_PROBE_UART_THRE)<>0
+      PokeL(#EMMC_PROBE_UART_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure EmmcProbeHex(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      EmmcProbeTx(48+digit)
+    Else
+      EmmcProbeTx(55+digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure EmmcProbeWord(value.i)
+  EmmcProbeHex(value)
+  EmmcProbeTx(32)
+EndProcedure
+
+Procedure EmmcProbeNewline()
+  EmmcProbeTx(13)
+  EmmcProbeTx(10)
+EndProcedure
+
+Procedure.i Main()
+  Protected power.i
+  Protected status.i
+  Protected idle.i
+  Protected gate6.i
+  Protected gate32.i
+  Protected refusal.i
+  Protected interrupts.i
+  Protected attempt.i
+  EmmcProbeTx(69) : EmmcProbeTx(48) : EmmcProbeTx(32)
+  power=PeekL(#EMMC_PROBE_PMU+$14) & $FFFFFFFF
+  status=PeekL(#EMMC_PROBE_PMU+$18) & $FFFFFFFF
+  idle=PeekL(#EMMC_PROBE_PMU+$60) & $FFFFFFFF
+  gate6=PeekL(#EMMC_PROBE_CRU+$318) & $FFFFFFFF
+  gate32=PeekL(#EMMC_PROBE_CRU+$380) & $FFFFFFFF
+  EmmcProbeWord(power)
+  EmmcProbeWord(status)
+  EmmcProbeWord(idle)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_PMU+$64) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_PMU+$68) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_CRU+$154) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_CRU+$158) & $FFFFFFFF)
+  EmmcProbeWord(gate6)
+  EmmcProbeWord(gate32)
+  If (status & (1 << 26))<>0 : refusal=refusal | 1 : EndIf
+  If (idle & (1 << 24))<>0 : refusal=refusal | 2 : EndIf
+  If (gate6 & ((1 << 12) | (1 << 14)))<>0 : refusal=refusal | 4 : EndIf
+  If (gate32 & ((1 << 8) | (1 << 9) | (1 << 10)))<>0 : refusal=refusal | 8 : EndIf
+  EmmcProbeWord(refusal)
+  EmmcProbeNewline()
+  If refusal<>0
+    ProcedureReturn $454D0000 | refusal
+  EndIf
+  EmmcProbeTx(69) : EmmcProbeTx(49) : EmmcProbeTx(32)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$24) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$2C) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$40) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$44) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$FC) & $FFFFFFFF)
+  EmmcProbeNewline()
+  ; CMD13 is a status query. It changes no card contents or selection state.
+  ; Keep the host's established clock/power/PHY settings from the loader.
+  If (PeekL(#EMMC_PROBE_HOST+$24) & 3)<>0
+    ProcedureReturn $454D1001
+  EndIf
+  PokeL(#EMMC_PROBE_HOST+$30,$FFFFFFFF)
+  PokeL(#EMMC_PROBE_HOST+$34,$08FF8003)
+  PokeL(#EMMC_PROBE_HOST+$08,$00010000)
+  PokeL(#EMMC_PROBE_HOST+$0C,$0D1A0000)
+  interrupts=0
+  For attempt=0 To 4000000
+    interrupts=PeekL(#EMMC_PROBE_HOST+$30) & $FFFFFFFF
+    If (interrupts & $08FF8001)<>0 : Break : EndIf
+  Next
+  EmmcProbeTx(69) : EmmcProbeTx(50) : EmmcProbeTx(32)
+  EmmcProbeWord(interrupts)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$10) & $FFFFFFFF)
+  EmmcProbeWord(PeekL(#EMMC_PROBE_HOST+$24) & $FFFFFFFF)
+  EmmcProbeNewline()
+  If (interrupts & 1)=0 Or (interrupts & $08FF8000)<>0
+    ProcedureReturn $454D2001
+  EndIf
+  ProcedureReturn $454D2000
+EndProcedure

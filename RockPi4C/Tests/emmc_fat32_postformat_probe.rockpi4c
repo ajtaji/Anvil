@@ -1,0 +1,134 @@
+; Independent read-only check of the eMMC user-area FAT32 metadata.
+; pmf:target rockpi4c
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+Global rock_mode_pixel_hz.i
+Global rock_mode_valid.i
+Global rock_mode_vpll_actual_hz.i
+Global rock_mode_vpll_dsmpd.i
+Global rock_mode_vpll_fb.i
+Global rock_mode_vpll_frac.i
+Global rock_mode_vpll_post1.i
+Global rock_mode_vpll_post2.i
+Global rock_mode_vpll_ref.i
+Procedure.i RockModeVpllPlan(pixelHz.i)
+  ProcedureReturn 0
+EndProcedure
+XIncludeFile "RockPi4C/Lib/cru.pbi"
+XIncludeFile "RockPi4C/Lib/emmc.pbi"
+
+Global Dim post_sector.a[511]
+
+Procedure.i PostCrc(*buffer)
+  Protected crc.i=$FFFFFFFF
+  Protected index.i
+  Protected bit.i
+  For index=0 To 511
+    crc=crc ! (PeekA(*buffer+index) & 255)
+    For bit=0 To 7
+      If (crc & 1)<>0
+        crc=(crc >> 1) ! $EDB88320
+      Else
+        crc=crc >> 1
+      EndIf
+    Next
+    crc=crc & $FFFFFFFF
+  Next
+  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+EndProcedure
+
+Procedure PostHex(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      RockUartByte(48+digit)
+    Else
+      RockUartByte(55+digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Protected *buffer=@post_sector[0]
+  Protected pass.i
+  Protected slot.i
+  Protected lba.i
+  Protected expected.i
+  Protected observed.i
+  If RockUartAdopt()=0
+    ProcedureReturn $454D5007
+  EndIf
+  If RockEmmcInit()=0
+    ProcedureReturn $454D5001
+  EndIf
+  RockUartText("EMMC CLOCK ")
+  PostHex(rock_emmc_clockHz)
+  RockUartByte(32)
+  PostHex(rock_emmc_fastFallback)
+  RockUartByte(13)
+  RockUartByte(10)
+  If rock_emmc_clockHz<>25000000 Or rock_emmc_fastFallback<>0
+    ProcedureReturn $454D5008
+  EndIf
+  If RockEmmcBlockCount()<>$0747C000 Or rock_emmc_accessPartition<>0
+    ProcedureReturn $454D5002
+  EndIf
+  For pass=0 To 1
+    For slot=0 To 8
+      Select slot
+        Case 0
+          lba=0 : expected=$7CB82187
+        Case 1
+          lba=1 : expected=$B2AA7578
+        Case 2
+          lba=2 : expected=$B2AA7578
+        Case 3
+          lba=32768 : expected=$6ADDB191
+        Case 4
+          lba=32769 : expected=$D35B1B3F
+        Case 5
+          lba=32774 : expected=$6ADDB191
+        Case 6
+          lba=32775 : expected=$D35B1B3F
+        Case 7
+          lba=32800 : expected=$8B1781C4
+        Case 8
+          lba=33822 : expected=$8B1781C4
+      EndSelect
+      PokeL($FF84800C,$76)
+      If RockEmmcReadBlocks(lba,1,*buffer)=0
+        ProcedureReturn $454D5003
+      EndIf
+      observed=PostCrc(*buffer)
+      RockUartText("EMMC VERIFY ")
+      PostHex(pass)
+      RockUartByte(32)
+      PostHex(lba)
+      RockUartByte(32)
+      PostHex(observed)
+      RockUartByte(13)
+      RockUartByte(10)
+      If observed<>expected
+        ProcedureReturn $454D5004
+      EndIf
+    Next
+    PokeL($FF84800C,$76)
+    If RockEmmcReadBlocks(34844,1,*buffer)=0
+      ProcedureReturn $454D5005
+    EndIf
+    observed=PostCrc(*buffer)
+    RockUartText("EMMC ROOT ")
+    PostHex(pass)
+    RockUartByte(32)
+    PostHex(observed)
+    RockUartByte(13)
+    RockUartByte(10)
+    If observed<>$B2AA7578
+      ProcedureReturn $454D5006
+    EndIf
+  Next
+  ProcedureReturn $454D5000
+EndProcedure

@@ -1,0 +1,100 @@
+; Read-only EL3/GICv3 secure physical timer admission check for RK3399.
+; Returns X0=$5746493000000000 | refusal bits. No MMIO/sysreg writes.
+; pmf:target rockpi4c
+
+#WFI_GICD = $FEE00000
+#WFI_GICR = $FEF00000
+#WFI_GICR_STRIDE = $20000
+#WFI_GICR_SGI = $10000
+#WFI_PPI29 = $20000000
+Global wfi_preflight_scratch.i
+
+ProcedureNaked.i WfiPreflightEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightDaif()
+  ASM
+    mrs x0, daif
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightMpidr()
+  ASM
+    mrs x0, mpidr_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightSre3()
+  ASM
+    .long $D53ECCA0 ; MRS X0, ICC_SRE_EL3
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightSre1()
+  ASM
+    .long $D538CCA0 ; MRS X0, ICC_SRE_EL1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i WfiPreflightTimerCtl()
+  ASM
+    mrs x0, cntps_ctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected refusal.i
+  Protected mpidr.i
+  Protected affinity.i
+  Protected typer.i
+  Protected frame.i
+  Protected gicr.i
+  Protected control.i
+  Protected sgi.i
+
+  wfi_preflight_scratch = 0
+
+  If WfiPreflightEl() <> 12 : ProcedureReturn $5746493000000001 : EndIf
+  If WfiPreflightHz() <> 24000000 : refusal = refusal | 2 : EndIf
+  If (WfiPreflightDaif() & $40) = 0 : refusal = refusal | 4 : EndIf
+  control = PeekL(#WFI_GICD) & $FFFFFFFF
+  If (control & $10) = 0 : refusal = refusal | 8 : EndIf
+  If (control & $40) <> 0 : refusal = refusal | $10 : EndIf
+  If (PeekL(#WFI_GICD + 4) & $1F) < 4 : refusal = refusal | $20 : EndIf
+
+  mpidr = WfiPreflightMpidr()
+  affinity = (mpidr & $FF) | (mpidr & $FF00) | (mpidr & $FF0000) | ((mpidr >> 32 & $FF) << 24)
+  For frame = 0 To 5
+    gicr = #WFI_GICR + frame * #WFI_GICR_STRIDE
+    typer = PeekI(gicr + 8)
+    If ((typer >> 32) & $FFFFFFFF) = affinity
+      Break
+    EndIf
+  Next
+  If frame >= 6 : ProcedureReturn $5746493000000000 | refusal | $40 : EndIf
+  If (PeekL(gicr + $14) & 6) <> 0 : refusal = refusal | $80 : EndIf
+  sgi = gicr + #WFI_GICR_SGI
+  If (PeekL(sgi + $100) & #WFI_PPI29) <> 0 : refusal = refusal | $100 : EndIf
+  If (PeekL(sgi + $200) & #WFI_PPI29) <> 0 : refusal = refusal | $200 : EndIf
+  If (PeekL(sgi + $300) & #WFI_PPI29) <> 0 : refusal = refusal | $400 : EndIf
+  If (WfiPreflightSre3() & 1) = 0 : refusal = refusal | $800 : EndIf
+  If (WfiPreflightSre1() & 1) = 0 : refusal = refusal | $1000 : EndIf
+  If (WfiPreflightTimerCtl() & 1) <> 0 : refusal = refusal | $2000 : EndIf
+  ProcedureReturn $5746493000000000 | refusal | (frame << 16)
+EndProcedure

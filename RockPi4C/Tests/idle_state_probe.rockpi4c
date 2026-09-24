@@ -1,0 +1,42 @@
+; Read-only snapshot of build 144 recovery/screen state.
+; Addresses come from build/rockpi4c/anvil-flat.img.sym and must not be
+; reused after a relink. The resident payload command arms the deadman.
+; Return: $4944 | flags[7:0] | ring occupancy[12:0] | banner phase[7:0].
+; pmf:target rockpi4c
+
+#PROBE_SCREEN_READY = 41943168
+#PROBE_SCREEN_ATTACHED = 44064624
+#PROBE_IDLE_READY = 44064672
+#PROBE_SCROLL_ACTIVE = 44124032
+#PROBE_RING_TAIL = 44834808
+#PROBE_CPU_DIRTY = 45323488
+#PROBE_SCREEN_FAULT = 62181672
+#PROBE_BANNER_PHASE = 62582456
+#PROBE_ROW_DIRTY = 63892600
+#PROBE_RING_HEAD = 68191896
+#PROBE_RECOVERY_READY = 68571240
+
+Global idle_state_probe_scratch.i
+
+Procedure.i Main()
+  Protected flags.i
+  Protected head.i
+  Protected tail.i
+  Protected occupancy.i
+  Protected phase.i
+
+  idle_state_probe_scratch = 0
+  If PeekI(#PROBE_SCREEN_READY) <> 0 : flags = flags | 1 : EndIf
+  If PeekI(#PROBE_SCREEN_ATTACHED) <> 0 : flags = flags | 2 : EndIf
+  If PeekI(#PROBE_IDLE_READY) <> 0 : flags = flags | 4 : EndIf
+  If PeekI(#PROBE_SCROLL_ACTIVE) <> 0 : flags = flags | 8 : EndIf
+  If PeekI(#PROBE_CPU_DIRTY) <> 0 : flags = flags | $10 : EndIf
+  If PeekI(#PROBE_ROW_DIRTY) <> 0 : flags = flags | $20 : EndIf
+  If PeekI(#PROBE_SCREEN_FAULT) <> 0 : flags = flags | $40 : EndIf
+  If PeekI(#PROBE_RECOVERY_READY) <> 0 : flags = flags | $80 : EndIf
+  head = PeekI(#PROBE_RING_HEAD)
+  tail = PeekI(#PROBE_RING_TAIL)
+  occupancy = (head - tail) & 8191
+  phase = PeekI(#PROBE_BANNER_PHASE) & 255
+  ProcedureReturn $4944000000000000 | (flags << 32) | (occupancy << 16) | phase
+EndProcedure

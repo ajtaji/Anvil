@@ -5,6 +5,15 @@
 Global rock_uart_ready.i
 Global rock_uart_error.i
 Global *rock_uart_mirror_hook
+#ROCK_UART_RX_RING_MASK = 1023
+Global Dim rock_uart_rx_ring.a[1024]
+Global rock_uart_rx_head.i
+Global rock_uart_rx_tail.i
+Global rock_uart_rx_error_pending.i
+Global rock_uart_rx_last_pump_end.i
+Global rock_uart_rx_max_outside_ticks.i
+Global rock_uart_rx_context.i
+Global rock_uart_rx_max_context.i
 
 #ROCK_UART_LSR_DR = $01
 #ROCK_UART_LSR_RX_ERRORS = $1E
@@ -25,6 +34,13 @@ EndProcedure
 Procedure.i RockUartAdopt()
   Protected status.i
   rock_uart_ready = 0
+  rock_uart_rx_head = 0
+  rock_uart_rx_tail = 0
+  rock_uart_rx_error_pending = 0
+  rock_uart_rx_last_pump_end = 0
+  rock_uart_rx_max_outside_ticks = 0
+  rock_uart_rx_context = 0
+  rock_uart_rx_max_context = 0
   status = PeekL(#ROCK_UART2 + #ROCK_UART_USR) & $FFFFFFFF
   If status = $FFFFFFFF
     rock_uart_error = 1
@@ -33,6 +49,84 @@ Procedure.i RockUartAdopt()
   rock_uart_ready = 1
   rock_uart_error = 0
   ProcedureReturn 1
+EndProcedure
+
+; Move at most one hardware-FIFO worth of bytes into software storage before
+; running the slower command parser. Both byte and burst consumers pop this
+; ring first, so prefetched command framing stays visible to file transfers.
+Procedure.i RockUartPumpRaw(limit.i)
+  Protected status.i
+  Protected nextHead.i
+  Protected count.i
+  If rock_uart_ready = 0 Or limit <= 0 : ProcedureReturn 0 : EndIf
+  If rock_uart_rx_error_pending <> 0 : ProcedureReturn -2 : EndIf
+  While count < limit
+    status = PeekL(#ROCK_UART2 + #ROCK_UART_LSR) & $FFFFFFFF
+    If status = $FFFFFFFF
+      rock_uart_error = 4
+      rock_uart_rx_error_pending = 1
+      ProcedureReturn -2
+    EndIf
+    If (status & #ROCK_UART_LSR_RX_ERRORS) <> 0
+      If (status & #ROCK_UART_LSR_DR) <> 0
+        status = PeekL(#ROCK_UART2 + #ROCK_UART_THR) & $FFFFFFFF
+      EndIf
+      rock_uart_error = 5
+      rock_uart_rx_error_pending = 1
+      ProcedureReturn -2
+    EndIf
+    If (status & #ROCK_UART_LSR_DR) = 0 : Break : EndIf
+    nextHead = (rock_uart_rx_head + 1) & #ROCK_UART_RX_RING_MASK
+    If nextHead = rock_uart_rx_tail
+      rock_uart_error = 7
+      rock_uart_rx_error_pending = 1
+      ProcedureReturn -2
+    EndIf
+    rock_uart_rx_ring[rock_uart_rx_head] = PeekL(#ROCK_UART2 + #ROCK_UART_THR) & 255
+    rock_uart_rx_head = nextHead
+    count = count + 1
+  Wend
+  ProcedureReturn count
+EndProcedure
+
+Procedure.i RockUartPump(limit.i)
+  Protected start.i
+  Protected gap.i
+  Protected result.i
+  start = RockTimerTicks()
+  If rock_uart_rx_last_pump_end <> 0 And start >= rock_uart_rx_last_pump_end
+    gap = start - rock_uart_rx_last_pump_end
+    If gap > rock_uart_rx_max_outside_ticks
+      rock_uart_rx_max_outside_ticks = gap
+      rock_uart_rx_max_context = rock_uart_rx_context
+    EndIf
+  EndIf
+  result = RockUartPumpRaw(limit)
+  rock_uart_rx_last_pump_end = RockTimerTicks()
+  ProcedureReturn result
+EndProcedure
+
+; CRLF is one terminator. Before a synchronous binary receiver starts, consume
+; its LF from the shared ring or FIFO; a bare CR gets a 100 us bounded wait.
+Procedure.i RockUartDropOptionalLf()
+  Protected start.i
+  Protected now.i
+  start = RockTimerTicks()
+  Repeat
+    If rock_uart_rx_tail <> rock_uart_rx_head
+      If (rock_uart_rx_ring[rock_uart_rx_tail] & 255) = 10
+        rock_uart_rx_tail = (rock_uart_rx_tail + 1) & #ROCK_UART_RX_RING_MASK
+        ProcedureReturn 1
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    If rock_uart_rx_error_pending <> 0 : ProcedureReturn 0 : EndIf
+    RockUartPump(2)
+    now = RockTimerTicks()
+    If now < start Or now - start >= rock_timer_frequency / 10000
+      ProcedureReturn 0
+    EndIf
+  ForEver
 EndProcedure
 
 Procedure.i RockUartByte(value.i)
@@ -67,6 +161,15 @@ EndProcedure
 Procedure.i RockUartReceive()
   Protected status.i
   If rock_uart_ready=0 : ProcedureReturn -1 : EndIf
+  If rock_uart_rx_tail <> rock_uart_rx_head
+    status = rock_uart_rx_ring[rock_uart_rx_tail] & 255
+    rock_uart_rx_tail = (rock_uart_rx_tail + 1) & #ROCK_UART_RX_RING_MASK
+    ProcedureReturn status
+  EndIf
+  If rock_uart_rx_error_pending <> 0
+    rock_uart_rx_error_pending = 0
+    ProcedureReturn -2
+  EndIf
   ; RK3399's UART node requires 32-bit accesses. A receive error contaminates
   ; the command line even when RBR still contains a byte, so consume that byte
   ; and return a distinct error instead of exposing it to the parser.
@@ -96,6 +199,16 @@ Procedure.i RockUartReceiveBurst(*dst, capacity.i)
   Protected count.i
   If rock_uart_ready = 0 Or *dst = 0 Or capacity <= 0 : ProcedureReturn 0 : EndIf
   count = 0
+  While count < capacity And rock_uart_rx_tail <> rock_uart_rx_head
+    PokeA(*dst + count, rock_uart_rx_ring[rock_uart_rx_tail] & 255)
+    rock_uart_rx_tail = (rock_uart_rx_tail + 1) & #ROCK_UART_RX_RING_MASK
+    count = count + 1
+  Wend
+  If count = capacity : ProcedureReturn count : EndIf
+  If rock_uart_rx_error_pending <> 0
+    rock_uart_rx_error_pending = 0
+    ProcedureReturn -2
+  EndIf
   While count < capacity
     status = PeekL(#ROCK_UART2 + #ROCK_UART_LSR) & $FFFFFFFF
     If status = $FFFFFFFF

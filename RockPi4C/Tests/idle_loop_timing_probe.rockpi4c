@@ -1,0 +1,77 @@
+; Build 144 only: bounded timing of recovery poll, watchdog pet, and WFE.
+; Procedure offsets from build/rockpi4c/anvil-flat.img.sym are rebased by
+; the $41000 image load address. Payload command arms the physical deadman.
+; pmf:target rockpi4c
+
+#PROBE_RECOVERY_POLL = $DC338
+#PROBE_WATCHDOG_PET = $A1F38
+#PROBE_IDLE_WAIT = $A22A8
+
+Global idle_loop_probe_target.i
+
+ProcedureNaked.i LoopProbeEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LoopProbeHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LoopProbeTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LoopProbeCall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    adrp x9, global_idle_loop_probe_target
+    add x9, x9, #:lo12:global_idle_loop_probe_target
+    ldr x9, [x9]
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i LoopProbeAverage(target.i)
+  Protected before.i
+  Protected after.i
+  Protected duration.i
+  Protected total.i
+  Protected count.i
+  idle_loop_probe_target = target
+  For count = 0 To 63
+    before = LoopProbeTicks()
+    LoopProbeCall()
+    after = LoopProbeTicks()
+    If after < before : ProcedureReturn -1 : EndIf
+    duration = after - before
+    If duration > 24000000 / 100 : ProcedureReturn -2 : EndIf
+    total = total + duration
+  Next
+  ProcedureReturn total / 64
+EndProcedure
+
+Procedure.i Main()
+  Protected recovery.i
+  Protected watchdog.i
+  Protected idle.i
+  If LoopProbeEl() <> 12 : ProcedureReturn $494C455200000001 : EndIf
+  If LoopProbeHz() <> 24000000 : ProcedureReturn $494C455200000002 : EndIf
+  recovery = LoopProbeAverage(#PROBE_RECOVERY_POLL)
+  watchdog = LoopProbeAverage(#PROBE_WATCHDOG_PET)
+  idle = LoopProbeAverage(#PROBE_IDLE_WAIT)
+  If recovery < 0 Or watchdog < 0 Or idle < 0 : ProcedureReturn $494C455200000003 : EndIf
+  If recovery > $FFFF Or watchdog > $FFFF Or idle > $FFFF : ProcedureReturn $494C455200000004 : EndIf
+  ProcedureReturn $494C000000000000 | (recovery << 32) | (watchdog << 16) | idle
+EndProcedure

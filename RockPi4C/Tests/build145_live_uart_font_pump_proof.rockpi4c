@@ -1,0 +1,247 @@
+; Returning build-145 UART proof: resident TrueType glyphs with UART pumps.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+#LIVE_POLL = $000DED08
+#LIVE_SCREEN = $000DA35C
+#LIVE_UART_BYTE = $00042260
+#LIVE_RECOVERY_LENGTH = 68778224
+#LIVE_RECOVERY_DISCARD = 69023640
+#LIVE_RECOVERY_ERROR = 45323880
+#LIVE_UART_ERROR = 68398472
+#LIVE_RX_MAX_GAP = 44490344
+#LIVE_RX_LAST_END = 62789832
+#LIVE_SCREEN_HEAD = 68398456
+#LIVE_SCREEN_TAIL = 44835864
+#LIVE_SCREEN_SCROLL = 44125072
+#LIVE_SCREEN_ROW_DIRTY = 64099144
+#LIVE_CPU_DIRTY = 45324544
+#LIVE_CPU_HUNDREDTHS = 44490352
+#LIVE_FONT_GLYPH = $000D5898
+#LIVE_UART_PUMP = $00041EDC
+#LIVE_CPU_FILL = $000D46FC
+
+Global live_target.i
+Global live_current_code.i
+Global live_current_x.i
+Global live_target_strip.i
+Global live_fill_target.i
+Global Dim live_test_strip.l[3840]
+Global Dim live_test_alpha.l[240]
+
+ProcedureNaked LiveGlyph()
+  ASM
+    adrp x0, global_live_current_code
+    add x0, x0, #:lo12:global_live_current_code
+    ldr x0, [x0]
+    adrp x1, global_live_current_x
+    add x1, x1, #:lo12:global_live_current_x
+    ldr x1, [x1]
+    movz x2, #2
+    movz x3, #0x8496
+    movk x3, #0xFF78, lsl #16
+    adrp x4, global_live_target_strip
+    add x4, x4, #:lo12:global_live_target_strip
+    ldr x4, [x4]
+    movz x5, #768
+    movz x6, #192
+    movz x7, #20
+    movz x16, #0x5898
+    movk x16, #0x000D, lsl #16
+    br x16
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveFill()
+  ASM
+    adrp x0, global_live_fill_target
+    add x0, x0, #:lo12:global_live_fill_target
+    ldr x0, [x0]
+    movz x1, #0x0028
+    movk x1, #0xFF00, lsl #16
+    movz x2, #768
+    movz x16, #0x46FC
+    movk x16, #0x000D, lsl #16
+    br x16
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LivePump()
+  ASM
+    movz x0, #64
+    movz x16, #0x1EDC
+    movk x16, #0x0004, lsl #16
+    br x16
+  ENDASM
+EndProcedure
+
+; Same 12 x 20 TrueType per-pixel blend arithmetic as screen_console.pbi.
+; A private alpha source gives every pixel nonzero work. The UART pump at
+; each row is the candidate service bound, without touching the scanout.
+Procedure ProofGlyph(x.i, target.i)
+  Protected xx.i
+  Protected yy.i
+  Protected alpha.i
+  Protected red.i
+  Protected green.i
+  Protected blue.i
+  For yy = 0 To 19
+    For xx = 0 To 11
+      alpha = (live_test_alpha[yy * 12 + xx] >> 24) & 255
+      If alpha <> 0
+        red = (120 * alpha + 0 * (255 - alpha) + 127) / 255
+        green = (132 * alpha + 0 * (255 - alpha) + 127) / 255
+        blue = (150 * alpha + 40 * (255 - alpha) + 127) / 255
+        PokeL(target + yy * 768 + (x + xx) * 4, $FF000000 | (red << 16) | (green << 8) | blue)
+      EndIf
+    Next
+    LivePump()
+  Next
+EndProcedure
+
+ProcedureNaked.i LiveTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LiveKctl()
+  ASM
+    mrs x0, cntkctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveWait()
+  ASM
+    .long $D50320BF ; SEVL
+    wfe
+    wfe
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i LiveCall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    adrp x9, global_live_target
+    add x9, x9, #:lo12:global_live_target
+    ldr x9, [x9]
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveMarker()
+  ASM
+    stp x19, x30, [sp, #-16]!
+    movz x19, #0x2260
+    movk x19, #0x0004, lsl #16
+    movz x0, #82
+    blr x19
+    movz x0, #88
+    blr x19
+    movz x0, #82
+    blr x19
+    movz x0, #69
+    blr x19
+    movz x0, #65
+    blr x19
+    movz x0, #68
+    blr x19
+    movz x0, #89
+    blr x19
+    movz x0, #10
+    blr x19
+    ldp x19, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected firstLength.i
+  Protected firstRecoveryError.i
+  Protected firstUartError.i
+  Protected cpuUsage.i
+  Protected start.i
+  Protected now.i
+  Protected consumed.i
+  Protected maxGap.i
+  Protected delta.i
+  Protected failure.i
+  Protected glyph.i
+  Protected label.i
+  Protected pixel.i
+  Protected row.i
+  If (LiveKctl() & $FC) <> $C4 : ProcedureReturn $4C52455200000001 : EndIf
+  firstLength = PeekI(#LIVE_RECOVERY_LENGTH)
+  firstRecoveryError = PeekI(#LIVE_RECOVERY_ERROR)
+  firstUartError = PeekI(#LIVE_UART_ERROR)
+  If PeekI(#LIVE_RECOVERY_DISCARD) <> 0 : ProcedureReturn $4C52455200000002 : EndIf
+  cpuUsage = PeekI(#LIVE_CPU_HUNDREDTHS)
+  PokeI(#LIVE_RX_MAX_GAP, 0)
+  PokeI(#LIVE_RX_LAST_END, 0)
+  For pixel = 0 To 239
+    live_test_alpha[pixel] = (((pixel * 37 + 1) & 255) << 24)
+  Next
+  LiveMarker()
+  start = LiveTicks()
+  Repeat
+    live_target = #LIVE_POLL
+    LiveCall()
+    If PeekI(#LIVE_RECOVERY_LENGTH) > firstLength : Break : EndIf
+    now = LiveTicks()
+    If now < start Or now - start > 24000000 * 2
+      failure = 3
+      Break
+    EndIf
+  ForEver
+  If failure = 0
+    ; Recreate the CPU field's twelve resident TrueType glyph calls on a
+    ; private strip, with the proposed row-level UART pump cadence.
+    label = "CPU0  29.84%"
+    live_target_strip = @live_test_strip[0]
+    For row = 0 To 19
+      live_fill_target = live_target_strip + row * 768
+      LiveFill()
+      LivePump() ; private status clear row pump
+    Next
+    For glyph = 0 To 11
+      live_current_code = PeekA(label + glyph) & 255
+      live_current_x = 24 + glyph * 12
+      LivePump()
+      ProofGlyph(live_current_x, live_target_strip)
+    Next
+    LivePump()
+    start = LiveTicks()
+    Repeat
+      now = LiveTicks()
+      If now < start Or now - start > 24000000 * 2
+        failure = 4
+        Break
+      EndIf
+      If now - start >= 24000000 : Break : EndIf
+      live_target = #LIVE_POLL
+      consumed = LiveCall()
+      If PeekI(#LIVE_SCREEN_HEAD) <> PeekI(#LIVE_SCREEN_TAIL) Or PeekI(#LIVE_SCREEN_SCROLL) <> 0 Or PeekI(#LIVE_CPU_DIRTY) <> 0 Or PeekI(#LIVE_SCREEN_ROW_DIRTY) <> 0
+        live_target = #LIVE_SCREEN
+        LiveCall()
+      EndIf
+      If consumed = 0 : LiveWait() : EndIf
+    ForEver
+  EndIf
+  delta = PeekI(#LIVE_RECOVERY_LENGTH) - firstLength
+  maxGap = PeekI(#LIVE_RX_MAX_GAP)
+  If delta <> 400 : failure = 5 : EndIf
+  If PeekI(#LIVE_RECOVERY_DISCARD) <> 0 : failure = 6 : EndIf
+  If PeekI(#LIVE_RECOVERY_ERROR) <> firstRecoveryError : failure = 7 : EndIf
+  If PeekI(#LIVE_UART_ERROR) <> firstUartError : failure = 8 : EndIf
+  If maxGap >= 10240 : failure = 9 : EndIf
+  If failure <> 0
+    ProcedureReturn $4C52455200000000 | ((maxGap & $FFFF) << 16) | ((delta & $FF) << 8) | failure
+  EndIf
+  ProcedureReturn $4C52000000000000 | ((maxGap & $FFFF) << 32) | ((delta & $FFFF) << 16) | (cpuUsage & $FFFF)
+EndProcedure

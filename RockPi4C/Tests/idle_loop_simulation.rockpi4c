@@ -1,0 +1,275 @@
+; Build 144 return-only rehearsal of the candidate EL3 recovery idle loop.
+; Function offsets from anvil-flat.img.sym are rebased by $41000.
+; The resident payload command arms the physical deadman before entry.
+; This payload restores CNTKCTL_EL1 and does not alter GIC or VBAR.
+; pmf:target rockpi4c
+
+#SIM_RECOVERY_POLL = $DC338
+#SIM_UART_BYTE = $41B18
+#SIM_SCREEN_SERVICE = $D798C
+#SIM_WATCHDOG_PET = $A1F38
+#SIM_SCREEN_READY = 41943168
+#SIM_SCROLL_ACTIVE = 44124032
+#SIM_RING_TAIL = 44834808
+#SIM_DISPLAY_READY = 44834856
+#SIM_CPU_DIRTY = 45323488
+#SIM_SCREEN_FAULT = 62181672
+#SIM_ROW_DIRTY = 63892600
+#SIM_ROW_LAST = 68092872
+#SIM_RING_HEAD = 68191896
+#SIM_RECOVERY_LENGTH = 68571144
+#SIM_RECOVERY_DISCARD = 68816112
+#SIM_RECOVERY_ERROR = 45322824
+#SIM_UART_ERROR = 68191912
+#SIM_MIRROR_HOOK = 63554824
+#SIM_RX_EXPECTED = 0
+
+Global idle_sim_target.i
+Global idle_sim_kctl_write.i
+
+ProcedureNaked.i IdleSimEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimDaif()
+  ASM
+    mrs x0, daif
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimKctl()
+  ASM
+    mrs x0, cntkctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked IdleSimWriteKctl()
+  ASM
+    adrp x9, global_idle_sim_kctl_write
+    add x9, x9, #:lo12:global_idle_sim_kctl_write
+    ldr x0, [x9]
+    msr cntkctl_el1, x0
+    isb
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimWait()
+  ASM
+    isb
+    mrs x9, cntpct_el0
+    .long $D50320BF ; SEVL
+    wfe
+    wfe
+    isb
+    mrs x0, cntpct_el0
+    sub x0, x0, x9
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleSimCall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    adrp x9, global_idle_sim_target
+    add x9, x9, #:lo12:global_idle_sim_target
+    ldr x9, [x9]
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked IdleSimMarker()
+  ASM
+    stp x19, x30, [sp, #-16]!
+    movz x19, #0x1B18
+    movk x19, #0x4, lsl #16
+    movz x0, #82
+    blr x19
+    movz x0, #88
+    blr x19
+    movz x0, #82
+    blr x19
+    movz x0, #69
+    blr x19
+    movz x0, #65
+    blr x19
+    movz x0, #68
+    blr x19
+    movz x0, #89
+    blr x19
+    movz x0, #10
+    blr x19
+    ldp x19, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i IdleSimScreenWork(now.i)
+  If PeekI(#SIM_DISPLAY_READY) = 0 Or PeekI(#SIM_SCREEN_FAULT) <> 0
+    ProcedureReturn 0
+  EndIf
+  If PeekI(#SIM_SCREEN_READY) = 0 Or PeekI(#SIM_SCROLL_ACTIVE) <> 0 Or PeekI(#SIM_CPU_DIRTY) <> 0 Or PeekI(#SIM_RING_HEAD) <> PeekI(#SIM_RING_TAIL)
+    ProcedureReturn 1
+  EndIf
+  If PeekI(#SIM_ROW_DIRTY) <> 0
+    If now < PeekI(#SIM_ROW_LAST) Or now - PeekI(#SIM_ROW_LAST) >= 240000
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected original.i
+  Protected setting.i
+  Protected start.i
+  Protected now.i
+  Protected lastPet.i
+  Protected lastPoll.i
+  Protected pollGap.i
+  Protected maxPollGap.i
+  Protected idleTicks.i
+  Protected waited.i
+  Protected elapsed.i
+  Protected usage.i
+  Protected count.i
+  Protected failure.i
+  Protected consumed.i
+  Protected initialRxLength.i
+  Protected initialRxError.i
+  Protected initialRxDiscard.i
+  Protected mirrorHook.i
+  Protected beforeCall.i
+  Protected callTicks.i
+  Protected maxPollTicks.i
+  Protected maxScreenTicks.i
+
+  If IdleSimEl() <> 12 : ProcedureReturn $4944455200000001 : EndIf
+  If (IdleSimDaif() & $C0) <> $C0 : ProcedureReturn $4944455200000002 : EndIf
+  If IdleSimHz() <> 24000000 : ProcedureReturn $4944455200000003 : EndIf
+  original = IdleSimKctl()
+  setting = (original & $FFFFFFFFFFFFFF03) | $C4
+  idle_sim_kctl_write = setting
+  IdleSimWriteKctl()
+  If (IdleSimKctl() & $FC) <> $C4
+    failure = 4
+  EndIf
+
+  ; Drain mirrored payload-entry text and any prior scrolling first. This
+  ; proves the idle window starts with no display work pending.
+  start = IdleSimTicks()
+  If failure = 0
+    For count = 0 To 1023
+      now = IdleSimTicks()
+      If PeekI(#SIM_RING_HEAD) = PeekI(#SIM_RING_TAIL) And PeekI(#SIM_SCROLL_ACTIVE) = 0 And PeekI(#SIM_CPU_DIRTY) = 0 And PeekI(#SIM_ROW_DIRTY) = 0 And PeekI(#SIM_SCREEN_READY) <> 0 : Break : EndIf
+      idle_sim_target = #SIM_SCREEN_SERVICE
+      IdleSimCall()
+      If IdleSimTicks() - start > 24000000 * 5
+        failure = 5
+        Break
+      EndIf
+    Next
+    If PeekI(#SIM_RING_HEAD) <> PeekI(#SIM_RING_TAIL) Or PeekI(#SIM_SCROLL_ACTIVE) <> 0 Or PeekI(#SIM_CPU_DIRTY) <> 0 Or PeekI(#SIM_ROW_DIRTY) <> 0 : failure = 6 : EndIf
+  EndIf
+
+  If failure = 0
+    initialRxLength = PeekI(#SIM_RECOVERY_LENGTH)
+    initialRxError = PeekI(#SIM_RECOVERY_ERROR)
+    initialRxDiscard = PeekI(#SIM_RECOVERY_DISCARD)
+    If #SIM_RX_EXPECTED > 0
+      ; Signal the host only after screen backlog is drained and polling starts.
+      mirrorHook = PeekI(#SIM_MIRROR_HOOK)
+      PokeI(#SIM_MIRROR_HOOK, 0)
+      IdleSimMarker()
+      PokeI(#SIM_MIRROR_HOOK, mirrorHook)
+    EndIf
+    count = 0
+    start = IdleSimTicks()
+    lastPet = start
+    lastPoll = start
+    Repeat
+      now = IdleSimTicks()
+      If now < start Or now - start > 24000000 * 2
+        failure = 7
+        Break
+      EndIf
+      If now - start >= 24000000 : Break : EndIf
+      If now - lastPet >= 2400000
+        idle_sim_target = #SIM_WATCHDOG_PET
+        IdleSimCall()
+        lastPet = now
+      EndIf
+      pollGap = now - lastPoll
+      If pollGap > maxPollGap : maxPollGap = pollGap : EndIf
+      lastPoll = now
+      idle_sim_target = #SIM_RECOVERY_POLL
+      beforeCall = IdleSimTicks()
+      consumed = IdleSimCall()
+      callTicks = IdleSimTicks() - beforeCall
+      If callTicks > maxPollTicks : maxPollTicks = callTicks : EndIf
+      now = IdleSimTicks()
+      If IdleSimScreenWork(now) <> 0
+        idle_sim_target = #SIM_SCREEN_SERVICE
+        beforeCall = IdleSimTicks()
+        IdleSimCall()
+        callTicks = IdleSimTicks() - beforeCall
+        If callTicks > maxScreenTicks : maxScreenTicks = callTicks : EndIf
+      EndIf
+      If consumed = 0
+        waited = IdleSimWait()
+        If waited < 0 Or waited > 24000000
+          failure = 8
+          Break
+        EndIf
+        idleTicks = idleTicks + waited
+      EndIf
+      count = count + 1
+    ForEver
+    elapsed = IdleSimTicks() - start
+    If elapsed > 0 And idleTicks <= elapsed
+      usage = ((elapsed - idleTicks) * 10000 + elapsed / 2) / elapsed
+    Else
+      failure = 9
+    EndIf
+    If #SIM_RX_EXPECTED > 0
+      If PeekI(#SIM_RECOVERY_LENGTH) - initialRxLength <> #SIM_RX_EXPECTED Or PeekI(#SIM_RECOVERY_DISCARD) <> 0 Or PeekI(#SIM_RECOVERY_ERROR) <> initialRxError
+        ; Return the observable parser state for a failed stress run.
+        failure = 14
+      EndIf
+    EndIf
+  EndIf
+
+  idle_sim_kctl_write = original
+  IdleSimWriteKctl()
+  If IdleSimKctl() <> original : failure = 10 : EndIf
+  If failure = 14
+    ProcedureReturn $5354000000000000 | ((maxPollGap & $FFFF) << 32) | ((maxPollTicks & $FFFF) << 16) | (maxScreenTicks & $FFFF)
+  EndIf
+  If failure <> 0 : ProcedureReturn $4944455200000000 | failure : EndIf
+  If usage > 10000 Or maxPollGap > $FFFF Or count > $FFFF
+    ProcedureReturn $494445520000000B
+  EndIf
+  ProcedureReturn $4944000000000000 | (usage << 32) | (maxPollGap << 16) | count
+EndProcedure

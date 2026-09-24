@@ -1,0 +1,200 @@
+; Read two bounded crops from VOPB's active scanout buffer. The host runner
+; validates the live VOPB scanout base, mode, stride, and bounded DDR range.
+; This payload never writes to framebuffer memory. Run only through
+; tools/rockpi4c_banner_capture.py with Anvil's physical deadman armed.
+; pmf:target rockpi4c
+
+#CAP_VOPB = $FF900000
+#CAP_WDT = $FF84800C
+#CAP_UART_THR = $FF1A0000
+#CAP_UART_LSR = $FF1A0014
+#CAP_UART_DR = 1
+#CAP_UART_RX_ERRORS = $1E
+#CAP_FB_MAX_BYTES = 2560*1600*4
+#CAP_LEFT_W = 420
+#CAP_RIGHT_W = 140
+#CAP_CROP_H = 120
+#CAP_LINE_PIXELS = 32
+
+Global cap_tx_fault.i
+Global cap_fb.i
+Global cap_pitch.i
+Global Dim cap_packet.l[32]
+
+ProcedureNaked.i CapTicks()
+  ASM
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i CapTickRate()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+; Acknowledgment is required for every bounded PIX packet. The board never
+; outruns the host receive queue, and a damaged packet can be resent at most
+; three times. The physical watchdog remains fed during the bounded wait.
+Procedure.i CapWaitAck()
+  Protected begin.i
+  Protected rate.i
+  Protected attempt.i
+  Protected status.i
+  Protected response.i
+  begin=CapTicks()
+  rate=CapTickRate()
+  If rate<=0 Or rate>1000000000 : ProcedureReturn 0 : EndIf
+  For attempt=0 To 200000000
+    status=PeekL(#CAP_UART_LSR) & $FFFFFFFF
+    If (status & #CAP_UART_RX_ERRORS)<>0
+      If (status & #CAP_UART_DR)<>0 : response=PeekL(#CAP_UART_THR) : EndIf
+      ProcedureReturn 2
+    EndIf
+    If (status & #CAP_UART_DR)<>0
+      response=PeekL(#CAP_UART_THR) & 255
+      If response=43 : ProcedureReturn 1 : EndIf
+      If response=45 : ProcedureReturn 2 : EndIf
+    EndIf
+    If (attempt & $FFF)=0 : PokeL(#CAP_WDT,$76) : EndIf
+    If CapTicks()-begin>rate*3 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure CapTx(value.i)
+  Protected spin.i
+  If cap_tx_fault<>0
+    ProcedureReturn
+  EndIf
+  For spin=0 To 999999
+    If (PeekL(#CAP_UART_LSR) & $20)<>0
+      PokeL(#CAP_UART_THR,value & 255)
+      ProcedureReturn
+    EndIf
+  Next
+  cap_tx_fault=1
+EndProcedure
+
+Procedure CapText(text.i)
+  Protected index.i
+  Protected code.i
+  index=0
+  Repeat
+    code=PeekA(text+index) & 255
+    If code=0 : Break : EndIf
+    CapTx(code)
+    index=index+1
+  ForEver
+EndProcedure
+
+Procedure CapHex(value.i,digits.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=(digits-1)*4 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      CapTx(48+digit)
+    Else
+      CapTx(55+digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure CapEol()
+  CapTx(13)
+  CapTx(10)
+EndProcedure
+
+Procedure.i CapCrop(id.i,startX.i,width.i)
+  Protected row.i
+  Protected offset.i
+  Protected count.i
+  Protected column.i
+  Protected pixel.i
+  Protected hash.i=$811C9DC5
+  Protected lineHash.i
+  Protected retry.i
+  Protected ack.i
+  CapText("CROP ") : CapHex(id,1) : CapTx(32)
+  CapHex(startX,4) : CapTx(32) : CapHex(0,4) : CapTx(32)
+  CapHex(width,4) : CapTx(32) : CapHex(#CAP_CROP_H,4) : CapEol()
+  For row=0 To #CAP_CROP_H-1
+    offset=0
+    While offset<width
+      count=width-offset
+      If count>#CAP_LINE_PIXELS : count=#CAP_LINE_PIXELS : EndIf
+      lineHash=$811C9DC5
+      For column=0 To count-1
+        pixel=PeekL(cap_fb+row*cap_pitch+(startX+offset+column)*4) & $FFFFFFFF
+        pixel=pixel & $FFFFFF
+        cap_packet[column]=pixel
+        lineHash=((lineHash ! pixel)*$01000193) & $FFFFFFFF
+      Next
+      ack=0
+      For retry=0 To 3
+        CapText("PIX ") : CapHex(id,1) : CapTx(32)
+        CapHex(row,4) : CapTx(32) : CapHex(offset,4) : CapTx(32)
+        CapHex(count,2) : CapTx(32)
+        For column=0 To count-1
+          CapHex(cap_packet[column],6)
+        Next
+        CapTx(32) : CapHex(lineHash,8) : CapEol()
+        If cap_tx_fault<>0 : ProcedureReturn 0 : EndIf
+        ack=CapWaitAck()
+        If ack=1 : Break : EndIf
+        If ack=0 : ProcedureReturn 0 : EndIf
+      Next
+      If ack<>1 : ProcedureReturn 0 : EndIf
+      For column=0 To count-1
+        hash=((hash ! cap_packet[column])*$01000193) & $FFFFFFFF
+      Next
+      PokeL(#CAP_WDT,$76)
+      offset=offset+count
+    Wend
+  Next
+  CapText("END ") : CapHex(id,1) : CapTx(32) : CapHex(hash,8) : CapEol()
+  If cap_tx_fault<>0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Protected control.i
+  Protected mode.i
+  Protected active.i
+  Protected stride.i
+  Protected width.i
+  Protected height.i
+  Protected bytes.i
+  cap_tx_fault=0
+  control=PeekL(#CAP_VOPB+$30) & $FFFFFFFF
+  mode=PeekL(#CAP_VOPB+$10) & $FFFFFFFF
+  stride=PeekL(#CAP_VOPB+$3C) & $FFFFFFFF
+  cap_fb=PeekL(#CAP_VOPB+$40) & $FFFFFFFF
+  active=PeekL(#CAP_VOPB+$48) & $FFFFFFFF
+  width=(active & $1FFF)+1
+  height=((active >> 16) & $1FFF)+1
+  cap_pitch=(stride & $3FFF)*4
+  bytes=cap_pitch*height
+  If (control & 1)=0 Or (mode & 15)<>15
+    ProcedureReturn $43415011
+  EndIf
+  If width<#CAP_LEFT_W Or width<#CAP_RIGHT_W Or height<#CAP_CROP_H Or width>2560 Or height>1600
+    ProcedureReturn $43415012
+  EndIf
+  If cap_pitch<width*4 Or cap_pitch>2560*4 Or bytes<=0 Or bytes>#CAP_FB_MAX_BYTES
+    ProcedureReturn $43415013
+  EndIf
+  If cap_fb<$02000000 Or cap_fb+bytes>=$10000000 Or cap_fb+bytes<cap_fb
+    ProcedureReturn $43415014
+  EndIf
+  CapText("CAP1 ") : CapHex(cap_fb,8) : CapTx(32)
+  CapHex(width,4) : CapTx(32) : CapHex(height,4) : CapTx(32)
+  CapHex(cap_pitch,8) : CapTx(32) : CapHex(control,8) : CapTx(32)
+  CapHex(mode,8) : CapEol()
+  If CapCrop(0,0,#CAP_LEFT_W)=0 : ProcedureReturn $43415021 : EndIf
+  If CapCrop(1,width-#CAP_RIGHT_W,#CAP_RIGHT_W)=0 : ProcedureReturn $43415022 : EndIf
+  ProcedureReturn $43415000
+EndProcedure

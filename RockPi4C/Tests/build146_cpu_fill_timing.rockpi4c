@@ -1,0 +1,47 @@
+; Return-only, private-strip timing of the installed build-146 status fill.
+; pmf:target rockpi4c
+
+Global live_fill_target.i
+Global Dim live_strip.l[3840]
+
+ProcedureNaked.i LiveTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked LiveFill()
+  ASM
+    adrp x0, global_live_fill_target
+    add x0, x0, #:lo12:global_live_fill_target
+    ldr x0, [x0]
+    movz x1, #0x0028
+    movk x1, #0xFF00, lsl #16
+    movz x2, #768
+    movz x16, #0x46FC
+    movk x16, #0x000D, lsl #16
+    br x16
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected row.i
+  Protected before.i
+  Protected after.i
+  Protected span.i
+  Protected maximum.i
+  Protected sum.i
+  For row = 0 To 19
+    live_fill_target = @live_strip[0] + row * 768
+    before = LiveTicks()
+    LiveFill()
+    after = LiveTicks()
+    If after < before : ProcedureReturn $4649455200000001 : EndIf
+    span = after - before
+    If span > maximum : maximum = span : EndIf
+    sum = sum + span
+  Next
+  ProcedureReturn $4649000000000000 | ((maximum & $FFFF) << 32) | (sum & $FFFFFFFF)
+EndProcedure

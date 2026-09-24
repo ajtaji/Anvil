@@ -1,0 +1,62 @@
+; Returning LF/CRLF plus binary-body proof for the production UART2 ring.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+#CRC_POLY = $EDB88320
+XIncludeFile "Anvil/Core/crc.pbi"
+
+#FRAME_BYTES = 32
+Global Dim rx_frame.a[#FRAME_BYTES]
+
+Procedure.i RxFrameWait(bytes.i)
+  Protected start.i
+  Protected now.i
+  Protected available.i
+  Protected pumped.i
+  start = RockTimerTicks()
+  Repeat
+    pumped = RockUartPump(64)
+    If pumped < 0 Or rock_uart_error <> 0 : ProcedureReturn 0 : EndIf
+    available = (rock_uart_rx_head - rock_uart_rx_tail) & #ROCK_UART_RX_RING_MASK
+    If available >= bytes : ProcedureReturn 1 : EndIf
+    now = RockTimerTicks()
+    If now < start Or now - start > 24000000 * 2 : ProcedureReturn 0 : EndIf
+  ForEver
+EndProcedure
+
+Procedure.i Main()
+  Protected first.i
+  Protected second.i
+  Protected value.i
+  If RockTimerInit() = 0 Or RockUartAdopt() = 0
+    ProcedureReturn $4652414D00000001
+  EndIf
+  RockUartText("FRAME1READY") : RockUartByte(10)
+  If RxFrameWait(#FRAME_BYTES + 2) = 0 : ProcedureReturn $4652414D00000002 : EndIf
+  value = RockUartReceive()
+  If value <> 81 : ProcedureReturn $4652414D00000003 : EndIf
+  value = RockUartReceive()
+  If value <> 10 : ProcedureReturn $4652414D00000004 : EndIf
+  If RockUartReceiveBurst(@rx_frame[0], #FRAME_BYTES) <> #FRAME_BYTES
+    ProcedureReturn $4652414D00000005
+  EndIf
+  first = Crc32(@rx_frame[0], #FRAME_BYTES) & $FFFFFFFF
+
+  RockUartText("FRAME2READY") : RockUartByte(10)
+  If RxFrameWait(#FRAME_BYTES + 3) = 0 : ProcedureReturn $4652414D00000006 : EndIf
+  value = RockUartReceive()
+  If value <> 82 : ProcedureReturn $4652414D00000007 : EndIf
+  value = RockUartReceive()
+  If value <> 13 : ProcedureReturn $4652414D00000008 : EndIf
+  If RockUartDropOptionalLf() <> 1 : ProcedureReturn $4652414D00000009 : EndIf
+  If RockUartReceiveBurst(@rx_frame[0], #FRAME_BYTES) <> #FRAME_BYTES
+    ProcedureReturn $4652414D0000000A
+  EndIf
+  second = Crc32(@rx_frame[0], #FRAME_BYTES) & $FFFFFFFF
+  If rock_uart_error <> 0 : ProcedureReturn $4652414D0000000B : EndIf
+  ProcedureReturn (first << 32) | second
+EndProcedure

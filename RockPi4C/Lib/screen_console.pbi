@@ -23,14 +23,18 @@
 #ROCK_SCREEN_SERVICE_US = 1500
 #ROCK_SCREEN_ROW_IDLE_US = 10000
 #ROCK_SCREEN_DMA_MIN_BYTES = 256
-#ROCK_SCREEN_SCROLL_CHUNK_BYTES = 65536
+#ROCK_SCREEN_SCROLL_CHUNK_BYTES = 8192
 #ROCK_SCREEN_CPU_WATCHDOG_BYTES = 262144
 #ROCK_SCREEN_BANNER_H = 120
 #ROCK_SCREEN_CELL_W = 12
 #ROCK_SCREEN_CELL_H = 20
 ; Match the maximum scanout width admitted by the display contract.
 #ROCK_SCREEN_MAX_WIDTH = 2560
-#ROCK_SCREEN_ROW_BUFFER_BYTES = #ROCK_SCREEN_MAX_WIDTH * #ROCK_SCREEN_CELL_H * 4
+#ROCK_SCREEN_ROW_BUFFER_BYTES = #ROCK_SCREEN_MAX_WIDTH * #ROCK_RGA_ROW_H * 4
+#ROCK_SCREEN_CPU_Y = 94
+#ROCK_SCREEN_CPU_W = 192
+#ROCK_SCREEN_TITLE_PIXEL_HEIGHT = 28
+#ROCK_SCREEN_TITLE_ADVANCE = 20
 #ROCK_SCREEN_STYLE_NORMAL = 0
 #ROCK_SCREEN_STYLE_PROMPT = 1
 
@@ -69,9 +73,14 @@ Global rock_screen_text_render.i
 Global rock_screen_row_last_ticks.i
 Global rock_screen_dma_text_bytes.i
 Global rock_screen_cpu_text_bytes.i
+Global rock_screen_cpu_hundredths.i
+Global rock_screen_cpu_dirty.i
+Global rock_screen_cpu_strip_ready.i
 Global Dim rock_screen_ring.a[#ROCK_SCREEN_RING_BYTES]
 Global Dim rock_screen_ring_style.a[#ROCK_SCREEN_RING_BYTES]
-Global Dim rock_screen_row_buffer.l[#ROCK_SCREEN_MAX_WIDTH * #ROCK_SCREEN_CELL_H]
+Global Dim rock_screen_row_buffer.l[#ROCK_SCREEN_MAX_WIDTH * #ROCK_RGA_ROW_H]
+Global Dim rock_screen_cpu_strip.l[#ROCK_SCREEN_MAX_WIDTH * #ROCK_SCREEN_CELL_H]
+Global Dim rock_screen_cpu_label.a[12]
 
 ; Return nonzero once the service call has consumed its time slice. A timer
 ; that has not been initialised cannot enforce a deadline, so the independent
@@ -97,6 +106,9 @@ Procedure RockScreenCpuFill32(dst.i, value.i, bytes.i)
     If (offset & (#ROCK_SCREEN_CPU_WATCHDOG_BYTES - 1)) = 0
       RockWatchdogPet()
     EndIf
+    If (offset & 127) = 0 And rock_uart_ready <> 0
+      RockUartPump(64)
+    EndIf
     PokeL(dst + offset, value)
     offset = offset + 4
   Wend
@@ -110,6 +122,9 @@ Procedure RockScreenCpuCopyUp(dst.i, src.i, bytes.i)
   While offset + 4 <= bytes
     If (offset & (#ROCK_SCREEN_CPU_WATCHDOG_BYTES - 1)) = 0
       RockWatchdogPet()
+    EndIf
+    If (offset & 127) = 0 And rock_uart_ready <> 0
+      RockUartPump(64)
     EndIf
     PokeL(dst + offset, PeekL(src + offset))
     offset = offset + 4
@@ -231,6 +246,231 @@ Procedure.i RockScreenText(text.i, x.i, y.i, scale.i, colour.i)
   ProcedureReturn RockScreenTextRange(text, x, y, scale, colour, 0, 4096)
 EndProcedure
 
+; The atlas is built by the shared TrueType rasterizer. Blend a cropped 12 x 20
+; cell into a surface which is already filled with the banner background.
+Procedure RockScreenFontGlyph(code.i, x.i, y.i, colour.i, target.i, pitch.i, width.i, height.i)
+  Protected cellX.i
+  Protected cellY.i
+  Protected xx.i
+  Protected yy.i
+  Protected alpha.i
+  Protected red.i
+  Protected green.i
+  Protected blue.i
+  Protected bgRed.i
+  Protected bgGreen.i
+  Protected bgBlue.i
+  If rock_font_ready = 0 Or target = 0
+    ProcedureReturn
+  EndIf
+  If code < #ROCK_FONT_FIRST Or code >= #ROCK_FONT_FIRST + #ROCK_FONT_COUNT
+    code = 63
+  EndIf
+  cellX = ((code - #ROCK_FONT_FIRST) % #ROCK_FONT_COLUMNS) * #ROCK_FONT_CELL + 4
+  cellY = ((code - #ROCK_FONT_FIRST) / #ROCK_FONT_COLUMNS) * #ROCK_FONT_CELL
+  bgRed = (#ROCK_SCREEN_BG >> 16) & 255
+  bgGreen = (#ROCK_SCREEN_BG >> 8) & 255
+  bgBlue = #ROCK_SCREEN_BG & 255
+  RockUartPump(64)
+  For yy = 0 To #ROCK_SCREEN_CELL_H - 1
+    If y + yy >= 0 And y + yy < height
+      For xx = 0 To #ROCK_SCREEN_CELL_W - 1
+        If x + xx >= 0 And x + xx < width
+          alpha = (rock_font_atlas[(cellY + yy) * #ROCK_FONT_ATLAS_W + cellX + xx] >> 24) & 255
+          If alpha <> 0
+            red = (((colour >> 16) & 255) * alpha + bgRed * (255 - alpha) + 127) / 255
+            green = (((colour >> 8) & 255) * alpha + bgGreen * (255 - alpha) + 127) / 255
+            blue = ((colour & 255) * alpha + bgBlue * (255 - alpha) + 127) / 255
+            PokeL(target + (y + yy) * pitch + (x + xx) * 4, $FF000000 | (red << 16) | (green << 8) | blue)
+          EndIf
+        EndIf
+      Next
+    EndIf
+    RockUartPump(64)
+  Next
+EndProcedure
+
+Procedure.i RockScreenBannerTextRange(text.i, x.i, y.i, colour.i, first.i, count.i)
+  Protected index.i
+  Protected drawn.i
+  Protected code.i
+  If rock_font_ready = 0
+    ProcedureReturn RockScreenTextRange(text, x, y, 2, colour, first, count)
+  EndIf
+  index = first
+  While drawn < count
+    code = PeekA(text + index) & 255
+    If code = 0 : Break : EndIf
+    RockScreenFontGlyph(code, x + index * #ROCK_SCREEN_CELL_W, y, colour, rock_display_buffer, rock_display_pitch, rock_display_width, rock_display_height)
+    index = index + 1
+    drawn = drawn + 1
+  Wend
+  ProcedureReturn index
+EndProcedure
+
+Procedure RockScreenBannerTitleGlyph(code.i, x.i, y.i, colour.i)
+  Protected glyph.i
+  Protected width.i
+  Protected height.i
+  Protected stride.i
+  Protected bearingX.i
+  Protected bearingY.i
+  Protected advance.i
+  Protected units.i
+  Protected ascent.i
+  Protected descent.i
+  Protected lineGap.i
+  Protected lineBox.i
+  Protected baseline.i
+  Protected drawX.i
+  Protected drawY.i
+  Protected xx.i
+  Protected yy.i
+  Protected alpha.i
+  Protected red.i
+  Protected green.i
+  Protected blue.i
+  If rock_font_ready = 0
+    RockScreenGlyph(code, x, y, 3, colour)
+    ProcedureReturn
+  EndIf
+  glyph = AnvilTrueTypeGlyphForCodepoint(code)
+  If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
+    RockScreenGlyph(code, x, y, 3, colour)
+    ProcedureReturn
+  EndIf
+  If AnvilTrueTypeRasterizeGlyph(glyph, #ROCK_SCREEN_TITLE_PIXEL_HEIGHT, @rock_font_coverage[0], #ROCK_FONT_COVERAGE_BYTES, @width, @height, @stride, @bearingX, @bearingY, @advance) = 0
+    RockScreenGlyph(code, x, y, 3, colour)
+    ProcedureReturn
+  EndIf
+  If width <= 0 Or height <= 0
+    ProcedureReturn
+  EndIf
+  units = AnvilTrueTypeUnitsPerEm()
+  If units <= 0
+    ProcedureReturn
+  EndIf
+  ascent = (AnvilTrueTypeAscender() * #ROCK_SCREEN_TITLE_PIXEL_HEIGHT) / units
+  descent = (AnvilTrueTypeDescender() * #ROCK_SCREEN_TITLE_PIXEL_HEIGHT) / units
+  lineGap = (AnvilTrueTypeLineGap() * #ROCK_SCREEN_TITLE_PIXEL_HEIGHT) / units
+  lineBox = ascent - descent + lineGap
+  baseline = y + (32 - lineBox) / 2 + ascent
+  drawX = x + (#ROCK_SCREEN_TITLE_ADVANCE - advance) / 2 + bearingX
+  drawY = baseline - bearingY
+  For yy = 0 To height - 1
+    For xx = 0 To width - 1
+      alpha = PeekA(@rock_font_coverage[0] + yy * stride + xx) & 255
+      If alpha <> 0
+        red = (((colour >> 16) & 255) * alpha + ((#ROCK_SCREEN_BG >> 16) & 255) * (255 - alpha) + 127) / 255
+        green = (((colour >> 8) & 255) * alpha + ((#ROCK_SCREEN_BG >> 8) & 255) * (255 - alpha) + 127) / 255
+        blue = ((colour & 255) * alpha + (#ROCK_SCREEN_BG & 255) * (255 - alpha) + 127) / 255
+        RockScreenPixel(drawX + xx, drawY + yy, $FF000000 | (red << 16) | (green << 8) | blue)
+      EndIf
+    Next
+  Next
+  RockWatchdogPet()
+EndProcedure
+
+; The caller supplies hundredths of a percent. This setter does no display IO.
+Procedure RockScreenCpuUsageUpdate(hundredths.i)
+  If hundredths < 0
+    hundredths = 0
+  EndIf
+  If hundredths > 10000
+    hundredths = 10000
+  EndIf
+  If rock_screen_cpu_strip_ready = 0 Or rock_screen_cpu_hundredths <> hundredths
+    rock_screen_cpu_hundredths = hundredths
+    rock_screen_cpu_dirty = 1
+  EndIf
+EndProcedure
+
+Procedure RockScreenStatusBitmapGlyph(code.i, x.i, colour.i)
+  Protected bits.i
+  Protected row.i
+  Protected col.i
+  Protected sx.i
+  Protected sy.i
+  If code < 32 Or code > 126
+    code = 63
+  EndIf
+  bits = AnvilTextGlyph(code)
+  For row = 0 To 6
+    For col = 0 To 3
+      If (bits & (1 << ((6 - row) * 4 + 3 - col))) <> 0
+        For sy = 0 To 1
+          For sx = 0 To 1
+            PokeL(@rock_screen_cpu_strip[0] + (2 + row * 2 + sy) * rock_display_pitch + (x + col * 2 + sx) * 4, colour)
+          Next
+        Next
+      EndIf
+    Next
+  Next
+EndProcedure
+
+; Preserve the logo and separator in a private 20-line strip. Recompose only
+; the status rectangle there, then publish the whole strip in one DMA copy.
+Procedure RockScreenCpuUsageService()
+  Protected source.i
+  Protected bytes.i
+  Protected row.i
+  Protected index.i
+  Protected code.i
+  Protected whole.i
+  Protected fraction.i
+  If rock_screen_ready = 0 Or rock_screen_cpu_dirty = 0
+    ProcedureReturn
+  EndIf
+  If rock_display_pitch * #ROCK_RGA_ROW_H > #ROCK_SCREEN_ROW_BUFFER_BYTES
+    ProcedureReturn
+  EndIf
+  source = rock_display_buffer + #ROCK_SCREEN_CPU_Y * rock_display_pitch
+  bytes = rock_display_pitch * #ROCK_SCREEN_CELL_H
+  If rock_screen_cpu_strip_ready = 0
+    If rock_dma_pl330_ready = 0 Or RockDmaCopy(@rock_screen_cpu_strip[0], source, bytes) = 0
+      RockScreenCpuCopyUp(@rock_screen_cpu_strip[0], source, bytes)
+    EndIf
+    rock_screen_cpu_strip_ready = 1
+  EndIf
+  For row = 0 To #ROCK_SCREEN_CELL_H - 1
+    RockScreenCpuFill32(@rock_screen_cpu_strip[0] + row * rock_display_pitch + 24 * 4, #ROCK_SCREEN_BG, #ROCK_SCREEN_CPU_W * 4)
+    RockUartPump(64)
+  Next
+  whole = rock_screen_cpu_hundredths / 100
+  fraction = rock_screen_cpu_hundredths % 100
+  rock_screen_cpu_label[0] = 67
+  rock_screen_cpu_label[1] = 80
+  rock_screen_cpu_label[2] = 85
+  rock_screen_cpu_label[3] = 48
+  rock_screen_cpu_label[4] = 32
+  rock_screen_cpu_label[5] = 32
+  rock_screen_cpu_label[6] = 32
+  If whole >= 100
+    rock_screen_cpu_label[5] = 48 + whole / 100
+  EndIf
+  If whole >= 10
+    rock_screen_cpu_label[6] = 48 + (whole / 10) % 10
+  EndIf
+  rock_screen_cpu_label[7] = 48 + whole % 10
+  rock_screen_cpu_label[8] = 46
+  rock_screen_cpu_label[9] = 48 + fraction / 10
+  rock_screen_cpu_label[10] = 48 + fraction % 10
+  rock_screen_cpu_label[11] = 37
+  For index = 0 To 11
+    code = rock_screen_cpu_label[index] & 255
+    If rock_font_ready <> 0
+      RockScreenFontGlyph(code, 24 + index * #ROCK_SCREEN_CELL_W, 2, #ROCK_SCREEN_FAINT, @rock_screen_cpu_strip[0], rock_display_pitch, rock_display_width, #ROCK_SCREEN_CELL_H)
+    Else
+      RockScreenStatusBitmapGlyph(code, 24 + index * 10, #ROCK_SCREEN_FAINT)
+    EndIf
+  Next
+  If rock_dma_pl330_ready = 0 Or RockDmaCopy(source, @rock_screen_cpu_strip[0], bytes) = 0
+    RockScreenCpuCopyUp(source, @rock_screen_cpu_strip[0], bytes)
+  EndIf
+  rock_screen_cpu_dirty = 0
+  RockWatchdogPet()
+EndProcedure
+
 ; VOP WIN0 scans one linear, pitched surface. PL330 copies a contiguous span,
 ; so a complete terminal row is rasterized offscreen and published as one DMA
 ; transfer. The row buffer is owned by this adapter and never scanned directly.
@@ -251,11 +491,35 @@ EndProcedure
 Procedure RockScreenBufferPublish()
   Protected dst.i
   Protected bytes.i
+  Protected frameBytes.i
+  Protected lower.i
+  Protected lowerCopy.i
   If rock_screen_row_buffer_active = 0 Or rock_screen_row_buffer_dirty = 0
     ProcedureReturn
   EndIf
   bytes = rock_display_pitch * #ROCK_SCREEN_CELL_H
   dst = rock_display_buffer + (#ROCK_SCREEN_BANNER_H + rock_screen_row * #ROCK_SCREEN_CELL_H) * rock_display_pitch
+  ; RGA2 requires at least 34 scan lines. Preserve the next 20 scan lines
+  ; in the spare half of the row buffer before publishing this 40-line tile.
+  ; The final terminal row remains on the proven PL330 path.
+  frameBytes=rock_display_pitch*rock_display_height
+  If rock_rga_ready<>0 And rock_screen_row<rock_screen_rows-1 And dst+rock_display_pitch*#ROCK_RGA_ROW_H<=rock_display_buffer+frameBytes
+    lower=dst+bytes
+    lowerCopy=@rock_screen_row_buffer[0]+bytes
+    If rock_dma_pl330_ready=0 Or RockDmaCopy(lowerCopy,lower,bytes)=0
+      RockScreenCpuCopyUp(lowerCopy,lower,bytes)
+    EndIf
+    If RockRgaCopyRow(dst,rock_display_buffer,frameBytes)<>0
+      rock_screen_dma_text_bytes=rock_screen_dma_text_bytes+rock_display_pitch*#ROCK_RGA_ROW_H
+      rock_screen_row_buffer_dirty=0
+      RockWatchdogPet()
+      ProcedureReturn
+    EndIf
+    ; Even if the RGA command reports an error, restore the neighboring row.
+    If rock_dma_pl330_ready=0 Or RockDmaCopy(lower,lowerCopy,bytes)=0
+      RockScreenCpuCopyUp(lower,lowerCopy,bytes)
+    EndIf
+  EndIf
   If rock_dma_pl330_ready <> 0
     If RockDmaCopy(dst, @rock_screen_row_buffer[0], bytes) <> 0
       rock_screen_dma_text_bytes = rock_screen_dma_text_bytes + bytes
@@ -274,12 +538,6 @@ EndProcedure
 Procedure RockScreenClearCell(col.i, row.i)
   Protected line.i
   RockScreenBufferEnsure()
-  If rock_rga_ready<>0
-    If RockRgaCopyGlyph(32,col*#ROCK_SCREEN_CELL_W,0)<>0
-      rock_screen_row_buffer_dirty=1
-      ProcedureReturn
-    EndIf
-  EndIf
   For line = 0 To #ROCK_SCREEN_CELL_H - 1
     RockScreenCpuFill32(@rock_screen_row_buffer[0] + line * rock_display_pitch + col * #ROCK_SCREEN_CELL_W * 4, #ROCK_SCREEN_BG, #ROCK_SCREEN_CELL_W * 4)
   Next
@@ -382,8 +640,14 @@ Procedure RockScreenPaintByte(code.i, style.i)
       fg = #ROCK_SCREEN_STEEL
       If style = #ROCK_SCREEN_STYLE_PROMPT : fg = #ROCK_SCREEN_PROMPT : EndIf
       RockScreenBufferEnsure()
-      If rock_rga_ready<>0 And RockRgaCopyGlyph(code,rock_screen_col*#ROCK_SCREEN_CELL_W,style)<>0
-        rock_screen_row_buffer_dirty=1
+      If rock_font_ready <> 0
+        If RockRgaAtlasGlyph(code,rock_screen_col*#ROCK_SCREEN_CELL_W,@rock_screen_row_buffer[0],rock_display_pitch,rock_display_width,#ROCK_SCREEN_CELL_H,style)<>0
+          rock_screen_row_buffer_dirty=1
+        Else
+          RockScreenClearCell(rock_screen_col, rock_screen_row)
+          RockScreenFontGlyph(code, rock_screen_col * #ROCK_SCREEN_CELL_W, 0, fg, @rock_screen_row_buffer[0], rock_display_pitch, rock_display_width, #ROCK_SCREEN_CELL_H)
+          rock_screen_row_buffer_dirty = 1
+        EndIf
       Else
         RockScreenClearCell(rock_screen_col, rock_screen_row)
         rock_screen_text_render = 1
@@ -463,11 +727,12 @@ Procedure.i RockScreenAttach()
   rock_screen_row_buffer_active = 0
   rock_screen_row_buffer_dirty = 0
   rock_screen_text_render = 0
+  rock_screen_cpu_strip_ready = 0
   If RockRgaInit(#ROCK_SCREEN_STEEL,#ROCK_SCREEN_PROMPT,#ROCK_SCREEN_BG,@rock_screen_row_buffer[0],rock_display_pitch,rock_display_width)<>0
-    If rock_uart_ready<>0 : RockUartLine("HDMI TRUE TYPE RGA TEXT READY") : EndIf
+    If rock_uart_ready<>0 : RockUartLine("HDMI TRUE TYPE ATLAS RGA ROW READY") : EndIf
   Else
     If rock_uart_ready<>0
-      RockUartText("HDMI TRUE TYPE RGA TEXT ERR=")
+      RockUartText("HDMI TRUE TYPE ATLAS; RGA ROW ERR=")
       RockStorageHex8(rock_rga_error)
       RockUartLine("")
     EndIf
@@ -522,9 +787,9 @@ Procedure RockScreenBannerService(start.i)
     Case 1
       text = "PureMetal Forge"
       If rock_screen_banner_pos < 10
-        RockScreenGlyph(PeekA(text + rock_screen_banner_pos) & 255, 24 + rock_screen_banner_pos * 15, 18, 3, #ROCK_SCREEN_STEEL)
+        RockScreenBannerTitleGlyph(PeekA(text + rock_screen_banner_pos) & 255, 24 + rock_screen_banner_pos * #ROCK_SCREEN_TITLE_ADVANCE, 14, #ROCK_SCREEN_STEEL)
       ElseIf rock_screen_banner_pos < 15
-        RockScreenGlyph(PeekA(text + rock_screen_banner_pos) & 255, 24 + rock_screen_banner_pos * 15, 18, 3, #ROCK_SCREEN_ORANGE)
+        RockScreenBannerTitleGlyph(PeekA(text + rock_screen_banner_pos) & 255, 24 + rock_screen_banner_pos * #ROCK_SCREEN_TITLE_ADVANCE, 14, #ROCK_SCREEN_ORANGE)
       EndIf
       rock_screen_banner_pos = rock_screen_banner_pos + 1
       If rock_screen_banner_pos >= 15
@@ -533,20 +798,20 @@ Procedure RockScreenBannerService(start.i)
       EndIf
     Case 2
       text = "Anvil Monitor  |  Rock Pi 4C  |  RK3399  |  AArch64 at EL3"
-      rock_screen_banner_pos = RockScreenTextRange(text, 24, 56, 2, #ROCK_SCREEN_FAINT, rock_screen_banner_pos, 8)
+      rock_screen_banner_pos = RockScreenBannerTextRange(text, 24, 54, #ROCK_SCREEN_FAINT, rock_screen_banner_pos, 8)
       If PeekA(text + rock_screen_banner_pos) = 0
         rock_screen_banner_phase = 3
         rock_screen_banner_pos = 0
       EndIf
     Case 3
       text = AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME)
-      rock_screen_banner_pos = RockScreenTextRange(text, 24, 78, 2, #ROCK_SCREEN_STEEL, rock_screen_banner_pos, 8)
+      rock_screen_banner_pos = RockScreenBannerTextRange(text, 24, 76, #ROCK_SCREEN_STEEL, rock_screen_banner_pos, 8)
       If PeekA(text + rock_screen_banner_pos) = 0
         rock_screen_banner_phase = 4
         rock_screen_banner_pos = 0
       EndIf
     Case 4
-      RockScreenText("CPU0 --.--%", 24, 96, 2, #ROCK_SCREEN_FAINT)
+      RockScreenBannerTextRange("CPU0 --.--%", 24, 96, #ROCK_SCREEN_FAINT, 0, 16)
       rock_screen_banner_phase = 5
       rock_screen_banner_row = 0
     Case 5
@@ -576,8 +841,8 @@ Procedure RockScreenBannerService(start.i)
       EndIf
     Case 6
       If rock_display_width >= 500
-        x = rock_display_width - 96 + ((#ANVIL_PIC_W - 45) / 2)
-        RockScreenText("A N V I L", x, 92, 1, #ROCK_SCREEN_LOGO_NAME)
+        x = rock_display_width - 96 + ((#ANVIL_PIC_W - 9 * #ROCK_SCREEN_CELL_W) / 2)
+        RockScreenBannerTextRange("A N V I L", x, 90, #ROCK_SCREEN_LOGO_NAME, 0, 9)
       EndIf
       rock_screen_banner_phase = 7
     Case 7
@@ -634,6 +899,14 @@ Procedure RockScreenService()
   If rock_screen_ready = 0
     RockScreenBannerService(start)
     ProcedureReturn
+  EndIf
+  ; Reserve one bounded status publication when the one-second sample arrives.
+  ; A continuous UART stream must not starve the CPU field.
+  If rock_screen_cpu_dirty <> 0
+    RockScreenCpuUsageService()
+    If RockScreenTimeExpired(start) <> 0
+      ProcedureReturn
+    EndIf
   EndIf
   If rock_screen_scroll_active <> 0
     RockScreenScrollService()
