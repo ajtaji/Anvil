@@ -1,0 +1,85 @@
+; RK3399 RGA admission probe. Read-only: no power, clock, reset, RGA,
+; framebuffer or filesystem writes. RGA MMIO is read only if Linux's
+; power-domain, gate and reset contract says that the block is reachable.
+; Run through Anvil's deadman-protected returning payload command.
+; Sources: Linux rk3399.dtsi, clk-rk3399.c, pm_domains.c, rga-hw.h.
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
+
+#RGA_PMU = $FF310000
+#RGA_CRU = $FF760000
+#RGA_BASE = $FF680000
+
+Procedure RgaHex(value.i)
+  Protected shift.i
+  Protected nibble.i
+  For shift=28 To 0 Step -4
+    nibble=(value >> shift) & 15
+    If nibble<10 : RockUartByte(48+nibble) : Else : RockUartByte(55+nibble) : EndIf
+  Next
+EndProcedure
+
+Procedure RgaField(label.i,value.i)
+  RockUartText(label)
+  RgaHex(value)
+  RockUartLine("")
+EndProcedure
+
+Procedure.i Main()
+  Protected power.i
+  Protected status.i
+  Protected idleReq.i
+  Protected idleSt.i
+  Protected idleAck.i
+  Protected gate4.i
+  Protected gate16.i
+  Protected reset6.i
+  Protected clksel11.i
+  Protected clksel12.i
+  Protected blocked.i
+
+  RockCaptureEnvironment()
+  RockCaptureSctlrEl3()
+  If rock_current_el<>12 Or (rock_sctlr_el3 & $1005)<>0 : ProcedureReturn $524701 : EndIf
+  If RockUartAdopt()=0 : ProcedureReturn $524702 : EndIf
+  power=PeekL(#RGA_PMU+$14) & $FFFFFFFF
+  status=PeekL(#RGA_PMU+$18) & $FFFFFFFF
+  idleReq=PeekL(#RGA_PMU+$60) & $FFFFFFFF
+  idleSt=PeekL(#RGA_PMU+$64) & $FFFFFFFF
+  idleAck=PeekL(#RGA_PMU+$68) & $FFFFFFFF
+  gate4=PeekL(#RGA_CRU+$300+4*4) & $FFFFFFFF
+  gate16=PeekL(#RGA_CRU+$300+16*4) & $FFFFFFFF
+  reset6=PeekL(#RGA_CRU+$400+6*4) & $FFFFFFFF
+  clksel11=PeekL(#RGA_CRU+$100+11*4) & $FFFFFFFF
+  clksel12=PeekL(#RGA_CRU+$100+12*4) & $FFFFFFFF
+  RockUartLine("RGA ADMISSION READ ONLY")
+  RgaField(" POWER=",power)
+  RgaField(" STATUS=",status)
+  RgaField(" IDLE_REQ=",idleReq)
+  RgaField(" IDLE_ST=",idleSt)
+  RgaField(" IDLE_ACK=",idleAck)
+  RgaField(" GATE4=",gate4)
+  RgaField(" GATE16=",gate16)
+  RgaField(" RESET6=",reset6)
+  RgaField(" CLKSEL11=",clksel11)
+  RgaField(" CLKSEL12=",clksel12)
+  blocked=0
+  If ((power | status) & (1 << 18))<>0 : blocked=blocked | 1 : EndIf
+  If ((idleReq | idleSt | idleAck) & (1 << 5))<>0 : blocked=blocked | 2 : EndIf
+  If (gate4 & $700)<>0 : blocked=blocked | 4 : EndIf
+  If (gate16 & $F00)<>0 : blocked=blocked | 8 : EndIf
+  If (reset6 & $680)<>0 : blocked=blocked | 16 : EndIf
+  RgaField(" BLOCKED=",blocked)
+  If blocked<>0 : ProcedureReturn $52471000 | blocked : EndIf
+  ASM
+    dsb sy
+  ENDASM
+  RgaField(" VERSION=",PeekL(#RGA_BASE+$28) & $FFFFFFFF)
+  RgaField(" SYS_CTRL=",PeekL(#RGA_BASE+$0) & $FFFFFFFF)
+  RgaField(" INT=",PeekL(#RGA_BASE+$10) & $FFFFFFFF)
+  ProcedureReturn $52470000
+EndProcedure
