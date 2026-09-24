@@ -122,7 +122,7 @@ def check_source(vop_path: Path) -> None:
             "rockvopfield(#vop_win2_ctrl0,$00000011,0)",
             "rockvopfield(#vop_sys_ctrl,$0063f800,#vop_global_regdone_enable)",
             "rockvopfield(#vop_sys_ctrl1,$0003f000,$0003d000)",
-            "rockvopwrite(#vop_dsp_ctrl0,0)",
+            "rockvopwrite(#vop_dsp_ctrl0,outmode)",
             "rockvopwrite(#vop_htotal,hsynclength | (rock_mode_htotal << 16))",
             "rockvopwrite(#vop_post_scl_factor,#vop_scale_unity_xy)",
             "rockvopwrite(#vop_cabc_ctrl0,(pixeltotal << 4) | $00000008)",
@@ -156,6 +156,32 @@ def check_source(vop_path: Path) -> None:
         in prepare,
         "VOPB HDMI path clears RK3399 v3.5 global_regdone_en",
     )
+    # The released 5.10 kernel drives VOPB -> HDMI as ROCKCHIP_OUT_MODE_AAAA
+    # (30-bit bus, pre_dither_down 0); only VOPL (no OUTPUT_10BIT) is P888.
+    # P888 on VOPB scrambled every HDMI pixel on the board (2026-09-23).
+    require("#vop_dsp_out_mode_aaaa = $0000000f" in source and
+            "#vop_dsp_out_mode_p888 = $00000000" in source,
+            "missing pinned VOP output-mode constants")
+    ordered(
+        prepare,
+        (
+            "outmode=#vop_dsp_out_mode_aaaa",
+            "ditherctrl=0",
+            "outmode=#vop_dsp_out_mode_p888",
+            "ditherctrl=#vop_dsp_p888_pre_dither",
+            "rockvopwrite(#vop_dsp_ctrl0,outmode)",
+            "rockvopwrite(#vop_dsp_ctrl1,ditherctrl)",
+        ),
+        "per-route VOP output mode",
+    )
+    # Read-modify-write must merge into the software register image: an MMIO
+    # read returns the ACTIVE bank and drops fields pending before CFG_DONE.
+    field = procedure(source, "rockvopfield")
+    require("rock_vop_shadow[" in field and "rockvopread(offset)" not in field.split("else")[0],
+            "RockVopField reads the active MMIO bank instead of the register image")
+    write = procedure(source, "rockvopwrite")
+    require("rock_vop_shadow[" in write,
+            "RockVopWrite does not keep the register image current")
 
     # Independently exercise the exact CABC pixel-count expressions for both
     # the proven fallback and native preferred mode. Both fields are 23 bits.

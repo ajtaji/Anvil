@@ -26,6 +26,22 @@
 #VOP_WIN0_CTRL1_RGB_UNITY = $00400000
 #VOP_WIN0_SRC_ALPHA_OPAQUE = $00FF0000
 #VOP_DSP_P888_PRE_DITHER = $00000002
+; DSP_CTRL0.out_mode[3:0]. VOPL -> MiniDP is a 24-bit parallel P888 output.
+; VOPB -> HDMI is the RK3399's 30-bit RGB101010 internal bus: the released
+; ROCK Pi 4C 5.10.110 kernel's dw_hdmi_rockchip_select_output stores
+; ROCKCHIP_OUT_MODE_AAAA (15) for every RGB mode, and vop_update_csc keeps it
+; on VOPB because rk3399_vop_big.feature has OUTPUT_10BIT (0x45; VOPL 0x44
+; lacks it and is forced to P888). The DW HDMI sampler (TX_INVID0=RGB 8-bit)
+; takes the top 8 bits of each 10-bit lane, so P888 on VOPB scrambles pixel
+; bits across lanes: correct framebuffer, wrong hues, speckled ramps and text.
+; The same function writes pre_dither_down = (out_mode <> AAAA).
+#VOP_DSP_OUT_MODE_P888 = $00000000
+#VOP_DSP_OUT_MODE_AAAA = $0000000F
+; Software image of the VOP register window (Linux vop->regsbak). Every
+; writable VOP control register is double-buffered until CFG_DONE and an MMIO
+; read returns the ACTIVE bank, so a read-modify-write before CFG_DONE would
+; silently discard fields written earlier in the same commit.
+#VOP_SHADOW_WORDS = $400 >> 2
 #VOP_DSP_LAYER_LITTLE = $0000E400
 #VOP_GLOBAL_REGDONE_ENABLE = $00000800
 #VOP_HDMI_ENABLE = $00002000
@@ -109,6 +125,9 @@ Global rock_vop_output.i
 ; Global ordering is not an alignment contract. Reserve one alignment unit
 ; of slack and derive the scanout base within this compiler-owned object.
 Global Dim rock_vop_framebuffer.l[#ROCK_FB_MAX_WORDS+4]
+; One register image per VOP (index rock_vop_output: 0 VOPL, 1 VOPB).
+Global Dim rock_vop_shadow.l[2*#VOP_SHADOW_WORDS]
+Global Dim rock_vop_shadow_ready.i[2]
 
 Procedure.i RockVopFramebuffer()
   ProcedureReturn (@rock_vop_framebuffer[0]+#ROCK_FB_ALIGNMENT-1) & $FFFFFFFFFFFFFFF0
@@ -118,8 +137,24 @@ Procedure.i RockVopRead(offset.i)
   ProcedureReturn PeekL(rock_vop_base+offset) & $FFFFFFFF
 EndProcedure
 
+Procedure RockVopShadowAdopt()
+  ; Linux vop_initial() copies the whole register window into regsbak once the
+  ; VOP is clocked and out of reset. Do the same on this VOP's first owned
+  ; access; from then on every RockVopWrite keeps the image current.
+  Protected index.i
+  Protected slot.i = rock_vop_output*#VOP_SHADOW_WORDS
+  For index=0 To #VOP_SHADOW_WORDS-1
+    rock_vop_shadow[slot+index]=PeekL(rock_vop_base+index*4)
+  Next
+  rock_vop_shadow_ready[rock_vop_output]=1
+EndProcedure
+
 Procedure RockVopWrite(offset.i, value.i)
+  If rock_vop_shadow_ready[rock_vop_output]=0 : RockVopShadowAdopt() : EndIf
   PokeL(rock_vop_base+offset,value & $FFFFFFFF)
+  If offset>=0 And offset<#VOP_SHADOW_WORDS*4 And (offset & 3)=0
+    rock_vop_shadow[rock_vop_output*#VOP_SHADOW_WORDS+(offset >> 2)]=value & $FFFFFFFF
+  EndIf
 EndProcedure
 
 Procedure RockVopCaptureTelemetry()
@@ -165,7 +200,16 @@ Procedure RockVopSelectHdmiVopB()
 EndProcedure
 
 Procedure RockVopField(offset.i, mask.i, value.i)
-  Protected prior.i = RockVopRead(offset)
+  ; Merge into the software image, never the MMIO read: the read returns the
+  ; ACTIVE bank and would drop fields still pending in this commit (live
+  ; build 133 lost DSP_CTRL1.pre_dither_down exactly this way).
+  Protected prior.i
+  If rock_vop_shadow_ready[rock_vop_output]=0 : RockVopShadowAdopt() : EndIf
+  If offset>=0 And offset<#VOP_SHADOW_WORDS*4 And (offset & 3)=0
+    prior=rock_vop_shadow[rock_vop_output*#VOP_SHADOW_WORDS+(offset >> 2)] & $FFFFFFFF
+  Else
+    prior=RockVopRead(offset)
+  EndIf
   RockVopWrite(offset,(prior & ~mask) | (value & mask))
 EndProcedure
 
@@ -391,6 +435,8 @@ Procedure.i RockVopPrepareMode()
   Protected vactiveStart.i
   Protected vactiveEnd.i
   Protected pixelTotal.i
+  Protected outMode.i
+  Protected ditherCtrl.i
   rock_vop_ready=0
   rock_vop_prepared=0
   rock_vop_configured=0
@@ -426,16 +472,24 @@ Procedure.i RockVopPrepareMode()
   ; and allow thirty global AXI reads outstanding. The pinned Radxa 4.4
   ; vop_initial() also sets global_regdone_en at SYS_CTRL[11]. RK3399 VOPB is
   ; VOP 3.5, where this bit remains required for HDMI CFG_DONE commits. Do not
-  ; clear it while changing the physical output enable. RGB overlay/output,
-  ; progressive scan and P888 require every DSP_CTRL0 functional field zero.
+  ; clear it while changing the physical output enable. RGB overlay/output and
+  ; progressive scan leave every other DSP_CTRL0 functional field zero; only
+  ; out_mode differs per route (see #VOP_DSP_OUT_MODE_AAAA).
+  If rock_vop_output=1
+    outMode=#VOP_DSP_OUT_MODE_AAAA
+    ditherCtrl=0
+  Else
+    outMode=#VOP_DSP_OUT_MODE_P888
+    ditherCtrl=#VOP_DSP_P888_PRE_DITHER
+  EndIf
   If rock_vop_output=1
     RockVopField(#VOP_SYS_CTRL,$0063F800,#VOP_GLOBAL_REGDONE_ENABLE | #VOP_HDMI_ENABLE)
   Else
     RockVopField(#VOP_SYS_CTRL,$0063F800,#VOP_GLOBAL_REGDONE_ENABLE)
   EndIf
   RockVopField(#VOP_SYS_CTRL1,$0003F000,$0003D000)
-  RockVopWrite(#VOP_DSP_CTRL0,0)
-  RockVopWrite(#VOP_DSP_CTRL1,#VOP_DSP_P888_PRE_DITHER)
+  RockVopWrite(#VOP_DSP_CTRL0,outMode)
+  RockVopWrite(#VOP_DSP_CTRL1,ditherCtrl)
   If rock_vop_output=1
     ; RK3399 VOPB HDMI polarity uses DSP_CTRL1[23:20], unlike DP[18:16].
     RockVopField(#VOP_DSP_CTRL1,$00F00000,(pinPolarity | $00000008) << 20)
