@@ -166,9 +166,9 @@ def main() -> int:
     if get_file.count("RockUartSetMirrorHook(*mirror)") != 3:
         raise AssertionError("binary transfer does not restore the mirror on success and both failures")
 
-    # Desk composition must not promote unverified hardware capability or
-    # turn the one-shot diagnostic into automatic boot display.
-    for token in ("#CAP_DISPLAY = 0", "#ROCK_DIRECTSD_HDMI_AUTO = 0"):
+    # Desk composition must not promote unverified hardware capability. Boot
+    # HDMI is on since the physical monitor verified VOPB AAAA (2026-09-23).
+    for token in ("#CAP_DISPLAY = 0", "#ROCK_DIRECTSD_HDMI_AUTO = 1"):
         if token not in platform:
             raise AssertionError(f"unproven display policy changed: {token}")
 

@@ -74,6 +74,7 @@ Procedure RockRecoveryLoop()
 EndProcedure
 
 Procedure Main()
+  Protected resetStatus.i
   ; The generic A64 startup preserves firmware x0 through BSS clear and sets
   ; SP to the explicit profile value before calling Main.
   ASM
@@ -139,27 +140,41 @@ Procedure Main()
     EndIf
   EndIf
   If #ROCK_DIRECTSD_HDMI_ENABLED <> 0 And #ROCK_DIRECTSD_HDMI_AUTO <> 0
-    ; Automatic HDMI obeys the same deadman gate as the serial command. A
-    ; failed watchdog setup leaves all display registers untouched.
-    If RockWatchdogArm()=0
+    ; Boot-time HDMI runs the same one-shot RockHdmiDisplayUp as the serial
+    ; `hdmi` command, behind the same deadman. Every wait inside it is bounded
+    ; (HPD 300 ms, DDC 10 ms per byte, PHY lock 10 ms, first frame 50 ms), and
+    ; any refusal prints its reason and falls through to serial recovery, so a
+    ; missing monitor never costs the COM7 console.
+    ; CRU_GLB_RST_ST[5:4] (W1C) records a watchdog-triggered hot reset. That
+    ; may have been a wedged display bring-up, so never retry it automatically:
+    ; skip to recovery, where `hdmi` remains available for one attempt.
+    resetStatus=PeekL(#ROCK_CRU+$514) & $3F
+    PokeL(#ROCK_CRU+$514,resetStatus)
+    If (resetStatus & $30)<>0
+      If rock_uart_ready<>0 : RockUartLine("HDMI AUTO SKIPPED: LAST RESET WAS WATCHDOG; TYPE hdmi TO RETRY") : EndIf
+    ElseIf RockWatchdogArm()=0
       If rock_uart_ready<>0
-        RockUartLine("STOP: RK3399 HDMI DEADMAN REFUSED")
+        RockUartLine("HDMI AUTO SKIPPED: DEADMAN REFUSED; RECOVERY CONTINUES")
         RockWatchdogTelemetry()
       EndIf
-      RockRecoveryLoop()
-    EndIf
-    RockWatchdogPet()
-    ; Latch before touching shared display hardware. Recovery cannot issue a
-    ; second attempt if initialization partially transitions before failing.
-    rock_recovery_hdmi_attempted=1
-    If RockHdmiDisplayUp()=0
-      If rock_uart_ready<>0 : RockUartLine("STOP: RK3399 HDMI BRING-UP REFUSED") : EndIf
-      RockRecoveryLoop()
+    Else
+      RockWatchdogPet()
+      ; Latch before touching shared display hardware. Recovery cannot issue a
+      ; second attempt if initialization partially transitions before failing.
+      rock_recovery_hdmi_attempted=1
+      If rock_uart_ready<>0 : RockUartLine("HDMI AUTO INIT BEGIN; DEADMAN ARMED") : EndIf
+      If RockHdmiDisplayUp()=0
+        If rock_uart_ready<>0 : RockUartLine("HDMI AUTO INIT FAILED; RECOVERY CONTINUES") : EndIf
+      ElseIf rock_uart_ready<>0
+        RockUartLine("HDMI INIT READY")
+      EndIf
     EndIf
   EndIf
   If rock_uart_ready <> 0
     If #ROCK_DIRECTSD_DISPLAY_ENABLED <> 0
       RockUartLine("ANVIL ROCK PI 4C EL3 FOUNDATION READY; IRQ STILL MASKED")
+    ElseIf #ROCK_DIRECTSD_HDMI_ENABLED <> 0 And #ROCK_DIRECTSD_HDMI_AUTO <> 0
+      RockUartLine("ANVIL ROCK PI 4C EL3 READY; HDMI VOPB; AUTO ON")
     ElseIf #ROCK_DIRECTSD_HDMI_ENABLED <> 0
       RockUartLine("ANVIL ROCK PI 4C EL3 READY; TYPE HDMI; VOPB; AUTO OFF")
     Else
