@@ -1,0 +1,130 @@
+; Returning 400-byte UART RX ring proof using the production UART2 source.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+
+Global rx_proof_kctl_write.i
+
+ProcedureNaked.i RxProofEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i RxProofDaif()
+  ASM
+    mrs x0, daif
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i RxProofKctl()
+  ASM
+    mrs x0, cntkctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked RxProofSetKctl()
+  ASM
+    adrp x9, global_rx_proof_kctl_write
+    add x9, x9, #:lo12:global_rx_proof_kctl_write
+    ldr x0, [x9]
+    msr cntkctl_el1, x0
+    isb
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked RxProofWait()
+  ASM
+    .long $D50320BF ; SEVL
+    wfe
+    wfe
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected original.i
+  Protected start.i
+  Protected now.i
+  Protected lastPumpEnd.i
+  Protected maxGap.i
+  Protected gap.i
+  Protected pumped.i
+  Protected consumed.i
+  Protected attempt.i
+  Protected value.i
+  Protected count.i
+  Protected failure.i
+
+  If RxProofEl() <> 12 Or (RxProofDaif() & $C0) <> $C0
+    ProcedureReturn $5258455200000001
+  EndIf
+  If RockTimerInit() = 0 Or RockUartAdopt() = 0
+    ProcedureReturn $5258455200000002
+  EndIf
+  original = RxProofKctl()
+  rx_proof_kctl_write = (original & $FFFFFFFFFFFFFF03) | $C4
+  RxProofSetKctl()
+  If (RxProofKctl() & $FC) <> $C4
+    rx_proof_kctl_write = original
+    RxProofSetKctl()
+    ProcedureReturn $5258455200000003
+  EndIf
+
+  RockUartByte(82) : RockUartByte(88) : RockUartByte(82)
+  RockUartByte(69) : RockUartByte(65) : RockUartByte(68)
+  RockUartByte(89) : RockUartByte(10)
+  start = RockTimerTicks()
+  lastPumpEnd = start
+  Repeat
+    now = RockTimerTicks()
+    If now < start Or now - start > 24000000 * 2
+      failure = 4
+      Break
+    EndIf
+    If now - start >= 24000000 : Break : EndIf
+    gap = now - lastPumpEnd
+    If gap > maxGap : maxGap = gap : EndIf
+    pumped = RockUartPump(64)
+    lastPumpEnd = RockTimerTicks()
+    consumed = Bool(pumped <> 0)
+    For attempt = 0 To 7
+      value = RockUartReceive()
+      If value = -1 : Break : EndIf
+      If value = -2
+        failure = 5
+        Break
+      EndIf
+      consumed = 1
+      If value <> 120
+        failure = 6
+        Break
+      EndIf
+      count = count + 1
+      If count > 400
+        failure = 7
+        Break
+      EndIf
+    Next
+    If failure <> 0 : Break : EndIf
+    If consumed = 0 : RxProofWait() : EndIf
+  ForEver
+  rx_proof_kctl_write = original
+  RxProofSetKctl()
+  If RxProofKctl() <> original : failure = 8 : EndIf
+  If rock_uart_error <> 0 : failure = 9 : EndIf
+  If count <> 400 : failure = 10 : EndIf
+  If maxGap >= 10240 : failure = 11 : EndIf
+  If failure <> 0
+    ProcedureReturn $5258455200000000 | ((maxGap & $FFFF) << 16) | ((count & $FF) << 8) | failure
+  EndIf
+  ProcedureReturn $5258505200000000 | ((maxGap & $FFFF) << 16) | count
+EndProcedure

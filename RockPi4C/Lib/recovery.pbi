@@ -9,7 +9,8 @@
 ; abbreviation or network transport.
 
 #ROCK_RECOVERY_LINE_BYTES = 512
-#ROCK_RECOVERY_POLL_BYTES = 64
+#ROCK_RECOVERY_POLL_BYTES = 8
+#ROCK_RECOVERY_PUMP_BYTES = 64
 
 Global Dim rock_recovery_line.a[#ROCK_RECOVERY_LINE_BYTES]
 Global rock_recovery_length.i
@@ -348,7 +349,9 @@ Procedure RockRecoveryFinishLine()
     rock_recovery_length=0
     RockRecoveryReset()
   ElseIf RockRecoveryLineIsHelp()<>0
-    RockUartLine("COMMANDS: help hdmi payload gpuinfo fontatlas reboot storage sdmeta ls map read get write put writeproof trustupdate")
+    RockUartLine("COMMANDS: help hdmi payload gpuinfo fontatlas reboot storage sdmeta map read get write put writeproof trustupdate")
+    RockUartLine("FILES: sd emmc fs ls [path] stat <path> cat <path> load <path> receive <len> <crc> save <path>")
+    RockUartLine("       mkdir <path> rm <path> rmdir <path> mv <old> <new>; quoted paths work")
   ElseIf RockRecoveryLineIsPayload()<>0
     If rock_recovery_fatal_mode<>0
       RockUartLine("ERR PAYLOAD DISABLED IN FATAL RECOVERY")
@@ -392,8 +395,10 @@ Procedure RockRecoveryFinishLine()
     If rock_recovery_fatal_mode<>0
       RockUartLine("ERR STORAGE DISABLED IN FATAL RECOVERY")
     Else
-      If RockStorageCommand(@rock_recovery_line[0], rock_recovery_length)=0
-        RockUartLine("ERR COMMAND")
+      If RockFsCommand(@rock_recovery_line[0], rock_recovery_length)=0
+        If RockStorageCommand(@rock_recovery_line[0], rock_recovery_length)=0
+          RockUartLine("ERR COMMAND")
+        EndIf
       EndIf
     EndIf
   EndIf
@@ -419,9 +424,13 @@ Procedure.i RockRecoveryPoll()
   Protected attempt.i
   Protected value.i
   Protected consumed.i
+  Protected pumped.i
   If rock_recovery_ready=0 : ProcedureReturn 0 : EndIf
-  ; Consume only bytes already waiting in the UART and cap work per call. No
-  ; partial line blocks the monitor's late recovery loop.
+  ; Empty the hardware FIFO into a shared software ring before the slower
+  ; parser. Limit parsing so the next refill occurs well inside the UART
+  ; FIFO's 427 us fill interval at 1.5 Mbaud.
+  pumped = RockUartPump(#ROCK_RECOVERY_PUMP_BYTES)
+  If pumped <> 0 : consumed = 1 : EndIf
   For attempt=0 To #ROCK_RECOVERY_POLL_BYTES-1
     value=RockUartReceive()
     If value=-1 : Break : EndIf
@@ -439,7 +448,8 @@ Procedure.i RockRecoveryPoll()
       rock_recovery_error=2
       rock_recovery_discard=1
     ElseIf value=13
-      rock_recovery_skip_lf=1
+      RockUartDropOptionalLf()
+      rock_recovery_skip_lf=0
       RockRecoveryFinishLine()
     ElseIf value=10
       RockRecoveryFinishLine()

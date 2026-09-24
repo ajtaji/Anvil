@@ -3,9 +3,9 @@
 ; pmf:load $00041000
 ; pmf:bss $02800000
 ; pmf:stack $05000000
-#ANVIL_BUILD = 135 ; pmf:build
+#ANVIL_BUILD = 147 ; pmf:build
 #ANVIL_BUILD_DATE = 20260923 ; pmf:builddate
-#ANVIL_BUILD_TIME = 200907 ; pmf:buildtime
+#ANVIL_BUILD_TIME = 231343 ; pmf:buildtime
 XIncludeFile "RockPi4C/Board/platform.pbi"
 XIncludeFile "RockPi4C/Lib/soc.pbi"
 XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
@@ -32,10 +32,13 @@ XIncludeFile "RockPi4C/Lib/display_mode.pbi"
 XIncludeFile "RockPi4C/Lib/cru.pbi"
 XIncludeFile "RockPi4C/Lib/gpu_probe.pbi"
 XIncludeFile "RockPi4C/Lib/watchdog.pbi"
+XIncludeFile "RockPi4C/Lib/idle_timer.pbi"
 XIncludeFile "RockPi4C/Lib/dma_pl330.pbi"
 XIncludeFile "RockPi4C/Lib/sdmmc.pbi"
+XIncludeFile "RockPi4C/Lib/emmc.pbi"
 XIncludeFile "RockPi4C/Lib/storage.pbi"
 XIncludeFile "RockPi4C/Lib/storage_proof.pbi"
+XIncludeFile "RockPi4C/Lib/fs_commands.pbi"
 XIncludeFile "RockPi4C/Lib/pmic.pbi"
 XIncludeFile "RockPi4C/Lib/tcphy.pbi"
 XIncludeFile "RockPi4C/Lib/cdn_dp.pbi"
@@ -57,20 +60,88 @@ rock_cold_park:
   ENDASM
 EndProcedure
 
+Procedure.i RockScreenWorkPending(now.i)
+  If rock_display_ready = 0 Or rock_screen_fault <> 0
+    ProcedureReturn 0
+  EndIf
+  If rock_screen_ready = 0 Or rock_screen_scroll_active <> 0 Or rock_screen_cpu_dirty <> 0 Or rock_screen_head <> rock_screen_tail
+    ProcedureReturn 1
+  EndIf
+  If rock_screen_row_buffer_dirty <> 0
+    If now < rock_screen_row_last_ticks Or now - rock_screen_row_last_ticks >= (rock_timer_frequency / 1000000) * #ROCK_SCREEN_ROW_IDLE_US
+      ProcedureReturn 1
+    EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure RockRecoveryLoop()
+  Protected windowStart.i
+  Protected sampleEnd.i
+  Protected loopNow.i
+  Protected lastPet.i
+  Protected windowIdle.i
+  Protected idleTicks.i
+  Protected consumed.i
+  Protected windowTicks.i
+  Protected usage.i
+  Protected idleReady.i
   ; Only entered after the direct-SD EL3/timer/UART contract has passed.
-  ; IRQ stays masked: actively poll UART instead of sleeping in WFE, which
-  ; cannot service an incoming FTDI command without an interrupt source.
+  ; IRQ stays masked. The timer event stream sends a wake every 341.3 us;
+  ; received UART bytes are drained before another idle wait.
   If RockRecoveryInit() = 0 : RockPark() : EndIf
+  If rock_idle_skip_after_watchdog = 0 And rock_watchdog_armed = 0
+    If RockWatchdogArm() = 0 And rock_uart_ready <> 0
+      RockUartLine("IDLE TIMER SKIPPED: DEADMAN REFUSED; BUSY-POLL RECOVERY CONTINUES")
+    EndIf
+  EndIf
+  idleReady = RockIdleTimerInit()
+  windowStart = RockTimerTicks()
+  lastPet = windowStart
   Repeat
     ; A watchdog armed by HDMI stays live for the rest of this healthy
     ; recovery session. Pet it only from the ordinary command loop; fatal
     ; exception recovery deliberately cannot hide a wedged subsystem.
-    RockWatchdogPet()
-    RockRecoveryPoll()
-    RockScreenService()
-    RockWatchdogPet()
-    RockTimerWaitUs(1000)
+    loopNow = RockTimerTicks()
+    If loopNow < lastPet Or loopNow - lastPet >= rock_timer_frequency / 10
+      RockWatchdogPet()
+      lastPet = loopNow
+    EndIf
+    consumed = RockRecoveryPoll()
+    If RockScreenWorkPending(RockTimerTicks()) <> 0
+      RockScreenService()
+    EndIf
+    If idleReady <> 0 And consumed = 0
+      idleTicks = RockIdleTimerWait()
+      If idleTicks < 0 Or idleTicks > rock_timer_frequency
+        ; An anomalous timer reading must never distort CPU usage or keep
+        ; selecting WFE. The recovery loop remains live on its polling path.
+        idleReady = 0
+        windowIdle = 0
+      Else
+        windowIdle = windowIdle + idleTicks
+      EndIf
+    ElseIf idleReady = 0
+      ; A missing deadman or a watchdog reset keeps the proven busy-poll
+      ; recovery path available, with a truthful 100.00% reading.
+      RockTimerWaitUs(1000)
+    EndIf
+    sampleEnd = RockTimerTicks()
+    If sampleEnd < windowStart
+      windowStart = sampleEnd
+      windowIdle = 0
+    ElseIf sampleEnd - windowStart >= rock_timer_frequency
+      windowTicks = sampleEnd - windowStart
+      usage = 10000
+      If idleReady <> 0 And windowIdle <= windowTicks
+        usage = ((windowTicks - windowIdle) * 10000 + windowTicks / 2) / windowTicks
+      EndIf
+      If usage < 0 : usage = 0 : EndIf
+      If usage > 10000 : usage = 10000 : EndIf
+      RockScreenCpuUsageUpdate(usage)
+      windowStart = sampleEnd
+      windowIdle = 0
+    EndIf
   ForEver
 EndProcedure
 
@@ -125,6 +196,11 @@ Procedure Main()
     RockPark()
   EndIf
   RockSecurityTelemetry()
+  ; If a previous WFE ever failed to wake, the resident deadman resets the
+  ; board. Preserve the busy-poll fallback on that boot instead of retrying.
+  If (PeekL(#ROCK_CRU+$514) & $30) <> 0
+    rock_idle_skip_after_watchdog = 1
+  EndIf
   ; EL3 GIC/timer and display ownership are explicit opt-in capabilities.
   ; Keep IRQ masked. HDMI VOPB has an explicit serial command for the initial
   ; direct-loader proof; automatic initialization remains a build-time opt-in.

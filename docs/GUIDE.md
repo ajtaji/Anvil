@@ -2,7 +2,8 @@
 
 The book: how to build Anvil, put it on a Raspberry Pi 4, talk to it, write a
 payload, run that payload from a host machine, use all four cores, and replace
-the monitor without losing the board.
+the monitor without losing the board. Later chapters cover the Pi 3 and the
+original ROCK Pi 4C boot and recovery paths.
 
 The rest of `docs/` is the engineering record, with notes that describe each
 piece of work and the boundary it establishes.
@@ -35,6 +36,7 @@ path in.** Chapter 11 is the map back out to them, by topic.
 | 18 | [TrueType pair positioning and layout](guide/18_truetype_layout.txt) | T6 applies checked legacy kern or selected GPOS PairPos values and lays out bounded UTF-8 glyph runs. |
 | 19 | [TrueType console commands and defaults](guide/19_truetype_console.txt) | Load/select TrueType faces, choose a pixel height, and save or restore a default path with bitmap fallback. |
 | 20 | [TrueType fonts in the resident Vulkan console](guide/20_truetype_vulkan_runtime.txt) | Use font slots in the Vulkan console, understand cache warming and fixed-cell fitting, and distinguish emitted and returning-payload proofs from resident visual acceptance. |
+| 21 | [Anvil on the ROCK Pi 4C](guide/21_the_rock_pi_4c.txt) | EL3 direct-SD boot, checked recovery, SD and eMMC file commands, HDMI TrueType and RGA console, and bounded Mali payload proofs. |
 
 [`guide/00_OUTLINE.txt`](guide/00_OUTLINE.txt) documents the book itself: the
 markup, the rules the chapters are written to, and the chapter plan. Files whose

@@ -1,0 +1,555 @@
+; Bounded 25 MHz eMMC user-area single-sector write/verify/restore proof.
+; Only LBA 32768 may be written, and only after an immediate zero readback.
+; Boot partitions and low partition-table sectors are never selected/written.
+; pmf:target rockpi4c
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+
+#EMMC_I_HOST = $FE330000
+#EMMC_I_UART_THR = $FF1A0000
+#EMMC_I_UART_LSR = $FF1A0014
+#EMMC_I_WDT_CRR = $FF84800C
+#EMMC_I_CMD_ERROR = $FFFF8000
+
+Global emmc_i_lastInterrupt.i
+Global emmc_i_lastResponse.i
+Global Dim emmc_i_data.a[511]
+Global Dim emmc_i_original.a[511]
+
+Procedure.i EmmcITx(value.i)
+  Protected attempt.i
+  For attempt=0 To 1000000
+    If (PeekL(#EMMC_I_UART_LSR) & $20)<>0
+      PokeL(#EMMC_I_UART_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure EmmcIHex(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      EmmcITx(48+digit)
+    Else
+      EmmcITx(55+digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure EmmcIWord(value.i)
+  EmmcIHex(value)
+  EmmcITx(32)
+EndProcedure
+
+Procedure EmmcINewline()
+  EmmcITx(13)
+  EmmcITx(10)
+EndProcedure
+
+Procedure.i EmmcICrc(*buffer)
+  Protected crc.i=$FFFFFFFF
+  Protected index.i
+  Protected bit.i
+  For index=0 To 511
+    crc=crc ! (PeekA(*buffer+index) & 255)
+    For bit=0 To 7
+      If (crc & 1)<>0
+        crc=(crc >> 1) ! $EDB88320
+      Else
+        crc=crc >> 1
+      EndIf
+    Next
+    crc=crc & $FFFFFFFF
+  Next
+  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+EndProcedure
+
+Procedure.i EmmcIWait8(offset.i,mask.i,wanted.i,timeoutUs.i)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  start=RockTimerTicks()
+  For attempt=0 To 1000000
+    If (PeekA(#EMMC_I_HOST+offset) & mask)=wanted
+      ProcedureReturn 1
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start >= 24*timeoutUs
+      Break
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i EmmcICmd(index.i,argument.i,flags.i)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  Protected status.i
+  If EmmcIWaitPresent(3,0,100000)=0
+    emmc_i_lastInterrupt=$FFFFFFFF
+    ProcedureReturn 0
+  EndIf
+  PokeL(#EMMC_I_HOST+$30,$FFFFFFFF)
+  PokeL(#EMMC_I_HOST+$08,argument)
+  PokeL(#EMMC_I_HOST+$0C,((index << 8) | flags) << 16)
+  start=RockTimerTicks()
+  For attempt=0 To 4000000
+    status=PeekL(#EMMC_I_HOST+$30) & $FFFFFFFF
+    If (status & (1 | #EMMC_I_CMD_ERROR))<>0
+      Break
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start >= 2400000
+      Break
+    EndIf
+  Next
+  emmc_i_lastInterrupt=status
+  emmc_i_lastResponse=PeekL(#EMMC_I_HOST+$10) & $FFFFFFFF
+  PokeL(#EMMC_I_HOST+$30,status & (1 | #EMMC_I_CMD_ERROR))
+  ProcedureReturn Bool((status & 1)<>0 And (status & #EMMC_I_CMD_ERROR)=0)
+EndProcedure
+
+Procedure.i EmmcIWaitPresent(mask.i,wanted.i,timeoutUs.i)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  start=RockTimerTicks()
+  For attempt=0 To 4000000
+    If (PeekL(#EMMC_I_HOST+$24) & mask)=wanted
+      ProcedureReturn 1
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start >= 24*timeoutUs
+      Break
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i EmmcIReadData(index.i,argument.i,*buffer)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  Protected status.i
+  Protected word.i
+  If EmmcIWaitPresent(3,0,100000)=0
+    emmc_i_lastInterrupt=$FFFFFFFE
+    ProcedureReturn 0
+  EndIf
+  PokeL(#EMMC_I_HOST+$30,$FFFFFFFF)
+  PokeW(#EMMC_I_HOST+$04,512)
+  PokeW(#EMMC_I_HOST+$06,1)
+  PokeL(#EMMC_I_HOST+$08,argument)
+  PokeL(#EMMC_I_HOST+$0C,(((index << 8) | $3A) << 16) | $10)
+  start=RockTimerTicks()
+  For attempt=0 To 10000000
+    status=PeekL(#EMMC_I_HOST+$30) & $FFFFFFFF
+    If (status & ($20 | #EMMC_I_CMD_ERROR))<>0
+      Break
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start >= 12000000
+      Break
+    EndIf
+  Next
+  emmc_i_lastInterrupt=status
+  emmc_i_lastResponse=PeekL(#EMMC_I_HOST+$10) & $FFFFFFFF
+  If (status & $20)=0 Or (status & #EMMC_I_CMD_ERROR)<>0
+    ProcedureReturn 0
+  EndIf
+  For word=0 To 127
+    PokeL(*buffer+word*4,PeekL(#EMMC_I_HOST+$20))
+  Next
+  start=RockTimerTicks()
+  For attempt=0 To 10000000
+    status=PeekL(#EMMC_I_HOST+$30) & $FFFFFFFF
+    If (status & (2 | #EMMC_I_CMD_ERROR))<>0
+      Break
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start >= 12000000
+      Break
+    EndIf
+  Next
+  emmc_i_lastInterrupt=status
+  PokeL(#EMMC_I_HOST+$30,status)
+  ProcedureReturn Bool((status & 2)<>0 And (status & #EMMC_I_CMD_ERROR)=0)
+EndProcedure
+
+Procedure.i EmmcIWriteData(lba.i,*buffer)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  Protected status.i
+  Protected word.i
+  If EmmcIWaitPresent(3,0,100000)=0
+    ProcedureReturn 0
+  EndIf
+  PokeL(#EMMC_I_HOST+$30,$FFFFFFFF)
+  PokeW(#EMMC_I_HOST+$04,512)
+  PokeW(#EMMC_I_HOST+$06,1)
+  PokeL(#EMMC_I_HOST+$08,lba)
+  PokeL(#EMMC_I_HOST+$0C,(((24 << 8) | $3A) << 16))
+  start=RockTimerTicks()
+  For attempt=0 To 10000000
+    status=PeekL(#EMMC_I_HOST+$30) & $FFFFFFFF
+    If (status & ($10 | #EMMC_I_CMD_ERROR))<>0
+      Break
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start>=12000000
+      Break
+    EndIf
+  Next
+  emmc_i_lastInterrupt=status
+  If (status & $10)=0 Or (status & #EMMC_I_CMD_ERROR)<>0
+    ProcedureReturn 0
+  EndIf
+  For word=0 To 127
+    PokeL(#EMMC_I_HOST+$20,PeekL(*buffer+word*4))
+  Next
+  start=RockTimerTicks()
+  For attempt=0 To 40000000
+    status=PeekL(#EMMC_I_HOST+$30) & $FFFFFFFF
+    If (status & (2 | #EMMC_I_CMD_ERROR))<>0
+      Break
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start>=48000000
+      Break
+    EndIf
+  Next
+  emmc_i_lastInterrupt=status
+  PokeL(#EMMC_I_HOST+$30,status)
+  If (status & 2)=0 Or (status & #EMMC_I_CMD_ERROR)<>0
+    ProcedureReturn 0
+  EndIf
+  For attempt=0 To 2000
+    PokeL(#EMMC_I_WDT_CRR,$76)
+    If EmmcICmd(13,$00010000,$1A)=0
+      ProcedureReturn 0
+    EndIf
+    If (emmc_i_lastResponse & $1F00)=$0900
+      ProcedureReturn 1
+    EndIf
+    If RockTimerWaitUs(1000)=0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Main()
+  Protected clock.i
+  Protected power.i
+  Protected attempt.i
+  Protected ocr.i
+  Protected *data
+  Protected sectorCount.i
+  Protected word.i
+  Protected testWrite.i
+  Protected testRead.i
+  Protected testMatch.i
+  Protected restoreWrite.i
+  Protected restoreRead.i
+  Protected restoreMatch.i
+  Protected originalCrc.i
+  Protected expectedCrc.i
+  Protected readCrc.i
+  Protected restoredCrc.i
+  Protected mismatchIndex.i
+  Protected mismatchActual.i
+  Protected clockRestored.i
+  Protected slowRead.i
+  Protected slowCrc.i
+  If RockTimerInit()=0
+    ProcedureReturn $454D3001
+  EndIf
+  ; Preserve parent source, PHY and voltage; only move the card clock to the
+  ; 400 kHz identification divider of the observed 200 MHz SCLK_EMMC.
+  PokeA(#EMMC_I_HOST+$2F,6)
+  If EmmcIWait8($2F,6,0,10000)=0
+    ProcedureReturn $454D3002
+  EndIf
+  power=PeekA(#EMMC_I_HOST+$29) & 255
+  PokeA(#EMMC_I_HOST+$28,$C0)
+  If (power & 1)=0
+    PokeA(#EMMC_I_HOST+$29,$0B)
+  EndIf
+  PokeW(#EMMC_I_HOST+$2C,$FA01)
+  If EmmcIWait8($2C,2,2,10000)=0
+    ProcedureReturn $454D3003
+  EndIf
+  PokeW(#EMMC_I_HOST+$2C,$FA05)
+  clock=PeekW(#EMMC_I_HOST+$2C) & $FFFF
+  PokeL(#EMMC_I_HOST+$34,$08FF8033)
+  PokeL(#EMMC_I_HOST+$38,0)
+  EmmcITx(73)
+  EmmcITx(48)
+  EmmcITx(32)
+  EmmcIWord(power)
+  EmmcIWord(clock)
+  EmmcIWord(PeekL(#EMMC_I_HOST+$24) & $FFFFFFFF)
+  EmmcINewline()
+  If EmmcICmd(0,0,0)=0
+    EmmcITx(73)
+    EmmcITx(49)
+    EmmcITx(32)
+    EmmcIWord(emmc_i_lastInterrupt)
+    EmmcIWord(emmc_i_lastResponse)
+    EmmcINewline()
+    ProcedureReturn $454D3004
+  EndIf
+  EmmcITx(73)
+  EmmcITx(49)
+  EmmcITx(32)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcIWord(emmc_i_lastResponse)
+  EmmcINewline()
+  ocr=0
+  For attempt=0 To 100
+    PokeL(#EMMC_I_WDT_CRR,$76)
+    If EmmcICmd(1,$40FF8080,2)=0
+      EmmcITx(73)
+      EmmcITx(50)
+      EmmcITx(32)
+      EmmcIWord(emmc_i_lastInterrupt)
+      EmmcIWord(emmc_i_lastResponse)
+      EmmcINewline()
+      ProcedureReturn $454D3005
+    EndIf
+    ocr=emmc_i_lastResponse
+    If (ocr & $80000000)<>0
+      Break
+    EndIf
+    If RockTimerWaitUs(10000)=0
+      ProcedureReturn $454D3006
+    EndIf
+  Next
+  EmmcITx(73)
+  EmmcITx(50)
+  EmmcITx(32)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcIWord(ocr)
+  EmmcIWord(attempt)
+  EmmcINewline()
+  If (ocr & $80000000)=0
+    ProcedureReturn $454D3007
+  EndIf
+  If EmmcICmd(2,0,9)=0
+    ProcedureReturn $454D3008
+  EndIf
+  EmmcITx(73)
+  EmmcITx(51)
+  EmmcITx(32)
+  EmmcIWord(PeekL(#EMMC_I_HOST+$10))
+  EmmcIWord(PeekL(#EMMC_I_HOST+$14))
+  EmmcIWord(PeekL(#EMMC_I_HOST+$18))
+  EmmcIWord(PeekL(#EMMC_I_HOST+$1C))
+  EmmcINewline()
+  If EmmcICmd(3,$00010000,$1A)=0
+    ProcedureReturn $454D3009
+  EndIf
+  If EmmcICmd(9,$00010000,9)=0
+    ProcedureReturn $454D300A
+  EndIf
+  If EmmcICmd(7,$00010000,$1B)=0
+    ProcedureReturn $454D300B
+  EndIf
+  *data=@emmc_i_data[0]
+  If EmmcIReadData(8,0,*data)=0
+    EmmcITx(73)
+    EmmcITx(52)
+    EmmcITx(32)
+    EmmcIWord(emmc_i_lastInterrupt)
+    EmmcIWord(emmc_i_lastResponse)
+    EmmcINewline()
+    ProcedureReturn $454D300D
+  EndIf
+  sectorCount=(PeekA(*data+212) & 255) | ((PeekA(*data+213) & 255)<<8) | ((PeekA(*data+214) & 255)<<16) | ((PeekA(*data+215) & 255)<<24)
+  EmmcITx(73)
+  EmmcITx(52)
+  EmmcITx(32)
+  EmmcIWord(PeekA(*data+192) & 255)
+  EmmcIWord(PeekA(*data+179) & 255)
+  EmmcIWord(PeekA(*data+160) & 255)
+  EmmcIWord(PeekA(*data+226) & 255)
+  EmmcIWord(sectorCount)
+  EmmcIWord(PeekL(*data))
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcINewline()
+  If EmmcIReadData(17,0,*data)=0
+    EmmcITx(73)
+    EmmcITx(53)
+    EmmcITx(32)
+    EmmcIWord(emmc_i_lastInterrupt)
+    EmmcIWord(emmc_i_lastResponse)
+    EmmcINewline()
+    ProcedureReturn $454D300E
+  EndIf
+  EmmcITx(73)
+  EmmcITx(53)
+  EmmcITx(32)
+  EmmcIWord(PeekL(*data))
+  EmmcIWord(PeekL(*data+4))
+  EmmcIWord(PeekL(*data+8))
+  EmmcIWord(PeekL(*data+12))
+  EmmcIWord(PeekW(*data+510) & $FFFF)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcINewline()
+  If EmmcIReadData(17,1,*data)=0
+    ProcedureReturn $454D300F
+  EndIf
+  EmmcITx(73)
+  EmmcITx(54)
+  EmmcITx(32)
+  EmmcIWord(PeekL(*data))
+  EmmcIWord(PeekL(*data+4))
+  EmmcIWord(PeekL(*data+72))
+  EmmcIWord(PeekL(*data+80))
+  EmmcINewline()
+  If EmmcIReadData(17,2,*data)=0
+    ProcedureReturn $454D3010
+  EndIf
+  EmmcITx(73)
+  EmmcITx(55)
+  EmmcITx(32)
+  EmmcIWord(PeekL(*data))
+  EmmcIWord(PeekL(*data+32))
+  EmmcIWord(PeekL(*data+40))
+  EmmcIWord(PeekL(*data+128))
+  EmmcINewline()
+  If EmmcIReadData(17,32768,@emmc_i_original[0])=0
+    ProcedureReturn $454D3011
+  EndIf
+  EmmcITx(73)
+  EmmcITx(56)
+  EmmcITx(32)
+  EmmcIWord(PeekL(@emmc_i_original[0]))
+  EmmcIWord(PeekL(@emmc_i_original[0]+4))
+  EmmcIWord(PeekW(@emmc_i_original[0]+510) & $FFFF)
+  EmmcINewline()
+  For word=0 To 127
+    If PeekL(@emmc_i_original[0]+word*4)<>0
+      ProcedureReturn $454D3012
+    EndIf
+    PokeL(*data+word*4,$A55A0000 | word)
+  Next
+  originalCrc=EmmcICrc(@emmc_i_original[0])
+  expectedCrc=EmmcICrc(*data)
+  For word=0 To 127
+    If (PeekL(*data+word*4) & $FFFFFFFF)<>(($A55A0000 | word) & $FFFFFFFF)
+      ProcedureReturn $454D3015
+    EndIf
+  Next
+  EmmcITx(87)
+  EmmcITx(48)
+  EmmcITx(32)
+  EmmcIWord(originalCrc)
+  EmmcIWord(expectedCrc)
+  EmmcIWord(PeekL(*data) & $FFFFFFFF)
+  EmmcINewline()
+  ; SDHCI 200 MHz parent / (2*4) = 25 MHz.
+  PokeW(#EMMC_I_HOST+$2C,$0401)
+  If EmmcIWait8($2C,2,2,10000)=0
+    PokeW(#EMMC_I_HOST+$2C,$FA01)
+    EmmcIWait8($2C,2,2,10000)
+    PokeW(#EMMC_I_HOST+$2C,$FA05)
+    ProcedureReturn $454D3016
+  EndIf
+  PokeW(#EMMC_I_HOST+$2C,$0405)
+  ; From here onward, every path attempts to restore the saved sector.
+  testWrite=EmmcIWriteData(32768,*data)
+  EmmcITx(87)
+  EmmcITx(49)
+  EmmcITx(32)
+  EmmcIWord(testWrite)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcINewline()
+  If testWrite<>0
+    testRead=EmmcIReadData(17,32768,*data)
+    If testRead<>0
+      readCrc=EmmcICrc(*data)
+      testMatch=1
+      For word=0 To 127
+        If (PeekL(*data+word*4) & $FFFFFFFF)<>(($A55A0000 | word) & $FFFFFFFF)
+          testMatch=0
+          mismatchIndex=word
+          mismatchActual=PeekL(*data+word*4) & $FFFFFFFF
+          Break
+        EndIf
+      Next
+    EndIf
+  EndIf
+  EmmcITx(87)
+  EmmcITx(50)
+  EmmcITx(32)
+  EmmcIWord(testRead)
+  EmmcIWord(testMatch)
+  EmmcIWord(readCrc)
+  EmmcIWord(mismatchIndex)
+  EmmcIWord(mismatchActual)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcINewline()
+  If testWrite=0 Or testRead=0
+    PokeA(#EMMC_I_HOST+$2F,6)
+    EmmcIWait8($2F,6,0,10000)
+  EndIf
+  restoreWrite=EmmcIWriteData(32768,@emmc_i_original[0])
+  If restoreWrite<>0
+    restoreRead=EmmcIReadData(17,32768,*data)
+    If restoreRead<>0
+      restoredCrc=EmmcICrc(*data)
+      restoreMatch=1
+      For word=0 To 127
+        If (PeekL(*data+word*4) & $FFFFFFFF)<>(PeekL(@emmc_i_original[0]+word*4) & $FFFFFFFF)
+          restoreMatch=0
+          Break
+        EndIf
+      Next
+    EndIf
+  EndIf
+  EmmcITx(87)
+  EmmcITx(51)
+  EmmcITx(32)
+  EmmcIWord(restoreWrite)
+  EmmcIWord(restoreRead)
+  EmmcIWord(restoreMatch)
+  EmmcIWord(restoredCrc)
+  EmmcIWord(emmc_i_lastInterrupt)
+  EmmcINewline()
+  PokeA(#EMMC_I_HOST+$2F,6)
+  If EmmcIWait8($2F,6,0,10000)<>0
+    PokeW(#EMMC_I_HOST+$2C,$FA01)
+    If EmmcIWait8($2C,2,2,10000)<>0
+      PokeW(#EMMC_I_HOST+$2C,$FA05)
+      clockRestored=1
+      slowRead=EmmcIReadData(17,32768,*data)
+      If slowRead<>0
+        slowCrc=EmmcICrc(*data)
+      EndIf
+    EndIf
+  EndIf
+  EmmcITx(87)
+  EmmcITx(52)
+  EmmcITx(32)
+  EmmcIWord(clockRestored)
+  EmmcIWord(slowRead)
+  EmmcIWord(slowCrc)
+  EmmcIWord(PeekW(#EMMC_I_HOST+$2C) & $FFFF)
+  EmmcINewline()
+  If clockRestored=0 Or slowRead=0 Or slowCrc<>originalCrc
+    ProcedureReturn $454D3017
+  EndIf
+  If restoreWrite=0 Or restoreRead=0 Or restoreMatch=0
+    ProcedureReturn $454D3013
+  EndIf
+  If testWrite=0 Or testRead=0 Or testMatch=0
+    ProcedureReturn $454D3014
+  EndIf
+  ProcedureReturn $454D3000
+EndProcedure

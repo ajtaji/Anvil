@@ -202,6 +202,7 @@ Procedure RockDmaPl330CaptureActivity()
   rock_dma_pl330_ftc0=RockDmaPl330Read(#ROCK_DMA_PL330_FTC0)
   rock_dma_pl330_inten=RockDmaPl330Read(#ROCK_DMA_PL330_INTEN)
   rock_dma_pl330_es=RockDmaPl330Read(#ROCK_DMA_PL330_ES)
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   rock_dma_pl330_intstatus=RockDmaPl330Read(#ROCK_DMA_PL330_INTSTATUS)
   rock_dma_pl330_cpc0=RockDmaPl330Read(#ROCK_DMA_PL330_CPC0)
   rock_dma_pl330_sa0=RockDmaPl330Read(#ROCK_DMA_PL330_SA0)
@@ -291,10 +292,13 @@ Procedure.i RockDmaPl330BuildProgram(source.i,destination.i,words.i)
   If words>256 And (words & 255)<>0 : ProcedureReturn 0 : EndIf
   For clear=0 To #ROCK_DMA_PL330_MAX_PROGRAM-1
     PokeA(rock_dma_pl330_program_address+clear,0)
+    If clear = 47 And rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   Next
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   offset=RockDmaPl330EmitMov(0,#ROCK_DMA_PL330_MOV_CCR,#ROCK_DMA_PL330_CCR_SECURE_COPY)
   offset=RockDmaPl330EmitMov(offset,#ROCK_DMA_PL330_MOV_SAR,source)
   offset=RockDmaPl330EmitMov(offset,#ROCK_DMA_PL330_MOV_DAR,destination)
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   If offset<0 : ProcedureReturn 0 : EndIf
   If words<=256
     offset=RockDmaPl330EmitLp(offset,1,words)
@@ -315,6 +319,7 @@ Procedure.i RockDmaPl330BuildProgram(source.i,destination.i,words.i)
     If offset<0 : ProcedureReturn 0 : EndIf
     offset=RockDmaPl330EmitLpEnd(offset,0,offset-loopStart)
   EndIf
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   If offset<0 : ProcedureReturn 0 : EndIf
   offset=RockDmaPl330EmitByte(offset,#ROCK_DMA_PL330_CMD_SEV)
   offset=RockDmaPl330EmitByte(offset,0)
@@ -322,6 +327,7 @@ Procedure.i RockDmaPl330BuildProgram(source.i,destination.i,words.i)
   If offset<0 : ProcedureReturn 0 : EndIf
   rock_dma_pl330_program_bytes=offset
   RockDmaPl330Barrier()
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -336,7 +342,9 @@ Procedure.i RockDmaPl330DebugExecute(opcode.i,argument.i,asManager.i)
   start=RockTimerTicks()
   timeout=(rock_timer_frequency/1000000)*#ROCK_DMA_PL330_DEBUG_TIMEOUT_US
   If timeout<1 : timeout=1 : EndIf
+  rock_uart_rx_context = 11
   Repeat
+    If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
     If (RockDmaPl330Read(#ROCK_DMA_PL330_DBGSTATUS) & #ROCK_DMA_PL330_DBG_BUSY)=0 : Break : EndIf
     now=RockTimerTicks()
     If now<start Or now-start>=timeout
@@ -349,6 +357,8 @@ Procedure.i RockDmaPl330DebugExecute(opcode.i,argument.i,asManager.i)
   RockDmaPl330Barrier()
   RockDmaPl330Write(#ROCK_DMA_PL330_DBGCMD,0)
   RockDmaPl330Barrier()
+  rock_uart_rx_context = 12
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -363,6 +373,7 @@ Procedure.i RockDmaPl330Kill()
   timeout=(rock_timer_frequency/1000000)*#ROCK_DMA_PL330_DEBUG_TIMEOUT_US
   If timeout<1 : timeout=1 : EndIf
   Repeat
+    If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
     RockDmaPl330CaptureActivity()
     If (rock_dma_pl330_cs0 & $F)=#ROCK_DMA_PL330_STATE_STOP : ProcedureReturn 1 : EndIf
     now=RockTimerTicks()
@@ -380,10 +391,13 @@ Procedure.i RockDmaPl330RunProgram()
   Protected managerState.i
   Protected goArgument.i
   rock_dma_pl330_fault_valid=0
+  rock_uart_rx_context = 6
   If rock_dma_pl330_program_address<=0 Or rock_dma_pl330_program_address>$FFFFFFFF
     rock_dma_pl330_error=#ROCK_DMA_PL330_ERROR_PROGRAM : ProcedureReturn 0
   EndIf
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   RockDmaPl330CaptureActivity()
+  rock_uart_rx_context = 7
   If (rock_dma_pl330_cs0 & $F)<>#ROCK_DMA_PL330_STATE_STOP Or rock_dma_pl330_fsc<>0 Or rock_dma_pl330_ftc0<>0
     rock_dma_pl330_error=#ROCK_DMA_PL330_ERROR_BUSY : ProcedureReturn 0
   EndIf
@@ -392,10 +406,12 @@ Procedure.i RockDmaPl330RunProgram()
   RockDmaPl330Write(#ROCK_DMA_PL330_INTCLR,#ROCK_DMA_PL330_EVENT0)
   RockDmaPl330Write(#ROCK_DMA_PL330_INTEN,rock_dma_pl330_inten | #ROCK_DMA_PL330_EVENT0)
   RockDmaPl330Barrier()
+  If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
   ; DMAGO is six bytes. DBGINST0 carries secure GO+channel 0; DBGINST1 carries
   ; the physical microcode address. Bit 1 is deliberately clear (manager-secure).
   goArgument=rock_dma_pl330_program_address & $FFFFFFFF
   RockWatchdogPet()
+  rock_uart_rx_context = 8
   If RockDmaPl330DebugExecute(#ROCK_DMA_PL330_CMD_GO,goArgument,1)=0
     RockDmaPl330Write(#ROCK_DMA_PL330_INTEN,rock_dma_pl330_inten & $FFFFFFFE)
     ProcedureReturn 0
@@ -404,6 +420,8 @@ Procedure.i RockDmaPl330RunProgram()
   timeout=(rock_timer_frequency/1000000)*#ROCK_DMA_PL330_JOB_TIMEOUT_US
   If timeout<1 : timeout=1 : EndIf
   Repeat
+    rock_uart_rx_context = 9
+    If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
     RockDmaPl330CaptureActivity()
     state=rock_dma_pl330_cs0 & $F
     managerState=rock_dma_pl330_ds & $F
@@ -416,6 +434,8 @@ Procedure.i RockDmaPl330RunProgram()
       RockDmaPl330Write(#ROCK_DMA_PL330_INTEN,rock_dma_pl330_inten & $FFFFFFFE)
       RockDmaPl330Barrier()
       RockWatchdogPet()
+      rock_uart_rx_context = 10
+      If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
       ProcedureReturn 1
     EndIf
     now=RockTimerTicks()
@@ -558,6 +578,8 @@ Procedure.i RockDmaPl330Transfer(destination.i,source.i,bytes.i)
     chunkRemaining=remaining
     If chunkRemaining>#ROCK_DMA_PL330_MAX_CHUNK : chunkRemaining=#ROCK_DMA_PL330_MAX_CHUNK : EndIf
     While chunkRemaining>0
+      rock_uart_rx_context = 1
+      If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
       words=chunkRemaining/4
       If words>65536
         batchWords=65536
@@ -567,10 +589,15 @@ Procedure.i RockDmaPl330Transfer(destination.i,source.i,bytes.i)
         batchWords=words
       EndIf
       batchBytes=batchWords*4
+      rock_uart_rx_context = 2
       If RockDmaPl330BuildProgram(source,destination,batchWords)=0
         rock_dma_pl330_error=#ROCK_DMA_PL330_ERROR_PROGRAM : ProcedureReturn 0
       EndIf
+      rock_uart_rx_context = 3
+      If rock_uart_ready <> 0 : RockUartPump(64) : EndIf
+      rock_uart_rx_context = 4
       If RockDmaPl330RunProgram()=0 : ProcedureReturn 0 : EndIf
+      rock_uart_rx_context = 5
       destination=destination+batchBytes
       source=source+batchBytes
       remaining=remaining-batchBytes

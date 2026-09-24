@@ -1,0 +1,354 @@
+; 512 MiB FAT32 volume in the RK3399 eMMC user area. Returning payload.
+; Never selects or writes boot0, boot1, RPMB, or SPI.
+; The MBR is published only after every volume-metadata sector verifies.
+; pmf:target rockpi4c
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+; The clock library also has display-only entry points. This payload never
+; calls them; satisfy its link interface without pulling in display state.
+Global rock_mode_pixel_hz.i
+Global rock_mode_valid.i
+Global rock_mode_vpll_actual_hz.i
+Global rock_mode_vpll_dsmpd.i
+Global rock_mode_vpll_fb.i
+Global rock_mode_vpll_frac.i
+Global rock_mode_vpll_post1.i
+Global rock_mode_vpll_post2.i
+Global rock_mode_vpll_ref.i
+Procedure.i RockModeVpllPlan(pixelHz.i)
+  ProcedureReturn 0
+EndProcedure
+XIncludeFile "RockPi4C/Lib/cru.pbi"
+XIncludeFile "RockPi4C/Lib/emmc.pbi"
+
+#EF_START = 32768
+#EF_TOTAL = 1048576
+#EF_FAT = 1022
+#EF_PREFIX = 2084
+#EF_CARD_SECTORS = $0747C000
+#EF_HOST = $FE330000
+#EF_WDT_RESTART = $FF84800C
+
+Global Dim ef_expected.a[511]
+Global Dim ef_actual.a[511]
+
+Procedure EfZero(*buffer)
+  Protected index.i
+  For index=0 To 511
+    PokeA(*buffer+index,0)
+  Next
+EndProcedure
+
+Procedure EfText(*buffer,offset.i,*text,length.i)
+  Protected index.i
+  For index=0 To length-1
+    PokeA(*buffer+offset+index,PeekA(*text+index))
+  Next
+EndProcedure
+
+Procedure EfPut16(*buffer,offset.i,value.i)
+  PokeA(*buffer+offset,value & 255)
+  PokeA(*buffer+offset+1,(value >> 8) & 255)
+EndProcedure
+
+Procedure EfPut32(*buffer,offset.i,value.i)
+  PokeA(*buffer+offset,value & 255)
+  PokeA(*buffer+offset+1,(value >> 8) & 255)
+  PokeA(*buffer+offset+2,(value >> 16) & 255)
+  PokeA(*buffer+offset+3,(value >> 24) & 255)
+EndProcedure
+
+Procedure EfBoot(*buffer)
+  EfZero(*buffer)
+  PokeA(*buffer+0,$EB)
+  PokeA(*buffer+1,$58)
+  PokeA(*buffer+2,$90)
+  EfText(*buffer,3,"ANVIL   ",8)
+  EfPut16(*buffer,11,512)
+  PokeA(*buffer+13,8)
+  EfPut16(*buffer,14,32)
+  PokeA(*buffer+16,2)
+  PokeA(*buffer+21,$F8)
+  EfPut16(*buffer,24,63)
+  EfPut16(*buffer,26,255)
+  EfPut32(*buffer,28,#EF_START)
+  EfPut32(*buffer,32,#EF_TOTAL)
+  EfPut32(*buffer,36,#EF_FAT)
+  EfPut32(*buffer,44,2)
+  EfPut16(*buffer,48,1)
+  EfPut16(*buffer,50,6)
+  PokeA(*buffer+64,$80)
+  PokeA(*buffer+66,$29)
+  EfPut32(*buffer,67,$20260923)
+  EfText(*buffer,71,"ANVIL EMMC ",11)
+  EfText(*buffer,82,"FAT32   ",8)
+  EfPut16(*buffer,510,$AA55)
+EndProcedure
+
+Procedure EfInfo(*buffer)
+  EfZero(*buffer)
+  EfPut32(*buffer,0,$41615252)
+  EfPut32(*buffer,484,$61417272)
+  EfPut32(*buffer,488,130811)
+  EfPut32(*buffer,492,3)
+  EfPut32(*buffer,508,$AA550000)
+EndProcedure
+
+Procedure EfMbr(*buffer)
+  EfZero(*buffer)
+  EfPut32(*buffer,440,$20260923)
+  PokeA(*buffer+447,$FE)
+  PokeA(*buffer+448,$FF)
+  PokeA(*buffer+449,$FF)
+  PokeA(*buffer+450,$0C)
+  PokeA(*buffer+451,$FE)
+  PokeA(*buffer+452,$FF)
+  PokeA(*buffer+453,$FF)
+  EfPut32(*buffer,454,#EF_START)
+  EfPut32(*buffer,458,#EF_TOTAL)
+  EfPut16(*buffer,510,$AA55)
+EndProcedure
+
+Procedure EfSector(offset.i,*buffer)
+  EfZero(*buffer)
+  Select offset
+    Case 0
+      EfBoot(*buffer)
+    Case 6
+      EfBoot(*buffer)
+    Case 1
+      EfInfo(*buffer)
+    Case 7
+      EfInfo(*buffer)
+    Case 32
+      EfPut32(*buffer,0,$0FFFFFF8)
+      EfPut32(*buffer,4,$0FFFFFFF)
+      EfPut32(*buffer,8,$0FFFFFFF)
+    Case 1054
+      EfPut32(*buffer,0,$0FFFFFF8)
+      EfPut32(*buffer,4,$0FFFFFFF)
+      EfPut32(*buffer,8,$0FFFFFFF)
+  EndSelect
+EndProcedure
+
+Procedure.i EfSame(*left,*right)
+  Protected index.i
+  For index=0 To 511
+    If (PeekA(*left+index) & 255)<>(PeekA(*right+index) & 255)
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EfIsZero(*buffer)
+  Protected index.i
+  For index=0 To 511
+    If (PeekA(*buffer+index) & 255)<>0
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i EfCrc(*buffer)
+  Protected crc.i=$FFFFFFFF
+  Protected index.i
+  Protected bit.i
+  For index=0 To 511
+    crc=crc ! (PeekA(*buffer+index) & 255)
+    For bit=0 To 7
+      If (crc & 1)<>0
+        crc=(crc >> 1) ! $EDB88320
+      Else
+        crc=crc >> 1
+      EndIf
+    Next
+    crc=crc & $FFFFFFFF
+  Next
+  ProcedureReturn (crc ! $FFFFFFFF) & $FFFFFFFF
+EndProcedure
+
+Procedure.i EfClock(divider.i)
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  PokeW(#EF_HOST+$2C,(divider << 8) | 1)
+  start=RockTimerTicks()
+  For attempt=0 To 1000000
+    If (PeekA(#EF_HOST+$2C) & 2)<>0
+      PokeW(#EF_HOST+$2C,(divider << 8) | 5)
+      ProcedureReturn 1
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start>=240000
+      Break
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i EfResetCmdData()
+  Protected start.i
+  Protected now.i
+  Protected attempt.i
+  PokeA(#EF_HOST+$2F,6)
+  start=RockTimerTicks()
+  For attempt=0 To 1000000
+    If (PeekA(#EF_HOST+$2F) & 6)=0
+      ProcedureReturn 1
+    EndIf
+    now=RockTimerTicks()
+    If now<start Or now-start>=240000
+      Break
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure EfHex(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      RockUartByte(48+digit)
+    Else
+      RockUartByte(55+digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure EfStatus(*name,value.i)
+  RockUartText(*name)
+  RockUartByte(32)
+  EfHex(value)
+  RockUartByte(13)
+  RockUartByte(10)
+EndProcedure
+
+Procedure.i Main()
+  Protected offset.i
+  Protected blankLba.i
+  Protected *want=@ef_expected[0]
+  Protected *got=@ef_actual[0]
+  Protected failure.i
+  If RockUartAdopt()=0
+    ProcedureReturn $454D4011
+  EndIf
+  If RockEmmcInit()=0
+    ProcedureReturn $454D4001
+  EndIf
+  If RockEmmcBlockCount()<>#EF_CARD_SECTORS Or rock_emmc_accessPartition<>0
+    ProcedureReturn $454D4002
+  EndIf
+  ; Refuse a nonblank partition table. At the volume start, accept either
+  ; blank media or this exact boot sector so an interrupted pre-MBR pass
+  ; can be repeated safely.
+  For offset=0 To 3
+    Select offset
+      Case 0 : blankLba=0
+      Case 1 : blankLba=1
+      Case 2 : blankLba=2
+      Case 3 : blankLba=#EF_START
+    EndSelect
+    If RockEmmcReadBlocks(blankLba,1,*got)=0
+      ProcedureReturn $454D4003
+    EndIf
+    If offset=3
+      EfSector(0,*want)
+      If EfIsZero(*got)=0 And EfSame(*want,*got)=0
+        ProcedureReturn $454D4003
+      EndIf
+    ElseIf EfIsZero(*got)=0
+      ProcedureReturn $454D4003
+    EndIf
+  Next
+  EfMbr(*want)
+  If EfCrc(*want)<>$7CB82187
+    ProcedureReturn $454D4004
+  EndIf
+  EfSector(0,*want)
+  If EfCrc(*want)<>$6ADDB191
+    ProcedureReturn $454D4005
+  EndIf
+  EfSector(1,*want)
+  If EfCrc(*want)<>$D35B1B3F
+    ProcedureReturn $454D4006
+  EndIf
+  EfSector(32,*want)
+  If EfCrc(*want)<>$8B1781C4
+    ProcedureReturn $454D4007
+  EndIf
+  If RockEmmcArmWrites()=0
+    ProcedureReturn $454D4008
+  EndIf
+  If EfClock(4)=0
+    RockEmmcDisarmWrites()
+    EfResetCmdData()
+    EfClock(250)
+    ProcedureReturn $454D4009
+  EndIf
+  ; The MBR remains blank throughout both full metadata passes.
+  For offset=0 To #EF_PREFIX-1
+    PokeL(#EF_WDT_RESTART,$76)
+    EfSector(offset,*want)
+    If RockEmmcWriteBlocks(#EF_START+offset,1,*want)=0
+      failure=$454D400A
+      Break
+    EndIf
+    If (offset & 255)=255
+      EfStatus("FAT WRITE",offset)
+    EndIf
+  Next
+  If failure=0
+    If RockEmmcFlush()=0
+      failure=$454D400B
+    EndIf
+  EndIf
+  If failure=0
+    For offset=0 To #EF_PREFIX-1
+      PokeL(#EF_WDT_RESTART,$76)
+      EfSector(offset,*want)
+      If RockEmmcReadBlocks(#EF_START+offset,1,*got)=0 Or EfSame(*want,*got)=0
+        failure=$454D400C
+        Break
+      EndIf
+      If (offset & 255)=255
+        EfStatus("FAT VERIFY",offset)
+      EndIf
+    Next
+  EndIf
+  If failure=0
+    EfMbr(*want)
+    If RockEmmcWriteBlocks(0,1,*want)=0
+      failure=$454D400D
+    ElseIf RockEmmcReadBlocks(0,1,*got)=0 Or EfSame(*want,*got)=0
+      failure=$454D400E
+    EndIf
+    If failure<>0
+      ; If MBR publication failed, hide the partial volume again.
+      If rock_emmc_writeEnabled=0
+        RockEmmcArmWrites()
+      EndIf
+      EfZero(*want)
+      If RockEmmcWriteBlocks(0,1,*want)=0 Or RockEmmcReadBlocks(0,1,*got)=0 Or EfIsZero(*got)=0
+        failure=$454D400F
+      EndIf
+    EndIf
+  EndIf
+  RockEmmcDisarmWrites()
+  If EfResetCmdData()=0
+    failure=$454D4010
+  EndIf
+  If EfClock(250)=0
+    failure=$454D4010
+  EndIf
+  If failure<>0
+    EfStatus("FAT ERROR",failure)
+    ProcedureReturn failure
+  EndIf
+  EfStatus("FAT READY",$454D4000)
+  ProcedureReturn $454D4000
+EndProcedure

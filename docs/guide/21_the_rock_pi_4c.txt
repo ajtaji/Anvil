@@ -1,0 +1,66 @@
+@CHAPTER Anvil on the ROCK Pi 4C
+
+@INTRO The original RK3399 ROCK Pi 4C boots one Anvil component from SD at EL3. Anvil owns its filesystem, HDMI console, and bounded payload experiments.
+
+@SECTION Boot and recovery
+
+The Rockchip DDR/miniloader loads one Anvil component at `$00040000`. That
+component contains the EL3 entry prefix, full runtime, and board device tree.
+The entry checks its exception level, device-tree handoff, stack, interrupt
+mask, MMU and cache state, UART baud rate, and timer. The source root is
+`RockPi4C/Board/board.rockpi4c`.
+
+The recovery UART runs at 1,500,000 baud. A returning payload uses a stage
+address reported by the running monitor; the host compiles for that address
+and checks that its BSS and stack do not collide with Anvil. The hardware
+deadman is armed and verified before entry. The payload returns to Anvil's
+EL3 stack and exception vectors. Use a bounded payload to prove a hardware
+change before making and installing another full monitor build.
+
+The direct-SD board package contains `anvil.bin`, the extracted component,
+and `trust-anvil.img`, two checked copies for the fixed SD trust range. It is
+not a blank-card image. From a running direct-SD Anvil, `trustupdate` checks
+the image, writes the backup and primary copies, and reads both back. Reboot
+is a separate command after verification.
+
+@SECTION Files on SD and eMMC
+
+Build 147 mounts the SD card's exFAT partition. It can also select the
+eMMC user area's 512 MiB FAT32 data partition at LBA 32768. The filesystem
+parser is shared Anvil code; the Rock Pi supplies separate SD and eMMC
+block-device adapters. The eMMC boot partitions, RPMB, and SPI are not
+written by these commands.
+
+Use `sd` or `emmc` to select a medium and `fs` to inspect the mounted
+volume. `ls`, `stat`, `cat`, `load`, and `get` read files. `put`, `receive`
+followed by `save`, `mkdir`, `mv`, `rm`, and `rmdir` change files. Uploads
+use bounded acknowledged windows and a checked staging area. The writer
+arms for one file operation and disarms afterward. On the original 4C,
+build 145 passed creation, transfer, flush, remount, readback, rename,
+and removal on both volumes. Build 147 mounted both volumes again.
+
+@SECTION Display and graphics
+
+HDMI runs at 1920×1080/60 through the RK3399 VOPB. The VOPB output bus
+uses its 30-bit mode even when the HDMI input is RGB888. Anvil's shared
+TrueType rasterizer prepares a glyph atlas. The board composes terminal
+rows privately and RGA2 publishes them to the live framebuffer. PL330
+handles framebuffer transfers and the bounded fallback. Build 145's
+resident counters showed 46 RGA row jobs, no RGA failures, and zero CPU
+text-copy bytes. A cropped screen capture showed sharp text and a clean
+shaded logo.
+
+Build 147 also passed two live CPU-status update stress runs while receiving
+400/400 bytes at 1.5 Mbaud with no UART error or discarded command bytes.
+The UART is pumped during bounded CPU fallback spans as well as DMA waits.
+The newer build's bounded pixel capture did not complete across the serial
+ACK/retry transport, so the last accepted visual crop is from build 145.
+
+A returning payload has rendered a guarded 48×48 private surface with the
+Mali-T860, copied it through RGA2 to a bounded live scanout area, checked
+pixels and guards, and restored the saved screen region exactly. The
+production console does not use Mali. This Midgard GPU has no current
+hardware Vulkan driver. MiniDP bring-up remains separate work.
+
+See `RockPi4C/README.md`, `RockPi4C/EMMC.md`, and
+`RockPi4C/RENDERING.md` for the board contract and exact proof limits.

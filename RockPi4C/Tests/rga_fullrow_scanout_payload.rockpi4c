@@ -1,0 +1,214 @@
+; Full-width RGA2 row proof on live scanout with saved-region restoration.
+; The runner reserves source and backup inside the payload stage after
+; checking the live stage, image extent, and stack gap.
+; pmf:target rockpi4c
+
+#RGA_BASE = $FF680000
+#RGA_WDT = $FF84800C
+#RGA_UART_THR = $FF1A0000
+#RGA_UART_LSR = $FF1A0014
+#RGA_VOPB = $FF900000
+#RGA_WIDTH = 1920
+#RGA_HEIGHT = 40
+#RGA_BYTES = #RGA_WIDTH * #RGA_HEIGHT * 4
+#RGA_SAVE_BYTES = #RGA_WIDTH * (#RGA_HEIGHT + 2) * 4
+#RGA_SRC = @@SOURCE@@
+#RGA_BACKUP = @@BACKUP@@
+
+Global Dim rga_full_src_pages.a[432]
+Global Dim rga_full_dst_pages.a[432]
+Global Dim rga_full_command.a[256]
+
+Procedure.i RgaFullTx(value.i)
+  Protected spin.i
+  For spin=0 To 999999
+    If (PeekL(#RGA_UART_LSR) & $20)<>0
+      PokeL(#RGA_UART_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure RgaFullHex(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10 : RgaFullTx(48+digit) : Else : RgaFullTx(55+digit) : EndIf
+  Next
+  RgaFullTx(32)
+EndProcedure
+
+Procedure.i RgaFullMap(table.i,buffer.i,bytes.i)
+  Protected first.i
+  Protected offset.i
+  Protected count.i
+  Protected index.i
+  first=buffer & ~$FFF
+  offset=buffer-first
+  count=(offset+bytes+4095)/4096
+  If count<1 Or count>104 : ProcedureReturn -1 : EndIf
+  For index=0 To count-1
+    PokeL(table+index*4,first+index*4096)
+  Next
+  ProcedureReturn offset
+EndProcedure
+
+Procedure.i Main()
+  Protected source.i=#RGA_SRC
+  Protected backup.i=#RGA_BACKUP
+  Protected destination.i
+  Protected framebuffer.i
+  Protected frameBytes.i
+  Protected width.i
+  Protected height.i
+  Protected pitch.i
+  Protected active.i
+  Protected control.i
+  Protected mode.i
+  Protected stride.i
+  Protected saveOrigin.i
+  Protected sourceTable.i
+  Protected destinationTable.i
+  Protected command.i
+  Protected sourceOffset.i
+  Protected destinationOffset.i
+  Protected index.i
+  Protected x.i
+  Protected y.i
+  Protected value.i
+  Protected expected.i
+  Protected interrupt.i
+  Protected poll.i
+  Protected bad.i
+  Protected first.i=$FFFFFFFF
+  Protected restoreBad.i
+  If (PeekL(#RGA_BASE+$28) & $FFFFFFFF)<>$03218218 : ProcedureReturn $52464610 : EndIf
+  control=PeekL(#RGA_VOPB+$30) & $FFFFFFFF
+  mode=PeekL(#RGA_VOPB+$10) & $FFFFFFFF
+  stride=PeekL(#RGA_VOPB+$3C) & $FFFFFFFF
+  framebuffer=PeekL(#RGA_VOPB+$40) & $FFFFFFFF
+  active=PeekL(#RGA_VOPB+$48) & $FFFFFFFF
+  width=(active & $1FFF)+1
+  height=((active >> 16) & $1FFF)+1
+  pitch=(stride & $3FFF)*4
+  frameBytes=pitch*height
+  If (control & 1)=0 Or (mode & 15)<>15 : ProcedureReturn $52464630 : EndIf
+  If width<>#RGA_WIDTH Or height<>1080 Or pitch<>#RGA_WIDTH*4 : ProcedureReturn $52464631 : EndIf
+  If framebuffer<$02000000 Or framebuffer+frameBytes>=$10000000 Or framebuffer+frameBytes<framebuffer
+    ProcedureReturn $52464632
+  EndIf
+  destination=framebuffer+(height-48)*pitch
+  saveOrigin=destination-pitch
+  If saveOrigin<framebuffer Or saveOrigin+#RGA_SAVE_BYTES>framebuffer+frameBytes
+    ProcedureReturn $52464633
+  EndIf
+  sourceTable=(@rga_full_src_pages[0]+15) & ~$F
+  destinationTable=(@rga_full_dst_pages[0]+15) & ~$F
+  command=(@rga_full_command[0]+15) & ~$F
+  If source<0 Or backup<0 Or destination<0 Or sourceTable<0 Or destinationTable<0 Or command<0
+    ProcedureReturn $52464611
+  EndIf
+  If source>$FFFFFFFF Or backup>$FFFFFFFF Or destination>$FFFFFFFF Or sourceTable>$FFFFFFFF Or destinationTable>$FFFFFFFF Or command>$FFFFFFFF
+    ProcedureReturn $52464612
+  EndIf
+  PokeL(source-4,$11223344)
+  PokeL(source+#RGA_BYTES,$55667788)
+  PokeL(backup-4,$AABBCCDD)
+  PokeL(backup+#RGA_SAVE_BYTES,$99AABBCC)
+  For y=0 To #RGA_HEIGHT-1
+    For x=0 To #RGA_WIDTH-1
+      index=y*#RGA_WIDTH+x
+      value=$FF000000 | ((x & 255) << 16) | ((y & 255) << 8) | ((x ! y) & 255)
+      PokeL(source+index*4,value)
+    Next
+    PokeL(#RGA_WDT,$76)
+  Next
+  For index=0 To (#RGA_SAVE_BYTES/4)-1
+    PokeL(backup+index*4,PeekL(saveOrigin+index*4))
+    If (index & $FFF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  sourceOffset=RgaFullMap(sourceTable,source,#RGA_BYTES)
+  destinationOffset=RgaFullMap(destinationTable,destination,#RGA_BYTES)
+  If sourceOffset<0 Or destinationOffset<0 : ProcedureReturn $52464613 : EndIf
+  For index=0 To 31 : PokeL(command+index*4,0) : Next
+  PokeL(command+$00,$40)
+  PokeL(command+$04,$10)
+  PokeL(command+$08,sourceOffset)
+  PokeL(command+$18,(#RGA_WIDTH << 16) | #RGA_WIDTH)
+  PokeL(command+$1C,((#RGA_HEIGHT-1) << 16) | (#RGA_WIDTH-1))
+  PokeL(command+$38,$10)
+  PokeL(command+$3C,destinationOffset)
+  PokeL(command+$48,#RGA_WIDTH)
+  PokeL(command+$4C,((#RGA_HEIGHT-1) << 16) | (#RGA_WIDTH-1))
+  PokeL(command+$6C,$777)
+  PokeL(command+$70,sourceTable >> 4)
+  PokeL(command+$74,destinationTable >> 4)
+  PokeL(command+$78,destinationTable >> 4)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#RGA_BASE+$08,command)
+  PokeL(#RGA_BASE+$00,0)
+  PokeL(#RGA_BASE+$00,$22)
+  PokeL(#RGA_BASE+$10,$600)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#RGA_BASE+$04,1)
+  interrupt=0
+  For poll=0 To 999999
+    interrupt=PeekL(#RGA_BASE+$10) & $FFFFFFFF
+    If (interrupt & 15)<>0 : Break : EndIf
+    If (poll & $FFF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  If (interrupt & 15)<>0 : PokeL(#RGA_BASE+$10,(interrupt & 15) << 4) : EndIf
+  If (interrupt & 15)=0
+    PokeL(#RGA_BASE+$00,0)
+    ASM
+      dsb sy
+    ENDASM
+  EndIf
+  bad=0
+  For y=0 To #RGA_HEIGHT-1
+    For x=0 To #RGA_WIDTH-1
+      index=y*#RGA_WIDTH+x
+      expected=$FF000000 | ((x & 255) << 16) | ((y & 255) << 8) | ((x ! y) & 255)
+      If (PeekL(source+index*4) & $FFFFFFFF)<>expected Or (PeekL(destination+index*4) & $FFFFFFFF)<>expected
+        If bad=0 : first=index : EndIf
+        bad=bad+1
+      EndIf
+    Next
+    PokeL(#RGA_WDT,$76)
+  Next
+  If (PeekL(source-4) & $FFFFFFFF)<>$11223344 : bad=bad+1 : EndIf
+  If (PeekL(source+#RGA_BYTES) & $FFFFFFFF)<>$55667788 : bad=bad+1 : EndIf
+  For x=0 To #RGA_WIDTH-1
+    If (PeekL(saveOrigin+x*4) & $FFFFFFFF)<>(PeekL(backup+x*4) & $FFFFFFFF) : bad=bad+1 : EndIf
+    If (PeekL(destination+#RGA_BYTES+x*4) & $FFFFFFFF)<>(PeekL(backup+#RGA_BYTES+#RGA_WIDTH*4+x*4) & $FFFFFFFF)
+      bad=bad+1
+    EndIf
+  Next
+  For index=0 To (#RGA_SAVE_BYTES/4)-1
+    PokeL(saveOrigin+index*4,PeekL(backup+index*4))
+    If (index & $FFF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  restoreBad=0
+  For index=0 To (#RGA_SAVE_BYTES/4)-1
+    If (PeekL(saveOrigin+index*4) & $FFFFFFFF)<>(PeekL(backup+index*4) & $FFFFFFFF)
+      restoreBad=restoreBad+1
+    EndIf
+    If (index & $FFF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  If (PeekL(backup-4) & $FFFFFFFF)<>$AABBCCDD : restoreBad=restoreBad+1 : EndIf
+  If (PeekL(backup+#RGA_SAVE_BYTES) & $FFFFFFFF)<>$99AABBCC : restoreBad=restoreBad+1 : EndIf
+  RgaFullTx(82) : RgaFullTx(70) : RgaFullTx(50) : RgaFullTx(32)
+  RgaFullHex(interrupt) : RgaFullHex(bad) : RgaFullHex(restoreBad)
+  RgaFullHex(first) : RgaFullHex(framebuffer) : RgaFullHex(destination)
+  RgaFullTx(13) : RgaFullTx(10)
+  If (interrupt & 4)=0 Or (interrupt & 3)<>0 Or bad<>0 Or restoreBad<>0
+    ProcedureReturn $52464721
+  EndIf
+  ProcedureReturn $52464700
+EndProcedure

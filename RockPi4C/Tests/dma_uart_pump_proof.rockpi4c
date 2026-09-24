@@ -1,0 +1,110 @@
+; Returning live UART receive during the edited production PL330 copy path.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+Procedure.i RockModeVpllPlan(pixelHz.i)
+  ProcedureReturn 0
+EndProcedure
+XIncludeFile "RockPi4C/Lib/cru.pbi"
+
+; Initialization is not called in this proof: Anvil already owns the live
+; PL330 and physical watchdog. These satisfy unused initialization references.
+Global rock_current_el.i
+Global rock_sctlr_el3.i
+Procedure.i RockSecurityReleaseDma()
+  ProcedureReturn 0
+EndProcedure
+Procedure RockWatchdogPet()
+EndProcedure
+XIncludeFile "RockPi4C/Lib/dma_pl330.pbi"
+
+#PROOF_SOURCE = $03D00000
+#PROOF_DEST = $03D20000
+#PROOF_PROGRAM = $03CF8000
+#PROOF_BYTES = 8192
+
+Procedure.i Main()
+  Protected index.i
+  Protected pattern.i
+  Protected start.i
+  Protected dmaTicks.i
+  Protected deadline.i
+  Protected count.i
+  Protected attempt.i
+  Protected pumped.i
+  Protected value.i
+  Protected error.i
+  Protected maxGap.i
+
+  If RockTimerInit() = 0 Or RockUartAdopt() = 0
+    ProcedureReturn $4450455200000001
+  EndIf
+  ; Reuse only the already-initialized, stopped resident channel. Refuse a
+  ; live or faulted PL330 rather than resetting a channel in use.
+  If (PeekL(#ROCK_DMA_PL330_BASE + #ROCK_DMA_PL330_CS0) & $F) <> 0 Or (PeekL(#ROCK_DMA_PL330_BASE + #ROCK_DMA_PL330_FSC) & $FFFFFFFF) <> 0 Or (PeekL(#ROCK_DMA_PL330_BASE + #ROCK_DMA_PL330_FTC0) & $FFFFFFFF) <> 0
+    ProcedureReturn $4450455200000002
+  EndIf
+  rock_dma_pl330_ready = 1
+  rock_dma_pl330_revision = 0
+  rock_dma_pl330_program_address = #PROOF_PROGRAM
+  rock_dma_pl330_inten = PeekL(#ROCK_DMA_PL330_BASE + #ROCK_DMA_PL330_INTEN) & $FFFFFFFF
+  For index = 0 To (#PROOF_BYTES / 4) - 1
+    pattern = ((index * $9E37) ! $12345678) & $FFFFFFFF
+    PokeL(#PROOF_SOURCE + index * 4, pattern)
+    PokeL(#PROOF_DEST + index * 4, 0)
+  Next
+  ASM
+    dsb sy
+  ENDASM
+  RockUartText("DMARDY") : RockUartByte(10)
+  deadline = RockTimerTicks() + 24000000 * 2
+  Repeat
+    pumped = RockUartPump(64)
+    If pumped < 0 : error = 3 : Break : EndIf
+    If pumped > 0 : Break : EndIf
+    If RockTimerTicks() >= deadline : error = 4 : Break : EndIf
+  ForEver
+  If error = 0
+    start = RockTimerTicks()
+    If RockDmaCopy(#PROOF_DEST, #PROOF_SOURCE, #PROOF_BYTES) = 0
+      error = 5
+    EndIf
+    dmaTicks = RockTimerTicks() - start
+  EndIf
+  If error = 0
+    While count < 400
+      pumped = RockUartPump(64)
+      If pumped < 0 : error = 6 : Break : EndIf
+      For attempt = 0 To 7
+        value = RockUartReceive()
+        If value = -1 : Break : EndIf
+        If value <> 120 : error = 7 : Break : EndIf
+        count = count + 1
+        If count > 400 : error = 8 : Break : EndIf
+      Next
+      If error <> 0 : Break : EndIf
+      If RockTimerTicks() >= deadline : error = 9 : Break : EndIf
+    Wend
+  EndIf
+  maxGap = rock_uart_rx_max_outside_ticks
+  If error = 0
+    For index = 0 To (#PROOF_BYTES / 4) - 1
+      pattern = ((index * $9E37) ! $12345678) & $FFFFFFFF
+      If (PeekL(#PROOF_DEST + index * 4) & $FFFFFFFF) <> pattern
+        error = 10
+        Break
+      EndIf
+    Next
+  EndIf
+  If rock_uart_error <> 0 : error = 11 : EndIf
+  If maxGap >= 10240 : error = 12 : EndIf
+  If dmaTicks <= 0 Or dmaTicks > 24000000 / 10 : error = 13 : EndIf
+  If error <> 0
+    ProcedureReturn $4450455200000000 | ((maxGap & $FFFF) << 16) | ((rock_uart_rx_max_context & $FF) << 8) | error
+  EndIf
+  ProcedureReturn $4450000000000000 | ((maxGap & $FFFF) << 32) | (((dmaTicks / 24) & $FFFF) << 16) | count
+EndProcedure

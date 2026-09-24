@@ -1,0 +1,34 @@
+; Read-only EL3 display status; returns behind Anvil's armed deadman.
+; pmf:target rockpi4c
+
+#PROBE_DISPLAY_READY = 44835912
+#PROBE_SCREEN_READY = 41943168
+#PROBE_FONT_READY = 43793656
+#PROBE_SCREEN_FAULT = 62388040
+#PROBE_DISPLAY_ERROR = 64099152
+#PROBE_WIDTH = 62388016
+#PROBE_HEIGHT = 68296464
+#PROBE_PITCH = 68779904
+#PROBE_VOPB_WIN0 = $FF900030
+#PROBE_VOPB_MODE = $FF900010
+#PROBE_VOPB_MMU_FAULT = $FF903F0C
+
+Global live_result.i
+
+Procedure.i Main()
+  Protected width.i
+  Protected height.i
+  If PeekI(#PROBE_DISPLAY_READY)=0 : ProcedureReturn $4844455200000001 : EndIf
+  If PeekI(#PROBE_SCREEN_READY)=0 : ProcedureReturn $4844455200000002 : EndIf
+  If PeekI(#PROBE_FONT_READY)=0 : ProcedureReturn $4844455200000003 : EndIf
+  If PeekI(#PROBE_SCREEN_FAULT)<>0 : ProcedureReturn $4844455200000004 : EndIf
+  If PeekI(#PROBE_DISPLAY_ERROR)<>0 : ProcedureReturn $4844455200000005 : EndIf
+  width=PeekI(#PROBE_WIDTH)
+  height=PeekI(#PROBE_HEIGHT)
+  If width<>1920 Or height<>1080 Or PeekI(#PROBE_PITCH)<>7680 : ProcedureReturn $4844455200000006 : EndIf
+  If (PeekL(#PROBE_VOPB_WIN0) & 1)=0 : ProcedureReturn $4844455200000007 : EndIf
+  If (PeekL(#PROBE_VOPB_MODE) & 15)<>15 : ProcedureReturn $4844455200000008 : EndIf
+  If PeekL(#PROBE_VOPB_MMU_FAULT)<>0 : ProcedureReturn $4844455200000009 : EndIf
+  live_result = $4844000000000000 | ((width & $FFFF) << 16) | (height & $FFFF)
+  ProcedureReturn live_result
+EndProcedure

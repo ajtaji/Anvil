@@ -1,0 +1,18 @@
+; Read-only RK3399 UART2 component/FIFO admission probe.
+; DW UART CPR at $F4 encodes FIFO depth in bits [23:16] times 16.
+; Return: $5541 | CPR[31:0] | RFL[7:0] | LSR[7:0].
+; pmf:target rockpi4c
+
+#PROBE_UART2 = $FF1A0000
+Global uart_fifo_probe_scratch.i
+
+Procedure.i Main()
+  Protected cpr.i
+  Protected rfl.i
+  Protected lsr.i
+  uart_fifo_probe_scratch = 0
+  cpr = PeekL(#PROBE_UART2 + $F4) & $FFFFFFFF
+  rfl = PeekL(#PROBE_UART2 + $84) & 255
+  lsr = PeekL(#PROBE_UART2 + $14) & 255
+  ProcedureReturn $5541000000000000 | (cpr << 16) | (rfl << 8) | lsr
+EndProcedure

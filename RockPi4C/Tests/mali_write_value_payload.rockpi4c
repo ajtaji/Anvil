@@ -2,8 +2,9 @@
 ; PMU/CRU admission state, follows Linux Panfrost's reset and power sequence,
 ; configures AS0, and submits one Mesa v5 WRITE_VALUE job to private memory.
 ; The resident payload command arms Anvil's physical deadman before entry.
-; No framebuffer or filesystem memory is a job target. The load address below
-; is build 121's stage; relink to the current `map` stage before each use.
+; No framebuffer or filesystem memory is a job target. Compile and run this
+; only through tools/rockpi4c_mali_job_proof.py: it reads the live stage,
+; links at that address, checks the stack gap, and uses the deadman uploader.
 ;
 ; Wire format when infrastructure is admitted:
 ;   G1 <PWRDN_CON> <PWRDN_ST> <IDLE_REQ> <IDLE_ST> <IDLE_ACK>
@@ -26,9 +27,6 @@
 ; header exception, JS1 status, AS0 fault. Success returns 0x47513000.
 ;
 ; pmf:target rockpi4c
-; pmf:load $03A78088
-; pmf:bss $10000000
-; pmf:stack $12000000
 
 #GPU_REACH_UART2_THR = $FF1A0000
 #GPU_REACH_UART2_LSR = $FF1A0014

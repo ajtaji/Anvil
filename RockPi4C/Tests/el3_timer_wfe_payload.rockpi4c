@@ -1,0 +1,140 @@
+; Returning EL3 generic-timer event-stream proof. It changes only the
+; current PE's CNTKCTL_EL1, restores that register before returning, and
+; leaves interrupts masked, the GIC, VBAR_EL3, and Anvil memory untouched.
+; The resident payload command arms the physical deadman before entry.
+; A missing WFE event is recovered by that deadman, never by a timer loop.
+;
+; Success: X0 = $5746xxxxxxxxxxxx | (max pair ticks << 32) |
+;               (qualified pairs << 24) | elapsed ticks.
+; Failure: X0 = $57464545xxxxxxxx, where the low byte identifies the check.
+;
+; pmf:target rockpi4c
+
+Global idle_proof_kctl_write.i
+
+ProcedureNaked.i IdleProofEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofDaif()
+  ASM
+    mrs x0, daif
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofKctl()
+  ASM
+    mrs x0, cntkctl_el1
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked IdleProofSetKctl()
+  ASM
+    adrp x9, global_idle_proof_kctl_write
+    add x9, x9, #:lo12:global_idle_proof_kctl_write
+    ldr x0, [x9]
+    msr cntkctl_el1, x0
+    isb
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofVbar()
+  ASM
+    mrs x0, vbar_el3
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i IdleProofWait()
+  ASM
+    ; Prime and clear the local event latch. The second WFE then waits for
+    ; the next timer event, bounded by one configured event interval.
+    .long $D50320BF ; SEVL
+    wfe
+    wfe
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected original.i
+  Protected setting.i
+  Protected vbar.i
+  Protected first.i
+  Protected last.i
+  Protected now.i
+  Protected elapsed.i
+  Protected count.i
+  Protected qualified.i
+  Protected pairTicks.i
+  Protected maxPair.i
+
+  If IdleProofEl() <> 12 : ProcedureReturn $5746454500000001 : EndIf
+  If (IdleProofDaif() & $C0) <> $C0 : ProcedureReturn $5746454500000002 : EndIf
+  If IdleProofHz() <> 24000000 : ProcedureReturn $5746454500000003 : EndIf
+  vbar = IdleProofVbar()
+  If vbar = 0 Or (vbar & 2047) <> 0 : ProcedureReturn $5746454500000004 : EndIf
+
+  original = IdleProofKctl()
+  ; EVNTI=12 selects a rising transition of counter bit 12. At 24 MHz,
+  ; consecutive transitions are 8,192 ticks (about 341.3 us) apart.
+  setting = (original & $FFFFFFFFFFFFFF03) | $C4
+  idle_proof_kctl_write = setting
+  IdleProofSetKctl()
+  If (IdleProofKctl() & $FC) <> $C4
+    idle_proof_kctl_write = original
+    IdleProofSetKctl()
+    ProcedureReturn $5746454500000005
+  EndIf
+
+  first = IdleProofTicks()
+  last = first
+  For count = 0 To 7
+    now = IdleProofWait()
+    If now < last
+      idle_proof_kctl_write = original
+      IdleProofSetKctl()
+      ProcedureReturn $5746454500000006
+    EndIf
+    pairTicks = now - last
+    If pairTicks > maxPair : maxPair = pairTicks : EndIf
+    If pairTicks >= 1000
+      qualified = qualified + 1
+    EndIf
+    last = now
+  Next
+  idle_proof_kctl_write = original
+  IdleProofSetKctl()
+  If IdleProofKctl() <> original : ProcedureReturn $5746454500000007 : EndIf
+  If IdleProofVbar() <> vbar : ProcedureReturn $5746454500000008 : EndIf
+
+  elapsed = last - first
+  If qualified < 7 : ProcedureReturn $5746454500000B00 | qualified : EndIf
+  If elapsed < 24000000 / 600 : ProcedureReturn $5746454500000009 : EndIf
+  If elapsed > 24000000 / 10 : ProcedureReturn $574645450000000A : EndIf
+  If maxPair > 9000 : ProcedureReturn $5746454500000000 | maxPair : EndIf
+  ProcedureReturn $5746000000000000 | ((maxPair & $FFFF) << 32) | (qualified << 24) | (elapsed & $FFFFFF)
+EndProcedure

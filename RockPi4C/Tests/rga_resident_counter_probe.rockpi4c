@@ -1,0 +1,67 @@
+; Read the installed monitor's RGA and console counters without changing them.
+; Host substitutes symbol addresses from the exact installed build and links
+; this returning payload to Anvil's live stage with a separately guarded stack.
+; pmf:target rockpi4c
+
+#RGAC_UART_THR = $FF1A0000
+#RGAC_UART_LSR = $FF1A0014
+#RGAC_JOBS = @@JOBS@@
+#RGAC_FAILURES = @@FAILURES@@
+#RGAC_READY = @@READY@@
+#RGAC_ATLAS_READY = @@ATLAS_READY@@
+#RGAC_ERROR = @@ERROR@@
+#RGAC_ROW_WIDTH = @@ROW_WIDTH@@
+#RGAC_ROW_PITCH = @@ROW_PITCH@@
+#RGAC_DMA_BYTES = @@DMA_BYTES@@
+#RGAC_CPU_BYTES = @@CPU_BYTES@@
+
+Global rgac_bss.i
+
+Procedure.i RgacTx(value.i)
+  Protected spins.i
+  For spins=0 To 999999
+    If (PeekL(#RGAC_UART_LSR) & $20)<>0
+      PokeL(#RGAC_UART_THR,value & 255)
+      ProcedureReturn 1
+    EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RgacHex32(value.i)
+  Protected shift.i
+  Protected digit.i
+  For shift=28 To 0 Step -4
+    digit=(value >> shift) & 15
+    If digit<10
+      If RgacTx(48+digit)=0 : ProcedureReturn 0 : EndIf
+    Else
+      If RgacTx(55+digit)=0 : ProcedureReturn 0 : EndIf
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RgacWord(value.i)
+  If RgacHex32(value)=0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn RgacTx(32)
+EndProcedure
+
+Procedure.i Main()
+  ; One short tagged line: readiness, geometry, jobs/failures/error and
+  ; cumulative PL330/CPU console bytes. All monitor addresses are read-only.
+  If RgacTx(82)=0 Or RgacTx(71)=0 Or RgacTx(65)=0 Or RgacTx(67)=0 Or RgacTx(32)=0
+    ProcedureReturn $52474301
+  EndIf
+  If RgacWord(PeekL(#RGAC_READY))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_ATLAS_READY))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_ROW_WIDTH))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_ROW_PITCH))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_JOBS))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_FAILURES))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_ERROR))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacWord(PeekL(#RGAC_DMA_BYTES))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacHex32(PeekL(#RGAC_CPU_BYTES))=0 : ProcedureReturn $52474301 : EndIf
+  If RgacTx(13)=0 Or RgacTx(10)=0 : ProcedureReturn $52474301 : EndIf
+  ProcedureReturn $52474300
+EndProcedure

@@ -1,0 +1,107 @@
+; Returning PL330 scroll-slice timing proof in private payload staging RAM.
+; The resident payload command arms the physical deadman before entry.
+; pmf:target rockpi4c
+
+#PROOF_STAGE = $03CEF748
+#PROOF_SOURCE = $03D00000
+#PROOF_DEST = $03D20000
+#PROOF_COPY = $000A6670
+#PROOF_LARGE = 65536
+#PROOF_SMALL = 8192
+Global scroll_probe_guard.i
+
+ProcedureNaked.i ScrollProbeTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i ScrollProbeHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i ScrollProbeDmaLarge()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    movz x0, #0x0000
+    movk x0, #0x03D2, lsl #16
+    movz x1, #0x0000
+    movk x1, #0x03D0, lsl #16
+    movz x2, #0x0000
+    movk x2, #0x0001, lsl #16
+    movz x9, #0x6670
+    movk x9, #0x000A, lsl #16
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i ScrollProbeDmaSmall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    movz x0, #0x0000
+    movk x0, #0x03D2, lsl #16
+    movz x1, #0x0000
+    movk x1, #0x03D0, lsl #16
+    movz x2, #8192
+    movz x9, #0x6670
+    movk x9, #0x000A, lsl #16
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected index.i
+  Protected pattern.i
+  Protected start.i
+  Protected largeTicks.i
+  Protected smallTicks.i
+  If ScrollProbeHz() <> 24000000
+    ProcedureReturn $444D455200000001
+  EndIf
+  scroll_probe_guard = #PROOF_SOURCE
+  For index = 0 To (#PROOF_LARGE / 4) - 1
+    pattern = ((index * $9E37) ! $12345678) & $FFFFFFFF
+    PokeL(#PROOF_SOURCE + index * 4, pattern)
+    PokeL(#PROOF_DEST + index * 4, 0)
+  Next
+  ASM
+    dsb sy
+  ENDASM
+  start = ScrollProbeTicks()
+  If ScrollProbeDmaLarge() = 0 : ProcedureReturn $444D455200000002 : EndIf
+  largeTicks = ScrollProbeTicks() - start
+  For index = 0 To (#PROOF_LARGE / 4) - 1
+    pattern = ((index * $9E37) ! $12345678) & $FFFFFFFF
+    If (PeekL(#PROOF_DEST + index * 4) & $FFFFFFFF) <> pattern
+      ProcedureReturn $444D455200000003
+    EndIf
+  Next
+  For index = 0 To (#PROOF_SMALL / 4) - 1
+    PokeL(#PROOF_DEST + index * 4, 0)
+  Next
+  ASM
+    dsb sy
+  ENDASM
+  start = ScrollProbeTicks()
+  If ScrollProbeDmaSmall() = 0 : ProcedureReturn $444D455200000004 : EndIf
+  smallTicks = ScrollProbeTicks() - start
+  For index = 0 To (#PROOF_SMALL / 4) - 1
+    pattern = ((index * $9E37) ! $12345678) & $FFFFFFFF
+    If (PeekL(#PROOF_DEST + index * 4) & $FFFFFFFF) <> pattern
+      ProcedureReturn $444D455200000005
+    EndIf
+  Next
+  If largeTicks <= 0 Or smallTicks <= 0 Or largeTicks > $FFFF Or smallTicks > $FFFF
+    ProcedureReturn $444D455200000006
+  EndIf
+  ProcedureReturn $444D000000000000 | (largeTicks << 16) | smallTicks
+EndProcedure

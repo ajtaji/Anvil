@@ -1,0 +1,91 @@
+; Build 144 only: bounded empty-path timing of resident RockScreenService.
+; Its address and globals come from build/rockpi4c/anvil-flat.img.sym.
+; The service is called through the A64 procedure ABI with a private stack.
+; Payload entry is protected by the resident physical deadman.
+; pmf:target rockpi4c
+
+#PROBE_SCREEN_SERVICE = $D798C
+#PROBE_RING_TAIL = 44834808
+#PROBE_RING_HEAD = 68191896
+#PROBE_SCROLL_ACTIVE = 44124032
+
+Global idle_screen_probe_scratch.i
+
+ProcedureNaked.i ScreenProbeEl()
+  ASM
+    mrs x0, currentel
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i ScreenProbeHz()
+  ASM
+    mrs x0, cntfrq_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked.i ScreenProbeTicks()
+  ASM
+    isb
+    mrs x0, cntpct_el0
+    ret
+  ENDASM
+EndProcedure
+
+ProcedureNaked ScreenProbeCall()
+  ASM
+    stp x29, x30, [sp, #-16]!
+    movz x9, #$798C
+    movk x9, #$D, lsl #16
+    blr x9
+    ldp x29, x30, [sp], #16
+    ret
+  ENDASM
+EndProcedure
+
+Procedure.i Main()
+  Protected initialTail.i
+  Protected finalTail.i
+  Protected before.i
+  Protected after.i
+  Protected duration.i
+  Protected total.i
+  Protected last.i
+  Protected count.i
+  Protected consumed.i
+  Protected empty.i
+  Protected drainStart.i
+  Protected drained.i
+
+  idle_screen_probe_scratch = 0
+  If ScreenProbeEl() <> 12 : ProcedureReturn $5343455200000001 : EndIf
+  If ScreenProbeHz() <> 24000000 : ProcedureReturn $5343455200000002 : EndIf
+  initialTail = PeekI(#PROBE_RING_TAIL)
+  drainStart = ScreenProbeTicks()
+  For count = 0 To 1023
+    If PeekI(#PROBE_RING_HEAD) = PeekI(#PROBE_RING_TAIL) And PeekI(#PROBE_SCROLL_ACTIVE) = 0 : Break : EndIf
+    ScreenProbeCall()
+    If ScreenProbeTicks() - drainStart > 24000000 * 5
+      ProcedureReturn $5343455200000005
+    EndIf
+  Next
+  If PeekI(#PROBE_RING_HEAD) <> PeekI(#PROBE_RING_TAIL) Or PeekI(#PROBE_SCROLL_ACTIVE) <> 0
+    ProcedureReturn $5343455200000006
+  EndIf
+  drained = (PeekI(#PROBE_RING_TAIL) - initialTail) & 8191
+  For count = 0 To 63
+    before = ScreenProbeTicks()
+    ScreenProbeCall()
+    after = ScreenProbeTicks()
+    If after < before : ProcedureReturn $5343455200000003 : EndIf
+    duration = after - before
+    If duration > 24000000 / 100 : ProcedureReturn $5343455200000004 : EndIf
+    total = total + duration
+    last = duration
+  Next
+  finalTail = PeekI(#PROBE_RING_TAIL)
+  consumed = (finalTail - initialTail) & 8191
+  If PeekI(#PROBE_RING_HEAD) = finalTail And PeekI(#PROBE_SCROLL_ACTIVE) = 0 : empty = 1 : EndIf
+  ProcedureReturn $5343000000000000 | (empty << 47) | ((drained & $7FFF) << 32) | (((total / 64) & $FFFF) << 16) | (last & $FFFF)
+EndProcedure
