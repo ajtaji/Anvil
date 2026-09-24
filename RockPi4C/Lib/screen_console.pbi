@@ -26,8 +26,8 @@
 #ROCK_SCREEN_SCROLL_CHUNK_BYTES = 65536
 #ROCK_SCREEN_CPU_WATCHDOG_BYTES = 262144
 #ROCK_SCREEN_BANNER_H = 120
-#ROCK_SCREEN_CELL_W = 10
-#ROCK_SCREEN_CELL_H = 16
+#ROCK_SCREEN_CELL_W = 12
+#ROCK_SCREEN_CELL_H = 20
 ; Match the maximum scanout width admitted by the display contract.
 #ROCK_SCREEN_MAX_WIDTH = 2560
 #ROCK_SCREEN_ROW_BUFFER_BYTES = #ROCK_SCREEN_MAX_WIDTH * #ROCK_SCREEN_CELL_H * 4
@@ -274,6 +274,12 @@ EndProcedure
 Procedure RockScreenClearCell(col.i, row.i)
   Protected line.i
   RockScreenBufferEnsure()
+  If rock_rga_ready<>0
+    If RockRgaCopyGlyph(32,col*#ROCK_SCREEN_CELL_W,0)<>0
+      rock_screen_row_buffer_dirty=1
+      ProcedureReturn
+    EndIf
+  EndIf
   For line = 0 To #ROCK_SCREEN_CELL_H - 1
     RockScreenCpuFill32(@rock_screen_row_buffer[0] + line * rock_display_pitch + col * #ROCK_SCREEN_CELL_W * 4, #ROCK_SCREEN_BG, #ROCK_SCREEN_CELL_W * 4)
   Next
@@ -373,12 +379,17 @@ Procedure RockScreenPaintByte(code.i, style.i)
         ProcedureReturn
       EndIf
       If rock_screen_col >= rock_screen_cols : RockScreenNewline() : EndIf
-      RockScreenClearCell(rock_screen_col, rock_screen_row)
       fg = #ROCK_SCREEN_STEEL
       If style = #ROCK_SCREEN_STYLE_PROMPT : fg = #ROCK_SCREEN_PROMPT : EndIf
-      rock_screen_text_render = 1
-      RockScreenGlyph(code, rock_screen_col * #ROCK_SCREEN_CELL_W, #ROCK_SCREEN_BANNER_H + rock_screen_row * #ROCK_SCREEN_CELL_H, 2, fg)
-      rock_screen_text_render = 0
+      RockScreenBufferEnsure()
+      If rock_rga_ready<>0 And RockRgaCopyGlyph(code,rock_screen_col*#ROCK_SCREEN_CELL_W,style)<>0
+        rock_screen_row_buffer_dirty=1
+      Else
+        RockScreenClearCell(rock_screen_col, rock_screen_row)
+        rock_screen_text_render = 1
+        RockScreenGlyph(code, rock_screen_col * #ROCK_SCREEN_CELL_W, #ROCK_SCREEN_BANNER_H + rock_screen_row * #ROCK_SCREEN_CELL_H, 2, fg)
+        rock_screen_text_render = 0
+      EndIf
       rock_screen_col = rock_screen_col + 1
   EndSelect
 EndProcedure
@@ -452,6 +463,15 @@ Procedure.i RockScreenAttach()
   rock_screen_row_buffer_active = 0
   rock_screen_row_buffer_dirty = 0
   rock_screen_text_render = 0
+  If RockRgaInit(#ROCK_SCREEN_STEEL,#ROCK_SCREEN_PROMPT,#ROCK_SCREEN_BG,@rock_screen_row_buffer[0],rock_display_pitch,rock_display_width)<>0
+    If rock_uart_ready<>0 : RockUartLine("HDMI TRUE TYPE RGA TEXT READY") : EndIf
+  Else
+    If rock_uart_ready<>0
+      RockUartText("HDMI TRUE TYPE RGA TEXT ERR=")
+      RockStorageHex8(rock_rga_error)
+      RockUartLine("")
+    EndIf
+  EndIf
   rock_screen_attached = 1
   rock_screen_ready = 0
   ProcedureReturn 1

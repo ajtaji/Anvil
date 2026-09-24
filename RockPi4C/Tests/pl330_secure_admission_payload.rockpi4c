@@ -1,0 +1,208 @@
+; Bounded RK3399 DMAC0 secure-admission proof for the live Anvil payload stage.
+; Build exactly with:
+;   --load-addr 0x03A4BBD8 --bss-addr 0x03AD0000
+;   --stack-addr 0x03E40000 --entry-returns
+;
+; The only non-UART writes are the original official RK3399 TF-A
+; dma_secure_cfg(secure) sequence for DMAC0: DDR master-region CON22, secure
+; SOC_CON8/9/10 tie-offs, reset 163 assert, five microseconds, reset release.
+; DMAC1 and the shared PERILP0 reset are never written.
+; pmf:target rockpi4c
+; pmf:load $03A4BBD8
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
+
+#ADMIT_CRU = $FF760000
+#ADMIT_SGRF = $FF330000
+#ADMIT_DMAC0 = $FF6D0000
+#ADMIT_CLKSEL23 = $15C
+#ADMIT_CLKGATE7 = $31C
+#ADMIT_CLKGATE25 = $364
+#ADMIT_SOFTRST10 = $428
+#ADMIT_GPLL_CON0 = $080
+#ADMIT_GPLL_CON1 = $084
+#ADMIT_GPLL_CON2 = $088
+#ADMIT_GPLL_CON3 = $08C
+#ADMIT_DDR_MST22 = $058
+#ADMIT_SOC_CON8 = $8020
+#ADMIT_SOC_CON9 = $8024
+#ADMIT_SOC_CON10 = $8028
+#ADMIT_SECURE_MASK = $FFFF0000
+#ADMIT_DDR0_SECURE_MASK = $00010001
+#ADMIT_DMAC0_RESET_ASSERT = $00080008
+#ADMIT_DMAC0_RESET_RELEASE = $00080000
+#ADMIT_RESET_BITS = $00000009
+#ADMIT_HOLD_US = 5
+
+#ADMIT_OK = $3300A000
+#ADMIT_ERR_EL = $3300AE01
+#ADMIT_ERR_CACHE = $3300AE02
+#ADMIT_ERR_TIMER = $3300AE03
+#ADMIT_ERR_UART = $3300AE04
+#ADMIT_ERR_GPLL = $3300AE05
+#ADMIT_ERR_READY = $3300AE06
+#ADMIT_ERR_SGRF = $3300AE07
+#ADMIT_ERR_HOLD = $3300AE08
+#ADMIT_ERR_RELEASE = $3300AE09
+#ADMIT_ERR_ZERO_ID = $3300AE0A
+#ADMIT_ERR_ID = $3300AE0B
+
+Procedure AdmitHexNibble(value.i)
+  value=value & 15
+  If value<10 : RockUartByte(48+value) : Else : RockUartByte(55+value) : EndIf
+EndProcedure
+
+Procedure AdmitHex32(value.i)
+  Protected shift.i
+  For shift=28 To 0 Step -4
+    AdmitHexNibble(value >> shift)
+  Next
+EndProcedure
+
+Procedure AdmitPair(label0.i,value0.i,label1.i,value1.i)
+  RockUartText(label0) : AdmitHex32(value0)
+  RockUartText(label1) : AdmitHex32(value1)
+  RockUartLine("")
+EndProcedure
+
+Procedure.i AdmitGpllRate()
+  Protected con0.i=PeekL(#ADMIT_CRU+#ADMIT_GPLL_CON0) & $FFFFFFFF
+  Protected con1.i=PeekL(#ADMIT_CRU+#ADMIT_GPLL_CON1) & $FFFFFFFF
+  Protected con2.i=PeekL(#ADMIT_CRU+#ADMIT_GPLL_CON2) & $FFFFFFFF
+  Protected con3.i=PeekL(#ADMIT_CRU+#ADMIT_GPLL_CON3) & $FFFFFFFF
+  Protected fb.i=con0 & $FFF
+  Protected ref.i=con1 & $3F
+  Protected post1.i=(con1 >> 8) & 7
+  Protected post2.i=(con1 >> 12) & 7
+  Protected rate.i
+  If (con2 & $80000000)=0 Or ((con3 >> 8) & 3)<>1 Or (con3 & 9)<>8
+    ProcedureReturn 0
+  EndIf
+  If fb<16 Or fb>3200 Or ref=0 Or post1=0 Or post2=0
+    ProcedureReturn 0
+  EndIf
+  rate=(24000000*fb/ref)/(post1*post2)
+  If rate<>400000000 And rate<>594000000 And rate<>800000000
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn rate
+EndProcedure
+
+Procedure.i AdmitPid()
+  ProcedureReturn (PeekL(#ADMIT_DMAC0+$FE0) & $FF) | ((PeekL(#ADMIT_DMAC0+$FE4) & $FF) << 8) | ((PeekL(#ADMIT_DMAC0+$FE8) & $FF) << 16) | ((PeekL(#ADMIT_DMAC0+$FEC) & $FF) << 24)
+EndProcedure
+
+Procedure.i AdmitCid()
+  ProcedureReturn (PeekL(#ADMIT_DMAC0+$FF0) & $FF) | ((PeekL(#ADMIT_DMAC0+$FF4) & $FF) << 8) | ((PeekL(#ADMIT_DMAC0+$FF8) & $FF) << 16) | ((PeekL(#ADMIT_DMAC0+$FFC) & $FF) << 24)
+EndProcedure
+
+Procedure.i Main()
+  Protected clksel23.i
+  Protected gate7.i
+  Protected gate25.i
+  Protected resetBefore.i
+  Protected resetAfter.i
+  Protected gpll.i
+  Protected sgrf8Before.i
+  Protected sgrf9Before.i
+  Protected sgrf10Before.i
+  Protected ddr22Before.i
+  Protected sgrf8After.i
+  Protected sgrf9After.i
+  Protected sgrf10After.i
+  Protected ddr22After.i
+  Protected held.i
+  Protected ds.i
+  Protected dpc.i
+  Protected cs0.i
+  Protected cpc0.i
+  Protected cr0.i
+  Protected crd.i
+  Protected pid.i
+  Protected cid.i
+
+  RockCaptureEnvironment()
+  RockCaptureSctlrEl3()
+  If rock_current_el<>12 : ProcedureReturn #ADMIT_ERR_EL : EndIf
+  If (rock_sctlr_el3 & $1005)<>0 : ProcedureReturn #ADMIT_ERR_CACHE : EndIf
+  If RockTimerInit()=0 : ProcedureReturn #ADMIT_ERR_TIMER : EndIf
+  If RockUartAdopt()=0 : ProcedureReturn #ADMIT_ERR_UART : EndIf
+
+  gpll=AdmitGpllRate()
+  If gpll=0 : ProcedureReturn #ADMIT_ERR_GPLL : EndIf
+  clksel23=PeekL(#ADMIT_CRU+#ADMIT_CLKSEL23) & $FFFFFFFF
+  gate7=PeekL(#ADMIT_CRU+#ADMIT_CLKGATE7) & $FFFFFFFF
+  gate25=PeekL(#ADMIT_CRU+#ADMIT_CLKGATE25) & $FFFFFFFF
+  resetBefore=PeekL(#ADMIT_CRU+#ADMIT_SOFTRST10) & $FFFFFFFF
+  ; Require GPLL as ACLK_PERILP0 parent, its source/composite gates, the
+  ; DMAC0/NoC gates, and both the shared/leaf resets already released.
+  If (clksel23 & $80)=0 Or (gate7 & $5)<>0 Or (gate25 & $A0)<>0 Or (resetBefore & #ADMIT_RESET_BITS)<>0
+    ProcedureReturn #ADMIT_ERR_READY
+  EndIf
+
+  sgrf8Before=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON8) & $FFFFFFFF
+  sgrf9Before=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON9) & $FFFFFFFF
+  sgrf10Before=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON10) & $FFFFFFFF
+  ddr22Before=PeekL(#ADMIT_SGRF+#ADMIT_DDR_MST22) & $FFFFFFFF
+
+  ; Exact RK3399 TF-A DMAC0 secure admission writes.
+  PokeL(#ADMIT_SGRF+#ADMIT_DDR_MST22,#ADMIT_DDR0_SECURE_MASK)
+  PokeL(#ADMIT_SGRF+#ADMIT_SOC_CON8,#ADMIT_SECURE_MASK)
+  PokeL(#ADMIT_SGRF+#ADMIT_SOC_CON9,#ADMIT_SECURE_MASK)
+  PokeL(#ADMIT_SGRF+#ADMIT_SOC_CON10,#ADMIT_SECURE_MASK)
+  ASM
+    dsb sy
+  ENDASM
+  sgrf8After=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON8) & $FFFFFFFF
+  sgrf9After=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON9) & $FFFFFFFF
+  sgrf10After=PeekL(#ADMIT_SGRF+#ADMIT_SOC_CON10) & $FFFFFFFF
+  ddr22After=PeekL(#ADMIT_SGRF+#ADMIT_DDR_MST22) & $FFFFFFFF
+  If sgrf8After<>0 Or sgrf9After<>0 Or sgrf10After<>0 Or (ddr22After & 1)=0
+    ProcedureReturn #ADMIT_ERR_SGRF
+  EndIf
+
+  PokeL(#ADMIT_CRU+#ADMIT_SOFTRST10,#ADMIT_DMAC0_RESET_ASSERT)
+  ASM
+    dsb sy
+  ENDASM
+  held=RockTimerWaitUs(#ADMIT_HOLD_US)
+  ; This release is unconditional after the assert, including a bounded timer
+  ; failure. No software exit exists between the assert and this write.
+  PokeL(#ADMIT_CRU+#ADMIT_SOFTRST10,#ADMIT_DMAC0_RESET_RELEASE)
+  ASM
+    dsb sy
+  ENDASM
+  resetAfter=PeekL(#ADMIT_CRU+#ADMIT_SOFTRST10) & $FFFFFFFF
+  If held=0 : ProcedureReturn #ADMIT_ERR_HOLD : EndIf
+  If (resetAfter & #ADMIT_RESET_BITS)<>0 : ProcedureReturn #ADMIT_ERR_RELEASE : EndIf
+
+  ds=PeekL(#ADMIT_DMAC0+$000) & $FFFFFFFF
+  dpc=PeekL(#ADMIT_DMAC0+$004) & $FFFFFFFF
+  cs0=PeekL(#ADMIT_DMAC0+$100) & $FFFFFFFF
+  cpc0=PeekL(#ADMIT_DMAC0+$104) & $FFFFFFFF
+  cr0=PeekL(#ADMIT_DMAC0+$E00) & $FFFFFFFF
+  crd=PeekL(#ADMIT_DMAC0+$E14) & $FFFFFFFF
+  pid=AdmitPid()
+  cid=AdmitCid()
+
+  RockUartLine("PL330 DMAC0 SECURE ADMISSION")
+  AdmitPair(" CLKSEL23=",clksel23," GPLL=",gpll)
+  AdmitPair(" GATE7=",gate7," GATE25=",gate25)
+  AdmitPair(" RESET_BEFORE=",resetBefore," RESET_AFTER=",resetAfter)
+  AdmitPair(" SOC8_BEFORE=",sgrf8Before," SOC8_AFTER=",sgrf8After)
+  AdmitPair(" SOC9_BEFORE=",sgrf9Before," SOC9_AFTER=",sgrf9After)
+  AdmitPair(" SOC10_BEFORE=",sgrf10Before," SOC10_AFTER=",sgrf10After)
+  AdmitPair(" DDR22_BEFORE=",ddr22Before," DDR22_AFTER=",ddr22After)
+  AdmitPair(" DS=",ds," DPC=",dpc)
+  AdmitPair(" CS0=",cs0," CPC0=",cpc0)
+  AdmitPair(" CR0=",cr0," CRD=",crd)
+  AdmitPair(" PID=",pid," CID=",cid)
+
+  If pid=0 And cid=0 : ProcedureReturn #ADMIT_ERR_ZERO_ID : EndIf
+  If (pid & $FFFFF)<>$41330 Or cid<>$B105F00D : ProcedureReturn #ADMIT_ERR_ID : EndIf
+  ProcedureReturn #ADMIT_OK
+EndProcedure

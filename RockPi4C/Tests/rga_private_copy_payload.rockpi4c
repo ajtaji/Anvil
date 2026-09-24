@@ -1,0 +1,150 @@
+; RK3399 RGA private-buffer copy proof. No framebuffer/filesystem writes.
+; Linux v6.1 drivers/media/platform/rockchip/rga/rga-{hw,buf}.c is the
+; register, page-table and command-sequence authority. Anvil's resident
+; payload command arms the deadman; this payload also pets it in polling.
+
+XIncludeFile "RockPi4C/Board/platform.pbi"
+XIncludeFile "RockPi4C/Lib/soc.pbi"
+XIncludeFile "RockPi4C/Lib/arch_timer.pbi"
+XIncludeFile "RockPi4C/Lib/uart2.pbi"
+XIncludeFile "RockPi4C/Lib/boot_contract.pbi"
+
+#RGA_PMU = $FF310000
+#RGA_CRU = $FF760000
+#RGA_BASE = $FF680000
+#RGA_WDT = $FF84800C
+#RGA_SIDE = 64
+#RGA_PIXELS = #RGA_SIDE * #RGA_SIDE
+#RGA_BYTES = #RGA_PIXELS * 4
+
+Global Dim rga_source.a[#RGA_BYTES+4096]
+Global Dim rga_target.a[#RGA_BYTES+4096]
+Global Dim rga_src_pages.a[128]
+Global Dim rga_dst_pages.a[128]
+Global Dim rga_command.a[256]
+
+Procedure RgaHex(value.i)
+  Protected shift.i
+  Protected nibble.i
+  For shift=28 To 0 Step -4
+    nibble=(value >> shift) & 15
+    If nibble<10 : RockUartByte(48+nibble) : Else : RockUartByte(55+nibble) : EndIf
+  Next
+EndProcedure
+
+Procedure RgaField(label.i,value.i)
+  RockUartText(label) : RgaHex(value) : RockUartLine("")
+EndProcedure
+
+Procedure.i Main()
+  Protected blocked.i
+  Protected source.i
+  Protected target.i
+  Protected sourcePages.i
+  Protected targetPages.i
+  Protected command.i
+  Protected index.i
+  Protected value.i
+  Protected interrupt.i
+  Protected polls.i
+  Protected sourceGuard.i
+  Protected targetGuard.i
+  Protected priorInt.i
+
+  RockCaptureEnvironment()
+  RockCaptureSctlrEl3()
+  If rock_current_el<>12 Or (rock_sctlr_el3 & $1005)<>0 : ProcedureReturn $524801 : EndIf
+  If RockUartAdopt()=0 : ProcedureReturn $524802 : EndIf
+  blocked=0
+  If ((PeekL(#RGA_PMU+$14) | PeekL(#RGA_PMU+$18)) & (1 << 18))<>0 : blocked=blocked | 1 : EndIf
+  If ((PeekL(#RGA_PMU+$60) | PeekL(#RGA_PMU+$64) | PeekL(#RGA_PMU+$68)) & (1 << 5))<>0 : blocked=blocked | 2 : EndIf
+  If (PeekL(#RGA_CRU+$310) & $700)<>0 : blocked=blocked | 4 : EndIf
+  If (PeekL(#RGA_CRU+$340) & $F00)<>0 : blocked=blocked | 8 : EndIf
+  If (PeekL(#RGA_CRU+$418) & $680)<>0 : blocked=blocked | 16 : EndIf
+  If blocked<>0 : RgaField("RGA BLOCKED=",blocked) : ProcedureReturn $52481000 | blocked : EndIf
+  If (PeekL(#RGA_BASE+$28) & $FFFFFFFF)<>$03218218 : ProcedureReturn $524803 : EndIf
+  ; The reference IRQ handler acknowledges pending low-nibble bits by
+  ; writing them shifted into bits 4..7 before a new command is started.
+  priorInt=PeekL(#RGA_BASE+$10) & $FFFFFFFF
+  RgaField("RGA PRIOR INT=",priorInt)
+  If (priorInt & 15)<>0
+    PokeL(#RGA_BASE+$10,(priorInt & 15) << 4)
+    If (PeekL(#RGA_BASE+$10) & 15)<>0 : ProcedureReturn $524804 : EndIf
+  EndIf
+
+  source=(@rga_source[0]+4095) & ~$FFF
+  target=(@rga_target[0]+4095) & ~$FFF
+  sourcePages=(@rga_src_pages[0]+15) & ~$F
+  targetPages=(@rga_dst_pages[0]+15) & ~$F
+  command=(@rga_command[0]+15) & ~$F
+  If source<0 Or target<0 Or sourcePages<0 Or targetPages<0 Or command<0 : ProcedureReturn $524805 : EndIf
+  If source>$FFFFFFFF Or target>$FFFFFFFF Or sourcePages>$FFFFFFFF Or targetPages>$FFFFFFFF Or command>$FFFFFFFF : ProcedureReturn $524806 : EndIf
+  sourceGuard=source+#RGA_BYTES
+  targetGuard=target+#RGA_BYTES
+  PokeL(sourceGuard,$4AFE1234)
+  PokeL(targetGuard,$5678BEEF)
+  For index=0 To #RGA_PIXELS-1
+    value=$00100000 | (index & $FFFF)
+    PokeL(source+index*4,value)
+    PokeL(target+index*4,$A5A5A5A5)
+  Next
+  For index=0 To 3
+    PokeL(sourcePages+index*4,source+index*4096)
+    PokeL(targetPages+index*4,target+index*4096)
+  Next
+  For index=0 To 31 : PokeL(command+index*4,0) : Next
+
+  ; rga_cmd_set_mode + rga_cmd_set_trans_info for 64x64 ARGB32.
+  ; Linux's V4L2 ARGB32 mapping uses ABGR8888 with RB_SWAP on both sides.
+  PokeL(command+($100-$100),$40)
+  PokeL(command+($104-$100),$10)
+  PokeL(command+($108-$100),0)
+  PokeL(command+($118-$100),$00400040)
+  PokeL(command+($11C-$100),$003F003F)
+  PokeL(command+($138-$100),$10)
+  PokeL(command+($13C-$100),0)
+  PokeL(command+($148-$100),$40)
+  PokeL(command+($14C-$100),$003F003F)
+  PokeL(command+($16C-$100),$777)
+  PokeL(command+($170-$100),sourcePages >> 4)
+  PokeL(command+($174-$100),targetPages >> 4)
+  PokeL(command+($178-$100),targetPages >> 4)
+  ASM
+    dsb sy
+  ENDASM
+  RgaField("RGA CMD=",command)
+  RgaField("RGA SRC=",source)
+  RgaField("RGA DST=",target)
+  PokeL(#RGA_BASE+$08,command)
+  PokeL(#RGA_BASE+$00,0)
+  PokeL(#RGA_BASE+$00,$22)
+  PokeL(#RGA_BASE+$10,$600)
+  ASM
+    dsb sy
+  ENDASM
+  PokeL(#RGA_BASE+$04,1)
+  interrupt=0
+  For polls=0 To 999999
+    interrupt=PeekL(#RGA_BASE+$10) & $FFFFFFFF
+    If (interrupt & $F)<>0 : Break : EndIf
+    If (polls & $FFF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  RgaField("RGA INT=",interrupt)
+  RgaField("RGA POLLS=",polls)
+  RgaField("RGA CTRL=",PeekL(#RGA_BASE+$00) & $FFFFFFFF)
+  If (interrupt & 4)=0 : ProcedureReturn $524807 : EndIf
+  If (interrupt & 3)<>0 : ProcedureReturn $524808 : EndIf
+  For index=0 To #RGA_PIXELS-1
+    If PeekL(target+index*4)<>PeekL(source+index*4)
+      RgaField("RGA BAD INDEX=",index)
+      RgaField("RGA ACTUAL=",PeekL(target+index*4))
+      ProcedureReturn $524809
+    EndIf
+    If (index & $3FF)=0 : PokeL(#RGA_WDT,$76) : EndIf
+  Next
+  RgaField("RGA SRC GUARD=",PeekL(sourceGuard))
+  RgaField("RGA DST GUARD=",PeekL(targetGuard))
+  If PeekL(sourceGuard)<>$4AFE1234 Or PeekL(targetGuard)<>$5678BEEF : ProcedureReturn $52480A : EndIf
+  RockUartLine("RGA PRIVATE COPY PASS")
+  ProcedureReturn $52480000
+EndProcedure

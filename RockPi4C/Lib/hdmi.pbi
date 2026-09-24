@@ -46,6 +46,7 @@
 #ROCK_HDMI_FC_CH1PREAM = $1015
 #ROCK_HDMI_FC_CH2PREAM = $1016
 #ROCK_HDMI_FC_STAT2 = $10D8
+#ROCK_HDMI_FC_DATAUTO3 = $10B7
 #ROCK_HDMI_VP_PR_CD = $0801
 #ROCK_HDMI_VP_STUFF = $0802
 #ROCK_HDMI_VP_REMAP = $0803
@@ -81,12 +82,25 @@
 #ROCK_HDMI_I2CM_SS_SCL_LCNT_0 = $7E0E
 #ROCK_HDMI_I2CM_SS_SCL_LCNT_1 = $7E0D
 #ROCK_HDMI_A_HDCPCFG0 = $5000
+#ROCK_HDMI_A_VIDPOLCFG = $5009
+#ROCK_HDMI_CSC_CFG = $4100
+#ROCK_HDMI_CSC_SCALE = $4101
+#ROCK_HDMI_FC_AVICONF3 = $1017
+#ROCK_HDMI_FC_AVICONF0 = $1019
+#ROCK_HDMI_FC_AVICONF1 = $101A
+#ROCK_HDMI_FC_AVICONF2 = $101B
+#ROCK_HDMI_FC_AVIVID = $101C
+#ROCK_HDMI_FC_AVIETB0 = $101D
+#ROCK_HDMI_FC_AVISRB1 = $1024
+#ROCK_HDMI_FC_PRCONF = $10E0
 
 Global rock_hdmi_error.i
 Global rock_hdmi_phy_lock_status.i
 Global rock_hdmi_phy_powerdown_status.i
 Global rock_hdmi_last_phy_i2c_status.i
 Global Dim rock_hdmi_edid_staging.a[127]
+Global Dim rock_hdmi_cta.a[127]
+Global rock_hdmi_sink_hdmi.i
 
 Procedure.i RockHdmiRead8(offset.i)
   ProcedureReturn PeekL(#ROCK_HDMI_BASE + (offset << 2)) & $FF
@@ -167,11 +181,11 @@ Procedure.i RockHdmiWaitDdcDone(timeoutMs.i)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i RockHdmiReadEdid(pointer.i)
+Procedure.i RockHdmiReadEdidBlock(pointer.i,block.i)
   Protected index.i
   Protected retry.i
   Protected result.i
-  If pointer=0 Or rock_timer_frequency<>#ROCK_TIMER_FREQUENCY_EXPECTED
+  If pointer=0 Or block<0 Or block>4 Or rock_timer_frequency<>#ROCK_TIMER_FREQUENCY_EXPECTED
     rock_hdmi_error=50 : ProcedureReturn 0
   EndIf
   RockHdmiInitController()
@@ -191,10 +205,10 @@ Procedure.i RockHdmiReadEdid(pointer.i)
     RockHdmiWrite8(#ROCK_HDMI_I2CM_DIV,$00)
     RockHdmiWrite8(#ROCK_HDMI_I2CM_SLAVE,$50)
     RockHdmiWrite8(#ROCK_HDMI_I2CM_SEGADDR,$30)
-    RockHdmiWrite8(#ROCK_HDMI_I2CM_SEGPTR,$00)
+    RockHdmiWrite8(#ROCK_HDMI_I2CM_SEGPTR,block >> 1)
     RockHdmiWrite8(#ROCK_HDMI_IH_I2CM_STAT0,$03)
     For index=0 To 127
-      RockHdmiWrite8(#ROCK_HDMI_I2CM_ADDRESS,index)
+      RockHdmiWrite8(#ROCK_HDMI_I2CM_ADDRESS,((block & 1) << 7) | index)
       RockHdmiWrite8(#ROCK_HDMI_I2CM_OPERATION,1)
       result=RockHdmiWaitDdcDone(10)
       If result<>1
@@ -214,6 +228,48 @@ Procedure.i RockHdmiReadEdid(pointer.i)
       rock_hdmi_error=0
       ProcedureReturn 1
     EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockHdmiReadEdid(pointer.i)
+  ProcedureReturn RockHdmiReadEdidBlock(pointer,0)
+EndProcedure
+
+; Linux's drm_detect_hdmi_monitor() checks the CTA vendor-specific data
+; block for HDMI OUI 00-0C-03 before choosing HDMI mode and an AVI packet.
+Procedure.i RockHdmiDetectSink(pointer.i)
+  Protected block.i
+  Protected index.i
+  Protected limit.i
+  Protected header.i
+  Protected size.i
+  Protected checksum.i
+  Protected extensionCount.i
+  rock_hdmi_sink_hdmi=0
+  extensionCount=PeekA(pointer+126) & 255
+  If extensionCount>4 : extensionCount=4 : EndIf
+  For block=1 To extensionCount
+    If RockHdmiReadEdidBlock(@rock_hdmi_cta[0],block)=0 : Continue : EndIf
+    checksum=0
+    For index=0 To 127 : checksum=checksum+(rock_hdmi_cta[index] & 255) : Next
+    If (checksum & 255)<>0 Or (rock_hdmi_cta[0] & 255)<>2 : Continue : EndIf
+    limit=rock_hdmi_cta[2] & 255
+    If limit<4 Or limit>127 : Continue : EndIf
+    index=4
+    While index<limit
+      header=rock_hdmi_cta[index] & 255
+      size=header & 31
+      If index+size>=limit : Break : EndIf
+      If (header >> 5)=3 And size>=3
+        If (rock_hdmi_cta[index+1] & 255)=3 And (rock_hdmi_cta[index+2] & 255)=$0C And (rock_hdmi_cta[index+3] & 255)=0
+          rock_hdmi_sink_hdmi=1
+          ProcedureReturn 1
+        EndIf
+      EndIf
+      index=index+size+1
+    Wend
+    RockWatchdogPet()
   Next
   ProcedureReturn 0
 EndProcedure
@@ -254,8 +310,8 @@ Procedure.i RockHdmiPhyI2cWrite(data.i,address.i)
 EndProcedure
 
 Procedure.i RockHdmiSelectMpll(pixelHz.i)
-  ; Values and ceiling thresholds are rockchip-u-boot-next-dev:
-  ; drivers/video/rockchip/rk_hdmi.c rockchip_mpll_cfg[].
+  ; The 147.2/184 MHz RGB8 rows match the MPLL table extracted from the
+  ; released ROCK Pi 4C Debian 5.10.110-6-rockchip kernel binary.
   If pixelHz<=40000000
     If RockHdmiPhyI2cWrite($00B3,$06)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($0000,$15)=0 : ProcedureReturn 0 : EndIf
@@ -272,13 +328,13 @@ Procedure.i RockHdmiSelectMpll(pixelHz.i)
     If RockHdmiPhyI2cWrite($0072,$06)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($0001,$15)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn RockHdmiPhyI2cWrite($0028,$10)
-  ElseIf pixelHz<=146250000
+  ElseIf pixelHz<=147200000
     If RockHdmiPhyI2cWrite($0051,$06)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($0002,$15)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn RockHdmiPhyI2cWrite($0038,$10)
-  ElseIf pixelHz<=148500000
+  ElseIf pixelHz<=184000000
     If RockHdmiPhyI2cWrite($0051,$06)=0 : ProcedureReturn 0 : EndIf
-    If RockHdmiPhyI2cWrite($0003,$15)=0 : ProcedureReturn 0 : EndIf
+    If RockHdmiPhyI2cWrite($0002,$15)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn RockHdmiPhyI2cWrite($0000,$10)
   ElseIf pixelHz<=272000000 Or pixelHz<=340000000
     If RockHdmiPhyI2cWrite($0040,$06)=0 : ProcedureReturn 0 : EndIf
@@ -289,16 +345,16 @@ Procedure.i RockHdmiSelectMpll(pixelHz.i)
 EndProcedure
 
 Procedure.i RockHdmiSelectPhy(pixelHz.i)
-  ; Values and ceiling thresholds are rockchip-u-boot-next-dev:
-  ; drivers/video/rockchip/rk_hdmi.c rockchip_phy_config[].
+  ; The 74.25/165/297 MHz rows match the PHY table extracted from the
+  ; released ROCK Pi 4C Debian 5.10.110-6-rockchip kernel binary.
   If pixelHz<=74250000
     If RockHdmiPhyI2cWrite($0004,$19)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($8009,$09)=0 : ProcedureReturn 0 : EndIf
     ProcedureReturn RockHdmiPhyI2cWrite($0272,$0E)
-  ElseIf pixelHz<=148500000
+  ElseIf pixelHz<=165000000
     If RockHdmiPhyI2cWrite($0004,$19)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($802B,$09)=0 : ProcedureReturn 0 : EndIf
-    ProcedureReturn RockHdmiPhyI2cWrite($028D,$0E)
+    ProcedureReturn RockHdmiPhyI2cWrite($0209,$0E)
   ElseIf pixelHz<=297000000
     If RockHdmiPhyI2cWrite($0005,$19)=0 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($8039,$09)=0 : ProcedureReturn 0 : EndIf
@@ -320,14 +376,19 @@ Procedure.i RockHdmiPhyConfigure(pixelHz.i)
   For attempt=0 To 1
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$02,$02)
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$01,$00)
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$40,$00)
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$80,$00)
+    ; The shipped Gen2 PHY path clears TXPWRON, waits for lock to drop, then
+    ; asserts PDDQ. PDZ/ENTMDS are Gen1 controls and are never touched here.
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$08,$00)
     ; The newer Rockchip/Linux sequence waits for TX_PHY_LOCK low between
     ; TXPWRON=0 and PDDQ=1. Preserve its non-fatal behavior: the raw result is
     ; retained for telemetry, then the bounded reset/configure pass proceeds.
     RockHdmiPhyWaitPowerDown()
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$10,$10)
+    ; The live CONFIG2_ID is F3 (Gen2 HDMI 2.0 PHY). Its entry in the
+    ; installed Debian kernel's dw_hdmi_phys[] has has_svsret=1; assert this
+    ; before the reset, as dw_hdmi_phy_init() does. A deadman payload proved
+    ; this makes PHY_STAT0.TX_PHY_LOCK assert with PDZ/ENTMDS left off.
+    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$20,$20)
     RockHdmiWrite8(#ROCK_HDMI_MC_PHYRSTZ,1)
     RockHdmiWrite8(#ROCK_HDMI_MC_PHYRSTZ,0)
     RockHdmiWrite8(#ROCK_HDMI_MC_HEACPHY_RST,1) ; HEACPHY_RST_ASSERT
@@ -338,13 +399,12 @@ Procedure.i RockHdmiPhyConfigure(pixelHz.i)
     If RockHdmiPhyI2cWrite($0000,$13)=0 : rock_hdmi_error=21 : ProcedureReturn 0 : EndIf
     If RockHdmiPhyI2cWrite($0006,$17)=0 : rock_hdmi_error=22 : ProcedureReturn 0 : EndIf
     If RockHdmiSelectPhy(pixelHz)=0 : rock_hdmi_error=23 : ProcedureReturn 0 : EndIf
-    If RockHdmiPhyI2cWrite($8000,$05)=0 : rock_hdmi_error=24 : ProcedureReturn 0 : EndIf
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$80,$80)
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$40,$00)
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$40,$40)
+    ; The released ROCK Pi 4C Debian 5.10 HDMI binary ends its PHY table
+    ; programming at VLEVCTRL (0x0E). Do not force CKCALCTRL.OVERRIDE here:
+    ; that extra write belongs to a different DesignWare driver revision.
+    ; Gen2 power-on in the released kernel writes TXPWRON=1, then PDDQ=0.
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$08,$08)
     RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$10,$00)
-    RockHdmiUpdate8(#ROCK_HDMI_PHY_CONF0,$20,$20)
     start=RockTimerTicks()
     For value=0 To 999999
       status=RockHdmiRead8(#ROCK_HDMI_PHY_STAT0) & 1
@@ -373,12 +433,13 @@ Procedure RockHdmiComposeTiming()
   Protected vBack.i = rock_mode_vtotal-rock_mode_vsync_end
   Protected hBlank.i = hFront+hSync+hBack
   Protected vBlank.i = vFront+vSync+vBack
-  Protected invid.i = $10 ; Data-enable polarity is active high.
+  ; The shipped DesignWare setup asserts HDCP_KEEPOUT even for unencrypted
+  ; video. It preserves the control/data-island spacing some sinks require.
+  Protected invid.i = $90 ; HDCP keepout plus active-high data enable.
   If rock_mode_vsync_positive<>0 : invid=invid | $40 : EndIf
   If rock_mode_hsync_positive<>0 : invid=invid | $20 : EndIf
-  ; Base-block EDID alone does not prove an HDMI VSDB sink. Emit DVI-compatible
-  ; RGB timing (no AVI/audio packets) until the caller supplies CTA parsing.
-  invid=invid | $00 ; DVI mode, progressive, low-active blank (header value 0).
+  ; The released driver selects HDMI only after EDID advertises HDMI VSDB.
+  If rock_hdmi_sink_hdmi<>0 : invid=invid | $08 : EndIf
   RockHdmiWrite8(#ROCK_HDMI_FC_INVIDCONF,invid)
   RockHdmiWrite8(#ROCK_HDMI_FC_INHACTV1,rock_mode_width >> 8)
   RockHdmiWrite8(#ROCK_HDMI_FC_INHACTV0,rock_mode_width)
@@ -397,7 +458,11 @@ EndProcedure
 
 Procedure RockHdmiVideoPacketize()
   Protected value.i
+  ; RGB888 takes the packetizer bypass path in the shipped ROCK Pi 4C
+  ; Debian 5.10.110 driver: depth code zero, output selector BYPASS (3).
+  ; Deeper color formats alone use the nonzero depth codes.
   RockHdmiWrite8(#ROCK_HDMI_VP_PR_CD,0)
+  RockHdmiUpdate8(#ROCK_HDMI_FC_DATAUTO3,$04,0)
   RockHdmiUpdate8(#ROCK_HDMI_VP_STUFF,$01,$01)
   RockHdmiUpdate8(#ROCK_HDMI_VP_CONF,$14,$04)
   RockHdmiUpdate8(#ROCK_HDMI_VP_STUFF,$20,$20)
@@ -407,6 +472,77 @@ Procedure RockHdmiVideoPacketize()
   RockHdmiUpdate8(#ROCK_HDMI_VP_CONF,$03,$03)
   value=RockHdmiRead8(#ROCK_HDMI_VP_CONF)
   If (value & $43)<>$43 : rock_hdmi_error=30 : EndIf
+EndProcedure
+
+Procedure RockHdmiConfigureAvi()
+  Protected aspect.i
+  Protected vic.i
+  Protected address.i
+  ; The released dw-hdmi setup writes the AVI packet before packetizer,
+  ; CSC, sampler, and HDCP polarity setup. The framebuffer is full-range RGB.
+  aspect=0
+  If rock_mode_width*9=rock_mode_height*16 : aspect=$20 : EndIf
+  If rock_mode_width*3=rock_mode_height*4 : aspect=$10 : EndIf
+  vic=0
+  If rock_mode_width=1920 And rock_mode_height=1080 And rock_mode_pixel_hz=148500000 And rock_mode_htotal=2200 And rock_mode_vtotal=1125
+    vic=16
+  EndIf
+  RockHdmiWrite8(#ROCK_HDMI_FC_AVICONF0,$40)
+  RockHdmiWrite8(#ROCK_HDMI_FC_AVICONF1,aspect | $08)
+  RockHdmiWrite8(#ROCK_HDMI_FC_AVICONF2,$08)
+  RockHdmiWrite8(#ROCK_HDMI_FC_AVIVID,vic)
+  RockHdmiWrite8(#ROCK_HDMI_FC_PRCONF,$10)
+  RockHdmiWrite8(#ROCK_HDMI_FC_AVICONF3,0)
+  For address=#ROCK_HDMI_FC_AVIETB0 To #ROCK_HDMI_FC_AVISRB1
+    RockHdmiWrite8(address,0)
+  Next
+EndProcedure
+
+Procedure RockHdmiVideoCsc()
+  Protected index.i
+  Protected a.i
+  Protected b.i
+  Protected c.i
+  ; RGB8 input and RGB8 output: no interpolation or conversion. The Linux
+  ; driver still writes identity coefficients and scale 1 before sampling.
+  RockHdmiWrite8(#ROCK_HDMI_CSC_CFG,0)
+  RockHdmiUpdate8(#ROCK_HDMI_CSC_SCALE,$F0,0)
+  For index=0 To 3
+    a=0 : b=0 : c=0
+    If index=0 : a=$2000 : EndIf
+    If index=1 : b=$2000 : EndIf
+    If index=2 : c=$2000 : EndIf
+    RockHdmiWrite8($4103+index*2,a & 255)
+    RockHdmiWrite8($4102+index*2,a >> 8)
+    RockHdmiWrite8($410B+index*2,b & 255)
+    RockHdmiWrite8($410A+index*2,b >> 8)
+    RockHdmiWrite8($4113+index*2,c & 255)
+    RockHdmiWrite8($4112+index*2,c >> 8)
+  Next
+  RockHdmiUpdate8(#ROCK_HDMI_CSC_SCALE,$03,1)
+EndProcedure
+
+Procedure RockHdmiVideoSample()
+  RockHdmiWrite8(#ROCK_HDMI_TX_INVID0,1)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING,7)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+1,0)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+2,0)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+3,0)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+4,0)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+5,0)
+  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+6,0)
+EndProcedure
+
+Procedure RockHdmiVideoHdcp()
+  Protected mode.i=0
+  Protected polarity.i=$10
+  If rock_hdmi_sink_hdmi<>0 : mode=1 : EndIf
+  If rock_mode_vsync_positive<>0 : polarity=polarity | $08 : EndIf
+  If rock_mode_hsync_positive<>0 : polarity=polarity | $02 : EndIf
+  ; The installed 5.10 binary writes all three VIDPOLCFG polarity bits in
+  ; one masked update, after TX_INVID0. For 1080p positive sync this is 0x1A.
+  RockHdmiUpdate8(#ROCK_HDMI_A_VIDPOLCFG,$1A,polarity)
+  RockHdmiUpdate8(#ROCK_HDMI_A_HDCPCFG0,$01,mode)
 EndProcedure
 
 Procedure RockHdmiStateTelemetry()
@@ -461,37 +597,34 @@ Procedure.i RockHdmiEnableSelected()
   If (RockHdmiRead8(#ROCK_HDMI_PHY_STAT0) & 2)=0
     rock_hdmi_error=4 : ProcedureReturn 0
   EndIf
-  RockHdmiInitController()
-  ; Disable every DW subclock while establishing deterministic controller state.
+  ; Match the released driver's dw_hdmi_setup() order. Controller/DDC setup
+  ; already ran before EDID; this mode pass starts with overflow masked.
+  RockHdmiWrite8(#ROCK_HDMI_IH_MUTE_FC_STAT2,$03)
   RockHdmiWrite8(#ROCK_HDMI_MC_CLKDIS,$7F)
-  RockHdmiWrite8(#ROCK_HDMI_MC_FLOWCTRL,0)
   RockHdmiComposeTiming()
   If RockHdmiPhyConfigure(rock_mode_pixel_hz)=0 : ProcedureReturn 0 : EndIf
+  ; dw_hdmi_enable_video_path(): control intervals, then pixel and TMDS
+  ; clocks, then the explicit RGB CSC bypass.
   RockHdmiWrite8(#ROCK_HDMI_FC_CTRLDUR,12)
   RockHdmiWrite8(#ROCK_HDMI_FC_EXCTRLDUR,32)
   RockHdmiWrite8(#ROCK_HDMI_FC_EXCTRLSPAC,1)
   RockHdmiWrite8(#ROCK_HDMI_FC_CH0PREAM,$0B)
   RockHdmiWrite8(#ROCK_HDMI_FC_CH1PREAM,$16)
   RockHdmiWrite8(#ROCK_HDMI_FC_CH2PREAM,$21)
-  RockHdmiWrite8(#ROCK_HDMI_MC_FLOWCTRL,0)
-  ; The base-block-only path deliberately emits DVI-compatible RGB. Match
-  ; dw_hdmi_setup() by selecting DVI in both the frame composer and HDCP
-  ; mode latch instead of depending on the controller reset value.
-  RockHdmiUpdate8(#ROCK_HDMI_A_HDCPCFG0,$01,$00)
-  RockHdmiVideoPacketize()
-  If rock_hdmi_error<>0 : ProcedureReturn 0 : EndIf
   clkdis=$7F & (~$01)
   RockHdmiWrite8(#ROCK_HDMI_MC_CLKDIS,clkdis)
   clkdis=clkdis & (~$02)
   RockHdmiWrite8(#ROCK_HDMI_MC_CLKDIS,clkdis)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INVID0,1)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING,7)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+1,0)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+2,0)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+3,0)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+4,0)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+5,0)
-  RockHdmiWrite8(#ROCK_HDMI_TX_INSTUFFING+6,0)
+  RockHdmiWrite8(#ROCK_HDMI_MC_CLKDIS,clkdis)
+  RockHdmiWrite8(#ROCK_HDMI_MC_FLOWCTRL,0)
+  If rock_hdmi_sink_hdmi<>0 : RockHdmiConfigureAvi() : EndIf
+  RockHdmiVideoPacketize()
+  If rock_hdmi_error<>0 : ProcedureReturn 0 : EndIf
+  RockHdmiVideoCsc()
+  RockHdmiVideoSample()
+  RockHdmiVideoHdcp()
+  ; The released setup clears a frame-composer overflow only after every
+  ; video block is configured, with a TMDS reset and repeated FC write.
   RockHdmiWrite8(#ROCK_HDMI_MC_SWRSTZ,$FD)
   value=RockHdmiRead8(#ROCK_HDMI_FC_INVIDCONF)
   RockHdmiWrite8(#ROCK_HDMI_FC_INVIDCONF,value)
@@ -506,10 +639,10 @@ Procedure.i RockHdmiEnableSelected()
     rock_hdmi_error=32 : ProcedureReturn 0
   EndIf
   value=RockHdmiRead8(#ROCK_HDMI_PHY_CONF0)
-  If (value & $FB)<>$EA
+  If (value & $3B)<>$2A
     rock_hdmi_error=33 : ProcedureReturn 0
   EndIf
-  If (RockHdmiRead8(#ROCK_HDMI_A_HDCPCFG0) & 1)<>0
+  If (RockHdmiRead8(#ROCK_HDMI_A_HDCPCFG0) & 1)<>Bool(rock_hdmi_sink_hdmi<>0)
     rock_hdmi_error=34 : ProcedureReturn 0
   EndIf
   ProcedureReturn 1

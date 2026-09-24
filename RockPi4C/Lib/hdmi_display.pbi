@@ -145,6 +145,9 @@ Procedure.i RockHdmiDisplayUp()
   If RockHdmiReadEdid(@rock_hdmi_edid[0])=0
     ProcedureReturn RockHdmiDisplayFail(22,"HDE2 HDMI DDC EDID BASE BLOCK READ FAILED.")
   EndIf
+  RockHdmiDetectSink(@rock_hdmi_edid[0])
+  RockUartText("HDMI EDID SINK=")
+  If rock_hdmi_sink_hdmi<>0 : RockUartLine("HDMI CTA VSDB") : Else : RockUartLine("DVI/UNKNOWN") : EndIf
   RockWatchdogPet()
   rock_display_stage=$D004
   If RockModeSelect(@rock_hdmi_edid[0])=0

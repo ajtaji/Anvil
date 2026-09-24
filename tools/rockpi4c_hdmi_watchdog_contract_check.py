@@ -31,7 +31,7 @@ def main() -> int:
     hdmi_core = HDMI_CORE.read_text(encoding="utf-8")
     vop = VOP.read_text(encoding="utf-8")
     display_up = procedure(hdmi, "RockHdmiDisplayUp")
-    ddc = procedure(hdmi_core, "RockHdmiReadEdid")
+    ddc = procedure(hdmi_core, "RockHdmiReadEdidBlock")
     ddc_wait = procedure(hdmi_core, "RockHdmiWaitDdcDone")
     phy_write = procedure(hdmi_core, "RockHdmiPhyI2cWrite")
     phy_wait = procedure(hdmi_core, "RockHdmiWaitPhyI2c")
@@ -99,10 +99,20 @@ def main() -> int:
         require(field in telemetry, f"final HDMI telemetry omits {field}")
     require("RockHdmiStateTelemetry()" in display_up,
             "successful HDMI bring-up omits final raw-state telemetry")
-    dvi = enable.index("RockHdmiUpdate8(#ROCK_HDMI_A_HDCPCFG0,$01,$00)")
-    packetizer = enable.index("RockHdmiVideoPacketize()")
-    require(dvi < packetizer,
-            "DVI mode latch is not explicit before packetizer activation")
+    setup_order = (
+        "RockHdmiComposeTiming()",
+        "RockHdmiPhyConfigure(rock_mode_pixel_hz)",
+        "RockHdmiWrite8(#ROCK_HDMI_FC_CTRLDUR,12)",
+        "RockHdmiConfigureAvi()",
+        "RockHdmiVideoPacketize()",
+        "RockHdmiVideoCsc()",
+        "RockHdmiVideoSample()",
+        "RockHdmiVideoHdcp()",
+        "RockHdmiWrite8(#ROCK_HDMI_MC_SWRSTZ,$FD)",
+    )
+    require([enable.index(marker) for marker in setup_order] == sorted(
+        enable.index(marker) for marker in setup_order),
+        "HDMI setup no longer follows the released driver block order")
     for field in ("raw_version", "raw_sys_ctrl", "raw_sys_ctrl1",
                   "raw_dsp_ctrl0", "raw_dsp_ctrl1", "raw_win0_ctrl0",
                   "raw_win0_vir", "raw_win0_mst", "raw_htotal",
