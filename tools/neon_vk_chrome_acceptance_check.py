@@ -37,7 +37,7 @@ STACK_BYTES = 0x00100000
 LOADER_LR = 0xDEAD0000
 STEP_LIMIT = 2_000_000
 HOOK_STEP_LIMIT = 6_000_000
-HOOK_ASSERTIONS = 44
+HOOK_ASSERTIONS = 48
 GEOMETRY_ASSERTIONS = 45
 
 HOOK_LIBS = (
@@ -54,6 +54,7 @@ API_NAMES = (
     "NeonVkChromeBegin",
     "NeonVkChromeBox",
     "NeonVkChromeText",
+    "NeonVkChromeTextTex",
     "NeonVkChromeFanBegin",
     "NeonVkChromeFanPoint",
     "NeonVkChromeFanEnd",
@@ -267,7 +268,7 @@ def procedure_containing(text: str, needle: str) -> tuple[str, str]:
 def neon_hook_source_gate(text: str) -> int:
     names = (
         "NeonDrawBackendInstall", "NeonDrawBackendClear", "NeonDrawBackendActive",
-        "Neon_Box", "Neon_Text", "Neon_ScissorSet", "Neon_ScissorClear",
+        "Neon_Box", "Neon_Text", "Neon_TextTex", "Neon_ScissorSet", "Neon_ScissorClear",
         "NeonFanBegin", "NeonFanPoint", "NeonFanEnd", "NeonFanOutline",
         "NeonLinesBegin", "NeonLine", "NeonLinesEnd",
     )
@@ -290,6 +291,7 @@ def neon_hook_source_gate(text: str) -> int:
     assignments = (
         "gNeonBackendBox          = boxProc",
         "gNeonBackendText         = textProc",
+        "gNeonBackendTextTex      = textTexProc",
         "gNeonBackendScissorSet   = scissorSetProc",
         "gNeonBackendScissorClear = scissorClearProc",
         "gNeonBackendFanBegin     = fanBeginProc",
@@ -309,6 +311,7 @@ def neon_hook_source_gate(text: str) -> int:
     clear_targets = (
         "gNeonBackendBox          = @neon_BackendBoxUnbound",
         "gNeonBackendText         = @neon_BackendTextUnbound",
+        "gNeonBackendTextTex      = @neon_BackendTextTexUnbound",
         "gNeonBackendScissorSet   = @neon_BackendScissorSetUnbound",
         "gNeonBackendScissorClear = @neon_BackendScissorClearUnbound",
         "gNeonBackendFanBegin     = @neon_BackendFanBeginUnbound",
@@ -328,6 +331,7 @@ def neon_hook_source_gate(text: str) -> int:
     forwarding = (
         ("Neon_Box", "gNeonBackendBox(x, y, w, h, colour)"),
         ("Neon_Text", "gNeonBackendText(font, x, y, *s, colour)"),
+        ("Neon_TextTex", "gNeonBackendTextTex(font, x, y, *s, colour)"),
         ("Neon_ScissorSet", "gNeonBackendScissorSet(x, y, w, h)"),
         ("Neon_ScissorClear", "gNeonBackendScissorClear()"),
         ("NeonFanBegin", "gNeonBackendFanBegin()"),
@@ -401,6 +405,14 @@ def source_gate(text: str) -> int:
     if "Neon_AtlasRasterGlyphUV(" not in glyph:
         raise AssertionError("text path does not consume the copied Neon glyph UV contract")
     checks += 1
+    textured = bodies["NeonVkChromeTextTex"]
+    for marker in ("Neon_A(colour)", "Neon_AtlasRasterGeneration()", "glyphCount * 6", "Neon_AtlasRasterGlyphUV(", "nvcDraw(first, count, colour)"):
+        if marker not in textured:
+            raise AssertionError("textured text path lacks " + marker)
+    checks += 5
+    if "nvcAtlasRefresh()" not in bodies["NeonVkChromeBegin"]:
+        raise AssertionError("Begin does not refresh the bitmap atlas before recording")
+    checks += 1
 
     wrapper = bodies["NeonVkChromeCreate"]
     create = bodies["NeonVkChromeCreateWithCapacities"]
@@ -413,7 +425,7 @@ def source_gate(text: str) -> int:
         raise AssertionError("Create does not install exactly one complete hook-compatible primitive family")
     checks += 1
     callback_names = (
-        "Box", "Text", "ScissorSet", "ScissorClear", "FanBegin", "FanPoint",
+        "Box", "Text", "TextTex", "ScissorSet", "ScissorClear", "FanBegin", "FanPoint",
         "FanEnd", "FanOutline", "LinesBegin", "Line", "LinesEnd",
     )
     for callback in callback_names:

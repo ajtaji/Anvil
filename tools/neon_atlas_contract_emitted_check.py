@@ -26,7 +26,7 @@ STACK = 0x03000000
 STACK_BYTES = 0x00100000
 LOADER_LR = 0xDEAD0000
 STEP_LIMIT = 20_000_000
-ASSERTIONS = 41
+ASSERTIONS = 46
 
 MUTANTS = (
     (
@@ -43,7 +43,7 @@ MUTANTS = (
     ),
     (
         "a prior font's raster remains visible",
-        "If neon_rasterBuilt = 0 Or neon_rasterFontBits <> neon_fbits",
+        "If neon_rasterBuilt = 0 Or neon_rasterFontBits <> neon_fbits Or neon_rasterRevision <> neon_fontRevision",
         "If neon_rasterBuilt = 0",
         28,
     ),

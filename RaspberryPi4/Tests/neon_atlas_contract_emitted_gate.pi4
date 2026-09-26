@@ -50,6 +50,7 @@ Procedure.i Main()
   Protected base.i
   Protected ch.i
   Protected stableLeft.i
+  Protected generation.i
 
   ; The allocator normally assigns these two private buffers in NeonInit.
   ; Keeping them in BSS makes this a CPU-only emitted test.
@@ -121,6 +122,16 @@ Procedure.i Main()
   If PeekN(base + (((#NAC_EXPECT_H - 1) * #NAC_EXPECT_W) * 4)) <> $FFFFFFFF : ProcedureReturn 39 : EndIf
   If PeekN(base + ((((#NAC_EXPECT_H - 1) * #NAC_EXPECT_W) + 1) * 4)) <> 0 : ProcedureReturn 40 : EndIf
   If Neon_AtlasRasterGlyphUV(#NAC_LAST, @again) <> 1 Or again\bottom >= uv\top : ProcedureReturn 41 : EndIf
+
+  ; Reusing a bitmap address is an explicit new generation. The caller may
+  ; have changed the bits or cell metadata in place.
+  generation = Neon_AtlasRasterGeneration()
+  If generation <= 0 : ProcedureReturn 42 : EndIf
+  PokeA(@nacFontB[0], $FF)
+  If NeonFontUse(@nacFontB[0], #NAC_CELL_W, #NAC_CELL_H, #NAC_FIRST, #NAC_LAST) <> #NEON_OK : ProcedureReturn 43 : EndIf
+  If Neon_AtlasRasterReady() <> 0 Or Neon_AtlasRasterGeneration() <> 0 : ProcedureReturn 44 : EndIf
+  If Neon_AtlasRasterEnsure() <> #NEON_OK : ProcedureReturn 45 : EndIf
+  If Neon_AtlasRasterGeneration() <= generation Or PeekN(base) <> $FFFFFFFF : ProcedureReturn 46 : EndIf
 
   ProcedureReturn 0
 EndProcedure
