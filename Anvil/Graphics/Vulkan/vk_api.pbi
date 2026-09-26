@@ -1264,6 +1264,28 @@ Procedure vkDestroyRenderPass(device.i, renderPass.i, *pAllocator)
   AnvilVkRenderPassDestroy(device, renderPass)
 EndProcedure
 
+; The granularity is a performance hint for the render-pass configuration.
+; The accepted configuration is one 32-bpp colour target without MSAA.
+Procedure vkGetRenderAreaGranularity(device.i, renderPass.i, *pGranularity.VkExtent2D)
+  Define d.i
+  Define rp.i
+  If *pGranularity = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkGetRenderAreaGranularity needs a writable VkExtent2D output (Anvil code -20001, null pGranularity).")
+    ProcedureReturn
+  EndIf
+  d = avkDevSlot(device)
+  rp = avkRpSlot(renderPass)
+  If d = 0 Or rp = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetRenderAreaGranularity was given a stale device or render pass (Anvil code -20002); the output was left untouched.")
+    ProcedureReturn
+  EndIf
+  If avkRpDev[rp] <> d
+    avkFault(#ANVIL_VK_ERR_OWNER, "vkGetRenderAreaGranularity was given a render pass from another VkDevice (Anvil code -20003); the output was left untouched.")
+    ProcedureReturn
+  EndIf
+  avkBackendRenderAreaGranularity(*pGranularity)
+EndProcedure
+
 Procedure.i vkCreateImageView(device.i, *pCreateInfo.VkImageViewCreateInfo, *pAllocator, *pView)
   Define rc.i
   If *pCreateInfo = 0 Or *pView = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf

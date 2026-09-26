@@ -144,6 +144,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetImageMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageSparseMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageSparseMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageSubresourceLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageSubresourceLayout, domain) : EndIf
+  If avkDispatchName(*pName, "vkGetRenderAreaGranularity") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetRenderAreaGranularity, domain) : EndIf
   If avkDispatchName(*pName, "vkInvalidateMappedMemoryRanges") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkInvalidateMappedMemoryRanges, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceFeatures") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceFeatures, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceFormatProperties, domain) : EndIf

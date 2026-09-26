@@ -192,6 +192,15 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn n
 EndProcedure
 
+; One 32-bpp colour target without MSAA uses 64x64 V3D 4.2 tiles.
+; The accepted render-pass family has exactly that target configuration.
+Procedure avkBackendRenderAreaGranularity(*out.VkExtent2D)
+  Define tileIndex.i
+  tileIndex = V3dTileSizeIndex(1, 0, 0, 0)
+  *out\width = V3dTileWidthOf(tileIndex)
+  *out\height = V3dTileHeightOf(tileIndex)
+EndProcedure
+
 ; This first real texture tranche accepts one texel only. For a one-texel
 ; image the sole BGRA word at the linear image's base is also the sole useful
 ; texel of V3D's LINEARTILE level; every coordinate clamps to it. Wider images
