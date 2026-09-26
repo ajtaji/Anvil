@@ -1,0 +1,165 @@
+; vulkanBufferTransferProof.pi4 - ordered Vulkan buffer transfers on Pi 4.
+;
+; Diagnostic RAM payload. Compile with --load-addr 0x600000
+; --stack-addr 0x4F00000 --entry-returns. Run only with the Pi 4 board
+; lease, screen dma, a bounded deadman, and a fresh screenshot.
+;
+; Return x0 = 0 only when public Vulkan copy, fill, and update commands
+; produce the expected bytes and the recorded update retains its source
+; after the caller changes that source. Other x0 values identify the stage.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VBTP_ARENA = $0A000000
+#VBTP_ARENA_BYTES = $01000000
+#VBTP_SURFACE = $06000000
+#VBTP_WIN_BASE = $063E8000
+#VBTP_WIN_BYTES = 4227072
+#VBTP_MAP_SPAN = 8323072
+
+Procedure.i Main()
+  Define status.i = 1
+  Define neonReady.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define src.i, dst.i, srcMem.i, dstMem.i, srcMap.i, dstMap.i
+  Define fence.i, count.i, cbHandle.i, fenceArray.i, i.i, rc.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define region.VkBufferCopy
+  Define Dim regions.VkBufferCopy[2]
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define Dim updateData.l[2]
+
+  Repeat
+    If NeonArena(#VBTP_ARENA, #VBTP_ARENA_BYTES) <> #NEON_OK : status = 2 : Break : EndIf
+    If NeonSurface(#VBTP_SURFACE, 800, 1280, 3200) <> #NEON_OK : status = 3 : Break : EndIf
+    NeonSurfaceMapSpan(#VBTP_MAP_SPAN)
+    If NeonInit() <> #NEON_OK : status = 4 : Break : EndIf
+    neonReady = 1
+    If AnvilVkV3dWindow(#VBTP_WIN_BASE, #VBTP_WIN_BYTES) <> #VK_SUCCESS : status = 5 : Break : EndIf
+
+    ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : status = 6 : Break : EndIf
+    count = 1
+    If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS Or phys = 0 : status = 7 : Break : EndIf
+    prio = 0
+    qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    qci\queueCount = 1
+    qci\pQueuePriorities = @prio
+    dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    dci\queueCreateInfoCount = 1
+    dci\pQueueCreateInfos = @qci
+    If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : status = 8 : Break : EndIf
+    vkGetDeviceQueue(dev, 0, 0, @queue)
+    If queue = 0 : status = 9 : Break : EndIf
+
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\size = 64
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    If vkCreateBuffer(dev, @bci, 0, @src) <> #VK_SUCCESS : status = 10 : Break : EndIf
+    If vkCreateBuffer(dev, @bci, 0, @dst) <> #VK_SUCCESS : status = 11 : Break : EndIf
+    vkGetBufferMemoryRequirements(dev, src, @req)
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    mai\allocationSize = req\size
+    mai\memoryTypeIndex = 0
+    If vkAllocateMemory(dev, @mai, 0, @srcMem) <> #VK_SUCCESS : status = 12 : Break : EndIf
+    If vkBindBufferMemory(dev, src, srcMem, 0) <> #VK_SUCCESS : status = 13 : Break : EndIf
+    vkGetBufferMemoryRequirements(dev, dst, @req)
+    mai\allocationSize = req\size
+    If vkAllocateMemory(dev, @mai, 0, @dstMem) <> #VK_SUCCESS : status = 14 : Break : EndIf
+    If vkBindBufferMemory(dev, dst, dstMem, 0) <> #VK_SUCCESS : status = 15 : Break : EndIf
+    If vkMapMemory(dev, srcMem, 0, #VK_WHOLE_SIZE, 0, @srcMap) <> #VK_SUCCESS : status = 16 : Break : EndIf
+    If vkMapMemory(dev, dstMem, 0, #VK_WHOLE_SIZE, 0, @dstMap) <> #VK_SUCCESS : status = 17 : Break : EndIf
+    For i = 0 To 15
+      PokeL(srcMap + i * 4, $10000000 + i)
+      PokeL(dstMap + i * 4, $EEEEEEEE)
+    Next
+
+    pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : status = 18 : Break : EndIf
+    cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    cbai\commandPool = pool
+    cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    cbai\commandBufferCount = 1
+    If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : status = 19 : Break : EndIf
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS : status = 20 : Break : EndIf
+
+    ; Two regions in one call, then a fill, update and copy. The final copy
+    ; must read the update result, proving the mixed stream's order.
+    regions[0]\srcOffset = 0 : regions[0]\dstOffset = 0 : regions[0]\size = 16
+    regions[1]\srcOffset = 16 : regions[1]\dstOffset = 16 : regions[1]\size = 16
+    vkCmdCopyBuffer(cmd, src, dst, 2, @regions[0])
+    vkCmdFillBuffer(cmd, dst, 8, 8, $A1B2C3D4)
+    updateData[0] = $12345678 : updateData[1] = $90ABCDEF
+    vkCmdUpdateBuffer(cmd, dst, 16, 8, @updateData[0])
+    updateData[0] = 0 : updateData[1] = 0
+    region\srcOffset = 16 : region\dstOffset = 32 : region\size = 8
+    vkCmdCopyBuffer(cmd, dst, dst, 1, @region)
+    If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : status = 21 : Break : EndIf
+
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 22 : Break : EndIf
+    cbHandle = cmd
+    si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+    si\commandBufferCount = 1
+    si\pCommandBuffers = @cbHandle
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    If rc <> #VK_SUCCESS : status = 23 : Break : EndIf
+    fenceArray = fence
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 24 : Break : EndIf
+
+    For i = 0 To 15
+      If i = 0 Or i = 1 Or i = 6 Or i = 7
+        If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $10000000 + i : status = 25 : Break : EndIf
+      ElseIf i = 2 Or i = 3
+        If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $A1B2C3D4 : status = 26 : Break : EndIf
+      ElseIf i = 4 Or i = 8
+        If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $12345678 : status = 27 : Break : EndIf
+      ElseIf i = 5 Or i = 9
+        If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $90ABCDEF : status = 28 : Break : EndIf
+      Else
+        If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $EEEEEEEE : status = 29 : Break : EndIf
+      EndIf
+    Next
+    If status >= 25 : Break : EndIf
+    status = 0
+  Until 1
+
+  If dev <> 0
+    vkDeviceWaitIdle(dev)
+    If srcMap <> 0 : vkUnmapMemory(dev, srcMem) : EndIf
+    If dstMap <> 0 : vkUnmapMemory(dev, dstMem) : EndIf
+    If fence <> 0 : vkDestroyFence(dev, fence, 0) : EndIf
+    If pool <> 0 : vkDestroyCommandPool(dev, pool, 0) : EndIf
+    If src <> 0 : vkDestroyBuffer(dev, src, 0) : EndIf
+    If dst <> 0 : vkDestroyBuffer(dev, dst, 0) : EndIf
+    If srcMem <> 0 : vkFreeMemory(dev, srcMem, 0) : EndIf
+    If dstMem <> 0 : vkFreeMemory(dev, dstMem, 0) : EndIf
+    vkDestroyDevice(dev, 0)
+  EndIf
+  If inst <> 0 : vkDestroyInstance(inst, 0) : EndIf
+  If neonReady <> 0 : NeonShutdown() : EndIf
+  ProcedureReturn status
+EndProcedure
