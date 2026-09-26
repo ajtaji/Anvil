@@ -129,6 +129,7 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 Global Dim nwReport.l[#NW_REPORT_WORDS]
 Global Dim nwDmaScratch.a[768]
 Global Dim nwClear.l[4]
+Global Dim nwPairClear.l[4]
 Global Dim nwProbeX.i[12]
 Global Dim nwProbeY.i[12]
 
@@ -200,6 +201,41 @@ Procedure.i nwCapacityFrame()
   If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1 Or NeonVkChromePresentPending() <> 0
     ProcedureReturn #NW_ERR_PRESENT
   EndIf
+  ProcedureReturn #NW_OK
+EndProcedure
+
+; Capture the native oracle's box/alpha scene from the completed Vulkan
+; attachment. The source remains a real GPU image; the CPU only copies the
+; finished 64x64 BGRA region into the monitor's RAM readback slot.
+Procedure.i nwPairBoxesFrame(imageBase.i, imagePitch.i)
+  Define rc.i, x.i, y.i
+  ; IEEE-754 binary32 round-to-nearest for 17/255, 33/255 and 55/255.
+  nwPairClear[0] = $3D888889
+  nwPairClear[1] = $3E048485
+  nwPairClear[2] = $3E5CDCDD
+  nwPairClear[3] = $3F800000
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = Neon_Box(2, 3, 18, 11, Neon_RGBA(40, 70, 160, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Box(8, 8, 24, 14, Neon_RGBA(220, 90, 30, 128))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Box(-3, -2, 9, 7, Neon_RGBA(250, 250, 20, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromeDrawCount() <> 3 Or NeonVkChromeVertexCount() <> 18
+    ProcedureReturn #NW_ERR_COUNTS
+  EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA($07000000 + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
   ProcedureReturn #NW_OK
 EndProcedure
 
@@ -460,6 +496,18 @@ Procedure.i Main()
     ProcedureReturn nwReturn(#NW_ERR_COUNTS)
   EndIf
   nwPut(#NW_S_CAPACITY_BOXES, #NW_CAPACITY_BOXES)
+
+  ; This off-screen paired frame is consumed before the widget's ordinary
+  ; display frame. The first 16,384 bytes at $07000000 are readback only.
+  rc = nwPairBoxesFrame(imageBase, imagePitch)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
 
   ; Bind the display owner's DMA path before the scene consumes the adapter's
   ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
