@@ -131,13 +131,9 @@ secondary_spin:
   b    boot_kernel
 
 primary_cpu:
-  ; "Early GPU firmware revisions need a little break here" - the stock
-  ; stub's ldelay(100000) on the primary. rpi5_bl31_setup.c:128-129.
-  movz x0, #0x86A0
-  movk x0, #0x0001, lsl #16          ; 100000
-primary_delay:
-  sub  x0, x0, #1
-  cbnz x0, primary_delay
+  ; The firmware's delay, then the debug UART the stock stub would have
+  ; opened, then this stub's own line. See primary_prepare.
+  bl   primary_prepare
 
   ; The firmware clears the magic once it has written both words below.
   ; A non-zero magic means they were never written: say so, do not jump.
@@ -300,30 +296,82 @@ errata_done:
   ret
 
 ; ----------------------------------------------------------------------
-;  magic_not_cleared - the firmware never wrote the kernel/DTB words.
-;  Print "STUB MAGIC" on the debug UART (already at 115200 from the
-;  bootloader) and park. Loud, not a branch to address zero.
+;  primary_prepare - core 0 only, before it reads the firmware's words.
+;
+;  1. "Early GPU firmware revisions need a little break here" - the stock
+;     stub's ldelay(100000). rpi5_bl31_setup.c:128-129.
+;  2. Open the debug UART exactly as the stock stub does, because this
+;     stub replaces the code that did it: rpi5_console_init() ->
+;     console_pl011_core_init (TF-A drivers/arm/pl011/aarch64/
+;     pl011_console.S). Clock 921600*16*3 = 44,236,800 Hz
+;     (rpi_hw.h:220), 115200 baud: divisor = clock*4/baud = 1536,
+;     IBRD = 1536 >> 6 = 24, FBRD = 1536 & $3F = 0. LCR_H = FEN|WLEN_8 =
+;     $70, ECR cleared, CR = RXE|TXE|UARTEN = $301. First silicon boot,
+;     2026-09-26, with no UART setup anywhere: zero bytes on the wire.
+;  3. Say "ANVIL EL3 STUB" so a silent board can be told apart from a
+;     board whose stub ran and whose kernel did not.
 ; ----------------------------------------------------------------------
-magic_not_cleared:
+primary_prepare:
+  mov  x15, x30
+  movz x0, #0x86A0
+  movk x0, #0x0001, lsl #16          ; 100000
+primary_delay:
+  sub  x0, x0, #1
+  cbnz x0, primary_delay
+
+  movz x9, #0x1000
+  movk x9, #0x7D00, lsl #16
+  movk x9, #0x0010, lsl #32          ; PL011 $107D001000
+  str  wzr, [x9, #0x30]              ; UARTCR: disable before programming
+  movz w1, #24
+  str  w1, [x9, #0x24]               ; UARTIBRD
+  str  wzr, [x9, #0x28]              ; UARTFBRD
+  movz w1, #0x70
+  str  w1, [x9, #0x2C]               ; UARTLCR_H: FEN | WLEN_8
+  str  wzr, [x9, #0x04]              ; UARTECR: clear errors
+  movz w1, #0x0301
+  str  w1, [x9, #0x30]               ; UARTCR: RXE | TXE | UARTEN
+
+  adr  x10, stub_text
+  bl   uart_puts
+  mov  x30, x15
+  ret
+
+; ----------------------------------------------------------------------
+;  uart_puts - x10 = NUL-terminated string. Uses x9..x13.
+; ----------------------------------------------------------------------
+uart_puts:
   movz x9, #0x1000
   movk x9, #0x7D00, lsl #16
   movk x9, #0x0010, lsl #32          ; PL011 DR $107D001000
-  adr  x10, magic_text
-magic_next:
+puts_next:
   ldrb w11, [x10]
-  cbz  w11, magic_park
-magic_wait:
+  cbz  w11, puts_done
+puts_wait:
   ldr  w12, [x9, #0x18]              ; FR
   movz w13, #0x20                    ; TXFF
   and  w12, w12, w13
-  cbnz w12, magic_wait
+  cbnz w12, puts_wait
   str  w11, [x9]
   add  x10, x10, #1
-  b    magic_next
+  b    puts_next
+puts_done:
+  ret
+
+; ----------------------------------------------------------------------
+;  magic_not_cleared - the firmware never wrote the kernel/DTB words.
+;  Say so on the debug UART (opened by primary_prepare) and park. Loud,
+;  not a branch to address zero.
+; ----------------------------------------------------------------------
+magic_not_cleared:
+  adr  x10, magic_text
+  bl   uart_puts
 magic_park:
   wfe
   b    magic_park
 
+stub_text:
+  .byte 65, 78, 86, 73, 76, 32, 69, 76, 51, 32, 83, 84, 85, 66, 13, 10, 0  ; "ANVIL EL3 STUB\r\n"
 magic_text:
   .byte 83, 84, 85, 66, 32, 77, 65, 71, 73, 67, 13, 10, 0  ; "STUB MAGIC\r\n"
 

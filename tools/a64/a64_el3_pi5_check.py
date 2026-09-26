@@ -448,6 +448,21 @@ def make_cpu(blob: bytes, mpidr: int, midr: int | None = None) -> A64:
     return cpu
 
 
+def trace_uart(cpu: A64) -> list[int]:
+    """Record every byte stored to the debug UART's data register. The one
+    hook this gate installs on a store; returns the live list."""
+    captured: list[int] = []
+    orig_store = cpu.store
+
+    def traced_store(addr: int, value: int, size: int) -> None:
+        orig_store(addr, value, size)
+        if addr == UART_DR:
+            captured.append(value & 0xFF)
+
+    cpu.store = traced_store
+    return captured
+
+
 def run_bounded(cpu: A64, blob_len: int, limit: int) -> int:
     """Step until the pc leaves the stub or `limit` is reached. Returns
     the number of steps actually taken, so a run that never leaves can be
@@ -474,6 +489,7 @@ def check_primary(blob: bytes) -> list[str]:
     cpu.memory.update({DTB_PTR_OFF + i: (dtb >> (8 * i)) & 0xFF
                        for i in range(4)})
     cpu.memory.update({STUB_MAGIC_OFF + i: 0 for i in range(4)})  # cleared
+    uart_out = trace_uart(cpu)
 
     steps = run_bounded(cpu, len(blob), 400_000)
     if cpu.pc >= len(blob) and cpu.pc != kernel:
@@ -523,6 +539,24 @@ def check_primary(blob: bytes) -> list[str]:
                          "never erets, so preparing a return is dead code "
                          "or a drop somebody put back." % cpu.sysreg(reg))
     print("   elr_el3 / spsr_el3 untouched")
+
+    # The debug UART, opened as the stock stub's console_pl011_core_init
+    # does (this stub replaces the code that did it; the first silicon boot
+    # with no UART setup put zero bytes on the wire). UARTCR is written
+    # twice - off, then on - so its FINAL value is what is asserted here.
+    for off, want, name in ((0x24, 24, "UARTIBRD"), (0x28, 0, "UARTFBRD"),
+                            (0x2C, 0x70, "UARTLCR_H (FEN|WLEN_8)"),
+                            (0x30, 0x301, "UARTCR (RXE|TXE|UARTEN)")):
+        got = cpu.raw_load(UART_DR + off, 4)
+        if got != want:
+            fails.append("%s at 0x%X is 0x%X after core 0 ran; 115200 baud "
+                         "from 44,236,800 Hz needs 0x%X." % (name, UART_DR + off, got, want))
+    print("   debug UART: IBRD 24, FBRD 0, LCR_H 0x70, CR 0x301 (115200 8N1, FIFOs on)")
+    if bytes(uart_out) != b"ANVIL EL3 STUB\r\n":
+        fails.append("core 0 wrote %r to the UART before the branch; it must "
+                     "say exactly b'ANVIL EL3 STUB\\r\\n'." % bytes(uart_out))
+    else:
+        print("   said %r before branching" % bytes(uart_out))
 
     igroups = [cpu.raw_load(GICD_IGROUPR + 4 * i, 4) for i in range(11)]
     beyond = cpu.raw_load(GICD_IGROUPR + 4 * 11, 4)
@@ -613,15 +647,7 @@ def check_magic_not_cleared(blob: bytes) -> list[str]:
     # UART FR (+0x18) is never written here, so it reads zero from this
     # flat model's default - which is the "always ready to transmit" case
     # the task asked for.
-    captured: list[int] = []
-    orig_store = cpu.store
-
-    def traced_store(addr: int, value: int, size: int) -> None:
-        orig_store(addr, value, size)
-        if addr == UART_DR:
-            captured.append(value & 0xFF)
-
-    cpu.store = traced_store  # the one hook this gate installs on a store
+    captured = trace_uart(cpu)
 
     visited: list[int] = []
     limit = 260_000
@@ -634,7 +660,7 @@ def check_magic_not_cleared(blob: bytes) -> list[str]:
         cpu.step()
 
     got = bytes(captured)
-    want = b"STUB MAGIC\r\n"
+    want = b"ANVIL EL3 STUB\r\nSTUB MAGIC\r\n"
     if got != want:
         fails.append("the UART DR trace is %r and must be %r." % (got, want))
     else:
