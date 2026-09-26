@@ -539,6 +539,32 @@ Procedure.i nwPairStressFrame(imageBase.i, imagePitch.i, captureBase.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scene 14: after a refused zero-width rebind, render the
+; same target generation with a box and two forms of the word GEN2.
+Procedure.i nwPairGenerationFrame(imageBase.i, imagePitch.i, captureBase.i)
+  Define rc.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = Neon_Box(5, 5, 20, 20, Neon_RGBA(40, 70, 160, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_UI, 8, 8, "GEN2", Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_TextTex(#NEON_FONT_UI, 8, 8, "GEN2", Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA(captureBase + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
 ; The backend requires the framebuffer and attachment to have identical
 ; extents. Make the oracle target, draw once, then restore the widget target.
 Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPitch.i, scene.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, rotation.i, captureBase.i, nativePitch.i)
@@ -589,6 +615,14 @@ Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPi
     rc = NeonVkChromeRebind(framebuffer, logicalW, logicalH, physicalW, physicalH, imagePitch, rotation)
     If rc = #VK_SUCCESS : rebound = 1 : EndIf
   EndIf
+  If rc = #VK_SUCCESS And scene = 14
+    rc = NeonVkChromeRebind(framebuffer, 0, 64, 64, 64, imagePitch, 0)
+    If rc = #NEON_VK_CHROME_ERR_ARGS And NeonVkChromeError() = #NEON_VK_CHROME_ERR_ARGS
+      rc = NeonVkChromeRebind(framebuffer, 64, 64, 64, 64, imagePitch, 0)
+    Else
+      rc = #NW_ERR_COUNTS
+    EndIf
+  EndIf
   If rc = #VK_SUCCESS
     If scene = 0
       rc = nwPairClearFrame(imageBase, imagePitch, captureBase)
@@ -596,6 +630,8 @@ Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPi
       rc = nwPairEdgesFrame(imageBase, imagePitch)
     ElseIf scene = 13
       rc = nwPairStressFrame(imageBase, imagePitch, captureBase)
+    ElseIf scene = 14
+      rc = nwPairGenerationFrame(imageBase, imagePitch, captureBase)
     Else
       rc = nwPairRotationFrame(imageBase, imagePitch, physicalW, physicalH, captureBase, nativePitch)
     EndIf
@@ -978,6 +1014,16 @@ Procedure.i Main()
   Next
 
   rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, 0, 64, 64, 64, 64, 0, $07034000, 256)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, 14, 64, 64, 64, 64, 0, $0703C000, 256)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
