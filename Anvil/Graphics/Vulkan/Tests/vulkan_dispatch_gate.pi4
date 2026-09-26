@@ -59,6 +59,8 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceImageFormatProperties") = @vkGetPhysicalDeviceImageFormatProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties") = @vkGetPhysicalDeviceMemoryProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSparseImageFormatProperties") = @vkGetPhysicalDeviceSparseImageFormatProperties)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPhysicalDeviceSparseImageFormatProperties") = 0)
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateDevice") = @vkCreateDevice)
   Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties") = @vkEnumerateDeviceExtensionProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceLayerProperties") = @vkEnumerateDeviceLayerProperties)
@@ -93,6 +95,11 @@ Procedure.i Main()
   Vkd(count = 0 And propertySentinel = 99)
   count = 77
   Vkd(vkEnumerateDeviceLayerProperties($12345678, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(count = 77 And propertySentinel = 99)
+  vkGetPhysicalDeviceSparseImageFormatProperties(physical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_SAMPLE_COUNT_1_BIT, #VK_IMAGE_USAGE_SAMPLED_BIT, #VK_IMAGE_TILING_LINEAR, @count, @propertySentinel)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  vkGetPhysicalDeviceSparseImageFormatProperties($12345678, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_SAMPLE_COUNT_1_BIT, #VK_IMAGE_USAGE_SAMPLED_BIT, #VK_IMAGE_TILING_LINEAR, @count, @propertySentinel)
   Vkd(count = 77 And propertySentinel = 99)
 
   ; Representative device commands resolve identically through valid GIPA/GDPA.

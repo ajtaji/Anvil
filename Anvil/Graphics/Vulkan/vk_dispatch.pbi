@@ -138,6 +138,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetPhysicalDeviceImageFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceImageFormatProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceMemoryProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceMemoryProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceQueueFamilyProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceQueueFamilyProperties, domain) : EndIf
+  If avkDispatchName(*pName, "vkGetPhysicalDeviceSparseImageFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceSparseImageFormatProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkMapMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkMapMemory, domain) : EndIf
   If avkDispatchName(*pName, "vkQueueSubmit") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueSubmit, domain) : EndIf
   If avkDispatchName(*pName, "vkQueueWaitIdle") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueWaitIdle, domain) : EndIf
