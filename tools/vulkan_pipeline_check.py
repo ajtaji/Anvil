@@ -1010,7 +1010,7 @@ def grade(cpu, rc) -> Grader:
     g.need("[D] a set of the second layout's two-binding shape was allocated",
            slot(150), 0)
     g.need("[D] the write raised no fault", slot(118), 0)
-    g.need("[D] a descriptor copy is refused", slot(70), ERR_UNSUPPORTED)
+    g.need("[D] a malformed descriptor copy is refused", slot(70), ERR_ARGS)
     uniform_base = slot(69)
     g.want_true("[D] the uniform buffer has an address", uniform_base != 0,
                 hex(uniform_base))
@@ -1911,9 +1911,9 @@ DESCRIPTOR_MUTANTS = (
     ("a descriptor range may wrap past the end of its buffer",
      "    If range < #ANVIL_VK_UNIFORM_BYTES Or range > (size - off)\n",
      "    If range < #ANVIL_VK_UNIFORM_BYTES Or range > size\n"),
-    ("a descriptor copy is accepted",
-     "  If copyCount <> 0 Or *pCopies <> 0\n",
-     "  If copyCount < 0 Or *pCopies = -1\n"),
+    ("a malformed descriptor copy is accepted",
+     "  If (*copy\\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET\n",
+     "  If 0 = 1\n"),
     ("a write may claim a descriptor type different from its copied set schema",
      "  If t <> avkDsType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + b]\n",
      "  If t < 0\n"),

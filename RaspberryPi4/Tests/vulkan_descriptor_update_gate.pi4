@@ -1,0 +1,228 @@
+; Emitted public-API gate for ordered, atomic descriptor write arrays.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VDU_OUT = $06000000
+#VDU_ROWS = $06000100
+#VDU_HEAP = $02000000
+#VDU_MAGIC = $56445550 ; VDUP
+
+Global vduChecks.i
+Global vduFails.i
+
+Procedure Vdu(ok.i)
+  PokeN(#VDU_ROWS + vduChecks * 8, ok)
+  vduChecks = vduChecks + 1
+  If ok = 0 : vduFails = vduFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, layout.i, mixedLayout.i, pool.i, pool2.i, set.i, set2.i, set3.i, set4.i, buf.i, mem.i, slot.i, slot2.i
+  Define count.l = 1
+  Define prio.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define lci.VkDescriptorSetLayoutCreateInfo
+  Define Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Define pci.VkDescriptorPoolCreateInfo
+  Define size.VkDescriptorPoolSize
+  Define Dim mixedSizes.VkDescriptorPoolSize[2]
+  Define ai.VkDescriptorSetAllocateInfo
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define Dim info.VkDescriptorBufferInfo[2]
+  Define Dim writes.VkWriteDescriptorSet[2]
+  Define Dim copies.VkCopyDescriptorSet[2]
+
+  AnvilVkTestBackendHeap(#VDU_HEAP, $00100000)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vdu(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  Vdu(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS And count = 1)
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  Vdu(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+
+  bindings[0]\binding = 0
+  bindings[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[0]\descriptorCount = 1
+  bindings[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  bindings[1]\binding = 1
+  bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[1]\descriptorCount = 1
+  bindings[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  lci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  lci\bindingCount = 2 : lci\pBindings = @bindings[0]
+  Vdu(vkCreateDescriptorSetLayout(dev, @lci, 0, @layout) = #VK_SUCCESS)
+  size\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  size\descriptorCount = 4
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\maxSets = 2
+  pci\poolSizeCount = 1 : pci\pPoolSizes = @size
+  Vdu(vkCreateDescriptorPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool
+  ai\descriptorSetCount = 1 : ai\pSetLayouts = @layout
+  Vdu(vkAllocateDescriptorSets(dev, @ai, @set) = #VK_SUCCESS)
+  Vdu(vkAllocateDescriptorSets(dev, @ai, @set2) = #VK_SUCCESS)
+  slot = avkDsSlot(set) * #ANVIL_VK_MAX_SET_BINDINGS
+  slot2 = avkDsSlot(set2) * #ANVIL_VK_MAX_SET_BINDINGS
+
+  bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bci\size = 64
+  bci\usage = #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+  bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  Vdu(vkCreateBuffer(dev, @bci, 0, @buf) = #VK_SUCCESS)
+  vkGetBufferMemoryRequirements(dev, buf, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  Vdu(vkAllocateMemory(dev, @mai, 0, @mem) = #VK_SUCCESS)
+  Vdu(vkBindBufferMemory(dev, buf, mem, 0) = #VK_SUCCESS)
+
+  info[0]\buffer = buf : info[0]\offset = 0 : info[0]\range = 16
+  info[1]\buffer = buf : info[1]\offset = 16 : info[1]\range = 16
+  writes[0]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writes[0]\dstSet = set : writes[0]\dstBinding = 0
+  writes[0]\descriptorCount = 1
+  writes[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  writes[0]\pBufferInfo = @info[0]
+  writes[1]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  writes[1]\dstSet = set : writes[1]\dstBinding = 1
+  writes[1]\descriptorCount = 1
+  writes[1]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  writes[1]\pBufferInfo = @info[1]
+
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 2, @writes[0], 0, 0)
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsBuf[slot] = buf And avkDsBuf[slot + 1] = buf)
+  Vdu(avkDsOffset[slot] = 0 And avkDsOffset[slot + 1] = 16)
+
+  info[0]\offset = 32
+  info[1]\offset = 4
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 2, @writes[0], 0, 0)
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  Vdu(avkDsOffset[slot] = 0 And avkDsOffset[slot + 1] = 16)
+  Vdu(avkDsRange[slot] = 16 And avkDsRange[slot + 1] = 16)
+
+  info[1]\offset = 48
+  writes[1]\dstBinding = 0
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 2, @writes[0], 0, 0)
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsOffset[slot] = 48 And avkDsOffset[slot + 1] = 16)
+
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 0, 0)
+  Vdu(AnvilVkFaultCode() = 0 And avkDsOffset[slot] = 48)
+  avkFlightActive = 1
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 2, @writes[0], 0, 0)
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_STATE)
+  avkFlightActive = 0
+  Vdu(avkDsOffset[slot] = 48)
+
+  copies[0]\sType = #VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET
+  copies[0]\srcSet = set : copies[0]\srcBinding = 0
+  copies[0]\dstSet = set2 : copies[0]\dstBinding = 0
+  copies[0]\descriptorCount = 2
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsOffset[slot2] = 48 And avkDsOffset[slot2 + 1] = 16)
+
+  writes[0]\dstBinding = 0 : info[0]\offset = 32
+  copies[0]\descriptorCount = 1
+  copies[0]\dstBinding = 1
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @writes[0], 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsOffset[slot] = 32 And avkDsOffset[slot2 + 1] = 32)
+
+  copies[0]\srcSet = set2 : copies[0]\srcBinding = 0
+  copies[0]\dstSet = set2 : copies[0]\dstBinding = 1
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsOffset[slot2 + 1] = 48)
+
+  copies[0]\dstBinding = 0
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  Vdu(avkDsOffset[slot2] = 48 And avkDsOffset[slot2 + 1] = 48)
+
+  copies[0]\dstBinding = 2
+  info[0]\offset = 0
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 1, @writes[0], 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  Vdu(avkDsOffset[slot] = 32 And avkDsOffset[slot2] = 48)
+  copies[0]\dstBinding = 0
+  copies[0]\srcSet = set
+  copies[0]\dstSet = set2
+  copies[0]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  Vdu(avkDsOffset[slot2] = 48)
+
+  copies[0]\sType = #VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET
+  copies[0]\srcSet = set : copies[0]\srcBinding = 0
+  copies[0]\dstSet = set2 : copies[0]\dstBinding = 0
+  copies[1]\sType = #VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET
+  copies[1]\srcSet = set2 : copies[1]\srcBinding = 0
+  copies[1]\dstSet = set2 : copies[1]\dstBinding = 1
+  copies[1]\descriptorCount = 1
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 2, @copies[0])
+  Vdu(AnvilVkFaultCode() = 0)
+  Vdu(avkDsOffset[slot2] = 32 And avkDsOffset[slot2 + 1] = 32)
+
+  copies[0]\srcBinding = 1
+  copies[1]\dstBinding = 2
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 2, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  Vdu(avkDsOffset[slot2] = 32 And avkDsOffset[slot2 + 1] = 32)
+
+  bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  Vdu(vkCreateDescriptorSetLayout(dev, @lci, 0, @mixedLayout) = #VK_SUCCESS)
+  mixedSizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  mixedSizes[0]\descriptorCount = 2
+  mixedSizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  mixedSizes[1]\descriptorCount = 2
+  pci\maxSets = 2 : pci\poolSizeCount = 2 : pci\pPoolSizes = @mixedSizes[0]
+  Vdu(vkCreateDescriptorPool(dev, @pci, 0, @pool2) = #VK_SUCCESS)
+  ai\descriptorPool = pool2 : ai\pSetLayouts = @mixedLayout
+  Vdu(vkAllocateDescriptorSets(dev, @ai, @set3) = #VK_SUCCESS)
+  Vdu(vkAllocateDescriptorSets(dev, @ai, @set4) = #VK_SUCCESS)
+  copies[0]\srcSet = set3 : copies[0]\dstSet = set4
+  copies[0]\srcBinding = 0 : copies[0]\dstBinding = 0
+  copies[0]\descriptorCount = 2
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  copies[0]\srcBinding = 1 : copies[0]\dstSet = set
+  copies[0]\dstBinding = 1 : copies[0]\descriptorCount = 1
+  AnvilVkFaultClear()
+  vkUpdateDescriptorSets(dev, 0, 0, 1, @copies[0])
+  Vdu(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  vkDestroyDescriptorPool(dev, pool2, 0)
+  vkDestroyDescriptorSetLayout(dev, mixedLayout, 0)
+
+  vkDestroyDescriptorPool(dev, pool, 0)
+  vkDestroyDescriptorSetLayout(dev, layout, 0)
+  vkDestroyBuffer(dev, buf, 0)
+  vkFreeMemory(dev, mem, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  PokeN(#VDU_OUT, #VDU_MAGIC)
+  PokeN(#VDU_OUT + 8, vduChecks)
+  PokeN(#VDU_OUT + 16, vduFails)
+  ProcedureReturn vduFails
+EndProcedure
