@@ -610,10 +610,10 @@ def main() -> int:
           f"{steps:,} executed A64 instructions")
     print("  the real vkCreateImage, vkGetImageMemoryRequirements, vkAllocateMemory,")
     print("  vkBindImageMemory, vkMapMemory, vkUnmapMemory, vkCmdPipelineBarrier,")
-    print("  vkCmdClearColorImage, vkCmdCopyBuffer, vkQueueSubmit, vkCreateFence, vkGetFenceStatus,")
+    print("  vkCmdClearColorImage, vkCmdCopyBuffer, vkCmdFillBuffer, vkQueueSubmit, vkCreateFence, vkGetFenceStatus,")
     print("  vkWaitForFences, vkResetFences and")
     print("  vkDeviceWaitIdle ran; no MMIO, framebuffer, GPU or DMA was touched")
-    print("  every byte of the bound image still held its poison: no CPU clear exists")
+    print("  every byte of the bound image still held its poison: no CPU image clear exists")
 
     if not args.mutate:
         print("  (run with --mutate to also require every plausible mistake to be caught)")

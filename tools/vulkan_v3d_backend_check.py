@@ -190,8 +190,8 @@ DYNAMIC_MUTANTS = (
     (
         "a render target outside the mapped span reaches V3D",
         NEON_CORE,
-        "  If base < neon_mapBase Or (base - neon_mapBase) > (neon_mapBytes - bytes)\n",
-        "  If base < neon_mapBase And (base - neon_mapBase) > (neon_mapBytes - bytes)\n",
+        "    If base >= neon_mapBase And (base - neon_mapBase) <= (neon_mapBytes - bytes)\n",
+        "    If base >= neon_mapBase Or (base - neon_mapBase) <= (neon_mapBytes - bytes)\n",
     ),
     (
         "a geometry larger than the carved capacity is accepted",
@@ -418,8 +418,18 @@ def source_contract(text: str) -> list[str]:
     for snippet in REQUIRED_HOST_COHERENT_COMPLETION:
         if snippet not in render_wait:
             failures.append("the HOST_COHERENT completion contract lost: " + snippet)
+    # Buffer copies/fills write only the identity-mapped coherent heap. Keep
+    # the CPU fallback ban on the image, clear and draw backend methods.
+    render_text = text
+    for name in ("avkBackendSubmitBufferCopy", "avkBackendSubmitBufferFill"):
+        start = render_text.find("Procedure.i " + name + "(")
+        end = render_text.find("EndProcedure", start)
+        if start < 0 or end < start:
+            failures.append("the backend lost its bounded buffer transfer seam " + name)
+        else:
+            render_text = render_text[:start] + render_text[end + len("EndProcedure"):]
     for token in FORBIDDEN_TOKENS:
-        if token in text:
+        if token in render_text:
             failures.append("the backend holds a processor-side fallback token " + token)
 
     neon = NEON_CORE.read_text(encoding="utf-8")
@@ -428,7 +438,7 @@ def source_contract(text: str) -> list[str]:
     rebind = neon[begin:end] if begin >= 0 and end > begin else ""
     dynamic_required = (
         "If neon_inFrame <> 0",
-        "If base < neon_mapBase Or (base - neon_mapBase) > (neon_mapBytes - bytes)",
+        "mappedOk = NeonGpuRangeMapped(base, bytes)",
         "If pw > neon_capPhysW Or ph > neon_capPhysH",
         "If plan\\tileAllocBytes > neon_tallocBytes Or plan\\tileStateBytes > neon_tstateBytes",
         "rollbackRc = V3dRenderBegin(oldPw, oldPh, oldFmt)",
@@ -437,6 +447,16 @@ def source_contract(text: str) -> list[str]:
     for snippet in dynamic_required:
         if snippet not in rebind:
             failures.append("the transactional geometry contract lost: " + snippet)
+    start = neon.find("Procedure.i NeonGpuRangeMapped(")
+    end = neon.find("EndProcedure", start)
+    mapped = neon[start:end] if start >= 0 and end > start else ""
+    for snippet in (
+        "If base <= 0 Or bytes < 1 Or base + bytes <= base",
+        "If base >= neon_mapBase And (base - neon_mapBase) <= (neon_mapBytes - bytes)",
+        "If base >= neon_extraMapBase And (base - neon_extraMapBase) <= (neon_extraMapBytes - bytes)",
+    ):
+        if snippet not in mapped:
+            failures.append("the mapped-range contract lost: " + snippet)
     planned = rebind.find("r = V3dRenderBegin(pw, ph, outFmt)")
     tabled = rebind.find("neon_BuildCoordinateTables(pw, ph, cx, cy)")
     published = rebind.find("neon_fb = base")

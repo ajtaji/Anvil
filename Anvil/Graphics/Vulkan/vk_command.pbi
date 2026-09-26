@@ -78,6 +78,7 @@ EndStructure
 #ANVIL_VK_OP_CLEAR_COLOR = 2
 #ANVIL_VK_OP_COPY_BUFFER_IMAGE = 3
 #ANVIL_VK_OP_COPY_BUFFER = 4
+#ANVIL_VK_OP_FILL_BUFFER = 5
 
 ; "the tracker does not know yet" for a layout inside a recording.
 #ANVIL_VK_LAYOUT_UNKNOWN = -2
@@ -473,6 +474,61 @@ Procedure AnvilVkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, region
     avkOpSourceBytes[o] = *r\size
     i = i + 1
   Wend
+EndProcedure
+
+; A fill is a transfer into one bound coherent buffer. VK_WHOLE_SIZE is
+; rounded down to complete four-byte words, as required by core Vulkan.
+Procedure AnvilVkCmdFillBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, size.i, data.i)
+  Define c.i
+  Define d.i
+  Define bytes.i
+  Define targetSize.i
+  Define destination.i
+  Define o.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING Or avkCbRpActive[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdFillBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
+    ProcedureReturn
+  EndIf
+  targetSize = AnvilVkBufferSize(dstBuffer)
+  If dstOffset < 0 Or (dstOffset % 4) <> 0 Or dstOffset >= targetSize
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdFillBuffer requires a four-byte aligned offset inside the destination buffer (Anvil code -20001, invalid offset); correct the offset and buffer.")
+    ProcedureReturn
+  EndIf
+  If size = #VK_WHOLE_SIZE
+    bytes = ((targetSize - dstOffset) / 4) * 4
+  Else
+    bytes = size
+    If bytes < 1 Or (bytes % 4) <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdFillBuffer requires a positive four-byte multiple or VK_WHOLE_SIZE (Anvil code -20001, invalid size); correct the fill range.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  ; A whole-size range can round to zero. Validate the destination's owner,
+  ; usage and binding with one byte, then record no write.
+  If bytes = 0
+    If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, dstOffset, 1, @destination) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdFillBuffer needs a live, bound same-device transfer-destination buffer (Anvil code -20004, invalid buffer); bind the buffer and set TRANSFER_DST usage.")
+    EndIf
+    ProcedureReturn
+  EndIf
+  If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, dstOffset, bytes, @destination) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdFillBuffer needs a live, bound same-device transfer-destination buffer covering the complete range (Anvil code -20004, invalid buffer); repair the binding or range.")
+    ProcedureReturn
+  EndIf
+  o = avkOpAppend(c, #ANVIL_VK_OP_FILL_BUFFER)
+  If o = 0
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool ran out of recorded-command storage for vkCmdFillBuffer (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset unused command buffers.")
+    ProcedureReturn
+  EndIf
+  avkOpBuffer[o] = dstBuffer
+  avkOpBufferOffset[o] = dstOffset
+  avkOpSourceBytes[o] = bytes
+  avkOpColor[o] = data & $FFFFFFFF
 EndProcedure
 
 ; Exact bounded vkCmdCopyBufferToImage semantics: one tightly packed whole
@@ -1354,7 +1410,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       copies = copies + 1
       copyOp = o
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
-    ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+    ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
       bufferCopies = bufferCopies + 1
     EndIf
     o = avkOpNext[o]
@@ -1376,7 +1432,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given both a clear and a buffer-to-image copy (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. Record each backend job in its own command buffer until ordered multi-job submission exists.")
   EndIf
   If bufferCopies > 0 And (clears > 0 Or copies > 0)
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot mix a buffer copy with a clear or image copy in one backend job (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); submit these jobs separately.")
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot mix a buffer transfer or fill with a clear or image copy in one backend job (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); submit these jobs separately.")
   EndIf
   If avkCbRpDone[c] <> 0 And avkCbDrawCount[c] = 0
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer whose render pass contains no draw (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A render pass with no draw would be a clear wearing a render pass's clothes, and vkCmdClearColorImage is the honest way to ask for that.")
@@ -1409,6 +1465,10 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         EndIf
         If sourceBase < destinationBase + avkOpSourceBytes[o] And destinationBase < sourceBase + avkOpSourceBytes[o]
           ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping source and destination memory for vkCmdCopyBuffer (Anvil code -20001, overlapping copy); no copy was submitted.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], avkOpSourceBytes[o], @destinationBase) = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer fill now names a stale, unbound or wrong-device destination (Anvil code -20004, stale resource); no transfer was submitted.")
         EndIf
       EndIf
       o = avkOpNext[o]
@@ -1485,6 +1545,13 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         If job <> #ANVIL_VK_JOB_DONE
           avkFlightComplete(0)
           ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdCopyBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
+        destinationBase = AnvilVkBufferAddress(avkOpBuffer[o]) + avkOpBufferOffset[o]
+        job = avkBackendSubmitBufferFill(destinationBase, avkOpSourceBytes[o], avkOpColor[o])
+        If job <> #ANVIL_VK_JOB_DONE
+          avkFlightComplete(0)
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdFillBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
         EndIf
       EndIf
       o = avkOpNext[o]

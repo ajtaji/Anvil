@@ -1077,17 +1077,25 @@ def main() -> int:
     failures = []
     checks = check_registry(failures)
 
-    # The Pi backend must lower through the engine this tree proves on
-    # silicon, and must not contain a processor-side or DMA fallback: a
-    # fallback would let a green board test be a test of memcpy.
+    # The Pi backend must lower image work through the engine this tree
+    # proves on silicon. CPU writes are allowed only inside the coherent
+    # buffer copy/fill seams, never as image clear or draw fallbacks.
     backend_source = V3D_BACKEND.read_text(encoding="utf-8")
     for required in ("NeonRebindSurface", "NeonFrameBegin", "NeonFrameEnd"):
         if required not in backend_source:
             failures.append("the Pi 4 V3D backend omits " + required)
         checks += 1
-    for forbidden in ("PokeN(", "PokeI(", "PokeL(", "DspCopy", "DmaCopy", "DisplayClear",
+    image_backend_source = backend_source
+    for name in ("avkBackendSubmitBufferCopy", "avkBackendSubmitBufferFill"):
+        start = image_backend_source.find("Procedure.i " + name + "(")
+        end = image_backend_source.find("EndProcedure", start)
+        if start < 0 or end < start:
+            failures.append("the Pi 4 V3D backend omits the bounded buffer seam " + name)
+        else:
+            image_backend_source = image_backend_source[:start] + image_backend_source[end + len("EndProcedure"):]
+    for forbidden in ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy", "DisplayClear",
                       "DspDmaFill"):
-        if forbidden in backend_source:
+        if forbidden in image_backend_source:
             failures.append("the Pi 4 V3D backend contains the fallback token " + forbidden)
         checks += 1
 
@@ -1134,7 +1142,7 @@ def main() -> int:
           % (model_checks, steps))
     print("  production boundary executed in %d A64 instructions; device count stays zero"
           % prod_steps)
-    print("  the Pi 4 V3D backend lowers through Neon/V3D and holds no CPU or DMA fallback")
+    print("  the Pi 4 image path lowers through Neon/V3D and holds no CPU or DMA image fallback")
     if args.mutate_queue:
         caught, detail = queue_capability_mutation()
         if not caught:
