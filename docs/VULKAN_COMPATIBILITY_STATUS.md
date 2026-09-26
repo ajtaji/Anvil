@@ -78,6 +78,15 @@ settings through `NeonFontSetup` still need a renderer-neutral state query.
 The paired text proof uses a 256x16 scissor on the existing 800x1280 target,
 so target rebind and the remaining 13 native scenes still need proof.
 
+Native oracle scene 3 now passes the same full-pixel Pi 4 comparison: two
+nested scissors and a final zero-size clip leave exactly the native 16,384
+BGRA bytes. The RAM payload returned under the 15-second deadman with fresh
+capture 11, and the established widget frame still passed 133 checks. Its
+report, raw clip pixels and capture are in
+`docs/evidence/vulkan-paired-clips-20260926/`. Three native scenes are now
+paired; the Vulkan producer still uses one oversized attachment rather than
+the oracle's changing target extents.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor

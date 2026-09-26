@@ -291,6 +291,35 @@ Procedure.i nwPairGlyphsFrame(imageBase.i, imagePitch.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scene 3: two nested clips followed by an empty clip. The
+; final box must leave every pixel untouched even if its draw is recorded.
+Procedure.i nwPairClipsFrame(imageBase.i, imagePitch.i)
+  Define rc.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorSet(3, 3, 30, 24)
+  rc = Neon_Box(0, 0, 50, 40, Neon_RGBA(200, 40, 80, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Neon_ScissorSet(10, 10, 8, 8)
+  rc = Neon_Box(0, 0, 40, 40, Neon_RGBA(20, 220, 120, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Neon_ScissorSet(0, 0, 0, 0)
+  rc = Neon_Box(0, 0, 64, 64, Neon_RGBA(250, 250, 250, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA($0700C000 + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  Neon_ScissorClear()
+  ProcedureReturn #NW_OK
+EndProcedure
+
 Procedure.i Main()
   Define rc.i
   Define count.i
@@ -562,6 +591,16 @@ Procedure.i Main()
   EndIf
 
   rc = nwPairGlyphsFrame(imageBase, imagePitch)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairClipsFrame(imageBase, imagePitch)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
