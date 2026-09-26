@@ -117,6 +117,15 @@ deadman off and core leases zero. See
 `docs/evidence/vulkan-paired-order-20260926/`. Seven native scenes are now
 paired, with eight scenes and changing target extents still outstanding.
 
+Native oracle scene 8 now matches the 16,384-byte Pi 4 Vulkan crop too:
+single pixels at both corners survive, and the box starting at (64,64)
+does not affect the captured 64x64 region. This is a crop-level proof;
+the Vulkan attachment is still 800x1280, so the third box is not yet a
+proof of target-bound rejection. The RAM payload returned under the
+15-second deadman with fresh capture 18, and the board was released cleanly.
+See `docs/evidence/vulkan-paired-edges-20260926/`. Eight native scenes
+are paired; seven scenes and target-extent parity remain outstanding.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
