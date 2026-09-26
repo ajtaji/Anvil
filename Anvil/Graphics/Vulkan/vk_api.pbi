@@ -14,10 +14,9 @@
 ; gets a compile-time refusal naming it, which is the loudest possible
 ; answer and far better than a stub that returns VK_SUCCESS.
 ;
-; There is no loader, no vkGetInstanceProcAddr, no dispatch table, no
-; layer interface and no extension negotiation. A program calls these
-; names directly, at link time. That is a real limitation and it is in
-; the capability table.
+; There is no platform loader, layer interface or extension negotiation.
+; Direct calls and the separately included vk_dispatch.pbi expose only
+; the implemented subset recorded in the capability table.
 ;
 ; The include order is fixed and explicit:
 ;     XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
@@ -43,6 +42,28 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  INSTANCE, PHYSICAL DEVICE, DEVICE, QUEUE
 ; ----------------------------------------------------------------------
+; No layers or extensions are implemented. Enumeration still has the Vulkan
+; two-call shape: a null output array is a count query, and any capacity is
+; enough for an empty list. A named layer cannot supply extensions.
+Procedure.i vkEnumerateInstanceLayerProperties(*pPropertyCount, *pProperties)
+  If *pPropertyCount = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkEnumerateInstanceLayerProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
+  EndIf
+  PokeL(*pPropertyCount, 0)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i vkEnumerateInstanceExtensionProperties(*pLayerName, *pPropertyCount, *pProperties)
+  If *pPropertyCount = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkEnumerateInstanceExtensionProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
+  EndIf
+  If *pLayerName <> 0
+    ProcedureReturn avkFault(#VK_ERROR_LAYER_NOT_PRESENT, "vkEnumerateInstanceExtensionProperties was given a layer name (VkResult -6, VK_ERROR_LAYER_NOT_PRESENT); Anvil has no layers. Pass a null pLayerName to enumerate implementation extensions.")
+  EndIf
+  PokeL(*pPropertyCount, 0)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure.i vkCreateInstance(*pCreateInfo.VkInstanceCreateInfo, *pAllocator, *pInstance)
   Define rc.i
   If *pCreateInfo = 0 Or *pInstance = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
@@ -77,6 +98,20 @@ EndProcedure
 
 Procedure.i vkEnumeratePhysicalDevices(instance.i, *pPhysicalDeviceCount, *pPhysicalDevices)
   ProcedureReturn AnvilVkPhysicalEnumerate(instance, *pPhysicalDeviceCount, *pPhysicalDevices)
+EndProcedure
+
+Procedure.i vkEnumerateDeviceExtensionProperties(physicalDevice.i, *pLayerName, *pPropertyCount, *pProperties)
+  If *pPropertyCount = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkEnumerateDeviceExtensionProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkEnumerateDeviceExtensionProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the count and properties were left untouched.")
+  EndIf
+  If *pLayerName <> 0
+    ProcedureReturn avkFault(#VK_ERROR_LAYER_NOT_PRESENT, "vkEnumerateDeviceExtensionProperties was given a layer name (VkResult -6, VK_ERROR_LAYER_NOT_PRESENT); Anvil has no layers. Pass a null pLayerName to enumerate implementation extensions.")
+  EndIf
+  PokeL(*pPropertyCount, 0)
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperties.VkPhysicalDeviceMemoryProperties)
