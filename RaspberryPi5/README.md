@@ -1,9 +1,35 @@
 # Raspberry Pi 5 source bring-up
 
-There is no Raspberry Pi 5 Anvil image or hardware boot proof. The Pi 5 is not
-connected. The prepared card in the separate vault has FAT32 and exFAT volumes,
-Pi 5 DTB variants and overlays, but no `ANVIL5.IMG`. Do not put the Pi 4
+The prepared Pi 5 card has a first-entry **diagnostic** `ANVIL5.IMG`, not a
+network-capable Anvil monitor. The Pi 5 is not connected, so firmware handoff,
+serial output and Wi-Fi remain unproved on hardware. Do not put the Pi 4
 `kernel8.img` in its place.
+
+`Boot/board.pi4` produces the diagnostic with the IDE compiler:
+
+```powershell
+PureMetalForge.exe --compile RaspberryPi5/Boot/board.pi4 -t pi4 -o runs/pi5-entry.img
+```
+
+The present compiler has only the Pi 4 AArch64 target. This source uses that
+instruction emitter without its BCM2711 hardware intrinsics or libraries. It
+is linked at the documented 64-bit firmware default `$200000`, with separate
+BSS at `$400000` and stack at `$800000`. The emitter's `_start` sets the stack,
+masks exceptions and clears BSS using x9/x10/x16; it does not modify x0 before
+the source saves the expected live FDT pointer. These are source and compiler
+checks, not Pi 5 firmware measurements. The image writes `ANVIL PI5` and
+`FDT 0` (missing pointer), `FDT 1` (magic only) or `FDT 2` (bad magic) at
+115200 baud on the dedicated 3.3 V Pi 5 debug UART. It then stays in a loop.
+It cannot read the card, display a prompt, or join Wi-Fi.
+
+The source DTB's UART10 child address `$7D001000` translates through `/soc`
+`ranges` to CPU physical `$107D001000`. The WLAN is a function on BCM2712
+SDIO2 at physical `$1001100000`, 4-bit, non-removable, with a WL_ON regulator.
+`dtb_contract.py` now validates both translations and the wireless bus
+contract across all three staged tree variants. A previous untested diagnostic
+used `$107C001000`; it was replaced on the card before any Pi 5 boot.
+Wi-Fi requires a Pi 5 SDIO2 transport, power/clock/pin setup, firmware upload,
+and the existing CYW43 protocol and network stack, followed by board proof.
 
 `Boot/dtb_contract.py` is a **host-side source-tree preflight**. It validates
 the FDT envelope, node structure, Pi 5/BCM2712 identity, memory node, enabled

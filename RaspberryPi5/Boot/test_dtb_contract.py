@@ -3,9 +3,10 @@
 import struct
 import unittest
 import os
+import re
 from pathlib import Path
 
-from dtb_contract import DtbError, early_uart, inspect, parse
+from dtb_contract import DtbError, early_uart, inspect, parse, wlan_sdio
 
 
 VAULT_DTB = Path(os.environ["PI5_DTB_DIR"]) if "PI5_DTB_DIR" in os.environ else None
@@ -30,6 +31,20 @@ class DtbContractTests(unittest.TestCase):
                 self.assertEqual(result["early_uart"],
                                  "/soc@107c000000/serial@7d001000")
                 self.assertIn("arm,pl011", result["early_uart_compatible"])
+                self.assertEqual(result["early_uart_physical"], 0x107D001000)
+                self.assertEqual(result["wifi_sdio_host"], "/axi/mmc@1100000")
+                self.assertEqual(result["wifi_sdio_physical"], 0x1001100000)
+
+    def test_first_entry_uart_constant_matches_translated_dtb(self):
+        source = Path(__file__).with_name("board.pi4").read_text()
+        constant = re.search(r"^#PI5_UART_DR\s*=\s*\$([0-9A-Fa-f]+)$",
+                             source, re.MULTILINE)
+        self.assertIsNotNone(constant)
+        expected = int(constant.group(1), 16)
+        for name in VARIANTS:
+            with self.subTest(name=name):
+                result = inspect((VAULT_DTB / name).read_bytes())
+                self.assertEqual(expected, result["early_uart_physical"])
 
     def test_early_uart_refuses_missing_and_disabled_targets(self):
         good = parse((VAULT_DTB / VARIANTS[0]).read_bytes())
@@ -72,6 +87,21 @@ class DtbContractTests(unittest.TestCase):
         self.assertEqual(len(good), len(bad))
         with self.assertRaisesRegex(DtbError, "does not identify"):
             inspect(bad)
+
+    def test_rejects_unmapped_uart_and_disabled_wlan(self):
+        good = parse((VAULT_DTB / VARIANTS[0]).read_bytes())
+        bad = {path: props.copy() for path, props in good.items()}
+        bad["/soc@107c000000"]["ranges"] = b"\0" * 16
+        with self.assertRaisesRegex(DtbError, "not covered"):
+            early_uart(bad)
+        bad = {path: props.copy() for path, props in good.items()}
+        bad["/axi/mmc@1100000"]["status"] = b"disabled\0"
+        with self.assertRaisesRegex(DtbError, "disabled or not 4-bit"):
+            wlan_sdio(bad)
+        bad["/axi/mmc@1100000"]["status"] = b"okay\0"
+        del bad["/axi/mmc@1100000"]["vmmc-supply"]
+        with self.assertRaisesRegex(DtbError, "power or pin"):
+            wlan_sdio(bad)
 
 
 if __name__ == "__main__":
