@@ -575,16 +575,37 @@ Procedure.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *bas
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i avkTransferBufferResolve(buffer.i, deviceSlot.i, usage.i, offset.i, bytes.i, *baseOut)
+  Define b.i
+  Define base.i
+  If *baseOut <> 0 : PokeI(*baseOut, 0) : EndIf
+  b = avkBufSlot(buffer)
+  If b = 0 Or avkBufDev[b] <> deviceSlot Or avkBufBound[b] = 0 : ProcedureReturn 0 : EndIf
+  If (avkBufUsage[b] & usage) = 0 : ProcedureReturn 0 : EndIf
+  If offset < 0 Or bytes < 1 Or offset >= avkBufSize[b] Or bytes > (avkBufSize[b] - offset) : ProcedureReturn 0 : EndIf
+  base = AnvilVkBufferAddress(buffer)
+  If base = 0 : ProcedureReturn 0 : EndIf
+  If *baseOut <> 0 : PokeI(*baseOut, base + offset) : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure avkCopyBufferRetain(c.i)
   Define o.i
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         avkBufInFlight[b] = avkBufInFlight[b] + 1
         avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+      EndIf
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+        b = avkBufSlot(avkOpDstBuffer[o])
+        If b <> 0
+          avkBufInFlight[b] = avkBufInFlight[b] + 1
+          avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] + 1
+        EndIf
       EndIf
     EndIf
     o = avkOpNext[o]
@@ -596,11 +617,18 @@ Procedure avkCopyBufferRelease(c.i)
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
         If avkMemInFlight[avkBufMemSlot[b]] > 0 : avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1 : EndIf
+      EndIf
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+        b = avkBufSlot(avkOpDstBuffer[o])
+        If b <> 0
+          If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf
+          If avkMemInFlight[avkBufMemSlot[b]] > 0 : avkMemInFlight[avkBufMemSlot[b]] = avkMemInFlight[avkBufMemSlot[b]] - 1 : EndIf
+        EndIf
       EndIf
     EndIf
     o = avkOpNext[o]

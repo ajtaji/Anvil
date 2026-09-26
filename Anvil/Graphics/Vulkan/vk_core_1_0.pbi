@@ -698,6 +698,13 @@ Structure VkFenceCreateInfo Align #PB_Structure_AlignC
   flags.l
 EndStructure
 
+; Three VkDeviceSize members; 24 bytes with eight-byte alignment on AArch64.
+Structure VkBufferCopy Align #PB_Structure_AlignC
+  srcOffset.q
+  dstOffset.q
+  size.q
+EndStructure
+
 Structure VkEventCreateInfo Align #PB_Structure_AlignC
   sType.l
   *pNext

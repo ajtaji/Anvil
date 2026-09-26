@@ -92,6 +92,10 @@ Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   ProcedureReturn -1
 EndProcedure
 
+Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
+  ProcedureReturn -1
+EndProcedure
+
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
   ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
 EndProcedure

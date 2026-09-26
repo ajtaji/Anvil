@@ -787,6 +787,22 @@ Procedure.i vkCreateEvent(device.i, *pCreateInfo.VkEventCreateInfo, *pAllocator,
   ProcedureReturn AnvilVkEventCreate(device, *pEvent)
 EndProcedure
 
+; Exact core-1.0 signature. The current backend accepts one complete region
+; per submission and rejects larger arrays before recording any partial work.
+Procedure vkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, regionCount.i, *pRegions.VkBufferCopy)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyBuffer was given a stale VkCommandBuffer (Anvil code -20002, invalid handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If regionCount <> 1 Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBuffer requires exactly one VkBufferCopy region (Anvil code -20005, region arrays not implemented); no partial copy was recorded.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, *pRegions)
+EndProcedure
+
 Procedure vkDestroyEvent(device.i, event.i, *pAllocator)
   Define rc.i
   If avkNoAllocator(*pAllocator, 14) <> #VK_SUCCESS

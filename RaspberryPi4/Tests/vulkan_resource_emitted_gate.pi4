@@ -112,6 +112,12 @@ Procedure.i Main()
   Define offC.i
   Define imgBase.i
   Define mapped.i
+  Define copySrc.i
+  Define copyDst.i
+  Define copySrcMem.i
+  Define copyDstMem.i
+  Define copySrcPtr.i
+  Define copyDstPtr.i
 
   Define ici.VkInstanceCreateInfo
   Define dci.VkDeviceCreateInfo
@@ -130,6 +136,8 @@ Procedure.i Main()
   Define pbDstStage.i
   Define pbMemoryBarrierCount.i
   Define range.VkImageSubresourceRange
+  Define copyBufferInfo.VkBufferCreateInfo
+  Define copyRegion.VkBufferCopy
   Define cbHandle.i
   Define cb2Handle.i
   Define si2.VkSubmitInfo
@@ -793,6 +801,86 @@ Procedure.i Main()
   vkDestroyImage(dev, img, 0)
   Vkr(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
   Sentence()
+  ; One real buffer transfer, including unmodified bytes on either side of
+  ; the region. Both buffers use separate memory allocations to rule out a
+  ; coincidental alias or a copy that bypasses the recorded offsets.
+  copyBufferInfo\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  copyBufferInfo\size = 32
+  copyBufferInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copySrc) = #VK_SUCCESS)
+  copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copyDst) = #VK_SUCCESS)
+  vkGetBufferMemoryRequirements(dev, copySrc, @req)
+  mai\allocationSize = req\size
+  Vkr(vkAllocateMemory(dev, @mai, 0, @copySrcMem) = #VK_SUCCESS)
+  Vkr(vkAllocateMemory(dev, @mai, 0, @copyDstMem) = #VK_SUCCESS)
+  Vkr(vkBindBufferMemory(dev, copySrc, copySrcMem, 0) = #VK_SUCCESS)
+  Vkr(vkBindBufferMemory(dev, copyDst, copyDstMem, 0) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copySrcMem, 0, 32, 0, @copySrcPtr) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  i = 0
+  While i < 32
+    PokeA(copySrcPtr + i, i + 31)
+    PokeA(copyDstPtr + i, $A5)
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copySrcMem)
+  vkUnmapMemory(dev, copyDstMem)
+  copyRegion\srcOffset = 4
+  copyRegion\dstOffset = 8
+  copyRegion\size = 16
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cmd
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  i = 0
+  While i < 32
+    If i >= 8 And i < 24
+      Vkr(PeekA(copyDstPtr + i) = i + 27)
+    Else
+      Vkr(PeekA(copyDstPtr + i) = $A5)
+    EndIf
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyDstMem)
+
+  ; Two recorded transfers exceed the current one-job backend. Submission
+  ; refuses before copying either one, leaving the first destination byte.
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  PokeA(copyDstPtr + 8, $E7)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekA(copyDstPtr + 8) = $E7)
+  vkUnmapMemory(dev, copyDstMem)
+
+  ; Vulkan forbids a source and destination region that touch the same
+  ; bytes, even when both usage bits are present on one buffer.
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copySrc, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; The recorded destination handle must not silently revive after destroy.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  vkDestroyBuffer(dev, copyDst, 0)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  vkDestroyBuffer(dev, copySrc, 0)
+  vkFreeMemory(dev, copySrcMem, 0)
+  vkFreeMemory(dev, copyDstMem, 0)
   AnvilVkFaultClear()
   vkFreeMemory(dev, mem, 0)
   Vkr(AnvilVkFaultCode() = #ANVIL_VK_OK)
