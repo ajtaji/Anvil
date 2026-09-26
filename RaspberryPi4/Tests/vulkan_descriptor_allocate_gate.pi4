@@ -1,0 +1,125 @@
+; Emitted public-API gate for transactional descriptor-set array allocation.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VDA_OUT = $06000000
+#VDA_ROWS = $06000100
+#VDA_HEAP = $02000000
+#VDA_MAGIC = $5644414C ; VDAL
+
+Global vdaChecks.i
+Global vdaFails.i
+
+Procedure Vda(ok.i)
+  PokeN(#VDA_ROWS + vdaChecks * 8, ok)
+  vdaChecks = vdaChecks + 1
+  If ok = 0 : vdaFails = vdaFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, uboLayout.i, imageLayout.i, pool.i, pool2.i
+  Define p.i, p2.i, oldUbo.i, oldImage.i, oldOther.i
+  Define count.l = 1
+  Define prio.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define lci.VkDescriptorSetLayoutCreateInfo
+  Define binding.VkDescriptorSetLayoutBinding
+  Define pci.VkDescriptorPoolCreateInfo
+  Define Dim sizes.VkDescriptorPoolSize[2]
+  Define ai.VkDescriptorSetAllocateInfo
+  Define Dim layouts.i[2]
+  Define Dim outputs.i[2]
+
+  AnvilVkTestBackendHeap(#VDA_HEAP, $00100000)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vda(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  Vda(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS And count = 1)
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  Vda(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+
+  binding\binding = 0
+  binding\descriptorCount = 1
+  binding\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  lci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  lci\bindingCount = 1 : lci\pBindings = @binding
+  binding\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  Vda(vkCreateDescriptorSetLayout(dev, @lci, 0, @uboLayout) = #VK_SUCCESS)
+  binding\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  Vda(vkCreateDescriptorSetLayout(dev, @lci, 0, @imageLayout) = #VK_SUCCESS)
+
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  sizes[0]\descriptorCount = 1
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  sizes[1]\descriptorCount = 1
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  pci\maxSets = 2
+  pci\poolSizeCount = 2 : pci\pPoolSizes = @sizes[0]
+  Vda(vkCreateDescriptorPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+  p = avkDpSlot(pool)
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool
+  ai\descriptorSetCount = 2 : ai\pSetLayouts = @layouts[0]
+  layouts[0] = uboLayout : layouts[1] = imageLayout
+  outputs[0] = $1111 : outputs[1] = $2222
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_SUCCESS)
+  Vda(avkDsSlot(outputs[0]) <> 0 And avkDsSlot(outputs[1]) <> 0 And outputs[0] <> outputs[1])
+  Vda(avkDpSetsOut[p] = 2 And avkDpUboOut[p] = 1 And avkDpSampleOut[p] = 1)
+  oldUbo = outputs[0] : oldImage = outputs[1]
+  Vda(vkFreeDescriptorSets(dev, pool, 2, @outputs[0]) = #VK_SUCCESS)
+  Vda(avkDpSetsOut[p] = 0 And avkDpUboOut[p] = 0 And avkDpSampleOut[p] = 0)
+
+  layouts[1] = $12345678
+  outputs[0] = $1111 : outputs[1] = $2222
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #ANVIL_VK_ERR_HANDLE)
+  Vda(outputs[0] = #VK_NULL_HANDLE And outputs[1] = #VK_NULL_HANDLE)
+  Vda(avkDpSetsOut[p] = 0 And avkDpUboOut[p] = 0 And avkDpSampleOut[p] = 0)
+
+  layouts[1] = uboLayout
+  outputs[0] = $1111 : outputs[1] = $2222
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_ERROR_OUT_OF_POOL_MEMORY)
+  Vda(outputs[0] = #VK_NULL_HANDLE And outputs[1] = #VK_NULL_HANDLE)
+  Vda(avkDpSetsOut[p] = 0 And avkDpUboOut[p] = 0 And avkDpSampleOut[p] = 0)
+
+  layouts[1] = imageLayout
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_SUCCESS)
+  Vda(outputs[0] <> oldUbo And outputs[1] <> oldImage)
+  Vda(avkDsSlot(oldUbo) = 0 And avkDsSlot(oldImage) = 0)
+  oldUbo = outputs[0] : oldImage = outputs[1]
+  outputs[0] = $1111 : outputs[1] = $2222
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_ERROR_OUT_OF_POOL_MEMORY)
+  Vda(outputs[0] = #VK_NULL_HANDLE And outputs[1] = #VK_NULL_HANDLE)
+  Vda(avkDpSetsOut[p] = 2 And avkDpUboOut[p] = 1 And avkDpSampleOut[p] = 1)
+
+  sizes[0]\descriptorCount = 2 : sizes[1]\descriptorCount = 2
+  pci\maxSets = 3
+  Vda(vkCreateDescriptorPool(dev, @pci, 0, @pool2) = #VK_SUCCESS)
+  p2 = avkDpSlot(pool2)
+  ai\descriptorPool = pool2
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_SUCCESS)
+  Vda(avkDsSlot(outputs[0]) <> 0 And avkDsSlot(outputs[1]) <> 0)
+  oldOther = outputs[0]
+  ai\descriptorSetCount = 1
+  outputs[0] = $1111
+  Vda(vkAllocateDescriptorSets(dev, @ai, @outputs[0]) = #VK_ERROR_TOO_MANY_OBJECTS)
+  Vda(outputs[0] = #VK_NULL_HANDLE)
+  Vda(avkDpSetsOut[p2] = 2 And avkDpUboOut[p2] = 1 And avkDpSampleOut[p2] = 1)
+  vkDestroyDescriptorPool(dev, pool2, 0)
+  Vda(avkDsSlot(oldOther) = 0 And avkDpSetsOut[p2] = 0)
+  Vda(avkDsSlot(oldUbo) <> 0 And avkDsSlot(oldImage) <> 0)
+  vkDestroyDescriptorPool(dev, pool, 0)
+  vkDestroyDescriptorSetLayout(dev, imageLayout, 0)
+  vkDestroyDescriptorSetLayout(dev, uboLayout, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+
+  PokeN(#VDA_OUT, #VDA_MAGIC)
+  PokeN(#VDA_OUT + 8, vdaChecks)
+  PokeN(#VDA_OUT + 16, vdaFails)
+  ProcedureReturn vdaFails
+EndProcedure
