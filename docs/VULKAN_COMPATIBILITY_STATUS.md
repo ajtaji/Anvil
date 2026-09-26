@@ -109,6 +109,14 @@ released with the deadman off and all core leases zero. See
 captures, and SHA-256 manifests. Six native scenes are paired; the other
 nine and changing target extents remain to be tested.
 
+Native oracle scene 6 also matches exactly on Pi 4: an opaque box, textured
+text inside a scissor, and a diagonal line after clearing that scissor kept
+the native draw order and all 16,384 BGRA bytes. The RAM payload returned
+under a 15-second deadman with fresh capture 17; the board was released with
+deadman off and core leases zero. See
+`docs/evidence/vulkan-paired-order-20260926/`. Seven native scenes are now
+paired, with eight scenes and changing target extents still outstanding.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
