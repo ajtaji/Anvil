@@ -86,6 +86,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCmdDraw") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdDraw, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdDrawIndexed") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdDrawIndexed, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdEndRenderPass") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdEndRenderPass, domain) : EndIf
+  If avkDispatchName(*pName, "vkCmdFillBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdFillBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdPipelineBarrier") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdPipelineBarrier, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdPushConstants") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdPushConstants, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdSetScissor") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdSetScissor, domain) : EndIf
