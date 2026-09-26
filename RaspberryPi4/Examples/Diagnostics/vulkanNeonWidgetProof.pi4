@@ -396,6 +396,36 @@ Procedure.i nwPairLinesFrame(imageBase.i, imagePitch.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scene 6: box, clipped textured text, then an unclipped line.
+Procedure.i nwPairOrderFrame(imageBase.i, imagePitch.i)
+  Define rc.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = Neon_Box(4, 4, 40, 30, Neon_RGBA(40, 70, 160, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Neon_ScissorSet(10, 10, 50, 20)
+  rc = Neon_TextTex(#NEON_FONT_UI, 12, 12, "ORDER", Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = NeonLinesBegin()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  NeonLine(0, 63, 63, 0)
+  rc = NeonLinesEnd(Neon_RGBA(200, 68, 34, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA($0701C000 + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
 Procedure.i Main()
   Define rc.i
   Define count.i
@@ -707,6 +737,16 @@ Procedure.i Main()
   EndIf
 
   rc = nwPairLinesFrame(imageBase, imagePitch)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairOrderFrame(imageBase, imagePitch)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
