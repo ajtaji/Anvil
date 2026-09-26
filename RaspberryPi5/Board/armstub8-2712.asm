@@ -365,6 +365,17 @@ uart_puts_both_early:
 ;           FBRD 8; LCR_H $70; CR $301.
 ; ----------------------------------------------------------------------
 rp1_uart0_init:
+  ; config.txt enable_rp1_uart=1: the firmware sets UART0 to 115200 and
+  ; does not reset RP1 (raspberrypi/documentation config_txt/boot.adoc).
+  ; An enabled UART0 is inherited as the firmware left it.
+  movz x9, #0x0003, lsl #16
+  movk x9, #0x001F, lsl #32          ; RP1 UART0 $1F00030000
+  ldr  w0, [x9, #0x30]               ; UARTCR
+  movz w1, #1                        ; UARTEN
+  and  w0, w0, w1
+  cbz  w0, rp1_uart0_program
+  ret
+rp1_uart0_program:
   movz x9, #0x8000
   movk x9, #0x0001, lsl #16
   movk x9, #0x001F, lsl #32          ; RP1 clocks $1F00018000

@@ -49,6 +49,7 @@ Global gP5Width.q
 Global gP5Height.q
 Global gP5Pitch.q
 Global gP5Order.q
+Global gP5Depth.q
 Global gP5Col.q
 Global gP5Row.q
 
@@ -67,6 +68,40 @@ Procedure P5UartByte(base.q, value.l)
   PokeL(base, value)
 EndProcedure
 
+; Program both UARTs here too, so serial does not depend on which EL3
+; stub ran. The values are the EL3 stub's (armstub8-2712.asm, where each
+; is cited): UART10 at 44,236,800 Hz -> IBRD 24 FBRD 0; RP1 UART0 clocked
+; from the RP1 50 MHz crystal -> IBRD 27 FBRD 8; GPIO14/15 FUNCSEL 4.
+Procedure P5PL011Init(base.q, ibrd.l, fbrd.l)
+  PokeL(base + $30, 0)          ; UARTCR off
+  PokeL(base + $24, ibrd)
+  PokeL(base + $28, fbrd)
+  PokeL(base + $2C, $70)        ; FEN | WLEN_8
+  PokeL(base + $04, 0)          ; UARTECR
+  PokeL(base + $30, $301)       ; RXE | TXE | UARTEN
+EndProcedure
+
+; config.txt enable_rp1_uart=1 makes the firmware set RP1 UART0 to 115200
+; and not reset RP1 (raspberrypi/documentation config_txt/boot.adoc,
+; enable_rp1_uart and pciex4_reset). With the default pciex4_reset=1 RP1
+; is reset before the kernel starts and touching it hangs the core: the
+; first three Pi 5 boots, 2026-09-26, zero bytes and a blank monitor.
+; An enabled UART0 is inherited as the firmware left it.
+Procedure P5SerialInit()
+  P5PL011Init(#P5_UART10, 24, 0)
+  If (PeekL(#P5_UART0 + $30) & 1) <> 0
+    ProcedureReturn
+  EndIf
+  PokeL($1F00018054, $40)       ; CLK_UART_CTRL: AUXSRC = XOSC
+  PokeL($1F00018058, 1)         ; CLK_UART_DIV_INT
+  PokeL($1F00018054, $840)      ; + ENABLE
+  PokeL($1F000D0074, 4)         ; GPIO14 FUNCSEL uart0
+  PokeL($1F000D007C, 4)         ; GPIO15 FUNCSEL uart0
+  PokeL($1F000F003C, (PeekL($1F000F003C) | $40) & ~$80)   ; pad 14: IE, not OD
+  PokeL($1F000F0040, (PeekL($1F000F0040) | $40) & ~$80)   ; pad 15
+  P5PL011Init(#P5_UART0, 27, 8)
+EndProcedure
+
 Procedure P5SerialByte(value.l)
   P5UartByte(#P5_UART0, value)
   P5UartByte(#P5_UART10, value)
@@ -77,6 +112,12 @@ EndProcedure
 ;  Pi 3 framebuffer draws them.
 ; ----------------------------------------------------------------------
 Procedure.l P5Pack(r.l, g.l, b.l)
+  ; 16 bpp is RGB565. First Pi 5 boot, 2026-09-26: DEPTH 32 was asked
+  ; for and the firmware answered 1920 x 1080, pitch 3840 - two bytes a
+  ; pixel. The depth drawn is the one the reply grants, never the request.
+  If gP5Depth = 16
+    ProcedureReturn ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+  EndIf
   ; Pixel order from the firmware's reply: 1 = RGB, 0 = BGR.
   If gP5Order = 1
     ProcedureReturn r | (g << 8) | (b << 16)
@@ -88,7 +129,11 @@ Procedure P5Pixel(x.q, y.q, colour.l)
   If gP5Fb = 0 Or x < 0 Or y < 0 Or x >= gP5Width Or y >= gP5Height
     ProcedureReturn
   EndIf
-  PokeL(gP5Fb + y * gP5Pitch + x * 4, colour)
+  If gP5Depth = 16
+    PokeW(gP5Fb + y * gP5Pitch + x * 2, colour)
+  Else
+    PokeL(gP5Fb + y * gP5Pitch + x * 4, colour)
+  EndIf
 EndProcedure
 
 Procedure P5Fill(x0.q, y0.q, w.q, h.q, colour.l)
@@ -275,9 +320,18 @@ Procedure.l P5FramebufferInit()
   gP5FbRaw = P5Get(23) & $FFFFFFFF
   gP5Pitch = P5Get(28) & $FFFFFFFF
   gP5Order = P5Get(19)
+  gP5Depth = P5Get(15)
   gP5Width = P5Get(5)
   gP5Height = P5Get(6)
   If gP5FbRaw = 0 Or gP5Pitch = 0
+    ProcedureReturn 0
+  EndIf
+  ; Draw only in a format this file can pack, and only if the pitch
+  ; agrees with it; anything else is reported, not guessed at.
+  If gP5Depth <> 16 And gP5Depth <> 32
+    ProcedureReturn 0
+  EndIf
+  If gP5Pitch < gP5Width * (gP5Depth / 8)
     ProcedureReturn 0
   EndIf
   If (gP5FbRaw & $C0000000) = $C0000000
@@ -302,8 +356,7 @@ Procedure Main()
     str  x2, [x1]
   EndASM
 
-  P5Text(?s_boot) : P5Newline()
-
+  ; The screen first: it needs only the VideoCore mailbox, not RP1.
   P5DisplaySize()
   If P5FramebufferInit() = 1
     ; Anvil's banner: the band colour the logo is composited on.
@@ -319,8 +372,10 @@ Procedure Main()
     Next
   EndIf
 
+  P5SerialInit()
   gP5Col = 0
   gP5Row = 0
+  P5Text(?s_boot) : P5Newline()
   P5Text(?s_board) : P5Newline()
   P5Text(?s_el) : P5Dec(gP5El) : P5Newline()
   If gP5El <> 3
@@ -333,7 +388,8 @@ Procedure Main()
     P5Text(?s_fbraw) : P5Hex(gP5FbRaw) : P5Newline()
     P5Text(?s_fb) : P5Hex(gP5Fb) : P5Newline()
     P5Text(?s_size) : P5Dec(gP5Width) : P5Text(?s_x) : P5Dec(gP5Height)
-    P5Text(?s_pitch) : P5Dec(gP5Pitch) : P5Newline()
+    P5Text(?s_pitch) : P5Dec(gP5Pitch)
+    P5Text(?s_depth) : P5Dec(gP5Depth) : P5Text(?s_order) : P5Dec(gP5Order) : P5Newline()
     P5Text(?s_ok) : P5Newline()
   EndIf
 
@@ -354,6 +410,8 @@ DataSection
   s_size: Data.a 68,105,115,112,108,97,121,32,0  ; "Display "
   s_x: Data.a 32,120,32,0  ; " x "
   s_pitch: Data.a 32,32,112,105,116,99,104,32,0  ; "  pitch "
+  s_depth: Data.a 32,32,100,101,112,116,104,32,0  ; "  depth "
+  s_order: Data.a 32,32,111,114,100,101,114,32,0  ; "  order "
   s_mbfail: Data.a 77,65,73,76,66,79,88,58,32,110,111,32,102,114,97,109,101,98,117,102,102,101,114,44,32,99,111,100,101,32,48,120,0  ; "MAILBOX: no framebuffer, code 0x"
   s_ok: Data.a 68,105,115,112,108,97,121,32,117,112,46,32,78,101,120,116,58,32,99,111,110,115,111,108,101,44,32,107,101,121,98,111,97,114,100,44,32,115,116,111,114,97,103,101,46,0  ; "Display up. Next: console, keyboard, storage."
   s_boot: Data.a 65,78,86,73,76,32,80,73,53,32,66,79,65,82,68,0  ; "ANVIL PI5 BOARD"
