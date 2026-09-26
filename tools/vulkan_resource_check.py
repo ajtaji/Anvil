@@ -336,8 +336,8 @@ MUTANTS = (
     (
         "vkCmdPipelineBarrier discards its tenth stack argument",
         "vk_api.pbi",
-        "  AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, *pImageMemoryBarriers)\n",
-        "  AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, 0)\n",
+        "    AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, *bar)\n",
+        "    AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, 0)\n",
     ),
 )
 

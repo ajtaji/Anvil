@@ -739,6 +739,10 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, dependencyFlags.i, memoryBarrierCount.i, *pMemoryBarriers, bufferMemoryBarrierCount.i, *pBufferMemoryBarriers, imageMemoryBarrierCount.i, *pImageMemoryBarriers.VkImageMemoryBarrier)
   Define c.i
+  Define i.i
+  Define j.i
+  Define *bar.VkImageMemoryBarrier
+  Define *other.VkImageMemoryBarrier
   srcStageMask = srcStageMask & $FFFFFFFF
   dstStageMask = dstStageMask & $FFFFFFFF
   dependencyFlags = dependencyFlags & $FFFFFFFF
@@ -758,22 +762,53 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a global memory barrier or a buffer memory barrier (Anvil code -20005, unsupported barrier kind); only image memory barriers are implemented in this slice, so record image barriers only.")
     ProcedureReturn
   EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdPipelineBarrier requires a recording command buffer (Anvil code -20004, wrong recording state); call vkBeginCommandBuffer first.")
+    ProcedureReturn
+  EndIf
+  If avkStagesKnown(srcStageMask) = 0 Or avkStagesKnown(dstStageMask) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a stage mask this implementation does not track (Anvil code -20005, unsupported stage); both stage masks must name supported, nonzero stages.")
+    ProcedureReturn
+  EndIf
   If imageMemoryBarrierCount = 0
+    ; The ordered command stream already provides an execution dependency.
     ProcedureReturn
   EndIf
-  If imageMemoryBarrierCount <> 1 Or *pImageMemoryBarriers = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given more than one image memory barrier in a single call (Anvil code -20005, barrier arrays not implemented); record them one at a time, because executing only the first would be a silently different dependency.")
+  If imageMemoryBarrierCount > #ANVIL_VK_MAX_CB_REFS Or *pImageMemoryBarriers = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier requires a non-null image barrier array of at most two entries (Anvil code -20005, bounded image barrier array); split larger arrays across calls.")
     ProcedureReturn
   EndIf
-  If *pImageMemoryBarriers\sType <> #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier was given a VkImageMemoryBarrier whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER.")
-    ProcedureReturn
-  EndIf
-  If *pImageMemoryBarriers\pNext <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an image memory barrier with a pNext chain (Anvil code -20005, no pNext extension is implemented); nothing was recorded, because an ignored extension structure is a silently different dependency.")
-    ProcedureReturn
-  EndIf
-  AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, *pImageMemoryBarriers)
+  i = 0
+  While i < imageMemoryBarrierCount
+    *bar = *pImageMemoryBarriers + i * SizeOf(VkImageMemoryBarrier)
+    If *bar\sType <> #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier was given a VkImageMemoryBarrier whose sType is wrong (Anvil code -20001, wrong sType); every entry must be VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER.")
+      ProcedureReturn
+    EndIf
+    If *bar\pNext <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given an image memory barrier with a pNext chain (Anvil code -20005, no pNext extension is implemented); nothing was recorded, because an ignored extension structure is a silently different dependency.")
+      ProcedureReturn
+    EndIf
+    j = 0
+    While j < i
+      *other = *pImageMemoryBarriers + j * SizeOf(VkImageMemoryBarrier)
+      If *other\image = *bar\image
+        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier has two barriers for the same image in one call (Anvil code -20005, overlapping barriers); use separate calls for successive layout transitions.")
+        ProcedureReturn
+      EndIf
+      j = j + 1
+    Wend
+    i = i + 1
+  Wend
+  i = 0
+  While i < imageMemoryBarrierCount
+    *bar = *pImageMemoryBarriers + i * SizeOf(VkImageMemoryBarrier)
+    AnvilVkCmdImageBarrier(commandBuffer, srcStageMask, dstStageMask, *bar)
+    If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+      ProcedureReturn
+    EndIf
+    i = i + 1
+  Wend
 EndProcedure
 
 ; pColor is a VkClearColorValue. Its float32 arm is read here, because
