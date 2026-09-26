@@ -1778,7 +1778,12 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   EndIf
   lay = avkLaySlot(*ci\layout)
   rp = avkRpSlot(*ci\renderPass)
-  If lay = 0 Or rp = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If lay = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkCreateGraphicsPipelines was given a stale or foreign VkPipelineLayout (Anvil code -20002, invalid layout handle); create a live layout on this device before building the pipeline.")
+  EndIf
+  If rp = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkCreateGraphicsPipelines was given a stale or foreign VkRenderPass (Anvil code -20002, invalid render-pass handle); create a live render pass on this device before building the pipeline.")
+  EndIf
   If avkLayDev[lay] <> d Or avkRpDev[rp] <> d
     ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkCreateGraphicsPipelines was given a pipeline layout or a render pass from a different VkDevice (Anvil code -20003, wrong parent); every object in one pipeline must share a device.")
   EndIf
@@ -1799,7 +1804,9 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
       ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given specialization constants (Anvil code -20005, specialization not implemented); the front end walks the module as it was compiled, so a constant substituted at pipeline creation would never reach the emitted shader.")
     EndIf
     s = avkShSlot(*st\module)
-    If s = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+    If s = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkCreateGraphicsPipelines was given a stale or foreign VkShaderModule (Anvil code -20002, invalid shader-module handle); keep every stage module live through pipeline creation.")
+    EndIf
     If avkShDev[s] <> d
       ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkCreateGraphicsPipelines was given a shader module from a different VkDevice (Anvil code -20003, wrong parent); every object in one pipeline must share a device.")
     EndIf

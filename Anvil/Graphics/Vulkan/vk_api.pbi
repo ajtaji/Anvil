@@ -1216,24 +1216,37 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  THE GRAPHICS PIPELINE
 ;
-;  vkCreateGraphicsPipelines takes an array and this slice creates one at
-;  a time. A count above one is REFUSED rather than partly honoured: the
-;  specification says a failure writes VK_NULL_HANDLE into the rest, and
-;  creating the first and silently stopping would be exactly the silent
-;  partial success this engine never gives.
+;  Every element is attempted independently. A failed element remains null;
+;  successful handles remain caller-owned even when another element fails.
 ; ----------------------------------------------------------------------
 Procedure.i vkCreateGraphicsPipelines(device.i, pipelineCache.i, createInfoCount.i, *pCreateInfos.VkGraphicsPipelineCreateInfo, *pAllocator, *pPipelines)
   Define rc.i
+  Define firstError.i
+  Define i.i
+  Define createInfoBase.i
   If *pCreateInfos = 0 Or *pPipelines = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   If pipelineCache <> #VK_NULL_HANDLE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a VkPipelineCache (Anvil code -20005, pipeline cache not implemented); there is no vkCreatePipelineCache here, so pass VK_NULL_HANDLE.")
   EndIf
-  If createInfoCount <> 1
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked to create other than exactly one pipeline in one call (Anvil code -20005, batched creation not implemented); create them one at a time, because creating the first and stopping would be a silent partial success.")
+  If createInfoCount < 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines needs a positive createInfoCount (Anvil code -20001, empty pipeline array); supply at least one VkGraphicsPipelineCreateInfo.")
   EndIf
-  ProcedureReturn AnvilVkGraphicsPipelineCreate(device, *pCreateInfos, *pPipelines)
+  i = 0
+  While i < createInfoCount
+    PokeI(*pPipelines + (i * SizeOf(.i)), #VK_NULL_HANDLE)
+    i = i + 1
+  Wend
+  firstError = #VK_SUCCESS
+  createInfoBase = *pCreateInfos
+  i = 0
+  While i < createInfoCount
+    rc = AnvilVkGraphicsPipelineCreate(device, createInfoBase + (i * SizeOf(VkGraphicsPipelineCreateInfo)), *pPipelines + (i * SizeOf(.i)))
+    If rc <> #VK_SUCCESS And firstError = #VK_SUCCESS : firstError = rc : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn firstError
 EndProcedure
 
 Procedure vkDestroyPipeline(device.i, pipeline.i, *pAllocator)

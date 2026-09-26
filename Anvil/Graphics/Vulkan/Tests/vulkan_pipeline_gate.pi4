@@ -83,6 +83,8 @@ Global Dim pgReport.i[700]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
+Global Dim pgBatchBytes.a[1024]
+Global Dim pgBatchOut.i[3]
 Global Dim pgSavedConstant.a[8192]
 Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
@@ -114,6 +116,15 @@ Procedure.i pgCompileV3d(slot.i, pipeline.i, vertexModule.i, fragmentModule.i)
   build\vertexIr = AnvilVkShaderModuleIr(vertexModule)
   build\fragmentIr = AnvilVkShaderModuleIr(fragmentModule)
   ProcedureReturn AnvilVkV3dCompile(@build)
+EndProcedure
+
+Procedure pgClonePipelineInfo(*from, *to)
+  Define offset.i
+  offset = 0
+  While offset < SizeOf(VkGraphicsPipelineCreateInfo)
+    PokeA(*to + offset, PeekA(*from + offset))
+    offset = offset + 1
+  Wend
 EndProcedure
 
 Procedure.i Main()
@@ -773,7 +784,38 @@ Procedure.i Main()
   gp\renderPass = rp
   gp\subpass = 0
   gp\basePipelineIndex = -1
-  If vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeA) <> #VK_SUCCESS
+  ; A failed first element leaves a null slot while the second still builds.
+  pgClonePipelineInfo(@gp, @pgBatchBytes[0])
+  pgClonePipelineInfo(@gp, @pgBatchBytes[0] + SizeOf(VkGraphicsPipelineCreateInfo))
+  PokeL(@pgBatchBytes[0], #VK_STRUCTURE_TYPE_APPLICATION_INFO)
+  pgBatchOut[0] = 99 : pgBatchOut[1] = 99
+  If vkCreateGraphicsPipelines(dev, 0, 2, @pgBatchBytes[0], 0, @pgBatchOut[0]) <> #ANVIL_VK_ERR_ARGS
+    ProcedureReturn pgStop(201)
+  EndIf
+  If pgBatchOut[0] <> #VK_NULL_HANDLE
+    ProcedureReturn pgStop(202)
+  EndIf
+  If pgBatchOut[1] = #VK_NULL_HANDLE
+    ProcedureReturn pgStop(208)
+  EndIf
+  pipeA = pgBatchOut[1]
+  ; Two valid elements produce independent live handles. Destroying them
+  ; must not retire the first pipeline kept by this diagnostic.
+  pgClonePipelineInfo(@gp, @pgBatchBytes[0])
+  pgClonePipelineInfo(@gp, @pgBatchBytes[0] + SizeOf(VkGraphicsPipelineCreateInfo))
+  pgBatchOut[0] = 99 : pgBatchOut[1] = 99
+  If vkCreateGraphicsPipelines(dev, 0, 2, @pgBatchBytes[0], 0, @pgBatchOut[0]) <> #VK_SUCCESS
+    ProcedureReturn pgStop(203)
+  EndIf
+  If pgBatchOut[0] = #VK_NULL_HANDLE Or pgBatchOut[1] = #VK_NULL_HANDLE Or pgBatchOut[0] = pgBatchOut[1]
+    ProcedureReturn pgStop(204)
+  EndIf
+  vkDestroyPipeline(dev, pgBatchOut[0], 0)
+  vkDestroyPipeline(dev, pgBatchOut[1], 0)
+  If avkPipeSlot(pipeA) = 0
+    ProcedureReturn pgStop(205)
+  EndIf
+  If pipeA = #VK_NULL_HANDLE
     ProcedureReturn pgStop(21)
   EndIf
 
