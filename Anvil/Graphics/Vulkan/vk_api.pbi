@@ -125,6 +125,21 @@ Procedure.i vkEnumerateDeviceLayerProperties(physicalDevice.i, *pPropertyCount, 
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+; Sparse residency is not advertised by vkGetPhysicalDeviceFeatures and no
+; sparse image creation flags are accepted. The Vulkan query therefore has
+; zero matching format-property records for every valid parameter set.
+Procedure vkGetPhysicalDeviceSparseImageFormatProperties(physicalDevice.i, format.i, type.i, samples.i, usage.i, tiling.i, *pPropertyCount, *pProperties)
+  If *pPropertyCount = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkGetPhysicalDeviceSparseImageFormatProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
+    ProcedureReturn
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceSparseImageFormatProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the count and properties were left untouched.")
+    ProcedureReturn
+  EndIf
+  PokeL(*pPropertyCount, 0)
+EndProcedure
+
 Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperties.VkPhysicalDeviceMemoryProperties)
   Define i.i
   Define n.i
