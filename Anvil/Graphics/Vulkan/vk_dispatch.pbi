@@ -9,7 +9,7 @@
 ; commands which merely exist to report a deterministic unsupported result.
 ;
 ; Vulkan 1.0 lookup domains used here:
-;   GIPA(NULL)     - audited global commands only (currently vkCreateInstance)
+;   GIPA(NULL)     - audited global commands only
 ;   GIPA(instance) - audited instance/device commands and both resolvers
 ;   GDPA(device)   - audited device commands and GDPA itself
 ; Handles are generation checked before any table lookup, so null, foreign and
@@ -122,6 +122,9 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkDestroyShaderModule") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyShaderModule, domain) : EndIf
   If avkDispatchName(*pName, "vkDeviceWaitIdle") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDeviceWaitIdle, domain) : EndIf
   If avkDispatchName(*pName, "vkEndCommandBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkEndCommandBuffer, domain) : EndIf
+  If avkDispatchName(*pName, "vkEnumerateInstanceLayerProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_GLOBAL, @vkEnumerateInstanceLayerProperties, domain) : EndIf
+  If avkDispatchName(*pName, "vkEnumerateInstanceExtensionProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_GLOBAL, @vkEnumerateInstanceExtensionProperties, domain) : EndIf
+  If avkDispatchName(*pName, "vkEnumerateDeviceExtensionProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumerateDeviceExtensionProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkEnumeratePhysicalDevices") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumeratePhysicalDevices, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeCommandBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeMemory, domain) : EndIf

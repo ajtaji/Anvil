@@ -27,6 +27,7 @@ Procedure.i Main()
   Define physical.i
   Define device.i
   Define count.l
+  Define propertySentinel.l
 
   AnvilVkTestBackendHeap($07000000, $00100000)
   Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
@@ -34,8 +35,10 @@ Procedure.i Main()
   Vkd(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
   Vkd(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
 
-  ; Vulkan 1.0 null-instance lookup exposes only the audited global entry.
+  ; Vulkan 1.0 null-instance lookup exposes the three audited global entries.
   Vkd(vkGetInstanceProcAddr(0, "vkCreateInstance") = @vkCreateInstance)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumerateInstanceLayerProperties") = @vkEnumerateInstanceLayerProperties)
+  Vkd(vkGetInstanceProcAddr(0, "vkEnumerateInstanceExtensionProperties") = @vkEnumerateInstanceExtensionProperties)
   Vkd(vkGetInstanceProcAddr(0, "vkGetInstanceProcAddr") = 0)
   Vkd(vkGetInstanceProcAddr(0, "vkEnumeratePhysicalDevices") = 0)
   Vkd(vkGetInstanceProcAddr(0, "vkDeviceWaitIdle") = 0)
@@ -55,8 +58,33 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties") = @vkGetPhysicalDeviceMemoryProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateDevice") = @vkCreateDevice)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties") = @vkEnumerateDeviceExtensionProperties)
   Vkd(vkGetDeviceProcAddr(device, "vkCreateDevice") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceExtensionProperties") = 0)
   Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
+
+  ; Empty discovery is a real zero-count query, including supplied output
+  ; storage; invalid layer and physical-device requests preserve the outputs.
+  count = 77 : propertySentinel = 99
+  Vkd(vkEnumerateInstanceLayerProperties(@count, 0) = #VK_SUCCESS)
+  Vkd(count = 0)
+  count = 77
+  Vkd(vkEnumerateInstanceLayerProperties(@count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateInstanceExtensionProperties(0, @count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateInstanceExtensionProperties("missing", @count, @propertySentinel) = #VK_ERROR_LAYER_NOT_PRESENT)
+  Vkd(count = 77 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceExtensionProperties(physical, 0, @count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceExtensionProperties(physical, "missing", @count, @propertySentinel) = #VK_ERROR_LAYER_NOT_PRESENT)
+  Vkd(count = 77 And propertySentinel = 99)
+  Vkd(vkEnumerateDeviceExtensionProperties($12345678, 0, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(count = 77 And propertySentinel = 99)
 
   ; Representative device commands resolve identically through valid GIPA/GDPA.
   Vkd(vkGetInstanceProcAddr(instance, "vkAllocateMemory") = @vkAllocateMemory)
