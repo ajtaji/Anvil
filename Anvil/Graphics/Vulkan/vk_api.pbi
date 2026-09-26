@@ -610,28 +610,100 @@ EndProcedure
 
 Procedure.i vkAllocateCommandBuffers(device.i, *pAllocateInfo.VkCommandBufferAllocateInfo, *pCommandBuffers)
   Define rc.i
+  Define count.i
+  Define i.i
+  Define j.i
+  Define handle.i
   If *pAllocateInfo = 0 Or *pCommandBuffers = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If *pAllocateInfo\sType <> #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkAllocateCommandBuffers was given a VkCommandBufferAllocateInfo whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO.")
   EndIf
   rc = avkNoPNext(*pAllocateInfo\pNext)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
-  If *pAllocateInfo\commandBufferCount <> 1
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkAllocateCommandBuffers was asked for more than one command buffer in a single call (Anvil code -20005, array allocation not implemented); allocate them one at a time, because a partially satisfied array allocation has no defined unwind here yet.")
+  count = *pAllocateInfo\commandBufferCount
+  If count < 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkAllocateCommandBuffers requires a positive commandBufferCount (Anvil code -20001, empty allocation); request at least one command buffer.")
   EndIf
-  ProcedureReturn AnvilVkCommandBufferAllocate(device, *pAllocateInfo\commandPool, *pAllocateInfo\level, *pCommandBuffers)
+  i = 0
+  While i < count
+    PokeI(*pCommandBuffers + (i * SizeOf(.i)), #VK_NULL_HANDLE)
+    i = i + 1
+  Wend
+  i = 0
+  While i < count
+    rc = AnvilVkCommandBufferAllocate(device, *pAllocateInfo\commandPool, *pAllocateInfo\level, *pCommandBuffers + (i * SizeOf(.i)))
+    If rc <> #VK_SUCCESS
+      j = 0
+      While j < i
+        handle = PeekI(*pCommandBuffers + (j * SizeOf(.i)))
+        AnvilVkCommandBufferFree(device, *pAllocateInfo\commandPool, handle)
+        PokeI(*pCommandBuffers + (j * SizeOf(.i)), #VK_NULL_HANDLE)
+        j = j + 1
+      Wend
+      If rc = #VK_ERROR_TOO_MANY_OBJECTS
+        ProcedureReturn avkFault(#VK_ERROR_OUT_OF_HOST_MEMORY, "vkAllocateCommandBuffers exhausted the fixed command-buffer table (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); every partial allocation was freed and every output is null.")
+      EndIf
+      ProcedureReturn rc
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 Procedure vkFreeCommandBuffers(device.i, commandPool.i, commandBufferCount.i, *pCommandBuffers)
   Define rc.i
-  If *pCommandBuffers = 0 Or commandBufferCount <> 1
-    avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkFreeCommandBuffers was asked to free a number of command buffers other than one (Anvil code -20005, array free not implemented); nothing was freed. Free them one at a time.")
+  Define d.i
+  Define p.i
+  Define c.i
+  Define i.i
+  Define j.i
+  Define handle.i
+  If *pCommandBuffers = 0 Or commandBufferCount < 1
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkFreeCommandBuffers requires a positive count and an array of handles (Anvil code -20001, invalid array); nothing was freed.")
     ProcedureReturn
   EndIf
-  rc = AnvilVkCommandBufferFree(device, commandPool, PeekI(*pCommandBuffers))
-  If rc <> #VK_SUCCESS And rc <> #ANVIL_VK_ERR_STATE
-    avkFault(rc, "vkFreeCommandBuffers was given a device, pool or command buffer handle that do not belong together (Anvil code in the fault record); nothing was freed. Free a command buffer through the pool it was allocated from.")
+  d = avkDevSlot(device)
+  p = avkPoolSlot(commandPool)
+  If d = 0 Or p = 0 Or avkPoolDev[p] <> d
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkFreeCommandBuffers was given a stale or foreign device or pool (Anvil code -20002, invalid owner); nothing was freed.")
+    ProcedureReturn
   EndIf
+  i = 0
+  While i < commandBufferCount
+    handle = PeekI(*pCommandBuffers + (i * SizeOf(.i)))
+    If handle <> #VK_NULL_HANDLE
+      c = avkCmdSlot(handle)
+      If c = 0 Or avkCmdPool[c] <> p
+        avkFault(#ANVIL_VK_ERR_HANDLE, "vkFreeCommandBuffers found a stale or foreign buffer in its array (Anvil code -20002, invalid handle); nothing was freed.")
+        ProcedureReturn
+      EndIf
+      If avkCmdState[c] = #ANVIL_VK_CB_PENDING
+        avkFault(#ANVIL_VK_ERR_STATE, "vkFreeCommandBuffers found a pending buffer in its array (Anvil code -20004, pending command buffer); nothing was freed.")
+        ProcedureReturn
+      EndIf
+      j = 0
+      While j < i
+        If PeekI(*pCommandBuffers + (j * SizeOf(.i))) = handle
+          avkFault(#ANVIL_VK_ERR_ARGS, "vkFreeCommandBuffers was given the same buffer twice (Anvil code -20001, duplicate handle); nothing was freed.")
+          ProcedureReturn
+        EndIf
+        j = j + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < commandBufferCount
+    handle = PeekI(*pCommandBuffers + (i * SizeOf(.i)))
+    If handle <> #VK_NULL_HANDLE
+      rc = AnvilVkCommandBufferFree(device, commandPool, handle)
+      If rc <> #VK_SUCCESS
+        avkFault(rc, "vkFreeCommandBuffers could not release a preflighted buffer (Anvil code in the fault record); inspect the pool's recorded resources.")
+        ProcedureReturn
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
 EndProcedure
 
 Procedure.i vkBeginCommandBuffer(commandBuffer.i, *pBeginInfo.VkCommandBufferBeginInfo)
