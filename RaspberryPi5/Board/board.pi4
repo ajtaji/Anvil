@@ -50,6 +50,18 @@ Global gP5Height.q
 Global gP5Pitch.q
 Global gP5Order.q
 Global gP5Depth.q
+Global gP5Ticks.q
+
+; The architectural counter, 54 MHz (the EL3 stub sets CNTFRQ_EL0).
+Procedure.q P5Ticks()
+  ASM
+    mrs  x2, cntpct_el0
+    adrp x1, global_gp5ticks
+    add  x1, x1, #:lo12:global_gp5ticks
+    str  x2, [x1]
+  EndASM
+  ProcedureReturn gP5Ticks
+EndProcedure
 Global gP5Col.q
 Global gP5Row.q
 
@@ -356,7 +368,22 @@ Procedure Main()
     str  x2, [x1]
   EndASM
 
+  ; The instruction cache needs no MMU (SCTLR_EL3.I, bit 12). First
+  ; boot drew visibly slowly with every fetch going to DRAM. EL3 only:
+  ; SCTLR_EL3 does not exist below it.
+  If gP5El = 3
+    ASM
+      mrs  x2, sctlr_el3
+      movz x3, #0x1000
+      orr  x2, x2, x3
+      msr  sctlr_el3, x2
+      isb
+    EndASM
+  EndIf
+
   ; The screen first: it needs only the VideoCore mailbox, not RP1.
+  Define paintStart.q = P5Ticks()
+  Define paintTicks.q = 0
   P5DisplaySize()
   If P5FramebufferInit() = 1
     ; Anvil's banner: the band colour the logo is composited on.
@@ -371,6 +398,7 @@ Procedure Main()
       P5Glyph(PeekA(?s_title + i), 230 + i * 15, 80, P5Pack(240, 224, 192))
     Next
   EndIf
+  paintTicks = P5Ticks() - paintStart
 
   P5SerialInit()
   gP5Col = 0
@@ -390,6 +418,7 @@ Procedure Main()
     P5Text(?s_size) : P5Dec(gP5Width) : P5Text(?s_x) : P5Dec(gP5Height)
     P5Text(?s_pitch) : P5Dec(gP5Pitch)
     P5Text(?s_depth) : P5Dec(gP5Depth) : P5Text(?s_order) : P5Dec(gP5Order) : P5Newline()
+    P5Text(?s_paint) : P5Dec(paintTicks / 54000) : P5Text(?s_ms) : P5Newline()
     P5Text(?s_ok) : P5Newline()
   EndIf
 
@@ -410,6 +439,8 @@ DataSection
   s_size: Data.a 68,105,115,112,108,97,121,32,0  ; "Display "
   s_x: Data.a 32,120,32,0  ; " x "
   s_pitch: Data.a 32,32,112,105,116,99,104,32,0  ; "  pitch "
+  s_paint: Data.a 80,97,105,110,116,32,40,99,108,101,97,114,32,43,32,98,97,110,110,101,114,32,43,32,108,111,103,111,41,58,32,0  ; "Paint (clear + banner + logo): "
+  s_ms: Data.a 32,109,115,0  ; " ms"
   s_depth: Data.a 32,32,100,101,112,116,104,32,0  ; "  depth "
   s_order: Data.a 32,32,111,114,100,101,114,32,0  ; "  order "
   s_mbfail: Data.a 77,65,73,76,66,79,88,58,32,110,111,32,102,114,97,109,101,98,117,102,102,101,114,44,32,99,111,100,101,32,48,120,0  ; "MAILBOX: no framebuffer, code 0x"
