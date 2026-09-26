@@ -105,6 +105,8 @@ Global nvcAtlasBaseH.i
 Global nvcAtlasBytes.i
 Global nvcAtlasUploadMapped.i
 Global nvcAtlasUploadCount.i
+Global nvcAtlasGeneration.i
+Global nvcAtlasFaulted.i
 ; Preserve the first failing create boundary before rollback can replace the
 ; Vulkan fault with a secondary cleanup diagnostic.
 Global nvcCreateStage.i
@@ -170,6 +172,7 @@ Declare.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
 Declare NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
 Declare NeonVkChromeScissorClear()
 Declare.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
+Declare.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
 Declare.i NeonVkChromeMeasureWidth(font.i, *s)
 Declare.i NeonVkChromeMeasureLineHeight(font.i)
 Declare.i NeonVkChromeFanBegin()
@@ -434,6 +437,50 @@ Procedure.i nvcAtlasUploadWarm()
   ProcedureReturn rc
 EndProcedure
 
+; Refresh the bitmap-owned atlas columns only while the frame is quiescent.
+; TrueType glyphs live from x=32 onward. A failed GPU upload poisons this
+; owner because the prior image contents can no longer be trusted.
+Procedure.i nvcAtlasRefresh()
+  Define source.i, width.i, height.i, bytes.i, generation.i
+  Define x.i, y.i, target.i, rc.i
+  Define white.NeonAtlasGlyphUV
+  If nvcInFrame <> 0 Or nvcAtlasFaulted <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
+  rc = Neon_AtlasRasterEnsure()
+  If rc <> #NEON_OK Or Neon_AtlasRasterReady() = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
+  generation = Neon_AtlasRasterGeneration()
+  If generation = nvcAtlasGeneration : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  width = Neon_AtlasRasterWidth() : height = Neon_AtlasRasterHeight()
+  bytes = Neon_AtlasRasterBytes() : source = Neon_AtlasRasterBase()
+  If source = 0 Or width < 1 Or width > 16 Or height < 1 Or height > nvcAtlasH Or bytes <> width * height * 4
+    ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS
+  EndIf
+  If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
+  For y = 0 To nvcAtlasH - 1
+    For x = 0 To 63
+      target = y * nvcAtlasW * 4 + x
+      PokeA(nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + target, 0)
+    Next
+  Next
+  For y = 0 To height - 1
+    For x = 0 To width * 4 - 1
+      target = y * nvcAtlasW * 4 + x
+      PokeA(nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + target, PeekA(source + y * width * 4 + x))
+    Next
+  Next
+  rc = nvcAtlasUploadWarm()
+  If rc <> #VK_SUCCESS
+    nvcAtlasFaulted = 1
+    ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN
+  EndIf
+  nvcAtlasBaseW = width : nvcAtlasBaseH = height
+  nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, width), nvcAtlasW)
+  nvcWhiteU1 = neon_F32Ratio(nvcF32Pixel(white\right, width), nvcAtlasW)
+  nvcWhiteV0 = neon_F32Ratio(nvcF32Pixel(white\top, height), nvcAtlasH)
+  nvcWhiteV1 = neon_F32Ratio(nvcF32Pixel(white\bottom, height), nvcAtlasH)
+  nvcAtlasGeneration = generation
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 ; Fragment shader:
 ;   sampled atlas * per-draw RGBA push tint + a persistent zero UBO.
 ; The zero UBO keeps the exact proven sampled/push lowering used by the
@@ -645,7 +692,11 @@ Procedure.i nvcAtlasCreateAndUpload()
     nvcCreateStage = 419
     rc = nvcSubmitAndWait()
   EndIf
-  If rc = #VK_SUCCESS : nvcAtlasUploadCount = 1 : EndIf
+  If rc = #VK_SUCCESS
+    nvcAtlasUploadCount = 1
+    nvcAtlasGeneration = Neon_AtlasRasterGeneration()
+    nvcAtlasFaulted = 0
+  EndIf
   ProcedureReturn rc
 EndProcedure
 
@@ -863,7 +914,7 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   EndIf
   ; The family goes in as parameters, never through a structure: see
   ; NeonDrawBackendInstall and forum 915.
-  rc = NeonDrawBackendInstall(@NeonVkChromeBox, @NeonVkChromeText, @NeonVkChromeScissorSet, @NeonVkChromeScissorClear, @NeonVkChromeFanBegin, @NeonVkChromeFanPoint, @NeonVkChromeFanEnd, @NeonVkChromeFanOutline, @NeonVkChromeLinesBegin, @NeonVkChromeLine, @NeonVkChromeLinesEnd)
+  rc = NeonDrawBackendInstall(@NeonVkChromeBox, @NeonVkChromeText, @NeonVkChromeTextTex, @NeonVkChromeScissorSet, @NeonVkChromeScissorClear, @NeonVkChromeFanBegin, @NeonVkChromeFanPoint, @NeonVkChromeFanEnd, @NeonVkChromeFanOutline, @NeonVkChromeLinesBegin, @NeonVkChromeLine, @NeonVkChromeLinesEnd)
   If rc <> #NEON_OK
     nvcError = #NEON_VK_CHROME_ERR_STATE
     NeonVkChromeDestroy()
@@ -907,6 +958,8 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   If nvcTTDirty <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
+  rc = nvcAtlasRefresh()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nvcFail(rc) : EndIf
   clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = 0
   If *clearValue <> 0
     clear[0] = PeekL(*clearValue + 0) : clear[1] = PeekL(*clearValue + 4)
@@ -1531,6 +1584,9 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
   Define cellH.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If AnvilTrueTypeSlotSelected() < 0 And Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
+  EndIf
   If AnvilTrueTypeSlotSelected() >= 0
     If font < 0 Or font > 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
     nvcTTFontPixels = nvcTTFontHeightFor(font)
@@ -1562,6 +1618,69 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
       If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
+        If nvcAtlasMapBitmapUV(@uv) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
+        nvcVertices = nvcVertices + 6 : count = count + 6
+      EndIf
+      cx = cx + adv
+    EndIf
+    i = i + 1
+  Wend
+  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ProcedureReturn nvcDraw(first, count, colour)
+EndProcedure
+
+; The public textured-text primitive has native bitmap metrics and rejection
+; rules. Preflight the visible run before touching the ordered vertex cursor.
+Procedure.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
+  Define uv.NeonAtlasGlyphUV
+  Define i.i, ch.i, cx.i, adv.i, cellH.i
+  Define glyphCount.i, first.i, count.i, visible.i
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If *s = 0 Or Neon_A(colour) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If Neon_AtlasRasterReady() = 0 Or Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
+  EndIf
+  adv = Neon_CharWidth(font) : cellH = Neon_LineHeight(font)
+  If adv < 1 Or cellH < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  If (y + cellH) <= 0 Or y >= nvcHeight : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If neon_clipOn <> 0
+    If (y + cellH) <= neon_clipY Or y >= (neon_clipY + neon_clipH) : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  EndIf
+  cx = x : i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
+        visible = 0
+        If (cx + adv) > 0 And cx < nvcWidth
+          If neon_clipOn = 0 : visible = 1
+          ElseIf (cx + adv) > neon_clipX And cx < (neon_clipX + neon_clipW) : visible = 1
+          EndIf
+        EndIf
+        If visible <> 0 : glyphCount = glyphCount + 1 : EndIf
+      EndIf
+      cx = cx + adv
+    EndIf
+    i = i + 1
+  Wend
+  If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  first = nvcVertices : cx = x : i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      visible = 0
+      If (cx + adv) > 0 And cx < nvcWidth
+        If neon_clipOn = 0 : visible = 1
+        ElseIf (cx + adv) > neon_clipX And cx < (neon_clipX + neon_clipW) : visible = 1
+        EndIf
+      EndIf
+      If visible <> 0 And Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
         If nvcAtlasMapBitmapUV(@uv) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
         nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
         nvcVertices = nvcVertices + 6 : count = count + 6
@@ -1827,6 +1946,7 @@ Procedure NeonVkChromeDestroy()
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
   nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0
+  nvcAtlasGeneration = 0 : nvcAtlasFaulted = 0
   nvcTTCount = 0 : nvcTTDirty = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
   nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
   nvcTargetGeneration = 0

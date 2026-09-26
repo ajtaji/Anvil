@@ -132,6 +132,8 @@ def check_source() -> int:
     for needle in scene_required:
         if needle not in compose:
             fail(f"acceptance scene omits real widget call: {needle}")
+    if 'Neon_TextTex(#NEON_FONT_UI, #NVWA_TEXT_X, #NVWA_TEXT_Y, "VULKAN PATH", Neon_C_Text)' not in compose:
+        fail("acceptance scene omits the public textured-text draw")
     for needle in ("NeonVkChromeBox(", "NeonVkChromeText(",
                    "NeonFrameBegin(", "NeonFrameEnd("):
         if needle in compose:

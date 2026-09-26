@@ -14,6 +14,7 @@ XIncludeFile "RaspberryPi4/Lib/neon.pi4"
 
 #NVH_BOX_SENTINEL = 701
 #NVH_TEXT_SENTINEL = 702
+#NVH_TEXT_TEX_SENTINEL = 708
 #NVH_FAN_BEGIN_SENTINEL = 703
 #NVH_FAN_END_SENTINEL = 704
 #NVH_FAN_OUTLINE_SENTINEL = 705
@@ -27,6 +28,7 @@ Global nvhBoxW.i
 Global nvhBoxH.i
 Global nvhBoxColour.i
 Global nvhTextCalls.i
+Global nvhTextTexCalls.i
 Global nvhTextFont.i
 Global nvhTextX.i
 Global nvhTextY.i
@@ -74,6 +76,13 @@ Procedure.i NvhText(font.i, x.i, y.i, *s, colour.i)
   nvhTextString = *s
   nvhTextColour = colour
   ProcedureReturn #NVH_TEXT_SENTINEL
+EndProcedure
+
+Procedure.i NvhTextTex(font.i, x.i, y.i, *s, colour.i)
+  nvhTextTexCalls = nvhTextTexCalls + 1
+  nvhTextFont = font : nvhTextX = x : nvhTextY = y
+  nvhTextString = *s : nvhTextColour = colour
+  ProcedureReturn #NVH_TEXT_TEX_SENTINEL
 EndProcedure
 
 Procedure NvhScissorSet(x.i, y.i, w.i, h.i)
@@ -137,11 +146,11 @@ Procedure.i Main()
   If NeonDrawBackendActive() <> 0 : ProcedureReturn 1 : EndIf
 
   ; Every partial family is refused and cannot alter the inactive owner.
-  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, 0, @NvhLinesEnd) <> #NEON_ERR_ARGS : ProcedureReturn 2 : EndIf
+  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhTextTex, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, 0, @NvhLinesEnd) <> #NEON_ERR_ARGS : ProcedureReturn 2 : EndIf
   If NeonDrawBackendActive() <> 0 : ProcedureReturn 6 : EndIf
   If gNeonBackendBox <> 0 Or gNeonBackendText <> 0 Or gNeonBackendScissorSet <> 0 Or gNeonBackendScissorClear <> 0 : ProcedureReturn 7 : EndIf
 
-  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_OK : ProcedureReturn 8 : EndIf
+  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhTextTex, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_OK : ProcedureReturn 8 : EndIf
   If NeonDrawBackendActive() <> 1 : ProcedureReturn 9 : EndIf
   If gNeonBackendBox <> @NvhBox Or gNeonBackendText <> @NvhText : ProcedureReturn 10 : EndIf
   If gNeonBackendScissorSet <> @NvhScissorSet Or gNeonBackendScissorClear <> @NvhScissorClear : ProcedureReturn 11 : EndIf
@@ -150,7 +159,8 @@ Procedure.i Main()
   oldText = gNeonBackendText
   oldSet = gNeonBackendScissorSet
   oldClear = gNeonBackendScissorClear
-  If NeonDrawBackendInstall(@NvhBox, 0, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_ERR_ARGS : ProcedureReturn 12 : EndIf
+  If NeonDrawBackendInstall(@NvhBox, 0, @NvhTextTex, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_ERR_ARGS : ProcedureReturn 12 : EndIf
+  If NeonDrawBackendInstall(@NvhBox, @NvhText, 0, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_ERR_ARGS : ProcedureReturn 45 : EndIf
   If gNeonBackendBox <> oldBox Or gNeonBackendText <> oldText Or gNeonBackendScissorSet <> oldSet Or gNeonBackendScissorClear <> oldClear : ProcedureReturn 13 : EndIf
   If NeonDrawBackendActive() <> 1 : ProcedureReturn 14 : EndIf
 
@@ -163,6 +173,11 @@ Procedure.i Main()
   If result <> #NVH_TEXT_SENTINEL Or nvhTextCalls <> 1 : ProcedureReturn 18 : EndIf
   If nvhTextFont <> 21 Or nvhTextX <> 22 Or nvhTextY <> 23 : ProcedureReturn 19 : EndIf
   If nvhTextString <> @nvhStringBuf[0] Or nvhTextColour <> $10203040 : ProcedureReturn 20 : EndIf
+
+  result = Neon_TextTex(24, 25, 26, @nvhStringBuf[0], $50607080)
+  If result <> #NVH_TEXT_TEX_SENTINEL Or nvhTextTexCalls <> 1 : ProcedureReturn 46 : EndIf
+  If nvhTextFont <> 24 Or nvhTextX <> 25 Or nvhTextY <> 26 : ProcedureReturn 47 : EndIf
+  If nvhTextString <> @nvhStringBuf[0] Or nvhTextColour <> $50607080 : ProcedureReturn 48 : EndIf
 
   Neon_ScissorSet(31, 32, 33, 34)
   If nvhScissorSetCalls <> 1 : ProcedureReturn 21 : EndIf
@@ -188,14 +203,14 @@ Procedure.i Main()
   If neon_nVerts <> 0 Or neon_nDraws <> 0 : ProcedureReturn 42 : EndIf
 
   ; An all-zero family is an explicit clear and restores the native path.
-  If NeonDrawBackendInstall(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) <> #NEON_OK : ProcedureReturn 25 : EndIf
+  If NeonDrawBackendInstall(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) <> #NEON_OK : ProcedureReturn 25 : EndIf
   If NeonDrawBackendActive() <> 0 : ProcedureReturn 26 : EndIf
   If gNeonBackendBox <> @neon_BackendBoxUnbound Or gNeonBackendText <> @neon_BackendTextUnbound : ProcedureReturn 27 : EndIf
   If gNeonBackendScissorSet <> @neon_BackendScissorSetUnbound Or gNeonBackendScissorClear <> @neon_BackendScissorClearUnbound : ProcedureReturn 28 : EndIf
   If Neon_Box(1, 2, 3, 4, 5) <> #NEON_ERR_NOFRAME : ProcedureReturn 29 : EndIf
   If nvhBoxCalls <> 1 : ProcedureReturn 30 : EndIf
 
-  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_OK : ProcedureReturn 31 : EndIf
+  If NeonDrawBackendInstall(@NvhBox, @NvhText, @NvhTextTex, @NvhScissorSet, @NvhScissorClear, @NvhFanBegin, @NvhFanPoint, @NvhFanEnd, @NvhFanOutline, @NvhLinesBegin, @NvhLine, @NvhLinesEnd) <> #NEON_OK : ProcedureReturn 31 : EndIf
   NeonDrawBackendClear()
   If NeonDrawBackendActive() <> 0 : ProcedureReturn 32 : EndIf
   If gNeonBackendBox <> @neon_BackendBoxUnbound Or gNeonBackendText <> @neon_BackendTextUnbound : ProcedureReturn 33 : EndIf

@@ -22,6 +22,25 @@ the Khronos MIT notice in `licenses/Khronos-Vulkan-Registry-MIT.txt`.
 
 ## What exists now
 
+On 2026-09-26, the resident Neon adapter gained an explicit `Neon_TextTex`
+callback. It preflights the visible glyph run, retains the public bitmap font
+metrics and clipping rules, and emits one atlas-sampled Vulkan draw. Selecting
+a font now advances the CPU atlas revision even when its bitmap address is
+reused. A quiescent Vulkan frame refreshes the bitmap columns before recording
+and publishes the new revision only after the upload completes; an uncertain
+upload poisons the adapter until recreation. This is a fail-closed in-place
+refresh, not the separate-image transactional replacement described in
+`docs/NEON_VULKAN_RESOURCE_LIFETIME_DESIGN.md`.
+
+The native 15-scene oracle passed on Pi 4 build 210 with its full 245,760-byte
+capture saved in `docs/evidence/neon-texttex-20260926/`. A separate real Vulkan
+widget frame using `Neon_TextTex` passed 129 report and rotated-pixel checks.
+These are distinct proofs: the 15-scene Vulkan producer and native/Vulkan
+pixel comparison are still outstanding. Its capacity scene requests more than
+the current 4,096 recorded Vulkan draws in one frame, so the producer needs
+ordered batching or an equivalent bounded multi-submit design before parity
+can be claimed.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor

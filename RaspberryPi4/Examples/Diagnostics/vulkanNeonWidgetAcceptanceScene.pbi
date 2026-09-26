@@ -172,7 +172,7 @@ Procedure.i NvwaCompose()
   ; Ground and a real titled panel.
   Neon_Box(0, 0, #NVWA_WIDTH, #NVWA_HEIGHT, Neon_C_Bg)
   Neon_Panel(#NVWA_PANEL_X, #NVWA_PANEL_Y, #NVWA_PANEL_W, #NVWA_PANEL_H, "PROJECT", Neon_C_Acc, #NVWA_PANEL_HEADER_H)
-  Neon_Text(#NEON_FONT_UI, #NVWA_TEXT_X, #NVWA_TEXT_Y, "VULKAN PATH", Neon_C_Text)
+  Neon_TextTex(#NEON_FONT_UI, #NVWA_TEXT_X, #NVWA_TEXT_Y, "VULKAN PATH", Neon_C_Text)
 
   ; The list owns a real widget clip and scrollbar. The fourth visible call is
   ; partially clipped; the fifth is wholly outside and emits no primitive.
@@ -221,7 +221,7 @@ Procedure.i NvwaPrime()
   If Neon_SurfaceW() <> #NVWA_WIDTH Or Neon_SurfaceH() <> #NVWA_HEIGHT
     ProcedureReturn #NVWA_ERR_GEOMETRY
   EndIf
-  rc = NeonDrawBackendInstall(@nvwaPrimeBox, @nvwaPrimeText, @nvwaPrimeScissorSet, @nvwaPrimeScissorClear, @neon_BackendFanBeginUnbound, @neon_BackendFanPointUnbound, @neon_BackendFanEndUnbound, @neon_BackendFanOutlineUnbound, @neon_BackendLinesBeginUnbound, @neon_BackendLineUnbound, @neon_BackendLinesEndUnbound)
+  rc = NeonDrawBackendInstall(@nvwaPrimeBox, @nvwaPrimeText, @nvwaPrimeText, @nvwaPrimeScissorSet, @nvwaPrimeScissorClear, @neon_BackendFanBeginUnbound, @neon_BackendFanPointUnbound, @neon_BackendFanEndUnbound, @neon_BackendFanOutlineUnbound, @neon_BackendLinesBeginUnbound, @neon_BackendLineUnbound, @neon_BackendLinesEndUnbound)
   If rc <> #NEON_OK
     ProcedureReturn rc
   EndIf

@@ -304,6 +304,7 @@ Global neon_inFrame.i  = 0
 ; Ownership stays with the installer; Neon only borrows the addresses.
 Global gNeonBackendBox.i          = 0
 Global gNeonBackendText.i         = 0
+Global gNeonBackendTextTex.i      = 0
 Global gNeonBackendScissorSet.i   = 0
 Global gNeonBackendScissorClear.i = 0
 Global gNeonBackendFanBegin.i     = 0
@@ -462,8 +463,11 @@ Global neon_emitNP.i    = 0
 ; ---- the atlas, once built (lazily, from the current font) ------------
 Global neon_texBuilt.i    = 0     ; the atlas has been filled and tiled
 Global neon_texFontBits.i = 0     ; the font it was built for; a change rebuilds
+Global neon_fontRevision.i = 0
+Global neon_texRevision.i = -1
 Global neon_rasterBuilt.i    = 0  ; CPU RGBA atlas and UV table are complete
 Global neon_rasterFontBits.i = 0  ; font which owns that immutable snapshot
+Global neon_rasterRevision.i = -1
 Global neon_rasterW.i        = 0  ; dimensions of the borrowed linear view
 Global neon_rasterH.i        = 0
 Global neon_rasterBytes.i    = 0  ; exact populated CPU raster extent
@@ -519,6 +523,10 @@ Procedure.i neon_BackendBoxUnbound(x.i, y.i, w.i, h.i, colour.i)
 EndProcedure
 
 Procedure.i neon_BackendTextUnbound(font.i, x.i, y.i, *s, colour.i)
+  ProcedureReturn #NEON_ERR_NOFRAME
+EndProcedure
+
+Procedure.i neon_BackendTextTexUnbound(font.i, x.i, y.i, *s, colour.i)
   ProcedureReturn #NEON_ERR_NOFRAME
 EndProcedure
 
@@ -591,7 +599,7 @@ EndProcedure
 
 ; Install one complete primitive family or none.  A partial family would
 ; split one widget frame between two frame owners, so it is refused rather
-; than guessed at.  Passing eleven zeroes restores the native Neon path.
+; than guessed at.  Passing twelve zeroes restores the native Neon path.
 ;
 ; THE ADDRESSES ARE PARAMETERS, NOT FIELDS OF A STRUCTURE (forum 915). For a
 ; while this took a NeonDrawBackend pointer and loaded each address out of
@@ -604,12 +612,12 @@ EndProcedure
 ; globals, so the compiler is right to refuse a loop it cannot rule out.
 ; An address passed as a parameter is followed exactly, to the procedure
 ; the caller named.
-Procedure.i NeonDrawBackendInstall(boxProc.i, textProc.i, scissorSetProc.i, scissorClearProc.i, fanBeginProc.i, fanPointProc.i, fanEndProc.i, fanOutlineProc.i, linesBeginProc.i, lineProc.i, linesEndProc.i)
-  If boxProc = 0 And textProc = 0 And scissorSetProc = 0 And scissorClearProc = 0 And fanBeginProc = 0 And fanPointProc = 0 And fanEndProc = 0 And fanOutlineProc = 0 And linesBeginProc = 0 And lineProc = 0 And linesEndProc = 0
+Procedure.i NeonDrawBackendInstall(boxProc.i, textProc.i, textTexProc.i, scissorSetProc.i, scissorClearProc.i, fanBeginProc.i, fanPointProc.i, fanEndProc.i, fanOutlineProc.i, linesBeginProc.i, lineProc.i, linesEndProc.i)
+  If boxProc = 0 And textProc = 0 And textTexProc = 0 And scissorSetProc = 0 And scissorClearProc = 0 And fanBeginProc = 0 And fanPointProc = 0 And fanEndProc = 0 And fanOutlineProc = 0 And linesBeginProc = 0 And lineProc = 0 And linesEndProc = 0
     NeonDrawBackendClear()
     ProcedureReturn #NEON_OK
   EndIf
-  If boxProc = 0 Or textProc = 0 Or scissorSetProc = 0 Or scissorClearProc = 0
+  If boxProc = 0 Or textProc = 0 Or textTexProc = 0 Or scissorSetProc = 0 Or scissorClearProc = 0
     neon_err = #NEON_ERR_ARGS
     ProcedureReturn #NEON_ERR_ARGS
   EndIf
@@ -624,6 +632,7 @@ Procedure.i NeonDrawBackendInstall(boxProc.i, textProc.i, scissorSetProc.i, scis
   NeonMeasureBackendClear()
   gNeonBackendBox          = boxProc
   gNeonBackendText         = textProc
+  gNeonBackendTextTex      = textTexProc
   gNeonBackendScissorSet   = scissorSetProc
   gNeonBackendScissorClear = scissorClearProc
   gNeonBackendFanBegin     = fanBeginProc
@@ -641,6 +650,7 @@ Procedure NeonDrawBackendClear()
   NeonMeasureBackendClear()
   gNeonBackendBox          = @neon_BackendBoxUnbound
   gNeonBackendText         = @neon_BackendTextUnbound
+  gNeonBackendTextTex      = @neon_BackendTextTexUnbound
   gNeonBackendScissorSet   = @neon_BackendScissorSetUnbound
   gNeonBackendScissorClear = @neon_BackendScissorClearUnbound
   gNeonBackendFanBegin     = @neon_BackendFanBeginUnbound
@@ -3743,6 +3753,9 @@ Procedure.i NeonFontUse(bitsAddr.i, cellW.i, cellH.i, first.i, last.i)
   neon_frb    = (cellW + 7) / 8
   neon_ffirst = first
   neon_flast  = last
+  ; An explicit font selection invalidates both atlas forms even if the caller
+  ; reused the same bitmap address with changed glyphs or cell metadata.
+  neon_fontRevision = neon_fontRevision + 1
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -4202,7 +4215,7 @@ Procedure.i neon_RasterEnsure()
     neon_err = #NEON_ERR_FONT
     ProcedureReturn #NEON_ERR_FONT
   EndIf
-  If neon_rasterBuilt <> 0 And neon_rasterFontBits = neon_fbits
+  If neon_rasterBuilt <> 0 And neon_rasterFontBits = neon_fbits And neon_rasterRevision = neon_fontRevision
     ProcedureReturn #NEON_OK
   EndIf
   If neon_texSrc <= 0 Or neon_glyphUV <= 0
@@ -4284,6 +4297,7 @@ Procedure.i neon_RasterEnsure()
   neon_atlasGlyphs = nGlyph
   neon_rasterBytes = bytes
   neon_rasterFontBits = neon_fbits
+  neon_rasterRevision = neon_fontRevision
   neon_rasterBuilt = 1
   ProcedureReturn #NEON_OK
 EndProcedure
@@ -4309,7 +4323,7 @@ Procedure.i neon_TexEnsure()
   Protected bytes.i
   Protected r.i
 
-  If neon_texBuilt <> 0 And neon_texFontBits = neon_fbits
+  If neon_texBuilt <> 0 And neon_texFontBits = neon_fbits And neon_texRevision = neon_fontRevision
     ProcedureReturn #NEON_OK
   EndIf
   r = neon_RasterEnsure()
@@ -4372,6 +4386,7 @@ Procedure.i neon_TexEnsure()
 
   neon_texBuilt    = 1
   neon_texFontBits = neon_fbits
+  neon_texRevision = neon_fontRevision
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -4400,13 +4415,18 @@ Procedure.i Neon_AtlasRasterEnsure()
 EndProcedure
 
 Procedure.i Neon_AtlasRasterReady()
-  If neon_rasterBuilt = 0 Or neon_rasterFontBits <> neon_fbits
+  If neon_rasterBuilt = 0 Or neon_rasterFontBits <> neon_fbits Or neon_rasterRevision <> neon_fontRevision
     ProcedureReturn 0
   EndIf
   If neon_texSrc <= 0 Or neon_rasterW < 1 Or neon_rasterH < 1 Or neon_rasterBytes < 1
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i Neon_AtlasRasterGeneration()
+  If Neon_AtlasRasterReady() = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn neon_rasterRevision
 EndProcedure
 
 Procedure.i Neon_AtlasRasterBase()
@@ -4712,6 +4732,10 @@ Procedure.i Neon_TextTex(font.i, x.i, y.i, *s, colour.i)
   Protected uR.i
   Protected vT.i
   Protected vB.i
+
+  If gNeonBackendActive <> 0
+    ProcedureReturn gNeonBackendTextTex(font, x, y, *s, colour)
+  EndIf
 
   If neon_inFrame = 0
     neon_err = #NEON_ERR_NOFRAME
