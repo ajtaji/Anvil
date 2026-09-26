@@ -130,6 +130,13 @@ Global Dim nwReport.l[#NW_REPORT_WORDS]
 Global Dim nwDmaScratch.a[768]
 Global Dim nwClear.l[4]
 Global Dim nwPairClear.l[4]
+Global Dim nwFlat0.a[25]
+Global Dim nwFlat1.a[25]
+Global Dim nwFlat2.a[24]
+Global Dim nwFlat3.a[25]
+Global Dim nwTex0.a[33]
+Global Dim nwTex1.a[33]
+Global Dim nwTex2.a[32]
 Global Dim nwProbeX.i[12]
 Global Dim nwProbeY.i[12]
 
@@ -236,6 +243,51 @@ Procedure.i nwPairBoxesFrame(imageBase.i, imagePitch.i)
       PokeA($07000000 + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
     Next
   Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
+; The native oracle's scene 2: all printable glyphs through four flat font
+; faces and three atlas-sampled runs. Its logical extent is 256x16.
+Procedure.i nwPairGlyphsFrame(imageBase.i, imagePitch.i)
+  Define rc.i, i.i, x.i, y.i
+  For i = 0 To 23 : nwFlat0[i] = 32 + i : nwFlat1[i] = 56 + i : nwFlat3[i] = 103 + i : Next
+  For i = 0 To 22 : nwFlat2[i] = 80 + i : Next
+  For i = 0 To 31 : nwTex0[i] = 32 + i : nwTex1[i] = 64 + i : Next
+  For i = 0 To 30 : nwTex2[i] = 96 + i : Next
+  nwFlat0[24] = 0 : nwFlat1[24] = 0 : nwFlat2[23] = 0 : nwFlat3[24] = 0
+  nwTex0[32] = 0 : nwTex1[32] = 0 : nwTex2[31] = 0
+
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorSet(0, 0, 256, 16)
+  rc = Neon_Text(#NEON_FONT_UI, 0, 0, @nwFlat0[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_SMALL, 0, 0, @nwFlat1[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_MONO, 0, 0, @nwFlat2[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_BOLD, 0, 0, @nwFlat3[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_TextTex(#NEON_FONT_UI, 0, 0, @nwTex0[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_TextTex(#NEON_FONT_UI, 0, 0, @nwTex1[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_TextTex(#NEON_FONT_UI, 0, 0, @nwTex2[0], Neon_RGBA(238, 196, 122, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromeDrawCount() <> 7 Or NeonVkChromeVertexCount() <> 1140
+    ProcedureReturn #NW_ERR_COUNTS
+  EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 15
+    For x = 0 To 1023
+      PokeA($07008000 + (y * 1024) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  Neon_ScissorClear()
   ProcedureReturn #NW_OK
 EndProcedure
 
@@ -500,6 +552,16 @@ Procedure.i Main()
   ; This off-screen paired frame is consumed before the widget's ordinary
   ; display frame. The first 16,384 bytes at $07000000 are readback only.
   rc = nwPairBoxesFrame(imageBase, imagePitch)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairGlyphsFrame(imageBase, imagePitch)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
