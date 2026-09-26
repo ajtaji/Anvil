@@ -45,10 +45,11 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_SURFACE_PITCH     = 3200
 #NW_SURFACE_BYTES     = 4096000
 #NW_WINDOW            = $063E8000
-#NW_WINDOW_BYTES      = $00800000
-#NW_MAP_SPAN          = $00BE8000
+#NW_WINDOW_BYTES      = $00C00000
+#NW_MAP_SPAN          = $00FE8000
 #NW_DSI_SCAN          = $08A00000
 #NW_SHOW_MS           = 3000
+#NW_CAPACITY_BOXES    = 3505
 
 #NW_OK                = 0
 #NW_NOT_TRIED         = 1
@@ -122,7 +123,7 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_S_CLEAR_G         = 59
 #NW_S_CLEAR_B         = 60
 #NW_S_CLEAR_A         = 61
-#NW_S_RESERVED        = 62
+#NW_S_CAPACITY_BOXES  = 62
 #NW_S_TAIL            = 63
 
 Global Dim nwReport.l[#NW_REPORT_WORDS]
@@ -174,6 +175,32 @@ Procedure nwCapturePixels(base.i, pitch.i)
     k = k + 1
   Wend
   nwPut(#NW_S_PIXEL_COUNT, 12)
+EndProcedure
+
+; Run the native oracle's 3,505 consecutive boxes through one real Vulkan
+; draw. This frame stays off-screen; the established widget frame below is
+; still the one captured and compared by the host checker.
+Procedure.i nwCapacityFrame()
+  Define i.i, rc.i
+  rc = NeonVkChromeBegin(@nwClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeBoxBatchBegin()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  For i = 0 To #NW_CAPACITY_BOXES - 1
+    rc = Neon_Box(i & 63, (i >> 6) & 63, 1, 1, Neon_RGBA(40, 70, 160, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  rc = NeonVkChromeBoxBatchEnd()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromeDrawCount() <> 1 Or NeonVkChromeVertexCount() <> (#NW_CAPACITY_BOXES * 6)
+    ProcedureReturn #NW_ERR_COUNTS
+  EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1 Or NeonVkChromePresentPending() <> 0
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  ProcedureReturn #NW_OK
 EndProcedure
 
 Procedure.i Main()
@@ -408,7 +435,7 @@ Procedure.i Main()
   ; The shipped adapter allocates all resident resources here and publishes
   ; the widget callbacks only after its Vulkan atlas upload has completed.
   nwPut(#NW_S_STEP, 4)
-  rc = NeonVkChromeCreate(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_EXPECT_QUADS)
+  rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_EXPECT_DRAWS, #NW_CAPACITY_BOXES)
   nwPut(#NW_S_CREATE_RC, rc)
   nwPut(#NW_S_READY_BEFORE, NeonVkChromeReady())
   nwPut(#NW_S_HOOK_AFTER, NeonDrawBackendActive())
@@ -422,9 +449,21 @@ Procedure.i Main()
   EndIf
   adapterMade = 1
 
+  nwPut(#NW_S_STEP, 5)
+  rc = nwCapacityFrame()
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_COUNTS)
+  EndIf
+  nwPut(#NW_S_CAPACITY_BOXES, #NW_CAPACITY_BOXES)
+
   ; Bind the display owner's DMA path before the scene consumes the adapter's
   ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
-  nwPut(#NW_S_STEP, 5)
+  nwPut(#NW_S_STEP, 6)
   rc = DisplayAdopt(#NW_DSI_SCAN, #NW_SURFACE_PITCH, #NVWA_WIDTH, #NVWA_HEIGHT, 32)
   nwPut(#NW_S_DISPLAY_ERROR, DisplayLastError())
   If rc <> #DSP_OK
@@ -449,7 +488,7 @@ Procedure.i Main()
   fallbackBefore = DisplayDmaFallbacks()
   refusalBefore = DisplayDmaRefusals()
 
-  nwPut(#NW_S_STEP, 6)
+  nwPut(#NW_S_STEP, 7)
   rc = NvwaRenderFrame(@nwClear[0], imageBase, imagePitch)
   nwPut(#NW_S_SCENE_RC, rc)
   nwPut(#NW_S_DRAW_ACTUAL, NeonVkChromeDrawCount())
@@ -499,7 +538,7 @@ Procedure.i Main()
 
   ; Destroy the production adapter first: it removes the complete callback
   ; family and retires every resource it owns. Then retire caller-owned Vulkan.
-  nwPut(#NW_S_STEP, 7)
+  nwPut(#NW_S_STEP, 8)
   NeonVkChromeDestroy()
   nwPut(#NW_S_READY_AFTER, NeonVkChromeReady())
   vkDeviceWaitIdle(dev)
@@ -513,7 +552,7 @@ Procedure.i Main()
   vkDestroyInstance(inst, 0)
   NeonShutdown()
   nwPut(#NW_S_SHUTDOWN, 1)
-  nwPut(#NW_S_STEP, 8)
+  nwPut(#NW_S_STEP, 9)
 
   If nwGet(#NW_S_READY_AFTER) <> 0 Or NeonDrawBackendActive() <> 0
     ProcedureReturn nwReturn(#NW_ERR_ADAPTER)

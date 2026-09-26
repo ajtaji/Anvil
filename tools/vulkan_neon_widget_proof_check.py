@@ -100,7 +100,10 @@ def check_source() -> int:
         "vkCreateRenderPass(dev, @passInfo, 0, @renderPass)",
         "vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)",
         "NvwaPrime()",
-        "NeonVkChromeCreate(phys, dev, queue, pool, renderPass, framebuffer",
+        "NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer",
+        "rc = nwCapacityFrame()",
+        "NeonVkChromeBoxBatchBegin()",
+        "NeonVkChromeBoxBatchEnd()",
         "NvwaRenderFrame(@nwClear[0], imageBase, imagePitch)",
         "DisplayDmaBind()",
         "DisplayDmaOps() - dmaBefore",
@@ -163,7 +166,7 @@ def report_from_bytes(data: bytes) -> tuple[int, ...]:
 def check_report_bytes(data: bytes) -> int:
     r = report_from_bytes(data)
     exact = {
-        0: MAGIC, 1: 0, 2: 8, 3: REPORT_BYTES,
+        0: MAGIC, 1: 0, 2: 9, 3: REPORT_BYTES,
         17: 0, 18: 0, 19: 0,
         20: 1, 21: 0, 22: 0, 23: 1,
         24: 47, 25: 654, 26: 47, 27: 654,
@@ -173,7 +176,7 @@ def check_report_bytes(data: bytes) -> int:
         54: 0x181, 55: 1, 56: 1, 57: 0,
         58: 0x3DCCCCCD, 59: 0x3E4CCCCD,
         60: 0x3E99999A, 61: 0x3F800000,
-        63: TAIL,
+        62: 3505, 63: TAIL,
     }
     for slot, expected in exact.items():
         if r[slot] != expected:
@@ -303,11 +306,12 @@ def check_png(path: Path, record: dict | None = None) -> int:
 
 def synthetic() -> tuple[bytes, bytes]:
     words = [0] * REPORT_WORDS
-    exact = {0: MAGIC, 1: 0, 2: 8, 3: REPORT_BYTES, 17: 0, 18: 0, 19: 0,
+    exact = {0: MAGIC, 1: 0, 2: 9, 3: REPORT_BYTES, 17: 0, 18: 0, 19: 0,
              20: 1, 21: 0, 22: 0, 23: 1, 24: 47, 25: 654, 26: 47,
              27: 654, 28: 35, 29: 12, 30: 74, 31: 4, 32: 1, 37: 1, 38: 12,
              53: 1, 54: 0x181, 55: 1, 56: 1, 57: 0, 58: 0x3DCCCCCD,
-             59: 0x3E4CCCCD, 60: 0x3E99999A, 61: 0x3F800000, 63: TAIL}
+             59: 0x3E4CCCCD, 60: 0x3E99999A, 61: 0x3F800000,
+             62: 3505, 63: TAIL}
     exact.update({slot: 0x1000 + slot for slot in range(4, 17)})
     exact[15], exact[16] = W*H*4, PITCH
     for slot, value in exact.items(): words[slot] = value
