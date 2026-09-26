@@ -22,6 +22,17 @@ the Khronos MIT notice in `licenses/Khronos-Vulkan-Registry-MIT.txt`.
 
 ## What exists now
 
+The full native/Vulkan Neon pixel oracle now passes on Pi 4: one returning
+RAM-only Vulkan producer rendered all 15 scenes, and all 245,760 BGRA bytes
+matched the native V3D capture. Scene 14's zero-width rebind was refused as
+expected before a valid rebind; the normal widget frame then rendered with
+47 draws and 654 vertices. The build-210 board run used a 15-second deadman,
+returned after 12.3 seconds, produced fresh capture 27 and was released with
+the deadman off and all core leases zero. Its source, raw pixels, report,
+capture and SHA-256 manifest are in
+`docs/evidence/vulkan-paired-all15-20260926/`. This is a bounded Neon
+compatibility proof, not Vulkan 1.0 conformance or CTS coverage.
+
 On 2026-09-26, the resident Neon adapter gained an explicit `Neon_TextTex`
 callback. It preflights the visible glyph run, retains the public bitmap font
 metrics and clipping rules, and emits one atlas-sampled Vulkan draw. Selecting
@@ -35,8 +46,8 @@ refresh, not the separate-image transactional replacement described in
 The native 15-scene oracle passed on Pi 4 build 210 with its full 245,760-byte
 capture saved in `docs/evidence/neon-texttex-20260926/`. A separate real Vulkan
 widget frame using `Neon_TextTex` passed 129 report and rotated-pixel checks.
-These are distinct proofs: the 15-scene Vulkan producer and native/Vulkan
-pixel comparison are still outstanding. Its capacity scene would request
+These were distinct early proofs: the 15-scene Vulkan producer and native/Vulkan
+pixel comparison were still outstanding at that stage. Its capacity scene would request
 4,687 Vulkan draws through one-call/one-draw lowering, above the shared
 4,096-record ceiling. An opt-in same-tint/same-scissor box batch now lowers
 its 3,505 consecutive boxes to one ordered draw; the 19-assertion emitted
@@ -49,8 +60,8 @@ one draw and 21,030 vertices, followed by the established widget frame with
 report and rotated-pixel checks under a 15-second deadman; see
 `docs/evidence/vulkan-box-batch-20260926/`. The first larger-buffer attempt
 correctly refused allocation within the diagnostic's 8 MiB Vulkan window;
-the passing run used 12 MiB within its mapped RAM span. The full paired
-15-scene Vulkan producer and pixel comparison remain outstanding.
+the passing run used 12 MiB within its mapped RAM span. The subsequent paired
+producer and pixel comparison are recorded above and scene by scene below.
 
 The next Pi 4 RAM diagnostic rendered native oracle scene 1 (three ordered
 boxes, including source-over alpha and a clipped negative-origin box) through
@@ -154,6 +165,13 @@ in 12.2 seconds under the board's 15-second deadman, produced fresh capture
 26, restored the widget frame and released the board cleanly. Evidence:
 `docs/evidence/vulkan-paired-stress-20260926/`. Fourteen native scenes are
 paired; scene 14's rebind and expected-error behavior remains.
+
+The final Pi 4 run added scene 14's invalid zero-width rebind check, a valid
+rebind to the same exact 64x64 target, and its `GEN2` flat and textured text
+frame. All 15 scenes were read back from that one run and compared in native
+scene order, with zero differing bytes across 245,760. The full report still
+shows a successful restored widget frame. See
+`docs/evidence/vulkan-paired-all15-20260926/` for the complete corpus.
 
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
