@@ -136,6 +136,7 @@ Procedure.i Main()
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
   Define bar.VkImageMemoryBarrier
+  Dim bars.VkImageMemoryBarrier(2)
   Define pbSrcStage.i
   Define pbDstStage.i
   Define pbMemoryBarrierCount.i
@@ -792,6 +793,67 @@ Procedure.i Main()
   Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
   bar\image = img
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; Two distinct image transitions in one API call must both reach the
+  ; submission, with the second array entry read at its real stride.
+  bars(0)\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bars(0)\image = img
+  bars(0)\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bars(0)\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bars(0)\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bars(0)\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bars(0)\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bars(0)\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bars(0)\subresourceRange\levelCount = 1
+  bars(0)\subresourceRange\layerCount = 1
+  bars(1)\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bars(1)\image = img2
+  bars(1)\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bars(1)\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bars(1)\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bars(1)\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bars(1)\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bars(1)\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bars(1)\subresourceRange\levelCount = 1
+  bars(1)\subresourceRange\layerCount = 1
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, 0, 0, 0, 0, 2, @bars(0))
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(AnvilVkImageLayout(img) = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+  Vkr(AnvilVkImageLayout(img2) = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A later malformed entry must be detected before recording any entry.
+  bars(1)\sType = 0
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, 0, 0, 0, 0, 2, @bars(0))
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  bars(1)\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bars(1)\image = img
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, 0, 0, 0, 0, 2, @bars(0))
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  bars(1)\image = img2
+
+  ; Even an execution-only barrier validates its stage masks and state.
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, 0, 0, 0, 0, 0, 0)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, 0, 0, 0, 0, 0, 0)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INVALID)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, 0, pbDstStage, 0, 0, 0, 0, 0, 0, 0)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; ------------------------------------------------------------------
