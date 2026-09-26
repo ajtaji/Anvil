@@ -452,9 +452,32 @@ Procedure.i nwPairEdgesFrame(imageBase.i, imagePitch.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scenes 9..12 use a 63x47 logical target at four rotations.
+; The native capture poisons every unused byte with A5 before rendering.
+Procedure.i nwPairRotationFrame(imageBase.i, imagePitch.i, physicalW.i, physicalH.i, captureBase.i, nativePitch.i)
+  Define rc.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = Neon_Box(4, 8, 11, 23, Neon_RGBA(40, 70, 160, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For x = 0 To 16383 : PokeA(captureBase + x, $A5) : Next
+  For y = 0 To physicalH - 1
+    For x = 0 To physicalW * 4 - 1
+      PokeA(captureBase + (y * nativePitch) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
 ; The backend requires the framebuffer and attachment to have identical
-; extents. Give scene 8 its own 64x64 image, then restore the widget target.
-Procedure.i nwPairEdgesExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPitch.i)
+; extents. Make the oracle target, draw once, then restore the widget target.
+Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPitch.i, scene.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, rotation.i, captureBase.i, nativePitch.i)
   Define info.VkImageCreateInfo
   Define req.VkMemoryRequirements
   Define alloc.VkMemoryAllocateInfo
@@ -465,7 +488,7 @@ Procedure.i nwPairEdgesExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, wid
 
   info\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
   info\imageType = #VK_IMAGE_TYPE_2D : info\format = #VK_FORMAT_B8G8R8A8_UNORM
-  info\extent\width = 64 : info\extent\height = 64 : info\extent\depth = 1
+  info\extent\width = physicalW : info\extent\height = physicalH : info\extent\depth = 1
   info\mipLevels = 1 : info\arrayLayers = 1 : info\samples = #VK_SAMPLE_COUNT_1_BIT
   info\tiling = #VK_IMAGE_TILING_LINEAR
   info\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -481,7 +504,7 @@ Procedure.i nwPairEdgesExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, wid
   If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, image, memory, 0) : EndIf
   If rc = #VK_SUCCESS
     imageBase = AnvilVkImageAddress(image) : imagePitch = AnvilVkImageRowPitch(image)
-    If imageBase = 0 Or imagePitch < 256 : rc = #NW_ERR_MEMORY : EndIf
+    If imageBase = 0 Or imagePitch < physicalW * 4 : rc = #NW_ERR_MEMORY : EndIf
   EndIf
   If rc = #VK_SUCCESS
     viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
@@ -494,15 +517,21 @@ Procedure.i nwPairEdgesExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, wid
   If rc = #VK_SUCCESS
     frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
     frameInfo\renderPass = renderPass : frameInfo\attachmentCount = 1
-    frameInfo\pAttachments = @view : frameInfo\width = 64
-    frameInfo\height = 64 : frameInfo\layers = 1
+    frameInfo\pAttachments = @view : frameInfo\width = physicalW
+    frameInfo\height = physicalH : frameInfo\layers = 1
     rc = vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)
   EndIf
   If rc = #VK_SUCCESS
-    rc = NeonVkChromeRebind(framebuffer, 64, 64, 64, 64, imagePitch, 0)
+    rc = NeonVkChromeRebind(framebuffer, logicalW, logicalH, physicalW, physicalH, imagePitch, rotation)
     If rc = #VK_SUCCESS : rebound = 1 : EndIf
   EndIf
-  If rc = #VK_SUCCESS : rc = nwPairEdgesFrame(imageBase, imagePitch) : EndIf
+  If rc = #VK_SUCCESS
+    If scene = 8
+      rc = nwPairEdgesFrame(imageBase, imagePitch)
+    Else
+      rc = nwPairRotationFrame(imageBase, imagePitch, physicalW, physicalH, captureBase, nativePitch)
+    EndIf
+  EndIf
   If rc = #VK_SUCCESS
     rc = NeonVkChromeRebind(widgetFramebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_WIDTH, #NVWA_HEIGHT, widgetPitch, 0)
     If rc = #VK_SUCCESS : rebound = 0 : EndIf
@@ -541,6 +570,11 @@ Procedure.i Main()
   Define adapterMade.i
   Define vkMade.i
   Define neonMade.i
+  Define scene.i
+  Define rotation.i
+  Define physicalW.i
+  Define physicalH.i
+  Define nativePitch.i
   Define ici.VkInstanceCreateInfo
   Define fp.VkFormatProperties
   Define qci.VkDeviceQueueCreateInfo
@@ -848,7 +882,7 @@ Procedure.i Main()
     ProcedureReturn nwReturn(#NW_ERR_PIXELS)
   EndIf
 
-  rc = nwPairEdgesExactTarget(dev, renderPass, framebuffer, imagePitch)
+  rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, 8, 64, 64, 64, 64, 0, $07020000, 256)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
@@ -857,6 +891,23 @@ Procedure.i Main()
     vkDestroyInstance(inst, 0) : NeonShutdown()
     ProcedureReturn nwReturn(#NW_ERR_PIXELS)
   EndIf
+
+  For scene = 9 To 12
+    rotation = (scene - 9) * 90
+    physicalW = 63 : physicalH = 47 : nativePitch = 252
+    If rotation = 90 Or rotation = 270
+      physicalW = 47 : physicalH = 63 : nativePitch = 188
+    EndIf
+    rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, scene, 63, 47, physicalW, physicalH, rotation, $07024000 + ((scene - 9) * 16384), nativePitch)
+    If rc <> #NW_OK
+      NeonVkChromeDestroy()
+      vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+      vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+      vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+      vkDestroyInstance(inst, 0) : NeonShutdown()
+      ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+    EndIf
+  Next
 
   ; Bind the display owner's DMA path before the scene consumes the adapter's
   ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
