@@ -29,7 +29,7 @@
 ;     every binding has descriptorCount 1 at VK_SHADER_STAGE_FRAGMENT_BIT
 ;   * a descriptor pool whose rows are accumulated per supported type,
 ;     including duplicate rows, with optional FREE_DESCRIPTOR_SET_BIT
-;   * vkAllocateDescriptorSets of one set at a time
+;   * vkAllocateDescriptorSets of a bounded array, with whole-call preflight
 ;   * vkFreeDescriptorSets of an atomically checked array, returning each
 ;     freed set's type budget to its owning pool
 ;   * vkUpdateDescriptorSets of one write at a time, no copies
@@ -515,11 +515,23 @@ Procedure.i AnvilVkDescriptorSetsAllocate(device.i, *ai.VkDescriptorSetAllocateI
   Define s.i
   Define k.i
   Define idx.i
+  Define i.i
+  Define count.i
+  Define found.i
   Define needUbo.i
   Define needSample.i
+  Define Dim layouts.i(#ANVIL_VK_MAX_DESCRIPTOR_SETS - 1)
+  Define Dim slots.i(#ANVIL_VK_MAX_DESCRIPTOR_SETS - 1)
 
   If *out = 0 Or *ai = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
-  PokeI(*out, #VK_NULL_HANDLE)
+  count = *ai\descriptorSetCount & $FFFFFFFF
+  If count = 0 Or count > #ANVIL_VK_MAX_DESCRIPTOR_SETS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkAllocateDescriptorSets needs between one and the bounded global descriptor-set capacity per call (Anvil code -20005, unsupported allocation count).")
+  EndIf
+  For i = 0 To count - 1
+    PokeI(*out + i * SizeOf(.i), #VK_NULL_HANDLE)
+  Next
+
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   If (*ai\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
@@ -528,68 +540,85 @@ Procedure.i AnvilVkDescriptorSetsAllocate(device.i, *ai.VkDescriptorSetAllocateI
   If *ai\pNext <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkAllocateDescriptorSets was given a pNext chain (Anvil code -20005, no pNext extension is implemented); no set was allocated.")
   EndIf
-  If (*ai\descriptorSetCount & $FFFFFFFF) <> 1 Or *ai\pSetLayouts = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkAllocateDescriptorSets was asked for other than exactly one descriptor set (Anvil code -20005, unsupported allocation); allocate one set per call here, so that a partial failure cannot leave some of an array written and the rest not.")
+  If *ai\pSetLayouts = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkAllocateDescriptorSets needs a layout for every requested set (Anvil code -20001, null pSetLayouts).")
   EndIf
+
   p = avkDpSlot(*ai\descriptorPool)
   If p = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  lay = avkDslSlot(PeekI(*ai\pSetLayouts))
-  If lay = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If avkDpDev[p] <> d Or avkDslDev[lay] <> d
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkAllocateDescriptorSets was given a descriptor pool or a set layout from a different VkDevice (Anvil code -20003, wrong parent); every object in one allocation must share a device.")
+  If avkDpDev[p] <> d
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkAllocateDescriptorSets was given a descriptor pool from a different VkDevice (Anvil code -20003, wrong parent).")
   EndIf
+
+  ; Validate the complete layout array and sum both descriptor budgets before
+  ; publishing any set. No failed call can leave a partially allocated array.
   needUbo = 0
   needSample = 0
-  k = 0
-  While k < avkDslCount[lay]
-    idx = (lay * #ANVIL_VK_MAX_SET_BINDINGS) + k
-    If avkDslType[idx] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-      needUbo = needUbo + 1
-    ElseIf avkDslType[idx] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-      needSample = needSample + 1
-    Else
-      ProcedureReturn #ANVIL_VK_ERR_STATE
+  For i = 0 To count - 1
+    lay = avkDslSlot(PeekI(*ai\pSetLayouts + i * SizeOf(.i)))
+    If lay = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+    If avkDslDev[lay] <> d
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkAllocateDescriptorSets was given a set layout from a different VkDevice (Anvil code -20003, wrong parent).")
     EndIf
-    k = k + 1
-  Wend
-  If avkDpSetsOut[p] >= avkDpMaxSets[p]
-    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets has already handed out every set this pool declared (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set was allocated. Raise VkDescriptorPoolCreateInfo.maxSets, or reset the pool.")
+    layouts(i) = lay
+    For k = 0 To avkDslCount[lay] - 1
+      idx = (lay * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      If avkDslType[idx] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+        needUbo = needUbo + 1
+      ElseIf avkDslType[idx] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+        needSample = needSample + 1
+      Else
+        ProcedureReturn #ANVIL_VK_ERR_STATE
+      EndIf
+    Next
+  Next
+
+  If count > (avkDpMaxSets[p] - avkDpSetsOut[p])
+    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets needs more set slots than this pool has left (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set was allocated.")
   EndIf
-  ; Check both type budgets by subtraction before publishing any set or moving
-  ; either counter. A mixed allocation is one transaction, never half a set.
   If needUbo > (avkDpUboCapacity[p] - avkDpUboOut[p]) Or needSample > (avkDpSampleCapacity[p] - avkDpSampleOut[p])
     ProcedureReturn avkFault(#VK_ERROR_OUT_OF_POOL_MEMORY, "vkAllocateDescriptorSets needs more uniform-buffer or combined-image-sampler descriptors than this pool has left (VkResult -1000069000, VK_ERROR_OUT_OF_POOL_MEMORY); no set or per-type counter was changed.")
   EndIf
 
-  s = 1
-  While s <= #ANVIL_VK_MAX_DESCRIPTOR_SETS And avkDsLive[s] <> 0 : s = s + 1 : Wend
-  If s > #ANVIL_VK_MAX_DESCRIPTOR_SETS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
-  avkDsGen[s] = avkNextGen(avkDsGen[s])
-  avkDsDev[s] = d
-  avkDsPool[s] = p
-  avkDsCount[s] = avkDslCount[lay]
-  k = 0
-  While k < #ANVIL_VK_MAX_SET_BINDINGS
-    idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + k
-    avkDsType[idx] = -1
-    avkDsStages[idx] = 0
-    If k < avkDslCount[lay]
-      avkDsType[idx] = avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
-      avkDsStages[idx] = avkDslStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+  found = 0
+  For s = 1 To #ANVIL_VK_MAX_DESCRIPTOR_SETS
+    If avkDsLive[s] = 0
+      slots(found) = s
+      found = found + 1
+      If found = count : Break : EndIf
     EndIf
-    avkDsBuf[idx] = 0
-    avkDsOffset[idx] = 0
-    avkDsRange[idx] = 0
-    avkDsSampler[idx] = 0
-    avkDsView[idx] = 0
-    avkDsImageLayout[idx] = 0
-    k = k + 1
-  Wend
-  avkDpSetsOut[p] = avkDpSetsOut[p] + 1
+  Next
+  If found <> count : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+
+  ; Every operation after preflight is a non-failing table write.
+  For i = 0 To count - 1
+    s = slots(i)
+    lay = layouts(i)
+    avkDsGen[s] = avkNextGen(avkDsGen[s])
+    avkDsDev[s] = d
+    avkDsPool[s] = p
+    avkDsCount[s] = avkDslCount[lay]
+    For k = 0 To #ANVIL_VK_MAX_SET_BINDINGS - 1
+      idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + k
+      avkDsType[idx] = -1
+      avkDsStages[idx] = 0
+      If k < avkDslCount[lay]
+        avkDsType[idx] = avkDslType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+        avkDsStages[idx] = avkDslStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k]
+      EndIf
+      avkDsBuf[idx] = 0
+      avkDsOffset[idx] = 0
+      avkDsRange[idx] = 0
+      avkDsSampler[idx] = 0
+      avkDsView[idx] = 0
+      avkDsImageLayout[idx] = 0
+    Next
+    avkDsLive[s] = 1
+    PokeI(*out + i * SizeOf(.i), avkToken(#ANVIL_VK_TYPE_DESCRIPTOR_SET, s, avkDsGen[s]))
+  Next
+  avkDpSetsOut[p] = avkDpSetsOut[p] + count
   avkDpUboOut[p] = avkDpUboOut[p] + needUbo
   avkDpSampleOut[p] = avkDpSampleOut[p] + needSample
-  avkDsLive[s] = 1
-  PokeI(*out, avkToken(#ANVIL_VK_TYPE_DESCRIPTOR_SET, s, avkDsGen[s]))
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
