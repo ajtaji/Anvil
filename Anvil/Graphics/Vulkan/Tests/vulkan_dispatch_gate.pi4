@@ -3,7 +3,7 @@
 ; ======================================================================
 ; Runs on the AArch64 interpreter. The test backend supplies object handles
 ; without touching hardware; this gate checks exact function addresses,
-; lookup domains, spelling, withheld names, and stale owner rejection.
+; lookup domains, spelling, missing names, and stale owner rejection.
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
@@ -211,9 +211,9 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkDestroySemaphore") = @vkDestroySemaphore)
   Vkd(vkGetDeviceProcAddr(device, "vkDestroySemaphore") = @vkDestroySemaphore)
 
-  ; Declared-but-withheld and missing names never leak through any domain.
-  Vkd(vkGetInstanceProcAddr(instance, "vkFreeDescriptorSets") = 0)
-  Vkd(vkGetDeviceProcAddr(device, "vkFreeDescriptorSets") = 0)
+  ; Individual set free is a device command; names remain domain-checked.
+  Vkd(vkGetInstanceProcAddr(instance, "vkFreeDescriptorSets") = @vkFreeDescriptorSets)
+  Vkd(vkGetDeviceProcAddr(device, "vkFreeDescriptorSets") = @vkFreeDescriptorSets)
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateEvent") = @vkCreateEvent)
   Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = @vkCreateEvent)
 
