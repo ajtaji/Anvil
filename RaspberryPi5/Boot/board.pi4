@@ -66,7 +66,9 @@ Procedure Main()
   Pi5PutBanner()
   If gPi5Dtb = 0
     Pi5PutStatus(48)
-  ElseIf PeekL(gPi5Dtb) = $EDFE0DD0
+  ; PeekL is signed: the loaded magic sign-extends, so mask to 32 bits before
+  ; comparing or a valid FDT reads as bad magic.
+  ElseIf (PeekL(gPi5Dtb) & $FFFFFFFF) = $EDFE0DD0
     Pi5PutStatus(49)
   Else
     Pi5PutStatus(50)
