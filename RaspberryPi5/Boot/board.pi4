@@ -8,6 +8,9 @@
 ; translate it to CPU physical $107D001000. Before this
 ; address is used for anything beyond the first diagnostic, the live FDT must
 ; be parsed and its ranges verified on real hardware.
+;
+; It also prints `EL n`, the level the firmware entered it at. Anvil must run
+; at EL3; until a Pi 5 EL3 armstub exists this is expected to read EL 2.
 
 LoadAddress  $200000
 BssAddress   $400000
@@ -18,6 +21,7 @@ StackAddress $800000
 #PI5_UART_TXFF = $20
 
 Global gPi5Dtb.q
+Global gPi5El.q
 
 Procedure Pi5PutByte(value.l)
   Define spins.l = 0
@@ -61,9 +65,21 @@ Procedure Main()
     adrp x1, global_gpi5dtb
     add  x1, x1, #:lo12:global_gpi5dtb
     str  x0, [x1]
+    ; The level is read, never asserted: CurrentEL bits 3:2 (all others RES0).
+    mrs  x2, CurrentEL
+    lsr  x2, x2, #2
+    adrp x1, global_gpi5el
+    add  x1, x1, #:lo12:global_gpi5el
+    str  x2, [x1]
   EndASM
 
   Pi5PutBanner()
+  Pi5PutByte(69)  ; E
+  Pi5PutByte(76)  ; L
+  Pi5PutByte(32)
+  Pi5PutByte(48 + gPi5El)
+  Pi5PutByte(13)
+  Pi5PutByte(10)
   If gPi5Dtb = 0
     Pi5PutStatus(48)
   ; PeekL is signed: the loaded magic sign-extends, so mask to 32 bits before
