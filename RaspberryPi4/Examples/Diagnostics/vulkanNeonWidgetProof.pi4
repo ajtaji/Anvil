@@ -320,6 +320,30 @@ Procedure.i nwPairClipsFrame(imageBase.i, imagePitch.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scene 7: two overlapping source-over boxes. Capture the
+; completed GPU attachment for a byte-exact comparison with the native frame.
+Procedure.i nwPairAlphaFrame(imageBase.i, imagePitch.i)
+  Define rc.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = Neon_Box(8, 8, 34, 34, Neon_RGBA(255, 0, 0, 128))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Box(24, 24, 34, 34, Neon_RGBA(0, 0, 255, 128))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA($07010000 + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
 Procedure.i Main()
   Define rc.i
   Define count.i
@@ -601,6 +625,16 @@ Procedure.i Main()
   EndIf
 
   rc = nwPairClipsFrame(imageBase, imagePitch)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairAlphaFrame(imageBase, imagePitch)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)

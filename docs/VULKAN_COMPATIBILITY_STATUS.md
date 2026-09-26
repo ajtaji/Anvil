@@ -87,6 +87,16 @@ report, raw clip pixels and capture are in
 paired; the Vulkan producer still uses one oversized attachment rather than
 the oracle's changing target extents.
 
+Native oracle scene 7 now passes a full-pixel Pi 4 Vulkan comparison as well:
+two overlapping half-alpha boxes yield exactly the native 16,384 BGRA bytes.
+The returning build-210 RAM payload used a 15-second deadman, produced fresh
+capture 12, and the established widget frame passed 133 report/pixel checks.
+Evidence is in `docs/evidence/vulkan-paired-alpha-20260926/`. Four native
+scenes are paired; the remaining 11 scenes and changing target extents still
+need proof. The first alpha candidate was safely refused before entry because
+its linked address overlapped the monitor; the successful image was rebuilt
+for the board's `00600000` RAM window.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
