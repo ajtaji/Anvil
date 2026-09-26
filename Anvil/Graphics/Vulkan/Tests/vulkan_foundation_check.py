@@ -109,6 +109,7 @@ CONSTANTS = {
     "VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK", "VK_BORDER_COLOR_INT_OPAQUE_BLACK",
     "VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE", "VK_BORDER_COLOR_INT_OPAQUE_WHITE",
     "VK_MAX_MEMORY_TYPES", "VK_MAX_MEMORY_HEAPS",
+    "VK_MAX_PHYSICAL_DEVICE_NAME_SIZE",
     "VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT", "VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT",
     "VK_MEMORY_PROPERTY_HOST_COHERENT_BIT", "VK_MEMORY_PROPERTY_HOST_CACHED_BIT",
     "VK_MEMORY_HEAP_DEVICE_LOCAL_BIT",
@@ -479,7 +480,8 @@ PB_SUFFIX = {
     "VkImageUsageFlags": ".l", "VkSharingMode": ".l", "VkImageLayout": ".l",
     "VkImageAspectFlags": ".l", "VkAccessFlags": ".l",
     "VkFormatFeatureFlags": ".l",
-    "VkSampleCountFlags": ".l",
+    "VkSampleCountFlags": ".l", "VkPhysicalDeviceType": ".l",
+    "uint8_t": ".a", "char": ".a",
     "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
     "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l", "VkSemaphoreCreateFlags": ".l",
     "VkDeviceSize": ".q", "uint64_t": ".q",
@@ -488,6 +490,8 @@ PB_SUFFIX = {
     "VkDeviceMemory": ".i", "VkFence": ".i",
     "VkOffset2D": ".VkOffset2D", "VkExtent2D": ".VkExtent2D",
     "VkExtent3D": ".VkExtent3D",
+    "VkPhysicalDeviceLimits": ".VkPhysicalDeviceLimits",
+    "VkPhysicalDeviceSparseProperties": ".VkPhysicalDeviceSparseProperties",
     "VkImageSubresourceRange": ".VkImageSubresourceRange",
     "VkMemoryType": ".VkMemoryType", "VkMemoryHeap": ".VkMemoryHeap",
     # The graphics pipeline vocabulary, added 2026-09-11. size_t is the
@@ -680,8 +684,9 @@ def expected_pbi_member(member: ET.Element) -> str:
     # extent in the member's own text and not as an <enum>, so the
     # branch below would silently expect a scalar and a four-element
     # array would pass as one float.
-    if raw.endswith("]") and member.findtext("enum") is None:
-        extent = raw[raw.rindex("[") + 1:-1]
+    tail = (member.find("name").tail or "").strip()
+    if tail.startswith("[") and tail.endswith("]") and member.findtext("enum") is None:
+        extent = tail[1:-1]
         try:
             return "%s%s[%s]" % (name, PB_SUFFIX[c_type], extent)
         except KeyError as exc:
@@ -779,6 +784,17 @@ def check_registry(failures: list[str]) -> int:
                 failures.append("%s declaration %r, registry requires %r" %
                                 (name, pbi_structs.get(name), expected_decl))
         checks += 2
+    # The large properties ABI is checked field-for-field against the pinned
+    # registry. Independent emitted sizes and offsets below catch alignment.
+    for name in ("VkPhysicalDeviceLimits", "VkPhysicalDeviceSparseProperties",
+                 "VkPhysicalDeviceProperties"):
+        node = types.get(name)
+        if node is None:
+            failures.append("registry has no structure " + name)
+            continue
+        if pbi_structs.get(name) != tuple(expected_pbi_member(m) for m in members(node)):
+            failures.append("%s declaration differs from registry" % name)
+        checks += 1
     # Anvil declares no Vulkan union, and must not: PureMetal has no
     # union, and one arm of VkClearColorValue masquerading as the whole
     # type is exactly the silent wrong answer this project refuses.

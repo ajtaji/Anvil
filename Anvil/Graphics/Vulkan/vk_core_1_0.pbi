@@ -23,6 +23,7 @@
 #VK_MAX_EXTENSION_NAME_SIZE = 256
 #VK_MAX_DESCRIPTION_SIZE = 256
 #VK_UUID_SIZE = 16
+#VK_MAX_PHYSICAL_DEVICE_NAME_SIZE = 256
 
 ; VkFormat -- only the two 8-bit-per-channel colour formats this slice names.
 ; B8G8R8A8_UNORM is the one it implements; R8G8B8A8_UNORM is declared so a
@@ -343,6 +344,137 @@ Structure VkPhysicalDeviceFeatures Align #PB_Structure_AlignC
   sparseResidencyAliased.l
   variableMultisampleRate.l
   inheritedQueries.l
+EndStructure
+
+
+; Complete registry ABI for the core physical-device properties query.
+Structure VkPhysicalDeviceLimits Align #PB_Structure_AlignC
+  maxImageDimension1D.l
+  maxImageDimension2D.l
+  maxImageDimension3D.l
+  maxImageDimensionCube.l
+  maxImageArrayLayers.l
+  maxTexelBufferElements.l
+  maxUniformBufferRange.l
+  maxStorageBufferRange.l
+  maxPushConstantsSize.l
+  maxMemoryAllocationCount.l
+  maxSamplerAllocationCount.l
+  bufferImageGranularity.q
+  sparseAddressSpaceSize.q
+  maxBoundDescriptorSets.l
+  maxPerStageDescriptorSamplers.l
+  maxPerStageDescriptorUniformBuffers.l
+  maxPerStageDescriptorStorageBuffers.l
+  maxPerStageDescriptorSampledImages.l
+  maxPerStageDescriptorStorageImages.l
+  maxPerStageDescriptorInputAttachments.l
+  maxPerStageResources.l
+  maxDescriptorSetSamplers.l
+  maxDescriptorSetUniformBuffers.l
+  maxDescriptorSetUniformBuffersDynamic.l
+  maxDescriptorSetStorageBuffers.l
+  maxDescriptorSetStorageBuffersDynamic.l
+  maxDescriptorSetSampledImages.l
+  maxDescriptorSetStorageImages.l
+  maxDescriptorSetInputAttachments.l
+  maxVertexInputAttributes.l
+  maxVertexInputBindings.l
+  maxVertexInputAttributeOffset.l
+  maxVertexInputBindingStride.l
+  maxVertexOutputComponents.l
+  maxTessellationGenerationLevel.l
+  maxTessellationPatchSize.l
+  maxTessellationControlPerVertexInputComponents.l
+  maxTessellationControlPerVertexOutputComponents.l
+  maxTessellationControlPerPatchOutputComponents.l
+  maxTessellationControlTotalOutputComponents.l
+  maxTessellationEvaluationInputComponents.l
+  maxTessellationEvaluationOutputComponents.l
+  maxGeometryShaderInvocations.l
+  maxGeometryInputComponents.l
+  maxGeometryOutputComponents.l
+  maxGeometryOutputVertices.l
+  maxGeometryTotalOutputComponents.l
+  maxFragmentInputComponents.l
+  maxFragmentOutputAttachments.l
+  maxFragmentDualSrcAttachments.l
+  maxFragmentCombinedOutputResources.l
+  maxComputeSharedMemorySize.l
+  maxComputeWorkGroupCount.l[3]
+  maxComputeWorkGroupInvocations.l
+  maxComputeWorkGroupSize.l[3]
+  subPixelPrecisionBits.l
+  subTexelPrecisionBits.l
+  mipmapPrecisionBits.l
+  maxDrawIndexedIndexValue.l
+  maxDrawIndirectCount.l
+  maxSamplerLodBias.f
+  maxSamplerAnisotropy.f
+  maxViewports.l
+  maxViewportDimensions.l[2]
+  viewportBoundsRange.f[2]
+  viewportSubPixelBits.l
+  minMemoryMapAlignment.i
+  minTexelBufferOffsetAlignment.q
+  minUniformBufferOffsetAlignment.q
+  minStorageBufferOffsetAlignment.q
+  minTexelOffset.l
+  maxTexelOffset.l
+  minTexelGatherOffset.l
+  maxTexelGatherOffset.l
+  minInterpolationOffset.f
+  maxInterpolationOffset.f
+  subPixelInterpolationOffsetBits.l
+  maxFramebufferWidth.l
+  maxFramebufferHeight.l
+  maxFramebufferLayers.l
+  framebufferColorSampleCounts.l
+  framebufferDepthSampleCounts.l
+  framebufferStencilSampleCounts.l
+  framebufferNoAttachmentsSampleCounts.l
+  maxColorAttachments.l
+  sampledImageColorSampleCounts.l
+  sampledImageIntegerSampleCounts.l
+  sampledImageDepthSampleCounts.l
+  sampledImageStencilSampleCounts.l
+  storageImageSampleCounts.l
+  maxSampleMaskWords.l
+  timestampComputeAndGraphics.l
+  timestampPeriod.f
+  maxClipDistances.l
+  maxCullDistances.l
+  maxCombinedClipAndCullDistances.l
+  discreteQueuePriorities.l
+  pointSizeRange.f[2]
+  lineWidthRange.f[2]
+  pointSizeGranularity.f
+  lineWidthGranularity.f
+  strictLines.l
+  standardSampleLocations.l
+  optimalBufferCopyOffsetAlignment.q
+  optimalBufferCopyRowPitchAlignment.q
+  nonCoherentAtomSize.q
+EndStructure
+
+Structure VkPhysicalDeviceSparseProperties Align #PB_Structure_AlignC
+  residencyStandard2DBlockShape.l
+  residencyStandard2DMultisampleBlockShape.l
+  residencyStandard3DBlockShape.l
+  residencyAlignedMipSize.l
+  residencyNonResidentStrict.l
+EndStructure
+
+Structure VkPhysicalDeviceProperties Align #PB_Structure_AlignC
+  apiVersion.l
+  driverVersion.l
+  vendorID.l
+  deviceID.l
+  deviceType.l
+  deviceName.a[#VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]
+  pipelineCacheUUID.a[#VK_UUID_SIZE]
+  limits.VkPhysicalDeviceLimits
+  sparseProperties.VkPhysicalDeviceSparseProperties
 EndStructure
 
 Structure VkDeviceCreateInfo Align #PB_Structure_AlignC
