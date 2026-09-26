@@ -114,6 +114,17 @@ Procedure.i vkEnumerateDeviceExtensionProperties(physicalDevice.i, *pLayerName, 
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+Procedure.i vkEnumerateDeviceLayerProperties(physicalDevice.i, *pPropertyCount, *pProperties)
+  If *pPropertyCount = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkEnumerateDeviceLayerProperties needs pPropertyCount (Anvil code -20001, null output count); pass a writable count pointer.")
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkEnumerateDeviceLayerProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the count and properties were left untouched.")
+  EndIf
+  PokeL(*pPropertyCount, 0)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure vkGetPhysicalDeviceMemoryProperties(physicalDevice.i, *pMemoryProperties.VkPhysicalDeviceMemoryProperties)
   Define i.i
   Define n.i
@@ -341,6 +352,22 @@ EndProcedure
 
 Procedure.i vkDeviceWaitIdle(device.i)
   ProcedureReturn AnvilVkDeviceWaitIdle(device)
+EndProcedure
+
+; This bounded implementation owns one queue per device. Once the queue's
+; generation and parent have been checked, device-idle is queue-idle.
+Procedure.i vkQueueWaitIdle(queue.i)
+  Define q.i
+  Define d.i
+  q = avkQueueSlot(queue)
+  If q = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkQueueWaitIdle was given a VkQueue handle that is not live (Anvil code -20002, stale or foreign handle); no wait was performed.")
+  EndIf
+  d = avkQueueDev[q]
+  If d < 1 Or d > #ANVIL_VK_MAX_DEVICES Or avkDevLive[d] = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkQueueWaitIdle found no live parent device for the queue (Anvil code -20002, stale owner); no wait was performed.")
+  EndIf
+  ProcedureReturn AnvilVkDeviceWaitIdle(avkToken(#ANVIL_VK_TYPE_DEVICE, d, avkDevGen[d]))
 EndProcedure
 
 ; ----------------------------------------------------------------------

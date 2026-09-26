@@ -125,6 +125,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkEnumerateInstanceLayerProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_GLOBAL, @vkEnumerateInstanceLayerProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkEnumerateInstanceExtensionProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_GLOBAL, @vkEnumerateInstanceExtensionProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkEnumerateDeviceExtensionProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumerateDeviceExtensionProperties, domain) : EndIf
+  If avkDispatchName(*pName, "vkEnumerateDeviceLayerProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumerateDeviceLayerProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkEnumeratePhysicalDevices") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumeratePhysicalDevices, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeCommandBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeMemory, domain) : EndIf
@@ -139,6 +140,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetPhysicalDeviceQueueFamilyProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceQueueFamilyProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkMapMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkMapMemory, domain) : EndIf
   If avkDispatchName(*pName, "vkQueueSubmit") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueSubmit, domain) : EndIf
+  If avkDispatchName(*pName, "vkQueueWaitIdle") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueWaitIdle, domain) : EndIf
   If avkDispatchName(*pName, "vkResetCommandBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetCommandBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkResetCommandPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetCommandPool, domain) : EndIf
   If avkDispatchName(*pName, "vkResetDescriptorPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetDescriptorPool, domain) : EndIf

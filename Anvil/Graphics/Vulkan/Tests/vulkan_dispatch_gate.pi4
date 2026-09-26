@@ -26,6 +26,7 @@ Procedure.i Main()
   Define instance.i
   Define physical.i
   Define device.i
+  Define queue.i
   Define count.l
   Define propertySentinel.l
 
@@ -34,6 +35,7 @@ Procedure.i Main()
   count = 1
   Vkd(AnvilVkPhysicalEnumerate(instance, @count, @physical) = #VK_SUCCESS)
   Vkd(AnvilVkDeviceCreate(physical, @device) = #VK_SUCCESS)
+  Vkd(AnvilVkDeviceQueue(device, @queue) = #VK_SUCCESS)
 
   ; Vulkan 1.0 null-instance lookup exposes the three audited global entries.
   Vkd(vkGetInstanceProcAddr(0, "vkCreateInstance") = @vkCreateInstance)
@@ -59,8 +61,10 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateDevice") = @vkCreateDevice)
   Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties") = @vkEnumerateDeviceExtensionProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkEnumerateDeviceLayerProperties") = @vkEnumerateDeviceLayerProperties)
   Vkd(vkGetDeviceProcAddr(device, "vkCreateDevice") = 0)
   Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceExtensionProperties") = 0)
+  Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceLayerProperties") = 0)
   Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
 
   ; Empty discovery is a real zero-count query, including supplied output
@@ -84,6 +88,11 @@ Procedure.i Main()
   Vkd(vkEnumerateDeviceExtensionProperties(physical, "missing", @count, @propertySentinel) = #VK_ERROR_LAYER_NOT_PRESENT)
   Vkd(count = 77 And propertySentinel = 99)
   Vkd(vkEnumerateDeviceExtensionProperties($12345678, 0, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(count = 77 And propertySentinel = 99)
+  Vkd(vkEnumerateDeviceLayerProperties(physical, @count, @propertySentinel) = #VK_SUCCESS)
+  Vkd(count = 0 And propertySentinel = 99)
+  count = 77
+  Vkd(vkEnumerateDeviceLayerProperties($12345678, @count, @propertySentinel) = #ANVIL_VK_ERR_HANDLE)
   Vkd(count = 77 And propertySentinel = 99)
 
   ; Representative device commands resolve identically through valid GIPA/GDPA.
@@ -111,6 +120,10 @@ Procedure.i Main()
   Vkd(vkGetDeviceProcAddr(device, "vkCmdSetViewport") = @vkCmdSetViewport)
   Vkd(vkGetInstanceProcAddr(instance, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
   Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = @vkDeviceWaitIdle)
+  Vkd(vkGetInstanceProcAddr(instance, "vkQueueWaitIdle") = @vkQueueWaitIdle)
+  Vkd(vkGetDeviceProcAddr(device, "vkQueueWaitIdle") = @vkQueueWaitIdle)
+  Vkd(vkQueueWaitIdle(queue) = #VK_SUCCESS)
+  Vkd(vkQueueWaitIdle($12345678) = #ANVIL_VK_ERR_HANDLE)
 
   ; Public binary semaphore entry points have exact device domains.
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateSemaphore") = @vkCreateSemaphore)
@@ -139,6 +152,7 @@ Procedure.i Main()
   Vkd(vkGetDeviceProcAddr($12345678, "vkDeviceWaitIdle") = 0)
   Vkd(AnvilVkDeviceDestroy(device) = #VK_SUCCESS)
   Vkd(vkGetDeviceProcAddr(device, "vkDeviceWaitIdle") = 0)
+  Vkd(vkQueueWaitIdle(queue) = #ANVIL_VK_ERR_HANDLE)
   Vkd(AnvilVkInstanceDestroy(instance) = #VK_SUCCESS)
   Vkd(vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices") = 0)
 
