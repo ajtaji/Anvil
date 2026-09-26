@@ -43,8 +43,14 @@ its 3,505 consecutive boxes to one ordered draw; the 19-assertion emitted
 gate proves that exact count, capacity refusal, and colour mismatch on the
 desk. The paired producer must use `NeonVkChromeCreateWithCapacities` to
 reserve at least 6,373 vertex quads as well as the separate draw budget.
-The batch and full paired oracle still need Pi 4 execution before pixel
-parity can be claimed.
+The box batch now also passes a real Pi 4 Vulkan frame: 3,505 boxes lower to
+one draw and 21,030 vertices, followed by the established widget frame with
+47 draws and 654 vertices. The final widget capture passed 212 independent
+report and rotated-pixel checks under a 15-second deadman; see
+`docs/evidence/vulkan-box-batch-20260926/`. The first larger-buffer attempt
+correctly refused allocation within the diagnostic's 8 MiB Vulkan window;
+the passing run used 12 MiB within its mapped RAM span. The full paired
+15-scene Vulkan producer and pixel comparison remain outstanding.
 
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
