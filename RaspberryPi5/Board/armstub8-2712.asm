@@ -131,6 +131,14 @@ secondary_spin:
   b    boot_kernel
 
 primary_cpu:
+  ; "Early GPU firmware revisions need a little break here" - the stock
+  ; stub's ldelay(100000) on the primary. rpi5_bl31_setup.c:128-129.
+  movz x0, #0x86A0
+  movk x0, #0x0001, lsl #16          ; 100000
+primary_delay:
+  sub  x0, x0, #1
+  cbnz x0, primary_delay
+
   ; The firmware clears the magic once it has written both words below.
   ; A non-zero magic means they were never written: say so, do not jump.
   adr  x4, stub_magic
