@@ -123,6 +123,28 @@ def strings(value: bytes) -> list[str]:
         raise DtbError("non-ASCII string-list value") from exc
 
 
+def early_uart(nodes: dict[str, dict[str, bytes]]) -> dict[str, object]:
+    """Resolve the source tree's selected early console, including aliases."""
+    chosen = nodes.get("/chosen", {})
+    aliases = nodes.get("/aliases", {})
+    stdout = strings(chosen.get("stdout-path", b""))[0]
+    target, separator, options = stdout.partition(":")
+    if not target or (separator and not options):
+        raise DtbError("chosen stdout-path is empty or has empty options")
+    if not target.startswith("/"):
+        target = strings(aliases.get(target, b""))[0]
+    if not target.startswith("/") or target not in nodes:
+        raise DtbError("chosen stdout-path does not resolve to a node")
+    uart = nodes[target]
+    if uart.get("status", b"okay\0") != b"okay\0":
+        raise DtbError("chosen early UART is not enabled")
+    compatible = strings(uart.get("compatible", b""))
+    if "arm,pl011" not in compatible or not uart.get("reg"):
+        raise DtbError("chosen early UART is not a mapped PL011")
+    return {"stdout_path": stdout, "early_uart": target,
+            "early_uart_compatible": compatible}
+
+
 def inspect(blob: bytes) -> dict[str, object]:
     nodes = parse(blob)
     root = nodes["/"]
@@ -159,6 +181,7 @@ def inspect(blob: bytes) -> dict[str, object]:
             "memory_nodes": memory, "rp1_bridge": rp1_path,
             "rp1_pcie_host": parent, "pcie_nodes": pcie,
             "node_count": len(nodes),
+            **early_uart(nodes),
             "warning": "Source DTB only; firmware may modify the live DTB."}
 
 

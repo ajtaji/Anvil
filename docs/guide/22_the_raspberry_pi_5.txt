@@ -26,8 +26,12 @@ py -3 -m unittest discover -s RaspberryPi5/Boot -p test_dtb_contract.py -v
 @ENDFRAG
 
 The recorded host run reported `Raspberry Pi 5` and `brcm,bcm2712` for all
-three variants, with an RP1 bridge at `/axi/pcie@1000120000/rp1`. The three
-tests passed; corrupt and wrong-board DTBs were refused. On another host,
+three variants, with an RP1 bridge at `/axi/pcie@1000120000/rp1`. It also
+resolved `chosen/stdout-path` (`serial10:115200n8`) to the enabled PL011 at
+`/soc@107c000000/serial@7d001000`. The source RP1 `serial0` and `serial1`
+nodes are disabled, so the first debug UART image must not assume either one.
+Four tests passed; corrupt and wrong-board DTBs and invalid early-UART paths
+were refused. On another host,
 set `PI5_DTB_DIR` to the explicit folder with those three named files before
 running the tests.
 
