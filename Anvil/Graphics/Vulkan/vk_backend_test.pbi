@@ -338,6 +338,17 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
+Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
+  Define i.i
+  If source = 0 Or destination = 0 Or bytes < 1 : ProcedureReturn -1 : EndIf
+  i = 0
+  While i < bytes
+    PokeA(destination + i, PeekA(source + i))
+    i = i + 1
+  Wend
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
 Procedure.i avkBackendPoll()
   avkTbPolls = avkTbPolls + 1
   avkTbTicks = avkTbTicks + 1

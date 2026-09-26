@@ -67,7 +67,8 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   ; Semantic allowlist approved 2026-09-13. vkFreeDescriptorSets is withheld:
   ; every pool refuses its enabling flag, so the declaration is not usable
   ; semantics. The bounded whole-image vkCmdCopyBufferToImage transaction is
-  ; exposed after its independent desk and Pi 4 silicon gates passed.
+  ; exposed after its independent desk and Pi 4 silicon gates passed. The
+  ; coherent-heap vkCmdCopyBuffer path has an emitted byte-exact desk gate.
   If avkDispatchName(*pName, "vkAllocateCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkAllocateCommandBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkAllocateDescriptorSets") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkAllocateDescriptorSets, domain) : EndIf
   If avkDispatchName(*pName, "vkAllocateMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkAllocateMemory, domain) : EndIf
@@ -80,6 +81,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCmdBindPipeline") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdBindPipeline, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdBindVertexBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdBindVertexBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdClearColorImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdClearColorImage, domain) : EndIf
+  If avkDispatchName(*pName, "vkCmdCopyBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdCopyBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdCopyBufferToImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdCopyBufferToImage, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdDraw") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdDraw, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdDrawIndexed") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdDrawIndexed, domain) : EndIf
