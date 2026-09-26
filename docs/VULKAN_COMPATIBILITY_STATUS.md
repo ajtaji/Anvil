@@ -97,6 +97,18 @@ need proof. The first alpha candidate was safely refused before entry because
 its linked address overlapped the monitor; the successful image was rebuilt
 for the board's `00600000` RAM window.
 
+Native oracle scenes 4 and 5 now also have exact Pi 4 Vulkan pixel pairs.
+The adapter centres its triangle-strip lowering on the integer line path;
+the earlier one-sided strip missed 53 fan-outline pixels. The corrected
+four-point fan outline with alpha fill matched all 16,384 native BGRA bytes
+in scene 4. A separate crossing-diagonal line list with a degenerate point
+matched all 16,384 bytes in scene 5. Both returning RAM payloads used a
+15-second deadman and produced fresh capture 16 from the final source. The board was
+released with the deadman off and all core leases zero. See
+`docs/evidence/vulkan-paired-lines-20260926/` for both reports, readbacks,
+captures, and SHA-256 manifests. Six native scenes are paired; the other
+nine and changing target extents remain to be tested.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
