@@ -24,6 +24,8 @@ The complete physical-device properties ABI is now present and checked, but
 `vkGetPhysicalDeviceProperties` is not exposed yet. In particular, the core
 `maxImageDimension1D` and `maxImageDimension3D` fields describe guaranteed
 image support, whereas the current image owner accepts only bounded 2D BGRA8.
+Core Vulkan's required limits include 4096 for 1D/2D and 256 for 3D;
+the current Pi 4 image bound is derived from the active Neon surface capacity.
 Publishing zeros or invented 1D/3D limits would mislead callers. The next
 properties step must first extend the image capability contract or establish a
 specification-valid way to report this incomplete device.

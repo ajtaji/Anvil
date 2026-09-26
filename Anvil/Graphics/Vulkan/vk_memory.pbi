@@ -477,7 +477,7 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
     ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
   EndIf
   If width < 1 Or height < 1 Or width > avkBackendMaxImageDimension2D() Or height > avkBackendMaxImageDimension2D()
-    avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an extent outside this device's limits (Anvil code -20001, invalid argument); width and height must be at least one and no more than maxImageDimension2D, which vkGetPhysicalDeviceProperties reports.")
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given an extent outside this backend's supported 2D range (Anvil code -20001, invalid argument); query the exact format, tiling, usage and flags with vkGetPhysicalDeviceImageFormatProperties before choosing width and height.")
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0
