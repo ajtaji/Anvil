@@ -52,6 +52,18 @@ correctly refused allocation within the diagnostic's 8 MiB Vulkan window;
 the passing run used 12 MiB within its mapped RAM span. The full paired
 15-scene Vulkan producer and pixel comparison remain outstanding.
 
+The next Pi 4 RAM diagnostic rendered native oracle scene 1 (three ordered
+boxes, including source-over alpha and a clipped negative-origin box) through
+the resident Vulkan adapter before the unchanged widget frame. A CRC-checked
+readback of the completed GPU attachment matched all 16,384 BGRA bytes of the
+saved native scene exactly. The returning build-210 run used a 15-second
+deadman, returned its expected report pointer, and produced fresh capture 8;
+the widget frame passed 133 report and rotated-pixel checks. Evidence is in
+`docs/evidence/vulkan-paired-boxes-20260926/`. This first pair uses the
+top-left 64x64 region of an 800x1280 attachment. It does not yet exercise
+Vulkan rebind, odd extents, rotated targets, glyph parity, or the remaining
+14 native scenes.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
