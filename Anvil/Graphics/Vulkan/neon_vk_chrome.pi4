@@ -384,7 +384,7 @@ Procedure.i nvcF32Pixel(bits.i, dimension.i)
   ProcedureReturn mantissa >> (0 - shift)
 EndProcedure
 
-Procedure.i nvcAtlasMapBitmapUV(*uv.NeonAtlasGlyphUV)
+Procedure.i nvcAtlasMapBitmapUV(*uv.NeonAtlasGlyphUV, bold.i)
   Define x0.i, x1.i, y0.i, y1.i
   If *uv = 0 Or nvcAtlasBaseW < 1 Or nvcAtlasBaseH < 1
     ProcedureReturn 0
@@ -396,6 +396,7 @@ Procedure.i nvcAtlasMapBitmapUV(*uv.NeonAtlasGlyphUV)
   If x0 < 0 Or x1 < x0 Or x1 > nvcAtlasBaseW Or y0 < 0 Or y1 < y0 Or y1 > nvcAtlasBaseH
     ProcedureReturn 0
   EndIf
+  If bold <> 0 : x0 = x0 + 16 : x1 = x1 + 16 : EndIf
   *uv\left = neon_F32Ratio(x0, nvcAtlasW)
   *uv\right = neon_F32Ratio(x1, nvcAtlasW)
   *uv\top = neon_F32Ratio(y0, nvcAtlasH)
@@ -466,17 +467,12 @@ Procedure.i nvcAtlasRefresh()
   EndIf
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   For y = 0 To nvcAtlasH - 1
-    For x = 0 To 63
+    For x = 0 To 127
       target = y * nvcAtlasW * 4 + x
       PokeA(nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + target, 0)
     Next
   Next
-  For y = 0 To height - 1
-    For x = 0 To width * 4 - 1
-      target = y * nvcAtlasW * 4 + x
-      PokeA(nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + target, PeekA(source + y * width * 4 + x))
-    Next
-  Next
+  If nvcBitmapStageCopy(source, width, height) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   rc = nvcAtlasUploadWarm()
   If rc <> #VK_SUCCESS
     nvcAtlasFaulted = 1
@@ -489,6 +485,32 @@ Procedure.i nvcAtlasRefresh()
   nvcWhiteV1 = neon_F32Ratio(nvcF32Pixel(white\bottom, height), nvcAtlasH)
   nvcAtlasGeneration = generation
   ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; The native bold bitmap ORs each row with a one-pixel right shift. Reserve
+; columns 16..31 for that mask, keeping glyph cells independent at their edge.
+Procedure.i nvcBitmapStageCopy(source.i, width.i, height.i)
+  Define uv.NeonAtlasGlyphUV
+  Define cellW.i, x.i, y.i, src.i, base.i, ink.i, boldInk.i
+  If source = 0 Or width < 1 Or width > 16 Or height < 1 Or nvcAtlasUploadMapped = 0
+    ProcedureReturn 0
+  EndIf
+  If Neon_AtlasRasterGlyphUV(Neon_AtlasRasterFirstGlyph(), @uv) = 0
+    ProcedureReturn 0
+  EndIf
+  cellW = nvcF32Pixel(uv\right, width) - nvcF32Pixel(uv\left, width)
+  If cellW < 1 Or cellW > 8 Or (width % cellW) <> 0 : ProcedureReturn 0 : EndIf
+  For y = 0 To height - 1
+    For x = 0 To width - 1
+      src = source + ((y * width + x) * 4)
+      base = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + ((y * nvcAtlasW + x) * 4)
+      ink = PeekL(src) : boldInk = ink
+      If boldInk = 0 And (x % cellW) <> 0 : boldInk = PeekL(src - 4) : EndIf
+      PokeL(base, ink)
+      PokeL(base + (16 * 4), boldInk)
+    Next
+  Next
+  ProcedureReturn 1
 EndProcedure
 
 ; Fragment shader:
@@ -638,13 +660,8 @@ Procedure.i nvcAtlasCreateAndUpload()
     PokeA(mapped + #NEON_VK_CHROME_ATLAS_PAD + i, 0)
     i + 1
   Wend
-  For y = 0 To nvcAtlasBaseH - 1
-    For x = 0 To nvcAtlasBaseW * 4 - 1
-      target = y * nvcAtlasW * 4 + x
-      PokeA(mapped + #NEON_VK_CHROME_ATLAS_PAD + target, PeekA(source + y * nvcAtlasBaseW * 4 + x))
-    Next
-  Next
   nvcAtlasUploadMapped = mapped
+  If nvcBitmapStageCopy(source, nvcAtlasBaseW, nvcAtlasBaseH) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
@@ -1642,7 +1659,7 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
       If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        If nvcAtlasMapBitmapUV(@uv, font = #NEON_FONT_BOLD) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
         nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
         nvcVertices = nvcVertices + 6 : count = count + 6
       EndIf
@@ -1725,7 +1742,7 @@ Procedure.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
         EndIf
       EndIf
       If visible <> 0 And Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        If nvcAtlasMapBitmapUV(@uv, 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
         nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
         nvcVertices = nvcVertices + 6 : count = count + 6
       EndIf

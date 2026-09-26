@@ -64,6 +64,20 @@ top-left 64x64 region of an 800x1280 attachment. It does not yet exercise
 Vulkan rebind, odd extents, rotated targets, glyph parity, or the remaining
 14 native scenes.
 
+Native oracle scene 2 now also has a Pi 4 Vulkan pixel pair. Its first run
+identified 100 missing ink pixels in the bold flat face: every missing pixel
+sat immediately right of existing ink. The adapter now stages Neon's
+one-pixel emboldened bitmap in reserved atlas columns 16..31 and selects it
+for the bold flat-text face. The final GPU readback matches all 16,384 bytes
+of the native 256x16 scene, which includes four flat-font calls and three
+textured-font calls covering printable ASCII. The same run returned cleanly
+under a 15-second deadman, produced fresh capture 10, and passed 133 widget
+report/pixel checks. See `docs/evidence/vulkan-paired-glyphs-20260926/`.
+The current selection follows the default bold face index; altered bold
+settings through `NeonFontSetup` still need a renderer-neutral state query.
+The paired text proof uses a 256x16 scissor on the existing 800x1280 target,
+so target rebind and the remaining 13 native scenes still need proof.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
