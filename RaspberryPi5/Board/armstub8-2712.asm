@@ -80,8 +80,8 @@ _start:
   ; --- the local timer: increment by 1, the crystal, divide-by-1 ------
   ; rpi5_bl31_setup.c:118-126. Global registers; every core writing the
   ; same values is harmless, as on Pi 4.
-  movz x0, #0x0028, lsl #16
-  movk x0, #0x107C, lsl #32          ; $107C280000
+  movz x0, #0x7C28, lsl #16
+  movk x0, #0x0010, lsl #32          ; $107C280000
   movz w1, #0
   str  w1, [x0]
   movz w1, #0x8000, lsl #16
