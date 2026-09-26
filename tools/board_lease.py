@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import re
 import sys
 from pathlib import Path
 
@@ -74,6 +75,18 @@ def callout(text: str) -> str:
     return text[i:j].rstrip()
 
 
+def live_state(text: str) -> str:
+    """Only the first callout status line grants a lease.
+
+    Historical 'Previously' text may contain FREE or an old lane name and
+    must never authorize a new board session.
+    """
+    lines = callout(text).splitlines()
+    if len(lines) < 2:
+        raise SystemExit("board_lease: live-holder status line is missing")
+    return lines[1].strip()
+
+
 def replace(text: str, body: str, nl: str) -> str:
     i, j = bounds(text)
     return text[:i] + body.replace("\n", nl) + nl + nl + text[j:]
@@ -90,6 +103,7 @@ def main() -> int:
     path = Path(args.share)
     text, nl = read(path)
     now = callout(text)
+    state = live_state(text)
 
     if args.action == "show":
         print(now)
@@ -103,7 +117,7 @@ def main() -> int:
         return 2
 
     if args.action == "require":
-        if lane not in now:
+        if not state.startswith(f"> **HELD - {lane}.**"):
             print(f"REFUSED: the board is not {lane}'s. The callout says:\n")
             print(now)
             return 2
@@ -114,7 +128,7 @@ def main() -> int:
         if not args.text:
             print("board_lease: take needs one line saying what will be sent.")
             return 2
-        if "**FREE**" not in now:
+        if not re.match(r"^> \*\*FREE(?:\*\*|[ -])", state):
             print("REFUSED: the board is not FREE, so nothing was changed and "
                   "nothing may be sent. The callout says:\n")
             print(now)
@@ -127,7 +141,7 @@ def main() -> int:
         return 0
 
     if args.action == "release":
-        if lane not in now:
+        if not state.startswith(f"> **HELD - {lane}.**"):
             print(f"REFUSED: {lane} does not hold the board, so it has nothing "
                   "to release. The callout says:\n")
             print(now)
