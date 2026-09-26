@@ -36,10 +36,15 @@ The native 15-scene oracle passed on Pi 4 build 210 with its full 245,760-byte
 capture saved in `docs/evidence/neon-texttex-20260926/`. A separate real Vulkan
 widget frame using `Neon_TextTex` passed 129 report and rotated-pixel checks.
 These are distinct proofs: the 15-scene Vulkan producer and native/Vulkan
-pixel comparison are still outstanding. Its capacity scene requests more than
-the current 4,096 recorded Vulkan draws in one frame, so the producer needs
-ordered batching or an equivalent bounded multi-submit design before parity
-can be claimed.
+pixel comparison are still outstanding. Its capacity scene would request
+4,687 Vulkan draws through one-call/one-draw lowering, above the shared
+4,096-record ceiling. An opt-in same-tint/same-scissor box batch now lowers
+its 3,505 consecutive boxes to one ordered draw; the 19-assertion emitted
+gate proves that exact count, capacity refusal, and colour mismatch on the
+desk. The paired producer must use `NeonVkChromeCreateWithCapacities` to
+reserve at least 6,373 vertex quads as well as the separate draw budget.
+The batch and full paired oracle still need Pi 4 execution before pixel
+parity can be claimed.
 
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real

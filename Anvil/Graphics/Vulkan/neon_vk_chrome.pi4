@@ -67,6 +67,14 @@ Global nvcGridBatchActive.i
 Global nvcGridBatchFirst.i
 Global nvcGridBatchSlot.i
 Global nvcGridBatchGeneration.i
+Global nvcBoxBatchActive.i
+Global nvcBoxBatchFirst.i
+Global nvcBoxBatchCount.i
+Global nvcBoxBatchColour.i
+Global nvcBoxBatchClipX.i
+Global nvcBoxBatchClipY.i
+Global nvcBoxBatchClipW.i
+Global nvcBoxBatchClipH.i
 Global nvcPathKind.i
 Global nvcPathCount.i
 Global nvcPathError.i
@@ -169,6 +177,8 @@ Declare NeonVkChromeDestroy()
 Declare.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
 Declare.i NeonVkChromeRebind(framebuffer.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, pitch.i, rotation.i)
 Declare.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
+Declare.i NeonVkChromeBoxBatchBegin()
+Declare.i NeonVkChromeBoxBatchEnd()
 Declare NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
 Declare NeonVkChromeScissorClear()
 Declare.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
@@ -879,6 +889,7 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   nvcWidth = width : nvcHeight = height
   nvcMaxQuads = maxDraws : nvcMaxVertexQuads = maxVertexQuads
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
+  nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
   nvcError = 0
   nvcCreateStage = 0 : nvcCreateFaultCode = 0 : nvcCreateFaultText = 0
   nvdPresentClear()
@@ -1076,6 +1087,7 @@ EndProcedure
 Procedure.i nvcDraw(first.i, count.i, colour.i)
   Define sc.VkRect2D
   Define Dim push.l[4]
+  If nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
@@ -1093,9 +1105,21 @@ Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
   Define first.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If w <= 0 Or h <= 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  ; Capacity is preflighted before any vertex write or ordered cursor change.
+  ; Reserve one draw for either this box or the complete active box span.
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  If nvcBoxBatchActive <> 0
+    If nvcBoxBatchCount = 0
+      nvcBoxBatchFirst = nvcVertices : nvcBoxBatchColour = colour
+      nvcBoxBatchClipX = nvcClipX : nvcBoxBatchClipY = nvcClipY
+      nvcBoxBatchClipW = nvcClipW : nvcBoxBatchClipH = nvcClipH
+    ElseIf colour <> nvcBoxBatchColour Or nvcClipX <> nvcBoxBatchClipX Or nvcClipY <> nvcBoxBatchClipY Or nvcClipW <> nvcBoxBatchClipW Or nvcClipH <> nvcBoxBatchClipH
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    EndIf
+    nvcQuad(nvcVertices, x, y, x + w, y + h, nvcWhiteU0, nvcWhiteV0, nvcWhiteU1, nvcWhiteV1)
+    nvcVertices = nvcVertices + 6 : nvcBoxBatchCount = nvcBoxBatchCount + 6
+    ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
   first = nvcVertices
   ; Boxes sample only Neon's dedicated opaque-white atlas texel.
@@ -1260,7 +1284,7 @@ EndProcedure
 ; and keep each color in one contiguous vertex range / Vulkan draw.
 Procedure.i NeonVkChromeGridBatchBegin()
   Define slot.i
-  If nvcReady = 0 Or nvcInFrame = 0 Or nvcMapped = 0 Or nvcGridBatchActive <> 0 Or nvcTTDirty <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcMapped = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcTTDirty <> 0 Or nvcPathKind <> #NVC_PATH_NONE
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   slot = AnvilTrueTypeSlotSelected()
@@ -1512,7 +1536,7 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
   Define count.i, lines.i, measured.i, visible.i, maxWidth.i, originX.i, baseline.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
   nvcTTErrorStage = 0 : nvcTTUnitsProbe = 0 : nvcTTCountProbe = 0
   nvcTTLinesProbe = 0 : nvcTTMeasuredProbe = 0 : nvcTTMetricsStateProbe = 0
-  If nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If nvcTTDirty <> 0 : nvcTTErrorStage = 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   slot = AnvilTrueTypeSlotSelected()
@@ -1563,7 +1587,7 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
 EndProcedure
 
 Procedure.i NeonVkChromeTrueTypeText(pixelHeight.i, x.i, y.i, *s, colour.i)
-  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or pixelHeight < 1 Or pixelHeight > 512
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or pixelHeight < 1 Or pixelHeight > 512
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcTTFontPixels = pixelHeight
@@ -1582,7 +1606,7 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
   Define glyphCount.i
   Define adv.i
   Define cellH.i
-  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If AnvilTrueTypeSlotSelected() < 0 And Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
@@ -1630,13 +1654,33 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
   ProcedureReturn nvcDraw(first, count, colour)
 EndProcedure
 
+; Consecutive boxes with one tint and scissor are one ordered triangle-list
+; draw. This is opt-in so ordinary chrome draw counts remain unchanged.
+Procedure.i NeonVkChromeBoxBatchBegin()
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcDrawCount >= nvcMaxQuads : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBoxBatchActive = 1 : nvcBoxBatchFirst = nvcVertices : nvcBoxBatchCount = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeBoxBatchEnd()
+  Define count.i, first.i, colour.i
+  If nvcInFrame = 0 Or nvcBoxBatchActive = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  count = nvcBoxBatchCount : first = nvcBoxBatchFirst : colour = nvcBoxBatchColour
+  nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
+  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ProcedureReturn nvcDraw(first, count, colour)
+EndProcedure
+
 ; The public textured-text primitive has native bitmap metrics and rejection
 ; rules. Preflight the visible run before touching the ordered vertex cursor.
 Procedure.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
   Define uv.NeonAtlasGlyphUV
   Define i.i, ch.i, cx.i, adv.i, cellH.i
   Define glyphCount.i, first.i, count.i, visible.i
-  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If *s = 0 Or Neon_A(colour) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If Neon_AtlasRasterReady() = 0 Or Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
@@ -1698,7 +1742,7 @@ EndProcedure
 ; ordered Vulkan draw. FanOutline deliberately keeps the fan cursor alive so
 ; the existing outline-then-fill call order reuses the same logical points.
 Procedure.i NeonVkChromeFanBegin()
-  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcPathKind = #NVC_PATH_FAN : nvcPathCount = 0 : nvcPathError = 0
@@ -1769,7 +1813,7 @@ Procedure.i NeonVkChromeFanEnd(colour.i)
 EndProcedure
 
 Procedure.i NeonVkChromeLinesBegin()
-  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcPathKind = #NVC_PATH_LINES : nvcPathCount = 0 : nvcPathError = 0
@@ -1824,6 +1868,10 @@ EndProcedure
 ; overflow; an empty intersection becomes the Vulkan zero-size collapse.
 Procedure NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
   Define x0.q : Define y0.q : Define spanX.q : Define spanY.q
+  If nvcBoxBatchActive <> 0
+    nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    ProcedureReturn
+  EndIf
   x0 = x : y0 = y : spanX = w : spanY = h
   If w <= 0 Or h <= 0
     nvcClipX = 0 : nvcClipY = 0 : nvcClipW = 0 : nvcClipH = 0
@@ -1860,12 +1908,16 @@ Procedure NeonVkChromeScissorSet(x.i, y.i, w.i, h.i)
 EndProcedure
 
 Procedure NeonVkChromeScissorClear()
+  If nvcBoxBatchActive <> 0
+    nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    ProcedureReturn
+  EndIf
   nvcClipX = 0 : nvcClipY = 0 : nvcClipW = nvcPhysicalW : nvcClipH = nvcPhysicalH
 EndProcedure
 
 Procedure.i NeonVkChromeEnd()
   Define rc.i
-  If nvcReady = 0 Or nvcInFrame = 0 Or nvcGridBatchActive <> 0
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   ; The current backend requires at least one draw in a render pass. An empty
@@ -1900,6 +1952,7 @@ Procedure NeonVkChromeDestroy()
   Define cmd.i
   nvdWsiRollback()
   nvdPresentClear()
+  nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
   If nvcHooksInstalled <> 0
     NeonDrawBackendClear()
     nvcHooksInstalled = 0
