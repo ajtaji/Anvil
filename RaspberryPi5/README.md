@@ -9,8 +9,10 @@ Pi 5 DTB variants and overlays, but no `ANVIL5.IMG`. Do not put the Pi 4
 the FDT envelope, node structure, Pi 5/BCM2712 identity, memory node, enabled
 BCM2712 PCIe host, RP1 bridge, and address-translation properties. It reports
 the paths a first board image must discover from the *bootloader-provided*
-DTB. It does not prove the firmware-selected DTB, RAM extent, PCIe windows,
-EL3 handoff, or a single peripheral at runtime.
+DTB. It also resolves the source tree's `chosen/stdout-path` through aliases
+and refuses a missing, disabled or non-PL011 early UART. It does not prove the
+firmware-selected DTB, RAM extent, PCIe windows, EL3 handoff, or a single
+peripheral at runtime.
 
 Run it against the three explicit pinned files in the vault:
 
@@ -20,9 +22,12 @@ py -3 RaspberryPi5/Boot/dtb_contract.py "$env:PI5_DTB_DIR\bcm2712-rpi-5-b.dtb" "
 py -3 -m unittest discover -s RaspberryPi5/Boot -p test_dtb_contract.py -v
 ```
 
-The preflight reports `Raspberry Pi 5`, `brcm,bcm2712`, a memory node, and
-`/axi/pcie@1000120000/rp1` for each pinned variant. Three tests pass,
-including malformed-tree and wrong-board refusals. Set `PI5_DTB_DIR` to
+The preflight reports `Raspberry Pi 5`, `brcm,bcm2712`, a memory node,
+`/axi/pcie@1000120000/rp1`, and the enabled PL011 early UART at
+`/soc@107c000000/serial@7d001000` for each pinned variant. Four tests pass,
+including malformed-tree, wrong-board and broken-UART refusals. The source
+trees select `serial10:115200n8`; their RP1 `serial0` and `serial1` nodes are
+disabled. Set `PI5_DTB_DIR` to
 the explicit directory containing the three named DTBs on another host.
 
 Next source milestones, in dependency order:

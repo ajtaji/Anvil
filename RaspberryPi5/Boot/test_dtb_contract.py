@@ -5,7 +5,7 @@ import unittest
 import os
 from pathlib import Path
 
-from dtb_contract import DtbError, inspect, parse
+from dtb_contract import DtbError, early_uart, inspect, parse
 
 
 VAULT_DTB = Path(os.environ["PI5_DTB_DIR"]) if "PI5_DTB_DIR" in os.environ else None
@@ -26,6 +26,32 @@ class DtbContractTests(unittest.TestCase):
                 self.assertEqual(result["model"], "Raspberry Pi 5")
                 self.assertIn("brcm,bcm2712", result["compatible"])
                 self.assertTrue(result["rp1_bridge"].endswith("/rp1"))
+                self.assertEqual(result["stdout_path"], "serial10:115200n8")
+                self.assertEqual(result["early_uart"],
+                                 "/soc@107c000000/serial@7d001000")
+                self.assertIn("arm,pl011", result["early_uart_compatible"])
+
+    def test_early_uart_refuses_missing_and_disabled_targets(self):
+        good = parse((VAULT_DTB / VARIANTS[0]).read_bytes())
+        uart_path = good["/aliases"]["serial10"].rstrip(b"\0").decode()
+        bad = {path: props.copy() for path, props in good.items()}
+        bad["/aliases"]["serial10"] = b"/missing\0"
+        with self.assertRaisesRegex(DtbError, "does not resolve"):
+            early_uart(bad)
+        bad["/aliases"]["serial10"] = good["/aliases"]["serial10"]
+        bad[uart_path]["status"] = b"disabled\0"
+        with self.assertRaisesRegex(DtbError, "not enabled"):
+            early_uart(bad)
+        bad[uart_path]["status"] = good[uart_path]["status"]
+        bad[uart_path]["compatible"] = b"vendor,not-pl011\0"
+        with self.assertRaisesRegex(DtbError, "not a mapped PL011"):
+            early_uart(bad)
+        bad[uart_path]["compatible"] = good[uart_path]["compatible"]
+        bad["/chosen"]["stdout-path"] = (uart_path + ":115200n8\0").encode()
+        self.assertEqual(early_uart(bad)["early_uart"], uart_path)
+        bad["/chosen"]["stdout-path"] = b"serial10:\0"
+        with self.assertRaisesRegex(DtbError, "empty options"):
+            early_uart(bad)
 
     def test_rejects_truncated_and_corrupt_blobs(self):
         good = (VAULT_DTB / VARIANTS[0]).read_bytes()
