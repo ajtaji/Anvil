@@ -332,18 +332,94 @@ primary_delay:
   movz w1, #0x0301
   str  w1, [x9, #0x30]               ; UARTCR: RXE | TXE | UARTEN
 
+  ; Say it on the debug connector BEFORE touching RP1: if an RP1 access
+  ; ever faults, that line is already out.
+  adr  x10, stub_text
+  bl   uart_puts_both_early
+  bl   rp1_uart0_init
+  movz x14, #1
   adr  x10, stub_text
   bl   uart_puts
   mov  x30, x15
   ret
 
+uart_puts_both_early:
+  movz x14, #0
+  b    uart_puts
+
 ; ----------------------------------------------------------------------
-;  uart_puts - x10 = NUL-terminated string. Uses x9..x13.
+;  rp1_uart0_init - the 40-pin header UART (GPIO14 TX pin 8, GPIO15 RX
+;  pin 10), the one every board on this bench is wired to. On the Pi 5
+;  it is RP1's UART0, reached over PCIe; the firmware leaves the RP1 link
+;  up. Addresses from the pinned sources, translated through the pinned
+;  DTB ranges (RP1 c0_40xxxxxx -> PCIe 0_00xxxxxx -> CPU 1F_00xxxxxx):
+;    clock  RP1 clocks $1F00018000 (rp1.dtsi:27). CLK_UART_CTRL +$54,
+;           DIV_INT +$58 (clk-rp1.c:60-63); AUXSRC bits 9:5, ENABLE bit 11
+;           (clk-rp1.c:261-262). Aux index 2 = XOSC, 50 MHz
+;           (clk-rp1.c:1636-1640, rp1.dtsi): no PLL needed.
+;    pins   IO_BANK0 $1F000D0000, GPIOn CTRL = base + n*8 + 4
+;           (pinctrl-rp1.c:1647); FUNCSEL 4 = uart0 on GPIO14/15.
+;           PADS_BANK0 $1F000F0000, pad n = base + 4 + n*4
+;           (pinctrl-rp1.c:1652); set IE bit 6, clear OD bit 7.
+;    uart   $1F00030000 (rp1.dtsi:64). 50 MHz*4/115200 = 1736: IBRD 27,
+;           FBRD 8; LCR_H $70; CR $301.
+; ----------------------------------------------------------------------
+rp1_uart0_init:
+  movz x9, #0x8000
+  movk x9, #0x0001, lsl #16
+  movk x9, #0x001F, lsl #32          ; RP1 clocks $1F00018000
+  movz w1, #0x0040
+  str  w1, [x9, #0x54]               ; CLK_UART_CTRL: AUXSRC = XOSC, off
+  movz w1, #1
+  str  w1, [x9, #0x58]               ; CLK_UART_DIV_INT = 1
+  movz w1, #0x0840
+  str  w1, [x9, #0x54]               ; CLK_UART_CTRL: AUXSRC = XOSC, ENABLE
+
+  movz x9, #0x000D, lsl #16
+  movk x9, #0x001F, lsl #32          ; IO_BANK0 $1F000D0000
+  movz w1, #4                        ; FUNCSEL uart0
+  str  w1, [x9, #0x74]               ; GPIO14_CTRL
+  str  w1, [x9, #0x7C]               ; GPIO15_CTRL
+
+  movz x9, #0x000F, lsl #16
+  movk x9, #0x001F, lsl #32          ; PADS_BANK0 $1F000F0000
+  movz w2, #0x40                     ; IE
+  movz w3, #0x80                     ; OD
+  ldr  w0, [x9, #0x3C]               ; pad GPIO14
+  orr  w0, w0, w2
+  bic  w0, w0, w3
+  str  w0, [x9, #0x3C]
+  ldr  w0, [x9, #0x40]               ; pad GPIO15
+  orr  w0, w0, w2
+  bic  w0, w0, w3
+  str  w0, [x9, #0x40]
+
+  movz x9, #0x0003, lsl #16
+  movk x9, #0x001F, lsl #32          ; RP1 UART0 $1F00030000
+  str  wzr, [x9, #0x30]              ; UARTCR off
+  movz w1, #27
+  str  w1, [x9, #0x24]               ; UARTIBRD
+  movz w1, #8
+  str  w1, [x9, #0x28]               ; UARTFBRD
+  movz w1, #0x70
+  str  w1, [x9, #0x2C]               ; UARTLCR_H: FEN | WLEN_8
+  str  wzr, [x9, #0x04]              ; UARTECR
+  movz w1, #0x0301
+  str  w1, [x9, #0x30]               ; UARTCR: RXE | TXE | UARTEN
+  ret
+
+; ----------------------------------------------------------------------
+;  uart_puts - x10 = NUL-terminated string; x14 = 0 for the debug
+;  connector (UART10 $107D001000), 1 for the header (RP1 UART0
+;  $1F00030000). Uses x9..x13.
 ; ----------------------------------------------------------------------
 uart_puts:
   movz x9, #0x1000
   movk x9, #0x7D00, lsl #16
-  movk x9, #0x0010, lsl #32          ; PL011 DR $107D001000
+  movk x9, #0x0010, lsl #32          ; UART10 $107D001000
+  cbz  x14, puts_next
+  movz x9, #0x0003, lsl #16
+  movk x9, #0x001F, lsl #32          ; RP1 UART0 $1F00030000
 puts_next:
   ldrb w11, [x10]
   cbz  w11, puts_done
@@ -364,6 +440,10 @@ puts_done:
 ;  not a branch to address zero.
 ; ----------------------------------------------------------------------
 magic_not_cleared:
+  movz x14, #0
+  adr  x10, magic_text
+  bl   uart_puts
+  movz x14, #1
   adr  x10, magic_text
   bl   uart_puts
 magic_park:
