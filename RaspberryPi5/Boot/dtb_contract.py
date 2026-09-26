@@ -123,6 +123,56 @@ def strings(value: bytes) -> list[str]:
         raise DtbError("non-ASCII string-list value") from exc
 
 
+def _number(cells: bytes) -> int:
+    if not cells or len(cells) % 4:
+        raise DtbError("malformed device-tree cell value")
+    return int.from_bytes(cells, "big")
+
+
+def mapped_reg(nodes: dict[str, dict[str, bytes]], path: str) -> int:
+    """Translate the first reg address through ancestor ranges to CPU space."""
+    if path not in nodes or path == "/":
+        raise DtbError("mapped node is missing")
+    parent = path.rsplit("/", 1)[0] or "/"
+    props = nodes[parent]
+    address_cells = _number(props.get("#address-cells", b""))
+    size_cells = _number(props.get("#size-cells", b""))
+    if not 1 <= address_cells <= 2 or not 1 <= size_cells <= 2:
+        raise DtbError("unsupported reg cell layout")
+    reg = nodes[path].get("reg", b"")
+    width = 4 * (address_cells + size_cells)
+    if len(reg) < width or len(reg) % width:
+        raise DtbError("missing or malformed reg")
+    address = _number(reg[:address_cells * 4])
+    span = _number(reg[address_cells * 4:width])
+    if span == 0:
+        raise DtbError("zero-length reg")
+    while parent != "/":
+        grandparent = parent.rsplit("/", 1)[0] or "/"
+        bus = nodes[parent]
+        child_cells = _number(bus.get("#address-cells", b""))
+        cpu_cells = _number(nodes[grandparent].get("#address-cells", b""))
+        size_cells = _number(bus.get("#size-cells", b""))
+        if not 1 <= child_cells <= 2 or not 1 <= cpu_cells <= 2 or not 1 <= size_cells <= 2:
+            raise DtbError("unsupported ranges cell layout")
+        ranges = bus.get("ranges")
+        entry_size = 4 * (child_cells + cpu_cells + size_cells)
+        if ranges is None or not ranges or len(ranges) % entry_size:
+            raise DtbError("missing or malformed bus ranges")
+        for offset in range(0, len(ranges), entry_size):
+            entry = ranges[offset:offset + entry_size]
+            child = _number(entry[:4 * child_cells])
+            cpu = _number(entry[4 * child_cells:4 * (child_cells + cpu_cells)])
+            length = _number(entry[4 * (child_cells + cpu_cells):])
+            if address >= child and span <= length and address - child <= length - span:
+                address = cpu + address - child
+                break
+        else:
+            raise DtbError(f"reg is not covered by {parent} ranges")
+        parent = grandparent
+    return address
+
+
 def early_uart(nodes: dict[str, dict[str, bytes]]) -> dict[str, object]:
     """Resolve the source tree's selected early console, including aliases."""
     chosen = nodes.get("/chosen", {})
@@ -142,7 +192,29 @@ def early_uart(nodes: dict[str, dict[str, bytes]]) -> dict[str, object]:
     if "arm,pl011" not in compatible or not uart.get("reg"):
         raise DtbError("chosen early UART is not a mapped PL011")
     return {"stdout_path": stdout, "early_uart": target,
+            "early_uart_physical": mapped_reg(nodes, target),
             "early_uart_compatible": compatible}
+
+
+def wlan_sdio(nodes: dict[str, dict[str, bytes]]) -> dict[str, object]:
+    radios = [path for path, props in nodes.items()
+              if "compatible" in props
+              if "brcm,bcm4329-fmac" in strings(props["compatible"])]
+    if len(radios) != 1:
+        raise DtbError("expected one Pi 5 WLAN SDIO function")
+    radio = radios[0]
+    host = radio.rsplit("/", 1)[0]
+    props = nodes[host]
+    if "brcm,bcm2712-sdhci" not in strings(props.get("compatible", b"")):
+        raise DtbError("WLAN parent is not the BCM2712 SDHCI host")
+    if props.get("status") != b"okay\0" or props.get("bus-width") != b"\0\0\0\4":
+        raise DtbError("WLAN SDIO host is disabled or not 4-bit")
+    if "non-removable" not in props or "vmmc-supply" not in props or "pinctrl-0" not in props:
+        raise DtbError("WLAN SDIO power or pin contract is absent")
+    if nodes[radio].get("reg") != b"\0\0\0\1":
+        raise DtbError("WLAN function number is not one")
+    return {"wifi_function": radio, "wifi_sdio_host": host,
+            "wifi_sdio_physical": mapped_reg(nodes, host)}
 
 
 def inspect(blob: bytes) -> dict[str, object]:
@@ -182,6 +254,7 @@ def inspect(blob: bytes) -> dict[str, object]:
             "rp1_pcie_host": parent, "pcie_nodes": pcie,
             "node_count": len(nodes),
             **early_uart(nodes),
+            **wlan_sdio(nodes),
             "warning": "Source DTB only; firmware may modify the live DTB."}
 
 
