@@ -887,6 +887,18 @@ Procedure vkCmdFillBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, size.i, dat
   AnvilVkCmdFillBuffer(commandBuffer, dstBuffer, dstOffset, size, data)
 EndProcedure
 
+; Exact core-1.0 signature; the private command slot captures pData now,
+; so the application may change or release its source after this call.
+Procedure vkCmdUpdateBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, dataSize.i, *pData)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdUpdateBuffer was given a stale VkCommandBuffer (Anvil code -20002, invalid handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdUpdateBuffer(commandBuffer, dstBuffer, dstOffset, dataSize, *pData)
+EndProcedure
+
 Procedure vkDestroyEvent(device.i, event.i, *pAllocator)
   Define rc.i
   If avkNoAllocator(*pAllocator, 14) <> #VK_SUCCESS

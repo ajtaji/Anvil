@@ -53,7 +53,7 @@ vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceQueueFamilyProperties
 vkGetPhysicalDeviceSparseImageFormatProperties
 vkMapMemory vkQueueSubmit vkQueueWaitIdle vkResetCommandBuffer vkResetCommandPool
 vkResetDescriptorPool vkResetFences vkResetEvent vkSetEvent vkUnmapMemory vkUpdateDescriptorSets
-vkWaitForFences""".split())
+vkWaitForFences vkCmdUpdateBuffer""".split())
 RESOLVERS = frozenset(("vkGetInstanceProcAddr", "vkGetDeviceProcAddr"))
 DOMAIN_TOKEN = {"global": "#AVK_DISPATCH_GLOBAL", "instance": "#AVK_DISPATCH_INSTANCE",
                 "device": "#AVK_DISPATCH_DEVICE", "gipa": "#AVK_DISPATCH_INSTANCE",

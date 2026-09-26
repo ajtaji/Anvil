@@ -91,6 +91,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCmdPushConstants") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdPushConstants, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdSetScissor") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdSetScissor, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdSetViewport") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdSetViewport, domain) : EndIf
+  If avkDispatchName(*pName, "vkCmdUpdateBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdUpdateBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateCommandPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateCommandPool, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateDescriptorPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateDescriptorPool, domain) : EndIf
