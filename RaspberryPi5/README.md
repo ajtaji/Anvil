@@ -22,6 +22,14 @@ checks, not Pi 5 firmware measurements. The image writes `ANVIL PI5` and
 115200 baud on the dedicated 3.3 V Pi 5 debug UART. It then stays in a loop.
 It cannot read the card, display a prompt, or join Wi-Fi.
 
+`PeekL` is signed, so the magic word must be masked to 32 bits before it is
+compared with `$EDFE0DD0`. The first card image compared the sign-extended
+value against a zero-extended constant and would have printed `FDT 2` for every
+valid tree (disassembly audit, 2026-09-26). The corrected image is 1,108 bytes,
+SHA-256 `1D5EA770653E7A26F3C6A72B12307A9A9CB967389DA52AF7BDBCC909172FB01D`.
+The card's `config.txt` adds `os_check=0` (not a Linux kernel) and
+`uart_2ndstage=1` (bootloader progress on the debug UART).
+
 The source DTB's UART10 child address `$7D001000` translates through `/soc`
 `ranges` to CPU physical `$107D001000`. The WLAN is a function on BCM2712
 SDIO2 at physical `$1001100000`, 4-bit, non-removable, with a WL_ON regulator.
