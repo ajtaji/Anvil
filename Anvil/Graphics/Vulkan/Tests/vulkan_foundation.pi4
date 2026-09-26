@@ -45,6 +45,9 @@ Procedure.i Main()
   Define features.VkPhysicalDeviceFeatures
   Define formatProps.VkFormatProperties
   Define imageProps.VkImageFormatProperties
+  Define eventInfo.VkEventCreateInfo
+  Define event.i
+  Define retiredEvent.i
   Define featureFailures.i
   Define i.i
 
@@ -164,6 +167,8 @@ Procedure.i Main()
   Vkt(OffsetOf(VkBufferImageCopy\imageOffset) = 32)
   Vkt(OffsetOf(VkBufferImageCopy\imageExtent) = 44)
   Vkt(SizeOf(VkFenceCreateInfo) = 24)
+  Vkt(SizeOf(VkEventCreateInfo) = 24)
+  Vkt(OffsetOf(VkEventCreateInfo\flags) = 16)
   Vkt(OffsetOf(VkFenceCreateInfo\flags) = 16)
   Vkt(SizeOf(VkSamplerCreateInfo) = 80)
   Vkt(OffsetOf(VkSamplerCreateInfo\magFilter) = 20)
@@ -385,6 +390,27 @@ Procedure.i Main()
   vkGetDeviceQueue(dev, 0, 0, @queue)
   Vkt(queue <> #VK_NULL_HANDLE)
 
+  eventInfo\sType = #VK_STRUCTURE_TYPE_EVENT_CREATE_INFO
+  event = 123
+  eventInfo\flags = 1
+  Vkt(vkCreateEvent(dev, @eventInfo, 0, @event) = #ANVIL_VK_ERR_UNSUPPORTED)
+  eventInfo\flags = 0
+  Vkt(vkCreateEvent(dev, @eventInfo, 0, @event) = #VK_SUCCESS)
+  Vkt(avkTokenKind(event) = #ANVIL_VK_TYPE_EVENT)
+  Vkt(vkGetEventStatus(dev, event) = #VK_EVENT_RESET)
+  Vkt(vkSetEvent(dev, event) = #VK_SUCCESS)
+  Vkt(vkSetEvent(dev, event) = #VK_SUCCESS)
+  Vkt(vkGetEventStatus(dev, event) = #VK_EVENT_SET)
+  Vkt(vkResetEvent(dev, event) = #VK_SUCCESS)
+  Vkt(vkGetEventStatus(dev, event) = #VK_EVENT_RESET)
+  Vkt(vkSetEvent($12345678, event) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(vkGetEventStatus(dev, event) = #VK_EVENT_RESET)
+  retiredEvent = event
+  vkDestroyEvent(dev, event, 0)
+  Vkt(vkGetEventStatus(dev, retiredEvent) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(vkCreateEvent(dev, @eventInfo, 0, @event) = #VK_SUCCESS)
+  Vkt(event <> retiredEvent)
+
   pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
   pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
   pci\queueFamilyIndex = 7
@@ -418,6 +444,7 @@ Procedure.i Main()
   Vkt(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
   Vkt(AnvilVkInstanceDestroy(inst) = #VK_SUCCESS)
+  Vkt(vkGetEventStatus(dev, event) = #ANVIL_VK_ERR_HANDLE)
   Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_ERR_HANDLE)
   Vkt(AnvilVkDeviceQueue(dev, @queue) = #ANVIL_VK_ERR_HANDLE)
   formatProps\linearTilingFeatures = 123

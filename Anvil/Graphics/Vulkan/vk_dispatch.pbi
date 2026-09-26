@@ -93,6 +93,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCreateDescriptorPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateDescriptorPool, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateDescriptorSetLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateDescriptorSetLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateDevice") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkCreateDevice, domain) : EndIf
+  If avkDispatchName(*pName, "vkCreateEvent") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateEvent, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateFence") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateFence, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateFramebuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateFramebuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateGraphicsPipelines") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateGraphicsPipelines, domain) : EndIf
@@ -109,6 +110,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkDestroyDescriptorPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyDescriptorPool, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyDescriptorSetLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyDescriptorSetLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyDevice") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyDevice, domain) : EndIf
+  If avkDispatchName(*pName, "vkDestroyEvent") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyEvent, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyFence") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyFence, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyFramebuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyFramebuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyImage, domain) : EndIf
@@ -133,6 +135,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetBufferMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetBufferMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetDeviceQueue") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetDeviceQueue, domain) : EndIf
   If avkDispatchName(*pName, "vkGetFenceStatus") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetFenceStatus, domain) : EndIf
+  If avkDispatchName(*pName, "vkGetEventStatus") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetEventStatus, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageSparseMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageSparseMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageSubresourceLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageSubresourceLayout, domain) : EndIf
@@ -150,6 +153,8 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkResetCommandPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetCommandPool, domain) : EndIf
   If avkDispatchName(*pName, "vkResetDescriptorPool") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetDescriptorPool, domain) : EndIf
   If avkDispatchName(*pName, "vkResetFences") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetFences, domain) : EndIf
+  If avkDispatchName(*pName, "vkResetEvent") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetEvent, domain) : EndIf
+  If avkDispatchName(*pName, "vkSetEvent") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkSetEvent, domain) : EndIf
   If avkDispatchName(*pName, "vkUnmapMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkUnmapMemory, domain) : EndIf
   If avkDispatchName(*pName, "vkUpdateDescriptorSets") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkUpdateDescriptorSets, domain) : EndIf
   If avkDispatchName(*pName, "vkWaitForFences") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkWaitForFences, domain) : EndIf

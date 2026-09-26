@@ -72,6 +72,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_DESCRIPTOR_POOL = 18
 #ANVIL_VK_TYPE_DESCRIPTOR_SET = 19
 #ANVIL_VK_TYPE_SAMPLER = 20
+#ANVIL_VK_TYPE_EVENT = 21
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -85,6 +86,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_QUEUES = 4
 #ANVIL_VK_MAX_COMMAND_POOLS = 16
 #ANVIL_VK_MAX_COMMAND_BUFFERS = 32
+#ANVIL_VK_MAX_EVENTS = 16
 
 ; HOW MANY VERTEX INPUT BINDINGS one pipeline may describe, and therefore
 ; how many vertex buffers one draw may read. It lives here rather than in
@@ -386,6 +388,10 @@ Global Dim avkCmdLevel.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCmdState.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCmdBeginFlags.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCmdOps.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkEventLive.a[#ANVIL_VK_MAX_EVENTS + 1]
+Global Dim avkEventGen.i[#ANVIL_VK_MAX_EVENTS + 1]
+Global Dim avkEventDev.i[#ANVIL_VK_MAX_EVENTS + 1]
+Global Dim avkEventSet.a[#ANVIL_VK_MAX_EVENTS + 1]
 
 ; ----------------------------------------------------------------------
 ;  THE VALIDATION FAULT RECORD.
@@ -686,6 +692,62 @@ Procedure.i AnvilVkDeviceQueue(device.i, *out)
     q = q + 1
   Wend
   ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+EndProcedure
+
+; Host event state. GPU event commands are withheld until a submission path
+; can honor their stage masks and memory dependencies.
+Procedure.i avkEventSlot(event.i)
+  Define s.i
+  s = avkTokenShape(event, #ANVIL_VK_TYPE_EVENT, #ANVIL_VK_MAX_EVENTS)
+  If s = 0 Or avkEventLive[s] = 0 Or avkEventGen[s] <> avkTokenGen(event) : ProcedureReturn 0 : EndIf
+  ProcedureReturn s
+EndProcedure
+
+Procedure.i AnvilVkEventCreate(device.i, *out)
+  Define d.i
+  Define s.i
+  If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out, #VK_NULL_HANDLE)
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_DRAW) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateEvent needs a graphics-capable queue family (Anvil code -20005, transfer-only backend); no event was created.")
+  EndIf
+  s = 1
+  While s <= #ANVIL_VK_MAX_EVENTS And avkEventLive[s] <> 0 : s = s + 1 : Wend
+  If s > #ANVIL_VK_MAX_EVENTS : ProcedureReturn #VK_ERROR_OUT_OF_HOST_MEMORY : EndIf
+  avkEventGen[s] = avkNextGen(avkEventGen[s])
+  avkEventDev[s] = d
+  avkEventSet[s] = 0
+  avkEventLive[s] = 1
+  PokeI(*out, avkToken(#ANVIL_VK_TYPE_EVENT, s, avkEventGen[s]))
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkEventDestroy(device.i, event.i)
+  Define d.i
+  Define s.i
+  If event = #VK_NULL_HANDLE : ProcedureReturn #VK_SUCCESS : EndIf
+  d = avkDevSlot(device)
+  s = avkEventSlot(event)
+  If d = 0 Or s = 0 Or avkEventDev[s] <> d : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  avkEventLive[s] = 0
+  avkEventSet[s] = 0
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkEventState(device.i, event.i, action.i)
+  Define d.i
+  Define s.i
+  d = avkDevSlot(device)
+  s = avkEventSlot(event)
+  If d = 0 Or s = 0 Or avkEventDev[s] <> d
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "a host event command was given a stale, foreign or wrong-device VkEvent (Anvil code -20002, invalid handle); event state was not changed.")
+  EndIf
+  If action = 1 : avkEventSet[s] = 1 : ProcedureReturn #VK_SUCCESS : EndIf
+  If action = 2 : avkEventSet[s] = 0 : ProcedureReturn #VK_SUCCESS : EndIf
+  If avkEventSet[s] <> 0 : ProcedureReturn #VK_EVENT_SET : EndIf
+  ProcedureReturn #VK_EVENT_RESET
 EndProcedure
 
 Procedure.i AnvilVkCommandPoolCreate(device.i, flags.i, *out)

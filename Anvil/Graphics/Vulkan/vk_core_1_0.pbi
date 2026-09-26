@@ -84,6 +84,7 @@
 #VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE = 6
 #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8
 #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9
+#VK_STRUCTURE_TYPE_EVENT_CREATE_INFO = 10
 #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
 #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31
 #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39
@@ -692,6 +693,12 @@ Structure VkSamplerCreateInfo Align #PB_Structure_AlignC
 EndStructure
 
 Structure VkFenceCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+EndStructure
+
+Structure VkEventCreateInfo Align #PB_Structure_AlignC
   sType.l
   *pNext
   flags.l
