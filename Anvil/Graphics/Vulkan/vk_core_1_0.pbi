@@ -483,6 +483,20 @@ Structure VkImageSubresourceRange Align #PB_Structure_AlignC
   layerCount.l
 EndStructure
 
+Structure VkImageSubresource Align #PB_Structure_AlignC
+  aspectMask.l
+  mipLevel.l
+  arrayLayer.l
+EndStructure
+
+Structure VkSubresourceLayout Align #PB_Structure_AlignC
+  offset.q
+  size.q
+  rowPitch.q
+  arrayPitch.q
+  depthPitch.q
+EndStructure
+
 Structure VkImageSubresourceLayers Align #PB_Structure_AlignC
   aspectMask.l
   mipLevel.l
