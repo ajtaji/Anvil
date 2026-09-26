@@ -51,6 +51,8 @@ Global gP5Pitch.q
 Global gP5Order.q
 Global gP5Depth.q
 Global gP5Ticks.q
+Global gP5DepthReply.q
+Global gP5DepthTag.q
 
 ; The architectural counter, 54 MHz (the EL3 stub sets CNTFRQ_EL0).
 Procedure.q P5Ticks()
@@ -332,18 +334,24 @@ Procedure.l P5FramebufferInit()
   gP5FbRaw = P5Get(23) & $FFFFFFFF
   gP5Pitch = P5Get(28) & $FFFFFFFF
   gP5Order = P5Get(19)
-  gP5Depth = P5Get(15)
+  gP5DepthReply = P5Get(15) & $FFFFFFFF
+  gP5DepthTag = P5Get(14) & $FFFFFFFF
   gP5Width = P5Get(5)
   gP5Height = P5Get(6)
-  If gP5FbRaw = 0 Or gP5Pitch = 0
+  If gP5FbRaw = 0 Or gP5Pitch = 0 Or gP5Width = 0
     ProcedureReturn 0
   EndIf
-  ; Draw only in a format this file can pack, and only if the pitch
-  ; agrees with it; anything else is reported, not guessed at.
-  If gP5Depth <> 16 And gP5Depth <> 32
-    ProcedureReturn 0
-  EndIf
-  If gP5Pitch < gP5Width * (gP5Depth / 8)
+  ; THE PITCH DECIDES THE PIXEL SIZE, not the DEPTH word. Pi 5 silicon,
+  ; 2026-09-26: 1920 wide, pitch 3840 (2 bytes a pixel), and 32-bit
+  ; writes came out exactly double width - while the DEPTH reply did not
+  ; say 16. Both reply words are printed on serial; only 2 or 4 bytes a
+  ; pixel is drawn, anything else is refused and reported.
+  If gP5Pitch / gP5Width = 2
+    gP5Depth = 16
+  ElseIf gP5Pitch / gP5Width = 4
+    gP5Depth = 32
+  Else
+    gP5Depth = 0
     ProcedureReturn 0
   EndIf
   If (gP5FbRaw & $C0000000) = $C0000000
@@ -410,6 +418,8 @@ Procedure Main()
     P5Text(?s_el3warn) : P5Newline()
   EndIf
   P5Text(?s_dtb) : P5Hex(gP5Dtb) : P5Newline()
+  P5Text(?s_depthraw) : P5Hex(gP5DepthReply) : P5Text(?s_tag) : P5Hex(gP5DepthTag)
+  P5Text(?s_pitch) : P5Dec(gP5Pitch) : P5Text(?s_x) : P5Dec(gP5Width) : P5Newline()
   If gP5Fb = 0
     P5Text(?s_mbfail) : P5Hex(P5Get(1) & $FFFFFFFF) : P5Newline()
   Else
@@ -441,6 +451,8 @@ DataSection
   s_pitch: Data.a 32,32,112,105,116,99,104,32,0  ; "  pitch "
   s_paint: Data.a 80,97,105,110,116,32,40,99,108,101,97,114,32,43,32,98,97,110,110,101,114,32,43,32,108,111,103,111,41,58,32,0  ; "Paint (clear + banner + logo): "
   s_ms: Data.a 32,109,115,0  ; " ms"
+  s_depthraw: Data.a 68,69,80,84,72,32,114,101,112,108,121,32,48,120,0  ; "DEPTH reply 0x"
+  s_tag: Data.a 32,32,116,97,103,32,48,120,0  ; "  tag 0x"
   s_depth: Data.a 32,32,100,101,112,116,104,32,0  ; "  depth "
   s_order: Data.a 32,32,111,114,100,101,114,32,0  ; "  order "
   s_mbfail: Data.a 77,65,73,76,66,79,88,58,32,110,111,32,102,114,97,109,101,98,117,102,102,101,114,44,32,99,111,100,101,32,48,120,0  ; "MAILBOX: no framebuffer, code 0x"
