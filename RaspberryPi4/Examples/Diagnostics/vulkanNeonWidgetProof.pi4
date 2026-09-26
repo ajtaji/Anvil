@@ -430,17 +430,18 @@ EndProcedure
 Procedure.i nwPairEdgesFrame(imageBase.i, imagePitch.i)
   Define rc.i, x.i, y.i
   rc = NeonVkChromeBegin(@nwPairClear[0])
-  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If rc <> #VK_SUCCESS : nwPut(#NW_S_SCENE_RC, rc) : ProcedureReturn rc : EndIf
   Neon_ScissorClear()
   rc = Neon_Box(0, 0, 1, 1, Neon_RGBA(255, 0, 0, 255))
-  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  If rc <> #NEON_VK_CHROME_OK : nwPut(#NW_S_SCENE_RC, rc) : ProcedureReturn rc : EndIf
   rc = Neon_Box(63, 63, 1, 1, Neon_RGBA(0, 255, 0, 255))
-  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  If rc <> #NEON_VK_CHROME_OK : nwPut(#NW_S_SCENE_RC, rc) : ProcedureReturn rc : EndIf
   rc = Neon_Box(64, 64, 4, 4, Neon_RGBA(0, 0, 255, 255))
-  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  If rc <> #NEON_VK_CHROME_OK : nwPut(#NW_S_SCENE_RC, rc) : ProcedureReturn rc : EndIf
   rc = NeonVkChromeEnd()
-  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If rc <> #VK_SUCCESS : nwPut(#NW_S_SCENE_RC, rc) : ProcedureReturn rc : EndIf
   If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    nwPut(#NW_S_SCENE_RC, NeonVkChromeError())
     ProcedureReturn #NW_ERR_PRESENT
   EndIf
   For y = 0 To 63
@@ -449,6 +450,72 @@ Procedure.i nwPairEdgesFrame(imageBase.i, imagePitch.i)
     Next
   Next
   ProcedureReturn #NW_OK
+EndProcedure
+
+; The backend requires the framebuffer and attachment to have identical
+; extents. Give scene 8 its own 64x64 image, then restore the widget target.
+Procedure.i nwPairEdgesExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPitch.i)
+  Define info.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+  Define image.i, memory.i, view.i, framebuffer.i
+  Define imageBase.i, imagePitch.i, rc.i, rebound.i
+
+  info\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  info\imageType = #VK_IMAGE_TYPE_2D : info\format = #VK_FORMAT_B8G8R8A8_UNORM
+  info\extent\width = 64 : info\extent\height = 64 : info\extent\depth = 1
+  info\mipLevels = 1 : info\arrayLayers = 1 : info\samples = #VK_SAMPLE_COUNT_1_BIT
+  info\tiling = #VK_IMAGE_TILING_LINEAR
+  info\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  info\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  info\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @info, 0, @image)
+  If rc = #VK_SUCCESS
+    vkGetImageMemoryRequirements(dev, image, @req)
+    alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+    rc = vkAllocateMemory(dev, @alloc, 0, @memory)
+  EndIf
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, image, memory, 0) : EndIf
+  If rc = #VK_SUCCESS
+    imageBase = AnvilVkImageAddress(image) : imagePitch = AnvilVkImageRowPitch(image)
+    If imageBase = 0 Or imagePitch < 256 : rc = #NW_ERR_MEMORY : EndIf
+  EndIf
+  If rc = #VK_SUCCESS
+    viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    viewInfo\image = image : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+    viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+    viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+    rc = vkCreateImageView(dev, @viewInfo, 0, @view)
+  EndIf
+  If rc = #VK_SUCCESS
+    frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+    frameInfo\renderPass = renderPass : frameInfo\attachmentCount = 1
+    frameInfo\pAttachments = @view : frameInfo\width = 64
+    frameInfo\height = 64 : frameInfo\layers = 1
+    rc = vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)
+  EndIf
+  If rc = #VK_SUCCESS
+    rc = NeonVkChromeRebind(framebuffer, 64, 64, 64, 64, imagePitch, 0)
+    If rc = #VK_SUCCESS : rebound = 1 : EndIf
+  EndIf
+  If rc = #VK_SUCCESS : rc = nwPairEdgesFrame(imageBase, imagePitch) : EndIf
+  If rc = #VK_SUCCESS
+    rc = NeonVkChromeRebind(widgetFramebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_WIDTH, #NVWA_HEIGHT, widgetPitch, 0)
+    If rc = #VK_SUCCESS : rebound = 0 : EndIf
+  EndIf
+  If rc <> #VK_SUCCESS
+    nwPut(#NW_S_SCENE_RC, rc) : nwPut(#NW_S_BACKEND_ERROR, NeonVkChromeError())
+    If rebound <> 0 : NeonVkChromeDestroy() : EndIf
+  EndIf
+  If framebuffer <> 0 : vkDestroyFramebuffer(dev, framebuffer, 0) : EndIf
+  If view <> 0 : vkDestroyImageView(dev, view, 0) : EndIf
+  If image <> 0 : vkDestroyImage(dev, image, 0) : EndIf
+  If memory <> 0 : vkFreeMemory(dev, memory, 0) : EndIf
+  ProcedureReturn rc
 EndProcedure
 
 Procedure.i Main()
@@ -781,7 +848,7 @@ Procedure.i Main()
     ProcedureReturn nwReturn(#NW_ERR_PIXELS)
   EndIf
 
-  rc = nwPairEdgesFrame(imageBase, imagePitch)
+  rc = nwPairEdgesExactTarget(dev, renderPass, framebuffer, imagePitch)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
