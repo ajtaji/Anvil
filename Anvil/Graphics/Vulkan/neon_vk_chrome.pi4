@@ -1028,12 +1028,12 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-Procedure.i nvcClipXBits(x.i)
-  ProcedureReturn neon_F32Ratio((x * 2) - nvcPhysicalW, nvcPhysicalW)
+Procedure.i nvcClipXBits2(x2.i)
+  ProcedureReturn neon_F32Ratio(x2 - nvcPhysicalW, nvcPhysicalW)
 EndProcedure
 
-Procedure.i nvcClipYBits(y.i)
-  ProcedureReturn neon_F32Ratio((y * 2) - nvcPhysicalH, nvcPhysicalH)
+Procedure.i nvcClipYBits2(y2.i)
+  ProcedureReturn neon_F32Ratio(y2 - nvcPhysicalH, nvcPhysicalH)
 EndProcedure
 
 Procedure nvcVertex(index.i, x.i, y.i, u.i, v.i)
@@ -1050,7 +1050,7 @@ Procedure nvcVertex(index.i, x.i, y.i, u.i, v.i)
     tx = x : ty = y
   EndIf
   p = nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
-  PokeL(p + 0, nvcClipXBits(tx)) : PokeL(p + 4, nvcClipYBits(ty))
+  PokeL(p + 0, nvcClipXBits2(tx * 2)) : PokeL(p + 4, nvcClipYBits2(ty * 2))
   PokeL(p + 8, u) : PokeL(p + 12, v)
   PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
 EndProcedure
@@ -1078,17 +1078,55 @@ Procedure nvcSolidQuad(x0.i, y0.i, x1.i, y1.i, x2.i, y2.i, x3.i, y3.i)
   nvcSolidTriangle(nvcVertices + 3, x0, y0, x2, y2, x3, y3)
 EndProcedure
 
+; Half-pixel positions keep a one-pixel triangle strip centred on the
+; corresponding V3D line, whose integer coordinates describe its centre.
+Procedure nvcLineVertex(index.i, x2.i, y2.i)
+  Define p.i
+  Define tx2.i
+  Define ty2.i
+  If nvcRotation = 90
+    tx2 = nvcLogicalH * 2 - y2 : ty2 = x2
+  ElseIf nvcRotation = 180
+    tx2 = nvcLogicalW * 2 - x2 : ty2 = nvcLogicalH * 2 - y2
+  ElseIf nvcRotation = 270
+    tx2 = y2 : ty2 = nvcLogicalW * 2 - x2
+  Else
+    tx2 = x2 : ty2 = y2
+  EndIf
+  p = nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
+  PokeL(p + 0, nvcClipXBits2(tx2))
+  PokeL(p + 4, nvcClipYBits2(ty2))
+  PokeL(p + 8, nvcWhiteU0) : PokeL(p + 12, nvcWhiteV0)
+  PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+EndProcedure
+
 Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
   Define dx.i
   Define dy.i
+  Define a.i
+  Define b.i
+  Define c.i
+  Define d.i
   dx = x1 - x0 : If dx < 0 : dx = 0 - dx : EndIf
   dy = y1 - y0 : If dy < 0 : dy = 0 - dy : EndIf
   If dx = 0 And dy = 0
     nvcSolidQuad(x0, y0, x0 + 1, y0, x0 + 1, y0 + 1, x0, y0 + 1)
   ElseIf dx >= dy
-    nvcSolidQuad(x0, y0, x1, y1, x1, y1 + 1, x0, y0 + 1)
+    a = y0 * 2 - 1 : b = y1 * 2 - 1 : c = y1 * 2 + 1 : d = y0 * 2 + 1
+    nvcLineVertex(nvcVertices + 0, x0 * 2, a)
+    nvcLineVertex(nvcVertices + 1, x1 * 2, b)
+    nvcLineVertex(nvcVertices + 2, x1 * 2, c)
+    nvcLineVertex(nvcVertices + 3, x0 * 2, a)
+    nvcLineVertex(nvcVertices + 4, x1 * 2, c)
+    nvcLineVertex(nvcVertices + 5, x0 * 2, d)
   Else
-    nvcSolidQuad(x0, y0, x1, y1, x1 + 1, y1, x0 + 1, y0)
+    a = x0 * 2 - 1 : b = x1 * 2 - 1 : c = x1 * 2 + 1 : d = x0 * 2 + 1
+    nvcLineVertex(nvcVertices + 0, a, y0 * 2)
+    nvcLineVertex(nvcVertices + 1, b, y1 * 2)
+    nvcLineVertex(nvcVertices + 2, c, y1 * 2)
+    nvcLineVertex(nvcVertices + 3, a, y0 * 2)
+    nvcLineVertex(nvcVertices + 4, c, y1 * 2)
+    nvcLineVertex(nvcVertices + 5, d, y0 * 2)
   EndIf
 EndProcedure
 
