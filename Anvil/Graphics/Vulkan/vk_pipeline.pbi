@@ -594,7 +594,7 @@ Procedure avkCopyBufferRetain(c.i)
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         avkBufInFlight[b] = avkBufInFlight[b] + 1
@@ -617,7 +617,7 @@ Procedure avkCopyBufferRelease(c.i)
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf

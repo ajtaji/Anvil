@@ -852,6 +852,58 @@ Procedure.i Main()
   Wend
   vkUnmapMemory(dev, copyDstMem)
 
+  ; Fill writes the caller's 32-bit word in host byte order and leaves all
+  ; bytes outside the range untouched. A whole-size fill reaches the end.
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 4, 12, $A1B2C3D4)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr((PeekL(copyDstPtr + 4) & $FFFFFFFF) = $A1B2C3D4)
+  Vkr((PeekL(copyDstPtr + 8) & $FFFFFFFF) = $A1B2C3D4)
+  Vkr((PeekL(copyDstPtr + 12) & $FFFFFFFF) = $A1B2C3D4)
+  Vkr(PeekA(copyDstPtr + 3) = $A5)
+  Vkr(PeekA(copyDstPtr + 16) = 43)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 20, #VK_WHOLE_SIZE, $11223344)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekL(copyDstPtr + 20) = $11223344)
+  Vkr(PeekL(copyDstPtr + 24) = $11223344)
+  Vkr(PeekL(copyDstPtr + 28) = $11223344)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 2, 4, $11223344)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 4, 6, $11223344)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+
+  ; A fill followed by a copy in the same recording executes in order.
+  copyRegion\srcOffset = 0
+  copyRegion\dstOffset = 8
+  copyRegion\size = 8
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 4, 12, $55667788)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr((PeekL(copyDstPtr + 4) & $FFFFFFFF) = $55667788)
+  i = 0
+  While i < 8
+    Vkr(PeekA(copyDstPtr + 8 + i) = i + 31)
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyDstMem)
+
   ; Two disjoint regions in one public call copy exact, separate byte spans.
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
   i = 0
@@ -942,20 +994,43 @@ Procedure.i Main()
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
-  ; A later stale region prevents an earlier valid copy from executing.
+  ; A later stale fill prevents an earlier valid copy from executing.
   ; Preflight covers the complete command stream before the first write.
   copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  copyBufferInfo\size = 31
   Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copyLate) = #VK_SUCCESS)
   vkGetBufferMemoryRequirements(dev, copyLate, @req)
   mai\allocationSize = req\size
   Vkr(vkAllocateMemory(dev, @mai, 0, @copyLateMem) = #VK_SUCCESS)
   Vkr(vkBindBufferMemory(dev, copyLate, copyLateMem, 0) = #VK_SUCCESS)
+  ; The final three bytes of a 31-byte buffer are excluded by WHOLE_SIZE's
+  ; nearest-smaller-multiple-of-four rule.
+  Vkr(vkMapMemory(dev, copyLateMem, 0, 31, 0, @copyDstPtr) = #VK_SUCCESS)
+  i = 24
+  While i < 31
+    PokeA(copyDstPtr + i, $A5)
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyLateMem)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyLate, 24, #VK_WHOLE_SIZE, $11223344)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyLateMem, 0, 31, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekL(copyDstPtr + 24) = $11223344)
+  i = 28
+  While i < 31
+    Vkr(PeekA(copyDstPtr + i) = $A5)
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyLateMem)
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
   PokeA(copyDstPtr + 8, $E7)
   vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
-  vkCmdCopyBuffer(cmd, copySrc, copyLate, 1, @copyRegion)
+  vkCmdFillBuffer(cmd, copyLate, 8, 8, $11223344)
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
   vkDestroyBuffer(dev, copyLate, 0)
   Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)

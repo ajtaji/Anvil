@@ -875,6 +875,18 @@ Procedure vkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, regionCount
   AnvilVkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, regionCount, *pRegions)
 EndProcedure
 
+; Exact core-1.0 signature; data is one uint32 repeated over a four-byte
+; aligned transfer-destination range, with VK_WHOLE_SIZE rounding down.
+Procedure vkCmdFillBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, size.i, data.i)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdFillBuffer was given a stale VkCommandBuffer (Anvil code -20002, invalid handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdFillBuffer(commandBuffer, dstBuffer, dstOffset, size, data)
+EndProcedure
+
 Procedure vkDestroyEvent(device.i, event.i, *pAllocator)
   Define rc.i
   If avkNoAllocator(*pAllocator, 14) <> #VK_SUCCESS
