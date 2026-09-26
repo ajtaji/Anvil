@@ -230,6 +230,12 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn avkTbMaxDim
 EndProcedure
 
+; The explicit state backend has no hardware tile cost.
+Procedure avkBackendRenderAreaGranularity(*out.VkExtent2D)
+  *out\width = 1
+  *out\height = 1
+EndProcedure
+
 ; The state backend models the portable contract over its full declared
 ; extent. It never claims a pixel; the V3D emitter gate is the execution-side
 ; oracle for a real texture request.

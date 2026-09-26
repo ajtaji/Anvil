@@ -1,0 +1,90 @@
+; Emitted public-API gate for vkGetRenderAreaGranularity.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
+
+#VRG_OUT = $06000000
+#VRG_ROWS = $06000100
+#VRG_MAGIC = $56524752 ; VRGR
+
+Global vrgChecks.i
+Global vrgFails.i
+
+Procedure Vrg(ok.i)
+  PokeN(#VRG_ROWS + vrgChecks * 8, ok)
+  vrgChecks = vrgChecks + 1
+  If ok = 0 : vrgFails = vrgFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, rp.i
+  Define count.l = 1
+  Define prio.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define gran.VkExtent2D
+
+  AnvilVkTestBackendHeap($02000000, $00100000)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vrg(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  Vrg(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS And count = 1)
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  Vrg(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM
+  att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1 : rpci\pAttachments = @att
+  rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  Vrg(vkCreateRenderPass(dev, @rpci, 0, @rp) = #VK_SUCCESS)
+  gran\width = 77 : gran\height = 88
+  AnvilVkFaultClear()
+  vkGetRenderAreaGranularity(dev, rp, @gran)
+  Vrg(AnvilVkFaultCode() = 0)
+  Vrg(gran\width = 1 And gran\height = 1)
+  Vrg(vkGetInstanceProcAddr(inst, "vkGetRenderAreaGranularity") = @vkGetRenderAreaGranularity)
+  Vrg(vkGetDeviceProcAddr(dev, "vkGetRenderAreaGranularity") = @vkGetRenderAreaGranularity)
+  Vrg(vkGetInstanceProcAddr(0, "vkGetRenderAreaGranularity") = 0)
+
+  AnvilVkFaultClear()
+  vkGetRenderAreaGranularity(dev, rp, 0)
+  Vrg(AnvilVkFaultCode() = #ANVIL_VK_ERR_ARGS)
+  gran\width = 77 : gran\height = 88
+  AnvilVkFaultClear()
+  vkGetRenderAreaGranularity($12345678, rp, @gran)
+  Vrg(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vrg(gran\width = 77 And gran\height = 88)
+  AnvilVkFaultClear()
+  vkGetRenderAreaGranularity(dev, $12345678, @gran)
+  Vrg(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vrg(gran\width = 77 And gran\height = 88)
+  vkDestroyRenderPass(dev, rp, 0)
+  AnvilVkFaultClear()
+  vkGetRenderAreaGranularity(dev, rp, @gran)
+  Vrg(AnvilVkFaultCode() = #ANVIL_VK_ERR_HANDLE)
+  Vrg(gran\width = 77 And gran\height = 88)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+
+  PokeN(#VRG_OUT, #VRG_MAGIC)
+  PokeN(#VRG_OUT + 8, vrgChecks)
+  PokeN(#VRG_OUT + 16, vrgFails)
+  ProcedureReturn vrgFails
+EndProcedure

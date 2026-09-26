@@ -337,6 +337,7 @@ Declare.i avkBackendImageAlignment()
 Declare.i avkBackendImageCopySourceAlignment()
 Declare.i avkBackendRowPitchFor(width.i)
 Declare.i avkBackendMaxImageDimension2D()
+Declare avkBackendRenderAreaGranularity(*out.VkExtent2D)
 ; Largest dimension this backend can truthfully consume through an actual
 ; sampled-image instruction. Zero means no sampling path is implemented.
 Declare.i avkBackendSampledMaxDimension2D(tiling.i)

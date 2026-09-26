@@ -76,6 +76,11 @@ Procedure.i avkBackendMaxImageDimension2D()
   ProcedureReturn 0
 EndProcedure
 
+Procedure avkBackendRenderAreaGranularity(*out.VkExtent2D)
+  *out\width = 1
+  *out\height = 1
+EndProcedure
+
 Procedure.i avkBackendSampledMaxDimension2D(tiling.i)
   ProcedureReturn 0
 EndProcedure
