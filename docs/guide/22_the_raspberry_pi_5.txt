@@ -1,0 +1,37 @@
+@CHAPTER Raspberry Pi 5: source bring-up
+
+@INTRO The Pi 5 card is prepared, but Anvil has no Pi 5 image or hardware boot proof. Host checks can validate reference device trees before a board is connected.
+
+@SECTION Current boundary
+
+The prepared card contains a 1 GiB FAT32 boot partition, an exFAT data
+partition, `config.txt`, three Pi 5 DTB variants, and selected overlays. Its
+`config.txt` names `ANVIL5.IMG`; that image does not exist yet. The Pi 4
+`kernel8.img` and `armstub8.bin` are not Pi 5 substitutes. Pi 5 firmware is
+in EEPROM, but Anvil still needs an EL3-safe entry, live device-tree handoff,
+BCM2712/RP1 drivers, and hardware proof.
+
+The vault's `Raspberry Pi 5/SOURCES.md` identifies the pinned official DTBs,
+Linux driver references, and datasheets. Its `HARDWARE-BRINGUP.md` lists the
+hardware acceptance still owed. No Pi 5 board was connected for this chapter.
+
+@SECTION Check the source device trees
+
+From the Anvil repository root, use the explicit vault paths on this host:
+
+@FRAG
+$env:PI5_DTB_DIR = "$env:USERPROFILE\Desktop\CompilerEmbedded\Raspberry Pi 5\Boot staging"
+py -3 RaspberryPi5/Boot/dtb_contract.py "$env:PI5_DTB_DIR\bcm2712-rpi-5-b.dtb" "$env:PI5_DTB_DIR\bcm2712-d-rpi-5-b.dtb" "$env:PI5_DTB_DIR\bcm2712d0-rpi-5-b.dtb"
+py -3 -m unittest discover -s RaspberryPi5/Boot -p test_dtb_contract.py -v
+@ENDFRAG
+
+The recorded host run reported `Raspberry Pi 5` and `brcm,bcm2712` for all
+three variants, with an RP1 bridge at `/axi/pcie@1000120000/rp1`. The three
+tests passed; corrupt and wrong-board DTBs were refused. On another host,
+set `PI5_DTB_DIR` to the explicit folder with those three named files before
+running the tests.
+
+These are source DTBs. The bootloader may change the selected DTB, especially
+memory, reserved areas, and boot data. The eventual Anvil image must validate
+and parse the live x0 tree before touching addresses. The current preflight
+is not a boot test and does not make the card bootable.

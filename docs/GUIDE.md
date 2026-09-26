@@ -37,6 +37,7 @@ path in.** Chapter 11 is the map back out to them, by topic.
 | 19 | [TrueType console commands and defaults](guide/19_truetype_console.txt) | Load/select TrueType faces, choose a pixel height, and save or restore a default path with bitmap fallback. |
 | 20 | [TrueType fonts in the resident Vulkan console](guide/20_truetype_vulkan_runtime.txt) | Use font slots in the Vulkan console, understand cache warming and fixed-cell fitting, and distinguish emitted and returning-payload proofs from resident visual acceptance. |
 | 21 | [Anvil on the ROCK Pi 4C](guide/21_the_rock_pi_4c.txt) | EL3 direct-SD boot, checked recovery, SD and eMMC file commands, HDMI TrueType and RGA console, and bounded Mali payload proofs. |
+| 22 | [Raspberry Pi 5: source bring-up](guide/22_the_raspberry_pi_5.txt) | Prepared but not bootable card, pinned Pi 5 DTB preflight, and hardware work still required. |
 
 [`guide/00_OUTLINE.txt`](guide/00_OUTLINE.txt) documents the book itself: the
 markup, the rules the chapters are written to, and the chapter plan. Files whose
