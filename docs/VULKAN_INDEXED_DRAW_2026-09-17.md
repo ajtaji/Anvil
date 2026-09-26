@@ -74,5 +74,35 @@ diagnostic. It binds a UINT16 buffer at byte offset four, selects indices
 `2, 0, 1` with `firstIndex = 1`, and requires the exact adjacent
 `INDEX_BUFFER_SETUP` and `INDEXED_PRIM_LIST` packets in the captured binning
 control list before accepting the same two-pass pixel oracle as the established
-triangle proof. The diagnostic builds successfully; a Pi 4 execution and
-silicon verdict are still owed.
+triangle proof.
+
+## Pi 4 silicon acceptance, 2026-09-26
+
+The current `main` source at `c66e4b9` compiled with the tracked PureMetal
+Forge executable from compiler commit `8480695c`. Build 210 of the Raspberry
+Pi 4 monitor reported staging at `$00600000`, so the diagnostic was built at
+that address. The returning PMFBOOT v2 container was 875,544 bytes, SHA-256
+`9BBC183F6D9D18858CDC43E1552845E85CCEEBBD33E6670A8A9DE03A1C1DF291`.
+
+The RAM-only run over Wi-Fi `192.168.1.111` used the DMA console tier, a
+confirmed 15-second deadman, and a fresh capture. The board verified the
+container digest before entry, returned expected `x0=$00AD44C0`, and reached
+the real `pmf>` prompt. The complete 256-byte report has both magic words,
+both pass verdicts zero, all three red and green inside pixels correct, all
+six outside pixels at the clear colour, and unchanged guard sums. Bin and
+render jobs each advanced from zero to two; submit/wait, MMU, native backend
+and Vulkan validation fault slots were zero. The present verdict was one and
+the diagnostic reached step ten. A zero second-pass verdict also means its
+exact adjacent index setup/draw packet and odd-viewport packet oracles passed.
+
+Capture sequence advanced from zero to one. The fresh 1280 x 800 PNG shows
+the green triangle on the blue-grey ground, with pixel SHA-256
+`D79CBB44CEAB1A2E2632B5BD5F60BED114F638D2B1E776178C3F8BF5329FA8AB`.
+Afterward, `last run` confirmed return, `deadman off` confirmed disarm, and
+`coretest status` showed secondary, GIC and watchdog leases all zero. No
+flash, reset or boot-medium write occurred. The manifest, report bytes and
+picture are in `docs/evidence/vulkan-indexed-20260926/`; the full local run is
+`runs/vulkan-indexed-20260926-r1/`.
+
+This proves the bounded UINT16 indexed case on Pi 4 silicon. UINT32 and wider
+indexed workloads retain their desk evidence and need separate silicon proof.
