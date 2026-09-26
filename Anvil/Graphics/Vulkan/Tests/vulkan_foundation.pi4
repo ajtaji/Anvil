@@ -16,6 +16,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
 
 Global vktFails.i = 0
 Global vktChecks.i = 0
+Global Dim vktCmdArray.i[33]
 
 Procedure Vkt(ok.i)
   PokeN(#VKT_OUT + $100 + (vktChecks * 8), ok)
@@ -48,6 +49,8 @@ Procedure.i Main()
   Define eventInfo.VkEventCreateInfo
   Define event.i
   Define retiredEvent.i
+  Define retiredCmd.i
+  Define savedCmd.i
   Define featureFailures.i
   Define i.i
 
@@ -425,8 +428,49 @@ Procedure.i Main()
   cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
   cbai\commandPool = pool
   cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 0
+  Vkt(vkAllocateCommandBuffers(dev, @cbai, @vktCmdArray[0]) = #ANVIL_VK_ERR_ARGS)
+  ; Exhaust the fixed command-buffer table in one call. Vulkan requires
+  ; every output to be null and all partial allocations to be freed.
+  cbai\commandBufferCount = 33
+  i = 0
+  While i < 33
+    vktCmdArray[i] = $12345678
+    i = i + 1
+  Wend
+  Vkt(vkAllocateCommandBuffers(dev, @cbai, @vktCmdArray[0]) = #VK_ERROR_OUT_OF_HOST_MEMORY)
+  i = 0
+  While i < 33
+    Vkt(vktCmdArray[i] = #VK_NULL_HANDLE)
+    i = i + 1
+  Wend
   cbai\commandBufferCount = 2
-  Vkt(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vkt(vkAllocateCommandBuffers(dev, @cbai, @vktCmdArray[0]) = #VK_SUCCESS)
+  Vkt(vktCmdArray[0] <> #VK_NULL_HANDLE And vktCmdArray[1] <> #VK_NULL_HANDLE)
+  Vkt(AnvilVkCommandBufferState(vktCmdArray[0]) = #ANVIL_VK_CB_INITIAL)
+  Vkt(AnvilVkCommandBufferState(vktCmdArray[1]) = #ANVIL_VK_CB_INITIAL)
+  ; An invalid later entry must leave an earlier valid entry allocated.
+  savedCmd = vktCmdArray[1]
+  vktCmdArray[1] = $12345678
+  vkFreeCommandBuffers(dev, pool, 2, @vktCmdArray[0])
+  Vkt(AnvilVkCommandBufferState(vktCmdArray[0]) = #ANVIL_VK_CB_INITIAL)
+  vktCmdArray[1] = savedCmd
+  vktCmdArray[1] = vktCmdArray[0]
+  vkFreeCommandBuffers(dev, pool, 2, @vktCmdArray[0])
+  Vkt(AnvilVkCommandBufferState(vktCmdArray[0]) = #ANVIL_VK_CB_INITIAL)
+  vktCmdArray[1] = savedCmd
+  retiredCmd = vktCmdArray[0]
+  vktCmdArray[1] = #VK_NULL_HANDLE
+  vkFreeCommandBuffers(dev, pool, 2, @vktCmdArray[0])
+  Vkt(AnvilVkCommandBufferState(retiredCmd) = #ANVIL_VK_ERR_HANDLE)
+  Vkt(AnvilVkCommandBufferState(savedCmd) = #ANVIL_VK_CB_INITIAL)
+  vktCmdArray[0] = #VK_NULL_HANDLE
+  vktCmdArray[1] = savedCmd
+  vkFreeCommandBuffers(dev, pool, 2, @vktCmdArray[0])
+  Vkt(AnvilVkCommandBufferState(savedCmd) = #ANVIL_VK_ERR_HANDLE)
+  vktCmdArray[0] = #VK_NULL_HANDLE
+  vktCmdArray[1] = #VK_NULL_HANDLE
+  vkFreeCommandBuffers(dev, pool, 2, @vktCmdArray[0])
   cbai\commandBufferCount = 1
   Vkt(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #VK_SUCCESS)
   Vkt(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_INITIAL)
