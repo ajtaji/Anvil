@@ -1181,12 +1181,8 @@ Procedure.i vkAllocateDescriptorSets(device.i, *pAllocateInfo.VkDescriptorSetAll
   ProcedureReturn AnvilVkDescriptorSetsAllocate(device, *pAllocateInfo, *pDescriptorSets)
 EndProcedure
 
-; vkFreeDescriptorSets EXISTS AND IT REFUSES, which is not the same as
-; not being here: a caller who reaches for it is told that this pool was
-; created without VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT and
-; what to do instead, rather than failing to link.
 Procedure.i vkFreeDescriptorSets(device.i, descriptorPool.i, descriptorSetCount.i, *pDescriptorSets)
-  ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkFreeDescriptorSets was called on a pool that was not created with VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT (Anvil code -20005, individual descriptor-set freeing not implemented); no set was freed. That bit is refused at vkCreateDescriptorPool, so every pool here returns its sets together - call vkResetDescriptorPool or vkDestroyDescriptorPool.")
+  ProcedureReturn AnvilVkDescriptorSetsFree(device, descriptorPool, descriptorSetCount, *pDescriptorSets)
 EndProcedure
 
 Procedure vkUpdateDescriptorSets(device.i, descriptorWriteCount.i, *pDescriptorWrites.VkWriteDescriptorSet, descriptorCopyCount.i, *pDescriptorCopies)

@@ -1,0 +1,130 @@
+; Emitted public-API gate for individual Vulkan descriptor-set freeing.
+; The explicit test backend touches no GPU or MMIO.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VDF_OUT = $06000000
+#VDF_ROWS = $06000100
+#VDF_HEAP = $02000000
+#VDF_MAGIC = $56444652 ; VDFR
+
+Global vdfChecks.i
+Global vdfFails.i
+
+Procedure Vdf(ok.i)
+  PokeN(#VDF_ROWS + vdfChecks * 8, ok)
+  vdfChecks = vdfChecks + 1
+  If ok = 0 : vdfFails = vdfFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, layout.i, pool.i, plainPool.i, otherPool.i
+  Define a.i, b.i, replacement.i, plainSet.i, oldA.i, bad.i, p.i
+  Define count.l = 1
+  Define prio.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define lci.VkDescriptorSetLayoutCreateInfo
+  Define Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Define pci.VkDescriptorPoolCreateInfo
+  Define Dim sizes.VkDescriptorPoolSize[2]
+  Define ai.VkDescriptorSetAllocateInfo
+  Define Dim handles.i[2]
+
+  AnvilVkTestBackendHeap(#VDF_HEAP, $00100000)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vdf(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  Vdf(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS And count = 1)
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  Vdf(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+
+  bindings[0]\binding = 0
+  bindings[0]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[0]\descriptorCount = 1
+  bindings[0]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  bindings[1]\binding = 1
+  bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  bindings[1]\descriptorCount = 1
+  bindings[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  lci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  lci\bindingCount = 2 : lci\pBindings = @bindings[0]
+  Vdf(vkCreateDescriptorSetLayout(dev, @lci, 0, @layout) = #VK_SUCCESS)
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  sizes[0]\descriptorCount = 2
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  sizes[1]\descriptorCount = 2
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  pci\maxSets = 2
+  pci\poolSizeCount = 2 : pci\pPoolSizes = @sizes[0]
+  Vdf(vkCreateDescriptorPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+  p = avkDpSlot(pool)
+  Vdf(avkDpFlags[p] = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool
+  ai\descriptorSetCount = 1 : ai\pSetLayouts = @layout
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @a) = #VK_SUCCESS)
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @b) = #VK_SUCCESS)
+  Vdf(avkDpSetsOut[p] = 2 And avkDpUboOut[p] = 2 And avkDpSampleOut[p] = 2)
+  Vdf(vkCreateDescriptorPool(dev, @pci, 0, @otherPool) = #VK_SUCCESS)
+  handles[0] = a
+  Vdf(vkFreeDescriptorSets(dev, otherPool, 1, @handles[0]) = #ANVIL_VK_ERR_OWNER)
+  Vdf(avkDsSlot(a) <> 0 And avkDpSetsOut[p] = 2)
+  vkDestroyDescriptorPool(dev, otherPool, 0)
+  bad = $12345678
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @bad) = #VK_ERROR_OUT_OF_POOL_MEMORY)
+
+  handles[0] = a : handles[1] = $12345678
+  Vdf(vkFreeDescriptorSets(dev, pool, 2, @handles[0]) = #ANVIL_VK_ERR_HANDLE)
+  Vdf(avkDsSlot(a) <> 0 And avkDpSetsOut[p] = 2 And avkDpUboOut[p] = 2)
+  handles[1] = a
+  Vdf(vkFreeDescriptorSets(dev, pool, 2, @handles[0]) = #ANVIL_VK_ERR_ARGS)
+  Vdf(avkDsSlot(a) <> 0 And avkDpSetsOut[p] = 2)
+  handles[1] = #VK_NULL_HANDLE
+  Vdf(vkFreeDescriptorSets(dev, pool, 2, @handles[0]) = #VK_SUCCESS)
+  Vdf(avkDsSlot(a) = 0 And avkDsSlot(b) <> 0)
+  Vdf(avkDpSetsOut[p] = 1 And avkDpUboOut[p] = 1 And avkDpSampleOut[p] = 1)
+  oldA = a
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @replacement) = #VK_SUCCESS)
+  Vdf(replacement <> oldA And avkDsSlot(oldA) = 0)
+  handles[0] = oldA
+  Vdf(vkFreeDescriptorSets(dev, pool, 1, @handles[0]) = #ANVIL_VK_ERR_HANDLE)
+  Vdf(avkDpSetsOut[p] = 2 And avkDpUboOut[p] = 2 And avkDpSampleOut[p] = 2)
+  handles[0] = replacement
+  avkFlightActive = 1
+  Vdf(vkFreeDescriptorSets(dev, pool, 1, @handles[0]) = #ANVIL_VK_ERR_STATE)
+  avkFlightActive = 0
+  Vdf(avkDsSlot(replacement) <> 0 And avkDpSetsOut[p] = 2)
+  handles[0] = b : handles[1] = replacement
+  Vdf(vkFreeDescriptorSets(dev, pool, 2, @handles[0]) = #VK_SUCCESS)
+  Vdf(avkDpSetsOut[p] = 0 And avkDpUboOut[p] = 0 And avkDpSampleOut[p] = 0)
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @replacement) = #VK_SUCCESS)
+  handles[0] = replacement
+  Vdf(vkFreeDescriptorSets(dev, pool, 0, @handles[0]) = #ANVIL_VK_ERR_ARGS)
+  Vdf(avkDsSlot(replacement) <> 0 And avkDpSetsOut[p] = 1)
+  Vdf(vkResetDescriptorPool(dev, pool, 0) = #VK_SUCCESS)
+  Vdf(avkDsSlot(replacement) = 0 And avkDpSetsOut[p] = 0)
+  vkDestroyDescriptorPool(dev, pool, 0)
+
+  pci\flags = 0
+  Vdf(vkCreateDescriptorPool(dev, @pci, 0, @plainPool) = #VK_SUCCESS)
+  ai\descriptorPool = plainPool
+  Vdf(vkAllocateDescriptorSets(dev, @ai, @plainSet) = #VK_SUCCESS)
+  handles[0] = plainSet
+  Vdf(vkFreeDescriptorSets(dev, plainPool, 1, @handles[0]) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vdf(avkDsSlot(plainSet) <> 0)
+  vkDestroyDescriptorPool(dev, plainPool, 0)
+  Vdf(avkDsSlot(plainSet) = 0)
+  vkDestroyDescriptorSetLayout(dev, layout, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+
+  PokeN(#VDF_OUT, #VDF_MAGIC)
+  PokeN(#VDF_OUT + 8, vdfChecks)
+  PokeN(#VDF_OUT + 16, vdfFails)
+  ProcedureReturn vdfFails
+EndProcedure

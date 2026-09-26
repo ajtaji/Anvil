@@ -28,8 +28,10 @@
 ;     uniform buffer or a combined image sampler;
 ;     every binding has descriptorCount 1 at VK_SHADER_STAGE_FRAGMENT_BIT
 ;   * a descriptor pool whose rows are accumulated per supported type,
-;     including duplicate rows, with no FREE_DESCRIPTOR_SET_BIT
+;     including duplicate rows, with optional FREE_DESCRIPTOR_SET_BIT
 ;   * vkAllocateDescriptorSets of one set at a time
+;   * vkFreeDescriptorSets of an atomically checked array, returning each
+;     freed set's type budget to its owning pool
 ;   * vkUpdateDescriptorSets of one write at a time, no copies
 ;   * a uniform buffer of at least sixteen bytes at an offset that is a
 ;     multiple of sixteen, or one bound linear BGRA8 sampled image view and
@@ -81,6 +83,7 @@ Global Dim avkDslStages.i[(#ANVIL_VK_MAX_SET_LAYOUTS + 1) * #ANVIL_VK_MAX_SET_BI
 Global Dim avkDpLive.a[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpGen.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpDev.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
+Global Dim avkDpFlags.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpMaxSets.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpSetsOut.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
 Global Dim avkDpUboCapacity.i[#ANVIL_VK_MAX_DESCRIPTOR_POOLS + 1]
@@ -292,10 +295,7 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
   If *ci\pNext <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given a pNext chain (Anvil code -20005, no pNext extension is implemented); no pool was created.")
   EndIf
-  If (*ci\flags & #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT) <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was asked for VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT (Anvil code -20005, individual descriptor-set freeing not implemented); vkFreeDescriptorSets has nothing to return a set to. Destroy or reset the whole pool instead.")
-  EndIf
-  If (*ci\flags & $FFFFFFFF) <> 0
+  If ((*ci\flags & $FFFFFFFF) & (~#VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)) <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given a creation flag this implementation does not have (Anvil code -20005, unsupported flags); no pool was created.")
   EndIf
   If (*ci\maxSets & $FFFFFFFF) < 1 Or (*ci\maxSets & $FFFFFFFF) > #ANVIL_VK_MAX_DESCRIPTOR_SETS
@@ -341,6 +341,7 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
   If s > #ANVIL_VK_MAX_DESCRIPTOR_POOLS : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
   avkDpGen[s] = avkNextGen(avkDpGen[s])
   avkDpDev[s] = d
+  avkDpFlags[s] = *ci\flags & $FFFFFFFF
   avkDpMaxSets[s] = *ci\maxSets & $FFFFFFFF
   avkDpSetsOut[s] = 0
   avkDpUboCapacity[s] = uboCapacity
@@ -352,26 +353,32 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+Procedure avkDescClearSet(s.i)
+  Define j.i
+  avkDsLive[s] = 0
+  avkDsDev[s] = 0
+  avkDsPool[s] = 0
+  avkDsCount[s] = 0
+  j = 0
+  While j < #ANVIL_VK_MAX_SET_BINDINGS
+    avkDsType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = -1
+    avkDsStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsBuf[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsOffset[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsRange[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsSampler[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsView[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    avkDsImageLayout[(s * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
+    j = j + 1
+  Wend
+EndProcedure
+
 Procedure avkDescFreePoolSets(p.i)
   Define k.i
-  Define j.i
   k = 1
   While k <= #ANVIL_VK_MAX_DESCRIPTOR_SETS
     If avkDsLive[k] <> 0 And avkDsPool[k] = p
-      avkDsLive[k] = 0
-      avkDsCount[k] = 0
-      j = 0
-      While j < #ANVIL_VK_MAX_SET_BINDINGS
-        avkDsType[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = -1
-        avkDsStages[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsBuf[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsOffset[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsRange[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsSampler[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsView[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        avkDsImageLayout[(k * #ANVIL_VK_MAX_SET_BINDINGS) + j] = 0
-        j = j + 1
-      Wend
+      avkDescClearSet(k)
     EndIf
     k = k + 1
   Wend
@@ -419,6 +426,83 @@ Procedure AnvilVkDescriptorPoolDestroy(device.i, pool.i)
   ; says so, and this is where that happens.
   avkDescFreePoolSets(p)
   avkDpLive[p] = 0
+  avkDpFlags[p] = 0
+EndProcedure
+
+; Preflight the complete array before returning a single slot or budget.
+; Vulkan permits null entries. A stale, duplicate, foreign or wrong-pool
+; non-null entry leaves every live set and counter untouched.
+Procedure.i AnvilVkDescriptorSetsFree(device.i, pool.i, count.i, *sets)
+  Define d.i
+  Define p.i
+  Define i.i
+  Define j.i
+  Define s.i
+  Define handle.i
+  Define idx.i
+  Define needUbo.i
+  Define needSample.i
+  Define liveCount.i
+  d = avkDevSlot(device)
+  p = avkDpSlot(pool)
+  If d = 0 Or p = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkDpDev[p] <> d
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkFreeDescriptorSets was given a pool owned by another device (Anvil code -20003, wrong parent); no set was freed.")
+  EndIf
+  If (avkDpFlags[p] & #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkFreeDescriptorSets requires VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT on its pool (Anvil code -20005, pool does not support individual free); no set was freed.")
+  EndIf
+  If count < 1 Or count > #ANVIL_VK_MAX_DESCRIPTOR_SETS Or *sets = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkFreeDescriptorSets requires a positive bounded descriptorSetCount and an array (Anvil code -20001, invalid array); no set was freed.")
+  EndIf
+  If avkFlightActive <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkFreeDescriptorSets was called while a submission is in flight (Anvil code -20004, possible descriptor use); wait for its fence or device idle before freeing.")
+  EndIf
+  needUbo = 0 : needSample = 0 : liveCount = 0
+  i = 0
+  While i < count
+    handle = PeekI(*sets + (i * SizeOf(.i)))
+    If handle <> #VK_NULL_HANDLE
+      s = avkDsSlot(handle)
+      If s = 0
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkFreeDescriptorSets was given a stale or invalid set handle (Anvil code -20002, invalid handle); no set was freed.")
+      EndIf
+      If avkDsDev[s] <> d Or avkDsPool[s] <> p
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkFreeDescriptorSets was given a set from another device or pool (Anvil code -20003, wrong parent); no set was freed.")
+      EndIf
+      j = 0
+      While j < i
+        If PeekI(*sets + (j * SizeOf(.i))) = handle
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkFreeDescriptorSets was given a duplicate non-null handle (Anvil code -20001, duplicate set); no set was freed.")
+        EndIf
+        j = j + 1
+      Wend
+      liveCount = liveCount + 1
+      j = 0
+      While j < avkDsCount[s]
+        idx = (s * #ANVIL_VK_MAX_SET_BINDINGS) + j
+        If avkDsType[idx] = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : needUbo = needUbo + 1 : EndIf
+        If avkDsType[idx] = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : needSample = needSample + 1 : EndIf
+        j = j + 1
+      Wend
+    EndIf
+    i = i + 1
+  Wend
+  If liveCount > avkDpSetsOut[p] Or needUbo > avkDpUboOut[p] Or needSample > avkDpSampleOut[p]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkFreeDescriptorSets found inconsistent pool accounting (Anvil code -20004, internal pool state); no set was freed.")
+  EndIf
+  i = 0
+  While i < count
+    handle = PeekI(*sets + (i * SizeOf(.i)))
+    If handle <> #VK_NULL_HANDLE
+      avkDescClearSet(avkDsSlot(handle))
+    EndIf
+    i = i + 1
+  Wend
+  avkDpSetsOut[p] = avkDpSetsOut[p] - liveCount
+  avkDpUboOut[p] = avkDpUboOut[p] - needUbo
+  avkDpSampleOut[p] = avkDpSampleOut[p] - needSample
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 ; ======================================================================

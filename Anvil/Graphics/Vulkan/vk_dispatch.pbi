@@ -64,9 +64,9 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetInstanceProcAddr") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetInstanceProcAddr, domain) : EndIf
   If avkDispatchName(*pName, "vkGetDeviceProcAddr") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetDeviceProcAddr, domain) : EndIf
 
-  ; Semantic allowlist approved 2026-09-13. vkFreeDescriptorSets is withheld:
-  ; every pool refuses its enabling flag, so the declaration is not usable
-  ; semantics. The bounded whole-image vkCmdCopyBufferToImage transaction is
+  ; Semantic allowlist approved 2026-09-13. Individual descriptor-set freeing
+  ; is exposed after its pool-flag, array and quota gates passed. The bounded
+  ; whole-image vkCmdCopyBufferToImage transaction is
   ; exposed after its independent desk and Pi 4 silicon gates passed. The
   ; coherent-heap vkCmdCopyBuffer path has an emitted byte-exact desk gate.
   If avkDispatchName(*pName, "vkAllocateCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkAllocateCommandBuffers, domain) : EndIf
@@ -134,6 +134,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkEnumerateDeviceLayerProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumerateDeviceLayerProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkEnumeratePhysicalDevices") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumeratePhysicalDevices, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeCommandBuffers, domain) : EndIf
+  If avkDispatchName(*pName, "vkFreeDescriptorSets") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeDescriptorSets, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeMemory, domain) : EndIf
   If avkDispatchName(*pName, "vkFlushMappedMemoryRanges") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFlushMappedMemoryRanges, domain) : EndIf
   If avkDispatchName(*pName, "vkGetBufferMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetBufferMemoryRequirements, domain) : EndIf

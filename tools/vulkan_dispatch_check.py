@@ -28,7 +28,7 @@ MAGIC = 0x564B4450
 OUT = 0x06000000
 ROWS = 0x06000100
 
-WITHHELD = frozenset(("vkFreeDescriptorSets",))
+WITHHELD = frozenset()
 ALLOWLIST = frozenset("""vkAllocateCommandBuffers vkAllocateDescriptorSets
 vkAllocateMemory vkBeginCommandBuffer vkBindBufferMemory vkBindImageMemory
 vkCmdBeginRenderPass vkCmdBindDescriptorSets vkCmdBindPipeline
@@ -45,7 +45,7 @@ vkDestroyInstance vkDestroyPipeline vkDestroyPipelineLayout
 vkDestroyRenderPass vkDestroySampler vkDestroySemaphore vkDestroyShaderModule vkDeviceWaitIdle
 vkEndCommandBuffer vkEnumerateDeviceExtensionProperties vkEnumerateDeviceLayerProperties
 vkEnumerateInstanceExtensionProperties vkEnumerateInstanceLayerProperties
-vkEnumeratePhysicalDevices vkFreeCommandBuffers vkFreeMemory vkFlushMappedMemoryRanges
+vkEnumeratePhysicalDevices vkFreeCommandBuffers vkFreeDescriptorSets vkFreeMemory vkFlushMappedMemoryRanges
 vkGetBufferMemoryRequirements vkGetDeviceQueue vkGetFenceStatus vkGetEventStatus
 vkGetImageMemoryRequirements vkGetImageSparseMemoryRequirements vkGetImageSubresourceLayout vkInvalidateMappedMemoryRanges vkGetPhysicalDeviceFeatures
 vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceImageFormatProperties
@@ -166,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
             checks += 1
 
         # Hostile table models: unreviewed exposure, wrong pointer, wrong
-        # domain, case drift, a removed audited command, and both withheld rows.
+        # domain, case drift, and a removed audited command.
         mutants = []
         missing = dict(rows); missing.pop("vkQueueSubmit"); mutants.append(("removed audited row", missing))
         extra = dict(rows); extra["vkCreateQueryPool"] = ("#AVK_DISPATCH_DEVICE", "vkCreateQueryPool"); mutants.append(("missing command exposed", extra))
@@ -197,8 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mutate:
             mutations = (
                 ("wrong domain", "@vkCreateDevice, domain)", "@vkCreateDevice, #AVK_QUERY_GDPA_DEVICE)"),
-                ("withheld exposure", "  ProcedureReturn 0\nEndProcedure\n\nProcedure.i vkGetInstanceProcAddr",
-                 "  If avkDispatchName(*pName, \"vkFreeDescriptorSets\") : ProcedureReturn @vkFreeDescriptorSets : EndIf\n  ProcedureReturn 0\nEndProcedure\n\nProcedure.i vkGetInstanceProcAddr"),
+                ("missing free-set entry", "  If avkDispatchName(*pName, \"vkFreeDescriptorSets\") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeDescriptorSets, domain) : EndIf\n", ""),
                 ("wrong pointer", "@vkDeviceWaitIdle, domain)", "@vkQueueSubmit, domain)"),
             )
             for label, before, after in mutations:
