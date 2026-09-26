@@ -129,11 +129,13 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkEnumeratePhysicalDevices") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkEnumeratePhysicalDevices, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeCommandBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeCommandBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkFreeMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFreeMemory, domain) : EndIf
+  If avkDispatchName(*pName, "vkFlushMappedMemoryRanges") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkFlushMappedMemoryRanges, domain) : EndIf
   If avkDispatchName(*pName, "vkGetBufferMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetBufferMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetDeviceQueue") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetDeviceQueue, domain) : EndIf
   If avkDispatchName(*pName, "vkGetFenceStatus") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetFenceStatus, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageMemoryRequirements") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageMemoryRequirements, domain) : EndIf
   If avkDispatchName(*pName, "vkGetImageSubresourceLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetImageSubresourceLayout, domain) : EndIf
+  If avkDispatchName(*pName, "vkInvalidateMappedMemoryRanges") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkInvalidateMappedMemoryRanges, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceFeatures") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceFeatures, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceFormatProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceImageFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceImageFormatProperties, domain) : EndIf

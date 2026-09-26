@@ -416,6 +416,57 @@ Procedure vkUnmapMemory(device.i, memory.i)
   AnvilVkMemoryUnmap(device, memory)
 EndProcedure
 
+; The mapped types currently offered by the production backend are host
+; coherent. Submission/completion own cache maintenance, so these commands
+; validate their complete input array and need no additional cache operation.
+Procedure.i avkCoherentMappedRanges(device.i, memoryRangeCount.i, *pMemoryRanges.VkMappedMemoryRange)
+  Define d.i
+  Define s.i
+  Define i.i
+  Define mapStart.i
+  Define mapEnd.i
+  Define *range.VkMappedMemoryRange
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "a mapped-memory range command was given a stale or foreign VkDevice handle (Anvil code -20002); no ranges were processed.") : EndIf
+  If memoryRangeCount < 1 Or *pMemoryRanges = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "a mapped-memory range command needs at least one VkMappedMemoryRange and a non-null array (Anvil code -20001); no ranges were processed.")
+  EndIf
+  i = 0
+  While i < memoryRangeCount
+    *range = *pMemoryRanges + i * SizeOf(VkMappedMemoryRange)
+    If *range\sType <> #VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE Or *range\pNext <> 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "a mapped-memory range has a wrong sType or non-null pNext (Anvil code -20001); use VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE and a null pNext.")
+    EndIf
+    s = avkMemSlot(*range\memory)
+    If s = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "a mapped-memory range names memory that is not live (Anvil code -20002); no ranges were processed.") : EndIf
+    If avkMemDev[s] <> d : ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "a mapped-memory range names memory owned by another device (Anvil code -20003); no ranges were processed.") : EndIf
+    If avkMemMapped[s] = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "a mapped-memory range names memory with no active host mapping (Anvil code -20004); map it first.") : EndIf
+    If (avkBackendMemoryTypeFlags(avkMemType[s]) & #VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "a mapped-memory range uses a non-coherent memory type (Anvil code -20005); cache operations for that type are not implemented.")
+    EndIf
+    mapStart = avkMemMapOffset[s]
+    mapEnd = mapStart + avkMemMapSize[s]
+    If *range\offset < mapStart Or *range\offset >= mapEnd
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "a mapped-memory range begins outside the current mapping (Anvil code -20001); choose an offset inside the mapped allocation span.")
+    EndIf
+    If *range\size <> #VK_WHOLE_SIZE
+      If *range\size <= 0 Or *range\size > mapEnd - *range\offset
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "a mapped-memory range has zero size or extends beyond the current mapping (Anvil code -20001); use a positive size inside the mapped span or VK_WHOLE_SIZE.")
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i vkFlushMappedMemoryRanges(device.i, memoryRangeCount.i, *pMemoryRanges.VkMappedMemoryRange)
+  ProcedureReturn avkCoherentMappedRanges(device, memoryRangeCount, *pMemoryRanges)
+EndProcedure
+
+Procedure.i vkInvalidateMappedMemoryRanges(device.i, memoryRangeCount.i, *pMemoryRanges.VkMappedMemoryRange)
+  ProcedureReturn avkCoherentMappedRanges(device, memoryRangeCount, *pMemoryRanges)
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  IMAGES
 ; ----------------------------------------------------------------------
