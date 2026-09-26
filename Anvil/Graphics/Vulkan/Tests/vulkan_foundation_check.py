@@ -69,6 +69,7 @@ CONSTANTS = {
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO",
     "VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO",
     "VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO", "VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE", "VK_STRUCTURE_TYPE_FENCE_CREATE_INFO",
+    "VK_STRUCTURE_TYPE_EVENT_CREATE_INFO",
     "VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO",
     "VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO", "VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO", "VK_STRUCTURE_TYPE_MEMORY_BARRIER",
     "VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER", "VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER",
@@ -484,6 +485,7 @@ PB_SUFFIX = {
     "uint8_t": ".a", "char": ".a",
     "VkMemoryPropertyFlags": ".l", "VkMemoryHeapFlags": ".l",
     "VkQueueFlags": ".l", "VkFenceCreateFlags": ".l", "VkSemaphoreCreateFlags": ".l",
+    "VkEventCreateFlags": ".l",
     "VkDeviceSize": ".q", "uint64_t": ".q",
     "VkCommandPool": ".i", "VkRenderPass": ".i", "VkFramebuffer": ".i",
     "VkSemaphore": ".i", "VkCommandBuffer": ".i", "VkImage": ".i",
@@ -588,6 +590,10 @@ STRUCTS.update({
         ("uint32_t", "descriptorCount")),
 })
 
+
+STRUCTS["VkEventCreateInfo"] = (("VkStructureType", "sType"),
+                                ("void", "pNext"),
+                                ("VkEventCreateFlags", "flags"))
 
 # The registry writes its all-ones sentinels as C expressions.
 C_SENTINELS = {"(~0U)": 0xFFFFFFFF, "(~0ULL)": 0xFFFFFFFFFFFFFFFF, "(~0U-1)": 0xFFFFFFFE}

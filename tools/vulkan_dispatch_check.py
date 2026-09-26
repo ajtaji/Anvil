@@ -36,23 +36,23 @@ vkCmdBindIndexBuffer vkCmdBindVertexBuffers vkCmdClearColorImage vkCmdCopyBuffer
 vkCmdDraw vkCmdDrawIndexed vkCmdEndRenderPass
 vkCmdPipelineBarrier vkCmdPushConstants vkCmdSetScissor vkCmdSetViewport vkCreateBuffer vkCreateCommandPool
 vkCreateDescriptorPool vkCreateDescriptorSetLayout vkCreateDevice vkCreateFence
-vkCreateFramebuffer vkCreateGraphicsPipelines vkCreateImage vkCreateImageView
+vkCreateEvent vkCreateFramebuffer vkCreateGraphicsPipelines vkCreateImage vkCreateImageView
 vkCreateInstance vkCreatePipelineLayout vkCreateRenderPass vkCreateSampler
 vkCreateSemaphore vkCreateShaderModule vkDestroyBuffer vkDestroyCommandPool
-vkDestroyDescriptorPool vkDestroyDescriptorSetLayout vkDestroyDevice
+vkDestroyDescriptorPool vkDestroyDescriptorSetLayout vkDestroyDevice vkDestroyEvent
 vkDestroyFence vkDestroyFramebuffer vkDestroyImage vkDestroyImageView
 vkDestroyInstance vkDestroyPipeline vkDestroyPipelineLayout
 vkDestroyRenderPass vkDestroySampler vkDestroySemaphore vkDestroyShaderModule vkDeviceWaitIdle
 vkEndCommandBuffer vkEnumerateDeviceExtensionProperties vkEnumerateDeviceLayerProperties
 vkEnumerateInstanceExtensionProperties vkEnumerateInstanceLayerProperties
 vkEnumeratePhysicalDevices vkFreeCommandBuffers vkFreeMemory vkFlushMappedMemoryRanges
-vkGetBufferMemoryRequirements vkGetDeviceQueue vkGetFenceStatus
+vkGetBufferMemoryRequirements vkGetDeviceQueue vkGetFenceStatus vkGetEventStatus
 vkGetImageMemoryRequirements vkGetImageSparseMemoryRequirements vkGetImageSubresourceLayout vkInvalidateMappedMemoryRanges vkGetPhysicalDeviceFeatures
 vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceImageFormatProperties
 vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceQueueFamilyProperties
 vkGetPhysicalDeviceSparseImageFormatProperties
 vkMapMemory vkQueueSubmit vkQueueWaitIdle vkResetCommandBuffer vkResetCommandPool
-vkResetDescriptorPool vkResetFences vkUnmapMemory vkUpdateDescriptorSets
+vkResetDescriptorPool vkResetFences vkResetEvent vkSetEvent vkUnmapMemory vkUpdateDescriptorSets
 vkWaitForFences""".split())
 RESOLVERS = frozenset(("vkGetInstanceProcAddr", "vkGetDeviceProcAddr"))
 DOMAIN_TOKEN = {"global": "#AVK_DISPATCH_GLOBAL", "instance": "#AVK_DISPATCH_INSTANCE",
@@ -169,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
         # domain, case drift, a removed audited command, and both withheld rows.
         mutants = []
         missing = dict(rows); missing.pop("vkQueueSubmit"); mutants.append(("removed audited row", missing))
-        extra = dict(rows); extra["vkCreateEvent"] = ("#AVK_DISPATCH_DEVICE", "vkCreateEvent"); mutants.append(("missing command exposed", extra))
+        extra = dict(rows); extra["vkCreateQueryPool"] = ("#AVK_DISPATCH_DEVICE", "vkCreateQueryPool"); mutants.append(("missing command exposed", extra))
         target = dict(rows); target["vkDeviceWaitIdle"] = ("#AVK_DISPATCH_DEVICE", "vkQueueSubmit"); mutants.append(("wrong pointer", target))
         domain = dict(rows); domain["vkCreateDevice"] = ("#AVK_DISPATCH_DEVICE", "vkCreateDevice"); mutants.append(("wrong domain", domain))
         case = dict(rows); case["vkdevicewaitidle"] = case.pop("vkDeviceWaitIdle"); mutants.append(("case-folded key", case))

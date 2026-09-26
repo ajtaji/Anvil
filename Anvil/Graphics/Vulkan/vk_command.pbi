@@ -1517,6 +1517,11 @@ Procedure.i AnvilVkDeviceDestroy(device.i)
     If avkFenceLive[i] <> 0 And avkFenceDev[i] = d : avkFenceLive[i] = 0 : EndIf
     i = i + 1
   Wend
+  i = 1
+  While i <= #ANVIL_VK_MAX_EVENTS
+    If avkEventLive[i] <> 0 And avkEventDev[i] = d : avkEventLive[i] = 0 : avkEventSet[i] = 0 : EndIf
+    i = i + 1
+  Wend
   q = 1
   While q <= #ANVIL_VK_MAX_QUEUES
     If avkQueueLive[q] <> 0 And avkQueueDev[q] = d : avkQueueLive[q] = 0 : EndIf

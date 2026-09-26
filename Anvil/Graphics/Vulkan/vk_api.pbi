@@ -771,6 +771,45 @@ Procedure vkDestroySemaphore(device.i, semaphore.i, *pAllocator)
   EndIf
 EndProcedure
 
+Procedure.i vkCreateEvent(device.i, *pCreateInfo.VkEventCreateInfo, *pAllocator, *pEvent)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pEvent = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  rc = avkNoAllocator(*pAllocator, 13)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_EVENT_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateEvent needs VK_STRUCTURE_TYPE_EVENT_CREATE_INFO (Anvil code -20001, wrong sType); no event was created.")
+  EndIf
+  rc = avkNoPNext(*pCreateInfo\pNext)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\flags <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateEvent was given event flags (Anvil code -20005, unsupported flags); pass zero for a host-visible event.")
+  EndIf
+  ProcedureReturn AnvilVkEventCreate(device, *pEvent)
+EndProcedure
+
+Procedure vkDestroyEvent(device.i, event.i, *pAllocator)
+  Define rc.i
+  If avkNoAllocator(*pAllocator, 14) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  rc = AnvilVkEventDestroy(device, event)
+  If rc <> #VK_SUCCESS
+    avkFault(rc, "vkDestroyEvent was given a stale, foreign or wrong-device VkEvent (Anvil code -20002, invalid handle); nothing was destroyed.")
+  EndIf
+EndProcedure
+
+Procedure.i vkGetEventStatus(device.i, event.i)
+  ProcedureReturn AnvilVkEventState(device, event, 0)
+EndProcedure
+
+Procedure.i vkSetEvent(device.i, event.i)
+  ProcedureReturn AnvilVkEventState(device, event, 1)
+EndProcedure
+
+Procedure.i vkResetEvent(device.i, event.i)
+  ProcedureReturn AnvilVkEventState(device, event, 2)
+EndProcedure
+
 Procedure.i vkCreateFence(device.i, *pCreateInfo.VkFenceCreateInfo, *pAllocator, *pFence)
   Define rc.i
   If *pCreateInfo = 0 Or *pFence = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
