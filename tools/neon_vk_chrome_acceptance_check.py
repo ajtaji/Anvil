@@ -27,6 +27,7 @@ ADAPTER = ROOT / "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/neon_vk_chrome_acceptance_gate.pi4"
 HOOK_GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/neon_draw_backend_hook_gate.pi4"
 GEOMETRY_GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/neon_vk_chrome_geometry_gate.pi4"
+BOX_BATCH_GATE = ROOT / "Anvil/Graphics/Vulkan/Tests/neon_vk_chrome_box_batch_gate.pi4"
 REAL_SCENE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"
 NEON = ROOT / "RaspberryPi4/Lib/neon.pi4"
 DEFAULT_COMPILER = Path(r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe")
@@ -39,6 +40,7 @@ STEP_LIMIT = 2_000_000
 HOOK_STEP_LIMIT = 6_000_000
 HOOK_ASSERTIONS = 48
 GEOMETRY_ASSERTIONS = 45
+BOX_BATCH_ASSERTIONS = 19
 
 HOOK_LIBS = (
     "uart.pi4", "timer.pi4", "safety.pi4", "mailbox.pi4", "display.pi4",
@@ -53,6 +55,8 @@ API_NAMES = (
     "NeonVkChromeCreateWithCapacities",
     "NeonVkChromeBegin",
     "NeonVkChromeBox",
+    "NeonVkChromeBoxBatchBegin",
+    "NeonVkChromeBoxBatchEnd",
     "NeonVkChromeText",
     "NeonVkChromeTextTex",
     "NeonVkChromeFanBegin",
@@ -191,6 +195,16 @@ def build_geometry_gate(compiler: Path, work: Path, adapter_text: str) -> Path:
     )
     production = "\n\n".join(procedure_body(adapter_text, name) for name in names)
     return build(compiler, work, "geometry", source.replace(marker, production))
+
+
+def build_box_batch_gate(compiler: Path, work: Path, adapter_text: str) -> Path:
+    source = BOX_BATCH_GATE.read_text(encoding="utf-8-sig")
+    marker = "; @PRODUCTION_BOX_BATCH@"
+    if source.count(marker) != 1:
+        raise AssertionError("production box batch injection marker drifted")
+    names = ("NeonVkChromeBox", "NeonVkChromeBoxBatchBegin", "NeonVkChromeBoxBatchEnd")
+    production = "\n\n".join(procedure_body(adapter_text, name) for name in names)
+    return build(compiler, work, "box-batch", source.replace(marker, production))
 
 
 def symbol_bounds(path: Path) -> tuple[int, int]:
@@ -405,6 +419,13 @@ def source_gate(text: str) -> int:
     if "Neon_AtlasRasterGlyphUV(" not in glyph:
         raise AssertionError("text path does not consume the copied Neon glyph UV contract")
     checks += 1
+    batch_begin = bodies["NeonVkChromeBoxBatchBegin"]
+    batch_end = bodies["NeonVkChromeBoxBatchEnd"]
+    if "nvcBoxBatchActive = 1" not in batch_begin or "nvcBoxBatchCount = nvcBoxBatchCount + 6" not in box:
+        raise AssertionError("box batch does not retain consecutive geometry")
+    if "nvcDraw(first, count, colour)" not in batch_end or "nvcBoxBatchActive <> 0" not in bodies["NeonVkChromeEnd"]:
+        raise AssertionError("box batch is not flushed explicitly before frame end")
+    checks += 2
     textured = bodies["NeonVkChromeTextTex"]
     for marker in ("Neon_A(colour)", "Neon_AtlasRasterGeneration()", "glyphCount * 6", "Neon_AtlasRasterGlyphUV(", "nvcDraw(first, count, colour)"):
         if marker not in textured:
@@ -601,6 +622,15 @@ def run_geometry_gate(compiler: Path, a64, adapter_text: str) -> int:
     return steps
 
 
+def run_box_batch_gate(compiler: Path, a64, adapter_text: str) -> int:
+    with tempfile.TemporaryDirectory(prefix="anvil-neon-vk-box-batch-") as temporary:
+        image = build_box_batch_gate(compiler, Path(temporary), adapter_text)
+        result, steps = execute(a64, image, HOOK_STEP_LIMIT)
+        if result:
+            raise AssertionError(f"production box batch gate failed assertion {result} after {steps:,} instructions")
+    return steps
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
@@ -627,6 +657,7 @@ def main() -> int:
             return 2
         checks = source_gate(adapter_text)
         geometry_steps = run_geometry_gate(compiler, a64, adapter_text)
+        box_batch_steps = run_box_batch_gate(compiler, a64, adapter_text)
         scene_checks = 0
         if REAL_SCENE.is_file():
             scene_checks = real_scene_gate(REAL_SCENE.read_text(encoding="utf-8-sig"))
@@ -636,6 +667,7 @@ def main() -> int:
     print(f"neon_vk_chrome_acceptance_check: PASS - {checks} adapter checks and 27 emitted invariants")
     print(f"  Neon hook: {hook_checks} source checks, {HOOK_ASSERTIONS} emitted assertions in {hook_steps:,} A64 instructions")
     print(f"  Production geometry: {GEOMETRY_ASSERTIONS} emitted assertions in {geometry_steps:,} A64 instructions")
+    print(f"  Box batching: {BOX_BATCH_ASSERTIONS} emitted assertions in {box_batch_steps:,} A64 instructions")
     print(f"  Oracle: {steps:,} baseline A64 instructions; {mutants} hostile traces rejected in {mutant_steps:,}")
     if scene_checks:
         print(f"  Real widget scene: {scene_checks} display-owner presentation checks")
