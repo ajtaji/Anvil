@@ -27,8 +27,11 @@ Procedure.i Main()
   Define physical.i
   Define device.i
   Define queue.i
+  Define image.i
   Define count.l
   Define propertySentinel.l
+  Define subresource.VkImageSubresource
+  Define layout.VkSubresourceLayout
 
   AnvilVkTestBackendHeap($07000000, $00100000)
   Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
@@ -68,6 +71,24 @@ Procedure.i Main()
   Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceExtensionProperties") = 0)
   Vkd(vkGetDeviceProcAddr(device, "vkEnumerateDeviceLayerProperties") = 0)
   Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
+
+  Vkd(AnvilVkImageCreate(device, 3, 2, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, #VK_IMAGE_LAYOUT_UNDEFINED, @image) = #VK_SUCCESS)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
+  subresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  subresource\mipLevel = 0 : subresource\arrayLayer = 0
+  layout\size = 77
+  vkGetImageSubresourceLayout(device, image, @subresource, @layout)
+  Vkd(layout\offset = 0 And layout\size = AnvilVkImageSize(image))
+  Vkd(layout\rowPitch = AnvilVkImageRowPitch(image) And layout\rowPitch >= 12)
+  Vkd(layout\arrayPitch = 0 And layout\depthPitch = 0)
+  layout\size = 77 : subresource\mipLevel = 1
+  vkGetImageSubresourceLayout(device, image, @subresource, @layout)
+  Vkd(layout\size = 77)
+  subresource\mipLevel = 0
+  vkGetImageSubresourceLayout($12345678, image, @subresource, @layout)
+  Vkd(layout\size = 77)
+  AnvilVkImageDestroy(device, image)
 
   ; Empty discovery is a real zero-count query, including supplied output
   ; storage; invalid layer and physical-device requests preserve the outputs.

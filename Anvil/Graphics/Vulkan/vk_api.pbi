@@ -463,6 +463,35 @@ Procedure vkGetImageMemoryRequirements(device.i, image.i, *pMemoryRequirements.V
   *pMemoryRequirements\memoryTypeBits = avkImageMemoryTypeBits()
 EndProcedure
 
+Procedure vkGetImageSubresourceLayout(device.i, image.i, *pSubresource.VkImageSubresource, *pLayout.VkSubresourceLayout)
+  Define d.i
+  Define s.i
+  If *pSubresource = 0 Or *pLayout = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkGetImageSubresourceLayout needs both pSubresource and pLayout (Anvil code -20001, null pointer); the layout was not written.")
+    ProcedureReturn
+  EndIf
+  d = avkDevSlot(device)
+  s = avkImgSlot(image)
+  If d = 0 Or s = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetImageSubresourceLayout was given a device or image handle that is not live (Anvil code -20002, stale or foreign handle); the layout was left untouched.")
+    ProcedureReturn
+  EndIf
+  If avkImgDev[s] <> d
+    avkFault(#ANVIL_VK_ERR_OWNER, "vkGetImageSubresourceLayout was given a device that does not own the image (Anvil code -20003, wrong parent); the layout was left untouched.")
+    ProcedureReturn
+  EndIf
+  If avkImgTiling[s] <> #VK_IMAGE_TILING_LINEAR Or *pSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *pSubresource\mipLevel <> 0 Or *pSubresource\arrayLayer <> 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkGetImageSubresourceLayout only accepts the color aspect, mip zero and layer zero of a linear image (Anvil code -20001, invalid subresource); the layout was left untouched.")
+    ProcedureReturn
+  EndIf
+  *pLayout\offset = 0
+  *pLayout\size = avkImgSize[s]
+  *pLayout\rowPitch = avkImgPitch[s]
+  ; These pitches are undefined for a non-array, non-3D image.
+  *pLayout\arrayPitch = 0
+  *pLayout\depthPitch = 0
+EndProcedure
+
 Procedure.i vkBindImageMemory(device.i, image.i, memory.i, memoryOffset.i)
   ProcedureReturn AnvilVkImageBindMemory(device, image, memory, memoryOffset)
 EndProcedure
