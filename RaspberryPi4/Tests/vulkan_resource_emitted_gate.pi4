@@ -60,6 +60,7 @@ Procedure Sentence()
 EndProcedure
 
 Global Dim vkrColor.l[4]
+Global Dim vkrCopyRegions.a[64]
 
 Procedure SetColor(r.i, g.i, b.i, a.i)
   PokeL(@vkrColor[0] + 0, r)
@@ -116,6 +117,8 @@ Procedure.i Main()
   Define copyDst.i
   Define copySrcMem.i
   Define copyDstMem.i
+  Define copyLate.i
+  Define copyLateMem.i
   Define copySrcPtr.i
   Define copyDstPtr.i
 
@@ -809,7 +812,7 @@ Procedure.i Main()
   copyBufferInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
   copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
   Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copySrc) = #VK_SUCCESS)
-  copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
   Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copyDst) = #VK_SUCCESS)
   vkGetBufferMemoryRequirements(dev, copySrc, @req)
   mai\allocationSize = req\size
@@ -849,20 +852,87 @@ Procedure.i Main()
   Wend
   vkUnmapMemory(dev, copyDstMem)
 
-  ; Two recorded transfers exceed the current one-job backend. Submission
-  ; refuses before copying either one, leaving the first destination byte.
+  ; Two disjoint regions in one public call copy exact, separate byte spans.
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  i = 0
+  While i < 32
+    PokeA(copyDstPtr + i, $A5)
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyDstMem)
+  PokeI(@vkrCopyRegions[0] + 0, 0)
+  PokeI(@vkrCopyRegions[0] + 8, 0)
+  PokeI(@vkrCopyRegions[0] + 16, 4)
+  PokeI(@vkrCopyRegions[0] + 24, 8)
+  PokeI(@vkrCopyRegions[0] + 32, 16)
+  PokeI(@vkrCopyRegions[0] + 40, 8)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 2, @vkrCopyRegions[0])
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  i = 0
+  While i < 32
+    If i < 4
+      Vkr(PeekA(copyDstPtr + i) = i + 31)
+    ElseIf i >= 16 And i < 24
+      Vkr(PeekA(copyDstPtr + i) = i + 23)
+    Else
+      Vkr(PeekA(copyDstPtr + i) = $A5)
+    EndIf
+    i = i + 1
+  Wend
+  vkUnmapMemory(dev, copyDstMem)
+
+  ; Destination ranges in a single call must not overlap. A rejected array
+  ; leaves the command buffer invalid without appending its first region.
+  PokeI(@vkrCopyRegions[0] + 32, 2)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 2, @vkrCopyRegions[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(avkCbOpHead[avkCmdSlot(cmd)] = 0)
+  PokeI(@vkrCopyRegions[0] + 32, 16)
+
+  ; A source in region two may not read a destination from region one.
+  PokeI(@vkrCopyRegions[0] + 8, 16)
+  PokeI(@vkrCopyRegions[0] + 24, 16)
+  PokeI(@vkrCopyRegions[0] + 32, 24)
+  PokeI(@vkrCopyRegions[0] + 40, 4)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copySrc, 2, @vkrCopyRegions[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+
+  ; Separate commands execute in order. The second copies bytes that the
+  ; first just wrote, without a stale host pointer surviving recording.
+  copyRegion\srcOffset = 4
+  copyRegion\dstOffset = 8
+  copyRegion\size = 16
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
   PokeA(copyDstPtr + 8, $E7)
   vkUnmapMemory(dev, copyDstMem)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
-  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  copyRegion\srcOffset = 8
+  copyRegion\dstOffset = 24
+  copyRegion\size = 8
+  vkCmdCopyBuffer(cmd, copyDst, copyDst, 1, @copyRegion)
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
-  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
-  Vkr(PeekA(copyDstPtr + 8) = $E7)
+  Vkr(PeekA(copyDstPtr + 8) = 35)
+  i = 24
+  While i < 32
+    Vkr(PeekA(copyDstPtr + i) = i + 11)
+    i = i + 1
+  Wend
   vkUnmapMemory(dev, copyDstMem)
+  copyRegion\srcOffset = 4
+  copyRegion\dstOffset = 8
+  copyRegion\size = 16
 
   ; Vulkan forbids a source and destination region that touch the same
   ; bytes, even when both usage bits are present on one buffer.
@@ -870,6 +940,29 @@ Procedure.i Main()
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   vkCmdCopyBuffer(cmd, copySrc, copySrc, 1, @copyRegion)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A later stale region prevents an earlier valid copy from executing.
+  ; Preflight covers the complete command stream before the first write.
+  copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  Vkr(vkCreateBuffer(dev, @copyBufferInfo, 0, @copyLate) = #VK_SUCCESS)
+  vkGetBufferMemoryRequirements(dev, copyLate, @req)
+  mai\allocationSize = req\size
+  Vkr(vkAllocateMemory(dev, @mai, 0, @copyLateMem) = #VK_SUCCESS)
+  Vkr(vkBindBufferMemory(dev, copyLate, copyLateMem, 0) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  PokeA(copyDstPtr + 8, $E7)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  vkCmdCopyBuffer(cmd, copySrc, copyLate, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  vkDestroyBuffer(dev, copyLate, 0)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekA(copyDstPtr + 8) = $E7)
+  vkUnmapMemory(dev, copyDstMem)
+  vkFreeMemory(dev, copyLateMem, 0)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; The recorded destination handle must not silently revive after destroy.

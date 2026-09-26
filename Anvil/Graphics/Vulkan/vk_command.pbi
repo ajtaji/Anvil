@@ -24,7 +24,7 @@
 ; No implementation source was consulted or translated.
 ;
 ; WHAT IS NOT HERE, and is refused with a real code and a sentence:
-; secondary execution, multi-region buffer copies, blits, dispatches,
+; secondary execution, blits, dispatches,
 ; render passes, queries, events, timeline semaphores, memory and buffer
 ; barriers, multi-range clears, partial-rectangle clears, depth and
 ; stencil clears, and more than one outstanding submission.
@@ -378,14 +378,25 @@ Procedure avkOpsRelease(c.i)
   avkCbOpTail[c] = 0
 EndProcedure
 
-; One VkBufferCopy is copied into the command stream. Buffer handles remain
-; generation-tagged until submission, which rechecks both bindings and ranges.
-Procedure AnvilVkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, *r.VkBufferCopy)
+; A complete VkBufferCopy array is validated before any region is appended.
+; All source regions must be disjoint from every destination region, and
+; destination regions must be mutually disjoint within this one Vulkan call.
+; Separate commands remain ordered and may use an earlier command's output.
+Procedure AnvilVkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, regionCount.i, *regions.VkBufferCopy)
   Define c.i
   Define d.i
   Define o.i
+  Define i.i
+  Define j.i
+  Define freeOps.i
+  Define sourceBase.i
+  Define destinationBase.i
   Define source.i
   Define destination.i
+  Define priorSource.i
+  Define priorDestination.i
+  Define *r.VkBufferCopy
+  Define *prior.VkBufferCopy
   c = avkCmdSlot(commandBuffer)
   If c = 0
     ProcedureReturn
@@ -394,29 +405,74 @@ Procedure AnvilVkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, *r.VkB
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
     ProcedureReturn
   EndIf
-  If *r\size < 1 Or *r\srcOffset < 0 Or *r\dstOffset < 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer requires positive size and non-negative offsets (Anvil code -20001, invalid VkBufferCopy); correct the region before recording.")
+  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyBuffer has more regions than the command pool can retain (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); split the transfer across command buffers.")
+    ProcedureReturn
+  EndIf
+  freeOps = 0
+  o = 1
+  While o <= #ANVIL_VK_MAX_OPS
+    If avkOpLive[o] = 0 : freeOps = freeOps + 1 : EndIf
+    o = o + 1
+  Wend
+  If freeOps < regionCount
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyBuffer cannot retain every region in the shared command pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset unused command buffers.")
     ProcedureReturn
   EndIf
   d = avkPoolDev[avkCmdPool[c]]
-  If avkTransferBufferResolve(srcBuffer, d, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, *r\srcOffset, *r\size, @source) = 0 Or avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, *r\dstOffset, *r\size, @destination) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBuffer needs live, bound, same-device buffers with transfer source and destination usage covering the complete region (Anvil code -20004, invalid buffer); repair the bindings or range.")
-    ProcedureReturn
-  EndIf
-  If source < destination + *r\size And destination < source + *r\size
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer source and destination memory ranges overlap (Anvil code -20001, overlapping copy); use disjoint ranges as Vulkan requires.")
-    ProcedureReturn
-  EndIf
-  o = avkOpAppend(c, #ANVIL_VK_OP_COPY_BUFFER)
-  If o = 0
-    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool ran out of recorded-command storage for vkCmdCopyBuffer (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset unused command buffers.")
-    ProcedureReturn
-  EndIf
-  avkOpBuffer[o] = srcBuffer
-  avkOpBufferOffset[o] = *r\srcOffset
-  avkOpDstBuffer[o] = dstBuffer
-  avkOpDstOffset[o] = *r\dstOffset
-  avkOpSourceBytes[o] = *r\size
+  sourceBase = AnvilVkBufferAddress(srcBuffer)
+  destinationBase = AnvilVkBufferAddress(dstBuffer)
+  i = 0
+  While i < regionCount
+    *r = *regions + (i * SizeOf(VkBufferCopy))
+    If *r\size < 1 Or *r\srcOffset < 0 Or *r\dstOffset < 0
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer requires positive sizes and non-negative offsets (Anvil code -20001, invalid VkBufferCopy); correct every region before recording.")
+      ProcedureReturn
+    EndIf
+    If avkTransferBufferResolve(srcBuffer, d, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, *r\srcOffset, *r\size, @source) = 0 Or avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, *r\dstOffset, *r\size, @destination) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBuffer needs live, bound, same-device transfer buffers covering every region (Anvil code -20004, invalid buffer); repair the bindings or ranges.")
+      ProcedureReturn
+    EndIf
+    If source < destination + *r\size And destination < source + *r\size
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer source and destination memory ranges overlap (Anvil code -20001, overlapping copy); use disjoint regions as Vulkan requires.")
+      ProcedureReturn
+    EndIf
+    j = 0
+    While j < i
+      *prior = *regions + (j * SizeOf(VkBufferCopy))
+      priorSource = sourceBase + *prior\srcOffset
+      priorDestination = destinationBase + *prior\dstOffset
+      If source < priorDestination + *prior\size And priorDestination < source + *r\size
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer has a source region overlapping an earlier destination region (Anvil code -20001, overlapping copy); every source and destination region in one call must be disjoint.")
+        ProcedureReturn
+      EndIf
+      If destination < priorSource + *prior\size And priorSource < destination + *r\size
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer has a destination region overlapping an earlier source region (Anvil code -20001, overlapping copy); every source and destination region in one call must be disjoint.")
+        ProcedureReturn
+      EndIf
+      If destination < priorDestination + *prior\size And priorDestination < destination + *r\size
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBuffer has two overlapping destination regions (Anvil code -20001, overlapping destinations); each destination byte may be written only once in one call.")
+        ProcedureReturn
+      EndIf
+      j = j + 1
+    Wend
+    i = i + 1
+  Wend
+  i = 0
+  While i < regionCount
+    *r = *regions + (i * SizeOf(VkBufferCopy))
+    o = avkOpAppend(c, #ANVIL_VK_OP_COPY_BUFFER)
+    If o = 0
+      avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool ran out of recorded-command storage while appending vkCmdCopyBuffer (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset the invalid command buffer.")
+      ProcedureReturn
+    EndIf
+    avkOpBuffer[o] = srcBuffer
+    avkOpBufferOffset[o] = *r\srcOffset
+    avkOpDstBuffer[o] = dstBuffer
+    avkOpDstOffset[o] = *r\dstOffset
+    avkOpSourceBytes[o] = *r\size
+    i = i + 1
+  Wend
 EndProcedure
 
 ; Exact bounded vkCmdCopyBufferToImage semantics: one tightly packed whole
@@ -1205,7 +1261,6 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   Define copies.i
   Define copyOp.i
   Define bufferCopies.i
-  Define bufferCopyOp.i
   Define colour.i
   Define target.i
   Define sourceBase.i
@@ -1287,7 +1342,6 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   copies = 0
   copyOp = 0
   bufferCopies = 0
-  bufferCopyOp = 0
   colour = 0
   target = 0
   o = avkCbOpHead[c]
@@ -1302,7 +1356,6 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
       bufferCopies = bufferCopies + 1
-      bufferCopyOp = o
     EndIf
     o = avkOpNext[o]
   Wend
@@ -1311,9 +1364,6 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   EndIf
   If copies > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one buffer-to-image copy (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This bounded backend transaction executes exactly one complete TFU transfer.")
-  EndIf
-  If bufferCopies > 1
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given more than one vkCmdCopyBuffer operation (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); this backend executes one buffer transfer per submission.")
   EndIf
   ; A command buffer is either a transfer or a render pass, never both.
   ; The backend seam carries ONE job, and running the clear and throwing
@@ -1350,13 +1400,19 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer-to-image copy no longer resolves to a complete optimal-image backend plan (Anvil code -20004, invalid destination resource); nothing was submitted.")
     EndIf
   EndIf
-  If bufferCopies = 1
-    If avkTransferBufferResolve(avkOpBuffer[bufferCopyOp], d, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, avkOpBufferOffset[bufferCopyOp], avkOpSourceBytes[bufferCopyOp], @sourceBase) = 0 Or avkTransferBufferResolve(avkOpDstBuffer[bufferCopyOp], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpDstOffset[bufferCopyOp], avkOpSourceBytes[bufferCopyOp], @destinationBase) = 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer copy now names a stale, unbound or wrong-device buffer or range (Anvil code -20004, stale resource); re-record with live transfer buffers.")
-    EndIf
-    If sourceBase < destinationBase + avkOpSourceBytes[bufferCopyOp] And destinationBase < sourceBase + avkOpSourceBytes[bufferCopyOp]
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping source and destination memory for vkCmdCopyBuffer (Anvil code -20001, overlapping copy); use disjoint ranges.")
-    EndIf
+  If bufferCopies > 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, avkOpBufferOffset[o], avkOpSourceBytes[o], @sourceBase) = 0 Or avkTransferBufferResolve(avkOpDstBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpDstOffset[o], avkOpSourceBytes[o], @destinationBase) = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer copy now names a stale, unbound or wrong-device buffer or range (Anvil code -20004, stale resource); no copy was submitted.")
+        EndIf
+        If sourceBase < destinationBase + avkOpSourceBytes[o] And destinationBase < sourceBase + avkOpSourceBytes[o]
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping source and destination memory for vkCmdCopyBuffer (Anvil code -20001, overlapping copy); no copy was submitted.")
+        EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
   EndIf
   f = 0
   If fence <> #VK_NULL_HANDLE
@@ -1419,13 +1475,21 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn #VK_SUCCESS
   EndIf
 
-  If bufferCopies = 1
-    job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, avkOpSourceBytes[bufferCopyOp])
-    If job < 0
-      avkFlightComplete(0)
-      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to execute vkCmdCopyBuffer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
-    EndIf
-    If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
+  If bufferCopies > 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER
+        sourceBase = AnvilVkBufferAddress(avkOpBuffer[o]) + avkOpBufferOffset[o]
+        destinationBase = AnvilVkBufferAddress(avkOpDstBuffer[o]) + avkOpDstOffset[o]
+        job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, avkOpSourceBytes[o])
+        If job <> #ANVIL_VK_JOB_DONE
+          avkFlightComplete(0)
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdCopyBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+        EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
+    avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf
   If clears = 0
