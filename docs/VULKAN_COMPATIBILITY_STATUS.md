@@ -138,6 +138,13 @@ payload used a 15-second deadman, produced fresh capture 23, restored the
 `docs/evidence/vulkan-paired-rotations-20260926/`. Twelve of the 15 native
 scenes are paired; scenes 0, 13 and 14 remain.
 
+Scene 0's clear-only render pass now matches the native 64x64 frame across
+all 16,384 bytes on a separate exact-size Vulkan target. The returning Pi 4
+RAM payload produced fresh capture 24 under the 15-second deadman and
+restored the widget frame; the board was released cleanly. See
+`docs/evidence/vulkan-paired-clear-20260926/`. Thirteen native scenes are
+paired; the stress-capacity scene 13 and rebind/error scene 14 remain.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
