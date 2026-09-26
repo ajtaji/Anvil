@@ -125,8 +125,18 @@ view and framebuffer, rebound the adapter to that exact target, then restored
 the 800x1280 widget target. Its render-area, viewport and framebuffer extent
 therefore matched the native target. The RAM payload returned under the
 15-second deadman with fresh capture 22, and the board was released cleanly.
-See `docs/evidence/vulkan-paired-edges-20260926/`. Eight native scenes
-are paired; seven scenes and other target extents and rotations remain.
+See `docs/evidence/vulkan-paired-edges-20260926/`. This brought the paired
+count to eight before the rotated targets below.
+
+Native oracle scenes 9..12 now match on Pi 4 too. Each has a 63x47 logical
+target; the adapter used separate exact-size images and framebuffers for
+physical extents 63x47 or 47x63 at rotations 0, 90, 180 and 270 degrees.
+All four complete 16,384-byte scene buffers, including the native A5 guard
+area outside the active rows, matched byte-for-byte. The returning RAM
+payload used a 15-second deadman, produced fresh capture 23, restored the
+800x1280 widget frame, and left the board free with no core leases. Evidence:
+`docs/evidence/vulkan-paired-rotations-20260926/`. Twelve of the 15 native
+scenes are paired; scenes 0, 13 and 14 remain.
 
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
