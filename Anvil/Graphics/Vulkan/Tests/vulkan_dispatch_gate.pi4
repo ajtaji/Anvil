@@ -15,6 +15,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
 
 Global vkdChecks.i = 0
 Global vkdFails.i = 0
+Global Dim vkdSparseSentinel.a[128]
 
 Procedure Vkd(ok.i)
   PokeN(#VKD_ROWS + vkdChecks * 8, ok)
@@ -76,6 +77,20 @@ Procedure.i Main()
   Vkd(vkGetDeviceProcAddr(device, "vkEnumeratePhysicalDevices") = 0)
 
   Vkd(AnvilVkImageCreate(device, 3, 2, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, #VK_IMAGE_LAYOUT_UNDEFINED, @image) = #VK_SUCCESS)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetImageSparseMemoryRequirements") = @vkGetImageSparseMemoryRequirements)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetImageSparseMemoryRequirements") = @vkGetImageSparseMemoryRequirements)
+  count = 1 : vkdSparseSentinel[0] = 99
+  vkGetImageSparseMemoryRequirements(device, image, @count, @vkdSparseSentinel[0])
+  Vkd(count = 0 And vkdSparseSentinel[0] = 99)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, image, @count, 0)
+  Vkd(count = 0)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, $12345678, @count, @vkdSparseSentinel[0])
+  Vkd(count = 77 And vkdSparseSentinel[0] = 99)
+  count = 77
+  vkGetImageSparseMemoryRequirements(device, image, 0, @vkdSparseSentinel[0])
+  Vkd(count = 77 And vkdSparseSentinel[0] = 99)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
   Vkd(vkGetDeviceProcAddr(device, "vkGetImageSubresourceLayout") = @vkGetImageSubresourceLayout)
   subresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
