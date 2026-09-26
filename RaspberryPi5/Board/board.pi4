@@ -1,0 +1,360 @@
+; ======================================================================
+;  board.pi4 - THE RASPBERRY PI 5 COMPILE TARGET, first composition.
+;
+;      PureMetalForge --compile RaspberryPi5/Board/board.pi4 -t pi4 -o ANVIL5.IMG
+;
+;  The Pi 5 hardware layer under Anvil's shared code, first milestone:
+;  boot at EL3 through RaspberryPi5/Board/armstub8-2712.asm, then put a
+;  picture on the HDMI monitor with Anvil's own logo and glyphs, and say
+;  the same on the serial console. The compiler has no pi5 target yet;
+;  -t pi4 selects the A64 emitter and nothing Pi 4 specific is included.
+;
+;  WHAT IS PI 5 HERE, every address from the pinned sources in the vault
+;  (Raspberry Pi 5/Sources, Boot staging DTBs):
+;    * VideoCore mailbox: /soc@107c000000/mailbox@7c013880, soc ranges
+;      0 -> $10_00000000, so $107C013880. Read +$00, status +$18, write
+;      +$20, write status +$38, as on every bcm2835-mbox.
+;    * The mailbox takes ARM physical addresses: /soc has no dma-ranges
+;      and the firmware node's are empty (identity). The Pi 4's $C0000000
+;      bus alias does NOT apply. The framebuffer address the firmware
+;      returns is printed raw and stripped of the $C0000000 alias only if
+;      it carries one - the one unmeasured rule here, kept visible.
+;    * Serial: RP1 UART0 at $1F00030000 (header pins 8/10, the bench
+;      wiring) and UART10 at $107D001000 (debug connector). The EL3 stub
+;      programs both at 115200 8N1; this file only writes them.
+;    * Memory: atf@0 reserves $0..$80000 for the stub. The image is at
+;      $200000, the mailbox buffer at $F00000, BSS at $1000000.
+;
+;  MMU and caches are off at entry, so the mailbox buffer and the
+;  framebuffer need no cache maintenance in this milestone.
+; ======================================================================
+LoadAddress  $200000
+BssAddress   $1000000
+StackAddress $8000000
+
+XIncludeFile "Anvil/Graphics/text_glyph.pbi"
+XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
+
+#P5_UART0      = $1F00030000   ; RP1 UART0, 40-pin header pins 8/10
+#P5_UART10     = $107D001000   ; debug connector
+#P5_MBOX       = $107C013880
+#P5_MBOX_BUF   = $F00000
+#P5_SPIN_LIMIT = 2000000
+
+Global gP5Dtb.q
+Global gP5El.q
+Global gP5Fb.q
+Global gP5FbRaw.q
+Global gP5Width.q
+Global gP5Height.q
+Global gP5Pitch.q
+Global gP5Order.q
+Global gP5Col.q
+Global gP5Row.q
+
+; ----------------------------------------------------------------------
+;  Serial. Bounded waits: a UART that never drains costs time, not the
+;  boot.
+; ----------------------------------------------------------------------
+Procedure P5UartByte(base.q, value.l)
+  Define spins.l = 0
+  While (PeekL(base + $18) & $20) <> 0
+    spins = spins + 1
+    If spins = 1000000
+      ProcedureReturn
+    EndIf
+  Wend
+  PokeL(base, value)
+EndProcedure
+
+Procedure P5SerialByte(value.l)
+  P5UartByte(#P5_UART0, value)
+  P5UartByte(#P5_UART10, value)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The screen: Anvil's shared 4x7 glyphs at x3, a 15 x 24 cell, as the
+;  Pi 3 framebuffer draws them.
+; ----------------------------------------------------------------------
+Procedure.l P5Pack(r.l, g.l, b.l)
+  ; Pixel order from the firmware's reply: 1 = RGB, 0 = BGR.
+  If gP5Order = 1
+    ProcedureReturn r | (g << 8) | (b << 16)
+  EndIf
+  ProcedureReturn b | (g << 8) | (r << 16)
+EndProcedure
+
+Procedure P5Pixel(x.q, y.q, colour.l)
+  If gP5Fb = 0 Or x < 0 Or y < 0 Or x >= gP5Width Or y >= gP5Height
+    ProcedureReturn
+  EndIf
+  PokeL(gP5Fb + y * gP5Pitch + x * 4, colour)
+EndProcedure
+
+Procedure P5Fill(x0.q, y0.q, w.q, h.q, colour.l)
+  Define x.q
+  Define y.q
+  For y = y0 To y0 + h - 1
+    For x = x0 To x0 + w - 1
+      P5Pixel(x, y, colour)
+    Next
+  Next
+EndProcedure
+
+Procedure P5Glyph(code.l, x.q, y.q, colour.l)
+  Define glyph.q = AnvilTextGlyph(code)
+  Define row.q
+  Define col.q
+  Define sx.q
+  Define sy.q
+  For row = 0 To 6
+    For col = 0 To 3
+      If (glyph & (1 << ((6 - row) * 4 + 3 - col))) <> 0
+        For sy = 0 To 2
+          For sx = 0 To 2
+            P5Pixel(x + col * 3 + sx, y + row * 3 + sy, colour)
+          Next
+        Next
+      EndIf
+    Next
+  Next
+EndProcedure
+
+; The logo is 76 x 74 R,G,B bytes, drawn at x2.
+Procedure P5Logo(x0.q, y0.q)
+  Define x.q
+  Define y.q
+  Define at.q
+  Define colour.l
+  For y = 0 To #ANVIL_PIC_H - 1
+    For x = 0 To #ANVIL_PIC_W - 1
+      at = ?anvilPix + (y * #ANVIL_PIC_W + x) * 3
+      colour = P5Pack(PeekA(at), PeekA(at + 1), PeekA(at + 2))
+      P5Pixel(x0 + x * 2, y0 + y * 2, colour)
+      P5Pixel(x0 + x * 2 + 1, y0 + y * 2, colour)
+      P5Pixel(x0 + x * 2, y0 + y * 2 + 1, colour)
+      P5Pixel(x0 + x * 2 + 1, y0 + y * 2 + 1, colour)
+    Next
+  Next
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The console: every character to both UARTs and, once there is one,
+;  to the screen below the banner.
+; ----------------------------------------------------------------------
+Procedure P5Char(code.l)
+  P5SerialByte(code)
+  If gP5Fb = 0 Or code = 13
+    ProcedureReturn
+  EndIf
+  If code = 10
+    gP5Col = 0
+    gP5Row = gP5Row + 1
+    ProcedureReturn
+  EndIf
+  P5Glyph(code, 60 + gP5Col * 15, 220 + gP5Row * 30, P5Pack(240, 224, 192))
+  gP5Col = gP5Col + 1
+EndProcedure
+
+Procedure P5Text(text.q)
+  Define n.q
+  Define code.l
+  For n = 0 To 255
+    code = PeekA(text + n)
+    If code = 0
+      ProcedureReturn
+    EndIf
+    P5Char(code)
+  Next
+EndProcedure
+
+Procedure P5Newline()
+  P5Char(13)
+  P5Char(10)
+EndProcedure
+
+Procedure P5Hex(value.q)
+  Define shift.q
+  Define digit.l
+  For shift = 60 To 0 Step -4
+    digit = (value >> shift) & $F
+    If digit < 10
+      P5Char(48 + digit)
+    Else
+      P5Char(55 + digit)
+    EndIf
+  Next
+EndProcedure
+
+Procedure P5Dec(value.q)
+  Define div.q = 1000000000
+  Define started.l = 0
+  Define digit.l
+  If value = 0
+    P5Char(48)
+    ProcedureReturn
+  EndIf
+  While div > 0
+    digit = (value / div) % 10
+    If digit <> 0 Or started = 1
+      P5Char(48 + digit)
+      started = 1
+    EndIf
+    div = div / 10
+  Wend
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The mailbox, property channel 8. Returns 1 when the firmware answered
+;  on channel 8 and the response code has bit 31 set.
+; ----------------------------------------------------------------------
+Procedure.l P5MailboxCall(buffer.q)
+  Define spins.l = 0
+  Define reply.l
+  While (PeekL(#P5_MBOX + $38) & $80000000) <> 0   ; write side FULL
+    spins = spins + 1
+    If spins = #P5_SPIN_LIMIT
+      ProcedureReturn 0
+    EndIf
+  Wend
+  PokeL(#P5_MBOX + $20, (buffer & $FFFFFFF0) | 8)
+  Repeat
+    spins = 0
+    While (PeekL(#P5_MBOX + $18) & $40000000) <> 0  ; read side EMPTY
+      spins = spins + 1
+      If spins = #P5_SPIN_LIMIT
+        ProcedureReturn 0
+      EndIf
+    Wend
+    reply = PeekL(#P5_MBOX)
+  Until (reply & $F) = 8
+  If (PeekL(buffer + 4) & $80000000) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure P5Put(index.q, value.l)
+  PokeL(#P5_MBOX_BUF + index * 4, value)
+EndProcedure
+
+Procedure.l P5Get(index.q)
+  ProcedureReturn PeekL(#P5_MBOX_BUF + index * 4)
+EndProcedure
+
+; The display's native size (GET_PHYSICAL $40003); 1920 x 1080 when the
+; firmware reports none.
+Procedure P5DisplaySize()
+  P5Put(0, 32) : P5Put(1, 0)
+  P5Put(2, $40003) : P5Put(3, 8) : P5Put(4, 0) : P5Put(5, 0) : P5Put(6, 0)
+  P5Put(7, 0)
+  gP5Width = 1920
+  gP5Height = 1080
+  If P5MailboxCall(#P5_MBOX_BUF) = 1
+    If P5Get(5) >= 640 And P5Get(6) >= 480
+      gP5Width = P5Get(5)
+      gP5Height = P5Get(6)
+    EndIf
+  EndIf
+EndProcedure
+
+; One transaction, the tags DisplayInit uses on the Pi 4: SETPHYS,
+; SETVIRT, DEPTH 32, ORDER, ALLOCATE (align 16), GETPITCH.
+Procedure.l P5FramebufferInit()
+  P5Put(0, 120) : P5Put(1, 0)
+  P5Put(2, $48003) : P5Put(3, 8) : P5Put(4, 8) : P5Put(5, gP5Width) : P5Put(6, gP5Height)
+  P5Put(7, $48004) : P5Put(8, 8) : P5Put(9, 8) : P5Put(10, gP5Width) : P5Put(11, gP5Height)
+  P5Put(12, $48005) : P5Put(13, 4) : P5Put(14, 4) : P5Put(15, 32)
+  P5Put(16, $48006) : P5Put(17, 4) : P5Put(18, 4) : P5Put(19, 0)
+  P5Put(20, $40001) : P5Put(21, 8) : P5Put(22, 8) : P5Put(23, 16) : P5Put(24, 0)
+  P5Put(25, $40008) : P5Put(26, 4) : P5Put(27, 4) : P5Put(28, 0)
+  P5Put(29, 0)
+  If P5MailboxCall(#P5_MBOX_BUF) = 0
+    ProcedureReturn 0
+  EndIf
+  gP5FbRaw = P5Get(23) & $FFFFFFFF
+  gP5Pitch = P5Get(28) & $FFFFFFFF
+  gP5Order = P5Get(19)
+  gP5Width = P5Get(5)
+  gP5Height = P5Get(6)
+  If gP5FbRaw = 0 Or gP5Pitch = 0
+    ProcedureReturn 0
+  EndIf
+  If (gP5FbRaw & $C0000000) = $C0000000
+    gP5Fb = gP5FbRaw & $3FFFFFFF
+  Else
+    gP5Fb = gP5FbRaw
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Main()
+  ; The entry preamble and this prologue leave x0 alone: capture the
+  ; firmware's DTB pointer, and the level we were entered at, first.
+  ASM
+    adrp x1, global_gp5dtb
+    add  x1, x1, #:lo12:global_gp5dtb
+    str  x0, [x1]
+    mrs  x2, CurrentEL
+    lsr  x2, x2, #2
+    adrp x1, global_gp5el
+    add  x1, x1, #:lo12:global_gp5el
+    str  x2, [x1]
+  EndASM
+
+  P5Text(?s_boot) : P5Newline()
+
+  P5DisplaySize()
+  If P5FramebufferInit() = 1
+    ; Anvil's banner: the band colour the logo is composited on.
+    P5Fill(0, 0, gP5Width, gP5Height, P5Pack(24, 12, 8))
+    P5Fill(0, 0, gP5Width, 200, P5Pack(0, 0, 40))
+    P5Logo(40, 26)
+    gP5Col = 0
+    gP5Row = -5
+    ; The title, large, beside the logo.
+    Define i.q
+    For i = 0 To 4
+      P5Glyph(PeekA(?s_title + i), 230 + i * 15, 80, P5Pack(240, 224, 192))
+    Next
+  EndIf
+
+  gP5Col = 0
+  gP5Row = 0
+  P5Text(?s_board) : P5Newline()
+  P5Text(?s_el) : P5Dec(gP5El) : P5Newline()
+  If gP5El <> 3
+    P5Text(?s_el3warn) : P5Newline()
+  EndIf
+  P5Text(?s_dtb) : P5Hex(gP5Dtb) : P5Newline()
+  If gP5Fb = 0
+    P5Text(?s_mbfail) : P5Hex(P5Get(1) & $FFFFFFFF) : P5Newline()
+  Else
+    P5Text(?s_fbraw) : P5Hex(gP5FbRaw) : P5Newline()
+    P5Text(?s_fb) : P5Hex(gP5Fb) : P5Newline()
+    P5Text(?s_size) : P5Dec(gP5Width) : P5Text(?s_x) : P5Dec(gP5Height)
+    P5Text(?s_pitch) : P5Dec(gP5Pitch) : P5Newline()
+    P5Text(?s_ok) : P5Newline()
+  EndIf
+
+  Repeat
+  ForEver
+EndProcedure
+
+Main()
+
+DataSection
+  s_title: Data.a 65,78,86,73,76,0  ; "ANVIL"
+  s_board: Data.a 82,97,115,112,98,101,114,114,121,32,80,105,32,53,32,45,32,66,67,77,50,55,49,50,32,45,32,65,110,118,105,108,32,80,105,32,53,32,104,97,114,100,119,97,114,101,32,108,97,121,101,114,0  ; "Raspberry Pi 5 - BCM2712 - Anvil Pi 5 hardware layer"
+  s_el: Data.a 69,120,99,101,112,116,105,111,110,32,108,101,118,101,108,58,32,0  ; "Exception level: "
+  s_el3warn: Data.a 78,79,84,32,69,76,51,58,32,116,104,101,32,65,110,118,105,108,32,69,76,51,32,115,116,117,98,32,100,105,100,32,110,111,116,32,114,117,110,0  ; "NOT EL3: the Anvil EL3 stub did not run"
+  s_dtb: Data.a 68,101,118,105,99,101,32,116,114,101,101,32,97,116,32,48,120,0  ; "Device tree at 0x"
+  s_fbraw: Data.a 70,114,97,109,101,98,117,102,102,101,114,32,40,102,105,114,109,119,97,114,101,41,32,48,120,0  ; "Framebuffer (firmware) 0x"
+  s_fb: Data.a 70,114,97,109,101,98,117,102,102,101,114,32,48,120,0  ; "Framebuffer 0x"
+  s_size: Data.a 68,105,115,112,108,97,121,32,0  ; "Display "
+  s_x: Data.a 32,120,32,0  ; " x "
+  s_pitch: Data.a 32,32,112,105,116,99,104,32,0  ; "  pitch "
+  s_mbfail: Data.a 77,65,73,76,66,79,88,58,32,110,111,32,102,114,97,109,101,98,117,102,102,101,114,44,32,99,111,100,101,32,48,120,0  ; "MAILBOX: no framebuffer, code 0x"
+  s_ok: Data.a 68,105,115,112,108,97,121,32,117,112,46,32,78,101,120,116,58,32,99,111,110,115,111,108,101,44,32,107,101,121,98,111,97,114,100,44,32,115,116,111,114,97,103,101,46,0  ; "Display up. Next: console, keyboard, storage."
+  s_boot: Data.a 65,78,86,73,76,32,80,73,53,32,66,79,65,82,68,0  ; "ANVIL PI5 BOARD"
+EndDataSection
