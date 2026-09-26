@@ -514,6 +514,27 @@ Procedure vkGetImageMemoryRequirements(device.i, image.i, *pMemoryRequirements.V
   *pMemoryRequirements\memoryTypeBits = avkImageMemoryTypeBits()
 EndProcedure
 
+; vkCreateImage refuses sparse creation flags, so every live image has zero
+; sparse residency requirements. Preserve caller storage beyond the count.
+Procedure vkGetImageSparseMemoryRequirements(device.i, image.i, *pSparseMemoryRequirementCount, *pSparseMemoryRequirements)
+  Define d.i
+  Define s.i
+  If *pSparseMemoryRequirementCount = 0
+    avkFault(#ANVIL_VK_ERR_ARGS, "vkGetImageSparseMemoryRequirements needs pSparseMemoryRequirementCount (Anvil code -20001, null output count); pass a writable count pointer.")
+    ProcedureReturn
+  EndIf
+  d = avkDevSlot(device) : s = avkImgSlot(image)
+  If d = 0 Or s = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetImageSparseMemoryRequirements was given a device or image handle that is not live (Anvil code -20002, stale or foreign handle); the count and requirements were left untouched.")
+    ProcedureReturn
+  EndIf
+  If avkImgDev[s] <> d
+    avkFault(#ANVIL_VK_ERR_OWNER, "vkGetImageSparseMemoryRequirements was given a device that does not own the image (Anvil code -20003, wrong parent); the count and requirements were left untouched.")
+    ProcedureReturn
+  EndIf
+  PokeL(*pSparseMemoryRequirementCount, 0)
+EndProcedure
+
 Procedure vkGetImageSubresourceLayout(device.i, image.i, *pSubresource.VkImageSubresource, *pLayout.VkSubresourceLayout)
   Define d.i
   Define s.i
