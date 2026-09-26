@@ -80,6 +80,7 @@
 #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO = 3
 #VK_STRUCTURE_TYPE_SUBMIT_INFO = 4
 #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO = 5
+#VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE = 6
 #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO = 8
 #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9
 #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
@@ -495,6 +496,14 @@ Structure VkSubresourceLayout Align #PB_Structure_AlignC
   rowPitch.q
   arrayPitch.q
   depthPitch.q
+EndStructure
+
+Structure VkMappedMemoryRange Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  memory.i
+  offset.q
+  size.q
 EndStructure
 
 Structure VkImageSubresourceLayers Align #PB_Structure_AlignC

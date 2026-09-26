@@ -28,10 +28,13 @@ Procedure.i Main()
   Define device.i
   Define queue.i
   Define image.i
+  Define memory.i
+  Define mappedPointer.i
   Define count.l
   Define propertySentinel.l
   Define subresource.VkImageSubresource
   Define layout.VkSubresourceLayout
+  Define mappedRange.VkMappedMemoryRange
 
   AnvilVkTestBackendHeap($07000000, $00100000)
   Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
@@ -89,6 +92,28 @@ Procedure.i Main()
   vkGetImageSubresourceLayout($12345678, image, @subresource, @layout)
   Vkd(layout\size = 77)
   AnvilVkImageDestroy(device, image)
+
+  Vkd(AnvilVkMemoryAllocate(device, 128, 1, @memory) = #VK_SUCCESS)
+  Vkd(AnvilVkMemoryMap(device, memory, 16, 64, 0, @mappedPointer) = #VK_SUCCESS)
+  mappedRange\sType = #VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE
+  mappedRange\pNext = 0
+  mappedRange\memory = memory
+  mappedRange\offset = 16
+  mappedRange\size = 32
+  Vkd(vkGetDeviceProcAddr(device, "vkFlushMappedMemoryRanges") = @vkFlushMappedMemoryRanges)
+  Vkd(vkGetDeviceProcAddr(device, "vkInvalidateMappedMemoryRanges") = @vkInvalidateMappedMemoryRanges)
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  mappedRange\offset = 8
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_ARGS)
+  mappedRange\offset = 16
+  mappedRange\size = 65
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_ARGS)
+  mappedRange\size = #VK_WHOLE_SIZE
+  Vkd(vkFlushMappedMemoryRanges(device, 1, @mappedRange) = #VK_SUCCESS)
+  AnvilVkMemoryUnmap(device, memory)
+  Vkd(vkInvalidateMappedMemoryRanges(device, 1, @mappedRange) = #ANVIL_VK_ERR_STATE)
+  AnvilVkMemoryFree(device, memory)
 
   ; Empty discovery is a real zero-count query, including supplied output
   ; storage; invalid layer and physical-device requests preserve the outputs.
