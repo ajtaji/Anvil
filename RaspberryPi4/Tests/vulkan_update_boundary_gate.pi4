@@ -1,0 +1,115 @@
+; Emitted A64 proof of the complete core-1.0 vkCmdUpdateBuffer 64 KiB limit.
+; This links the explicit test backend and touches no GPU or MMIO.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VUP_OUT = $06000000
+#VUP_ROWS = $06000100
+#VUP_HEAP = $00200000
+#VUP_HEAP_BYTES = $00040000
+
+Global vupChecks.i = 0
+Global vupFails.i = 0
+Global Dim vupSource.a[65536]
+
+Procedure Vup(ok.i)
+  PokeN(#VUP_ROWS + (vupChecks * 8), ok)
+  vupChecks = vupChecks + 1
+  If ok = 0 : vupFails = vupFails + 1 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define buffer.i
+  Define memory.i
+  Define mapped.i
+  Define count.l
+  Define prio.l
+  Define i.i
+  Define mismatch.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define si.VkSubmitInfo
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+
+  AnvilVkTestBackendHeap(#VUP_HEAP, #VUP_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  Vup(vkCreateInstance(@ici, 0, @inst) = #VK_SUCCESS)
+  count = 1
+  Vup(vkEnumeratePhysicalDevices(inst, @count, @phys) = #VK_SUCCESS And count = 1)
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  Vup(vkCreateDevice(phys, @dci, 0, @dev) = #VK_SUCCESS)
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  Vup(queue <> #VK_NULL_HANDLE)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  Vup(vkCreateCommandPool(dev, @pci, 0, @pool) = #VK_SUCCESS)
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  Vup(vkAllocateCommandBuffers(dev, @cbai, @cmd) = #VK_SUCCESS)
+
+  bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bci\size = 65536
+  bci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  Vup(vkCreateBuffer(dev, @bci, 0, @buffer) = #VK_SUCCESS)
+  vkGetBufferMemoryRequirements(dev, buffer, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 1
+  Vup(vkAllocateMemory(dev, @mai, 0, @memory) = #VK_SUCCESS)
+  Vup(vkBindBufferMemory(dev, buffer, memory, 0) = #VK_SUCCESS)
+
+  i = 0
+  While i < 65536
+    vupSource[i] = i & $FF
+    i = i + 1
+  Wend
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  Vup(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, buffer, 0, 65536, @vupSource[0])
+  vupSource[0] = $EE
+  vupSource[65535] = $EE
+  Vup(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cmd
+  Vup(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vup(vkMapMemory(dev, memory, 0, 65536, 0, @mapped) = #VK_SUCCESS)
+  mismatch = 0
+  i = 0
+  While i < 65536
+    If PeekA(mapped + i) <> (i & $FF) : mismatch = mismatch + 1 : EndIf
+    i = i + 1
+  Wend
+  Vup(mismatch = 0)
+  vkUnmapMemory(dev, memory)
+  vkDestroyBuffer(dev, buffer, 0)
+  vkFreeMemory(dev, memory, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+
+  PokeN(#VUP_OUT + 0, $56555044) ; "VUPD"
+  PokeN(#VUP_OUT + 8, vupChecks)
+  PokeN(#VUP_OUT + 16, vupFails)
+  ProcedureReturn vupFails
+EndProcedure

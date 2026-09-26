@@ -36,6 +36,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 ; running out of them is a real VK_ERROR_OUT_OF_HOST_MEMORY that a test
 ; can provoke, and so a hundred idle command buffers cost nothing.
 #ANVIL_VK_MAX_OPS = 32
+#ANVIL_VK_MAX_UPDATE_BYTES = 65536
 #ANVIL_VK_MAX_CB_REFS = 2
 
 ; One shared pool holds every non-empty vkCmdDraw snapshot recorded by every
@@ -79,6 +80,7 @@ EndStructure
 #ANVIL_VK_OP_COPY_BUFFER_IMAGE = 3
 #ANVIL_VK_OP_COPY_BUFFER = 4
 #ANVIL_VK_OP_FILL_BUFFER = 5
+#ANVIL_VK_OP_UPDATE_BUFFER = 6
 
 ; "the tracker does not know yet" for a layout inside a recording.
 #ANVIL_VK_LAYOUT_UNKNOWN = -2
@@ -98,6 +100,9 @@ Global Dim avkOpDstBuffer.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpDstOffset.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpSourceBytes.i[#ANVIL_VK_MAX_OPS + 1]
 Global Dim avkOpSourcePitch.i[#ANVIL_VK_MAX_OPS + 1]
+; Each possible update operation owns the complete Vulkan 1.0 maximum so
+; its source bytes survive caller mutation until reset or submission.
+Global Dim avkOpUpdateData.a[#ANVIL_VK_MAX_OPS * #ANVIL_VK_MAX_UPDATE_BYTES]
 
 Global Dim avkCbOpHead.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbOpTail.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -529,6 +534,48 @@ Procedure AnvilVkCmdFillBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, size.i
   avkOpBufferOffset[o] = dstOffset
   avkOpSourceBytes[o] = bytes
   avkOpColor[o] = data & $FFFFFFFF
+EndProcedure
+
+; vkCmdUpdateBuffer copies pData at recording time. The operation's slot owns
+; a private 64 KiB maximum payload; reset releases the slot for reuse.
+Procedure AnvilVkCmdUpdateBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, dataSize.i, *pData)
+  Define c.i
+  Define d.i
+  Define destination.i
+  Define o.i
+  Define i.i
+  Define *payload
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING Or avkCbRpActive[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdUpdateBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
+    ProcedureReturn
+  EndIf
+  If dstOffset < 0 Or (dstOffset % 4) <> 0 Or dataSize < 1 Or dataSize > #ANVIL_VK_MAX_UPDATE_BYTES Or (dataSize % 4) <> 0 Or *pData = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdUpdateBuffer needs a four-byte aligned destination, a non-null source, and a positive four-byte multiple of at most 65536 bytes (Anvil code -20001, invalid update); correct the arguments.")
+    ProcedureReturn
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, dstOffset, dataSize, @destination) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdUpdateBuffer needs a live, bound same-device transfer-destination buffer covering the complete range (Anvil code -20004, invalid buffer); repair the binding or range.")
+    ProcedureReturn
+  EndIf
+  o = avkOpAppend(c, #ANVIL_VK_OP_UPDATE_BUFFER)
+  If o = 0
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool ran out of recorded-command storage for vkCmdUpdateBuffer (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); reset unused command buffers.")
+    ProcedureReturn
+  EndIf
+  *payload = @avkOpUpdateData[(o - 1) * #ANVIL_VK_MAX_UPDATE_BYTES]
+  i = 0
+  While i < dataSize
+    PokeA(*payload + i, PeekA(*pData + i))
+    i = i + 1
+  Wend
+  avkOpBuffer[o] = dstBuffer
+  avkOpBufferOffset[o] = dstOffset
+  avkOpSourceBytes[o] = dataSize
 EndProcedure
 
 ; Exact bounded vkCmdCopyBufferToImage semantics: one tightly packed whole
@@ -1410,7 +1457,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       copies = copies + 1
       copyOp = o
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
-    ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
+    ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
       bufferCopies = bufferCopies + 1
     EndIf
     o = avkOpNext[o]
@@ -1469,6 +1516,10 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
         If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], avkOpSourceBytes[o], @destinationBase) = 0
           ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer fill now names a stale, unbound or wrong-device destination (Anvil code -20004, stale resource); no transfer was submitted.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], avkOpSourceBytes[o], @destinationBase) = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer update now names a stale, unbound or wrong-device destination (Anvil code -20004, stale resource); no transfer was submitted.")
         EndIf
       EndIf
       o = avkOpNext[o]
@@ -1552,6 +1603,13 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         If job <> #ANVIL_VK_JOB_DONE
           avkFlightComplete(0)
           ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdFillBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
+        destinationBase = AnvilVkBufferAddress(avkOpBuffer[o]) + avkOpBufferOffset[o]
+        job = avkBackendSubmitBufferCopy(@avkOpUpdateData[(o - 1) * #ANVIL_VK_MAX_UPDATE_BYTES], destinationBase, avkOpSourceBytes[o])
+        If job <> #ANVIL_VK_JOB_DONE
+          avkFlightComplete(0)
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdUpdateBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
         EndIf
       EndIf
       o = avkOpNext[o]

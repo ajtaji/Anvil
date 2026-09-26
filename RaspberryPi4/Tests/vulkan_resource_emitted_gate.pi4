@@ -61,6 +61,7 @@ EndProcedure
 
 Global Dim vkrColor.l[4]
 Global Dim vkrCopyRegions.a[64]
+Global Dim vkrUpdateData.a[16]
 
 Procedure SetColor(r.i, g.i, b.i, a.i)
   PokeL(@vkrColor[0] + 0, r)
@@ -904,6 +905,45 @@ Procedure.i Main()
   Wend
   vkUnmapMemory(dev, copyDstMem)
 
+  ; Update captures source bytes while recording. Overwriting the caller's
+  ; array before submission must not alter the destination.
+  i = 0
+  While i < 12
+    vkrUpdateData[i] = i + 60
+    i = i + 1
+  Wend
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 4, 12, @vkrUpdateData[0])
+  i = 0
+  While i < 12
+    vkrUpdateData[i] = $EE
+    i = i + 1
+  Wend
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekA(copyDstPtr + 3) = $A5)
+  i = 0
+  While i < 12
+    Vkr(PeekA(copyDstPtr + 4 + i) = i + 60)
+    i = i + 1
+  Wend
+  Vkr(PeekA(copyDstPtr + 16) = 43)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 2, 12, @vkrUpdateData[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 4, 6, @vkrUpdateData[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 4, 65540, @vkrUpdateData[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
+
   ; Two disjoint regions in one public call copy exact, separate byte spans.
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
   i = 0
@@ -994,7 +1034,7 @@ Procedure.i Main()
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
-  ; A later stale fill prevents an earlier valid copy from executing.
+  ; A later stale update prevents an earlier valid copy from executing.
   ; Preflight covers the complete command stream before the first write.
   copyBufferInfo\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
   copyBufferInfo\size = 31
@@ -1030,7 +1070,7 @@ Procedure.i Main()
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
-  vkCmdFillBuffer(cmd, copyLate, 8, 8, $11223344)
+  vkCmdUpdateBuffer(cmd, copyLate, 8, 8, @vkrUpdateData[0])
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
   vkDestroyBuffer(dev, copyLate, 0)
   Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_STATE)
