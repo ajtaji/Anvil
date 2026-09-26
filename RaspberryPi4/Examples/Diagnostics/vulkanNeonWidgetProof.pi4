@@ -50,6 +50,8 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_DSI_SCAN          = $08A00000
 #NW_SHOW_MS           = 3000
 #NW_CAPACITY_BOXES    = 3505
+#NW_STRESS_DRAWS      = 1183         ; one box batch + 2*(252+339) text calls
+#NW_STRESS_QUADS      = 6373         ; 3505 boxes + 2868 text glyphs
 
 #NW_OK                = 0
 #NW_NOT_TRIED         = 1
@@ -494,6 +496,49 @@ Procedure.i nwPairClearFrame(imageBase.i, imagePitch.i, captureBase.i)
   ProcedureReturn #NW_OK
 EndProcedure
 
+; Native oracle scene 13: capacity stress. Batched boxes keep the draw
+; budget bounded while retaining each of the native visible pixels.
+Procedure.i nwPairStressFrame(imageBase.i, imagePitch.i, captureBase.i)
+  Define rc.i, i.i, x.i, y.i
+  rc = NeonVkChromeBegin(@nwPairClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  Neon_ScissorClear()
+  rc = NeonVkChromeBoxBatchBegin()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  For i = 0 To #NW_CAPACITY_BOXES - 1
+    rc = Neon_Box(i & 63, (i >> 6) & 63, 1, 1, Neon_RGBA(40, 70, 160, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  rc = NeonVkChromeBoxBatchEnd()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  For i = 1 To 252
+    rc = Neon_Text(#NEON_FONT_UI, 0, 0, "|||", Neon_RGBA(238, 196, 122, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = Neon_TextTex(#NEON_FONT_UI, 0, 0, "|||", Neon_RGBA(238, 196, 122, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  For i = 1 To 339
+    rc = Neon_Text(#NEON_FONT_UI, 0, 0, "||", Neon_RGBA(238, 196, 122, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = Neon_TextTex(#NEON_FONT_UI, 0, 0, "||", Neon_RGBA(238, 196, 122, 255))
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If NeonVkChromeDrawCount() <> #NW_STRESS_DRAWS Or NeonVkChromeVertexCount() <> (#NW_STRESS_QUADS * 6)
+    ProcedureReturn #NW_ERR_COUNTS
+  EndIf
+  If NeonVkChromePresentPending() <> 1 Or NeonVkChromePresentConsume() <> 1
+    ProcedureReturn #NW_ERR_PRESENT
+  EndIf
+  For y = 0 To 63
+    For x = 0 To 255
+      PokeA(captureBase + (y * 256) + x, PeekA(imageBase + (y * imagePitch) + x))
+    Next
+  Next
+  ProcedureReturn #NW_OK
+EndProcedure
+
 ; The backend requires the framebuffer and attachment to have identical
 ; extents. Make the oracle target, draw once, then restore the widget target.
 Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPitch.i, scene.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, rotation.i, captureBase.i, nativePitch.i)
@@ -549,6 +594,8 @@ Procedure.i nwPairExactTarget(dev.i, renderPass.i, widgetFramebuffer.i, widgetPi
       rc = nwPairClearFrame(imageBase, imagePitch, captureBase)
     ElseIf scene = 8
       rc = nwPairEdgesFrame(imageBase, imagePitch)
+    ElseIf scene = 13
+      rc = nwPairStressFrame(imageBase, imagePitch, captureBase)
     Else
       rc = nwPairRotationFrame(imageBase, imagePitch, physicalW, physicalH, captureBase, nativePitch)
     EndIf
@@ -805,7 +852,7 @@ Procedure.i Main()
   ; The shipped adapter allocates all resident resources here and publishes
   ; the widget callbacks only after its Vulkan atlas upload has completed.
   nwPut(#NW_S_STEP, 4)
-  rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NVWA_EXPECT_DRAWS, #NW_CAPACITY_BOXES)
+  rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NW_STRESS_DRAWS, #NW_STRESS_QUADS)
   nwPut(#NW_S_CREATE_RC, rc)
   nwPut(#NW_S_READY_BEFORE, NeonVkChromeReady())
   nwPut(#NW_S_HOOK_AFTER, NeonDrawBackendActive())
@@ -931,6 +978,16 @@ Procedure.i Main()
   Next
 
   rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, 0, 64, 64, 64, 64, 0, $07034000, 256)
+  If rc <> #NW_OK
+    NeonVkChromeDestroy()
+    vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+    vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+    vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+    vkDestroyInstance(inst, 0) : NeonShutdown()
+    ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+  EndIf
+
+  rc = nwPairExactTarget(dev, renderPass, framebuffer, imagePitch, 13, 64, 64, 64, 64, 0, $07038000, 256)
   If rc <> #NW_OK
     NeonVkChromeDestroy()
     vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)

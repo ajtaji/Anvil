@@ -145,6 +145,16 @@ restored the widget frame; the board was released cleanly. See
 `docs/evidence/vulkan-paired-clear-20260926/`. Thirteen native scenes are
 paired; the stress-capacity scene 13 and rebind/error scene 14 remain.
 
+Scene 13 now matches all 16,384 native bytes on an exact-size Vulkan target.
+Its 3,505 boxes used one ordered same-colour batch, followed by 1,182 flat
+and textured text draws. The adapter reserved exactly 1,183 draws and 6,373
+vertex quads; the earlier 47-draw widget reservation correctly refused the
+stress load instead of overrunning. The returning Pi 4 RAM payload completed
+in 12.2 seconds under the board's 15-second deadman, produced fresh capture
+26, restored the widget frame and released the board cleanly. Evidence:
+`docs/evidence/vulkan-paired-stress-20260926/`. Fourteen native scenes are
+paired; scene 14's rebind and expected-error behavior remains.
+
 Updated 2026-09-11, when the SPIR-V front end and the first graphics
 pipeline landed, and again the same day when three things followed it: a real
 interpolated gradient, a second vertex input binding, and the first descriptor
