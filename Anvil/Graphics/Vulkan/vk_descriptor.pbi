@@ -32,7 +32,7 @@
 ;   * vkAllocateDescriptorSets of a bounded array, with whole-call preflight
 ;   * vkFreeDescriptorSets of an atomically checked array, returning each
 ;     freed set's type budget to its owning pool
-;   * vkUpdateDescriptorSets of one write at a time, no copies
+;   * vkUpdateDescriptorSets of up to sixteen ordered writes and copies
 ;   * a uniform buffer of at least sixteen bytes at an offset that is a
 ;     multiple of sixteen, or one bound linear BGRA8 sampled image view and
 ;     one sampler in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
@@ -625,11 +625,10 @@ EndProcedure
 ; ======================================================================
 ;  vkUpdateDescriptorSets
 ; ======================================================================
-;  ONE WRITE PER CALL and no copies. A descriptor copy moves a binding
-;  from one set to another and would let a set hold a descriptor whose
-;  type its own layout never declared; there is no reason to have it
-;  here and every reason not to guess at its rules.
-Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWriteDescriptorSet, copyCount.i, *pCopies)
+;  Each bounded write is validated against its destination schema. All writes
+;  commit in array order, or an invalid later write restores the prior state.
+;  Copies then execute in order, with matching source/destination schemas.
+Procedure.i AnvilVkDescriptorSetWriteOne(device.i, *pWrites.VkWriteDescriptorSet)
   Define d.i
   Define s.i
   Define b.i
@@ -648,12 +647,6 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
 
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
-  If copyCount <> 0 Or *pCopies <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkUpdateDescriptorSets was given descriptor copies (Anvil code -20005, descriptor copies not implemented); nothing was written. A copy would move a descriptor between sets without either set's layout being consulted, and this implementation checks a write against the layout every time.")
-  EndIf
-  If writeCount <> 1 Or *pWrites = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkUpdateDescriptorSets was given other than exactly one write (Anvil code -20005, unsupported update); write one descriptor per call here, so a refusal names the write that failed and no earlier write in the same array has already landed.")
-  EndIf
   If (*pWrites\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets was given a VkWriteDescriptorSet whose sType is wrong (Anvil code -20001, wrong sType); it must be VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET.")
   EndIf
@@ -764,6 +757,135 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
   EndIf
 
   ProcedureReturn avkDescRefuseType(t)
+EndProcedure
+
+Procedure.i AnvilVkDescriptorSetCopyOne(device.i, *copy.VkCopyDescriptorSet)
+  Define d.i
+  Define src.i
+  Define dst.i
+  Define srcBinding.i
+  Define dstBinding.i
+  Define count.i
+  Define j.i
+  Define srcIdx.i
+  Define dstIdx.i
+
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If (*copy\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets received a VkCopyDescriptorSet with the wrong sType (Anvil code -20001); nothing was copied.")
+  EndIf
+  If *copy\pNext <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkUpdateDescriptorSets received an unsupported descriptor-copy pNext chain (Anvil code -20005); nothing was copied.")
+  EndIf
+  src = avkDsSlot(*copy\srcSet)
+  dst = avkDsSlot(*copy\dstSet)
+  If src = 0 Or dst = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkDsDev[src] <> d Or avkDsDev[dst] <> d
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_OWNER, "vkUpdateDescriptorSets copy source and destination must belong to the same VkDevice (Anvil code -20003); nothing was copied.")
+  EndIf
+  If avkFlightActive <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkUpdateDescriptorSets cannot copy into a descriptor set while a submission is in flight (Anvil code -20004); nothing was copied.")
+  EndIf
+  srcBinding = *copy\srcBinding & $FFFFFFFF
+  dstBinding = *copy\dstBinding & $FFFFFFFF
+  count = *copy\descriptorCount & $FFFFFFFF
+  If (*copy\srcArrayElement & $FFFFFFFF) <> 0 Or (*copy\dstArrayElement & $FFFFFFFF) <> 0 Or count < 1 Or count > #ANVIL_VK_MAX_SET_BINDINGS
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets copies only whole one-element bindings in the bounded descriptor schema (Anvil code -20001); nothing was copied.")
+  EndIf
+  If srcBinding >= avkDsCount[src] Or dstBinding >= avkDsCount[dst] Or count > (avkDsCount[src] - srcBinding) Or count > (avkDsCount[dst] - dstBinding)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets copy range exceeds a source or destination set binding (Anvil code -20001); nothing was copied.")
+  EndIf
+  If src = dst And srcBinding < (dstBinding + count) And dstBinding < (srcBinding + count)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets cannot copy overlapping descriptor ranges within one set (Anvil code -20001); nothing was copied.")
+  EndIf
+  For j = 0 To count - 1
+    srcIdx = (src * #ANVIL_VK_MAX_SET_BINDINGS) + srcBinding + j
+    dstIdx = (dst * #ANVIL_VK_MAX_SET_BINDINGS) + dstBinding + j
+    If avkDsType[srcIdx] <> avkDsType[dstIdx]
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets copy source and destination descriptor types differ (Anvil code -20001); nothing was copied.")
+    EndIf
+    If j <> 0
+      If avkDsType[srcIdx] <> avkDsType[srcIdx - j] Or avkDsStages[srcIdx] <> avkDsStages[srcIdx - j] Or avkDsType[dstIdx] <> avkDsType[dstIdx - j] Or avkDsStages[dstIdx] <> avkDsStages[dstIdx - j]
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkUpdateDescriptorSets copy crosses bindings with different descriptor types or stage flags (Anvil code -20001); nothing was copied.")
+      EndIf
+    EndIf
+  Next
+  For j = 0 To count - 1
+    srcIdx = (src * #ANVIL_VK_MAX_SET_BINDINGS) + srcBinding + j
+    dstIdx = (dst * #ANVIL_VK_MAX_SET_BINDINGS) + dstBinding + j
+    avkDsBuf[dstIdx] = avkDsBuf[srcIdx]
+    avkDsOffset[dstIdx] = avkDsOffset[srcIdx]
+    avkDsRange[dstIdx] = avkDsRange[srcIdx]
+    avkDsSampler[dstIdx] = avkDsSampler[srcIdx]
+    avkDsView[dstIdx] = avkDsView[srcIdx]
+    avkDsImageLayout[dstIdx] = avkDsImageLayout[srcIdx]
+  Next
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWriteDescriptorSet, copyCount.i, *pCopies.VkCopyDescriptorSet)
+  Define i.i
+  Define rc.i
+  ; PMF's current A64 lowering can lose the fifth parameter after nested
+  ; calls; capture its entry value before any validation calls.
+  Define copyBase.i = *pCopies
+  Define Dim priorBuf.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorOffset.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorRange.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorSampler.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorView.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorImageLayout.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+
+  If avkDevSlot(device) = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If writeCount < 0 Or writeCount > 16 Or copyCount < 0 Or copyCount > 16 Or (writeCount <> 0 And *pWrites = 0) Or (copyCount <> 0 And copyBase = 0)
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkUpdateDescriptorSets needs bounded write and copy arrays of at most sixteen operations each (Anvil code -20005, unsupported update).")
+  EndIf
+  If writeCount = 0 And copyCount = 0 : ProcedureReturn #VK_SUCCESS : EndIf
+
+  ; Snapshot the complete bounded payload table. Sequential writes see earlier
+  ; writes, but a refused later write restores every earlier destination.
+  For i = 0 To ((#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS) - 1
+    priorBuf(i) = avkDsBuf[i]
+    priorOffset(i) = avkDsOffset[i]
+    priorRange(i) = avkDsRange[i]
+    priorSampler(i) = avkDsSampler[i]
+    priorView(i) = avkDsView[i]
+    priorImageLayout(i) = avkDsImageLayout[i]
+  Next
+  If writeCount <> 0
+  For i = 0 To writeCount - 1
+    rc = AnvilVkDescriptorSetWriteOne(device, *pWrites + i * SizeOf(VkWriteDescriptorSet))
+    If rc <> #VK_SUCCESS
+      For i = 0 To ((#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS) - 1
+        avkDsBuf[i] = priorBuf(i)
+        avkDsOffset[i] = priorOffset(i)
+        avkDsRange[i] = priorRange(i)
+        avkDsSampler[i] = priorSampler(i)
+        avkDsView[i] = priorView(i)
+        avkDsImageLayout[i] = priorImageLayout(i)
+      Next
+      ProcedureReturn rc
+    EndIf
+  Next
+  EndIf
+  If copyCount <> 0
+  For i = 0 To copyCount - 1
+    rc = AnvilVkDescriptorSetCopyOne(device, copyBase + i * SizeOf(VkCopyDescriptorSet))
+    If rc <> #VK_SUCCESS
+      For i = 0 To ((#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS) - 1
+        avkDsBuf[i] = priorBuf(i)
+        avkDsOffset[i] = priorOffset(i)
+        avkDsRange[i] = priorRange(i)
+        avkDsSampler[i] = priorSampler(i)
+        avkDsView[i] = priorView(i)
+        avkDsImageLayout[i] = priorImageLayout(i)
+      Next
+      ProcedureReturn rc
+    EndIf
+  Next
+  EndIf
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 ; ======================================================================
