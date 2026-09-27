@@ -361,6 +361,19 @@ Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
+Procedure.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
+  CompilerIf #DSP_DMA_LINKED = 1
+  If source = 0 Or destination = 0 Or rowBytes < 1 Or rows < 1 : ProcedureReturn -1 : EndIf
+  If HwVkDmaCopyRows(avkV3dWindowBase, avkV3dWindowBytes, source, sourcePitch, destination, destinationPitch, rowBytes, rows) = 0
+    ProcedureReturn -1
+  EndIf
+  CompilerElse
+  ProcedureReturn -1
+  CompilerEndIf
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
 Procedure.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
   CompilerIf #DSP_DMA_LINKED = 1
   If destination = 0 Or bytes < 1 Or (bytes % 4) <> 0 : ProcedureReturn -1 : EndIf

@@ -28,6 +28,39 @@ Procedure.i HwVkDmaCopy(base.i, windowBytes.i, source.i, destination.i, bytes.i)
   ProcedureReturn Bool(copied <> 0 And restored <> 0)
 EndProcedure
 
+; Submit one 2D DMA descriptor when its row geometry fits the controller.
+; Larger gaps and conservative span overlap keep the guarded row-copy path.
+Procedure.i HwVkDmaCopyRows(base.i, windowBytes.i, source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
+  Define sourceSpan.i, destinationSpan.i, oldBase.i, oldBytes.i
+  Define copied.i, restored.i, row.i
+  If rowBytes < 1 Or rows < 1 Or sourcePitch < rowBytes Or destinationPitch < rowBytes
+    ProcedureReturn 0
+  EndIf
+  sourceSpan = (rows - 1) * sourcePitch + rowBytes
+  destinationSpan = (rows - 1) * destinationPitch + rowBytes
+  If sourceSpan < rowBytes Or destinationSpan < rowBytes Or HwVkDmaWindowContains(base, windowBytes, destination, destinationSpan) = 0
+    ProcedureReturn 0
+  EndIf
+  If rows = 1 Or rowBytes > #DMA_MAX_ROW_BYTES Or rows > #DMA_MAX_ROWS Or sourcePitch - rowBytes > #DMA_STRIDE_MAX Or destinationPitch - rowBytes > #DMA_STRIDE_MAX Or (destination < source + sourceSpan And source < destination + destinationSpan)
+    For row = 0 To rows - 1
+      If HwVkDmaCopy(base, windowBytes, source + row * sourcePitch, destination + row * destinationPitch, rowBytes) = 0
+        ProcedureReturn 0
+      EndIf
+    Next
+    ProcedureReturn 1
+  EndIf
+  If DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  oldBase = dma_bounds : oldBytes = dma_boundsN
+  If DmaSetBounds(base, windowBytes) = 0 : ProcedureReturn 0 : EndIf
+  DmaCacheRange(source, sourceSpan)
+  DmaCacheRange(destination, destinationSpan)
+  copied = DmaCopy2D(destination, destinationPitch, source, sourcePitch, rowBytes, rows)
+  If copied <> 0 : DmaCacheRange(destination, destinationSpan) : EndIf
+  restored = DmaSetBounds(oldBase, oldBytes)
+  If copied <> 0 And restored <> 0 : hwVkDmaOps = hwVkDmaOps + 1 : EndIf
+  ProcedureReturn Bool(copied <> 0 And restored <> 0)
+EndProcedure
+
 Procedure.i HwVkDmaFill(base.i, windowBytes.i, destination.i, bytes.i, pattern.i)
   Define oldBase.i, oldBytes.i, mainBytes.i, tailBytes.i, filled.i, restored.i
   If HwVkDmaWindowContains(base, windowBytes, destination, bytes) = 0 Or DmaReady() = 0

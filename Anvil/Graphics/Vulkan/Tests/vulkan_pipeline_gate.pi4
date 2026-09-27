@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[808]
+Global Dim pgReport.i[811]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 807
+  If slot < 0 Or slot > 810
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (808 * 8), slot)
+  PokeI(#PG_OUT + (811 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -154,6 +154,7 @@ Procedure.i Main()
   Define fence.i
   Define lifeFence.i
   Define count.i
+  Define copyRowsBefore.i
   Define vsA.i
   Define fsA.i
   Define vsB.i
@@ -3714,6 +3715,7 @@ Procedure.i Main()
   imageCopyRegions[1]\srcOffset\x = 8 : imageCopyRegions[1]\srcOffset\y = 0
   imageCopyRegions[1]\dstOffset\x = 20 : imageCopyRegions[1]\dstOffset\y = 0
   imageCopyRegions[1]\extent\width = 4 : imageCopyRegions[1]\extent\height = 4
+  copyRowsBefore = AnvilVkTestBackendCopyRowsCalls()
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegions[0])
   vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegions[1])
@@ -3721,6 +3723,7 @@ Procedure.i Main()
   vkResetFences(dev, 1, @fenceArray)
   pgPut(793, vkQueueSubmit(queue, 1, @si, fence))
   pgPut(794, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(808, AnvilVkTestBackendCopyRowsCalls() - copyRowsBefore)
   count = 0
   For k = 0 To 31
     For j = 0 To 31
@@ -3746,6 +3749,7 @@ Procedure.i Main()
   pgPut(795, count)
   pgPut(796, AnvilVkSubmissionOutstanding())
   ; Two separate image-to-buffer commands keep their DMA rows ordered.
+  copyRowsBefore = AnvilVkTestBackendCopyRowsCalls()
   For i = 0 To bufci\size - 1 : PokeA(AnvilVkBufferAddress(copyBuf) + i, $D3) : Next
   readbackRegions[1]\bufferOffset = 256
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
@@ -3755,6 +3759,7 @@ Procedure.i Main()
   vkResetFences(dev, 1, @fenceArray)
   pgPut(798, vkQueueSubmit(queue, 1, @si, fence))
   pgPut(799, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(809, AnvilVkTestBackendCopyRowsCalls() - copyRowsBefore)
   count = 0
   For k = 0 To bufci\size - 1
     rc = $D3
@@ -3772,6 +3777,7 @@ Procedure.i Main()
   pgPut(800, count)
   pgPut(801, AnvilVkSubmissionOutstanding())
   ; Two separate linear buffer-to-image uploads retain their own rows.
+  copyRowsBefore = AnvilVkTestBackendCopyRowsCalls()
   uploadRegions[0]\imageOffset\x = 4 : uploadRegions[0]\imageOffset\y = 0
   uploadRegions[1]\imageOffset\x = 8 : uploadRegions[1]\imageOffset\y = 0
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
@@ -3781,6 +3787,7 @@ Procedure.i Main()
   vkResetFences(dev, 1, @fenceArray)
   pgPut(803, vkQueueSubmit(queue, 1, @si, fence))
   pgPut(804, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(810, AnvilVkTestBackendCopyRowsCalls() - copyRowsBefore)
   count = 0
   For k = 0 To 31
     For j = 0 To 31

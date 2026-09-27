@@ -101,6 +101,10 @@ Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
   ProcedureReturn -1
 EndProcedure
 
+Procedure.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
+  ProcedureReturn -1
+EndProcedure
+
 Procedure.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
   ProcedureReturn -1
 EndProcedure
