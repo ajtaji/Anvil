@@ -1399,6 +1399,8 @@ Procedure.i avkSpvBuildVertexPlan()
   Define c3.i
   Define a0.i
   Define a1.i
+  Define a2.i
+  Define a3.i
 
   If spvPosVar = 0
     ProcedureReturn avkSpvMalformed("a SPIR-V vertex module never writes gl_Position (Anvil code -20001, incomplete vertex shader); a vertex shader must store a four-component clip position into the Position built-in, or nothing can be rasterised.")
@@ -1439,6 +1441,26 @@ Procedure.i avkSpvBuildVertexPlan()
   EndIf
   If spvKind[c3] <> #ANVIL_SPV_K_CONST Or spvConstWord[c3] <> $3F800000
     ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a vertex shader whose gl_Position.w is not the constant 1.0 (Anvil code -20005, unsupported position); this slice emits no perspective divide, so a w other than one would change the picture in a way the emitted shader would not carry out.")
+  EndIf
+  ; A second vec2 input can scale XY in the vertex QPU. Both products must
+  ; preserve component order and consume whole Location inputs; a general
+  ; arithmetic graph is still withheld until its complete lowering exists.
+  If spvValueSrc[c0] = #ANVIL_SPV_V_FMUL And spvValueSrc[c1] = #ANVIL_SPV_V_FMUL
+    a0 = spvValueA[c0] : a1 = spvValueA[c1]
+    a2 = spvValueB[c0] : a3 = spvValueB[c1]
+    If spvValueSrc[a0] <> #ANVIL_SPV_V_EXTRACT Or spvValueSrc[a1] <> #ANVIL_SPV_V_EXTRACT Or spvValueSrc[a2] <> #ANVIL_SPV_V_EXTRACT Or spvValueSrc[a3] <> #ANVIL_SPV_V_EXTRACT
+      ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a scaled position whose factors are not direct vertex-input components (Anvil code -20005, unsupported position arithmetic).")
+    EndIf
+    If spvValueB[a0] <> 0 Or spvValueB[a1] <> 1 Or spvValueB[a2] <> 0 Or spvValueB[a3] <> 1
+      ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a scaled position whose XY input components are swizzled (Anvil code -20005, unsupported position arithmetic).")
+    EndIf
+    a0 = avkSpvAttrOfValue(spvValueA[a0]) : a1 = avkSpvAttrOfValue(spvValueA[a1])
+    a2 = avkSpvAttrOfValue(spvValueA[a2]) : a3 = avkSpvAttrOfValue(spvValueA[a3])
+    If a0 < 0 Or a2 < 0 Or a0 <> a1 Or a2 <> a3 Or a0 = a2 Or spvPlanAttrComp[a0] <> 2 Or spvPlanAttrComp[a2] <> 2
+      ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end requires distinct vec2 position and scale inputs for its bounded GPU XY multiply (Anvil code -20005, unsupported position arithmetic).")
+    EndIf
+    spvPlanPosAttr = a0
+    ProcedureReturn avkSpvCheckVertexVaryings()
   EndIf
   If spvValueSrc[c0] <> #ANVIL_SPV_V_EXTRACT Or spvValueSrc[c1] <> #ANVIL_SPV_V_EXTRACT
     ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a vertex shader whose gl_Position.x or .y is not one component taken out of an input (Anvil code -20005, unsupported position); write gl_Position as vec4(inPosition.x, inPosition.y, 0.0, 1.0) over a two-component clip-space attribute.")

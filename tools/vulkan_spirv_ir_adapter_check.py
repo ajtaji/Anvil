@@ -515,6 +515,7 @@ def interface_cases() -> list[dict]:
 
 def fixtures() -> list[dict]:
     accepted = [
+        ("vertex position scaled by a second vec2 input", oracle.vertex_scaled()),
         ("legacy varying", oracle.fragment_varying()),
         ("legacy push constant", oracle.fragment_push()),
         ("legacy constant", oracle.fragment_constant()),

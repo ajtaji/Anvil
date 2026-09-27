@@ -43,3 +43,24 @@ diagnostics under a compile-time branch. The normal Pi 4 image contains no
 demo frame loop. To run the saved payload again, acquire the Pi 4 board lease
 and use `tools/board_run_leased.py` with `--addr 0x600000`, `--tier dma`, a
 15-second deadman, and `--expect-x0 0`; the board tool takes a fresh capture.
+
+## GPU perspective-scale follow-up
+
+The vertex front end and V3D 4.2 vertex-pair lowerer now accept a bounded
+`gl_Position = vec4(position.x * scale.x, position.y * scale.y, 0, 1)`
+shape from two distinct `vec2` vertex inputs. The coordinate and vertex QPU
+programs multiply those components before viewport conversion. The pyramid
+places the unscaled rotated XY numerator and perspective scale in separate
+attributes, so its final per-vertex projection multiply runs on V3D.
+Rotation, reciprocal scale calculation, face ordering, and vertex-buffer
+updates still run on the CPU. A general matrix transform, nonconstant clip Z/W,
+and depth attachment remain future work.
+
+The final-source RAM payload and capture are in
+`docs/evidence/vulkan-pyramid-gpu-scale-20260927/`. The PMFBOOT v2 container is
+998,880 bytes, SHA-256
+`15ef01d3012a337a19cef5475fe59cc38351d3c1e9c7086ab36ae64d68af9387`.
+On monitor build 210, the board verified the upload, returned `x0=0` after
+10.1 seconds, and produced fresh capture 76. The V3D console was restored;
+the deadman and capture were off and coretest leases were zero. No reset,
+flash, or boot-medium write was made.

@@ -92,6 +92,9 @@ Structure AvkIrV3d42VertexPlan Align #PB_Structure_AlignC
   positionInputVariableId.i
   positionInputMember.i
   positionLoadId.i
+  positionScaleVariableId.i
+  positionScaleLoadId.i
+  positionScaled.i
   varyingCount.i
   varyingComponents.i
   varyings.AvkIrV3d42VertexVarying[#ANVIL_IR_V3D42_MAX_IO]
@@ -1051,17 +1054,43 @@ Procedure.i avk42VertexWholeInputLoad(*m.AvkIrModule, valueId.i, lanes.i, *varia
   ProcedureReturn *n\sourceId
 EndProcedure
 
-Procedure.i avk42VertexPositionValue(*m.AvkIrModule, valueId.i, outputType.i, *loadOut, *variableOut)
+Procedure.i avk42VertexPositionValue(*m.AvkIrModule, valueId.i, outputType.i, *loadOut, *variableOut, *scaleLoadOut, *scaleVariableOut)
   Protected *construct.AvkIrNode = avkIrFindNode(*m, valueId)
   Protected *x.AvkIrNode
   Protected *y.AvkIrNode
+  Protected *px.AvkIrNode
+  Protected *py.AvkIrNode
+  Protected *sx.AvkIrNode
+  Protected *sy.AvkIrNode
   Protected loadId.i
   Protected variableId.i
+  Protected scaleLoad.i
+  Protected scaleVariable.i
   If *construct = 0 Or *construct\kind <> #ANVIL_IR_OP_COMPOSITE_CONSTRUCT Or *construct\operandCount <> 4 Or *construct\resultType <> outputType
     ProcedureReturn 0
   EndIf
   *x = avkIrFindNode(*m, *construct\operand0)
   *y = avkIrFindNode(*m, *construct\operand1)
+  If avk42VertexScalarBits(*m, *construct\operand2, $00000000) = 0 Or avk42VertexScalarBits(*m, *construct\operand3, $3F800000) = 0
+    ProcedureReturn 0
+  EndIf
+  PokeI(*scaleLoadOut, 0) : PokeI(*scaleVariableOut, 0)
+  If *x <> 0 And *y <> 0 And *x\kind = #ANVIL_IR_OP_FMUL And *y\kind = #ANVIL_IR_OP_FMUL
+    If *x\operandCount <> 2 Or *y\operandCount <> 2 Or avk42VertexFloatShape(*m, *x\resultType, 1) = 0 Or *y\resultType <> *x\resultType : ProcedureReturn 0 : EndIf
+    *px = avkIrFindNode(*m, *x\operand0) : *py = avkIrFindNode(*m, *y\operand0)
+    *sx = avkIrFindNode(*m, *x\operand1) : *sy = avkIrFindNode(*m, *y\operand1)
+    If *px = 0 Or *py = 0 Or *sx = 0 Or *sy = 0 : ProcedureReturn 0 : EndIf
+    If *px\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT Or *py\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT Or *sx\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT Or *sy\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT : ProcedureReturn 0 : EndIf
+    If *px\operandCount <> 1 Or *py\operandCount <> 1 Or *sx\operandCount <> 1 Or *sy\operandCount <> 1 : ProcedureReturn 0 : EndIf
+    If *px\literalCount <> 1 Or *py\literalCount <> 1 Or *sx\literalCount <> 1 Or *sy\literalCount <> 1 : ProcedureReturn 0 : EndIf
+    If *px\literal0 <> 0 Or *py\literal0 <> 1 Or *sx\literal0 <> 0 Or *sy\literal0 <> 1 Or *px\operand0 <> *py\operand0 Or *sx\operand0 <> *sy\operand0 : ProcedureReturn 0 : EndIf
+    loadId = avk42VertexWholeInputLoad(*m, *px\operand0, 2, @variableId)
+    scaleLoad = avk42VertexWholeInputLoad(*m, *sx\operand0, 2, @scaleVariable)
+    If loadId = 0 Or scaleLoad = 0 Or variableId = scaleVariable Or *px\resultType <> *x\resultType Or *sx\resultType <> *x\resultType : ProcedureReturn 0 : EndIf
+    PokeI(*loadOut, loadId) : PokeI(*variableOut, variableId)
+    PokeI(*scaleLoadOut, scaleLoad) : PokeI(*scaleVariableOut, scaleVariable)
+    ProcedureReturn 1
+  EndIf
   If *x = 0 Or *y = 0 Or *x\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT Or *y\kind <> #ANVIL_IR_OP_COMPOSITE_EXTRACT
     ProcedureReturn 0
   EndIf
@@ -1071,9 +1100,6 @@ Procedure.i avk42VertexPositionValue(*m.AvkIrModule, valueId.i, outputType.i, *l
   If avk42VertexFloatShape(*m, *x\resultType, 1) = 0 Or *y\resultType <> *x\resultType : ProcedureReturn 0 : EndIf
   loadId = avk42VertexWholeInputLoad(*m, *x\operand0, 2, @variableId)
   If loadId = 0 : ProcedureReturn 0 : EndIf
-  If avk42VertexScalarBits(*m, *construct\operand2, $00000000) = 0 Or avk42VertexScalarBits(*m, *construct\operand3, $3F800000) = 0
-    ProcedureReturn 0
-  EndIf
   PokeI(*loadOut, loadId) : PokeI(*variableOut, variableId)
   ProcedureReturn 1
 EndProcedure
@@ -1091,6 +1117,8 @@ Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
   Protected outputType.i
   Protected sourceVariable.i
   Protected sourceLoad.i
+  Protected scaleLoad.i
+  Protected scaleVariable.i
   Protected count.i
   Protected total.i
   Protected *n.AvkIrNode
@@ -1135,12 +1163,14 @@ Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
         If member >= 0 And avk42VertexPositionMemberValid(*m, *n\operand0, variableId, member) = 0
           ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, variableId, *n\sourceOpcode, 2)
         EndIf
-        sourceLoad = 0 : sourceVariable = 0
-        If avk42VertexPositionValue(*m, *n\operand1, outputType, @sourceLoad, @sourceVariable) = 0
+        sourceLoad = 0 : sourceVariable = 0 : scaleLoad = 0 : scaleVariable = 0
+        If avk42VertexPositionValue(*m, *n\operand1, outputType, @sourceLoad, @sourceVariable, @scaleLoad, @scaleVariable) = 0
           ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
         EndIf
         *p\positionOutputVariableId = variableId : *p\positionOutputMember = member
         *p\positionInputVariableId = sourceVariable : *p\positionInputMember = -1 : *p\positionLoadId = sourceLoad
+        *p\positionScaleVariableId = scaleVariable : *p\positionScaleLoadId = scaleLoad
+        *p\positionScaled = Bool(scaleVariable <> 0)
       Else
         If member >= 0 Or location < 0 Or location >= #ANVIL_IR_V3D42_MAX_IO
           ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, variableId, *n\sourceOpcode, 2)
@@ -1242,6 +1272,12 @@ Procedure.i avk42VertexValidateInputs(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan, *
   If *found = 0 Or *found\components <> 2
     ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3)
   EndIf
+  If *p\positionScaled
+    *found = avk42FindIo(*t\inputs, *t\inputCount, *p\positionScaleVariableId, -1)
+    If *found = 0 Or *found\components <> 2 Or *p\positionScaleVariableId = *p\positionInputVariableId
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionScaleVariableId, #ANVIL_IR_SPV_LOAD, 3)
+    EndIf
+  EndIf
   i = 0
   While i < *p\varyingCount
     *vary = *p + OffsetOf(AvkIrV3d42VertexPlan\varyings) + i * SizeOf(AvkIrV3d42VertexVarying)
@@ -1281,9 +1317,12 @@ Procedure.i avk42EmitVertexProgram(*p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexP
   Protected kcount.i
   Protected b.i
   Protected temp.i
+  Protected positionX.i
+  Protected positionY.i
   Protected slot.i
   Protected code.i
   Protected *pos.AvkIrV3d42Io
+  Protected *scale.AvkIrV3d42Io
   Protected *src.AvkIrV3d42Io
   Protected *vary.AvkIrV3d42VertexVarying
   If coordinate <> 0 : outSlots = 6 + *p\varyingComponents : code = @avk42VertexCsScratch[0] : Else : outSlots = 4 + *p\varyingComponents : code = @avk42VertexVsScratch[0] : EndIf
@@ -1291,24 +1330,37 @@ Procedure.i avk42EmitVertexProgram(*p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexP
   b = kcount + 4 : temp = b + inputSlots
   *pos = avk42FindIo(*t\inputs, *t\inputCount, *p\positionInputVariableId, -1)
   If *pos = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3) : EndIf
+  positionX = b + *pos\firstSlot : positionY = positionX + 1
+  If *p\positionScaled
+    *scale = avk42FindIo(*t\inputs, *t\inputCount, *p\positionScaleVariableId, -1)
+    If *scale = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionScaleVariableId, #ANVIL_IR_SPV_LOAD, 3) : EndIf
+  EndIf
   r = V3dQpuProgramBeginSeg(code, #ANVIL_IR_V3D42_CODE_BYTES, 1)
   If r <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, 0, 0, 4 + Bool(coordinate = 0)) : EndIf
   k = 0
   While k < kcount + 4 And r = 0 : r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0) : k = k + 1 : Wend
   k = 0
   While k < inputSlots And r = 0 : r = avk42EmitLdvpm(k, b + k) : k = k + 1 : Wend
-  If r = 0
-    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(b + *pos\firstSlot, kcount + 2) : r = V3dQpuEmit()
+  If *p\positionScaled <> 0 And r = 0
+    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 2, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionX, b + *scale\firstSlot) : r = V3dQpuEmit()
+    If r = 0
+      V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 3, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionY, b + *scale\firstSlot + 1) : r = V3dQpuEmit()
+    EndIf
+    If r = 0 : r = V3dQpuNop() : EndIf
+    positionX = temp + 2 : positionY = temp + 3
   EndIf
   If r = 0
-    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 1, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(b + *pos\firstSlot + 1, kcount + 3) : r = V3dQpuEmit()
+    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionX, kcount + 2) : r = V3dQpuEmit()
+  EndIf
+  If r = 0
+    V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 1, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionY, kcount + 3) : r = V3dQpuEmit()
   EndIf
   If r = 0 : r = V3dQpuNop() : EndIf
   If r = 0 : r = V3dQpuAdd1(#V3DQ_A_FTOIN, temp, 0, #V3DQ_MUX_A, temp) : EndIf
   If r = 0 : r = V3dQpuAdd1(#V3DQ_A_FTOIN, temp + 1, 0, #V3DQ_MUX_A, temp + 1) : EndIf
   If coordinate <> 0
-    If r = 0 : r = avk42EmitStvpm(0, b + *pos\firstSlot) : EndIf
-    If r = 0 : r = avk42EmitStvpm(1, b + *pos\firstSlot + 1) : EndIf
+    If r = 0 : r = avk42EmitStvpm(0, positionX) : EndIf
+    If r = 0 : r = avk42EmitStvpm(1, positionY) : EndIf
     If r = 0 : r = avk42EmitStvpm(2, kcount) : EndIf
     If r = 0 : r = avk42EmitStvpm(3, kcount + 1) : EndIf
     If r = 0 : r = avk42EmitStvpm(4, temp) : EndIf

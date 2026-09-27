@@ -206,6 +206,26 @@ Procedure vgPositionValueVariant(*m.AvkIrModule, kind.i)
   EndSelect
 EndProcedure
 
+; Two independent vec2 attributes produce gl_Position.xy through per-vertex
+; float multiplication. The first is clip position, the second is scale.
+Procedure vgScaledPosition(*m.AvkIrModule)
+  vgModule(*m,0,0,0)
+  vgVariables[2]\sourceId=12 : vgVariables[2]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE
+  vgVariables[2]\pointerType=5 : vgVariables[2]\storageClass=#ANVIL_IR_STORAGE_INPUT
+  vgInterfaces[2]=12 : *m\variableCount=3 : *m\interfaceCount=3
+  vgDecor(2,12,-1,#ANVIL_IR_DEC_LOCATION,1) : *m\decorationCount=3
+  vgNode(3,44,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[3]\operand0=12
+  vgNode(4,45,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[4]\operand0=44 : vgNodes[4]\literalCount=1 : vgNodes[4]\literal0=0
+  vgNode(5,46,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[5]\operand0=44 : vgNodes[5]\literalCount=1 : vgNodes[5]\literal0=1
+  vgNode(6,47,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[6]\operand0=41 : vgNodes[6]\operand1=45
+  vgNode(7,48,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[7]\operand0=42 : vgNodes[7]\operand1=46
+  vgNode(8,43,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4)
+  vgNodes[8]\operand0=47 : vgNodes[8]\operand1=48 : vgNodes[8]\operand2=30 : vgNodes[8]\operand3=31
+  vgNode(9,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[9]\operand0=20 : vgNodes[9]\operand1=43
+  vgNode(10,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0)
+  *m\nodeCount=11 : vgBlocks[0]\nodeCount=11
+EndProcedure
+
 ; Position destination multiplicity hostiles: the semantic target, rather
 ; than the raw pointer ID, is unique.
 Procedure vgDuplicatePosition(*m.AvkIrModule, kind.i)
@@ -507,6 +527,11 @@ Procedure.i Main()
   vgModule(@m,0,0,0) : vgTarget(@t,47,0,0,4,4) : vgFill(@t) : vgResultSentinel(@r) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : If rc<>0 : vgReport[47*#VG_STRIDE+17]=Bool(vgUntouched(@t)<>0 And vgResultIsSentinel(@r)<>0) : EndIf : vgRecord(47,rc,@r,@t)
   vgModule(@m,0,0,0) : rc=AnvilVkIrV3d42PlanVertex(@m,0) : vgReport[48*#VG_STRIDE+0]=rc : vgReport[48*#VG_STRIDE+1]=AnvilVkIrV3d42Error() : vgReport[48*#VG_STRIDE+2]=AnvilVkIrV3d42SourceId() : vgReport[48*#VG_STRIDE+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[48*#VG_STRIDE+4]=AnvilVkIrV3d42Stage()
   vgModule(@m,0,0,0) : vgTarget(@t,49,0,0,4,4) : vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,0) : vgReport[49*#VG_STRIDE+0]=rc : vgReport[49*#VG_STRIDE+1]=AnvilVkIrV3d42Error() : vgReport[49*#VG_STRIDE+2]=AnvilVkIrV3d42SourceId() : vgReport[49*#VG_STRIDE+3]=AnvilVkIrV3d42SourceOpcode() : vgReport[49*#VG_STRIDE+4]=AnvilVkIrV3d42Stage() : vgReport[49*#VG_STRIDE+17]=vgStorageUntouched(49)
+  vgScaledPosition(@m) : vgTarget(@t,50,0,0,4,4)
+  vgInputs[1]\variableId=12 : vgInputs[1]\member=-1 : vgInputs[1]\firstSlot=2 : vgInputs[1]\components=2 : t\inputCount=2
+  vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(50,rc,@r,@t)
+  rc=AnvilVkIrV3d42PlanVertex(@m,@p)
+  vgReport[50*#VG_STRIDE+17]=Bool(rc=0 And p\positionScaled<>0 And p\positionInputVariableId=10 And p\positionScaleVariableId=12 And p\positionScaleLoadId=44)
 
   vgReport[4000]=#VG_MAGIC
   ProcedureReturn @vgReport[0]
