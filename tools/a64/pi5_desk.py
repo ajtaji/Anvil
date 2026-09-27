@@ -114,13 +114,15 @@ class Machine:
     (lo, hi) ranges below 4 GiB that also belong to the model."""
 
     def __init__(self, img: pathlib.Path, procs: dict, model, windows=(),
-                 cntfrq: int = CNTFRQ_PI5, ticks_per_step: int = 1):
+                 cntfrq: int = CNTFRQ_PI5, ticks_per_step: int = 1,
+                 load: int = LOAD, stack: int = STACK):
         self.procs = procs
+        self.stack = stack
         self.cpu = cpu = A64()
         blob = img.read_bytes()
         for i, b in enumerate(blob):
-            cpu.memory[LOAD + i] = b
-        attach_symbols(cpu, img, LOAD)
+            cpu.memory[load + i] = b
+        attach_symbols(cpu, img, load)
         cpu.cntpct_per_instruction = ticks_per_step
         mem = cpu.memory
         wins = list(windows)
@@ -164,7 +166,7 @@ class Machine:
             die("the image has no procedure %s" % name)
         c = self.cpu
         c.pc = self.procs[key]
-        c.sp = STACK
+        c.sp = self.stack
         c.x[30] = RETURN
         for i, v in enumerate(args):
             c.x[i] = v & ((1 << 64) - 1)

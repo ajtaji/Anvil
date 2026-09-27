@@ -75,32 +75,36 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  Pi3EnterPayload(a) - call the address, and come back.
 ;
-;  A BLR AND NOT A BR. The payload is CALLED, so a plain `ret` at its end
-;  brings the processor back here with this monitor still resident and
-;  still owning the card, the console and the page tables. A branch would
-;  be a handover, and this board already has one of those - the loader's,
-;  which is how this image was started.
+;  A CALL AND NOT A BRANCH. The payload is CALLED, so a plain `ret` at its
+;  end brings the processor back here with this monitor still resident and
+;  still owning the card, the console and the page tables.
 ;
-;  x0 IS THE ENTRY POINT AND x0 IS ALSO THE FIRST ARGUMENT, which is
-;  convenient and worth stating rather than discovering: a payload built
-;  from this tree takes no arguments, so what it actually receives in x0
-;  is its own address, and nothing reads it.
+;  THE ENTRY ITSELF IS Anvil/Kernel/payload_call.pbi's PayloadCall(), and
+;  that is the change of 2026-09-27. This procedure used to be a `blr x0`
+;  of its own, which entered every payload with x0 = ITS OWN ENTRY ADDRESS
+;  - so a payload built --wants-services read its first instructions as
+;  the service table and refused to bind, on this board and nowhere on the
+;  desk. PayloadCall() hands over gGoX0 (the table pmfboot filled, or 0),
+;  zeroes x1..x7, invalidates the instruction cache the way the old
+;  barriers did, and brings back sp, DAIF and the payload's x0 (gGoRc).
 ;
-;  THE BARRIERS ARE THE POINT. The payload's bytes were written as DATA,
-;  with the caches on; without the instruction-cache invalidate the fetch
-;  at its entry can see whatever was there before, which is the failure
-;  that produces no message at all. Anvil/Core/memcmd.pbi has already
-;  cleaned the range by address through CacheFlushRange(); this is the
-;  fence that makes the clean visible to the fetch.
+;  PayloadEnter() clears gGoX0 on the way back out, as the Pi 4 does, so a
+;  plain `run` after a `boot` is not handed a stale table.
 ; ----------------------------------------------------------------------
 Procedure Pi3EnterPayload(a.i)
-  ASM
-    dsb sy
-    ic iallu
-    dsb sy
-    isb
-    blr x0
-  EndASM
+  PayloadEnter(a)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwPayloadReturned() - the vectors are this monitor's (it installed them
+;  at start-up, Anvil/Kernel/exceptions.pbi), and a same-level payload may
+;  have pointed VBAR somewhere else. Put ours back.
+; ----------------------------------------------------------------------
+Procedure.i HwPayloadReturned()
+  If ExceptionInstall() <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
 EndProcedure
 
 Procedure.i Pi3MonDeadmanStart(seconds.i)

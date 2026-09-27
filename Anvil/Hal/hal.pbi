@@ -1781,6 +1781,17 @@
 ;              a payload that branches on it has re-forked the thing the
 ;              capability model exists to prevent, and the ABI gate looks
 ;              for exactly that.
+;    HwPayload* (NO CAPABILITY)  THE BOARD'S HALF OF ENTERING A PAYLOAD.
+;              Anvil/Kernel/payload_call.pbi's PayloadCall() keeps the
+;              entry contract (x0 the table, x1..x7 zero, the monitor's
+;              sp and DAIF back afterwards) on every board that includes
+;              it; what it cannot know is whether this board owns the
+;              exception vectors a payload may have replaced.
+;                 HwPayloadReturned()    called once, on the monitor's own
+;                                        stack, after the payload returns.
+;                                        Reinstall this level's vectors if
+;                                        the board owns them. 1 when the
+;                                        monitor is whole again, 0 if not.
 ;    HwPwm*    (#CAP_PWM)  a modulated output and the part's own
 ;              temperature, for the `fan` family (Anvil/Core/fan_cmd.pbi).
 ;              IMPLEMENTED on the Pi 4 as RaspberryPi4/Board/hw_pwm.pi4

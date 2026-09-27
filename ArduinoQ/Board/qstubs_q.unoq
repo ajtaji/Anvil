@@ -303,10 +303,10 @@ Procedure AutoSet(a.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  RunAt(a) - branch to a loaded payload. This one is REAL and it works:
-;  the address is called through the same indirect-call shape every UEFI
-;  call in this port uses. It does not come back unless the payload
-;  returns, which is the Pi 4's contract too.
+;  RunAt(a) - branch to a loaded payload, through the one entry every
+;  board shares (PayloadEnter, Anvil/Kernel/payload_call.pbi): x0 the
+;  service table or 0, x1..x7 zero. It does not come back unless the
+;  payload returns, which is the Pi 4's contract too.
 ;
 ;  IT STANDS THE INPUT DISPATCHER DOWN FIRST, for the same reason
 ;  RaspberryPi4/Board/cache.pi4's RunAt does: a payload takes the whole
@@ -339,12 +339,18 @@ EndProcedure
 ;  (#CAP_NET is 0 and the console pumps above are no-ops), so there is
 ;  no bus master of Anvil's to stop.
 ; ----------------------------------------------------------------------
+Declare.i PayloadEnter(a.i)    ; Anvil/Kernel/payload_call.pbi, included after state.pbi
+
 Procedure RunAt(a.i)
   If a = 0
     ProcedureReturn
   EndIf
   InputPayloadSuspend()
-  QCall(a, 0, 0, 0, 0, 0)
+  ; THE ENTRY IS Anvil/Kernel/payload_call.pbi (2026-09-27). This was
+  ; QCall(a, 0, 0, 0, 0, 0), which entered every payload with x0 = 0 and
+  ; x5..x7 as they happened to be - so a payload built --wants-services
+  ; was never handed the table pmfboot filled, and refused to bind.
+  PayloadEnter(a)
 EndProcedure
 
 ; ----------------------------------------------------------------------
