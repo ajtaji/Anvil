@@ -27,10 +27,13 @@ WHAT THE MODEL DOES THAT A REGISTER STORE WOULD NOT
 
 WHAT IT CANNOT DO: say anything about silicon.  Desk proof only; silicon owed.
 
-THE FIRMWARE FALLBACK IS OWED.  thermal.pi4 falls back to the property
-mailbox; RaspberryPi4/Lib/mailbox.pi4 has no #PMF_CHIP = 2712 branch yet
-(the Pi 5 port lane owns it), so this probe never asks it.  When that
-branch lands, this gate FAILS by name until its mailbox model is extended.
+THE FIRMWARE FALLBACK.  thermal.pi4 falls back to the property mailbox,
+and RaspberryPi4/Lib/mailbox.pi4 carries the BCM2712 transport.  The model is
+the published one: mailbox@7c013880 (bcm2712.dtsi) through /soc, the
+bcm2835-mailbox.c register map, channel 8, and bus address = ARM address for
+DRAM (bcm2712.dtsi /soc dma-ranges map 0 -> 0; a BCM2711 $C0000000 alias
+in the message is refused by name).  A second run serves an INVALID AVS
+reading, so the firmware must answer and the source must say so.
 
 Run:     py -3 -B tools/a64/a64_fan_pi5_check.py --compiler <PureMetalForge.exe>
 Mutants: add --mutate (every one must be killed).
@@ -138,7 +141,22 @@ PINNED = {
     "soc_example": (0x7D001000, 0x107D001000),
     # THM
     "AVS_RO_TEMP_STATUS": 0x200, "VALID_bits": (16, 10), "DATA_genmask": (9, 0),
+    # bcm2712.dtsi: mailbox: mailbox@7c013880 { "brcm,bcm2835-mbox" };
+    # /soc dma-ranges = <0x00 0x00000000  0x00 0x00000000  0x10 0x00000000> -
+    # DRAM is at bus 0, no alias.
+    "mbox_bus": 0x7C013880, "dram_bus_offset": 0,
+    # bcm2835-mailbox.c: MAIL0_RD 0x00, MAIL0_STA 0x18, MAIL1_WRT 0x20,
+    # MAIL1_STA 0x38; ARM_MS_EMPTY BIT(30).  Channel 8 = property tags.
+    "MAIL0_RD": 0x00, "MAIL0_STA": 0x18, "MAIL1_WRT": 0x20, "MAIL1_STA": 0x38,
+    "ARM_MS_EMPTY": 1 << 30, "channel": 8,
+    # raspberrypi-firmware.h
+    "TAG_TEMPERATURE": 0x00030006, "TAG_MAX_TEMPERATURE": 0x0003000A,
 }
+
+# What the modelled firmware answers - not a value any AVS code converts to
+# exactly, so the fallback run can tell which source answered.
+FW_TEMP_MILLI = 61234
+FW_TEMP_MAX_MILLI = 85000
 
 
 class Facts:
@@ -187,6 +205,7 @@ class Facts:
         self.valid = sum(1 << x for x in P["VALID_bits"])
         self.slope, self.offset = P["coefficients"]
         self.uart_dr = self.soc(0x7D001000)
+        self.mbox = self.soc(P["mbox_bus"])
         self.uart_fr = self.uart_dr + 0x18
 
     def bank(self, g):
@@ -308,8 +327,11 @@ C_CODES = [780, 740, 736, 720, 700, 680, 700, 736, 740, 745, 736, 600]
 
 
 class Board:
-    def __init__(self, cpu, f: Facts):
+    def __init__(self, cpu, f: Facts, avs_b_valid: bool = True):
         self.cpu, self.f = cpu, f
+        self.avs_b_valid = avs_b_valid
+        self.reply = None
+        self.tags: list[int] = []
         self.uart = bytearray()
         self.ticks = 0
         self.fails: list[str] = []
@@ -377,14 +399,61 @@ class Board:
     def phase_c(self):
         return b"=== C curve ===" in self.uart
 
+    def mailbox_write(self, msg):
+        P = PINNED
+        if msg & 0xF != P["channel"]:
+            die("the image used mailbox channel %d, not %d" % (msg & 0xF, P["channel"]))
+        bus = msg & ~0xF
+        if bus & 0xC0000000:
+            die("the mailbox message carries $%08X - the BCM2711's $C0000000 alias; "
+                "on a BCM2712 DRAM is at bus 0 (dma-ranges)" % bus)
+        arm = bus - P["dram_bus_offset"]
+        ld, st = self.cpu.load, self.cpu.store
+        total = ld(arm, 4)
+        if total < 12 or total % 4 or total > 4096 or ld(arm + 4, 4) != 0:
+            die("a malformed property buffer at $%X" % arm)
+        off = 8
+        while True:
+            tag = ld(arm + off, 4)
+            if tag == 0:
+                break
+            vb = ld(arm + off + 4, 4)
+            self.tags.append(tag)
+            if tag == P["TAG_TEMPERATURE"]:
+                val = FW_TEMP_MILLI
+            elif tag == P["TAG_MAX_TEMPERATURE"]:
+                val = FW_TEMP_MAX_MILLI
+            else:
+                die("the fan stack sent tag $%08X; it should only ask for the "
+                    "temperature and the maximum" % tag)
+            st(arm + off + 12, 0, 4)
+            st(arm + off + 16, val, 4)
+            st(arm + off + 8, 0x80000000 | 8, 4)
+            off += 12 + vb
+        st(arm + 4, 0x80000000, 4)
+        self.reply = msg
+
     def load(self, a, size):
         f = self.f
         if a == f.uart_fr:
             return 0
+        P = PINNED
+        if f.mbox <= a < f.mbox + 0x40:
+            off = a - f.mbox
+            if off == P["MAIL1_STA"]:
+                return 0
+            if off == P["MAIL0_STA"]:
+                return 0 if self.reply is not None else P["ARM_MS_EMPTY"]
+            if off == P["MAIL0_RD"]:
+                if self.reply is None:
+                    die("the image read an empty mailbox")
+                r, self.reply = self.reply, None
+                return r
+            die("read of mailbox +$%02X, which the transport never needs" % off)
         if a == f.avs_status:
             self.avs_reads += 1
             if not self.phase_c():
-                return f.valid | B_CODE
+                return (f.valid if self.avs_b_valid else 0) | B_CODE
             code = self.c_codes.pop(0) if self.c_codes else C_CODES[-1]
             self.c_served.append(code)
             return f.valid | code
@@ -430,6 +499,11 @@ class Board:
         if a == f.uart_dr:
             self.uart.append(v & 0xFF)
             return
+        if a == f.mbox + PINNED["MAIL1_WRT"]:
+            self.mailbox_write(v)
+            return
+        if f.mbox <= a < f.mbox + 0x40:
+            die("write to mailbox +$%02X, which is not MAIL1_WRT" % (a - f.mbox))
         self.writes.append((len(self.uart), a, v))
         if f.pwm0 <= a < f.pwm0 + 0x100:
             die("a write to rp1_pwm0 (+$%X): the fan is on rp1_pwm1" % (a - f.pwm0))
@@ -480,13 +554,13 @@ class Board:
         die("unmodelled MMIO write at $%X = $%X" % (a, v))
 
 
-def run(img: pathlib.Path, f: Facts, limit=60_000_000):
+def run(img: pathlib.Path, f: Facts, limit=60_000_000, avs_b_valid=True):
     cpu = A64()
     for i, b in enumerate(img.read_bytes()):
         cpu.memory[LOAD + i] = b
     attach_symbols(cpu, img, LOAD)
     cpu.pc, cpu.sp, cpu.x[30] = LOAD, STACK, LR
-    board = Board(cpu, f)
+    board = Board(cpu, f, avs_b_valid)
     mem = cpu.memory
 
     def bcm2711(a):
@@ -615,13 +689,14 @@ def check(fails: list, work: pathlib.Path) -> int:
 
     hal = {k: const(REL_HAL, k) for k in (
         "#HW_PWM_OK", "#HW_PWM_PIN", "#HW_PWM_HZ", "#HW_PWM_DUTY", "#HW_PWM_STATE",
-        "#HW_PWM_KIND_NONE", "#HW_PWM_KIND_HARD", "#HW_TEMP_SRC_REGISTER")}
+        "#HW_PWM_KIND_NONE", "#HW_PWM_KIND_HARD", "#HW_TEMP_SRC_REGISTER",
+        "#HW_TEMP_SRC_FIRMWARE")}
 
-    # The firmware fallback: see the docstring.
+    # The firmware transport must exist on this chip, or the probe's
+    # mailbox rows would talk to the BCM2711's addresses.
     mbx = pi5_view(source(REL_MBX)) != source(REL_MBX)
-    expect(not mbx, "RaspberryPi4/Lib/mailbox.pi4 now has a #PMF_CHIP = 2712 branch: "
-           "extend this gate's mailbox model and set the probe's #FAN_MBX = 1, so "
-           "the Pi 5 firmware fallback is proven instead of owed")
+    expect(mbx, "RaspberryPi4/Lib/mailbox.pi4 has no #PMF_CHIP = 2712 branch, so the "
+           "Pi 5 firmware fallback cannot be asked")
 
     img = build(work)
     board, x0, steps = run(img, f)
@@ -660,6 +735,24 @@ def check(fails: list, work: pathlib.Path) -> int:
            % (s.one("B milli"), B_CODE, f.slope * B_CODE + f.offset))
     expect(s.one("B source") == hal["#HW_TEMP_SRC_REGISTER"], "B: the source is not the register")
     expect(s.one("B bound") == 1, "B: the thermal seam was not bound after a good read")
+    expect(s.one("B mbxinit") == 1, "B: MailboxInit failed on the BCM2712 transport")
+    expect(s.one("B mbxmilli") == FW_TEMP_MILLI and s.one("B maxmilli") == FW_TEMP_MAX_MILLI,
+           "B: the firmware said %s / %s, want %d / %d"
+           % (s.one("B mbxmilli"), s.one("B maxmilli"), FW_TEMP_MILLI, FW_TEMP_MAX_MILLI))
+
+    # ---- B, again: the register answers INVALID, the firmware must answer --
+    fb, fx0, _ = run(img, f, avs_b_valid=False)
+    ft = fb.uart.decode("utf-8", "replace")
+    fs = Said(ft)
+    expect(fs.one("B milli") == FW_TEMP_MILLI,
+           "fallback: with the AVS invalid HwTempMilliC gave %s, the firmware says %d"
+           % (fs.one("B milli"), FW_TEMP_MILLI))
+    expect(fs.one("B source") == hal["#HW_TEMP_SRC_FIRMWARE"],
+           "fallback: the source is %s, not the firmware" % fs.one("B source"))
+    expect(fs.one("B bound") == 0, "fallback: the seam was bound with no good reading")
+    expect(fs.one("END fails") == 0 and fx0 == 0, "fallback run: the probe disagreed with itself")
+    expect(set(fb.tags) == {PINNED["TAG_TEMPERATURE"], PINNED["TAG_MAX_TEMPERATURE"]},
+           "fallback: tags asked %s" % sorted("%08X" % x for x in set(fb.tags)))
 
     # ---- P: refusals touch nothing; the begin programs the DTB's channel ----
     first_hw = min((u for u, a, v in board.writes), default=None)
@@ -791,6 +884,9 @@ MUTATIONS = [
     (REL_LIB, "End stops the fan", "PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, rp1pwm_range)", "PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, 0)"),
     (REL_HOST, "a 25 kHz default instead of the DTB period", "#PI5_FAN_HZ  = 24058", "#PI5_FAN_HZ  = 25000"),
     (REL_AVS, "the Pi 4 line on a Pi 5", "#AVS_TEMP_SLOPE  = -550", "#AVS_TEMP_SLOPE  = -487"),
+    (REL_HOST, "the firmware reported as the register",
+     "    Case #THERM_SRC_MAILBOX\n      ProcedureReturn #HW_TEMP_SRC_FIRMWARE",
+     "    Case #THERM_SRC_MAILBOX\n      ProcedureReturn #HW_TEMP_SRC_REGISTER"),
     (REL_HWMOD, "the Pi 4 AVS address on a Pi 5", "#HWDEV_AVS_MONITOR = $107D542000", "#HWDEV_AVS_MONITOR = $FD5D2000"),
 ]
 
