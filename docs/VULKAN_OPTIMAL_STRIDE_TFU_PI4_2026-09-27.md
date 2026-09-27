@@ -43,6 +43,10 @@ interpreted AArch64 instructions and compiled all eight current Pi 4 board
 diagnostics. The normal Pi 4 image compiled at 4,327,804 bytes on the
 combined tree, and its generated source build stamp was restored. The
 standalone atlas acceptance checker also passed its synthetic fixture.
+The full public pipeline gate passed 772 checks over 203,706,551 interpreted
+AArch64 instructions. Its optimal-image command fixture verified that an
+18-texel source row reaches the backend as a 72-byte TFU pitch, while a
+16-texel row is refused for a 17-texel-wide image.
 
 This is one complete image, one mip, one layer, one sample and one BGRA8
 format. Partial optimal regions, multiple optimal copies in a submission,
