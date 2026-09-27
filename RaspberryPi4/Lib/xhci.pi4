@@ -3366,12 +3366,29 @@ EndProcedure
 ; event names the TRB that ended it: normally the last (it carries IOC),
 ; but a short packet or an error ends the descriptor at whichever TRB it
 ; happened on. wantLo = 0 means any transfer of the right type.
+; A TRANSFER DESCRIPTOR THAT WRAPS THE RING IS REFUSED, LOUDLY, AT ONCE.
+; The match below is a contiguous address range, first..last TRB. A TD
+; that crossed the Link TRB would have its last TRB BELOW its first, no
+; event could ever match, and the transfer would report a five-second
+; timeout - a silent wrong answer about the device for what is a driver
+; fault. xh_RingRoom pads every control and bulk TD so this cannot happen
+; today; this is the assert that keeps it true (a64_hid_check's
+; straddle-the-link measured it, 2026-09-27). A wrap-aware match was the
+; alternative and was not chosen: xh_Bulk's residual arithmetic
+; ((xh_evTrb - firstTrb) / 16) assumes the same contiguity, so a
+; wrap-aware match alone would trade a timeout for a wrong byte count.
+#XHCI_ERR_TD_WRAP = 50
+
 Procedure.i xh_WaitEventFor(expect.i, wantLo.i, wantHi.i, ms.i)
   Define at.i
   Define d.i
   Define ty.i
   Define t0.i
   Define site.i
+
+  If wantLo <> 0 And wantHi < wantLo
+    ProcedureReturn xh_Fail(#XHCI_ERR_TD_WRAP)
+  EndIf
 
   ; WHICH LEDGER ROW. A command completion is answered by the CONTROLLER
   ; and a transfer event by a DEVICE on a wire, so they are different
@@ -7204,6 +7221,8 @@ CompilerEndIf
       ProcedureReturn "xhci: Reset Endpoint and Set TR Dequeue both ran and the endpoint is still halted - the pipe is gone, re-address the device"
     Case #XHCI_ERR_GONE
       ProcedureReturn "xhci: a controller register read back with every bit set - that is the bus answering for a device that is no longer on it, not a value this controller can produce, so check PCI Express and the BAR before anything about USB"
+    Case #XHCI_ERR_TD_WRAP
+      ProcedureReturn "xhci: a transfer descriptor was queued across the ring's Link TRB - its completion could never be matched, so it was refused instead of timing out; this is a driver fault (xh_RingRoom must pad every TD), not a device fault"
     Case #XHCI_ERR_HCE
       ProcedureReturn "xhci: HCHalted never set and USBSTS bit 12 (Host Controller Error) is 1 - the controller reports an internal error it cannot leave on its own; xHCI 1.2 section 4.24.1 answers that with HCRST, which the reset path issues, so if this recurs on every start the error is a hard one and the part needs a power cycle"
   EndSelect

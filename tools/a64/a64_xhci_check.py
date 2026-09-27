@@ -1097,6 +1097,10 @@ ex("a null destination is refused", -1)
 ex("with the argument error", E_ARG)
 ex("a length past the bounce buffer is refused", -1)
 ex("with the argument error again", E_ARG)
+# 11b. a wrapped TD is refused loudly and at once
+ex("a TD whose last TRB is below its first is refused", 0)
+ex("with #XHCI_ERR_TD_WRAP", 50)
+ex("inside 10 ms - no timeout was waited out", 1)
 # 12. the arena
 ex("the arena did not overflow", None)     # patched below - a range test
 ex("check count", None)
@@ -1200,6 +1204,13 @@ BREAKAGES = {
     "no-ioc": (
         "  f3 = #XHCI_TRB_IOC | (#XHCI_TRB_STATUS << 10)",
         "  f3 = (#XHCI_TRB_STATUS << 10)"),
+    # ---- a wrapped TD, added 2026-09-27 ----------------------------------
+    # Without the assert a TD across the Link TRB waits out its whole
+    # timeout and reports #XHCI_ERR_EVT_TIMEOUT - a device fault that is
+    # really a driver fault.
+    "no-td-wrap-assert": (
+        "  If wantLo <> 0 And wantHi < wantLo\n    ProcedureReturn xh_Fail(#XHCI_ERR_TD_WRAP)\n  EndIf\n",
+        ""),
     # ---- root-port power, added 2026-09-26 -------------------------------
     # The Pi 4 path never powers its root ports: port 2 stays dark.
     "no-root-port-power": (
