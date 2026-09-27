@@ -213,7 +213,7 @@ remains missing.
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
 - Buffer/image copies beyond the implemented tightly packed whole-image
-  buffer-to-optimal-image TFU transfer, one rectangular linear-image DMA
+  buffer-to-optimal-image TFU transfer, one rectangular buffer-to-linear-image DMA upload, one rectangular linear-image DMA
   copy and one rectangular linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
   clears and multi-range clears remain missing. TFU is not represented as a
   general memcpy.

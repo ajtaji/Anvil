@@ -3282,7 +3282,7 @@ Procedure.i Main()
 
   ; Read the same tight linear image back through the public buffer command.
   bufci\size = avkImgSize[avkImgSlot(img)] + 64
-  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
   If vkCreateBuffer(dev, @bufci, 0, @copyBuf) <> #VK_SUCCESS : ProcedureReturn pgStop(93) : EndIf
   vkGetBufferMemoryRequirements(dev, copyBuf, @req)
   mai\allocationSize = req\size : mai\memoryTypeIndex = 0
@@ -3362,6 +3362,57 @@ Procedure.i Main()
   vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
   pgPut(733, vkEndCommandBuffer(cmd))
   pgPut(734, AnvilVkSubmissionOutstanding())
+
+  ; Upload the readback rectangle into a differently pitched linear image.
+  imgci\extent\width = 32 : imgci\extent\height = 32
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img2) <> #VK_SUCCESS : ProcedureReturn pgStop(96) : EndIf
+  vkGetImageMemoryRequirements(dev, img2, @req)
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @mem2) <> #VK_SUCCESS : ProcedureReturn pgStop(97) : EndIf
+  If vkBindImageMemory(dev, img2, mem2, 0) <> #VK_SUCCESS : ProcedureReturn pgStop(98) : EndIf
+  i = 0
+  While i < avkImgSize[avkImgSlot(img2)]
+    PokeA(AnvilVkImageAddress(img2) + i, $A5)
+    i = i + 1
+  Wend
+  bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = img2
+  copyRegion\bufferOffset = 64
+  copyRegion\imageOffset\x = 7 : copyRegion\imageOffset\y = 9
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  pgPut(735, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(736, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(737, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To 31
+    For j = 0 To 31
+      For i = 0 To 3
+        If j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = (((k - 9 + 5) * #PG_W + (j - 7 + 3)) * 4 + i) * 37 + 11
+          rc = rc & $FF
+        Else
+          rc = $A5
+        EndIf
+        If PeekA(AnvilVkImageAddress(img2) + (k * 32 + j) * 4 + i) <> rc : count = count + 1 : EndIf
+      Next
+    Next
+  Next
+  pgPut(738, count)
+  pgPut(739, AnvilVkImageLayout(img2))
+  copyRegion\imageOffset\x = 31
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  pgPut(740, vkEndCommandBuffer(cmd))
+  pgPut(741, AnvilVkSubmissionOutstanding())
+  vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
+  vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE
   vkFreeMemory(dev, copyMem, 0) : copyMem = #VK_NULL_HANDLE
 
