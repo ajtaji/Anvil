@@ -41,6 +41,125 @@
 ;  being multi-core safe.
 ; ======================================================================
 
+; ======================================================================
+;  BCM2712 (Pi 5, -t pi5, #PMF_CHIP = 2712) - THE SAME SEAM OVER RP1.
+;
+;  On the Pi 5 the 40-pin header is not the SoC's GPIO at all; it is the
+;  RP1 southbridge's bank 0, a different peripheral IP. So on 2712 these
+;  wrappers sit on RaspberryPi4/Lib/gpio_rp1.pi4 (Rule 30's "different IP
+;  gets a thin host file"), which the board lists INSTEAD of gpio.pi4
+;  for the pin calls. The Pi 4 branch below the CompilerElse is untouched
+;  and is what -t pi4 compiles, byte for byte.
+;
+;  WHAT CHANGES IN THE TRANSLATION, and why each line is here:
+;    * Mode: RP1 splits "which function" (IO_BANK0 CTRL FUNCSEL) from "which
+;      way SIO drives" (SYS_RIO0 OE). FUNCSEL 5 is the plain-GPIO function
+;      (pinctrl-rp1.c:101); only then does OE decide input vs output. Any
+;      other table column 0..8 is an alternate function, and its NUMBER is
+;      the column - pinctrl-rp1.c's PIN() rows list a0..a8 in order, no
+;      BCM2711-style out-of-order codes to undo.
+;    * FUNCSEL >= 9 is RP1_FSEL_NONE (pinctrl-rp1.c:102-103; $1F is the
+;      hardware's "no function"). The pin has no function at all, which is
+;      neither input, output nor a nameable alternate, so ModeGet answers
+;      -1 and the `gpio` report prints "??" rather than a plausible word.
+;    * Pull: RP1's field is 1 = DOWN, 2 = UP - the REVERSE of the BCM2711
+;      (gpio_rp1.pi4's header). Mapped by name, both directions, so the
+;      reversal lives in exactly one pair of Selects.
+;    * Extent: gpio_rp1.pi4 drives bank 0 only (RP1 GPIO 0..27), which is
+;      exactly the header, so Count and UserMax are both that bank.
+;    * Reserved: the console. The first Pi 5 Anvil boot was captured from
+;      RP1 UART0 on header pins 8/10 (vault HARDWARE-BRINGUP.md, 2026-09-26
+;      18:09), which are RP1 GPIO 14/15 on FUNCSEL 4 (pinctrl-rp1.c:496-497,
+;      column a4 = uart0). The Pi 5 radio is on BCM2712 SDIO2 pins, not RP1
+;      bank 0, so it has nothing to reserve here.
+;
+;  DESK-PROOF ONLY (tools/a64/gpio_rp1_check.py). Silicon owed.
+; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+
+Procedure.i HwGpioCount()
+  ProcedureReturn #RP1_PIN_MAX + 1
+EndProcedure
+
+Procedure.i HwGpioUserMax()
+  ProcedureReturn #RP1_PIN_MAX
+EndProcedure
+
+Procedure.i HwGpioModeGet(pin.i)
+  Define f.i
+  f = Rp1FuncSelGet(pin)
+  If f < 0
+    ProcedureReturn -1
+  EndIf
+  If f = #RP1_FUNCSEL_GPIO
+    If Rp1PinModeGet(pin) = 1
+      ProcedureReturn #HW_GPIO_OUT
+    EndIf
+    ProcedureReturn #HW_GPIO_IN
+  EndIf
+  If f <= 8
+    ProcedureReturn #HW_GPIO_ALT
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwGpioAltGet(pin.i)
+  Define f.i
+  f = Rp1FuncSelGet(pin)
+  If f < 0 Or f = #RP1_FUNCSEL_GPIO Or f > 8
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn f
+EndProcedure
+
+Procedure.i HwGpioLevelGet(pin.i)
+  ProcedureReturn Rp1DigitalRead(pin)
+EndProcedure
+
+Procedure.i HwGpioPullGet(pin.i)
+  Select Rp1PinPullGet(pin)
+    Case #RP1_PULL_NONE
+      ProcedureReturn #HW_PULL_NONE
+    Case #RP1_PULL_UP
+      ProcedureReturn #HW_PULL_UP
+    Case #RP1_PULL_DOWN
+      ProcedureReturn #HW_PULL_DOWN
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; #HW_GPIO_ALT is refused for the same reason as on the Pi 4: "some
+; alternate" is not a whole instruction.
+Procedure.i HwGpioMode(pin.i, mode.i)
+  If mode = #HW_GPIO_IN
+    ProcedureReturn Rp1PinMode(pin, 0)
+  EndIf
+  If mode = #HW_GPIO_OUT
+    ProcedureReturn Rp1PinMode(pin, 1)
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwGpioWrite(pin.i, level.i)
+  If level = 0
+    ProcedureReturn Rp1DigitalWrite(pin, #RP1_PIN_LOW)
+  EndIf
+  ProcedureReturn Rp1DigitalWrite(pin, #RP1_PIN_HIGH)
+EndProcedure
+
+Procedure.i HwGpioToggle(pin.i)
+  ProcedureReturn Rp1PinToggle(pin)
+EndProcedure
+
+Procedure.i HwGpioReservedReason(pin.i)
+  If pin = 14 Or pin = 15
+    ProcedureReturn "the serial console this prompt is arriving on: RP1 UART0 is on GPIO 14 and 15 (header pins 8 and 10), and driving either would cut the console mid-command"
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+CompilerElse
+
 ; ----------------------------------------------------------------------
 ;  Extent.
 ; ----------------------------------------------------------------------
@@ -231,3 +350,4 @@ Procedure.i HwGpioReservedReason(pin.i)
   EndIf
   ProcedureReturn 0
 EndProcedure
+CompilerEndIf
