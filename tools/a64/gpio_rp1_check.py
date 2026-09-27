@@ -198,7 +198,7 @@ def gate(cc, override, workdir):
     OUT, OE = SYS_RIO0, SYS_RIO0 + 4
 
     # --- extent -----------------------------------------------------------
-    check(call("HwGpioCount") == 28, "HwGpioCount is not RP1 bank 0's 28 lines")
+    check(call("HwGpioCount") == 54, "HwGpioCount is not RP1's 54 lines (banks 0..2)")
     check(call("HwGpioUserMax") == 27, "HwGpioUserMax is not 27")
 
     # --- address arithmetic ----------------------------------------------
@@ -363,8 +363,16 @@ def gate(cc, override, workdir):
               "drive on bad pin %d accepted" % p)
     check(not rp1.log, "a bad pin reached RP1: %r" % rp1.log[:3])
     check(call("Rp1GpioBadPinCount") >= 21, "bad pins were not counted")
-    check(call("HwGpioCount") == 28 and call("HwGpioUserMax") == 27,
-          "hw_gpio's advertised extent moved - #RP1_PIN_MAX still means the header")
+    check(call("HwGpioCount") == 54 and call("HwGpioUserMax") == 27,
+          "hw_gpio advertises something other than 54 lines with header max 27")
+    # the advertised count and the reachable set agree: the last line
+    # works through the seam, the first line past it is refused
+    check(call("HwGpioMode", 53, H["#HW_GPIO_IN"]) == 1 and
+          call("HwGpioModeGet", 53) == H["#HW_GPIO_IN"], "GPIO53 (line 54 of 54) refused")
+    rp1.log.clear()
+    check(call("HwGpioMode", 54, H["#HW_GPIO_OUT"]) == 0 and
+          call("HwGpioModeGet", 54) == -1 and not rp1.log,
+          "pin 54 (past the advertised count) was not refused untouched")
 
     # --- the console is reserved --------------------------------------------
     for p in (14, 15):
@@ -425,6 +433,8 @@ MUTATIONS = [
     (REL_LIB, "unsupported current rounded to 2 mA", "    Default\n      ProcedureReturn 0\n  EndSelect\n  Rp1GpioBarrier()\n  a = Rp1PadAddr(pin)\n  v = Rp1ReadReg(a)\n  v = v & ~(#RP1_PAD_DRIVE_MASK2",
      "    Default\n      code = 0\n  EndSelect\n  Rp1GpioBarrier()\n  a = Rp1PadAddr(pin)\n  v = Rp1ReadReg(a)\n  v = v & ~(#RP1_PAD_DRIVE_MASK2"),
     (REL_LIB, "drive written over the whole pad", "  v = v & ~(#RP1_PAD_DRIVE_MASK2 << #RP1_PAD_DRIVE_SHIFT)\n", "  v = 0\n"),
+    (REL_HW, "2712 count left at the header's 28",
+     "  ProcedureReturn #RP1_GPIO_LAST + 1", "  ProcedureReturn #RP1_PIN_MAX + 1"),
     (REL_HW, "2712 ModeGet reads OE inverted",
      "    If Rp1PinModeGet(pin) = 1\n      ProcedureReturn #HW_GPIO_OUT",
      "    If Rp1PinModeGet(pin) = 0\n      ProcedureReturn #HW_GPIO_OUT"),
