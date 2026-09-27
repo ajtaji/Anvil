@@ -1649,7 +1649,11 @@ CompilerIf #PMF_CHIP = 2712
                     ; seam (hw_gpio.pi4's 2712 branch). Desk-proved; silicon owed.
   #CAP_I2C      = 1   ; RP1 I2C1 (DesignWare) through Lib/i2c_dw.pi4 under the
                     ; HwI2c* seam (hw_i2c.pi4's 2712 branch). Desk-proved; silicon owed.
-  #CAP_TOUCH    = 0   ; PI 5 NOT YET: the Pi 4 panel's bus is BCM2711 BSC0.
+  #CAP_TOUCH    = 1   ; the panel MCU ($45) and Goodix touch on the camera/display
+                    ; connector's RP1 I2C (CAM/DISP 1 = I2C4 by default, `touch bus
+                    ; display0` for CAM/DISP 0) through i2c.pi4's 2712 branches over
+                    ; Lib/i2c_dw.pi4. I2C only - no DSI video yet. Desk-proved
+                    ; (tools/a64/a64_touch_pi5_check.py); silicon owed.
   #CAP_MMC      = 1   ; the same SD host, raw, through HwMmc* (Board/hw_mmc.pi4).
   #CAP_USB      = 1   ; RP1's DWC3 xHCI behind PCIe, through the shared
                     ; Lib/pcie.pi4 + Lib/xhci.pi4 2712 branches; keyboard and
@@ -2302,10 +2306,18 @@ CompilerIf #PMF_CHIP = 2712
       Print(" did not check (fdt ")
       PrintDec(FdtError())
       PrintN("), so the DMA")
-      PrintN("   channel mask and the radio's pin stepping are not set: the processor")
-      PrintN("   draws the screen and `wifi` will refuse.")
+      PrintN("   channel mask, the RAM size and the radio's pin stepping are not set: the")
+      PrintN("   processor draws the screen, the MMU maps only the first GiB, and `wifi`")
+      PrintN("   will refuse.")
       ProcedureReturn
     EndIf
+    ; THE RAM THE MMU MAY MAP: the RAM bank that starts at 0, from the LIVE
+    ; /memory - the bootloader rewrites that node for the board it is on, so
+    ; the file's placeholder is not the answer. MmuSetRamBytes (Lib/mmu.pi4)
+    ; ignores anything under 1 GiB, rounds down to a whole GiB and stops at
+    ; the SoC window. This runs from Main before anything turns the MMU or
+    ; the caches on, so the first MmuBuildTables already has it.
+    MmuSetRamBytes(FdtMemoryEndFromZero())
     node = FdtFindNode("/axi/dma@10600")
     p = 0
     If node <> 0
@@ -2320,7 +2332,14 @@ CompilerIf #PMF_CHIP = 2712
       PrintN("!! the device tree names no /axi/dma@10600 channel mask, so the")
       PrintN("   processor draws the screen.")
     EndIf
-    If FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0
+    ; BOTH STEPPINGS NAMED IS A TREE THAT CONTRADICTS ITSELF, and picking
+    ; one would mux the radio's pins for a chip that may not be this one.
+    ; sdio.pi4's own reader refused it before f4beb01; the refusal stays,
+    ; here: nothing is set, so `wifi` refuses rather than guesses.
+    If FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0 And FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
+      PrintN("!! the firmware device tree names BOTH the C0 and the D0 pinctrl, so the")
+      PrintN("   radio's pin stepping is not set and `wifi` will refuse.")
+    ElseIf FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0
       SdioSetPinctrl(#SDIO_PINCTRL_C0)
     ElseIf FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
       SdioSetPinctrl(#SDIO_PINCTRL_D0)
@@ -3108,11 +3127,7 @@ Procedure Main()
     ; there is no RequireCap: a board without the include does not have
     ; the command at all.
     ElseIf WordIs("touch") <> 0
-      CompilerIf #PMF_CHIP = 2712
-      RequireCap(#CAP_TOUCH, "touch", "the Pi 4 panel's touch controller is on the BCM2711's display I2C, and this Raspberry Pi 5 build has no display-connector I2C driver yet")
-      CompilerElse
       CmdTouch()
-      CompilerEndIf
     ; dsi - the other half of the same ribbon: the SoC's DSI1 host, the
     ; panel's own init table, and the HVS and pixel valve behind them.
     ; A whole word only; d is dump. This board's own, so no RequireCap.
