@@ -1,0 +1,149 @@
+; ======================================================================
+;  hw_spi.pi4 - the HwSpi* backend (Anvil/Hal/hal.pbi, #CAP_SPI). THE
+;  BOARD SIDE OF THE SPI SEAM; Anvil/Bus/spi.pbi and the `spi` command
+;  above it know bus numbers, chip selects, modes and #HW_SPI_* codes,
+;  never a register.
+;
+;  BCM2712 (Pi 5) ONLY, today: thin wrappers over RaspberryPi4/Lib/
+;  spi_dw.pi4 (RP1 SPI0, a DesignWare SSI). The board lists this file only
+;  where #CAP_SPI = 1. The Pi 4 declares #CAP_SPI = 0 and does not include
+;  it; its SPI0 (bus 0x7E204000 = ARM $FE204000, Broadcom's own SPI master
+;  - CS/FIFO/CLK/DLEN registers, not a DesignWare SSI - on GPIO 7-11 ALT0)
+;  would be a CompilerElse branch here over its own thin host file. A
+;  different IP again, so nothing below is shared with it.
+;
+;  BUS 0 = Linux spi0 on the header (GPIO 9/10/11, CE0 GPIO 8, CE1 GPIO
+;  7), so `spi` and /dev/spidev0.N agree on which wires they mean.
+;
+;  DESK-PROOF ONLY (tools/a64/spi_dw_check.py). Silicon owed.
+; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+
+#PI5_SPI_HEADER_BUS = 0
+
+Procedure.i SpiMapCode(c.i)
+  Select c
+    Case #SPIDW_OK
+      ProcedureReturn #HW_SPI_OK
+    Case #SPIDW_ARG
+      ProcedureReturn #HW_SPI_ARG
+    Case #SPIDW_RANGE
+      ProcedureReturn #HW_SPI_ARG
+  EndSelect
+  ; TIMEOUT and NODEV: the controller did not do the transfer.
+  ProcedureReturn #HW_SPI_IO
+EndProcedure
+
+Procedure.i HwSpiDefaultBus()
+  ProcedureReturn #PI5_SPI_HEADER_BUS
+EndProcedure
+
+Procedure.i HwSpiBusValid(bus.i)
+  If bus = #PI5_SPI_HEADER_BUS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwSpiCsCount(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #SPIDW_CS_COUNT
+EndProcedure
+
+Procedure.i HwSpiUp(bus.i, hz.i, mode.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn #HW_SPI_NOBUS
+  EndIf
+  ProcedureReturn SpiMapCode(SpiDwUp(hz, mode))
+EndProcedure
+
+Procedure.i HwSpiDown(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn #HW_SPI_NOBUS
+  EndIf
+  SpiDwDown()
+  ProcedureReturn #HW_SPI_OK
+EndProcedure
+
+; The achieved rate (never above the one asked for), or a negative code.
+Procedure.i HwSpiSetSpeed(bus.i, hz.i)
+  Define r.i
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn #HW_SPI_NOBUS
+  EndIf
+  If SpiDwIsUp() = 0
+    ProcedureReturn #HW_SPI_ARG
+  EndIf
+  r = SpiDwUp(hz, SpiDwMode())
+  If r <> #SPIDW_OK
+    ProcedureReturn SpiMapCode(r)
+  EndIf
+  ProcedureReturn SpiDwRate()
+EndProcedure
+
+Procedure.i HwSpiGetSpeed(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn #HW_SPI_NOBUS
+  EndIf
+  ProcedureReturn SpiDwRate()
+EndProcedure
+
+Procedure.i HwSpiGetMode(bus.i)
+  If HwSpiBusValid(bus) = 0 Or SpiDwIsUp() = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn SpiDwMode()
+EndProcedure
+
+Procedure.i HwSpiRateMin(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SpiDwRateMin()
+EndProcedure
+
+Procedure.i HwSpiRateMax(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn SpiDwRateMax()
+EndProcedure
+
+Procedure.i HwSpiXfer(bus.i, cs.i, *tx, *rx, n.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn #HW_SPI_NOBUS
+  EndIf
+  ProcedureReturn SpiMapCode(SpiDwXfer(cs, *tx, *rx, n))
+EndProcedure
+
+Procedure.i HwSpiPin(bus.i, which.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn -1
+  EndIf
+  Select which
+    Case #HW_SPI_MOSI
+      ProcedureReturn #SPIDW_PIN_MOSI
+    Case #HW_SPI_MISO
+      ProcedureReturn #SPIDW_PIN_MISO
+    Case #HW_SPI_SCLK
+      ProcedureReturn #SPIDW_PIN_SCLK
+    Case #HW_SPI_CS0
+      ProcedureReturn #SPIDW_PIN_CE0
+    Case #HW_SPI_CS1
+      ProcedureReturn #SPIDW_PIN_CE1
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; The data pins' function. The chip selects are plain GPIO outputs
+; (bcm2712-rpi.dtsi cs-gpios), which `gpio` reports as "output".
+Procedure.i HwSpiPinFunc(bus.i)
+  If HwSpiBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn "alt0"
+EndProcedure
+
+CompilerEndIf

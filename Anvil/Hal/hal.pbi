@@ -1578,15 +1578,27 @@
 ;                                        assuming it.
 ;                 HwUartClose(n)
 ;
-;    HwSpi*    (#CAP_SPI)  THE TRANSPORT NOTHING IN THIS TREE HAS. There
-;              is no SPI library at all. It stays on the critical path
-;              after the 2026-09-04 ruling because LoRa is a module on SPI
-;              and LoRa is the vehicle link's second transport.
+;    HwSpi*    (#CAP_SPI)  SPI. It stays on the critical path after the
+;              2026-09-04 ruling because LoRa is a module on SPI and LoRa
+;              is the vehicle link's second transport. IMPLEMENTED on the
+;              Pi 5 (2026-09-27) as RaspberryPi4/Board/hw_spi.pi4 over
+;              Lib/spi_dw.pi4 (RP1 SPI0); the shared layer above the seam
+;              is Anvil/Bus/spi.pbi and the command Anvil/Core/spi_cmd.pbi,
+;              both compiled only where #CAP_SPI = 1. The Pi 4 has none.
+;                 HwSpiDefaultBus()      the bus `spi` uses
 ;                 HwSpiBusValid(bus)     1 if this board drives it
+;                 HwSpiCsCount(bus)      chip selects on it (0 if none)
 ;                 HwSpiUp(bus, hz, mode) mux the pins, set the clock and
 ;                                        the CPOL/CPHA mode (0..3), enable
-;                                        the controller. Idempotent.
+;                                        the controller. Idempotent; a
+;                                        second call re-programs rate and
+;                                        mode. A #HW_SPI_* code.
+;                 HwSpiDown(bus)         release it; chip selects idle
 ;                 HwSpiSetSpeed(bus,hz) / HwSpiGetSpeed(bus)
+;                                        the achieved rate, NEVER above
+;                                        the one asked for, or a code
+;                 HwSpiGetMode(bus)      0..3, or -1 when not up
+;                 HwSpiRateMin(bus) / HwSpiRateMax(bus)
 ;                 HwSpiXfer(bus,cs,*tx,*rx,n)
 ;                                        ONE full-duplex transfer of n
 ;                                        bytes with chip select asserted

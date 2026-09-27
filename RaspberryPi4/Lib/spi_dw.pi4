@@ -1,0 +1,364 @@
+; ======================================================================
+;  spi_dw.pi4 - the Pi 5's header SPI: RP1 SPI0, a Synopsys DesignWare APB
+;  SSI. THE ONE FILE THAT KNOWS THE DW SSI REGISTERS. A different IP from
+;  the BCM2711's SPI0 (Rule 30: a thin host file, not a branch).
+;
+;  ---- WHERE THE NUMBERS COME FROM (rule 21) ----------------------------
+;
+;  Pinned Linux, raspberrypi/linux 7e030b60792d (fetched read-only):
+;    drivers/spi/spi-dw.h       register offsets (CTRLR0 $00 .. DR $60),
+;                               the PSSI CTRLR0 fields (DFS [3:0] or, on
+;                               a 32-bit-frame build, [20:16]; SCPH bit 6;
+;                               SCPOL bit 7; TMOD [9:8], 0 = transmit and
+;                               receive), SR bits (BUSY 0)
+;    drivers/spi/spi-dw-core.c  dw_spi_hw_init: FIFO depth found by
+;                               writing TXFTLR 1..255 until it will not
+;                               read back, DFS32 found by writing CTRLR0
+;                               all-ones while disabled; dw_spi_set_cs:
+;                               "DW SPI controller demands any native CS
+;                               being set in order to proceed", SER bit 0
+;                               when a GPIO is the chip select;
+;                               dw_spi_update_config: clk_div =
+;                               min(DIV_ROUND_UP(max_freq, hz) + 1, $FFFE)
+;                               & $FFFE (the divider is EVEN only);
+;                               dw_spi_tx_max: never put more in flight
+;                               than the FIFO holds (tx room AND the
+;                               rx-tx gap), or the RX FIFO overruns
+;    drivers/spi/spi-dw-mmio.c  "snps,dw-apb-ssi" -> dw_spi_pssi_init
+;  Vault Sources/rp1.dtsi: rp1_spi0: spi@50000, reg <0xc0 0x40050000 0x0
+;    0x130>, "snps,dw-apb-ssi", clocks RP1_CLK_SYS (assigned 200 MHz),
+;    num-cs 2; rp1_spi0_gpio9: function "spi0" on gpio9/10/11, bias
+;    disabled, drive-strength 12; rp1_spi0_cs_gpio7: gpio7/8 as plain GPIO,
+;    pull-up. bcm2712-rpi.dtsi: cs-gpios = <&gpio 8 1>, <&gpio 7 1> - CE0
+;    is GPIO 8, CE1 is GPIO 7, ACTIVE LOW, driven as GPIOs, not by the SSI.
+;  pinctrl-rp1.c:491-493 - spi0 is column a0 on GPIO 9, 10, 11: FUNCSEL 0.
+;    GPIO 9 = MISO, 10 = MOSI, 11 = SCLK (the 40-pin header's SPI0 pins
+;    21, 19, 23; CE0 pin 24, CE1 pin 26).
+;
+;  Base: 0xc0_40050000 through the Pi 5 DTB's rp1 and pcie@1000120000
+;  ranges (the same translation as I2C1 and UART0) -> CPU $1F00050000.
+;
+;  ---- WHAT A TRANSFER IS ----------------------------------------------
+;
+;  One call, one chip-select assertion, n bytes each way, 8-bit frames,
+;  transmit-and-receive mode always (a missing tx buffer sends $00, a
+;  missing rx buffer discards) - the seam's "full duplex and one call"
+;  contract. Order: disable, CTRLR0, BAUDR, IMR = 0, SER = bit 0, enable,
+;  CS low, feed/drain, wait for RX complete and SR.BUSY clear, CS high,
+;  SER = 0. Polled; a deadline on timer.pi4's Ticks() ends it as
+;  #SPIDW_TIMEOUT with the SSI disabled (which flushes both FIFOs) and CS
+;  released.
+;
+;  THE CLOCK IS NOT MEASURED. 200 MHz is what Linux assigns RP1_CLK_SYS.
+;  The fastest rate offered is clock/2 (the smallest even divider).
+;
+;  DESK PROOF ONLY (tools/a64/spi_dw_check.py). SILICON OWED.
+;
+;  DEPENDENCIES: timer.pi4 (Ticks, TickHz), gpio_rp1.pi4 (pins), listed
+;  before this file by the board.
+; ======================================================================
+
+EnableExplicit
+
+#SPIDW_BASE = $1F00050000          ; RP1 SPI0 - see the header
+
+#SPIDW_CTRLR0  = $00
+#SPIDW_SSIENR  = $08
+#SPIDW_SER     = $10
+#SPIDW_BAUDR   = $14
+#SPIDW_TXFTLR  = $18
+#SPIDW_TXFLR   = $20
+#SPIDW_RXFLR   = $24
+#SPIDW_SR      = $28
+#SPIDW_IMR     = $2C
+#SPIDW_ICR     = $48
+#SPIDW_DR      = $60
+
+#SPIDW_SCPH    = $40               ; CTRLR0 bit 6
+#SPIDW_SCPOL   = $80               ; CTRLR0 bit 7
+#SPIDW_DFS_MASK = $F               ; CTRLR0 [3:0] on a 16-bit-frame build
+#SPIDW_DFS32_SHIFT = 16            ; CTRLR0 [20:16] on a 32-bit-frame build
+#SPIDW_SR_BUSY = $01
+
+#SPIDW_CLK_HZ  = 200000000         ; RP1_CLK_SYS as rp1.dtsi assigns it
+#SPIDW_DIV_MIN = 2
+#SPIDW_DIV_MAX = $FFFE
+
+; Pins (see the header).
+#SPIDW_PIN_MISO = 9
+#SPIDW_PIN_MOSI = 10
+#SPIDW_PIN_SCLK = 11
+#SPIDW_PIN_CE0  = 8
+#SPIDW_PIN_CE1  = 7
+#SPIDW_FUNCSEL  = 0
+#SPIDW_DRIVE_MA = 12
+#SPIDW_CS_COUNT = 2
+
+#SPIDW_TIMEOUT_US = 20000          ; plus twice the wire time of the bytes
+#SPIDW_SPIN_MAX   = 4000000
+
+#SPIDW_OK      = 0
+#SPIDW_ARG     = -1
+#SPIDW_RANGE   = -2
+#SPIDW_TIMEOUT = -3
+#SPIDW_NODEV   = -4                ; FIFO probe found no FIFO: not a DW SSI
+
+Global spidw_up.i
+Global spidw_div.i
+Global spidw_mode.i
+Global spidw_fifo.i
+Global spidw_dfs32.i
+Global spidw_timeouts.i
+Global spidw_err.i
+
+Procedure.i SpiDwRd(off.i)
+  ProcedureReturn PeekN(#SPIDW_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure SpiDwWr(off.i, v.i)
+  PokeL(#SPIDW_BASE + off, v)
+EndProcedure
+
+Procedure SpiDwBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; dw_spi_update_config's divider: even, at least 2, at most $FFFE.
+; Returns the divider, or 0 for a rate this clock cannot make.
+Procedure.i SpiDwDivFor(hz.i)
+  Define d.i
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  d = ((#SPIDW_CLK_HZ + hz - 1) / hz + 1) & (-2)
+  If d < #SPIDW_DIV_MIN Or d > #SPIDW_DIV_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn d
+EndProcedure
+
+Procedure.i SpiDwRateMin()
+  ProcedureReturn (#SPIDW_CLK_HZ + #SPIDW_DIV_MAX - 1) / #SPIDW_DIV_MAX
+EndProcedure
+
+Procedure.i SpiDwRateMax()
+  ProcedureReturn #SPIDW_CLK_HZ / #SPIDW_DIV_MIN
+EndProcedure
+
+Procedure SpiDwCsLevel(cs.i, high.i)
+  Define pin.i
+  pin = #SPIDW_PIN_CE0
+  If cs = 1
+    pin = #SPIDW_PIN_CE1
+  EndIf
+  If high <> 0
+    Rp1DigitalWrite(pin, #RP1_PIN_HIGH)
+  Else
+    Rp1DigitalWrite(pin, #RP1_PIN_LOW)
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SpiDwUp(hz, mode) - mux the pins, probe the block, program the rate
+;  and mode. Re-programs if already up (a different device may want a
+;  different mode). #SPIDW_OK, or a refusal with nothing changed.
+; ----------------------------------------------------------------------
+Procedure.i SpiDwUp(hz.i, mode.i)
+  Define d.i
+  Define f.i
+  Define cr.i
+  If mode < 0 Or mode > 3
+    ProcedureReturn #SPIDW_ARG
+  EndIf
+  d = SpiDwDivFor(hz)
+  If d = 0
+    ProcedureReturn #SPIDW_RANGE
+  EndIf
+  If spidw_up = 0
+    ; Chip selects first, and HIGH before they become outputs, so neither
+    ; device sees a select glitch while the pins change hands.
+    SpiDwCsLevel(0, 1)
+    SpiDwCsLevel(1, 1)
+    Rp1PinPull(#SPIDW_PIN_CE0, #RP1_PULL_UP)
+    Rp1PinPull(#SPIDW_PIN_CE1, #RP1_PULL_UP)
+    Rp1PinMode(#SPIDW_PIN_CE0, 1)
+    Rp1PinMode(#SPIDW_PIN_CE1, 1)
+    Rp1PinPull(#SPIDW_PIN_MISO, #RP1_PULL_NONE)
+    Rp1PinPull(#SPIDW_PIN_MOSI, #RP1_PULL_NONE)
+    Rp1PinPull(#SPIDW_PIN_SCLK, #RP1_PULL_NONE)
+    Rp1PinDrive(#SPIDW_PIN_MISO, #SPIDW_DRIVE_MA)
+    Rp1PinDrive(#SPIDW_PIN_MOSI, #SPIDW_DRIVE_MA)
+    Rp1PinDrive(#SPIDW_PIN_SCLK, #SPIDW_DRIVE_MA)
+    Rp1FuncSelSet(#SPIDW_PIN_MISO, #SPIDW_FUNCSEL)
+    Rp1FuncSelSet(#SPIDW_PIN_MOSI, #SPIDW_FUNCSEL)
+    Rp1FuncSelSet(#SPIDW_PIN_SCLK, #SPIDW_FUNCSEL)
+    SpiDwBarrier()
+    ; dw_spi_reset_chip, then dw_spi_hw_init's two probes.
+    SpiDwWr(#SPIDW_SSIENR, 0)
+    SpiDwWr(#SPIDW_IMR, 0)
+    SpiDwRd(#SPIDW_ICR)
+    SpiDwWr(#SPIDW_SER, 0)
+    f = 1
+    While f < 256
+      SpiDwWr(#SPIDW_TXFTLR, f)
+      If SpiDwRd(#SPIDW_TXFTLR) <> f
+        Break
+      EndIf
+      f = f + 1
+    Wend
+    SpiDwWr(#SPIDW_TXFTLR, 0)
+    If f = 1
+      spidw_err = #SPIDW_NODEV
+      ProcedureReturn #SPIDW_NODEV
+    EndIf
+    spidw_fifo = f
+    SpiDwWr(#SPIDW_CTRLR0, $FFFFFFFF)
+    cr = SpiDwRd(#SPIDW_CTRLR0)
+    SpiDwWr(#SPIDW_CTRLR0, 0)
+    spidw_dfs32 = 0
+    If (cr & #SPIDW_DFS_MASK) = 0
+      spidw_dfs32 = 1
+    EndIf
+    spidw_up = 1
+  EndIf
+  spidw_div = d
+  spidw_mode = mode
+  ProcedureReturn #SPIDW_OK
+EndProcedure
+
+Procedure SpiDwDown()
+  If spidw_up <> 0
+    SpiDwWr(#SPIDW_SSIENR, 0)
+    SpiDwWr(#SPIDW_SER, 0)
+    SpiDwCsLevel(0, 1)
+    SpiDwCsLevel(1, 1)
+  EndIf
+  spidw_up = 0
+EndProcedure
+
+Procedure.i SpiDwIsUp()
+  ProcedureReturn spidw_up
+EndProcedure
+
+Procedure.i SpiDwRate()
+  If spidw_up = 0 Or spidw_div = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #SPIDW_CLK_HZ / spidw_div
+EndProcedure
+
+Procedure.i SpiDwMode()
+  ProcedureReturn spidw_mode
+EndProcedure
+
+Procedure.i SpiDwFifo()
+  ProcedureReturn spidw_fifo
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SpiDwXfer(cs, *tx, *rx, n) - see WHAT A TRANSFER IS in the header.
+; ----------------------------------------------------------------------
+Procedure.i SpiDwXfer(cs.i, *tx, *rx, n.i)
+  Define cr.i
+  Define sent.i
+  Define got.i
+  Define b.i
+  Define hz.i
+  Define deadline.i
+  Define spins.i
+  Define result.i
+  Define wireUs.i
+
+  If spidw_up = 0
+    ProcedureReturn #SPIDW_ARG
+  EndIf
+  If cs < 0 Or cs >= #SPIDW_CS_COUNT Or n < 1 Or n > 65536
+    ProcedureReturn #SPIDW_ARG
+  EndIf
+
+  cr = 0                                   ; FRF Motorola, TMOD transmit+receive
+  If spidw_dfs32 <> 0
+    cr = 7 << #SPIDW_DFS32_SHIFT           ; 8-bit frames
+  Else
+    cr = 7
+  EndIf
+  If (spidw_mode & 1) <> 0
+    cr = cr | #SPIDW_SCPH
+  EndIf
+  If (spidw_mode & 2) <> 0
+    cr = cr | #SPIDW_SCPOL
+  EndIf
+
+  SpiDwBarrier()
+  SpiDwWr(#SPIDW_SSIENR, 0)
+  SpiDwWr(#SPIDW_CTRLR0, cr)
+  SpiDwWr(#SPIDW_BAUDR, spidw_div)
+  SpiDwWr(#SPIDW_IMR, 0)
+  SpiDwWr(#SPIDW_SER, 1)
+  SpiDwWr(#SPIDW_SSIENR, 1)
+  SpiDwCsLevel(cs, 0)
+
+  hz = TickHz()
+  deadline = 0
+  If hz > 0
+    wireUs = (n * 8 * 2 * 1000000) / (#SPIDW_CLK_HZ / spidw_div)
+    deadline = Ticks() + (hz / 1000000) * (#SPIDW_TIMEOUT_US + wireUs)
+  EndIf
+
+  sent = 0
+  got = 0
+  spins = 0
+  result = #SPIDW_TIMEOUT
+  Repeat
+    ; dw_spi_tx_max: room in the TX FIFO, and never more in flight than
+    ; the FIFO depth (the rx-tx gap), or the RX side overruns.
+    If sent < n
+      If SpiDwRd(#SPIDW_TXFLR) < spidw_fifo And (sent - got) < spidw_fifo
+        b = 0
+        If *tx <> 0
+          b = PeekA(*tx + sent) & $FF
+        EndIf
+        SpiDwWr(#SPIDW_DR, b)
+        sent = sent + 1
+        Continue
+      EndIf
+    EndIf
+    If got < sent
+      If SpiDwRd(#SPIDW_RXFLR) > 0
+        b = SpiDwRd(#SPIDW_DR) & $FF
+        If *rx <> 0
+          PokeA(*rx + got, b)
+        EndIf
+        got = got + 1
+        Continue
+      EndIf
+    EndIf
+    If got = n
+      If (SpiDwRd(#SPIDW_SR) & #SPIDW_SR_BUSY) = 0
+        result = #SPIDW_OK
+        Break
+      EndIf
+    EndIf
+    spins = spins + 1
+    If spins > #SPIDW_SPIN_MAX
+      Break
+    EndIf
+    If deadline > 0
+      If Ticks() > deadline
+        Break
+      EndIf
+    EndIf
+  ForEver
+
+  If result <> #SPIDW_OK
+    spidw_timeouts = spidw_timeouts + 1
+    SpiDwWr(#SPIDW_SSIENR, 0)              ; flushes both FIFOs
+  EndIf
+  SpiDwCsLevel(cs, 1)
+  SpiDwWr(#SPIDW_SER, 0)
+  SpiDwBarrier()
+  ProcedureReturn result
+EndProcedure

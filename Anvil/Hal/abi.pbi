@@ -1906,27 +1906,41 @@ EndProcedure
 ;  THE TRANSPORT NOTHING IN THIS TREE HAS. There is no SPI library at all,
 ;  and the seam stays in Phase A after the 2026-09-04 ruling because LoRa
 ;  is a module on SPI and LoRa is the vehicle link's second transport.
-;  Documented in hal.pi4; no board declares #CAP_SPI yet.
+;  Documented in hal.pbi. A board with #CAP_SPI = 1 (the Pi 5) answers
+;  from its HwSpi* backend; every other board compiles the lines it
+;  always had - the CompilerIf is on the capability, not on a chip.
 ; ======================================================================
 Procedure.i SvcSpiUp(bus.i, hz.i, mode.i)
   If SvcRequireCap(#CAP_SPI, "spi", "this board exposes no SPI bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_SPI = 1
+  ProcedureReturn HwSpiUp(bus, hz, mode)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcSpiSetSpeed(bus.i, hz.i)
   If SvcRequireCap(#CAP_SPI, "spi", "this board exposes no SPI bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_SPI = 1
+  ProcedureReturn HwSpiSetSpeed(bus, hz)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcSpiGetSpeed(bus.i)
   If SvcRequireCap(#CAP_SPI, "spi", "this board exposes no SPI bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_SPI = 1
+  ProcedureReturn HwSpiGetSpeed(bus)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 ; ONE FULL-DUPLEX TRANSFER WITH CS ASSERTED FOR THE WHOLE OF IT, and one
@@ -1937,14 +1951,22 @@ Procedure.i SvcSpiXfer(bus.i, cs.i, *tx, *rx, n.i)
   If SvcRequireCap(#CAP_SPI, "spi", "this board exposes no SPI bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_SPI = 1
+  ProcedureReturn HwSpiXfer(bus, cs, *tx, *rx, n)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcSpiPin(bus.i, which.i)
   If SvcRequireCap(#CAP_SPI, "spi", "this board exposes no SPI bus to Anvil") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_SPI = 1
+  ProcedureReturn HwSpiPin(bus, which)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================
