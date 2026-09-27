@@ -46,6 +46,73 @@
 ;     DmaFill32(DisplayBase(), DisplayPitch(), 1920, 1080, colour)
 ;
 ; ======================================================================
+; THE PI 5 (BCM2712) - THE SAME FILE BEHIND A SEAM. DESK-PROVEN ONLY.
+; ======================================================================
+; Rule 30: one DMA library. A -t pi5 build (#PMF_CHIP = 2712) takes the
+; CompilerIf #PMF_CHIP = 2712 branches; every -t pi4 line is in the
+; CompilerElse, untouched, and the -t pi4 image is byte-identical. The
+; public procedures are the same names with the same contracts (scratch,
+; bounds, init, fill, copy, wait, errors), so a display library above
+; this file does not change. SILICON OWED; the desk gate is
+; tools/a64/a64_dma_pi5_check.py.
+;
+; Pinned sources: raspberrypi/linux 7e030b60792de1c15b9ec1d8d5d34d63f0f0f1d8
+; drivers/dma/bcm2835-dma.c, bcm2712-ds.dtsi, and the three pinned
+; firmware DTBs (vault "Raspberry Pi 5").
+;
+;   THE CONTROLLERS. Two instances, "brcm,bcm2712-dma":
+;     dma32: dma@10000  reg <0x10 0x00010000 0 0x600>, channels 0-5
+;     dma40: dma@10600  reg <0x10 0x00010600 0 0x600>, channels 6-11
+;     (bcm2712-ds.dtsi 307-344; /axi ranges are identity, so physical
+;     $1000010000 and $1000010600). The driver rebases every instance to
+;     channel 0 - chan_start = (base / $100) & $F, base -= chan_start *
+;     $100 (bcm2835-dma.c 1324-1325) - so channel n's registers are at
+;     $1000010000 + n * $100 on both. THIS BRANCH DRIVES ONLY 6-11, the
+;     40-bit channels: bcm2712_dma_cfg.chan_40bit_mask = BIT(6)..BIT(11),
+;     dma_mask 40 bits (334-338).
+;   WHICH ARE OURS. brcm,dma-channel-mask is the firmware's statement of
+;     what it leaves free (read at probe, 1370-1378). The pinned firmware
+;     DTBs say $7C0 for dma40 - channels 6-10 free, 11 reserved - and $3F
+;     for dma32; the .dtsi source says $0FC0 and $0035. THE FIRMWARE
+;     EDITS THE MASK, so the board must pass the LIVE tree's value to
+;     DmaSetChannelMask(); #DMA_2712_DTB_MASK40 is only the pinned default.
+;     A channel outside the mask is refused (#DMA_ERR_RESERVED).
+;   REACH. /axi dma-ranges map bus = physical for the first $10_0000_0000
+;     (bcm2712.dtsi 435-439), and the engine is 40-bit. So DmaBusAddr() is
+;     the identity and DmaAddrOk()'s cap is 64 GiB, not 1 GiB.
+;   REGISTERS (BCM2711_DMA40_*, 225-311): CS +$00, CB +$04, DEBUG +$0C,
+;     TI +$10, SRC +$14, SRCI +$18, DEST +$1C, DESTI +$20, LEN +$24,
+;     NEXT_CB +$28. CS: ACTIVE 0, END 1, INT 2, WAITING_FOR_WRITES 7,
+;     PROT 9:8, ERR 10, TRANSACTIONS 25, WAIT_FOR_WRITES 28.
+;   THE CONTROL BLOCK (struct bcm2711_dma40_scb, 72-81): ti, src, srci,
+;     dst, dsti, len, next_cb, rsvd - 32 bytes, 32-byte aligned. src/dst
+;     carry the low 32 address bits and srci/dsti carry the top 8 in bits
+;     7:0 with INC (12), SIZE (14:13) and BURST_LEN (11:8) above them
+;     (541-548). CB and NEXT_CB take the block's address SHIFTED RIGHT 5
+;     (to_40bit_cbaddr, 393-397). Up to 1 GiB per block (MAX_DMA40_LEN).
+;   START (bcm2835_dma_start_desc, 762-766): CB = addr >> 5, then CS =
+;     ACTIVE | PROT | flags; this file's flag is WAIT_FOR_WRITES, one of
+;     the driver's own BCM2711_DMA40_MEMCPY_FLAGS (307-311).
+;   DONE. "A zero control block address means the channel is idle. (The
+;     ACTIVE flag in the CS register is not a reliable indicator.)"
+;     (681-686), and the interrupt handler completes a descriptor on CB
+;     reading zero (815). So done = CB zero, no TRANSACTIONS, no
+;     WAITING_FOR_WRITES; failure = CS.ERR or a DEBUG error bit (273-276).
+;   ABORT (bcm2835_dma_abort, 675-708): pause by clearing ACTIVE, wait for
+;     TRANSACTIONS to clear, CS = PROT, DEBUG |= RESET (bit 23).
+;   NO 2D. The pinned driver never uses DMA4 2D mode (TDMODE / STRIDE are
+;     defined, 263 and 305, and nothing sets them), so this branch does
+;     not either: a rectangle is a CHAIN of one-row control blocks linked
+;     by next_cb, exactly the way the driver chains frames (576-583), and
+;     a rectangle whose pitch equals its row is one block. The chain lives
+;     in the caller's scratch: block 0 at +0, the pattern at +256, blocks
+;     1.. from +512, so a 512-byte scratch still works one row per start
+;     and a bigger one (DmaScratchChainRows) runs that many rows per start.
+;   NO MAILBOX, NO ENABLE REGISTER, NO LITE ENGINES, NO YLENGTH QUESTION on
+;     this path; DmaInit() checks the scratch, the bounds, the channel
+;     against the mask, and that the channel is idle, then resets it.
+;
+; ======================================================================
 ; THREE HAZARDS. EACH ONE LOOKS LIKE ONE OF THE OTHERS AT THE BENCH.
 ; ======================================================================
 ;
@@ -340,7 +407,11 @@
 ; dma-controller@7e007000 with reg = <0x7e007000 0xb00>. Note the 0xb00
 ; span: the device tree stops before the DMA4 channels because it
 ; describes them as a separate node.
+CompilerIf #PMF_CHIP = 2712
+#DMA_BASE     = $1000010000    ; channel 0's slot; see THE PI 5 above
+CompilerElse
 #DMA_BASE     = $FE007000
+CompilerEndIf
 #DMA_CHAN_STEP = $100          ; :2292-2293
 
 ; Per-channel registers, all offsets from the channel base. :2460-2503
@@ -429,7 +500,11 @@
 
 ; THE REACH OF THE 30-BIT ENGINES. bcm2711.dtsi:45 and the PAGE field
 ; at bcm2711-peripherals.txt:4994-5002. See HAZARD 1 in the header.
+CompilerIf #PMF_CHIP = 2712
+#DMA_LIMIT     = $1000000000   ; /axi dma-ranges identity window, 64 GiB
+CompilerElse
 #DMA_LIMIT     = $40000000
+CompilerEndIf
 #DMA_BUS_ALIAS = $C0000000     ; the uncached view the engines address
 #DMA_BUS_MASK  = $3FFFFFFF     ; the 30 bits that are actually decoded
 
@@ -629,6 +704,35 @@
 #DMA_ERR_ROWLIMIT  = -18  ; a fill row longer than #DMA_FILL_MAX_ROW_BYTES
 #DMA_ERR_BURST     = -19  ; a burst length at or above the bus-locking one
 #DMA_ERR_UNSAFE    = -20  ; channel quiescence could not be established
+CompilerIf #PMF_CHIP = 2712
+#DMA_ERR_RESERVED  = -21  ; the channel is outside the firmware's mask
+
+; ---- BCM2712 dma40. Every number from bcm2835-dma.c, line given. -------
+#DMA40_CS       = $00      ; 225
+#DMA40_CB       = $04      ; 226
+#DMA40_DEBUG    = $0C      ; 227
+#DMA40_SRC      = $14      ; 229
+#DMA40_CS_ACTIVE        = $00000001   ; 237
+#DMA40_CS_END           = $00000002   ; 238
+#DMA40_CS_INT           = $00000004   ; 239
+#DMA40_CS_WAITING       = $00000080   ; 244 WAITING_FOR_WRITES
+#DMA40_CS_PROT          = $00000300   ; 246
+#DMA40_CS_ERR           = $00000400   ; 247
+#DMA40_CS_TRANSACTIONS  = $02000000   ; 250
+#DMA40_CS_WAIT_WRITES   = $10000000   ; 251 WAIT_FOR_WRITES
+#DMA40_TI_WAIT_RESP     = $00000004   ; 264
+#DMA40_DEBUG_ERRORS     = $0000000F   ; 273-276 write/fifo/read/read-cb
+#DMA40_DEBUG_RESET      = $00800000   ; 285
+#DMA40_XI_BURST_SHIFT   = 8           ; 298 BURST_LEN
+#DMA40_XI_INC           = $00001000   ; 299
+#DMA40_XI_SIZE_128      = $00004000   ; 302
+#DMA40_MAX_LEN          = $40000000   ; 296 MAX_DMA40_LEN = SZ_1G
+#DMA40_CHAN_FIRST       = 6           ; chan_40bit_mask, 334-336
+#DMA40_CHAN_LAST        = 11
+#DMA40_CHAN_BITS        = $FC0
+#DMA_2712_DTB_MASK40    = $7C0        ; pinned firmware DTBs, dma@10600
+#DMA40_CHAIN_BASE       = 512         ; blocks 1.. start here in scratch
+CompilerEndIf
 
 
 ; ======================================================================
@@ -703,7 +807,13 @@ Global dma_scratchN.i = 0      ; its length in bytes
 Global dma_bounds.i   = 0      ; base of the one writable window
 Global dma_boundsN.i  = 0      ; its length in bytes
 Global dma_haveBounds.i = 0    ; 1 once DmaSetBounds() has been obeyed
+CompilerIf #PMF_CHIP = 2712
+Global dma_chan.i     = 6      ; the first 40-bit channel the pinned DTBs leave free
+Global dma_mask40.i   = #DMA_2712_DTB_MASK40  ; the firmware's free channels
+Global dma_lastBlocks.i = 0    ; control blocks in the last chain started
+CompilerElse
 Global dma_chan.i     = 0      ; the channel this file drives
+CompilerEndIf
 Global dma_ready.i    = 0      ; 1 once DmaInit() has succeeded
 Global dma_quarantined.i = 0   ; selected channel failed verified quiescence
 Global dma_err.i      = 0      ; the last error, one of #DMA_ERR_*
@@ -1135,7 +1245,12 @@ EndProcedure
 ; engine would have been told.
 ; ----------------------------------------------------------------------
 Procedure.i DmaBusAddr(physAddr.i)
+CompilerIf #PMF_CHIP = 2712
+  ; Identity: /axi dma-ranges <0 0 0 0 0x10 0> (bcm2712.dtsi 435).
+  ProcedureReturn physAddr
+CompilerElse
   ProcedureReturn #DMA_BUS_ALIAS | (physAddr & #DMA_BUS_MASK)
+CompilerEndIf
 EndProcedure
 
 
@@ -1278,6 +1393,22 @@ Procedure.i DmaSetChannel(ch.i)
   If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
   If dma_ready <> 0 And DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   dma_err = #DMA_ERR_NONE
+CompilerIf #PMF_CHIP = 2712
+  ; 6..11 only (the 40-bit channels), and only if the firmware's mask
+  ; leaves it free. 0..5 are the 32-bit engines of dma@10000, which this
+  ; branch does not drive.
+  If ch < #DMA40_CHAN_FIRST Or ch > #DMA40_CHAN_LAST
+    dma_err = #DMA_ERR_CHANNEL
+    ProcedureReturn 0
+  EndIf
+  If ((dma_mask40 >> ch) & 1) = 0
+    dma_err = #DMA_ERR_RESERVED
+    ProcedureReturn 0
+  EndIf
+  dma_chan  = ch
+  dma_ready = 0
+  ProcedureReturn 1
+CompilerEndIf
 
   If ch < 0
     dma_err = #DMA_ERR_CHANNEL
@@ -1345,6 +1476,42 @@ EndProcedure
 ; that reasoning is still right and it now belongs to the one caller it
 ; was ever true for, instead of to everybody.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+; DmaSetChannelMask - BCM2712 only. The LIVE device tree's
+; brcm,dma-channel-mask for dma@10600, which is the firmware's statement
+; of which 40-bit channels it leaves free. Bits outside 6..11 are refused
+; rather than ignored: a mask with them set is not this controller's.
+; Clears the ready flag; DmaInit() re-checks the channel against it.
+; ----------------------------------------------------------------------
+Procedure.i DmaSetChannelMask(mask.i)
+  dma_err = #DMA_ERR_NONE
+  If (mask & (~#DMA40_CHAN_BITS)) <> 0 Or mask = 0
+    dma_err = #DMA_ERR_ARGS
+    ProcedureReturn 0
+  EndIf
+  dma_mask40 = mask
+  dma_ready  = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DmaChannelMask()
+  ProcedureReturn dma_mask40
+EndProcedure
+
+; How many rows one start can chain with the scratch block given.
+Procedure.i DmaScratchChainRows()
+  If dma_scratchN < #DMA_SCRATCH_BYTES
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1 + ((dma_scratchN - #DMA40_CHAIN_BASE) / #DMA_CB_BYTES)
+EndProcedure
+
+Procedure.i DmaLastBlocks()
+  ProcedureReturn dma_lastBlocks
+EndProcedure
+CompilerEndIf
+
 Procedure.i DmaSetBurst(n.i)
   dma_err = #DMA_ERR_NONE
   If n < 0
@@ -1431,9 +1598,16 @@ EndProcedure
 ; Table 38: ACTIVE clears before the last write response; Table 45 counts
 ; those responses. This is only the selected legacy channel, never DMA4.
 Procedure.i DmaQuiescent()
+CompilerIf #PMF_CHIP = 2712
+  ; CB zero is the driver's idle test (681-686, 815); ACTIVE is not.
+  If DmaRegRead(#DMA40_CB) <> 0 : ProcedureReturn 0 : EndIf
+  If (DmaRegRead(#DMA40_CS) & (#DMA40_CS_TRANSACTIONS | #DMA40_CS_WAITING)) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+CompilerElse
   If (DmaRegRead(#DMA_CS) & (#DMA_CS_ACTIVE | #DMA_CS_WAITING)) <> 0 : ProcedureReturn 0 : EndIf
   If (DmaRegRead(#DMA_DEBUG) & #DMA_DEBUG_WRITES) <> 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
+CompilerEndIf
 EndProcedure
 
 Procedure.i DmaQuarantine()
@@ -1483,6 +1657,44 @@ Procedure.i DmaChannelReset()
   Protected start.i
   Protected hz.i
   Protected limit.i
+
+CompilerIf #PMF_CHIP = 2712
+  ; bcm2835_dma_abort's 40-bit branch (675-708): pause, drain
+  ; TRANSACTIONS, CS = PROT, DEBUG |= RESET - then this file also demands
+  ; the idle test before it calls the channel clean.
+  hz = DmaCounterHz()
+  If hz < 0 Or hz > $FFFFFFFF : hz = 0 : EndIf
+  limit = (hz * 20000 + 999999) / 1000000
+  If DmaRegRead(#DMA40_CB) <> 0
+    DmaRegWrite(#DMA40_CS, DmaRegRead(#DMA40_CS) & (~#DMA40_CS_ACTIVE))
+    dma40_Barrier()
+    start = DmaTicks()
+    i = #DMA_RESET_SPINS
+    While (DmaRegRead(#DMA40_CS) & #DMA40_CS_TRANSACTIONS) <> 0
+      i = i - 1
+      If hz > 0
+        If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
+      Else
+        If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
+      EndIf
+    Wend
+  EndIf
+  DmaRegWrite(#DMA40_CS, #DMA40_CS_PROT)
+  DmaRegWrite(#DMA40_DEBUG, DmaRegRead(#DMA40_DEBUG) | #DMA40_DEBUG_RESET)
+  dma40_Barrier()
+  start = DmaTicks()
+  i = #DMA_RESET_SPINS
+  While DmaQuiescent() = 0
+    i = i - 1
+    If hz > 0
+      If (DmaTicks() - start) >= limit : ProcedureReturn DmaQuarantine() : EndIf
+    Else
+      If i <= 0 : ProcedureReturn DmaQuarantine() : EndIf
+    EndIf
+  Wend
+  dma_quarantined = 0
+  ProcedureReturn 1
+CompilerEndIf
 
   ; Pause before reset. RESET clears DEBUG's outstanding-write count, so
   ; polling only after RESET would discard the very evidence we need.
@@ -1576,6 +1788,30 @@ Procedure.i DmaWait(timeoutUs.i)
   spins   = 0
   cs      = DmaRegRead(#DMA_CS)
 
+CompilerIf #PMF_CHIP = 2712
+  While waiting = 1
+    cs = DmaRegRead(#DMA40_CS)
+    dbg = DmaRegRead(#DMA40_DEBUG)
+    If (cs & #DMA40_CS_ERR) <> 0 Or (dbg & #DMA40_DEBUG_ERRORS) <> 0
+      dma_err = #DMA_ERR_HW
+      rc = 0
+      waiting = 0
+    ElseIf DmaQuiescent() = 1
+      waiting = 0
+    Else
+      spins = spins + 1
+      If hz <= 0 And spins > #DMA_SPIN_LIMIT
+        waiting = 0
+        rc      = 0
+        dma_err = #DMA_ERR_TIMEOUT
+      ElseIf limit > 0 And (DmaTicks() - t0) > limit
+        waiting = 0
+        rc      = 0
+        dma_err = #DMA_ERR_TIMEOUT
+      EndIf
+    EndIf
+  Wend
+CompilerElse
   While waiting = 1
     cs = DmaRegRead(#DMA_CS)
     dbg = DmaRegRead(#DMA_DEBUG)
@@ -1602,11 +1838,26 @@ Procedure.i DmaWait(timeoutUs.i)
       EndIf
     EndIf
   Wend
+CompilerEndIf
 
   dma_lastTicks = DmaTicks() - t0
   dma_lastCs    = cs
+CompilerIf #PMF_CHIP = 2712
+  dbg           = DmaRegRead(#DMA40_DEBUG)
+  dma_lastDebug = dbg
+  If rc = 0
+    If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
+    ProcedureReturn 0
+  EndIf
+  If (cs & #DMA40_CS_ERR) <> 0 Or (dbg & #DMA40_DEBUG_ERRORS) <> 0
+    dma_err = #DMA_ERR_HW
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+CompilerElse
   dbg           = DmaRegRead(#DMA_DEBUG)
   dma_lastDebug = dbg
+CompilerEndIf
 
   If rc = 0
     If DmaAbort() = 0 : ProcedureReturn 0 : EndIf
@@ -1662,6 +1913,12 @@ Procedure.i DmaSubmit(ti.i, srcBus.i, dstBus.i, lenWord.i, strideWord.i)
   Protected cs.i
 
   If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+CompilerIf #PMF_CHIP = 2712
+  ; The legacy 8-word control block has no meaning on a 40-bit channel.
+  ; Nothing in this branch calls this; a caller that does is refused.
+  dma_err = #DMA_ERR_CHANNEL
+  ProcedureReturn 0
+CompilerEndIf
   If DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
   cb = dma_scratch + #DMA_SCRATCH_CB
 
@@ -1807,6 +2064,10 @@ Procedure.i DmaCalibrate()
   Protected advance.i
 
   dma_err = #DMA_ERR_NONE
+CompilerIf #PMF_CHIP = 2712
+  ; No 2D mode on this path, so no YLENGTH convention to measure.
+  ProcedureReturn 1
+CompilerEndIf
 
   If dma_scratch = 0
     dma_err = #DMA_ERR_NOSCRATCH
@@ -1857,6 +2118,9 @@ EndProcedure
 ; diagnostic to print when DmaCalibrate() refuses - the number is the
 ; whole diagnosis, and 65540 in particular says "TDMODE was ignored".
 Procedure.i DmaCalibrateAdvance()
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 0
+CompilerEndIf
   ProcedureReturn DmaRegRead(#DMA_SOURCE_AD) - DmaBusAddr(dma_scratch + #DMA_SCRATCH_PATTERN)
 EndProcedure
 
@@ -1954,6 +2218,29 @@ Procedure.i DmaInit()
     ProcedureReturn 0
   EndIf
 
+CompilerIf #PMF_CHIP = 2712
+  ; The channel against the mask again: DmaSetChannelMask() may have
+  ; narrowed it after DmaSetChannel() chose. Then idle, then reset.
+  If dma_chan < #DMA40_CHAN_FIRST Or dma_chan > #DMA40_CHAN_LAST
+    dma_err = #DMA_ERR_CHANNEL
+    ProcedureReturn 0
+  EndIf
+  If ((dma_mask40 >> dma_chan) & 1) = 0
+    dma_err = #DMA_ERR_RESERVED
+    ProcedureReturn 0
+  EndIf
+  If DmaRegRead(#DMA40_CB) <> 0 Or (DmaRegRead(#DMA40_CS) & #DMA40_CS_ACTIVE) <> 0
+    dma_err = #DMA_ERR_BUSY
+    ProcedureReturn 0
+  EndIf
+  If DmaChannelReset() = 0
+    dma_err = #DMA_ERR_BUSY
+    ProcedureReturn 0
+  EndIf
+  dma_ready = 1
+  ProcedureReturn 1
+CompilerEndIf
+
   en   = DmaGlobalRead(#DMA_ENABLE)
   page = (en >> 24) & $F
   If page <> 0
@@ -1996,7 +2283,11 @@ EndProcedure
 ; PAGELITE fields in the top byte are the interesting part and the
 ; reason this is exposed at all.
 Procedure.i DmaEnableRaw()
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn -1        ; no global ENABLE is read on this path
+CompilerElse
   ProcedureReturn DmaGlobalRead(#DMA_ENABLE)
+CompilerEndIf
 EndProcedure
 
 Procedure.i DmaScratchBase()
@@ -2112,6 +2403,120 @@ Procedure.i DmaDestOk(dst.i, pitch.i, rowBytes.i, rows.i)
 EndProcedure
 
 
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  BCM2712 - THE 40-BIT CHAIN. See THE PI 5 in the header.
+; ======================================================================
+
+; dsb sy then isb - the same pair the intrinsic barrier emits,
+; written here so this branch adds no call to a name defined elsewhere
+; (layering rule 4).
+Procedure dma40_Barrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; Where control block k lives in the scratch block.
+Procedure.i dma40_Slot(k.i)
+  If k = 0
+    ProcedureReturn dma_scratch + #DMA_SCRATCH_CB
+  EndIf
+  ProcedureReturn dma_scratch + #DMA40_CHAIN_BASE + ((k - 1) * #DMA_CB_BYTES)
+EndProcedure
+
+; One struct bcm2711_dma40_scb (72-81), filled as bcm2835_dma_create_cb_chain
+; fills it (541-548): low 32 address bits in src/dst, the top 8 in the low
+; byte of srci/dsti beside INC/SIZE/BURST. next is 0 or the next block's
+; address >> 5 (to_40bit_cbaddr).
+Procedure dma40_Block(k.i, srcBus.i, srcInc.i, dstBus.i, len.i, nextBlock.i)
+  Protected cb.i
+  Protected xi.i
+  xi = #DMA40_XI_SIZE_128 | ((dma_burst & $F) << #DMA40_XI_BURST_SHIFT)
+  cb = dma40_Slot(k)
+  PokeL(cb +  0, #DMA40_TI_WAIT_RESP)
+  PokeL(cb +  4, srcBus & $FFFFFFFF)
+  If srcInc <> 0
+    PokeL(cb +  8, ((srcBus >> 32) & $FF) | xi | #DMA40_XI_INC)
+  Else
+    PokeL(cb +  8, ((srcBus >> 32) & $FF) | xi)
+  EndIf
+  PokeL(cb + 12, dstBus & $FFFFFFFF)
+  PokeL(cb + 16, ((dstBus >> 32) & $FF) | xi | #DMA40_XI_INC)
+  PokeL(cb + 20, len & $FFFFFFFF)
+  If nextBlock < 0
+    PokeL(cb + 24, 0)
+  Else
+    PokeL(cb + 24, (DmaBusAddr(dma40_Slot(nextBlock)) >> 5) & $FFFFFFFF)
+  EndIf
+  PokeL(cb + 28, 0)
+EndProcedure
+
+; Start blocks 0..n-1 (already linked) and wait. The one place in this
+; branch that writes CB and sets ACTIVE (bcm2835_dma_start_desc, 762-766).
+Procedure.i dma40_Run(n.i)
+  If dma_quarantined <> 0 : dma_err = #DMA_ERR_UNSAFE : ProcedureReturn 0 : EndIf
+  If DmaQuiescent() = 0 : ProcedureReturn DmaQuarantine() : EndIf
+  ; Everything the engine can read out of the scratch block, cleaned.
+  If n > 1
+    DmaCacheRange(dma_scratch, #DMA40_CHAIN_BASE + ((n - 1) * #DMA_CB_BYTES))
+  Else
+    DmaCacheRange(dma_scratch, #DMA_SCRATCH_PATTERN + #DMA_PATTERN_BYTES)
+  EndIf
+  dma_lastBlocks = n
+  DmaRegWrite(#DMA40_CS, #DMA40_CS_PROT | #DMA40_CS_END | #DMA40_CS_INT)
+  DmaRegWrite(#DMA40_CB, (DmaBusAddr(dma40_Slot(0)) >> 5) & $FFFFFFFF)
+  dma40_Barrier()
+  DmaRegWrite(#DMA40_CS, #DMA40_CS_ACTIVE | #DMA40_CS_PROT | #DMA40_CS_WAIT_WRITES)
+  ProcedureReturn DmaWait(#DMA_TIMEOUT_US)
+EndProcedure
+
+; rows rows of rowBytes, source advancing by srcPitch per row (0 for a
+; fill) and incrementing within the row when srcInc, destination by
+; dstPitch. Contiguous rectangles collapse to one block; the rest run in
+; batches of DmaScratchChainRows() blocks per start.
+Procedure.i dma40_Rect(dstBus.i, dstPitch.i, srcBus.i, srcPitch.i, srcInc.i, rowBytes.i, rows.i)
+  Protected cap.i
+  Protected done.i
+  Protected k.i
+  Protected n.i
+  Protected nxt.i
+  If dstPitch = rowBytes And (srcInc = 0 Or srcPitch = rowBytes)
+    If (rowBytes * rows) <= #DMA40_MAX_LEN
+      dma40_Block(0, srcBus, srcInc, dstBus, rowBytes * rows, -1)
+      ProcedureReturn dma40_Run(1)
+    EndIf
+  EndIf
+  cap = DmaScratchChainRows()
+  If cap < 1
+    dma_err = #DMA_ERR_SMALL
+    ProcedureReturn 0
+  EndIf
+  done = 0
+  While done < rows
+    n = rows - done
+    If n > cap
+      n = cap
+    EndIf
+    k = 0
+    While k < n
+      nxt = k + 1
+      If nxt >= n
+        nxt = -1
+      EndIf
+      dma40_Block(k, srcBus + ((done + k) * srcPitch), srcInc, dstBus + ((done + k) * dstPitch), rowBytes, nxt)
+      k = k + 1
+    Wend
+    If dma40_Run(n) = 0
+      ProcedureReturn 0
+    EndIf
+    done = done + n
+  Wend
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf
+
 ; ======================================================================
 ;  THE OPERATIONS
 ; ======================================================================
@@ -2208,6 +2613,12 @@ Procedure.i DmaFillPattern32(dst.i, pitch.i, rowBytes.i, rows.i, pattern.i)
     i = i + 4
   Wend
 
+CompilerIf #PMF_CHIP = 2712
+  ; The same 256-byte pattern, read with INC clear (the source pointer
+  ; does not advance between beats' bursts; 256 bytes covers a 16-beat
+  ; 128-bit burst - see WHY THE PATTERN IS 256 BYTES).
+  ProcedureReturn dma40_Rect(DmaBusAddr(dst), pitch, DmaBusAddr(p), 0, 0, rowBytes, rows)
+CompilerEndIf
   ti = 0
   ti = ti | #DMA_TI_TDMODE
   ti = ti | #DMA_TI_SRC_WIDTH        ; 128-bit reads of the pattern
@@ -2333,6 +2744,9 @@ Procedure.i DmaCopy2D(dst.i, dstPitch.i, src.i, srcPitch.i, rowBytes.i, rows.i)
     EndIf
   EndIf
 
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn dma40_Rect(DmaBusAddr(dst), dstPitch, DmaBusAddr(src), srcPitch, 1, rowBytes, rows)
+CompilerEndIf
   ti = 0
   ti = ti | #DMA_TI_TDMODE
   ti = ti | #DMA_TI_SRC_WIDTH
@@ -2404,6 +2818,9 @@ Procedure.i DmaCopy(dst.i, src.i, bytes.i)
     EndIf
   EndIf
 
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn dma40_Rect(DmaBusAddr(dst), bytes, DmaBusAddr(src), bytes, 1, bytes, 1)
+CompilerEndIf
   ti = 0
   ti = ti | #DMA_TI_SRC_WIDTH
   ti = ti | #DMA_TI_SRC_INC
@@ -2427,6 +2844,18 @@ Procedure.i DmaErrorText()
   If dma_quarantined <> 0
     ProcedureReturn "DMA error -20: the channel has not stopped safely. Its buffers must not be reused; check the channel and bus before explicit recovery."
   EndIf
+CompilerIf #PMF_CHIP = 2712
+  Select dma_err
+    Case #DMA_ERR_RESERVED
+      ProcedureReturn "dma: that 40-bit channel is outside the firmware's brcm,dma-channel-mask for dma@10600 - the firmware owns it. Pass the live tree's mask to DmaSetChannelMask() and pick a channel it leaves free"
+    Case #DMA_ERR_CHANNEL
+      ProcedureReturn "dma: on BCM2712 this file drives only the 40-bit channels 6 to 11 (dma@10600); 0 to 5 are the 32-bit engines of dma@10000"
+    Case #DMA_ERR_REACH
+      ProcedureReturn "dma: an address is at or above $1000000000 - outside the /axi dma-ranges identity window the 40-bit engines address"
+    Case #DMA_ERR_SMALL
+      ProcedureReturn "dma: the scratch block is shorter than 512 bytes - control block 0, the 256-byte fill pattern, and the chain area from +512"
+  EndSelect
+CompilerEndIf
   Select dma_err
     Case #DMA_ERR_NONE
       ProcedureReturn "dma: ok"
