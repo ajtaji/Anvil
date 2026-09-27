@@ -1339,6 +1339,27 @@ def check_guarded_keys() -> list[str]:
 # ---------------------------------------------------------------------
 #  --mutate
 # ---------------------------------------------------------------------
+MINOR_LINE = re.compile(r"^(#SVC_ABI_MINOR[ \t]*=[ \t]*)(\d+)", re.M)
+
+
+def minor_bump_site(body: str) -> tuple[str, str] | None:
+    """The minor-bump mutation, derived from abi_version.pbi as it stands:
+    the one #SVC_ABI_MINOR line, and the same line one higher.  None when
+    the file does not hold exactly one such line - the caller makes that an
+    ERROR, not a skip."""
+    hits = list(MINOR_LINE.finditer(body))
+    if len(hits) != 1:
+        return None
+    m = hits[0]
+    return m.group(0), "%s%d" % (m.group(1), int(m.group(2)) + 1)
+
+
+class MutationSiteMissing(Exception):
+    """A mutant's search text is not in its file exactly once.  The mutant
+    cannot be applied, so the defect it stands for is not being tested.
+    That is an ERROR for the whole --mutate run, never a quiet skip."""
+
+
 MUTANTS = {
     "null-slot": (
         # ONE reserved slot nulled after the fill - slot 155, the vehicle
@@ -1372,9 +1393,11 @@ MUTANTS = {
     ),
     "minor-bump": (
         # abi_minor raised with no slot appended.  The minor lives in
-        # abi_version.pbi on Anvil main.
-        "#SVC_ABI_MINOR   = 2",
-        "#SVC_ABI_MINOR   = 3",
+        # abi_version.pbi on Anvil main.  The site is READ from that file
+        # (minor_bump_site), never written here as a number: a hard-coded
+        # "= 2" outlived the 1.3 bump and the mutant stopped applying.
+        minor_bump_site,
+        None,
         "dynamic", ABI_VERSION,
     ),
     "collide-errs": (
@@ -1468,12 +1491,21 @@ def mutate(only: str | None = None) -> tuple[int, int]:
         ran += 1
         print(f"\n=== mutant: {name} (part {which} must go RED) ===")
         original = path.read_text(encoding="utf-8")
+        if callable(find):
+            site = find(original)
+            if site is None:
+                raise MutationSiteMissing(
+                    f"mutant {name}: {path.name} does not hold exactly one line "
+                    f"the mutant can derive its site from ({find.__name__}), so "
+                    "this defect is NOT being tested")
+            find, repl = site
+            print(f"  site derived from {path.name}: {find!r} -> {repl!r}")
         if original.count(find) != 1:
-            print(f"  !! the mutation site for {name} occurs {original.count(find)} "
-                  f"times in {path.name}, not once; this mutant proves nothing and "
-                  "the gate is ABSTAINING on it")
-            failures += 1
-            continue
+            raise MutationSiteMissing(
+                f"mutant {name}: its search text {find!r} occurs "
+                f"{original.count(find)} times in {path.name}, not once, so this "
+                "defect is NOT being tested. Update the mutant's site to the "
+                "source as it stands.")
         OVERRIDE.clear()
         OVERRIDE[path] = original.replace(find, repl, 1)
         try:
@@ -1523,7 +1555,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="anvil-abicheck-") as td:
         CTX["work"] = pathlib.Path(td)
         if args.mutate:
-            bad, ran = mutate(args.only)
+            try:
+                bad, ran = mutate(args.only)
+            except MutationSiteMissing as e:
+                print(f"\nERROR: {e}")
+                print("RESULT: ERROR - a mutant could not be applied; the "
+                      "--mutate run proves nothing until its site is fixed")
+                return 2
             print()
             if not ran:
                 print("RESULT: RED - no mutant belongs to the part named by --only, "
