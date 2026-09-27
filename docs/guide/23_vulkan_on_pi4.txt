@@ -4,9 +4,11 @@
 
 @SECTION Rendering and transfers
 
-The resident Vulkan console uses the public command and resource path. An accepted draw list becomes one V3D bin/render transaction, with GPU tile clear and store. The supported whole-image buffer-to-optimal-image upload uses the texture unit. Buffer copies, fills, updates, equal-size linear image copies, and tightly packed linear image readbacks use guarded DMA on the production Pi 4 backend. `vkCmdUpdateBuffer` captures caller bytes at recording time; submission transfers the captured bytes by DMA. The display owner presents a completed attachment separately.
+The resident Vulkan console uses the public command and resource path. An accepted draw list becomes one V3D bin/render transaction, with GPU tile clear and store. The supported whole-image buffer-to-optimal-image upload uses the texture unit. Buffer copies, fills, updates, rectangular linear image copies, and tightly packed linear image readbacks use guarded DMA on the production Pi 4 backend. `vkCmdUpdateBuffer` captures caller bytes at recording time; submission transfers the captured bytes by DMA. The display owner presents a completed attachment separately.
 
 The production V3D backend refuses a buffer transfer if its board DMA seam is not linked. It does not copy the transfer through a CPU byte loop. A separate test backend does perform byte writes as an explicit oracle for desk checks; that backend is not the Pi 4 runtime. CPU work is still needed to record commands, validate resources, stage caller data and rasterize source glyphs for the atlas. These are not GPU drawing operations.
+
+`vkCmdCopyImage` accepts one nonempty rectangle between bound linear BGRA8 images with transfer usage, compatible transfer layouts, mip zero, one layer, and depth one. The source and destination may have different dimensions and offsets. Submission rechecks their row spans and refuses overlapping accessed texels, including aliased allocations. A tight whole-image copy uses one DMA transfer; a subrectangle uses one DMA transfer per row. Multiple regions, optimal-tiled image copies, mips, layers, and mixed command jobs remain unsupported.
 
 @SECTION The supported image readback
 

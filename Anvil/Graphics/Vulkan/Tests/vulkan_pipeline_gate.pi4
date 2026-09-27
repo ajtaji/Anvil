@@ -24,6 +24,7 @@
 ;   PMF_COMPILER=<PureMetalForge.exe> PMF_A64_INTERP=<a64_interp.py> \
 ;       py -3 tools/vulkan_pipeline_check.py --mutate
 
+#PMF_CHIP = 2711
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
@@ -217,6 +218,8 @@ Procedure.i Main()
   Define bad.i
   Define vaddr.i
   Define i.i
+  Define j.i
+  Define k.i
   Define lifeBase.i
   Define lifeIr.i
   Define lifeIrGen.i
@@ -3233,11 +3236,47 @@ Procedure.i Main()
     i = i + 1
   Wend
   pgPut(714, count)
-  imageCopyRegion\extent\width = #PG_W - 1
+  ; Copy a nonzero rectangle between two positions. Every untouched pixel
+  ; stays poisoned; the byte oracle checks each copied channel.
+  i = 0
+  While i < avkImgSize[avkImgSlot(img2)]
+    PokeA(AnvilVkImageAddress(img2) + i, $A5)
+    i = i + 1
+  Wend
+  imageCopyRegion\srcOffset\x = 3 : imageCopyRegion\srcOffset\y = 5
+  imageCopyRegion\dstOffset\x = 7 : imageCopyRegion\dstOffset\y = 9
+  imageCopyRegion\extent\width = 17 : imageCopyRegion\extent\height = 13
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegion)
   pgPut(715, vkEndCommandBuffer(cmd))
-  pgPut(716, AnvilVkSubmissionOutstanding())
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(716, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(723, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To #PG_H - 1
+    For j = 0 To #PG_W - 1
+      For i = 0 To 3
+        If j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = (((k - 9 + 5) * #PG_W + (j - 7 + 3)) * 4 + i) * 37 + 11
+          rc = rc & $FF
+        Else
+          rc = $A5
+        EndIf
+        If PeekA(AnvilVkImageAddress(img2) + (k * #PG_W + j) * 4 + i) <> rc : count = count + 1 : EndIf
+      Next
+    Next
+  Next
+  pgPut(724, count)
+  imageCopyRegion\srcOffset\x = 60
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegion)
+  pgPut(725, vkEndCommandBuffer(cmd))
+  pgPut(726, AnvilVkSubmissionOutstanding())
+  imageCopyRegion\srcOffset\x = 3
+  imageCopyRegion\dstOffset\x = #PG_W - 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegion)
+  pgPut(727, vkEndCommandBuffer(cmd))
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
 
