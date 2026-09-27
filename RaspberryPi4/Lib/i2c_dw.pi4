@@ -1,6 +1,6 @@
 ; ======================================================================
-;  i2c_dw.pi4 - the Pi 5's header I2C: RP1 I2C1, a Synopsys DesignWare
-;  I2C master. THE ONE FILE THAT KNOWS THE DESIGNWARE COMMAND-FIFO MODEL,
+;  i2c_dw.pi4 - the Pi 5's I2C: RP1 I2C1 on the header and RP1 I2C4 / I2C6
+;  on the two camera/display connectors, Synopsys DesignWare I2C masters. THE ONE FILE THAT KNOWS THE DESIGNWARE COMMAND-FIFO MODEL,
 ;  the RP1 twin of RaspberryPi4/Lib/i2c.pi4 (which knows the BCM2711 BSC).
 ;
 ;  A DIFFERENT IP, SO A THIN HOST FILE (Rule 30). The BSC is "load DLEN,
@@ -43,7 +43,45 @@
 ;  first). 7-bit addresses only. One message per call - START, address,
 ;  n bytes, STOP - which is the HwI2c seam's contract on the Pi 4 too: a
 ;  register read is HwI2cWrite then HwI2cRead, with a STOP between.
-;  No repeated start, no 10-bit, no SMBus quick command.
+;  DwI2cWriteReadOn adds the ONE combined transfer a Goodix touch
+;  controller needs (below). No 10-bit, no SMBus quick command.
+;
+;  ---- THREE INSTANCES OF ONE BLOCK, NOT THREE DRIVERS ------------------
+;
+;  #DWI2C_INST_HEADER  RP1 I2C1  i2c@74000  GPIO 2/3   FUNCSEL 3  header
+;  #DWI2C_INST_MIPI1   RP1 I2C4  i2c@80000  GPIO 40/41 FUNCSEL 2  CAM/DISP 1
+;  #DWI2C_INST_MIPI0   RP1 I2C6  i2c@88000  GPIO 38/39 FUNCSEL 3  CAM/DISP 0
+;
+;  Pinned bcm2712-rpi-5-b.dts:208-222: i2c_csi_dsi0 is &i2c6 with
+;  pinctrl rp1_i2c6_38_39 ("for MIPI0 connector only"), i2c_csi_dsi1 is
+;  &i2c4 with rp1_i2c4_40_41 ("for MIPI1 connector only"), both at
+;  clock-frequency 100000, and i2c_csi_dsi - the label every display
+;  overlay targets by default - is an alias of i2c_csi_dsi1. So MIPI1 is
+;  the display bus unless DwI2cSetDisplayPort(0) says otherwise.
+;  rp1.dtsi:353-381 gives i2c@80000 and i2c@88000 (reg c0_40080000 and
+;  c0_40088000, same RP1_CLK_SYS and the same 65/100 ns edges as I2C1),
+;  and rp1.dtsi:683-694 the pin groups: 12 mA, bias-pull-up.
+;  ***THE TWO CONNECTORS' FUNCSELS DIFFER***: pinctrl-rp1.c:520-523 puts
+;  i2c6 in column a3 of GPIO 38/39 but i2c4 in column a2 of GPIO 40/41.
+;  One constant for both would put one connector on uart5 or spi6.
+;
+;  The per-instance state (up, rate, FIFO depths, counts, last abort
+;  source, timeouts) is swapped by DwI2cUse(), so every procedure below
+;  works on "the current instance" and the public entries say which one
+;  that is. DwI2cUp/Xfer/Write/Read/Probe/SetSpeed/GetSpeed keep their
+;  old meaning - the HEADER - so hw_i2c.pi4 is untouched by this.
+;
+;  ---- THE REPEATED START ---------------------------------------------
+;
+;  DwI2cWriteReadOn queues the write bytes, then the READ commands, the
+;  FIRST READ carrying DATA_CMD BIT(10) (RESTART) and the last command
+;  BIT(9) (STOP) - i2c-designware-master.c:527-573 at the pinned
+;  7e030b60792d: "If both IC_EMPTYFIFO_HOLD_MASTER_EN and IC_RESTART_EN
+;  are set, we must manually set restart bit between messages", and
+;  master_cfg carries DW_IC_CON_RESTART_EN (master.c:999), as IC_CON
+;  does here. There is NO STOP between the halves - a GT9xx forgets its
+;  16-bit register pointer at a STOP (goodix.c's goodix_i2c_read sends
+;  the two messages as one i2c_transfer).
 ;
 ;  EVERY BYTE IS QUEUED WITH THE LAST ONE CARRYING STOP, AND THE FIFO IS
 ;  KEPT FED. i2c-designware-master.c sets BIT(9) on the last byte "always"
@@ -75,7 +113,8 @@
 ;  counts are clock_calc()'s formula over it. If the bench measures a
 ;  different SCL, #DWI2C_CLK_HZ is the line to change, and it is named.
 ;
-;  DESK PROOF ONLY (tools/a64/i2c_dw_check.py). SILICON OWED.
+;  DESK PROOF ONLY (tools/a64/i2c_dw_check.py for the header,
+;  tools/a64/a64_touch_pi5_check.py for the display buses). SILICON OWED.
 ;
 ;  DEPENDENCIES: RaspberryPi4/Lib/timer.pi4 (Ticks, TickHz) and
 ;  RaspberryPi4/Lib/gpio_rp1.pi4 (the pin mux), both listed before this
@@ -85,6 +124,14 @@
 EnableExplicit
 
 #DWI2C_BASE = $1F00074000          ; RP1 I2C1 - see the header
+#DWI2C_I2C4_BASE = $1F00080000     ; RP1 I2C4 i2c@80000 - MIPI1 (i2c_csi_dsi1)
+#DWI2C_I2C6_BASE = $1F00088000     ; RP1 I2C6 i2c@88000 - MIPI0 (i2c_csi_dsi0)
+
+#DWI2C_INST_HEADER = 0             ; see THREE INSTANCES in the header
+#DWI2C_INST_MIPI1  = 1
+#DWI2C_INST_MIPI0  = 2
+#DWI2C_INSTS       = 3
+#DWI2C_SAVED       = 9             ; per-instance words DwI2cUse swaps
 
 ; Register offsets - include/linux/designware_i2c.h.
 #DWI2C_CON           = $00
@@ -119,9 +166,11 @@ EnableExplicit
 #DWI2C_CON_RESTART_EN    = $20
 #DWI2C_CON_SLAVE_DISABLE = $40
 
-; IC_DATA_CMD - bit 8 READ, bit 9 STOP (master.c: 0x100, BIT(9)).
+; IC_DATA_CMD - bit 8 READ, bit 9 STOP, bit 10 RESTART (master.c: 0x100,
+; BIT(9), BIT(10)).
 #DWI2C_CMD_READ = $100
 #DWI2C_CMD_STOP = $200
+#DWI2C_CMD_RESTART = $400
 
 ; IC_RAW_INTR_STAT bits.
 #DWI2C_INTR_TX_ABRT  = $40         ; BIT(6)
@@ -142,18 +191,31 @@ EnableExplicit
 #DWI2C_FUNCSEL  = 3
 #DWI2C_DRIVE_MA = 12             ; rp1.dtsi rp1_i2c1_2_3 drive-strength = <12>
 
+; The display connectors' pins (rp1.dtsi:683-694, pinctrl-rp1.c:520-523).
+; Same 12 mA and pull-up as the header pair.
+#DWI2C_I2C4_SDA     = 40
+#DWI2C_I2C4_SCL     = 41
+#DWI2C_I2C4_FUNCSEL = 2          ; i2c4 is column a2 on GPIO 40/41
+#DWI2C_I2C6_SDA     = 38
+#DWI2C_I2C6_SCL     = 39
+#DWI2C_I2C6_FUNCSEL = 3          ; i2c6 is column a3 on GPIO 38/39
+
 #DWI2C_TIMEOUT_US  = 20000         ; per transfer, plus one per byte below
 #DWI2C_BYTE_US     = 1000
 #DWI2C_SPIN_MAX    = 2000000
 
 ; Results. The numbers equal hal.pbi's #HW_I2C_* where one exists, but
-; hw_i2c.pi4 maps them by name - see its I2cMapCode note.
+; hw_i2c.pi4 maps them by name - see its I2cMapCode note. They ALSO equal
+; Lib/i2c.pi4's #I2C_* codes, all seven: i2c.pi4's #PMF_CHIP = 2712
+; branches hand these straight up (it is compiled before this file and so
+; cannot name them), and tools/a64/a64_touch_pi5_check.py fails if any
+; pair disagrees. ABORT is -11, not -9: -9 is i2c.pi4's #I2C_NOCHIP.
 #DWI2C_OK      = 0
 #DWI2C_NACK    = -2
 #DWI2C_TIMEOUT = -4
 #DWI2C_ARG     = -5
 #DWI2C_RANGE   = -7
-#DWI2C_ABORT   = -9                ; TX_ABRT for a reason other than NACK
+#DWI2C_ABORT   = -11               ; TX_ABRT for a reason other than NACK
 #DWI2C_NODEV   = -10               ; COMP_TYPE did not identify the block
 
 Global dwi2c_up.i
@@ -168,6 +230,13 @@ Global dwi2c_calc_h.i            ; DwI2cCounts' answer, not yet programmed
 Global dwi2c_calc_l.i
 Global dwi2c_timeouts.i
 Global dwi2c_probe_byte.i
+Global dwi2c_inst.i              ; the instance the state above describes
+Global dwi2c_base.i              ; and its block, pins and function
+Global dwi2c_sda.i
+Global dwi2c_scl.i
+Global dwi2c_fsel.i
+Global dwi2c_disp_mipi0.i        ; 0 (the default): the display bus is MIPI1
+Global Dim dwi2c_saved.i[#DWI2C_INSTS * #DWI2C_SAVED]
 
 Procedure DwI2cBarrier()
   ASM
@@ -177,11 +246,149 @@ Procedure DwI2cBarrier()
 EndProcedure
 
 Procedure.i DwI2cRd(off.i)
-  ProcedureReturn PeekN(#DWI2C_BASE + off) & $FFFFFFFF
+  ProcedureReturn PeekN(dwi2c_base + off) & $FFFFFFFF
 EndProcedure
 
 Procedure DwI2cWr(off.i, v.i)
-  PokeL(#DWI2C_BASE + off, v)
+  PokeL(dwi2c_base + off, v)
+EndProcedure
+
+Procedure.i DwI2cInstValid(inst.i)
+  If inst >= 0 And inst < #DWI2C_INSTS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cUse(inst) - make inst the current instance: park the state of the
+;  one that was current, fetch inst's, and point the block, pins and
+;  function at it. Always sets the addresses, so no path reaches a
+;  register through a base nobody chose. The caller has validated inst.
+; ----------------------------------------------------------------------
+Procedure DwI2cUse(inst.i)
+  Define o.i
+  If inst <> dwi2c_inst
+    o = dwi2c_inst * #DWI2C_SAVED
+    dwi2c_saved[o] = dwi2c_up
+    dwi2c_saved[o + 1] = dwi2c_rate
+    dwi2c_saved[o + 2] = dwi2c_txdepth
+    dwi2c_saved[o + 3] = dwi2c_rxdepth
+    dwi2c_saved[o + 4] = dwi2c_abort_source
+    dwi2c_saved[o + 5] = dwi2c_comp_type
+    dwi2c_saved[o + 6] = dwi2c_hcnt
+    dwi2c_saved[o + 7] = dwi2c_lcnt
+    dwi2c_saved[o + 8] = dwi2c_timeouts
+    o = inst * #DWI2C_SAVED
+    dwi2c_up = dwi2c_saved[o]
+    dwi2c_rate = dwi2c_saved[o + 1]
+    dwi2c_txdepth = dwi2c_saved[o + 2]
+    dwi2c_rxdepth = dwi2c_saved[o + 3]
+    dwi2c_abort_source = dwi2c_saved[o + 4]
+    dwi2c_comp_type = dwi2c_saved[o + 5]
+    dwi2c_hcnt = dwi2c_saved[o + 6]
+    dwi2c_lcnt = dwi2c_saved[o + 7]
+    dwi2c_timeouts = dwi2c_saved[o + 8]
+    dwi2c_inst = inst
+  EndIf
+  If inst = #DWI2C_INST_MIPI1
+    dwi2c_base = #DWI2C_I2C4_BASE
+    dwi2c_sda = #DWI2C_I2C4_SDA
+    dwi2c_scl = #DWI2C_I2C4_SCL
+    dwi2c_fsel = #DWI2C_I2C4_FUNCSEL
+  ElseIf inst = #DWI2C_INST_MIPI0
+    dwi2c_base = #DWI2C_I2C6_BASE
+    dwi2c_sda = #DWI2C_I2C6_SDA
+    dwi2c_scl = #DWI2C_I2C6_SCL
+    dwi2c_fsel = #DWI2C_I2C6_FUNCSEL
+  Else
+    dwi2c_base = #DWI2C_BASE
+    dwi2c_sda = #DWI2C_PIN_SDA
+    dwi2c_scl = #DWI2C_PIN_SCL
+    dwi2c_fsel = #DWI2C_FUNCSEL
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The display bus: which connector i2c.pi4's #I2C_BUS_DISPLAY means.
+;  DwI2cSetDisplayPort(1) is CAM/DISP 1 (MIPI1, RP1 I2C4 - the default,
+;  because i2c_csi_dsi is an alias of it), (0) is CAM/DISP 0 (MIPI0, RP1
+;  I2C6). Any other number is refused with 0 and changes nothing.
+; ----------------------------------------------------------------------
+Procedure.i DwI2cSetDisplayPort(port.i)
+  If port = 1
+    dwi2c_disp_mipi0 = 0
+    ProcedureReturn 1
+  EndIf
+  If port = 0
+    dwi2c_disp_mipi0 = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DwI2cDisplayPort()
+  If dwi2c_disp_mipi0 <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DwI2cHeaderInst()
+  ProcedureReturn #DWI2C_INST_HEADER
+EndProcedure
+
+Procedure.i DwI2cDisplayInst()
+  If dwi2c_disp_mipi0 <> 0
+    ProcedureReturn #DWI2C_INST_MIPI0
+  EndIf
+  ProcedureReturn #DWI2C_INST_MIPI1
+EndProcedure
+
+; What an instance IS - for a diagnostic to print before it touches it.
+; -1 for an instance that does not exist. No state is swapped.
+Procedure.i DwI2cBaseOf(inst.i)
+  If inst = #DWI2C_INST_MIPI1
+    ProcedureReturn #DWI2C_I2C4_BASE
+  ElseIf inst = #DWI2C_INST_MIPI0
+    ProcedureReturn #DWI2C_I2C6_BASE
+  ElseIf inst = #DWI2C_INST_HEADER
+    ProcedureReturn #DWI2C_BASE
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i DwI2cSdaOf(inst.i)
+  If inst = #DWI2C_INST_MIPI1
+    ProcedureReturn #DWI2C_I2C4_SDA
+  ElseIf inst = #DWI2C_INST_MIPI0
+    ProcedureReturn #DWI2C_I2C6_SDA
+  ElseIf inst = #DWI2C_INST_HEADER
+    ProcedureReturn #DWI2C_PIN_SDA
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i DwI2cSclOf(inst.i)
+  If inst = #DWI2C_INST_MIPI1
+    ProcedureReturn #DWI2C_I2C4_SCL
+  ElseIf inst = #DWI2C_INST_MIPI0
+    ProcedureReturn #DWI2C_I2C6_SCL
+  ElseIf inst = #DWI2C_INST_HEADER
+    ProcedureReturn #DWI2C_PIN_SCL
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i DwI2cFuncSelOf(inst.i)
+  If inst = #DWI2C_INST_MIPI1
+    ProcedureReturn #DWI2C_I2C4_FUNCSEL
+  ElseIf inst = #DWI2C_INST_MIPI0
+    ProcedureReturn #DWI2C_I2C6_FUNCSEL
+  ElseIf inst = #DWI2C_INST_HEADER
+    ProcedureReturn #DWI2C_FUNCSEL
+  EndIf
+  ProcedureReturn -1
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -284,24 +491,25 @@ Procedure DwI2cProgram()
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  DwI2cUp() - mux GPIO 2/3 to i2c1 with the pull-ups rp1.dtsi asks for,
-;  identify the block, read its FIFO depths, program 100 kHz. Once. A bus
-;  already up is left alone, rate included (the Pi 4 lesson in
-;  hw_i2c.pi4: re-initialising per command threw away `i2c speed`).
-;  Returns 1, or 0 with the reason in DwI2cUpError().
+;  DwI2cUpCur() - mux the current instance's two pins to its function
+;  with the pull-ups rp1.dtsi asks for, identify the block, read its FIFO
+;  depths, program 100 kHz. Once. A bus already up is left alone, rate
+;  included (the Pi 4 lesson in hw_i2c.pi4: re-initialising per command
+;  threw away `i2c speed`). Returns 1, or 0 with the reason in
+;  DwI2cUpError(). DwI2cUp() is the header's; DwI2cUpOn(inst) any one's.
 ; ----------------------------------------------------------------------
-Procedure.i DwI2cUp()
+Procedure.i DwI2cUpCur()
   Define p.i
   If dwi2c_up = 1
     ProcedureReturn 1
   EndIf
-  If Rp1FuncSelSet(#DWI2C_PIN_SDA, #DWI2C_FUNCSEL) = 0 Or Rp1FuncSelSet(#DWI2C_PIN_SCL, #DWI2C_FUNCSEL) = 0
+  If Rp1FuncSelSet(dwi2c_sda, dwi2c_fsel) = 0 Or Rp1FuncSelSet(dwi2c_scl, dwi2c_fsel) = 0
     ProcedureReturn 0
   EndIf
-  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_UP)
-  Rp1PinPull(#DWI2C_PIN_SCL, #RP1_PULL_UP)
-  Rp1PinDrive(#DWI2C_PIN_SDA, #DWI2C_DRIVE_MA)
-  Rp1PinDrive(#DWI2C_PIN_SCL, #DWI2C_DRIVE_MA)
+  Rp1PinPull(dwi2c_sda, #RP1_PULL_UP)
+  Rp1PinPull(dwi2c_scl, #RP1_PULL_UP)
+  Rp1PinDrive(dwi2c_sda, #DWI2C_DRIVE_MA)
+  Rp1PinDrive(dwi2c_scl, #DWI2C_DRIVE_MA)
   DwI2cBarrier()
   dwi2c_comp_type = DwI2cRd(#DWI2C_COMP_TYPE)
   If dwi2c_comp_type <> #DWI2C_COMP_TYPE_VALUE
@@ -335,7 +543,41 @@ Procedure.i DwI2cUpError()
   ProcedureReturn #DWI2C_TIMEOUT
 EndProcedure
 
+Procedure.i DwI2cUp()
+  DwI2cUse(#DWI2C_INST_HEADER)
+  ProcedureReturn DwI2cUpCur()
+EndProcedure
+
+Procedure.i DwI2cUpOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn DwI2cUpCur()
+EndProcedure
+
+; Is inst up already? Asks, never brings it up.
+Procedure.i DwI2cIsUpOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  DwI2cUse(inst)
+  If dwi2c_up = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i DwI2cCompType()
+  DwI2cUse(#DWI2C_INST_HEADER)
+  ProcedureReturn dwi2c_comp_type
+EndProcedure
+
+Procedure.i DwI2cCompTypeOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  DwI2cUse(inst)
   ProcedureReturn dwi2c_comp_type
 EndProcedure
 
@@ -343,9 +585,9 @@ EndProcedure
 ;  DwI2cSetSpeed(hz) - the achieved rate, or #DWI2C_RANGE with nothing
 ;  touched. DwI2cGetSpeed() - the rate programmed.
 ; ----------------------------------------------------------------------
-Procedure.i DwI2cSetSpeed(hz.i)
+Procedure.i DwI2cSetSpeedCur(hz.i)
   Define r.i
-  If DwI2cUp() = 0
+  If DwI2cUpCur() = 0
     ProcedureReturn DwI2cUpError()
   EndIf
   r = DwI2cCounts(hz)
@@ -362,16 +604,48 @@ Procedure.i DwI2cSetSpeed(hz.i)
   ProcedureReturn r
 EndProcedure
 
-Procedure.i DwI2cGetSpeed()
-  If DwI2cUp() = 0
+Procedure.i DwI2cGetSpeedCur()
+  If DwI2cUpCur() = 0
     ProcedureReturn DwI2cUpError()
   EndIf
   ProcedureReturn dwi2c_rate
 EndProcedure
 
+Procedure.i DwI2cSetSpeed(hz.i)
+  DwI2cUse(#DWI2C_INST_HEADER)
+  ProcedureReturn DwI2cSetSpeedCur(hz)
+EndProcedure
+
+Procedure.i DwI2cGetSpeed()
+  DwI2cUse(#DWI2C_INST_HEADER)
+  ProcedureReturn DwI2cGetSpeedCur()
+EndProcedure
+
+Procedure.i DwI2cSetSpeedOn(inst.i, hz.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn DwI2cSetSpeedCur(hz)
+EndProcedure
+
+Procedure.i DwI2cGetSpeedOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn DwI2cGetSpeedCur()
+EndProcedure
+
 ; ----------------------------------------------------------------------
-;  DwI2cXfer(addr, *buf, n, rd) - ONE message: START, addr+R/W, n bytes,
-;  STOP. rd <> 0 reads into *buf, else writes from it. #DWI2C_* result.
+;  DwI2cMsgCur(addr, *wbuf, wn, *rbuf, rn) - on the current instance:
+;  START, addr+W, wn bytes from *wbuf, then (if rn > 0) RESTART, addr+R,
+;  rn bytes into *rbuf, then STOP. wn = 0 is a plain read, rn = 0 a plain
+;  write; the RESTART bit goes only on the first READ after a write (see
+;  THE REPEATED START). #DWI2C_* result.
+;
+;  DwI2cXfer(addr, *buf, n, rd) - ONE plain message on the HEADER: rd <> 0
+;  reads into *buf, else writes from it.
 ;
 ;  i2c_dw_xfer_init's order: disable, TAR, mask interrupts, enable, read
 ;  CLR_INTR to clear anything stale. Then the queue loop: an abort is
@@ -382,7 +656,7 @@ EndProcedure
 ;  rx_outstanding rule - then the RX FIFO is drained. Done is every byte
 ;  queued (and read) AND STOP_DET.
 ; ----------------------------------------------------------------------
-Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
+Procedure.i DwI2cMsgCur(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   Define issued.i
   Define got.i
   Define raw.i
@@ -392,11 +666,13 @@ Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
   Define deadline.i
   Define spins.i
   Define result.i
+  Define total.i
 
-  If addr < 0 Or addr > $7F Or n < 1 Or n > 65535
+  If addr < 0 Or addr > $7F Or wn < 0 Or rn < 0 Or wn > 65535 Or rn > 65535 Or wn + rn < 1
     ProcedureReturn #DWI2C_ARG
   EndIf
-  If DwI2cUp() = 0
+  total = wn + rn
+  If DwI2cUpCur() = 0
     ProcedureReturn DwI2cUpError()
   EndIf
 
@@ -414,7 +690,7 @@ Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
   hz = TickHz()
   deadline = 0
   If hz > 0
-    deadline = Ticks() + (hz / 1000000) * (#DWI2C_TIMEOUT_US + n * #DWI2C_BYTE_US)
+    deadline = Ticks() + (hz / 1000000) * (#DWI2C_TIMEOUT_US + total * #DWI2C_BYTE_US)
   EndIf
 
   issued = 0
@@ -434,31 +710,34 @@ Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
       EndIf
       Break
     EndIf
-    If issued < n
+    If issued < total
       If DwI2cRd(#DWI2C_TXFLR) < dwi2c_txdepth
-        If rd = 0 Or (issued - got) < dwi2c_rxdepth
+        If issued < wn Or (issued - wn - got) < dwi2c_rxdepth
           cmd = 0
-          If issued = n - 1
+          If issued = total - 1
             cmd = #DWI2C_CMD_STOP
           EndIf
-          If rd <> 0
-            DwI2cWr(#DWI2C_DATA_CMD, cmd | #DWI2C_CMD_READ)
+          If issued < wn
+            DwI2cWr(#DWI2C_DATA_CMD, cmd | (PeekA(*wbuf + issued) & $FF))
           Else
-            DwI2cWr(#DWI2C_DATA_CMD, cmd | (PeekA(*buf + issued) & $FF))
+            If issued = wn And wn > 0
+              cmd = cmd | #DWI2C_CMD_RESTART
+            EndIf
+            DwI2cWr(#DWI2C_DATA_CMD, cmd | #DWI2C_CMD_READ)
           EndIf
           issued = issued + 1
           Continue
         EndIf
       EndIf
     EndIf
-    If rd <> 0 And got < issued
+    If got < rn And got < issued - wn
       If DwI2cRd(#DWI2C_RXFLR) > 0
-        PokeA(*buf + got, DwI2cRd(#DWI2C_DATA_CMD) & $FF)
+        PokeA(*rbuf + got, DwI2cRd(#DWI2C_DATA_CMD) & $FF)
         got = got + 1
         Continue
       EndIf
     EndIf
-    If issued = n And (rd = 0 Or got = n)
+    If issued = total And got = rn
       If (raw & #DWI2C_INTR_STOP_DET) <> 0
         DwI2cRd(#DWI2C_CLR_STOP_DET)
         result = #DWI2C_OK
@@ -484,6 +763,42 @@ Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
   ProcedureReturn result
 EndProcedure
 
+Procedure.i DwI2cXferCur(addr.i, *buf, n.i, rd.i)
+  If n < 1
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  If rd <> 0
+    ProcedureReturn DwI2cMsgCur(addr, 0, 0, *buf, n)
+  EndIf
+  ProcedureReturn DwI2cMsgCur(addr, *buf, n, 0, 0)
+EndProcedure
+
+Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
+  DwI2cUse(#DWI2C_INST_HEADER)
+  ProcedureReturn DwI2cXferCur(addr, *buf, n, rd)
+EndProcedure
+
+Procedure.i DwI2cXferOn(inst.i, addr.i, *buf, n.i, rd.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn DwI2cXferCur(addr, *buf, n, rd)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cWriteReadOn(inst, addr, *wbuf, wn, *rbuf, rn) - the combined
+;  transfer: wn >= 1 bytes written, a repeated start, rn >= 1 bytes read,
+;  one STOP at the end. The GT9xx register read (THE REPEATED START).
+; ----------------------------------------------------------------------
+Procedure.i DwI2cWriteReadOn(inst.i, addr.i, *wbuf, wn.i, *rbuf, rn.i)
+  If DwI2cInstValid(inst) = 0 Or wn < 1 Or rn < 1
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn DwI2cMsgCur(addr, *wbuf, wn, *rbuf, rn)
+EndProcedure
+
 Procedure.i DwI2cWrite(addr.i, *buf, n.i)
   ProcedureReturn DwI2cXfer(addr, *buf, n, 0)
 EndProcedure
@@ -499,14 +814,46 @@ Procedure.i DwI2cProbe(addr.i)
   ProcedureReturn DwI2cXfer(addr, @dwi2c_probe_byte, 1, 1)
 EndProcedure
 
+Procedure.i DwI2cProbeOn(inst.i, addr.i)
+  ProcedureReturn DwI2cXferOn(inst, addr, @dwi2c_probe_byte, 1, 1)
+EndProcedure
+
 Procedure.i DwI2cAbortSource()
+  DwI2cUse(#DWI2C_INST_HEADER)
   ProcedureReturn dwi2c_abort_source
 EndProcedure
 
-; The pin seam's two readings: is the pin on i2c1, and what the pad reads
-; (RIO_IN reports the pad whatever function drives it).
+Procedure.i DwI2cAbortSourceOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn dwi2c_abort_source
+EndProcedure
+
+Procedure.i DwI2cTimeoutsOn(inst.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  DwI2cUse(inst)
+  ProcedureReturn dwi2c_timeouts
+EndProcedure
+
+; The pin seam's two readings: is the pin on i2c1 (DwI2cPinMuxedOn: on
+; inst's function), and what the pad reads (RIO_IN reports the pad
+; whatever function drives it).
 Procedure.i DwI2cPinMuxed(pin.i)
   If Rp1FuncSelGet(pin) = #DWI2C_FUNCSEL
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DwI2cPinMuxedOn(inst.i, pin.i)
+  If DwI2cInstValid(inst) = 0
+    ProcedureReturn 0
+  EndIf
+  If Rp1FuncSelGet(pin) = DwI2cFuncSelOf(inst)
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
