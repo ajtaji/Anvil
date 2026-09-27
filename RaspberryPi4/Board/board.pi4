@@ -2371,6 +2371,39 @@ CompilerIf #PMF_CHIP = 2712
       Bt7SetPinctrl(#BT7_PINCTRL_D0)
     EndIf
   EndProcedure
+
+  ; ----------------------------------------------------------------------
+  ;  Pi5CachesOn() - the boot's CacheEnable, LOUD when it refuses. A monitor
+  ;  that silently stays uncached is correct and slow, and the slowness is
+  ;  the only symptom - so the refusal is one sentence on the console (and
+  ;  the UART10 tee), with the reason when one can be named. CacheEnable
+  ;  returns 1/0 only; on 0 the builder is run once more to learn its code
+  ;  (the caches are off, so building tables into gMmuTables is inert).
+  ;  Returns CacheEnable's answer. Gate: tools/a64/pi5_cache_boot_check.py.
+  ; ----------------------------------------------------------------------
+  Procedure.i Pi5CachesOn()
+    Define rc.i
+    If CacheEnable() <> 0
+      ProcedureReturn 1
+    EndIf
+    Print("!! the caches are OFF: ")
+    If MmuBuildable() = 0
+      Print("this build has no page-table support for this exception level")
+    Else
+      CacheMapNc()
+      rc = MmuBuildTables(CacheTablesBase())
+      Select rc
+        Case #MMU_ERR_NC_HIGH
+          Print("a non-cacheable region (the framebuffer or a DMA buffer) lies above the first GiB, where the map has no 2 MiB split")
+        Default
+          Print("CacheEnable refused (mmu code ")
+          PrintDec(rc)
+          Print(")")
+      EndSelect
+    EndIf
+    PrintN(". The monitor runs uncached - correct, and slower; `cache on` tries again.")
+    ProcedureReturn 0
+  EndProcedure
 CompilerEndIf
 
 Procedure Main()
@@ -2589,7 +2622,7 @@ Procedure Main()
   ; CacheMapNc builds the Non-Cacheable map, and after Pi5DtbApply (top of
   ; Main), whose MmuSetRamBytes sized RAM from the live /memory.
   CompilerIf #PMF_CHIP = 2712
-    CacheEnable()
+    Pi5CachesOn()
   CompilerEndIf
   I2cTraceEnable(0)
   BootTimingMark(#BTM_TOUCH_END, 0, 0)
