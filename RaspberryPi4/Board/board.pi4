@@ -2268,6 +2268,63 @@ XIncludeFile "Anvil/Kernel/Scheduler/timer_el3.pbi"
 XIncludeFile "RaspberryPi4/Board/el3_acceptance.pi4"
 XIncludeFile "RaspberryPi4/Board/exception_support.pi4"
 
+CompilerIf #PMF_CHIP = 2712
+  ; ----------------------------------------------------------------------
+  ;  BCM2712: THE FACTS ONLY THE LIVE DEVICE TREE HAS, applied once, early
+  ;  in Main, through the ONE shared reader (Anvil/Core/fdt.pbi):
+  ;    * /axi/dma@10600 brcm,dma-channel-mask - which 40-bit DMA channels
+  ;      the firmware leaves free (pinned DTBs: $7C0). dma.pi4's DmaInit
+  ;      refuses a channel outside it; with no mask it refuses outright.
+  ;    * the pinctrl stepping - "brcm,bcm2712c0-pinctrl" or
+  ;      "brcm,bcm2712d0-pinctrl" - which sdio.pi4 needs before it may mux
+  ;      the radio's SDIO2 pins. Anything else: SdioSetPinctrl is not
+  ;      called and `wifi` refuses in the library, by name.
+  ;  A tree that does not check is reported and nothing is applied: the
+  ;  processor draws the screen and the radio stays down. Never fatal.
+  ; ----------------------------------------------------------------------
+  XIncludeFile "Anvil/Core/fdt.pbi"
+
+  Procedure.i pi5_Be32(p.i)
+    ProcedureReturn (PeekA(p) << 24) | (PeekA(p + 1) << 16) | (PeekA(p + 2) << 8) | PeekA(p + 3)
+  EndProcedure
+
+  Procedure Pi5DtbApply()
+    Define dtb.i
+    Define node.i
+    Define p.i
+    dtb = HwFirmwareDtb()
+    If dtb <= 0 Or FdtCheck(dtb, $100000) <> #FDT_OK
+      Print("!! the firmware device tree at ")
+      PutAddr(dtb)
+      Print(" did not check (fdt ")
+      PrintDec(FdtError())
+      PrintN("), so the DMA")
+      PrintN("   channel mask and the radio's pin stepping are not set: the processor")
+      PrintN("   draws the screen and `wifi` will refuse.")
+      ProcedureReturn
+    EndIf
+    node = FdtFindNode("/axi/dma@10600")
+    p = 0
+    If node <> 0
+      p = FdtGetProp(node, "brcm,dma-channel-mask")
+    EndIf
+    If p <> 0 And FdtPropLen() = 4
+      If DmaSetChannelMask(pi5_Be32(p)) = 0
+        PrintN("!! the device tree's DMA channel mask names channels this engine does")
+        PrintN("   not have, so the processor draws the screen.")
+      EndIf
+    Else
+      PrintN("!! the device tree names no /axi/dma@10600 channel mask, so the")
+      PrintN("   processor draws the screen.")
+    EndIf
+    If FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0
+      SdioSetPinctrl(#SDIO_PINCTRL_C0)
+    ElseIf FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
+      SdioSetPinctrl(#SDIO_PINCTRL_D0)
+    EndIf
+  EndProcedure
+CompilerEndIf
+
 Procedure Main()
   Define c.i
   Define hz.i
@@ -2338,6 +2395,7 @@ Procedure Main()
     If Uart10Attach() = 1 Or Uart10Init(115200) = 1
       Uart10Tee(1)
     EndIf
+    Pi5DtbApply()
   CompilerEndIf
   If gExceptionReady = 0
     Print("!! Processor exception installation failed with code ")
@@ -2872,11 +2930,7 @@ Procedure Main()
       CmdSettings()
 
     ElseIf WordIs("wifi") <> 0
-      CompilerIf #PMF_CHIP = 2712
-      RequireCap(#CAP_NET, "wifi", "the Raspberry Pi 5's radio is on the BCM2712's SDIO2 host and this build has no driver for it yet")
-      CompilerElse
       CmdWifi()
-      CompilerEndIf
 
     ; THE U-BOOT ENV NAMES over the same settings store. These ARE
     ; accepted as aliases, unlike the memory family's setenv note that

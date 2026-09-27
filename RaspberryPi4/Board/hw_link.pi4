@@ -54,9 +54,12 @@
 ; ----------------------------------------------------------------------
 Procedure.i HwLinkHas(kind.i)
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: the Pi 5's Ethernet is RP1's Cadence GEM and its radio is on
-  ; SDIO2; this build drives neither as a link (#CAP_NET is 0), so the
-  ; honest answer for both kinds is "not on this board".
+  ; BCM2712: the radio on SDIO2 is driven (sdio.pi4 / wifi.pi4 2712
+  ; branches); the Pi 5's Ethernet is RP1's Cadence GEM and is not, so
+  ; the wired kind is "not on this board".
+  If kind = #HW_LINK_WIFI
+    ProcedureReturn 1
+  EndIf
   ProcedureReturn 0
   CompilerEndIf
   If kind = #HW_LINK_WIRED
