@@ -229,7 +229,10 @@ the report at `$00AD46E0` had zero status in slots 1 and 4, exact red/green
 triangle and background probes, and the monitor took fresh capture 34. Evidence
 is in `runs/vulkan-cache-triangle-20260926/run2/`. This proves pipeline
 creation and drawing with a non-null cache; it does not prove binary reuse or
-booting the newer Vulkan-default monitor image.
+booting the newer Vulkan-default monitor image. Its presentation step used
+the CPU `DisplayBlit` path, so the capture did not prove accelerated transfer
+to the scanout surface. The triangle diagnostic now links the display DMA
+path for every variant and requires one completed DMA operation to pass.
 
 ### The implemented public entry points
 
