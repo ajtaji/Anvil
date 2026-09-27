@@ -57,9 +57,19 @@ class Stop(Exception):
     pass
 
 
-def build_monitor(cc: str, work: pathlib.Path):
+def build_monitor(cc: str, work: pathlib.Path, override: dict | None = None):
+    """override maps an XIncludeFile path of board.pi4 to replacement text
+    (a mutant): that one include is pointed at a copy in `work`."""
     work.mkdir(parents=True, exist_ok=True)
-    src = (ROOT / "RaspberryPi4/Board/board.pi4").read_bytes().split(b"\n")
+    text = (ROOT / "RaspberryPi4/Board/board.pi4").read_bytes()
+    for rel, body in (override or {}).items():
+        marker = ('XIncludeFile "%s"' % rel).encode()
+        if text.count(marker) != 1:
+            d.die("board.pi4 does not include %s exactly once" % rel)
+        copy = work / ("mut_" + pathlib.Path(rel).name)
+        copy.write_text(body, encoding="utf-8")
+        text = text.replace(marker, ('XIncludeFile "%s"' % copy.resolve().as_posix()).encode())
+    src = text.split(b"\n")
     keep = [l for l in src if l.rstrip(b"\r") != b"#PMF_CHIP = 2711"]
     if len(keep) != len(src):
         print("  (compiling a copy of board.pi4 without its %d `#PMF_CHIP = 2711` line)"

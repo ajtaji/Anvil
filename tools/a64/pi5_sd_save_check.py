@@ -187,15 +187,34 @@ class SdHost:
         self.words_written = 0
         self.drop_word = drop_word
         self.app = False
+        self.shape_errors = []
 
     def complete(self):
         self.intr |= 0x1                                     # CMD_DONE
+
+    # THE RESPONSE SHAPE EACH COMMAND'S ANSWER HAS, and the checks it allows
+    # ([SDHCI] 2.2.6 Response Type Select 00/01/10/11; SD Physical Layer
+    # 4.9): R2 (CMD2, CMD9) is 136 bits with a CRC and no index; R3 (ACMD41)
+    # is 48 bits with neither; R1/R6/R7 are 48 bits with both; R1b (CMD7) is
+    # type 11. A host that asks for a different shape gets what silicon gave
+    # the Pi 5 on 2026-09-27 for CMD2 sent as type 10: CMD_CRC | CMD_END_BIT.
+    SHAPE = {0: (0, 0, 0), 2: (1, 1, 0), 3: (2, 1, 1), 7: (3, 1, 1), 8: (2, 1, 1), 9: (1, 1, 0),
+             13: (2, 1, 1), 16: (2, 1, 1), 17: (2, 1, 1), 24: (2, 1, 1), 55: (2, 1, 1)}
+    SHAPE_APP = {41: (2, 0, 0)}
 
     def command(self, v):
         idx = (v >> 24) & 0x3F
         arg = self.regs.get(0x08, 0)
         self.cmds.append(idx)
         r = [0, 0, 0, 0]
+        want = (self.SHAPE_APP if self.app else self.SHAPE).get(idx)
+        got = ((v >> 16) & 3, (v >> 19) & 1, (v >> 20) & 1)
+        if want is not None and got != want:
+            self.shape_errors.append("CMD%d sent as response type %d, CRC check %d, index check %d; "
+                                     "its response is type %d, CRC %d, index %d" % ((idx,) + got + want))
+            self.app = False
+            self.intr |= 0x8000 | 0x60000                    # ERR + CMD_CRC + CMD_END_BIT
+            return
         app, self.app = self.app, False
         if idx == 0:
             pass
@@ -304,6 +323,7 @@ def run(img, procs, syms, new_image: bytes, card: dict, drop_word=-1):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
+    ap.add_argument("--mutants", action="store_true")
     args = ap.parse_args()
     cc = d.compiler(args.compiler)
     work = ROOT / "_work" / "pi5_sd_save"
@@ -341,6 +361,25 @@ def main() -> int:
         run(img, procs, syms, new, card2, drop_word=5)
         check(read_file(card2, b"ANVIL5  IMG") != new,
               "negative control: a card that loses one word per data block fails the readback")
+        check(not host.shape_errors, "every command was sent with its response's shape (%s)"
+              % "; ".join(host.shape_errors[:2]))
+        if args.mutants:
+            emmc = (ROOT / "RaspberryPi4/Lib/emmc.pi4").read_text(encoding="utf-8")
+            for why, m_old, m_new in (("CMD2 as a 48-bit response", "#SD_CMD2  = $02090000", "#SD_CMD2  = $020A0000"),
+                                   ("CMD9 as a 48-bit response", "#SD_CMD9  = $09090000", "#SD_CMD9  = $090A0000"),
+                                   ("ACMD41 with a CRC check", "#SD_ACMD41 = $29020000", "#SD_ACMD41 = $290A0000")):
+                if emmc.count(m_old) != 1:
+                    check(False, "mutant %s: the edit matched %d times" % (why, emmc.count(m_old)))
+                    continue
+                mimg, mprocs, msyms = build_monitor(cc, work / ("m_" + why.split()[0]),
+                                                    {"RaspberryPi4/Lib/emmc.pi4": emmc.replace(m_old, m_new)})
+                mcard = make_card(old, config)
+                try:
+                    mhost = run(mimg, mprocs, msyms, new, mcard)
+                    red = read_file(mcard, b"ANVIL5  IMG") != new or bool(mhost.shape_errors)
+                except d.GateFail:
+                    red = True
+                check(red, "mutant %s: the save goes red" % why)
     except d.GateFail as e:
         print("pi5_sd_save_check: FAIL - %s" % e)
         return 1
