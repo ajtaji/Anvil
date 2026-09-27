@@ -895,6 +895,78 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
   Wend
 EndProcedure
 
+; Report the limits this bounded device can actually execute. In particular,
+; unsupported dimensions and stages stay zero rather than inheriting Vulkan's
+; required conformance minima. A caller must inspect these before using the
+; device; this query does not claim full core-1.0 conformance.
+Procedure vkGetPhysicalDeviceProperties(physicalDevice.i, *pProperties.VkPhysicalDeviceProperties)
+  Define i.i
+  Define *name
+  Define *destination
+  Define *ranges
+  Define dimension.i
+  If *pProperties = 0
+    ProcedureReturn
+  EndIf
+  If avkPhysSlot(physicalDevice) = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkGetPhysicalDeviceProperties was given a VkPhysicalDevice handle that is not live (Anvil code -20002, stale or foreign handle); the properties structure was left untouched, so do not read it.")
+    ProcedureReturn
+  EndIf
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceProperties)
+    PokeA(*pProperties + i, 0)
+    i = i + 1
+  Wend
+  *pProperties\apiVersion = #VK_API_VERSION_1_0
+  *pProperties\driverVersion = 1
+  *pProperties\deviceType = #VK_PHYSICAL_DEVICE_TYPE_OTHER
+  If AnvilVkBackendIsGpu() <> 0
+    *pProperties\deviceType = #VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+  EndIf
+  *name = avkBackendName()
+  *destination = *pProperties + OffsetOf(VkPhysicalDeviceProperties\deviceName)
+  i = 0
+  While i < #VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1 And PeekA(*name + i) <> 0
+    PokeA(*destination + i, PeekA(*name + i))
+    i = i + 1
+  Wend
+  dimension = avkBackendMaxImageDimension2D()
+  *pProperties\limits\maxImageDimension2D = dimension
+  *pProperties\limits\maxImageArrayLayers = 1
+  *pProperties\limits\maxUniformBufferRange = #ANVIL_VK_UNIFORM_BYTES
+  *pProperties\limits\maxPushConstantsSize = #ANVIL_VK_UNIFORM_BYTES
+  *pProperties\limits\maxMemoryAllocationCount = #ANVIL_VK_MAX_MEMORY
+  *pProperties\limits\maxSamplerAllocationCount = #ANVIL_VK_MAX_SAMPLERS
+  *pProperties\limits\bufferImageGranularity = avkBackendImageAlignment()
+  *pProperties\limits\maxBoundDescriptorSets = 1
+  *pProperties\limits\maxPerStageDescriptorSamplers = 1
+  *pProperties\limits\maxPerStageDescriptorUniformBuffers = 1
+  *pProperties\limits\maxPerStageDescriptorSampledImages = 1
+  *pProperties\limits\maxPerStageResources = #ANVIL_VK_MAX_SET_BINDINGS
+  *pProperties\limits\maxDescriptorSetSamplers = 1
+  *pProperties\limits\maxDescriptorSetUniformBuffers = 1
+  *pProperties\limits\maxDescriptorSetSampledImages = 1
+  *pProperties\limits\maxVertexInputAttributes = #ANVIL_SPV_MAX_ATTRS
+  *pProperties\limits\maxVertexInputBindings = #ANVIL_VK_MAX_BINDINGS
+  *pProperties\limits\maxFragmentOutputAttachments = 1
+  *pProperties\limits\maxViewports = 1
+  *pProperties\limits\maxViewportDimensions[0] = dimension
+  *pProperties\limits\maxViewportDimensions[1] = dimension
+  *pProperties\limits\maxFramebufferWidth = dimension
+  *pProperties\limits\maxFramebufferHeight = dimension
+  *pProperties\limits\maxFramebufferLayers = 1
+  *pProperties\limits\framebufferColorSampleCounts = #VK_SAMPLE_COUNT_1_BIT
+  *pProperties\limits\maxColorAttachments = 1
+  *pProperties\limits\sampledImageColorSampleCounts = #VK_SAMPLE_COUNT_1_BIT
+  *pProperties\limits\minMemoryMapAlignment = 1
+  *pProperties\limits\minUniformBufferOffsetAlignment = #ANVIL_VK_UNIFORM_ALIGN
+  *pProperties\limits\optimalBufferCopyOffsetAlignment = avkBackendImageCopySourceAlignment()
+  *pProperties\limits\nonCoherentAtomSize = 1
+  *ranges = *pProperties + OffsetOf(VkPhysicalDeviceProperties\limits) + OffsetOf(VkPhysicalDeviceLimits\lineWidthRange)
+  PokeL(*ranges, $3F800000)
+  PokeL(*ranges + 4, $3F800000)
+EndProcedure
+
 ; pColor is a VkClearColorValue. Its float32 arm is read here, because
 ; the only format this implementation creates is a UNORM one and the
 ; specification says a UNORM image is cleared from float32. The four
