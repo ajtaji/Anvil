@@ -587,11 +587,6 @@ EndProcedure
 Procedure.i UsbEnumerate()
   Define i.i
   Define phase.i
-  CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: the Pi 5's USB is RP1's xHCI; Lib/pcie + Lib/xhci are the Pi 4's
-  ; VL805 path and are never started here (#CAP_USB is 0).
-  ProcedureReturn 0
-  CompilerEndIf
   ; Leave the retained-only hook installed for storage's later retry too.
   XhciSetTraceHook(@UsbTraceWord)
   ; AND BIND THE SHARED USB CORE BEFORE ANYTHING ENUMERATES. The mass
@@ -686,9 +681,6 @@ EndProcedure
 
 Procedure MouseTryAttach()
   gMouseTried = 1
-  CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn            ; BCM2712: no USB host driver, so no mouse or keyboard
-  CompilerEndIf
   If XhciReady() = 0
     PrintN("Looking for a USB mouse or keyboard - this starts PCI Express and")
     PrintN("the USB host controller, which the monitor does not do at boot, so")

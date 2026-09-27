@@ -59,17 +59,11 @@ Procedure BootConfigUp()
   NetConsoleSetLlTick(@NetLinkLocalTick)
   PrintN("Bringing up the board - each line names what it is starting, so a")
   PrintN("hang or a failure shows exactly where.")
-  CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: RP1's USB and the BCM2712 SD host have no driver in this
-  ; build (#CAP_USB and #CAP_STORAGE are 0), so neither is touched.
-  PrintN("usb: not started - the Raspberry Pi 5's USB (RP1) is not wired in this build.")
-  up = StorageUp()
-  CompilerElse
   ; PCI Express, the xHCI host and the USB devices, each a one-liner.
+  ; (BCM2712: RP1's xHCI through the same two libraries' 2712 branches.)
   UsbEnumerate()
   ; The boot medium prints its own name and size - that IS its log line.
   up = StorageUp()
-  CompilerEndIf
   If up <> 0
     ; SettingsLoad is silent, so it gets a kernel-style line of its own.
     BootStep("settings")
@@ -102,10 +96,10 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure BootNetUp()
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: Ethernet is RP1's Cadence GEM and the radio is on SDIO2;
-  ; neither has a driver here (#CAP_NET is 0).
-  PrintN("network: not started - the Raspberry Pi 5's Ethernet (RP1) and Wi-Fi (SDIO2)")
-  PrintN("     have no driver in this build yet. The serial console is the console.")
+  ; BCM2712: Ethernet is RP1's Cadence GEM and has no driver here
+  ; (#CAP_NET is 0); the radio is driven but is not joined at boot yet.
+  PrintN("network: not started - the Raspberry Pi 5's Ethernet (RP1) has no driver in")
+  PrintN("     this build, and the radio is not joined at boot: type wifi join.")
   ProcedureReturn
   CompilerEndIf
   gBootLog = 1
