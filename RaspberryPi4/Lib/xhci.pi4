@@ -6196,11 +6196,59 @@ Procedure.i XhciBulkOut(*buf, len.i)
   ProcedureReturn n
 EndProcedure
 
+; ----------------------------------------------------------------------
+; AN UNALIGNED BULK-IN BUFFER IS BOUNCED (2026-09-27, the caches-on DMA
+; audit). A device write lands in memory, and xh_Inval then cleans AND
+; invalidates every cache line the buffer touches - including the partial
+; first and last lines, whose other bytes belong to someone else. If any
+; of those neighbouring bytes were written while the transfer ran (this
+; driver's own polling globals can sit next to a caller buffer in BSS),
+; the write-back puts the stale copy of the transfer's bytes over what the
+; device delivered - a wrong read with good status. So a buffer that does
+; not start AND end on a 64-byte line is received into a line-aligned
+; bounce and copied out: no controller write ever shares a line with
+; memory it does not own. Up to #XHCI_BULKIN_BOUNCE bytes - the sizes
+; that are unaligned in practice (status wrappers, sense data, one-off
+; reads; usbmsc.pi4 already bounces its own unaligned block I/O to 64
+; bytes). Larger AND unaligned is refused by name rather than risked.
+; ----------------------------------------------------------------------
+#XHCI_BULKIN_BOUNCE = 4096
+#XHCI_ERR_UNALIGNED = 51
+Global Dim xh_bulkBounce.a[#XHCI_BULKIN_BOUNCE + #XHCI_ALIGN]
+
+Procedure.i xh_BulkInBounced(*buf, len.i)
+  Define n.i
+  Define t0.i
+  Define bb.i
+  Define i.i
+  If len > #XHCI_BULKIN_BOUNCE
+    ProcedureReturn xh_Fail(#XHCI_ERR_UNALIGNED)
+  EndIf
+  bb = ((@xh_bulkBounce[0] + (#XHCI_ALIGN - 1)) / #XHCI_ALIGN) * #XHCI_ALIGN
+  t0 = XhciWaitMark()
+  xh_Clean(bb, len)
+  n = xh_Bulk(#XHCI_RING_BULK_IN, xh_dciIn, bb, len)
+  If n > 0
+    xh_Inval(bb, n)
+    i = 0
+    While i < n
+      PokeA(*buf + i, PeekA(bb + i))
+      i = i + 1
+    Wend
+  EndIf
+  XhciAccountWait(#XHCI_W_BULK, t0)
+  XhciAccountBulkBytes(n)
+  ProcedureReturn n
+EndProcedure
+
 Procedure.i XhciBulkIn(*buf, len.i)
   Define n.i
   Define t0.i
   If *buf = 0
     ProcedureReturn xh_Fail(#XHCI_ERR_ARG)
+  EndIf
+  If ((*buf | len) & (#XHCI_ALIGN - 1)) <> 0
+    ProcedureReturn xh_BulkInBounced(*buf, len)
   EndIf
   t0 = XhciWaitMark()
   ; Clean first even though this is a read. The lines are about to be
@@ -7221,6 +7269,8 @@ CompilerEndIf
       ProcedureReturn "xhci: Reset Endpoint and Set TR Dequeue both ran and the endpoint is still halted - the pipe is gone, re-address the device"
     Case #XHCI_ERR_GONE
       ProcedureReturn "xhci: a controller register read back with every bit set - that is the bus answering for a device that is no longer on it, not a value this controller can produce, so check PCI Express and the BAR before anything about USB"
+    Case #XHCI_ERR_UNALIGNED
+      ProcedureReturn "xhci: a bulk read into a buffer that is not 64-byte aligned at both ends, and larger than the 4096-byte bounce - refused, because receiving it in place lets a cache write-back of the neighbouring bytes overwrite what the device delivered; align the buffer or read it in pieces"
     Case #XHCI_ERR_TD_WRAP
       ProcedureReturn "xhci: a transfer descriptor was queued across the ring's Link TRB - its completion could never be matched, so it was refused instead of timing out; this is a driver fault (xh_RingRoom must pad every TD), not a device fault"
     Case #XHCI_ERR_HCE
