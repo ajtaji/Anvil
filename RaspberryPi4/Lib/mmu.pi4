@@ -1279,6 +1279,13 @@ EndProcedure
 
 ; Geometry, all from v2025.01_cache_v8.c:121-126 and :132-138 as
 ; reasoned in THE GEOMETRY above.
+;
+; THE CHIP SEAM (Rule 30: one MMU library). A -t pi5 build predefines
+; #PMF_CHIP = 2712 and takes the CompilerElse arm: the BCM2712 map, see
+; "THE BCM2712 MAP" below. Every -t pi4 line sits in the first arm,
+; unchanged, so a -t pi4 image is byte-identical to the one before the
+; seam existed.
+CompilerIf #PMF_CHIP <> 2712
 #MMU_L1_ENTRIES  = 64            ; va_bits 36, level-1 index is [35:30]
 #MMU_L2_ENTRIES  = 512           ; a full 4 KiB table, 9 index bits
 #MMU_TABLE_BYTES = 8192          ; two 4 KiB tables, level 1 then level 2
@@ -1294,6 +1301,73 @@ EndProcedure
 ; $6_0000_0000 (24 * 1 GiB). See THE MAP above for why eight slots.
 #MMU_PCIE_SLOT_LO = 24
 #MMU_PCIE_SLOT_HI = 31
+CompilerElse
+; ======================================================================
+;  THE BCM2712 MAP (Raspberry Pi 5, Cortex-A76, -t pi5)
+; ======================================================================
+;
+;  Sources (vault "Raspberry Pi 5/Sources/", kernel pin 7e030b60...):
+;    bcm2712.dtsi:185     cma alloc-ranges 0..$4000_0000 (the low GiB)
+;    bcm2712.dtsi:189-191 soc@107c000000, ranges child 0 -> $10_0000_0000,
+;                         2 GiB: the BCM2712 peripheral space
+;    bcm2712.dtsi:424-435 axi: identity ranges for 0..$10_0000_0000 (RAM)
+;                         and $10_0000_0000 + 4 GiB (V3D $10_0200_0000,
+;                         SD $10_00FF_F000, SDIO2 $10_0110_0000, PCIe
+;                         hosts $10_0011_0000.., all in slots 64..67)
+;    bcm2712.dtsi:545-549 pcie2 (RP1) outbound: 32-bit window at
+;                         $1F_0000_0000, ~4 GiB (slots 124..127); RP1
+;                         UART0 $1F_0003_0000, GPIO $1F_000D_0000
+;    bcm2712-rpi-5-b.dts:18-21 memory@0 reg <0 0 0 0x28000000>: the
+;                         SOURCE value; the bootloader rewrites /memory, so
+;                         the board passes the live size (MmuSetRamBytes)
+;    HARDWARE-BRINGUP.md  EL3 stub at 0..$80000 (TF-A BL31_LIMIT), DTB at
+;                         $2EFEC600, firmware framebuffer $3F800000 (both
+;                         measured on the first Pi 5 boot, 2026-09-26),
+;                         GIC-400 $10_7FFF_9000, PM $10_7D20_0000
+;
+;  THE GEOMETRY. The top address to map is $1F_FFFF_FFFF, above 2^36, so
+;  U-Boot's rule (v2025.01_cache_v8.c:82-84) gives ips = 2 (40-bit PA)
+;  and va_bits = 40, T0SZ = 24 (v2025.01_armv8_mmu.h:83). At va_bits >= 39
+;  the walk STARTS AT LEVEL 0 (cache_v8.c:137-139), so there are three
+;  4 KiB tables: level 0 (one live entry, 512 GiB), level 1 (512 x 1 GiB)
+;  and one level 2 (512 x 2 MiB) splitting the low gigabyte. Laid out as
+;  L1 at base, L2 at base+4096, L0 at base+8192 - so MmuDescriptor() and
+;  MmuDescriptorL2() read the level-1 and level-2 tables exactly as on
+;  the Pi 4 - and TTBR0 points at the level-0 table.
+;
+;  Level 1, 1 GiB slots:
+;    0         TABLE     the low GiB, split into 2 MiB blocks (below)
+;    1..R-1    Normal WB RAM above the first GiB, R = RAM bytes >> 30
+;    64..67    Device    $10_0000_0000..$10_FFFF_FFFF, the SoC
+;    124..127  Device    $1F_0000_0000..$1F_FFFF_FFFF, the RP1 window
+;    else      FAULT
+;  Level 2 under slot 0: every 2 MiB block Normal WB, except blocks named
+;  Non-Cacheable by MmuAddNc (the framebuffer, DMA rings) - the EL3 stub,
+;  the image, BSS, stacks and the DTB are all ordinary cached RAM.
+;
+;  TCR_EL3 / TCR_EL2 for this map, composed exactly as cache_v8.c:93-103:
+;    TCR_EL3_RSVD (1<<31)|(1<<23)   $80800000   mmu.h:103-104
+;    ips << 16, ips = 2             $00020000   cache_v8.c:82-84, :96-98
+;    TCR_TG0_4K                     $00000000   mmu.h:97
+;    TCR_SHARED_INNER (3<<12)       $00003000   mmu.h:96
+;    TCR_ORGN_WBWA (1<<10)          $00000400   mmu.h:90
+;    TCR_IRGN_WBWA (1<<8)           $00000100   mmu.h:85
+;    TCR_T0SZ(40) = 64-40 = 24      $00000018   mmu.h:83
+;                                   ----------
+;                                   $80823518
+;  MAIR and the descriptor attributes are the Pi 4's, unchanged.
+#MMU_L1_ENTRIES  = 512           ; level 1 indexes bits [38:30] under L0[0]
+#MMU_L2_ENTRIES  = 512
+#MMU_TABLE_BYTES = 12288         ; L1, L2, L0 - three 4 KiB tables
+#MMU_SPLIT_SLOT  = 0             ; the low GiB is the split one
+#MMU_PERIPH_BASE = $1000000000   ; RAM stops, the SoC begins (axi ranges)
+#MMU_PCIE_SLOT_LO = 124          ; the RP1 window, $1F_0000_0000
+#MMU_PCIE_SLOT_HI = 127
+#MMU_SOC_SLOT_LO  = 64           ; $10_0000_0000
+#MMU_SOC_SLOT_HI  = 67           ; to $10_FFFF_FFFF
+#MMU_TCR_2712     = $80823518
+#MMU_RAM_DEFAULT  = $40000000    ; 1 GiB until the board passes /memory
+CompilerEndIf
 
 ; MmuBuildTables() refusals. Negative, and distinct, because "the
 ; tables were not built" and "the tables were built somewhere useless"
@@ -1346,6 +1420,26 @@ Procedure MmuAddNc(lo.i, hi.i)
   mmu_ncN = mmu_ncN + 1
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+; MmuSetRamBytes - the top of contiguous RAM from address 0, as the live
+; DTB /memory node gives it. Rounded DOWN to a gigabyte, so a partial
+; gigabyte beyond the last whole one is left unmapped rather than mapped
+; over something that is not RAM; never below 1 GiB (the low GiB is always
+; mapped, split into 2 MiB blocks) and never into the SoC window at
+; $10_0000_0000. Anything else is refused by keeping the previous value.
+Global mmu_ramBytes.i = #MMU_RAM_DEFAULT
+
+Procedure MmuSetRamBytes(bytes.i)
+  If bytes < $40000000
+    ProcedureReturn
+  EndIf
+  If bytes > #MMU_PERIPH_BASE
+    bytes = #MMU_PERIPH_BASE
+  EndIf
+  mmu_ramBytes = (bytes >> 30) << 30
+EndProcedure
+CompilerEndIf
+
 ; mmu_BlockNc - 1 if the 2 MiB block starting at pa overlaps any NC region.
 Procedure.i mmu_BlockNc(pa.i)
   Define k.i
@@ -1392,6 +1486,7 @@ Global mmu_flushaddr.i
 ;  is the whole reason stage 1 is provable: everything that could be
 ;  wrong is inspectable BEFORE the one instruction that commits to it.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP <> 2712
 Procedure.i MmuBuildTables(base.i)
   Define i.i
   Define pa.i
@@ -1488,6 +1583,78 @@ Procedure.i MmuBuildTables(base.i)
 
   ProcedureReturn 0
 EndProcedure
+CompilerElse
+Procedure.i MmuBuildTables(base.i)
+  Define i.i
+  Define pa.i
+  Define l2.i
+  Define l0.i
+  Define d.i
+  Define ramSlots.i
+
+  If base = 0
+    ProcedureReturn #MMU_ERR_NULL
+  EndIf
+  If (base & $FFF) <> 0
+    ProcedureReturn #MMU_ERR_ALIGN
+  EndIf
+  If base < $400000
+    ProcedureReturn #MMU_ERR_LOW
+  EndIf
+
+  l2 = base + 4096
+  l0 = base + 8192
+
+  ; ---- level 2: the low gigabyte in 2 MiB blocks --------------------
+  ; All RAM - the EL3 stub (0..$80000), the image, BSS, stacks, the DTB
+  ; ($2EFEC600) - Write-Back, except the blocks MmuAddNc named, which are
+  ; Normal Non-Cacheable for the bus masters that never see the D-cache
+  ; (the firmware framebuffer at $3F800000, DMA rings).
+  For i = 0 To #MMU_L2_ENTRIES - 1
+    pa = i << 21
+    If mmu_BlockNc(pa) <> 0
+      d = pa | #MMU_ATTR_NORMAL_NC
+    Else
+      d = pa | #MMU_DRAM_ATTR
+    EndIf
+    PokeI(l2 + (i << 3), d)
+  Next
+
+  ; ---- level 1: 512 x 1 GiB ------------------------------------------
+  ramSlots = mmu_ramBytes >> 30
+  For i = 0 To #MMU_L1_ENTRIES - 1
+    pa = i << 30
+    If i = #MMU_SPLIT_SLOT
+      d = l2 | #MMU_DESC_TABLE
+    ElseIf i < ramSlots And i < #MMU_SOC_SLOT_LO
+      d = pa | #MMU_DRAM_ATTR
+    ElseIf i >= #MMU_SOC_SLOT_LO And i <= #MMU_SOC_SLOT_HI
+      d = pa | #MMU_ATTR_DEVICE
+    ElseIf i >= #MMU_PCIE_SLOT_LO And i <= #MMU_PCIE_SLOT_HI
+      d = pa | #MMU_ATTR_DEVICE
+    Else
+      d = #MMU_DESC_FAULT
+    EndIf
+    PokeI(base + (i << 3), d)
+  Next
+
+  ; ---- level 0: entry 0 covers 0..512 GiB, the rest fault ------------
+  For i = 0 To 511
+    If i = 0
+      d = base | #MMU_DESC_TABLE
+    Else
+      d = #MMU_DESC_FAULT
+    EndIf
+    PokeI(l0 + (i << 3), d)
+  Next
+
+  mmu_ttbr = l0
+  mmu_tcr  = #MMU_TCR_2712
+  mmu_mair = #MMU_MAIR_EL2
+
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  MmuDescriptor(base, slot)   - read back one level-1 descriptor.

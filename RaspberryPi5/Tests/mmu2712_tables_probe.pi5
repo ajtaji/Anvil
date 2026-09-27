@@ -1,0 +1,46 @@
+; mmu2712_tables_probe.pi5 - build the BCM2712 page tables, enable nothing.
+;
+; DIAGNOSTIC. Does not ship. The harness for tools/a64/a64_mmu_2712_check.py:
+; it runs RaspberryPi4/Lib/mmu.pi4's -t pi5 arm of MmuBuildTables() so the
+; gate can walk the tables it writes. It touches NO system register and NO
+; peripheral, so it is equally safe as a payload on the board, where the
+; monitor can dump the tables with `md` afterwards.
+;
+; INPUTS, read from four quadwords the gate (or a person at the monitor)
+; writes before the run, so one image covers every case:
+;   $5F0000  RAM bytes for MmuSetRamBytes (0 = leave the 1 GiB default)
+;   $5F0008  Non-Cacheable region start (0 = none)
+;   $5F0010  Non-Cacheable region end (exclusive)
+;   $5F0018  table base (must be 4 KiB aligned, >= $400000)
+; OUTPUT: x0 = MmuBuildTables()'s return; the TTBR value at $5F0020 and the
+; TCR value at $5F0028.
+;
+; BUILD: PureMetalForge.exe --compile RaspberryPi5\Tests\mmu2712_tables_probe.pi5
+;        -t pi5 --entry-returns --load-addr 0x400000 --stack-addr 0x3000000
+
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#MP_IN = $5F0000
+
+Procedure.i Main()
+  Protected ram.i
+  Protected nclo.i
+  Protected nchi.i
+  Protected base.i
+  Protected rc.i
+  ram  = PeekI(#MP_IN)
+  nclo = PeekI(#MP_IN + 8)
+  nchi = PeekI(#MP_IN + 16)
+  base = PeekI(#MP_IN + 24)
+  If ram <> 0
+    MmuSetRamBytes(ram)
+  EndIf
+  MmuClearNc()
+  If nclo <> 0
+    MmuAddNc(nclo, nchi)
+  EndIf
+  rc = MmuBuildTables(base)
+  PokeI(#MP_IN + 32, mmu_ttbr)
+  PokeI(#MP_IN + 40, mmu_tcr)
+  ProcedureReturn rc
+EndProcedure
