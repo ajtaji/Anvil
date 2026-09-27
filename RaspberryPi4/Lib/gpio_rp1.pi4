@@ -147,10 +147,8 @@
 ;
 ;  ---- MEMORY ORDERING ---------------------------------------------------
 ;
-;  Same discipline as gpio.pi4 and the same tool: a64_barrier() (dsb sy +
-;  isb, RaspberryPi4/Intrinsics/bcm2711_hardware.def - the intrinsic name is
-;  inherited from the -t pi4 target and is not BCM2711-specific; -t pi5 is
-;  the same A64 core with a different southbridge). RP1 sits behind PCIe,
+;  Same discipline as gpio.pi4: dsb sy + isb at the edges of each service,
+;  written inline in Rp1GpioBarrier() (see the note there). RP1 sits behind PCIe,
 ;  which is a stronger reason for a barrier at each peripheral service's
 ;  edges than BCM2711's AXI fabric was, not a weaker one.
 ;
@@ -208,8 +206,15 @@ EnableExplicit
 
 Global rp1_gpio_bad_pins.i
 
+; The barrier is written out as inline A64 rather than as a call to the
+; a64_barrier() intrinsic: tools/layering_check.py counts a64_ as a private
+; namespace (a gate stub defines a procedure of that name), and 49b710f's
+; call here was a NEW rule-4 crossing. Same two instructions.
 Procedure Rp1GpioBarrier()
-  a64_barrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
 EndProcedure
 
 Procedure.i Rp1PinValid(pin.i)
@@ -241,11 +246,28 @@ Procedure.i Rp1RioBit(pin.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  Rp1PadInit(pin) - the pad-level setup rp1_set_fsel() always does: input
+;  buffer on, output driver enabled (pinctrl-rp1.c:683-684, 654, 660). Every
+;  RP1 function needs this, GPIO included, so Rp1PinMode and Rp1FuncSelSet
+;  call it before touching CTRL. Preserves the current PULL field (a read-modify-write,
+;  unlike Rp1FuncSelSet's deterministic CTRL write) - pull is this file's
+;  own separate setting and a mode change must not disturb it.
+; ----------------------------------------------------------------------
+Procedure Rp1PadInit(pin.i)
+  Define a.i
+  Define v.i
+  a = Rp1PadAddr(pin)
+  v = Rp1ReadReg(a)
+  v = v | #RP1_PAD_IN_ENABLE
+  v = v & ~#RP1_PAD_OUT_DISABLE
+  PokeL(a, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  Rp1FuncSelSet(pin, funcsel) - the raw 5-bit field. Exposed (not just
-;  Rp1PinMode) because a future caller muxing a pin to i2c1 (funcsel 3 on
-;  RP1 GPIO2/3 - rp1.dtsi's rp1_i2c1_2_3 group, pinctrl-rp1.c:484) needs
-;  this and not "input" or "output". Not yet called by anything in this
-;  file; the I2C bring-up owns that call.
+;  Rp1PinMode) because a caller muxing a pin to i2c1 (funcsel 3 on RP1
+;  GPIO2/3 - rp1.dtsi's rp1_i2c1_2_3 group, pinctrl-rp1.c:484) needs this
+;  and not "input" or "output". RaspberryPi4/Lib/i2c_dw.pi4 is that caller.
 ;
 ;  Deterministic write, not read-modify-write: OUTOVER/OEOVER/INOVER are
 ;  written 0 (PERI, also the reset value) alongside FUNCSEL, matching
@@ -257,10 +279,18 @@ Procedure.i Rp1FuncSelSet(pin.i, funcsel.i)
   If Rp1PinValid(pin) = 0
     ProcedureReturn 0
   EndIf
-  If funcsel < 0 Or funcsel > 31
+  ; 0..8 are the nine table columns (pinctrl-rp1.c:98, RP1_FSEL_COUNT);
+  ; anything else is not a function this file can name, so it is refused
+  ; rather than written (rp1_set_fsel would turn it into NONE_HW, $1F).
+  If funcsel < 0 Or funcsel > 8
     ProcedureReturn 0
   EndIf
   Rp1GpioBarrier()
+  ; rp1_set_fsel() enables the pad's input buffer and output driver for
+  ; EVERY real function (pinctrl-rp1.c:683-684) - without that an i2c1
+  ; pin could neither drive nor hear the bus. Added 2026-09-26 with the
+  ; I2C host (RaspberryPi4/Lib/i2c_dw.pi4), the first caller.
+  Rp1PadInit(pin)
   PokeL(Rp1CtrlAddr(pin), funcsel)
   ProcedureReturn 1
 EndProcedure
@@ -274,24 +304,6 @@ Procedure.i Rp1FuncSelGet(pin.i)
   v = Rp1ReadReg(Rp1CtrlAddr(pin)) & $1F
   Rp1GpioBarrier()
   ProcedureReturn v
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  Rp1PadInit(pin) - the pad-level setup rp1_set_fsel() always does: input
-;  buffer on, output driver enabled (pinctrl-rp1.c:683-684, 654, 660). Every
-;  RP1 function needs this, GPIO included, so Rp1PinMode calls it before
-;  touching CTRL. Preserves the current PULL field (a read-modify-write,
-;  unlike Rp1FuncSelSet's deterministic CTRL write) - pull is this file's
-;  own separate setting and a mode change must not disturb it.
-; ----------------------------------------------------------------------
-Procedure Rp1PadInit(pin.i)
-  Define a.i
-  Define v.i
-  a = Rp1PadAddr(pin)
-  v = Rp1ReadReg(a)
-  v = v | #RP1_PAD_IN_ENABLE
-  v = v & ~#RP1_PAD_OUT_DISABLE
-  PokeL(a, v)
 EndProcedure
 
 ; ----------------------------------------------------------------------
