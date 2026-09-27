@@ -1391,6 +1391,11 @@ EndProcedure
 ; variable saying which tier is up would be a second opinion, and the two
 ; would disagree the first time one of them was not updated.
 Procedure.i ScrShotTier()
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If VulkanConsoleReady() <> 0
+    ProcedureReturn #HW_TIER_V3D
+  EndIf
+  CompilerEndIf
   CompilerIf #ANVIL_V3D_CONSOLE = 1
   If gV3dConOn <> 0
     ProcedureReturn #HW_TIER_V3D
@@ -2537,8 +2542,8 @@ Procedure CmdScreen()
   EndIf
 
   ; ---- the console tier: V3D GPU, DMA framebuffer, or plain CPU ---------
-  ; These are the manual overrides for the boot-time auto-selection. V3D is
-  ; the preferred tier; dma and cpu drop to the framebuffer console (the
+  ; These are the manual overrides for the boot-time auto-selection. Vulkan
+  ; is preferred, then native V3D; dma and cpu use the framebuffer console (the
   ; same code - gDma is the only difference, DMA scroll vs CPU scroll), and
   ; they exist even in a build with no V3D so the operator can force CPU.
   CompilerIf #ANVIL_V3D_CONSOLE = 1
@@ -2565,7 +2570,7 @@ Procedure CmdScreen()
     If VulkanConsoleStart() = #AVC_OK
       PrintN("The console is now rendered through the resident Vulkan Chrome adapter.")
       PrintN("  Type screen dma to return to the framebuffer console; screen v3d")
-      PrintN("  returns to the native V3D renderer. Vulkan remains opt-in.")
+      PrintN("  returns to the native V3D renderer.")
     Else
       Print("!! Vulkan console startup failed (code ")
       PrintDec(VulkanConsoleError())
@@ -2668,14 +2673,14 @@ Procedure CmdScreen()
     PrintN("                     Painting into memory and presenting to the panel")
     PrintN("                     are separate rows. Touches no hardware")
     PrintN("  The console tier is auto-selected at boot by driver availability,")
-    PrintN("  V3D preferred. Override it:")
+    PrintN("  Vulkan preferred, then native V3D, then the framebuffer. Override it:")
     CompilerIf #ANVIL_V3D_CONSOLE = 1
-    PrintN("  screen v3d         the V3D GPU (NeonArcade) - the preferred tier")
+    PrintN("  screen v3d         the native V3D GPU renderer (NeonArcade)")
     CompilerEndIf
     PrintN("  screen dma         the DMA-accelerated framebuffer console")
     PrintN("  screen cpu         the plain-CPU framebuffer console (no DMA scroll)")
     CompilerIf #ANVIL_VULKAN_CONSOLE = 1
-    PrintN("  screen vulkan      the resident Vulkan Chrome console (opt-in)")
+    PrintN("  screen vulkan      the resident Vulkan Chrome console (boot default)")
     CompilerEndIf
     ProcedureReturn
   EndIf

@@ -741,6 +741,11 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
   Define c.i
   Define i.i
   Define j.i
+  Define d.i
+  Define o.i
+  Define actualBytes.i
+  Define *memory.VkMemoryBarrier
+  Define *bufferBarrier.VkBufferMemoryBarrier
   Define *bar.VkImageMemoryBarrier
   Define *other.VkImageMemoryBarrier
   srcStageMask = srcStageMask & $FFFFFFFF
@@ -758,10 +763,6 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier was given a dependency flag that core Vulkan 1.0 does not define (Anvil code -20001, invalid argument); the only bit is VK_DEPENDENCY_BY_REGION_BIT.")
     ProcedureReturn
   EndIf
-  If memoryBarrierCount <> 0 Or bufferMemoryBarrierCount <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a global memory barrier or a buffer memory barrier (Anvil code -20005, unsupported barrier kind); only image memory barriers are implemented in this slice, so record image barriers only.")
-    ProcedureReturn
-  EndIf
   If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdPipelineBarrier requires a recording command buffer (Anvil code -20004, wrong recording state); call vkBeginCommandBuffer first.")
     ProcedureReturn
@@ -770,14 +771,71 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a stage mask this implementation does not track (Anvil code -20005, unsupported stage); both stage masks must name supported, nonzero stages.")
     ProcedureReturn
   EndIf
-  If imageMemoryBarrierCount = 0
-    ; The ordered command stream already provides an execution dependency.
+  If memoryBarrierCount > 8 Or bufferMemoryBarrierCount > 8
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier accepts up to eight global and eight buffer barriers per call (Anvil code -20005, bounded barrier arrays); split a larger dependency across calls.")
     ProcedureReturn
   EndIf
-  If imageMemoryBarrierCount > #ANVIL_VK_MAX_CB_REFS Or *pImageMemoryBarriers = 0
+  If imageMemoryBarrierCount > #ANVIL_VK_MAX_CB_REFS Or (imageMemoryBarrierCount > 0 And *pImageMemoryBarriers = 0)
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier requires a non-null image barrier array of at most two entries (Anvil code -20005, bounded image barrier array); split larger arrays across calls.")
     ProcedureReturn
   EndIf
+  If memoryBarrierCount > 0 Or bufferMemoryBarrierCount > 0
+    If avkCbRpActive[c] <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "transfer-scoped global and buffer barriers require a command buffer outside a render pass (Anvil code -20005, unsupported render-pass dependency).")
+      ProcedureReturn
+    EndIf
+    If (srcStageMask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))) <> 0 Or (dstStageMask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))) <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "global and buffer memory barriers currently synchronize only the ordered transfer stage (Anvil code -20005, unsupported stage scope).")
+      ProcedureReturn
+    EndIf
+    If (memoryBarrierCount > 0 And *pMemoryBarriers = 0) Or (bufferMemoryBarrierCount > 0 And *pBufferMemoryBarriers = 0)
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier was given a null global or buffer barrier array with a nonzero count (Anvil code -20001, invalid argument); Pass a real array for every nonzero barrier count.")
+      ProcedureReturn
+    EndIf
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  i = 0
+  While i < memoryBarrierCount
+    *memory = *pMemoryBarriers + i * SizeOf(VkMemoryBarrier)
+    If *memory\sType <> #VK_STRUCTURE_TYPE_MEMORY_BARRIER
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier has a VkMemoryBarrier with the wrong sType (Anvil code -20001, invalid argument).")
+      ProcedureReturn
+    EndIf
+    If *memory\pNext <> 0 Or ((*memory\srcAccessMask | *memory\dstAccessMask) & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT))) <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "the global memory barrier requests an extension or access outside Anvil's ordered transfer path (Anvil code -20005, unsupported dependency).")
+      ProcedureReturn
+    EndIf
+    If (*memory\srcAccessMask <> 0 And (srcStageMask & #VK_PIPELINE_STAGE_TRANSFER_BIT) = 0) Or (*memory\dstAccessMask <> 0 And (dstStageMask & #VK_PIPELINE_STAGE_TRANSFER_BIT) = 0)
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "a global transfer access must name the transfer stage in the matching pipeline stage mask (Anvil code -20001, incomplete dependency).")
+      ProcedureReturn
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < bufferMemoryBarrierCount
+    *bufferBarrier = *pBufferMemoryBarriers + i * SizeOf(VkBufferMemoryBarrier)
+    If *bufferBarrier\sType <> #VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdPipelineBarrier has a VkBufferMemoryBarrier with the wrong sType (Anvil code -20001, invalid argument).")
+      ProcedureReturn
+    EndIf
+    If *bufferBarrier\pNext <> 0 Or ((*bufferBarrier\srcAccessMask | *bufferBarrier\dstAccessMask) & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT))) <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "the buffer memory barrier requests an extension or access outside Anvil's ordered transfer path (Anvil code -20005, unsupported dependency).")
+      ProcedureReturn
+    EndIf
+    If (*bufferBarrier\srcAccessMask <> 0 And (srcStageMask & #VK_PIPELINE_STAGE_TRANSFER_BIT) = 0) Or (*bufferBarrier\dstAccessMask <> 0 And (dstStageMask & #VK_PIPELINE_STAGE_TRANSFER_BIT) = 0)
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "a buffer transfer access must name the transfer stage in the matching pipeline stage mask (Anvil code -20001, incomplete dependency).")
+      ProcedureReturn
+    EndIf
+    If Not (((*bufferBarrier\srcQueueFamilyIndex & $FFFFFFFF) = #VK_QUEUE_FAMILY_IGNORED And (*bufferBarrier\dstQueueFamilyIndex & $FFFFFFFF) = #VK_QUEUE_FAMILY_IGNORED) Or (*bufferBarrier\srcQueueFamilyIndex = #ANVIL_VK_QUEUE_FAMILY And *bufferBarrier\dstQueueFamilyIndex = #ANVIL_VK_QUEUE_FAMILY))
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier cannot transfer buffer ownership between queue families on this one-family device (Anvil code -20005, unsupported ownership transfer).")
+      ProcedureReturn
+    EndIf
+    If avkBufferBarrierResolve(*bufferBarrier\buffer, d, *bufferBarrier\offset, *bufferBarrier\size, @actualBytes) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdPipelineBarrier needs a live, bound same-device buffer and an in-range nonempty span (Anvil code -20004, invalid buffer barrier range).")
+      ProcedureReturn
+    EndIf
+    i = i + 1
+  Wend
   i = 0
   While i < imageMemoryBarrierCount
     *bar = *pImageMemoryBarriers + i * SizeOf(VkImageMemoryBarrier)
@@ -798,6 +856,32 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
       EndIf
       j = j + 1
     Wend
+    i = i + 1
+  Wend
+  ; The ordered coherent transfer stream executes operations in this same
+  ; sequence, so these transfer-scoped dependencies need no backend cache
+  ; operation. Keep each entry in the stream for capacity and lifetime checks.
+  i = 0
+  While i < memoryBarrierCount
+    o = avkOpAppend(c, #ANVIL_VK_OP_MEMORY_BARRIER)
+    If o = 0
+      avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool cannot retain every global memory barrier (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY).")
+      ProcedureReturn
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < bufferMemoryBarrierCount
+    *bufferBarrier = *pBufferMemoryBarriers + i * SizeOf(VkBufferMemoryBarrier)
+    o = avkOpAppend(c, #ANVIL_VK_OP_BUFFER_BARRIER)
+    If o = 0
+      avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool cannot retain every buffer memory barrier (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY).")
+      ProcedureReturn
+    EndIf
+    avkBufferBarrierResolve(*bufferBarrier\buffer, d, *bufferBarrier\offset, *bufferBarrier\size, @actualBytes)
+    avkOpBuffer[o] = *bufferBarrier\buffer
+    avkOpBufferOffset[o] = *bufferBarrier\offset
+    avkOpSourceBytes[o] = actualBytes
     i = i + 1
   Wend
   i = 0

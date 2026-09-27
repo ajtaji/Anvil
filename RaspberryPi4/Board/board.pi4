@@ -1357,8 +1357,8 @@ XIncludeFile "RaspberryPi4/Lib/display.pi4"
 ;
 ;  A second console backend that renders the HDMI text with the GPU
 ;  instead of the DMA/CPU text grid, double-buffered with a vertical-blank
-;  page flip. It is OPT-IN at run time (`screen v3d`, back with `screen
-;  dma`) and the DMA console stays the default and the fallback, so a board
+;  page flip. It is the fallback GPU tier when Vulkan is unavailable (`screen
+;  v3d` selects it explicitly; `screen dma` selects the framebuffer), so a board
 ;  with no V3D - or one where V3dInit fails - is unaffected. Set the flag to
 ;  0 to compile the whole thing out (the three libraries below are then dead
 ;  code and pruned, and the DMA console is all there is). The engine and its
@@ -1906,8 +1906,8 @@ XIncludeFile "RaspberryPi4/Board/v3d_console.pi4"
 CompilerEndIf
 ; THE VULKAN / TRUEType CONSOLE, behind #ANVIL_VULKAN_CONSOLE. It uses
 ; the same V3D/Neon device backend plus the resident Chrome's single atlas;
-; the console module owns its Vulkan target and switches only on `screen
-; vulkan`. The caller still owns the default DMA console until selected.
+; the console module owns its Vulkan target. Boot now tries it before the
+; native V3D tier; `screen vulkan` also selects it explicitly afterward.
 ; This path requires the V3D/Neon libraries above; setting Vulkan on while
 ; those dependencies are compiled out is an invalid board configuration.
 CompilerIf #ANVIL_VULKAN_CONSOLE = 1 And #ANVIL_V3D_CONSOLE = 0
@@ -2134,6 +2134,7 @@ XIncludeFile "RaspberryPi4/Board/exception_support.pi4"
 Procedure Main()
   Define c.i
   Define hz.i
+  Define vulkanBootRc.i
 
   ASM
     ; CAPTURE THE FIRMWARE DEVICE-TREE POINTER, FIRST, BEFORE ANYTHING
@@ -2354,12 +2355,28 @@ Procedure Main()
 
   TimeBoot()
   NtpServiceBoot()
-  ; Switch the established surface to the preferred V3D renderer before the
-  ; long network bring-up paints its progress. ScreenUp's initial banner is
-  ; necessarily drawn once by the CPU/DMA tier because V3D needs that live
-  ; surface. Failure is non-fatal: V3dConAutoStart leaves the DMA/CPU
-  ; renderer active, which is a readable console and not a degraded one.
-  CompilerIf #ANVIL_V3D_CONSOLE = 1
+  ; The screen first needs a live framebuffer for its banner and shared grid.
+  ; Once it exists, prefer the resident Vulkan/Neon renderer. A clean Vulkan
+  ; startup failure can fall back through native V3D to DMA/CPU. A quarantined
+  ; GPU must never be handed to a different renderer until ownership is safe.
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If gScreen <> 0
+    vulkanBootRc = VulkanConsoleStart()
+    If vulkanBootRc = #AVC_OK
+      PrintN("display renderer: Vulkan on V3D (NeonArcade); the preferred tier is up.")
+    ElseIf VulkanConsoleQuarantined() = 0
+      Print("Vulkan console unavailable at boot (code ")
+      PrintDec(vulkanBootRc)
+      PrintN("); trying the native V3D renderer.")
+      V3dConAutoStart()
+    Else
+      PrintN("!! Vulkan GPU ownership is quarantined; screen rendering is suspended.")
+    EndIf
+  Else
+    V3dConAutoStart()
+  EndIf
+  BootTimingMark(#BTM_V3D_END, Bool(VulkanConsoleReady() <> 0 Or gV3dConOn <> 0), 0)
+  CompilerElseIf #ANVIL_V3D_CONSOLE = 1
   V3dConAutoStart()
   BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
   CompilerElse

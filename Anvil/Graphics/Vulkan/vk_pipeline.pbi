@@ -589,12 +589,29 @@ Procedure.i avkTransferBufferResolve(buffer.i, deviceSlot.i, usage.i, offset.i, 
   ProcedureReturn 1
 EndProcedure
 
+; Resource and range contract for transfer-scoped buffer memory barriers.
+; Unlike a copy, a barrier does not require a particular usage bit.
+Procedure.i avkBufferBarrierResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *actualBytes)
+  Define b.i
+  Define count.i
+  If *actualBytes <> 0 : PokeI(*actualBytes, 0) : EndIf
+  b = avkBufSlot(buffer)
+  If b = 0 Or avkBufDev[b] <> deviceSlot Or avkBufBound[b] = 0 : ProcedureReturn 0 : EndIf
+  If offset < 0 Or offset >= avkBufSize[b] : ProcedureReturn 0 : EndIf
+  count = bytes
+  If count = #VK_WHOLE_SIZE : count = avkBufSize[b] - offset : EndIf
+  If count < 1 Or count > avkBufSize[b] - offset : ProcedureReturn 0 : EndIf
+  If AnvilVkBufferAddress(buffer) = 0 : ProcedureReturn 0 : EndIf
+  If *actualBytes <> 0 : PokeI(*actualBytes, count) : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure avkCopyBufferRetain(c.i)
   Define o.i
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_BUFFER_BARRIER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         avkBufInFlight[b] = avkBufInFlight[b] + 1
@@ -617,7 +634,7 @@ Procedure avkCopyBufferRelease(c.i)
   Define b.i
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE Or avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_BUFFER_BARRIER
       b = avkBufSlot(avkOpBuffer[o])
       If b <> 0
         If avkBufInFlight[b] > 0 : avkBufInFlight[b] = avkBufInFlight[b] - 1 : EndIf

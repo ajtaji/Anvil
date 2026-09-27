@@ -81,6 +81,8 @@ EndStructure
 #ANVIL_VK_OP_COPY_BUFFER = 4
 #ANVIL_VK_OP_FILL_BUFFER = 5
 #ANVIL_VK_OP_UPDATE_BUFFER = 6
+#ANVIL_VK_OP_BUFFER_BARRIER = 7
+#ANVIL_VK_OP_MEMORY_BARRIER = 8
 
 ; "the tracker does not know yet" for a layout inside a recording.
 #ANVIL_VK_LAYOUT_UNKNOWN = -2
@@ -195,6 +197,7 @@ Declare avkDrawListDiscard()
 Declare.i avkDrawListSubmit()
 Declare.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *baseOut)
 Declare.i avkTransferBufferResolve(buffer.i, deviceSlot.i, usage.i, offset.i, bytes.i, *baseOut)
+Declare.i avkBufferBarrierResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *actualBytes)
 Declare avkCopyBufferRetain(c.i)
 Declare avkCopyBufferRelease(c.i)
 Declare avkCbFail(c.i, code.i, text.i)
@@ -1520,6 +1523,10 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
         If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], avkOpSourceBytes[o], @destinationBase) = 0
           ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer update now names a stale, unbound or wrong-device destination (Anvil code -20004, stale resource); no transfer was submitted.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_BUFFER_BARRIER
+        If avkBufferBarrierResolve(avkOpBuffer[o], d, avkOpBufferOffset[o], avkOpSourceBytes[o], 0) = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer memory barrier now names a stale, unbound or wrong-device buffer or range (Anvil code -20004, stale barrier resource); no transfer was submitted.")
         EndIf
       EndIf
       o = avkOpNext[o]

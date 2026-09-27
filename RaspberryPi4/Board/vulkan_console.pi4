@@ -340,6 +340,12 @@ Procedure.i VulkanConsoleStart()
     avcStartupFallback(#AVC_ERR_V3D)
     ProcedureReturn #AVC_ERR_V3D
   EndIf
+  ; Vulkan is now eligible as the first GPU tier at boot. Native V3D used
+  ; to enable the data cache before this path ran; make that guarantee here
+  ; as well so full-screen vertex and atlas work uses the coherent fast path.
+  CompilerIf #ANVIL_V3D_CACHE_AUTO = 1
+  CacheEnable()
+  CompilerEndIf
   If gV3dConOn <> 0 : V3dConStop() : EndIf
   avcLogicalW = DisplayWidth() : avcLogicalH = DisplayHeight()
   avcWidth = ScrGpuPhysicalW() : avcHeight = ScrGpuPhysicalH()
