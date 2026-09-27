@@ -38,8 +38,8 @@ X=136..458, Y=563..701, and 10,521 cyan pixels at X=138..459, Y=514..599.
 Capture 99's scissor-only result had no cyan pixels. The smaller image
 therefore proves viewport mapping changed on the GPU, not just clipping.
 The exact payload, screenshot and monitor metadata are in
-`docs/evidence/vulkan-subviewport-20260927/`. A two-framebuffer resize proof
-remains open.
+`docs/evidence/vulkan-subviewport-20260927/`. A later two-framebuffer resize
+proof is recorded in `docs/VULKAN_FRAMEBUFFER_RESIZE_PI4_2026-09-27.md`.
 
 The next follow-up accepts a nonnegative whole-pixel viewport offset while
 requiring the entire rectangle to fit the framebuffer and its centre to fit
