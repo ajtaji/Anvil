@@ -42,7 +42,7 @@
 Global gSdUp.i
 Global gFatUp.i
 Global gUsbUp.i                ; 1 once a USB block device is readable
-Global gMedium.i               ; 0 none, 1 USB, 2 SD card
+Global gMedium.i               ; 0 none, 1 USB, 2 SD card, 3 NVMe (2712)
 Global Dim gUsbCfg.a[512]      ; a configuration descriptor, DMA-reachable
 
 ; ======================================================================
@@ -318,28 +318,15 @@ Procedure.i storage_MountAny(*medium)
   ProcedureReturn 0
 EndProcedure
 
-Procedure.i StorageUp()
-  ; 1 if a filesystem is mounted and ready, 0 with a reason printed.
-  ;
-  ; USB FIRST, CARD SECOND, because that is the order this machine
-  ; actually boots in. Both are tried before giving up, and which one
-  ; answered is reported - two media that behave identically until they
-  ; do not is exactly the sort of thing worth naming out loud.
-  If gFatUp <> 0
-    ProcedureReturn 1
-  EndIf
-  CompilerIf #PMF_CHIP = 2712
-    ; BCM2712: THE CARD ONLY, AND WRITABLE. USB mass storage is not wired on
-    ; the Pi 5 in this composition (#CAP_USB is 0), so the card is the one
-    ; medium, and `save` and settings save need it to take writes: its
-    ; writer is emmc.pi4's SdWriteBlocks, the same single-block CMD24 path
-    ; the Pi 4's raw `mmc write` uses. No SdSetBaseClockKhz here - the
-    ; 2712 base clock is the DTB's fixed 200 MHz (emmc.pi4).
+CompilerIf #PMF_CHIP = 2712
+  ; The card: emmc.pi4's 2712 branch (no SdSetBaseClockKhz - the base clock
+  ; is the DTB's fixed 200 MHz), writable through SdWriteBlocks, the same
+  ; single-block CMD24 path the Pi 4's raw `mmc write` uses.
+  Procedure.i storage_SdUp2712()
     MonPhaseMark(#BPH_STORAGE | 5)
     If gSdUp = 0
       If SdInit() = 0
-        PrintN("!! no usable SD card, so no medium came up and no file can be read or")
-        PrintN("   written. Check that a card is seated in the slot.")
+        PrintN("!! no usable SD card. Check that a card is seated in the slot.")
         Print("   The card slot said: ")
         UartWriteStr(SdErrorText())   ; a POINTER - never Print/PrintN it
         PrintNl()
@@ -363,6 +350,82 @@ Procedure.i StorageUp()
     gHwFileWriter   = @SdWriteBlocks
     PrintN("Mounted the SD card. Files will be read from and written to this.")
     ProcedureReturn 1
+  EndProcedure
+
+  ; The NVMe drive: pcie.pi4's pcie1 + Anvil/Storage/nvme.pbi, in the
+  ; order RaspberryPi5/Tests/nvme2712_probe.pi5 proves on the desk. No
+  ; link (#PCIE_ERR_LINK, nothing in the slot) is QUIET - that is the
+  ; normal board. Anything past the link that fails says so.
+  Global Dim gNvmeArena.a[#NVME_ARENA_BYTES + 4095]
+  Procedure.i storage_NvmeUp2712()
+    Define arena.i
+    Pcie1SetTimebase(@Ticks, @TickHz)
+    If Pcie1Init() = 0
+      If Pcie1Error() <> #PCIE_ERR_LINK
+        Print("!! the external PCIe port would not start, so no NVMe drive: ")
+        UartWriteStr(Pcie1ErrorText())
+        PrintNl()
+      EndIf
+      ProcedureReturn 0
+    EndIf
+    If Pcie1Enumerate() = 0
+      Print("!! a PCIe link came up but no endpoint could be enumerated: ")
+      UartWriteStr(Pcie1ErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    If Pcie1ClassCode() <> $010802
+      PrintN("!! the device on the external PCIe port is not an NVMe drive, so it is")
+      PrintN("   left alone.")
+      ProcedureReturn 0
+    EndIf
+    arena = ((@gNvmeArena[0] + 4095) / 4096) * 4096
+    NvmeSetCacheOps(@DmaCacheRange, @DmaCacheRange)
+    If NvmeAttach(Pcie1BarCpu(), arena, #NVME_ARENA_BYTES, Pcie1DmaOffset()) = 0
+      Print("!! the NVMe drive would not attach: ")
+      UartWriteStr(NvmeErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    FsSetRangeReader(@NvmeReadBlocks)
+    If storage_MountAny("NVMe drive") = 0
+      PrintN("!! the NVMe drive is readable but none of its partitions could be mounted.")
+      Print("   The last partition tried said: ")
+      UartWriteStr(FsErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    gMedium = 3
+    gFatUp = 1
+    gHwFileWritable = 1
+    gHwFileMounted  = 1
+    gHwFileWriter   = @NvmeWriteBlocks
+    FsSetBlockFlusher(@NvmeFlush)
+    PrintN("Mounted the NVMe drive. Files will be read from and written to this.")
+    ProcedureReturn 1
+  EndProcedure
+CompilerEndIf
+
+Procedure.i StorageUp()
+  ; 1 if a filesystem is mounted and ready, 0 with a reason printed.
+  ;
+  ; USB FIRST, CARD SECOND, because that is the order this machine
+  ; actually boots in. Both are tried before giving up, and which one
+  ; answered is reported - two media that behave identically until they
+  ; do not is exactly the sort of thing worth naming out loud.
+  If gFatUp <> 0
+    ProcedureReturn 1
+  EndIf
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: THE CARD FIRST, THEN AN NVMe DRIVE, BOTH WRITABLE. The card
+    ; is the medium the firmware booted from, so it wins; the NVMe drive on
+    ; the external PCIe x1 is tried only when no card mounts, which keeps a
+    ; board without a drive from paying the ~200 ms PCIe link wait at every
+    ; boot. USB mass storage is not wired on the Pi 5 here (#CAP_USB is 0).
+    If storage_SdUp2712() <> 0
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn storage_NvmeUp2712()
   CompilerEndIf
 
   ; THE BOOT TRAIL (forum 880) marks each step of the mount as well as the
@@ -501,6 +564,15 @@ Procedure HwStorageReport()
   Define n.i
   Define t.i
   Define blocks.i
+  CompilerIf #PMF_CHIP = 2712
+    If gMedium = 3
+      Print("The medium is an NVMe drive holding ")
+      PrintDec(NvmeBlockCount())
+    Else
+      Print("The boot medium is an SD card holding ")
+      PrintDec(SdBlockCount())
+    EndIf
+  CompilerElse
   If gMedium = 1
     Print("The boot medium is a USB stick holding ")
     PrintDec(MscBlockCount())
@@ -508,6 +580,7 @@ Procedure HwStorageReport()
     Print("The boot medium is an SD card holding ")
     PrintDec(SdBlockCount())
   EndIf
+  CompilerEndIf
   PrintN(" blocks of 512 bytes each.")
 
   ; EVERY PARTITION, not only the first. Each slot the table names is
@@ -573,8 +646,10 @@ Procedure HwStorageReport()
   PrintN("  exFAT: UTF-8 long names in folders, matched case-insensitively through")
   PrintN("  the volume's own up-case table. FAT32: 8.3 short names in the root")
   PrintN("  directory only; a long name or a folder is refused, not half-matched.")
+  CompilerIf #PMF_CHIP <> 2712
   If gMedium <> 1
     PrintN("  Writing is implemented for the USB medium only, so save, mkdir, rm,")
     PrintN("  rename and saveenv will refuse while this card is what came up.")
   EndIf
+  CompilerEndIf
 EndProcedure

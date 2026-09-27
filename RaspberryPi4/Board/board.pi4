@@ -1436,6 +1436,12 @@ CompilerEndIf
 ; controller driver and the mass-storage driver above both use it.
 XIncludeFile "Anvil/Bus/usb_core.pbi"
 XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+; BCM2712: an NVMe drive on the external PCIe x1 (pcie1, cold-started by
+; pcie.pi4's 2712 branch), through the shared block device Anvil/Storage/
+; nvme.pbi. Board/storage.pi4 tries it only when no SD card mounts.
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "Anvil/Storage/nvme.pbi"
+CompilerEndIf
 XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
 XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
 ; The mouse cursor on the screen. hid.pi4 rides on the xhci.pi4 already
