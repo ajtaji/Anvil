@@ -9,10 +9,18 @@ Global gInterruptReady.i
 Procedure HwExceptionByte(value.i)
   Define attempt.i
   For attempt = 0 To 4095
+    CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: the console PL011 is RP1 UART0 (RaspberryPi4/Lib/uart.pi4).
+    If (PeekL(#UART_BASE + #UART_FR_OFF) & $20) = 0
+      PokeL(#UART_BASE + #UART_DR_OFF, value & 255)
+      ProcedureReturn
+    EndIf
+    CompilerElse
     If (PeekL($FE201018) & $20) = 0
       PokeL($FE201000, value & 255)
       ProcedureReturn
     EndIf
+    CompilerEndIf
   Next
 EndProcedure
 

@@ -109,7 +109,16 @@ EnableExplicit
 ;  DSI_PORT_*; getting this wrong reads STAT and writes PHYC. Every
 ;  offset below is from the DSI1 half, vc4_dsi.c:389-533.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. No Pi 5 DSI driver; the panel probe fails at I2C first.
+CompilerIf #PMF_CHIP = 2712
+#DSI1_BASE = $DEAD00000000
+CompilerElse
 #DSI1_BASE = $FE700000
+CompilerEndIf
 
 #DSI1_CTRL_OFF           = $00
 #DSI1_TXPKT1C_OFF        = $04
@@ -344,7 +353,16 @@ EnableExplicit
 ;    clk-bcm2835.c:274  A2W_PLLD_PER  0x1540  the PER channel divider
 ;    clk-bcm2835.c:275  A2W_PLLD_DSI1 0x1640  the DSI1 channel divider
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. No Pi 5 clock-manager driver.
+CompilerIf #PMF_CHIP = 2712
+#DSI_CM_BASE = $DEAD00000000
+CompilerElse
 #DSI_CM_BASE   = $FE101000
+CompilerEndIf
 #DSI_CM_PASSWD = $5A000000
 
 #CM_PLLD_OFF      = $010C

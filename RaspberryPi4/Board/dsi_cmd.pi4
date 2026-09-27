@@ -1079,7 +1079,11 @@ Procedure DsiSnapshotTake()
   ; GPFSEL4 holds the function select for GPIO 40..49, which is where the
   ; display connector's I2C pair lives. Whether the firmware left it
   ; muxed says whether the firmware went looking for a panel.
+  CompilerIf #PMF_CHIP = 2712
+  dsi_snapGpfsel4 = 0             ; BCM2712: no BCM2711 GPIO block
+  CompilerElse
   dsi_snapGpfsel4 = PeekN($FE200010) & $FFFFFFFF
+  CompilerEndIf
 
   dsi_snapDomDsi1 = dsi_SnapDomain(#DSI_DOMAIN_DSI1)
   dsi_snapDomDsi0 = dsi_SnapDomain(#DSI_DOMAIN_DSI0)

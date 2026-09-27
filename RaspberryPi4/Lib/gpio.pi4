@@ -248,7 +248,16 @@ EnableExplicit
 ;  base address is 0x7e200000". Bus $7Ennnnnn is ARM physical
 ;  $FEnnnnnn - bcm2711.dtsi:41.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. The Pi 5's header GPIO is RP1 IO_BANK0; #CAP_GPIO is 0 and GpioPinValid() refuses every pin.
+CompilerIf #PMF_CHIP = 2712
+#GPIO_BASE = $DEAD00000000
+CompilerElse
 #GPIO_BASE   = $FE200000      ; bus $7E200000, translated per soc ranges
+CompilerEndIf
 
 #GPFSEL0_OFF = $00            ; function select, 10 pins per reg
 #GPSET0_OFF  = $1C            ; output set,      32 pins per reg
@@ -365,6 +374,10 @@ EndProcedure
 ;  GpioPinValid(pin) - 1 if the pin exists, 0 otherwise (and counted).
 ; ----------------------------------------------------------------------
 Procedure.i GpioPinValid(pin.i)
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: there is no BCM2711 GPIO block, so no pin is this file's.
+  ProcedureReturn 0
+  CompilerEndIf
   If pin < 0 Or pin > #PIN_MAX
     gpio_bad_pins = gpio_bad_pins + 1
     ProcedureReturn 0

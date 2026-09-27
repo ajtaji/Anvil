@@ -268,6 +268,11 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i eth_HwUp()
   Define startErr.i
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the Pi 5's Ethernet is RP1's Cadence GEM, not GENET; this
+  ; build has no driver for it (#CAP_NET is 0), so the wire is down.
+  ProcedureReturn #ETH_HWUP_DOWN
+  CompilerEndIf
   If gEthUp = 1
     If GenetStarted() = 1
       If GenetPhyLinkUp() = 1

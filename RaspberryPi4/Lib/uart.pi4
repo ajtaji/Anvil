@@ -492,9 +492,24 @@
 ;  5.2 Register View, p.67, "The GPIO register base address is
 ;  0x7e200000". Bus $7Ennnnnn is ARM physical $FEnnnnnn on this part -
 ;  bcm2711.dtsi:41.
+;
+;  BCM2712 (-t pi5, #PMF_CHIP = 2712). The header pins 8/10 are RP1's
+;  UART0, the same ARM PL011 behind PCIe: rp1.dtsi serial@30000 through
+;  the pinned DTB ranges to CPU $1F_0003_0000, and on silicon 2026-09-26
+;  (vault Raspberry Pi 5/HARDWARE-BRINGUP.md). There is no BCM2711 GPIO
+;  block; the pin set-up is RP1's (uart_MuxPins). RP1 must be out of
+;  reset: config.txt enable_rp1_uart=1 and pciex4_reset=0, or the first
+;  access to this window hangs the core.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+#UART_BASE       = $1F00030000 ; RP1 serial@30000, the PL011
+#UART_RP1_CLOCKS = $1F00018000 ; RP1 clocks; CLK_UART_CTRL +$54, DIV_INT +$58
+#UART_RP1_IOBANK = $1F000D0000 ; RP1 IO_BANK0; GPIOn_CTRL = base + n*8 + 4
+#UART_RP1_PADS   = $1F000F0000 ; RP1 PADS_BANK0; pad n = base + 4 + n*4
+CompilerElse
 #UART_BASE      = $FE201000    ; serial@7e201000, the PL011
 #UART_GPIO_BASE = $FE200000    ; gpio@7e200000, for the pin mux only
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  PL011 UART0 register OFFSETS. 32-bit device registers - PeekL/PokeL
@@ -535,8 +550,15 @@
 ; ----------------------------------------------------------------------
 ;  The reference clock. THIS IS THE config.txt NUMBER - see the header.
 ;      init_uart_clock=48000000
+;  BCM2712: RP1's 50 MHz XOSC, which uart_MuxPins() selects as CLK_UART
+;  with divider 1 (clk-rp1.c; RaspberryPi5/Board/armstub8-2712.asm), so
+;  the number is what this file programs, not a config.txt line.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+#UART_CLOCK_HZ = 50000000
+CompilerElse
 #UART_CLOCK_HZ = 48000000
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  How long a bounded wait waits.
@@ -1265,6 +1287,22 @@ EndProcedure
 Procedure uart_MuxPins()
   Define v.i
 
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the RP1 sequence, as the EL3 stub's rp1_uart0_init
+  ; (RaspberryPi5/Board/armstub8-2712.asm). CLK_UART_CTRL AUXSRC = XOSC
+  ; with ENABLE clear, DIV_INT = 1, then ENABLE - which is what makes
+  ; #UART_CLOCK_HZ true. FUNCSEL 4 (uart0) on GPIO14/15. Pads 14/15 input
+  ; enable on, output disable off, drive and pull bits left as found.
+  PokeL(#UART_RP1_CLOCKS + $54, $40)
+  PokeL(#UART_RP1_CLOCKS + $58, 1)
+  PokeL(#UART_RP1_CLOCKS + $54, $840)
+  PokeL(#UART_RP1_IOBANK + $74, 4)
+  PokeL(#UART_RP1_IOBANK + $7C, 4)
+  v = PeekN(#UART_RP1_PADS + $3C)
+  PokeL(#UART_RP1_PADS + $3C, (v | $40) & (~$80))
+  v = PeekN(#UART_RP1_PADS + $40)
+  PokeL(#UART_RP1_PADS + $40, (v | $40) & (~$80))
+  CompilerElse
   ; --- function select: FSEL14 = ALT0 (b100), FSEL15 = ALT0 (b100) ---
   v = PeekN(#UART_GPIO_BASE + #UART_GPFSEL1_OFF)
   ; Clear bits 17:12 - $3F000 - then set b100 at 12 and b100 at 15.
@@ -1279,6 +1317,7 @@ Procedure uart_MuxPins()
   v = v & (~$F0000000)
   v = v | (1 << 30)
   PokeL(#UART_GPIO_BASE + #UART_GPPUP0_OFF, v)
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1429,6 +1468,16 @@ EndProcedure
 ;  nothing.
 ; ----------------------------------------------------------------------
 Procedure.i UartInit(baud.i)
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: ADOPT the firmware's port when it already runs at the rate
+  ; asked for. enable_rp1_uart=1 leaves RP1 UART0 enabled at 115200, and
+  ; the EL3 stub leaves an enabled port alone; re-initialising would flush
+  ; what the stub queued. Any other rate, or a port that is off, is the
+  ; full cold bring-up at the 50 MHz uart_MuxPins programs.
+  If baud = 115200 And (PeekN(#UART_BASE + #UART_CR_OFF) & #CR_UARTEN) <> 0
+    ProcedureReturn UartAttach()
+  EndIf
+  CompilerEndIf
   ProcedureReturn UartInitClk(baud, #UART_CLOCK_HZ)
 EndProcedure
 

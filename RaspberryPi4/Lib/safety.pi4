@@ -412,8 +412,18 @@
 ;  so a bare one would read and write eight bytes here and stamp on
 ;  $00001004 as well. Nothing else is known to live there, which is
 ;  precisely why nobody would notice.
+;
+;  BCM2712: $0..$7FFFF is the Pi 5 EL3 stub (armstub8-2712.asm; DTB
+;  reserved-memory atf@0), and this word is written before every reset,
+;  so at $1000 it would overwrite the stub. It moves to +$F00 of the boot
+;  phase page (#MON_PHASE_LO = $001FB000, RaspberryPi4/Board/memmap.pi4),
+;  above everything that page's records use (+0 .. +2623). CHOSEN.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+#SAFETY_COUNT_ADDR = $001FBF00
+CompilerElse
 #SAFETY_COUNT_ADDR = $00001000
+CompilerEndIf
 
 ; Marks OUR counter, so a word left holding something else - and after a
 ; firmware reload that word could hold anything at all - is not mistaken
@@ -426,7 +436,21 @@
 
 ; The PM / watchdog block. USED, as of 2026-08-25 - see the top of this
 ; file for the citation behind every offset below.
+;
+; BCM2712 (-t pi5, #PMF_CHIP = 2712) keeps the same PM watchdog:
+;   * pm: watchdog@7d200000, compatible "brcm,bcm2712-pm" (bcm2712-ds.dtsi),
+;     through /soc to $107D200000; linux 7e030b6 bcm2835-pm.c matches
+;     bcm2712-pm and hands the SAME window to bcm2835_wdt.c, whose PM_RSTC
+;     $1C / PM_WDOG $24 / password / WRCFG values below are unchanged;
+;   * raspberrypi/arm-trusted-firmware bcm2712 plat/rpi/rpi5/include/
+;     rpi_hw.h - RPI_IO_BASE $107C000000 + $01200000 - and rpi5_pm.c resets
+;     the Pi 5 with the sequence safety_WdogArm() performs.
+; Silicon owed.
+CompilerIf #PMF_CHIP = 2712
+#SAFETY_PM_BASE = $107D200000
+CompilerElse
 #SAFETY_PM_BASE = $FE100000
+CompilerEndIf
 
 ; PM / watchdog registers, all of them from
 ; Datasheets/pi4/uboot/v2025.01_bcm2835_wdt.c - see the header.

@@ -441,7 +441,16 @@ EnableExplicit
 ;
 ;  bcm2711.dtsi:125 rng@7e104000, translated by bcm2711.dtsi:41.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. The Pi 5's RNG is not the BCM2711 RNG200; EntropyInit() refuses and the DRBG fails closed.
+CompilerIf #PMF_CHIP = 2712
+#ENTROPY_BASE = $DEAD00000000
+CompilerElse
 #ENTROPY_BASE = $FE104000
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  RNG200 REGISTER OFFSETS AND BIT MASKS.
@@ -631,16 +640,24 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i EntropyReg(off.i)
   Protected v.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 0          ; BCM2712: no RNG200 - see #ENTROPY_BASE
+  CompilerElse
   EntropyBarrier()
   v = PeekN(#ENTROPY_BASE + off)
   EntropyBarrier()
   ProcedureReturn v & $FFFFFFFF
+  CompilerEndIf
 EndProcedure
 
 Procedure EntropySetReg(off.i, v.i)
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn
+  CompilerElse
   EntropyBarrier()
   PokeN(#ENTROPY_BASE + off, v & $FFFFFFFF)
   EntropyBarrier()
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -730,6 +747,9 @@ EndProcedure
 ;  which is where they can be attributed.
 ; ----------------------------------------------------------------------
 Procedure.i EntropyBegin()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn #ENTROPY_ERR_OFF    ; BCM2712: no RNG200; the DRBG fails closed
+  CompilerEndIf
   If EntropyEnabled() = 1
     ProcedureReturn #ENTROPY_ALREADY
   EndIf

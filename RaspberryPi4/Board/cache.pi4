@@ -174,9 +174,16 @@ EndProcedure
 ;  and a payload run. Ethernet frame RX/TX is coherent by construction (the
 ;  RX ring NC + genet.pi4's dc civac) but was not verified on a test rig.
 ; ======================================================================
+; BCM2712: 0. mmu.pi4's tables describe the BCM2711 map - they end at
+; 64 GiB and mark $FC000000.. as the peripheral window - so on a Pi 5 they
+; would unmap RP1 UART0 ($1F_0003_0000) and the console with it.
+CompilerIf #PMF_CHIP = 2712
+#ANVIL_CACHE = 0
+CompilerElse
 #ANVIL_CACHE = 1          ; 1 = the `cache` command can enable the D-cache.
                           ; 0 compiles the capability out; the monitor then
                           ; behaves exactly as it did before caches existed.
+CompilerEndIf
 
 Global gCacheOn.i = 0     ; 1 while the cached MMU is live. 0 at every boot.
 

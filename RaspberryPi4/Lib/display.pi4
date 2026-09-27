@@ -2417,7 +2417,25 @@ Procedure.i DisplayInit(width.i, height.i, depth.i)
   ; mailbox.pi4 converts the other way, ARM + $C0000000, for the buffer
   ; it sends. Same dma-ranges entry, same gigabyte, opposite direction.
   ; U-Boot calls its version bus_to_phys() (v2025.01_msg.c:199).
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: NO BUS ALIAS - the firmware returned the unaliased $3F800000
+  ; on Pi 5 silicon 2026-09-26 - and THE PITCH DECIDES THE PIXEL SIZE,
+  ; not the depth word. That boot asked for 32, got pitch 3840 for 1920
+  ; wide (two bytes a pixel), and 32-bit writes came out double width
+  ; while the depth reply did not say 16 (RaspberryPi5/Board/board.pi4).
+  ; Only an exact 2 or 4 bytes a pixel overrides the reply; anything else
+  ; is left for DspInstall to refuse out loud.
+  If aw > 0
+    If pitch / aw = 2
+      ad = 16
+    ElseIf pitch / aw = 4
+      ad = 32
+    EndIf
+  EndIf
+  ProcedureReturn DspInstall(bus & $FFFFFFFF, bus, sz, pitch, aw, ah, ad)
+  CompilerElse
   ProcedureReturn DspInstall(bus & $3FFFFFFF, bus, sz, pitch, aw, ah, ad)
+  CompilerEndIf
 EndProcedure
 
 
