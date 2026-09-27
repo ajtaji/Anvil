@@ -5,11 +5,12 @@ SILICON OWED. Builds RaspberryPi5/Tests/wifi2712_probe.pi5 with `-t pi5`
 (RaspberryPi4/Lib/sdio.pi4 through its #PMF_CHIP = 2712 seams, and
 Anvil/Net/cyw43.pbi unchanged) and runs it on tools/a64/a64_interp.py with:
 
-  * a pinned firmware DTB in DRAM, from which sdio.pi4's
-    SdioSetPinctrlFromDtb takes the pinctrl stepping (C0 from
+  * a pinned firmware DTB in DRAM, from which the fixture takes the
+    pinctrl stepping exactly as board.pi4's Pi5DtbApply does - the compatible
+    through Anvil/Core/fdt.pbi, then sdio.pi4's SdioSetPinctrl (C0 from
     bcm2712-rpi-5-b.dtb, D0 from bcm2712d0-rpi-5-b.dtb, and a refusal for
     bcm2712-d-rpi-5-b.dtb, whose pinctrl@7d504100 carries neither
-    compatible)
+    compatible). sdio.pi4 reads no device tree (rule 30).
   * the BCM2712 SDIO2 host, cfg block, gio (WL_ON = GPIO28) and pinctrl
     model of tools/a64/a64_sdio_pi5_check.py: the card answers only after
     WL_ON has been cycled and high for the regulator's startup delay, with
@@ -29,7 +30,10 @@ UploadFirmware, UploadNvram, Start, HtClock, AnnounceHost, F2 enable, and
 Cyw43WifiUp (CLM download and the first ioctls over F2).
 
 MUTANTS (unless --no-mutants): a wrong SDIO2 host base, a wrong WL_ON pin,
-the F2 ready wait skipped, and the two pinctrl steppings swapped.
+the F2 ready wait skipped, SdioSetPinctrl recording C0 whatever it is
+told, fdt.pbi comparing only "brcm,bcm2712c0-" (the d-rpi tree's
+"brcm,bcm2712c0-aon-pinctrl" would then read as C0), and fdt.pbi refusing
+every tree. A mutant that does not build is an error, not a kill.
 
 WHY THE FIRMWARE IS THE PI 4'S: brcmfmac picks the firmware by chip, not by
 board - brcmfmac/sdio.c 633 (BRCMF_FW_CLM_DEF(43455, "brcmfmac43455-sdio"))
@@ -64,7 +68,8 @@ import a64_sdio_pi5_check as hostgate  # noqa: E402
 
 FIXTURE = pathlib.PurePosixPath("RaspberryPi5/Tests/wifi2712_probe.pi5")
 LIBRARY = pathlib.PurePosixPath("RaspberryPi4/Lib/sdio.pi4")
-MUTANT_FILES = (FIXTURE, LIBRARY,
+FDT = pathlib.PurePosixPath("Anvil/Core/fdt.pbi")
+MUTANT_FILES = (FIXTURE, LIBRARY, FDT,
                 pathlib.PurePosixPath("Anvil/Net/cyw43.pbi"),
                 pathlib.PurePosixPath("Anvil/Net/cyw43_rx_glom.pbi"),
                 pathlib.PurePosixPath("RaspberryPi4/Intrinsics/bcm2711_hardware.def"))
@@ -210,7 +215,7 @@ def run(img, k, k4, scenario, tree_bytes, stepping, blobs, limit=400_000_000):
     except AlignmentFault as f:
         raise SystemExit(f.message())
     out = [struct.unpack_from("<I", bytes(cpu.memory.get(OUT + 4 * j + i, 0) for i in range(4)))[0]
-           for j in range(17)]
+           for j in range(18)]
     out = [v - (1 << 32) if v & 0x80000000 else v for v in out]
     return board, hc, card, out
 
@@ -222,7 +227,10 @@ def gate(img, k, k4, trees, blobs, verbose, radio_trees=("bcm2712-rpi-5-b.dtb", 
         b, hc, card, o = run(img, k, k4, 2, trees[name], want, blobs)
         exp = {"C0": 1, "D0": 2, None: -2}[want]
         ck(o[16] == DONE and o[1] == exp and o[0] == (1 if want else 0),
-           f"{name}: SdioSetPinctrlFromDtb -> {o[0]}, result {o[1]} (want {exp})")
+           f"{name}: SdioSetPinctrl -> {o[0]}, stepping read {o[1]} (want {exp})")
+        # sdio.pi4 must hold what it was told: #SDIO_PINCTRL_C0 1, D0 2, unknown 0.
+        ck(o[17] == {"C0": 1, "D0": 2, None: 0}[want],
+           f"{name}: SdioPinctrl() is {o[17]} after the stepping (want {want})")
     b, hc, card, o = run(img, k, k4, 2, b"", None, blobs)
     ck(o[0] == 0 and o[1] == -1, f"no tree: refused, result {o[1]} (want -1)")
     # The radio, on each stepping.
@@ -266,29 +274,42 @@ MUTANTS = [
     ("F2 ready wait skipped",
      lambda t: _once(t, "  If SdioCmd52Write(0, #SDIO_CCCR_IOEx, reg | (1 << fn)) = 0\n    ProcedureReturn 0\n  EndIf\n",
                      "  If SdioCmd52Write(0, #SDIO_CCCR_IOEx, reg | (1 << fn)) = 0\n    ProcedureReturn 0\n  EndIf\n  ProcedureReturn 1\n")),
-    ("pinctrl steppings swapped",
-     lambda t: _once(t, "    sdio_pinctrlDtb = 1\n    ProcedureReturn SdioSetPinctrl(#SDIO_PINCTRL_C0)",
-                     "    sdio_pinctrlDtb = 1\n    ProcedureReturn SdioSetPinctrl(#SDIO_PINCTRL_D0)")),
+    ("SdioSetPinctrl records C0 whatever it is told",
+     lambda t: _once(t, "    sdio_pinctrl = kind\n", "    sdio_pinctrl = #SDIO_PINCTRL_C0\n")),
+    ("fdt.pbi compares only the first 15 characters (brcm,bcm2712c0-)",
+     lambda t: _once(t, "  Repeat\n    a = PeekA(p + i)\n",
+                     "  Repeat\n    If i = 15\n      ProcedureReturn 1\n    EndIf\n    a = PeekA(p + i)\n"),
+     FDT),
+    ("fdt.pbi refuses every tree (magic)",
+     lambda t: _once(t, "#FDT_MAGIC       = $D00DFEED", "#FDT_MAGIC       = $D00DFEEE"), FDT),
 ]
 
 
 def mutants(compiler, k, k4, trees, blobs, work):
-    raw = (ROOT / LIBRARY).read_bytes().decode("latin-1")
-    crlf = "\r\n" in raw
-    lib = raw.replace("\r\n", "\n")
     alive = []
-    for name, edit in MUTANTS:
+    for entry in MUTANTS:
+        name, edit = entry[0], entry[1]
+        target = entry[2] if len(entry) > 2 else LIBRARY
+        raw = (ROOT / target).read_bytes().decode("latin-1")
+        crlf = "\r\n" in raw
+        src = raw.replace("\r\n", "\n")
         root = work / "m"
         if root.exists():
             shutil.rmtree(root)
         for f in MUTANT_FILES:
             (root / f).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / f, root / f)
-        text = edit(lib)
-        (root / LIBRARY).write_bytes((text.replace("\n", "\r\n") if crlf else text).encode("latin-1"))
+        text = edit(src)
+        (root / target).write_bytes((text.replace("\n", "\r\n") if crlf else text).encode("latin-1"))
         img = work / "m.img"
         try:
             build(compiler, root, img)
+        except SystemExit as e:
+            # A mutant that does not compile proves nothing about the gate.
+            print(f"  mutant ERROR {name}: did not build - {str(e).splitlines()[0][:120]}")
+            alive.append(name)
+            continue
+        try:
             ck = gate(img, k, k4, trees, blobs, False, radio_trees=("bcm2712-rpi-5-b.dtb",))
             red, why = bool(ck.bad), (ck.bad[0] if ck.bad else "every check passed")
         except SystemExit as e:
