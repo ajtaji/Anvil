@@ -1896,8 +1896,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If clears > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one clear (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This slice lowers one clear per submission, so record one clear per command buffer until the backend carries a command list.")
   EndIf
-  If copyGroups > 1 Or (copies > 0 And (clears > 0 Or imageCopies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0))
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires one buffer-to-image array in its own command buffer (VkResult -8); no partial command stream was submitted.")
+  If copies > 0 And (clears > 0 Or imageCopies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires buffer-to-image commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
   EndIf
   If imageCopies > 0 And (clears > 0 Or copies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-copy commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
@@ -1933,13 +1933,14 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     If job <> #ANVIL_VK_OK : ProcedureReturn job : EndIf
   EndIf
   If copies > 0
-    If target < 1 Or avkImgBound[target] = 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or unbound buffer-to-image destination (Anvil code -20004); nothing was submitted.")
-    EndIf
     o = avkCbOpHead[c]
     While o <> 0
       If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
         copyOp = o
+        target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        If target < 1 Or avkImgBound[target] = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or unbound buffer-to-image destination (Anvil code -20004); nothing was submitted.")
+        EndIf
         copyAlign = avkBackendImageCopySourceAlignment()
         If copyAlign < 1 Or (copyAlign & (copyAlign - 1)) <> 0 Or (avkOpBufferOffset[o] % copyAlign) <> 0
           ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded copy no longer satisfies the active backend's image-copy source alignment (Anvil code -20004); re-record against the current target contract.")
@@ -2221,6 +2222,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       o = avkCbOpHead[c]
       While o <> 0
         If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+          target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
           copyBytes = avkOpSourcePitch[o]
           sourcePitch = avkOpBufferPitch[o]
           copyRows = avkOpRows[o]

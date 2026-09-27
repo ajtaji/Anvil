@@ -25,7 +25,7 @@ graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
 combined `sampler2D` implicit-LOD request from either the measured one-texel
 linear image or the bounded optimal BGRA8 image path. A whole optimal-image
 `vkCmdCopyBufferToImage` upload executes a TFU raster-to-`UIF_NO_XOR` copy;
-bounded multi-region rectangular strided linear-image uploads (two regions silicon-proved by `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`) and bounded multi-region linear
+bounded multi-region and ordered-call rectangular strided linear-image uploads (two regions silicon-proved by `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`; separate calls by `docs/VULKAN_MULTI_CALL_UPLOAD_DMA_PI4_2026-09-27.md`) and bounded multi-region linear
 `vkCmdCopyImage` and `vkCmdCopyImageToBuffer` transfers execute guarded DMA. Submission revalidates live
 resources before transfer and publishes the final layout only after success. Submission
 and the following sampled draw are both observed through public fences.

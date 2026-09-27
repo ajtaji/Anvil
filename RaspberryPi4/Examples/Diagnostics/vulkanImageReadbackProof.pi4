@@ -549,6 +549,33 @@ Procedure.i Main()
     Next
     If status = 147 : Break : EndIf
 
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 148 : Break : EndIf
+    uploadRegions[0]\imageOffset\x = 4 : uploadRegions[0]\imageOffset\y = 0
+    uploadRegions[1]\imageOffset\x = 8 : uploadRegions[1]\imageOffset\y = 0
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 149 : Break : EndIf
+    vkCmdCopyBufferToImage(arrayUploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @uploadRegions[0])
+    vkCmdCopyBufferToImage(arrayUploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @uploadRegions[1])
+    If vkEndCommandBuffer(arrayUploadCmd) <> #VK_SUCCESS : status = 150 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 151 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 152 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 153 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 154 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 155 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If (j >= 7 And j < 24 And k >= 9 And k < 22) Or (j >= 24 And j < 32 And k >= 24 And k < 32) Or (j < 4 And k >= 24 And k < 28) Or (j >= 28 And j < 32 And k < 4) Or (j < 24 And k < 4)
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 156 : Break : EndIf
+      Next
+      If status = 156 : Break : EndIf
+    Next
+    If status = 156 : Break : EndIf
+
     status = 0
   Until 1
 
