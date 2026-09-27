@@ -2329,6 +2329,16 @@ Procedure Main()
   ; This installs only the current EL's vectors; it never unmasks IRQs.
   HwExceptionPrepare()
   UartInit(115200)
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: the JST debug connector (UART10, $107D001000) as a second
+    ; window on the console, teed from the header port (RaspberryPi4/Lib/
+    ; uart.pi4, Anvil 73c6886). Adopted if the firmware or the EL3 stub left
+    ; it running, else brought up at 115200. The tee is bounded and never
+    ; delays the header port, so a quiet header still leaves this one.
+    If Uart10Attach() = 1 Or Uart10Init(115200) = 1
+      Uart10Tee(1)
+    EndIf
+  CompilerEndIf
   If gExceptionReady = 0
     Print("!! Processor exception installation failed with code ")
     PrintDec(ExceptionError()) : PrintNl()
