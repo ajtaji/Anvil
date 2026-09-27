@@ -1019,6 +1019,518 @@ CompilerIf #PMF_CHIP = 2712
     EndSelect
     ProcedureReturn "pcie: unknown error"
   EndProcedure
+
+; ======================================================================
+;  BCM2712 pcie1 - THE EXTERNAL x1 CONNECTOR (M.2 HAT), COLD-STARTED
+; ======================================================================
+;  A SECOND controller, a separate family of procedures (Pcie1*), and
+;  nothing above this line changes: pcie2/RP1 stays the adopt-only path the
+;  USB worker proved, and its link is never touched from here. The one
+;  shared resource is RESCAL (below), and it is only triggered if it has
+;  not already completed.
+;
+;  SILICON OWED. Desk gate: tools/a64/a64_nvme_pi5_check.py.
+;
+;  THE NODE (pinned firmware DTBs, all three agree): /axi/pcie@1000110000,
+;  "brcm,bcm2712-pcie", reg <0x10 0x00110000 0x0 0x9310>, num-lanes 1,
+;  max-link-speed 2, linux,pci-domain 1, resets <&rescal>, <&bcm_reset 43>
+;  ("rescal", "bridge"), status "disabled" - config.txt dtparam=pciex1 (or
+;  =nvme) enables it (bcm2712-rpi.dtsi 229-234). brcm,fifo-qos-map
+;  <3 3 3 3> (bcm2712-rpi-5-b.dts 126-128), brcm,clkreq-mode "safe" (760).
+;    ranges      mem32 PCIe $8000_0000 -> CPU $1B_8000_0000, $8000_0000
+;                bytes (entry 1; the 64-bit entry is not used here)
+;    dma-ranges  PCIe $10_0000_0000 -> CPU 0, $10_0000_0000 bytes (entry 1;
+;                entry 2 is the 4 KiB MSI target - polled here, not used)
+;    rescal      reset-controller@119500 -> $10_0011_9500 (/soc ranges)
+;    bcm_reset   reset-controller@1504318 -> $10_0150_4318
+;
+;  THE SEQUENCE is the pinned driver's, pcie-brcmstb.c (vault Sources):
+;    probe       reset_control_reset(rescal) (2529) - reset-brcmstb-rescal.c
+;                START bit 0, poll STATUS bit 0 for 1000 us, clear START
+;    setup       bridge_sw_init_set(1)/(0) = <&bcm_reset 43> assert/deassert
+;                (950-972; reset-brcmstb.c SET +0 / CLEAR +4 per 0x18 bank,
+;                bit id & 31, 100-200 us after deassert); SERDES_IDDQ off
+;                (1400-1407); MISC_CTRL (1411-1432, burst 2 = 512 B for
+;                7712); inbound BAR1 + UBUS remap (1328-1364, size code
+;                1174-1238); RC mode (1437); LINK_CAPABILITY width 1
+;                (1477-1500); class $060400 (1506); outbound WIN0
+;                (620-661); little-endian BAR2 (1541); post_setup_bcm2712
+;                (1029-1161: MDIO 54 MHz refclk table, PM clock, UBUS/AXI
+;                error and timeout settings, AXI QoS fixes, fifo-qos-map)
+;    start_link  set_gen (608-618), CLKREQ# disabled, PERST# released
+;                (perst_set_7278: PCIE_CTRL.PERSTB, 1006-1016), 100 ms, then
+;                link-up polled every 5 ms for up to 100 ms (1772-1833);
+;                clkreq "safe" (1574-1636). Link down is a REFUSAL.
+;  PERST# is ASSERTED first (perst_set_7278(1)) because this is a cold start
+;  from whatever the firmware left; the driver does the same on turn-off.
+;  PCI_EXP_* offsets (LNKSTA $12, LNKCTL2 $30, SLS/TLS bits 3:0) are the PCI
+;  Express capability layout at BRCM_PCIE_CAP_REGS $AC.
+; ======================================================================
+  #PCIE1_RC_BASE   = $1000110000
+  #PCIE1_RC_SIZE   = $9310
+  #PCIE1_OUT_CPU   = $1B80000000
+  #PCIE1_OUT_BUS   = $80000000
+  #PCIE1_OUT_SIZE  = $80000000
+  #PCIE1_DMA_BUS   = $1000000000
+  #PCIE1_DMA_SIZE  = $1000000000
+  #PCIE1_RESCAL    = $1000119500      ; START +0, STATUS +8
+  #PCIE1_RESET     = $1001504318      ; brcmstb-reset: bank n at n * $18
+  #PCIE1_BRIDGE_ID = 43               ; resets <&bcm_reset 43>
+
+  #PCIE_B_MISC_CTRL        = $4008
+  #PCIE_B_MEM_WIN0_LO      = $400C
+  #PCIE_B_MEM_WIN0_HI      = $4010
+  #PCIE_B_RC_BAR1_LO       = $402C
+  #PCIE_B_RETRY_TIMEOUT    = $405C
+  #PCIE_B_PCIE_CTRL        = $4064
+  #PCIE_B_WIN0_BASE_LIMIT  = $4070
+  #PCIE_B_WIN0_BASE_HI     = $4080
+  #PCIE_B_WIN0_LIMIT_HI    = $4084
+  #PCIE_B_CTRL_1           = $40A0
+  #PCIE_B_UBUS_CTRL        = $40A4
+  #PCIE_B_UBUS_TIMEOUT     = $40A8
+  #PCIE_B_UBUS_BAR1        = $40AC
+  #PCIE_B_TC_QOS_MAP0      = $4160        ; (i) at $4160 - 4 * i
+  #PCIE_B_AXI_INTF_CTRL    = $416C
+  #PCIE_B_AXI_READ_ERR     = $4170
+  #PCIE_B_HARD_DEBUG       = $4304        ; pcie_offsets_bcm7712
+  #PCIE_B_VENDOR_REG1      = $0188
+  #PCIE_B_ID_VAL3          = $043C
+  #PCIE_B_LINK_CAP         = $04DC
+  #PCIE_B_ROOT_CAP         = $04F8
+  #PCIE_B_MDIO_ADDR        = $1100
+  #PCIE_B_MDIO_WR          = $1104
+  #PCIE_B_PHY_CTL_1        = $1804
+  #PCIE_B_PHY_CTL_15       = $184C
+  #PCIE_B_LNKCTL2          = $00DC        ; $AC + PCI_EXP_LNKCTL2 $30
+
+  #PCIE_B_PERSTB           = $4
+  #PCIE_B_SERDES_IDDQ      = $08000000
+  #PCIE_B_CLKREQ_MASK      = $00310002    ; CLKREQ_DEBUG | REFCLK_OVRD_EN | _OUT | L1SS_EN
+  #PCIE_B_REFCLK_OVRD      = $00110000    ; REFCLK_OVRD_OUT | REFCLK_OVRD_ENABLE
+  #PCIE_B_MDIO_DONE        = $80000000
+
+  #PCIE_ERR_RESCAL   = -20
+  #PCIE_ERR_MDIO     = -21
+  #PCIE_ERR_BAR      = -22
+  #PCIE_ERR_NO_TIMER = -23
+
+  Global pcie1_up.i
+  Global pcie1_err.i
+  Global pcie1_enumerated.i
+  Global pcie1_linkSpeed.i = -1
+  Global pcie1_linkWidth.i = -1
+  Global pcie1_id.i
+  Global pcie1_class.i
+  Global pcie1_barCpu.i
+  Global pcie1_barBytes.i
+  Global pcie1_rescalRan.i = -1   ; 1 ran it, 0 found it already done
+
+  ; THE TIMEBASE IS HANDED IN. This file reads no counter of its own
+  ; (layering rule 3: the generic-timer read belongs to timer.pi4), and it
+  ; does not call Ticks()/TickHz() by name either, because programs build
+  ; pcie.pi4 -t pi5 for the pcie2 path without timer.pi4. The board says
+  ;     Pcie1SetTimebase(@Ticks, @TickHz)
+  ; and Pcie1Init refuses (#PCIE_ERR_NO_TIMER) until it has.
+  Global *pcie1_ticksFn
+  Global *pcie1_hzFn
+
+  Procedure Pcie1SetTimebase(ticksFn.i, hzFn.i)
+    *pcie1_ticksFn = ticksFn
+    *pcie1_hzFn = hzFn
+  EndProcedure
+
+  Procedure.i pcie1_Ticks()
+    If *pcie1_ticksFn = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn pcie1_ticksFn()
+  EndProcedure
+
+  Procedure.i pcie1_TickHz()
+    If *pcie1_hzFn = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn pcie1_hzFn()
+  EndProcedure
+
+  ; Spin for at least us microseconds. A missing or zero timebase is
+  ; refused by the caller (Pcie1Init) before anything is waited on.
+  Procedure pcie1_DelayUs(us.i)
+    Define t0.i
+    Define want.i
+    want = (pcie1_TickHz() / 1000000) * us
+    t0 = pcie1_Ticks()
+    While (pcie1_Ticks() - t0) < want
+    Wend
+  EndProcedure
+
+  Procedure.i pcie1_Rd(off.i)
+    Define v.i
+    If off < 0 Or (off & 3) <> 0 Or (off + 4) > #PCIE1_RC_SIZE
+      ProcedureReturn 0
+    EndIf
+    v = PeekN(#PCIE1_RC_BASE + off)
+    pcie_Sync()
+    ProcedureReturn v
+  EndProcedure
+
+  Procedure pcie1_Wr(off.i, v.i)
+    If off < 0 Or (off & 3) <> 0 Or (off + 4) > #PCIE1_RC_SIZE
+      ProcedureReturn
+    EndIf
+    pcie_Sync()
+    PokeL(#PCIE1_RC_BASE + off, v & $FFFFFFFF)
+    pcie_Sync()
+  EndProcedure
+
+  Procedure pcie1_Mod(off.i, clearMask.i, setMask.i)
+    pcie1_Wr(off, (pcie1_Rd(off) & (~clearMask)) | setMask)
+  EndProcedure
+
+  ; brcm_pcie_mdio_write (552-566): ADDR = the packet for port 0 (regad in
+  ; bits 15:0, CMD bit 20 = 0 for write), read ADDR back, WR_DATA =
+  ; DONE | data, then poll WR_DATA until DONE clears - 100 us.
+  Procedure.i pcie1_MdioWrite(regad.i, wrdata.i)
+    Define t0.i
+    Define budget.i
+    pcie1_Wr(#PCIE_B_MDIO_ADDR, regad & $FFFF)
+    pcie1_Rd(#PCIE_B_MDIO_ADDR)
+    pcie1_Wr(#PCIE_B_MDIO_WR, #PCIE_B_MDIO_DONE | (wrdata & $FFFF))
+    budget = (pcie1_TickHz() / 1000000) * 100
+    t0 = pcie1_Ticks()
+    While (pcie1_Rd(#PCIE_B_MDIO_WR) & #PCIE_B_MDIO_DONE) <> 0
+      If (pcie1_Ticks() - t0) > budget
+        ProcedureReturn 0
+      EndIf
+    Wend
+    ProcedureReturn 1
+  EndProcedure
+
+  ; reset-brcmstb-rescal.c brcm_rescal_reset_set (24-52). RESCAL is SHARED
+  ; by every PCIe PHY, including pcie2's live link to RP1, so it is only run
+  ; when its STATUS bit does not already say calibrated.
+  Procedure.i pcie1_Rescal()
+    Define t0.i
+    Define budget.i
+    If (PeekN(#PCIE1_RESCAL + 8) & 1) <> 0
+      pcie1_rescalRan = 0
+      ProcedureReturn 1
+    EndIf
+    pcie1_rescalRan = 1
+    PokeL(#PCIE1_RESCAL, PeekN(#PCIE1_RESCAL) | 1)
+    pcie_Sync()
+    If (PeekN(#PCIE1_RESCAL) & 1) = 0
+      ProcedureReturn 0
+    EndIf
+    budget = (pcie1_TickHz() / 1000000) * 1000
+    t0 = pcie1_Ticks()
+    While (PeekN(#PCIE1_RESCAL + 8) & 1) = 0
+      If (pcie1_Ticks() - t0) > budget
+        ProcedureReturn 0
+      EndIf
+    Wend
+    PokeL(#PCIE1_RESCAL, PeekN(#PCIE1_RESCAL) & (~1))
+    pcie_Sync()
+    ProcedureReturn 1
+  EndProcedure
+
+  ; <&bcm_reset 43>: bank 43 >> 5 = 1 at +$18, bit 43 & 31 = 11. Assert
+  ; writes SET (+0), deassert writes CLEAR (+4) and waits (reset-brcmstb.c).
+  Procedure pcie1_Bridge(assertIt.i)
+    Define bank.i
+    bank = #PCIE1_RESET + ((#PCIE1_BRIDGE_ID >> 5) * $18)
+    pcie_Sync()
+    If assertIt <> 0
+      PokeL(bank, 1 << (#PCIE1_BRIDGE_ID & 31))
+    Else
+      PokeL(bank + 4, 1 << (#PCIE1_BRIDGE_ID & 31))
+    EndIf
+    pcie_Sync()
+    pcie1_DelayUs(200)
+  EndProcedure
+
+  Procedure.i Pcie1Init()
+    Define v.i
+    Define i.i
+    Define cpuMb.i
+    Define limMb.i
+    pcie1_err = 0
+    If pcie1_up <> 0
+      ProcedureReturn 1
+    EndIf
+    If pcie1_TickHz() <= 0
+      pcie1_err = #PCIE_ERR_NO_TIMER
+      ProcedureReturn 0
+    EndIf
+    ; --- probe: rescal ---------------------------------------------------
+    If pcie1_Rescal() = 0
+      pcie1_err = #PCIE_ERR_RESCAL
+      ProcedureReturn 0
+    EndIf
+    ; --- cold: PERST# asserted, bridge through reset ----------------------
+    pcie1_Mod(#PCIE_B_PCIE_CTRL, #PCIE_B_PERSTB, 0)
+    pcie1_Bridge(1)
+    pcie1_Bridge(0)
+    pcie1_Mod(#PCIE_B_HARD_DEBUG, #PCIE_B_SERDES_IDDQ, 0)
+    pcie1_DelayUs(200)
+    ; SCB_ACCESS_EN, CFG_READ_UR_MODE, MAX_BURST_SIZE 2, RCB_MPS, RCB_64B.
+    pcie1_Mod(#PCIE_B_MISC_CTRL, $300000, $1000 | $2000 | $200000 | $400 | $80)
+    ; --- inbound window 1: PCIe $10_0000_0000 -> CPU 0, 64 GiB ------------
+    ; size code ilog2(2^36) - 15 = 21.
+    pcie1_Wr(#PCIE_B_RC_BAR1_LO, (#PCIE1_DMA_BUS & $FFFFFFE0) | 21)
+    pcie1_Wr(#PCIE_B_RC_BAR1_LO + 4, (#PCIE1_DMA_BUS >> 32) & $FFFFFFFF)
+    pcie1_Wr(#PCIE_B_UBUS_BAR1, 0 | 1)
+    pcie1_Wr(#PCIE_B_UBUS_BAR1 + 4, 0)
+    If (pcie1_Rd(#PCIE_MISC_PCIE_STATUS) & #PCIE_STATUS_PORT_MASK) = 0
+      pcie1_err = #PCIE_ERR_EP_MODE
+      ProcedureReturn 0
+    EndIf
+    ; num-lanes 1.
+    v = pcie1_Rd(#PCIE_B_LINK_CAP)
+    If ((v >> 4) & $1F) <> 1
+      pcie1_Wr(#PCIE_B_LINK_CAP, (v & (~$1F0)) | (1 << 4))
+      pcie1_Mod(#PCIE_B_PHY_CTL_1, 0, $8)
+    EndIf
+    pcie1_Mod(#PCIE_B_ID_VAL3, $FFFFFF, $060400)
+    ; --- outbound window 0 ------------------------------------------------
+    cpuMb = #PCIE1_OUT_CPU / $100000
+    limMb = (#PCIE1_OUT_CPU + #PCIE1_OUT_SIZE - 1) / $100000
+    pcie1_Wr(#PCIE_B_MEM_WIN0_LO, #PCIE1_OUT_BUS & $FFFFFFFF)
+    pcie1_Wr(#PCIE_B_MEM_WIN0_HI, (#PCIE1_OUT_BUS >> 32) & $FFFFFFFF)
+    pcie1_Mod(#PCIE_B_WIN0_BASE_LIMIT, $FFF0FFF0, ((cpuMb & $FFF) << 4) | ((limMb & $FFF) << 20))
+    pcie1_Mod(#PCIE_B_WIN0_BASE_HI, $FF, (cpuMb >> 12) & $FF)
+    pcie1_Mod(#PCIE_B_WIN0_LIMIT_HI, $FF, (limMb >> 12) & $FF)
+    pcie1_Mod(#PCIE_B_VENDOR_REG1, $C, 0)
+    ; --- post_setup_bcm2712 -----------------------------------------------
+    If pcie1_MdioWrite($1F, $1600) = 0
+      pcie1_err = #PCIE_ERR_MDIO
+      ProcedureReturn 0
+    EndIf
+    If pcie1_MdioWrite($16, $50B9) = 0 Or pcie1_MdioWrite($17, $BDA1) = 0 Or pcie1_MdioWrite($18, $0094) = 0
+      pcie1_err = #PCIE_ERR_MDIO
+      ProcedureReturn 0
+    EndIf
+    If pcie1_MdioWrite($19, $97B4) = 0 Or pcie1_MdioWrite($1B, $5030) = 0 Or pcie1_MdioWrite($1C, $5030) = 0
+      pcie1_err = #PCIE_ERR_MDIO
+      ProcedureReturn 0
+    EndIf
+    If pcie1_MdioWrite($1E, $0007) = 0
+      pcie1_err = #PCIE_ERR_MDIO
+      ProcedureReturn 0
+    EndIf
+    pcie1_DelayUs(200)
+    pcie1_Mod(#PCIE_B_PHY_CTL_15, $FF, $12)
+    pcie1_Mod(#PCIE_B_UBUS_CTRL, 0, (1 << 13) | (1 << 19))
+    pcie1_Wr(#PCIE_B_AXI_READ_ERR, $FFFFFFFF)
+    pcie1_Wr(#PCIE_B_UBUS_TIMEOUT, $B2D0000)
+    pcie1_Wr(#PCIE_B_RETRY_TIMEOUT, $ABA0000)
+    pcie1_Mod(#PCIE_B_AXI_INTF_CTRL, (1 << 7), (1 << 13) | (1 << 12) | (1 << 11))
+    If (pcie1_Rd(#PCIE_B_AXI_INTF_CTRL) & (1 << 12)) = 0
+      pcie1_Mod(#PCIE_B_AXI_INTF_CTRL, $3F, 15)
+    EndIf
+    pcie1_Mod(#PCIE_B_CTRL_1, (1 << 5), 0)
+    i = 0
+    While i < 8
+      pcie1_Wr(#PCIE_B_TC_QOS_MAP0 - (i * 4), $3333)   ; fifo-qos-map <3 3 3 3>
+      i = i + 1
+    Wend
+    ; --- start_link -------------------------------------------------------
+    pcie1_Mod(#PCIE_B_LINK_CAP, $F, 2)                 ; max-link-speed 2
+    pcie1_Mod(#PCIE_B_LNKCTL2, $F, 2)
+    pcie1_Mod(#PCIE_B_HARD_DEBUG, #PCIE_B_CLKREQ_MASK, 0)
+    pcie1_Mod(#PCIE_B_PCIE_CTRL, 0, #PCIE_B_PERSTB)    ; PERST# released
+    pcie1_DelayUs(100000)
+    i = 0
+    While i < 100 And (pcie1_Rd(#PCIE_MISC_PCIE_STATUS) & (#PCIE_STATUS_PHYLINKUP_MASK | #PCIE_STATUS_DL_ACTIVE_MASK)) <> (#PCIE_STATUS_PHYLINKUP_MASK | #PCIE_STATUS_DL_ACTIVE_MASK)
+      pcie1_DelayUs(5000)
+      i = i + 5
+    Wend
+    v = pcie1_Rd(#PCIE_MISC_PCIE_STATUS)
+    If (v & #PCIE_STATUS_PHYLINKUP_MASK) = 0 Or (v & #PCIE_STATUS_DL_ACTIVE_MASK) = 0
+      pcie1_err = #PCIE_ERR_LINK
+      ProcedureReturn 0
+    EndIf
+    ; clkreq "safe": refclk driven by the RC, L1SS un-advertised.
+    pcie1_Mod(#PCIE_B_HARD_DEBUG, #PCIE_B_CLKREQ_MASK, #PCIE_B_REFCLK_OVRD)
+    pcie1_Mod(#PCIE_B_ROOT_CAP, $F8, 2 << 3)
+    v = pcie1_Rd(#PCIE_LNK_WORD)
+    pcie1_linkSpeed = (v >> 16) & $F
+    pcie1_linkWidth = (v >> 20) & $3F
+    pcie1_up = 1
+    ProcedureReturn 1
+  EndProcedure
+
+  Procedure.i Pcie1LinkUp()
+    Define v.i
+    v = pcie1_Rd(#PCIE_MISC_PCIE_STATUS)
+    ProcedureReturn Bool((v & #PCIE_STATUS_PHYLINKUP_MASK) <> 0 And (v & #PCIE_STATUS_DL_ACTIVE_MASK) <> 0)
+  EndProcedure
+
+  ; Config space. Bus 0 device 0 is the RC's own registers; everything
+  ; else goes through EXT_CFG_INDEX/DATA with PCIE_ECAM_OFFSET and only
+  ; after link-up ("An access to our HW w/o link-up will cause a CPU Abort").
+  Procedure.i Pcie1CfgRead32(bus.i, dev.i, fn.i, off.i)
+    If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+      ProcedureReturn #PCIE_ERR_CFG_BDF
+    EndIf
+    If bus = 0 And dev = 0
+      ProcedureReturn pcie1_Rd(off & $FFF)
+    EndIf
+    If pcie1_up = 0 Or Pcie1LinkUp() = 0
+      ProcedureReturn #PCIE_ERR_NOT_UP
+    EndIf
+    pcie1_Wr(#PCIE_EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (fn << 12))
+    ProcedureReturn pcie1_Rd(#PCIE_EXT_CFG_DATA + (off & $FFF))
+  EndProcedure
+
+  Procedure Pcie1CfgWrite32(bus.i, dev.i, fn.i, off.i, v.i)
+    If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+      ProcedureReturn
+    EndIf
+    If bus = 0 And dev = 0
+      pcie1_Wr(off & $FFF, v)
+      ProcedureReturn
+    EndIf
+    If pcie1_up = 0 Or Pcie1LinkUp() = 0
+      ProcedureReturn
+    EndIf
+    pcie1_Wr(#PCIE_EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (fn << 12))
+    pcie1_Wr(#PCIE_EXT_CFG_DATA + (off & $FFF), v)
+  EndProcedure
+
+  ; One endpoint at bus 1 device 0: the root port's bus numbers, the
+  ; endpoint's identity, BAR0 sized (PCI Local Bus 6.2.5.1: write all ones,
+  ; read back, 64-bit if type 2) and placed at the start of the outbound
+  ; window, the root port's memory window over it, and memory decode plus
+  ; bus mastering on both ends.
+  Procedure.i Pcie1Enumerate()
+    Define id.i
+    Define lo.i
+    Define hi.i
+    Define is64.i
+    Define mask.i
+    Define bytes.i
+    Define lim.i
+    pcie1_err = 0
+    If pcie1_enumerated <> 0
+      ProcedureReturn 1
+    EndIf
+    If pcie1_up = 0
+      pcie1_err = #PCIE_ERR_LINK
+      ProcedureReturn 0
+    EndIf
+    Pcie1CfgWrite32(0, 0, 0, $18, $00010100)          ; primary 0, secondary 1, subordinate 1
+    id = Pcie1CfgRead32(1, 0, 0, $00)
+    If id < 0 Or id = $FFFFFFFF Or id = 0
+      pcie1_err = #PCIE_ERR_NO_ENDPOINT
+      ProcedureReturn 0
+    EndIf
+    pcie1_id = id
+    pcie1_class = (Pcie1CfgRead32(1, 0, 0, $08) >> 8) & $FFFFFF
+    If ((Pcie1CfgRead32(1, 0, 0, $0C) >> 16) & $7F) <> 0
+      pcie1_err = #PCIE_ERR_BAR                       ; not a type 0 header
+      ProcedureReturn 0
+    EndIf
+    lo = Pcie1CfgRead32(1, 0, 0, $10)
+    If (lo & 1) <> 0
+      pcie1_err = #PCIE_ERR_BAR                       ; BAR0 is I/O
+      ProcedureReturn 0
+    EndIf
+    is64 = Bool(((lo >> 1) & 3) = 2)
+    Pcie1CfgWrite32(1, 0, 0, $10, $FFFFFFFF)
+    mask = Pcie1CfgRead32(1, 0, 0, $10) & $FFFFFFF0
+    hi = $FFFFFFFF
+    If is64 <> 0
+      Pcie1CfgWrite32(1, 0, 0, $14, $FFFFFFFF)
+      hi = Pcie1CfgRead32(1, 0, 0, $14)
+    EndIf
+    If mask = 0
+      pcie1_err = #PCIE_ERR_BAR
+      ProcedureReturn 0
+    EndIf
+    If hi <> $FFFFFFFF
+      pcie1_err = #PCIE_ERR_BAR                       ; larger than 4 GiB
+      ProcedureReturn 0
+    EndIf
+    bytes = ((~mask) & $FFFFFFFF) + 1
+    If bytes > #PCIE1_OUT_SIZE
+      pcie1_err = #PCIE_ERR_BAR
+      ProcedureReturn 0
+    EndIf
+    Pcie1CfgWrite32(1, 0, 0, $10, #PCIE1_OUT_BUS & $FFFFFFFF)
+    If is64 <> 0
+      Pcie1CfgWrite32(1, 0, 0, $14, (#PCIE1_OUT_BUS >> 32) & $FFFFFFFF)
+    EndIf
+    ; The root port forwards [base, limit] downstream: memory base/limit at
+    ; $20 in 1 MiB units, the prefetchable window closed (base > limit).
+    lim = #PCIE1_OUT_BUS + ((bytes + $FFFFF) & (~$FFFFF)) - 1
+    Pcie1CfgWrite32(0, 0, 0, $20, ((#PCIE1_OUT_BUS >> 16) & $FFF0) | (lim & $FFF00000))
+    Pcie1CfgWrite32(0, 0, 0, $24, $0000FFF0)
+    Pcie1CfgWrite32(0, 0, 0, $28, 0)
+    Pcie1CfgWrite32(0, 0, 0, $2C, 0)
+    Pcie1CfgWrite32(0, 0, 0, #PCI_CFG_COMMAND, (Pcie1CfgRead32(0, 0, 0, #PCI_CFG_COMMAND) & $FFFF) | #PCI_CMD_MEMORY | #PCI_CMD_BUS_MASTER)
+    Pcie1CfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, (Pcie1CfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF) | #PCI_CMD_MEMORY | #PCI_CMD_BUS_MASTER)
+    pcie1_barBytes = bytes
+    pcie1_barCpu = #PCIE1_OUT_CPU + (#PCIE1_OUT_BUS - #PCIE1_OUT_BUS)
+    pcie1_enumerated = 1
+    ProcedureReturn 1
+  EndProcedure
+
+  Procedure.i Pcie1Up()         : ProcedureReturn pcie1_up : EndProcedure
+  Procedure.i Pcie1Error()      : ProcedureReturn pcie1_err : EndProcedure
+  Procedure.i Pcie1Id()         : ProcedureReturn pcie1_id : EndProcedure
+  Procedure.i Pcie1ClassCode()  : ProcedureReturn pcie1_class : EndProcedure
+  Procedure.i Pcie1BarBytes()   : ProcedureReturn pcie1_barBytes : EndProcedure
+  Procedure.i Pcie1LinkSpeed()  : ProcedureReturn pcie1_linkSpeed : EndProcedure
+  Procedure.i Pcie1LinkWidth()  : ProcedureReturn pcie1_linkWidth : EndProcedure
+  Procedure.i Pcie1RescalRan()  : ProcedureReturn pcie1_rescalRan : EndProcedure
+
+  ; CPU address of BAR0, or 0 before enumeration.
+  Procedure.i Pcie1BarCpu()
+    If pcie1_enumerated = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn pcie1_barCpu
+  EndProcedure
+
+  ; What an endpoint must be handed for ARM physical memory: inbound
+  ; window 1 maps PCIe $10_0000_0000 onto CPU 0 for 64 GiB.
+  Procedure.i Pcie1DmaOffset()
+    If pcie1_up = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn #PCIE1_DMA_BUS
+  EndProcedure
+
+  Procedure.i Pcie1DmaBus(physAddr.i)
+    If pcie1_up = 0 Or physAddr < 0 Or physAddr >= #PCIE1_DMA_SIZE
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    ProcedureReturn physAddr + #PCIE1_DMA_BUS
+  EndProcedure
+
+  Procedure.i Pcie1ErrorText()
+    Select pcie1_err
+      Case 0
+        ProcedureReturn "pcie1: ok"
+      Case #PCIE_ERR_LINK
+        ProcedureReturn "pcie1 error -4: no link on the external x1 connector after PERST# release (100 ms + 100 ms) - nothing in the M.2 slot, or the HAT unpowered"
+      Case #PCIE_ERR_EP_MODE
+        ProcedureReturn "pcie1 error -5: the controller does not report root-complex mode after the bridge reset"
+      Case #PCIE_ERR_RESCAL
+        ProcedureReturn "pcie1 error -20: the shared PCIe/SATA RESCAL calibration did not complete in 1 ms"
+      Case #PCIE_ERR_MDIO
+        ProcedureReturn "pcie1 error -21: a SerDes MDIO write (the 54 MHz refclk table) never completed"
+      Case #PCIE_ERR_NO_ENDPOINT
+        ProcedureReturn "pcie1 error -7: the link is up but bus 1 device 0 answers no vendor ID"
+      Case #PCIE_ERR_NO_TIMER
+        ProcedureReturn "pcie1 error -23: no timebase - call Pcie1SetTimebase(@Ticks, @TickHz) first; every wait here is bounded and cannot be without one"
+      Case #PCIE_ERR_BAR
+        ProcedureReturn "pcie1 error -22: the endpoint's BAR0 is not a memory BAR this file can place (I/O, zero, or larger than the 2 GiB window)"
+    EndSelect
+    ProcedureReturn "pcie1: unknown error"
+  EndProcedure
 CompilerElse
 EnableExplicit
 
