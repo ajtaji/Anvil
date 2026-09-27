@@ -1120,7 +1120,7 @@ Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
   Protected lanes.i
   Protected variableId.i
   Protected firstVariable.i = 0
-  Protected sawArithmetic.i = 0
+  Protected arithmeticCount.i = 0
   Protected *n.AvkIrNode
   Protected *load.AvkIrNode
   Dim pending.i[512]
@@ -1145,7 +1145,8 @@ Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
       If firstVariable = 0 : firstVariable = variableId : EndIf
       avk42VertexGraphUsed[*load\sourceId] = 1
     ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
-      sawArithmetic = 1
+      arithmeticCount = arithmeticCount + 1
+      If arithmeticCount > 8 : ProcedureReturn 0 : EndIf
       If *n\operandCount <> 2 Or sp > 509 : ProcedureReturn 0 : EndIf
       pending[sp] = *n\operand0 : sp = sp + 1
       pending[sp] = *n\operand1 : sp = sp + 1
@@ -1154,7 +1155,7 @@ Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
     EndIf
     avk42VertexGraphUsed[id] = 1
   Wend
-  If firstVariable = 0 Or sawArithmetic = 0 : ProcedureReturn 0 : EndIf
+  If firstVariable = 0 Or arithmeticCount = 0 : ProcedureReturn 0 : EndIf
   PokeI(*variableOut, firstVariable)
   ProcedureReturn 1
 EndProcedure
@@ -1575,6 +1576,11 @@ Procedure.i AnvilVkIrV3d42LowerVertexPair(*m.AvkIrModule, *t.AvkIrV3d42VertexPai
   If *m = 0 Or *t = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
   rc = AnvilVkIrV3d42PlanVertex(*m, @avk42VertexPlanPending) : If rc <> 0 : ProcedureReturn rc : EndIf
   rc = avk42VertexValidateInputs(*m, @avk42VertexPlanPending, *t, @inputSlots) : If rc <> 0 : ProcedureReturn rc : EndIf
+  ; A wider input and deeper graph rendered sparse missing pixels on Pi 4.
+  ; Keep this path inside the 12-slot envelope verified by the board demo.
+  If avk42VertexPlanPending\positionGeneral <> 0 And inputSlots > 12
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, inputSlots, 0, 3)
+  EndIf
   ; Public viewport decoding admits exact whole-pixel extents 1..65535.
   ; Multiplication by 128 is therefore checked by that same bound, cannot
   ; overflow, and remains below 2^23 so the binary32 stream word is exact.

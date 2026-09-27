@@ -346,6 +346,9 @@ def grade(cpu, report):
          "matrix vertex emits four multiplies and two adds in both stages")
     need(tuple(q(cpu,matrix+i*8) for i in (11,12)) == (512,512),
          "matrix vertex preserves viewport conversion")
+    too_deep = report + 52*STRIDE*8
+    need(q(cpu,too_deep) == neg(-23403) and q(cpu,too_deep+17*8) == 1,
+         "ninth live vertex arithmetic node refuses without touching outputs")
     b = report + 4*STRIDE*8
     need(q(cpu,b) == (1<<64)-23403 and q(cpu,b+4*8) == 2, "direct vec4 Position exact refusal")
     need(q(cpu,b+17*8) == 1, "direct vec4 refusal preserves four spans/result")
