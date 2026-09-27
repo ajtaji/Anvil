@@ -2346,6 +2346,25 @@ BREAKAGES = {
         "  EndIf",
         "  XhciControlIn(#HID_RT_OUT, #HID_REQ_SET_IDLE, 0, iface, 0)\n"
         "  hid_idle[h] = 1"),
+    # ---- straddling the Link TRB, MOVED HERE FROM HARMLESS 2026-09-27 -----
+    # Let a transfer descriptor STRADDLE the Link TRB instead of padding
+    # to it.  This used to sit in HARMLESS ("U-Boot allows it, the padding
+    # is a preference"), and it has FAILED at every commit since the Anvil
+    # source baseline (a2935e2, 2026-09-22) with every compiler on the
+    # desk: the mouse behind the composite receiver never attaches.
+    #
+    # THE DRIVER IS RIGHT AND THE ENTRY WAS WRONG.  xh_WaitEventFor
+    # matches a transfer event against the TD's TRB address RANGE
+    # (wantLo..wantHi = first..last TRB, xhci.pi4, "since 2026-09-17"),
+    # which assumes the TD is contiguous.  A straddling TD's last TRB sits
+    # at the top of the segment, BELOW its first, so no event ever matches
+    # and the transfer times out.  Measured: the same straddle with a
+    # wrap-aware range test passes all 473 assertions.  Padding is
+    # therefore REQUIRED by the range match, not a preference - and this
+    # mutation is the proof that deleting it breaks enumeration.
+    "straddle-the-link": ("xhci",
+        "  pad = #XHCI_LINK_INDEX - xh_ringEnq[r]",
+        "  pad = 0"),
 }
 
 # ---------------------------------------------------------------------
@@ -2366,28 +2385,6 @@ HARMLESS = {
         "#HID_REQ_SET_IDLE, 0, iface, 0",
         "#HID_REQ_SET_IDLE, $2000, iface, 0"),
 
-    # THE REJECTED ALTERNATIVE TO NO-OP PADDING: do nothing at all, and
-    # let a transfer descriptor STRADDLE the Link TRB.  U-Boot allows it
-    # - xhci-ring.c's inc_enq() hands the Link TRB over mid-descriptor
-    # whenever more_trbs_coming is set.
-    #
-    # a64_xhci_check.py already records this mutation as harmless, and
-    # THAT MEASUREMENT WAS WORTHLESS: with only three-TRB transfers and
-    # 63 usable slots the enqueue index lands exactly on the Link TRB
-    # every lap, so the padding and the straddle both never happen
-    # and the mutation removed code that never ran.  This workload mixes
-    # two- and three-TRB descriptors and reaches the branch dozens of
-    # times, so the measurement here is a real one.
-    #
-    # It passing is the reason the fix's comment can say the straddle
-    # was REJECTED rather than BROKEN.  Padding was chosen anyway,
-    # because the deferred-cycle trick in XhciControlIn is easier to
-    # reason about when a descriptor cannot cross a producer-cycle
-    # toggle - but that is a preference, and this line is the evidence
-    # that it is only a preference.
-    "straddle-the-link": ("xhci",
-        "  pad = #XHCI_LINK_INDEX - xh_ringEnq[r]",
-        "  pad = 0"),
 }
 
 
