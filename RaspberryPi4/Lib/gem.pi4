@@ -912,9 +912,15 @@ EndProcedure
 ; scratch, so its link cannot be up for a few seconds whatever is plugged
 ; in: in that one case the link is waited for, up to waitMs, rather than
 ; answering a "no cable" that no cable could have changed. 1 in, 0 not.
+;
+; A 0 SAYS WHY, in GemError(): #GEM_ERR_NO_LINK ONLY when the PHY answered
+; and its link is down - a cable question. Anything else (RP1 unreachable,
+; no GEM, a silent PHY, a dead MDIO bus) keeps the controller's own code,
+; so the boot never names a controller fault as a missing cable.
 Procedure.i GemCableIn(waitMs.i)
   Define t0.i
   Define budget.i
+  Define r.i
   If GemProbe() = 0
     ProcedureReturn 0
   EndIf
@@ -923,19 +929,28 @@ Procedure.i GemCableIn(waitMs.i)
     ProcedureReturn 0
   EndIf
   If gem_phyWasReset = 0 Or waitMs <= 0
-    If GemPhyLinkUp() = 1
+    r = GemPhyLinkUp()
+    If r = 1
       ProcedureReturn 1
+    EndIf
+    If r = 0
+      gem_err = #GEM_ERR_NO_LINK
     EndIf
     ProcedureReturn 0
   EndIf
   t0 = Ticks()
   budget = GemTimeoutTicks(waitMs)
   Repeat
-    If GemPhyLinkUp() = 1
+    r = GemPhyLinkUp()
+    If r = 1
       ProcedureReturn 1
+    EndIf
+    If r < 0
+      ProcedureReturn 0
     EndIf
     gem_Progress()
   Until (Ticks() - t0) > budget
+  gem_err = #GEM_ERR_NO_LINK
   ProcedureReturn 0
 EndProcedure
 

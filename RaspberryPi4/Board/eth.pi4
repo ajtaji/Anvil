@@ -851,12 +851,38 @@ EndProcedure
 
 Procedure EthBootWired()
   Define k.i
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: "no cable" ONLY when the PHY answered with its link down.
+  ; EthCableIn is also 0 when RP1's PCIe link is down, when no GEM or no
+  ; PHY answers - and calling any of those a missing cable sends somebody
+  ; to check a cable that is in. GemCableIn leaves #GEM_ERR_NO_LINK for
+  ; the cable case and the controller's own code for everything else.
+  If EthCableIn() = 0
+    If GemError() <> #GEM_ERR_NO_LINK
+      PrintN("wired: the Ethernet controller could not be reached, so no address was")
+      PrintN("   asked for and nothing was started. This is not the cable - it is the")
+      PrintN("   controller or the path to it (on the Raspberry Pi 5, RP1 behind PCIe).")
+      EthWhyGenet()
+      If GemError() = #GEM_ERR_RP1
+        Print("   The PCIe layer said: ")
+        UartWriteStr(PcieErrorText())
+        PrintNl()
+      EndIf
+      ProcedureReturn
+    EndIf
+    PrintN("wired: no cable. Nothing is plugged into the Ethernet socket, so no")
+    PrintN("address was asked for and nothing was started. This costs no time and")
+    PrintN("is the ordinary answer on a bench that runs on Wi-Fi.")
+    ProcedureReturn
+  EndIf
+  CompilerElse
   If EthCableIn() = 0
     PrintN("wired: no cable. Nothing is plugged into the Ethernet socket, so no")
     PrintN("address was asked for and nothing was started. This costs no time and")
     PrintN("is the ordinary answer on a bench that runs on Wi-Fi.")
     ProcedureReturn
   EndIf
+  CompilerEndIf
 
   PrintN("Ethernet: the cable is in, so an address is asked for by DHCP first -")
   PrintN("a server on this segment is the only thing that can say an address is")
