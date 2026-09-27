@@ -35,10 +35,10 @@ WHAT IS ASSERTED
   SD_PIN_SEL = SD at every clock change, 400 kHz then 25 MHz from the
   200 MHz DTB clock, CMD52(abort) CMD0 CMD5 CMD5.. CMD3 CMD7(rca) then
   the CCCR bus-width and function-1 enable CMD52s, in that order.
-  REFUSALS: mute card -> SdioInit 0 at CMD5 with no CMD3/CMD7; no
+  REFUSALS: mute card -> SdioInit 0 at CMD5, #SDIO_ERR_NO_CARD, no CMD3/CMD7; no
   pinctrl stepping -> #SDIO_ERR_PINCTRL with NO register touched at all;
   no DTB clock -> #SDIO_ERR_BASECLK with no command issued.
-  MUTANTS (unless --no-mutants): eight edits of sdio.pi4's 2712 branch,
+  MUTANTS (unless --no-mutants): nine edits of sdio.pi4's 2712 branch,
   each rebuilt and rerun; every one must turn a check red.
 
 WHERE THE NUMBERS COME FROM. The PINNED table below, each with its file
@@ -463,7 +463,7 @@ class Sdhci2712(pi4gate.Sdhci):
             # shows bit 15 accompanying every error bit).
             self.commands.append((index, cmdreg & 0xFF, self.reg.get(k["SDHCI_ARGUMENT"], 0)))
             self.silent.append(index)
-            self.intstat |= k["SDHCI_INT_TIMEOUT"] | 0x8000
+            self.intstat |= k["SDHCI_INT_TIMEOUT"] | k["SDHCI_INT_ERROR"]
             return
         super()._command(word)
 
@@ -694,12 +694,12 @@ def scenario_refusals(ck: Checks, img, k, codes) -> None:
     ck(out[10] == DONE and out[0] == 0, "mute card: SdioInit refuses (returns 0)")
     ck(5 in idx and 3 not in idx and 7 not in idx, f"mute card: stopped at CMD5, no CMD3/CMD7 {idx}")
     ck(out[3] == 5, f"mute card: SdioLastCmd is 5 (got {out[3]})")
-    ck(out[1] in (codes["SDIO_ERR_NO_CARD"], codes["SDIO_ERR_CMD_ERROR"]),
-       f"mute card: error {out[1]} is NO_CARD or CMD_ERROR")
-    if out[1] == codes["SDIO_ERR_CMD_ERROR"]:
-        print("    NOTE mute card reports #SDIO_ERR_CMD_ERROR, not #SDIO_ERR_NO_CARD: silicon sets the Error\n"
-              "         Interrupt bit 15 beside Command Timeout, and sdio_Command compares the whole error\n"
-              "         field to TIMEOUT alone. A loud refusal either way; the label is a shared-code defect.")
+    # The model reports no response as silicon does - Command Timeout
+    # AND Error Interrupt bit 15 - so this checks that the refusal is
+    # NAMED "no card" (sdio_Command masks bit 15 out of its timeout
+    # compare since 2026-09-26; before that it said CMD_ERROR).
+    ck(out[1] == codes["SDIO_ERR_NO_CARD"],
+       f"mute card: error {out[1]} is #SDIO_ERR_NO_CARD ({codes['SDIO_ERR_NO_CARD']})")
     check_wl_on(ck, "mute card", b, k)
 
     # No pinctrl stepping: refuse before ANY register is written.
@@ -719,8 +719,7 @@ def gate(img: pathlib.Path, k: dict, codes: dict, verbose: bool, quick: bool = F
     ck = Checks(verbose)
     scenario_success(ck, img, k, codes, "C0", warm=True)
     scenario_success(ck, img, k, codes, "D0", warm=False)
-    if not quick:
-        scenario_refusals(ck, img, k, codes)
+    scenario_refusals(ck, img, k, codes)
     return ck
 
 
@@ -767,6 +766,9 @@ MUTANTS = [
                      "sdio_PinField($0C, 24, #SDIO_BRCM_FIELD_MUX, 3)")),
     ("BCM2711 pull encoding (1 = pull-down here)",
      lambda t: _once(t, "#SDIO_BRCM_PULL_UP   = 2", "#SDIO_BRCM_PULL_UP   = 1")),
+    ("timeout compare includes Error Interrupt bit 15 (the pre-fix label)",
+     lambda t: _once(t, "If (intr & #SDIO_INT_ERROR_MASK & (~#SDIO_INT_ERROR)) = #SDIO_INT_TIMEOUT",
+                     "If (intr & #SDIO_INT_ERROR_MASK) = #SDIO_INT_TIMEOUT")),
     ("SD_PIN_SEL never written",
      lambda t: _once(t, "  PokeL(#SDIO_CFG_BASE + #SDIO_CFG_SD_PIN_SEL, c1 | #SDIO_CFG_SD_PIN_SEL_SD)\n", "")),
 ]

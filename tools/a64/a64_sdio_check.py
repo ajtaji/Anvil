@@ -349,7 +349,8 @@ _pin(RPI, "drivers/mmc/host/sdhci.h", {
     "SDHCI_INT_ENABLE": (0x34, 137), "SDHCI_SIGNAL_ENABLE": (0x38, 138),
     "SDHCI_INT_RESPONSE": (0x01, 139), "SDHCI_INT_DATA_END": (0x02, 140),
     "SDHCI_INT_SPACE_AVAIL": (0x10, 143), "SDHCI_INT_DATA_AVAIL": (0x20, 144),
-    "SDHCI_INT_CARD_INT": (0x100, 147), "SDHCI_INT_TIMEOUT": (0x10000, 151),
+    "SDHCI_INT_CARD_INT": (0x100, 147), "SDHCI_INT_ERROR": (0x8000, 150),
+    "SDHCI_INT_TIMEOUT": (0x10000, 151),
     "SDHCI_INT_ERROR_MASK": (0xFFFF8000, 164),
     "SDHCI_CAPABILITIES": (0x40, 210), "SDHCI_CLOCK_BASE_SHIFT": (8, 215),
     "SDHCI_CAPABILITIES_1": (0x44, 231), "SDHCI_HOST_VERSION": (0xFE, 279),
@@ -1783,6 +1784,11 @@ class Sdhci:
         # and the refusal path in _cmd53.
         self.card_refused = False
         self.dat_inhibited = False
+        # A card that never answers (no_card_gate). The controller then
+        # reports Command Timeout AND the Error Interrupt summary bit 15
+        # for every command that expects a response - which is what
+        # silicon does, and what this model did not do until 2026-09-26.
+        self.mute = False
 
         # Capabilities: ENTIRELY ZERO, which is what the board reported
         # on 2026-08-26 - $FE300040 and $FE300044 both read $00000000
@@ -1935,6 +1941,10 @@ class Sdhci:
                 f"still set from an earlier REFUSED command. The data line "
                 f"was never reset - see the R5 refusal path in "
                 f"sdio_Cmd53Xfer")
+
+        if self.mute and (flags & k["SDHCI_CMD_RESP_MASK"]) != k["SDHCI_CMD_RESP_NONE"]:
+            self.intstat |= k["SDHCI_INT_TIMEOUT"] | k["SDHCI_INT_ERROR"]
+            return
 
         resp = self._card_command(index, flags, arg, tm)
         self.resp = [resp & 0xFFFFFFFF, 0, 0, 0]
@@ -2435,6 +2445,7 @@ def build(compiler: str, source: pathlib.Path, out: pathlib.Path) -> None:
 
 
 def run(img: pathlib.Path, k: dict, board_out: list, limit: int = 60_000_000,
+        mute: bool = False,
         dram: dict | None = None):
     blob = img.read_bytes()
     cpu = A64()
@@ -2458,6 +2469,7 @@ def run(img: pathlib.Path, k: dict, board_out: list, limit: int = 60_000_000,
     card = Cyw43Card(k)
     hcbase = k["SOC_ARM_BASE"] + (k["MMCNR_BUS"] - k["SOC_BUS_BASE"])
     hc = Sdhci(k, card, hcbase)
+    hc.mute = mute
     fw = Firmware(k)
     board = Board(cpu, k, hc, fw)
     board_out.append(board)
@@ -3568,6 +3580,42 @@ def probe_gate(k: dict, verbose: bool, compiler: str, work: pathlib.Path) -> int
     return 0
 
 
+def no_card_gate(k: dict, work: pathlib.Path) -> int:
+    """The same probe image, and a card that never answers.
+
+    The refusal must be NAMED correctly: "nothing answered CMD5"
+    (#SDIO_ERR_NO_CARD), not "command error". Silicon reports a missing
+    response as Command Timeout plus the Error Interrupt summary bit, and
+    sdio.pi4 compared the whole error field to Command Timeout alone
+    until 2026-09-26, so on a board with no radio it named the wrong
+    fault. That compare is what this run pins down.
+    """
+    img = work / "sdiocheck.img"
+    parts: list = []
+    run(img, k, parts, mute=True)
+    board, hc = parts[0], parts[1]
+    text = board.uart.decode("utf-8", "replace")
+    idx = [c[0] for c in hc.commands]
+    fails = []
+    if "SdioInit (want 1)" not in text:
+        fails.append("the probe never reached SdioInit")
+    if "sdio: nothing answered CMD5" not in text:
+        fails.append("the no-card refusal is not #SDIO_ERR_NO_CARD's text")
+    if "sdio: command error" in text:
+        fails.append("a missing card was reported as a command error")
+    if k["SD_IO_SEND_OP_COND"] not in idx or k["SD_SEND_RELATIVE_ADDR"] in idx             or k["MMC_SELECT_CARD"] in idx:
+        fails.append("the bring-up did not stop at CMD5 (%s)" % idx)
+    for f in fails:
+        print("FAIL (no card): " + f)
+    if fails:
+        tail = text[text.find("-- sdio bring-up --"):][:800]
+        print(tail)
+        return 1
+    print("a64_sdio_check: no-card PASS - a card that never answers is refused "
+          "at CMD5 as 'nothing answered CMD5', with no CMD3/CMD7.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"),
@@ -3600,7 +3648,10 @@ def main() -> int:
         work = pathlib.Path(tmp)
         if args.scan:
             return scan_gate(k, args.verbose, args.compiler, work, args.nvram)
-        return probe_gate(k, args.verbose, args.compiler, work)
+        rc = probe_gate(k, args.verbose, args.compiler, work)
+        if rc == 0:
+            rc = no_card_gate(k, work)
+        return rc
 
 
 if __name__ == "__main__":

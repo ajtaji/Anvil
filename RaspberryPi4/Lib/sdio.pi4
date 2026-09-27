@@ -3074,7 +3074,16 @@ Procedure.i sdio_Command(cmdtm.i, arg.i, tmoIsOk.i)
     sdio_ResetLine(1)
     ; A bare Command Timeout with nothing else set is the "no answer"
     ; case, and it is the one some callers expect.
-    If (intr & #SDIO_INT_ERROR_MASK) = #SDIO_INT_TIMEOUT
+    ;
+    ; "NOTHING ELSE" EXCLUDES THE SUMMARY BIT. Error Interrupt, bit 15
+    ; (SDHCI_INT_ERROR, sdhci.h line 150), is set by the controller
+    ; beside EVERY error bit - the Pi 4 bench's $00048000 is END_BIT plus
+    ; bit 15. Until 2026-09-26 this compared the whole error field, bit
+    ; 15 included, to TIMEOUT alone, so on silicon a card that never
+    ; answered CMD5 came back #SDIO_ERR_CMD_ERROR instead of
+    ; #SDIO_ERR_NO_CARD: still a refusal, with the wrong name on it.
+    ; The modelled controller never set bit 15, which is how it lasted.
+    If (intr & #SDIO_INT_ERROR_MASK & (~#SDIO_INT_ERROR)) = #SDIO_INT_TIMEOUT
       If tmoIsOk <> 0
         ProcedureReturn -1
       EndIf
