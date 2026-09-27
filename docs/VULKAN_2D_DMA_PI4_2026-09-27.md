@@ -48,3 +48,7 @@ The production V3D backend gate passed 85 checks over 4,404,360
 interpreted AArch64 instructions and compiled all eight current Pi 4
 diagnostics. The normal Pi 4 image compiled at 4,329,848 bytes on the
 combined tree; its generated source build stamp was restored.
+The public Vulkan pipeline gate passed 775 checks over 203,786,046
+interpreted AArch64 instructions. It checked exact transferred and
+untouched bytes and verified that two separate image-copy, readback, and
+upload calls each reach the row-transfer backend twice.
