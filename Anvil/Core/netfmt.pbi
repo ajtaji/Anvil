@@ -132,7 +132,14 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure EthWhyGenet()
   Print("   The Ethernet controller said: ")
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the wired MAC is RP1's GEM; the board's link seam names its
+  ; words (HwLinkWhyText, Anvil/Hal/hal.pbi), so this shared file names
+  ; no driver on that chip.
+  UartWriteStr(HwLinkWhyText(#HW_LINK_WIRED))
+  CompilerElse
   UartWriteStr(GenetErrorText())
+  CompilerEndIf
   PrintNl()
 EndProcedure
 

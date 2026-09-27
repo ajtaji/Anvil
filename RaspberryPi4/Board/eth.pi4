@@ -55,7 +55,11 @@ Procedure EthDown()
   ; gEthUp is the monitor's logical state, not a hardware interlock. A
   ; half-failed start can have enabled receive DMA before that flag was set,
   ; so always ask the idempotent driver stop to clear both enable paths.
+  CompilerIf #PMF_CHIP = 2712
+  GemStop()
+  CompilerElse
   GenetStop()
+  CompilerEndIf
   gEthUp = 0
 EndProcedure
 
@@ -98,6 +102,14 @@ EndProcedure
 #ETH_HWUP_ALREADY = 2
 
 Procedure.i EthPayloadStopChecked()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: RP1's GEM. GemStopChecked clears NCR.RE and NCR.TE, keeps
+  ; the management port, and answers 1 only when NCR reads back with both
+  ; clear - the same enable-field boundary as the GENET arm below, and no
+  ; stronger (the GEM has no cited "DMA idle" either). With RP1's PCIe
+  ; link down nothing on RP1 can master the bus, so that is a stop too.
+  ProcedureReturn GemStopChecked()
+  CompilerElse
   Define cmd.i
   Define tdma.i
   Define rdma.i
@@ -124,14 +136,21 @@ Procedure.i EthPayloadStopChecked()
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
+  CompilerEndIf
 EndProcedure
 
 Procedure.i EthPayloadQuiesce()
   Define was.i
   was = 0
+  CompilerIf #PMF_CHIP = 2712
+  If gEthUp <> 0 Or GemStarted() <> 0
+    was = 1
+  EndIf
+  CompilerElse
   If gEthUp <> 0 Or GenetStarted() <> 0
     was = 1
   EndIf
+  CompilerEndIf
   If EthPayloadStopChecked() = 0
     gEthUp = 0
     PrintN("!! the Ethernet stop command or an enable-field readback failed, so")
@@ -266,13 +285,158 @@ EndProcedure
 ;  may still apply a new address afterward; a payload return keeps the one
 ;  that was already bound.
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  eth_GemUp - eth_HwUp's BCM2712 arm: the same four results, the same
+;  order and the same software identity work, over RP1's Cadence GEM
+;  (RaspberryPi4/Lib/gem.pi4, included by hw_link.pi4).
+;
+;  WHY IT IS A PROCEDURE OF ITS OWN and not forks inside eth_HwUp: the
+;  dialect will not let an If open in one CompilerIf arm and close in
+;  another, and the GENET arm's three failure sentences (the half-duplex
+;  refusal above all) are GENET's. The identity tail - NetDefaults,
+;  NetArpFlush, NetSetMac, gEthUp - is restated rather than shared
+;  because sharing it would move Pi 4 lines, and the Pi 4 image is held
+;  byte-identical. Rule 30's cost of that, written down: when Pi 4
+;  identity stops mattering, eth_HwUp and this collapse into one body
+;  over a wired-MAC seam.
+;
+;  WHAT IS DIFFERENT FROM GENET, and each is a Pi 5 fact:
+;    * the MAC is behind RP1's PCIe link, so GemProbe proves the link, the
+;      inbound window and RP1's identity (pcie.pi4) before any access -
+;      an RP1 access with the link down hangs the core;
+;    * the PHY may be held in reset on RP1 GPIO 32; GemStart resets it
+;      only if it does not answer, and negotiates from there;
+;    * half duplex is not refused - the GEM has a duplex bit (NCFGR.FD)
+;      and gem.pi4 sets it from the resolution.
+; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+Procedure.i eth_GemUp()
+  Define startErr.i
+  If gEthUp = 1
+    If GemStarted() = 1
+      If GemPhyLinkUp() = 1
+        ProcedureReturn #ETH_HWUP_ALREADY
+      EndIf
+    EndIf
+    PrintN("The Ethernet was up and is not any more - the link has gone away since")
+    PrintN("the last command. Bringing it up again from the beginning.")
+    gEthUp = 0
+  EndIf
+
+  gEthUp = 0
+  If EthPayloadStopChecked() = 0
+    PrintN("!! the Ethernet rebuild could not establish a stopped controller.")
+    PrintN("   Its stop command or its enable-field readback failed. The caller")
+    PrintN("   must reset rather than continue beside a possibly active MAC.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_UNSAFE
+  EndIf
+
+  EthMacFetch()
+
+  If GemProbe() = 0
+    PrintN("!! the Ethernet controller did not identify itself, so nothing was")
+    PrintN("   done. On the Raspberry Pi 5 it is RP1's Cadence GEM, behind the")
+    PrintN("   PCIe link to RP1, so a failure here is that link, RP1's bus")
+    PrintN("   mastering, or this monitor reading the wrong address - not a cable")
+    PrintN("   and not a switch.")
+    EthWhyGenet()
+    If GemError() = #GEM_ERR_RP1
+      Print("   The PCIe layer said: ")
+      UartWriteStr(PcieErrorText())
+      PrintNl()
+    EndIf
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  If GemSetMac(@gEthMac[0]) = 0
+    PrintN("!! the Ethernet controller refused this board's hardware address, so")
+    PrintN("   nothing was done.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+  If GemSetRegion(#ETH_RX_BASE, #ETH_RX_BYTES) = 0
+    PrintN("!! the Ethernet controller refused its DMA region, so nothing was")
+    PrintN("   done. That region is a constant in this monitor and not something")
+    PrintN("   you typed, so this is a fault in Anvil rather than in what you did.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  Print("Bringing the Ethernet up. Waiting up to ")
+  PrintDec(#ETH_LINK_MS)
+  PrintN(" milliseconds for the link")
+  PrintN("to come up and for auto-negotiation to finish, so this pauses.")
+  UartDrain()
+
+  ; The screen keeps drawing through the wait, as GENET's does (the board
+  ; hands genet.pi4 the same hook in Main).
+  GemSetProgressHook(@ScreenServiceTick)
+  If GemStart(#ETH_LINK_MS) = 0
+    ; The same rule as the GENET arm: prove the controller stopped BEFORE
+    ; saying why it failed. GemStart never sets RE or TE on a failure, and
+    ; the checked stop is what shows it.
+    startErr = GemError()
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the Ethernet start failed, and its cleanup stop command or its")
+      PrintN("   enable-field readback also failed. The caller must reset rather")
+      PrintN("   than continue beside a possibly active MAC.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
+    If startErr = #GEM_ERR_NO_LINK
+      PrintN("!! there is no Ethernet link, so the network is not up and nothing")
+      PrintN("   was done. Nothing is plugged into this board's Ethernet socket, or")
+      PrintN("   the other end of the cable is not powered, or the cable is bad. Put")
+      PrintN("   one in, wait a moment for the socket lights, and type the command")
+      PrintN("   again. This monitor waited five seconds and then answered, rather")
+      PrintN("   than sitting here looking like a hung board.")
+      ProcedureReturn #ETH_HWUP_DOWN
+    EndIf
+    If startErr = #GEM_ERR_ANEG
+      PrintN("!! the Ethernet link came up but auto-negotiation never finished, so")
+      PrintN("   nothing was done. The speed and duplex a PHY reports before")
+      PrintN("   negotiation completes are left over from last time and acting on")
+      PrintN("   them would configure the controller wrongly. This is usually an")
+      PrintN("   old switch or a fixed-speed port at the other end. The network is")
+      PrintN("   not up and nothing was done.")
+      ProcedureReturn #ETH_HWUP_DOWN
+    EndIf
+    PrintN("!! the Ethernet controller did not start, so the network is not up and")
+    PrintN("   nothing was done.")
+    EthWhyGenet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  If NetMacSet(#HW_LINK_WIRED) = 0
+    NetDefaults()
+  EndIf
+  NetArpFlush(#HW_LINK_WIRED)
+  If NetSetMac(#HW_LINK_WIRED, @gEthMac[0]) = 0
+    If EthPayloadStopChecked() = 0
+      PrintN("!! the network stack refused the wired address, and the controller")
+      PrintN("   cleanup stop command or its enable-field readback failed. The")
+      PrintN("   caller must reset rather than continue beside a possibly active MAC.")
+      EthWhyGenet()
+      ProcedureReturn #ETH_HWUP_UNSAFE
+    EndIf
+    PrintN("!! the network stack refused this board's hardware address, so nothing")
+    PrintN("   was done.")
+    EthWhyNet()
+    ProcedureReturn #ETH_HWUP_DOWN
+  EndIf
+
+  gEthUp = 1
+  ProcedureReturn #ETH_HWUP_STARTED
+EndProcedure
+CompilerEndIf
+
 Procedure.i eth_HwUp()
   Define startErr.i
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: the Pi 5's Ethernet is RP1's Cadence GEM, not GENET; this
-  ; build has no driver for it (#CAP_NET is 0), so the wire is down.
-  ProcedureReturn #ETH_HWUP_DOWN
-  CompilerEndIf
+  ; BCM2712: RP1's Cadence GEM, through eth_GemUp above.
+  ProcedureReturn eth_GemUp()
+  CompilerElse
   If gEthUp = 1
     If GenetStarted() = 1
       If GenetPhyLinkUp() = 1
@@ -420,6 +584,7 @@ Procedure.i eth_HwUp()
 
   gEthUp = 1
   ProcedureReturn #ETH_HWUP_STARTED
+  CompilerEndIf
 EndProcedure
 
 ; Ordinary monitor callers use this wrapper, never the raw four-result value directly.
@@ -431,8 +596,13 @@ Procedure.i eth_HwUpLocal()
   Define r.i
   r = eth_HwUp()
   If r < 0
+    CompilerIf #PMF_CHIP = 2712
+    PrintN("The monitor is resetting through firmware because RP1's Ethernet MAC")
+    PrintN("could not be proved disabled after a failed local start.")
+    CompilerElse
     PrintN("The monitor is resetting through firmware because GENET could not be")
     PrintN("proved disabled after a failed local start.")
+    CompilerEndIf
     UartDrain()
     SafetyToFirmware()
   EndIf
@@ -468,6 +638,17 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i EthCableIn()
   Define v.i
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: GemCableIn probes RP1 (link, window, identity) before any
+  ; access, reads the PHY's identity and link bit, and resets a PHY that
+  ; does not answer (RP1 GPIO 32). A PHY just out of reset negotiates from
+  ; scratch, so ONLY in that case the link is waited for, up to
+  ; #ETH_LINK_MS, instead of answering a "no cable" nothing could change.
+  ; A PHY that answers costs two MDIO reads, as on the Pi 4. The screen
+  ; keeps drawing through that one wait.
+  GemSetProgressHook(@ScreenServiceTick)
+  ProcedureReturn GemCableIn(#ETH_LINK_MS)
+  CompilerElse
   If GenetProbe() = 0
     ProcedureReturn 0
   EndIf
@@ -481,6 +662,7 @@ Procedure.i EthCableIn()
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -534,11 +716,19 @@ Procedure.i HwLinkStaticUp()
   If EthCableIn() = 0
     ProcedureReturn #HW_LINK_NONE
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If gEthUp <> 1 Or GemStarted() <> 1 Or GemPhyLinkUp() <> 1
+    If eth_HwUpLocal() <= #ETH_HWUP_DOWN
+      ProcedureReturn #HW_LINK_NONE
+    EndIf
+  EndIf
+  CompilerElse
   If gEthUp <> 1 Or GenetStarted() <> 1 Or GenetPhyLinkUp() <> 1
     If eth_HwUpLocal() <= #ETH_HWUP_DOWN
       ProcedureReturn #HW_LINK_NONE
     EndIf
   EndIf
+  CompilerEndIf
   If HwLinkOpen(1) = 0
     ProcedureReturn #HW_LINK_NONE
   EndIf
@@ -911,6 +1101,57 @@ EndProcedure
 ;  is absent, rather than staying silent about it.
 ; ----------------------------------------------------------------------
 Procedure HwLinkSayCounters()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the same report over RP1's GEM. Its counters CLEAR WHEN
+  ; READ, so gem.pi4's GemStat keeps running totals since GemStart and
+  ; this is safe to type twice. The GEM keeps no ring-overflow count of
+  ; GENET's kind; "no receive buffer" and "overrun" are its two.
+  PrintN("THE WIRED ETHERNET, as its own controller counted it.")
+  If GemStarted() <> 1
+    PrintN("  The Ethernet controller has not been started, so it has counted")
+    PrintN("  nothing. Put a cable in and type net up, then ask again. Nothing was")
+    PrintN("  read and nothing was changed.")
+    eth_SayRadioCounters()
+    ProcedureReturn
+  EndIf
+  PrintN("What the Ethernet controller has counted since this interface came up.")
+  PrintN("A counter that is zero is not printed, apart from the two packet counts,")
+  PrintN("so anything you see below is a number worth reading.")
+  PrintNl()
+  Print("  Pause frames this board SENT: ")
+  PrintDec(GemStat(#GEM_STAT_TX_PAUSE))
+  PrintN(".")
+  If GemStat(#GEM_STAT_TX_PAUSE) > 0
+    PrintN("  !! THAT MUST BE ZERO. This board is telling the machine at the other")
+    PrintN("     end of the cable to stop transmitting. The GEM sends a pause frame")
+    PrintN("     only when asked to, and gem.pi4 never asks.")
+  EndIf
+  eth_SayCount("Pause frames the other end sent us", GemStat(#GEM_STAT_RX_PAUSE), 0)
+  PrintNl()
+  eth_SayCount("Good frames the controller received", GemStat(#GEM_STAT_RX_FRAMES), 1)
+  eth_SayCount("Good frames the controller sent", GemStat(#GEM_STAT_TX_FRAMES), 1)
+  PrintNl()
+  eth_SayCount("Frames arriving with a bad checksum", GemStat(#GEM_STAT_RX_FCS), 0)
+  eth_SayCount("Frames arriving misaligned", GemStat(#GEM_STAT_RX_ALIGN), 0)
+  eth_SayCount("Frames arriving with an impossible length", GemStat(#GEM_STAT_RX_LENGTH), 0)
+  eth_SayCount("Frames arriving oversize", GemStat(#GEM_STAT_RX_OVERSIZE), 0)
+  eth_SayCount("Jabber", GemStat(#GEM_STAT_RX_JABBER), 0)
+  eth_SayCount("Transmit underruns", GemStat(#GEM_STAT_TX_UNDERRUN), 0)
+  eth_SayCount("Late collisions", GemStat(#GEM_STAT_TX_LATECOLL), 0)
+  eth_SayCount("Excessive collisions", GemStat(#GEM_STAT_TX_EXCOLL), 0)
+  eth_SayCount("Frames dropped because no receive buffer was free", GemStat(#GEM_STAT_RX_NOBUF), 0)
+  eth_SayCount("Frames dropped by a receive overrun", GemStat(#GEM_STAT_RX_OVERRUN), 0)
+  eth_SayCount("Frames this driver dropped as malformed", GemRxDrops(), 0)
+  PrintNl()
+  Print("  Times this interface has been brought up: ")
+  PrintDec(GemStartCount())
+  PrintN(". Each one clears every")
+  PrintN("  counter above, so they are about the most recent bring-up only.")
+  eth_SayCount("Times auto-negotiation was restarted", GemAnegRestarts(), 0)
+  eth_SayCount("Times the PHY had to be reset to answer", GemPhyResets(), 0)
+  eth_SayCount("Times the link was seen to drop and come back", GemLinkDrops(), 0)
+  eth_SayRadioCounters()
+  CompilerElse
   ; ---- THE WIRED ETHERNET ------------------------------------------
   PrintN("THE WIRED ETHERNET, as its own controller counted it.")
   If GenetStarted() <> 1
@@ -1004,6 +1245,7 @@ Procedure HwLinkSayCounters()
     PrintN("     counts as one. Zero means none was seen, not that none happened.")
   EndIf
   eth_SayRadioCounters()
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1123,6 +1365,17 @@ Procedure.i HwLinkOpen(needIp.i)
   EndIf
 
   wiredLink = 0
+  CompilerIf #PMF_CHIP = 2712
+  If gEthUp = 1
+    If GemStarted() = 1
+      If GemPhyLinkUp() = 1
+        wiredLink = 1                  ; already up: two MDIO reads
+      Else
+        gEthUp = 0                     ; the cable has gone since last time
+      EndIf
+    EndIf
+  EndIf
+  CompilerElse
   If gEthUp = 1
     If GenetStarted() = 1
       If GenetPhyLinkUp() = 1
@@ -1132,6 +1385,7 @@ Procedure.i HwLinkOpen(needIp.i)
       EndIf
     EndIf
   EndIf
+  CompilerEndIf
 
   ; The five-second bring-up is paid only when it is worth paying: the
   ; operator asked for wired, or the radio has nothing.

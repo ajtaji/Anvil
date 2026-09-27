@@ -1,0 +1,1557 @@
+; ======================================================================
+;  gem.pi4 - RP1's CADENCE GEM ETHERNET MAC (Raspberry Pi 5, BCM2712),
+;  its BCM54213PE PHY over MDIO, and queue 0's two descriptor rings.
+;  Polled. A library: nothing here prints. BCM2712 (-t pi5) builds only.
+; ======================================================================
+;
+;  WHERE IT PLUGS IN. The wired arm of the ONE link seam - the HwLink*
+;  backend RaspberryPi4/Board/hw_link.pi4 and the board half
+;  RaspberryPi4/Board/eth.pi4 - calls this file under
+;  `CompilerIf #PMF_CHIP = 2712`, exactly where the Pi 4 calls
+;  RaspberryPi4/Lib/genet.pi4. Everything above that seam - net.pbi, ARP,
+;  IP, DHCP, the console, TCP, TFTP - is the same code on both boards.
+;  This file is the only thing the Pi 5 adds to the wire.
+;
+;  USE, in the order GemStart checks for:
+;
+;      GemProbe()                       RP1 reachable over PCIe, bus master
+;                                       on, and a 64-bit-DMA GEM at the base
+;      GemSetMac(@mac[0])               six bytes (eth_mac.pi4, the mailbox)
+;      GemSetRegion(base, bytes)        >= #GEM_REGION_MIN, 64-byte aligned
+;      GemStart(linkMs)                 1 up; 0 and GemError() otherwise
+;      GemSend(@frame[0], n, ms)        1 sent, 0 not
+;      GemRecv(@into[0], cap)           >0 bytes, 0 nothing now, <0 refused
+;      GemRecvWait(@into[0], cap, ms)   the same, waiting up to ms
+;      GemStop() / GemStopChecked()     RE and TE off, read back
+;
+;  DEPENDENCIES, all included by the board before this file and none of
+;  them included here (a library includes no library):
+;    RaspberryPi4/Lib/timer.pi4     Ticks() / TickHz() - the one owner of
+;                                   the generic-timer read (layering rule 3)
+;    RaspberryPi4/Lib/pcie.pi4      PcieInit / PcieEnumerate / PcieEnableDma
+;                                   (its 2712 branch) and PcieDmaBus /
+;                                   PcieDmaOk - the ONE inbound-window
+;                                   translation, shared with RP1's xHCI
+;    RaspberryPi4/Lib/gpio_rp1.pi4  Rp1DigitalWrite / Rp1PinOutput for the
+;                                   PHY's reset line, RP1 GPIO 32
+;  The same shape as RaspberryPi4/Lib/i2c_dw.pi4, which calls
+;  gpio_rp1.pi4, and xhci.pi4, which calls pcie.pi4.
+;
+; ======================================================================
+;  STATUS: DESK-PROVEN, SILICON OWED
+; ======================================================================
+;  Proved by tools/a64/a64_gem_pi5_check.py against a modelled pcie2 +
+;  RP1, a GEM register file and DMA engine, a BCM54213PE on MDIO, RP1
+;  GPIO 32 and a write-back data cache over the DMA region. Nothing here
+;  has touched an RP1. The questions only the board can answer are in
+;  the vault, Raspberry Pi 5/HARDWARE-BRINGUP.md, "Pi 5 Ethernet".
+;
+; ======================================================================
+;  THE SOURCES, AND THE ONE THAT IS MISSING
+; ======================================================================
+;  [D]  vault Raspberry Pi 5/Sources/rp1.dtsi:999-1016 (ethernet@100000),
+;       bcm2712-rpi-5-b.dts:135-162 (&rp1 ranges / dma-ranges) and
+;       :170-181 (&rp1_eth: phy-handle, phy-reset-gpios, ethernet-phy@1),
+;       bcm2712.dtsi pcie2 ranges / dma-ranges; re-derived from the three
+;       pinned DTBs by the gate.
+;  [R]  vault Raspberry Pi 5/References/rp1-peripherals.pdf chapter 7:
+;       GEM_GXL 1p09, RGMII, 64-bit DMA addressing, AXI bursts over 16
+;       beats illegal (Table 135), Table 132 eth $40100000 / eth_cfg
+;       $40104000, eth_cfg CONTROL / STATUS / CLKGEN (Tables 134, 135, 139).
+;  [B]  PureBasicCode RaspberryPi4/Reference/v6.12_brcmphy.h,
+;       v6.12_phy_broadcom.c, v6.12_bcm_phy_lib.c - the PHY.
+;  [M]  THE GEM's REGISTER MAP, BIT FIELDS AND DESCRIPTOR FORMAT ARE NOT
+;       PINNED ANYWHERE ON THIS DISK. RP1's datasheet defers to Cadence's
+;       GEM_GXL user guide ([R] ch. 7), which is not public, and Linux's
+;       drivers/net/ethernet/cadence/macb.h / macb_main.c were NOT
+;       downloaded (no download without the owner's OK). Every #GEM_
+;       register constant below is written from the macb driver's names
+;       and carries that name, so it can be checked line by line the day
+;       the source is pinned; the URLs are on the vault's morning list for
+;       2026-09-27. UNTIL THEN THESE ARE ONE READING, NOT A CITATION - the
+;       same honest limit tools/a64/a64_net_check.py states for its
+;       protocol constants.
+;
+; ======================================================================
+;  WHERE THE BLOCK IS, AND WHERE ITS DMA LANDS
+; ======================================================================
+;  [D] rp1.dtsi:1000  reg = <0xc0 0x40100000 0x0 0x4000>
+;      bcm2712-rpi-5-b.dts &rp1 ranges: RP1 c0_40xxxxxx -> PCIe 0 (size
+;      $410000); bcm2712.dtsi pcie2 ranges: PCIe 0 -> CPU $1F_0000_0000.
+;      => THE GEM IS AT CPU $1F_0010_0000, 16 KiB, and eth_cfg at
+;      $1F_0010_4000 ([R] Table 132). The same arithmetic the firmware
+;      printed for RP1 UART0 on the first boot ("RP1_UART 0000001f00030000").
+;  DMA: the GEM is an RP1 bus master. What goes into a descriptor or a
+;      queue pointer is PcieDmaBus(cpu) - &rp1 dma-ranges entry 1 plus
+;      pcie2's inbound window, CPU + $10_0000_0000, found and verified by
+;      pcie.pi4's PcieInit. That does not fit in 32 bits, so the GEM's
+;      64-bit addressing (DCFG6.DAW64, DMACFG.ADDR64, the 16-byte
+;      descriptor and the TBQPH/RBQPH high words) is REQUIRED, not optional.
+;
+; ======================================================================
+;  CACHE MAINTENANCE - THE REGION IS TREATED AS CACHEABLE
+; ======================================================================
+;  The BCM2712 turns its data cache on (RaspberryPi4/Board/cache.pi4).
+;  Nothing here assumes the region was mapped Non-Cacheable; every line
+;  the GEM reads is cleaned after the CPU writes it and every line the
+;  GEM writes is invalidated before the CPU reads it (`dc civac`, which
+;  on a clean line is an invalidate). With the region mapped
+;  Non-Cacheable as well the maintenance is harmless.
+;
+;  ONE HAZARD NEEDS MORE THAN MAINTENANCE: a 64-byte line holds FOUR
+;  16-byte descriptors. Cleaning a line the CPU dirtied writes back all
+;  four, including a neighbour the GEM may have updated since the CPU
+;  last read it - which silently un-receives a frame. So:
+;    * RX descriptors are handed back to the GEM FOUR AT A TIME, a whole
+;      line, only when all four have been consumed and therefore none of
+;      them can be written by the GEM (it writes only descriptors it owns).
+;      The ring keeps 124 of its 128 descriptors armed at all times.
+;    * TX is one frame at a time and waited for (as genet.pi4's is), so
+;      no descriptor the CPU cleans can be one the GEM is still writing.
+;
+; ======================================================================
+;  OWNERSHIP - THE USED BIT, BOTH RINGS
+; ======================================================================
+;  RX: bit 0 of the ADDRESS word. 0 = the GEM may fill it; the GEM sets
+;      it when a frame is in the buffer, and the CPU clears it to give the
+;      buffer back. Bit 1 = WRAP (last descriptor of the ring).
+;  TX: bit 31 of the CONTROL word. 0 = the GEM may send it; the GEM sets
+;      it when the frame has gone. Bit 30 = WRAP, bit 15 = LAST.
+;  The two rings use the SAME name for OPPOSITE words, which is exactly
+;  the kind of thing a mutation of this file checks.
+; ======================================================================
+
+CompilerIf #PMF_CHIP <> 2712
+  CompilerError "RaspberryPi4/Lib/gem.pi4 drives RP1's Ethernet MAC at CPU $1F_0010_0000, which exists only on the BCM2712 (Raspberry Pi 5). Build with -t pi5."
+CompilerEndIf
+
+; ---------------------------------------------------------- the blocks
+#GEM_BASE       = $1F00100000   ; [D] rp1.dtsi:1000 through the two ranges
+#GEM_SIZE       = $4000         ; [D] rp1.dtsi:1000 reg size
+#GEM_CFG_BASE   = $1F00104000   ; [R] Table 132 eth_cfg $40104000, same window
+#GEM_CFG_SIZE   = $2C           ; [R] Table 133: CONTROL .. INTS
+
+; ----------------------------------- eth_cfg, [R] Tables 133-135, 139
+#GEM_CFG_CONTROL = $00
+#GEM_CFG_STATUS  = $04
+#GEM_CFG_CLKGEN  = $14
+#GEM_CTRL_MEM_PD = $10          ; CONTROL bit 4, memory power down (reset 0)
+#GEM_CLK_TXCLKDELEN = $200      ; CLKGEN bit 9: a MAC-side TX clock delay
+#GEM_CLK_ENABLE     = $80       ; CLKGEN bit 7 (reset 1)
+#GEM_CLK_KILL       = $40       ; CLKGEN bit 6
+#GEM_CLK_OVERRIDE   = $08       ; CLKGEN bit 3: SPEED_OVERRIDE_EN
+#GEM_STAT_AXI_ILLEGAL = $30     ; STATUS bits 5:4, AWLEN/ARLEN over 16 beats
+
+; ------------------------------------------ GEM registers, [M] names
+#GEM_NCR       = $0000   ; MACB_NCR
+#GEM_NCFGR     = $0004   ; MACB_NCFGR
+#GEM_NSR       = $0008   ; MACB_NSR
+#GEM_USRIO     = $000C   ; GEM_USRIO
+#GEM_DMACFG    = $0010   ; GEM_DMACFG
+#GEM_TSR       = $0014   ; MACB_TSR
+#GEM_RBQP      = $0018   ; MACB_RBQP
+#GEM_TBQP      = $001C   ; MACB_TBQP
+#GEM_RSR       = $0020   ; MACB_RSR
+#GEM_ISR       = $0024   ; MACB_ISR
+#GEM_IDR       = $002C   ; MACB_IDR
+#GEM_MAN       = $0034   ; MACB_MAN
+#GEM_AMP       = $0054   ; GEM_AMP (AXI max pipeline)
+#GEM_SA1B      = $0088   ; GEM_SA1B; SA2..SA4 follow at +8 per pair
+#GEM_SA1T      = $008C   ; GEM_SA1T
+#GEM_MID       = $00FC   ; MACB_MID
+#GEM_DCFG1     = $0280   ; GEM_DCFG1
+#GEM_DCFG6     = $0294   ; GEM_DCFG6
+#GEM_Q_ISR     = $0400   ; GEM_ISR(q)  = $0400 + 4*q, q = hardware queue - 1
+#GEM_Q_TBQP    = $0440   ; GEM_TBQP(q)
+#GEM_Q_RBQP    = $0480   ; GEM_RBQP(q)
+#GEM_TBQPH     = $04C8   ; MACB_TBQPH - ONE high word for every queue
+#GEM_RBQPH     = $04D4   ; MACB_RBQPH
+#GEM_Q_IDR     = $0620   ; GEM_IDR(q)
+
+; statistics - clear on read; GemStat keeps running totals
+#GEM_STAT_TX_FRAMES   = $0108   ; GEM_TXCNT
+#GEM_STAT_TX_PAUSE    = $0114   ; GEM_TXPAUSECNT
+#GEM_STAT_TX_UNDERRUN = $0134   ; GEM_TXURUNCNT
+#GEM_STAT_TX_EXCOLL   = $0140   ; GEM_EXCESSCOLLCNT
+#GEM_STAT_TX_LATECOLL = $0144   ; GEM_LATECOLLCNT
+#GEM_STAT_RX_FRAMES   = $0158   ; GEM_RXCNT
+#GEM_STAT_RX_PAUSE    = $0164   ; GEM_RXPAUSECNT
+#GEM_STAT_RX_OVERSIZE = $0188   ; GEM_RXOVRCNT
+#GEM_STAT_RX_JABBER   = $018C   ; GEM_RXJABCNT
+#GEM_STAT_RX_FCS      = $0190   ; GEM_RXFCSCNT
+#GEM_STAT_RX_LENGTH   = $0194   ; GEM_RXLENGTHCNT
+#GEM_STAT_RX_ALIGN    = $019C   ; GEM_RXALIGNCNT
+#GEM_STAT_RX_NOBUF    = $01A0   ; GEM_RXRESERRCNT - no receive buffer free
+#GEM_STAT_RX_OVERRUN  = $01A4   ; GEM_RXORCNT
+#GEM_STAT_FIRST       = $0100
+#GEM_STAT_LAST        = $01A4
+
+; -------------------------------------------------------------- NCR
+#GEM_NCR_RE      = $004    ; bit 2  receive enable
+#GEM_NCR_TE      = $008    ; bit 3  transmit enable
+#GEM_NCR_MPE     = $010    ; bit 4  management (MDIO) port enable
+#GEM_NCR_CLRSTAT = $020    ; bit 5  clear the statistics
+#GEM_NCR_TSTART  = $200    ; bit 9  start transmission
+; ------------------------------------------------------------ NCFGR
+#GEM_NCFGR_SPD   = $00000001   ; bit 0  100 Mbit/s
+#GEM_NCFGR_FD    = $00000002   ; bit 1  full duplex
+#GEM_NCFGR_BIG   = $00000100   ; bit 8  1536-byte frames
+#GEM_NCFGR_GBE   = $00000400   ; bit 10 gigabit
+#GEM_NCFGR_PAE   = $00002000   ; bit 13 pause enable (left clear)
+#GEM_NCFGR_DRFCS = $00020000   ; bit 17 strip the FCS from received frames
+#GEM_NCFGR_CLK_SHIFT = 18      ; bits 20:18 MDC divider
+#GEM_NCFGR_CLK_MASK  = $001C0000
+#GEM_NCFGR_DBW_SHIFT = 21      ; bits 22:21 data bus width
+#GEM_NCFGR_DBW_MASK  = $00600000
+; MDC. The GEM's pclk is RP1_CLK_SYS ([D] rp1.dtsi:1005), assigned
+; 200,000,000 Hz ([D] rp1.dtsi:53). The divider is macb's table (8, 16,
+; 32, 48, 64, 96, 128, 224 = codes 0..7); 96 is the smallest that keeps
+; MDC at or under IEEE 802.3's 2.5 MHz: 200 MHz / 96 = 2.08 MHz.
+#GEM_MDC_DIV96   = 5
+; -------------------------------------------------------------- NSR
+#GEM_NSR_IDLE    = $004        ; bit 2  the MDIO shift register is idle
+; -------------------------------------------------------------- TSR
+#GEM_TSR_UBR     = $01         ; used bit read
+#GEM_TSR_RLE     = $04         ; retry limit exceeded
+#GEM_TSR_BEX     = $10         ; AHB/AXI error mid frame
+#GEM_TSR_COMP    = $20         ; transmit complete
+#GEM_TSR_UND     = $40         ; underrun
+#GEM_TSR_FAULTS  = $54         ; RLE | BEX | UND
+; -------------------------------------------------------------- MAN
+; Clause 22: SOF 01 (31:30), RW 10 read / 01 write (29:28), PHYA (27:23),
+; REGA (22:18), CODE 10 (17:16), DATA (15:0).
+#GEM_MAN_READ  = $60020000
+#GEM_MAN_WRITE = $50020000
+#GEM_MAN_PHYA_SHIFT = 23
+#GEM_MAN_REGA_SHIFT = 18
+#GEM_MDIO_TIMEOUT_MS = 1000
+; ------------------------------------------------------------ USRIO
+#GEM_USRIO_RGMII = $1          ; GEM_RGMII, bit 0
+; ----------------------------------------------------------- DMACFG
+#GEM_DMACFG_FBLDO_MASK = $0000001F   ; 4:0 burst length
+#GEM_DMACFG_ENDIA_DESC = $00000040   ; 6   (cleared: little-endian)
+#GEM_DMACFG_ENDIA_PKT  = $00000080   ; 7   (cleared)
+#GEM_DMACFG_RXBMS      = $00000300   ; 9:8 all of the RX packet buffer
+#GEM_DMACFG_TXPBMS     = $00000400   ; 10  all of the TX packet buffer
+#GEM_DMACFG_TXCOEN     = $00000800   ; 11  (cleared: no checksum offload)
+#GEM_DMACFG_RXBS_MASK  = $00FF0000   ; 23:16 RX buffer size / 64
+#GEM_DMACFG_RXBS_SHIFT = 16
+#GEM_DMACFG_RXEXT      = $10000000   ; 28  (cleared: no timestamp words)
+#GEM_DMACFG_TXEXT      = $20000000   ; 29  (cleared)
+#GEM_DMACFG_ADDR64     = $40000000   ; 30  64-bit descriptors - REQUIRED
+; [R] Table 135: an AXI burst over 16 beats is illegal and needs a block
+; reset to clear. 16 is the most this file ever asks for.
+#GEM_BURST = 16
+; ------------------------------------------------------------ AMP
+; [D] rp1.dtsi:1011-1013: cdns,ar2r-max-pipe 8, aw2w-max-pipe 8,
+; use-aw2b-fill. Fields as macb's GEM_AMP: AR2R 7:0, AW2W 15:8, AW2B 16.
+#GEM_AMP_FIELDS = $0001FFFF
+#GEM_AMP_WANT   = $00010808
+; ------------------------------------------------------------- DCFG
+#GEM_MID_IDNUM_SHIFT = 16            ; 27:16; 2 and above is a GEM
+#GEM_DCFG1_DBWDEF_SHIFT = 25         ; 27:25: 1 = 32, 2 = 64, 4 = 128 bit
+#GEM_DCFG6_DAW64 = $00800000         ; bit 23
+#GEM_DCFG6_QMASK = $000000FE         ; bits 7:1, hardware queues 1..7
+
+; ------------------------------------------------------ descriptors
+#GEM_DESC_SIZE  = 16                 ; 64-bit form: addr, ctrl, addr hi, 0
+#GEM_DESC_ADDR  = 0
+#GEM_DESC_CTRL  = 4
+#GEM_DESC_ADDRH = 8
+#GEM_DESC_PAD   = 12
+#GEM_RX_USED    = $00000001          ; RX address word bit 0
+#GEM_RX_WRAP    = $00000002          ; RX address word bit 1
+#GEM_RX_LEN     = $00003FFF          ; RX control 13:0 (RBOF is 0, so the
+                                     ; top two bits are zero either way)
+#GEM_RX_SOF     = $00004000          ; bit 14
+#GEM_RX_EOF     = $00008000          ; bit 15
+#GEM_TX_LEN     = $00003FFF          ; TX control 13:0
+#GEM_TX_LAST    = $00008000          ; bit 15
+#GEM_TX_FAULTS  = $38000000          ; 27 exhausted | 28 underrun | 29 error
+#GEM_TX_WRAP    = $40000000          ; bit 30
+#GEM_TX_USED    = $80000000          ; bit 31
+
+; ------------------------------------------------------- the region
+; One caller-owned region, 64-byte aligned. Buffers are 1536 bytes: an
+; 802.3 frame (1514 + FCS) rounded up to the GEM's 64-byte RX unit.
+#GEM_BUF_BYTES   = 1536
+#GEM_RX_DESCS    = 128               ; a multiple of 4 - see the header
+#GEM_TX_DESCS    = 8
+#GEM_OFF_RXRING  = $00000            ; 128 x 16 = $800
+#GEM_OFF_TXRING  = $00800            ;   8 x 16 = $80
+#GEM_OFF_TXTIE   = $00880            ; one USED|WRAP descriptor, queues 1..7
+#GEM_OFF_RXTIE   = $00890            ; one USED|WRAP descriptor, queues 1..7
+#GEM_OFF_TXBUF   = $01000            ;   8 x 1536
+#GEM_OFF_RXBUF   = $04000            ; 128 x 1536
+#GEM_REGION_MIN  = $34000
+#GEM_FRAME_MAX   = 1514
+#GEM_FRAME_MIN   = 60                ; padded here with zeros
+#GEM_LINE        = 64                ; Cortex-A76 data cache line
+
+; --------------------------------------------------------------- PHY
+#GEM_PHY_ADDR      = 1               ; [D] dts ethernet-phy@1, reg = <0x1>
+#GEM_PHY_RESET_GPIO = 32             ; [D] dts phy-reset-gpios <&rp1_gpio 32
+                                     ;     GPIO_ACTIVE_LOW> ("ETH_RST_N")
+#GEM_PHY_RESET_MS  = 5               ; [D] dts phy-reset-duration = <5>
+; BCM54210E family: [B] brcmphy.h:26 PHY_ID_BCM54210E $600D84A0, matched
+; under $FFFFFFF0 (phy_broadcom.c:1438-1439, :1723) - the Pi's BCM54213PE
+; reads $600D84A2 and Linux drives it with this entry, whose
+; config_init (phy_broadcom.c:464-465 -> bcm54210e_config_init :114-118)
+; is the RGMII clock-delay set-up below.
+#GEM_PHY_ID        = $600D84A0
+#GEM_PHY_ID_MASK   = $FFFFFFF0
+#GEM_MII_BMCR      = 0
+#GEM_MII_BMSR      = 1
+#GEM_MII_PHYSID1   = 2
+#GEM_MII_PHYSID2   = 3
+#GEM_MII_ADVERTISE = 4
+#GEM_MII_LPA       = 5
+#GEM_MII_CTRL1000  = 9
+#GEM_MII_STAT1000  = 10
+#GEM_BMCR_ISOLATE   = $0400
+#GEM_BMCR_PDOWN     = $0800
+#GEM_BMCR_ANENABLE  = $1000
+#GEM_BMCR_LOOPBACK  = $4000
+#GEM_BMCR_ANRESTART = $0200
+#GEM_BMSR_LSTATUS   = $0004
+#GEM_BMSR_ANEGCOMPLETE = $0020
+#GEM_LPA_10FULL     = $0040
+#GEM_LPA_100HALF    = $0080
+#GEM_LPA_100FULL    = $0100
+#GEM_LPA_1000HALF   = $0400
+#GEM_LPA_1000FULL   = $0800
+; phy-mode "rgmii-id" ([D] rp1.dtsi:1010): the PHY adds BOTH clock
+; delays. bcm54xx_config_clock_delay ([B] phy_broadcom.c:73-111):
+; RXC-RXD skew in the AUXCTL MISC shadow, GTXCLK in shadow CLK_CTL.
+#GEM_BCM_AUX_CTL      = $18          ; [B] brcmphy.h:98
+#GEM_BCM_AUXCTL_MISC  = $07          ; :138
+#GEM_BCM_AUXCTL_SKEW  = $0100        ; :141
+#GEM_BCM_AUXCTL_WREN  = $8000        ; :143
+#GEM_BCM_AUXCTL_RDSHIFT = 12         ; :145
+#GEM_BCM_AUXCTL_SELMASK = $0007      ; :146
+#GEM_BCM_SHD          = $1C          ; :117
+#GEM_BCM_SHD_WRITE    = $8000        ; :118
+#GEM_BCM_SHD_SHIFT    = 10           ; :119 SHD_VAL(x) = (x & $1F) << 10
+#GEM_BCM_SHD_DATA     = $03FF        ; :120
+#GEM_BCM_CLK_CTL      = $03          ; :356 BCM54810_SHD_CLK_CTL
+#GEM_BCM_GTXCLK_EN    = $0200        ; :357
+
+#GEM_HZ_FALLBACK = 54000000          ; the BCM2712 EL3 stub's counter rate
+#GEM_HZ_MAX      = 1000000000
+#GEM_PROGRESS_MS = 1000
+
+; ------------------------------------------------------------ errors
+#GEM_ERR_NONE        =   0
+#GEM_ERR_ARG         =  -1
+#GEM_ERR_RANGE       =  -2
+#GEM_ERR_RP1         =  -3
+#GEM_ERR_BUSMASTER   =  -4
+#GEM_ERR_VERSION     =  -5
+#GEM_ERR_NO_DMA64    =  -6
+#GEM_ERR_MDIO_BUSY   =  -7
+#GEM_ERR_PHY_NONE    =  -8
+#GEM_ERR_PHY_ID      =  -9
+#GEM_ERR_NO_LINK     = -10
+#GEM_ERR_ANEG        = -11
+#GEM_ERR_NO_MAC      = -12
+#GEM_ERR_NO_REGION   = -13
+#GEM_ERR_NOT_STARTED = -14
+#GEM_ERR_NOT_PROBED  = -15
+#GEM_ERR_TX_TIMEOUT  = -16
+#GEM_ERR_TX_FAULT    = -17
+#GEM_ERR_RX_LONG     = -18
+#GEM_ERR_RX_FRAG     = -19
+#GEM_ERR_AXI         = -20
+
+Global gem_err.i
+Global gem_probed.i
+Global gem_started.i
+Global gem_mid.i
+Global gem_dcfg1.i
+Global gem_dcfg6.i
+Global gem_macSet.i
+Global gem_sab.i
+Global gem_sat.i
+Global gem_region.i
+Global gem_regionBytes.i
+Global gem_phyId.i
+Global gem_phyResets.i
+Global gem_phyWasReset.i
+Global gem_speed.i
+Global gem_fullDuplex.i
+Global gem_txHead.i
+Global gem_rxTail.i
+Global gem_txCount.i
+Global gem_rxCount.i
+Global gem_rxDrops.i
+Global gem_linkDrops.i
+Global gem_anegRestarts.i
+Global gem_startCount.i
+Global gem_lastTsr.i
+Global gem_flushAddr.i
+Global Dim gem_stat.i[64]
+Global *gem_progressHook = 0
+Global gem_progressBusy.i = 0
+Global gem_progressAt.i = 0
+Global gem_progressStep.i = 0
+
+; ======================================================================
+;  TIME - through timer.pi4, the one owner of the generic-timer read
+; ======================================================================
+Procedure.i GemTimeoutTicks(ms.i)
+  Define hz.i
+  If ms <= 0
+    ProcedureReturn 0
+  EndIf
+  hz = TickHz()
+  If hz <= 0 Or hz > #GEM_HZ_MAX
+    hz = #GEM_HZ_FALLBACK
+  EndIf
+  ProcedureReturn (hz / 1000) * ms
+EndProcedure
+
+Procedure gem_DelayMs(ms.i)
+  Define t0.i
+  Define budget.i
+  t0 = Ticks()
+  budget = GemTimeoutTicks(ms)
+  While (Ticks() - t0) < budget
+  Wend
+EndProcedure
+
+Procedure.i GemSetProgressHook(*fn)
+  Define old.i
+  old = *gem_progressHook
+  *gem_progressHook = *fn
+  gem_progressBusy = 0
+  If *fn <> 0
+    gem_progressStep = GemTimeoutTicks(#GEM_PROGRESS_MS)
+    gem_progressAt = Ticks() - gem_progressStep
+  EndIf
+  ProcedureReturn old
+EndProcedure
+
+Procedure gem_Progress()
+  Define now.i
+  If *gem_progressHook = 0 Or gem_progressBusy <> 0
+    ProcedureReturn
+  EndIf
+  now = Ticks()
+  If (now - gem_progressAt) < gem_progressStep
+    ProcedureReturn
+  EndIf
+  gem_progressAt = now
+  gem_progressBusy = 1
+  gem_progressHook()
+  gem_progressBusy = 0
+EndProcedure
+
+; ======================================================================
+;  BARRIER AND CACHE LINES
+; ======================================================================
+; Written inline, not as a64_barrier(): layering rule 4 counts a64_ as a
+; private namespace (the same reason gpio_rp1.pi4 gives).
+Procedure gem_Barrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; `ldr x9`, never `ldr w9`: the address is a 64-bit .i.
+Procedure gem_CacheLine()
+  ASM
+    adrp x9, global_gem_flushaddr
+    add  x9, x9, #:lo12:global_gem_flushaddr
+    ldr  x9, [x9]
+    dc civac, x9
+  EndASM
+EndProcedure
+
+; Clean and invalidate every line [addr, addr + len) touches, then one
+; barrier. A clean line is simply dropped; a dirty one is written back
+; first. Rounded down by division, never by a 32-bit mask.
+Procedure gem_CacheRange(addr.i, len.i)
+  Define a.i
+  Define e.i
+  If len <= 0
+    ProcedureReturn
+  EndIf
+  gem_Barrier()
+  a = (addr / #GEM_LINE) * #GEM_LINE
+  e = addr + len
+  While a < e
+    gem_flushAddr = a
+    gem_CacheLine()
+    a = a + #GEM_LINE
+  Wend
+  gem_Barrier()
+EndProcedure
+
+; ======================================================================
+;  REGISTER ACCESS - bounded, aligned, 32 bits
+; ======================================================================
+; RP1 is behind PCIe and its writes are POSTED: a write can sit in the
+; fabric while the next instruction runs. Every write something waits on
+; (NCR above all, whose TSTART starts a transmission) is followed by a
+; read of the same register, which cannot complete until the write has.
+Procedure.i gem_Rd(off.i)
+  If off < 0 Or (off & 3) <> 0 Or (off + 4) > #GEM_SIZE
+    gem_err = #GEM_ERR_RANGE
+    ProcedureReturn #GEM_ERR_RANGE
+  EndIf
+  ProcedureReturn PeekN(#GEM_BASE + off)
+EndProcedure
+
+Procedure.i gem_Wr(off.i, v.i)
+  If off < 0 Or (off & 3) <> 0 Or (off + 4) > #GEM_SIZE
+    gem_err = #GEM_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  PokeL(#GEM_BASE + off, v & $FFFFFFFF)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i gem_WrSync(off.i, v.i)
+  If gem_Wr(off, v) = 0
+    ProcedureReturn 0
+  EndIf
+  gem_Rd(off)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i gem_CfgRd(off.i)
+  If off < 0 Or (off & 3) <> 0 Or (off + 4) > #GEM_CFG_SIZE
+    gem_err = #GEM_ERR_RANGE
+    ProcedureReturn #GEM_ERR_RANGE
+  EndIf
+  ProcedureReturn PeekN(#GEM_CFG_BASE + off)
+EndProcedure
+
+Procedure.i gem_CfgWr(off.i, v.i)
+  If off < 0 Or (off & 3) <> 0 Or (off + 4) > #GEM_CFG_SIZE
+    gem_err = #GEM_ERR_RANGE
+    ProcedureReturn 0
+  EndIf
+  PokeL(#GEM_CFG_BASE + off, v & $FFFFFFFF)
+  PeekN(#GEM_CFG_BASE + off)
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  RP1 AND THE PROBE
+; ======================================================================
+; RP1 IS ONLY REACHABLE WHILE ITS PCIe LINK IS UP. With the link down
+; (config.txt without pciex4_reset=0) the first access HANGS THE CORE -
+; measured on the first Pi 5 boot, vault HARDWARE-BRINGUP.md. So nothing
+; in this file touches $1F_xxxx_xxxx before pcie.pi4 has proved the link,
+; the inbound window and RP1's identity; those three calls are cached
+; there and cost one flag test after the first time.
+Procedure.i gem_Rp1Up()
+  If PcieInit() = 0
+    ProcedureReturn 0
+  EndIf
+  If PcieEnumerate() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Is a GEM with 64-bit DMA there, and may RP1 master the bus? 1 or 0 with
+; GemError(). MID's IDNUM of 2 or more is how macb tells a GEM from the
+; older MACB; DCFG6.DAW64 is the 64-bit address capability this board
+; cannot do without; DCFG1 carries the bus width NCFGR.DBW must match.
+Procedure.i GemProbe()
+  Define mid.i
+  gem_err = #GEM_ERR_NONE
+  gem_probed = 0
+  If gem_Rp1Up() = 0
+    gem_err = #GEM_ERR_RP1
+    ProcedureReturn 0
+  EndIf
+  ; rp1.c's pci_set_master(): without Bus Master Enable every descriptor
+  ; fetch is refused on the link. Idempotent; xhci.pi4's path calls it too.
+  If PcieEnableDma() = 0
+    gem_err = #GEM_ERR_BUSMASTER
+    ProcedureReturn 0
+  EndIf
+  mid = gem_Rd(#GEM_MID)
+  gem_mid = mid
+  If mid < 0 Or mid = $FFFFFFFF Or ((mid >> #GEM_MID_IDNUM_SHIFT) & $FFF) < 2
+    gem_err = #GEM_ERR_VERSION
+    ProcedureReturn 0
+  EndIf
+  gem_dcfg1 = gem_Rd(#GEM_DCFG1)
+  gem_dcfg6 = gem_Rd(#GEM_DCFG6)
+  If (gem_dcfg6 & #GEM_DCFG6_DAW64) = 0
+    gem_err = #GEM_ERR_NO_DMA64
+    ProcedureReturn 0
+  EndIf
+  gem_probed = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GemMid()
+  ProcedureReturn gem_mid
+EndProcedure
+
+; NCFGR.DBW for DCFG1.DBWDEF, as macb_dbw: 4 -> 128-bit (2), 2 -> 64-bit
+; (1), anything else 32-bit (0).
+Procedure.i gem_Dbw()
+  Define d.i
+  d = (gem_dcfg1 >> #GEM_DCFG1_DBWDEF_SHIFT) & 7
+  If d = 4
+    ProcedureReturn 2 << #GEM_NCFGR_DBW_SHIFT
+  EndIf
+  If d = 2
+    ProcedureReturn 1 << #GEM_NCFGR_DBW_SHIFT
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The management port: MDC divider and bus width into NCFGR (keeping
+; every other bit), then NCR.MPE. Harmless on a running MAC - both fields
+; are what GemStart writes anyway.
+Procedure gem_MdioEnable()
+  Define v.i
+  v = gem_Rd(#GEM_NCFGR)
+  v = v & ~(#GEM_NCFGR_CLK_MASK | #GEM_NCFGR_DBW_MASK)
+  v = v | (#GEM_MDC_DIV96 << #GEM_NCFGR_CLK_SHIFT) | gem_Dbw()
+  gem_Wr(#GEM_NCFGR, v)
+  v = gem_Rd(#GEM_NCR)
+  gem_WrSync(#GEM_NCR, v | #GEM_NCR_MPE)
+EndProcedure
+
+; ======================================================================
+;  MDIO - clause 22 through MAN, idle from NSR
+; ======================================================================
+Procedure.i gem_MdioIdle()
+  Define t0.i
+  Define budget.i
+  Define v.i
+  t0 = Ticks()
+  budget = GemTimeoutTicks(#GEM_MDIO_TIMEOUT_MS)
+  Repeat
+    v = gem_Rd(#GEM_NSR)
+    If v >= 0 And (v & #GEM_NSR_IDLE) <> 0
+      ProcedureReturn 1
+    EndIf
+    If (Ticks() - t0) > budget
+      gem_err = #GEM_ERR_MDIO_BUSY
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+
+Procedure.i GemMdioRead(phy.i, reg.i)
+  If phy < 0 Or phy > 31 Or reg < 0 Or reg > 31
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn #GEM_ERR_ARG
+  EndIf
+  If gem_MdioIdle() = 0
+    ProcedureReturn #GEM_ERR_MDIO_BUSY
+  EndIf
+  gem_Wr(#GEM_MAN, #GEM_MAN_READ | (phy << #GEM_MAN_PHYA_SHIFT) | (reg << #GEM_MAN_REGA_SHIFT))
+  If gem_MdioIdle() = 0
+    ProcedureReturn #GEM_ERR_MDIO_BUSY
+  EndIf
+  ProcedureReturn gem_Rd(#GEM_MAN) & $FFFF
+EndProcedure
+
+Procedure.i GemMdioWrite(phy.i, reg.i, value.i)
+  If phy < 0 Or phy > 31 Or reg < 0 Or reg > 31
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If gem_MdioIdle() = 0
+    ProcedureReturn 0
+  EndIf
+  gem_Wr(#GEM_MAN, #GEM_MAN_WRITE | (phy << #GEM_MAN_PHYA_SHIFT) | (reg << #GEM_MAN_REGA_SHIFT) | (value & $FFFF))
+  If gem_MdioIdle() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  THE PHY
+; ======================================================================
+; Identify. 1 = a BCM54210E-family PHY at address 1; 0 with
+; #GEM_ERR_PHY_NONE when nothing drove MDIO (all ones: the GEM completes
+; a frame whether or not a PHY answers; all zeros: something holds the
+; line low), #GEM_ERR_PHY_ID for any other part, MDIO errors as they came.
+Procedure.i gem_PhyIdentify()
+  Define hi.i
+  Define lo.i
+  hi = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_PHYSID1)
+  If hi < 0
+    ProcedureReturn 0
+  EndIf
+  lo = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_PHYSID2)
+  If lo < 0
+    ProcedureReturn 0
+  EndIf
+  gem_phyId = (hi << 16) | lo
+  If (hi = $FFFF And lo = $FFFF) Or (hi = 0 And lo = 0)
+    gem_err = #GEM_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+  If (gem_phyId & #GEM_PHY_ID_MASK) <> #GEM_PHY_ID
+    gem_err = #GEM_ERR_PHY_ID
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GemPhyId()
+  ProcedureReturn gem_phyId
+EndProcedure
+
+; The PHY's hardware reset, RP1 GPIO 32, ACTIVE LOW, held for 5 ms ([D]).
+; OUT is cleared BEFORE the pin becomes an output, so the line goes
+; straight from whatever the firmware left to "reset asserted" with no
+; high glitch. After release the part is given the same 5 ms before its
+; first MDIO frame - a settling choice made here, not a cited figure.
+Procedure gem_PhyReset()
+  Rp1DigitalWrite(#GEM_PHY_RESET_GPIO, #RP1_PIN_LOW)
+  Rp1PinOutput(#GEM_PHY_RESET_GPIO)
+  gem_DelayMs(#GEM_PHY_RESET_MS)
+  Rp1DigitalWrite(#GEM_PHY_RESET_GPIO, #RP1_PIN_HIGH)
+  gem_DelayMs(#GEM_PHY_RESET_MS)
+  gem_phyResets = gem_phyResets + 1
+EndProcedure
+
+; Find the PHY: if it answers, it is left exactly as it is (a link the
+; firmware trained is not dropped for nothing); if NOTHING answers it may
+; be held in reset, so it is reset once and asked again. 1 answering,
+; 0 not (GemError()). gem_phyWasReset says whether a reset was needed.
+Procedure.i gem_PhyAttach()
+  gem_phyWasReset = 0
+  If gem_PhyIdentify() = 1
+    ProcedureReturn 1
+  EndIf
+  If gem_err <> #GEM_ERR_PHY_NONE
+    ProcedureReturn 0
+  EndIf
+  gem_PhyReset()
+  gem_phyWasReset = 1
+  gem_err = #GEM_ERR_NONE
+  ProcedureReturn gem_PhyIdentify()
+EndProcedure
+
+; bcm54xx_config_clock_delay for RGMII_ID ([B] phy_broadcom.c:73-111):
+;   RX: bcm54xx_auxctl_read(MISC) = write AUX_CTL SELMASK | MISC << 12,
+;       read AUX_CTL ([B] bcm_phy_lib.c:106-113); OR in WREN and SKEW_EN;
+;       bcm54xx_auxctl_write = write AUX_CTL MISC | val (:117-120).
+;   TX: bcm_phy_read_shadow(CLK_CTL) = write SHD SHD_VAL(CLK_CTL), read
+;       SHD, keep SHD_DATA (:242-246); OR in GTXCLK_EN;
+;       bcm_phy_write_shadow = SHD WRITE | SHD_VAL | SHD_DATA (:249-255).
+; The MAC adds no delay (eth_cfg CLKGEN.TXCLKDELEN is cleared in
+; GemStart), so the PHY must add both - which is what "rgmii-id" means.
+Procedure.i gem_PhyRgmiiDelays()
+  Define v.i
+  If GemMdioWrite(#GEM_PHY_ADDR, #GEM_BCM_AUX_CTL, #GEM_BCM_AUXCTL_SELMASK | (#GEM_BCM_AUXCTL_MISC << #GEM_BCM_AUXCTL_RDSHIFT)) = 0
+    ProcedureReturn 0
+  EndIf
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_BCM_AUX_CTL)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  v = v | #GEM_BCM_AUXCTL_WREN | #GEM_BCM_AUXCTL_SKEW
+  If GemMdioWrite(#GEM_PHY_ADDR, #GEM_BCM_AUX_CTL, #GEM_BCM_AUXCTL_MISC | v) = 0
+    ProcedureReturn 0
+  EndIf
+  If GemMdioWrite(#GEM_PHY_ADDR, #GEM_BCM_SHD, #GEM_BCM_CLK_CTL << #GEM_BCM_SHD_SHIFT) = 0
+    ProcedureReturn 0
+  EndIf
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_BCM_SHD)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  v = (v & #GEM_BCM_SHD_DATA) | #GEM_BCM_GTXCLK_EN
+  If GemMdioWrite(#GEM_PHY_ADDR, #GEM_BCM_SHD, #GEM_BCM_SHD_WRITE | (#GEM_BCM_CLK_CTL << #GEM_BCM_SHD_SHIFT) | (v & #GEM_BCM_SHD_DATA)) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; BMSR's link bit LATCHES LOW (IEEE 802.3 22.2.4.2.13): the first read
+; says whether it dropped since the last read, the second says now.
+; 1 up, 0 down, negative an MDIO fault - test for negative first.
+Procedure.i GemPhyLinkUp()
+  Define latched.i
+  Define v.i
+  If gem_probed = 0
+    gem_err = #GEM_ERR_NOT_PROBED
+    ProcedureReturn #GEM_ERR_NOT_PROBED
+  EndIf
+  latched = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_BMSR)
+  If latched < 0
+    ProcedureReturn latched
+  EndIf
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_BMSR)
+  If v < 0
+    ProcedureReturn v
+  EndIf
+  If (v & #GEM_BMSR_LSTATUS) <> 0
+    If (latched & #GEM_BMSR_LSTATUS) = 0
+      gem_linkDrops = gem_linkDrops + 1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Wait for link AND negotiation, bounded by `ms`. 1, or 0 with
+; #GEM_ERR_NO_LINK / #GEM_ERR_ANEG.
+Procedure.i gem_PhyWaitUp(ms.i)
+  Define t0.i
+  Define budget.i
+  Define bmsr.i
+  t0 = Ticks()
+  budget = GemTimeoutTicks(ms)
+  bmsr = 0
+  Repeat
+    bmsr = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_BMSR)
+    If bmsr < 0
+      ProcedureReturn 0
+    EndIf
+    bmsr = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_BMSR)
+    If bmsr < 0
+      ProcedureReturn 0
+    EndIf
+    gem_Progress()
+    If (bmsr & #GEM_BMSR_LSTATUS) <> 0 And (bmsr & #GEM_BMSR_ANEGCOMPLETE) <> 0
+      ProcedureReturn 1
+    EndIf
+    If (Ticks() - t0) > budget
+      Break
+    EndIf
+  ForEver
+  If (bmsr & #GEM_BMSR_LSTATUS) <> 0
+    gem_err = #GEM_ERR_ANEG
+  Else
+    gem_err = #GEM_ERR_NO_LINK
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Restart negotiation with the PHY's own advertisement, powered up and
+; not isolated or looped back (the DT marks this PHY
+; brcm,powerdown-enable, so a previous owner may have left it down).
+Procedure.i gem_PhyRestartAneg()
+  Define v.i
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_BMCR)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  v = v & ~(#GEM_BMCR_PDOWN | #GEM_BMCR_ISOLATE | #GEM_BMCR_LOOPBACK)
+  v = v | #GEM_BMCR_ANENABLE | #GEM_BMCR_ANRESTART
+  If GemMdioWrite(#GEM_PHY_ADDR, #GEM_MII_BMCR, v) = 0
+    ProcedureReturn 0
+  EndIf
+  gem_anegRestarts = gem_anegRestarts + 1
+  ProcedureReturn 1
+EndProcedure
+
+; What the two ends agreed: gigabit from (CTRL1000 << 2) & STAT1000, else
+; ADVERTISE & LPA - the resolution genet.pi4 uses, over the same bits.
+Procedure.i gem_PhyResolve()
+  Define gb.i
+  Define v.i
+  Define lpa.i
+  gem_speed = 10
+  gem_fullDuplex = 0
+  gb = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_STAT1000)
+  If gb < 0
+    ProcedureReturn 0
+  EndIf
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_CTRL1000)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  gb = gb & (v << 2)
+  If (gb & (#GEM_LPA_1000FULL | #GEM_LPA_1000HALF)) <> 0
+    gem_speed = 1000
+    If (gb & #GEM_LPA_1000FULL) <> 0
+      gem_fullDuplex = 1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  v = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_ADVERTISE)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  lpa = GemMdioRead(#GEM_PHY_ADDR, #GEM_MII_LPA)
+  If lpa < 0
+    ProcedureReturn 0
+  EndIf
+  lpa = lpa & v
+  If (lpa & (#GEM_LPA_100FULL | #GEM_LPA_100HALF)) <> 0
+    gem_speed = 100
+    If (lpa & #GEM_LPA_100FULL) <> 0
+      gem_fullDuplex = 1
+    EndIf
+  ElseIf (lpa & #GEM_LPA_10FULL) <> 0
+    gem_fullDuplex = 1
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GemSpeed()
+  ProcedureReturn gem_speed
+EndProcedure
+
+Procedure.i GemFullDuplex()
+  ProcedureReturn gem_fullDuplex
+EndProcedure
+
+; IS A CABLE IN, cheaply and without starting the MAC. The board's
+; EthCableIn. A PHY that answers costs two MDIO reads. A PHY that did
+; NOT answer is reset, and a PHY just out of reset negotiates from
+; scratch, so its link cannot be up for a few seconds whatever is plugged
+; in: in that one case the link is waited for, up to waitMs, rather than
+; answering a "no cable" that no cable could have changed. 1 in, 0 not.
+Procedure.i GemCableIn(waitMs.i)
+  Define t0.i
+  Define budget.i
+  If GemProbe() = 0
+    ProcedureReturn 0
+  EndIf
+  gem_MdioEnable()
+  If gem_PhyAttach() = 0
+    ProcedureReturn 0
+  EndIf
+  If gem_phyWasReset = 0 Or waitMs <= 0
+    If GemPhyLinkUp() = 1
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn 0
+  EndIf
+  t0 = Ticks()
+  budget = GemTimeoutTicks(waitMs)
+  Repeat
+    If GemPhyLinkUp() = 1
+      ProcedureReturn 1
+    EndIf
+    gem_Progress()
+  Until (Ticks() - t0) > budget
+  ProcedureReturn 0
+EndProcedure
+
+; ======================================================================
+;  THE HARDWARE ADDRESS AND THE REGION
+; ======================================================================
+; SA1B = bytes 0..3 little-endian, SA1T = bytes 4..5. The images are
+; built here and written in GemStart, bottom then top: writing the bottom
+; half disables the filter until the top is written.
+Procedure.i GemSetMac(*mac)
+  Define i.i
+  Define zero.i
+  If *mac = 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If (PeekA(*mac) & 1) <> 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  zero = 1
+  For i = 0 To 5
+    If PeekA(*mac + i) <> 0
+      zero = 0
+    EndIf
+  Next
+  If zero = 1
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  gem_sab = PeekA(*mac) | (PeekA(*mac + 1) << 8) | (PeekA(*mac + 2) << 16) | (PeekA(*mac + 3) << 24)
+  gem_sat = PeekA(*mac + 4) | (PeekA(*mac + 5) << 8)
+  gem_macSet = 1
+  ProcedureReturn 1
+EndProcedure
+
+; The caller's region: 64-byte aligned, at least #GEM_REGION_MIN, and
+; wholly inside pcie2's inbound window (PcieDmaOk) - memory RP1 can reach.
+Procedure.i GemSetRegion(base.i, bytes.i)
+  If base <= 0 Or (base % #GEM_LINE) <> 0 Or bytes < #GEM_REGION_MIN
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If PcieDmaOk(base, bytes) = 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  gem_region = base
+  gem_regionBytes = bytes
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GemRegion()
+  ProcedureReturn gem_region
+EndProcedure
+
+; One 64-bit descriptor address: the high word first, the low word LAST,
+; because on RX the low word carries USED and the moment USED clears the
+; GEM may take the descriptor - its high half must already be there.
+Procedure gem_DescAddr(d.i, bus.i, flags.i)
+  PokeL(d + #GEM_DESC_ADDRH, (bus >> 32) & $FFFFFFFF)
+  PokeL(d + #GEM_DESC_PAD, 0)
+  gem_Barrier()
+  PokeL(d + #GEM_DESC_ADDR, (bus & $FFFFFFFF) | flags)
+EndProcedure
+
+Procedure.i gem_RxBuf(i.i)
+  ProcedureReturn gem_region + #GEM_OFF_RXBUF + i * #GEM_BUF_BYTES
+EndProcedure
+
+; Hand one whole line of RX descriptors - four, `first` a multiple of 4
+; - to the GEM: control 0, the buffer's bus address with USED CLEAR
+; (the GEM owns it), WRAP on the ring's last. Then clean the line. Every
+; byte of the line is written, so no stale neighbour rides back to DRAM.
+Procedure gem_RxArmLine(first.i)
+  Define i.i
+  Define d.i
+  Define f.i
+  For i = first To first + 3
+    d = gem_region + #GEM_OFF_RXRING + i * #GEM_DESC_SIZE
+    PokeL(d + #GEM_DESC_CTRL, 0)
+    f = 0
+    If i = #GEM_RX_DESCS - 1
+      f = #GEM_RX_WRAP
+    EndIf
+    gem_DescAddr(d, PcieDmaBus(gem_RxBuf(i)), f)
+  Next
+  gem_CacheRange(gem_region + #GEM_OFF_RXRING + first * #GEM_DESC_SIZE, #GEM_LINE)
+EndProcedure
+
+; Both rings from nothing. TX: every descriptor USED (the CPU owns it),
+; WRAP on the last. RX: every line armed. The tie-off descriptors give
+; queues 1..7 - which this polled driver does not use - a USED|WRAP
+; descriptor each way so they find nothing to do. Then the whole
+; region's lines are cleaned and dropped: a payload or an earlier run may
+; have left dirty lines over the buffers, and a dirty line written back
+; later would land on top of a frame the GEM had just received.
+Procedure gem_RingsInit()
+  Define i.i
+  Define d.i
+  Define f.i
+  For i = 0 To #GEM_TX_DESCS - 1
+    d = gem_region + #GEM_OFF_TXRING + i * #GEM_DESC_SIZE
+    gem_DescAddr(d, 0, 0)
+    f = #GEM_TX_USED
+    If i = #GEM_TX_DESCS - 1
+      f = f | #GEM_TX_WRAP
+    EndIf
+    PokeL(d + #GEM_DESC_CTRL, f)
+  Next
+  d = gem_region + #GEM_OFF_TXTIE
+  gem_DescAddr(d, 0, 0)
+  PokeL(d + #GEM_DESC_CTRL, #GEM_TX_USED | #GEM_TX_WRAP)
+  d = gem_region + #GEM_OFF_RXTIE
+  PokeL(d + #GEM_DESC_CTRL, 0)
+  gem_DescAddr(d, 0, #GEM_RX_USED | #GEM_RX_WRAP)
+  gem_CacheRange(gem_region, #GEM_OFF_RXBUF + #GEM_RX_DESCS * #GEM_BUF_BYTES)
+  i = 0
+  While i < #GEM_RX_DESCS
+    gem_RxArmLine(i)
+    i = i + 4
+  Wend
+  gem_txHead = 0
+  gem_rxTail = 0
+EndProcedure
+
+; Queue pointers, written only while RE and TE are off: the ONE high
+; word for all queues, then queue 0's low words, then the tie-offs for
+; every other queue DCFG6 says exists.
+Procedure gem_QueuePointers()
+  Define q.i
+  Define rx.i
+  Define tx.i
+  rx = PcieDmaBus(gem_region + #GEM_OFF_RXRING)
+  tx = PcieDmaBus(gem_region + #GEM_OFF_TXRING)
+  gem_Wr(#GEM_RBQPH, (rx >> 32) & $FFFFFFFF)
+  gem_Wr(#GEM_TBQPH, (tx >> 32) & $FFFFFFFF)
+  gem_Wr(#GEM_RBQP, rx & $FFFFFFFF)
+  gem_Wr(#GEM_TBQP, tx & $FFFFFFFF)
+  For q = 1 To 7
+    If (gem_dcfg6 & (1 << q)) <> 0
+      gem_Wr(#GEM_Q_RBQP + (q - 1) * 4, PcieDmaBus(gem_region + #GEM_OFF_RXTIE) & $FFFFFFFF)
+      gem_Wr(#GEM_Q_TBQP + (q - 1) * 4, PcieDmaBus(gem_region + #GEM_OFF_TXTIE) & $FFFFFFFF)
+      gem_Wr(#GEM_Q_IDR + (q - 1) * 4, $FFFFFFFF)
+      gem_Rd(#GEM_Q_ISR + (q - 1) * 4)
+    EndIf
+  Next
+EndProcedure
+
+; ======================================================================
+;  STOP - the payload boundary. Idempotent, probe-independent.
+; ======================================================================
+; RE and TE off, MPE kept, read back. 1 when NCR reads back with both
+; clear - or when RP1's PCIe link is down, because then nothing on RP1
+; can master the bus at all and there is nothing to stop (touching RP1
+; with the link down would hang the core, which is the one outcome worse
+; than an unproved stop).
+;
+; THE LINK TEST IS PcieLinkUp, NOT PcieInit, ON PURPOSE. PcieInit reports
+; its phases through the board's hook, which prints, and printing can
+; reach the network console's flush - HwLinkSend - GemSend - which calls
+; this on a transmit timeout. The compiler refuses that loop (no
+; recursion on any target), and it is right to: PcieLinkUp is one read
+; of pcie2's own status register, on the SoC side, and cannot hang.
+Procedure.i GemStopChecked()
+  Define v.i
+  gem_started = 0
+  If PcieLinkUp() = 0
+    ProcedureReturn 1
+  EndIf
+  v = gem_Rd(#GEM_NCR)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  gem_WrSync(#GEM_NCR, v & ~(#GEM_NCR_RE | #GEM_NCR_TE))
+  gem_Barrier()
+  v = gem_Rd(#GEM_NCR)
+  If v < 0 Or (v & (#GEM_NCR_RE | #GEM_NCR_TE)) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i GemStop()
+  ProcedureReturn GemStopChecked()
+EndProcedure
+
+; ======================================================================
+;  START
+; ======================================================================
+;  1  eth_cfg: memory powered, the RGMII clock generator running, no
+;     MAC-side TX delay, speed taken from the MAC ([R] Tables 134, 139)
+;  2  RE/TE off; NCFGR = MDC divider | DBW; USRIO = RGMII; NCR = MPE
+;  3  the PHY: found (reset once if silent), identified, RGMII delays
+;  4  rings, then queue pointers (RE/TE off, so the GEM takes them)
+;  5  statistics cleared, status cleared, every interrupt masked (polled)
+;  6  SA1 bottom then top; SA2..SA4 zeroed
+;  7  NCFGR |= DRFCS | BIG; AMP from the DT; DMACFG RXBS 24 | burst 16 |
+;     RXBMS | TXPBMS | ADDR64, no endian swap, no checksum offload, no
+;     timestamp words
+;  8  negotiate: link and completion within linkMs; resolve speed/duplex
+;  9  NCFGR: SPD / GBE / FD to match; PAE clear (no pause honoured)
+; 10  NCR |= RE | TE, read back
+; 1 up, 0 with GemError(). A failure part-way leaves the MAC stopped
+; (RE/TE were never set) - the board's checked stop proves it anyway.
+Procedure.i GemStart(linkMs.i)
+  Define v.i
+  Define q.i
+  gem_started = 0
+  If gem_probed = 0
+    gem_err = #GEM_ERR_NOT_PROBED
+    ProcedureReturn 0
+  EndIf
+  If gem_macSet = 0
+    gem_err = #GEM_ERR_NO_MAC
+    ProcedureReturn 0
+  EndIf
+  If gem_region = 0
+    gem_err = #GEM_ERR_NO_REGION
+    ProcedureReturn 0
+  EndIf
+  If linkMs <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  gem_err = #GEM_ERR_NONE
+
+  ; ---- 1: eth_cfg
+  v = gem_CfgRd(#GEM_CFG_STATUS)
+  If v < 0
+    ProcedureReturn 0
+  EndIf
+  If (v & #GEM_STAT_AXI_ILLEGAL) <> 0
+    ; [R] Table 135: "Will need block reset, and maybe system reset".
+    gem_err = #GEM_ERR_AXI
+    ProcedureReturn 0
+  EndIf
+  v = gem_CfgRd(#GEM_CFG_CONTROL)
+  If (v & #GEM_CTRL_MEM_PD) <> 0
+    gem_CfgWr(#GEM_CFG_CONTROL, v & ~#GEM_CTRL_MEM_PD)
+  EndIf
+  v = gem_CfgRd(#GEM_CFG_CLKGEN)
+  v = v & ~(#GEM_CLK_KILL | #GEM_CLK_TXCLKDELEN | #GEM_CLK_OVERRIDE)
+  gem_CfgWr(#GEM_CFG_CLKGEN, v | #GEM_CLK_ENABLE)
+
+  ; ---- 2: the MAC stopped, the management port on
+  v = gem_Rd(#GEM_NCR)
+  gem_WrSync(#GEM_NCR, v & ~(#GEM_NCR_RE | #GEM_NCR_TE))
+  gem_Wr(#GEM_NCFGR, (#GEM_MDC_DIV96 << #GEM_NCFGR_CLK_SHIFT) | gem_Dbw())
+  gem_Wr(#GEM_USRIO, #GEM_USRIO_RGMII)
+  gem_WrSync(#GEM_NCR, #GEM_NCR_MPE)
+
+  ; ---- 3: the PHY
+  If gem_PhyAttach() = 0
+    ProcedureReturn 0
+  EndIf
+  If gem_PhyRgmiiDelays() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 4: rings, then pointers
+  gem_RingsInit()
+  gem_QueuePointers()
+
+  ; ---- 5: statistics, status, interrupts
+  gem_WrSync(#GEM_NCR, #GEM_NCR_MPE | #GEM_NCR_CLRSTAT)
+  For q = 0 To 63
+    gem_stat[q] = 0
+  Next
+  gem_Wr(#GEM_TSR, $FFFFFFFF)
+  gem_Wr(#GEM_RSR, $FFFFFFFF)
+  gem_Wr(#GEM_IDR, $FFFFFFFF)
+  gem_Rd(#GEM_ISR)
+  gem_Wr(#GEM_ISR, $FFFFFFFF)
+
+  ; ---- 6: the station address
+  gem_Wr(#GEM_SA1B, gem_sab)
+  gem_Wr(#GEM_SA1T, gem_sat)
+  For q = 1 To 3
+    gem_Wr(#GEM_SA1B + q * 8, 0)
+    gem_Wr(#GEM_SA1T + q * 8, 0)
+  Next
+
+  ; ---- 7: frame format, AXI, DMA
+  gem_Wr(#GEM_NCFGR, (#GEM_MDC_DIV96 << #GEM_NCFGR_CLK_SHIFT) | gem_Dbw() | #GEM_NCFGR_DRFCS | #GEM_NCFGR_BIG)
+  v = gem_Rd(#GEM_AMP)
+  gem_Wr(#GEM_AMP, (v & ~#GEM_AMP_FIELDS) | #GEM_AMP_WANT)
+  v = gem_Rd(#GEM_DMACFG)
+  v = v & ~(#GEM_DMACFG_RXBS_MASK | #GEM_DMACFG_FBLDO_MASK | #GEM_DMACFG_ENDIA_PKT | #GEM_DMACFG_ENDIA_DESC | #GEM_DMACFG_TXCOEN | #GEM_DMACFG_RXEXT | #GEM_DMACFG_TXEXT)
+  v = v | ((#GEM_BUF_BYTES / 64) << #GEM_DMACFG_RXBS_SHIFT) | #GEM_BURST | #GEM_DMACFG_RXBMS | #GEM_DMACFG_TXPBMS | #GEM_DMACFG_ADDR64
+  gem_Wr(#GEM_DMACFG, v)
+
+  ; ---- 8: the link
+  If gem_PhyRestartAneg() = 0
+    ProcedureReturn 0
+  EndIf
+  If gem_PhyWaitUp(linkMs) = 0
+    ProcedureReturn 0
+  EndIf
+  If gem_PhyResolve() = 0
+    ProcedureReturn 0
+  EndIf
+
+  ; ---- 9: the MAC follows the PHY
+  v = gem_Rd(#GEM_NCFGR)
+  v = v & ~(#GEM_NCFGR_SPD | #GEM_NCFGR_FD | #GEM_NCFGR_PAE | #GEM_NCFGR_GBE)
+  If gem_speed = 100
+    v = v | #GEM_NCFGR_SPD
+  ElseIf gem_speed = 1000
+    v = v | #GEM_NCFGR_GBE
+  EndIf
+  If gem_fullDuplex = 1
+    v = v | #GEM_NCFGR_FD
+  EndIf
+  gem_Wr(#GEM_NCFGR, v)
+
+  ; ---- 10: on
+  gem_Barrier()
+  gem_WrSync(#GEM_NCR, #GEM_NCR_MPE | #GEM_NCR_RE | #GEM_NCR_TE)
+  gem_started = 1
+  gem_startCount = gem_startCount + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  SEND - one frame, one descriptor, waited for
+; ======================================================================
+; The frame is COPIED into this driver's own TX buffer (padded to 60
+; bytes), so the caller's buffer may be anywhere and is free the moment
+; this returns. The descriptor after it is (re)marked USED first - the
+; end of the queue - then the frame's descriptor gets its address and,
+; last, its control word with USED clear. Both lines are cleaned, then
+; NCR.TSTART (read back: posted write). The GEM sets USED in the frame's
+; descriptor when it is done; that is what is waited for, the line
+; invalidated before every look.
+;
+; A TIMEOUT STOPS THE MAC. A descriptor the GEM never handed back is a
+; ring whose state nobody knows; the next command's bring-up rebuilds it
+; from nothing, which HwLinkReady and eth_HwUp notice by GemStarted().
+Procedure.i GemSend(*frame, length.i, timeoutMs.i)
+  Define d.i
+  Define nd.i
+  Define nxt.i
+  Define buf.i
+  Define n.i
+  Define i.i
+  Define ctrl.i
+  Define t0.i
+  Define budget.i
+  Define tsr.i
+  If gem_started = 0
+    gem_err = #GEM_ERR_NOT_STARTED
+    ProcedureReturn 0
+  EndIf
+  If *frame = 0 Or length < 14 Or length > #GEM_FRAME_MAX Or timeoutMs <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  buf = gem_region + #GEM_OFF_TXBUF + gem_txHead * #GEM_BUF_BYTES
+  i = 0
+  While i < length
+    PokeB(buf + i, PeekA(*frame + i))
+    i = i + 1
+  Wend
+  n = length
+  While n < #GEM_FRAME_MIN
+    PokeB(buf + n, 0)
+    n = n + 1
+  Wend
+  gem_CacheRange(buf, n)
+
+  d = gem_region + #GEM_OFF_TXRING + gem_txHead * #GEM_DESC_SIZE
+  nxt = (gem_txHead + 1) % #GEM_TX_DESCS
+  nd = gem_region + #GEM_OFF_TXRING + nxt * #GEM_DESC_SIZE
+  If nxt = #GEM_TX_DESCS - 1
+    PokeL(nd + #GEM_DESC_CTRL, #GEM_TX_USED | #GEM_TX_WRAP)
+  Else
+    PokeL(nd + #GEM_DESC_CTRL, #GEM_TX_USED)
+  EndIf
+  gem_DescAddr(d, PcieDmaBus(buf), 0)
+  gem_Barrier()
+  ctrl = (n & #GEM_TX_LEN) | #GEM_TX_LAST
+  If gem_txHead = #GEM_TX_DESCS - 1
+    ctrl = ctrl | #GEM_TX_WRAP
+  EndIf
+  PokeL(d + #GEM_DESC_CTRL, ctrl)
+  gem_CacheRange(d, #GEM_DESC_SIZE)
+  gem_CacheRange(nd, #GEM_DESC_SIZE)
+
+  gem_WrSync(#GEM_NCR, gem_Rd(#GEM_NCR) | #GEM_NCR_TSTART)
+
+  t0 = Ticks()
+  budget = GemTimeoutTicks(timeoutMs)
+  Repeat
+    gem_CacheRange(d, #GEM_DESC_SIZE)
+    ctrl = PeekN(d + #GEM_DESC_CTRL)
+    If (ctrl & #GEM_TX_USED) <> 0
+      Break
+    EndIf
+    If (Ticks() - t0) > budget
+      GemStopChecked()
+      gem_err = #GEM_ERR_TX_TIMEOUT
+      ProcedureReturn 0
+    EndIf
+  ForEver
+
+  tsr = gem_Rd(#GEM_TSR)
+  gem_lastTsr = tsr
+  gem_Wr(#GEM_TSR, tsr)
+  gem_txHead = nxt
+  If (ctrl & #GEM_TX_FAULTS) <> 0 Or (tsr & #GEM_TSR_FAULTS) <> 0
+    gem_err = #GEM_ERR_TX_FAULT
+    ProcedureReturn 0
+  EndIf
+  gem_txCount = gem_txCount + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ======================================================================
+;  RECEIVE - one look at the ring, never a wait
+; ======================================================================
+; The descriptor at the tail is the CPU's once its USED bit is set. Its
+; control word carries SOF, EOF and the length (FCS already stripped,
+; NCFGR.DRFCS). A frame is copied out after its buffer's lines are
+; invalidated. The descriptor stays USED - the GEM will not touch it -
+; until the fourth descriptor of its line has been consumed, and then
+; the whole line is handed back at once (see the header).
+;
+; >0 the frame's length; 0 nothing there now (not an error); <0 a
+; refusal - the frame is dropped and its descriptor consumed either way.
+Procedure.i GemRecv(*into, capacity.i)
+  Define d.i
+  Define a.i
+  Define ctrl.i
+  Define len.i
+  Define buf.i
+  Define i.i
+  Define r.i
+  If gem_started = 0
+    gem_err = #GEM_ERR_NOT_STARTED
+    ProcedureReturn #GEM_ERR_NOT_STARTED
+  EndIf
+  If *into = 0 Or capacity <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn #GEM_ERR_ARG
+  EndIf
+  d = gem_region + #GEM_OFF_RXRING + gem_rxTail * #GEM_DESC_SIZE
+  gem_CacheRange(d, #GEM_DESC_SIZE)
+  a = PeekN(d + #GEM_DESC_ADDR)
+  If (a & #GEM_RX_USED) = 0
+    ProcedureReturn 0
+  EndIf
+  ctrl = PeekN(d + #GEM_DESC_CTRL)
+  len = ctrl & #GEM_RX_LEN
+  buf = gem_RxBuf(gem_rxTail)
+  r = 0
+  If (ctrl & #GEM_RX_SOF) = 0 Or (ctrl & #GEM_RX_EOF) = 0 Or len > #GEM_BUF_BYTES Or len < 14
+    r = #GEM_ERR_RX_FRAG
+  ElseIf len > capacity
+    r = #GEM_ERR_RX_LONG
+  Else
+    gem_CacheRange(buf, len)
+    i = 0
+    While i < len
+      PokeB(*into + i, PeekA(buf + i))
+      i = i + 1
+    Wend
+    r = len
+  EndIf
+  If (gem_rxTail % 4) = 3
+    gem_RxArmLine(gem_rxTail - 3)
+  EndIf
+  gem_rxTail = (gem_rxTail + 1) % #GEM_RX_DESCS
+  If r < 0
+    gem_err = r
+    gem_rxDrops = gem_rxDrops + 1
+    ProcedureReturn r
+  EndIf
+  gem_rxCount = gem_rxCount + 1
+  ProcedureReturn r
+EndProcedure
+
+; The waiting form. A zero or negative wait is refused: a WAIT of zero is
+; a bad argument, and the seam's "look once" is GemRecv (hw_link.pi4
+; HwLinkRecv, the lesson written there on 2026-09-07).
+Procedure.i GemRecvWait(*into, capacity.i, ms.i)
+  Define t0.i
+  Define budget.i
+  Define n.i
+  If ms <= 0
+    gem_err = #GEM_ERR_ARG
+    ProcedureReturn #GEM_ERR_ARG
+  EndIf
+  t0 = Ticks()
+  budget = GemTimeoutTicks(ms)
+  Repeat
+    n = GemRecv(*into, capacity)
+    If n <> 0
+      ProcedureReturn n
+    EndIf
+    If (Ticks() - t0) > budget
+      ProcedureReturn 0
+    EndIf
+  ForEver
+EndProcedure
+
+; ======================================================================
+;  GETTERS AND COUNTERS
+; ======================================================================
+Procedure.i GemStarted()
+  ProcedureReturn gem_started
+EndProcedure
+
+Procedure.i GemProbed()
+  ProcedureReturn gem_probed
+EndProcedure
+
+Procedure.i GemTxCount()
+  ProcedureReturn gem_txCount
+EndProcedure
+
+Procedure.i GemRxCount()
+  ProcedureReturn gem_rxCount
+EndProcedure
+
+Procedure.i GemRxDrops()
+  ProcedureReturn gem_rxDrops
+EndProcedure
+
+Procedure.i GemLinkDrops()
+  ProcedureReturn gem_linkDrops
+EndProcedure
+
+Procedure.i GemAnegRestarts()
+  ProcedureReturn gem_anegRestarts
+EndProcedure
+
+Procedure.i GemStartCount()
+  ProcedureReturn gem_startCount
+EndProcedure
+
+Procedure.i GemPhyResets()
+  ProcedureReturn gem_phyResets
+EndProcedure
+
+; One statistics counter as a RUNNING TOTAL since the last GemStart. The
+; GEM's counters clear when read, so printing the register would zero it
+; and the next reading would be wrong. Refused unless started, and for an
+; offset outside the counter block.
+Procedure.i GemStat(off.i)
+  Define i.i
+  Define v.i
+  If gem_started = 0
+    ProcedureReturn #GEM_ERR_NOT_STARTED
+  EndIf
+  If off < #GEM_STAT_FIRST Or off > #GEM_STAT_LAST Or (off & 3) <> 0
+    ProcedureReturn #GEM_ERR_RANGE
+  EndIf
+  i = (off - #GEM_STAT_FIRST) / 4
+  v = gem_Rd(off)
+  If v < 0
+    ProcedureReturn v
+  EndIf
+  gem_stat[i] = gem_stat[i] + v
+  ProcedureReturn gem_stat[i]
+EndProcedure
+
+Procedure.i GemError()
+  ProcedureReturn gem_err
+EndProcedure
+
+; Full sentences that keep the code and name the first thing to check.
+Procedure.i GemErrorText()
+  Select gem_err
+    Case #GEM_ERR_NONE
+      ProcedureReturn "gem: no error"
+    Case #GEM_ERR_ARG
+      ProcedureReturn "gem error -1: a parameter was out of range - a frame under 14 or over 1514 bytes, a group or all-zero MAC, a zero wait, or a DMA region that is misaligned, too small or outside RP1's inbound window"
+    Case #GEM_ERR_RANGE
+      ProcedureReturn "gem error -2: a register offset fell outside the GEM's 16 KiB block - an offset was computed wrongly in this monitor"
+    Case #GEM_ERR_RP1
+      ProcedureReturn "gem error -3: RP1 is not reachable over PCIe, so its Ethernet MAC was not touched - check that config.txt has pciex4_reset=0 (the pcie error above says which check failed)"
+    Case #GEM_ERR_BUSMASTER
+      ProcedureReturn "gem error -4: RP1's Bus Master Enable would not set, so the Ethernet DMA could never reach memory"
+    Case #GEM_ERR_VERSION
+      ProcedureReturn "gem error -5: the block at $1F_0010_0000 does not identify as a Cadence GEM (MID) - all ones means nothing decodes there"
+    Case #GEM_ERR_NO_DMA64
+      ProcedureReturn "gem error -6: the GEM reports no 64-bit DMA addressing, and RP1 reaches memory only through bus addresses above $10_0000_0000"
+    Case #GEM_ERR_MDIO_BUSY
+      ProcedureReturn "gem error -7: the MDIO bus never went idle within one second - the management port is not running"
+    Case #GEM_ERR_PHY_NONE
+      ProcedureReturn "gem error -8: nothing answered on MDIO at PHY address 1, even after the PHY was reset on RP1 GPIO 32"
+    Case #GEM_ERR_PHY_ID
+      ProcedureReturn "gem error -9: the PHY at address 1 is not a BCM54210E-family part, so its RGMII delay set-up is not known"
+    Case #GEM_ERR_NO_LINK
+      ProcedureReturn "gem error -10: the PHY reports no link - nothing is plugged into the Ethernet socket, the far end is off, or the cable is bad"
+    Case #GEM_ERR_ANEG
+      ProcedureReturn "gem error -11: the link came up but auto-negotiation never completed - usually a fixed-speed port at the other end"
+    Case #GEM_ERR_NO_MAC
+      ProcedureReturn "gem error -12: no hardware address was given to the GEM (GemSetMac)"
+    Case #GEM_ERR_NO_REGION
+      ProcedureReturn "gem error -13: no DMA region was given to the GEM (GemSetRegion)"
+    Case #GEM_ERR_NOT_STARTED
+      ProcedureReturn "gem error -14: the GEM has not been started"
+    Case #GEM_ERR_NOT_PROBED
+      ProcedureReturn "gem error -15: the GEM has not been probed (GemProbe)"
+    Case #GEM_ERR_TX_TIMEOUT
+      ProcedureReturn "gem error -16: a transmitted frame's descriptor was never handed back, so the MAC was stopped - check that RP1's 125 MHz Ethernet clock is running"
+    Case #GEM_ERR_TX_FAULT
+      ProcedureReturn "gem error -17: the GEM reported the transmission failed (retry limit, bus error or underrun)"
+    Case #GEM_ERR_RX_LONG
+      ProcedureReturn "gem error -18: a received frame was longer than the buffer it was asked into, and was dropped"
+    Case #GEM_ERR_RX_FRAG
+      ProcedureReturn "gem error -19: a received frame was not whole in one receive buffer, and was dropped"
+    Case #GEM_ERR_AXI
+      ProcedureReturn "gem error -20: RP1 flagged an illegal AXI burst from the Ethernet block (eth_cfg STATUS), which needs a block or system reset - power-cycle the board"
+  EndSelect
+  ProcedureReturn "gem: an error code this driver does not know"
+EndProcedure
