@@ -1934,11 +1934,11 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If clears > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one clear (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This slice lowers one clear per submission, so record one clear per command buffer until the backend carries a command list.")
   EndIf
-  If copies > 0 And (clears > 0 Or imageCopies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires buffer-to-image commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
+  If copies > 0 And (clears > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image transfers outside clear, readback, buffer-transfer and render jobs (VkResult -8); no partial command stream was submitted.")
   EndIf
-  If imageCopies > 0 And (clears > 0 Or copies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-copy commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
+  If imageCopies > 0 And (clears > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image transfers outside clear, readback, buffer-transfer and render jobs (VkResult -8); no partial command stream was submitted.")
   EndIf
   If readbacks > 0 And (clears > 0 Or copies > 0 Or imageCopies > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-to-buffer DMA readback commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
@@ -1990,7 +1990,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           If avkImgBackendLayout[target] = 0
             ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an incomplete optimal-image TFU transaction (Anvil code -20004); nothing was submitted.")
           EndIf
-          If copies > 1 And avkBackendImageCopyBatchReady() = 0
+          If copies + imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
             ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order multiple optimal-image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
           EndIf
           copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
@@ -2052,7 +2052,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or incompatible image-copy resource (Anvil code -20004); nothing was submitted.")
     EndIf
     If avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_OPTIMAL And avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_OPTIMAL
-      If imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
+      If copies + imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
         ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order optimal-image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
       EndIf
       tiledCopy\windowBase = avkHeapBase : tiledCopy\windowBytes = avkHeapBytes
@@ -2068,7 +2068,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid optimal-image TFU copy or changed resource layout (Anvil code -20004); nothing was submitted.")
       EndIf
     ElseIf avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_LINEAR And avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_OPTIMAL
-      If imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
+      If copies + imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
         ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order linear-to-optimal image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
       EndIf
       copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
@@ -2242,7 +2242,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
     ProcedureReturn #VK_SUCCESS
   EndIf
-  If imageCopies > 0
+  If imageCopies > 0 Or copies > 0
     o = avkCbOpHead[c]
     While o <> 0
       If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE
@@ -2296,49 +2296,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while copying a Vulkan image region (VkResult -4); the command buffer was invalidated and its fence signalled.")
         EndIf
         EndIf
-      EndIf
-      o = avkOpNext[o]
-    Wend
-    avkFlightComplete(1)
-    ProcedureReturn #VK_SUCCESS
-  EndIf
-  If readbacks > 0
-    o = avkCbOpHead[c]
-    While o <> 0
-      If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
-        sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
-        sourcePitch = avkImgPitch[sourceImageSlot]
-        copyBytes = avkOpSourceBytes[o]
-        copyRows = avkOpSourcePitch[o]
-        destinationPitch = avkOpBufferPitch[o]
-        sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[o]
-        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
-          avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the image-to-buffer readback destination changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
-        EndIf
-        If copyBytes = sourcePitch And copyBytes = destinationPitch
-          job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
-          If job <> #ANVIL_VK_JOB_DONE
-            avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
-          EndIf
-        Else
-          job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
-          If job <> #ANVIL_VK_JOB_DONE
-            avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading Vulkan image rows into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
-          EndIf
-        EndIf
-      EndIf
-      o = avkOpNext[o]
-    Wend
-    avkFlightComplete(1)
-    ProcedureReturn #VK_SUCCESS
-  EndIf
-  If copies > 0
-    o = avkCbOpHead[c]
-    While o <> 0
-      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
         target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
         If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
           copyBytes = avkOpSourcePitch[o]
@@ -2378,7 +2336,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           copy\paddedWidth = avkImgPaddedW[target] : copy\paddedHeight = avkImgPaddedH[target]
           copy\timeoutUs = 250000
           job = avkBackendSubmitImageCopy(@copy)
-          If job < 0 Or (copies > 1 And job <> #ANVIL_VK_JOB_DONE)
+          If job < 0 Or (copies + imageCopies > 1 And job <> #ANVIL_VK_JOB_DONE)
             avkFlightComplete(0)
             ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing ordered vkCmdCopyBufferToImage transfers (VkResult -4); the destination layout was not advanced, the command buffer is invalid and its fence is signalled.")
           EndIf
@@ -2390,7 +2348,39 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf
-
+  If readbacks > 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
+        sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        sourcePitch = avkImgPitch[sourceImageSlot]
+        copyBytes = avkOpSourceBytes[o]
+        copyRows = avkOpSourcePitch[o]
+        destinationPitch = avkOpBufferPitch[o]
+        sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[o]
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
+          avkFlightComplete(0)
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the image-to-buffer readback destination changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
+        EndIf
+        If copyBytes = sourcePitch And copyBytes = destinationPitch
+          job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+        Else
+          job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading Vulkan image rows into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+        EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
+    avkFlightComplete(1)
+    ProcedureReturn #VK_SUCCESS
+  EndIf
   If bufferCopies > 0
     o = avkCbOpHead[c]
     While o <> 0

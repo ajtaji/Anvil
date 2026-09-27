@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 833
+REPORT_WORDS = 840
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1311,6 +1311,13 @@ def grade(cpu, rc) -> Grader:
     g.need("linear-to-optimal copy publishes destination layout", slot(830), 5)
     g.need("linear source retains transfer layout", slot(831), 6)
     g.need("linear-to-optimal copy fence settles", slot(832), 0)
+    g.need("mixed upload then optimal copy recording", slot(833), 0)
+    g.need("mixed upload then optimal copy submission", slot(834), 0)
+    g.need("mixed stream reaches raster TFU once", slot(835), 1)
+    g.need("mixed stream reaches tiled TFU once", slot(836), 1)
+    g.need("mixed stream restores upload source layout", slot(837), 5)
+    g.need("mixed stream publishes copied destination layout", slot(838), 5)
+    g.need("mixed stream fence settles", slot(839), 0)
     g.need("backend failure is reported as device lost", slot(264), -4)
     g.need("failed copy does not publish its final shader-read layout", slot(265), 0)
     g.need("failed-copy fence is settled", slot(266), 0)
