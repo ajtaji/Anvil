@@ -29,7 +29,7 @@ def main():
                     self.refusal_guard=True
                     m.A64.store(self,d+0x200,(1<<29) if value==3 else 0,4)
                     m.A64.store(self,d+0x80,0 if value==4 else 0xffffffff,4)
-                    self.system_registers[0xd51e1100]=0 if value==5 else 0x5b1
+                    self.system_registers[0xd51e1100]=0 if value==5 else 0x5b3
                     if value==6:self.current_el=2
             if d+0x100<=addr<d+0x120:value=self.load(addr,size)|value
             if d+0x180<=addr<d+0x1a0:
@@ -44,7 +44,7 @@ def main():
         build_count.record_build(source,'pi4',image,by='tools/scheduler_context_timer_check.py',compiler=str(compiler))
         cpu=Model();cpu.memory.update({0x400000+i:b for i,b in enumerate(image.read_bytes())})
         cpu.pc,cpu.sp,cpu.x[30]=0x400000,0x3000000,0x7000000
-        cpu.enable_system_registers(el=3,preset={0xd51ec000:0x8000,0xd51800a0:0,0xd51b4220:960,0xd51e1100:0x5b1,0xd51fe220:2,0xd51fe240:1234})
+        cpu.enable_system_registers(el=3,preset={0xd51ec000:0x8000,0xd51800a0:0,0xd51b4220:960,0xd51e1100:0x5b3,0xd51fe220:2,0xd51fe240:1234})
         for addr,value in ((d+0xfe8,0x20),(d+8,0x43b),(c+0xfc,0x0202143b),(d+4,0x407),(d,3),(c,0x1e7),(c+4,255),(d+0x80,0xffffffff),(c+12,1023)):
             m.A64.store(cpu,addr,value,4)
         for steps in range(300000):
