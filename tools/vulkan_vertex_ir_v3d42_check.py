@@ -339,6 +339,13 @@ def grade(cpu, report):
          "scaled vertex emits extra per-vertex QPU instructions for both stages")
     need(tuple(q(cpu,scaled+i*8) for i in (11,12)) == (512,512),
          "scaled vertex preserves viewport conversion")
+    matrix = report + 51*STRIDE*8
+    need(q(cpu,matrix) == 0 and q(cpu,matrix+17*8) == 1,
+         "matrix vertex position plans and lowers")
+    need(tuple(q(cpu,matrix+i*8) for i in (5,6,7,8,9,10)) == (352,336,10,10,6,0),
+         "matrix vertex emits four multiplies and two adds in both stages")
+    need(tuple(q(cpu,matrix+i*8) for i in (11,12)) == (512,512),
+         "matrix vertex preserves viewport conversion")
     b = report + 4*STRIDE*8
     need(q(cpu,b) == (1<<64)-23403 and q(cpu,b+4*8) == 2, "direct vec4 Position exact refusal")
     need(q(cpu,b+17*8) == 1, "direct vec4 refusal preserves four spans/result")

@@ -1382,13 +1382,63 @@ EndProcedure
 ; ----------------------------------------------------------------------
 ;  THE VERTEX PLAN.
 ;
-;  Position must be four components built from the x and y of ONE input,
+;  Position must be four components built from input components,
 ;  a zero z and a one w. That is not a shortcut taken to save work: this
 ;  pipeline has no depth buffer and no perspective divide worth the name,
 ;  so a shader that asks for another z or another w would be asking for
 ;  behaviour the render pass does not have, and a front end that accepted
 ;  it would be promising something the picture would not show.
 ; ----------------------------------------------------------------------
+; The typed vertex backend accepts a bounded binary32 scalar expression
+; graph over attribute components and exact zero/one constants. Validate the
+; same shape here so public pipeline creation does not promise more than the
+; backend can emit.
+Procedure.i avkSpvVertexScalarGraph(x.i, y.i)
+  Define sp.i = 0
+  Define id.i
+  Define src.i
+  Define attr.i
+  Define firstAttr.i = -1
+  Define sawArithmetic.i = 0
+  Dim pending.i[512]
+  Dim seen.i[#ANVIL_SPV_MAX_ID + 1]
+  pending[sp] = x : sp = sp + 1
+  pending[sp] = y : sp = sp + 1
+  While sp > 0
+    sp = sp - 1 : id = pending[sp]
+    If avkSpvIdOk(id) = 0 : ProcedureReturn -1 : EndIf
+    If seen[id] <> 0 : Continue : EndIf
+    If spvValueType[id] = 0 Or avkSpvComponents(spvValueType[id]) <> 1 Or avkSpvIsFloatish(spvValueType[id]) = 0
+      ProcedureReturn -1
+    EndIf
+    Select spvValueSrc[id]
+      Case #ANVIL_SPV_V_CONST
+        If spvConstWord[id] <> 0 And spvConstWord[id] <> $3F800000 : ProcedureReturn -1 : EndIf
+      Case #ANVIL_SPV_V_EXTRACT
+        src = spvValueA[id] : attr = avkSpvAttrOfValue(src)
+        If attr < 0 Or spvPlanAttrComp[attr] < 2 Or spvPlanAttrComp[attr] > 4 Or spvValueB[id] < 0 Or spvValueB[id] >= spvPlanAttrComp[attr]
+          ProcedureReturn -1
+        EndIf
+        If firstAttr < 0 : firstAttr = attr : EndIf
+      Case #ANVIL_SPV_V_FADD
+        sawArithmetic = 1
+        If sp > 509 : ProcedureReturn -1 : EndIf
+        pending[sp] = spvValueA[id] : sp = sp + 1
+        pending[sp] = spvValueB[id] : sp = sp + 1
+      Case #ANVIL_SPV_V_FMUL
+        sawArithmetic = 1
+        If sp > 509 : ProcedureReturn -1 : EndIf
+        pending[sp] = spvValueA[id] : sp = sp + 1
+        pending[sp] = spvValueB[id] : sp = sp + 1
+      Default
+        ProcedureReturn -1
+    EndSelect
+    seen[id] = 1
+  Wend
+  If sawArithmetic = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn firstAttr
+EndProcedure
+
 Procedure.i avkSpvBuildVertexPlan()
   Define v.i
   Define n.i
@@ -1442,9 +1492,15 @@ Procedure.i avkSpvBuildVertexPlan()
   If spvKind[c3] <> #ANVIL_SPV_K_CONST Or spvConstWord[c3] <> $3F800000
     ProcedureReturn avkSpvRefuse(#SpvOpStore, "the SPIR-V front end refused a vertex shader whose gl_Position.w is not the constant 1.0 (Anvil code -20005, unsupported position); this slice emits no perspective divide, so a w other than one would change the picture in a way the emitted shader would not carry out.")
   EndIf
-  ; A second vec2 input can scale XY in the vertex QPU. Both products must
-  ; preserve component order and consume whole Location inputs; a general
-  ; arithmetic graph is still withheld until its complete lowering exists.
+  ; Preserve the existing direct and scaled forms, then admit the bounded
+  ; scalar graph handled by the typed vertex backend.
+  k = avkSpvVertexScalarGraph(c0, c1)
+  If k >= 0
+    spvPlanPosAttr = k
+    ProcedureReturn avkSpvCheckVertexVaryings()
+  EndIf
+
+  ; Retain the older diagnostic for unsupported scaled expressions.
   If spvValueSrc[c0] = #ANVIL_SPV_V_FMUL And spvValueSrc[c1] = #ANVIL_SPV_V_FMUL
     a0 = spvValueA[c0] : a1 = spvValueA[c1]
     a2 = spvValueB[c0] : a3 = spvValueB[c1]

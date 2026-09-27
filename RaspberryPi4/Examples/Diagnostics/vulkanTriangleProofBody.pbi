@@ -286,7 +286,7 @@ CompilerEndIf
 #VTP_X2 = $3F000000                    ;  0.5
 #VTP_Y2 = $3F000000                    ;  0.5
 CompilerIf #VTP_PYRAMID_DEMO
-#VTP_STRIDE = 32                       ; vec2 position + vec4 colour + vec2 perspective scale
+#VTP_STRIDE = 48                       ; vec4 object/scale + colour + vec4 transform coefficients
 CompilerElse
 #VTP_STRIDE = 24                       ; vec2 position + vec4 colour
 CompilerEndIf
@@ -546,40 +546,43 @@ EndProcedure
 CompilerEndIf
 
 CompilerIf #VTP_PYRAMID_DEMO
-Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, scale.f, r.i, g.i, b.i)
+Global vtpRowX0.f, vtpRowX2.f
+Global vtpRowY0.f, vtpRowY2.f
+
+Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, z.f, scale.f, r.i, g.i, b.i)
   Define p.i = base + index * #VTP_STRIDE
-  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@y))
-  PokeL(p + 8, r) : PokeL(p + 12, g)
-  PokeL(p + 16, b) : PokeL(p + 20, #VTP_F_ONE)
-  PokeL(p + 24, PeekL(@scale)) : PokeL(p + 28, PeekL(@scale))
+  Define fixedY.f = y * 0.91 * 0.72
+  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@z))
+  PokeL(p + 8, PeekL(@fixedY)) : PokeL(p + 12, PeekL(@scale))
+  PokeL(p + 16, r) : PokeL(p + 20, g)
+  PokeL(p + 24, b) : PokeL(p + 28, #VTP_F_ONE)
+  PokeL(p + 32, PeekL(@vtpRowX0)) : PokeL(p + 36, PeekL(@vtpRowX2))
+  PokeL(p + 40, PeekL(@vtpRowY0)) : PokeL(p + 44, PeekL(@vtpRowY2))
 EndProcedure
 
 Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
   Define Dim x.f[5]
   Define Dim y.f[5]
   Define Dim z.f[5]
-  Define Dim sx.f[5]
-  Define Dim sy.f[5]
   Define Dim depth.f[5]
   Define Dim scales.f[5]
   Define Dim faceDepth.f[4]
   Define Dim order.i[4]
   Define i.i, j.i, face.i, a.i, b.i, d.i, tmp.i
-  Define xx.f, zz.f, scale.f
+  Define zz.f, scale.f
   Define red.i, green.i, blue.i
+  vtpRowX0 = ca * 0.82 : vtpRowX2 = sa * 0.82
+  vtpRowY0 = sa * 0.42 * 0.72 : vtpRowY2 = 0.0 - ca * 0.42 * 0.72
   x[0] = 0.0 : y[0] = 1.25 : z[0] = 0.0
   x[1] = -1.0 : y[1] = -0.80 : z[1] = -1.0
   x[2] = 1.0 : y[2] = -0.80 : z[2] = -1.0
   x[3] = 1.0 : y[3] = -0.80 : z[3] = 1.0
   x[4] = -1.0 : y[4] = -0.80 : z[4] = 1.0
   For i = 0 To 4
-    xx = x[i] * ca + z[i] * sa
     zz = z[i] * ca - x[i] * sa
     depth[i] = zz * 0.91 + y[i] * 0.42
     scale = 1.65 / (3.6 - depth[i])
     scales[i] = scale
-    sx[i] = xx * 0.82
-    sy[i] = (y[i] * 0.91 - zz * 0.42) * 0.72
   Next
   For face = 0 To 3
     order[face] = face
@@ -604,9 +607,9 @@ Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
       Default : red = $3F333333 : green = $3E99999A : blue = $3F666666
     EndSelect
     d = i * 3
-    vtpPyramidVertex(base, d + 0, sx[0], sy[0], scales[0], red, green, blue)
-    vtpPyramidVertex(base, d + 1, sx[a], sy[a], scales[a], red, green, blue)
-    vtpPyramidVertex(base, d + 2, sx[b], sy[b], scales[b], red, green, blue)
+    vtpPyramidVertex(base, d + 0, x[0], y[0], z[0], scales[0], red, green, blue)
+    vtpPyramidVertex(base, d + 1, x[a], y[a], z[a], scales[a], red, green, blue)
+    vtpPyramidVertex(base, d + 2, x[b], y[b], z[b], scales[b], red, green, blue)
   Next
 EndProcedure
 CompilerEndIf
@@ -740,7 +743,7 @@ CompilerEndIf
   Define pcr.VkPushConstantRange
   Define Dim stages.VkPipelineShaderStageCreateInfo[2]
   Define bind.VkVertexInputBindingDescription
-  Define Dim attrs.VkVertexInputAttributeDescription[3]
+  Define Dim attrs.VkVertexInputAttributeDescription[4]
   Define vi.VkPipelineVertexInputStateCreateInfo
   Define ia.VkPipelineInputAssemblyStateCreateInfo
   Define vpstate.VkPipelineViewportStateCreateInfo
@@ -1188,12 +1191,16 @@ CompilerEndIf
   attrs[1]\location = 1
   attrs[1]\binding = 0
   attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+CompilerIf #VTP_PYRAMID_DEMO
+  attrs[1]\offset = 16
+CompilerElse
   attrs[1]\offset = 8
+CompilerEndIf
 CompilerIf #VTP_PYRAMID_DEMO
   attrs[2]\location = 2
   attrs[2]\binding = 0
-  attrs[2]\format = #VK_FORMAT_R32G32_SFLOAT
-  attrs[2]\offset = 24
+  attrs[2]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  attrs[2]\offset = 32
 CompilerEndIf
   vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
   vi\vertexBindingDescriptionCount = 1
@@ -1254,6 +1261,7 @@ CompilerEndIf
   stages[0]\module = vsB
   stages[1]\module = fsB
 CompilerIf #VTP_PYRAMID_DEMO
+  attrs[0]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
   vi\vertexAttributeDescriptionCount = 3
 CompilerElse
   vi\vertexAttributeDescriptionCount = 2

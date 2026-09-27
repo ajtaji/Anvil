@@ -2,18 +2,16 @@
 
 `RaspberryPi4/Examples/Diagnostics/vulkanPyramidDemo.pi4` is a returning RAM
 payload. It rotates a square pyramid through 12 angles over one revolution.
-Each frame updates five projected 3D points and back-to-front face order on
-the CPU, then records one public Vulkan render pass with a 12-vertex triangle
+The initial version updated five projected 3D points and back-to-front face order on
+the CPU each frame, then recorded one public Vulkan render pass with a 12-vertex triangle
 draw. V3D fetches and shades the vertices and rasterizes the four coloured
 faces. A guarded display DMA transfer presents the completed attachment on
 each frame. The payload checks for V3D faults and verifies 12 completed draws
 and 12 DMA presentations before returning zero.
 
-The production Pi 4 backend currently accepts two-dimensional position and
-colour attributes. The CPU projection is five points per frame; none of the
-triangle pixels are drawn by a CPU fallback. GPU matrix transform and a depth
-attachment need additional vertex-shader and pipeline support before this
-demo can move its transform and visibility calculation to V3D.
+The initial backend accepted two-dimensional position and colour attributes.
+The CPU projection was five points per frame; none of the triangle pixels were
+drawn by a CPU fallback. Later GPU transform work is described below.
 
 The final PMFBOOT v2 container is
 `docs/evidence/vulkan-pyramid-demo-20260927/vulkanPyramidDemo.img.pmf`.
@@ -54,7 +52,7 @@ places the unscaled rotated XY numerator and perspective scale in separate
 attributes, so its final per-vertex projection multiply runs on V3D.
 Rotation, reciprocal scale calculation, face ordering, and vertex-buffer
 updates still run on the CPU. A general matrix transform, nonconstant clip Z/W,
-and depth attachment remain future work.
+and depth attachment were not supported by that first follow-up.
 
 The final-source RAM payload and capture are in
 `docs/evidence/vulkan-pyramid-gpu-scale-20260927/`. The PMFBOOT v2 container is
@@ -64,3 +62,35 @@ On monitor build 210, the board verified the upload, returned `x0=0` after
 10.1 seconds, and produced fresh capture 76. The V3D console was restored;
 the deadman and capture were off and coretest leases were zero. No reset,
 flash, or boot-medium write was made.
+
+## GPU per-vertex matrix arithmetic
+
+The vertex front end now accepts a bounded scalar `FAdd`/`FMul` expression
+graph over vertex input components and exact zero/one constants. The V3D 4.2
+vertex-pair lowerer emits that arithmetic in both the coordinate and vertex
+QPU programs and reuses registers after their final use. The pyramid sends its
+object coordinates, perspective scale, colour, and four changing rotation
+coefficients as three vertex attributes. V3D computes the two XY rotation
+numerators and their perspective-scale products for each vertex before
+viewport conversion and rasterization.
+
+The CPU still updates the frame's sine/cosine coefficients, preweights the
+fixed pitch term of object Y, computes reciprocal perspective scale and face
+order, and uploads the vertex buffer. Clip Z/W remain fixed at zero/one, and
+there is no depth attachment. This is a hardware vertex transform for the
+accepted graph shape, not a general Vulkan matrix-shader implementation.
+
+The verified RAM payload and capture are in
+`docs/evidence/vulkan-pyramid-gpu-matrix-20260927/`. Its PMFBOOT v2 container
+is 1,014,376 bytes, SHA-256
+`3467f34872f725143a98b7bbbf49418af9874c8b397b808b352f7ccaa8e94d05`.
+Monitor build 210 verified the upload at `$600000` and returned `x0=0` after
+9.2 seconds under a 15-second deadman. Fresh capture 89 shows a clean pyramid.
+The resident console was restored, the board lease was released, and no reset,
+flash, or boot-medium write occurred.
+
+A four-attribute experiment moved the fixed pitch term into GPU arithmetic too.
+It returned `x0=0`, but capture 88 had scattered black pixels. It is not the
+demo default while that artifact remains unexplained. The source checkers
+exercise the bounded graph lowering, while the board capture establishes the
+clean working shader and records the outstanding hardware limit.

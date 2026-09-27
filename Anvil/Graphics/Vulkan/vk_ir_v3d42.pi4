@@ -95,6 +95,9 @@ Structure AvkIrV3d42VertexPlan Align #PB_Structure_AlignC
   positionScaleVariableId.i
   positionScaleLoadId.i
   positionScaled.i
+  positionGeneral.i
+  positionXValueId.i
+  positionYValueId.i
   varyingCount.i
   varyingComponents.i
   varyings.AvkIrV3d42VertexVarying[#ANVIL_IR_V3D42_MAX_IO]
@@ -140,6 +143,9 @@ Global Dim avk42VertexCsScratch.i[128]
 Global Dim avk42VertexVsScratch.i[128]
 Global Dim avk42VertexCsUniform.l[#ANVIL_IR_V3D42_UNIFORM_WORDS]
 Global Dim avk42VertexVsUniform.l[#ANVIL_IR_V3D42_UNIFORM_WORDS]
+Global Dim avk42VertexGraphUsed.i[193]
+Global Dim avk42VertexGraphReg.i[193]
+Global Dim avk42VertexGraphUses.i[193]
 
 Global avk42Error.i = 0
 Global avk42SourceId.i = 0
@@ -1104,6 +1110,55 @@ Procedure.i avk42VertexPositionValue(*m.AvkIrModule, valueId.i, outputType.i, *l
   ProcedureReturn 1
 EndProcedure
 
+; A bounded scalar arithmetic graph is the first general vertex transform
+; path. All leaves are float32 components of Location inputs, or exact zero
+; and one. The verifier has already checked SSA dominance and operand types.
+Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
+  Protected sp.i = 0
+  Protected id.i
+  Protected i.i
+  Protected lanes.i
+  Protected variableId.i
+  Protected firstVariable.i = 0
+  Protected sawArithmetic.i = 0
+  Protected *n.AvkIrNode
+  Protected *load.AvkIrNode
+  Dim pending.i[512]
+  i = 0 : While i < 193 : avk42VertexGraphUsed[i] = 0 : i = i + 1 : Wend
+  pending[sp] = xId : sp = sp + 1
+  pending[sp] = yId : sp = sp + 1
+  While sp > 0
+    sp = sp - 1 : id = pending[sp]
+    If id <= 0 Or id >= 193 : ProcedureReturn 0 : EndIf
+    If avk42VertexGraphUsed[id] <> 0 : Continue : EndIf
+    If avk42VertexScalarBits(*m, id, $00000000) <> 0 Or avk42VertexScalarBits(*m, id, $3F800000) <> 0 : Continue : EndIf
+    *n = avkIrFindNode(*m, id)
+    If *n = 0 Or avk42VertexFloatShape(*m, *n\resultType, 1) = 0 : ProcedureReturn 0 : EndIf
+    If *n\kind = #ANVIL_IR_OP_COMPOSITE_EXTRACT
+      If *n\operandCount <> 1 Or *n\literalCount <> 1 : ProcedureReturn 0 : EndIf
+      *load = avkIrFindNode(*m, *n\operand0)
+      If *load = 0 : ProcedureReturn 0 : EndIf
+      lanes = avkIrFloatLanes(*m, *load\resultType)
+      If lanes < 2 Or lanes > 4 Or *n\literal0 < 0 Or *n\literal0 >= lanes : ProcedureReturn 0 : EndIf
+      variableId = 0
+      If avk42VertexWholeInputLoad(*m, *n\operand0, lanes, @variableId) = 0 : ProcedureReturn 0 : EndIf
+      If firstVariable = 0 : firstVariable = variableId : EndIf
+      avk42VertexGraphUsed[*load\sourceId] = 1
+    ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+      sawArithmetic = 1
+      If *n\operandCount <> 2 Or sp > 509 : ProcedureReturn 0 : EndIf
+      pending[sp] = *n\operand0 : sp = sp + 1
+      pending[sp] = *n\operand1 : sp = sp + 1
+    Else
+      ProcedureReturn 0
+    EndIf
+    avk42VertexGraphUsed[id] = 1
+  Wend
+  If firstVariable = 0 Or sawArithmetic = 0 : ProcedureReturn 0 : EndIf
+  PokeI(*variableOut, firstVariable)
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
   Protected i.i
   Protected location.i
@@ -1122,6 +1177,7 @@ Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
   Protected count.i
   Protected total.i
   Protected *n.AvkIrNode
+  Protected *construct.AvkIrNode
   Protected *v.AvkIrVariable
   Protected *vary.AvkIrV3d42VertexVarying
   avk42ClearVertexPlan(*p)
@@ -1165,7 +1221,17 @@ Procedure.i avk42BuildVertexPlan(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan)
         EndIf
         sourceLoad = 0 : sourceVariable = 0 : scaleLoad = 0 : scaleVariable = 0
         If avk42VertexPositionValue(*m, *n\operand1, outputType, @sourceLoad, @sourceVariable, @scaleLoad, @scaleVariable) = 0
-          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+          *construct = avkIrFindNode(*m, *n\operand1)
+          If *construct = 0 Or *construct\kind <> #ANVIL_IR_OP_COMPOSITE_CONSTRUCT Or *construct\operandCount <> 4 Or *construct\resultType <> outputType
+            ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+          EndIf
+          If avk42VertexScalarBits(*m, *construct\operand2, $00000000) = 0 Or avk42VertexScalarBits(*m, *construct\operand3, $3F800000) = 0
+            ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+          EndIf
+          If avk42VertexPositionGraph(*m, *construct\operand0, *construct\operand1, @sourceVariable) = 0
+            ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *n\operand1, *n\sourceOpcode, 2)
+          EndIf
+          *p\positionGeneral = 1 : *p\positionXValueId = *construct\operand0 : *p\positionYValueId = *construct\operand1
         EndIf
         *p\positionOutputVariableId = variableId : *p\positionOutputMember = member
         *p\positionInputVariableId = sourceVariable : *p\positionInputMember = -1 : *p\positionLoadId = sourceLoad
@@ -1269,7 +1335,10 @@ Procedure.i avk42VertexValidateInputs(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan, *
   Wend
   If expectedSlot < 2 Or expectedSlot > #ANVIL_IR_V3D42_MAX_SLOT + 1 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, expectedSlot, 0, 3) : EndIf
   *found = avk42FindIo(*t\inputs, *t\inputCount, *p\positionInputVariableId, -1)
-  If *found = 0 Or *found\components <> 2
+  If *found = 0
+    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3)
+  EndIf
+  If (*p\positionGeneral = 0 And *found\components <> 2) Or (*p\positionGeneral <> 0 And (*found\components < 2 Or *found\components > 4))
     ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionInputVariableId, #ANVIL_IR_SPV_LOAD, 3)
   EndIf
   If *p\positionScaled
@@ -1309,7 +1378,96 @@ Procedure avk42VertexFillUniform(base.i, words.i, halfW.i, halfH.i)
   PokeL(base + ((i + 3) * 4), avk42VertexF32FromInt(halfH))
 EndProcedure
 
-Procedure.i avk42EmitVertexProgram(*p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexPairTarget, inputSlots.i, halfW.i, halfH.i, coordinate.i)
+Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, *p.AvkIrV3d42VertexPlan, b.i, temp.i, kcount.i, *xOut, *yOut)
+  Protected i.i
+  Protected id.i
+  Protected nextReg.i = temp + 2
+  Protected left.i
+  Protected right.i
+  Protected leftId.i
+  Protected rightId.i
+  Protected destReg.i
+  Protected freeCount.i = 0
+  Protected rc.i
+  Protected *n.AvkIrNode
+  Protected *c.AvkIrConstant
+  Protected *io.AvkIrV3d42Io
+  Dim freeReg.i[64]
+  i = 0 : While i < 193 : avk42VertexGraphReg[i] = -1 : i = i + 1 : Wend
+  i = 0 : While i < 193 : avk42VertexGraphUses[i] = 0 : i = i + 1 : Wend
+  avk42VertexGraphUses[*p\positionXValueId] = avk42VertexGraphUses[*p\positionXValueId] + 1
+  avk42VertexGraphUses[*p\positionYValueId] = avk42VertexGraphUses[*p\positionYValueId] + 1
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i) : id = *n\sourceId
+    If id > 0 And id < 193 And avk42VertexGraphUsed[id] <> 0 And (*n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL)
+      avk42VertexGraphUses[*n\operand0] = avk42VertexGraphUses[*n\operand0] + 1
+      avk42VertexGraphUses[*n\operand1] = avk42VertexGraphUses[*n\operand1] + 1
+    EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < *m\constantCount
+    *c = avkIrConstantAt(*m, i)
+    If avk42VertexScalarBits(*m, *c\sourceId, $00000000) <> 0 : avk42VertexGraphReg[*c\sourceId] = kcount : EndIf
+    If avk42VertexScalarBits(*m, *c\sourceId, $3F800000) <> 0 : avk42VertexGraphReg[*c\sourceId] = kcount + 1 : EndIf
+    i = i + 1
+  Wend
+  i = 0
+  While i < *m\nodeCount
+    *n = avkIrNodeAt(*m, i) : id = *n\sourceId
+    If id > 0 And id < 193 And avk42VertexGraphUsed[id] <> 0
+      If *n\kind = #ANVIL_IR_OP_LOAD
+        *io = avk42FindIo(*t\inputs, *t\inputCount, *n\operand0, -1)
+        If *io = 0 Or *io\components <> avkIrFloatLanes(*m, *n\resultType)
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *n\operand0, *n\sourceOpcode, 4)
+        EndIf
+        avk42VertexGraphReg[id] = b + *io\firstSlot
+      ElseIf *n\kind = #ANVIL_IR_OP_COMPOSITE_EXTRACT
+        left = avk42VertexGraphReg[*n\operand0]
+        If left < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, id, *n\sourceOpcode, 4) : EndIf
+        avk42VertexGraphReg[id] = left + *n\literal0
+      ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
+        leftId = *n\operand0 : rightId = *n\operand1
+        left = avk42VertexGraphReg[leftId] : right = avk42VertexGraphReg[rightId]
+        If left < 0 Or right < 0
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *n\sourceOpcode, 4)
+        EndIf
+        If freeCount > 0
+          freeCount = freeCount - 1 : destReg = freeReg[freeCount]
+        Else
+          If nextReg > #ANVIL_IR_V3D42_MAX_REG : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *n\sourceOpcode, 4) : EndIf
+          destReg = nextReg : nextReg = nextReg + 1
+        EndIf
+        If *n\kind = #ANVIL_IR_OP_FADD
+          rc = V3dQpuAdd2(#V3DQ_A_FADD, destReg, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, left, right)
+        Else
+          V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, destReg, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(left, right) : rc = V3dQpuEmit()
+        EndIf
+        If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, id, *n\sourceOpcode, 4) : EndIf
+        ; Keep a dependent read behind the QPU register write latency.
+        rc = V3dQpuNop()
+        If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, id, *n\sourceOpcode, 4) : EndIf
+        avk42VertexGraphUses[leftId] = avk42VertexGraphUses[leftId] - 1
+        If avk42VertexGraphUses[leftId] = 0 And avk42VertexGraphReg[leftId] >= temp + 2
+          freeReg[freeCount] = avk42VertexGraphReg[leftId] : freeCount = freeCount + 1
+        EndIf
+        avk42VertexGraphUses[rightId] = avk42VertexGraphUses[rightId] - 1
+        If avk42VertexGraphUses[rightId] = 0 And avk42VertexGraphReg[rightId] >= temp + 2
+          freeReg[freeCount] = avk42VertexGraphReg[rightId] : freeCount = freeCount + 1
+        EndIf
+        avk42VertexGraphReg[id] = destReg
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  left = avk42VertexGraphReg[*p\positionXValueId] : right = avk42VertexGraphReg[*p\positionYValueId]
+  If left < 0 Or right < 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_LAYOUT, *p\positionOutputVariableId, #ANVIL_IR_SPV_STORE, 4) : EndIf
+  PokeI(*xOut, left) : PokeI(*yOut, right)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avk42EmitVertexProgram(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexPairTarget, inputSlots.i, halfW.i, halfH.i, coordinate.i)
   Protected r.i
   Protected k.i
   Protected c.i
@@ -1341,6 +1499,9 @@ Procedure.i avk42EmitVertexProgram(*p.AvkIrV3d42VertexPlan, *t.AvkIrV3d42VertexP
   While k < kcount + 4 And r = 0 : r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, k, 0) : k = k + 1 : Wend
   k = 0
   While k < inputSlots And r = 0 : r = avk42EmitLdvpm(k, b + k) : k = k + 1 : Wend
+  If *p\positionGeneral <> 0 And r = 0
+    r = avk42VertexEmitGraph(*m, *t, *p, b, temp, kcount, @positionX, @positionY)
+  EndIf
   If *p\positionScaled <> 0 And r = 0
     V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 2, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionX, b + *scale\firstSlot) : r = V3dQpuEmit()
     If r = 0
@@ -1421,12 +1582,12 @@ Procedure.i AnvilVkIrV3d42LowerVertexPair(*m.AvkIrModule, *t.AvkIrV3d42VertexPai
     ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, 0, 0, 3)
   EndIf
   halfW = *t\viewportWidth * 128 : halfH = *t\viewportHeight * 128
-  rc = avk42EmitVertexProgram(@avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 1) : If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = avk42EmitVertexProgram(*m, @avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 1) : If rc <> 0 : ProcedureReturn rc : EndIf
   avk42VertexPairPending\coordinateCodeBytes = V3dQpuProgramBytes()
   csK = 6 + avk42VertexPlanPending\varyingComponents : If inputSlots > csK : csK = inputSlots : EndIf
   avk42VertexPairPending\coordinateUniformWords = csK + 4
   avk42VertexFillUniform(@avk42VertexCsUniform[0], avk42VertexPairPending\coordinateUniformWords, halfW, halfH)
-  rc = avk42EmitVertexProgram(@avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 0) : If rc <> 0 : ProcedureReturn rc : EndIf
+  rc = avk42EmitVertexProgram(*m, @avk42VertexPlanPending, *t, inputSlots, halfW, halfH, 0) : If rc <> 0 : ProcedureReturn rc : EndIf
   avk42VertexPairPending\vertexCodeBytes = V3dQpuProgramBytes()
   vsK = 4 + avk42VertexPlanPending\varyingComponents : If inputSlots > vsK : vsK = inputSlots : EndIf
   avk42VertexPairPending\vertexUniformWords = vsK + 4

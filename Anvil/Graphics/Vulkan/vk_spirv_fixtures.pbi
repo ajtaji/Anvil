@@ -30,7 +30,7 @@
 Global Dim vtpVsA.l[256]
 Global Dim vtpFsA.l[256]
 Global Dim vtpVsB.l[256]
-Global Dim vtpVsBScaled.l[256]
+Global Dim vtpVsBScaled.l[512]
 Global Dim vtpFsB.l[256]
 Global Dim vtpFsC.l[256]
 Global Dim vtpVsD.l[256]
@@ -80,6 +80,7 @@ Global vtpN.i = 0
 #VTP_OpMemberDecorate = 72
 #VTP_OpCompositeConstruct = 80
 #VTP_OpCompositeExtract = 81
+#VTP_OpFAdd = 129
 #VTP_OpFMul = 133
 #VTP_OpImageSampleImplicitLod = 87
 #VTP_OpLabel = 248
@@ -359,10 +360,10 @@ Procedure.i vtpBuildVsB()
   ProcedureReturn vtpN * 4
 EndProcedure
 
-; Scaled-position variant used by the GPU-perspective pyramid proof.
+; Per-vertex two-row transform and perspective multiply for the pyramid.
 Procedure.i vtpBuildVsBScaled()
   vtpBuf = @vtpVsBScaled[0]
-  vtpHeader(33)
+  vtpHeader(55)
   vtpIns(#VTP_OpCapability, 1) : vtpW(#VTP_CapShader)
   vtpIns(#VTP_OpMemoryModel, 2) : vtpW(#VTP_AddrLogical) : vtpW(#VTP_MemGLSL450)
   vtpIns(#VTP_OpEntryPoint, 9) : vtpW(#VTP_EmVertex) : vtpW(19) : vtpW(#VTP_NAME0) : vtpW(#VTP_NAME1) : vtpW(15) : vtpW(16) : vtpW(17) : vtpW(18) : vtpW(27)
@@ -377,8 +378,9 @@ Procedure.i vtpBuildVsBScaled()
   vtpIns(#VTP_OpTypeFloat, 2) : vtpW(3) : vtpW(32)
   vtpIns(#VTP_OpTypeVector, 3) : vtpW(4) : vtpW(3) : vtpW(2)
   vtpIns(#VTP_OpTypeVector, 3) : vtpW(5) : vtpW(3) : vtpW(4)
-  vtpIns(#VTP_OpTypePointer, 3) : vtpW(6) : vtpW(#VTP_ScInput) : vtpW(4)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(6) : vtpW(#VTP_ScInput) : vtpW(5)
   vtpIns(#VTP_OpTypePointer, 3) : vtpW(7) : vtpW(#VTP_ScInput) : vtpW(5)
+  vtpIns(#VTP_OpTypePointer, 3) : vtpW(54) : vtpW(#VTP_ScInput) : vtpW(5)
   vtpIns(#VTP_OpTypePointer, 3) : vtpW(8) : vtpW(#VTP_ScOutput) : vtpW(5)
   vtpIns(#VTP_OpTypeStruct, 2) : vtpW(9) : vtpW(5)
   vtpIns(#VTP_OpTypePointer, 3) : vtpW(10) : vtpW(#VTP_ScOutput) : vtpW(9)
@@ -390,18 +392,29 @@ Procedure.i vtpBuildVsBScaled()
   vtpIns(#VTP_OpVariable, 3) : vtpW(7) : vtpW(16) : vtpW(#VTP_ScInput)
   vtpIns(#VTP_OpVariable, 3) : vtpW(8) : vtpW(17) : vtpW(#VTP_ScOutput)
   vtpIns(#VTP_OpVariable, 3) : vtpW(10) : vtpW(18) : vtpW(#VTP_ScOutput)
-  vtpIns(#VTP_OpVariable, 3) : vtpW(6) : vtpW(27) : vtpW(#VTP_ScInput)
+  vtpIns(#VTP_OpVariable, 3) : vtpW(54) : vtpW(27) : vtpW(#VTP_ScInput)
   vtpIns(#VTP_OpFunction, 4) : vtpW(1) : vtpW(19) : vtpW(0) : vtpW(2)
   vtpIns(#VTP_OpLabel, 1) : vtpW(20)
-  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(21) : vtpW(15)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(5) : vtpW(21) : vtpW(15)
   vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(22) : vtpW(21) : vtpW(0)
   vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(23) : vtpW(21) : vtpW(1)
-  vtpIns(#VTP_OpLoad, 3) : vtpW(4) : vtpW(28) : vtpW(27)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(34) : vtpW(21) : vtpW(2)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(35) : vtpW(21) : vtpW(3)
+  vtpIns(#VTP_OpLoad, 3) : vtpW(5) : vtpW(28) : vtpW(27)
   vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(29) : vtpW(28) : vtpW(0)
   vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(30) : vtpW(28) : vtpW(1)
-  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(31) : vtpW(22) : vtpW(29)
-  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(32) : vtpW(23) : vtpW(30)
-  vtpIns(#VTP_OpCompositeConstruct, 6) : vtpW(5) : vtpW(24) : vtpW(31) : vtpW(32) : vtpW(13) : vtpW(14)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(38) : vtpW(28) : vtpW(2)
+  vtpIns(#VTP_OpCompositeExtract, 4) : vtpW(3) : vtpW(39) : vtpW(28) : vtpW(3)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(41) : vtpW(22) : vtpW(29)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(42) : vtpW(34) : vtpW(30)
+  vtpIns(#VTP_OpFAdd, 4) : vtpW(3) : vtpW(45) : vtpW(41) : vtpW(42)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(46) : vtpW(45) : vtpW(35)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(47) : vtpW(22) : vtpW(38)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(49) : vtpW(34) : vtpW(39)
+  vtpIns(#VTP_OpFAdd, 4) : vtpW(3) : vtpW(50) : vtpW(47) : vtpW(23)
+  vtpIns(#VTP_OpFAdd, 4) : vtpW(3) : vtpW(51) : vtpW(50) : vtpW(49)
+  vtpIns(#VTP_OpFMul, 4) : vtpW(3) : vtpW(52) : vtpW(51) : vtpW(35)
+  vtpIns(#VTP_OpCompositeConstruct, 6) : vtpW(5) : vtpW(24) : vtpW(46) : vtpW(52) : vtpW(13) : vtpW(14)
   vtpIns(#VTP_OpAccessChain, 4) : vtpW(8) : vtpW(25) : vtpW(18) : vtpW(12)
   vtpIns(#VTP_OpStore, 2) : vtpW(25) : vtpW(24)
   vtpIns(#VTP_OpLoad, 3) : vtpW(5) : vtpW(26) : vtpW(16)
