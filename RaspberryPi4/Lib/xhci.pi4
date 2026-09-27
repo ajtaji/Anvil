@@ -1991,6 +1991,91 @@ EndProcedure
 ; or an emitter peephole: none of those gives device I/O its ordering.
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+  ; ====================================================================
+  ;  BCM2712 (-t pi5): THE SAME DRIVER, BEHIND RP1 INSTEAD OF A VL805
+  ; ====================================================================
+  ;  On the Pi 5 the host controller is one of RP1's two Synopsys DWC3
+  ;  cores (dwc_usb3 v3.30b, rp1-peripherals.pdf chapter 5), in xHCI host
+  ;  mode, reached as memory through RP1's BAR - not a PCI function to
+  ;  enumerate. Everything above the register block is unchanged; three
+  ;  things differ, and each is confined to a CompilerIf #PMF_CHIP = 2712
+  ;  branch with the Pi 4 lines kept verbatim in CompilerElse:
+  ;
+  ;  1. WHERE IT IS. XhciInitRp1(n) takes pcie.pi4's PcieRp1UsbHost(n):
+  ;     usbhost0 CPU $1F_0020_0000, usbhost1 $1F_0030_0000 (translated in
+  ;     pcie.pi4's 2712 header). XhciInit() uses host xh_rp1Host, 0 by
+  ;     default: rp1_usb0 is the controller the board's DTB gives the
+  ;     USB-A power switch pins (bcm2712-rpi-5-b.dts &rp1_usb0 pinctrl
+  ;     usb_vbus_pins: GPIO42 USB_VBUS_EN, GPIO43 USB_OC_N) and alias
+  ;     usb0. Each RP1 controller has one USB 2 and one USB 3 PHY
+  ;     (rp1-peripherals.pdf ch. 5), i.e. one blue + one black port pair;
+  ;     WHICH physical pair is usbhost0 is not in any source on this disk
+  ;     and is owed to silicon - XhciSelectRp1Host(1) is the other pair.
+  ;     No internal hub: a keyboard trains on a ROOT port here.
+  ;
+  ;  2. THE DWC3 WRAPPER. Before the xHCI registers mean anything the
+  ;     core is put in host mode - xh_Dwc3Host(), from Linux 7e030b60
+  ;     drivers/usb/dwc3/core.c (dwc3_core_is_valid, dwc3_ss_phy_setup,
+  ;     dwc3_hs_phy_setup, dwc3_core_soft_reset, the GUCTL1 quirk block,
+  ;     dwc3_set_prtcap) with rp1.dtsi usb@200000's quirk list.
+  ;
+  ;  3. EVERY POINTER THE CONTROLLER SEES IS TRANSLATED. RP1 masters
+  ;     reach ARM memory at CPU + $10_0000_0000 (&rp1 dma-ranges entry 1
+  ;     through pcie2's dma-ranges; pcie.pi4 PcieDmaBus). The rings,
+  ;     DCBAA, contexts, scratchpad, TRB buffers and the four 64-bit
+  ;     pointer registers are written through xh_Dma(); the TRB pointer
+  ;     an event names comes back through xh_DmaCpu(). And ERSTBA is
+  ;     written HIGH HALF FIRST: dwc3/host.c sets "write-64-hi-lo-quirk",
+  ;     which xhci-mem.c applies to erst_base only (hi_lo_writeq).
+  ;
+  ;  NOT SILICON-VERIFIED. Desk proof: tools/a64/a64_xhci_pi5_check.py.
+  ; ====================================================================
+  #DWC3_GSNPSID      = $C120     ; dwc3/core.h
+  #DWC3_GCTL         = $C110
+  #DWC3_GUCTL1       = $C11C
+  #DWC3_GHWPARAMS0   = $C140
+  #DWC3_GUSB2PHYCFG0 = $C200     ; DWC3_GUSB2PHYCFG(0)
+  #DWC3_GUSB3PIPECTL0 = $C2C0    ; DWC3_GUSB3PIPECTL(0)
+  #DWC3_DCTL         = $C704
+  #DWC3_IP           = $5533     ; DWC3_IP, "U3" in GSNPSID 31:16
+  #DWC3_GCTL_PRTCAP_MASK = $3000 ; DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_OTG)
+  #DWC3_GCTL_PRTCAP_HOST = $1000 ; DWC3_GCTL_PRTCAPDIR(DWC3_GCTL_PRTCAP_HOST)
+  #DWC3_DCTL_RUN_STOP = $80000000
+  #DWC3_DCTL_CSFTRST  = $40000000
+  #DWC3_GUSB2PHYCFG_SUSPHY  = $00000040     ; BIT(6)
+  #DWC3_GUSB3PIPECTL_SUSPHY = $00020000     ; BIT(17)
+  #DWC3_GUSB3PIPECTL_DISRXDETINP3 = $10000000 ; BIT(28), snps,dis_rxdet_inp3_quirk
+  #DWC3_GUCTL1_NAK_PER_ENH_FS = $00080000   ; BIT(19), snps,enhanced-nak-fs-quirk
+  #DWC3_GUCTL1_PARKMODE_DISABLE_SS = $00020000   ; BIT(17)
+  #DWC3_GUCTL1_PARKMODE_DISABLE_FSLS = $00008000 ; BIT(15)
+  ; dwc3_core_soft_reset() allows 1000 x udelay(1) on a DWC_usb3 core; a
+  ; 100 ms bound is generous and still bounded.
+  #XHCI_TMO_DWC3_MS = 100
+  #XHCI_PH_DWC3 = 14
+  #XHCI_ERR_RP1_HOST   = 60
+  #XHCI_ERR_DWC3_ID    = 61
+  #XHCI_ERR_DWC3_MODE  = 62
+  #XHCI_ERR_DWC3_RESET = 63
+  #XHCI_ERR_DWC3_HOST  = 64
+  #XHCI_ERR_AC64       = 65
+  Global xh_rp1Host.i = 0
+  Global xh_dwc3Id.i = 0
+
+  ; CPU -> the address the controller must be handed. XhciInitRp1 has
+  ; already proved the whole arena inside the window with PcieDmaOk, and
+  ; xh_Bulk proves each caller buffer, so a refusal here is a driver bug.
+  Procedure.i xh_Dma(cpu.i)
+    ProcedureReturn PcieDmaBus(cpu)
+  EndProcedure
+
+  ; A pointer the controller wrote back (an event's TRB address) -> CPU.
+  ; -1 for anything outside the window: not a TRB this driver issued.
+  Procedure.i xh_DmaCpu(busAddr.i)
+    ProcedureReturn PcieDmaCpu(busAddr)
+  EndProcedure
+CompilerEndIf
+
 Procedure.i xh_Rd(base.i, off.i)
   Define v.i
   v = PeekN(base + off)
@@ -2026,12 +2111,38 @@ EndProcedure
 ; The order is a hardware requirement, not a style choice, and this is
 ; the only place in the file that writes a wide register.
 Procedure xh_Wr64(base.i, off.i, v.i)
+CompilerIf #PMF_CHIP = 2712
+  ; Every caller writes a pointer the controller will follow - DCBAAP,
+  ; CRCR, ERDP (and ERSTBA through xh_Wr64HiLo) - so the translation is
+  ; applied here once. The low flag bits ride along: the offset only
+  ; moves bit 36.
+  ; xh_Wr carries the same ordered-writel barriers as the lines below.
+  Define d.i
+  d = xh_Dma(v)
+  xh_Wr(base, off, d & $FFFFFFFF)
+  xh_Wr(base, off + 4, (d >> 32) & $FFFFFFFF)
+CompilerElse
   a64_barrier()
   PokeN(base + off,     v & $FFFFFFFF)
   a64_barrier()
   PokeN(base + off + 4, (v >> 32) & $FFFFFFFF)
   a64_barrier()
+CompilerEndIf
 EndProcedure
+
+CompilerIf #PMF_CHIP = 2712
+  ; ERSTBA on a DWC3: HIGH dword first. dwc3/host.c dwc3_host_init() sets
+  ; "write-64-hi-lo-quirk"; xhci-plat.c turns it into XHCI_WRITE_64_HI_LO;
+  ; xhci-mem.c xhci_add_interrupter() then writes erst_base with
+  ; hi_lo_writeq() - and nothing else. The low write is the one that
+  ; commits the table base, so it must see the final high half.
+  Procedure xh_Wr64HiLo(base.i, off.i, v.i)
+    Define d.i
+    d = xh_Dma(v)
+    xh_Wr(base, off + 4, (d >> 32) & $FFFFFFFF)
+    xh_Wr(base, off, d & $FFFFFFFF)
+  EndProcedure
+CompilerEndIf
 
 ; ======================================================================
 ;  FAILURE BOOKKEEPING. One place, so every refusal captures the same
@@ -2684,8 +2795,13 @@ Procedure xh_RingReset(r.i)
 
   ; segment_ptr - 64 bits, low half then high half, same as every other
   ; wide field. The segment points at itself: one segment.
+CompilerIf #PMF_CHIP = 2712
+  PokeN(lnk + 0, xh_Dma(base) & $FFFFFFFF)
+  PokeN(lnk + 4, (xh_Dma(base) >> 32) & $FFFFFFFF)
+CompilerElse
   PokeN(lnk + 0,  base & $FFFFFFFF)
   PokeN(lnk + 4,  (base >> 32) & $FFFFFFFF)
+CompilerEndIf
   PokeN(lnk + 8,  0)                     ; intr_target
   ; control: TRB_TYPE(TRB_LINK) | LINK_TOGGLE, cycle clear.
   PokeN(lnk + 12, ((#XHCI_TRB_LINK << 10) | #XHCI_LINK_TOGGLE) & $FFFFFFFF)
@@ -3020,8 +3136,13 @@ Procedure.i xh_MemInit()
   If xh_erst = 0
     ProcedureReturn xh_Fail(#XHCI_ERR_ARENA)
   EndIf
+CompilerIf #PMF_CHIP = 2712
+  PokeN(xh_erst + 0, xh_Dma(xh_evBase) & $FFFFFFFF)
+  PokeN(xh_erst + 4, (xh_Dma(xh_evBase) >> 32) & $FFFFFFFF)
+CompilerElse
   PokeN(xh_erst + 0, xh_evBase & $FFFFFFFF)
   PokeN(xh_erst + 4, (xh_evBase >> 32) & $FFFFFFFF)
+CompilerEndIf
   PokeN(xh_erst + 8, #XHCI_TRBS_PER_SEG)
   PokeN(xh_erst + 12, 0)
   xh_Clean(xh_erst, #XHCI_ERST_ENTRY_SIZE)
@@ -3066,7 +3187,11 @@ Procedure.i xh_MemInit()
 
   v = xh_Rd64(xh_ir, #XHCI_ERSTBA)
   v = (v & #XHCI_ERST_PTR_MASK) | (xh_erst & (~#XHCI_ERST_PTR_MASK))
+CompilerIf #PMF_CHIP = 2712
+  xh_Wr64HiLo(xh_ir, #XHCI_ERSTBA, v)
+CompilerElse
   xh_Wr64(xh_ir, #XHCI_ERSTBA, v)
+CompilerEndIf
 
   ; ---- the scratchpad. xhci-mem.c, xhci_scratchpad_alloc(): if
   ; HCS_MAX_SCRATCHPAD is zero there is nothing to do at all, and the
@@ -3097,13 +3222,21 @@ Procedure.i xh_MemInit()
     i = 0
     While i < xh_scratch
       sp = xh_spPages + (i * #XHCI_PAGE_BYTES)
+CompilerIf #PMF_CHIP = 2712
+      PokeX(xh_spArray + (i * 8), xh_Dma(sp))
+CompilerElse
       PokeX(xh_spArray + (i * 8), sp)
+CompilerEndIf
       i = i + 1
     Wend
     xh_Clean(xh_spArray, #XHCI_SCRATCH_ARRAY_BYTES)
     xh_Clean(xh_spPages, xh_scratch * #XHCI_PAGE_BYTES)
     ; DCBAA entry 0 IS the scratchpad array pointer.
+CompilerIf #PMF_CHIP = 2712
+    PokeX(xh_dcbaa + 0, xh_Dma(xh_spArray))
+CompilerElse
     PokeX(xh_dcbaa + 0, xh_spArray)
+CompilerEndIf
   EndIf
   xh_Clean(xh_dcbaa, #XHCI_DCBAA_BYTES)
 
@@ -3290,7 +3423,11 @@ Procedure.i xh_WaitEventFor(expect.i, wantLo.i, wantHi.i, ms.i)
         ; command first, which is a horrible thing to depend on.
         ;
         ; wantLo 0 means "any", for callers that genuinely cannot say.
+CompilerIf #PMF_CHIP = 2712
+        xh_evTrb = xh_DmaCpu((xh_evF1 << 32) | (xh_evF0 & $FFFFFFFF))
+CompilerElse
         xh_evTrb = (xh_evF1 << 32) | (xh_evF0 & $FFFFFFFF)
+CompilerEndIf
         If wantLo = 0
           XhciAccountWait(site, t0)
           ProcedureReturn 1
@@ -3380,7 +3517,16 @@ EndProcedure
 Procedure.i xh_Command(cmd.i, addr.i, slot.i, ms.i)
   Define f3.i
   f3 = (cmd << 10) | ((slot & $FF) << 24)
+CompilerIf #PMF_CHIP = 2712
+  ; Enable Slot and No-Op carry no pointer (0); every other command's
+  ; parameter is an input context in the arena.
+  If addr <> 0
+    addr = xh_Dma(addr)
+  EndIf
   xh_QueueTrb(#XHCI_RING_CMD, addr & $FFFFFFFF, (addr >> 32) & $FFFFFFFF, 0, f3)
+CompilerElse
+  xh_QueueTrb(#XHCI_RING_CMD, addr & $FFFFFFFF, (addr >> 32) & $FFFFFFFF, 0, f3)
+CompilerEndIf
   xh_Doorbell(0, 0)                      ; DB_VALUE_HOST
   If xh_WaitEvent(#XHCI_TRB_COMPLETION, ms) = 0
     ProcedureReturn 0
@@ -3577,7 +3723,11 @@ Procedure.i xh_ClearHalt(slot.i, ring.i, dci.i)
   ;    of the address carries the CYCLE BIT (`new_cycle`), the high half
   ;    is the rest of the address, and the third word holds the stream
   ;    id - zero here, because no endpoint in this file uses streams.
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_TrbAddr(ring, xh_ringEnq[ring])) | xh_ringCycle[ring]
+CompilerElse
   deq = xh_TrbAddr(ring, xh_ringEnq[ring]) | xh_ringCycle[ring]
+CompilerEndIf
   If xh_CommandEp(#XHCI_TRB_SET_DEQ, deq & $FFFFFFFF, (deq >> 32) & $FFFFFFFF, slot, dci, #XHCI_TMO_EVENT_MS) = 0
     ok = 0
   EndIf
@@ -3789,6 +3939,170 @@ Procedure.i XhciInitAt(bus.i, dev.i, fn.i)
   ProcedureReturn 1
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+  ; ------------------------------------------------------------------
+  ;  xh_Dwc3Host - put RP1's DWC3 core in xHCI host mode.
+  ;  Linux 7e030b60 drivers/usb/dwc3/core.c, in its order:
+  ;    dwc3_core_is_valid()   GSNPSID 31:16 must read "U3" ($5533)
+  ;    GHWPARAMS0 mode        host (1) or DRD (2); RP1 has no device mode
+  ;    dwc3_ss_phy_setup()    GUSB3PIPECTL(0): SUSPHY clear before init,
+  ;                           DISRXDETINP3 for snps,dis_rxdet_inp3_quirk
+  ;    dwc3_hs_phy_setup()    GUSB2PHYCFG(0): SUSPHY clear
+  ;    dwc3_core_soft_reset() DCTL.CSFTRST set, RUN_STOP clear, wait for
+  ;                           CSFTRST to self-clear (bounded; loud)
+  ;    GUCTL1                 rp1.dtsi quirks: enhanced-nak-fs,
+  ;                           parkmode-disable-ss, parkmode-disable-fsls
+  ;    dwc3_set_prtcap(HOST)  GCTL PRTCAPDIR = 1, read back
+  ;  The xHCI halt/HCRST that follows is xhci.pi4's own, unchanged - Linux
+  ;  likewise leaves the host block's reset to the xHCI driver.
+  ;  NOT applied (named so nobody believes otherwise): snps,axi-pipe-limit,
+  ;  tx-max-burst, tx-thr-num-pkt (Raspberry Pi additions to dwc3, not in
+  ;  the files read), usb3-lpm, and the RP1 VBUS pin function on GPIO42/43,
+  ;  which belongs to the GPIO lane and is assumed left by the firmware.
+  ; ------------------------------------------------------------------
+  Procedure.i xh_Dwc3Host()
+    Define v.i
+    Define d.i
+    xh_Phase(#XHCI_PH_DWC3)
+    v = xh_Rd(xh_cap, #DWC3_GSNPSID)
+    xh_dwc3Id = v
+    If ((v >> 16) & $FFFF) <> #DWC3_IP
+      ProcedureReturn xh_Fail(#XHCI_ERR_DWC3_ID)
+    EndIf
+    v = xh_Rd(xh_cap, #DWC3_GHWPARAMS0) & 3
+    If v <> 1 And v <> 2
+      ProcedureReturn xh_Fail(#XHCI_ERR_DWC3_MODE)
+    EndIf
+    v = xh_Rd(xh_cap, #DWC3_GUSB3PIPECTL0)
+    v = (v & (~#DWC3_GUSB3PIPECTL_SUSPHY)) | #DWC3_GUSB3PIPECTL_DISRXDETINP3
+    xh_Wr(xh_cap, #DWC3_GUSB3PIPECTL0, v)
+    v = xh_Rd(xh_cap, #DWC3_GUSB2PHYCFG0)
+    xh_Wr(xh_cap, #DWC3_GUSB2PHYCFG0, v & (~#DWC3_GUSB2PHYCFG_SUSPHY))
+    v = xh_Rd(xh_cap, #DWC3_DCTL)
+    xh_Wr(xh_cap, #DWC3_DCTL, (v | #DWC3_DCTL_CSFTRST) & (~#DWC3_DCTL_RUN_STOP))
+    d = xh_Deadline(#XHCI_TMO_DWC3_MS)
+    While (xh_Rd(xh_cap, #DWC3_DCTL) & #DWC3_DCTL_CSFTRST) <> 0
+      If xh_Expired(d) <> 0
+        ProcedureReturn xh_Fail(#XHCI_ERR_DWC3_RESET)
+      EndIf
+    Wend
+    v = xh_Rd(xh_cap, #DWC3_GUCTL1)
+    v = v | #DWC3_GUCTL1_NAK_PER_ENH_FS | #DWC3_GUCTL1_PARKMODE_DISABLE_SS | #DWC3_GUCTL1_PARKMODE_DISABLE_FSLS
+    xh_Wr(xh_cap, #DWC3_GUCTL1, v)
+    v = xh_Rd(xh_cap, #DWC3_GCTL)
+    xh_Wr(xh_cap, #DWC3_GCTL, (v & (~#DWC3_GCTL_PRTCAP_MASK)) | #DWC3_GCTL_PRTCAP_HOST)
+    If (xh_Rd(xh_cap, #DWC3_GCTL) & #DWC3_GCTL_PRTCAP_MASK) <> #DWC3_GCTL_PRTCAP_HOST
+      ProcedureReturn xh_Fail(#XHCI_ERR_DWC3_HOST)
+    EndIf
+    ProcedureReturn 1
+  EndProcedure
+
+  ; Choose which RP1 controller XhciInit() brings up (0 or 1). Only
+  ; before XhciInit; a running controller is never switched underneath
+  ; the slots it addressed.
+  Procedure.i XhciSelectRp1Host(n.i)
+    If xh_ready <> 0 Or n < 0 Or n > 1
+      ProcedureReturn 0
+    EndIf
+    xh_rp1Host = n
+    ProcedureReturn 1
+  EndProcedure
+  Procedure.i XhciRp1Host() : ProcedureReturn xh_rp1Host : EndProcedure
+  Procedure.i XhciDwc3Id()  : ProcedureReturn xh_dwc3Id  : EndProcedure
+
+  ; XhciInitRp1 - XhciInitAt's sequence for an RP1 controller. The same
+  ; phases, the same refusals, and between the mapping and the first xHCI
+  ; register read, the DWC3 host-mode step. The Pi 4's XhciInitAt stays
+  ; compiled here and refuses on its own: pcie.pi4 reports a non-zero
+  ; inbound offset, and that path writes untranslated pointers.
+  Procedure.i XhciInitRp1(host.i)
+    Define maxs.i
+    Define v.i
+    xh_err = #XHCI_ERR_NONE
+    xh_ready = 0
+    xh_cap = 0
+    xh_op = 0
+    xh_db = 0
+    xh_rt = 0
+    xh_ir = 0
+    If host < 0 Or host > 1
+      ProcedureReturn xh_Fail(#XHCI_ERR_RP1_HOST)
+    EndIf
+    xh_bus = 0
+    xh_dev = host
+    xh_fn = 0
+    xh_Phase(#XHCI_PH_CLOCK)
+    xh_hz = xh_TickHz()
+    If xh_hz < 1000000 Or xh_hz > 1000000000
+      ProcedureReturn xh_Fail(#XHCI_ERR_NO_CNTFRQ)
+    EndIf
+    xh_Phase(#XHCI_PH_ARENA)
+    xh_base = (@xh_arena[0] + (#XHCI_ALIGN - 1)) / #XHCI_ALIGN
+    xh_base = xh_base * #XHCI_ALIGN
+    xh_end = @xh_arena[0] + #XHCI_ARENA_BYTES
+    xh_brk = xh_base
+    If PcieDmaOk(xh_base, xh_end - xh_base) = 0
+      ProcedureReturn xh_Fail(#XHCI_ERR_DMA_RANGE)
+    EndIf
+    xh_Phase(#XHCI_PH_LOCATE)
+    ; 0 until pcie.pi4 has proved the link up and RP1 present: a read of
+    ; RP1 with the link down does not fail, it hangs the core.
+    v = PcieRp1UsbHost(host)
+    If v = 0
+      ProcedureReturn xh_Fail(#XHCI_ERR_RP1_HOST)
+    EndIf
+    xh_cap = v
+    xh_id = PcieCfgRead32(1, 0, 0, $00)
+    If xh_Dwc3Host() = 0
+      ProcedureReturn 0
+    EndIf
+    xh_Phase(#XHCI_PH_CAPS)
+    If xh_ReadCaps() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    ; Every pointer is above 64 GiB as the controller sees it, so a
+    ; controller without 64-bit addressing cannot be given one.
+    If xh_ac64 = 0
+      xh_Fail(#XHCI_ERR_AC64)
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    xh_Phase(#XHCI_PH_RESET)
+    If xh_EnableDma() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    If xh_Halt() = 0
+      If xh_err <> #XHCI_ERR_HCE
+        xh_FailStop()
+        ProcedureReturn 0
+      EndIf
+    EndIf
+    If xh_Reset() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    xh_Phase(#XHCI_PH_CONFIG)
+    maxs = xh_maxSlots & $FF
+    v = xh_Rd(xh_op, #XHCI_CONFIG)
+    xh_Wr(xh_op, #XHCI_CONFIG, maxs | (v & (~$FF)))
+    xh_Phase(#XHCI_PH_MEMORY)
+    If xh_MemInit() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    xh_Phase(#XHCI_PH_RUN)
+    If xh_Start() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    xh_ready = 1
+    xh_Phase(#XHCI_PH_DONE)
+    ProcedureReturn 1
+  EndProcedure
+CompilerEndIf
+
 ; XhciInit - the VL805 on a Raspberry Pi 4: bus 1, device 0, function 0.
 ; See WHERE THE REGISTERS ARE in the header for the citation.
 Procedure.i XhciInit()
@@ -3801,7 +4115,11 @@ Procedure.i XhciInit()
   If xh_ready <> 0
     ProcedureReturn 1
   EndIf
+CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn XhciInitRp1(xh_rp1Host)
+CompilerElse
   ProcedureReturn XhciInitAt(1, 0, 0)
+CompilerEndIf
 EndProcedure
 
 ; XhciStop - halt the controller and disable its event interrupt.
@@ -4503,7 +4821,11 @@ Procedure.i XhciAddressDeviceAt(slot.i, port.i, speed.i, route.i, ttSlot.i, ttPo
   ; Endpoint 0 Context.
   PokeN(ectx + 0, 0)                                     ; ep_info
   PokeN(ectx + 4, #XHCI_EP_TYPE_CTRL | #XHCI_EP_ERRCNT_3 | ((mps & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[slot]) | xh_ringCycle[slot]
+CompilerElse
   deq = xh_ringBase[slot] | xh_ringCycle[slot]
+CompilerEndIf
   PokeN(ectx + 8,  deq & $FFFFFFFF)                      ; deq low
   PokeN(ectx + 12, (deq >> 32) & $FFFFFFFF)              ; deq high
   PokeN(ectx + 16, 8)                                    ; tx_info, avg 8
@@ -4513,7 +4835,11 @@ Procedure.i XhciAddressDeviceAt(slot.i, port.i, speed.i, route.i, ttSlot.i, ttPo
   ; The output context goes in the DCBAA at this slot's index. It is
   ; written by the CONTROLLER, so it is only ever cleaned before the
   ; controller is told about it and invalidated before it is read.
+CompilerIf #PMF_CHIP = 2712
+  PokeX(xh_dcbaa + (slot * 8), xh_Dma(xh_devCtx[slot]))
+CompilerElse
   PokeX(xh_dcbaa + (slot * 8), xh_devCtx[slot])
+CompilerEndIf
   xh_Clean(xh_dcbaa + (slot * 8), 8)
   xh_Clean(xh_devCtx[slot], #XHCI_DEV_CTX_BYTES)
 
@@ -4629,7 +4955,11 @@ Procedure.i XhciSetEp0MaxPacket(mps.i)
 
   PokeN(ectx + 0, 0)                    ; ep_info, EP_STATE cleared
   PokeN(ectx + 4, #XHCI_EP_TYPE_CTRL | #XHCI_EP_ERRCNT_3 | ((mps & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[xh_slot]) | xh_ringCycle[xh_slot]
+CompilerElse
   deq = xh_ringBase[xh_slot] | xh_ringCycle[xh_slot]
+CompilerEndIf
   PokeN(ectx + 8,  deq & $FFFFFFFF)
   PokeN(ectx + 12, (deq >> 32) & $FFFFFFFF)
   PokeN(ectx + 16, 8)
@@ -5020,8 +5350,13 @@ Procedure.i xh_Control(bmRequestType.i, bRequest.i, wValue.i, wIndex.i, wLength.
     If (bmRequestType & $80) <> 0
       f3 = f3 | #XHCI_TRB_ISP | #XHCI_TRB_DIR_IN
     EndIf
+CompilerIf #PMF_CHIP = 2712
+    sf0 = xh_Dma(xh_bounce) & $FFFFFFFF
+    sf1 = (xh_Dma(xh_bounce) >> 32) & $FFFFFFFF
+CompilerElse
     sf0 = xh_bounce & $FFFFFFFF
     sf1 = (xh_bounce >> 32) & $FFFFFFFF
+CompilerEndIf
     xh_QueueTrb(xh_slot, sf0, sf1, wLength & $1FFFF, f3)
   EndIf
 
@@ -5428,14 +5763,22 @@ Procedure.i xh_BulkContexts(slot.i, drop.i)
   ; The two endpoint contexts.
   PokeN(eo + 0, 0)
   PokeN(eo + 4, #XHCI_EP_TYPE_BULK_OUT | #XHCI_EP_ERRCNT_3 | ((xh_burstOut & $FF) << 8) | ((xh_mpsOut & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[#XHCI_RING_BULK_OUT]) | xh_ringCycle[#XHCI_RING_BULK_OUT]
+CompilerElse
   deq = xh_ringBase[#XHCI_RING_BULK_OUT] | xh_ringCycle[#XHCI_RING_BULK_OUT]
+CompilerEndIf
   PokeN(eo + 8,  deq & $FFFFFFFF)
   PokeN(eo + 12, (deq >> 32) & $FFFFFFFF)
   PokeN(eo + 16, xh_mpsOut & $FFFF)
 
   PokeN(ei + 0, 0)
   PokeN(ei + 4, #XHCI_EP_TYPE_BULK_IN | #XHCI_EP_ERRCNT_3 | ((xh_burstIn & $FF) << 8) | ((xh_mpsIn & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[#XHCI_RING_BULK_IN]) | xh_ringCycle[#XHCI_RING_BULK_IN]
+CompilerElse
   deq = xh_ringBase[#XHCI_RING_BULK_IN] | xh_ringCycle[#XHCI_RING_BULK_IN]
+CompilerEndIf
   PokeN(ei + 8,  deq & $FFFFFFFF)
   PokeN(ei + 12, (deq >> 32) & $FFFFFFFF)
   PokeN(ei + 16, xh_mpsIn & $FFFF)
@@ -5634,7 +5977,11 @@ Procedure.i xh_Bulk(ring.i, dci.i, addr.i, len.i)
     If k = 0
       cyc = startCycle ! 1
     EndIf
+CompilerIf #PMF_CHIP = 2712
+    at = xh_QueueTrbCy(ring, xh_Dma(addr + done) & $FFFFFFFF, (xh_Dma(addr + done) >> 32) & $FFFFFFFF, f2, f3, cyc)
+CompilerElse
     at = xh_QueueTrbCy(ring, (addr + done) & $FFFFFFFF, ((addr + done) >> 32) & $FFFFFFFF, f2, f3, cyc)
+CompilerEndIf
     lastTrb = at
     done = done + seg
     seg = len - done
@@ -6645,6 +6992,24 @@ EndProcedure
 ; describe an old one. XhciErrorText() below is the same thing for the
 ; error that is live now, and is what almost every caller wants.
 Procedure.i XhciErrorTextOf(code.i)
+CompilerIf #PMF_CHIP = 2712
+  Select code
+    Case #XHCI_ERR_RP1_HOST
+      ProcedureReturn "xhci: no RP1 USB host to map - host number not 0/1, or pcie.pi4 has not proved the RP1 link up and RP1 present (PcieInit, PcieEnumerate)"
+    Case #XHCI_ERR_DWC3_ID
+      ProcedureReturn "xhci: GSNPSID does not read 'U3' ($5533xxxx) - this is not the DWC3 core RP1 documents at that address"
+    Case #XHCI_ERR_DWC3_MODE
+      ProcedureReturn "xhci: GHWPARAMS0 says the DWC3 core was built device-only - it cannot be an xHCI host"
+    Case #XHCI_ERR_DWC3_RESET
+      ProcedureReturn "xhci: DWC3 core soft reset (DCTL.CSFTRST) never self-cleared within 100 ms"
+    Case #XHCI_ERR_DWC3_HOST
+      ProcedureReturn "xhci: GCTL.PRTCAPDIR did not read back as host after it was written"
+    Case #XHCI_ERR_AC64
+      ProcedureReturn "xhci: HCCPARAMS1.AC64 is clear, but every RP1 DMA address is above 64 GiB - refused"
+    Case #XHCI_ERR_DMA_OFFSET
+      ProcedureReturn "xhci: the Pi 4 path (XhciInitAt) refuses on BCM2712 - RP1's inbound offset is not zero; use XhciInit / XhciInitRp1"
+  EndSelect
+CompilerEndIf
   Select code
     Case #XHCI_ERR_NONE
       ProcedureReturn "xhci: ok"

@@ -1,0 +1,134 @@
+; ======================================================================
+; pi5UsbSelfTest - the modelled-RP1 gate for the SHARED USB host path on
+; BCM2712. Build with -t pi5 (#PMF_CHIP = 2712); run by
+; tools/a64/a64_xhci_pi5_check.py on the project's A64 oracle.
+; ----------------------------------------------------------------------
+; Unlike pi4XhciSelfTest this stubs NOTHING: it includes the real
+; RaspberryPi4/Lib/pcie.pi4 and RaspberryPi4/Lib/xhci.pi4, and on -t pi5
+; their CompilerIf #PMF_CHIP = 2712 branches are what runs. The harness
+; models the BCM2712 pcie2 register block (link status, the inbound
+; windows, the config index/data pair to RP1) and one RP1 DWC3 core in
+; xHCI host mode whose DMA arrives through RP1's dma-ranges.
+;
+; NOTHING HERE IS A CLAIM ABOUT SILICON.
+;
+; Every check appends to res[]. The harness holds the expected list; a
+; failed bring-up records its codes and STOPS, so each refusal scenario is
+; a short, exact prefix rather than a cascade of follow-on failures.
+; ======================================================================
+
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+#RES_MAX = 128
+
+Global Dim res.i[#RES_MAX]
+Global nres.i = 0
+Global Dim desc.a[64]
+
+Procedure Chk(v.i)
+  If nres < #RES_MAX
+    res[nres] = v
+  EndIf
+  nres = nres + 1
+EndProcedure
+
+Procedure Main()
+  Define n.i
+  Define slot.i
+  Define i.i
+  Define good.i
+
+  ; ---- 1. the link and RP1, verified, never trained ------------------
+  Chk(PcieInit())
+  Chk(PcieError())
+  If PcieError() <> 0
+    Chk(XhciInit())               ; must refuse without touching RP1
+    Chk(XhciLastError())
+    ProcedureReturn
+  EndIf
+  Chk(PcieDmaWindowSize())
+  Chk(PcieDmaWindowBar())
+  Chk(PcieLinkSpeed())
+  Chk(PcieLinkWidth())
+  Chk(PcieEnumerate())
+  Chk(PcieError())
+  Chk(PcieDmaBus($12340))         ; the translation, from outside
+  Chk(PcieDmaCpu($1000012340))
+
+  ; ---- 2. DWC3 host mode, then the xHCI bring-up ---------------------
+  Chk(XhciInit())
+  Chk(XhciLastError())
+  If XhciReady() = 0
+    ProcedureReturn
+  EndIf
+  Chk(XhciDwc3Id())
+  Chk(XhciAc64())
+  Chk(XhciCapBase())
+  Chk(XhciDeviceId())
+  Chk(XhciMaxPorts())
+  Chk(XhciRp1Host())
+  Chk(XhciSelectRp1Host(1))       ; refused: the controller is running
+
+  ; ---- 3. command and event rings, both wrapped ----------------------
+  Chk(XhciNoOp())
+  Chk(XhciLastComp())
+  i = 0
+  good = 0
+  While i < 70
+    If XhciNoOp() <> 0
+      good = good + 1
+    EndIf
+    i = i + 1
+  Wend
+  Chk(good)
+  Chk(XhciSkippedEvents())
+
+  ; ---- 4. port status: SS port 3 trained; USB 2 port 1 unpowered with
+  ;         a high-speed device behind the switch; port 2 empty ---------
+  Chk(XhciFirstConnectedPort())
+  Chk(XhciPortSpeed(3))
+  Chk(XhciPortConnected(1))
+  Chk(XhciPortReset(1))
+  Chk(XhciPortEnabled(1))
+  Chk(XhciPortSpeed(1))
+  Chk(XhciPortReset(2))
+  Chk(XhciLastError())
+
+  ; ---- 5. Enable Slot, Address Device, a descriptor ------------------
+  slot = XhciEnableSlot()
+  Chk(slot)
+  Chk(XhciAddressDevice(slot, 1, 3))
+  Chk(XhciDeviceAddress())
+  Chk(XhciSlotState())
+  n = XhciGetDeviceDescriptor(@desc[0], 64)
+  Chk(n)
+  Chk(XhciLastComp())
+  Chk(desc[10])
+  Chk(desc[11])
+
+  ; ---- 6. the endpoint-0 ring wrapped through its (translated) Link ---
+  i = 0
+  good = 0
+  While i < 30
+    If XhciGetDescriptor(1, 0, 0, 8) = 8
+      good = good + 1
+    EndIf
+    i = i + 1
+  Wend
+  Chk(good)
+
+  ; ---- 7. a stall, recovered with a translated Set TR Dequeue --------
+  Chk(XhciGetDescriptor(99, 0, 0, 8))
+  Chk(XhciLastComp())
+  Chk(XhciLastError())
+  Chk(XhciGetDescriptor(1, 0, 0, 8))
+
+  ; ---- 8. the Pi 4 entry point refuses on this chip -------------------
+  Chk(XhciInitAt(1, 0, 0))
+  Chk(XhciLastError())
+
+  Chk(nres)
+EndProcedure
+
+Main()
