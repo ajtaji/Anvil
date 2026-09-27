@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[784]
+Global Dim pgReport.i[792]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (784 * 8), slot)
+  PokeI(#PG_OUT + (792 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -356,6 +356,7 @@ Procedure.i Main()
   Define copyImageAddress.i
   Define copyFailures.i
   Define copyRegion.VkBufferImageCopy
+  Define Dim readbackRegions.VkBufferImageCopy[2]
 
   pgPut(0, #PG_MAGIC)
   ; THE BOARD DIAGNOSTIC'S OWN MODULES, assembled by the same file the
@@ -3605,6 +3606,55 @@ Procedure.i Main()
   vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
   pgPut(756, vkEndCommandBuffer(cmd))
   pgPut(757, AnvilVkSubmissionOutstanding())
+  ; One public command copies two independent rectangles, including padded
+  ; destination rows. Every other destination byte must remain untouched.
+  For i = 0 To bufci\size - 1 : PokeA(AnvilVkBufferAddress(copyBuf) + i, $D3) : Next
+  readbackRegions[0]\bufferOffset = 64
+  readbackRegions[0]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  readbackRegions[0]\imageSubresource\layerCount = 1
+  readbackRegions[0]\imageOffset\x = 3 : readbackRegions[0]\imageOffset\y = 5
+  readbackRegions[0]\imageExtent\width = 4 : readbackRegions[0]\imageExtent\height = 4 : readbackRegions[0]\imageExtent\depth = 1
+  readbackRegions[1]\bufferOffset = 256
+  readbackRegions[1]\bufferRowLength = 6
+  readbackRegions[1]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  readbackRegions[1]\imageSubresource\layerCount = 1
+  readbackRegions[1]\imageOffset\x = 20 : readbackRegions[1]\imageOffset\y = 10
+  readbackRegions[1]\imageExtent\width = 4 : readbackRegions[1]\imageExtent\height = 3 : readbackRegions[1]\imageExtent\depth = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 2, @readbackRegions[0])
+  pgPut(776, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(777, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(778, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To bufci\size - 1
+    rc = $D3
+    If k >= 64 And k < 128
+      j = (k - 64) / 16 : i = (k - 64) % 16
+      rc = (((j + 5) * #PG_W + (i / 4 + 3)) * 4 + (i % 4)) * 37 + 11
+      rc = rc & $FF
+    ElseIf k >= 256 And k < 320
+      j = (k - 256) / 24 : i = (k - 256) % 24
+      If j < 3 And i < 16
+        rc = (((j + 10) * #PG_W + (i / 4 + 20)) * 4 + (i % 4)) * 37 + 11
+        rc = rc & $FF
+      EndIf
+    EndIf
+    If PeekA(AnvilVkBufferAddress(copyBuf) + k) <> rc : count = count + 1 : EndIf
+  Next
+  pgPut(779, count)
+  readbackRegions[1]\imageOffset\x = 62
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 2, @readbackRegions[0])
+  pgPut(780, vkEndCommandBuffer(cmd))
+  readbackRegions[1]\imageOffset\x = 20 : readbackRegions[1]\bufferOffset = 80
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 2, @readbackRegions[0])
+  pgPut(781, vkEndCommandBuffer(cmd))
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 33, @readbackRegions[0])
+  pgPut(782, vkEndCommandBuffer(cmd))
+  pgPut(783, AnvilVkSubmissionOutstanding())
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE

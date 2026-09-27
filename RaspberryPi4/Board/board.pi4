@@ -1291,14 +1291,6 @@ XIncludeFile "RaspberryPi4/Lib/touch_goodix.pi4"
 ; over I2C while its 200-command init table goes out over DSI.
 XIncludeFile "RaspberryPi4/Lib/dsi_host.pi4"
 XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2_dcs.pi4"
-CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: RP1's DesignWare DSI host (a different IP from dsi_host.pi4's
-  ; VC4 DSI1) and the official 7" panel, command mode only. It registers
-  ; itself as dsi_host.pi4's RP1 host, so dsi_panel_v2_dcs.pi4 above runs
-  ; unmodified. Desk gate: tools/a64/a64_dsi_pi5_check.py.
-  XIncludeFile "RaspberryPi4/Lib/dsi_dw.pi4"
-  XIncludeFile "RaspberryPi4/Lib/dsi_panel_rpi7.pi4"
-CompilerEndIf
 ; PWM, the SoC temperature, and the fan curve - the three halves of the
 ; `fan` command, in dependency order.
 ;
@@ -1999,12 +1991,6 @@ CompilerEndIf
 ; Touch's hardware backend follows screen geometry below, because input
 ; and presentation must use the same rotation and physical coordinates.
 XIncludeFile "RaspberryPi4/Board/dsi_cmd.pi4"
-CompilerIf #PMF_CHIP = 2712
-  ; The Pi 5's `dsi` (RP1 host). MANUAL ONLY: nothing at boot touches the
-  ; RP1 DSI block, whose registers may hang the core on a read while its
-  ; clock is off.
-  XIncludeFile "RaspberryPi4/Board/dsi_cmd_rp1.pi4"
-CompilerEndIf
 XIncludeFile "RaspberryPi4/Board/clock_info.pi4"
 XIncludeFile "Anvil/Core/auto.pbi"
 ; THE DISPLAY SEAM, ahead of everything that reports on a screen or
@@ -3147,7 +3133,7 @@ Procedure Main()
     ; A whole word only; d is dump. This board's own, so no RequireCap.
     ElseIf WordIs("dsi") <> 0
       CompilerIf #PMF_CHIP = 2712
-      CmdDsiRp1()
+      RequireCap(0, "dsi", "the DSI host, HVS and pixel valve it drives are the BCM2711's, and this Raspberry Pi 5 build has no driver for the BCM2712's")
       CompilerElse
       CmdDsi()
       CompilerEndIf

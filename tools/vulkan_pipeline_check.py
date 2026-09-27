@@ -61,14 +61,14 @@ LOADER_LR = 0xDEAD0000
 # original pipeline gate. This remains a finite execution ceiling: a valid
 # gate must return, while a mutation-created loop still terminates as an
 # infrastructure failure rather than being misreported as a semantic kill.
-STEP_LIMIT = int(os.environ.get("ANVIL_VK_PIPELINE_STEP_LIMIT", "180000000"))
+STEP_LIMIT = int(os.environ.get("ANVIL_VK_PIPELINE_STEP_LIMIT", "220000000"))
 MMIO = 0xFC000000
 
 IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 784
+REPORT_WORDS = 792
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1621,6 +1621,14 @@ def grade(cpu, rc) -> Grader:
     g.need("cross-region source and destination overlap refuses the array", slot(773), ERR_ARGS)
     g.need("image copy region count above capacity is refused", slot(774), ERR_ARGS)
     g.need("invalid image-copy arrays leave no flight", slot(775), 0)
+    g.need("two-region image readback records atomically", slot(776), 0)
+    g.need("two-region image readback submits", slot(777), 0)
+    g.need("two-region image readback completes", slot(778), 0)
+    g.need("two-region readback preserves pixels, padding and guards", slot(779), 0)
+    g.need("invalid later readback region refuses the array", slot(780), ERR_ARGS)
+    g.need("overlapping readback destinations refuse the array", slot(781), ERR_ARGS)
+    g.need("readback region count above capacity is refused", slot(782), ERR_ARGS)
+    g.need("invalid readback arrays leave no flight", slot(783), 0)
     g.need("whole image-to-buffer readback records", slot(717), 0)
     g.need("whole image-to-buffer readback submits", slot(718), 0)
     g.need("whole image-to-buffer readback completes", slot(719), 0)
