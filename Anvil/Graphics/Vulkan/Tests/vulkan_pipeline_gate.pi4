@@ -331,6 +331,8 @@ Procedure.i Main()
   Define cb.VkPipelineColorBlendStateCreateInfo
   Define gp.VkGraphicsPipelineCreateInfo
   Define rpbi.VkRenderPassBeginInfo
+  Define attachment.VkClearAttachment
+  Define clearRect.VkClearRect
   Define cbHandle.i
   Define texSlot.i
   Define fenceArray.i
@@ -3121,6 +3123,49 @@ Procedure.i Main()
   rc = vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000)
   pgPut(678, rc)
   pgPut(679, avkPipeInFlight[avkPipeSlot(pipeA)] + avkPipeInFlight[avkPipeSlot(pipeC)] + avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)] + avkBufInFlight[avkBufSlot(buf)] + avkBufInFlight[avkBufSlot(bufP)] + avkBufInFlight[avkBufSlot(bufC)])
+
+  ; A full attachment clear before the first draw replaces the pass load
+  ; clear. Mutating the caller's colour afterward cannot change that draw.
+  attachment\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  attachment\colorAttachment = 0
+  attachment\clearValue[0] = #PG_PUSH_R : attachment\clearValue[1] = #PG_PUSH_G
+  attachment\clearValue[2] = #PG_PUSH_B : attachment\clearValue[3] = #PG_PUSH_A
+  clearRect\rect\extent\width = #PG_W : clearRect\rect\extent\height = #PG_H
+  clearRect\baseArrayLayer = 0 : clearRect\layerCount = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  pgPut(697, avkCbClearWord[avkCmdSlot(cmd)])
+  pgPut(698, SizeOf(VkClearAttachment))
+  pgPut(699, SizeOf(VkClearRect))
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  bufHandle = buf : bufOffset = 0
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdEndRenderPass(cmd)
+  pgPut(691, vkEndCommandBuffer(cmd))
+  attachment\clearValue[0] = 0 : attachment\clearValue[1] = 0
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(692, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(693, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(694, AnvilVkTestBackendLastDrawColor())
+
+  ; Partial and post-draw clears must invalidate recording before submission.
+  clearRect\rect\extent\width = #PG_W - 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  vkCmdEndRenderPass(cmd)
+  pgPut(695, vkEndCommandBuffer(cmd))
+  clearRect\rect\extent\width = #PG_W
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
+  vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  vkCmdEndRenderPass(cmd)
+  pgPut(696, vkEndCommandBuffer(cmd))
 
   ; ------------------------------------------------------------------
   ;  Ordered teardown.

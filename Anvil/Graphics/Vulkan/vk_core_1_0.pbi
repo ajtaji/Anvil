@@ -227,6 +227,19 @@ Structure VkRect2D Align #PB_Structure_AlignC
   extent.VkExtent2D
 EndStructure
 
+; VkClearValue is a 16-byte union. This colour-word view preserves its C ABI.
+Structure VkClearAttachment Align #PB_Structure_AlignC
+  aspectMask.l
+  colorAttachment.l
+  clearValue.l[4]
+EndStructure
+
+Structure VkClearRect Align #PB_Structure_AlignC
+  rect.VkRect2D
+  baseArrayLayer.l
+  layerCount.l
+EndStructure
+
 Structure VkFormatProperties Align #PB_Structure_AlignC
   linearTilingFeatures.l
   optimalTilingFeatures.l

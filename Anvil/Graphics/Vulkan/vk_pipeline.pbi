@@ -2323,6 +2323,40 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
   avkRefCur[avkRefIndex(c, k)] = avkRpFinalLayout[rp]
 EndProcedure
 
+; The first whole-target attachment clear can replace the render pass load
+; clear. V3D executes the resulting word in its tile clear, before any draw.
+Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachment, *rect.VkClearRect)
+  Define c.i, fb.i, red.i, green.i, blue.i, alpha.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING Or avkCbRpActive[c] = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdClearAttachments requires a recording command buffer inside a render pass (Anvil code -20004, wrong command state); no clear was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkCbDrawCount[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments after a draw needs an ordered in-pass clear primitive (Anvil code -20005, unsupported order); this backend only folds a whole clear into the tile load before the first draw.")
+    ProcedureReturn
+  EndIf
+  fb = avkCbFb[c]
+  If fb = 0 Or *attachment\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *attachment\colorAttachment <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires the render pass's one colour attachment (Anvil code -20005, unsupported aspect or index); depth and stencil clears are unavailable.")
+    ProcedureReturn
+  EndIf
+  If *rect\rect\offset\x <> 0 Or *rect\rect\offset\y <> 0 Or *rect\rect\extent\width <> avkFbW[fb] Or *rect\rect\extent\height <> avkFbH[fb] Or *rect\baseArrayLayer <> 0 Or *rect\layerCount <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires the complete one-layer framebuffer (Anvil code -20005, partial attachment clear unavailable); no pixels were cleared.")
+    ProcedureReturn
+  EndIf
+  ; The VkClearValue union begins after two uint32 members. Read its four
+  ; binary32 words exactly as vkCmdBeginRenderPass reads pClearValues.
+  red = avkUnorm8FromF32Bits(avkU32(*attachment + 8))
+  green = avkUnorm8FromF32Bits(avkU32(*attachment + 12))
+  blue = avkUnorm8FromF32Bits(avkU32(*attachment + 16))
+  alpha = avkUnorm8FromF32Bits(avkU32(*attachment + 20))
+  avkCbClearWord[c] = (alpha << 24) | (red << 16) | (green << 8) | blue
+EndProcedure
+
 Procedure AnvilVkCmdBindPipeline(commandBuffer.i, bindPoint.i, pipeline.i)
   Define c.i
   Define p.i
