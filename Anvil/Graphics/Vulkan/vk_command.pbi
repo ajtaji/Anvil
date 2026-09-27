@@ -730,7 +730,8 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
 EndProcedure
 
 ; One rectangular linear BGRA8 image copy lowers to guarded DMA row transfers.
-; The two image references retain both allocations through the job.
+; Distinct images retain both allocations; a disjoint copy within one image
+; uses one reference and GENERAL layout for both roles.
 Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage.i, dstLayout.i, *r.VkImageCopy)
   Define c.i, d.i, src.i, dst.i, srcRef.i, dstRef.i, o.i
   Define rowBytes.i, rows.i, srcOffset.i, dstOffset.i
@@ -749,8 +750,8 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
   EndIf
   src = avkImgSlot(srcImage)
   dst = avkImgSlot(dstImage)
-  If src = 0 Or dst = 0 Or srcImage = dstImage
-    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdCopyImage requires two distinct live image handles (Anvil code -20002); no copy was recorded.")
+  If src = 0 Or dst = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdCopyImage requires live image handles (Anvil code -20002); no copy was recorded.")
     ProcedureReturn
   EndIf
   d = avkPoolDev[avkCmdPool[c]]
@@ -772,6 +773,10 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
   EndIf
   If Not (srcLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL Or srcLayout = #VK_IMAGE_LAYOUT_GENERAL) Or Not (dstLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL Or dstLayout = #VK_IMAGE_LAYOUT_GENERAL)
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImage requires a transfer-source or GENERAL source layout and a transfer-destination or GENERAL destination layout (Anvil code -20001); no copy was recorded.")
+    ProcedureReturn
+  EndIf
+  If srcImage = dstImage And (srcLayout <> #VK_IMAGE_LAYOUT_GENERAL Or dstLayout <> #VK_IMAGE_LAYOUT_GENERAL)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImage requires GENERAL layout for both roles when copying within one image (Anvil code -20001); no copy was recorded.")
     ProcedureReturn
   EndIf
   If *r\srcSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *r\dstSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *r\srcSubresource\mipLevel <> 0 Or *r\dstSubresource\mipLevel <> 0 Or *r\srcSubresource\baseArrayLayer <> 0 Or *r\dstSubresource\baseArrayLayer <> 0 Or *r\srcSubresource\layerCount <> 1 Or *r\dstSubresource\layerCount <> 1
