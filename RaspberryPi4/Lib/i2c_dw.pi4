@@ -1,0 +1,514 @@
+; ======================================================================
+;  i2c_dw.pi4 - the Pi 5's header I2C: RP1 I2C1, a Synopsys DesignWare
+;  I2C master. THE ONE FILE THAT KNOWS THE DESIGNWARE COMMAND-FIFO MODEL,
+;  the RP1 twin of RaspberryPi4/Lib/i2c.pi4 (which knows the BCM2711 BSC).
+;
+;  A DIFFERENT IP, SO A THIN HOST FILE (Rule 30). The BSC is "load DLEN,
+;  set ST, wait for DONE"; the DesignWare block is a command FIFO in which
+;  every byte is its own command word (data, or a READ request) carrying
+;  its own STOP flag. Nothing in i2c.pi4 applies, so nothing is shared.
+;
+;  ---- WHERE THE NUMBERS COME FROM (rule 21: do not guess) -------------
+;
+;  Pinned Linux, raspberrypi/linux 7e030b60792d:
+;    include/linux/designware_i2c.h     every register offset and bit below
+;    drivers/i2c/busses/i2c-designware-core.h    DW_IC_COMP_TYPE_VALUE,
+;                                       the TX_ABRT source bits
+;    drivers/i2c/busses/i2c-designware-master.c  the transfer sequence
+;                                       (i2c_dw_xfer_init, _xfer_msg), the
+;                                       STOP-on-last-byte rule and the SCL
+;                                       count formula (clock_calc)
+;    drivers/i2c/busses/i2c-designware-common.c  __i2c_dw_disable, the FIFO
+;                                       depths from COMP_PARAM_1, the
+;                                       COMP_TYPE identity check
+;  Vault Sources/rp1.dtsi:
+;    rp1_i2c1: i2c@74000  reg = <0xc0 0x40074000 0x0 0x1000>,
+;      compatible "snps,designware-i2c", clocks RP1_CLK_SYS,
+;      i2c-scl-rising-time-ns 65, i2c-scl-falling-time-ns 100
+;    RP1_CLK_SYS assigned-clock-rate 200000000
+;    rp1_i2c1_2_3: function "i2c1" on gpio2/gpio3, bias-pull-up
+;  pinctrl-rp1.c:484-485 - i2c1 is column a3 on GPIO 2 and 3, so FUNCSEL 3.
+;
+;  THE BASE ADDRESS, TRANSLATED THROUGH THE PI 5 DTB (Boot staging/
+;  bcm2712-rpi-5-b.dtb), not by eye: the rp1 node's ranges map RP1 bus
+;  0xc0_40000000 to PCI 0x0, and pcie@1000120000's ranges map PCI 0x0 to
+;  CPU 0x1f_00000000. So 0xc0_40074000 is CPU $1F00074000 - the same rule
+;  that gives RP1 UART0 $1F00030000, which the firmware printed on the
+;  first Pi 5 boot. (A vault note of 2026-09-26 wrote "$1F0000074000",
+;  two zeroes too many; that address is not RP1.)
+;
+;  ---- WHAT THIS DRIVER DOES AND DOES NOT DO ----------------------------
+;
+;  Polled, interrupts masked (INTR_MASK = 0, as i2c_dw_xfer_init does
+;  first). 7-bit addresses only. One message per call - START, address,
+;  n bytes, STOP - which is the HwI2c seam's contract on the Pi 4 too: a
+;  register read is HwI2cWrite then HwI2cRead, with a STOP between.
+;  No repeated start, no 10-bit, no SMBus quick command.
+;
+;  EVERY BYTE IS QUEUED WITH THE LAST ONE CARRYING STOP, AND THE FIFO IS
+;  KEPT FED. i2c-designware-master.c sets BIT(9) on the last byte "always"
+;  because IC_EMPTYFIFO_HOLD_MASTER_EN cannot be read back: on a block
+;  built without it an EMPTY TX FIFO ENDS THE TRANSFER with a STOP. So a
+;  write is queued as fast as TXFLR allows, never byte-then-wait.
+;
+;  THE TIMEOUT IS A DEADLINE ON THE ARCHITECTURAL COUNTER, read through
+;  RaspberryPi4/Lib/timer.pi4's Ticks()/TickHz() (the owner of that read -
+;  tools/layering_check.py's generic-timer-read protocol), plus an
+;  iteration backstop, so a counter nobody programmed cannot hang it.
+;  A timeout disables the controller before returning.
+;
+;  NACK IS NOT A TIMEOUT. A TX_ABRT whose TX_ABRT_SOURCE has any of bits
+;  0..4 (7B_ADDR_NOACK .. GCALL_NOACK, core.h DW_IC_TX_ABRT_NOACK) is a
+;  device that did not answer: #DWI2C_NACK. Any other abort (arbitration
+;  lost, master disabled) is reported as #DWI2C_ABORT with the raw source
+;  kept in dwi2c_abort_source for a diagnostic to print.
+;
+;  THE IDENTITY CHECK. DwI2cUp() reads COMP_TYPE and refuses the block
+;  unless it reads $44570140 ("DW" + $0140, core.h DW_IC_COMP_TYPE_VALUE)
+;  - the check the Linux driver makes before it trusts the registers. A
+;  wrong base address, or RP1 held in reset, fails HERE and loudly rather
+;  than as a bus that "has no devices".
+;
+;  THE CLOCK IS THE ONE UNMEASURED NUMBER. 200 MHz is the rate Linux
+;  ASSIGNS to RP1_CLK_SYS (rp1.dtsi); Anvil assumes the firmware left RP1
+;  at that rate (config.txt keeps RP1 up with pciex4_reset=0). The SCL
+;  counts are clock_calc()'s formula over it. If the bench measures a
+;  different SCL, #DWI2C_CLK_HZ is the line to change, and it is named.
+;
+;  DESK PROOF ONLY (tools/a64/i2c_dw_check.py). SILICON OWED.
+;
+;  DEPENDENCIES: RaspberryPi4/Lib/timer.pi4 (Ticks, TickHz) and
+;  RaspberryPi4/Lib/gpio_rp1.pi4 (the pin mux), both listed before this
+;  file by the board; a library never includes a library.
+; ======================================================================
+
+EnableExplicit
+
+#DWI2C_BASE = $1F00074000          ; RP1 I2C1 - see the header
+
+; Register offsets - include/linux/designware_i2c.h.
+#DWI2C_CON           = $00
+#DWI2C_TAR           = $04
+#DWI2C_DATA_CMD      = $10
+#DWI2C_SS_SCL_HCNT   = $14
+#DWI2C_SS_SCL_LCNT   = $18
+#DWI2C_FS_SCL_HCNT   = $1C
+#DWI2C_FS_SCL_LCNT   = $20
+#DWI2C_INTR_MASK     = $30
+#DWI2C_RAW_INTR_STAT = $34
+#DWI2C_RX_TL         = $38
+#DWI2C_TX_TL         = $3C
+#DWI2C_CLR_INTR      = $40
+#DWI2C_CLR_TX_ABRT   = $54
+#DWI2C_CLR_STOP_DET  = $60
+#DWI2C_ENABLE        = $6C
+#DWI2C_TXFLR         = $74
+#DWI2C_RXFLR         = $78
+#DWI2C_TX_ABRT_SOURCE = $80
+#DWI2C_ENABLE_STATUS = $9C
+#DWI2C_COMP_PARAM_1  = $F4
+#DWI2C_COMP_TYPE     = $FC
+
+#DWI2C_COMP_TYPE_VALUE = $44570140 ; core.h:31
+
+; IC_CON: MASTER | SPEED | RESTART_EN | SLAVE_DISABLE - the master_cfg
+; i2c_dw_configure_master() builds (master.c:998-1011).
+#DWI2C_CON_MASTER        = $01
+#DWI2C_CON_SPEED_STD     = $02
+#DWI2C_CON_SPEED_FAST    = $04
+#DWI2C_CON_RESTART_EN    = $20
+#DWI2C_CON_SLAVE_DISABLE = $40
+
+; IC_DATA_CMD - bit 8 READ, bit 9 STOP (master.c: 0x100, BIT(9)).
+#DWI2C_CMD_READ = $100
+#DWI2C_CMD_STOP = $200
+
+; IC_RAW_INTR_STAT bits.
+#DWI2C_INTR_TX_ABRT  = $40         ; BIT(6)
+#DWI2C_INTR_STOP_DET = $200        ; BIT(9)
+
+#DWI2C_ABRT_NOACK = $1F            ; core.h: TX_ABRT bits 0..4
+
+; SCL timing inputs (rp1.dtsi i2c1 node, RP1_CLK_SYS).
+#DWI2C_CLK_HZ   = 200000000
+#DWI2C_RISE_NS  = 65
+#DWI2C_FALL_NS  = 100
+#DWI2C_RATE_MAX = 400000           ; fast mode; FM+ and HS not offered
+#DWI2C_DEFAULT_HZ = 100000
+
+; The pins (pinctrl-rp1.c:484-485, rp1.dtsi rp1_i2c1_2_3).
+#DWI2C_PIN_SDA  = 2
+#DWI2C_PIN_SCL  = 3
+#DWI2C_FUNCSEL  = 3
+
+#DWI2C_TIMEOUT_US  = 20000         ; per transfer, plus one per byte below
+#DWI2C_BYTE_US     = 1000
+#DWI2C_SPIN_MAX    = 2000000
+
+; Results. The numbers equal hal.pbi's #HW_I2C_* where one exists, but
+; hw_i2c.pi4 maps them by name - see its I2cMapCode note.
+#DWI2C_OK      = 0
+#DWI2C_NACK    = -2
+#DWI2C_TIMEOUT = -4
+#DWI2C_ARG     = -5
+#DWI2C_RANGE   = -7
+#DWI2C_ABORT   = -9                ; TX_ABRT for a reason other than NACK
+#DWI2C_NODEV   = -10               ; COMP_TYPE did not identify the block
+
+Global dwi2c_up.i
+Global dwi2c_rate.i
+Global dwi2c_txdepth.i
+Global dwi2c_rxdepth.i
+Global dwi2c_abort_source.i
+Global dwi2c_comp_type.i
+Global dwi2c_hcnt.i
+Global dwi2c_lcnt.i
+Global dwi2c_calc_h.i            ; DwI2cCounts' answer, not yet programmed
+Global dwi2c_calc_l.i
+Global dwi2c_timeouts.i
+Global dwi2c_probe_byte.i
+
+Procedure DwI2cBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+Procedure.i DwI2cRd(off.i)
+  ProcedureReturn PeekN(#DWI2C_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure DwI2cWr(off.i, v.i)
+  PokeL(#DWI2C_BASE + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cCounts(hz) - clock_calc() (master.c:56-72) for this clock and
+;  these edges, into dwi2c_calc_h/dwi2c_calc_l (NOT the live counts - a
+;  refused or exploratory call must not disturb what is programmed). Returns the achieved rate in
+;  Hz (clock / period), or #DWI2C_RANGE for a rate the 16-bit counts
+;  cannot reach. Linux CLAMPS at $FFFF and carries on at a rate nobody
+;  asked for; this refuses, like i2c.pi4 does for its divider.
+;
+;  min_high_ns: 4000 up to 100 kHz, then linear 4000 -> 600 at 400 kHz.
+;  high = ceil(clk_khz * min_high_ns / 1e6) + 1, less the fall time in
+;  cycles; low = period - high - the rise time in cycles.
+; ----------------------------------------------------------------------
+Procedure.i DwI2cCounts(hz.i)
+  Define clkKhz.i
+  Define wantKhz.i
+  Define minHighNs.i
+  Define high.i
+  Define period.i
+  Define hc.i
+  Define lc.i
+  If hz <= 0 Or hz > #DWI2C_RATE_MAX
+    ProcedureReturn #DWI2C_RANGE
+  EndIf
+  clkKhz = #DWI2C_CLK_HZ / 1000
+  wantKhz = hz / 1000
+  If wantKhz < 1
+    ProcedureReturn #DWI2C_RANGE
+  EndIf
+  If wantKhz <= 100
+    minHighNs = 4000
+  Else
+    minHighNs = ((wantKhz - 100) * 600 + (400 - wantKhz) * 4000) / 300
+  EndIf
+  high = (clkKhz * minHighNs + 999999) / 1000000 + 1
+  period = (clkKhz + wantKhz - 1) / wantKhz
+  hc = high - (clkKhz * #DWI2C_FALL_NS) / 1000000
+  lc = period - high - (clkKhz * #DWI2C_RISE_NS) / 1000000
+  ; The databook minimums (HCNT >= 6, LCNT >= 8) and the 16-bit fields.
+  If hc < 6 Or lc < 8 Or hc > $FFFF Or lc > $FFFF
+    ProcedureReturn #DWI2C_RANGE
+  EndIf
+  dwi2c_calc_h = hc
+  dwi2c_calc_l = lc
+  ProcedureReturn #DWI2C_CLK_HZ / period
+EndProcedure
+
+; The slowest and fastest rates DwI2cCounts accepts, found by the same
+; arithmetic rather than written down - so they move if the clock does.
+Procedure.i DwI2cRateMin()
+  Define khz.i
+  khz = 1
+  While khz <= 400
+    If DwI2cCounts(khz * 1000) > 0
+      ProcedureReturn khz * 1000
+    EndIf
+    khz = khz + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DwI2cRateMax()
+  ProcedureReturn #DWI2C_RATE_MAX
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cDisable() - IC_ENABLE = 0 and wait for IC_ENABLE_STATUS bit 0 to
+;  clear (__i2c_dw_disable, common.c:541-600). TAR, CON and the counts
+;  may only be written while it is clear. Returns 1, or 0 if it never
+;  cleared inside the deadline.
+; ----------------------------------------------------------------------
+Procedure.i DwI2cDisable()
+  Define n.i
+  DwI2cWr(#DWI2C_ENABLE, 0)
+  n = 0
+  While n < 100000
+    If (DwI2cRd(#DWI2C_ENABLE_STATUS) & 1) = 0
+      ProcedureReturn 1
+    EndIf
+    n = n + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; Program CON and the SCL counts for dwi2c_rate. Controller must be off.
+Procedure DwI2cProgram()
+  Define con.i
+  con = #DWI2C_CON_MASTER | #DWI2C_CON_RESTART_EN | #DWI2C_CON_SLAVE_DISABLE
+  If dwi2c_rate > 100000
+    con = con | #DWI2C_CON_SPEED_FAST
+    DwI2cWr(#DWI2C_FS_SCL_HCNT, dwi2c_hcnt)
+    DwI2cWr(#DWI2C_FS_SCL_LCNT, dwi2c_lcnt)
+  Else
+    con = con | #DWI2C_CON_SPEED_STD
+    DwI2cWr(#DWI2C_SS_SCL_HCNT, dwi2c_hcnt)
+    DwI2cWr(#DWI2C_SS_SCL_LCNT, dwi2c_lcnt)
+  EndIf
+  DwI2cWr(#DWI2C_CON, con)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cUp() - mux GPIO 2/3 to i2c1 with the pull-ups rp1.dtsi asks for,
+;  identify the block, read its FIFO depths, program 100 kHz. Once. A bus
+;  already up is left alone, rate included (the Pi 4 lesson in
+;  hw_i2c.pi4: re-initialising per command threw away `i2c speed`).
+;  Returns 1, or 0 with the reason in DwI2cUpError().
+; ----------------------------------------------------------------------
+Procedure.i DwI2cUp()
+  Define p.i
+  If dwi2c_up = 1
+    ProcedureReturn 1
+  EndIf
+  If Rp1FuncSelSet(#DWI2C_PIN_SDA, #DWI2C_FUNCSEL) = 0 Or Rp1FuncSelSet(#DWI2C_PIN_SCL, #DWI2C_FUNCSEL) = 0
+    ProcedureReturn 0
+  EndIf
+  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_UP)
+  Rp1PinPull(#DWI2C_PIN_SCL, #RP1_PULL_UP)
+  DwI2cBarrier()
+  dwi2c_comp_type = DwI2cRd(#DWI2C_COMP_TYPE)
+  If dwi2c_comp_type <> #DWI2C_COMP_TYPE_VALUE
+    ProcedureReturn 0
+  EndIf
+  p = DwI2cRd(#DWI2C_COMP_PARAM_1)
+  dwi2c_txdepth = ((p >> 16) & $FF) + 1
+  dwi2c_rxdepth = ((p >> 8) & $FF) + 1
+  If DwI2cDisable() = 0
+    ProcedureReturn 0
+  EndIf
+  dwi2c_rate = DwI2cCounts(#DWI2C_DEFAULT_HZ)
+  dwi2c_hcnt = dwi2c_calc_h
+  dwi2c_lcnt = dwi2c_calc_l
+  DwI2cProgram()
+  DwI2cWr(#DWI2C_INTR_MASK, 0)
+  DwI2cWr(#DWI2C_RX_TL, 0)
+  DwI2cWr(#DWI2C_TX_TL, 0)
+  DwI2cBarrier()
+  dwi2c_up = 1
+  ProcedureReturn 1
+EndProcedure
+
+; What DwI2cUp found when it said no: #DWI2C_NODEV if COMP_TYPE was not
+; the DesignWare value (the number read is DwI2cCompType()), else
+; #DWI2C_TIMEOUT (the enable bit would not clear).
+Procedure.i DwI2cUpError()
+  If dwi2c_comp_type <> #DWI2C_COMP_TYPE_VALUE
+    ProcedureReturn #DWI2C_NODEV
+  EndIf
+  ProcedureReturn #DWI2C_TIMEOUT
+EndProcedure
+
+Procedure.i DwI2cCompType()
+  ProcedureReturn dwi2c_comp_type
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cSetSpeed(hz) - the achieved rate, or #DWI2C_RANGE with nothing
+;  touched. DwI2cGetSpeed() - the rate programmed.
+; ----------------------------------------------------------------------
+Procedure.i DwI2cSetSpeed(hz.i)
+  Define r.i
+  If DwI2cUp() = 0
+    ProcedureReturn DwI2cUpError()
+  EndIf
+  r = DwI2cCounts(hz)
+  If r <= 0
+    ProcedureReturn #DWI2C_RANGE
+  EndIf
+  If DwI2cDisable() = 0
+    ProcedureReturn #DWI2C_TIMEOUT
+  EndIf
+  dwi2c_rate = r
+  dwi2c_hcnt = dwi2c_calc_h
+  dwi2c_lcnt = dwi2c_calc_l
+  DwI2cProgram()
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i DwI2cGetSpeed()
+  If DwI2cUp() = 0
+    ProcedureReturn DwI2cUpError()
+  EndIf
+  ProcedureReturn dwi2c_rate
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DwI2cXfer(addr, *buf, n, rd) - ONE message: START, addr+R/W, n bytes,
+;  STOP. rd <> 0 reads into *buf, else writes from it. #DWI2C_* result.
+;
+;  i2c_dw_xfer_init's order: disable, TAR, mask interrupts, enable, read
+;  CLR_INTR to clear anything stale. Then the queue loop: an abort is
+;  checked FIRST on every pass (a NACKed last byte raises TX_ABRT and
+;  STOP_DET together, and it must read as the NACK it is), then the TX
+;  FIFO is fed while it has room - and for a read, while the RX FIFO has
+;  room for every READ command still outstanding, master.c's
+;  rx_outstanding rule - then the RX FIFO is drained. Done is every byte
+;  queued (and read) AND STOP_DET.
+; ----------------------------------------------------------------------
+Procedure.i DwI2cXfer(addr.i, *buf, n.i, rd.i)
+  Define issued.i
+  Define got.i
+  Define raw.i
+  Define cmd.i
+  Define src.i
+  Define hz.i
+  Define deadline.i
+  Define spins.i
+  Define result.i
+
+  If addr < 0 Or addr > $7F Or n < 1 Or n > 65535
+    ProcedureReturn #DWI2C_ARG
+  EndIf
+  If DwI2cUp() = 0
+    ProcedureReturn DwI2cUpError()
+  EndIf
+
+  DwI2cBarrier()
+  If DwI2cDisable() = 0
+    dwi2c_timeouts = dwi2c_timeouts + 1
+    ProcedureReturn #DWI2C_TIMEOUT
+  EndIf
+  DwI2cWr(#DWI2C_TAR, addr)
+  DwI2cWr(#DWI2C_INTR_MASK, 0)
+  DwI2cWr(#DWI2C_ENABLE, 1)
+  DwI2cRd(#DWI2C_ENABLE_STATUS)          ; master.c's dummy read
+  DwI2cRd(#DWI2C_CLR_INTR)
+
+  hz = TickHz()
+  deadline = 0
+  If hz > 0
+    deadline = Ticks() + (hz / 1000000) * (#DWI2C_TIMEOUT_US + n * #DWI2C_BYTE_US)
+  EndIf
+
+  issued = 0
+  got = 0
+  spins = 0
+  result = #DWI2C_TIMEOUT
+  Repeat
+    raw = DwI2cRd(#DWI2C_RAW_INTR_STAT)
+    If (raw & #DWI2C_INTR_TX_ABRT) <> 0
+      src = DwI2cRd(#DWI2C_TX_ABRT_SOURCE)
+      dwi2c_abort_source = src
+      DwI2cRd(#DWI2C_CLR_TX_ABRT)
+      If (src & #DWI2C_ABRT_NOACK) <> 0
+        result = #DWI2C_NACK
+      Else
+        result = #DWI2C_ABORT
+      EndIf
+      Break
+    EndIf
+    If issued < n
+      If DwI2cRd(#DWI2C_TXFLR) < dwi2c_txdepth
+        If rd = 0 Or (issued - got) < dwi2c_rxdepth
+          cmd = 0
+          If issued = n - 1
+            cmd = #DWI2C_CMD_STOP
+          EndIf
+          If rd <> 0
+            DwI2cWr(#DWI2C_DATA_CMD, cmd | #DWI2C_CMD_READ)
+          Else
+            DwI2cWr(#DWI2C_DATA_CMD, cmd | (PeekA(*buf + issued) & $FF))
+          EndIf
+          issued = issued + 1
+          Continue
+        EndIf
+      EndIf
+    EndIf
+    If rd <> 0 And got < issued
+      If DwI2cRd(#DWI2C_RXFLR) > 0
+        PokeA(*buf + got, DwI2cRd(#DWI2C_DATA_CMD) & $FF)
+        got = got + 1
+        Continue
+      EndIf
+    EndIf
+    If issued = n And (rd = 0 Or got = n)
+      If (raw & #DWI2C_INTR_STOP_DET) <> 0
+        DwI2cRd(#DWI2C_CLR_STOP_DET)
+        result = #DWI2C_OK
+        Break
+      EndIf
+    EndIf
+    spins = spins + 1
+    If spins > #DWI2C_SPIN_MAX
+      Break
+    EndIf
+    If deadline > 0
+      If Ticks() > deadline
+        Break
+      EndIf
+    EndIf
+  ForEver
+
+  If result = #DWI2C_TIMEOUT
+    dwi2c_timeouts = dwi2c_timeouts + 1
+    DwI2cDisable()
+  EndIf
+  DwI2cBarrier()
+  ProcedureReturn result
+EndProcedure
+
+Procedure.i DwI2cWrite(addr.i, *buf, n.i)
+  ProcedureReturn DwI2cXfer(addr, *buf, n, 0)
+EndProcedure
+
+Procedure.i DwI2cRead(addr.i, *buf, n.i)
+  ProcedureReturn DwI2cXfer(addr, *buf, n, 1)
+EndProcedure
+
+; A ONE-BYTE READ, not a zero-length write: the DesignWare block has no
+; zero-length transfer without the SMBus quick-command option, which is
+; not guaranteed present. i2cdetect -r probes the same way.
+Procedure.i DwI2cProbe(addr.i)
+  ProcedureReturn DwI2cXfer(addr, @dwi2c_probe_byte, 1, 1)
+EndProcedure
+
+Procedure.i DwI2cAbortSource()
+  ProcedureReturn dwi2c_abort_source
+EndProcedure
+
+; The pin seam's two readings: is the pin on i2c1, and what the pad reads
+; (RIO_IN reports the pad whatever function drives it).
+Procedure.i DwI2cPinMuxed(pin.i)
+  If Rp1FuncSelGet(pin) = #DWI2C_FUNCSEL
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DwI2cPadLevel(pin.i)
+  ProcedureReturn Rp1DigitalRead(pin)
+EndProcedure
