@@ -1,0 +1,65 @@
+; ======================================================================
+;  hw_bt.pi4 - the HwBt* seam (Anvil/Hal/hal.pbi): the Bluetooth HCI UART
+;  as a byte pipe, for Anvil/Net/hci.pbi. Thin wrappers that pick the
+;  chip's host file:
+;    BCM2712 (Pi 5)  RaspberryPi4/Lib/bt_uart_7271.pi4 - uarta, a 16550-
+;                    class brcm,bcm7271-uart; the board must first say the
+;                    pinctrl stepping with Bt7SetPinctrl(1 = C0 / 2 = D0)
+;    BCM2711 (Pi 4)  RaspberryPi4/Lib/bt_uart.pi4 - the PL011 on GPIO 30-33
+;  The board includes exactly one of those two, under the same
+;  CompilerIf #PMF_CHIP = 2712, before this file.
+;  DESK PROOF ONLY (tools/a64/hci_bt_check.py). Silicon owed.
+; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+
+Procedure.i HwBtOpen()
+  ProcedureReturn Bt7Open()
+EndProcedure
+
+Procedure HwBtClose()
+  Bt7Close()
+EndProcedure
+
+Procedure.i HwBtPut(b.i)
+  ProcedureReturn Bt7Put(b)
+EndProcedure
+
+Procedure.i HwBtGet()
+  ProcedureReturn Bt7Get()
+EndProcedure
+
+Procedure.i HwBtSetBaud(baud.i)
+  ProcedureReturn Bt7SetBaud(baud)
+EndProcedure
+
+Procedure.i HwBtWhy()
+  ProcedureReturn Bt7Why()
+EndProcedure
+
+CompilerElse
+
+Procedure.i HwBtOpen()
+  ProcedureReturn BtuOpen()
+EndProcedure
+
+Procedure HwBtClose()
+  BtuClose()
+EndProcedure
+
+Procedure.i HwBtPut(b.i)
+  ProcedureReturn BtuPut(b)
+EndProcedure
+
+Procedure.i HwBtGet()
+  ProcedureReturn BtuGet()
+EndProcedure
+
+Procedure.i HwBtSetBaud(baud.i)
+  ProcedureReturn BtuSetBaud(baud)
+EndProcedure
+
+Procedure.i HwBtWhy()
+  ProcedureReturn BtuWhy()
+EndProcedure
+
+CompilerEndIf

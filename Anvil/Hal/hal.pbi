@@ -1578,6 +1578,21 @@
 ;                                        assuming it.
 ;                 HwUartClose(n)
 ;
+;    HwBt*     (no #CAP - the board includes Bluetooth or it does not)
+;              THE BLUETOOTH CONTROLLER'S HCI UART, as a byte pipe.
+;              Anvil/Net/hci.pbi runs HCI (H4), the Broadcom patch
+;              download and the inquiry over it; the `bt` command
+;              (Anvil/Core/bt_cmd.pbi) drives hci.pbi. IMPLEMENTED on the
+;              Pi 4 and Pi 5 as RaspberryPi4/Board/hw_bt.pi4 over
+;              Lib/bt_uart.pi4 (PL011) or Lib/bt_uart_7271.pi4 (uarta).
+;                 HwBtOpen()             pins, power, UART at 115200 with
+;                                        RTS/CTS. 1, or 0 with HwBtWhy()
+;                 HwBtClose()
+;                 HwBtPut(b)             1, or 0 if the byte never left
+;                 HwBtGet()              a byte, or -1: never blocks
+;                 HwBtSetBaud(baud)      the host side only; 1 or 0
+;                 HwBtWhy()              ADDRESS of a sentence
+;
 ;    HwSpi*    (#CAP_SPI)  SPI. It stays on the critical path after the
 ;              2026-09-04 ruling because LoRa is a module on SPI and LoRa
 ;              is the vehicle link's second transport. IMPLEMENTED on the

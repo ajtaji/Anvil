@@ -1,0 +1,196 @@
+; ======================================================================
+;  bt_uart_7271.pi4 - the Pi 5's Bluetooth byte pipe: BCM2712 "uarta" to
+;  the CYW43455, and BT_REG_ON. The host side of the HwBt* seam (Board/hw_bt.pi4) Anvil/Net/hci.pbi runs
+;  HCI over. BCM2712 only - a different UART IP from the Pi 4's PL011
+;  (bt_uart.pi4), so a thin file of its own (rule 30), not a branch.
+;
+;  ---- WHERE THE NUMBERS COME FROM (vault Raspberry Pi 5/Sources) --------
+;  bcm2712-ds.dtsi 196-205: uarta: serial@7d50c000, "brcm,bcm7271-uart",
+;    reg <0x7d50c000 0x20>, reg-shift 2, reg-io-width 4 - through /soc's
+;    ranges (the translation already proven for UART10 at $107D001000) at
+;    CPU $107D50C000. A 16550-class port (8250_bcm7271.c): registers every
+;    FOUR bytes - RBR/THR/DLL $00, IER/DLM $04, FCR $08, LCR $0C (DLAB bit
+;    7), MCR $10 (RTS bit 1, AFE bit 5), LSR $14 (DR bit 0, THRE bit 5).
+;  bcm2712-rpi-5-b.dts 365-380: "uarta communicates with the BT module",
+;    uart-has-rtscts, auto-flow-control, clock-frequency 96000000,
+;    max-speed 3000000, shutdown-gpios = <&gio 29 GPIO_ACTIVE_HIGH>,
+;    pinctrl uarta_24_pins + bt_shutdown_pins (gpio29, function "gpio").
+;  bcm2712-ds.dtsi 141-162: uarta_24_pins - GPIO 24 RTS (no bias), 25 CTS
+;    (pull-up), 26 TXD (no bias), 27 RXD (pull-up), function "uart0".
+;  pinctrl-brcmstb-bcm2712.c - THE LAYOUT DEPENDS ON THE CHIP STEPPING,
+;    exactly as sdio.pi4 found for the radio's pins:
+;      C0 GPIO_REGS (150-155): 24 (3,0 / 9,1) 25 (3,1 / 9,2) 26 (3,2 / 9,3)
+;         27 (3,3 / 9,4) 29 (3,5 / 9,6); functions (540-545): uart0 is
+;         fsel 3 on GPIO 24, fsel 4 on 25-27.
+;      D0 GPIO_REGS (313-318): 24 (2,0 / 5,6) 25 (2,1 / 5,7) 26 (2,2 / 5,8)
+;         27 (2,3 / 5,9) 29 (2,5 / 5,11); functions (607-612): uart0 is
+;         fsel 4 on 24-27.
+;    (muxreg,muxbit / padreg,padbit): mux field at +muxreg*4 bit muxbit*4,
+;    pad at +padreg*4 bit padbit*2 (pinctrl-brcmstb.c BIT_TO_REG/SHIFT);
+;    pulls NONE 0 / UP 2 (pinctrl-brcmstb.c 30-32). Pinctrl base
+;    $107D504100. The board says which stepping (Bt7SetPinctrl, the same
+;    1 = C0 / 2 = D0 numbering as SdioSetPinctrl); unknown -> refuse.
+;  gio 29 - gpio-brcmstb.c: bank 0 at $107D508500, DATA +$04, IODIR +$08
+;    (1 = input), bit 29 (sdio.pi4 drives WL_ON = bit 28 of the same
+;    bank, so these are read-modify-writes of bit 29 alone).
+;  Divisor = 96 MHz / (16 x baud): 115200 -> 52 (+0.16 %), 3000000 -> 2.
+;
+;  DESK PROOF ONLY (tools/a64/hci_bt_check.py). SILICON OWED.
+;  DEPENDENCIES: none (mailbox-free: the Pi 5's BT_REG_ON is a SoC GPIO).
+; ======================================================================
+
+EnableExplicit
+
+#BT7_BASE = $107D50C000
+#BT7_THR = $00
+#BT7_DLL = $00
+#BT7_IER = $04
+#BT7_DLM = $04
+#BT7_FCR = $08
+#BT7_LCR = $0C
+#BT7_MCR = $10
+#BT7_LSR = $14
+
+#BT7_LCR_DLAB = $80
+#BT7_LCR_8N1  = $03
+#BT7_FCR_ON   = $07                ; enable, clear RX, clear TX
+#BT7_MCR_AFE  = $22                ; AFE | RTS: hardware RTS/CTS
+#BT7_LSR_DR   = $01
+#BT7_LSR_THRE = $20
+#BT7_CLOCK_HZ = 96000000
+
+#BT7_PINCTRL = $107D504100
+#BT7_GIO     = $107D508500
+#BT7_GIO_DATA  = $04
+#BT7_GIO_IODIR = $08
+#BT7_BT_ON_BIT = 29
+
+#BT7_PINCTRL_C0 = 1
+#BT7_PINCTRL_D0 = 2
+
+#BT7_TX_SPIN = 2000000
+
+Global bt7_pinctrl.i
+Global bt7_why.i
+Global bt7_open.i
+
+Procedure.i Bt7Rd(off.i)
+  ProcedureReturn PeekN(#BT7_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure Bt7Wr(off.i, v.i)
+  PokeL(#BT7_BASE + off, v)
+EndProcedure
+
+Procedure Bt7Field(base.i, off.i, shift.i, mask.i, value.i)
+  Define v.i
+  v = PeekN(base + off) & $FFFFFFFF
+  v = v & (~(mask << shift))
+  v = v | ((value & mask) << shift)
+  PokeL(base + off, v)
+EndProcedure
+
+; C0 = 1, D0 = 2 (the live DTB's pinctrl@7d504100 compatible). 1 if taken.
+Procedure.i Bt7SetPinctrl(kind.i)
+  If kind = #BT7_PINCTRL_C0 Or kind = #BT7_PINCTRL_D0
+    bt7_pinctrl = kind
+    ProcedureReturn 1
+  EndIf
+  bt7_pinctrl = 0
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Bt7MuxPins()
+  If bt7_pinctrl = #BT7_PINCTRL_C0
+    Bt7Field(#BT7_PINCTRL, $24, 2, 3, 0)        ; 24 RTS  no bias
+    Bt7Field(#BT7_PINCTRL, $24, 4, 3, 2)        ; 25 CTS  pull-up
+    Bt7Field(#BT7_PINCTRL, $24, 6, 3, 0)        ; 26 TXD  no bias
+    Bt7Field(#BT7_PINCTRL, $24, 8, 3, 2)        ; 27 RXD  pull-up
+    Bt7Field(#BT7_PINCTRL, $0C, 0, $F, 3)       ; 24 uart0 = fsel 3
+    Bt7Field(#BT7_PINCTRL, $0C, 4, $F, 4)       ; 25 uart0 = fsel 4
+    Bt7Field(#BT7_PINCTRL, $0C, 8, $F, 4)       ; 26
+    Bt7Field(#BT7_PINCTRL, $0C, 12, $F, 4)      ; 27
+    Bt7Field(#BT7_PINCTRL, $0C, 20, $F, 0)      ; 29 gpio
+  Else
+    Bt7Field(#BT7_PINCTRL, $14, 12, 3, 0)
+    Bt7Field(#BT7_PINCTRL, $14, 14, 3, 2)
+    Bt7Field(#BT7_PINCTRL, $14, 16, 3, 0)
+    Bt7Field(#BT7_PINCTRL, $14, 18, 3, 2)
+    Bt7Field(#BT7_PINCTRL, $08, 0, $F, 4)
+    Bt7Field(#BT7_PINCTRL, $08, 4, $F, 4)
+    Bt7Field(#BT7_PINCTRL, $08, 8, $F, 4)
+    Bt7Field(#BT7_PINCTRL, $08, 12, $F, 4)
+    Bt7Field(#BT7_PINCTRL, $08, 20, $F, 0)
+  EndIf
+EndProcedure
+
+; BT_REG_ON: value before direction, so the line never glitches.
+Procedure Bt7Power(on.i)
+  Bt7Field(#BT7_GIO, #BT7_GIO_DATA, #BT7_BT_ON_BIT, 1, on)
+  Bt7Field(#BT7_GIO, #BT7_GIO_IODIR, #BT7_BT_ON_BIT, 1, 0)
+EndProcedure
+
+Procedure.i Bt7Divisor(baud.i)
+  Define d.i
+  If baud <= 0 : ProcedureReturn 0 : EndIf
+  d = (#BT7_CLOCK_HZ + baud * 8) / (baud * 16)
+  If d < 1 Or d > $FFFF : ProcedureReturn 0 : EndIf
+  ProcedureReturn d
+EndProcedure
+
+Procedure.i Bt7Program(baud.i)
+  Define d.i = Bt7Divisor(baud)
+  If d = 0 : ProcedureReturn 0 : EndIf
+  Bt7Wr(#BT7_IER, 0)
+  Bt7Wr(#BT7_LCR, #BT7_LCR_DLAB | #BT7_LCR_8N1)
+  Bt7Wr(#BT7_DLL, d & $FF)
+  Bt7Wr(#BT7_DLM, (d >> 8) & $FF)
+  Bt7Wr(#BT7_LCR, #BT7_LCR_8N1)
+  Bt7Wr(#BT7_FCR, #BT7_FCR_ON)
+  Bt7Wr(#BT7_MCR, #BT7_MCR_AFE)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Bt7Why()
+  If bt7_why = 0 : ProcedureReturn "the Bluetooth UART is open" : EndIf
+  ProcedureReturn bt7_why
+EndProcedure
+
+Procedure.i Bt7Open()
+  bt7_open = 0
+  bt7_why = 0
+  If bt7_pinctrl <> #BT7_PINCTRL_C0 And bt7_pinctrl <> #BT7_PINCTRL_D0
+    bt7_why = "the board has not said which BCM2712 stepping this is (C0 or D0), and the Bluetooth pins' registers differ between them, so nothing was written"
+    ProcedureReturn 0
+  EndIf
+  Bt7MuxPins()
+  Bt7Power(1)
+  Bt7Program(115200)
+  bt7_open = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Bt7Close()
+  If bt7_open : Bt7Wr(#BT7_IER, 0) : EndIf
+  bt7_open = 0
+EndProcedure
+
+Procedure.i Bt7Put(b.i)
+  Define n.i = 0
+  While (Bt7Rd(#BT7_LSR) & #BT7_LSR_THRE) = 0
+    n + 1
+    If n > #BT7_TX_SPIN : ProcedureReturn 0 : EndIf
+  Wend
+  Bt7Wr(#BT7_THR, b & $FF)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Bt7Get()
+  If (Bt7Rd(#BT7_LSR) & #BT7_LSR_DR) = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn Bt7Rd(#BT7_THR) & $FF
+EndProcedure
+
+Procedure.i Bt7SetBaud(baud.i)
+  If Bt7Divisor(baud) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bt7Program(baud)
+EndProcedure

@@ -1,0 +1,204 @@
+; ======================================================================
+;  bt_uart.pi4 - the Pi 4's Bluetooth byte pipe: the BCM2711 PL011 UART0
+;  on GPIO 30-33 to the CYW43455, and BT_ON. The host side of the HwBt* seam that
+;  Anvil/Net/hci.pbi runs HCI over. Pi 4 (BCM2711) only: the Pi 5's
+;  Bluetooth UART is a different IP (a brcm,bcm7271-uart, 16550-class)
+;  and has its own thin file, RaspberryPi4/Lib/bt_uart_7271.pi4 (rule 30).
+;
+;  ---- WHERE THE NUMBERS COME FROM (pinned Linux 7e030b60792d) ----------
+;  bcm2711-rpi-4-b.dts 257-262: "uart0 communicates with the BT module",
+;    pinctrl-0 = <&uart0_ctsrts_gpio30 &uart0_gpio32>, uart-has-rtscts.
+;  bcm283x.dtsi 259-268: uart0_ctsrts_gpio30 = GPIO 30 (CTS) / 31 (RTS) on
+;    ALT3, pulls UP / OFF; uart0_gpio32 = GPIO 32 (TXD) / 33 (RXD) on ALT3,
+;    pulls OFF / UP. (BCM2835_PUD_UP is the device tree's number; on the
+;    BCM2711 gpio.pi4's #PULL_UP carries the inverted register encoding.)
+;  bcm271x-rpi-bt.dtsi 3-11: max-speed = <3000000>, shutdown-gpios =
+;    <&expgpio 0 GPIO_ACTIVE_HIGH>; bcm2711-rpi-4-b.dts 72: expgpio line 0
+;    is "BT_ON". gpio-raspberrypi-exp.c 20, 32-51, 82-93, 189: the firmware
+;    GPIO expander, line + RPI_EXP_GPIO_BASE (128), SET_GPIO_CONFIG with
+;    six words (gpio, direction 1 = out, polarity, term_en, term_pull_up,
+;    state) and SET_GPIO_STATE (gpio, state); a nonzero gpio word in the
+;    answer is a failure. Tags $00038043 / $00038041
+;    (raspberrypi-firmware.h).
+;  The PL011: RaspberryPi4/Lib/uart.pi4's header (BCM2711 peripherals ch.11)
+;    - base $FE201000, DR $00, FR $18 (BUSY 3, RXFE 4, TXFF 5), IBRD $24,
+;    FBRD $28, LCRH $2C (FEN 4, WLEN 6:5), CR $30 (UARTEN 0, TXE 8, RXE 9,
+;    RTSEN 14, CTSEN 15), IMSC $38, ICR $44; UARTCLK 48 MHz
+;    (init_uart_clock=48000000, the same boot-medium line uart.pi4 relies
+;    on); divisor = UARTCLK / (16 x baud), fraction in 64ths, rounded.
+;
+;  ---- THE PL011 IS ALSO THE CONSOLE: THE SWAP ---------------------------
+;  The BCM2711 has one PL011 that can reach GPIO 30-33, and Anvil's serial
+;  console is that same PL011 on GPIO 14/15 (uart.pi4). Driving Bluetooth
+;  through it moves the transmitter off the console's pins - the console
+;  would go silent mid-command. So BtuOpen() READS GPFSEL1 first and, if
+;  GPIO 14 or 15 is on ALT0 (the PL011), REFUSES and writes nothing at all.
+;  Bluetooth on this board needs the swap the stock firmware makes: the
+;  console on the mini UART (UART1, GPIO 14/15 ALT5) and the PL011 given
+;  to Bluetooth - the owner's decision, made where the console is chosen,
+;  not here. (The other direction, Bluetooth on the mini UART,
+;  bcm2711-rpi-4-b.dts uart1_bt_pins ALT5 at 230400, ties Bluetooth to the
+;  VPU clock; not done.)
+;
+;  DESK PROOF ONLY (tools/a64/hci_bt_check.py). SILICON OWED.
+;
+;  DEPENDENCIES: gpio.pi4 (PinAlt, PinPull, PinModeGet), mailbox.pi4
+;  (MailboxBegin/SetWord/Send/Word), listed before this file.
+; ======================================================================
+
+EnableExplicit
+
+#BTU_BASE  = $FE201000            ; PL011 UART0
+#BTU_DR    = $00
+#BTU_FR    = $18
+#BTU_IBRD  = $24
+#BTU_FBRD  = $28
+#BTU_LCRH  = $2C
+#BTU_CR    = $30
+#BTU_IMSC  = $38
+#BTU_ICR   = $44
+
+#BTU_FR_BUSY = $08
+#BTU_FR_RXFE = $10
+#BTU_FR_TXFF = $20
+#BTU_LCRH_8N1_FIFO = $70          ; WLEN = 11 (8 bits), FEN
+#BTU_CR_RUN  = $C301              ; CTSEN | RTSEN | RXE | TXE | UARTEN
+
+#BTU_CLOCK_HZ = 48000000
+
+#BTU_PIN_CTS = 30
+#BTU_PIN_RTS = 31
+#BTU_PIN_TXD = 32
+#BTU_PIN_RXD = 33
+#BTU_ALT     = 3
+
+#BTU_TAG_SET_GPIO_CONFIG = $00038043
+#BTU_TAG_SET_GPIO_STATE  = $00038041
+#BTU_EXP_BT_ON = 128              ; expgpio 0 + RPI_EXP_GPIO_BASE
+
+#BTU_TX_SPIN = 2000000
+
+Global btu_why.i
+Global btu_open.i
+
+Procedure.i BtuRd(off.i)
+  ProcedureReturn PeekN(#BTU_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure BtuWr(off.i, v.i)
+  PokeL(#BTU_BASE + off, v)
+EndProcedure
+
+Procedure BtuBarrier()
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; BT_ON through the firmware expander: configure as an output, then drive.
+Procedure.i BtuPower(on.i)
+  If MailboxBegin(#BTU_TAG_SET_GPIO_CONFIG, 24, 24) = 0 : ProcedureReturn 0 : EndIf
+  MailboxSetWord(0, #BTU_EXP_BT_ON)
+  MailboxSetWord(1, 1)
+  MailboxSetWord(2, 0)
+  MailboxSetWord(3, 0)
+  MailboxSetWord(4, 0)
+  MailboxSetWord(5, on)
+  If MailboxSend() = 0 Or MailboxWord(0) <> 0 : ProcedureReturn 0 : EndIf
+  If MailboxBegin(#BTU_TAG_SET_GPIO_STATE, 8, 8) = 0 : ProcedureReturn 0 : EndIf
+  MailboxSetWord(0, #BTU_EXP_BT_ON)
+  MailboxSetWord(1, on)
+  If MailboxSend() = 0 Or MailboxWord(0) <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The 64ths-of-a-divisor value, rounded; 0 if out of the PL011's range.
+Procedure.i BtuDiv64(baud.i)
+  Define d.i
+  If baud <= 0 : ProcedureReturn 0 : EndIf
+  d = (#BTU_CLOCK_HZ * 4 + baud / 2) / baud
+  If d < 64 Or (d >> 6) > $FFFF : ProcedureReturn 0 : EndIf
+  ProcedureReturn d
+EndProcedure
+
+; Program the rate with the UART disabled and drained (the PL011 TRM's
+; order, uart.pi4's order): CR = 0, wait not BUSY, flush the FIFOs, then
+; IBRD/FBRD and LCRH together, then CR.
+Procedure.i BtuProgram(baud.i)
+  Define d.i = BtuDiv64(baud)
+  Define n.i
+  If d = 0 : ProcedureReturn 0 : EndIf
+  BtuWr(#BTU_CR, 0)
+  n = 0
+  While (BtuRd(#BTU_FR) & #BTU_FR_BUSY) <> 0 And n < #BTU_TX_SPIN : n + 1 : Wend
+  BtuWr(#BTU_LCRH, 0)
+  BtuWr(#BTU_IMSC, 0)
+  BtuWr(#BTU_ICR, $7FF)
+  BtuWr(#BTU_IBRD, d >> 6)
+  BtuWr(#BTU_FBRD, d & 63)
+  BtuWr(#BTU_LCRH, #BTU_LCRH_8N1_FIFO)
+  BtuWr(#BTU_CR, #BTU_CR_RUN)
+  BtuBarrier()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i BtuWhy()
+  If btu_why = 0 : ProcedureReturn "the Bluetooth UART is open" : EndIf
+  ProcedureReturn btu_why
+EndProcedure
+
+Procedure.i BtuOpen()
+  btu_open = 0
+  btu_why = 0
+  ; THE SWAP. Read only - a refusal writes nothing.
+  If PinModeGet(14) = #PIN_ALT0 Or PinModeGet(15) = #PIN_ALT0
+    btu_why = "the PL011 is this board's serial console on GPIO 14 and 15; Bluetooth needs the same PL011 on GPIO 30 to 33, so the console must move to the mini UART first"
+    ProcedureReturn 0
+  EndIf
+  If BtuPower(1) = 0
+    btu_why = "the firmware would not drive BT_ON (expander line 0) through the mailbox"
+    ProcedureReturn 0
+  EndIf
+  ; Pulls first, then the function, as uart.pi4 muxes its own pins.
+  PinPull(#BTU_PIN_CTS, #PULL_UP)
+  PinPull(#BTU_PIN_RTS, #PULL_NONE)
+  PinPull(#BTU_PIN_TXD, #PULL_NONE)
+  PinPull(#BTU_PIN_RXD, #PULL_UP)
+  PinAlt(#BTU_PIN_CTS, #BTU_ALT)
+  PinAlt(#BTU_PIN_RTS, #BTU_ALT)
+  PinAlt(#BTU_PIN_TXD, #BTU_ALT)
+  PinAlt(#BTU_PIN_RXD, #BTU_ALT)
+  BtuProgram(115200)
+  btu_open = 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure BtuClose()
+  If btu_open
+    BtuWr(#BTU_CR, 0)
+  EndIf
+  btu_open = 0
+EndProcedure
+
+Procedure.i BtuPut(b.i)
+  Define n.i = 0
+  While (BtuRd(#BTU_FR) & #BTU_FR_TXFF) <> 0
+    n + 1
+    If n > #BTU_TX_SPIN : ProcedureReturn 0 : EndIf
+  Wend
+  BtuWr(#BTU_DR, b & $FF)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i BtuGet()
+  If (BtuRd(#BTU_FR) & #BTU_FR_RXFE) <> 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn BtuRd(#BTU_DR) & $FF
+EndProcedure
+
+; The controller has already switched (hci.pbi waits for its Command
+; Complete first); drain what is in flight, then re-program.
+Procedure.i BtuSetBaud(baud.i)
+  If BtuDiv64(baud) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn BtuProgram(baud)
+EndProcedure

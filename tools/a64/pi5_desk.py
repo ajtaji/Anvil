@@ -77,7 +77,7 @@ def const_in(text: str, name: str, where: str) -> int:
 
 
 def build(cc: str, text: str, name: str, workdir: pathlib.Path,
-          override: dict, includes: list) -> tuple:
+          override: dict, includes: list, target: str = "pi5") -> tuple:
     """Compile `text` with its XIncludeFile lines for `includes` redirected
     to mutated copies where `override` names them. Returns (image, procs)."""
     workdir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +92,7 @@ def build(cc: str, text: str, name: str, workdir: pathlib.Path,
     src = workdir / (name + ".pi4")
     src.write_text(text, encoding="utf-8")
     img = workdir / (name + ".img")
-    r = subprocess.run([cc, "--compile", str(src), "-t", "pi5",
+    r = subprocess.run([cc, "--compile", str(src), "-t", target,
                         "--entry-returns", "--load-addr", hex(LOAD),
                         "--stack-addr", hex(STACK), "-o", str(img)],
                        cwd=str(ROOT), env=dict(os.environ, PMF_ROOT=str(ROOT)),
