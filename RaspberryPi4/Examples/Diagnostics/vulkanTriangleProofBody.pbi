@@ -749,7 +749,7 @@ CompilerEndIf
   Define vpstate.VkPipelineViewportStateCreateInfo
   Define vp.VkViewport
   Define sc.VkRect2D
-CompilerIf #VTP_PYRAMID_DEMO = 2
+CompilerIf #VTP_PYRAMID_DEMO >= 2
   Define dynamicState.VkPipelineDynamicStateCreateInfo
   Define Dim dynamicKinds.l[2]
 CompilerEndIf
@@ -1275,7 +1275,7 @@ CompilerElse
   vi\vertexAttributeDescriptionCount = 2
 CompilerEndIf
   gp\layout = layB
-CompilerIf #VTP_PYRAMID_DEMO = 2
+CompilerIf #VTP_PYRAMID_DEMO >= 2
   dynamicKinds[0] = #VK_DYNAMIC_STATE_VIEWPORT
   dynamicKinds[1] = #VK_DYNAMIC_STATE_SCISSOR
   dynamicState\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
@@ -1357,16 +1357,24 @@ CompilerIf #VTP_PYRAMID_DEMO
     EndIf
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
-CompilerIf #VTP_PYRAMID_DEMO = 2
+CompilerIf #VTP_PYRAMID_DEMO >= 2
     ; Exercise per-draw V3D viewport uniforms, clipper scale and scissor.
-    ; The final frame maps the pyramid into a half-size viewport.
+    ; The final frame maps the pyramid into a half-size viewport; mode three
+    ; also moves its origin without changing the coordinate shader's scale.
     If (frame & 1) <> 0
       PokeL(@vp\width, $43C80000)  ; 400.0
       PokeL(@vp\height, $44200000) ; 640.0
       sc\extent\width = 400 : sc\extent\height = 640
+CompilerIf #VTP_PYRAMID_DEMO = 3
+      PokeL(@vp\x, $43480000)      ; 200.0
+      PokeL(@vp\y, $43A00000)      ; 320.0
+      sc\offset\x = 200 : sc\offset\y = 320
+CompilerEndIf
     Else
+      PokeL(@vp\x, #VTP_F_ZERO) : PokeL(@vp\y, #VTP_F_ZERO)
       PokeL(@vp\width, $4447C000)  ; 799.0
       PokeL(@vp\height, $449FE000) ; 1279.0
+      sc\offset\x = 0 : sc\offset\y = 0
       sc\extent\width = #VTP_VIEW_W : sc\extent\height = #VTP_VIEW_H
     EndIf
     vkCmdSetViewport(cmd, 0, 1, @vp)
