@@ -415,11 +415,15 @@ Procedure.i Pi3LoaderBootMemory()
     ProcedureReturn 0
   EndIf
   If pi3_dtb >= $80000 And pi3_dtb < $200000 : ProcedureReturn 0 : EndIf
-  If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
+  ; THE WHOLE TREE, NOT ONLY ITS MAGIC AND LENGTH: FdtCheck (the one shared
+  ; reader, Anvil/Core/fdt.pbi) proves the header, the blocks and one full
+  ; token walk, bounded by the RAM left above the pointer and by 1 MiB - the
+  ; same size rule the magic-and-length check applied - so a torn DTB is
+  ; refused here rather than handed on.
+  total = pi3_ram_end - pi3_dtb
+  If total > 1048576 : total = 1048576 : EndIf
+  If FdtCheck(pi3_dtb, total) <> #FDT_OK : ProcedureReturn 0 : EndIf
   total = Pi3ReadBe32(pi3_dtb + 4)
-  If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
-    ProcedureReturn 0
-  EndIf
   pi3_dtb_end = pi3_dtb + total
   If pi3_dtb < $200000 And pi3_dtb_end > $80000 : ProcedureReturn 0 : EndIf
   ; All RAM remains unallocated. Preserve the entire DTB including reservations.
