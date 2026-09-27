@@ -2,8 +2,9 @@
 ;
 ; DIAGNOSTIC. IT DOES NOT SHIP. This is a returning, RAM-only instrument.
 ; It uses only public Vulkan commands for the render: an 8x8 optimal BGRA8
-; atlas is copied twice in order through TFU-backed vkCmdCopyBufferToImage,
-; then sampled with UV attributes,
+; atlas is uploaded twice through TFU-backed vkCmdCopyBufferToImage, copied
+; optimal-to-optimal, then copied from a prepared linear image to a fresh
+; optimal image through vkCmdCopyImage. The final image is sampled with UV attributes,
 ; multiplied by a per-draw push tint, blended, and drawn as eight ordered
 ; quads in one render pass. Each draw snapshots public vkCmdSetScissor state.
 ;
@@ -15,7 +16,7 @@
 ; Desk build:
 ;   PureMetalForge.exe --compile \
 ;     RaspberryPi4/Examples/Diagnostics/vulkanAtlasChromeProof.pi4 -t pi4 \
-;     --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;     --load-addr 0x600000 --stack-addr 0x3000000 --entry-returns \
 ;     -o vulkanAtlasChromeProof.img
 ;
 ; A future authorized Pi run must lease the board, use a returning deadman,
@@ -547,7 +548,11 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
   Define texMem.i
   Define texCopy.i
   Define texCopyMem.i
-  Define texCopyView.i
+  Define texLinear.i
+  Define texLinearMem.i
+  Define texLinearCopy.i
+  Define texLinearCopyMem.i
+  Define texLinearCopyView.i
   Define stage.i
   Define stageMem.i
   Define texView.i
@@ -566,6 +571,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
   Define bytesVs.i
   Define bytesFs.i
   Define texAddr.i
+  Define texLinearPitch.i
   Define hostType.i
   Define shrec.i
   Define stream.i
@@ -1098,16 +1104,79 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
     EndIf
   EndIf
   If status = #VVP_OK
-    ivci\image = texCopy
-    rc = vkCreateImageView(dev, @ivci, 0, @texCopyView)
+    ; Host initialization prepares a linear VkImage; the Vulkan image copy
+    ; itself must use TFU and write a fresh optimal allocation.
+    ici\tiling = #VK_IMAGE_TILING_LINEAR
+    ici\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    rc = vkCreateImage(dev, @ici, 0, @texLinear)
     If rc = #VK_SUCCESS
-      dii\imageView = texCopyView
+      vkGetImageMemoryRequirements(dev, texLinear, @req)
+      texLinearPitch = AnvilVkImageRowPitch(texLinear)
+      mai\allocationSize = req\size : mai\memoryTypeIndex = hostType
+      rc = vkAllocateMemory(dev, @mai, 0, @texLinearMem)
+    EndIf
+    If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, texLinear, texLinearMem, 0) : EndIf
+    If rc = #VK_SUCCESS : rc = vkMapMemory(dev, texLinearMem, 0, #VK_WHOLE_SIZE, 0, @mapped) : EndIf
+    If rc = #VK_SUCCESS
+      k = 0
+      While k < (#VAC_ATLAS_W * #VAC_ATLAS_H)
+        PokeL(mapped + (k / #VAC_ATLAS_W) * texLinearPitch + (k % #VAC_ATLAS_W) * 4, PeekL(AnvilVkBufferAddress(stage) + 64 + ((k / #VAC_ATLAS_W) * #VAC_ATLAS_SOURCE_STRIDE + (k % #VAC_ATLAS_W)) * 4))
+        k = k + 1
+      Wend
+      vkUnmapMemory(dev, texLinearMem)
+    EndIf
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_IMAGE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+    ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+    rc = vkCreateImage(dev, @ici, 0, @texLinearCopy)
+    If rc = #VK_SUCCESS
+      vkGetImageMemoryRequirements(dev, texLinearCopy, @req)
+      mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+      rc = vkAllocateMemory(dev, @mai, 0, @texLinearCopyMem)
+    EndIf
+    If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, texLinearCopy, texLinearCopyMem, 0) : EndIf
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_IMAGE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    vkResetCommandBuffer(cmd, 0)
+    rc = vkBeginCommandBuffer(cmd, *bi)
+    If rc = #VK_SUCCESS
+      bar\image = texLinear
+      bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      bar\image = texLinearCopy
+      bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdCopyImage(cmd, texLinear, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texLinearCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopy)
+      bar\image = texLinearCopy
+      bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    fenceArray = fence
+    If rc = #VK_SUCCESS : rc = vkResetFences(dev, 1, @fenceArray) : EndIf
+    If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, *si, fence) : EndIf
+    If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) : EndIf
+    If rc <> #VK_SUCCESS Or AnvilVkImageLayout(texLinearCopy) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc)
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    ivci\image = texLinearCopy
+    rc = vkCreateImageView(dev, @ivci, 0, @texLinearCopyView)
+    If rc = #VK_SUCCESS
+      dii\imageView = texLinearCopyView
       AnvilVkFaultClear()
       vkUpdateDescriptorSets(dev, 1, @wds[1], 0, 0)
       If AnvilVkFaultCode() <> #ANVIL_VK_OK : rc = AnvilVkFaultCode() : EndIf
     EndIf
     If rc <> #VK_SUCCESS : status = #VVP_ERR_DESCRIPTOR : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
-    texAddr = AnvilVkImageAddress(texCopy)
+    texAddr = AnvilVkImageAddress(texLinearCopy)
     vvpPut(#VVP_S_TEX_ADDR, texAddr)
   EndIf
 
@@ -1116,8 +1185,8 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
     vvpPut(#VVP_S_FAULT_BEFORE_MIX, AnvilVkFaultCount())
     vvpPut(#VVP_S_FAULT_CODE_BEFORE_MIX, AnvilVkFaultCode())
     ub = avkBufSlot(bufUni) : um = avkMemSlot(memUni)
-    ss = avkSamplerSlot(sampler) : sv = avkIvSlot(texCopyView)
-    simg = avkImgSlot(texCopy) : smem = avkMemSlot(texCopyMem)
+    ss = avkSamplerSlot(sampler) : sv = avkIvSlot(texLinearCopyView)
+    simg = avkImgSlot(texLinearCopy) : smem = avkMemSlot(texLinearCopyMem)
     fbSlot = avkFbSlot(*rpbi\framebuffer) : av = avkFbView[fbSlot]
     aimg = avkIvImgSlot[av] : amem = avkImgMemSlot[aimg]
     vvpPut(#VVP_S_FLIGHT_BEFORE, avkBufInFlight[ub] + avkMemInFlight[um] + avkSampInFlight[ss] + avkIvInFlight[sv] + avkImgInFlight[simg] + avkMemInFlight[smem] + avkIvInFlight[av] + avkImgInFlight[aimg] + avkMemInFlight[amem])
@@ -1261,7 +1330,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
       status = #VVP_ERR_NO_JOBS
     ElseIf vvpGet(#VVP_S_TEX_MMU) <> 0 Or vvpGet(#VVP_S_TEX_OOM) <> 0 Or vvpGet(#VVP_S_TEX_NATIVE) <> 0
       status = #VVP_ERR_V3D_FAULT
-    ElseIf vvpGet(#VVP_S_TFU_AFTER) - vvpGet(#VVP_S_TFU_BEFORE) <> 3 Or vvpGet(#VVP_S_TEX_COPY_SUBMIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_WAIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_LAYOUT) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    ElseIf vvpGet(#VVP_S_TFU_AFTER) - vvpGet(#VVP_S_TFU_BEFORE) <> 4 Or vvpGet(#VVP_S_TEX_COPY_SUBMIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_WAIT) <> #VK_SUCCESS Or vvpGet(#VVP_S_TEX_COPY_LAYOUT) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
       status = #VVP_ERR_DESCRIPTOR_LOWERING
     ElseIf vvpGet(#VVP_S_TEX_STATE_BASE) <> (texAddr & $FFFFFFFF) Or vvpGet(#VVP_S_TEX_STATE_WIDTH) <> $20000000 Or vvpGet(#VVP_S_TEX_STATE_HEIGHT) <> $00400800 Or vvpGet(#VVP_S_TEX_STATE_FORMAT) <> $00A9C840 Or vvpGet(#VVP_S_TEX_UIF_WORD4) <> $40 Or vvpGet(#VVP_S_TEX_SAMP0) <> $83 Or vvpGet(#VVP_S_TEX_SAMP1) <> $00090000 Or vvpGet(#VVP_S_TEX_STREAM_TLB) <> $FFFFFFFF
       status = #VVP_ERR_DESCRIPTOR_LOWERING
@@ -1283,7 +1352,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
   vkDestroyDescriptorPool(dev, dpool, 0)
   vkDestroyDescriptorSetLayout(dev, dsl, 0)
   vkDestroySampler(dev, sampler, 0)
-  vkDestroyImageView(dev, texCopyView, 0)
+  vkDestroyImageView(dev, texLinearCopyView, 0)
   vkDestroyImageView(dev, texView, 0)
   vkDestroyBuffer(dev, stage, 0)
   vkFreeMemory(dev, stageMem, 0)
@@ -1291,6 +1360,10 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
   vkFreeMemory(dev, texMem, 0)
   vkDestroyImage(dev, texCopy, 0)
   vkFreeMemory(dev, texCopyMem, 0)
+  vkDestroyImage(dev, texLinear, 0)
+  vkFreeMemory(dev, texLinearMem, 0)
+  vkDestroyImage(dev, texLinearCopy, 0)
+  vkFreeMemory(dev, texLinearCopyMem, 0)
   ProcedureReturn status
 EndProcedure
 
