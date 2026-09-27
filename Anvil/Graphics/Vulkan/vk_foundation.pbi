@@ -242,6 +242,24 @@ Structure AnvilVkBackendImageCopy Align #PB_Structure_AlignC
   timeoutUs.i
 EndStructure
 
+; A complete level-zero optimal-image copy, with both resources resolved to
+; mapped addresses before crossing the backend boundary.
+Structure AnvilVkBackendTiledImageCopy Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
+  sourceLayout.i
+  destinationLayout.i
+  paddedWidth.i
+  paddedHeight.i
+  timeoutUs.i
+EndStructure
+
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   pipeline.i          ; the backend's own pipeline slot
   targetBase.i        ; the colour attachment's first byte
@@ -347,6 +365,8 @@ Declare.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, *p
 Declare.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
 Declare.i avkBackendImageCopyBatchReady()
 Declare.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+Declare.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
+Declare.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
 Declare.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
 Declare.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)

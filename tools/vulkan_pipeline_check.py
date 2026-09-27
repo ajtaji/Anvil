@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 815
+REPORT_WORDS = 824
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1293,6 +1293,15 @@ def grade(cpu, rc) -> Grader:
     g.need("ordered optimal upload submission", slot(812), 0)
     g.need("two optimal TFU uploads reach the backend", slot(813), 2)
     g.need("ordered optimal upload publishes final layout", slot(814), 5)
+    g.need("optimal image-copy destination creation", slot(815), 0)
+    g.need("optimal image-copy memory allocation", slot(816), 0)
+    g.need("optimal image-copy memory binding", slot(817), 0)
+    g.need("optimal image-copy command recording", slot(818), 0)
+    g.need("optimal image-copy submission", slot(819), 0)
+    g.need("optimal image copy reaches the tiled TFU backend", slot(820), 1)
+    g.need("optimal image copy publishes destination layout", slot(821), 5)
+    g.need("optimal image-copy fence settles", slot(822), 0)
+    g.need("optimal image copy restores source layout", slot(823), 5)
     g.need("backend failure is reported as device lost", slot(264), -4)
     g.need("failed copy does not publish its final shader-read layout", slot(265), 0)
     g.need("failed-copy fence is settled", slot(266), 0)

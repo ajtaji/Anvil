@@ -45,6 +45,7 @@ EXPECTED_TOKENS = (
     "dstBytes = paddedW * paddedH * #ANVIL_V3D_TEXTURE_TEXEL_BYTES",
     "V3dTfuSourceRaster(*transfer\\sourceBase, *plan\\sourceStrideTexels, *plan\\sourceReadBytes)",
     "V3dTfuDest(*transfer\\destinationBase, *plan\\tfuOutputFormat, *plan\\destinationBytes)",
+    "V3dTfuSourceUifNoXor(*copy\\sourceBase, *plan\\paddedHeight, *plan\\destinationBytes)",
     "ProcedureReturn V3dTfuWait(*transfer\\timeoutUs)",
 )
 
@@ -276,7 +277,7 @@ def main() -> int:
         return 1
 
     print(f"vulkan_v3d_texture_check: PASS - {checks} emitted checks, {steps:,} instructions")
-    print("  raw four-byte raster staging -> V3D 4.2 UIF_NO_XOR, level 0 only")
+    print("  raw four-byte raster staging or UIF_NO_XOR source -> V3D 4.2 UIF_NO_XOR, level 0 only")
     print("  independent UIF address oracle covers 1x1, utile/block edges, odd and 4096x4096")
     print("  mapped ranges, capacities, alignment, overlap and timeout refuse before TFU")
     print("  exact Begin/Source/Dest/Submit/Wait order and injected owner failures are enforced")

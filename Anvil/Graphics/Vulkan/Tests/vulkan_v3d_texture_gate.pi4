@@ -64,6 +64,13 @@ Procedure.i V3dTfuSourceRaster(address.i, strideTexels.i, bytes.i)
   ProcedureReturn tgMockEnter(2)
 EndProcedure
 
+Procedure.i V3dTfuSourceUifNoXor(address.i, paddedHeight.i, bytes.i)
+  tgA0 = address
+  tgA1 = paddedHeight
+  tgA2 = bytes
+  ProcedureReturn tgMockEnter(2)
+EndProcedure
+
 Procedure.i V3dTfuDest(address.i, outputFormat.i, bytes.i)
   tgA0 = address
   tgA1 = outputFormat
@@ -98,6 +105,7 @@ EndProcedure
 Procedure.i Main()
   Protected p.AvkV3dTexturePlan
   Protected t.AvkV3dTextureTransfer
+  Protected tiled.AvkV3dTextureTiledCopy
   Protected rc.i
   Protected i.i
 
@@ -203,6 +211,27 @@ Procedure.i Main()
   t\timeoutUs = 1000000
   tgMockReset(0)
   tgCheck(AnvilVkV3dTextureConvert(@t, @p) = 0 And tgCalls = 5)
+
+  ; Optimal-to-optimal conversion uses the tiled input setter and the
+  ; same finite TFU job order, after validating both complete allocations.
+  tiled\windowBase = $02000000 : tiled\windowBytes = $00100000
+  tiled\sourceBase = $02001000 : tiled\sourceBytes = 2048
+  tiled\destinationBase = $02002000 : tiled\destinationBytes = 2048
+  tiled\width = 17 : tiled\height = 13
+  tiled\paddedWidth = 32 : tiled\paddedHeight = 16
+  tiled\timeoutUs = 250000
+  tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureTiledConvert(@tiled, @p) = 0 And tgCalls = 5)
+  tgCheck(tgSeq[1] = 1 And tgSeq[2] = 2 And tgSeq[3] = 3 And tgSeq[4] = 4 And tgSeq[5] = 5)
+  tgMockReset(2)
+  tgCheck(AnvilVkV3dTextureTiledConvert(@tiled, @p) = -24002 And tgCalls = 2)
+  tgCheck(tgA0 = $02001000 And tgA1 = 16 And tgA2 = 2048)
+  tiled\sourceBytes = 2047 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureTiledConvert(@tiled, @p) = #ANVIL_V3D_TEXTURE_ERR_RANGE And tgCalls = 0)
+  tiled\sourceBytes = 2048 : tiled\destinationBase = $02001000 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureTiledConvert(@tiled, @p) = #ANVIL_V3D_TEXTURE_ERR_OVERLAP And tgCalls = 0)
+  tiled\destinationBase = $02002000 : tiled\paddedHeight = 8 : tgMockReset(0)
+  tgCheck(AnvilVkV3dTextureTiledConvert(@tiled, @p) = #ANVIL_V3D_TEXTURE_ERR_ARGS And tgCalls = 0)
 
   tgReport[0] = #TG_MAGIC
   tgReport[1] = tgChecks

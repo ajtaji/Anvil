@@ -326,7 +326,7 @@ Procedure.i AnvilVkImageFormatSupport(format.i, imageType.i, tiling.i, usage.i, 
       ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
     EndIf
   ElseIf tiling = #VK_IMAGE_TILING_OPTIMAL
-    If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
+    If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0
       ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
     EndIf
   Else

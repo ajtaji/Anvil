@@ -260,7 +260,7 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
     ProcedureReturn #VK_SUCCESS
   EndIf
   If tiling <> #VK_IMAGE_TILING_OPTIMAL : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
-  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
+  If (usage & (~(#VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT))) <> 0 : ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED : EndIf
   pw = ((width + 31) / 32) * 32
   ph = ((height + 7) / 8) * 8
   *plan\bytes = pw * ph * 4
@@ -274,6 +274,7 @@ Global avkTbLastCopySource.i = 0
 Global avkTbLastCopyDestination.i = 0
 Global avkTbLastCopyBytes.i = 0
 Global avkTbLastCopySourcePitch.i = 0
+Global avkTbTiledCopies.i = 0
 
 Procedure.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
   If *copy = 0 : ProcedureReturn -1 : EndIf
@@ -325,6 +326,30 @@ EndProcedure
 
 Procedure.i AnvilVkTestBackendLastCopyBytes()
   ProcedureReturn avkTbLastCopyBytes
+EndProcedure
+
+Procedure.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceBytes < 1 Or *copy\destinationBytes < 1 Or *copy\width < 1 Or *copy\height < 1 Or *copy\sourceLayout = 0 Or *copy\destinationLayout = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
+  If avkBackendTiledImageCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  If avkTbFail <> 0
+    avkTbNative = avkTbFail : avkTbFail = 0
+    ProcedureReturn -1
+  EndIf
+  avkTbTiledCopies = avkTbTiledCopies + 1
+  avkTbNative = 0
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i AnvilVkTestBackendTiledCopies()
+  ProcedureReturn avkTbTiledCopies
 EndProcedure
 
 Procedure.i AnvilVkTestBackendLastCopySourcePitch()

@@ -102,8 +102,16 @@ EndProcedure
   EndProcedure
 
   Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
-  ProcedureReturn -1
-EndProcedure
+    ProcedureReturn -1
+  EndProcedure
+
+  Procedure.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
+    ProcedureReturn -1
+  EndProcedure
+
+  Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
+    ProcedureReturn -1
+  EndProcedure
 
 Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
   ProcedureReturn -1

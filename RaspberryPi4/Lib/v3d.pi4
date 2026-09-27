@@ -3788,6 +3788,30 @@ Procedure.i V3dTfuSourceRaster(addr.i, strideTexels.i, bytes.i)
   ProcedureReturn #V3D_OK
 EndProcedure
 
+; A level-zero UIF_NO_XOR source uses IIS as padded height in UIF blocks,
+; rather than as a raster row pitch. The 32-bit texel owner supplies the
+; allocation byte span separately for cache maintenance.
+Procedure.i V3dTfuSourceUifNoXor(addr.i, paddedHeight.i, bytes.i)
+  Protected height.i
+  v3d_tfuHaveSrc = 0
+  height = (v3d_tfuIos >> #V3D_TFU_IOS_HEIGHT_SHIFT) & #V3D_TFU_IOS_DIM_MAX
+  If addr <= 0 Or (addr % #V3D_TFU_IOA_ADDR_ALIGN) <> 0 Or (v3d_tfuIos & #V3D_TFU_IOS_DIM_MAX) < 1 Or height < 1 Or paddedHeight < height Or (paddedHeight % 8) <> 0 Or bytes < 1
+    v3d_err = #V3D_ERR_TFU_ARGS
+    ProcedureReturn #V3D_ERR_TFU_ARGS
+  EndIf
+  CompilerIf #PMF_CHIP = 2712
+  v3d_tfuIcfg = V3dTfuIcfgWord(#V3D_TFU_IFMT_UIF_NO_XOR, (v3d_tfuIcfg >> #V3D_TFU_ICFG_TTYPE_SHIFT) & #V3D_TFU_ICFG_TTYPE_MAX, 0, 0)
+  CompilerElse
+  v3d_tfuIcfg = V3dTfuIcfgWord(#V3D_TFU_IFMT_UIF_NO_XOR, (v3d_tfuIcfg >> #V3D_TFU_ICFG_TTYPE_SHIFT) & 255, 0, 0)
+  CompilerEndIf
+  v3d_tfuIia = addr
+  v3d_tfuIis = paddedHeight / 8
+  v3d_tfuSrcAddr = addr
+  v3d_tfuSrcBytes = bytes
+  v3d_tfuHaveSrc = 1
+  ProcedureReturn #V3D_OK
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  V3dTfuDest - the output image and its tiling.
 ;
