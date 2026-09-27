@@ -1112,7 +1112,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
     ; Host initialization prepares a linear VkImage; the Vulkan image copy
     ; itself must use TFU and write a fresh optimal allocation.
     ici\tiling = #VK_IMAGE_TILING_LINEAR
-    ici\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    ici\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
     rc = vkCreateImage(dev, @ici, 0, @texLinear)
     If rc = #VK_SUCCESS
       vkGetImageMemoryRequirements(dev, texLinear, @req)
@@ -1169,6 +1169,48 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
     If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) : EndIf
     If rc <> #VK_SUCCESS Or AnvilVkImageLayout(texLinearCopy) <> #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
       status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc)
+    EndIf
+  EndIf
+  ; Read the earlier optimal copy back into the linear image through guarded
+  ; 2D DMA. Every texel must match the original staging atlas exactly.
+  If status = #VVP_OK
+    vkResetCommandBuffer(cmd, 0)
+    rc = vkBeginCommandBuffer(cmd, *bi)
+    If rc = #VK_SUCCESS
+      bar\image = texCopy
+      bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      bar\image = texLinear
+      bar\srcAccessMask = #VK_ACCESS_TRANSFER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdCopyImage(cmd, texCopy, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texLinear, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopy)
+      bar\image = texCopy
+      bar\srcAccessMask = #VK_ACCESS_TRANSFER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    fenceArray = fence
+    If rc = #VK_SUCCESS : rc = vkResetFences(dev, 1, @fenceArray) : EndIf
+    If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, *si, fence) : EndIf
+    If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) : EndIf
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc) : EndIf
+  EndIf
+  If status = #VVP_OK
+    rc = vkMapMemory(dev, texLinearMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+    If rc = #VK_SUCCESS
+      bad = 0
+      For k = 0 To #VAC_ATLAS_W * #VAC_ATLAS_H - 1
+        If PeekL(mapped + (k / #VAC_ATLAS_W) * texLinearPitch + (k % #VAC_ATLAS_W) * 4) <> PeekL(AnvilVkBufferAddress(stage) + 64 + ((k / #VAC_ATLAS_W) * #VAC_ATLAS_SOURCE_STRIDE + (k % #VAC_ATLAS_W)) * 4)
+          bad = bad + 1
+        EndIf
+      Next
+      vkUnmapMemory(dev, texLinearMem)
+      If bad <> 0 : status = #VVP_ERR_PIXELS_IN : vvpPut(#VVP_S_TEX_DETAIL, bad) : EndIf
+    Else
+      status = #VVP_ERR_IMAGE : vvpPut(#VVP_S_TEX_DETAIL, rc)
     EndIf
   EndIf
   ; Earlier uploads left texel zero white. The recorded DMA buffer update

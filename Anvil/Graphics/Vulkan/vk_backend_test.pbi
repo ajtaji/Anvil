@@ -348,6 +348,20 @@ Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
+Procedure.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceBytes < 1 Or *copy\destinationBytes < 1 Or *copy\destinationPitch < *copy\width * 4 Or *copy\sourceLayout = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
+  If avkBackendTiledReadbackValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
 Procedure.i AnvilVkTestBackendTiledCopies()
   ProcedureReturn avkTbTiledCopies
 EndProcedure

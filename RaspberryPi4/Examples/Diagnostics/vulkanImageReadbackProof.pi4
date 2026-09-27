@@ -1,6 +1,6 @@
 ; Pi 4 RAM diagnostic: V3D clear, whole and rectangular DMA readback,
 ; and rectangular DMA image copy/upload through the public Vulkan commands.
-; Compile for load $600000, stack $4F00000, returning entry. Use the board
+; Compile for a safe RAM payload address, returning entry. Use the board
 ; lease, DMA console, 15-second deadman, and a fresh return screenshot.
 
 #PMF_CHIP = 2711
@@ -34,6 +34,7 @@ Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
   Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i, arrayCmd.i, arrayReadCmd.i, arrayUploadCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
+  Define optImg.i, optMem.i, linImg.i, linMem.i, linMap.i, linPitch.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
   Define qci.VkDeviceQueueCreateInfo
@@ -613,21 +614,104 @@ Procedure.i Main()
     Next
     If status = 165 : Break : EndIf
 
+    ; The odd extent crosses UIF block columns and padded-height rows.
+    ; One ordered transfer uploads through TFU, then detiles through guarded
+    ; 2D DMA. The complete linear image is compared against the source.
+    imgci\extent\width = 37 : imgci\extent\height = 13
+    imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
+    imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    If vkCreateImage(dev, @imgci, 0, @optImg) <> #VK_SUCCESS : status = 166 : Break : EndIf
+    vkGetImageMemoryRequirements(dev, optImg, @req)
+    If req\size <> 4096 : status = 167 : Break : EndIf
+    mai\allocationSize = req\size
+    If vkAllocateMemory(dev, @mai, 0, @optMem) <> #VK_SUCCESS : status = 168 : Break : EndIf
+    If vkBindImageMemory(dev, optImg, optMem, 0) <> #VK_SUCCESS : status = 169 : Break : EndIf
+    imgci\tiling = #VK_IMAGE_TILING_LINEAR
+    If vkCreateImage(dev, @imgci, 0, @linImg) <> #VK_SUCCESS : status = 170 : Break : EndIf
+    vkGetImageMemoryRequirements(dev, linImg, @req)
+    linPitch = AnvilVkImageRowPitch(linImg)
+    If req\size <> 1924 Or linPitch <> 148 : status = 171 : Break : EndIf
+    mai\allocationSize = req\size
+    If vkAllocateMemory(dev, @mai, 0, @linMem) <> #VK_SUCCESS : status = 172 : Break : EndIf
+    If vkBindImageMemory(dev, linImg, linMem, 0) <> #VK_SUCCESS : status = 173 : Break : EndIf
+    If vkMapMemory(dev, linMem, 0, #VK_WHOLE_SIZE, 0, @linMap) <> #VK_SUCCESS : status = 174 : Break : EndIf
+    For i = 0 To 1923 : PokeA(linMap + i, $A5) : Next
+    For i = 0 To 480
+      PokeL(bufMap + 4096 + i * 4, $FF000000 | ((i * 7919 + 17) & $FFFFFF))
+    Next
+    region\bufferOffset = 4096 : region\bufferRowLength = 0 : region\bufferImageHeight = 0
+    region\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    region\imageSubresource\mipLevel = 0 : region\imageSubresource\baseArrayLayer = 0 : region\imageSubresource\layerCount = 1
+    region\imageOffset\x = 0 : region\imageOffset\y = 0 : region\imageOffset\z = 0
+    region\imageExtent\width = 37 : region\imageExtent\height = 13 : region\imageExtent\depth = 1
+    imageRegion\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegion\srcSubresource\mipLevel = 0 : imageRegion\srcSubresource\baseArrayLayer = 0 : imageRegion\srcSubresource\layerCount = 1
+    imageRegion\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegion\dstSubresource\mipLevel = 0 : imageRegion\dstSubresource\baseArrayLayer = 0 : imageRegion\dstSubresource\layerCount = 1
+    imageRegion\srcOffset\x = 0 : imageRegion\srcOffset\y = 0 : imageRegion\srcOffset\z = 0
+    imageRegion\dstOffset\x = 0 : imageRegion\dstOffset\y = 0 : imageRegion\dstOffset\z = 0
+    imageRegion\extent\width = 37 : imageRegion\extent\height = 13 : imageRegion\extent\depth = 1
+    bar\image = optImg
+    bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    bar\subresourceRange\baseMipLevel = 0 : bar\subresourceRange\levelCount = 1
+    bar\subresourceRange\baseArrayLayer = 0 : bar\subresourceRange\layerCount = 1
+    bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED : bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 175 : Break : EndIf
+    ; A partial optimal readback is refused at recording, before any DMA.
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 184 : Break : EndIf
+    imageRegion\extent\width = 36
+    dmaBefore = hwVkDmaOps
+    vkCmdCopyImage(arrayUploadCmd, optImg, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageRegion)
+    If vkEndCommandBuffer(arrayUploadCmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or hwVkDmaOps <> dmaBefore : status = 185 : Break : EndIf
+    imageRegion\extent\width = 37
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 186 : Break : EndIf
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 176 : Break : EndIf
+    vkCmdPipelineBarrier(arrayUploadCmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyBufferToImage(arrayUploadCmd, buf, optImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    vkCmdPipelineBarrier(arrayUploadCmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    bar\image = linImg
+    bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    vkCmdPipelineBarrier(arrayUploadCmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyImage(arrayUploadCmd, optImg, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageRegion)
+    If vkEndCommandBuffer(arrayUploadCmd) <> #VK_SUCCESS : status = 177 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 178 : Break : EndIf
+    dmaBefore = hwVkDmaOps : cbHandle = arrayUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 179 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 180 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 40 Or DmaQuiescent() = 0 : status = 181 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 182 : Break : EndIf
+    For i = 0 To 480
+      If (PeekL(linMap + (i / 37) * linPitch + (i % 37) * 4) & $FFFFFFFF) <> ($FF000000 | ((i * 7919 + 17) & $FFFFFF))
+        status = 183 : Break
+      EndIf
+    Next
+    If status = 183 : Break : EndIf
+
     status = 0
   Until 1
 
   If dev <> 0
     vkDeviceWaitIdle(dev)
     If dstMap <> 0 : vkUnmapMemory(dev, dstMem) : EndIf
+    If linMap <> 0 : vkUnmapMemory(dev, linMem) : EndIf
     If bufMap <> 0 : vkUnmapMemory(dev, bufMem) : EndIf
     If fence <> 0 : vkDestroyFence(dev, fence, 0) : EndIf
     If pool <> 0 : vkDestroyCommandPool(dev, pool, 0) : EndIf
     If buf <> 0 : vkDestroyBuffer(dev, buf, 0) : EndIf
     If img <> 0 : vkDestroyImage(dev, img, 0) : EndIf
     If dstImg <> 0 : vkDestroyImage(dev, dstImg, 0) : EndIf
+    If optImg <> 0 : vkDestroyImage(dev, optImg, 0) : EndIf
+    If linImg <> 0 : vkDestroyImage(dev, linImg, 0) : EndIf
     If bufMem <> 0 : vkFreeMemory(dev, bufMem, 0) : EndIf
     If imgMem <> 0 : vkFreeMemory(dev, imgMem, 0) : EndIf
     If dstMem <> 0 : vkFreeMemory(dev, dstMem, 0) : EndIf
+    If optMem <> 0 : vkFreeMemory(dev, optMem, 0) : EndIf
+    If linMem <> 0 : vkFreeMemory(dev, linMem, 0) : EndIf
     vkDestroyDevice(dev, 0)
   EndIf
   If inst <> 0 : vkDestroyInstance(inst, 0) : EndIf
