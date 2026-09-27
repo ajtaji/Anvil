@@ -185,8 +185,19 @@ BREAK_BUDGET = 3_000_000
 class Ctl:
     """The fabricated xHCI host controller."""
 
-    def __init__(self, cpu: A64) -> None:
+    def __init__(self, cpu: A64, mode: str = "cold") -> None:
         self.cpu = cpu
+        # "cold": port 2 is switched off with a device behind it, so only
+        # a driver that powers the root ports ever sees it. "firmware": the
+        # firmware already powered every port (the Pi 4 as it has always
+        # booted), so the driver must not write a single PORTSC during
+        # bring-up and must not wait - it behaves exactly as before.
+        self.mode = mode
+        self.port_writes = 0
+        self.port_writes_at_first_db = None
+        self.power_ons: dict[int, int] = {}
+        self.resets: dict[int, int] = {}
+        self.power_tick: dict[int, int] = {}
         self.violations: list[str] = []
         self.log: list[str] = []
 
@@ -222,6 +233,8 @@ class Ctl:
         self.port = {1: P_POWER, 2: 0, 3: P_POWER, 4: 0, 5: P_POWER}
         self.port[4] = P_POWER | P_CONNECT | P_PE | (SPEED_SS << 10)
         self.port_dev = {2: SPEED_HS}        # what appears once powered
+        if mode == "firmware":
+            self.port[2] = P_POWER | P_CONNECT
 
         # Ring state.
         self.cmd_base = 0
@@ -353,6 +366,12 @@ class Ctl:
         if R_PORTS <= off < R_PORTS + MAX_PORTS * 0x10:
             n = (off - R_PORTS) // 0x10 + 1
             if (off - R_PORTS) % 0x10 == 0:
+                # USB 2 root hub bPwrOn2PwrGood = 10 -> 20 ms: a port's
+                # status is not to be trusted sooner after its switch.
+                t0 = self.power_tick.get(n)
+                if t0 is not None and self.ticks - t0 < 20 * CNTFRQ // 1000:
+                    self.bad(f"port {n} status read before power-good "
+                             f"({(self.ticks - t0) * 1000 // CNTFRQ} ms after the switch)")
                 return self.port.get(n, 0)
             return 0
 
@@ -466,6 +485,12 @@ class Ctl:
             self.log.append("erdp")
 
     def _port_write(self, n: int, value: int) -> None:
+        self.port_writes += 1
+        if (value & P_POWER) and not (self.port.get(n, 0) & P_POWER):
+            self.power_ons[n] = self.power_ons.get(n, 0) + 1
+            self.power_tick[n] = self.ticks
+        if value & P_RESET:
+            self.resets[n] = self.resets.get(n, 0) + 1
         cur = self.port.get(n, 0)
         # Change bits are write-1-to-clear.
         cleared = value & 0x00FE0000
@@ -507,6 +532,8 @@ class Ctl:
             self.ev_pcs ^= 1
 
     def doorbell(self, index: int, value: int) -> None:
+        if self.port_writes_at_first_db is None:
+            self.port_writes_at_first_db = self.port_writes
         if not (self.cfg[0x04] & 0x04):
             self.bad("a doorbell was rung with PCI bus mastering disabled")
         if index == 0:
@@ -1017,14 +1044,14 @@ ex("seventy more No-Ops, wrapping both rings", 70)
 ex("the last one is Success", 1)
 ex("nothing unexpected turned up on the way", 0)
 # 6. ports
-ex("the first connected port is 4", 4)
+ex("the first connected port is 2 - powered by XhciInit", 2)
 ex("port 1 has nothing connected", 0)
 ex("port 4 has something connected", 1)
 ex("port 4 is already enabled", 1)
 ex("port 4 reports SuperSpeed", SPEED_SS)
 ex("resetting an already-enabled port succeeds", 1)
 ex("and leaves its speed alone", SPEED_SS)
-ex("port 2 is not connected before it is powered", 0)
+ex("port 2 is connected before any reset (XhciInit powered it)", 1)
 ex("port 2 has no speed before it is reset", 0)
 ex("port 2 powers up, connects and resets", 1)
 ex("port 2 is enabled afterwards", 1)
@@ -1173,6 +1200,19 @@ BREAKAGES = {
     "no-ioc": (
         "  f3 = #XHCI_TRB_IOC | (#XHCI_TRB_STATUS << 10)",
         "  f3 = (#XHCI_TRB_STATUS << 10)"),
+    # ---- root-port power, added 2026-09-26 -------------------------------
+    # The Pi 4 path never powers its root ports: port 2 stays dark.
+    "no-root-port-power": (
+        "  xh_Phase(#XHCI_PH_PORTPWR)\n  If xh_PowerRootPorts() = 0\n    xh_FailStop()\n    ProcedureReturn 0\n  EndIf\n\n  xh_ready = 1\n",
+        "\n  xh_ready = 1\n"),
+    # Power every port whether or not it is on - a PORTSC write on a board
+    # whose firmware already powered it (and a 100 ms wait for nothing).
+    "power-already-powered-ports": (
+        "    If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0\n      xh_PortWrite(p, #XHCI_PORT_POWER)",
+        "    If 1 = 1\n      xh_PortWrite(p, #XHCI_PORT_POWER)"),
+    # Trust the device list without the power-good wait.
+    "no-root-power-wait": (
+        "    xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)\n", "\n"),
     # Hand the first control TRB to the controller immediately, instead
     # of writing it with the cycle bit inverted and correcting it once
     # the rest of the transfer descriptor exists.  poll_ep0_race() is
@@ -1318,7 +1358,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def execute(img: pathlib.Path, sym: dict[str, int],
-            budget: int = 120_000_000) -> tuple[Ctl, A64, int, bool]:
+            budget: int = 120_000_000, mode: str = "cold") -> tuple[Ctl, A64, int, bool]:
     blob = img.read_bytes()
     cpu = A64(pc=LOAD)
     for i, b in enumerate(blob):
@@ -1331,7 +1371,7 @@ def execute(img: pathlib.Path, sym: dict[str, int],
     # and whose wrong half reads as a column of zeroes rather than an
     # error. A missing `.dbg` costs the name, not the check.
     attach_symbols(cpu, img, LOAD)
-    ctl = Ctl(cpu)
+    ctl = Ctl(cpu, mode)
     install(cpu, ctl)
     trap = LOAD + sym["_a64_end_trap"]
     steps = 0
@@ -1439,6 +1479,26 @@ def compare(got: list[int], ctl: Ctl) -> list[str]:
     want("endpoint 0 is not left halted", ctl.ep0_halted, False)
     want("and the controller reports it running again", ctl.ep0_state, 1)
 
+    # ---- root-port power (open bug 2026-09-26, fixed for both boards) ----
+    # No port is ever switched on twice, and no port is reset more than once
+    # by this program (port 2's one reset; port 4 is already enabled and
+    # port 1 is empty, so neither may be reset at all).
+    want("no port was powered on twice",
+         [n for n, c in ctl.power_ons.items() if c > 1], [])
+    want("no port reset storm", {n: c for n, c in ctl.resets.items() if c > 1}, {})
+    want("only port 2 was reset", sorted(ctl.resets), [2])
+    if ctl.mode == "cold":
+        want("XhciInit switched on the one port that was off (port 2)",
+             ctl.power_ons, {2: 1})
+        want("and wrote no other PORTSC during bring-up",
+             ctl.port_writes_at_first_db, 1)
+        want("port 2 was powered before the first command",
+             before("port2-powered", "noop"), True)
+    else:
+        want("a port the firmware powered is not written during bring-up",
+             ctl.port_writes_at_first_db, 0)
+        want("and nothing is switched on at all", ctl.power_ons, {})
+
     for v in ctl.violations:
         fails.append(f"model refused: {v}")
     return fails
@@ -1446,17 +1506,23 @@ def compare(got: list[int], ctl: Ctl) -> list[str]:
 
 def once(compiler: str, src: pathlib.Path, img: pathlib.Path,
          budget: int = 120_000_000) -> tuple[list[str], int, int]:
+    """Build once, run twice: a cold port 2 the driver must power, and
+    every port already powered by firmware, where it must change nothing.
+    The program's results must be identical in both."""
     build(compiler, src, img)
     sym = load_syms(img)
-    ctl, cpu, steps, finished = execute(img, sym, budget)
-    got = collect(cpu, sym)
-    fails = compare(got, ctl)
-    if not finished:
-        # A driver that hangs is a red gate, not a stuck harness.  The
-        # deliberate breakages below are given a much smaller budget than
-        # the real run precisely so that a hang costs seconds.
-        fails.insert(0, f"the program did not reach its end trap within "
-                        f"{budget} interpreter steps - the driver hung")
+    fails: list[str] = []
+    steps = 0
+    for mode in ("cold", "firmware"):
+        ctl, cpu, steps, finished = execute(img, sym, budget, mode)
+        got = collect(cpu, sym)
+        fails += [f"[{mode}] {f}" for f in compare(got, ctl)]
+        if not finished:
+            # A driver that hangs is a red gate, not a stuck harness.  The
+            # deliberate breakages below are given a much smaller budget than
+            # the real run precisely so that a hang costs seconds.
+            fails.insert(0, f"[{mode}] the program did not reach its end trap "
+                            f"within {budget} interpreter steps - the driver hung")
     return fails, steps, len(EXPECT)
 
 
