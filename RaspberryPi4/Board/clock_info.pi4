@@ -8,6 +8,36 @@
 ;  contain no chip at all. Its only caller has always been the line a
 ;  few dozen lines below this one.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  BCM2712 (-t pi5): the board names of the BCM2712 family, from the TYPE
+;  field (bits 11:4) of a new-style revision code -  Pi 5,  Compute
+;  Module 5,  Pi 500,  Compute Module 5 Lite (Raspberry Pi's
+;  published revision-code table, the same source the BCM2711 names above
+;  come from; NOT VENDORED in the vault - the first `info` on the bench is
+;  the check). 0 for a type this monitor has no name for.
+;
+;  THE SoC STEPPING IS NOT IN THE REVISION CODE. The code's low nibble is
+;  the BOARD revision (1.0, 1.1). Whether the BCM2712 is C1 or D0 is read
+;  elsewhere - V3D HUB_IDENT3.IPREV (vault "GPU - V3D 7.1 port plan") or
+;  which DTB the firmware chose (bcm2712d0-rpi-5-b.dtb on D0) - so `info`
+;  says so rather than guessing it from the board revision.
+; ----------------------------------------------------------------------
+Procedure.i PiRevBoardName2712(t.i)
+  Select t
+    Case $17
+      ProcedureReturn "Pi 5 Model B"
+    Case $18
+      ProcedureReturn "Compute Module 5"
+    Case $19
+      ProcedureReturn "Pi 500"
+    Case $1A
+      ProcedureReturn "Compute Module 5 Lite"
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+
 Procedure PutRevision(r.i)
   Define t.i
   Define p.i
@@ -30,6 +60,14 @@ Procedure PutRevision(r.i)
   ; the header: a decoder that names a board it has never met is a
   ; confident wrong answer, and the SoC and memory below are decoded
   ; from their own fields and stay correct whatever this says.
+  CompilerIf #PMF_CHIP = 2712
+  If PiRevBoardName2712(t) <> 0
+    UartWriteStr(PiRevBoardName2712(t))
+  Else
+    Print("a board this monitor does not have a name for, type $")
+    PutHex2(t)
+  EndIf
+  CompilerElse
   If t = $11
     Print("Pi 4 Model B")
   ElseIf t = $13
@@ -42,6 +80,7 @@ Procedure PutRevision(r.i)
     Print("a board this monitor does not have a name for, type $")
     PutHex2(t)
   EndIf
+  CompilerEndIf
 
   Print(", ")
   If p = 0
@@ -73,6 +112,9 @@ Procedure PutRevision(r.i)
 
   Print(", rev 1.")
   PrintDec(r & $F)
+  CompilerIf #PMF_CHIP = 2712
+  Print(" (board revision; the SoC stepping, C1 or D0, is not in this code)")
+  CompilerEndIf
 EndProcedure
 
 Procedure CmdInfo()
