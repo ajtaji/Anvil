@@ -589,9 +589,8 @@ Procedure AnvilVkCmdUpdateBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, data
   avkOpSourceBytes[o] = dataSize
 EndProcedure
 
-; Exact bounded vkCmdCopyBufferToImage semantics: one tightly packed whole
-; BGRA8 level/layer from a TRANSFER_SRC buffer into an optimal TRANSFER_DST
-; image. The command captures the handles and immutable region values here;
+; One tightly packed BGRA8 region uses TFU for an optimal destination or
+; guarded DMA rows for a linear destination. The command captures the handles and region values here;
 ; the queue resolves and validates the live resources again before retaining
 ; them, as Vulkan lifetime belongs to submission rather than recording.
 Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstImageLayout.i, *r.VkBufferImageCopy)
@@ -634,15 +633,19 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage was given a destination image with no memory bound (Anvil code -20004, image not bound); call vkBindImageMemory first.")
     ProcedureReturn
   EndIf
-  If avkImgTiling[s] <> #VK_IMAGE_TILING_OPTIMAL Or (avkImgUsage[s] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires an optimal-tiled destination created with VK_IMAGE_USAGE_TRANSFER_DST_BIT (Anvil code -20001, wrong destination contract); this bounded transfer does not reinterpret a linear image as tiled.")
+  If (avkImgTiling[s] <> #VK_IMAGE_TILING_OPTIMAL And avkImgTiling[s] <> #VK_IMAGE_TILING_LINEAR) Or (avkImgUsage[s] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires a linear or optimal BGRA8 destination with TRANSFER_DST usage (Anvil code -20001, wrong destination contract); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If dstImageLayout <> #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage was given a destination layout other than VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL (Anvil code -20001, wrong copy layout); transition the image before the copy and name that exact layout.")
+  If dstImageLayout <> #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL And (avkImgTiling[s] <> #VK_IMAGE_TILING_LINEAR Or dstImageLayout <> #VK_IMAGE_LAYOUT_GENERAL)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires TRANSFER_DST_OPTIMAL or, for a linear image, GENERAL layout (Anvil code -20001, wrong copy layout); transition the image before copying.")
     ProcedureReturn
   EndIf
-  copyAlign = avkBackendImageCopySourceAlignment()
+  If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR
+    copyAlign = #ANVIL_VK_BGRA8_TEXEL_BYTES
+  Else
+    copyAlign = avkBackendImageCopySourceAlignment()
+  EndIf
   If copyAlign < 1 Or (copyAlign & (copyAlign - 1)) <> 0
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage could not obtain a power-of-two source-alignment contract from the active backend (Anvil code -20005, incomplete copy backend); no transfer was recorded.")
     ProcedureReturn
@@ -659,14 +662,26 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given a subresource other than colour mip zero, layer zero, count one (Anvil code -20005, unsupported subresource); every image in this subset has exactly that one subresource.")
     ProcedureReturn
   EndIf
-  If *r\imageOffset\x <> 0 Or *r\imageOffset\y <> 0 Or *r\imageOffset\z <> 0 Or *r\imageExtent\width <> avkImgW[s] Or *r\imageExtent\height <> avkImgH[s] Or *r\imageExtent\depth <> 1
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given a partial destination region (Anvil code -20005, partial copy not implemented); offset must be zero and extent must cover the complete one-level image.")
+  If *r\imageOffset\x < 0 Or *r\imageOffset\y < 0 Or *r\imageOffset\z <> 0 Or *r\imageExtent\width < 1 Or *r\imageExtent\height < 1 Or *r\imageExtent\depth <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires a positive two-dimensional region with non-negative XY offsets and zero Z offset (Anvil code -20001); nothing was recorded.")
     ProcedureReturn
   EndIf
-  sourcePitch = avkImgW[s] * #ANVIL_VK_BGRA8_TEXEL_BYTES
-  sourceBytes = sourcePitch * avkImgH[s]
+  If *r\imageOffset\x > avkImgW[s] - *r\imageExtent\width Or *r\imageOffset\y > avkImgH[s] - *r\imageExtent\height
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires the complete rectangle to fit its destination image (Anvil code -20001); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkImgTiling[s] = #VK_IMAGE_TILING_OPTIMAL And (*r\imageOffset\x <> 0 Or *r\imageOffset\y <> 0 Or *r\imageExtent\width <> avkImgW[s] Or *r\imageExtent\height <> avkImgH[s])
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage still requires one complete optimal-image region for the TFU (Anvil code -20005); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  sourcePitch = *r\imageExtent\width * #ANVIL_VK_BGRA8_TEXEL_BYTES
+  sourceBytes = sourcePitch * *r\imageExtent\height
   If sourcePitch < 1 Or sourceBytes < sourcePitch
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage computed a wrapped source span (Anvil code -20001, invalid extent); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR And (sourcePitch > avkImgPitch[s] Or *r\imageOffset\y * avkImgPitch[s] + *r\imageOffset\x * #ANVIL_VK_BGRA8_TEXEL_BYTES + (*r\imageExtent\height - 1) * avkImgPitch[s] + sourcePitch > avkImgSize[s])
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage found a linear image pitch or allocation too short for the requested rows (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
   EndIf
   If avkCopyBufferResolve(srcBuffer, d, *r\bufferOffset, sourceBytes, 0) = 0
@@ -692,6 +707,9 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
   avkOpNewLayout[o] = dstImageLayout
   avkOpBuffer[o] = srcBuffer
   avkOpBufferOffset[o] = *r\bufferOffset
+  If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR
+    avkOpDstOffset[o] = *r\imageOffset\y * avkImgPitch[s] + *r\imageOffset\x * #ANVIL_VK_BGRA8_TEXEL_BYTES
+  EndIf
   avkOpSourceBytes[o] = sourceBytes
   avkOpSourcePitch[o] = sourcePitch
 EndProcedure
@@ -1711,15 +1729,43 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     If job <> #ANVIL_VK_OK : ProcedureReturn job : EndIf
   EndIf
   If copies = 1
-    copyAlign = avkBackendImageCopySourceAlignment()
+    If target < 1 Or avkImgBound[target] = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or unbound buffer-to-image destination (Anvil code -20004); nothing was submitted.")
+    EndIf
+    If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
+      copyAlign = #ANVIL_VK_BGRA8_TEXEL_BYTES
+    Else
+      copyAlign = avkBackendImageCopySourceAlignment()
+    EndIf
     If copyAlign < 1 Or (copyAlign & (copyAlign - 1)) <> 0 Or (avkOpBufferOffset[copyOp] % copyAlign) <> 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that the recorded copy no longer satisfies the active backend's image-copy source alignment (Anvil code -20004, backend contract changed); re-record against the current target contract.")
     EndIf
     If avkCopyBufferResolve(avkOpBuffer[copyOp], d, avkOpBufferOffset[copyOp], avkOpSourceBytes[copyOp], @sourceBase) = 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a vkCmdCopyBufferToImage source buffer is no longer live, bound, owned, aligned or large enough (Anvil code -20004, stale source resource); re-record against a valid transfer-source buffer.")
     EndIf
-    If target < 1 Or avkImgTiling[target] <> #VK_IMAGE_TILING_OPTIMAL Or avkImgBackendLayout[target] = 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer-to-image copy no longer resolves to a complete optimal-image backend plan (Anvil code -20004, invalid destination resource); nothing was submitted.")
+    If avkImgTiling[target] = #VK_IMAGE_TILING_OPTIMAL
+      If avkImgBackendLayout[target] = 0
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a recorded buffer-to-image copy no longer resolves to a complete optimal-image backend plan (Anvil code -20004, invalid destination resource); nothing was submitted.")
+      EndIf
+    ElseIf avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
+      copyBytes = avkOpSourcePitch[copyOp]
+      If copyBytes < 1 Or (avkOpSourceBytes[copyOp] % copyBytes) <> 0
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid linear buffer-to-image row shape (Anvil code -20004); nothing was submitted.")
+      EndIf
+      copyRows = avkOpSourceBytes[copyOp] / copyBytes
+      destinationPitch = avkImgPitch[target]
+      If copyRows < 1 Or copyBytes > destinationPitch Or avkOpDstOffset[copyOp] < 0 Or avkOpDstOffset[copyOp] + (copyRows - 1) * destinationPitch + copyBytes > avkImgSize[target]
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid linear buffer-to-image destination row span (Anvil code -20004); nothing was submitted.")
+      EndIf
+      destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target] + avkOpDstOffset[copyOp]
+      For k = 0 To copyRows - 1
+        destinationRowBase = destinationBase + k * destinationPitch
+        If sourceBase < destinationRowBase + copyBytes And destinationRowBase < sourceBase + avkOpSourceBytes[copyOp]
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping buffer-to-image source and destination memory (Anvil code -20001); nothing was submitted.")
+        EndIf
+      Next
+    Else
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an unsupported buffer-to-image destination tiling (Anvil code -20004); nothing was submitted.")
     EndIf
   EndIf
   If imageCopies = 1
@@ -1887,6 +1933,25 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn #VK_SUCCESS
   EndIf
   If copies = 1
+    If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
+      If copyBytes = destinationPitch
+        job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
+        If job <> #ANVIL_VK_JOB_DONE
+          avkFlightComplete(0)
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image (VkResult -4); the command buffer was invalidated and its fence signalled.")
+        EndIf
+      Else
+        For k = 0 To copyRows - 1
+          job = avkBackendSubmitBufferCopy(sourceBase + k * copyBytes, destinationBase + k * destinationPitch, copyBytes)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image row (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+        Next
+      EndIf
+      avkFlightComplete(1)
+      ProcedureReturn #VK_SUCCESS
+    EndIf
     copy\windowBase = avkHeapBase
     copy\windowBytes = avkHeapBytes
     copy\sourceBase = sourceBase

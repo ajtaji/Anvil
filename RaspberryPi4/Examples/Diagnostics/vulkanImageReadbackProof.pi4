@@ -1,5 +1,5 @@
 ; Pi 4 RAM diagnostic: V3D clear, whole and rectangular DMA readback,
-; and rectangular DMA image copy through the public Vulkan commands.
+; and rectangular DMA image copy/upload through the public Vulkan commands.
 ; Compile for load $600000, stack $4F00000, returning entry. Use the board
 ; lease, DMA console, 15-second deadman, and a fresh return screenshot.
 
@@ -32,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -110,7 +110,7 @@ Procedure.i Main()
 
     bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
     bci\size = #VIR_BUFFER_BYTES
-    bci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
     bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
     If vkCreateBuffer(dev, @bci, 0, @buf) <> #VK_SUCCESS : status = 17 : Break : EndIf
     vkGetBufferMemoryRequirements(dev, buf, @req)
@@ -129,6 +129,7 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @readCmd) <> #VK_SUCCESS : status = 23 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @copyCmd) <> #VK_SUCCESS : status = 45 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @rectReadCmd) <> #VK_SUCCESS : status = 54 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @uploadCmd) <> #VK_SUCCESS : status = 65 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -257,6 +258,31 @@ Procedure.i Main()
       If (PeekA(bufMap + i) & $FF) <> $A5 : status = 64 : Break : EndIf
     Next
     If status = 64 : Break : EndIf
+
+    For i = 0 To #VIR_DST_BYTES - 1 : PokeA(dstMap + i, $A5) : Next
+    region\imageOffset\x = 7 : region\imageOffset\y = 9
+    If vkBeginCommandBuffer(uploadCmd, @bi) <> #VK_SUCCESS : status = 66 : Break : EndIf
+    vkCmdCopyBufferToImage(uploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+    If vkEndCommandBuffer(uploadCmd) <> #VK_SUCCESS : status = 67 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 68 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = uploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 69 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 70 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 13 Or DmaQuiescent() = 0 : status = 71 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 72 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 73 : Break : EndIf
+      Next
+      If status = 73 : Break : EndIf
+    Next
+    If status = 73 : Break : EndIf
     status = 0
   Until 1
 
