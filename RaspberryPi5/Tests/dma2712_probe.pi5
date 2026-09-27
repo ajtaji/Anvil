@@ -1,0 +1,72 @@
+; dma2712_probe.pi5 - RaspberryPi4/Lib/dma.pi4 built -t pi5, its BCM2712
+; 40-bit branch driven through the SAME public procedures the display
+; path uses. DESK FIXTURE, no UART: tools/a64/a64_dma_pi5_check.py writes
+; the scenario at #CTL, runs the image against a modelled dma40
+; controller, and reads the results back from #OUT. Silicon owed.
+;
+;   #CTL +0 scenario   1 chained rectangle fill, destination above 4 GiB
+;                      2 rectangle copy in batches (small scratch)
+;                      3 contiguous DmaCopy - one block
+;                      4 contiguous fill - one block
+;                      5 DmaSetChannel(11): outside the firmware's mask
+;                      6 DmaSetChannel(0): a 32-bit channel
+;                      7 DmaSetChannelMask($780), then DmaInit on channel 6
+;                      8 a fill whose engine never completes (timeout)
+;                      9 DmaInit on a channel found busy
+;        +4 scratch bytes
+;
+;   #OUT +0 DmaSetScratch  +4 DmaSetBounds  +8 channel/mask call
+;       +12 DmaInit        +16 the operation +20 DmaError()
+;       +24 DmaLastBlocks  +28 DmaScratchChainRows  +32 DmaChannel
+;       +36 $600DF00D, written last   +40 DmaError() right after the
+;       channel/mask call (the later calls reset it)
+;
+;   pmfc dma2712_probe.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o dma2712.img
+
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+
+#CTL = $00E00000
+#OUT = $00E00100
+#SCR = $00800000
+#SRC = $00A00000
+#WIN = $140000000       ; five gigabytes: needs the top address byte
+
+Define sc.i
+Define r.i
+
+sc = PeekN(#CTL)
+r = 0
+PokeL(#OUT + 0, DmaSetScratch(#SCR, PeekN(#CTL + 4)))
+PokeL(#OUT + 4, DmaSetBounds(#WIN, $100000))
+If sc = 5
+  PokeL(#OUT + 8, DmaSetChannel(11))
+EndIf
+If sc = 6
+  PokeL(#OUT + 8, DmaSetChannel(0))
+EndIf
+If sc = 7
+  PokeL(#OUT + 8, DmaSetChannelMask($780))
+EndIf
+PokeL(#OUT + 40, DmaError())
+PokeL(#OUT + 12, DmaInit())
+If DmaReady() = 1
+  If sc = 1 Or sc = 8
+    r = DmaFill32(#WIN + $100, 1024, 64, 20, $11223344)
+  EndIf
+  If sc = 2
+    r = DmaCopy2D(#WIN + $40, 2048, #SRC, 1536, 300, 10)
+  EndIf
+  If sc = 3
+    r = DmaCopy(#WIN, #SRC, 8192)
+  EndIf
+  If sc = 4
+    r = DmaFill32(#WIN, 256, 64, 16, $A5A55A5A)
+  EndIf
+EndIf
+PokeL(#OUT + 16, r)
+PokeL(#OUT + 20, DmaError())
+PokeL(#OUT + 24, DmaLastBlocks())
+PokeL(#OUT + 28, DmaScratchChainRows())
+PokeL(#OUT + 32, DmaChannel())
+PokeL(#OUT + 36, $600DF00D)
