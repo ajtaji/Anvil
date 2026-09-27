@@ -542,6 +542,484 @@
 ; is still the one thing here that has never run.
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  BCM2712 (-t pi5, #PMF_CHIP = 2712) - RP1 BEHIND pcie2, ALREADY UP
+; ======================================================================
+;  Everything from CompilerElse down is the Pi 4 file, untouched; a -t pi4
+;  build never parses this branch and its image is byte-identical.
+;
+;  WHAT IS DIFFERENT ON THE PI 5. The USB host is not a PCIe device
+;  enumerated behind the root complex (the Pi 4's VL805). It is one of
+;  RP1's two Synopsys DWC3 controllers, reached as MEMORY through RP1's
+;  BAR, and the link to RP1 is left trained by the firmware when
+;  config.txt says pciex4_reset=0 (measured on silicon 2026-09-26: with
+;  the default reset the first RP1 access hangs the core; vault
+;  "Raspberry Pi 5/HARDWARE-BRINGUP.md", first boot). So this branch
+;  NEVER resets, trains or re-windows the link. It reads, verifies and
+;  refuses:
+;
+;    PcieInit()       the link is up (PHYLINKUP + DL_ACTIVE, the root
+;                     port in RC mode), and an inbound window maps PCIe
+;                     $10_0000_0000 onto ARM physical 0 - the only way the
+;                     xHCI's DMA can reach memory.
+;    PcieEnumerate()  bus 1 device 0 is RP1 (1DE4:0001) with memory
+;                     decoding on.
+;    PcieEnableDma()  RP1's Bus Master Enable (rp1.c: pci_set_master()).
+;
+;  THE ADDRESSES, each translated through the device tree rather than
+;  remembered (Linux 7e030b60 arch/arm64/boot/dts/broadcom/):
+;
+;    pcie2 registers   bcm2712.dtsi pcie2 reg = <0x10 0x00120000 0x0
+;                      0x9310>  ->  $10_0012_0000, $9310 bytes
+;    RP1 peripherals   bcm2712-rpi-5-b.dts &rp1 ranges: RP1 c0_40xxxxxx
+;                      -> PCIe 00_00xxxxxx (size $410000); bcm2712.dtsi
+;                      pcie2 ranges: PCIe 00_0000_0000 -> CPU 1f_0000_0000;
+;                      /axi ranges identity for 1c_..1f_. So RP1
+;                      c0_4020_0000 (usbhost0, rp1.dtsi usb@200000) is CPU
+;                      $1F_0020_0000 and usbhost1 (usb@300000) is
+;                      $1F_0030_0000. The firmware's own boot line
+;                      "RP1_UART 0000001f00030000" is the same arithmetic
+;                      for UART0 (RP1 c0_4003_0000) - measured.
+;    DMA (inbound)     &rp1 dma-ranges entry 1: RP1 1x_xxxxxxxx -> PCIe
+;                      1x_xxxxxxxx (64 GiB); pcie2 dma-ranges entry 2:
+;                      PCIe 10_0000_0000 -> CPU 00_0000_0000 (64 GiB). So
+;                      the xHCI must be handed CPU + $10_0000_0000. Linux's
+;                      phys_to_dma() takes the FIRST dma-range that covers
+;                      the address, which is this one. (&rp1's third entry,
+;                      RP1 0x_ -> PCIe 1x_, also covers low memory; it is
+;                      NOT used here, so every pointer the controller sees
+;                      and echoes back has one form.)
+;
+;  Error codes are this file's #PCIE_ERR_* numbers, with the Pi 4 values
+;  where the meaning is the same.
+; ======================================================================
+  EnableExplicit
+
+  #PCIE_RC_BASE = $1000120000      ; bcm2712.dtsi pcie2 reg
+  #PCIE_RC_SIZE = $9310
+  #PCIE_OUT_CPU  = $1F00000000     ; pcie2 ranges: PCIe 0 -> CPU 1f_0000_0000
+  #PCIE_OUT_BUS  = $00000000
+  #PCIE_OUT_SIZE = $00410000       ; &rp1 ranges size - RP1's peripheral BAR
+  #PCIE_DMA_BUS  = $1000000000     ; &rp1 + pcie2 dma-ranges: CPU 0 -> PCIe 10_
+  #PCIE_DMA_LIMIT = $1000000000    ; the window is 64 GiB of ARM physical
+
+; RP1's USB host blocks, RP1 addresses from rp1.dtsi and rp1-peripherals.pdf
+; chapter 5 table 85 (usbhost0 0x40200000, usbhost1 0x40300000), offset
+; into the BAR by subtracting RP1's c0_4000_0000 base.
+  #PCIE_RP1_USBHOST0 = $00200000
+  #PCIE_RP1_USBHOST1 = $00300000
+  #PCIE_RP1_USBHOST_SIZE = $00100000
+
+; pcie-brcmstb.c (vault Sources, 7e030b60 tree): PCIE_MISC_PCIE_STATUS and
+; its masks; pcie_offsets_bcm7712 EXT_CFG_INDEX $9000 / EXT_CFG_DATA $8000;
+; the inbound window registers RC_BAR1..3 CONFIG_LO at $402C + 8 * (n - 1),
+; RC_BAR4..10 at $40D4 + 8 * (n - 4); UBUS_BAR1..3 CONFIG_REMAP at $40AC,
+; UBUS_BAR4..10 at $410C, same stride; bcm2712_cfg num_inbound_wins = 10.
+  #PCIE_MISC_PCIE_STATUS = $4068
+  #PCIE_STATUS_PORT_MASK      = $80
+  #PCIE_STATUS_DL_ACTIVE_MASK = $20
+  #PCIE_STATUS_PHYLINKUP_MASK = $10
+  #PCIE_EXT_CFG_INDEX = $9000
+  #PCIE_EXT_CFG_DATA  = $8000
+  #PCIE_RC_BAR1_LO   = $402C
+  #PCIE_RC_BAR4_LO   = $40D4
+  #PCIE_UBUS_BAR1    = $40AC
+  #PCIE_UBUS_BAR4    = $410C
+  #PCIE_INBOUND_WINS = 10
+  #PCIE_LNK_WORD     = $BC         ; BRCM_PCIE_CAP_REGS $AC + LNKCTL $10
+
+; RP1's identity, rp1.c: PCI_VENDOR_ID_RPI $1DE4, PCI_DEVICE_ID_RP1_C0 1.
+  #PCIE_RP1_ID = $00011DE4
+  #PCI_CFG_COMMAND    = $04
+  #PCI_CMD_MEMORY     = $0002
+  #PCI_CMD_BUS_MASTER = $0004
+
+  #PCIE_ERR_RANGE     = -1
+  #PCIE_ERR_ALIGN     = -2
+  #PCIE_ERR_LINK      = -4
+  #PCIE_ERR_EP_MODE   = -5
+  #PCIE_ERR_CFG_BDF   = -6
+  #PCIE_ERR_NO_ENDPOINT = -7
+  #PCIE_ERR_INBOUND   = -16
+  #PCIE_ERR_RP1_MEM   = -17
+  #PCIE_ERR_NOT_UP    = -18
+
+; The phase numbers the board's boot trail prints, shared with the Pi 4.
+  #PCIE_PH_IDLE     = 0
+  #PCIE_PH_CANARY   = 1
+  #PCIE_PH_PROBE    = 2
+  #PCIE_PH_ADOPT    = 3
+  #PCIE_PH_INBOUND  = 4
+  #PCIE_PH_PERST    = 5
+  #PCIE_PH_SERDES   = 6
+  #PCIE_PH_CTRL     = 7
+  #PCIE_PH_TRAIN    = 8
+  #PCIE_PH_WINDOW   = 9
+  #PCIE_PH_UP       = 10
+  #PCIE_PH_BUSNUM   = 11
+  #PCIE_PH_ENUM     = 12
+  #PCIE_PH_DONE     = 13
+
+  Global pcie_up.i
+  Global pcie_err.i
+  Global pcie_enumerated.i
+  Global pcie_memBytes.i
+  Global pcie_linkSpeed.i = -1
+  Global pcie_linkWidth.i = -1
+  Global pcie_dmaWin.i            ; bytes of ARM memory the inbound window maps
+  Global pcie_dmaBar.i            ; which RC_BARn it was found in, 0 = none
+  Global pcie_phaseAt.i = #PCIE_PH_IDLE
+  Global *pcie_phaseHook = 0
+
+  Procedure PcieSetMemoryBytes(bytes.i)
+    pcie_memBytes = bytes
+  EndProcedure
+
+  Procedure.i PcieMemoryBytes()
+    ProcedureReturn pcie_memBytes
+  EndProcedure
+
+  Procedure.i PciePhase() : ProcedureReturn pcie_phaseAt : EndProcedure
+
+  Procedure.i PciePhaseText(p.i)
+    Select p
+      Case #PCIE_PH_PROBE   : ProcedureReturn "probe"
+      Case #PCIE_PH_INBOUND : ProcedureReturn "inbound"
+      Case #PCIE_PH_UP      : ProcedureReturn "up"
+      Case #PCIE_PH_ENUM    : ProcedureReturn "endpoint"
+      Case #PCIE_PH_DONE    : ProcedureReturn "ok"
+    EndSelect
+    ProcedureReturn "idle"
+  EndProcedure
+
+  Procedure.i PcieSetPhaseHook(*fn)
+    Define old.i
+    old = *pcie_phaseHook
+    *pcie_phaseHook = *fn
+    ProcedureReturn old
+  EndProcedure
+
+  Procedure pcie_Phase(p.i)
+    pcie_phaseAt = p
+    If *pcie_phaseHook <> 0
+      pcie_phaseHook()
+    EndIf
+  EndProcedure
+
+; Bounded, ordered 32-bit access to the pcie2 register block - the same
+; contract as the Pi 4 accessors (readl()/writel() carry barriers).
+; pcie_Sync is the a64_barrier sequence (dsb sy; isb), local to this branch.
+  Procedure pcie_Sync()
+    ASM
+      dsb sy
+      isb
+    EndASM
+  EndProcedure
+
+  Procedure.i PcieRcPeek(off.i)
+    Define v.i
+    If off < 0
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    If (off & 3) <> 0
+      ProcedureReturn #PCIE_ERR_ALIGN
+    EndIf
+    If (off + 4) > #PCIE_RC_SIZE
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    v = PeekN(#PCIE_RC_BASE + off)
+    pcie_Sync()
+    ProcedureReturn v
+  EndProcedure
+
+  Procedure pcie_Poke(off.i, v.i)
+    If off < 0 Or (off & 3) <> 0 Or (off + 4) > #PCIE_RC_SIZE
+      ProcedureReturn
+    EndIf
+    pcie_Sync()
+    PokeN(#PCIE_RC_BASE + off, v & $FFFFFFFF)
+    pcie_Sync()
+  EndProcedure
+
+; brcm_pcie_link_up(): PHYLINKUP and DL_ACTIVE, both.
+  Procedure.i PcieLinkUp()
+    Define v.i
+    v = PcieRcPeek(#PCIE_MISC_PCIE_STATUS)
+    If v < 0
+      ProcedureReturn 0
+    EndIf
+    If (v & #PCIE_STATUS_PHYLINKUP_MASK) = 0 Or (v & #PCIE_STATUS_DL_ACTIVE_MASK) = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndProcedure
+
+; Configuration space through the index/data pair (brcm_pcie_map_bus()).
+; "An access to our HW w/o link-up will cause a CPU Abort" - so nothing
+; below bus 0 is touched until PcieInit has seen the link up.
+  Procedure.i PcieCfgRead32(bus.i, dev.i, fn.i, off.i)
+    If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+      ProcedureReturn #PCIE_ERR_CFG_BDF
+    EndIf
+    If bus = 0 And dev = 0
+      ProcedureReturn PcieRcPeek(off & $FFF)
+    EndIf
+    If pcie_up = 0
+      ProcedureReturn #PCIE_ERR_NOT_UP
+    EndIf
+    pcie_Poke(#PCIE_EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (fn << 12))
+    ProcedureReturn PcieRcPeek(#PCIE_EXT_CFG_DATA + (off & $FFF))
+  EndProcedure
+
+  Procedure PcieCfgWrite32(bus.i, dev.i, fn.i, off.i, v.i)
+    If bus < 0 Or dev < 0 Or fn < 0 Or off < 0 Or (off & 3) <> 0
+      ProcedureReturn
+    EndIf
+    If bus = 0 And dev = 0
+      pcie_Poke(off & $FFF, v)
+      ProcedureReturn
+    EndIf
+    If pcie_up = 0
+      ProcedureReturn
+    EndIf
+    pcie_Poke(#PCIE_EXT_CFG_INDEX, (bus << 20) | (dev << 15) | (fn << 12))
+    pcie_Poke(#PCIE_EXT_CFG_DATA + (off & $FFF), v)
+  EndProcedure
+
+; brcm_pcie_encode_ibar_size() read backwards: 1..21 are 64 KiB..64 GiB
+; (log2 - 15), $1C..$1F are 4..32 KiB; 0 is a disabled window.
+  Procedure.i pcie_IbarBytes(code.i)
+    If code >= 1 And code <= 21
+      ProcedureReturn 1 << (code + 15)
+    EndIf
+    If code >= $1C And code <= $1F
+      ProcedureReturn 1 << ((code - $1C) + 12)
+    EndIf
+    ProcedureReturn 0
+  EndProcedure
+
+; Find the inbound window the DMA arithmetic above depends on: PCIe
+; $10_0000_0000 onto CPU 0, access enabled. set_inbound_win_registers()
+; writes RC_BARn LO = low(pci_offset) | size code, HI = high(pci_offset),
+; and on 7712-class parts UBUS_BARn REMAP LO = low(cpu) & ~$FFF | ACCESS_EN,
+; HI = high(cpu). Which BAR number the firmware used is not assumed; all
+; ten are read. Records the window size, or 0.
+  Procedure.i pcie_FindDmaWindow()
+    Define n.i
+    Define lo.i
+    Define hi.i
+    Define rlo.i
+    Define rhi.i
+    Define reg.i
+    Define ubus.i
+    Define bytes.i
+    pcie_dmaWin = 0
+    pcie_dmaBar = 0
+    n = 1
+    While n <= #PCIE_INBOUND_WINS
+      If n <= 3
+        reg  = #PCIE_RC_BAR1_LO + (8 * (n - 1))
+        ubus = #PCIE_UBUS_BAR1 + (8 * (n - 1))
+      Else
+        reg  = #PCIE_RC_BAR4_LO + (8 * (n - 4))
+        ubus = #PCIE_UBUS_BAR4 + (8 * (n - 4))
+      EndIf
+      lo  = PcieRcPeek(reg)
+      hi  = PcieRcPeek(reg + 4)
+      rlo = PcieRcPeek(ubus)
+      rhi = PcieRcPeek(ubus + 4)
+      bytes = pcie_IbarBytes(lo & $1F)
+      If bytes > 0 And (lo & $FFFFFFE0) = 0 And hi = (#PCIE_DMA_BUS >> 32)
+        If (rlo & 1) <> 0 And (rlo & $FFFFF000) = 0 And rhi = 0
+          pcie_dmaWin = bytes
+          pcie_dmaBar = n
+          ProcedureReturn 1
+        EndIf
+      EndIf
+      n = n + 1
+    Wend
+    ProcedureReturn 0
+  EndProcedure
+
+  Procedure.i PcieInit()
+    Define v.i
+    pcie_err = 0
+    If pcie_up <> 0
+      ProcedureReturn 1
+    EndIf
+    pcie_Phase(#PCIE_PH_PROBE)
+    v = PcieRcPeek(#PCIE_MISC_PCIE_STATUS)
+    If v < 0 Or (v & #PCIE_STATUS_PORT_MASK) = 0
+      pcie_err = #PCIE_ERR_EP_MODE
+      ProcedureReturn 0
+    EndIf
+    If PcieLinkUp() = 0
+      pcie_err = #PCIE_ERR_LINK
+      ProcedureReturn 0
+    EndIf
+    v = PcieRcPeek(#PCIE_LNK_WORD)
+    If v >= 0
+      pcie_linkSpeed = (v >> 16) & $F
+      pcie_linkWidth = (v >> 20) & $3F
+    EndIf
+    pcie_Phase(#PCIE_PH_INBOUND)
+    If pcie_FindDmaWindow() = 0
+      pcie_err = #PCIE_ERR_INBOUND
+      ProcedureReturn 0
+    EndIf
+    pcie_up = 1
+    pcie_Phase(#PCIE_PH_UP)
+    ProcedureReturn 1
+  EndProcedure
+
+  Procedure.i PcieEnumerate()
+    Define id.i
+    Define cmd.i
+    pcie_err = 0
+    If pcie_enumerated <> 0
+      ProcedureReturn 1
+    EndIf
+    If pcie_up = 0
+      pcie_err = #PCIE_ERR_LINK
+      ProcedureReturn 0
+    EndIf
+    pcie_Phase(#PCIE_PH_ENUM)
+    id = PcieCfgRead32(1, 0, 0, $00)
+    If id <> #PCIE_RP1_ID
+      pcie_err = #PCIE_ERR_NO_ENDPOINT
+      ProcedureReturn 0
+    EndIf
+    ; The firmware left RP1 decoding memory (its UART0 is how this board
+    ; talks at all). If it did not, the BAR is not routed and every RP1
+    ; access would be the hang measured on the first boots.
+    cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
+    If (cmd & #PCI_CMD_MEMORY) = 0
+      pcie_err = #PCIE_ERR_RP1_MEM
+      ProcedureReturn 0
+    EndIf
+    pcie_enumerated = 1
+    pcie_Phase(#PCIE_PH_DONE)
+    ProcedureReturn 1
+  EndProcedure
+
+; rp1.c rp1_probe(): pci_set_master(). Without it every DMA the xHCI
+; issues is refused on the link and the rings are never read.
+  Procedure.i PcieEnableDma()
+    Define cmd.i
+    If pcie_enumerated = 0
+      ProcedureReturn 0
+    EndIf
+    cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & $FFFF
+    PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd | #PCI_CMD_BUS_MASTER)
+    ProcedureReturn Bool((PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND) & #PCI_CMD_BUS_MASTER) <> 0)
+  EndProcedure
+
+; CPU address of RP1 USB host n (0 or 1), or 0 before the link is proved
+; up and RP1 identified - a read there with the link down does not fail,
+; it hangs.
+  Procedure.i PcieRp1UsbHost(n.i)
+    If pcie_enumerated = 0
+      ProcedureReturn 0
+    EndIf
+    If n = 0
+      ProcedureReturn #PCIE_OUT_CPU + #PCIE_RP1_USBHOST0
+    ElseIf n = 1
+      ProcedureReturn #PCIE_OUT_CPU + #PCIE_RP1_USBHOST1
+    EndIf
+    ProcedureReturn 0
+  EndProcedure
+
+; Can the controller reach [addr, addr+len)? Inside the window PcieInit
+; found, and never address 0.
+  Procedure.i PcieDmaOk(addr.i, len.i)
+    If len <= 0 Or addr <= 0
+      ProcedureReturn 0
+    EndIf
+    If pcie_dmaWin = 0
+      ProcedureReturn 0
+    EndIf
+    If (addr + len) > pcie_dmaWin Or (addr + len) > #PCIE_DMA_LIMIT
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndProcedure
+
+; ARM physical -> the address the xHCI must be handed. The same name and
+; meaning as the Pi 4's PcieDmaBus (physical + inbound offset).
+  Procedure.i PcieDmaBus(physAddr.i)
+    If physAddr < 0 Or pcie_dmaWin = 0 Or physAddr >= pcie_dmaWin
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    ProcedureReturn physAddr + #PCIE_DMA_BUS
+  EndProcedure
+
+; The inverse, for a pointer the controller hands back in an event.
+; Anything outside the window is not a pointer this driver issued.
+  Procedure.i PcieDmaCpu(busAddr.i)
+    If busAddr < #PCIE_DMA_BUS Or busAddr >= (#PCIE_DMA_BUS + pcie_dmaWin)
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    ProcedureReturn busAddr - #PCIE_DMA_BUS
+  EndProcedure
+
+  ; The Pi 4 ownership seam, answered for BCM2712. Nothing is adopted and
+  ; nothing is re-windowed here: RP1's BAR routing is the firmware's and
+  ; is left alone, and a controller the firmware left running is halted
+  ; and reset by xhci.pi4's own XhciInitRp1 before a ring is installed.
+  Procedure.i PcieNeedsTakeover() : ProcedureReturn 0 : EndProcedure
+  Procedure.i PcieAdoptCpu()      : ProcedureReturn 0 : EndProcedure
+  Procedure.i PcieAdoptHalted()   : ProcedureReturn 1 : EndProcedure
+
+  ; The Pi 4 meaning, kept: the offset the root complex adds to an ARM
+  ; physical address on the way in. It is NOT zero here, which is exactly
+  ; why xhci.pi4's Pi 4 XhciInitAt (bare physical pointers) refuses on
+  ; this chip with #XHCI_ERR_DMA_OFFSET.
+  Procedure.i PcieDmaOffset()
+    If pcie_dmaWin = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn #PCIE_DMA_BUS
+  EndProcedure
+
+  ; An RP1 BAR-relative bus address -> CPU, refused outside the window.
+  Procedure.i PcieCpuFromBus(busAddr.i)
+    If busAddr < #PCIE_OUT_BUS Or busAddr >= (#PCIE_OUT_BUS + #PCIE_OUT_SIZE)
+      ProcedureReturn #PCIE_ERR_RANGE
+    EndIf
+    ProcedureReturn #PCIE_OUT_CPU + (busAddr - #PCIE_OUT_BUS)
+  EndProcedure
+
+  Procedure.i PcieDmaWindowSize() : ProcedureReturn pcie_dmaWin : EndProcedure
+  Procedure.i PcieDmaWindowBar()  : ProcedureReturn pcie_dmaBar : EndProcedure
+  Procedure.i PcieAdopted()       : ProcedureReturn 0 : EndProcedure
+  Procedure.i PcieError()         : ProcedureReturn pcie_err : EndProcedure
+  Procedure.i PcieLinkSpeed()     : ProcedureReturn pcie_linkSpeed : EndProcedure
+  Procedure.i PcieLinkWidth()     : ProcedureReturn pcie_linkWidth : EndProcedure
+; bcm2712_cfg carries CFG_QUIRK_NO_SSC: there is no spread-spectrum step
+; on this part, so these report "not applicable" (-1), never a boolean.
+  Procedure.i PcieSscOk()         : ProcedureReturn -1 : EndProcedure
+  Procedure.i PcieSscCntlRaw()    : ProcedureReturn -1 : EndProcedure
+  Procedure.i PcieSscStatusRaw()  : ProcedureReturn -1 : EndProcedure
+
+  Procedure.i PcieErrorText()
+    Select pcie_err
+      Case 0
+        ProcedureReturn "pcie: ok"
+      Case #PCIE_ERR_LINK
+        ProcedureReturn "pcie error -4: the link to RP1 is down. Anvil does not train the BCM2712 link; the firmware resets RP1 before the kernel unless config.txt has pciex4_reset=0."
+      Case #PCIE_ERR_EP_MODE
+        ProcedureReturn "pcie error -5: pcie2 does not report root-complex mode (PCIE_STATUS bit 7 clear)"
+      Case #PCIE_ERR_INBOUND
+        ProcedureReturn "pcie error -16: no inbound window maps PCIe $10_0000_0000 onto ARM physical 0 (RC_BAR1..10 / UBUS_BAR1..10 read back). RP1's DMA - the USB rings - cannot reach memory; refused rather than run a controller that reports success into nothing."
+      Case #PCIE_ERR_NO_ENDPOINT
+        ProcedureReturn "pcie error -7: bus 1 device 0 is not RP1 (1DE4:0001)"
+      Case #PCIE_ERR_RP1_MEM
+        ProcedureReturn "pcie error -17: RP1 is present but its memory decoding is off - the firmware did not leave RP1 usable"
+    EndSelect
+    ProcedureReturn "pcie: unknown error"
+  EndProcedure
+CompilerElse
 EnableExplicit
 
 ; ----------------------------------------------------------------------
@@ -2679,3 +3157,4 @@ Procedure.i PcieDmaBus(physAddr.i)
   EndIf
   ProcedureReturn physAddr + pcie_dmaOff
 EndProcedure
+CompilerEndIf

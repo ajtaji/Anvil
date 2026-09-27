@@ -247,7 +247,15 @@ Procedure.i HwUsbHostVersion() : ProcedureReturn XhciVersion() : EndProcedure
 Procedure.i HwUsbHostLinkSpeed() : ProcedureReturn PcieLinkSpeed() : EndProcedure
 Procedure.i HwUsbHostLinkWidth() : ProcedureReturn PcieLinkWidth() : EndProcedure
 Procedure.i HwUsbHostLinkSsc()   : ProcedureReturn PcieSscOk() : EndProcedure
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the host is an RP1 DWC3 core, which loads no firmware. Its
+  ; config offset $50 is RP1's, not a VL805 version word, so the board
+  ; says it cannot say (hal.pbi: -1). The link rows above read pcie2 -
+  ; the BCM2712 root port to RP1 - through pcie.pi4's 2712 branch.
+  Procedure.i HwUsbHostFirmware()  : ProcedureReturn -1 : EndProcedure
+CompilerElse
 Procedure.i HwUsbHostFirmware()  : ProcedureReturn PcieCfgRead32(1, 0, 0, $50) : EndProcedure
+CompilerEndIf
 
 ; ======================================================================
 ;  THE LINK, IN RAW WORDS - the seam behind `usb link`
