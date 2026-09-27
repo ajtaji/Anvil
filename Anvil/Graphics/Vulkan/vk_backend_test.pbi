@@ -361,6 +361,26 @@ Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
+Global avkTbCopyRowsCalls.i = 0
+
+Procedure.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
+  Define row.i, column.i
+  If source = 0 Or destination = 0 Or rowBytes < 1 Or rows < 1 Or sourcePitch < rowBytes Or destinationPitch < rowBytes
+    ProcedureReturn -1
+  EndIf
+  avkTbCopyRowsCalls = avkTbCopyRowsCalls + 1
+  For row = 0 To rows - 1
+    For column = 0 To rowBytes - 1
+      PokeA(destination + row * destinationPitch + column, PeekA(source + row * sourcePitch + column))
+    Next
+  Next
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i AnvilVkTestBackendCopyRowsCalls()
+  ProcedureReturn avkTbCopyRowsCalls
+EndProcedure
+
 Procedure.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
   Define i.i
   If destination = 0 Or bytes < 1 Or (bytes % 4) <> 0 : ProcedureReturn -1 : EndIf

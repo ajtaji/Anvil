@@ -2163,10 +2163,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         If copyBytes = sourcePitch And copyBytes = destinationPitch
           job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
         Else
-          For k = 0 To copyRows - 1
-            job = avkBackendSubmitBufferCopy(sourceBase + k * sourcePitch, destinationBase + k * destinationPitch, copyBytes)
-            If job <> #ANVIL_VK_JOB_DONE : Break : EndIf
-          Next
+          job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
         EndIf
         If job <> #ANVIL_VK_JOB_DONE
           avkFlightComplete(0)
@@ -2199,13 +2196,11 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
           EndIf
         Else
-          For k = 0 To copyRows - 1
-            job = avkBackendSubmitBufferCopy(sourceBase + k * sourcePitch, destinationBase + k * destinationPitch, copyBytes)
-            If job <> #ANVIL_VK_JOB_DONE
-              avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image row into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
-            EndIf
-          Next
+          job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading Vulkan image rows into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
         EndIf
       EndIf
       o = avkOpNext[o]
@@ -2235,13 +2230,11 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image (VkResult -4); the command buffer was invalidated and its fence signalled.")
             EndIf
           Else
-            For k = 0 To copyRows - 1
-              job = avkBackendSubmitBufferCopy(sourceBase + k * sourcePitch, destinationBase + k * destinationPitch, copyBytes)
-              If job <> #ANVIL_VK_JOB_DONE
-                avkFlightComplete(0)
-                ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image row (VkResult -4); the command buffer was invalidated and its fence signalled.")
-              EndIf
-            Next
+            job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
+            If job <> #ANVIL_VK_JOB_DONE
+              avkFlightComplete(0)
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading linear Vulkan image rows (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            EndIf
           EndIf
         EndIf
         o = avkOpNext[o]
