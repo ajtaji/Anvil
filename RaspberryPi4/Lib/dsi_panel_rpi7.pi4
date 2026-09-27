@@ -1,0 +1,254 @@
+; ======================================================================
+;  dsi_panel_rpi7.pi4 - the official Raspberry Pi 7" Touch Display (the
+;  first one): its power/backlight microcontroller at I2C $45 and its
+;  Toshiba TC358762 DSI-to-DPI bridge, the two things that have to be
+;  told something before the glass will light.
+; ----------------------------------------------------------------------
+;  TWO PARTS, TWO BUSES. The microcontroller (an Atmel) is on the display
+;  connector's I2C - it switches the bridge's power and drives the
+;  backlight PWM. The bridge is on the DSI link and is configured with
+;  generic long writes, one register per packet. The Atmel answering says
+;  nothing about the link; the bridge taking its writes says nothing
+;  about the pixels (there are none until the DSI host's video - step 3).
+;
+;  ---- WHERE THE NUMBERS COME FROM (rule 21) ---------------------------
+;
+;  PureBasicCode RaspberryPi4/Reference/rpi-6.12.y_panel-raspberrypi-
+;  touchscreen.c (Linux rpi-6.12.y drivers/gpu/drm/panel/panel-
+;  raspberrypi-touchscreen.c, compatible "raspberrypi,7inch-touchscreen-
+;  panel"):
+;    :61-81    the Atmel's registers: REG_ID $80, PORTA $81, PORTB $82,
+;              POWERON $85, PWM $86
+;    :84-189   the TC358762 registers used below
+;    :197-212  the mode: 25979 kHz; 800 +1 +2 +46; 480 +7 +2 +21
+;    :219-250  a register read: write the number, 100-300 us, read one
+;    :252-260  a register write: smbus write byte data (reg, value)
+;    :262-276  a bridge write: generic write of reg16 LE then val32 LE
+;    :295-335  prepare: 100 ms, POWERON 1, 20-25 ms, PORTB bit 0 polled
+;              up to 100 times, eleven bridge writes, 100 ms, STARTPPI,
+;              STARTDSI, 100 ms
+;    :337-352  enable: PWM 255 (the backlight), PORTA BIT(2) (flip)
+;    :278-288  disable: PWM 0, POWERON 0
+;    :421-438  probe: REG_ID must be $DE (v1) or $C3 (v2); POWERON 0
+;    :495-504  the DSI device: 1 lane, RGB888, VIDEO | SYNC_PULSE | LPM
+;
+;  The Pi 5's own overlay for this panel (vc4-kms-dsi-7inch) drives the
+;  same two parts through the tc358762 bridge driver and the Atmel
+;  regulator driver; neither is pinned (morning list). This file follows
+;  the panel driver above, which is.
+;
+;  THE TOUCH controller of this panel (FT5406 at $38) has no driver in
+;  Anvil; touch_goodix.pi4 is for the Goodix panels.
+;
+;  DEPENDENCIES, listed before this file by the board: timer.pi4, i2c.pi4
+;  (the caller selects the display bus), dsi_host.pi4 and dsi_dw.pi4 (the
+;  bridge writes go through DsiDwGenericWrite - the BCM2711 host has no
+;  generic long write, so on the Pi 4 this file is not compiled in).
+;  DESK PROOF ONLY (tools/a64/a64_dsi_pi5_check.py). SILICON OWED.
+; ======================================================================
+
+EnableExplicit
+
+#RPI7_ADDR = $45
+
+#RPI7_REG_ID      = $80
+#RPI7_REG_PORTA   = $81
+#RPI7_REG_PORTB   = $82
+#RPI7_REG_POWERON = $85
+#RPI7_REG_PWM     = $86
+
+#RPI7_ID_V1 = $DE
+#RPI7_ID_V2 = $C3
+#RPI7_PORTA_HFLIP = $04          ; BIT(2), the firmware's default orientation
+#RPI7_PWR_POLLS   = 100
+
+; TC358762 registers (panel-raspberrypi-touchscreen.c:84-189).
+#TC_PPI_STARTPPI        = $0104
+#TC_PPI_LPTXTIMECNT     = $0114
+#TC_PPI_D0S_ATMR        = $0144
+#TC_PPI_D1S_ATMR        = $0148
+#TC_PPI_D0S_CLRSIPOCOUNT = $0164
+#TC_PPI_D1S_CLRSIPOCOUNT = $0168
+#TC_DSI_STARTDSI        = $0204
+#TC_DSI_LANEENABLE      = $0210
+#TC_LANEENABLE_CLOCK_D0 = $03    ; DSI_LANEENABLE_CLOCK | _D0
+#TC_LCDCTRL             = $0420
+#TC_SPICMR              = $0450
+#TC_SYSCTRL             = $0464
+
+; The mode (:197-212) and the link (:495-504) - what DsiDwUp is given.
+#RPI7_PIXEL_KHZ = 25979
+#RPI7_LANES     = 1
+#RPI7_BPP       = 24
+
+Global rpi7_id.i = -1            ; REG_ID as read, -1 never
+Global rpi7_code.i               ; the last #I2C_* code
+Global rpi7_pwrok.i              ; 1 if PORTB bit 0 came up in prepare
+Global rpi7_bridge_ok.i          ; bridge writes the host took
+Global rpi7_bridge_bad.i         ; and refused
+Global rpi7_backlight.i = -1
+
+Procedure.i Rpi7Write(reg.i, v.i)
+  Define r.i
+  Dim pkt.a[2]
+  pkt[0] = reg & $FF
+  pkt[1] = v & $FF
+  r = I2cWrite(#RPI7_ADDR, @pkt, 2)
+  rpi7_code = r
+  If r <> #I2C_OK
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; A register read the way the driver does it: the number, a pause, the byte.
+Procedure.i Rpi7Read(reg.i)
+  Define r.i
+  Dim a.a[1]
+  Dim b.a[1]
+  a[0] = reg & $FF
+  r = I2cWrite(#RPI7_ADDR, @a, 1)
+  rpi7_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+  delayMicroseconds(300)
+  b[0] = 0
+  r = I2cRead(#RPI7_ADDR, @b, 1)
+  rpi7_code = r
+  If r <> #I2C_OK
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn b[0] & $FF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rpi7Probe() - is this the official panel? REG_ID must read $DE or $C3
+;  (the driver refuses anything else, and so does this). Then the bridge
+;  is switched OFF, as the driver's probe does, so prepare starts clean.
+;  1, or 0 with Rpi7Id() / Rpi7BusCode() saying why.
+; ----------------------------------------------------------------------
+Procedure.i Rpi7Probe()
+  rpi7_id = Rpi7Read(#RPI7_REG_ID)
+  If rpi7_id <> #RPI7_ID_V1 And rpi7_id <> #RPI7_ID_V2
+    ProcedureReturn 0
+  EndIf
+  If Rpi7Write(#RPI7_REG_POWERON, 0) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(25)
+  ProcedureReturn 1
+EndProcedure
+
+; One TC358762 register: reg16 then val32, little-endian, one generic
+; long write (:262-276).
+Procedure.i Rpi7Bridge(reg.i, v.i)
+  Dim m.a[6]
+  m[0] = reg & $FF
+  m[1] = (reg >> 8) & $FF
+  m[2] = v & $FF
+  m[3] = (v >> 8) & $FF
+  m[4] = (v >> 16) & $FF
+  m[5] = (v >> 24) & $FF
+  If DsiDwGenericWrite(@m, 6) = 0
+    rpi7_bridge_bad = rpi7_bridge_bad + 1
+    ProcedureReturn 0
+  EndIf
+  rpi7_bridge_ok = rpi7_bridge_ok + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rpi7HostUp() - the RP1 DSI host brought up for this panel's mode and
+;  link. The panel's driver owns these numbers, so they live here.
+; ----------------------------------------------------------------------
+Procedure.i Rpi7HostUp()
+  DsiDwSetModeH(#RPI7_PIXEL_KHZ, 800, 800 + 1, 800 + 1 + 2, 800 + 1 + 2 + 46)
+  DsiDwSetModeV(480, 480 + 7, 480 + 7 + 2, 480 + 7 + 2 + 21)
+  ProcedureReturn DsiDwUp(#RPI7_LANES, #RPI7_BPP, #DSIDW_F_LPM | #DSIDW_F_SYNC_PULSE)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rpi7Prepare() - rpi_touchscreen_prepare (:295-335), in its order. The
+;  DSI host must already be up (the bridge writes are DSI packets). 1 if
+;  the Atmel took POWERON and the host took all eleven bridge writes.
+;  PORTB bit 0 not coming up is RECORDED (Rpi7PowerOk), not fatal - the
+;  driver carries on too.
+; ----------------------------------------------------------------------
+Procedure.i Rpi7Prepare()
+  Define i.i
+  Define d.i
+  Define ok.i
+  rpi7_bridge_ok = 0
+  rpi7_bridge_bad = 0
+  rpi7_pwrok = 0
+  delay(100)
+  If Rpi7Write(#RPI7_REG_POWERON, 1) = 0
+    ProcedureReturn 0
+  EndIf
+  delay(25)
+  i = 0
+  While i < #RPI7_PWR_POLLS
+    d = Rpi7Read(#RPI7_REG_PORTB)
+    If d >= 0 And (d & 1) <> 0
+      rpi7_pwrok = 1
+      Break
+    EndIf
+    i = i + 1
+  Wend
+  Rpi7Bridge(#TC_DSI_LANEENABLE, #TC_LANEENABLE_CLOCK_D0)
+  Rpi7Bridge(#TC_PPI_D0S_CLRSIPOCOUNT, $05)
+  Rpi7Bridge(#TC_PPI_D1S_CLRSIPOCOUNT, $05)
+  Rpi7Bridge(#TC_PPI_D0S_ATMR, $00)
+  Rpi7Bridge(#TC_PPI_D1S_ATMR, $00)
+  Rpi7Bridge(#TC_PPI_LPTXTIMECNT, $03)
+  Rpi7Bridge(#TC_SPICMR, $00)
+  Rpi7Bridge(#TC_LCDCTRL, $00100150)
+  Rpi7Bridge(#TC_SYSCTRL, $040F)
+  delay(100)
+  Rpi7Bridge(#TC_PPI_STARTPPI, $01)
+  Rpi7Bridge(#TC_DSI_STARTDSI, $01)
+  delay(100)
+  ok = 0
+  If rpi7_bridge_bad = 0
+    ok = 1
+  EndIf
+  ProcedureReturn ok
+EndProcedure
+
+; The backlight, 0 dark to 255 full. 1 if the Atmel took it.
+Procedure.i Rpi7Backlight(level.i)
+  If level < 0 Or level > 255
+    ProcedureReturn 0
+  EndIf
+  If Rpi7Write(#RPI7_REG_PWM, level) = 0
+    ProcedureReturn 0
+  EndIf
+  rpi7_backlight = level
+  ProcedureReturn 1
+EndProcedure
+
+; rpi_touchscreen_enable (:337-352): the backlight full, the orientation.
+Procedure.i Rpi7Enable()
+  If Rpi7Backlight(255) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Rpi7Write(#RPI7_REG_PORTA, #RPI7_PORTA_HFLIP)
+EndProcedure
+
+; rpi_touchscreen_disable (:278-288).
+Procedure.i Rpi7Disable()
+  Define ok.i
+  ok = Rpi7Backlight(0)
+  If Rpi7Write(#RPI7_REG_POWERON, 0) = 0
+    ok = 0
+  EndIf
+  ProcedureReturn ok
+EndProcedure
+
+Procedure.i Rpi7Id()         : ProcedureReturn rpi7_id         : EndProcedure
+Procedure.i Rpi7BusCode()    : ProcedureReturn rpi7_code       : EndProcedure
+Procedure.i Rpi7PowerOk()    : ProcedureReturn rpi7_pwrok      : EndProcedure
+Procedure.i Rpi7BridgeOk()   : ProcedureReturn rpi7_bridge_ok  : EndProcedure
+Procedure.i Rpi7BridgeBad()  : ProcedureReturn rpi7_bridge_bad : EndProcedure
+Procedure.i Rpi7BacklightLevel() : ProcedureReturn rpi7_backlight : EndProcedure

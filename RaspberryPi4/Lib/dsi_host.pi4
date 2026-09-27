@@ -336,6 +336,28 @@ CompilerEndIf
 #MIPI_DSI_DCS_LONG_WRITE        = $39   ; command + two or more
 #MIPI_DSI_DCS_READ              = $06   ; command, reply expected
 #MIPI_DSI_SET_MAX_RETURN_SIZE   = $37
+CompilerIf #PMF_CHIP = 2712
+  ; The generic writes RP1's host (Lib/dsi_dw.pi4) sends for the official
+  ; 7" panel's bridge - mipi_dsi_generic_write's four types, the same
+  ; header (include/video/mipi_display.h; not pinned, on the morning list).
+  #MIPI_DSI_GENERIC_SHORT_WRITE_0_PARAM = $03
+  #MIPI_DSI_GENERIC_SHORT_WRITE_1_PARAM = $13
+  #MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM = $23
+  #MIPI_DSI_GENERIC_LONG_WRITE          = $29
+
+  ; THE RP1 HOST'S DCS ENTRY POINTS, handed in by Lib/dsi_dw.pi4 when its
+  ; host comes up. A pointer and not a direct call, so this file builds
+  ; on 2712 with or without dsi_dw.pi4 in the image; until it is set,
+  ; DsiDcsWrite answers 0 and DsiDcsRead -1 - a refusal, never a write
+  ; into a BCM2711 register.
+  Global *dsi_rp1_dcsw
+  Global *dsi_rp1_dcsr
+
+  Procedure DsiHostRp1(writeFn.i, readFn.i)
+    *dsi_rp1_dcsw = writeFn
+    *dsi_rp1_dcsr = readFn
+  EndProcedure
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE CLOCK MANAGER. Base and password as pwm.pi4 already documents
@@ -1726,6 +1748,13 @@ EndProcedure
 ;  than sending a short packet with the tail missing.
 ; ----------------------------------------------------------------------
 Procedure.i DsiDcsWrite(cmd.i, param.i, nparam.i)
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the DSI host is RP1's DesignWare one - Lib/dsi_dw.pi4.
+  If *dsi_rp1_dcsw = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn dsi_rp1_dcsw(cmd, param, nparam)
+  CompilerEndIf
   If nparam = 0
     ProcedureReturn DsiXfer(#MIPI_DSI_DCS_SHORT_WRITE, cmd, 0, 0)
   EndIf
@@ -1752,6 +1781,12 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i DsiDcsRead(cmd.i)
   Define rx.i
+  CompilerIf #PMF_CHIP = 2712
+  If *dsi_rp1_dcsr = 0                      ; RP1's host - Lib/dsi_dw.pi4
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn dsi_rp1_dcsr(cmd)
+  CompilerEndIf
 
   ; Tell the panel how much it may send back. Without it a panel is
   ; entitled to return its own idea of a maximum and overrun the reply.

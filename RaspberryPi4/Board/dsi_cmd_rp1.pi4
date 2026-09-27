@@ -1,0 +1,242 @@
+; ======================================================================
+;  dsi_cmd_rp1.pi4 - the Pi 5's `dsi` command: RP1's DesignWare DSI host
+;  through Lib/dsi_dw.pi4, in COMMAND MODE ONLY - the panel is powered,
+;  told its init sequence and its backlight is lit, but no pixel is sent
+;  (the DSI DMA front end is step 3 of the vault plan "DSI display on the
+;  Pi 5").
+;
+;  WHY A SECOND COMMAND FILE. Board/dsi_cmd.pi4 is the BCM2711 host's
+;  instrument - clock manager, VC4 registers, HVS, pixel valve - and none
+;  of its subcommands has an RP1 meaning; this is the thin twin, as
+;  Lib/dsi_dw.pi4 is to Lib/dsi_host.pi4. The board includes it only
+;  under #PMF_CHIP = 2712, after dsi_dw.pi4 and dsi_panel_rpi7.pi4, and
+;  its `dsi` arm calls CmdDsiRp1() there. DESK-PROVED LIBRARIES
+;  (tools/a64/a64_dsi_pi5_check.py); the command itself is not gated.
+;
+;    dsi                  what the host is doing
+;    dsi port 0|1         which camera/display connector (DSI and its I2C)
+;    dsi up               the official 7" display (Atmel $45 + TC358762)
+;    dsi up waveshare     the Waveshare v2 10.1" A (MCU $45 + DCS table)
+;    dsi light <n>        the backlight, 0..255, DECIMAL
+;    dsi off              backlight and bridge off, host down
+; ======================================================================
+
+EnableExplicit
+
+Global dsicmd_panel.i            ; 0 none, 1 the official 7", 2 Waveshare v2
+
+Procedure DsiRp1SayErr(e.i)
+  Select e
+    Case #DSIDW_ERR_ARG
+      Print("the mode or link was out of range")
+    Case #DSIDW_ERR_NOHOST
+      Print("the host's version word read 0 or all ones - its RP1 clock (MIPIn_CFG) may be off, and this tree cannot switch it on yet")
+    Case #DSIDW_ERR_PLL
+      Print("no D-PHY PLL setting reaches the lane rate")
+    Case #DSIDW_ERR_NOLOCK
+      Print("the D-PHY PLL never locked; the PHY was put back in reset")
+    Case #DSIDW_ERR_NOSTOP
+      Print("the lanes never reached stop state; the host was powered down")
+    Case #DSIDW_ERR_NOTUP
+      Print("the host is not up")
+    Case #DSIDW_ERR_FIFO
+      Print("the command FIFOs never drained")
+    Case #DSIDW_ERR_RX
+      Print("the panel did not answer a read")
+    Default
+      Print("code ")
+      PrintDec(e)
+  EndSelect
+EndProcedure
+
+Procedure DsiRp1Status()
+  Print("RP1 DSI host on CAM/DISP ")
+  PrintDec(DsiDwPort())
+  Print(", base $")
+  PutHexN(DsiDwHostBase(), 10)
+  If DsiDwIsUp() = 0
+    PrintN(": down.")
+    ProcedureReturn
+  EndIf
+  PrintN(": up, LP command mode, no video (step 3).")
+  Print("  version word $")
+  PutHexN(DsiDwVersion(), 8)
+  Print(", D-PHY VCO ")
+  PrintDec(DsiDwVcoHz())
+  Print(" Hz (M ")
+  PrintDec(DsiDwPllM())
+  Print(", N ")
+  PrintDec(DsiDwPllN())
+  Print("), byte clock ")
+  PrintDec(DsiDwByteHz())
+  PrintN(" Hz")
+  Print("  packets sent ")
+  PrintDec(DsiDwSent())
+  Print(", refused ")
+  PrintDec(DsiDwFails())
+  PrintN("")
+EndProcedure
+
+Procedure DsiRp1Up(which.i)
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If I2cUp() = 0
+    PrintN("!! the connector's I2C bus would not come up. Nothing was done.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+  If which = 1
+    If Rpi7Probe() = 0
+      Print("!! no official 7-inch panel microcontroller at $45 (REG_ID ")
+      PrintDec(Rpi7Id())
+      PrintN(", want 222 or 195). Nothing else was done.")
+      I2cSelectBus(#I2C_BUS_HEADER)
+      ProcedureReturn
+    EndIf
+    PrintN("The panel's Atmel answered; the bridge is off.")
+    If Rpi7HostUp() = 0
+      Print("!! the DSI host did not come up: ")
+      DsiRp1SayErr(DsiDwError())
+      PrintN(".")
+      I2cSelectBus(#I2C_BUS_HEADER)
+      ProcedureReturn
+    EndIf
+    DsiRp1Status()
+    If Rpi7Prepare() = 0
+      Print("!! the bridge set-up did not complete: ")
+      PrintDec(Rpi7BridgeOk())
+      Print(" of 11 writes taken; ")
+      DsiRp1SayErr(DsiDwError())
+      PrintN(".")
+    Else
+      PrintN("The TC358762 took all 11 register writes.")
+    EndIf
+    If Rpi7PowerOk() = 0
+      PrintN("  (the Atmel never reported the bridge powered - PORTB bit 0)")
+    EndIf
+    If Rpi7Enable() = 0
+      PrintN("!! the backlight write was not acknowledged.")
+    Else
+      PrintN("Backlight 255. The glass is lit but shows no picture: video is step 3.")
+      dsicmd_panel = 1
+    EndIf
+  Else
+    If DsiV2Begin() = 0
+      PrintN("!! no Waveshare v2 MCU answered at $45. Nothing else was done.")
+      I2cSelectBus(#I2C_BUS_HEADER)
+      ProcedureReturn
+    EndIf
+    DsiDwSetModeH(70000, 800, 840, 860, 880)
+    DsiDwSetModeV(1280, 1300, 1320, 1324)
+    If DsiDwUp(2, 24, #DSIDW_F_LPM | #DSIDW_F_NONCONT) = 0
+      Print("!! the DSI host did not come up: ")
+      DsiRp1SayErr(DsiDwError())
+      PrintN(".")
+      I2cSelectBus(#I2C_BUS_HEADER)
+      ProcedureReturn
+    EndIf
+    DsiRp1Status()
+    If DsiPanelPrepare() = 0
+      Print("!! the init table did not complete: ")
+      PrintDec(DsiPanelSent())
+      Print(" sent, ")
+      PrintDec(DsiPanelFailed())
+      PrintN(" refused.")
+    Else
+      Print("The panel took its init table: ")
+      PrintDec(DsiPanelSent())
+      PrintN(" DCS commands.")
+    EndIf
+    If DsiV2Backlight(255) = 0
+      PrintN("!! the backlight write was not acknowledged.")
+    Else
+      PrintN("Backlight 255. No picture yet: video is step 3.")
+      dsicmd_panel = 2
+    EndIf
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+EndProcedure
+
+Procedure DsiRp1Light(v.i)
+  Define ok.i
+  If dsicmd_panel = 0
+    PrintN("!! no panel has been brought up with `dsi up`; nothing was written.")
+    ProcedureReturn
+  EndIf
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If dsicmd_panel = 1
+    ok = Rpi7Backlight(v)
+  Else
+    ok = DsiV2Backlight(v)
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  If ok = 0
+    PrintN("!! the backlight write was not acknowledged.")
+  Else
+    Print("Backlight ")
+    PrintDec(v)
+    PrintN(".")
+  EndIf
+EndProcedure
+
+Procedure DsiRp1Off()
+  I2cSelectBus(#I2C_BUS_DISPLAY)
+  If dsicmd_panel = 1
+    Rpi7Disable()
+  ElseIf dsicmd_panel = 2
+    DsiV2Backlight(0)
+  EndIf
+  I2cSelectBus(#I2C_BUS_HEADER)
+  DsiDwDown()
+  dsicmd_panel = 0
+  PrintN("Backlight off, host down.")
+EndProcedure
+
+Procedure CmdDsiRp1()
+  Define v.i
+  SkipSpace()
+  If gLine[gPos] = 0
+    DsiRp1Status()
+    ProcedureReturn
+  EndIf
+  gWordAt = gPos
+  SkipWord()
+  gWordLen = gPos - gWordAt
+  If WordIs("up") <> 0
+    SkipSpace()
+    If gLine[gPos] = 0
+      DsiRp1Up(1)
+      ProcedureReturn
+    EndIf
+    gWordAt = gPos
+    SkipWord()
+    gWordLen = gPos - gWordAt
+    If WordIs("waveshare") <> 0
+      DsiRp1Up(2)
+    Else
+      PrintN("!! dsi up takes nothing (the official 7-inch) or waveshare.")
+    EndIf
+  ElseIf WordIs("port") <> 0
+    v = ParseDec()
+    If gParseOk = 0 Or (v <> 0 And v <> 1)
+      PrintN("!! dsi port takes 0 or 1.")
+      ProcedureReturn
+    EndIf
+    If DsiDwSetPort(v) = 0
+      PrintN("!! the host is up; `dsi off` first. Nothing was changed.")
+      ProcedureReturn
+    EndIf
+    DwI2cSetDisplayPort(v)
+    DsiRp1Status()
+  ElseIf WordIs("light") <> 0
+    v = ParseDec()
+    If gParseOk = 0 Or v < 0 Or v > 255
+      PrintN("!! dsi light needs a DECIMAL level, 0 to 255.")
+      ProcedureReturn
+    EndIf
+    DsiRp1Light(v)
+  ElseIf WordIs("off") <> 0
+    DsiRp1Off()
+  Else
+    PrintN("dsi | dsi port 0|1 | dsi up [waveshare] | dsi light <0..255> | dsi off")
+  EndIf
+EndProcedure

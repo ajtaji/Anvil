@@ -1,0 +1,858 @@
+; ======================================================================
+;  dsi_dw.pi4 - the Pi 5's DSI host: RP1's Synopsys DesignWare MIPI DSI
+;  controller and its D-PHY, in COMMAND MODE. THE ONE FILE THAT KNOWS THE
+;  DESIGNWARE DSI REGISTERS, the RP1 twin of RaspberryPi4/Lib/dsi_host.pi4
+;  (which knows the BCM2711's VC4 DSI1).
+;
+;  A DIFFERENT IP, SO A THIN HOST FILE (Rule 30). Nothing in dsi_host.pi4
+;  applies below the MIPI packet: different register map, D-PHY, clocks
+;  and power (vault: Raspberry Pi 5/DSI display on the Pi 5 - plan.md).
+;  What IS shared is the packet vocabulary (#MIPI_DSI_* in dsi_host.pi4,
+;  which this file follows in the include order) and the panel drivers
+;  above it: DsiDwUp hands DsiDwDcsWrite / DsiDwDcsRead to dsi_host.pi4
+;  (DsiHostRp1), whose DsiDcsWrite / DsiDcsRead call them on
+;  #PMF_CHIP = 2712, so dsi_panel_v2_dcs.pi4 runs unmodified.
+;
+;  ---- WHAT THIS DOES AND DOES NOT DO -----------------------------------
+;
+;  Step 2 of the plan: host power-up, D-PHY PLL and timers, LP command
+;  mode, generic and DCS writes, one-byte DCS reads. NO VIDEO: the DPI
+;  clock (rp1dsi_dpiclk_start) and the RP1 DSI DMA front end are step 3,
+;  so no pixel reaches the glass. A panel's init table does.
+;
+;  ***THE CLOCKS ARE NOT PROGRAMMED HERE, AND CANNOT YET BE (plan step
+;  1).*** The host's register clock is RP1_CLK_MIPIn_CFG (rp1.dtsi
+;  assigns 25 MHz) and its register lives in drivers/clk/clk-rp1.c, which
+;  is not pinned - on the morning list. Linux enables it in bind
+;  (rp1_dsi.c:317-318) and touches MIPI CFG before it (rp1_dsi.c:492).
+;  So DsiDwUp() READS DSI_VERSION_CFG FIRST and refuses with
+;  #DSIDW_ERR_NOHOST, having written nothing, if it reads 0 or all ones:
+;  a host whose clock is off cannot be told from one that is absent, and
+;  either way nothing below would work. Whether an unclocked RP1 block
+;  answers 0 or stalls the PCIe read is a SILICON QUESTION.
+;  The D-PHY reference is the crystal, hardwired (rp1.dtsi:1164 "&clk_xosc
+;  hardwired to DSI refclk"), 50 MHz (rp1dsi_refclk_freq's default,
+;  rp1_dsi_dsi.c:387-395). The byte clock is the D-PHY PLL's own output.
+;
+;  ---- WHERE THE NUMBERS COME FROM (rule 21: do not guess) -------------
+;
+;  Pinned, vault Raspberry Pi 5/Sources (raspberrypi/linux 7e030b60792d):
+;    rp1_dsi_dsi.c:18-114   the DW register map; :90-101 the PHY test
+;                           interface bits; :138-151 the PHY test codes
+;    rp1_dsi_dsi.c:184-198  dphy_transaction (the five accesses)
+;    rp1_dsi_dsi.c:201-248  dphy_get_div (M even 2..298, N 1..99,
+;                           5 MHz <= ref/N <= 40 MHz, refuse >= 1/64 off)
+;    rp1_dsi_dsi.c:260-300  hsfreq_table - generated into the DataSection
+;                           below by a script from that file; the gate
+;                           re-parses the C and compares every byte
+;    rp1_dsi_dsi.c:302-376  hsfreqrange, PLL programming, dphy_init order
+;    rp1_dsi_dsi.c:379-385  MIPI CFG: CFG = 0 selects DSI (not CSI-2)
+;    rp1_dsi_dsi.c:451-579  rp1dsi_dsi_setup - the whole order below
+;    rp1_dsi_dsi.c:581-630  rp1dsi_dsi_send; :632-660 rp1dsi_dsi_recv
+;    rp1_dsi_dsi.c:662-669  rp1dsi_dsi_stop
+;    rp1.dtsi:1152-1190     the two hosts' three blocks each
+;  Read from a scratch fetch at the same commit (not vaulted; on the
+;  morning list): rp1_dsi.c:388-410 (host_transfer: header word as
+;  mipi_dsi_create_packet builds it, payload, then recv), rp1_dsi.h:22-34.
+;  The three blocks, through the pinned DTB's rp1 and pcie ranges:
+;    MIPI0 dsi@110000: DMA $1F00118000, host $1F0011C000, CFG $1F00120000
+;    MIPI1 dsi@128000: DMA $1F00130000, host $1F00134000, CFG $1F00138000
+;  MIPI1 (CAM/DISP 1) is the default: the display overlays target &dsi1.
+;  THE DMA BLOCK IS NEVER TOUCHED by this file (step 3).
+;
+;  ---- DEVIATIONS FROM rp1dsi_dsi_setup, all deliberate -----------------
+;  * MIPI CFG INTE is written 0, not DSI_DMA: this file polls.
+;  * No DPI clock start (step 3).
+;  * A PLL that never locks or lanes that never reach stop state are
+;    ERRORS here (the host powered back down, PHY into reset) - Linux
+;    logs and carries on.
+;
+;  POLLED. Timeouts are deadlines on timer.pi4's Ticks()/TickHz() plus
+;  an iteration backstop. DESK PROOF ONLY (tools/a64/a64_dsi_pi5_check.py).
+;  SILICON OWED.
+;
+;  DEPENDENCIES, listed before this file by the board: timer.pi4
+;  (Ticks, TickHz, delayMicroseconds, delay) and dsi_host.pi4 (#MIPI_DSI_*).
+; ======================================================================
+
+EnableExplicit
+
+; The two hosts' blocks (see the header).
+#DSIDW_MIPI0_HOST = $1F0011C000
+#DSIDW_MIPI0_CFG  = $1F00120000
+#DSIDW_MIPI1_HOST = $1F00134000
+#DSIDW_MIPI1_CFG  = $1F00138000
+
+; DesignWare host registers - rp1_dsi_dsi.c:18-114.
+#DSIDW_VERSION_CFG      = $000
+#DSIDW_PWR_UP           = $004
+#DSIDW_CLKMGR_CFG       = $008
+#DSIDW_DPI_COLOR_CODING = $010
+#DSIDW_DPI_CFG_POL      = $014
+#DSIDW_DPI_LP_CMD_TIM   = $018
+#DSIDW_PCKHDL_CFG       = $02C
+#DSIDW_GEN_VCID         = $030
+#DSIDW_MODE_CFG         = $034
+#DSIDW_VID_MODE_CFG     = $038
+#DSIDW_VID_PKT_SIZE     = $03C
+#DSIDW_VID_NUM_CHUNKS   = $040
+#DSIDW_VID_NULL_SIZE    = $044
+#DSIDW_VID_HSA_TIME     = $048
+#DSIDW_VID_HBP_TIME     = $04C
+#DSIDW_VID_HLINE_TIME   = $050
+#DSIDW_VID_VSA_LINES    = $054
+#DSIDW_VID_VBP_LINES    = $058
+#DSIDW_VID_VFP_LINES    = $05C
+#DSIDW_VID_VACTIVE_LINES = $060
+#DSIDW_CMD_MODE_CFG     = $068
+#DSIDW_GEN_HDR          = $06C
+#DSIDW_GEN_PLD_DATA     = $070
+#DSIDW_CMD_PKT_STATUS   = $074
+#DSIDW_TO_CNT_CFG       = $078
+#DSIDW_BTA_TO_CNT       = $08C
+#DSIDW_LPCLK_CTRL       = $094
+#DSIDW_PHY_TMR_LPCLK_CFG = $098
+#DSIDW_PHY_TMR_CFG      = $09C
+#DSIDW_PHYRSTZ          = $0A0
+#DSIDW_PHY_IF_CFG       = $0A4
+#DSIDW_PHY_STATUS       = $0B0
+#DSIDW_PHY_TST_CTRL0    = $0B4
+#DSIDW_PHY_TST_CTRL1    = $0B8
+
+#DSIDW_PCKHDL_EOTP_TX_EN = $01           ; BIT(0)
+#DSIDW_PCKHDL_BTA_EN     = $04           ; BIT(2)
+#DSIDW_VID_LP_CMD_EN     = $8000         ; BIT(15)
+#DSIDW_VID_LP_ALL        = $3F00         ; LP_HFP|HBP|VACT|VFP|VBP|VSA, BIT(13..8)
+#DSIDW_VID_LP_HBP_EN     = $1000         ; BIT(12)
+#DSIDW_VID_SYNC_EVENTS   = 1
+#DSIDW_VID_BURST         = 2
+#DSIDW_CMD_MODE_ALL_LP   = $10F7F00
+#DSIDW_CMD_MODE_ACK_RQST = $02           ; BIT(1)
+#DSIDW_PHYRSTZ_SHUTDOWNZ = $01
+#DSIDW_PHYRSTZ_RSTZ      = $02
+#DSIDW_TST0_TESTCLR      = $01           ; PHY_TST_CTRL0 BIT(0)
+#DSIDW_TST0_TESTCLK      = $02           ; BIT(1)
+#DSIDW_TST1_TESTEN       = $10000        ; PHY_TST_CTRL1 BIT(16)
+#DSIDW_PHY_LOCK          = $01           ; PHY_STATUS BIT(0)
+
+; CMD_PKT_STATUS: (status & $F) = 5 is "command and write-payload FIFOs
+; both empty" (rp1_dsi_dsi.c:588); bit 4 read-payload empty, bit 6 read
+; command busy (:639).
+#DSIDW_PKT_IDLE_MASK = $0F
+#DSIDW_PKT_IDLE      = $05
+#DSIDW_PKT_RD_EMPTY  = $10
+#DSIDW_PKT_RD_BUSY   = $40
+
+; D-PHY test codes - rp1_dsi_dsi.c:138-151.
+#DSIDW_TC_PLL_INPUT_DIV = $17
+#DSIDW_TC_PLL_LOOP_DIV  = $18
+#DSIDW_TC_PLL_DIV_CTRL  = $19
+#DSIDW_TC_CLK_PN_SWAP   = $35
+#DSIDW_TC_HS_RX_CTRL_L0 = $44
+#DSIDW_TC_D0_PN_SWAP    = $45
+#DSIDW_TC_D1_PN_SWAP    = $55
+#DSIDW_TC_D2_PN_SWAP    = $85
+#DSIDW_TC_D3_PN_SWAP    = $95
+
+; MIPI CFG block - rp1_dsi_dsi.c:157-178.
+#DSIDW_MIPICFG_CFG  = $04
+#DSIDW_MIPICFG_INTE = $2C
+
+; Numbers rp1dsi_dsi_setup uses - rp1_dsi_dsi.c:451-457.
+#DSIDW_REFCLK_HZ     = 50000000
+#DSIDW_DPI_MAX_KHZ   = 200000
+#DSIDW_BYTE_MIN      = 10000000
+#DSIDW_BYTE_MAX      = 187500000
+#DSIDW_ESC_MAX       = 20000000
+#DSIDW_TO_CLK_DIV    = $50
+#DSIDW_LPRX_TO_VAL   = $40
+#DSIDW_BTA_TO_VAL    = $D00
+#DSIDW_HSFREQ_ROWS   = 39
+#DSIDW_HSFREQ_BYTES  = 7
+
+; Mode flags DsiDwUp takes - the MIPI_DSI_MODE_* the panel drivers set.
+#DSIDW_F_LPM        = $01    ; MIPI_DSI_MODE_LPM: commands in low power
+#DSIDW_F_SYNC_PULSE = $02    ; MIPI_DSI_MODE_VIDEO_SYNC_PULSE
+#DSIDW_F_BURST      = $04    ; MIPI_DSI_MODE_VIDEO_BURST
+#DSIDW_F_NO_EOT     = $08    ; MIPI_DSI_MODE_NO_EOT_PACKET
+#DSIDW_F_NONCONT    = $10    ; MIPI_DSI_CLOCK_NON_CONTINUOUS
+
+#DSIDW_LOCK_US  = 200000     ; Linux: up to 16384 polls of 10-50 us
+#DSIDW_STOP_US  = 50000      ; Linux: up to 1024 polls of 10-50 us
+#DSIDW_FIFO_US  = 40000      ; Linux: up to 256 polls of 100-150 us
+#DSIDW_SPIN_MAX = 4000000
+
+#DSIDW_OK          = 0
+#DSIDW_ERR_ARG     = -1      ; lanes, format or mode not given or out of range
+#DSIDW_ERR_NOHOST  = -2      ; DSI_VERSION_CFG read 0 or all ones
+#DSIDW_ERR_PLL     = -3      ; no M/N within 1/64 of the lane rate
+#DSIDW_ERR_NOLOCK  = -4      ; PHY_STATUS never showed PLL lock
+#DSIDW_ERR_NOSTOP  = -5      ; the lanes never reached stop state
+#DSIDW_ERR_NOTUP   = -6      ; a transfer with the host not up
+#DSIDW_ERR_FIFO    = -7      ; the command FIFOs never drained
+#DSIDW_ERR_RX      = -8      ; a read got no reply
+
+Global dsidw_mipi0.i            ; 0 (the default): the host is MIPI1
+Global dsidw_host.i
+Global dsidw_cfg.i
+Global dsidw_up.i
+Global dsidw_err.i
+Global dsidw_version.i
+Global dsidw_lanes.i
+Global dsidw_bpp.i
+Global dsidw_flags.i
+Global dsidw_pixkhz.i
+Global dsidw_hdisplay.i
+Global dsidw_hss.i
+Global dsidw_hse.i
+Global dsidw_htotal.i
+Global dsidw_vdisplay.i
+Global dsidw_vss.i
+Global dsidw_vse.i
+Global dsidw_vtotal.i
+Global dsidw_m.i
+Global dsidw_n.i
+Global dsidw_vco.i
+Global dsidw_byte.i
+Global dsidw_hsidx.i
+Global dsidw_clkdiv.i
+Global dsidw_cmdtim.i
+Global dsidw_sent.i
+Global dsidw_fails.i
+Global dsidw_phystat.i
+
+Procedure.i dsidw_Fail(e.i)
+  dsidw_err = e
+  ProcedureReturn 0
+EndProcedure
+
+Procedure dsidw_Pick()
+  If dsidw_mipi0 <> 0
+    dsidw_host = #DSIDW_MIPI0_HOST
+    dsidw_cfg = #DSIDW_MIPI0_CFG
+  Else
+    dsidw_host = #DSIDW_MIPI1_HOST
+    dsidw_cfg = #DSIDW_MIPI1_CFG
+  EndIf
+EndProcedure
+
+Procedure.i DsiDwRd(off.i)
+  ProcedureReturn PeekN(dsidw_host + off) & $FFFFFFFF
+EndProcedure
+
+Procedure DsiDwWr(off.i, v.i)
+  PokeL(dsidw_host + off, v)
+EndProcedure
+
+Procedure dsidw_CfgWr(off.i, v.i)
+  PokeL(dsidw_cfg + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Which host: DsiDwSetPort(1) is CAM/DISP 1 (MIPI1, the default - the
+;  display overlays target &dsi1), (0) is CAM/DISP 0 (MIPI0). Refused
+;  (0, nothing changed) for any other number or with a host up.
+; ----------------------------------------------------------------------
+Procedure.i DsiDwSetPort(port.i)
+  If dsidw_up <> 0
+    ProcedureReturn 0
+  EndIf
+  If port = 1
+    dsidw_mipi0 = 0
+    ProcedureReturn 1
+  EndIf
+  If port = 0
+    dsidw_mipi0 = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i DsiDwPort()
+  If dsidw_mipi0 <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i DsiDwHostBase()
+  dsidw_Pick()
+  ProcedureReturn dsidw_host
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  hsfreq_table (rp1_dsi_dsi.c:260-300): row i, field f - 0/1 the MHz
+;  ceiling (little-endian), 2 hsfreqrange, 3 clk_lp2hs, 4 clk_hs2lp,
+;  5 data_lp2hs, 6 data_hs2lp.
+; ----------------------------------------------------------------------
+Procedure.i dsidw_Hs(i.i, f.i)
+  ProcedureReturn PeekA(?dsidw_hsfreq + i * #DSIDW_HSFREQ_BYTES + f) & $FF
+EndProcedure
+
+Procedure.i dsidw_HsMhz(i.i)
+  ProcedureReturn dsidw_Hs(i, 0) | (dsidw_Hs(i, 1) << 8)
+EndProcedure
+
+; dphy_set_hsfreqrange's search: the first row whose ceiling covers mhz,
+; else the last row.
+Procedure.i DsiDwHsIndex(mhz.i)
+  Define i.i
+  i = 0
+  While i < #DSIDW_HSFREQ_ROWS - 1
+    If mhz <= dsidw_HsMhz(i)
+      Break
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn i
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDwPllPlan(ref, vco) - dphy_get_div (rp1_dsi_dsi.c:201-248): the
+;  achieved VCO in Hz with M and N in dsidw_m / dsidw_n, or 0 if no pair
+;  comes within 1/64 of the wanted rate. Pure arithmetic, no register.
+; ----------------------------------------------------------------------
+Procedure.i DsiDwPllPlan(ref.i, vco.i)
+  Define n.i
+  Define halfM.i
+  Define f.i
+  Define e.i
+  Define bestE.i
+  Define bestN.i
+  Define bestM.i
+  If ref <= 0 Or vco <= 0
+    ProcedureReturn 0
+  EndIf
+  bestE = vco
+  bestN = 0
+  bestM = 0
+  n = 1 + ref / 40000000
+  While n * 5000000 <= ref And n < 100
+    halfM = (n * vco + ref) / (2 * ref)
+    If halfM < 150
+      f = (2 * halfM * ref) / n
+      If f > vco
+        e = f - vco
+      Else
+        e = vco - f
+      EndIf
+      If e < bestE
+        bestN = n
+        bestM = 2 * halfM
+        bestE = e
+        If e = 0
+          Break
+        EndIf
+      EndIf
+    EndIf
+    n = n + 1
+  Wend
+  If bestN = 0 Or bestM < 2 Or 64 * bestE >= vco
+    ProcedureReturn 0
+  EndIf
+  dsidw_n = bestN
+  dsidw_m = bestM
+  ProcedureReturn (bestM * ref) / bestN
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The panel's mode, as its Linux driver's drm_display_mode gives it.
+;  Command mode needs htotal and vdisplay (the timeouts) and the hsync
+;  (the LP command window); the rest is written for step 3.
+; ----------------------------------------------------------------------
+Procedure DsiDwSetModeH(pixelKhz.i, hdisplay.i, hsyncStart.i, hsyncEnd.i, htotal.i)
+  dsidw_pixkhz = pixelKhz
+  dsidw_hdisplay = hdisplay
+  dsidw_hss = hsyncStart
+  dsidw_hse = hsyncEnd
+  dsidw_htotal = htotal
+EndProcedure
+
+Procedure DsiDwSetModeV(vdisplay.i, vsyncStart.i, vsyncEnd.i, vtotal.i)
+  dsidw_vdisplay = vdisplay
+  dsidw_vss = vsyncStart
+  dsidw_vse = vsyncEnd
+  dsidw_vtotal = vtotal
+EndProcedure
+
+; dphy_transaction (rp1_dsi_dsi.c:184-198): the code latched on TESTCLK
+; falling with TESTEN set, the data on TESTCLK rising with it clear.
+Procedure dsidw_PhyTest(code.i, v.i)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL1, (code & $FF) | #DSIDW_TST1_TESTEN)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, 0)
+  DsiDwRd(#DSIDW_PHY_TST_CTRL1)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL1, v & $FF)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, #DSIDW_TST0_TESTCLK)
+EndProcedure
+
+; Poll PHY_STATUS until (status & mask) = mask, on a Ticks() deadline and
+; an iteration backstop. The last word read is kept for a diagnostic.
+Procedure.i dsidw_WaitPhy(mask.i, us.i)
+  Define hz.i
+  Define deadline.i
+  Define spins.i
+  hz = TickHz()
+  deadline = 0
+  If hz > 0
+    deadline = Ticks() + (hz / 1000000) * us
+  EndIf
+  spins = 0
+  Repeat
+    dsidw_phystat = DsiDwRd(#DSIDW_PHY_STATUS)
+    If (dsidw_phystat & mask) = mask
+      ProcedureReturn 1
+    EndIf
+    spins = spins + 1
+    If spins > #DSIDW_SPIN_MAX
+      ProcedureReturn 0
+    EndIf
+    If deadline > 0
+      If Ticks() > deadline
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDwUp(lanes, bpp, flags) - rp1dsi_dsi_setup (rp1_dsi_dsi.c:459-579)
+;  for the mode set above, in its order, ending in LP command mode with
+;  the lanes in stop state. bpp 24 (RGB888) or 16 (RGB565); flags the
+;  #DSIDW_F_* the panel's driver declares. 1, or 0 with DsiDwError().
+;
+;  Everything that can be refused is refused BEFORE the first write: the
+;  arguments, the host's identity word, and a PLL plan within 1/64 and
+;  inside the D-PHY's 80..1500 MHz table (Linux logs an out-of-range rate
+;  and programs it anyway).
+; ----------------------------------------------------------------------
+Procedure.i DsiDwUp(lanes.i, bpp.i, flags.i)
+  Define khz.i
+  Define byte.i
+  Define vco.i
+  Define mhz.i
+  Define mask.i
+  Define v.i
+  Define t.i
+  Define c.i
+  Define colour.i
+
+  dsidw_up = 0
+  dsidw_err = #DSIDW_OK
+  If lanes < 1 Or lanes > 4 Or dsidw_pixkhz <= 0 Or dsidw_htotal <= 0 Or dsidw_vdisplay <= 0
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_ARG)
+  EndIf
+  If bpp = 24
+    colour = $005                        ; get_colorcode RGB888
+  ElseIf bpp = 16
+    colour = $000                        ; RGB565
+  Else
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_ARG)
+  EndIf
+  dsidw_lanes = lanes
+  dsidw_bpp = bpp
+  dsidw_flags = flags
+
+  ; The byte clock the mode needs, clamped as Linux clamps it.
+  khz = dsidw_pixkhz
+  If khz > #DSIDW_DPI_MAX_KHZ
+    khz = #DSIDW_DPI_MAX_KHZ
+  EndIf
+  byte = (bpp * 125 * khz) / lanes
+  If byte < #DSIDW_BYTE_MIN
+    byte = #DSIDW_BYTE_MIN
+  EndIf
+  If byte > #DSIDW_BYTE_MAX
+    byte = #DSIDW_BYTE_MAX
+  EndIf
+  vco = DsiDwPllPlan(#DSIDW_REFCLK_HZ, 8 * byte)
+  If vco = 0
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_PLL)
+  EndIf
+  mhz = vco / 1000000
+  If mhz < 80 Or mhz > 1500
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_PLL)
+  EndIf
+  dsidw_vco = vco
+  dsidw_hsidx = DsiDwHsIndex(mhz)
+
+  ; The host must answer before anything is written (see the header).
+  dsidw_Pick()
+  dsidw_version = DsiDwRd(#DSIDW_VERSION_CFG)
+  If dsidw_version = 0 Or dsidw_version = $FFFFFFFF
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_NOHOST)
+  EndIf
+
+  ; rp1dsi_mipicfg_setup: DSI, not CSI-2. Polled, so no interrupt.
+  dsidw_CfgWr(#DSIDW_MIPICFG_CFG, 0)
+  dsidw_CfgWr(#DSIDW_MIPICFG_INTE, 0)
+
+  DsiDwWr(#DSIDW_PHY_IF_CFG, lanes - 1)
+  DsiDwWr(#DSIDW_DPI_CFG_POL, 0)
+  DsiDwWr(#DSIDW_GEN_VCID, 0)
+  DsiDwWr(#DSIDW_DPI_COLOR_CODING, colour)
+
+  mask = #DSIDW_VID_LP_ALL
+  If (flags & #DSIDW_F_LPM) <> 0
+    mask = mask | #DSIDW_VID_LP_CMD_EN
+  EndIf
+  If (flags & #DSIDW_F_BURST) <> 0
+    mask = mask | #DSIDW_VID_BURST
+  ElseIf (flags & #DSIDW_F_SYNC_PULSE) = 0
+    mask = mask | #DSIDW_VID_SYNC_EVENTS
+  ElseIf 8 * lanes > bpp
+    mask = mask & (~#DSIDW_VID_LP_HBP_EN)
+  EndIf
+  DsiDwWr(#DSIDW_VID_MODE_CFG, mask)
+  If (flags & #DSIDW_F_LPM) <> 0
+    DsiDwWr(#DSIDW_CMD_MODE_CFG, #DSIDW_CMD_MODE_ALL_LP)
+  Else
+    DsiDwWr(#DSIDW_CMD_MODE_CFG, 0)
+  EndIf
+  v = #DSIDW_PCKHDL_BTA_EN
+  If (flags & #DSIDW_F_NO_EOT) = 0
+    v = v | #DSIDW_PCKHDL_EOTP_TX_EN
+  EndIf
+  DsiDwWr(#DSIDW_PCKHDL_CFG, v)
+  DsiDwWr(#DSIDW_MODE_CFG, 1)             ; command mode
+
+  t = (bpp * dsidw_htotal * dsidw_vdisplay) / (7 * #DSIDW_TO_CLK_DIV * lanes)
+  If t > $FFFF
+    t = 0
+  EndIf
+  DsiDwWr(#DSIDW_TO_CNT_CFG, (t << 16) | #DSIDW_LPRX_TO_VAL)
+  DsiDwWr(#DSIDW_BTA_TO_CNT, #DSIDW_BTA_TO_VAL)
+  dsidw_clkdiv = 1 + byte / #DSIDW_ESC_MAX
+  If dsidw_clkdiv < 2
+    dsidw_clkdiv = 2
+  EndIf
+  DsiDwWr(#DSIDW_CLKMGR_CFG, (#DSIDW_TO_CLK_DIV << 8) | dsidw_clkdiv)
+
+  ; The video timings - unused until step 3, written as Linux writes them.
+  DsiDwWr(#DSIDW_VID_PKT_SIZE, dsidw_hdisplay)
+  DsiDwWr(#DSIDW_VID_NUM_CHUNKS, 0)
+  DsiDwWr(#DSIDW_VID_NULL_SIZE, 0)
+  DsiDwWr(#DSIDW_VID_HSA_TIME, (bpp * (dsidw_hse - dsidw_hss)) / (8 * lanes))
+  DsiDwWr(#DSIDW_VID_HBP_TIME, (bpp * (dsidw_htotal - dsidw_hse)) / (8 * lanes))
+  DsiDwWr(#DSIDW_VID_HLINE_TIME, (bpp * dsidw_htotal) / (8 * lanes))
+  DsiDwWr(#DSIDW_VID_VSA_LINES, dsidw_vse - dsidw_vss)
+  DsiDwWr(#DSIDW_VID_VBP_LINES, dsidw_vtotal - dsidw_vse)
+  DsiDwWr(#DSIDW_VID_VFP_LINES, dsidw_vss - dsidw_vdisplay)
+  DsiDwWr(#DSIDW_VID_VACTIVE_LINES, dsidw_vdisplay)
+
+  ; dphy_init (rp1_dsi_dsi.c:348-376): PHY in reset, test interface
+  ; cleared, the PLL programmed, the lanes' polarity (all normal - no
+  ; lane-polarities in the display overlays), out of reset.
+  DsiDwWr(#DSIDW_PHYRSTZ, 0)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, #DSIDW_TST0_TESTCLK)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL1, 0)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, #DSIDW_TST0_TESTCLK | #DSIDW_TST0_TESTCLR)
+  delayMicroseconds(1)
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, #DSIDW_TST0_TESTCLK)
+  delayMicroseconds(1)
+  dsidw_PhyTest(#DSIDW_TC_HS_RX_CTRL_L0, dsidw_Hs(dsidw_hsidx, 2) << 1)
+  dsidw_PhyTest(#DSIDW_TC_PLL_DIV_CTRL, $30)
+  dsidw_PhyTest(#DSIDW_TC_PLL_INPUT_DIV, dsidw_n - 1)
+  dsidw_PhyTest(#DSIDW_TC_PLL_LOOP_DIV, $80 | ((dsidw_m - 1) >> 5))
+  dsidw_PhyTest(#DSIDW_TC_PLL_LOOP_DIV, (dsidw_m - 1) & $1F)
+  dsidw_PhyTest(#DSIDW_TC_CLK_PN_SWAP, 0)
+  dsidw_PhyTest(#DSIDW_TC_D0_PN_SWAP, 0)
+  dsidw_PhyTest(#DSIDW_TC_D1_PN_SWAP, 0)
+  dsidw_PhyTest(#DSIDW_TC_D2_PN_SWAP, 0)
+  dsidw_PhyTest(#DSIDW_TC_D3_PN_SWAP, 0)
+  delayMicroseconds(1)
+  DsiDwWr(#DSIDW_PHYRSTZ, #DSIDW_PHYRSTZ_SHUTDOWNZ)
+  delayMicroseconds(1)
+  DsiDwWr(#DSIDW_PHYRSTZ, #DSIDW_PHYRSTZ_SHUTDOWNZ | #DSIDW_PHYRSTZ_RSTZ)
+  delayMicroseconds(1)
+  dsidw_byte = vco >> 3
+
+  DsiDwWr(#DSIDW_PHY_TMR_LPCLK_CFG, dsidw_Hs(dsidw_hsidx, 3) | (dsidw_Hs(dsidw_hsidx, 4) << 16))
+  DsiDwWr(#DSIDW_PHY_TMR_CFG, dsidw_Hs(dsidw_hsidx, 5) | (dsidw_Hs(dsidw_hsidx, 6) << 16))
+
+  ; LP bytes per vertical-blanking line (rp1_dsi_dsi.c:537-546).
+  c = dsidw_htotal
+  If (flags & #DSIDW_F_SYNC_PULSE) <> 0
+    c = c - (dsidw_hse - dsidw_hss)
+  EndIf
+  c = (bpp * c - 64) / (8 * lanes)
+  c = c - dsidw_Hs(dsidw_hsidx, 6)
+  c = c - dsidw_Hs(dsidw_hsidx, 5)
+  c = (c / dsidw_clkdiv) - 24
+  If c < 0
+    c = 0
+  Else
+    c = c >> 4
+  EndIf
+  dsidw_cmdtim = c
+  DsiDwWr(#DSIDW_DPI_LP_CMD_TIM, c << 16)
+
+  If dsidw_WaitPhy(#DSIDW_PHY_LOCK, #DSIDW_LOCK_US) = 0
+    DsiDwWr(#DSIDW_PHYRSTZ, 0)
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_NOLOCK)
+  EndIf
+
+  If (flags & #DSIDW_F_NONCONT) <> 0
+    DsiDwWr(#DSIDW_LPCLK_CTRL, $3)
+  Else
+    DsiDwWr(#DSIDW_LPCLK_CTRL, $1)
+  EndIf
+  DsiDwWr(#DSIDW_PHY_TST_CTRL0, $2)
+  DsiDwWr(#DSIDW_PWR_UP, 1)
+
+  ; Stop state on every lane in use (rp1_dsi_dsi.c:561-574).
+  mask = $10
+  If lanes >= 2
+    mask = mask | $80
+  EndIf
+  If lanes >= 3
+    mask = mask | $200
+  EndIf
+  If lanes >= 4
+    mask = mask | $800
+  EndIf
+  If dsidw_WaitPhy(mask, #DSIDW_STOP_US) = 0
+    DsiDwWr(#DSIDW_PWR_UP, 0)
+    DsiDwWr(#DSIDW_PHYRSTZ, 0)
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_NOSTOP)
+  EndIf
+
+  dsidw_up = 1
+  dsidw_Register()
+  ProcedureReturn 1
+EndProcedure
+
+; rp1dsi_dsi_stop (rp1_dsi_dsi.c:662-669), less the DPI clock.
+Procedure DsiDwDown()
+  If dsidw_host = 0
+    ProcedureReturn
+  EndIf
+  DsiDwWr(#DSIDW_MODE_CFG, 1)
+  DsiDwWr(#DSIDW_LPCLK_CTRL, 2)
+  DsiDwWr(#DSIDW_PWR_UP, 0)
+  DsiDwWr(#DSIDW_PHYRSTZ, 0)
+  dsidw_up = 0
+EndProcedure
+
+; Both command FIFOs empty, on a deadline.
+Procedure.i dsidw_WaitIdle()
+  Define hz.i
+  Define deadline.i
+  Define spins.i
+  hz = TickHz()
+  deadline = 0
+  If hz > 0
+    deadline = Ticks() + (hz / 1000000) * #DSIDW_FIFO_US
+  EndIf
+  spins = 0
+  Repeat
+    If (DsiDwRd(#DSIDW_CMD_PKT_STATUS) & #DSIDW_PKT_IDLE_MASK) = #DSIDW_PKT_IDLE
+      ProcedureReturn 1
+    EndIf
+    spins = spins + 1
+    If spins > #DSIDW_SPIN_MAX
+      ProcedureReturn 0
+    EndIf
+    If deadline > 0
+      If Ticks() > deadline
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  dsidw_Send(hdr, *buf, n) - rp1dsi_dsi_send (rp1_dsi_dsi.c:581-630):
+;  wait for empty FIFOs, set LP (the panel's LPM flag, as
+;  mipi_dsi_create_packet's caller passes MIPI_DSI_MSG_USE_LPM), the
+;  payload in little-endian words, then the header word, then wait for
+;  empty again. hdr is the four-byte packet header as a word: data type
+;  (virtual channel 0) in bits 7:0, then data0/data1 or the word count.
+; ----------------------------------------------------------------------
+Procedure.i dsidw_Send(hdr.i, *buf, n.i)
+  Define v.i
+  Define i.i
+  If dsidw_up = 0
+    dsidw_fails = dsidw_fails + 1
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_NOTUP)
+  EndIf
+  If dsidw_WaitIdle() = 0
+    dsidw_fails = dsidw_fails + 1
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_FIFO)
+  EndIf
+  v = DsiDwRd(#DSIDW_VID_MODE_CFG)
+  If (dsidw_flags & #DSIDW_F_LPM) <> 0
+    v = v | #DSIDW_VID_LP_CMD_EN
+  Else
+    v = v & (~#DSIDW_VID_LP_CMD_EN)
+  EndIf
+  DsiDwWr(#DSIDW_VID_MODE_CFG, v)
+  If (dsidw_flags & #DSIDW_F_LPM) <> 0
+    DsiDwWr(#DSIDW_CMD_MODE_CFG, #DSIDW_CMD_MODE_ALL_LP)
+  Else
+    DsiDwWr(#DSIDW_CMD_MODE_CFG, 0)
+  EndIf
+  DsiDwRd(#DSIDW_CMD_MODE_CFG)
+  i = 0
+  While i < n
+    v = PeekA(*buf + i) & $FF
+    If i + 1 < n
+      v = v | ((PeekA(*buf + i + 1) & $FF) << 8)
+    EndIf
+    If i + 2 < n
+      v = v | ((PeekA(*buf + i + 2) & $FF) << 16)
+    EndIf
+    If i + 3 < n
+      v = v | ((PeekA(*buf + i + 3) & $FF) << 24)
+    EndIf
+    DsiDwWr(#DSIDW_GEN_PLD_DATA, v)
+    i = i + 4
+  Wend
+  DsiDwWr(#DSIDW_GEN_HDR, hdr)
+  If dsidw_WaitIdle() = 0
+    dsidw_fails = dsidw_fails + 1
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_FIFO)
+  EndIf
+  dsidw_sent = dsidw_sent + 1
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDwGenericWrite(*buf, n) - mipi_dsi_generic_write: 0, 1 or 2 bytes
+;  as a generic short write, more as one generic long write. 1 or 0.
+; ----------------------------------------------------------------------
+Procedure.i DsiDwGenericWrite(*buf, n.i)
+  If n < 0 Or n > 65535
+    ProcedureReturn dsidw_Fail(#DSIDW_ERR_ARG)
+  EndIf
+  If n = 0
+    ProcedureReturn dsidw_Send(#MIPI_DSI_GENERIC_SHORT_WRITE_0_PARAM, 0, 0)
+  EndIf
+  If n = 1
+    ProcedureReturn dsidw_Send(#MIPI_DSI_GENERIC_SHORT_WRITE_1_PARAM | ((PeekA(*buf) & $FF) << 8), 0, 0)
+  EndIf
+  If n = 2
+    ProcedureReturn dsidw_Send(#MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM | ((PeekA(*buf) & $FF) << 8) | ((PeekA(*buf + 1) & $FF) << 16), 0, 0)
+  EndIf
+  ProcedureReturn dsidw_Send(#MIPI_DSI_GENERIC_LONG_WRITE | ((n & $FF) << 8) | (((n >> 8) & $FF) << 16), *buf, n)
+EndProcedure
+
+; DsiDwDcsWrite(cmd, param, nparam) - a DCS short write, the Pi 4's
+; DsiDcsWrite contract (dsi_host.pi4 forwards here on 2712). 1 or 0.
+Procedure.i DsiDwDcsWrite(cmd.i, param.i, nparam.i)
+  If nparam = 0
+    ProcedureReturn dsidw_Send(#MIPI_DSI_DCS_SHORT_WRITE | ((cmd & $FF) << 8), 0, 0)
+  EndIf
+  If nparam = 1
+    ProcedureReturn dsidw_Send(#MIPI_DSI_DCS_SHORT_WRITE_PARAM | ((cmd & $FF) << 8) | ((param & $FF) << 16), 0, 0)
+  EndIf
+  ProcedureReturn dsidw_Fail(#DSIDW_ERR_ARG)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  DsiDwDcsRead(cmd) - one byte from the panel, 0..255, or -1. The
+;  maximum return size first (mipi_dsi_dcs_read's order), the read
+;  request, then rp1dsi_dsi_recv's wait: read command no longer busy AND
+;  the read FIFO not empty. A write can succeed into a disconnected
+;  ribbon; a read cannot - the panel has to drive the reply.
+; ----------------------------------------------------------------------
+Procedure.i DsiDwDcsRead(cmd.i)
+  Define hz.i
+  Define deadline.i
+  Define spins.i
+  If dsidw_Send(#MIPI_DSI_SET_MAX_RETURN_SIZE | (1 << 8), 0, 0) = 0
+    ProcedureReturn -1
+  EndIf
+  If dsidw_Send(#MIPI_DSI_DCS_READ | ((cmd & $FF) << 8), 0, 0) = 0
+    ProcedureReturn -1
+  EndIf
+  hz = TickHz()
+  deadline = 0
+  If hz > 0
+    deadline = Ticks() + (hz / 1000000) * #DSIDW_FIFO_US
+  EndIf
+  spins = 0
+  Repeat
+    If (DsiDwRd(#DSIDW_CMD_PKT_STATUS) & (#DSIDW_PKT_RD_BUSY | #DSIDW_PKT_RD_EMPTY)) = 0
+      ProcedureReturn DsiDwRd(#DSIDW_GEN_PLD_DATA) & $FF
+    EndIf
+    spins = spins + 1
+    If spins > #DSIDW_SPIN_MAX
+      Break
+    EndIf
+    If deadline > 0
+      If Ticks() > deadline
+        Break
+      EndIf
+    EndIf
+  ForEver
+  dsidw_err = #DSIDW_ERR_RX
+  ProcedureReturn -1
+EndProcedure
+
+; Hand the two DCS entry points to dsi_host.pi4, so DsiDcsWrite /
+; DsiDcsRead (and dsi_panel_v2_dcs.pi4 above them) reach this host.
+Procedure dsidw_Register()
+  DsiHostRp1(@DsiDwDcsWrite, @DsiDwDcsRead)
+EndProcedure
+
+Procedure.i DsiDwIsUp()      : ProcedureReturn dsidw_up      : EndProcedure
+Procedure.i DsiDwError()     : ProcedureReturn dsidw_err     : EndProcedure
+Procedure.i DsiDwVersion()   : ProcedureReturn dsidw_version : EndProcedure
+Procedure.i DsiDwVcoHz()     : ProcedureReturn dsidw_vco     : EndProcedure
+Procedure.i DsiDwByteHz()    : ProcedureReturn dsidw_byte    : EndProcedure
+Procedure.i DsiDwPllM()      : ProcedureReturn dsidw_m       : EndProcedure
+Procedure.i DsiDwPllN()      : ProcedureReturn dsidw_n       : EndProcedure
+Procedure.i DsiDwHsRow()     : ProcedureReturn dsidw_hsidx   : EndProcedure
+Procedure.i DsiDwEscDiv()    : ProcedureReturn dsidw_clkdiv  : EndProcedure
+Procedure.i DsiDwCmdTime()   : ProcedureReturn dsidw_cmdtim  : EndProcedure
+Procedure.i DsiDwSent()      : ProcedureReturn dsidw_sent    : EndProcedure
+Procedure.i DsiDwFails()     : ProcedureReturn dsidw_fails   : EndProcedure
+Procedure.i DsiDwPhyStatus() : ProcedureReturn dsidw_phystat : EndProcedure
+
+; ----------------------------------------------------------------------
+;  hsfreq_table, rp1_dsi_dsi.c:260-300, generated from that file: per row
+;  the MHz ceiling (lo, hi), hsfreqrange, clk_lp2hs, clk_hs2lp,
+;  data_lp2hs, data_hs2lp.
+; ----------------------------------------------------------------------
+DataSection
+  dsidw_hsfreq:
+  Data.b $59, $00, $00, $20, $14, $1A, $0D   ;   89 MHz
+  Data.b $63, $00, $10, $23, $17, $1C, $0E   ;   99 MHz
+  Data.b $6D, $00, $20, $20, $16, $1A, $0D   ;  109 MHz
+  Data.b $81, $00, $01, $1F, $14, $1B, $0D   ;  129 MHz
+  Data.b $8B, $00, $11, $21, $16, $1A, $0E   ;  139 MHz
+  Data.b $95, $00, $21, $21, $15, $1A, $0E   ;  149 MHz
+  Data.b $A9, $00, $02, $20, $14, $1B, $0D   ;  169 MHz
+  Data.b $B3, $00, $12, $24, $17, $1E, $0F   ;  179 MHz
+  Data.b $C7, $00, $22, $28, $16, $21, $0F   ;  199 MHz
+  Data.b $DB, $00, $03, $28, $16, $21, $0F   ;  219 MHz
+  Data.b $EF, $00, $13, $2C, $18, $24, $10   ;  239 MHz
+  Data.b $F9, $00, $23, $30, $18, $26, $11   ;  249 MHz
+  Data.b $0D, $01, $04, $30, $18, $26, $11   ;  269 MHz
+  Data.b $2B, $01, $14, $32, $1B, $29, $12   ;  299 MHz
+  Data.b $49, $01, $05, $38, $1C, $2D, $12   ;  329 MHz
+  Data.b $67, $01, $15, $3B, $1C, $30, $13   ;  359 MHz
+  Data.b $8F, $01, $25, $3D, $1E, $32, $14   ;  399 MHz
+  Data.b $C1, $01, $06, $43, $1F, $37, $15   ;  449 MHz
+  Data.b $F3, $01, $16, $49, $1F, $3B, $16   ;  499 MHz
+  Data.b $25, $02, $07, $4F, $24, $3F, $18   ;  549 MHz
+  Data.b $57, $02, $17, $53, $25, $44, $19   ;  599 MHz
+  Data.b $89, $02, $08, $5A, $26, $49, $1B   ;  649 MHz
+  Data.b $BB, $02, $18, $5F, $28, $4D, $1C   ;  699 MHz
+  Data.b $ED, $02, $09, $66, $28, $54, $1C   ;  749 MHz
+  Data.b $1F, $03, $19, $6A, $2A, $57, $1E   ;  799 MHz
+  Data.b $51, $03, $29, $71, $2C, $5D, $1F   ;  849 MHz
+  Data.b $83, $03, $39, $76, $2F, $62, $20   ;  899 MHz
+  Data.b $B5, $03, $0A, $7C, $2F, $66, $22   ;  949 MHz
+  Data.b $E7, $03, $1A, $82, $31, $6B, $23   ;  999 MHz
+  Data.b $19, $04, $2A, $87, $33, $6F, $25   ; 1049 MHz
+  Data.b $4B, $04, $3A, $8B, $33, $72, $26   ; 1099 MHz
+  Data.b $7D, $04, $0B, $92, $36, $78, $28   ; 1149 MHz
+  Data.b $AF, $04, $1B, $99, $39, $7D, $29   ; 1199 MHz
+  Data.b $E1, $04, $2B, $9E, $3A, $82, $2A   ; 1249 MHz
+  Data.b $13, $05, $3B, $A3, $3A, $87, $2C   ; 1299 MHz
+  Data.b $45, $05, $0C, $A8, $3C, $8C, $2D   ; 1349 MHz
+  Data.b $77, $05, $1C, $AC, $40, $90, $2F   ; 1399 MHz
+  Data.b $A9, $05, $2C, $B0, $41, $94, $30   ; 1449 MHz
+  Data.b $DC, $05, $3C, $B5, $42, $99, $32   ; 1500 MHz
+EndDataSection
