@@ -420,15 +420,24 @@ def source_contract(text: str) -> list[str]:
     for snippet in REQUIRED_HOST_COHERENT_COMPLETION:
         if snippet not in render_wait:
             failures.append("the HOST_COHERENT completion contract lost: " + snippet)
-    # Buffer copies/fills write only the identity-mapped coherent heap. Keep
-    # the CPU fallback ban on the image, clear and draw backend methods.
+    # The Pi 4 backend must not substitute processor loops when board DMA is
+    # absent. The desk test backend owns the byte oracle instead.
     render_text = text
-    for name in ("avkBackendSubmitBufferCopy", "avkBackendSubmitBufferFill"):
+    for name, dma_call in (("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
+                           ("avkBackendSubmitBufferFill", "HwVkDmaFill(")):
         start = render_text.find("Procedure.i " + name + "(")
         end = render_text.find("EndProcedure", start)
         if start < 0 or end < start:
             failures.append("the backend lost its bounded buffer transfer seam " + name)
         else:
+            transfer = render_text[start:end]
+            if ("CompilerIf #DSP_DMA_LINKED = 1" not in transfer
+                    or dma_call not in transfer
+                    or "CompilerElse\n  ProcedureReturn -1\n  CompilerEndIf" not in transfer):
+                failures.append("the Pi 4 buffer transfer no longer requires DMA: " + name)
+            for token in ("PeekA(", "PokeA(", "PeekL(", "PokeL(", "CopyMemory("):
+                if token in transfer:
+                    failures.append("the Pi 4 buffer transfer contains a CPU copy: " + name)
             render_text = render_text[:start] + render_text[end + len("EndProcedure"):]
     for token in FORBIDDEN_TOKENS:
         if token in render_text:

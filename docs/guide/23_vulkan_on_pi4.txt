@@ -1,0 +1,19 @@
+@CHAPTER Vulkan on a Raspberry Pi 4
+
+@INTRO Anvil implements a bounded Vulkan core-1.0 subset on the Pi 4. Accepted draws and colour clears run on the V3D GPU; supported transfers use the V3D texture unit or guarded DMA. Unsupported shapes return a diagnostic rather than a partial result.
+
+@SECTION Rendering and transfers
+
+The resident Vulkan console uses the public command and resource path. An accepted draw list becomes one V3D bin/render transaction, with GPU tile clear and store. The supported whole-image buffer-to-optimal-image upload uses the texture unit. Buffer copies, fills, updates, equal-size linear image copies, and tightly packed linear image readbacks use guarded DMA on the production Pi 4 backend. `vkCmdUpdateBuffer` captures caller bytes at recording time; submission transfers the captured bytes by DMA. The display owner presents a completed attachment separately.
+
+The production V3D backend refuses a buffer transfer if its board DMA seam is not linked. It does not copy the transfer through a CPU byte loop. A separate test backend does perform byte writes as an explicit oracle for desk checks; that backend is not the Pi 4 runtime. CPU work is still needed to record commands, validate resources, stage caller data and rasterize source glyphs for the atlas. These are not GPU drawing operations.
+
+@SECTION The supported image readback
+
+`vkCmdCopyImageToBuffer` accepts exactly one region covering a complete, tightly packed linear BGRA8 image. The source must have transfer-source usage and be in `TRANSFER_SRC_OPTIMAL` or `GENERAL`; the destination must be a bound transfer-destination buffer with a four-byte-aligned offset and enough space. The command retains both allocations, rechecks the resources at submission, and refuses overlapping memory. Padded rows, subrectangles, array layers, multiple regions, and mixed jobs are not yet implemented.
+
+The readback passed a desk byte check, including all pixels of a 64 by 64 image and the untouched prefix of a destination buffer. The new command has not yet been run as a Pi 4 hardware readback. It does not make arbitrary optimal-tiled images readable through this command.
+
+@SECTION Build and proof boundary
+
+The normal Pi 4 image compiles with the IDE compiler's `--compile` path and links the board DMA seam. The emitted V3D backend gate checks its source contract, links the production backend, and runs an engine-down no-MMIO fixture. Those checks cannot prove a new transfer on silicon. A returning Pi 4 diagnostic is needed for that claim. The detailed implemented and refused Vulkan calls are in `docs/VULKAN_COMPATIBILITY_STATUS.md` and `Anvil/Graphics/Vulkan/COVERAGE.md`. Anvil is not a conformant Vulkan 1.0 implementation.
