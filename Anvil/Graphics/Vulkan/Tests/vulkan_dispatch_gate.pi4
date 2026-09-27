@@ -16,6 +16,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
 Global vkdChecks.i = 0
 Global vkdFails.i = 0
 Global Dim vkdSparseSentinel.a[128]
+Global Dim vkdCacheBytes.a[32]
 
 Procedure Vkd(ok.i)
   PokeN(#VKD_ROWS + vkdChecks * 8, ok)
@@ -38,6 +39,13 @@ Procedure.i Main()
   Define layout.VkSubresourceLayout
   Define mappedRange.VkMappedMemoryRange
   Define properties.VkPhysicalDeviceProperties
+  Define cacheInfo.VkPipelineCacheCreateInfo
+  Define cache.i
+  Define cache2.i
+  Define cacheSize.i
+  Define cacheSource.i
+  Define pipelineInfo.VkGraphicsPipelineCreateInfo
+  Define pipelineOut.i
 
   AnvilVkTestBackendHeap($07000000, $00100000)
   Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
@@ -59,6 +67,10 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
   Vkd(vkGetDeviceProcAddr(device, "vkGetDeviceProcAddr") = @vkGetDeviceProcAddr)
   Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = @vkCreateEvent)
+  Vkd(vkGetDeviceProcAddr(device, "vkCreatePipelineCache") = @vkCreatePipelineCache)
+  Vkd(vkGetDeviceProcAddr(device, "vkDestroyPipelineCache") = @vkDestroyPipelineCache)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPipelineCacheData") = @vkGetPipelineCacheData)
+  Vkd(vkGetDeviceProcAddr(device, "vkMergePipelineCaches") = @vkMergePipelineCaches)
   Vkd(vkGetDeviceProcAddr(device, "vkDestroyEvent") = @vkDestroyEvent)
   Vkd(vkGetDeviceProcAddr(device, "vkGetEventStatus") = @vkGetEventStatus)
   Vkd(vkGetDeviceProcAddr(device, "vkSetEvent") = @vkSetEvent)
@@ -239,6 +251,30 @@ Procedure.i Main()
   Vkd(vkGetDeviceProcAddr(device, "vkFreeDescriptorSets") = @vkFreeDescriptorSets)
   Vkd(vkGetInstanceProcAddr(instance, "vkCreateEvent") = @vkCreateEvent)
   Vkd(vkGetDeviceProcAddr(device, "vkCreateEvent") = @vkCreateEvent)
+
+  ; An empty cache has a stable 32-byte header and accepts a round trip.
+  cacheInfo\sType = #VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO
+  Vkd(vkCreatePipelineCache(device, @cacheInfo, 0, @cache) = #VK_SUCCESS)
+  Vkd(vkCreateGraphicsPipelines(device, cache, 0, @pipelineInfo, 0, @pipelineOut) = #ANVIL_VK_ERR_ARGS)
+  cacheSize = 0
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, 0) = #VK_SUCCESS And cacheSize = 32)
+  cacheSize = 12
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, @vkdCacheBytes[0]) = #VK_INCOMPLETE And cacheSize = 12)
+  cacheSize = 32
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, @vkdCacheBytes[0]) = #VK_SUCCESS And cacheSize = 32)
+  Vkd(PeekL(@vkdCacheBytes[0]) = 32 And PeekL(@vkdCacheBytes[4]) = 1)
+  cacheInfo\initialDataSize = 32
+  cacheInfo\pInitialData = @vkdCacheBytes[0]
+  Vkd(vkCreatePipelineCache(device, @cacheInfo, 0, @cache2) = #VK_SUCCESS)
+  cacheSource = cache2
+  Vkd(vkMergePipelineCaches(device, cache, 1, @cacheSource) = #VK_SUCCESS)
+  Vkd(vkMergePipelineCaches(device, cache, 1, @cache) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(vkGetPipelineCacheData($12345678, cache, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  vkDestroyPipelineCache(device, cache2, 0)
+  Vkd(vkGetPipelineCacheData(device, cache2, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  vkDestroyPipelineCache(device, cache, 0)
+  Vkd(vkGetPipelineCacheData(device, cache, @cacheSize, 0) = #ANVIL_VK_ERR_HANDLE)
+  Vkd(vkCreateGraphicsPipelines(device, cache, 0, @pipelineInfo, 0, @pipelineOut) = #ANVIL_VK_ERR_HANDLE)
 
   ; Names are byte exact: no case folding, prefix matching, suffix guessing,
   ; alias invention, or unterminated overlong match.

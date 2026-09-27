@@ -88,6 +88,7 @@
 #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO = 9
 #VK_STRUCTURE_TYPE_EVENT_CREATE_INFO = 10
 #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 14
+#VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17
 #VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO = 31
 #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO = 39
 #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO = 40
@@ -897,6 +898,22 @@ EndStructure
 #VK_ACCESS_UNIFORM_READ_BIT = $00000008
 #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT = $00000080
 #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT = $00000100
+
+Structure VkPipelineCacheCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  initialDataSize.i
+  *pInitialData
+EndStructure
+
+Structure VkPipelineCacheHeaderVersionOne Align #PB_Structure_AlignC
+  headerSize.l
+  headerVersion.l
+  vendorID.l
+  deviceID.l
+  pipelineCacheUUID.a[16]
+EndStructure
 
 Structure VkShaderModuleCreateInfo Align #PB_Structure_AlignC
   sType.l

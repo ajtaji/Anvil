@@ -1540,6 +1540,43 @@ EndProcedure
 ;  Every element is attempted independently. A failed element remains null;
 ;  successful handles remain caller-owned even when another element fails.
 ; ----------------------------------------------------------------------
+Procedure.i vkCreatePipelineCache(device.i, *pCreateInfo.VkPipelineCacheCreateInfo, *pAllocator, *pPipelineCache)
+  Define rc.i
+  If *pCreateInfo = 0 Or *pPipelineCache = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*pPipelineCache, #VK_NULL_HANDLE)
+  rc = avkNoAllocator(*pAllocator, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\sType <> #VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreatePipelineCache requires VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO (Anvil code -20001, wrong sType); no cache was created.")
+  EndIf
+  rc = avkNoPNext(*pCreateInfo\pNext)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If *pCreateInfo\flags <> 0 : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+  If *pCreateInfo\initialDataSize < 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pCreateInfo\initialDataSize > 0 And *pCreateInfo\pInitialData = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  ; Imported data is a hint. This implementation starts with an empty cache.
+  ProcedureReturn AnvilVkPipelineCacheCreate(device, *pPipelineCache)
+EndProcedure
+
+Procedure vkDestroyPipelineCache(device.i, pipelineCache.i, *pAllocator)
+  Define rc.i
+  If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
+    ProcedureReturn
+  EndIf
+  rc = AnvilVkPipelineCacheDestroy(device, pipelineCache)
+  If rc <> #VK_SUCCESS
+    avkFault(rc, "vkDestroyPipelineCache was given a stale or wrong-device cache (Anvil code -20002, invalid handle); nothing was destroyed.")
+  EndIf
+EndProcedure
+
+Procedure.i vkGetPipelineCacheData(device.i, pipelineCache.i, *pDataSize, *pData)
+  ProcedureReturn AnvilVkPipelineCacheData(device, pipelineCache, *pDataSize, *pData)
+EndProcedure
+
+Procedure.i vkMergePipelineCaches(device.i, dstCache.i, srcCacheCount.i, *pSrcCaches)
+  ProcedureReturn AnvilVkPipelineCacheMerge(device, dstCache, srcCacheCount, *pSrcCaches)
+EndProcedure
+
 Procedure.i vkCreateGraphicsPipelines(device.i, pipelineCache.i, createInfoCount.i, *pCreateInfos.VkGraphicsPipelineCreateInfo, *pAllocator, *pPipelines)
   Define rc.i
   Define firstError.i
@@ -1549,7 +1586,10 @@ Procedure.i vkCreateGraphicsPipelines(device.i, pipelineCache.i, createInfoCount
   rc = avkNoAllocator(*pAllocator, 0)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   If pipelineCache <> #VK_NULL_HANDLE
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a VkPipelineCache (Anvil code -20005, pipeline cache not implemented); there is no vkCreatePipelineCache here, so pass VK_NULL_HANDLE.")
+    i = avkCacheSlot(pipelineCache)
+    If i = 0 Or avkCacheDev[i] <> avkDevSlot(device)
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_HANDLE, "vkCreateGraphicsPipelines was given a stale or wrong-device VkPipelineCache (Anvil code -20002, invalid handle); no pipeline was created.")
+    EndIf
   EndIf
   If createInfoCount < 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines needs a positive createInfoCount (Anvil code -20001, empty pipeline array); supply at least one VkGraphicsPipelineCreateInfo.")

@@ -73,6 +73,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TYPE_DESCRIPTOR_SET = 19
 #ANVIL_VK_TYPE_SAMPLER = 20
 #ANVIL_VK_TYPE_EVENT = 21
+#ANVIL_VK_TYPE_PIPELINE_CACHE = 22
 
 #ANVIL_VK_CB_INITIAL = 0
 #ANVIL_VK_CB_RECORDING = 1
@@ -87,6 +88,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_COMMAND_POOLS = 16
 #ANVIL_VK_MAX_COMMAND_BUFFERS = 32
 #ANVIL_VK_MAX_EVENTS = 16
+#ANVIL_VK_MAX_PIPELINE_CACHES = 8
 
 ; HOW MANY VERTEX INPUT BINDINGS one pipeline may describe, and therefore
 ; how many vertex buffers one draw may read. It lives here rather than in
@@ -395,6 +397,10 @@ Global Dim avkEventLive.a[#ANVIL_VK_MAX_EVENTS + 1]
 Global Dim avkEventGen.i[#ANVIL_VK_MAX_EVENTS + 1]
 Global Dim avkEventDev.i[#ANVIL_VK_MAX_EVENTS + 1]
 Global Dim avkEventSet.a[#ANVIL_VK_MAX_EVENTS + 1]
+Global Dim avkCacheLive.a[#ANVIL_VK_MAX_PIPELINE_CACHES + 1]
+Global Dim avkCacheGen.i[#ANVIL_VK_MAX_PIPELINE_CACHES + 1]
+Global Dim avkCacheDev.i[#ANVIL_VK_MAX_PIPELINE_CACHES + 1]
+Global Dim avkCacheDevGen.i[#ANVIL_VK_MAX_PIPELINE_CACHES + 1]
 
 ; ----------------------------------------------------------------------
 ;  THE VALIDATION FAULT RECORD.
@@ -704,6 +710,103 @@ Procedure.i avkEventSlot(event.i)
   s = avkTokenShape(event, #ANVIL_VK_TYPE_EVENT, #ANVIL_VK_MAX_EVENTS)
   If s = 0 Or avkEventLive[s] = 0 Or avkEventGen[s] <> avkTokenGen(event) : ProcedureReturn 0 : EndIf
   ProcedureReturn s
+EndProcedure
+
+; A cache has a valid portable header but no compiled pipeline entries. The
+; current pipeline compiler runs for each create call, so exporting or merging
+; a cache never claims a shader binary that can be reused.
+Procedure.i avkCacheSlot(cache.i)
+  Define s.i
+  Define d.i
+  s = avkTokenShape(cache, #ANVIL_VK_TYPE_PIPELINE_CACHE, #ANVIL_VK_MAX_PIPELINE_CACHES)
+  If s = 0 Or avkCacheLive[s] = 0 Or avkCacheGen[s] <> avkTokenGen(cache) : ProcedureReturn 0 : EndIf
+  d = avkCacheDev[s]
+  If d < 1 Or d > #ANVIL_VK_MAX_DEVICES : ProcedureReturn 0 : EndIf
+  If avkDevLive[d] = 0 Or avkDevGen[d] <> avkCacheDevGen[s] : ProcedureReturn 0 : EndIf
+  ProcedureReturn s
+EndProcedure
+
+Procedure.i AnvilVkPipelineCacheCreate(device.i, *out)
+  Define d.i
+  Define s.i
+  If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out, #VK_NULL_HANDLE)
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  s = 1
+  While s <= #ANVIL_VK_MAX_PIPELINE_CACHES And avkCacheLive[s] <> 0 : s = s + 1 : Wend
+  If s > #ANVIL_VK_MAX_PIPELINE_CACHES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+  avkCacheGen[s] = avkNextGen(avkCacheGen[s])
+  avkCacheDev[s] = d
+  avkCacheDevGen[s] = avkDevGen[d]
+  avkCacheLive[s] = 1
+  PokeI(*out, avkToken(#ANVIL_VK_TYPE_PIPELINE_CACHE, s, avkCacheGen[s]))
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkPipelineCacheDestroy(device.i, cache.i)
+  Define d.i
+  Define s.i
+  If cache = #VK_NULL_HANDLE : ProcedureReturn #VK_SUCCESS : EndIf
+  d = avkDevSlot(device)
+  s = avkCacheSlot(cache)
+  If d = 0 Or s = 0 Or avkCacheDev[s] <> d : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  avkCacheLive[s] = 0
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkPipelineCacheData(device.i, cache.i, *pDataSize, *pData)
+  Define d.i
+  Define s.i
+  Define cap.i
+  Define n.i
+  Define i.i
+  Define header.VkPipelineCacheHeaderVersionOne
+  d = avkDevSlot(device)
+  s = avkCacheSlot(cache)
+  If d = 0 Or s = 0 Or avkCacheDev[s] <> d : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If *pDataSize = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *pData = 0
+    PokeI(*pDataSize, SizeOf(VkPipelineCacheHeaderVersionOne))
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  cap = PeekI(*pDataSize)
+  If cap < 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  n = cap
+  If n > SizeOf(VkPipelineCacheHeaderVersionOne) : n = SizeOf(VkPipelineCacheHeaderVersionOne) : EndIf
+  i = 0
+  While i < SizeOf(VkPipelineCacheHeaderVersionOne)
+    PokeA(@header + i, 0)
+    i = i + 1
+  Wend
+  header\headerSize = SizeOf(VkPipelineCacheHeaderVersionOne)
+  header\headerVersion = 1
+  i = 0
+  While i < n
+    PokeA(*pData + i, PeekA(@header + i))
+    i = i + 1
+  Wend
+  PokeI(*pDataSize, n)
+  If n < SizeOf(VkPipelineCacheHeaderVersionOne) : ProcedureReturn #VK_INCOMPLETE : EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i AnvilVkPipelineCacheMerge(device.i, dst.i, count.i, *sources)
+  Define d.i
+  Define s.i
+  Define i.i
+  Define source.i
+  d = avkDevSlot(device)
+  s = avkCacheSlot(dst)
+  If d = 0 Or s = 0 Or avkCacheDev[s] <> d : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If count < 1 Or *sources = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  i = 0
+  While i < count
+    source = avkCacheSlot(PeekI(*sources + (i * SizeOf(.i))))
+    If source = 0 Or avkCacheDev[source] <> d Or source = s : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 Procedure.i AnvilVkEventCreate(device.i, *out)
