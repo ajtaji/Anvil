@@ -59,6 +59,8 @@ def check_source() -> int:
     for needle in required:
         if needle not in text:
             fail(f"public atlas/chrome source contract missing: {needle}")
+    if text.count("vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)") != 2:
+        fail("the atlas must record exactly two ordered TFU uploads")
 
     # Only inspect the mixed pass' render-pass sequence. Eight draws and eight
     # public dynamic-scissor snapshots are the acceptance shape.
@@ -96,7 +98,7 @@ def check_report(path: Path) -> int:
         133: PROBES[0][1], 134: PROBES[1][1], 135: PROBES[2][1],
         136: PROBES[3][1], 137: PROBES[4][1], 138: PROBES[5][1],
         153: 0, 154: 0, 155: 0,
-        159: 0, 160: 1,
+        159: 0, 160: 2,
         163: 0, 164: 0, 165: 0,
         166: 5,                 # VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         167: 1,                 # exact scene probes
@@ -139,7 +141,7 @@ def check_screenshot(path: Path) -> int:
 def synthetic() -> tuple[bytes, bytes]:
     r = [0] * 240
     exact = {
-        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 1, 162: 1024, 166: 5,
+        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 2, 162: 1024, 166: 5,
         167: 1, 175: 11, 220: 1, 221: 1, 222: 1, 223: 8,
         236: 0x40, 239: TAIL, 144: 0x20000000, 145: 0x00400800,
         149: 7, 150: 8, 151: 9, 152: 10, 87: 0x1234, 88: 0x1234,

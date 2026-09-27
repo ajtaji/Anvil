@@ -93,7 +93,15 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
   ProcedureReturn #VK_ERROR_FORMAT_NOT_SUPPORTED
 EndProcedure
 
-Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
+  Procedure.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
+    ProcedureReturn -1
+  EndProcedure
+
+  Procedure.i avkBackendImageCopyBatchReady()
+    ProcedureReturn 0
+  EndProcedure
+
+  Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   ProcedureReturn -1
 EndProcedure
 
