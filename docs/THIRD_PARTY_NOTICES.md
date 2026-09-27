@@ -244,3 +244,13 @@ with Cypress integrated circuit products, and the repository's MIT license does
 not extend to them.
 
 Source: [RPi-Distro/firmware-nonfree at the pinned commit](https://github.com/RPi-Distro/firmware-nonfree/tree/c91cd2804cf7463aab913e7247c176049f16bbd6)
+
+`Firmware/CYW43455/BCM4345C0.hcd` is the same chip's Bluetooth patch RAM, from
+RPi-Distro `bluez-firmware` at commit
+`cdf61dc691a49ff01a124752bd04194907f0f9cd`,
+`debian/firmware/broadcom/BCM4345C0.hcd` (SHA-256
+`51c45e77ddad91a19e96dc8fb75295b2087c279940df2634b23baf71b6dea42c`). Its
+licence is that tree's `debian/firmware/broadcom/LICENSE.cypress`, retained
+byte-exact as [licenses/Cypress-bluez-firmware-LICENSE.cypress.html](../licenses/Cypress-bluez-firmware-LICENSE.cypress.html)
+(upstream stores it as a saved HTML page of linux-firmware's `LICENCE.cypress`).
+Source: [RPi-Distro/bluez-firmware at the pinned commit](https://github.com/RPi-Distro/bluez-firmware/tree/cdf61dc691a49ff01a124752bd04194907f0f9cd/debian/firmware/broadcom)

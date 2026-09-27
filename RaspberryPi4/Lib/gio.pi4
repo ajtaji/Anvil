@@ -1,0 +1,214 @@
+; ======================================================================
+;  gio.pi4 - the BCM2712's own GPIO blocks, gio and gio_aon. BCM2712 ONLY
+;  (-t pi5, #PMF_CHIP = 2712). THE ONE FILE THAT KNOWS THE BRCMSTB GPIO
+;  REGISTERS (rule 30): sdio.pi4 (WL_ON) and led_act.pi4 (the ACT LED)
+;  call it instead of each poking the block.
+;
+;  NOT RP1. The 40-pin header, the fan and the PWR LED are RP1 GPIO
+;  (Lib/gpio_rp1.pi4). These two blocks are the SoC's: the radio's power
+;  line, the ACT LED, RP1_RUN, SD power, the PMIC interrupt, the power
+;  button.
+;
+;  ---- WHERE THE NUMBERS COME FROM (vault "Raspberry Pi 5/Sources",
+;  raspberrypi/linux 7e030b60792de1c15b9ec1d8d5d34d63f0f0f1d8) ---------
+;
+;    bcm2712-ds.dtsi:183-194  gio: gpio@7d508500, "brcm,brcmstb-gpio",
+;                             reg $40, brcm,gpio-bank-widths <32 22>
+;    bcm2712.dtsi:254-264     gio_aon: gpio@7d517c00, "brcm,bcm7445-gpio",
+;                             reg $40, bank widths <17 6>; NO interrupt
+;                             controller - the firmware watches the PMIC
+;                             interrupt on this bank
+;    bcm2712-rpi-5-b.dts:550-553  &gio narrowed to <32 4> for the Pi 5
+;                             ("GPIOs above 35 are not used")
+;    THE COMPILED DTBs DIFFER BY STEPPING for gio_aon: bcm2712-rpi-5-b.dtb
+;    (C0) says <17 6>, bcm2712d0-rpi-5-b.dtb and bcm2712-d-rpi-5-b.dtb say
+;    <15 6>. This file takes the NARROWER, 15: AON lines 15 and 16 exist
+;    only on one stepping, nothing here uses them, and a line that may not
+;    exist is refused rather than guessed.
+;    Through the /soc ranges of the three pinned DTBs (the translation that
+;    puts the PL011 at $107D001000): gio $107D508500, gio_aon $107D517C00.
+;    gpio-brcmstb.c:15-36     eight 32-bit registers per bank: ODEN +$00,
+;                             DATA +$04, IODIR +$08, ... ; a bank is $20
+;    gpio-brcmstb.c:59-62, 700-701  a pin number is bank*32 + bit (the DT
+;                             offset of bank n is n*32), bit < the bank's
+;                             width
+;    gpio-brcmstb.c:670-681   "direction bits have 0 = output and 1 =
+;                             input": IODIR is handed to gpio_generic as
+;                             .dirin; DATA as .dat, no set/clear registers
+;
+;  PINS IN USE (bcm2712-rpi-5-b.dts): gio 28 WL_ON (sdio2's regulator),
+;  gio 29 BT_ON, gio 20 the power button (gpio-keys, active low, 50 ms
+;  debounce, pull-up), gio_aon 9 the ACT LED (active low).
+;
+;  EVERY WRITE IS A READ-MODIFY-WRITE OF ONE BIT: both banks carry other
+;  owners' lines (RP1_RUN, SD power, the PMIC interrupt on gio_aon).
+;  An output is taken VALUE FIRST, THEN DIRECTION, so a pin never drives a
+;  stale level on becoming an output (gpio-brcmstb.c's gpio_generic order,
+;  which sdio.pi4 and led_act.pi4 used before this file).
+;
+;  POLLED, NO INTERRUPTS, no pinctrl (the pad function and pull are the
+;  BCM2712 pinctrl's - sdio.pi4 muxes WL_ON itself).
+;  DESK PROOF ONLY (tools/a64/gio_check.py). SILICON OWED.
+; ======================================================================
+
+CompilerIf #PMF_CHIP <> 2712
+gio_is_the_BCM2712_GPIO_build_with_t_pi5()
+CompilerEndIf
+
+EnableExplicit
+
+#GIO_MAIN = 0                     ; gio: gpio@7d508500
+#GIO_AON  = 1                     ; gio_aon: gpio@7d517c00
+
+#GIO_MAIN_BASE = $107D508500
+#GIO_AON_BASE  = $107D517C00
+
+#GIO_BANK_BYTES = $20             ; eight registers
+#GIO_ODEN  = $00
+#GIO_DATA  = $04
+#GIO_IODIR = $08
+
+; Bank widths - the pinned DTBs' (gio_aon: the narrower stepping's, 15).
+#GIO_MAIN_W0 = 32
+#GIO_MAIN_W1 = 4
+#GIO_AON_W0  = 15
+#GIO_AON_W1  = 6
+
+#GIO_PIN_PWR_BUTTON = 20          ; gio 20, active low
+
+; 1 if block/pin is a line that exists, else 0.
+Procedure.i GioValid(block.i, pin.i)
+  Define bank.i
+  Define bit.i
+  Define w.i
+  If pin < 0 Or pin > 63
+    ProcedureReturn 0
+  EndIf
+  bank = pin >> 5
+  bit = pin & 31
+  If block = #GIO_MAIN
+    w = #GIO_MAIN_W0
+    If bank = 1
+      w = #GIO_MAIN_W1
+    EndIf
+  ElseIf block = #GIO_AON
+    w = #GIO_AON_W0
+    If bank = 1
+      w = #GIO_AON_W1
+    EndIf
+  Else
+    ProcedureReturn 0
+  EndIf
+  If bit >= w
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; The address of register reg for pin's bank. Caller has validated.
+Procedure.i gio_Reg(block.i, pin.i, reg.i)
+  Define base.i
+  base = #GIO_MAIN_BASE
+  If block = #GIO_AON
+    base = #GIO_AON_BASE
+  EndIf
+  ProcedureReturn base + (pin >> 5) * #GIO_BANK_BYTES + reg
+EndProcedure
+
+Procedure.i gio_Bit(pin.i)
+  ProcedureReturn 1 << (pin & 31)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GioRead(block, pin) - the DATA bit: 1 high, 0 low, -1 no such line.
+;  For an output that is the level being driven; for an input, the pad.
+; ----------------------------------------------------------------------
+Procedure.i GioRead(block.i, pin.i)
+  If GioValid(block, pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If (PeekN(gio_Reg(block, pin, #GIO_DATA)) & gio_Bit(pin)) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; GioIsOutput(block, pin) - 1 output (IODIR 0), 0 input, -1 no such line.
+Procedure.i GioIsOutput(block.i, pin.i)
+  If GioValid(block, pin) = 0
+    ProcedureReturn -1
+  EndIf
+  If (PeekN(gio_Reg(block, pin, #GIO_IODIR)) & gio_Bit(pin)) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GioWrite(block, pin, level) - set the DATA bit (nonzero = high), that
+;  bit alone. Does not change the direction. 1, or 0 for no such line.
+; ----------------------------------------------------------------------
+Procedure.i GioWrite(block.i, pin.i, level.i)
+  Define a.i
+  Define v.i
+  If GioValid(block, pin) = 0
+    ProcedureReturn 0
+  EndIf
+  a = gio_Reg(block, pin, #GIO_DATA)
+  v = PeekN(a) & $FFFFFFFF
+  If level <> 0
+    v = v | gio_Bit(pin)
+  Else
+    v = v & (~gio_Bit(pin))
+  EndIf
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GioOutput(block, pin, level) - make pin an output driving level: the
+;  value first, then the direction. 1, or 0 for no such line.
+; ----------------------------------------------------------------------
+Procedure.i GioOutput(block.i, pin.i, level.i)
+  Define a.i
+  If GioWrite(block, pin, level) = 0
+    ProcedureReturn 0
+  EndIf
+  a = gio_Reg(block, pin, #GIO_IODIR)
+  PokeL(a, (PeekN(a) & $FFFFFFFF) & (~gio_Bit(pin)))
+  ProcedureReturn 1
+EndProcedure
+
+; GioInput(block, pin) - make pin an input. 1, or 0 for no such line.
+Procedure.i GioInput(block.i, pin.i)
+  Define a.i
+  If GioValid(block, pin) = 0
+    ProcedureReturn 0
+  EndIf
+  a = gio_Reg(block, pin, #GIO_IODIR)
+  PokeL(a, (PeekN(a) & $FFFFFFFF) | gio_Bit(pin))
+  ProcedureReturn 1
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  GioPwrButton() - the power button as it is right now: 1 pressed, 0
+;  released, -1 the pin is not an input (someone made it an output, so
+;  the DATA bit is not the button). ACTIVE LOW (dts pwr_key: <&gio 20
+;  GPIO_ACTIVE_LOW>). NO DEBOUNCE - the DT asks for 50 ms, and a caller
+;  that wants a press, not a level, samples it that way.
+;
+;  NOT WIRED TO ANYTHING: the seam (a HwButton* reader, or an event) is
+;  the owner's ruling. A press while the board is off, and a long press,
+;  are the PMIC's and firmware's and never reach this read. Whether the
+;  firmware applied the pad's pull-up (pwr_button_pins, bias-pull-up) is a
+;  silicon question; this read does not touch the pad.
+; ----------------------------------------------------------------------
+Procedure.i GioPwrButton()
+  If GioIsOutput(#GIO_MAIN, #GIO_PIN_PWR_BUTTON) <> 0
+    ProcedureReturn -1
+  EndIf
+  If GioRead(#GIO_MAIN, #GIO_PIN_PWR_BUTTON) = 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure

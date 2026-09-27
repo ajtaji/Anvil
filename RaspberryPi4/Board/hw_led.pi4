@@ -1,0 +1,101 @@
+; ======================================================================
+;  hw_led.pi4 - the HwLed* and HwButton* backends (Anvil/Hal/hal.pbi;
+;  seams approved by the owner 2026-09-27), for the Pi 4 and the Pi 5.
+;
+;  Pi 5 (#PMF_CHIP = 2712): the ACT LED (gio_aon 9, active low) and the
+;  PWR LED (RP1 GPIO44, active low) through RaspberryPi4/Lib/led_act.pi4,
+;  and the power button (gio 20, active low) through
+;  RaspberryPi4/Lib/gio.pi4's GioPwrButton().
+;
+;  Pi 4: the ACT LED is BCM2711 GPIO 42, ACTIVE HIGH - PureBasicCode
+;  RaspberryPi4/Reference/rpi-6.12.y_bcm2711-rpi-4-b.dts:163-164
+;  (&led_act { gpios = <&gpio 42 GPIO_ACTIVE_HIGH>; }) - driven through
+;  RaspberryPi4/Lib/gpio.pi4 (value first, then the pin made an output, so
+;  taking it never flashes the LED). The Pi 4's PWR LED is on the
+;  firmware's GPIO expander, which Anvil does not drive: HwLedPwr answers
+;  #HW_LED_NONE. The Pi 4 has no power button: #HW_BTN_NONE.
+;
+;  Every set is read back; a level that did not follow is #HW_LED_STUCK,
+;  never success. Nothing is touched before the first call.
+;
+;  INCLUDE ORDER (house rule 10): Anvil/Hal/hal.pbi, and on the Pi 4
+;  gpio.pi4; on the Pi 5 gpio_rp1.pi4, gio.pi4 and led_act.pi4 - all
+;  before this file. DESK PROOF ONLY (tools/a64/a64_led_button_check.py).
+;  SILICON OWED.
+; ======================================================================
+
+CompilerIf #PMF_CHIP = 2712
+
+Procedure.i hwled_Map(c.i)
+  If c = #LED_ACT_OK
+    ProcedureReturn #HW_LED_OK
+  EndIf
+  ProcedureReturn #HW_LED_STUCK
+EndProcedure
+
+Procedure.i HwLedAct(on.i)
+  Define c.i
+  If led_act_begun = 0
+    c = LedActBegin()
+    If c <> #LED_ACT_OK
+      ProcedureReturn hwled_Map(c)
+    EndIf
+  EndIf
+  ProcedureReturn hwled_Map(LedActSet(on))
+EndProcedure
+
+Procedure.i HwLedPwr(on.i)
+  Define c.i
+  If led_pwr_begun = 0
+    c = LedPwrBegin()
+    If c <> #LED_ACT_OK
+      ProcedureReturn hwled_Map(c)
+    EndIf
+  EndIf
+  ProcedureReturn hwled_Map(LedPwrSet(on))
+EndProcedure
+
+Procedure.i HwPwrButton()
+  Define b.i
+  b = GioPwrButton()
+  If b < 0
+    ProcedureReturn #HW_BTN_NONE
+  EndIf
+  ProcedureReturn b
+EndProcedure
+
+CompilerElse
+
+#PI4_LED_ACT_PIN = 42              ; bcm2711-rpi-4-b.dts:163-164, active high
+
+Global hwled_actTaken.i
+
+Procedure.i HwLedAct(on.i)
+  Define level.i
+  level = 0
+  If on <> 0
+    level = 1
+  EndIf
+  If hwled_actTaken = 0
+    ; value first, then direction: the LED never flashes on being taken
+    DigitalWrite(#PI4_LED_ACT_PIN, level)
+    PinOutput(#PI4_LED_ACT_PIN)
+    hwled_actTaken = 1
+  Else
+    DigitalWrite(#PI4_LED_ACT_PIN, level)
+  EndIf
+  If PinModeGet(#PI4_LED_ACT_PIN) <> #PIN_OUTPUT Or DigitalRead(#PI4_LED_ACT_PIN) <> level
+    ProcedureReturn #HW_LED_STUCK
+  EndIf
+  ProcedureReturn #HW_LED_OK
+EndProcedure
+
+Procedure.i HwLedPwr(on.i)
+  ProcedureReturn #HW_LED_NONE
+EndProcedure
+
+Procedure.i HwPwrButton()
+  ProcedureReturn #HW_BTN_NONE
+EndProcedure
+
+CompilerEndIf

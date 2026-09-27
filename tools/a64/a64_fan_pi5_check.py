@@ -696,7 +696,7 @@ def check(fails: list, work: pathlib.Path) -> int:
             fails.append(msg)
 
     hal = {k: const(REL_HAL, k) for k in (
-        "#HW_PWM_OK", "#HW_PWM_PIN", "#HW_PWM_HZ", "#HW_PWM_DUTY", "#HW_PWM_STATE",
+        "#HW_PWM_OK", "#HW_PWM_PIN", "#HW_PWM_HZ", "#HW_PWM_DUTY", "#HW_PWM_STATE", "#HW_PWM_BUSY",
         "#HW_PWM_KIND_NONE", "#HW_PWM_KIND_HARD", "#HW_TEMP_SRC_REGISTER",
         "#HW_TEMP_SRC_FIRMWARE")}
 
@@ -769,12 +769,17 @@ def check(fails: list, work: pathlib.Path) -> int:
            "P: a register was written before the begin (a refusal touched hardware)")
     expect(s.one("P duty early") == hal["#HW_PWM_STATE"], "P: Duty before Begin is not STATE")
     expect(s.one("P end early") == hal["#HW_PWM_STATE"], "P: End before Begin is not STATE")
-    expect(s.one("P begin pin18") == hal["#HW_PWM_PIN"], "P: pin 18 was not refused as PIN")
+    # GPIO18 is a header PWM0 pin since 2026-09-27: offered as hardware PWM.
+    # Beginning it is PWM0's gate (a64_pwm0_pi5_check.py), not this one's,
+    # whose model holds only the fan's clock and block.
+    expect(s.one("P hard pin18") == 1, "P: pin 18 (header PWM0) is not offered as hardware PWM")
+    expect(s.one("P begin pin5") == hal["#HW_PWM_PIN"], "P: pin 5 was not refused as PIN")
     expect(s.one("P begin hz0") == hal["#HW_PWM_HZ"], "P: 0 Hz was not refused as HZ")
     expect(s.one("P begin hzhigh") == hal["#HW_PWM_HZ"], "P: past HzMax was not refused")
-    expect(s.one("P count") == 1 and s.one("P pinat") == f.fan_gpio
+    expect(s.one("P count") == 5 and s.one("P pinat") == f.fan_gpio
            and s.one("P default") == f.fan_gpio,
-           "P: the offered pin is not GPIO%d alone (the DTB's FAN_PWM)" % f.fan_gpio)
+           "P: the fan pin GPIO%d (the DTB's FAN_PWM) is not the first and default of the "
+           "five offered (it and the header's PWM0 pins)" % f.fan_gpio)
     hz = s.one("P hzdefault") or 0
     expect(hz > 0 and (10**9 + hz // 2) // hz == f.period_ns,
            "P: HwPwmHzDefault %d Hz is not the DTB's %d ns period" % (hz, f.period_ns))
@@ -888,7 +893,7 @@ def check(fails: list, work: pathlib.Path) -> int:
 # ======================================================================
 MUTATIONS = [
     (REL_LIB, "channel 2 instead of the DTB's 3", "#RP1PWM_CHAN        = 3", "#RP1PWM_CHAN        = 2"),
-    (REL_LIB, "INVERT dropped", "#RP1PWM_CTRL_DEFAULT | #RP1PWM_CTRL_INVERT)", "#RP1PWM_CTRL_DEFAULT)"),
+    (REL_LIB, "INVERT dropped", "    ctl = #RP1PWM_CTRL_DEFAULT | #RP1PWM_CTRL_INVERT\n", "    ctl = #RP1PWM_CTRL_DEFAULT\n"),
     (REL_LIB, "clk_pwm1 on aux parent 1", "#RP1PWM_CLK_XOSC     = 2 << 5", "#RP1PWM_CLK_XOSC     = 1 << 5"),
     (REL_LIB, "SET_UPDATE on the wrong bit", "#RP1PWM_SET_UPDATE  = $80000000", "#RP1PWM_SET_UPDATE  = $40000000"),
     (REL_LIB, "a 54 MHz PWM clock assumed", "#RP1PWM_CLK_HZ       = 50000000", "#RP1PWM_CLK_HZ       = 54000000"),
@@ -903,7 +908,7 @@ MUTATIONS = [
     (REL_LIB, "one pulse per revolution", "#RP1_TACH_PPR       = 2", "#RP1_TACH_PPR       = 1"),
     (REL_LIB, "fan pad pulled up", "Rp1PinPull(#RP1PWM_FAN_GPIO, #RP1_PULL_DOWN)", "Rp1PinPull(#RP1PWM_FAN_GPIO, #RP1_PULL_UP)"),
     (REL_LIB, "fan pin left on FUNCSEL 5", "#RP1PWM_FAN_FSEL   = 0", "#RP1PWM_FAN_FSEL   = 5"),
-    (REL_LIB, "End stops the fan", "PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, rp1pwm_range)", "PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, 0)"),
+    (REL_LIB, "End stops the fan", "PokeL(rp1pwm_base + $20 + rp1pwm_coff, rp1pwm_range)", "PokeL(rp1pwm_base + $20 + rp1pwm_coff, 0)"),
     (REL_HOST, "a 25 kHz default instead of the DTB period", "#PI5_FAN_HZ  = 24058", "#PI5_FAN_HZ  = 25000"),
     (REL_AVS, "the Pi 4 line on a Pi 5", "#AVS_TEMP_SLOPE  = -550", "#AVS_TEMP_SLOPE  = -487"),
     (REL_HOST, "the firmware reported as the register",
