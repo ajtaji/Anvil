@@ -213,8 +213,13 @@ CompilerEndIf
 #VTP_PANEL_PITCH = 3200
 #VTP_SCREEN_BYTES = 4096000
 #VTP_WIN_BASE = $063E8000              ; $06000000 + 4,096,000
+CompilerIf #VTP_PYRAMID_DEMO = 6
+#VTP_WIN_BYTES = 6291456               ; two attachments, vertex and pipeline data
+#VTP_MAP_SPAN = #VTP_SCREEN_BYTES + #VTP_WIN_BYTES
+CompilerElse
 #VTP_WIN_BYTES = 4227072               ; one screen plus 128 KiB
 #VTP_MAP_SPAN = 8323072
+CompilerEndIf
 #VTP_DSI_SCAN = $08A00000
 
 #VTP_GUARD = $5A3C0FF0
@@ -681,6 +686,14 @@ Procedure.i Main()
   Define fence.i
   Define count.i
   Define imgBase.i
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  Define imgSmall.i
+  Define memSmall.i
+  Define viewSmall.i
+  Define fbSmall.i
+  Define imgSmallBase.i
+  Define imageSmallPitch.i
+CompilerEndIf
   Define vaddr.i
   Define iaddr.i
   Define mapped.i
@@ -983,6 +996,43 @@ CompilerEndIf
     NeonShutdown()
     ProcedureReturn vtpStop(#VTP_ERR_FRAMEBUFFER)
   EndIf
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  ; A separate attachment and framebuffer at half extent share the render
+  ; pass and pipeline. Alternating them exercises real target rebinds.
+  imgci\extent\width = 400 : imgci\extent\height = 640
+  If vkCreateImage(dev, @imgci, 0, @imgSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, imgSmall, @req)
+  mai\allocationSize = req\size
+  rc = vkAllocateMemory(dev, @mai, 0, @memSmall)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, req\size)
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MEMORY)
+  EndIf
+  rc = vkBindImageMemory(dev, imgSmall, memSmall, 0)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, req\size)
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_BIND)
+  EndIf
+  imgSmallBase = AnvilVkImageAddress(imgSmall)
+  imageSmallPitch = AnvilVkImageRowPitch(imgSmall)
+  mapped = 0
+  If vkMapMemory(dev, memSmall, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> imgSmallBase
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  vtpFill(mapped, req\size, ~#VTP_CLEAR_WORD)
+  vkUnmapMemory(dev, memSmall)
+  ivci\image = imgSmall
+  If vkCreateImageView(dev, @ivci, 0, @viewSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_VIEW)
+  EndIf
+  fbci\pAttachments = @viewSmall
+  fbci\width = 400 : fbci\height = 640
+  If vkCreateFramebuffer(dev, @fbci, 0, @fbSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FRAMEBUFFER)
+  EndIf
+CompilerEndIf
 
   ; ------------------------------------------------------------------
   ;  4. The vertex buffer. Three vertices, position and colour, and the
@@ -1371,6 +1421,15 @@ CompilerIf #VTP_PYRAMID_DEMO
       vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 3)
       NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_RECORD)
     EndIf
+CompilerIf #VTP_PYRAMID_DEMO = 6
+    If (frame & 1) <> 0
+      rpbi\framebuffer = fbSmall
+      rpbi\renderArea\extent\width = 400 : rpbi\renderArea\extent\height = 640
+    Else
+      rpbi\framebuffer = fb
+      rpbi\renderArea\extent\width = #VTP_VIEW_W : rpbi\renderArea\extent\height = #VTP_VIEW_H
+    EndIf
+CompilerEndIf
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
 CompilerIf #VTP_PYRAMID_DEMO >= 2
@@ -1382,7 +1441,7 @@ CompilerIf #VTP_PYRAMID_DEMO <> 5
       PokeL(@vp\width, $43C80000)  ; 400.0
       PokeL(@vp\height, $44200000) ; 640.0
       sc\extent\width = 400 : sc\extent\height = 640
-CompilerIf #VTP_PYRAMID_DEMO >= 3
+CompilerIf #VTP_PYRAMID_DEMO >= 3 And #VTP_PYRAMID_DEMO <> 6
       PokeL(@vp\x, $43480000)      ; 200.0
       PokeL(@vp\y, $43A00000)      ; 320.0
       sc\offset\x = 200 : sc\offset\y = 320
@@ -1419,7 +1478,15 @@ CompilerEndIf
       vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 6)
       NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FENCE)
     EndIf
+CompilerIf #VTP_PYRAMID_DEMO = 6
+    If (frame & 1) <> 0
+      DisplayBlit(imgSmallBase, imageSmallPitch, 0, 0, 400, 640)
+    Else
+      DisplayBlit(imgBase, imagePitch, 0, 0, #VTP_VIEW_W, #VTP_VIEW_H)
+    EndIf
+CompilerElse
     DisplayBlit(imgBase, imagePitch, 0, 0, #VTP_VIEW_W, #VTP_VIEW_H)
+CompilerEndIf
     If V3dMmuFaultsNow() <> 0 Or V3dBinOomCount() <> 0
       NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_V3D_FAULT)
     EndIf
@@ -1436,7 +1503,14 @@ CompilerEndIf
   vkDestroyPipelineLayout(dev, layA, 0) : vkDestroyPipelineLayout(dev, layB, 0)
   vkDestroyShaderModule(dev, vsA, 0) : vkDestroyShaderModule(dev, fsA, 0)
   vkDestroyShaderModule(dev, vsB, 0) : vkDestroyShaderModule(dev, fsB, 0)
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  vkDestroyFramebuffer(dev, fbSmall, 0)
+CompilerEndIf
   vkDestroyFramebuffer(dev, fb, 0) : vkDestroyRenderPass(dev, rp, 0)
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  vkDestroyImageView(dev, viewSmall, 0)
+  vkDestroyImage(dev, imgSmall, 0) : vkFreeMemory(dev, memSmall, 0)
+CompilerEndIf
   vkDestroyImageView(dev, view, 0)
   vkDestroyBuffer(dev, buf, 0) : vkFreeMemory(dev, bmem, 0)
   vkDestroyImage(dev, img, 0) : vkFreeMemory(dev, mem, 0)
