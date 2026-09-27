@@ -19,6 +19,8 @@ decide from the whole transcript.
 
   python tools/anvil.py boot                      - get to a prompt, load Anvil
   python tools/anvil.py run IMG ADDR [cmds...]    - load an image and go
+  python tools/anvil.py send IMG ADDR [cmds...]   - to a RUNNING monitor: b, then cmds
+                                                    (the Pi 5: set ANVIL_PORT=COM4)
   python tools/anvil.py cmd  CMD [CMD...]         - send commands
   python tools/anvil.py watch SECONDS             - listen only
 """
@@ -389,6 +391,27 @@ def main():
         elif what == "cmd":
             a.prompt()
             for c in sys.argv[2:]:
+                print(">>> " + c)
+                print(a.cmd(c))
+        elif what == "send":
+            # A payload to the monitor that is ALREADY RUNNING - the Pi 5's
+            # case (there is no U-Boot to reload it from, unlike `run`
+            # below): wait for its prompt, `b` the file with its CRC, and
+            # only on "ok" type the commands that follow (e.g. "run 10000000"
+            # for a raw image, "boot mem 10000000" for a .pmf).
+            if len(sys.argv) < 4:
+                print("!! send needs a file and a hex address: send IMG ADDR [command ...]")
+                return 2
+            img, addr = sys.argv[2], int(sys.argv[3], 16)
+            if a.prompt() != "pmf":
+                print("!! no Anvil prompt on %s - is the monitor running?" % a.s.port)
+                return 1
+            out = a.block(img, addr)
+            print(out)
+            if "ok" not in out or "crc" in out:
+                print("!! the block did not land cleanly - no command was typed")
+                return 1
+            for c in sys.argv[4:]:
                 print(">>> " + c)
                 print(a.cmd(c))
         elif what == "run":
