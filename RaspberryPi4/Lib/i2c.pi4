@@ -251,7 +251,22 @@ EnableExplicit
 ; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
 ; range, so with the MMU off an access that ever got past this driver's
 ; refusal would take an address-size fault that Anvil reports - never a
-; silent write somewhere else. The Pi 5's header I2C is RP1's; #CAP_I2C is 0 and I2cInit()/I2cXfer() refuse with #I2C_NOCHIP.
+; silent write somewhere else.
+;
+; BCM2712: THIS FILE'S BUS API FORWARDS TO RP1. Both buses are RP1
+; DesignWare blocks there, driven by Lib/i2c_dw.pi4 (included after this
+; file on 2712; its procedures are called forward, its constants are not
+; named). #I2C_BUS_HEADER is RP1 I2C1 on GPIO 2/3; #I2C_BUS_DISPLAY is
+; the camera/display connector i2c_dw.pi4's DwI2cDisplayInst() names -
+; CAM/DISP 1 (RP1 I2C4, GPIO 40/41) unless DwI2cSetDisplayPort(0) picked
+; CAM/DISP 0 (RP1 I2C6, GPIO 38/39). I2cInit, I2cIsUp, I2cXfer,
+; I2cWriteRead, I2cSetSpeed/GetSpeed, the Bus* identity, I2cPinMuxed and
+; I2cPadLevel each carry a #PMF_CHIP = 2712 branch; I2cRd answers
+; $FFFFFFFF there (no BSC register to sample - the trace records it so)
+; and I2cSnapshot answers 0. The #DWI2C_* result codes EQUAL the #I2C_*
+; ones and are handed up unchanged; tools/a64/a64_touch_pi5_check.py
+; fails if any pair disagrees. So touch_goodix.pi4 and dsi_panel_v2.pi4
+; run on the Pi 5 unmodified.
 CompilerIf #PMF_CHIP = 2712
   #BSC1_BASE = $DEAD00000000
 CompilerElse
@@ -474,6 +489,12 @@ CompilerEndIf
                               ; in the same commit - an unmapped code falling
                               ; through I2cMapCode's default would be reported
                               ; as a timeout, which is the wrong sentence.
+CompilerIf #PMF_CHIP = 2712
+  ; RP1 DesignWare only - the values Lib/i2c_dw.pi4 returns and this file
+  ; hands up unchanged (see the BCM2712 note at #BSC1_BASE).
+  #I2C_NODEV = -10              ; COMP_TYPE did not identify a DesignWare block
+  #I2C_ABORT = -11              ; TX_ABRT for a reason other than a NACK
+CompilerEndIf
 
 ; One bounded, non-mutating sequence of controller reads for diagnostics.
 ; Each member is a 32-bit BSC register read through I2cRd (PeekN); FIFO is
@@ -669,6 +690,15 @@ EndProcedure
 ;  exactly ONE piece of state and no way for four globals to disagree
 ;  about which bus this is.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+Procedure.i I2cDwInst()
+  If i2c_sel = #I2C_SEL_DISPLAY
+    ProcedureReturn DwI2cDisplayInst()
+  EndIf
+  ProcedureReturn DwI2cHeaderInst()
+EndProcedure
+CompilerEndIf
+
 Procedure.i I2cBus()
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn #I2C_BUS_DISPLAY
@@ -677,6 +707,9 @@ Procedure.i I2cBus()
 EndProcedure
 
 Procedure.i I2cBusBase()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cBaseOf(I2cDwInst())
+  CompilerEndIf
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn #BSC0_BASE
   EndIf
@@ -684,6 +717,9 @@ Procedure.i I2cBusBase()
 EndProcedure
 
 Procedure.i I2cBusSda()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cSdaOf(I2cDwInst())
+  CompilerEndIf
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn #I2C_DISP_PIN_SDA
   EndIf
@@ -691,6 +727,9 @@ Procedure.i I2cBusSda()
 EndProcedure
 
 Procedure.i I2cBusScl()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cSclOf(I2cDwInst())
+  CompilerEndIf
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn #I2C_DISP_PIN_SCL
   EndIf
@@ -698,6 +737,9 @@ Procedure.i I2cBusScl()
 EndProcedure
 
 Procedure.i I2cBusAlt()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cFuncSelOf(I2cDwInst())   ; the RP1 FUNCSEL, not a BCM alt
+  CompilerEndIf
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn #I2C_DISP_PIN_ALT
   EndIf
@@ -717,6 +759,9 @@ EndProcedure
 ;  OFFSETS stay constants: they are the same in every BSC.
 ; ----------------------------------------------------------------------
 Procedure.i I2cRd(off.i)
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn $FFFFFFFF   ; no BSC on the BCM2712 - "not sampled"
+  CompilerEndIf
   If i2c_sel = #I2C_SEL_DISPLAY
     ProcedureReturn PeekN(#BSC0_BASE + off) & $FFFFFFFF
   EndIf
@@ -1104,6 +1149,9 @@ Procedure.i I2cSetSpeed(hz.i)
   If hz <= 0
     ProcedureReturn #I2C_ARG
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cSetSpeedOn(I2cDwInst(), hz)
+  CompilerEndIf
   src = I2cSourceHz()
   If hz > I2cRateMax(src) Or hz < I2cRateMin(src)
     ProcedureReturn #I2C_RANGE
@@ -1124,6 +1172,9 @@ EndProcedure
 ;  a defect in this procedure.
 ; ----------------------------------------------------------------------
 Procedure.i I2cGetSpeed()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cGetSpeedOn(I2cDwInst())
+  CompilerEndIf
   ProcedureReturn I2cRateFor(I2cSourceHz(), I2cGetDiv())
 EndProcedure
 
@@ -1151,7 +1202,7 @@ EndProcedure
 Procedure.i I2cInit()
   Define r.i
   CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn 0          ; BCM2712: no BCM2711 BSC - see #BSC1_BASE
+  ProcedureReturn DwI2cUpOn(I2cDwInst())   ; BCM2712: RP1 - see #BSC1_BASE
   CompilerEndIf
   ; The SELECTED bus's pads and the SELECTED bus's alt. On bus 1 that is
   ; GPIO 2/3 to ALT0 (SDA1/SCL1); on bus 0 it is GPIO 44/45 to ALT1
@@ -1188,7 +1239,7 @@ EndProcedure
 Procedure.i I2cIsUp()
   Define c.i
   CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn 0          ; BCM2712: no BCM2711 BSC - see #BSC1_BASE
+  ProcedureReturn DwI2cIsUpOn(I2cDwInst())   ; BCM2712: RP1 - see #BSC1_BASE
   CompilerEndIf
   If I2cPinsMuxed() <> 1
     ProcedureReturn 0
@@ -1244,6 +1295,9 @@ EndProcedure
 Procedure.i I2cPinMuxed(pin.i)
   Define m.i
   Define want.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn DwI2cPinMuxedOn(I2cDwInst(), pin)
+  CompilerEndIf
   m = PinModeGet(pin)
   If m < 0
     ProcedureReturn -1
@@ -1293,6 +1347,9 @@ EndProcedure
 ;  procedure existed nothing read it.
 ; ----------------------------------------------------------------------
 Procedure.i I2cPadLevel(pin.i)
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn Rp1DigitalRead(pin)
+  CompilerEndIf
   ProcedureReturn DigitalRead(pin)
 EndProcedure
 
@@ -1456,6 +1513,9 @@ Procedure.i I2cSnapshot(*snap)
   If *snap = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 0          ; no BSC registers on the BCM2712 to show
+  CompilerEndIf
   PokeL(*snap + #I2C_SNAP_C * 4, I2cRd(#BSC_C_OFF))
   PokeL(*snap + #I2C_SNAP_S * 4, I2cRd(#BSC_S_OFF))
   PokeL(*snap + #I2C_SNAP_DLEN * 4, I2cRd(#BSC_DLEN_OFF))
@@ -1497,7 +1557,7 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
     ProcedureReturn #I2C_ARG
   EndIf
   CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn #I2C_NOCHIP
+  ProcedureReturn DwI2cXferOn(I2cDwInst(), addr, *buf, n, isRead)
   CompilerEndIf
   If I2cEnsureIdle() = 0
     ProcedureReturn #I2C_TIMEOUT
@@ -1709,7 +1769,12 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
     ProcedureReturn #I2C_ARG
   EndIf
   CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn #I2C_NOCHIP
+  ; RP1 DesignWare: one command-FIFO transfer with DATA_CMD RESTART on the
+  ; first READ (i2c_dw.pi4's THE REPEATED START). The BSC's TXW race and
+  ; its #I2C_NOSR do not exist there. Traced like the Pi 4 path.
+  tracePhase = I2cTraceGoodixPhase(addr)
+  trace = I2cTraceBegin(tracePhase)
+  ProcedureReturn I2cTraceReturn(trace, DwI2cWriteReadOn(I2cDwInst(), addr, *wbuf, wn, *rbuf, rn))
   CompilerEndIf
   tracePhase = I2cTraceGoodixPhase(addr)
   trace = I2cTraceBegin(tracePhase)

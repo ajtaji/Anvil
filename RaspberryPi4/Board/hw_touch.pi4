@@ -347,7 +347,11 @@ Procedure.i HwTouchUp()
   gTouchErr = 0
   If TouchBusEnter() = 0
     TouchBusLeave()
+    CompilerIf #PMF_CHIP = 2712
+    gTouchErr = "the camera/display connector's I2C bus would not come up (RP1 I2C4 on GPIO 40/41 for CAM/DISP 1, I2C6 on GPIO 38/39 for CAM/DISP 0), so nothing on the panel - not the touch controller and not its power micro - can be reached; `touch bus` names the one in use."
+    CompilerElse
     gTouchErr = "the display connector's I2C bus would not come up, so nothing on the panel - not the touch controller and not its power micro - can be reached; check that GPIO 44 and 45 are free with `gpio status 44`."
+    CompilerEndIf
     ProcedureReturn 0
   EndIf
 

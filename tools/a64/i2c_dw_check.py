@@ -28,6 +28,10 @@ WHAT THE MODEL ENFORCES, so a defect is an error it names:
   * DATA_CMD written while disabled, a TX FIFO pushed past its depth, READ
     commands outstanding past the RX depth (overrun), DATA_CMD read from an
     empty RX FIFO - refused;
+  * RESTART (DATA_CMD bit 10, master.c:571-573) only with IC_CON RESTART_EN
+    set; it ends the current segment WITHOUT a STOP and starts a new one to
+    the same address. A direction change without it is refused. (Used by
+    the display buses' combined transfer - a64_touch_pi5_check.py.)
   * the bus runs in model time: one byte takes BYTE_TICKS counter ticks, so
     a driver that lets the TX FIFO run dry mid-message is caught - under
     the NO-HOLD variant as a second START, under the HOLD variant as a
@@ -123,7 +127,11 @@ class Device:
 
 
 class DesignWare:
-    def __init__(self, cpu, devices, hold, comp_type=COMP_TYPE, byte_ticks=BYTE_TICKS):
+    def __init__(self, cpu, devices, hold, comp_type=COMP_TYPE, byte_ticks=BYTE_TICKS,
+                 base=DW, rx_depth=RX_DEPTH, param_1=PARAM_1):
+        self.base = base
+        self.rx_depth = rx_depth
+        self.param_1 = param_1
         self.cpu = cpu
         self.byte_ticks = byte_ticks
         self.devices = devices
@@ -154,6 +162,8 @@ class DesignWare:
         self.cur = None
         self.in_txn = False
         self.stop_det = True
+        if self.dev is not None and hasattr(self.dev, "stop"):
+            self.dev.stop()
 
     def _abort(self, bit):
         self.source |= 1 << bit
@@ -174,13 +184,20 @@ class DesignWare:
             self.txq.pop(0)
             start = max(self.busy_until, t)
             rd = bool(cmd & 0x100)
+            if cmd & 0x400 and self.in_txn:
+                # RESTART: this segment ends with Sr, not P - no STOP_DET.
+                self.txns.append((self.cur[0], self.cur[1], bytes(self.cur[2]), "restart"))
+                self.cur = None
+                self.in_txn = False
+            elif cmd & 0x400:
+                d.die("RESTART on the first command of a transfer - there is nothing to restart")
             if not self.in_txn:
                 addr = self.r.get(0x04, 0) & 0x7F
                 self.in_txn = True
                 self.cur = [addr, "r" if rd else "w", []]
                 self.dir = rd
                 self.dev = self.devices.get(addr)
-                if self.dev is None:
+                if self.dev is None or (hasattr(self.dev, "present") and not self.dev.present()):
                     self.busy_until = start + self.byte_ticks
                     self._abort(0)                # ABRT_7B_ADDR_NOACK
                     return
@@ -191,7 +208,7 @@ class DesignWare:
             elif rd != self.dir:
                 d.die("READ and WRITE commands mixed in one message without RESTART")
             if rd:
-                if len(self.rxq) >= RX_DEPTH:
+                if len(self.rxq) >= self.rx_depth:
                     d.die("RX FIFO overrun: more READ commands outstanding than its depth")
                 b = self.dev.read()
                 self.rxq.append(b)
@@ -212,7 +229,7 @@ class DesignWare:
     def __call__(self, addr, size, value):
         if size != 4:
             d.die("DesignWare access of %d bytes at $%X" % (size, addr))
-        off = addr - DW
+        off = addr - self.base
         self.advance()
         if value is None:
             if off == 0x10:
@@ -244,7 +261,7 @@ class DesignWare:
             if off == 0x80:
                 return self.source
             if off == 0xF4:
-                return PARAM_1
+                return self.param_1
             if off == 0xFC:
                 return self.comp_type
             if off in (0x00, 0x04, 0x14, 0x18, 0x1C, 0x20, 0x30, 0x38, 0x3C):
@@ -272,8 +289,10 @@ class DesignWare:
         if off == 0x10:
             if not self.enabled:
                 d.die("DATA_CMD written while the block is disabled")
-            if value & ~0x3FF or value & 0x400:
+            if value & ~0x7FF:
                 d.die("DATA_CMD $%X sets a bit this driver has no business setting" % value)
+            if value & 0x400 and not self.r.get(0x00, 0) & 0x20:
+                d.die("DATA_CMD RESTART with IC_CON RESTART_EN clear")
             if self.abort:
                 return                              # flushed until CLR_TX_ABRT
             if len(self.txq) >= TX_DEPTH:
@@ -443,13 +462,14 @@ MUTATIONS = [
     (REL_LIB, "the vault's mistyped base $1F0000074000",
      "#DWI2C_BASE = $1F00074000", "#DWI2C_BASE = $1F0000074000"),
     (REL_LIB, "STOP on the first byte, not the last",
-     "          If issued = n - 1\n            cmd = #DWI2C_CMD_STOP",
+     "          If issued = total - 1\n            cmd = #DWI2C_CMD_STOP",
      "          If issued = 0\n            cmd = #DWI2C_CMD_STOP"),
     (REL_LIB, "no STOP at all", "            cmd = #DWI2C_CMD_STOP\n", "            cmd = 0\n"),
     (REL_LIB, "READ as bit 10 (RESTART)", "#DWI2C_CMD_READ = $100", "#DWI2C_CMD_READ = $400"),
     (REL_LIB, "NACK bits not recognised", "#DWI2C_ABRT_NOACK = $1F", "#DWI2C_ABRT_NOACK = $0"),
     (REL_LIB, "RX outstanding limit ignored",
-     "        If rd = 0 Or (issued - got) < dwi2c_rxdepth", "        If rd = 0 Or (issued - got) < 1000"),
+     "        If issued < wn Or (issued - wn - got) < dwi2c_rxdepth",
+     "        If issued < wn Or (issued - wn - got) < 1000"),
     (REL_LIB, "TX depth ignored",
      "      If DwI2cRd(#DWI2C_TXFLR) < dwi2c_txdepth", "      If DwI2cRd(#DWI2C_TXFLR) < 1000"),
     (REL_LIB, "COMP_TYPE not checked",
@@ -470,7 +490,7 @@ MUTATIONS = [
      "    con = con | #DWI2C_CON_SPEED_FAST", "    con = con | #DWI2C_CON_SPEED_STD"),
     (REL_LIB, "pins on the wrong function", "#DWI2C_FUNCSEL  = 3", "#DWI2C_FUNCSEL  = 4"),
     (REL_LIB, "pins at 8 mA, not rp1.dtsi's 12", "#DWI2C_DRIVE_MA = 12 ", "#DWI2C_DRIVE_MA = 8 "),
-    (REL_LIB, "pins pulled down", "  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_UP)", "  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_DOWN)"),
+    (REL_LIB, "pins pulled down", "  Rp1PinPull(dwi2c_sda, #RP1_PULL_UP)", "  Rp1PinPull(dwi2c_sda, #RP1_PULL_DOWN)"),
     (REL_LIB, "refused rate still programs counts",
      "  r = DwI2cCounts(hz)\n  If r <= 0\n    ProcedureReturn #DWI2C_RANGE\n  EndIf",
      "  r = DwI2cCounts(hz)\n  If r <= 0\n    dwi2c_rate = 5000\n    ProcedureReturn #DWI2C_RANGE\n  EndIf"),

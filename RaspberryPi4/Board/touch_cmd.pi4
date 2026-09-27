@@ -87,6 +87,17 @@ Procedure TouchUsage()
   PrintN("  touch panel prepare          request iovcc, avdd and panel reset")
   PrintN("  touch panel light <n>        backlight, 0 dark to 255 full, DECIMAL")
   PrintN("  touch panel reset            request a touch-reset pulse from the MCU")
+  CompilerIf #PMF_CHIP = 2712
+  PrintN("  touch bus display            the display connector's bus - the default")
+  PrintN("  touch bus display1           CAM/DISP 1: RP1 I2C4 on GPIO 40/41 (default)")
+  PrintN("  touch bus display0           CAM/DISP 0: RP1 I2C6 on GPIO 38/39")
+  PrintN("  touch bus header             RP1 I2C1 on GPIO 2 and 3 instead")
+  PrintN("  touch axes                   the controller-to-panel axis correction")
+  PrintN("  touch axes <swap> <invx> <invy>   set it, each 0 or 1, and SAVE it")
+  PrintN("The default bus is CAM/DISP 1's, the one Linux's display overlays use")
+  PrintN("unless told dsi0. There is no DSI video on this board yet: the panel")
+  PrintN("MCU and the touch controller are reached over I2C alone.")
+  CompilerElse
   PrintN("  touch bus display            use BSC0 on GPIO 44/45 - the default")
   PrintN("  touch bus header             use BSC1 on GPIO 2 and 3 instead")
   PrintN("  touch axes                   the controller-to-panel axis correction")
@@ -94,6 +105,7 @@ Procedure TouchUsage()
   PrintN("The default bus is the DISPLAY connector's, BSC0 on GPIO 44/45 at")
   PrintN("ALT1. No jumpers are needed. The header bus is one command away for")
   PrintN("a panel wired to pins 3 and 5 instead.")
+  CompilerEndIf
   PrintN("A finger moves the same cursor a USB mouse moves and a tap presses")
   PrintN("the same button, so there is nothing to turn on: touch comes up with")
   PrintN("the panel at boot. `touch axes` is the one thing an eye may have to")
@@ -129,6 +141,34 @@ EndProcedure
 ;  wires is not a result.
 ; ----------------------------------------------------------------------
 Procedure TouchSayBus()
+  CompilerIf #PMF_CHIP = 2712
+  ; RP1 DesignWare blocks (i2c.pi4's BCM2712 note). "alt" is the RP1
+  ; FUNCSEL here - it differs between the two connectors.
+  If I2cBus() = #I2C_BUS_DISPLAY
+    If DwI2cDisplayPort() = 0
+      Print("The bus is RP1 I2C6 on GPIO ")
+    Else
+      Print("The bus is RP1 I2C4 on GPIO ")
+    EndIf
+  Else
+    Print("The bus is RP1 I2C1 on GPIO ")
+  EndIf
+  PrintDec(I2cBusSda())
+  Print(" and ")
+  PrintDec(I2cBusScl())
+  Print(", at FUNCSEL ")
+  PrintDec(I2cBusAlt())
+  Print(", base $")
+  PutHexN(I2cBusBase(), 10)
+  If I2cBus() = #I2C_BUS_DISPLAY
+    Print(" - camera/display connector CAM/DISP ")
+    PrintDec(DwI2cDisplayPort())
+    PrintN(".")
+  Else
+    PrintN(" - the 40-pin header.")
+  EndIf
+  ProcedureReturn
+  CompilerEndIf
   If I2cBus() = #I2C_BUS_DISPLAY
     Print("The bus is BSC0 on GPIO ")
   Else
@@ -166,6 +206,18 @@ Procedure TouchSayPads(when.i)
   Else
     Print("  after the mux:  ")
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  Print("sda funcsel ")
+  PrintDec(Rp1FuncSelGet(I2cBusSda()))
+  Print(" level ")
+  PrintDec(I2cPadLevel(I2cBusSda()))
+  Print(", scl funcsel ")
+  PrintDec(Rp1FuncSelGet(I2cBusScl()))
+  Print(" level ")
+  PrintDec(I2cPadLevel(I2cBusScl()))
+  PrintN("")
+  ProcedureReturn
+  CompilerEndIf
   Print("sda fsel ")
   PrintDec(PinModeGet(I2cBusSda()))
   Print(" level ")
@@ -760,6 +812,25 @@ Procedure TouchBus()
   gWordAt = gPos
   SkipWord()
   gWordLen = gPos - gWordAt
+
+  CompilerIf #PMF_CHIP = 2712
+  ; Which of the two camera/display connectors - i2c_dw.pi4 holds it.
+  If WordIs("display0") <> 0 Or WordIs("display1") <> 0
+    If WordIs("display0") <> 0
+      DwI2cSetDisplayPort(0)
+    Else
+      DwI2cSetDisplayPort(1)
+    EndIf
+    gTouchBus = #I2C_BUS_DISPLAY
+    I2cSelectBus(gTouchBus)
+    TouchSayBus()
+    TouchSayPads(0)
+    PrintN("Nothing was muxed and nothing was enabled - the next touch command")
+    PrintN("does that. The levels above are the pads as the firmware left them.")
+    I2cSelectBus(#I2C_BUS_HEADER)
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
 
   If WordIs("display") <> 0
     gTouchBus = #I2C_BUS_DISPLAY
