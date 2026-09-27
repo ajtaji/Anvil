@@ -139,7 +139,10 @@ FINGERPRINTS = (
     {
         "id": "dtb-magic",
         "what": "the flattened-device-tree magic",
-        "owners": ("Anvil/Core/boot_cmd.pbi",),
+        # fdt.pbi is THE reader; boot_cmd.pbi stays an owner only until it
+        # moves onto FdtCheck (vault: "The shared FDT reader - fdt.pbi and
+        # its migration 2026-09-26", row 1).
+        "owners": ("Anvil/Core/fdt.pbi", "Anvil/Core/boot_cmd.pbi"),
         "pattern": r"\$D00DFEED\b",
     },
     {
