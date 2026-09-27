@@ -267,9 +267,10 @@ class Pi5V3d(S1.Model):
         self.core_writes[off] = v
 
 
-def build(root: pathlib.Path, workdir: pathlib.Path, compiler: str, name: str) -> pathlib.Path:
+def build(root: pathlib.Path, workdir: pathlib.Path, compiler: str, name: str,
+          probe_rel: pathlib.Path = PROBE_REL) -> pathlib.Path:
     img = workdir / name
-    r = subprocess.run([compiler, "--compile", str(root / PROBE_REL), "-t", "pi5", "-s", "--entry-returns",
+    r = subprocess.run([compiler, "--compile", str(root / probe_rel), "-t", "pi5", "-s", "--entry-returns",
                         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK), "-o", str(img)],
                        cwd=root, env=dict(os.environ, PMF_ROOT=str(root)),
                        capture_output=True, text=True)
@@ -280,13 +281,13 @@ def build(root: pathlib.Path, workdir: pathlib.Path, compiler: str, name: str) -
 
 
 def run(img, midr=S1.MIDR_A76, tfu_mode="normal", tick_step=64, fw_kw=None,
-        limit=60_000_000, **model_kw):
+        limit=60_000_000, model_cls=None, **model_kw):
     cpu = A64()
     for i, b in enumerate(img.read_bytes()):
         cpu.memory[LOAD + i] = b
     cpu.pc, cpu.sp, cpu.x[30] = LOAD, STACK, LOADER_LR
     mem = cpu.memory
-    m = Pi5V3d(mem, tfu_mode, **model_kw)
+    m = (model_cls or Pi5V3d)(mem, tfu_mode, **model_kw)
     fw = P4.Firmware(dict(P4.PINNED_TAGS), P4.PINNED_CLOCK_ID, 11, 10, **(fw_kw or {}))
     syms = S1._symbols(img)
 
@@ -499,11 +500,11 @@ def payload_window(img: pathlib.Path, monitor_bytes: int | None) -> list[str]:
 
 def not_ported(lib: str) -> list[str]:
     """Every 4.2-only job path must refuse by name on a 2712 build, before it
-    touches a register: CSD (plan B4), binning and render (D1-D5), and the
-    bridge-based ownership reset (A7)."""
+    touches a register: binning and render (D1-D5) and the bridge-based
+    ownership reset (A7). (CSD was ported at step 3; a64_v3d71_csd_check.py.)"""
     import re
     errs = []
-    for name in ("V3dCsdSubmit", "V3dBinSubmit", "V3dRenderSubmit", "V3dOwnershipHardwareReset"):
+    for name in ("V3dBinSubmit", "V3dRenderSubmit", "V3dOwnershipHardwareReset"):
         m = re.search(rf"(?ms)^Procedure\.i {name}\(\)\n(.*?)^EndProcedure", lib)
         if not m:
             errs.append(f"not ported: {name} is missing")
@@ -541,10 +542,11 @@ MUTANTS = [
                                            "  If 0")),
     ("BCM2711 domain claim kept on 2712", lambda t: _sub(t, "  v3d_domainReply = -1\n  v3d_powerReply  = -1\n  CompilerElse\n",
                                                           "  v3d_domainReply = v3d_MbxIdState(#V3D_TAG_SET_DOMAIN_STATE, #V3D_DOMAIN_ID_NEW, #V3D_MBX_STATE_ON, 1)\n  v3d_powerReply  = -1\n  CompilerElse\n")),
-    ("CSD runs 4.2 offsets on 2712", lambda t: _sub(
-        t, "B4). Refused by\n  ; name rather than run with 4.2 offsets on a 7.1 part.\n"
+    ("binning runs 4.2 packets on 2712", lambda t: _sub(
+        t, "binning packets change shape (vault \"GPU - V3D 7.1 port plan\", D2-D4). Refused by\n"
+           "  ; name rather than run with 4.2 offsets on a 7.1 part.\n"
            "  v3d_err = #V3D_ERR_NOT_PORTED\n  ProcedureReturn #V3D_ERR_NOT_PORTED\n",
-        "B4).\n")),
+        "binning packets change shape (vault \"GPU - V3D 7.1 port plan\", D2-D4).\n")),
     ("PM password dropped", lambda t: _sub(t, "  PokeL(#V3D_PM_BASE + off, #V3D_PM_PASSWORD | (value & $00FFFFFF))",
                                             "  PokeL(#V3D_PM_BASE + off, value & $00FFFFFF)")),
 ]
@@ -565,7 +567,7 @@ def main() -> int:
         errs += scenarios(img)
         for e in errs:
             print("FAIL", e)
-        print(f"a64_v3d71_tfu_check: healthy + already-powered + 8 refusals + 4 not-ported "
+        print(f"a64_v3d71_tfu_check: healthy + already-powered + 8 refusals + 3 not-ported "
               f"refusals + the payload window, {len(errs)} failure(s)")
         rc = 1 if errs else 0
         if a.mutate:

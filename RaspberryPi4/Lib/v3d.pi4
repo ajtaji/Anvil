@@ -956,6 +956,19 @@ CompilerEndIf
 #V3D_CSD_STATUS_HAVE_CURRENT = 2         ; BIT(1), v3d_regs.h:407
 #V3D_CSD_STATUS_HAVE_QUEUED  = 1         ; BIT(0), v3d_regs.h:408
 
+CompilerIf #PMF_CHIP = 2712
+  ; The `ver >= 71` arm (pinned v3d_regs.h:415-454), plus CFG7, which the
+  ; kernel writes 0 before CFG0 kicks (v3d_sched.c:411-424) and the Mesa
+  ; simulator the same (v3dx_simulator.c:221-231). CSD_STATUS stays $900.
+  #V3D_CSD_QUEUED_CFG0 = $00930
+  #V3D_CSD_QUEUED_CFG1 = $00934
+  #V3D_CSD_QUEUED_CFG2 = $00938
+  #V3D_CSD_QUEUED_CFG3 = $0093C
+  #V3D_CSD_QUEUED_CFG4 = $00940
+  #V3D_CSD_QUEUED_CFG5 = $00944
+  #V3D_CSD_QUEUED_CFG6 = $00948
+  #V3D_CSD_QUEUED_CFG7 = $0094C  ; V3D_V7_CSD_QUEUED_CFG7, :454
+CompilerElse
 #V3D_CSD_QUEUED_CFG0 = $00904  ; v3d_regs.h:410, ver < 71 arm
 #V3D_CSD_QUEUED_CFG1 = $00908  ; v3d_regs.h:416
 #V3D_CSD_QUEUED_CFG2 = $0090C  ; v3d_regs.h:422
@@ -963,6 +976,7 @@ CompilerEndIf
 #V3D_CSD_QUEUED_CFG4 = $00914  ; v3d_regs.h:440
 #V3D_CSD_QUEUED_CFG5 = $00918  ; v3d_regs.h:443
 #V3D_CSD_QUEUED_CFG6 = $0091C  ; v3d_regs.h:446
+CompilerEndIf
 
 ; CFG0, CFG1 and CFG2 are (count << 16) | offset, for X, Y and Z.
 ; v3d_csd.h:26-27, and v3d_regs.h:411-426 gives the same two fields
@@ -1002,7 +1016,11 @@ CompilerEndIf
 
 ; CSDDONE in CTL_INT_STS. v3d_regs.h:275, ver < 71 arm. Read as
 ; evidence after the fact and never waited on - see NUM_COMPLETED.
+CompilerIf #PMF_CHIP = 2712
+  #V3D_CTL_INT_CSDDONE = 64    ; V3D_INT_CSDDONE(ver >= 71) = BIT(6), v3d_regs.h:283
+CompilerElse
 #V3D_CTL_INT_CSDDONE = 128     ; BIT(7)
+CompilerEndIf
 
 
 ; ======================================================================
@@ -4451,13 +4469,6 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i V3dCsdSubmit()
   Protected st.i
-  CompilerIf #PMF_CHIP = 2712
-  ; V3D 4.2 only: CSD CFG0-6 move to $930-$948 and CFG7 must be written (vault "GPU - V3D 7.1 port plan", B4). Refused by
-  ; name rather than run with 4.2 offsets on a 7.1 part.
-  v3d_err = #V3D_ERR_NOT_PORTED
-  ProcedureReturn #V3D_ERR_NOT_PORTED
-  CompilerEndIf
-
   If v3d_ready = 0
     v3d_err = #V3D_ERR_NOINIT
     ProcedureReturn #V3D_ERR_NOINIT
@@ -4530,6 +4541,10 @@ Procedure.i V3dCsdSubmit()
   V3dCoreWrite(#V3D_CSD_QUEUED_CFG4, v3d_csdCfg4)
   V3dCoreWrite(#V3D_CSD_QUEUED_CFG5, v3d_csdCfg5)
   V3dCoreWrite(#V3D_CSD_QUEUED_CFG6, v3d_csdCfg6)
+  CompilerIf #PMF_CHIP = 2712
+  ; 7.1 has an eighth word and the kernel keeps it 0 (v3d_sched.c:415-421).
+  V3dCoreWrite(#V3D_CSD_QUEUED_CFG7, 0)
+  CompilerEndIf
 
   ; THE BARRIER IS LOAD BEARING, for V3dTfuSubmit()'s reason. The six
   ; writes above are Device memory and are ordered against each other
