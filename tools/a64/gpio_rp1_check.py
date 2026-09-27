@@ -170,6 +170,7 @@ def driver(override):
             "  Rp1GpioBadPinCount() : Rp1PinDrive(0, 0) : Rp1PinDriveGet(0)\n"
             "  Rp1FuncSelGet(0) : Rp1PinOutput(0) : Rp1PinInput(0) : Rp1DigitalWrite(0, 0)\n"
             "  Rp1DigitalRead(0) : Rp1PinModeGet(0) : Rp1PinPullGet(0) : Rp1RioBase(0)\n"
+            "  Rp1PinOutputDisable(0, 0)\n"
             "EndIf\n")
 
 
@@ -343,6 +344,15 @@ def gate(cc, override, workdir):
         check(call("Rp1DigitalRead", p) == 1, "GPIO%d did not read its pad high" % p)
         rp1.pad_in = 0
         check(call("Rp1DigitalRead", p) == 0, "GPIO%d did not read its pad low" % p)
+    # OUT_DISABLE alone (the fan tach's open-collector input, GPIO29)
+    rp1.reg[pad(29)] = 0x41 | (2 << 2) | 0x30
+    check(call("Rp1PinOutputDisable", 29, 1) == 1 and
+          rp1.reg[pad(29)] == 0x41 | (2 << 2) | 0x30 | 0x80,
+          "Rp1PinOutputDisable(29, 1) did not set bit 7 alone (PAD $%X)" % rp1.reg[pad(29)])
+    check(call("Rp1PinOutputDisable", 29, 0) == 1 and
+          rp1.reg[pad(29)] == 0x41 | (2 << 2) | 0x30,
+          "Rp1PinOutputDisable(29, 0) did not clear bit 7 alone")
+    check(call("Rp1PinOutputDisable", 54, 1) == 0, "OutputDisable on pin 54 accepted")
     rp1.reg[pad(53)] = 0x41
     check(call("Rp1PinPull", 53, 2) == 1 and rp1.reg[pad(53)] == 0x41 | (2 << 2),
           "pull UP on GPIO53 did not land in bank 2's last pad")
@@ -424,6 +434,8 @@ MUTATIONS = [
      "#RP1_PADS_BANK0_BASE + Rp1BankOff(pin) + 4", "#RP1_PADS_BANK0_BASE + 4"),
     (REL_LIB, "CTRL without the bank block offset",
      "#RP1_IO_BANK0_BASE + Rp1BankOff(pin) + (pin", "#RP1_IO_BANK0_BASE + (pin"),
+    (REL_LIB, "OutputDisable writes the whole pad",
+     "    v = v | #RP1_PAD_OUT_DISABLE\n  Else", "    v = #RP1_PAD_OUT_DISABLE\n  Else"),
     (REL_LIB, "pad left disabled by a mode change",
      "  v = v & ~#RP1_PAD_OUT_DISABLE\n", "\n"),
     (REL_LIB, "FuncSelSet skips the pad", "  Rp1PadInit(pin)\n  PokeL(Rp1CtrlAddr(pin), funcsel)",

@@ -573,6 +573,32 @@ Procedure.i Rp1PinDriveGet(pin.i)
   ProcedureReturn 12
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  Rp1PinOutputDisable(pin, off) - the pad's OUT_DISABLE bit (bit 7,
+;  pinctrl-rp1.c RP1_PAD_OUT_DISABLE_MASK), for a pin that must never
+;  drive - an open-collector input such as the Pi 5 fan's tach (GPIO29).
+;  off <> 0 sets it, 0 clears it; every other pad bit is kept. Note that
+;  Rp1PinMode/Rp1FuncSelSet clear it (rp1_set_fsel does the same), so a
+;  caller that wants it set calls this AFTER them.
+; ----------------------------------------------------------------------
+Procedure.i Rp1PinOutputDisable(pin.i, off.i)
+  Define a.i
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  Rp1GpioBarrier()
+  a = Rp1PadAddr(pin)
+  v = Rp1ReadReg(a)
+  If off <> 0
+    v = v | #RP1_PAD_OUT_DISABLE
+  Else
+    v = v & (~#RP1_PAD_OUT_DISABLE)
+  EndIf
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i Rp1GpioBadPinCount()
   ProcedureReturn rp1_gpio_bad_pins
 EndProcedure
