@@ -220,6 +220,16 @@ diagnostic passed on Pi 4 silicon on 2026-09-26; see
 The bounded public buffer-copy/fill/update stream passed a Pi 4 RAM diagnostic
 on 2026-09-26; see `docs/VULKAN_BUFFER_TRANSFER_PI4_2026-09-26.md`. The full
 65,536-byte update limit is still desk-proved only.
+The graphics triangle diagnostic now creates a live same-device pipeline cache,
+reads its 32-byte header, and passes the cache to both graphics-pipeline
+creations. The committed source at `5f9172d` ran on Pi 4 silicon from RAM on
+2026-09-26: the board verified the 901,364-byte container with SHA-256
+`D292F08CC1EB10CC8097A62F0A637137EFE6F1B96A1FC4AA95EFB287E176DD26`,
+the report at `$00AD46E0` had zero status in slots 1 and 4, exact red/green
+triangle and background probes, and the monitor took fresh capture 34. Evidence
+is in `runs/vulkan-cache-triangle-20260926/run2/`. This proves pipeline
+creation and drawing with a non-null cache; it does not prove binary reuse or
+booting the newer Vulkan-default monitor image.
 
 ### The implemented public entry points
 
