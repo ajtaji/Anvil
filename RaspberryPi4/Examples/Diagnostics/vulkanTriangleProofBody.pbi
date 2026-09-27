@@ -181,12 +181,8 @@ XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
-CompilerIf #VTP_LIST_PROOF
-  #DSP_DMA_LINKED = 1
-  XIncludeFile "RaspberryPi4/Lib/dma.pi4"
-CompilerElse
-  #DSP_DMA_LINKED = 0
-CompilerEndIf
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
 XIncludeFile "RaspberryPi4/Lib/display.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
@@ -459,11 +455,9 @@ CompilerEndIf
 Global Dim vtpReport.l[64]
 Global Dim vtpClear.l[4]
 Global Dim vtpPush.l[4]
-CompilerIf #VTP_LIST_PROOF
-  ; dma.pi4 needs a 512-byte block aligned to 256. Keeping the storage in the
-  ; returning payload makes the DMA presentation independent of monitor state.
-  Global Dim vtpDmaScratch.a[768]
-CompilerEndIf
+; dma.pi4 needs a 512-byte block aligned to 256. Keeping the storage in the
+; returning payload makes the DMA presentation independent of monitor state.
+Global Dim vtpDmaScratch.a[768]
 
 ; The four SPIR-V modules are assembled by
 ; Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi, which the desk gate walks
@@ -1491,10 +1485,8 @@ CompilerEndIf
   rc = DisplayAdopt(#VTP_DSI_SCAN, #VTP_PANEL_PITCH, #VTP_PANEL_W, #VTP_PANEL_H, 32)
   vtpPut(#VTP_S_DISPLAY_ERR, DisplayLastError())
   If rc = #DSP_OK
-CompilerIf #VTP_LIST_PROOF
     ; The scene is already complete in the V3D attachment. Present it as one
-    ; DMA copy; a CPU DisplayBlit fallback remains correct but is a failed
-    ; acceleration proof and is recorded in slot 57.
+    ; DMA copy. A CPU DisplayBlit fallback fails the proof through slot 57.
     dmaScratch = @vtpDmaScratch[0] + 255
     dmaScratch = dmaScratch - (dmaScratch % 256)
     If DmaSetScratch(dmaScratch, 512) <> 0
@@ -1506,12 +1498,9 @@ CompilerIf #VTP_LIST_PROOF
       EndIf
     EndIf
     dmaBefore = DisplayDmaOps()
-CompilerEndIf
     DisplayBlit(imgBase, imagePitch, 0, 0, #VTP_VIEW_W, #VTP_VIEW_H)
-CompilerIf #VTP_LIST_PROOF
     vtpPut(#VTP_S_CB_TEXT, DisplayDmaOps() - dmaBefore)
     DisplayUseDma(0)
-CompilerEndIf
     DisplayFlush()
     vtpPut(#VTP_S_PRESENT, #VTP_P_OK)
     delay(#VTP_SHOW_MS)
@@ -1554,6 +1543,10 @@ CompilerEndIf
   NeonShutdown()
   vtpPut(#VTP_S_SHUTDOWN, 1)
 
+  If vtpGet(#VTP_S_PRESENT) <> #VTP_P_OK Or vtpGet(#VTP_S_DISPLAY_ERR) <> #DSP_OK Or vtpGet(#VTP_S_CB_TEXT) <> 1
+    ProcedureReturn vtpStop(#VTP_ERR_PRESENT)
+  EndIf
+
   ; ------------------------------------------------------------------
   ;  10. The uniform-colour verdict. Every one of these is a separate
   ;      way to be wrong, and they are checked in the order that makes
@@ -1578,11 +1571,6 @@ CompilerIf #VTP_LIST_PROOF
   EndIf
   If vtpGet(#VTP_S_LAYOUT_AFTER) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL Or vtpGet(#VTP_S_SHUTDOWN) <> 1
     ProcedureReturn vtpStop(#VTP_ERR_FENCE)
-  EndIf
-  ; DisplayLastError carries the display API's return code; #DSP_OK is the
-  ; positive value 1, not the Vulkan convention of zero success.
-  If vtpGet(#VTP_S_PRESENT) <> #VTP_P_OK Or vtpGet(#VTP_S_DISPLAY_ERR) <> #DSP_OK Or vtpGet(#VTP_S_CB_TEXT) <> 1
-    ProcedureReturn vtpStop(#VTP_ERR_PRESENT)
   EndIf
   ProcedureReturn vtpStop(#VTP_OK)
 CompilerElse
