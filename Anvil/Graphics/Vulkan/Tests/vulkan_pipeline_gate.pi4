@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[792]
+Global Dim pgReport.i[797]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 791
+  If slot < 0 Or slot > 796
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (792 * 8), slot)
+  PokeI(#PG_OUT + (797 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -3705,6 +3705,45 @@ Procedure.i Main()
   vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 33, @uploadRegions[0])
   pgPut(790, vkEndCommandBuffer(cmd))
   pgPut(791, AnvilVkSubmissionOutstanding())
+  ; Separate image-copy commands in one recording execute all of their DMA
+  ; rows in order, after preflight has checked both complete calls.
+  imageCopyRegions[0]\srcOffset\x = 0 : imageCopyRegions[0]\srcOffset\y = 0
+  imageCopyRegions[0]\dstOffset\x = 16 : imageCopyRegions[0]\dstOffset\y = 0
+  imageCopyRegions[0]\extent\width = 4 : imageCopyRegions[0]\extent\height = 4
+  imageCopyRegions[1]\srcOffset\x = 8 : imageCopyRegions[1]\srcOffset\y = 0
+  imageCopyRegions[1]\dstOffset\x = 20 : imageCopyRegions[1]\dstOffset\y = 0
+  imageCopyRegions[1]\extent\width = 4 : imageCopyRegions[1]\extent\height = 4
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegions[0])
+  vkCmdCopyImage(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegions[1])
+  pgPut(792, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(793, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(794, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To 31
+    For j = 0 To 31
+      For i = 0 To 3
+        If j < 4 And k < 4
+          rc = (((k + 5) * #PG_W + (j + 3)) * 4 + i) * 37 + 11
+        ElseIf j >= 12 And j < 16 And k < 3
+          rc = (((k + 10) * #PG_W + (j - 12 + 20)) * 4 + i) * 37 + 11
+        ElseIf j >= 16 And j < 20 And k < 4
+          rc = ((k * #PG_W + (j - 16)) * 4 + i) * 37 + 11
+        ElseIf j >= 20 And j < 24 And k < 4
+          rc = ((k * #PG_W + (j - 20 + 8)) * 4 + i) * 37 + 11
+        ElseIf j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = (((k - 9 + 5) * #PG_W + (j - 7 + 3)) * 4 + i) * 37 + 11
+        Else
+          rc = $A5
+        EndIf
+        If rc <> $A5 : rc = rc & $FF : EndIf
+        If PeekA(AnvilVkImageAddress(img2) + (k * 32 + j) * 4 + i) <> rc : count = count + 1 : EndIf
+      Next
+    Next
+  Next
+  pgPut(795, count)
+  pgPut(796, AnvilVkSubmissionOutstanding())
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE
