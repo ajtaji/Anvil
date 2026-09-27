@@ -1253,6 +1253,15 @@ XIncludeFile "RaspberryPi4/Lib/i2c_dw.pi4"
 XIncludeFile "RaspberryPi4/Lib/rtc_fw.pi4"
 XIncludeFile "RaspberryPi4/Lib/spi_dw.pi4"
 CompilerEndIf
+; Bluetooth: the HCI UART byte pipe (PL011 on the Pi 4, uarta on the Pi 5),
+; its HwBt* seam, and the shared HCI layer (needs Ticks/TickHz).
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Lib/bt_uart_7271.pi4"
+CompilerElse
+XIncludeFile "RaspberryPi4/Lib/bt_uart.pi4"
+CompilerEndIf
+XIncludeFile "RaspberryPi4/Board/hw_bt.pi4"
+XIncludeFile "Anvil/Net/hci.pbi"
 ; HDMI DDC is separate from GPIO BSC0/1: the firmware AUTOI2C handoff and
 ; dedicated BSC2/BSC7 hardware are owned by this direct reader.
 XIncludeFile "RaspberryPi4/Lib/hdmi_ddc.pi4"
@@ -1992,6 +2001,7 @@ XIncludeFile "Anvil/Core/uptime.pbi"
 ; before it is called, so this include has to come first. Moving it back
 ; down breaks the build at CmdInfo - loudly, which is the right failure.
 XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+XIncludeFile "Anvil/Core/bt_cmd.pbi"
 CompilerIf #CAP_SPI = 1
 XIncludeFile "Anvil/Core/spi_cmd.pbi"
 CompilerEndIf
@@ -2352,11 +2362,13 @@ CompilerIf #PMF_CHIP = 2712
     ; here: nothing is set, so `wifi` refuses rather than guesses.
     If FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0 And FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
       PrintN("!! the firmware device tree names BOTH the C0 and the D0 pinctrl, so the")
-      PrintN("   radio's pin stepping is not set and `wifi` will refuse.")
+      PrintN("   radio's pin stepping is not set and `wifi` and `bt up` will refuse.")
     ElseIf FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0
       SdioSetPinctrl(#SDIO_PINCTRL_C0)
+      Bt7SetPinctrl(#BT7_PINCTRL_C0)
     ElseIf FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
       SdioSetPinctrl(#SDIO_PINCTRL_D0)
+      Bt7SetPinctrl(#BT7_PINCTRL_D0)
     EndIf
   EndProcedure
 CompilerEndIf
@@ -3133,6 +3145,8 @@ Procedure Main()
     ; degrades to the honest "not available" refusal.
     ElseIf WordIs("i2c") <> 0
       CmdI2c()
+    ElseIf WordIs("bt") <> 0
+      CmdBt()
 
     ; touch - the DSI panel's touch controller and its power MCU. A whole
     ; word only; t is not free, and this family is not worth a letter

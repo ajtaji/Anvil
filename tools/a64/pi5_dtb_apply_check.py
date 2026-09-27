@@ -9,7 +9,8 @@ tools/a64/a64_interp.py:
   on 2026-09-26) with gBootDtb pointing at it:
     * dma.pi4's channel mask must be /axi/dma@10600's brcm,dma-channel-mask,
       read here independently from the same blob;
-    * sdio.pi4's pinctrl stepping must be C0 (1) when the tree has a
+    * sdio.pi4's pinctrl stepping - and bt_uart_7271.pi4's, the same
+      numbering, from the same reading - must be C0 (1) when the tree has a
       "brcm,bcm2712c0-pinctrl" node, D0 (2) for "brcm,bcm2712d0-pinctrl",
       and stay UNSET (0) for a tree naming neither (bcm2712-d-rpi-5-b.dtb
       is one) - the Wi-Fi library then refuses rather than guess;
@@ -207,6 +208,7 @@ def apply(img, procs, syms, blob: bytes):
     mask = int.from_bytes(m.peek(glob(syms, "dma_mask40"), 8), "little")
     kind = int.from_bytes(m.peek(glob(syms, "sdio_pinctrl"), 8), "little")
     apply.ram = int.from_bytes(m.peek(glob(syms, "mmu_ramBytes"), 8), "little")
+    apply.bt = int.from_bytes(m.peek(glob(syms, "bt7_pinctrl"), 8), "little")
     return mask, kind, con.tx.decode("ascii", "replace")
 
 
@@ -234,6 +236,8 @@ def main() -> int:
             check(kind == want_kind,
                   "%s: pinctrl stepping %d (the tree says %d%s)" % (name, kind, want_kind,
                   ", neither stepping: left unset, so `wifi` refuses" if want_kind == 0 else ""))
+            check(apply.bt == want_kind,
+                  "%s: Bluetooth pin stepping %d (the tree says %d)" % (name, apply.bt, want_kind))
             check(apply.ram == want_ram(blob, MMU_SENTINEL),
                   "%s: MMU RAM size $%X (the tree's bank at 0 gives $%X)"
                   % (name, apply.ram, want_ram(blob, MMU_SENTINEL)))
@@ -255,7 +259,7 @@ def main() -> int:
         both = with_node((args.dtb_dir / DTBS[0]).read_bytes(), b"brcm,bcm2712d0-pinctrl")
         want_mask, _ = dtb_facts(both)
         mask, kind, out = apply(img, procs, syms, both)
-        check(kind == 0 and "BOTH" in out and mask == want_mask,
+        check(kind == 0 and apply.bt == 0 and "BOTH" in out and mask == want_mask,
               "a tree naming both C0 and D0 pinctrl: stepping left unset (%d), the console says so, "
               "the DMA mask still $%X" % (kind, mask))
 
