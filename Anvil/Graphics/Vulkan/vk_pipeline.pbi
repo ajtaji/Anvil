@@ -29,8 +29,7 @@
 ;   * attributes at locations 0..n-1 (n <= 4), R32G32_SFLOAT,
 ;     R32G32B32_SFLOAT or R32G32B32A32_SFLOAT, all from binding 0
 ;   * VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, no primitive restart
-;   * one viewport and one scissor; either or both may be dynamic, with a
-;     dynamic viewport paired with dynamic scissor for resize-safe state
+;   * one viewport and one scissor; either, both or neither may be dynamic
 ;   * VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, no depth bias, line width
 ;     1.0, no depth clamp, no rasteriser discard
 ;   * one sample, no sample shading, no alpha to coverage
@@ -1704,9 +1703,6 @@ Procedure.i avkPipeDynamicState(*ds.VkPipelineDynamicStateCreateInfo, *dynamicVi
     EndIf
     k = k + 1
   Wend
-  If viewport <> 0 And scissor = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines requested a dynamic viewport without dynamic scissor (Anvil code -20005, unsupported dynamic state pair); resize-safe viewport pipelines must supply both per draw.")
-  EndIf
   PokeI(*dynamicViewport, viewport) : PokeI(*dynamicScissor, scissor)
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1734,7 +1730,7 @@ Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynam
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a null pViewports without enabling VK_DYNAMIC_STATE_VIEWPORT (Anvil code -20005, missing static viewport); supply one viewport or make viewport and scissor dynamic.")
   EndIf
   If dynamicScissor = 0 And *vp\pScissors = 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a null pScissors without enabling VK_DYNAMIC_STATE_SCISSOR (Anvil code -20005, missing static scissor); supply one full-viewport scissor or make scissor dynamic.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a null pScissors without enabling VK_DYNAMIC_STATE_SCISSOR (Anvil code -20005, missing static scissor); supply one scissor or make scissor dynamic.")
   EndIf
   If dynamicViewport <> 0
     avkPipeViewX[pipe] = 0 : avkPipeViewY[pipe] = 0
@@ -1753,29 +1749,24 @@ Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynam
   avkPipeViewY[pipe] = avkIntFromF32Bits(y)
   avkPipeViewW[pipe] = avkIntFromF32Bits(w)
   avkPipeViewH[pipe] = avkIntFromF32Bits(h)
-  If avkPipeViewW[pipe] < 1 Or avkPipeViewH[pipe] < 1
+  If avkPipeViewW[pipe] < 1 Or avkPipeViewH[pipe] < 1 Or avkPipeViewW[pipe] > 32767 Or avkPipeViewH[pipe] > 32767
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose width or height is not a positive whole number of pixels (Anvil code -20005, unsupported viewport); the emitted coordinate shader scales clip space by half the viewport in whole pixels, so a fractional or a flipped viewport would not be carried out as asked.")
   EndIf
   If avkPipeViewX[pipe] < 0 Or avkPipeViewY[pipe] < 0 Or avkPipeViewX[pipe] > 16383 Or avkPipeViewY[pipe] > 16383 Or (avkPipeViewX[pipe] * 256 + avkPipeViewW[pipe] * 128) > $3FFFFF Or (avkPipeViewY[pipe] * 256 + avkPipeViewH[pipe] * 128) > $3FFFFF
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose positive whole-pixel centre does not fit V3D's u14.8 offset field (Anvil code -20005, unsupported viewport); keep the viewport inside the render target and its centre below 16384 pixels.")
   EndIf
-  If dynamicScissor = 0
-    *sc = *vp\pScissors
-    If *sc\offset\x <> avkPipeViewX[pipe] Or *sc\offset\y <> avkPipeViewY[pipe]
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a static scissor whose origin differs from the viewport (Anvil code -20005, unsupported static scissor); match the viewport or use VK_DYNAMIC_STATE_SCISSOR.")
-    EndIf
-    If (*sc\extent\width & $FFFFFFFF) <> avkPipeViewW[pipe] Or (*sc\extent\height & $FFFFFFFF) <> avkPipeViewH[pipe]
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a static scissor that is not the whole viewport (Anvil code -20005, unsupported static scissor); use VK_DYNAMIC_STATE_SCISSOR for per-draw clipping.")
-    EndIf
-    avkPipeScissorX[pipe] = avkPipeViewX[pipe] : avkPipeScissorY[pipe] = avkPipeViewY[pipe]
-    avkPipeScissorW[pipe] = avkPipeViewW[pipe] : avkPipeScissorH[pipe] = avkPipeViewH[pipe]
-  Else
-    avkPipeScissorX[pipe] = 0 : avkPipeScissorY[pipe] = 0
-    avkPipeScissorW[pipe] = 0 : avkPipeScissorH[pipe] = 0
-  EndIf
   If (PeekL(@*v\minDepth) & $FFFFFFFF) <> 0 Or (PeekL(@*v\maxDepth) & $FFFFFFFF) <> $3F800000
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport depth range other than exactly zero through one (Anvil code -20005, unsupported viewport depth); depth buffering is not implemented.")
   EndIf
+  EndIf
+  If dynamicScissor = 0
+    *sc = *vp\pScissors
+    avkPipeScissorX[pipe] = *sc\offset\x : avkPipeScissorY[pipe] = *sc\offset\y
+    avkPipeScissorW[pipe] = *sc\extent\width & $FFFFFFFF
+    avkPipeScissorH[pipe] = *sc\extent\height & $FFFFFFFF
+  Else
+    avkPipeScissorX[pipe] = 0 : avkPipeScissorY[pipe] = 0
+    avkPipeScissorW[pipe] = 0 : avkPipeScissorH[pipe] = 0
   EndIf
   ProcedureReturn #VK_SUCCESS
 EndProcedure
