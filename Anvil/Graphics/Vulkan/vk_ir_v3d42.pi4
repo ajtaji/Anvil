@@ -1146,7 +1146,7 @@ Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
       avk42VertexGraphUsed[*load\sourceId] = 1
     ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
       arithmeticCount = arithmeticCount + 1
-      If arithmeticCount > 9 : ProcedureReturn 0 : EndIf
+      If arithmeticCount > 12 : ProcedureReturn 0 : EndIf
       If *n\operandCount <> 2 Or sp > 509 : ProcedureReturn 0 : EndIf
       pending[sp] = *n\operand0 : sp = sp + 1
       pending[sp] = *n\operand1 : sp = sp + 1
@@ -1379,10 +1379,12 @@ Procedure avk42VertexFillUniform(base.i, words.i, halfW.i, halfH.i)
   PokeL(base + ((i + 3) * 4), avk42VertexF32FromInt(halfH))
 EndProcedure
 
-Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, *p.AvkIrV3d42VertexPlan, b.i, temp.i, kcount.i, *xOut, *yOut)
+Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, *p.AvkIrV3d42VertexPlan, b.i, temp.i, kcount.i, inputSlots.i, *xOut, *yOut)
   Protected i.i
   Protected id.i
-  Protected nextReg.i = temp + 2
+  Protected scratchBase.i = temp + 2
+  Protected scratchLimit.i = #ANVIL_IR_V3D42_MAX_REG + 1
+  Protected nextReg.i
   Protected left.i
   Protected right.i
   Protected leftId.i
@@ -1394,6 +1396,11 @@ Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, 
   Protected *c.AvkIrConstant
   Protected *io.AvkIrV3d42Io
   Dim freeReg.i[64]
+  ; With 14 input words, RF10..13 are input VPM indices that have already
+  ; been consumed. Coordinate output writes only slots 0..9, so these four
+  ; registers can hold the graph while RF0..9 retain their slot indices.
+  If inputSlots = 14 : scratchBase = 10 : scratchLimit = 14 : EndIf
+  nextReg = scratchBase
   i = 0 : While i < 193 : avk42VertexGraphReg[i] = -1 : i = i + 1 : Wend
   i = 0 : While i < 193 : avk42VertexGraphUses[i] = 0 : i = i + 1 : Wend
   avk42VertexGraphUses[*p\positionXValueId] = avk42VertexGraphUses[*p\positionXValueId] + 1
@@ -1434,10 +1441,14 @@ Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, 
         If left < 0 Or right < 0
           ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *n\sourceOpcode, 4)
         EndIf
-        If freeCount > 0
+        If avk42VertexGraphUses[leftId] = 1 And left >= scratchBase And left < scratchLimit
+          destReg = left
+        ElseIf avk42VertexGraphUses[rightId] = 1 And right >= scratchBase And right < scratchLimit
+          destReg = right
+        ElseIf freeCount > 0
           freeCount = freeCount - 1 : destReg = freeReg[freeCount]
         Else
-          If nextReg > #ANVIL_IR_V3D42_MAX_REG : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *n\sourceOpcode, 4) : EndIf
+          If nextReg >= scratchLimit : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_RANGE, id, *n\sourceOpcode, 4) : EndIf
           destReg = nextReg : nextReg = nextReg + 1
         EndIf
         If *n\kind = #ANVIL_IR_OP_FADD
@@ -1450,11 +1461,11 @@ Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, 
         rc = V3dQpuNop()
         If rc <> 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ENCODE, id, *n\sourceOpcode, 4) : EndIf
         avk42VertexGraphUses[leftId] = avk42VertexGraphUses[leftId] - 1
-        If avk42VertexGraphUses[leftId] = 0 And avk42VertexGraphReg[leftId] >= temp + 2
+        If avk42VertexGraphUses[leftId] = 0 And avk42VertexGraphReg[leftId] >= scratchBase And avk42VertexGraphReg[leftId] < scratchLimit And avk42VertexGraphReg[leftId] <> destReg
           freeReg[freeCount] = avk42VertexGraphReg[leftId] : freeCount = freeCount + 1
         EndIf
         avk42VertexGraphUses[rightId] = avk42VertexGraphUses[rightId] - 1
-        If avk42VertexGraphUses[rightId] = 0 And avk42VertexGraphReg[rightId] >= temp + 2
+        If avk42VertexGraphUses[rightId] = 0 And avk42VertexGraphReg[rightId] >= scratchBase And avk42VertexGraphReg[rightId] < scratchLimit And avk42VertexGraphReg[rightId] <> destReg
           freeReg[freeCount] = avk42VertexGraphReg[rightId] : freeCount = freeCount + 1
         EndIf
         avk42VertexGraphReg[id] = destReg
@@ -1501,7 +1512,8 @@ Procedure.i avk42EmitVertexProgram(*m.AvkIrModule, *p.AvkIrV3d42VertexPlan, *t.A
   k = 0
   While k < inputSlots And r = 0 : r = avk42EmitLdvpm(k, b + k) : k = k + 1 : Wend
   If *p\positionGeneral <> 0 And r = 0
-    r = avk42VertexEmitGraph(*m, *t, *p, b, temp, kcount, @positionX, @positionY)
+    r = avk42VertexEmitGraph(*m, *t, *p, b, temp, kcount, inputSlots, @positionX, @positionY)
+    If inputSlots = 14 : temp = b + 12 : EndIf
   EndIf
   If *p\positionScaled <> 0 And r = 0
     V3dQpuReset() : V3dQpuMul(#V3DQ_M_FMUL, temp + 2, 0, #V3DQ_MUX_A, #V3DQ_MUX_B) : V3dQpuRaddr(positionX, b + *scale\firstSlot) : r = V3dQpuEmit()
@@ -1566,6 +1578,8 @@ Procedure.i AnvilVkIrV3d42LowerVertexPair(*m.AvkIrModule, *t.AvkIrV3d42VertexPai
   Protected halfH.i
   Protected i.i
   Protected j.i
+  Protected *vary.AvkIrV3d42VertexVarying
+  Protected *varyInput.AvkIrV3d42Io
   Dim bases.i[4]
   Dim sizes.i[4]
   avk42Error = 0 : avk42SourceId = 0 : avk42SourceOpcode = 0 : avk42Stage = 0
@@ -1576,10 +1590,25 @@ Procedure.i AnvilVkIrV3d42LowerVertexPair(*m.AvkIrModule, *t.AvkIrV3d42VertexPai
   If *m = 0 Or *t = 0 : ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_ARGS, 0, 0, 1) : EndIf
   rc = AnvilVkIrV3d42PlanVertex(*m, @avk42VertexPlanPending) : If rc <> 0 : ProcedureReturn rc : EndIf
   rc = avk42VertexValidateInputs(*m, @avk42VertexPlanPending, *t, @inputSlots) : If rc <> 0 : ProcedureReturn rc : EndIf
-  ; A wider input and deeper graph rendered sparse missing pixels on Pi 4.
-  ; Keep this path inside the 12-slot envelope verified by the board demo.
-  If avk42VertexPlanPending\positionGeneral <> 0 And inputSlots > 12
-    ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, inputSlots, 0, 3)
+  If avk42VertexPlanPending\positionGeneral <> 0
+    ; Coordinate output slots 0..9 remain live as VPM store indices. The
+    ; 14-word path reuses index registers 10..13 only after input fetch, and
+    ; later overwrites input slots 12..13 for viewport conversion. Refuse a
+    ; varying that would still need those input words at the VPM stores.
+    If avk42VertexPlanPending\varyingComponents > 4 Or inputSlots = 13 Or inputSlots > 14
+      ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, inputSlots, 0, 3)
+    EndIf
+    If inputSlots = 14
+      i = 0
+      While i < avk42VertexPlanPending\varyingCount
+        *vary = @avk42VertexPlanPending + OffsetOf(AvkIrV3d42VertexPlan\varyings) + i * SizeOf(AvkIrV3d42VertexVarying)
+        *varyInput = avk42FindIo(*t\inputs, *t\inputCount, *vary\sourceVariableId, -1)
+        If *varyInput = 0 Or (*varyInput\firstSlot + *vary\components) > 12
+          ProcedureReturn avk42Fail(#ANVIL_IR_V3D42_ERR_UNSUPPORTED, *vary\sourceVariableId, 0, 3)
+        EndIf
+        i = i + 1
+      Wend
+    EndIf
   EndIf
   ; Public viewport decoding admits exact whole-pixel extents 1..65535.
   ; Multiplication by 128 is therefore checked by that same bound, cannot
