@@ -97,6 +97,15 @@ U2_SUSPHY, U3_SUSPHY, U3_DISRXDET = 1 << 6, 1 << 17, 1 << 28
 GUCTL1_WANT = (1 << 19) | (1 << 17) | (1 << 15)
 
 RP1_ID = 0x00011DE4
+
+# The USB power-switch pins, from rp1_iobanks[] (pinctrl-rp1.c:295): bank 2
+# = GPIO34..53, IO block +$8000, pads block +$8004; GPIO42/43 are its
+# pins 8 and 9. vbus1 is FUNCSEL column 2 (PIN(42/43, ...), lines 524-525).
+IO_BANK0 = RP1_CPU + 0xD0000
+PADS_BANK0 = RP1_CPU + 0xF0000
+VBUS_CTRL = {42: IO_BANK0 + 0x8000 + 8 * 8 + 4, 43: IO_BANK0 + 0x8000 + 9 * 8 + 4}
+VBUS_PAD = {42: PADS_BANK0 + 0x8004 + 8 * 4, 43: PADS_BANK0 + 0x8004 + 9 * 4}
+VBUS_REGS = set(VBUS_CTRL.values()) | set(VBUS_PAD.values())
 GSNPSID_330B = 0x5533330B         # dwc_usb3 v3.30b (rp1-peripherals ch. 5)
 HCS1_RP1 = X.MAX_SLOTS | (X.MAX_INTRS << 8) | (3 << 24)   # 3 root ports
 
@@ -187,6 +196,9 @@ class Rp1Ctl(X.Ctl):
         self.rp1_touched = False
         self.scratch_checked = False
         self.xhci_before_host = False
+        # the two VBUS pins' CTRL (reset: FUNCSEL $1F, none) and PAD words
+        self.gpio = {a: 0x1F for a in VBUS_CTRL.values()}
+        self.gpio.update({a: 0x80 for a in VBUS_PAD.values()})
 
     # -- the pcie2 block ----------------------------------------------
     def link_up(self) -> bool:
@@ -385,9 +397,13 @@ def install(cpu: A64, ctl: Rp1Ctl) -> None:
                 ctl.bad(f"load from unmodelled RP1 USB offset ${off:X}")
                 return 0
             return ctl.reg_read(off)
+        if addr in VBUS_REGS:
+            if size != 4:
+                ctl.bad(f"a {size}-byte RP1 GPIO load")
+            return ctl.gpio[addr]
         if RP1_CPU <= addr < RP1_CPU + RP1_SIZE:
-            ctl.bad(f"load from RP1 ${addr - RP1_CPU:X}, not usbhost0 - "
-                    f"the gate brings up host 0 only")
+            ctl.bad(f"load from RP1 ${addr - RP1_CPU:X}, not usbhost0 or the "
+                    f"GPIO42/43 CTRL/PAD words")
             return 0
         return raw_load(addr, size)
 
@@ -416,8 +432,18 @@ def install(cpu: A64, ctl: Rp1Ctl) -> None:
                 return
             ctl.reg_write(off, value)
             return
+        if addr in VBUS_REGS:
+            if size != 4:
+                ctl.bad(f"a {size}-byte RP1 GPIO store")
+            if not ctl.link_up():
+                ctl.bad("RP1 GPIO written with the link down")
+            ctl.gpio[addr] = value & 0xFFFFFFFF
+            if addr in VBUS_CTRL.values():
+                ctl.log.append(f"vbus-ctrl-{value & 0x1F}")
+            return
         if RP1_CPU <= addr < RP1_CPU + RP1_SIZE:
-            ctl.bad(f"store to RP1 ${addr - RP1_CPU:X}, not usbhost0")
+            ctl.bad(f"store to RP1 ${addr - RP1_CPU:X}, not usbhost0 or the "
+                    f"GPIO42/43 CTRL/PAD words")
             return
         raw_store(addr, value, size)
 
@@ -493,8 +519,8 @@ def expect(scenario: str) -> list[tuple[str, int]]:
         ("host 0 selected", 0),
         ("host switch refused while running", 0),
         ("the board's VBUS hook ran once", 1),
-        ("VBUS state 0: gpio_rp1.pi4 has no bank-2 setter for GPIO42/43", 0),
-        ("both VBUS pins refused by gpio_rp1 (and RP1 untouched)", 2),
+        ("VBUS state 1: GPIO42/43 muxed to vbus1 through gpio_rp1 bank 2", 1),
+        ("no pin refused by gpio_rp1", 0),
         ("XhciInit powered all three root ports", 3),
         ("a No-Op completed", 1),
         ("Success", 1),
@@ -591,6 +617,13 @@ def run(img: pathlib.Path, scenario: str, budget: int) -> list[str]:
         need("the soft reset completed", "dwc3-csftrst-cleared" in ctl.log)
         need("the soft reset before host mode", before("dwc3-csftrst-cleared", "dwc3-host"))
         need("host mode before the xHCI reset", before("dwc3-host", "hcrst"))
+        for pin in (42, 43):
+            need(f"GPIO{pin} CTRL holds FUNCSEL 2 (vbus1)",
+                 ctl.gpio[VBUS_CTRL[pin]] & 0x1F == 2)
+            need(f"GPIO{pin} pad enabled (IN_ENABLE set, OUT_DISABLE clear)",
+                 ctl.gpio[VBUS_PAD[pin]] & 0xC0 == 0x40)
+        need("VBUS was muxed before the first root port was powered",
+             before("vbus-ctrl-2", "port1-powered"))
         need("the root ports were powered after the reset",
              before("hcrst", "port1-powered") and "port3-powered" in ctl.log)
         need("GUSB2PHYCFG0.SUSPHY cleared", not ctl.dwc[GUSB2PHYCFG0] & U2_SUSPHY)
@@ -658,6 +691,8 @@ MUTANTS = {
     "no-inbound-check": (PCIE, "    If pcie_FindDmaWindow() = 0\n      pcie_err = #PCIE_ERR_INBOUND\n",
                          "    If pcie_FindDmaWindow() = 2\n      pcie_err = #PCIE_ERR_INBOUND\n"),
     "no-ac64-check": (XHCI, "    If xh_ac64 = 0\n      xh_Fail(#XHCI_ERR_AC64)", "    If xh_ac64 = 2\n      xh_Fail(#XHCI_ERR_AC64)"),
+    "vbus-ctrl-in-bank0": (GPIO, "#RP1_IO_BANK0_BASE + Rp1BankOff(pin) + (pin", "#RP1_IO_BANK0_BASE + (pin"),
+    "vbus-pad-in-bank0": (GPIO, "#RP1_PADS_BANK0_BASE + Rp1BankOff(pin) + 4", "#RP1_PADS_BANK0_BASE + 4"),
     "no-vbus-hook-call": (XHCI, "    If *xh_vbusHook <> 0\n      xh_vbusHook()\n    EndIf\n", "\n"),
     "no-root-port-power": (XHCI, "    If xh_PowerRootPorts() = 0\n", "    If 1 = 0\n"),
     "no-power-good-wait": (XHCI, "      xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)\n", "\n"),

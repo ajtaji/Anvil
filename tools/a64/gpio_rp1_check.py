@@ -23,6 +23,12 @@ sources, not from the library under test:
                              every block aliased RW +0, XOR +$1000,
                              SET +$2000, CLR +$3000.
 
+  pinctrl-rp1.c:291-296      rp1_iobanks[]: bank 0 = GPIO0..27, gpio/rio
+                             $0000, pads $0004; bank 1 = GPIO28..33, $4000 /
+                             $4004; bank 2 = GPIO34..53, $8000 / $8004. A
+                             pin's offset is its index WITHIN its bank
+                             (lines 1645-1653) - bit j of the bank's RIO.
+
 So a wrong offset in the library is an access the model names as
 unmodelled, not a matching wrong offset in a mirror. The HW-level vocabulary
 (#HW_GPIO_*, #HW_PULL_*) is read from Anvil/Hal/hal.pbi, the file that owns
@@ -49,7 +55,17 @@ IO_BANK0 = 0x1F_000D_0000
 SYS_RIO0 = 0x1F_000E_0000
 PADS_BANK0 = 0x1F_000F_0000
 WINDOW = 0xC000
-PINS = 28
+PINS = 28                       # bank 0, the header (hw_gpio's extent)
+# rp1_iobanks[] (pinctrl-rp1.c:293-295): (first gpio, count, block offset).
+BANKS = ((0, 28, 0x0000), (28, 6, 0x4000), (34, 20, 0x8000))
+LAST = 53
+
+
+def bank_of(pin):
+    for i, (first, count, off) in enumerate(BANKS):
+        if first <= pin < first + count:
+            return i, pin - first, off
+    raise ValueError(pin)
 
 REL_LIB = "RaspberryPi4/Lib/gpio_rp1.pi4"
 REL_HW = "RaspberryPi4/Board/hw_gpio.pi4"
@@ -59,7 +75,7 @@ HAL_NAMES = ("#HW_GPIO_IN", "#HW_GPIO_OUT", "#HW_GPIO_ALT",
 
 
 class Rp1Gpio:
-    """RP1 bank 0 as pinctrl-rp1.c describes it."""
+    """RP1's three GPIO banks as pinctrl-rp1.c describes them."""
 
     def __init__(self):
         self.reg = {}            # RW address -> 32-bit value
@@ -67,55 +83,63 @@ class Rp1Gpio:
         self.pad_in = 0          # external level on each pin's pad (bit per pin)
 
     def _decode(self, addr):
-        # Bank 0 of each window is its first $4000: registers in +$000..$FFF,
-        # then the XOR/SET/CLR copies at +$1000/+$2000/+$3000. Banks 1 and 2
-        # (+$4000, +$8000) are not modelled - gpio_rp1.pi4 does not drive them.
+        # Each window is three $4000 bank blocks (+$0000, +$4000, +$8000);
+        # inside a block the registers sit at +$000..$FFF and the
+        # XOR/SET/CLR copies at +$1000/+$2000/+$3000. Returns (window base,
+        # bank, RW address, alias).
         for base in (IO_BANK0, SYS_RIO0, PADS_BANK0):
-            if base <= addr < base + 0x4000:
+            if base <= addr < base + WINDOW:
                 off = addr - base
-                return base, base + (off & 0xFFF), off & 0x3000
-        d.die("unmodelled access at $%X (not RP1 bank 0 GPIO)" % addr)
+                bank = off // 0x4000
+                blk = base + bank * 0x4000
+                return base, bank, blk + (off & 0xFFF), off & 0x3000
+        d.die("unmodelled access at $%X (not RP1 GPIO)" % addr)
 
-    def _valid(self, base, rw):
-        off = rw - base
+    def _valid(self, base, bank, rw):
+        count = BANKS[bank][1]
+        off = rw - base - bank * 0x4000
         if base == IO_BANK0:
-            if off % 8 not in (0, 4) or off // 8 >= PINS:
-                d.die("IO_BANK0 access at +$%X is not a bank-0 STATUS/CTRL word" % off)
+            if off % 8 not in (0, 4) or off // 8 >= count:
+                d.die("IO_BANK0 access at bank %d +$%X is not a STATUS/CTRL word "
+                      "of one of its %d pins" % (bank, off, count))
         elif base == SYS_RIO0:
             if off not in (0, 4, 8):
-                d.die("SYS_RIO0 access at +$%X is not OUT/OE/IN" % off)
+                d.die("SYS_RIO0 access at bank %d +$%X is not OUT/OE/IN" % (bank, off))
         else:
-            if off < 4 or off % 4 or (off - 4) // 4 >= PINS:
-                d.die("PADS_BANK0 access at +$%X is not a bank-0 pad word "
-                      "(+$0 is the bank voltage select, which nothing here owns)" % off)
+            if off < 4 or off % 4 or (off - 4) // 4 >= count:
+                d.die("PADS access at bank %d +$%X is not a pad word of one of its "
+                      "%d pins (+$0 is the bank voltage select, which nothing here "
+                      "owns)" % (bank, off, count))
 
-    def rio_in(self):
-        oe = self.reg.get(SYS_RIO0 + 4, 0)
-        out = self.reg.get(SYS_RIO0 + 0, 0)
+    def rio_in(self, bank=0):
+        first, count, boff = BANKS[bank]
+        oe = self.reg.get(SYS_RIO0 + boff + 4, 0)
+        out = self.reg.get(SYS_RIO0 + boff + 0, 0)
         v = 0
-        for p in range(PINS):
-            bit = 1 << p
-            ctrl = self.reg.get(IO_BANK0 + p * 8 + 4, 0x1F)
+        for j in range(count):
+            bit = 1 << j
+            ctrl = self.reg.get(IO_BANK0 + boff + j * 8 + 4, 0x1F)
             if (ctrl & 0x1F) == 5 and oe & bit:
                 v |= out & bit
-            else:
-                v |= self.pad_in & bit
+            elif self.pad_in & (1 << (first + j)):
+                v |= bit
         return v
 
     def __call__(self, addr, size, value):
         if size != 4:
             d.die("RP1 access of %d bytes at $%X: every RP1 register is 32-bit" % (size, addr))
-        base, rw, alias = self._decode(addr)
-        self._valid(base, rw)
+        base, bank, rw, alias = self._decode(addr)
+        self._valid(base, bank, rw)
+        rio_in = SYS_RIO0 + bank * 0x4000 + 8
         if value is None:
             if alias:
                 d.die("read through the alias window at $%X" % addr)
             self.log.append(("r", addr, None))
-            if rw == SYS_RIO0 + 8:
-                return self.rio_in()
+            if rw == rio_in:
+                return self.rio_in(bank)
             return self.reg.get(rw, 0x1F if base == IO_BANK0 and (rw - base) % 8 == 4 else 0)
         self.log.append(("w", addr, value))
-        if rw == SYS_RIO0 + 8:
+        if rw == rio_in:
             d.die("write to RIO_IN, which is read-only")
         old = self.reg.get(rw, 0)
         if alias == 0:
@@ -144,6 +168,8 @@ def driver(override):
             "  HwGpioWrite(0, 0) : HwGpioToggle(0) : HwGpioReservedReason(0)\n"
             "  Rp1CtrlAddr(0) : Rp1PadAddr(0) : Rp1FuncSelSet(0, 0) : Rp1PinPull(0, 0)\n"
             "  Rp1GpioBadPinCount() : Rp1PinDrive(0, 0) : Rp1PinDriveGet(0)\n"
+            "  Rp1FuncSelGet(0) : Rp1PinOutput(0) : Rp1PinInput(0) : Rp1DigitalWrite(0, 0)\n"
+            "  Rp1DigitalRead(0) : Rp1PinModeGet(0) : Rp1PinPullGet(0) : Rp1RioBase(0)\n"
             "EndIf\n")
 
 
@@ -164,8 +190,11 @@ def gate(cc, override, workdir):
     def call(name, *a):
         return m.signed(m.call(name, *a))
 
-    ctrl = lambda p: IO_BANK0 + p * 8 + 4
-    pad = lambda p: PADS_BANK0 + 4 + p * 4
+    # Every address from the rp1_iobanks[] table above, never from the library.
+    ctrl = lambda p: IO_BANK0 + bank_of(p)[2] + bank_of(p)[1] * 8 + 4
+    pad = lambda p: PADS_BANK0 + bank_of(p)[2] + 4 + bank_of(p)[1] * 4
+    rio = lambda p: SYS_RIO0 + bank_of(p)[2]
+    bit = lambda p: 1 << bank_of(p)[1]
     OUT, OE = SYS_RIO0, SYS_RIO0 + 4
 
     # --- extent -----------------------------------------------------------
@@ -264,9 +293,67 @@ def gate(cc, override, workdir):
     check(call("Rp1FuncSelSet", 3, 9) == 0 and rp1.reg[ctrl(3)] == 3,
           "FUNCSEL 9 was written")
 
-    # --- bad pins touch nothing -----------------------------------------------
+    # --- banks 1 and 2 (GPIO28..53) -------------------------------------------
+    for p in (28, 30, 33, 34, 42, 43, 44, 45, 53):
+        check(call("Rp1CtrlAddr", p) == ctrl(p), "CTRL address for bank-%d pin %d"
+              % (bank_of(p)[0], p))
+        check(call("Rp1PadAddr", p) == pad(p), "PAD address for bank-%d pin %d"
+              % (bank_of(p)[0], p))
+        check(call("Rp1RioBase", p) == rio(p), "RIO block for bank-%d pin %d"
+              % (bank_of(p)[0], p))
+    # USB VBUS: GPIO42/43 to vbus1, FUNCSEL column 2 (pinctrl-rp1.c:524-525)
     rp1.log.clear()
-    for p in (28, 40, -1):
+    for p in (42, 43):
+        rp1.reg[pad(p)] = 0x80
+        check(call("Rp1FuncSelSet", p, 2) == 1, "Rp1FuncSelSet(%d, vbus1) refused" % p)
+        check(rp1.reg[ctrl(p)] == 2, "CTRL(%d) is $%X, want FUNCSEL 2 (vbus1)"
+              % (p, rp1.reg.get(ctrl(p), 0)))
+        check(rp1.reg[pad(p)] == 0x40, "PAD(%d) not enabled by FuncSelSet" % p)
+        check(call("Rp1FuncSelGet", p) == 2, "FuncSelGet(%d) is not 2" % p)
+    check(not [a for op, a, v in rp1.log if op == "w" and IO_BANK0 <= a < IO_BANK0 + 0x4000],
+          "a bank-2 FuncSelSet wrote into bank 0's block")
+    # PWR LED GPIO44: output, driven through bank 2's RIO bit 10 only
+    rp1.reg[rio(44) + 4] = 1 << 11              # GPIO45's OE already set
+    rp1.reg[OE] = 1 << 10                       # bank 0 GPIO10's OE, must not move
+    rp1.log.clear()
+    check(call("Rp1PinOutput", 44) == 1, "Rp1PinOutput(44) refused")
+    check(rp1.reg[ctrl(44)] == 5, "CTRL(44) is not FUNCSEL 5 (GPIO)")
+    check(rp1.writes_to(rio(44) + 4 + 0x2000) == [bit(44)], "GPIO44's OE did not "
+          "go through bank 2's SET alias with bit 10")
+    check(rp1.reg[rio(44) + 4] == (1 << 11) | (1 << 10), "bank 2 OE is $%X"
+          % rp1.reg[rio(44) + 4])
+    check(rp1.reg[OE] == 1 << 10, "a bank-2 output moved bank 0's OE")
+    check(call("Rp1PinModeGet", 44) == 1, "ModeGet(44) is not output")
+    check(call("Rp1DigitalWrite", 44, 0) == 1 and
+          rp1.writes_to(rio(44) + 0x3000) == [bit(44)], "GPIO44 low not via bank 2 CLR")
+    check(call("Rp1DigitalRead", 44) == 0, "GPIO44 did not read back low")
+    check(call("Rp1DigitalWrite", 44, 1) == 1 and call("Rp1DigitalRead", 44) == 1,
+          "GPIO44 did not read back high")
+    # Fan PWM GPIO45: pwm1 is column 0 (pinctrl-rp1.c:527)
+    check(call("Rp1FuncSelSet", 45, 0) == 1 and rp1.reg[ctrl(45)] == 0,
+          "GPIO45 not muxed to pwm1 (FUNCSEL 0)")
+    # Bank edges: 33 is bank 1 bit 5, 34 is bank 2 bit 0; 28 is bank 1 bit 0
+    for p in (28, 33, 34, 53):
+        rp1.log.clear()
+        check(call("Rp1PinInput", p) == 1, "Rp1PinInput(%d) refused" % p)
+        check(rp1.writes_to(rio(p) + 4 + 0x3000) == [bit(p)],
+              "GPIO%d input did not clear bit %d of bank %d's OE"
+              % (p, bank_of(p)[1], bank_of(p)[0]))
+        rp1.pad_in = 1 << p
+        check(call("Rp1DigitalRead", p) == 1, "GPIO%d did not read its pad high" % p)
+        rp1.pad_in = 0
+        check(call("Rp1DigitalRead", p) == 0, "GPIO%d did not read its pad low" % p)
+    rp1.reg[pad(53)] = 0x41
+    check(call("Rp1PinPull", 53, 2) == 1 and rp1.reg[pad(53)] == 0x41 | (2 << 2),
+          "pull UP on GPIO53 did not land in bank 2's last pad")
+    check(call("Rp1PinDrive", 30, 12) == 1 and call("Rp1PinDriveGet", 30) == 12,
+          "12 mA on bank-1 GPIO30 did not read back")
+
+    # --- bad pins touch nothing -----------------------------------------------
+    # (Before banks 1 and 2, 28 and 40 were the bad pins here. They are real
+    # lines now and are exercised above; 54 is the first pin RP1 does not have.)
+    rp1.log.clear()
+    for p in (54, 60, -1):
         check(call("HwGpioModeGet", p) == -1, "ModeGet(%d) is not -1" % p)
         check(call("HwGpioLevelGet", p) == -1, "LevelGet(%d) is not -1" % p)
         check(call("HwGpioPullGet", p) == -1, "PullGet(%d) is not -1" % p)
@@ -276,6 +363,8 @@ def gate(cc, override, workdir):
               "drive on bad pin %d accepted" % p)
     check(not rp1.log, "a bad pin reached RP1: %r" % rp1.log[:3])
     check(call("Rp1GpioBadPinCount") >= 21, "bad pins were not counted")
+    check(call("HwGpioCount") == 28 and call("HwGpioUserMax") == 27,
+          "hw_gpio's advertised extent moved - #RP1_PIN_MAX still means the header")
 
     # --- the console is reserved --------------------------------------------
     for p in (14, 15):
@@ -296,21 +385,37 @@ MUTATIONS = [
     (REL_LIB, "PADS_BANK0 without the $1F prefix",
      "#RP1_PADS_BANK0_BASE = $1F000F0000", "#RP1_PADS_BANK0_BASE = $1F0000F0000"),
     (REL_LIB, "CTRL read at STATUS (+0)",
-     "ProcedureReturn #RP1_IO_BANK0_BASE + pin * 8 + 4", "ProcedureReturn #RP1_IO_BANK0_BASE + pin * 8"),
+     "(pin - Rp1BankFirst(pin)) * 8 + 4", "(pin - Rp1BankFirst(pin)) * 8"),
     (REL_LIB, "pad word without the bank voltage-select skip",
-     "ProcedureReturn #RP1_PADS_BANK0_BASE + 4 + pin * 4", "ProcedureReturn #RP1_PADS_BANK0_BASE + pin * 4"),
+     "Rp1BankOff(pin) + 4 + (pin - Rp1BankFirst(pin)) * 4", "Rp1BankOff(pin) + (pin - Rp1BankFirst(pin)) * 4"),
     (REL_LIB, "GPIO function is FUNCSEL 0",
      "#RP1_FUNCSEL_GPIO = 5 ", "#RP1_FUNCSEL_GPIO = 0 "),
     (REL_LIB, "output-enable written through RW",
-     "PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF + #RP1_SET_OFF, Rp1RioBit(pin))",
-     "PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF, Rp1RioBit(pin))"),
+     "PokeL(Rp1RioBase(pin) + #RP1_RIO_OE_OFF + #RP1_SET_OFF, Rp1RioBit(pin))",
+     "PokeL(Rp1RioBase(pin) + #RP1_RIO_OE_OFF, Rp1RioBit(pin))"),
     (REL_LIB, "high and low swapped (SET/CLR)",
-     "PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))",
-     "PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_SET_OFF, Rp1RioBit(pin))"),
+     "PokeL(Rp1RioBase(pin) + #RP1_RIO_OUT_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))",
+     "PokeL(Rp1RioBase(pin) + #RP1_RIO_OUT_OFF + #RP1_SET_OFF, Rp1RioBit(pin))"),
     (REL_LIB, "level read from RIO_OUT, not RIO_IN",
-     "v = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_IN_OFF)",
-     "v = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF)"),
-    (REL_LIB, "bank 1 admitted", "#RP1_PIN_MAX = 27", "#RP1_PIN_MAX = 53"),
+     "v = Rp1ReadReg(Rp1RioBase(pin) + #RP1_RIO_IN_OFF)",
+     "v = Rp1ReadReg(Rp1RioBase(pin) + #RP1_RIO_OUT_OFF)"),
+    (REL_LIB, "a pin RP1 does not have admitted", "#RP1_GPIO_LAST = 53", "#RP1_GPIO_LAST = 54"),
+    (REL_LIB, "header extent widened (hw_gpio would advertise 54)", "#RP1_PIN_MAX = 27", "#RP1_PIN_MAX = 53"),
+    (REL_LIB, "bank 1 and 2 first-GPIO rows swapped",
+     "    Case 2\n      ProcedureReturn #RP1_BANK2_FIRST\n    Case 1\n      ProcedureReturn #RP1_BANK1_FIRST",
+     "    Case 2\n      ProcedureReturn #RP1_BANK1_FIRST\n    Case 1\n      ProcedureReturn #RP1_BANK2_FIRST"),
+    (REL_LIB, "bank stride $2000", "#RP1_BANK_STRIDE = $4000", "#RP1_BANK_STRIDE = $2000"),
+    (REL_LIB, "bank 2 starts at 33", "#RP1_BANK2_FIRST = 34", "#RP1_BANK2_FIRST = 33"),
+    (REL_LIB, "bank 1 starts at 27", "#RP1_BANK1_FIRST = 28", "#RP1_BANK1_FIRST = 27"),
+    (REL_LIB, "RIO always bank 0's block",
+     "  ProcedureReturn #RP1_SYS_RIO0_BASE + Rp1BankOff(pin)",
+     "  ProcedureReturn #RP1_SYS_RIO0_BASE"),
+    (REL_LIB, "RIO bit is the GPIO number, not the in-bank index",
+     "  ProcedureReturn 1 << (pin - Rp1BankFirst(pin))", "  ProcedureReturn 1 << pin"),
+    (REL_LIB, "pad without the bank block offset",
+     "#RP1_PADS_BANK0_BASE + Rp1BankOff(pin) + 4", "#RP1_PADS_BANK0_BASE + 4"),
+    (REL_LIB, "CTRL without the bank block offset",
+     "#RP1_IO_BANK0_BASE + Rp1BankOff(pin) + (pin", "#RP1_IO_BANK0_BASE + (pin"),
     (REL_LIB, "pad left disabled by a mode change",
      "  v = v & ~#RP1_PAD_OUT_DISABLE\n", "\n"),
     (REL_LIB, "FuncSelSet skips the pad", "  Rp1PadInit(pin)\n  PokeL(Rp1CtrlAddr(pin), funcsel)",
