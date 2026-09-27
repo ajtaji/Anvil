@@ -10,6 +10,7 @@ XIncludeFile "Anvil/Kernel/exceptions.pbi"
 XIncludeFile "RaspberryPi3/Lib/mailbox.pbi"
 XIncludeFile "Anvil/Graphics/text_glyph.pbi"
 XIncludeFile "RaspberryPi3/Lib/framebuffer.pbi"
+XIncludeFile "Anvil/Core/fdt.pbi"        ; the one shared DTB reader boot_memory reads through
 XIncludeFile "RaspberryPi3/Lib/boot_memory.pbi"
 XIncludeFile "RaspberryPi3/Lib/sdhost.pbi"
 XIncludeFile "Anvil/Storage/fat32.pbi"
