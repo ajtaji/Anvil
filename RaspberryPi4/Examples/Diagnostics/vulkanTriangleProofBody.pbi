@@ -749,6 +749,10 @@ CompilerEndIf
   Define vpstate.VkPipelineViewportStateCreateInfo
   Define vp.VkViewport
   Define sc.VkRect2D
+CompilerIf #VTP_PYRAMID_DEMO = 2
+  Define dynamicState.VkPipelineDynamicStateCreateInfo
+  Define Dim dynamicKinds.l[2]
+CompilerEndIf
   Define rs.VkPipelineRasterizationStateCreateInfo
   Define ms.VkPipelineMultisampleStateCreateInfo
   Define cba.VkPipelineColorBlendAttachmentState
@@ -1271,6 +1275,14 @@ CompilerElse
   vi\vertexAttributeDescriptionCount = 2
 CompilerEndIf
   gp\layout = layB
+CompilerIf #VTP_PYRAMID_DEMO = 2
+  dynamicKinds[0] = #VK_DYNAMIC_STATE_VIEWPORT
+  dynamicKinds[1] = #VK_DYNAMIC_STATE_SCISSOR
+  dynamicState\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+  dynamicState\dynamicStateCount = 2
+  dynamicState\pDynamicStates = @dynamicKinds[0]
+  gp\pDynamicState = @dynamicState
+CompilerEndIf
   rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeB)
   If rc <> #VK_SUCCESS
     vtpPut(#VTP_S_DETAIL, rc)
@@ -1345,6 +1357,17 @@ CompilerIf #VTP_PYRAMID_DEMO
     EndIf
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
+CompilerIf #VTP_PYRAMID_DEMO = 2
+    ; Exercise the per-draw V3D viewport uniforms and clip packet. The
+    ; viewport must match this framebuffer; the last scissor is half size.
+    If (frame & 1) <> 0
+      sc\extent\width = 400 : sc\extent\height = 640
+    Else
+      sc\extent\width = #VTP_VIEW_W : sc\extent\height = #VTP_VIEW_H
+    EndIf
+    vkCmdSetViewport(cmd, 0, 1, @vp)
+    vkCmdSetScissor(cmd, 0, 1, @sc)
+CompilerEndIf
     vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
     vkCmdDraw(cmd, 12, 1, 0, 0)
     vkCmdEndRenderPass(cmd)
