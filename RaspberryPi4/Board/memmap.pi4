@@ -62,9 +62,99 @@
 ;  whole point of it.
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  THE BCM2712 MAP - THE PI 5'S OWN, DERIVED FROM THE PI 5'S FACTS
+;
+;  Ruling 2026-09-27: every board gets its own memory map. Until this
+;  date the Pi 5 build borrowed the Pi 4's - linked at $00200000, with its
+;  stack and its fixed records in the band just below that - and the Pi 5
+;  never once ran that layout.
+;
+;  THE EVIDENCE. The Pi 5 firmware loads kernel= at $00080000 and does not
+;  move it. The first full boot (2026-09-27, image 92ee2ba) ran there, and
+;  the Pi 4 layout put the stack ($00100000), the boot phase record and
+;  boot trail ($001FB000..), the raw-core stacks and the autoboot record
+;  INSIDE the running code; the trail overwrote ScrPresentedPixel (image
+;  +$17B660 = $001FB660) and the board died at a procedure entry, EC 0.
+;  The port lane's load guard was then booted with kernel_address=0x200000
+;  in config.txt's [pi5] section, and it printed
+;      Anvil was loaded at 00080000 and is built to run at 00200000
+;  so the firmware ignores kernel_address with our arm stub. $00080000 is
+;  a FACT about the Pi 5's boot path, not a choice, and this build is
+;  linked there (board.pi4 LoadAddress). There is no relocation copy.
+;
+;  THE PI 5 FACTS THE MAP IS BUILT FROM:
+;
+;    $00000000..$0007FFFF  the EL3 stub (RaspberryPi5/Board/
+;                          armstub8-2712.asm; DTB reserved-memory atf@0;
+;                          TF-A BL31_LIMIT $80000). Region 9. Nothing of
+;                          ours may live below the image: the Pi 4's
+;                          "below the load address" band DOES NOT EXIST
+;                          on this board.
+;    $00080000..           the image, where the firmware put it (above).
+;                          3,218,860 bytes at b23ec46, so it ends at
+;                          $00391CAB and the low payload window starts at
+;                          the next megabyte, $00400000 - computed by
+;                          HwPayLo(0), never typed.
+;    $00000000..$27FFFFFF  the ARM's DRAM in the first gigabyte (the
+;                          source DTB's /memory ends at $28000000; the
+;                          VideoCore owns $28000000..$3FFFFFFF - vault,
+;                          "MMU and caches on the Pi 5").
+;    $2EFEC600..$2EFFFFFF  the firmware DTB, measured 2026-09-26. Region 10.
+;    $3F800000..$3FBFFFFF  the firmware framebuffer, measured 2026-09-26.
+;                          Region 11.
+;    $00080000..$0FFFFFFF  the compiler's BCM2712 bootstrap envelope
+;                          (LoadAddress, BssAddress and StackAddress sit
+;                          inside it).
+;
+;  SO THE FIXED RECORDS GO ABOVE THE IMAGE, AND FAR ABOVE IT. A fixed
+;  record just above the image would be a ceiling on the image, and the
+;  2026-09-08 ruling removed the last one. The first fixed reservations
+;  above the image are already the payload stack corridor ($07F00000) and
+;  the named bands above it; the records join them ABOVE the monitor's
+;  BSS window, at $0E000000, where they add no new limit on the image and
+;  sit in the ARM's DRAM, inside the bootstrap envelope, below the high
+;  window #PAY1_LO ($10000000) and clear of the DTB and the framebuffer:
+;
+;    $0E000000..$0E000FFF  the boot phase record page (#MON_PHASE_LO),
+;                          with the boot-count word at +$F00 = $0E000F00
+;                          (#SAFETY_COUNT_ADDR, Lib/safety.pi4)  region 6
+;    $0E001000..$0E003FFF  the raw-secondary stacks                region 4
+;    $0E004000..$0E004FFF  the autoboot record (#AB_BASE)           region 2
+;    $0E005000..$0E0FFFFF  claimed by nothing ON PURPOSE: a monitor stack
+;                          that overruns its megabyte walks into this, not
+;                          into a record
+;    $0E100000..$0E1FFFFF  the monitor's own stack, top #MON_STACK =
+;                          $0E200000, growing down                 region 12
+;
+;  The Pi 4 needs no region 12 because its stack is below its image, in
+;  DRAM no window reaches; here it is in the middle of DRAM, and `w`,
+;  `fill` and `copy` must refuse it like every other monitor record.
+;
+;  THE BANDS SHARED WITH THE PI 4 (the DSI framebuffer $08A00000, the
+;  modules $09200000, the capture area $0B000000, the Vulkan heap
+;  $0C000000, BSS $0D000000..$0DFFFFFF, the payload stack corridor
+;  $07F00000..$080FFFFF and #PAY0_HI) are KEPT, not shifted: each one was
+;  checked against the facts above - inside the ARM's DRAM, clear of the
+;  stub, of the image's megabyte, of the DTB and of the framebuffer - and
+;  tools/a64/pi5_memmap_check.py checks it again on every run.
+;
+;  UNMEASURED - SILICON OWED: that $0E000000..$0E004FFF keeps its contents
+;  across a watchdog reset on the Pi 5 (the boot count and the phase
+;  record depend on it). The firmware is known to write kernel= at $80000,
+;  the DTB and its framebuffer; nothing says it writes here, and nothing
+;  yet proves that it does not.
+; ======================================================================
+#MON_STACK    = $0E200000      ; monitor stack top, grows down
+#MON_STACK_LO = $0E100000      ; its megabyte, refused as region 12
+#MON_STACK_HI = $0E1FFFFF
+#MON_LO       = $00080000      ; the Pi 5 firmware's load address (above)
+CompilerElse
 #MON_STACK = $00100000         ; monitor stack top, grows down
 #MON_LO    = $00200000         ; monitor image base (--load-addr,
                                ; CONFIG.TXT kernel_address)
+CompilerEndIf
 
 ; The granularity the map moves in. See THE GRAIN IS ONE MEGABYTE above.
 #MON_GRAIN = $00100000
@@ -138,7 +228,11 @@
 ;  therefore 64-byte aligned, so AutoFlush() still needs exactly one
 ;  cache line for all three words ($1FF000..$1FF017).
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+  #AB_BASE   = $0E004000       ; THE BCM2712 MAP, top of this file
+CompilerElse
 #AB_BASE   = $001FF000
+CompilerEndIf
 #AB_BYTES  = $00001000         ; the whole page is reserved, not 24 bytes:
                                ; a refusal that names a page is one an
                                ; operator can act on, and the page is not
@@ -155,9 +249,15 @@
 ;  core_worker.pi4 is not in the live include graph; these accessors establish
 ;  ownership and monitor protection without activating a secondary core.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+  #CORE_RAW_STACK_LO    = $0E001000   ; THE BCM2712 MAP, top of this file
+  #CORE_RAW_STACK_PAGE  = $00001000
+  #CORE_RAW_STACK_HI    = $0E003FFF
+CompilerElse
 #CORE_RAW_STACK_LO    = $001FC000
 #CORE_RAW_STACK_PAGE  = $00001000
 #CORE_RAW_STACK_HI    = $001FEFFF
+CompilerEndIf
 
 Procedure.i HwCoreRawStackBase(core.i)
   Select core
@@ -251,6 +351,7 @@ CompilerIf #PMF_CHIP = 2712
   #MON_REGION_EL3STUB = 9
   #MON_REGION_DTB     = 10
   #MON_REGION_FWFB    = 11
+  #MON_REGION_STACK   = 12      ; the monitor stack, THE BCM2712 MAP
   #MON_EL3STUB_LO     = $00000000   ; the EL3 stub: DTB atf@0, TF-A BL31_LIMIT
   #MON_EL3STUB_HI     = $0007FFFF
   #MON_FWDTB_LO       = $2EFEC600   ; the firmware DTB, measured 2026-09-26
@@ -482,7 +583,11 @@ CompilerEndIf
 ;
 ;  The rest of the line is reserved and left alone.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+  #MON_PHASE_LO  = $0E000000   ; THE BCM2712 MAP, top of this file
+CompilerElse
 #MON_PHASE_LO    = $001FB000
+CompilerEndIf
 #MON_PHASE_BYTES = $00001000   ; the whole page, as #AB_BASE reserves its
                                ; own: a refusal that names a page is one an
                                ; operator can act on
@@ -1036,7 +1141,7 @@ EndProcedure
 ; ======================================================================
 Procedure.i HwMonRegions()
   CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn 12
+  ProcedureReturn 13
   CompilerElse
   ProcedureReturn 9
   CompilerEndIf
@@ -1047,6 +1152,7 @@ Procedure.i HwMonRegionLo(i.i)
   If i = #MON_REGION_EL3STUB : ProcedureReturn #MON_EL3STUB_LO : EndIf
   If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_LO : EndIf
   If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_LO : EndIf
+  If i = #MON_REGION_STACK : ProcedureReturn #MON_STACK_LO : EndIf
   CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonLo()
@@ -1071,6 +1177,7 @@ Procedure.i HwMonRegionHi(i.i)
   If i = #MON_REGION_EL3STUB : ProcedureReturn #MON_EL3STUB_HI : EndIf
   If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_HI : EndIf
   If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_HI : EndIf
+  If i = #MON_REGION_STACK : ProcedureReturn #MON_STACK_HI : EndIf
   CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonHi()
@@ -1100,6 +1207,9 @@ Procedure HwMonRegionSay(i.i)
     ProcedureReturn
   ElseIf i = #MON_REGION_FWFB
     Print("the firmware framebuffer, measured 2026-09-26")
+    ProcedureReturn
+  ElseIf i = #MON_REGION_STACK
+    Print("this monitor's own stack")
     ProcedureReturn
   EndIf
   CompilerEndIf

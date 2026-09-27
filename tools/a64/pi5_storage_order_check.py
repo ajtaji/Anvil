@@ -41,7 +41,7 @@ import pi5_sd_save_check as SD                        # noqa: E402
 from a64_interp import A64, attach_symbols            # noqa: E402
 from pmf_compiler import resolve_compiler             # noqa: E402
 
-MON_LOAD, STACK, LR = 0x200000, 0x3000000, 0xDEADBEE0
+MON_LOAD, STACK, LR = 0x80000, 0x3000000, 0xDEADBEE0   # the link address (THE BCM2712 MAP)
 UART0 = 0x1F00030000
 PCIE1, PCIE1_SIZE = 0x1000110000, 0x10000
 BOUND_MS = 5000

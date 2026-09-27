@@ -161,7 +161,45 @@ def proc_body(code: str, header_re: str):
     return m.group(0) if m else None
 
 
+_CIF = re.compile(r"^\s*CompilerIf\b(.*)$", re.I)
+_CELSE = re.compile(r"^\s*CompilerElse\b", re.I)
+_CEND = re.compile(r"^\s*CompilerEndIf\b", re.I)
+_CHIP_2712 = re.compile(r"^\s*#PMF_CHIP\s*=\s*2712\s*(;.*)?$", re.I)
+
+
+def without_2712(text: str) -> str:
+    """text with every `CompilerIf #PMF_CHIP = 2712` arm removed (its
+    CompilerElse arm kept). This gate builds and reads the -t pi4 board, and
+    rule 30 puts a Pi 5 difference FIRST in such a block - so a first-match
+    read of the raw text would take the Pi 5's value (THE BCM2712 MAP in
+    memmap.pi4, LoadAddress in board.pi4) for the Pi 4's."""
+    out, stack = [], []          # stack: True while inside a skipped arm
+    for line in text.replace("\r\n", "\n").split("\n"):
+        m = _CIF.match(line)
+        if m:
+            skip_now = any(stack)
+            stack.append(bool(_CHIP_2712.match(m.group(1))))
+            if not skip_now and not stack[-1]:
+                out.append(line)
+            continue
+        if _CELSE.match(line) and stack:
+            was = stack[-1]
+            stack[-1] = False if was else stack[-1]
+            if not any(stack[:-1]) and not was:
+                out.append(line)
+            continue
+        if _CEND.match(line) and stack:
+            was = stack.pop()
+            if not any(stack) and not was:
+                out.append(line)
+            continue
+        if not any(stack):
+            out.append(line)
+    return "\n".join(out)
+
+
 def const(text: str, name: str) -> int:
+    text = without_2712(text)
     m = re.search(r"^\s*#%s\s*=\s*(\$?)([0-9A-Fa-f]+)" % name, text, re.M)
     if not m:
         raise SystemExit("The constant #%s could not be found, so the gate "
@@ -180,7 +218,7 @@ LOAD_RE = r"^\s*LoadAddress\s+\$([0-9A-Fa-f]+)"
 
 
 def load_addr(path: pathlib.Path) -> int:
-    m = re.search(LOAD_RE, path.read_text(encoding="utf-8", errors="replace"),
+    m = re.search(LOAD_RE, without_2712(path.read_text(encoding="utf-8", errors="replace")),
                   re.M)
     if not m:
         raise SystemExit("There is no LoadAddress line in %s, so the image's "

@@ -115,7 +115,13 @@ class Machine:
 
     def __init__(self, img: pathlib.Path, procs: dict, model, windows=(),
                  cntfrq: int = CNTFRQ_PI5, ticks_per_step: int = 1,
-                 load: int = LOAD, stack: int = STACK):
+                 load: int = None, stack: int = None):
+        # LOAD / STACK read NOW, not when this line was defined: the monitor
+        # gates set pi5_desk.LOAD to the monitor's link address before they
+        # build a Machine, and a default bound at import time loaded the
+        # image at $400000 under procedures addressed at the link address.
+        load = LOAD if load is None else load
+        stack = STACK if stack is None else stack
         self.procs = procs
         self.stack = stack
         self.cpu = cpu = A64()

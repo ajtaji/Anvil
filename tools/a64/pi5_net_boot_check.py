@@ -46,7 +46,7 @@ import a64_gem_pi5_check as G                          # noqa: E402
 from a64_interp import A64, AlignmentFault, attach_symbols   # noqa: E402
 from pmf_compiler import resolve_compiler               # noqa: E402
 
-MON_LOAD, STACK, LR = 0x200000, 0x3000000, 0xDEADBEE0
+MON_LOAD, STACK, LR = 0x80000, 0x3000000, 0xDEADBEE0   # the link address (THE BCM2712 MAP)
 UART0 = 0x1F00030000
 MBX = 0x107C013880
 TAG_MAC = 0x00010003

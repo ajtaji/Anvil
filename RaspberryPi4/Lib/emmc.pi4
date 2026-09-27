@@ -2380,7 +2380,11 @@ Procedure.i SdErrorText()
     Case #SD_ERR_NO_CNTFRQ
       ProcedureReturn "sd: CNTFRQ_EL0 is not a usable frequency - cannot bound any wait, nothing attempted"
     Case #SD_ERR_NO_CONTROLLER
+      CompilerIf #PMF_CHIP = 2712
+        ProcedureReturn "sd: nothing answering as SDHCI at $10_00FF_F000 (SLOTISR_VER all-zero or all-ones)"
+      CompilerElse
       ProcedureReturn "sd: nothing answering as SDHCI at $FE340000 (SLOTISR_VER all-zero or all-ones)"
+      CompilerEndIf
     Case #SD_ERR_BAD_VERSION
       ProcedureReturn "sd: host controller version field is not a defined SDHCI version - wrong device?"
     Case #SD_ERR_NO_CAPS
