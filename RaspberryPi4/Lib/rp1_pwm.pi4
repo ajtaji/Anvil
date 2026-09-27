@@ -38,11 +38,10 @@
 ;    drivers/clk/clk-rp1.c CLK_PWM1_CTRL 0x84, DIV_INT 0x88, DIV_FRAC
 ;                          0x8c; CLK_CTRL_ENABLE BIT(11), AUXSRC bits
 ;                          9:5; clk_pwm1's aux parent 2 is the crystal.
-;    pinctrl-rp1.c         banks {0,28,0x0000} {28,6,0x4000}
-;                          {34,20,0x8000}; ctrl = gpio + n*8 + 4, pad =
-;                          pads + bank + 4 + n*4, RIO IN +8, OE +4,
-;                          CLR alias +0x3000; FUNCSEL 5 = gpio (SYS_RIO);
-;                          PIN(45, pwm1, ...) = FUNCSEL 0.
+;    pinctrl-rp1.c         PIN(45, pwm1, ...) = FUNCSEL 0; the pins'
+;                          bank/CTRL/PAD/RIO arithmetic is NOT here - it is
+;                          RaspberryPi4/Lib/gpio_rp1.pi4's (rule 30, since
+;                          2026-09-27; this file used to carry its own copy).
 ;    rp1-peripherals.pdf   3.4 PWM, Tables 25, 26, 31.
 ;  RP1's window: rp1.dtsi 0xc0_40xxxxxx is CPU $1F_00xxxxxx (vault
 ;  HARDWARE-BRINGUP.md; the same reach uart.pi4 uses for RP1 UART0).
@@ -72,6 +71,7 @@
 ;
 ;  REQUIRES (house rule 10 - the board lists every library):
 ;      RaspberryPi4/Lib/timer.pi4     Micros() for Rp1TachMeasure
+;      RaspberryPi4/Lib/gpio_rp1.pi4  GPIO45 and GPIO29 (before this file)
 ; ======================================================================
 
 ; A BUILD FOR ANY OTHER CHIP IS REFUSED, BY NAME. The dialect has no
@@ -87,9 +87,6 @@ CompilerEndIf
 ; ----------------------------------------------------------------------
 #RP1PWM_BASE   = $1F0009C000   ; rp1.dtsi pwm@9c000 (rp1_pwm1)
 #RP1PWM_CLOCKS = $1F00018000   ; rp1.dtsi clocks@18000
-#RP1PWM_IOBANK = $1F000D0000   ; rp1_gpio reg 0 (IO_BANK0..2)
-#RP1PWM_RIO    = $1F000E0000   ; rp1_gpio reg 1 (SYS_RIO0..2)
-#RP1PWM_PADS   = $1F000F0000   ; rp1_gpio reg 2 (PADS_BANK0..2)
 
 ; ----------------------------------------------------------------------
 ;  PWM registers (pwm-rp1.c; rp1-peripherals.pdf Table 25).
@@ -118,36 +115,12 @@ CompilerEndIf
 #RP1PWM_CLK_HZ       = 50000000    ; rp1.dtsi assigned-clock-rates, DIV 1
 
 ; ----------------------------------------------------------------------
-;  The two pins. Addresses derived in the header's formula, written out
-;  so a reader can hold each against pinctrl-rp1.c's bank table.
-;    GPIO45 = bank 2 (base 34, $8000) index 11
-;    GPIO29 = bank 1 (base 28, $4000) index 1
+;  The two pins (dts gpio-line-names GPIO45 "FAN_PWM", GPIO29 "FAN_TACH").
+;  Every register touch on them goes through gpio_rp1.pi4.
 ; ----------------------------------------------------------------------
-#RP1PWM_FAN_GPIO   = 45
-#RP1PWM_FAN_CTRL   = #RP1PWM_IOBANK + $8000 + 11 * 8 + 4   ; $...805C
-#RP1PWM_FAN_PAD    = #RP1PWM_PADS + $8004 + 11 * 4         ; $...8030
-#RP1PWM_FAN_FSEL   = 0                                      ; pwm1
-
+#RP1PWM_FAN_GPIO   = 45            ; = gpio_rp1.pi4 #RP1_GPIO_FAN_PWM
+#RP1PWM_FAN_FSEL   = 0             ; pwm1 (= #RP1_FUNCSEL_PWM1_45)
 #RP1PWM_TACH_GPIO  = 29
-#RP1PWM_TACH_CTRL  = #RP1PWM_IOBANK + $4000 + 1 * 8 + 4    ; $...400C
-#RP1PWM_TACH_PAD   = #RP1PWM_PADS + $4004 + 1 * 4          ; $...4008
-#RP1PWM_TACH_RIO   = #RP1PWM_RIO + $4000                   ; SYS_RIO1
-#RP1PWM_TACH_BIT   = 1 << 1
-#RP1PWM_FSEL_GPIO  = 5
-
-; GPIO CTRL fields cleared when a function is chosen (pinctrl-rp1.c
-; rp1_set_fsel: FUNCSEL, and OUTOVER/OEOVER back to "peripheral").
-#RP1PWM_CTRL_CLEAR = $1F | $3000 | $C000
-; Pad fields (pinctrl-rp1.c RP1_PAD_*).
-#RP1PWM_PAD_PULL   = $0C
-#RP1PWM_PAD_PULLDN = $04           ; RP1_PUD_DOWN << 2 (bias-pull-down)
-#RP1PWM_PAD_PULLUP = $08           ; RP1_PUD_UP << 2
-#RP1PWM_PAD_IE     = $40
-#RP1PWM_PAD_OD     = $80
-
-#RP1PWM_RIO_IN     = $08
-#RP1PWM_RIO_OE     = $04
-#RP1PWM_RIO_CLR    = $3000
 
 ; ----------------------------------------------------------------------
 ;  Design choices, not citations.
@@ -283,12 +256,12 @@ Procedure.i Rp1PwmBegin(hz.i)
   EndIf
 
   ; The pin, last, so the pad first sees a configured channel: FUNCSEL 0
-  ; (pwm1), output from the peripheral, input on, output on, pull-down.
-  v = PeekN(#RP1PWM_FAN_CTRL)
-  PokeL(#RP1PWM_FAN_CTRL, (v & (~#RP1PWM_CTRL_CLEAR)) | #RP1PWM_FAN_FSEL)
-  v = PeekN(#RP1PWM_FAN_PAD)
-  v = (v & (~(#RP1PWM_PAD_PULL | #RP1PWM_PAD_OD))) | #RP1PWM_PAD_IE | #RP1PWM_PAD_PULLDN
-  PokeL(#RP1PWM_FAN_PAD, v)
+  ; (pwm1) with the override fields at "peripheral", input on, output on
+  ; (Rp1FuncSelSet, as rp1_set_fsel), then the dtsi's bias-pull-down.
+  If Rp1FuncSelSet(#RP1PWM_FAN_GPIO, #RP1PWM_FAN_FSEL) = 0
+    ProcedureReturn #RP1PWM_ERR_START
+  EndIf
+  Rp1PinPull(#RP1PWM_FAN_GPIO, #RP1_PULL_DOWN)
 
   rp1pwm_range = r
   rp1pwm_permille = 0
@@ -370,7 +343,7 @@ EndProcedure
 ;  THE TACHOMETER
 ; ======================================================================
 Procedure.i Rp1TachLevel()
-  If (PeekN(#RP1PWM_TACH_RIO + #RP1PWM_RIO_IN) & #RP1PWM_TACH_BIT) <> 0
+  If Rp1DigitalRead(#RP1PWM_TACH_GPIO) = #RP1_PIN_HIGH
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
@@ -380,13 +353,13 @@ EndProcedure
 ; cleared), input enabled, output disabled, pulled UP: the tach output of
 ; a four-wire fan is open-collector. The pull is a choice, not a citation.
 Procedure Rp1TachBegin(nowUs.i)
-  Define v.i
-  v = PeekN(#RP1PWM_TACH_CTRL)
-  PokeL(#RP1PWM_TACH_CTRL, (v & (~#RP1PWM_CTRL_CLEAR)) | #RP1PWM_FSEL_GPIO)
-  PokeL(#RP1PWM_TACH_RIO + #RP1PWM_RIO_CLR + #RP1PWM_RIO_OE, #RP1PWM_TACH_BIT)
-  v = PeekN(#RP1PWM_TACH_PAD)
-  v = (v & (~#RP1PWM_PAD_PULL)) | #RP1PWM_PAD_IE | #RP1PWM_PAD_OD | #RP1PWM_PAD_PULLUP
-  PokeL(#RP1PWM_TACH_PAD, v)
+  ; gpio_rp1.pi4: GPIO function + SYS_RIO OE cleared (input), then the pad's
+  ; output driver off and the pull up. Rp1PinInput enables the pad's output
+  ; driver as rp1_set_fsel does, so OUT_DISABLE is set after it; OE is
+  ; already clear by then, so the pin never drives.
+  Rp1PinInput(#RP1PWM_TACH_GPIO)
+  Rp1PinOutputDisable(#RP1PWM_TACH_GPIO, 1)
+  Rp1PinPull(#RP1PWM_TACH_GPIO, #RP1_PULL_UP)
   rp1tach_last = Rp1TachLevel()
   rp1tach_edges = 0
   rp1tach_total = 0
