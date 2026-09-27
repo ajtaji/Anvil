@@ -1,0 +1,438 @@
+; ======================================================================
+;  gpio_rp1.pi4 - RP1 (BCM2712 / Pi 5 southbridge) general-purpose I/O.
+;  THE ONE FILE THAT KNOWS RP1'S GPIO ENCODING, the RP1 twin of
+;  RaspberryPi4/Lib/gpio.pi4 (which knows the BCM2711's).
+;
+;  RP1's GPIO IS NOT THE BCM2711'S. It is a different peripheral IP block
+;  entirely - three separate register windows (IO_BANK0, SYS_RIO0,
+;  PADS_BANK0) instead of one GPFSEL/GPSET/GPCLR block, and pin direction
+;  lives in a THIRD block (SYS_RIO0) rather than being folded into function
+;  select. Rule 30 (vault RULES.md): a Pi-4-ness-under-CompilerIf pattern is
+;  for the SAME IP with per-chip differences; RP1's GPIO is a DIFFERENT IP,
+;  so it gets its own file rather than a branch inside gpio.pi4 - the same
+;  choice this project already made for RA4M1AndRelated/Lib/gpio.unor4
+;  alongside this one.
+;
+;  Only IO bank 0 (RP1 GPIO0..27, the ones RP1 brings to the Pi 5 40-pin
+;  header) is implemented. Banks 1 and 2 (RP1 GPIO28..53, on-board uses)
+;  are out of scope for this pass and Rp1PinValid() refuses them.
+;
+;  ---- WHERE THE ADDRESSES COME FROM (rule 21: do not guess) -----------
+;
+;  Every address below is read out of two files on disk, both already in
+;  the vault (C:\Users\ajtaj\Desktop\CompilerEmbedded\Raspberry Pi 5\Sources\):
+;
+;    rp1.dtsi        - the RP1 device tree source. Line 482 names the GPIO
+;                       node "gpio@d0000" and its reg property (line 483-485)
+;                       lists THREE windows, RP1-local:
+;                         0x400d0000  size 0xc000   IO_BANK0
+;                         0x400e0000  size 0xc000   SYS_RIO0
+;                         0x400f0000  size 0xc000   PADS_BANK0
+;    pinctrl-rp1.c   - the Linux pinctrl driver, register-bit ground truth.
+;
+;  THE HOST ADDRESS TRANSLATION. RP1-local windows above are 0x400Xnnnn;
+;  the ARM/host physical address that this monitor's PeekL/PokeL must use is
+;  $1F00000000 + (local & $FFFFF) - checked against the one RP1 address this
+;  project has already proven on real hardware: RP1_UART0, printed by the
+;  firmware itself as "0000001f00030000" (vault HARDWARE-BRINGUP.md, the
+;  2026-09-26 boot log), against rp1.dtsi's uart0 node at local 0x40030000.
+;  0x40030000 & $FFFFF = $30000, and $1F00000000 + $30000 = $1F00030000 -
+;  the exact figure the firmware printed. The same arithmetic on the GPIO
+;  node's three windows gives the three bases below.
+;
+;  #PADS_BANK0 IS $1F000F0000, NOT $1F000E0000 OR THE OTHER WAY AROUND.
+;  The order in the dtsi reg property is IO_BANK0, SYS_RIO0, PADS_BANK0, in
+;  that order, at consecutive $10000 strides - so a reviewer can check
+;  three lines against three lines in the dtsi rather than three against a
+;  transcription.
+;
+;  ---- CTRL: FUNCTION SELECT, ONE REGISTER PAIR PER PIN -----------------
+;
+;  pinctrl-rp1.c:1647-1648 - each pin gets an 8-byte pair in IO_BANK0:
+;  STATUS at +0, CTRL at +4 ("j * sizeof(u32) * 2"). So for bank 0 (pin ==
+;  bank offset, since bank 0 starts at RP1 GPIO 0):
+;
+;    CTRL(pin) = #RP1_IO_BANK0_BASE + pin*8 + 4
+;
+;  CTRL's FUNCSEL field is bits [4:0] (pinctrl-rp1.c:66-67, mask $1f). The
+;  function table (pinctrl-rp1.c:481-486, the PIN() macro) lists each pin's
+;  eight alternate functions in COLUMN ORDER, and "gpio" (i.e. SIO / this
+;  driver's plain digital I/O) is always the SIXTH column - so its FUNCSEL
+;  value is always 5, the same on every pin:
+;
+;    PIN(2, spi0, dpi, uart1, i2c1, ir, gpio, proc_rio, pio, spi2)
+;               0     1    2     3   4  ^5      6        7    8
+;
+;  #RP1_FUNCSEL_GPIO = 5, confirmed directly at pinctrl-rp1.c:101
+;  ("#define RP1_FSEL_GPIO 0x05").
+;
+;  ***THIS IS NOT THE BCM2711'S ENCODING AND MUST NOT BE CONFUSED WITH IT.***
+;  gpio.pi4's #PIN_OUTPUT is the raw FSEL code 1 on a BCM2711. On RP1, 5
+;  selects the SIO/plain-GPIO function and DIRECTION IS A SEPARATE REGISTER
+;  (SYS_RIO0's OE, below) - CTRL's FUNCSEL never encodes input-vs-output.
+;
+;  OUTOVER/OEOVER/INOVER (CTRL bits [13:12]/[15:14]/[17:16]) are left at 0
+;  (PERI - "follow the peripheral", pinctrl-rp1.c:108,113,118), which is
+;  also the field's reset value; the Linux driver's own rp1_set_fsel()
+;  writes them explicitly for the SAME reason this file writes CTRL as one
+;  flat value rather than a read-modify-write: FUNCSEL is the only field
+;  this driver's callers ever need to change on this pin, so the whole
+;  register is deterministic (FUNCSEL, three zero override fields) rather
+;  than assembled from a prior read whose other bits nothing here owns.
+;
+;  ---- SYS_RIO0: DIRECTION, LEVEL AND OUTPUT -----------------------------
+;
+;  pinctrl-rp1.c:123-125, offsets inside SYS_RIO0 (bank 0 rio_offset is
+;  0x0000 - pinctrl-rp1.c:293):
+;
+;    +$00  RIO_OUT   the pin's driven level (write; SET/CLR alias below)
+;    +$04  RIO_OE    output-enable, one bit per pin: 0 = input, 1 = output
+;                     (pinctrl-rp1.c:696-707, rp1_get_dir/rp1_set_dir)
+;    +$08  RIO_IN    the pin's ACTUAL level, read-only (rp1_get_value,
+;                     pinctrl-rp1.c:709-711) - the RP1 twin of gpio.pi4's
+;                     GPLEV: what the pad reads, not a shadow of intent.
+;
+;  Bank 0 pins are bits 0..27 of these three words directly (pin->offset ==
+;  the RP1 GPIO number for bank 0, since bank 0's min_gpio is 0).
+;
+;  ---- THE ATOMIC SET/CLR/XOR ALIAS, THE SAME SCHEME TWICE ---------------
+;
+;  pinctrl-rp1.c:43-46: every RP1 register block repeats itself at three
+;  more offsets - RW at +0, XOR at +$1000, SET at +$2000, CLR at +$3000 -
+;  and a SET/CLR write only touches the bits that are 1 in the value
+;  written, leaving every other bit alone. This driver uses SET/CLR for
+;  RIO_OUT and RIO_OE (exactly as pinctrl-rp1.c:702-707 and 714-718 do:
+;  rp1_set_dir and rp1_set_value ONLY ever go through +$2000/+$3000, never
+;  a bare RIO_OUT/RIO_OE write) - the RP1 equivalent of gpio.pi4's
+;  BCM2711 GPSET0/GPCLR0 being separate write-only registers, and for the
+;  same reason: two pins in the same word can be driven by two callers
+;  without one clobbering the other's read-modify-write.
+;
+;  CTRL is NOT accessed through SET/CLR here - FUNCSEL is a 5-bit field,
+;  not independent single bits, so Rp1FuncSelSet does a plain read-modify-
+;  write of the RW copy, the same shape gpio.pi4's PinMode uses for GPFSEL.
+;
+;  ---- PADS_BANK0: THE PULL, AND THE INPUT/OUTPUT ENABLE ----------------
+;
+;  pinctrl-rp1.c:293 (bank 0's pads_offset is $0004 - there is a
+;  bank-wide voltage-select word at +$0000 this driver does not touch) and
+;  1652-1653 ("j * sizeof(u32)"): one 32-bit word per pin.
+;
+;    PAD(pin) = #RP1_PADS_BANK0_BASE + $04 + pin*4
+;
+;  Fields (pinctrl-rp1.c:127-138):
+;    bit 0    SLEWFAST
+;    bit 1    SCHMITT
+;    bits 3:2 PULL        0 = off, 1 = pull DOWN, 2 = pull UP  (Table via
+;                         #define RP1_PUD_OFF/DOWN/UP, pinctrl-rp1.c:94-96)
+;    bits 5:4 DRIVE       2/4/8/12 mA
+;    bit 6    IN_ENABLE   the input buffer; must be 1 to read the pin at all
+;    bit 7    OUT_DISABLE 0 = output driver enabled, 1 = disabled
+;
+;  ***THE PULL ENCODING IS NOT THE BCM2711'S, AND THE NUMBERS DO NOT EVEN
+;  MATCH UP.*** gpio.pi4's #PULL_UP is 1 and #PULL_DOWN is 2 (BCM2711 Table
+;  90). RP1's #RP1_PUD_DOWN is 1 and #RP1_PUD_UP is 2 - THE OTHER WAY
+;  ROUND (pinctrl-rp1.c:94-96). A caller that reused gpio.pi4's #PULL_UP
+;  constant here would silently pull a pin DOWN. #RP1_PULL_NONE/#RP1_PULL_UP/
+;  #RP1_PULL_DOWN are named separately and on purpose, so a call site reads
+;  "Rp1PinPull(pin, #RP1_PULL_UP)" and cannot typo its way into the other
+;  file's numbering.
+;
+;  rp1_set_fsel() (pinctrl-rp1.c:683-684) sets IN_ENABLE and OUT_DISABLE=0
+;  UNCONDITIONALLY for any real function, GPIO included - so on RP1 both
+;  the pad's input buffer and output driver stay enabled all the time, and
+;  it is SYS_RIO0's OE bit, not the pad, that decides whether the pin is
+;  actually driving. Rp1PinMode() sets the pad this way once and leaves it;
+;  Rp1PinPull() only ever touches the PULL field.
+;
+;  ---- MEMORY ORDERING ---------------------------------------------------
+;
+;  Same discipline as gpio.pi4 and the same tool: a64_barrier() (dsb sy +
+;  isb, RaspberryPi4/Intrinsics/bcm2711_hardware.def - the intrinsic name is
+;  inherited from the -t pi4 target and is not BCM2711-specific; -t pi5 is
+;  the same A64 core with a different southbridge). RP1 sits behind PCIe,
+;  which is a stronger reason for a barrier at each peripheral service's
+;  edges than BCM2711's AXI fabric was, not a weaker one.
+;
+;  ---- STATUS -------------------------------------------------------------
+;
+;  Written 2026-09-26. DESK-PROOF ONLY: every address and field is cited
+;  against pinctrl-rp1.c and rp1.dtsi above, and the three base addresses
+;  are cross-checked against the one RP1 address already proven on real
+;  Pi 5 silicon (RP1_UART0, vault HARDWARE-BRINGUP.md). NOTHING IN THIS
+;  FILE HAS DRIVEN A REAL RP1 PIN. "Silicon owed" per the desk-proof brief.
+;
+;  DEPENDENCIES: none. This file includes no other library (house rule 10).
+; ======================================================================
+
+EnableExplicit
+
+; ----------------------------------------------------------------------
+;  THE THREE BOARD-SPECIFIC ADDRESSES. See the header for the derivation.
+; ----------------------------------------------------------------------
+#RP1_IO_BANK0_BASE   = $1F000D0000
+#RP1_SYS_RIO0_BASE   = $1F000E0000
+#RP1_PADS_BANK0_BASE = $1F000F0000
+
+; The atomic alias scheme, pinctrl-rp1.c:43-46 - added to a register's RW
+; offset to reach its XOR/SET/CLR twin.
+#RP1_XOR_OFF = $1000
+#RP1_SET_OFF = $2000
+#RP1_CLR_OFF = $3000
+
+; SYS_RIO0 register offsets, bank 0 (rio_offset = 0 - pinctrl-rp1.c:293).
+#RP1_RIO_OUT_OFF = $00
+#RP1_RIO_OE_OFF  = $04
+#RP1_RIO_IN_OFF  = $08
+
+; CTRL's FUNCSEL field - bits 4:0 (pinctrl-rp1.c:66-67).
+#RP1_FUNCSEL_GPIO = 5          ; pinctrl-rp1.c:101, the SIO/plain-I/O function
+
+; PAD field bits (pinctrl-rp1.c:127-138).
+#RP1_PAD_PULL_SHIFT   = 2
+#RP1_PAD_PULL_MASK3   = 3      ; 2-bit field, pre-shift
+#RP1_PAD_IN_ENABLE    = $40    ; bit 6
+#RP1_PAD_OUT_DISABLE  = $80    ; bit 7
+
+; Pull encodings - NOT gpio.pi4's numbers. pinctrl-rp1.c:94-96.
+#RP1_PULL_NONE = 0
+#RP1_PULL_DOWN = 1             ; <- opposite of gpio.pi4's #PULL_DOWN (2)
+#RP1_PULL_UP   = 2             ; <- opposite of gpio.pi4's #PULL_UP   (1)
+
+#RP1_PIN_LOW  = 0
+#RP1_PIN_HIGH = 1
+
+; Bank 0 only - RP1 GPIO 0..27, the ones this southbridge brings to the
+; Pi 5 40-pin header. Banks 1/2 (28..53) are out of scope for this pass.
+#RP1_PIN_MAX = 27
+
+Global rp1_gpio_bad_pins.i
+
+Procedure Rp1GpioBarrier()
+  a64_barrier()
+EndProcedure
+
+Procedure.i Rp1PinValid(pin.i)
+  If pin < 0 Or pin > #RP1_PIN_MAX
+    rp1_gpio_bad_pins = rp1_gpio_bad_pins + 1
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1ReadReg(addr.i)
+  ProcedureReturn PeekN(addr) & $FFFFFFFF
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Address helpers - one procedure per register family, the same shape
+;  gpio.pi4 uses so the two files are easy to compare line for line.
+; ----------------------------------------------------------------------
+Procedure.i Rp1CtrlAddr(pin.i)
+  ProcedureReturn #RP1_IO_BANK0_BASE + pin * 8 + 4
+EndProcedure
+
+Procedure.i Rp1PadAddr(pin.i)
+  ProcedureReturn #RP1_PADS_BANK0_BASE + 4 + pin * 4
+EndProcedure
+
+Procedure.i Rp1RioBit(pin.i)
+  ProcedureReturn 1 << pin
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1FuncSelSet(pin, funcsel) - the raw 5-bit field. Exposed (not just
+;  Rp1PinMode) because a future caller muxing a pin to i2c1 (funcsel 3 on
+;  RP1 GPIO2/3 - rp1.dtsi's rp1_i2c1_2_3 group, pinctrl-rp1.c:484) needs
+;  this and not "input" or "output". Not yet called by anything in this
+;  file; the I2C bring-up owns that call.
+;
+;  Deterministic write, not read-modify-write: OUTOVER/OEOVER/INOVER are
+;  written 0 (PERI, also the reset value) alongside FUNCSEL, matching
+;  rp1_set_fsel()'s own unconditional write of those three fields
+;  (pinctrl-rp1.c:686-693) - there is no caller of this file that owns any
+;  other bit in CTRL.
+; ----------------------------------------------------------------------
+Procedure.i Rp1FuncSelSet(pin.i, funcsel.i)
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If funcsel < 0 Or funcsel > 31
+    ProcedureReturn 0
+  EndIf
+  Rp1GpioBarrier()
+  PokeL(Rp1CtrlAddr(pin), funcsel)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1FuncSelGet(pin.i)
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  Rp1GpioBarrier()
+  v = Rp1ReadReg(Rp1CtrlAddr(pin)) & $1F
+  Rp1GpioBarrier()
+  ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1PadInit(pin) - the pad-level setup rp1_set_fsel() always does: input
+;  buffer on, output driver enabled (pinctrl-rp1.c:683-684, 654, 660). Every
+;  RP1 function needs this, GPIO included, so Rp1PinMode calls it before
+;  touching CTRL. Preserves the current PULL field (a read-modify-write,
+;  unlike Rp1FuncSelSet's deterministic CTRL write) - pull is this file's
+;  own separate setting and a mode change must not disturb it.
+; ----------------------------------------------------------------------
+Procedure Rp1PadInit(pin.i)
+  Define a.i
+  Define v.i
+  a = Rp1PadAddr(pin)
+  v = Rp1ReadReg(a)
+  v = v | #RP1_PAD_IN_ENABLE
+  v = v & ~#RP1_PAD_OUT_DISABLE
+  PokeL(a, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1PinMode(pin, out) - select the GPIO/SIO function and set the
+;  direction. out <> 0 means output. Returns 1 on success, 0 for a bad pin.
+;
+;  ORDER: pad first (input+output enabled at the pad), then CTRL to the
+;  GPIO function, then SYS_RIO0's OE - the same "configure before you
+;  switch the pin over" discipline gpio.pi4's PinPull-before-PinMode note
+;  argues for, applied to RP1's extra register.
+; ----------------------------------------------------------------------
+Procedure.i Rp1PinMode(pin.i, out.i)
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  Rp1GpioBarrier()
+  Rp1PadInit(pin)
+  PokeL(Rp1CtrlAddr(pin), #RP1_FUNCSEL_GPIO)
+  ; SYS_RIO0 OE, via the SET/CLR alias (pinctrl-rp1.c:702-707): 0 = input,
+  ; 1 = output. A CLR write here means "make this bit 0", not "clear the
+  ; register" - only the named bit is touched.
+  If out <> 0
+    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
+  Else
+    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1PinInput(pin.i)
+  ProcedureReturn Rp1PinMode(pin, 0)
+EndProcedure
+
+Procedure.i Rp1PinOutput(pin.i)
+  ProcedureReturn Rp1PinMode(pin, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1PinModeGet(pin) - 0 (input) or 1 (output) from SYS_RIO0's OE bit, or
+;  -1 for a bad pin. Unlike gpio.pi4's PinModeGet this says nothing about
+;  alternate functions - CTRL's FUNCSEL would have to be read separately
+;  (Rp1FuncSelGet) and is not folded in here, because on RP1 "what function"
+;  and "which way does SIO drive it" are two different registers and
+;  collapsing them the way the BCM2711 wrapper does would hide which one
+;  changed.
+; ----------------------------------------------------------------------
+Procedure.i Rp1PinModeGet(pin.i)
+  Define oe.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  Rp1GpioBarrier()
+  oe = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF)
+  Rp1GpioBarrier()
+  If (oe & Rp1RioBit(pin)) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1DigitalWrite(pin, level) / Rp1DigitalRead(pin) / Rp1PinToggle(pin) -
+;  the RIO_OUT / RIO_IN halves. RIO_OUT is SET/CLR, same reasoning as
+;  gpio.pi4's GPSET/GPCLR: two pins in the same word, two callers, no
+;  read-modify-write to race. RIO_IN is the pad's actual level
+;  (rp1_get_value, pinctrl-rp1.c:709-711) - not a shadow of what was written.
+; ----------------------------------------------------------------------
+Procedure.i Rp1DigitalWrite(pin.i, level.i)
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  Rp1GpioBarrier()
+  If level = #RP1_PIN_LOW
+    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
+  Else
+    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1DigitalRead(pin.i)
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  Rp1GpioBarrier()
+  v = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_IN_OFF)
+  Rp1GpioBarrier()
+  If (v & Rp1RioBit(pin)) <> 0
+    ProcedureReturn #RP1_PIN_HIGH
+  EndIf
+  ProcedureReturn #RP1_PIN_LOW
+EndProcedure
+
+Procedure.i Rp1PinToggle(pin.i)
+  Define lvl.i
+  lvl = Rp1DigitalRead(pin)
+  If lvl < 0
+    ProcedureReturn 0
+  EndIf
+  If lvl = #RP1_PIN_HIGH
+    ProcedureReturn Rp1DigitalWrite(pin, #RP1_PIN_LOW)
+  EndIf
+  ProcedureReturn Rp1DigitalWrite(pin, #RP1_PIN_HIGH)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1PinPull(pin, pull) - #RP1_PULL_NONE / #RP1_PULL_DOWN / #RP1_PULL_UP.
+;  ***THESE NUMBERS ARE NOT gpio.pi4's #PULL_* NUMBERS - SEE THE HEADER.***
+;  Read-modify-write of the PAD word's 2-bit field, same shape gpio.pi4's
+;  PinPull uses for GPIO_PUP_PDN_CNTRL.
+; ----------------------------------------------------------------------
+Procedure.i Rp1PinPull(pin.i, pull.i)
+  Define a.i
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  If pull <> #RP1_PULL_NONE And pull <> #RP1_PULL_UP And pull <> #RP1_PULL_DOWN
+    ProcedureReturn 0
+  EndIf
+  Rp1GpioBarrier()
+  a = Rp1PadAddr(pin)
+  v = Rp1ReadReg(a)
+  v = v & ~(#RP1_PAD_PULL_MASK3 << #RP1_PAD_PULL_SHIFT)
+  v = v | (pull << #RP1_PAD_PULL_SHIFT)
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1PinPullGet(pin.i)
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  Rp1GpioBarrier()
+  v = (Rp1ReadReg(Rp1PadAddr(pin)) >> #RP1_PAD_PULL_SHIFT) & #RP1_PAD_PULL_MASK3
+  Rp1GpioBarrier()
+  ProcedureReturn v
+EndProcedure
+
+Procedure.i Rp1GpioBadPinCount()
+  ProcedureReturn rp1_gpio_bad_pins
+EndProcedure
