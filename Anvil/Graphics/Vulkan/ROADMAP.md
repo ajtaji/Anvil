@@ -47,6 +47,14 @@ desk gate checks the source for one.
 
 ### What this backend still cannot do, and says so
 
+The rotating Pi 4 pyramid demo (`docs/VULKAN_PYRAMID_DEMO_PI4_2026-09-27.md`)
+proves 12 V3D triangle renders and 12 DMA presentations on silicon. Its five
+3D points are still projected on the CPU and its faces sorted there because
+this vertex path accepts pass-through 2D positions and the render pass has no
+depth attachment. GPU vertex transformation and depth testing are the next
+rendering capabilities to add.
+
+
 - **Extents beyond the proved capacity.** The backend accepts linear BGRA8
   images through the V3D planner up to the configured equal width/height
   maximum and derives row pitch from the same rule used by creation and the
