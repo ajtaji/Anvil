@@ -79,7 +79,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[728]
+Global Dim pgReport.i[744]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -90,7 +90,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 727
+  If slot < 0 Or slot > 743
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -98,7 +98,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (728 * 8), slot)
+  PokeI(#PG_OUT + (744 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -3240,6 +3240,54 @@ Procedure.i Main()
   pgPut(716, AnvilVkSubmissionOutstanding())
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
+
+  ; Read the same tight linear image back through the public buffer command.
+  bufci\size = avkImgSize[avkImgSlot(img)] + 64
+  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+  If vkCreateBuffer(dev, @bufci, 0, @copyBuf) <> #VK_SUCCESS : ProcedureReturn pgStop(93) : EndIf
+  vkGetBufferMemoryRequirements(dev, copyBuf, @req)
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @copyMem) <> #VK_SUCCESS : ProcedureReturn pgStop(94) : EndIf
+  If vkBindBufferMemory(dev, copyBuf, copyMem, 0) <> #VK_SUCCESS : ProcedureReturn pgStop(95) : EndIf
+  i = 0
+  While i < bufci\size
+    PokeA(AnvilVkBufferAddress(copyBuf) + i, $D3)
+    i = i + 1
+  Wend
+  copyRegion\bufferOffset = 64
+  copyRegion\bufferRowLength = 0 : copyRegion\bufferImageHeight = 0
+  copyRegion\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  copyRegion\imageSubresource\mipLevel = 0
+  copyRegion\imageSubresource\baseArrayLayer = 0
+  copyRegion\imageSubresource\layerCount = 1
+  copyRegion\imageOffset\x = 0 : copyRegion\imageOffset\y = 0 : copyRegion\imageOffset\z = 0
+  copyRegion\imageExtent\width = #PG_W
+  copyRegion\imageExtent\height = #PG_H
+  copyRegion\imageExtent\depth = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
+  pgPut(717, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(718, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(719, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0 : i = 0
+  While i < avkImgSize[avkImgSlot(img)]
+    If PeekA(AnvilVkBufferAddress(copyBuf) + 64 + i) <> ((i * 37 + 11) & $FF) : count = count + 1 : EndIf
+    i = i + 1
+  Wend
+  pgPut(720, count)
+  count = 0 : i = 0
+  While i < 64
+    If PeekA(AnvilVkBufferAddress(copyBuf) + i) <> $D3 : count = count + 1 : EndIf
+    i = i + 1
+  Wend
+  pgPut(721, count)
+  copyRegion\imageExtent\width = #PG_W - 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
+  pgPut(722, vkEndCommandBuffer(cmd))
+  vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE
+  vkFreeMemory(dev, copyMem, 0) : copyMem = #VK_NULL_HANDLE
 
   ; ------------------------------------------------------------------
   ;  Ordered teardown.

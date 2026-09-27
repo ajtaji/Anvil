@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 728
+REPORT_WORDS = 744
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1598,6 +1598,12 @@ def grade(cpu, rc) -> Grader:
     g.need("whole linear image copy matches every source byte", slot(714), 0)
     g.need("partial image copy invalidates recording", slot(715), ERR_UNSUPPORTED)
     g.need("refused partial image copy leaves no flight", slot(716), 0)
+    g.need("whole image-to-buffer readback records", slot(717), 0)
+    g.need("whole image-to-buffer readback submits", slot(718), 0)
+    g.need("whole image-to-buffer readback completes", slot(719), 0)
+    g.need("whole image-to-buffer readback matches every source byte", slot(720), 0)
+    g.need("readback preserves destination prefix outside the region", slot(721), 0)
+    g.need("partial image-to-buffer readback invalidates recording", slot(722), ERR_UNSUPPORTED)
     g.need("held draw retains its exact pipeline", slot(660), 1)
     g.need("held draw retains its exact descriptor set", slot(661), 1)
     g.need("held draw retains its exact framebuffer", slot(662), 1)
@@ -2188,7 +2194,7 @@ def main() -> int:
     print("  the whole public path runs: eight shader modules, five pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, a sampler, three descriptor set layouts, two pools")
     print("  and three sets, six graphics pipelines over four live slots, ordered render passes with draws,")
-    print("  whole-attachment and clear-only render-pass jobs, a whole linear image copy, multiple submissions and a fence")
+    print("  whole-attachment and clear-only render-pass jobs, linear image copy and readback, multiple submissions and a fence")
     print("  all five shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")
