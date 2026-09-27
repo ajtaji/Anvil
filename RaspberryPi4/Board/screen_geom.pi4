@@ -543,11 +543,37 @@ EndProcedure
 ; the map deliberately remains identity because the HVS mirrors at scan-out.
 ; That yields the intended upright logical image rather than double-mirroring
 ; bytes which are already consumed through the HVS mirror bits.
+CompilerIf #PMF_CHIP = 2712
+; ScrWiden565(v) - one RGB565 word as the $FFRRGGBB a 32 bpp surface holds.
+; Each field widened by bit replication ($1F -> $FF, 0 -> 0): the widening
+; hw_con.pi4's blend read-back and ScrCaptureWiden16 use. BCM2712 only.
+Procedure.i ScrWiden565(v.i)
+  Define r5.i
+  Define g6.i
+  Define b5.i
+  r5 = (v >> 11) & $1F
+  g6 = (v >> 5) & $3F
+  b5 = v & $1F
+  ProcedureReturn (($FF << 24) | (((r5 << 3) | (r5 >> 2)) << 16)) | ((((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2)))
+EndProcedure
+CompilerEndIf
+
 Procedure.i ScrCapturePixel(fb.i, pitch.i, deg.i, panelW.i, panelH.i, x.i, y.i)
   Define px.i
   Define py.i
   px = ScrMapX(deg, x, y, panelW, panelH)
   py = ScrMapY(deg, x, y, panelW, panelH)
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: THE LIVE SURFACE IS RGB565. The only 2-byte raster this
+  ; monitor has is the firmware's HDMI surface when DisplayBytesPerPixel()
+  ; says 2; the kept picture (ScrCaptureWiden16) and every DSI buffer are
+  ; 4. A pixel read from that surface is widened here, so every reader -
+  ; `pic` (CmdPic), `picr` (CmdPicR) and their PC tools - still receives
+  ; the 32-bit $FFRRGGBB words it has always received.
+  If fb = DisplayViewBase() And DisplayBytesPerPixel() = 2
+    ProcedureReturn ScrWiden565(PeekW(fb + py * pitch + px * 2) & $FFFF)
+  EndIf
+  CompilerEndIf
   ProcedureReturn PeekN(fb + py * pitch + px * 4) & $FFFFFFFF
 EndProcedure
 

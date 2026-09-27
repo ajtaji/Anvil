@@ -754,9 +754,19 @@ Procedure.i ScrCaptureSnapshot(*base, *w, *h, *pitch, *rot, *panelW, *panelH, *b
     ProcedureReturn 0
   EndIf
 
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: 2 bytes a pixel is described too - ScrCapturePixel widens the
+  ; live RGB565 surface for `pic`/`picr`, and the one caller that WRITES
+  ; pixels into what this describes (the V3D overlays, banner_clock.pi4)
+  ; refuses 2 by name.
+  If fb = 0 Or pw < 1 Or ph < 1 Or p < (pw * d) Or (d <> 4 And d <> 2)
+    ProcedureReturn 0
+  EndIf
+  CompilerElse
   If fb = 0 Or pw < 1 Or ph < 1 Or p < (pw * d) Or d <> 4
     ProcedureReturn 0
   EndIf
+  CompilerEndIf
   PokeI(*base, fb)
   PokeI(*w, ScrLogicalW(r, pw, ph))
   PokeI(*h, ScrLogicalH(r, pw, ph))
@@ -854,9 +864,6 @@ Procedure.i ScrCaptureWiden16(who.i, x0.i, tier.i)
   Define sx.i
   Define sy.i
   Define v.i
-  Define r5.i
-  Define g6.i
-  Define b5.i
   fb = DisplayViewBase()
   pw = DisplayWidth()
   ph = DisplayHeight()
@@ -874,10 +881,7 @@ Procedure.i ScrCaptureWiden16(who.i, x0.i, tier.i)
     sx = 0
     While sx < pw
       v = PeekW(fb + sy * pitch + sx * 2) & $FFFF
-      r5 = (v >> 11) & $1F
-      g6 = (v >> 5) & $3F
-      b5 = v & $1F
-      PokeL(dst, (($FF << 24) | (((r5 << 3) | (r5 >> 2)) << 16)) | ((((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2))))
+      PokeL(dst, ScrWiden565(v))
       dst = dst + 4
       sx = sx + 1
     Wend
@@ -1064,6 +1068,17 @@ Procedure.i ScrPresentedPixel(x.i, y.i, colour.i)
   EndIf
   px = ScrMapX(rot, x, y, pw, ph)
   py = ScrMapY(rot, x, y, pw, ph)
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the HDMI surface is RGB565 and the callers' colours come from
+  ; DisplayRGB, which already packs 565 for it - so a 2-byte store. A
+  ; 32-bit one here wrote two pixels, the second one garbage.
+  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 2
+    at = fb + py * pitch + px * 2
+    PokeW(at, colour)
+    MmuCleanRange(at, 2)
+    ProcedureReturn 1
+  EndIf
+  CompilerEndIf
   at = fb + py * pitch + px * 4
   PokeL(at, colour)
   MmuCleanRange(at, 4)

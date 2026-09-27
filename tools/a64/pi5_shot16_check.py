@@ -104,7 +104,7 @@ def driver(ov):
         'XIncludeFile "%s"' % REL_FMT,
         proc(geom, "ScrSideways", REL_GEOM), proc(geom, "ScrLogicalW", REL_GEOM), proc(geom, "ScrLogicalH", REL_GEOM),
         proc(geom, "ScrMapX", REL_GEOM), proc(geom, "ScrMapY", REL_GEOM),
-        proc(geom, "ScrCapturePixel", REL_GEOM),
+        proc(geom, "ScrWiden565", REL_GEOM), proc(geom, "ScrCapturePixel", REL_GEOM),
         proc(src, "ScrCaptureSnapshot", REL_SRC),
         proc(src, "ScrCaptureWiden16", REL_SRC),
         proc(src, "ScrCaptureToArea", REL_SRC),
@@ -246,18 +246,18 @@ def gate(ov, work, cc):
 
 
 MUTATIONS = [
-    (REL_SRC, "packing: red and blue fields swapped", "      r5 = (v >> 11) & $1F\n", "      r5 = v & $1F\n"),
-    (REL_SRC, "packing: green read as 5 bits", "      g6 = (v >> 5) & $3F\n", "      g6 = (v >> 5) & $1F\n"),
+    (REL_GEOM, "packing: red and blue fields swapped", "  r5 = (v >> 11) & $1F\n", "  r5 = v & $1F\n"),
+    (REL_GEOM, "packing: green read as 5 bits", "  g6 = (v >> 5) & $3F\n", "  g6 = (v >> 5) & $1F\n"),
     (REL_SRC, "stride: 32 bpp source step", "      v = PeekW(fb + sy * pitch + sx * 2) & $FFFF\n",
      "      v = PeekW(fb + sy * pitch + sx * 4) & $FFFF\n"),
     (REL_SRC, "pitch ignored (width * 2)", "      v = PeekW(fb + sy * pitch + sx * 2) & $FFFF\n",
      "      v = PeekW(fb + sy * pw * 2 + sx * 2) & $FFFF\n"),
-    (REL_SRC, "no widening (plain shift)",
-     "      PokeL(dst, (($FF << 24) | (((r5 << 3) | (r5 >> 2)) << 16)) | ((((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2))))\n",
-     "      PokeL(dst, (($FF << 24) | ((r5 << 3) << 16)) | (((g6 << 2) << 8) | (b5 << 3)))\n"),
+    (REL_GEOM, "no widening (plain shift)",
+     "  ProcedureReturn (($FF << 24) | (((r5 << 3) | (r5 >> 2)) << 16)) | ((((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2)))\n",
+     "  ProcedureReturn (($FF << 24) | ((r5 << 3) << 16)) | (((g6 << 2) << 8) | (b5 << 3))\n"),
     (REL_SRC, "header keeps the source pitch", "  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH,  pw * 4)\n", "  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH,  pitch)\n"),
-    (REL_SRC, "16 bpp still refused", "  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 2\n",
-     "  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 3\n"),
+    (REL_SRC, "16 bpp still refused", "  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 2\n    ProcedureReturn ScrCaptureWiden16",
+     "  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 3\n    ProcedureReturn ScrCaptureWiden16"),
 ]
 
 
