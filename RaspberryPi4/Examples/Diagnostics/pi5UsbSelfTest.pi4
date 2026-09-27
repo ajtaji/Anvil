@@ -18,6 +18,7 @@
 ; ======================================================================
 
 XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
 XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
 
 #RES_MAX = 128
@@ -25,6 +26,24 @@ XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
 Global Dim res.i[#RES_MAX]
 Global nres.i = 0
 Global Dim desc.a[64]
+
+Global gVbusCalls.i = 0
+
+; The VBUS hook, in the shape hw_usb.pi4's hwusb_Rp1Vbus has (that file
+; cannot be built alone): the real gpio_rp1.pi4 asked for GPIO42/43 in
+; function vbus1, and the answer reported to xhci.pi4.
+Procedure GateVbus()
+  Define a.i
+  Define b.i
+  gVbusCalls = gVbusCalls + 1
+  a = Rp1FuncSelSet(42, 2)
+  b = Rp1FuncSelSet(43, 2)
+  If a <> 0 And b <> 0
+    XhciSetVbusState(1)
+  Else
+    XhciSetVbusState(0)
+  EndIf
+EndProcedure
 
 Procedure Chk(v.i)
   If nres < #RES_MAX
@@ -57,6 +76,7 @@ Procedure Main()
   Chk(PcieDmaCpu($1000012340))
 
   ; ---- 2. DWC3 host mode, then the xHCI bring-up ---------------------
+  XhciSetVbusHook(@GateVbus)
   Chk(XhciInit())
   Chk(XhciLastError())
   If XhciReady() = 0
@@ -69,6 +89,11 @@ Procedure Main()
   Chk(XhciMaxPorts())
   Chk(XhciRp1Host())
   Chk(XhciSelectRp1Host(1))       ; refused: the controller is running
+  ; VBUS and root-port power, done by XhciInit before anything walks
+  Chk(gVbusCalls)
+  Chk(XhciVbusState())            ; 0 today: gpio_rp1 is bank 0 only
+  Chk(Rp1GpioBadPinCount())       ; both VBUS pins refused, RP1 untouched
+  Chk(XhciRootPortsPowered())
 
   ; ---- 3. command and event rings, both wrapped ----------------------
   Chk(XhciNoOp())
@@ -84,8 +109,8 @@ Procedure Main()
   Chk(good)
   Chk(XhciSkippedEvents())
 
-  ; ---- 4. port status: SS port 3 trained; USB 2 port 1 unpowered with
-  ;         a high-speed device behind the switch; port 2 empty ---------
+  ; ---- 4. port status after XhciInit powered the root ports: SS port 3
+  ;         trained, a high-speed device on USB 2 port 1, port 2 empty ---
   Chk(XhciFirstConnectedPort())
   Chk(XhciPortSpeed(3))
   Chk(XhciPortConnected(1))

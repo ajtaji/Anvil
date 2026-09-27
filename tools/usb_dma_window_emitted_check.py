@@ -34,11 +34,21 @@ like the silicon did:
   * every byte a read claims is compared with the medium's known content.
 
 Main returns a bitmask of what went wrong. THE GATE REQUIRES BOTH: the tree
-under test returns 0, AND the same probe built from commit 7db5b0a's
-pcie.pi4 (build 173) returns exactly the silicon failure - wrong-data read,
-failed write, rejected flush, dead device, and a PcieDmaOk that approves an
-unreachable buffer. A gate that could not have caught 173 does not get to say
-the next build is safe.
+under test returns 0, AND the same probe built with build 173's defect put
+back into the CURRENT sources returns exactly the silicon failure - wrong-data
+read, failed write, rejected flush, dead device, and a PcieDmaOk that approves
+an unreachable buffer. A gate that could not have caught 173 does not get to
+say the next build is safe.
+
+BUILD 173 IS A MUTATION, NOT A COMMIT. This gate used to `git show 7db5b0a`
+(build 173). That commit was lost in the Anvil public-history reset of
+2026-09-19/22 (single "source baseline" commit a2935e2), so the gate could
+not run. Build 173's whole files cannot be reconstructed faithfully; its
+defect can, from the account above, and BUILD_173 below puts exactly that
+back into the current files: the inbound window programmed 1 GiB (size code
+15 in RC_BAR2 and SCB0) while the DMA check answers from the 3 GiB erratum
+alone. The current mass-storage recovery code stays in, and still cannot
+save a device whose DMA went outside the window - which the gate asserts.
 
 Usage:
   PMF_COMPILER=<PureMetalForge.exe> python tools/usb_dma_window_emitted_check.py
@@ -64,7 +74,17 @@ PCIE = "RaspberryPi4/Lib/pcie.pi4"
 USBMSC = "RaspberryPi4/Lib/usbmsc.pi4"
 XHCI = "RaspberryPi4/Lib/xhci.pi4"
 LOCAL_INTERP = ROOT / "tools" / "a64" / "a64_interp.py"
-BROKEN_REV = "7db5b0a"          # build 173
+# Build 173's defect, applied to the CURRENT sources (see the docstring).
+# Every anchor must match exactly once or the gate refuses to run.
+BUILD_173 = (
+    ("RaspberryPi4/Lib/pcie.pi4", "  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, code)",
+     "  pcie_Poke(#PCIE_MISC_RC_BAR2_CONFIG_LO, 15)"),
+    ("RaspberryPi4/Lib/pcie.pi4", "code << 27)", "15 << 27)"),
+    ("RaspberryPi4/Lib/pcie.pi4",
+     "  limit = #PCIE_DMA_LIMIT\n  If PcieInboundBytes() < limit\n    limit = PcieInboundBytes()\n  EndIf\n"
+     "  If pcie_memBytes > 0 And pcie_memBytes < limit\n    limit = pcie_memBytes\n  EndIf\n",
+     "  limit = #PCIE_DMA_LIMIT\n"),
+)
 DRAM_LO, DRAM_HI = 0x40000000, 0x40100000
 STEP_LIMIT = 40_000_000
 
@@ -1057,9 +1077,14 @@ def describe(mask: int) -> str:
     return ", ".join(v for k, v in names.items() if mask & k) or "none"
 
 
-def git_show(rev: str, path: str) -> str:
-    return subprocess.run(["git", "show", f"{rev}:{path}"], cwd=ROOT, check=True,
-                          capture_output=True, text=True, encoding="utf-8").stdout.replace("\r\n", "\n")
+def build_173(srcs: dict[str, str]) -> dict[str, str]:
+    out = dict(srcs)
+    for rel, old, new in BUILD_173:
+        if out[rel].count(old) != 1:
+            raise SystemExit(f"dma window gate: build-173 anchor matched {out[rel].count(old)} times "
+                             f"in {rel}, not once - re-aim it: {old[:60]!r}")
+        out[rel] = out[rel].replace(old, new)
+    return out
 
 
 def main() -> int:
@@ -1135,8 +1160,9 @@ def main() -> int:
         if result != 0:
             print("usb_dma_window_emitted_check: FAIL - the tree under test fails: " + describe(result))
             return 1
-        broken, _ = execute(a64, build(compiler, work, program(git_show(BROKEN_REV, PCIE), git_show(BROKEN_REV, USBMSC), git_show(BROKEN_REV, XHCI)), "b173"))
-        print(f"  build 173 ({BROKEN_REV}): {describe(broken)}")
+        b173 = build_173({PCIE: pcie, USBMSC: msc, XHCI: xhci})
+        broken, _ = execute(a64, build(compiler, work, program(b173[PCIE], b173[USBMSC], b173[XHCI]), "b173"))
+        print(f"  build 173 (defect reintroduced): {describe(broken)}")
         if broken & SILICON_173 != SILICON_173:
             print(f"usb_dma_window_emitted_check: FAIL - build 173's code gives {broken} ({describe(broken)}), "
                   f"not the silicon failure {SILICON_173} ({describe(SILICON_173)}): this gate would not have caught it")

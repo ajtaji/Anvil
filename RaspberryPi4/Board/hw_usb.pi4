@@ -574,10 +574,45 @@ Procedure.i hwusb_CtrlOut(rt.i, req.i, val.i, idx.i, *src, len.i)
   ProcedureReturn XhciControlOut(rt, req, val, idx, *src, len)
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+  ; ------------------------------------------------------------------
+  ;  THE PI 5 BOARD'S USB POWER SWITCH. bcm2712-rpi-5-b.dts gives
+  ;  &rp1_usb0 pinctrl usb_vbus_pins: GPIO42 USB_VBUS_EN and GPIO43
+  ;  USB_OC_N, function "vbus1" - column 2 of pinctrl-rp1.c's
+  ;  PIN(42/43, gpclk, uart5, vbus1, spi6, i2s2, gpio, proc_rio). Done
+  ;  through RaspberryPi4/Lib/gpio_rp1.pi4 (the GPIO lane's file, included
+  ;  by board.pi4 before this one), run by xhci.pi4 as its VBUS hook once
+  ;  the RP1 link is proven.
+  ;
+  ;  AS OF 2026-09-26 gpio_rp1.pi4 IS BANK 0 ONLY (#RP1_PIN_MAX = 27), so
+  ;  both calls are REFUSED without touching RP1 and the state reported is
+  ;  0 - "the board could not set VBUS". Owed by the GPIO lane: bank 2
+  ;  (GPIO34..53: IO_BANK0 + $8000, PADS + $8004, pinctrl-rp1.c:295) in
+  ;  Rp1FuncSelSet. Until then VBUS is whatever the firmware left.
+  ; ------------------------------------------------------------------
+  #HWUSB_RP1_VBUS_EN = 42
+  #HWUSB_RP1_VBUS_OC = 43
+  #HWUSB_RP1_FSEL_VBUS1 = 2
+  Procedure hwusb_Rp1Vbus()
+    Define a.i
+    Define b.i
+    a = Rp1FuncSelSet(#HWUSB_RP1_VBUS_EN, #HWUSB_RP1_FSEL_VBUS1)
+    b = Rp1FuncSelSet(#HWUSB_RP1_VBUS_OC, #HWUSB_RP1_FSEL_VBUS1)
+    If a <> 0 And b <> 0
+      XhciSetVbusState(1)
+    Else
+      XhciSetVbusState(0)
+    EndIf
+  EndProcedure
+CompilerEndIf
+
 ; Called once, before anything enumerates. Idempotent, so a second caller
 ; costs two stores and changes nothing.
 Procedure HwUsbBindCore()
   UsbCoreSetHost(@hwusb_CtrlIn, @hwusb_CtrlOut)
+CompilerIf #PMF_CHIP = 2712
+  XhciSetVbusHook(@hwusb_Rp1Vbus)
+CompilerEndIf
 EndProcedure
 
 ; ======================================================================
