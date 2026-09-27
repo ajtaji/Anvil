@@ -18,7 +18,7 @@ this directory.
 | `pi4FaultProbe.pi4` | It includes RaspberryPi4/Lib/fault.pi4 (the fault-vector reporting library), which Anvil main does not carry. |
 | `pi4GicProbe.pi4` | It includes RaspberryPi4/Lib/gic.pi4 (the GIC-400 registration library), which Anvil main does not carry; Anvil main's interrupt support is RaspberryPi4/Lib/interrupts.pi4 with a different interface. |
 | `pi4GicTimer.pi4` | It includes RaspberryPi4/Lib/fault.pi4 and RaspberryPi4/Lib/gic.pi4, neither of which Anvil main carries. |
-| `pi4HciProbe.pi4` | It includes RaspberryPi4/Lib/bluetooth.pi4 (the Bluetooth HCI transport), which Anvil main does not carry. |
+| `pi4HciProbe.pi4` | It includes RaspberryPi4/Lib/bluetooth.pi4 (the Bluetooth HCI transport), which Anvil main never carried - it and the gate it names (tools/a64/a64_hci_check.py) were left out of the source baseline. Superseded 2026-09-27 by Anvil/Net/hci.pbi over the HwBt* seam (Board/hw_bt.pi4, Lib/bt_uart.pi4, Lib/bt_uart_7271.pi4), the `bt` command and tools/a64/hci_bt_check.py; kept for its notes on the PL011 routing and the placeholder address. |
 | `pi4HdmiAudioProbe.pi4` | It includes RaspberryPi4/Lib/hdmiaudio.pi4 (the HDMI audio driver), which Anvil main does not carry. |
 | `pi4HdmiAudioTone.pi4` | It includes RaspberryPi4/Lib/hdmiaudio.pi4 (the HDMI audio driver), which Anvil main does not carry. |
 | `pi4KokoroAudioCompile.pi4` | It includes RaspberryPi4/Lib/hdmiaudio.pi4, RaspberryPi4/Lib/kokoro_audio.pi4 and MathLib/onnx/pcm_fp32.pmi, none of which Anvil main carries. |
