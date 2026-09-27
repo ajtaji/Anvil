@@ -25,7 +25,7 @@ graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
 combined `sampler2D` implicit-LOD request from either the measured one-texel
 linear image or the bounded optimal BGRA8 image path. A whole optimal-image
 `vkCmdCopyBufferToImage` upload executes a TFU raster-to-`UIF_NO_XOR` copy;
-rectangular strided linear-image uploads and bounded multi-region linear
+bounded multi-region rectangular strided linear-image uploads (two regions silicon-proved by `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`) and bounded multi-region linear
 `vkCmdCopyImage` and `vkCmdCopyImageToBuffer` transfers execute guarded DMA. Submission revalidates live
 resources before transfer and publishes the final layout only after success. Submission
 and the following sampled draw are both observed through public fences.
@@ -214,7 +214,7 @@ remains missing.
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
 - Buffer/image copies beyond the implemented tightly packed whole-image
-  buffer-to-optimal-image TFU transfer, one rectangular strided buffer-to-linear-image DMA upload, bounded multi-region linear-image DMA
+  buffer-to-optimal-image TFU transfer, bounded multi-region strided buffer-to-linear-image DMA upload, bounded multi-region linear-image DMA
   copy and bounded multi-region strided linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
   clears and multi-range clears remain missing. TFU is not represented as a
   general memcpy.
