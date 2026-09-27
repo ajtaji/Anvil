@@ -61,14 +61,14 @@ LOADER_LR = 0xDEAD0000
 # original pipeline gate. This remains a finite execution ceiling: a valid
 # gate must return, while a mutation-created loop still terminates as an
 # infrastructure failure rather than being misreported as a semantic kill.
-STEP_LIMIT = int(os.environ.get("ANVIL_VK_PIPELINE_STEP_LIMIT", "150000000"))
+STEP_LIMIT = int(os.environ.get("ANVIL_VK_PIPELINE_STEP_LIMIT", "180000000"))
 MMIO = 0xFC000000
 
 IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 744
+REPORT_WORDS = 768
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1623,6 +1623,22 @@ def grade(cpu, rc) -> Grader:
     g.need("rectangular linear buffer-to-image upload publishes destination layout", slot(739), 7)
     g.need("out-of-bounds linear buffer-to-image destination is refused", slot(740), ERR_ARGS)
     g.need("refused buffer-to-image upload leaves no flight", slot(741), 0)
+    g.need("strided linear buffer-to-image upload records", slot(742), 0)
+    g.need("strided linear buffer-to-image upload submits", slot(743), 0)
+    g.need("strided linear buffer-to-image upload completes", slot(744), 0)
+    g.need("strided linear buffer-to-image upload skips padding and preserves pixels", slot(745), 0)
+    g.need("strided linear buffer-to-image upload preserves layout", slot(746), 7)
+    g.need("upload refuses too-short buffer row length", slot(747), ERR_ARGS)
+    g.need("upload refuses too-short buffer image height", slot(748), ERR_ARGS)
+    g.need("refused strided upload leaves no flight", slot(749), 0)
+    g.need("strided image-to-buffer readback records", slot(750), 0)
+    g.need("strided image-to-buffer readback submits", slot(751), 0)
+    g.need("strided image-to-buffer readback completes", slot(752), 0)
+    g.need("strided image-to-buffer readback preserves row padding", slot(753), 0)
+    g.need("strided image-to-buffer readback preserves outer guards", slot(754), 0)
+    g.need("readback refuses too-short buffer row length", slot(755), ERR_ARGS)
+    g.need("readback refuses too-short buffer image height", slot(756), ERR_ARGS)
+    g.need("refused strided readback leaves no flight", slot(757), 0)
     g.need("held draw retains its exact pipeline", slot(660), 1)
     g.need("held draw retains its exact descriptor set", slot(661), 1)
     g.need("held draw retains its exact framebuffer", slot(662), 1)

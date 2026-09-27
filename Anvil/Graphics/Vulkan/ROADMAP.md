@@ -24,7 +24,7 @@ dependency.
 graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
 combined `sampler2D` implicit-LOD request from either the measured one-texel
 linear image or the bounded optimal BGRA8 image path. The optimal path records
-one tightly packed whole-image `vkCmdCopyBufferToImage`, revalidates and retains
+one whole optimal-image or rectangular strided linear-image `vkCmdCopyBufferToImage`, revalidates and retains
 both live resources at submission, executes a TFU raster-to-`UIF_NO_XOR` copy,
 and publishes shader-read layout only after successful completion. Submission
 and the following sampled draw are both observed through public fences.
@@ -213,8 +213,8 @@ remains missing.
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
 - Buffer/image copies beyond the implemented tightly packed whole-image
-  buffer-to-optimal-image TFU transfer, one rectangular buffer-to-linear-image DMA upload, one rectangular linear-image DMA
-  copy and one rectangular linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
+  buffer-to-optimal-image TFU transfer, one rectangular strided buffer-to-linear-image DMA upload, one rectangular linear-image DMA
+  copy and one rectangular strided linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
   clears and multi-range clears remain missing. TFU is not represented as a
   general memcpy.
 - Queries, timestamps, conditional behavior, dynamic state other than the

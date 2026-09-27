@@ -32,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -130,6 +130,8 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @copyCmd) <> #VK_SUCCESS : status = 45 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @rectReadCmd) <> #VK_SUCCESS : status = 54 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @uploadCmd) <> #VK_SUCCESS : status = 65 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @strideUploadCmd) <> #VK_SUCCESS : status = 74 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @strideReadCmd) <> #VK_SUCCESS : status = 75 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -283,6 +285,74 @@ Procedure.i Main()
       If status = 73 : Break : EndIf
     Next
     If status = 73 : Break : EndIf
+
+    For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
+    For k = 0 To 12
+      For j = 0 To 22
+        If j < 17
+          PokeL(bufMap + 64 + (k * 23 + j) * 4, #VIR_EXPECT)
+        Else
+          PokeL(bufMap + 64 + (k * 23 + j) * 4, $C7C7C7C7)
+        EndIf
+      Next
+    Next
+    For i = 0 To #VIR_DST_BYTES - 1 : PokeA(dstMap + i, $A5) : Next
+    region\bufferRowLength = 23 : region\bufferImageHeight = 15
+    If vkBeginCommandBuffer(strideUploadCmd, @bi) <> #VK_SUCCESS : status = 76 : Break : EndIf
+    vkCmdCopyBufferToImage(strideUploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+    If vkEndCommandBuffer(strideUploadCmd) <> #VK_SUCCESS : status = 77 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 78 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = strideUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 79 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 80 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 13 Or DmaQuiescent() = 0 : status = 81 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 82 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 83 : Break : EndIf
+      Next
+      If status = 83 : Break : EndIf
+    Next
+    If status = 83 : Break : EndIf
+
+    For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
+    region\imageOffset\x = 3 : region\imageOffset\y = 5
+    If vkBeginCommandBuffer(strideReadCmd, @bi) <> #VK_SUCCESS : status = 84 : Break : EndIf
+    vkCmdCopyImageToBuffer(strideReadCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @region)
+    If vkEndCommandBuffer(strideReadCmd) <> #VK_SUCCESS : status = 85 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 86 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = strideReadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 87 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 88 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 13 Or DmaQuiescent() = 0 : status = 89 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 90 : Break : EndIf
+    For k = 0 To 12
+      For j = 0 To 22
+        If j < 17
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(bufMap + 64 + (k * 23 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 91 : Break : EndIf
+      Next
+      If status = 91 : Break : EndIf
+    Next
+    If status = 91 : Break : EndIf
+    For i = 0 To 63
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 92 : Break : EndIf
+    Next
+    If status = 92 : Break : EndIf
+    For i = 64 + 13 * 23 * 4 To #VIR_BUFFER_BYTES - 1
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 93 : Break : EndIf
+    Next
+    If status = 93 : Break : EndIf
     status = 0
   Until 1
 
