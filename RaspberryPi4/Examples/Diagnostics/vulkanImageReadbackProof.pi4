@@ -1,4 +1,5 @@
-; Pi 4 RAM diagnostic: V3D clear followed by public Vulkan DMA image readback.
+; Pi 4 RAM diagnostic: V3D clear, whole and rectangular DMA readback,
+; and rectangular DMA image copy through the public Vulkan commands.
 ; Compile for load $600000, stack $4F00000, returning entry. Use the board
 ; lease, DMA console, 15-second deadman, and a fresh return screenshot.
 
@@ -31,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -127,6 +128,7 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @clearCmd) <> #VK_SUCCESS : status = 22 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @readCmd) <> #VK_SUCCESS : status = 23 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @copyCmd) <> #VK_SUCCESS : status = 45 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @rectReadCmd) <> #VK_SUCCESS : status = 54 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -229,6 +231,32 @@ Procedure.i Main()
       If status = 53 : Break : EndIf
     Next
     If status = 53 : Break : EndIf
+
+    For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
+    region\imageOffset\x = 3 : region\imageOffset\y = 5
+    region\imageExtent\width = 17 : region\imageExtent\height = 13
+    If vkBeginCommandBuffer(rectReadCmd, @bi) <> #VK_SUCCESS : status = 55 : Break : EndIf
+    vkCmdCopyImageToBuffer(rectReadCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @region)
+    If vkEndCommandBuffer(rectReadCmd) <> #VK_SUCCESS : status = 56 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 57 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = rectReadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 58 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 59 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 13 Or DmaQuiescent() = 0 : status = 60 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 61 : Break : EndIf
+    For i = 0 To 63
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 62 : Break : EndIf
+    Next
+    If status = 62 : Break : EndIf
+    For i = 0 To 220
+      If (PeekL(bufMap + 64 + i * 4) & $FFFFFFFF) <> #VIR_EXPECT : status = 63 : Break : EndIf
+    Next
+    If status = 63 : Break : EndIf
+    For i = 64 + 17 * 13 * 4 To #VIR_BUFFER_BYTES - 1
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 64 : Break : EndIf
+    Next
+    If status = 64 : Break : EndIf
     status = 0
   Until 1
 

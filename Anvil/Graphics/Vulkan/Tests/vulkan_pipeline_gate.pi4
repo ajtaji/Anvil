@@ -3321,10 +3321,47 @@ Procedure.i Main()
     i = i + 1
   Wend
   pgPut(721, count)
-  copyRegion\imageExtent\width = #PG_W - 1
+  i = 0
+  While i < bufci\size
+    PokeA(AnvilVkBufferAddress(copyBuf) + i, $D3)
+    i = i + 1
+  Wend
+  copyRegion\imageOffset\x = 3 : copyRegion\imageOffset\y = 5
+  copyRegion\imageExtent\width = 17 : copyRegion\imageExtent\height = 13
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
   pgPut(722, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(728, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(729, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To 12
+    For j = 0 To 16
+      For i = 0 To 3
+        rc = (((k + 5) * #PG_W + (j + 3)) * 4 + i) * 37 + 11
+        If PeekA(AnvilVkBufferAddress(copyBuf) + 64 + (k * 17 + j) * 4 + i) <> (rc & $FF) : count = count + 1 : EndIf
+      Next
+    Next
+  Next
+  pgPut(730, count)
+  count = 0
+  For i = 0 To 63
+    If PeekA(AnvilVkBufferAddress(copyBuf) + i) <> $D3 : count = count + 1 : EndIf
+  Next
+  For i = 64 + 17 * 13 * 4 To bufci\size - 1
+    If PeekA(AnvilVkBufferAddress(copyBuf) + i) <> $D3 : count = count + 1 : EndIf
+  Next
+  pgPut(731, count)
+  copyRegion\imageOffset\x = 60
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
+  pgPut(732, vkEndCommandBuffer(cmd))
+  copyRegion\imageOffset\x = 3
+  copyRegion\bufferOffset = bufci\size - 4
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @copyRegion)
+  pgPut(733, vkEndCommandBuffer(cmd))
+  pgPut(734, AnvilVkSubmissionOutstanding())
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE
   vkFreeMemory(dev, copyMem, 0) : copyMem = #VK_NULL_HANDLE
 
