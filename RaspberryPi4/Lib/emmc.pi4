@@ -760,14 +760,20 @@ CompilerEndIf
 #SD_CMD0  = $00000000
 ; CMD2  ALL_SEND_CID        arg 0            R2
 ;
-; RESPONSE TYPE 01, NOT 10. Both R2 commands were $0x0A0000 - type 10, a
-; 48-bit window - from the source baseline until 2026-09-27, when the Pi 5
-; card refused CMD2 with CMD_CRC | CMD_END_BIT (INT $00068001) and the same
-; card answered $02090000 with its CID (sd2712_probe, Ron's Pi 5). The 136
-; bits of an R2 do not fit a 48-bit window, so no card ever passed CMD2
-; here, on either chip. tools/a64/pi5_sd_save_check.py's card now refuses a
-; command whose response type is not the one its response has.
-#SD_CMD2  = $02090000
+; BCM2712: RESPONSE TYPE 01 (136 bits). On 2026-09-27 the Pi 5's SDHCI
+; refused CMD2 sent as $020A0000 (type 10, a 48-bit window) with CMD_CRC |
+; CMD_END_BIT (INT $00068001), and the same card answered $02090000 with its
+; CID (sd2712_probe, Ron's Pi 5, over COM4). tools/a64/pi5_sd_save_check.py's
+; card refuses a command sent with the wrong response shape.
+; THE PI 4 KEEPS $020A0000, ON THE OWNER'S WORD THAT ITS CARD PATH WORKS: the
+; BCM2711 build is left byte-identical. Why type 10 would pass there is not
+; established (vault Bugs, "R2 as a 48-bit response"); do not "fix" it
+; without a Pi 4 silicon run.
+CompilerIf #PMF_CHIP = 2712
+  #SD_CMD2  = $02090000
+CompilerElse
+#SD_CMD2  = $020A0000
+CompilerEndIf
 ; CMD3  SEND_RELATIVE_ADDR  arg 0            R6
 #SD_CMD3  = $031A0000
 ; CMD7  SELECT_CARD         arg RCA<<16      R1b
@@ -775,7 +781,11 @@ CompilerEndIf
 ; CMD8  SEND_IF_COND        arg $1AA         R7
 #SD_CMD8  = $081A0000
 ; CMD9  SEND_CSD            arg RCA<<16      R2
-#SD_CMD9  = $09090000                 ; R2: type 01 + CRC check, as CMD2
+CompilerIf #PMF_CHIP = 2712
+  #SD_CMD9  = $09090000               ; R2: type 01 + CRC check, as CMD2
+CompilerElse
+#SD_CMD9  = $090A0000
+CompilerEndIf
 ; CMD13 SEND_STATUS         arg RCA<<16      R1
 #SD_CMD13 = $0D1A0000
 ; CMD16 SET_BLOCKLEN        arg 512          R1
