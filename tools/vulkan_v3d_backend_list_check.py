@@ -20,7 +20,7 @@ CONTRACTS = (
     "avkV3dCleanCacheIntervals()", "avkV3dCacheIntervalAdd", "If *d\\sampleMask <> 0",
     "If began <> 0", "packetBytes > (Neon_BclBytes() - 8192)",
     "avkV3dNormalizeScissor", "V3dClClipWindow(sc\\x, sc\\y, sc\\w, sc\\h)",
-    "avkV3dDrawViewportHalfWidthBits", "*d\\viewportW <> *d\\width",
+    "avkV3dDrawViewportHalfWidthBits", "*d\\viewportW > *d\\width",
     "V3dCacheBatchBegin()", "V3dCacheBatchRange(firstByte, endByte - firstByte)",
     "batchRc = V3dCacheBatchEnd()",
     "V3dClIndexBufferSetup(*d\\indexBase, *d\\indexBytes)",
@@ -92,7 +92,7 @@ def execute(interp: pathlib.Path, image: pathlib.Path, ceiling=200_000_000):
 def u64(cpu, addr): return sum(cpu.memory.get(addr+i, 0) << (8*i) for i in range(8))
 
 def grade(cpu, rc, stress_n=3505, admission_n=4096):
-    s = [u64(cpu, OUT+i*8) for i in range(120)]; bad=[]
+    s = [u64(cpu, OUT+i*8) for i in range(137)]; bad=[]
     def need(name, i, want):
         if s[i] != want: bad.append(f"{name}: got {s[i]:#x}, expected {want:#x}")
     need("return", -1, OUT) if False else None
@@ -128,6 +128,13 @@ def grade(cpu, rc, stress_n=3505, admission_n=4096):
       ("index range refused",112,(-1)&0xffffffffffffffff),("index range pre-begin",113,0),("index range pre-allocation",114,0),
       ("max vertex refused",115,(-1)&0xffffffffffffffff),("max vertex pre-begin",116,0),("max vertex pre-allocation",117,0),
       ("selected index cache start",118,0x02202004),("selected index cache bytes",119,6),
+      ("subviewport rc",120,0),("subviewport scaling packet",121,1),("subviewport offset packet",122,1),
+      ("subviewport X scaling",123,0x45800000),("subviewport Y scaling",124,0x45800000),
+      ("subviewport fine X",125,4096),("subviewport fine Y",126,4096),
+      ("subviewport clip packet",127,1),("subviewport clip width",128,32),("subviewport clip height",129,32),
+      ("subviewport primitive",130,1),("oversized viewport refused",131,(-1)&0xffffffffffffffff),
+      ("oversized viewport pre-begin",132,0),("oversized viewport pre-allocation",133,0),
+      ("indexed subviewport rc",134,0),("indexed subviewport packet",135,1),("indexed subviewport excludes array packet",136,0),
     ): need(name,i,w)
     if 0x03000000 <= s[57] < 0x03000000 + 4096*896: bad.append("stable record pointer still aliases the freed arena")
     return bad
@@ -144,7 +151,7 @@ def main():
         t0=time.perf_counter(); cpu,rc,steps=execute(interp,build(compiler)); elapsed=time.perf_counter()-t0; bad=grade(cpu,rc)
       if bad:
         print("vulkan_v3d_backend_list_check: FAIL"); [print("  "+x) for x in bad]; return 1
-      print(f"vulkan_v3d_backend_list_check: PASS - 100 property checks over 1/3/{3505}/4096 lists, {steps:,} A64 instructions, {elapsed:.3f}s")
+      print(f"vulkan_v3d_backend_list_check: PASS - 117 property checks over 1/3/{3505}/4096 lists, {steps:,} A64 instructions, {elapsed:.3f}s")
       print("  3505 is LIVE; 4096 is admission-only (sampleMask zero); physical cache union, one-barrier transaction, lifetime, transitions and rollback passed")
     if not args.mutate: return 0
     misses=0; gate_src=GATE.read_text(encoding="utf-8")

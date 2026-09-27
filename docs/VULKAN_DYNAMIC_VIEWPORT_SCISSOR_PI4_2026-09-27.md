@@ -20,13 +20,36 @@ same clear colour `(13,26,51,255)`. The image bounds show the final draw
 was clipped to the requested half-size scissor after viewport mapping.
 
 An initial trial requested a 400×640 viewport on the 799×1279 framebuffer.
-`vkCmdDraw` refused it before submission with `ANVIL_VK_ERR_UNSUPPORTED`
-and the recorded sentence that the dynamic viewport must equal the active
-framebuffer geometry. Capture 98 and the 256-byte report are preserved with
-the passing capture. This is the current API limit: a reusable pipeline can
-resize between different full-target framebuffer geometries, but a viewport
-smaller than its active framebuffer is not accepted. A two-framebuffer
-resize proof remains open.
+At that time `vkCmdDraw` refused it before submission with
+`ANVIL_VK_ERR_UNSUPPORTED`; capture 98 and the 256-byte report preserve
+that exact earlier boundary. The first accepted dynamic-state proof above
+used a full-target viewport and half-size scissor in capture 99.
+
+The follow-up removes that full-target restriction for one origin-zero
+whole-pixel viewport contained by the active framebuffer. It keeps the
+per-draw QPU scale, V3D clipper scale and fine viewport offset matched to
+the draw's dimensions. The same diagnostic now alternates both viewport
+and scissor sizes. Build 210 at 192.168.1.111 verified the 1,021,000-byte
+PMFBOOT payload (SHA-256
+`31a3f09e189207dd310ad9387e779a3af487b4ec4a7509aaa1d5a4594a325a38`)
+at `$600000`, returned `x0=0` in 9.2 seconds, and saved capture 100. Both
+pyramid faces are visible in the smaller region: 20,937 magenta pixels at
+X=136..458, Y=563..701, and 10,521 cyan pixels at X=138..459, Y=514..599.
+Capture 99's scissor-only result had no cyan pixels. The smaller image
+therefore proves viewport mapping changed on the GPU, not just clipping.
+The exact payload, screenshot and monitor metadata are in
+`docs/evidence/vulkan-subviewport-20260927/`. Viewports translated from
+the origin, larger than the framebuffer, fractional, flipped or with a
+nonstandard depth range remain unsupported. A two-framebuffer resize proof
+remains open.
+
+The emitted V3D draw-list gate passed 117 checks over 30,626,669 interpreted
+A64 instructions. Its new cases observe the 32×32 clipper scale and fine
+viewport offset, a completed indexed draw, and refusal of a 65×64 viewport
+on a 64×64 target before allocation or frame begin. The ordinary Pi 4 image
+compiled at 4,365,196 bytes as build 216. Its raw image and PMFBOOT container
+are retained beside capture 100; the raw image SHA-256 is
+`7aaf51140dc0b5fa41e0295b8e88a2f8e79b01b5632dcca1ccbf76514487847e`.
 
 Both runs were RAM-only. The deadman stopped, the capture was consumed,
 the board lease was released, and no flash, reset or boot-medium write

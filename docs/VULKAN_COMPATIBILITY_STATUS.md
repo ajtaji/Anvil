@@ -326,7 +326,7 @@ one gets a compile-time refusal naming it.
 | `vkCmdBindIndexBuffer` | Implemented for one live, same-device, bound buffer carrying `VK_BUFFER_USAGE_INDEX_BUFFER_BIT`, at an element-aligned offset, with `VK_INDEX_TYPE_UINT16` or `VK_INDEX_TYPE_UINT32`. The generation-tagged binding is re-resolved at submit. |
 | `vkCmdPushConstants` | Implemented for the whole sixteen-byte fragment-stage block at offset 0. |
 | `vkCmdSetScissor` | Implemented for `firstScissor` zero and one `VkRect2D`. A pipeline may declare dynamic scissor alone or with dynamic viewport; reset clears the supplied state, a nonempty draw requires it, and each draw snapshots its rectangle so later changes cannot alter earlier records. Signed offsets and unsigned extents are normalized without overflow by the backend; empty and wholly out-of-bounds rectangles become a zero-size clip. |
-| `vkCmdSetViewport` | Implemented for one origin-zero whole-pixel viewport with depth range exactly zero to one. A pipeline declaring `VK_DYNAMIC_STATE_VIEWPORT` must also declare dynamic scissor; every draw snapshots both. The viewport must equal the active framebuffer extent. A 12-frame dynamic viewport/scissor pyramid ran on Pi 4, with exact visible clipping in capture 99; see `docs/VULKAN_DYNAMIC_VIEWPORT_SCISSOR_PI4_2026-09-27.md`. |
+| `vkCmdSetViewport` | Implemented for one origin-zero whole-pixel viewport with depth range exactly zero to one. A pipeline declaring `VK_DYNAMIC_STATE_VIEWPORT` must also declare dynamic scissor; every draw snapshots both. The viewport may be smaller than its active framebuffer, with QPU scale and V3D clipper/offset following each draw. A 12-frame pyramid showed full-target scissor clipping in capture 99 and true half-target viewport mapping in capture 100; see `docs/VULKAN_DYNAMIC_VIEWPORT_SCISSOR_PI4_2026-09-27.md`. |
 | `vkCmdDraw` | Implemented for one instance and a vertex range inside every bound buffer. A zero vertex count is a no-op and consumes no backend draw slot. A command buffer snapshots up to 4,096 ordered draws, including the active pipeline, bindings, push data and generation-safe resource ledger. `TRIANGLE_LIST` accepts any positive vertex count; its primitive assembler discards an incomplete final triangle. |
 | `vkCmdDrawIndexed` | Implemented for one instance, `firstInstance = 0`, `vertexOffset = 0`, a bound UINT16/UINT32 index buffer and the existing triangle-list pipeline slice. Recording and submit both use subtraction-based range checks; submit scans the selected coherent indices, bounds every vertex fetch through their maximum, includes the exact index range in cache maintenance, and retains the index buffer and memory through completion. `firstIndex` is encoded exactly once as a byte offset in the V3D indexed-primitive packet. |
 
@@ -338,8 +338,8 @@ a binding nothing reads is refused rather than ignored; attributes at locations
 `R32G32B32A32_SFLOAT`, each naming one of those bindings and fitting inside
 THAT binding's stride; `VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST` with no primitive restart; one
 viewport and one scissor. The viewport begins at the origin and has
-whole-pixel extents. Dynamic viewport requires dynamic scissor and must cover
-the active framebuffer; dynamic scissor can also stand alone. Fill mode, no
+whole-pixel extents. Dynamic viewport requires dynamic scissor and must fit
+inside the active framebuffer; dynamic scissor can also stand alone. Fill mode, no
 culling, no depth bias, no depth clamp, no rasteriser discard; one sample;
 `pSampleMask` either null (sample zero enabled) or naming one word whose bit
 zero controls that sample; every channel written, with blending either disabled

@@ -9,6 +9,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #V3D_OK = 0
 #V3D_ERR_CL_ARGS = 27
 #NEON_OK = 0
+#DSP_DMA_LINKED = 0
 #NEON_ERR_LIST = 12
 #V3D_OFMT_RGBA8 = 1
 #V3D_BF_SRC_ALPHA = 6
@@ -51,6 +52,11 @@ Global gateVertexFirst1.i
 Global gateVertexBytes1.i
 Global gateViewportScale.i
 Global gateViewportOffset.i
+Global gateScaleX.i
+Global gateScaleY.i
+Global gateOffsetX.i
+Global gateOffsetY.i
+Global gateDynamicViewport.i
 Global gateClip.i
 Global gateClipX.i
 Global gateClipY.i
@@ -82,9 +88,13 @@ Global gateCacheBatchBarriers.i
 
 Procedure.i V3dTfuBegin(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dTfuSourceRaster(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dTfuDest(a.i,b.i,c.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dTfuSubmit() : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dTfuWait(a.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTileSizeIndex(a.i,b.i,c.i,d.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i V3dTileWidthOf(a.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i V3dTileHeightOf(a.i) : ProcedureReturn 64 : EndProcedure
 Procedure.i V3dError() : ProcedureReturn 0 : EndProcedure
 Procedure.i V3dCounterHz() : ProcedureReturn 54000000 : EndProcedure
 Procedure.i V3dTicks() : ProcedureReturn 0 : EndProcedure
@@ -129,11 +139,11 @@ Procedure.i V3dCacheBatchEnd()
 EndProcedure
 
 Procedure.i V3dCfgBitsWord(a.i,b.i,c.i,d.i) : ProcedureReturn 3 | (d << 12) : EndProcedure
-Procedure V3dClClipperXyScaling(a.i,b.i) : gateViewportScale = gateViewportScale + 1 : EndProcedure
+Procedure V3dClClipperXyScaling(a.i,b.i) : gateViewportScale = gateViewportScale + 1 : gateScaleX = a : gateScaleY = b : EndProcedure
 Procedure V3dClClipWindow(a.i,b.i,c.i,d.i)
   gateClip=gateClip+1 : gateClipX=a : gateClipY=b : gateClipW=c : gateClipH=d
 EndProcedure
-Procedure V3dClViewportOffset(a.i,b.i,c.i,d.i) : gateViewportOffset = gateViewportOffset + 1 : EndProcedure
+Procedure V3dClViewportOffset(a.i,b.i,c.i,d.i) : gateViewportOffset = gateViewportOffset + 1 : gateOffsetX = a : gateOffsetY = c : EndProcedure
 Procedure V3dClCfgBits(a.i) : gateCfg = gateCfg + 1 : EndProcedure
 Procedure V3dClBlendEnables(a.i) : gateBlendEnable = gateBlendEnable + 1 : EndProcedure
 Procedure V3dClBlendCfg(a.i,b.i,c.i,d.i,e.i,f.i,g.i) : gateBlendCfg = gateBlendCfg + 1 : EndProcedure
@@ -186,8 +196,8 @@ EndProcedure
 
 Procedure.i AnvilVkPipelineViewportWidth(p.i) : ProcedureReturn 64 : EndProcedure
 Procedure.i AnvilVkPipelineViewportHeight(p.i) : ProcedureReturn 64 : EndProcedure
-Procedure.i AnvilVkPipelineDynamicViewport(p.i) : ProcedureReturn 0 : EndProcedure
-Procedure.i avkqF32FromInt(v.i) : If v=8192 : ProcedureReturn $46000000 : EndIf : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineDynamicViewport(p.i) : ProcedureReturn gateDynamicViewport : EndProcedure
+Procedure.i avkqF32FromInt(v.i) : If v=8192 : ProcedureReturn $46000000 : EndIf : If v=4096 : ProcedureReturn $45800000 : EndIf : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineUsesPushConstants(p.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineUsesUniformBuffer(p.i) : ProcedureReturn gateUseUbo[p] : EndProcedure
 Procedure.i AnvilVkPipelineUsesSampledImage(p.i) : ProcedureReturn gateUseSample[p] : EndProcedure
@@ -235,6 +245,7 @@ Procedure ResetObs()
   gateCache=0 : gateSlotCache=0 : gateVertexCache=0
   gateCacheBatchOpen=0 : gateCacheBatchRanges=0 : gateCacheBatchBarriers=0
   gateViewportScale=0 : gateViewportOffset=0 : gateCfg=0 : gateBlendEnable=0
+  gateScaleX=0 : gateScaleY=0 : gateOffsetX=0 : gateOffsetY=0
   gateClip=0 : gateClipX=0 : gateClipY=0 : gateClipW=0 : gateClipH=0
   gateBlendCfg=0 : gateVary=0 : gateShader=0 : gatePrim=0 : gateClError=0
   gateIndexed=0 : gateIndexSetup=0 : gateIndexBase=0 : gateIndexBytes=0
@@ -385,5 +396,28 @@ Procedure.i Main()
   draws[0]\vertexCount=3 : draws[0]\maxVertex=$200000
   ResetObs() : rc=avkBackendSubmitDraw(@list)
   Put(115,rc) : Put(116,gateBegin) : Put(117,gateAlloc)
+
+  ; A dynamic sub-viewport must retain its own exact shader scale and V3D
+  ; clipper/offset packets inside a larger 64x64 attachment. An oversized
+  ; viewport must fail the complete list before any frame or allocation.
+  gateDynamicViewport=1
+  Fill(1,1) : draws[0]\viewportW=32 : draws[0]\viewportH=32
+  draws[0]\scissorW=32 : draws[0]\scissorH=32
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(120,rc) : Put(121,gateViewportScale) : Put(122,gateViewportOffset)
+  Put(123,gateScaleX) : Put(124,gateScaleY)
+  Put(125,gateOffsetX) : Put(126,gateOffsetY)
+  Put(127,gateClip) : Put(128,gateClipW) : Put(129,gateClipH) : Put(130,gatePrim)
+  Fill(1,1) : draws[0]\viewportW=65
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(131,rc) : Put(132,gateBegin) : Put(133,gateAlloc)
+  Fill(1,1) : draws[0]\viewportW=32 : draws[0]\viewportH=32
+  draws[0]\scissorW=32 : draws[0]\scissorH=32
+  draws[0]\indexBase=$02202000 : draws[0]\indexBytes=32
+  draws[0]\indexType=#VK_INDEX_TYPE_UINT16 : draws[0]\vertexCount=3
+  draws[0]\maxVertex=2
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(134,rc) : Put(135,gateIndexed) : Put(136,gatePrim)
+  gateDynamicViewport=0
   ProcedureReturn #OUT
 EndProcedure
