@@ -152,9 +152,8 @@
 #VK_QUEUE_TRANSFER_BIT = $00000004
 #VK_QUEUE_SPARSE_BINDING_BIT = $00000008
 
-; Synchronization vocabulary. The access and stage bits are the core-1.0
-; values; this slice implements only the transfer-write dependency and the
-; host read that follows it, and refuses every other combination out loud.
+; Synchronization vocabulary. These are the core-1.0 bit values; each
+; command validates the access/stage combinations it can actually execute.
 #VK_ACCESS_TRANSFER_READ_BIT = $00000800
 #VK_ACCESS_TRANSFER_WRITE_BIT = $00001000
 #VK_ACCESS_HOST_READ_BIT = $00002000
@@ -656,6 +655,25 @@ Structure VkBufferImageCopy Align #PB_Structure_AlignC
   imageSubresource.VkImageSubresourceLayers
   imageOffset.VkOffset3D
   imageExtent.VkExtent3D
+EndStructure
+
+Structure VkMemoryBarrier Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  srcAccessMask.l
+  dstAccessMask.l
+EndStructure
+
+Structure VkBufferMemoryBarrier Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  srcAccessMask.l
+  dstAccessMask.l
+  srcQueueFamilyIndex.l
+  dstQueueFamilyIndex.l
+  buffer.i
+  offset.q
+  size.q
 EndStructure
 
 Structure VkImageMemoryBarrier Align #PB_Structure_AlignC

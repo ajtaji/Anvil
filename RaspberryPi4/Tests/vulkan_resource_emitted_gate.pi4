@@ -136,6 +136,8 @@ Procedure.i Main()
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
   Define bar.VkImageMemoryBarrier
+  Define memBarrier.VkMemoryBarrier
+  Define bufBarrier.VkBufferMemoryBarrier
   Dim bars.VkImageMemoryBarrier(2)
   Define pbSrcStage.i
   Define pbDstStage.i
@@ -507,11 +509,11 @@ Procedure.i Main()
   bar\subresourceRange\baseMipLevel = 0
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
-  ; A global memory barrier and a buffer memory barrier are refused.
+  ; A nonzero barrier count requires its actual array pointer.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   pbMemoryBarrierCount = 1
   vkCmdPipelineBarrier(cmd, pbSrcStage, pbDstStage, 0, pbMemoryBarrierCount, 0, 0, 0, 1, @bar)
-  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_ARGS)
   Sentence()
   pbMemoryBarrierCount = 0
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
@@ -1141,6 +1143,53 @@ Procedure.i Main()
   vkUnmapMemory(dev, copyDstMem)
   vkFreeMemory(dev, copyLateMem, 0)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; Transfer-scoped global and buffer barriers preserve the order of a
+  ; write followed by a dependent read of the same coherent buffer.
+  memBarrier\sType = #VK_STRUCTURE_TYPE_MEMORY_BARRIER
+  memBarrier\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  memBarrier\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  bufBarrier\sType = #VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+  bufBarrier\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bufBarrier\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  bufBarrier\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bufBarrier\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bufBarrier\buffer = copyDst
+  bufBarrier\offset = 0
+  bufBarrier\size = #VK_WHOLE_SIZE
+  vkrUpdateData[0] = $5A
+  vkrUpdateData[1] = $6B
+  vkrUpdateData[2] = $7C
+  vkrUpdateData[3] = $8D
+  copyRegion\srcOffset = 0
+  copyRegion\dstOffset = 24
+  copyRegion\size = 4
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 0, 4, @vkrUpdateData[0])
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, @memBarrier, 1, @bufBarrier, 0, 0)
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_RECORDING)
+  vkCmdCopyBuffer(cmd, copyDst, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
+  Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
+  Vkr(PeekA(copyDstPtr + 24) = $5A)
+  Vkr(PeekA(copyDstPtr + 25) = $6B)
+  Vkr(PeekA(copyDstPtr + 26) = $7C)
+  Vkr(PeekA(copyDstPtr + 27) = $8D)
+  vkUnmapMemory(dev, copyDstMem)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  bufBarrier\offset = 32
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 1, @bufBarrier, 0, 0)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_STATE)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  bufBarrier\offset = 0
+  bufBarrier\dstQueueFamilyIndex = 1
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 1, @bufBarrier, 0, 0)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  bufBarrier\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
 
   ; The recorded destination handle must not silently revive after destroy.
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
