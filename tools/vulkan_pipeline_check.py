@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 841
+REPORT_WORDS = 849
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1319,6 +1319,14 @@ def grade(cpu, rc) -> Grader:
     g.need("mixed stream publishes copied destination layout", slot(838), 5)
     g.need("mixed stream fence settles", slot(839), 0)
     g.need("DMA buffer update precedes TFU image upload", slot(840) & 0xFFFFFFFF, 0xFFFF00FF)
+    g.need("mixed linear upload and readback recording", slot(841), 0)
+    g.need("mixed linear upload and readback submission", slot(842), 0)
+    g.need("mixed linear upload and readback fence wait", slot(843), 0)
+    g.need("mixed linear upload and readback use two DMA row jobs", slot(844), 2)
+    g.need("mixed linear upload then readback publishes source layout", slot(845), 6)
+    g.need("mixed linear upload and readback fence settles", slot(846), 0)
+    g.need("mixed linear upload and readback exact bytes", slot(847), 0)
+    g.need("mixed linear readback keeps trailing poison", slot(848), 0xD3)
     g.need("backend failure is reported as device lost", slot(264), -4)
     g.need("failed copy does not publish its final shader-read layout", slot(265), 0)
     g.need("failed-copy fence is settled", slot(266), 0)
