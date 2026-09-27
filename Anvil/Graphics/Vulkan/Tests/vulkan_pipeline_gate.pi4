@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 783
+  If slot < 0 Or slot > 791
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -357,6 +357,7 @@ Procedure.i Main()
   Define copyFailures.i
   Define copyRegion.VkBufferImageCopy
   Define Dim readbackRegions.VkBufferImageCopy[2]
+  Define Dim uploadRegions.VkBufferImageCopy[2]
 
   pgPut(0, #PG_MAGIC)
   ; THE BOARD DIAGNOSTIC'S OWN MODULES, assembled by the same file the
@@ -3655,6 +3656,55 @@ Procedure.i Main()
   vkCmdCopyImageToBuffer(cmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 33, @readbackRegions[0])
   pgPut(782, vkEndCommandBuffer(cmd))
   pgPut(783, AnvilVkSubmissionOutstanding())
+  ; A single upload command consumes both readback rectangles, including the
+  ; second region's padded buffer rows, and preserves every other image byte.
+  uploadRegions[0]\bufferOffset = 64
+  uploadRegions[0]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  uploadRegions[0]\imageSubresource\layerCount = 1
+  uploadRegions[0]\imageExtent\width = 4 : uploadRegions[0]\imageExtent\height = 4 : uploadRegions[0]\imageExtent\depth = 1
+  uploadRegions[1]\bufferOffset = 256
+  uploadRegions[1]\bufferRowLength = 6
+  uploadRegions[1]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  uploadRegions[1]\imageSubresource\layerCount = 1
+  uploadRegions[1]\imageOffset\x = 12
+  uploadRegions[1]\imageExtent\width = 4 : uploadRegions[1]\imageExtent\height = 3 : uploadRegions[1]\imageExtent\depth = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, @uploadRegions[0])
+  pgPut(784, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(785, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(786, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  count = 0
+  For k = 0 To 31
+    For j = 0 To 31
+      For i = 0 To 3
+        If j < 4 And k < 4
+          rc = (((k + 5) * #PG_W + (j + 3)) * 4 + i) * 37 + 11
+        ElseIf j >= 12 And j < 16 And k < 3
+          rc = (((k + 10) * #PG_W + (j - 12 + 20)) * 4 + i) * 37 + 11
+        ElseIf j >= 7 And j < 24 And k >= 9 And k < 22
+          rc = (((k - 9 + 5) * #PG_W + (j - 7 + 3)) * 4 + i) * 37 + 11
+        Else
+          rc = $A5
+        EndIf
+        If rc <> $A5 : rc = rc & $FF : EndIf
+        If PeekA(AnvilVkImageAddress(img2) + (k * 32 + j) * 4 + i) <> rc : count = count + 1 : EndIf
+      Next
+    Next
+  Next
+  pgPut(787, count)
+  uploadRegions[1]\imageOffset\x = 31
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, @uploadRegions[0])
+  pgPut(788, vkEndCommandBuffer(cmd))
+  uploadRegions[1]\imageOffset\x = 2 : uploadRegions[1]\imageOffset\y = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, @uploadRegions[0])
+  pgPut(789, vkEndCommandBuffer(cmd))
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 33, @uploadRegions[0])
+  pgPut(790, vkEndCommandBuffer(cmd))
+  pgPut(791, AnvilVkSubmissionOutstanding())
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE

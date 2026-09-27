@@ -32,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i, arrayCmd.i, arrayReadCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i, arrayCmd.i, arrayReadCmd.i, arrayUploadCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -50,6 +50,7 @@ Procedure.i Main()
   Define range.VkImageSubresourceRange
   Define region.VkBufferImageCopy
   Define Dim readRegions.VkBufferImageCopy[2]
+  Define Dim uploadRegions.VkBufferImageCopy[2]
   Define imageRegion.VkImageCopy
   Define Dim imageRegions.VkImageCopy[2]
   Define dstBar.VkImageMemoryBarrier
@@ -137,6 +138,7 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @selfCmd) <> #VK_SUCCESS : status = 94 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @arrayCmd) <> #VK_SUCCESS : status = 103 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @arrayReadCmd) <> #VK_SUCCESS : status = 112 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @arrayUploadCmd) <> #VK_SUCCESS : status = 121 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -428,7 +430,7 @@ Procedure.i Main()
     If status = 111 : Break : EndIf
 
     For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
-    readRegions[0]\bufferOffset = 32
+    readRegions[0]\bufferOffset = 64
     readRegions[0]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
     readRegions[0]\imageSubresource\layerCount = 1
     readRegions[0]\imageOffset\x = 3 : readRegions[0]\imageOffset\y = 5
@@ -451,14 +453,48 @@ Procedure.i Main()
     If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 119 : Break : EndIf
     For i = 0 To #VIR_BUFFER_BYTES - 1
       rc = $A5
-      If i >= 32 And i < 96
-        rc = (#VIR_EXPECT >> (((i - 32) % 4) * 8)) & $FF
+      If i >= 64 And i < 128
+        rc = (#VIR_EXPECT >> (((i - 64) % 4) * 8)) & $FF
       ElseIf i >= 256 And i < 352 And ((i - 256) % 24) < 16
         rc = (#VIR_EXPECT >> (((i - 256) % 4) * 8)) & $FF
       EndIf
       If (PeekA(bufMap + i) & $FF) <> rc : status = 120 : Break : EndIf
     Next
     If status = 120 : Break : EndIf
+
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 121 : Break : EndIf
+    uploadRegions[0]\bufferOffset = 64
+    uploadRegions[0]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    uploadRegions[0]\imageSubresource\layerCount = 1
+    uploadRegions[0]\imageExtent\width = 4 : uploadRegions[0]\imageExtent\height = 4 : uploadRegions[0]\imageExtent\depth = 1
+    uploadRegions[1]\bufferOffset = 256
+    uploadRegions[1]\bufferRowLength = 6
+    uploadRegions[1]\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    uploadRegions[1]\imageSubresource\layerCount = 1
+    uploadRegions[1]\imageOffset\x = 12
+    uploadRegions[1]\imageExtent\width = 4 : uploadRegions[1]\imageExtent\height = 4 : uploadRegions[1]\imageExtent\depth = 1
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 122 : Break : EndIf
+    vkCmdCopyBufferToImage(arrayUploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 2, @uploadRegions[0])
+    If vkEndCommandBuffer(arrayUploadCmd) <> #VK_SUCCESS : status = 123 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 124 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 125 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 126 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 127 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 128 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If (j >= 7 And j < 24 And k >= 9 And k < 22) Or (j >= 24 And j < 32 And k >= 24 And k < 32) Or (j < 4 And k >= 24 And k < 28) Or (j >= 28 And j < 32 And k < 4) Or (j < 4 And k < 4) Or (j >= 12 And j < 16 And k < 4)
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 129 : Break : EndIf
+      Next
+      If status = 129 : Break : EndIf
+    Next
+    If status = 129 : Break : EndIf
 
     status = 0
   Until 1

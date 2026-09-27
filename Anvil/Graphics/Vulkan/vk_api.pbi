@@ -989,9 +989,8 @@ Procedure vkCmdClearColorImage(commandBuffer.i, image.i, imageLayout.i, *pColor,
   AnvilVkCmdClearColorImage(commandBuffer, image, imageLayout, *pColor, *pRanges)
 EndProcedure
 
-; Exact core Vulkan 1.0 signature. The first executable tranche accepts one
-; whole, tightly packed region; refusing an array is safer than executing its
-; first member and silently leaving the rest uncopied.
+; Exact core Vulkan 1.0 signature. Linear BGRA8 accepts a bounded region
+; array; the full optimal-image TFU transaction still accepts one region.
 Procedure vkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstImageLayout.i, regionCount.i, *pRegions.VkBufferImageCopy)
   Define c.i
   c = avkCmdSlot(commandBuffer)
@@ -999,11 +998,11 @@ Procedure vkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, dstIm
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyBufferToImage was given a VkCommandBuffer handle that is not live (Anvil code -20002, stale or foreign handle); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If regionCount <> 1 Or *pRegions = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage was given other than one copy region (Anvil code -20005, region arrays not implemented); nothing was recorded because a partial array copy would be a false success.")
+  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires one to thirty-two non-null regions (Anvil code -20001); no partial array was copied.")
     ProcedureReturn
   EndIf
-  AnvilVkCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, *pRegions)
+  AnvilVkCmdCopyBufferToImage(commandBuffer, srcBuffer, dstImage, dstImageLayout, regionCount, *pRegions)
 EndProcedure
 
 ; ----------------------------------------------------------------------

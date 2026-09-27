@@ -1629,6 +1629,14 @@ def grade(cpu, rc) -> Grader:
     g.need("overlapping readback destinations refuse the array", slot(781), ERR_ARGS)
     g.need("readback region count above capacity is refused", slot(782), ERR_ARGS)
     g.need("invalid readback arrays leave no flight", slot(783), 0)
+    g.need("two-region linear upload records atomically", slot(784), 0)
+    g.need("two-region linear upload submits", slot(785), 0)
+    g.need("two-region linear upload completes", slot(786), 0)
+    g.need("two-region upload preserves every copied and untouched image byte", slot(787), 0)
+    g.need("invalid later upload region refuses the array", slot(788), ERR_ARGS)
+    g.need("overlapping upload destinations refuse the array", slot(789), ERR_ARGS)
+    g.need("upload region count above capacity is refused", slot(790), ERR_ARGS)
+    g.need("invalid upload arrays leave no flight", slot(791), 0)
     g.need("whole image-to-buffer readback records", slot(717), 0)
     g.need("whole image-to-buffer readback submits", slot(718), 0)
     g.need("whole image-to-buffer readback completes", slot(719), 0)
@@ -2046,9 +2054,9 @@ MEMORY_MUTANTS = (
 )
 
 API_MUTANTS = (
-    ("vkCmdCopyBufferToImage accepts more than one region",
-     "  If regionCount <> 1 Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, \"vkCmdCopyBufferToImage was given other than one copy region",
-     "  If regionCount < 0 Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, \"vkCmdCopyBufferToImage was given other than one copy region"),
+    ("vkCmdCopyBufferToImage refuses a linear region array",
+     "  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdCopyBufferToImage requires one to thirty-two non-null regions",
+     "  If regionCount <> 1 Or *pRegions = 0\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdCopyBufferToImage requires one to thirty-two non-null regions"),
     ("an image view with an empty mip range is accepted",
      "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) <> 1 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n",
      "  If (*pCreateInfo\\subresourceRange\\levelCount & $FFFFFFFF) < 0 Or (*pCreateInfo\\subresourceRange\\layerCount & $FFFFFFFF) <> 1\n"),
@@ -2143,7 +2151,7 @@ OPTIMAL_COPY_MUTANTS = frozenset({
     "a failed TFU copy publishes its final image layout",
     "buffer-to-image submit does not retain the source buffer",
     "an optimal image publishes a fake linear row pitch",
-    "vkCmdCopyBufferToImage accepts more than one region",
+    "vkCmdCopyBufferToImage refuses a linear region array",
     "the copy backend cannot hold an in-flight transfer",
     "the copy backend reports source bytes as destination capacity",
 })
