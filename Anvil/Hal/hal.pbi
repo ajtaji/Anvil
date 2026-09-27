@@ -121,6 +121,11 @@
 ;  capability flags claim, and a clean "unsupported" path (via the gate)
 ;  for the ones they do not.
 ;
+;    HwVkDma*  (Pi 4 Vulkan backend only) guarded coherent buffer copy and
+;              fill into the registered offscreen heap. The board owns the
+;              DMA write window, cache maintenance and display-bound restore.
+;              Both return 1 only after the transfer and restore complete.
+;
 ;    HwGpio*   (#CAP_GPIO)  general-purpose I/O. IMPLEMENTED as the
 ;              demonstrator of this whole model - see Anvil/Core/gpio_cmd.pbi
 ;              and, on the Pi 4, RaspberryPi4/Board/hw_gpio.pi4 over

@@ -12,13 +12,15 @@ XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
-#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+#DSP_DMA_LINKED = 1
 XIncludeFile "RaspberryPi4/Lib/display.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
 XIncludeFile "RaspberryPi4/Lib/neon.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 
 #VBTP_ARENA = $0A000000
@@ -27,6 +29,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VBTP_WIN_BASE = $063E8000
 #VBTP_WIN_BYTES = 4227072
 #VBTP_MAP_SPAN = 8323072
+Global Dim vbtpDmaScratch.a[767]
 
 Procedure.i Main()
   Define status.i = 1
@@ -49,6 +52,7 @@ Procedure.i Main()
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
   Define Dim updateData.l[2]
+  Define scratch.i
 
   Repeat
     If NeonArena(#VBTP_ARENA, #VBTP_ARENA_BYTES) <> #NEON_OK : status = 2 : Break : EndIf
@@ -57,6 +61,13 @@ Procedure.i Main()
     If NeonInit() <> #NEON_OK : status = 4 : Break : EndIf
     neonReady = 1
     If AnvilVkV3dWindow(#VBTP_WIN_BASE, #VBTP_WIN_BYTES) <> #VK_SUCCESS : status = 5 : Break : EndIf
+    scratch = @vbtpDmaScratch[0] + 255
+    scratch = scratch - (scratch % 256)
+    If DmaSetScratch(scratch, #DMA_SCRATCH_BYTES) = 0 : status = 30 : Break : EndIf
+    ; Keep an independent display-sized write bound outside the Vulkan heap.
+    ; Every Vulkan transfer must restore this bound before the next operation.
+    If DmaSetBounds(#VBTP_SURFACE, 4096000) = 0 : status = 31 : Break : EndIf
+    If DmaInit() = 0 : status = 32 : Break : EndIf
 
     ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
     If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : status = 6 : Break : EndIf
@@ -144,6 +155,9 @@ Procedure.i Main()
       EndIf
     Next
     If status >= 25 : Break : EndIf
+    If hwVkDmaOps <> 5 : status = 33 : Break : EndIf
+    If DmaQuiescent() = 0 : status = 34 : Break : EndIf
+    If dma_bounds <> #VBTP_SURFACE Or dma_boundsN <> 4096000 : status = 35 : Break : EndIf
     status = 0
   Until 1
 

@@ -219,7 +219,10 @@ diagnostic passed on Pi 4 silicon on 2026-09-26; see
 `docs/VULKAN_INDEXED_DRAW_2026-09-17.md`. UINT32 remains desk-proved only.
 The bounded public buffer-copy/fill/update stream passed a Pi 4 RAM diagnostic
 on 2026-09-26; see `docs/VULKAN_BUFFER_TRANSFER_PI4_2026-09-26.md`. The full
-65,536-byte update limit is still desk-proved only.
+65,536-byte update limit is still desk-proved only. The production Pi 4
+backend now performs these transfers by DMA. A follow-up RAM diagnostic
+proved five DMA operations, exact destination bytes, and restoration of a
+non-Vulkan DMA write bound; see the same hardware record.
 The graphics triangle diagnostic now creates a live same-device pipeline cache,
 reads its 32-byte header, and passes the cache to both graphics-pipeline
 creations. The committed source at `5f9172d` ran on Pi 4 silicon from RAM on

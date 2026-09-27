@@ -16,8 +16,12 @@ one command buffer:
 After fence completion, the diagnostic compares all 16 destination words,
 including untouched guard words, and returns zero only on an exact match.
 It tears down Vulkan objects and calls `NeonShutdown` before returning.
-The CPU performs these coherent *buffer* transfers by design; this proof is
-not a V3D image-rendering test.
+The first proof above used CPU buffer transfers. The Pi 4 backend now routes
+production copy, fill, and update through guarded DMA; V3D still renders
+images. The display DMA channel temporarily binds the Vulkan heap as its
+write window, cleans CPU-written sources, protects and invalidates
+destinations, and restores its prior write bound before reporting completion.
+No failed DMA submission silently falls back to a CPU Vulkan transfer.
 
 The PMF was compiled for load and entry `0x00600000` with stack top
 `0x04F00000`, because monitor build 210 occupies
@@ -39,3 +43,18 @@ reset, flash, or boot-medium write occurred.
 This proves the selected 64-byte ordered stream on Pi 4 silicon. The full
 65,536-byte `vkCmdUpdateBuffer` boundary remains an emitted desk proof, and
 the Vulkan 1.0 buffer-transfer and synchronization matrix is not yet complete.
+
+## DMA transfer proof
+
+The updated RAM diagnostic links the display DMA service and requires five
+completed hardware operations for its two copy regions, fill, update, and
+final copy. It starts with a display-sized write bound outside the Vulkan
+heap, then checks that this original bound is restored after the mixed Vulkan
+stream. The 545,160-byte PMFBOOT v2 image has SHA-256
+`3D6B6BE60363807D0CF5E44E4580219390B016EACD2569EBE517DAB11816A094`.
+Build 210 verified it at `$00600000`; the returning payload produced `x0=0`
+under a 15-second deadman and fresh capture 38. Evidence is in
+`runs/vulkan-dma-buffer-bound-20260926/`. The monitor returned to a real
+`pmf>` with deadman off, capture disarmed, and core leases zero. No flash,
+reset, or boot-medium write occurred. The normal Pi 4 image and the V3D
+backend gate compile after the change; the new image has not been booted.
