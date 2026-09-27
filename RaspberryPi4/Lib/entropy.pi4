@@ -441,13 +441,27 @@ EnableExplicit
 ;
 ;  bcm2711.dtsi:125 rng@7e104000, translated by bcm2711.dtsi:41.
 ; ----------------------------------------------------------------------
-; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
-; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
-; range, so with the MMU off an access that ever got past this driver's
-; refusal would take an address-size fault that Anvil reports - never a
-; silent write somewhere else. The Pi 5's RNG is not the BCM2711 RNG200; EntropyInit() refuses and the DRBG fails closed.
+; BCM2712 (-t pi5): THE SAME RNG200. The pinned Pi 5 tree
+; (vault Raspberry Pi 5/Sources, raspberrypi/linux 7e030b60792d)
+; bcm2712-ds.dtsi:123-127:
+;
+;     random: rng@7d208000 {
+;         compatible = "brcm,bcm2711-rng200";
+;         reg = <0x7d208000 0x28>;
+;         status = "okay";
+;     };
+;
+; - the SAME compatible string, so the same driver path (the one that
+; tests for "brcm,bcm2711-rng200" by name, cited throughout this file)
+; and the same $28-byte register window. Bus $7D208000 through the /soc
+; ranges of all three pinned DTBs (bcm2712-rpi-5-b, bcm2712d0-rpi-5-b,
+; bcm2712-d-rpi-5-b) is CPU $107D208000. Every line below this block is
+; shared; tools/a64/a64_entropy_pi5_check.py runs the Pi 4 gate's
+; transcripts and mutants against a -t pi5 build. (Until 2026-09-27 this
+; branch said the Pi 5's RNG was not an RNG200 and refused - wrong, and
+; it left Wi-Fi's WPA2 SNonce and the DRBG with no entropy.)
 CompilerIf #PMF_CHIP = 2712
-  #ENTROPY_BASE = $DEAD00000000
+  #ENTROPY_BASE = $107D208000
 CompilerElse
 #ENTROPY_BASE = $FE104000
 CompilerEndIf
@@ -640,24 +654,16 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i EntropyReg(off.i)
   Protected v.i
-  CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn 0          ; BCM2712: no RNG200 - see #ENTROPY_BASE
-  CompilerElse
   EntropyBarrier()
   v = PeekN(#ENTROPY_BASE + off)
   EntropyBarrier()
   ProcedureReturn v & $FFFFFFFF
-  CompilerEndIf
 EndProcedure
 
 Procedure EntropySetReg(off.i, v.i)
-  CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn
-  CompilerElse
   EntropyBarrier()
   PokeN(#ENTROPY_BASE + off, v & $FFFFFFFF)
   EntropyBarrier()
-  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -747,9 +753,6 @@ EndProcedure
 ;  which is where they can be attributed.
 ; ----------------------------------------------------------------------
 Procedure.i EntropyBegin()
-  CompilerIf #PMF_CHIP = 2712
-  ProcedureReturn #ENTROPY_ERR_OFF    ; BCM2712: no RNG200; the DRBG fails closed
-  CompilerEndIf
   If EntropyEnabled() = 1
     ProcedureReturn #ENTROPY_ALREADY
   EndIf
