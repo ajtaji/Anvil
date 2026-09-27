@@ -129,7 +129,7 @@ def compat_first(nodes, s):
     return None
 
 
-def expected(blob):
+def expected(blob, facts=True):
     nodes = DC.parse(blob)
     info = DC.inspect(blob)
     # anchor the widened arithmetic on everything mapped_reg answers
@@ -174,6 +174,8 @@ def expected(blob):
             sum(1 for p in nodes if p != "/" and p.count("/") == 1),
             sum(1 for p in nodes if p.startswith("/reserved-memory/") and p.count("/") == 2)
             if "/reserved-memory" in nodes else -1]
+    if not facts:
+        return want
     # the fixed facts this gate is named for, independently of the oracle
     for i, v in ((1, 0x107D001000), (2, 0x1001100000), (3, 0x1000FFF000), (4, 0x107FFF9000),
                  (5, 0x107FFFA000), (6, 0x1F00030000), (7, 0x107D001000)):
@@ -239,6 +241,34 @@ def run(img, blob, limit=None):
     return got
 
 
+def modified_valid(blob):
+    """Valid trees with one ranges entry changed so that a translation must
+    now FAIL - for the code paths the pinned trees never exercise: a PCI
+    space code that differs, and a reg that overruns its window by less than
+    its own length."""
+    rp1 = bytes.fromhex("000000c0" "40000000" "02000000" "00000000" "00000000" "00000000" "00410000")
+    # The same bytes also open rp1's dma-ranges; take the one whose property
+    # header names "ranges".
+    strings_at = struct.unpack_from(">I", blob, 12)[0]
+    hits = []
+    at = blob.find(rp1)
+    while at >= 0:
+        tok, ln, name = struct.unpack_from(">3I", blob, at - 12)
+        end = blob.index(b"\0", strings_at + name)
+        if tok == 3 and ln == len(rp1) and blob[strings_at + name:end] == b"ranges":
+            hits.append(at)
+        at = blob.find(rp1, at + 1)
+    if len(hits) != 1:
+        raise Fail(f"rp1's ranges property was found {len(hits)} times, want once")
+    at = hits[0]
+    io_space = bytearray(blob)
+    io_space[at + 8] = 0x01                        # phys.hi space 2 (memory) -> 1 (I/O)
+    short = bytearray(blob)
+    short[at + 24:at + 28] = bytes.fromhex("00030080")   # UART0 0x30000+0x100 overruns it
+    return [("rp1 ranges in PCI I/O space", bytes(io_space)),
+            ("rp1 window ends inside UART0's reg", bytes(short))]
+
+
 def corrupt_variants(blob):
     h = list(struct.unpack_from(">10I", blob))
     off_struct, off_strings, off_rsv, size_strings, size_struct = h[2], h[3], h[4], h[8], h[9]
@@ -263,7 +293,18 @@ def corrupt_variants(blob):
     while o + 16 <= off_struct and blob[o:o + 16] != bytes(16):
         o += 16
     rsv_zero[o:o + 16] = b"\x11" * 16
+    # FDT_END followed by four more structure bytes (one NOP): grow the
+    # structure block and move everything behind it.
+    end_block = off_struct + size_struct
+    grown = bytearray(blob[:end_block] + struct.pack(">I", 4) + blob[end_block:])
+    struct.pack_into(">I", grown, 4, len(grown))
+    struct.pack_into(">I", grown, 36, size_struct + 4)
+    for field in (2, 3, 4):
+        v = struct.unpack_from(">I", grown, 4 * field)[0]
+        if v >= end_block:
+            struct.pack_into(">I", grown, 4 * field, v + 4)
     return [
+        ("FDT_END not final", bytes(grown), None),
         ("bad magic", hdr(0, 0xD00DFEEE), None),
         ("totalsize past the buffer", hdr(1, len(blob) + 4), None),
         ("totalsize below the header", hdr(1, 32), None),
@@ -299,6 +340,16 @@ def scenarios(img, dtb_dir, first=False):
         if first and errs:
             return errs
         print(f"  {name}: {run.last_steps} instructions")
+    for label, blob in modified_valid(base):
+        want = expected(blob, facts=False)
+        if want[6] != -1:
+            raise Fail(f"modified '{label}': the oracle still translates UART0")
+        got = run(img, blob)
+        for i, (g, w) in enumerate(zip(got, want)):
+            if g != w:
+                errs.append(f"modified '{label}': answer {i} is {g:#x}, dtb_contract says {w:#x}")
+        if first and errs:
+            return errs
     for label, blob, limit in corrupt_variants(base):
         try:
             DC.parse(blob)
@@ -332,6 +383,7 @@ def main():
     ap.add_argument("--compiler", required=True)
     ap.add_argument("--dtb-dir", type=pathlib.Path, default=DEFAULT_DTB_DIR)
     ap.add_argument("--mutate", action="store_true")
+    ap.add_argument("--only", default=None, help="only mutants whose label contains one of these comma-separated texts")
     a = ap.parse_args()
     compiler = resolve_compiler(a.compiler)
     rc = 0
@@ -343,12 +395,13 @@ def main():
             errs = [str(e)]
         for e in errs:
             print("FAIL", e)
-        print(f"fdt_check: 3 pinned DTBs x {NQ} answers + 18 corrupt variants, {len(errs)} failure(s)")
+        print(f"fdt_check: 3 pinned DTBs x {NQ} answers + 2 modified trees + 19 corrupt variants, {len(errs)} failure(s)")
         rc = 1 if errs else 0
         if a.mutate:
             src = (ROOT / LIB_REL).read_text(encoding="utf-8").replace("\r\n", "\n")
             killed = 0
-            for i, (label, old, new) in enumerate(MUTANTS):
+            chosen = [m for m in MUTANTS if not a.only or any(k in m[0] for k in a.only.split(","))]
+            for i, (label, old, new) in enumerate(chosen):
                 if src.count(old) != 1:
                     print(f"MUTANT {label}: pattern not found once - list is stale")
                     rc = 1
@@ -365,8 +418,8 @@ def main():
                 killed += bool(merr)
                 print(f"MUTANT {label}: {'killed' if merr else 'SURVIVED'}"
                       + (f" ({merr[0][:100]})" if merr else ""))
-            print(f"mutants: {killed}/{len(MUTANTS)} killed")
-            if killed != len(MUTANTS):
+            print(f"mutants: {killed}/{len(chosen)} killed")
+            if killed != len(chosen):
                 rc = 1
     return rc
 
