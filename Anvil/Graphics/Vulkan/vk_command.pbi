@@ -195,6 +195,11 @@ Declare avkDrawListRetain(c.i)
 Declare avkDrawListRelease(c.i)
 Declare avkDrawListDiscard()
 Declare.i avkDrawListSubmit()
+Declare.i avkRenderClearPreflight(c.i)
+Declare avkRenderClearRetain(c.i)
+Declare avkRenderClearRelease()
+Declare avkRenderClearDiscard()
+Declare.i avkRenderClearSubmit()
 Declare.i avkCopyBufferResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *baseOut)
 Declare.i avkTransferBufferResolve(buffer.i, deviceSlot.i, usage.i, offset.i, bytes.i, *baseOut)
 Declare.i avkBufferBarrierResolve(buffer.i, deviceSlot.i, offset.i, bytes.i, *actualBytes)
@@ -1284,6 +1289,7 @@ Procedure avkFlightReleaseRefs(c.i)
   Define k.i
   Define s.i
   avkDrawListRelease(c)
+  avkRenderClearRelease()
   avkCopyBufferRelease(c)
   k = 0
   While k < avkCbRefCount[c]
@@ -1383,6 +1389,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   ; refused a signalled fence or semaphore transaction before a flight owned
   ; that closure. Never let a later transfer/barrier submission inherit it.
   avkDrawListDiscard()
+  avkRenderClearDiscard()
   If commandBuffer = #VK_NULL_HANDLE
     ; A submission with no command buffers is legal. Its wait/signal
     ; semaphore operations and fence complete synchronously because there is
@@ -1485,7 +1492,11 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot mix a buffer transfer or fill with a clear or image copy in one backend job (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); submit these jobs separately.")
   EndIf
   If avkCbRpDone[c] <> 0 And avkCbDrawCount[c] = 0
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer whose render pass contains no draw (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. A render pass with no draw would be a clear wearing a render pass's clothes, and vkCmdClearColorImage is the honest way to ask for that.")
+    If clears > 0 Or copies > 0 Or bufferCopies > 0
+      ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot mix a render-pass clear with a separate transfer in one backend job (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); submit the jobs in separate command buffers.")
+    EndIf
+    job = avkRenderClearPreflight(c)
+    If job <> #ANVIL_VK_OK : ProcedureReturn job : EndIf
   EndIf
   ; Resolve every generation-tagged draw dependency before the submission
   ; changes command/fence/resource state. A stale object is an application
@@ -1555,6 +1566,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   avkCmdState[c] = #ANVIL_VK_CB_PENDING
   avkFlightRetain(c)
   avkDrawListRetain(c)
+  avkRenderClearRetain(c)
   avkCopyBufferRetain(c)
   avkSubmitCount = avkSubmitCount + 1
   If avkCbDrawCount[c] > 0
@@ -1567,6 +1579,15 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     If job = #ANVIL_VK_JOB_DONE
       avkFlightComplete(1)
     EndIf
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If avkCbRpDone[c] <> 0
+    job = avkRenderClearSubmit()
+    If job < 0
+      avkFlightComplete(0)
+      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while clearing a render-pass attachment (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. Inspect the backend's V3D fault registers before retrying.")
+    EndIf
+    If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
     ProcedureReturn #VK_SUCCESS
   EndIf
   If copies = 1

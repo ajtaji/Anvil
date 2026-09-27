@@ -11,15 +11,19 @@ through the device dispatch table.
 The current V3D transaction cannot execute a partial in-pass clear or a clear
 after a draw without losing ordering. Arrays, partial rectangles, other
 aspects, and post-draw clears invalidate the command buffer; `vkEndCommandBuffer`
-reports the refusal. A render pass with no draw still cannot submit. These
-limits remain explicit until ordered in-pass clear primitives exist.
+reports the refusal. A render pass with no draw now submits its load/attachment
+clear through the same V3D tile-clear job used by `vkCmdClearColorImage`. Its
+framebuffer, render pass and image view remain retained until the job completes;
+the attachment image and allocation use the command buffer's image-reference
+ledger. Other limits remain explicit until ordered in-pass clear primitives exist.
 
 The accepted semantics and ABI follow the Vulkan specification for
 [`vkCmdClearAttachments`](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdClearAttachments.html),
 [`VkClearAttachment`](https://docs.vulkan.org/refpages/latest/refpages/source/VkClearAttachment.html),
 and [`VkClearRect`](https://docs.vulkan.org/refpages/latest/refpages/source/VkClearRect.html).
 The emitted pipeline gate checks the 24-byte records, recording-time capture,
-the backend's exact clear word, and refusal of partial and post-draw clears.
+the backend's exact clear word, clear-only submission and retained lifetime,
+and refusal of partial and post-draw clears.
 The emitted gate also proved that typed writes to the public clear-value array
 arrive intact. The implementation reads the union's four ABI words by offset,
 matching the existing render-pass clear path; direct typed pointer-array reads

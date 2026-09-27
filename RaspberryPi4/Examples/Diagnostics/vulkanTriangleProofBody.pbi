@@ -182,6 +182,7 @@ XIncludeFile "RaspberryPi4/Lib/timer.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 #DSP_DMA_LINKED = 1
+#PMF_CHIP = 2711
 XIncludeFile "RaspberryPi4/Lib/dma.pi4"
 XIncludeFile "RaspberryPi4/Lib/display.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"

@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 700
+REPORT_WORDS = 712
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1580,6 +1580,16 @@ def grade(cpu, rc) -> Grader:
     g.need("VkClearRect retains its C ABI size", slot(699), 24)
     g.need("partial attachment clear invalidates the command buffer", slot(695), ERR_UNSUPPORTED)
     g.need("post-draw attachment clear invalidates the command buffer", slot(696), ERR_UNSUPPORTED)
+    g.need("clear-only render pass ends", slot(700), 0)
+    g.need("clear-only render pass submits", slot(701), 0)
+    g.need("clear-only render pass invokes one backend job", slot(702), 1)
+    g.need("clear-only render pass preserves the captured tile colour",
+           slot(703) & 0xFFFFFFFF, 0xFFFF8000)
+    g.need("clear-only render pass can remain pending", slot(704), 1)
+    g.need("pending clear retains framebuffer, pass and view", slot(705), 3)
+    g.need("clear-only render pass completes through its fence", slot(706), 0)
+    g.need("completed clear releases framebuffer, pass and view", slot(707), 0)
+    g.need("clear-only pass publishes its final attachment layout", slot(708), 6)
     g.need("held draw retains its exact pipeline", slot(660), 1)
     g.need("held draw retains its exact descriptor set", slot(661), 1)
     g.need("held draw retains its exact framebuffer", slot(662), 1)
@@ -2170,7 +2180,7 @@ def main() -> int:
     print("  the whole public path runs: eight shader modules, five pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, a sampler, three descriptor set layouts, two pools")
     print("  and three sets, six graphics pipelines over four live slots, ordered render passes with draws,")
-    print("  a whole-attachment clear, multiple submissions and a fence")
+    print("  whole-attachment and clear-only render-pass GPU jobs, multiple submissions and a fence")
     print("  all five shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")

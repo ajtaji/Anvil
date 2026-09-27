@@ -79,7 +79,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[700]
+Global Dim pgReport.i[712]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -90,7 +90,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 699
+  If slot < 0 Or slot > 711
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -98,7 +98,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (700 * 8), slot)
+  PokeI(#PG_OUT + (712 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -3166,6 +3166,28 @@ Procedure.i Main()
   vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
   vkCmdEndRenderPass(cmd)
   pgPut(696, vkEndCommandBuffer(cmd))
+
+  ; A render pass with only a whole-attachment clear is a real GPU job.
+  ; Hold it to prove framebuffer/pass/view ownership lasts through the fence.
+  attachment\clearValue[0] = #PG_PUSH_R : attachment\clearValue[1] = #PG_PUSH_G
+  attachment\clearValue[2] = #PG_PUSH_B : attachment\clearValue[3] = #PG_PUSH_A
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  vkCmdEndRenderPass(cmd)
+  pgPut(700, vkEndCommandBuffer(cmd))
+  attachment\clearValue[0] = 0
+  beforeCalls = AnvilVkTestBackendCalls()
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
+  pgPut(701, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(702, AnvilVkTestBackendCalls() - beforeCalls)
+  pgPut(703, AnvilVkTestBackendLastColor())
+  pgPut(704, AnvilVkSubmissionOutstanding())
+  pgPut(705, avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)] + avkIvInFlight[avkIvSlot(view)])
+  AnvilVkTestBackendHold(0)
+  pgPut(706, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(707, avkFbInFlight[avkFbSlot(fb)] + avkRpInFlight[avkRpSlot(rp)] + avkIvInFlight[avkIvSlot(view)])
+  pgPut(708, avkImgLayout[avkImgSlot(img)])
 
   ; ------------------------------------------------------------------
   ;  Ordered teardown.
