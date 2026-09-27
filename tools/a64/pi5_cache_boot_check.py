@@ -35,7 +35,7 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import pi5_desk as d                                   # noqa: E402
 
-MON_LOAD = 0x200000
+MON_LOAD = 0x80000               # the Pi 5 firmware's load address = the link address
 UART0 = 0x1F00030000
 BOARD = "RaspberryPi4/Board/board.pi4"
 # The Pi 5 monitor runs at EL3 under our stub. The register seeds are

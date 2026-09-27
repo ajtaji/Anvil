@@ -15,8 +15,9 @@ Machine), and runs the shipped procedures the host tools drive:
             reaches through HwReboot, against a model of the BCM2712 PM
             block at $10_7D20_0000: WDOG gets PASSWORD | 10 and RSTC gets
             PASSWORD | (RSTC & ~WRCFG) | FULL_RESET, in that order, and the
-            boot-count word is cleared at $001FBF00 - never at $1000, which
-            is inside the Pi 5 EL3 stub.
+            boot-count word is cleared at $0E000F00 (#MON_PHASE_LO + $F00,
+            THE BCM2712 MAP in memmap.pi4) - never at $1000, which is
+            inside the Pi 5 EL3 stub.
 
 The write of the boot file between them (`save ANVIL5.IMG ...`) is the SD
 card's; see tools/a64/pi5_sd_save_check.py.
@@ -44,11 +45,11 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import pi5_desk as d                                   # noqa: E402
 
-MON_LOAD = 0x200000
+MON_LOAD = 0x80000               # the Pi 5 firmware's load address = the link address
 UART0 = 0x1F00030000
 PM = 0x107D200000
 PAYLOAD_AT = 0x10000000          # the Pi 5 high payload window (memmap.pi4)
-COUNT_ADDR = 0x001FBF00
+COUNT_ADDR = 0x0E000F00          # THE BCM2712 MAP; pi5_memmap_check proves it from the image
 OLD_COUNT_ADDR = 0x1000
 
 

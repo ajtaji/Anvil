@@ -13,7 +13,9 @@
      Main's three-line Pi5CachesOn block removed. The block must be
      exactly those three lines, once, or the run stops: a fallback built
      from a guess is not a fallback.
-  4. Prints both SHA-256s. Same commit and compiler -> same hashes.
+  4. Refuses an image the compiler did not link for $80000 - where the Pi 5
+     firmware loads kernel= (THE BCM2712 MAP, RaspberryPi4/Board/memmap.pi4).
+  5. Prints both SHA-256s. Same commit and compiler -> same hashes.
 
   --write DRIVE  copies both images to the card, only after:
      * the disk behind DRIVE has serial 121220160204 and the volume is
@@ -21,7 +23,12 @@
      * armstub8-2712.bin on the card passes
        tools/a64/a64_el3_pi5_check.py --image;
      * config.txt on the card has kernel=ANVIL5.IMG,
-       armstub=armstub8-2712.bin, enable_rp1_uart=1 and pciex4_reset=0.
+       armstub=armstub8-2712.bin, enable_rp1_uart=1 and pciex4_reset=0,
+       and NO kernel_address line: the monitor is linked at $80000, where
+       the firmware loads it, and a kernel_address=0x200000 left from the
+       borrowed Pi 4 layout is stale (the firmware ignores it with our arm
+       stub - measured 2026-09-27 - and a firmware that honoured it would
+       run the monitor off its own map).
      An existing ANVIL5.IMG is kept as ANVIL5.OLD only when there is no
      ANVIL5.OLD already (the known-good fallback is never overwritten).
      Both files are read back and their hashes compared.
@@ -50,6 +57,10 @@ CARD_SERIAL = "121220160204"
 CARD_LABEL = "ANVILBOOT"
 STUB = "armstub8-2712.bin"
 CONFIG_LINES = ("kernel=ANVIL5.IMG", "armstub=armstub8-2712.bin", "enable_rp1_uart=1", "pciex4_reset=0")
+# The Pi 5 monitor is linked at the firmware's own load address (THE BCM2712 MAP in
+# RaspberryPi4/Board/memmap.pi4); any kernel_address line on the card is refused.
+CONFIG_FORBIDDEN = ("kernel_address",)
+LINK_ADDRESS = 0x80000
 
 
 class Refused(Exception):
@@ -100,6 +111,16 @@ def config_missing(text: str) -> list:
     return [c for c in CONFIG_LINES if c.lower() not in have]
 
 
+def config_forbidden(text: str) -> list:
+    """The live lines of config.txt this card may not carry, as written."""
+    bad = []
+    for ln in text.splitlines():
+        live = ln.split("#", 1)[0].strip()
+        if "=" in live and live.split("=", 1)[0].strip().lower() in CONFIG_FORBIDDEN:
+            bad.append(live)
+    return bad
+
+
 # ----------------------------------------------------------------------
 #  export and build
 # ----------------------------------------------------------------------
@@ -114,7 +135,7 @@ def export(commit: str, dest: pathlib.Path) -> str:
     if tar.returncode != 0:
         raise Refused("git archive failed: %s" % tar.stderr.decode(errors="replace")[-300:])
     with tarfile.open(fileobj=io.BytesIO(tar.stdout)) as tf:
-        tf.extractall(dest)
+        tf.extractall(dest, filter="data")   # members may not leave dest, links or devices refused
     return full
 
 
@@ -125,6 +146,11 @@ def compile_board(cc: str, tree: pathlib.Path, text: str, name: str, out: pathli
                        env=dict(os.environ, PMF_ROOT=str(tree)), capture_output=True, text=True, errors="replace")
     if r.returncode != 0 or "pmfc: OK" not in r.stdout or not out.is_file():
         raise Refused("%s would not build:\n%s%s" % (name, r.stdout[-1500:], r.stderr[-500:]))
+    m = re.search(r"image linked for \$([0-9A-Fa-f]+)", r.stdout)
+    if not m or int(m.group(1), 16) != LINK_ADDRESS:
+        raise Refused("%s was linked for %s, not $%X where the Pi 5 firmware loads kernel= - "
+                      "this commit predates THE BCM2712 MAP; nothing written"
+                      % (name, "$" + m.group(1) if m else "an address the compiler did not print", LINK_ADDRESS))
     return out.read_bytes()
 
 
@@ -204,8 +230,13 @@ def write_card(res: dict, drive: str, say=print, root: pathlib.Path | None = Non
     missing = config_missing(cfg.read_text(encoding="utf-8", errors="replace"))
     if missing:
         raise Refused("config.txt on the card lacks %s - nothing written" % ", ".join(missing))
-    say("card %s: serial %s, label %s, %s passes the EL3 gate, config.txt has the four lines"
-        % (drive, serial, label, STUB))
+    stale = config_forbidden(cfg.read_text(encoding="utf-8", errors="replace"))
+    if stale:
+        raise Refused("config.txt on the card has %s - the Pi 5 monitor is linked at $%X, where the "
+                      "firmware loads kernel=; remove the line - nothing written"
+                      % (", ".join(stale), LINK_ADDRESS))
+    say("card %s: serial %s, label %s, %s passes the EL3 gate, config.txt has the four lines and no "
+        "kernel_address" % (drive, serial, label, STUB))
     cur = find_file(root, "ANVIL5.IMG")
     old = find_file(root, "ANVIL5.OLD")
     if cur is not None and old is None:

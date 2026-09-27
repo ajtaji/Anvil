@@ -416,11 +416,14 @@
 ;  BCM2712: $0..$7FFFF is the Pi 5 EL3 stub (armstub8-2712.asm; DTB
 ;  reserved-memory atf@0), and this word is written before every reset,
 ;  so at $1000 it would overwrite the stub. It moves to +$F00 of the boot
-;  phase page (#MON_PHASE_LO = $001FB000, RaspberryPi4/Board/memmap.pi4),
-;  above everything that page's records use (+0 .. +2623). CHOSEN.
+;  phase page (#MON_PHASE_LO = $0E000000 on the Pi 5 - THE BCM2712 MAP,
+;  RaspberryPi4/Board/memmap.pi4), above everything that page's records
+;  use (+0 .. +2623). CHOSEN. This file is included before memmap.pi4, so
+;  the number is written here and tools/a64/pi5_memmap_check.py proves it
+;  equals #MON_PHASE_LO + $F00 in the built image.
 ; ----------------------------------------------------------------------
 CompilerIf #PMF_CHIP = 2712
-  #SAFETY_COUNT_ADDR = $001FBF00
+  #SAFETY_COUNT_ADDR = $0E000F00
 CompilerElse
 #SAFETY_COUNT_ADDR = $00001000
 CompilerEndIf

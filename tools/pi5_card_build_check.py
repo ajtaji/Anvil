@@ -13,6 +13,9 @@ PowerShell. Rows (each names what the folder must hold afterwards):
   wrong serial            refused, folder byte-identical
   wrong label             refused, folder byte-identical
   config.txt lacks pciex4_reset=0   refused, folder byte-identical
+  config.txt has kernel_address=0x200000   refused, folder byte-identical
+                          (stale: the monitor is linked at the firmware's $80000)
+  ... or kernel_address behind leading blanks / in upper case: refused the same
   armstub corrupted       refused (a64_el3_pi5_check --image red), folder byte-identical
 
 and the source transforms: a Pi5CachesOn block that is not exactly the three
@@ -20,6 +23,7 @@ lines (changed, missing, doubled) is refused; a #PMF_CHIP line that is not
 the bridge is refused; an absent bridge is fine.
 
 MUTANTS of the tool, each must turn a row red: the serial check removed;
+the kernel_address refusal dropped;
 ANVIL5.OLD overwritten every time; the block check removed; the config
 check removed.
 
@@ -96,6 +100,10 @@ def rows(mod, res, stub, config, work, quiet=False):
             ("wrong label", T.CARD_SERIAL, "BOOTFS", config, stub),
             ("config.txt lacks pciex4_reset=0", T.CARD_SERIAL, T.CARD_LABEL,
              config.replace(b"pciex4_reset=0", b"# pciex4_reset=0"), stub),
+            ("config.txt has kernel_address=0x200000", T.CARD_SERIAL, T.CARD_LABEL,
+             config + b"\n[pi5]\nkernel_address=0x200000\n", stub),
+            ("config.txt has an indented upper-case KERNEL_ADDRESS", T.CARD_SERIAL, T.CARD_LABEL,
+             config + b"\n  KERNEL_ADDRESS = 0x80000\n", stub),
             ("armstub corrupted", T.CARD_SERIAL, T.CARD_LABEL, config,
              stub[:0x40] + bytes([stub[0x40] ^ 0xFF]) + stub[0x41:])):
         make_card(card, stubx, cfg)
@@ -130,6 +138,7 @@ MUTANTS = [
     ("the serial check removed", "    if serial != CARD_SERIAL:", "    if False:"),
     ("ANVIL5.OLD overwritten every time", "    if cur is not None and old is None:", "    if cur is not None:"),
     ("the block check removed", "    if n != 1 or calls != 1:", "    if False:"),
+    ("the kernel_address refusal dropped", "    if stale:\n        raise Refused", "    if False:\n        raise Refused"),
     ("the config check removed", "    if missing:\n        raise Refused(\"config.txt on the card lacks",
      "    if False:\n        raise Refused(\"config.txt on the card lacks"),
 ]
@@ -143,6 +152,9 @@ def main() -> int:
     if not a.compiler:
         raise SystemExit("pass --compiler or set PMF_COMPILER")
     config = STAGING.read_bytes()
+    if T.config_forbidden(config.decode("utf-8", "replace")):
+        raise SystemExit("the staged config.txt (%s) has a kernel_address line - it is not a card this "
+                         "tool may write, so it cannot be the gate's good card" % STAGING)
     with tempfile.TemporaryDirectory(prefix="pi5card_check_") as td:
         work = pathlib.Path(td)
         r = subprocess.run([a.compiler, "--compile", "--armstub", "-t", "pi4",

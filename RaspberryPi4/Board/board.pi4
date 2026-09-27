@@ -1137,8 +1137,17 @@
 ;  and still wins where it is the only thing said. If a flag and one of
 ;  these lines DISAGREE the build stops and names both values - it never
 ;  quietly picks one.
+;
+;  BCM2712: LoadAddress is $80000, where the Pi 5 firmware puts kernel=
+;  whatever config.txt says (measured 2026-09-27 by the load guard in
+;  Main). The Pi 5 has its own map for everything that follows from it -
+;  THE BCM2712 MAP at the top of Board/memmap.pi4.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+LoadAddress  $80000
+CompilerElse
 LoadAddress  $200000
+CompilerEndIf
 BssAddress   $0D000000
 StackAddress $8000000
 
@@ -2320,6 +2329,12 @@ CompilerIf #PMF_CHIP = 2712
     ProcedureReturn (PeekA(p) << 24) | (PeekA(p + 1) << 16) | (PeekA(p + 2) << 8) | PeekA(p + 3)
   EndProcedure
 
+  ; 1 when this image is not running at #MON_LO (Main's first lines).
+  Global gPi5LoadWrong.i
+  ; #MON_STACK, handed to Main's `mov sp` through memory so that the one
+  ; constant in memmap.pi4 is the only place the Pi 5 stack top is written.
+  Global gPi5StackTop.i
+
   Procedure Pi5DtbApply()
     Define dtb.i
     Define node.i
@@ -2452,10 +2467,37 @@ Procedure Main()
     ; movz zeroes the whole 64-bit register and movk writes one field
     ; without disturbing the rest, so this is a full 64-bit constant
     ; even though only one field is non-zero.
+  EndASM
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: ONLY WHERE WE WERE LINKED. This build is linked at $80000,
+    ; where the Pi 5 firmware loads kernel=, and its whole map - the stack
+    ; at #MON_STACK, the phase record, the boot-count word, the raw-core
+    ; stacks, the autoboot record and the low payload window - is THE
+    ; BCM2712 MAP in memmap.pi4, computed from that address. 2026-09-27,
+    ; the first full Pi 5 boot ran the Pi 4 layout at $80000: the stack and
+    ; the boot records landed inside the code and the board died at a
+    ; procedure entry ($1FB660, EC 0). So the stack moves only when the
+    ; image is where the map assumes; otherwise it stays on the emitted
+    ; $08000000 stack and the board stops below with a sentence instead of
+    ; running on a map that is not its own.
+    If MonImageLo() = #MON_LO
+      gPi5StackTop = #MON_STACK
+      ASM
+        adrp x16, global_gpi5stacktop
+        add  x16, x16, #:lo12:global_gpi5stacktop
+        ldr  x16, [x16]
+        mov  sp, x16
+      EndASM
+    Else
+      gPi5LoadWrong = 1
+    EndIf
+  CompilerElse
+  ASM
     movz x16, #0
     movk x16, #0x0010, lsl #16
     mov  sp, x16
   EndASM
+  CompilerEndIf
 
   ; ADOPT the port, do not initialise it. uart.pi4 offers both calls and
   ; the wrong one here would disable the PL011, reprogram it and flush
@@ -2469,6 +2511,22 @@ Procedure Main()
   HwExceptionPrepare()
   UartInit(115200)
   CompilerIf #PMF_CHIP = 2712
+    If gPi5LoadWrong <> 0
+      Print("!! Anvil was loaded at ")
+      PutAddr(MonImageLo())
+      Print(" and is built to run at ")
+      PutAddr(#MON_LO)
+      PrintN(", where the Pi 5 firmware puts kernel=.")
+      PrintN("   Something moved it - config.txt must have no kernel_address line.")
+      PrintN("   This monitor's memory map is computed from its link address, so it")
+      PrintN("   stops now, before its stack or its boot records are touched.")
+      PrintN("   Nothing else was started.")
+      Repeat
+        ASM
+          wfe
+        EndASM
+      ForEver
+    EndIf
     ; BCM2712: the JST debug connector (UART10, $107D001000) as a second
     ; window on the console, teed from the header port (RaspberryPi4/Lib/
     ; uart.pi4, Anvil 73c6886). Adopted if the firmware or the EL3 stub left
