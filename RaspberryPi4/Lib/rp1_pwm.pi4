@@ -55,13 +55,17 @@
 ;
 ;  THE TACHOMETER. The Linux device tree reads RPM from rp1_pwm1 + 0x3c
 ;  (rpm-regmap / rpm-offset), which the RP1 manual lists only as
-;  CHAN2_PHASE - a value some firmware maintains, undocumented. This file
-;  does NOT read it. It counts the tach line's rising edges itself, by
+;  CHAN2_PHASE - a value some firmware maintains, undocumented. The
+;  measurement this file stands behind does NOT read it: it counts the tach
+;  line's rising edges itself, by
 ;  polling GPIO29 through SYS_RIO, over a window measured with Micros(),
 ;  at two pulses per revolution (pwm-fan.c's default). A window in which
 ;  the polls were too far apart to be sure of every edge answers
 ;  #RP1_TACH_COARSE, not a number - an under-sampled tach silently reads
 ;  low, which is the one wrong answer a fan report must not give.
+;  Rp1FanRpmRegister() (end of file) reads the $3C word raw, as the device
+;  tree names it, for the seam ruling still owed (vault morning list
+;  2026-09-27, item 4). It is not converted and not trusted here.
 ;
 ;  NOT VERIFIED ON A Pi 5. Desk-proven only (tools/a64/a64_fan_pi5_check.py
 ;  against a register model built from the sources above). Silicon owed.
@@ -457,4 +461,19 @@ EndProcedure
 
 Procedure.i Rp1TachEdges()
   ProcedureReturn rp1tach_total
+EndProcedure
+
+; ======================================================================
+;  THE FIRMWARE'S RPM WORD - rp1_pwm1 + $3C, READ RAW.
+;  bcm2712-rpi-5-b.dts cooling_fan: rpm-regmap = <&rp1_pwm1>,
+;  rpm-offset = <0x3c>. rp1-peripherals.pdf Table 25 names $3C CHAN2_PHASE:
+;  whatever keeps an RPM there is firmware the manual does not describe,
+;  and whether it counts at all on this board is owed to silicon. One
+;  32-bit read, no write, no scaling: the seam decision (morning list
+;  item 4) chooses between this word and Rp1TachMeasure's counted edges.
+; ======================================================================
+#RP1PWM_RPM_REG = $3C              ; dts rpm-offset
+
+Procedure.i Rp1FanRpmRegister()
+  ProcedureReturn PeekN(#RP1PWM_BASE + #RP1PWM_RPM_REG) & $FFFFFFFF
 EndProcedure
