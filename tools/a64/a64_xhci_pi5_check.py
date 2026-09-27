@@ -695,9 +695,9 @@ MUTANTS = {
     "vbus-pad-in-bank0": (GPIO, "#RP1_PADS_BANK0_BASE + Rp1BankOff(pin) + 4", "#RP1_PADS_BANK0_BASE + 4"),
     "no-vbus-hook-call": (XHCI, "    If *xh_vbusHook <> 0\n      xh_vbusHook()\n    EndIf\n", "\n"),
     "no-root-port-power": (XHCI, "    If xh_PowerRootPorts() = 0\n", "    If 1 = 0\n"),
-    "no-power-good-wait": (XHCI, "      xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)\n", "\n"),
-    "no-power-readback": (XHCI, "      If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0\n        ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)",
-                          "      If 0 = 1\n        ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)"),
+    "no-power-good-wait": (XHCI, "    xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)\n", "\n"),
+    "no-power-readback": (XHCI, "    If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0\n      ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)",
+                          "    If 0 = 1\n      ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)"),
 }
 # Which scenario exposes each mutant (healthy unless named).
 MUTANT_SCENARIO = {"no-link-check": "link-down", "no-inbound-check": "no-inbound",

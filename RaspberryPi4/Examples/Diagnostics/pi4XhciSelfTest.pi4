@@ -197,7 +197,9 @@ Procedure Main()
 
   ; ---- 6. ports ------------------------------------------------------
   ; Port 4 is a SuperSpeed port that trained itself; port 2 is a USB 2
-  ; port that is not even powered yet; port 1 is powered and empty.
+  ; port whose switch was off until XhciInit powered the root ports (the
+  ; harness also runs it with the firmware having powered everything);
+  ; port 1 is powered and empty.
   Chk(XhciFirstConnectedPort())
   Chk(XhciPortConnected(1))
   Chk(XhciPortConnected(4))
@@ -207,7 +209,7 @@ Procedure Main()
                                  ; touching the port
   Chk(XhciPortSpeed(4))
 
-  Chk(XhciPortConnected(2))      ; unpowered, so nothing there yet
+  Chk(XhciPortConnected(2))      ; powered by XhciInit, device already seen
   Chk(XhciPortSpeed(2))
   Chk(XhciPortReset(2))          ; powers it, then resets it
   Chk(XhciPortEnabled(2))
