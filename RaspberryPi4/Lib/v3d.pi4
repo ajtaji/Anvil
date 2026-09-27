@@ -493,12 +493,29 @@
 ;  BLOCK BASES
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712 (Pi 5, V3D 7.1). The pinned bcm2712-rpi-5-b.dtb (vault
+  ; "Raspberry Pi 5/Boot staging/"), /axi/v3d@2000000 reg-names "hub",
+  ; "core0", "sms" (bcm2712-ds.dtsi:402-416; /axi ranges are identity, so
+  ; these are CPU physical), and the PM block
+  ; /soc@107c000000/watchdog@7d200000 (soc ranges child 0 ->
+  ; $10_0000_0000). THERE IS NO ASB BRIDGE ON THIS PART - the kernel passes
+  ; 0, 0 for both bridge registers (bcm2835-power.c:380-383) - so the
+  ; #V3D_ASB_* constants below stay the BCM2711's and no 2712 path reaches
+  ; them: V3dBridgeCheck, V3dBringUp and V3dOwnershipHardwareReset all have
+  ; their own 2712 bodies.
+  #V3D_HUB_BASE   = $1002000000
+  #V3D_CORE0_BASE = $1002008000
+  #V3D_PM_BASE    = $107D200000
+  #V3D_SMS_BASE   = $1002030800
+CompilerElse
 ; bcm2711.dtsi:607, py-videocore6/v3d.py:184
 #V3D_HUB_BASE   = $FEC00000
 ; bcm2711.dtsi:608, py-videocore6/v3d.py:193
 #V3D_CORE0_BASE = $FEC04000
 ; bcm2711.dtsi:113 - reg-names "pm"
 #V3D_PM_BASE    = $FE100000
+CompilerEndIf
 ; bcm2711.dtsi:114 - reg-names "asb". The LEGACY bridge.
 #V3D_ASB_BASE   = $FE00A000
 ; bcm2711.dtsi:115 - reg-names "rpivid_asb". THE ONE V3D USES.
@@ -514,6 +531,39 @@
 #V3D_PM_ENAB     = 4096        ; BIT(12), bcm2835-power.c:82
 #V3D_PM_ISFUNC   = 32          ; BIT(5), bcm2835-power.c:87
 #V3D_PM_PASSWORD = $5A000000   ; bcm2835-power.c:100
+
+CompilerIf #PMF_CHIP = 2712
+  ; The GRAFX parent domain's power sequence RUNS on the BCM2712 (on the
+  ; BCM2711 the early return at bcm2835-power.c:223-225 skips it), then the
+  ; V3D subdomain's reset lives in PM_GRAFX_2712, not PM_GRAFX. Pinned
+  ; kernel 7e030b60, vault "Raspberry Pi 5/Sources/bcm2835-power.c".
+  #V3D_PM_GRAFX_2712    = $304    ; :83
+  #V3D_PM_POWUP         = $01     ; :94
+  #V3D_PM_POWOK         = $02     ; :93
+  #V3D_PM_ISPOW         = $04     ; :92
+  #V3D_PM_MEMREP        = $08     ; :91
+  #V3D_PM_MRDONE        = $10     ; :90
+  #V3D_PM_INRUSH_SHIFT  = 13      ; :95
+  #V3D_PM_INRUSH_MASK   = $6000   ; :100 (3 << 13)
+  #V3D_PM_INRUSH_STEPS  = 4       ; :236-248, all four written, no break
+  #V3D_PM_POWOK_WAIT_US = 3       ; :242-247, 3000 ns per inrush step
+  #V3D_PM_MRDONE_WAIT_US = 1      ; :261-270
+  ; The V3D power/security state machine, new on 7.1. v3d_regs.h:518-542,
+  ; v3d_drv.h:295-299, v3d_power.c:11-28, v3d_gem.c:113-127.
+  #V3D_SMS_REE_CS           = $000
+  #V3D_SMS_TEE_CS           = $400
+  #V3D_SMS_CLEAR_POWER_OFF  = $20000000 ; BIT(29)
+  #V3D_SMS_STATE_MASK       = $F
+  #V3D_SMS_IDLE             = $0
+  #V3D_SMS_ISOLATING_FOR_RESET = $A
+  #V3D_SMS_RESETTING        = $B
+  #V3D_SMS_RESET_REQ        = $4        ; V3D_SET_FIELD(0x4, V3D_SMS_STATE)
+  #V3D_SMS_WAIT_US          = 100000    ; 100 ms, v3d_power.c:19-20
+  ; The CPU guard that replaces the bridge witness: MIDR_EL1 implementer
+  ; and part number (arch/arm64/include/asm/cputype.h:54, 75).
+  #V3D_MIDR_IMPL_ARM = $41
+  #V3D_MIDR_PART_A76 = $D0B
+CompilerEndIf
 
 #V3D_ASB_V3D_S_CTRL  = $08     ; bcm2835-power.c:115
 #V3D_ASB_V3D_M_CTRL  = $0C     ; bcm2835-power.c:116
@@ -685,6 +735,24 @@
 ;  7.1 offsets, writing TFU_CS at $400 hits something else entirely.
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+  ; The `ver >= 71` arm of every macro (pinned v3d_regs.h:99-147), plus the
+  ; new output-configuration register IOC. There is no TFU_CRC on 7.1.
+  #V3D_TFU_CS    = $00700 ; :99
+  #V3D_TFU_SU    = $00704 ; :109
+  #V3D_TFU_ICFG  = $00708 ; :120
+  #V3D_TFU_IIA   = $0070C ; :125
+  #V3D_TFU_ICA   = $00710 ; :127
+  #V3D_TFU_IIS   = $00714 ; :129
+  #V3D_TFU_IUA   = $00718 ; :131
+  #V3D_TFU_IOC   = $0071C ; :133 - V3D_V7_TFU_IOC, output configuration
+  #V3D_TFU_IOA   = $00720 ; :135
+  #V3D_TFU_IOS   = $00724 ; :137
+  #V3D_TFU_COEF0 = $00728 ; :139
+  #V3D_TFU_COEF1 = $0072C ; :143
+  #V3D_TFU_COEF2 = $00730 ; :145
+  #V3D_TFU_COEF3 = $00734 ; :147
+CompilerElse
 #V3D_TFU_CS    = $00400 ; v3d_regs.h:91
 #V3D_TFU_SU    = $00404 ; v3d_regs.h:101
 #V3D_TFU_ICFG  = $00408 ; v3d_regs.h:112
@@ -699,6 +767,7 @@
 #V3D_TFU_COEF2 = $0042C ; v3d_regs.h:137
 #V3D_TFU_COEF3 = $00430 ; v3d_regs.h:139
 #V3D_TFU_CRC   = $00434 ; v3d_regs.h:142
+CompilerEndIf
 
 ; TFU_CS. CVTCT is the one that matters: an eight-bit count of
 ; CONVERSIONS COMPLETED. mesa/v3dx_simulator.c:182 and :200 use
@@ -744,6 +813,35 @@
 ;  is what makes the two families distinguishable at all.
 ; ----------------------------------------------------------------------
 
+CompilerIf #PMF_CHIP = 2712
+  ; V3D 7.1: pinned Mesa 61f25904 src/broadcom/common/v3d_tfu.h (vault
+  ; "Raspberry Pi 5/Sources/mesa-61f25904/common_v3d_tfu.h"), the V3D71_
+  ; block, used the way vulkan/v3dvx_meta_common.c:962-1003 uses it. ICFG
+  ; keeps only the input tiling and the texture type; the OUTPUT tiling,
+  ; the stride and the mip count moved to the new IOC register, and IOA is
+  ; the output address alone. There is no OPAD.
+  #V3D_TFU_ICFG_TTYPE_SHIFT  = 16  ; V3D71_TFU_ICFG_OTYPE_SHIFT
+  #V3D_TFU_ICFG_FORMAT_SHIFT = 23  ; V3D71_TFU_ICFG_IFORMAT_SHIFT
+  #V3D_TFU_ICFG_TTYPE_MAX    = 127 ; seven bits, 22:16, before IFORMAT at 23
+  #V3D_TFU_IFMT_RASTER      = 0
+  #V3D_TFU_IFMT_SAND        = 1
+  #V3D_TFU_IFMT_CONSTANT_COLOUR = 2
+  #V3D_TFU_IFMT_LINEARTILE  = 3
+  #V3D_TFU_IFMT_UBLINEAR_1  = 4
+  #V3D_TFU_IFMT_UBLINEAR_2  = 5
+  #V3D_TFU_IFMT_UIF_NO_XOR  = 6
+  #V3D_TFU_IFMT_UIF_XOR     = 7
+  #V3D_TFU_IOC_DIMTW        = 1    ; V3D71_TFU_IOC_DIMTW
+  #V3D_TFU_IOC_NUMMM_SHIFT  = 4
+  #V3D_TFU_IOC_FORMAT_SHIFT = 12
+  #V3D_TFU_IOC_STRIDE_SHIFT = 16
+  #V3D_TFU_OFMT_RASTER      = 0    ; 7.1 CAN write raster (:996-998)
+  #V3D_TFU_OFMT_LINEARTILE  = 3
+  #V3D_TFU_OFMT_UBLINEAR_1  = 4
+  #V3D_TFU_OFMT_UBLINEAR_2  = 5
+  #V3D_TFU_OFMT_UIF_NO_XOR  = 6
+  #V3D_TFU_OFMT_UIF_XOR     = 7
+CompilerElse
 ; ICFG. Reference/mesa-24.3.4_v3d_tfu.h:36-49.
 #V3D_TFU_ICFG_NUMMM_SHIFT  = 5   ; :36 - (last_level - base_level)
 #V3D_TFU_ICFG_TTYPE_SHIFT  = 9   ; :37 - the texture data format
@@ -769,6 +867,7 @@
 #V3D_TFU_OFMT_UBLINEAR_2  = 5    ; :32
 #V3D_TFU_OFMT_UIF_NO_XOR  = 6    ; :33
 #V3D_TFU_OFMT_UIF_XOR     = 7    ; :34
+CompilerEndIf
 
 ; THE OUTPUT ADDRESS THEREFORE HAS TO BE 64-BYTE ALIGNED, because bits
 ; 5:0 of IOA are not address. There is no RASTER code in the output
@@ -1091,10 +1190,18 @@
 ; bits 11:8. THIS IS A PREDICTION MADE IN ADVANCE OF THE READ and it
 ; is the pass criterion. The upper bits are NOT predicted - the
 ; capability bits and NHOSTS are what the read is for.
+CompilerIf #PMF_CHIP = 2712
+  ; V3D 7.1: TVER=7, REV=1, NCORES=1. v3d_drv.c:418-424 computes
+  ; ver = TVER*10 + REV and demands 71 for "brcm,2712-v3d" (:303).
+  #V3D_IDENT1_EXPECT_LOW12 = $117
+  #V3D_EXPECT_TVER   = 7
+  #V3D_EXPECT_REV    = 1
+CompilerElse
 #V3D_IDENT1_EXPECT_LOW12 = $124
-#V3D_IDENT1_LOW12_MASK   = $FFF
 #V3D_EXPECT_TVER   = 4
 #V3D_EXPECT_REV    = 2
+CompilerEndIf
+#V3D_IDENT1_LOW12_MASK   = $FFF
 #V3D_EXPECT_NCORES = 1
 
 ; The second witness, on core 0. py-videocore6/README.md:23 gives the
@@ -1103,7 +1210,13 @@
 ; refusal, because a part that answered IDENT correctly and then
 ; disagreed about its own geometry is a finding to print rather than
 ; a reason to stop.
+CompilerIf #PMF_CHIP = 2712
+  ; "3 slices x 4 QPU" - Idein py-videocore7 README:21-22, a secondary
+  ; source; printed, never a refusal.
+  #V3D_EXPECT_NSLC = 3
+CompilerElse
 #V3D_EXPECT_NSLC = 2
+CompilerEndIf
 #V3D_EXPECT_QUPS = 4
 
 
@@ -1140,6 +1253,13 @@
 
 #V3D_ERR_OWNER_BUSY  = 34  ; another payload still owns the V3D seam
 #V3D_ERR_OWNER_RESET = 35  ; targeted command-thread reset did not verify
+; BCM2712 / V3D 7.1 (their paths are compiled only for -t pi5).
+#V3D_ERR_NOT_A76     = 36  ; a -t pi5 build on a CPU that is not a Cortex-A76
+#V3D_ERR_GRAFX_POWOK = 37  ; GRAFX POWOK never set at any inrush step (undone)
+#V3D_ERR_GRAFX_MRDONE = 38 ; GRAFX memory repair never finished (undone)
+#V3D_ERR_SMS_RESUME  = 39  ; SMS TEE_CS never reached IDLE in 100 ms
+#V3D_ERR_SMS_RESET   = 40  ; SMS REE_CS stayed isolating/resetting 100 ms
+#V3D_ERR_NOT_PORTED  = 41  ; this path is V3D 4.2 only - not yet ported to 7.1
 #V3D_CLE_CTCS_CTRSTA = 1 << 15 ; Broadcom guide: reset/stop
 #V3D_CLE_CTCS_CTRUN  = 1 << 5  ; guide: stop at halt
 #V3D_CLE_CTCS_CTSUBS = 1 << 4  ; guide: stopped at halt
@@ -1245,6 +1365,13 @@ Global v3d_coreIdent1.i = 0
 Global v3d_coreIdent2.i = 0
 
 Global v3d_grafxBefore.i = 0    ; PM_GRAFX as found
+CompilerIf #PMF_CHIP = 2712
+  Global v3d_g2712Before.i = 0  ; PM_GRAFX_2712 as found
+  Global v3d_g2712After.i  = 0  ; PM_GRAFX_2712 after V3DRSTN, read back
+  Global v3d_smsTeeAfter.i = 0  ; SMS TEE_CS after the resume
+  Global v3d_smsReeAfter.i = 0  ; SMS REE_CS after the reset
+  Global v3d_midr.i        = 0  ; MIDR_EL1 as the CPU guard read it
+CompilerEndIf
 Global v3d_grafxAfter.i  = 0    ; PM_GRAFX after the deassert, read back
 Global v3d_asbMBefore.i  = 0
 Global v3d_asbMAfter.i   = 0
@@ -1581,6 +1708,24 @@ Procedure V3dPmWrite(off.i, value.i)
   PokeL(#V3D_PM_BASE + off, #V3D_PM_PASSWORD | (value & $00FFFFFF))
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+; The SMS takes plain 32-bit accesses; no password (v3d_power.c:17,
+; v3d_gem.c:119 write it with V3D_SMS_WRITE).
+Procedure.i V3dSmsRead(off.i)
+  ProcedureReturn PeekN(#V3D_SMS_BASE + off)
+EndProcedure
+
+Procedure V3dSmsWrite(off.i, value.i)
+  PokeL(#V3D_SMS_BASE + off, value)
+EndProcedure
+
+Procedure.i v3d_ReadMidr()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+CompilerEndIf
+
 Procedure.i V3dAsbRead(off.i)
   ProcedureReturn PeekN(#V3D_RPIVID_ASB_BASE + off)
 EndProcedure
@@ -1628,6 +1773,28 @@ EndProcedure
 ;  mapped, which is a different diagnosis from both wrong.
 ; ----------------------------------------------------------------------
 Procedure.i V3dBridgeCheck()
+  CompilerIf #PMF_CHIP = 2712
+  ; NO BRIDGES ON THE BCM2712, BUT THE REASON FOR THE CHECK REMAINS: the PM
+  ; block also holds PM_RSTC and PM_WDOG, so no password-bearing write goes
+  ; out until the program knows it is on the part these addresses belong
+  ; to. The two witnesses here are the CPU (a Cortex-A76 - a Pi 4 has no PM
+  ; block at $10_7D20_0000) and PM_GRAFX answering with something other
+  ; than all-ones. Both are reads.
+  Protected g.i
+  v3d_brdgLegacy = 0
+  v3d_brdgRpivid = 0
+  v3d_midr = v3d_ReadMidr() & $FFFFFFFF
+  If ((v3d_midr >> 24) & $FF) <> #V3D_MIDR_IMPL_ARM Or ((v3d_midr >> 4) & $FFF) <> #V3D_MIDR_PART_A76
+    v3d_err = #V3D_ERR_NOT_A76
+    ProcedureReturn #V3D_ERR_NOT_A76
+  EndIf
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  If g = $FFFFFFFF
+    v3d_err = #V3D_ERR_PM_DEAD
+    ProcedureReturn #V3D_ERR_PM_DEAD
+  EndIf
+  ProcedureReturn #V3D_OK
+  CompilerElse
   v3d_brdgLegacy = V3dBridgeIdLegacy()
   v3d_brdgRpivid = V3dBridgeIdRpivid()
 
@@ -1640,6 +1807,7 @@ Procedure.i V3dBridgeCheck()
     ProcedureReturn #V3D_ERR_BRIDGE_RPIVID
   EndIf
   ProcedureReturn #V3D_OK
+  CompilerEndIf
 EndProcedure
 
 
@@ -1738,8 +1906,14 @@ Procedure V3dAskFirmware()
   v3d_mbxUsed = 1
 
   ; --- what the firmware thinks now, before anything is asked of it --
+  CompilerIf #PMF_CHIP = 2712
+  ; The domain and power ids are the BCM2711's; not asked (see below).
+  v3d_domainBefore     = -1
+  v3d_powerBefore      = -1
+  CompilerElse
   v3d_domainBefore     = V3dQueryDomainState()
   v3d_powerBefore      = V3dQueryPowerState()
+  CompilerEndIf
   v3d_clockStateBefore = V3dQueryClockState()
   v3d_clockRate        = MailboxClockRate(#V3D_CLOCK_ID)
   v3d_clockMax         = MailboxClockRateMax(#V3D_CLOCK_ID)
@@ -1775,11 +1949,23 @@ Procedure V3dAskFirmware()
   ;  v3d_powerReply is left at -1 to mean "not attempted", which is a
   ;  different thing from the -2 that means "attempted and the
   ;  transport failed", and both are different from a real reply.
+  CompilerIf #PMF_CHIP = 2712
+  ; NO DOMAIN OR POWER CLAIM ON THE BCM2712. The numbers 11 and 10 are the
+  ; BCM2711 firmware's; the Pi 5 kernel powers V3D through the PM block
+  ; (power-domains = <&pm 1>, bcm2712-ds.dtsi:409) and never asks the
+  ; firmware, and on the Pi 4 one redundant power tag killed the property
+  ; mailbox for the rest of the session (the note above). V3dBringUp powers
+  ; the domain the kernel's way. The CLOCK below is still the firmware's:
+  ; clocks = <&firmware_clocks 5>, the same id as the Pi 4.
+  v3d_domainReply = -1
+  v3d_powerReply  = -1
+  CompilerElse
   v3d_domainReply = v3d_MbxIdState(#V3D_TAG_SET_DOMAIN_STATE, #V3D_DOMAIN_ID_NEW, #V3D_MBX_STATE_ON, 1)
   v3d_powerReply  = -1
   If v3d_domainReply <> 1
     v3d_powerReply = v3d_MbxIdState(#V3D_TAG_SET_POWER_STATE, #V3D_POWER_ID_OLD, #V3D_MBX_STATE_ON, 1)
   EndIf
+  CompilerEndIf
 
   ; --- claim the clock, then ask it to run at its ceiling ------------
   v3d_MbxIdState(#V3D_TAG_SET_CLOCK_STATE, #V3D_CLOCK_ID, #V3D_MBX_STATE_ON, 1)
@@ -1788,7 +1974,11 @@ Procedure V3dAskFirmware()
   EndIf
 
   ; --- and what it says afterwards -----------------------------------
+  CompilerIf #PMF_CHIP = 2712
+  v3d_domainAfter     = -1
+  CompilerElse
   v3d_domainAfter     = V3dQueryDomainState()
+  CompilerEndIf
   v3d_clockStateAfter = V3dQueryClockState()
   ; MEASURED, not configured. The firmware counts edges to produce this
   ; one, which is why the tag exists separately from GET_CLOCK_RATE, and
@@ -1928,6 +2118,201 @@ EndProcedure
 ;
 ;  Returns #V3D_OK or the error that stopped it.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  v3d_PmWaitBit - poll a PM register for a bit, with the tick deadline
+;  and the spin backstop every wait in this file carries. 1 = seen.
+; ----------------------------------------------------------------------
+Procedure.i v3d_PmWaitBit(off.i, bit.i, us.i)
+  Protected hz.i
+  Protected deadline.i
+  Protected spins.i
+  hz = V3dCounterHz()
+  deadline = 0
+  If hz > 0
+    deadline = V3dTicks() + ((hz / 1000000) * us) + 1
+  EndIf
+  spins = 0
+  Repeat
+    If (V3dPmRead(off) & bit) <> 0
+      ProcedureReturn 1
+    EndIf
+    spins = spins + 1
+    If spins > #V3D_SPIN_LIMIT
+      ProcedureReturn 0
+    EndIf
+    If hz > 0
+      If V3dTicks() > deadline
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3d_GrafxPowerOn - bcm2835_power_power_on(pd, PM_GRAFX),
+;  bcm2835-power.c:214-281, which RUNS on the BCM2712 (no rpivid_asb, so
+;  the early return at :223-225 is not taken). A domain the firmware
+;  already powered (POWUP set) is left alone (:227-229).
+;
+;  THE INRUSH RAMP WRITES ALL FOUR STEPS, EXACTLY AS THE KERNEL'S LOOP DOES
+;  (:236-248 has no break): the verdict is POWOK after the last step.
+;  Stopping early would be a guess about the hardware (vault plan, open
+;  question 5). Each failure undoes what was done, as :277-280 does.
+; ----------------------------------------------------------------------
+Procedure.i v3d_GrafxPowerOn()
+  Protected g.i
+  Protected inrush.i
+  Protected powok.i
+
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  If (g & #V3D_PM_POWUP) <> 0
+    ProcedureReturn #V3D_OK
+  EndIf
+
+  powok = 0
+  inrush = 0
+  While inrush < #V3D_PM_INRUSH_STEPS
+    g = V3dPmRead(#V3D_PM_GRAFX)
+    V3dPmWrite(#V3D_PM_GRAFX, (g & ~#V3D_PM_INRUSH_MASK) | (inrush << #V3D_PM_INRUSH_SHIFT) | #V3D_PM_POWUP)
+    powok = v3d_PmWaitBit(#V3D_PM_GRAFX, #V3D_PM_POWOK, #V3D_PM_POWOK_WAIT_US)
+    inrush = inrush + 1
+  Wend
+  If powok = 0
+    g = V3dPmRead(#V3D_PM_GRAFX)
+    V3dPmWrite(#V3D_PM_GRAFX, g & ~(#V3D_PM_POWUP | #V3D_PM_INRUSH_MASK))
+    v3d_err = #V3D_ERR_GRAFX_POWOK
+    ProcedureReturn #V3D_ERR_GRAFX_POWOK
+  EndIf
+
+  ; Electrical isolation off (:256-257), memory repair (:259-270).
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_ISPOW)
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_MEMREP)
+  If v3d_PmWaitBit(#V3D_PM_GRAFX, #V3D_PM_MRDONE, #V3D_PM_MRDONE_WAIT_US) = 0
+    g = V3dPmRead(#V3D_PM_GRAFX)
+    V3dPmWrite(#V3D_PM_GRAFX, g & ~#V3D_PM_ISPOW)
+    g = V3dPmRead(#V3D_PM_GRAFX)
+    V3dPmWrite(#V3D_PM_GRAFX, g & ~(#V3D_PM_POWUP | #V3D_PM_INRUSH_MASK))
+    v3d_err = #V3D_ERR_GRAFX_MRDONE
+    ProcedureReturn #V3D_ERR_GRAFX_MRDONE
+  EndIf
+
+  ; Functional isolation off (:272-273).
+  g = V3dPmRead(#V3D_PM_GRAFX)
+  V3dPmWrite(#V3D_PM_GRAFX, g | #V3D_PM_ISFUNC)
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  v3d_SmsWait - poll an SMS register's STATE field. `want` >= 0 waits
+;  for STATE = want; `want` < 0 waits for STATE to be neither
+;  ISOLATING_FOR_RESET nor RESETTING. 1 = reached.
+; ----------------------------------------------------------------------
+Procedure.i v3d_SmsWait(off.i, want.i)
+  Protected hz.i
+  Protected deadline.i
+  Protected spins.i
+  Protected s.i
+  hz = V3dCounterHz()
+  deadline = 0
+  If hz > 0
+    deadline = V3dTicks() + ((hz / 1000000) * #V3D_SMS_WAIT_US)
+  EndIf
+  spins = 0
+  Repeat
+    s = V3dSmsRead(off) & #V3D_SMS_STATE_MASK
+    If want >= 0
+      If s = want
+        ProcedureReturn 1
+      EndIf
+    ElseIf s <> #V3D_SMS_ISOLATING_FOR_RESET And s <> #V3D_SMS_RESETTING
+      ProcedureReturn 1
+    EndIf
+    spins = spins + 1
+    If spins > #V3D_SPIN_LIMIT
+      ProcedureReturn 0
+    EndIf
+    If hz > 0
+      If V3dTicks() > deadline
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  ForEver
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  V3dBringUp() - BCM2712 / V3D 7.1.
+;
+;    1. the CPU and PM witnesses (V3dBridgeCheck, 2712 body)
+;    2. the GRAFX parent domain, the kernel's full rail sequence
+;    3. the V3D subdomain: V3DRSTN in PM_GRAFX_2712 ($304), bracketed by
+;       the 1 us settles (bcm2835-power.c:300-306), READ BACK. The kernel's
+;       own reset-status read looks at $10C on this part (:579, vault open
+;       question 6); this reads $304, where the bit was written.
+;    4. the SMS: resume (TEE_CS <- CLEAR_POWER_OFF, wait IDLE), then reset
+;       (REE_CS <- STATE 4, wait until not isolating/resetting) -
+;       v3d_power.c:11-28 then v3d_gem.c:113-127, in that order.
+;
+;  NO V3D REGISTER - SMS, HUB OR CORE - IS READ BEFORE STEP 3 HAS SUCCEEDED,
+;  and no hub or core register before step 4: a read of a powered-down V3D
+;  may hang the bus rather than fault (vault open question 7). The
+;  after-reset IDENT snapshot is taken only once the SMS is idle.
+; ----------------------------------------------------------------------
+Procedure.i V3dBringUp()
+  Protected r.i
+  Protected g.i
+
+  r = V3dBridgeCheck()
+  If r <> #V3D_OK
+    ProcedureReturn r
+  EndIf
+
+  v3d_grafxBefore = V3dPmRead(#V3D_PM_GRAFX)
+  v3d_g2712Before = V3dPmRead(#V3D_PM_GRAFX_2712)
+
+  r = v3d_GrafxPowerOn()
+  v3d_grafxAfter = V3dPmRead(#V3D_PM_GRAFX)
+  If r <> #V3D_OK
+    ProcedureReturn r
+  EndIf
+
+  V3dDelayUs(#V3D_RESET_SETTLE_US)
+  g = V3dPmRead(#V3D_PM_GRAFX_2712)
+  V3dPmWrite(#V3D_PM_GRAFX_2712, g | #V3D_PM_V3DRSTN)
+  V3dBarrier()
+  V3dDelayUs(#V3D_RESET_SETTLE_US)
+  g = V3dPmRead(#V3D_PM_GRAFX_2712)
+  v3d_g2712After = g
+  If (g & #V3D_PM_V3DRSTN) = 0
+    v3d_err = #V3D_ERR_RESET
+    ProcedureReturn #V3D_ERR_RESET
+  EndIf
+
+  V3dSmsWrite(#V3D_SMS_TEE_CS, #V3D_SMS_CLEAR_POWER_OFF)
+  V3dBarrier()
+  If v3d_SmsWait(#V3D_SMS_TEE_CS, #V3D_SMS_IDLE) = 0
+    v3d_smsTeeAfter = V3dSmsRead(#V3D_SMS_TEE_CS)
+    v3d_err = #V3D_ERR_SMS_RESUME
+    ProcedureReturn #V3D_ERR_SMS_RESUME
+  EndIf
+  v3d_smsTeeAfter = V3dSmsRead(#V3D_SMS_TEE_CS)
+
+  V3dSmsWrite(#V3D_SMS_REE_CS, #V3D_SMS_RESET_REQ)
+  V3dBarrier()
+  If v3d_SmsWait(#V3D_SMS_REE_CS, -1) = 0
+    v3d_smsReeAfter = V3dSmsRead(#V3D_SMS_REE_CS)
+    v3d_err = #V3D_ERR_SMS_RESET
+    ProcedureReturn #V3D_ERR_SMS_RESET
+  EndIf
+  v3d_smsReeAfter = V3dSmsRead(#V3D_SMS_REE_CS)
+
+  v3d_ident1AfterReset = V3dHubRead(#V3D_HUB_IDENT1)
+  v3d_ident1AfterAsb   = v3d_ident1AfterReset   ; no bridges: the same read
+  ProcedureReturn #V3D_OK
+EndProcedure
+CompilerElse
 Procedure.i V3dBringUp()
   Protected r.i
   Protected g.i
@@ -1991,6 +2376,7 @@ Procedure.i V3dBringUp()
   v3d_ident1AfterAsb = V3dHubRead(#V3D_HUB_IDENT1)
   ProcedureReturn #V3D_OK
 EndProcedure
+CompilerEndIf
 
 
 ; ======================================================================
@@ -2171,6 +2557,19 @@ Procedure.i V3dInit()
   v3d_ready = 0
   v3d_err   = #V3D_OK
 
+  CompilerIf #PMF_CHIP = 2712
+  ; NOT READ ON THE BCM2712. The Pi 4 snapshot at entry and after the
+  ; clock is a hub read before the domain is known to be up, and on this
+  ; part such a read may hang the bus instead of returning zero (vault
+  ; open question 7; the RP1 did hang on first boot). -1 means "not read".
+  v3d_ident1AtEntry = -1
+  r = V3dBridgeCheck()
+  If r <> #V3D_OK
+    ProcedureReturn r
+  EndIf
+  V3dAskFirmware()
+  v3d_ident1AfterClock = -1
+  CompilerElse
   ; Read first, write nothing. See the note above.
   v3d_ident1AtEntry = V3dHubRead(#V3D_HUB_IDENT1)
 
@@ -2181,13 +2580,19 @@ Procedure.i V3dInit()
 
   V3dAskFirmware()
   v3d_ident1AfterClock = V3dHubRead(#V3D_HUB_IDENT1)
+  CompilerEndIf
 
   r = V3dBringUp()
   If r <> #V3D_OK
+    CompilerIf #PMF_CHIP = 2712
+    ; NOT on the BCM2712: a failed bring-up means the domain, the reset or
+    ; the SMS is not known good, and reading IDENT then may hang.
+    CompilerElse
     ; Read the identity anyway. A bring-up that failed at the ASB while
     ; IDENT already reads correctly is a completely different finding
     ; from one where IDENT is still zero, and the difference is free.
     V3dReadIdent()
+    CompilerEndIf
     ProcedureReturn r
   EndIf
 
@@ -3146,6 +3551,9 @@ Global v3d_tfuIia.i  = 0
 Global v3d_tfuIis.i  = 0
 Global v3d_tfuIoa.i  = 0
 Global v3d_tfuIos.i  = 0
+CompilerIf #PMF_CHIP = 2712
+  Global v3d_tfuIoc.i = 0         ; 7.1 output configuration (tiling)
+CompilerEndIf
 Global v3d_tfuSrcAddr.i  = 0
 Global v3d_tfuSrcBytes.i = 0
 Global v3d_tfuDstAddr.i  = 0
@@ -3179,11 +3587,22 @@ Global v3d_tfuJobs.i      = 0
 ; fields in the same positions.
 Procedure.i V3dTfuIcfgWord(inputFormat.i, texType.i, mipmaps.i, outputPad.i)
   Protected v.i
+  CompilerIf #PMF_CHIP = 2712
+  ; 7.1: ICFG is IFORMAT << 23 | OTYPE << 16 and nothing else
+  ; (v3dvx_meta_common.c:962-971). Mip count and output padding do not
+  ; live here any more; a caller asking for either gets -1, which no
+  ; register value can be, rather than bits in the wrong field.
+  If mipmaps <> 0 Or outputPad <> 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn (inputFormat << #V3D_TFU_ICFG_FORMAT_SHIFT) | (texType << #V3D_TFU_ICFG_TTYPE_SHIFT)
+  CompilerElse
   v = inputFormat << #V3D_TFU_ICFG_FORMAT_SHIFT
   v = v | (texType << #V3D_TFU_ICFG_TTYPE_SHIFT)
   v = v | (mipmaps << #V3D_TFU_ICFG_NUMMM_SHIFT)
   v = v | (outputPad << #V3D_TFU_ICFG_OPAD_SHIFT)
   ProcedureReturn v
+  CompilerEndIf
 EndProcedure
 
 ; IOA. THE ADDRESS AND THE OUTPUT TILING SHARE ONE REGISTER, so this
@@ -3194,12 +3613,38 @@ EndProcedure
 ; refusal because it is the call that has the address.
 Procedure.i V3dTfuIoaWord(dstAddr.i, outputFormat.i, skipLevel0.i)
   Protected v.i
+  CompilerIf #PMF_CHIP = 2712
+  ; 7.1: IOA is the output address alone (v3dvx_meta_common.c:973); the
+  ; tiling and DIMTW are V3dTfuIocWord's.
+  ProcedureReturn dstAddr
+  CompilerElse
   v = dstAddr | (outputFormat << #V3D_TFU_IOA_FORMAT_SHIFT)
   If skipLevel0 <> 0
     v = v | #V3D_TFU_IOA_DIMTW
   EndIf
   ProcedureReturn v
+  CompilerEndIf
 EndProcedure
+
+CompilerIf #PMF_CHIP = 2712
+; IOC, 7.1 only: FORMAT << 12 | STRIDE << 16 | NUMMM << 4 | DIMTW
+; (v3d_tfu.h V3D71_TFU_IOC_*, v3dvx_meta_common.c:981-1002). STRIDE is
+; needed only for a raster or UIF destination; this library writes
+; neither (V3dTfuDest refuses them), so it is always 0 here.
+Procedure.i V3dTfuIocWord(outputFormat.i, strideField.i, mipmaps.i, skipLevel0.i)
+  Protected v.i
+  v = (outputFormat << #V3D_TFU_IOC_FORMAT_SHIFT) | (strideField << #V3D_TFU_IOC_STRIDE_SHIFT)
+  v = v | (mipmaps << #V3D_TFU_IOC_NUMMM_SHIFT)
+  If skipLevel0 <> 0
+    v = v | #V3D_TFU_IOC_DIMTW
+  EndIf
+  ProcedureReturn v
+EndProcedure
+
+Procedure.i V3dTfuIocSent()
+  ProcedureReturn v3d_tfuIoc
+EndProcedure
+CompilerEndIf
 
 ; IOS. (height << 16) | width, in TEXELS, both witnesses agreeing.
 Procedure.i V3dTfuIosWord(width.i, height.i)
@@ -3252,6 +3697,14 @@ Procedure.i V3dTfuBegin(width.i, height.i, texType.i)
     v3d_err = #V3D_ERR_TFU_ARGS
     ProcedureReturn #V3D_ERR_TFU_ARGS
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; OTYPE is seven bits on 7.1 (22:16, IFORMAT starts at 23).
+  If texType > #V3D_TFU_ICFG_TTYPE_MAX
+    v3d_err = #V3D_ERR_TFU_ARGS
+    ProcedureReturn #V3D_ERR_TFU_ARGS
+  EndIf
+  v3d_tfuIoc = 0
+  CompilerEndIf
 
   v3d_tfuIos  = V3dTfuIosWord(width, height)
   ; RASTER in, no mipmaps, no UIF output padding. All three are fields
@@ -3347,12 +3800,26 @@ Procedure.i V3dTfuDest(addr.i, outputFormat.i, bytes.i)
     v3d_err = #V3D_ERR_TFU_ARGS
     ProcedureReturn #V3D_ERR_TFU_ARGS
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; A UIF destination on 7.1 needs IOC.STRIDE = padded height / (2 x the
+  ; microtile height), and the microtile height depends on the texel size,
+  ; which this library is never told (it is handed a format code). Refused
+  ; by name until a caller can say the padded height; LINEARTILE and the
+  ; two UBLINEAR layouts need no stride.
+  If outputFormat = #V3D_TFU_OFMT_UIF_NO_XOR Or outputFormat = #V3D_TFU_OFMT_UIF_XOR
+    v3d_err = #V3D_ERR_TFU_ARGS
+    ProcedureReturn #V3D_ERR_TFU_ARGS
+  EndIf
+  CompilerEndIf
   If bytes < 1
     v3d_err = #V3D_ERR_TFU_ARGS
     ProcedureReturn #V3D_ERR_TFU_ARGS
   EndIf
 
   v3d_tfuIoa      = V3dTfuIoaWord(addr, outputFormat, 0)
+  CompilerIf #PMF_CHIP = 2712
+  v3d_tfuIoc      = V3dTfuIocWord(outputFormat, 0, 0, 0)
+  CompilerEndIf
   v3d_tfuDstAddr  = addr
   v3d_tfuDstBytes = bytes
   v3d_tfuHaveDst  = 1
@@ -3443,8 +3910,19 @@ Procedure.i V3dTfuSubmit()
   V3dHubWrite(#V3D_TFU_ICA, 0)
   V3dHubWrite(#V3D_TFU_IUA, 0)
   V3dHubWrite(#V3D_TFU_IOA, v3d_tfuIoa)
+  CompilerIf #PMF_CHIP = 2712
+  ; 7.1: IOC after IOA, and COEF1..3 ALWAYS written (v3d_sched.c:348-363:
+  ; `ver >= V3D_GEN_71 || USECOEF`).
+  V3dHubWrite(#V3D_TFU_IOC, v3d_tfuIoc)
   V3dHubWrite(#V3D_TFU_IOS, v3d_tfuIos)
   V3dHubWrite(#V3D_TFU_COEF0, 0)
+  V3dHubWrite(#V3D_TFU_COEF1, 0)
+  V3dHubWrite(#V3D_TFU_COEF2, 0)
+  V3dHubWrite(#V3D_TFU_COEF3, 0)
+  CompilerElse
+  V3dHubWrite(#V3D_TFU_IOS, v3d_tfuIos)
+  V3dHubWrite(#V3D_TFU_COEF0, 0)
+  CompilerEndIf
 
   ; THE BARRIER IS LOAD BEARING. The register writes above are Device
   ; memory and are ordered against each other by the memory type, but
@@ -3973,6 +4451,12 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i V3dCsdSubmit()
   Protected st.i
+  CompilerIf #PMF_CHIP = 2712
+  ; V3D 4.2 only: CSD CFG0-6 move to $930-$948 and CFG7 must be written (vault "GPU - V3D 7.1 port plan", B4). Refused by
+  ; name rather than run with 4.2 offsets on a 7.1 part.
+  v3d_err = #V3D_ERR_NOT_PORTED
+  ProcedureReturn #V3D_ERR_NOT_PORTED
+  CompilerEndIf
 
   If v3d_ready = 0
     v3d_err = #V3D_ERR_NOINIT
@@ -6652,6 +7136,14 @@ Procedure.i V3dOwnershipHardwareReset()
   Protected clk.i
   Protected r.i
 
+  CompilerIf #PMF_CHIP = 2712
+  ; The 7.1 reset is the PM reset controller (power the V3D domain off and
+  ; on, bcm2835-power.c:541-563) followed by an SMS reset (v3d_gem.c:102-
+  ; 155) - vault plan item A7, not ported yet. The BCM2711 bridge sequence
+  ; below would write the Pi 4's ASB addresses; refuse by name instead.
+  v3d_err = #V3D_ERR_NOT_PORTED
+  ProcedureReturn #V3D_ERR_NOT_PORTED
+  CompilerEndIf
   If V3dBridgeCheck() <> #V3D_OK
     ProcedureReturn #V3D_ERR_OWNER_RESET
   EndIf
@@ -7607,6 +8099,12 @@ EndProcedure
 ;  V3dBinSubmit - CT0QMA, CT0QMS, CT0QTS, CT0QBA, CT0QEA.
 ; ----------------------------------------------------------------------
 Procedure.i V3dBinSubmit()
+  CompilerIf #PMF_CHIP = 2712
+  ; V3D 4.2 only: the binning packets change shape (vault "GPU - V3D 7.1 port plan", D2-D4). Refused by
+  ; name rather than run with 4.2 offsets on a 7.1 part.
+  v3d_err = #V3D_ERR_NOT_PORTED
+  ProcedureReturn #V3D_ERR_NOT_PORTED
+  CompilerEndIf
   If v3d_ready = 0
     v3d_err = #V3D_ERR_NOINIT
     ProcedureReturn #V3D_ERR_NOINIT
@@ -7802,6 +8300,12 @@ EndProcedure
 ;  wrote and allocates nothing.
 ; ----------------------------------------------------------------------
 Procedure.i V3dRenderSubmit()
+  CompilerIf #PMF_CHIP = 2712
+  ; V3D 4.2 only: the render packets change shape (vault "GPU - V3D 7.1 port plan", D1-D5). Refused by
+  ; name rather than run with 4.2 offsets on a 7.1 part.
+  v3d_err = #V3D_ERR_NOT_PORTED
+  ProcedureReturn #V3D_ERR_NOT_PORTED
+  CompilerEndIf
   If v3d_ready = 0
     v3d_err = #V3D_ERR_NOINIT
     ProcedureReturn #V3D_ERR_NOINIT

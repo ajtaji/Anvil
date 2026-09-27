@@ -1,0 +1,183 @@
+; v3d71_tfu_probe.pi5 - the first V3D 7.1 milestone on the Pi 5: power,
+; clock, identity, and one TFU job that completes.
+;
+; DIAGNOSTIC. Does not ship. Unlike v3d71_ident_probe.pi5 (stage 1, which
+; carries its own copy of the sequence), this one calls THE LIBRARY:
+; RaspberryPi4/Lib/v3d.pi4 built -t pi5, whose #PMF_CHIP = 2712 arms hold
+; the BCM2712 bring-up and the V3D 7.1 TFU. So it proves the seam, not a
+; private copy of it:
+;
+;   1. V3dInit()             CPU guard (Cortex-A76), firmware clock 5,
+;                            GRAFX rail, V3DRSTN in PM_GRAFX_2712, SMS
+;                            resume + reset, IDENT = $117
+;   2. V3dMmuInit/Map        the V3D's own page table (unchanged on 7.1)
+;   3. one TFU job           16x4 RGBA8, raster in, LINEARTILE out, through
+;                            the 7.1 register block ($700) and the new IOC
+;   4. completion            TFU_CS.CVTCT moved (V3dTfuWait) AND the TFUC
+;                            interrupt status bit is set, unmasked
+;   5. the bytes             every output texel checked on the CPU against
+;                            the LINEARTILE layout (Mesa v3d_tiling.c)
+;
+; RETURN: $71 when all five hold. Otherwise $100 + the V3dInit error,
+; $200 + the MMU error, $300 + the TFU error, $400 if TFUC was not set,
+; $500 + the count of wrong bytes. Printed on RP1 UART0 as well.
+;
+; BUILD (PMF_ROOT = the Anvil root):
+;   PureMetalForge.exe --compile RaspberryPi5\Tests\v3d71_tfu_probe.pi5
+;       -t pi5 --entry-returns --load-addr 0x400000 --stack-addr 0x3000000
+;       -o _work\v3d71tfu.img
+; The load and stack addresses are the Pi 4 payload convention; confirm them
+; against the Pi 5 monitor's payload window before the first silicon run
+; (vault plan, open question 8). Desk gate: tools/a64/a64_v3d71_tfu_check.py.
+
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#P5_UART_DR = $1F00030000     ; RP1 UART0, vault HARDWARE-BRINGUP
+#P5_UART_FR = $1F00030018
+
+#TP_PT       = $640000        ; V3D page table (4096 entries, VA 0..$FFFFFF)
+#TP_PT_BYTES = 16384
+#TP_ILLEGAL  = $648000        ; MMU illegal-address page
+#TP_SRC      = $650000        ; input page
+#TP_DST      = $651000        ; output page
+#TP_PAGE     = 4096
+
+#TP_W = 16                    ; one row of 4x4 microtiles: the LINEARTILE
+#TP_H = 4                     ; layout needs no padding and no stride
+#TP_CPP = 4
+#TP_BYTES = 256
+#TP_POISON = $A5A5A5A5
+
+Procedure PutC(c.i)
+  Protected f.i
+  Repeat
+    f = PeekN(#P5_UART_FR)
+  Until (f & 32) = 0
+  PokeL(#P5_UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Protected i.i
+  Protected c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Protected i.i
+  Protected n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure Row(*name, v.i)
+  PutS("  ") : PutS(*name) : PutS(" $") : PutHex(v, 8) : PutC(13) : PutC(10)
+EndProcedure
+
+; LINEARTILE: a single line of 64-byte microtiles, each 4x4 texels at
+; 4 bytes (Mesa v3d_tiling.c:84-102, utile 4x4 for cpp 4 at :37-66).
+Procedure.i LtOffset(x.i, y.i)
+  ProcedureReturn (64 * ((x / 4) + (y / 4))) + ((x % 4) * #TP_CPP) + ((y % 4) * 4 * #TP_CPP)
+EndProcedure
+
+Procedure.i Main()
+  Protected r.i
+  Protected i.i
+  Protected x.i
+  Protected y.i
+  Protected bad.i
+  Protected ints.i
+  Protected want.i
+  Protected got.i
+
+  PutS("=== V3D 7.1 TFU PROBE (Pi 5) ===") : PutC(13) : PutC(10)
+
+  r = V3dInit()
+  Row("V3dInit          ", r)
+  Row("PM_GRAFX after   ", v3d_grafxAfter)
+  Row("PM_GRAFX_2712    ", v3d_g2712After)
+  Row("SMS TEE / REE    ", (v3d_smsTeeAfter << 16) | (v3d_smsReeAfter & $FFFF))
+  Row("HUB_IDENT1       ", V3dIdent1())
+  Row("HUB_IDENT3       ", V3dIdent3())
+  Row("clock 5 measured ", V3dClockMeasured())
+  If r <> #V3D_OK
+    PutS("verdict: V3dInit refused") : PutC(13) : PutC(10)
+    ProcedureReturn $100 + r
+  EndIf
+
+  r = V3dMmuInit(#TP_PT, #TP_PT_BYTES, #TP_ILLEGAL)
+  If r = #V3D_OK : r = V3dMmuMap(#TP_SRC, #TP_SRC, #TP_PAGE) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#TP_DST, #TP_DST, #TP_PAGE) : EndIf
+  If r <> #V3D_OK
+    Row("MMU refused      ", r)
+    ProcedureReturn $200 + r
+  EndIf
+
+  V3dInvalidateCaches()
+  V3dHubIntClear(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+  V3dHubIntUnmask(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+
+  For i = 0 To #TP_BYTES - 1
+    PokeA(#TP_SRC + i, i)
+  Next
+  For i = 0 To #TP_BYTES - 4 Step 4
+    PokeL(#TP_DST + i, #TP_POISON)
+  Next
+
+  r = V3dTfuBegin(#TP_W, #TP_H, #V3D_TEXFMT_RGBA8)
+  If r = #V3D_OK : r = V3dTfuSourceRaster(#TP_SRC, #TP_W, #TP_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuDest(#TP_DST, #V3D_TFU_OFMT_LINEARTILE, #TP_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuSubmit() : EndIf
+  Row("TFU_ICFG sent    ", V3dTfuIcfgSent())
+  Row("TFU_IOA sent     ", V3dTfuIoaSent())
+  Row("TFU_IOC sent     ", V3dTfuIocSent())
+  If r = #V3D_OK : r = V3dTfuWait(#V3D_TFU_TIMEOUT_US) : EndIf
+  ints = V3dHubIntStsNow()
+  Row("TFU result       ", r)
+  Row("TFU_CS after     ", V3dTfuCsAfter())
+  Row("HUB_INT_STS      ", ints)
+  Row("MMU_CTL          ", V3dMmuCtlNow())
+
+  V3dHubIntClear(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+  V3dHubIntMask(#V3D_HUB_INT_TFUC | #V3D_HUB_INT_TFUF)
+
+  If r <> #V3D_OK
+    PutS("verdict: the TFU job did not complete") : PutC(13) : PutC(10)
+    ProcedureReturn $300 + r
+  EndIf
+  If (ints & #V3D_HUB_INT_TFUC) = 0
+    PutS("verdict: CVTCT moved but TFUC was never raised") : PutC(13) : PutC(10)
+    ProcedureReturn $400
+  EndIf
+
+  bad = 0
+  For y = 0 To #TP_H - 1
+    For x = 0 To #TP_W - 1
+      want = PeekL(#TP_SRC + ((y * #TP_W) + x) * #TP_CPP) & $FFFFFFFF
+      got = PeekL(#TP_DST + LtOffset(x, y)) & $FFFFFFFF
+      If got <> want
+        bad = bad + #TP_CPP
+      EndIf
+    Next
+  Next
+  Row("wrong bytes      ", bad)
+  If bad <> 0
+    PutS("verdict: the output is not the LINEARTILE image") : PutC(13) : PutC(10)
+    ProcedureReturn $500 + bad
+  EndIf
+
+  PutS("verdict: OK - V3D 7.1 powered, identified, TFU job done and verified") : PutC(13) : PutC(10)
+  ProcedureReturn $71
+EndProcedure
