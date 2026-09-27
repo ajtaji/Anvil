@@ -339,10 +339,13 @@ EndProcedure
 ;                 SD0/SDIO on GPIO 48..53 that older Pis used for the card
 ;                 is not the Pi 4's card path.
 ;
-;  Bluetooth's UART on GPIO 30..33 is deliberately left OUT: bluetooth.pi4
-;  records that Anvil does not bring BT up and nothing here muxes 30..33,
-;  so refusing them would claim an in-use that is not true. Add them here
-;  the day a BT bring-up lands, next to the radio it belongs with.
+;    GPIO 30..33  the same radio's Bluetooth UART. RaspberryPi4/Lib/
+;                 bt_uart.pi4 muxes these four to ALT3 (PL011 CTS/RTS/TXD/
+;                 RXD, bcm283x.dtsi 259-268) when `bt up` opens the link.
+;                 Until the console leaves the PL011, `bt up` refuses on
+;                 this board and nothing muxes them; they are reserved
+;                 anyway, because they are the radio's wires, not the
+;                 user's, and a write to one mid-link would break it.
 ; ----------------------------------------------------------------------
 Procedure.i HwGpioReservedReason(pin.i)
   If pin = 14 Or pin = 15
@@ -350,6 +353,9 @@ Procedure.i HwGpioReservedReason(pin.i)
   EndIf
   If pin >= 34 And pin <= 39
     ProcedureReturn "part of the on-board Wi-Fi and Bluetooth radio's SDIO bus: the CYW43455 is soldered down on GPIO 34 to 39"
+  EndIf
+  If pin >= 30 And pin <= 33
+    ProcedureReturn "the on-board radio's Bluetooth UART: the CYW43455's HCI link is on GPIO 30 to 33"
   EndIf
   ProcedureReturn 0
 EndProcedure
