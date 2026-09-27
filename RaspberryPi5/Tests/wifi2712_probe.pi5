@@ -1,0 +1,95 @@
+; wifi2712_probe.pi5 - the Pi 5's CYW43455 on BCM2712 SDIO2, brought up by
+; the SAME libraries as the Pi 4 (RaspberryPi4/Lib/sdio.pi4 through its
+; #PMF_CHIP = 2712 seams, Anvil/Net/cyw43.pbi unchanged), in the order
+; RaspberryPi4/Examples/Diagnostics/pi4WifiScan.pi4 uses. DESK FIXTURE, no
+; UART: tools/a64/a64_wifi_pi5_check.py loads a pinned firmware DTB and
+; the blobs into DRAM, writes #CTL, models the host and the radio, and
+; reads #OUT. Silicon owed.
+;
+;   #CTL +0  1 = the radio up to Cyw43WifiUp; 2 = pinctrl from the DTB only
+;        +8  the device tree (what the board keeps as gBootDtb)
+;       +16  firmware bytes at #FW, +20 NVRAM bytes at #NV, +24 CLM at #CLM
+;
+;   #OUT +0 SdioSetPinctrlFromDtb  +4 SdioPinctrlDtbResult  +8 SdioInit
+;       +12 SdioLastError  +16 SdioEnableFunction(1)  +20 Cyw43Attach
+;       +24 Cyw43ChipId    +28 Cyw43PrepareDownload   +32 Cyw43UploadFirmware
+;       +36 Cyw43UploadNvram +40 Cyw43Start  +44 Cyw43HtClock
+;       +48 Cyw43AnnounceHost +52 SdioEnableFunction(2)
+;       +56 Cyw43WifiUp (0 is success)  +60 Cyw43ErrorText's code
+;       +64 $600DF00D, written last
+;
+;   pmfc wifi2712_probe.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o wifi2712.img
+
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+
+#CTL = $00E00000
+#OUT = $00E00100
+#FW       = $01000000
+#NV       = $01200000
+#NV_WORK  = $01210000
+#NV_WORK_MAX = 4096
+#SCRATCH  = $01220000
+#SCRATCH_LEN = 2048
+#CLM      = $01300000
+
+Define sc.i
+Define r.i
+
+sc = PeekN(#CTL)
+r = SdioSetPinctrlFromDtb(PeekN(#CTL + 8) | (PeekN(#CTL + 12) << 32))
+PokeL(#OUT + 0, r)
+PokeL(#OUT + 4, SdioPinctrlDtbResult())
+If sc = 1 And r = 1
+  SdioSetBaseClockKhz(#SDIO_2712_DTB_BASE_KHZ)
+  r = SdioInit()
+  PokeL(#OUT + 8, r)
+  PokeL(#OUT + 12, SdioLastError())
+  If r = 1
+    r = SdioEnableFunction(1)
+    PokeL(#OUT + 16, r)
+  EndIf
+  If r = 1
+    Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+    Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+    r = Cyw43Attach()
+    PokeL(#OUT + 20, r)
+    PokeL(#OUT + 24, Cyw43ChipId())
+  EndIf
+  If r = 1
+    Cyw43SetBlockMode(1)
+    r = Cyw43PrepareDownload()
+    PokeL(#OUT + 28, r)
+  EndIf
+  If r = 1
+    r = Cyw43UploadFirmware(#FW, PeekN(#CTL + 16), #SCRATCH, #SCRATCH_LEN)
+    PokeL(#OUT + 32, r)
+  EndIf
+  If r = 1
+    r = Cyw43UploadNvram(#NV, PeekN(#CTL + 20), #NV_WORK, #NV_WORK_MAX, #SCRATCH, #SCRATCH_LEN)
+    PokeL(#OUT + 36, r)
+  EndIf
+  If r = 1
+    r = Cyw43Start()
+    PokeL(#OUT + 40, r)
+  EndIf
+  If r = 1
+    r = Cyw43HtClock()
+    PokeL(#OUT + 44, r)
+  EndIf
+  If r = 1
+    r = Cyw43AnnounceHost()
+    PokeL(#OUT + 48, r)
+  EndIf
+  If r = 1
+    r = SdioEnableFunction(2)
+    PokeL(#OUT + 52, r)
+  EndIf
+  If r = 1
+    PokeL(#OUT + 56, Cyw43WifiUp(#CLM, PeekN(#CTL + 24), #CYW43_EVMASK_SCAN, 2000))
+  EndIf
+  PokeL(#OUT + 60, Cyw43LastError())
+EndIf
+PokeL(#OUT + 64, $600DF00D)
