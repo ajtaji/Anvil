@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[824]
+Global Dim pgReport.i[833]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 823
+  If slot < 0 Or slot > 832
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (824 * 8), slot)
+  PokeI(#PG_OUT + (833 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -352,6 +352,8 @@ Procedure.i Main()
   Define copyImgMem.i
   Define tiledDst.i
   Define tiledDstMem.i
+  Define linearSrc.i
+  Define linearSrcMem.i
   Define failImg.i
   Define failImgMem.i
   Define copyPtr.i
@@ -2225,12 +2227,48 @@ Procedure.i Main()
   pgPut(821, AnvilVkImageLayout(tiledDst))
   pgPut(822, vkGetFenceStatus(dev, fence))
   pgPut(823, AnvilVkImageLayout(copyImg))
+
+  ; A linear image is also a TFU raster source for a whole optimal image.
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  pgPut(824, vkCreateImage(dev, @imgci, 0, @linearSrc))
+  vkGetImageMemoryRequirements(dev, linearSrc, @req)
+  mai\allocationSize = req\size
+  pgPut(825, vkAllocateMemory(dev, @mai, 0, @linearSrcMem))
+  pgPut(826, vkBindImageMemory(dev, linearSrc, linearSrcMem, 0))
+  count = AnvilVkTestBackendCopies()
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  bar\image = linearSrc
+  bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  bar\image = tiledDst
+  bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyImage(cmd, linearSrc, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tiledDst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegion)
+  bar\image = tiledDst
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(827, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(828, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(829, AnvilVkTestBackendCopies() - count)
+  pgPut(830, AnvilVkImageLayout(tiledDst))
+  pgPut(831, AnvilVkImageLayout(linearSrc))
+  pgPut(832, vkGetFenceStatus(dev, fence))
+  vkDestroyImage(dev, linearSrc, 0)
+  vkFreeMemory(dev, linearSrcMem, 0)
   vkDestroyImage(dev, tiledDst, 0)
   vkFreeMemory(dev, tiledDstMem, 0)
 
   ; A backend failure is transactional. Even though the recording contains
   ; a final shader-read barrier, an image whose TFU copy failed must retain
   ; its entry layout and the fence must still settle.
+  imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
   imgci\extent\width = 17
   imgci\extent\height = 13
   pgPut(260, vkCreateImage(dev, @imgci, 0, @failImg))

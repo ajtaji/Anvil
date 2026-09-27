@@ -833,8 +833,8 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImage requires bound source and destination images (Anvil code -20004); no copy was recorded.")
     ProcedureReturn
   EndIf
-  If (avkImgTiling[src] <> #VK_IMAGE_TILING_LINEAR Or avkImgTiling[dst] <> #VK_IMAGE_TILING_LINEAR) And (avkImgTiling[src] <> #VK_IMAGE_TILING_OPTIMAL Or avkImgTiling[dst] <> #VK_IMAGE_TILING_OPTIMAL)
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage requires matching linear or optimal BGRA8 image tiling (Anvil code -20005); no copy was recorded.")
+  If (avkImgTiling[src] <> #VK_IMAGE_TILING_LINEAR Or (avkImgTiling[dst] <> #VK_IMAGE_TILING_LINEAR And avkImgTiling[dst] <> #VK_IMAGE_TILING_OPTIMAL)) And (avkImgTiling[src] <> #VK_IMAGE_TILING_OPTIMAL Or avkImgTiling[dst] <> #VK_IMAGE_TILING_OPTIMAL)
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage supports linear-to-linear, linear-to-optimal or optimal-to-optimal BGRA8 images (Anvil code -20005); no copy was recorded.")
     ProcedureReturn
   EndIf
   If (avkImgUsage[src] & #VK_IMAGE_USAGE_TRANSFER_SRC_BIT) = 0 Or (avkImgUsage[dst] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
@@ -849,10 +849,14 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImage requires GENERAL layout for both roles when copying within one image (Anvil code -20001); no copy was recorded.")
     ProcedureReturn
   EndIf
-  If avkImgTiling[src] = #VK_IMAGE_TILING_OPTIMAL
+  If avkImgTiling[dst] = #VK_IMAGE_TILING_OPTIMAL
     *r = *regions
-    If regionCount <> 1 Or srcImage = dstImage Or avkImgW[src] <> avkImgW[dst] Or avkImgH[src] <> avkImgH[dst] Or avkImgBackendLayout[src] = 0 Or avkImgBackendLayout[dst] = 0 Or avkImgBackendLayout[src] <> avkImgBackendLayout[dst] Or avkImgPaddedW[src] <> avkImgPaddedW[dst] Or avkImgPaddedH[src] <> avkImgPaddedH[dst] Or avkImgSize[src] <> avkImgSize[dst]
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage requires one complete optimal-image region between distinct images with the same TFU layout and extent (Anvil code -20005); nothing was recorded.")
+    If regionCount <> 1 Or srcImage = dstImage Or avkImgW[src] <> avkImgW[dst] Or avkImgH[src] <> avkImgH[dst] Or avkImgBackendLayout[dst] = 0 Or (avkImgTiling[src] = #VK_IMAGE_TILING_OPTIMAL And (avkImgBackendLayout[src] <> avkImgBackendLayout[dst] Or avkImgPaddedW[src] <> avkImgPaddedW[dst] Or avkImgPaddedH[src] <> avkImgPaddedH[dst] Or avkImgSize[src] <> avkImgSize[dst]))
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage requires one complete image region into a distinct optimal image with a compatible TFU source and extent (Anvil code -20005); nothing was recorded.")
+      ProcedureReturn
+    EndIf
+    If avkImgTiling[src] = #VK_IMAGE_TILING_LINEAR And (avkImgPitch[src] < avkImgW[src] * #ANVIL_VK_BGRA8_TEXEL_BYTES Or (avkImgPitch[src] % #ANVIL_VK_BGRA8_TEXEL_BYTES) <> 0 Or avkImgSize[src] < avkImgPitch[src] * avkImgH[src])
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImage found an invalid linear source pitch or allocation for the TFU (Anvil code -20004); nothing was recorded.")
       ProcedureReturn
     EndIf
     If *r\srcSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *r\dstSubresource\aspectMask <> #VK_IMAGE_ASPECT_COLOR_BIT Or *r\srcSubresource\mipLevel <> 0 Or *r\dstSubresource\mipLevel <> 0 Or *r\srcSubresource\baseArrayLayer <> 0 Or *r\dstSubresource\baseArrayLayer <> 0 Or *r\srcSubresource\layerCount <> 1 Or *r\dstSubresource\layerCount <> 1 Or *r\srcOffset\x <> 0 Or *r\srcOffset\y <> 0 Or *r\srcOffset\z <> 0 Or *r\dstOffset\x <> 0 Or *r\dstOffset\y <> 0 Or *r\dstOffset\z <> 0 Or *r\extent\width <> avkImgW[src] Or *r\extent\height <> avkImgH[src] Or *r\extent\depth <> 1
@@ -2063,6 +2067,23 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       If avkImgW[sourceImageSlot] <> avkImgW[destinationImageSlot] Or avkImgH[sourceImageSlot] <> avkImgH[destinationImageSlot] Or avkImgPaddedW[sourceImageSlot] <> avkImgPaddedW[destinationImageSlot] Or avkImgPaddedH[sourceImageSlot] <> avkImgPaddedH[destinationImageSlot] Or avkBackendTiledImageCopyValidate(@tiledCopy) <> 0
         ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid optimal-image TFU copy or changed resource layout (Anvil code -20004); nothing was submitted.")
       EndIf
+    ElseIf avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_LINEAR And avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_OPTIMAL
+      If imageCopies > 1 And avkBackendImageCopyBatchReady() = 0
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order linear-to-optimal image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
+      EndIf
+      copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
+      copy\sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot]
+      copy\sourceBytes = avkImgSize[sourceImageSlot]
+      copy\sourcePitch = avkImgPitch[sourceImageSlot]
+      copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[destinationImageSlot]] + avkImgMemOffset[destinationImageSlot]
+      copy\destinationBytes = avkImgSize[destinationImageSlot]
+      copy\width = avkImgW[sourceImageSlot] : copy\height = avkImgH[sourceImageSlot]
+      copy\destinationLayout = avkImgBackendLayout[destinationImageSlot]
+      copy\paddedWidth = avkImgPaddedW[destinationImageSlot] : copy\paddedHeight = avkImgPaddedH[destinationImageSlot]
+      copy\timeoutUs = 250000
+      If avkImgW[sourceImageSlot] <> avkImgW[destinationImageSlot] Or avkImgH[sourceImageSlot] <> avkImgH[destinationImageSlot] Or avkBackendImageCopyValidate(@copy) <> 0
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid linear-to-optimal TFU source, destination or layout (Anvil code -20004); nothing was submitted.")
+      EndIf
     ElseIf avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_LINEAR And avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_LINEAR
     sourcePitch = avkImgPitch[sourceImageSlot]
     destinationPitch = avkImgPitch[destinationImageSlot]
@@ -2241,6 +2262,22 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           If job <> #ANVIL_VK_JOB_DONE
             avkFlightComplete(0)
             ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying an optimal Vulkan image (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+        ElseIf avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_OPTIMAL
+          copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
+          copy\sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot]
+          copy\sourceBytes = avkImgSize[sourceImageSlot]
+          copy\sourcePitch = avkImgPitch[sourceImageSlot]
+          copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[destinationImageSlot]] + avkImgMemOffset[destinationImageSlot]
+          copy\destinationBytes = avkImgSize[destinationImageSlot]
+          copy\width = avkImgW[sourceImageSlot] : copy\height = avkImgH[sourceImageSlot]
+          copy\destinationLayout = avkImgBackendLayout[destinationImageSlot]
+          copy\paddedWidth = avkImgPaddedW[destinationImageSlot] : copy\paddedHeight = avkImgPaddedH[destinationImageSlot]
+          copy\timeoutUs = 250000
+          job = avkBackendSubmitImageCopy(@copy)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying a linear Vulkan image into an optimal image (VkResult -4); the command buffer was invalidated and its fence signalled.")
           EndIf
         Else
         sourcePitch = avkImgPitch[sourceImageSlot]
