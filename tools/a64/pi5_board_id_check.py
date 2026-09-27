@@ -39,6 +39,7 @@ REL_ID = "RaspberryPi4/Board/hw_id.pi4"
 REL_INFO = "RaspberryPi4/Board/clock_info.pi4"
 REL_SDIO = "RaspberryPi4/Lib/sdio.pi4"
 REL_LED = "RaspberryPi4/Lib/led_act.pi4"
+REL_GPIO = "RaspberryPi4/Lib/gpio_rp1.pi4"
 REL_FMT = "Anvil/Core/format.pbi"
 REL_SAFETY = "RaspberryPi4/Lib/safety.pi4"
 
@@ -128,6 +129,7 @@ EndProcedure
 XIncludeFile "Anvil/Core/format.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_id.pi4"
 XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
 XIncludeFile "RaspberryPi4/Lib/led_act.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
 ; --- cut from clock_info.pi4 ---
@@ -138,8 +140,64 @@ Global gate_never.i
 If gate_never = 1
   HwIdBoard() : HwIdCpu() : HwIdTarget() : HwPmfTargetId() : HwIdSayImage()
   PutRevision(0) : LedActBegin() : LedActSet(0) : LedActToggle() : safety_WdogArm(10)
+  LedPwrBegin() : LedPwrSet(0) : LedPwrToggle() : LedPwrLit() : LedPwrIsOutput()
 EndIf
 '''
+
+
+# ---- the PWR LED: RP1 GPIO44, from the sources, never from the library ----
+# bcm2712-rpi-5-b.dts led_pwr gpios = <&rp1_gpio 44 GPIO_ACTIVE_LOW>;
+# pinctrl-rp1.c rp1_iobanks[2] = {34, 20, gpio $8000, rio $8000, pads $8004},
+# so GPIO44 is bank 2 index 10; CTRL = IO + $8000 + 10*8 + 4, PAD = PADS +
+# $8004 + 10*4, RIO OUT/OE/IN at SYS_RIO + $8000 + 0/4/8, bit 10, with the
+# SET/CLR aliases at +$2000/+$3000; FUNCSEL 5 = GPIO. RP1 is CPU $1F_00xxxxxx.
+PWR_BIT = 1 << 10
+PWR_CTRL = 0x1F_000D_0000 + 0x8000 + 10 * 8 + 4
+PWR_PAD = 0x1F_000F_0000 + 0x8004 + 10 * 4
+PWR_RIO = 0x1F_000E_0000 + 0x8000
+
+
+class PwrModel:
+    """GPIO44 and its bank-2 neighbours; anything else RP1 is refused."""
+
+    def __init__(self, oe=1 << 11, out=1 << 11, stuck=None):
+        self.ctrl, self.pad = 0x1F, 0x80               # reset: no function, pad off
+        self.oe, self.out = oe, out                    # GPIO45's bits are someone else's
+        self.oe0, self.out0 = oe, out
+        self.stuck = stuck                             # None, or the level the pad is stuck at
+        self.log = []
+
+    def rio_in(self):
+        if self.stuck is not None:
+            return self.stuck
+        if self.ctrl & 0x1F == 5 and self.oe & PWR_BIT:
+            return self.out
+        return PWR_BIT                                 # an undriven LED pad reads high
+
+    def lit(self):
+        return self.ctrl & 0x1F == 5 and bool(self.oe & PWR_BIT) and not self.out & PWR_BIT
+
+    def __call__(self, addr, size, value):
+        if size != 4:
+            d.die("a %d-byte RP1 access at $%X" % (size, addr))
+        regs = {PWR_CTRL: "ctrl", PWR_PAD: "pad"}
+        if addr in regs:
+            if value is None:
+                return getattr(self, regs[addr])
+            self.log.append((regs[addr], value))
+            setattr(self, regs[addr], value & 0xFFFFFFFF)
+            return 0
+        off = addr - PWR_RIO
+        if off in (0, 4, 8) and value is None:
+            return {0: self.out, 4: self.oe, 8: self.rio_in()}[off]
+        if off in (0x2000, 0x3000, 0x2004, 0x3004) and value is not None:
+            which = "out" if (off & 0xF) == 0 else "oe"
+            self.log.append((which + ("+" if off & 0x2000 and not off & 0x1000 else "-"), value))
+            cur = getattr(self, which)
+            setattr(self, which, cur | value if off < 0x3000 else cur & ~value)
+            return 0
+        d.die("the PWR LED touched $%X (%s), not GPIO44's CTRL/PAD or bank 2's RIO "
+              "OUT/OE/IN through SET/CLR" % (addr, "read" if value is None else "write"))
 
 
 def cut_revision(text: str) -> str:
@@ -213,7 +271,7 @@ def gate(override: dict, work: pathlib.Path, cc: str) -> int:
     info = d.source(REL_INFO, override)
     text = DRIVER.replace("%(REVISION)s", cut_revision(info))
     img, procs = d.build(cc, text, "boardid", work, override,
-                         [REL_FMT, REL_ID, REL_SDIO, REL_LED, REL_SAFETY])
+                         [REL_FMT, REL_ID, REL_SDIO, REL_GPIO, REL_LED, REL_SAFETY])
 
     # ---- identity ------------------------------------------------------
     m = Model()
@@ -265,6 +323,39 @@ def gate(override: dict, work: pathlib.Path, cc: str) -> int:
     mc2 = d.Machine(img, procs, m2)
     expect(mc2.signed(mc2.call("LedActBegin")) == stuck, "a pin that stays an input was accepted")
     expect(mc2.signed(mc2.call("LedActSet", 1)) == st, "Set after a failed Begin was accepted")
+    # ---- the PWR LED (RP1 GPIO44, active low) ------------------------------
+    p = PwrModel()
+    mp = d.Machine(img, procs, p)
+    expect(mp.signed(mp.call("LedPwrSet", 1)) == st and not p.log,
+           "LedPwrSet before LedPwrBegin was not refused, or it wrote")
+    expect(mp.call("LedPwrBegin") == 0, "LedPwrBegin failed")
+    kinds = [k for k, v in p.log]
+    expect(kinds and kinds[0] == "out+" and p.log[0][1] == PWR_BIT,
+           "Begin did not set GPIO44 high (dark) first: %s" % kinds)
+    expect(kinds.index("ctrl") < kinds.index("oe+"),
+           "Begin enabled the output before selecting the GPIO function: %s" % kinds)
+    expect(p.ctrl == 5 and p.pad & 0xC0 == 0x40 and p.oe & PWR_BIT and not p.lit(),
+           "after Begin GPIO44 is not a dark GPIO output (CTRL $%X PAD $%X)" % (p.ctrl, p.pad))
+    for want in (1, 0, 1):
+        expect(mp.call("LedPwrSet", want) == 0 and p.lit() == bool(want),
+               "LedPwrSet(%d) left the PWR LED %s" % (want, "lit" if p.lit() else "dark"))
+    expect(mp.call("LedPwrLit") == 1, "LedPwrLit does not read lit from the pad")
+    expect(mp.call("LedPwrToggle") == 0 and not p.lit(), "LedPwrToggle did not toggle")
+    expect(mp.call("LedPwrSet", 7) == 0 and p.lit(), "LedPwrSet(7) is not 'on'")
+    expect(p.oe & ~PWR_BIT == p.oe0 & ~PWR_BIT and p.out & ~PWR_BIT == p.out0 & ~PWR_BIT,
+           "another bank-2 line (GPIO45, the fan) moved")
+    # A pad stuck LOW reads lit from the start: Begin refuses, and nothing
+    # after it is accepted. A pad stuck HIGH passes Begin (dark is what
+    # Begin asks for) and is caught by the first Set that asks for lit.
+    p2 = PwrModel(stuck=0)
+    mp2 = d.Machine(img, procs, p2)
+    expect(mp2.signed(mp2.call("LedPwrBegin")) == stuck and
+           mp2.signed(mp2.call("LedPwrSet", 1)) == st,
+           "a PWR LED pad stuck lit was accepted by Begin")
+    p3 = PwrModel(stuck=PWR_BIT)
+    mp3 = d.Machine(img, procs, p3)
+    expect(mp3.call("LedPwrBegin") == 0 and mp3.signed(mp3.call("LedPwrSet", 1)) == stuck,
+           "a PWR LED pad stuck dark was reported lit")
     # ---- reset: the PM watchdog on a BCM2712 -----------------------------
     saf = d.source(REL_SAFETY, override)
     if re.search(r"CompilerIf #PMF_CHIP = 2712\s*\n#SAFETY_PM_BASE", saf):
@@ -305,6 +396,13 @@ MUTATIONS = [
     (REL_LED, "a whole-register write", "PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))", "PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, 0)"),
     (REL_LED, "direction before value (a flash)", "  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v | #LED_ACT_BIT)\n  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))\n", "  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))\n  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v | #LED_ACT_BIT)\n"),
     (REL_LED, "the readback skipped", "  If LedActIsOutput() = 0 Or LedActLit() <> 0\n", "  If 0\n"),
+    (REL_LED, "PWR LED active high", "    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_LOW)\n  Else\n    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH)",
+     "    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH)\n  Else\n    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_LOW)"),
+    (REL_LED, "PWR LED output before its level (a flash)",
+     "  If Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH) = 0\n    ProcedureReturn #LED_ACT_STUCK\n  EndIf\n  If Rp1PinOutput(#RP1_GPIO_PWR_LED) = 0\n    ProcedureReturn #LED_ACT_STUCK\n  EndIf\n",
+     "  If Rp1PinOutput(#RP1_GPIO_PWR_LED) = 0\n    ProcedureReturn #LED_ACT_STUCK\n  EndIf\n  If Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH) = 0\n    ProcedureReturn #LED_ACT_STUCK\n  EndIf\n"),
+    (REL_LED, "PWR LED readback skipped", "  If LedPwrIsOutput() = 0 Or LedPwrLit() <> 0\n", "  If 0\n"),
+    (REL_GPIO, "PWR LED on GPIO43", "#RP1_GPIO_PWR_LED     = 44", "#RP1_GPIO_PWR_LED     = 43"),
 ]
 
 

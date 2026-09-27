@@ -30,9 +30,13 @@
 ;  ORDER: value, then direction - the LED is set OFF before the pin
 ;  becomes an output, so taking the pin never flashes it.
 ;
-;  WHAT IS NOT HERE, AND WHY. The red PWR LED is RP1 GPIO44, active low
-;  (dts led_pwr) - RP1 bank 1, which RaspberryPi4/Lib/gpio_rp1.pi4 does
-;  not implement yet. The power button is NOT a GPIO this monitor owns: a
+;  THE RED PWR LED is here too, below - RP1 GPIO44, active low (dts
+;  led_pwr), in RP1 IO bank 2, driven through RaspberryPi4/Lib/gpio_rp1.pi4
+;  (banks 1 and 2 since Anvil d4fb13c). Same shape as the ACT LED, no copy
+;  of any GPIO encoding. Library level only: no seam until the owner rules
+;  on the status-LED seam (vault morning list 2026-09-27, item 6).
+;
+;  WHAT IS NOT HERE, AND WHY. The power button is NOT a GPIO this monitor owns: a
 ;  press while the board is off, and a long press, are the PMIC's and the
 ;  firmware's; the running system sees it as gio GPIO20, active low,
 ;  pull-up (dts pwr_button gpio-keys, KEY_POWER), and its pull is set by
@@ -40,7 +44,8 @@
 ;  ruling (see the vault note).
 ;
 ;  NOT VERIFIED ON A Pi 5. Desk-proven (tools/a64/led_act_check.py).
-;  REQUIRES: RaspberryPi4/Lib/sdio.pi4 (the two gio offsets).
+;  REQUIRES: RaspberryPi4/Lib/sdio.pi4 (the two gio offsets) and
+;  RaspberryPi4/Lib/gpio_rp1.pi4 (the PWR LED), both included before this.
 ; ======================================================================
 
 CompilerIf #PMF_CHIP <> 2712
@@ -115,4 +120,70 @@ EndProcedure
 
 Procedure.i LedActToggle()
   ProcedureReturn LedActSet(1 - led_act_on)
+EndProcedure
+
+; ======================================================================
+;  THE PWR LED - RP1 GPIO44, ACTIVE LOW.
+;  bcm2712-rpi-5-b.dts led_pwr: gpios = <&rp1_gpio 44 GPIO_ACTIVE_LOW>,
+;  label "PWR"; pinctrl-rp1.c PIN(44, ..., gpio, ...) - plain GPIO is
+;  FUNCSEL 5 (#RP1_FUNCSEL_GPIO). The pin is gpio_rp1.pi4's
+;  #RP1_GPIO_PWR_LED; every register touch is gpio_rp1.pi4's.
+;
+;  LIT IS READ FROM THE PAD (RIO_IN), not from what was written, so a pin
+;  that did not follow is refused by name. Order as the ACT LED: the level
+;  (high = dark) is set BEFORE the pin becomes a GPIO output, so taking
+;  it never flashes the LED. Returns the #LED_ACT_* codes.
+; ======================================================================
+Global led_pwr_on.i
+Global led_pwr_begun.i
+
+Procedure.i LedPwrIsOutput()
+  If Rp1FuncSelGet(#RP1_GPIO_PWR_LED) = #RP1_FUNCSEL_GPIO And Rp1PinModeGet(#RP1_GPIO_PWR_LED) = 1
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i LedPwrLit()
+  If Rp1DigitalRead(#RP1_GPIO_PWR_LED) = #RP1_PIN_LOW
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i LedPwrBegin()
+  led_pwr_begun = 0
+  If Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH) = 0
+    ProcedureReturn #LED_ACT_STUCK
+  EndIf
+  If Rp1PinOutput(#RP1_GPIO_PWR_LED) = 0
+    ProcedureReturn #LED_ACT_STUCK
+  EndIf
+  If LedPwrIsOutput() = 0 Or LedPwrLit() <> 0
+    ProcedureReturn #LED_ACT_STUCK
+  EndIf
+  led_pwr_on = 0
+  led_pwr_begun = 1
+  ProcedureReturn #LED_ACT_OK
+EndProcedure
+
+Procedure.i LedPwrSet(on.i)
+  If led_pwr_begun = 0
+    ProcedureReturn #LED_ACT_STATE
+  EndIf
+  If on <> 0
+    on = 1
+    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_LOW)
+  Else
+    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH)
+  EndIf
+  If LedPwrLit() <> on
+    ProcedureReturn #LED_ACT_STUCK
+  EndIf
+  led_pwr_on = on
+  ProcedureReturn #LED_ACT_OK
+EndProcedure
+
+Procedure.i LedPwrToggle()
+  ProcedureReturn LedPwrSet(1 - led_pwr_on)
 EndProcedure
