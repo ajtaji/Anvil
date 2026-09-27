@@ -217,6 +217,14 @@ EndProcedure
 #XHCI_TMO_EVENT_MS = 5000
 #XHCI_EP_STATE_RUNNING = 1
 #XHCI_EP_STATE_STOPPED = 3
+; XhciBulkIn's unaligned-buffer bounce (xhci.pi4, 2026-09-27). Every
+; buffer this probe reads into is 64-byte aligned (msc_BlockIo bounces its
+; own), so the bounce is linked and never taken - what the probe measures
+; is unchanged.
+#XHCI_ALIGN = 64
+#XHCI_BULKIN_BOUNCE = 4096
+#XHCI_ERR_UNALIGNED = 51
+Global Dim xh_bulkBounce.a[#XHCI_BULKIN_BOUNCE + #XHCI_ALIGN]
 
 Global Dim msc_pool.a[#MSC_POOL_BYTES]
 Global msc_base.i = 0
@@ -980,7 +988,7 @@ MSC_PROCS = ("MscBuffers", "msc_Cbw", "msc_Csw", "msc_Data", "msc_Bounce", "msc_
 # Production procedures on the controller side of a recovery. Build 173 has
 # none of them, which is the point; the probe takes what the source under
 # test actually has.
-XHCI_PROCS = ("XhciBulkOut", "XhciBulkIn", "xh_DrainEvents", "XhciBulkReconfigure")
+XHCI_PROCS = ("XhciBulkOut", "xh_BulkInBounced", "XhciBulkIn", "xh_DrainEvents", "XhciBulkReconfigure")
 
 
 def program(pcie_src: str, msc_src: str, xhci_src: str) -> str:

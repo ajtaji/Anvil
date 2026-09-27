@@ -197,8 +197,13 @@ class BotStick(H.Dev):
             self.state = "csw"
 
 
+P5_DMA_OFF = K.P5.DMA_OFF
+
+
 class Rp1MscCtl(K.Rp1HidCtl):
     """RP1 + HID bus, plus bulk endpoints."""
+
+    bounce = None                   # (lo, hi) CPU range of xh_bulkBounce
 
     def configure_endpoint(self, slot, in_ctx):
         comp = super().configure_endpoint(slot, in_ctx)
@@ -269,6 +274,13 @@ class Rp1MscCtl(K.Rp1HidCtl):
                 self.bad("a bulk TD ends without TRB_IOC - no event would be posted")
             total = sum(n for _, n in segs)
             if dir_in:
+                lo = segs[0][0] - P5_DMA_OFF
+                hi = lo + total
+                inside_bounce = self.bounce and self.bounce[0] <= lo and hi <= self.bounce[1]
+                if (lo % 64 or hi % 64) and not inside_bounce:
+                    self.bad(f"a bulk-IN TD writes ${lo:X}..${hi:X}, sharing a cache line with "
+                             f"memory outside the buffer and outside xhci.pi4's bounce - a "
+                             f"write-back of the neighbours would overwrite the delivered bytes")
                 comp, data = dev.bulk_in(self, total)
                 data = data or b""
                 pos = 0
@@ -329,6 +341,7 @@ MAIN = r'''
 Global Dim gName.a[16]
 Global Dim gNew.a[16]
 Global Dim gBuf.a[1024]
+Global Dim gArea.a[1024]
 
 Procedure PutName(*dst, *src)
   Define i.i
@@ -343,6 +356,7 @@ Procedure Main()
   Define t0.i
   Define n.i
   Define i.i
+  Define a.i
   t0 = xh_Ticks()
   Chk(UsbEnumerate())
   Chk((xh_Ticks() - t0) / (xh_TickHz() / 1000))
@@ -381,6 +395,47 @@ Procedure Main()
   FsClose()
   Chk(Bool(FsFlush() <> 0))
   Chk(FsLastError())
+  ; ---- an UNALIGNED bulk-IN buffer: a raw Bulk-Only INQUIRY read to
+  ; byte 5 of a sentinel-filled area. Its neighbours must survive and no
+  ; controller write may share a cache line with them (the model checks
+  ; the second; the bounce is what makes both true).
+  a = ((@gArea[0] + 63) / 64) * 64
+  i = 0
+  While i < 256
+    PokeA(a + i, $A5)
+    i = i + 1
+  Wend
+  i = 0
+  While i < 31
+    PokeA(a + 512 + i, 0)
+    i = i + 1
+  Wend
+  PokeL(a + 512, $43425355)
+  PokeL(a + 516, $12345678)
+  PokeL(a + 520, 36)
+  PokeA(a + 524, $80)
+  PokeA(a + 526, 6)
+  PokeA(a + 527, $12)
+  PokeA(a + 531, 36)
+  Chk(XhciBulkOut(a + 512, 31))
+  Chk(XhciBulkIn(a + 5, 36))
+  Chk(XhciBulkIn(a + 576, 64))
+  n = 0
+  i = 0
+  While i < 256
+    If i < 5 Or i >= 41
+      If PeekA(a + i) = $A5
+        n = n + 1
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  Chk(n)
+  Chk(PeekA(a + 5 + 8))
+  Chk(PeekL(a + 576 + 4))
+  ; larger than the bounce AND unaligned: refused by name, nothing queued
+  Chk(XhciBulkIn(a + 1, 5000))
+  Chk(XhciLastError())
   Chk(nres)
 EndProcedure
 
@@ -442,6 +497,7 @@ def build(compiler, work, root, cursor_text):
     if "usbmsc.pi4" not in head or "MscSetupCurrent()\n  ProcedureReturn 0" in head:
         raise SystemExit("could not adapt the kbd gate's program - re-aim")
     cut = K.without_guard(K.cut(cursor_text, "Procedure.i UsbEnumerate()"))
+    head = head.replace("#RES_MAX = 64", "#RES_MAX = 128")
     text = head.replace("%(CUT)s", cut) + MAIN
     src = work / "usbmsc5.pi4"
     src.write_text(text, encoding="utf-8")
@@ -469,6 +525,9 @@ def run(img, scenario, budget=200_000_000):
     stick = BotStick(disk) if disk is not None else None
     topo = {3: stick} if stick else {}
     ctl = Rp1MscCtl(cpu, topo, "healthy")
+    if "global_xh_bulkbounce" in sym:
+        b0 = sym["global_xh_bulkbounce"]
+        ctl.bounce = (b0, b0 + 4096 + 64)
     K.install(cpu, ctl)
     trap = LOAD + sym["_a64_end_trap"]
     done = False
@@ -478,12 +537,12 @@ def run(img, scenario, budget=200_000_000):
             break
         cpu.step()
     nres = cpu.load(sym["global_nres"], 8)
-    got = [cpu.load(sym["global_res"] + 8 * i, 8) for i in range(min(nres, 64))]
+    got = [cpu.load(sym["global_res"] + 8 * i, 8) for i in range(min(nres, 128))]
     got = [v - (1 << 64) if v >= 1 << 63 else v for v in got]
     fails = []
     if not done:
         return [f"the program never reached its end trap in {budget} steps - IT HUNG"]
-    want_n = 7 if scenario == "nostick" else 62
+    want_n = 7 if scenario == "nostick" else 70
     if len(got) < want_n:
         return [f"{scenario}: the program recorded {len(got)} results, want {want_n} "
                 f"(it stopped early: enumerate/bulk/ready = {got[:5]})"] + \
@@ -517,6 +576,17 @@ def run(img, scenario, budget=200_000_000):
             fails.append(f"{scenario}: NEW.TXT on the stick holds {bytes(e.data)[:16]!r}...")
         if rep.errors:
             fails.append(f"{scenario}: fs_reference finds damage: {rep.errors[:3]}")
+        cbw_out, got_in, csw_in, alive, vend, csw_tag, big, big_err = got[61:69]
+        if [cbw_out, got_in, csw_in] != [31, 36, 13]:
+            fails.append(f"{scenario}: raw INQUIRY moved {[cbw_out, got_in, csw_in]}, want [31, 36, 13]")
+        if alive != 220:
+            fails.append(f"{scenario}: {220 - alive} of the 220 sentinel bytes around the "
+                         f"unaligned buffer were overwritten")
+        if vend != ord("A") or csw_tag != 0x12345678:
+            fails.append(f"{scenario}: the unaligned read delivered vendor byte {vend}, CSW tag ${csw_tag:X}")
+        if big != 0 or big_err != 51:
+            fails.append(f"{scenario}: an unaligned 5000-byte read gave {big}, error {big_err} "
+                         f"(want 0, 51 #XHCI_ERR_UNALIGNED)")
     fails += ["model refused: " + v for v in ctl.violations]
     return fails
 
@@ -528,6 +598,9 @@ MUTANTS = {
     "stick-never-offered-to-msc": (REL_CURSOR,
         "    If XhciUseSlot(HidOtherSlot(i)) <> 0\n      MscSetupCurrent()\n",
         "    If XhciUseSlot(HidOtherSlot(i)) <> 0\n"),
+    "unaligned-bulk-in-not-bounced": ("RaspberryPi4/Lib/xhci.pi4",
+        "  If ((*buf | len) & (#XHCI_ALIGN - 1)) <> 0\n    ProcedureReturn xh_BulkInBounced(*buf, len)\n  EndIf\n",
+        ""),
     "bulk-ring-untranslated": ("RaspberryPi4/Lib/xhci.pi4",
         "  deq = xh_Dma(xh_ringBase[#XHCI_RING_BULK_IN]) | xh_ringCycle[#XHCI_RING_BULK_IN]",
         "  deq = xh_ringBase[#XHCI_RING_BULK_IN] | xh_ringCycle[#XHCI_RING_BULK_IN]"),
