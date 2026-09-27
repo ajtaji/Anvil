@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 712
+REPORT_WORDS = 728
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1590,6 +1590,14 @@ def grade(cpu, rc) -> Grader:
     g.need("clear-only render pass completes through its fence", slot(706), 0)
     g.need("completed clear releases framebuffer, pass and view", slot(707), 0)
     g.need("clear-only pass publishes its final attachment layout", slot(708), 6)
+    g.need("VkImageCopy retains its core 1.0 C ABI size", slot(709), 68)
+    g.need("whole linear image copy records", slot(710), 0)
+    g.need("whole linear image copy submits", slot(711), 0)
+    g.need("whole linear image copy completes", slot(712), 0)
+    g.need("whole linear image copy preserves destination layout", slot(713), 7)
+    g.need("whole linear image copy matches every source byte", slot(714), 0)
+    g.need("partial image copy invalidates recording", slot(715), ERR_UNSUPPORTED)
+    g.need("refused partial image copy leaves no flight", slot(716), 0)
     g.need("held draw retains its exact pipeline", slot(660), 1)
     g.need("held draw retains its exact descriptor set", slot(661), 1)
     g.need("held draw retains its exact framebuffer", slot(662), 1)
@@ -2180,7 +2188,7 @@ def main() -> int:
     print("  the whole public path runs: eight shader modules, five pipeline layouts, a")
     print("  render pass, a framebuffer, four buffers, a sampler, three descriptor set layouts, two pools")
     print("  and three sets, six graphics pipelines over four live slots, ordered render passes with draws,")
-    print("  whole-attachment and clear-only render-pass GPU jobs, multiple submissions and a fence")
+    print("  whole-attachment and clear-only render-pass jobs, a whole linear image copy, multiple submissions and a fence")
     print("  all five shader variants were compiled by the REAL V3D QPU emitter, and every byte")
     print("  of their shader records, attribute records, uniform streams and default")
     print("  attribute values matches a record this checker packed from the documented layout")

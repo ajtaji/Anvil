@@ -212,10 +212,11 @@ remains missing.
 - General command allocation arrays, secondary execution and inheritance,
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
-- Buffer/image copies beyond the one implemented tightly packed whole-image
-  buffer-to-optimal-image transfer; blits, resolves, fills, updates, mip
-  transitions, depth/stencil clears, partial colour clears and multi-range
-  clears remain missing. TFU is not represented as a general memcpy.
+- Buffer/image copies beyond the implemented tightly packed whole-image
+  buffer-to-optimal-image TFU transfer and equal-size whole linear-image DMA
+  copy; blits, resolves, mip transitions, depth/stencil clears, partial colour
+  clears and multi-range clears remain missing. TFU is not represented as a
+  general memcpy.
 - Queries, timestamps, conditional behavior, dynamic state other than the
   implemented per-draw viewport/scissor pair, indirect draws, dispatch, and broader
   render-pass commands. The sixteen-byte fragment push-constant block is

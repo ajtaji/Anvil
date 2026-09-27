@@ -661,6 +661,14 @@ Structure VkImageSubresourceLayers Align #PB_Structure_AlignC
   layerCount.l
 EndStructure
 
+Structure VkImageCopy Align #PB_Structure_AlignC
+  srcSubresource.VkImageSubresourceLayers
+  srcOffset.VkOffset3D
+  dstSubresource.VkImageSubresourceLayers
+  dstOffset.VkOffset3D
+  extent.VkExtent3D
+EndStructure
+
 ; Exact core-1.0 ABI. VkDeviceSize gives the structure eight-byte alignment;
 ; the embedded records place imageExtent at byte 44 and the C ABI rounds the
 ; complete record to 56 bytes.
