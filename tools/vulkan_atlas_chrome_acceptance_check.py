@@ -25,7 +25,7 @@ MAGIC, TAIL = 0x59524156, 0x56415259
 # coordinate, exact attachment/presented BGRA word, semantic assertion
 PROBES = (
     ((100, 110), 0xFF000080, "solid panel from the atlas' white texel and blue tint"),
-    ((100, 150), 0xFF00FFFF, "later solid toolbar from the same texel and cyan tint"),
+    ((100, 150), 0xFF0000FF, "later solid toolbar from the ordered magenta upload and cyan tint"),
     ((130, 316), 0xFF000080, "transparent glyph texel preserves the panel"),
     ((150, 316), 0xFFFFFFFF, "covered atlas texel receives white tint"),
     ((650, 316), 0xFFFF00FF, "covered atlas texel inside final scissor receives magenta tint"),
@@ -45,6 +45,8 @@ def check_source() -> int:
         "vkCmdCopyBufferToImage(cmd, stage, tex",
         "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
         "vkCmdCopyImage(cmd, texLinear, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texLinearCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
+        "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texMixed, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
+        "PokeL(mapped + 64, $FFFF00FF)",
         "copy\\bufferRowLength = #VAC_ATLAS_SOURCE_STRIDE",
         "#VAC_ATLAS_SOURCE_STRIDE = 16",
         "#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
@@ -61,8 +63,8 @@ def check_source() -> int:
     for needle in required:
         if needle not in text:
             fail(f"public atlas/chrome source contract missing: {needle}")
-    if text.count("vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)") != 2:
-        fail("the atlas must record exactly two ordered TFU uploads")
+    if text.count("vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)") != 3:
+        fail("the atlas must record two initial uploads and one mixed-stream upload")
 
     # Only inspect the mixed pass' render-pass sequence. Eight draws and eight
     # public dynamic-scissor snapshots are the acceptance shape.
@@ -100,7 +102,7 @@ def check_report(path: Path) -> int:
         133: PROBES[0][1], 134: PROBES[1][1], 135: PROBES[2][1],
         136: PROBES[3][1], 137: PROBES[4][1], 138: PROBES[5][1],
         153: 0, 154: 0, 155: 0,
-        159: 0, 160: 4,
+        159: 0, 160: 6,
         163: 0, 164: 0, 165: 0,
         166: 5,                 # VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         167: 1,                 # exact scene probes
@@ -143,7 +145,7 @@ def check_screenshot(path: Path) -> int:
 def synthetic() -> tuple[bytes, bytes]:
     r = [0] * 240
     exact = {
-        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 4, 162: 1024, 166: 5,
+        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 6, 162: 1024, 166: 5,
         167: 1, 175: 11, 220: 1, 221: 1, 222: 1, 223: 8,
         236: 0x40, 239: TAIL, 144: 0x20000000, 145: 0x00400800,
         149: 7, 150: 8, 151: 9, 152: 10, 87: 0x1234, 88: 0x1234,
