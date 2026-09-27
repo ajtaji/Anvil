@@ -692,6 +692,41 @@ Procedure.i Main()
     Next
     If status = 183 : Break : EndIf
 
+    ; The same odd UIF image reads directly into padded buffer rows.
+    ; Check every texel and the untouched gaps around each destination row.
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 187 : Break : EndIf
+    region\bufferOffset = 8192 : region\bufferRowLength = 41 : region\bufferImageHeight = 13
+    region\imageExtent\width = 36
+    dmaBefore = hwVkDmaOps
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 188 : Break : EndIf
+    vkCmdCopyImageToBuffer(arrayUploadCmd, optImg, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @region)
+    If vkEndCommandBuffer(arrayUploadCmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or hwVkDmaOps <> dmaBefore : status = 189 : Break : EndIf
+    region\imageExtent\width = 37
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 190 : Break : EndIf
+    For i = 8192 To 10307 : PokeA(bufMap + i, $A5) : Next
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 191 : Break : EndIf
+    vkCmdCopyImageToBuffer(arrayUploadCmd, optImg, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @region)
+    If vkEndCommandBuffer(arrayUploadCmd) <> #VK_SUCCESS : status = 192 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 193 : Break : EndIf
+    dmaBefore = hwVkDmaOps : cbHandle = arrayUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 194 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 195 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 40 Or DmaQuiescent() = 0 : status = 196 : Break : EndIf
+    For k = 0 To 12
+      For j = 0 To 36
+        i = k * 37 + j
+        If (PeekL(bufMap + 8192 + (k * 41 + j) * 4) & $FFFFFFFF) <> ($FF000000 | ((i * 7919 + 17) & $FFFFFF)) : status = 197 : Break : EndIf
+      Next
+      If status = 197 : Break : EndIf
+      If k < 12
+        For j = 37 * 4 To 41 * 4 - 1
+          If (PeekA(bufMap + 8192 + k * 41 * 4 + j) & $FF) <> $A5 : status = 198 : Break : EndIf
+        Next
+      EndIf
+      If status = 198 : Break : EndIf
+    Next
+    If status = 197 Or status = 198 : Break : EndIf
+
     status = 0
   Until 1
 
