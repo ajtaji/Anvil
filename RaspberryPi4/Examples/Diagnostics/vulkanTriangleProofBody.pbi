@@ -286,7 +286,7 @@ CompilerEndIf
 #VTP_X2 = $3F000000                    ;  0.5
 #VTP_Y2 = $3F000000                    ;  0.5
 CompilerIf #VTP_PYRAMID_DEMO
-#VTP_STRIDE = 48                       ; vec4 object/scale + colour + vec4 transform coefficients
+#VTP_STRIDE = 56                       ; vec4 object/scale + colour + two vec3 transform rows
 CompilerElse
 #VTP_STRIDE = 24                       ; vec2 position + vec4 colour
 CompilerEndIf
@@ -546,18 +546,18 @@ EndProcedure
 CompilerEndIf
 
 CompilerIf #VTP_PYRAMID_DEMO
-Global vtpRowX0.f, vtpRowX2.f
-Global vtpRowY0.f, vtpRowY2.f
+Global vtpRowX0.f, vtpRowX1.f, vtpRowX2.f
+Global vtpRowY0.f, vtpRowY1.f, vtpRowY2.f
 
 Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, z.f, scale.f, r.i, g.i, b.i)
   Define p.i = base + index * #VTP_STRIDE
-  Define fixedY.f = y * 0.91 * 0.72
-  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@z))
-  PokeL(p + 8, PeekL(@fixedY)) : PokeL(p + 12, PeekL(@scale))
+  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@y))
+  PokeL(p + 8, PeekL(@z)) : PokeL(p + 12, PeekL(@scale))
   PokeL(p + 16, r) : PokeL(p + 20, g)
   PokeL(p + 24, b) : PokeL(p + 28, #VTP_F_ONE)
-  PokeL(p + 32, PeekL(@vtpRowX0)) : PokeL(p + 36, PeekL(@vtpRowX2))
-  PokeL(p + 40, PeekL(@vtpRowY0)) : PokeL(p + 44, PeekL(@vtpRowY2))
+  PokeL(p + 32, PeekL(@vtpRowX0)) : PokeL(p + 36, PeekL(@vtpRowX1))
+  PokeL(p + 40, PeekL(@vtpRowX2)) : PokeL(p + 44, PeekL(@vtpRowY0))
+  PokeL(p + 48, PeekL(@vtpRowY1)) : PokeL(p + 52, PeekL(@vtpRowY2))
 EndProcedure
 
 Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
@@ -571,8 +571,8 @@ Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
   Define i.i, j.i, face.i, a.i, b.i, d.i, tmp.i
   Define zz.f, scale.f
   Define red.i, green.i, blue.i
-  vtpRowX0 = ca * 0.82 : vtpRowX2 = sa * 0.82
-  vtpRowY0 = sa * 0.42 * 0.72 : vtpRowY2 = 0.0 - ca * 0.42 * 0.72
+  vtpRowX0 = ca * 0.82 : vtpRowX1 = 0.0 : vtpRowX2 = sa * 0.82
+  vtpRowY0 = sa * 0.42 * 0.72 : vtpRowY1 = 0.91 * 0.72 : vtpRowY2 = 0.0 - ca * 0.42 * 0.72
   x[0] = 0.0 : y[0] = 1.25 : z[0] = 0.0
   x[1] = -1.0 : y[1] = -0.80 : z[1] = -1.0
   x[2] = 1.0 : y[2] = -0.80 : z[2] = -1.0
@@ -1199,8 +1199,12 @@ CompilerEndIf
 CompilerIf #VTP_PYRAMID_DEMO
   attrs[2]\location = 2
   attrs[2]\binding = 0
-  attrs[2]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  attrs[2]\format = #VK_FORMAT_R32G32B32_SFLOAT
   attrs[2]\offset = 32
+  attrs[3]\location = 3
+  attrs[3]\binding = 0
+  attrs[3]\format = #VK_FORMAT_R32G32B32_SFLOAT
+  attrs[3]\offset = 44
 CompilerEndIf
   vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
   vi\vertexBindingDescriptionCount = 1
@@ -1262,7 +1266,7 @@ CompilerEndIf
   stages[1]\module = fsB
 CompilerIf #VTP_PYRAMID_DEMO
   attrs[0]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
-  vi\vertexAttributeDescriptionCount = 3
+  vi\vertexAttributeDescriptionCount = 4
 CompilerElse
   vi\vertexAttributeDescriptionCount = 2
 CompilerEndIf

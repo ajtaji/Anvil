@@ -12,7 +12,7 @@ Global Dim vgVariables.AvkIrVariable[12]
 Global Dim vgInterfaces.i[12]
 Global Dim vgDecorations.AvkIrDecoration[24]
 Global Dim vgBlocks.AvkIrBlock[2]
-Global Dim vgNodes.AvkIrNode[24]
+Global Dim vgNodes.AvkIrNode[32]
 Global Dim vgInputs.AvkIrV3d42Io[4]
 Global Dim vgCsCode.i[#VG_CASES * 128]
 Global Dim vgVsCode.i[#VG_CASES * 128]
@@ -28,7 +28,7 @@ Procedure vgZero()
   i=0 : While i<SizeOf(.i)*12 : PokeA(@vgInterfaces[0]+i,0) : i=i+1 : Wend
   i=0 : While i<SizeOf(AvkIrDecoration)*24 : PokeA(@vgDecorations[0]+i,0) : i=i+1 : Wend
   i=0 : While i<SizeOf(AvkIrBlock)*2 : PokeA(@vgBlocks[0]+i,0) : i=i+1 : Wend
-  i=0 : While i<SizeOf(AvkIrNode)*24 : PokeA(@vgNodes[0]+i,0) : i=i+1 : Wend
+  i=0 : While i<SizeOf(AvkIrNode)*32 : PokeA(@vgNodes[0]+i,0) : i=i+1 : Wend
   i=0 : While i<SizeOf(AvkIrV3d42Io)*4 : PokeA(@vgInputs[0]+i,0) : i=i+1 : Wend
 EndProcedure
 
@@ -260,17 +260,21 @@ Procedure vgMatrixPosition(*m.AvkIrModule)
   *m\nodeCount=n : vgBlocks[0]\nodeCount=n
 EndProcedure
 
-; A tenth live arithmetic node exceeds the board-verified graph envelope.
+; A thirteenth live arithmetic node exceeds the board-verified graph envelope.
 Procedure vgMatrixTooDeep(*m.AvkIrModule)
+  Protected n.i = 15
+  Protected id.i = 58
+  Protected previous.i = 53
   vgMatrixPosition(*m)
-  vgNode(15,58,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[15]\operand0=53 : vgNodes[15]\operand1=30
-  vgNode(16,59,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[16]\operand0=58 : vgNodes[16]\operand1=30
-  vgNode(17,60,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[17]\operand0=59 : vgNodes[17]\operand1=30
-  vgNode(18,61,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[18]\operand0=60 : vgNodes[18]\operand1=30
-  vgNode(19,57,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4) : vgNodes[19]\operand0=61 : vgNodes[19]\operand1=56 : vgNodes[19]\operand2=30 : vgNodes[19]\operand3=31
-  vgNode(20,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[20]\operand0=20 : vgNodes[20]\operand1=57
-  vgNode(21,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0)
-  *m\nodeCount=22 : vgBlocks[0]\nodeCount=22
+  *m\idBound=72
+  While id <= 64
+    vgNode(n,id,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[n]\operand0=previous : vgNodes[n]\operand1=30
+    previous=id : id=id+1 : n=n+1
+  Wend
+  vgNode(n,57,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4) : vgNodes[n]\operand0=previous : vgNodes[n]\operand1=56 : vgNodes[n]\operand2=30 : vgNodes[n]\operand3=31 : n=n+1
+  vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=20 : vgNodes[n]\operand1=57 : n=n+1
+  vgNode(n,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : n=n+1
+  *m\nodeCount=n : vgBlocks[0]\nodeCount=n
 EndProcedure
 
 ; Position destination multiplicity hostiles: the semantic target, rather

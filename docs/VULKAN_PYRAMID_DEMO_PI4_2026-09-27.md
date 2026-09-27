@@ -80,7 +80,7 @@ order, and uploads the vertex buffer. Clip Z/W remain fixed at zero/one, and
 there is no depth attachment. This is a hardware vertex transform for the
 accepted graph shape, not a general Vulkan matrix-shader implementation.
 
-The current-source RAM payload and capture are in
+The three-attribute RAM payload and capture are in
 `docs/evidence/vulkan-pyramid-gpu-matrix-20260927/`. Its PMFBOOT v2 container
 is `vulkanPyramidGuard9.img.pmf`, 1,014,616 bytes, SHA-256
 `56e5e3bc1ca71a47fc306460177e82f3d9a754f17405b220aa2303cfc1fa57f9`.
@@ -89,10 +89,36 @@ Monitor build 210 verified the upload at `$600000` and returned `x0=0` after
 The resident console was restored, the board lease was released, and no reset,
 flash, or boot-medium write occurred.
 
-A four-attribute experiment moved the fixed pitch term into GPU arithmetic too.
-It returned `x0=0`, but capture 88 had scattered black pixels. It is not the
-demo default while that artifact remains unexplained. The lowerer now refuses
-graph shapes exceeding nine arithmetic nodes or twelve input words, the
-tested envelope for this demo. The source checkers
-exercise the bounded graph lowering, while the board capture establishes the
-clean working shader and records the outstanding hardware limit.
+A first four-attribute experiment moved the fixed pitch term into GPU
+arithmetic too. It returned `x0=0`, but capture 88 had scattered black pixels.
+The cause and corrected path are recorded below.
+
+## Three-coordinate transform on V3D
+
+The current pyramid sends object X/Y/Z, perspective scale, colour, and two
+three-component transform rows in four attributes: fourteen binary32 input
+words per vertex. The coordinate and vertex QPUs each compute two row dot
+products and multiply them by the per-vertex scale. The CPU no longer
+preweights the pitch term of object Y. It still computes the frame's row
+coefficients, reciprocal perspective scale and face order, and uploads the
+vertex buffer. Clip Z/W remain fixed at zero/one and no depth attachment is
+present, so this is not a general 4x4 Vulkan matrix shader.
+
+The original fourteen-word shader produced scattered black pixels despite
+returning zero. A controlled ten-operation shader rendered cleanly with
+twelve input words (capture 92), showed the artifacts with fourteen words
+(capture 93), then rendered cleanly when graph temporaries used RF10..13 only
+after those registers had supplied their VPM input indices (capture 94).
+In-place reuse of a dying arithmetic operand remained clean (capture 95).
+The twelve-operation, two-row shader then rendered cleanly in captures 96
+and 97. The lowerer retains VPM output indices RF0..9, limits the fourteen-word
+path to at most four varying components, and refuses a varying that would
+still need the input registers reused for viewport results.
+
+The current-source RAM payload is
+`docs/evidence/vulkan-pyramid-gpu-full3d-20260927/vulkanPyramidFull3D.img.pmf`,
+1,017,632 bytes, SHA-256
+`a8a6490122ebc0055fc857a368b51577eff74b767ddb8001885f9e170e024e45`.
+Monitor build 210 verified it at `$600000`; the payload returned `x0=0` after
+9.2 seconds under a 15-second deadman, and clean capture 97 was saved. The
+board lease was released with no flash, reset, or boot-medium write.
