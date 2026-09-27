@@ -80,19 +80,19 @@ order, and uploads the vertex buffer. Clip Z/W remain fixed at zero/one, and
 there is no depth attachment. This is a hardware vertex transform for the
 accepted graph shape, not a general Vulkan matrix-shader implementation.
 
-The verified RAM payload and capture are in
+The current-source RAM payload and capture are in
 `docs/evidence/vulkan-pyramid-gpu-matrix-20260927/`. Its PMFBOOT v2 container
-is 1,014,376 bytes, SHA-256
-`3467f34872f725143a98b7bbbf49418af9874c8b397b808b352f7ccaa8e94d05`.
+is `vulkanPyramidGuard9.img.pmf`, 1,014,616 bytes, SHA-256
+`56e5e3bc1ca71a47fc306460177e82f3d9a754f17405b220aa2303cfc1fa57f9`.
 Monitor build 210 verified the upload at `$600000` and returned `x0=0` after
-9.2 seconds under a 15-second deadman. Fresh capture 89 shows a clean pyramid.
+9.2 seconds under a 15-second deadman. Fresh capture 91 shows a clean pyramid.
 The resident console was restored, the board lease was released, and no reset,
 flash, or boot-medium write occurred.
 
 A four-attribute experiment moved the fixed pitch term into GPU arithmetic too.
 It returned `x0=0`, but capture 88 had scattered black pixels. It is not the
 demo default while that artifact remains unexplained. The lowerer now refuses
-graph shapes exceeding eight arithmetic nodes or twelve input words, the
+graph shapes exceeding nine arithmetic nodes or twelve input words, the
 tested envelope for this demo. The source checkers
 exercise the bounded graph lowering, while the board capture establishes the
 clean working shader and records the outstanding hardware limit.
