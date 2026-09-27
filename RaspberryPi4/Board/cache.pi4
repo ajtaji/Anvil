@@ -174,11 +174,16 @@ EndProcedure
 ;  and a payload run. Ethernet frame RX/TX is coherent by construction (the
 ;  RX ring NC + genet.pi4's dc civac) but was not verified on a test rig.
 ; ======================================================================
-; BCM2712: 0. mmu.pi4's tables describe the BCM2711 map - they end at
-; 64 GiB and mark $FC000000.. as the peripheral window - so on a Pi 5 they
-; would unmap RP1 UART0 ($1F_0003_0000) and the console with it.
+; BCM2712: 1 since mmu.pi4 carries the BCM2712 map (Anvil 9509c32): the
+; low GiB Write-Back except the CacheMapNc regions, RAM above it up to
+; MmuSetRamBytes, the SoC at $10_0000_0000 and the RP1 window at
+; $1F_0000_0000 Device-nGnRnE, everything else a fault. It was 0 while the
+; tables described only the BCM2711 map, which would have unmapped RP1 UART0
+; and the console with it. The enable is MmuEnableCached, whose EL3 arm
+; (SCTLR/TCR/MAIR/TTBR0_EL3) is chosen at run time exactly as on a Pi 4 at
+; EL3. Desk gate: tools/a64/a64_cache_2712_check.py.
 CompilerIf #PMF_CHIP = 2712
-  #ANVIL_CACHE = 0
+  #ANVIL_CACHE = 1
 CompilerElse
 #ANVIL_CACHE = 1          ; 1 = the `cache` command can enable the D-cache.
                           ; 0 compiles the capability out; the monitor then
@@ -213,12 +218,18 @@ Procedure CacheMapNc()
   If DisplayReady() <> 0 And DisplayBase() > 0
     MmuAddNc(DisplayBase(), DisplayBase() + DisplaySize())
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: no GENET, so no GENET receive ring. The firmware framebuffer
+  ; ($3F800000 at the granted 16 bpp, HARDWARE-BRINGUP first boot) is the
+  ; DisplayBase range above.
+  CompilerElse
   ; The GENET receive ring - the ethernet DMA writes frames straight into
   ; it. genet.pi4 also carries dc civac maintenance for this; the NC mapping
   ; is belt-and-braces so the RX path is coherent by construction. The
   ; literal is #ETH_RX_BASE .. +#ETH_RX_BYTES because eth_globals.pi4 is
   ; included after this file.
   MmuAddNc($08100000, $08180000)
+  CompilerEndIf
 EndProcedure
 
 ; Turn the cached MMU on. Rebuilds the tables every time (a returned

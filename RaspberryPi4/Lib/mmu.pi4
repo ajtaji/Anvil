@@ -1367,6 +1367,9 @@ CompilerElse
 #MMU_SOC_SLOT_HI  = 67           ; to $10_FFFF_FFFF
 #MMU_TCR_2712     = $80823518
 #MMU_RAM_DEFAULT  = $40000000    ; 1 GiB until the board passes /memory
+#MMU_ERR_NC_HIGH  = -4           ; an MmuAddNc region reaches past the
+                                 ; low GiB, where the map has no 2 MiB
+                                 ; split to make it Non-Cacheable
 CompilerEndIf
 
 ; MmuBuildTables() refusals. Negative, and distinct, because "the
@@ -1601,6 +1604,15 @@ Procedure.i MmuBuildTables(base.i)
   If base < $400000
     ProcedureReturn #MMU_ERR_LOW
   EndIf
+  ; Only the low GiB is split into 2 MiB blocks, so only there can a region
+  ; be made Non-Cacheable. A region reaching above it (a relocated or larger
+  ; framebuffer, a DMA ring above 1 GiB) would silently stay Write-Back and
+  ; the bus master would read stale DRAM - refused by name instead.
+  For i = 0 To mmu_ncN - 1
+    If mmu_ncHi[i] > $40000000
+      ProcedureReturn #MMU_ERR_NC_HIGH
+    EndIf
+  Next
 
   l2 = base + 4096
   l0 = base + 8192

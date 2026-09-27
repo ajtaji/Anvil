@@ -297,6 +297,10 @@ def scenarios(img: pathlib.Path) -> list[str]:
         rc, *_ = run(img, 0, 0, 0, base)
         if rc != want:
             errs.append(f"refusal: base ${base:X} returned {rc}, want {want}")
+    # An NC region the low-GiB split cannot express: refused, not left WB.
+    rc, *_ = run(img, 8 * GiB, 0x3FF00000, 0x40100000, TABLES)
+    if rc != -4:
+        errs.append(f"refusal: an NC region crossing 1 GiB returned {rc}, want -4")
     return errs
 
 
@@ -332,7 +336,7 @@ def main() -> int:
             errs = [str(e)]
         for e in errs:
             print("FAIL", e)
-        print(f"a64_mmu_2712_check: 7 map cases + 3 refusals, {len(errs)} failure(s)")
+        print(f"a64_mmu_2712_check: 7 map cases + 4 refusals, {len(errs)} failure(s)")
         rc = 1 if errs else 0
         if a.mutate:
             src = (ROOT / LIB_REL).read_text(encoding="utf-8")

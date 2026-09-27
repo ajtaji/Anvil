@@ -1,0 +1,34 @@
+; cache2712_probe.pi5 - the BCM2712 caches-on sequence, for
+; tools/a64/a64_cache_2712_check.py. DIAGNOSTIC; does not ship.
+;
+; It is exactly what cache.pi4's CacheEnable() does on a -t pi5 build, minus
+; the board globals: the RAM size from /memory, the framebuffer Non-Cacheable,
+; the tables built, then MmuEnableCached() (invalidate the D-cache by set/way
+; while C is off, TLB invalidate, TTBR0/TCR/MAIR, then SCTLR |= M|C|I - at
+; EL3 on this part). With $5F0020 non-zero it then runs
+; MmuDisableCachedFlushed(), the payload-jump path.
+;
+; INPUTS (quadwords):  $5F0000 RAM bytes   $5F0008 framebuffer start
+;                      $5F0010 framebuffer end   $5F0018 table base
+;                      $5F0020 1 = also disable
+; OUTPUT: x0 = MmuBuildTables' return; $5F0030 = MmuBuildable().
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+#CP_IN = $5F0000
+
+Procedure.i Main()
+  Protected rc.i
+  PokeI(#CP_IN + $30, MmuBuildable())
+  MmuSetRamBytes(PeekI(#CP_IN))
+  MmuClearNc()
+  MmuAddNc(PeekI(#CP_IN + 8), PeekI(#CP_IN + 16))
+  rc = MmuBuildTables(PeekI(#CP_IN + 24))
+  If rc <> 0
+    ProcedureReturn rc
+  EndIf
+  MmuEnableCached()
+  If PeekI(#CP_IN + 32) <> 0
+    MmuDisableCachedFlushed()
+  EndIf
+  ProcedureReturn 0
+EndProcedure

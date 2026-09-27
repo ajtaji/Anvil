@@ -1422,6 +1422,15 @@ class A64:
             self.put(rd, acc & 0xFFFFFFFF, 0)
             return
 
+        # CLZ (scalar, data-processing 1 source). mmu.pi4's set/way walk
+        # takes its way shift from `clz w5, w3` (ways-1); 32/64 on zero.
+        if (ins & 0x7FFFFC00) == 0x5AC01000:
+            sf = (ins >> 31) & 1
+            bits = 64 if sf else 32
+            v = self.reg((ins >> 5) & 31, sf) & ((1 << bits) - 1)
+            self.put(ins & 31, bits - v.bit_length(), sf)
+            return
+
         # Variable shifts and divide.
         key = ins & 0x1FE0FC00
         two_src = {
