@@ -432,6 +432,19 @@
 #V3DQ_SIG_ROTATE    = 2048
 #V3DQ_SIG_WRTMUC    = 4096
 #V3DQ_SIG_SMIMM     = 8192
+CompilerIf #PMF_CHIP = 2712
+  ; V3D 7.1 has FOUR small-immediate signals, one per ALU input
+  ; (qpu_pack.c:131-197, rows 14/15/30/31). #V3DQ_SIG_SMIMM is input B.
+  #V3DQ_SIG_SMIMM_A  = 16384
+  #V3DQ_SIG_SMIMM_C  = 32768
+  #V3DQ_SIG_SMIMM_D  = 65536
+  ; No accumulators, four raddrs: add a 11:6, add b 5:0, mul c 23:18,
+  ; mul d 17:12 (qpu_pack.c:78-111, the 7.1 fields).
+  #V3DQ_RADDR_C_SHIFT = 18
+  #V3DQ_RADDR_D_SHIFT = 12
+  ; The add-half MOV is a 7.x operation (qpu_instr.h:232-233).
+  #V3DQ_A_MOV = 83
+CompilerEndIf
 
 ; The six signals that carry a write address in the COND field instead
 ; of a condition. qpu_instr.c:1061-1073. When any of these is set the
@@ -682,6 +695,10 @@
 ; is not the magic flag there, it is the IN/OUT selector. A caller who
 ; asked for a magic destination asked for a different instruction.
 #V3DQ_ERR_VPM_DEST    = -16
+; V3D 7.1 (the #PMF_CHIP = 2712 arm).
+#V3DQ_ERR_NOT_PORTED  = -17 ; a 4.2 mux/accumulator operand, or an operation
+                            ; the 7.1 packer does not carry yet
+#V3DQ_ERR_IMM_INPUT   = -18 ; small-immediate input is not 0..3 (a/b/c/d)
 
 ; ======================================================================
 ;  STATE
@@ -724,6 +741,11 @@ Global v3dq_mulUnpackB.i  = #V3DQ_UNPACK_NONE
 Global v3dq_raddrA.i      = 0
 Global v3dq_raddrB.i      = 0
 Global v3dq_raddrBIsImm.i = 0
+CompilerIf #PMF_CHIP = 2712
+  Global v3dq_raddrC.i  = 0       ; the mul half's two inputs (7.1)
+  Global v3dq_raddrD.i  = 0
+  Global v3dq_legacy.i  = 0       ; a 4.2-shaped setter was used; refused
+CompilerEndIf
 
 Global v3dq_sig.i         = #V3DQ_SIG_NONE
 Global v3dq_sigAddr.i     = 0
@@ -856,7 +878,241 @@ EndProcedure
 ;  comment says "26-30 reserved" (:159) and an instruction carrying
 ;  one is undefined.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  V3D 7.1 - THE #PMF_CHIP = 2712 PACKER (vault "GPU - V3D 7.1 port plan",
+;  step 3). Transcribed from the pinned Mesa 61f25904 qpu_pack.c 7.1
+;  tables; its word-for-word witness is tools/v3d71_qpu.py, and the gate
+;  tools/a64/a64_v3d71_csd_check.py compares every emitted word with
+;  pack(assemble(text)) for the same instruction text.
+;
+;  THE OPERAND MODEL CHANGES. There are no accumulators and no muxes: each
+;  input names a register-file entry 0..63 through its own raddr (add a/b,
+;  mul c/d), or a small immediate through that input's own signal. The
+;  4.2 setters (V3dQpuAdd/Mul/Raddr/SmallImm with muxes) are refused on a
+;  2712 build with #V3DQ_ERR_NOT_PORTED; V3dQpuAddRf / V3dQpuMulRf /
+;  V3dQpuImm are the 7.1 spellings.
+;
+;  CARRIED, and everything else refused by name (#V3DQ_ERR_ADD_OP /
+;  #V3DQ_ERR_MUL_OP), because an untested encoding is worse than none:
+;    add, 2 sources   add sub min max umin umax shl shr asr ror and or xor
+;    add, 1 source    not neg clz, mov (249)
+;    add, 0 sources   nop tidx eidx barrierid tmuwt (opcode 187)
+;    mul              add sub umul24 smul24, mov and nop (opcode 14)
+;  No pack or unpack modifier. No float operation yet.
+;
+;  A DESTINATION-LESS HALF PACKS waddr 0, NOT MAGIC - Mesa's own vectors
+;  (tests/qpu_disasm.c) and the oracle agree - rather than the 4.2 file's
+;  magic NOP address. Writes to the magic addresses 7.1 reserves (0-4, the
+;  accumulators; 19-24, the 4.2 SFU) are refused: the SFU is an add
+;  operation on 7.1.
+; ======================================================================
+Procedure.i v3dq_SigPack71(flags.i)
+  Select flags
+    Case 0 : ProcedureReturn 0
+    Case #V3DQ_SIG_THRSW : ProcedureReturn 1
+    Case #V3DQ_SIG_LDUNIF : ProcedureReturn 2
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIF : ProcedureReturn 3
+    Case #V3DQ_SIG_LDTMU : ProcedureReturn 4
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU : ProcedureReturn 5
+    Case #V3DQ_SIG_LDTMU | #V3DQ_SIG_LDUNIF : ProcedureReturn 6
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU | #V3DQ_SIG_LDUNIF : ProcedureReturn 7
+    Case #V3DQ_SIG_LDVARY : ProcedureReturn 8
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY : ProcedureReturn 9
+    Case #V3DQ_SIG_LDVARY | #V3DQ_SIG_LDUNIF : ProcedureReturn 10
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY | #V3DQ_SIG_LDUNIF : ProcedureReturn 11
+    Case #V3DQ_SIG_LDUNIFRF : ProcedureReturn 12
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDUNIFRF : ProcedureReturn 13
+    Case #V3DQ_SIG_SMIMM_A : ProcedureReturn 14
+    Case #V3DQ_SIG_SMIMM : ProcedureReturn 15
+    Case #V3DQ_SIG_LDTLB : ProcedureReturn 16
+    Case #V3DQ_SIG_LDTLBU : ProcedureReturn 17
+    Case #V3DQ_SIG_WRTMUC : ProcedureReturn 18
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_WRTMUC : ProcedureReturn 19
+    Case #V3DQ_SIG_LDVARY | #V3DQ_SIG_WRTMUC : ProcedureReturn 20
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDVARY | #V3DQ_SIG_WRTMUC : ProcedureReturn 21
+    Case #V3DQ_SIG_UCB : ProcedureReturn 22
+    Case #V3DQ_SIG_LDUNIFA : ProcedureReturn 24
+    Case #V3DQ_SIG_LDUNIFARF : ProcedureReturn 25
+    Case #V3DQ_SIG_LDTMU | #V3DQ_SIG_WRTMUC : ProcedureReturn 26
+    Case #V3DQ_SIG_THRSW | #V3DQ_SIG_LDTMU | #V3DQ_SIG_WRTMUC : ProcedureReturn 27
+    Case #V3DQ_SIG_SMIMM_C : ProcedureReturn 30
+    Case #V3DQ_SIG_SMIMM_D : ProcedureReturn 31
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; qpu_instr.h:89-115: reserved as destinations on 7.x.
+Procedure.i v3dq_WaddrReserved71(w.i)
+  If w >= 0 And w <= 4
+    ProcedureReturn 1
+  EndIf
+  If w >= 19 And w <= 24
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; The destination field for one half: 0 non-magic when the operation
+; writes nothing, otherwise the caller's, refusing the reserved magics.
+; Returns (magic << 6) | waddr, or -1.
+Procedure.i v3dq_Dest71(hasDst.i, waddr.i, magic.i)
+  If hasDst = 0
+    ProcedureReturn 0
+  EndIf
+  If waddr < 0 Or waddr > 63
+    ProcedureReturn -1
+  EndIf
+  If magic <> 0
+    If v3dq_WaddrReserved71(waddr) <> 0
+      ProcedureReturn -1
+    EndIf
+    ProcedureReturn 64 | waddr
+  EndIf
+  ProcedureReturn waddr
+EndProcedure
+
+Procedure.i v3dq_PackAdd71()
+  Protected opcode.i
+  Protected rb.i
+  Protected nsrc.i
+  Protected hasDst.i
+  Protected d.i
+
+  If v3dq_addPack <> #V3DQ_PACK_NONE
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+  EndIf
+  If v3dq_addUnpackA <> #V3DQ_UNPACK_NONE Or v3dq_addUnpackB <> #V3DQ_UNPACK_NONE
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+  EndIf
+
+  nsrc = 2
+  hasDst = 1
+  rb = -1
+  Select v3dq_addOp
+    Case #V3DQ_A_ADD  : opcode = 56
+    Case #V3DQ_A_SUB  : opcode = 60
+    Case #V3DQ_A_MIN  : opcode = 120
+    Case #V3DQ_A_MAX  : opcode = 121
+    Case #V3DQ_A_UMIN : opcode = 122
+    Case #V3DQ_A_UMAX : opcode = 123
+    Case #V3DQ_A_SHL  : opcode = 124
+    Case #V3DQ_A_SHR  : opcode = 125
+    Case #V3DQ_A_ASR  : opcode = 126
+    Case #V3DQ_A_ROR  : opcode = 127
+    Case #V3DQ_A_AND  : opcode = 181
+    Case #V3DQ_A_OR   : opcode = 182
+    Case #V3DQ_A_XOR  : opcode = 183
+    Case #V3DQ_A_NOT  : opcode = 186 : rb = 0 : nsrc = 1
+    Case #V3DQ_A_NEG  : opcode = 186 : rb = 1 : nsrc = 1
+    Case #V3DQ_A_CLZ  : opcode = 186 : rb = 5 : nsrc = 1
+    Case #V3DQ_A_MOV  : opcode = 249 : rb = 3 : nsrc = 1   ; int32 unpack none
+    Case #V3DQ_A_NOP  : opcode = 187 : rb = 0 : nsrc = 0 : hasDst = 0
+    Case #V3DQ_A_TIDX : opcode = 187 : rb = 1 : nsrc = 0
+    Case #V3DQ_A_EIDX : opcode = 187 : rb = 2 : nsrc = 0
+    Case #V3DQ_A_BARRIERID : opcode = 187 : rb = 14 : nsrc = 0
+    Case #V3DQ_A_TMUWT : opcode = 187 : rb = 15 : nsrc = 0
+    Default
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_ADD_OP)
+  EndSelect
+
+  ; An operand the operation does not take must not be set: on 7.1 the
+  ; b field IS the operation for 0/1-source forms, and a caller's value
+  ; there would silently become a different operation.
+  If nsrc < 2
+    If v3dq_raddrB <> 0 Or (v3dq_sig & #V3DQ_SIG_SMIMM) <> 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+    EndIf
+  EndIf
+  If nsrc < 1
+    If v3dq_raddrA <> 0 Or (v3dq_sig & #V3DQ_SIG_SMIMM_A) <> 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+    EndIf
+  EndIf
+
+  d = v3dq_Dest71(hasDst, v3dq_addWaddr, v3dq_addMagic)
+  If d < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+
+  If rb >= 0
+    v3dq_lo = (v3dq_lo & ~#V3DQ_RADDR_MASK) | rb
+  EndIf
+  v3dq_lo = v3dq_lo | (opcode << #V3DQ_OP_ADD_SHIFT)
+  v3dq_hi = v3dq_hi | ((d & #V3DQ_WADDR_A_MASK) << #V3DQ_WADDR_A_SHIFT_HI)
+  If (d & 64) <> 0
+    v3dq_hi = v3dq_hi | #V3DQ_MA_HI
+  EndIf
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+Procedure.i v3dq_PackMul71()
+  Protected opcode.i
+  Protected rc.i
+  Protected rd.i
+  Protected nsrc.i
+  Protected hasDst.i
+  Protected d.i
+
+  If v3dq_mulPack <> #V3DQ_PACK_NONE
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_PACK)
+  EndIf
+  If v3dq_mulUnpackA <> #V3DQ_UNPACK_NONE Or v3dq_mulUnpackB <> #V3DQ_UNPACK_NONE
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_UNPACK)
+  EndIf
+  If v3dq_raddrC < 0 Or v3dq_raddrC > 63 Or v3dq_raddrD < 0 Or v3dq_raddrD > 63
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+
+  rc = v3dq_raddrC
+  rd = v3dq_raddrD
+  nsrc = 2
+  hasDst = 1
+  Select v3dq_mulOp
+    Case #V3DQ_M_ADD    : opcode = 1
+    Case #V3DQ_M_SUB    : opcode = 2
+    Case #V3DQ_M_UMUL24 : opcode = 3
+    Case #V3DQ_M_SMUL24 : opcode = 9
+    Case #V3DQ_M_MOV    : opcode = 14 : nsrc = 1
+    Case #V3DQ_M_NOP    : opcode = 14 : nsrc = 0 : hasDst = 0
+    Default
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_MUL_OP)
+  EndSelect
+  If nsrc < 2
+    If rd <> 0 Or (v3dq_sig & #V3DQ_SIG_SMIMM_D) <> 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+    EndIf
+    If v3dq_mulOp = #V3DQ_M_MOV
+      rd = 3                ; int32 unpack none (qpu_pack.c:772-813)
+    Else
+      rd = 63
+    EndIf
+  EndIf
+  If nsrc < 1
+    If rc <> 0 Or (v3dq_sig & #V3DQ_SIG_SMIMM_C) <> 0
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+    EndIf
+  EndIf
+
+  d = v3dq_Dest71(hasDst, v3dq_mulWaddr, v3dq_mulMagic)
+  If d < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_RANGE)
+  EndIf
+
+  v3dq_lo = v3dq_lo | (rc << #V3DQ_RADDR_C_SHIFT) | (rd << #V3DQ_RADDR_D_SHIFT)
+  v3dq_hi = v3dq_hi | (opcode << #V3DQ_OP_MUL_SHIFT_HI)
+  v3dq_hi = v3dq_hi | ((d & #V3DQ_WADDR_M_MASK) << #V3DQ_WADDR_M_SHIFT_HI)
+  If (d & 64) <> 0
+    v3dq_hi = v3dq_hi | #V3DQ_MM_HI
+  EndIf
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+CompilerEndIf
+
 Procedure.i v3dq_SigPack(flags.i)
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn v3dq_SigPack71(flags)
+  CompilerEndIf
   Select flags
     Case #V3DQ_SIG_NONE
       ProcedureReturn 0
@@ -1887,6 +2143,11 @@ Procedure V3dQpuReset()
   v3dq_raddrA      = 0
   v3dq_raddrB      = 0
   v3dq_raddrBIsImm = 0
+  CompilerIf #PMF_CHIP = 2712
+  v3dq_raddrC      = 0
+  v3dq_raddrD      = 0
+  v3dq_legacy      = 0
+  CompilerEndIf
 
   v3dq_sig      = #V3DQ_SIG_NONE
   v3dq_sigAddr  = 0
@@ -1918,6 +2179,9 @@ EndProcedure
 ;  pass anything.
 ; ----------------------------------------------------------------------
 Procedure V3dQpuAdd(op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  CompilerIf #PMF_CHIP = 2712
+  v3dq_legacy = 1       ; a mux operand: 4.2 only
+  CompilerEndIf
   v3dq_addOp    = op
   v3dq_addWaddr = waddr
   v3dq_addMagic = magic
@@ -1926,6 +2190,9 @@ Procedure V3dQpuAdd(op.i, waddr.i, magic.i, muxA.i, muxB.i)
 EndProcedure
 
 Procedure V3dQpuMul(op.i, waddr.i, magic.i, muxA.i, muxB.i)
+  CompilerIf #PMF_CHIP = 2712
+  v3dq_legacy = 1       ; a mux operand: 4.2 only
+  CompilerEndIf
   v3dq_mulOp    = op
   v3dq_mulWaddr = waddr
   v3dq_mulMagic = magic
@@ -1950,6 +2217,9 @@ EndProcedure
 ;  read, reached through mux 6 and mux 7.
 ; ----------------------------------------------------------------------
 Procedure V3dQpuRaddr(a.i, b.i)
+  CompilerIf #PMF_CHIP = 2712
+  v3dq_legacy = 1       ; a mux operand: 4.2 only
+  CompilerEndIf
   v3dq_raddrA = a
   v3dq_raddrB = b
 EndProcedure
@@ -2008,6 +2278,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i V3dQpuSmallImm(value.i)
   Protected idx.i
+  CompilerIf #PMF_CHIP = 2712
+  v3dq_legacy = 1       ; a mux operand: 4.2 only
+  CompilerEndIf
 
   If v3dq_raddrB <> 0
     If v3dq_raddrBIsImm = 0
@@ -2050,6 +2323,51 @@ Procedure V3dQpuBranchSet(cond.i, msfign.i, bdi.i, ub.i, bdu.i, setLink.i, offse
   v3dq_brRaddrA  = raddrA
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  THE 7.1 OPERAND API. Each input names a register-file entry 0..63;
+;  V3dQpuImm replaces one input with a small immediate. An input the
+;  operation does not take must be left 0 - the packer refuses otherwise,
+;  because on 7.1 the b/d field of a 0- or 1-source form IS the operation.
+; ----------------------------------------------------------------------
+Procedure V3dQpuAddRf(op.i, waddr.i, magic.i, rfA.i, rfB.i)
+  v3dq_addOp    = op
+  v3dq_addWaddr = waddr
+  v3dq_addMagic = magic
+  v3dq_raddrA   = rfA
+  v3dq_raddrB   = rfB
+EndProcedure
+
+Procedure V3dQpuMulRf(op.i, waddr.i, magic.i, rfC.i, rfD.i)
+  v3dq_mulOp    = op
+  v3dq_mulWaddr = waddr
+  v3dq_mulMagic = magic
+  v3dq_raddrC   = rfC
+  v3dq_raddrD   = rfD
+EndProcedure
+
+; input: 0 = add a, 1 = add b, 2 = mul c, 3 = mul d. One per instruction:
+; the four immediate signals are separate rows of the signal table and
+; combine with nothing (qpu_pack.c:131-197).
+Procedure.i V3dQpuImm(input.i, value.i)
+  Protected idx.i
+  idx = v3dq_SmallImmIndex(value)
+  If idx < 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_SMALLIMM)
+  EndIf
+  Select input
+    Case 0 : v3dq_raddrA = idx : v3dq_sig = v3dq_sig | #V3DQ_SIG_SMIMM_A
+    Case 1 : v3dq_raddrB = idx : v3dq_sig = v3dq_sig | #V3DQ_SIG_SMIMM
+    Case 2 : v3dq_raddrC = idx : v3dq_sig = v3dq_sig | #V3DQ_SIG_SMIMM_C
+    Case 3 : v3dq_raddrD = idx : v3dq_sig = v3dq_sig | #V3DQ_SIG_SMIMM_D
+    Default
+      ProcedureReturn v3dq_Fail(#V3DQ_ERR_IMM_INPUT)
+  EndSelect
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+CompilerEndIf
+
 ; ======================================================================
 ;  THE PACKER
 ; ======================================================================
@@ -2091,6 +2409,9 @@ Procedure.i v3dq_PackAdd()
   Protected magicOk.i
   Protected forceMa.i
   Protected stw.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn v3dq_PackAdd71()
+  CompilerEndIf
 
   op    = v3dq_addOp
   waddr = v3dq_addWaddr
@@ -2334,6 +2655,9 @@ Procedure.i v3dq_PackMul()
   Protected nsrc.i
   Protected opcode.i
   Protected packed.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn v3dq_PackMul71()
+  CompilerEndIf
 
   op   = v3dq_mulOp
   muxA = v3dq_mulMuxA
@@ -2554,6 +2878,12 @@ Procedure.i V3dQpuPack()
   If v3dq_type = #V3DQ_TYPE_BRANCH
     ProcedureReturn v3dq_PackBranch()
   EndIf
+
+  CompilerIf #PMF_CHIP = 2712
+  If v3dq_legacy <> 0
+    ProcedureReturn v3dq_Fail(#V3DQ_ERR_NOT_PORTED)
+  EndIf
+  CompilerEndIf
 
   ; :2419-2421.
   sigCode = v3dq_SigPack(v3dq_sig)
@@ -2862,10 +3192,12 @@ Procedure.i v3dq_Hazard()
   EndIf
 
   units = tmu + sfu + vpm + tlb + tsy
-  ; :291-294. LDTMU counts on 4.2 and not on 7.1; this is a 4.2 file.
+  ; :291-294. LDTMU counts on 4.2 and not on 7.1.
+  CompilerIf #PMF_CHIP <> 2712
   If (v3dq_sig & #V3DQ_SIG_LDTMU) <> 0
     units = units + 1
   EndIf
+  CompilerEndIf
   If (v3dq_sig & #V3DQ_SIG_LDTLB) <> 0
     units = units + 1
   EndIf
@@ -3192,9 +3524,41 @@ EndProcedure
 ; opcode-187 family.
 Procedure.i V3dQpuAdd0(op.i, waddr.i, magic.i)
   V3dQpuReset()
+  CompilerIf #PMF_CHIP = 2712
+  V3dQpuAddRf(op, waddr, magic, 0, 0)
+  CompilerElse
   V3dQpuAdd(op, waddr, magic, 0, 0)
+  CompilerEndIf
   ProcedureReturn V3dQpuEmit()
 EndProcedure
+
+CompilerIf #PMF_CHIP = 2712
+; A register-to-register or register-to-unit move on the MUL half, which
+; leaves the ADD half free. 7.1's mul MOV is opcode 14, raddr_d 3.
+Procedure.i V3dQpuMovRf(waddr.i, magic.i, rf.i)
+  V3dQpuReset()
+  V3dQpuMulRf(#V3DQ_M_MOV, waddr, magic, rf, 0)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+; Two-source ADD, and the immediate-B form, in the 7.1 operand model.
+Procedure.i V3dQpuAddRf2(op.i, waddr.i, magic.i, rfA.i, rfB.i)
+  V3dQpuReset()
+  V3dQpuAddRf(op, waddr, magic, rfA, rfB)
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+
+Procedure.i V3dQpuAddRfImm(op.i, waddr.i, magic.i, rfA.i, imm.i)
+  Protected r.i
+  V3dQpuReset()
+  V3dQpuAddRf(op, waddr, magic, rfA, 0)
+  r = V3dQpuImm(1, imm)
+  If r <> #V3DQ_OK
+    ProcedureReturn r
+  EndIf
+  ProcedureReturn V3dQpuEmit()
+EndProcedure
+CompilerEndIf
 
 ; ADD with a small immediate as the B operand.
 Procedure.i V3dQpuAddImm(op.i, waddr.i, magic.i, muxA.i, raddrA.i, imm.i)
