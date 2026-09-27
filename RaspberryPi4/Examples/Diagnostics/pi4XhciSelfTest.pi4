@@ -299,10 +299,10 @@ Procedure Main()
   ; wantHi below wantLo is what a TD across the Link TRB would present.
   ; It must fail immediately with #XHCI_ERR_TD_WRAP (50), not wait out a
   ; five-second timeout and blame the device.
-  t0 = xh_Ticks()
-  Chk(xh_WaitEventFor(#XHCI_TRB_TRANSFER, XhciCmdRing() + $100, XhciCmdRing(), 5000))
+  t0 = XhciWaitMark()
+  Chk(XhciWaitTransferTd(XhciCmdRing() + $100, XhciCmdRing(), 5000))
   Chk(XhciLastError())
-  Chk(Bool((xh_Ticks() - t0) < (xh_TickHz() / 100)))
+  Chk(Bool((XhciWaitMark() - t0) < (XhciTickHz() / 100)))
 
   ; ---- 12. the arena did not overflow --------------------------------
   Chk(XhciArenaUsed())

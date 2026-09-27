@@ -1763,6 +1763,13 @@ Procedure.i XhciWaitMark()
   ProcedureReturn xh_Ticks()
 EndProcedure
 
+; The rate XhciWaitMark() advances at, in Hz, so that a caller outside
+; this file can turn two marks into a duration without reading the
+; generic timer itself (tools/layering_check.py: timer.pi4 owns it).
+Procedure.i XhciTickHz()
+  ProcedureReturn xh_TickHz()
+EndProcedure
+
 ; Record one visit to a site. t0 is what XhciWaitMark() answered.
 ; PUBLIC because usbmsc.pi4's three settles belong in the same table -
 ; a second table in a second file is how two halves of one answer end up
@@ -3479,6 +3486,15 @@ EndProcedure
 ; that costs when the event ring has traffic from more than one source.
 Procedure.i xh_WaitEvent(expect.i, ms.i)
   ProcedureReturn xh_WaitEventFor(expect, 0, 0, ms)
+EndProcedure
+
+; Wait for the Transfer Event of the TD whose TRBs run firstTrb..lastTrb.
+; PUBLIC so that pi4XhciSelfTest can prove the wrapped-TD refusal above
+; without calling an xh_ name: no public transfer can queue a wrapped TD -
+; that is what the assert keeps true - so the only way to show the assert
+; fires is to hand it the range directly.
+Procedure.i XhciWaitTransferTd(firstTrb.i, lastTrb.i, ms.i)
+  ProcedureReturn xh_WaitEventFor(#XHCI_TRB_TRANSFER, firstTrb, lastTrb, ms)
 EndProcedure
 
 ; ----------------------------------------------------------------------
