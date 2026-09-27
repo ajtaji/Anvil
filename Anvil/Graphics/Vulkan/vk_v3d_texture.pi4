@@ -1,16 +1,16 @@
 ; ======================================================================
-;  V3D 4.2 linear-staging to optimal-tiled texture transfer
+;  V3D 4.2 optimal-tiled texture transfers and layout
 ; ======================================================================
 ; SPDX-License-Identifier: MIT
 ;
-; An isolated hardware translation component. It is not included by the
-; Vulkan object engine yet and it does not advertise VK_IMAGE_TILING_OPTIMAL.
-; Its one job is narrower: plan and execute an exact copy of opaque four-byte
-; texels from a raster staging image into one V3D UIF_NO_XOR level-zero image.
+; The Pi 4 Vulkan backend uses this component to plan and transfer exact
+; four-byte texels between raster staging and V3D UIF_NO_XOR level-zero images.
+; TFU handles writes to tiled memory; guarded 2D DMA reads utile rows back
+; into linear images because TFU cannot produce raster output.
 ;
 ; REQUIRES RaspberryPi4/Lib/v3d.pi4 before this file. House rule 10 keeps
-; libraries from including libraries, so an eventual Pi 4 integration must
-; list both. The five V3dTfu* calls below are the complete hardware seam.
+; libraries from including libraries, so the Pi 4 composition lists both.
+; The five V3dTfu* calls below are the TFU hardware seam.
 ;
 ; SOURCE CONTRACT (Mesa 24.3.4 files saved in the Pi 4 Reference vault):
 ;   v3dx_tfu.c:57-77,92-156
@@ -109,6 +109,20 @@ Structure AvkV3dTextureTiledCopy Align #PB_Structure_AlignC
   paddedWidth.i
   paddedHeight.i
   timeoutUs.i
+EndStructure
+
+Structure AvkV3dTextureReadback Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  destinationBase.i
+  destinationBytes.i
+  destinationPitch.i
+  width.i
+  height.i
+  paddedWidth.i
+  paddedHeight.i
 EndStructure
 
 Procedure avkV3dTexturePlanClear(*plan.AvkV3dTexturePlan)
@@ -301,4 +315,47 @@ Procedure.i AnvilVkV3dTextureTiledConvert(*copy.AvkV3dTextureTiledCopy, *plan.Av
   rc = V3dTfuSubmit()
   If rc <> 0 : ProcedureReturn rc : EndIf
   ProcedureReturn V3dTfuWait(*copy\timeoutUs)
+EndProcedure
+
+; A UIF_NO_XOR surface is arranged in columns of four 8x8 UIF blocks.
+; Each block has four 4x4, 64-byte utiles in row-major order. Addressing
+; one utile at a time lets the DMA controller scatter tiled rows into raster
+; rows without a processor pixel-copy loop.
+Procedure.i AnvilVkV3dTextureUifOffset(x.i, y.i, paddedHeight.i)
+  Protected bx.i, by.i, blocksHigh.i, blockIndex.i
+  Protected localX.i, localY.i, utileIndex.i
+  bx = x / 8 : by = y / 8
+  blocksHigh = paddedHeight / 8
+  blockIndex = (bx / 4) * (4 * blocksHigh) + by * 4 + (bx % 4)
+  localX = x % 8 : localY = y % 8
+  utileIndex = (localY / 4) * 2 + (localX / 4)
+  ProcedureReturn blockIndex * 256 + utileIndex * 64 + (localY % 4) * 16 + (localX % 4) * 4
+EndProcedure
+
+Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan.AvkV3dTexturePlan)
+  Protected rc.i, destinationSpan.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *read = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*read\width, *read\height, *read\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *read\paddedWidth <> *plan\paddedWidth Or *read\paddedHeight <> *plan\paddedHeight
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If *read\destinationPitch < *read\width * 4 Or (*read\destinationPitch % 4) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*read\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*read\destinationBase % 4) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  destinationSpan = (*read\height - 1) * *read\destinationPitch + *read\width * 4
+  If destinationSpan < *read\width * 4 Or *read\sourceBytes < *plan\destinationBytes Or *read\destinationBytes < destinationSpan
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\destinationBase, destinationSpan) = 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangesOverlap(*read\sourceBase, *plan\destinationBytes, *read\destinationBase, destinationSpan) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP
+  EndIf
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure

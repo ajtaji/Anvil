@@ -77,7 +77,7 @@ REQUIRED_DESCRIPTOR_CONTRACT = (
 )
 REQUIRED_SAMPLE_MASK_CONTRACT = (
     "If *d\\sampleMask <> 0",
-    "V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, *d\\firstVertex)",
+    "V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, *d\\firstVertex)",
 )
 REQUIRED_BLEND_CONTRACT = (
     "If *d\\blendMode = #ANVIL_VK_BLEND_SRC_OVER",
@@ -424,7 +424,8 @@ def source_contract(text: str) -> list[str]:
     # The Pi 4 backend must not substitute processor loops when board DMA is
     # absent. The desk test backend owns the byte oracle instead.
     render_text = text
-    for name, dma_call in (("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
+    for name, dma_call in (("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
+                           ("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
                            ("avkBackendSubmitBufferCopyRows", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitBufferFill", "HwVkDmaFill(")):
         start = render_text.find("Procedure.i " + name + "(")
@@ -524,8 +525,8 @@ def main() -> int:
     print("  object engine and the V3D backend; the whole closure resolves at this revision")
     print("  with the engine down the backend enumerates no device and refuses every clear")
     print("  NOT ONE MMIO ACCESS was made reaching that answer")
-    print("  the backend lowers only through NeonRebindSurface/NeonFrameBegin/NeonFrameEnd and")
-    print("  holds no processor-side or DMA image fallback")
+    print("  rendering lowers through NeonRebindSurface/NeonFrameBegin/NeonFrameEnd;")
+    print("  tiled readback requires guarded DMA, with no processor pixel-copy path")
     print("  HOST_COHERENT is backed by required submit and render-completion cache maintenance")
     if diagnostic_built:
         print(f"  all {len(DIAGNOSTICS)} board diagnostics build at $500000:")
