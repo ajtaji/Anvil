@@ -219,6 +219,11 @@ Procedure BannerClockTick()
   If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
     ProcedureReturn
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If BannerOverlayRefuse16(bpp) <> 0
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
   PresentedOverlayClock(base, pitch, rot, panelW, panelH, @gBannerClockText[0])
   If overlap <> 0
     PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
@@ -351,6 +356,11 @@ Procedure TouchKeyboardPresentedCursor(y0.i, y1.i)
   If ScrCaptureSnapshot(@base, @lw, @lh, @pitch, @rot, @panelW, @panelH, @bpp) = 0
     ProcedureReturn
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If BannerOverlayRefuse16(bpp) <> 0
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
   PresentedOverlayCursor(base, pitch, rot, panelW, panelH)
   gPresentedOverlayRect\x = gCurX
   gPresentedOverlayRect\y = gCurY
@@ -867,6 +877,36 @@ Procedure TouchKeyboardLayerReconcile()
     gTkbLayoutGen = TouchKeyboardLayoutGeneration()
   EndIf
 EndProcedure
+
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  BannerOverlayRefuse16(bpp) - 1 when the V3D overlays must not draw.
+;
+;  The presented-surface overlays (clock and cursor over a V3D frame)
+;  WRITE 32-bit pixels. ScrCaptureSnapshot describes the BCM2712's RGB565
+;  surface as 2 bytes a pixel now (for `pic`), so a 2 here is refused, by
+;  name, the first time and counted every time - never drawn as two
+;  garbage pixels per point. V3D is off on the 2712 today, so this is a
+;  guard, not a path anybody takes.
+; ----------------------------------------------------------------------
+Global gBannerOverlay16Refused.i
+
+Procedure.i BannerOverlayRefuse16(bpp.i)
+  If bpp = 4
+    ProcedureReturn 0
+  EndIf
+  If gBannerOverlay16Refused = 0
+    PrintN("!! the V3D banner overlay was not drawn: the presented surface is")
+    PrintN("   2 bytes a pixel (RGB565) and the overlay writes 32-bit pixels.")
+  EndIf
+  gBannerOverlay16Refused = gBannerOverlay16Refused + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i BannerOverlayRefused16Count()
+  ProcedureReturn gBannerOverlay16Refused
+EndProcedure
+CompilerEndIf
 
 Procedure.i TouchKeyboardRefusedCount()
   ProcedureReturn gTkbShowRefused
