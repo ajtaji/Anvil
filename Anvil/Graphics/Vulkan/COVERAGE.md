@@ -45,6 +45,13 @@ compile — neither can silently enumerate the wrong thing.
 | Explicit test backend | `vk_backend_test.pbi` models one device over a caller-supplied window. It records the exact clear it was asked for — address, extent, pitch, colour word — and **writes nothing**, so a gate can then read the image back and require that every poisoned byte survived. It can hold a submission outstanding or fail a later poll once, making pending semaphore/fence/resource ownership and both completion and rollback reachable from a desk. |
 | V3D execution | `vk_v3d_backend.pi4` lowers whole-image clears and accepted graphics draw lists through transactional Neon/V3D bin-render jobs, and lowers the bounded optimal buffer-to-image copy through a real TFU job. A draw list uses one bin/render pair, normalizes each snapshotted scissor without overflow, emits `CLIP_WINDOW` only when it changes, and performs all coalesced cache-range maintenance under one final barrier. There is no processor or DMA image fallback in rendering; presentation is a separate display-owner DMA operation. The 2026-09-13 4x4 proof copied raster BGRA8 into `UIF_NO_XOR`, then sampled it. The 2026-09-16 six-draw proof executed one bin/render pair and one DMA presentation. The final 8x8 atlas/chrome Pi 4 run returned exact `x0=0x6C85A0`, recorded one TFU advance, one bin/render pair and one display-DMA presentation, passed 211 exact report/pixel checks and produced a clean rotated 800x1280 screenshot. |
 
+The 2026-09-26 Pi 4 RAM proof cleared a 64×64 linear BGRA8 image on V3D,
+then copied it into a buffer by guarded DMA through the public
+`vkCmdCopyImageToBuffer` command. It returned zero after exact pixel and guard
+checks, one bin/render pair, one DMA completion, quiescence and write-bound
+restoration; see `docs/VULKAN_IMAGE_READBACK_PI4_2026-09-26.md`. This is a
+bounded silicon result, not general tiled or partial image readback.
+
 ## Compiler ABI boundary
 
 On AArch64 the public memory ABI is LP64: Vulkan 32-bit scalars align to 4,
