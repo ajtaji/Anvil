@@ -38,6 +38,26 @@
 ;  the image was produced, and
 ;  somebody diagnosing a bad image goes where it points.
 ; ----------------------------------------------------------------------
+;
+;  BCM2712 (-t pi5, #PMF_CHIP = 2712). The product is the Raspberry Pi 5
+;  Model B (bcm2712-rpi-5-b.dts, model "Raspberry Pi 5"; the image is
+;  built for that board file), the core is the Cortex-A76 (MIDR part $D0B,
+;  vault "GPU - V3D 7.1 port plan"), and the -t word is pi5. What the
+;  FIRMWARE says the board is - Pi 5, Pi 500, CM5 - is decoded from the
+;  revision code by `info` (clock_info.pi4 PutRevision), not asserted here.
+CompilerIf #PMF_CHIP = 2712
+Procedure.i HwIdBoard()
+  ProcedureReturn "Raspberry Pi 5 Model B"
+EndProcedure
+
+Procedure.i HwIdCpu()
+  ProcedureReturn "Cortex-A76"
+EndProcedure
+
+Procedure.i HwIdTarget()
+  ProcedureReturn "pi5"
+EndProcedure
+CompilerElse
 Procedure.i HwIdBoard()
   ProcedureReturn "Raspberry Pi 4"
 EndProcedure
@@ -49,13 +69,20 @@ EndProcedure
 Procedure.i HwIdTarget()
   ProcedureReturn "pi4"
 EndProcedure
+CompilerEndIf
 
 ; PMFBOOT v2's compiler-owned target identity. Numeric because it is an
 ; admission ABI rather than display text; 2711 is the append-only BCM2711
 ; target code declared by the compiler and Anvil/Core/pmfboot.pbi.
+CompilerIf #PMF_CHIP = 2712
+Procedure.i HwPmfTargetId()
+  ProcedureReturn 2712
+EndProcedure
+CompilerElse
 Procedure.i HwPmfTargetId()
   ProcedureReturn 2711
 EndProcedure
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  HwIdEl() - the exception level, READ FROM THE PROCESSOR.
@@ -104,6 +131,16 @@ EndProcedure
 ;  the same sentence, and it is worth saying out loud for the same reason:
 ;  it tells somebody holding a file which loader is supposed to take it.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+Procedure HwIdSayImage()
+  PrintN("  This image is the kernel file config.txt names on the Pi 5 card")
+  PrintN("  (kernel=). The firmware loads the whole file to")
+  Print("  ")
+  PutAddr(#MON_LO)
+  PrintN(" and our own arm stub enters it there at exception level 3,")
+  PrintN("  with no loader in between.")
+EndProcedure
+CompilerElse
 Procedure HwIdSayImage()
   PrintN("  This image is a kernel8.img. The firmware loads the whole file to")
   Print("  ")
@@ -112,6 +149,7 @@ Procedure HwIdSayImage()
   PrintN("  which is why its size is not capped by anything: there is nothing")
   PrintN("  above it in the boot path to make room for.")
 EndProcedure
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  HwIdImageLen() - how many bytes this monitor's own image is, or 0.
