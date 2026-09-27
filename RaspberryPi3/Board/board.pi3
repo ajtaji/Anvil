@@ -217,6 +217,7 @@ XIncludeFile "Anvil/Hal/hal.pbi"
 XIncludeFile "Anvil/Core/state.pbi"
 XIncludeFile "Anvil/Kernel/exceptions.pbi"
 XIncludeFile "Anvil/Core/format.pbi"
+XIncludeFile "Anvil/Core/fdt.pbi"          ; the one shared DTB reader (Pi3MonitorBootMemory)
 XIncludeFile "Anvil/Core/crc.pbi"
 XIncludeFile "Anvil/Core/sha256.pbi"
 XIncludeFile "Anvil/Core/wallclock.pbi"
@@ -462,11 +463,15 @@ Procedure.i Pi3MonitorBootMemory()
   EndIf
   pi3_ram_end = pi3_ram_base + size
   If pi3_dtb < $1000 Or (pi3_dtb & 7) <> 0 Or pi3_dtb > pi3_ram_end - 40 : ProcedureReturn 0 : EndIf
-  If Pi3ReadBe32(pi3_dtb) <> $D00DFEED : ProcedureReturn 0 : EndIf
+  ; THE WHOLE TREE, NOT ONLY ITS MAGIC AND LENGTH: FdtCheck (the one shared
+  ; reader, Anvil/Core/fdt.pbi) proves the header, the blocks and one full
+  ; token walk, bounded by the RAM left above the pointer and by 1 MiB - the
+  ; same size rule the magic-and-length check applied - so a torn DTB is
+  ; refused here rather than handed on.
+  total = pi3_ram_end - pi3_dtb
+  If total > 1048576 : total = 1048576 : EndIf
+  If FdtCheck(pi3_dtb, total) <> #FDT_OK : ProcedureReturn 0 : EndIf
   total = Pi3ReadBe32(pi3_dtb + 4)
-  If total < 40 Or total > 1048576 Or total > pi3_ram_end - pi3_dtb
-    ProcedureReturn 0
-  EndIf
   pi3_dtb_end = pi3_dtb + total
   ProcedureReturn 1
 EndProcedure
