@@ -48,6 +48,7 @@ DIAGNOSTICS = (
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanBlendProof.pi4",
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanIndexedTriangleProof.pi4",
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanPropertiesProof.pi4",
+    ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanTriangleProof.pi4",
 )
 
 LOAD = 0x00400000
@@ -516,9 +517,10 @@ def main() -> int:
     print("  holds no processor-side or DMA image fallback")
     print("  HOST_COHERENT is backed by required submit and render-completion cache maintenance")
     if diagnostic_built:
-        print("  all six board diagnostics build at $500000 - vulkanClearProof.pi4,")
+        print("  all seven board diagnostics build at $400000 - vulkanClearProof.pi4,")
         print("  vulkanClearRefusals.pi4, vulkanDynamicGeometryProof.pi4,")
-        print("  vulkanBlendProof.pi4, vulkanIndexedTriangleProof.pi4 and vulkanPropertiesProof.pi4")
+        print("  vulkanBlendProof.pi4, vulkanIndexedTriangleProof.pi4,")
+        print("  vulkanPropertiesProof.pi4 and vulkanTriangleProof.pi4")
         print("  (not executed: they need the GPU, and that is a slot)")
 
     if not args.mutate:

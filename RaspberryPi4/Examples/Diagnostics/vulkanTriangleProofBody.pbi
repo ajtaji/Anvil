@@ -626,6 +626,8 @@ Procedure.i Main()
   Define pipeA.i
   Define pipeB.i
   Define pipeC.i
+  Define pipelineCache.i
+  Define pipelineCacheSize.i
   Define bytesA.i
   Define bytesB.i
   Define bytesC.i
@@ -662,6 +664,8 @@ Procedure.i Main()
   Define bufci.VkBufferCreateInfo
   Define smci.VkShaderModuleCreateInfo
   Define plci.VkPipelineLayoutCreateInfo
+  Define cacheInfo.VkPipelineCacheCreateInfo
+  Define Dim cacheData.a[32]
   Define pcr.VkPushConstantRange
   Define Dim stages.VkPipelineShaderStageCreateInfo[2]
   Define bind.VkVertexInputBindingDescription
@@ -767,6 +771,20 @@ Procedure.i Main()
     vtpPut(#VTP_S_DETAIL, rc)
     NeonShutdown()
     ProcedureReturn vtpStop(#VTP_ERR_DEVICE)
+  EndIf
+  cacheInfo\sType = #VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO
+  rc = vkCreatePipelineCache(dev, @cacheInfo, 0, @pipelineCache)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  pipelineCacheSize = 32
+  rc = vkGetPipelineCacheData(dev, pipelineCache, @pipelineCacheSize, @cacheData[0])
+  If rc <> #VK_SUCCESS Or pipelineCacheSize <> 32 Or PeekL(@cacheData[0]) <> 32 Or PeekL(@cacheData[4]) <> 1
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
   EndIf
   vkGetDeviceQueue(dev, 0, 0, @queue)
   pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
@@ -1118,7 +1136,7 @@ CompilerEndIf
   gp\renderPass = rp
   gp\subpass = 0
   gp\basePipelineIndex = -1
-  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeA)
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeA)
   If rc <> #VK_SUCCESS
     vtpPut(#VTP_S_DETAIL, rc)
     vtpPut(#VTP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
@@ -1137,7 +1155,7 @@ CompilerIf #VTP_LIST_PROOF
   cba\srcAlphaBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
   cba\dstAlphaBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
   cba\alphaBlendOp = #VK_BLEND_OP_ADD
-  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeC)
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeC)
   If rc <> #VK_SUCCESS
     vtpPut(#VTP_S_DETAIL, rc)
     NeonShutdown()
@@ -1152,7 +1170,7 @@ CompilerEndIf
   stages[1]\module = fsB
   vi\vertexAttributeDescriptionCount = 2
   gp\layout = layB
-  rc = vkCreateGraphicsPipelines(dev, 0, 1, @gp, 0, @pipeB)
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeB)
   If rc <> #VK_SUCCESS
     vtpPut(#VTP_S_DETAIL, rc)
     vtpPut(#VTP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
@@ -1512,6 +1530,7 @@ CompilerEndIf
 CompilerIf #VTP_LIST_PROOF
   vkDestroyPipeline(dev, pipeC, 0)
 CompilerEndIf
+  vkDestroyPipelineCache(dev, pipelineCache, 0)
   vkDestroyPipelineLayout(dev, layA, 0)
   vkDestroyPipelineLayout(dev, layB, 0)
   vkDestroyShaderModule(dev, vsA, 0)
