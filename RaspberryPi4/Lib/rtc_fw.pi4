@@ -1,0 +1,146 @@
+; ======================================================================
+;  rtc_fw.pi4 - the Pi 5's battery-backed real-time clock, which the
+;  firmware owns and which Anvil reaches only through the property
+;  mailbox. THE ONE FILE THAT KNOWS THE RTC TAGS.
+;
+;  NOT A CHIP DRIVER. The BCM2712's RTC sits behind the VideoCore/PMIC and
+;  has no ARM-visible register interface; the Linux driver
+;  (drivers/rtc/rtc-rpi.c, raspberrypi/linux 7e030b60792d) is two
+;  firmware property tags and nothing else, and so is this file. It calls
+;  RaspberryPi4/Lib/mailbox.pi4's public transport (MailboxBegin /
+;  MailboxSetWord / MailboxSend / MailboxWord / MailboxRespBytes) and
+;  never touches a mailbox register - the transport, and whatever it
+;  needs to be on BCM2712, belong to that file.
+;
+;  ---- THE MESSAGE (rtc-rpi.c, word for word) ---------------------------
+;
+;    RPI_FIRMWARE_GET_RTC_REG = $00030087   (rtc-rpi.c:25)
+;    RPI_FIRMWARE_SET_RTC_REG = $00038087   (rtc-rpi.c:26)
+;
+;  Both carry the same 8-byte value, u32 data[2] = { register, value }
+;  (rtc-rpi.c:42, 54: rpi_firmware_property(fw, tag, &data, sizeof(data)))
+;  - so MailboxBegin(tag, 8, 8). GET sends { reg, 0 } and the answer is
+;  data[1]; SET sends { reg, value }. The register numbers are the
+;  driver's enum (rtc-rpi.c:28-37): 0 TIME, 1 ALARM, 2 ALARM_PENDING,
+;  3 ALARM_ENABLE, 4 BBAT_CHG_VOLTS, 5 ..._MIN, 6 ..._MAX, 7 BBAT_VOLTS.
+;
+;  TIME is seconds since 1970-01-01 00:00:00 UTC as an UNSIGNED 32-bit
+;  word (rtc_time64_to_tm(data[1]) on a u32), so it is read here with
+;  MailboxWord's 32-bit mask and returned as a non-negative .i. A value
+;  that does not fit 32 bits is refused on the way in rather than
+;  truncated into a different date.
+;
+;  ---- WHAT "FAILED" MEANS ------------------------------------------------
+;
+;  -1 from a getter, 0 from a setter, and RtcFwError() says which:
+;    #RTCFW_ERR_MAILBOX  the transaction failed; MailboxError() has the step
+;    #RTCFW_ERR_SHORT    the firmware answered the tag with fewer than the
+;                        8 bytes the value needs - a firmware that does not
+;                        implement this tag the way rtc-rpi.c expects
+;    #RTCFW_ERR_ARG      a register number or value this file will not send
+;  A Pi 4's firmware does not know these tags; on that board the answer is
+;  #RTCFW_ERR_MAILBOX (#MBX_ERR_TAG), which is the right answer, and the
+;  Pi 4 composition does not include this file.
+;
+;  THERE IS NO "THE CLOCK IS VALID" BIT in this interface - rtc-rpi.c has
+;  none - so a board with no battery reads back whatever the firmware
+;  counted since power-on. The caller that seeds the wall clock from this
+;  must apply its own floor (Anvil/Core/wallclock.pbi's
+;  #WALLCLOCK_EPOCH_MIN refuses anything before 1980).
+;
+;  DESK PROOF ONLY (tools/a64/rtc_fw_check.py, the message layout against
+;  a modelled firmware). SILICON OWED.
+;
+;  DEPENDENCIES: RaspberryPi4/Lib/mailbox.pi4, listed before this file by
+;  the board (house rule 10).
+; ======================================================================
+
+EnableExplicit
+
+#RTCFW_TAG_GET = $00030087
+#RTCFW_TAG_SET = $00038087
+#RTCFW_VALUE_BYTES = 8
+
+#RTCFW_REG_TIME           = 0
+#RTCFW_REG_ALARM          = 1
+#RTCFW_REG_ALARM_PENDING  = 2
+#RTCFW_REG_ALARM_ENABLE   = 3
+#RTCFW_REG_BBAT_CHG_VOLTS = 4
+#RTCFW_REG_BBAT_CHG_MIN   = 5
+#RTCFW_REG_BBAT_CHG_MAX   = 6
+#RTCFW_REG_BBAT_VOLTS     = 7
+#RTCFW_REG_LAST           = 7
+
+#RTCFW_OK          = 0
+#RTCFW_ERR_MAILBOX = 1
+#RTCFW_ERR_SHORT   = 2
+#RTCFW_ERR_ARG     = 3
+
+Global rtcfw_err.i
+
+Procedure.i RtcFwError()
+  ProcedureReturn rtcfw_err
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RtcFwReadReg(reg) - one GET_RTC_REG. The register's 32-bit value, or -1.
+; ----------------------------------------------------------------------
+Procedure.i RtcFwReadReg(reg.i)
+  rtcfw_err = #RTCFW_OK
+  If reg < 0 Or reg > #RTCFW_REG_LAST
+    rtcfw_err = #RTCFW_ERR_ARG
+    ProcedureReturn -1
+  EndIf
+  If MailboxBegin(#RTCFW_TAG_GET, #RTCFW_VALUE_BYTES, #RTCFW_VALUE_BYTES) = 0
+    rtcfw_err = #RTCFW_ERR_MAILBOX
+    ProcedureReturn -1
+  EndIf
+  MailboxSetWord(0, reg)
+  MailboxSetWord(1, 0)
+  If MailboxSend() = 0
+    rtcfw_err = #RTCFW_ERR_MAILBOX
+    ProcedureReturn -1
+  EndIf
+  If MailboxRespBytes() < #RTCFW_VALUE_BYTES
+    rtcfw_err = #RTCFW_ERR_SHORT
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn MailboxWord(1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  RtcFwWriteReg(reg, value) - one SET_RTC_REG. 1, or 0.
+; ----------------------------------------------------------------------
+Procedure.i RtcFwWriteReg(reg.i, value.i)
+  rtcfw_err = #RTCFW_OK
+  If reg < 0 Or reg > #RTCFW_REG_LAST Or value < 0 Or value > $FFFFFFFF
+    rtcfw_err = #RTCFW_ERR_ARG
+    ProcedureReturn 0
+  EndIf
+  If MailboxBegin(#RTCFW_TAG_SET, #RTCFW_VALUE_BYTES, #RTCFW_VALUE_BYTES) = 0
+    rtcfw_err = #RTCFW_ERR_MAILBOX
+    ProcedureReturn 0
+  EndIf
+  MailboxSetWord(0, reg)
+  MailboxSetWord(1, value)
+  If MailboxSend() = 0
+    rtcfw_err = #RTCFW_ERR_MAILBOX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Seconds since 1970-01-01 UTC, or -1 (rpi_rtc_read_time).
+Procedure.i RtcFwTime()
+  ProcedureReturn RtcFwReadReg(#RTCFW_REG_TIME)
+EndProcedure
+
+; Set the RTC to epoch seconds, 0..$FFFFFFFF (rpi_rtc_set_time).
+Procedure.i RtcFwSetTime(epoch.i)
+  ProcedureReturn RtcFwWriteReg(#RTCFW_REG_TIME, epoch)
+EndProcedure
+
+; The backup battery's voltage in microvolts, or -1 (battery_voltage_show).
+Procedure.i RtcFwBatteryMicrovolts()
+  ProcedureReturn RtcFwReadReg(#RTCFW_REG_BBAT_VOLTS)
+EndProcedure
