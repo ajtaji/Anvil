@@ -75,8 +75,13 @@ Procedure.i AnvilSchedulerPrepareWfe()
   firstCount = AnvilSchedulerCounterValue()
 
   ; EVNTI selects a counter bit; rising transitions occur every
-  ; 2^(EVNTI+1) ticks. Cap each sleep interval at 500 microseconds.
+  ; 2^(EVNTI+1) ticks. The Pi 4's measured bit-15 event sleeps about
+  ; 1.21 ms, reducing prompt polling while retaining input service on
+  ; every wake. Other targets keep their existing 500 us bound.
   target = hz / 2000
+  CompilerIf #PMF_CHIP = 2711
+  target = hz / 500
+  CompilerEndIf
   evnti = 0
   period = 2
   While evnti < 15 And period <= target / 2
@@ -201,6 +206,24 @@ Procedure.i AnvilSchedulerQualifyPi3Wfe()
   EndIf
   ; The 32-sample deadman-protected hardware qualification is documented
   ; for this exact BCM2837/EL3/counter path. Do not repeat it on every boot.
+  anvil_promptProbePassed = 1
+  AnvilSchedulerWfeVerified(1)
+  ProcedureReturn anvil_promptWfeEnabled
+EndProcedure
+
+; The BCM2711 EL3/counter path passed deadman-guarded 32-wake silicon
+; probes at both bit 13 and bit 15 with CNTFRQ_EL0 = 54 MHz. Keep the readback and frequency
+; bounds at every boot; a different clock or exception level polls instead.
+Procedure.i AnvilSchedulerQualifyPi4Wfe()
+  anvil_promptWfeReady = 0
+  anvil_promptProbePassed = 0
+  anvil_promptWfeEnabled = 0
+  If MmuEl() <> 3 Or AnvilSchedulerCounterHz() <> 54000000
+    ProcedureReturn 0
+  EndIf
+  If AnvilSchedulerPrepareWfe() <= 0
+    ProcedureReturn 0
+  EndIf
   anvil_promptProbePassed = 1
   AnvilSchedulerWfeVerified(1)
   ProcedureReturn anvil_promptWfeEnabled

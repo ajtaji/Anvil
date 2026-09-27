@@ -28,7 +28,7 @@
 ;   * one vertex input binding, VK_VERTEX_INPUT_RATE_VERTEX
 ;   * attributes at locations 0..n-1 (n <= 4), R32G32_SFLOAT,
 ;     R32G32B32_SFLOAT or R32G32B32A32_SFLOAT, all from binding 0
-;   * VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, no primitive restart
+;   * TRIANGLE_LIST and TRIANGLE_STRIP, no primitive restart
 ;   * one viewport and one scissor; either, both or neither may be dynamic
 ;   * VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, no depth bias, line width
 ;     1.0, no depth clamp, no rasteriser discard
@@ -189,6 +189,7 @@ Global Dim avkPipeBindingCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindingType.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkPipeBindingStages.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 Global Dim avkPipeRp.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeTopology.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindStride.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_BINDINGS]
 Global Dim avkPipeAttrBinding.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_SPV_MAX_ATTRS]
@@ -1447,11 +1448,11 @@ Procedure.i avkPipeCheckInputAssembly(*ia.VkPipelineInputAssemblyStateCreateInfo
   If (*ia\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a VkPipelineInputAssemblyStateCreateInfo whose sType is wrong (Anvil code -20001, wrong sType).")
   EndIf
-  If (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST (Anvil code -20005, unsupported topology); the one primitive mode this slice writes into the control list is a triangle list, and a strip or a fan would change the vertex order the binner reads.")
+  If (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST And (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than TRIANGLE_LIST or TRIANGLE_STRIP (Anvil code -20005, unsupported topology); point, line and fan primitives need their own validated V3D packet path.")
   EndIf
   If (*ia\primitiveRestartEnable & $FFFFFFFF) <> #VK_FALSE
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for primitive restart (Anvil code -20005, unsupported state); primitive restart only has meaning for an indexed draw, and there is no index buffer here.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for primitive restart (Anvil code -20005, unsupported state); indexed strip restart is not implemented.")
   EndIf
   ProcedureReturn #VK_SUCCESS
 EndProcedure
@@ -1788,6 +1789,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   Define dynamicViewport.i
   Define dynamicScissor.i
   Define *st.VkPipelineShaderStageCreateInfo
+  Define *ia.VkPipelineInputAssemblyStateCreateInfo
   Define build.AnvilVkBackendPipelineBuildInfo
 
   If *out = 0 Or *ci = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
@@ -1951,6 +1953,8 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
     k = k + 1
   Wend
   avkPipeRp[s] = rp
+  *ia = *ci\pInputAssemblyState
+  avkPipeTopology[s] = *ia\topology & $FFFFFFFF
   avkPipeDynamicViewport[s] = dynamicViewport
   avkPipeDynamicScissor[s] = dynamicScissor
   avkPipePosAttr[s] = avkShPosAttr[vs]
@@ -2066,6 +2070,7 @@ Procedure AnvilVkPipelineDestroy(device.i, pipeline.i)
     avkPipeCodeMem[s] = 0
   EndIf
   avkPipeLive[s] = 0
+  avkPipeTopology[s] = 0
   avkPipeDynamicViewport[s] = 0
   avkPipeDynamicScissor[s] = 0
   avkPipeScissorX[s] = 0 : avkPipeScissorY[s] = 0
@@ -2319,6 +2324,11 @@ Procedure AnvilVkCmdBeginRenderPass(commandBuffer.i, renderPass.i, framebuffer.i
   avkCbFbHandle[c] = framebuffer
   avkCbRpActive[c] = 1
   avkRefCur[avkRefIndex(c, k)] = avkRpFinalLayout[rp]
+EndProcedure
+
+Procedure.i AnvilVkPipelineTopology(pipe.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn -1 : EndIf
+  ProcedureReturn avkPipeTopology[pipe]
 EndProcedure
 
 ; The first whole-target attachment clear can replace the render pass load
@@ -2796,7 +2806,7 @@ Procedure AnvilVkCmdBindIndexBuffer(commandBuffer.i, buffer.i, offset.i, indexTy
 EndProcedure
 
 ; Core indexed drawing, deliberately bounded to one instance, zero base
-; vertex/base instance and the pipeline's triangle-list topology. Index bytes
+; vertex/base instance and the pipeline's triangle-list or strip topology. Index bytes
 ; remain application memory: submission preflight re-resolves and scans the
 ; live uint16/uint32 range before any fence, retain counter or backend job
 ; changes state.
