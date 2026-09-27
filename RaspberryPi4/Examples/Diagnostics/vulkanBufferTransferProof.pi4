@@ -30,11 +30,12 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VBTP_WIN_BYTES = 4227072
 #VBTP_MAP_SPAN = 8323072
 Global Dim vbtpDmaScratch.a[767]
+Global Dim vbtpLargeUpdate.l[16383]
 
 Procedure.i Main()
   Define status.i = 1
   Define neonReady.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i, largeCmd.i
   Define src.i, dst.i, srcMem.i, dstMem.i, srcMap.i, dstMap.i
   Define fence.i, count.i, cbHandle.i, fenceArray.i, i.i, rc.i
   Define ici.VkInstanceCreateInfo
@@ -85,7 +86,7 @@ Procedure.i Main()
     If queue = 0 : status = 9 : Break : EndIf
 
     bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
-    bci\size = 64
+    bci\size = 65536
     bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
     bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
     If vkCreateBuffer(dev, @bci, 0, @src) <> #VK_SUCCESS : status = 10 : Break : EndIf
@@ -158,6 +159,40 @@ Procedure.i Main()
     If hwVkDmaOps <> 5 : status = 33 : Break : EndIf
     If DmaQuiescent() = 0 : status = 34 : Break : EndIf
     If dma_bounds <> #VBTP_SURFACE Or dma_boundsN <> 4096000 : status = 35 : Break : EndIf
+
+    ; The maximum legal update size exercises the DMA fill's multirow path
+    ; and the linear copy from the command buffer's retained data snapshot.
+    If vkAllocateCommandBuffers(dev, @cbai, @largeCmd) <> #VK_SUCCESS : status = 36 : Break : EndIf
+    If vkBeginCommandBuffer(largeCmd, @bi) <> #VK_SUCCESS : status = 37 : Break : EndIf
+    vkCmdFillBuffer(largeCmd, dst, 0, 65536, $5A37C0DE)
+    If vkEndCommandBuffer(largeCmd) <> #VK_SUCCESS : status = 38 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 39 : Break : EndIf
+    cbHandle = largeCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 40 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 41 : Break : EndIf
+    For i = 0 To 16383
+      If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $5A37C0DE : status = 42 : Break : EndIf
+    Next
+    If status = 42 : Break : EndIf
+    If hwVkDmaOps <> 6 Or dma_bounds <> #VBTP_SURFACE : status = 43 : Break : EndIf
+
+    For i = 0 To 16383
+      vbtpLargeUpdate[i] = $46000000 + i
+    Next
+    If vkAllocateCommandBuffers(dev, @cbai, @largeCmd) <> #VK_SUCCESS : status = 44 : Break : EndIf
+    If vkBeginCommandBuffer(largeCmd, @bi) <> #VK_SUCCESS : status = 45 : Break : EndIf
+    vkCmdUpdateBuffer(largeCmd, dst, 0, 65536, @vbtpLargeUpdate[0])
+    If vkEndCommandBuffer(largeCmd) <> #VK_SUCCESS : status = 46 : Break : EndIf
+    For i = 0 To 16383 : vbtpLargeUpdate[i] = 0 : Next
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 47 : Break : EndIf
+    cbHandle = largeCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 48 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 49 : Break : EndIf
+    For i = 0 To 16383
+      If (PeekL(dstMap + i * 4) & $FFFFFFFF) <> $46000000 + i : status = 50 : Break : EndIf
+    Next
+    If status = 50 : Break : EndIf
+    If hwVkDmaOps <> 7 Or dma_bounds <> #VBTP_SURFACE Or DmaQuiescent() = 0 : status = 51 : Break : EndIf
     status = 0
   Until 1
 
