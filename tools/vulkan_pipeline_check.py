@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 792
+REPORT_WORDS = 797
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1637,6 +1637,11 @@ def grade(cpu, rc) -> Grader:
     g.need("overlapping upload destinations refuse the array", slot(789), ERR_ARGS)
     g.need("upload region count above capacity is refused", slot(790), ERR_ARGS)
     g.need("invalid upload arrays leave no flight", slot(791), 0)
+    g.need("two ordered image-copy calls record", slot(792), 0)
+    g.need("two ordered image-copy calls submit", slot(793), 0)
+    g.need("two ordered image-copy calls complete", slot(794), 0)
+    g.need("two ordered image-copy calls preserve all destination bytes", slot(795), 0)
+    g.need("ordered image-copy calls leave no flight", slot(796), 0)
     g.need("whole image-to-buffer readback records", slot(717), 0)
     g.need("whole image-to-buffer readback submits", slot(718), 0)
     g.need("whole image-to-buffer readback completes", slot(719), 0)

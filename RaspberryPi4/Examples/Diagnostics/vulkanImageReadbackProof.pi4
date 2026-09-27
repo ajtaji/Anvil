@@ -496,6 +496,35 @@ Procedure.i Main()
     Next
     If status = 129 : Break : EndIf
 
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 130 : Break : EndIf
+    imageRegions[0]\srcOffset\x = 0 : imageRegions[0]\srcOffset\y = 0
+    imageRegions[0]\dstOffset\x = 16 : imageRegions[0]\dstOffset\y = 0
+    imageRegions[1]\srcOffset\x = 8 : imageRegions[1]\srcOffset\y = 0
+    imageRegions[1]\dstOffset\x = 20 : imageRegions[1]\dstOffset\y = 0
+    If vkBeginCommandBuffer(arrayCmd, @bi) <> #VK_SUCCESS : status = 131 : Break : EndIf
+    vkCmdCopyImage(arrayCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @imageRegions[0])
+    vkCmdCopyImage(arrayCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @imageRegions[1])
+    If vkEndCommandBuffer(arrayCmd) <> #VK_SUCCESS : status = 132 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 133 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 134 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 135 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 136 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 137 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If (j >= 7 And j < 24 And k >= 9 And k < 22) Or (j >= 24 And j < 32 And k >= 24 And k < 32) Or (j < 4 And k >= 24 And k < 28) Or (j >= 28 And j < 32 And k < 4) Or (j < 4 And k < 4) Or (j >= 12 And j < 24 And k < 4)
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 138 : Break : EndIf
+      Next
+      If status = 138 : Break : EndIf
+    Next
+    If status = 138 : Break : EndIf
+
     status = 0
   Until 1
 
