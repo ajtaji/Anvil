@@ -492,11 +492,11 @@ EndProcedure
 ;  the state are therefore re-emitted on every draw: CFG_BITS owns the master
 ;  bit, BLEND_ENABLES owns RT0, and an enabled draw also emits BLEND_CFG.
 ;
-;  THE VIEWPORT MUST BE THE RENDER GEOMETRY. NeonFrameBegin establishes the
-;  surface-wide clip window. This backend then re-emits the clipper scale and
-;  viewport offset from the compiled pipeline's exact u14.8 half extents, so
-;  odd dimensions retain their half pixel and the coordinate shader, clipper
-;  and rasteriser all consume the same value.
+;  A VIEWPORT MAY FIT INSIDE THE RENDER GEOMETRY. NeonFrameBegin establishes
+;  the surface-wide clip window. This backend then re-emits the clipper scale
+;  and viewport offset from each draw's exact u14.8 half extents, so odd
+;  dimensions retain their half pixel and the coordinate shader, clipper and
+;  rasteriser all consume the same value.
 
 ; Neon's frame prologue writes CFG_BITS with both facings enabled, no
 ; clockwise winding and depth function ALWAYS, and then ORs in the blend
@@ -737,7 +737,7 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If *d\viewportX <> 0 Or *d\viewportY <> 0 Or *d\viewportW <> *d\width Or *d\viewportH <> *d\height Or *d\viewportW < 1 Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > 32767
+  If *d\viewportX <> 0 Or *d\viewportY <> 0 Or *d\viewportW < 1 Or *d\viewportW > *d\width Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > *d\height Or *d\viewportH > 32767
     ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
   EndIf
   If AnvilVkPipelineDynamicViewport(pipe) = 0 And (AnvilVkPipelineViewportWidth(pipe) <> *d\viewportW Or AnvilVkPipelineViewportHeight(pipe) <> *d\viewportH)

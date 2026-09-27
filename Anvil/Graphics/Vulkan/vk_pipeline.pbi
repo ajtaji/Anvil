@@ -1711,8 +1711,8 @@ Procedure.i avkPipeDynamicState(*ds.VkPipelineDynamicStateCreateInfo, *dynamicVi
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-; The viewport is either a fixed full target or a per-draw full target. The
-; scissor is likewise static or dynamic. Vulkan ignores the corresponding
+; The viewport is fixed or per draw, origin-zero and contained by the target.
+; The scissor is likewise static or dynamic. Vulkan ignores the corresponding
 ; pointer when state is dynamic, so null is legal in that case.
 Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynamicViewport.i, dynamicScissor.i)
   Define *v.VkViewport
@@ -2676,8 +2676,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     EndIf
     vx = avkCbViewportX[c] : vy = avkCbViewportY[c]
     vw = avkCbViewportW[c] : vh = avkCbViewportH[c]
-    If vw <> avkFbW[fb] Or vh <> avkFbH[fb]
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw used a dynamic viewport that does not equal the active framebuffer geometry (Anvil code -20005, unsupported viewport); this bounded path supports resize by reusing a pipeline with one full-target viewport.")
+    If vw > avkFbW[fb] Or vh > avkFbH[fb]
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw used a dynamic viewport larger than the active framebuffer (Anvil code -20005, unsupported viewport); use an origin-zero whole-pixel viewport contained by the framebuffer.")
       ProcedureReturn
     EndIf
   Else
@@ -2912,8 +2912,8 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     EndIf
     vx = avkCbViewportX[c] : vy = avkCbViewportY[c]
     vw = avkCbViewportW[c] : vh = avkCbViewportH[c]
-    If vw <> avkFbW[fb] Or vh <> avkFbH[fb]
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed used a dynamic viewport that does not equal the active framebuffer geometry (Anvil code -20005, unsupported viewport); this bounded path supports one full-target viewport.")
+    If vw > avkFbW[fb] Or vh > avkFbH[fb]
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed used a dynamic viewport larger than the active framebuffer (Anvil code -20005, unsupported viewport); use an origin-zero whole-pixel viewport contained by the framebuffer.")
       ProcedureReturn
     EndIf
   Else

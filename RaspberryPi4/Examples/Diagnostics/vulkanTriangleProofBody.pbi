@@ -1358,11 +1358,15 @@ CompilerIf #VTP_PYRAMID_DEMO
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
 CompilerIf #VTP_PYRAMID_DEMO = 2
-    ; Exercise the per-draw V3D viewport uniforms and clip packet. The
-    ; viewport must match this framebuffer; the last scissor is half size.
+    ; Exercise per-draw V3D viewport uniforms, clipper scale and scissor.
+    ; The final frame maps the pyramid into a half-size viewport.
     If (frame & 1) <> 0
+      PokeL(@vp\width, $43C80000)  ; 400.0
+      PokeL(@vp\height, $44200000) ; 640.0
       sc\extent\width = 400 : sc\extent\height = 640
     Else
+      PokeL(@vp\width, $4447C000)  ; 799.0
+      PokeL(@vp\height, $449FE000) ; 1279.0
       sc\extent\width = #VTP_VIEW_W : sc\extent\height = #VTP_VIEW_H
     EndIf
     vkCmdSetViewport(cmd, 0, 1, @vp)
