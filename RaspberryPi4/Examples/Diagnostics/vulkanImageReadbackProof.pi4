@@ -1,0 +1,194 @@
+; Pi 4 RAM diagnostic: V3D clear followed by public Vulkan DMA image readback.
+; Compile for load $600000, stack $4F00000, returning entry. Use the board
+; lease, DMA console, 15-second deadman, and a fresh return screenshot.
+
+#PMF_CHIP = 2711
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VIR_ARENA = $0A000000
+#VIR_SURFACE = $06000000
+#VIR_WIN_BASE = $063E8000
+#VIR_WIN_BYTES = 4227072
+#VIR_IMAGE_BYTES = 16384
+#VIR_BUFFER_BYTES = 16512
+#VIR_EXPECT = $FF3380B2
+Global Dim virDmaScratch.a[767]
+Global Dim virColor.l[4]
+
+Procedure.i Main()
+  Define status.i = 1, neonReady.i = 0, i.i, rc.i, scratch.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i
+  Define img.i, imgMem.i, buf.i, bufMem.i, bufMap.i, fence.i
+  Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define bar.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Define region.VkBufferImageCopy
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+
+  Repeat
+    If NeonArena(#VIR_ARENA, $01000000) <> #NEON_OK : status = 2 : Break : EndIf
+    If NeonSurface(#VIR_SURFACE, 800, 1280, 3200) <> #NEON_OK : status = 3 : Break : EndIf
+    NeonSurfaceMapSpan(8323072)
+    If NeonInit() <> #NEON_OK : status = 4 : Break : EndIf
+    neonReady = 1
+    If AnvilVkV3dWindow(#VIR_WIN_BASE, #VIR_WIN_BYTES) <> #VK_SUCCESS : status = 5 : Break : EndIf
+    scratch = @virDmaScratch[0] + 255
+    scratch = scratch - (scratch % 256)
+    If DmaSetScratch(scratch, #DMA_SCRATCH_BYTES) = 0 : status = 6 : Break : EndIf
+    If DmaSetBounds(#VIR_SURFACE, 4096000) = 0 : status = 7 : Break : EndIf
+    If DmaInit() = 0 : status = 8 : Break : EndIf
+
+    ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : status = 9 : Break : EndIf
+    count = 1
+    If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS Or phys = 0 : status = 10 : Break : EndIf
+    qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    qci\queueCount = 1 : qci\pQueuePriorities = @prio
+    dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+    If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : status = 11 : Break : EndIf
+    vkGetDeviceQueue(dev, 0, 0, @queue)
+    If queue = 0 : status = 12 : Break : EndIf
+
+    imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+    imgci\imageType = #VK_IMAGE_TYPE_2D
+    imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+    imgci\extent\width = 64 : imgci\extent\height = 64 : imgci\extent\depth = 1
+    imgci\mipLevels = 1 : imgci\arrayLayers = 1
+    imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+    imgci\tiling = #VK_IMAGE_TILING_LINEAR
+    imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS : status = 13 : Break : EndIf
+    vkGetImageMemoryRequirements(dev, img, @req)
+    If req\size <> #VIR_IMAGE_BYTES Or AnvilVkImageRowPitch(img) <> 256 : status = 14 : Break : EndIf
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+    If vkAllocateMemory(dev, @mai, 0, @imgMem) <> #VK_SUCCESS : status = 15 : Break : EndIf
+    If vkBindImageMemory(dev, img, imgMem, 0) <> #VK_SUCCESS : status = 16 : Break : EndIf
+
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\size = #VIR_BUFFER_BYTES
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    If vkCreateBuffer(dev, @bci, 0, @buf) <> #VK_SUCCESS : status = 17 : Break : EndIf
+    vkGetBufferMemoryRequirements(dev, buf, @req)
+    mai\allocationSize = req\size
+    If vkAllocateMemory(dev, @mai, 0, @bufMem) <> #VK_SUCCESS : status = 18 : Break : EndIf
+    If vkBindBufferMemory(dev, buf, bufMem, 0) <> #VK_SUCCESS : status = 19 : Break : EndIf
+    If vkMapMemory(dev, bufMem, 0, #VK_WHOLE_SIZE, 0, @bufMap) <> #VK_SUCCESS : status = 20 : Break : EndIf
+    For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
+
+    pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : status = 21 : Break : EndIf
+    cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    cbai\commandBufferCount = 1
+    If vkAllocateCommandBuffers(dev, @cbai, @clearCmd) <> #VK_SUCCESS : status = 22 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @readCmd) <> #VK_SUCCESS : status = 23 : Break : EndIf
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
+    fenceArray = fence
+    si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+    si\commandBufferCount = 1 : si\pCommandBuffers = @cbHandle
+
+    virColor[0] = $3E4CCCCD : virColor[1] = $3F000000
+    virColor[2] = $3F333333 : virColor[3] = $3F800000
+    bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\image = img
+    bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+    range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    range\levelCount = 1 : range\layerCount = 1
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    If vkBeginCommandBuffer(clearCmd, @bi) <> #VK_SUCCESS : status = 25 : Break : EndIf
+    vkCmdPipelineBarrier(clearCmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdClearColorImage(clearCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @virColor[0], 1, @range)
+    If vkEndCommandBuffer(clearCmd) <> #VK_SUCCESS : status = 26 : Break : EndIf
+    binBefore = V3dBinJobs() : renBefore = V3dRenderJobs()
+    cbHandle = clearCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 27 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 28 : Break : EndIf
+    If V3dBinJobs() <> binBefore + 1 Or V3dRenderJobs() <> renBefore + 1 : status = 29 : Break : EndIf
+
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    region\bufferOffset = 64
+    region\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    region\imageSubresource\layerCount = 1
+    region\imageExtent\width = 64 : region\imageExtent\height = 64 : region\imageExtent\depth = 1
+    If vkBeginCommandBuffer(readCmd, @bi) <> #VK_SUCCESS : status = 30 : Break : EndIf
+    vkCmdPipelineBarrier(readCmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyImageToBuffer(readCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @region)
+    If vkEndCommandBuffer(readCmd) <> #VK_SUCCESS : status = 31 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 32 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = readCmd
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    If rc <> #VK_SUCCESS : status = 33 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 34 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 1 Or DmaQuiescent() = 0 : status = 35 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 36 : Break : EndIf
+    For i = 0 To 63
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 37 : Break : EndIf
+    Next
+    If status = 37 : Break : EndIf
+    For i = 0 To 4095
+      If (PeekL(bufMap + 64 + i * 4) & $FFFFFFFF) <> #VIR_EXPECT : status = 38 : Break : EndIf
+    Next
+    If status = 38 : Break : EndIf
+    For i = 16448 To #VIR_BUFFER_BYTES - 1
+      If (PeekA(bufMap + i) & $FF) <> $A5 : status = 39 : Break : EndIf
+    Next
+    If status = 39 : Break : EndIf
+    status = 0
+  Until 1
+
+  If dev <> 0
+    vkDeviceWaitIdle(dev)
+    If bufMap <> 0 : vkUnmapMemory(dev, bufMem) : EndIf
+    If fence <> 0 : vkDestroyFence(dev, fence, 0) : EndIf
+    If pool <> 0 : vkDestroyCommandPool(dev, pool, 0) : EndIf
+    If buf <> 0 : vkDestroyBuffer(dev, buf, 0) : EndIf
+    If img <> 0 : vkDestroyImage(dev, img, 0) : EndIf
+    If bufMem <> 0 : vkFreeMemory(dev, bufMem, 0) : EndIf
+    If imgMem <> 0 : vkFreeMemory(dev, imgMem, 0) : EndIf
+    vkDestroyDevice(dev, 0)
+  EndIf
+  If inst <> 0 : vkDestroyInstance(inst, 0) : EndIf
+  If neonReady <> 0 : NeonShutdown() : EndIf
+  ProcedureReturn status
+EndProcedure
