@@ -226,6 +226,40 @@ Procedure vgScaledPosition(*m.AvkIrModule)
   *m\nodeCount=11 : vgBlocks[0]\nodeCount=11
 EndProcedure
 
+; Two input rows perform a 2x2 transform in the coordinate and vertex QPUs.
+Procedure vgMatrixPosition(*m.AvkIrModule)
+  Protected n.i=0
+  vgModule(*m,0,0,0)
+  vgVariables[1]\sourceId=11 : vgVariables[1]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[1]\pointerType=5 : vgVariables[1]\storageClass=#ANVIL_IR_STORAGE_INPUT
+  vgVariables[2]\sourceId=12 : vgVariables[2]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[2]\pointerType=5 : vgVariables[2]\storageClass=#ANVIL_IR_STORAGE_INPUT
+  vgVariables[3]\sourceId=20 : vgVariables[3]\sourceOpcode=#ANVIL_IR_SPV_VARIABLE : vgVariables[3]\pointerType=8 : vgVariables[3]\storageClass=#ANVIL_IR_STORAGE_OUTPUT
+  vgInterfaces[1]=11 : vgInterfaces[2]=12 : vgInterfaces[3]=20
+  *m\variableCount=4 : *m\interfaceCount=4
+  vgDecor(1,11,-1,#ANVIL_IR_DEC_LOCATION,1)
+  vgDecor(2,12,-1,#ANVIL_IR_DEC_LOCATION,2)
+  vgDecor(3,20,-1,#ANVIL_IR_DEC_BUILTIN,#ANVIL_IR_BUILTIN_POSITION)
+  *m\decorationCount=4
+  vgNode(n,40,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=10 : n=n+1
+  vgNode(n,41,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=40 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=0 : n=n+1
+  vgNode(n,42,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=40 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=1 : n=n+1
+  vgNode(n,43,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=11 : n=n+1
+  vgNode(n,44,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=43 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=0 : n=n+1
+  vgNode(n,45,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=43 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=1 : n=n+1
+  vgNode(n,46,#ANVIL_IR_SPV_LOAD,#ANVIL_IR_OP_LOAD,3,1) : vgNodes[n]\operand0=12 : n=n+1
+  vgNode(n,47,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=46 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=0 : n=n+1
+  vgNode(n,48,#ANVIL_IR_SPV_COMPOSITE_EXTRACT,#ANVIL_IR_OP_COMPOSITE_EXTRACT,2,1) : vgNodes[n]\operand0=46 : vgNodes[n]\literalCount=1 : vgNodes[n]\literal0=1 : n=n+1
+  vgNode(n,51,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[n]\operand0=41 : vgNodes[n]\operand1=44 : n=n+1
+  vgNode(n,52,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[n]\operand0=42 : vgNodes[n]\operand1=45 : n=n+1
+  vgNode(n,53,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[n]\operand0=51 : vgNodes[n]\operand1=52 : n=n+1
+  vgNode(n,54,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[n]\operand0=41 : vgNodes[n]\operand1=47 : n=n+1
+  vgNode(n,55,#ANVIL_IR_SPV_FMUL,#ANVIL_IR_OP_FMUL,2,2) : vgNodes[n]\operand0=42 : vgNodes[n]\operand1=48 : n=n+1
+  vgNode(n,56,#ANVIL_IR_SPV_FADD,#ANVIL_IR_OP_FADD,2,2) : vgNodes[n]\operand0=54 : vgNodes[n]\operand1=55 : n=n+1
+  vgNode(n,57,#ANVIL_IR_SPV_COMPOSITE_CONSTRUCT,#ANVIL_IR_OP_COMPOSITE_CONSTRUCT,4,4) : vgNodes[n]\operand0=53 : vgNodes[n]\operand1=56 : vgNodes[n]\operand2=30 : vgNodes[n]\operand3=31 : n=n+1
+  vgNode(n,0,#ANVIL_IR_SPV_STORE,#ANVIL_IR_OP_STORE,0,2) : vgNodes[n]\operand0=20 : vgNodes[n]\operand1=57 : n=n+1
+  vgNode(n,0,#ANVIL_IR_SPV_RETURN,#ANVIL_IR_OP_RETURN,0,0) : n=n+1
+  *m\nodeCount=n : vgBlocks[0]\nodeCount=n
+EndProcedure
+
 ; Position destination multiplicity hostiles: the semantic target, rather
 ; than the raw pointer ID, is unique.
 Procedure vgDuplicatePosition(*m.AvkIrModule, kind.i)
@@ -532,6 +566,11 @@ Procedure.i Main()
   vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(50,rc,@r,@t)
   rc=AnvilVkIrV3d42PlanVertex(@m,@p)
   vgReport[50*#VG_STRIDE+17]=Bool(rc=0 And p\positionScaled<>0 And p\positionInputVariableId=10 And p\positionScaleVariableId=12 And p\positionScaleLoadId=44)
+
+  vgMatrixPosition(@m) : vgTarget(@t,51,22,0,4,4)
+  vgFill(@t) : rc=AnvilVkIrV3d42LowerVertexPair(@m,@t,@r) : vgRecord(51,rc,@r,@t)
+  rc=AnvilVkIrV3d42PlanVertex(@m,@p)
+  vgReport[51*#VG_STRIDE+17]=Bool(rc=0 And p\positionGeneral<>0 And p\positionXValueId=53 And p\positionYValueId=56)
 
   vgReport[4000]=#VG_MAGIC
   ProcedureReturn @vgReport[0]

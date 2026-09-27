@@ -75,7 +75,7 @@ OP = {
     "Decorate": 71, "MemberDecorate": 72,
     "VectorShuffle": 79, "CompositeConstruct": 80, "CompositeExtract": 81,
     "SampledImage": 86, "ImageSampleImplicitLod": 87,
-    "FMul": 133, "MatrixTimesVector": 145,
+    "FAdd": 129, "FMul": 133, "MatrixTimesVector": 145,
     "SelectionMerge": 247, "Label": 248, "Branch": 249,
     "BranchConditional": 250, "Return": 253, "FunctionEnd_": 56,
 }
@@ -285,6 +285,60 @@ def vertex_scaled() -> bytes:
         ins(OP["FunctionEnd"]),
     ]
     return module(29, b)
+
+
+def vertex_matrix2() -> bytes:
+    """Position XY is a two-row dot product executed by the vertex QPU."""
+    b = [
+        ins(OP["Capability"], CAP_SHADER),
+        ins(OP["MemoryModel"], ADDR_LOGICAL, MEM_GLSL450),
+        ins(OP["EntryPoint"], EM_VERTEX, 16, *lit("main"), 13, 14, 23, 29),
+        ins(OP["MemberDecorate"], 8, 0, DEC_BUILTIN, BUILTIN_POSITION),
+        ins(OP["Decorate"], 8, DEC_BLOCK),
+        ins(OP["Decorate"], 13, DEC_LOCATION, 0),
+        ins(OP["Decorate"], 23, DEC_LOCATION, 1),
+        ins(OP["Decorate"], 29, DEC_LOCATION, 2),
+        ins(OP["TypeVoid"], 1),
+        ins(OP["TypeFunction"], 2, 1),
+        ins(OP["TypeFloat"], 3, 32),
+        ins(OP["TypeVector"], 4, 3, 2),
+        ins(OP["TypeVector"], 5, 3, 4),
+        ins(OP["TypePointer"], 6, SC_INPUT, 4),
+        ins(OP["TypeStruct"], 8, 5),
+        ins(OP["TypePointer"], 9, SC_OUTPUT, 8),
+        ins(OP["TypePointer"], 7, SC_OUTPUT, 5),
+        ins(OP["TypeInt"], 10, 32, 1),
+        ins(OP["Constant"], 10, 11, 0),
+        ins(OP["Constant"], 3, 12, F0),
+        ins(OP["Constant"], 3, 15, F1),
+        ins(OP["Variable"], 6, 13, SC_INPUT),
+        ins(OP["Variable"], 9, 14, SC_OUTPUT),
+        ins(OP["Variable"], 6, 23, SC_INPUT),
+        ins(OP["Variable"], 6, 29, SC_INPUT),
+        ins(OP["Function"], 1, 16, 0, 2),
+        ins(OP["Label"], 17),
+        ins(OP["Load"], 4, 18, 13),
+        ins(OP["CompositeExtract"], 3, 19, 18, 0),
+        ins(OP["CompositeExtract"], 3, 20, 18, 1),
+        ins(OP["Load"], 4, 24, 23),
+        ins(OP["CompositeExtract"], 3, 25, 24, 0),
+        ins(OP["CompositeExtract"], 3, 26, 24, 1),
+        ins(OP["Load"], 4, 30, 29),
+        ins(OP["CompositeExtract"], 3, 31, 30, 0),
+        ins(OP["CompositeExtract"], 3, 32, 30, 1),
+        ins(OP["FMul"], 3, 33, 19, 25),
+        ins(OP["FMul"], 3, 34, 20, 26),
+        ins(OP["FAdd"], 3, 35, 33, 34),
+        ins(OP["FMul"], 3, 36, 19, 31),
+        ins(OP["FMul"], 3, 37, 20, 32),
+        ins(OP["FAdd"], 3, 38, 36, 37),
+        ins(OP["CompositeConstruct"], 5, 21, 35, 38, 12, 15),
+        ins(OP["AccessChain"], 7, 22, 14, 11),
+        ins(OP["Store"], 22, 21),
+        ins(OP["Return"]),
+        ins(OP["FunctionEnd"]),
+    ]
+    return module(39, b)
 
 
 def fragment_varying() -> bytes:

@@ -516,6 +516,7 @@ def interface_cases() -> list[dict]:
 def fixtures() -> list[dict]:
     accepted = [
         ("vertex position scaled by a second vec2 input", oracle.vertex_scaled()),
+        ("vertex position transformed by two matrix rows", oracle.vertex_matrix2()),
         ("legacy varying", oracle.fragment_varying()),
         ("legacy push constant", oracle.fragment_push()),
         ("legacy constant", oracle.fragment_constant()),
@@ -859,7 +860,7 @@ def grade(cpu, result: int, cases: list[dict]) -> Grade:
                 break
         interfaces = interface_words[name_at:]
         g.need(f"{name}: IR module header", module[:9],
-               [original_words[1], bound, 2, function["sourceId"], OP["Function"], function["id0"],
+               [original_words[1], bound, 1 if interface_words[1] == 0 else 2, function["sourceId"], OP["Function"], function["id0"],
                 function["resultType"], block["sourceId"], len(types)])
         g.need(f"{name}: IR section counts", [module[10], module[12], module[16], module[18], module[20]],
                [len(constants), len(variables), len(decorations), 1, len(nodes)])
