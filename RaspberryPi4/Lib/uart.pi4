@@ -583,6 +583,157 @@ CompilerEndIf
 ; ----------------------------------------------------------------------
 #UART_SPIN_MAX = 1000000
 
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  BCM2712 UART10 - THE 3-PIN DEBUG CONNECTOR, A SECOND PORT
+; ======================================================================
+;  The header (pins 8/10, RP1 UART0 above) stays THE console. UART10 is an
+;  ADDITIONAL port a board may select: a tee of everything the console
+;  writes (Uart10Tee), and its own write/read procedures. Nothing here
+;  ever replaces or delays the header port - a tee byte UART10 cannot
+;  take is dropped and counted (Uart10Dropped), and the header write
+;  happens exactly as it would with no tee.
+;
+;  WHERE (pinned firmware DTBs, all three): /soc@107c000000/serial@7d001000,
+;  "arm,pl011-axi", "arm,pl011", status okay, alias serial10, and the
+;  chosen stdout-path "serial10:115200n8"; /soc ranges put it at
+;  $10_7D00_1000 (RaspberryPi5/Boot/dtb_contract.py early_uart()). The
+;  same PL011 register file as the header port, so every offset and bit
+;  above applies.
+;
+;  THE CLOCK - TWO SOURCES DISAGREE, SO THE STUB'S SETTING IS ADOPTED.
+;  The DTB gives serial10 clocks = <&clk_uart>, /clocks/clk-uart
+;  fixed-clock 9,216,000 Hz (IBRD 5 at 115200). TF-A's rpi_hw.h:220, which
+;  RaspberryPi5/Board/armstub8-2712.asm follows, uses 44,236,800 Hz (IBRD
+;  24). Until silicon says which, Uart10Attach adopts the port exactly as
+;  the EL3 stub left it (CR.UARTEN set) and Uart10Init only reprograms a
+;  port that is off - at the DTB's number, the one Linux uses. Silicon
+;  owed: vault Raspberry Pi 5/HARDWARE-BRINGUP.md, "Pi 5 debug UART".
+; ======================================================================
+  #UART10_BASE         = $107D001000
+  #UART10_CLOCK_HZ_DTB = 9216000     ; /clocks/clk-uart in the pinned DTBs
+  #UART10_CLOCK_HZ_TFA = 44236800    ; TF-A rpi_hw.h:220 - the stub's choice
+  #UART10_TEE_SPINS    = 4096        ; a tee byte waits this long, then drops
+
+  Global uart10_up.i       ; 1 once attached or initialised
+  Global uart10_tee.i      ; 1: every console byte is copied here as well
+  Global uart10_dropped.i  ; tee or write bytes UART10 could not take
+
+  ; One byte to UART10, bounded; never blocks the caller for long.
+  Procedure.i uart10_Put(c.i)
+    Define n.i
+    If uart10_up = 0
+      ProcedureReturn 0
+    EndIf
+    n = 0
+    While (PeekN(#UART10_BASE + #UART_FR_OFF) & #FR_TXFF) <> 0
+      n = n + 1
+      If n >= #UART10_TEE_SPINS
+        uart10_dropped = uart10_dropped + 1
+        ProcedureReturn 0
+      EndIf
+    Wend
+    PokeL(#UART10_BASE + #UART_DR_OFF, c & $FF)
+    ProcedureReturn 1
+  EndProcedure
+
+  ; Adopt UART10 as the EL3 stub (or the firmware) left it: 1 if it is
+  ; enabled with the transmitter on, 0 and nothing written if it is not.
+  Procedure.i Uart10Attach()
+    Define cr.i
+    cr = PeekN(#UART10_BASE + #UART_CR_OFF)
+    If (cr & #CR_UARTEN) = 0 Or (cr & #CR_TXE) = 0
+      uart10_up = 0
+      ProcedureReturn 0
+    EndIf
+    uart10_up = 1
+    ProcedureReturn 1
+  EndProcedure
+
+  ; Cold bring-up at an explicit clock, in the same order as UartInitClk
+  ; (disable, BUSY bounded, flush, mask/clear, divisor, LCRH, enable).
+  Procedure.i Uart10InitClk(baud.i, clkhz.i)
+    Define t.i
+    Define n.i
+    If baud <= 0 Or clkhz <= 0
+      ProcedureReturn 0
+    EndIf
+    t = (((clkhz * 8) / baud) + 1) / 2
+    If t < 64 Or (t >> 6) > 65535
+      ProcedureReturn 0
+    EndIf
+    PokeL(#UART10_BASE + #UART_CR_OFF, 0)
+    n = 0
+    While (PeekN(#UART10_BASE + #UART_FR_OFF) & #FR_BUSY) <> 0 And n < #UART_SPIN_MAX
+      n = n + 1
+    Wend
+    PokeL(#UART10_BASE + #UART_LCRH_OFF, 0)
+    PokeL(#UART10_BASE + #UART_IMSC_OFF, 0)
+    PokeL(#UART10_BASE + #UART_ICR_OFF, #ICR_ALL)
+    PokeL(#UART10_BASE + #UART_IBRD_OFF, t >> 6)
+    PokeL(#UART10_BASE + #UART_FBRD_OFF, t & 63)
+    PokeL(#UART10_BASE + #UART_LCRH_OFF, #LCRH_WLEN8 | #LCRH_FEN)
+    PokeL(#UART10_BASE + #UART_CR_OFF, #CR_UARTEN | #CR_TXE | #CR_RXE)
+    uart10_up = 1
+    ProcedureReturn 1
+  EndProcedure
+
+  ; Adopt if already running, otherwise bring it up at the DTB's clock.
+  Procedure.i Uart10Init(baud.i)
+    If Uart10Attach() = 1
+      ProcedureReturn 1
+    EndIf
+    ProcedureReturn Uart10InitClk(baud, #UART10_CLOCK_HZ_DTB)
+  EndProcedure
+
+  ; Select or deselect the tee. Selecting needs the port up first.
+  Procedure.i Uart10Tee(on.i)
+    If on <> 0 And uart10_up = 0
+      uart10_tee = 0
+      ProcedureReturn 0
+    EndIf
+    uart10_tee = Bool(on <> 0)
+    ProcedureReturn 1
+  EndProcedure
+
+  Procedure.i Uart10Write(c.i)
+    ProcedureReturn uart10_Put(c)
+  EndProcedure
+
+  Procedure Uart10WriteStr(*s)
+    Define c.i
+    Define i.i
+    i = 0
+    Repeat
+      c = PeekA(*s + i)
+      If c = 0
+        Break
+      EndIf
+      uart10_Put(c)
+      i = i + 1
+    ForEver
+  EndProcedure
+
+  Procedure.i Uart10ReadReady()
+    If uart10_up = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn Bool((PeekN(#UART10_BASE + #UART_FR_OFF) & #FR_RXFE) = 0)
+  EndProcedure
+
+  ; A byte from UART10, or -1 when none is waiting.
+  Procedure.i Uart10Read()
+    If Uart10ReadReady() = 0
+      ProcedureReturn -1
+    EndIf
+    ProcedureReturn PeekN(#UART10_BASE + #UART_DR_OFF) & $FF
+  EndProcedure
+
+  Procedure.i Uart10Up()      : ProcedureReturn uart10_up : EndProcedure
+  Procedure.i Uart10TeeOn()   : ProcedureReturn uart10_tee : EndProcedure
+  Procedure.i Uart10Dropped() : ProcedureReturn uart10_dropped : EndProcedure
+CompilerEndIf
+
 Global uart_ready.i            ; 0 = never brought up or adopted
 Global uart_dropped.i          ; characters given up on - see UartDropped()
 
@@ -1063,6 +1214,14 @@ Procedure UartWrite(c.i)
       ProcedureReturn 1
     EndIf
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; The debug-connector tee (Uart10Tee). A log port, so it sees every
+  ; console byte whether or not the header's FIFO takes it; it never
+  ; replaces or delays the header write below.
+  If uart10_tee <> 0
+    uart10_Put(c)
+  EndIf
+  CompilerEndIf
   n = 0
   Repeat
     f = PeekN(#UART_BASE + #UART_FR_OFF)

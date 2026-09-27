@@ -1,0 +1,48 @@
+; uart10_probe.pi5 - RaspberryPi4/Lib/uart.pi4 built -t pi5: the header
+; console (RP1 UART0) with the debug connector (BCM2712 UART10) as a
+; second, selectable port. DESK FIXTURE: tools/a64/a64_uart10_pi5_check.py
+; models both PL011s, writes #CTL and reads #OUT. Silicon owed.
+;
+;   #CTL +0  1 adopt UART10 as the stub left it, tee on, then off, then a
+;            UART10-only write and a UART10 read
+;            2 UART10 found off: Uart10Init(115200), then a UART10 write
+;            3 adopt, tee on, UART10's FIFO never drains
+;            4 UART10 off and not initialised: selecting the tee refuses
+;        +$800 "tee+hdr ", +$840 "hdr-only ", +$880 "dbg-only" (NUL-terminated)
+;
+;   #OUT +0 Uart10Attach  +4 Uart10Tee(1)  +8 Uart10Read  +12 Uart10Dropped
+;       +16 Uart10Init    +20 Uart10Up     +24 $600DF00D
+;
+;   pmfc uart10_probe.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o uart10.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+
+#CTL = $00E00000
+#OUT = $00E00100
+
+Define sc.i
+
+sc = PeekN(#CTL)
+If sc = 1 Or sc = 3
+  PokeL(#OUT + 0, Uart10Attach())
+  PokeL(#OUT + 4, Uart10Tee(1))
+  UartWriteStr(#CTL + $800)
+  If sc = 1
+    Uart10Tee(0)
+    UartWriteStr(#CTL + $840)
+    Uart10WriteStr(#CTL + $880)
+    PokeL(#OUT + 8, Uart10Read())
+  EndIf
+EndIf
+If sc = 2
+  PokeL(#OUT + 16, Uart10Init(115200))
+  Uart10WriteStr(#CTL + $880)
+EndIf
+If sc = 4
+  PokeL(#OUT + 4, Uart10Tee(1))
+  UartWriteStr(#CTL + $840)
+EndIf
+PokeL(#OUT + 12, Uart10Dropped())
+PokeL(#OUT + 20, Uart10Up())
+PokeL(#OUT + 24, $600DF00D)
