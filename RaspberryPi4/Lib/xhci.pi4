@@ -2949,22 +2949,19 @@ EndProcedure
 ;  command ring)". A No-Op TRB with no IOC bit is consumed and produces
 ;  no event, so nothing downstream has to know they happened.
 ;
-;  THE REJECTED ALTERNATIVE was to delete the call and let a transfer
-;  descriptor STRADDLE the Link TRB. It is legal - U-Boot does it, and
-;  xhci-ring.c's inc_enq() hands the Link TRB over mid-descriptor
-;  whenever more_trbs_coming is set, which for a control transfer it is.
-;  It was rejected because the deferred-cycle trick in XhciControlIn
-;  interacts with it: the Setup TRB is written with the wrong cycle and
-;  corrected at the end, and reasoning about that across a segment
-;  boundary and a producer-cycle toggle is exactly the kind of thing
-;  that is right until it is not. Padding costs at most 62 TRB writes
-;  per lap of the ring, once every twenty-odd transfers, against a
-;  device that answers in milliseconds.
-;
-;  The straddle is not merely asserted to be worse - it is a MUTATION in
-;  a64_hid_check.py ("straddle-the-link"), so whether it also works is
-;  measured rather than argued, this time on a workload that actually
-;  reaches the branch.
+;  THE ALTERNATIVE - delete the call and let a transfer descriptor
+;  STRADDLE the Link TRB - is legal xHCI (U-Boot does it: xhci-ring.c's
+;  inc_enq() hands the Link TRB over mid-descriptor whenever
+;  more_trbs_coming is set), BUT NOT IN THIS FILE. CORRECTED 2026-09-27:
+;  this paragraph used to call padding a preference. It is REQUIRED.
+;  xh_WaitEventFor matches a transfer event against the TD's TRB address
+;  range, first..last, and a TD that wraps has its last TRB below its
+;  first, so its completion never matches and the transfer times out.
+;  a64_hid_check.py's "straddle-the-link" mutation proves it (a BREAKAGE
+;  there; it sat wrongly in HARMLESS until 2026-09-27), and the same
+;  straddle with a wrap-aware range test was measured to pass - so the
+;  range match, not the deferred-cycle trick, is what forbids it. Padding
+;  costs at most 62 TRB writes per lap of the ring.
 ;
 ;  Padding is only safe because every transfer in this file is
 ;  synchronous: the ring is idle when this is called, so the No-Ops are
