@@ -1,0 +1,92 @@
+; Returning Pi 4 diagnostic for the production Vulkan physical-device query.
+; Select `screen dma` before running: this payload owns the V3D page table.
+; The 64-byte report at $06800000 is read back after the payload returns.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
+
+#VPP_REPORT = $06800000
+#VPP_SURFACE = $06000000
+#VPP_SURFACE_BYTES = 4096000
+#VPP_ARENA = $0A000000
+#VPP_ARENA_BYTES = $01000000
+
+Procedure.i Main()
+  Define inst.i
+  Define phys.i
+  Define count.l
+  Define rc.i
+  Define status.i
+  Define i.i
+  Define info.VkInstanceCreateInfo
+  Define props.VkPhysicalDeviceProperties
+
+  i = 0
+  While i < 64
+    PokeL(#VPP_REPORT + i, 0)
+    i = i + 4
+  Wend
+  PokeL(#VPP_REPORT + 0, $56505031)
+  PokeL(#VPP_REPORT + 4, 1)
+  If NeonArena(#VPP_ARENA, #VPP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn 1 : EndIf
+  If NeonSurface(#VPP_SURFACE, 800, 1280, 3200) <> #NEON_OK : ProcedureReturn 1 : EndIf
+  NeonSurfaceMapSpan(#VPP_SURFACE_BYTES * 2)
+  If NeonInit() <> #NEON_OK : ProcedureReturn 1 : EndIf
+  rc = AnvilVkV3dWindow(#VPP_SURFACE + #VPP_SURFACE_BYTES, #VPP_SURFACE_BYTES)
+  If rc <> #VK_SUCCESS
+    PokeL(#VPP_REPORT + 4, 2)
+    NeonShutdown()
+    ProcedureReturn 2
+  EndIf
+  info\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@info, 0, @inst)
+  If rc <> #VK_SUCCESS
+    PokeL(#VPP_REPORT + 4, 3)
+    NeonShutdown()
+    ProcedureReturn 3
+  EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1
+    PokeL(#VPP_REPORT + 4, 4)
+    vkDestroyInstance(inst, 0)
+    NeonShutdown()
+    ProcedureReturn 4
+  EndIf
+
+  vkGetPhysicalDeviceProperties(phys, @props)
+  PokeL(#VPP_REPORT + 8, props\apiVersion)
+  PokeL(#VPP_REPORT + 12, props\deviceType)
+  PokeL(#VPP_REPORT + 16, props\limits\maxImageDimension2D)
+  PokeL(#VPP_REPORT + 20, props\limits\maxFramebufferWidth)
+  PokeL(#VPP_REPORT + 24, props\limits\maxUniformBufferRange)
+  PokeL(#VPP_REPORT + 28, props\limits\maxBoundDescriptorSets)
+  PokeL(#VPP_REPORT + 32, props\limits\optimalBufferCopyOffsetAlignment)
+  PokeL(#VPP_REPORT + 36, props\limits\maxComputeWorkGroupInvocations)
+  PokeL(#VPP_REPORT + 40, PeekA(@props + OffsetOf(VkPhysicalDeviceProperties\deviceName)))
+  status = 0
+  If props\apiVersion <> #VK_API_VERSION_1_0 : status = 5 : EndIf
+  If props\deviceType <> #VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU : status = 6 : EndIf
+  If props\limits\maxImageDimension2D < 800 : status = 7 : EndIf
+  If props\limits\maxFramebufferWidth <> props\limits\maxImageDimension2D : status = 8 : EndIf
+  If props\limits\maxUniformBufferRange <> #ANVIL_VK_UNIFORM_BYTES : status = 9 : EndIf
+  If props\limits\maxBoundDescriptorSets <> 1 : status = 10 : EndIf
+  If props\limits\optimalBufferCopyOffsetAlignment <> avkBackendImageCopySourceAlignment() : status = 11 : EndIf
+  If props\limits\maxComputeWorkGroupInvocations <> 0 : status = 12 : EndIf
+  If vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceProperties") <> @vkGetPhysicalDeviceProperties : status = 13 : EndIf
+  PokeL(#VPP_REPORT + 4, status)
+  vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  ProcedureReturn status
+EndProcedure
