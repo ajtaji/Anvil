@@ -834,6 +834,73 @@ EndProcedure
 ;  Returns 1 on a complete capture, 0 having written nothing but the
 ;  cleared magic.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  ScrCaptureWiden16(who, x0, tier) - ScrCaptureToArea for an RGB565 HDMI
+;  surface (BCM2712). Each 5- and 6-bit field is widened to 8 bits by bit
+;  replication - the widening HwConRect's blend read-back uses - so $1F
+;  is $FF and 0 is 0, and the kept copy is 4 bytes a pixel at a pitch of
+;  width * 4. The magic is already clear (the caller cleared it) and is
+;  written LAST, as ScrCaptureToArea does. The header lines are that
+;  procedure's, restated: its own copy stays byte-identical for -t pi4.
+; ----------------------------------------------------------------------
+Procedure.i ScrCaptureWiden16(who.i, x0.i, tier.i)
+  Define fb.i
+  Define pw.i
+  Define ph.i
+  Define pitch.i
+  Define n.i
+  Define dst.i
+  Define sx.i
+  Define sy.i
+  Define v.i
+  Define r5.i
+  Define g6.i
+  Define b5.i
+  fb = DisplayViewBase()
+  pw = DisplayWidth()
+  ph = DisplayHeight()
+  pitch = DisplayPitch()
+  If fb = 0 Or pw < 1 Or ph < 1 Or pitch < pw * 2
+    ProcedureReturn 0
+  EndIf
+  n = pw * 4 * ph
+  If n > #MON_SHOT_PIX_BYTES
+    ProcedureReturn 0
+  EndIf
+  dst = #MON_SHOT_PIX
+  sy = 0
+  While sy < ph
+    sx = 0
+    While sx < pw
+      v = PeekW(fb + sy * pitch + sx * 2) & $FFFF
+      r5 = (v >> 11) & $1F
+      g6 = (v >> 5) & $3F
+      b5 = v & $1F
+      PokeL(dst, (($FF << 24) | (((r5 << 3) | (r5 >> 2)) << 16)) | ((((g6 << 2) | (g6 >> 4)) << 8) | ((b5 << 3) | (b5 >> 2))))
+      dst = dst + 4
+      sx = sx + 1
+    Wend
+    sy = sy + 1
+  Wend
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SEQ,    ShotNextSeq())
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_W,      pw)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_H,      ph)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PITCH,  pw * 4)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_ROT,    0)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_TIER,   tier)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_X0,     x0)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELW, pw)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_PANELH, ph)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BPP,    4)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_SRC,    gScrSrc)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_WHO,    who)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_BYTES,  n)
+  PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, #MON_SHOT_MAGIC)
+  ProcedureReturn 1
+EndProcedure
+CompilerEndIf
+
 Procedure.i ScrCaptureToArea(who.i, x0.i, tier.i)
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   Define fb.i
@@ -861,6 +928,20 @@ Procedure.i ScrCaptureToArea(who.i, x0.i, tier.i)
   ; including the ones that refuse - leaves an area that reads as empty
   ; rather than as the previous run's.
   PokeI(#MON_SHOT_HDR + #MON_SHOT_OFF_MAGIC, 0)
+
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: THE FIRMWARE'S SURFACE IS RGB565 (1920 x 1080, pitch 3840 -
+  ; Lib/display.pi4 takes the pixel size from the pitch). Chosen from
+  ; DisplayBytesPerPixel(): ScrCaptureWiden16 keeps the picture WIDENED to
+  ; the $FFRRGGBB words a 32 bpp surface holds and describes it as 4 bytes
+  ; a pixel, so every reader of the area (ShotDump, ScrCapturePixel,
+  ; tools/pmfshot.py) is unchanged and exact. ScrCaptureSnapshot still
+  ; refuses 2 for its OTHER callers - the live `pic` stream reads 4-byte
+  ; pixels and the V3D overlays write them into what it describes.
+  If gScrSrc = #SCR_SRC_HDMI And DisplayBytesPerPixel() = 2
+    ProcedureReturn ScrCaptureWiden16(who, x0, tier)
+  EndIf
+  CompilerEndIf
 
   If ScrCaptureSnapshot(@fb, @w, @h, @pitch, @rot, @panelW, @panelH, @bpp) = 0
     ProcedureReturn 0
