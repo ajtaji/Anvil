@@ -192,10 +192,8 @@ Procedure.i avkV3dTextureRangesOverlap(a.i, aBytes.i, b.i, bBytes.i)
   ProcedureReturn 0
 EndProcedure
 
-; Validate everything before changing the TFU descriptor, then issue the five
-; low-level operations in Mesa's job order. Any failure returns immediately;
-; no later operation can turn a refused or partially described job into work.
-Procedure.i AnvilVkV3dTextureConvert(*transfer.AvkV3dTextureTransfer, *plan.AvkV3dTexturePlan)
+; The queue can validate a whole ordered upload before the first TFU job.
+Procedure.i AnvilVkV3dTextureValidate(*transfer.AvkV3dTextureTransfer, *plan.AvkV3dTexturePlan)
   Protected rc.i
 
   If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
@@ -228,6 +226,15 @@ Procedure.i AnvilVkV3dTextureConvert(*transfer.AvkV3dTextureTransfer, *plan.AvkV
   If avkV3dTextureRangesOverlap(*transfer\sourceBase, *plan\sourceReadBytes, *transfer\destinationBase, *plan\destinationBytes) <> 0
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP
   EndIf
+
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
+; Issue the five low-level operations in Mesa's job order only after validation.
+Procedure.i AnvilVkV3dTextureConvert(*transfer.AvkV3dTextureTransfer, *plan.AvkV3dTexturePlan)
+  Protected rc.i
+  rc = AnvilVkV3dTextureValidate(*transfer, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
 
   rc = V3dTfuBegin(*plan\width, *plan\height, *plan\rawTextureType)
   If rc <> 0 : ProcedureReturn rc : EndIf

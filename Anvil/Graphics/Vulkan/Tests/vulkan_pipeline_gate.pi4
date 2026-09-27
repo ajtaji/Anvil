@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[811]
+Global Dim pgReport.i[815]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 810
+  If slot < 0 Or slot > 814
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (811 * 8), slot)
+  PokeI(#PG_OUT + (815 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -2153,6 +2153,30 @@ Procedure.i Main()
   sampled\paddedHeight = 16
   AnvilVkV3dFragmentUniforms(texSlot, #PG_OPTIMAL_STATE, 0, 0, @sampled)
   pgPut(270, #PG_OPTIMAL_STATE)
+
+  ; Two complete optimal uploads in one submission execute in record order.
+  ; The public fence and final layout settle only after both TFU jobs finish.
+  count = AnvilVkTestBackendCopies()
+  bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\image = copyImg
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(811, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(812, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(813, AnvilVkTestBackendCopies() - count)
+  pgPut(814, AnvilVkImageLayout(copyImg))
 
   ; A backend failure is transactional. Even though the recording contains
   ; a final shader-read barrier, an image whose TFU copy failed must retain

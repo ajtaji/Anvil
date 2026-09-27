@@ -1945,8 +1945,23 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found that a vkCmdCopyBufferToImage source buffer is no longer live, bound, owned, aligned or large enough (Anvil code -20004, stale source resource); re-record against a valid transfer-source buffer.")
         EndIf
         If avkImgTiling[target] = #VK_IMAGE_TILING_OPTIMAL
-          If copies <> 1 Or avkImgBackendLayout[target] = 0
+          If avkImgBackendLayout[target] = 0
             ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an incomplete optimal-image TFU transaction (Anvil code -20004); nothing was submitted.")
+          EndIf
+          If copies > 1 And avkBackendImageCopyBatchReady() = 0
+            ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order multiple optimal-image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
+          EndIf
+          copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
+          copy\sourceBase = sourceBase : copy\sourceBytes = avkOpSourceBytes[o]
+          copy\sourcePitch = avkOpBufferPitch[o]
+          copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target]
+          copy\destinationBytes = avkImgSize[target]
+          copy\width = avkImgW[target] : copy\height = avkImgH[target]
+          copy\destinationLayout = avkImgBackendLayout[target]
+          copy\paddedWidth = avkImgPaddedW[target] : copy\paddedHeight = avkImgPaddedH[target]
+          copy\timeoutUs = 250000
+          If avkBackendImageCopyValidate(@copy) <> 0
+            ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid optimal-image TFU source, destination or layout (Anvil code -20004); nothing was submitted.")
           EndIf
         ElseIf avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
           copyBytes = avkOpSourcePitch[o]
@@ -2209,11 +2224,11 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn #VK_SUCCESS
   EndIf
   If copies > 0
-    If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
-      o = avkCbOpHead[c]
-      While o <> 0
-        If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
-          target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+        target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
           copyBytes = avkOpSourcePitch[o]
           sourcePitch = avkOpBufferPitch[o]
           copyRows = avkOpRows[o]
@@ -2236,32 +2251,31 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading linear Vulkan image rows (VkResult -4); the command buffer was invalidated and its fence signalled.")
             EndIf
           EndIf
+        Else
+          If avkCopyBufferResolve(avkOpBuffer[o], d, avkOpBufferOffset[o], avkOpSourceBytes[o], @sourceBase) = 0
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the optimal-image source changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+          copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
+          copy\sourceBase = sourceBase : copy\sourceBytes = avkOpSourceBytes[o]
+          copy\sourcePitch = avkOpBufferPitch[o]
+          copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target]
+          copy\destinationBytes = avkImgSize[target]
+          copy\width = avkImgW[target] : copy\height = avkImgH[target]
+          copy\destinationLayout = avkImgBackendLayout[target]
+          copy\paddedWidth = avkImgPaddedW[target] : copy\paddedHeight = avkImgPaddedH[target]
+          copy\timeoutUs = 250000
+          job = avkBackendSubmitImageCopy(@copy)
+          If job < 0 Or (copies > 1 And job <> #ANVIL_VK_JOB_DONE)
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing ordered vkCmdCopyBufferToImage transfers (VkResult -4); the destination layout was not advanced, the command buffer is invalid and its fence is signalled.")
+          EndIf
+          If job = #ANVIL_VK_JOB_PENDING : ProcedureReturn #VK_SUCCESS : EndIf
         EndIf
-        o = avkOpNext[o]
-      Wend
-      avkFlightComplete(1)
-      ProcedureReturn #VK_SUCCESS
-    EndIf
-    copy\windowBase = avkHeapBase
-    copy\windowBytes = avkHeapBytes
-    copy\sourceBase = sourceBase
-    copy\sourceBytes = avkOpSourceBytes[copyOp]
-    copy\sourcePitch = avkOpBufferPitch[copyOp]
-    copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target]
-    copy\destinationBytes = avkImgSize[target]
-    copy\width = avkImgW[target]
-    copy\height = avkImgH[target]
-    copy\destinationLayout = avkImgBackendLayout[target]
-    copy\paddedWidth = avkImgPaddedW[target]
-    copy\paddedHeight = avkImgPaddedH[target]
-    copy\timeoutUs = 250000
-    job = avkBackendSubmitImageCopy(@copy)
-    If job < 0
-      avkFlightComplete(0)
-      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing vkCmdCopyBufferToImage (VkResult -4, VK_ERROR_DEVICE_LOST); the destination layout was not advanced, the command buffer is invalid and its fence is signalled. Inspect the backend's TFU and MMU fault evidence before retrying.")
-      ProcedureReturn #VK_ERROR_DEVICE_LOST
-    EndIf
-    If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
+    avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf
 

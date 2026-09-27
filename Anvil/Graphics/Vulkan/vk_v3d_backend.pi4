@@ -245,16 +245,39 @@ Procedure.i avkBackendImagePlan(width.i, height.i, format.i, tiling.i, usage.i, 
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+Procedure.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
+  Define t.AvkV3dTextureTransfer
+  Define p.AvkV3dTexturePlan
+  Define rc.i
+  If *copy = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
+  t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes
+  t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
+  t\width = *copy\width : t\height = *copy\height
+  t\sourcePitch = *copy\sourcePitch : t\timeoutUs = *copy\timeoutUs
+  rc = AnvilVkV3dTextureValidate(@t, @p)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If p\textureMemoryFormat <> *copy\destinationLayout Or p\paddedWidth <> *copy\paddedWidth Or p\paddedHeight <> *copy\paddedHeight
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
+Procedure.i avkBackendImageCopyBatchReady()
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   Define t.AvkV3dTextureTransfer
   Define p.AvkV3dTexturePlan
   Define rc.i
   avkV3dNative = 0
   If *copy = 0 : avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn -1 : EndIf
-  If *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
-    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
-    ProcedureReturn -1
-  EndIf
+  rc = avkBackendImageCopyValidate(*copy)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
   t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
   t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes
   t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
@@ -263,10 +286,6 @@ Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   rc = AnvilVkV3dTextureConvert(@t, @p)
   If rc <> #ANVIL_V3D_TEXTURE_OK
     avkV3dNative = rc
-    ProcedureReturn -1
-  EndIf
-  If p\textureMemoryFormat <> *copy\destinationLayout Or p\paddedWidth <> *copy\paddedWidth Or p\paddedHeight <> *copy\paddedHeight
-    avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_ARGS
     ProcedureReturn -1
   EndIf
   avkV3dJobs = avkV3dJobs + 1

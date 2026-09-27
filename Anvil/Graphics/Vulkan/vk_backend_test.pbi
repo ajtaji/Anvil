@@ -275,6 +275,19 @@ Global avkTbLastCopyDestination.i = 0
 Global avkTbLastCopyBytes.i = 0
 Global avkTbLastCopySourcePitch.i = 0
 
+Procedure.i avkBackendImageCopyValidate(*copy.AnvilVkBackendImageCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\windowBase <= 0 Or *copy\windowBytes < 1 Or *copy\sourceBytes < 1 Or *copy\destinationBytes < 1 Or *copy\width < 1 Or *copy\height < 1 Or *copy\sourcePitch < *copy\width * 4 Or *copy\destinationLayout = 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendImageCopyBatchReady()
+  If avkTbHold <> 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   If *copy = 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
