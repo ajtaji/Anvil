@@ -1455,6 +1455,22 @@ Procedure vkDestroyRenderPass(device.i, renderPass.i, *pAllocator)
   AnvilVkRenderPassDestroy(device, renderPass)
 EndProcedure
 
+; A whole-attachment clear before any draw lowers to the Pi 4 tile clear.
+; Other rectangles and later clears need a separate in-pass draw operation.
+Procedure vkCmdClearAttachments(commandBuffer.i, attachmentCount.i, *pAttachments.VkClearAttachment, rectCount.i, *pRects.VkClearRect)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdClearAttachments was given a stale VkCommandBuffer (Anvil code -20002, invalid handle); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If attachmentCount <> 1 Or *pAttachments = 0 Or rectCount <> 1 Or *pRects = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires exactly one colour attachment and one whole-framebuffer rectangle (Anvil code -20005, unsupported array); no partial clear was recorded.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdClearAttachments(commandBuffer, *pAttachments, *pRects)
+EndProcedure
+
 ; The granularity is a performance hint for the render-pass configuration.
 ; The accepted configuration is one 32-bpp colour target without MSAA.
 Procedure vkGetRenderAreaGranularity(device.i, renderPass.i, *pGranularity.VkExtent2D)

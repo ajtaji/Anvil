@@ -81,6 +81,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCmdBindPipeline") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdBindPipeline, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdBindVertexBuffers") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdBindVertexBuffers, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdClearColorImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdClearColorImage, domain) : EndIf
+  If avkDispatchName(*pName, "vkCmdClearAttachments") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdClearAttachments, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdCopyBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdCopyBuffer, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdCopyBufferToImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdCopyBufferToImage, domain) : EndIf
   If avkDispatchName(*pName, "vkCmdDraw") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCmdDraw, domain) : EndIf
