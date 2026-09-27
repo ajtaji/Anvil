@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 802
+REPORT_WORDS = 807
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1647,6 +1647,11 @@ def grade(cpu, rc) -> Grader:
     g.need("two ordered image-to-buffer calls complete", slot(799), 0)
     g.need("two ordered image-to-buffer calls preserve all destination bytes", slot(800), 0)
     g.need("ordered image-to-buffer calls leave no flight", slot(801), 0)
+    g.need("two ordered buffer-to-image calls record", slot(802), 0)
+    g.need("two ordered buffer-to-image calls submit", slot(803), 0)
+    g.need("two ordered buffer-to-image calls complete", slot(804), 0)
+    g.need("two ordered buffer-to-image calls preserve all destination bytes", slot(805), 0)
+    g.need("ordered buffer-to-image calls leave no flight", slot(806), 0)
     g.need("whole image-to-buffer readback records", slot(717), 0)
     g.need("whole image-to-buffer readback submits", slot(718), 0)
     g.need("whole image-to-buffer readback completes", slot(719), 0)
