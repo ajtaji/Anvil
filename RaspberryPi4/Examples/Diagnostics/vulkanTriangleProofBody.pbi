@@ -541,6 +541,69 @@ Procedure vtpListRect(base.i, first.i, x0.i, y0.i, x1.i, y1.i, r.i, g.i, b.i, a.
 EndProcedure
 CompilerEndIf
 
+CompilerIf #VTP_PYRAMID_DEMO
+Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, r.i, g.i, b.i)
+  Define p.i = base + index * #VTP_STRIDE
+  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@y))
+  PokeL(p + 8, r) : PokeL(p + 12, g)
+  PokeL(p + 16, b) : PokeL(p + 20, #VTP_F_ONE)
+EndProcedure
+
+Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
+  Define Dim x.f[5]
+  Define Dim y.f[5]
+  Define Dim z.f[5]
+  Define Dim sx.f[5]
+  Define Dim sy.f[5]
+  Define Dim depth.f[5]
+  Define Dim faceDepth.f[4]
+  Define Dim order.i[4]
+  Define i.i, j.i, face.i, a.i, b.i, d.i, tmp.i
+  Define xx.f, zz.f, scale.f
+  Define red.i, green.i, blue.i
+  x[0] = 0.0 : y[0] = 1.25 : z[0] = 0.0
+  x[1] = -1.0 : y[1] = -0.80 : z[1] = -1.0
+  x[2] = 1.0 : y[2] = -0.80 : z[2] = -1.0
+  x[3] = 1.0 : y[3] = -0.80 : z[3] = 1.0
+  x[4] = -1.0 : y[4] = -0.80 : z[4] = 1.0
+  For i = 0 To 4
+    xx = x[i] * ca + z[i] * sa
+    zz = z[i] * ca - x[i] * sa
+    depth[i] = zz * 0.91 + y[i] * 0.42
+    scale = 1.65 / (3.6 - depth[i])
+    sx[i] = xx * scale * 0.82
+    sy[i] = (y[i] * 0.91 - zz * 0.42) * scale * 0.72
+  Next
+  For face = 0 To 3
+    order[face] = face
+    a = face + 1 : b = (face + 1) % 4 + 1
+    faceDepth[face] = (depth[0] + depth[a] + depth[b]) / 3.0
+  Next
+  ; No depth attachment yet: submit the convex faces back to front.
+  For i = 0 To 2
+    For j = i + 1 To 3
+      If faceDepth[order[j]] < faceDepth[order[i]]
+        tmp = order[i] : order[i] = order[j] : order[j] = tmp
+      EndIf
+    Next
+  Next
+  For i = 0 To 3
+    face = order[i]
+    a = face + 1 : b = (face + 1) % 4 + 1
+    Select face
+      Case 0 : red = $3F666666 : green = $3E99999A : blue = $3E4CCCCD
+      Case 1 : red = $3E4CCCCD : green = $3F333333 : blue = $3F666666
+      Case 2 : red = $3F666666 : green = $3ECCCCCD : blue = $3F333333
+      Default : red = $3F333333 : green = $3E99999A : blue = $3F666666
+    EndSelect
+    d = i * 3
+    vtpPyramidVertex(base, d + 0, sx[0], sy[0], red, green, blue)
+    vtpPyramidVertex(base, d + 1, sx[a], sy[a], red, green, blue)
+    vtpPyramidVertex(base, d + 2, sx[b], sy[b], red, green, blue)
+  Next
+EndProcedure
+CompilerEndIf
+
 ; Control-list words are byte-aligned, not naturally aligned. Read them the
 ; same byte-wise way the V3D packet encoder writes them.
 Procedure.i vtpLe32(addr.i)
@@ -637,6 +700,11 @@ Procedure.i Main()
   Define drawsBefore.i
   Define dmaScratch.i
   Define dmaBefore.i
+CompilerIf #VTP_PYRAMID_DEMO
+  Define frame.i
+  Define pyramidCos.f, pyramidSin.f, nextCos.f, nextSin.f
+  Define pyramidStart.i
+CompilerEndIf
 
   Define ici.VkInstanceCreateInfo
   Define fp.VkFormatProperties
@@ -1175,6 +1243,119 @@ CompilerEndIf
     ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
   EndIf
   vtpPut(#VTP_S_PIPE_B, AnvilVkPipelineCodeBase(pipeB))
+
+CompilerIf #VTP_PYRAMID_DEMO
+  ; A bounded animation in RAM. Each frame is one public Vulkan render pass;
+  ; only five 3D points and their face order are calculated on the CPU.
+  vtpStep(6)
+  PokeL(@vtpClear[0] + 0, $3D4CCCCD)
+  PokeL(@vtpClear[0] + 4, $3DCCCCCD)
+  PokeL(@vtpClear[0] + 8, $3E4CCCCD)
+  PokeL(@vtpClear[0] + 12, #VTP_F_ONE)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #VTP_VIEW_W
+  rpbi\renderArea\extent\height = #VTP_VIEW_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @vtpClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+  EndIf
+  bufHandle = buf : bufOffset = 0
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cbHandle
+  fenceArray = fence
+  If DisplayAdopt(#VTP_DSI_SCAN, #VTP_PANEL_PITCH, #VTP_PANEL_W, #VTP_PANEL_H, 32) <> #DSP_OK
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_PRESENT)
+  EndIf
+  dmaScratch = @vtpDmaScratch[0] + 255
+  dmaScratch = dmaScratch - (dmaScratch % 256)
+  If DmaSetScratch(dmaScratch, 512) = 0 Or DisplayDmaBind() = 0 Or DmaInit() = 0
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_PRESENT)
+  EndIf
+  DisplayDmaReadback(1) : DisplayUseDma(1)
+  pyramidStart = DisplayDmaOps()
+  pyramidCos = 1.0 : pyramidSin = 0.0
+  For frame = 0 To 11
+    mapped = 0
+    If vkMapMemory(dev, bmem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> vaddr
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
+    EndIf
+    vtpPyramidFrame(mapped, pyramidCos, pyramidSin)
+    vkUnmapMemory(dev, bmem)
+    nextCos = pyramidCos * 0.8660254 - pyramidSin * 0.5
+    nextSin = pyramidSin * 0.8660254 + pyramidCos * 0.5
+    pyramidCos = nextCos : pyramidSin = nextSin
+    If frame > 0
+      rc = vkResetCommandBuffer(cmd, 0)
+      If rc <> #VK_SUCCESS
+        vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 1)
+        NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_RECORD)
+      EndIf
+      rc = vkResetFences(dev, 1, @fenceArray)
+      If rc <> #VK_SUCCESS
+        vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 2)
+        NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+      EndIf
+    EndIf
+    rc = vkBeginCommandBuffer(cmd, @bi)
+    If rc <> #VK_SUCCESS
+      vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 3)
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_RECORD)
+    EndIf
+    vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+    vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
+    vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+    vkCmdDraw(cmd, 12, 1, 0, 0)
+    vkCmdEndRenderPass(cmd)
+    rc = vkEndCommandBuffer(cmd)
+    If rc <> #VK_SUCCESS
+      vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 4)
+      vtpPut(#VTP_S_CB_TEXT, AnvilVkCommandBufferFailureText(cmd))
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_RECORD)
+    EndIf
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    If rc <> #VK_SUCCESS
+      vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 5)
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_SUBMIT)
+    EndIf
+    rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+    If rc <> #VK_SUCCESS
+      vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, 6)
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+    EndIf
+    DisplayBlit(imgBase, imagePitch, 0, 0, #VTP_VIEW_W, #VTP_VIEW_H)
+    If V3dMmuFaultsNow() <> 0 Or V3dBinOomCount() <> 0
+      NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_V3D_FAULT)
+    EndIf
+    delay(120)
+  Next
+  vtpPut(#VTP_S_DRAWS, avkBackendDraws())
+  vtpPut(#VTP_S_PRESENT, DisplayDmaOps() - pyramidStart)
+  DisplayUseDma(0) : DisplayFlush()
+  delay(900)
+  vkDeviceWaitIdle(dev)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyPipeline(dev, pipeA, 0) : vkDestroyPipeline(dev, pipeB, 0)
+  vkDestroyPipelineCache(dev, pipelineCache, 0)
+  vkDestroyPipelineLayout(dev, layA, 0) : vkDestroyPipelineLayout(dev, layB, 0)
+  vkDestroyShaderModule(dev, vsA, 0) : vkDestroyShaderModule(dev, fsA, 0)
+  vkDestroyShaderModule(dev, vsB, 0) : vkDestroyShaderModule(dev, fsB, 0)
+  vkDestroyFramebuffer(dev, fb, 0) : vkDestroyRenderPass(dev, rp, 0)
+  vkDestroyImageView(dev, view, 0)
+  vkDestroyBuffer(dev, buf, 0) : vkFreeMemory(dev, bmem, 0)
+  vkDestroyImage(dev, img, 0) : vkFreeMemory(dev, mem, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0) : vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  If vtpGet(#VTP_S_DRAWS) <> 12 Or vtpGet(#VTP_S_PRESENT) <> 12
+    ProcedureReturn vtpStop(#VTP_ERR_NO_JOBS)
+  EndIf
+  ProcedureReturn 0
+CompilerEndIf
 
   ; ------------------------------------------------------------------
   ;  6. PASS ONE: the uniform-colour triangle.
