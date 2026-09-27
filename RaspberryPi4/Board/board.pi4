@@ -2585,6 +2585,12 @@ Procedure Main()
   I2cTraceEnable(1)
   ScreenUp()
   TouchBoot()
+  ; BCM2712: caches on, after ScreenUp so DisplayBase() is known when
+  ; CacheMapNc builds the Non-Cacheable map, and after Pi5DtbApply (top of
+  ; Main), whose MmuSetRamBytes sized RAM from the live /memory.
+  CompilerIf #PMF_CHIP = 2712
+    CacheEnable()
+  CompilerEndIf
   I2cTraceEnable(0)
   BootTimingMark(#BTM_TOUCH_END, 0, 0)
   ; Paint whatever the pre-screen lines left queued the instant the glass
