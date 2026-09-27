@@ -470,6 +470,12 @@ PMF_FLAG_WANTS_DTB = 2
 PMF_FLAG_WANTS_SERVICES = 4
 
 
+class BuildFailed(Exception):
+    """A program this gate needed did not build.  Nothing about it was
+    tested, so this is never a pass and never a catch: the plain run reports
+    that part as ERROR, and --mutate stops with RESULT: ERROR."""
+
+
 def compile_to(source: pathlib.Path, out: pathlib.Path, extra: list[str]) -> dict[str, int]:
     out.parent.mkdir(parents=True, exist_ok=True)
     cmd = [CTX["compiler"], "--compile", str(source), "-t", "pi4", "-s",
@@ -480,8 +486,8 @@ def compile_to(source: pathlib.Path, out: pathlib.Path, extra: list[str]) -> dic
                        env=dict(os.environ, PMF_ROOT=str(ROOT)),
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if r.returncode != 0 or "pmfc: OK" not in r.stdout or not out.exists():
-        raise SystemExit("The build of %s failed, so nothing about it was "
-                         "tested. The compiler said:\n%s" % (source.name, r.stdout[-4000:]))
+        raise BuildFailed("The build of %s failed, so nothing about it was "
+                          "tested. The compiler said:\n%s" % (source.name, r.stdout[-4000:]))
     syms: dict[str, int] = {}
     symfile = pathlib.Path(str(out) + ".sym")
     if symfile.exists():
@@ -1239,6 +1245,12 @@ def guard_source(settings_include: str) -> tuple[str, list[tuple[str, int]]]:
         'XIncludeFile "RaspberryPi4/Lib/fat.pi4"',
         'XIncludeFile "RaspberryPi4/Lib/uart.pi4"',
         'XIncludeFile "Anvil/Hal/hal.pbi"',
+        # hwfile.pbi stamps every change with the wall clock
+        # (hwfile_Stamp -> WallClockTrusted), and wallclock.pbi needs
+        # Ticks()/TickHz() before it - the order board.pi4 and
+        # pi4SettingsSelfTest.pi4 use.
+        'XIncludeFile "RaspberryPi4/Lib/timer.pi4"',
+        'XIncludeFile "Anvil/Core/wallclock.pbi"',
         'XIncludeFile "Anvil/Storage/hwfile.pbi"',
         'XIncludeFile "%s"' % settings_include,
         "",
@@ -1354,10 +1366,21 @@ def minor_bump_site(body: str) -> tuple[str, str] | None:
     return m.group(0), "%s%d" % (m.group(1), int(m.group(2)) + 1)
 
 
-class MutationSiteMissing(Exception):
-    """A mutant's search text is not in its file exactly once.  The mutant
-    cannot be applied, so the defect it stands for is not being tested.
-    That is an ERROR for the whole --mutate run, never a quiet skip."""
+class MutateError(Exception):
+    """A mutant that could not be judged.  The defect it stands for is not
+    being tested, so the whole --mutate run is an ERROR - never a quiet
+    skip and never a catch."""
+
+
+class MutationSiteMissing(MutateError):
+    """A mutant's search text is not in its file exactly once."""
+
+
+class MutantDidNotRun(MutateError):
+    """The part a mutant belongs to stopped before judging it - a build
+    that failed, or a check that refused its input.  A mutant that breaks
+    the build has proved that the compiler notices, not that this check
+    does."""
 
 
 MUTANTS = {
@@ -1510,9 +1533,10 @@ def mutate(only: str | None = None) -> tuple[int, int]:
         OVERRIDE[path] = original.replace(find, repl, 1)
         try:
             probs = parts[which]()
-        except (SystemExit, RuntimeError) as e:
-            print(f"  caught: the mutant did not run cleanly ({e})")
-            continue
+        except (BuildFailed, SystemExit, RuntimeError) as e:
+            raise MutantDidNotRun(
+                f"mutant {name}: part {which} stopped before judging it, so "
+                f"this defect is NOT being tested. It said: {e}") from e
         finally:
             OVERRIDE.clear()
         if not probs:
@@ -1557,10 +1581,10 @@ def main() -> int:
         if args.mutate:
             try:
                 bad, ran = mutate(args.only)
-            except MutationSiteMissing as e:
+            except MutateError as e:
                 print(f"\nERROR: {e}")
-                print("RESULT: ERROR - a mutant could not be applied; the "
-                      "--mutate run proves nothing until its site is fixed")
+                print("RESULT: ERROR - a mutant could not be applied or judged; "
+                      "the --mutate run proves nothing until that is fixed")
                 return 2
             print()
             if not ran:
@@ -1574,6 +1598,7 @@ def main() -> int:
             return 0
 
         total = 0
+        errors = 0
         parts = (("A  static - the constants agree", check_static, "static"),
                  ("B  hygiene - the probe names no chip", check_probe_hygiene, "hygiene"),
                  ("C  container - --wants-services sets bit 2", check_container, "container"),
@@ -1590,7 +1615,14 @@ def main() -> int:
             print("=" * 70)
             print(title)
             print("=" * 70)
-            probs = fn()
+            try:
+                probs = fn()
+            except BuildFailed as e:
+                print(f"  !! {e}")
+                print(f"  {title[0]}: ERROR - nothing in this part was tested")
+                errors += 1
+                print()
+                continue
             if probs:
                 for p in probs:
                     print(f"  !! {p}")
@@ -1600,6 +1632,10 @@ def main() -> int:
                 print(f"  {title[0]}: GREEN")
             print()
 
+    if errors:
+        print(f"RESULT: ERROR - {errors} part(s) did not build, so they were not "
+              "tested" + (f"; {total} problem(s) in the parts that ran" if total else ""))
+        return 2
     if total:
         print(f"RESULT: RED ({total} problem(s))")
         return 1
