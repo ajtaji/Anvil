@@ -285,7 +285,11 @@ CompilerEndIf
 #VTP_Y1 = $3F000000                    ;  0.5
 #VTP_X2 = $3F000000                    ;  0.5
 #VTP_Y2 = $3F000000                    ;  0.5
+CompilerIf #VTP_PYRAMID_DEMO
+#VTP_STRIDE = 32                       ; vec2 position + vec4 colour + vec2 perspective scale
+CompilerElse
 #VTP_STRIDE = 24                       ; vec2 position + vec4 colour
+CompilerEndIf
 
 ; The six sample points. The odd viewport makes the triangle's apex
 ; (399.5, 319.75) and its base run from (199.75, 959.25) to
@@ -542,11 +546,12 @@ EndProcedure
 CompilerEndIf
 
 CompilerIf #VTP_PYRAMID_DEMO
-Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, r.i, g.i, b.i)
+Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, scale.f, r.i, g.i, b.i)
   Define p.i = base + index * #VTP_STRIDE
   PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@y))
   PokeL(p + 8, r) : PokeL(p + 12, g)
   PokeL(p + 16, b) : PokeL(p + 20, #VTP_F_ONE)
+  PokeL(p + 24, PeekL(@scale)) : PokeL(p + 28, PeekL(@scale))
 EndProcedure
 
 Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
@@ -556,6 +561,7 @@ Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
   Define Dim sx.f[5]
   Define Dim sy.f[5]
   Define Dim depth.f[5]
+  Define Dim scales.f[5]
   Define Dim faceDepth.f[4]
   Define Dim order.i[4]
   Define i.i, j.i, face.i, a.i, b.i, d.i, tmp.i
@@ -571,8 +577,9 @@ Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
     zz = z[i] * ca - x[i] * sa
     depth[i] = zz * 0.91 + y[i] * 0.42
     scale = 1.65 / (3.6 - depth[i])
-    sx[i] = xx * scale * 0.82
-    sy[i] = (y[i] * 0.91 - zz * 0.42) * scale * 0.72
+    scales[i] = scale
+    sx[i] = xx * 0.82
+    sy[i] = (y[i] * 0.91 - zz * 0.42) * 0.72
   Next
   For face = 0 To 3
     order[face] = face
@@ -597,9 +604,9 @@ Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
       Default : red = $3F333333 : green = $3E99999A : blue = $3F666666
     EndSelect
     d = i * 3
-    vtpPyramidVertex(base, d + 0, sx[0], sy[0], red, green, blue)
-    vtpPyramidVertex(base, d + 1, sx[a], sy[a], red, green, blue)
-    vtpPyramidVertex(base, d + 2, sx[b], sy[b], red, green, blue)
+    vtpPyramidVertex(base, d + 0, sx[0], sy[0], scales[0], red, green, blue)
+    vtpPyramidVertex(base, d + 1, sx[a], sy[a], scales[a], red, green, blue)
+    vtpPyramidVertex(base, d + 2, sx[b], sy[b], scales[b], red, green, blue)
   Next
 EndProcedure
 CompilerEndIf
@@ -733,7 +740,7 @@ CompilerEndIf
   Define pcr.VkPushConstantRange
   Define Dim stages.VkPipelineShaderStageCreateInfo[2]
   Define bind.VkVertexInputBindingDescription
-  Define Dim attrs.VkVertexInputAttributeDescription[2]
+  Define Dim attrs.VkVertexInputAttributeDescription[3]
   Define vi.VkPipelineVertexInputStateCreateInfo
   Define ia.VkPipelineInputAssemblyStateCreateInfo
   Define vpstate.VkPipelineViewportStateCreateInfo
@@ -1065,7 +1072,11 @@ CompilerEndIf
   vtpStep(5)
   bytesA = vtpBuildVsA()
   bytesB = vtpBuildFsA()
+CompilerIf #VTP_PYRAMID_DEMO
+  bytesC = vtpBuildVsBScaled()
+CompilerElse
   bytesC = vtpBuildVsB()
+CompilerEndIf
   bytesD = vtpBuildFsB()
   smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
   smci\pCode = @vtpVsA[0]
@@ -1086,7 +1097,11 @@ CompilerEndIf
     NeonShutdown()
     ProcedureReturn vtpStop(#VTP_ERR_SHADER)
   EndIf
+CompilerIf #VTP_PYRAMID_DEMO
+  smci\pCode = @vtpVsBScaled[0]
+CompilerElse
   smci\pCode = @vtpVsB[0]
+CompilerEndIf
   smci\codeSize = bytesC
   rc = vkCreateShaderModule(dev, @smci, 0, @vsB)
   If rc <> #VK_SUCCESS
@@ -1174,6 +1189,12 @@ CompilerEndIf
   attrs[1]\binding = 0
   attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
   attrs[1]\offset = 8
+CompilerIf #VTP_PYRAMID_DEMO
+  attrs[2]\location = 2
+  attrs[2]\binding = 0
+  attrs[2]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[2]\offset = 24
+CompilerEndIf
   vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
   vi\vertexBindingDescriptionCount = 1
   vi\pVertexBindingDescriptions = @bind
@@ -1232,7 +1253,11 @@ CompilerEndIf
 
   stages[0]\module = vsB
   stages[1]\module = fsB
+CompilerIf #VTP_PYRAMID_DEMO
+  vi\vertexAttributeDescriptionCount = 3
+CompilerElse
   vi\vertexAttributeDescriptionCount = 2
+CompilerEndIf
   gp\layout = layB
   rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeB)
   If rc <> #VK_SUCCESS
