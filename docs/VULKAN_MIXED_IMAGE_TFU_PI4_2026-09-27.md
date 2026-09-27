@@ -7,3 +7,5 @@ The public API diagnostic at `RaspberryPi4/Examples/Diagnostics/vulkanAtlasChrom
 The 1,136,336-byte PMFBOOT v2 payload has SHA-256 `b0685accd5a27dde12ad50aa557473cfe978748afd3dcde56e10fb9687ee5ecd`. The Pi 4 verified its upload at `0x600000`, returned the expected report pointer `x0=0x8308C8` after about 10.4 seconds, and produced capture 66. The report, raw screenshot, capture and run metadata are in `docs/evidence/vulkan-mixed-image-20260927/`. The resident Vulkan console was restored; deadman and capture were disarmed, coretest leases were zero, and the board was released. This was a RAM-only run with no flash or boot-medium write.
 
 The normal Pi 4 image compiled at 4,344,356 bytes and its generated source build stamp was restored. The full public pipeline gate passed 804 checks over 203,967,134 interpreted AArch64 instructions. The production V3D backend gate passed 92 checks over 4,405,988 instructions.
+
+The diagnostic was subsequently extended to put a guarded DMA buffer update before this upload-and-copy sequence; see `docs/VULKAN_DMA_TFU_STREAM_PI4_2026-09-27.md` for the current source and its fresh hardware proof.
