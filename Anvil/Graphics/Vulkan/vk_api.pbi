@@ -1462,11 +1462,11 @@ Procedure vkCmdCopyImage(commandBuffer.i, srcImage.i, srcImageLayout.i, dstImage
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyImage was given a stale command buffer (Anvil code -20002); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If regionCount <> 1 Or *pRegions = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage currently requires exactly one non-null region (Anvil code -20005); no partial array was copied.")
+  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImage requires one to thirty-two non-null regions (Anvil code -20001); no partial array was copied.")
     ProcedureReturn
   EndIf
-  AnvilVkCmdCopyImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, *pRegions)
+  AnvilVkCmdCopyImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, *pRegions)
 EndProcedure
 
 Procedure vkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcImageLayout.i, dstBuffer.i, regionCount.i, *pRegions.VkBufferImageCopy)

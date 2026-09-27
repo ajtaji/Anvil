@@ -32,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i, arrayCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -50,6 +50,7 @@ Procedure.i Main()
   Define range.VkImageSubresourceRange
   Define region.VkBufferImageCopy
   Define imageRegion.VkImageCopy
+  Define Dim imageRegions.VkImageCopy[2]
   Define dstBar.VkImageMemoryBarrier
   Define fci.VkFenceCreateInfo
   Define si.VkSubmitInfo
@@ -133,6 +134,7 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @strideUploadCmd) <> #VK_SUCCESS : status = 74 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @strideReadCmd) <> #VK_SUCCESS : status = 75 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @selfCmd) <> #VK_SUCCESS : status = 94 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @arrayCmd) <> #VK_SUCCESS : status = 103 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -385,6 +387,43 @@ Procedure.i Main()
       If status = 102 : Break : EndIf
     Next
     If status = 102 : Break : EndIf
+
+    imageRegions[0]\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegions[0]\srcSubresource\layerCount = 1
+    imageRegions[0]\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegions[0]\dstSubresource\layerCount = 1
+    imageRegions[0]\srcOffset\x = 7 : imageRegions[0]\srcOffset\y = 9
+    imageRegions[0]\dstOffset\x = 0 : imageRegions[0]\dstOffset\y = 24
+    imageRegions[0]\extent\width = 4 : imageRegions[0]\extent\height = 4 : imageRegions[0]\extent\depth = 1
+    imageRegions[1]\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegions[1]\srcSubresource\layerCount = 1
+    imageRegions[1]\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    imageRegions[1]\dstSubresource\layerCount = 1
+    imageRegions[1]\srcOffset\x = 24 : imageRegions[1]\srcOffset\y = 24
+    imageRegions[1]\dstOffset\x = 28 : imageRegions[1]\dstOffset\y = 0
+    imageRegions[1]\extent\width = 4 : imageRegions[1]\extent\height = 4 : imageRegions[1]\extent\depth = 1
+    If vkBeginCommandBuffer(arrayCmd, @bi) <> #VK_SUCCESS : status = 104 : Break : EndIf
+    vkCmdCopyImage(arrayCmd, dstImg, #VK_IMAGE_LAYOUT_GENERAL, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 2, @imageRegions[0])
+    If vkEndCommandBuffer(arrayCmd) <> #VK_SUCCESS : status = 105 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 106 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 107 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 108 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 109 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 110 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If (j >= 7 And j < 24 And k >= 9 And k < 22) Or (j >= 24 And j < 32 And k >= 24 And k < 32) Or (j < 4 And k >= 24 And k < 28) Or (j >= 28 And j < 32 And k < 4)
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 111 : Break : EndIf
+      Next
+      If status = 111 : Break : EndIf
+    Next
+    If status = 111 : Break : EndIf
 
     status = 0
   Until 1
