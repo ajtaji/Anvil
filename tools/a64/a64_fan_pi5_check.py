@@ -322,6 +322,9 @@ def counts(rng: int, permille: int) -> int:
 #  THE MODELLED BOARD
 # ======================================================================
 RPM_FULL = 6000
+# What the modelled firmware keeps in rp1_pwm1 + $3C (dts rpm-offset) - a
+# value no counted tach in this run can produce, so the row names its source.
+FW_RPM_WORD = 2718
 B_CODE = 739
 C_CODES = [780, 740, 736, 720, 700, 680, 700, 736, 740, 745, 736, 600]
 
@@ -459,6 +462,11 @@ class Board:
             return f.valid | code
         if f.pwm1 <= a < f.pwm1 + 0x100:
             off = a - f.pwm1
+            if off == 0x3C:
+                # bcm2712-rpi-5-b.dts cooling_fan rpm-regmap = <&rp1_pwm1>,
+                # rpm-offset = <0x3c>: the firmware's RPM word.
+                self.rpm_reads = getattr(self, "rpm_reads", 0) + 1
+                return FW_RPM_WORD
             if off == 0:
                 # The update is taken in the PWM clock domain: only a running
                 # clk_pwm1 ever clears SET_UPDATE.
@@ -831,6 +839,16 @@ def check(fails: list, work: pathlib.Path) -> int:
     expect(coarse is not None and coarse < 0 and coarse == const(REL_LIB, "#RP1_TACH_COARSE"),
            "T: a window polled every 5 ms answered %s, not COARSE" % coarse)
 
+    # ---- R: the firmware's RPM word, read raw ------------------------------
+    expect(s.one("R rpmreg") == FW_RPM_WORD,
+           "R: Rp1FanRpmRegister gave %s, the word at rp1_pwm1 + $3C is %d"
+           % (s.one("R rpmreg"), FW_RPM_WORD))
+    expect(getattr(board, "rpm_reads", 0) == 1,
+           "R: rp1_pwm1 + $3C was read %d times, want exactly once"
+           % getattr(board, "rpm_reads", 0))
+    expect(not [a for u, a, v in board.writes if a == f.pwm1 + 0x3C],
+           "R: rp1_pwm1 + $3C was written - it is a read-only report here")
+
     # ---- C: register -> milli C -> milli F -> curve -> DUTY register -------
     pol = Policy()
     steps_c = s.all("C step")
@@ -888,6 +906,11 @@ MUTATIONS = [
      "    Case #THERM_SRC_MAILBOX\n      ProcedureReturn #HW_TEMP_SRC_FIRMWARE",
      "    Case #THERM_SRC_MAILBOX\n      ProcedureReturn #HW_TEMP_SRC_REGISTER"),
     (REL_HWMOD, "the Pi 4 AVS address on a Pi 5", "#HWDEV_AVS_MONITOR = $107D542000", "#HWDEV_AVS_MONITOR = $FD5D2000"),
+    (REL_LIB, "rpm word read at CHAN2_RANGE ($38)", "#RP1PWM_RPM_REG = $3C", "#RP1PWM_RPM_REG = $38"),
+    (REL_LIB, "rpm word read from rp1_pwm0", "  ProcedureReturn PeekN(#RP1PWM_BASE + #RP1PWM_RPM_REG) & $FFFFFFFF",
+     "  ProcedureReturn PeekN(#RP1PWM_BASE - $4000 + #RP1PWM_RPM_REG) & $FFFFFFFF"),
+    (REL_LIB, "rpm word scaled", "  ProcedureReturn PeekN(#RP1PWM_BASE + #RP1PWM_RPM_REG) & $FFFFFFFF",
+     "  ProcedureReturn (PeekN(#RP1PWM_BASE + #RP1PWM_RPM_REG) & $FFFFFFFF) * 2"),
 ]
 
 
