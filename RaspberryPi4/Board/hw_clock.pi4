@@ -1,0 +1,153 @@
+; ======================================================================
+;  hw_clock.pi4 - the HwClock* backend (Anvil/Hal/hal.pbi, #CAP_RTC) for
+;  BCM2712 (Pi 5). THE BOARD SIDE OF "WHAT TIME IS IT, AND WHY BELIEVE IT".
+;
+;  2712 ONLY. The Pi 4 has no RTC (hal.pbi, abi.pbi) and does not include
+;  this file; board.pi4 lists it under CompilerIf #PMF_CHIP = 2712, after
+;  RaspberryPi4/Lib/rtc_fw.pi4, Anvil/Core/wallclock.pbi and hal.pbi and
+;  before Anvil/Hal/abi.pbi (whose clock slots call it on 2712).
+;
+;  THE SOURCE IS THE FIRMWARE'S BATTERY-BACKED RTC (rtc_fw.pi4, from
+;  rtc-rpi.c). HwClockSeed() reads it once and anchors the wall clock with
+;  #WALLCLOCK_SRC_RTC. THE 1980 FLOOR IS APPLIED HERE, BY THE SEEDER: the
+;  firmware interface has no "time valid" bit, and a Pi 5 whose battery is
+;  flat (or absent) counts up from zero at power-on - 1970 plus uptime.
+;  Anything below #WALLCLOCK_EPOCH_MIN is refused with its own reason
+;  (#HWCLK_SEED_FLOOR) and the clock stays unset, rather than being
+;  anchored to a 1970 date that WallClockSet would also refuse under a
+;  less specific name.
+;
+;  PROVENANCE IS READ BACK FROM THE WALL CLOCK, NOT REMEMBERED HERE, so
+;  that a later SNTP or restore that re-anchors the clock is reflected:
+;    #WALLCLOCK_SRC_RTC       -> #HW_CLK_RTC
+;    #WALLCLOCK_SRC_RESTORED  -> #HW_CLK_RESTORED (a floor)
+;    anything else            -> #HW_CLK_UNSET
+;  MANUAL and SNTP map to UNSET on purpose: hal.pbi's provenance order has
+;  no code for them, and 49 CFR 395 App. A 4.3.1.5(a) (hal.pbi's reason
+;  there is no setter) excludes a person-entered time. Whether an
+;  unauthenticated SNTP reply should count is an open owner question.
+;
+;  ORDER AT BOOT MATTERS: time_cmd.pbi's TimeBoot() anchors a saved value
+;  as RESTORED unconditionally, so HwClockSeed() must run AFTER TimeBoot()
+;  or the floor would overwrite the RTC. If nothing called it, the first
+;  HwClockProvenance()/HwClockUtc() seeds once, lazily.
+;
+;  HwClockUncertaintyMs() IS -1 AND THAT IS THE HONEST ANSWER. hal.pbi
+;  requires the bound to come from a worst-case ppm constant "carrying its
+;  source". No document on this disk states the Pi 5 RTC crystal's
+;  tolerance, and the RTC is not an authoritative sync, so there is no
+;  number to give; -1 is "no measurement", which callers must not average.
+;  HwClockLastSyncTicks() is -1 for the same reason (only GNSS syncs).
+;  HwClockNotifyGnss() refuses: #CAP_GNSS is 0 on this board.
+;
+;  DESK PROOF ONLY (tools/a64/hw_clock_check.py). SILICON OWED.
+; ======================================================================
+
+EnableExplicit
+
+#HWCLK_SEED_NEVER   = 0         ; not attempted
+#HWCLK_SEED_OK      = 1         ; anchored from the RTC
+#HWCLK_SEED_MAILBOX = 2         ; the firmware did not answer (RtcFwError())
+#HWCLK_SEED_FLOOR   = 3         ; the RTC reads before 1980: flat battery
+#HWCLK_SEED_RANGE   = 4         ; the RTC reads 2100 or later, or the wall
+                                ; clock refused it (WallClockLastError())
+
+Global hwclk_seed.i
+Global hwclk_rtc_epoch.i
+
+; ----------------------------------------------------------------------
+;  HwClockSeed() - read the RTC and anchor the wall clock. Returns one of
+;  #HWCLK_SEED_*; OK is the only one that touched the wall clock.
+; ----------------------------------------------------------------------
+Procedure.i HwClockSeed()
+  Define t.i
+  t = RtcFwTime()
+  hwclk_rtc_epoch = t
+  If t < 0
+    hwclk_seed = #HWCLK_SEED_MAILBOX
+    ProcedureReturn hwclk_seed
+  EndIf
+  If t < #WALLCLOCK_EPOCH_MIN
+    hwclk_seed = #HWCLK_SEED_FLOOR
+    ProcedureReturn hwclk_seed
+  EndIf
+  If t >= #WALLCLOCK_EPOCH_MAX
+    hwclk_seed = #HWCLK_SEED_RANGE
+    ProcedureReturn hwclk_seed
+  EndIf
+  If WallClockSet(t, #WALLCLOCK_SRC_RTC) = 0
+    hwclk_seed = #HWCLK_SEED_RANGE
+    ProcedureReturn hwclk_seed
+  EndIf
+  hwclk_seed = #HWCLK_SEED_OK
+  ProcedureReturn hwclk_seed
+EndProcedure
+
+Procedure.i HwClockSeedResult()
+  ProcedureReturn hwclk_seed
+EndProcedure
+
+; What the RTC last read, raw (-1 if the read failed) - for a diagnostic
+; that wants to show a refused 1970 value rather than just "refused".
+Procedure.i HwClockRtcRaw()
+  ProcedureReturn hwclk_rtc_epoch
+EndProcedure
+
+Procedure.i HwClockProvenance()
+  Define s.i
+  If hwclk_seed = #HWCLK_SEED_NEVER
+    HwClockSeed()
+  EndIf
+  s = WallClockSource()
+  If s = #WALLCLOCK_SRC_RTC
+    ProcedureReturn #HW_CLK_RTC
+  EndIf
+  If s = #WALLCLOCK_SRC_RESTORED
+    ProcedureReturn #HW_CLK_RESTORED
+  EndIf
+  ProcedureReturn #HW_CLK_UNSET
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  HwClockUtc(*out) - seven 32-bit fields: year, month, day, hour, minute,
+;  second, millisecond, UTC. ALWAYS written (zeros when there is no time),
+;  and the provenance is the return value (hal.pbi).
+; ----------------------------------------------------------------------
+Procedure.i HwClockUtc(*out)
+  Define p.i
+  Define i.i
+  Define now.i
+  i = 0
+  While i < 28
+    PokeB(*out + i, 0)
+    i = i + 1
+  Wend
+  p = HwClockProvenance()
+  If p = #HW_CLK_UNSET
+    ProcedureReturn p
+  EndIf
+  now = WallClockNow()
+  If WallClockToCivil(now) = 0
+    ProcedureReturn #HW_CLK_UNSET
+  EndIf
+  PokeL(*out + 0, WallClockYear())
+  PokeL(*out + 4, WallClockMonth())
+  PokeL(*out + 8, WallClockDay())
+  PokeL(*out + 12, WallClockHour())
+  PokeL(*out + 16, WallClockMinute())
+  PokeL(*out + 20, WallClockSecond())
+  PokeL(*out + 24, WallClockMicros() / 1000)
+  ProcedureReturn p
+EndProcedure
+
+Procedure.i HwClockUncertaintyMs()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwClockLastSyncTicks()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwClockNotifyGnss(*fix)
+  ProcedureReturn 0
+EndProcedure

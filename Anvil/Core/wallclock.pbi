@@ -30,6 +30,16 @@ EnableExplicit
 #WALLCLOCK_SRC_MANUAL   = 1
 #WALLCLOCK_SRC_RESTORED = 2
 #WALLCLOCK_SRC_SNTP  = 3
+; A battery-backed real-time clock said so. BCM2712 (Pi 5) only: its
+; firmware RTC (RaspberryPi4/Lib/rtc_fw.pi4) is the only RTC any Anvil
+; board has. Every line that ADMITS this source sits under
+; CompilerIf #PMF_CHIP = 2712, so every other target's image is the one
+; it was before the constant existed (the constant alone emits nothing).
+; It is TRUSTED - a clock that kept counting through power-off is a
+; time, not the RESTORED floor - but it is not SNTP: WallClockSourceText
+; names it, and the seeder (RaspberryPi4/Board/hw_clock.pi4) refuses any
+; reading below #WALLCLOCK_EPOCH_MIN, which is what a flat battery gives.
+#WALLCLOCK_SRC_RTC   = 4
 
 #WALLCLOCK_ZONE_UTC     = 0
 #WALLCLOCK_ZONE_FIXED   = 1
@@ -263,10 +273,17 @@ Procedure.i WallClockSet(epoch.i, source.i)
 
   wallclock_err = #WALLCLOCK_ERR_NONE
 
+  CompilerIf #PMF_CHIP = 2712
+  If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_RTC
+    wallclock_err = #WALLCLOCK_ERR_SOURCE
+    ProcedureReturn 0
+  EndIf
+  CompilerElse
   If source < #WALLCLOCK_SRC_MANUAL Or source > #WALLCLOCK_SRC_SNTP
     wallclock_err = #WALLCLOCK_ERR_SOURCE
     ProcedureReturn 0
   EndIf
+  CompilerEndIf
   If epoch < #WALLCLOCK_EPOCH_MIN Or epoch >= #WALLCLOCK_EPOCH_MAX
     wallclock_err = #WALLCLOCK_ERR_RANGE
     ProcedureReturn 0
@@ -636,6 +653,11 @@ Procedure.i WallClockTrusted()
   If wallclock_src = #WALLCLOCK_SRC_MANUAL Or wallclock_src = #WALLCLOCK_SRC_SNTP
     ProcedureReturn 1
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If wallclock_src = #WALLCLOCK_SRC_RTC
+    ProcedureReturn 1
+  EndIf
+  CompilerEndIf
   ProcedureReturn 0
 EndProcedure
 
@@ -1341,6 +1363,11 @@ Procedure.i WallClockSourceText()
     Case #WALLCLOCK_SRC_SNTP
       ProcedureReturn "SNTP/network reply (not authenticated)"
   EndSelect
+  CompilerIf #PMF_CHIP = 2712
+  If wallclock_src = #WALLCLOCK_SRC_RTC
+    ProcedureReturn "battery-backed RTC"
+  EndIf
+  CompilerEndIf
   ProcedureReturn "never set"
 EndProcedure
 

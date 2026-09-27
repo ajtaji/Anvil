@@ -1059,8 +1059,17 @@ EndProcedure
 ;
 ; A SEPARATE PROCEDURE, called by both slot 17 and slot 18, so that "what
 ; time is it" and "how much do you trust it" cannot answer differently.
+;
+; BCM2712 (Pi 5) HAS ONE: the firmware's battery-backed RTC, through the
+; board's HwClock* backend (RaspberryPi4/Board/hw_clock.pi4), which the
+; board includes before this file and only on 2712. Every other target
+; compiles the line it always had.
 Procedure.i SvcClockProv()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn HwClockProvenance()
+  CompilerElse
   ProcedureReturn #HW_CLK_UNSET
+  CompilerEndIf
 EndProcedure
 
 ; Slot 16. Monotonic microseconds since Anvil started. Wraps at 2^63 us,
@@ -1090,7 +1099,11 @@ Procedure.i SvcUtc(*out)
     PokeB(*out + i, 0)
     i = i + 1
   Wend
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn HwClockUtc(*out)
+  CompilerElse
   ProcedureReturn SvcClockProv()
+  CompilerEndIf
 EndProcedure
 
 ; Slot 18. The same code without filling anything.
