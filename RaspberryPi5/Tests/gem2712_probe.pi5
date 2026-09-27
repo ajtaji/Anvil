@@ -1,0 +1,172 @@
+; gem2712_probe.pi5 - RP1's Ethernet (RaspberryPi4/Lib/gem.pi4) built -t pi5
+; and driven through the REAL link seam, RaspberryPi4/Board/hw_link.pi4, into
+; the REAL shared stack, Anvil/Network/net.pbi. DESK FIXTURE for
+; tools/a64/a64_gem_pi5_check.py, which models pcie2 + RP1, the GEM, the
+; BCM54213PE, RP1 GPIO 32 and a write-back cache over the DMA region, writes
+; #CTL and reads #OUT. Silicon owed.
+;
+; Only the RADIO half of hw_link.pi4 is stubbed below (cyw43 / wifi / the
+; console are not in this image); every wired line it runs is the board's.
+;
+;   #CTL +0 scenario (the gate's own number; the probe runs the same steps)
+;        +4 how many frames the gate will put on the wire
+;        +8 the board's MAC (6 bytes)     +16 IP  +20 mask  +24 gateway
+;        +28 1 = ask GemCableIn first     +32 1 = one HwLinkSend, no receive
+;
+;   #OUT +0 GemProbe      +4 GemError     +8 GemSetMac    +12 GemSetRegion
+;        +16 GemCableIn   +20 GemStart    +24 GemError    +28 frames in
+;        +32 replies out  +36 receive refusals            +40 send refusals
+;        +44 HwLinkReady  +48 HwLinkSpeed +52 HwLinkDuplex
+;        +56 GemStopChecked +60 GemPhyResets +64 GemError at the end
+;        +68 the lone HwLinkSend          +72 $600DF00D
+;        +76 GemRxCount   +80 GemTxCount  +84 GemStarted after the stop
+;
+;   PureMetalForge --compile gem2712_probe.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o gem.img
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "Anvil/Network/net.pbi"
+
+; ---- the radio's half of the seam, which this image does not carry ----
+Global gWifiKeyed.i
+Global Dim wifi_ourMac.a[6]
+Procedure.i Cyw43DataMax()
+  ProcedureReturn 1500
+EndProcedure
+Procedure.i Cyw43DataPtr()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43Send(n.i)
+  ProcedureReturn -1
+EndProcedure
+Procedure.i Cyw43Receive(ms.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i Cyw43ReceivePtr()
+  ProcedureReturn 0
+EndProcedure
+Procedure WifiServiceEapolFrame(p.i, n.i)
+EndProcedure
+Procedure.i NetConsoleOn()
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetIfUsable(kind.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetConsoleOfferUdp(p.i, kind.i)
+  ProcedureReturn 0
+EndProcedure
+Procedure WifiSetConsoleOwnsRx(on.i)
+EndProcedure
+Procedure WifiNoteRxProof()
+EndProcedure
+
+XIncludeFile "RaspberryPi4/Board/hw_link.pi4"
+
+#CTL = $00E00000
+#OUT = $00E00100
+#REGION = $08100000              ; eth_globals.pi4 #ETH_RX_BASE
+#REGION_BYTES = $80000           ; eth_globals.pi4 #ETH_RX_BYTES
+
+Global Dim rxbuf.a[2048]
+Global Dim txframe.a[64]
+Global probeTicks.i
+
+; A progress hook, so the compiler can follow gem.pi4's hook pointer
+; exactly (the board hands it ScreenServiceTick).
+Procedure probe_Tick()
+  probeTicks = probeTicks + 1
+EndProcedure
+
+Define sc.i
+Define want.i
+Define got.i
+Define sent.i
+Define rxerr.i
+Define txerr.i
+Define idle.i
+Define n.i
+Define r.i
+Define i.i
+
+sc = PeekN(#CTL)
+want = PeekN(#CTL + 4)
+GemSetProgressHook(@probe_Tick)
+
+PokeL(#OUT + 0, GemProbe())
+PokeL(#OUT + 4, GemError())
+If PeekN(#OUT + 0) = 1
+  PokeL(#OUT + 8, GemSetMac(#CTL + 8))
+  PokeL(#OUT + 12, GemSetRegion(#REGION, #REGION_BYTES))
+  If PeekN(#CTL + 28) = 1
+    PokeL(#OUT + 16, GemCableIn(5000))
+  EndIf
+  PokeL(#OUT + 20, GemStart(5000))
+  PokeL(#OUT + 24, GemError())
+  If PeekN(#OUT + 20) = 1
+    NetInit()
+    NetSetMac(#HW_LINK_WIRED, #CTL + 8)
+    NetSetIPv4(#HW_LINK_WIRED, PeekN(#CTL + 16), PeekN(#CTL + 20), PeekN(#CTL + 24))
+    PokeL(#OUT + 44, HwLinkReady(#HW_LINK_WIRED))
+    PokeL(#OUT + 48, HwLinkSpeed(#HW_LINK_WIRED))
+    PokeL(#OUT + 52, HwLinkDuplex(#HW_LINK_WIRED))
+    If PeekN(#CTL + 32) = 1
+      ; one frame straight out through the seam: a broadcast of 42 bytes,
+      ; padded by the driver to 60
+      For i = 0 To 5
+        txframe[i] = $FF
+        txframe[i + 6] = PeekA(#CTL + 8 + i)
+      Next
+      txframe[12] = $08
+      txframe[13] = $06
+      For i = 14 To 41
+        txframe[i] = i
+      Next
+      PokeL(#OUT + 68, HwLinkSend(#HW_LINK_WIRED, @txframe[0], 42, 100))
+    Else
+      got = 0
+      sent = 0
+      rxerr = 0
+      txerr = 0
+      idle = 0
+      While idle < 3 And got < want + 8 And rxerr < 8
+        ; a POLL first (ms = 0, the console pump's call), then a wait
+        n = HwLinkRecv(#HW_LINK_WIRED, @rxbuf[0], 2048, 0)
+        If n = 0
+          n = HwLinkRecv(#HW_LINK_WIRED, @rxbuf[0], 2048, 200)
+        EndIf
+        If n > 0
+          got = got + 1
+          idle = 0
+          r = NetInput(#HW_LINK_WIRED, HwLinkRxPtr(#HW_LINK_WIRED), n)
+          If r = #NET_IN_REPLY
+            If HwLinkSend(#HW_LINK_WIRED, NetOutBuf(), NetOutLen(), 100) = 1
+              sent = sent + 1
+            Else
+              txerr = txerr + 1
+            EndIf
+          EndIf
+        ElseIf n = 0
+          idle = idle + 1
+        Else
+          rxerr = rxerr + 1
+        EndIf
+      Wend
+      PokeL(#OUT + 28, got)
+      PokeL(#OUT + 32, sent)
+      PokeL(#OUT + 36, rxerr)
+      PokeL(#OUT + 40, txerr)
+    EndIf
+  EndIf
+  PokeL(#OUT + 56, GemStopChecked())
+  PokeL(#OUT + 84, GemStarted())
+EndIf
+PokeL(#OUT + 60, GemPhyResets())
+PokeL(#OUT + 64, GemError())
+PokeL(#OUT + 76, GemRxCount())
+PokeL(#OUT + 80, GemTxCount())
+PokeL(#OUT + 72, $600DF00D)

@@ -41,7 +41,17 @@
 ;  before link.pi4. This language resolves a call to a procedure it has
 ;  already seen, so a backend that arrived after its caller would not
 ;  link - which is the loud failure and the right one.
+;
+;  BCM2712 (-t pi5): THE WIRED LINK IS RP1's CADENCE GEM, not GENET. Its
+;  driver, RaspberryPi4/Lib/gem.pi4, is included here and only here, so
+;  the seam and its one wired driver arrive together; it needs timer.pi4,
+;  pcie.pi4 and gpio_rp1.pi4, all of which the board includes before this
+;  file. Every Pi 4 line below is inside a CompilerElse (or unchanged
+;  outside one) and a -t pi4 image is byte-identical.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+  XIncludeFile "RaspberryPi4/Lib/gem.pi4"
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  HwLinkHas - what this board HAS, as opposed to what is up right now.
@@ -54,9 +64,12 @@
 ; ----------------------------------------------------------------------
 Procedure.i HwLinkHas(kind.i)
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: the radio on SDIO2 is driven (sdio.pi4 / wifi.pi4 2712
-  ; branches); the Pi 5's Ethernet is RP1's Cadence GEM and is not, so
-  ; the wired kind is "not on this board".
+  ; BCM2712: the radio on SDIO2 (sdio.pi4 / wifi.pi4 2712 branches) and
+  ; the socket, RP1's Cadence GEM (RaspberryPi4/Lib/gem.pi4). Whether the
+  ; commands may USE them is #CAP_NET's question, asked by RequireCap.
+  If kind = #HW_LINK_WIRED
+    ProcedureReturn 1
+  EndIf
   If kind = #HW_LINK_WIFI
     ProcedureReturn 1
   EndIf
@@ -95,6 +108,15 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i HwLinkReady(kind.i)
   If kind = #HW_LINK_WIRED
+    CompilerIf #PMF_CHIP = 2712
+    If GemStarted() <> 1
+      ProcedureReturn 0
+    EndIf
+    If GemPhyLinkUp() <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+    CompilerElse
     If GenetStarted() <> 1
       ProcedureReturn 0
     EndIf
@@ -102,6 +124,7 @@ Procedure.i HwLinkReady(kind.i)
       ProcedureReturn 0
     EndIf
     ProcedureReturn 1
+    CompilerEndIf
   EndIf
   If kind = #HW_LINK_WIFI
     If gWifiKeyed = 0
@@ -174,16 +197,32 @@ Procedure.i HwLinkSpeed(kind.i)
   If kind <> #HW_LINK_WIRED
     ProcedureReturn #HW_LINK_SPEED_UNKNOWN
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If GemStarted() <> 1
+    ProcedureReturn #HW_LINK_SPEED_UNKNOWN
+  EndIf
+  ProcedureReturn GemSpeed()
+  CompilerElse
   If GenetStarted() <> 1
     ProcedureReturn #HW_LINK_SPEED_UNKNOWN
   EndIf
   ProcedureReturn GenetSpeed()
+  CompilerEndIf
 EndProcedure
 
 Procedure.i HwLinkDuplex(kind.i)
   If kind <> #HW_LINK_WIRED
     ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  If GemStarted() <> 1
+    ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
+  EndIf
+  If GemFullDuplex() = 1
+    ProcedureReturn #HW_LINK_DUPLEX_FULL
+  EndIf
+  ProcedureReturn #HW_LINK_DUPLEX_HALF
+  CompilerElse
   If GenetStarted() <> 1
     ProcedureReturn #HW_LINK_DUPLEX_UNKNOWN
   EndIf
@@ -191,6 +230,7 @@ Procedure.i HwLinkDuplex(kind.i)
     ProcedureReturn #HW_LINK_DUPLEX_FULL
   EndIf
   ProcedureReturn #HW_LINK_DUPLEX_HALF
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -209,7 +249,11 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i HwLinkWhyText(kind.i)
   If kind = #HW_LINK_WIRED
+    CompilerIf #PMF_CHIP = 2712
+    ProcedureReturn GemErrorText()
+    CompilerElse
     ProcedureReturn GenetErrorText()
+    CompilerEndIf
   EndIf
   ProcedureReturn ""
 EndProcedure
@@ -232,10 +276,19 @@ Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
     ProcedureReturn 0
   EndIf
   If kind = #HW_LINK_WIRED
+    CompilerIf #PMF_CHIP = 2712
+    ; GemSend copies into its own DMA buffer and waits for the GEM to
+    ; hand the descriptor back, the same 1/0 contract as GenetSend.
+    If GemSend(buf, n, ms) <> 1
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+    CompilerElse
     If GenetSend(buf, n, ms) <> 1
       ProcedureReturn 0
     EndIf
     ProcedureReturn 1
+    CompilerEndIf
   EndIf
   If kind = #HW_LINK_WIFI
     If n > Cyw43DataMax()
@@ -316,6 +369,15 @@ Procedure.i HwLinkRecv(kind.i, buf.i, max.i, ms.i)
   Define n.i
   gHwLinkRxPtr = 0
   If kind = #HW_LINK_WIRED
+    CompilerIf #PMF_CHIP = 2712
+    ; The same poll-versus-wait split for the GEM: GemRecv is one look at
+    ; the ring, GemRecvWait refuses a zero wait exactly as GenetRecvWait.
+    If ms <= 0
+      n = GemRecv(buf, max)
+    Else
+      n = GemRecvWait(buf, max, ms)
+    EndIf
+    CompilerElse
     If ms <= 0
       ; ONE LOOK AT THE RING, NO WAIT. GenetRecv is the poll
       ; GenetRecvWait loops over, so this is that loop's body run once -
@@ -324,6 +386,7 @@ Procedure.i HwLinkRecv(kind.i, buf.i, max.i, ms.i)
     Else
       n = GenetRecvWait(buf, max, ms)
     EndIf
+    CompilerEndIf
     If n > 0
       gHwLinkRxPtr = buf
     EndIf

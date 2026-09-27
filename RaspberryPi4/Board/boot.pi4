@@ -96,11 +96,25 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure BootNetUp()
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: Ethernet is RP1's Cadence GEM and has no driver here
-  ; (#CAP_NET is 0); the radio is driven but is not joined at boot yet.
-  PrintN("network: not started - the Raspberry Pi 5's Ethernet (RP1) has no driver in")
-  PrintN("     this build, and the radio is not joined at boot: type wifi join.")
+  CompilerIf #CAP_NET = 0
+  ; BCM2712 with the network commands off (#CAP_NET 0): nothing started.
+  PrintN("network: not started - this Raspberry Pi 5 build has its network")
+  PrintN("     commands off (#CAP_NET is 0).")
   ProcedureReturn
+  CompilerElse
+  ; BCM2712: the wired half exactly as on the Pi 4 - EthBootWired over
+  ; RP1's GEM (eth.pi4 / RaspberryPi4/Lib/gem.pi4), then the console.
+  ; The radio is driven but is not joined at boot on the Pi 5 yet (the
+  ; Wi-Fi lane's choice), so the Wi-Fi half below is not run.
+  gBootLog = 1
+  EthBootWired()
+  ScreenServiceTick()
+  NetConsoleRearm()
+  ScreenServiceTick()
+  PrintN("Wi-Fi is not joined at boot on the Raspberry Pi 5 yet: type wifi join.")
+  gBootLog = 0
+  ProcedureReturn
+  CompilerEndIf
   CompilerEndIf
   gBootLog = 1
   ; Ethernet is recovery infrastructure, not stored configuration. Bring
