@@ -270,6 +270,10 @@ Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
   Define dr.i
   Define dg.i
   Define db.i
+  CompilerIf #PMF_CHIP = 2712
+  Define bpp.i
+  Define px16.i
+  CompilerEndIf
 
   If DisplayReady() = 0
     ProcedureReturn
@@ -315,6 +319,63 @@ Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
   HwConDamage(y, h)
 
   pitch = DisplayPitch()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: ONE LOOP FOR BOTH PIXEL SIZES. The Pi 5 firmware grants a
+  ; 16 bpp surface (pitch 3840 at 1920 wide; Lib/display.pi4 derives the
+  ; size from the pitch), so the step, the store and the read-back follow
+  ; DisplayBytesPerPixel() - 2 is RGB565 through DisplayRGB, the surface's
+  ; own packer; 4 is exactly the Pi 4's arithmetic below. Any other size is
+  ; not a surface this loop can address and nothing is written. The
+  ; CompilerElse copy is the Pi 4's own lines, kept only so -t pi4 stays
+  ; byte-identical; this loop is a superset of it.
+  bpp = DisplayBytesPerPixel()
+  If bpp <> 2 And bpp <> 4
+    ProcedureReturn
+  EndIf
+  px16 = DisplayRGB(sr, sg, sb)
+  row = 0
+  While row < h
+    p = base + (y + row) * pitch + x * bpp
+    col = 0
+    While col < w
+      If a = 255
+        If bpp = 4
+          PokeL(p, argb & $00FFFFFF)
+        Else
+          PokeW(p, px16)
+        EndIf
+      Else
+        If bpp = 4
+          d = PeekL(p)
+          dr = (d >> 16) & $FF
+          dg = (d >> 8) & $FF
+          db = d & $FF
+        Else
+          ; 5:6:5 widened back to 8:8:8 by bit replication, so full scale
+          ; stays full scale ($1F -> $FF) and black stays black.
+          d = PeekW(p) & $FFFF
+          dr = (d >> 11) & $1F
+          dg = (d >> 5) & $3F
+          db = d & $1F
+          dr = (dr << 3) | (dr >> 2)
+          dg = (dg << 2) | (dg >> 4)
+          db = (db << 3) | (db >> 2)
+        EndIf
+        dr = (a * sr + (255 - a) * dr + 127) / 255
+        dg = (a * sg + (255 - a) * dg + 127) / 255
+        db = (a * sb + (255 - a) * db + 127) / 255
+        If bpp = 4
+          PokeL(p, (dr << 16) | (dg << 8) | db)
+        Else
+          PokeW(p, DisplayRGB(dr, dg, db))
+        EndIf
+      EndIf
+      p = p + bpp
+      col = col + 1
+    Wend
+    row = row + 1
+  Wend
+  CompilerElse
   row = 0
   While row < h
     p = base + (y + row) * pitch + x * 4
@@ -337,6 +398,7 @@ Procedure HwConRect(x.i, y.i, w.i, h.i, argb.i)
     Wend
     row = row + 1
   Wend
+  CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------

@@ -321,14 +321,27 @@ Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
   Define outG.i
   Define outB.i
   Define x0.i
+  CompilerIf #PMF_CHIP = 2712
+  Define bpp.i
+  CompilerEndIf
 
   fbBase = DisplayBase()
   If fbBase = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the firmware's surface is 16 bpp (see hw_con.pi4 HwConRect).
+  ; DisplayRGB already packs for the surface's depth; only the store width
+  ; and the column step follow it.
+  bpp = DisplayBytesPerPixel()
+  If bpp <> 2 And bpp <> 4
+    ProcedureReturn 0
+  EndIf
+  CompilerElse
   If DisplayBytesPerPixel() <> 4
     ProcedureReturn 0
   EndIf
+  CompilerEndIf
   pitch = DisplayPitch()
 
   fgR = (fg >> 16) & $FF
@@ -384,7 +397,15 @@ Procedure.i DrawSmoothText(x.i, base.i, *s, fid.i, fg.i, bg.i)
                 outR = bgR + (fgR - bgR) * cov / 255
                 outG = bgG + (fgG - bgG) * cov / 255
                 outB = bgB + (fgB - bgB) * cov / 255
+                CompilerIf #PMF_CHIP = 2712
+                If bpp = 4
+                  PokeL(fbBase + gy * pitch + gx * 4, DisplayRGB(outR, outG, outB))
+                Else
+                  PokeW(fbBase + gy * pitch + gx * 2, DisplayRGB(outR, outG, outB))
+                EndIf
+                CompilerElse
                 PokeL(fbBase + gy * pitch + gx * 4, DisplayRGB(outR, outG, outB))
+                CompilerEndIf
               EndIf
             EndIf
             col = col + 1
