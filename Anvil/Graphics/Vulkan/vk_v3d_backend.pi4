@@ -494,7 +494,7 @@ EndProcedure
 ;
 ;  A VIEWPORT MAY FIT INSIDE THE RENDER GEOMETRY. NeonFrameBegin establishes
 ;  the surface-wide clip window. This backend then re-emits the clipper scale
-;  and viewport offset from each draw's exact u14.8 half extents, so odd
+;  and viewport offset from each draw's exact u14.8 centre, so odd
 ;  dimensions retain their half pixel and the coordinate shader, clipper and
 ;  rasteriser all consume the same value.
 
@@ -737,7 +737,10 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If *d\viewportX <> 0 Or *d\viewportY <> 0 Or *d\viewportW < 1 Or *d\viewportW > *d\width Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > *d\height Or *d\viewportH > 32767
+  If *d\viewportX < 0 Or *d\viewportY < 0 Or *d\viewportX > 16383 Or *d\viewportY > 16383 Or *d\viewportW < 1 Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > 32767
+    ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
+  EndIf
+  If *d\viewportX > *d\width Or *d\viewportY > *d\height Or *d\viewportW > (*d\width - *d\viewportX) Or *d\viewportH > (*d\height - *d\viewportY) Or (*d\viewportX * 256 + *d\viewportW * 128) > $3FFFFF Or (*d\viewportY * 256 + *d\viewportH * 128) > $3FFFFF
     ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
   EndIf
   If AnvilVkPipelineDynamicViewport(pipe) = 0 And (AnvilVkPipelineViewportWidth(pipe) <> *d\viewportW Or AnvilVkPipelineViewportHeight(pipe) <> *d\viewportH)
@@ -854,6 +857,16 @@ EndProcedure
 Procedure.i avkV3dDrawViewportHalfHeightFine(*d.AnvilVkBackendDraw)
   If *d = 0 Or *d\viewportH < 1 Or *d\viewportH > 32767 : ProcedureReturn 0 : EndIf
   ProcedureReturn *d\viewportH * 128
+EndProcedure
+
+Procedure.i avkV3dDrawViewportOffsetXFine(*d.AnvilVkBackendDraw)
+  If *d = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn *d\viewportX * 256 + avkV3dDrawViewportHalfWidthFine(*d)
+EndProcedure
+
+Procedure.i avkV3dDrawViewportOffsetYFine(*d.AnvilVkBackendDraw)
+  If *d = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn *d\viewportY * 256 + avkV3dDrawViewportHalfHeightFine(*d)
 EndProcedure
 
 Procedure.i avkV3dDrawViewportHalfWidthBits(*d.AnvilVkBackendDraw)
@@ -1402,11 +1415,11 @@ Procedure.i avkBackendSubmitDraw(*payload)
           clipX = sc\x : clipY = sc\y : clipW = sc\w : clipH = sc\h
           scissorTransitions = scissorTransitions + 1
         EndIf
-        If halfW <> avkV3dDrawViewportHalfWidthBits(*d) Or halfH <> avkV3dDrawViewportHalfHeightBits(*d) Or fineW <> avkV3dDrawViewportHalfWidthFine(*d) Or fineH <> avkV3dDrawViewportHalfHeightFine(*d)
+        If halfW <> avkV3dDrawViewportHalfWidthBits(*d) Or halfH <> avkV3dDrawViewportHalfHeightBits(*d) Or fineW <> avkV3dDrawViewportOffsetXFine(*d) Or fineH <> avkV3dDrawViewportOffsetYFine(*d)
           V3dClClipperXyScaling(avkV3dDrawViewportHalfWidthBits(*d), avkV3dDrawViewportHalfHeightBits(*d))
-          V3dClViewportOffset(avkV3dDrawViewportHalfWidthFine(*d), 0, avkV3dDrawViewportHalfHeightFine(*d), 0)
+          V3dClViewportOffset(avkV3dDrawViewportOffsetXFine(*d), 0, avkV3dDrawViewportOffsetYFine(*d), 0)
           halfW = avkV3dDrawViewportHalfWidthBits(*d) : halfH = avkV3dDrawViewportHalfHeightBits(*d)
-          fineW = avkV3dDrawViewportHalfWidthFine(*d) : fineH = avkV3dDrawViewportHalfHeightFine(*d)
+          fineW = avkV3dDrawViewportOffsetXFine(*d) : fineH = avkV3dDrawViewportOffsetYFine(*d)
           viewportTransitions = viewportTransitions + 1
         EndIf
         If blend <> *d\blendMode

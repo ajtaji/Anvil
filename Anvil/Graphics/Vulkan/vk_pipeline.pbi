@@ -1711,7 +1711,7 @@ Procedure.i avkPipeDynamicState(*ds.VkPipelineDynamicStateCreateInfo, *dynamicVi
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
-; The viewport is fixed or per draw, origin-zero and contained by the target.
+; The viewport is fixed or per draw, whole-pixel and contained by the target.
 ; The scissor is likewise static or dynamic. Vulkan ignores the corresponding
 ; pointer when state is dynamic, so null is legal in that case.
 Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynamicViewport.i, dynamicScissor.i)
@@ -1756,18 +1756,18 @@ Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynam
   If avkPipeViewW[pipe] < 1 Or avkPipeViewH[pipe] < 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose width or height is not a positive whole number of pixels (Anvil code -20005, unsupported viewport); the emitted coordinate shader scales clip space by half the viewport in whole pixels, so a fractional or a flipped viewport would not be carried out as asked.")
   EndIf
-  If avkPipeViewX[pipe] <> 0 Or avkPipeViewY[pipe] <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport that does not start at the origin (Anvil code -20005, unsupported viewport); this slice renders one viewport covering the whole render target.")
+  If avkPipeViewX[pipe] < 0 Or avkPipeViewY[pipe] < 0 Or avkPipeViewX[pipe] > 16383 Or avkPipeViewY[pipe] > 16383 Or (avkPipeViewX[pipe] * 256 + avkPipeViewW[pipe] * 128) > $3FFFFF Or (avkPipeViewY[pipe] * 256 + avkPipeViewH[pipe] * 128) > $3FFFFF
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose positive whole-pixel centre does not fit V3D's u14.8 offset field (Anvil code -20005, unsupported viewport); keep the viewport inside the render target and its centre below 16384 pixels.")
   EndIf
   If dynamicScissor = 0
     *sc = *vp\pScissors
-    If *sc\offset\x <> 0 Or *sc\offset\y <> 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a static scissor that does not start at the origin (Anvil code -20005, unsupported static scissor); use VK_DYNAMIC_STATE_SCISSOR for per-draw clipping.")
+    If *sc\offset\x <> avkPipeViewX[pipe] Or *sc\offset\y <> avkPipeViewY[pipe]
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a static scissor whose origin differs from the viewport (Anvil code -20005, unsupported static scissor); match the viewport or use VK_DYNAMIC_STATE_SCISSOR.")
     EndIf
     If (*sc\extent\width & $FFFFFFFF) <> avkPipeViewW[pipe] Or (*sc\extent\height & $FFFFFFFF) <> avkPipeViewH[pipe]
       ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a static scissor that is not the whole viewport (Anvil code -20005, unsupported static scissor); use VK_DYNAMIC_STATE_SCISSOR for per-draw clipping.")
     EndIf
-    avkPipeScissorX[pipe] = 0 : avkPipeScissorY[pipe] = 0
+    avkPipeScissorX[pipe] = avkPipeViewX[pipe] : avkPipeScissorY[pipe] = avkPipeViewY[pipe]
     avkPipeScissorW[pipe] = avkPipeViewW[pipe] : avkPipeScissorH[pipe] = avkPipeViewH[pipe]
   Else
     avkPipeScissorX[pipe] = 0 : avkPipeScissorY[pipe] = 0
@@ -2413,8 +2413,8 @@ Procedure AnvilVkCmdSetViewport(commandBuffer.i, firstViewport.i, viewportCount.
   y = avkIntFromF32Bits(PeekL(@*viewports\y) & $FFFFFFFF)
   w = avkIntFromF32Bits(PeekL(@*viewports\width) & $FFFFFFFF)
   h = avkIntFromF32Bits(PeekL(@*viewports\height) & $FFFFFFFF)
-  If x <> 0 Or y <> 0 Or w < 1 Or w > 32767 Or h < 1 Or h > 32767 Or (PeekL(@*viewports\minDepth) & $FFFFFFFF) <> 0 Or (PeekL(@*viewports\maxDepth) & $FFFFFFFF) <> $3F800000
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdSetViewport requires an origin-zero positive whole-pixel viewport no larger than 32767 with depth exactly zero through one (Anvil code -20005, unsupported viewport); fractional, flipped, translated and depth-remapped viewports are not implemented.")
+  If x < 0 Or y < 0 Or x > 16383 Or y > 16383 Or w < 1 Or w > 32767 Or h < 1 Or h > 32767 Or (x * 256 + w * 128) > $3FFFFF Or (y * 256 + h * 128) > $3FFFFF Or (PeekL(@*viewports\minDepth) & $FFFFFFFF) <> 0 Or (PeekL(@*viewports\maxDepth) & $FFFFFFFF) <> $3F800000
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdSetViewport requires a nonnegative whole-pixel viewport with a centre fitting V3D's u14.8 offset field and depth exactly zero through one (Anvil code -20005, unsupported viewport); fractional, flipped and depth-remapped viewports are not implemented.")
     ProcedureReturn
   EndIf
   avkCbViewportX[c] = x : avkCbViewportY[c] = y
@@ -2676,8 +2676,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     EndIf
     vx = avkCbViewportX[c] : vy = avkCbViewportY[c]
     vw = avkCbViewportW[c] : vh = avkCbViewportH[c]
-    If vw > avkFbW[fb] Or vh > avkFbH[fb]
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw used a dynamic viewport larger than the active framebuffer (Anvil code -20005, unsupported viewport); use an origin-zero whole-pixel viewport contained by the framebuffer.")
+    If vx > avkFbW[fb] Or vy > avkFbH[fb] Or vw > (avkFbW[fb] - vx) Or vh > (avkFbH[fb] - vy)
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw used a dynamic viewport outside the active framebuffer (Anvil code -20005, unsupported viewport); use a nonnegative whole-pixel rectangle contained by the framebuffer.")
       ProcedureReturn
     EndIf
   Else
@@ -2912,8 +2912,8 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     EndIf
     vx = avkCbViewportX[c] : vy = avkCbViewportY[c]
     vw = avkCbViewportW[c] : vh = avkCbViewportH[c]
-    If vw > avkFbW[fb] Or vh > avkFbH[fb]
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed used a dynamic viewport larger than the active framebuffer (Anvil code -20005, unsupported viewport); use an origin-zero whole-pixel viewport contained by the framebuffer.")
+    If vx > avkFbW[fb] Or vy > avkFbH[fb] Or vw > (avkFbW[fb] - vx) Or vh > (avkFbH[fb] - vy)
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed used a dynamic viewport outside the active framebuffer (Anvil code -20005, unsupported viewport); use a nonnegative whole-pixel rectangle contained by the framebuffer.")
       ProcedureReturn
     EndIf
   Else

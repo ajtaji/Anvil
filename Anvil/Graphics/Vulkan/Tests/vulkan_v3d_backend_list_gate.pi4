@@ -418,6 +418,22 @@ Procedure.i Main()
   draws[0]\maxVertex=2
   ResetObs() : rc=avkBackendSubmitDraw(@list)
   Put(134,rc) : Put(135,gateIndexed) : Put(136,gatePrim)
+
+  ; Translation changes the fine viewport centre and clip origin, not the
+  ; half-size scale. A rectangle crossing the attachment edge is atomic.
+  Fill(1,1) : draws[0]\viewportX=8 : draws[0]\viewportY=12
+  draws[0]\viewportW=32 : draws[0]\viewportH=32
+  draws[0]\scissorX=8 : draws[0]\scissorY=12
+  draws[0]\scissorW=32 : draws[0]\scissorH=32
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(137,rc) : Put(138,gateViewportScale) : Put(139,gateViewportOffset)
+  Put(140,gateScaleX) : Put(141,gateScaleY)
+  Put(142,gateOffsetX) : Put(143,gateOffsetY)
+  Put(144,gateClipX) : Put(145,gateClipY)
+  Put(146,gateClipW) : Put(147,gateClipH) : Put(148,gatePrim)
+  Fill(1,1) : draws[0]\viewportX=40 : draws[0]\viewportW=32
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(149,rc) : Put(150,gateBegin) : Put(151,gateAlloc)
   gateDynamicViewport=0
   ProcedureReturn #OUT
 EndProcedure
