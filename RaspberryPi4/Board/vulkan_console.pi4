@@ -354,6 +354,13 @@ Procedure.i VulkanConsoleStart()
     avcStartupFallback(#AVC_ERR_DISPLAY)
     ProcedureReturn #AVC_ERR_DISPLAY
   EndIf
+  If gDma = 0 Or DmaReady() = 0
+    gDma = ScreenDmaUp()
+  EndIf
+  If gDma = 0 Or DmaReady() = 0
+    avcStartupFallback(#AVC_ERR_PRESENT)
+    ProcedureReturn #AVC_ERR_PRESENT
+  EndIf
   rc = avcCreateTarget()
   If rc <> #AVC_OK
     avcError = rc
@@ -548,6 +555,25 @@ Procedure.i avcWarmGrid()
   ProcedureReturn rc
 EndProcedure
 
+; Copy one Vulkan-rendered rectangle with the display DMA channel. The source
+; was written by V3D and is already in DRAM after the completed queue submit;
+; cleaning its CPU alias could write stale cache lines over those GPU pixels.
+; The destination may contain CPU-painted banner or keyboard pixels, so evict
+; its cache lines on both sides of the bus-master write.
+Procedure.i avcDmaCopyRect(dst.i, dstPitch.i, src.i, srcPitch.i, x.i, y.i, w.i, h.i)
+  Define d.i, s.i, rowBytes.i
+  If w <= 0 Or h <= 0 : ProcedureReturn 1 : EndIf
+  rowBytes = w * 4
+  d = dst + y * dstPitch + x * 4
+  s = src + y * srcPitch + x * 4
+  DmaCacheRect(d, dstPitch, rowBytes, h)
+  If DmaCopy2D(d, dstPitch, s, srcPitch, rowBytes, h) = 0
+    ProcedureReturn 0
+  EndIf
+  DmaCacheRect(d, dstPitch, rowBytes, h)
+  ProcedureReturn 1
+EndProcedure
+
 ; Copy the physical Vulkan raster into the established display draw surface.
 ; The source already has the physical orientation selected by Chrome's rebind.
 ; Leave the existing banner rectangle untouched, then use the display layer's
@@ -555,7 +581,8 @@ EndProcedure
 Procedure.i avcCopyToDisplay()
   Define dst.i, dstPitch.i, width.i, height.i, bx.i, by.i, bw.i, bh.i, rotation.i
   Define keepKeyboard.i, keyboardY0.i, keyboardY1.i
-  Define row.i, leftBytes.i, rightBytes.i, srcRow.i, dstRow.i
+  Define topEnd.i, bottomStart.i
+  Define keyboardX.i, keyboardY.i, keyboardW.i, keyboardH.i, bytes.i
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
   width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
@@ -574,43 +601,73 @@ Procedure.i avcCopyToDisplay()
     bx = width - LogoHeight() : by = 0 : bw = LogoHeight() : bh = height
   ElseIf rotation = 270
     bx = 0 : by = 0 : bw = LogoHeight() : bh = height
-  ElseIf gScrSrc = #SCR_SRC_DSI And gScrRot = 180
-    ; The HVS applies the 180-degree mirror after this physical buffer, so
-    ; its logical top banner is the bottom physical strip in this source.
-    bx = 0 : by = height - LogoHeight() : bw = width : bh = LogoHeight()
   EndIf
   If bx < 0 Or by < 0 Or bw < 0 Or bh < 0 Or bx + bw > width Or by + bh > height
     ProcedureReturn 0
   EndIf
-  For row = 0 To height - 1
-    srcRow = avcImageBase + row * avcImagePitch
-    dstRow = dst + row * dstPitch
-    ; HDMI presents in place at rotation zero, so leave the existing CPU
-    ; keyboard band untouched while replacing the GPU-composed rows. DSI
-    ; copies to MON_FB_DRAW and restores the band from the presented front
-    ; below through the display layer's canonical rotation transform.
-    If gScrSrc = #SCR_SRC_HDMI And rotation = 0 And keepKeyboard <> 0 And row >= keyboardY0 And row <= keyboardY1
-      Continue
-    ElseIf gScrSrc = #SCR_SRC_DSI Or row < by Or row >= by + bh
-      DspCopyUp(dstRow, srcRow, width * 4)
-    Else
-      leftBytes = bx * 4
-      rightBytes = (width - bx - bw) * 4
-      If leftBytes > 0 : DspCopyUp(dstRow, srcRow, leftBytes) : EndIf
-      If rightBytes > 0 : DspCopyUp(dstRow + (bx + bw) * 4, srcRow + (bx + bw) * 4, rightBytes) : EndIf
-    EndIf
-  Next
-  ; MON_FB_DRAW may still contain the CPU logical banner from before the
-  ; first Vulkan frame. Restore the physical, rotation-correct banner just
-  ; as the V3D painter does before presenting this DSI surface.
+  If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
   If gScrSrc = #SCR_SRC_DSI
-    If ScrGpuKeepBanner(dst) = 0 : ProcedureReturn 0 : EndIf
+    ; The established present path restores the transformed banner and
+    ; keyboard from scanout after this complete physical-frame copy.
+    If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, 0, 0, width, height) = 0
+      ProcedureReturn 0
+    EndIf
+  ElseIf rotation = 0
+    ; HDMI scans the destination in place. Preserve its CPU keyboard band
+    ; and top banner by submitting only the remaining full-width spans.
+    topEnd = by + bh
+    If keepKeyboard <> 0
+      If keyboardY0 > topEnd
+        If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, 0, topEnd, width, keyboardY0 - topEnd) = 0
+          ProcedureReturn 0
+        EndIf
+      EndIf
+      bottomStart = keyboardY1 + 1
+      If bottomStart < topEnd : bottomStart = topEnd : EndIf
+    Else
+      bottomStart = topEnd
+    EndIf
+    If bottomStart < height
+      If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, 0, bottomStart, width, height - bottomStart) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
+  Else
+    ProcedureReturn 0
   EndIf
-  If gScrSrc = #SCR_SRC_DSI And keepKeyboard <> 0
-    V3dConKeepKeyboardBand(dst)
+  ; DSI's front contains the correctly transformed CPU banner and keyboard.
+  ; Restore their physical rectangles with DMA before the full-frame present.
+  If gScrSrc = #SCR_SRC_DSI
+    If avcDmaCopyRect(dst, dstPitch, #MON_FB_SCAN, dstPitch, bx, by, bw, bh) = 0
+      ProcedureReturn 0
+    EndIf
+    If keepKeyboard <> 0
+      keyboardX = 0 : keyboardY = keyboardY0
+      keyboardW = width : keyboardH = keyboardY1 - keyboardY0 + 1
+      If rotation = 90
+        keyboardX = width - keyboardY1 - 1 : keyboardY = 0
+        keyboardW = keyboardY1 - keyboardY0 + 1 : keyboardH = height
+      ElseIf rotation = 270
+        keyboardX = keyboardY0 : keyboardY = 0
+        keyboardW = keyboardY1 - keyboardY0 + 1 : keyboardH = height
+      EndIf
+      If keyboardX < 0 Or keyboardY < 0 Or keyboardW < 1 Or keyboardH < 1 Or keyboardX + keyboardW > width Or keyboardY + keyboardH > height
+        ProcedureReturn 0
+      EndIf
+      If avcDmaCopyRect(dst, dstPitch, #MON_FB_SCAN, dstPitch, keyboardX, keyboardY, keyboardW, keyboardH) = 0
+        ProcedureReturn 0
+      EndIf
+    EndIf
   EndIf
-  MmuCleanRange(dst, dstPitch * height)
-  ProcedureReturn ScrGpuPresent(dst, ScrGpuBytes())
+  bytes = ScrGpuBytes()
+  MmuCleanRange(dst, bytes)
+  If gScrSrc = #SCR_SRC_DSI
+    ScrDsiWaitFrameStart()
+    DmaCacheRange(#MON_FB_SCAN, bytes)
+    If DmaCopy(#MON_FB_SCAN, dst, bytes) = 0 : ProcedureReturn 0 : EndIf
+    DmaCacheRange(#MON_FB_SCAN, bytes)
+  EndIf
+  ProcedureReturn 1
 EndProcedure
 
 Procedure VulkanConsolePump()
