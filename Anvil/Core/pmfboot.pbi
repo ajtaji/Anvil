@@ -75,7 +75,7 @@
 ;
 ;     96      4    arch      compiler architecture ID: 1 = AArch64
 ;    100      4    target    compiler target ID: BCM2837=2837,
-;                            BCM2711=2711, QCM2290=2290
+;                            BCM2711=2711, BCM2712=2712, QCM2290=2290
 ;    104      8    stack     initial stack top compiled into the image
 ;    112     16    reserved  written 0 and required 0 on read
 ;    ------  ----  ---------------------------------------------------
@@ -215,6 +215,7 @@
 #PMF_ARCH_AARCH64  = 1
 #PMF_TARGET_BCM2837 = 2837
 #PMF_TARGET_BCM2711 = 2711
+#PMF_TARGET_BCM2712 = 2712
 #PMF_TARGET_QCM2290 = 2290
 
 ; Field offsets. Named, so a reader can check each against the table in
@@ -512,6 +513,14 @@ Procedure.i PmfCheckV2Metadata()
     Case #PMF_TARGET_QCM2290
       knownTarget = 1
   EndSelect
+  ; BCM2712 is a known target only to a monitor built for it (-t pi5). A
+  ; -t pi4 monitor calls it unknown, and a -t pi5 monitor refuses a 2711
+  ; image at the HwPmfTargetId() comparison below - both directions refused.
+  CompilerIf #PMF_CHIP = 2712
+    If gPmfTarget = #PMF_TARGET_BCM2712
+      knownTarget = 1
+    EndIf
+  CompilerEndIf
   If knownTarget = 0
     Print("!! this version-2 container names unknown target ID ")
     PrintDec(gPmfTarget)

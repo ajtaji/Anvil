@@ -531,13 +531,30 @@ EnableExplicit
 ; ----------------------------------------------------------------------
 ; The controller. $100 bytes, per the dtsi reg property.
 ; ----------------------------------------------------------------------
-; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
-; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
-; range, so with the MMU off an access that ever got past this driver's
-; refusal would take an address-size fault that Anvil reports - never a
-; silent write somewhere else. The Pi 5's card is the BCM2712 SDHCI; #CAP_STORAGE is 0 and the boot skips the card.
+; BCM2712 (-t pi5, #PMF_CHIP = 2712): THE SAME SDHCI-CLASS HOST. The Pi 5's
+; micro-SD slot is /soc@107c000000/mmc@fff000, compatible
+; "brcm,bcm2712-sdhci", reg = <0xfff000 0x260>, <0xfff400 0x200>; /soc's
+; ranges put bus 0 at $10_00000000 (all three pinned firmware DTBs agree,
+; RaspberryPi5/Boot/dtb_contract.py). The second window is Broadcom's "cfg"
+; block (sdhci-brcmstb.c:37-51): SD_PIN_SEL and the card-detect test bits.
+; Every Pi 5 difference in this file is under #PMF_CHIP = 2712 and cites
+; its source: this base, the cfg window, the fixed 200 MHz base clock, the
+; clock-stop + SD_PIN_SEL in sd_SetClock, the cfg card-present override
+; in SdInit, and the version ceiling. Everything else is the Pi 4 driver.
+; Not yet run on BCM2712 silicon.
 CompilerIf #PMF_CHIP = 2712
-  #SD_BASE = $DEAD00000000
+  #SD_BASE = $1000FFF000
+  #SD_CFG  = $1000FFF400
+  #SD_CFG_CTRL             = $00        ; sdhci-brcmstb.c:40 SDIO_CFG_CTRL
+  #SD_CFG_CTRL_TEST_EN     = $80000000  ; :41 bit 31 SDCD_N_TEST_EN
+  #SD_CFG_CTRL_TEST_LEV    = $40000000  ; :42 bit 30 SDCD_N_TEST_LEV
+  #SD_CFG_SD_PIN_SEL       = $44        ; :44 SDIO_CFG_SD_PIN_SEL
+  #SD_CFG_SD_PIN_SEL_MASK  = $3         ; :45 bits 1:0
+  #SD_CFG_SD_PIN_SEL_SD    = $2         ; :46 BIT(1), SD (not eMMC/HS) timings
+  ; The base clock is FIXED: mmc@fff000's clock is /clocks/clk-emmc2,
+  ; clock-frequency = <200000000> in the pinned DTBs. Capabilities is not
+  ; asked; SdSetBaseClockKhz() can still override it.
+  #SD_BASECLK_2712_KHZ     = 200000
 CompilerElse
 #SD_BASE = $FE340000
 CompilerEndIf
@@ -999,6 +1016,17 @@ Procedure sd_Wr(off.i, v.i)
   PokeL(#SD_BASE + off, v)
 EndProcedure
 
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the cfg window beside the host - same idiom as sd_Rd/sd_Wr.
+  Procedure.i sd_RdCfg(off.i)
+    ProcedureReturn PeekN(#SD_CFG + off) & $FFFFFFFF
+  EndProcedure
+
+  Procedure sd_WrCfg(off.i, v.i)
+    PokeL(#SD_CFG + off, v)
+  EndProcedure
+CompilerEndIf
+
 ; ======================================================================
 ;  Failure bookkeeping. One place, so every refusal captures the same
 ;  three things: which error, what the controller's INTERRUPT word said,
@@ -1058,9 +1086,18 @@ Procedure.i sd_ControllerPlausible()
   EndIf
   sd_ver    = (v >> 16) & $FF
   sd_vendor = (v >> 24) & $FF
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: the Host Controller Version field runs one step further on
+    ; this part's newer SDHCI (3 = 4.00, 4 = 4.10, 5 = 4.20), so the
+    ; plausibility ceiling is 5. The raw value stays in sd_ver.
+    If sd_ver > 5
+      ProcedureReturn sd_Fail(#SD_ERR_BAD_VERSION)
+    EndIf
+  CompilerElse
   If sd_ver > 4
     ProcedureReturn sd_Fail(#SD_ERR_BAD_VERSION)
   EndIf
+  CompilerEndIf
 
   c = sd_Rd(#SD_CAPS0)
   If c = 0 Or c = $FFFFFFFF
@@ -1090,6 +1127,9 @@ Procedure.i sd_BaseClockKhz()
     ProcedureReturn sd_userBase
   EndIf
 
+  CompilerIf #PMF_CHIP = 2712
+    ProcedureReturn #SD_BASECLK_2712_KHZ   ; BCM2712: DT-fixed, see #SD_BASE
+  CompilerEndIf
   If sd_ver >= 2
     mhz = (sd_caps0 >> 8) & $FF     ; 3.00 and later: 8-bit field
   Else
@@ -1170,9 +1210,20 @@ Procedure.i sd_SetClock(wantKhz.i)
     sd_clkKhz = sd_baseKhz / (2 * n)
   EndIf
 
+  CompilerIf #PMF_CHIP = 2712
+    ; 1 - BCM2712: sdhci_bcm2712_set_clock (sdhci-brcmstb.c:155-189) zeroes
+    ;     the WHOLE 16-bit Clock Control half first (:165), then selects the
+    ;     SD personality in cfg SD_PIN_SEL (:176-182). Every rate this driver
+    ;     asks for is below HS, so it is always SD, never MMC.
+    c1 = sd_Rd(#SD_CONTROL1) & $FFFF0000
+    sd_Wr(#SD_CONTROL1, c1)
+    c1 = sd_RdCfg(#SD_CFG_SD_PIN_SEL) & (~#SD_CFG_SD_PIN_SEL_MASK)
+    sd_WrCfg(#SD_CFG_SD_PIN_SEL, c1 | #SD_CFG_SD_PIN_SEL_SD)
+  CompilerElse
   ; 1 - stop the SD clock, keeping the internal clock and the timeout.
   c1 = sd_Rd(#SD_CONTROL1) & $FFFFFFFB      ; clear bit 2 only
   sd_Wr(#SD_CONTROL1, c1)
+  CompilerEndIf
 
   ; 2 - divisor, timeout, internal clock enable. Clock Generator Select
   ;     stays 0: Divided Clock Mode, which is the mode the arithmetic in
@@ -1660,6 +1711,13 @@ Procedure.i SdInit()
   ; 1-bit bus. 4-bit is on the deliberately-left-out list.
   c0 = c0 & $FFFFFFFD
   sd_Wr(#SD_CONTROL0, c0)
+  CompilerIf #PMF_CHIP = 2712
+    ; BCM2712: the Broadcom cfg block's OWN forced card presence,
+    ; sdhci_brcmstb_cfginit_2712 (sdhci-brcmstb.c:283-290): TEST_LEV (bit 30)
+    ; to 0 and TEST_EN (bit 31) to 1 - active-low SDCD_N held "present".
+    c0 = sd_RdCfg(#SD_CFG_CTRL) & (~#SD_CFG_CTRL_TEST_LEV)
+    sd_WrCfg(#SD_CFG_CTRL, c0 | #SD_CFG_CTRL_TEST_EN)
+  CompilerEndIf
   ; [PHYS] asks for a settling time after the supply is enabled. 1 ms is
   ; far more than the ramp of a rail that, on this board, was already up.
   sd_DelayUs(1000)

@@ -329,11 +329,40 @@ Procedure.i StorageUp()
     ProcedureReturn 1
   EndIf
   CompilerIf #PMF_CHIP = 2712
-  ; BCM2712: neither medium this procedure knows is the Pi 5's - USB is
-  ; RP1's and the card is on the BCM2712 SD host - so nothing is mounted.
-  PrintN("!! no storage on this Raspberry Pi 5 build yet: its USB is RP1's and its")
-  PrintN("   card is on the BCM2712 SD host, and neither has a driver here.")
-  ProcedureReturn 0
+    ; BCM2712: THE CARD ONLY, AND WRITABLE. USB mass storage is not wired on
+    ; the Pi 5 in this composition (#CAP_USB is 0), so the card is the one
+    ; medium, and `save` and settings save need it to take writes: its
+    ; writer is emmc.pi4's SdWriteBlocks, the same single-block CMD24 path
+    ; the Pi 4's raw `mmc write` uses. No SdSetBaseClockKhz here - the
+    ; 2712 base clock is the DTB's fixed 200 MHz (emmc.pi4).
+    MonPhaseMark(#BPH_STORAGE | 5)
+    If gSdUp = 0
+      If SdInit() = 0
+        PrintN("!! no usable SD card, so no medium came up and no file can be read or")
+        PrintN("   written. Check that a card is seated in the slot.")
+        Print("   The card slot said: ")
+        UartWriteStr(SdErrorText())   ; a POINTER - never Print/PrintN it
+        PrintNl()
+        ProcedureReturn 0
+      EndIf
+      gSdUp = 1
+    EndIf
+    FsSetRangeReader(@SdReadBlocks)
+    If storage_MountAny("SD card") = 0
+      PrintN("!! the SD card is readable but none of its four partitions could be")
+      PrintN("   mounted, so no file on it can be opened.")
+      Print("   The last partition tried said: ")
+      UartWriteStr(FsErrorText())
+      PrintNl()
+      ProcedureReturn 0
+    EndIf
+    gMedium = 2
+    gFatUp = 1
+    gHwFileWritable = 1
+    gHwFileMounted  = 1
+    gHwFileWriter   = @SdWriteBlocks
+    PrintN("Mounted the SD card. Files will be read from and written to this.")
+    ProcedureReturn 1
   CompilerEndIf
 
   ; THE BOOT TRAIL (forum 880) marks each step of the mount as well as the
