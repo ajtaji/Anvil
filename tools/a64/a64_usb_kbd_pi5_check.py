@@ -423,14 +423,12 @@ def run(img, scenario, budget=60_000_000):
     if ms > BOUND_MS[scenario]:
         fails.append(f"UsbEnumerate took {ms} ms of modelled time, bound {BOUND_MS[scenario]}")
     if scenario == "kbd":
-        # XhciLastError is 30 (#XHCI_ERR_ARG) after a walk that met the
-        # SuperSpeed stick: HidAttach hands its bMaxPacketSize0, 9 (2^9 on
-        # SuperSpeed), to XhciSetEp0MaxPacket, which refuses it. Harmless to
-        # the walk, and the same on the Pi 4 - vault open bug 2026-09-27.
-        # Pinned so that fixing it changes this line on purpose.
-        if [enum_ok, perr, xerr, has_kbd, vbus] != [1, 0, 30, 1, 1]:
+        # XhciLastError is 0 after a walk that met the SuperSpeed stick. It
+        # was 30 (#XHCI_ERR_ARG) until 2026-09-27: HidAttach handed the
+        # stick's bMaxPacketSize0 exponent (9) to XhciSetEp0MaxPacket.
+        if [enum_ok, perr, xerr, has_kbd, vbus] != [1, 0, 0, 1, 1]:
             fails.append(f"kbd: enumerate/pcie/xhci/keyboard/vbus = "
-                         f"{[enum_ok, perr, xerr, has_kbd, vbus]}, want [1, 0, 30, 1, 1]")
+                         f"{[enum_ok, perr, xerr, has_kbd, vbus]}, want [1, 0, 0, 1, 1]")
         served = kb.served
         if len(served) < POLLS:
             fails.append(f"kbd: the keyboard served {len(served)} boot reports, "

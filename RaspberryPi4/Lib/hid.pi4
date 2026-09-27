@@ -1461,8 +1461,15 @@ Procedure.i HidAttach(slot.i, want.i, skipIface.i)
   ; A failure here is NOT fatal. A device that will not answer eight
   ; bytes will fail the configuration read below and be reported there,
   ; with an error that says more than this one could.
+  ;
+  ; NOT ON SUPERSPEED. There byte 7 is an EXPONENT (9 = 2^9 = 512, USB 3.2
+  ; section 9.6.1) and the controller already holds 512 from Address
+  ; Device (xh_MaxPacketFor). Handing the 9 to XhciSetEp0MaxPacket got it
+  ; refused as it should be - and left XhciLastError() = #XHCI_ERR_ARG
+  ; after a walk that had succeeded, an argument fault that never
+  ; happened (vault open bug 2026-09-27, found by a64_usb_kbd_pi5_check).
   n = XhciGetDescriptor(#HID_DT_DEVICE, 0, 0, 8)
-  If n >= 8
+  If n >= 8 And XhciSlotSpeed() <> #XHCI_SPEED_SUPER
     XhciSetEp0MaxPacket(PeekA(XhciBounceAddr() + 7))
   EndIf
 
