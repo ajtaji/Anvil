@@ -10,17 +10,19 @@
 ;        +8  the device tree (what the board keeps as gBootDtb)
 ;       +16  firmware bytes at #FW, +20 NVRAM bytes at #NV, +24 CLM at #CLM
 ;
-;   #OUT +0 SdioSetPinctrlFromDtb  +4 SdioPinctrlDtbResult  +8 SdioInit
+;   #OUT +0 SdioSetPinctrl's answer  +4 the stepping read (1 C0, 2 D0,
+;           -1 no tree, -2 neither compatible)  +8 SdioInit
 ;       +12 SdioLastError  +16 SdioEnableFunction(1)  +20 Cyw43Attach
 ;       +24 Cyw43ChipId    +28 Cyw43PrepareDownload   +32 Cyw43UploadFirmware
 ;       +36 Cyw43UploadNvram +40 Cyw43Start  +44 Cyw43HtClock
 ;       +48 Cyw43AnnounceHost +52 SdioEnableFunction(2)
 ;       +56 Cyw43WifiUp (0 is success)  +60 Cyw43ErrorText's code
-;       +64 $600DF00D, written last
+;       +64 $600DF00D, written last  +68 SdioPinctrl() after the stepping
 ;
 ;   pmfc wifi2712_probe.pi5 -t pi5 --load-addr 0x400000 \
 ;        --stack-addr 0x3000000 --entry-returns -o wifi2712.img
 
+XIncludeFile "Anvil/Core/fdt.pbi"
 XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
 XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
 XIncludeFile "Anvil/Net/cyw43.pbi"
@@ -37,11 +39,32 @@ XIncludeFile "Anvil/Net/cyw43.pbi"
 
 Define sc.i
 Define r.i
+Define dtb.i
+Define step.i
 
+; THE STEPPING, taken exactly the way RaspberryPi4/Board/board.pi4's
+; Pi5DtbApply takes it (Anvil 319729b): the tree checked by the ONE reader,
+; Anvil/Core/fdt.pbi, with the same bound; "brcm,bcm2712c0-pinctrl" found ->
+; C0, else "brcm,bcm2712d0-pinctrl" -> D0, else SdioSetPinctrl is not
+; called. Pi5DtbApply lives in board.pi4, which a fixture cannot include,
+; so these lines restate it; keep them equal to it.
 sc = PeekN(#CTL)
-r = SdioSetPinctrlFromDtb(PeekN(#CTL + 8) | (PeekN(#CTL + 12) << 32))
+dtb = PeekN(#CTL + 8) | (PeekN(#CTL + 12) << 32)
+r = 0
+step = -1
+If dtb > 0 And FdtCheck(dtb, $100000) = #FDT_OK
+  step = -2
+  If FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0) <> 0
+    step = 1
+    r = SdioSetPinctrl(#SDIO_PINCTRL_C0)
+  ElseIf FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0) <> 0
+    step = 2
+    r = SdioSetPinctrl(#SDIO_PINCTRL_D0)
+  EndIf
+EndIf
 PokeL(#OUT + 0, r)
-PokeL(#OUT + 4, SdioPinctrlDtbResult())
+PokeL(#OUT + 4, step)
+PokeL(#OUT + 68, SdioPinctrl())
 If sc = 1 And r = 1
   SdioSetBaseClockKhz(#SDIO_2712_DTB_BASE_KHZ)
   r = SdioInit()

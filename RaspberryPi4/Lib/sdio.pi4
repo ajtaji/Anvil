@@ -124,9 +124,10 @@
 ;             D0 ("brcm,bcm2712d0-pinctrl"): GPIO_REGS lines 317-324,
 ;                BRCMSTB_PIN lines 613-618 - sd2 is fsel 1 on all six
 ;           so the BOARD must say which, SdioSetPinctrl(#SDIO_PINCTRL_C0 /
-;           #SDIO_PINCTRL_D0), from the live DTB's pinctrl@7d504100
-;           compatible - SdioSetPinctrlFromDtb(gBootDtb) does exactly that
-;           - and SdioInit / SdioAssertWlOn REFUSE without it
+;           #SDIO_PINCTRL_D0), from the live DTB's pinctrl compatible, read
+;           through the one shared reader Anvil/Core/fdt.pbi (the board's
+;           Pi5DtbApply) - this file reads no device tree - and SdioInit /
+;           SdioAssertWlOn REFUSE without it
 ;           (#SDIO_ERR_PINCTRL). Guessing is a one-in-two chance of
 ;           putting six pins on MTSIF. NOTE: the pinned
 ;           bcm2712-d-rpi-5-b.dtb labels pinctrl@7d504100
@@ -1888,114 +1889,6 @@ EndProcedure
 
 Procedure.i SdioPinctrl()
   ProcedureReturn sdio_pinctrl
-EndProcedure
-
-; ----------------------------------------------------------------------
-;  SdioSetPinctrlFromDtb(dtb) - PUBLIC, BCM2712 only. The stepping from the
-;  LIVE device tree the firmware handed the kernel image in x0 (the board
-;  keeps it as gBootDtb). Returns what SdioSetPinctrl returned, or 0.
-;
-;  THE CALLER PASSES A TREE IT HAS ALREADY RECOGNISED - the board's
-;  gBootDtb, whose magic the boot path checks. Recognising a device tree
-;  (its magic) is Anvil/Core/boot_cmd.pbi's, and the shared FDT reader's
-;  once it lands (layering rule 3); this file does not repeat it. What it
-;  does check, so a wrong pointer cannot send the search off the end of
-;  memory: the header's totalsize (+4), off_dt_struct (+8) and
-;  size_dt_struct (+36), big-endian (Devicetree Specification v0.4 5.2),
-;  bounded to 4 MiB and to each other. A pointer at something else then
-;  finds neither string and is refused (-2).
-;
-;  WHAT IT SEARCHES. The structure block, for
-;  the two compatible strings pinctrl-brcmstb-bcm2712.c matches
-;  (bcm2712_pinctrl_match): "brcm,bcm2712c0-pinctrl" and
-;  "brcm,bcm2712d0-pinctrl", each a whole NUL-terminated string that starts
-;  a property value (4-byte aligned) or follows the NUL of the string
-;  before it. Exactly one of the two present -> that stepping. Neither, or
-;  both -> refused, sdio_pinctrlDtb says which, nothing is set. The pinned
-;  bcm2712-d-rpi-5-b.dtb labels pinctrl@7d504100 "brcm,bcm2712c0-aon-
-;  pinctrl" and so has neither: refused, as it must be.
-;
-;  TODO(fdt.pbi): replace the string search with a node lookup of
-;  /soc@107c000000/pinctrl@7d504100's compatible once Anvil's shared FDT
-;  reader lands (the GPU/MMU/GIC lane, aeafd728ed01250be). The search can
-;  only be fooled by a tree that names the main pinctrl compatible on some
-;  OTHER node, which none of the three pinned trees does.
-; ----------------------------------------------------------------------
-Global sdio_pinctrlDtb.i = 0   ; 1 C0, 2 D0, -1 no tree, -2 neither, -3 both
-
-Procedure.i sdio_Be32(a.i)
-  ProcedureReturn (PeekA(a) << 24) | (PeekA(a + 1) << 16) | (PeekA(a + 2) << 8) | PeekA(a + 3)
-EndProcedure
-
-; How many times the NUL-terminated string at *s appears in [lo, hi) as a
-; whole string value (see above).
-Procedure.i sdio_DtbCount(lo.i, hi.i, *s)
-  Define n.i
-  Define p.i
-  Define i.i
-  Define c0.i
-  Define hits.i
-  n = 0
-  While PeekA(*s + n) <> 0
-    n = n + 1
-  Wend
-  c0 = PeekA(*s)
-  hits = 0
-  p = lo
-  While (p + n) < hi
-    If PeekA(p) = c0
-      If ((p - lo) & 3) = 0 Or PeekA(p - 1) = 0
-        i = 1
-        While i < n And PeekA(p + i) = PeekA(*s + i)
-          i = i + 1
-        Wend
-        If i = n And PeekA(p + n) = 0
-          hits = hits + 1
-        EndIf
-      EndIf
-    EndIf
-    p = p + 1
-  Wend
-  ProcedureReturn hits
-EndProcedure
-
-Procedure.i SdioSetPinctrlFromDtb(dtb.i)
-  Define total.i
-  Define off.i
-  Define size.i
-  Define c0.i
-  Define d0.i
-  sdio_pinctrl = #SDIO_PINCTRL_UNKNOWN
-  sdio_pinctrlDtb = -1
-  If dtb <= 0 Or (dtb & 3) <> 0
-    ProcedureReturn 0
-  EndIf
-  total = sdio_Be32(dtb + 4)
-  off = sdio_Be32(dtb + 8)
-  size = sdio_Be32(dtb + 36)
-  If total < 40 Or total > $400000 Or off < 40 Or (off + size) > total
-    ProcedureReturn 0
-  EndIf
-  c0 = sdio_DtbCount(dtb + off, dtb + off + size, "brcm,bcm2712c0-pinctrl")
-  d0 = sdio_DtbCount(dtb + off, dtb + off + size, "brcm,bcm2712d0-pinctrl")
-  If c0 > 0 And d0 = 0
-    sdio_pinctrlDtb = 1
-    ProcedureReturn SdioSetPinctrl(#SDIO_PINCTRL_C0)
-  EndIf
-  If d0 > 0 And c0 = 0
-    sdio_pinctrlDtb = 2
-    ProcedureReturn SdioSetPinctrl(#SDIO_PINCTRL_D0)
-  EndIf
-  If c0 > 0
-    sdio_pinctrlDtb = -3
-  Else
-    sdio_pinctrlDtb = -2
-  EndIf
-  ProcedureReturn 0
-EndProcedure
-
-Procedure.i SdioPinctrlDtbResult()
-  ProcedureReturn sdio_pinctrlDtb
 EndProcedure
 
 Procedure.i SdioCfgCtrl()
