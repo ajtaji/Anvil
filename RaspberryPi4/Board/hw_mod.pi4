@@ -123,8 +123,17 @@ EndProcedure
 ;  processor address is $FD5D2000 and not $FE5D2000. Getting that wrong
 ;  reads a different peripheral, and the validity bits in the register
 ;  are what would catch it.
+;
+;  BCM2712 (-t pi5, #PMF_CHIP = 2712): avs-monitor@7d542000
+;  (bcm2712-ds.dtsi), same compatible, through the /soc ranges to
+;  $10_7D54_2000 - the translation that puts the PL011 at $107D001000
+;  (vault Raspberry Pi 5/HARDWARE-BRINGUP.md).
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+#HWDEV_AVS_MONITOR = $107D542000
+CompilerElse
 #HWDEV_AVS_MONITOR = $FD5D2000
+CompilerEndIf
 
 Procedure.i HwDevCount()
   ProcedureReturn 1

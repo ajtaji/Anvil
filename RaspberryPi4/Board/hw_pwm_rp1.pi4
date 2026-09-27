@@ -1,0 +1,202 @@
+; ======================================================================
+;  hw_pwm_rp1.pi4 - the Raspberry Pi 5 HwPwm* and HwTemp* backend: the
+;  thin board half of the seam declared in Anvil/Hal/hal.pbi, over
+;  RaspberryPi4/Lib/rp1_pwm.pi4 (RP1 PWM1 channel 3 + the tach) and
+;  RaspberryPi4/Lib/thermal.pi4 (the temperature, shared with the Pi 4).
+;
+;  It is the -t pi5 counterpart of RaspberryPi4/Board/hw_pwm.pi4, and the
+;  two are separate files for the reason rp1_pwm.pi4's header gives: the
+;  PWM blocks underneath share no register. The fan POLICY above both is
+;  one file (Anvil/Core/fan.pbi) and one command (Anvil/Core/fan_cmd.pbi).
+;
+;  WHAT THE BOARD KNOWS THAT THE Pi 4 DID NOT: WHERE THE FAN IS. The Pi 5
+;  has a fan connector, and its device tree names the line: FAN_PWM on
+;  RP1 GPIO45, FAN_TACH on RP1 GPIO29 (bcm2712-rpi-5-b.dts). So there is
+;  exactly one pin, it is the default, and there is no software channel -
+;  the 40-pin header's GPIOs are not offered for a fan here.
+;
+;  THE FREQUENCY IS THE DEVICE TREE'S 41566 ns PERIOD, as hertz because
+;  the seam speaks hertz: 1e9 / 41566 = 24058 Hz, which rp1_pwm.pi4 turns
+;  back into exactly 41566 ns and RANGE 2078 (checked by the desk gate).
+;
+;  THE TEMPERATURE comes through thermal.pi4 unchanged: the thermal seam
+;  when a THERMAL.MOD fills it (RaspberryPi4/Modules/thermal_avs.pi4, now
+;  with the BCM2712 coefficients under #PMF_CHIP = 2712), the firmware
+;  mailbox otherwise. The three wrappers below are the Pi 4 file's.
+;
+;  INCLUDE ORDER (house rule 10): timer.pi4, mailbox.pi4, the seam
+;  registry, thermal.pi4, rp1_pwm.pi4, Anvil/Hal/hal.pbi, then this file.
+;  RaspberryPi4/Board/board.pi4 owns the include: under #PMF_CHIP = 2712
+;  it takes Lib/rp1_pwm.pi4 and this file where -t pi4 takes Lib/pwm.pi4
+;  and Board/hw_pwm.pi4 (vault Raspberry Pi 5/HARDWARE-BRINGUP.md, "Pi 5
+;  fan - desk proof").
+;
+;  NOT VERIFIED ON A Pi 5. Silicon owed.
+; ======================================================================
+
+#PI5_FAN_PIN = #RP1PWM_FAN_GPIO    ; 45, FAN_PWM
+#PI5_FAN_HZ  = 24058               ; 1e9 / 41566 ns (cooling_fan pwms)
+
+Procedure.i Pi5PwmMapCode(c.i)
+  Select c
+    Case #RP1PWM_OK
+      ProcedureReturn #HW_PWM_OK
+    Case #RP1PWM_ERR_HZ
+      ProcedureReturn #HW_PWM_HZ
+    Case #RP1PWM_ERR_DUTY
+      ProcedureReturn #HW_PWM_DUTY
+    Case #RP1PWM_ERR_STATE
+      ProcedureReturn #HW_PWM_STATE
+    Case #RP1PWM_ERR_CLOCK
+      ProcedureReturn #HW_PWM_BUSY
+    Case #RP1PWM_ERR_START
+      ProcedureReturn #HW_PWM_BUSY
+  EndSelect
+  ; An unmapped code is a backend bug; never let it pass as success.
+  ProcedureReturn #HW_PWM_BUSY
+EndProcedure
+
+Procedure.i HwPwmPinCount()
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPwmPinAt(i.i)
+  If i = 0
+    ProcedureReturn #PI5_FAN_PIN
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmPinIsHard(pin.i)
+  If pin = #PI5_FAN_PIN
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmDefaultPin()
+  ProcedureReturn #PI5_FAN_PIN
+EndProcedure
+
+Procedure.i HwPwmHzDefault()
+  ProcedureReturn #PI5_FAN_HZ
+EndProcedure
+
+Procedure.i HwPwmHzMin(pin.i)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwPwmHzMax(pin.i)
+  ProcedureReturn #RP1PWM_CLK_HZ / #RP1PWM_RANGE_MIN
+EndProcedure
+
+; No pin on this list is shared with anything else - GPIO45 is wired to
+; the fan connector only - so nothing is reserved.
+Procedure.i HwPwmReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
+
+; Begin also starts the tachometer: the fan and its tach arrive together.
+Procedure.i HwPwmBegin(pin.i, hz.i)
+  Define c.i
+  If HwPwmPinIsHard(pin) <> 1
+    ProcedureReturn #HW_PWM_PIN
+  EndIf
+  c = Rp1PwmBegin(hz)
+  If c = #RP1PWM_OK
+    Rp1TachBegin(Micros())
+  EndIf
+  ProcedureReturn Pi5PwmMapCode(c)
+EndProcedure
+
+Procedure.i HwPwmDuty(permille.i)
+  ProcedureReturn Pi5PwmMapCode(Rp1PwmDuty(permille))
+EndProcedure
+
+Procedure.i HwPwmEnd()
+  ProcedureReturn Pi5PwmMapCode(Rp1PwmEnd())
+EndProcedure
+
+; The tick's call: the channel needs nothing; the tach is polled here.
+Procedure HwPwmService()
+  Rp1TachPoll(Micros())
+EndProcedure
+
+Procedure.i HwPwmKind()
+  If Rp1PwmOn() <> 0
+    ProcedureReturn #HW_PWM_KIND_HARD
+  EndIf
+  ProcedureReturn #HW_PWM_KIND_NONE
+EndProcedure
+
+Procedure.i HwPwmPin()
+  If Rp1PwmOn() <> 0
+    ProcedureReturn #PI5_FAN_PIN
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwPwmHz()
+  If Rp1PwmOn() = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn Rp1PwmHz()
+EndProcedure
+
+Procedure.i HwPwmDutyNow()
+  ProcedureReturn Rp1PwmDutyNow()
+EndProcedure
+
+Procedure.i HwPwmDetail(which.i)
+  If Rp1PwmOn() = 0
+    ProcedureReturn -1
+  EndIf
+  Select which
+    Case #HW_PWM_DETAIL_RANGE
+      ProcedureReturn Rp1PwmRange()
+    Case #HW_PWM_DETAIL_DIVISOR
+      ProcedureReturn Rp1PwmDivisor()
+    Case #HW_PWM_DETAIL_SRCHZ
+      ProcedureReturn Rp1PwmClockHz()
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; The fan's measured speed: RPM, #RP1_TACH_NONE before the first complete
+; window, #RP1_TACH_COARSE when the tick polled too slowly to count every
+; edge. NOT YET ON THE SEAM - hal.pbi has no tach entry and fan_cmd.pbi
+; prints none; see the vault note for the proposed seam line.
+Procedure.i HwFanTachRpm()
+  ProcedureReturn Rp1TachRpm()
+EndProcedure
+
+; ======================================================================
+;  THE TEMPERATURE HALF - RaspberryPi4/Board/hw_pwm.pi4's three wrappers.
+; ======================================================================
+Procedure.i HwTempMilliC()
+  Define t.i
+  t = ThermalMilliC()
+  If t = #THERM_NONE
+    ProcedureReturn #HW_TEMP_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.i HwTempMaxMilliC()
+  Define t.i
+  t = ThermalMaxMilliC()
+  If t = #THERM_NONE
+    ProcedureReturn #HW_TEMP_NONE
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+Procedure.i HwTempSource()
+  Select ThermalSource()
+    Case #THERM_SRC_REGISTER
+      ProcedureReturn #HW_TEMP_SRC_REGISTER
+    Case #THERM_SRC_MAILBOX
+      ProcedureReturn #HW_TEMP_SRC_FIRMWARE
+  EndSelect
+  ProcedureReturn #HW_TEMP_SRC_NONE
+EndProcedure

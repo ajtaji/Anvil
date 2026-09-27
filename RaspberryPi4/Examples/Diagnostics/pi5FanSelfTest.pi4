@@ -1,0 +1,323 @@
+; pi5FanSelfTest.pi4 - the Raspberry Pi 5 fan stack, measured rather than
+; believed. -t pi5 ONLY.
+;
+; DIAGNOSTIC. Does not ship. The -t pi5 counterpart of pi4FanSelfTest.pi4.
+;
+;   AT THE DESK it is the payload tools/a64/a64_fan_pi5_check.py drives
+;   under the AArch64 model, with RP1's PWM1, clk_pwm1, IO_BANK/SYS_RIO/
+;   PADS, a four-wire fan whose tach follows its duty, and the BCM2712 AVS
+;   monitor behind it - all modelled from the published sources, not from
+;   this tree. Every parsed line is "LABEL value..." for the gate.
+;
+;   ON A Pi 5 (silicon owed) the same labels answer whether the fan turns,
+;   how fast the tach says, and what the AVS register reads.
+;
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi5FanSelfTest.pi4 \
+;        -t pi5 --load-addr 0x400000 --stack-addr 0x3000000 --entry-returns \
+;        -o fan5self.img
+;
+; THE FAN CONNECTOR IS DRIVEN. Unlike the Pi 4 probe there is no pin to
+; choose: GPIO45 goes only to the fan connector.
+;
+; THE RETURN VALUE is the number of internal disagreements.
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+
+#UART_DR = $107D001000   ; the BCM2712 debug PL011 (HARDWARE-BRINGUP.md)
+#UART_FR = $107D001018
+
+Procedure str_print_at(p.i)
+  Define c.i
+  Repeat
+    c = PeekA(p)
+    If c = 0 : Break : EndIf
+    Repeat
+    Until (PeekN(#UART_FR) & 32) = 0
+    PokeL(#UART_DR, c)
+    p = p + 1
+  ForEver
+EndProcedure
+
+XIncludeFile "Anvil/Hal/seams.pbi"
+XIncludeFile "Anvil/Hal/module_format.pbi"
+XIncludeFile "Anvil/Hal/module_runtime.pbi"
+XIncludeFile "Anvil/Core/mod_registry.pbi"
+XIncludeFile "RaspberryPi4/Lib/thermal.pi4"
+XIncludeFile "RaspberryPi4/Lib/rp1_pwm.pi4"
+; hal.pbi's RequireCap() writes its refusal through the UART library;
+; this program has none, so the one it needs is the PL011 loop above.
+Procedure UartWriteStr(p.i)
+  str_print_at(p)
+EndProcedure
+Procedure UartWriteNl()
+  Repeat
+  Until (PeekN(#UART_FR) & 32) = 0
+  PokeL(#UART_DR, 13)
+  Repeat
+  Until (PeekN(#UART_FR) & 32) = 0
+  PokeL(#UART_DR, 10)
+EndProcedure
+
+XIncludeFile "Anvil/Hal/hal.pbi"
+XIncludeFile "RaspberryPi4/Board/hw_pwm_rp1.pi4"
+XIncludeFile "Anvil/Core/fan.pbi"
+
+; The register driver, linked by the gate exactly as the Pi 4 gate links
+; it (RaspberryPi4/Modules/thermal_avs.pi4 with its four module
+; declaration lines removed). As committed: no driver, seam empty.
+#FAN_AVS_DRIVER = 0
+#FAN_AVS_DEVICE = 0
+; FAN-AVS-DRIVER-INCLUDE
+
+; 1 only once RaspberryPi4/Lib/mailbox.pi4 carries a #PMF_CHIP = 2712
+; branch; until then its addresses are the BCM2711's and the firmware
+; fallback cannot be asked on this part. The gate decides.
+#FAN_MBX = 0
+
+; The tach window the probe measures with, in microseconds.
+#FAN_TACH_WINDOW_US = 200000
+
+Global fails.i
+
+Procedure PutC(c.i)
+  Repeat
+  Until (PeekN(#UART_FR) & 32) = 0
+  PokeL(#UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Define c.i
+  Repeat
+    c = PeekA(*s)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    *s = *s + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutDec(v.i)
+  Define d.i
+  Define started.i
+  Define digit.i
+  If v < 0
+    PutC(45)
+    v = 0 - v
+  EndIf
+  If v = 0
+    PutC(48)
+    ProcedureReturn
+  EndIf
+  d = 1000000000000000000
+  started = 0
+  While d > 0
+    digit = (v / d) % 10
+    If digit <> 0 Or started = 1
+      PutC(48 + digit)
+      started = 1
+    EndIf
+    d = d / 10
+  Wend
+EndProcedure
+
+Procedure Row(*name, v.i)
+  PutS(*name) : PutC(32) : PutDec(v) : PutNl()
+EndProcedure
+
+Procedure Row2(*name, a.i, b.i)
+  PutS(*name) : PutC(32) : PutDec(a) : PutC(32) : PutDec(b) : PutNl()
+EndProcedure
+
+Procedure Row3(*name, a.i, b.i, c.i)
+  PutS(*name) : PutC(32) : PutDec(a) : PutC(32) : PutDec(b) : PutC(32) : PutDec(c) : PutNl()
+EndProcedure
+
+Procedure Claim(*what, got.i, want.i)
+  If got = want
+    ProcedureReturn
+  EndIf
+  fails = fails + 1
+  PutS("!! ") : PutS(*what) : PutS(" gave ") : PutDec(got)
+  PutS(" and this program expected ") : PutDec(want) : PutNl()
+EndProcedure
+
+; ======================================================================
+;  A - the BCM2712 conversion, over every code
+; ======================================================================
+Procedure SectionA()
+  Define i.i
+  Define chk.i
+  PutS("=== A conversion ===") : PutNl()
+  CompilerIf #FAN_AVS_DRIVER = 1
+  Row2("A code", 0, AvsCodeToMilliC(0))
+  Row2("A code", 700, AvsCodeToMilliC(700))
+  Row2("A code", 1023, AvsCodeToMilliC(1023))
+  chk = 0
+  i = 0
+  While i < 1024
+    chk = (chk * 131 + (AvsCodeToMilliC(i) + 1000000)) % 1000000007
+    i = i + 1
+  Wend
+  Row("A fold", chk)
+  Row2("A validof", $10400, AvsValid($10400))
+  Row2("A validof", $10000, AvsValid($10000))
+  Row2("A validof", $00400, AvsValid($00400))
+  CompilerElse
+  PutS("A skipped - no register driver linked") : PutNl()
+  CompilerEndIf
+EndProcedure
+
+; ======================================================================
+;  B - the sources: the loader's steps, then the reading
+; ======================================================================
+Global Dim fanSvc.i[#SVC_SEAM_HDR_BYTES / 8 + #SVC_SEAM_SLOT_GET + 1]
+
+Procedure SectionB()
+  PutS("=== B sources ===") : PutNl()
+  ModSeamReset()
+  CompilerIf #FAN_AVS_DRIVER = 1
+  Row("B probe", ModuleProbe(0, #FAN_AVS_DEVICE))
+  fanSvc[#SVC_SEAM_HDR_BYTES / 8 + #SVC_SEAM_SLOT_FILL] = @ModSeamFill
+  Row("B allow", ModSeamAllow(0, #SVCCAP_THERMAL))
+  ModSeamFillOpen(0)
+  Row("B init", ModuleInit(@fanSvc[0], #FAN_AVS_DEVICE))
+  Row("B fills", ModSeamFillClose())
+  CompilerEndIf
+  Row("B milli", HwTempMilliC())
+  Row("B source", HwTempSource())
+  Row("B bound", ModSeamBindCount(#SVCCAP_THERMAL))
+  CompilerIf #FAN_MBX = 1
+  If MailboxInit() = 0
+    Row("B mbxinit", 0)
+  Else
+    Row("B mbxinit", 1)
+  EndIf
+  Row("B maxmilli", HwTempMaxMilliC())
+  CompilerEndIf
+EndProcedure
+
+; ======================================================================
+;  P - the channel: refusals first (touching nothing), then the begin
+; ======================================================================
+Procedure SectionP()
+  PutS("=== P pwm ===") : PutNl()
+  Row("P kind0", HwPwmKind())
+  Row("P duty early", HwPwmDuty(500))
+  Row("P end early", HwPwmEnd())
+  Row("P begin pin18", HwPwmBegin(18, HwPwmHzDefault()))
+  Row("P begin hz0", HwPwmBegin(45, 0))
+  Row("P begin hzhigh", HwPwmBegin(45, HwPwmHzMax(45) + 1000))
+  Row("P count", HwPwmPinCount())
+  Row("P pinat", HwPwmPinAt(0))
+  Row("P default", HwPwmDefaultPin())
+  Row("P hzdefault", HwPwmHzDefault())
+  Row("P hzmax", HwPwmHzMax(45))
+  Row("P begin", HwPwmBegin(HwPwmDefaultPin(), HwPwmHzDefault()))
+  Row("P kind", HwPwmKind())
+  Row("P pin", HwPwmPin())
+  Row("P hz", HwPwmHz())
+  Row("P range", HwPwmDetail(#HW_PWM_DETAIL_RANGE))
+  Row("P divisor", HwPwmDetail(#HW_PWM_DETAIL_DIVISOR))
+  Row("P srchz", HwPwmDetail(#HW_PWM_DETAIL_SRCHZ))
+  Row("P stalls", HwPwmDetail(#HW_PWM_DETAIL_STALLS))
+  Row2("P duty", 0, HwPwmDuty(0))
+  Row2("P duty", 1, HwPwmDuty(1))
+  Row2("P duty", 333, HwPwmDuty(333))
+  Row2("P duty", 500, HwPwmDuty(500))
+  Row2("P duty", 999, HwPwmDuty(999))
+  Row2("P duty", 1000, HwPwmDuty(1000))
+  Row2("P duty", 1001, HwPwmDuty(1001))
+  Row2("P duty", -1, HwPwmDuty(-1))
+  Row("P dutynow", HwPwmDutyNow())
+EndProcedure
+
+; ======================================================================
+;  T - the tachometer. The modelled fan turns in proportion to the duty
+;  the channel is really generating, so these rows are the loop closed.
+; ======================================================================
+Procedure TRow(permille.i)
+  HwPwmDuty(permille)
+  Row2("T rpm", permille, Rp1TachMeasure(#FAN_TACH_WINDOW_US))
+EndProcedure
+
+Procedure SectionT()
+  Define i.i
+  Define t0.i
+  PutS("=== T tach ===") : PutNl()
+  TRow(1000)
+  TRow(500)
+  TRow(250)
+  TRow(0)
+  Row("T edges", Rp1TachEdges())
+  ; A tick that polls every 5 ms cannot see every edge of a fast fan:
+  ; the window must answer COARSE, not a low number.
+  HwPwmDuty(1000)
+  t0 = Micros()
+  Rp1TachBegin(t0)
+  i = 1
+  While i <= 250
+    Rp1TachPoll(t0 + i * 5000)
+    i = i + 1
+  Wend
+  Row("T coarse", Rp1TachRpm())
+EndProcedure
+
+; ======================================================================
+;  C - temperature to duty to register, end to end. The gate serves one
+;  AVS code per read; each step reads, converts once, decides, drives.
+; ======================================================================
+Procedure CStep(ms.i)
+  Define t.i
+  Define f.i
+  Define d.i
+  t = HwTempMilliC()
+  f = HwTempMilliF(t)
+  d = FanDutyFor(f, 1, ms)
+  Row3("C step", t, f, d)
+  Row("C set", HwPwmDuty(d))
+EndProcedure
+
+Procedure SectionC()
+  Define i.i
+  PutS("=== C curve ===") : PutNl()
+  FanPolicyReset()
+  i = 0
+  While i < 12
+    CStep(i * 1000)
+    i = i + 1
+  Wend
+  ; A step with no thermometer is the failsafe, and it reaches the pin.
+  Row("C blind", HwPwmDuty(FanDutyFor(0, 0, 20000)))
+  Row("C blindduty", HwPwmDutyNow())
+EndProcedure
+
+; ======================================================================
+;  E - release. The seam says End leaves the fan in the state the board
+;  considers safe; on this connector that is full speed.
+; ======================================================================
+Procedure SectionE()
+  PutS("=== E end ===") : PutNl()
+  HwPwmDuty(0)
+  Row("E end", HwPwmEnd())
+  Row("E kind", HwPwmKind())
+  Row("E duty after", HwPwmDuty(500))
+  Row("E end again", HwPwmEnd())
+EndProcedure
+
+Procedure.i Main()
+  fails = 0
+  PutS("pi5 fan self-test") : PutNl()
+  TimerInit()
+  SectionA()
+  SectionB()
+  SectionP()
+  SectionT()
+  SectionC()
+  SectionE()
+  Row("END fails", fails)
+  ProcedureReturn fails
+EndProcedure
