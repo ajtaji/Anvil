@@ -58,6 +58,7 @@ LOAD = 0x200000
 SRC = ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "pi5UsbSelfTest.pi4"
 PCIE = ROOT / "RaspberryPi4" / "Lib" / "pcie.pi4"
 XHCI = ROOT / "RaspberryPi4" / "Lib" / "xhci.pi4"
+GPIO = ROOT / "RaspberryPi4" / "Lib" / "gpio_rp1.pi4"
 
 # ---- the addresses, each from the device tree (see pcie.pi4's 2712 header)
 RC_BASE = 0x10_0012_0000          # bcm2712.dtsi pcie2 reg
@@ -100,7 +101,11 @@ GSNPSID_330B = 0x5533330B         # dwc_usb3 v3.30b (rp1-peripherals ch. 5)
 HCS1_RP1 = X.MAX_SLOTS | (X.MAX_INTRS << 8) | (3 << 24)   # 3 root ports
 
 SCENARIOS = ("healthy", "link-down", "no-inbound", "never-halts",
-             "never-runs", "dwc3-reset-stuck", "not-dwc3", "no-ac64")
+             "never-runs", "dwc3-reset-stuck", "not-dwc3", "no-ac64",
+             "port-power-stuck")
+# xHCI 1.2 5.4.8 / USB 2 root hub bPwrOn2PwrGood: nothing may trust a
+# port's status sooner than 20 ms after its power switch was turned on.
+POWER_GOOD_TICKS = 20 * X.CNTFRQ // 1000
 
 
 class TransMem:
@@ -166,11 +171,14 @@ class Rp1Ctl(X.Ctl):
         }
         self.csft_reads = 0
         self.hc1 = X.HCC1 & ~1 if scenario == "no-ac64" else X.HCC1
-        # Ports: 1 = USB 2, unpowered, a high-speed device behind the
-        # switch; 2 = USB 2, powered, empty; 3 = SuperSpeed, trained.
+        # Ports: 1 = USB 2 with a high-speed device, 2 = USB 2 empty,
+        # 3 = SuperSpeed with a device. PPC is set (HCC1 bit 3), and HCRST
+        # leaves every port switch OFF - so a driver that does not power
+        # the root ports sees nothing at all.
         self.port = {1: 0, 2: X.P_POWER,
                      3: X.P_POWER | X.P_CONNECT | X.P_PE | (X.SPEED_SS << 10)}
-        self.port_dev = {1: X.SPEED_HS}
+        self.port_dev = {1: X.SPEED_HS, 3: X.SPEED_SS}
+        self.power_tick: dict[int, int] = {}
         if scenario == "never-halts":
             # The firmware left it running and it will not stop.
             self.reg[X.R_USBCMD] = X.CMD_RUN
@@ -244,7 +252,25 @@ class Rp1Ctl(X.Ctl):
         return (self.dwc[GCTL] & PRTCAP_MASK) == PRTCAP_HOST
 
     # -- the xHCI block, gated by the wrapper ---------------------------
+    def _port_write(self, n: int, value: int) -> None:
+        was = self.port.get(n, 0) & X.P_POWER
+        if self.scenario == "port-power-stuck":
+            value &= ~X.P_POWER
+        super()._port_write(n, value)
+        if not was and self.port.get(n, 0) & X.P_POWER:
+            self.power_tick[n] = self.ticks
+            self.log.append(f"port{n}-powered")
+            if self.port_dev.get(n) == X.SPEED_SS:
+                # a SuperSpeed link trains by itself once powered
+                self.port[n] |= X.P_PE | (X.SPEED_SS << 10)
+
     def reg_read(self, off: int) -> int:
+        if X.R_PORTS <= off < X.R_PORTS + 3 * 0x10 and (off - X.R_PORTS) % 0x10 == 0:
+            n = (off - X.R_PORTS) // 0x10 + 1
+            t = self.power_tick.get(n)
+            if t is not None and self.ticks - t < POWER_GOOD_TICKS:
+                self.bad(f"port {n} status trusted before power-good "
+                         f"({(self.ticks - t) * 1000 // X.CNTFRQ} ms after the switch)")
         if off == 0x04:
             return HCS1_RP1
         if off == 0x10:
@@ -265,6 +291,12 @@ class Rp1Ctl(X.Ctl):
             self.bad(f"xHCI register ${off:X} written before the DWC3 core "
                      f"was put in host mode (GCTL.PRTCAPDIR)")
         super().reg_write(off, value)
+        if off == X.R_USBCMD and value & X.CMD_RESET:
+            # HCRST: with PPC set, every port switch goes off (xHCI 1.2
+            # 5.4.8 PP is 0 after reset when PPC = 1 - modelled that way).
+            for n in self.port:
+                self.port[n] = 0
+            self.power_tick.clear()
 
     def _wide_written(self, base: int, half: int) -> None:
         v = self.wide[base]
@@ -418,6 +450,7 @@ def install(cpu: A64, ctl: Rp1Ctl) -> None:
 # ---------------------------------------------------------------------
 E_HALT, E_RUN, E_NO_CONNECT, E_STALL, E_DMA_OFFSET = 12, 17, 20, 29, 48
 E_DMA_RANGE = 10
+E_PORT_POWER = 21
 E_RP1_HOST, E_DWC3_ID, E_DWC3_RESET, E_AC64 = 60, 61, 63, 65
 PCIE_ERR_LINK, PCIE_ERR_INBOUND = -4, -16
 
@@ -446,7 +479,7 @@ def expect(scenario: str) -> list[tuple[str, int]]:
                 ("XhciInit refuses", 0), ("arena not reachable", E_DMA_RANGE)]
     fail = {"never-halts": E_HALT, "never-runs": E_RUN,
             "dwc3-reset-stuck": E_DWC3_RESET, "not-dwc3": E_DWC3_ID,
-            "no-ac64": E_AC64}
+            "no-ac64": E_AC64, "port-power-stuck": E_PORT_POWER}
     if scenario in fail:
         return HEAD_OK + [("XhciInit refuses", 0), ("with the named error", fail[scenario])]
     ex = HEAD_OK + [
@@ -459,14 +492,18 @@ def expect(scenario: str) -> list[tuple[str, int]]:
         ("three root ports", 3),
         ("host 0 selected", 0),
         ("host switch refused while running", 0),
+        ("the board's VBUS hook ran once", 1),
+        ("VBUS state 0: gpio_rp1.pi4 has no bank-2 setter for GPIO42/43", 0),
+        ("both VBUS pins refused by gpio_rp1 (and RP1 untouched)", 2),
+        ("XhciInit powered all three root ports", 3),
         ("a No-Op completed", 1),
         ("Success", 1),
         ("seventy more, wrapping both rings", 70),
         ("nothing skipped", 0),
-        ("the first connected port is the SuperSpeed port 3", 3),
+        ("the first connected port is port 1 - powered by XhciInit", 1),
         ("port 3 SuperSpeed", X.SPEED_SS),
-        ("port 1 not connected before power", 0),
-        ("port 1 powers up and resets", 1),
+        ("port 1 already connected, before any reset", 1),
+        ("port 1 resets", 1),
         ("port 1 enabled", 1),
         ("port 1 high speed", X.SPEED_HS),
         ("resetting empty port 2 fails", 0),
@@ -554,6 +591,8 @@ def run(img: pathlib.Path, scenario: str, budget: int) -> list[str]:
         need("the soft reset completed", "dwc3-csftrst-cleared" in ctl.log)
         need("the soft reset before host mode", before("dwc3-csftrst-cleared", "dwc3-host"))
         need("host mode before the xHCI reset", before("dwc3-host", "hcrst"))
+        need("the root ports were powered after the reset",
+             before("hcrst", "port1-powered") and "port3-powered" in ctl.log)
         need("GUSB2PHYCFG0.SUSPHY cleared", not ctl.dwc[GUSB2PHYCFG0] & U2_SUSPHY)
         need("GUSB3PIPECTL0.SUSPHY cleared", not ctl.dwc[GUSB3PIPECTL0] & U3_SUSPHY)
         need("GUSB3PIPECTL0.DISRXDETINP3 set", bool(ctl.dwc[GUSB3PIPECTL0] & U3_DISRXDET))
@@ -619,17 +658,22 @@ MUTANTS = {
     "no-inbound-check": (PCIE, "    If pcie_FindDmaWindow() = 0\n      pcie_err = #PCIE_ERR_INBOUND\n",
                          "    If pcie_FindDmaWindow() = 2\n      pcie_err = #PCIE_ERR_INBOUND\n"),
     "no-ac64-check": (XHCI, "    If xh_ac64 = 0\n      xh_Fail(#XHCI_ERR_AC64)", "    If xh_ac64 = 2\n      xh_Fail(#XHCI_ERR_AC64)"),
+    "no-vbus-hook-call": (XHCI, "    If *xh_vbusHook <> 0\n      xh_vbusHook()\n    EndIf\n", "\n"),
+    "no-root-port-power": (XHCI, "    If xh_PowerRootPorts() = 0\n", "    If 1 = 0\n"),
+    "no-power-good-wait": (XHCI, "      xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)\n", "\n"),
+    "no-power-readback": (XHCI, "      If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0\n        ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)",
+                          "      If 0 = 1\n        ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)"),
 }
 # Which scenario exposes each mutant (healthy unless named).
 MUTANT_SCENARIO = {"no-link-check": "link-down", "no-inbound-check": "no-inbound",
-                   "no-ac64-check": "no-ac64"}
+                   "no-ac64-check": "no-ac64", "no-power-readback": "port-power-stuck"}
 # The CRLF/LF of the libraries is kept; anchors are matched on LF text.
 
 
 def make_mutant(name: str, work: pathlib.Path) -> pathlib.Path:
     """A private tree: the program plus mutated copies of both libraries."""
     lib, old, new = MUTANTS[name]
-    for f in (PCIE, XHCI):
+    for f in (PCIE, XHCI, GPIO):
         text = f.read_bytes().decode("utf-8").replace("\r\n", "\n")
         if f == lib:
             hits = text.count(old)

@@ -2061,6 +2061,24 @@ CompilerIf #PMF_CHIP = 2712
   #XHCI_ERR_AC64       = 65
   Global xh_rp1Host.i = 0
   Global xh_dwc3Id.i = 0
+  ; ROOT-PORT POWER. With HCCPARAMS1.PPC set the ports have power switches,
+  ; and after HCRST nothing has turned them on: the shared HID walk only
+  ; resets ports that ALREADY show a connection, so an unpowered port is a
+  ; device nobody ever sees. Linux powers every root port (hub.c
+  ; hub_power_on -> xhci-hub.c SetPortFeature(PORT_POWER)) and waits
+  ; bPwrOn2PwrGood x 2 ms (hub.c:1655): 10 -> 20 ms on the USB 2 root hub,
+  ; 50 -> 100 ms on the USB 3 one (xhci-hub.c:295, :348). One 100 ms wait
+  ; covers both.
+  #XHCI_TMO_ROOTPWR_MS = 100
+  #XHCI_PH_PORTPWR = 15
+  ; VBUS. The board, not this library, knows which pins switch the port
+  ; power (bcm2712-rpi-5-b.dts &rp1_usb0: GPIO42/43, function vbus1). It
+  ; installs a hook; XhciInitRp1 calls it once the link and RP1 are proven
+  ; and before the ports are powered. The hook reports with
+  ; XhciSetVbusState: 1 set, 0 the board could not set it. -1 = no hook.
+  Global *xh_vbusHook = 0
+  Global xh_vbusState.i = -1
+  Global xh_portsPowered.i = 0
 
   ; CPU -> the address the controller must be handed. XhciInitRp1 has
   ; already proved the whole arena inside the window with PcieDmaOk, and
@@ -4010,6 +4028,55 @@ CompilerIf #PMF_CHIP = 2712
   Procedure.i XhciRp1Host() : ProcedureReturn xh_rp1Host : EndProcedure
   Procedure.i XhciDwc3Id()  : ProcedureReturn xh_dwc3Id  : EndProcedure
 
+  Procedure.i XhciSetVbusHook(*fn)
+    Define old.i
+    old = *xh_vbusHook
+    *xh_vbusHook = *fn
+    ProcedureReturn old
+  EndProcedure
+  Procedure XhciSetVbusState(v.i)
+    xh_vbusState = v
+  EndProcedure
+  Procedure.i XhciVbusState() : ProcedureReturn xh_vbusState : EndProcedure
+  Procedure.i XhciRootPortsPowered() : ProcedureReturn xh_portsPowered : EndProcedure
+
+  ; Power every root port that is off, wait power-good once, then read
+  ; every port back. A port that will not hold power is refused loudly:
+  ; the alternative is an empty device list that looks like no device.
+  Procedure.i xh_PowerRootPorts()
+    Define p.i
+    Define n.i
+    Define t0.i
+    xh_portsPowered = 0
+    ; PPC clear: PP is hardwired on (xHCI 1.2 5.4.8) - nothing to switch.
+    If (xh_hcc1 & $08) = 0
+      ProcedureReturn 1
+    EndIf
+    n = 0
+    p = 1
+    While p <= xh_maxPorts
+      If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0
+        xh_PortWrite(p, #XHCI_PORT_POWER)
+        n = n + 1
+      EndIf
+      p = p + 1
+    Wend
+    If n > 0
+      t0 = XhciWaitMark()
+      xh_DelayMs(#XHCI_TMO_ROOTPWR_MS)
+      XhciAccountWait(#XHCI_W_PORTPWR, t0)
+    EndIf
+    p = 1
+    While p <= xh_maxPorts
+      If (xh_Rd(xh_op, xh_PortOff(p) + #XHCI_PORTSC) & #XHCI_PORT_POWER) = 0
+        ProcedureReturn xh_Fail(#XHCI_ERR_PORT_POWER)
+      EndIf
+      p = p + 1
+    Wend
+    xh_portsPowered = n
+    ProcedureReturn 1
+  EndProcedure
+
   ; XhciInitRp1 - XhciInitAt's sequence for an RP1 controller. The same
   ; phases, the same refusals, and between the mapping and the first xHCI
   ; register read, the DWC3 host-mode step. The Pi 4's XhciInitAt stays
@@ -4094,6 +4161,17 @@ CompilerIf #PMF_CHIP = 2712
     EndIf
     xh_Phase(#XHCI_PH_RUN)
     If xh_Start() = 0
+      xh_FailStop()
+      ProcedureReturn 0
+    EndIf
+    ; VBUS through the board, then root-port power, before anything walks
+    ; the ports.
+    xh_Phase(#XHCI_PH_PORTPWR)
+    xh_vbusState = -1
+    If *xh_vbusHook <> 0
+      xh_vbusHook()
+    EndIf
+    If xh_PowerRootPorts() = 0
       xh_FailStop()
       ProcedureReturn 0
     EndIf
