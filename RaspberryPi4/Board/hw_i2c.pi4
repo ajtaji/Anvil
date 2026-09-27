@@ -54,6 +54,191 @@
 ;  HARDWARE-VERIFIED, and it was right to: the bus had never worked.
 ; ======================================================================
 
+; ======================================================================
+;  BCM2712 (Pi 5, -t pi5, #PMF_CHIP = 2712) - THE SAME SEAM OVER RP1 I2C1.
+;
+;  The Pi 5's header I2C (GPIO 2/3, pins 3/5) is RP1's I2C1, a Synopsys
+;  DesignWare master - not a BSC. These wrappers sit on
+;  RaspberryPi4/Lib/i2c_dw.pi4, whose header carries the register
+;  citations and the base-address translation through the Pi 5 DTB. The
+;  Pi 4 branch below the CompilerElse is untouched and is what -t pi4
+;  compiles, byte for byte.
+;
+;  Same bus NUMBER as the Pi 4 (1), because Linux names this controller
+;  i2c1 too, so `i2c` and `i2cdetect -y 1` agree on both boards.
+;
+;  What the Pi 4 branch says and this one cannot:
+;    * #HW_I2C_CLKT is never returned. The DesignWare block reports a held
+;      clock as a transfer that does not finish (#HW_I2C_TIMEOUT); its
+;      SCL-stuck-low detector is an optional databook feature this driver
+;      does not rely on. HwI2cPadLevel is still there to measure the pads.
+;    * A non-NACK abort (arbitration lost, master disabled) and a block
+;      that failed its COMP_TYPE identity check also come back as
+;      #HW_I2C_TIMEOUT - "the controller did not finish" - which is the
+;      only portable code that does not claim a cause. DwI2cAbortSource()
+;      and DwI2cCompType() keep the raw facts for a diagnostic.
+;    * The source clock is RP1_CLK_SYS as rp1.dtsi ASSIGNS it, not a
+;      measurement; HwI2cSourceWhere says so in as many words.
+;
+;  DESK-PROOF ONLY (tools/a64/i2c_dw_check.py). Silicon owed.
+; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+
+#PI5_I2C_HEADER_BUS = 1
+
+Procedure.i I2cMapCode(c.i)
+  Select c
+    Case #DWI2C_OK
+      ProcedureReturn #HW_I2C_OK
+    Case #DWI2C_NACK
+      ProcedureReturn #HW_I2C_NACK
+    Case #DWI2C_TIMEOUT
+      ProcedureReturn #HW_I2C_TIMEOUT
+    Case #DWI2C_ARG
+      ProcedureReturn #HW_I2C_ARG
+    Case #DWI2C_RANGE
+      ProcedureReturn #HW_I2C_RANGE
+    Case #DWI2C_ABORT
+      ProcedureReturn #HW_I2C_TIMEOUT
+    Case #DWI2C_NODEV
+      ProcedureReturn #HW_I2C_TIMEOUT
+  EndSelect
+  ProcedureReturn #HW_I2C_TIMEOUT
+EndProcedure
+
+Procedure.i HwI2cDefaultBus()
+  ProcedureReturn #PI5_I2C_HEADER_BUS
+EndProcedure
+
+Procedure.i HwI2cBusValid(bus.i)
+  If bus = #PI5_I2C_HEADER_BUS
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i HwI2cUp(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DwI2cUp()
+EndProcedure
+
+Procedure.i HwI2cProbe(bus.i, addr.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(DwI2cProbe(addr))
+EndProcedure
+
+Procedure.i HwI2cWrite(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(DwI2cWrite(addr, *buf, n))
+EndProcedure
+
+Procedure.i HwI2cRead(bus.i, addr.i, *buf, n.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  ProcedureReturn I2cMapCode(DwI2cRead(addr, *buf, n))
+EndProcedure
+
+Procedure.i HwI2cSetSpeed(bus.i, hz.i)
+  Define r.i
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  r = DwI2cSetSpeed(hz)
+  If r <= 0
+    ProcedureReturn I2cMapCode(r)
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i HwI2cGetSpeed(bus.i)
+  Define r.i
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn #HW_I2C_NOBUS
+  EndIf
+  r = DwI2cGetSpeed()
+  If r <= 0
+    ProcedureReturn I2cMapCode(r)
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i HwI2cSourceHz(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #DWI2C_CLK_HZ
+EndProcedure
+
+Procedure.i HwI2cSourceWhere(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn "RP1's system clock at the rate Linux assigns it (rp1.dtsi), not measured"
+EndProcedure
+
+Procedure.i HwI2cRateMin(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DwI2cRateMin()
+EndProcedure
+
+Procedure.i HwI2cRateMax(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn DwI2cRateMax()
+EndProcedure
+
+Procedure.i HwI2cPin(bus.i, which.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn -1
+  EndIf
+  If which = #HW_I2C_SDA
+    ProcedureReturn #DWI2C_PIN_SDA
+  EndIf
+  If which = #HW_I2C_SCL
+    ProcedureReturn #DWI2C_PIN_SCL
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
+; "alt3": the `gpio` report prints RP1 FUNCSEL n as ALTn (hw_gpio.pi4's
+; 2712 branch), so this is the word an operator sees there.
+Procedure.i HwI2cPinFunc(bus.i)
+  If HwI2cBusValid(bus) = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn "alt3"
+EndProcedure
+
+Procedure.i HwI2cPinReady(bus.i, which.i)
+  Define pin.i
+  pin = HwI2cPin(bus, which)
+  If pin < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn DwI2cPinMuxed(pin)
+EndProcedure
+
+Procedure.i HwI2cPadLevel(bus.i, which.i)
+  Define pin.i
+  pin = HwI2cPin(bus, which)
+  If pin < 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn DwI2cPadLevel(pin)
+EndProcedure
+
+CompilerElse
+
 ; The header I2C bus on this board. Named so the core can ask "what is the
 ; default bus here?" without hard-coding 1 - a different board answers with
 ; its own number and the command is unchanged.
@@ -340,3 +525,4 @@ Procedure.i HwI2cPadLevel(bus.i, which.i)
   EndIf
   ProcedureReturn I2cPadLevel(pin)
 EndProcedure
+CompilerEndIf
