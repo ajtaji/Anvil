@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 768
+REPORT_WORDS = 784
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1609,9 +1609,18 @@ def grade(cpu, rc) -> Grader:
     g.need("same-image copy preserves all source, destination and untouched bytes", slot(761), 0)
     g.need("same-image copy leaves GENERAL layout", slot(762), 1)
     g.need("same-image copy refuses non-GENERAL layouts", slot(763), ERR_ARGS)
-    g.need("overlapping same-image copy records for submit preflight", slot(764), 0)
-    g.need("overlapping same-image DMA copy is refused before submission", slot(765), ERR_ARGS)
+    g.need("overlapping same-image copy is refused during recording", slot(764), ERR_ARGS)
+    g.need("refused same-image copy preserves GENERAL layout", slot(765), 1)
     g.need("refused overlapping same-image copy leaves no flight", slot(766), 0)
+    g.need("two-region image copy records atomically", slot(767), 0)
+    g.need("two-region image copy submits", slot(768), 0)
+    g.need("two-region image copy completes", slot(769), 0)
+    g.need("two-region image copy preserves every image byte", slot(770), 0)
+    g.need("invalid later image region refuses the whole array", slot(771), ERR_ARGS)
+    g.need("overlapping image-copy destinations refuse the array", slot(772), ERR_ARGS)
+    g.need("cross-region source and destination overlap refuses the array", slot(773), ERR_ARGS)
+    g.need("image copy region count above capacity is refused", slot(774), ERR_ARGS)
+    g.need("invalid image-copy arrays leave no flight", slot(775), 0)
     g.need("whole image-to-buffer readback records", slot(717), 0)
     g.need("whole image-to-buffer readback submits", slot(718), 0)
     g.need("whole image-to-buffer readback completes", slot(719), 0)

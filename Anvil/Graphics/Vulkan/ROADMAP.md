@@ -23,10 +23,11 @@ dependency.
 `vk_v3d_backend.pi4` executes validated whole-image clears and the bounded
 graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
 combined `sampler2D` implicit-LOD request from either the measured one-texel
-linear image or the bounded optimal BGRA8 image path. The optimal path records
-one whole optimal-image or rectangular strided linear-image `vkCmdCopyBufferToImage`, revalidates and retains
-both live resources at submission, executes a TFU raster-to-`UIF_NO_XOR` copy,
-and publishes shader-read layout only after successful completion. Submission
+linear image or the bounded optimal BGRA8 image path. A whole optimal-image
+`vkCmdCopyBufferToImage` upload executes a TFU raster-to-`UIF_NO_XOR` copy;
+rectangular strided linear-image uploads and bounded multi-region linear
+`vkCmdCopyImage` transfers execute guarded DMA. Submission revalidates live
+resources before transfer and publishes the final layout only after success. Submission
 and the following sampled draw are both observed through public fences.
 
 The execution path is `NeonRebindSurface`, `NeonFrameBegin` and `NeonFrameEnd`.
