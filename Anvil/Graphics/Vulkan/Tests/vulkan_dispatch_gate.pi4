@@ -31,11 +31,13 @@ Procedure.i Main()
   Define image.i
   Define memory.i
   Define mappedPointer.i
+  Define i.i
   Define count.l
   Define propertySentinel.l
   Define subresource.VkImageSubresource
   Define layout.VkSubresourceLayout
   Define mappedRange.VkMappedMemoryRange
+  Define properties.VkPhysicalDeviceProperties
 
   AnvilVkTestBackendHeap($07000000, $00100000)
   Vkd(AnvilVkInstanceCreate(@instance) = #VK_SUCCESS)
@@ -71,6 +73,27 @@ Procedure.i Main()
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFormatProperties") = @vkGetPhysicalDeviceFormatProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceImageFormatProperties") = @vkGetPhysicalDeviceImageFormatProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceMemoryProperties") = @vkGetPhysicalDeviceMemoryProperties)
+  Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties") = @vkGetPhysicalDeviceProperties)
+  Vkd(vkGetDeviceProcAddr(device, "vkGetPhysicalDeviceProperties") = 0)
+  i = 0
+  While i < SizeOf(VkPhysicalDeviceProperties)
+    PokeA(@properties + i, $A5)
+    i = i + 1
+  Wend
+  vkGetPhysicalDeviceProperties(physical, @properties)
+  Vkd(properties\apiVersion = #VK_API_VERSION_1_0)
+  Vkd(properties\deviceType = #VK_PHYSICAL_DEVICE_TYPE_OTHER)
+  Vkd(properties\limits\maxImageDimension2D = avkBackendMaxImageDimension2D())
+  Vkd(properties\limits\maxUniformBufferRange = #ANVIL_VK_UNIFORM_BYTES)
+  Vkd(properties\limits\minUniformBufferOffsetAlignment = #ANVIL_VK_UNIFORM_ALIGN)
+  Vkd(properties\limits\optimalBufferCopyOffsetAlignment = avkBackendImageCopySourceAlignment())
+  Vkd(properties\limits\maxBoundDescriptorSets = 1 And properties\limits\maxColorAttachments = 1)
+  Vkd(properties\limits\maxImageDimension3D = 0 And properties\limits\maxComputeWorkGroupInvocations = 0)
+  Vkd(PeekA(@properties + OffsetOf(VkPhysicalDeviceProperties\deviceName)) = 116)
+  Vkd(PeekA(@properties + OffsetOf(VkPhysicalDeviceProperties\pipelineCacheUUID)) = 0)
+  properties\driverVersion = 77
+  vkGetPhysicalDeviceProperties($12345678, @properties)
+  Vkd(properties\driverVersion = 77)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceQueueFamilyProperties") = @vkGetPhysicalDeviceQueueFamilyProperties)
   Vkd(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceSparseImageFormatProperties") = @vkGetPhysicalDeviceSparseImageFormatProperties)
   Vkd(vkGetDeviceProcAddr(device, "vkGetPhysicalDeviceSparseImageFormatProperties") = 0)
