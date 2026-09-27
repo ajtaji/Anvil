@@ -39,3 +39,6 @@ mixed render/transfer jobs are refused.
 The production V3D backend gate passed 85 checks and compiled all eight Pi 4
 board diagnostics. The normal Pi 4 image compiled at 4,327,940 bytes against
 the combined current tree; its generated source build stamp was restored.
+The public Vulkan pipeline gate passed 771 checks over 203,706,937
+interpreted AArch64 instructions, including separate upload-call completion
+and an exact whole-image byte oracle.

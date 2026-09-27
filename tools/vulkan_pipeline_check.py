@@ -68,7 +68,7 @@ IN = 0x06000000
 FIXTURES = 0x06010000
 OUT = 0x06100000
 MAGIC = 0x564B5047
-REPORT_WORDS = 807
+REPORT_WORDS = 808
 
 # The emitter's own memory map, from vk_v3d_shader.pi4's header.
 OFF_CS_CODE = 0
@@ -1287,6 +1287,7 @@ def grade(cpu, rc) -> Grader:
                 slot(257) != 0 and slot(257) != slot(256),
                 f"{slot(256):#x} / {slot(257):#x}")
     g.need("backend received the complete padded optimal allocation", slot(258), 2048)
+    g.need("optimal upload preserves padded source stride for the TFU", slot(807), 72)
     g.need("successful wait settles the outstanding transaction", slot(259), 0)
     g.need("backend failure is reported as device lost", slot(264), -4)
     g.need("failed copy does not publish its final shader-read layout", slot(265), 0)

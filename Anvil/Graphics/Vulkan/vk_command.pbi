@@ -706,10 +706,6 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage computed a wrapped source span (Anvil code -20001, invalid extent); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If avkImgTiling[s] = #VK_IMAGE_TILING_OPTIMAL And bufferPitch <> sourcePitch
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage requires tightly packed source rows for an optimal-image TFU upload (Anvil code -20005); nothing was recorded.")
-    ProcedureReturn
-  EndIf
   If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR And (sourcePitch > avkImgPitch[s] Or *r\imageOffset\y * avkImgPitch[s] + *r\imageOffset\x * #ANVIL_VK_BGRA8_TEXEL_BYTES + (*r\imageExtent\height - 1) * avkImgPitch[s] + sourcePitch > avkImgSize[s])
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage found a linear image pitch or allocation too short for the requested rows (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
@@ -2257,7 +2253,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     copy\windowBytes = avkHeapBytes
     copy\sourceBase = sourceBase
     copy\sourceBytes = avkOpSourceBytes[copyOp]
-    copy\sourcePitch = avkOpSourcePitch[copyOp]
+    copy\sourcePitch = avkOpBufferPitch[copyOp]
     copy\destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target]
     copy\destinationBytes = avkImgSize[target]
     copy\width = avkImgW[target]

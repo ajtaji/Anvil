@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[807]
+Global Dim pgReport.i[808]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 806
+  If slot < 0 Or slot > 807
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (807 * 8), slot)
+  PokeI(#PG_OUT + (808 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -2083,7 +2083,7 @@ Procedure.i Main()
   copyImageAddress = AnvilVkImageAddress(copyImg)
 
   copyRegion\bufferOffset = 64
-  copyRegion\bufferRowLength = 0
+  copyRegion\bufferRowLength = 18
   copyRegion\bufferImageHeight = 0
   copyRegion\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   copyRegion\imageSubresource\mipLevel = 0
@@ -2136,6 +2136,7 @@ Procedure.i Main()
   pgPut(257, AnvilVkTestBackendLastCopyDestination())
   pgPut(258, AnvilVkTestBackendLastCopyBytes())
   pgPut(259, AnvilVkSubmissionOutstanding())
+  pgPut(807, AnvilVkTestBackendLastCopySourcePitch())
   sampled\base = copyImageAddress
   sampled\bytes = 2048
   sampled\width = 17
@@ -2194,7 +2195,7 @@ Procedure.i Main()
   vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
   If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
   copyRegion\imageExtent\width = 17
-  copyRegion\bufferRowLength = 18
+  copyRegion\bufferRowLength = 16
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
   If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : copyFailures = copyFailures + 1 : EndIf
