@@ -1275,13 +1275,29 @@ CompilerElse
   vi\vertexAttributeDescriptionCount = 2
 CompilerEndIf
   gp\layout = layB
+CompilerIf #VTP_PYRAMID_DEMO >= 4
+  ; Static scissor is intentionally smaller and offset independently of the
+  ; viewport. Pipeline creation snapshots it before the frame loop.
+  sc\offset\x = 200 : sc\offset\y = 320
+  sc\extent\width = 200 : sc\extent\height = 640
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO = 5
+  PokeL(@vp\x, $43480000) : PokeL(@vp\y, $43A00000)
+  PokeL(@vp\width, $43C80000) : PokeL(@vp\height, $44200000)
+CompilerEndIf
 CompilerIf #VTP_PYRAMID_DEMO >= 2
+CompilerIf #VTP_PYRAMID_DEMO <> 5
   dynamicKinds[0] = #VK_DYNAMIC_STATE_VIEWPORT
+CompilerIf #VTP_PYRAMID_DEMO = 4
+  dynamicState\dynamicStateCount = 1
+CompilerElse
   dynamicKinds[1] = #VK_DYNAMIC_STATE_SCISSOR
-  dynamicState\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
   dynamicState\dynamicStateCount = 2
+CompilerEndIf
+  dynamicState\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
   dynamicState\pDynamicStates = @dynamicKinds[0]
   gp\pDynamicState = @dynamicState
+CompilerEndIf
 CompilerEndIf
   rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeB)
   If rc <> #VK_SUCCESS
@@ -1358,6 +1374,7 @@ CompilerIf #VTP_PYRAMID_DEMO
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
 CompilerIf #VTP_PYRAMID_DEMO >= 2
+CompilerIf #VTP_PYRAMID_DEMO <> 5
     ; Exercise per-draw V3D viewport uniforms, clipper scale and scissor.
     ; The final frame maps the pyramid into a half-size viewport; mode three
     ; also moves its origin without changing the coordinate shader's scale.
@@ -1365,7 +1382,7 @@ CompilerIf #VTP_PYRAMID_DEMO >= 2
       PokeL(@vp\width, $43C80000)  ; 400.0
       PokeL(@vp\height, $44200000) ; 640.0
       sc\extent\width = 400 : sc\extent\height = 640
-CompilerIf #VTP_PYRAMID_DEMO = 3
+CompilerIf #VTP_PYRAMID_DEMO >= 3
       PokeL(@vp\x, $43480000)      ; 200.0
       PokeL(@vp\y, $43A00000)      ; 320.0
       sc\offset\x = 200 : sc\offset\y = 320
@@ -1378,7 +1395,10 @@ CompilerEndIf
       sc\extent\width = #VTP_VIEW_W : sc\extent\height = #VTP_VIEW_H
     EndIf
     vkCmdSetViewport(cmd, 0, 1, @vp)
+CompilerIf #VTP_PYRAMID_DEMO <> 4
     vkCmdSetScissor(cmd, 0, 1, @sc)
+CompilerEndIf
+CompilerEndIf
 CompilerEndIf
     vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
     vkCmdDraw(cmd, 12, 1, 0, 0)
