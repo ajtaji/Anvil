@@ -576,6 +576,43 @@ Procedure.i Main()
     Next
     If status = 156 : Break : EndIf
 
+    ; One transfer command buffer uploads a distinct 4x4 pattern to a linear
+    ; image, makes the write visible, then reads those exact texels back.
+    ; The second DMA job must see the first; old pixels cannot satisfy this.
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 157 : Break : EndIf
+    For i = 0 To 63
+      PokeA(bufMap + 4096 + i, (i * 13 + 7) & $FF)
+      PokeA(bufMap + 8192 + i, $A5)
+    Next
+    uploadRegions[0]\bufferOffset = 4096
+    uploadRegions[0]\bufferRowLength = 0 : uploadRegions[0]\bufferImageHeight = 0
+    uploadRegions[0]\imageOffset\x = 24 : uploadRegions[0]\imageOffset\y = 24
+    readRegions[0]\bufferOffset = 8192
+    readRegions[0]\bufferRowLength = 0 : readRegions[0]\bufferImageHeight = 0
+    readRegions[0]\imageOffset\x = 24 : readRegions[0]\imageOffset\y = 24
+    bar\image = dstImg
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_GENERAL : bar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
+    If vkBeginCommandBuffer(arrayUploadCmd, @bi) <> #VK_SUCCESS : status = 158 : Break : EndIf
+    vkCmdCopyBufferToImage(arrayUploadCmd, buf, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @uploadRegions[0])
+    vkCmdPipelineBarrier(arrayUploadCmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyImageToBuffer(arrayUploadCmd, dstImg, #VK_IMAGE_LAYOUT_GENERAL, buf, 1, @readRegions[0])
+    If vkEndCommandBuffer(arrayUploadCmd) <> #VK_SUCCESS : status = 159 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 160 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayUploadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 161 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 162 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 2 Or DmaQuiescent() = 0 : status = 163 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 164 : Break : EndIf
+    For i = 0 To 63
+      rc = (i * 13 + 7) & $FF
+      If (PeekA(bufMap + 8192 + i) & $FF) <> rc Or (PeekA(dstMap + ((24 + i / 16) * 32 + 24) * 4 + (i % 16)) & $FF) <> rc
+        status = 165 : Break
+      EndIf
+    Next
+    If status = 165 : Break : EndIf
+
     status = 0
   Until 1
 

@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[841]
+Global Dim pgReport.i[849]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 840
+  If slot < 0 Or slot > 848
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (841 * 8), slot)
+  PokeI(#PG_OUT + (849 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -3622,7 +3622,7 @@ Procedure.i Main()
 
   ; Upload the readback rectangle into a differently pitched linear image.
   imgci\extent\width = 32 : imgci\extent\height = 32
-  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
   imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
   If vkCreateImage(dev, @imgci, 0, @img2) <> #VK_SUCCESS : ProcedureReturn pgStop(96) : EndIf
   vkGetImageMemoryRequirements(dev, img2, @req)
@@ -3967,6 +3967,40 @@ Procedure.i Main()
   Next
   pgPut(805, count)
   pgPut(806, AnvilVkSubmissionOutstanding())
+  ; One transfer command buffer uploads and then reads back the same
+  ; 4x4 rectangle through two ordered linear-image DMA jobs.
+  For i = 0 To 63
+    PokeA(AnvilVkBufferAddress(copyBuf) + 4096 + i, (i * 13 + 7) & $FF)
+    PokeA(AnvilVkBufferAddress(copyBuf) + 8192 + i, $D3)
+  Next
+  uploadRegions[0]\bufferOffset = 4096
+  uploadRegions[0]\bufferRowLength = 0 : uploadRegions[0]\bufferImageHeight = 0
+  uploadRegions[0]\imageOffset\x = 24 : uploadRegions[0]\imageOffset\y = 24
+  readbackRegions[0]\bufferOffset = 8192
+  readbackRegions[0]\bufferRowLength = 0 : readbackRegions[0]\bufferImageHeight = 0
+  readbackRegions[0]\imageOffset\x = 24 : readbackRegions[0]\imageOffset\y = 24
+  bar\image = img2
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  copyRowsBefore = AnvilVkTestBackendCopyRowsCalls()
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, copyBuf, img2, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @uploadRegions[0])
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyImageToBuffer(cmd, img2, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, copyBuf, 1, @readbackRegions[0])
+  pgPut(841, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(842, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(843, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+  pgPut(844, AnvilVkTestBackendCopyRowsCalls() - copyRowsBefore)
+  pgPut(845, AnvilVkImageLayout(img2))
+  pgPut(846, vkGetFenceStatus(dev, fence))
+  count = 0
+  For i = 0 To 63
+    rc = (i * 13 + 7) & $FF
+    If PeekA(AnvilVkBufferAddress(copyBuf) + 8192 + i) <> rc Or PeekA(AnvilVkImageAddress(img2) + ((24 + i / 16) * 32 + 24) * 4 + (i % 16)) <> rc : count = count + 1 : EndIf
+  Next
+  pgPut(847, count)
+  pgPut(848, PeekA(AnvilVkBufferAddress(copyBuf) + 8192 + 64))
   vkDestroyImage(dev, img2, 0) : img2 = #VK_NULL_HANDLE
   vkFreeMemory(dev, mem2, 0) : mem2 = #VK_NULL_HANDLE
   vkDestroyBuffer(dev, copyBuf, 0) : copyBuf = #VK_NULL_HANDLE
