@@ -190,6 +190,7 @@ XIncludeFile "RaspberryPi4/Lib/neon.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 
 CompilerIf #VTP_LIST_PROOF

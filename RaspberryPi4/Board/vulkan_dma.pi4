@@ -1,0 +1,57 @@
+; Guarded Pi 4 DMA transfers for the Vulkan heap. The display channel's
+; original write bound is restored after every synchronous operation.
+Global hwVkDmaOps.i
+
+Procedure.i HwVkDmaWindowContains(base.i, windowBytes.i, dst.i, bytes.i)
+  If base <= 0 Or windowBytes <= 0 Or dst < base Or bytes <= 0
+    ProcedureReturn 0
+  EndIf
+  If bytes > windowBytes Or (dst - base) > (windowBytes - bytes)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i HwVkDmaCopy(base.i, windowBytes.i, source.i, destination.i, bytes.i)
+  Define oldBase.i, oldBytes.i, copied.i, restored.i
+  If HwVkDmaWindowContains(base, windowBytes, destination, bytes) = 0 Or DmaReady() = 0
+    ProcedureReturn 0
+  EndIf
+  oldBase = dma_bounds : oldBytes = dma_boundsN
+  If DmaSetBounds(base, windowBytes) = 0 : ProcedureReturn 0 : EndIf
+  DmaCacheRange(source, bytes)
+  DmaCacheRange(destination, bytes)
+  copied = DmaCopy(destination, source, bytes)
+  If copied <> 0 : DmaCacheRange(destination, bytes) : EndIf
+  restored = DmaSetBounds(oldBase, oldBytes)
+  If copied <> 0 And restored <> 0 : hwVkDmaOps = hwVkDmaOps + 1 : EndIf
+  ProcedureReturn Bool(copied <> 0 And restored <> 0)
+EndProcedure
+
+Procedure.i HwVkDmaFill(base.i, windowBytes.i, destination.i, bytes.i, pattern.i)
+  Define oldBase.i, oldBytes.i, mainBytes.i, tailBytes.i, filled.i, restored.i
+  If HwVkDmaWindowContains(base, windowBytes, destination, bytes) = 0 Or DmaReady() = 0
+    ProcedureReturn 0
+  EndIf
+  If (destination % 4) <> 0 Or (bytes % 4) <> 0 : ProcedureReturn 0 : EndIf
+  oldBase = dma_bounds : oldBytes = dma_boundsN
+  If DmaSetBounds(base, windowBytes) = 0 : ProcedureReturn 0 : EndIf
+  DmaCacheRange(destination, bytes)
+  filled = 1
+  mainBytes = (bytes / 4096) * 4096
+  tailBytes = bytes - mainBytes
+  If mainBytes > 0
+    If DmaFillPattern32(destination, 4096, 4096, mainBytes / 4096, pattern) = 0
+      filled = 0
+    EndIf
+  EndIf
+  If filled <> 0 And tailBytes > 0
+    If DmaFillPattern32(destination + mainBytes, tailBytes, tailBytes, 1, pattern) = 0
+      filled = 0
+    EndIf
+  EndIf
+  If filled <> 0 : DmaCacheRange(destination, bytes) : EndIf
+  restored = DmaSetBounds(oldBase, oldBytes)
+  If filled <> 0 And restored <> 0 : hwVkDmaOps = hwVkDmaOps + 1 : EndIf
+  ProcedureReturn Bool(filled <> 0 And restored <> 0)
+EndProcedure
