@@ -1902,8 +1902,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If imageCopies > 0 And (clears > 0 Or copies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-copy commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
   EndIf
-  If readbackGroups > 1 Or (readbacks > 0 And (clears > 0 Or copies > 0 Or imageCopies > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0))
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires one image-to-buffer DMA readback array in its own command buffer (VkResult -8); no partial command stream was submitted.")
+  If readbacks > 0 And (clears > 0 Or copies > 0 Or imageCopies > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0)
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-to-buffer DMA readback commands in their own command buffer (VkResult -8); no partial command stream was submitted.")
   EndIf
   ; A command buffer is either a transfer or a render pass, never both.
   ; The backend seam carries ONE job, and running the clear and throwing

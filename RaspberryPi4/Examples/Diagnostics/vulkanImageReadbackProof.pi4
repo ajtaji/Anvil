@@ -525,6 +525,30 @@ Procedure.i Main()
     Next
     If status = 138 : Break : EndIf
 
+    If vkResetCommandPool(dev, pool, 0) <> #VK_SUCCESS : status = 139 : Break : EndIf
+    For i = 0 To #VIR_BUFFER_BYTES - 1 : PokeA(bufMap + i, $A5) : Next
+    If vkBeginCommandBuffer(arrayReadCmd, @bi) <> #VK_SUCCESS : status = 140 : Break : EndIf
+    vkCmdCopyImageToBuffer(arrayReadCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @readRegions[0])
+    vkCmdCopyImageToBuffer(arrayReadCmd, img, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, @readRegions[1])
+    If vkEndCommandBuffer(arrayReadCmd) <> #VK_SUCCESS : status = 141 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 142 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = arrayReadCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 143 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 144 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 145 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 146 : Break : EndIf
+    For i = 0 To #VIR_BUFFER_BYTES - 1
+      rc = $A5
+      If i >= 64 And i < 128
+        rc = (#VIR_EXPECT >> (((i - 64) % 4) * 8)) & $FF
+      ElseIf i >= 256 And i < 352 And ((i - 256) % 24) < 16
+        rc = (#VIR_EXPECT >> (((i - 256) % 4) * 8)) & $FF
+      EndIf
+      If (PeekA(bufMap + i) & $FF) <> rc : status = 147 : Break : EndIf
+    Next
+    If status = 147 : Break : EndIf
+
     status = 0
   Until 1
 
