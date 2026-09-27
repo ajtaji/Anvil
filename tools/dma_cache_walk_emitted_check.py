@@ -56,11 +56,15 @@ def fixture(source: str) -> str:
     if len(constants) != 1:
         raise AssertionError("real BCM2711 cache-line contract is not exactly 64 bytes")
     parts = [proc(source, name) for name in
-             ("DmaCacheLine", "DmaCacheLines", "DmaCacheRange", "DmaCacheRect")]
+             ("DmaCacheLine", "dma_NeedsWalk", "DmaCacheLines", "DmaCacheRange", "DmaCacheRect")]
     # The walk's bounds are file-scope in the real library, not the walk's own
     # locals: automatic storage has no address inline assembly can name.
     return ("EnableExplicit\n" + constants[0] +
             "\nGlobal dma_flushaddr.i\nGlobal dma_walklo.i\nGlobal dma_walkhi.i\n" +
+            # The skip policy at its library default (cache may be on, no
+            # Non-Cacheable range): the walk must be the legacy walk.
+            "#DMA_NC_MAX = 4\nGlobal dma_cacheOff.i\nGlobal Dim dma_ncLo.i[#DMA_NC_MAX]\n"
+            "Global Dim dma_ncHi.i[#DMA_NC_MAX]\nGlobal dma_ncN.i\n" +
             "\n\n".join(parts) + """
 Procedure.i Main()
   DmaCacheRange($100000, 64)

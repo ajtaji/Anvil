@@ -851,6 +851,31 @@ Global dma_lastTicks.i = 0     ; CNTPCT_EL0 elapsed over the last wait
 Global dma_lastCs.i   = 0      ; CS as it read at the end of the last wait
 Global dma_lastDebug.i = 0     ; DEBUG likewise
 
+; ----------------------------------------------------------------------
+; WHEN THE WALK IS SKIPPED (2026-09-27). A dc civac walk buys coherence only
+; for lines the D-cache can hold. Two cases where it holds none:
+;   * the D-cache is OFF (SCTLR.C clear): every data access is Non-
+;     Cacheable. On the Pi 5 with caches off a full-screen DMA clear spent
+;     ~16 ms of its ~23 ms here (tools/a64/pi5_draw16_check.py --model);
+;   * the range is mapped Normal Non-Cacheable (the framebuffer, via the
+;     board's CacheMapNc), with no line left over from a cacheable past -
+;     every enable invalidates the whole cache first, every disable cleans
+;     and invalidates it.
+; THIS LIBRARY CANNOT KNOW EITHER, so the OWNER OF THE MMU declares them:
+; DmaSetCacheOff() and DmaAddUncached(). Neither is ever assumed. The
+; defaults are "cache may be on" and "nothing is uncached", so a program
+; that never calls them walks exactly as before - the safe direction. The
+; barrier is kept on every path: a CPU store to Non-Cacheable memory still
+; has to be ordered before the engine is started.
+; Board owner: RaspberryPi4/Board/cache.pi4 CacheDmaPolicy.
+; Gate: tools/cache_coherence_policy_check.py.
+; ----------------------------------------------------------------------
+#DMA_NC_MAX = 4
+Global dma_cacheOff.i = 0      ; 1 = the owner says SCTLR.C is clear
+Global Dim dma_ncLo.i[#DMA_NC_MAX]
+Global Dim dma_ncHi.i[#DMA_NC_MAX]
+Global dma_ncN.i = 0
+
 
 ; ======================================================================
 ;  THE ARCHITECTURAL COUNTER
@@ -964,6 +989,49 @@ EndProcedure
 ; rather than making every caller remember - and it is why this one is
 ; named for the operation rather than for the range.
 ; ----------------------------------------------------------------------
+; The D-cache state, as the MMU owner measured it: 1 = off. See WHEN THE
+; WALK IS SKIPPED above.
+Procedure DmaSetCacheOff(off.i)
+  If off <> 0
+    dma_cacheOff = 1
+  Else
+    dma_cacheOff = 0
+  EndIf
+EndProcedure
+
+; Forget every declared Non-Cacheable range.
+Procedure DmaClearUncached()
+  dma_ncN = 0
+EndProcedure
+
+; Declare [lo, hi) mapped Normal Non-Cacheable. 0 if refused (empty range
+; or the table is full) - a refused range is simply walked, never lost.
+Procedure.i DmaAddUncached(lo.i, hi.i)
+  If hi <= lo Or dma_ncN >= #DMA_NC_MAX
+    ProcedureReturn 0
+  EndIf
+  dma_ncLo[dma_ncN] = lo
+  dma_ncHi[dma_ncN] = hi
+  dma_ncN = dma_ncN + 1
+  ProcedureReturn 1
+EndProcedure
+
+; 1 if [addr, addr+len) can hold a D-cache line, so the walk is needed.
+Procedure.i dma_NeedsWalk(addr.i, len.i)
+  Protected i.i
+  If dma_cacheOff <> 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < dma_ncN
+    If addr >= dma_ncLo[i] And (addr + len) <= dma_ncHi[i]
+      ProcedureReturn 0
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 1
+EndProcedure
+
 Procedure DmaCacheLines(addr.i, len.i)
   Protected a.i
   Protected e.i
@@ -1010,7 +1078,12 @@ EndProcedure
 ; can never be wrong - and it is left that way rather than testing the
 ; length twice. Nothing in this tree calls it with zero.
 Procedure DmaCacheRange(addr.i, len.i)
-  DmaCacheLines(addr, len)
+  ; The skip test lives in the two public walks, not in DmaCacheLines, so
+  ; the per-line loop stays call-free and a rectangle pays one test, not
+  ; one per row. The barrier is kept either way.
+  If dma_NeedsWalk(addr, len) <> 0
+    DmaCacheLines(addr, len)
+  EndIf
   a64_barrier()                  ; dsb sy + isb, from the intrinsics
 EndProcedure
 
@@ -1054,14 +1127,18 @@ Procedure DmaCacheRect(addr.i, pitch.i, rowBytes.i, rows.i)
     ProcedureReturn
   EndIf
 
-  If pitch = rowBytes
-    DmaCacheLines(addr, rowBytes * rows)
-  Else
-    r = 0
-    While r < rows
-      DmaCacheLines(addr + (r * pitch), rowBytes)
-      r = r + 1
-    Wend
+  ; One test for the whole rectangle rather than one per row; the one
+  ; barrier below is kept either way.
+  If dma_NeedsWalk(addr, (pitch * (rows - 1)) + rowBytes) <> 0
+    If pitch = rowBytes
+      DmaCacheLines(addr, rowBytes * rows)
+    Else
+      r = 0
+      While r < rows
+        DmaCacheLines(addr + (r * pitch), rowBytes)
+        r = r + 1
+      Wend
+    EndIf
   EndIf
 
   a64_barrier()
