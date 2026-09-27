@@ -1,0 +1,460 @@
+; ======================================================================
+;  rp1_pwm.pi4 - the Raspberry Pi 5 fan connector: RP1's PWM1 channel 3
+;  on RP1 GPIO45, and the fan's tachometer on RP1 GPIO29, counted by
+;  polling. BCM2712 ONLY (-t pi5, #PMF_CHIP = 2712).
+;
+;  WHY THIS IS A SEPARATE LIBRARY AND NOT A #PMF_CHIP BRANCH OF pwm.pi4.
+;  RaspberryPi4/Lib/pwm.pi4 drives the BCM2711's own PWM blocks: a CTL
+;  byte per channel, RNG/DAT pairs, a status register whose BERR bit is
+;  the only way to see a start that did not happen, and a clock manager
+;  that needs a password on every write. RP1's PWM is a different IP -
+;  a GLOBAL_CTRL enable per channel with a self-clearing SET_UPDATE, four
+;  channels of CTRL/RANGE/PHASE/DUTY, per-channel output inversion, and
+;  a clock in RP1's own clock manager with no password at all. Not one
+;  register offset or bit is shared. A branch inside pwm.pi4 would be two
+;  drivers in one file; this is the other driver, and it exists once.
+;  The fan POLICY is not here and not duplicated: Anvil/Core/fan.pbi and
+;  Anvil/Core/fan_cmd.pbi are the same files on both boards.
+;
+;  SOURCES (pinned: vault "Raspberry Pi 5/Sources", and raspberrypi/linux
+;  commit 7e030b60792de1c15b9ec1d8d5d34d63f0f0f1d8):
+;    bcm2712-rpi-5-b.dts   cooling_fan: pwms = <&rp1_pwm1 3 41566
+;                          PWM_POLARITY_INVERTED>; &rp1_pwm1 pinctrl
+;                          rp1_pwm1_gpio45; gpio-line-names GPIO29
+;                          "FAN_TACH", GPIO45 "FAN_PWM".
+;    rp1.dtsi              pwm@9c000 reg <0xc0 0x4009c000 ...>,
+;                          assigned-clock-rates <50000000>;
+;                          rp1_pwm1_gpio45 { function = "pwm1";
+;                          bias-pull-down; }; rp1_gpio reg d0000/e0000/
+;                          f0000 (IO_BANK, SYS_RIO, PADS).
+;    drivers/pwm/pwm-rp1.c the reference implementation the RP1 manual
+;                          itself points to (rp1-peripherals.pdf 3.4.5):
+;                          CHANNEL_CTRL(x) 0x14+16x, RANGE(x) 0x18+16x,
+;                          DUTY(x) 0x20+16x, default ctrl BIT(8)+BIT(0),
+;                          polarity BIT(3), SET_UPDATE BIT(31), and the
+;                          arithmetic: clk_period = round(1e9 / rate),
+;                          RANGE = round(period / clk_period),
+;                          DUTY = round(duty / clk_period).
+;    drivers/clk/clk-rp1.c CLK_PWM1_CTRL 0x84, DIV_INT 0x88, DIV_FRAC
+;                          0x8c; CLK_CTRL_ENABLE BIT(11), AUXSRC bits
+;                          9:5; clk_pwm1's aux parent 2 is the crystal.
+;    pinctrl-rp1.c         banks {0,28,0x0000} {28,6,0x4000}
+;                          {34,20,0x8000}; ctrl = gpio + n*8 + 4, pad =
+;                          pads + bank + 4 + n*4, RIO IN +8, OE +4,
+;                          CLR alias +0x3000; FUNCSEL 5 = gpio (SYS_RIO);
+;                          PIN(45, pwm1, ...) = FUNCSEL 0.
+;    rp1-peripherals.pdf   3.4 PWM, Tables 25, 26, 31.
+;  RP1's window: rp1.dtsi 0xc0_40xxxxxx is CPU $1F_00xxxxxx (vault
+;  HARDWARE-BRINGUP.md; the same reach uart.pi4 uses for RP1 UART0).
+;
+;  THE POLARITY IS THE DEVICE TREE'S. The connector's FAN_PWM line is
+;  inverted on the board, so the channel's INVERT bit is set and DUTY is
+;  the fan's own duty: DUTY = 0 is a stopped fan, DUTY = RANGE is full.
+;  That is exactly how Linux drives it (pwm-fan writes duty_cycle =
+;  period * level / 255 into an INVERTED pwm).
+;
+;  THE TACHOMETER. The Linux device tree reads RPM from rp1_pwm1 + 0x3c
+;  (rpm-regmap / rpm-offset), which the RP1 manual lists only as
+;  CHAN2_PHASE - a value some firmware maintains, undocumented. This file
+;  does NOT read it. It counts the tach line's rising edges itself, by
+;  polling GPIO29 through SYS_RIO, over a window measured with Micros(),
+;  at two pulses per revolution (pwm-fan.c's default). A window in which
+;  the polls were too far apart to be sure of every edge answers
+;  #RP1_TACH_COARSE, not a number - an under-sampled tach silently reads
+;  low, which is the one wrong answer a fan report must not give.
+;
+;  NOT VERIFIED ON A Pi 5. Desk-proven only (tools/a64/a64_fan_pi5_check.py
+;  against a register model built from the sources above). Silicon owed.
+;
+;  REQUIRES (house rule 10 - the board lists every library):
+;      RaspberryPi4/Lib/timer.pi4     Micros() for Rp1TachMeasure
+; ======================================================================
+
+; A BUILD FOR ANY OTHER CHIP IS REFUSED, BY NAME. The dialect has no
+; CompilerError, so the refusal is a call to a procedure that does not
+; exist and whose name is the sentence: the compiler's "is not defined"
+; error then says what went wrong and what to include instead.
+CompilerIf #PMF_CHIP <> 2712
+rp1_pwm_is_the_BCM2712_fan_driver_build_with_t_pi5_a_BCM2711_board_uses_pwm_pi4()
+CompilerEndIf
+
+; ----------------------------------------------------------------------
+;  RP1 blocks, CPU addresses ($1F_00xxxxxx = RP1 $c0_40xxxxxx).
+; ----------------------------------------------------------------------
+#RP1PWM_BASE   = $1F0009C000   ; rp1.dtsi pwm@9c000 (rp1_pwm1)
+#RP1PWM_CLOCKS = $1F00018000   ; rp1.dtsi clocks@18000
+#RP1PWM_IOBANK = $1F000D0000   ; rp1_gpio reg 0 (IO_BANK0..2)
+#RP1PWM_RIO    = $1F000E0000   ; rp1_gpio reg 1 (SYS_RIO0..2)
+#RP1PWM_PADS   = $1F000F0000   ; rp1_gpio reg 2 (PADS_BANK0..2)
+
+; ----------------------------------------------------------------------
+;  PWM registers (pwm-rp1.c; rp1-peripherals.pdf Table 25).
+; ----------------------------------------------------------------------
+#RP1PWM_GLOBAL_CTRL = $00
+#RP1PWM_CHAN        = 3            ; cooling_fan pwms = <&rp1_pwm1 3 ...>
+#RP1PWM_CHAN_CTRL   = $14 + 16 * #RP1PWM_CHAN   ; $44
+#RP1PWM_CHAN_RANGE  = $18 + 16 * #RP1PWM_CHAN   ; $48
+#RP1PWM_CHAN_DUTY   = $20 + 16 * #RP1PWM_CHAN   ; $50
+#RP1PWM_SET_UPDATE  = $80000000    ; GLOBAL_CTRL bit 31, self-clearing
+#RP1PWM_CHAN_EN     = 1 << #RP1PWM_CHAN
+#RP1PWM_CTRL_DEFAULT = $101        ; FIFO_POP_MASK | MODE 1 trailing edge
+#RP1PWM_CTRL_INVERT  = 8           ; PWM_POLARITY, BIT(3)
+
+; ----------------------------------------------------------------------
+;  clk_pwm1 (clk-rp1.c). No password, no BUSY bit: RP1's clock manager
+;  is not the BCM2711's CPRMAN.
+; ----------------------------------------------------------------------
+#RP1PWM_CLK_CTRL     = $84
+#RP1PWM_CLK_DIV_INT  = $88
+#RP1PWM_CLK_DIV_FRAC = $8C
+#RP1PWM_CLK_ENABLE   = $800        ; CLK_CTRL_ENABLE, BIT(11)
+#RP1PWM_CLK_AUXSRC   = $3E0        ; CLK_CTRL_AUXSRC_MASK, GENMASK(9, 5)
+#RP1PWM_CLK_XOSC     = 2 << 5      ; aux parent 2 = the 50 MHz crystal
+#RP1PWM_XOSC_HZ      = 50000000
+#RP1PWM_CLK_HZ       = 50000000    ; rp1.dtsi assigned-clock-rates, DIV 1
+
+; ----------------------------------------------------------------------
+;  The two pins. Addresses derived in the header's formula, written out
+;  so a reader can hold each against pinctrl-rp1.c's bank table.
+;    GPIO45 = bank 2 (base 34, $8000) index 11
+;    GPIO29 = bank 1 (base 28, $4000) index 1
+; ----------------------------------------------------------------------
+#RP1PWM_FAN_GPIO   = 45
+#RP1PWM_FAN_CTRL   = #RP1PWM_IOBANK + $8000 + 11 * 8 + 4   ; $...805C
+#RP1PWM_FAN_PAD    = #RP1PWM_PADS + $8004 + 11 * 4         ; $...8030
+#RP1PWM_FAN_FSEL   = 0                                      ; pwm1
+
+#RP1PWM_TACH_GPIO  = 29
+#RP1PWM_TACH_CTRL  = #RP1PWM_IOBANK + $4000 + 1 * 8 + 4    ; $...400C
+#RP1PWM_TACH_PAD   = #RP1PWM_PADS + $4004 + 1 * 4          ; $...4008
+#RP1PWM_TACH_RIO   = #RP1PWM_RIO + $4000                   ; SYS_RIO1
+#RP1PWM_TACH_BIT   = 1 << 1
+#RP1PWM_FSEL_GPIO  = 5
+
+; GPIO CTRL fields cleared when a function is chosen (pinctrl-rp1.c
+; rp1_set_fsel: FUNCSEL, and OUTOVER/OEOVER back to "peripheral").
+#RP1PWM_CTRL_CLEAR = $1F | $3000 | $C000
+; Pad fields (pinctrl-rp1.c RP1_PAD_*).
+#RP1PWM_PAD_PULL   = $0C
+#RP1PWM_PAD_PULLDN = $04           ; RP1_PUD_DOWN << 2 (bias-pull-down)
+#RP1PWM_PAD_PULLUP = $08           ; RP1_PUD_UP << 2
+#RP1PWM_PAD_IE     = $40
+#RP1PWM_PAD_OD     = $80
+
+#RP1PWM_RIO_IN     = $08
+#RP1PWM_RIO_OE     = $04
+#RP1PWM_RIO_CLR    = $3000
+
+; ----------------------------------------------------------------------
+;  Design choices, not citations.
+;  RANGE_MIN: a range of at least 1000 counts gives every permille step
+;  its own count, so the fan command's resolution is never a lie. At
+;  50 MHz that caps the frequency at 50 kHz; a four-pin fan wants 25.
+; ----------------------------------------------------------------------
+#RP1PWM_RANGE_MIN = 1000
+#RP1PWM_RANGE_MAX = $FFFFFFFF
+#RP1PWM_DUTY_MAX  = 1000
+#RP1PWM_SPIN_MAX  = 100000         ; SET_UPDATE polls before giving up
+
+#RP1PWM_OK        = 0
+#RP1PWM_ERR_HZ    = -2
+#RP1PWM_ERR_DUTY  = -3
+#RP1PWM_ERR_STATE = -5
+#RP1PWM_ERR_CLOCK = -7             ; clk_pwm1 did not read back as asked
+#RP1PWM_ERR_START = -8             ; SET_UPDATE never self-cleared
+
+; The tachometer.
+#RP1_TACH_PPR       = 2            ; pwm-fan.c default pulses-per-revolution
+#RP1_TACH_WINDOW_US = 1000000      ; one measurement per second
+#RP1_TACH_GAP_US    = 1000         ; a longer gap between polls = coarse
+#RP1_TACH_NONE      = -1           ; no complete window yet
+#RP1_TACH_COARSE    = -2           ; polled too slowly to trust a count
+
+Global rp1pwm_on.i
+Global rp1pwm_range.i
+Global rp1pwm_permille.i
+Global rp1pwm_counts.i
+
+Global rp1tach_on.i
+Global rp1tach_last.i
+Global rp1tach_edges.i
+Global rp1tach_total.i
+Global rp1tach_winStart.i
+Global rp1tach_lastPoll.i
+Global rp1tach_maxGap.i
+Global rp1tach_rpm.i = #RP1_TACH_NONE
+
+; ======================================================================
+;  THE ARITHMETIC - pwm-rp1.c's, restated, and pure so a gate can walk it
+; ======================================================================
+; The nanosecond period the seam's hertz asks for, rounded to nearest.
+Procedure.i Rp1PwmPeriodNs(hz.i)
+  If hz <= 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn (1000000000 + hz / 2) / hz
+EndProcedure
+
+; RANGE for a period: DIV_ROUND_CLOSEST(period, clk_period) with
+; clk_period = DIV_ROUND_CLOSEST(NSEC_PER_SEC, rate) - 20 ns at 50 MHz.
+; 0 when the result is outside the envelope.
+Procedure.i Rp1PwmRangeFor(hz.i)
+  Define clkNs.i
+  Define r.i
+  clkNs = (1000000000 + #RP1PWM_CLK_HZ / 2) / #RP1PWM_CLK_HZ
+  r = (Rp1PwmPeriodNs(hz) + clkNs / 2) / clkNs
+  If r < #RP1PWM_RANGE_MIN Or r > #RP1PWM_RANGE_MAX
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn r
+EndProcedure
+
+; DUTY counts for a permille. The rails are exact - 0 is 0 and 1000 is
+; the whole range - and everything between rounds to nearest.
+Procedure.i Rp1PwmCounts(range.i, permille.i)
+  If permille <= 0
+    ProcedureReturn 0
+  EndIf
+  If permille >= #RP1PWM_DUTY_MAX
+    ProcedureReturn range
+  EndIf
+  ProcedureReturn (range * permille + #RP1PWM_DUTY_MAX / 2) / #RP1PWM_DUTY_MAX
+EndProcedure
+
+; ======================================================================
+;  THE CHANNEL
+; ======================================================================
+; rp1pwm_Update() - request a settings update and wait for the PWM clock
+; domain to take it. SET_UPDATE self-clears only when clk_pwm1 is
+; running, so a bit that never clears is a channel that never started:
+; the RP1 form of the BCM2711's BERR lesson, and it is answered loudly.
+Procedure.i rp1pwm_Update()
+  Define n.i
+  PokeL(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL, PeekN(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL) | #RP1PWM_SET_UPDATE)
+  n = 0
+  While (PeekN(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL) & #RP1PWM_SET_UPDATE) <> 0
+    n = n + 1
+    If n > #RP1PWM_SPIN_MAX
+      ProcedureReturn #RP1PWM_ERR_START
+    EndIf
+  Wend
+  ProcedureReturn #RP1PWM_OK
+EndProcedure
+
+; Rp1PwmBegin(hz) - clock, channel, then pin, and the fan starts STOPPED
+; (DUTY 0); the policy's first Duty call is what turns it.
+Procedure.i Rp1PwmBegin(hz.i)
+  Define r.i
+  Define v.i
+  r = Rp1PwmRangeFor(hz)
+  If r = 0
+    ProcedureReturn #RP1PWM_ERR_HZ
+  EndIf
+
+  ; clk_pwm1: crystal with ENABLE clear, divide by one, then ENABLE.
+  v = PeekN(#RP1PWM_CLOCKS + #RP1PWM_CLK_CTRL)
+  v = (v & (~(#RP1PWM_CLK_ENABLE | #RP1PWM_CLK_AUXSRC))) | #RP1PWM_CLK_XOSC
+  PokeL(#RP1PWM_CLOCKS + #RP1PWM_CLK_CTRL, v)
+  PokeL(#RP1PWM_CLOCKS + #RP1PWM_CLK_DIV_INT, 1)
+  PokeL(#RP1PWM_CLOCKS + #RP1PWM_CLK_DIV_FRAC, 0)
+  PokeL(#RP1PWM_CLOCKS + #RP1PWM_CLK_CTRL, v | #RP1PWM_CLK_ENABLE)
+  v = PeekN(#RP1PWM_CLOCKS + #RP1PWM_CLK_CTRL)
+  If (v & (#RP1PWM_CLK_ENABLE | #RP1PWM_CLK_AUXSRC)) <> (#RP1PWM_CLK_ENABLE | #RP1PWM_CLK_XOSC)
+    ProcedureReturn #RP1PWM_ERR_CLOCK
+  EndIf
+  If PeekN(#RP1PWM_CLOCKS + #RP1PWM_CLK_DIV_INT) <> 1
+    ProcedureReturn #RP1PWM_ERR_CLOCK
+  EndIf
+
+  ; The channel, in pwm-rp1.c's order: mode, duty, range, polarity,
+  ; enable, update.
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_CTRL, #RP1PWM_CTRL_DEFAULT)
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, 0)
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_RANGE, r)
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_CTRL, #RP1PWM_CTRL_DEFAULT | #RP1PWM_CTRL_INVERT)
+  PokeL(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL, PeekN(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL) | #RP1PWM_CHAN_EN)
+  If rp1pwm_Update() <> #RP1PWM_OK
+    PokeL(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL, PeekN(#RP1PWM_BASE + #RP1PWM_GLOBAL_CTRL) & (~#RP1PWM_CHAN_EN))
+    ProcedureReturn #RP1PWM_ERR_START
+  EndIf
+
+  ; The pin, last, so the pad first sees a configured channel: FUNCSEL 0
+  ; (pwm1), output from the peripheral, input on, output on, pull-down.
+  v = PeekN(#RP1PWM_FAN_CTRL)
+  PokeL(#RP1PWM_FAN_CTRL, (v & (~#RP1PWM_CTRL_CLEAR)) | #RP1PWM_FAN_FSEL)
+  v = PeekN(#RP1PWM_FAN_PAD)
+  v = (v & (~(#RP1PWM_PAD_PULL | #RP1PWM_PAD_OD))) | #RP1PWM_PAD_IE | #RP1PWM_PAD_PULLDN
+  PokeL(#RP1PWM_FAN_PAD, v)
+
+  rp1pwm_range = r
+  rp1pwm_permille = 0
+  rp1pwm_counts = 0
+  rp1pwm_on = 1
+  ProcedureReturn #RP1PWM_OK
+EndProcedure
+
+; DUTY has its own update strobe (Table 26) - no SET_UPDATE needed.
+Procedure.i Rp1PwmDuty(permille.i)
+  If rp1pwm_on = 0
+    ProcedureReturn #RP1PWM_ERR_STATE
+  EndIf
+  If permille < 0 Or permille > #RP1PWM_DUTY_MAX
+    ProcedureReturn #RP1PWM_ERR_DUTY
+  EndIf
+  rp1pwm_counts = Rp1PwmCounts(rp1pwm_range, permille)
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, rp1pwm_counts)
+  rp1pwm_permille = permille
+  ProcedureReturn #RP1PWM_OK
+EndProcedure
+
+; Rp1PwmEnd() - release, leaving the fan at FULL. The seam's contract is
+; "the state the board considers safe for a fan", and on this connector
+; the one level whose meaning the device tree fixes is DUTY = RANGE with
+; the channel inverted and running: full speed. A disabled channel's idle
+; level through the inverter is not documented, so it is not relied on.
+Procedure.i Rp1PwmEnd()
+  If rp1pwm_on = 0
+    ProcedureReturn #RP1PWM_ERR_STATE
+  EndIf
+  PokeL(#RP1PWM_BASE + #RP1PWM_CHAN_DUTY, rp1pwm_range)
+  rp1pwm_counts = rp1pwm_range
+  rp1pwm_permille = #RP1PWM_DUTY_MAX
+  rp1pwm_on = 0
+  ProcedureReturn #RP1PWM_OK
+EndProcedure
+
+Procedure.i Rp1PwmOn()
+  ProcedureReturn rp1pwm_on
+EndProcedure
+
+Procedure.i Rp1PwmRange()
+  ProcedureReturn rp1pwm_range
+EndProcedure
+
+Procedure.i Rp1PwmDutyNow()
+  ProcedureReturn rp1pwm_permille
+EndProcedure
+
+Procedure.i Rp1PwmHz()
+  If rp1pwm_range = 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn #RP1PWM_CLK_HZ / rp1pwm_range
+EndProcedure
+
+; The clock READ BACK, not remembered: crystal / DIV_INT (0 means 65536,
+; clk-rp1.c), or -1 when clk_pwm1 is off or not on the crystal.
+Procedure.i Rp1PwmDivisor()
+  Define d.i
+  d = PeekN(#RP1PWM_CLOCKS + #RP1PWM_CLK_DIV_INT) & $FFFF
+  If d = 0
+    d = 65536
+  EndIf
+  ProcedureReturn d
+EndProcedure
+
+Procedure.i Rp1PwmClockHz()
+  Define v.i
+  v = PeekN(#RP1PWM_CLOCKS + #RP1PWM_CLK_CTRL)
+  If (v & (#RP1PWM_CLK_ENABLE | #RP1PWM_CLK_AUXSRC)) <> (#RP1PWM_CLK_ENABLE | #RP1PWM_CLK_XOSC)
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn #RP1PWM_XOSC_HZ / Rp1PwmDivisor()
+EndProcedure
+
+; ======================================================================
+;  THE TACHOMETER
+; ======================================================================
+Procedure.i Rp1TachLevel()
+  If (PeekN(#RP1PWM_TACH_RIO + #RP1PWM_RIO_IN) & #RP1PWM_TACH_BIT) <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Rp1TachBegin(nowUs) - GPIO29 as a plain input (FUNCSEL 5, SYS_RIO OE
+; cleared), input enabled, output disabled, pulled UP: the tach output of
+; a four-wire fan is open-collector. The pull is a choice, not a citation.
+Procedure Rp1TachBegin(nowUs.i)
+  Define v.i
+  v = PeekN(#RP1PWM_TACH_CTRL)
+  PokeL(#RP1PWM_TACH_CTRL, (v & (~#RP1PWM_CTRL_CLEAR)) | #RP1PWM_FSEL_GPIO)
+  PokeL(#RP1PWM_TACH_RIO + #RP1PWM_RIO_CLR + #RP1PWM_RIO_OE, #RP1PWM_TACH_BIT)
+  v = PeekN(#RP1PWM_TACH_PAD)
+  v = (v & (~#RP1PWM_PAD_PULL)) | #RP1PWM_PAD_IE | #RP1PWM_PAD_OD | #RP1PWM_PAD_PULLUP
+  PokeL(#RP1PWM_TACH_PAD, v)
+  rp1tach_last = Rp1TachLevel()
+  rp1tach_edges = 0
+  rp1tach_total = 0
+  rp1tach_winStart = nowUs
+  rp1tach_lastPoll = nowUs
+  rp1tach_maxGap = 0
+  rp1tach_rpm = #RP1_TACH_NONE
+  rp1tach_on = 1
+EndProcedure
+
+; Rp1TachPollWindow(nowUs, windowUs) - one sample; closes the window when
+; it has run its length. Rising edges only, two per revolution.
+Procedure Rp1TachPollWindow(nowUs.i, windowUs.i)
+  Define lv.i
+  Define gap.i
+  Define el.i
+  If rp1tach_on = 0
+    ProcedureReturn
+  EndIf
+  gap = nowUs - rp1tach_lastPoll
+  If gap > rp1tach_maxGap
+    rp1tach_maxGap = gap
+  EndIf
+  rp1tach_lastPoll = nowUs
+  lv = Rp1TachLevel()
+  If lv = 1 And rp1tach_last = 0
+    rp1tach_edges = rp1tach_edges + 1
+    rp1tach_total = rp1tach_total + 1
+  EndIf
+  rp1tach_last = lv
+  el = nowUs - rp1tach_winStart
+  If el >= windowUs
+    If rp1tach_maxGap > #RP1_TACH_GAP_US
+      rp1tach_rpm = #RP1_TACH_COARSE
+    Else
+      rp1tach_rpm = (rp1tach_edges * 60000000) / (#RP1_TACH_PPR * el)
+    EndIf
+    rp1tach_edges = 0
+    rp1tach_maxGap = 0
+    rp1tach_winStart = nowUs
+  EndIf
+EndProcedure
+
+; The periodic form, for the monitor's tick.
+Procedure Rp1TachPoll(nowUs.i)
+  Rp1TachPollWindow(nowUs, #RP1_TACH_WINDOW_US)
+EndProcedure
+
+; Rp1TachMeasure(windowUs) - a blocking measurement: poll as fast as the
+; core can for one window and answer it. For the report and the bench.
+Procedure.i Rp1TachMeasure(windowUs.i)
+  Define t.i
+  If rp1tach_on = 0
+    Rp1TachBegin(Micros())
+  EndIf
+  t = Micros()
+  rp1tach_edges = 0
+  rp1tach_maxGap = 0
+  rp1tach_winStart = t
+  rp1tach_lastPoll = t
+  rp1tach_last = Rp1TachLevel()
+  rp1tach_rpm = #RP1_TACH_NONE
+  While rp1tach_rpm = #RP1_TACH_NONE
+    Rp1TachPollWindow(Micros(), windowUs)
+  Wend
+  ProcedureReturn rp1tach_rpm
+EndProcedure
+
+Procedure.i Rp1TachRpm()
+  ProcedureReturn rp1tach_rpm
+EndProcedure
+
+Procedure.i Rp1TachEdges()
+  ProcedureReturn rp1tach_total
+EndProcedure

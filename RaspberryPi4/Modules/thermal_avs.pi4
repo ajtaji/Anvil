@@ -136,8 +136,20 @@ Seam #SVCCAP_THERMAL
 
 ; The two coefficients, named separately so a reader can check each one
 ; against the device tree line rather than against a folded constant.
+;
+; BCM2712 (-t pi5, #PMF_CHIP = 2712): the same block and the same driver -
+; bcm2712-ds.dtsi avs-monitor@7d542000 carries a "brcm,bcm2711-thermal"
+; child - with its own line, &cpu_thermal { coefficients = <(-550) 450000>; }
+; (bcm2712-ds.dtsi, cpu-thermal). Only the two numbers differ. NOTE: the
+; module header carries an architecture, not a chip, so a THERMAL.MOD
+; built -t pi4 would load on a Pi 5 and read with the wrong line.
+CompilerIf #PMF_CHIP = 2712
+#AVS_TEMP_SLOPE  = -550
+#AVS_TEMP_OFFSET = 450000
+CompilerElse
 #AVS_TEMP_SLOPE  = -487
 #AVS_TEMP_OFFSET = 410040
+CompilerEndIf
 
 ; The block base the board handed us at init. Zero until then, and a read
 ; before init answers the sentinel rather than dereferencing zero.

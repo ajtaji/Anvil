@@ -363,8 +363,26 @@ def const_in(text: str, name: str, where: str) -> int:
     return int(v)
 
 
+def pi4_view(text: str) -> str:
+    """The text as -t pi4 compiles it: every `CompilerIf #PMF_CHIP = 2712`
+    branch dropped up to its CompilerElse, so a BCM2712 value written
+    first under Rule 30 is never read as the Pi 4's."""
+    out, skip = [], False
+    for ln in text.split("\n"):
+        s = ln.strip()
+        if re.match(r"CompilerIf\s+#PMF_CHIP\s*=\s*2712\b", s):
+            skip = True
+            continue
+        if skip and s.startswith("CompilerElse"):
+            skip = False
+            continue
+        if not skip:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def const(rel: str, name: str) -> int:
-    return const_in(source(rel), name, rel)
+    return const_in(pi4_view(source(rel)), name, rel)
 
 
 class Policy:
