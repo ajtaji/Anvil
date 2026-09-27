@@ -3107,6 +3107,23 @@ EndProcedure
 ; does not do. To add it: double the half-word, require
 ; (dsp_pitch & 1) = 0, and add a 16bpp group to the gate FIRST.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+; DisplayFillWord(colour) - BCM2712: the 32-bit word DmaFillPattern32
+; repeats to fill with `colour` at the surface's depth. At 16 bpp the
+; 5:6:5 half-word is doubled into both halves (the recipe in the note
+; above); at 32 bpp it is the pixel itself. Every row of a 16 bpp fill
+; must start on an even byte, which DspDmaReady guarantees by refusing an
+; odd base or pitch - x * 2 is then always even.
+; ----------------------------------------------------------------------
+Procedure.i DisplayFillWord(colour.i)
+  If dsp_bpp = 2
+    ProcedureReturn ((colour & $FFFF) << 16) | (colour & $FFFF)
+  EndIf
+  ProcedureReturn colour & $FFFFFFFF
+EndProcedure
+CompilerEndIf
+
 Procedure.i DspDmaReady()
   If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
   If dsp_ready = 0
@@ -3115,9 +3132,22 @@ Procedure.i DspDmaReady()
   If dsp_dmaOn = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the firmware's surface is 5:6:5. Accepted when every row
+  ; starts on an even byte; tools/a64/pi5_draw16_check.py is the 16 bpp
+  ; group the note above asks for, run before this was switched on.
+  If dsp_bpp = 2
+    If (dsp_pitch & 1) <> 0 Or (dsp_base & 1) <> 0
+      ProcedureReturn 0
+    EndIf
+  ElseIf dsp_bpp <> 4
+    ProcedureReturn 0
+  EndIf
+  CompilerElse
   If dsp_bpp <> 4
     ProcedureReturn 0
   EndIf
+  CompilerEndIf
   If DmaReady() = 0
     ProcedureReturn 0
   EndIf
@@ -3223,6 +3253,10 @@ Procedure.i DspDmaFill(x.i, y.i, w.i, h.i, colour.i)
   DspDmaSyncRect(x0, y0, x1 - x0, rows)
 
   ; --- 2. the transfer -----------------------------------------------
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: the word the engine repeats, at the surface's depth.
+  colour = DisplayFillWord(colour)
+  CompilerEndIf
   If DmaFillPattern32(dst, dsp_pitch, rowBytes, rows, colour & $FFFFFFFF) = 0
     ; THE ENGINE WAS ASKED AND SAID NO. Counted separately from a policy
     ; fallback because the two mean completely different things: this

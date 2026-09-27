@@ -1271,6 +1271,17 @@ Procedure.i ScreenFastScroll(n.i)
   If DmaCopy(dst, src, keep * pitch) = 0
     ProcedureReturn 0
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: DmaFill32 is 4 bytes a pixel and the surface may be 2 - the
+  ; vacated rows are filled at the surface's own depth with the word
+  ; DspDmaFill uses (DisplayFillWord). The fallback is the one below.
+  If DisplayBytesPerPixel() = 2
+    If DmaFillPattern32(dst + (keep * pitch), pitch, DisplayWidth() * 2, n * chgt, DisplayFillWord(gScreenBg)) = 0
+      DisplayFillRect(0, LogoHeight() + keep, DisplayWidth(), n * chgt, gScreenBg)
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  CompilerEndIf
   If DmaFill32(dst + (keep * pitch), pitch, DisplayWidth(), n * chgt, gScreenBg) = 0
     ; THE COPY HAS ALREADY LANDED, so returning 0 here would be wrong:
     ; the caller's fallback would print the line feed, the library would
