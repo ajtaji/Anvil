@@ -13,9 +13,25 @@
 ;  choice this project already made for RA4M1AndRelated/Lib/gpio.unor4
 ;  alongside this one.
 ;
-;  Only IO bank 0 (RP1 GPIO0..27, the ones RP1 brings to the Pi 5 40-pin
-;  header) is implemented. Banks 1 and 2 (RP1 GPIO28..53, on-board uses)
-;  are out of scope for this pass and Rp1PinValid() refuses them.
+;  ALL THREE IO BANKS, since 2026-09-26 (late night): bank 0 = RP1 GPIO0..27
+;  (the Pi 5 40-pin header), bank 1 = GPIO28..33, bank 2 = GPIO34..53
+;  (on-board uses: GPIO42/43 USB VBUS switch, GPIO44 PWR LED, GPIO45 fan
+;  PWM - bcm2712-rpi-5-b.dts). One address rule for every pin, taken from
+;  pinctrl-rp1.c:291-296, rp1_iobanks[]:
+;
+;              first  count  gpio    rio     pads
+;    bank 0      0     28   $0000   $0000   $0004
+;    bank 1     28      6   $4000   $4000   $4004
+;    bank 2     34     20   $8000   $8000   $8004
+;
+;  and pinctrl-rp1.c:1645-1653: pin->offset = j (the pin's index WITHIN its
+;  bank), gpio = gpio_base + gpio_offset + j*8, rio = rio_base + rio_offset
+;  (one OUT/OE/IN word set per bank, bit j), pad = pads_base + pads_offset
+;  + j*4. The three windows are $C000 long (rp1.dtsi:483-485) - exactly
+;  three $4000 bank blocks, each with its own XOR/SET/CLR aliases.
+;
+;  #RP1_PIN_MAX STAYS 27 AND STILL MEANS THE HEADER: hw_gpio.pi4 advertises
+;  that many lines. The library's own limit is #RP1_GPIO_LAST (53).
 ;
 ;  ---- WHERE THE ADDRESSES COME FROM (rule 21: do not guess) -----------
 ;
@@ -202,9 +218,30 @@ EnableExplicit
 #RP1_PIN_LOW  = 0
 #RP1_PIN_HIGH = 1
 
-; Bank 0 only - RP1 GPIO 0..27, the ones this southbridge brings to the
-; Pi 5 40-pin header. Banks 1/2 (28..53) are out of scope for this pass.
+; The HEADER: RP1 GPIO 0..27, bank 0 - what hw_gpio.pi4 advertises.
 #RP1_PIN_MAX = 27
+
+; Every RP1 GPIO line, all three banks (pinctrl-rp1.c rp1_iobanks[]).
+#RP1_GPIO_LAST = 53
+#RP1_BANK1_FIRST = 28
+#RP1_BANK2_FIRST = 34
+; A bank's block inside each window: gpio_offset = rio_offset = bank * $4000,
+; pads_offset = bank * $4000 + 4 (the +4 skips the bank voltage-select word).
+#RP1_BANK_STRIDE = $4000
+
+; On-board lines (bcm2712-rpi-5-b.dts) and the FUNCSEL columns that name
+; their function in pinctrl-rp1.c's PIN() table (lines 524-527):
+;   PIN(42, gpclk5, uart5, vbus1, spi6, i2s2, gpio, proc_rio, _, _)
+;   PIN(43, gpclk4, uart5, vbus1, spi6, i2s2, gpio, proc_rio, _, _)
+;   PIN(44, gpclk5, i2c5,  pwm1,  spi6, i2s2, gpio, proc_rio, _, _)
+;   PIN(45, pwm1,   i2c5,  spi7,  spi6, i2s2, gpio, proc_rio, _, _)
+#RP1_GPIO_USB_VBUS_EN = 42     ; &rp1_usb0 usb_vbus_pins, USB_VBUS_EN
+#RP1_GPIO_USB_OC_N    = 43     ; USB_OC_N
+#RP1_GPIO_PWR_LED     = 44     ; led_pwr, gpios <&rp1_gpio 44 ACTIVE_LOW> - plain GPIO (5)
+#RP1_GPIO_FAN_PWM     = 45     ; &rp1_pwm1 pinctrl rp1_pwm1_gpio45 ("FAN_PWM")
+#RP1_FUNCSEL_VBUS1    = 2      ; column 2 on GPIO42 and GPIO43
+#RP1_FUNCSEL_PWM1_45  = 0      ; column 0 on GPIO45 (the fan's tach is pwm1's
+                               ; rpm register $3C, not a pin - dts rpm-offset)
 
 Global rp1_gpio_bad_pins.i
 
@@ -220,7 +257,7 @@ Procedure Rp1GpioBarrier()
 EndProcedure
 
 Procedure.i Rp1PinValid(pin.i)
-  If pin < 0 Or pin > #RP1_PIN_MAX
+  If pin < 0 Or pin > #RP1_GPIO_LAST
     rp1_gpio_bad_pins = rp1_gpio_bad_pins + 1
     ProcedureReturn 0
   EndIf
@@ -235,16 +272,47 @@ EndProcedure
 ;  Address helpers - one procedure per register family, the same shape
 ;  gpio.pi4 uses so the two files are easy to compare line for line.
 ; ----------------------------------------------------------------------
+; Which bank a (valid) pin is in, that bank's first GPIO, and the
+; bank block's offset inside each of the three windows.
+Procedure.i Rp1Bank(pin.i)
+  If pin >= #RP1_BANK2_FIRST
+    ProcedureReturn 2
+  EndIf
+  If pin >= #RP1_BANK1_FIRST
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Rp1BankFirst(pin.i)
+  Select Rp1Bank(pin)
+    Case 2
+      ProcedureReturn #RP1_BANK2_FIRST
+    Case 1
+      ProcedureReturn #RP1_BANK1_FIRST
+  EndSelect
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Rp1BankOff(pin.i)
+  ProcedureReturn Rp1Bank(pin) * #RP1_BANK_STRIDE
+EndProcedure
+
 Procedure.i Rp1CtrlAddr(pin.i)
-  ProcedureReturn #RP1_IO_BANK0_BASE + pin * 8 + 4
+  ProcedureReturn #RP1_IO_BANK0_BASE + Rp1BankOff(pin) + (pin - Rp1BankFirst(pin)) * 8 + 4
 EndProcedure
 
 Procedure.i Rp1PadAddr(pin.i)
-  ProcedureReturn #RP1_PADS_BANK0_BASE + 4 + pin * 4
+  ProcedureReturn #RP1_PADS_BANK0_BASE + Rp1BankOff(pin) + 4 + (pin - Rp1BankFirst(pin)) * 4
+EndProcedure
+
+; The pin's bank's SYS_RIO block (OUT +0, OE +4, IN +8) and its bit in it.
+Procedure.i Rp1RioBase(pin.i)
+  ProcedureReturn #RP1_SYS_RIO0_BASE + Rp1BankOff(pin)
 EndProcedure
 
 Procedure.i Rp1RioBit(pin.i)
-  ProcedureReturn 1 << pin
+  ProcedureReturn 1 << (pin - Rp1BankFirst(pin))
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -328,9 +396,9 @@ Procedure.i Rp1PinMode(pin.i, out.i)
   ; 1 = output. A CLR write here means "make this bit 0", not "clear the
   ; register" - only the named bit is touched.
   If out <> 0
-    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
+    PokeL(Rp1RioBase(pin) + #RP1_RIO_OE_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
   Else
-    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
+    PokeL(Rp1RioBase(pin) + #RP1_RIO_OE_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
   EndIf
   ProcedureReturn 1
 EndProcedure
@@ -358,7 +426,7 @@ Procedure.i Rp1PinModeGet(pin.i)
     ProcedureReturn -1
   EndIf
   Rp1GpioBarrier()
-  oe = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_OE_OFF)
+  oe = Rp1ReadReg(Rp1RioBase(pin) + #RP1_RIO_OE_OFF)
   Rp1GpioBarrier()
   If (oe & Rp1RioBit(pin)) <> 0
     ProcedureReturn 1
@@ -379,9 +447,9 @@ Procedure.i Rp1DigitalWrite(pin.i, level.i)
   EndIf
   Rp1GpioBarrier()
   If level = #RP1_PIN_LOW
-    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
+    PokeL(Rp1RioBase(pin) + #RP1_RIO_OUT_OFF + #RP1_CLR_OFF, Rp1RioBit(pin))
   Else
-    PokeL(#RP1_SYS_RIO0_BASE + #RP1_RIO_OUT_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
+    PokeL(Rp1RioBase(pin) + #RP1_RIO_OUT_OFF + #RP1_SET_OFF, Rp1RioBit(pin))
   EndIf
   ProcedureReturn 1
 EndProcedure
@@ -392,7 +460,7 @@ Procedure.i Rp1DigitalRead(pin.i)
     ProcedureReturn -1
   EndIf
   Rp1GpioBarrier()
-  v = Rp1ReadReg(#RP1_SYS_RIO0_BASE + #RP1_RIO_IN_OFF)
+  v = Rp1ReadReg(Rp1RioBase(pin) + #RP1_RIO_IN_OFF)
   Rp1GpioBarrier()
   If (v & Rp1RioBit(pin)) <> 0
     ProcedureReturn #RP1_PIN_HIGH

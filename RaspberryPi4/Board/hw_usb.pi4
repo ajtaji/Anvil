@@ -584,11 +584,10 @@ CompilerIf #PMF_CHIP = 2712
   ;  by board.pi4 before this one), run by xhci.pi4 as its VBUS hook once
   ;  the RP1 link is proven.
   ;
-  ;  AS OF 2026-09-26 gpio_rp1.pi4 IS BANK 0 ONLY (#RP1_PIN_MAX = 27), so
-  ;  both calls are REFUSED without touching RP1 and the state reported is
-  ;  0 - "the board could not set VBUS". Owed by the GPIO lane: bank 2
-  ;  (GPIO34..53: IO_BANK0 + $8000, PADS + $8004, pinctrl-rp1.c:295) in
-  ;  Rp1FuncSelSet. Until then VBUS is whatever the firmware left.
+  ;  GPIO42/43 are RP1 bank 2 (GPIO34..53); gpio_rp1.pi4 addresses all
+  ;  three banks since Anvil's bank-1/2 extension (rp1_iobanks[],
+  ;  pinctrl-rp1.c:291-296). A refusal from either call reports 0 - "the
+  ;  board could not set VBUS" - and VBUS is then whatever the firmware left.
   ; ------------------------------------------------------------------
   #HWUSB_RP1_VBUS_EN = 42
   #HWUSB_RP1_VBUS_OC = 43
