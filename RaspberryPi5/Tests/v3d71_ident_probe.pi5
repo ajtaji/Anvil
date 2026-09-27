@@ -1,0 +1,435 @@
+; v3d71_ident_probe.pi5 - stage 1 of the Pi 5 GPU port. Is the V3D 7.1 there?
+;
+; DIAGNOSTIC. Does not ship. A standalone payload for the Raspberry Pi 5
+; (BCM2712, V3D 7.1 / VideoCore VII). It does ONLY what stage 1 of the vault
+; note "Raspberry Pi 5/GPU - V3D 7.1 port plan" needs:
+;
+;   1. refuse to run on anything but a Cortex-A76 (the Pi 5's core)
+;   2. power the GRAFX domain with the kernel's full sequence
+;   3. release the V3D reset through PM_GRAFX_2712 ($304)
+;   4. SMS resume, then SMS reset
+;   5. read HUB_IDENT0..3, MMU_DEBUG_INFO and CORE0 IDENT0..2 and print them
+;
+; It turns nothing off, touches no clock and no mailbox, and writes exactly
+; two PM registers ($10C and $304) and two SMS registers. The V3D clock is
+; firmware clock 5 (bcm2712-ds.dtsi:411); asking for it needs the mailbox,
+; which belongs in the shared mailbox library, not a second copy here. If
+; IDENT reads zero after every step, the clock is the next suspect, and the
+; next probe asks for it through that library.
+;
+; EVERY ADDRESS IS CITED. The sources are pinned in the vault under
+; "Raspberry Pi 5/Sources/" (kernel 7e030b60792de1c15b9ec1d8d5d34d63f0f0f1d8):
+;
+;   PM block        $10_7D20_0000   bcm2712-rpi-5-b.dtb /soc@107c000000/
+;                                   watchdog@7d200000 reg <0x7d200000 0x308>,
+;                                   soc ranges <0x0 0x10 0x0 0x80000000>
+;   V3D hub         $10_0200_0000   dtb /axi/v3d@2000000 reg "hub"
+;   V3D core0       $10_0200_8000   dtb reg "core0"
+;   V3D sms         $10_0203_0800   dtb reg "sms" (bcm2712-ds.dtsi:404-407)
+;   console         $1F_0003_0000   RP1 UART0, a PL011 left at 115200 by the
+;                                   firmware's enable_rp1_uart=1 (vault
+;                                   HARDWARE-BRINGUP "FIRST ANVIL BOOT");
+;                                   DR +$00, FR +$18, TXFF = FR bit 5
+;
+; BUILD - a payload that RETURNS to the resident monitor:
+;
+;   PureMetalForge.exe --compile RaspberryPi5\Tests\v3d71_ident_probe.pi5
+;       -t pi5 --entry-returns --load-addr 0x400000 --stack-addr 0x3000000
+;       -o _work\v3d71ident.img        (with PMF_ROOT set to the Anvil root)
+;
+; The load and stack addresses are the Pi 4 payload convention. Confirm them
+; against the Pi 5 monitor's payload window before the first run.
+;
+; ARM THE DEADMAN FIRST. This writes the SoC's power-management block, and a
+; read of a V3D register while its domain is down may hang the bus instead of
+; faulting (the RP1 did exactly that on first boot). So no V3D register is
+; read until the domain is up, the reset released and the SMS idle.
+;
+; RETURN VALUE: $117 if HUB_IDENT1's low 12 bits are $117 (TVER 7, REV 1,
+; NCORES 1: v3d_drv.c:418-424 computes ver = TVER*10 + REV and demands 71 for
+; "brcm,2712-v3d", v3d_drv.c:303), otherwise 0 with the reason printed.
+
+; ---------------------------------------------------------------- addresses
+#P5_PM_BASE        = $107D200000
+#P5_V3D_HUB        = $1002000000
+#P5_V3D_CORE0      = $1002008000
+#P5_V3D_SMS        = $1002030800
+#P5_UART_DR        = $1F00030000
+#P5_UART_FR        = $1F00030018
+
+; ------------------------------------------------ PM (bcm2835-power.c)
+#P5_PM_GRAFX       = $10C          ; :81   the GRAFX (parent) domain
+#P5_PM_GRAFX_2712  = $304          ; :83   the V3D subdomain on BCM2712
+#P5_PM_ENAB        = $1000         ; :84
+#P5_PM_V3DRSTN     = $40           ; :88   bit 6
+#P5_PM_ISFUNC      = $20           ; :89
+#P5_PM_MRDONE      = $10           ; :90
+#P5_PM_MEMREP      = $08           ; :91
+#P5_PM_ISPOW       = $04           ; :92
+#P5_PM_POWOK       = $02           ; :93
+#P5_PM_POWUP       = $01           ; :94
+#P5_PM_INRUSH_SHIFT = 13           ; :95
+#P5_PM_INRUSH_MASK = $6000         ; :100  (3 << 13)
+#P5_PM_PASSWORD    = $5A000000     ; :102
+#P5_POWOK_WAIT_US  = 3             ; :242-247  3000 ns per inrush step
+#P5_MRDONE_WAIT_US = 1             ; :261-270  1000 ns
+#P5_RESET_SETTLE_US = 1            ; :300-301  "1 us will be enough"
+
+; ------------------------------------------------ SMS (v3d_regs.h, v3d_drv.h)
+#P5_SMS_REE_CS     = $000          ; v3d_regs.h:518
+#P5_SMS_TEE_CS     = $400          ; v3d_regs.h:519
+#P5_SMS_CLEAR_POWER_OFF = $20000000 ; v3d_regs.h:522  bit 29
+#P5_SMS_STATE_MASK = $F            ; v3d_regs.h:541-542
+#P5_SMS_IDLE       = $0            ; v3d_drv.h:295
+#P5_SMS_ISOLATING_FOR_RESET = $A   ; v3d_drv.h:296
+#P5_SMS_RESETTING  = $B            ; v3d_drv.h:297
+#P5_SMS_RESET_REQ  = $4            ; v3d_gem.c:119  V3D_SET_FIELD(0x4, V3D_SMS_STATE)
+#P5_SMS_WAIT_MS    = 100           ; v3d_power.c:19-20, v3d_gem.c:121-124
+
+; ------------------------------------------------ identity (v3d_regs.h)
+#P5_HUB_IDENT0     = $00008        ; :35
+#P5_HUB_IDENT1     = $0000C        ; :37
+#P5_HUB_IDENT2     = $00010        ; :51
+#P5_HUB_IDENT3     = $00014        ; :56
+#P5_MMU_DEBUG_INFO = $01238        ; :209
+#P5_CTL_IDENT0     = $00000        ; :219
+#P5_CTL_IDENT1     = $00004        ; :223
+#P5_CTL_IDENT2     = $00008        ; :238
+#P5_IDENT1_EXPECT_LOW12 = $117     ; TVER 7 (3:0), REV 1 (7:4), NCORES 1 (11:8)
+#P5_CORE_IDENT0_EXPECT_VER = 7     ; v3d_device_info.c:65  major = IDENT0 >> 24
+#P5_CORE_IDENT1_EXPECT_REV = 1     ; v3d_device_info.c:66  minor = IDENT1 & $F
+
+; ------------------------------------------------ the CPU (cputype.h)
+#P5_MIDR_IMPL_ARM  = $41           ; arch/arm64/include/asm/cputype.h:54
+#P5_MIDR_PART_A76  = $D0B          ; cputype.h:75 (the A72 is $D08, :69)
+
+; ------------------------------------------------ verdicts
+#P5_OK             = 0
+#P5_ERR_NOT_A76    = 1
+#P5_ERR_PM_DEAD    = 2
+#P5_ERR_GRAFX_POWOK = 3
+#P5_ERR_GRAFX_MRDONE = 4
+#P5_ERR_RESET      = 5
+#P5_ERR_SMS_RESUME = 6
+#P5_ERR_SMS_RESET  = 7
+#P5_ERR_IDENT      = 8
+
+; ======================================================================
+;  Console. Its own four lines, like every standalone probe: nothing in
+;  this program may depend on a board library that is mid-seam.
+; ======================================================================
+Procedure PutC(c.i)
+  Protected f.i
+  Repeat
+    f = PeekN(#P5_UART_FR)
+  Until (f & 32) = 0
+  PokeL(#P5_UART_DR, c)
+EndProcedure
+
+Procedure PutS(*s)
+  Protected i.i
+  Protected c.i
+  i = 0
+  Repeat
+    c = PeekA(*s + i)
+    If c = 0 : Break : EndIf
+    PutC(c)
+    i = i + 1
+  ForEver
+EndProcedure
+
+Procedure PutNl()
+  PutC(13) : PutC(10)
+EndProcedure
+
+Procedure PutHex(v.i, digits.i)
+  Protected i.i
+  Protected n.i
+  For i = digits - 1 To 0 Step -1
+    n = (v >> (i * 4)) & $F
+    If n < 10
+      PutC(48 + n)
+    Else
+      PutC(55 + n)
+    EndIf
+  Next
+EndProcedure
+
+Procedure RowHex(*name, v.i)
+  PutS("  ")
+  PutS(*name)
+  PutS(" $")
+  PutHex(v, 8)
+  PutNl()
+EndProcedure
+
+; ======================================================================
+;  Time. The generic counter, read directly; CNTFRQ is read, not assumed.
+; ======================================================================
+Procedure.i P5Ticks()
+  ASM
+    mrs x0, cntpct_el0
+  EndASM
+EndProcedure
+
+Procedure.i P5CounterHz()
+  ASM
+    mrs x0, cntfrq_el0
+  EndASM
+EndProcedure
+
+Procedure.i P5Midr()
+  ASM
+    mrs x0, midr_el1
+  EndASM
+EndProcedure
+
+Procedure P5DelayUs(us.i)
+  Protected t0.i
+  Protected n.i
+  n = (P5CounterHz() * us) / 1000000 + 1
+  t0 = P5Ticks()
+  While P5Ticks() - t0 < n
+  Wend
+EndProcedure
+
+; ======================================================================
+;  PM access. EVERY write carries the password, and the value is masked to
+;  24 bits first so nothing can land in the password byte. A PM write
+;  without $5A in bits 31:24 is discarded silently (bcm2835-power.c:102,
+;  PM_WRITE), so the read-back after each write is where a mistake shows.
+;  Only $10C and $304 are ever written: the same block holds PM_RSTC and
+;  PM_WDOG, which reset the SoC.
+; ======================================================================
+Procedure.i PmRead(off.i)
+  ProcedureReturn PeekN(#P5_PM_BASE + off) & $FFFFFFFF
+EndProcedure
+
+Procedure PmWrite(off.i, value.i)
+  PokeL(#P5_PM_BASE + off, #P5_PM_PASSWORD | (value & $00FFFFFF))
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  bcm2835_power_power_on(pd, PM_GRAFX), bcm2835-power.c:214-281. On BCM2711
+;  the early return at :223-225 skips all of this; on BCM2712 there is no
+;  rpivid_asb and it RUNS. If the firmware already powered the domain
+;  (POWUP set) it is left alone (:227-229).
+; ----------------------------------------------------------------------
+Procedure.i GrafxPowerOn()
+  Protected g.i
+  Protected inrush.i
+  Protected powok.i
+  Protected t0.i
+  Protected limit.i
+
+  g = PmRead(#P5_PM_GRAFX)
+  If g & #P5_PM_POWUP
+    ProcedureReturn #P5_OK
+  EndIf
+
+  ; Ramp the inrush current, 3 us per step (:231-248). EXACTLY as the kernel
+  ; does it: the for loop has no break, so all four inrush values are
+  ; written even after POWOK appears, and the verdict is POWOK after the
+  ; last step. Stopping early would be a guess about the hardware.
+  powok = 0
+  inrush = 0
+  While inrush <= 3
+    powok = 0
+    g = PmRead(#P5_PM_GRAFX)
+    PmWrite(#P5_PM_GRAFX, (g & ~#P5_PM_INRUSH_MASK) | (inrush << #P5_PM_INRUSH_SHIFT) | #P5_PM_POWUP)
+    limit = (P5CounterHz() * #P5_POWOK_WAIT_US) / 1000000 + 1
+    t0 = P5Ticks()
+    Repeat
+      If PmRead(#P5_PM_GRAFX) & #P5_PM_POWOK
+        powok = 1
+      EndIf
+    Until powok = 1 Or P5Ticks() - t0 >= limit
+    inrush = inrush + 1
+  Wend
+  If powok = 0
+    ; Undo, as the kernel does (:279-280).
+    g = PmRead(#P5_PM_GRAFX)
+    PmWrite(#P5_PM_GRAFX, g & ~(#P5_PM_POWUP | #P5_PM_INRUSH_MASK))
+    ProcedureReturn #P5_ERR_GRAFX_POWOK
+  EndIf
+
+  ; Disable electrical isolation (:256-257).
+  g = PmRead(#P5_PM_GRAFX)
+  PmWrite(#P5_PM_GRAFX, g | #P5_PM_ISPOW)
+
+  ; Repair memory and wait for MRDONE, 1 us (:259-270).
+  g = PmRead(#P5_PM_GRAFX)
+  PmWrite(#P5_PM_GRAFX, g | #P5_PM_MEMREP)
+  limit = (P5CounterHz() * #P5_MRDONE_WAIT_US) / 1000000 + 1
+  t0 = P5Ticks()
+  While (PmRead(#P5_PM_GRAFX) & #P5_PM_MRDONE) = 0
+    If P5Ticks() - t0 >= limit
+      ; Undo ISPOW and POWUP (:277-280).
+      g = PmRead(#P5_PM_GRAFX)
+      PmWrite(#P5_PM_GRAFX, g & ~#P5_PM_ISPOW)
+      g = PmRead(#P5_PM_GRAFX)
+      PmWrite(#P5_PM_GRAFX, g & ~(#P5_PM_POWUP | #P5_PM_INRUSH_MASK))
+      ProcedureReturn #P5_ERR_GRAFX_MRDONE
+    EndIf
+  Wend
+
+  ; Disable functional isolation (:272-273).
+  g = PmRead(#P5_PM_GRAFX)
+  PmWrite(#P5_PM_GRAFX, g | #P5_PM_ISFUNC)
+  ProcedureReturn #P5_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  The V3D subdomain on BCM2712: bcm2835_asb_power_on(pd, PM_GRAFX_2712,
+;  0, 0, PM_V3DRSTN) (bcm2835-power.c:380-383). With no pm clock in the
+;  DT (pd->clk is NULL) that is: wait 1 us (:300-301), set V3DRSTN (:305-306),
+;  and the two ASB calls return at once because their register is 0
+;  (:160-161). There are no bridges to enable on this part.
+; ----------------------------------------------------------------------
+Procedure.i V3dResetRelease()
+  Protected g.i
+  P5DelayUs(#P5_RESET_SETTLE_US)
+  g = PmRead(#P5_PM_GRAFX_2712)
+  PmWrite(#P5_PM_GRAFX_2712, g | #P5_PM_V3DRSTN)
+  P5DelayUs(#P5_RESET_SETTLE_US)
+  If (PmRead(#P5_PM_GRAFX_2712) & #P5_PM_V3DRSTN) = 0
+    ProcedureReturn #P5_ERR_RESET
+  EndIf
+  ProcedureReturn #P5_OK
+EndProcedure
+
+Procedure.i SmsRead(off.i)
+  ProcedureReturn PeekN(#P5_V3D_SMS + off) & $FFFFFFFF
+EndProcedure
+
+; v3d_resume_sms, v3d_power.c:11-28: CLEAR_POWER_OFF into TEE_CS, then wait
+; up to 100 ms for STATE = IDLE; then v3d_reset_sms, v3d_gem.c:113-127:
+; STATE field = 4 into REE_CS, then wait up to 100 ms for STATE to be
+; neither ISOLATING_FOR_RESET nor RESETTING.
+Procedure.i SmsResumeAndReset()
+  Protected t0.i
+  Protected limit.i
+  Protected s.i
+  limit = P5CounterHz() / 1000 * #P5_SMS_WAIT_MS
+  PokeL(#P5_V3D_SMS + #P5_SMS_TEE_CS, #P5_SMS_CLEAR_POWER_OFF)
+  t0 = P5Ticks()
+  Repeat
+    s = SmsRead(#P5_SMS_TEE_CS) & #P5_SMS_STATE_MASK
+    If s <> #P5_SMS_IDLE And P5Ticks() - t0 >= limit
+      ProcedureReturn #P5_ERR_SMS_RESUME
+    EndIf
+  Until s = #P5_SMS_IDLE
+
+  PokeL(#P5_V3D_SMS + #P5_SMS_REE_CS, #P5_SMS_RESET_REQ)
+  t0 = P5Ticks()
+  Repeat
+    s = SmsRead(#P5_SMS_REE_CS) & #P5_SMS_STATE_MASK
+    If (s = #P5_SMS_ISOLATING_FOR_RESET Or s = #P5_SMS_RESETTING) And P5Ticks() - t0 >= limit
+      ProcedureReturn #P5_ERR_SMS_RESET
+    EndIf
+  Until s <> #P5_SMS_ISOLATING_FOR_RESET And s <> #P5_SMS_RESETTING
+  ProcedureReturn #P5_OK
+EndProcedure
+
+Procedure PutVerdict(e.i)
+  Select e
+    Case #P5_OK
+      PutS("OK")
+    Case #P5_ERR_NOT_A76
+      PutS("NOT_A76 - MIDR_EL1 is not an Arm Cortex-A76. This probe is for the Pi 5 only; nothing was written.")
+    Case #P5_ERR_PM_DEAD
+      PutS("PM_DEAD - PM_GRAFX read all-ones. The PM base $10_7D20_0000 is not mapped; check the monitor's map.")
+    Case #P5_ERR_GRAFX_POWOK
+      PutS("GRAFX_POWOK - POWOK never set at any inrush step. The GRAFX rail did not come up; POWUP was undone.")
+    Case #P5_ERR_GRAFX_MRDONE
+      PutS("GRAFX_MRDONE - memory repair never finished. ISPOW and POWUP were undone.")
+    Case #P5_ERR_RESET
+      PutS("RESET - V3DRSTN did not stick in PM_GRAFX_2712 ($304). Check the password and the offset.")
+    Case #P5_ERR_SMS_RESUME
+      PutS("SMS_RESUME - TEE_CS STATE never reached IDLE within 100 ms.")
+    Case #P5_ERR_SMS_RESET
+      PutS("SMS_RESET - REE_CS STATE stayed in isolating/resetting for 100 ms.")
+    Case #P5_ERR_IDENT
+      PutS("IDENT - HUB_IDENT1 low 12 bits are not $117 (V3D 7.1). Zero means dark (clock?), all-ones means unmapped.")
+    Default
+      PutS("unknown code")
+  EndSelect
+EndProcedure
+
+Procedure.i Main()
+  Protected midr.i
+  Protected e.i
+  Protected i1.i
+  Protected ci0.i
+  Protected ci1.i
+
+  PutNl()
+  PutS("=== V3D 7.1 IDENT PROBE (Pi 5, stage 1) ===")
+  PutNl()
+
+  ; 1. The CPU. MIDR implementer (31:24) and part number (15:4),
+  ;    cputype.h:26-41. A Pi 4 would say $D08 and has no PM block at
+  ;    $10_7D20_0000, so it must never reach the first write.
+  midr = P5Midr() & $FFFFFFFF
+  RowHex("MIDR_EL1               ", midr)
+  If ((midr >> 24) & $FF) <> #P5_MIDR_IMPL_ARM Or ((midr >> 4) & $FFF) <> #P5_MIDR_PART_A76
+    e = #P5_ERR_NOT_A76
+    PutS("verdict: ") : PutVerdict(e) : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; 2. The PM block, before anything.
+  RowHex("PM_GRAFX       at entry", PmRead(#P5_PM_GRAFX))
+  RowHex("PM_GRAFX_2712  at entry", PmRead(#P5_PM_GRAFX_2712))
+  If PmRead(#P5_PM_GRAFX) = $FFFFFFFF
+    e = #P5_ERR_PM_DEAD
+    PutS("verdict: ") : PutVerdict(e) : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  e = GrafxPowerOn()
+  RowHex("PM_GRAFX     after rail", PmRead(#P5_PM_GRAFX))
+  If e = #P5_OK
+    e = V3dResetRelease()
+    RowHex("PM_GRAFX_2712 after RST", PmRead(#P5_PM_GRAFX_2712))
+  EndIf
+  If e = #P5_OK
+    RowHex("SMS_TEE_CS  before     ", SmsRead(#P5_SMS_TEE_CS))
+    RowHex("SMS_REE_CS  before     ", SmsRead(#P5_SMS_REE_CS))
+    e = SmsResumeAndReset()
+    RowHex("SMS_TEE_CS  after      ", SmsRead(#P5_SMS_TEE_CS))
+    RowHex("SMS_REE_CS  after      ", SmsRead(#P5_SMS_REE_CS))
+  EndIf
+  If e <> #P5_OK
+    PutS("verdict: ") : PutVerdict(e) : PutNl()
+    PutS("=== V3D 7.1 NOT REACHED - no V3D register was read ===") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  ; 5. Identity. Only now is a hub or core register read.
+  i1 = PeekN(#P5_V3D_HUB + #P5_HUB_IDENT1) & $FFFFFFFF
+  ci0 = PeekN(#P5_V3D_CORE0 + #P5_CTL_IDENT0) & $FFFFFFFF
+  ci1 = PeekN(#P5_V3D_CORE0 + #P5_CTL_IDENT1) & $FFFFFFFF
+  RowHex("HUB_IDENT0  $1002000008", PeekN(#P5_V3D_HUB + #P5_HUB_IDENT0) & $FFFFFFFF)
+  RowHex("HUB_IDENT1  $100200000C", i1)
+  RowHex("HUB_IDENT2  $1002000010", PeekN(#P5_V3D_HUB + #P5_HUB_IDENT2) & $FFFFFFFF)
+  RowHex("HUB_IDENT3  $1002000014", PeekN(#P5_V3D_HUB + #P5_HUB_IDENT3) & $FFFFFFFF)
+  RowHex("MMU_DEBUG   $1002001238", PeekN(#P5_V3D_HUB + #P5_MMU_DEBUG_INFO) & $FFFFFFFF)
+  RowHex("CORE_IDENT0 $1002008000", ci0)
+  RowHex("CORE_IDENT1 $1002008004", ci1)
+  RowHex("CORE_IDENT2 $1002008008", PeekN(#P5_V3D_CORE0 + #P5_CTL_IDENT2) & $FFFFFFFF)
+  ; IDENT3 IPREV (15:8) >= 10 is the D0 stepping, which changes the
+  ; shader-record layout (v3d_device_info.h:93-97). Printed, not judged.
+  RowHex("IPREV (IDENT3 15:8)    ", (PeekN(#P5_V3D_HUB + #P5_HUB_IDENT3) >> 8) & $FF)
+
+  If (i1 & $FFF) <> #P5_IDENT1_EXPECT_LOW12 Or ((ci0 >> 24) & $FF) <> #P5_CORE_IDENT0_EXPECT_VER Or (ci1 & $F) <> #P5_CORE_IDENT1_EXPECT_REV
+    e = #P5_ERR_IDENT
+    PutS("verdict: ") : PutVerdict(e) : PutNl()
+    PutS("=== V3D DID NOT IDENTIFY AS 7.1 ===") : PutNl()
+    ProcedureReturn 0
+  EndIf
+
+  PutS("verdict: ") : PutVerdict(#P5_OK) : PutNl()
+  PutS("=== V3D 7.1 IS ALIVE - HUB_IDENT1 low 12 bits are $117 ===") : PutNl()
+  ProcedureReturn #P5_IDENT1_EXPECT_LOW12
+EndProcedure
