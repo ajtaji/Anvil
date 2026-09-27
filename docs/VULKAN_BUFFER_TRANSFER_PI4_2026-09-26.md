@@ -40,9 +40,8 @@ Afterward, build 210 answered at a real `pmf>` prompt; the deadman was
 explicitly off, capture disarmed, and all `coretest` leases were zero. No
 reset, flash, or boot-medium write occurred.
 
-This proves the selected 64-byte ordered stream on Pi 4 silicon. The full
-65,536-byte `vkCmdUpdateBuffer` boundary remains an emitted desk proof, and
-the Vulkan 1.0 buffer-transfer and synchronization matrix is not yet complete.
+This proves the selected 64-byte ordered stream on Pi 4 silicon. The
+Vulkan 1.0 buffer-transfer and synchronization matrix is not yet complete.
 
 ## DMA transfer proof
 
@@ -58,3 +57,15 @@ under a 15-second deadman and fresh capture 38. Evidence is in
 `pmf>` with deadman off, capture disarmed, and core leases zero. No flash,
 reset, or boot-medium write occurred. The normal Pi 4 image and the V3D
 backend gate compile after the change; the new image has not been booted.
+
+A second DMA RAM payload exercises both a full 65,536-byte fill and the
+maximum 65,536-byte `vkCmdUpdateBuffer`. It verifies all 16,384 destination
+words after each operation, overwrites the update caller's array before
+submission, requires seven completed DMA operations across the complete
+stream, and rechecks the original non-Vulkan DMA bound. The 548,704-byte
+PMFBOOT v2 image has SHA-256
+`7D1C6D22D4BF20479ACA0898E60C4A420CC66A429CD4686FB25A84A277B96983`.
+Build 210 verified the upload and returned `x0=0` under a 15-second deadman
+with fresh capture 39. Evidence is in `runs/vulkan-dma-buffer-full-20260926/`.
+The monitor returned to a real `pmf>` with deadman off, capture disarmed,
+and core leases zero. No flash, reset, or boot-medium write occurred.
