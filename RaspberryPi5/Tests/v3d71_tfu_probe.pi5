@@ -24,11 +24,19 @@
 ;
 ; BUILD (PMF_ROOT = the Anvil root):
 ;   PureMetalForge.exe --compile RaspberryPi5\Tests\v3d71_tfu_probe.pi5
-;       -t pi5 --entry-returns --load-addr 0x400000 --stack-addr 0x3000000
+;       -t pi5 --entry-returns --load-addr 0x4000000 --stack-addr 0x8000000
 ;       -o _work\v3d71tfu.img
-; The load and stack addresses are the Pi 4 payload convention; confirm them
-; against the Pi 5 monitor's payload window before the first silicon run
-; (vault plan, open question 8). Desk gate: tools/a64/a64_v3d71_tfu_check.py.
+; WHERE IT RUNS (checked on the desk, 2026-09-27, against memmap.pi4's
+; 2712 branch AND the compiler's BCM2712 envelope). The Pi 5 monitor is
+; linked at #MON_LO = $00200000; its low payload window runs from
+; MonGrainUp(#MON_LO + image size) - $600000 for the 3.1 MB -t pi5 image at
+; Anvil 92ee2ba, rising as the monitor grows - to #PAY0_HI = $07EFFFFF. The
+; Pi 4 convention of $400000 lands INSIDE the resident Pi 5 monitor. The
+; high window #PAY1_* ($10000000..$1FFFFFFF) is refused by the compiler,
+; whose -t pi5 bootstrap envelope ends at $0FFFFFFF. So: image at
+; $04000000 (BSS at +512 KiB), buffers at $0440xxxx, the stack top at
+; $08000000 in the #PAY_STACK corridor. The desk gate checks all of it.
+; Desk gate: tools/a64/a64_v3d71_tfu_check.py.
 
 XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
 XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
@@ -36,11 +44,16 @@ XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
 #P5_UART_DR = $1F00030000     ; RP1 UART0, vault HARDWARE-BRINGUP
 #P5_UART_FR = $1F00030018
 
-#TP_PT       = $640000        ; V3D page table (4096 entries, VA 0..$FFFFFF)
+; Physical pages in the low payload window. The V3D page table covers GPU
+; VAs 0..$FFFFFF (4096 entries), so the two image pages are mapped at small
+; VAs; the TFU is handed VAs, the CPU checks the physical pages.
+#TP_PT       = $04400000      ; V3D page table, 16 KiB
 #TP_PT_BYTES = 16384
-#TP_ILLEGAL  = $648000        ; MMU illegal-address page
-#TP_SRC      = $650000        ; input page
-#TP_DST      = $651000        ; output page
+#TP_ILLEGAL  = $04408000      ; MMU illegal-address page
+#TP_SRC      = $04410000      ; input page (physical)
+#TP_DST      = $04411000      ; output page (physical)
+#TP_SRC_VA   = $00010000      ; ... and where the TFU sees them
+#TP_DST_VA   = $00011000
 #TP_PAGE     = 4096
 
 #TP_W = 16                    ; one row of 4x4 microtiles: the LINEARTILE
@@ -118,8 +131,8 @@ Procedure.i Main()
   EndIf
 
   r = V3dMmuInit(#TP_PT, #TP_PT_BYTES, #TP_ILLEGAL)
-  If r = #V3D_OK : r = V3dMmuMap(#TP_SRC, #TP_SRC, #TP_PAGE) : EndIf
-  If r = #V3D_OK : r = V3dMmuMap(#TP_DST, #TP_DST, #TP_PAGE) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#TP_SRC_VA, #TP_SRC, #TP_PAGE) : EndIf
+  If r = #V3D_OK : r = V3dMmuMap(#TP_DST_VA, #TP_DST, #TP_PAGE) : EndIf
   If r <> #V3D_OK
     Row("MMU refused      ", r)
     ProcedureReturn $200 + r
@@ -137,8 +150,8 @@ Procedure.i Main()
   Next
 
   r = V3dTfuBegin(#TP_W, #TP_H, #V3D_TEXFMT_RGBA8)
-  If r = #V3D_OK : r = V3dTfuSourceRaster(#TP_SRC, #TP_W, #TP_BYTES) : EndIf
-  If r = #V3D_OK : r = V3dTfuDest(#TP_DST, #V3D_TFU_OFMT_LINEARTILE, #TP_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuSourceRaster(#TP_SRC_VA, #TP_W, #TP_BYTES) : EndIf
+  If r = #V3D_OK : r = V3dTfuDest(#TP_DST_VA, #V3D_TFU_OFMT_LINEARTILE, #TP_BYTES) : EndIf
   If r = #V3D_OK : r = V3dTfuSubmit() : EndIf
   Row("TFU_ICFG sent    ", V3dTfuIcfgSent())
   Row("TFU_IOA sent     ", V3dTfuIoaSent())
