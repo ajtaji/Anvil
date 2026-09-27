@@ -49,6 +49,7 @@ DIAGNOSTICS = (
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanIndexedTriangleProof.pi4",
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanPropertiesProof.pi4",
     ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanTriangleProof.pi4",
+    ROOT / "RaspberryPi4" / "Examples" / "Diagnostics" / "vulkanImageReadbackProof.pi4",
 )
 
 LOAD = 0x00400000
@@ -495,7 +496,7 @@ def main() -> int:
             print("  " + failure)
         return 1
 
-    # Both board diagnostics must at least build, at their own load address.
+    # Every board diagnostic must at least build. They are not run here.
     for diagnostic in DIAGNOSTICS:
         try:
             build(compiler, ROOT, diagnostic, 0x500000, 0x4F00000,
@@ -526,10 +527,9 @@ def main() -> int:
     print("  holds no processor-side or DMA image fallback")
     print("  HOST_COHERENT is backed by required submit and render-completion cache maintenance")
     if diagnostic_built:
-        print("  all seven board diagnostics build at $400000 - vulkanClearProof.pi4,")
-        print("  vulkanClearRefusals.pi4, vulkanDynamicGeometryProof.pi4,")
-        print("  vulkanBlendProof.pi4, vulkanIndexedTriangleProof.pi4,")
-        print("  vulkanPropertiesProof.pi4 and vulkanTriangleProof.pi4")
+        print(f"  all {len(DIAGNOSTICS)} board diagnostics build at $500000:")
+        for diagnostic in DIAGNOSTICS:
+            print("  " + diagnostic.name)
         print("  (not executed: they need the GPU, and that is a slot)")
 
     if not args.mutate:
