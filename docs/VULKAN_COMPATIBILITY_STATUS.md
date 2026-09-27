@@ -45,7 +45,7 @@ The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
 uniform range, one bound descriptor set, 64-byte copy-source alignment and
-zero compute capacity. The payload returned `x0=0`, produced fresh capture 31,
+zero compute capacity. The committed diagnostic returned `x0=0`, produced fresh capture 32,
 and left the monitor at its prompt with the deadman off. The normal image's
 boot-default selection remains a separate untested boot path.
 
