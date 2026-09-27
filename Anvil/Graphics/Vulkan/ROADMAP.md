@@ -215,7 +215,7 @@ remains missing.
   command-pool external synchronization beyond the current state engine.
 - Buffer/image copies beyond the implemented tightly packed whole-image
   buffer-to-optimal-image TFU transfer, bounded multi-region strided buffer-to-linear-image DMA upload, bounded multi-region linear-image DMA
-  copy (including ordered calls in one command buffer) and bounded multi-region strided linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
+  copy (including ordered calls in one command buffer) and bounded multi-region and ordered-call strided linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
   clears and multi-range clears remain missing. TFU is not represented as a
   general memcpy.
 - Queries, timestamps, conditional behavior, dynamic state other than the
