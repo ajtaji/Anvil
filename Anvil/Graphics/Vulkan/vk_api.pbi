@@ -1469,6 +1469,20 @@ Procedure vkCmdCopyImage(commandBuffer.i, srcImage.i, srcImageLayout.i, dstImage
   AnvilVkCmdCopyImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, *pRegions)
 EndProcedure
 
+Procedure vkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcImageLayout.i, dstBuffer.i, regionCount.i, *pRegions.VkBufferImageCopy)
+  Define c.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyImageToBuffer was given a stale command buffer (Anvil code -20002); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If regionCount <> 1 Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer currently requires exactly one non-null region (Anvil code -20005); no partial array was copied.")
+    ProcedureReturn
+  EndIf
+  AnvilVkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout, dstBuffer, *pRegions)
+EndProcedure
+
 ; A whole-attachment clear before any draw lowers to the Pi 4 tile clear.
 ; Other rectangles and later clears need a separate in-pass draw operation.
 Procedure vkCmdClearAttachments(commandBuffer.i, attachmentCount.i, *pAttachments.VkClearAttachment, rectCount.i, *pRects.VkClearRect)
