@@ -1390,8 +1390,8 @@ XIncludeFile "RaspberryPi4/Lib/display.pi4"
 ;  is no driver for it in this tree; the DMA/CPU console is all there is.
 ; ----------------------------------------------------------------------
 CompilerIf #PMF_CHIP = 2712
-#ANVIL_V3D_CONSOLE = 0
-#ANVIL_VULKAN_CONSOLE = 0
+  #ANVIL_V3D_CONSOLE = 0
+  #ANVIL_VULKAN_CONSOLE = 0
 CompilerElse
 #ANVIL_V3D_CONSOLE = 1
 ; The screen/cache policy reads this build choice before cache.pi4 is included.
@@ -1634,22 +1634,22 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
 ;  -t pi5 image. Flip a line to 1 when its driver lands, as #CAP_I2C was.
 ; ======================================================================
 CompilerIf #PMF_CHIP = 2712
-#CAP_STORAGE  = 0   ; PI 5 NOT YET: the card is the BCM2712 SDHCI at
+  #CAP_STORAGE  = 0   ; PI 5 NOT YET: the card is the BCM2712 SDHCI at
                     ; $1000FFF000; USB is RP1's xHCI behind PCIe.
-#CAP_NET      = 0   ; PI 5 NOT YET: Ethernet is RP1's Cadence GEM and the
+  #CAP_NET      = 0   ; PI 5 NOT YET: Ethernet is RP1's Cadence GEM and the
                     ; radio is on BCM2712 SDIO2; neither has a driver.
-#CAP_GPIO     = 1   ; RP1 bank 0 through Lib/gpio_rp1.pi4 under the HwGpio*
+  #CAP_GPIO     = 1   ; RP1 bank 0 through Lib/gpio_rp1.pi4 under the HwGpio*
                     ; seam (hw_gpio.pi4's 2712 branch). Desk-proved; silicon owed.
-#CAP_I2C      = 1   ; RP1 I2C1 (DesignWare) through Lib/i2c_dw.pi4 under the
+  #CAP_I2C      = 1   ; RP1 I2C1 (DesignWare) through Lib/i2c_dw.pi4 under the
                     ; HwI2c* seam (hw_i2c.pi4's 2712 branch). Desk-proved; silicon owed.
-#CAP_TOUCH    = 0   ; PI 5 NOT YET: the Pi 4 panel's bus is BCM2711 BSC0.
-#CAP_MMC      = 0   ; PI 5 NOT YET: follows #CAP_STORAGE's SD host.
-#CAP_USB      = 0   ; PI 5 NOT YET: RP1 xHCI behind PCIe.
-#CAP_PWM      = 1   ; the fan connector: RP1 PWM1 channel 3 + tach
+  #CAP_TOUCH    = 0   ; PI 5 NOT YET: the Pi 4 panel's bus is BCM2711 BSC0.
+  #CAP_MMC      = 0   ; PI 5 NOT YET: follows #CAP_STORAGE's SD host.
+  #CAP_USB      = 0   ; PI 5 NOT YET: RP1 xHCI behind PCIe.
+  #CAP_PWM      = 1   ; the fan connector: RP1 PWM1 channel 3 + tach
                     ; (Lib/rp1_pwm.pi4, Board/hw_pwm_rp1.pi4), and the
                     ; temperature through thermal.pi4. Desk-proved
                     ; (tools/a64/a64_fan_pi5_check.py); silicon owed.
-#CAP_BOOT_EL1 = 1   ; the same handoff contract as the Pi 4; HwBootToEl1
+  #CAP_BOOT_EL1 = 1   ; the same handoff contract as the Pi 4; HwBootToEl1
                     ; refuses at EL3 in a sentence exactly as it does there.
 CompilerElse
 #CAP_STORAGE  = 1   ; a block medium + FAT filesystem. USB stick and SD
@@ -1741,7 +1741,7 @@ CompilerEndIf
 ;  seat those are the same fact and the same honest refusal.
 ; ----------------------------------------------------------------------
 CompilerIf #PMF_CHIP = 2712
-#CAP_CONSOLE  = 0   ; PI 5 NOT YET: the Pi 5 firmware grants a 16 bpp
+  #CAP_CONSOLE  = 0   ; PI 5 NOT YET: the Pi 5 firmware grants a 16 bpp
                     ; surface (silicon 2026-09-26) and hw_con.pi4's HwCon*
                     ; writes 32-bit pixels. The monitor's own console draws
                     ; 16 bpp through Lib/display.pi4; a payload's does not.
@@ -1779,7 +1779,7 @@ CompilerEndIf
                     ; the pins through HwGpioReservedReason() - or the next
                     ; person to type `gpio` gets a surprise.
 CompilerIf #PMF_CHIP = 2712
-#CAP_SPI      = 1   ; RP1 SPI0 (DesignWare SSI) through Lib/spi_dw.pi4 under
+  #CAP_SPI      = 1   ; RP1 SPI0 (DesignWare SSI) through Lib/spi_dw.pi4 under
                     ; the HwSpi* seam (Board/hw_spi.pi4), the shared layer
                     ; Anvil/Bus/spi.pbi and the `spi` command. Desk-proved
                     ; (tools/a64/spi_dw_check.py); silicon owed.
@@ -1799,7 +1799,7 @@ CompilerEndIf
                     ; the wire format to the second unit, which is that
                     ; unit's own design note. Phase A item 2a.
 CompilerIf #PMF_CHIP = 2712
-#CAP_RTC      = 1   ; THE PI 5 HAS ONE: the firmware's battery-backed RTC,
+  #CAP_RTC      = 1   ; THE PI 5 HAS ONE: the firmware's battery-backed RTC,
                     ; read over the mailbox by Lib/rtc_fw.pi4 through the
                     ; HwClock* backend Board/hw_clock.pi4 (included before
                     ; abi.pbi below, 2712 only) and seeded at boot right
@@ -1819,7 +1819,7 @@ CompilerEndIf
 ; has re-forked the thing the capability model exists to prevent, and
 ; tools/a64/a64_abi_check.py looks for exactly that.
 CompilerIf #PMF_CHIP = 2712
-#SVC_BOARD_ID = 4   ; #SVC_BOARD_PI5
+  #SVC_BOARD_ID = 4   ; #SVC_BOARD_PI5
 CompilerElse
 #SVC_BOARD_ID = 1   ; #SVC_BOARD_PI4
 CompilerEndIf
