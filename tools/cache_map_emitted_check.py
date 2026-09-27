@@ -57,14 +57,15 @@ def fixture(cache: str) -> str:
             "#ANVIL_CACHE = 1\n"
             "Global Dim mmu_ncLo.i[#MMU_NC_MAX]\nGlobal Dim mmu_ncHi.i[#MMU_NC_MAX]\n"
             "Global mmu_ncN.i\nGlobal mmu_ttbr.i\nGlobal mmu_tcr.i\nGlobal mmu_mair.i\n"
-            "Global gCacheOn.i\n"
+            "Global gCacheOn.i\nGlobal gCacheDspLo.i\nGlobal gCacheDspHi.i\n"
             "Global testReady.i\nGlobal testBase.i\nGlobal testSize.i\n"
             "Procedure.i DisplayReady()\n ProcedureReturn testReady\nEndProcedure\n"
             "Procedure.i DisplayBase()\n ProcedureReturn testBase\nEndProcedure\n"
             "Procedure.i DisplaySize()\n ProcedureReturn testSize\nEndProcedure\n" +
             "Procedure.i MmuBuildable()\n ProcedureReturn 1\nEndProcedure\n"
             "Procedure.i CacheTablesBase()\n ProcedureReturn $A00000\nEndProcedure\n"
-            "Procedure MmuEnableCached()\nEndProcedure\n" +
+            "Procedure MmuEnableCached()\nEndProcedure\n"
+            "Procedure CacheDmaPolicy()\nEndProcedure\n" +
             "\n\n".join(proc(mmu, n) for n in procedures) + "\n" + proc(cache, "CacheMapNc") + r'''
 ''' + proc(cache, "CacheEnable") + r'''
 Procedure.i Probe(mode.i, rot.i, addr.i)
@@ -206,7 +207,8 @@ def check_product(a64, product):
         cases.extend(((1, rot, 0x7E00000, WB), (1, rot, 0x9200000, WB),
                       (1, rot, 0x8100000, NC)))
     # Each initial source state gets a fresh cache-table build. Dynamic HDMI
-    # rebinding while caches remain enabled is not part of the current contract.
+    # rebinding while caches remain enabled is CacheDisplayMoved's, gated by
+    # tools/cache_coherence_policy_check.py.
     for mode, rot in ((0, 0), (2, 0), (1, 90)):
         cases.extend(((mode, rot, 0x8A00000, NC), (mode, rot, 0x8E00000, NC),
                       (mode, rot, 0x10000000, NC if mode == 2 else WB)))

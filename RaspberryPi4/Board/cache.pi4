@@ -212,11 +212,20 @@ EndProcedure
 ; of them is the currently adopted DisplayBase, so map their complete reserved
 ; window independently of source and rotation. The adopted display mapping is
 ; retained for the firmware-owned HDMI framebuffer.
+; The adopted display range the live tables carry Non-Cacheable, recorded
+; so CacheDisplayMoved can tell a moved framebuffer from the same one.
+Global gCacheDspLo.i
+Global gCacheDspHi.i
+
 Procedure CacheMapNc()
+  gCacheDspLo = 0
+  gCacheDspHi = 0
   MmuClearNc()
   MmuAddNc(#MON_FB_LO, #MON_FB_HI + 1)
   If DisplayReady() <> 0 And DisplayBase() > 0
     MmuAddNc(DisplayBase(), DisplayBase() + DisplaySize())
+    gCacheDspLo = DisplayBase()
+    gCacheDspHi = DisplayBase() + DisplaySize()
   EndIf
   CompilerIf #PMF_CHIP = 2712
   ; BCM2712: no GENET, so no GENET receive ring. The firmware framebuffer
@@ -230,6 +239,32 @@ Procedure CacheMapNc()
   ; included after this file.
   MmuAddNc($08100000, $08180000)
   CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CacheDmaPolicy - tell dma.pi4 when its dc civac walk can buy nothing.
+;
+;  gCacheOn IS SCTLR.C for this monitor: the stub enters with $30C50830
+;  (C clear) every time - see the header above - and only CacheEnable and
+;  CacheDisable change C, each of which calls this after it has done so.
+;  Cache off: nothing is cacheable, skip every walk. Cache on: the DSI band
+;  and the adopted display range are mapped Non-Cacheable by CacheMapNc
+;  (both SUBSETS of the 2 MiB blocks MmuAddNc marks), so walks inside them
+;  are skipped; everything else is walked. ScreenDmaUp calls it once at
+;  boot so the caches-off skip is in force from the first clear. Gate:
+;  tools/cache_coherence_policy_check.py.
+; ----------------------------------------------------------------------
+Procedure CacheDmaPolicy()
+  DmaClearUncached()
+  If gCacheOn = 0
+    DmaSetCacheOff(1)
+    ProcedureReturn
+  EndIf
+  DmaSetCacheOff(0)
+  DmaAddUncached(#MON_FB_LO, #MON_FB_HI + 1)
+  If gCacheDspHi > gCacheDspLo
+    DmaAddUncached(gCacheDspLo, gCacheDspHi)
+  EndIf
 EndProcedure
 
 ; Turn the cached MMU on. Rebuilds the tables every time (a returned
@@ -254,6 +289,7 @@ Procedure.i CacheEnable()
   EndIf
   MmuEnableCached()
   gCacheOn = 1
+  CacheDmaPolicy()
   ProcedureReturn 1
   CompilerElse
   ProcedureReturn 0
@@ -270,6 +306,50 @@ Procedure CacheDisable()
   EndIf
   MmuDisableCachedFlushed()
   gCacheOn = 0
+  CacheDmaPolicy()
+  CompilerEndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  CacheDisplayMoved - call after every DisplayInit that can run with the
+;  cache on (`screen on` at the prompt, V3dConTryDouble).
+;
+;  THE DEFECT IT CLOSES (2026-09-27 DMA audit, both chips). The tables mark
+;  the framebuffer Non-Cacheable only for the range CacheMapNc saw when
+;  CacheEnable built them. A later DisplayInit lets the firmware hand back a
+;  NEW base; with the old tables still live the new surface is Write-Back,
+;  so the CPU's pixels sit in the D-cache while the display controller, V3D
+;  and the DMA engine read stale DRAM. Nothing fails; the picture is wrong.
+;
+;  THE FIX IS A REMAP, NOT A REFUSAL: tear down (CacheDisable - M|C|I off,
+;  then clean+invalidate by set/way, so no line of the new surface survives
+;  cacheable), then CacheEnable (CacheMapNc sees the new base, the tables are
+;  rebuilt, the TLB is invalidated, the cache comes back). Only when the new
+;  range is not already covered: the same surface, or one inside the fixed
+;  DSI band, costs nothing. If the rebuild is refused the cache simply stays
+;  off - coherent, and `cache` reports it. Gate:
+;  tools/cache_display_remap_check.py.
+; ----------------------------------------------------------------------
+Procedure CacheDisplayMoved()
+  CompilerIf #ANVIL_CACHE = 1
+  Define lo.i
+  Define hi.i
+  If gCacheOn = 0
+    ProcedureReturn
+  EndIf
+  If DisplayReady() = 0 Or DisplayBase() <= 0
+    ProcedureReturn
+  EndIf
+  lo = DisplayBase()
+  hi = lo + DisplaySize()
+  If lo >= gCacheDspLo And hi <= gCacheDspHi
+    ProcedureReturn
+  EndIf
+  If lo >= #MON_FB_LO And hi <= #MON_FB_HI + 1
+    ProcedureReturn
+  EndIf
+  CacheDisable()
+  CacheEnable()
   CompilerEndIf
 EndProcedure
 
