@@ -879,9 +879,14 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
   Next
 EndProcedure
 
-; One rectangular linear-image readback uses guarded DMA row transfers on Pi 4.
-Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, dstBuffer.i, *r.VkBufferImageCopy)
-  Define c.i, d.i, src.i, ref.i, o.i, rowBytes.i, rows.i, sourceOffset.i, bytes.i, bufferPitch.i
+; One bounded array of rectangular linear-image readbacks uses guarded DMA
+; row transfers on Pi 4. Preflight every region before recording any of them.
+Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, dstBuffer.i, regionCount.i, *regions.VkBufferImageCopy)
+  Define c.i, d.i, src.i, ref.i, o.i, i.i, j.i, freeOps.i, group.i
+  Define rowBytes.i, rows.i, sourceOffset.i, bytes.i, bufferPitch.i
+  Define sourceBase.i, destinationBase.i, priorSource.i, priorDestination.i
+  Define priorBytes.i, priorPitch.i
+  Define *r.VkBufferImageCopy, *prior.VkBufferImageCopy
   c = avkCmdSlot(commandBuffer)
   If c = 0
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyImageToBuffer was given a stale command buffer (Anvil code -20002); nothing was recorded.")
@@ -891,8 +896,16 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImageToBuffer requires a recording command buffer outside a render pass (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If *r = 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer requires a non-null region (Anvil code -20001); nothing was recorded.")
+  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS Or *regions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer requires one to thirty-two non-null regions (Anvil code -20001); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  freeOps = 0
+  For o = 1 To #ANVIL_VK_MAX_OPS
+    If avkOpLive[o] = 0 : freeOps = freeOps + 1 : EndIf
+  Next
+  If freeOps < regionCount
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyImageToBuffer cannot retain every region in the shared command pool (VkResult -1); reset unused command buffers.")
     ProcedureReturn
   EndIf
   src = avkImgSlot(srcImage)
@@ -913,6 +926,8 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer requires TRANSFER_SRC_OPTIMAL or GENERAL source layout (Anvil code -20001); nothing was recorded.")
     ProcedureReturn
   EndIf
+  For i = 0 To regionCount - 1
+  *r = *regions + i * SizeOf(VkBufferImageCopy)
   If *r\bufferOffset < 0 Or (*r\bufferOffset % 4) <> 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer requires a non-negative four-byte-aligned destination buffer offset (Anvil code -20001); nothing was recorded.")
     ProcedureReturn
@@ -943,10 +958,31 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImageToBuffer found an image pitch or allocation too short for the requested rows (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, *r\bufferOffset, bytes, 0) = 0
+  If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, *r\bufferOffset, bytes, @destinationBase) = 0
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImageToBuffer requires a live, bound TRANSFER_DST buffer covering the requested rectangle (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
   EndIf
+  sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[src]] + avkImgMemOffset[src] + sourceOffset
+  If avkImageRowsOverlap(sourceBase, avkImgPitch[src], rowBytes, rows, destinationBase, bufferPitch, rowBytes, rows)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer source and destination memory overlap (Anvil code -20001); no array region was recorded.")
+    ProcedureReturn
+  EndIf
+  For j = 0 To i - 1
+    *prior = *regions + j * SizeOf(VkBufferImageCopy)
+    priorBytes = *prior\imageExtent\width * #ANVIL_VK_BGRA8_TEXEL_BYTES
+    priorPitch = priorBytes
+    If *prior\bufferRowLength <> 0 : priorPitch = *prior\bufferRowLength * #ANVIL_VK_BGRA8_TEXEL_BYTES : EndIf
+    priorSource = avkHeapBase + avkMemOffset[avkImgMemSlot[src]] + avkImgMemOffset[src] + *prior\imageOffset\y * avkImgPitch[src] + *prior\imageOffset\x * #ANVIL_VK_BGRA8_TEXEL_BYTES
+    If avkTransferBufferResolve(dstBuffer, d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, *prior\bufferOffset, (*prior\imageExtent\height - 1) * priorPitch + priorBytes, @priorDestination) = 0
+      avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImageToBuffer lost an earlier destination while validating the region array (Anvil code -20004); nothing was recorded.")
+      ProcedureReturn
+    EndIf
+    If avkImageRowsOverlap(sourceBase, avkImgPitch[src], rowBytes, rows, priorDestination, priorPitch, priorBytes, *prior\imageExtent\height) <> 0 Or avkImageRowsOverlap(priorSource, avkImgPitch[src], priorBytes, *prior\imageExtent\height, destinationBase, bufferPitch, rowBytes, rows) <> 0 Or avkImageRowsOverlap(priorDestination, priorPitch, priorBytes, *prior\imageExtent\height, destinationBase, bufferPitch, rowBytes, rows) <> 0
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer regions overlap source and destination memory or two destinations (Anvil code -20001); no array region was recorded.")
+      ProcedureReturn
+    EndIf
+  Next
+  Next
   ref = avkCbRef(c, srcImage, src)
   If ref < 0
     avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyImageToBuffer exceeded the command buffer's image-reference capacity (VkResult -1); nothing was recorded.")
@@ -956,18 +992,25 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyImageToBuffer cannot retain its source image or match its recorded layout (Anvil code -20004); nothing was recorded.")
     ProcedureReturn
   EndIf
-  o = avkOpAppend(c, #ANVIL_VK_OP_COPY_IMAGE_BUFFER)
-  If o = 0
-    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyImageToBuffer exhausted recorded-command storage (VkResult -1); reset unused command buffers.")
-    ProcedureReturn
-  EndIf
-  avkOpRef[o] = ref
-  avkOpBuffer[o] = dstBuffer
-  avkOpBufferOffset[o] = *r\bufferOffset
-  avkOpDstOffset[o] = sourceOffset
-  avkOpSourceBytes[o] = rowBytes
-  avkOpSourcePitch[o] = rows
-  avkOpBufferPitch[o] = bufferPitch
+  group = 0
+  For i = 0 To regionCount - 1
+    *r = *regions + i * SizeOf(VkBufferImageCopy)
+    o = avkOpAppend(c, #ANVIL_VK_OP_COPY_IMAGE_BUFFER)
+    If o = 0
+      avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyImageToBuffer exhausted recorded-command storage (VkResult -1); reset the invalid command buffer.")
+      ProcedureReturn
+    EndIf
+    If group = 0 : group = o : EndIf
+    avkOpCopyGroup[o] = group
+    avkOpRef[o] = ref
+    avkOpBuffer[o] = dstBuffer
+    avkOpBufferOffset[o] = *r\bufferOffset
+    avkOpDstOffset[o] = *r\imageOffset\y * avkImgPitch[src] + *r\imageOffset\x * #ANVIL_VK_BGRA8_TEXEL_BYTES
+    avkOpSourceBytes[o] = *r\imageExtent\width * #ANVIL_VK_BGRA8_TEXEL_BYTES
+    avkOpSourcePitch[o] = *r\imageExtent\height
+    avkOpBufferPitch[o] = avkOpSourceBytes[o]
+    If *r\bufferRowLength <> 0 : avkOpBufferPitch[o] = *r\bufferRowLength * #ANVIL_VK_BGRA8_TEXEL_BYTES : EndIf
+  Next
 EndProcedure
 
 ; Return a command buffer to the initial state: no ops, no references, no
@@ -1654,7 +1697,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   Define imageCopyGroup.i
   Define imageCopyGroups.i
   Define readbacks.i
-  Define readbackOp.i
+  Define readbackGroup.i
+  Define readbackGroups.i
   Define sourceImageSlot.i
   Define destinationImageSlot.i
   Define copyBytes.i
@@ -1757,7 +1801,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   imageCopyGroup = 0
   imageCopyGroups = 0
   readbacks = 0
-  readbackOp = 0
+  readbackGroup = 0
+  readbackGroups = 0
   bufferCopies = 0
   colour = 0
   target = 0
@@ -1782,7 +1827,12 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       EndIf
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
       readbacks = readbacks + 1
-      readbackOp = o
+      If readbackGroup = 0
+        readbackGroup = avkOpCopyGroup[o]
+        readbackGroups = 1
+      ElseIf avkOpCopyGroup[o] <> readbackGroup
+        readbackGroups = readbackGroups + 1
+      EndIf
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
       bufferCopies = bufferCopies + 1
     EndIf
@@ -1797,8 +1847,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If imageCopyGroups > 1 Or (imageCopies > 0 And (clears > 0 Or copies > 0 Or readbacks > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0))
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires one vkCmdCopyImage array in its own command buffer (VkResult -8); no partial command stream was submitted.")
   EndIf
-  If readbacks > 1 Or (readbacks > 0 And (clears > 0 Or copies > 0 Or imageCopies > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0))
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires one image-to-buffer DMA readback in its own command buffer (VkResult -8); no partial command stream was submitted.")
+  If readbackGroups > 1 Or (readbacks > 0 And (clears > 0 Or copies > 0 Or imageCopies > 0 Or bufferCopies > 0 Or avkCbDrawCount[c] > 0 Or avkCbRpDone[c] <> 0))
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires one image-to-buffer DMA readback array in its own command buffer (VkResult -8); no partial command stream was submitted.")
   EndIf
   ; A command buffer is either a transfer or a render pass, never both.
   ; The backend seam carries ONE job, and running the clear and throwing
@@ -1917,28 +1967,46 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   EndIf
   o = avkOpNext[o]
   Wend
-  If readbacks = 1
-    sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[readbackOp])]
-    copyBytes = avkOpSourceBytes[readbackOp]
-    copyRows = avkOpSourcePitch[readbackOp]
-    If sourceImageSlot < 1 Or avkImgBound[sourceImageSlot] = 0 Or avkImgTiling[sourceImageSlot] <> #VK_IMAGE_TILING_LINEAR
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale image-to-buffer source (Anvil code -20004); nothing was submitted.")
-    EndIf
-    sourcePitch = avkImgPitch[sourceImageSlot]
-    destinationPitch = avkOpBufferPitch[readbackOp]
-    If copyBytes < 1 Or copyRows < 1 Or copyBytes > sourcePitch Or destinationPitch < copyBytes Or avkOpDstOffset[readbackOp] < 0 Or avkOpDstOffset[readbackOp] + (copyRows - 1) * sourcePitch + copyBytes > avkImgSize[sourceImageSlot]
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid image-to-buffer rectangle or changed image pitch (Anvil code -20004); nothing was submitted.")
-    EndIf
-    If avkTransferBufferResolve(avkOpBuffer[readbackOp], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[readbackOp], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or undersized image-to-buffer destination (Anvil code -20004); nothing was submitted.")
-    EndIf
-    sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[readbackOp]
-    For k = 0 To copyRows - 1
-      sourceRowBase = sourceBase + k * sourcePitch
-      If sourceRowBase < destinationBase + (copyRows - 1) * destinationPitch + copyBytes And destinationBase < sourceRowBase + copyBytes
-        ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping image-to-buffer source and destination memory (Anvil code -20001); nothing was submitted.")
+  If readbacks > 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
+        sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        copyBytes = avkOpSourceBytes[o]
+        copyRows = avkOpSourcePitch[o]
+        If sourceImageSlot < 1 Or avkImgBound[sourceImageSlot] = 0 Or avkImgTiling[sourceImageSlot] <> #VK_IMAGE_TILING_LINEAR
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale image-to-buffer source (Anvil code -20004); nothing was submitted.")
+        EndIf
+        sourcePitch = avkImgPitch[sourceImageSlot]
+        destinationPitch = avkOpBufferPitch[o]
+        If copyBytes < 1 Or copyRows < 1 Or copyBytes > sourcePitch Or destinationPitch < copyBytes Or avkOpDstOffset[o] < 0 Or avkOpDstOffset[o] + (copyRows - 1) * sourcePitch + copyBytes > avkImgSize[sourceImageSlot]
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid image-to-buffer rectangle or changed image pitch (Anvil code -20004); nothing was submitted.")
+        EndIf
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale or undersized image-to-buffer destination (Anvil code -20004); nothing was submitted.")
+        EndIf
+        sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[o]
+        If avkImageRowsOverlap(sourceBase, sourcePitch, copyBytes, copyRows, destinationBase, destinationPitch, copyBytes, copyRows) <> 0
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping image-to-buffer source and destination memory (Anvil code -20001); nothing was submitted.")
+        EndIf
+        other = avkOpNext[o]
+        While other <> 0
+          If avkOpKind[other] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER And avkOpCopyGroup[other] = avkOpCopyGroup[o]
+            otherBytes = avkOpSourceBytes[other]
+            otherRows = avkOpSourcePitch[other]
+            otherSourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[other]
+            If avkTransferBufferResolve(avkOpBuffer[other], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[other], (otherRows - 1) * avkOpBufferPitch[other] + otherBytes, @otherDestinationBase) = 0
+              ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale image-to-buffer destination in the readback array (Anvil code -20004); nothing was submitted.")
+            EndIf
+            If avkImageRowsOverlap(sourceBase, sourcePitch, copyBytes, copyRows, otherDestinationBase, avkOpBufferPitch[other], otherBytes, otherRows) <> 0 Or avkImageRowsOverlap(otherSourceBase, sourcePitch, otherBytes, otherRows, destinationBase, destinationPitch, copyBytes, copyRows) <> 0 Or avkImageRowsOverlap(destinationBase, destinationPitch, copyBytes, copyRows, otherDestinationBase, avkOpBufferPitch[other], otherBytes, otherRows) <> 0
+              ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping source and destination memory or two destinations in one readback array (Anvil code -20001); no DMA was started.")
+            EndIf
+          EndIf
+          other = avkOpNext[other]
+        Wend
       EndIf
-    Next
+      o = avkOpNext[o]
+    Wend
   EndIf
   If bufferCopies > 0
     o = avkCbOpHead[c]
@@ -2043,22 +2111,38 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf
-  If readbacks = 1
-    If copyBytes = sourcePitch And copyBytes = destinationPitch
-      job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
-      If job <> #ANVIL_VK_JOB_DONE
-        avkFlightComplete(0)
-        ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
-      EndIf
-    Else
-      For k = 0 To copyRows - 1
-        job = avkBackendSubmitBufferCopy(sourceBase + k * sourcePitch, destinationBase + k * destinationPitch, copyBytes)
-        If job <> #ANVIL_VK_JOB_DONE
+  If readbacks > 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
+        sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        sourcePitch = avkImgPitch[sourceImageSlot]
+        copyBytes = avkOpSourceBytes[o]
+        copyRows = avkOpSourcePitch[o]
+        destinationPitch = avkOpBufferPitch[o]
+        sourceBase = avkHeapBase + avkMemOffset[avkImgMemSlot[sourceImageSlot]] + avkImgMemOffset[sourceImageSlot] + avkOpDstOffset[o]
+        If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image row into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the image-to-buffer readback destination changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
         EndIf
-      Next
-    EndIf
+        If copyBytes = sourcePitch And copyBytes = destinationPitch
+          job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
+          If job <> #ANVIL_VK_JOB_DONE
+            avkFlightComplete(0)
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          EndIf
+        Else
+          For k = 0 To copyRows - 1
+            job = avkBackendSubmitBufferCopy(sourceBase + k * sourcePitch, destinationBase + k * destinationPitch, copyBytes)
+            If job <> #ANVIL_VK_JOB_DONE
+              avkFlightComplete(0)
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image row into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            EndIf
+          Next
+        EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
     avkFlightComplete(1)
     ProcedureReturn #VK_SUCCESS
   EndIf

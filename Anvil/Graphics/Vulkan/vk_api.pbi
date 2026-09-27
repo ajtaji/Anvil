@@ -1476,11 +1476,11 @@ Procedure vkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcImageLayout.i, 
     avkFault(#ANVIL_VK_ERR_HANDLE, "vkCmdCopyImageToBuffer was given a stale command buffer (Anvil code -20002); nothing was recorded.")
     ProcedureReturn
   EndIf
-  If regionCount <> 1 Or *pRegions = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer currently requires exactly one non-null region (Anvil code -20005); no partial array was copied.")
+  If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS Or *pRegions = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImageToBuffer requires one to thirty-two non-null regions (Anvil code -20001); no partial array was copied.")
     ProcedureReturn
   EndIf
-  AnvilVkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout, dstBuffer, *pRegions)
+  AnvilVkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout, dstBuffer, regionCount, *pRegions)
 EndProcedure
 
 ; A whole-attachment clear before any draw lowers to the Pi 4 tile clear.
