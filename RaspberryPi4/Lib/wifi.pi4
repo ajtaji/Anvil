@@ -235,6 +235,11 @@ EndProcedure
 Procedure.i WifiClockHz()
   Define hz.i
   Define tries.i
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: SDIO2 is fed by clk-emmc2, a DTB fixed clock - NOT the
+  ; firmware's clock id 1. See THE PI 5 (BCM2712) in sdio.pi4.
+  ProcedureReturn #SDIO_2712_DTB_BASE_KHZ * 1000
+CompilerEndIf
   hz = 0
   tries = 0
   While tries < #WIFI_CLOCK_TRIES And hz <= 0
@@ -287,11 +292,16 @@ Procedure.i WifiRadioUp()
   EndIf
 
   ; -- the bus --
+CompilerIf #PMF_CHIP = 2712
+  ; No mailbox on the BCM2712 radio path: the clock is the DTB's and
+  ; WL_ON is a GPIO. The board must already have called SdioSetPinctrl.
+CompilerElse
   If MailboxInit() = 0
     PrintN("!! the VideoCore mailbox would not initialise, so the radio's clock")
     PrintN("   cannot be asked for. Nothing was brought up.")
     ProcedureReturn 0
   EndIf
+CompilerEndIf
   hz = WifiClockHz()
   If hz <= 0
     PrintN("!! the firmware would not report the EMMC clock. The HDMI")
@@ -2338,7 +2348,12 @@ Procedure WifiRadioInitTick()
       gWifiRinitPhase = #WIFI_RINIT_MBX_INIT
 
     Case #WIFI_RINIT_MBX_INIT
+CompilerIf #PMF_CHIP = 2712
+      ; No mailbox on the BCM2712 radio path; see WifiClockHz.
+      r = 1
+CompilerElse
       r = MailboxInit()
+CompilerEndIf
       If wifi_RadioInitStillOwned(generation) = 0
         ProcedureReturn
       EndIf
@@ -2358,7 +2373,11 @@ Procedure WifiRadioInitTick()
     Case #WIFI_RINIT_CLOCK_TRY
       ; One complete mailbox transaction remains atomic. The retry loop and
       ; its gaps do not: each failed reply returns to the outer service owner.
+CompilerIf #PMF_CHIP = 2712
+      r = WifiClockHz()
+CompilerElse
       r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)
+CompilerEndIf
       If wifi_RadioInitStillOwned(generation) = 0
         ProcedureReturn
       EndIf

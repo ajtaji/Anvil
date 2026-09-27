@@ -59,6 +59,83 @@
 ; of accessors that say "not attempted" rather than "failed".
 ;
 ; ======================================================================
+; THE PI 5 (BCM2712) - THE SAME FILE BEHIND A SEAM. DESK-PROVEN ONLY.
+; ======================================================================
+; Rule 30: one SDIO library. A -t pi5 build (#PMF_CHIP = 2712) takes the
+; CompilerIf #PMF_CHIP = 2712 branches below; every -t pi4 line is in the
+; CompilerElse, untouched, and the -t pi4 image is byte-identical (proved
+; from an export of HEAD, 2026-09-26). Everything above the host -
+; Anvil/Net/cyw43.pbi, wifi_assoc, wpa2sup - is unchanged: the radio on
+; both boards is function 1 of a "brcm,bcm4329-fmac" SDIO device.
+;
+; Pinned sources: raspberrypi/linux 7e030b60792de1c15b9ec1d8d5d34d63f0f0f1d8
+; (vault "Raspberry Pi 5/Sources", listed in its SOURCES.md) and the three
+; pinned firmware DTBs.
+;
+;   HOST    sdio2: mmc@1100000, "brcm,bcm2712-sdhci", reg "host"
+;           <0x10 0x01100000 0x260> and "cfg" <0x10 0x01100400 0x200>
+;           (bcm2712-ds.dtsi lines 388-400). Physical $1001100000 and
+;           $1001100400 - /axi ranges, RaspberryPi5/Boot/dtb_contract.py
+;           wlan_sdio(), identical in all three DTBs. A standard SDHCI
+;           register file, so every command path below is shared.
+;           NOT $1000FFF000: that is mmc@fff000, the SD-card host.
+;   CFG     sdhci-brcmstb.c: SDIO_CFG_CTRL $00 (line 40), force presence
+;           for a non-removable card = SDCD_N_TEST_EN set, SDCD_N_TEST_LEV
+;           clear (lines 283-290); SDIO_CFG_CQ_CAPABILITY $4C =
+;           (3 << 12) | base MHz (lines 292-295); SDIO_CFG_SD_PIN_SEL $44,
+;           mask 3, SD = bit 1, written with the card clock stopped on
+;           every clock change (sdhci_bcm2712_set_clock, lines 155-189).
+;           MAX_50MHZ_MODE is NOT written: cfginit_2712 writes it only
+;           for SDR50/SDR104/HS200/HS400 (lines 274-281), none of which
+;           this file uses.
+;   CLOCK   clocks = <&clk_emmc2>: /clocks/clk-emmc2, "fixed-clock",
+;           clock-frequency $0BEBC200 = 200 MHz in all three pinned DTBs.
+;           THE CAPABILITIES FIELD IS NOT A FALLBACK HERE: the node
+;           carries sdhci-caps-mask = <0x0000C000 0x0>, i.e. the vendor
+;           masks bits of the very field a fallback would read. A -t pi5
+;           SdioInit refuses (#SDIO_ERR_BASECLK) unless the board supplies
+;           the clock: SdioSetBaseClockKhz(#SDIO_2712_DTB_BASE_KHZ) today,
+;           the live DTB's value once the board reads it.
+;   WL_ON   wl_on_reg: regulator-fixed, gpio = <&gio 28 GPIO_ACTIVE_HIGH>,
+;           startup-delay-us = <150000>, and it is sdio2's vmmc-supply
+;           (bcm2712-rpi-5-b.dts lines 64-76 and 423-433). BCM2712 GPIO,
+;           NOT RP1 and NOT the firmware expander: no mailbox on this path.
+;           gio: gpio@7d508500, "brcm,brcmstb-gpio" (bcm2712-ds.dtsi lines
+;           183-195) -> $107D508500 through /soc ranges. Register layout,
+;           drivers/gpio/gpio-brcmstb.c lines 15-36 and 59-62: eight
+;           32-bit registers per bank (ODEN, DATA, IODIR, ...), GPIO n in
+;           bank n>>5 bit n&31, so GPIO28 is DATA +$04 / IODIR +$08 bit 28;
+;           IODIR 1 = input, 0 = output (line 672). Sequence: mux GPIO28
+;           to "gpio" (wl_on_pins, dts lines 349-352), drive LOW (value
+;           then direction), hold #SDIO_WL_ON_LOW_MS, drive HIGH, wait
+;           #SDIO_WL_ON_HIGH_MS = 150 ms (= the regulator's startup-delay-
+;           us), read both bits back. Success is the readback.
+;   PINS    sdio2_30_pins (bcm2712-ds.dtsi lines 164-181): GPIO30 clk
+;           bias-disable, GPIO31 cmd and GPIO32-35 dat bias-pull-up,
+;           function "sd2". pinctrl@7d504100 -> $107D504100.
+;           drivers/pinctrl/bcm/pinctrl-brcmstb.h (MUX_BIT/PAD_BIT) and
+;           pinctrl-brcmstb.c lines 30-36: mux field = 4 bits at reg*4,
+;           shift*4; pad = 2 bits at reg*4, shift*2; pull NONE 0, DOWN 1,
+;           UP 2 (NOT the BCM2711 encoding - see THE PULL ENCODING below).
+;           THE LAYOUT DEPENDS ON THE CHIP STEPPING and nothing in the
+;           register file says which: pinctrl-brcmstb-bcm2712.c
+;             C0 ("brcm,bcm2712c0-pinctrl"): GPIO_REGS lines 154-161,
+;                BRCMSTB_PIN lines 546-551 - sd2 is fsel 4,4,4,3,4,3
+;             D0 ("brcm,bcm2712d0-pinctrl"): GPIO_REGS lines 317-324,
+;                BRCMSTB_PIN lines 613-618 - sd2 is fsel 1 on all six
+;           so the BOARD must say which, SdioSetPinctrl(#SDIO_PINCTRL_C0 /
+;           #SDIO_PINCTRL_D0), from the live DTB's pinctrl@7d504100
+;           compatible, and SdioInit / SdioAssertWlOn REFUSE without it
+;           (#SDIO_ERR_PINCTRL). Guessing is a one-in-two chance of
+;           putting six pins on MTSIF. NOTE: the pinned
+;           bcm2712-d-rpi-5-b.dtb labels pinctrl@7d504100
+;           "brcm,bcm2712c0-aon-pinctrl" - neither string above - so a
+;           board reading that tree must refuse, not map it to C0.
+;
+; SILICON OWED. Nothing on this path has run on a Pi 5. The desk gate is
+; tools/a64/a64_sdio_pi5_check.py.
+;
+; ======================================================================
 ; WHAT HAS AND HAS NOT RUN ON SILICON. READ THIS FIRST.
 ; ======================================================================
 ; THIS FILE CARRIES THE CYW43455. Everything the Wi-Fi radio has ever
@@ -867,8 +944,15 @@
 ;  THE CONTROLLER
 ; ======================================================================
 
+CompilerIf #PMF_CHIP = 2712
+; sdio2: mmc@1100000 "host" and "cfg" -> physical through /axi ranges.
+; See THE PI 5 (BCM2712) in the header.
+#SDIO_BASE     = $1001100000
+#SDIO_CFG_BASE = $1001100400
+CompilerElse
 ; mmcnr@7e300000 -> ARM $FE300000. See THE CONTROLLER above.
 #SDIO_BASE = $FE300000
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  SDHCI register offsets. Every one from rpi-6.12.y_sdhci.h, line given.
@@ -1315,6 +1399,48 @@
 #SDIO_PULL_UP   = 1
 #SDIO_PULL_DOWN = 2
 
+CompilerIf #PMF_CHIP = 2712
+; ----------------------------------------------------------------------
+;  BCM2712 ONLY. Every number cited in THE PI 5 (BCM2712) in the header;
+;  the line numbers are the pinned files'.
+; ----------------------------------------------------------------------
+; The cfg block, sdhci-brcmstb.c.
+#SDIO_CFG_CTRL               = $00         ; line 40
+#SDIO_CFG_CTRL_SDCD_TEST_EN  = $80000000   ; line 41, BIT(31)
+#SDIO_CFG_CTRL_SDCD_TEST_LEV = $40000000   ; line 42, BIT(30)
+#SDIO_CFG_SD_PIN_SEL         = $44         ; line 44
+#SDIO_CFG_SD_PIN_SEL_MASK    = $3          ; line 45
+#SDIO_CFG_SD_PIN_SEL_SD      = $2          ; line 46, BIT(1)
+#SDIO_CFG_CQ_CAPABILITY      = $4C         ; line 37
+#SDIO_CFG_CQ_FMUL            = $3000       ; 3 << FMUL_SHIFT 12, lines 38, 294
+
+; clk-emmc2's clock-frequency in all three pinned DTBs ($0BEBC200 Hz).
+#SDIO_2712_DTB_BASE_KHZ = 200000
+
+; pinctrl@7d504100 and gio: gpio@7d508500, through /soc ranges.
+#SDIO_PINCTRL_BASE = $107D504100
+#SDIO_GIO_BASE     = $107D508500
+#SDIO_GIO_DATA     = $04               ; GIO_DATA(0), gpio-brcmstb.c 17, 30
+#SDIO_GIO_IODIR    = $08               ; GIO_IODIR(0), lines 18, 31
+#SDIO_WL_ON_BIT    = $10000000         ; GPIO28: bank 0, bit 28 (lines 60-62)
+
+; Which pinctrl register layout this chip has. The board says; see PINS.
+#SDIO_PINCTRL_UNKNOWN = 0
+#SDIO_PINCTRL_C0      = 1              ; "brcm,bcm2712c0-pinctrl"
+#SDIO_PINCTRL_D0      = 2              ; "brcm,bcm2712d0-pinctrl"
+
+; pinctrl-brcmstb.c lines 30-33. UP IS 2 HERE; on the BCM2711 it is 1.
+#SDIO_BRCM_PULL_NONE = 0
+#SDIO_BRCM_PULL_UP   = 2
+#SDIO_BRCM_FIELD_MUX = $F              ; BRCMSTB_FSEL_MASK, -bcm2712.c line 19
+#SDIO_BRCM_FIELD_PAD = $3              ; BRCMSTB_PULL_MASK, line 33
+
+; Refusals only a -t pi5 build can raise. Numbered after the last shared
+; code so no Pi 4 log changes meaning.
+#SDIO_ERR_PINCTRL = 33
+#SDIO_ERR_WL_ON   = 34
+CompilerEndIf
+
 ; ======================================================================
 ;  THE FIRMWARE PROPERTY TAGS THIS FILE ISSUES ITSELF
 ;
@@ -1469,6 +1595,11 @@ Global sdio_caps1.i  = 0
 Global sdio_hostVerRaw.i = 0   ; the whole word at $FC, as found
 Global sdio_gpfsel3.i = 0      ; GPFSEL3 as sdio_MuxPins left it
 Global sdio_gppup2.i  = 0      ; GPIO_PUP_PDN_CNTRL_REG2, likewise
+CompilerIf #PMF_CHIP = 2712
+Global sdio_pinctrl.i = 0      ; #SDIO_PINCTRL_*, from the board
+Global sdio_cfgCtrl.i = 0      ; SDIO_CFG_CTRL as SdioInit left it
+Global sdio_cfgPinSel.i = 0    ; SDIO_CFG_SD_PIN_SEL, likewise
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  What the firmware said, and whether it was asked at all.
@@ -1720,6 +1851,117 @@ Procedure sdio_MuxPins()
 EndProcedure
 
 
+CompilerIf #PMF_CHIP = 2712
+; ======================================================================
+;  BCM2712 PINS. See PINS under THE PI 5 (BCM2712) in the header.
+;
+;  sdio_PinField - read-modify-write ONE field of one pinctrl register,
+;  as brcmstb_pinctrl_fsel_set / brcmstb_pull_config_set do
+;  (pinctrl-brcmstb.c lines 121-125 and 311-314). Every register here
+;  holds eight pins' mux fields or fifteen pins' pads, so a whole-register
+;  write would re-mux the Bluetooth UART and the SD card's neighbours.
+; ======================================================================
+Procedure sdio_PinField(off.i, shift.i, mask.i, value.i)
+  Define v.i
+  v = PeekN(#SDIO_PINCTRL_BASE + off)
+  v = v & (~(mask << shift))
+  v = v | ((value & mask) << shift)
+  PokeL(#SDIO_PINCTRL_BASE + off, v)
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  SdioSetPinctrl(kind) - PUBLIC, BCM2712 only. The board states which
+;  pinctrl layout the chip has, from the live DTB's pinctrl@7d504100
+;  compatible: "brcm,bcm2712c0-pinctrl" -> #SDIO_PINCTRL_C0,
+;  "brcm,bcm2712d0-pinctrl" -> #SDIO_PINCTRL_D0, anything else -> do not
+;  call this, and SdioInit refuses. Returns 1 if kind was one of the two.
+; ----------------------------------------------------------------------
+Procedure.i SdioSetPinctrl(kind.i)
+  If kind = #SDIO_PINCTRL_C0 Or kind = #SDIO_PINCTRL_D0
+    sdio_pinctrl = kind
+    ProcedureReturn 1
+  EndIf
+  sdio_pinctrl = #SDIO_PINCTRL_UNKNOWN
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i SdioPinctrl()
+  ProcedureReturn sdio_pinctrl
+EndProcedure
+
+Procedure.i SdioCfgCtrl()
+  ProcedureReturn sdio_cfgCtrl
+EndProcedure
+
+Procedure.i SdioCfgPinSel()
+  ProcedureReturn sdio_cfgPinSel
+EndProcedure
+
+; GPIO28 to function "gpio" (fsel 0 - func_gpio, and a function number
+; below n_funcs is used as the fsel directly, pinctrl-brcmstb.c lines 98-110).
+; wl_on_pins carries no bias property, so its pad is left alone.
+;   C0 GPIO_REGS(28, 3, 4, 9, 5)  -bcm2712.c line 154: mux +$0C bit 16
+;   D0 GPIO_REGS(28, 2, 4, 5, 10) -bcm2712.c line 317: mux +$08 bit 16
+Procedure.i sdio_MuxWlOn2712()
+  If sdio_pinctrl = #SDIO_PINCTRL_C0
+    sdio_PinField($0C, 16, #SDIO_BRCM_FIELD_MUX, 0)
+    ProcedureReturn 1
+  EndIf
+  If sdio_pinctrl = #SDIO_PINCTRL_D0
+    sdio_PinField($08, 16, #SDIO_BRCM_FIELD_MUX, 0)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; GPIO30..35 to "sd2", clock no pull, CMD and DAT0..3 pull-up.
+;   C0 -bcm2712.c lines 156-161 and 546-551:
+;      30 (3,6 / 9,7)  sd2 = fsel 4     33 (4,1 / 9,10) sd2 = fsel 3
+;      31 (3,7 / 9,8)  sd2 = fsel 4     34 (4,2 / 9,11) sd2 = fsel 4
+;      32 (4,0 / 9,9)  sd2 = fsel 4     35 (4,3 / 9,12) sd2 = fsel 3
+;   D0 -bcm2712.c lines 319-324 and 613-618, sd2 = fsel 1 on all six:
+;      30 (2,6 / 5,12) 31 (2,7 / 5,13) 32 (3,0 / 5,14)
+;      33 (3,1 / 6,0)  34 (3,2 / 6,1)  35 (3,3 / 6,2)
+;   (muxreg,muxshift / padreg,padshift): mux at +muxreg*4 bit muxshift*4,
+;   pad at +padreg*4 bit padshift*2 - pinctrl-brcmstb.h MUX_BIT/PAD_BIT
+;   and pinctrl-brcmstb.c BIT_TO_REG/BIT_TO_SHIFT (lines 35-36).
+; Returns 0, touching nothing, when the layout is unknown.
+Procedure.i sdio_MuxPins2712()
+  If sdio_pinctrl = #SDIO_PINCTRL_C0
+    sdio_PinField($0C, 24, #SDIO_BRCM_FIELD_MUX, 4)
+    sdio_PinField($0C, 28, #SDIO_BRCM_FIELD_MUX, 4)
+    sdio_PinField($10,  0, #SDIO_BRCM_FIELD_MUX, 4)
+    sdio_PinField($10,  4, #SDIO_BRCM_FIELD_MUX, 3)
+    sdio_PinField($10,  8, #SDIO_BRCM_FIELD_MUX, 4)
+    sdio_PinField($10, 12, #SDIO_BRCM_FIELD_MUX, 3)
+    sdio_PinField($24, 14, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_NONE)
+    sdio_PinField($24, 16, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($24, 18, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($24, 20, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($24, 22, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($24, 24, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    ProcedureReturn 1
+  EndIf
+  If sdio_pinctrl = #SDIO_PINCTRL_D0
+    sdio_PinField($08, 24, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($08, 28, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($0C,  0, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($0C,  4, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($0C,  8, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($0C, 12, #SDIO_BRCM_FIELD_MUX, 1)
+    sdio_PinField($14, 24, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_NONE)
+    sdio_PinField($14, 26, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($14, 28, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($18,  0, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($18,  2, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    sdio_PinField($18,  4, #SDIO_BRCM_FIELD_PAD, #SDIO_BRCM_PULL_UP)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+CompilerEndIf
+
+
 ; ======================================================================
 ;  THE FIRMWARE HALF OF THE BRING-UP
 ;
@@ -1818,6 +2060,11 @@ EndProcedure
 ;  complete. Rule 1 above.
 ; ----------------------------------------------------------------------
 Procedure.i sdio_MbxIdState(tag.i, id.i, state.i, sendState.i)
+CompilerIf #PMF_CHIP = 2712
+  ; No VideoCore on this path: the BCM2712 SDIO2 clock is a DTB fixed
+  ; clock and WL_ON is a GPIO. "Not asked" - rule 1 below.
+  ProcedureReturn -1
+CompilerElse
   If MailboxReady() = 0
     ProcedureReturn -1
   EndIf
@@ -1833,6 +2080,7 @@ Procedure.i sdio_MbxIdState(tag.i, id.i, state.i, sendState.i)
     ProcedureReturn -1
   EndIf
   ProcedureReturn MailboxWord(1)
+CompilerEndIf
 EndProcedure
 
 
@@ -1972,6 +2220,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure sdio_EnableClockAndPower()
   Define s.i
+CompilerIf #PMF_CHIP = 2712
+  ; Nothing to ask: see sdio_MbxIdState. Every accessor keeps its -1.
+CompilerElse
 
   ; --- the clock -------------------------------------------------------
   ; GET_CLOCK_STATE, eight bytes: { u32 clock id, u32 state }.
@@ -2010,6 +2261,7 @@ Procedure sdio_EnableClockAndPower()
   s = SdioQueryPowerState(#SDIO_PWR_DEVID_SDHCI)
   sdio_pwrState = s
   sdio_pwrStateAfter = s
+CompilerEndIf
 EndProcedure
 
 
@@ -2140,6 +2392,84 @@ EndProcedure
 ;  Returns 1 only if the readback says the pin is high.
 ; ----------------------------------------------------------------------
 Procedure.i SdioAssertWlOn()
+CompilerIf #PMF_CHIP = 2712
+  ; ---- BCM2712: WL_ON is gio GPIO28, driven directly. ------------------
+  ; See WL_ON under THE PI 5 (BCM2712) in the header. The rungs, in
+  ; sdio_wlOnStep, and what a stop at each means:
+  ;   0  no usable CNTFRQ - the hold and the 150 ms would be zero, so
+  ;      nothing was driven
+  ;   1  the board never called SdioSetPinctrl - nothing was driven
+  ;   2  GPIO28 muxed to "gpio"; the level and direction as found are
+  ;      recorded in SdioWlOnLevelFound / SdioWlOnDirectionFound
+  ;   3  driven LOW and held #SDIO_WL_ON_LOW_MS
+  ;   4  driven HIGH, #SDIO_WL_ON_HIGH_MS spent
+  ;   5  the readback said the pin is NOT an output driving high
+  ;   6  done: the readback says output, high
+  ;
+  ; ALWAYS A FULL CYCLE, whatever the pin was found at. The Pi 4 branch
+  ; skips its low phase because each edge there is a firmware property
+  ; transaction that the board has refused; here an edge is one store,
+  ; and a radio that some earlier stage left powered is exactly the warm
+  ; start the low phase exists to turn into a cold one ("a warm restart
+  ; looks like a cold one", RP2040/Lib/cyw43.pico line 1973). Once per
+  ; run, latched, for the same reason as the Pi 4 branch's ONCE PER RUN.
+  Define d.i
+  If sdio_wlOnDone = 1
+    ProcedureReturn 1
+  EndIf
+  sdio_wlOnStep       = 0
+  sdio_wlOnLevel      = -1
+  sdio_wlOnLevelFound = -1
+  sdio_wlOnDirFound   = -1
+  If sdio_EnsureTimebase() = 0
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnStep = 1
+  If sdio_MuxWlOn2712() = 0
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnStep = 2
+  ; As found. Direction reported the Pi 4 way: 1 = output.
+  d = PeekN(#SDIO_GIO_BASE + #SDIO_GIO_IODIR)
+  sdio_wlOnDirFound = 1
+  If (d & #SDIO_WL_ON_BIT) <> 0
+    sdio_wlOnDirFound = 0
+  EndIf
+  sdio_wlOnLevelFound = 0
+  If (PeekN(#SDIO_GIO_BASE + #SDIO_GIO_DATA) & #SDIO_WL_ON_BIT) <> 0
+    sdio_wlOnLevelFound = 1
+  EndIf
+
+  ; LOW: the value first, then the direction, so the pin never drives a
+  ; stale high on becoming an output (the generic MMIO GPIO's
+  ; value-then-direction order, which gpio-brcmstb.c lines 672-681 use).
+  d = PeekN(#SDIO_GIO_BASE + #SDIO_GIO_DATA) & (~#SDIO_WL_ON_BIT)
+  PokeL(#SDIO_GIO_BASE + #SDIO_GIO_DATA, d)
+  d = PeekN(#SDIO_GIO_BASE + #SDIO_GIO_IODIR) & (~#SDIO_WL_ON_BIT)
+  PokeL(#SDIO_GIO_BASE + #SDIO_GIO_IODIR, d)
+  sdio_wlOnStep = 3
+  sdio_DelayMs(#SDIO_WL_ON_LOW_MS)
+
+  ; HIGH, then the regulator's startup-delay-us, 150000.
+  d = PeekN(#SDIO_GIO_BASE + #SDIO_GIO_DATA) | #SDIO_WL_ON_BIT
+  PokeL(#SDIO_GIO_BASE + #SDIO_GIO_DATA, d)
+  sdio_wlOnStep = 4
+  sdio_DelayMs(#SDIO_WL_ON_HIGH_MS)
+
+  ; SUCCESS IS THE READBACK: an output, driving high.
+  sdio_wlOnStep = 5
+  If (PeekN(#SDIO_GIO_BASE + #SDIO_GIO_IODIR) & #SDIO_WL_ON_BIT) <> 0
+    ProcedureReturn 0
+  EndIf
+  If (PeekN(#SDIO_GIO_BASE + #SDIO_GIO_DATA) & #SDIO_WL_ON_BIT) = 0
+    sdio_wlOnLevel = 0
+    ProcedureReturn 0
+  EndIf
+  sdio_wlOnLevel = 1
+  sdio_wlOnStep  = 6
+  sdio_wlOnDone  = 1
+  ProcedureReturn 1
+CompilerElse
   Define polarity.i
   Define level.i
 
@@ -2361,6 +2691,7 @@ Procedure.i SdioAssertWlOn()
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
+CompilerEndIf
 EndProcedure
 
 
@@ -2484,6 +2815,11 @@ Procedure.i sdio_BaseClockKhz()
   If sdio_userBase > 0
     ProcedureReturn sdio_userBase
   EndIf
+CompilerIf #PMF_CHIP = 2712
+  ; NOT A FALLBACK ON THIS CHIP: the DTB masks this field
+  ; (sdhci-caps-mask <0x0000C000 0x0>). Unknown means refuse.
+  ProcedureReturn 0
+CompilerEndIf
   mhz = (sdio_caps0 >> 8) & $3F
   If mhz = 0
     ProcedureReturn 0
@@ -2562,6 +2898,15 @@ Procedure.i sdio_SetClock(wantKhz.i)
   ; 1
   c1 = sdio_Rd(#SDIO_CONTROL1) & (~#SDIO_CLK_CARD_EN)
   sdio_Wr(#SDIO_CONTROL1, c1)
+
+CompilerIf #PMF_CHIP = 2712
+  ; 1b. SD_PIN_SEL = SD, with the card clock stopped and before the new
+  ; divisor - sdhci_bcm2712_set_clock, sdhci-brcmstb.c lines 165-182.
+  ; No timing this file uses is an eMMC rate, so it is always SD.
+  c1 = PeekN(#SDIO_CFG_BASE + #SDIO_CFG_SD_PIN_SEL) & (~#SDIO_CFG_SD_PIN_SEL_MASK)
+  PokeL(#SDIO_CFG_BASE + #SDIO_CFG_SD_PIN_SEL, c1 | #SDIO_CFG_SD_PIN_SEL_SD)
+  sdio_cfgPinSel = PeekN(#SDIO_CFG_BASE + #SDIO_CFG_SD_PIN_SEL)
+CompilerEndIf
 
   ; 2. N[7:0] to word bits 15:8, N[9:8] to word bits 7:6.
   lo = (n & $FF) << 8
@@ -3908,11 +4253,24 @@ Procedure.i SdioInit()
   ; "not attempted"; if the firmware refuses a tag they record the
   ; refusal and carry on. Nothing below depends on any of it succeeding,
   ; and that is deliberate: this file's subject is the controller.
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: NOT advisory. There is no firmware in the way of either
+  ; step, so a failure is ours and nothing below can work without them.
+  ; Pins first (the host's pinctrl "default" state is applied at probe,
+  ; before its vmmc-supply is enabled), then the radio's power.
+  If sdio_MuxPins2712() = 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_PINCTRL)
+  EndIf
+  If SdioAssertWlOn() = 0
+    ProcedureReturn sdio_Fail(#SDIO_ERR_WL_ON)
+  EndIf
+CompilerElse
   sdio_EnableClockAndPower()
   SdioAssertWlOn()
 
   ; --- 2 ---------------------------------------------------------------
   sdio_MuxPins()
+CompilerEndIf
 
   ; --- 3 ---------------------------------------------------------------
   If sdio_ControllerPlausible() = 0
@@ -3924,6 +4282,23 @@ Procedure.i SdioInit()
   If sdio_baseKhz <= 0
     ProcedureReturn sdio_Fail(#SDIO_ERR_BASECLK)
   EndIf
+
+CompilerIf #PMF_CHIP = 2712
+  ; --- 4b: the cfg block, sdhci_brcmstb_cfginit_2712 --------------------
+  ; Force presence for a non-removable card: TEST_EN set, TEST_LEV clear
+  ; (sdhci-brcmstb.c lines 283-290); without it Present State says no
+  ; card and the host has nothing to address. Then the CQ timer's base
+  ; clock in MHz, at least 1 (lines 292-295). The cfg block is not in
+  ; the SDHCI register file, so Software Reset For All does not undo it.
+  v = PeekN(#SDIO_CFG_BASE + #SDIO_CFG_CTRL) & (~#SDIO_CFG_CTRL_SDCD_TEST_LEV)
+  PokeL(#SDIO_CFG_BASE + #SDIO_CFG_CTRL, v | #SDIO_CFG_CTRL_SDCD_TEST_EN)
+  sdio_cfgCtrl = PeekN(#SDIO_CFG_BASE + #SDIO_CFG_CTRL)
+  r = sdio_baseKhz / 1000
+  If r < 1
+    r = 1
+  EndIf
+  PokeL(#SDIO_CFG_BASE + #SDIO_CFG_CQ_CAPABILITY, #SDIO_CFG_CQ_FMUL | r)
+CompilerEndIf
 
   ; --- 5 ---------------------------------------------------------------
   ; Software Reset For All clears the clock setup as well, which is why
@@ -4259,6 +4634,25 @@ EndProcedure
 ; The rung, as a full sentence. The caller prints it; nothing here
 ; assumes a particular output library.
 Procedure.i SdioWlOnStepText()
+CompilerIf #PMF_CHIP = 2712
+  Select sdio_wlOnStep
+    Case 0
+      ProcedureReturn "wl_on: CNTFRQ_EL0 is unusable, so the low hold and the 150 ms could not be timed - nothing was driven"
+    Case 1
+      ProcedureReturn "wl_on: the board never called SdioSetPinctrl (C0 or D0), so GPIO28 could not be muxed - nothing was driven"
+    Case 2
+      ProcedureReturn "wl_on: GPIO28 muxed to gpio and read; the drive never started"
+    Case 3
+      ProcedureReturn "wl_on: driven low and held; the high edge never happened"
+    Case 4
+      ProcedureReturn "wl_on: driven high; the 150 ms startup delay did not finish"
+    Case 5
+      ProcedureReturn "wl_on: the readback says GPIO28 is not an output driving high - the store did not land, or something else owns gio bank 0"
+    Case 6
+      ProcedureReturn "wl_on: cycled low then high, and the readback says output, high - a powered radio"
+  EndSelect
+  ProcedureReturn "wl_on: SdioAssertWlOn has not been called in this run"
+CompilerElse
   Select sdio_wlOnStep
     Case 0
       ProcedureReturn "wl_on: the mailbox was never ready, so nothing at all was sent - call MailboxInit() first"
@@ -4290,6 +4684,7 @@ Procedure.i SdioWlOnStepText()
       ProcedureReturn "wl_on: every transaction completed - the level beside this line is what the firmware says the pin is, and 1 is a powered radio"
   EndSelect
   ProcedureReturn "wl_on: SdioAssertWlOn has not been called in this run"
+CompilerEndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -4758,6 +5153,22 @@ EndProcedure
 ;  string would be wrong out loud.
 ; ----------------------------------------------------------------------
 Procedure.i SdioErrorText()
+CompilerIf #PMF_CHIP = 2712
+  ; BCM2712 wording for the codes whose Pi 4 text names Pi 4 hardware,
+  ; and the two codes only this chip raises. The rest fall through.
+  Select sdio_err
+    Case #SDIO_ERR_NO_CONTROLLER
+      ProcedureReturn "sdio: the word at $10011000FC (SDIO2 host version) is all-zero or all-ones - nothing decodes at sdio2; check the /axi translation and that this IS a BCM2712"
+    Case #SDIO_ERR_BASECLK
+      ProcedureReturn "sdio: base clock unknown - on BCM2712 Capabilities is never used; call SdioSetBaseClockKhz with clk-emmc2's DTB clock-frequency (#SDIO_2712_DTB_BASE_KHZ in the pinned trees)"
+    Case #SDIO_ERR_NO_CARD
+      ProcedureReturn "sdio: nothing answered CMD5 - WL_ON (gio GPIO28) read back high, so the radio had power and did not speak; check SdioWlOnStep (want 6), the sd2 pin mux and SdioCfgCtrl (force presence)"
+    Case #SDIO_ERR_PINCTRL
+      ProcedureReturn "sdio: the BCM2712 pinctrl stepping was never supplied - call SdioSetPinctrl with C0 or D0 from the live DTB's pinctrl@7d504100 compatible; nothing was driven"
+    Case #SDIO_ERR_WL_ON
+      ProcedureReturn "sdio: WL_ON (gio GPIO28) did not read back as an output driving high - see SdioWlOnStep and SdioWlOnStepText; the radio has no power"
+  EndSelect
+CompilerEndIf
   Select sdio_err
     Case #SDIO_ERR_NONE
       ProcedureReturn "sdio: ok"
