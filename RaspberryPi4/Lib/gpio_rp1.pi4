@@ -191,6 +191,8 @@ EnableExplicit
 #RP1_PAD_PULL_MASK3   = 3      ; 2-bit field, pre-shift
 #RP1_PAD_IN_ENABLE    = $40    ; bit 6
 #RP1_PAD_OUT_DISABLE  = $80    ; bit 7
+#RP1_PAD_DRIVE_SHIFT  = 4      ; bits 5:4 (pinctrl-rp1.c:133-134)
+#RP1_PAD_DRIVE_MASK2  = 3      ; 2-bit field, pre-shift
 
 ; Pull encodings - NOT gpio.pi4's numbers. pinctrl-rp1.c:94-96.
 #RP1_PULL_NONE = 0
@@ -443,6 +445,64 @@ Procedure.i Rp1PinPullGet(pin.i)
   v = (Rp1ReadReg(Rp1PadAddr(pin)) >> #RP1_PAD_PULL_SHIFT) & #RP1_PAD_PULL_MASK3
   Rp1GpioBarrier()
   ProcedureReturn v
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Rp1PinDrive(pin, mA) / Rp1PinDriveGet(pin) - the pad's DRIVE field,
+;  bits 5:4, in MILLIAMPS at the call site: 2, 4, 8 or 12 map to field
+;  values 0..3 (pinctrl-rp1.c:140-143, RP1_PAD_DRIVE_2MA..12MA, and the
+;  PIN_CONFIG_DRIVE_STRENGTH switch at 1431-1447). Any other current is
+;  refused (0), as the Linux driver returns -ENOTSUPP rather than rounding.
+;  Read-modify-write of that field only; pull, slew, Schmitt and the
+;  enables are left as they are. DriveGet answers mA, or -1 for a bad pin.
+;  Added 2026-09-26 for RaspberryPi4/Lib/i2c_dw.pi4, whose pins rp1.dtsi
+;  gives drive-strength = <12>.
+; ----------------------------------------------------------------------
+Procedure.i Rp1PinDrive(pin.i, ma.i)
+  Define code.i
+  Define a.i
+  Define v.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn 0
+  EndIf
+  Select ma
+    Case 2
+      code = 0
+    Case 4
+      code = 1
+    Case 8
+      code = 2
+    Case 12
+      code = 3
+    Default
+      ProcedureReturn 0
+  EndSelect
+  Rp1GpioBarrier()
+  a = Rp1PadAddr(pin)
+  v = Rp1ReadReg(a)
+  v = v & ~(#RP1_PAD_DRIVE_MASK2 << #RP1_PAD_DRIVE_SHIFT)
+  v = v | (code << #RP1_PAD_DRIVE_SHIFT)
+  PokeL(a, v)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Rp1PinDriveGet(pin.i)
+  Define code.i
+  If Rp1PinValid(pin) = 0
+    ProcedureReturn -1
+  EndIf
+  Rp1GpioBarrier()
+  code = (Rp1ReadReg(Rp1PadAddr(pin)) >> #RP1_PAD_DRIVE_SHIFT) & #RP1_PAD_DRIVE_MASK2
+  Rp1GpioBarrier()
+  Select code
+    Case 0
+      ProcedureReturn 2
+    Case 1
+      ProcedureReturn 4
+    Case 2
+      ProcedureReturn 8
+  EndSelect
+  ProcedureReturn 12
 EndProcedure
 
 Procedure.i Rp1GpioBadPinCount()

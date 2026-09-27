@@ -339,8 +339,9 @@ def gate(cc, override, workdir):
               "GPIO 2/3 are not on FUNCSEL 3 (i2c1)")
         for p in (2, 3):
             padv = gpio.reg.get(PADS_BANK0 + 4 + p * 4, 0)
-            check((padv >> 2) & 3 == 2 and padv & 0x40 and not padv & 0x80,
-                  "pad %d is $%X: want pull UP (RP1 field 2), input on, output enabled" % (p, padv))
+            check((padv >> 2) & 3 == 2 and padv & 0x40 and not padv & 0x80 and (padv >> 4) & 3 == 3,
+                  "pad %d is $%X: want pull UP (RP1 field 2), 12 mA (drive field 3, "
+                  "rp1.dtsi drive-strength), input on, output enabled" % (p, padv))
         hc, lc, _ = clock_calc(100)
         check(dw.r.get(0x00) == 0x63, "IC_CON is $%X, want MASTER|SPEED_STD|RESTART_EN|"
               "SLAVE_DISABLE = $63" % dw.r.get(0x00, 0))
@@ -468,6 +469,7 @@ MUTATIONS = [
     (REL_LIB, "fast mode programmed as standard",
      "    con = con | #DWI2C_CON_SPEED_FAST", "    con = con | #DWI2C_CON_SPEED_STD"),
     (REL_LIB, "pins on the wrong function", "#DWI2C_FUNCSEL  = 3", "#DWI2C_FUNCSEL  = 4"),
+    (REL_LIB, "pins at 8 mA, not rp1.dtsi's 12", "#DWI2C_DRIVE_MA = 12 ", "#DWI2C_DRIVE_MA = 8 "),
     (REL_LIB, "pins pulled down", "  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_UP)", "  Rp1PinPull(#DWI2C_PIN_SDA, #RP1_PULL_DOWN)"),
     (REL_LIB, "refused rate still programs counts",
      "  r = DwI2cCounts(hz)\n  If r <= 0\n    ProcedureReturn #DWI2C_RANGE\n  EndIf",

@@ -17,7 +17,9 @@ sources, not from the library under test:
                              table columns, >= 9 "none"; SYS_RIO0 OUT +0,
                              OE +4, IN +8, one bit per pin; PAD = PADS_BANK0
                              + 4 + pin*4, PULL = PAD[3:2] with 1 = DOWN,
-                             2 = UP; IN_ENABLE bit 6, OUT_DISABLE bit 7;
+                             2 = UP; DRIVE = PAD[5:4], 0..3 = 2/4/8/12 mA
+                             (RP1_PAD_DRIVE_2MA..12MA, lines 140-143);
+                             IN_ENABLE bit 6, OUT_DISABLE bit 7;
                              every block aliased RW +0, XOR +$1000,
                              SET +$2000, CLR +$3000.
 
@@ -141,7 +143,7 @@ def driver(override):
             "  HwGpioLevelGet(0) : HwGpioPullGet(0) : HwGpioMode(0, 0)\n"
             "  HwGpioWrite(0, 0) : HwGpioToggle(0) : HwGpioReservedReason(0)\n"
             "  Rp1CtrlAddr(0) : Rp1PadAddr(0) : Rp1FuncSelSet(0, 0) : Rp1PinPull(0, 0)\n"
-            "  Rp1GpioBadPinCount()\n"
+            "  Rp1GpioBadPinCount() : Rp1PinDrive(0, 0) : Rp1PinDriveGet(0)\n"
             "EndIf\n")
 
 
@@ -232,6 +234,19 @@ def gate(cc, override, workdir):
     check(call("HwGpioPullGet", 5) == H["#HW_PULL_UP"], "a field-2 pull did not report UP")
     check(call("Rp1PinPull", 5, 3) == 0, "pull encoding 3 (reserved) was accepted")
 
+    # --- drive strength: mA in, PAD[5:4] = 0..3 for 2/4/8/12 ----------------
+    for ma, code in ((2, 0), (4, 1), (8, 2), (12, 3)):
+        rp1.reg[pad(6)] = 0x41 | (2 << 2) | 0x80 | (((code + 1) & 3) << 4)
+        check(call("Rp1PinDrive", 6, ma) == 1, "Rp1PinDrive(6, %d) refused" % ma)
+        check(rp1.reg[pad(6)] == 0x41 | (2 << 2) | 0x80 | (code << 4),
+              "%d mA left PAD(6) = $%X: want field %d and every other bit kept"
+              % (ma, rp1.reg[pad(6)], code))
+        check(call("Rp1PinDriveGet", 6) == ma, "DriveGet did not read back %d mA" % ma)
+    before = rp1.reg[pad(6)]
+    for ma in (0, 3, 6, 16, -4):
+        check(call("Rp1PinDrive", 6, ma) == 0 and rp1.reg[pad(6)] == before,
+              "a %d mA drive was accepted (Linux: -ENOTSUPP)" % ma)
+
     # --- alternate functions -------------------------------------------------
     for f in (0, 3, 4, 8):
         rp1.reg[ctrl(2)] = f
@@ -257,8 +272,10 @@ def gate(cc, override, workdir):
         check(call("HwGpioPullGet", p) == -1, "PullGet(%d) is not -1" % p)
         check(call("HwGpioMode", p, H["#HW_GPIO_OUT"]) == 0, "Mode(%d) accepted" % p)
         check(call("HwGpioWrite", p, 1) == 0, "Write(%d) accepted" % p)
+        check(call("Rp1PinDrive", p, 12) == 0 and call("Rp1PinDriveGet", p) == -1,
+              "drive on bad pin %d accepted" % p)
     check(not rp1.log, "a bad pin reached RP1: %r" % rp1.log[:3])
-    check(call("Rp1GpioBadPinCount") >= 15, "bad pins were not counted")
+    check(call("Rp1GpioBadPinCount") >= 21, "bad pins were not counted")
 
     # --- the console is reserved --------------------------------------------
     for p in (14, 15):
@@ -298,6 +315,11 @@ MUTATIONS = [
      "  v = v & ~#RP1_PAD_OUT_DISABLE\n", "\n"),
     (REL_LIB, "FuncSelSet skips the pad", "  Rp1PadInit(pin)\n  PokeL(Rp1CtrlAddr(pin), funcsel)",
      "  PokeL(Rp1CtrlAddr(pin), funcsel)"),
+    (REL_LIB, "drive field at bit 3", "#RP1_PAD_DRIVE_SHIFT  = 4 ", "#RP1_PAD_DRIVE_SHIFT  = 3 "),
+    (REL_LIB, "12 mA encoded as 8 mA", "    Case 12\n      code = 3", "    Case 12\n      code = 2"),
+    (REL_LIB, "unsupported current rounded to 2 mA", "    Default\n      ProcedureReturn 0\n  EndSelect\n  Rp1GpioBarrier()\n  a = Rp1PadAddr(pin)\n  v = Rp1ReadReg(a)\n  v = v & ~(#RP1_PAD_DRIVE_MASK2",
+     "    Default\n      code = 0\n  EndSelect\n  Rp1GpioBarrier()\n  a = Rp1PadAddr(pin)\n  v = Rp1ReadReg(a)\n  v = v & ~(#RP1_PAD_DRIVE_MASK2"),
+    (REL_LIB, "drive written over the whole pad", "  v = v & ~(#RP1_PAD_DRIVE_MASK2 << #RP1_PAD_DRIVE_SHIFT)\n", "  v = 0\n"),
     (REL_HW, "2712 ModeGet reads OE inverted",
      "    If Rp1PinModeGet(pin) = 1\n      ProcedureReturn #HW_GPIO_OUT",
      "    If Rp1PinModeGet(pin) = 0\n      ProcedureReturn #HW_GPIO_OUT"),
