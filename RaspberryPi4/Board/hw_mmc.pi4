@@ -84,7 +84,9 @@ Procedure.i HwMmcUp()
   EndIf
   ; The base clock the controller cannot discover for itself. Measured,
   ; not guessed - see the header.
-  SdSetBaseClockKhz(250000)
+  CompilerIf #PMF_CHIP <> 2712
+  SdSetBaseClockKhz(250000)     ; BCM2711 EMMC2; the 2712 clock is emmc.pi4's DT value
+  CompilerEndIf
   If SdInit() = 0
     ProcedureReturn 0
   EndIf
