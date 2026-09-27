@@ -43,6 +43,8 @@ def check_source() -> int:
         "ici\\tiling = #VK_IMAGE_TILING_OPTIMAL",
         "ici\\extent\\width = #VAC_ATLAS_W",
         "vkCmdCopyBufferToImage(cmd, stage, tex",
+        "copy\\bufferRowLength = #VAC_ATLAS_SOURCE_STRIDE",
+        "#VAC_ATLAS_SOURCE_STRIDE = 16",
         "#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
         "#VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER",
         "gp\\pDynamicState = @dyn",

@@ -273,6 +273,7 @@ Global avkTbCopies.i = 0
 Global avkTbLastCopySource.i = 0
 Global avkTbLastCopyDestination.i = 0
 Global avkTbLastCopyBytes.i = 0
+Global avkTbLastCopySourcePitch.i = 0
 
 Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   If *copy = 0 : ProcedureReturn -1 : EndIf
@@ -287,6 +288,7 @@ Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
   avkTbLastCopySource = *copy\sourceBase
   avkTbLastCopyDestination = *copy\destinationBase
   avkTbLastCopyBytes = *copy\destinationBytes
+  avkTbLastCopySourcePitch = *copy\sourcePitch
   avkTbNative = 0
   If avkTbHold <> 0
     avkTbBusy = 1
@@ -310,6 +312,10 @@ EndProcedure
 
 Procedure.i AnvilVkTestBackendLastCopyBytes()
   ProcedureReturn avkTbLastCopyBytes
+EndProcedure
+
+Procedure.i AnvilVkTestBackendLastCopySourcePitch()
+  ProcedureReturn avkTbLastCopySourcePitch
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
