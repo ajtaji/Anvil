@@ -39,3 +39,11 @@ two-region linear shape above, not Vulkan 1.0 conformance.
 
 The relevant core command and valid-usage rules are in the
 [Khronos `vkCmdCopyBufferToImage` reference](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdCopyBufferToImage.html).
+
+The public pipeline gate passed 756 property checks over 185,396,084
+interpreted A64 instructions. Its new slots verify both copied regions,
+untouched image bytes, a malformed later region, overlapping destinations,
+and a region count above the bounded pool. The production V3D backend gate
+passed 85 checks, the resource gate 724, and the dispatch gate 604. The normal
+Pi 4 image compiled at 4,300,736 bytes with the IDE compiler; its generated
+source build stamp was restored afterward.
