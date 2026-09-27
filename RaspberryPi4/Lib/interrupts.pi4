@@ -6,8 +6,44 @@
 ; Parameterless handlers return 1 only after servicing their device source.
 ; GICC_IIDR fields: Arm DDI0471B section3.6.1 (revision field is ignored).
 ; https://documentation-service.arm.com/static/5e8f15e27100066a414f7424
+; THE CHIP SEAM (Rule 30: one GIC driver). A -t pi5 build predefines
+; #PMF_CHIP = 2712 and takes the CompilerElse arms below; every -t pi4 line
+; is in the first arm of each, unchanged, so a -t pi4 image is byte-identical.
+;
+; BCM2712 (Raspberry Pi 5) - the same GIC-400, at a different address and
+; with more lines. Sources (vault "Raspberry Pi 5/Sources/", kernel pin
+; 7e030b60..., and the pinned bcm2712-rpi-5-b.dtb):
+;   distributor  $10_7FFF_9000  bcm2712.dtsi:266-274, dtb /soc@107c000000/
+;   CPU iface    $10_7FFF_A000  interrupt-controller@7fff9000 reg, "arm,gic-400",
+;                               soc ranges child 0 -> $10_0000_0000 (:189-191);
+;                               also TF-A plat/rpi/rpi5/include/rpi_hw.h:98-99
+;                               (RaspberryPi5/Board/armstub8-2712.asm:68-69)
+;   line count   GICD_TYPER.ITLinesNumber, read, never assumed: the Pi 5 uses
+;                SPIs above 224 (SDIO2 is GIC_SPI 274 = INTID 306,
+;                bcm2712-ds.dtsi:393), so the Pi 4's 256-slot bound would
+;                refuse the controller outright. The GIC-400 itself stops at
+;                480 SPIs, 512 INTIDs (Arm DDI0471B), so 512 slots cover any
+;                GIC-400 and a TYPER claiming more is refused by name.
+;   timer PPIs   the same as the Pi 4 - /timer "arm,armv8-timer",
+;                bcm2712.dtsi:582-590: PPI 13 (secure physical, INTID 29),
+;                PPI 14 (non-secure physical, 30), PPI 11 (virtual, 27),
+;                PPI 10 (hypervisor, 26). Anvil/Kernel/Scheduler/timer_el3.pbi
+;                (INTID 29) therefore runs unchanged on top.
+;   group        the Pi 5 EL3 stub sets every IGROUPR word GICD_TYPER names
+;                (armstub8-2712.asm:182-218), the precondition the EL3 arm of
+;                InterruptClaim/Enable checks.
+;   NOT HERE     RP1's peripherals (its UART, GPIO, USB, ethernet) do not
+;                reach this GIC as lines: they arrive over PCIe as MSIs
+;                (bcm2712.dtsi:576 pcie2 msi-ranges, GIC_SPI 247 +8, and the RP1
+;                MSI-X block, drivers/mfd/rp1.c). That path is out of scope.
+CompilerIf #PMF_CHIP <> 2712
 #IG_D = $FF841000
 #IG_C = $FF842000
+CompilerElse
+#IG_D = $107FFF9000
+#IG_C = $107FFFA000
+#IG_SLOTS = 512
+CompilerEndIf
 Global ig_ready.i
 Global ig_el.i
 Global ig_vbar.i
@@ -15,10 +51,17 @@ Global ig_count.i
 Global ig_saved_d.i
 Global ig_saved_c.i
 Global ig_saved_pmr.i
+CompilerIf #PMF_CHIP <> 2712
 Dim ig_handlers.i(256)
 Dim ig_enabled.i(256)
 Dim ig_priority.i(256)
 Dim ig_target.i(256)
+CompilerElse
+Dim ig_handlers.i(#IG_SLOTS)
+Dim ig_enabled.i(#IG_SLOTS)
+Dim ig_priority.i(#IG_SLOTS)
+Dim ig_target.i(#IG_SLOTS)
+CompilerEndIf
 
 Procedure.i InterruptLevel()
   ASM
@@ -108,19 +151,33 @@ Procedure.i InterruptInit(expectedVbar.i)
     ProcedureReturn 0
   EndIf
   count = ((PeekL(#IG_D + 4) & 31) + 1) * 32
+  CompilerIf #PMF_CHIP <> 2712
   If count > 256
     ProcedureReturn 0
   EndIf
+  CompilerElse
+  ; More than a GIC-400 can have (DDI0471B: 480 SPIs) is not this part.
+  If count > #IG_SLOTS
+    ProcedureReturn 0
+  EndIf
+  CompilerEndIf
   ig_saved_d = PeekL(#IG_D)
   ig_saved_c = PeekL(#IG_C)
   ig_saved_pmr = PeekL(#IG_C + 4)
   ig_el = level
   ig_vbar = expectedVbar
   ig_count = count
+  CompilerIf #PMF_CHIP <> 2712
   For n = 0 To 255
     ig_handlers(n) = 0
     ig_enabled(n) = 0
   Next
+  CompilerElse
+  For n = 0 To #IG_SLOTS - 1
+    ig_handlers(n) = 0
+    ig_enabled(n) = 0
+  Next
+  CompilerEndIf
   If level = 3
     PokeL(#IG_D, 3)
     PokeL(#IG_C, $1E7)

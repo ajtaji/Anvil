@@ -1,0 +1,34 @@
+; interrupts_2712_gate.pi5 - drive RaspberryPi4/Lib/interrupts.pi4's BCM2712
+; arm for tools/a64/interrupts_2712_check.py. DIAGNOSTIC; does not ship.
+; Built -t pi5 --entry-returns; results are quadwords from $6000000, and
+; $6000400 holds the line count the gate's modelled GICD_TYPER reports.
+XIncludeFile "RaspberryPi4/Lib/interrupts.pi4"
+
+Procedure.i TestHandler()
+  PokeI($6000100, PeekI($6000100) + 1)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i LastHandler()
+  PokeI($6000108, PeekI($6000108) + 1)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure Main()
+  Protected lines.i
+  lines = PeekI($6000400)
+  PokeI($6000000, InterruptInit($8000))
+  PokeI($6000008, InterruptClaim(306, @TestHandler))     ; SDIO2, GIC_SPI 274
+  PokeI($6000010, InterruptEnable(306))
+  PokeI($6000018, InterruptClaim(29, @TestHandler))      ; secure physical timer PPI 13
+  PokeI($6000020, InterruptEnable(29))
+  PokeI($6000028, InterruptClaim(lines, @TestHandler))   ; one past TYPER: refuse
+  PokeI($6000030, InterruptClaim(lines - 1, @LastHandler))
+  PokeI($6000038, InterruptEnable(lines - 1))
+  PokeI($6000040, InterruptClaim(1023, @TestHandler))    ; the spurious ID: refuse
+  PokeI($6000048, InterruptClaim(15, @TestHandler))      ; an SGI: refuse
+  PokeI($6000050, InterruptStart())
+  PokeI($6000058, InterruptStop())
+  PokeI($6000060, InterruptDispatch())
+  PokeI($6000068, InterruptShutdown())
+EndProcedure
