@@ -24,7 +24,7 @@ CONTRACTS = (
     "V3dCacheBatchBegin()", "V3dCacheBatchRange(firstByte, endByte - firstByte)",
     "batchRc = V3dCacheBatchEnd()",
     "V3dClIndexBufferSetup(*d\\indexBase, *d\\indexBytes)",
-    "V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, 1, *d\\firstVertex * 2)",
+    "V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, 1, *d\\firstVertex * 2)",
     "AnvilVkV3dBuildDrawSlotRecord(pipe, pbase, drawBase, *d, *d\\maxVertex",
 )
 
@@ -43,7 +43,8 @@ MUTANTS = (
     ("negative scissor offset does not reduce the extent", "If w <= cut : w = 0 : Else : w = w - cut : EndIf", "If w <= cut : w = 0 : EndIf"),
     ("hostile scissor width escapes atomic preflight", "Or *d\\scissorW < 0 Or *d\\scissorW > $FFFFFFFF", "Or *d\\scissorW < 0 Or *d\\scissorW > $1FFFFFFFF"),
     ("cache transaction is not completed", "batchRc = V3dCacheBatchEnd()", "batchRc = cleaned"),
-    ("indexed firstIndex is doubled", "V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, 1, *d\\firstVertex * 2)", "V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, 1, *d\\firstVertex * 4)"),
+    ("indexed firstIndex is doubled", "V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, 1, *d\\firstVertex * 2)", "V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, 1, *d\\firstVertex * 4)"),
+    ("triangle strip silently becomes a triangle list", "ProcedureReturn #AVKQ_PRIM_TRIANGLE_STRIP", "ProcedureReturn #AVKQ_PRIM_TRIANGLES"),
     ("indexed draw slot uses count instead of scanned max", "AnvilVkV3dBuildDrawSlotRecord(pipe, pbase, drawBase, *d, *d\\maxVertex, AnvilVkV3dVaryingComponents(pipe))", "AnvilVkV3dBuildDrawSlotRecord(pipe, pbase, drawBase, *d, *d\\firstVertex + *d\\vertexCount - 1, AnvilVkV3dVaryingComponents(pipe))"),
     ("index cache clean starts at bind base", "avkV3dCacheIntervalAdd(*d\\indexBase + indexOffset, bytes)", "avkV3dCacheIntervalAdd(*d\\indexBase, bytes)"),
 )
@@ -92,7 +93,7 @@ def execute(interp: pathlib.Path, image: pathlib.Path, ceiling=200_000_000):
 def u64(cpu, addr): return sum(cpu.memory.get(addr+i, 0) << (8*i) for i in range(8))
 
 def grade(cpu, rc, stress_n=3505, admission_n=4096):
-    s = [u64(cpu, OUT+i*8) for i in range(152)]; bad=[]
+    s = [u64(cpu, OUT+i*8) for i in range(162)]; bad=[]
     def need(name, i, want):
         if s[i] != want: bad.append(f"{name}: got {s[i]:#x}, expected {want:#x}")
     need("return", -1, OUT) if False else None
@@ -140,6 +141,9 @@ def grade(cpu, rc, stress_n=3505, admission_n=4096):
       ("translated viewport fine X",142,6144),("translated viewport fine Y",143,7168),
       ("translated clip X",144,8),("translated clip Y",145,12),("translated clip width",146,32),("translated clip height",147,32),("translated primitive",148,1),
       ("cross-edge viewport refused",149,(-1)&0xffffffffffffffff),("cross-edge viewport pre-begin",150,0),("cross-edge viewport pre-allocation",151,0),
+      ("array strip rc",152,0),("array strip V3D mode",153,5),("array strip primitive",154,1),
+      ("indexed strip rc",155,0),("indexed strip V3D mode",156,5),("indexed strip packet",157,1),("indexed strip excludes array packet",158,0),
+      ("hostile topology refused",159,(-1)&0xffffffffffffffff),("hostile topology pre-begin",160,0),("hostile topology pre-allocation",161,0),
     ): need(name,i,w)
     if 0x03000000 <= s[57] < 0x03000000 + 4096*896: bad.append("stable record pointer still aliases the freed arena")
     return bad
@@ -156,7 +160,7 @@ def main():
         t0=time.perf_counter(); cpu,rc,steps=execute(interp,build(compiler)); elapsed=time.perf_counter()-t0; bad=grade(cpu,rc)
       if bad:
         print("vulkan_v3d_backend_list_check: FAIL"); [print("  "+x) for x in bad]; return 1
-      print(f"vulkan_v3d_backend_list_check: PASS - 132 property checks over 1/3/{3505}/4096 lists, {steps:,} A64 instructions, {elapsed:.3f}s")
+      print(f"vulkan_v3d_backend_list_check: PASS - 142 property checks over 1/3/{3505}/4096 lists, {steps:,} A64 instructions, {elapsed:.3f}s")
       print("  3505 is LIVE; 4096 is admission-only (sampleMask zero); physical cache union, one-barrier transaction, lifetime, transitions and rollback passed")
     if not args.mutate: return 0
     misses=0; gate_src=GATE.read_text(encoding="utf-8")

@@ -283,8 +283,8 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   maxVertex.i
   sampleMask.i        ; bit zero is the one rasterisation sample's coverage
   blendMode.i         ; #ANVIL_VK_BLEND_*, already validated and normalized
-  ; One origin-zero, positive whole-pixel viewport captured for this draw.
-  ; The V3D backend currently requires it to equal the live target geometry.
+  ; One positive whole-pixel viewport captured for this draw, with a
+  ; nonnegative origin and bounds inside the live target geometry.
   viewportX.i
   viewportY.i
   viewportW.i

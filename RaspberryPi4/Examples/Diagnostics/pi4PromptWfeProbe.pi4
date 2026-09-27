@@ -1,0 +1,95 @@
+; Returning RAM diagnostic: qualify Pi 4 EL3 counter-event WFE before
+; enabling it in the resident prompt. Run only under the monitor deadman.
+
+Procedure.i ProbeCounterHz()
+  Asm
+    mrs x0, cntfrq_el0
+  EndAsm
+EndProcedure
+
+Procedure.i ProbeCounter()
+  Asm
+    mrs x0, cntpct_el0
+  EndAsm
+EndProcedure
+
+Procedure.i ProbeControl()
+  Asm
+    mrs x0, cntkctl_el1
+  EndAsm
+EndProcedure
+
+Procedure ProbeSetControl(value.i)
+  Asm
+    msr cntkctl_el1, x0
+    isb
+  EndAsm
+EndProcedure
+
+Procedure.i Main()
+  Define hz.i
+  Define oldControl.i
+  Define control.i
+  Define readback.i
+  Define first.i
+  Define second.i
+  Define interval.i
+  Define n.i
+  Define elapsed.i
+  Define maximum.i
+  Define evnti.i
+  Define period.i
+  Define minimum.i
+  Define observedMax.i
+  Define total.i
+  Define target.i
+
+  hz = ProbeCounterHz()
+  If hz <> 54000000 : ProcedureReturn 1 : EndIf
+  first = ProbeCounter()
+  oldControl = ProbeControl()
+  ; The longest 4-bit event interval is 65,536 ticks, about 1.2 ms here.
+  target = hz / 500
+  evnti = 0
+  period = 2
+  While evnti < 15 And period <= target / 2
+    evnti = evnti + 1
+    period = period * 2
+  Wend
+  control = (oldControl & $FFFFFFFFFFFFFF03) | ((evnti & 15) << 4) | 4
+  ProbeSetControl(control)
+  readback = ProbeControl()
+  second = ProbeCounter()
+  If (readback & $FC) <> (control & $FC) Or second <= first
+    ProbeSetControl(oldControl)
+    ProcedureReturn 2
+  EndIf
+  maximum = hz / 500 + 1
+  minimum = maximum
+  total = 0
+  For n = 1 To 32
+    ; Drain a pending event before measuring the next event interval.
+    Asm
+      wfe
+    EndAsm
+    first = ProbeCounter()
+    Asm
+      wfe
+    EndAsm
+    elapsed = ProbeCounter() - first
+    If elapsed < minimum : minimum = elapsed : EndIf
+    If elapsed > observedMax : observedMax = elapsed : EndIf
+    total = total + elapsed
+    If elapsed <= 0 Or elapsed > maximum
+      ProbeSetControl(oldControl)
+      ProcedureReturn 3
+    EndIf
+  Next
+  ProbeSetControl(oldControl)
+  PokeL($A00000, $31454657)
+  PokeL($A00004, minimum)
+  PokeL($A00008, observedMax)
+  PokeL($A0000C, total)
+  PokeL($A00010, period)
+  ProcedureReturn 0
+EndProcedure

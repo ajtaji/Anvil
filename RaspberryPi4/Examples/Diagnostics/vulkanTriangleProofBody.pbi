@@ -1120,6 +1120,11 @@ CompilerIf #VTP_INDEXED_PROOF
   EndIf
   PokeW(mapped + 4, 99) : PokeW(mapped + 6, 2)
   PokeW(mapped + 8, 0) : PokeW(mapped + 10, 1)
+CompilerIf #VTP_PYRAMID_DEMO = 8
+  ; One dummy index followed by the four corners of the strip.
+  PokeW(mapped + 6, 0) : PokeW(mapped + 8, 1)
+  PokeW(mapped + 10, 2) : PokeW(mapped + 12, 3)
+CompilerEndIf
   vkUnmapMemory(dev, imem)
 CompilerEndIf
 
@@ -1325,7 +1330,10 @@ CompilerElse
   vi\vertexAttributeDescriptionCount = 2
 CompilerEndIf
   gp\layout = layB
-CompilerIf #VTP_PYRAMID_DEMO >= 4
+CompilerIf #VTP_PYRAMID_DEMO >= 7
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO >= 4 And #VTP_PYRAMID_DEMO <= 5
   ; Static scissor is intentionally smaller and offset independently of the
   ; viewport. Pipeline creation snapshots it before the frame loop.
   sc\offset\x = 200 : sc\offset\y = 320
@@ -1336,7 +1344,7 @@ CompilerIf #VTP_PYRAMID_DEMO = 5
   PokeL(@vp\width, $43C80000) : PokeL(@vp\height, $44200000)
 CompilerEndIf
 CompilerIf #VTP_PYRAMID_DEMO >= 2
-CompilerIf #VTP_PYRAMID_DEMO <> 5
+CompilerIf #VTP_PYRAMID_DEMO <> 5 And #VTP_PYRAMID_DEMO < 7
   dynamicKinds[0] = #VK_DYNAMIC_STATE_VIEWPORT
 CompilerIf #VTP_PYRAMID_DEMO = 4
   dynamicState\dynamicStateCount = 1
@@ -1400,6 +1408,16 @@ CompilerIf #VTP_PYRAMID_DEMO
       NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
     EndIf
     vtpPyramidFrame(mapped, pyramidCos, pyramidSin)
+CompilerIf #VTP_PYRAMID_DEMO >= 7
+    ; Four GPU-transformed corners form a square only when the primitive
+    ; mode is a strip: a triangle list would leave the fourth corner empty.
+    vtpRowX0=1.0 : vtpRowX1=0.0 : vtpRowX2=0.0
+    vtpRowY0=0.0 : vtpRowY1=1.0 : vtpRowY2=0.0
+    vtpPyramidVertex(mapped,0,-0.6,-0.6,0.0,1.0,$3F666666,$3E99999A,$3F333333)
+    vtpPyramidVertex(mapped,1,-0.6, 0.6,0.0,1.0,$3F666666,$3E99999A,$3F333333)
+    vtpPyramidVertex(mapped,2, 0.6,-0.6,0.0,1.0,$3F666666,$3E99999A,$3F333333)
+    vtpPyramidVertex(mapped,3, 0.6, 0.6,0.0,1.0,$3F666666,$3E99999A,$3F333333)
+CompilerEndIf
     vkUnmapMemory(dev, bmem)
     nextCos = pyramidCos * 0.8660254 - pyramidSin * 0.5
     nextSin = pyramidSin * 0.8660254 + pyramidCos * 0.5
@@ -1433,7 +1451,7 @@ CompilerEndIf
     vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
 CompilerIf #VTP_PYRAMID_DEMO >= 2
-CompilerIf #VTP_PYRAMID_DEMO <> 5
+CompilerIf #VTP_PYRAMID_DEMO <> 5 And #VTP_PYRAMID_DEMO < 7
     ; Exercise per-draw V3D viewport uniforms, clipper scale and scissor.
     ; The final frame maps the pyramid into a half-size viewport; mode three
     ; also moves its origin without changing the coordinate shader's scale.
@@ -1460,7 +1478,14 @@ CompilerEndIf
 CompilerEndIf
 CompilerEndIf
     vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+CompilerIf #VTP_PYRAMID_DEMO = 7
+    vkCmdDraw(cmd, 4, 1, 0, 0)
+CompilerElseIf #VTP_PYRAMID_DEMO = 8
+    vkCmdBindIndexBuffer(cmd, ibuf, 4, #VK_INDEX_TYPE_UINT16)
+    vkCmdDrawIndexed(cmd, 4, 1, 1, 0, 0)
+CompilerElse
     vkCmdDraw(cmd, 12, 1, 0, 0)
+CompilerEndIf
     vkCmdEndRenderPass(cmd)
     rc = vkEndCommandBuffer(cmd)
     If rc <> #VK_SUCCESS

@@ -20,6 +20,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #AVKQ_DRAW_OFF_SHREC = 0
 #AVKQ_OFF_SHREC = 3840
 #AVKQ_PRIM_TRIANGLES = 4
+#AVKQ_PRIM_TRIANGLE_STRIP = 5
 #GATE_STRESS_DRAWS = 3505
 
 Global Dim avkqVaryComps.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -68,7 +69,10 @@ Global gateBlendCfg.i
 Global gateVary.i
 Global gateShader.i
 Global gatePrim.i
+Global gateArrayMode.i
 Global gateIndexed.i
+Global gateIndexMode.i
+Global gateTopology.i = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
 Global gateIndexSetup.i
 Global gateIndexBase.i
 Global gateIndexBytes.i
@@ -149,12 +153,12 @@ Procedure V3dClBlendEnables(a.i) : gateBlendEnable = gateBlendEnable + 1 : EndPr
 Procedure V3dClBlendCfg(a.i,b.i,c.i,d.i,e.i,f.i,g.i) : gateBlendCfg = gateBlendCfg + 1 : EndProcedure
 Procedure V3dClNonperspFlags(a.i) : gateVary = gateVary + 1 : EndProcedure
 Procedure V3dClGlShaderState(a.i,b.i) : gateShader = gateShader + 1 : EndProcedure
-Procedure V3dClVertexArrayPrims(a.i,b.i,c.i) : gatePrim = gatePrim + 1 : EndProcedure
+Procedure V3dClVertexArrayPrims(a.i,b.i,c.i) : gatePrim = gatePrim + 1 : gateArrayMode=a : EndProcedure
 Procedure V3dClIndexBufferSetup(a.i,b.i)
   gateIndexSetup=gateIndexSetup+1 : gateIndexBase=a : gateIndexBytes=b
 EndProcedure
 Procedure V3dClIndexedPrims(a.i,b.i,c.i,d.i)
-  gateIndexed=gateIndexed+1 : gateIndexCount=b : gateIndexType=c : gateIndexOffset=d
+  gateIndexed=gateIndexed+1 : gateIndexMode=a : gateIndexCount=b : gateIndexType=c : gateIndexOffset=d
 EndProcedure
 Procedure.i V3dClError() : ProcedureReturn gateClError : EndProcedure
 
@@ -196,6 +200,7 @@ EndProcedure
 
 Procedure.i AnvilVkPipelineViewportWidth(p.i) : ProcedureReturn 64 : EndProcedure
 Procedure.i AnvilVkPipelineViewportHeight(p.i) : ProcedureReturn 64 : EndProcedure
+Procedure.i AnvilVkPipelineTopology(p.i) : ProcedureReturn gateTopology : EndProcedure
 Procedure.i AnvilVkPipelineDynamicViewport(p.i) : ProcedureReturn gateDynamicViewport : EndProcedure
 Procedure.i avkqF32FromInt(v.i) : If v=8192 : ProcedureReturn $46000000 : EndIf : If v=4096 : ProcedureReturn $45800000 : EndIf : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineUsesPushConstants(p.i) : ProcedureReturn 0 : EndProcedure
@@ -247,8 +252,8 @@ Procedure ResetObs()
   gateViewportScale=0 : gateViewportOffset=0 : gateCfg=0 : gateBlendEnable=0
   gateScaleX=0 : gateScaleY=0 : gateOffsetX=0 : gateOffsetY=0
   gateClip=0 : gateClipX=0 : gateClipY=0 : gateClipW=0 : gateClipH=0
-  gateBlendCfg=0 : gateVary=0 : gateShader=0 : gatePrim=0 : gateClError=0
-  gateIndexed=0 : gateIndexSetup=0 : gateIndexBase=0 : gateIndexBytes=0
+  gateBlendCfg=0 : gateVary=0 : gateShader=0 : gatePrim=0 : gateArrayMode=0 : gateClError=0
+  gateIndexed=0 : gateIndexMode=0 : gateIndexSetup=0 : gateIndexBase=0 : gateIndexBytes=0
   gateIndexType=0 : gateIndexOffset=0 : gateIndexCount=0
   gatePrepare=0 : gateBuild=0 : gateBuildMax=0
 EndProcedure
@@ -434,6 +439,22 @@ Procedure.i Main()
   Fill(1,1) : draws[0]\viewportX=40 : draws[0]\viewportW=32
   ResetObs() : rc=avkBackendSubmitDraw(@list)
   Put(149,rc) : Put(150,gateBegin) : Put(151,gateAlloc)
+  ; Strip topology must reach both hardware primitive packets. A hostile
+  ; pipeline topology must fail the complete list before any frame begins.
+  gateTopology=#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+  Fill(1,1) : draws[0]\vertexCount=4 : draws[0]\maxVertex=3
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(152,rc) : Put(153,gateArrayMode) : Put(154,gatePrim)
+  Fill(1,1) : draws[0]\indexBase=$02202000 : draws[0]\indexBytes=32
+  draws[0]\indexType=#VK_INDEX_TYPE_UINT16 : draws[0]\vertexCount=4
+  draws[0]\maxVertex=3
+  ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(155,rc) : Put(156,gateIndexMode) : Put(157,gateIndexed)
+  Put(158,gatePrim)
+  gateTopology=99
+  Fill(1,1) : ResetObs() : rc=avkBackendSubmitDraw(@list)
+  Put(159,rc) : Put(160,gateBegin) : Put(161,gateAlloc)
+  gateTopology=#VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
   gateDynamicViewport=0
   ProcedureReturn #OUT
 EndProcedure

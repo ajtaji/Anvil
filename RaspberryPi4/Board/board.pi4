@@ -1182,7 +1182,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 219        ; pmf:build
+#ANVIL_BUILD = 223        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1191,7 +1191,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20260927   ; pmf:builddate
-#ANVIL_BUILD_TIME = 141412     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 150246     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2798,6 +2798,14 @@ Procedure Main()
   ; configured and nothing at all when one is not.
   FanBoot()
   ScreenServiceTick()
+
+  CompilerIf #PMF_CHIP = 2711
+  If AnvilSchedulerQualifyPi4Wfe() <> 0
+    PrintN("Core 0 idle wait: counter-event WFE enabled; CPU usage sampling active.")
+  Else
+    PrintN("Core 0 idle wait: unavailable; prompt remains on cooperative polling.")
+  EndIf
+  CompilerEndIf
 
   ; THE BOOT LOG ENDS HERE, AND WITH IT THE LAST TIME A BACKGROUND SERVICE
   ; MAY SPEAK ON THE CONSOLE. From the first prompt on, anything that is not

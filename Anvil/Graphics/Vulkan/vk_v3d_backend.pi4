@@ -716,6 +716,16 @@ Procedure.i avkV3dNormalizeScissor(*d.AnvilVkBackendDraw, *out.AvkV3dNormalizedS
   ProcedureReturn 1
 EndProcedure
 
+Procedure.i avkV3dPrimitiveMode(pipe.i)
+  If AnvilVkPipelineTopology(pipe) = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    ProcedureReturn #AVKQ_PRIM_TRIANGLES
+  EndIf
+  If AnvilVkPipelineTopology(pipe) = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+    ProcedureReturn #AVKQ_PRIM_TRIANGLE_STRIP
+  EndIf
+  ProcedureReturn -1
+EndProcedure
+
 Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBackendDraw)
   Define pipe.i
   Define b.i
@@ -734,6 +744,7 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   pipe = *d\pipeline
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If AnvilVkV3dCodeBase(pipe) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
+  If avkV3dPrimitiveMode(pipe) < 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
@@ -1002,6 +1013,9 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
     avkFault(#ANVIL_VK_ERR_STATE, "the Pi 4 Vulkan backend was handed a draw for a pipeline whose compiled shaders have been released (Anvil code -20004, pipeline not compiled); nothing was submitted. Create the pipeline again before drawing with it.")
     ProcedureReturn -1
   EndIf
+  If avkV3dPrimitiveMode(pipe) < 0
+    ProcedureReturn -1
+  EndIf
 
   rc = avkBackendDrawSupported(*d\targetBase, *d\targetBytes, *d\width, *d\height, *d\pitch)
   If rc <> #VK_SUCCESS
@@ -1188,7 +1202,7 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
     ; clear still executes, but no primitive may enter rasterisation.
     If *d\sampleMask <> 0
       V3dClGlShaderState(pbase + #AVKQ_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
-      V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+      V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\firstVertex)
     EndIf
     If V3dClError() <> #V3D_OK
       rc = #NEON_ERR_LIST
@@ -1443,12 +1457,12 @@ Procedure.i avkBackendSubmitDraw(*payload)
         If *d\indexBase <> 0
           V3dClIndexBufferSetup(*d\indexBase, *d\indexBytes)
           If *d\indexType = #VK_INDEX_TYPE_UINT16
-            V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, 1, *d\firstVertex * 2)
+            V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 1, *d\firstVertex * 2)
           Else
-            V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, 2, *d\firstVertex * 4)
+            V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 2, *d\firstVertex * 4)
           EndIf
         Else
-          V3dClVertexArrayPrims(#AVKQ_PRIM_TRIANGLES, *d\vertexCount, *d\firstVertex)
+          V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\firstVertex)
         EndIf
       EndIf
       draw = draw + 1
