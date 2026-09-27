@@ -1,0 +1,71 @@
+; pi5SdioHost.pi5 - the BCM2712 SDIO2 host, brought up through the SAME
+; RaspberryPi4/Lib/sdio.pi4 the Pi 4 uses, with the SAME radio driver
+; (Anvil/Net/cyw43.pbi) linked above it.
+;
+; DESK FIXTURE. Does not ship. Nothing here has run on a Pi 5: silicon
+; owed. tools/a64/a64_sdio_pi5_check.py builds it -t pi5 and runs it on
+; the A64 interpreter against a modelled SDHCI host, cfg block, gio,
+; pinctrl and SDIO card.
+;
+; NO UART. The Pi 5 console library is another lane's work tonight, so
+; this fixture prints nothing: it writes its results as words at #OUT
+; and the gate reads them back. It reads its scenario from #CTL, which
+; the gate writes before the first instruction runs.
+;
+;   #CTL bit 0  the board says pinctrl C0  (SdioSetPinctrl)
+;        bit 1  the board says pinctrl D0
+;        bit 2  the board supplies the DTB base clock
+;        bit 3  also bind the radio driver's I/O (Cyw43SetIo) - never set
+;               by the gate; present so the whole Wi-Fi transport path is
+;               compiled and linked -t pi5, not just the host
+;
+;   #OUT +0  SdioInit()               +4  SdioLastError()
+;        +8  SdioWlOnStep()           +12 SdioLastCmd()
+;       +16  SdioEnableFunction(1)    +20 SdioBusWidth()
+;       +24  SdioRca()                +28 SdioCfgCtrl()
+;       +32  SdioCfgPinSel()          +36 SdioWlOnLevel()
+;       +40  $600DF00D, written last: the fixture ran to its end
+;
+;   pmfc pi5SdioHost.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o pi5sdio.img
+
+XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "Anvil/Net/cyw43_rx_glom.pbi"
+XIncludeFile "Anvil/Net/cyw43.pbi"
+
+#CTL = $00E00000
+#OUT = $00E00100
+#DONE = $600DF00D
+
+Define ctl.i
+Define r.i
+
+ctl = PeekN(#CTL)
+If (ctl & 1) <> 0
+  SdioSetPinctrl(#SDIO_PINCTRL_C0)
+EndIf
+If (ctl & 2) <> 0
+  SdioSetPinctrl(#SDIO_PINCTRL_D0)
+EndIf
+If (ctl & 4) <> 0
+  SdioSetBaseClockKhz(#SDIO_2712_DTB_BASE_KHZ)
+EndIf
+If (ctl & 8) <> 0
+  Cyw43SetIo(@SdioCmd52Read, @SdioCmd52Write, @SdioCmd53Read, @SdioCmd53Write)
+  Cyw43SetBlockIo(@SdioCmd53ReadBlocks, @SdioCmd53WriteBlocks)
+EndIf
+
+r = SdioInit()
+PokeL(#OUT + 0, r)
+PokeL(#OUT + 4, SdioLastError())
+PokeL(#OUT + 8, SdioWlOnStep())
+PokeL(#OUT + 12, SdioLastCmd())
+If r = 1
+  PokeL(#OUT + 16, SdioEnableFunction(1))
+  PokeL(#OUT + 20, SdioBusWidth())
+  PokeL(#OUT + 24, SdioRca())
+EndIf
+PokeL(#OUT + 28, SdioCfgCtrl())
+PokeL(#OUT + 32, SdioCfgPinSel())
+PokeL(#OUT + 36, SdioWlOnLevel())
+PokeL(#OUT + 40, #DONE)
