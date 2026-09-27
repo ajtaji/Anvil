@@ -103,6 +103,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkCreateGraphicsPipelines") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateGraphicsPipelines, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateImage") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateImage, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateImageView") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateImageView, domain) : EndIf
+  If avkDispatchName(*pName, "vkCreatePipelineCache") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreatePipelineCache, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateInstance") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_GLOBAL, @vkCreateInstance, domain) : EndIf
   If avkDispatchName(*pName, "vkCreatePipelineLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreatePipelineLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkCreateRenderPass") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkCreateRenderPass, domain) : EndIf
@@ -121,6 +122,7 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkDestroyImageView") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyImageView, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyInstance") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkDestroyInstance, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyPipeline") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyPipeline, domain) : EndIf
+  If avkDispatchName(*pName, "vkDestroyPipelineCache") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyPipelineCache, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyPipelineLayout") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyPipelineLayout, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroyRenderPass") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroyRenderPass, domain) : EndIf
   If avkDispatchName(*pName, "vkDestroySampler") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkDestroySampler, domain) : EndIf
@@ -152,8 +154,10 @@ Procedure.i avkDispatchLookup(*pName, domain.i)
   If avkDispatchName(*pName, "vkGetPhysicalDeviceMemoryProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceMemoryProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceQueueFamilyProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceQueueFamilyProperties, domain) : EndIf
+  If avkDispatchName(*pName, "vkGetPipelineCacheData") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkGetPipelineCacheData, domain) : EndIf
   If avkDispatchName(*pName, "vkGetPhysicalDeviceSparseImageFormatProperties") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_INSTANCE, @vkGetPhysicalDeviceSparseImageFormatProperties, domain) : EndIf
   If avkDispatchName(*pName, "vkMapMemory") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkMapMemory, domain) : EndIf
+  If avkDispatchName(*pName, "vkMergePipelineCaches") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkMergePipelineCaches, domain) : EndIf
   If avkDispatchName(*pName, "vkQueueSubmit") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueSubmit, domain) : EndIf
   If avkDispatchName(*pName, "vkQueueWaitIdle") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkQueueWaitIdle, domain) : EndIf
   If avkDispatchName(*pName, "vkResetCommandBuffer") : ProcedureReturn avkDispatchAddress(#AVK_DISPATCH_DEVICE, @vkResetCommandBuffer, domain) : EndIf
