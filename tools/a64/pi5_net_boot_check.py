@@ -66,9 +66,17 @@ def const(rel, name):
     return int(m.group(1))
 
 
-def build(cc, work):
+def build(cc, work, eth_text=None):
     work.mkdir(parents=True, exist_ok=True)
     text = (ROOT / "RaspberryPi4/Board/board.pi4").read_text(encoding="utf-8").replace("\r\n", "\n")
+    if eth_text is not None:
+        # A MUTANT: board.pi4 includes this copy of eth.pi4 instead of the tree's.
+        inc = 'XIncludeFile "RaspberryPi4/Board/eth.pi4"'
+        if text.count(inc) != 1:
+            die("board.pi4 no longer includes eth.pi4 exactly once")
+        mut = work / "eth_mut.pi4"
+        mut.write_text(eth_text, encoding="utf-8")
+        text = text.replace(inc, 'XIncludeFile "%s"' % mut.resolve().as_posix())
     if not re.search(r"CompilerIf #PMF_CHIP = 2712\n(?:.*\n)*?\s+#CAP_NET\s+= 1", text):
         die("the 2712 capability block does not set #CAP_NET = 1 - the boot network step is not compiled")
     text = "\n".join(l for l in text.split("\n") if l.rstrip("\r") != "#PMF_CHIP = 2711")
@@ -199,6 +207,30 @@ def run(img, procs, k, scen, limit=40_000_000):
     ms = (cpu.cntpct - t0) / G.MS
     return returned, ms, tx.decode("ascii", "replace"), bd, mbx["tags"]
 
+# THE MUTANT: the 2712 fault branch removed from EthBootWired, which is the
+# wording before 2026-09-27 - an RP1 link fault printed as "wired: no cable".
+# The rp1-down wording checks must go red; a mutant that does not BUILD is an
+# error, not a catch.
+WORDING_MUTANT = (
+    "    If GemError() <> #GEM_ERR_NO_LINK\n",
+    "    If 0\n",
+)
+
+
+def mutant(cc, k):
+    eth = (ROOT / "RaspberryPi4/Board/eth.pi4").read_text(encoding="utf-8").replace("\r\n", "\n")
+    old, new = WORDING_MUTANT
+    if eth.count(old) != 1:
+        die("the wording mutant's anchor matched %d times in eth.pi4" % eth.count(old))
+    try:
+        img, procs = build(cc, ROOT / "_work" / "pi5_net_boot_mut", eth.replace(old, new))
+    except SystemExit as e:
+        die("the wording mutant did not build - a mutant that does not build proves nothing: %s" % str(e)[:300])
+    ok, ms, out, bd, tags = run(img, procs, k, "rp1-down")
+    red = ("no cable" in out) or ("could not be reached" not in out)
+    print("  mutant %s  an RP1 fault printed as a missing cable (%r)" % ("RED  " if red else "ALIVE", out.strip()[-120:]))
+    return red
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -227,8 +259,11 @@ def main() -> int:
     check(re.search(r"CompilerIf #PMF_CHIP = 2712\s+CompilerIf #CAP_NET = 0.*?CompilerElse.*?EthBootWired\(\)",
                     boot, re.S) is not None,
           "boot.pi4: the 2712 BootNetUp calls the same EthBootWired as the Pi 4")
+    # rp1-down is a CONTROLLER fault and must never be called a missing
+    # cable: it must say the controller could not be reached, give the
+    # driver's and the PCIe layer's own words, and NOT say "no cable".
     for scen, want, cap_ms in (("no-cable", "wired: no cable", 1500),
-                               ("rp1-down", "wired: no cable", 1500),
+                               ("rp1-down", "wired: the Ethernet controller could not be reached", 1500),
                                ("cable-silent", "wired: link-local", bound),
                                ("clock-stopped", "wired: link-local", bound)):
         ok, ms, out, bd, tags = run(img, procs, k, scen)
@@ -238,11 +273,18 @@ def main() -> int:
         check(not bd.bad, "%s: the hardware model saw no misuse (%s)" % (scen, "; ".join(bd.bad[:2])))
         if scen == "rp1-down":
             check(not bd.rp1_touched, "rp1-down: RP1 never touched")
+            check("no cable" not in out, "rp1-down: an RP1 fault is not called a missing cable")
+            check("gem error -3" in out and "pcie error -4" in out,
+                  "rp1-down: the driver's and the PCIe layer's own words are printed")
+        if scen == "no-cable":
+            check("could not be reached" not in out, "no-cable: a real missing cable is not called a fault")
         if scen in ("cable-silent", "clock-stopped"):
             check(TAG_MAC in tags, "%s: the MAC came from the mailbox" % scen)
         if scen == "clock-stopped":
             check((bd.ecfg.get(0x14, 0) & 0x40) == 0 and (bd.ecfg.get(0x00, 0) & 0x10) == 0,
                   "clock-stopped: eth_cfg clock generator un-killed and memory powered")
+    if not mutant(cc, k):
+        fails.append("the wording mutant survived")
     if fails:
         print("pi5_net_boot_check: FAIL - %d check(s)" % len(fails))
         return 1
