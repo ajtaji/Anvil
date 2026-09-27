@@ -52,8 +52,11 @@ from a64_interp import A64  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 from pmf_compiler import resolve_compiler  # noqa: E402
 
-LOAD = 0x400000
-STACK = 0x3000000
+# The Pi 5 monitor's LOW payload window (memmap.pi4: MonGrainUp(#MON_LO +
+# image) .. #PAY0_HI; $400000 is inside the resident Pi 5 monitor, and the
+# compiler refuses #PAY1_* on -t pi5), and the #PAY_STACK corridor.
+LOAD = 0x4000000
+STACK = 0x8000000
 LOADER_LR = 0xDEADBEE0
 CNTFRQ = 54_000_000
 

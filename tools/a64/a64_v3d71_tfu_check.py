@@ -76,7 +76,7 @@ MMIO_FLOOR = S1.MMIO_FLOOR
 MBX = 0x10_0000_0000 + 0x7C013880
 MBX_READ, MBX_STATUS0, MBX_WRITE, MBX_STATUS1 = MBX, MBX + 0x18, MBX + 0x20, MBX + 0x38
 
-SRC, DST = 0x650000, 0x651000           # the probe's pages (its own constants)
+SRC, DST = 0x04410000, 0x04411000       # the probe's physical pages (its own constants)
 W, H, CPP = 16, 4, 4
 
 # ---- V3D 7.1 TFU, v3d_regs.h (pinned) ------------------------------------
@@ -269,7 +269,7 @@ class Pi5V3d(S1.Model):
 
 def build(root: pathlib.Path, workdir: pathlib.Path, compiler: str, name: str) -> pathlib.Path:
     img = workdir / name
-    r = subprocess.run([compiler, "--compile", str(root / PROBE_REL), "-t", "pi5", "--entry-returns",
+    r = subprocess.run([compiler, "--compile", str(root / PROBE_REL), "-t", "pi5", "-s", "--entry-returns",
                         "--load-addr", hex(LOAD), "--stack-addr", hex(STACK), "-o", str(img)],
                        cwd=root, env=dict(os.environ, PMF_ROOT=str(root)),
                        capture_output=True, text=True)
@@ -449,6 +449,54 @@ def scenarios(img) -> list[str]:
     return errs
 
 
+def payload_window(img: pathlib.Path, monitor_bytes: int | None) -> list[str]:
+    """The probe must sit where the Pi 5 monitor will admit it (memmap.pi4,
+    2712 branch): image, BSS, buffers inside the LOW payload window
+    MonGrainUp(#MON_LO + monitor) .. #PAY0_HI, the initial stack in the
+    #PAY_STACK corridor. The high window #PAY1_* is outside the compiler's
+    -t pi5 envelope ($80000..$0FFFFFFF) and is not used."""
+    import re
+    mm = (ROOT / "RaspberryPi4/Board/memmap.pi4").read_text(encoding="utf-8")
+    probe = (ROOT / PROBE_REL).read_text(encoding="utf-8")
+
+    def const(text, name):
+        m = re.search(rf"(?m)^\s*#{name}\s*=\s*\$([0-9A-Fa-f]+)", text)
+        if not m:
+            raise SystemExit(f"a64_v3d71_tfu_check: #{name} not found")
+        return int(m.group(1), 16)
+    mon_lo, grain, pay0_hi = const(mm, "MON_LO"), const(mm, "MON_GRAIN"), const(mm, "PAY0_HI")
+    stk_lo, stk_hi = const(mm, "PAY_STACK_LO"), const(mm, "PAY_STACK_HI")
+    # The low edge follows the monitor. Without a measured image, assume the
+    # monitor may grow to 32 MiB - the probe must still clear it.
+    mon = monitor_bytes if monitor_bytes is not None else 32 << 20
+    pay0_lo = -(-(mon_lo + mon) // grain) * grain
+    errs = []
+    sym = {}
+    symf = pathlib.Path(str(img) + ".sym")
+    for line in (symf.read_text(encoding="utf-8-sig").splitlines() if symf.exists() else []):
+        if "=" in line:
+            k, v = line.split("=", 1)
+            sym[k.strip().lower()] = int(v.strip(), 0)
+    if "__bss_start__" not in sym:
+        return ["window: the build wrote no .sym with __bss_start__/__bss_end__"]
+    spans = [("image", LOAD, LOAD + img.stat().st_size - 1),
+             ("BSS", sym["__bss_start__"], sym["__bss_end__"])]
+    for name in ("TP_PT", "TP_ILLEGAL", "TP_SRC", "TP_DST"):
+        a = const(probe, name)
+        spans.append((name, a, a + (0x4000 if name == "TP_PT" else 0x1000) - 1))
+    for name, lo, hi in spans:
+        if not (pay0_lo <= lo and hi <= pay0_hi):
+            errs.append(f"window: {name} ${lo:X}..${hi:X} is outside the Pi 5 low payload "
+                        f"window ${pay0_lo:X}..${pay0_hi:X}")
+    # HwPmfStackAllowed: the initial 16-byte ABI area in the corridor, or in
+    # a payload window.
+    lo16, hi16 = STACK - 16, STACK - 1
+    if not ((stk_lo <= lo16 and hi16 <= stk_hi) or (pay0_lo <= lo16 and hi16 <= pay0_hi)):
+        errs.append(f"window: the stack top ${STACK:X} is in neither the #PAY_STACK corridor "
+                    f"${stk_lo:X}..${stk_hi:X} nor the low payload window")
+    return errs
+
+
 def not_ported(lib: str) -> list[str]:
     """Every 4.2-only job path must refuse by name on a 2712 build, before it
     touches a register: CSD (plan B4), binning and render (D1-D5), and the
@@ -512,11 +560,13 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="v3d71tfu-") as td:
         td = pathlib.Path(td)
         errs = not_ported((ROOT / LIB_REL).read_text(encoding="utf-8").replace("\r\n", "\n"))
-        errs += scenarios(build(ROOT, td, compiler, "probe.img"))
+        img = build(ROOT, td, compiler, "probe.img")
+        errs += payload_window(img, None)
+        errs += scenarios(img)
         for e in errs:
             print("FAIL", e)
         print(f"a64_v3d71_tfu_check: healthy + already-powered + 8 refusals + 4 not-ported "
-              f"refusals, {len(errs)} failure(s)")
+              f"refusals + the payload window, {len(errs)} failure(s)")
         rc = 1 if errs else 0
         if a.mutate:
             lib = (ROOT / LIB_REL).read_text(encoding="utf-8").replace("\r\n", "\n")
