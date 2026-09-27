@@ -36,7 +36,13 @@ from console_out import relay_safe_output   # noqa: E402
 
 relay_safe_output()
 
-PORT = "COM7"
+# THE PORT: COM7 is the Pi 4 bench's FTDI and stays the default. ANVIL_PORT
+# overrides it for every tool that opens an Anvil() without naming a port
+# (the Pi 5's header UART is COM4 on this bench; anvil_update.py --board pi5
+# sets it). An empty value is refused rather than read as "no port".
+PORT = os.environ.get("ANVIL_PORT", "COM7")
+if not PORT:
+    raise SystemExit("ANVIL_PORT is set but empty - name a port (COM4) or unset it")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MON = os.path.join(REPO, "build", "pi4", "anvil.img")
 MON_ADDR = 0x200000

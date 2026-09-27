@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """anvil_update.py - replace Anvil with a new build, from Anvil.
 
-    python tools/anvil_update.py [image]
+    python tools/anvil_update.py [image] [--fast] [--board pi4|pi5]
+                                 [--port COMn] [--name FILE]
+
+    --board pi5   the Raspberry Pi 5 on this bench: --port COM4 and
+                  --name ANVIL5.IMG (the file its config.txt kernel= names)
+    --board pi4   the defaults: COM7 (or ANVIL_PORT) and KERNEL8.IMG
+    --port COMn   the serial port, overriding --board and ANVIL_PORT
+    --name FILE   the boot file to replace, overriding --board
 
 No U-Boot, no second machine, no pulling the stick. The running monitor
 receives the new image over the serial line, writes it to the file it
@@ -27,9 +34,12 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-from anvil import Anvil, stage_help
+from anvil import Anvil, PORT, stage_help
+import re
 
 SLOT_NAME = "KERNEL8.IMG"
+# --board: the serial port and the boot file of each bench board.
+BOARDS = {"pi4": (None, "KERNEL8.IMG"), "pi5": ("COM4", "ANVIL5.IMG")}
 
 # STAGE IS NOT A CONSTANT ANY MORE - 2026-09-08. It was 0x400000 here and
 # in three other tools; the board is asked instead, because the monitor's
@@ -56,15 +66,51 @@ def main():
     # `--Fast` was silently dropped and the write went ahead at 115200
     # while the invocation looked like the fast one. Anything starting
     # with `-` that is not `--fast` now refuses before a byte is sent.
+    global SLOT_NAME
     positional = []
-    for a in sys.argv[1:]:
+    port = None
+    name = None
+    board = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a == "--fast":
+            i += 1
+            continue
+        if a in ("--board", "--port", "--name"):
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                print("!! %s needs a value" % a)
+                print(__doc__)
+                return 2
+            v = args[i + 1]
+            if a == "--board":
+                if v not in BOARDS:
+                    print("!! --board is one of %s, not %s" % (", ".join(sorted(BOARDS)), v))
+                    return 2
+                board = v
+            elif a == "--port":
+                port = v
+            else:
+                name = v
+            i += 2
             continue
         if a.startswith("-"):
             print("!! not an option this tool knows: %s" % a)
             print(__doc__)
             return 2
         positional.append(a)
+        i += 1
+    if board is not None:
+        bport, bname = BOARDS[board]
+        port = port or bport
+        name = name or bname
+    if name:
+        if not re.match(r"^[A-Za-z0-9_]{1,8}\.[A-Za-z0-9]{1,3}$", name):
+            print("!! --name must be an 8.3 file name like ANVIL5.IMG, not %s" % name)
+            return 2
+        SLOT_NAME = name.upper()
+    print("boot file %s on %s" % (SLOT_NAME, port or PORT))
     if len(positional) > 1:
         print("!! one image at a time; did not expect: %s" % positional[1])
         print(__doc__)
@@ -75,7 +121,7 @@ def main():
     tmp = src
     print("%s: %d bytes" % (src, len(img)))
 
-    a = Anvil()
+    a = Anvil(port) if port else Anvil()
     try:
         if a.prompt() != "pmf":
             print("no Anvil prompt - is it running?")
