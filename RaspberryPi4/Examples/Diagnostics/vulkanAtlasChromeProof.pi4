@@ -149,6 +149,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 #VVP_ERR_MAP = 34
 #VVP_ERR_LIFETIME = 35
 #VVP_ERR_PRESENT = 36
+#VVP_ERR_DMA = 37
 
 #VVP_P_NOT_TRIED = 0
 #VVP_P_OK = 1
@@ -558,6 +559,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
   Define texMixedView.i
   Define stage.i
   Define stageMem.i
+  Define mixedColor.l
   Define texView.i
   Define sampler.i
   Define dsl.i
@@ -687,7 +689,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
     vvpPut(#VVP_S_TEX_ADDR, texAddr)
     bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
     bci\size = 64 + (#VAC_ATLAS_SOURCE_STRIDE * #VAC_ATLAS_H * 4)
-    bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
     bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
     rc = vkCreateBuffer(dev, @bci, 0, @stage)
     If rc <> #VK_SUCCESS
@@ -1169,17 +1171,9 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
       status = #VVP_ERR_FENCE : vvpPut(#VVP_S_TEX_DETAIL, rc)
     EndIf
   EndIf
-  If status = #VVP_OK
-    ; Earlier uploads left texel zero white. Change only the staging copy so
-    ; the final blue toolbar proves this upload precedes the image copy.
-    rc = vkMapMemory(dev, stageMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
-    If rc = #VK_SUCCESS
-      PokeL(mapped + 64, $FFFF00FF)
-      vkUnmapMemory(dev, stageMem)
-    Else
-      status = #VVP_ERR_MAP : vvpPut(#VVP_S_TEX_DETAIL, rc)
-    EndIf
-  EndIf
+  ; Earlier uploads left texel zero white. The recorded DMA buffer update
+  ; changes it to magenta before TFU reads the staging buffer.
+  mixedColor = $FFFF00FF
   If status = #VVP_OK
     ; A fresh optimal destination makes the final V3D pixels depend on this
     ; ordered upload-and-copy sequence rather than a previous image.
@@ -1206,6 +1200,7 @@ Procedure.i vvpSamplePass(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitIn
       bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
       bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
       vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdUpdateBuffer(cmd, stage, 64, 4, @mixedColor)
       vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
       bar\image = tex
       bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
@@ -1642,6 +1637,15 @@ Procedure.i Main()
     ProcedureReturn vvpStop(#VVP_ERR_NEON)
   EndIf
   vvpPut(#VVP_S_ARENA_NEED, Neon_ArenaNeed())
+  ; Initialise guarded DMA before Vulkan buffer transfers. Presentation
+  ; rebinds the display window after these synchronous jobs complete.
+  dmaScratch = @vacDmaScratch[0] + 255
+  dmaScratch = dmaScratch - (dmaScratch % 256)
+  If DmaSetScratch(dmaScratch, 512) = 0 Or DmaSetBounds(#VVP_SURFACE, #VVP_SCREEN_BYTES) = 0 Or DmaInit() = 0
+    vvpPut(#VVP_S_DETAIL, dma_err)
+    NeonShutdown()
+    ProcedureReturn vvpStop(#VVP_ERR_DMA)
+  EndIf
 
   ; ------------------------------------------------------------------
   ;  3. The Vulkan device, over the memory above the surface.
@@ -2507,15 +2511,9 @@ Procedure.i Main()
   rc = DisplayAdopt(#VVP_DSI_SCAN, #VVP_PANEL_PITCH, #VVP_PANEL_W, #VVP_PANEL_H, 32)
   vvpPut(#VVP_S_DISPLAY_ERR, DisplayLastError())
   If rc = #DSP_OK
-    dmaScratch = @vacDmaScratch[0] + 255
-    dmaScratch = dmaScratch - (dmaScratch % 256)
-    If DmaSetScratch(dmaScratch, 512) <> 0
-      If DisplayDmaBind() <> 0
-        If DmaInit() <> 0
-          DisplayDmaReadback(1)
-          DisplayUseDma(1)
-        EndIf
-      EndIf
+    If DisplayDmaBind() <> 0 And DmaReady() <> 0
+      DisplayDmaReadback(1)
+      DisplayUseDma(1)
     EndIf
     dmaBefore = DisplayDmaOps()
     DisplayBlit(imgBase, pitch, 0, 0, #VVP_PANEL_W, #VVP_PANEL_H)

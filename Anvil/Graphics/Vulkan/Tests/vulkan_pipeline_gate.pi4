@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[840]
+Global Dim pgReport.i[841]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 839
+  If slot < 0 Or slot > 840
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (840 * 8), slot)
+  PokeI(#PG_OUT + (841 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -357,6 +357,7 @@ Procedure.i Main()
   Define failImg.i
   Define failImgMem.i
   Define copyPtr.i
+  Define mixedColor.l
   Define copyAddress.i
   Define copyImageAddress.i
   Define copyFailures.i
@@ -2057,7 +2058,7 @@ Procedure.i Main()
   ;  runs through TFU and is then sampled by V3D.
   ; ------------------------------------------------------------------
   bufci\size = 1024
-  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+  bufci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
   pgPut(235, vkCreateBuffer(dev, @bufci, 0, @copyBuf))
   vkGetBufferMemoryRequirements(dev, copyBuf, @req)
   mai\allocationSize = req\size
@@ -2272,6 +2273,8 @@ Procedure.i Main()
   vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
   bar\image = tiledDst
   vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  mixedColor = $FFFF00FF
+  vkCmdUpdateBuffer(cmd, copyBuf, 64, 4, @mixedColor)
   vkCmdCopyBufferToImage(cmd, copyBuf, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copyRegion)
   bar\image = copyImg
   bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
@@ -2294,6 +2297,7 @@ Procedure.i Main()
   pgPut(837, AnvilVkImageLayout(copyImg))
   pgPut(838, AnvilVkImageLayout(tiledDst))
   pgPut(839, vkGetFenceStatus(dev, fence))
+  pgPut(840, PeekL(copyAddress))
   vkDestroyImage(dev, linearSrc, 0)
   vkFreeMemory(dev, linearSrcMem, 0)
   vkDestroyImage(dev, tiledDst, 0)

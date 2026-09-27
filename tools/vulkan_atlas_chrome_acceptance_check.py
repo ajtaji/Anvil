@@ -46,7 +46,8 @@ def check_source() -> int:
         "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
         "vkCmdCopyImage(cmd, texLinear, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texLinearCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
         "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texMixed, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
-        "PokeL(mapped + 64, $FFFF00FF)",
+        "vkCmdUpdateBuffer(cmd, stage, 64, 4, @mixedColor)",
+        "DmaSetBounds(#VVP_SURFACE, #VVP_SCREEN_BYTES)",
         "copy\\bufferRowLength = #VAC_ATLAS_SOURCE_STRIDE",
         "#VAC_ATLAS_SOURCE_STRIDE = 16",
         "#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
@@ -65,6 +66,14 @@ def check_source() -> int:
             fail(f"public atlas/chrome source contract missing: {needle}")
     if text.count("vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)") != 3:
         fail("the atlas must record two initial uploads and one mixed-stream upload")
+    mixed = text[text.index("; A fresh optimal destination makes the final V3D pixels depend") :]
+    operations = (
+        "vkCmdUpdateBuffer(cmd, stage, 64, 4, @mixedColor)",
+        "vkCmdCopyBufferToImage(cmd, stage, tex, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)",
+        "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texMixed, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
+    )
+    if [mixed.index(op) for op in operations] != sorted(mixed.index(op) for op in operations):
+        fail("DMA buffer update, TFU upload and TFU image copy must be recorded in that order")
 
     # Only inspect the mixed pass' render-pass sequence. Eight draws and eight
     # public dynamic-scissor snapshots are the acceptance shape.
