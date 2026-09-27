@@ -80,7 +80,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 #PG_UNIFORM_B = $3F800000            ; 1.0
 #PG_UNIFORM_A = $3E000000            ; 0.125
 
-Global Dim pgReport.i[815]
+Global Dim pgReport.i[824]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
@@ -91,7 +91,7 @@ Global Dim pgSavedDeadIo.a[8192]
 Global Dim pgSavedSample.a[8192]
 
 Procedure pgPut(slot.i, value.i)
-  If slot < 0 Or slot > 814
+  If slot < 0 Or slot > 823
     ProcedureReturn
   EndIf
   pgReport[slot] = value
@@ -99,7 +99,7 @@ Procedure pgPut(slot.i, value.i)
   ; hits its finite instruction ceiling, the host can identify the last
   ; completed public operation instead of guessing from one sampled PC.
   PokeI(#PG_OUT + (slot * 8), value)
-  PokeI(#PG_OUT + (815 * 8), slot)
+  PokeI(#PG_OUT + (824 * 8), slot)
 EndProcedure
 
 Procedure.i pgStop(status.i)
@@ -350,6 +350,8 @@ Procedure.i Main()
   Define copyMem.i
   Define copyImg.i
   Define copyImgMem.i
+  Define tiledDst.i
+  Define tiledDstMem.i
   Define failImg.i
   Define failImgMem.i
   Define copyPtr.i
@@ -2072,7 +2074,7 @@ Procedure.i Main()
   imgci\extent\width = 17
   imgci\extent\height = 13
   imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
-  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
   pgPut(239, vkCreateImage(dev, @imgci, 0, @copyImg))
   vkGetImageMemoryRequirements(dev, copyImg, @req)
   pgPut(240, req\size)
@@ -2177,6 +2179,54 @@ Procedure.i Main()
   pgPut(812, vkQueueSubmit(queue, 1, @si, fence))
   pgPut(813, AnvilVkTestBackendCopies() - count)
   pgPut(814, AnvilVkImageLayout(copyImg))
+
+  ; The source remains a real optimal image after upload. A complete
+  ; optimal-to-optimal vkCmdCopyImage must reach the tiled TFU backend.
+  pgPut(815, vkCreateImage(dev, @imgci, 0, @tiledDst))
+  vkGetImageMemoryRequirements(dev, tiledDst, @req)
+  mai\allocationSize = req\size
+  pgPut(816, vkAllocateMemory(dev, @mai, 0, @tiledDstMem))
+  pgPut(817, vkBindImageMemory(dev, tiledDst, tiledDstMem, 0))
+  imageCopyRegion\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  imageCopyRegion\srcSubresource\mipLevel = 0
+  imageCopyRegion\srcSubresource\baseArrayLayer = 0
+  imageCopyRegion\srcSubresource\layerCount = 1
+  imageCopyRegion\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  imageCopyRegion\dstSubresource\mipLevel = 0
+  imageCopyRegion\dstSubresource\baseArrayLayer = 0
+  imageCopyRegion\dstSubresource\layerCount = 1
+  imageCopyRegion\srcOffset\x = 0 : imageCopyRegion\srcOffset\y = 0 : imageCopyRegion\srcOffset\z = 0
+  imageCopyRegion\dstOffset\x = 0 : imageCopyRegion\dstOffset\y = 0 : imageCopyRegion\dstOffset\z = 0
+  imageCopyRegion\extent\width = 17 : imageCopyRegion\extent\height = 13 : imageCopyRegion\extent\depth = 1
+  count = AnvilVkTestBackendTiledCopies()
+  vkResetCommandBuffer(cmd, 0)
+  vkBeginCommandBuffer(cmd, @bi)
+  bar\image = copyImg
+  bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  bar\image = tiledDst
+  bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  vkCmdCopyImage(cmd, copyImg, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tiledDst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @imageCopyRegion)
+  bar\image = tiledDst
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  bar\image = copyImg
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_READ_BIT : bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  pgPut(818, vkEndCommandBuffer(cmd))
+  vkResetFences(dev, 1, @fenceArray)
+  pgPut(819, vkQueueSubmit(queue, 1, @si, fence))
+  pgPut(820, AnvilVkTestBackendTiledCopies() - count)
+  pgPut(821, AnvilVkImageLayout(tiledDst))
+  pgPut(822, vkGetFenceStatus(dev, fence))
+  pgPut(823, AnvilVkImageLayout(copyImg))
+  vkDestroyImage(dev, tiledDst, 0)
+  vkFreeMemory(dev, tiledDstMem, 0)
 
   ; A backend failure is transactional. Even though the recording contains
   ; a final shader-read barrier, an image whose TFU copy failed must retain

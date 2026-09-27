@@ -84,6 +84,16 @@ Procedure.i Main()
   Vkb(plan\tileAllocBytes = 561152)
   Vkb(plan\tileStateBytes = 102400)
 
+  ; Tiled TFU source setup only prepares register words. It must encode the
+  ; V3D 4.2 UIF_NO_XOR input format and padded height without touching MMIO.
+  Vkb(V3dTfuBegin(17, 13, 29) = #V3D_OK)
+  Vkb(V3dTfuSourceUifNoXor($02001000, 16, 2048) = #V3D_OK)
+  Vkb(V3dTfuIcfgSent() = (($E << 18) | (29 << 9)))
+  Vkb(V3dTfuIiaSent() = $02001000 And V3dTfuIisSent() = 2)
+  Vkb(V3dTfuBegin(17, 13, 29) = #V3D_OK)
+  Vkb(V3dTfuSourceUifNoXor($02001001, 16, 2048) <> #V3D_OK And V3dTfuIiaSent() = 0)
+  Vkb(V3dTfuSourceUifNoXor($02001000, 8, 2048) <> #V3D_OK And V3dTfuIiaSent() = 0)
+
   ; Every packet mode the submission builder does not implement is refused
   ; here, before any live state can be touched.
   Vkb(V3dRenderPlanBuild(0, 64, #V3D_OFMT_RGBA8, 1, 0, 0, @plan) = #V3D_ERR_CL_ARGS)

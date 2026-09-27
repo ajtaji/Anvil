@@ -43,6 +43,7 @@ def check_source() -> int:
         "ici\\tiling = #VK_IMAGE_TILING_OPTIMAL",
         "ici\\extent\\width = #VAC_ATLAS_W",
         "vkCmdCopyBufferToImage(cmd, stage, tex",
+        "vkCmdCopyImage(cmd, tex, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texCopy, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL",
         "copy\\bufferRowLength = #VAC_ATLAS_SOURCE_STRIDE",
         "#VAC_ATLAS_SOURCE_STRIDE = 16",
         "#VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER",
@@ -98,7 +99,7 @@ def check_report(path: Path) -> int:
         133: PROBES[0][1], 134: PROBES[1][1], 135: PROBES[2][1],
         136: PROBES[3][1], 137: PROBES[4][1], 138: PROBES[5][1],
         153: 0, 154: 0, 155: 0,
-        159: 0, 160: 2,
+        159: 0, 160: 3,
         163: 0, 164: 0, 165: 0,
         166: 5,                 # VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         167: 1,                 # exact scene probes
@@ -141,7 +142,7 @@ def check_screenshot(path: Path) -> int:
 def synthetic() -> tuple[bytes, bytes]:
     r = [0] * 240
     exact = {
-        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 2, 162: 1024, 166: 5,
+        0: MAGIC, 98: 1, 99: 1, 127: 1, 160: 3, 162: 1024, 166: 5,
         167: 1, 175: 11, 220: 1, 221: 1, 222: 1, 223: 8,
         236: 0x40, 239: TAIL, 144: 0x20000000, 145: 0x00400800,
         149: 7, 150: 8, 151: 9, 152: 10, 87: 0x1234, 88: 0x1234,
