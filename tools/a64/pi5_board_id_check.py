@@ -9,7 +9,7 @@ WHAT IS BUILT. One small driver program, compiled -t pi5, that links:
     RaspberryPi4/Board/clock_info.pi4 as TEXT (the rest of that file is
     the `info` command and its dependencies), so `info`'s board row is the
     shipped decoder;
-  * RaspberryPi4/Lib/sdio.pi4 (the gio offsets, one definition) and
+  * RaspberryPi4/Lib/gio.pi4 (every gio/gio_aon register access) and
     RaspberryPi4/Lib/led_act.pi4.
 Printing lands on a modelled PL011 at $107D001000.
 
@@ -37,7 +37,7 @@ import pi5_desk as d                               # noqa: E402
 
 REL_ID = "RaspberryPi4/Board/hw_id.pi4"
 REL_INFO = "RaspberryPi4/Board/clock_info.pi4"
-REL_SDIO = "RaspberryPi4/Lib/sdio.pi4"
+REL_GIO = "RaspberryPi4/Lib/gio.pi4"
 REL_LED = "RaspberryPi4/Lib/led_act.pi4"
 REL_GPIO = "RaspberryPi4/Lib/gpio_rp1.pi4"
 REL_FMT = "Anvil/Core/format.pbi"
@@ -128,7 +128,7 @@ Procedure.i HwMonBytes()
 EndProcedure
 XIncludeFile "Anvil/Core/format.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_id.pi4"
-XIncludeFile "RaspberryPi4/Lib/sdio.pi4"
+XIncludeFile "RaspberryPi4/Lib/gio.pi4"
 XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
 XIncludeFile "RaspberryPi4/Lib/led_act.pi4"
 XIncludeFile "RaspberryPi4/Lib/safety.pi4"
@@ -271,7 +271,7 @@ def gate(override: dict, work: pathlib.Path, cc: str) -> int:
     info = d.source(REL_INFO, override)
     text = DRIVER.replace("%(REVISION)s", cut_revision(info))
     img, procs = d.build(cc, text, "boardid", work, override,
-                         [REL_FMT, REL_ID, REL_SDIO, REL_GPIO, REL_LED, REL_SAFETY])
+                         [REL_FMT, REL_ID, REL_GIO, REL_GPIO, REL_LED, REL_SAFETY])
 
     # ---- identity ------------------------------------------------------
     m = Model()
@@ -390,11 +390,14 @@ MUTATIONS = [
     (REL_ID, "2711 target id", "ProcedureReturn 2712", "ProcedureReturn 2711"),
     (REL_INFO, "CM5 and Pi 500 swapped", 'Case $18\n      ProcedureReturn "Compute Module 5"', 'Case $19\n      ProcedureReturn "Compute Module 5"'),
     (REL_INFO, "stepping claimed from the board revision", "the SoC stepping, C1 or D0, is not in this code", "C1 stepping"),
-    (REL_LED, "PWR/ACT pin 9 read as 8", "#LED_ACT_BIT      = 1 << 9", "#LED_ACT_BIT      = 1 << 8"),
-    (REL_LED, "the main gio instead of gio_aon", "#LED_ACT_AON_BASE = $107D517C00", "#LED_ACT_AON_BASE = $107D508500"),
-    (REL_LED, "active high assumed", "    v = v & (~#LED_ACT_BIT)\n  Else\n    v = v | #LED_ACT_BIT", "    v = v | #LED_ACT_BIT\n  Else\n    v = v & (~#LED_ACT_BIT)"),
-    (REL_LED, "a whole-register write", "PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))", "PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, 0)"),
-    (REL_LED, "direction before value (a flash)", "  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v | #LED_ACT_BIT)\n  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))\n", "  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))\n  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)\n  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v | #LED_ACT_BIT)\n"),
+    (REL_LED, "PWR/ACT pin 9 read as 8", "#LED_ACT_PIN = 9 ", "#LED_ACT_PIN = 8 "),
+    (REL_LED, "the main gio instead of gio_aon", "  If GioIsOutput(#GIO_AON, #LED_ACT_PIN) = 1",
+     "  If GioIsOutput(#GIO_MAIN, #LED_ACT_PIN) = 1"),
+    (REL_LED, "active high assumed", "    GioWrite(#GIO_AON, #LED_ACT_PIN, 0)\n  Else\n    GioWrite(#GIO_AON, #LED_ACT_PIN, 1)",
+     "    GioWrite(#GIO_AON, #LED_ACT_PIN, 1)\n  Else\n    GioWrite(#GIO_AON, #LED_ACT_PIN, 0)"),
+    (REL_LED, "taken driving low (lit)", "  GioOutput(#GIO_AON, #LED_ACT_PIN, 1)", "  GioOutput(#GIO_AON, #LED_ACT_PIN, 0)"),
+    (REL_GIO, "a whole-register direction write", "  PokeL(a, (PeekN(a) & $FFFFFFFF) & (~gio_Bit(pin)))",
+     "  PokeL(a, 0)"),
     (REL_LED, "the readback skipped", "  If LedActIsOutput() = 0 Or LedActLit() <> 0\n", "  If 0\n"),
     (REL_LED, "PWR LED active high", "    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_LOW)\n  Else\n    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH)",
      "    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_HIGH)\n  Else\n    Rp1DigitalWrite(#RP1_GPIO_PWR_LED, #RP1_PIN_LOW)"),

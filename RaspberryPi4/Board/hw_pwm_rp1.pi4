@@ -11,9 +11,10 @@
 ;
 ;  WHAT THE BOARD KNOWS THAT THE Pi 4 DID NOT: WHERE THE FAN IS. The Pi 5
 ;  has a fan connector, and its device tree names the line: FAN_PWM on
-;  RP1 GPIO45, FAN_TACH on RP1 GPIO29 (bcm2712-rpi-5-b.dts). So there is
-;  exactly one pin, it is the default, and there is no software channel -
-;  the 40-pin header's GPIOs are not offered for a fan here.
+;  RP1 GPIO45, FAN_TACH on RP1 GPIO29 (bcm2712-rpi-5-b.dts). It is the
+;  default pin. The 40-pin header's hardware PWM pins - GPIO 12, 13, 18,
+;  19, RP1 PWM0, the same four the Pi 4 offers - are offered too
+;  (2026-09-27); there is no software channel.
 ;
 ;  THE FREQUENCY IS THE DEVICE TREE'S 41566 ns PERIOD, as hertz because
 ;  the seam speaks hertz: 1e9 / 41566 = 24058 Hz, which rp1_pwm.pi4 turns
@@ -41,6 +42,12 @@ Procedure.i Pi5PwmMapCode(c.i)
   Select c
     Case #RP1PWM_OK
       ProcedureReturn #HW_PWM_OK
+    Case #RP1PWM_ERR_PIN
+      ProcedureReturn #HW_PWM_PIN
+    Case #RP1PWM_ERR_INUSE
+      ProcedureReturn #HW_PWM_INUSE
+    Case #RP1PWM_ERR_CLOCK_OWED
+      ProcedureReturn #HW_PWM_BUSY
     Case #RP1PWM_ERR_HZ
       ProcedureReturn #HW_PWM_HZ
     Case #RP1PWM_ERR_DUTY
@@ -57,18 +64,27 @@ Procedure.i Pi5PwmMapCode(c.i)
 EndProcedure
 
 Procedure.i HwPwmPinCount()
-  ProcedureReturn 1
+  ProcedureReturn 5
 EndProcedure
 
 Procedure.i HwPwmPinAt(i.i)
-  If i = 0
-    ProcedureReturn #PI5_FAN_PIN
-  EndIf
+  Select i
+    Case 0
+      ProcedureReturn #PI5_FAN_PIN
+    Case 1
+      ProcedureReturn #RP1PWM_HDR_GPIO0
+    Case 2
+      ProcedureReturn #RP1PWM_HDR_GPIO1
+    Case 3
+      ProcedureReturn #RP1PWM_HDR_GPIO2
+    Case 4
+      ProcedureReturn #RP1PWM_HDR_GPIO3
+  EndSelect
   ProcedureReturn -1
 EndProcedure
 
 Procedure.i HwPwmPinIsHard(pin.i)
-  If pin = #PI5_FAN_PIN
+  If Rp1PwmPinValid(pin) = 1
     ProcedureReturn 1
   EndIf
   ProcedureReturn -1
@@ -90,10 +106,14 @@ Procedure.i HwPwmHzMax(pin.i)
   ProcedureReturn #RP1PWM_CLK_HZ / #RP1PWM_RANGE_MIN
 EndProcedure
 
-; No pin on this list is shared with anything else - GPIO45 is wired to
-; the fan connector only - so nothing is reserved.
+; GPIO45 is wired to the fan connector only, so nothing reserves it. A
+; header pin is reserved exactly when `gpio` would refuse it - the same
+; procedure, not a copy (the Pi 4 file's rule).
 Procedure.i HwPwmReservedReason(pin.i)
-  ProcedureReturn 0
+  If pin = #PI5_FAN_PIN
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn HwGpioReservedReason(pin)
 EndProcedure
 
 ; Begin also starts the tachometer: the fan and its tach arrive together.
@@ -102,8 +122,8 @@ Procedure.i HwPwmBegin(pin.i, hz.i)
   If HwPwmPinIsHard(pin) <> 1
     ProcedureReturn #HW_PWM_PIN
   EndIf
-  c = Rp1PwmBegin(hz)
-  If c = #RP1PWM_OK
+  c = Rp1PwmBeginPin(pin, hz)
+  If c = #RP1PWM_OK And pin = #PI5_FAN_PIN
     Rp1TachBegin(Micros())
   EndIf
   ProcedureReturn Pi5PwmMapCode(c)
@@ -131,7 +151,7 @@ EndProcedure
 
 Procedure.i HwPwmPin()
   If Rp1PwmOn() <> 0
-    ProcedureReturn #PI5_FAN_PIN
+    ProcedureReturn Rp1PwmPin()
   EndIf
   ProcedureReturn -1
 EndProcedure

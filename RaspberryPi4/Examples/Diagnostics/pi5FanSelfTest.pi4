@@ -61,6 +61,12 @@ Procedure UartWriteNl()
 EndProcedure
 
 XIncludeFile "Anvil/Hal/hal.pbi"
+; hw_pwm_rp1.pi4 asks the gpio seam which header pins are reserved; this
+; self-test drives only the fan connector, so no header pin is in play and
+; the board's answer (hw_gpio.pi4) is not linked here.
+Procedure.i HwGpioReservedReason(pin.i)
+  ProcedureReturn 0
+EndProcedure
 XIncludeFile "RaspberryPi4/Board/hw_pwm_rp1.pi4"
 XIncludeFile "Anvil/Core/fan.pbi"
 
@@ -214,7 +220,8 @@ Procedure SectionP()
   Row("P kind0", HwPwmKind())
   Row("P duty early", HwPwmDuty(500))
   Row("P end early", HwPwmEnd())
-  Row("P begin pin18", HwPwmBegin(18, HwPwmHzDefault()))
+  Row("P hard pin18", HwPwmPinIsHard(18))
+  Row("P begin pin5", HwPwmBegin(5, HwPwmHzDefault()))
   Row("P begin hz0", HwPwmBegin(45, 0))
   Row("P begin hzhigh", HwPwmBegin(45, HwPwmHzMax(45) + 1000))
   Row("P count", HwPwmPinCount())

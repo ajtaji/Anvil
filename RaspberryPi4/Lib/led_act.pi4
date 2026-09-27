@@ -15,17 +15,14 @@
 ;                          gpio@7d517c00. Through the /soc ranges that is
 ;                          CPU $107D517C00 (the translation that puts gio
 ;                          at $107D508500 and the PL011 at $107D001000).
-;    gpio-brcmstb.c        eight registers per bank, DATA +$04, IODIR +$08,
-;                          IODIR 1 = input. Those two OFFSETS are NOT
-;                          restated here: they are RaspberryPi4/Lib/
-;                          sdio.pi4's #SDIO_GIO_DATA / #SDIO_GIO_IODIR, the
-;                          one definition in this tree (the Wi-Fi lane's
-;                          WL_ON on the main gio). Only the AON base is new.
+;    gpio-brcmstb.c        the block's registers - NOT restated here: every
+;                          gio/gio_aon access is RaspberryPi4/Lib/gio.pi4's
+;                          (rule 30), and this file names the pin only.
 ;
-;  ACTIVE LOW: DATA bit 9 = 0 is LIT. Every write is a read-modify-write of
-;  bit 9 alone: gio_aon also carries RP1_RUN, SD power and the PMIC
-;  interrupt, and the firmware watches that bank (the DTS deletes
-;  gio_aon's interrupt-controller for exactly that reason).
+;  ACTIVE LOW: DATA bit 9 = 0 is LIT. gio.pi4 writes bit 9 alone:
+;  gio_aon also carries RP1_RUN, SD power and the PMIC interrupt, and the
+;  firmware watches that bank (the DTS deletes gio_aon's
+;  interrupt-controller for exactly that reason).
 ;
 ;  ORDER: value, then direction - the LED is set OFF before the pin
 ;  becomes an output, so taking the pin never flashes it.
@@ -36,15 +33,14 @@
 ;  of any GPIO encoding. Library level only: no seam until the owner rules
 ;  on the status-LED seam (vault morning list 2026-09-27, item 6).
 ;
-;  WHAT IS NOT HERE, AND WHY. The power button is NOT a GPIO this monitor owns: a
-;  press while the board is off, and a long press, are the PMIC's and the
-;  firmware's; the running system sees it as gio GPIO20, active low,
-;  pull-up (dts pwr_button gpio-keys, KEY_POWER), and its pull is set by
-;  the stepping-dependent main pinctrl. Reading it is left for the seam
-;  ruling (see the vault note).
+;  WHAT IS NOT HERE, AND WHY. The power button: a press while the board is
+;  off, and a long press, are the PMIC's and the firmware's; the running
+;  system sees it as gio GPIO20, active low, pull-up (dts pwr_button
+;  gpio-keys, KEY_POWER). Its read is gio.pi4's GioPwrButton(), not wired
+;  to anything until the seam ruling (see the vault note).
 ;
 ;  NOT VERIFIED ON A Pi 5. Desk-proven (tools/a64/led_act_check.py).
-;  REQUIRES: RaspberryPi4/Lib/sdio.pi4 (the two gio offsets) and
+;  REQUIRES: RaspberryPi4/Lib/gio.pi4 (the ACT LED's block) and
 ;  RaspberryPi4/Lib/gpio_rp1.pi4 (the PWR LED), both included before this.
 ; ======================================================================
 
@@ -52,8 +48,7 @@ CompilerIf #PMF_CHIP <> 2712
 led_act_is_the_BCM2712_ACT_LED_build_with_t_pi5()
 CompilerEndIf
 
-#LED_ACT_AON_BASE = $107D517C00    ; gio_aon, gpio@7d517c00
-#LED_ACT_BIT      = 1 << 9         ; AON_GPIO_09, bank 0
+#LED_ACT_PIN = 9                   ; gio_aon AON_GPIO_09 (#GIO_AON)
 
 #LED_ACT_OK    = 0
 #LED_ACT_STATE = -5                ; not begun
@@ -62,9 +57,9 @@ CompilerEndIf
 Global led_act_on.i
 Global led_act_begun.i
 
-; 1 when the readback says bit 9 is an output (IODIR 0).
+; 1 when the readback says the pin is an output.
 Procedure.i LedActIsOutput()
-  If (PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR) & #LED_ACT_BIT) = 0
+  If GioIsOutput(#GIO_AON, #LED_ACT_PIN) = 1
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
@@ -72,19 +67,16 @@ EndProcedure
 
 ; The level being DRIVEN, as lit (1) or dark (0) - active low undone here.
 Procedure.i LedActLit()
-  If (PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA) & #LED_ACT_BIT) = 0
+  If GioRead(#GIO_AON, #LED_ACT_PIN) = 0
     ProcedureReturn 1
   EndIf
   ProcedureReturn 0
 EndProcedure
 
-; Take the pin: DATA bit 9 high (dark), then IODIR bit 9 = output.
+; Take the pin: an output driving HIGH (dark) - gio.pi4 sets the value
+; before the direction, so taking it never flashes the LED.
 Procedure.i LedActBegin()
-  Define v.i
-  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)
-  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v | #LED_ACT_BIT)
-  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR)
-  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_IODIR, v & (~#LED_ACT_BIT))
+  GioOutput(#GIO_AON, #LED_ACT_PIN, 1)
   If LedActIsOutput() = 0 Or LedActLit() <> 0
     led_act_begun = 0
     ProcedureReturn #LED_ACT_STUCK
@@ -97,19 +89,14 @@ EndProcedure
 ; LedActSet(on) - 1 lit, 0 dark. Read back, and refuse by name if the
 ; level did not follow.
 Procedure.i LedActSet(on.i)
-  Define v.i
   If led_act_begun = 0
     ProcedureReturn #LED_ACT_STATE
   EndIf
-  v = PeekN(#LED_ACT_AON_BASE + #SDIO_GIO_DATA)
-  If on <> 0
-    v = v & (~#LED_ACT_BIT)
-  Else
-    v = v | #LED_ACT_BIT
-  EndIf
-  PokeL(#LED_ACT_AON_BASE + #SDIO_GIO_DATA, v)
   If on <> 0
     on = 1
+    GioWrite(#GIO_AON, #LED_ACT_PIN, 0)
+  Else
+    GioWrite(#GIO_AON, #LED_ACT_PIN, 1)
   EndIf
   If LedActLit() <> on
     ProcedureReturn #LED_ACT_STUCK

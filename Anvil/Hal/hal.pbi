@@ -1867,6 +1867,26 @@
 ;              TEMPERATURE section below for why it is here and not in
 ;              the sensor library.
 ;
+;    HwLed*    (#CAP_LED)   THE BOARD'S STATUS LEDs (seam approved by the
+;              owner 2026-09-27). IMPLEMENTED on the Pi 4 and the Pi 5 as
+;              RaspberryPi4/Board/hw_led.pi4:
+;                 HwLedAct(on)           the activity (green) LED: nonzero
+;                                        lit, 0 dark. A #HW_LED_* code; the
+;                                        backend reads the level back and
+;                                        answers #HW_LED_STUCK if it did
+;                                        not follow
+;                 HwLedPwr(on)           the power (red) LED, where the
+;                                        board can drive it; #HW_LED_NONE
+;                                        where it cannot
+;              The first call takes the pin; nothing is touched before it.
+;
+;    HwButton* (#CAP_BUTTON) THE POWER BUTTON, READ (seam approved by the
+;              owner 2026-09-27). IMPLEMENTED on the Pi 5 in hw_led.pi4:
+;                 HwPwrButton()          1 held down now, 0 up, or
+;                                        #HW_BTN_NONE (no button, or its
+;                                        line is not an input). A LEVEL,
+;                                        not an event: no debounce here.
+;
 ;    HwMmc*    (#CAP_MMC)   the raw `mmc` family, distinct from the
 ;              mounted-filesystem path #CAP_STORAGE rides. IMPLEMENTED on
 ;              the Pi 4 as RaspberryPi4/Board/hw_mmc.pi4 over
@@ -2082,6 +2102,12 @@
 #HW_PWM_STATE   = -5   ; nothing has been begun, so there is nothing to
                        ; set or end
 #HW_PWM_INUSE   = -6   ; the board's one modulator is already elsewhere
+
+; The status-LED and power-button seams (HwLed*, HwButton* above).
+#HW_LED_OK    = 0
+#HW_LED_NONE  = -1     ; this board has no such LED it can drive
+#HW_LED_STUCK = -2     ; the level read back did not follow the write
+#HW_BTN_NONE  = -1     ; no button, or its line cannot be read as one
 
 ; The duty scale, fixed HERE so the core and every backend agree without
 ; either of them naming a range register. Permille, not percent: a fan
