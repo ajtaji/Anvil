@@ -142,7 +142,12 @@ Procedure.i UsbDiskUp()
   If PcieEnumerate() = 0
     PrintN("!! the PCI Express bus started but walking it to find what is on it")
     PrintN("   failed, so the USB host controller was never found and no USB stick")
-    PrintN("   can be read. The SD card slot is tried next.")
+    ; BCM2712: the card was tried FIRST (StorageUp), so nothing follows.
+    CompilerIf #PMF_CHIP = 2712
+      PrintN("   can be read.")
+    CompilerElse
+      PrintN("   can be read. The SD card slot is tried next.")
+    CompilerEndIf
     Print("   The bus said: ")
     UartWriteStr(PcieErrorText())
     PrintNl()
@@ -254,14 +259,21 @@ Procedure.i UsbDiskUp()
     PrintN("   a disk on it. If something IS plugged in, check that it is in a port")
     PrintN("   on the board itself and not behind a hub: this monitor does not walk")
     PrintN("   through hubs yet, so a stick in a hub is invisible to it.")
-    PrintN("   The SD card slot is tried next.")
+    CompilerIf #PMF_CHIP <> 2712
+      PrintN("   The SD card slot is tried next.")
+    CompilerEndIf
     ProcedureReturn 0
   EndIf
 
   If XhciSetConfiguration(cfgVal) = 0
     PrintN("!! a USB storage device was found, but telling it which of its own")
     PrintN("   configurations to switch into failed, so it is not usable and")
-    PrintN("   nothing can be read off it. The SD card slot is tried next.")
+    ; BCM2712: the card was tried FIRST (StorageUp), so nothing follows.
+    CompilerIf #PMF_CHIP = 2712
+      PrintN("   nothing can be read off it.")
+    CompilerElse
+      PrintN("   nothing can be read off it. The SD card slot is tried next.")
+    CompilerEndIf
     Print("   The USB controller said: ")
     UartWriteStr(XhciErrorText())
     PrintNl()
@@ -270,7 +282,12 @@ Procedure.i UsbDiskUp()
   If XhciConfigureBulk(epOut, mpsOut, burstOut, epIn, mpsIn, burstIn) = 0
     PrintN("!! a USB storage device was found and configured, but opening the two")
     PrintN("   pipes that carry the actual data to and from it failed. Nothing can")
-    PrintN("   be read off it. The SD card slot is tried next.")
+    ; BCM2712: the card was tried FIRST (StorageUp), so nothing follows.
+    CompilerIf #PMF_CHIP = 2712
+      PrintN("   be read off it.")
+    CompilerElse
+      PrintN("   be read off it. The SD card slot is tried next.")
+    CompilerEndIf
     Print("   The USB controller said: ")
     UartWriteStr(XhciErrorText())
     PrintNl()
@@ -417,15 +434,18 @@ Procedure.i StorageUp()
     ProcedureReturn 1
   EndIf
   CompilerIf #PMF_CHIP = 2712
-    ; BCM2712: THE CARD FIRST, THEN AN NVMe DRIVE, BOTH WRITABLE. The card
-    ; is the medium the firmware booted from, so it wins; the NVMe drive on
-    ; the external PCIe x1 is tried only when no card mounts, which keeps a
-    ; board without a drive from paying the ~200 ms PCIe link wait at every
-    ; boot. USB mass storage is not wired on the Pi 5 here (#CAP_USB is 0).
+    ; BCM2712: THE CARD FIRST, THEN AN NVMe DRIVE, THEN A USB STICK, ALL
+    ; WRITABLE. The card is the medium the firmware booted from, so it wins;
+    ; the NVMe drive on the external PCIe x1 is tried only when no card
+    ; mounts, which keeps a board without a drive from paying the ~200 ms
+    ; PCIe link wait at every boot; a USB stick on RP1's xHCI is last, through
+    ; the shared block below (tools/a64/a64_usb_msc_pi5_check.py).
     If storage_SdUp2712() <> 0
       ProcedureReturn 1
     EndIf
-    ProcedureReturn storage_NvmeUp2712()
+    If storage_NvmeUp2712() <> 0
+      ProcedureReturn 1
+    EndIf
   CompilerEndIf
 
   ; THE BOOT TRAIL (forum 880) marks each step of the mount as well as the
@@ -471,6 +491,10 @@ Procedure.i StorageUp()
   EndIf
 
   MonPhaseMark(#BPH_STORAGE | 5)
+  CompilerIf #PMF_CHIP = 2712
+    PrintN("Nothing usable on the SD card, an NVMe drive or USB.")
+    ProcedureReturn 0
+  CompilerEndIf
   PrintN("Nothing usable on USB, so the SD card slot is being tried instead.")
   If gSdUp = 0
     SdSetBaseClockKhz(250000)
@@ -568,6 +592,9 @@ Procedure HwStorageReport()
     If gMedium = 3
       Print("The medium is an NVMe drive holding ")
       PrintDec(NvmeBlockCount())
+    ElseIf gMedium = 1
+      Print("The medium is a USB stick holding ")
+      PrintDec(MscBlockCount())
     Else
       Print("The boot medium is an SD card holding ")
       PrintDec(SdBlockCount())
