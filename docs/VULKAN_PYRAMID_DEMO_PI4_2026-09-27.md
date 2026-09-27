@@ -91,6 +91,8 @@ flash, or boot-medium write occurred.
 
 A four-attribute experiment moved the fixed pitch term into GPU arithmetic too.
 It returned `x0=0`, but capture 88 had scattered black pixels. It is not the
-demo default while that artifact remains unexplained. The source checkers
+demo default while that artifact remains unexplained. The lowerer now refuses
+graph shapes exceeding eight arithmetic nodes or twelve input words, the
+tested envelope for this demo. The source checkers
 exercise the bounded graph lowering, while the board capture establishes the
 clean working shader and records the outstanding hardware limit.
