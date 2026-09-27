@@ -19,7 +19,11 @@ old accepted and the new refuses is reported, with fdt.pbi's error code, and
 allowed only when FdtCheck refuses it (the shared reader is stricter by
 design - see the note - and the difference is listed, not hidden).
 
-Callers: --caller boot_memory (Pi3BootRanges).
+Callers: --caller boot_memory (Pi3BootRanges, row 2), loader_span
+(Pi3LoaderBootMemory's DTB check, row 3), monitor_span (Pi3MonitorBootMemory,
+row 4). A "span" caller is a FRAGMENT: the lines between two anchors that
+both the old and the new file share are cut out of each and wrapped in a
+procedure (pi3_dtb, pi3_ram_end) -> pi3_dtb_end or 0.
 Run:  py -3 -B tools/a64/fdt_migration_check.py --compiler <PureMetalForge.exe> --caller boot_memory
       [--old-rev ef0e4cd | --old-file <path>] [--mutate]
 """
@@ -194,6 +198,32 @@ def boot_memory_corpus():
     return cases
 
 
+def big_tree(extra):
+    b = Builder()
+    b.node("")
+    b.prop("#address-cells", word(2))
+    b.prop("#size-cells", word(2))
+    b.prop("pad", bytes(extra))
+    b.end()
+    return b.blob()
+
+
+def span_corpus():
+    """(name, blob, ramspan): the tree at TREE and pi3_ram_end = TREE + ramspan."""
+    out = []
+    for name, blob, n in boot_memory_corpus():
+        out.append((name, blob, n))
+        if name in ("empty", "fixed high ok", "reserve ok"):
+            for extra in (-1, 7, 64, 0x200000):
+                out.append(("%s ram%+d" % (name, extra), blob, len(blob) + extra))
+    big = big_tree(0x100000)                    # a valid tree just over 1 MiB
+    out.append(("valid tree over 1 MiB, ram 2 MiB", big, 0x200000))
+    fit = big_tree(0x100000 - 200)              # a valid tree just under 1 MiB
+    out.append(("valid tree under 1 MiB, ram 2 MiB", fit, 0x200000))
+    out.append(("valid tree under 1 MiB, ram short", fit, len(fit) - 4))
+    return out
+
+
 # ======================================================================
 #  Callers
 # ======================================================================
@@ -221,7 +251,47 @@ CALLERS = {
             ("exact total not required", "  If p3bmBe32(dtb + 4) <> total Or", "  If 0 Or"),
         ],
     ),
+    "loader_span": dict(
+        path="RaspberryPi3/Board/update_boot_support.pbi",
+        target="pi3", fragment=("  If pi3_dtb >= $80000 And pi3_dtb < $200000 : ProcedureReturn 0 : EndIf\n",
+                                "  pi3_dtb_end = pi3_dtb + total\n"),
+        old_prefix="", old_entry="Span",
+        call=lambda mc, name, addr, n: mc.call(name, addr, addr + n),
+        corpus=span_corpus,
+        mutations=[
+            ("1 MiB cap dropped", "  If total > 1048576 : total = 1048576 : EndIf\n", ""),
+            ("RAM bound ignored", "  total = pi3_ram_end - pi3_dtb\n", "  total = 1048576\n"),
+            ("span from the bound, not the header", "  total = Pi3ReadBe32(pi3_dtb + 4)\n  pi3_dtb_end", "  pi3_dtb_end"),
+        ],
+    ),
+    "monitor_span": dict(
+        path="RaspberryPi3/Board/board.pi3",
+        target="pi3", fragment=("  If pi3_dtb < $1000 Or (pi3_dtb & 7) <> 0 Or pi3_dtb > pi3_ram_end - 40 : ProcedureReturn 0 : EndIf\n",
+                                "  pi3_dtb_end = pi3_dtb + total\n"),
+        old_prefix="", old_entry="Span",
+        call=lambda mc, name, addr, n: mc.call(name, addr, addr + n),
+        corpus=span_corpus,
+        mutations=[
+            ("1 MiB cap dropped", "  If total > 1048576 : total = 1048576 : EndIf\n", ""),
+            ("RAM bound ignored", "  total = pi3_ram_end - pi3_dtb\n", "  total = 1048576\n"),
+            ("span from the bound, not the header", "  total = Pi3ReadBe32(pi3_dtb + 4)\n  pi3_dtb_end", "  pi3_dtb_end"),
+        ],
+    ),
 }
+
+
+def cut(text, frag, where):
+    a, b = frag
+    i = text.find(a)
+    j = text.find(b, i + len(a)) if i >= 0 else -1
+    if i < 0 or j < 0 or text.count(a) != 1:
+        raise SystemExit("%s: the fragment anchors are not there exactly once" % where)
+    return text[i + len(a):j + len(b)]
+
+
+def span_proc(name, body):
+    return ("Procedure.i %s(pi3_dtb.i, pi3_ram_end.i)\n  Protected total.i\n  Protected pi3_dtb_end.i\n"
+            "%s  ProcedureReturn pi3_dtb_end\nEndProcedure\n" % (name, body))
 
 
 def old_source(caller, rev, old_file):
@@ -235,6 +305,8 @@ def old_source(caller, rev, old_file):
             raise SystemExit("cannot read the old %s at %s: %s" % (c["path"], rev, r.stderr.strip()))
         text = r.stdout
     text = text.replace("\r\n", "\n")
+    if c.get("fragment"):
+        return span_proc("OldSpan", cut(text, c["fragment"], "the old " + c["path"]))
     text = re.sub(r"\b%s" % re.escape(c["old_prefix"]), "old_" + c["old_prefix"], text)
     text = re.sub(r"\b%s\b" % re.escape(c["old_entry"]), "Old" + c["old_entry"], text)
     return text
@@ -244,6 +316,10 @@ def build(caller, ov, work, cc, old_text):
     c = CALLERS[caller]
     work.mkdir(parents=True, exist_ok=True)
     new_text = d.source(c["path"], ov).replace("\r\n", "\n")
+    if c.get("fragment"):
+        new_text = ("Procedure.i Pi3ReadBe32(address.i)\n  ProcedureReturn (PeekA(address) << 24) | "
+                    "(PeekA(address + 1) << 16) | (PeekA(address + 2) << 8) | PeekA(address + 3)\n"
+                    "EndProcedure\n" + span_proc("Span", cut(new_text, c["fragment"], c["path"])))
     (work / "new.pbi").write_text(new_text, encoding="utf-8")
     (work / "old.pbi").write_text(old_text, encoding="utf-8")
     drv = ("; fdt_migration_check driver - generated\n"
@@ -282,14 +358,14 @@ def gate(caller, ov, work, cc, old_text, verbose=False):
     agree = 0
     region = 0x20000
     for name, blob, n in cases:
-        mc.poke(TREE, bytes(region))
+        mc.poke(TREE, bytes(max(region, len(blob) + 64)))
         mc.poke(TREE, blob)
         new = mc.signed(c["call"](mc, c["old_entry"], TREE, n))
         err = mc.signed(mc.call("FdtError"))
         old = mc.signed(c["call"](mc, "Old" + c["old_entry"], TREE, n))
         if new == old:
             agree += 1
-        elif old == 1 and new == 0 and err != 0:
+        elif old != 0 and new == 0 and err != 0:
             stricter.append((name, err))
         else:
             bad.append((name, old, new, err))
@@ -303,13 +379,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
     ap.add_argument("--caller", required=True, choices=sorted(CALLERS))
-    ap.add_argument("--old-rev", default="ef0e4cd")
+    ap.add_argument("--old-rev", default=None, help="default: ef0e4cd for boot_memory, 5f07075 for the spans")
     ap.add_argument("--old-file", default=None)
     ap.add_argument("--mutate", action="store_true")
     ap.add_argument("--only", default=None, help="run only mutants whose label contains this")
     a = ap.parse_args()
     cc = d.compiler(a.compiler)
-    old = old_source(a.caller, a.old_rev, a.old_file)
+    rev = a.old_rev or ("ef0e4cd" if a.caller == "boot_memory" else "5f07075")
+    old = old_source(a.caller, rev, a.old_file)
     top = pathlib.Path(tempfile.mkdtemp(prefix="anvil-fdtmig-"))
     try:
         try:
