@@ -246,6 +246,13 @@ Global avkFlightDrawCount.i = 0
 Global avkFlightLedgerCommitted.i = 0
 Global avkFlightDrawPreparedCb.i = 0
 Global avkFlightDrawOwnerCb.i = 0
+Global avkRenderClearPreparedCb.i = 0
+Global avkRenderClearRetained.i = 0
+Global avkRenderClearFb.i = 0
+Global avkRenderClearRp.i = 0
+Global avkRenderClearView.i = 0
+Global avkRenderClearImage.i = 0
+Global avkRenderClearWord.i = 0
 
 ; Generation-tagged handles are resolved once during whole-list preflight.
 ; Retain and release use only these captured slots, including the memory slot
@@ -3289,6 +3296,76 @@ CompilerEndIf
 ; ======================================================================
 ;  CLOSED MULTI-DRAW FLIGHT
 ; ======================================================================
+; A render pass with no primitives still performs its loadOp clear and store.
+; Resolve its generation-tagged attachment before acquiring a fence, then
+; retain the pass objects for a backend job that may remain outstanding.
+Procedure.i avkRenderClearPreflight(c.i)
+  Define fb.i, rp.i, iv.i, img.i, image.i, base.i, rc.i
+  avkRenderClearPreparedCb = 0
+  fb = avkFbSlot(avkCbFbHandle[c])
+  If fb = 0 Or fb <> avkCbFb[c]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a clear-only render pass with a stale framebuffer (Anvil code -20004, stale framebuffer); nothing was submitted.")
+  EndIf
+  rp = avkRpSlot(avkFbRpHandle[fb])
+  iv = avkIvSlot(avkFbViewHandle[fb])
+  If rp = 0 Or rp <> avkFbRp[fb] Or iv = 0 Or iv <> avkFbView[fb]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a clear-only render pass with a stale render pass or image view (Anvil code -20004, stale framebuffer dependency); nothing was submitted.")
+  EndIf
+  image = avkIvImage[iv]
+  img = avkImgSlot(image)
+  If img = 0 Or img <> avkIvImgSlot[iv] Or avkImgBound[img] = 0 Or avkImgMemSlot[img] < 1
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a clear-only render pass with a stale or unbound colour image (Anvil code -20004, stale attachment); nothing was submitted.")
+  EndIf
+  base = AnvilVkImageAddress(image)
+  rc = avkBackendClearSupported(base, avkImgSize[img], avkImgW[img], avkImgH[img], avkImgPitch[img])
+  If rc <> #VK_SUCCESS
+    ProcedureReturn avkFault(rc, "vkQueueSubmit found that the graphics backend cannot clear this render-pass attachment (backend refusal); nothing was submitted.")
+  EndIf
+  avkRenderClearFb = fb
+  avkRenderClearRp = rp
+  avkRenderClearView = iv
+  avkRenderClearImage = img
+  avkRenderClearWord = avkCbClearWord[c]
+  avkRenderClearPreparedCb = c
+  ProcedureReturn #ANVIL_VK_OK
+EndProcedure
+
+Procedure avkRenderClearRetain(c.i)
+  If avkRenderClearPreparedCb <> c Or avkRenderClearRetained <> 0 Or avkFlightActive = 0 Or avkFlightCb <> c
+    ProcedureReturn
+  EndIf
+  avkFbInFlight[avkRenderClearFb] = avkFbInFlight[avkRenderClearFb] + 1
+  avkRpInFlight[avkRenderClearRp] = avkRpInFlight[avkRenderClearRp] + 1
+  avkIvInFlight[avkRenderClearView] = avkIvInFlight[avkRenderClearView] + 1
+  avkRenderClearRetained = 1
+EndProcedure
+
+Procedure avkRenderClearRelease()
+  If avkRenderClearRetained = 0
+    ProcedureReturn
+  EndIf
+  If avkFbInFlight[avkRenderClearFb] > 0 : avkFbInFlight[avkRenderClearFb] = avkFbInFlight[avkRenderClearFb] - 1 : EndIf
+  If avkRpInFlight[avkRenderClearRp] > 0 : avkRpInFlight[avkRenderClearRp] = avkRpInFlight[avkRenderClearRp] - 1 : EndIf
+  If avkIvInFlight[avkRenderClearView] > 0 : avkIvInFlight[avkRenderClearView] = avkIvInFlight[avkRenderClearView] - 1 : EndIf
+  avkRenderClearRetained = 0
+  avkRenderClearPreparedCb = 0
+EndProcedure
+
+Procedure avkRenderClearDiscard()
+  If avkRenderClearRetained = 0
+    avkRenderClearPreparedCb = 0
+  EndIf
+EndProcedure
+
+Procedure.i avkRenderClearSubmit()
+  Define img.i
+  If avkRenderClearRetained = 0
+    ProcedureReturn -1
+  EndIf
+  img = avkRenderClearImage
+  ProcedureReturn avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[img]] + avkImgMemOffset[img], avkImgSize[img], avkImgW[img], avkImgH[img], avkImgPitch[img], avkRenderClearWord)
+EndProcedure
+
 Procedure.i avkFlightVertexIndex(draw.i, binding.i)
   ProcedureReturn (draw * #ANVIL_VK_MAX_BINDINGS) + binding
 EndProcedure
