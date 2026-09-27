@@ -534,10 +534,20 @@ EnableExplicit
 
 ; ---- the device -------------------------------------------------------
 ; bcm283x.dtsi mailbox@7e00b880, translated by bcm2711.dtsi's soc ranges.
+; BCM2712: /soc@107c000000/mailbox@7c013880, soc ranges 0 -> $10_00000000,
+; so $107C013880 - the same register offsets from a different base. Used
+; on Pi 5 silicon 2026-09-26 (RaspberryPi5/Board/board.pi4).
+CompilerIf #PMF_CHIP = 2712
+#MBX_READ    = $107C013880     ; MAIL0_RD   - replies arrive here
+#MBX_STATUS0 = $107C013898     ; MAIL0_STA  - the READ side's status
+#MBX_WRITE   = $107C0138A0     ; MAIL1_WRT  - requests go here
+#MBX_STATUS1 = $107C0138B8     ; MAIL1_STA  - the WRITE side's status
+CompilerElse
 #MBX_READ    = $FE00B880       ; MAIL0_RD   - replies arrive here
 #MBX_STATUS0 = $FE00B898       ; MAIL0_STA  - the READ side's status
 #MBX_WRITE   = $FE00B8A0       ; MAIL1_WRT  - requests go here
 #MBX_STATUS1 = $FE00B8B8       ; MAIL1_STA  - the WRITE side's status
+CompilerEndIf
 
 #MBX_FULL    = $80000000       ; ARM_MS_FULL  = BIT(31)
 #MBX_EMPTY   = $40000000       ; ARM_MS_EMPTY = BIT(30)
@@ -546,7 +556,15 @@ EnableExplicit
 #MBX_CHANMASK = $F             ; MBOX_MSG puts the channel in the low nibble
 
 ; ARM address -> VideoCore bus address. See THE BUS ADDRESS above.
+; BCM2712: the mailbox takes ARM physical addresses - /soc has no
+; dma-ranges, and on Pi 5 silicon 2026-09-26 an unaliased buffer was
+; answered and an unaliased framebuffer ($3F800000) came back. The
+; first-gigabyte limit below is kept as a chosen bound.
+CompilerIf #PMF_CHIP = 2712
+#MBX_BUS_OFFSET = 0
+CompilerElse
 #MBX_BUS_OFFSET = $C0000000
+CompilerEndIf
 ; ... and the end of the window that offset is valid in.
 #MBX_DMA_LIMIT  = $40000000
 

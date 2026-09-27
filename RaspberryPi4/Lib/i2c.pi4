@@ -247,7 +247,16 @@ EnableExplicit
 ;  missed conversion would not silently write offset $04 for ever - the
 ;  same discipline gpio.pi4 adopted when it split base from offsets.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. The Pi 5's header I2C is RP1's; #CAP_I2C is 0 and I2cInit()/I2cXfer() refuse with #I2C_NOCHIP.
+CompilerIf #PMF_CHIP = 2712
+#BSC1_BASE = $DEAD00000000
+CompilerElse
 #BSC1_BASE     = $FE804000
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE TWO PINS, NAMED ONCE. Alternative-function table, p.77: GPIO2 ALT0
@@ -307,7 +316,16 @@ EnableExplicit
 ;  the cheapest thing on this bench that can tell a bad cable from a bad
 ;  driver.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. As #BSC1_BASE above.
+CompilerIf #PMF_CHIP = 2712
+#BSC0_BASE = $DEAD00000000
+CompilerElse
 #BSC0_BASE     = $FE205000
+CompilerEndIf
 
 #I2C_DISP_PIN_SDA = 44        ; GPIO44 - SDA0 on ALT1, the DSI/CSI pair
 #I2C_DISP_PIN_SCL = 45        ; GPIO45 - SCL0 on ALT1
@@ -440,6 +458,7 @@ EnableExplicit
                               ; it on "this board has no such bus", and two
                               ; enumerations that agree by accident are how a
                               ; bus error gets relabelled silently.
+#I2C_NOCHIP    = -9           ; BCM2712: these are BCM2711 BSC blocks; no Pi 5 I2C driver
 #I2C_NOSR      = -8           ; the write phase of I2cWriteRead finished
                               ; before the controller ever reported the
                               ; transfer ACTIVE, so the repeated start could
@@ -1131,6 +1150,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i I2cInit()
   Define r.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 0          ; BCM2712: no BCM2711 BSC - see #BSC1_BASE
+  CompilerEndIf
   ; The SELECTED bus's pads and the SELECTED bus's alt. On bus 1 that is
   ; GPIO 2/3 to ALT0 (SDA1/SCL1); on bus 0 it is GPIO 44/45 to ALT1
   ; (SDA0/SCL0), the display connector's pair - and ALT1 is the number
@@ -1165,6 +1187,9 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure.i I2cIsUp()
   Define c.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 0          ; BCM2712: no BCM2711 BSC - see #BSC1_BASE
+  CompilerEndIf
   If I2cPinsMuxed() <> 1
     ProcedureReturn 0
   EndIf
@@ -1323,6 +1348,9 @@ Procedure.i I2cRecover()
   Define s.i
   Define spin.i
   Define deadline.i
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn #I2C_NOCHIP
+  CompilerEndIf
 
   a64_barrier()
   I2cWr(#BSC_C_OFF, #BSC_C_CLEAR)
@@ -1468,6 +1496,9 @@ Procedure.i I2cXfer(addr.i, *buf, n.i, isRead.i)
   If n < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn #I2C_NOCHIP
+  CompilerEndIf
   If I2cEnsureIdle() = 0
     ProcedureReturn #I2C_TIMEOUT
   EndIf
@@ -1677,6 +1708,9 @@ Procedure.i I2cWriteRead(addr.i, *wbuf, wn.i, *rbuf, rn.i)
   If wn < 1 Or rn < 1 Or addr < 0 Or addr > $7F
     ProcedureReturn #I2C_ARG
   EndIf
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn #I2C_NOCHIP
+  CompilerEndIf
   tracePhase = I2cTraceGoodixPhase(addr)
   trace = I2cTraceBegin(tracePhase)
   If I2cEnsureIdle() = 0

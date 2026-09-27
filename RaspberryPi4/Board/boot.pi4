@@ -59,10 +59,20 @@ Procedure BootConfigUp()
   NetConsoleSetLlTick(@NetLinkLocalTick)
   PrintN("Bringing up the board - each line names what it is starting, so a")
   PrintN("hang or a failure shows exactly where.")
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: RP1's USB and the BCM2712 SD host have no driver in this
+  ; build (#CAP_USB and #CAP_STORAGE are 0), so neither is touched.
+  PrintN("usb: not started - the Raspberry Pi 5's USB is RP1's xHCI, and this build")
+  PrintN("     has no driver for it yet.")
+  PrintN("storage: not started - no Raspberry Pi 5 SD driver in this build yet, so")
+  PrintN("     there is no SETTINGS.TXT; the defaults stand.")
+  up = 0
+  CompilerElse
   ; PCI Express, the xHCI host and the USB devices, each a one-liner.
   UsbEnumerate()
   ; The boot medium prints its own name and size - that IS its log line.
   up = StorageUp()
+  CompilerEndIf
   If up <> 0
     ; SettingsLoad is silent, so it gets a kernel-style line of its own.
     BootStep("settings")
@@ -94,6 +104,13 @@ EndProcedure
 ;  between them would be a fact about the past rather than about now.
 ; ----------------------------------------------------------------------
 Procedure BootNetUp()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: Ethernet is RP1's Cadence GEM and the radio is on SDIO2;
+  ; neither has a driver here (#CAP_NET is 0).
+  PrintN("network: not started - the Raspberry Pi 5's Ethernet (RP1) and Wi-Fi (SDIO2)")
+  PrintN("     have no driver in this build yet. The serial console is the console.")
+  ProcedureReturn
+  CompilerEndIf
   gBootLog = 1
   ; Ethernet is recovery infrastructure, not stored configuration. Bring
   ; it up on every boot; EthBootWired is bounded and falls back to the

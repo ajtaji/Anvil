@@ -742,7 +742,16 @@ EnableExplicit
 ; ======================================================================
 ; bcm2711.dtsi:589  reg = <0x0 0x7d580000 0x10000>, translated through
 ; the soc ranges at bcm2711.dtsi:41-43. See WHERE THE BLOCK IS.
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. The Pi 5's Ethernet is RP1's Cadence GEM; #CAP_NET is 0 and the boot's network half says so.
+CompilerIf #PMF_CHIP = 2712
+#GENET_BASE = $DEAD00000000
+CompilerElse
 #GENET_BASE = $FD580000
+CompilerEndIf
 #GENET_SIZE = $10000
 
 ; ======================================================================

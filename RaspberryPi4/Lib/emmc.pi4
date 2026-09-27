@@ -531,7 +531,16 @@ EnableExplicit
 ; ----------------------------------------------------------------------
 ; The controller. $100 bytes, per the dtsi reg property.
 ; ----------------------------------------------------------------------
+; BCM2712 (-t pi5): NO DRIVER for this block on the Pi 5. The base below
+; is not a BCM2711 address and lies above the Cortex-A76's 40-bit physical
+; range, so with the MMU off an access that ever got past this driver's
+; refusal would take an address-size fault that Anvil reports - never a
+; silent write somewhere else. The Pi 5's card is the BCM2712 SDHCI; #CAP_STORAGE is 0 and the boot skips the card.
+CompilerIf #PMF_CHIP = 2712
+#SD_BASE = $DEAD00000000
+CompilerElse
 #SD_BASE = $FE340000
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ; Register offsets. [SDHCI] Table 2-1, as 32-bit aggregates - see the

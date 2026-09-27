@@ -282,6 +282,36 @@ Procedure.i HwAddrCheck(lo.i, hi.i, forWrite.i)
   gPiAddrLo = 0
   gPiAddrHi = 0
 
+  CompilerIf #PMF_CHIP = 2712
+  ; ==================================================================
+  ;  BCM2712. The MMU is off (#ANVIL_CACHE is 0 there), so there are no
+  ;  tables to consult and every access goes straight to the bus. Only
+  ;  three spans are answered SAFE, each one this monitor already uses:
+  ;    $00000000..$3FFFFFFF  the first gigabyte of DRAM, which every Pi 5
+  ;                          has (it holds the stub, the image, the DTB
+  ;                          at $2EFEC600 and the framebuffer at $3F800000)
+  ;    $107C000000..$107FFFFFFF  /soc@107c000000: mailbox, UART10, PM
+  ;                          watchdog, GIC-400 (TF-A rpi_hw.h)
+  ;    $1F00000000..$1F003FFFFF  RP1's peripheral window, live only with
+  ;                          config.txt pciex4_reset=0 (RP1 UART0 is here)
+  ;  Everything else is refused until a Pi 5 map from the live DTB exists:
+  ;  a read of a gated or absent block on this part can stop the core.
+  ; ==================================================================
+  If lo >= 0 And hi <= $3FFFFFFF And lo <= hi
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+  If lo >= $107C000000 And hi <= $107FFFFFFF And lo <= hi
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+  If lo >= $1F00000000 And hi <= $1F003FFFFF And lo <= hi
+    ProcedureReturn #HW_ADDR_SAFE
+  EndIf
+  *gPiAddrWhy = "outside the three spans this Raspberry Pi 5 build knows are safe with the MMU off - the first gigabyte of DRAM, the BCM2712 window at $107C000000 and RP1's at $1F00000000; a read of a gated or absent block on this part can stop the processor"
+  gPiAddrLo = lo
+  gPiAddrHi = hi
+  ProcedureReturn #HW_ADDR_UNCLOCKED
+  CompilerEndIf
+
   ; ==================================================================
   ;  1. NOT MAPPED BY THIS MONITOR. Any overlap refuses the whole range,
   ;     and the size is not consulted: a translation fault stops the
@@ -372,6 +402,16 @@ Procedure HwAddrReport()
   ; `info` that explained the old certainty would have been the most
   ; confident wrong paragraph in the monitor.
   PutMonitorMap()
+  CompilerIf #PMF_CHIP = 2712
+  PrintN("            A write into any of that is refused and the refusal names")
+  PrintN("            the region.")
+  PrintN("addresses   Raspberry Pi 5, MMU off: SAFE is the first gigabyte of DRAM,")
+  PrintN("            the BCM2712 window $107C000000..$107FFFFFFF and RP1's")
+  PrintN("            $1F00000000..$1F003FFFFF. Everything else is refused, because")
+  PrintN("            on this part a read of a gated or absent block can stop the")
+  PrintN("            processor, and no Pi 5 map is read from the device tree yet.")
+  ProcedureReturn
+  CompilerEndIf
   PrintN("            A write into any of that is refused and the refusal names")
   PrintN("            the region. The first line is MEASURED, not declared: the")
   PrintN("            image carries the address of its own end, so the monitor")

@@ -394,6 +394,7 @@
 #SVC_BOARD_PI4     = 1
 #SVC_BOARD_UNOQ    = 2
 #SVC_BOARD_PI3     = 3
+#SVC_BOARD_PI5     = 4
 
 ; ----------------------------------------------------------------------
 ;  THE SLOT MAP. Fixed group bases with spare room.

@@ -188,8 +188,16 @@ EndProcedure
 ;  Anvil/Hal/abi.pbi gates group 15 on it, the same way it gates the
 ;  touch group on #CAP_TOUCH: a board that declares 0 compiles the
 ;  #SVC_ENOSYS arm and links against no secondary-core code at all.
+;
+;  BCM2712: 0. The secondary cores park in the Pi 5 EL3 stub
+;  (RaspberryPi5/Board/armstub8-2712.asm) and no resident worker has
+;  been proved on that part, so no job owner is offered.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+#CAP_PARALLEL = 0
+CompilerElse
 #CAP_PARALLEL = 1
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE MONITOR'S DATA WINDOW - the Globals, put there by BssAddress.
@@ -229,10 +237,30 @@ EndProcedure
 ;               eaten by its own first push.
 ;    #PAY1_*    the whole of bdinfo's second bank, which nothing else on
 ;               this board enters.
+;
+;  BCM2712: #PAY1_* is CHOSEN, not measured - $10000000..$1FFFFFFF, inside
+;  the first gigabyte every Pi 5 has, clear of BSS, of the firmware DTB
+;  (measured at $2EFEC600) and of the firmware framebuffer (measured at
+;  $3F800000). No /memory parser exists yet; widen it from the live DTB.
 ; ----------------------------------------------------------------------
 #PAY0_HI   = $07EFFFFF
+CompilerIf #PMF_CHIP = 2712
+#PAY1_LO   = $10000000
+#PAY1_HI   = $1FFFFFFF
+; The three regions the Pi 5 adds to HwMonRegion*() below.
+#MON_REGION_EL3STUB = 9
+#MON_REGION_DTB     = 10
+#MON_REGION_FWFB    = 11
+#MON_EL3STUB_LO     = $00000000   ; the EL3 stub: DTB atf@0, TF-A BL31_LIMIT
+#MON_EL3STUB_HI     = $0007FFFF
+#MON_FWDTB_LO       = $2EFEC600   ; the firmware DTB, measured 2026-09-26
+#MON_FWDTB_HI       = $2EFFFFFF   ; to the next 64 KiB boundary; a bound
+#MON_FWFB_LO        = $3F800000   ; the firmware framebuffer, measured 2026-09-26
+#MON_FWFB_HI        = $3FBFFFFF   ; 1920 x 1080 x 2 bytes, rounded up to 4 MiB
+CompilerElse
 #PAY1_LO   = $40000000
 #PAY1_HI   = $FBFFFFFF
+CompilerEndIf
 
 ; A payload's default link-time stack has a dedicated two-MiB corridor
 ; above the low payload window. PMF admission checks the initial 16-byte
@@ -1007,10 +1035,19 @@ EndProcedure
 ;  one whose extent moved.
 ; ======================================================================
 Procedure.i HwMonRegions()
+  CompilerIf #PMF_CHIP = 2712
+  ProcedureReturn 12
+  CompilerElse
   ProcedureReturn 9
+  CompilerEndIf
 EndProcedure
 
 Procedure.i HwMonRegionLo(i.i)
+  CompilerIf #PMF_CHIP = 2712
+  If i = #MON_REGION_EL3STUB : ProcedureReturn #MON_EL3STUB_LO : EndIf
+  If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_LO : EndIf
+  If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_LO : EndIf
+  CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonLo()
     Case 1 : ProcedureReturn #MON_DATA_LO
@@ -1030,6 +1067,11 @@ Procedure.i HwMonRegionLo(i.i)
 EndProcedure
 
 Procedure.i HwMonRegionHi(i.i)
+  CompilerIf #PMF_CHIP = 2712
+  If i = #MON_REGION_EL3STUB : ProcedureReturn #MON_EL3STUB_HI : EndIf
+  If i = #MON_REGION_DTB : ProcedureReturn #MON_FWDTB_HI : EndIf
+  If i = #MON_REGION_FWFB : ProcedureReturn #MON_FWFB_HI : EndIf
+  CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonHi()
     Case 1 : ProcedureReturn #MON_DATA_HI
@@ -1049,6 +1091,18 @@ EndProcedure
 ; HwIdSayConsole() and I2cSayPins() are: the board owns the prose about
 ; its own hardware and the core owns the layout of the line.
 Procedure HwMonRegionSay(i.i)
+  CompilerIf #PMF_CHIP = 2712
+  If i = #MON_REGION_EL3STUB
+    Print("the Pi 5 EL3 stub, which entered this monitor")
+    ProcedureReturn
+  ElseIf i = #MON_REGION_DTB
+    Print("the firmware device tree, at the address measured 2026-09-26")
+    ProcedureReturn
+  ElseIf i = #MON_REGION_FWFB
+    Print("the firmware framebuffer, measured 2026-09-26")
+    ProcedureReturn
+  EndIf
+  CompilerEndIf
   Select i
     Case 0
       Print("this monitor's code, measured from the image")

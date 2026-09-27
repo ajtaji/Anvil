@@ -1241,6 +1241,18 @@ XIncludeFile "Anvil/Graphics/edid.pbi"
 ; library never includes a library; the order is written here). Its header
 ; carries the BSC register citations against BCM2711 ARM Peripherals ch.3.
 XIncludeFile "RaspberryPi4/Lib/i2c.pi4"
+; BCM2712: the header's GPIO and I2C are RP1's - bank 0 through
+; Lib/gpio_rp1.pi4 and I2C1 through the DesignWare host Lib/i2c_dw.pi4 -
+; and the clock is the firmware's RTC (Lib/rtc_fw.pi4). hw_gpio.pi4 and
+; hw_i2c.pi4 take these under their own #PMF_CHIP = 2712 branches. Only
+; new files here: a library both targets need never goes inside a chip
+; test, because this compiler records a FALSE-branch XIncludeFile as done.
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
+XIncludeFile "RaspberryPi4/Lib/i2c_dw.pi4"
+XIncludeFile "RaspberryPi4/Lib/rtc_fw.pi4"
+XIncludeFile "RaspberryPi4/Lib/spi_dw.pi4"
+CompilerEndIf
 ; HDMI DDC is separate from GPIO BSC0/1: the firmware AUTOI2C handoff and
 ; dedicated BSC2/BSC7 hardware are owned by this direct reader.
 XIncludeFile "RaspberryPi4/Lib/hdmi_ddc.pi4"
@@ -1297,7 +1309,16 @@ XIncludeFile "RaspberryPi4/Lib/dsi_panel_v2_dcs.pi4"
 ; uses it is compiled for every board. Its own header carries the
 ; reasoning. House rule 10 applies to the two below - neither includes
 ; the other, so the order is stated here.
+; BCM2712: the fan is RP1 PWM1 channel 3 on RP1 GPIO45 with a tach on
+; GPIO29, driven by Lib/rp1_pwm.pi4 (it shares no register with the BCM2711
+; PWM blocks). thermal.pi4 stays outside the chip test on purpose: this
+; compiler records an XIncludeFile in a FALSE CompilerIf branch as done, so
+; a library that both targets need is never put inside one.
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Lib/rp1_pwm.pi4"
+CompilerElse
 XIncludeFile "RaspberryPi4/Lib/pwm.pi4"
+CompilerEndIf
 XIncludeFile "RaspberryPi4/Lib/thermal.pi4"
 ; The MMU and caches. Compiled in for the runtime `cache` command; the
 ; caches are OFF at boot and turned on only by hand, so the resident
@@ -1365,10 +1386,17 @@ XIncludeFile "RaspberryPi4/Lib/display.pi4"
 ;  0 to compile the whole thing out (the three libraries below are then dead
 ;  code and pruned, and the DMA console is all there is). The engine and its
 ;  QPU assembler are the same three libraries the pi4Neon* diagnostics use.
+;  BCM2712: both 0. The Pi 5's GPU is VideoCore VII (V3D 7.1) and there
+;  is no driver for it in this tree; the DMA/CPU console is all there is.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+#ANVIL_V3D_CONSOLE = 0
+#ANVIL_VULKAN_CONSOLE = 0
+CompilerElse
 #ANVIL_V3D_CONSOLE = 1
 ; The screen/cache policy reads this build choice before cache.pi4 is included.
 #ANVIL_VULKAN_CONSOLE = 1
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE FAN IN THE BANNER, behind #ANVIL_BANNER_FAN.
@@ -1596,7 +1624,34 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
 ;  that 0 until 2026-09-01, when the BSC driver was written and it flipped
 ;  to 1 with no other change (its own line below records that); as of that
 ;  date nothing in this block is 0.
+;
+;  BCM2712 (-t pi5, #PMF_CHIP = 2712) IS THE FIRST BLOCK BELOW. This same
+;  composition builds the Raspberry Pi 5, and each 0 there is a Pi 5 fact:
+;  the hardware exists on the board but no BCM2712/RP1 driver is in this
+;  tree yet, so the command still exists and RequireCap refuses it in a
+;  sentence. The BCM2711 drivers stay compiled for the Pi 4 and refuse on
+;  2712 in their own register accessors, so no BCM2711 address is in a
+;  -t pi5 image. Flip a line to 1 when its driver lands, as #CAP_I2C was.
 ; ======================================================================
+CompilerIf #PMF_CHIP = 2712
+#CAP_STORAGE  = 0   ; PI 5 NOT YET: the card is the BCM2712 SDHCI at
+                    ; $1000FFF000; USB is RP1's xHCI behind PCIe.
+#CAP_NET      = 0   ; PI 5 NOT YET: Ethernet is RP1's Cadence GEM and the
+                    ; radio is on BCM2712 SDIO2; neither has a driver.
+#CAP_GPIO     = 1   ; RP1 bank 0 through Lib/gpio_rp1.pi4 under the HwGpio*
+                    ; seam (hw_gpio.pi4's 2712 branch). Desk-proved; silicon owed.
+#CAP_I2C      = 1   ; RP1 I2C1 (DesignWare) through Lib/i2c_dw.pi4 under the
+                    ; HwI2c* seam (hw_i2c.pi4's 2712 branch). Desk-proved; silicon owed.
+#CAP_TOUCH    = 0   ; PI 5 NOT YET: the Pi 4 panel's bus is BCM2711 BSC0.
+#CAP_MMC      = 0   ; PI 5 NOT YET: follows #CAP_STORAGE's SD host.
+#CAP_USB      = 0   ; PI 5 NOT YET: RP1 xHCI behind PCIe.
+#CAP_PWM      = 1   ; the fan connector: RP1 PWM1 channel 3 + tach
+                    ; (Lib/rp1_pwm.pi4, Board/hw_pwm_rp1.pi4), and the
+                    ; temperature through thermal.pi4. Desk-proved
+                    ; (tools/a64/a64_fan_pi5_check.py); silicon owed.
+#CAP_BOOT_EL1 = 1   ; the same handoff contract as the Pi 4; HwBootToEl1
+                    ; refuses at EL3 in a sentence exactly as it does there.
+CompilerElse
 #CAP_STORAGE  = 1   ; a block medium + FAT filesystem. USB stick and SD
                     ; card, driven by Lib/usbmsc + Lib/emmc under Lib/fat -
                     ; load / save / mount work today.
@@ -1668,6 +1723,7 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
                     ; refusal itself, in a whole sentence, before it takes
                     ; the machine apart. See its header for what an
                     ; EL3-to-EL1 handover would need.
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE SEVEN GROUPS THE PAYLOAD ABI ADDED, 2026-09-04.
@@ -1684,11 +1740,18 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
 ;  hardware is genuinely not wired to this board - and from the payload's
 ;  seat those are the same fact and the same honest refusal.
 ; ----------------------------------------------------------------------
+CompilerIf #PMF_CHIP = 2712
+#CAP_CONSOLE  = 0   ; PI 5 NOT YET: the Pi 5 firmware grants a 16 bpp
+                    ; surface (silicon 2026-09-26) and hw_con.pi4's HwCon*
+                    ; writes 32-bit pixels. The monitor's own console draws
+                    ; 16 bpp through Lib/display.pi4; a payload's does not.
+CompilerElse
 #CAP_CONSOLE  = 1   ; A PIXEL SURFACE ANVIL CAN HAND TO A PAYLOAD, over the
                     ; HwCon* seam (RaspberryPi4/Board/hw_con.pi4) on
                     ; Lib/display.pi4's mailbox framebuffer and
                     ; Board/display.pi4's rasteriser. Not the monitor's own
                     ; terminal grid - that stays Anvil's.
+CompilerEndIf
 ; #CAP_TOUCH IS DECLARED ONCE, FURTHER UP THIS BLOCK, AND IT IS 1.
 ; It is not repeated here, and the reason is worth the four lines it
 ; costs. This branch was written when no board in the tree could reach a
@@ -1715,10 +1778,17 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
                     ; and that decision belongs in a backend that also names
                     ; the pins through HwGpioReservedReason() - or the next
                     ; person to type `gpio` gets a surprise.
+CompilerIf #PMF_CHIP = 2712
+#CAP_SPI      = 1   ; RP1 SPI0 (DesignWare SSI) through Lib/spi_dw.pi4 under
+                    ; the HwSpi* seam (Board/hw_spi.pi4), the shared layer
+                    ; Anvil/Bus/spi.pbi and the `spi` command. Desk-proved
+                    ; (tools/a64/spi_dw_check.py); silicon owed.
+CompilerElse
 #CAP_SPI      = 0   ; THERE IS NO SPI LIBRARY IN THIS TREE AT ALL. SPI0 is
                     ; on GPIO 7-11 (ALT0) and nothing drives it. It stays on
                     ; the critical path because LoRa is a module on SPI and
                     ; LoRa is the vehicle link's second transport.
+CompilerEndIf
 #CAP_VEHLINK  = 0   ; NO BACKEND YET. This is the seam that REPLACED CAN on
                     ; 2026-09-04: this product does not hook to the engine
                     ; port at all. A separate device plugs into that port
@@ -1728,6 +1798,13 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
                     ; Anvil already brings that radio up; what is missing is
                     ; the wire format to the second unit, which is that
                     ; unit's own design note. Phase A item 2a.
+CompilerIf #PMF_CHIP = 2712
+#CAP_RTC      = 1   ; THE PI 5 HAS ONE: the firmware's battery-backed RTC,
+                    ; read over the mailbox by Lib/rtc_fw.pi4 through the
+                    ; HwClock* backend Board/hw_clock.pi4 (included before
+                    ; abi.pbi below, 2712 only) and seeded at boot right
+                    ; after TimeBoot(). Desk-proved; silicon owed.
+CompilerElse
 #CAP_RTC      = 0   ; THIS PART HAS NO REAL-TIME CLOCK, and that is measured
                     ; rather than assumed: grepping the four device trees
                     ; for an rtc@ node gives five hits, all of them uartclk
@@ -1735,12 +1812,17 @@ XIncludeFile "RaspberryPi4/Lib/core_accept.pi4"
                     ; 2026-08-28). 1 here would mean a DS3231 is wired to
                     ; the header I2C bus, and none is - so every cold boot
                     ; starts #HW_CLK_UNSET and says so.
+CompilerEndIf
 
 ; The board's identity for the payload ABI, one of Anvil/Hal/abi.pbi's
 ; #SVC_BOARD_* codes. INFORMATIONAL ONLY - a payload that branches on it
 ; has re-forked the thing the capability model exists to prevent, and
 ; tools/a64/a64_abi_check.py looks for exactly that.
+CompilerIf #PMF_CHIP = 2712
+#SVC_BOARD_ID = 4   ; #SVC_BOARD_PI5
+CompilerElse
 #SVC_BOARD_ID = 1   ; #SVC_BOARD_PI4
+CompilerEndIf
 
 ; ----------------------------------------------------------------------
 ;  THE HAL FOUNDATION IS INCLUDED FURTHER UP THIS FILE, next to fat.pi4
@@ -1771,6 +1853,11 @@ XIncludeFile "RaspberryPi4/Board/hw_gpio.pi4"
 ; that knows the BCM2711 has BSC1 on the header; the `i2c` command above it
 ; knows only bus numbers and portable result codes.
 XIncludeFile "RaspberryPi4/Board/hw_i2c.pi4"
+; The HwSpi* backend and the shared SPI layer, only where #CAP_SPI is 1.
+CompilerIf #CAP_SPI = 1
+XIncludeFile "RaspberryPi4/Board/hw_spi.pi4"
+XIncludeFile "Anvil/Bus/spi.pbi"
+CompilerEndIf
 ; The Pi 4 HwPwm* and HwTemp* backend, thin wrappers over Lib/pwm.pi4 and
 ; Lib/thermal.pi4 (both included above) returning the #HW_PWM_* and
 ; #HW_TEMP_* codes hal.pi4 defines. IT MUST COME AFTER hw_gpio.pi4, and
@@ -1778,7 +1865,19 @@ XIncludeFile "RaspberryPi4/Board/hw_i2c.pi4"
 ; HwGpioUserMax() rather than keeping a second copy of the reserved-pin
 ; list, so that the pins `fan` refuses and the pins `gpio` refuses can
 ; never drift apart.
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Board/hw_pwm_rp1.pi4"
+CompilerElse
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Board/hw_pwm_rp1.pi4"
+CompilerElse
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Board/hw_pwm_rp1.pi4"
+CompilerElse
 XIncludeFile "RaspberryPi4/Board/hw_pwm.pi4"
+CompilerEndIf
+CompilerEndIf
+CompilerEndIf
 
 XIncludeFile "Anvil/Core/state.pbi"
 XIncludeFile "RaspberryPi4/Board/display_globals.pi4"
@@ -1871,6 +1970,9 @@ XIncludeFile "Anvil/Core/uptime.pbi"
 ; before it is called, so this include has to come first. Moving it back
 ; down breaks the build at CmdInfo - loudly, which is the right failure.
 XIncludeFile "Anvil/Core/i2c_cmd.pbi"
+CompilerIf #CAP_SPI = 1
+XIncludeFile "Anvil/Core/spi_cmd.pbi"
+CompilerEndIf
 ; Pi-specific DSI/MMIO commands follow the shared address/abort guards.
 ; Touch's hardware backend follows screen geometry below, because input
 ; and presentation must use the same rotation and physical coordinates.
@@ -2059,6 +2161,11 @@ XIncludeFile "Anvil/Core/crypto_cmd.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_board.pi4"
 XIncludeFile "RaspberryPi4/Board/hw_con.pi4"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
+; BCM2712: the HwClock* backend over the firmware RTC; abi.pbi's SvcUtc and
+; clock provenance call it on 2712, so it comes before abi.pbi.
+CompilerIf #PMF_CHIP = 2712
+XIncludeFile "RaspberryPi4/Board/hw_clock.pi4"
+CompilerEndIf
 XIncludeFile "Anvil/Hal/abi.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 ; ----------------------------------------------------------------------
@@ -2122,6 +2229,26 @@ XIncludeFile "Anvil/Core/usb_cmd.pbi"
 ; TrueType is a memory-only parser. The monitor's font command supplies a
 ; bounded file read and resident-slot memory; graphics code only borrows the
 ; selected face and never owns a filesystem handle.
+;
+; BCM2712: the Vulkan block above is compiled out there, and this compiler
+; records an XIncludeFile inside a FALSE CompilerIf as already included -
+; so the XIncludeFile below would be skipped and font_cmd.pbi would not
+; build. A plain IncludeFile under the chip test is not recorded that way.
+; The defect is recursive - the renderer's own nine XIncludeFiles were
+; expanded inside the dead block and recorded too - so on 2712 they are
+; named here, in the renderer's order, and its own lines then skip them.
+CompilerIf #PMF_CHIP = 2712
+IncludeFile "Anvil/Graphics/truetype.pbi"
+IncludeFile "Anvil/Graphics/truetype_metrics.pbi"
+IncludeFile "Anvil/Graphics/truetype_cmap.pbi"
+IncludeFile "Anvil/Graphics/truetype_outlines.pbi"
+IncludeFile "Anvil/Graphics/truetype_raster.pbi"
+IncludeFile "Anvil/Graphics/truetype_kern.pbi"
+IncludeFile "Anvil/Graphics/truetype_gpos.pbi"
+IncludeFile "Anvil/Graphics/truetype_layout.pbi"
+IncludeFile "Anvil/Graphics/truetype_slots.pbi"
+IncludeFile "Anvil/Graphics/truetype_renderer.pbi"
+CompilerEndIf
 XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
 XIncludeFile "Anvil/Core/font_cmd.pbi"
 XIncludeFile "Anvil/Core/help.pbi"
@@ -2357,6 +2484,11 @@ Procedure Main()
   ScreenServiceTick()
 
   TimeBoot()
+  CompilerIf #PMF_CHIP = 2712
+  ; BCM2712: seed the wall clock from the firmware RTC, AFTER TimeBoot has
+  ; set the clock's defaults (Anvil/Core/wallclock.pbi) so the seed wins.
+  HwClockSeed()
+  CompilerEndIf
   NtpServiceBoot()
   ; The screen first needs a live framebuffer for its banner and shared grid.
   ; Once it exists, prefer the resident Vulkan/Neon renderer. A clean Vulkan
@@ -2580,6 +2712,15 @@ Procedure Main()
       EndIf
     EndIf
 
+    ; spi - ahead of the chain because a CompilerIf cannot wrap an ElseIf
+    ; arm in this compiler today; only a #CAP_SPI = 1 board compiles it.
+    CompilerIf #CAP_SPI = 1
+    If c <> 0 And WordIs("spi") <> 0
+      CmdSpi()
+      c = 0
+    EndIf
+    CompilerEndIf
+
     ; THE WORD FIRST, THE LETTER SECOND. Both reach the same handler;
     ; the word is what a reader of the transcript sees.
     If c = 0
@@ -2714,7 +2855,11 @@ Procedure Main()
       CmdSettings()
 
     ElseIf WordIs("wifi") <> 0
+      CompilerIf #PMF_CHIP = 2712
+      RequireCap(#CAP_NET, "wifi", "the Raspberry Pi 5's radio is on the BCM2712's SDIO2 host and this build has no driver for it yet")
+      CompilerElse
       CmdWifi()
+      CompilerEndIf
 
     ; THE U-BOOT ENV NAMES over the same settings store. These ARE
     ; accepted as aliases, unlike the memory family's setenv note that
@@ -2889,12 +3034,20 @@ Procedure Main()
     ; there is no RequireCap: a board without the include does not have
     ; the command at all.
     ElseIf WordIs("touch") <> 0
+      CompilerIf #PMF_CHIP = 2712
+      RequireCap(#CAP_TOUCH, "touch", "the Pi 4 panel's touch controller is on the BCM2711's display I2C, and this Raspberry Pi 5 build has no display-connector I2C driver yet")
+      CompilerElse
       CmdTouch()
+      CompilerEndIf
     ; dsi - the other half of the same ribbon: the SoC's DSI1 host, the
     ; panel's own init table, and the HVS and pixel valve behind them.
     ; A whole word only; d is dump. This board's own, so no RequireCap.
     ElseIf WordIs("dsi") <> 0
+      CompilerIf #PMF_CHIP = 2712
+      RequireCap(0, "dsi", "the DSI host, HVS and pixel valve it drives are the BCM2711's, and this Raspberry Pi 5 build has no driver for the BCM2712's")
+      CompilerElse
       CmdDsi()
+      CompilerEndIf
     ; mmio - ONE 32-bit load. It exists because `memory` reads BYTES and
     ; the peripheral blocks on this part answer a sub-word read with a
     ; block-identity string, so `memory.l` over MMIO returns a plausible

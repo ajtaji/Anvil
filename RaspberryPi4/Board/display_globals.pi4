@@ -90,7 +90,15 @@ Global gDma.i                  ; 1 once the DMA engine is up AND bound to
 ; turned out to be shorter than a single read burst and the engine
 ; filled the tail of a long row with whatever lay behind it
 ; (dma.pi4:2349). DmaSetScratch() refuses anything smaller.
+;
+; BCM2712: 64 KiB. The 40-bit Pi 5 engine (RaspberryPi4/Lib/dma.pi4's
+; 2712 branch) takes a larger scratch block; still 256-byte aligned by
+; ScreenDmaUp's rounding.
+CompilerIf #PMF_CHIP = 2712
+#MON_DMA_SCRATCH = $10000
+CompilerElse
 #MON_DMA_SCRATCH = 512
+CompilerEndIf
 Global Dim gDmaScratch.a[#MON_DMA_SCRATCH + 255]
 Global gScreenIndex.i = -1     ; the display INDEX the running screen was
                                ; brought up on, or -1 for "the firmware's
