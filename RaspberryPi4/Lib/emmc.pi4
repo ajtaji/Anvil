@@ -759,7 +759,15 @@ CompilerEndIf
 ; CMD0  GO_IDLE_STATE       arg 0            no response
 #SD_CMD0  = $00000000
 ; CMD2  ALL_SEND_CID        arg 0            R2
-#SD_CMD2  = $020A0000
+;
+; RESPONSE TYPE 01, NOT 10. Both R2 commands were $0x0A0000 - type 10, a
+; 48-bit window - from the source baseline until 2026-09-27, when the Pi 5
+; card refused CMD2 with CMD_CRC | CMD_END_BIT (INT $00068001) and the same
+; card answered $02090000 with its CID (sd2712_probe, Ron's Pi 5). The 136
+; bits of an R2 do not fit a 48-bit window, so no card ever passed CMD2
+; here, on either chip. tools/a64/pi5_sd_save_check.py's card now refuses a
+; command whose response type is not the one its response has.
+#SD_CMD2  = $02090000
 ; CMD3  SEND_RELATIVE_ADDR  arg 0            R6
 #SD_CMD3  = $031A0000
 ; CMD7  SELECT_CARD         arg RCA<<16      R1b
@@ -767,7 +775,7 @@ CompilerEndIf
 ; CMD8  SEND_IF_COND        arg $1AA         R7
 #SD_CMD8  = $081A0000
 ; CMD9  SEND_CSD            arg RCA<<16      R2
-#SD_CMD9  = $090A0000
+#SD_CMD9  = $09090000                 ; R2: type 01 + CRC check, as CMD2
 ; CMD13 SEND_STATUS         arg RCA<<16      R1
 #SD_CMD13 = $0D1A0000
 ; CMD16 SET_BLOCKLEN        arg 512          R1
