@@ -70,10 +70,9 @@ XIncludeFile "Anvil/Core/fan.pbi"
 #FAN_AVS_DEVICE = 0
 ; FAN-AVS-DRIVER-INCLUDE
 
-; 1 only once RaspberryPi4/Lib/mailbox.pi4 carries a #PMF_CHIP = 2712
-; branch; until then its addresses are the BCM2711's and the firmware
-; fallback cannot be asked on this part. The gate decides.
-#FAN_MBX = 0
+; The firmware mailbox: RaspberryPi4/Lib/mailbox.pi4's #PMF_CHIP = 2712
+; transport. 1 - the fallback and the throttle point are asked.
+#FAN_MBX = 1
 
 ; The tach window the probe measures with, in microseconds.
 #FAN_TACH_WINDOW_US = 200000
@@ -187,15 +186,21 @@ Procedure SectionB()
   Row("B init", ModuleInit(@fanSvc[0], #FAN_AVS_DEVICE))
   Row("B fills", ModSeamFillClose())
   CompilerEndIf
-  Row("B milli", HwTempMilliC())
-  Row("B source", HwTempSource())
-  Row("B bound", ModSeamBindCount(#SVCCAP_THERMAL))
+  ; The firmware is brought up BEFORE the reading, so that a register
+  ; that answers invalid falls back to it (thermal.pi4) - the gate's
+  ; second run serves exactly that.
   CompilerIf #FAN_MBX = 1
   If MailboxInit() = 0
     Row("B mbxinit", 0)
   Else
     Row("B mbxinit", 1)
   EndIf
+  CompilerEndIf
+  Row("B milli", HwTempMilliC())
+  Row("B source", HwTempSource())
+  Row("B bound", ModSeamBindCount(#SVCCAP_THERMAL))
+  CompilerIf #FAN_MBX = 1
+  Row("B mbxmilli", ThermalMailboxMilliC())
   Row("B maxmilli", HwTempMaxMilliC())
   CompilerEndIf
 EndProcedure
