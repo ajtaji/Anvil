@@ -32,7 +32,7 @@ Global Dim virColor.l[4]
 
 Procedure.i Main()
   Define status.i = 1, neonReady.i = 0, i.i, j.i, k.i, rc.i, scratch.i
-  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, clearCmd.i, readCmd.i, copyCmd.i, rectReadCmd.i, uploadCmd.i, strideUploadCmd.i, strideReadCmd.i, selfCmd.i
   Define img.i, imgMem.i, dstImg.i, dstMem.i, dstMap.i, buf.i, bufMem.i, bufMap.i, fence.i
   Define count.i, cbHandle.i, fenceArray.i, binBefore.i, renBefore.i, dmaBefore.i
   Define ici.VkInstanceCreateInfo
@@ -98,7 +98,7 @@ Procedure.i Main()
     If vkBindImageMemory(dev, img, imgMem, 0) <> #VK_SUCCESS : status = 16 : Break : EndIf
 
     imgci\extent\width = 32 : imgci\extent\height = 32
-    imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
     If vkCreateImage(dev, @imgci, 0, @dstImg) <> #VK_SUCCESS : status = 40 : Break : EndIf
     vkGetImageMemoryRequirements(dev, dstImg, @req)
     If req\size <> #VIR_DST_BYTES Or AnvilVkImageRowPitch(dstImg) <> 128 : status = 41 : Break : EndIf
@@ -132,6 +132,7 @@ Procedure.i Main()
     If vkAllocateCommandBuffers(dev, @cbai, @uploadCmd) <> #VK_SUCCESS : status = 65 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @strideUploadCmd) <> #VK_SUCCESS : status = 74 : Break : EndIf
     If vkAllocateCommandBuffers(dev, @cbai, @strideReadCmd) <> #VK_SUCCESS : status = 75 : Break : EndIf
+    If vkAllocateCommandBuffers(dev, @cbai, @selfCmd) <> #VK_SUCCESS : status = 94 : Break : EndIf
     fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = 24 : Break : EndIf
     fenceArray = fence
@@ -353,6 +354,38 @@ Procedure.i Main()
       If (PeekA(bufMap + i) & $FF) <> $A5 : status = 93 : Break : EndIf
     Next
     If status = 93 : Break : EndIf
+
+    dstBar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    dstBar\newLayout = #VK_IMAGE_LAYOUT_GENERAL
+    dstBar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    dstBar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT
+    imageRegion\srcOffset\x = 7 : imageRegion\srcOffset\y = 9
+    imageRegion\dstOffset\x = 24 : imageRegion\dstOffset\y = 24
+    imageRegion\extent\width = 8 : imageRegion\extent\height = 8
+    If vkBeginCommandBuffer(selfCmd, @bi) <> #VK_SUCCESS : status = 95 : Break : EndIf
+    vkCmdPipelineBarrier(selfCmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @dstBar)
+    vkCmdCopyImage(selfCmd, dstImg, #VK_IMAGE_LAYOUT_GENERAL, dstImg, #VK_IMAGE_LAYOUT_GENERAL, 1, @imageRegion)
+    If vkEndCommandBuffer(selfCmd) <> #VK_SUCCESS : status = 96 : Break : EndIf
+    If vkResetFences(dev, 1, @fenceArray) <> #VK_SUCCESS : status = 97 : Break : EndIf
+    dmaBefore = hwVkDmaOps
+    cbHandle = selfCmd
+    If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : status = 98 : Break : EndIf
+    If vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000) <> #VK_SUCCESS : status = 99 : Break : EndIf
+    If hwVkDmaOps <> dmaBefore + 8 Or DmaQuiescent() = 0 : status = 100 : Break : EndIf
+    If dma_bounds <> #VIR_SURFACE Or dma_boundsN <> 4096000 : status = 101 : Break : EndIf
+    For k = 0 To 31
+      For j = 0 To 31
+        If (j >= 7 And j < 24 And k >= 9 And k < 22) Or (j >= 24 And j < 32 And k >= 24 And k < 32)
+          rc = #VIR_EXPECT
+        Else
+          rc = $A5A5A5A5
+        EndIf
+        If (PeekL(dstMap + (k * 32 + j) * 4) & $FFFFFFFF) <> (rc & $FFFFFFFF) : status = 102 : Break : EndIf
+      Next
+      If status = 102 : Break : EndIf
+    Next
+    If status = 102 : Break : EndIf
+
     status = 0
   Until 1
 
