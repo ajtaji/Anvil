@@ -1,0 +1,88 @@
+; nvme2712_probe.pi5 - the Pi 5's external PCIe x1 (pcie1, cold-started by
+; RaspberryPi4/Lib/pcie.pi4's 2712 branch) with an NVMe drive behind it
+; (Anvil/Storage/nvme.pbi), mounted through the SHARED filesystem seam.
+; DESK FIXTURE, no UART: tools/a64/a64_nvme_pi5_check.py writes #CTL,
+; models the controller, the link and the drive, and reads #OUT. Silicon
+; owed.
+;
+;   #CTL +0  1 = mount partition 1 and read HELLO.TXT back, then write
+;            NEW.TXT and flush; 2 = stop after NvmeAttach (refusal cases)
+;        +$800 "HELLO.TXT", +$840 "NEW.TXT" - NUL-terminated, from the gate
+;
+;   #OUT +0 Pcie1Init  +4 Pcie1Error  +8 Pcie1Enumerate  +12 Pcie1ClassCode
+;       +16 NvmeAttach +20 NvmeError  +24 NvmeLbaBytes   +28 NvmeBlockCount
+;       +32 FsSelectPartition(1)      +36 bytes read from HELLO.TXT
+;       +40 NEW.TXT written (1/0)     +44 FsError        +48 $600DF00D
+;       +52 FsOpen(HELLO.TXT)         +56 FsSize() of it
+;       +60 FsLastError / +64 FsErrorKind straight after that open
+;       +68 NvmeReadBlocks(1000, 48, #BIG) - six pages, so a PRP list
+;       +72 NvmeWriteBlocks(1, 1, #BIG)   - on a 4 KiB namespace an edge
+;           write into the device block that holds the MBR
+;   #BUF    the bytes read from HELLO.TXT
+;
+;   pmfc nvme2712_probe.pi5 -t pi5 --load-addr 0x400000 \
+;        --stack-addr 0x3000000 --entry-returns -o nvme2712.img
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "Anvil/Storage/nvme.pbi"
+XIncludeFile "Anvil/Storage/fat32.pbi"
+XIncludeFile "Anvil/Storage/exfat.pbi"
+XIncludeFile "Anvil/Storage/filesystem.pbi"
+
+#CTL   = $00E00000
+#OUT   = $00E00100
+#BUF   = $00E01000
+#ARENA = $01000000
+#BIG   = $00E20000
+
+Define sc.i
+Define r.i
+Define n.i
+Define h.i
+
+sc = PeekN(#CTL)
+Pcie1SetTimebase(@Ticks, @TickHz)
+r = Pcie1Init()
+PokeL(#OUT + 0, r)
+PokeL(#OUT + 4, Pcie1Error())
+If r = 1
+  r = Pcie1Enumerate()
+  PokeL(#OUT + 8, r)
+  PokeL(#OUT + 12, Pcie1ClassCode())
+  If r = 1
+    r = NvmeAttach(Pcie1BarCpu(), #ARENA, #NVME_ARENA_BYTES, Pcie1DmaOffset())
+    PokeL(#OUT + 16, r)
+    PokeL(#OUT + 20, NvmeError())
+    PokeL(#OUT + 24, NvmeLbaBytes())
+    PokeL(#OUT + 28, NvmeBlockCount())
+    If r = 1 And sc = 1
+      FsSetRangeReader(@NvmeReadBlocks)
+      FsSetRangeWriter(@NvmeWriteBlocks)
+      FsSetBlockFlusher(@NvmeFlush)
+      r = FsSelectPartition(1)
+      PokeL(#OUT + 32, r)
+      If r <> 0
+        n = FsOpen(#CTL + $800)
+        PokeL(#OUT + 52, n)
+        PokeL(#OUT + 60, FsLastError())
+        PokeL(#OUT + 64, FsErrorKind())
+        If n <> 0
+          PokeL(#OUT + 56, FsSize())
+          n = FsRead(#BUF, 512)
+          PokeL(#OUT + 36, n)
+          FsClose()
+        EndIf
+        If FsCreate(#CTL + $840) <> 0
+          h = FsWrite(#BUF, 64)
+          FsClose()
+          PokeL(#OUT + 40, Bool(h = 64 And FsFlush() <> 0))
+        EndIf
+      EndIf
+      PokeL(#OUT + 44, FsLastError())
+      PokeL(#OUT + 68, NvmeReadBlocks(1000, 48, #BIG))
+      PokeL(#OUT + 72, NvmeWriteBlocks(1, 1, #BIG))
+    EndIf
+  EndIf
+EndIf
+PokeL(#OUT + 48, $600DF00D)
