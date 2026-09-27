@@ -1,0 +1,75 @@
+; fdt_gate.pi5 - drive Anvil/Core/fdt.pbi for tools/a64/fdt_check.py.
+; DIAGNOSTIC; does not ship. Also a payload the Pi 5 monitor can run
+; against the LIVE tree: put its address at $5F0000 and its bound at
+; $5F0008, run, then read the answers from $5F1000.
+;
+; Answers, one quadword each from $5F1000 (-1 = refused / absent):
+;   +0   FdtCheck            +8   UART10 serial@7d001000 reg 0
+;   +16  SDIO2 mmc@1100000   +24  SD mmc@fff000 reg 0
+;   +32  GIC distributor     +40  GIC CPU interface (reg 1)
+;   +48  RP1 UART0 via alias uart0 (two ranges levels, one a PCI bus)
+;   +56  stdout node reg 0   +64  /memory end from 0
+;   +72  C0 pinctrl reg 0    +80  D0 pinctrl reg 0
+;   +88  FdtCompatible(pinctrl@7d504100, "brcm,bcm2712c0-pinctrl")
+;   +96  #address-cells of /axi/pcie@1000120000
+;   +104 /soc/serial@7d001000 (unit-less component) reg 0
+;   +112 a missing node (must be -1)
+;   +120 /axi/mmc@1100000/wifi@1 raw reg address (size-less child)
+;   +128 memory-reservation entries   +136 children of /
+;   +144 children of /reserved-memory (-1 if no such node)
+XIncludeFile "Anvil/Core/fdt.pbi"
+
+#FG_IN  = $5F0000
+#FG_OUT = $5F1000
+
+Procedure.i FgAddr(node.i, index.i)
+  If node = 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn FdtRegAddress(node, index)
+EndProcedure
+
+Procedure.i FgChildren(node.i)
+  Protected k.i, c.i
+  k = 0
+  c = FdtFirstChild(node)
+  While c <> 0
+    k = k + 1
+    c = FdtNextSibling(c)
+  Wend
+  ProcedureReturn k
+EndProcedure
+
+Procedure Main()
+  Protected rc.i, n.i
+  For n = 0 To 18
+    PokeI(#FG_OUT + n * 8, -1)
+  Next
+  rc = FdtCheck(PeekI(#FG_IN), PeekI(#FG_IN + 8))
+  PokeI(#FG_OUT, rc)
+  If rc <> #FDT_OK
+    ProcedureReturn
+  EndIf
+  PokeI(#FG_OUT + 8,  FgAddr(FdtFindNode("/soc@107c000000/serial@7d001000"), 0))
+  PokeI(#FG_OUT + 16, FgAddr(FdtFindNode("/axi/mmc@1100000"), 0))
+  PokeI(#FG_OUT + 24, FgAddr(FdtFindNode("/soc@107c000000/mmc@fff000"), 0))
+  n = FdtFindNode("/soc@107c000000/interrupt-controller@7fff9000")
+  PokeI(#FG_OUT + 32, FgAddr(n, 0))
+  PokeI(#FG_OUT + 40, FgAddr(n, 1))
+  PokeI(#FG_OUT + 48, FgAddr(FdtFindNode(FdtAlias("uart0")), 0))
+  PokeI(#FG_OUT + 56, FgAddr(FdtStdoutNode(), 0))
+  PokeI(#FG_OUT + 64, FdtMemoryEndFromZero())
+  PokeI(#FG_OUT + 72, FgAddr(FdtFindCompatible("brcm,bcm2712c0-pinctrl", 0), 0))
+  PokeI(#FG_OUT + 80, FgAddr(FdtFindCompatible("brcm,bcm2712d0-pinctrl", 0), 0))
+  PokeI(#FG_OUT + 88, FdtCompatible(FdtFindNode("/soc@107c000000/pinctrl@7d504100"), "brcm,bcm2712c0-pinctrl"))
+  PokeI(#FG_OUT + 96, FdtAddressCells(FdtFindNode("/axi/pcie@1000120000")))
+  PokeI(#FG_OUT + 104, FgAddr(FdtFindNode("/soc/serial@7d001000"), 0))
+  n = FdtFindNode("/soc@107c000000/no-such-node@0")
+  If n = 0 : PokeI(#FG_OUT + 112, -1) : Else : PokeI(#FG_OUT + 112, n) : EndIf
+  n = FdtFindNode("/axi/mmc@1100000/wifi@1")
+  If n <> 0
+    If FdtReg(n, 0) = #FDT_OK : PokeI(#FG_OUT + 120, FdtRegBase()) : EndIf
+  EndIf
+  PokeI(#FG_OUT + 128, FdtReserveCount())
+  PokeI(#FG_OUT + 136, FgChildren(FdtRoot()))
+  n = FdtFindNode("/reserved-memory")
+  If n <> 0 : PokeI(#FG_OUT + 144, FgChildren(n)) : EndIf
+EndProcedure
