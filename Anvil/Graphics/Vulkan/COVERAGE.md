@@ -22,7 +22,7 @@ currently amounts to and where the files are.
 | `vk_memory.pbi` | `VkDeviceMemory` and `VkImage`: the device heap, first-fit suballocation with real reuse, one checked host mapping per host-visible allocation, memory requirements, binding rules, linear and bounded optimal image plans, image usages including `COLOR_ATTACHMENT`, layout and queue-family ownership. |
 | `vk_sync.pbi` | `VkFence`: two states, one owner while in use, reset and destroy refusals. |
 | `vk_semaphore.pbi` | Core-1.0 binary semaphore lifetime and ordered transaction state: generation owners, reserve/commit/complete/rollback, one-signal consumption, pending references and atomic device teardown. There is no timeline behavior or host signal/reset operation. |
-| `vk_command.pbi` | The recorded command stream, layout and dynamic-scissor tracking across a recording, generation-tagged resource retention, submission, completion, and bounded finite host waits. It owns multi-region `vkCmdCopyBuffer` and ordered `vkCmdFillBuffer` / `vkCmdUpdateBuffer` transactions, the one-region whole-image `vkCmdCopyBufferToImage` transaction, rectangular linear-image `vkCmdCopyImage` transactions and whole tight linear-image `vkCmdCopyImageToBuffer` transactions lowered through the guarded DMA backend on Pi 4. The flight ticket publishes or rolls back binary semaphore state only at real immediate or polled completion. An already-satisfied `UINT64_MAX` wait succeeds; an unsatisfied one is explicitly withheld until host calls are reentrant. |
+| `vk_command.pbi` | The recorded command stream, layout and dynamic-scissor tracking across a recording, generation-tagged resource retention, submission, completion, and bounded finite host waits. It owns multi-region `vkCmdCopyBuffer` and ordered `vkCmdFillBuffer` / `vkCmdUpdateBuffer` transactions, the one-region whole-image `vkCmdCopyBufferToImage` transaction, and rectangular linear-image `vkCmdCopyImage` / `vkCmdCopyImageToBuffer` transactions lowered through the guarded DMA backend on Pi 4. The flight ticket publishes or rolls back binary semaphore state only at real immediate or polled completion. An already-satisfied `UINT64_MAX` wait succeeds; an unsatisfied one is explicitly withheld until host calls are reentrant. |
 | `vk_api.pbi` | The public `vk*` entry points and their validation, including a bounded whole-framebuffer `vkCmdClearAttachments` inside a render pass. |
 | `vk_backend_none.pbi` | The absent backend: no device is enumerated. UNO Q and any Pi build without V3D link this. |
 | `vk_backend_test.pbi` | The explicit test backend: state and a call log, **no GPU and no pixels ever written**. |
@@ -50,7 +50,10 @@ then copied it into a buffer by guarded DMA through the public
 `vkCmdCopyImageToBuffer` command. It returned zero after exact pixel and guard
 checks, one bin/render pair, one DMA completion, quiescence and write-bound
 restoration; see `docs/VULKAN_IMAGE_READBACK_PI4_2026-09-26.md`. This is a
-bounded silicon result, not general tiled or partial image readback.
+bounded whole-image silicon result. A later 17×13 rectangular linear readback
+passed on silicon with thirteen guarded DMA operations and exact copied/untouched
+bytes; see `docs/VULKAN_IMAGE_RECT_READBACK_PI4_2026-09-27.md`.
+Optimal-tiled readback remains unsupported.
 
 ## Compiler ABI boundary
 
