@@ -288,7 +288,9 @@ def source_contract() -> None:
     require("extensioncount>1" not in cdn,
             "EDID acquisition silently truncates advertised extension blocks")
     display = libraries["display.pbi"].lower()
-    display_up = display.split("procedure.i rockdisplayup()", 1)[1].split(
+    # The cold-to-visible chain is one attempt, run native first and then at
+    # most once more as the firmware-trained 1024x768 fallback.
+    display_up = display.split("procedure.i rockdisplayupattempt(native.i)", 1)[1].split(
         "endprocedure", 1
     )[0]
     order = [
@@ -374,7 +376,7 @@ def source_contract() -> None:
         "rockcdnhotplug()": ("dpe7 cdn err ", "rock_cdn_error"),
         "rockcdnhostcapabilities()": ("dpef cdn err ", "rock_cdn_error"),
         "rockcdnreadedid()": ("dpe9 cdn err ", "rock_cdn_error"),
-        "rockcdntrain()": ("dpeb cdn err ", "rock_cdn_error"),
+        "trained": ("dpeb cdn err ", "rock_cdn_error"),
         "rockcdnvideostatus(0)": ("dpec cdn err ", "rock_cdn_error"),
         "rockcruvpllmode()": ("dpe1 cru err ", "rock_cru_error"),
         "rockvoppreparemode()": ("dpea vop err ", "rock_vop_error"),
@@ -1574,8 +1576,8 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                       "rockcdnlinkcarriesmode:",
                       "rockcdnvideomode:"):
             require(label in asm, f"emitted silicon witness is missing: {label}")
-        display_up_asm = asm.split("rockdisplayup:", 1)[1].split(
-            "rockdisplaybuffer:", 1
+        display_up_asm = asm.split("rockdisplayupattempt:", 1)[1].split(
+            "rockdisplaystopscanout:", 1
         )[0]
         emitted_witnesses = [
             "bl rockdisplaydppowertelemetry", "bl rockdisplayfirmwaretelemetry",
@@ -1587,7 +1589,7 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         display_source = (ROCK / "Lib/display.pbi").read_text(
             encoding="utf-8").lower()
         display_source_up = display_source.split(
-            "procedure.i rockdisplayup()", 1)[1].split("endprocedure", 1)[0]
+            "procedure.i rockdisplayupattempt(native.i)", 1)[1].split("endprocedure", 1)[0]
         expected_subsystem_witnesses = display_source_up.count(
             "rockdisplaysubsystemtelemetry(")
         require(expected_subsystem_witnesses > 0 and
@@ -1597,7 +1599,7 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         require("global_rock_cru_dp_core_rate" in display_up_asm,
                 "emitted Cadence setup lost the live core-clock handoff")
         dpcd_telemetry_asm = asm.split("rockdisplaydpcdtelemetry:", 1)[1].split(
-            "rockdisplayup:", 1
+            "rockdisplaytraintelemetry:", 1
         )[0]
         require("bl rockdisplaymailboxtelemetry" in dpcd_telemetry_asm,
                 "emitted DPCD failure lost its partial-header witness")
@@ -1632,8 +1634,10 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
         )[0]
         require(len(re.findall(r"\bbl\s+rockcrureset\b", prepare_asm)) == 10,
                 "emitted prepare no longer leaves all asserted display resets held")
+        # RockTcPhyUp is followed in tcphy.pbi by the per-rate owners
+        # (RockTcDpClkWait onward), whose own waits must not be counted here.
         tcphy_up_asm = asm.split("rocktcphyup:", 1)[1].split(
-            "rockcdnmailboxwitnessreset:", 1
+            "rocktcdpclkwait:", 1
         )[0]
         tcphy_resets = [match.start() for match in re.finditer(
             r"\bbl\s+rockcrureset\b", tcphy_up_asm
@@ -1651,8 +1655,10 @@ def compiler_contract(compiler: Path) -> tuple[int, str]:
                 tcphy_resets[0] < common < pll < tcphy_resets[1] < waits[0] <
                 tcphy_resets[2] < waits[1] < calibrate < power_state,
                 "emitted TCPHY config/reset/readiness order drifted")
+        # The host link-training procedures follow RockCdnVideoMode in
+        # cdn_dp.pbi; their own register writes are not the video mode.
         video_asm = asm.split("rockcdnvideomode:", 1)[1].split(
-            "rock_dptx_firmware:", 1)[0]
+            "rockcdndpcdreadbytes:", 1)[0]
         reg_writes = [match.start() for match in re.finditer(
             r"\bbl\s+rockcdnregwrite\b", video_asm
         )]

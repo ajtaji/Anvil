@@ -4,6 +4,16 @@
 
 XIncludeFile "RockPi4C/Lib/display_common.pbi"
 
+; The host-trained native attempt must never cost the picture the firmware
+; path already gave. RockDisplayUp runs RockDisplayUpAttempt(1) first: host
+; link training (per-rate PHY) and the EDID preferred mode. If that attempt
+; fails at or after link training, the whole cold chain runs once more as
+; RockDisplayUpAttempt(0), the pre-host-training path: firmware training on
+; the cold RBR PHY and the EDID established 1024x768@60 mode.
+Global rock_display_link_reached.i
+Global rock_display_native_error.i
+Global rock_display_fallback_used.i
+
 Procedure RockDisplayEdidTelemetry()
   Protected block.i
   Protected offset.i
@@ -487,17 +497,47 @@ Procedure RockDisplayDpcdTelemetry()
   EndIf
 EndProcedure
 
-Procedure.i RockDisplayUp()
+Procedure RockDisplayTrainTelemetry()
+  ; Which training owned the link, at what rate and lanes, and the software
+  ; path's last step when it had to fall back to the firmware.
+  If rock_uart_ready <> 0
+    If rock_cdn_use_fw_training=0
+      RockUartText("DP LINK SW-TRAINED RATE ")
+    Else
+      RockUartText("DP LINK FW-TRAINED RATE ")
+    EndIf
+    RockDisplayHexByte(rock_cdn_link_rate)
+    RockUartText(" LANES ")
+    RockDisplayHexByte(rock_cdn_link_lanes)
+    RockUartText(" LEVELS ")
+    RockDisplayHexByte(rock_cdn_sw_train_swing)
+    RockUartText(" SWSTEP ")
+    RockDisplayHexByte(rock_cdn_sw_train_error)
+    RockUartText(" SWRATE ")
+    RockDisplayHexByte(rock_cdn_sw_train_rate)
+    RockUartText(" PHY ")
+    RockDisplayHexLong(RockTcRead(#TCPHY_DP_CLK_CTL))
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+EndProcedure
+
+Procedure.i RockDisplayUpAttempt(native.i)
   Protected prepared.i
   Protected configured.i
   Protected modeFailure.i
   Protected linkLaneMask.i
+  Protected trained.i
+  ; The VOP layer defaults to VOPL, but an HDMI attempt earlier in the same
+  ; boot selects VOPB. MiniDP is VOPL -> CDN DP; own the selection here.
+  RockVopSelectMiniDp()
   rock_display_ready=0
   rock_display_width=0
   rock_display_height=0
   rock_display_pitch=0
   rock_display_buffer=0
   rock_display_error=0
+  rock_display_link_reached=0
   RockDisplayStage("DP00 BEGIN COLD MINIDP")
   prepared = RockCruDisplayPrepare()
   RockDisplayDpPowerTelemetry()
@@ -564,14 +604,42 @@ Procedure.i RockDisplayUp()
   RockDisplayEdidTelemetry()
   RockDisplayEdidCapabilities()
   RockDisplayModeTelemetry("DP05 EDID MODE ")
-  If RockCdnTrain()=0
+  ; Everything from here on is what the fallback attempt exists to replace.
+  rock_display_link_reached=1
+  If native<>0
+    ; cdn_dp_train_link(): host training first (per-rate PHY PLL and lanes,
+    ; sink-requested swing/pre-emphasis), firmware training only as fallback.
+    trained=RockCdnTrainLink()
+  Else
+    ; The fallback: the established 1024x768@60 when the EDID lists it (else
+    ; the EDID mode, exactly as before), trained by the Cadence firmware on
+    ; the cold RBR PHY that RockTcPhyUp just set up. No host training step.
+    If RockModeFallback(@rock_cdn_edid[0],#ROCK_MODE_REASON_LINK_RATE)<>0
+      RockDisplayModeTelemetry("DP MODE FALLBACK ")
+    ElseIf RockModeSelect(@rock_cdn_edid[0])=0
+      RockDisplaySubsystemTelemetry("DPE9 MODE REJECTION REASON ",rock_mode_reason)
+      ProcedureReturn RockDisplayFail(9,"DPE9 INVALID EDID OR NO SUPPORTED MODE")
+    EndIf
+    rock_cdn_sw_train_error=0
+    rock_cdn_sw_train_rate=0
+    rock_cdn_sw_train_swing=0
+    rock_cdn_use_fw_training=1
+    trained=RockCdnTrain()
+  EndIf
+  If trained=0
+    RockDisplayTrainTelemetry()
     RockDisplaySubsystemTelemetry("DPEB CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(11,"DPEB DISPLAYPORT LINK TRAIN")
   EndIf
+  RockDisplayTrainTelemetry()
   RockDisplayStage("DP07 LINK TRAINED")
-  If RockCdnVideoStatus(0)=0
-    RockDisplaySubsystemTelemetry("DPEC CDN ERR ",rock_cdn_error)
-    ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE")
+  ; SET_VIDEO idle/valid belong to the firmware-trained link only
+  ; (cdn_dp_encoder_enable: `if (dp->use_fw_training)`).
+  If rock_cdn_use_fw_training<>0
+    If RockCdnVideoStatus(0)=0
+      RockDisplaySubsystemTelemetry("DPEC CDN ERR ",rock_cdn_error)
+      ProcedureReturn RockDisplayFail(12,"DPEC VIDEO IDLE")
+    EndIf
   EndIf
   ; Admit the selected mode before any timing registers are programmed.
   ; The encoder's pure plan performs no mailbox writes on refusal.
@@ -610,9 +678,11 @@ Procedure.i RockDisplayUp()
     RockDisplaySubsystemTelemetry("DPED CDN ERR ",rock_cdn_error)
     ProcedureReturn RockDisplayFail(13,"Display setup failed with code 13; check the DisplayPort timing programming.")
   EndIf
-  If RockCdnVideoStatus(1)=0
-    RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
-    ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
+  If rock_cdn_use_fw_training<>0
+    If RockCdnVideoStatus(1)=0
+      RockDisplaySubsystemTelemetry("DPEE CDN ERR ",rock_cdn_error)
+      ProcedureReturn RockDisplayFail(14,"DPEE VIDEO VALID")
+    EndIf
   EndIf
   If RockVopConfigurePrimary()=0
     RockDisplaySubsystemTelemetry("DPEA VOP ERR ",rock_vop_error)
@@ -646,6 +716,43 @@ Procedure.i RockDisplayUp()
   rock_display_ready=1
   RockDisplayModeTelemetry("DP08 SCANOUT READY ")
   ProcedureReturn 1
+EndProcedure
+
+Procedure RockDisplayStopScanout()
+  ; A failed attempt may have left WIN0 fetching the framebuffer. Stop the
+  ; fetch and latch it before the cold retry holds the VOPL AXI/AHB/DCLK
+  ; resets, as the kernel disables the CRTC before touching its clocks.
+  RockVopSelectMiniDp()
+  If rock_vop_configured<>0
+    RockVopWrite(#VOP_WIN0_CTRL0,rock_vop_win0_ctrl0_pending & ~#VOP_WIN_ENABLE)
+    If RockVopLatchFrame()=0
+      RockDisplayStage("DP0F WIN0 STOP NOT LATCHED; COLD RESET FOLLOWS")
+    EndIf
+  EndIf
+  rock_vop_ready=0
+  rock_vop_prepared=0
+  rock_vop_configured=0
+EndProcedure
+
+Procedure.i RockDisplayUp()
+  rock_display_native_error=0
+  rock_display_fallback_used=0
+  If RockDisplayUpAttempt(1)<>0 : ProcedureReturn 1 : EndIf
+  ; A failure before link training (clocks, power, firmware, HPD, AUX, EDID)
+  ; is common to both paths; retrying it cannot help.
+  If rock_display_link_reached=0 : ProcedureReturn 0 : EndIf
+  rock_display_native_error=rock_display_error
+  rock_display_fallback_used=1
+  If rock_uart_ready<>0
+    RockUartText("DP0F NATIVE ATTEMPT FAILED CODE ")
+    RockDisplayHexByte(rock_display_native_error)
+    RockUartText("; COLD RETRY, FIRMWARE-TRAINED 1024X768")
+    RockUartByte(13)
+    RockUartByte(10)
+  EndIf
+  RockWatchdogPet()
+  RockDisplayStopScanout()
+  ProcedureReturn RockDisplayUpAttempt(0)
 EndProcedure
 
 Procedure.i RockDisplayBuffer()
