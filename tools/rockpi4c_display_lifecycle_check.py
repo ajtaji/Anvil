@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check display admission/commit order and emitted fail-stop control flow.
+"""Check display admission/commit order, emitted fail-stop control flow and the
+one cold 1024x768 fallback after a failed native (host-trained) attempt.
 
 The MMIO/mailbox owners are mocked, not the production facade. This proves
 ordering and failure propagation, not physical display timing or visibility.
@@ -10,23 +11,89 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-PHASES = [
+# One attempt of the cold-to-visible chain. RockDisplayUp runs it natively
+# (host link training), and after a failure at or past link training runs it
+# ONCE more from the CRU resets as the fallback: established 1024x768 mode,
+# firmware training on the cold PHY, SET_VIDEO idle/valid.
+COLD = [
     "rockcrudisplayprepare", "rockcrucadencerelease",
     "rockcdnfirmwareload", "rockcdnfirmwareactive", "rockcdnenableevents",
     "rocktcphyup", "rockcdnhotplug", "rockcdnhostcapabilities",
-    "rockcdndpcd", "rockcdnreadedid", "rockcdntrain", "video-idle",
-    "rockcdnplanvideo", "rockvopmodevalid", "rockcruvpllmode", "rockvoppreparemode",
-    "rockcdnvideomode", "video-valid", "rockvopconfigureprimary",
-    "rockvopstartprimary", "rockcdnreadlivelinkstatus",
-    "rockdisplayframetelemetry",
+    "rockcdndpcd", "rockcdnreadedid",
 ]
+COMMIT = [
+    "rockcdnplanvideo", "rockvopmodevalid", "rockcruvpllmode", "rockvoppreparemode",
+    "rockcdnvideomode",
+]
+PLANE = [
+    "rockvopconfigureprimary", "rockvopstartprimary", "rockcdnreadlivelinkstatus",
+]
+TRACED = set(COLD + COMMIT + PLANE) | {
+    "rockcdntrainlink", "rockcdntrain", "rockmodefallback", "rockmodeselect",
+    "rockdisplayframetelemetry", "rockdisplaystopscanout",
+}
+PHASES = COLD + ["rockcdntrainlink", "video-idle"] + COMMIT + ["video-valid"] + PLANE + [
+    "rockdisplayframetelemetry"]
+
+
+def expected_run(fail, native_fw, valid_link, mode_fallback_ok=True):
+    """The designed control flow: returns (trace, result, fallback_used)."""
+    counts = {}
+    trace = []
+
+    def call(phase):
+        counts[phase] = counts.get(phase, 0) + 1
+        trace.append(phase)
+        if phase == "rockmodefallback" and not mode_fallback_ok:
+            return False
+        return counts[phase] not in fail.get(phase, ())
+
+    def attempt(native):
+        for phase in COLD:
+            if not call(phase):
+                return False, False
+        if native:
+            if not call("rockcdntrainlink"):
+                return False, True
+            fw = native_fw
+        else:
+            if not call("rockmodefallback"):
+                if not call("rockmodeselect"):
+                    return False, True
+            if not call("rockcdntrain"):
+                return False, True
+            fw = True
+        if fw and not call("video-idle"):
+            return False, True
+        for phase in COMMIT:
+            if not call(phase):
+                return False, True
+        if fw and not call("video-valid"):
+            return False, True
+        for phase in PLANE:
+            if not call(phase):
+                return False, True
+        if not valid_link:
+            return False, True
+        if not call("rockdisplayframetelemetry"):
+            return False, True
+        return True, True
+
+    done, reached = attempt(True)
+    if done:
+        return trace, 1, 0
+    if not reached:
+        return trace, 0, 0
+    call("rockdisplaystopscanout")
+    done, _ = attempt(False)
+    return trace, int(done), 1
 
 
 def source_contract():
     display = (ROOT / "RockPi4C/Lib/display.pbi").read_text().lower()
     cdn = (ROOT / "RockPi4C/Lib/cdn_dp.pbi").read_text().lower()
     vop = (ROOT / "RockPi4C/Lib/vop.pbi").read_text().lower()
-    body = display.split("procedure.i rockdisplayup()", 1)[1].split("endprocedure", 1)[0]
+    body = display.split("procedure.i rockdisplayupattempt(native.i)", 1)[1].split("endprocedure", 1)[0]
     publication_clear = ["rock_display_ready=0", "rock_display_width=0",
                          "rock_display_height=0", "rock_display_pitch=0",
                          "rock_display_buffer=0"]
@@ -41,6 +108,14 @@ def source_contract():
     offsets = [body.index(token) for token in ordered]
     assert offsets == sorted(offsets), "CRTC/encoder/plane commit order differs"
     assert '"dp08 visible ' not in body, "software cannot certify physical visibility"
+    wrapper = display.split("procedure.i rockdisplayup()", 1)[1].split("endprocedure", 1)[0]
+    assert wrapper.count("rockdisplayupattempt(") == 2, "exactly one fallback attempt"
+    tokens = ("rockdisplayupattempt(1)", "rock_display_link_reached=0",
+              "rockdisplaystopscanout()", "rockdisplayupattempt(0)")
+    for token in tokens:
+        assert token in wrapper, f"RockDisplayUp is missing {token}"
+    marks = [wrapper.index(token) for token in tokens]
+    assert marks == sorted(marks), "native, link-stage test, WIN0 stop, fallback"
     plan = cdn.split("procedure.i rockcdnplanvideo()", 1)[1].split("endprocedure", 1)[0]
     for forbidden in ("rockcdnregwrite", "rockcdnsend", "rockcdnwrite", "pokel", "pokea"):
         assert forbidden not in plan, "mode admission must not write hardware"
@@ -75,15 +150,23 @@ def emitted_contract(image):
     blob = image.read_bytes()
     memory = {load + index: value for index, value in enumerate(blob)}
     passive = {"rockcdnwrite", "rockcdninternalclocks", "rocktimerwaitus"}
-    phase_names = set(PHASES) - {"video-idle", "video-valid"}
+    # RockDisplayLinkLaneMask is pure logic under test, not an MMIO owner.
+    # Mocking it with the other rockdisplay* telemetry returned 1 for every
+    # lane count, so the invalid-lane cases could never fail as asserted.
+    not_mocked = ("rockdisplayup", "rockdisplayupattempt", "rockdisplayfail",
+                  "rockdisplaylinklanemask")
+    cases = 0
 
-    def run(failure=None, bad_alignment=False, lanes=2, lane_status=None,
-            stale_publication=False):
+    def run(fail=None, bad_alignment=False, lanes=2, lane_status=None,
+            stale_publication=False, native_fw=0, mode_fallback_ok=True):
+        nonlocal cases
+        fail = fail or {}
         cpu = module.A64()
         cpu.memory.update(memory)
         for name, value in {"rock_mode_width": 1920, "rock_mode_height": 1080,
                             "rock_mode_pitch": 7680, "rock_cdn_error": 34,
-                            "rock_cdn_link_lanes": lanes}.items():
+                            "rock_cdn_link_lanes": lanes,
+                            "rock_cdn_use_fw_training": native_fw}.items():
             cpu.raw_store(symbols["global_" + name], value, 8)
         if stale_publication:
             for name, value in {"rock_display_ready": 1,
@@ -99,50 +182,90 @@ def emitted_contract(image):
         cpu.raw_store(status + 2, 0 if bad_alignment else 1, 1)
         cpu.sp, cpu.x[30] = 0x05000000, returned
         cpu.pc = load + symbols["rockdisplayup"]
+        counts = {}
         trace = []
-        for _ in range(100000):
+        for _ in range(200000):
             if cpu.pc == returned:
                 break
             name = names.get(cpu.pc, "")
             phase = name
             if name == "rockcdnvideostatus":
                 phase = "video-valid" if cpu.x[0] else "video-idle"
-            if phase in phase_names or phase in ("video-idle", "video-valid"):
+            if phase in TRACED or phase in ("video-idle", "video-valid"):
                 trace.append(phase)
-                cpu.x[0] = int(phase != failure)
+                counts[phase] = counts.get(phase, 0) + 1
+                ok = counts[phase] not in fail.get(phase, ())
+                if phase == "rockmodefallback" and not mode_fallback_ok:
+                    ok = False
+                cpu.x[0] = int(ok)
                 cpu.pc = cpu.x[30]
             elif name == "rockvopframebuffer":
                 cpu.x[0], cpu.pc = 0x02965000, cpu.x[30]
-            elif name in passive or (name.startswith("rockdisplay") and
-                    name not in ("rockdisplayup", "rockdisplayfail")) or name.startswith("rockuart"):
+            elif (name in passive or name.startswith("rockuart") or
+                  (name.startswith("rockdisplay") and name not in not_mocked)):
                 cpu.x[0], cpu.pc = 1, cpu.x[30]
             else:
                 cpu.step()
         else:
             raise AssertionError("display facade did not return")
+        valid_link = (lanes in (1, 2) and not bad_alignment and
+                      (lane_status & (0x07 if lanes == 1 else 0x77)) == (0x07 if lanes == 1 else 0x77))
+        want, result, fallback = expected_run(fail, native_fw, valid_link, mode_fallback_ok)
         ready = cpu.raw_load(symbols["global_rock_display_ready"], 8)
-        valid_link = lanes in (1, 2) and (lane_status & (0x07 if lanes == 1 else 0x77)) == (0x07 if lanes == 1 else 0x77)
-        if failure is None and not bad_alignment and valid_link:
-            assert cpu.x[0] == 1 and ready == 1 and trace == PHASES, trace
-        else:
-            assert cpu.x[0] == 0 and ready == 0, (failure, trace, ready)
-            expected = PHASES[:PHASES.index(failure) + 1] if failure else PHASES[:-1]
-            assert trace == expected, (failure, trace, expected)
+        used = cpu.raw_load(symbols["global_rock_display_fallback_used"], 8)
+        native_error = cpu.raw_load(symbols["global_rock_display_native_error"], 8)
+        assert trace == want, (fail, native_fw, lanes, lane_status, bad_alignment, valid_link, trace, want)
+        assert cpu.x[0] == result and ready == result, (fail, cpu.x[0], ready, result)
+        assert used == fallback, (fail, used, fallback)
+        assert (native_error != 0) == bool(fallback), (fail, native_error, fallback)
+        if fallback:
+            # WIN0 stops before the second cold prepare holds the VOPL resets.
+            second_prepare = [i for i, p in enumerate(trace) if p == "rockcrudisplayprepare"][1]
+            assert trace.index("rockdisplaystopscanout") < second_prepare
         if stale_publication:
             for name in ("rock_display_width", "rock_display_height",
                          "rock_display_pitch", "rock_display_buffer"):
                 assert cpu.raw_load(symbols["global_" + name], 8) == 0, name
+        cases += 1
+        return fallback, result
 
-    run()
-    run(lanes=1)
-    run(lanes=1, lane_status=0)
-    run(lanes=0)
-    run(lanes=3)
-    for failure in PHASES:
-        run(failure)
-    run(failure=PHASES[0], stale_publication=True)
-    run(bad_alignment=True)
-    print(f"Emitted lifecycle: 2/1-lane success, invalid lanes, {len(PHASES)} owner failures, failed re-entry and bad alignment passed")
+    # Native success, host-trained and firmware-trained (inside RockCdnTrainLink).
+    assert run() == (0, 1)
+    assert run(native_fw=1) == (0, 1)
+    assert run(lanes=1) == (0, 1)
+    # Every phase failing once: a cold failure stops; a link-stage failure is
+    # recovered by the fallback and ends with a picture.
+    recovered = 0
+    for native_fw in (0, 1):
+        for phase in PHASES:
+            if phase in ("video-idle", "video-valid") and not native_fw:
+                continue
+            fallback, result = run(fail={phase: {1}}, native_fw=native_fw)
+            if phase in COLD:
+                assert (fallback, result) == (0, 0), phase
+            else:
+                assert (fallback, result) == (1, 1), phase
+                recovered += 1
+    # A link-stage phase failing in BOTH attempts ends with no picture and no
+    # third attempt; a cold phase failing only in the fallback also stops.
+    for phase in COMMIT + PLANE + ["rockdisplayframetelemetry"]:
+        assert run(fail={phase: {1, 2}}) == (1, 0), phase
+    assert run(fail={"video-idle": {1, 2}}, native_fw=1) == (1, 0)
+    assert run(fail={"rockcdntrainlink": {1}, "rockcdntrain": {1}}) == (1, 0)
+    for phase in COLD:
+        assert run(fail={"rockcdnplanvideo": {1}, phase: {2}}) == (1, 0), phase
+    # The fallback keeps the EDID mode when 1024x768 is not advertised.
+    assert run(fail={"rockvopstartprimary": {1}}, mode_fallback_ok=False) == (1, 1)
+    assert run(fail={"rockvopstartprimary": {1}, "rockmodeselect": {1}},
+               mode_fallback_ok=False) == (1, 0)
+    # Link validation failures (lanes, alignment) fall back and fail again.
+    assert run(lanes=1, lane_status=0) == (1, 0)
+    assert run(lanes=0) == (1, 0)
+    assert run(lanes=3) == (1, 0)
+    assert run(bad_alignment=True) == (1, 0)
+    run(fail={COLD[0]: {1}}, stale_publication=True)
+    print(f"Emitted lifecycle: {cases} runs; {recovered} single link-stage failures recovered "
+          f"by the cold 1024x768 fallback; cold failures stop; double failures stop after one retry")
 
 
 def main():

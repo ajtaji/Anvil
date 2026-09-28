@@ -18,6 +18,7 @@ Global rock_recovery_discard.i
 Global rock_recovery_ready.i
 Global rock_recovery_error.i
 Global rock_recovery_hdmi_attempted.i
+Global rock_recovery_minidp_attempted.i
 Global rock_recovery_fatal_mode.i
 Global rock_recovery_payload_entry.i
 Global rock_recovery_payload_sp.i
@@ -103,6 +104,11 @@ EndProcedure
 Procedure.i RockRecoveryLineIsHdmi()
   If rock_recovery_length<>4 : ProcedureReturn 0 : EndIf
   ProcedureReturn Bool((PeekA(@rock_recovery_line[0]) & 255)=104 And (PeekA(@rock_recovery_line[0]+1) & 255)=100 And (PeekA(@rock_recovery_line[0]+2) & 255)=109 And (PeekA(@rock_recovery_line[0]+3) & 255)=105)
+EndProcedure
+
+Procedure.i RockRecoveryLineIsMiniDp()
+  If rock_recovery_length<>6 : ProcedureReturn 0 : EndIf
+  ProcedureReturn Bool((PeekA(@rock_recovery_line[0]) & 255)=109 And (PeekA(@rock_recovery_line[0]+1) & 255)=105 And (PeekA(@rock_recovery_line[0]+2) & 255)=110 And (PeekA(@rock_recovery_line[0]+3) & 255)=105 And (PeekA(@rock_recovery_line[0]+4) & 255)=100 And (PeekA(@rock_recovery_line[0]+5) & 255)=112)
 EndProcedure
 
 Procedure.i RockRecoveryLineIsGpuInfo()
@@ -278,6 +284,12 @@ Procedure RockRecoveryHdmi()
     RockUartLine("HDMI ALREADY ATTEMPTED; REBOOT TO RETRY")
     ProcedureReturn
   EndIf
+  ; One display per boot: HDMI and MiniDP share VPLL, the scanout buffer and
+  ; the selected-mode state. Never retune them under a live MiniDP picture.
+  If rock_recovery_minidp_attempted<>0
+    RockUartLine("HDMI REFUSED: MINIDP OWNS VPLL AND THE SCANOUT THIS BOOT; REBOOT FIRST")
+    ProcedureReturn
+  EndIf
   If RockWatchdogArm()=0
     RockUartLine("HDMI REFUSED: DEADMAN NOT ARMED")
     RockWatchdogTelemetry()
@@ -294,6 +306,40 @@ Procedure RockRecoveryHdmi()
     RockRecoveryHex64(rock_display_error)
     RockUartText(" STAGE=")
     RockRecoveryHex64(rock_display_stage)
+    RockUartByte(13)
+    RockUartByte(10)
+    RockUartLine("REBOOT BEFORE RETRY")
+  EndIf
+EndProcedure
+
+Procedure RockRecoveryMiniDp()
+  ; The VOPL -> Cadence DP -> TCPHY0 bring-up, one attempt per boot behind the
+  ; same deadman as `hdmi`. It refuses when HDMI got as far as the shared
+  ; VPLL this boot (HDMI auto-init with a monitor on the HDMI port): unplug
+  ; HDMI and reboot. An HDMI attempt that stopped at hot-plug left VPLL alone.
+  Protected ready.i
+  If rock_recovery_minidp_attempted<>0
+    RockUartLine("MINIDP ALREADY ATTEMPTED; REBOOT TO RETRY")
+    ProcedureReturn
+  EndIf
+  If rock_display_ready<>0 Or (rock_hdmi_attempted<>0 And rock_display_stage>=$D006)
+    RockUartLine("MINIDP REFUSED: HDMI OWNS VPLL AND THE SCANOUT THIS BOOT; UNPLUG HDMI AND REBOOT")
+    ProcedureReturn
+  EndIf
+  If RockWatchdogArm()=0
+    RockUartLine("MINIDP REFUSED: DEADMAN NOT ARMED")
+    RockWatchdogTelemetry()
+    ProcedureReturn
+  EndIf
+  RockWatchdogPet()
+  rock_recovery_minidp_attempted=1
+  RockUartLine("MINIDP INIT BEGIN; DEADMAN ARMED; UART OUTPUT SYNCHRONOUS")
+  ready=RockDisplayUp()
+  If ready<>0
+    RockUartLine("MINIDP INIT READY")
+  Else
+    RockUartText("MINIDP INIT FAILED ERROR=")
+    RockRecoveryHex64(rock_display_error)
     RockUartByte(13)
     RockUartByte(10)
     RockUartLine("REBOOT BEFORE RETRY")
@@ -349,7 +395,7 @@ Procedure RockRecoveryFinishLine()
     rock_recovery_length=0
     RockRecoveryReset()
   ElseIf RockRecoveryLineIsHelp()<>0
-    RockUartLine("COMMANDS: help hdmi payload gpuinfo fontatlas reboot storage sdmeta map read get write put writeproof trustupdate")
+    RockUartLine("COMMANDS: help hdmi minidp payload gpuinfo fontatlas reboot storage sdmeta map read get write put writeproof trustupdate")
     RockUartLine("FILES: sd emmc fs ls [path] stat <path> cat <path> load <path> receive <len> <crc> save <path>")
     RockUartLine("       mkdir <path> rm <path> rmdir <path> mv <old> <new>; quoted paths work")
   ElseIf RockRecoveryLineIsPayload()<>0
@@ -363,6 +409,12 @@ Procedure RockRecoveryFinishLine()
       RockUartLine("ERR HDMI DISABLED IN FATAL RECOVERY")
     Else
       RockRecoveryHdmi()
+    EndIf
+  ElseIf RockRecoveryLineIsMiniDp()<>0
+    If rock_recovery_fatal_mode<>0
+      RockUartLine("ERR MINIDP DISABLED IN FATAL RECOVERY")
+    Else
+      RockRecoveryMiniDp()
     EndIf
   ElseIf RockRecoveryLineIsGpuInfo()<>0
     If rock_recovery_fatal_mode<>0

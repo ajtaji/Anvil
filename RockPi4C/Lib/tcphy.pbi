@@ -3,6 +3,13 @@
 ; init-mode=DP plus init-ss=1: two DP lanes on physical lanes 2/3 and USB3 on
 ; 0/1, normal orientation. Values and ordering are from the pinned Radxa
 ; release-4.4-rockpi4 TCPHY driver; no eDP or HDMI register is substituted.
+;
+; Link rate belongs to the HOST. The shipped 4.4.154-110/-116 kernel (the
+; image that drove this connector at 1920x1080) trains the link in software:
+; cdn_dp_software_train_link() calls typec_dp_phy_config(), which re-programs
+; PLL1, the high-speed clock divider and every lane's PLL clock selection for
+; RBR, HBR and HBR2 (tcphy_dp_set_link_rate, tcphy_dp_cfg_lane). Cold setup
+; only establishes RBR. RockTcDpConfig below is that per-rate owner.
 
 #ROCK_TCPHY0 = $FF7C0000
 #TCPHY_CMN_PLL0_VCOCAL_INIT = $210
@@ -57,7 +64,26 @@
 #TCPHY_TX_ANA4 = $1409C
 #TCPHY_TX_ANA5 = $140A4
 
+#TCPHY_DP_RATE_RBR = 162000
+#TCPHY_DP_RATE_HBR = 270000
+#TCPHY_DP_RATE_HBR2 = 540000
+; PHY_DP_CLK_CTL (0xc009<<2) handshake bits, pinned phy-rockchip-typec.c.
+#TCPHY_DP_PLL_ENABLE = $0001
+#TCPHY_DP_PLL_READY = $0002
+#TCPHY_DP_PLL_CLOCK_ENABLE = $0004
+#TCPHY_DP_PLL_CLOCK_ACK = $0008
+#TCPHY_DP_POWER_A0 = 0
+#TCPHY_DP_POWER_A2 = 2
+#TCPHY_DP_POWER_A3 = 3
+; PHY_MODE_SET_TIMEOUT in the pinned driver: 100 ms, polled every 10 us.
+#TCPHY_DP_MODE_TIMEOUT_US = 100000
+
 Global rock_tcphy_error.i
+; tcphy->dp.link_rate / lane_count. Cold setup leaves RBR loaded and the lane
+; count unset (0), exactly like the zeroed driver state, so the first
+; RockTcDpConfig writes PHY_DP_MODE_CTL's lane-disable field itself.
+Global rock_tcphy_dp_rate.i
+Global rock_tcphy_dp_lanes.i
 
 Procedure RockTcStage(text.i)
   If rock_uart_ready <> 0 : RockUartLine(text) : EndIf
@@ -92,29 +118,61 @@ Procedure RockTcUsbPll()
   RockTcWrite(#TCPHY_PLL0_LF,8)
 EndProcedure
 
+; PLL1 tables. The values are the pinned 4.4 dp_pll_rbr_cfg/dp_pll_hbr_cfg/
+; dp_pll_hbr2_cfg, byte-identical to the 5.10.110-6 binary's *_ssc_cfg tables
+; (ffff800010e35d58, ffff800010e35cc0, ffff800010e35af8). HBR and HBR2 share
+; one VCO; only the clock-select fields around them differ.
+Procedure RockTcDpPllLoad(rate.i)
+  If rate = #TCPHY_DP_RATE_RBR
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_INIT,$F0)
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_ITER,$18)
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_START,$30B9)
+    RockTcWrite(#TCPHY_CMN_PLL1_INTDIV,$86)
+    RockTcWrite(#TCPHY_CMN_PLL1_FRACDIV,$F915)
+    RockTcWrite(#TCPHY_CMN_PLL1_HIGH_THR,$22)
+    RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL1,$140)
+    RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL2,$7F03)
+    RockTcWrite(#TCPHY_CMN_PLL1_DSM_DIAG,$20)
+    RockTcWrite(#TCPHY_CMN_PLLSM1_USER,0)
+    RockTcWrite(#TCPHY_PLL1_OVRD,0)
+    RockTcWrite(#TCPHY_PLL1_FBH,0)
+    RockTcWrite(#TCPHY_PLL1_FBL,0)
+    RockTcWrite(#TCPHY_PLL1_V2I,6)
+    RockTcWrite(#TCPHY_PLL1_CP,$45)
+    RockTcWrite(#TCPHY_PLL1_LF,8)
+    RockTcWrite(#TCPHY_PLL1_PTAT1,$100)
+    RockTcWrite(#TCPHY_PLL1_PTAT2,7)
+    RockTcWrite(#TCPHY_PLL1_INCLK,1)
+  Else
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_INIT,$F0)
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_ITER,$18)
+    RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_START,$30B4)
+    RockTcWrite(#TCPHY_CMN_PLL1_INTDIV,$E0)
+    RockTcWrite(#TCPHY_CMN_PLL1_FRACDIV,$F479)
+    RockTcWrite(#TCPHY_CMN_PLL1_HIGH_THR,$38)
+    RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL1,$204)
+    RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL2,$7F03)
+    RockTcWrite(#TCPHY_CMN_PLL1_DSM_DIAG,$20)
+    RockTcWrite(#TCPHY_CMN_PLLSM1_USER,$1000)
+    RockTcWrite(#TCPHY_PLL1_OVRD,0)
+    RockTcWrite(#TCPHY_PLL1_FBH,0)
+    RockTcWrite(#TCPHY_PLL1_FBL,0)
+    RockTcWrite(#TCPHY_PLL1_V2I,7)
+    RockTcWrite(#TCPHY_PLL1_CP,$45)
+    RockTcWrite(#TCPHY_PLL1_LF,8)
+    RockTcWrite(#TCPHY_PLL1_PTAT1,1)
+    RockTcWrite(#TCPHY_PLL1_PTAT2,1)
+    RockTcWrite(#TCPHY_PLL1_INCLK,1)
+  EndIf
+EndProcedure
+
+; tcphy_cfg_dp_pll(tcphy, DP_DEFAULT_RATE): cold RBR, clocks enabled.
 Procedure RockTcDpRbrPll()
   Protected value.i = RockTcRead(#TCPHY_HSCLK_SEL)
   RockTcWrite(#TCPHY_DP_CLK_CTL,$2405)
   RockTcWrite(#TCPHY_HSCLK_SEL,(value & $FFFFFFCC) | $30)
-  RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_INIT,$F0)
-  RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_ITER,$18)
-  RockTcWrite(#TCPHY_CMN_PLL1_VCOCAL_START,$30B9)
-  RockTcWrite(#TCPHY_CMN_PLL1_INTDIV,$86)
-  RockTcWrite(#TCPHY_CMN_PLL1_FRACDIV,$F915)
-  RockTcWrite(#TCPHY_CMN_PLL1_HIGH_THR,$22)
-  RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL1,$140)
-  RockTcWrite(#TCPHY_CMN_PLL1_SS_CTRL2,$7F03)
-  RockTcWrite(#TCPHY_CMN_PLL1_DSM_DIAG,$20)
-  RockTcWrite(#TCPHY_CMN_PLLSM1_USER,0)
-  RockTcWrite(#TCPHY_PLL1_OVRD,0)
-  RockTcWrite(#TCPHY_PLL1_FBH,0)
-  RockTcWrite(#TCPHY_PLL1_FBL,0)
-  RockTcWrite(#TCPHY_PLL1_V2I,6)
-  RockTcWrite(#TCPHY_PLL1_CP,$45)
-  RockTcWrite(#TCPHY_PLL1_LF,8)
-  RockTcWrite(#TCPHY_PLL1_PTAT1,$100)
-  RockTcWrite(#TCPHY_PLL1_PTAT2,7)
-  RockTcWrite(#TCPHY_PLL1_INCLK,1)
+  RockTcDpPllLoad(#TCPHY_DP_RATE_RBR)
+  rock_tcphy_dp_rate=#TCPHY_DP_RATE_RBR
 EndProcedure
 
 Procedure RockTcCommon24M()
@@ -152,7 +210,11 @@ Procedure RockTcUsbRxLane(lane.i)
   RockTcWrite(RockTcLaneOffset($40E8,lane),$FB)
 EndProcedure
 
-Procedure RockTcDpLane(lane.i, swing.i, emphasis.i)
+; tcphy_dp_cfg_lane(tcphy, link_rate, swing, pre_emp, lane). Swing and
+; pre-emphasis come from tcphy_default_config[3][4] (5.10 ffff800010e35ef8);
+; the missing combinations are zero there too. XCVR_DIAG_PLLDRC_CTRL[14:12]
+; selects the lane's PLL clock: 5 at HBR2 (PLL1 divide-by-1), 6 below it.
+Procedure RockTcDpLane(lane.i, rate.i, swing.i, emphasis.i)
   Protected value.i
   Protected magnitude.i
   Protected post.i
@@ -176,7 +238,7 @@ Procedure RockTcDpLane(lane.i, swing.i, emphasis.i)
   RockTcWrite(RockTcLaneOffset($4103,lane),$98)
   RockTcWrite(RockTcLaneOffset($4050,lane),magnitude)
   RockTcWrite(RockTcLaneOffset($404C,lane),post)
-  If swing = 2 And emphasis = 0
+  If swing = 2 And emphasis = 0 And rate <> #TCPHY_DP_RATE_HBR2
     RockTcWrite(RockTcLaneOffset($41E1,lane),$700)
     RockTcWrite(RockTcLaneOffset($4047,lane),$13C)
   Else
@@ -184,7 +246,11 @@ Procedure RockTcDpLane(lane.i, swing.i, emphasis.i)
     RockTcWrite(RockTcLaneOffset($41E1,lane),$400)
   EndIf
   value = RockTcRead(RockTcLaneOffset($40E0,lane))
-  RockTcWrite(RockTcLaneOffset($40E0,lane),(value & $8FFF) | $6000)
+  If rate = #TCPHY_DP_RATE_HBR2
+    RockTcWrite(RockTcLaneOffset($40E0,lane),(value & $8FFF) | $5000)
+  Else
+    RockTcWrite(RockTcLaneOffset($40E0,lane),(value & $8FFF) | $6000)
+  EndIf
 EndProcedure
 
 Procedure.i RockTcSigned8(value.i)
@@ -295,8 +361,9 @@ Procedure.i RockTcPhyUp()
   RockTcDpRbrPll()
   RockTcUsbTxLane(0)
   RockTcUsbRxLane(1)
-  RockTcDpLane(2,0,0)
-  RockTcDpLane(3,0,0)
+  RockTcDpLane(2,#TCPHY_DP_RATE_RBR,0,0)
+  RockTcDpLane(3,#TCPHY_DP_RATE_RBR,0,0)
+  rock_tcphy_dp_lanes=0
   RockTcStage("TP05 TCPHY CONFIG WRITTEN")
   value = RockTcRead(#TCPHY_DP_MODE_CTL)
   RockTcWrite(#TCPHY_DP_MODE_CTL,(value & $FFFFFFF0) | $104)
@@ -317,5 +384,88 @@ Procedure.i RockTcPhyUp()
   value = RockTcRead(#TCPHY_DP_MODE_CTL) | $F000
   value = value & $FFFFCFFF
   RockTcWrite(#TCPHY_DP_MODE_CTL,value)
+  ProcedureReturn 1
+EndProcedure
+
+; readl_poll_timeout(PHY_DP_CLK_CTL, ...) with the driver's 10 us step and
+; 100 ms ceiling. Returns 1 when (value & mask) = wanted.
+Procedure.i RockTcDpClkWait(mask.i, wanted.i, errorCode.i)
+  If RockTcWaitMask(#TCPHY_DP_CLK_CTL,mask,wanted,#TCPHY_DP_MODE_TIMEOUT_US,10)=0
+    rock_tcphy_error=errorCode
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; tcphy_dp_set_lane_count(): disable and power down every DP lane the link
+; does not use. PHY_DP_MODE_CTL[15:12] are the DP lane-disable bits.
+Procedure.i RockTcDpSetLaneCount(lanes.i)
+  Protected value.i = RockTcRead(#TCPHY_DP_MODE_CTL) | $F000
+  Select lanes
+    Case 4 : value = value & $FFFF0FFF
+    Case 2 : value = value & $FFFFCFFF
+    Case 1 : value = value & $FFFFEFFF
+    Default
+      rock_tcphy_error=48
+      ProcedureReturn 0
+  EndSelect
+  RockTcWrite(#TCPHY_DP_MODE_CTL,value)
+  rock_tcphy_dp_lanes=lanes
+  ProcedureReturn 1
+EndProcedure
+
+; tcphy_dp_set_link_rate(): A3, gate the PLL clocks, stop PLL1, select the
+; rate's dividers and PLL table, restart, ungate, then A2 and A0. The PMA must
+; pass through A2 on every data-rate change.
+Procedure.i RockTcDpSetLinkRate(rate.i)
+  Protected value.i
+  Protected hsclk.i
+  Protected clkctl.i
+  If rate <> #TCPHY_DP_RATE_RBR And rate <> #TCPHY_DP_RATE_HBR And rate <> #TCPHY_DP_RATE_HBR2
+    rock_tcphy_error=49
+    ProcedureReturn 0
+  EndIf
+  If RockTcPowerState(#TCPHY_DP_POWER_A3)=0 : ProcedureReturn 0 : EndIf
+  value = RockTcRead(#TCPHY_DP_CLK_CTL) & ~#TCPHY_DP_PLL_CLOCK_ENABLE
+  RockTcWrite(#TCPHY_DP_CLK_CTL,value)
+  If RockTcDpClkWait(#TCPHY_DP_PLL_CLOCK_ACK,0,50)=0 : ProcedureReturn 0 : EndIf
+  value = RockTcRead(#TCPHY_DP_CLK_CTL) & ~#TCPHY_DP_PLL_ENABLE
+  RockTcWrite(#TCPHY_DP_CLK_CTL,value)
+  If RockTcDpClkWait(#TCPHY_DP_PLL_READY,0,51)=0 : ProcedureReturn 0 : EndIf
+  hsclk = RockTcRead(#TCPHY_HSCLK_SEL) & ~$33
+  clkctl = RockTcRead(#TCPHY_DP_CLK_CTL) & ~$FF00
+  If rate = #TCPHY_DP_RATE_HBR2
+    hsclk = hsclk | $20
+    clkctl = clkctl | $1200
+  Else
+    hsclk = hsclk | $30
+    clkctl = clkctl | $2400
+  EndIf
+  RockTcWrite(#TCPHY_HSCLK_SEL,hsclk)
+  RockTcWrite(#TCPHY_DP_CLK_CTL,clkctl)
+  RockTcDpPllLoad(rate)
+  value = RockTcRead(#TCPHY_DP_CLK_CTL) | #TCPHY_DP_PLL_ENABLE
+  RockTcWrite(#TCPHY_DP_CLK_CTL,value)
+  If RockTcDpClkWait(#TCPHY_DP_PLL_READY,#TCPHY_DP_PLL_READY,52)=0 : ProcedureReturn 0 : EndIf
+  value = RockTcRead(#TCPHY_DP_CLK_CTL) | #TCPHY_DP_PLL_CLOCK_ENABLE
+  RockTcWrite(#TCPHY_DP_CLK_CTL,value)
+  If RockTcDpClkWait(#TCPHY_DP_PLL_CLOCK_ACK,#TCPHY_DP_PLL_CLOCK_ACK,53)=0 : ProcedureReturn 0 : EndIf
+  If RockTcPowerState(#TCPHY_DP_POWER_A2)=0 : ProcedureReturn 0 : EndIf
+  If RockTcPowerState(#TCPHY_DP_POWER_A0)=0 : ProcedureReturn 0 : EndIf
+  rock_tcphy_dp_rate=rate
+  ProcedureReturn 1
+EndProcedure
+
+; typec_dp_phy_config(phy, link_rate, lane_count, swing, pre_emp) for the
+; split USB3+DP mode with normal orientation: DP lanes are PHY lanes 2 and 3.
+Procedure.i RockTcDpConfig(rate.i, lanes.i, swing.i, emphasis.i)
+  If lanes <> rock_tcphy_dp_lanes
+    If RockTcDpSetLaneCount(lanes)=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  If rate <> rock_tcphy_dp_rate
+    If RockTcDpSetLinkRate(rate)=0 : ProcedureReturn 0 : EndIf
+  EndIf
+  RockTcDpLane(2,rate,swing & 3,emphasis & 3)
+  RockTcDpLane(3,rate,swing & 3,emphasis & 3)
   ProcedureReturn 1
 EndProcedure

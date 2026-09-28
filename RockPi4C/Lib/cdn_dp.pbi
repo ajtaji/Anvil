@@ -19,6 +19,7 @@
 #CDN_VER_LIB_L = $0024
 #CDN_VER_LIB_H = $0028
 #CDN_SW_CLK_H = $0040
+#CDN_SOURCE_HDTX_CAR = $0900
 #CDN_APB_INT_MASK = $006C
 #CDN_SOURCE_DPTX_CAR = $0904
 #CDN_SOURCE_PHY_CAR = $0908
@@ -29,6 +30,8 @@
 #CDN_BND_HSYNC2VSYNC = $0B00
 #CDN_HSYNC2VSYNC_STATUS = $0B0C
 #CDN_HSYNC2VSYNC_POL_CTRL = $0B10
+#CDN_TX_PHY_CONFIG = $2000
+#CDN_FRAMER_GLOBAL_CONFIG = $2200
 #CDN_FRAMER_TU = $2208
 #CDN_FRAMER_PXL_REPR = $220C
 #CDN_FRAMER_SP = $2210
@@ -50,6 +53,8 @@
 #CDN_HORIZONTAL = $22B0
 #CDN_VERTICAL_0 = $22B4
 #CDN_VERTICAL_1 = $22B8
+#CDN_LANE_EN = $2300
+#CDN_ENHNCD = $2304
 #CDN_AUX_SWAP_INVERSION = $280C
 #CDN_SOURCE_PIF_STATUS = $30820
 #CDN_IMEM = $10000
@@ -61,6 +66,7 @@
 #CDN_SET_HOST_CAP = 1
 #CDN_GET_EDID = 2
 #CDN_READ_DPCD = 3
+#CDN_WRITE_DPCD = 4
 #CDN_ENABLE_EVENT = 5
 #CDN_WRITE_REGISTER = 6
 #CDN_READ_REGISTER = 7
@@ -94,6 +100,18 @@ Global rock_cdn_error.i
 Global rock_cdn_firmware_version.i
 Global rock_cdn_link_rate.i
 Global rock_cdn_link_lanes.i
+; 1 when the link came from the Cadence firmware's own training (the shipped
+; driver's fallback), 0 when the host trained it. Only the firmware path owns
+; the SET_VIDEO idle/valid mailbox commands (cdn_dp_encoder_enable).
+Global rock_cdn_use_fw_training.i
+Global rock_cdn_sw_train_error.i
+Global rock_cdn_sw_train_rate.i
+Global rock_cdn_sw_train_swing.i
+; Receiver capability 0000h..000Eh as read by cdn_dp_software_train_link,
+; the per-lane TRAINING_LANEx_SET image, and the outgoing AUX write payload.
+Global Dim rock_cdn_dpcd.a[15]
+Global Dim rock_cdn_train_set.a[4]
+Global Dim rock_cdn_dpcd_out.a[31]
 ; Firmware-owned source registers are written through the mailbox and are not
 ; CPU-readable on this handoff. Retain the successfully acknowledged values
 ; needed for diagnostics instead of probing that protected MMIO window.
@@ -632,6 +650,348 @@ Procedure.i RockCdnVideoMode()
   If RockCdnRegWrite(#CDN_VERTICAL_0,rock_mode_height | ((rock_mode_vtotal-rock_mode_vsync_start) << 16)) = 0 : ProcedureReturn 0 : EndIf
   If RockCdnRegWrite(#CDN_VERTICAL_1,rock_mode_vtotal) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn RockCdnRegField(#CDN_VB_ID,2,1,0)
+EndProcedure
+
+; ---------------------------------------------------------------------------
+; Host (software) link training.
+;
+; This is the path the shipped ROCK Pi 4C kernel takes FIRST. Decompiled from
+; linux-image-4.4.154-116 (cdn_dp_train_link ffffff8008698548,
+; cdn_dp_software_train_link ffffff8008699aa8 and its helpers; the 110 build
+; that shipped in the 2020 image has the same cdn-dp sources). The firmware
+; training that Anvil used alone is only that driver's fallback: its own
+; comment says the firmware "uses fixed phy config values", and it never
+; re-programs the Type-C PHY PLL for HBR/HBR2 from the host side.
+; ---------------------------------------------------------------------------
+
+; cdn_dp_dpcd_read + cdn_dp_get_aux_status, retried on AUX DEFER the way
+; drm_dp_dpcd_access retries (32 attempts).
+Procedure.i RockCdnDpcdReadBytes(address.i, count.i, destination.i)
+  Protected attempt.i
+  Protected aux.i
+  Protected index.i
+  If count < 1 Or count > 16 : rock_cdn_error=44 : ProcedureReturn 0 : EndIf
+  For attempt=0 To 31
+    PokeA(@rock_cdn_message[0],0)
+    PokeA(@rock_cdn_message[0]+1,count)
+    PokeA(@rock_cdn_message[0]+2,(address >> 16) & 255)
+    PokeA(@rock_cdn_message[0]+3,(address >> 8) & 255)
+    PokeA(@rock_cdn_message[0]+4,address & 255)
+    If RockCdnSend(#CDN_MB_DP_TX,#CDN_READ_DPCD,5,@rock_cdn_message[0])=0 : ProcedureReturn 0 : EndIf
+    If RockCdnReceive(#CDN_MB_DP_TX,#CDN_READ_DPCD,5+count,@rock_cdn_message[128])=0 : ProcedureReturn 0 : EndIf
+    aux=RockCdnLastAuxStatus()
+    If aux < 0 : ProcedureReturn 0 : EndIf
+    rock_cdn_aux_status=aux
+    Select aux
+      Case #CDN_AUX_ACK
+        For index=0 To count-1
+          PokeA(destination+index,PeekA(@rock_cdn_message[128]+5+index) & 255)
+        Next
+        ProcedureReturn 1
+      Case #CDN_AUX_DEFER
+        RockTimerWaitUs(500)
+      Case #CDN_AUX_NACK
+        rock_cdn_error=37 : ProcedureReturn 0
+      Case #CDN_AUX_SINK_ERROR
+        rock_cdn_error=38 : ProcedureReturn 0
+      Case #CDN_AUX_BUS_ERROR
+        rock_cdn_error=39 : ProcedureReturn 0
+      Default
+        rock_cdn_error=40 : ProcedureReturn 0
+    EndSelect
+  Next
+  rock_cdn_error=41
+  ProcedureReturn 0
+EndProcedure
+
+; cdn_dp_dpcd_write (DPTX_WRITE_DPCD, echo of length and address checked)
+; followed by the AUX status, as cdn_dp_aux_transfer does.
+Procedure.i RockCdnDpcdWriteBytes(address.i, count.i, source.i)
+  Protected attempt.i
+  Protected aux.i
+  Protected index.i
+  Protected echoed.i
+  If count < 1 Or count > 20 : rock_cdn_error=44 : ProcedureReturn 0 : EndIf
+  For attempt=0 To 31
+    PokeA(@rock_cdn_message[0],0)
+    PokeA(@rock_cdn_message[0]+1,count)
+    PokeA(@rock_cdn_message[0]+2,(address >> 16) & 255)
+    PokeA(@rock_cdn_message[0]+3,(address >> 8) & 255)
+    PokeA(@rock_cdn_message[0]+4,address & 255)
+    For index=0 To count-1
+      PokeA(@rock_cdn_message[0]+5+index,PeekA(source+index) & 255)
+    Next
+    If RockCdnSend(#CDN_MB_DP_TX,#CDN_WRITE_DPCD,5+count,@rock_cdn_message[0])=0 : ProcedureReturn 0 : EndIf
+    If RockCdnReceive(#CDN_MB_DP_TX,#CDN_WRITE_DPCD,5,@rock_cdn_message[128])=0 : ProcedureReturn 0 : EndIf
+    echoed=((PeekA(@rock_cdn_message[128]) & 255) << 8) | (PeekA(@rock_cdn_message[128]+1) & 255)
+    If echoed <> count : rock_cdn_error=45 : ProcedureReturn 0 : EndIf
+    echoed=((PeekA(@rock_cdn_message[128]+2) & 255) << 16) | ((PeekA(@rock_cdn_message[128]+3) & 255) << 8) | (PeekA(@rock_cdn_message[128]+4) & 255)
+    If echoed <> address : rock_cdn_error=45 : ProcedureReturn 0 : EndIf
+    aux=RockCdnLastAuxStatus()
+    If aux < 0 : ProcedureReturn 0 : EndIf
+    rock_cdn_aux_status=aux
+    Select aux
+      Case #CDN_AUX_ACK
+        ProcedureReturn 1
+      Case #CDN_AUX_DEFER
+        RockTimerWaitUs(500)
+      Case #CDN_AUX_NACK
+        rock_cdn_error=37 : ProcedureReturn 0
+      Case #CDN_AUX_SINK_ERROR
+        rock_cdn_error=38 : ProcedureReturn 0
+      Case #CDN_AUX_BUS_ERROR
+        rock_cdn_error=39 : ProcedureReturn 0
+      Default
+        rock_cdn_error=40 : ProcedureReturn 0
+    EndSelect
+  Next
+  rock_cdn_error=41
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i RockCdnRateKHz(code.i)
+  ; drm_dp_bw_code_to_link_rate(): code * 27000 kHz.
+  ProcedureReturn code*27000
+EndProcedure
+
+; drm_dp_clock_recovery_ok / drm_dp_channel_eq_ok over DPCD 0202h..0207h as
+; read into rock_cdn_live_link_status[0..5].
+Procedure.i RockCdnLaneStatus(lane.i)
+  ProcedureReturn (rock_cdn_live_link_status[lane >> 1] >> ((lane & 1)*4)) & 15
+EndProcedure
+
+Procedure.i RockCdnClockRecoveryOk(lanes.i)
+  Protected lane.i
+  For lane=0 To lanes-1
+    If (RockCdnLaneStatus(lane) & 1)=0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i RockCdnChannelEqOk(lanes.i)
+  Protected lane.i
+  If (rock_cdn_live_link_status[2] & 1)=0 : ProcedureReturn 0 : EndIf
+  For lane=0 To lanes-1
+    If (RockCdnLaneStatus(lane) & 7)<>7 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; drm_dp_link_train_clock_recovery_delay / _channel_eq_delay exactly as the
+; 4.4 binary: the raw TRAINING_AUX_RD_INTERVAL byte (000Eh) times 4 ms, or
+; 100 us / 400 us when it is zero. Feed the deadman around each wait.
+Procedure RockCdnTrainDelay(equalization.i)
+  Protected interval.i = rock_cdn_dpcd[14] & 255
+  RockWatchdogPet()
+  If interval=0
+    If equalization<>0 : RockTimerWaitUs(400) : Else : RockTimerWaitUs(100) : EndIf
+  Else
+    RockTimerWaitUs(interval*4000)
+  EndIf
+  RockWatchdogPet()
+EndProcedure
+
+; cdn_dp_set_pattern(): DP_FRAMER_GLOBAL_CONFIG, DP_TX_PHY_CONFIG_REG,
+; DPTX_LANE_EN and DPTX_ENHNCD, with the binary's exact values.
+Procedure.i RockCdnSetPattern(pattern.i)
+  Protected framer.i = ((rock_cdn_link_lanes-1) & 3) | $C8
+  Protected phy.i = $D1000
+  Protected enhanced.i = 0
+  If (pattern & 3)<>0
+    framer = framer | $20
+    phy = phy | $21 | ((pattern & 3) << 1)
+  EndIf
+  If RockCdnRegWrite(#CDN_FRAMER_GLOBAL_CONFIG,framer)=0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_TX_PHY_CONFIG,phy)=0 : ProcedureReturn 0 : EndIf
+  If RockCdnRegWrite(#CDN_LANE_EN,(1 << rock_cdn_link_lanes)-1)=0 : ProcedureReturn 0 : EndIf
+  If (rock_cdn_dpcd[0] & 255) > $10 And (rock_cdn_dpcd[2] & $80)<>0 : enhanced=1 : EndIf
+  ProcedureReturn RockCdnRegWrite(#CDN_ENHNCD,enhanced)
+EndProcedure
+
+; cdn_dp_set_link_train(): TRAINING_PATTERN_SET (0102h), followed by the
+; per-lane TRAINING_LANEx_SET bytes when a pattern is active.
+Procedure.i RockCdnSetLinkTrain(pattern.i)
+  Protected lane.i
+  Protected count.i = 1
+  rock_cdn_dpcd_out[0]=pattern & 255
+  If (pattern & 3)<>0
+    For lane=0 To rock_cdn_link_lanes-1
+      rock_cdn_dpcd_out[1+lane]=rock_cdn_train_set[lane]
+    Next
+    count=rock_cdn_link_lanes+1
+  EndIf
+  ProcedureReturn RockCdnDpcdWriteBytes($102,count,@rock_cdn_dpcd_out[0])
+EndProcedure
+
+; cdn_dp_set_signal_levels(): typec_dp_phy_config(rate, lanes, swing,
+; pre-emphasis) from TRAINING_LANE0_SET.
+Procedure.i RockCdnSetSignalLevels()
+  Protected set.i = rock_cdn_train_set[0] & 255
+  rock_cdn_sw_train_swing=set
+  If RockTcDpConfig(RockCdnRateKHz(rock_cdn_link_rate),rock_cdn_link_lanes,set & 3,(set >> 3) & 3)=0
+    rock_cdn_error=46
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; cdn_dp_update_link_train(): drive the new levels, then TRAINING_LANEx_SET.
+Procedure.i RockCdnUpdateLinkTrain()
+  Protected lane.i
+  If RockCdnSetSignalLevels()=0 : ProcedureReturn 0 : EndIf
+  For lane=0 To rock_cdn_link_lanes-1
+    rock_cdn_dpcd_out[lane]=rock_cdn_train_set[lane]
+  Next
+  ProcedureReturn RockCdnDpcdWriteBytes($103,rock_cdn_link_lanes,@rock_cdn_dpcd_out[0])
+EndProcedure
+
+; cdn_dp_get_adjust_train(): the highest request of any lane, voltage capped
+; at level 2 with MAX_SWING_REACHED, pre-emphasis capped by the level-2/1/0
+; limits 18h/10h/08h (ffffff8008d53424) with MAX_PRE_EMPHASIS_REACHED.
+Procedure RockCdnGetAdjustTrain()
+  Protected lane.i
+  Protected request.i
+  Protected voltage.i = 0
+  Protected emphasis.i = 0
+  Protected value.i
+  Protected limit.i
+  For lane=0 To rock_cdn_link_lanes-1
+    request=rock_cdn_live_link_status[4+(lane >> 1)] >> ((lane & 1)*4)
+    value=request & 3
+    If value >= voltage : voltage=value : EndIf
+    value=((request >> 2) & 3) << 3
+    If value >= emphasis : emphasis=value : EndIf
+  Next
+  If voltage >= 2 : voltage=6 : EndIf
+  Select voltage & 3
+    Case 0 : limit=$18
+    Case 1 : limit=$10
+    Case 2 : limit=$08
+    Default : limit=0
+  EndSelect
+  If emphasis >= limit : emphasis=limit | $20 : EndIf
+  For lane=0 To rock_cdn_link_lanes-1
+    rock_cdn_train_set[lane]=voltage | emphasis
+  Next
+EndProcedure
+
+Procedure.i RockCdnAllLanesMaxSwing()
+  Protected lane.i
+  For lane=0 To rock_cdn_link_lanes-1
+    If (rock_cdn_train_set[lane] & 4)=0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Clock recovery then channel equalization for the current rate/lane count.
+; Returns 1 on a trained link, 0 on a failure that may retry at a lower rate.
+Procedure.i RockCdnSoftwareTrainRate()
+  Protected tries.i
+  Protected maxSwing.i
+  Protected oldVoltage.i
+  Protected pattern.i
+  Protected lane.i
+  For lane=0 To 3 : rock_cdn_train_set[lane]=0 : Next
+  If RockCdnSetSignalLevels()=0 : rock_cdn_sw_train_error=1 : ProcedureReturn 0 : EndIf
+  If RockCdnSetPattern($21)=0 : rock_cdn_sw_train_error=2 : ProcedureReturn 0 : EndIf
+  If RockCdnSetLinkTrain($21)=0 : rock_cdn_sw_train_error=3 : ProcedureReturn 0 : EndIf
+  tries=1
+  maxSwing=0
+  Repeat
+    RockCdnTrainDelay(0)
+    If RockCdnReadLiveLinkStatus()=0 : rock_cdn_sw_train_error=4 : ProcedureReturn 0 : EndIf
+    If RockCdnClockRecoveryOk(rock_cdn_link_lanes)<>0 : Break : EndIf
+    If tries > 4 : rock_cdn_sw_train_error=5 : ProcedureReturn 0 : EndIf
+    If maxSwing<>0 : rock_cdn_sw_train_error=6 : ProcedureReturn 0 : EndIf
+    oldVoltage=rock_cdn_train_set[0] & 3
+    RockCdnGetAdjustTrain()
+    If RockCdnUpdateLinkTrain()=0 : rock_cdn_sw_train_error=7 : ProcedureReturn 0 : EndIf
+    If (rock_cdn_train_set[0] & 3)=oldVoltage : tries=tries+1 : Else : tries=1 : EndIf
+    If RockCdnAllLanesMaxSwing()<>0 : maxSwing=1 : EndIf
+  ForEver
+  ; TPS3 when the receiver is DPCD 1.2 or later and advertises it.
+  pattern=2
+  If (rock_cdn_dpcd[0] & 255) > $11 And (rock_cdn_dpcd[2] & $40)<>0 : pattern=3 : EndIf
+  If RockCdnSetPattern(pattern | $20)=0 : rock_cdn_sw_train_error=8 : ProcedureReturn 0 : EndIf
+  If RockCdnSetLinkTrain(pattern | $20)=0 : rock_cdn_sw_train_error=9 : ProcedureReturn 0 : EndIf
+  For tries=5 To 1 Step -1
+    RockCdnTrainDelay(1)
+    If RockCdnReadLiveLinkStatus()=0 : rock_cdn_sw_train_error=10 : ProcedureReturn 0 : EndIf
+    If RockCdnClockRecoveryOk(rock_cdn_link_lanes)=0 : rock_cdn_sw_train_error=11 : ProcedureReturn 0 : EndIf
+    If RockCdnChannelEqOk(rock_cdn_link_lanes)<>0 : ProcedureReturn 1 : EndIf
+    RockCdnGetAdjustTrain()
+    If RockCdnUpdateLinkTrain()=0 : rock_cdn_sw_train_error=12 : ProcedureReturn 0 : EndIf
+  Next
+  rock_cdn_sw_train_error=13
+  ProcedureReturn 0
+EndProcedure
+
+; cdn_dp_software_train_link(). Lane count is never reduced; the rate falls
+; HBR2 -> HBR -> RBR, and RBR failing is final.
+Procedure.i RockCdnSoftwareTrain()
+  Protected sinkLanes.i
+  Protected sinkRate.i
+  Protected trained.i
+  rock_cdn_sw_train_error=0
+  rock_cdn_sw_train_rate=0
+  If RockCdnDpcdReadBytes(0,15,@rock_cdn_dpcd[0])=0 : rock_cdn_sw_train_error=20 : ProcedureReturn 0 : EndIf
+  ; min(source lanes, sink MAX_LANE_COUNT): the 4C virtual-PD port has two
+  ; DP lanes (init-ss=1).
+  sinkLanes=rock_cdn_dpcd[2] & $1F
+  If sinkLanes > 2 : sinkLanes=2 : EndIf
+  If sinkLanes <> 1 And sinkLanes <> 2 : rock_cdn_sw_train_error=21 : ProcedureReturn 0 : EndIf
+  rock_cdn_link_lanes=sinkLanes
+  ; min(CDN_DP_MAX_LINK_RATE = 5.4 Gbps, sink MAX_LINK_RATE).
+  sinkRate=RockCdnRateKHz(rock_cdn_dpcd[1] & 255)
+  If sinkRate > 540000 : sinkRate=540000 : EndIf
+  rock_cdn_link_rate=sinkRate/27000
+  ; DOWNSPREAD_CTRL = 0 and MAIN_LINK_CHANNEL_CODING_SET = 8b/10b when the
+  ; sink lists it. The shipped driver ignores both AUX results here.
+  rock_cdn_dpcd_out[0]=0
+  rock_cdn_dpcd_out[1]=rock_cdn_dpcd[6] & 1
+  RockCdnDpcdWriteBytes($107,2,@rock_cdn_dpcd_out[0])
+  Repeat
+    If rock_cdn_link_rate<>#CDN_LINK_RBR And rock_cdn_link_rate<>#CDN_LINK_HBR And rock_cdn_link_rate<>#CDN_LINK_HBR2
+      rock_cdn_sw_train_error=22 : ProcedureReturn 0
+    EndIf
+    rock_cdn_sw_train_rate=rock_cdn_link_rate
+    ; LINK_BW_SET and LANE_COUNT_SET, enhanced framing when DPCD >= 1.1 lists it.
+    rock_cdn_dpcd_out[0]=rock_cdn_link_rate
+    rock_cdn_dpcd_out[1]=rock_cdn_link_lanes
+    If (rock_cdn_dpcd[0] & 255) > $10 And (rock_cdn_dpcd[2] & $80)<>0
+      rock_cdn_dpcd_out[1]=rock_cdn_link_lanes | $80
+    EndIf
+    RockCdnDpcdWriteBytes($100,2,@rock_cdn_dpcd_out[0])
+    trained=RockCdnSoftwareTrainRate()
+    If trained<>0 : Break : EndIf
+    Select rock_cdn_link_rate
+      Case #CDN_LINK_HBR2 : rock_cdn_link_rate=#CDN_LINK_HBR
+      Case #CDN_LINK_HBR : rock_cdn_link_rate=#CDN_LINK_RBR
+      Default
+        ; RBR failed: stop training and return the failure.
+        RockCdnSetPattern(0)
+        RockCdnSetLinkTrain(0)
+        ProcedureReturn 0
+    EndSelect
+  ForEver
+  ; Leave training: pattern off on both sides of the link.
+  If RockCdnSetPattern(0)=0 : rock_cdn_sw_train_error=23 : ProcedureReturn 0 : EndIf
+  If RockCdnSetLinkTrain(0)=0 : rock_cdn_sw_train_error=24 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; cdn_dp_train_link(): software first; on success SOURCE_HDTX_CAR = 0Fh and
+; use_fw_training = false. Only a software failure falls back to firmware.
+Procedure.i RockCdnTrainLink()
+  rock_cdn_use_fw_training=1
+  If RockCdnSoftwareTrain()<>0
+    If RockCdnRegWrite(#CDN_SOURCE_HDTX_CAR,$F)<>0
+      rock_cdn_use_fw_training=0
+      ProcedureReturn 1
+    EndIf
+    rock_cdn_sw_train_error=25
+  EndIf
+  ProcedureReturn RockCdnTrain()
 EndProcedure
 
 DataSection
