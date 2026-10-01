@@ -153,6 +153,14 @@ EndProcedure
     ProcedureReturn -1
   EndProcedure
 
+  Procedure.i avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+    ProcedureReturn -1
+  EndProcedure
+
+  Procedure.i avkBackendSubmitTiledMicroReadback(*copy.AnvilVkBackendTiledReadback)
+    ProcedureReturn -1
+  EndProcedure
+
 Procedure.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
   ProcedureReturn -1
 EndProcedure

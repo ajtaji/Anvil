@@ -184,6 +184,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; Full aligned utiles and whole-image TFU copies retain their own contracts.
 #ANVIL_VK_CAP_TILED_MICRO_COPY = $4000
 
+; A one-utile interior optimal-image readback into pitched buffer rows.
+; Aligned and edge-tail readback remain separate from this shape.
+#ANVIL_VK_CAP_TILED_MICRO_READBACK = $8000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
@@ -490,6 +494,8 @@ Declare.i avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiled
 Declare.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
+Declare.i avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+Declare.i avkBackendSubmitTiledMicroReadback(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
 Declare.i avkBackendSubmitBufferCopyRows(source.i, sourcePitch.i, destination.i, destinationPitch.i, rowBytes.i, rows.i)
 Declare.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
