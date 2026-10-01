@@ -426,6 +426,7 @@ def source_contract(text: str) -> list[str]:
     render_text = text
     for name, dma_call in (("avkBackendSubmitTiledRectCopy", "HwVkDmaCopy("),
                            ("avkBackendSubmitLinearTiledRectCopy", "HwVkDmaCopyRows("),
+                           ("avkBackendSubmitLinearTiledMicroCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
                            ("avkBackendSubmitBufferCopyRows", "HwVkDmaCopyRows("),

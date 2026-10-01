@@ -1,0 +1,36 @@
+; SPDX-License-Identifier: MIT
+; Pure one-utile byte-window preflight, without DMA access.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define rect.AvkV3dTextureLinearRectCopy, plan.AvkV3dTexturePlan
+  rect\windowBase = $06000000 : rect\windowBytes = $00100000
+  rect\sourceBase = $06001040 : rect\sourceBytes = 44 : rect\sourcePitch = 32
+  rect\sourceViewWidth = 3 : rect\sourceViewHeight = 2
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2048
+  rect\width = 16 : rect\height = 16 : rect\paddedWidth = 32 : rect\paddedHeight = 16
+  rect\sourceX = 0 : rect\sourceY = 0 : rect\destinationX = 5 : rect\destinationY = 6
+  rect\regionWidth = 3 : rect\regionHeight = 2
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If AnvilVkV3dTextureUifOffset(5, 6, 16) <> 228 Or AnvilVkV3dTextureUifOffset(4, 4, 16) <> 192 Or plan\destinationBytes <> 2048 : ProcedureReturn 2 : EndIf
+  rect\destinationX = 7 : rect\regionWidth = 2 : rect\sourceViewWidth = 2
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 3 : EndIf
+  rect\destinationX = 5 : rect\regionWidth = 3 : rect\sourceViewWidth = 3
+  rect\destinationY = 7
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 4 : EndIf
+  rect\destinationY = 6 : rect\sourceBytes = 43
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 5 : EndIf
+  rect\sourceBytes = 44 : rect\destinationBase = $06001000
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 6 : EndIf
+  rect\destinationBase = $06080000 : rect\sourcePitch = 32780 : rect\sourceBytes = 32800
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 7 : EndIf
+  rect\sourcePitch = 32776 : rect\sourceBytes = 32788
+  If AnvilVkV3dTextureMicroValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 8 : EndIf
+  ProcedureReturn 0
+EndProcedure

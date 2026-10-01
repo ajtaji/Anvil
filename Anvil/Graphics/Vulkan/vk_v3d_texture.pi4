@@ -454,6 +454,34 @@ Procedure.i AnvilVkV3dTextureLinearRectValidate(*copy.AvkV3dTextureLinearRectCop
   ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
 
+; A micro upload writes only the addressed texels within one UIF utile.
+; The source rows and destination byte window are checked before DMA.
+Procedure.i AnvilVkV3dTextureMicroValidate(*copy.AvkV3dTextureLinearRectCopy, *plan.AvkV3dTexturePlan)
+  Protected rc.i, localX.i, localY.i, rowBytes.i, sourceOffset.i, sourceSpan.i
+  Protected tileOffset.i, destinationOffset.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *copy = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionWidth > 4 Or *copy\regionHeight < 1 Or *copy\regionHeight > 4 Or *copy\sourceViewWidth < 1 Or *copy\sourceViewHeight < 1 Or *copy\sourceViewWidth > #ANVIL_V3D_TEXTURE_MAX_DIM Or *copy\sourceViewHeight > #ANVIL_V3D_TEXTURE_MAX_DIM : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\sourceViewWidth - *copy\regionWidth Or *copy\sourceY > *copy\sourceViewHeight - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  localX = *copy\destinationX % 4 : localY = *copy\destinationY % 4
+  If localX + *copy\regionWidth > 4 Or localY + *copy\regionHeight > 4 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rowBytes = *copy\regionWidth * 4
+  If *copy\sourcePitch < *copy\sourceViewWidth * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourcePitch - rowBytes > 32767 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If (*copy\sourceBase % 4) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < (*copy\sourceViewHeight - 1) * *copy\sourcePitch + *copy\sourceViewWidth * 4 Or *copy\destinationBytes < *plan\destinationBytes : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase, *copy\sourceBytes) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase, *plan\destinationBytes) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangesOverlap(*copy\sourceBase, *copy\sourceBytes, *copy\destinationBase, *copy\destinationBytes) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP : EndIf
+  sourceOffset = *copy\sourceY * *copy\sourcePitch + *copy\sourceX * 4
+  sourceSpan = (*copy\regionHeight - 1) * *copy\sourcePitch + rowBytes
+  tileOffset = AnvilVkV3dTextureUifOffset(*copy\destinationX - localX, *copy\destinationY - localY, *copy\paddedHeight)
+  destinationOffset = AnvilVkV3dTextureUifOffset(*copy\destinationX, *copy\destinationY, *copy\paddedHeight)
+  If sourceOffset < 0 Or sourceOffset + sourceSpan > *copy\sourceBytes Or tileOffset < 0 Or tileOffset > *plan\destinationBytes - 64 Or (tileOffset % 64) <> 0 Or destinationOffset <> tileOffset + localY * 16 + localX * 4 Or destinationOffset + (*copy\regionHeight - 1) * 16 + rowBytes > tileOffset + 64 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase + sourceOffset, sourceSpan) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase + destinationOffset, (*copy\regionHeight - 1) * 16 + rowBytes) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
 Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan.AvkV3dTexturePlan)
   Protected rc.i, destinationSpan.i, regionWidth.i, regionHeight.i
   If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
