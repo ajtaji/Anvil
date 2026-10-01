@@ -173,6 +173,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; A buffer's exact pitched byte view may scatter into optimal-image utiles.
 ; Distinct from an image-to-image linear source contract.
 #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY = $0800
+; A buffer may scatter short final UIF rows/columns only at image edges.
+; Complete-tile backends do not acquire this shape implicitly.
+#ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY = $1000
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
