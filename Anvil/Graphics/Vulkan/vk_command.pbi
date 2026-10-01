@@ -2086,7 +2086,7 @@ Procedure AnvilVkCmdClearColorImage(commandBuffer.i, image.i, imageLayout.i, *pC
   ; The backend has to be able to run it. Asking now, at record time,
   ; means an unsupported clear never reaches a queue at all.
   If avkBackendClearSupported(AnvilVkImageAddress(image), avkImgSize[s], avkImgW[s], avkImgH[s], avkImgPitch[s]) <> #VK_SUCCESS
-    avkCbFail(c, #VK_ERROR_FEATURE_NOT_PRESENT, "the graphics backend cannot clear an image of this size (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); the command buffer is now invalid. The Pi 4 V3D backend clears only an image whose width, height and row pitch match the render geometry the engine was initialised with, so create the image at the surface's own extent.")
+    avkCbFail(c, #VK_ERROR_FEATURE_NOT_PRESENT, "the graphics backend cannot clear an image of this size (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); the command buffer is now invalid. Create the image with an extent and row pitch supported by the selected backend.")
     ProcedureReturn
   EndIf
   k = avkCbRef(c, image, s)
@@ -3059,7 +3059,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     job = avkDrawListSubmit()
     If job < 0
       avkFlightComplete(0)
-      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a draw (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own code, and on the Pi 4 that is the Neon/V3D error - check the bin and render fault registers, the binner overflow count and the MMU violation address before resubmitting.")
+      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a draw (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own diagnostic code; inspect that backend's fault and capacity telemetry before resubmitting.")
       ProcedureReturn #VK_ERROR_DEVICE_LOST
     EndIf
     If job = #ANVIL_VK_JOB_DONE
@@ -3071,7 +3071,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     job = avkRenderClearSubmit()
     If job < 0
       avkFlightComplete(0)
-      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while clearing a render-pass attachment (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. Inspect the backend's V3D fault registers before retrying.")
+      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while clearing a render-pass attachment (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. Inspect the selected backend's fault telemetry before retrying.")
     EndIf
     If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
     ProcedureReturn #VK_SUCCESS
@@ -3360,7 +3360,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   job = avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target], avkImgSize[target], avkImgW[target], avkImgH[target], avkImgPitch[target], colour)
   If job < 0
     avkFlightComplete(0)
-    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a clear (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own code, and on the Pi 4 that is the Neon/V3D error - check the bin and render fault registers before resubmitting.")
+    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a clear (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own diagnostic code; inspect that backend's fault telemetry before resubmitting.")
     ProcedureReturn #VK_ERROR_DEVICE_LOST
   EndIf
   If job = #ANVIL_VK_JOB_DONE

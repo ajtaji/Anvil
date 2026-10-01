@@ -1449,7 +1449,7 @@ Procedure.i avkPipeCheckInputAssembly(*ia.VkPipelineInputAssemblyStateCreateInfo
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a VkPipelineInputAssemblyStateCreateInfo whose sType is wrong (Anvil code -20001, wrong sType).")
   EndIf
   If (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST And (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than TRIANGLE_LIST or TRIANGLE_STRIP (Anvil code -20005, unsupported topology); point, line and fan primitives need their own validated V3D packet path.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than TRIANGLE_LIST or TRIANGLE_STRIP (Anvil code -20005, unsupported topology); point, line and fan primitives need validated command support and a backend path.")
   EndIf
   If (*ia\primitiveRestartEnable & $FFFFFFFF) <> #VK_FALSE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for primitive restart (Anvil code -20005, unsupported state); indexed strip restart is not implemented.")
@@ -1526,7 +1526,7 @@ Procedure.i avkPipeCheckColorBlend(*cb.VkPipelineColorBlendStateCreateInfo, *out
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given blendEnable other than VK_FALSE or VK_TRUE (Anvil code -20001, invalid boolean); no pipeline was created.")
   EndIf
   If (*a\srcColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\dstColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\colorBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD Or (*a\srcAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\dstAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\alphaBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a blend equation other than straight source-over (Anvil code -20005, unsupported blend equation); the supported equation is SRC_ALPHA plus ONE_MINUS_SRC_ALPHA with ADD for both colour and alpha, matching Neon's measured V3D path.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a blend equation other than straight source-over (Anvil code -20005, unsupported blend equation); the supported equation is SRC_ALPHA plus ONE_MINUS_SRC_ALPHA with ADD for both colour and alpha.")
   EndIf
   If AnvilVkBackendCanBlendSourceOver() = 0
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateGraphicsPipelines requested straight source-over blending on a backend that does not advertise that operation (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); vkGetPhysicalDeviceFormatProperties therefore omits COLOR_ATTACHMENT_BLEND for this device.")
@@ -1754,7 +1754,7 @@ Procedure.i avkPipeViewport(pipe.i, *vp.VkPipelineViewportStateCreateInfo, dynam
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose width or height is not a positive whole number of pixels (Anvil code -20005, unsupported viewport); the emitted coordinate shader scales clip space by half the viewport in whole pixels, so a fractional or a flipped viewport would not be carried out as asked.")
   EndIf
   If avkPipeViewX[pipe] < 0 Or avkPipeViewY[pipe] < 0 Or avkPipeViewX[pipe] > 16383 Or avkPipeViewY[pipe] > 16383 Or (avkPipeViewX[pipe] * 256 + avkPipeViewW[pipe] * 128) > $3FFFFF Or (avkPipeViewY[pipe] * 256 + avkPipeViewH[pipe] * 128) > $3FFFFF
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose positive whole-pixel centre does not fit V3D's u14.8 offset field (Anvil code -20005, unsupported viewport); keep the viewport inside the render target and its centre below 16384 pixels.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport whose positive whole-pixel centre exceeds this implementation's 14-bit centre limit (Anvil code -20005, unsupported viewport); keep the viewport inside the render target and its centre below 16384 pixels.")
   EndIf
   If (PeekL(@*v\minDepth) & $FFFFFFFF) <> 0 Or (PeekL(@*v\maxDepth) & $FFFFFFFF) <> $3F800000
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a viewport depth range other than exactly zero through one (Anvil code -20005, unsupported viewport depth); depth buffering is not implemented.")
@@ -2435,7 +2435,7 @@ Procedure AnvilVkCmdSetViewport(commandBuffer.i, firstViewport.i, viewportCount.
   w = avkIntFromF32Bits(PeekL(@*viewports\width) & $FFFFFFFF)
   h = avkIntFromF32Bits(PeekL(@*viewports\height) & $FFFFFFFF)
   If x < 0 Or y < 0 Or x > 16383 Or y > 16383 Or w < 1 Or w > 32767 Or h < 1 Or h > 32767 Or (x * 256 + w * 128) > $3FFFFF Or (y * 256 + h * 128) > $3FFFFF Or (PeekL(@*viewports\minDepth) & $FFFFFFFF) <> 0 Or (PeekL(@*viewports\maxDepth) & $FFFFFFFF) <> $3F800000
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdSetViewport requires a nonnegative whole-pixel viewport with a centre fitting V3D's u14.8 offset field and depth exactly zero through one (Anvil code -20005, unsupported viewport); fractional, flipped and depth-remapped viewports are not implemented.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdSetViewport requires a nonnegative whole-pixel viewport with a centre below 16384 pixels and depth exactly zero through one (Anvil code -20005, unsupported viewport); fractional, flipped and depth-remapped viewports are not implemented.")
     ProcedureReturn
   EndIf
   avkCbViewportX[c] = x : avkCbViewportY[c] = y
@@ -3306,7 +3306,7 @@ Procedure.i avkDrawSubmit(c.i)
 
   rc = avkBackendDrawSupported(avkDrawRecord\targetBase, avkDrawRecord\targetBytes, avkDrawRecord\width, avkDrawRecord\height, avkDrawRecord\pitch)
   If rc <> #VK_SUCCESS
-    avkFault(rc, "the graphics backend cannot render into an attachment of this size or at this address (VkResult or Anvil code in AnvilVkFaultCode(); nothing was submitted). The Pi 4 V3D backend renders only at the geometry the engine was initialised with, and never into the buffer the display is scanning out.")
+    avkFault(rc, "the graphics backend cannot render into an attachment of this size or at this address (VkResult or Anvil code in AnvilVkFaultCode(); nothing was submitted). Check the selected backend's render-target extent and address requirements.")
     ProcedureReturn -1
   EndIf
   ProcedureReturn avkBackendSubmitDraw(@avkDrawRecord)
