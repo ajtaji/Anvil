@@ -301,3 +301,7 @@ Mesa's V3D documentation is a semantic and hardware reference, not a Linux
 runtime dependency and not a source of code. Passing the Khronos CTS and
 claiming a Vulkan version come only after those capabilities exist and are
 tested.
+
+### One-utile optimal-to-optimal microcopy
+
+A separate Pi 4 capability copies one 1–4 by 1–4 BGRA8 rectangle between distinct equal-size level-zero optimal images. Source and destination offsets are independent; each rectangle must fit within one 4×4 UIF utile, and each image’s other texels are preserved. The route requires both `TILED_RECT_COPY` and dedicated `TILED_MICRO_COPY`; it is isolated as the sole copy/transfer/draw operation in its command buffer. Shared recording and submit validation recheck capability, resource/layout generations, extents and allocation aliasing before dispatch. Pi 4 lowers only the requested row bytes with guarded DMA at a 16-byte row stride; it does not use CPU pixels or TFU. Other backends fail closed. The 2026-09-30 proof changed four destination texels and preserved 252 (including twelve same-utile neighbors); all 256 source texels remained unchanged. Each readback checked 64 padding words and 128 guards. TFU stayed at 2, DMA advanced 0→1 and jobs 2→3; a source utile-crossing request returned `-20005` during recording. MMU, OOM and native fault counts were zero. See `docs/evidence/vulkan-optimal-optimal-microrect-pi4-20260930/README.md`. Submit-time malformed-stream preflight remains desk-gate evidence.

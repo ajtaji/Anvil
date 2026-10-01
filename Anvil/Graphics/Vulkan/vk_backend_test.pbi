@@ -36,6 +36,7 @@ Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
 Global avkTbTiledRectCopies.i = 0
+Global avkTbTiledMicroCopies.i = 0
 Global avkTbLinearTiledRectCopies.i = 0
 Global avkTbLinearTiledMicroCopies.i = 0
 Global avkTbLastLinearRectSourceX.i = 0
@@ -392,6 +393,25 @@ Procedure.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
   If avkBackendTiledRectCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbTiledRectCopies = avkTbTiledRectCopies + 1
+  avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
+  avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
+  avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendTiledMicroCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceLayout = 0 Or *copy\destinationLayout = 0 Or *copy\sourceBytes < 64 Or *copy\destinationBytes < 64 : ProcedureReturn -1 : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionWidth > 4 Or *copy\regionHeight < 1 Or *copy\regionHeight > 4 : ProcedureReturn -1 : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn -1 : EndIf
+  If (*copy\sourceX % 4) + *copy\regionWidth > 4 Or (*copy\sourceY % 4) + *copy\regionHeight > 4 Or (*copy\destinationX % 4) + *copy\regionWidth > 4 Or (*copy\destinationY % 4) + *copy\regionHeight > 4 : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledMicroCopy(*copy.AnvilVkBackendTiledRectCopy)
+  If avkBackendTiledMicroCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbTiledMicroCopies = avkTbTiledMicroCopies + 1
   avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
   avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
   avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight

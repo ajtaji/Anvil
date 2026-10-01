@@ -180,6 +180,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; This does not expand the aligned full-tile or image-edge tail contracts.
 #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY = $2000
 
+; One optimal-to-optimal rectangle may copy rows inside a single UIF utile.
+; Full aligned utiles and whole-image TFU copies retain their own contracts.
+#ANVIL_VK_CAP_TILED_MICRO_COPY = $4000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
@@ -478,6 +482,8 @@ Declare.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendTiledMicroCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendSubmitTiledMicroCopy(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
