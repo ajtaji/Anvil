@@ -1,0 +1,298 @@
+; Returning Pi 4 proof of public vkCmdFillBuffer through guarded DMA.
+; One 64-byte fill changes 16 words in a 256-byte buffer. The other 48 words
+; and allocation guards remain intact. A separate offset-two command refuses.
+; RAM only: load $700000, stack $4F00000, 256-byte report in x0. No display.
+
+#PMF_CHIP = 2711
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VBF_MAGIC = $46424B56
+#VBF_TAIL = $564B4246
+#VBF_SURFACE = $06000000
+#VBF_SCREEN_BYTES = 4096000
+#VBF_WIN_BASE = $063E8000
+#VBF_WIN_BYTES = 4227072
+#VBF_MAP_SPAN = 8323072
+#VBF_ARENA = $0A000000
+#VBF_ARENA_BYTES = $01000000
+#VBF_WORD = $A1B2C3D4
+#VBF_SENTINEL = $C16C16C1
+#VBF_GUARD = $5A3C0FF0
+#VBF_OK = 0
+#VBF_ERR_SETUP = 1
+#VBF_ERR_ALLOC = 2
+#VBF_ERR_RECORD = 3
+#VBF_ERR_SUBMIT = 4
+#VBF_ERR_WORDS = 5
+#VBF_ERR_GUARDS = 6
+#VBF_ERR_COUNTERS = 7
+#VBF_ERR_REFUSAL = 8
+#VBF_ERR_FAULT = 9
+
+Global Dim vbfReport.l[64]
+Global Dim vbfDmaScratch.a[768]
+
+Procedure vbfPut(slot.i, value.i)
+  If slot >= 0 And slot < 64 : vbfReport[slot] = value & $FFFFFFFF : EndIf
+EndProcedure
+
+Procedure.i vbfGet(slot.i)
+  If slot < 0 Or slot >= 64 : ProcedureReturn 0 : EndIf
+  ProcedureReturn vbfReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure vbfFill(base.i, bytes.i, value.i)
+  Define i.i
+  For i = 0 To bytes - 4 Step 4 : PokeL(base + i, value) : Next
+EndProcedure
+
+Procedure.i Main()
+  Define status.i = #VBF_OK
+  Define rc.i
+  Define neonReady.i
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i, fence.i
+  Define buffer.i, memory.i, count.i, mapped.i, base.i, bound.i
+  Define dmaScratch.i, allocBytes.i, beforeFault.i, beforeRefusal.i
+  Define filled.i, untouched.i, preGuard.i, postGuard.i, padding.i
+  Define i.i, want.i, dmaBeforeRefusal.i, jobBeforeRefusal.i
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define bci.VkBufferCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define cbHandle.i, fenceHandle.i
+
+  vbfPut(0, #VBF_MAGIC) : vbfPut(62, 256) : vbfPut(63, #VBF_TAIL)
+  vbfPut(1, #VBF_ERR_SETUP) : vbfPut(2, 1)
+  vbfPut(35, $7FFFFFFF) : vbfPut(36, $7FFFFFFF)
+  TimerInit()
+  vbfFill(#VBF_SURFACE, #VBF_SCREEN_BYTES, #VBF_GUARD)
+  If NeonArena(#VBF_ARENA, #VBF_ARENA_BYTES) <> #NEON_OK : status = #VBF_ERR_SETUP : EndIf
+  If status = #VBF_OK
+    If NeonSurface(#VBF_SURFACE, 800, 1280, 3200) <> #NEON_OK : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    NeonSurfaceMapSpan(#VBF_MAP_SPAN)
+    If NeonInit() <> #NEON_OK : status = #VBF_ERR_SETUP : Else : neonReady = 1 : EndIf
+  EndIf
+  If status = #VBF_OK
+    dmaScratch = @vbfDmaScratch[0] + 255
+    dmaScratch = dmaScratch - (dmaScratch % 256)
+    If DmaSetScratch(dmaScratch, 512) = 0 Or DmaSetBounds(#VBF_SURFACE, #VBF_SCREEN_BYTES) = 0 Or DmaInit() = 0
+      status = #VBF_ERR_SETUP
+    EndIf
+  EndIf
+  If status = #VBF_OK
+    rc = AnvilVkV3dWindow(#VBF_WIN_BASE, #VBF_WIN_BYTES)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+
+  If status = #VBF_OK : vbfPut(2, 2) : EndIf
+  If status = #VBF_OK
+    ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    count = 1
+    rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+    If rc <> #VK_SUCCESS Or count <> 1 : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    qci\queueCount = 1 : qci\pQueuePriorities = @prio
+    dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+    If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    vkGetDeviceQueue(dev, 0, 0, @queue)
+    pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    cbai\commandBufferCount = 1
+    If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+  If status = #VBF_OK
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : status = #VBF_ERR_SETUP : EndIf
+  EndIf
+
+  If status = #VBF_OK : vbfPut(2, 3) : EndIf
+  If status = #VBF_OK
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\size = 256 : bci\usage = #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    If vkCreateBuffer(dev, @bci, 0, @buffer) <> #VK_SUCCESS : status = #VBF_ERR_ALLOC : EndIf
+  EndIf
+  If status = #VBF_OK
+    vkGetBufferMemoryRequirements(dev, buffer, @req)
+    vbfPut(3, req\size) : vbfPut(4, req\alignment)
+    vbfPut(37, req\memoryTypeBits)
+    If req\size < 256 Or req\size > 4096 Or (req\size % 4) <> 0 Or req\alignment < 1 Or req\alignment > 4096 Or (req\alignment % 4) <> 0 Or (req\memoryTypeBits & 1) = 0
+      status = #VBF_ERR_ALLOC
+    EndIf
+  EndIf
+  If status = #VBF_OK
+    bound = ((256 + req\alignment - 1) / req\alignment) * req\alignment
+    If bound < 256 Or bound > 4096 : status = #VBF_ERR_ALLOC : EndIf
+  EndIf
+  If status = #VBF_OK
+    allocBytes = bound + req\size + 256
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    mai\allocationSize = allocBytes
+    mai\memoryTypeIndex = 0
+    vbfPut(5, allocBytes) : vbfPut(6, bound)
+    rc = vkAllocateMemory(dev, @mai, 0, @memory)
+    vbfPut(35, rc)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_ALLOC : EndIf
+  EndIf
+  If status = #VBF_OK
+    rc = vkBindBufferMemory(dev, buffer, memory, bound)
+    vbfPut(36, rc)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_ALLOC : EndIf
+  EndIf
+  If status = #VBF_OK
+    base = AnvilVkBufferAddress(buffer)
+    vbfPut(7, base)
+    If vkMapMemory(dev, memory, 0, allocBytes, 0, @mapped) <> #VK_SUCCESS Or mapped = 0 Or base <> mapped + bound
+      status = #VBF_ERR_ALLOC
+    Else
+      vbfFill(mapped, allocBytes, #VBF_GUARD)
+      vbfFill(mapped + bound, 256, #VBF_SENTINEL)
+      vkUnmapMemory(dev, memory) : mapped = 0
+    EndIf
+  EndIf
+
+  If status = #VBF_OK : vbfPut(2, 4) : EndIf
+  If status = #VBF_OK
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS : status = #VBF_ERR_RECORD : EndIf
+  EndIf
+  If status = #VBF_OK
+    beforeFault = AnvilVkFaultCount()
+    vkCmdFillBuffer(cmd, buffer, 64, 64, #VBF_WORD)
+    rc = vkEndCommandBuffer(cmd)
+    vbfPut(8, rc)
+    If rc <> #VK_SUCCESS Or AnvilVkFaultCount() <> beforeFault : status = #VBF_ERR_RECORD : EndIf
+  EndIf
+  If status = #VBF_OK
+    vbfPut(10, hwVkDmaOps) : vbfPut(12, avkV3dJobs)
+    vbfPut(14, V3dTfuJobs()) : vbfPut(16, V3dBinJobs()) : vbfPut(18, V3dRenderJobs())
+    cbHandle = cmd
+    si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+    si\commandBufferCount = 1 : si\pCommandBuffers = @cbHandle
+    rc = vkQueueSubmit(queue, 1, @si, fence)
+    vbfPut(9, rc)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_SUBMIT : EndIf
+  EndIf
+  If status = #VBF_OK
+    fenceHandle = fence
+    rc = vkWaitForFences(dev, 1, @fenceHandle, 1, 2000000000)
+    vbfPut(20, rc)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_SUBMIT : EndIf
+  EndIf
+  vbfPut(11, hwVkDmaOps) : vbfPut(13, avkV3dJobs)
+  vbfPut(15, V3dTfuJobs()) : vbfPut(17, V3dBinJobs()) : vbfPut(19, V3dRenderJobs())
+
+  If status = #VBF_OK : vbfPut(2, 5) : EndIf
+  If status = #VBF_OK
+    If vkMapMemory(dev, memory, 0, allocBytes, 0, @mapped) <> #VK_SUCCESS Or mapped = 0
+      status = #VBF_ERR_ALLOC
+    Else
+      For i = 0 To 63
+        want = #VBF_SENTINEL
+        If i >= 16 And i < 32 : want = #VBF_WORD : EndIf
+        If (PeekL(mapped + bound + i * 4) & $FFFFFFFF) = want
+          If i >= 16 And i < 32 : filled = filled + 1 : Else : untouched = untouched + 1 : EndIf
+        EndIf
+      Next
+      For i = 0 To (bound / 4) - 1
+        If (PeekL(mapped + i * 4) & $FFFFFFFF) = #VBF_GUARD : preGuard = preGuard + 1 : EndIf
+      Next
+      For i = 0 To 63
+        If (PeekL(mapped + bound + req\size + i * 4) & $FFFFFFFF) = #VBF_GUARD : postGuard = postGuard + 1 : EndIf
+      Next
+      If req\size > 256
+        For i = 256 To req\size - 4 Step 4
+          If (PeekL(mapped + bound + i) & $FFFFFFFF) = #VBF_GUARD : padding = padding + 1 : EndIf
+        Next
+      EndIf
+      vkUnmapMemory(dev, memory) : mapped = 0
+    EndIf
+  EndIf
+  vbfPut(21, filled) : vbfPut(22, untouched)
+  vbfPut(23, preGuard) : vbfPut(24, postGuard) : vbfPut(25, padding)
+  If status = #VBF_OK
+    If filled <> 16 Or untouched <> 48 Or preGuard <> (bound / 4) Or postGuard <> 64 Or padding <> ((req\size - 256) / 4)
+      status = #VBF_ERR_WORDS
+    EndIf
+  EndIf
+
+  If status = #VBF_OK : vbfPut(2, 6) : EndIf
+  If status = #VBF_OK
+    rc = vkResetCommandBuffer(cmd, 0)
+    If rc <> #VK_SUCCESS : status = #VBF_ERR_REFUSAL : EndIf
+  EndIf
+  If status = #VBF_OK
+    beforeRefusal = AnvilVkFaultCount()
+    dmaBeforeRefusal = hwVkDmaOps : jobBeforeRefusal = avkV3dJobs
+    rc = vkBeginCommandBuffer(cmd, @bi)
+    If rc = #VK_SUCCESS
+      vkCmdFillBuffer(cmd, buffer, 2, 64, #VBF_WORD)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    vbfPut(26, rc) : vbfPut(27, AnvilVkFaultCount() - beforeRefusal)
+    vbfPut(28, hwVkDmaOps - dmaBeforeRefusal)
+    vbfPut(29, avkV3dJobs - jobBeforeRefusal)
+    If rc <> #ANVIL_VK_ERR_ARGS Or vbfGet(27) <> 1 Or vbfGet(28) <> 0 Or vbfGet(29) <> 0
+      status = #VBF_ERR_REFUSAL
+    EndIf
+  EndIf
+
+  If status = #VBF_OK : vbfPut(2, 7) : EndIf
+  vbfPut(30, V3dMmuFaultsNow()) : vbfPut(31, V3dBinOomCount())
+  vbfPut(32, AnvilVkBackendNativeError())
+  vbfPut(33, AnvilVkFaultCount() - beforeFault)
+  If status = #VBF_OK
+    If vbfGet(11) <> vbfGet(10) + 1 Or vbfGet(13) <> vbfGet(12) + 1 Or vbfGet(15) <> vbfGet(14) Or vbfGet(17) <> vbfGet(16) Or vbfGet(19) <> vbfGet(18)
+      status = #VBF_ERR_COUNTERS
+    EndIf
+  EndIf
+  If vbfGet(30) <> 0 Or vbfGet(31) <> 0 Or vbfGet(32) <> 0 : status = #VBF_ERR_FAULT : EndIf
+  If status = #VBF_OK And vbfGet(33) <> 1 : status = #VBF_ERR_REFUSAL : EndIf
+  If dev <> 0 : vkDeviceWaitIdle(dev) : EndIf
+  If buffer <> 0 : vkDestroyBuffer(dev, buffer, 0) : EndIf
+  If memory <> 0 : vkFreeMemory(dev, memory, 0) : EndIf
+  If fence <> 0 : vkDestroyFence(dev, fence, 0) : EndIf
+  If pool <> 0 : vkDestroyCommandPool(dev, pool, 0) : EndIf
+  If dev <> 0 : vkDestroyDevice(dev, 0) : EndIf
+  If inst <> 0 : vkDestroyInstance(inst, 0) : EndIf
+  If neonReady <> 0 : NeonShutdown() : EndIf
+  vbfPut(34, 1) : vbfPut(1, status)
+  ProcedureReturn @vbfReport[0]
+EndProcedure
