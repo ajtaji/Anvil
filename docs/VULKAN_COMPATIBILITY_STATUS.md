@@ -980,8 +980,14 @@ run on 2026-10-01. Its 1,408,064-byte PMF had SHA-256
 2.4 seconds under a 15-second deadman. The short run covers one widget frame,
 not the 15-scene corpus or paired fan/line frames, and it did not produce a
 screenshot. The earlier all-15-scene run remains historical evidence for the
-source at commit `a6b9a93`. The short run establishes the current-tree widget
-frame only; the paired fan/line proof has not been repeated on the current tree.
+source at commit `a6b9a93`. A separate current-tree mode-2 run covers the
+paired fan and line frames with full 64×64 BGRA comparisons. The current-tree
+mode-0 payload has now completed all 15 scenes on Pi 4 build 223: its report
+passes 124 checks and all 245,760 canonical scene bytes match the pinned
+native golden. The full payload returned in 11.185 seconds under a 15-second
+deadman. `VULKAN_NEON_ALL15_CURRENT_PI4.md` pins the source, capture, checker,
+hashes, and proof boundary. Its 3,505 capacity boxes are batched into one
+Vulkan draw, so ordered draw-list scale remains a separate hardware question.
 
 The first real implementation step is now in the tree rather than another
 synthetic primitive. `neon_vk_chrome.pi4` maps persistent box, atlas-text,
