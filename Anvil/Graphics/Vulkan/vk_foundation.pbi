@@ -152,6 +152,15 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; semaphore, lifetime counter or backend job.
 #ANVIL_VK_CAP_DRAW_LIST = $0020
 
+; The backend can execute coherent buffer copy, fill and update commands.
+; This is independent of graphics and tiled-image transfer support.
+#ANVIL_VK_CAP_BUFFER_TRANSFER = $0040
+
+; The backend can execute DMA-like image transfers into linear memory and
+; image-to-buffer readback. Tiled-image uploads and copies use a separate
+; backend path and do not depend on this capability.
+#ANVIL_VK_CAP_LINEAR_TRANSFER = $0080
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0

@@ -52,7 +52,7 @@ Global avkTbLastH.i = 0
 Global avkTbLastPitch.i = 0
 Global avkTbLastColor.i = 0
 Global avkTbNative.i = 0
-Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST
+Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
 
 ; Declare the window this backend suballocates. It is ordinary DRAM the
 ; caller owns; the backend never touches it.
