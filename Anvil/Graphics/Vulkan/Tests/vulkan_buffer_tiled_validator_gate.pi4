@@ -40,5 +40,41 @@ Procedure.i Main()
   If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 8 : EndIf
   rect\sourceViewHeight = 1028 : rect\sourceBytes = 16448 : rect\regionHeight = 1028
   If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 9 : EndIf
+  ; The final utile writes only valid rows and columns at image edges.
+  rect\sourceBase = $06001040 : rect\sourceBytes = 148 : rect\sourcePitch = 32
+  rect\sourceViewWidth = 5 : rect\sourceViewHeight = 5
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2048
+  rect\width = 13 : rect\height = 13 : rect\paddedWidth = 32 : rect\paddedHeight = 16
+  rect\sourceX = 0 : rect\sourceY = 0 : rect\destinationX = 8 : rect\destinationY = 8
+  rect\regionWidth = 5 : rect\regionHeight = 5
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 10 : EndIf
+  rect\sourceBytes = 147
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 11 : EndIf
+  rect\sourceBytes = 148 : rect\destinationX = 4
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 12 : EndIf
+  rect\destinationX = 8 : rect\destinationY = 4
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 13 : EndIf
+  rect\destinationY = 8 : rect\regionWidth = 4 : rect\sourceViewWidth = 4 : rect\sourceBytes = 144
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 14 : EndIf
+  rect\regionWidth = 5 : rect\sourceViewWidth = 5 : rect\sourceBytes = 148
+  rect\regionHeight = 4 : rect\sourceViewHeight = 4 : rect\sourceBytes = 116
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 15 : EndIf
+  rect\regionHeight = 5 : rect\sourceViewHeight = 5
+  rect\destinationBase = $06080000 : rect\sourcePitch = 32772 : rect\sourceBytes = 131108
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 16 : EndIf
+  rect\destinationBase = $06002000 : rect\sourcePitch = 16
+  rect\destinationX = 12 : rect\destinationY = 8 : rect\regionHeight = 5 : rect\sourceViewHeight = 5
+  rect\width = 13 : rect\regionWidth = 1 : rect\sourceViewWidth = 1 : rect\sourceBytes = 68
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 17 : EndIf
+  rect\width = 14 : rect\regionWidth = 2 : rect\sourceViewWidth = 2 : rect\sourceBytes = 72
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 18 : EndIf
+  rect\width = 15 : rect\regionWidth = 3 : rect\sourceViewWidth = 3 : rect\sourceBytes = 76
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 19 : EndIf
+  ; Bottom-only tails retain 16-byte tile rows and their wider stride limit.
+  rect\width = 13 : rect\destinationX = 8 : rect\regionWidth = 4 : rect\sourceViewWidth = 4
+  rect\destinationBase = $06080000 : rect\sourcePitch = 32780 : rect\sourceBytes = 131136
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 20 : EndIf
+  rect\sourcePitch = 32784 : rect\sourceBytes = 131152
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 21 : EndIf
   ProcedureReturn 0
 EndProcedure

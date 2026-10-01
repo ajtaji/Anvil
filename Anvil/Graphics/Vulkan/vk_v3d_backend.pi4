@@ -107,7 +107,7 @@ Procedure.i avkBackendCaps()
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
   caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
   CompilerIf #DSP_DMA_LINKED = 1
-    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY
+    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY
   CompilerEndIf
   ProcedureReturn caps
 EndProcedure
@@ -488,15 +488,17 @@ EndProcedure
 
 Procedure.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
   CompilerIf #DSP_DMA_LINKED = 1
-  Define x.i, y.i, source.i, destination.i, rc.i
+  Define x.i, y.i, cols.i, rows.i, source.i, destination.i, rc.i
   avkV3dNative = 0
   rc = avkBackendLinearTiledRectCopyValidate(*copy)
   If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
   For y = 0 To *copy\regionHeight - 1 Step 4
     For x = 0 To *copy\regionWidth - 1 Step 4
+      cols = *copy\regionWidth - x : If cols > 4 : cols = 4 : EndIf
+      rows = *copy\regionHeight - y : If rows > 4 : rows = 4 : EndIf
       source = *copy\sourceBase + (*copy\sourceY + y) * *copy\sourcePitch + (*copy\sourceX + x) * 4
       destination = *copy\destinationBase + AnvilVkV3dTextureUifOffset(*copy\destinationX + x, *copy\destinationY + y, *copy\paddedHeight)
-      If HwVkDmaCopyRows(*copy\windowBase, *copy\windowBytes, source, *copy\sourcePitch, destination, 16, 16, 4) = 0
+      If HwVkDmaCopyRows(*copy\windowBase, *copy\windowBytes, source, *copy\sourcePitch, destination, 16, cols * 4, rows) = 0
         avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_RANGE
         ProcedureReturn -1
       EndIf

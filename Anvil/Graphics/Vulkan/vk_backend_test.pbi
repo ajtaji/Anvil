@@ -401,9 +401,11 @@ Procedure.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTile
   If *copy = 0 : ProcedureReturn -1 : EndIf
   If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\width < 1 Or *copy\height < 1 Or *copy\sourceViewWidth < 1 Or *copy\sourceViewHeight < 1 Or *copy\sourcePitch < *copy\sourceViewWidth * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourcePitch - 16 > 32767 Or *copy\sourceBytes < (*copy\sourceViewHeight - 1) * *copy\sourcePitch + *copy\sourceViewWidth * 4 Or *copy\destinationLayout = 0 : ProcedureReturn -1 : EndIf
   If *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or (*copy\paddedWidth % 32) <> 0 Or (*copy\paddedHeight % 8) <> 0 Or *copy\destinationBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
-  If *copy\regionWidth < 4 Or *copy\regionHeight < 4 Or (*copy\regionWidth % 4) <> 0 Or (*copy\regionHeight % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 : ProcedureReturn -1 : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionHeight < 1 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 : ProcedureReturn -1 : EndIf
   If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\sourceViewWidth - *copy\regionWidth Or *copy\sourceY > *copy\sourceViewHeight - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn -1 : EndIf
-  If (*copy\regionWidth / 4) * (*copy\regionHeight / 4) > #ANVIL_VK_TILED_RECT_MAX_UTILES : ProcedureReturn -1 : EndIf
+  If ((*copy\regionWidth % 4) <> 0 And *copy\destinationX <> *copy\width - *copy\regionWidth) Or ((*copy\regionHeight % 4) <> 0 And *copy\destinationY <> *copy\height - *copy\regionHeight) : ProcedureReturn -1 : EndIf
+  If ((*copy\regionWidth - 1) / 4 + 1) * ((*copy\regionHeight - 1) / 4 + 1) > #ANVIL_VK_TILED_RECT_MAX_UTILES : ProcedureReturn -1 : EndIf
+  If (*copy\regionWidth % 4) <> 0 And *copy\sourcePitch - (*copy\regionWidth % 4) * 4 > 32767 : ProcedureReturn -1 : EndIf
   If (*copy\sourceBase % 4) <> 0 Or (*copy\destinationBase % 4) <> 0 Or *copy\windowBase <= 0 Or *copy\windowBytes < 1 : ProcedureReturn -1 : EndIf
   If *copy\sourceBase < *copy\windowBase Or *copy\sourceBase - *copy\windowBase > *copy\windowBytes - *copy\sourceBytes Or *copy\destinationBase < *copy\windowBase Or *copy\destinationBase - *copy\windowBase > *copy\windowBytes - *copy\destinationBytes : ProcedureReturn -1 : EndIf
   If *copy\sourceBase < *copy\destinationBase + *copy\destinationBytes And *copy\destinationBase < *copy\sourceBase + *copy\sourceBytes : ProcedureReturn -1 : EndIf

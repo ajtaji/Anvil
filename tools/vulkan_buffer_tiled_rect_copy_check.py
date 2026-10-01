@@ -26,7 +26,7 @@ def main() -> int:
             print(f"vulkan_buffer_tiled_rect_copy_check: FAIL - {stem} checkpoint {result} after {steps:,} A64 instructions")
             return 1
         total += steps
-    print(f"vulkan_buffer_tiled_rect_copy_check: PASS - 2 fixtures; ordered two-call preflight, pitched spans, cumulative tile budget and whole TFU independence over {total:,} A64 instructions")
+    print(f"vulkan_buffer_tiled_rect_copy_check: PASS - 2 fixtures; ordered complete/edge-tail preflight, exact pitched spans, cumulative tile budget and whole TFU independence over {total:,} A64 instructions")
     print(f"  compiler SHA-256 {digest}")
     return 0
 
