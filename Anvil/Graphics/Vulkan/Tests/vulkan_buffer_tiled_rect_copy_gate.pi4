@@ -118,7 +118,7 @@ Procedure.i Main()
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
   vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
-  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED : ProcedureReturn 28 : EndIf
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_ARGS : ProcedureReturn 28 : EndIf
 
   ; A full upload followed by a corrupt partial one must start no backend job.
   r\imageOffset\x = 0 : r\imageOffset\y = 0 : r\imageExtent\width = 16 : r\imageExtent\height = 16
@@ -152,5 +152,51 @@ Procedure.i Main()
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdCopyBufferToImage(cmd, aliasBuf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
   If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_ARGS : ProcedureReturn 37 : EndIf
+  ; Two separate calls retain their order and lower as two bounded backend jobs.
+  r\bufferOffset = 64 : r\imageOffset\x = 0 : r\imageOffset\y = 0
+  calls = AnvilVkTestBackendCalls()
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  r\bufferOffset = 256 : r\imageOffset\x = 8 : r\imageOffset\y = 8
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 42 : EndIf
+  first = avkCbOpHead[avkCmdSlot(cmd)] : second = avkOpNext[first]
+  If second = 0 Or avkOpNext[second] <> 0 Or avkOpBufferOffset[first] <> 64 Or avkOpBufferOffset[second] <> 256 Or avkOpImageX[first] <> 0 Or avkOpImageX[second] <> 8 : ProcedureReturn 43 : EndIf
+  If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS : ProcedureReturn 44 : EndIf
+  If vkQueueWaitIdle(queue) <> #VK_SUCCESS Or AnvilVkTestBackendCalls() <> calls + 2 Or avkTbLastLinearRectDestinationX <> 8 Or avkTbLastLinearRectDestinationY <> 8 : ProcedureReturn 45 : EndIf
+
+  ; The later malformed rectangle must abort before the earlier job starts.
+  calls = AnvilVkTestBackendCalls()
+  avkOpImageX[second] = 6
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_STATE Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 46 : EndIf
+
+  ; A third partial call cannot exceed this command-buffer subset.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  r\bufferOffset = 64 : r\imageOffset\x = 0 : r\imageOffset\y = 0
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  r\bufferOffset = 256 : r\imageOffset\x = 8 : r\imageOffset\y = 8
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  r\bufferOffset = 512 : r\imageOffset\x = 0 : r\imageOffset\y = 8
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 47 : EndIf
+
+  ; Distinct destinations do not license overlapping source byte spans.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  r\bufferOffset = 64 : r\imageOffset\x = 0 : r\imageOffset\y = 0
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  r\bufferOffset = 128 : r\imageOffset\x = 8 : r\imageOffset\y = 8
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_ARGS Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 48 : EndIf
+
+  ; The cumulative tile budget is checked before any source or destination work.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  r\bufferOffset = 64 : r\imageOffset\x = 0 : r\imageOffset\y = 0
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  r\bufferOffset = 256 : r\imageOffset\x = 8 : r\imageOffset\y = 8
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 49 : EndIf
+  first = avkCbOpHead[avkCmdSlot(cmd)]
+  avkOpSourcePitch[first] = 4096
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 50 : EndIf
   ProcedureReturn 0
 EndProcedure

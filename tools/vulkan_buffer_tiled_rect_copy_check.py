@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused public buffer-to-optimal rectangle and pure UIF validator gate."""
+"""Focused public ordered buffer-to-optimal rectangles and UIF validator gate."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def main() -> int:
             print(f"vulkan_buffer_tiled_rect_copy_check: FAIL - {stem} checkpoint {result} after {steps:,} A64 instructions")
             return 1
         total += steps
-    print(f"vulkan_buffer_tiled_rect_copy_check: PASS - 2 fixtures; public capability, exact pitched buffer span, 256-tile preflight and whole TFU independence over {total:,} A64 instructions")
+    print(f"vulkan_buffer_tiled_rect_copy_check: PASS - 2 fixtures; ordered two-call preflight, pitched spans, cumulative tile budget and whole TFU independence over {total:,} A64 instructions")
     print(f"  compiler SHA-256 {digest}")
     return 0
 
