@@ -102,9 +102,14 @@ Procedure.i AnvilVkV3dWindow(base.i, bytes.i)
 EndProcedure
 
 Procedure.i avkBackendCaps()
+  Define caps.i
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST
+  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST
+  CompilerIf #DSP_DMA_LINKED = 1
+    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
+  CompilerEndIf
+  ProcedureReturn caps
 EndProcedure
 
 Procedure.i avkBackendName()

@@ -122,6 +122,9 @@ Procedure.i Main()
   Define copyLateMem.i
   Define copySrcPtr.i
   Define copyDstPtr.i
+  Define priorCalls.i
+  Define priorSubmit.i
+  Define priorComplete.i
 
   Define ici.VkInstanceCreateInfo
   Define dci.VkDeviceCreateInfo
@@ -145,6 +148,7 @@ Procedure.i Main()
   Define range.VkImageSubresourceRange
   Define copyBufferInfo.VkBufferCreateInfo
   Define copyRegion.VkBufferCopy
+  Define uploadRegion.VkBufferImageCopy
   Define cbHandle.i
   Define cb2Handle.i
   Define si2.VkSubmitInfo
@@ -268,7 +272,7 @@ Procedure.i Main()
   AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR)
   Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_ERROR_FORMAT_NOT_SUPPORTED)
   Sentence()
-  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER)
   imgci\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT
 
   Vkr(vkCreateImage(dev, @imgci, 0, @img) = #VK_SUCCESS)
@@ -577,6 +581,25 @@ Procedure.i Main()
   vkCmdClearColorImage(cmd, img, #VK_IMAGE_LAYOUT_GENERAL, @vkrColor[0], 2, @range)
   Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
   Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+
+  ; A linear image upload needs the separate image-transfer capability.
+  ; Its refusal occurs before source-buffer resolution and preserves the
+  ; poisoned attachment and the backend call count.
+  uploadRegion\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  uploadRegion\imageSubresource\layerCount = 1
+  uploadRegion\imageExtent\width = 1
+  uploadRegion\imageExtent\height = 1
+  uploadRegion\imageExtent\depth = 1
+  priorCalls = AnvilVkTestBackendCalls()
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BUFFER_TRANSFER)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBufferToImage(cmd, #VK_NULL_HANDLE, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @uploadRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(AnvilVkTestBackendCalls() = priorCalls)
+  Vkr(PoisonIntact(imgBase, #VKR_IMG_BYTES) <> 0)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
 
   ; ------------------------------------------------------------------
@@ -898,12 +921,45 @@ Procedure.i Main()
   copyRegion\srcOffset = 4
   copyRegion\dstOffset = 8
   copyRegion\size = 16
+  ; A device without buffer-transfer execution refuses all three commands
+  ; while recording. No backend call or destination byte can move.
+  priorCalls = AnvilVkTestBackendCalls()
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_LINEAR_TRANSFER)
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdFillBuffer(cmd, copyDst, 4, 12, $A1B2C3D4)
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
+  Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
+  vkCmdUpdateBuffer(cmd, copyDst, 4, 12, @vkrUpdateData[0])
+  Vkr(vkEndCommandBuffer(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(AnvilVkTestBackendCalls() = priorCalls)
+  Vkr(PeekA(copyDstPtr + 8) = $A5)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER)
   Vkr(vkResetCommandBuffer(cmd, 0) = #VK_SUCCESS)
   Vkr(vkBeginCommandBuffer(cmd, @bi) = #VK_SUCCESS)
   vkCmdCopyBuffer(cmd, copySrc, copyDst, 1, @copyRegion)
   Vkr(vkEndCommandBuffer(cmd) = #VK_SUCCESS)
   si\commandBufferCount = 1
   si\pCommandBuffers = @cmd
+  priorSubmit = AnvilVkSubmitCount()
+  priorComplete = AnvilVkCompleteCount()
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_LINEAR_TRANSFER)
+  Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #ANVIL_VK_ERR_UNSUPPORTED)
+  Sentence()
+  Vkr(AnvilVkCommandBufferState(cmd) = #ANVIL_VK_CB_EXECUTABLE)
+  Vkr(AnvilVkSubmitCount() = priorSubmit)
+  Vkr(AnvilVkCompleteCount() = priorComplete)
+  Vkr(AnvilVkTestBackendCalls() = priorCalls)
+  Vkr(PeekA(copyDstPtr + 8) = $A5)
+  AnvilVkTestBackendCapabilities(#ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER)
   Vkr(vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE) = #VK_SUCCESS)
   Vkr(vkMapMemory(dev, copyDstMem, 0, 32, 0, @copyDstPtr) = #VK_SUCCESS)
   i = 0

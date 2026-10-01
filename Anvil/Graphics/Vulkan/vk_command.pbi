@@ -429,6 +429,10 @@ Procedure AnvilVkCmdCopyBuffer(commandBuffer.i, srcBuffer.i, dstBuffer.i, region
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
     ProcedureReturn
   EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBuffer requires a backend that executes buffer transfers (Anvil code -20005, unsupported transfer); choose a transfer-capable device before recording this command.")
+    ProcedureReturn
+  EndIf
   If regionCount < 1 Or regionCount > #ANVIL_VK_MAX_OPS
     avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdCopyBuffer has more regions than the command pool can retain (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); split the transfer across command buffers.")
     ProcedureReturn
@@ -516,6 +520,10 @@ Procedure AnvilVkCmdFillBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, size.i
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdFillBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
     ProcedureReturn
   EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdFillBuffer requires a backend that executes buffer transfers (Anvil code -20005, unsupported transfer); choose a transfer-capable device before recording this command.")
+    ProcedureReturn
+  EndIf
   targetSize = AnvilVkBufferSize(dstBuffer)
   If dstOffset < 0 Or (dstOffset % 4) <> 0 Or dstOffset >= targetSize
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdFillBuffer requires a four-byte aligned offset inside the destination buffer (Anvil code -20001, invalid offset); correct the offset and buffer.")
@@ -569,6 +577,10 @@ Procedure AnvilVkCmdUpdateBuffer(commandBuffer.i, dstBuffer.i, dstOffset.i, data
   EndIf
   If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING Or avkCbRpActive[c] <> 0
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdUpdateBuffer requires a recording command buffer outside a render pass (Anvil code -20004, wrong recording state); begin recording and end the pass first.")
+    ProcedureReturn
+  EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdUpdateBuffer requires a backend that executes buffer transfers (Anvil code -20005, unsupported transfer); choose a transfer-capable device before recording this command.")
     ProcedureReturn
   EndIf
   If dstOffset < 0 Or (dstOffset % 4) <> 0 Or dataSize < 1 Or dataSize > #ANVIL_VK_MAX_UPDATE_BYTES Or (dataSize % 4) <> 0 Or *pData = 0
@@ -656,6 +668,10 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
   EndIf
   If (avkImgTiling[s] <> #VK_IMAGE_TILING_OPTIMAL And avkImgTiling[s] <> #VK_IMAGE_TILING_LINEAR) Or (avkImgUsage[s] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage requires a linear or optimal BGRA8 destination with TRANSFER_DST usage (Anvil code -20001, wrong destination contract); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR And (avkBackendCaps() & #ANVIL_VK_CAP_LINEAR_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage requires a backend that executes linear-image uploads (Anvil code -20005, unsupported transfer); choose a device with linear transfer support.")
     ProcedureReturn
   EndIf
   If avkImgTiling[s] = #VK_IMAGE_TILING_OPTIMAL And regionCount <> 1
@@ -838,6 +854,10 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage requires linear or optimal BGRA8 images (Anvil code -20005); no copy was recorded.")
     ProcedureReturn
   EndIf
+  If avkImgTiling[dst] = #VK_IMAGE_TILING_LINEAR And (avkBackendCaps() & #ANVIL_VK_CAP_LINEAR_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImage requires a backend that executes copies into linear images (Anvil code -20005, unsupported transfer); choose a device with linear transfer support.")
+    ProcedureReturn
+  EndIf
   If (avkImgUsage[src] & #VK_IMAGE_USAGE_TRANSFER_SRC_BIT) = 0 Or (avkImgUsage[dst] & #VK_IMAGE_USAGE_TRANSFER_DST_BIT) = 0
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyImage requires TRANSFER_SRC usage on the source and TRANSFER_DST usage on the destination (Anvil code -20001); no copy was recorded.")
     ProcedureReturn
@@ -1007,6 +1027,10 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
   EndIf
   If (avkImgTiling[src] <> #VK_IMAGE_TILING_LINEAR And avkImgTiling[src] <> #VK_IMAGE_TILING_OPTIMAL) Or (avkImgUsage[src] & #VK_IMAGE_USAGE_TRANSFER_SRC_BIT) = 0
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer requires a supported source with TRANSFER_SRC usage (Anvil code -20005); nothing was recorded.")
+    ProcedureReturn
+  EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_LINEAR_TRANSFER) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer requires a backend that executes image readback (Anvil code -20005, unsupported transfer); choose a device with linear transfer support.")
     ProcedureReturn
   EndIf
   If srcLayout <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL And srcLayout <> #VK_IMAGE_LAYOUT_GENERAL
@@ -1944,6 +1968,28 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     EndIf
     o = avkOpNext[o]
   Wend
+  If bufferCopies > 0 And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TRANSFER) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit found recorded buffer transfers but the backend no longer supports them (Anvil code -20005, unsupported transfer); restore a transfer-capable backend before submitting.")
+  EndIf
+  If (avkBackendCaps() & #ANVIL_VK_CAP_LINEAR_TRANSFER) = 0
+    o = avkCbOpHead[c]
+    While o <> 0
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires an image-readback backend for this recorded command (Anvil code -20005, unsupported transfer); use a device with linear transfer support.")
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
+        target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
+        If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires a linear-image upload backend for this recorded command (Anvil code -20005, unsupported transfer); use a device with linear transfer support.")
+        EndIf
+      ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE
+        target = avkRefSlot[avkRefIndex(c, avkOpDstRef[o])]
+        If avkImgTiling[target] = #VK_IMAGE_TILING_LINEAR
+          ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires a linear-image copy backend for this recorded command (Anvil code -20005, unsupported transfer); use a device with linear transfer support.")
+        EndIf
+      EndIf
+      o = avkOpNext[o]
+    Wend
+  EndIf
   If clears > 1
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding more than one clear (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. This slice lowers one clear per submission, so record one clear per command buffer until the backend carries a command list.")
   EndIf

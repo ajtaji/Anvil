@@ -10,7 +10,9 @@ The registry is dual licensed Apache-2.0 OR MIT.
 
 `../../../docs/VULKAN_COMPATIBILITY_STATUS.md` holds the authoritative
 entry-point table and the cross-layer inventory. `ROADMAP.md` holds the
-detailed gap list. This file says what each of the four coverage classes
+detailed gap list. The board/backend capability matrix is in
+`../../../docs/VULKAN_BOARD_BACKENDS.md`. This file says what each of the
+four coverage classes
 currently amounts to and where the files are.
 
 ## The files
@@ -56,7 +58,7 @@ bytes; see `docs/VULKAN_IMAGE_RECT_READBACK_PI4_2026-09-27.md`.
 A two-region readback with a padded destination pitch then passed on Pi 4
 silicon with eight guarded DMA rows, exact copied/padding/guard bytes and
 fresh capture 48; see `docs/VULKAN_IMAGE_READBACK_ARRAY_DMA_PI4_2026-09-27.md`.
-Optimal-tiled readback remains unsupported.
+A complete level-zero optimal BGRA8 image can be read into a transfer-destination buffer through guarded 2D DMA with tight or padded rows; a 37×13 Pi 4 run checked all 481 texels, untouched padding, 40 DMA operations, and partial-region refusal (`docs/VULKAN_OPTIMAL_IMAGE_BUFFER_DMA_PI4_2026-09-27.md`). Partial optimal regions, mip levels, layers and format conversion remain unsupported.
 
 ## Compiler ABI boundary
 
