@@ -123,6 +123,10 @@ Structure AvkV3dTextureReadback Align #PB_Structure_AlignC
   height.i
   paddedWidth.i
   paddedHeight.i
+  sourceX.i
+  sourceY.i
+  regionWidth.i
+  regionHeight.i
 EndStructure
 
 Procedure avkV3dTexturePlanClear(*plan.AvkV3dTexturePlan)
@@ -333,7 +337,7 @@ Procedure.i AnvilVkV3dTextureUifOffset(x.i, y.i, paddedHeight.i)
 EndProcedure
 
 Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan.AvkV3dTexturePlan)
-  Protected rc.i, destinationSpan.i
+  Protected rc.i, destinationSpan.i, regionWidth.i, regionHeight.i
   If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
   If *read = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
   rc = AnvilVkV3dTexturePlanBuild(*read\width, *read\height, *read\width * 4, *plan)
@@ -341,14 +345,26 @@ Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan
   If *read\paddedWidth <> *plan\paddedWidth Or *read\paddedHeight <> *plan\paddedHeight
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
   EndIf
-  If *read\destinationPitch < *read\width * 4 Or (*read\destinationPitch % 4) <> 0
+  regionWidth = *read\regionWidth : regionHeight = *read\regionHeight
+  If regionWidth = 0 And regionHeight = 0 And *read\sourceX = 0 And *read\sourceY = 0
+    regionWidth = *read\width : regionHeight = *read\height
+  EndIf
+  If regionWidth < 1 Or regionHeight < 1 Or *read\sourceX < 0 Or *read\sourceY < 0 Or *read\sourceX > *read\width - regionWidth Or *read\sourceY > *read\height - regionHeight
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If *read\sourceX <> 0 Or *read\sourceY <> 0 Or regionWidth <> *read\width Or regionHeight <> *read\height
+    If (*read\sourceX % 4) <> 0 Or (*read\sourceY % 4) <> 0 Or (regionWidth % 4) <> 0 Or (regionHeight % 4) <> 0
+      ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+    EndIf
+  EndIf
+  If *read\destinationPitch < regionWidth * 4 Or (*read\destinationPitch % 4) <> 0
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
   EndIf
   If (*read\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*read\destinationBase % 4) <> 0
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
   EndIf
-  destinationSpan = (*read\height - 1) * *read\destinationPitch + *read\width * 4
-  If destinationSpan < *read\width * 4 Or *read\sourceBytes < *plan\destinationBytes Or *read\destinationBytes < destinationSpan
+  destinationSpan = (regionHeight - 1) * *read\destinationPitch + regionWidth * 4
+  If destinationSpan < regionWidth * 4 Or *read\sourceBytes < *plan\destinationBytes Or *read\destinationBytes < destinationSpan
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
   EndIf
   If avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\destinationBase, destinationSpan) = 0

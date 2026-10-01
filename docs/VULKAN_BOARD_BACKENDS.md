@@ -18,7 +18,7 @@ Compile-only probes built with the compiler fix shipped on `PureBasicCode` `main
 
 ## Bounded image readback
 
-The current Pi 4 status includes **full level-zero optimal BGRA8 image readback** into a transfer-destination buffer through guarded 2D DMA, with tight or padded destination rows and a one-layer, one-sample shape. The documented 37×13 silicon diagnostic checked all 481 texels, untouched padding, 40 DMA operations, and refusal of partial-region readback. Therefore optimal-tiled readback is supported for that bounded whole-image case. Partial optimal regions, mip levels, layers, and format conversion remain unsupported. This is distinct from general Vulkan image readback support on other backends.
+The Pi 4 backend supports full-image and a bounded partial level-zero optimal BGRA8 image readback into a transfer-destination buffer through guarded 2D DMA. The 2026-09-27 37×13 whole-image diagnostic checked all 481 texels, untouched padding and 40 DMA operations, proving odd full-image dimensions. The separate 2026-09-30 R2 partial proof returned report pointer `0x9408C8` and checked a 4×4-aligned region of 16 texels, 16 padding words and 32 guard words, with one DMA operation; an unaligned request returned `-20005`. Partial offsets and extents must align to 4×4 utiles, and edge tails remain refused. Mip levels, layers and format conversion remain unsupported. This is Pi 4-specific evidence, not general support on other backends.
 
 ## Extending the seam
 

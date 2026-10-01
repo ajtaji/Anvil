@@ -435,23 +435,30 @@ Procedure.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
   t\destinationPitch = *copy\destinationPitch
   t\width = *copy\width : t\height = *copy\height
   t\paddedWidth = *copy\paddedWidth : t\paddedHeight = *copy\paddedHeight
+  t\sourceX = *copy\sourceX : t\sourceY = *copy\sourceY
+  t\regionWidth = *copy\regionWidth : t\regionHeight = *copy\regionHeight
   ProcedureReturn AnvilVkV3dTextureReadbackValidate(@t, @p)
 EndProcedure
 
 Procedure.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
   CompilerIf #DSP_DMA_LINKED = 1
   Define x.i, y.i, cols.i, rows.i, source.i, destination.i
+  Define regionWidth.i, regionHeight.i
   Define rc.i
   avkV3dNative = 0
   rc = avkBackendTiledReadbackValidate(*copy)
   If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
-  For y = 0 To *copy\height - 1 Step 4
+  regionWidth = *copy\regionWidth : regionHeight = *copy\regionHeight
+  If regionWidth = 0 And regionHeight = 0
+    regionWidth = *copy\width : regionHeight = *copy\height
+  EndIf
+  For y = 0 To regionHeight - 1 Step 4
     rows = 4
-    If y + rows > *copy\height : rows = *copy\height - y : EndIf
-    For x = 0 To *copy\width - 1 Step 4
+    If y + rows > regionHeight : rows = regionHeight - y : EndIf
+    For x = 0 To regionWidth - 1 Step 4
       cols = 4
-      If x + cols > *copy\width : cols = *copy\width - x : EndIf
-      source = *copy\sourceBase + AnvilVkV3dTextureUifOffset(x, y, *copy\paddedHeight)
+      If x + cols > regionWidth : cols = regionWidth - x : EndIf
+      source = *copy\sourceBase + AnvilVkV3dTextureUifOffset(*copy\sourceX + x, *copy\sourceY + y, *copy\paddedHeight)
       destination = *copy\destinationBase + y * *copy\destinationPitch + x * 4
       If HwVkDmaCopyRows(*copy\windowBase, *copy\windowBytes, source, 16, destination, *copy\destinationPitch, cols * 4, rows) = 0
         avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_RANGE

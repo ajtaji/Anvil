@@ -142,10 +142,8 @@ tool reads it before the run and refuses a picture whose number did not move.
                     Default 60, which covers a deadman reset and the boot
                     after it.
     --settle S      twin mode only: how long to let it draw. Default 20.
-    --no-shot       do not arm a capture on return. THE RUN STILL NEEDS A
-                    PICTURE: use it only with a payload that captures
-                    itself, and expect the sequence check to say so if it
-                    did not.
+    --no-shot       do not arm or retrieve a picture. The payload return,
+                    requested trace and run record remain available.
 
 THE CONSOLE CLIENT IS THIS FILE'S OWN. Anvil's host tooling is being brought
 into this repository beside the monitor it drives, so this speaks the UDP
@@ -1357,6 +1355,7 @@ def run(args: argparse.Namespace) -> int:
         "console": f"{console_ip}:{args.console_port}",
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "twin": bool(args.twin),
+        "no_shot": bool(args.no_shot),
         "expected_x0": f"{expected_x0:016X}",
     }
     failures: list[str] = []
@@ -1643,7 +1642,7 @@ def run(args: argparse.Namespace) -> int:
         # rather than at a prompt: the prompt comes after the last of three
         # repeated END markers, and waiting for it doubles the timeout risk
         # for nothing.
-        if not skip_evidence:
+        if not skip_evidence and not args.no_shot:
             console.settle(quiet=0.3, cap=3.0)
             console.send("shot")
             reply = console.read_until(["END ", "ABORT ", "!! there is no kept"],
@@ -1668,7 +1667,7 @@ def run(args: argparse.Namespace) -> int:
         # capture that silently failed leaves the PREVIOUS run's picture in
         # place, perfectly well formed, and two identical PNGs read as a
         # payload that drew the same thing twice.
-        if not skip_evidence and header is not None:
+        if not skip_evidence and not args.no_shot and header is not None:
             if header["seq"] <= before:
                 failures.append(
                     f"the picture that came back is number {header['seq']} and "
@@ -1679,7 +1678,7 @@ def run(args: argparse.Namespace) -> int:
                 print(f"  picture {header['w']} x {header['h']}, capture "
                       f"number {header['seq']}, {header['tier_name']} tier, "
                       f"{header['rot']} degrees, {header['who_name']}")
-        elif not skip_evidence and not failures:
+        elif not skip_evidence and not args.no_shot and not failures:
             failures.append(
                 "the board streamed a picture with no SHOT header line, so "
                 "there is no way to say which run it is of.")
@@ -1722,8 +1721,11 @@ def run(args: argparse.Namespace) -> int:
         for entry in failures:
             print(f"   {entry}")
         return 1
-    print(f"Run complete: the payload returned expected x0 "
-          f"{expected_x0:016X} and the picture it left behind is on disk.")
+    if args.no_shot:
+        print(f"Run complete: the payload returned expected x0 {expected_x0:016X}.")
+    else:
+        print(f"Run complete: the payload returned expected x0 "
+              f"{expected_x0:016X} and the picture it left behind is on disk.")
     return 0
 
 
