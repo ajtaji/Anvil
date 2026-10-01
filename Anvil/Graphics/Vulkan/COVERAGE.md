@@ -58,7 +58,7 @@ bytes; see `docs/VULKAN_IMAGE_RECT_READBACK_PI4_2026-09-27.md`.
 A two-region readback with a padded destination pitch then passed on Pi 4
 silicon with eight guarded DMA rows, exact copied/padding/guard bytes and
 fresh capture 48; see `docs/VULKAN_IMAGE_READBACK_ARRAY_DMA_PI4_2026-09-27.md`.
-A complete level-zero optimal BGRA8 image can be read into a transfer-destination buffer through guarded 2D DMA with tight or padded rows; a 37×13 Pi 4 run checked all 481 texels, untouched padding, 40 DMA operations, and partial-region refusal (`docs/VULKAN_OPTIMAL_IMAGE_BUFFER_DMA_PI4_2026-09-27.md`). Partial optimal regions, mip levels, layers and format conversion remain unsupported.
+A complete level-zero optimal BGRA8 image can be read into a transfer-destination buffer through guarded 2D DMA with tight or padded rows; the 37×13 Pi 4 run checked all 481 texels, untouched padding and 40 DMA operations. A separate R2 Pi 4 proof returned report pointer `0x9408C8` and passed one 4×4-aligned partial region (16 exact texels, 16 padding words, 32 guard words, one DMA); it refused an unaligned region with `-20005`. Partial offsets/extents must follow the 4×4 utile boundary; edge tails remain refused. Mips, layers and format conversion are unsupported. Both proofs are recorded in `docs/VULKAN_OPTIMAL_IMAGE_BUFFER_DMA_PI4_2026-09-27.md`.
 
 ## Compiler ABI boundary
 

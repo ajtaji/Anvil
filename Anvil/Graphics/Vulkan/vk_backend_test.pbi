@@ -349,8 +349,16 @@ Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
 EndProcedure
 
 Procedure.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+  Define regionWidth.i, regionHeight.i
   If *copy = 0 : ProcedureReturn -1 : EndIf
-  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceBytes < 1 Or *copy\destinationBytes < 1 Or *copy\destinationPitch < *copy\width * 4 Or *copy\sourceLayout = 0
+  regionWidth = *copy\regionWidth : regionHeight = *copy\regionHeight
+  If regionWidth = 0 And regionHeight = 0 And *copy\sourceX = 0 And *copy\sourceY = 0
+    regionWidth = *copy\width : regionHeight = *copy\height
+  EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceBytes < 1 Or *copy\destinationBytes < 1 Or regionWidth < 1 Or regionHeight < 1 Or *copy\destinationPitch < regionWidth * 4 Or *copy\sourceLayout = 0
+    ProcedureReturn -1
+  EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\sourceX > *copy\width - regionWidth Or *copy\sourceY > *copy\height - regionHeight
     ProcedureReturn -1
   EndIf
   ProcedureReturn 0

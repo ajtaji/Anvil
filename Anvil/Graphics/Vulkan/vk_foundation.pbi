@@ -269,8 +269,8 @@ Structure AnvilVkBackendTiledImageCopy Align #PB_Structure_AlignC
   timeoutUs.i
 EndStructure
 
-; Whole level-zero UIF image to a linear BGRA8 image. The backend owns the
-; physical tiled address calculation and the transfer engine.
+; Level-zero UIF image rectangle to linear BGRA8 memory. The backend owns
+; the physical tiled address calculation and the transfer engine.
 Structure AnvilVkBackendTiledReadback Align #PB_Structure_AlignC
   windowBase.i
   windowBytes.i
@@ -284,6 +284,10 @@ Structure AnvilVkBackendTiledReadback Align #PB_Structure_AlignC
   sourceLayout.i
   paddedWidth.i
   paddedHeight.i
+  sourceX.i
+  sourceY.i
+  regionWidth.i
+  regionHeight.i
 EndStructure
 
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
