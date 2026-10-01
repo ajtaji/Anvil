@@ -35,6 +35,13 @@ Global avkTbFail.i = 0
 Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
+Global avkTbTiledRectCopies.i = 0
+Global avkTbLastRectSourceX.i = 0
+Global avkTbLastRectSourceY.i = 0
+Global avkTbLastRectDestinationX.i = 0
+Global avkTbLastRectDestinationY.i = 0
+Global avkTbLastRectWidth.i = 0
+Global avkTbLastRectHeight.i = 0
 ; Optional test-only retain observer. The pipeline gate registers addresses of
 ; exact in-flight counters; other gates leave every pointer zero. Sampling
 ; inside the backend callback proves acquisition happened before dispatch,
@@ -351,6 +358,31 @@ Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
   EndIf
   avkTbTiledCopies = avkTbTiledCopies + 1
   avkTbNative = 0
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceBytes < 64 Or *copy\destinationBytes < 64 Or *copy\sourceLayout = 0 Or *copy\destinationLayout = 0
+    ProcedureReturn -1
+  EndIf
+  If *copy\regionWidth < 4 Or *copy\regionHeight < 4 Or (*copy\regionWidth % 4) <> 0 Or (*copy\regionHeight % 4) <> 0 Or (*copy\sourceX % 4) <> 0 Or (*copy\sourceY % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0
+    ProcedureReturn -1
+  EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight
+    ProcedureReturn -1
+  EndIf
+  If (*copy\regionWidth / 4) * (*copy\regionHeight / 4) > #ANVIL_VK_TILED_RECT_MAX_UTILES : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+  If avkBackendTiledRectCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbTiledRectCopies = avkTbTiledRectCopies + 1
+  avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
+  avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
+  avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 

@@ -107,7 +107,7 @@ Procedure.i avkBackendCaps()
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
   caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
   CompilerIf #DSP_DMA_LINKED = 1
-    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
+    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_TILED_RECT_COPY
   CompilerEndIf
   ProcedureReturn caps
 EndProcedure
@@ -420,6 +420,50 @@ Procedure.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
   If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
   avkV3dJobs = avkV3dJobs + 1
   ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+  CompilerIf #DSP_DMA_LINKED = 1
+  Define t.AvkV3dTextureRectCopy, p.AvkV3dTexturePlan
+  If *copy = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR Or *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
+  t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes
+  t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
+  t\width = *copy\width : t\height = *copy\height
+  t\paddedWidth = *copy\paddedWidth : t\paddedHeight = *copy\paddedHeight
+  t\sourceX = *copy\sourceX : t\sourceY = *copy\sourceY
+  t\destinationX = *copy\destinationX : t\destinationY = *copy\destinationY
+  t\regionWidth = *copy\regionWidth : t\regionHeight = *copy\regionHeight
+  ProcedureReturn AnvilVkV3dTextureRectValidate(@t, @p)
+  CompilerElse
+  ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  CompilerEndIf
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+  CompilerIf #DSP_DMA_LINKED = 1
+  Define x.i, y.i, source.i, destination.i, rc.i
+  avkV3dNative = 0
+  rc = avkBackendTiledRectCopyValidate(*copy)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
+  For y = 0 To *copy\regionHeight - 1 Step 4
+    For x = 0 To *copy\regionWidth - 1 Step 4
+      source = *copy\sourceBase + AnvilVkV3dTextureUifOffset(*copy\sourceX + x, *copy\sourceY + y, *copy\paddedHeight)
+      destination = *copy\destinationBase + AnvilVkV3dTextureUifOffset(*copy\destinationX + x, *copy\destinationY + y, *copy\paddedHeight)
+      If HwVkDmaCopy(*copy\windowBase, *copy\windowBytes, source, destination, 64) = 0
+        avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_RANGE
+        ProcedureReturn -1
+      EndIf
+    Next
+  Next
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+  CompilerElse
+  ProcedureReturn -1
+  CompilerEndIf
 EndProcedure
 
 Procedure.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)

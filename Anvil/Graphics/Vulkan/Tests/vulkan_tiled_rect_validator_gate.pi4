@@ -1,0 +1,55 @@
+; SPDX-License-Identifier: MIT
+; Pure UIF rectangle planner and preflight, without hardware access.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define rect.AvkV3dTextureRectCopy, plan.AvkV3dTexturePlan
+  rect\windowBase = $06000000 : rect\windowBytes = $00100000
+  rect\sourceBase = $06001000 : rect\sourceBytes = 2048
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2048
+  rect\width = 16 : rect\height = 16
+  rect\paddedWidth = 32 : rect\paddedHeight = 16
+  rect\sourceX = 4 : rect\sourceY = 4
+  rect\destinationX = 8 : rect\destinationY = 8
+  rect\regionWidth = 4 : rect\regionHeight = 4
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If plan\destinationBytes <> 2048 Or AnvilVkV3dTextureUifOffset(4, 4, 16) <> 192 Or AnvilVkV3dTextureUifOffset(8, 8, 16) <> 1280 : ProcedureReturn 2 : EndIf
+  rect\sourceX = 2
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 3 : EndIf
+  rect\sourceX = 4 : rect\destinationX = 14
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 4 : EndIf
+  rect\destinationX = 8 : rect\destinationBase = rect\sourceBase
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 5 : EndIf
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2047
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 6 : EndIf
+  rect\destinationBytes = 2048 : rect\paddedWidth = 64
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 7 : EndIf
+
+  ; The same offset mapping safely crosses both 8x8 and 32-column groups.
+  rect\width = 40 : rect\height = 16
+  rect\paddedWidth = 64 : rect\paddedHeight = 16
+  rect\sourceBytes = 4096 : rect\destinationBytes = 4096
+  rect\sourceX = 28 : rect\sourceY = 4
+  rect\destinationX = 32 : rect\destinationY = 4
+  rect\regionWidth = 8 : rect\regionHeight = 4
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 8 : EndIf
+  If AnvilVkV3dTextureUifOffset(28, 4, 16) + 64 > 4096 Or AnvilVkV3dTextureUifOffset(32, 4, 16) + 64 > 4096 : ProcedureReturn 9 : EndIf
+
+  rect\width = 4 : rect\height = 1028
+  rect\paddedWidth = 32 : rect\paddedHeight = 1032
+  rect\sourceBytes = 132096 : rect\destinationBytes = 132096
+  rect\destinationBase = $06022000
+  rect\sourceX = 0 : rect\sourceY = 0
+  rect\destinationX = 0 : rect\destinationY = 0
+  rect\regionWidth = 4 : rect\regionHeight = 1024
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 10 : EndIf
+  rect\regionHeight = 1028
+  If AnvilVkV3dTextureRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure
