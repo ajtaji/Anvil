@@ -204,6 +204,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; The existing two-by-two grid capability remains independently selectable.
 #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY = $80000
 
+; Distinct optimal-image copies may include short final UIF rows or columns
+; only where both source and destination reach their image edge.
+#ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY = $100000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
@@ -502,6 +506,8 @@ Declare.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendTiledEdgeTailCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendSubmitTiledEdgeTailCopy(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendTiledMicroCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendSubmitTiledMicroCopy(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)

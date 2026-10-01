@@ -37,6 +37,7 @@ Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
 Global avkTbTiledRectCopies.i = 0
 Global avkTbTiledMicroCopies.i = 0
+Global avkTbTiledEdgeTailCopies.i = 0
 Global avkTbTiledMicroReadbacks.i = 0
 Global avkTbLastMicroReadSourceX.i = 0
 Global avkTbLastMicroReadSourceY.i = 0
@@ -402,6 +403,40 @@ Procedure.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
   If avkBackendTiledRectCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbTiledRectCopies = avkTbTiledRectCopies + 1
+  avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
+  avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
+  avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendTiledEdgeTailCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+  Define tile.AnvilVkBackendTiledRectCopy, x.i, y.i
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceLayout = 0 Or *copy\destinationLayout = 0 Or *copy\sourceBytes < 64 Or *copy\destinationBytes < 64 : ProcedureReturn -1 : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionHeight < 1 Or ((*copy\regionWidth % 4) = 0 And (*copy\regionHeight % 4) = 0) : ProcedureReturn -1 : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or (*copy\sourceX % 4) <> 0 Or (*copy\sourceY % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn -1 : EndIf
+  If ((*copy\regionWidth % 4) <> 0 And (*copy\sourceX <> *copy\width - *copy\regionWidth Or *copy\destinationX <> *copy\width - *copy\regionWidth)) Or ((*copy\regionHeight % 4) <> 0 And (*copy\sourceY <> *copy\height - *copy\regionHeight Or *copy\destinationY <> *copy\height - *copy\regionHeight)) : ProcedureReturn -1 : EndIf
+  If ((*copy\regionWidth - 1) / 4 + 1) * ((*copy\regionHeight - 1) / 4 + 1) > #ANVIL_VK_TILED_RECT_MAX_UTILES : ProcedureReturn -1 : EndIf
+  tile\sourceBase = *copy\sourceBase : tile\destinationBase = *copy\destinationBase
+  tile\sourceBytes = *copy\sourceBytes : tile\destinationBytes = *copy\destinationBytes
+  tile\sourceLayout = *copy\sourceLayout : tile\destinationLayout = *copy\destinationLayout
+  tile\width = *copy\width : tile\height = *copy\height
+  For y = 0 To *copy\regionHeight - 1 Step 4
+    For x = 0 To *copy\regionWidth - 1 Step 4
+      tile\sourceX = *copy\sourceX + x : tile\sourceY = *copy\sourceY + y
+      tile\destinationX = *copy\destinationX + x : tile\destinationY = *copy\destinationY + y
+      tile\regionWidth = *copy\regionWidth - x : If tile\regionWidth > 4 : tile\regionWidth = 4 : EndIf
+      tile\regionHeight = *copy\regionHeight - y : If tile\regionHeight > 4 : tile\regionHeight = 4 : EndIf
+      If avkBackendTiledMicroCopyValidate(@tile) <> 0 : ProcedureReturn -1 : EndIf
+    Next
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledEdgeTailCopy(*copy.AnvilVkBackendTiledRectCopy)
+  If avkBackendTiledEdgeTailCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1 : avkTbTiledEdgeTailCopies = avkTbTiledEdgeTailCopies + 1
   avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
   avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
   avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight

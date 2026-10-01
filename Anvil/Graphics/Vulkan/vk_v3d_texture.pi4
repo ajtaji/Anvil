@@ -419,6 +419,45 @@ Procedure.i AnvilVkV3dTextureRectValidate(*copy.AvkV3dTextureRectCopy, *plan.Avk
   ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
 
+Declare.i AnvilVkV3dTextureTiledMicroValidate(*copy.AvkV3dTextureRectCopy, *plan.AvkV3dTexturePlan)
+
+; Preflight every complete or short edge utile before the first DMA row copy.
+; Short rows or columns may touch only the corresponding image boundary.
+Procedure.i AnvilVkV3dTextureTiledEdgeTailValidate(*copy.AvkV3dTextureRectCopy, *plan.AvkV3dTexturePlan)
+  Protected tile.AvkV3dTextureRectCopy, tilePlan.AvkV3dTexturePlan
+  Protected x.i, y.i, cols.i, rows.i, rc.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *copy = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionHeight < 1 Or ((*copy\regionWidth % 4) = 0 And (*copy\regionHeight % 4) = 0) : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or (*copy\sourceX % 4) <> 0 Or (*copy\sourceY % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If ((*copy\regionWidth % 4) <> 0 And (*copy\sourceX <> *copy\width - *copy\regionWidth Or *copy\destinationX <> *copy\width - *copy\regionWidth)) Or ((*copy\regionHeight % 4) <> 0 And (*copy\sourceY <> *copy\height - *copy\regionHeight Or *copy\destinationY <> *copy\height - *copy\regionHeight)) : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If ((*copy\regionWidth - 1) / 4 + 1) * ((*copy\regionHeight - 1) / 4 + 1) > #ANVIL_V3D_TEXTURE_MAX_RECT_UTILES : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If (*copy\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < *plan\destinationBytes Or *copy\destinationBytes < *plan\destinationBytes : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase, *plan\destinationBytes) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangesOverlap(*copy\sourceBase, *copy\sourceBytes, *copy\destinationBase, *copy\destinationBytes) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP : EndIf
+  tile\windowBase = *copy\windowBase : tile\windowBytes = *copy\windowBytes
+  tile\sourceBase = *copy\sourceBase : tile\sourceBytes = *copy\sourceBytes
+  tile\destinationBase = *copy\destinationBase : tile\destinationBytes = *copy\destinationBytes
+  tile\width = *copy\width : tile\height = *copy\height
+  tile\paddedWidth = *copy\paddedWidth : tile\paddedHeight = *copy\paddedHeight
+  For y = 0 To *copy\regionHeight - 1 Step 4
+    For x = 0 To *copy\regionWidth - 1 Step 4
+      cols = *copy\regionWidth - x : If cols > 4 : cols = 4 : EndIf
+      rows = *copy\regionHeight - y : If rows > 4 : rows = 4 : EndIf
+      tile\sourceX = *copy\sourceX + x : tile\sourceY = *copy\sourceY + y
+      tile\destinationX = *copy\destinationX + x : tile\destinationY = *copy\destinationY + y
+      tile\regionWidth = cols : tile\regionHeight = rows
+      rc = AnvilVkV3dTextureTiledMicroValidate(@tile, @tilePlan)
+      If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+    Next
+  Next
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
 ; Copy only addressed texels between two different UIF utiles. Validate both
 ; complete utile windows and the actual last byte of each row span first.
 Procedure.i AnvilVkV3dTextureTiledMicroValidate(*copy.AvkV3dTextureRectCopy, *plan.AvkV3dTexturePlan)
