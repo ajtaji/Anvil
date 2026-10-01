@@ -176,6 +176,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; A buffer may scatter short final UIF rows/columns only at image edges.
 ; Complete-tile backends do not acquire this shape implicitly.
 #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY = $1000
+; One buffer-sourced rectangle may write within a single 4x4 optimal utile.
+; This does not expand the aligned full-tile or image-edge tail contracts.
+#ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY = $2000
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
@@ -477,6 +480,8 @@ Declare.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+Declare.i avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+Declare.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)

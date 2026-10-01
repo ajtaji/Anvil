@@ -24,8 +24,7 @@ dependency.
 graphics-pipeline draws listed in `COVERAGE.md` on the GPU. That includes a
 combined `sampler2D` implicit-LOD request from either the measured one-texel
 linear image or the bounded optimal BGRA8 image path. A whole optimal-image
-`vkCmdCopyBufferToImage` upload executes a TFU raster-to-`UIF_NO_XOR` copy;
-bounded multi-region and ordered-call rectangular strided linear-image uploads (two regions silicon-proved by `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`; separate calls by `docs/VULKAN_MULTI_CALL_UPLOAD_DMA_PI4_2026-09-27.md`) and bounded multi-region linear
+`vkCmdCopyBufferToImage` upload executes a TFU raster-to-`UIF_NO_XOR` copy. Separate bounded partial optimal-image uploads use guarded DMA, including edge tails and two ordered calls in one command buffer; partial linear-to-optimal, optimal-to-linear, optimal-to-optimal copies and optimal-image buffer readback also have separately bounded Pi 4 DMA paths. Their exact shapes and evidence are listed in `COVERAGE.md`; no non-Pi 4 backend capability is implied. A separate one-utile BGRA8 micro-upload uses a dedicated capability and guarded DMA on Pi 4; its 2026-09-30 bounded silicon proof and desk-only submit-preflight limit are recorded in `COVERAGE.md`. Other backends do not advertise the capability. Existing bounded multi-region and ordered-call rectangular strided linear-image uploads (two regions silicon-proved by `docs/VULKAN_IMAGE_UPLOAD_ARRAY_DMA_PI4_2026-09-27.md`; separate calls by `docs/VULKAN_MULTI_CALL_UPLOAD_DMA_PI4_2026-09-27.md`) and bounded multi-region linear
 `vkCmdCopyImage` and `vkCmdCopyImageToBuffer` transfers execute guarded DMA. Submission revalidates live
 resources before transfer and publishes the final layout only after success. Submission
 and the following sampled draw are both observed through public fences.
@@ -59,11 +58,7 @@ rendering capabilities to add.
   images through the V3D planner up to the configured equal width/height
   maximum and derives row pitch from the same rule used by creation and the
   public image-format query. Zero, overflowing, over-capacity or unmapped
-  geometry is refused before a job counter can move. Sampled resources remain
-  bounded: linear sampling is 1x1 only; optimal BGRA8 supports one mip, one
-  layer, one sample and the backend-planned size, with a single tightly packed
-  whole-image transfer region. Mips, partial regions, row-length overrides,
-  array layers, multisampling and other formats remain unsupported.
+  geometry is refused before a job counter can move. Sampled resources remain bounded: linear sampling is 1x1 only; optimal BGRA8 supports one mip, one layer, one sample and the backend-planned size. Its TFU upload path is a single whole-image transaction; this sampling-path limit does not remove the separate bounded partial transfer commands listed above. Mips, array layers, multisampling and other formats remain unsupported for this sampled-image shape.
 - **The buffer the display is scanning out.** This backend is offscreen by
   contract. Presentation stays with the display layer.
 - **Asynchrony.** `NeonFrameEnd` waits for both jobs before it returns, so
@@ -71,9 +66,10 @@ rendering capabilities to add.
   models the pending state correctly and the test backend exercises it, but on
   V3D the fence is signalled inside the submit. Real asynchrony needs
   interrupt-driven completion rather than the current bounded polls.
-- **More than one clear per submission, and more than one submission at a
-  time.** Both are refused, not truncated. One render pass may contain up to
-  4,096 accepted draws.
+- **Multiple submissions in flight.** The Pi 4 backend completes its one
+  bounded queue flight synchronously inside submission. A render pass can still
+  contain its bounded ordered draw list and the implemented partial color
+  attachment clear rectangles; asynchronous completion remains future work.
 
 ### Sampled-pixel silicon boundary
 
@@ -221,11 +217,12 @@ remains missing.
 - General command allocation arrays, secondary execution and inheritance,
   simultaneous-use and pending resubmission rules, reset/release behavior, and
   command-pool external synchronization beyond the current state engine.
-- Buffer/image copies beyond the implemented tightly packed whole-image
-  buffer-to-optimal-image TFU transfer, bounded multi-region strided buffer-to-linear-image DMA upload, bounded multi-region linear-image DMA
-  copy (including ordered calls in one command buffer) and bounded multi-region and ordered-call strided linear-image DMA readback; blits, resolves, mip transitions, depth/stencil clears, partial colour
-  clears and multi-range clears remain missing. TFU is not represented as a
-  general memcpy.
+- Blits, resolves, mip transitions, depth/stencil clears and multi-range
+  clears remain missing. Transfer support now includes the whole-image optimal
+  TFU upload plus separately bounded partial optimal uploads and optimal/linear
+  image-copy and readback paths on Pi 4; consult `COVERAGE.md` for the exact
+  shapes and silicon evidence. These Pi 4 capabilities do not establish support
+  on another board. TFU is not represented as a general memcpy.
 - Queries, timestamps, conditional behavior, dynamic state other than the
   implemented per-draw viewport/scissor pair, indirect draws, dispatch, and broader
   render-pass commands. The sixteen-byte fragment push-constant block is

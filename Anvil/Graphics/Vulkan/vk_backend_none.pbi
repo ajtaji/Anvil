@@ -129,6 +129,14 @@ EndProcedure
     ProcedureReturn -1
   EndProcedure
 
+  Procedure.i avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+    ProcedureReturn -1
+  EndProcedure
+
+  Procedure.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+    ProcedureReturn -1
+  EndProcedure
+
   Procedure.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
     ProcedureReturn -1
   EndProcedure
