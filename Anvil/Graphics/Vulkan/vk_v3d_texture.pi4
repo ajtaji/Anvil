@@ -60,6 +60,7 @@
 #ANVIL_V3D_TEXTURE_SOURCE_ALIGN   = 64
 #ANVIL_V3D_TEXTURE_MAX_DIM        = 4096
 #ANVIL_V3D_TEXTURE_MAX_TIMEOUT_US = 1000000
+#ANVIL_V3D_TEXTURE_MAX_RECT_UTILES = 256
 #ANVIL_V3D_TEXTURE_GPU_LIMIT      = $100000000
 
 ; V3D 4.2 packet values. These names state their role in this module rather
@@ -125,6 +126,25 @@ Structure AvkV3dTextureReadback Align #PB_Structure_AlignC
   paddedHeight.i
   sourceX.i
   sourceY.i
+  regionWidth.i
+  regionHeight.i
+EndStructure
+
+Structure AvkV3dTextureRectCopy Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
+  paddedWidth.i
+  paddedHeight.i
+  sourceX.i
+  sourceY.i
+  destinationX.i
+  destinationY.i
   regionWidth.i
   regionHeight.i
 EndStructure
@@ -334,6 +354,47 @@ Procedure.i AnvilVkV3dTextureUifOffset(x.i, y.i, paddedHeight.i)
   localX = x % 8 : localY = y % 8
   utileIndex = (localY / 4) * 2 + (localX / 4)
   ProcedureReturn blockIndex * 256 + utileIndex * 64 + (localY % 4) * 16 + (localX % 4) * 4
+EndProcedure
+
+; Every admitted rectangle consists solely of complete 64-byte UIF utiles.
+; Validate the entire list of tile addresses before the first DMA operation.
+Procedure.i AnvilVkV3dTextureRectValidate(*copy.AvkV3dTextureRectCopy, *plan.AvkV3dTexturePlan)
+  Protected rc.i, x.i, y.i, sourceOffset.i, destinationOffset.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *copy = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If *copy\regionWidth < 4 Or *copy\regionHeight < 4 Or (*copy\regionWidth % 4) <> 0 Or (*copy\regionHeight % 4) <> 0 Or *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*copy\sourceX % 4) <> 0 Or (*copy\sourceY % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*copy\regionWidth / 4) * (*copy\regionHeight / 4) > #ANVIL_V3D_TEXTURE_MAX_RECT_UTILES
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  EndIf
+  If (*copy\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < *plan\destinationBytes Or *copy\destinationBytes < *plan\destinationBytes
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase, *plan\destinationBytes) = 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+  EndIf
+  If avkV3dTextureRangesOverlap(*copy\sourceBase, *plan\destinationBytes, *copy\destinationBase, *plan\destinationBytes) <> 0
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP
+  EndIf
+  For y = 0 To *copy\regionHeight - 1 Step 4
+    For x = 0 To *copy\regionWidth - 1 Step 4
+      sourceOffset = AnvilVkV3dTextureUifOffset(*copy\sourceX + x, *copy\sourceY + y, *copy\paddedHeight)
+      destinationOffset = AnvilVkV3dTextureUifOffset(*copy\destinationX + x, *copy\destinationY + y, *copy\paddedHeight)
+      If sourceOffset < 0 Or destinationOffset < 0 Or sourceOffset > *plan\destinationBytes - 64 Or destinationOffset > *plan\destinationBytes - 64 Or (sourceOffset % 64) <> 0 Or (destinationOffset % 64) <> 0
+        ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE
+      EndIf
+    Next
+  Next
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
 
 Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan.AvkV3dTexturePlan)

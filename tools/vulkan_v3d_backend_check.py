@@ -424,7 +424,8 @@ def source_contract(text: str) -> list[str]:
     # The Pi 4 backend must not substitute processor loops when board DMA is
     # absent. The desk test backend owns the byte oracle instead.
     render_text = text
-    for name, dma_call in (("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
+    for name, dma_call in (("avkBackendSubmitTiledRectCopy", "HwVkDmaCopy("),
+                           ("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
                            ("avkBackendSubmitBufferCopyRows", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitBufferFill", "HwVkDmaFill(")):

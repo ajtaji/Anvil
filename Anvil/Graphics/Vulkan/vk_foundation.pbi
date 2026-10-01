@@ -164,6 +164,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; An in-render-pass colour rectangle clear can execute in recorded order.
 ; This is independent of whole-image clear and ordinary pipeline draws.
 #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT = $0100
+; The backend can copy whole 4x4 tiles between optimal images without TFU.
+; Whole-image TFU copies remain independent of this guarded-DMA capability.
+#ANVIL_VK_CAP_TILED_RECT_COPY = $0200
+#ANVIL_VK_TILED_RECT_MAX_UTILES = 256
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
@@ -271,6 +275,29 @@ Structure AnvilVkBackendTiledImageCopy Align #PB_Structure_AlignC
   paddedWidth.i
   paddedHeight.i
   timeoutUs.i
+EndStructure
+
+; One closed optimal-to-optimal rectangle. Coordinates and dimensions are
+; Vulkan texels; only the backend maps them to its tiled byte layout.
+Structure AnvilVkBackendTiledRectCopy Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
+  sourceLayout.i
+  destinationLayout.i
+  paddedWidth.i
+  paddedHeight.i
+  sourceX.i
+  sourceY.i
+  destinationX.i
+  destinationY.i
+  regionWidth.i
+  regionHeight.i
 EndStructure
 
 ; Level-zero UIF image rectangle to linear BGRA8 memory. The backend owns
@@ -412,6 +439,8 @@ Declare.i avkBackendImageCopyBatchReady()
 Declare.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
 Declare.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
+Declare.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
