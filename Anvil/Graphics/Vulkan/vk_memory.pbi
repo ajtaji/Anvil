@@ -482,7 +482,7 @@ Procedure.i AnvilVkImageCreate(device.i, width.i, height.i, format.i, tiling.i, 
   EndIf
   If (usage & #VK_IMAGE_USAGE_SAMPLED_BIT) <> 0
     If width > avkBackendSampledMaxDimension2D(tiling) Or height > avkBackendSampledMaxDimension2D(tiling)
-      avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given a sampled-image extent outside this backend's sampled-image limit (Anvil code -20001, sampled extent too large); query this exact usage with vkGetPhysicalDeviceImageFormatProperties. The Pi 4 V3D path currently samples one texel directly; larger linear images need an optimal-tiled representation and an explicit transfer that are not implemented yet.")
+      avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateImage was given a sampled-image extent outside this backend's sampled-image limit (Anvil code -20001, sampled extent too large); query this exact usage with vkGetPhysicalDeviceImageFormatProperties, then choose an extent and tiling the selected backend supports.")
       ProcedureReturn #ANVIL_VK_ERR_ARGS
     EndIf
   EndIf
