@@ -14,6 +14,8 @@ Backend choice is **static at build time**. Exactly one backend file is included
 
 `vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. A future board build that includes the portable API but has no GPU backend can link `vk_backend_none.pbi`; it enumerates no physical device.
 
+The Pi 4 whole-image clear path also passed a standalone offscreen 1024×768 BGRA8 proof: 786,432 exact pixels, intact adjacent guard, and one bin/render pair without OOM, MMU, native or validation faults. Raw `ERR_STAT=$1000` in both snapshots is the read-only VCDI idle status, not a fault. The run did not present an image and makes no claim for other boards. See `docs/evidence/vulkan-clear-extent1024-pi4-20261001/README.md`.
+
 Compile-only probes built with the compiler fix shipped on `PureBasicCode` `main` at commit `1752ead85bad59fadcbb633da68ed289a84e2639`: the A64 ABI gate in `tools/vulkan_alignc_cross_target_check.py` passed 39 checks (12 `SizeOf`/`OffsetOf` checks each for Pi 3, ROCK Pi 4C, and Pi 4, plus an RP2350 negative control); standalone `pi3` and `rockpi4c` Vulkan API + none-backend probes each linked a 192,784-byte image, and a UNO Q none-backend probe also compiled. These are compile/link results only: the production non-Pi 4 monitor roots still omit Vulkan, and no non-Pi 4 GPU path is claimed.
 
 ## Bounded image readback

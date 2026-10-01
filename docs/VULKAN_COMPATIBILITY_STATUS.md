@@ -418,6 +418,8 @@ not prove any unlisted shader instruction, descriptor type, format or WSI.
 
 ### Board runs
 
+A separate **2026-10-01 Pi 4 standalone 1024×768 `vkCmdClearColorImage` run passed**. The offscreen diagnostic cleared all 786,432 pixels to `$FF3380B2` at 4,096-byte pitch; every pixel matched and the adjacent native guard checksum was unchanged. Bin and render completions each advanced 0→1; OOM, MMU, native and validation faults were zero. The two raw `ERR_STAT` values were `$1000`, the read-only VCDI idle status bit. An initial checker that required raw zero rejected those two fields; the corrected checker rejects other error bits and passes the exact saved report plus 45 hostile mutations. No presentation or other-board behavior was tested. See `docs/evidence/vulkan-clear-extent1024-pi4-20261001/README.md`.
+
 **2026-09-11, run 1 — no GPU result.** `vulkanClearProof.pi4` (container
 `3a6cde76…`) returned in 1.16 s with status `#VCP_ERR_DISPLAY`, detail `-19`
 (`#DSP_ESEND`). It never reached V3D. The cause was in the diagnostic, not in

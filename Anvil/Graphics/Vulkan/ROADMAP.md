@@ -301,8 +301,10 @@ coverage machine-readable.
 
 ## The board proof for the clear
 
-`RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4` is the only thing that
-can show this path executes. It reserves the second half of a double-height
+A separate current-tree Pi 4 proof exercised the public whole-image clear at 1024×768 with a 4,096-byte pitch. Its 786,432 pixels matched exactly, its adjacent guard was unchanged, and one bin/render pair completed without OOM, MMU, native or validation faults. The raw `ERR_STAT` value `$1000` after each job is VCDI idle status, not a hardware error. It remained offscreen with no presentation; see `docs/evidence/vulkan-clear-extent1024-pi4-20261001/README.md`. This does not widen the advertised backend limits or establish another board path.
+
+The original `RaspberryPi4/Examples/Diagnostics/vulkanClearProof.pi4` proof
+reserves the second half of a double-height
 framebuffer as the offscreen window, creates the image through the public
 entry points, poisons every word of it with the complement of the expected
 value, submits the transition and the clear, waits on the fence, and then:

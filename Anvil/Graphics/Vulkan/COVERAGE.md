@@ -62,6 +62,8 @@ A complete level-zero optimal BGRA8 image can be read into a transfer-destinatio
 
 The 2026-09-30 Pi 4 clear-rectangle proof executed a 64×64 even-sized target with two draws and two attachment clears in one bin/render transaction. All 4,096 pixels matched exactly, including alpha-zero color `$00FF8000`; the padding mismatch count was zero. The out-of-bounds x=60, width=8 rectangle returned `-20001` before jobs. Partial rectangles are bounded to even framebuffer dimensions; the full pre-draw load clear remains supported on odd-sized targets. See `docs/evidence/vulkan-clear-attachments-pi4-20260930/README.md`.
 
+A separate 2026-10-01 Pi 4 standalone `vkCmdClearColorImage` proof cleared a 1024×768 linear BGRA8 image: all 786,432 pixels matched `$FF3380B2`, the neighboring native guard checksum stayed unchanged, and bin/render counters each advanced 0→1. Binner OOM, MMU, native and validation faults were zero. Both raw `ERR_STAT` snapshots contained only `$1000`, the read-only VCDI idle status bit, not an error. This offscreen run did not present or establish other-board support. See `docs/evidence/vulkan-clear-extent1024-pi4-20261001/README.md`.
+
 ## Compiler ABI boundary
 
 On AArch64 the public memory ABI is LP64: Vulkan 32-bit scalars align to 4,
