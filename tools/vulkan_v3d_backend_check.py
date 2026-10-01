@@ -429,6 +429,7 @@ def source_contract(text: str) -> list[str]:
                            ("avkBackendSubmitTiledMicroReadback", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitLinearTiledRectCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitLinearTiledMicroCopy", "HwVkDmaCopyRows("),
+                           ("avkBackendSubmitLinearTiledGridCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitBufferCopy", "HwVkDmaCopy("),
                            ("avkBackendSubmitBufferCopyRows", "HwVkDmaCopyRows("),

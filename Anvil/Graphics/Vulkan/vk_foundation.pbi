@@ -196,6 +196,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; Full aligned image scatters and buffer-sourced micro uploads remain separate.
 #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY = $20000
 
+; One buffer-sourced rectangle may span at most two adjacent UIF utile rows
+; and columns. Its four intersections are validated before any DMA work.
+#ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY = $40000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
@@ -500,6 +504,8 @@ Declare.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledR
 Declare.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendLinearTiledMicroCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+Declare.i avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+Declare.i avkBackendSubmitLinearTiledGridCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadback)
