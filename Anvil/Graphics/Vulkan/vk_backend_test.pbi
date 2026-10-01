@@ -46,6 +46,8 @@ Global avkTbLastMicroReadPitch.i = 0
 Global avkTbLastMicroReadSpan.i = 0
 Global avkTbLinearTiledRectCopies.i = 0
 Global avkTbLinearTiledMicroCopies.i = 0
+Global avkTbLinearTiledGridCopies.i = 0
+Global avkTbLastLinearGridIntersections.i = 0
 Global avkTbLastLinearRectSourceX.i = 0
 Global avkTbLastLinearRectSourceY.i = 0
 Global avkTbLastLinearRectDestinationX.i = 0
@@ -469,6 +471,35 @@ Procedure.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiled
   If avkBackendLinearTiledMicroCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
   avkTbLinearTiledMicroCopies = avkTbLinearTiledMicroCopies + 1
+  avkTbLastLinearRectDestinationX = *copy\destinationX : avkTbLastLinearRectDestinationY = *copy\destinationY
+  avkTbLastLinearRectWidth = *copy\regionWidth : avkTbLastLinearRectHeight = *copy\regionHeight
+  avkTbLastLinearRectSourcePitch = *copy\sourcePitch : avkTbLastLinearRectSourceBytes = *copy\sourceBytes
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+  Define columns.i, rows.i, firstCols.i, minCols.i
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionHeight < 1 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX <> 0 Or *copy\sourceY <> 0 Or *copy\sourceViewWidth <> *copy\regionWidth Or *copy\sourceViewHeight <> *copy\regionHeight : ProcedureReturn -1 : EndIf
+  If *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight Or *copy\sourcePitch < *copy\regionWidth * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourceBytes <> (*copy\regionHeight - 1) * *copy\sourcePitch + *copy\regionWidth * 4 : ProcedureReturn -1 : EndIf
+  columns = (*copy\destinationX + *copy\regionWidth - 1) / 4 - *copy\destinationX / 4 + 1
+  rows = (*copy\destinationY + *copy\regionHeight - 1) / 4 - *copy\destinationY / 4 + 1
+  firstCols = 4 - (*copy\destinationX % 4)
+  If firstCols > *copy\regionWidth : firstCols = *copy\regionWidth : EndIf
+  minCols = firstCols
+  If columns = 2 And *copy\regionWidth - firstCols < minCols : minCols = *copy\regionWidth - firstCols : EndIf
+  If *copy\sourcePitch - minCols * 4 > 32767 : ProcedureReturn -1 : EndIf
+  If columns < 1 Or columns > 2 Or rows < 1 Or rows > 2 Or columns * rows < 2 Or *copy\destinationLayout = 0 Or *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or *copy\destinationBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
+  If *copy\windowBase <= 0 Or *copy\windowBytes < *copy\sourceBytes Or *copy\windowBytes < *copy\destinationBytes Or *copy\sourceBase < *copy\windowBase Or *copy\destinationBase < *copy\windowBase Or *copy\sourceBase - *copy\windowBase > *copy\windowBytes - *copy\sourceBytes Or *copy\destinationBase - *copy\windowBase > *copy\windowBytes - *copy\destinationBytes : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase < *copy\destinationBase + *copy\destinationBytes And *copy\destinationBase < *copy\sourceBase + *copy\sourceBytes : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitLinearTiledGridCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+  If avkBackendLinearTiledGridCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbLinearTiledGridCopies = avkTbLinearTiledGridCopies + 1
+  avkTbLastLinearGridIntersections = ((*copy\destinationX + *copy\regionWidth - 1) / 4 - *copy\destinationX / 4 + 1) * ((*copy\destinationY + *copy\regionHeight - 1) / 4 - *copy\destinationY / 4 + 1)
   avkTbLastLinearRectDestinationX = *copy\destinationX : avkTbLastLinearRectDestinationY = *copy\destinationY
   avkTbLastLinearRectWidth = *copy\regionWidth : avkTbLastLinearRectHeight = *copy\regionHeight
   avkTbLastLinearRectSourcePitch = *copy\sourcePitch : avkTbLastLinearRectSourceBytes = *copy\sourceBytes

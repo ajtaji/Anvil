@@ -107,7 +107,7 @@ Procedure.i avkBackendCaps()
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
   caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
   CompilerIf #DSP_DMA_LINKED = 1
-    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY
+    caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_TAIL_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_COPY | #ANVIL_VK_CAP_TILED_MICRO_READBACK | #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY
   CompilerEndIf
   ProcedureReturn caps
 EndProcedure
@@ -581,6 +581,61 @@ Procedure.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiled
     avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_RANGE
     ProcedureReturn -1
   EndIf
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+  CompilerElse
+  ProcedureReturn -1
+  CompilerEndIf
+EndProcedure
+
+; A buffer rectangle crossing up to two UIF tile columns and rows is
+; decomposed into at most four disjoint micro copies. Validate every tile
+; before the first DMA operation can change the destination image.
+Procedure.i avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+  CompilerIf #DSP_DMA_LINKED = 1
+  Define t.AvkV3dTextureLinearRectCopy, p.AvkV3dTexturePlan
+  If *copy = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\destinationLayout <> #ANVIL_V3D_TEXTURE_MEM_UIF_NO_XOR : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  t\windowBase = *copy\windowBase : t\windowBytes = *copy\windowBytes
+  t\sourceBase = *copy\sourceBase : t\sourceBytes = *copy\sourceBytes : t\sourcePitch = *copy\sourcePitch
+  t\sourceViewWidth = *copy\sourceViewWidth : t\sourceViewHeight = *copy\sourceViewHeight
+  t\destinationBase = *copy\destinationBase : t\destinationBytes = *copy\destinationBytes
+  t\width = *copy\width : t\height = *copy\height
+  t\paddedWidth = *copy\paddedWidth : t\paddedHeight = *copy\paddedHeight
+  t\sourceX = *copy\sourceX : t\sourceY = *copy\sourceY
+  t\destinationX = *copy\destinationX : t\destinationY = *copy\destinationY
+  t\regionWidth = *copy\regionWidth : t\regionHeight = *copy\regionHeight
+  ProcedureReturn AnvilVkV3dTextureGridValidate(@t, @p)
+  CompilerElse
+  ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
+  CompilerEndIf
+EndProcedure
+
+Procedure.i avkBackendSubmitLinearTiledGridCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+  CompilerIf #DSP_DMA_LINKED = 1
+  Define firstX.i, firstY.i, lastX.i, lastY.i, tileX.i, tileY.i
+  Define ix.i, iy.i, endX.i, endY.i, cols.i, rows.i, source.i, destination.i, rc.i
+  avkV3dNative = 0
+  rc = avkBackendLinearTiledGridCopyValidate(*copy)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : avkV3dNative = rc : ProcedureReturn -1 : EndIf
+  firstX = (*copy\destinationX / 4) * 4 : firstY = (*copy\destinationY / 4) * 4
+  lastX = ((*copy\destinationX + *copy\regionWidth - 1) / 4) * 4
+  lastY = ((*copy\destinationY + *copy\regionHeight - 1) / 4) * 4
+  For tileY = firstY To lastY Step 4
+    For tileX = firstX To lastX Step 4
+      ix = tileX : If ix < *copy\destinationX : ix = *copy\destinationX : EndIf
+      iy = tileY : If iy < *copy\destinationY : iy = *copy\destinationY : EndIf
+      endX = tileX + 4 : If endX > *copy\destinationX + *copy\regionWidth : endX = *copy\destinationX + *copy\regionWidth : EndIf
+      endY = tileY + 4 : If endY > *copy\destinationY + *copy\regionHeight : endY = *copy\destinationY + *copy\regionHeight : EndIf
+      cols = endX - ix : rows = endY - iy
+      source = *copy\sourceBase + (iy - *copy\destinationY) * *copy\sourcePitch + (ix - *copy\destinationX) * 4
+      destination = *copy\destinationBase + AnvilVkV3dTextureUifOffset(ix, iy, *copy\paddedHeight)
+      If HwVkDmaCopyRows(*copy\windowBase, *copy\windowBytes, source, *copy\sourcePitch, destination, 16, cols * 4, rows) = 0
+        avkV3dNative = #ANVIL_V3D_TEXTURE_ERR_RANGE
+        ProcedureReturn -1
+      EndIf
+    Next
+  Next
   avkV3dJobs = avkV3dJobs + 1
   ProcedureReturn #ANVIL_VK_JOB_DONE
   CompilerElse
