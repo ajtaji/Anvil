@@ -44,6 +44,12 @@ The tile clear and the tile store are what write the image. There is no
 processor-side and no DMA image fallback anywhere under this path, and the
 desk gate checks the source for one.
 
+A bounded UINT32 indexed triangle proof joined the Pi 4 silicon coverage on
+2026-10-01. It verifies the public UINT32 bind, `firstIndex` byte offset,
+V3D packet bytes, index sentinels, display result and teardown; the evidence is
+`docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`. This establishes
+that diagnostic shape on Pi 4 only and does not imply another board backend.
+
 ### What this backend still cannot do, and says so
 
 The rotating Pi 4 pyramid demo (`docs/VULKAN_PYRAMID_DEMO_PI4_2026-09-27.md`)

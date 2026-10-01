@@ -64,8 +64,8 @@ CONTRACTS = {
     ),
     BACKEND: (
         "V3dClIndexBufferSetup(*d\\indexBase, *d\\indexBytes)",
-        "V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, 1, *d\\firstVertex * 2)",
-        "V3dClIndexedPrims(#AVKQ_PRIM_TRIANGLES, *d\\vertexCount, 2, *d\\firstVertex * 4)",
+        "V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, 1, *d\\firstVertex * 2)",
+        "V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, 2, *d\\firstVertex * 4)",
         "AnvilVkV3dBuildDrawSlotRecord(pipe, pbase, drawBase, *d, *d\\maxVertex",
         "avkV3dCacheIntervalAdd(*d\\indexBase + indexOffset, bytes)",
     ),
