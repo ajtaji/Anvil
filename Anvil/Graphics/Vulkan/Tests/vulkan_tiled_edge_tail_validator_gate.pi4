@@ -1,0 +1,46 @@
+; SPDX-License-Identifier: MIT
+; Pure optimal-to-optimal edge-tail tile preflight, without hardware access.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define rect.AvkV3dTextureRectCopy, plan.AvkV3dTexturePlan
+  rect\windowBase = $06000000 : rect\windowBytes = $00100000
+  rect\sourceBase = $06001000 : rect\sourceBytes = 2048
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2048
+  rect\width = 13 : rect\height = 13 : rect\paddedWidth = 32 : rect\paddedHeight = 16
+  rect\sourceX = 8 : rect\sourceY = 8 : rect\destinationX = 8 : rect\destinationY = 8
+  rect\regionWidth = 5 : rect\regionHeight = 5
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If plan\destinationBytes <> 2048 Or AnvilVkV3dTextureUifOffset(8, 8, 16) < 0 Or AnvilVkV3dTextureUifOffset(12, 12, 16) > 1984 : ProcedureReturn 2 : EndIf
+  rect\sourceX = 4 : rect\destinationX = 4
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 3 : EndIf
+  rect\sourceX = 8 : rect\destinationX = 8 : rect\sourceY = 4 : rect\destinationY = 4
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 4 : EndIf
+  rect\sourceY = 8 : rect\destinationY = 8 : rect\sourceX = 7
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 5 : EndIf
+  rect\sourceX = 8 : rect\destinationBase = rect\sourceBase
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 6 : EndIf
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2047
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 7 : EndIf
+  rect\destinationBytes = 2048 : rect\sourceBytes = 2047
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 8 : EndIf
+  rect\sourceBytes = 2048 : rect\regionWidth = 5 : rect\regionHeight = 4
+  rect\sourceY = 8 : rect\destinationY = 8
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 9 : EndIf
+  rect\regionWidth = 4 : rect\regionHeight = 5 : rect\sourceX = 8 : rect\destinationX = 8
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 10 : EndIf
+  If AnvilVkV3dTexturePlanBuild(1025, 4, 4100, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 11 : EndIf
+  rect\width = 1025 : rect\height = 4
+  rect\paddedWidth = plan\paddedWidth : rect\paddedHeight = plan\paddedHeight
+  rect\sourceBytes = plan\destinationBytes : rect\destinationBytes = plan\destinationBytes
+  rect\sourceX = 0 : rect\sourceY = 0 : rect\destinationX = 0 : rect\destinationY = 0
+  rect\regionWidth = 1025 : rect\regionHeight = 4
+  If AnvilVkV3dTextureTiledEdgeTailValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 12 : EndIf
+  ProcedureReturn 0
+EndProcedure
