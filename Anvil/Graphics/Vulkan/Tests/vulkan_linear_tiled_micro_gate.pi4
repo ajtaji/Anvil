@@ -1,0 +1,138 @@
+; SPDX-License-Identifier: MIT
+; Public linear-image to optimal-image one-utile microcopy contract.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+Procedure.i Main()
+  Define ici.VkInstanceCreateInfo, qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo, pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo, bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo, req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo, bar.VkImageMemoryBarrier
+  Define region.VkImageCopy, si.VkSubmitInfo
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define src.i, dst.i, aliasImage.i, smem.i, dmem.i
+  Define count.i, priority.l, calls.i, caps.i, o.i, savedPitch.i, savedMemorySlot.i
+
+  AnvilVkTestBackendHeap($06200000, $00100000)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY : cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D : imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = 16 : imgci\extent\height = 16 : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1 : imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @src) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  vkGetImageMemoryRequirements(dev, src, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @smem) <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  If vkBindImageMemory(dev, src, smem, 0) <> #VK_SUCCESS : ProcedureReturn 8 : EndIf
+  imgci\tiling = #VK_IMAGE_TILING_OPTIMAL
+  If vkCreateImage(dev, @imgci, 0, @dst) <> #VK_SUCCESS : ProcedureReturn 9 : EndIf
+  vkGetImageMemoryRequirements(dev, dst, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @dmem) <> #VK_SUCCESS : ProcedureReturn 10 : EndIf
+  If vkBindImageMemory(dev, dst, dmem, 0) <> #VK_SUCCESS : ProcedureReturn 11 : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED : bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS : ProcedureReturn 12 : EndIf
+  bar\image = src : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  bar\image = dst : bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 13 : EndIf
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO : si\commandBufferCount = 1 : si\pCommandBuffers = @cmd
+  If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS : ProcedureReturn 14 : EndIf
+  If vkQueueWaitIdle(queue) <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+
+  region\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT : region\srcSubresource\layerCount = 1
+  region\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT : region\dstSubresource\layerCount = 1
+  region\srcOffset\x = 3 : region\srcOffset\y = 5
+  region\dstOffset\x = 9 : region\dstOffset\y = 10
+  region\extent\width = 2 : region\extent\height = 2 : region\extent\depth = 1
+  calls = AnvilVkTestBackendCalls() : caps = avkTbCaps
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 16 : EndIf
+  AnvilVkTestBackendCapabilities((caps - #ANVIL_VK_CAP_LINEAR_TRANSFER) | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED : ProcedureReturn 17 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 18 : EndIf
+  o = avkCbOpHead[avkCmdSlot(cmd)]
+  If avkOpRows[o] <> 5 Or avkOpImageX[o] <> 3 Or avkOpImageY[o] <> 5 Or avkOpBufferOffset[o] <> 9 Or avkOpBufferPitch[o] <> 10 Or avkOpSourceBytes[o] <> 8 Or avkOpSourcePitch[o] <> 2 : ProcedureReturn 19 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY)
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 20 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY)
+  If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS : ProcedureReturn 21 : EndIf
+  If vkQueueWaitIdle(queue) <> #VK_SUCCESS Or AnvilVkTestBackendCalls() <> calls + 1 Or avkTbLinearTiledMicroCopies <> 1 Or avkTbLastLinearRectDestinationX <> 9 Or avkTbLastLinearRectDestinationY <> 10 Or avkTbLastLinearRectWidth <> 2 Or avkTbLastLinearRectHeight <> 2 Or avkTbLastLinearRectSourcePitch <> avkImgPitch[avkImgSlot(src)] : ProcedureReturn 22 : EndIf
+
+  region\dstOffset\x = 11
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 23 : EndIf
+  region\dstOffset\x = 9 : region\dstOffset\y = 11
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED : ProcedureReturn 24 : EndIf
+  region\dstOffset\y = 10
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 25 : EndIf
+  o = avkCbOpHead[avkCmdSlot(cmd)] : avkOpBufferOffset[o] = 11
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_STATE Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 26 : EndIf
+
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 27 : EndIf
+  savedPitch = avkImgPitch[avkImgSlot(src)] : avkImgPitch[avkImgSlot(src)] = savedPitch + 4
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_STATE Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 28 : EndIf
+  avkImgPitch[avkImgSlot(src)] = savedPitch
+
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  If vkCreateImage(dev, @imgci, 0, @aliasImage) <> #VK_SUCCESS : ProcedureReturn 29 : EndIf
+  If vkBindImageMemory(dev, aliasImage, dmem, 0) <> #VK_SUCCESS : ProcedureReturn 30 : EndIf
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, aliasImage, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_ARGS Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 31 : EndIf
+
+  ; Backing alias introduced after recording must fail whole-stream preflight.
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 32 : EndIf
+  savedMemorySlot = avkImgMemSlot[avkImgSlot(src)]
+  avkImgMemSlot[avkImgSlot(src)] = avkImgMemSlot[avkImgSlot(dst)]
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_ARGS Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 33 : EndIf
+  avkImgMemSlot[avkImgSlot(src)] = savedMemorySlot
+
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  vkCmdCopyImage(cmd, src, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls + 1 : ProcedureReturn 34 : EndIf
+  ProcedureReturn 0
+EndProcedure
