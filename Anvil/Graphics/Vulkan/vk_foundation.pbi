@@ -170,6 +170,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_TILED_RECT_MAX_UTILES = 256
 ; Guarded linear-row DMA scatter into complete optimal-image utiles.
 #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY = $0400
+; A buffer's exact pitched byte view may scatter into optimal-image utiles.
+; Distinct from an image-to-image linear source contract.
+#ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY = $0800
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
@@ -303,13 +306,16 @@ Structure AnvilVkBackendTiledRectCopy Align #PB_Structure_AlignC
 EndStructure
 
 ; Closed linear-to-optimal rectangle. Source coordinates use its actual row
-; pitch; only the destination layout is backend-specific.
+; pitch and independently bounded source view. A buffer can expose exactly
+; the requested rows while the destination retains its full image dimensions.
 Structure AnvilVkBackendLinearTiledRectCopy Align #PB_Structure_AlignC
   windowBase.i
   windowBytes.i
   sourceBase.i
   sourceBytes.i
   sourcePitch.i
+  sourceViewWidth.i
+  sourceViewHeight.i
   destinationBase.i
   destinationBytes.i
   width.i

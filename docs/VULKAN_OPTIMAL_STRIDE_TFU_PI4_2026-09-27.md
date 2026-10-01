@@ -48,6 +48,4 @@ AArch64 instructions. Its optimal-image command fixture verified that an
 18-texel source row reaches the backend as a 72-byte TFU pitch, while a
 16-texel row is refused for a 17-texel-wide image.
 
-This is one complete image, one mip, one layer, one sample and one BGRA8
-format. Partial optimal regions, multiple optimal copies in a submission,
-and format conversion remain outside the supported path.
+The TFU route remains one complete image, one mip, one layer, one sample and one BGRA8 format. A separate partial buffer-to-optimal upload is implemented for one region per command buffer, with 64-byte-aligned buffer offset, tight or padded row pitch, exact last-row source-span validation, 4×4-aligned destination offsets and extents, and at most 256 utiles. Pi 4 lowers it through guarded DMA behind `BUFFER_TO_TILED_RECT_COPY`. The 2026-09-30 proof replaced 16 destination texels and preserved 240 others; it checked 272 source words including 16 padding words, 64 readback padding and 96 guard checks. TFU stayed at 1, DMA advanced 0→1, and jobs advanced 1→2; a later readback advanced DMA 1→17. Destination `(2,8)` returned `-20005` before readback; MMU/OOM/native faults were zero, with one intentional validation fault. See `docs/evidence/vulkan-partial-buffer-optimal-pi4-20260930/README.md`. The established full-image TFU upload is unchanged, and other boards do not advertise the partial capability. Multiple optimal regions per call and format conversion remain unsupported.

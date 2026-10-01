@@ -1,0 +1,44 @@
+; SPDX-License-Identifier: MIT
+; Pure exact-span buffer-view to UIF-utile preflight, without DMA access.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define rect.AvkV3dTextureLinearRectCopy, plan.AvkV3dTexturePlan
+  rect\windowBase = $06000000 : rect\windowBytes = $00100000
+  rect\sourceBase = $06001040 : rect\sourceBytes = 112 : rect\sourcePitch = 32
+  rect\sourceViewWidth = 4 : rect\sourceViewHeight = 4
+  rect\destinationBase = $06002000 : rect\destinationBytes = 2048
+  rect\width = 16 : rect\height = 16 : rect\paddedWidth = 32 : rect\paddedHeight = 16
+  rect\sourceX = 0 : rect\sourceY = 0 : rect\destinationX = 8 : rect\destinationY = 8
+  rect\regionWidth = 4 : rect\regionHeight = 4
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If plan\destinationBytes <> 2048 Or AnvilVkV3dTextureUifOffset(8, 8, 16) <> 1280 : ProcedureReturn 2 : EndIf
+  rect\sourceBytes = 111
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 3 : EndIf
+  rect\sourceBytes = 64 : rect\sourcePitch = 16
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 4 : EndIf
+  rect\sourcePitch = 32 : rect\sourceBytes = 112 : rect\destinationX = 6
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 5 : EndIf
+  rect\destinationX = 8 : rect\sourceViewWidth = 3
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 6 : EndIf
+  rect\sourceViewWidth = 4 : rect\destinationBase = $06001000
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 7 : EndIf
+
+  ; 256 tiles work; a 257th tile is refused before any transfer.
+  rect\sourceBase = $06001040 : rect\sourcePitch = 16 : rect\sourceBytes = 16384
+  rect\sourceViewWidth = 4 : rect\sourceViewHeight = 1024
+  rect\destinationBase = $06030000 : rect\destinationBytes = 132096
+  rect\width = 4 : rect\height = 1028 : rect\paddedWidth = 32 : rect\paddedHeight = 1032
+  rect\destinationX = 0 : rect\destinationY = 0
+  rect\regionWidth = 4 : rect\regionHeight = 1024
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 8 : EndIf
+  rect\sourceViewHeight = 1028 : rect\sourceBytes = 16448 : rect\regionHeight = 1028
+  If AnvilVkV3dTextureLinearRectValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 9 : EndIf
+  ProcedureReturn 0
+EndProcedure
