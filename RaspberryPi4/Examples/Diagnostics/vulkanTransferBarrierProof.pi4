@@ -1,0 +1,348 @@
+; RAM-only Pi 4 proof of transfer-scoped global and buffer barriers.
+; One accepted fill/update/barrier/copy stream and one rejected later-range
+; barrier. Returns a 97-word report; no display, flash or filesystem writes.
+#PMF_CHIP = 2711
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_interp_expect.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VTB_MAGIC = $31425456
+#VTB_TAIL = $56425431
+#VTB_WORDS = 97
+#VTB_ARENA = $0A000000
+#VTB_ARENA_BYTES = $01000000
+#VTB_SURFACE = $06000000
+#VTB_SURFACE_BYTES = 4096000
+#VTB_WIN_BASE = $063E8000
+#VTB_WIN_BYTES = 4227072
+#VTB_MAP_SPAN = 8323072
+#VTB_POISON = $A5A5A5A5
+#VTB_FILL = $11223344
+#VTB_BUFFER_BYTES = 128
+#VTB_GUARD_BYTES = 256
+#VTB_OK = 0
+#VTB_ERR_INIT = 10
+#VTB_ERR_RESOURCE = 20
+#VTB_ERR_WINDOW = 30
+#VTB_ERR_VALID = 40
+#VTB_ERR_REJECT = 50
+#VTB_ERR_ORACLE = 60
+#VTB_ERR_FAULT = 70
+Global Dim vtbReport.l[97]
+Global Dim vtbDmaScratch.a[768]
+Global Dim vtbUpdate.l[4]
+
+Procedure vtbPut(slot.i, value.i)
+  If slot >= 0 And slot < #VTB_WORDS : vtbReport[slot] = value & $FFFFFFFF : EndIf
+EndProcedure
+
+Procedure.i vtbGet(slot.i)
+  If slot < 0 Or slot >= #VTB_WORDS : ProcedureReturn 0 : EndIf
+  ProcedureReturn vtbReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure.i vtbExpectedA(word.i)
+  If word >= 4 And word < 8 : ProcedureReturn ($E1000100 + word) & $FFFFFFFF : EndIf
+  If word < 16 : ProcedureReturn #VTB_FILL : EndIf
+  ProcedureReturn #VTB_POISON
+EndProcedure
+
+Procedure.i vtbExpectedB(word.i)
+  If word >= 8 And word < 24 : ProcedureReturn vtbExpectedA(word - 8) : EndIf
+  ProcedureReturn #VTB_POISON
+EndProcedure
+
+Procedure.i vtbInWindow(base.i, bytes.i)
+  If base < #VTB_WIN_BASE Or bytes < 1 Or bytes > #VTB_WIN_BYTES : ProcedureReturn 0 : EndIf
+  If base - #VTB_WIN_BASE > #VTB_WIN_BYTES - bytes : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Define status.i = #VTB_OK, rc.i, i.i, k.i, j.i, tick.i, firstBad.i = -1
+  Define instance.i, physical.i, device.i, queue.i, pool.i, command.i, fence.i
+  Define source.i, destination.i, sourceMemory.i, destinationMemory.i
+  Define memory.i, mapped.i, mapMemory.i, allocationBytes.i, bindOffset.i
+  Define sourceBase.i, destinationBase.i, goodWords.i, guardWords.i
+  Define dmaScratch.i, neonReady.i, count.i, cmdHandle.i, fenceHandle.i
+  Define dmaBefore.i, jobsBefore.i, tfuBefore.i, faultsBefore.i
+  Define badDmaBefore.i, badJobsBefore.i, badTfuBefore.i, badFaultsBefore.i
+  Define ici.VkInstanceCreateInfo, dci.VkDeviceCreateInfo, qci.VkDeviceQueueCreateInfo
+  Define priority.l, pci.VkCommandPoolCreateInfo, cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo, fci.VkFenceCreateInfo, si.VkSubmitInfo
+  Define bci.VkBufferCreateInfo, req.VkMemoryRequirements, destinationReq.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define globalBarrier.VkMemoryBarrier, bufferBarrier.VkBufferMemoryBarrier
+  Define copy.VkBufferCopy
+
+  vtbPut(0, #VTB_MAGIC) : vtbPut(2, 1) : vtbPut(3, #VTB_WORDS * 4)
+  vtbPut(22, $FFFFFFFF) : vtbPut(96, #VTB_TAIL)
+  TimerInit()
+  tick = Micros()
+  For k = 0 To (#VTB_SURFACE_BYTES / 4) - 1 : PokeL(#VTB_SURFACE + k * 4, #VTB_POISON) : Next
+  If NeonArena(#VTB_ARENA, #VTB_ARENA_BYTES) <> #NEON_OK : status = #VTB_ERR_INIT : EndIf
+  If status = #VTB_OK
+    If NeonSurface(#VTB_SURFACE, 800, 1280, 3200) <> #NEON_OK : status = #VTB_ERR_INIT : EndIf
+  EndIf
+  If status = #VTB_OK
+    NeonSurfaceMapSpan(#VTB_MAP_SPAN)
+    If NeonInit() <> #NEON_OK : status = #VTB_ERR_INIT : Else : neonReady = 1 : EndIf
+  EndIf
+  If status = #VTB_OK
+    dmaScratch = @vtbDmaScratch[0] + 255
+    dmaScratch = dmaScratch - (dmaScratch % 256)
+    If DmaSetScratch(dmaScratch, 512) = 0 Or DmaSetBounds(#VTB_SURFACE, #VTB_SURFACE_BYTES) = 0 Or DmaInit() = 0
+      status = #VTB_ERR_INIT
+    EndIf
+  EndIf
+  If status = #VTB_OK
+    If AnvilVkV3dWindow(#VTB_WIN_BASE, #VTB_WIN_BYTES) <> #VK_SUCCESS : status = #VTB_ERR_INIT : EndIf
+  EndIf
+  vtbPut(2, 2)
+  If status = #VTB_OK
+    ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    rc = vkCreateInstance(@ici, 0, @instance)
+    If rc = #VK_SUCCESS
+      count = 1 : rc = vkEnumeratePhysicalDevices(instance, @count, @physical)
+    EndIf
+    If rc <> #VK_SUCCESS Or count <> 1 : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    qci\queueCount = 1 : qci\pQueuePriorities = @priority
+    dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+    rc = vkCreateDevice(physical, @dci, 0, @device)
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    vkGetDeviceQueue(device, 0, 0, @queue)
+    pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    rc = vkCreateCommandPool(device, @pci, 0, @pool)
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    cbai\commandBufferCount = 1
+    rc = vkAllocateCommandBuffers(device, @cbai, @command)
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    rc = vkCreateFence(device, @fci, 0, @fence)
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\size = #VTB_BUFFER_BYTES
+    bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    rc = vkCreateBuffer(device, @bci, 0, @source)
+    If rc = #VK_SUCCESS : rc = vkCreateBuffer(device, @bci, 0, @destination) : EndIf
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  If status = #VTB_OK
+    vkGetBufferMemoryRequirements(device, source, @req)
+    vkGetBufferMemoryRequirements(device, destination, @destinationReq)
+    If req\size < #VTB_BUFFER_BYTES Or req\size > #VTB_WIN_BYTES - 512 Or req\alignment < 1 Or req\alignment > 4096 Or (req\memoryTypeBits & 1) = 0
+      status = #VTB_ERR_RESOURCE
+    ElseIf destinationReq\size <> req\size Or destinationReq\alignment <> req\alignment Or (destinationReq\memoryTypeBits & 1) = 0
+      status = #VTB_ERR_RESOURCE
+    Else
+      bindOffset = ((#VTB_GUARD_BYTES + req\alignment - 1) / req\alignment) * req\alignment
+      allocationBytes = bindOffset + req\size + #VTB_GUARD_BYTES
+      vtbPut(29, allocationBytes)
+      If allocationBytes > #VTB_WIN_BYTES : status = #VTB_ERR_WINDOW : EndIf
+    EndIf
+  EndIf
+  If status = #VTB_OK
+    mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+    mai\memoryTypeIndex = 0 : mai\allocationSize = allocationBytes
+    rc = vkAllocateMemory(device, @mai, 0, @sourceMemory)
+    If rc = #VK_SUCCESS : rc = vkBindBufferMemory(device, source, sourceMemory, bindOffset) : EndIf
+    If rc = #VK_SUCCESS : rc = vkAllocateMemory(device, @mai, 0, @destinationMemory) : EndIf
+    If rc = #VK_SUCCESS : rc = vkBindBufferMemory(device, destination, destinationMemory, bindOffset) : EndIf
+    If rc <> #VK_SUCCESS : status = #VTB_ERR_RESOURCE : EndIf
+  EndIf
+  ; Reject a bad heap/window or alias before writing a single guard word.
+  If status = #VTB_OK
+    For i = 0 To 1
+      If i = 0 : memory = sourceMemory : Else : memory = destinationMemory : EndIf
+      rc = vkMapMemory(device, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        status = #VTB_ERR_RESOURCE
+      Else
+        mapMemory = memory
+        If vtbInWindow(mapped, allocationBytes) = 0 : status = #VTB_ERR_WINDOW : EndIf
+        If i = 0 : sourceBase = mapped + bindOffset : Else : destinationBase = mapped + bindOffset : EndIf
+        vkUnmapMemory(device, memory) : mapped = 0 : mapMemory = 0
+      EndIf
+    Next
+    If sourceBase < destinationBase
+      If destinationBase - sourceBase < allocationBytes : status = #VTB_ERR_WINDOW : EndIf
+    Else
+      If sourceBase - destinationBase < allocationBytes : status = #VTB_ERR_WINDOW : EndIf
+    EndIf
+  EndIf
+  vtbPut(30, sourceBase) : vtbPut(31, destinationBase)
+  If status = #VTB_OK
+    For i = 0 To 1
+      If i = 0 : memory = sourceMemory : Else : memory = destinationMemory : EndIf
+      rc = vkMapMemory(device, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        status = #VTB_ERR_RESOURCE
+      Else
+        mapMemory = memory
+        For k = 0 To (allocationBytes / 4) - 1 : PokeL(mapped + k * 4, #VTB_POISON) : Next
+        DmaCacheRange(mapped, allocationBytes)
+        vkUnmapMemory(device, memory) : mapped = 0 : mapMemory = 0
+      EndIf
+    Next
+  EndIf
+
+  vtbPut(2, 3)
+  If status = #VTB_OK
+    For i = 0 To 3 : vtbUpdate[i] = $E1000104 + i : Next
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    cmdHandle = command
+    si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+    si\commandBufferCount = 1 : si\pCommandBuffers = @cmdHandle
+    globalBarrier\sType = #VK_STRUCTURE_TYPE_MEMORY_BARRIER
+    globalBarrier\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    globalBarrier\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bufferBarrier\sType = #VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+    bufferBarrier\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bufferBarrier\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bufferBarrier\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bufferBarrier\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bufferBarrier\buffer = source
+    bufferBarrier\offset = 0 : bufferBarrier\size = 64
+    copy\srcOffset = 0 : copy\dstOffset = 32 : copy\size = 64
+    dmaBefore = hwVkDmaOps : jobsBefore = avkV3dJobs : tfuBefore = V3dTfuJobs()
+    faultsBefore = AnvilVkFaultCount()
+    vtbPut(8, dmaBefore) : vtbPut(10, jobsBefore) : vtbPut(12, tfuBefore)
+    rc = vkBeginCommandBuffer(command, @bi)
+    If rc = #VK_SUCCESS
+      vkCmdFillBuffer(command, source, 0, 64, #VTB_FILL)
+      vkCmdUpdateBuffer(command, source, 16, 16, @vtbUpdate[0])
+      vkCmdPipelineBarrier(command, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, @globalBarrier, 1, @bufferBarrier, 0, 0)
+      vkCmdCopyBuffer(command, source, destination, 1, @copy)
+      rc = vkEndCommandBuffer(command)
+    EndIf
+    If rc = #VK_SUCCESS
+      fenceHandle = fence : rc = vkResetFences(device, 1, @fenceHandle)
+    EndIf
+    If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, @si, fence) : EndIf
+    If rc = #VK_SUCCESS : rc = vkWaitForFences(device, 1, @fenceHandle, 1, 2000000000) : EndIf
+    vtbPut(4, rc)
+    vtbPut(9, hwVkDmaOps) : vtbPut(11, avkV3dJobs) : vtbPut(13, V3dTfuJobs())
+    vtbPut(14, faultsBefore) : vtbPut(15, AnvilVkFaultCount())
+    vtbPut(23, Micros() - tick)
+    If rc <> #VK_SUCCESS Or hwVkDmaOps <> dmaBefore + 3 Or avkV3dJobs <> jobsBefore + 3 Or V3dTfuJobs() <> tfuBefore Or AnvilVkFaultCount() <> faultsBefore
+      status = #VTB_ERR_VALID
+    EndIf
+  EndIf
+
+  ; Record an accepted write first, then a barrier whose live buffer span
+  ; exceeds its 128-byte bound. The void command invalidates the recording;
+  ; end and submit must refuse it before that earlier write executes.
+  vtbPut(2, 4)
+  If status = #VTB_OK
+    rc = vkResetCommandBuffer(command, 0)
+    If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(command, @bi) : EndIf
+    If rc <> #VK_SUCCESS
+      status = #VTB_ERR_REJECT
+    Else
+      badDmaBefore = hwVkDmaOps : badJobsBefore = avkV3dJobs
+      badTfuBefore = V3dTfuJobs() : badFaultsBefore = AnvilVkFaultCount()
+      vtbPut(25, badDmaBefore) : vtbPut(27, badJobsBefore)
+      vkCmdFillBuffer(command, destination, 0, 64, $DEADBEEF)
+      bufferBarrier\offset = 120 : bufferBarrier\size = 16
+      vkCmdPipelineBarrier(command, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, @globalBarrier, 1, @bufferBarrier, 0, 0)
+      rc = vkEndCommandBuffer(command)
+      vtbPut(5, rc)
+      vtbPut(6, vkQueueSubmit(queue, 1, @si, #VK_NULL_HANDLE))
+      vtbPut(26, hwVkDmaOps) : vtbPut(27, badJobsBefore) : vtbPut(28, avkV3dJobs)
+      vtbPut(7, AnvilVkFaultCount() - badFaultsBefore)
+      If rc <> #ANVIL_VK_ERR_STATE Or vtbGet(6) = #VK_SUCCESS Or hwVkDmaOps <> badDmaBefore Or avkV3dJobs <> badJobsBefore Or V3dTfuJobs() <> badTfuBefore Or AnvilVkFaultCount() <= badFaultsBefore
+        status = #VTB_ERR_REJECT
+      EndIf
+    EndIf
+  EndIf
+
+  ; Capture complete source and destination buffers for an independent host
+  ; oracle; inspect 256 guard words around the two bound spans in the payload.
+  vtbPut(2, 5)
+  If sourceMemory <> 0 And destinationMemory <> 0 And sourceBase <> 0 And destinationBase <> 0
+    For i = 0 To 1
+      If i = 0 : memory = sourceMemory : Else : memory = destinationMemory : EndIf
+      rc = vkMapMemory(device, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        If status = #VTB_OK : status = #VTB_ERR_ORACLE : EndIf
+      Else
+        mapMemory = memory
+        DmaCacheRange(mapped, allocationBytes)
+        For k = 0 To 31
+          If i = 0
+            vtbPut(32 + k, PeekL(mapped + bindOffset + k * 4))
+            If vtbGet(32 + k) = vtbExpectedA(k) : goodWords + 1 : ElseIf firstBad = -1 : firstBad = k : EndIf
+          Else
+            vtbPut(64 + k, PeekL(mapped + bindOffset + k * 4))
+            If vtbGet(64 + k) = vtbExpectedB(k) : goodWords + 1 : ElseIf firstBad = -1 : firstBad = 32 + k : EndIf
+          EndIf
+        Next
+        For k = 0 To 63
+          If (PeekL(mapped + bindOffset - #VTB_GUARD_BYTES + k * 4) & $FFFFFFFF) = #VTB_POISON
+            guardWords + 1
+          ElseIf firstBad = -1
+            firstBad = 64 + i * 128 + k
+          EndIf
+          If (PeekL(mapped + bindOffset + req\size + k * 4) & $FFFFFFFF) = #VTB_POISON
+            guardWords + 1
+          ElseIf firstBad = -1
+            firstBad = 128 + i * 128 + k
+          EndIf
+        Next
+        vkUnmapMemory(device, memory) : mapped = 0 : mapMemory = 0
+      EndIf
+    Next
+    vtbPut(19, goodWords) : vtbPut(20, 64) : vtbPut(21, guardWords) : vtbPut(22, firstBad)
+    If status = #VTB_OK And (goodWords <> 64 Or guardWords <> 256) : status = #VTB_ERR_ORACLE : EndIf
+  EndIf
+
+  vtbPut(2, 6)
+  vtbPut(16, V3dMmuFaultsNow()) : vtbPut(17, V3dBinOomCount())
+  vtbPut(18, AnvilVkBackendNativeError())
+  If status = #VTB_OK And (vtbGet(16) <> 0 Or vtbGet(17) <> 0 Or vtbGet(18) <> 0) : status = #VTB_ERR_FAULT : EndIf
+  If mapped <> 0 And mapMemory <> 0 : vkUnmapMemory(device, mapMemory) : EndIf
+  If device <> 0 : vkDeviceWaitIdle(device) : EndIf
+  If command <> 0 : vkResetCommandBuffer(command, 0) : EndIf
+  If source <> 0 : vkDestroyBuffer(device, source, 0) : EndIf
+  If destination <> 0 : vkDestroyBuffer(device, destination, 0) : EndIf
+  If sourceMemory <> 0 : vkFreeMemory(device, sourceMemory, 0) : EndIf
+  If destinationMemory <> 0 : vkFreeMemory(device, destinationMemory, 0) : EndIf
+  If fence <> 0 : vkDestroyFence(device, fence, 0) : EndIf
+  If pool <> 0 : vkDestroyCommandPool(device, pool, 0) : EndIf
+  If device <> 0 : vkDestroyDevice(device, 0) : EndIf
+  If instance <> 0 : vkDestroyInstance(instance, 0) : EndIf
+  If neonReady <> 0 : NeonShutdown() : EndIf
+  vtbPut(1, status) : vtbPut(2, 7) : vtbPut(3, #VTB_WORDS * 4)
+  vtbPut(24, Micros() - tick)
+  ProcedureReturn @vtbReport[0]
+EndProcedure
