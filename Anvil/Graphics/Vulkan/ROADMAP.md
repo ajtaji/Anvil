@@ -142,12 +142,17 @@ states. A current-tree short Pi 4 run passed the widget frame on 2026-10-01:
 47 draws, 654 vertices, 35 box calls, 12 text calls, 74 glyph quads, four
 scissor calls, one display-DMA operation, zero fallback/refusal, and twelve
 pixel probes. Five scissor states are defined by the scene but were not
-independently measured. The run skipped capacity and paired-scene checks and
-produced no screenshot; evidence is in
-`docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. The earlier
-2026-09-26 all-15-scene run at `a6b9a93` includes paired fan/line frames and
-proves that historical source. Current-tree paired fan/line proofs and
-HDMI/DSI/rotation/resize and clean recovery coverage remain.
+independently measured. The short run skipped capacity and paired-scene checks and produced no
+screenshot; evidence is in
+`docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. A separate
+current-tree mode-2 Pi 4 run passed the production fan/outline and line scenes;
+both complete 64×64 BGRA captures matched the pinned native golden segments,
+with 12 report probes passing. CPU work copied the completed GPU attachment to
+RAM for observation; it did not render pixels. See
+`docs/evidence/vulkan-neon-fan-line-pi4-20261001/README.md`. The earlier
+2026-09-26 all-15-scene run at `a6b9a93` remains historical evidence for that
+source. A fresh current-tree all-15-scene run and HDMI/DSI/rotation/resize and
+clean recovery coverage remain.
 
 ## API and object gaps
 

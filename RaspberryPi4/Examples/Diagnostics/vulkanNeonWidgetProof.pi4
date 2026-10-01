@@ -12,8 +12,8 @@
 ;     RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetProof.pi4 -t pi4 \
 ;     --load-addr 0x700000 --stack-addr 0x4F00000 --entry-returns \
 ;     -o vulkanNeonWidgetProof.img
-; #NW_WIDGET_ONLY selects one production widget frame for a short RAM run.
-; Set it to zero to retain the historical capacity and paired-scene proof.
+; #NW_PROOF_MODE selects the historical full proof (0), one widget frame (1),
+; or the fan/outline and line GPU frames with fixed RAM captures (2).
 ;
 ; The return value is a pointer to exactly 64 little-endian 32-bit report
 ; words (256 bytes). tools/vulkan_neon_widget_proof_check.py owns the separate
@@ -52,7 +52,7 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_MAP_SPAN          = $00FE8000
 #NW_DSI_SCAN          = $08A00000
 #NW_SHOW_MS           = 3000
-#NW_WIDGET_ONLY       = 1
+#NW_PROOF_MODE        = 2
 #NW_CAPACITY_BOXES    = 3505
 #NW_STRESS_DRAWS      = 1183         ; one box batch + 2*(252+339) text calls
 #NW_STRESS_QUADS      = 6373         ; 3505 boxes + 2868 text glyphs
@@ -129,7 +129,7 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_S_CLEAR_G         = 59
 #NW_S_CLEAR_B         = 60
 #NW_S_CLEAR_A         = 61
-#NW_S_CAPACITY_BOXES  = 62
+#NW_S_CAPACITY_BOXES  = 62             ; 3505 full, 0 widget, 2 fan/line
 #NW_S_TAIL            = 63
 
 Global Dim nwReport.l[#NW_REPORT_WORDS]
@@ -895,7 +895,7 @@ Procedure.i Main()
   ; the widget callbacks only after its Vulkan atlas upload has completed.
   nwPut(#NW_S_STEP, 4)
   adapterDraws = #NW_STRESS_DRAWS : adapterQuads = #NW_STRESS_QUADS
-  If #NW_WIDGET_ONLY <> 0
+  If #NW_PROOF_MODE <> 0
     adapterDraws = #NVWA_EXPECT_DRAWS : adapterQuads = #NVWA_EXPECT_QUADS
   EndIf
   rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, adapterDraws, adapterQuads)
@@ -912,7 +912,54 @@ Procedure.i Main()
   EndIf
   adapterMade = 1
 
-  If #NW_WIDGET_ONLY = 0
+  If #NW_PROOF_MODE = 2
+    ; These constants are normally seeded by the boxes paired frame. The
+    ; fan/line-only proof uses that same clear without running another scene.
+    nwPairClear[0] = $3D888889 : nwPairClear[1] = $3E048485
+    nwPairClear[2] = $3E5CDCDD : nwPairClear[3] = $3F800000
+    nwPut(#NW_S_CAPACITY_BOXES, 2)
+    nwPut(#NW_S_STEP, 5)
+    rc = nwPairFanFrame(imageBase, imagePitch)
+    nwPut(#NW_S_SCENE_RC, rc)
+    If rc <> #NW_OK
+      NeonVkChromeDestroy()
+      vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+      vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+      vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+      vkDestroyInstance(inst, 0) : NeonShutdown()
+      ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+    EndIf
+    nwPut(#NW_S_DRAW_ACTUAL, NeonVkChromeDrawCount())
+    nwPut(#NW_S_VERTEX_ACTUAL, NeonVkChromeVertexCount())
+    rc = nwPairLinesFrame(imageBase, imagePitch)
+    nwPut(#NW_S_SCENE_RC, rc)
+    If rc <> #NW_OK
+      NeonVkChromeDestroy()
+      vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+      vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+      vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+      vkDestroyInstance(inst, 0) : NeonShutdown()
+      ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+    EndIf
+    nwPut(#NW_S_DRAW_EXPECT, NeonVkChromeDrawCount())
+    nwPut(#NW_S_VERTEX_EXPECT, NeonVkChromeVertexCount())
+    nwPut(#NW_S_PRESENT_PENDING, NeonVkChromePresentPending())
+    nwPut(#NW_S_BACKEND_ERROR, NeonVkChromeError())
+    nwPut(#NW_S_PIXEL_COUNT, 12)
+    nwPut(#NW_S_PIXEL0 + 0, PeekL($07014000 + (0 * 256) + (0 * 4)))
+    nwPut(#NW_S_PIXEL0 + 1, PeekL($07014000 + (42 * 256) + (8 * 4)))
+    nwPut(#NW_S_PIXEL0 + 2, PeekL($07014000 + (48 * 256) + (20 * 4)))
+    nwPut(#NW_S_PIXEL0 + 3, PeekL($07014000 + (38 * 256) + (28 * 4)))
+    nwPut(#NW_S_PIXEL0 + 4, PeekL($07014000 + (32 * 256) + (32 * 4)))
+    nwPut(#NW_S_PIXEL0 + 5, PeekL($07014000 + (61 * 256) + (61 * 4)))
+    nwPut(#NW_S_PIXEL0 + 6, PeekL($07018000 + (0 * 256) + (0 * 4)))
+    nwPut(#NW_S_PIXEL0 + 7, PeekL($07018000 + (2 * 256) + (2 * 4)))
+    nwPut(#NW_S_PIXEL0 + 8, PeekL($07018000 + (32 * 256) + (32 * 4)))
+    nwPut(#NW_S_PIXEL0 + 9, PeekL($07018000 + (61 * 256) + (61 * 4)))
+    nwPut(#NW_S_PIXEL0 + 10, PeekL($07018000 + (61 * 256) + (2 * 4)))
+    nwPut(#NW_S_PIXEL0 + 11, PeekL($07018000 + (1 * 256) + (0 * 4)))
+  Else
+  If #NW_PROOF_MODE = 0
   nwPut(#NW_S_STEP, 5)
   rc = nwCapacityFrame()
   If rc <> #NW_OK
@@ -1053,7 +1100,7 @@ Procedure.i Main()
     vkDestroyInstance(inst, 0) : NeonShutdown()
     ProcedureReturn nwReturn(#NW_ERR_PIXELS)
   EndIf
-  EndIf
+  EndIf ; historical paired scenes only
 
   ; Bind the display owner's DMA path before the scene consumes the adapter's
   ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
@@ -1128,7 +1175,8 @@ Procedure.i Main()
   nwCapturePixels(imageBase, imagePitch)
   DisplayUseDma(0)
   DisplayFlush()
-  If #NW_WIDGET_ONLY = 0 : delay(#NW_SHOW_MS) : EndIf
+  If #NW_PROOF_MODE = 0 : delay(#NW_SHOW_MS) : EndIf
+  EndIf ; widget/display branch; mode 2 joins at teardown
 
   ; Destroy the production adapter first: it removes the complete callback
   ; family and retires every resource it owns. Then retire caller-owned Vulkan.

@@ -101,8 +101,8 @@ def check_source() -> int:
         "vkCreateRenderPass(dev, @passInfo, 0, @renderPass)",
         "vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)",
         "NvwaPrime()",
-        "If #NW_WIDGET_ONLY = 0",
-        "If #NW_WIDGET_ONLY = 0 : delay(#NW_SHOW_MS) : EndIf",
+        "If #NW_PROOF_MODE = 0",
+        "If #NW_PROOF_MODE = 0 : delay(#NW_SHOW_MS) : EndIf",
         "NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer",
         "rc = nwCapacityFrame()",
         "NeonVkChromeBoxBatchBegin()",
@@ -116,8 +116,8 @@ def check_source() -> int:
     for needle in required:
         if needle not in payload:
             fail(f"payload public production path missing: {needle}")
-    if not re.search(r"(?m)^\s*#NW_WIDGET_ONLY\s*=\s*[01]\s*$", payload):
-        fail("payload must select widget-only or historical full mode")
+    if not re.search(r"(?m)^\s*#NW_PROOF_MODE\s*=\s*[012]\s*$", payload):
+        fail("payload must select full, widget or fan/line mode")
 
     forbidden = (
         "vk_backend_test.pbi", "vulkan_production_probe", "PokeL(imageBase",
