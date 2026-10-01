@@ -1,0 +1,1410 @@
+; Pi 4 public Vulkan ordered draw-list scale proof. Diagnostic only.
+; Every vkCmdDraw paints its own 2x2 cell in one private 128x128 BGRA8 image.
+; The staged variants contain 64, 256, or 1024 ACTUAL draw commands in one
+; render pass and one queue submit. No CPU operation paints final pixels.
+; Run 64 first, then 256, then 1024 only after each prior report passes.
+; Returning RAM image: load $700000, stack $4F00000, 256-byte x0 report.
+
+#VTP_BLEND_PROOF = 0
+#VTP_LIST_PROOF = 1
+#VTP_INDEXED_PROOF = 0
+#VTP_PYRAMID_DEMO = 0
+
+#PMF_CHIP = 2711
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+CompilerIf #VTP_LIST_PROOF
+  #VTP_MAGIC = $564B4453               ; "VKDS", slot 0
+  #VTP_TAIL_MAGIC = $53444B56          ; "VKDS" reversed, slot 63
+CompilerElse
+  #VTP_MAGIC = $564B5452               ; "VKTR", slot 0
+  #VTP_TAIL_MAGIC = $52544B56          ; "VKTR" reversed, slot 63
+CompilerEndIf
+
+#VTP_ARENA = $0A000000
+#VTP_ARENA_BYTES = $01000000
+
+#VTP_SURFACE = $06000000
+#VTP_PANEL_W = 800
+#VTP_PANEL_H = 1280
+#VTP_VIEW_W = 128
+#VTP_VIEW_H = 128
+#VTP_PANEL_PITCH = 3200
+#VTP_SCREEN_BYTES = 4096000
+#VTP_WIN_BASE = $063E8000              ; $06000000 + 4,096,000
+CompilerIf #VTP_PYRAMID_DEMO = 6
+#VTP_WIN_BYTES = 6291456               ; two attachments, vertex and pipeline data
+#VTP_MAP_SPAN = #VTP_SCREEN_BYTES + #VTP_WIN_BYTES
+CompilerElse
+#VTP_WIN_BYTES = 8388608               ; bounded private Vulkan heap
+#VTP_MAP_SPAN = #VTP_SCREEN_BYTES + #VTP_WIN_BYTES
+CompilerEndIf
+#VTP_DSI_SCAN = $08A00000
+
+#VTP_GUARD = $5A3C0FF0
+
+; The clear and the two triangle colours, as binary32 bit patterns in
+; R, G, B, A order, and the packed words they must become.
+#VTP_F_ZERO = $00000000
+#VTP_F_ONE = $3F800000
+CompilerIf #VTP_LIST_PROOF
+  #VTP_CLEAR_R = $3E4CCCCD
+  #VTP_CLEAR_G = $3F000000
+  #VTP_CLEAR_B = $3F333333
+  #VTP_CLEAR_A = $3F800000
+  #VTP_CLEAR_WORD = $FF3380B2
+  #VTP_RED_WORD = $FFFF0000
+  #VTP_GREEN_WORD = $FF00FF00
+  #VTP_SOURCE_ALPHA = $3F000000
+CompilerElseIf #VTP_BLEND_PROOF
+  ; Source-over acceptance scene: half-alpha red/green over opaque blue.
+  ; V3D quantizes the source factor to 128/255 and its exact complement to
+  ; 127/255. The source channel is therefore 128 while surviving blue is 127.
+  #VTP_CLEAR_R = $00000000
+  #VTP_CLEAR_G = $00000000
+  #VTP_CLEAR_B = $3F800000
+  #VTP_CLEAR_A = $3F800000
+  #VTP_CLEAR_WORD = $FF0000FF
+  #VTP_RED_WORD = $BF80007F
+  #VTP_GREEN_WORD = $BF00807F
+  #VTP_SOURCE_ALPHA = $3F000000
+CompilerElse
+  #VTP_CLEAR_R = $3E4CCCCD               ; 0.2 -> 51
+  #VTP_CLEAR_G = $3F000000               ; 0.5 -> 128
+  #VTP_CLEAR_B = $3F333333               ; 0.7 -> 178
+  #VTP_CLEAR_A = $3F800000               ; 1.0 -> 255
+  #VTP_CLEAR_WORD = $FF3380B2
+  #VTP_RED_WORD = $FFFF0000
+  #VTP_GREEN_WORD = $FF00FF00
+  #VTP_SOURCE_ALPHA = $3F800000
+CompilerEndIf
+
+CompilerIf #VTP_LIST_PROOF
+  #VTP_LIST_DRAWS = 64                 ; runner substitutes 256 or 1024
+  #VTP_LIST_VERTICES = #VTP_LIST_DRAWS * 6
+CompilerEndIf
+
+; The triangle, in clip space. +Y is DOWN, which is Vulkan's framebuffer
+; orientation and the V3D rasteriser's.
+#VTP_X0 = $00000000                    ;  0.0
+#VTP_Y0 = $BF000000                    ; -0.5
+#VTP_X1 = $BF000000                    ; -0.5
+#VTP_Y1 = $3F000000                    ;  0.5
+#VTP_X2 = $3F000000                    ;  0.5
+#VTP_Y2 = $3F000000                    ;  0.5
+CompilerIf #VTP_PYRAMID_DEMO
+#VTP_STRIDE = 56                       ; vec4 object/scale + colour + two vec3 transform rows
+CompilerElse
+#VTP_STRIDE = 24                       ; vec2 position + vec4 colour
+CompilerEndIf
+
+; The six sample points. The odd viewport makes the triangle's apex
+; (399.5, 319.75) and its base run from (199.75, 959.25) to
+; (599.25, 959.25); every point below remains comfortably clear of an edge.
+#VTP_IN0X = 400
+#VTP_IN0Y = 500
+#VTP_IN1X = 400
+#VTP_IN1Y = 700
+#VTP_IN2X = 400
+#VTP_IN2Y = 900
+#VTP_OUT0X = 100
+#VTP_OUT0Y = 100
+#VTP_OUT1X = 700
+#VTP_OUT1Y = 1200
+#VTP_OUT2X = 400
+#VTP_OUT2Y = 200
+
+#VTP_SHOW_MS = 0
+
+#VSM_ERR_REFUSAL = 32
+#VSM_ERR_FULL_IMAGE = 33
+#VSM_ERR_GUARD = 34
+#VSM_ERR_ORDER = 35
+
+; ----------------------------------------------------------------------
+;  THE VERDICT. Slot 1 is the final status for this single render pass.
+; ----------------------------------------------------------------------
+#VTP_OK = 0
+#VTP_NOT_TRIED = 1
+#VTP_ERR_NEON = 6
+#VTP_ERR_WINDOW = 7
+#VTP_ERR_INSTANCE = 8
+#VTP_ERR_DEVICE = 9
+#VTP_ERR_IMAGE = 10
+#VTP_ERR_MEMORY = 11
+#VTP_ERR_BIND = 12
+#VTP_ERR_VIEW = 13
+#VTP_ERR_RENDERPASS = 14
+#VTP_ERR_FRAMEBUFFER = 15
+#VTP_ERR_BUFFER = 16
+#VTP_ERR_SHADER = 17
+#VTP_ERR_LAYOUT = 18
+#VTP_ERR_PIPELINE = 19
+#VTP_ERR_RECORD = 20
+#VTP_ERR_SUBMIT = 21
+#VTP_ERR_FENCE = 22
+#VTP_ERR_PIXELS_IN = 23
+#VTP_ERR_PIXELS_OUT = 24
+#VTP_ERR_GUARD_CHANGED = 25
+#VTP_ERR_NO_JOBS = 26
+#VTP_ERR_V3D_FAULT = 27
+#VTP_ERR_FORMAT = 28
+#VTP_ERR_MAP = 29
+#VTP_ERR_VIEWPORT_PACKET = 30
+#VTP_ERR_PRESENT = 31
+
+; ERR_STAT bit 12 is V3D_ERR_VCDI. The BCM2711 V3D 4.2 documentation names
+; the VCD-idle condition in this register, and every healthy silicon graphics
+; run records $1000 throughout. It is state evidence, not a job failure. Any
+; other ERR_STAT bit remains fatal.
+#VTP_ERRSTAT_BENIGN_VCDI = $00001000
+
+; Independent V3D 4.2 packet oracle for the consecutive draw-local override.
+; Packet 110 is CLIPPER_XY_SCALING and packet 108 is VIEWPORT_OFFSET.
+; CLIPPER_XY_SCALING consumes binary32 values in 1/256-pixel units. The
+; origin-zero half extents and the unsigned u14.8 VIEWPORT_OFFSET fields are
+; therefore both width/height multiplied by 128; only their bit encodings
+; differ.
+#VTP_PKT_CLIPPER_XY_SCALING = 110
+#VTP_PKT_VIEWPORT_OFFSET = 108
+#VTP_SCALE_X_BITS = $47C7C000
+#VTP_SCALE_Y_BITS = $481FE000
+#VTP_FINE_X = $00018F80
+#VTP_FINE_Y = $00027F80
+
+#VTP_P_NOT_TRIED = 0
+#VTP_P_OK = 1
+#VTP_P_ADOPT_REFUSED = 2
+
+; Report slots.
+#VTP_S_MAGIC = 0
+#VTP_S_STATUS = 1
+#VTP_S_DETAIL = 2
+#VTP_S_DETAIL2 = 3
+#VTP_S_STATUS2 = 4
+#VTP_S_SURFACE = 5
+#VTP_S_WIN_BASE = 6
+#VTP_S_WIN_BYTES = 7
+#VTP_S_IMG_ADDR = 8
+#VTP_S_IMG_SIZE = 9
+#VTP_S_IMG_PITCH = 10
+#VTP_S_VERTEX_ADDR = 11
+#VTP_S_PIPE_A = 12
+#VTP_S_PIPE_B = 13
+#VTP_S_CLEAR_WORD = 14
+#VTP_S_RED_WORD = 15
+#VTP_S_GREEN_WORD = 16
+#VTP_S_P1_IN0 = 17
+#VTP_S_P1_IN1 = 18
+#VTP_S_P1_IN2 = 19
+#VTP_S_P1_OUT0 = 20
+#VTP_S_P1_OUT1 = 21
+#VTP_S_P1_OUT2 = 22
+#VTP_S_P2_IN0 = 23
+#VTP_S_P2_IN1 = 24
+#VTP_S_P2_IN2 = 25
+#VTP_S_P2_OUT0 = 26
+#VTP_S_P2_OUT1 = 27
+#VTP_S_P2_OUT2 = 28
+#VTP_S_BIN_BEFORE = 29
+#VTP_S_BIN_AFTER = 30
+#VTP_S_RENDER_BEFORE = 31
+#VTP_S_RENDER_AFTER = 32
+#VTP_S_BIN_OOM = 33
+#VTP_S_BIN_ERRSTAT = 34
+#VTP_S_RENDER_ERRSTAT = 35
+#VTP_S_MMU_FAULTS = 36
+#VTP_S_MMU_VIOADDR = 37
+#VTP_S_GUARD_BEFORE = 38
+#VTP_S_GUARD_AFTER = 39
+#VTP_S_SUBMIT1 = 40
+#VTP_S_WAIT1 = 41
+#VTP_S_SUBMIT2 = 42
+#VTP_S_WAIT2 = 43
+#VTP_S_NATIVE = 44
+#VTP_S_FAULT_COUNT = 45
+#VTP_S_FAULT_TEXT = 46
+#VTP_S_PRESENT = 47
+#VTP_S_DISPLAY_ERR = 48
+#VTP_S_ARENA_NEED = 49
+#VTP_S_BACKEND_DRAW = 50
+#VTP_S_BACKEND_NAME = 51
+#VTP_S_LAYOUT_AFTER = 52
+#VTP_S_US1 = 53
+#VTP_S_US2 = 54
+#VTP_S_DRAWS = 55
+#VTP_S_SHREC = 56
+#VTP_S_CB_TEXT = 57
+#VTP_S_SHUTDOWN = 58
+#VTP_S_EMIT_STAGE = 59
+#VTP_S_QPU_ERR = 60
+; HOW FAR THE PAYLOAD GOT. Bumped at the head of every numbered step, so
+; a report always says which step was running - no reader ever has to
+; infer it from which slots look written. It is the answer to "was step
+; eight reached", and it costs one store per step.
+#VTP_S_STEP = 61
+; The block's own length in bytes, and a tail magic. A dump that stops
+; short does not reach the tail, so "I read the whole report" stops being
+; something a reader has to take on trust.
+#VTP_S_BYTES = 62
+#VTP_S_TAIL = 63
+
+; ======================================================================
+;  THE REPORT IS 32 BITS WIDE AND THAT IS NOT A DETAIL
+; ======================================================================
+;  The monitor's dump has three widths - md.b, md.w and md.l - AND NO
+;  64-BIT ONE, and its count is in BYTES whichever is chosen
+;  (Anvil/Core/memcmd.pbi, the width table). A report of 64-bit slots can
+;  therefore only ever be read as 128 32-bit words, and slot N appears at
+;  word 2N with a zero word beside it. That is exactly how the first
+;  board run of this diagnostic was misread: twelve words that decoded
+;  perfectly as slots 9 to 14 were read as slots 17 to 28, so the
+;  addresses and sizes in the middle of the block were taken for the
+;  pixel readbacks, and the two verdicts - which live at words 2 and 8 -
+;  were never read at all.
+;
+;  So the block is 32-BIT WORDS. One slot is one word, `md.l` shows them
+;  one per column, and the slot number in this file is the word number in
+;  the dump. Every value it carries fits: the addresses are payload and
+;  window addresses below 4 GiB, the pixels are 32-bit words by
+;  definition, and the guard sum is masked to 32 bits below.
+; ======================================================================
+Global Dim vtpReport.l[64]
+Global Dim vtpClear.l[4]
+Global Dim vtpPush.l[4]
+; dma.pi4 needs a 512-byte block aligned to 256. Keeping the storage in the
+; returning payload makes the DMA presentation independent of monitor state.
+Global Dim vtpDmaScratch.a[768]
+
+; The four SPIR-V modules are assembled by
+; Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi, which the desk gate walks
+; too - so the exact words this payload hands the front end are the words
+; a gate has already checked against an independent assembler.
+
+Procedure vtpPut(slot.i, value.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn
+  EndIf
+  vtpReport[slot] = value & $FFFFFFFF
+EndProcedure
+
+; Read a slot back WITHOUT the sign of a 32-bit load leaking into a
+; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
+; comparing that against the constant $FFFF0000 would fail on every
+; correct run - which is the one way a width change like this turns a
+; green board into a red one.
+Procedure.i vtpGet(slot.i)
+  If slot < 0 Or slot > 63
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn vtpReport[slot] & $FFFFFFFF
+EndProcedure
+
+; Mark the numbered step that is now running. The report carries the
+; highest one reached, so a run that stopped says where.
+Procedure vtpStep(n.i)
+  vtpPut(#VTP_S_STEP, n)
+EndProcedure
+
+Procedure.i vtpStop(status.i)
+  vtpPut(#VTP_S_STATUS, status)
+  vtpPut(#VTP_S_FAULT_TEXT, AnvilVkFaultText())
+  vtpPut(#VTP_S_FAULT_COUNT, AnvilVkFaultCount())
+  ProcedureReturn @vtpReport[0]
+EndProcedure
+
+Procedure.i vtpSum(base.i, bytes.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < bytes
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFF
+    i = i + 4
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+Procedure vtpFill(base.i, bytes.i, word.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(base + i, word)
+    i = i + 4
+  Wend
+EndProcedure
+
+Procedure.i vtpPixel(imgBase.i, pitch.i, x.i, y.i)
+  ProcedureReturn PeekL(imgBase + (y * pitch) + (x * 4)) & $FFFFFFFF
+EndProcedure
+
+CompilerIf #VTP_LIST_PROOF
+Procedure vtpListVertex(base.i, index.i, xbits.i, ybits.i, rbits.i, gbits.i, bbits.i, abits.i)
+  Define p.i = base + (index * #VTP_STRIDE)
+  PokeL(p + 0, xbits) : PokeL(p + 4, ybits)
+  PokeL(p + 8, rbits) : PokeL(p + 12, gbits)
+  PokeL(p + 16, bbits) : PokeL(p + 20, abits)
+EndProcedure
+
+Procedure vtpListRect(base.i, first.i, x0.i, y0.i, x1.i, y1.i, r.i, g.i, b.i, a.i)
+  vtpListVertex(base, first + 0, x0, y0, r, g, b, a)
+  vtpListVertex(base, first + 1, x0, y1, r, g, b, a)
+  vtpListVertex(base, first + 2, x1, y1, r, g, b, a)
+  vtpListVertex(base, first + 3, x0, y0, r, g, b, a)
+  vtpListVertex(base, first + 4, x1, y1, r, g, b, a)
+  vtpListVertex(base, first + 5, x1, y0, r, g, b, a)
+EndProcedure
+
+; Integer pixel boundaries on the 128-wide viewport are exact binary32
+; multiples of 1/64, so adjacent draw cells never rely on rounding luck.
+Procedure.i vtpScaleClipBits(pixel.i)
+  Define n.i
+  Define sign.i
+  Define bits.i
+  n = pixel - 64
+  If n = 0 : ProcedureReturn 0 : EndIf
+  If n < 0 : sign = $80000000 : n = 0 - n : EndIf
+  bits = avkqF32FromInt(n)
+  ; Divide the exact integer float by 64 by lowering its biased exponent.
+  ProcedureReturn ((bits - (6 << 23)) | sign) & $FFFFFFFF
+EndProcedure
+CompilerEndIf
+
+CompilerIf #VTP_PYRAMID_DEMO
+Global vtpRowX0.f, vtpRowX1.f, vtpRowX2.f
+Global vtpRowY0.f, vtpRowY1.f, vtpRowY2.f
+
+Procedure vtpPyramidVertex(base.i, index.i, x.f, y.f, z.f, scale.f, r.i, g.i, b.i)
+  Define p.i = base + index * #VTP_STRIDE
+  PokeL(p + 0, PeekL(@x)) : PokeL(p + 4, PeekL(@y))
+  PokeL(p + 8, PeekL(@z)) : PokeL(p + 12, PeekL(@scale))
+  PokeL(p + 16, r) : PokeL(p + 20, g)
+  PokeL(p + 24, b) : PokeL(p + 28, #VTP_F_ONE)
+  PokeL(p + 32, PeekL(@vtpRowX0)) : PokeL(p + 36, PeekL(@vtpRowX1))
+  PokeL(p + 40, PeekL(@vtpRowX2)) : PokeL(p + 44, PeekL(@vtpRowY0))
+  PokeL(p + 48, PeekL(@vtpRowY1)) : PokeL(p + 52, PeekL(@vtpRowY2))
+EndProcedure
+
+Procedure vtpPyramidFrame(base.i, ca.f, sa.f)
+  Define Dim x.f[5]
+  Define Dim y.f[5]
+  Define Dim z.f[5]
+  Define Dim depth.f[5]
+  Define Dim scales.f[5]
+  Define Dim faceDepth.f[4]
+  Define Dim order.i[4]
+  Define i.i, j.i, face.i, a.i, b.i, d.i, tmp.i
+  Define zz.f, scale.f
+  Define red.i, green.i, blue.i
+  vtpRowX0 = ca * 0.82 : vtpRowX1 = 0.0 : vtpRowX2 = sa * 0.82
+  vtpRowY0 = sa * 0.42 * 0.72 : vtpRowY1 = 0.91 * 0.72 : vtpRowY2 = 0.0 - ca * 0.42 * 0.72
+  x[0] = 0.0 : y[0] = 1.25 : z[0] = 0.0
+  x[1] = -1.0 : y[1] = -0.80 : z[1] = -1.0
+  x[2] = 1.0 : y[2] = -0.80 : z[2] = -1.0
+  x[3] = 1.0 : y[3] = -0.80 : z[3] = 1.0
+  x[4] = -1.0 : y[4] = -0.80 : z[4] = 1.0
+  For i = 0 To 4
+    zz = z[i] * ca - x[i] * sa
+    depth[i] = zz * 0.91 + y[i] * 0.42
+    scale = 1.65 / (3.6 - depth[i])
+    scales[i] = scale
+  Next
+  For face = 0 To 3
+    order[face] = face
+    a = face + 1 : b = (face + 1) % 4 + 1
+    faceDepth[face] = (depth[0] + depth[a] + depth[b]) / 3.0
+  Next
+  ; No depth attachment yet: submit the convex faces back to front.
+  For i = 0 To 2
+    For j = i + 1 To 3
+      If faceDepth[order[j]] < faceDepth[order[i]]
+        tmp = order[i] : order[i] = order[j] : order[j] = tmp
+      EndIf
+    Next
+  Next
+  For i = 0 To 3
+    face = order[i]
+    a = face + 1 : b = (face + 1) % 4 + 1
+    Select face
+      Case 0 : red = $3F666666 : green = $3E99999A : blue = $3E4CCCCD
+      Case 1 : red = $3E4CCCCD : green = $3F333333 : blue = $3F666666
+      Case 2 : red = $3F666666 : green = $3ECCCCCD : blue = $3F333333
+      Default : red = $3F333333 : green = $3E99999A : blue = $3F666666
+    EndSelect
+    d = i * 3
+    vtpPyramidVertex(base, d + 0, x[0], y[0], z[0], scales[0], red, green, blue)
+    vtpPyramidVertex(base, d + 1, x[a], y[a], z[a], scales[a], red, green, blue)
+    vtpPyramidVertex(base, d + 2, x[b], y[b], z[b], scales[b], red, green, blue)
+  Next
+EndProcedure
+CompilerEndIf
+
+; Control-list words are byte-aligned, not naturally aligned. Read them the
+; same byte-wise way the V3D packet encoder writes them.
+Procedure.i vtpLe32(addr.i)
+  ProcedureReturn (PeekA(addr) & $FF) | ((PeekA(addr + 1) & $FF) << 8) | ((PeekA(addr + 2) & $FF) << 16) | ((PeekA(addr + 3) & $FF) << 24)
+EndProcedure
+
+; Return the byte offset of the exact consecutive scaling/offset pair. A
+; single opcode byte is not evidence because arbitrary packet payload can
+; contain the same value.
+Procedure.i vtpFindOddViewportPackets(base.i, bytes.i)
+  Define i.i
+  If base = 0 Or bytes < 18 : ProcedureReturn -1 : EndIf
+  i = 0
+  While i <= bytes - 18
+    If (PeekA(base + i) & $FF) = #VTP_PKT_CLIPPER_XY_SCALING
+      If vtpLe32(base + i + 1) = #VTP_SCALE_X_BITS And vtpLe32(base + i + 5) = #VTP_SCALE_Y_BITS
+        If (PeekA(base + i + 9) & $FF) = #VTP_PKT_VIEWPORT_OFFSET
+          If vtpLe32(base + i + 10) = #VTP_FINE_X And vtpLe32(base + i + 14) = #VTP_FINE_Y
+            ProcedureReturn i
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+; The indexed proof deliberately makes setup and draw adjacent. Compare every
+; field, not merely the opcodes: opcode-like payload bytes are common in a BCL.
+Procedure.i vtpFindIndexedPackets(base.i, bytes.i, indexBase.i, indexBytes.i)
+  Define i.i
+  If base = 0 Or bytes < 19 : ProcedureReturn -1 : EndIf
+  i = 0
+  While i <= bytes - 19
+    If (PeekA(base + i) & $FF) = 44 And vtpLe32(base + i + 1) = indexBase And vtpLe32(base + i + 5) = indexBytes
+      If (PeekA(base + i + 9) & $FF) = 32 And (PeekA(base + i + 10) & $FF) = $44
+        If vtpLe32(base + i + 11) = 3 And vtpLe32(base + i + 15) = 2
+          ProcedureReturn i
+        EndIf
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define img.i
+  Define mem.i
+  Define view.i
+  Define rp.i
+  Define fb.i
+  Define buf.i
+  Define bmem.i
+  Define ibuf.i
+  Define imem.i
+  Define fence.i
+  Define count.i
+  Define scaleDraw.i
+  Define scaleX.i
+  Define scaleY.i
+  Define scaleR.i
+  Define scaleG.i
+  Define scaleHash.i
+  Define imgBase.i
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  Define imgSmall.i
+  Define memSmall.i
+  Define viewSmall.i
+  Define fbSmall.i
+  Define imgSmallBase.i
+  Define imageSmallPitch.i
+CompilerEndIf
+  Define vaddr.i
+  Define iaddr.i
+  Define mapped.i
+  Define pitch.i
+  Define imagePitch.i
+  Define vsA.i
+  Define fsA.i
+  Define vsB.i
+  Define fsB.i
+  Define layA.i
+  Define layB.i
+  Define pipeA.i
+  Define pipeB.i
+  Define pipeC.i
+  Define pipelineCache.i
+  Define pipelineCacheSize.i
+  Define bytesA.i
+  Define bytesB.i
+  Define bytesC.i
+  Define bytesD.i
+  Define t0.i
+  Define hz.i
+  Define badIn.i
+  Define badOut.i
+  Define viewportPacket.i
+  Define indexPacket.i
+  Define drawsBefore.i
+  Define dmaScratch.i
+  Define dmaBefore.i
+CompilerIf #VTP_PYRAMID_DEMO
+  Define frame.i
+  Define pyramidCos.f, pyramidSin.f, nextCos.f, nextSin.f
+  Define pyramidStart.i
+CompilerEndIf
+
+  Define ici.VkInstanceCreateInfo
+  Define fp.VkFormatProperties
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo
+  Define smci.VkShaderModuleCreateInfo
+  Define plci.VkPipelineLayoutCreateInfo
+  Define cacheInfo.VkPipelineCacheCreateInfo
+  Define Dim cacheData.a[32]
+  Define pcr.VkPushConstantRange
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define bind.VkVertexInputBindingDescription
+  Define Dim attrs.VkVertexInputAttributeDescription[4]
+  Define vi.VkPipelineVertexInputStateCreateInfo
+  Define ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vpstate.VkPipelineViewportStateCreateInfo
+  Define vp.VkViewport
+  Define sc.VkRect2D
+CompilerIf #VTP_PYRAMID_DEMO >= 2
+  Define dynamicState.VkPipelineDynamicStateCreateInfo
+  Define Dim dynamicKinds.l[2]
+CompilerEndIf
+  Define rs.VkPipelineRasterizationStateCreateInfo
+  Define ms.VkPipelineMultisampleStateCreateInfo
+  Define sampleMaskZero.l = 0
+  Define cba.VkPipelineColorBlendAttachmentState
+  Define cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define cbHandle.i
+  Define fenceArray.i
+  Define bufHandle.i
+  Define bufOffset.q
+  Define ca.VkClearAttachment
+  Define cr.VkClearRect
+  Define x.i
+  Define y.i
+  Define got.i
+  Define want.i
+  Define bad.i
+  Define firstBad.i
+  Define paddingBad.i
+  Define guard0.i
+  Define guard1.i
+  Define bin0.i
+  Define render0.i
+  Define negativeBin.i
+  Define negativeRender.i
+
+  vtpPut(#VTP_S_MAGIC, #VTP_MAGIC)
+  vtpPut(#VTP_S_TAIL, #VTP_TAIL_MAGIC)
+  vtpPut(#VTP_S_BYTES, 256)
+  vtpStep(0)
+  vtpPut(#VTP_S_STATUS, #VTP_ERR_NEON)
+  vtpPut(#VTP_S_STATUS2, #VTP_NOT_TRIED)
+  vtpPut(#VTP_S_PRESENT, #VTP_P_NOT_TRIED)
+  vtpPut(#VTP_S_SURFACE, #VTP_SURFACE)
+  vtpPut(#VTP_S_WIN_BASE, #VTP_WIN_BASE)
+  vtpPut(#VTP_S_WIN_BYTES, #VTP_WIN_BYTES)
+  vtpPut(#VTP_S_CLEAR_WORD, #VTP_CLEAR_WORD)
+  vtpPut(#VTP_S_RED_WORD, #VTP_RED_WORD)
+  vtpPut(#VTP_S_GREEN_WORD, #VTP_GREEN_WORD)
+  TimerInit()
+  hz = TickHz() / 1000000
+  If hz < 1
+    hz = 1
+  EndIf
+  pitch = #VTP_PANEL_PITCH
+
+  ; The guard half, filled before anything else touches the engine.
+  vtpFill(#VTP_SURFACE, #VTP_SCREEN_BYTES, #VTP_GUARD)
+
+  ; ------------------------------------------------------------------
+  ;  1. The graphics engine, over memory this payload owns.
+  ; ------------------------------------------------------------------
+  vtpStep(1)
+  If NeonArena(#VTP_ARENA, #VTP_ARENA_BYTES) <> #NEON_OK
+    vtpPut(#VTP_S_DETAIL, Neon_Error())
+    ProcedureReturn vtpStop(#VTP_ERR_NEON)
+  EndIf
+  If NeonSurface(#VTP_SURFACE, #VTP_PANEL_W, #VTP_PANEL_H, pitch) <> #NEON_OK
+    vtpPut(#VTP_S_DETAIL, Neon_Error())
+    ProcedureReturn vtpStop(#VTP_ERR_NEON)
+  EndIf
+  NeonSurfaceMapSpan(#VTP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK
+    vtpPut(#VTP_S_DETAIL, Neon_Error())
+    vtpPut(#VTP_S_DETAIL2, Neon_ArenaNeed())
+    ProcedureReturn vtpStop(#VTP_ERR_NEON)
+  EndIf
+  vtpPut(#VTP_S_ARENA_NEED, Neon_ArenaNeed())
+
+  ; ------------------------------------------------------------------
+  ;  2. The Vulkan device, over the memory above the surface.
+  ; ------------------------------------------------------------------
+  vtpStep(2)
+  rc = AnvilVkV3dWindow(#VTP_WIN_BASE, #VTP_WIN_BYTES)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_WINDOW)
+  EndIf
+  vtpPut(#VTP_S_BACKEND_DRAW, AnvilVkBackendCanDraw())
+  vtpPut(#VTP_S_BACKEND_NAME, AnvilVkBackendName())
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_INSTANCE)
+  EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_INSTANCE)
+  EndIf
+  vkGetPhysicalDeviceFormatProperties(phys, #VK_FORMAT_B8G8R8A8_UNORM, @fp)
+  If fp\linearTilingFeatures <> (#VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | #VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) Or fp\optimalTilingFeatures <> #VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT Or fp\bufferFeatures <> 0
+    vtpPut(#VTP_S_DETAIL, fp\linearTilingFeatures)
+    vtpPut(#VTP_S_DETAIL2, fp\optimalTilingFeatures | fp\bufferFeatures)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_FORMAT)
+  EndIf
+  prio = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @dev)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_DEVICE)
+  EndIf
+  cacheInfo\sType = #VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO
+  rc = vkCreatePipelineCache(dev, @cacheInfo, 0, @pipelineCache)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  pipelineCacheSize = 32
+  rc = vkGetPipelineCacheData(dev, pipelineCache, @pipelineCacheSize, @cacheData[0])
+  If rc <> #VK_SUCCESS Or pipelineCacheSize <> 32 Or PeekL(@cacheData[0]) <> 32 Or PeekL(@cacheData[4]) <> 1
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_DEVICE)
+  EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool
+  cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_DEVICE)
+  EndIf
+
+  ; ------------------------------------------------------------------
+  ;  3. The colour attachment at the panel's native extent.
+  ; ------------------------------------------------------------------
+  vtpStep(3)
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #VTP_VIEW_W
+  imgci\extent\height = #VTP_VIEW_H
+  imgci\extent\depth = 1
+  imgci\mipLevels = 1
+  imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(dev, @imgci, 0, @img)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size
+  mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(dev, @mai, 0, @mem)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_MEMORY)
+  EndIf
+  rc = vkBindImageMemory(dev, img, mem, 0)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_BIND)
+  EndIf
+  imgBase = AnvilVkImageAddress(img)
+  vtpPut(#VTP_S_IMG_ADDR, imgBase)
+  vtpPut(#VTP_S_IMG_SIZE, req\size)
+  imagePitch = AnvilVkImageRowPitch(img)
+  vtpPut(#VTP_S_IMG_PITCH, imagePitch)
+  ; POISON IT through the public mapping API. An image that already held an
+  ; answer would prove nothing, and the map must name the bound image bytes.
+  mapped = 0
+  If vkMapMemory(dev, mem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> imgBase
+    vtpPut(#VTP_S_DETAIL, mapped)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  vtpFill(mapped, req\size, ~#VTP_CLEAR_WORD)
+  vkUnmapMemory(dev, mem)
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img
+  ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1
+  ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_VIEW)
+  EndIf
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM
+  att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0
+  aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1
+  sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1
+  rpci\pAttachments = @att
+  rpci\subpassCount = 1
+  rpci\pSubpasses = @sub
+  rc = vkCreateRenderPass(dev, @rpci, 0, @rp)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_RENDERPASS)
+  EndIf
+
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp
+  fbci\attachmentCount = 1
+  fbci\pAttachments = @view
+  fbci\width = #VTP_VIEW_W
+  fbci\height = #VTP_VIEW_H
+  fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_FRAMEBUFFER)
+  EndIf
+CompilerIf #VTP_PYRAMID_DEMO = 6
+  ; A separate attachment and framebuffer at half extent share the render
+  ; pass and pipeline. Alternating them exercises real target rebinds.
+  imgci\extent\width = 400 : imgci\extent\height = 640
+  If vkCreateImage(dev, @imgci, 0, @imgSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_IMAGE)
+  EndIf
+  vkGetImageMemoryRequirements(dev, imgSmall, @req)
+  mai\allocationSize = req\size
+  rc = vkAllocateMemory(dev, @mai, 0, @memSmall)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, req\size)
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MEMORY)
+  EndIf
+  rc = vkBindImageMemory(dev, imgSmall, memSmall, 0)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc) : vtpPut(#VTP_S_DETAIL2, req\size)
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_BIND)
+  EndIf
+  imgSmallBase = AnvilVkImageAddress(imgSmall)
+  imageSmallPitch = AnvilVkImageRowPitch(imgSmall)
+  mapped = 0
+  If vkMapMemory(dev, memSmall, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> imgSmallBase
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  vtpFill(mapped, req\size, ~#VTP_CLEAR_WORD)
+  vkUnmapMemory(dev, memSmall)
+  ivci\image = imgSmall
+  If vkCreateImageView(dev, @ivci, 0, @viewSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_VIEW)
+  EndIf
+  fbci\pAttachments = @viewSmall
+  fbci\width = 400 : fbci\height = 640
+  If vkCreateFramebuffer(dev, @fbci, 0, @fbSmall) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_FRAMEBUFFER)
+  EndIf
+CompilerEndIf
+
+  ; ------------------------------------------------------------------
+  ;  4. The vertex buffer. Three vertices, position and colour, and the
+  ;     same array serves both pipelines: the uniform-colour one
+  ;     declares one attribute over the same stride and simply never
+  ;     fetches the colour.
+  ; ------------------------------------------------------------------
+  vtpStep(4)
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+CompilerIf #VTP_LIST_PROOF
+  bufci\size = #VTP_LIST_VERTICES * #VTP_STRIDE
+CompilerElse
+  bufci\size = 3 * #VTP_STRIDE
+CompilerEndIf
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+  bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  If vkCreateBuffer(dev, @bufci, 0, @buf) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, buf, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @bmem) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
+  EndIf
+  If vkBindBufferMemory(dev, buf, bmem, 0) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
+  EndIf
+  vaddr = AnvilVkBufferAddress(buf)
+  vtpPut(#VTP_S_VERTEX_ADDR, vaddr)
+  mapped = 0
+  If vkMapMemory(dev, bmem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> vaddr
+    vtpPut(#VTP_S_DETAIL, mapped)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+CompilerIf #VTP_LIST_PROOF
+  ; A 32x32 grid of 4x4 cells. Each draw owns only the central 2x2 pixels.
+  ; First-vertex changes for every draw; all N calls must reach the backend.
+  For scaleDraw = 0 To #VTP_LIST_DRAWS - 1
+    scaleX = (scaleDraw % 32) * 4 + 1
+    scaleY = (scaleDraw / 32) * 4 + 1
+    scaleR = #VTP_F_ONE : scaleG = #VTP_F_ZERO
+    If (scaleDraw & 1) <> 0
+      scaleR = #VTP_F_ZERO : scaleG = #VTP_F_ONE
+    EndIf
+    vtpListRect(mapped, scaleDraw * 6, vtpScaleClipBits(scaleX), vtpScaleClipBits(scaleY), vtpScaleClipBits(scaleX + 2), vtpScaleClipBits(scaleY + 2), scaleR, scaleG, #VTP_F_ZERO, #VTP_F_ONE)
+  Next
+CompilerElse
+  PokeL(mapped + 0, #VTP_X0)
+  PokeL(mapped + 4, #VTP_Y0)
+  PokeL(mapped + 8, #VTP_F_ZERO)
+  PokeL(mapped + 12, #VTP_F_ONE)
+  PokeL(mapped + 16, #VTP_F_ZERO)
+  PokeL(mapped + 20, #VTP_SOURCE_ALPHA)
+  PokeL(mapped + 24, #VTP_X1)
+  PokeL(mapped + 28, #VTP_Y1)
+  PokeL(mapped + 32, #VTP_F_ZERO)
+  PokeL(mapped + 36, #VTP_F_ONE)
+  PokeL(mapped + 40, #VTP_F_ZERO)
+  PokeL(mapped + 44, #VTP_SOURCE_ALPHA)
+  PokeL(mapped + 48, #VTP_X2)
+  PokeL(mapped + 52, #VTP_Y2)
+  PokeL(mapped + 56, #VTP_F_ZERO)
+  PokeL(mapped + 60, #VTP_F_ONE)
+  PokeL(mapped + 64, #VTP_F_ZERO)
+  PokeL(mapped + 68, #VTP_SOURCE_ALPHA)
+CompilerEndIf
+  vkUnmapMemory(dev, bmem)
+
+CompilerIf #VTP_INDEXED_PROOF
+  ; Bind at byte four and draw from firstIndex one. The dummy element at the
+  ; bind base is not selected; the GPU must fetch 2,0,1 from byte offset two.
+  bufci\size = 16 : bufci\usage = #VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+  If vkCreateBuffer(dev, @bufci, 0, @ibuf) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
+  EndIf
+  vkGetBufferMemoryRequirements(dev, ibuf, @req) : mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @imem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, ibuf, imem, 0) <> #VK_SUCCESS
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
+  EndIf
+  iaddr = AnvilVkBufferAddress(ibuf) : mapped = 0
+  If vkMapMemory(dev, imem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> iaddr
+    NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
+  EndIf
+  PokeW(mapped + 4, 99) : PokeW(mapped + 6, 2)
+  PokeW(mapped + 8, 0) : PokeW(mapped + 10, 1)
+CompilerIf #VTP_PYRAMID_DEMO = 8
+  ; One dummy index followed by the four corners of the strip.
+  PokeW(mapped + 6, 0) : PokeW(mapped + 8, 1)
+  PokeW(mapped + 10, 2) : PokeW(mapped + 12, 3)
+CompilerEndIf
+  vkUnmapMemory(dev, imem)
+CompilerEndIf
+
+  ; ------------------------------------------------------------------
+  ;  5. Four shader modules, two layouts, two pipelines.
+  ; ------------------------------------------------------------------
+  vtpStep(5)
+  bytesA = vtpBuildVsA()
+  bytesB = vtpBuildFsA()
+CompilerIf #VTP_PYRAMID_DEMO
+  bytesC = vtpBuildVsBScaled()
+CompilerElse
+  bytesC = vtpBuildVsB()
+CompilerEndIf
+  bytesD = vtpBuildFsB()
+  smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  smci\pCode = @vtpVsA[0]
+  smci\codeSize = bytesA
+  rc = vkCreateShaderModule(dev, @smci, 0, @vsA)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpFsA[0]
+  smci\codeSize = bytesB
+  rc = vkCreateShaderModule(dev, @smci, 0, @fsA)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_SHADER)
+  EndIf
+CompilerIf #VTP_PYRAMID_DEMO
+  smci\pCode = @vtpVsBScaled[0]
+CompilerElse
+  smci\pCode = @vtpVsB[0]
+CompilerEndIf
+  smci\codeSize = bytesC
+  rc = vkCreateShaderModule(dev, @smci, 0, @vsB)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_SHADER)
+  EndIf
+  smci\pCode = @vtpFsB[0]
+  smci\codeSize = bytesD
+  rc = vkCreateShaderModule(dev, @smci, 0, @fsB)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_DETAIL2, AnvilVkSpirvLastOpcode())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_SHADER)
+  EndIf
+
+  pcr\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  pcr\offset = 0
+  pcr\size = 16
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  plci\pushConstantRangeCount = 1
+  plci\pPushConstantRanges = @pcr
+  If vkCreatePipelineLayout(dev, @plci, 0, @layA) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_LAYOUT)
+  EndIf
+  plci\pushConstantRangeCount = 0
+  plci\pPushConstantRanges = 0
+  If vkCreatePipelineLayout(dev, @plci, 0, @layB) <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_LAYOUT)
+  EndIf
+
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  ia\primitiveRestartEnable = #VK_FALSE
+  PokeL(@vp\x, #VTP_F_ZERO)
+  PokeL(@vp\y, #VTP_F_ZERO)
+  PokeL(@vp\width, $43000000)            ; 128.0
+  PokeL(@vp\height, $43000000)           ; 128.0
+  PokeL(@vp\minDepth, #VTP_F_ZERO)
+  PokeL(@vp\maxDepth, #VTP_F_ONE)
+  sc\offset\x = 0
+  sc\offset\y = 0
+  sc\extent\width = #VTP_VIEW_W
+  sc\extent\height = #VTP_VIEW_H
+  vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vpstate\viewportCount = 1
+  vpstate\pViewports = @vp
+  vpstate\scissorCount = 1
+  vpstate\pScissors = @sc
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL
+  rs\cullMode = #VK_CULL_MODE_NONE
+  rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, #VTP_F_ONE)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+  ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+CompilerIf #VTP_BLEND_PROOF
+  cba\blendEnable = #VK_TRUE
+  cba\srcColorBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
+  cba\dstColorBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+  cba\colorBlendOp = #VK_BLEND_OP_ADD
+  cba\srcAlphaBlendFactor = #VK_BLEND_FACTOR_SRC_ALPHA
+  cba\dstAlphaBlendFactor = #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+  cba\alphaBlendOp = #VK_BLEND_OP_ADD
+CompilerElse
+  cba\blendEnable = #VK_FALSE
+CompilerEndIf
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+  cb\attachmentCount = 1
+  cb\pAttachments = @cba
+
+  bind\binding = 0
+  bind\stride = #VTP_STRIDE
+  bind\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  attrs[0]\location = 0
+  attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32_SFLOAT
+  attrs[0]\offset = 0
+  attrs[1]\location = 1
+  attrs[1]\binding = 0
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+CompilerIf #VTP_PYRAMID_DEMO
+  attrs[1]\offset = 16
+CompilerElse
+  attrs[1]\offset = 8
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO
+  attrs[2]\location = 2
+  attrs[2]\binding = 0
+  attrs[2]\format = #VK_FORMAT_R32G32B32_SFLOAT
+  attrs[2]\offset = 32
+  attrs[3]\location = 3
+  attrs[3]\binding = 0
+  attrs[3]\format = #VK_FORMAT_R32G32B32_SFLOAT
+  attrs[3]\offset = 44
+CompilerEndIf
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\vertexBindingDescriptionCount = 1
+  vi\pVertexBindingDescriptions = @bind
+  vi\vertexAttributeDescriptionCount = 1
+  vi\pVertexAttributeDescriptions = @attrs[0]
+
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT
+  stages[0]\module = vsA
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT
+  stages[1]\module = fsA
+
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2
+  gp\pStages = @stages[0]
+  gp\pVertexInputState = @vi
+  gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vpstate
+  gp\pRasterizationState = @rs
+  gp\pMultisampleState = @ms
+  gp\pColorBlendState = @cb
+  gp\layout = layA
+  gp\renderPass = rp
+  gp\subpass = 0
+  gp\basePipelineIndex = -1
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeA)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
+    vtpPut(#VTP_S_QPU_ERR, AnvilVkV3dShaderError())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  vtpPut(#VTP_S_PIPE_A, AnvilVkPipelineCodeBase(pipeA))
+
+CompilerIf #VTP_LIST_PROOF
+  ; A second opaque push-colour pipeline snapshots sample bit zero as clear.
+  ; Restore the null mask before creating the ordinary varying pipeline.
+  ms\pSampleMask = @sampleMaskZero
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeC)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  ms\pSampleMask = 0
+CompilerEndIf
+
+  stages[0]\module = vsB
+  stages[1]\module = fsB
+CompilerIf #VTP_PYRAMID_DEMO
+  attrs[0]\format = #VK_FORMAT_R32G32B32A32_SFLOAT
+  vi\vertexAttributeDescriptionCount = 4
+CompilerElse
+  vi\vertexAttributeDescriptionCount = 2
+CompilerEndIf
+  gp\layout = layB
+CompilerIf #VTP_PYRAMID_DEMO >= 7
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO >= 4 And #VTP_PYRAMID_DEMO <= 5
+  ; Static scissor is intentionally smaller and offset independently of the
+  ; viewport. Pipeline creation snapshots it before the frame loop.
+  sc\offset\x = 200 : sc\offset\y = 320
+  sc\extent\width = 200 : sc\extent\height = 640
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO = 5
+  PokeL(@vp\x, $43480000) : PokeL(@vp\y, $43A00000)
+  PokeL(@vp\width, $43C80000) : PokeL(@vp\height, $44200000)
+CompilerEndIf
+CompilerIf #VTP_PYRAMID_DEMO >= 2
+CompilerIf #VTP_PYRAMID_DEMO <> 5 And #VTP_PYRAMID_DEMO < 7
+  dynamicKinds[0] = #VK_DYNAMIC_STATE_VIEWPORT
+CompilerIf #VTP_PYRAMID_DEMO = 4
+  dynamicState\dynamicStateCount = 1
+CompilerElse
+  dynamicKinds[1] = #VK_DYNAMIC_STATE_SCISSOR
+  dynamicState\dynamicStateCount = 2
+CompilerEndIf
+  dynamicState\sType = #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+  dynamicState\pDynamicStates = @dynamicKinds[0]
+  gp\pDynamicState = @dynamicState
+CompilerEndIf
+CompilerEndIf
+  rc = vkCreateGraphicsPipelines(dev, pipelineCache, 1, @gp, 0, @pipeB)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_EMIT_STAGE, AnvilVkV3dShaderStage())
+    vtpPut(#VTP_S_QPU_ERR, AnvilVkV3dShaderError())
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_PIPELINE)
+  EndIf
+  vtpPut(#VTP_S_PIPE_B, AnvilVkPipelineCodeBase(pipeB))
+
+  ; The framebuffer is 128x128. The original panel-sized Neon surface remains
+  ; a separate guard; the image and all draws live in the offscreen window.
+  vtpStep(6)
+  PokeL(@vtpClear[0] + 0, #VTP_CLEAR_R)
+  PokeL(@vtpClear[0] + 4, #VTP_CLEAR_G)
+  PokeL(@vtpClear[0] + 8, #VTP_CLEAR_B)
+  PokeL(@vtpClear[0] + 12, #VTP_CLEAR_A)
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp
+  rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #VTP_VIEW_W
+  rpbi\renderArea\extent\height = #VTP_VIEW_H
+  rpbi\clearValueCount = 1
+  rpbi\pClearValues = @vtpClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  rc = vkBeginCommandBuffer(cmd, @bi)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_RECORD)
+  EndIf
+  bufHandle = buf
+  bufOffset = 0
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
+  For scaleDraw = 0 To #VTP_LIST_DRAWS - 1
+    vkCmdDraw(cmd, 6, 1, scaleDraw * 6, 0)
+  Next
+  vkCmdEndRenderPass(cmd)
+  rc = vkEndCommandBuffer(cmd)
+  vtpPut(23, rc)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    vtpPut(#VTP_S_CB_TEXT, AnvilVkCommandBufferFailureText(cmd))
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_RECORD)
+  EndIf
+
+  ; A separate guard follows the complete Vulkan allocation window. Neither
+  ; guard is part of the image and neither is a source for expected pixels.
+  vtpFill(#VTP_WIN_BASE + #VTP_WIN_BYTES, 256, #VTP_GUARD)
+  guard0 = vtpSum(#VTP_SURFACE, #VTP_SCREEN_BYTES)
+  guard1 = vtpSum(#VTP_WIN_BASE + #VTP_WIN_BYTES, 256)
+  vtpPut(32, guard0)
+  vtpPut(34, guard1)
+  bin0 = V3dBinJobs()
+  render0 = V3dRenderJobs()
+  vtpPut(24, bin0)
+  vtpPut(26, render0)
+  vtpPut(38, avkBackendDraws())
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  rc = vkCreateFence(dev, @fci, 0, @fence)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+  EndIf
+  cbHandle = cmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1
+  si\pCommandBuffers = @cbHandle
+  rc = vkQueueSubmit(queue, 1, @si, fence)
+  vtpPut(40, rc)
+  If rc <> #VK_SUCCESS
+    vtpPut(#VTP_S_DETAIL, rc)
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_SUBMIT)
+  EndIf
+  fenceArray = fence
+  rc = vkWaitForFences(dev, 1, @fenceArray, 1, 2000000000)
+  vtpPut(41, rc)
+  If rc <> #VK_SUCCESS
+    NeonShutdown()
+    ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+  EndIf
+  vtpPut(25, V3dBinJobs())
+  vtpPut(27, V3dRenderJobs())
+  vtpPut(33, vtpSum(#VTP_SURFACE, #VTP_SCREEN_BYTES))
+  vtpPut(35, vtpSum(#VTP_WIN_BASE + #VTP_WIN_BYTES, 256))
+  vtpPut(39, avkBackendDraws())
+  vtpPut(42, AnvilVkBackendNativeError())
+  vtpPut(44, AnvilVkFaultCount())
+  vtpPut(47, V3dMmuFaultsNow())
+  vtpPut(48, V3dBinOomCount())
+  vtpPut(49, V3dBinErrStat())
+  vtpPut(50, V3dRenderErrStat())
+  vtpPut(51, AnvilVkImageLayout(img))
+  vtpPut(52, AnvilVkV3dLastListCount())
+  vtpPut(14, AnvilVkV3dLastListPrimitives())
+
+  ; Check all 16,384 pixels. Every draw has a unique 2x2 footprint, while
+  ; all uncovered cells must retain the render-pass clear colour.
+  vtpStep(7)
+  bad = 0
+  firstBad = -1
+  scaleHash = $811C9DC5
+  For y = 0 To 127
+    For x = 0 To 127
+      want = #VTP_CLEAR_WORD
+      If (x % 4) >= 1 And (x % 4) <= 2 And (y % 4) >= 1 And (y % 4) <= 2
+        If ((y / 4) * 32 + (x / 4)) < #VTP_LIST_DRAWS
+          want = #VTP_RED_WORD
+          If ((x / 4) & 1) <> 0 : want = #VTP_GREEN_WORD : EndIf
+        EndIf
+      EndIf
+      got = vtpPixel(imgBase, imagePitch, x, y)
+      scaleHash = ((scaleHash ! got) * $01000193) & $FFFFFFFF
+      If got <> want
+        bad = bad + 1
+        If firstBad < 0
+          firstBad = (y * 128) + x
+          vtpPut(20, got)
+          vtpPut(21, want)
+        EndIf
+      EndIf
+    Next
+  Next
+  vtpPut(17, 16384 - bad)
+  vtpPut(18, bad)
+  vtpPut(19, firstBad)
+  paddingBad = 0
+  If imagePitch > 512
+    For y = 0 To 127
+      For x = 512 To imagePitch - 4 Step 4
+        If (PeekL(imgBase + (y * imagePitch) + x) & $FFFFFFFF) <> (~#VTP_CLEAR_WORD & $FFFFFFFF)
+          paddingBad = paddingBad + 1
+        EndIf
+      Next
+    Next
+  EndIf
+  vtpPut(22, paddingBad)
+  vtpPut(36, imagePitch)
+  vtpPut(37, AnvilVkImageRowPitch(img) * 128)
+  vtpPut(12, vtpPixel(imgBase, imagePitch, 0, 0))
+  vtpPut(13, vtpPixel(imgBase, imagePitch, 8, 0))
+  vtpPut(53, scaleHash)
+  vtpPut(54, #VTP_LIST_DRAWS)
+  vtpPut(55, vtpPixel(imgBase, imagePitch, 1, 1))
+  vtpPut(56, vtpPixel(imgBase, imagePitch, 5, 1))
+  vtpPut(59, vtpPixel(imgBase, imagePitch, 1, 5))
+  vtpPut(60, vtpPixel(imgBase, imagePitch, 0, 0))
+
+  vtpStep(8)
+  vkDeviceWaitIdle(dev)
+  vkDestroyFence(dev, fence, 0)
+  vkDestroyPipeline(dev, pipeA, 0)
+  vkDestroyPipeline(dev, pipeB, 0)
+  vkDestroyPipeline(dev, pipeC, 0)
+  vkDestroyPipelineCache(dev, pipelineCache, 0)
+  vkDestroyPipelineLayout(dev, layA, 0)
+  vkDestroyPipelineLayout(dev, layB, 0)
+  vkDestroyShaderModule(dev, vsA, 0)
+  vkDestroyShaderModule(dev, fsA, 0)
+  vkDestroyShaderModule(dev, vsB, 0)
+  vkDestroyShaderModule(dev, fsB, 0)
+  vkDestroyFramebuffer(dev, fb, 0)
+  vkDestroyRenderPass(dev, rp, 0)
+  vkDestroyImageView(dev, view, 0)
+  vkDestroyBuffer(dev, buf, 0)
+  vkFreeMemory(dev, bmem, 0)
+  vkDestroyImage(dev, img, 0)
+  vkFreeMemory(dev, mem, 0)
+  vkDestroyCommandPool(dev, pool, 0)
+  vkDestroyDevice(dev, 0)
+  vkDestroyInstance(inst, 0)
+  NeonShutdown()
+  vtpPut(#VTP_S_SHUTDOWN, 1)
+
+  If vtpGet(23) <> #VK_SUCCESS
+    ProcedureReturn vtpStop(#VSM_ERR_REFUSAL)
+  EndIf
+  If bad <> 0 Or paddingBad <> 0
+    ProcedureReturn vtpStop(#VSM_ERR_FULL_IMAGE)
+  EndIf
+  If vtpGet(32) <> vtpGet(33) Or vtpGet(34) <> vtpGet(35)
+    ProcedureReturn vtpStop(#VSM_ERR_GUARD)
+  EndIf
+  If vtpGet(25) <> vtpGet(24) + 1 Or vtpGet(27) <> vtpGet(26) + 1 Or vtpGet(39) <> vtpGet(38) + #VTP_LIST_DRAWS Or vtpGet(52) <> #VTP_LIST_DRAWS Or vtpGet(14) <> #VTP_LIST_DRAWS
+    ProcedureReturn vtpStop(#VSM_ERR_ORDER)
+  EndIf
+  If vtpGet(42) <> 0 Or vtpGet(47) <> 0 Or vtpGet(48) <> 0 Or (vtpGet(49) & $FFFFEFFF) <> 0 Or (vtpGet(50) & $FFFFEFFF) <> 0 Or vtpGet(43) <> vtpGet(44)
+    ProcedureReturn vtpStop(#VTP_ERR_V3D_FAULT)
+  EndIf
+  If vtpGet(51) <> #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    ProcedureReturn vtpStop(#VTP_ERR_FENCE)
+  EndIf
+  ProcedureReturn vtpStop(#VTP_OK)
+EndProcedure
