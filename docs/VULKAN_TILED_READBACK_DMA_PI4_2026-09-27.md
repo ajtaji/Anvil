@@ -4,8 +4,16 @@
 region from a distinct `UIF_NO_XOR` optimal image into a linear image.
 The command layer checks both bound allocations, usage, layouts, full
 extent and overlap before recording. Submission revalidates the physical
-layout and mapped ranges before any transfer in the stream begins.
-Partial optimal regions remain explicitly unsupported.
+layout and mapped ranges before any transfer in the stream begins. This
+2026-09-27 hardware result covers the complete-image path described here.
+
+A later implementation adds a bounded partial region for distinct,
+equal-size, level-zero BGRA8 images. Source offsets must align to 4×4
+utiles; width and height must be multiples of four unless that dimension
+reaches the source image's right or bottom edge. Destination offsets are
+texel coordinates and the destination rectangle must remain in bounds.
+Source and destination allocations must be disjoint. The command stream
+preflights the whole transfer sequence before starting DMA. The 2026-09-30 Pi 4 proof copied all 25 texels of a `(32,8)` `5×5` region from a 37×13 image, preserving 456 other texels and 32 guard words. Its 148-byte destination pitch had no padding words; DMA advanced 0→4 and a same-sized non-edge tail was refused with `-20005` before additional transfer work. See `docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`. Mips, array layers, format conversion and other partial shapes remain unsupported.
 
 The TFU cannot emit raster output. The Pi 4 backend therefore calculates
 the address of each 4×4 utile and uses guarded 2D DMA to place its rows
@@ -43,6 +51,9 @@ AArch64 instructions. The broad public pipeline gate passed 813 checks
 over 204,188,143 instructions. Build 224 has not been installed; the
 Pi 4 remains on build 223.
 
-The current implementation issues one DMA job per 4×4 utile, so large
-images may be slow. It does not yet handle optimal-to-buffer readback,
-partial optimal regions, mip levels, array layers or format conversion.
+The complete-image implementation issues one DMA job per 4×4 utile, so
+large images may be slow. Mip levels, array layers and format conversion
+remain unsupported. Bounded optimal-to-buffer readback and partial
+optimal-to-linear image copy were added later; see
+`docs/evidence/vulkan-optimal-edge-tail-pi4-20260930/README.md` and
+`docs/evidence/vulkan-partial-optimal-linear-pi4-20260930/README.md`.
