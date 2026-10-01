@@ -36,6 +36,14 @@ Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
 Global avkTbTiledRectCopies.i = 0
+Global avkTbLinearTiledRectCopies.i = 0
+Global avkTbLastLinearRectSourceX.i = 0
+Global avkTbLastLinearRectSourceY.i = 0
+Global avkTbLastLinearRectDestinationX.i = 0
+Global avkTbLastLinearRectDestinationY.i = 0
+Global avkTbLastLinearRectWidth.i = 0
+Global avkTbLastLinearRectHeight.i = 0
+Global avkTbLastLinearRectSourcePitch.i = 0
 Global avkTbLastRectSourceX.i = 0
 Global avkTbLastRectSourceY.i = 0
 Global avkTbLastRectDestinationX.i = 0
@@ -383,6 +391,31 @@ Procedure.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
   avkTbLastRectSourceX = *copy\sourceX : avkTbLastRectSourceY = *copy\sourceY
   avkTbLastRectDestinationX = *copy\destinationX : avkTbLastRectDestinationY = *copy\destinationY
   avkTbLastRectWidth = *copy\regionWidth : avkTbLastRectHeight = *copy\regionHeight
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\width < 1 Or *copy\height < 1 Or *copy\sourcePitch < *copy\width * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourcePitch - 16 > 32767 Or *copy\sourceBytes < *copy\sourcePitch * *copy\height Or *copy\destinationLayout = 0 : ProcedureReturn -1 : EndIf
+  If *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or (*copy\paddedWidth % 32) <> 0 Or (*copy\paddedHeight % 8) <> 0 Or *copy\destinationBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
+  If *copy\regionWidth < 4 Or *copy\regionHeight < 4 Or (*copy\regionWidth % 4) <> 0 Or (*copy\regionHeight % 4) <> 0 Or (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn -1 : EndIf
+  If (*copy\regionWidth / 4) * (*copy\regionHeight / 4) > #ANVIL_VK_TILED_RECT_MAX_UTILES : ProcedureReturn -1 : EndIf
+  If (*copy\sourceBase % 4) <> 0 Or (*copy\destinationBase % 4) <> 0 Or *copy\windowBase <= 0 Or *copy\windowBytes < 1 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase < *copy\windowBase Or *copy\sourceBase - *copy\windowBase > *copy\windowBytes - *copy\sourceBytes Or *copy\destinationBase < *copy\windowBase Or *copy\destinationBase - *copy\windowBase > *copy\windowBytes - *copy\destinationBytes : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase < *copy\destinationBase + *copy\destinationBytes And *copy\destinationBase < *copy\sourceBase + *copy\sourceBytes : ProcedureReturn -1 : EndIf
+  If (*copy\sourceY + *copy\regionHeight - 1) * *copy\sourcePitch + (*copy\sourceX + *copy\regionWidth) * 4 > *copy\sourceBytes : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
+  If avkBackendLinearTiledRectCopyValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1
+  avkTbLinearTiledRectCopies = avkTbLinearTiledRectCopies + 1
+  avkTbLastLinearRectSourceX = *copy\sourceX : avkTbLastLinearRectSourceY = *copy\sourceY
+  avkTbLastLinearRectDestinationX = *copy\destinationX : avkTbLastLinearRectDestinationY = *copy\destinationY
+  avkTbLastLinearRectWidth = *copy\regionWidth : avkTbLastLinearRectHeight = *copy\regionHeight
+  avkTbLastLinearRectSourcePitch = *copy\sourcePitch
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 

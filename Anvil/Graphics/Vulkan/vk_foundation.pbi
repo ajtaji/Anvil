@@ -168,6 +168,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; Whole-image TFU copies remain independent of this guarded-DMA capability.
 #ANVIL_VK_CAP_TILED_RECT_COPY = $0200
 #ANVIL_VK_TILED_RECT_MAX_UTILES = 256
+; Guarded linear-row DMA scatter into complete optimal-image utiles.
+#ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY = $0400
 
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
@@ -289,6 +291,29 @@ Structure AnvilVkBackendTiledRectCopy Align #PB_Structure_AlignC
   width.i
   height.i
   sourceLayout.i
+  destinationLayout.i
+  paddedWidth.i
+  paddedHeight.i
+  sourceX.i
+  sourceY.i
+  destinationX.i
+  destinationY.i
+  regionWidth.i
+  regionHeight.i
+EndStructure
+
+; Closed linear-to-optimal rectangle. Source coordinates use its actual row
+; pitch; only the destination layout is backend-specific.
+Structure AnvilVkBackendLinearTiledRectCopy Align #PB_Structure_AlignC
+  windowBase.i
+  windowBytes.i
+  sourceBase.i
+  sourceBytes.i
+  sourcePitch.i
+  destinationBase.i
+  destinationBytes.i
+  width.i
+  height.i
   destinationLayout.i
   paddedWidth.i
   paddedHeight.i
@@ -441,6 +466,8 @@ Declare.i avkBackendTiledImageCopyValidate(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendSubmitTiledImageCopy(*copy.AnvilVkBackendTiledImageCopy)
 Declare.i avkBackendTiledRectCopyValidate(*copy.AnvilVkBackendTiledRectCopy)
 Declare.i avkBackendSubmitTiledRectCopy(*copy.AnvilVkBackendTiledRectCopy)
+Declare.i avkBackendLinearTiledRectCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
+Declare.i avkBackendSubmitLinearTiledRectCopy(*copy.AnvilVkBackendLinearTiledRectCopy)
 Declare.i avkBackendTiledReadbackValidate(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
 Declare.i avkBackendSubmitBufferCopy(source.i, destination.i, bytes.i)
