@@ -1,0 +1,41 @@
+; SPDX-License-Identifier: MIT
+; Pure V3D UIF readback validation without MMIO or a GPU job.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define rb.AvkV3dTextureReadback, plan.AvkV3dTexturePlan
+  rb\windowBase = $06000000 : rb\windowBytes = $00100000
+  rb\sourceBase = $06001000 : rb\sourceBytes = 4096
+  rb\destinationBase = $06005040 : rb\destinationBytes = 148
+  rb\destinationPitch = 32
+  rb\width = 37 : rb\height = 13
+  rb\paddedWidth = 64 : rb\paddedHeight = 16
+  rb\sourceX = 32 : rb\sourceY = 8
+  rb\regionWidth = 5 : rb\regionHeight = 5
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If plan\destinationBytes <> 4096 : ProcedureReturn 2 : EndIf
+
+  rb\sourceX = 28 : rb\sourceY = 4
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 3 : EndIf
+  rb\sourceX = 32 : rb\sourceY = 8
+  rb\destinationBytes = 147
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 4 : EndIf
+  rb\destinationBytes = 148
+  rb\destinationBase = rb\sourceBase + 64
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 5 : EndIf
+  rb\destinationBase = $06005040
+  rb\regionWidth = 4 : rb\regionHeight = 4
+  rb\sourceX = 4 : rb\sourceY = 4
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 6 : EndIf
+  rb\sourceX = 0 : rb\sourceY = 0
+  rb\regionWidth = 37 : rb\regionHeight = 13
+  rb\destinationPitch = 160 : rb\destinationBytes = 2068
+  If AnvilVkV3dTextureReadbackValidate(@rb, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 7 : EndIf
+  ProcedureReturn 0
+EndProcedure
