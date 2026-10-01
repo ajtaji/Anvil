@@ -350,8 +350,12 @@ culling, no depth bias, no depth clamp, no rasteriser discard; one sample;
 zero controls that sample; every channel written, with blending either disabled
 or exact straight source-over (`SRC_ALPHA`, `ONE_MINUS_SRC_ALPHA`, `ADD`) for
 both colour and alpha; no depth-stencil state and no other dynamic state.
-Everything else is refused with a code and a sentence.
-
+Everything else is refused with a code and a sentence. A 2026-10-01 Pi 4
+run proved the zero-bit single-sample case against a full-image oracle: three
+public draw records, two emitted primitives, and one bin/render job pair. The
+backend validates and elides the zero-coverage draw; this is not a V3D
+sample-mask packet claim. See
+`docs/evidence/vulkan-sample-mask-pi4-20261001/README.md`.
 
 `vkCmdPipelineBarrier`'s ten-parameter problem is closed. Compiler revision
 `a9f412a6` added aligned AArch64 stack arguments, so Anvil now exposes the

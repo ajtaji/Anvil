@@ -105,6 +105,12 @@ proof. Its UINT32 bind offset, `firstIndex` byte offset, exact V3D packet,
 index guards and presentation report are preserved in
 `docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`.
 
+A separate Pi 4 proof covers the one-sample zero-mask case: three public draws
+produce three list records but only two V3D primitives, and all 4,096 target
+pixels match the oracle. The backend validates then elides the zero-coverage
+draw; this does not demonstrate or claim a V3D sample-mask packet. See
+`docs/evidence/vulkan-sample-mask-pi4-20261001/README.md`.
+
 **Board run 5, 2026-09-11, PASSED**: both triangles rendered, every pixel probe
 exact, and the picture was presented. That is one uniform-colour triangle and
 one triangle whose three vertices carried the SAME colour through the varying
