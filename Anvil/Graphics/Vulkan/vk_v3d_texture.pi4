@@ -155,6 +155,8 @@ Structure AvkV3dTextureLinearRectCopy Align #PB_Structure_AlignC
   sourceBase.i
   sourceBytes.i
   sourcePitch.i
+  sourceViewWidth.i
+  sourceViewHeight.i
   destinationBase.i
   destinationBytes.i
   width.i
@@ -423,13 +425,14 @@ Procedure.i AnvilVkV3dTextureLinearRectValidate(*copy.AvkV3dTextureLinearRectCop
   Protected rc.i, x.i, y.i, sourceOffset.i, destinationOffset.i
   If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
   If *copy = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
-  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\sourcePitch, *plan)
+  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\width * 4, *plan)
   If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
-  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight Or *copy\sourcePitch - 16 > 32767 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceViewWidth < 1 Or *copy\sourceViewHeight < 1 Or *copy\sourceViewWidth > #ANVIL_V3D_TEXTURE_MAX_DIM Or *copy\sourceViewHeight > #ANVIL_V3D_TEXTURE_MAX_DIM Or *copy\sourcePitch < *copy\sourceViewWidth * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourcePitch - 16 > 32767 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
   If *copy\regionWidth < 4 Or *copy\regionHeight < 4 Or (*copy\regionWidth % 4) <> 0 Or (*copy\regionHeight % 4) <> 0 Or *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
-  If (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If (*copy\destinationX % 4) <> 0 Or (*copy\destinationY % 4) <> 0 Or *copy\sourceX > *copy\sourceViewWidth - *copy\regionWidth Or *copy\sourceY > *copy\sourceViewHeight - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
   If (*copy\regionWidth / 4) * (*copy\regionHeight / 4) > #ANVIL_V3D_TEXTURE_MAX_RECT_UTILES : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
-  If (*copy\sourceBase % 4) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < *copy\sourcePitch * *copy\height Or *copy\destinationBytes < *plan\destinationBytes : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If (*copy\sourceBase % 4) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < (*copy\sourceViewHeight - 1) * *copy\sourcePitch + *copy\sourceViewWidth * 4 Or *copy\destinationBytes < *plan\destinationBytes : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
   If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase, *copy\sourceBytes) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase, *plan\destinationBytes) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
   If avkV3dTextureRangesOverlap(*copy\sourceBase, *copy\sourceBytes, *copy\destinationBase, *copy\destinationBytes) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP : EndIf
   For y = 0 To *copy\regionHeight - 1 Step 4
