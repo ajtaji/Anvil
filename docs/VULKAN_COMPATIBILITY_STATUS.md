@@ -418,6 +418,13 @@ not prove any unlisted shader instruction, descriptor type, format or WSI.
 
 ### Board runs
 
+The 2026-10-01 Pi 4 transfer-scoped global and buffer barrier RAM proof
+passed an ordered fill/update/barrier/copy stream. It checked 64 buffer words,
+256 guards, and three guarded DMA operations/backend jobs. A later out-of-range
+buffer barrier invalidated its command buffer and added no DMA or backend work.
+See `docs/evidence/vulkan-transfer-barrier-pi4-20261001/README.md`. Shader and
+graphics memory scopes remain unsupported.
+
 The 2026-10-01 Pi 4 ordered draw-list scale proof passed 64, 256 and 1,024
 distinct `vkCmdDraw` calls in one render pass and submit per run. Every stage
 produced all 16,384 expected pixels in a private 128×128 attachment, advanced
