@@ -401,7 +401,7 @@ observable.
 | `tools/v3d_cache_batch_emitted_check.py` | PASS — 38 exact checks over 1,961 interpreted A64 instructions; all 6 hostile mutations are RED. | `V3dCacheBatchBegin`, `V3dCacheBatchRange` and `V3dCacheBatchEnd` retain several validated aligned ranges and issue one final barrier. Overflow, negative/full-width addresses, zero length, misuse, poisoning and the legacy single-range API are independently exercised. |
 | `tools/vulkan_atlas_chrome_acceptance_check.py` | BOARD PASS — 213 exact source/report/pixel-oracle checks against the current Pi 4 run. The returning diagnostic is a 1,094,336-byte PMF container with SHA-256 `9ca7480b29d7868a8a9e2f4d5719f68290d5844de3a3ac1a4c89fbb3e75dd8a3`. | One public render pass containing eight ordered six-vertex quads; an 8x8 optimal atlas copied from 16-texel-stride poison-padded rows through the TFU; UV sampling; descriptor-bound `sample * push + UBO`; tint and source-over blend; eight `vkCmdSetScissor` snapshots; exact solid/transparent/covered/clipped pixel regions; one TFU advance, one bin/render pair and one display-owner DMA presentation. Build 210 returned exact `x0=0x8208C8` with report slot 128 equal to zero, then returned to its prompt with the deadman off and no core leases; capture 57 and the 960-byte report are preserved in `docs/evidence/vulkan-optimal-stride-20260927/`. |
 | `tools/neon_atlas_contract_emitted_check.py` | PASS — 26 source checks and 41 emitted assertions over 3,118,073 interpreted A64 instructions; all 5 hostile mutations are RED. | The existing Neon font builder publishes one borrowed read-only linear RGBA8 raster, exact dimensions/bytes, copied ASCII 32..126 glyph UVs and one copied opaque-white texel rectangle only after a successful current-font ensure. Font changes invalidate every query; CPU-only ensure does no TFU/V3D work and does not publish the private tiled-atlas state early. |
-| `tools/neon_vk_chrome_acceptance_check.py` | DESK PASS — 267 production-adapter source checks, 27 emitted contract assertions, 58 hook source checks plus 44 emitted hook assertions, 45 emitted production-geometry assertions, and all 8 hostile traces RED. | `neon_vk_chrome.pi4` owns persistent pipeline, atlas, descriptors, command buffer, fence and coherent vertex storage; installs the complete box/text/scissor/fan/outline/line hook family only after successful creation; and atomically lowers bounded fans and one-pixel lines into Vulkan triangle lists. The exact emitted production procedures cover a convex fan, closed outline, horizontal/vertical/diagonal/zero-length lines, cursor preservation, overflow and safe reset. The real existing Neon panel/menu/list/text scene records 109 quads, 47 draws, 654 vertices and five scissor states, then consumes one intent and calls display DMA once. No Pi execution or screenshot of the new primitive shapes is claimed yet. |
+| `tools/neon_vk_chrome_acceptance_check.py` | DESK PASS — 267 production-adapter source checks, 27 emitted contract assertions, 58 hook source checks plus 44 emitted hook assertions, 45 emitted production-geometry assertions, and all 8 hostile traces RED. | `neon_vk_chrome.pi4` owns persistent pipeline, atlas, descriptors, command buffer, fence and coherent vertex storage; installs the complete box/text/scissor/fan/outline/line hook family only after successful creation; and atomically lowers bounded fans and one-pixel lines into Vulkan triangle lists. The exact emitted production procedures cover a convex fan, closed outline, horizontal/vertical/diagonal/zero-length lines, cursor preservation, overflow and safe reset. The real existing Neon panel/menu/list/text scene records 109 quads, 47 draws, 654 vertices and five expected scissor states. A current-tree short Pi 4 run on 2026-10-01 passed 47 draws, 654 vertices, 35 box calls, 12 text calls, 74 glyph quads, four expected scissor calls, one display-DMA operation, zero fallback/refusal/pending presentation/backend error, and 12 pixel probes; the report field is an expected-call count, not an independent measurement of the five states and this run produced no screenshot. See `docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. The 2026-09-26 all-15-scene board proof at commit `a6b9a93` includes paired fan/line frames and capture 27, but covers that historical source only; it does not establish those paired checks for the current tree. |
 | `tools/vulkan_interp_check.py` | PASS — 395 property checks over 372,292 executed A64 instructions; `--mutate` rejects all 14 plausible mistakes | That `vk_interp_expect.pbi` — the module the board diagnostic asks what colour a pixel should be — gives the same answers as a second implementation of the same stated rule written in Python: the clip-to-screen transform, twice the signed area, the three barycentric numerators, the strict inside test, the four channels and the packed B8G8R8A8 word, over eight triangles and thirty-three probe pixels. The weights at every covered probe sum to twice the area, and each corner probe is dominated by its own vertex by more than three tolerances — which is what makes a board run able to tell a gradient from a flat fill. It owns no hardware and makes no MMIO access |
 
 None of these desk gates prove GPU execution, displayed output, concurrency,
@@ -966,8 +966,15 @@ raster owner, so the current tree has different exact bytes: 977,076-byte PMF,
 SHA-256
 `c4b43f94547343ef2b01232a81a549f3444f66b4e29c3d90197a2b887fca147b`,
 expected report pointer `0x6C85C8`. It compiles and its atlas/display desk gates
-pass. A different lane currently owns the shared Pi 4, so this post-refactor
-artifact has not been run and does not borrow the earlier image's board PASS.
+pass. The current post-refactor source has since passed a bounded widget-only Pi 4
+run on 2026-10-01. Its 1,408,064-byte PMF had SHA-256
+`419DC48FA8688894BA49C425BF536C8ABFC2B419CA176DD2194DE32FC5E918DE`; build
+223 used CRC `5BC668D0`, returned `x0=0x9C6F38`, and completed the payload in
+2.4 seconds under a 15-second deadman. The short run covers one widget frame,
+not the 15-scene corpus or paired fan/line frames, and it did not produce a
+screenshot. The earlier all-15-scene run remains historical evidence for the
+source at commit `a6b9a93`. The short run establishes the current-tree widget
+frame only; the paired fan/line proof has not been repeated on the current tree.
 
 The first real implementation step is now in the tree rather than another
 synthetic primitive. `neon_vk_chrome.pi4` maps persistent box, atlas-text,
@@ -976,9 +983,9 @@ existing Neon widget layer selects it through one all-or-none primitive hook.
 The desk scene calls the real panel, menu, list and text procedures unchanged
 and proves 109 quads, 47 draws, 654 vertices, five scissor states, one submit
 intent and one display-DMA call with no processor pixel fallback. The emitted
-geometry gate additionally proves exact bounded triangle-list lowering. What
-remains is the exact Pi 4 run and screenshot of both the widget frame and new
-primitive shapes, then clean HDMI/DSI/rotation/resize coverage.
+geometry gate additionally proves exact bounded triangle-list lowering. The current-tree widget frame has a bounded Pi 4 proof, while current-tree
+paired fan/line proof, screenshot coverage, and clean HDMI/DSI/rotation/resize
+coverage remain.
 
 ## Prerequisites and hard gaps
 

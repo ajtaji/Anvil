@@ -86,6 +86,7 @@ def check_source() -> int:
     payload = PAYLOAD.read_text(encoding="utf-8")
     scene = SCENE.read_text(encoding="utf-8")
     required = (
+        'XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"',
         'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"',
         'XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"',
         "vkCreateInstance(@ici, 0, @inst)",
@@ -100,6 +101,8 @@ def check_source() -> int:
         "vkCreateRenderPass(dev, @passInfo, 0, @renderPass)",
         "vkCreateFramebuffer(dev, @frameInfo, 0, @framebuffer)",
         "NvwaPrime()",
+        "If #NW_WIDGET_ONLY = 0",
+        "If #NW_WIDGET_ONLY = 0 : delay(#NW_SHOW_MS) : EndIf",
         "NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer",
         "rc = nwCapacityFrame()",
         "NeonVkChromeBoxBatchBegin()",
@@ -113,6 +116,8 @@ def check_source() -> int:
     for needle in required:
         if needle not in payload:
             fail(f"payload public production path missing: {needle}")
+    if not re.search(r"(?m)^\s*#NW_WIDGET_ONLY\s*=\s*[01]\s*$", payload):
+        fail("payload must select widget-only or historical full mode")
 
     forbidden = (
         "vk_backend_test.pbi", "vulkan_production_probe", "PokeL(imageBase",
@@ -154,7 +159,7 @@ def check_source() -> int:
     for name, value in exact_constants.items():
         if not re.search(rf"(?m)^\s*#{name}\s*=\s*{value}\b", scene):
             fail(f"scene exact constant {name} is not {value}")
-    return len(required) + len(forbidden) + len(scene_required) + 4 + len(exact_constants)
+    return len(required) + len(forbidden) + len(scene_required) + 5 + len(exact_constants)
 
 
 def report_from_bytes(data: bytes) -> tuple[int, ...]:
@@ -176,11 +181,13 @@ def check_report_bytes(data: bytes) -> int:
         54: 0x181, 55: 1, 56: 1, 57: 0,
         58: 0x3DCCCCCD, 59: 0x3E4CCCCD,
         60: 0x3E99999A, 61: 0x3F800000,
-        62: 3505, 63: TAIL,
+        63: TAIL,
     }
     for slot, expected in exact.items():
         if r[slot] != expected:
             fail(f"report[{slot}] is 0x{r[slot]:08X}, expected 0x{expected:08X}")
+    if r[62] not in (0, 3505):
+        fail(f"report[62] capacity marker is {r[62]}, expected 0 (widget-only) or 3505 (full)")
     for slot in range(4, 17):
         if r[slot] == 0:
             fail(f"public Vulkan object/report field {slot} is zero")
@@ -325,12 +332,17 @@ def synthetic() -> tuple[bytes, bytes]:
 def self_test() -> int:
     report, pixels = synthetic()
     checks = check_report_bytes(report)
+    short = bytearray(report); struct.pack_into("<I", short, 62*4, 0)
+    checks += check_report_bytes(bytes(short))
     with tempfile.TemporaryDirectory(prefix="anvil-nvwa-") as td:
         raw = Path(td) / "scene.bgra"; raw.write_bytes(pixels)
         checks += check_raw(raw)
-    # Discrimination: one report count and one pixel mutation must be caught.
+    # Discrimination: count, mode marker and pixel mutations must be caught.
     caught = 0
     broken = bytearray(report); struct.pack_into("<I", broken, 24*4, 46)
+    try: check_report_bytes(bytes(broken))
+    except CheckError: caught += 1
+    broken = bytearray(report); struct.pack_into("<I", broken, 62*4, 1)
     try: check_report_bytes(bytes(broken))
     except CheckError: caught += 1
     broken_pixels = bytearray(pixels); struct.pack_into("<I", broken_pixels, 100*PITCH + 400*4, HEAD)
@@ -338,7 +350,7 @@ def self_test() -> int:
         raw = Path(td) / "bad.bgra"; raw.write_bytes(broken_pixels)
         try: check_raw(raw)
         except CheckError: caught += 1
-    if caught != 2: fail("self-test mutants were not rejected")
+    if caught != 3: fail("self-test mutants were not rejected")
     return checks + caught
 
 

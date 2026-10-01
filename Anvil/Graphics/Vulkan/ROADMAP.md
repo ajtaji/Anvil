@@ -137,9 +137,17 @@ path; and publishes one consumable present intent after one frame submission.
 Fans are lowered to bounded triangle lists and one-pixel outlines/lines to
 bounded triangle quads, with whole-primitive capacity preflight. The real-widget
 desk scene reuses the existing panel, list and menu procedures unchanged and
-proves 109 quads, 47 ordered draws, 654 vertices and five scissor states. The
-remaining tranche is silicon proof of that scene and the new primitive shapes,
-then resize, HDMI/DSI/rotation and clean recovery coverage.
+proves 109 quads, 47 ordered draws, 654 vertices and five expected scissor
+states. A current-tree short Pi 4 run passed the widget frame on 2026-10-01:
+47 draws, 654 vertices, 35 box calls, 12 text calls, 74 glyph quads, four
+scissor calls, one display-DMA operation, zero fallback/refusal, and twelve
+pixel probes. Five scissor states are defined by the scene but were not
+independently measured. The run skipped capacity and paired-scene checks and
+produced no screenshot; evidence is in
+`docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. The earlier
+2026-09-26 all-15-scene run at `a6b9a93` includes paired fan/line frames and
+proves that historical source. Current-tree paired fan/line proofs and
+HDMI/DSI/rotation/resize and clean recovery coverage remain.
 
 ## API and object gaps
 

@@ -10,8 +10,10 @@
 ; Desk build:
 ;   PureMetalForge.exe --compile \
 ;     RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetProof.pi4 -t pi4 \
-;     --load-addr 0x500000 --stack-addr 0x4F00000 --entry-returns \
+;     --load-addr 0x700000 --stack-addr 0x4F00000 --entry-returns \
 ;     -o vulkanNeonWidgetProof.img
+; #NW_WIDGET_ONLY selects one production widget frame for a short RAM run.
+; Set it to zero to retain the historical capacity and paired-scene proof.
 ;
 ; The return value is a pointer to exactly 64 little-endian 32-bit report
 ; words (256 bytes). tools/vulkan_neon_widget_proof_check.py owns the separate
@@ -30,6 +32,7 @@ XIncludeFile "RaspberryPi4/Lib/neon.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"
@@ -49,6 +52,7 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_MAP_SPAN          = $00FE8000
 #NW_DSI_SCAN          = $08A00000
 #NW_SHOW_MS           = 3000
+#NW_WIDGET_ONLY       = 1
 #NW_CAPACITY_BOXES    = 3505
 #NW_STRESS_DRAWS      = 1183         ; one box batch + 2*(252+339) text calls
 #NW_STRESS_QUADS      = 6373         ; 3505 boxes + 2868 text glyphs
@@ -679,6 +683,8 @@ Procedure.i Main()
   Define physicalW.i
   Define physicalH.i
   Define nativePitch.i
+  Define adapterDraws.i
+  Define adapterQuads.i
   Define ici.VkInstanceCreateInfo
   Define fp.VkFormatProperties
   Define qci.VkDeviceQueueCreateInfo
@@ -888,7 +894,11 @@ Procedure.i Main()
   ; The shipped adapter allocates all resident resources here and publishes
   ; the widget callbacks only after its Vulkan atlas upload has completed.
   nwPut(#NW_S_STEP, 4)
-  rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, #NW_STRESS_DRAWS, #NW_STRESS_QUADS)
+  adapterDraws = #NW_STRESS_DRAWS : adapterQuads = #NW_STRESS_QUADS
+  If #NW_WIDGET_ONLY <> 0
+    adapterDraws = #NVWA_EXPECT_DRAWS : adapterQuads = #NVWA_EXPECT_QUADS
+  EndIf
+  rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, adapterDraws, adapterQuads)
   nwPut(#NW_S_CREATE_RC, rc)
   nwPut(#NW_S_READY_BEFORE, NeonVkChromeReady())
   nwPut(#NW_S_HOOK_AFTER, NeonDrawBackendActive())
@@ -902,6 +912,7 @@ Procedure.i Main()
   EndIf
   adapterMade = 1
 
+  If #NW_WIDGET_ONLY = 0
   nwPut(#NW_S_STEP, 5)
   rc = nwCapacityFrame()
   If rc <> #NW_OK
@@ -1042,6 +1053,7 @@ Procedure.i Main()
     vkDestroyInstance(inst, 0) : NeonShutdown()
     ProcedureReturn nwReturn(#NW_ERR_PIXELS)
   EndIf
+  EndIf
 
   ; Bind the display owner's DMA path before the scene consumes the adapter's
   ; one presentation intent. NvwaRenderFrame refuses any fallback or refusal.
@@ -1116,7 +1128,7 @@ Procedure.i Main()
   nwCapturePixels(imageBase, imagePitch)
   DisplayUseDma(0)
   DisplayFlush()
-  delay(#NW_SHOW_MS)
+  If #NW_WIDGET_ONLY = 0 : delay(#NW_SHOW_MS) : EndIf
 
   ; Destroy the production adapter first: it removes the complete callback
   ; family and retires every resource it owns. Then retire caller-owned Vulkan.
