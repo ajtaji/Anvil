@@ -1,5 +1,5 @@
 ; SPDX-License-Identifier: MIT
-; Pure four-utile grid preflight, with no DMA access.
+; Pure up-to-sixteen-utile grid preflight, with no DMA access.
 Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
 Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
 Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
@@ -34,6 +34,30 @@ Procedure.i Main()
   If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 7 : EndIf
   rect\destinationX = 3 : rect\sourcePitch = 32 : rect\sourceBytes = 184
   rect\regionWidth = 6 : rect\regionHeight = 6 : rect\sourceViewWidth = 6 : rect\sourceViewHeight = 6
-  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 8 : EndIf
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 8 : EndIf
+  rect\regionWidth = 9 : rect\regionHeight = 9 : rect\sourceViewWidth = 9 : rect\sourceViewHeight = 9
+  rect\sourcePitch = 48 : rect\sourceBytes = 420
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 9 : EndIf
+  rect\regionWidth = 13 : rect\regionHeight = 13 : rect\sourceViewWidth = 13 : rect\sourceViewHeight = 13
+  rect\sourcePitch = 64 : rect\sourceBytes = 820
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 10 : EndIf
+  rect\regionWidth = 9 : rect\sourceViewWidth = 9 : rect\sourcePitch = 48 : rect\sourceBytes = 612
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 13 : EndIf
+  rect\regionWidth = 13 : rect\regionHeight = 9 : rect\sourceViewWidth = 13 : rect\sourceViewHeight = 9
+  rect\sourcePitch = 64 : rect\sourceBytes = 564
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 14 : EndIf
+  ; A one-column final intersection controls the skip even after two full tiles.
+  rect\regionWidth = 10 : rect\sourceViewWidth = 10
+  rect\sourcePitch = 32772 : rect\sourceBytes = 262216
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) = #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 15 : EndIf
+  rect\sourcePitch = 32768 : rect\sourceBytes = 262184
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 16 : EndIf
+  rect\width = 32 : rect\height = 32 : rect\paddedHeight = 32 : rect\destinationBytes = 4096
+  rect\regionWidth = 17 : rect\regionHeight = 13 : rect\sourceViewWidth = 17 : rect\sourceViewHeight = 13
+  rect\sourcePitch = 80 : rect\sourceBytes = 1028
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 11 : EndIf
+  rect\regionWidth = 13 : rect\regionHeight = 17 : rect\sourceViewWidth = 13 : rect\sourceViewHeight = 17
+  rect\sourcePitch = 64 : rect\sourceBytes = 1076
+  If AnvilVkV3dTextureGridValidate(@rect, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 12 : EndIf
   ProcedureReturn 0
 EndProcedure

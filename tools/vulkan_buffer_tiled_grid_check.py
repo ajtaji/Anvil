@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused public and pure four-utile buffer-to-optimal grid gate."""
+"""Focused public and pure bounded buffer-to-optimal grid gate."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def main() -> int:
             print(f"vulkan_buffer_tiled_grid_check: FAIL - {stem} checkpoint {result} after {steps:,} A64 instructions")
             return 1
         total += steps
-    print(f"vulkan_buffer_tiled_grid_check: PASS - 2 fixtures; public cap/preflight and pure four-utile intersections over {total:,} A64 instructions")
+    print(f"vulkan_buffer_tiled_grid_check: PASS - 2 fixtures; public cap/preflight and pure 2x2/4x4 intersections over {total:,} A64 instructions")
     print(f"  compiler SHA-256 {digest}")
     return 0
 

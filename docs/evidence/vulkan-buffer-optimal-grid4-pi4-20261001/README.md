@@ -1,0 +1,7 @@
+# Pi 4 buffer-to-optimal extended UIF grid upload
+
+The report is a 1,056-byte Pi 4 trace. SHA-256: `BB204BE58EB4BDCC961457449CFCDEEFA0885804A978E98AFF7E30C125CD8C79`.
+
+One `vkCmdCopyBufferToImage` region at destination `(3,3)` with extent `9×9` on a 16×16 optimal image used buffer offset 64, row length 12 (48-byte pitch), and exact source span 420 bytes. Its nine UIF intersections, in row-major order, were `1×1`, `4×1`, `4×1`, `1×4`, `4×4`, `4×4`, `1×4`, `4×4`, `4×4`. It copied 81 texels and preserved 175, including 63 unchanged texels within the touched 12×12 grid. Checks covered 81 exact source words plus 271 sentinels (including 27 source-padding words), 64 oracle-padding words and 96 guards. TFU stayed at 1, guarded DMA advanced 0→9 and backend jobs 1→2; a later full oracle readback advanced DMA 9→25. Status slots A/B/C/D and helper, MMU, OOM, native and validation-fault counts were all zero. The diagnostic returned `x0=0x8E88D0`; build 223 CRC was `5BC668D0`.
+
+The existing ≤2×2 route retains `BUFFER_TO_TILED_GRID_COPY` and tag 3. This 3–4 tile row/column route uses `BUFFER_TO_TILED_GRID_4X4_COPY` and tag 4, together with the base buffer/linear/rectangle capabilities; the Pi 4 backend advertises it only when DMA is linked. Other backends fail closed. Fifth-row/column refusal and submit-time malformed-stream preflight are signed desk-gate results, not silicon negatives. This was a RAM-only diagnostic; no flash or reset operation was performed. Board lease returned free and display state was restored.

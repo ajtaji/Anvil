@@ -478,7 +478,7 @@ Procedure.i avkBackendSubmitLinearTiledMicroCopy(*copy.AnvilVkBackendLinearTiled
 EndProcedure
 
 Procedure.i avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTiledRectCopy)
-  Define columns.i, rows.i, firstCols.i, minCols.i
+  Define columns.i, rows.i, firstCols.i, lastCols.i, minCols.i
   If *copy = 0 : ProcedureReturn -1 : EndIf
   If *copy\regionWidth < 1 Or *copy\regionHeight < 1 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX <> 0 Or *copy\sourceY <> 0 Or *copy\sourceViewWidth <> *copy\regionWidth Or *copy\sourceViewHeight <> *copy\regionHeight : ProcedureReturn -1 : EndIf
   If *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight Or *copy\sourcePitch < *copy\regionWidth * 4 Or (*copy\sourcePitch % 4) <> 0 Or *copy\sourceBytes <> (*copy\regionHeight - 1) * *copy\sourcePitch + *copy\regionWidth * 4 : ProcedureReturn -1 : EndIf
@@ -487,9 +487,12 @@ Procedure.i avkBackendLinearTiledGridCopyValidate(*copy.AnvilVkBackendLinearTile
   firstCols = 4 - (*copy\destinationX % 4)
   If firstCols > *copy\regionWidth : firstCols = *copy\regionWidth : EndIf
   minCols = firstCols
-  If columns = 2 And *copy\regionWidth - firstCols < minCols : minCols = *copy\regionWidth - firstCols : EndIf
+  If columns > 1
+    lastCols = (*copy\destinationX + *copy\regionWidth - 1) % 4 + 1
+    If lastCols < minCols : minCols = lastCols : EndIf
+  EndIf
   If *copy\sourcePitch - minCols * 4 > 32767 : ProcedureReturn -1 : EndIf
-  If columns < 1 Or columns > 2 Or rows < 1 Or rows > 2 Or columns * rows < 2 Or *copy\destinationLayout = 0 Or *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or *copy\destinationBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
+  If columns < 1 Or columns > 4 Or rows < 1 Or rows > 4 Or columns * rows < 2 Or *copy\destinationLayout = 0 Or *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or *copy\destinationBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
   If *copy\windowBase <= 0 Or *copy\windowBytes < *copy\sourceBytes Or *copy\windowBytes < *copy\destinationBytes Or *copy\sourceBase < *copy\windowBase Or *copy\destinationBase < *copy\windowBase Or *copy\sourceBase - *copy\windowBase > *copy\windowBytes - *copy\sourceBytes Or *copy\destinationBase - *copy\windowBase > *copy\windowBytes - *copy\destinationBytes : ProcedureReturn -1 : EndIf
   If *copy\sourceBase < *copy\destinationBase + *copy\destinationBytes And *copy\destinationBase < *copy\sourceBase + *copy\sourceBytes : ProcedureReturn -1 : EndIf
   ProcedureReturn 0

@@ -200,6 +200,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; and columns. Its four intersections are validated before any DMA work.
 #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY = $40000
 
+; A buffer-sourced rectangle may span up to four UIF utile rows and columns.
+; The existing two-by-two grid capability remains independently selectable.
+#ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY = $80000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0

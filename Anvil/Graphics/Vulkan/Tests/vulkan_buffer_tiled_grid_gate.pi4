@@ -1,5 +1,5 @@
 ; SPDX-License-Identifier: MIT
-; Public four-utile interior buffer upload through the state-only backend.
+; Public bounded interior buffer grid upload through the state-only backend.
 XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
 
@@ -114,5 +114,36 @@ Procedure.i Main()
   op = avkCbOpHead[avkCmdSlot(cmd)]
   If avkOpDstOffset[op] <> #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpBufferPitch[op] <> 20 Or avkOpSourceBytes[op] <> 100 : ProcedureReturn 29 : EndIf
   If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS Or vkQueueWaitIdle(queue) <> #VK_SUCCESS Or AnvilVkTestBackendCalls() <> calls + 1 Or avkTbLinearTiledGridCopies <> 2 : ProcedureReturn 30 : EndIf
+
+  ; The extended grid needs its own cap; the old two-by-two cap is insufficient.
+  calls = AnvilVkTestBackendCalls()
+  r\bufferRowLength = 12 : r\bufferImageHeight = 12
+  r\imageExtent\width = 9 : r\imageExtent\height = 9
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 31 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 32 : EndIf
+  op = avkCbOpHead[avkCmdSlot(cmd)]
+  If avkOpDstOffset[op] <> #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG Or avkOpBufferPitch[op] <> 48 Or avkOpSourceBytes[op] <> 420 : ProcedureReturn 33 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY)
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 34 : EndIf
+  AnvilVkTestBackendCapabilities(caps | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY)
+  If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS Or vkQueueWaitIdle(queue) <> #VK_SUCCESS Or AnvilVkTestBackendCalls() <> calls + 1 Or avkTbLastLinearGridIntersections <> 9 : ProcedureReturn 35 : EndIf
+  calls = AnvilVkTestBackendCalls()
+  avkOpSourceBytes[op] = 419
+  If vkQueueSubmit(queue, 1, @si, 0) <> #ANVIL_VK_ERR_STATE Or AnvilVkTestBackendCalls() <> calls : ProcedureReturn 36 : EndIf
+
+  ; Four-by-four is the accepted ceiling on this image.
+  r\bufferRowLength = 16 : r\bufferImageHeight = 16
+  r\imageExtent\width = 13 : r\imageExtent\height = 13
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdCopyBufferToImage(cmd, buf, img, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @r)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 37 : EndIf
+  op = avkCbOpHead[avkCmdSlot(cmd)]
+  If avkOpDstOffset[op] <> #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG Or avkOpBufferPitch[op] <> 64 Or avkOpSourceBytes[op] <> 820 : ProcedureReturn 38 : EndIf
+  If vkQueueSubmit(queue, 1, @si, 0) <> #VK_SUCCESS Or vkQueueWaitIdle(queue) <> #VK_SUCCESS Or AnvilVkTestBackendCalls() <> calls + 1 Or avkTbLastLinearGridIntersections <> 16 : ProcedureReturn 39 : EndIf
   ProcedureReturn 0
 EndProcedure
