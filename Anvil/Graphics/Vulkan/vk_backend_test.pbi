@@ -37,6 +37,13 @@ Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
 Global avkTbTiledRectCopies.i = 0
 Global avkTbTiledMicroCopies.i = 0
+Global avkTbTiledMicroReadbacks.i = 0
+Global avkTbLastMicroReadSourceX.i = 0
+Global avkTbLastMicroReadSourceY.i = 0
+Global avkTbLastMicroReadWidth.i = 0
+Global avkTbLastMicroReadHeight.i = 0
+Global avkTbLastMicroReadPitch.i = 0
+Global avkTbLastMicroReadSpan.i = 0
 Global avkTbLinearTiledRectCopies.i = 0
 Global avkTbLinearTiledMicroCopies.i = 0
 Global avkTbLastLinearRectSourceX.i = 0
@@ -487,6 +494,24 @@ EndProcedure
 Procedure.i avkBackendSubmitTiledReadback(*copy.AnvilVkBackendTiledReadback)
   If avkBackendTiledReadbackValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
   avkTbCalls = avkTbCalls + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkBackendTiledMicroReadbackValidate(*copy.AnvilVkBackendTiledReadback)
+  If *copy = 0 : ProcedureReturn -1 : EndIf
+  If *copy\sourceBase <= 0 Or *copy\destinationBase <= 0 Or *copy\sourceLayout = 0 Or *copy\regionWidth < 1 Or *copy\regionWidth > 4 Or *copy\regionHeight < 1 Or *copy\regionHeight > 4 : ProcedureReturn -1 : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or (*copy\sourceX % 4) + *copy\regionWidth > 4 Or (*copy\sourceY % 4) + *copy\regionHeight > 4 : ProcedureReturn -1 : EndIf
+  If *copy\destinationPitch < *copy\regionWidth * 4 Or (*copy\destinationPitch % 4) <> 0 Or *copy\destinationPitch - *copy\regionWidth * 4 > 32767 Or *copy\destinationBytes < (*copy\regionHeight - 1) * *copy\destinationPitch + *copy\regionWidth * 4 : ProcedureReturn -1 : EndIf
+  If *copy\paddedWidth < *copy\width Or *copy\paddedHeight < *copy\height Or *copy\sourceBytes < *copy\paddedWidth * *copy\paddedHeight * 4 : ProcedureReturn -1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitTiledMicroReadback(*copy.AnvilVkBackendTiledReadback)
+  If avkBackendTiledMicroReadbackValidate(*copy) <> 0 : ProcedureReturn -1 : EndIf
+  avkTbCalls = avkTbCalls + 1 : avkTbTiledMicroReadbacks = avkTbTiledMicroReadbacks + 1
+  avkTbLastMicroReadSourceX = *copy\sourceX : avkTbLastMicroReadSourceY = *copy\sourceY
+  avkTbLastMicroReadWidth = *copy\regionWidth : avkTbLastMicroReadHeight = *copy\regionHeight
+  avkTbLastMicroReadPitch = *copy\destinationPitch : avkTbLastMicroReadSpan = *copy\destinationBytes
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 

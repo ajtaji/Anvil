@@ -548,3 +548,31 @@ Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan
   EndIf
   ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
+
+; One interior source utile may be read into exact pitched buffer rows.
+; Validate its complete 64-byte tile and the last addressed byte first.
+Procedure.i AnvilVkV3dTextureMicroReadbackValidate(*read.AvkV3dTextureReadback, *plan.AvkV3dTexturePlan)
+  Protected rc.i, localX.i, localY.i, rowBytes.i, destinationSpan.i
+  Protected sourceTile.i, sourceOffset.i, sourceSpan.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *read = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*read\width, *read\height, *read\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *read\paddedWidth <> *plan\paddedWidth Or *read\paddedHeight <> *plan\paddedHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *read\regionWidth < 1 Or *read\regionWidth > 4 Or *read\regionHeight < 1 Or *read\regionHeight > 4 Or *read\sourceX < 0 Or *read\sourceY < 0 Or *read\sourceX > *read\width - *read\regionWidth Or *read\sourceY > *read\height - *read\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  localX = *read\sourceX % 4 : localY = *read\sourceY % 4
+  If localX + *read\regionWidth > 4 Or localY + *read\regionHeight > 4 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rowBytes = *read\regionWidth * 4
+  If *read\destinationPitch < rowBytes Or (*read\destinationPitch % 4) <> 0 Or *read\destinationPitch - rowBytes > 32767 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If (*read\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*read\destinationBase % 4) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  destinationSpan = (*read\regionHeight - 1) * *read\destinationPitch + rowBytes
+  If destinationSpan < rowBytes Or *read\sourceBytes < *plan\destinationBytes Or *read\destinationBytes < destinationSpan : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\destinationBase, destinationSpan) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangesOverlap(*read\sourceBase, *read\sourceBytes, *read\destinationBase, destinationSpan) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP : EndIf
+  sourceTile = AnvilVkV3dTextureUifOffset(*read\sourceX - localX, *read\sourceY - localY, *read\paddedHeight)
+  sourceOffset = AnvilVkV3dTextureUifOffset(*read\sourceX, *read\sourceY, *read\paddedHeight)
+  sourceSpan = (*read\regionHeight - 1) * 16 + rowBytes
+  If sourceTile < 0 Or sourceTile > *plan\destinationBytes - 64 Or (sourceTile % 64) <> 0 Or sourceOffset <> sourceTile + localY * 16 + localX * 4 Or sourceOffset + sourceSpan > sourceTile + 64 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\sourceBase + sourceTile, 64) = 0 Or avkV3dTextureRangeInWindow(*read\windowBase, *read\windowBytes, *read\sourceBase + sourceOffset, sourceSpan) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure

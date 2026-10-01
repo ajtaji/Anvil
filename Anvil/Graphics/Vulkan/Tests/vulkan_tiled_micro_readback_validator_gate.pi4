@@ -1,0 +1,35 @@
+; SPDX-License-Identifier: MIT
+; Pure one-utile UIF readback bounds without DMA access.
+Procedure.i V3dTfuBegin(w.i, h.i, kind.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceRaster(base.i, stride.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSourceUifNoXor(base.i, h.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuDest(base.i, fmt.i, bytes.i) : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuSubmit() : ProcedureReturn -1 : EndProcedure
+Procedure.i V3dTfuWait(us.i) : ProcedureReturn -1 : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_texture.pi4"
+
+Procedure.i Main()
+  Define sample.AvkV3dTextureReadback, plan.AvkV3dTexturePlan
+  sample\windowBase = $06000000 : sample\windowBytes = $00100000
+  sample\sourceBase = $06001000 : sample\sourceBytes = 2048
+  sample\destinationBase = $06002040 : sample\destinationBytes = 40 : sample\destinationPitch = 32
+  sample\width = 16 : sample\height = 16 : sample\paddedWidth = 32 : sample\paddedHeight = 16
+  sample\sourceX = 5 : sample\sourceY = 6 : sample\regionWidth = 2 : sample\regionHeight = 2
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 1 : EndIf
+  If plan\destinationBytes <> 2048 Or AnvilVkV3dTextureUifOffset(4, 4, 16) <> 192 Or AnvilVkV3dTextureUifOffset(5, 6, 16) <> 228 : ProcedureReturn 2 : EndIf
+  sample\sourceX = 7
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 3 : EndIf
+  sample\sourceX = 5 : sample\sourceY = 7
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 4 : EndIf
+  sample\sourceY = 6 : sample\destinationBytes = 39
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_ERR_RANGE : ProcedureReturn 5 : EndIf
+  sample\destinationBytes = 40 : sample\destinationBase = sample\sourceBase + 2048
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 6 : EndIf
+  sample\destinationBase = sample\sourceBase + 2044
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_ERR_OVERLAP : ProcedureReturn 7 : EndIf
+  sample\destinationBase = $06002040 : sample\destinationPitch = 32776 : sample\destinationBytes = 32784
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_ERR_ARGS : ProcedureReturn 8 : EndIf
+  sample\destinationPitch = 32772 : sample\destinationBytes = 32780
+  If AnvilVkV3dTextureMicroReadbackValidate(@sample, @plan) <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn 9 : EndIf
+  ProcedureReturn 0
+EndProcedure
