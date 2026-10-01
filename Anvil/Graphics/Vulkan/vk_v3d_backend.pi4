@@ -105,7 +105,7 @@ Procedure.i avkBackendCaps()
   Define caps.i
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
-  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST
+  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
   CompilerIf #DSP_DMA_LINKED = 1
     caps = caps | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
   CompilerEndIf
@@ -797,13 +797,21 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   Define sc.AvkV3dNormalizedScissor
 
   If *d = 0 Or *first = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+    If (*d\width % 2) <> 0 Or (*d\height % 2) <> 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+    If *d\clearRectX < 0 Or *d\clearRectY < 0 Or *d\clearRectW < 1 Or *d\clearRectH < 1 Or *d\clearRectW > *d\width Or *d\clearRectH > *d\height Or *d\clearRectX > *d\width - *d\clearRectW Or *d\clearRectY > *d\height - *d\clearRectH
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If *d\kind <> #ANVIL_VK_RENDER_OP_DRAW : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   pipe = *d\pipeline
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   If AnvilVkV3dCodeBase(pipe) = 0 : ProcedureReturn #ANVIL_VK_ERR_STATE : EndIf
   If avkV3dPrimitiveMode(pipe) < 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
-  If *d\targetBase <> *first\targetBase Or *d\targetBytes <> *first\targetBytes Or *d\width <> *first\width Or *d\height <> *first\height Or *d\pitch <> *first\pitch Or *d\clearBgra <> *first\clearBgra
-    ProcedureReturn #ANVIL_VK_ERR_ARGS
-  EndIf
   If *d\viewportX < 0 Or *d\viewportY < 0 Or *d\viewportX > 16383 Or *d\viewportY > 16383 Or *d\viewportW < 1 Or *d\viewportW > 32767 Or *d\viewportH < 1 Or *d\viewportH > 32767
     ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
   EndIf
@@ -967,6 +975,13 @@ Procedure.i avkV3dListPacketBytes(*list.AnvilVkBackendDrawList)
   clipH = PeekI(*list\draws + OffsetOf(AnvilVkBackendDraw\height))
   While draw < *list\drawCount
     *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+    If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+      bytes = bytes + 128
+      blend = -1 : vary = -1 : halfW = -1 : halfH = -1 : fineW = -1 : fineH = -1
+      clipX = -1 : clipY = -1 : clipW = -1 : clipH = -1
+      draw = draw + 1
+      Continue
+    EndIf
     If *d\sampleMask <> 0
       pipe = *d\pipeline
       If avkV3dNormalizeScissor(*d, @sc) = 0 : ProcedureReturn -1 : EndIf
@@ -1282,6 +1297,33 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
   ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure
 
+; Emit a replacement-colour rectangle with private Neon shader state. This
+; path does not inherit the application's blend, viewport, scissor or mask.
+Procedure.i avkV3dEmitClearRect(*d.AnvilVkBackendDraw)
+  Define first.i
+  If *d = 0 Or neon_nDraws >= #NEON_MAX_DRAWS Or neon_nVerts > #NEON_MAX_VERTS - 6
+    ProcedureReturn #NEON_ERR_RECORDS
+  EndIf
+  first = neon_nVerts
+  neon_Rect(*d\clearRectX, *d\clearRectY, *d\clearRectW, *d\clearRectH)
+  If neon_nVerts <> first + 6 : ProcedureReturn #NEON_ERR_VERTS : EndIf
+  neon_Uniforms(neon_nDraws, *d\clearRectBgra)
+  If neon_Record(neon_nDraws) <> #V3D_OK : ProcedureReturn #NEON_ERR_RECORDS : EndIf
+  V3dClClipWindow(*d\clearRectX, *d\clearRectY, *d\clearRectW, *d\clearRectH)
+  V3dClClipperXyScaling(neon_F32Int(neon_cx * 256), neon_F32Int(neon_cy * 256))
+  V3dClViewportOffset(neon_cx * 256, 0, neon_cy * 256, 0)
+  V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))
+  V3dClBlendEnables(0)
+  V3dClColorWriteMasks(0)
+  V3dClSampleState($3F80, $F)
+  V3dClNonperspFlags(0)
+  V3dClGlShaderState(neon_shrec + (neon_nDraws * #NEON_SHREC_STRIDE), #NEON_ATTRS)
+  V3dClVertexArrayPrims(#NEON_PRIM_TRIS, 6, first)
+  If V3dClError() <> #V3D_OK : ProcedureReturn #NEON_ERR_LIST : EndIf
+  neon_nDraws = neon_nDraws + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
 ; Consume one portable closed list as one hardware transaction. The arena is
 ; an ordinary internal heap allocation, so it is visible to the same overlap
 ; tracker as application memory and is returned on every exit path.
@@ -1319,6 +1361,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
   Define packetBytes.i
   Define lastRecord.i = avkV3dLastRecord
   Define liveDraws.i
+  Define preparedDraws.i
   Define viewportTransitions.i
   Define scissorTransitions.i
   Define blendTransitions.i
@@ -1355,7 +1398,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
       avkFault(rc, "the Pi 4 Vulkan backend refused a closed draw-list record during atomic preflight; no frame was begun and no primitive was submitted.")
       ProcedureReturn -1
     EndIf
-    If *d\sampleMask <> 0 : liveDraws = liveDraws + 1 : EndIf
+    If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT Or *d\sampleMask <> 0 : liveDraws = liveDraws + 1 : EndIf
     draw = draw + 1
   Wend
   packetBytes = avkV3dListPacketBytes(*list)
@@ -1388,7 +1431,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
     draw = 0
     While draw < *list\drawCount
       *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
-      If *d\sampleMask <> 0
+      If *d\kind = #ANVIL_VK_RENDER_OP_DRAW And *d\sampleMask <> 0
         pipe = *d\pipeline
         pbase = AnvilVkV3dCodeBase(pipe)
         drawBase = AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, draw)
@@ -1403,12 +1446,13 @@ Procedure.i avkBackendSubmitDraw(*payload)
           ProcedureReturn -1
         EndIf
         lastRecord = drawBase + #AVKQ_DRAW_OFF_SHREC
+        preparedDraws = preparedDraws + 1
       EndIf
       draw = draw + 1
     Wend
     ; `lastRecord` still names the live arena here. Snapshot it before any
     ; later operation can fail and before the arena is ever released.
-    avkV3dPublishLastRecord(lastRecord, AnvilVkV3dDrawLiveRecordBytes(pipe))
+    If preparedDraws > 0 : avkV3dPublishLastRecord(lastRecord, AnvilVkV3dDrawLiveRecordBytes(pipe)) : EndIf
   EndIf
 
   ; Collect every exact GPU-read span. One physical union follows after all
@@ -1418,7 +1462,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
     draw = 0
     While draw < *list\drawCount
       *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
-      If *d\sampleMask <> 0
+      If *d\kind = #ANVIL_VK_RENDER_OP_DRAW And *d\sampleMask <> 0
         pipe = *d\pipeline
         drawBase = AnvilVkV3dDrawSlotBase(arenaBase, arenaBytes, draw)
         rangeCount = AnvilVkV3dDrawCacheRangeCount(pipe)
@@ -1473,6 +1517,14 @@ Procedure.i avkBackendSubmitDraw(*payload)
     draw = 0
     While draw < *list\drawCount
       *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
+      If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+        rc = avkV3dEmitClearRect(*d)
+        If rc <> #NEON_OK : Break : EndIf
+        clipX = -1 : clipY = -1 : clipW = -1 : clipH = -1
+        blend = -1 : vary = -1 : halfW = -1 : halfH = -1 : fineW = -1 : fineH = -1
+        draw = draw + 1
+        Continue
+      EndIf
       ; A zero sample mask is still fully validated and owns a private slot,
       ; but emits no state and no primitive.
       If *d\sampleMask <> 0

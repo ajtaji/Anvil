@@ -1482,8 +1482,8 @@ Procedure vkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcImageLayout.i, 
   AnvilVkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout, dstBuffer, regionCount, *pRegions)
 EndProcedure
 
-; A whole-attachment clear before any draw lowers to the Pi 4 tile clear.
-; Other rectangles and later clears need a separate in-pass draw operation.
+; The portable recorder folds an early whole clear into the load operation or
+; appends an ordered rectangle clear when the backend advertises that path.
 Procedure vkCmdClearAttachments(commandBuffer.i, attachmentCount.i, *pAttachments.VkClearAttachment, rectCount.i, *pRects.VkClearRect)
   Define c.i
   c = avkCmdSlot(commandBuffer)
@@ -1492,7 +1492,7 @@ Procedure vkCmdClearAttachments(commandBuffer.i, attachmentCount.i, *pAttachment
     ProcedureReturn
   EndIf
   If attachmentCount <> 1 Or *pAttachments = 0 Or rectCount <> 1 Or *pRects = 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires exactly one colour attachment and one whole-framebuffer rectangle (Anvil code -20005, unsupported array); no partial clear was recorded.")
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires exactly one colour attachment and one rectangle (Anvil code -20005, unsupported array); no clear was recorded.")
     ProcedureReturn
   EndIf
   AnvilVkCmdClearAttachments(commandBuffer, *pAttachments, *pRects)

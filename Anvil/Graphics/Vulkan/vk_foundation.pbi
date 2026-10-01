@@ -161,6 +161,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; backend path and do not depend on this capability.
 #ANVIL_VK_CAP_LINEAR_TRANSFER = $0080
 
+; An in-render-pass colour rectangle clear can execute in recorded order.
+; This is independent of whole-image clear and ordinary pipeline draws.
+#ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT = $0100
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
@@ -290,7 +294,13 @@ Structure AnvilVkBackendTiledReadback Align #PB_Structure_AlignC
   regionHeight.i
 EndStructure
 
+; Entries share one ordered render-pass stream. A clear entry ignores all
+; application pipeline, blend, scissor, viewport and sample-mask state.
+#ANVIL_VK_RENDER_OP_DRAW = 0
+#ANVIL_VK_RENDER_OP_CLEAR_RECT = 1
+
 Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
+  kind.i              ; #ANVIL_VK_RENDER_OP_*
   pipeline.i          ; the backend's own pipeline slot
   targetBase.i        ; the colour attachment's first byte
   targetBytes.i
@@ -338,6 +348,11 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   ; The pointer names staging owned by the portable pipeline layer and remains
   ; valid until the submission completes. Zero when the shader has no texture.
   sampledImage.i
+  clearRectX.i
+  clearRectY.i
+  clearRectW.i
+  clearRectH.i
+  clearRectBgra.i
 EndStructure
 
 ; One already-closed ordered draw list. `draws` points to `drawCount`

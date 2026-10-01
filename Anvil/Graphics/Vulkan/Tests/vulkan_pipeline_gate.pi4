@@ -339,6 +339,9 @@ Procedure.i Main()
   Define rpbi.VkRenderPassBeginInfo
   Define attachment.VkClearAttachment
   Define clearRect.VkClearRect
+  Define clearCaps.i
+  Define clearOk.i
+  Define clearPixel.i
   Define cbHandle.i
   Define texSlot.i
   Define fenceArray.i
@@ -3310,22 +3313,63 @@ Procedure.i Main()
   pgPut(693, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
   pgPut(694, AnvilVkTestBackendLastDrawColor())
 
-  ; Partial and post-draw clears must invalidate recording before submission.
+  ; A partial clear is a real ordered operation even without an application
+  ; pipeline. The test backend observes the closed record and writes no pixel.
+  attachment\clearValue[0] = #PG_PUSH_R : attachment\clearValue[1] = #PG_PUSH_G
+  attachment\clearValue[2] = #PG_PUSH_B : attachment\clearValue[3] = 0
   clearRect\rect\extent\width = #PG_W - 1
+  clearPixel = PeekL(AnvilVkImageAddress(img))
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
   vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
   vkCmdEndRenderPass(cmd)
-  pgPut(695, vkEndCommandBuffer(cmd))
+  i = vkEndCommandBuffer(cmd)
+  attachment\clearValue[0] = 0 : attachment\clearValue[1] = 0
+  beforeCalls = AnvilVkTestBackendCalls()
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
+  rc = vkQueueSubmit(queue, 1, @si, fence)
+  *multiList = AnvilVkLastDrawList()
+  *multi0 = *multiList\draws
+  clearOk = Bool(i = #VK_SUCCESS And rc = #VK_SUCCESS And AnvilVkTestBackendCalls() = beforeCalls + 1 And *multiList\drawCount = 1 And *multi0\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT And *multi0\pipeline = 0 And *multi0\clearRectW = #PG_W - 1 And *multi0\clearRectBgra = $00FF8000 And PeekL(AnvilVkImageAddress(img)) = clearPixel)
+  AnvilVkTestBackendHold(0)
+  If vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000) <> #VK_SUCCESS : clearOk = 0 : EndIf
+
+  ; Removing only this capability refuses the same public command before a
+  ; backend call, while whole-load clears stay independently available.
+  clearCaps = avkTbCaps
+  AnvilVkTestBackendCapabilities(clearCaps - #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> beforeCalls + 1 Or PeekL(AnvilVkImageAddress(img)) <> clearPixel : clearOk = 0 : EndIf
+  AnvilVkTestBackendCapabilities(clearCaps)
+  pgPut(695, clearOk)
+
+  ; A zero-sample-mask draw cannot suppress the following clear. The final
+  ; draw remains after the clear in the one closed transaction.
+  attachment\clearValue[0] = #PG_PUSH_R : attachment\clearValue[1] = #PG_PUSH_G
   clearRect\rect\extent\width = #PG_W
   vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
   vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
-  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeE)
   vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
   vkCmdDraw(cmd, 3, 1, 0, 0)
   vkCmdClearAttachments(cmd, 1, @attachment, 1, @clearRect)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeA)
+  vkCmdDraw(cmd, 3, 1, 0, 0)
   vkCmdEndRenderPass(cmd)
-  pgPut(696, vkEndCommandBuffer(cmd))
+  i = vkEndCommandBuffer(cmd)
+  AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
+  rc = vkQueueSubmit(queue, 1, @si, fence)
+  *multiList = AnvilVkLastDrawList()
+  *multi0 = *multiList\draws
+  *multi1 = *multiList\draws + SizeOf(AnvilVkBackendDraw)
+  *multi2 = *multiList\draws + (2 * SizeOf(AnvilVkBackendDraw))
+  clearOk = Bool(i = #VK_SUCCESS And rc = #VK_SUCCESS And *multiList\drawCount = 3 And *multi0\kind = #ANVIL_VK_RENDER_OP_DRAW And *multi0\sampleMask = 0 And *multi1\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT And *multi1\clearRectBgra = $00FF8000 And *multi2\kind = #ANVIL_VK_RENDER_OP_DRAW And *multi2\sampleMask <> 0 And avkPipeInFlight[0] = 0)
+  AnvilVkTestBackendHold(0)
+  If vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000) <> #VK_SUCCESS : clearOk = 0 : EndIf
+  pgPut(696, clearOk)
 
   ; A render pass with only a whole-attachment clear is a real GPU job.
   ; Hold it to prove framebuffer/pass/view ownership lasts through the fence.
