@@ -192,6 +192,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; This is independent of optimal-image to buffer readback support.
 #ANVIL_VK_CAP_TILED_TO_LINEAR_MICRO_COPY = $10000
 
+; One linear-image rectangle may write within a single optimal UIF utile.
+; Full aligned image scatters and buffer-sourced micro uploads remain separate.
+#ANVIL_VK_CAP_LINEAR_TO_TILED_MICRO_COPY = $20000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0
