@@ -1,0 +1,715 @@
+; Bounded RAM-only public partial optimal-to-optimal BGRA8 copy proof.
+; Two independent TFU baselines, one guarded DMA image copy, mapped UIF oracles.
+; This diagnostic returns a fixed 264-word report and never flashes the board.
+#PMF_CHIP = 2711
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_interp_expect.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VVP_MAGIC = $59524156                 ; "VARY", slot 0
+#VVP_TAIL_MAGIC = $56415259            ; "YRAV", final report slot
+#VVP_REPORT_BYTES = 264 * 4
+#VVP_ARENA = $0A000000
+#VVP_ARENA_BYTES = $01000000
+#VVP_SURFACE = $06000000
+#VVP_PANEL_W = 800
+#VVP_PANEL_H = 1280
+#VVP_PANEL_PITCH = 3200
+#VVP_SCREEN_BYTES = 4096000
+#VVP_WIN_BASE = $063E8000              ; $06000000 + 4,096,000
+#VVP_WIN_BYTES = 4227072               ; one screen plus 128 KiB
+#VVP_MAP_SPAN = 8323072
+#VVP_GUARD = $5A3C0FF0
+#VVP_OK = 0
+#VVP_NOT_TRIED = 1
+#VVP_ERR_NEON = 6
+#VVP_ERR_WINDOW = 7
+#VVP_ERR_INSTANCE = 8
+#VVP_ERR_DEVICE = 9
+#VVP_ERR_FENCE = 22
+#VVP_ERR_V3D_FAULT = 27
+#VVP_ERR_DMA = 37
+#VVP_ERR_OPTIMAL_COPY = 38
+#VVP_S_MAGIC = 0
+#VVP_S_STATUS_A = 1
+#VVP_S_STATUS_B = 2
+#VVP_S_STATUS_C = 3
+#VVP_S_BIN_OOM = 82
+#VVP_S_MMU_FAULTS = 85
+#VVP_S_NATIVE = 95
+#VVP_S_FAULT_COUNT = 96
+#VVP_S_FAULT_TEXT = 97
+#VVP_S_SHUTDOWN = 110
+#VVP_S_STEP = 125
+#VVP_S_BYTES = 126
+#VVP_S_STATUS_D = 128
+#VVP_S_PARTIAL_DMA_BEFORE = 240
+#VVP_S_PARTIAL_DMA_AFTER = 241
+#VVP_S_PARTIAL_TEXELS = 243
+#VVP_S_PARTIAL_PADDING = 244
+#VVP_S_EDGE_STATUS = 248
+#VVP_S_EDGE_FAULT_DELTA = 239
+#VVP_S_EDGE_TFU_BEFORE = 249
+#VVP_S_EDGE_TFU_AFTER = 250
+#VVP_S_EDGE_DMA_BEFORE = 251
+#VVP_S_EDGE_DMA_AFTER = 252
+#VVP_S_EDGE_JOB_BEFORE = 253
+#VVP_S_EDGE_JOB_AFTER = 254
+#VVP_S_EDGE_TEXELS = 255
+#VVP_S_EDGE_PADDING = 256
+#VVP_S_EDGE_GUARDS = 257
+#VVP_S_EDGE_REFUSAL = 258
+#VVP_S_EDGE_FIRST = 259
+#VVP_S_EDGE_LAST = 260
+#VVP_S_EDGE_SOURCE_BYTES = 261
+#VVP_S_EDGE_DEST_BYTES = 262
+#VVP_S_COPY_UNTOUCHED = 247
+#VVP_S_TAIL = 263
+Global Dim vvpReport.l[264]
+Global Dim vacDmaScratch.a[768]
+
+Procedure vvpPut(slot.i, value.i)
+  If slot < 0 Or slot > 263
+    ProcedureReturn
+  EndIf
+  vvpReport[slot] = value & $FFFFFFFF
+EndProcedure
+
+; Read a slot back WITHOUT the sign of a 32-bit load leaking into a
+; 64-bit comparison. A pixel of $FFFF0000 read from a .l is -65536, and
+; comparing that against the constant would fail on every correct run.
+Procedure.i vvpGet(slot.i)
+  If slot < 0 Or slot > 263
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn vvpReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure vvpStep(n.i)
+  vvpPut(#VVP_S_STEP, n)
+EndProcedure
+
+; Stop with a verdict in EVERY pass that has not answered yet, so a
+; report never shows one pass failed and the others simply blank.
+Procedure.i vvpStop(status.i)
+  If vvpGet(#VVP_S_STATUS_A) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_A, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_B) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_B, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_C) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_C, status) : EndIf
+  If vvpGet(#VVP_S_STATUS_D) = #VVP_NOT_TRIED : vvpPut(#VVP_S_STATUS_D, status) : EndIf
+  vvpPut(#VVP_S_FAULT_TEXT, AnvilVkFaultText())
+  vvpPut(#VVP_S_FAULT_COUNT, AnvilVkFaultCount())
+  ProcedureReturn @vvpReport[0]
+EndProcedure
+
+Procedure.i vvpSum(base.i, bytes.i)
+  Define i.i
+  Define s.i
+  s = 0
+  i = 0
+  While i < bytes
+    s = (s + (PeekL(base + i) & $FFFFFFFF) + i) & $FFFFFFFF
+    i = i + 4
+  Wend
+  ProcedureReturn s
+EndProcedure
+
+Procedure vvpFill(base.i, bytes.i, word.i)
+  Define i.i
+  i = 0
+  While i < bytes
+    PokeL(base + i, word)
+    i = i + 4
+  Wend
+EndProcedure
+
+; One atlas vertex is position.xy, uv.xy, followed by an unused colour.xy.
+; Keeping the inherited 24-byte stride lets the earlier control passes use
+; the same public vertex buffer without a private backend seam.
+Procedure.i vvpEdgeWord(x.i, y.i)
+  ProcedureReturn ($FF000000 | (((x * 17 + y * 3) & 255) << 16) | (((x * 5 + y * 29) & 255) << 8) | ((x * 37 + y * 11) & 255)) & $FFFFFFFF
+EndProcedure
+
+
+; Stages select one 64-row source rectangle of width 16, 32 or 64.
+; Source (0,0) copies to destination (8,0); at 256 utiles x=0..7 stays intact.
+#COPY_TILES = 256
+#COPY_W = 72
+#COPY_H = 64
+#COPY_IMAGE_BYTES = 24576
+#COPY_STAGE_BYTES = 37056
+#COPY_SOURCE_STAGE = 64
+#COPY_DEST_STAGE = 18560
+#COPY_S_BASELINE = 220
+#COPY_S_CHANGED = 221
+#COPY_S_UNTOUCHED = 222
+#COPY_S_SOURCE = 223
+#COPY_S_PADDING = 224
+#COPY_S_GUARDS = 225
+#COPY_S_FIRST_BAD = 226
+#COPY_S_INIT_US = 227
+#COPY_S_BASE_US = 228
+#COPY_S_UPLOAD_US = 229
+#COPY_S_FINAL_US = 230
+#COPY_S_TOTAL_US = 231
+#COPY_S_ANCHORS = 232
+#COPY_S_WIDTH = 233
+#COPY_S_TILES = 234
+#COPY_S_ALIGN = 235
+#COPY_S_BIND = 236
+#COPY_S_STAGE = 237
+#COPY_S_SRC_GUARDS = 238
+#COPY_S_PAD_BEFORE = 215
+#COPY_S_PAD_AFTER = 216
+#COPY_S_DEST_PAD_BEFORE = 213
+#COPY_S_DEST_PAD_AFTER = 214
+#COPY_S_DEST_BASELINE = 219
+#COPY_S_ALLOCATION = 209
+#COPY_S_SOURCE_BASE = 210
+#COPY_S_DEST_BASE = 211
+#COPY_S_DISJOINT = 212
+#COPY_S_INIT_TFU_BEFORE = 217
+#COPY_S_INIT_TFU_AFTER = 218
+
+Procedure.i copyPattern(x.i, y.i, seed.i)
+  ProcedureReturn ($FF000000 | (((x * 17 + y * 3 + seed * 11) & 255) << 16) | (((x * 5 + y * 29 + seed * 7) & 255) << 8) | ((x * 37 + y * 11 + seed * 13) & 255)) & $FFFFFFFF
+EndProcedure
+
+; Independent oracle: no production UIF offset helper call. TFU first
+; produces a complete patterned image, which validates this mapping before
+; either partial DMA upload can run.
+Procedure.i copyOracleOffset(x.i, y.i)
+  Define group.i
+  Define blockColumn.i
+  Define blockRow.i
+  Define quadrant.i
+  Define inRow.i
+  group = x / 32
+  blockColumn = (x % 32) / 8
+  blockRow = y / 8
+  quadrant = ((y % 8) / 4) * 2 + ((x % 8) / 4)
+  inRow = (y % 4) * 16 + (x % 4) * 4
+  ProcedureReturn group * 8192 + blockRow * 1024 + blockColumn * 256 + quadrant * 64 + inRow
+EndProcedure
+
+Procedure.i copyAnchors()
+  If copyOracleOffset(0, 0) <> 0 Or copyOracleOffset(4, 0) <> 64 Or copyOracleOffset(0, 4) <> 128 Or copyOracleOffset(8, 0) <> 256 : ProcedureReturn 0 : EndIf
+  If copyOracleOffset(32, 0) <> 8192 Or copyOracleOffset(40, 0) <> 8448 Or copyOracleOffset(64, 0) <> 16384 Or copyOracleOffset(71, 63) <> 23804 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 8
+EndProcedure
+
+Procedure.i copySubmit(queue.i, dev.i, fence.i, *si.VkSubmitInfo)
+  Define rc.i
+  Define fenceHandle.i = fence
+  rc = vkResetFences(dev, 1, @fenceHandle)
+  If rc = #VK_SUCCESS : rc = vkQueueSubmit(queue, 1, *si, fence) : EndIf
+  If rc = #VK_SUCCESS : rc = vkWaitForFences(dev, 1, @fenceHandle, 1, 2000000000) : EndIf
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i vvpPartialOptimalCopyProof(phys.i, dev.i, queue.i, cmd.i, fence.i, *si.VkSubmitInfo, *bi.VkCommandBufferBeginInfo)
+  Define status.i = #VVP_OK, rc.i, width.i = #COPY_TILES / 4
+  Define sourceImage.i, destinationImage.i, sourceMem.i, destinationMem.i
+  Define stage.i, stageMem.i, mapped.i, mapMem.i, image.i, memory.i
+  Define bindOffset.i, imageBytes.i, allocationBytes.i, sourceBase.i, destinationBase.i
+  Define x.i, y.i, k.i, i.i, seed.i, base.i, off.i, expected.i
+  Define sourceBaseline.i, destinationBaseline.i, sourceUnchanged.i, changed.i, untouched.i
+  Define stageMatch.i, guards.i, stageGuards.i, bad.i, firstBad.i = -1
+  Define padSum.i, dmaBefore.i, jobBefore.i, tfuBefore.i, initTfuBefore.i
+  Define t0.i = Micros(), tick.i
+  Define ici.VkImageCreateInfo, bci.VkBufferCreateInfo, req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo, mp.VkPhysicalDeviceMemoryProperties
+  Define bar.VkImageMemoryBarrier, region.VkBufferImageCopy, copy.VkImageCopy
+
+  vvpPut(#COPY_S_WIDTH, width) : vvpPut(#COPY_S_TILES, #COPY_TILES)
+  vvpPut(#COPY_S_STAGE, #COPY_STAGE_BYTES) : vvpPut(#COPY_S_ANCHORS, copyAnchors())
+  If width < 16 Or width > 64 Or (width % 16) <> 0 Or vvpGet(#COPY_S_ANCHORS) <> 8 : status = 40 : EndIf
+  vkGetPhysicalDeviceMemoryProperties(phys, @mp)
+  If mp\memoryTypeCount < 1 Or (mp\memoryTypes[0]\propertyFlags & #VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) = 0 : status = 41 : EndIf
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO : mai\memoryTypeIndex = 0
+
+  If status = #VVP_OK
+    ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+    ici\imageType = #VK_IMAGE_TYPE_2D : ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+    ici\extent\width = #COPY_W : ici\extent\height = #COPY_H : ici\extent\depth = 1
+    ici\mipLevels = 1 : ici\arrayLayers = 1 : ici\samples = #VK_SAMPLE_COUNT_1_BIT
+    ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+    ici\usage = #VK_IMAGE_USAGE_TRANSFER_SRC_BIT | #VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    rc = vkCreateImage(dev, @ici, 0, @sourceImage)
+    If rc = #VK_SUCCESS : rc = vkCreateImage(dev, @ici, 0, @destinationImage) : EndIf
+    If rc <> #VK_SUCCESS : status = 42 : EndIf
+  EndIf
+  If status = #VVP_OK
+    vkGetImageMemoryRequirements(dev, sourceImage, @req)
+    imageBytes = req\size : vvpPut(#VVP_S_EDGE_DEST_BYTES, imageBytes)
+    vvpPut(#COPY_S_ALIGN, req\alignment)
+    If imageBytes <> #COPY_IMAGE_BYTES Or req\alignment < 1 Or (req\memoryTypeBits & 1) = 0
+      status = 43
+    Else
+      bindOffset = ((256 + req\alignment - 1) / req\alignment) * req\alignment
+      vvpPut(#COPY_S_BIND, bindOffset)
+      allocationBytes = bindOffset + imageBytes + 256
+      vvpPut(#COPY_S_ALLOCATION, allocationBytes)
+      mai\allocationSize = allocationBytes
+      rc = vkAllocateMemory(dev, @mai, 0, @sourceMem)
+      If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, sourceImage, sourceMem, bindOffset) : EndIf
+      If rc <> #VK_SUCCESS : status = 43 : EndIf
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    vkGetImageMemoryRequirements(dev, destinationImage, @req)
+    If req\size <> imageBytes Or req\alignment <> vvpGet(#COPY_S_ALIGN) Or (req\memoryTypeBits & 1) = 0
+      status = 43
+    Else
+      mai\allocationSize = allocationBytes
+      rc = vkAllocateMemory(dev, @mai, 0, @destinationMem)
+      If rc = #VK_SUCCESS : rc = vkBindImageMemory(dev, destinationImage, destinationMem, bindOffset) : EndIf
+      If rc <> #VK_SUCCESS : status = 43 : EndIf
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    For i = 0 To 1
+      If i = 0 : memory = sourceMem : Else : memory = destinationMem : EndIf
+      rc = vkMapMemory(dev, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        status = 44
+      Else
+        mapMem = memory
+        If i = 0
+          sourceBase = mapped + bindOffset
+          vvpPut(#COPY_S_SOURCE_BASE, sourceBase)
+        Else
+          destinationBase = mapped + bindOffset
+          vvpPut(#COPY_S_DEST_BASE, destinationBase)
+        EndIf
+        vkUnmapMemory(dev, memory) : mapped = 0 : mapMem = 0
+      EndIf
+    Next
+  EndIf
+  ; Check both full allocations and image spans before either TFU job.
+  If status = #VVP_OK
+    If allocationBytes <= imageBytes Or allocationBytes > #VVP_WIN_BYTES Or sourceBase < #VVP_WIN_BASE + bindOffset Or destinationBase < #VVP_WIN_BASE + bindOffset Or sourceBase > $FFFFFFFF - imageBytes Or destinationBase > $FFFFFFFF - imageBytes
+      status = 53
+    ElseIf sourceBase - bindOffset - #VVP_WIN_BASE > #VVP_WIN_BYTES - allocationBytes Or destinationBase - bindOffset - #VVP_WIN_BASE > #VVP_WIN_BYTES - allocationBytes
+      status = 53
+    ElseIf sourceBase <= destinationBase
+      If destinationBase - sourceBase < allocationBytes : status = 53 : EndIf
+    Else
+      If sourceBase - destinationBase < allocationBytes : status = 53 : EndIf
+    EndIf
+    If status = #VVP_OK : vvpPut(#COPY_S_DISJOINT, 1) : EndIf
+  EndIf
+  ; Only after validating both mapped allocations may this diagnostic write guards.
+  If status = #VVP_OK
+    For i = 0 To 1
+      If status = #VVP_OK
+        If i = 0 : memory = sourceMem : base = sourceBase : Else : memory = destinationMem : base = destinationBase : EndIf
+        rc = vkMapMemory(dev, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+        If rc <> #VK_SUCCESS Or mapped = 0
+          status = 44
+        Else
+          mapMem = memory
+          If mapped + bindOffset <> base
+            status = 53
+          Else
+            For k = 0 To 63
+              PokeL(mapped + bindOffset - 256 + k * 4, $A5A5A5A5)
+              PokeL(mapped + bindOffset + imageBytes + k * 4, $A5A5A5A5)
+            Next
+            DmaCacheRange(mapped + bindOffset - 256, imageBytes + 512)
+          EndIf
+          vkUnmapMemory(dev, memory) : mapped = 0 : mapMem = 0
+        EndIf
+      EndIf
+    Next
+  EndIf
+  If status = #VVP_OK
+    bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+    bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+    bci\size = #COPY_STAGE_BYTES : bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+    rc = vkCreateBuffer(dev, @bci, 0, @stage)
+    If rc <> #VK_SUCCESS : status = 45 : EndIf
+  EndIf
+  If status = #VVP_OK
+    vkGetBufferMemoryRequirements(dev, stage, @req)
+    If (req\memoryTypeBits & 1) = 0 : status = 45 : EndIf
+    If status = #VVP_OK
+      mai\allocationSize = req\size
+      rc = vkAllocateMemory(dev, @mai, 0, @stageMem)
+      If rc = #VK_SUCCESS : rc = vkBindBufferMemory(dev, stage, stageMem, 0) : EndIf
+      If rc <> #VK_SUCCESS : status = 45 : EndIf
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    rc = vkMapMemory(dev, stageMem, 0, #COPY_STAGE_BYTES, 0, @mapped)
+    If rc <> #VK_SUCCESS Or mapped = 0
+      status = 46
+    Else
+      mapMem = stageMem
+      For k = 0 To (#COPY_STAGE_BYTES / 4) - 1 : PokeL(mapped + k * 4, $A5A5A5A5) : Next
+      For y = 0 To #COPY_H - 1
+        For x = 0 To #COPY_W - 1
+          PokeL(mapped + #COPY_SOURCE_STAGE + y * #COPY_W * 4 + x * 4, copyPattern(x, y, 29))
+          PokeL(mapped + #COPY_DEST_STAGE + y * #COPY_W * 4 + x * 4, copyPattern(x, y, 7))
+        Next
+      Next
+      vkUnmapMemory(dev, stageMem) : mapped = 0 : mapMem = 0
+    EndIf
+  EndIf
+
+  If status = #VVP_OK
+    bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    bar\srcAccessMask = 0 : bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+    region\bufferRowLength = #COPY_W
+    region\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    region\imageSubresource\layerCount = 1
+    region\imageExtent\width = #COPY_W : region\imageExtent\height = #COPY_H : region\imageExtent\depth = 1
+    initTfuBefore = V3dTfuJobs() : vvpPut(#COPY_S_INIT_TFU_BEFORE, initTfuBefore)
+    tick = Micros()
+    For i = 0 To 1
+      If status = #VVP_OK
+        If i = 0
+          image = sourceImage : region\bufferOffset = #COPY_SOURCE_STAGE
+        Else
+          image = destinationImage : region\bufferOffset = #COPY_DEST_STAGE
+        EndIf
+        bar\image = image
+        rc = vkResetCommandBuffer(cmd, 0)
+        If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(cmd, *bi) : EndIf
+        If rc = #VK_SUCCESS
+          vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+          vkCmdCopyBufferToImage(cmd, stage, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @region)
+          rc = vkEndCommandBuffer(cmd)
+        EndIf
+        If rc = #VK_SUCCESS : rc = copySubmit(queue, dev, fence, *si) : EndIf
+        If rc <> #VK_SUCCESS : status = 47 : EndIf
+      EndIf
+    Next
+    vvpPut(#COPY_S_INIT_US, Micros() - tick)
+    vvpPut(#COPY_S_INIT_TFU_AFTER, V3dTfuJobs())
+    If V3dTfuJobs() <> initTfuBefore + 2 : status = 47 : EndIf
+  EndIf
+
+  ; TFU-produced source and destination baselines validate the independent oracle.
+  If status = #VVP_OK
+    tick = Micros()
+    For i = 0 To 1
+      If i = 0 : memory = sourceMem : seed = 29 : Else : memory = destinationMem : seed = 7 : EndIf
+      rc = vkMapMemory(dev, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        status = 48
+      Else
+        mapMem = memory : base = mapped + bindOffset
+        DmaCacheRange(mapped + bindOffset - 256, imageBytes + 512)
+        For y = 0 To #COPY_H - 1
+          For x = 0 To #COPY_W - 1
+            off = copyOracleOffset(x, y)
+            If off >= 0 And off <= imageBytes - 4 And (PeekL(base + off) & $FFFFFFFF) = copyPattern(x, y, seed)
+              If i = 0 : sourceBaseline + 1 : Else : destinationBaseline + 1 : EndIf
+            Else
+              bad + 1
+              If firstBad = -1 : firstBad = i * #COPY_W * #COPY_H + y * #COPY_W + x : EndIf
+            EndIf
+          Next
+        Next
+        padSum = 0
+        For y = 0 To #COPY_H - 1
+          For x = #COPY_W To 95
+            off = copyOracleOffset(x, y)
+            padSum = (padSum + (PeekL(base + off) & $FFFFFFFF) + off) & $FFFFFFFF
+          Next
+        Next
+        If i = 0 : vvpPut(#COPY_S_PAD_BEFORE, padSum) : Else : vvpPut(#COPY_S_DEST_PAD_BEFORE, padSum) : EndIf
+        vkUnmapMemory(dev, memory) : mapped = 0 : mapMem = 0
+      EndIf
+    Next
+    vvpPut(#COPY_S_BASE_US, Micros() - tick)
+    vvpPut(#COPY_S_BASELINE, sourceBaseline)
+    vvpPut(#COPY_S_DEST_BASELINE, destinationBaseline)
+    If sourceBaseline <> #COPY_W * #COPY_H Or destinationBaseline <> #COPY_W * #COPY_H : status = 48 : EndIf
+  EndIf
+
+  If status = #VVP_OK
+    bar\image = sourceImage
+    bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\dstAccessMask = #VK_ACCESS_TRANSFER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+    copy\srcSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    copy\srcSubresource\layerCount = 1
+    copy\dstSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    copy\dstSubresource\layerCount = 1
+    copy\dstOffset\x = 8
+    copy\extent\width = width : copy\extent\height = #COPY_H : copy\extent\depth = 1
+    rc = vkResetCommandBuffer(cmd, 0)
+    If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(cmd, *bi) : EndIf
+    If rc = #VK_SUCCESS
+      vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdCopyImage(cmd, sourceImage, #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+      rc = vkEndCommandBuffer(cmd)
+    EndIf
+    dmaBefore = hwVkDmaOps : jobBefore = avkV3dJobs : tfuBefore = V3dTfuJobs()
+    vvpPut(#VVP_S_EDGE_DMA_BEFORE, dmaBefore)
+    vvpPut(#VVP_S_EDGE_JOB_BEFORE, jobBefore)
+    vvpPut(#VVP_S_EDGE_TFU_BEFORE, tfuBefore)
+    tick = Micros()
+    If rc = #VK_SUCCESS : rc = copySubmit(queue, dev, fence, *si) : EndIf
+    vvpPut(#COPY_S_UPLOAD_US, Micros() - tick)
+    vvpPut(#VVP_S_EDGE_DMA_AFTER, hwVkDmaOps)
+    vvpPut(#VVP_S_EDGE_JOB_AFTER, avkV3dJobs)
+    vvpPut(#VVP_S_EDGE_TFU_AFTER, V3dTfuJobs())
+    If rc <> #VK_SUCCESS Or hwVkDmaOps <> dmaBefore + #COPY_TILES Or avkV3dJobs <> jobBefore + 1 Or V3dTfuJobs() <> tfuBefore : status = 49 : EndIf
+  EndIf
+
+  If status = #VVP_OK
+    tick = Micros()
+    For i = 0 To 1
+      If i = 0 : memory = sourceMem : seed = 29 : Else : memory = destinationMem : seed = 7 : EndIf
+      rc = vkMapMemory(dev, memory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+      If rc <> #VK_SUCCESS Or mapped = 0
+        status = 50
+      Else
+        mapMem = memory : base = mapped + bindOffset
+        DmaCacheRange(mapped + bindOffset - 256, imageBytes + 512)
+        For y = 0 To #COPY_H - 1
+          For x = 0 To #COPY_W - 1
+            If i = 0
+              expected = copyPattern(x, y, 29)
+            ElseIf x >= 8 And x < 8 + width
+              expected = copyPattern(x - 8, y, 29)
+            Else
+              expected = copyPattern(x, y, 7)
+            EndIf
+            off = copyOracleOffset(x, y)
+            If off >= 0 And off <= imageBytes - 4 And (PeekL(base + off) & $FFFFFFFF) = expected
+              If i = 0 : sourceUnchanged + 1 : ElseIf x >= 8 And x < 8 + width : changed + 1 : Else : untouched + 1 : EndIf
+            Else
+              bad + 1
+              If firstBad = -1 : firstBad = i * #COPY_W * #COPY_H + y * #COPY_W + x : EndIf
+            EndIf
+          Next
+        Next
+        padSum = 0
+        For y = 0 To #COPY_H - 1
+          For x = #COPY_W To 95
+            off = copyOracleOffset(x, y)
+            padSum = (padSum + (PeekL(base + off) & $FFFFFFFF) + off) & $FFFFFFFF
+          Next
+        Next
+        If i = 0 : vvpPut(#COPY_S_PAD_AFTER, padSum) : Else : vvpPut(#COPY_S_DEST_PAD_AFTER, padSum) : EndIf
+        For k = 0 To 63
+          If (PeekL(mapped + bindOffset - 256 + k * 4) & $FFFFFFFF) = $A5A5A5A5 : guards + 1 : Else : bad + 1 : EndIf
+          If (PeekL(mapped + bindOffset + imageBytes + k * 4) & $FFFFFFFF) = $A5A5A5A5 : guards + 1 : Else : bad + 1 : EndIf
+        Next
+        If i = 1
+          vvpPut(#VVP_S_EDGE_FIRST, PeekL(base + copyOracleOffset(0, 0)) & $FFFFFFFF)
+          vvpPut(#VVP_S_EDGE_LAST, PeekL(base + copyOracleOffset(71, 63)) & $FFFFFFFF)
+        EndIf
+        vkUnmapMemory(dev, memory) : mapped = 0 : mapMem = 0
+      EndIf
+    Next
+    vvpPut(#COPY_S_FINAL_US, Micros() - tick)
+  EndIf
+  If status = #VVP_OK
+    rc = vkMapMemory(dev, stageMem, 0, #COPY_STAGE_BYTES, 0, @mapped)
+    If rc <> #VK_SUCCESS Or mapped = 0
+      status = 51
+    Else
+      mapMem = stageMem : DmaCacheRange(mapped, #COPY_STAGE_BYTES)
+      For y = 0 To #COPY_H - 1
+        For x = 0 To #COPY_W - 1
+          If (PeekL(mapped + #COPY_SOURCE_STAGE + y * #COPY_W * 4 + x * 4) & $FFFFFFFF) = copyPattern(x, y, 29) : stageMatch + 1 : Else : bad + 1 : EndIf
+          If (PeekL(mapped + #COPY_DEST_STAGE + y * #COPY_W * 4 + x * 4) & $FFFFFFFF) = copyPattern(x, y, 7) : stageMatch + 1 : Else : bad + 1 : EndIf
+        Next
+      Next
+      For k = 0 To 15
+        If (PeekL(mapped + k * 4) & $FFFFFFFF) = $A5A5A5A5 : stageGuards + 1 : Else : bad + 1 : EndIf
+        If (PeekL(mapped + 18496 + k * 4) & $FFFFFFFF) = $A5A5A5A5 : stageGuards + 1 : Else : bad + 1 : EndIf
+        If (PeekL(mapped + 36992 + k * 4) & $FFFFFFFF) = $A5A5A5A5 : stageGuards + 1 : Else : bad + 1 : EndIf
+      Next
+      vkUnmapMemory(dev, stageMem) : mapped = 0 : mapMem = 0
+    EndIf
+  EndIf
+
+  vvpPut(#COPY_S_CHANGED, changed) : vvpPut(#COPY_S_UNTOUCHED, untouched)
+  vvpPut(#COPY_S_SOURCE, sourceUnchanged) : vvpPut(#COPY_S_PADDING, stageMatch)
+  vvpPut(#COPY_S_GUARDS, guards) : vvpPut(#COPY_S_SRC_GUARDS, stageGuards)
+  vvpPut(#COPY_S_FIRST_BAD, firstBad)
+  vvpPut(#COPY_S_TOTAL_US, Micros() - t0)
+  If status = #VVP_OK And (bad <> 0 Or changed <> width * #COPY_H Or untouched <> (#COPY_W - width) * #COPY_H Or sourceUnchanged <> #COPY_W * #COPY_H Or stageMatch <> 2 * #COPY_W * #COPY_H Or guards <> 256 Or stageGuards <> 48 Or vvpGet(#COPY_S_PAD_BEFORE) <> vvpGet(#COPY_S_PAD_AFTER) Or vvpGet(#COPY_S_DEST_PAD_BEFORE) <> vvpGet(#COPY_S_DEST_PAD_AFTER)) : status = 52 : EndIf
+
+  If mapped <> 0 And mapMem <> 0 : vkUnmapMemory(dev, mapMem) : EndIf
+  vkDeviceWaitIdle(dev)
+  vkResetCommandBuffer(cmd, 0)
+  If stage <> 0 : vkDestroyBuffer(dev, stage, 0) : EndIf
+  If stageMem <> 0 : vkFreeMemory(dev, stageMem, 0) : EndIf
+  If sourceImage <> 0 : vkDestroyImage(dev, sourceImage, 0) : EndIf
+  If destinationImage <> 0 : vkDestroyImage(dev, destinationImage, 0) : EndIf
+  If sourceMem <> 0 : vkFreeMemory(dev, sourceMem, 0) : EndIf
+  If destinationMem <> 0 : vkFreeMemory(dev, destinationMem, 0) : EndIf
+  vvpPut(#VVP_S_EDGE_STATUS, status)
+  ProcedureReturn status
+EndProcedure
+
+; One bounded offscreen image-copy proof; no sampled draw or presentation.
+Procedure.i Main()
+  Define status.i = #VVP_OK
+  Define aggStarted.i
+  Define rc.i
+  Define dmaScratch.i
+  Define inst.i
+  Define phys.i
+  Define dev.i
+  Define queue.i
+  Define pool.i
+  Define cmd.i
+  Define fence.i
+  Define count.i
+  Define faultBefore.i
+  Define cbHandle.i
+  Define neonReady.i
+  Define ici.VkInstanceCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define prio.l
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+
+  vvpPut(#VVP_S_MAGIC, #VVP_MAGIC)
+  vvpPut(#VVP_S_TAIL, #VVP_TAIL_MAGIC)
+  vvpPut(#VVP_S_BYTES, #VVP_REPORT_BYTES)
+  vvpPut(#VVP_S_STATUS_A, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_B, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_C, #VVP_NOT_TRIED)
+  vvpPut(#VVP_S_STATUS_D, #VVP_NOT_TRIED)
+  vvpStep(1)
+  TimerInit()
+  aggStarted = Micros()
+  vvpFill(#VVP_SURFACE, #VVP_SCREEN_BYTES, #VVP_GUARD)
+  If NeonArena(#VVP_ARENA, #VVP_ARENA_BYTES) <> #NEON_OK : status = #VVP_ERR_NEON : EndIf
+  If status = #VVP_OK
+    If NeonSurface(#VVP_SURFACE, #VVP_PANEL_W, #VVP_PANEL_H, #VVP_PANEL_PITCH) <> #NEON_OK
+      status = #VVP_ERR_NEON
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    NeonSurfaceMapSpan(#VVP_MAP_SPAN)
+    If NeonInit() <> #NEON_OK
+      status = #VVP_ERR_NEON
+    Else
+      neonReady = 1
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    dmaScratch = @vacDmaScratch[0] + 255
+    dmaScratch = dmaScratch - (dmaScratch % 256)
+    If DmaSetScratch(dmaScratch, 512) = 0 Or DmaSetBounds(#VVP_SURFACE, #VVP_SCREEN_BYTES) = 0 Or DmaInit() = 0
+      status = #VVP_ERR_DMA
+    EndIf
+  EndIf
+  If status = #VVP_OK
+    rc = AnvilVkV3dWindow(#VVP_WIN_BASE, #VVP_WIN_BYTES)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_WINDOW : EndIf
+  EndIf
+
+  vvpStep(2)
+  If status = #VVP_OK
+    ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+    rc = vkCreateInstance(@ici, 0, @inst)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_INSTANCE : EndIf
+  EndIf
+  If status = #VVP_OK
+    count = 1
+    rc = vkEnumeratePhysicalDevices(inst, @count, @phys)
+    If rc <> #VK_SUCCESS Or count <> 1 : status = #VVP_ERR_INSTANCE : EndIf
+  EndIf
+  If status = #VVP_OK
+    prio = 0
+    qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+    qci\queueCount = 1
+    qci\pQueuePriorities = @prio
+    dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+    dci\queueCreateInfoCount = 1
+    dci\pQueueCreateInfos = @qci
+    rc = vkCreateDevice(phys, @dci, 0, @dev)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DEVICE : EndIf
+  EndIf
+  If status = #VVP_OK
+    vkGetDeviceQueue(dev, 0, 0, @queue)
+    pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+    pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+    rc = vkCreateCommandPool(dev, @pci, 0, @pool)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DEVICE : EndIf
+  EndIf
+  If status = #VVP_OK
+    cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+    cbai\commandPool = pool
+    cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    cbai\commandBufferCount = 1
+    rc = vkAllocateCommandBuffers(dev, @cbai, @cmd)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_DEVICE : EndIf
+  EndIf
+  If status = #VVP_OK
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+    rc = vkCreateFence(dev, @fci, 0, @fence)
+    If rc <> #VK_SUCCESS : status = #VVP_ERR_FENCE : EndIf
+  EndIf
+  If status = #VVP_OK
+    cbHandle = cmd
+    si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+    si\commandBufferCount = 1
+    si\pCommandBuffers = @cbHandle
+    faultBefore = AnvilVkFaultCount()
+    vvpStep(3)
+    status = vvpPartialOptimalCopyProof(phys, dev, queue, cmd, fence, @si, @bi)
+    vvpPut(#VVP_S_EDGE_FAULT_DELTA, AnvilVkFaultCount() - faultBefore)
+  EndIf
+
+  vvpStep(4)
+  vvpPut(#VVP_S_MMU_FAULTS, V3dMmuFaultsNow())
+  vvpPut(#VVP_S_BIN_OOM, V3dBinOomCount())
+  vvpPut(#VVP_S_NATIVE, AnvilVkBackendNativeError())
+  If status = #VVP_OK And (vvpGet(#VVP_S_NATIVE) <> 0 Or AnvilVkFaultCount() <> 0 Or AnvilVkFaultText() <> 0) : status = #VVP_ERR_V3D_FAULT : EndIf
+  If status = #VVP_OK
+    If vvpGet(#VVP_S_EDGE_TFU_AFTER) <> vvpGet(#VVP_S_EDGE_TFU_BEFORE) Or vvpGet(#VVP_S_EDGE_DMA_AFTER) <> vvpGet(#VVP_S_EDGE_DMA_BEFORE) + #COPY_TILES Or vvpGet(#VVP_S_EDGE_JOB_AFTER) <> vvpGet(#VVP_S_EDGE_JOB_BEFORE) + 1 Or vvpGet(#COPY_S_BASELINE) <> #COPY_W * #COPY_H Or vvpGet(#COPY_S_DEST_BASELINE) <> #COPY_W * #COPY_H Or vvpGet(#COPY_S_CHANGED) <> vvpGet(#COPY_S_WIDTH) * #COPY_H Or vvpGet(#COPY_S_UNTOUCHED) <> (#COPY_W - vvpGet(#COPY_S_WIDTH)) * #COPY_H Or vvpGet(#COPY_S_SOURCE) <> #COPY_W * #COPY_H Or vvpGet(#COPY_S_GUARDS) <> 256 Or vvpGet(#COPY_S_SRC_GUARDS) <> 48
+      status = #VVP_ERR_OPTIMAL_COPY
+    EndIf
+  EndIf
+  If vvpGet(#VVP_S_MMU_FAULTS) <> 0 Or vvpGet(#VVP_S_BIN_OOM) <> 0
+    status = #VVP_ERR_V3D_FAULT
+  EndIf
+  If dev <> 0 : vkDeviceWaitIdle(dev) : EndIf
+  If fence <> 0 : vkDestroyFence(dev, fence, 0) : EndIf
+  If pool <> 0 : vkDestroyCommandPool(dev, pool, 0) : EndIf
+  If dev <> 0 : vkDestroyDevice(dev, 0) : EndIf
+  If inst <> 0 : vkDestroyInstance(inst, 0) : EndIf
+  If neonReady <> 0 : NeonShutdown() : EndIf
+  vvpPut(#VVP_S_SHUTDOWN, 1)
+  vvpPut(#COPY_S_TOTAL_US, Micros() - aggStarted)
+  vvpPut(#VVP_S_EDGE_STATUS, status)
+  ProcedureReturn vvpStop(status)
+EndProcedure
