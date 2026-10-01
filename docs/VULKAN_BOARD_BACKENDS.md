@@ -4,15 +4,17 @@ The shared Vulkan object and command layer is board-neutral. Its backend seam is
 
 Backend choice is **static at build time**. Exactly one backend file is included; none and test both deliberately implement the same seam. There is no runtime registration or dynamic backend loading. Capability bits describe the linked backend, so device, clear, GPU, draw, source-over blend, and draw-list support can be reported independently.
 
-| Board/build | Linked backend evidenced by the reviewed sources | GPU capability and proven scope |
+| Board/build | Current backend or monitor composition | GPU capability and proven scope |
 |---|---|---|
 | Raspberry Pi 4 | `Anvil/Graphics/Vulkan/vk_v3d_backend.pi4` | Real V3D 4.2 backend; reports device, clear, GPU, draw, source-over blend, and draw-list capabilities. Pi 4 silicon proofs cover bounded clears, graphics, uploads/copies/readbacks, and presentation via the display DMA path. This is not Vulkan 1.0 conformance or WSI. |
-| UNO Q | `Anvil/Graphics/Vulkan/vk_backend_none.pbi` | Confirmed no-device build: enumerates no physical device. UNO Q has no Vulkan present provider in the status document. |
-| Pi 3 | No board assignment is stated in these sources. | Unknown. Do not infer V3D support or a usable GPU backend. The no-backend file says any Pi build without V3D enumerates no device. |
-| RockPi4C | No board assignment is stated in these sources. | Unknown. No GPU backend or capability is established here. |
-| Pi 5 | No board assignment is stated in these sources. | Unknown. No GPU backend or capability is established here. |
+| UNO Q monitor | `ArduinoQ/Board/board.unoq` | The monitor composition includes neither the Vulkan API nor a Vulkan backend. The generic `vk_backend_none.pbi` is available for a separate no-GPU test/probe composition; it does not establish Vulkan inclusion in the monitor. |
+| Pi 3 monitor | `RaspberryPi3/Board/board.pi3` | The composition root does not include a Vulkan API/backend; the Pi 3 guide says Pi 3 Vulkan is not yet provided. |
+| ROCK Pi 4C monitor | `RockPi4C/Board/board.rockpi4c` | The composition root does not include a Vulkan API/backend; the board guide says no hardware Vulkan driver is provided. |
+| Pi 5 | No image or composition root is documented; the guide says Anvil has no Pi 5 image. | No Vulkan API/backend selection exists to assess yet. |
 
-`vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. `vk_backend_none.pbi` is the honest production choice when a target has no linked GPU backend; portable API code can compile while physical-device enumeration remains empty.
+`vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. A future board build that includes the portable API but has no GPU backend can link `vk_backend_none.pbi`; it enumerates no physical device.
+
+Compile-only probes built with the compiler fix shipped on `PureBasicCode` `main` at commit `1752ead85bad59fadcbb633da68ed289a84e2639`: the A64 ABI gate in `tools/vulkan_alignc_cross_target_check.py` passed 39 checks (12 `SizeOf`/`OffsetOf` checks each for Pi 3, ROCK Pi 4C, and Pi 4, plus an RP2350 negative control); standalone `pi3` and `rockpi4c` Vulkan API + none-backend probes each linked a 192,784-byte image, and a UNO Q none-backend probe also compiled. These are compile/link results only: the production non-Pi 4 monitor roots still omit Vulkan, and no non-Pi 4 GPU path is claimed.
 
 ## Bounded image readback
 
