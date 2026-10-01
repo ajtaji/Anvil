@@ -1,0 +1,210 @@
+; Bounded silicon diagnostic for the Pi 4 TrueType coverage conversion.
+; It exercises two complete 16-byte SIMD blocks plus a three-byte scalar tail.
+; Main returns a pointer to the fixed 128-byte report in x0.
+
+#TTCA_REPORT_BYTES = 128
+#TTCA_PIXELS = 35
+#TTCA_VALID_BYTES = 51
+#TTCA_INVALID_BYTES = 24
+#TTCA_EXTRA_BYTES = 67
+
+Global Dim ttcaReport.a(#TTCA_REPORT_BYTES)
+Global Dim ttcaValid.a(#TTCA_VALID_BYTES)
+Global Dim ttcaInvalid.a(#TTCA_INVALID_BYTES)
+Global Dim ttcaExtra.a(#TTCA_EXTRA_BYTES)
+
+XIncludeFile "Anvil/Graphics/truetype_raster_neon.pbi"
+
+Procedure.i Main()
+  Protected n.i,value.i,want.i
+  Protected validRc.i,invalidRc.i,extraRc.i,offset.i,alignedOffset.i
+  Protected extraReturnFailures.i
+  Protected outputFailures.i,guardFailures.i,invalidChanges.i
+  Protected status.i
+
+  ; Eight guard bytes, 35 pixels, then eight guard bytes.
+  n=0
+  While n<#TTCA_VALID_BYTES
+    ttcaValid(n)=$A5
+    n+1
+  Wend
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    ttcaValid(8+n)=value
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+
+  validRc=AnvilTrueTypeCoverageCountsToAlphaNeon(@ttcaValid(8),#TTCA_PIXELS,#TTCA_PIXELS)
+
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    want=(value*255+8)/16
+    If ttcaValid(8+n)<>want : outputFailures+1 : EndIf
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+  n=0
+  While n<8
+    If ttcaValid(n)<>$A5 : guardFailures+1 : EndIf
+    If ttcaValid(43+n)<>$A5 : guardFailures+1 : EndIf
+    n+1
+  Wend
+
+  ; Repeat the same two-block-plus-tail conversion at a 16-byte-aligned
+  ; address and one byte beyond it. The primary case above is alignment
+  ; residue eight, which is the address that exposed the original fault.
+  alignedOffset=(16-(@ttcaExtra(0)&15))&15
+  offset=alignedOffset
+  n=0
+  While n<#TTCA_EXTRA_BYTES
+    ttcaExtra(n)=$D6
+    n+1
+  Wend
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    ttcaExtra(offset+n)=value
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+  extraRc=AnvilTrueTypeCoverageCountsToAlphaNeon(@ttcaExtra(offset),#TTCA_PIXELS,#TTCA_PIXELS)
+  If extraRc<>1 : extraReturnFailures+1 : EndIf
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    want=(value*255+8)/16
+    If ttcaExtra(offset+n)<>want : outputFailures+1 : EndIf
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+  n=0
+  While n<#TTCA_EXTRA_BYTES
+    If n<offset Or n>=offset+#TTCA_PIXELS
+      If ttcaExtra(n)<>$D6 : guardFailures+1 : EndIf
+    EndIf
+    n+1
+  Wend
+
+  offset=alignedOffset+1
+  n=0
+  While n<#TTCA_EXTRA_BYTES
+    ttcaExtra(n)=$D6
+    n+1
+  Wend
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    ttcaExtra(offset+n)=value
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+  extraRc=AnvilTrueTypeCoverageCountsToAlphaNeon(@ttcaExtra(offset),#TTCA_PIXELS,#TTCA_PIXELS)
+  If extraRc<>1 : extraReturnFailures+1 : EndIf
+  n=0
+  value=0
+  While n<#TTCA_PIXELS
+    want=(value*255+8)/16
+    If ttcaExtra(offset+n)<>want : outputFailures+1 : EndIf
+    value+1
+    If value=17 : value=0 : EndIf
+    n+1
+  Wend
+  n=0
+  While n<#TTCA_EXTRA_BYTES
+    If n<offset Or n>=offset+#TTCA_PIXELS
+      If ttcaExtra(n)<>$D6 : guardFailures+1 : EndIf
+    EndIf
+    n+1
+  Wend
+
+  ; The invalid value is deliberately last. Validation must reject it before
+  ; either the complete SIMD block or the scalar tail changes any byte.
+  n=0
+  While n<#TTCA_INVALID_BYTES
+    ttcaInvalid(n)=$C3
+    n+1
+  Wend
+  n=0
+  value=0
+  While n<18
+    If n=17
+      ttcaInvalid(2+n)=8
+    Else
+      ttcaInvalid(2+n)=value
+      value+1
+    EndIf
+    n+1
+  Wend
+  ttcaInvalid(20)=17
+
+  invalidRc=AnvilTrueTypeCoverageCountsToAlphaNeon(@ttcaInvalid(2),19,19)
+
+  n=0
+  While n<#TTCA_INVALID_BYTES
+    want=$C3
+    If n>=2 And n<=19
+      If n=19
+        want=8
+      Else
+        want=n-2
+      EndIf
+    ElseIf n=20
+      want=17
+    EndIf
+    If ttcaInvalid(n)<>want : invalidChanges+1 : EndIf
+    n+1
+  Wend
+
+  status=0
+  If validRc<>1 Or extraReturnFailures<>0 : status+1 : EndIf
+  If outputFailures<>0 : status+2 : EndIf
+  If guardFailures<>0 : status+4 : EndIf
+  If invalidRc<>0 : status+8 : EndIf
+  If invalidChanges<>0 : status+16 : EndIf
+
+  n=0
+  While n<#TTCA_REPORT_BYTES
+    ttcaReport(n)=0
+    n+1
+  Wend
+  PokeN(@ttcaReport(0),$314E5454)       ; "TTN1"
+  PokeN(@ttcaReport(4),1)
+  PokeN(@ttcaReport(8),status)
+  PokeN(@ttcaReport(12),213)            ; three layouts, guards, rejection and returns
+  PokeN(@ttcaReport(16),validRc)
+  PokeN(@ttcaReport(20),invalidRc)
+  PokeN(@ttcaReport(24),#TTCA_PIXELS)
+  PokeN(@ttcaReport(28),#TTCA_REPORT_BYTES)
+  PokeN(@ttcaReport(32),outputFailures)
+  PokeN(@ttcaReport(36),guardFailures)
+  PokeN(@ttcaReport(40),invalidChanges)
+  PokeN(@ttcaReport(44),(2<<16)+3)       ; two SIMD blocks, three scalar pixels
+
+  n=0
+  While n<#TTCA_PIXELS
+    ttcaReport(48+n)=ttcaValid(8+n)
+    n+1
+  Wend
+  n=0
+  While n<8
+    ttcaReport(84+n)=ttcaValid(n)
+    ttcaReport(92+n)=ttcaValid(43+n)
+    n+1
+  Wend
+  n=0
+  While n<#TTCA_INVALID_BYTES
+    ttcaReport(100+n)=ttcaInvalid(n)
+    n+1
+  Wend
+  PokeN(@ttcaReport(124),$03080001)      ; alignment residues: 8, 0 and 1
+
+  ProcedureReturn @ttcaReport(0)
+EndProcedure
