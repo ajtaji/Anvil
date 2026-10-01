@@ -100,6 +100,11 @@ image views, framebuffers, graphics pipelines and the render-pass recording
 commands. `docs/VULKAN_COMPATIBILITY_STATUS.md` has the entry-point table, the
 fixed-function state a pipeline may declare and the gate results.
 
+The bounded UINT32 `vkCmdDrawIndexed` path now has a separate Pi 4 silicon
+proof. Its UINT32 bind offset, `firstIndex` byte offset, exact V3D packet,
+index guards and presentation report are preserved in
+`docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`.
+
 **Board run 5, 2026-09-11, PASSED**: both triangles rendered, every pixel probe
 exact, and the picture was presented. That is one uniform-colour triangle and
 one triangle whose three vertices carried the SAME colour through the varying

@@ -346,6 +346,7 @@ CompilerEndIf
 #VTP_ERR_MAP = 29
 #VTP_ERR_VIEWPORT_PACKET = 30
 #VTP_ERR_PRESENT = 31
+#VTP_ERR_INDEX_GUARD = 32
 
 ; ERR_STAT bit 12 is V3D_ERR_VCDI. The BCM2711 V3D 4.2 documentation names
 ; the VCD-idle condition in this register, and every healthy silicon graphics
@@ -651,12 +652,18 @@ EndProcedure
 ; field, not merely the opcodes: opcode-like payload bytes are common in a BCL.
 Procedure.i vtpFindIndexedPackets(base.i, bytes.i, indexBase.i, indexBytes.i)
   Define i.i
+  Define indexType.i = $44
+  Define firstByte.i = 2
+CompilerIf #VTP_INDEXED_PROOF = 2
+  indexType = $84
+  firstByte = 4
+CompilerEndIf
   If base = 0 Or bytes < 19 : ProcedureReturn -1 : EndIf
   i = 0
   While i <= bytes - 19
     If (PeekA(base + i) & $FF) = 44 And vtpLe32(base + i + 1) = indexBase And vtpLe32(base + i + 5) = indexBytes
-      If (PeekA(base + i + 9) & $FF) = 32 And (PeekA(base + i + 10) & $FF) = $44
-        If vtpLe32(base + i + 11) = 3 And vtpLe32(base + i + 15) = 2
+      If (PeekA(base + i + 9) & $FF) = 32 And (PeekA(base + i + 10) & $FF) = indexType
+        If vtpLe32(base + i + 11) = 3 And vtpLe32(base + i + 15) = firstByte
           ProcedureReturn i
         EndIf
       EndIf
@@ -1104,9 +1111,15 @@ CompilerEndIf
   vkUnmapMemory(dev, bmem)
 
 CompilerIf #VTP_INDEXED_PROOF
+CompilerIf #VTP_INDEXED_PROOF = 2
+  ; The selected UINT32 range begins one element after the byte-eight bind.
+  ; Four surrounding words expose any accidental write into the index buffer.
+  bufci\size = 32 : bufci\usage = #VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+CompilerElse
   ; Bind at byte four and draw from firstIndex one. The dummy element at the
   ; bind base is not selected; the GPU must fetch 2,0,1 from byte offset two.
   bufci\size = 16 : bufci\usage = #VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+CompilerEndIf
   If vkCreateBuffer(dev, @bufci, 0, @ibuf) <> #VK_SUCCESS
     NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_BUFFER)
   EndIf
@@ -1118,8 +1131,15 @@ CompilerIf #VTP_INDEXED_PROOF
   If vkMapMemory(dev, imem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> iaddr
     NeonShutdown() : ProcedureReturn vtpStop(#VTP_ERR_MAP)
   EndIf
+CompilerIf #VTP_INDEXED_PROOF = 2
+  PokeL(mapped + 0, $A1B2C3D4) : PokeL(mapped + 4, $E5F60718)
+  PokeL(mapped + 8, 99) : PokeL(mapped + 12, 2)
+  PokeL(mapped + 16, 0) : PokeL(mapped + 20, 1)
+  PokeL(mapped + 24, $193A5B7C) : PokeL(mapped + 28, $8D9EAFB0)
+CompilerElse
   PokeW(mapped + 4, 99) : PokeW(mapped + 6, 2)
   PokeW(mapped + 8, 0) : PokeW(mapped + 10, 1)
+CompilerEndIf
 CompilerIf #VTP_PYRAMID_DEMO = 8
   ; One dummy index followed by the four corners of the strip.
   PokeW(mapped + 6, 0) : PokeW(mapped + 8, 1)
@@ -1716,7 +1736,11 @@ CompilerElse
   vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
   vkCmdPushConstants(cmd, layA, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @vtpPush[0])
 CompilerIf #VTP_INDEXED_PROOF
+CompilerIf #VTP_INDEXED_PROOF = 2
+  vkCmdBindIndexBuffer(cmd, ibuf, 8, #VK_INDEX_TYPE_UINT32)
+CompilerElse
   vkCmdBindIndexBuffer(cmd, ibuf, 4, #VK_INDEX_TYPE_UINT16)
+CompilerEndIf
   vkCmdDrawIndexed(cmd, 3, 1, 1, 0, 0)
 CompilerElse
   vkCmdDraw(cmd, 3, 1, 0, 0)
@@ -1783,7 +1807,11 @@ CompilerEndIf
     vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipeB)
     vkCmdBindVertexBuffers(cmd, 0, 1, @bufHandle, @bufOffset)
 CompilerIf #VTP_INDEXED_PROOF
+CompilerIf #VTP_INDEXED_PROOF = 2
+    vkCmdBindIndexBuffer(cmd, ibuf, 8, #VK_INDEX_TYPE_UINT32)
+CompilerElse
     vkCmdBindIndexBuffer(cmd, ibuf, 4, #VK_INDEX_TYPE_UINT16)
+CompilerEndIf
     vkCmdDrawIndexed(cmd, 3, 1, 1, 0, 0)
 CompilerElse
     vkCmdDraw(cmd, 3, 1, 0, 0)
@@ -1809,7 +1837,11 @@ CompilerEndIf
           vtpPut(#VTP_S_DETAIL2, V3dBclBytes())
           viewportPacket = vtpFindOddViewportPackets(V3dBclStartAddr(), V3dBclBytes())
 CompilerIf #VTP_INDEXED_PROOF
+CompilerIf #VTP_INDEXED_PROOF = 2
+          indexPacket = vtpFindIndexedPackets(V3dBclStartAddr(), V3dBclBytes(), iaddr + 8, 24)
+CompilerElse
           indexPacket = vtpFindIndexedPackets(V3dBclStartAddr(), V3dBclBytes(), iaddr + 4, 12)
+CompilerEndIf
 CompilerEndIf
           vtpPut(#VTP_S_P2_IN0, vtpPixel(imgBase, imagePitch, #VTP_IN0X, #VTP_IN0Y))
           vtpPut(#VTP_S_P2_IN1, vtpPixel(imgBase, imagePitch, #VTP_IN1X, #VTP_IN1Y))
@@ -1851,6 +1883,17 @@ CompilerEndIf
   vtpPut(#VTP_S_MMU_VIOADDR, V3dMmuVioAddrNow())
   vtpPut(#VTP_S_GUARD_AFTER, vtpSum(#VTP_SURFACE, #VTP_SCREEN_BYTES))
   vtpPut(#VTP_S_DRAWS, avkBackendDraws())
+CompilerIf #VTP_INDEXED_PROOF = 2
+  mapped = 0
+  If vkMapMemory(dev, imem, 0, #VK_WHOLE_SIZE, 0, @mapped) <> #VK_SUCCESS Or mapped <> iaddr
+    vtpPut(#VTP_S_STATUS2, #VTP_ERR_MAP)
+  Else
+    If (PeekL(mapped + 0) & $FFFFFFFF) <> $A1B2C3D4 Or (PeekL(mapped + 4) & $FFFFFFFF) <> $E5F60718 Or (PeekL(mapped + 8) & $FFFFFFFF) <> 99 Or (PeekL(mapped + 12) & $FFFFFFFF) <> 2 Or (PeekL(mapped + 16) & $FFFFFFFF) <> 0 Or (PeekL(mapped + 20) & $FFFFFFFF) <> 1 Or (PeekL(mapped + 24) & $FFFFFFFF) <> $193A5B7C Or (PeekL(mapped + 28) & $FFFFFFFF) <> $8D9EAFB0
+      vtpPut(#VTP_S_STATUS2, #VTP_ERR_INDEX_GUARD)
+    EndIf
+    vkUnmapMemory(dev, imem)
+  EndIf
+CompilerEndIf
 
   ; ------------------------------------------------------------------
   ;  8. Present what is on the image now - the second triangle.
@@ -1877,7 +1920,9 @@ CompilerEndIf
     DisplayUseDma(0)
     DisplayFlush()
     vtpPut(#VTP_S_PRESENT, #VTP_P_OK)
+CompilerIf #VTP_INDEXED_PROOF <> 2
     delay(#VTP_SHOW_MS)
+CompilerEndIf
   Else
     vtpPut(#VTP_S_PRESENT, #VTP_P_ADOPT_REFUSED)
   EndIf
@@ -1948,6 +1993,11 @@ CompilerIf #VTP_LIST_PROOF
   EndIf
   ProcedureReturn vtpStop(#VTP_OK)
 CompilerElse
+CompilerIf #VTP_INDEXED_PROOF = 2
+  If vtpGet(#VTP_S_STATUS2) <> #VTP_OK
+    ProcedureReturn vtpStop(vtpGet(#VTP_S_STATUS2))
+  EndIf
+CompilerEndIf
   If vtpGet(#VTP_S_BIN_AFTER) <= vtpGet(#VTP_S_BIN_BEFORE) Or vtpGet(#VTP_S_RENDER_AFTER) <= vtpGet(#VTP_S_RENDER_BEFORE)
     ProcedureReturn vtpStop(#VTP_ERR_NO_JOBS)
   EndIf
