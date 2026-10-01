@@ -685,6 +685,7 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
   Define sourceBufferBytes.i, sourceBufferBase.i
   Define priorSource.i, priorDestination.i, priorBytes.i, priorPitch.i
   Define partialOptimal.i
+  Define priorPartialOp.i, tileCount.i
   Define *r.VkBufferImageCopy, *prior.VkBufferImageCopy
   c = avkCmdSlot(commandBuffer)
   If c = 0
@@ -781,14 +782,36 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     o = avkCbOpHead[c]
     While o <> 0
       If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG
-        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage supports one partial optimal upload per command buffer (Anvil code -20005); nothing was recorded.")
-        ProcedureReturn
+        If priorPartialOp <> 0
+          avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage supports at most two partial optimal uploads per command buffer (Anvil code -20005); nothing was recorded.")
+          ProcedureReturn
+        EndIf
+        priorPartialOp = o
       EndIf
       o = avkOpNext[o]
     Wend
-    If (*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or (*r\imageExtent\width % 4) <> 0 Or (*r\imageExtent\height % 4) <> 0 Or (*r\imageExtent\width / 4) * (*r\imageExtent\height / 4) > #ANVIL_VK_TILED_RECT_MAX_UTILES
+    If (*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or (*r\imageExtent\width % 4) <> 0 Or (*r\imageExtent\height % 4) <> 0 Or *r\imageExtent\width / 4 > #ANVIL_VK_TILED_RECT_MAX_UTILES Or *r\imageExtent\height / 4 > #ANVIL_VK_TILED_RECT_MAX_UTILES
       avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage partial optimal upload requires at most 256 complete aligned 4x4 tiles (Anvil code -20005); nothing was recorded.")
       ProcedureReturn
+    EndIf
+    tileCount = (*r\imageExtent\width / 4) * (*r\imageExtent\height / 4)
+    If tileCount > #ANVIL_VK_TILED_RECT_MAX_UTILES
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage partial optimal upload requires at most 256 complete aligned 4x4 tiles (Anvil code -20005); nothing was recorded.")
+      ProcedureReturn
+    EndIf
+    If priorPartialOp <> 0
+      If avkRefImage[avkRefIndex(c, avkOpRef[priorPartialOp])] <> dstImage
+        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage orders two partial optimal uploads only to the same destination image (Anvil code -20005); nothing was recorded.")
+        ProcedureReturn
+      EndIf
+      If tileCount + (avkOpSourcePitch[priorPartialOp] / 16) * (avkOpRows[priorPartialOp] / 4) > #ANVIL_VK_TILED_RECT_MAX_UTILES
+        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage ordered partial uploads exceed 256 tiles in total (Anvil code -20005); nothing was recorded.")
+        ProcedureReturn
+      EndIf
+      If *r\imageOffset\x < avkOpImageX[priorPartialOp] + avkOpSourcePitch[priorPartialOp] / 4 And avkOpImageX[priorPartialOp] < *r\imageOffset\x + *r\imageExtent\width And *r\imageOffset\y < avkOpImageY[priorPartialOp] + avkOpRows[priorPartialOp] And avkOpImageY[priorPartialOp] < *r\imageOffset\y + *r\imageExtent\height
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage ordered partial destination rectangles overlap (Anvil code -20001); nothing was recorded.")
+        ProcedureReturn
+      EndIf
     EndIf
   EndIf
   sourcePitch = *r\imageExtent\width * #ANVIL_VK_BGRA8_TEXEL_BYTES
@@ -819,6 +842,17 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     If sourceBufferBytes < 1 Or sourceBufferBase = 0 Or avkImageRowsOverlap(sourceBufferBase, sourceBufferBytes, sourceBufferBytes, 1, destinationBase, avkImgSize[s], avkImgSize[s], 1) <> 0
       avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage partial source buffer and optimal destination allocations overlap (Anvil code -20001); nothing was recorded.")
       ProcedureReturn
+    EndIf
+    If priorPartialOp <> 0
+      priorBytes = avkOpSourceBytes[priorPartialOp]
+      If avkCopyBufferResolve(avkOpBuffer[priorPartialOp], d, avkOpBufferOffset[priorPartialOp], priorBytes, @priorSource) = 0
+        avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdCopyBufferToImage lost the earlier partial upload source (Anvil code -20004); nothing was recorded.")
+        ProcedureReturn
+      EndIf
+      If avkImageRowsOverlap(sourceBase, sourceBytes, sourceBytes, 1, priorSource, priorBytes, priorBytes, 1) <> 0
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdCopyBufferToImage ordered partial source spans overlap (Anvil code -20001); nothing was recorded.")
+        ProcedureReturn
+      EndIf
     EndIf
   EndIf
   If avkImgTiling[s] = #VK_IMAGE_TILING_LINEAR
@@ -2011,6 +2045,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   Define tiledRectCount.i
   Define linearTiledRectCount.i
   Define partialBufferTiledCount.i
+  Define partialBufferTiledTiles.i
   Define readbacks.i
   Define readbackGroup.i
   Define readbackGroups.i
@@ -2127,6 +2162,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   tiledRectCount = 0
   linearTiledRectCount = 0
   partialBufferTiledCount = 0
+  partialBufferTiledTiles = 0
   readbacks = 0
   readbackGroup = 0
   readbackGroups = 0
@@ -2141,7 +2177,14 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
       copies = copies + 1
-      If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG : partialBufferTiledCount = partialBufferTiledCount + 1 : EndIf
+      If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG
+        partialBufferTiledCount = partialBufferTiledCount + 1
+        If avkOpSourcePitch[o] > #ANVIL_VK_TILED_RECT_MAX_UTILES * 16 Or avkOpRows[o] > #ANVIL_VK_TILED_RECT_MAX_UTILES * 4
+          partialBufferTiledTiles = #ANVIL_VK_TILED_RECT_MAX_UTILES + 1
+        ElseIf avkOpSourcePitch[o] >= 16 And avkOpRows[o] >= 4
+          partialBufferTiledTiles = partialBufferTiledTiles + (avkOpSourcePitch[o] / 16) * (avkOpRows[o] / 4)
+        EndIf
+      EndIf
       copyOp = o
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
       If copyGroup = 0
@@ -2186,8 +2229,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If linearTiledRectCount > 0 And (avkBackendCaps() & #ANVIL_VK_CAP_LINEAR_TO_TILED_RECT_COPY) = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires a backend that executes partial linear-to-optimal copies (Anvil code -20005); nothing was submitted.")
   EndIf
-  If partialBufferTiledCount > 1
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit supports one partial optimal buffer upload per command buffer (Anvil code -20005); nothing was submitted.")
+  If partialBufferTiledCount > 2 Or partialBufferTiledTiles > #ANVIL_VK_TILED_RECT_MAX_UTILES
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit supports at most two partial optimal buffer uploads and 256 tiles per command buffer (Anvil code -20005); nothing was submitted.")
   EndIf
   If partialBufferTiledCount > 0 And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY) = 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires a buffer-to-tiled backend for partial optimal buffer uploads (Anvil code -20005); nothing was submitted.")
@@ -2227,9 +2270,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires image-to-buffer DMA readback commands outside clear and render jobs (VkResult -8); no partial command stream was submitted.")
   EndIf
   ; A command buffer is either a transfer or a render pass, never both.
-  ; The backend seam carries ONE job, and running the clear and throwing
-  ; the draw away - or the other way round - would be a silent partial
-  ; submission, which is the one answer this engine never gives.
+  ; These mixed jobs have no ordered lowering; accepting only part of the
+  ; recording would be a silent wrong answer.
   If avkCbDrawCount[c] > 0 And (clears > 0 Or copies > 0 Or bufferCopies > 0)
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a command buffer holding both a vkCmdClearColorImage and a render pass (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was submitted. The backend seam carries one job per submission, so record the clear and the render pass in separate command buffers.")
   EndIf
@@ -2300,6 +2342,25 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             If avkBackendLinearTiledRectCopyValidate(@linearTiledRect) <> 0
               ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid partial buffer-to-optimal DMA scatter (Anvil code -20004); nothing was submitted.")
             EndIf
+            other = avkOpNext[o]
+            While other <> 0
+              If avkOpKind[other] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And avkOpDstOffset[other] = #ANVIL_VK_BUFFER_TILED_RECT_TAG
+                If avkRefSlot[avkRefIndex(c, avkOpRef[other])] <> target
+                  ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found partial optimal uploads targeting different images (Anvil code -20004); nothing was submitted.")
+                EndIf
+                otherBytes = avkOpSourcePitch[other] : otherRows = avkOpRows[other]
+                If otherBytes < 16 Or otherRows < 4 Or (avkOpImageX[o] < avkOpImageX[other] + otherBytes / 4 And avkOpImageX[other] < avkOpImageX[o] + copyBytes / 4 And avkOpImageY[o] < avkOpImageY[other] + otherRows And avkOpImageY[other] < avkOpImageY[o] + copyRows)
+                  ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found overlapping or malformed ordered partial optimal destinations (Anvil code -20004); nothing was submitted.")
+                EndIf
+                If avkCopyBufferResolve(avkOpBuffer[other], d, avkOpBufferOffset[other], avkOpSourceBytes[other], @otherSourceBase) = 0
+                  ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a stale later partial upload source (Anvil code -20004); nothing was submitted.")
+                EndIf
+                If avkImageRowsOverlap(sourceBase, sourceSpan, sourceSpan, 1, otherSourceBase, avkOpSourceBytes[other], avkOpSourceBytes[other], 1) <> 0
+                  ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkQueueSubmit found overlapping ordered partial source spans (Anvil code -20001); nothing was submitted.")
+                EndIf
+              EndIf
+              other = avkOpNext[other]
+            Wend
           Else
           If copies + imageCopies + bufferCopies + readbacks > 1 And avkBackendImageCopyBatchReady() = 0
             ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot order multiple optimal-image copies while the backend holds a pending transfer (VkResult -8); nothing was submitted.")
