@@ -419,6 +419,35 @@ Procedure.i AnvilVkV3dTextureRectValidate(*copy.AvkV3dTextureRectCopy, *plan.Avk
   ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
 
+; Copy only addressed texels between two different UIF utiles. Validate both
+; complete utile windows and the actual last byte of each row span first.
+Procedure.i AnvilVkV3dTextureTiledMicroValidate(*copy.AvkV3dTextureRectCopy, *plan.AvkV3dTexturePlan)
+  Protected rc.i, sourceLocalX.i, sourceLocalY.i, destinationLocalX.i, destinationLocalY.i
+  Protected sourceTile.i, destinationTile.i, sourceOffset.i, destinationOffset.i, rowBytes.i, rowSpan.i
+  If *plan <> 0 : avkV3dTexturePlanClear(*plan) : EndIf
+  If *copy = 0 Or *plan = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  rc = AnvilVkV3dTexturePlanBuild(*copy\width, *copy\height, *copy\width * 4, *plan)
+  If rc <> #ANVIL_V3D_TEXTURE_OK : ProcedureReturn rc : EndIf
+  If *copy\paddedWidth <> *plan\paddedWidth Or *copy\paddedHeight <> *plan\paddedHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\regionWidth < 1 Or *copy\regionWidth > 4 Or *copy\regionHeight < 1 Or *copy\regionHeight > 4 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If *copy\sourceX < 0 Or *copy\sourceY < 0 Or *copy\destinationX < 0 Or *copy\destinationY < 0 Or *copy\sourceX > *copy\width - *copy\regionWidth Or *copy\sourceY > *copy\height - *copy\regionHeight Or *copy\destinationX > *copy\width - *copy\regionWidth Or *copy\destinationY > *copy\height - *copy\regionHeight : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  sourceLocalX = *copy\sourceX % 4 : sourceLocalY = *copy\sourceY % 4
+  destinationLocalX = *copy\destinationX % 4 : destinationLocalY = *copy\destinationY % 4
+  If sourceLocalX + *copy\regionWidth > 4 Or sourceLocalY + *copy\regionHeight > 4 Or destinationLocalX + *copy\regionWidth > 4 Or destinationLocalY + *copy\regionHeight > 4 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If (*copy\sourceBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or (*copy\destinationBase % #ANVIL_V3D_TEXTURE_DEST_ALIGN) <> 0 Or *copy\sourceBytes < *plan\destinationBytes Or *copy\destinationBytes < *plan\destinationBytes : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase, *plan\destinationBytes) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase, *plan\destinationBytes) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangesOverlap(*copy\sourceBase, *copy\sourceBytes, *copy\destinationBase, *copy\destinationBytes) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_OVERLAP : EndIf
+  sourceTile = AnvilVkV3dTextureUifOffset(*copy\sourceX - sourceLocalX, *copy\sourceY - sourceLocalY, *copy\paddedHeight)
+  destinationTile = AnvilVkV3dTextureUifOffset(*copy\destinationX - destinationLocalX, *copy\destinationY - destinationLocalY, *copy\paddedHeight)
+  sourceOffset = AnvilVkV3dTextureUifOffset(*copy\sourceX, *copy\sourceY, *copy\paddedHeight)
+  destinationOffset = AnvilVkV3dTextureUifOffset(*copy\destinationX, *copy\destinationY, *copy\paddedHeight)
+  rowBytes = *copy\regionWidth * 4 : rowSpan = (*copy\regionHeight - 1) * 16 + rowBytes
+  If sourceTile < 0 Or destinationTile < 0 Or sourceTile > *plan\destinationBytes - 64 Or destinationTile > *plan\destinationBytes - 64 Or (sourceTile % 64) <> 0 Or (destinationTile % 64) <> 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If sourceOffset <> sourceTile + sourceLocalY * 16 + sourceLocalX * 4 Or destinationOffset <> destinationTile + destinationLocalY * 16 + destinationLocalX * 4 Or sourceOffset + rowSpan > sourceTile + 64 Or destinationOffset + rowSpan > destinationTile + 64 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  If avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\sourceBase + sourceOffset, rowSpan) = 0 Or avkV3dTextureRangeInWindow(*copy\windowBase, *copy\windowBytes, *copy\destinationBase + destinationOffset, rowSpan) = 0 : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_RANGE : EndIf
+  ProcedureReturn #ANVIL_V3D_TEXTURE_OK
+EndProcedure
+
 ; Preflight every source 4-row span and destination utile before the first
 ; guarded DMA descriptor. The source XY is a texel coordinate, not a tile.
 Procedure.i AnvilVkV3dTextureLinearRectValidate(*copy.AvkV3dTextureLinearRectCopy, *plan.AvkV3dTexturePlan)

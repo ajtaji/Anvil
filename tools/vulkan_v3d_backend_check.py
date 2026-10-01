@@ -425,6 +425,7 @@ def source_contract(text: str) -> list[str]:
     # absent. The desk test backend owns the byte oracle instead.
     render_text = text
     for name, dma_call in (("avkBackendSubmitTiledRectCopy", "HwVkDmaCopy("),
+                           ("avkBackendSubmitTiledMicroCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitLinearTiledRectCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitLinearTiledMicroCopy", "HwVkDmaCopyRows("),
                            ("avkBackendSubmitTiledReadback", "HwVkDmaCopyRows("),
