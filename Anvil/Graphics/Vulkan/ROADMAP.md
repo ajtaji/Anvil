@@ -50,6 +50,12 @@ V3D packet bytes, index sentinels, display result and teardown; the evidence is
 `docs/evidence/vulkan-indexed-uint32-pi4-20261001/README.md`. This establishes
 that diagnostic shape on Pi 4 only and does not imply another board backend.
 
+The Pi 4 backend also passed a one-sample zero-`pSampleMask` draw proof: three
+public records yielded two emitted primitives and an exact full-image oracle.
+The V3D backend omits the zero-coverage draw after validation; it does not emit
+a hardware sample-mask packet. Evidence:
+`docs/evidence/vulkan-sample-mask-pi4-20261001/README.md`.
+
 ### What this backend still cannot do, and says so
 
 The rotating Pi 4 pyramid demo (`docs/VULKAN_PYRAMID_DEMO_PI4_2026-09-27.md`)
