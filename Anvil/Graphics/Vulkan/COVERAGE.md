@@ -292,12 +292,16 @@ It has no processor pixel fallback. A current-tree short Pi 4 run passed on
 74 glyph quads, four expected scissor calls, one display-DMA operation, zero DMA fallback
 or refusal, zero pending presentation/backend error, and 12 pixel probes. The
 scene defines five scissor states; the diagnostic records four expected set/clear API calls
-and does not separately measure unique states. The run skipped capacity and
-paired-scene checks and produced no screenshot; see
-`docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. The earlier
-2026-09-26 all-15-scene proof at commit `a6b9a93` includes fan/line paired
-frames, but it proves that historical source only. Current-tree paired fan/line
-checks and broader HDMI/DSI/rotation/resize coverage remain. After that, the broader backend stages are
+and does not separately measure unique states. The short run skipped capacity and paired-scene checks and produced no
+screenshot; see `docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`.
+A separate current-tree mode-2 Pi 4 run passed the production fan/outline and
+line scenes: both 64×64 BGRA captures matched their native golden segments
+byte-for-byte, with 12 report probes passing. The diagnostic copied completed
+GPU attachment bytes to RAM for comparison; it did not render pixels on the CPU.
+See `docs/evidence/vulkan-neon-fan-line-pi4-20261001/README.md`. The earlier
+2026-09-26 all-15-scene proof at commit `a6b9a93` remains historical evidence
+for that source. A fresh current-tree all-15-scene run and broader HDMI/DSI/
+rotation/resize coverage remain. After that, the broader backend stages are
 per-object GPU virtual addressing and residency above
 today's single window, arithmetic beyond the current straight-line binary32
 `FAdd`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
