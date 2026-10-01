@@ -352,10 +352,8 @@ Procedure.i AnvilVkV3dTextureReadbackValidate(*read.AvkV3dTextureReadback, *plan
   If regionWidth < 1 Or regionHeight < 1 Or *read\sourceX < 0 Or *read\sourceY < 0 Or *read\sourceX > *read\width - regionWidth Or *read\sourceY > *read\height - regionHeight
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
   EndIf
-  If *read\sourceX <> 0 Or *read\sourceY <> 0 Or regionWidth <> *read\width Or regionHeight <> *read\height
-    If (*read\sourceX % 4) <> 0 Or (*read\sourceY % 4) <> 0 Or (regionWidth % 4) <> 0 Or (regionHeight % 4) <> 0
-      ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
-    EndIf
+  If (*read\sourceX % 4) <> 0 Or (*read\sourceY % 4) <> 0 Or ((regionWidth % 4) <> 0 And *read\sourceX <> *read\width - regionWidth) Or ((regionHeight % 4) <> 0 And *read\sourceY <> *read\height - regionHeight)
+    ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS
   EndIf
   If *read\destinationPitch < regionWidth * 4 Or (*read\destinationPitch % 4) <> 0
     ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS

@@ -1041,8 +1041,9 @@ Procedure AnvilVkCmdCopyImage(commandBuffer.i, srcImage.i, srcLayout.i, dstImage
   Next
 EndProcedure
 
-; Rectangular linear-image readbacks and one whole optimal-image readback use
-; guarded DMA on Pi 4. Preflight every region before recording any of them.
+; Rectangular linear-image readbacks and one optimal-image readback use guarded
+; DMA on Pi 4. Optimal partial regions start on 4-texel boundaries; a short
+; final utile may reach the image's right or bottom edge. Preflight all regions.
 Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, dstBuffer.i, regionCount.i, *regions.VkBufferImageCopy)
   Define c.i, d.i, src.i, ref.i, o.i, i.i, j.i, freeOps.i, group.i
   Define rowBytes.i, rows.i, sourceOffset.i, bytes.i, bufferPitch.i
@@ -1111,8 +1112,8 @@ Procedure AnvilVkCmdCopyImageToBuffer(commandBuffer.i, srcImage.i, srcLayout.i, 
     ProcedureReturn
   EndIf
   If avkImgTiling[src] = #VK_IMAGE_TILING_OPTIMAL
-    If regionCount <> 1 Or ((*r\imageOffset\x <> 0 Or *r\imageOffset\y <> 0 Or *r\imageExtent\width <> avkImgW[src] Or *r\imageExtent\height <> avkImgH[src]) And ((*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or (*r\imageExtent\width % 4) <> 0 Or (*r\imageExtent\height % 4) <> 0))
-      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer supports one whole optimal image or one four-texel-aligned optimal rectangle (Anvil code -20005); nothing was recorded.")
+    If regionCount <> 1 Or (*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or ((*r\imageExtent\width % 4) <> 0 And *r\imageOffset\x <> avkImgW[src] - *r\imageExtent\width) Or ((*r\imageExtent\height % 4) <> 0 And *r\imageOffset\y <> avkImgH[src] - *r\imageExtent\height)
+      avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyImageToBuffer supports one optimal rectangle with four-texel-aligned source offsets and only right/bottom edge tails (Anvil code -20005); nothing was recorded.")
       ProcedureReturn
     EndIf
   EndIf
@@ -2274,7 +2275,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           If copyBytes < 4 Or (copyBytes % 4) <> 0 Or copyRows < 1 Or destinationPitch < copyBytes Or avkOpImageX[o] < 0 Or avkOpImageY[o] < 0 Or avkOpImageX[o] > avkImgW[sourceImageSlot] - copyBytes / 4 Or avkOpImageY[o] > avkImgH[sourceImageSlot] - copyRows
             ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid optimal-image readback rectangle (Anvil code -20004); nothing was submitted.")
           EndIf
-          If (avkOpImageX[o] <> 0 Or avkOpImageY[o] <> 0 Or copyBytes <> avkImgW[sourceImageSlot] * 4 Or copyRows <> avkImgH[sourceImageSlot]) And ((avkOpImageX[o] % 4) <> 0 Or (avkOpImageY[o] % 4) <> 0 Or (copyBytes % 16) <> 0 Or (copyRows % 4) <> 0)
+          If (avkOpImageX[o] % 4) <> 0 Or (avkOpImageY[o] % 4) <> 0 Or ((copyBytes % 16) <> 0 And avkOpImageX[o] <> avkImgW[sourceImageSlot] - copyBytes / 4) Or ((copyRows % 4) <> 0 And avkOpImageY[o] <> avkImgH[sourceImageSlot] - copyRows)
             ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an unaligned optimal-image readback rectangle (Anvil code -20004); nothing was submitted.")
           EndIf
           If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
