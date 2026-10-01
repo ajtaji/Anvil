@@ -10,7 +10,7 @@ Backend choice is **static at build time**. Exactly one backend file is included
 | UNO Q monitor | `ArduinoQ/Board/board.unoq` | The monitor composition includes neither the Vulkan API nor a Vulkan backend. The generic `vk_backend_none.pbi` is available for a separate no-GPU test/probe composition; it does not establish Vulkan inclusion in the monitor. |
 | Pi 3 monitor | `RaspberryPi3/Board/board.pi3` | The composition root does not include a Vulkan API/backend; the Pi 3 guide says Pi 3 Vulkan is not yet provided. |
 | ROCK Pi 4C monitor | `RockPi4C/Board/board.rockpi4c` | The composition root does not include a Vulkan API/backend; the board guide says no hardware Vulkan driver is provided. |
-| Pi 5 | No image or composition root is documented; the guide says Anvil has no Pi 5 image. | No Vulkan API/backend selection exists to assess yet. |
+| Pi 5 entry diagnostic | `RaspberryPi5/Boot/board.pi4` builds the first-entry diagnostic `runs/pi5-entry.img`, named `ANVIL5.IMG` by the prepared card; it is not a full monitor. | This diagnostic composition includes no Vulkan API/backend, and no Pi 5 GPU path or hardware proof is established. |
 
 `vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. A future board build that includes the portable API but has no GPU backend can link `vk_backend_none.pbi`; it enumerates no physical device.
 
