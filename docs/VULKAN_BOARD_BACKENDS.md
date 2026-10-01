@@ -14,6 +14,16 @@ Backend choice is **static at build time**. Exactly one backend file is included
 
 `vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. A future board build that includes the portable API but has no GPU backend can link `vk_backend_none.pbi`; it enumerates no physical device.
 
+The current Pi 4 production adapter has also passed a fresh 15-scene Neon
+widget run: all 245,760 reference pixels matched the native golden corpus,
+with one display DMA presentation and no processor pixel fallback. The separate
+ordered draw-list test reached 1,024 actual `vkCmdDraw` records in one submit,
+checking all 16,384 output pixels at each 64-, 256-, and 1,024-draw stage.
+These are Pi 4 measurements; the shared backend interface remains available
+for other board implementations when their GPU paths are ready. See
+`docs/VULKAN_NEON_ALL15_CURRENT_PI4.md` and
+`RaspberryPi4/Examples/Diagnostics/vulkanDrawListScaleProof.md`.
+
 The Pi 4 whole-image clear path also passed a standalone offscreen 1024×768 BGRA8 proof: 786,432 exact pixels, intact adjacent guard, and one bin/render pair without OOM, MMU, native or validation faults. Raw `ERR_STAT=$1000` in both snapshots is the read-only VCDI idle status, not a fault. The run did not present an image and makes no claim for other boards. See `docs/evidence/vulkan-clear-extent1024-pi4-20261001/README.md`.
 
 The Pi 4 ordered partial `vkCmdCopyBufferToImage` route has a separate silicon proof at its combined 256-utile limit. Two disjoint uploads into one 72×64 optimal image changed 4,096 texels and preserved the 512-texel gap, padded backing and guards; guarded DMA advanced by 256 operations. The 64, 128, 192 and 256-utile RAM reports and bounded runtime measurements are in `docs/evidence/vulkan-two-partial-optimal-aggregate-pi4-20261001/README.md`. This does not extend GPU support to the other boards.
