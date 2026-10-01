@@ -51,8 +51,14 @@ Global avkTbLastW.i = 0
 Global avkTbLastH.i = 0
 Global avkTbLastPitch.i = 0
 Global avkTbLastColor.i = 0
+Global avkTbLastKind.i = #ANVIL_VK_RENDER_OP_DRAW
+Global avkTbLastClearX.i = 0
+Global avkTbLastClearY.i = 0
+Global avkTbLastClearW.i = 0
+Global avkTbLastClearH.i = 0
+Global avkTbLastClearBgra.i = 0
 Global avkTbNative.i = 0
-Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
+Global avkTbCaps.i = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER
 
 ; Declare the window this backend suballocates. It is ordinary DRAM the
 ; caller owns; the backend never touches it.
@@ -635,7 +641,14 @@ Procedure.i avkBackendSubmitDraw(*payload)
   draw = 0
   While draw < *list\drawCount
     *d = *list\draws + (draw * SizeOf(AnvilVkBackendDraw))
-    If *d\pipeline < 1 Or *d\targetBase = 0 Or *d\targetBytes < 1 Or *d\bindingCount < 0 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS
+    If *d\targetBase = 0 Or *d\targetBytes < 1 Or *d\bindingCount < 0 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS
+      ProcedureReturn -1
+    EndIf
+    If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+      If (avkTbCaps & #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT) = 0 Or *d\clearRectX < 0 Or *d\clearRectY < 0 Or *d\clearRectW < 1 Or *d\clearRectH < 1 Or *d\clearRectW > *d\width Or *d\clearRectH > *d\height Or *d\clearRectX > *d\width - *d\clearRectW Or *d\clearRectY > *d\height - *d\clearRectH
+        ProcedureReturn -1
+      EndIf
+    ElseIf *d\kind <> #ANVIL_VK_RENDER_OP_DRAW Or *d\pipeline < 1
       ProcedureReturn -1
     EndIf
     draw = draw + 1
@@ -651,6 +664,10 @@ Procedure.i avkBackendSubmitDraw(*payload)
     avkTbLastH = *d\height
     avkTbLastPitch = *d\pitch
     avkTbLastDrawColour = *d\clearBgra
+    avkTbLastKind = *d\kind
+    avkTbLastClearX = *d\clearRectX : avkTbLastClearY = *d\clearRectY
+    avkTbLastClearW = *d\clearRectW : avkTbLastClearH = *d\clearRectH
+    avkTbLastClearBgra = *d\clearRectBgra
     avkTbLastBindCount = *d\bindingCount
     tbk = 0
     While tbk < #ANVIL_VK_MAX_BINDINGS

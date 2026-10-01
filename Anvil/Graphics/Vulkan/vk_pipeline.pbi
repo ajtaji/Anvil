@@ -2331,10 +2331,10 @@ Procedure.i AnvilVkPipelineTopology(pipe.i)
   ProcedureReturn avkPipeTopology[pipe]
 EndProcedure
 
-; The first whole-target attachment clear can replace the render pass load
-; clear. V3D executes the resulting word in its tile clear, before any draw.
+; A whole-target clear before any ordered draw replaces the render-pass load
+; clear. Other rectangles enter the same ordered render stream as draws.
 Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachment, *rect.VkClearRect)
-  Define c.i, fb.i, red.i, green.i, blue.i, alpha.i
+  Define c.i, fb.i, red.i, green.i, blue.i, alpha.i, bgra.i, caps.i
   c = avkCmdSlot(commandBuffer)
   If c = 0
     ProcedureReturn
@@ -2343,8 +2343,8 @@ Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachm
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdClearAttachments requires a recording command buffer inside a render pass (Anvil code -20004, wrong command state); no clear was recorded.")
     ProcedureReturn
   EndIf
-  If avkCbDrawCount[c] <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments after a draw needs an ordered in-pass clear primitive (Anvil code -20005, unsupported order); this backend only folds a whole clear into the tile load before the first draw.")
+  If *attachment = 0 Or *rect = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdClearAttachments requires one live colour attachment and rectangle record (Anvil code -20001); no clear was recorded.")
     ProcedureReturn
   EndIf
   fb = avkCbFb[c]
@@ -2352,8 +2352,12 @@ Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachm
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires the render pass's one colour attachment (Anvil code -20005, unsupported aspect or index); depth and stencil clears are unavailable.")
     ProcedureReturn
   EndIf
-  If *rect\rect\offset\x <> 0 Or *rect\rect\offset\y <> 0 Or *rect\rect\extent\width <> avkFbW[fb] Or *rect\rect\extent\height <> avkFbH[fb] Or *rect\baseArrayLayer <> 0 Or *rect\layerCount <> 1
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires the complete one-layer framebuffer (Anvil code -20005, partial attachment clear unavailable); no pixels were cleared.")
+  If *rect\baseArrayLayer <> 0 Or *rect\layerCount <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires layer zero of the one-layer framebuffer (Anvil code -20005); no clear was recorded.")
+    ProcedureReturn
+  EndIf
+  If *rect\rect\offset\x < 0 Or *rect\rect\offset\y < 0 Or *rect\rect\extent\width < 1 Or *rect\rect\extent\height < 1 Or *rect\rect\offset\x > avkFbW[fb] - *rect\rect\extent\width Or *rect\rect\offset\y > avkFbH[fb] - *rect\rect\extent\height
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdClearAttachments requires a positive rectangle entirely inside the render area (Anvil code -20001); no clear was recorded.")
     ProcedureReturn
   EndIf
   ; The VkClearValue union begins after two uint32 members. Read its four
@@ -2362,7 +2366,23 @@ Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachm
   green = avkUnorm8FromF32Bits(avkU32(*attachment + 12))
   blue = avkUnorm8FromF32Bits(avkU32(*attachment + 16))
   alpha = avkUnorm8FromF32Bits(avkU32(*attachment + 20))
-  avkCbClearWord[c] = (alpha << 24) | (red << 16) | (green << 8) | blue
+  bgra = (alpha << 24) | (red << 16) | (green << 8) | blue
+  If avkCbDrawCount[c] = 0 And *rect\rect\offset\x = 0 And *rect\rect\offset\y = 0 And *rect\rect\extent\width = avkFbW[fb] And *rect\rect\extent\height = avkFbH[fb]
+    avkCbClearWord[c] = bgra
+    ProcedureReturn
+  EndIf
+  If (avkFbW[fb] % 2) <> 0 Or (avkFbH[fb] % 2) <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires even framebuffer dimensions for an ordered rectangle clear (Anvil code -20005); no clear was recorded.")
+    ProcedureReturn
+  EndIf
+  caps = avkBackendCaps()
+  If (caps & (#ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT)) <> (#ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT)
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdClearAttachments requires ordered hardware colour-rectangle support (Anvil code -20005); no clear was recorded.")
+    ProcedureReturn
+  EndIf
+  If avkRecordedClearRectAppend(c, *rect\rect\offset\x, *rect\rect\offset\y, *rect\rect\extent\width, *rect\rect\extent\height, bgra) < 1
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdClearAttachments exhausted the bounded ordered render-command pool (VkResult -1); reset the invalid command buffer.")
+  EndIf
 EndProcedure
 
 Procedure AnvilVkCmdBindPipeline(commandBuffer.i, bindPoint.i, pipeline.i)
@@ -3470,6 +3490,44 @@ Procedure.i avkDrawListPreflight(c.i)
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a truncated recorded-draw chain (Anvil code -20004, corrupt draw list); nothing was submitted.")
     EndIf
 
+    If avkRecordedDraw[slot]\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+      If (avkBackendCaps() & #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT) = 0
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit found an ordered attachment clear without backend rectangle support (VkResult -8); nothing was submitted.")
+      EndIf
+      If (avkFbW[fb] % 2) <> 0 Or (avkFbH[fb] % 2) <> 0
+        ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit found an ordered attachment clear with unsupported odd framebuffer dimensions (VkResult -8); nothing was submitted.")
+      EndIf
+      If avkRecordedDraw[slot]\viewportX < 0 Or avkRecordedDraw[slot]\viewportY < 0 Or avkRecordedDraw[slot]\viewportW < 1 Or avkRecordedDraw[slot]\viewportH < 1 Or avkRecordedDraw[slot]\viewportX > avkFbW[fb] - avkRecordedDraw[slot]\viewportW Or avkRecordedDraw[slot]\viewportY > avkFbH[fb] - avkRecordedDraw[slot]\viewportH
+        ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid ordered attachment-clear rectangle (Anvil code -20004); nothing was submitted.")
+      EndIf
+      avkFlightPipe[draw] = 0 : avkFlightSet[draw] = 0
+      avkFlightFb[draw] = fb : avkFlightRp[draw] = rp
+      avkFlightTargetView[draw] = iv : avkFlightTargetImage[draw] = img : avkFlightTargetMem[draw] = mem
+      avkFlightUniformBuf[draw] = 0 : avkFlightUniformMem[draw] = 0
+      avkFlightIndexBuf[draw] = 0 : avkFlightIndexMem[draw] = 0
+      avkFlightSampleImage[draw] = 0 : avkFlightSampleMem[draw] = 0
+      avkFlightSampler[draw] = 0 : avkFlightSampleView[draw] = 0
+      avkFlightDraw[draw]\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+      avkFlightDraw[draw]\pipeline = 0
+      avkFlightDraw[draw]\targetBase = avkHeapBase + avkMemOffset[mem] + avkImgMemOffset[img]
+      avkFlightDraw[draw]\targetBytes = avkImgSize[img]
+      avkFlightDraw[draw]\width = avkImgW[img] : avkFlightDraw[draw]\height = avkImgH[img]
+      avkFlightDraw[draw]\pitch = avkImgPitch[img]
+      avkFlightDraw[draw]\clearBgra = avkCbClearWord[c]
+      avkFlightDraw[draw]\bindingCount = 0 : avkFlightDraw[draw]\bindings = 0
+      avkFlightDraw[draw]\sampleMask = 0 : avkFlightDraw[draw]\sampledImage = 0
+      avkFlightDraw[draw]\clearRectX = avkRecordedDraw[slot]\viewportX
+      avkFlightDraw[draw]\clearRectY = avkRecordedDraw[slot]\viewportY
+      avkFlightDraw[draw]\clearRectW = avkRecordedDraw[slot]\viewportW
+      avkFlightDraw[draw]\clearRectH = avkRecordedDraw[slot]\viewportH
+      avkFlightDraw[draw]\clearRectBgra = avkRecordedDraw[slot]\pushWord[0] & $FFFFFFFF
+      slot = nextSlot : draw = draw + 1
+      Continue
+    EndIf
+    If avkRecordedDraw[slot]\kind <> #ANVIL_VK_RENDER_OP_DRAW
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an unknown ordered render operation (Anvil code -20004); nothing was submitted.")
+    EndIf
+
     p = avkPipeSlot(avkRecordedDraw[slot]\pipeline)
     If p = 0 Or avkPipeDev[p] <> avkFbDev[fb]
       ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded draw whose pipeline is stale or belongs to another device (Anvil code -20004, stale pipeline); nothing was submitted.")
@@ -3503,6 +3561,7 @@ Procedure.i avkDrawListPreflight(c.i)
     avkFlightSampler[draw] = 0
     avkFlightSampleView[draw] = 0
 
+    avkFlightDraw[draw]\kind = #ANVIL_VK_RENDER_OP_DRAW
     avkFlightDraw[draw]\pipeline = p
     avkFlightDraw[draw]\targetBase = avkHeapBase + avkMemOffset[mem] + avkImgMemOffset[img]
     avkFlightDraw[draw]\targetBytes = avkImgSize[img]
@@ -3532,6 +3591,9 @@ Procedure.i avkDrawListPreflight(c.i)
     avkFlightDraw[draw]\uniformBase = 0
     avkFlightDraw[draw]\uniformBytes = 0
     avkFlightDraw[draw]\sampledImage = 0
+    avkFlightDraw[draw]\clearRectX = 0 : avkFlightDraw[draw]\clearRectY = 0
+    avkFlightDraw[draw]\clearRectW = 0 : avkFlightDraw[draw]\clearRectH = 0
+    avkFlightDraw[draw]\clearRectBgra = 0
 
     ; Close indexed input from the live buffer generation. This CPU read is
     ; validation only: pixels and primitives remain exclusively GPU work. It
@@ -3681,7 +3743,7 @@ Procedure avkDrawListRetain(c.i)
   EndIf
   draw = 0
   While draw < avkFlightDrawCount
-    s = avkFlightPipe[draw] : avkPipeInFlight[s] = avkPipeInFlight[s] + 1
+    s = avkFlightPipe[draw] : If s > 0 : avkPipeInFlight[s] = avkPipeInFlight[s] + 1 : EndIf
     s = avkFlightSet[draw] : If s > 0 : avkDsInFlight[s] = avkDsInFlight[s] + 1 : EndIf
     s = avkFlightFb[draw] : avkFbInFlight[s] = avkFbInFlight[s] + 1
     s = avkFlightRp[draw] : avkRpInFlight[s] = avkRpInFlight[s] + 1
@@ -3738,7 +3800,7 @@ Procedure avkDrawListRelease(c.i)
   EndIf
   draw = 0
   While draw < avkFlightDrawCount
-    s = avkFlightPipe[draw] : If avkPipeInFlight[s] > 0 : avkPipeInFlight[s] = avkPipeInFlight[s] - 1 : EndIf
+    s = avkFlightPipe[draw] : If s > 0 And avkPipeInFlight[s] > 0 : avkPipeInFlight[s] = avkPipeInFlight[s] - 1 : EndIf
     s = avkFlightSet[draw] : If s > 0 And avkDsInFlight[s] > 0 : avkDsInFlight[s] = avkDsInFlight[s] - 1 : EndIf
     s = avkFlightFb[draw] : If avkFbInFlight[s] > 0 : avkFbInFlight[s] = avkFbInFlight[s] - 1 : EndIf
     s = avkFlightRp[draw] : If avkRpInFlight[s] > 0 : avkRpInFlight[s] = avkRpInFlight[s] - 1 : EndIf

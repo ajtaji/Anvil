@@ -1,0 +1,228 @@
+; SPDX-License-Identifier: MIT
+; Small public API fixture. The state-only backend observes ordered records
+; and never writes target pixels; the board diagnostic proves V3D pixels.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#VCG_HEAP = $06200000
+#VCG_HEAP_BYTES = $00100000
+#VCG_W = 8
+#VCG_H = 8
+
+Procedure.i Main()
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo
+  Define imgci.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription
+  Define aref.VkAttachmentReference
+  Define sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo
+  Define fbci.VkFramebufferCreateInfo
+  Define rpbi.VkRenderPassBeginInfo
+  Define ca.VkClearAttachment
+  Define cr.VkClearRect
+  Define fci.VkFenceCreateInfo
+  Define si.VkSubmitInfo
+  Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
+  Define img.i, mem.i, view.i, rp.i, fb.i, fence.i
+  Define oddImg.i, oddMem.i, oddView.i, oddFb.i
+  Define count.i, priority.l
+  Define Dim clearWords.l[4]
+  Define beforeCalls.i, beforePixel.i, savedCaps.i, rc.i
+  Define *list.AnvilVkBackendDrawList
+  Define *first.AnvilVkBackendDraw
+  Define *second.AnvilVkBackendDraw
+
+  AnvilVkTestBackendHeap(#VCG_HEAP, #VCG_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @inst) <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(phys, @dci, 0, @dev) <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  vkGetDeviceQueue(dev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  If vkCreateCommandPool(dev, @pci, 0, @pool) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  If vkAllocateCommandBuffers(dev, @cbai, @cmd) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D
+  imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #VCG_W : imgci\extent\height = #VCG_H : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1
+  imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  If vkCreateImage(dev, @imgci, 0, @img) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  vkGetImageMemoryRequirements(dev, img, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  If vkAllocateMemory(dev, @mai, 0, @mem) <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  If vkBindImageMemory(dev, img, mem, 0) <> #VK_SUCCESS : ProcedureReturn 8 : EndIf
+  PokeL(AnvilVkImageAddress(img), $5A31D4C2)
+  beforePixel = PeekL(AnvilVkImageAddress(img))
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = img : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  If vkCreateImageView(dev, @ivci, 0, @view) <> #VK_SUCCESS : ProcedureReturn 9 : EndIf
+
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM
+  att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_GENERAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1 : rpci\pAttachments = @att
+  rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  If vkCreateRenderPass(dev, @rpci, 0, @rp) <> #VK_SUCCESS : ProcedureReturn 10 : EndIf
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = rp : fbci\attachmentCount = 1 : fbci\pAttachments = @view
+  fbci\width = #VCG_W : fbci\height = #VCG_H : fbci\layers = 1
+  If vkCreateFramebuffer(dev, @fbci, 0, @fb) <> #VK_SUCCESS : ProcedureReturn 11 : EndIf
+
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  clearWords[0] = 0 : clearWords[1] = 0 : clearWords[2] = 0 : clearWords[3] = $3F800000
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = rp : rpbi\framebuffer = fb
+  rpbi\renderArea\extent\width = #VCG_W : rpbi\renderArea\extent\height = #VCG_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @clearWords[0]
+  ca\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT : ca\colorAttachment = 0
+  ca\clearValue[0] = $3F800000 : ca\clearValue[1] = $3F000000
+  ca\clearValue[2] = 0 : ca\clearValue[3] = 0
+  cr\rect\offset\x = 1 : cr\rect\offset\y = 1
+  cr\rect\extent\width = 6 : cr\rect\extent\height = 6
+  cr\baseArrayLayer = 0 : cr\layerCount = 1
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  If vkCreateFence(dev, @fci, 0, @fence) <> #VK_SUCCESS : ProcedureReturn 12 : EndIf
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cmd
+
+  ; Partial clear with no bound pipeline is a single closed render operation.
+  If vkBeginCommandBuffer(cmd, @bi) <> #VK_SUCCESS : ProcedureReturn 13 : EndIf
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 14 : EndIf
+  ca\clearValue[0] = 0 : ca\clearValue[1] = 0
+  beforeCalls = AnvilVkTestBackendCalls()
+  AnvilVkTestBackendHold(1)
+  If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+  *list = AnvilVkLastDrawList() : *first = *list\draws
+  If *list\drawCount <> 1 Or *first\kind <> #ANVIL_VK_RENDER_OP_CLEAR_RECT Or *first\pipeline <> 0 Or *first\clearRectX <> 1 Or *first\clearRectY <> 1 Or *first\clearRectW <> 6 Or *first\clearRectH <> 6 Or *first\clearRectBgra <> $00FF8000
+    ProcedureReturn 16
+  EndIf
+  If AnvilVkTestBackendCalls() <> beforeCalls + 1 Or PeekL(AnvilVkImageAddress(img)) <> beforePixel : ProcedureReturn 17 : EndIf
+  AnvilVkTestBackendHold(0)
+  If vkWaitForFences(dev, 1, @fence, 1, 1000000000) <> #VK_SUCCESS : ProcedureReturn 18 : EndIf
+  If avkPipeInFlight[0] <> 0 Or avkFbInFlight[avkFbSlot(fb)] <> 0 : ProcedureReturn 19 : EndIf
+
+  ; The capability gate refuses partial work before any backend call.
+  savedCaps = avkTbCaps
+  AnvilVkTestBackendCapabilities(savedCaps - #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> beforeCalls + 1 Or PeekL(AnvilVkImageAddress(img)) <> beforePixel : ProcedureReturn 20 : EndIf
+
+  ; A whole pre-draw clear remains independently available without the bit.
+  cr\rect\offset\x = 0 : cr\rect\offset\y = 0
+  cr\rect\extent\width = #VCG_W : cr\rect\extent\height = #VCG_H
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS Or avkCbClearWord[avkCmdSlot(cmd)] <> 0 : ProcedureReturn 21 : EndIf
+  AnvilVkTestBackendCapabilities(savedCaps)
+
+  ; Two in-pass clears retain their exact order and independent colours.
+  cr\rect\offset\x = 1 : cr\rect\offset\y = 1
+  cr\rect\extent\width = 6 : cr\rect\extent\height = 6
+  ca\clearValue[0] = $3F800000 : ca\clearValue[1] = $3F000000
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  cr\rect\offset\x = 0 : cr\rect\offset\y = 0
+  cr\rect\extent\width = 1 : cr\rect\extent\height = 1
+  ca\clearValue[0] = 0 : ca\clearValue[1] = $3F800000
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 22 : EndIf
+  vkResetFences(dev, 1, @fence)
+  AnvilVkTestBackendHold(1)
+  If vkQueueSubmit(queue, 1, @si, fence) <> #VK_SUCCESS : ProcedureReturn 23 : EndIf
+  *list = AnvilVkLastDrawList()
+  *first = *list\draws : *second = *list\draws + SizeOf(AnvilVkBackendDraw)
+  If *list\drawCount <> 2 Or *first\kind <> #ANVIL_VK_RENDER_OP_CLEAR_RECT Or *first\clearRectBgra <> $00FF8000 Or *second\kind <> #ANVIL_VK_RENDER_OP_CLEAR_RECT Or *second\clearRectBgra <> $0000FF00
+    ProcedureReturn 24
+  EndIf
+  AnvilVkTestBackendHold(0)
+  If vkWaitForFences(dev, 1, @fence, 1, 1000000000) <> #VK_SUCCESS : ProcedureReturn 25 : EndIf
+  If PeekL(AnvilVkImageAddress(img)) <> beforePixel : ProcedureReturn 26 : EndIf
+
+  ; Out-of-bounds geometry fails at recording, before a backend call.
+  beforeCalls = AnvilVkTestBackendCalls()
+  cr\rect\offset\x = 7 : cr\rect\extent\width = 2
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  rc = vkEndCommandBuffer(cmd)
+  If rc <> #ANVIL_VK_ERR_ARGS Or AnvilVkTestBackendCalls() <> beforeCalls Or PeekL(AnvilVkImageAddress(img)) <> beforePixel : ProcedureReturn 27 : EndIf
+
+  ; Neon's private solid-rect coordinates use an integer framebuffer centre.
+  ; An odd framebuffer's right/bottom edge is refused before backend work.
+  imgci\extent\width = 9 : imgci\extent\height = 7
+  If vkCreateImage(dev, @imgci, 0, @oddImg) <> #VK_SUCCESS : ProcedureReturn 28 : EndIf
+  vkGetImageMemoryRequirements(dev, oddImg, @req)
+  mai\allocationSize = req\size
+  If vkAllocateMemory(dev, @mai, 0, @oddMem) <> #VK_SUCCESS : ProcedureReturn 29 : EndIf
+  If vkBindImageMemory(dev, oddImg, oddMem, 0) <> #VK_SUCCESS : ProcedureReturn 30 : EndIf
+  ivci\image = oddImg
+  If vkCreateImageView(dev, @ivci, 0, @oddView) <> #VK_SUCCESS : ProcedureReturn 31 : EndIf
+  fbci\pAttachments = @oddView : fbci\width = 9 : fbci\height = 7
+  If vkCreateFramebuffer(dev, @fbci, 0, @oddFb) <> #VK_SUCCESS : ProcedureReturn 32 : EndIf
+  rpbi\framebuffer = oddFb
+  rpbi\renderArea\extent\width = 9 : rpbi\renderArea\extent\height = 7
+  cr\rect\offset\x = 8 : cr\rect\offset\y = 6
+  cr\rect\extent\width = 1 : cr\rect\extent\height = 1
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #ANVIL_VK_ERR_UNSUPPORTED Or AnvilVkTestBackendCalls() <> beforeCalls : ProcedureReturn 33 : EndIf
+  cr\rect\offset\x = 0 : cr\rect\offset\y = 0
+  cr\rect\extent\width = 9 : cr\rect\extent\height = 7
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi)
+  vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdClearAttachments(cmd, 1, @ca, 1, @cr)
+  vkCmdEndRenderPass(cmd)
+  If vkEndCommandBuffer(cmd) <> #VK_SUCCESS : ProcedureReturn 34 : EndIf
+  ProcedureReturn 0
+EndProcedure

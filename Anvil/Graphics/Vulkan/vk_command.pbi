@@ -44,15 +44,16 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 ; shared pool preserves that complete capacity without charging each of the 32
 ; command buffers half a megabyte while it is idle.
 #ANVIL_VK_MAX_RECORDED_DRAWS = 4096
-#ANVIL_VK_RECORDED_DRAW_BYTES = 216
+#ANVIL_VK_RECORDED_DRAW_BYTES = 224
 
-; Exactly 216 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values
+; Exactly 224 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values
 ; remain generation-tagged Vulkan handles. They are deliberately not resolved
 ; to slots or addresses while recording: submission owns that later lifetime
 ; boundary. Binding count/strides and all other immutable graphics state remain
 ; pipeline-owned and therefore need not be duplicated in every snapshot.
 Structure AnvilVkRecordedDraw Align #PB_Structure_AlignC
   next.i
+  kind.i
   pipeline.i
   descriptorSet.i
   firstVertex.i
@@ -236,6 +237,7 @@ Procedure avkRecordedDrawPoolInit()
       avkRecordedDraw[s]\next = 0
     EndIf
     avkRecordedDraw[s]\pipeline = 0
+    avkRecordedDraw[s]\kind = #ANVIL_VK_RENDER_OP_DRAW
     avkRecordedDraw[s]\descriptorSet = 0
     avkRecordedDraw[s]\firstVertex = 0
     avkRecordedDraw[s]\vertexCount = 0
@@ -285,6 +287,7 @@ Procedure.i avkRecordedDrawAppend(c.i, firstVertex.i, vertexCount.i, viewportX.i
   ; Every field is assigned before publication into the command-buffer chain.
   ; A reused slot therefore cannot expose bytes from its earlier owner.
   avkRecordedDraw[s]\next = 0
+  avkRecordedDraw[s]\kind = #ANVIL_VK_RENDER_OP_DRAW
   avkRecordedDraw[s]\pipeline = avkCbPipe[c]
   avkRecordedDraw[s]\descriptorSet = avkCbDescSet[c]
   avkRecordedDraw[s]\firstVertex = firstVertex
@@ -309,6 +312,54 @@ Procedure.i avkRecordedDrawAppend(c.i, firstVertex.i, vertexCount.i, viewportX.i
     k = k + 1
   Wend
 
+  avkRecordedDrawFreeHead = nextFree
+  avkRecordedDrawFreeCount = avkRecordedDrawFreeCount - 1
+  If avkCbDrawCount[c] = 0
+    avkCbDrawHead[c] = s
+  Else
+    avkRecordedDraw[avkCbDrawTail[c]]\next = s
+  EndIf
+  avkCbDrawTail[c] = s
+  avkCbDrawCount[c] = avkCbDrawCount[c] + 1
+  ProcedureReturn s
+EndProcedure
+
+; Append one already-validated in-pass colour rectangle. It owns no pipeline
+; or descriptor state; its kind and five values are the entire clear snapshot.
+Procedure.i avkRecordedClearRectAppend(c.i, x.i, y.i, w.i, h.i, bgra.i)
+  Define s.i, nextFree.i, k.i
+  If c < 1 Or c > #ANVIL_VK_MAX_COMMAND_BUFFERS Or x < 0 Or y < 0 Or w < 1 Or h < 1
+    ProcedureReturn -1
+  EndIf
+  avkRecordedDrawPoolInit()
+  If avkCbDrawCount[c] < 0 Or avkCbDrawCount[c] >= #ANVIL_VK_MAX_RECORDED_DRAWS
+    ProcedureReturn -1
+  EndIf
+  If (avkCbDrawCount[c] = 0 And (avkCbDrawHead[c] <> 0 Or avkCbDrawTail[c] <> 0)) Or (avkCbDrawCount[c] > 0 And (avkCbDrawHead[c] = 0 Or avkCbDrawTail[c] = 0))
+    ProcedureReturn -1
+  EndIf
+  s = avkRecordedDrawFreeHead
+  If s < 1 Or s > #ANVIL_VK_MAX_RECORDED_DRAWS Or avkRecordedDrawFreeCount < 1
+    ProcedureReturn -1
+  EndIf
+  nextFree = avkRecordedDraw[s]\next
+  avkRecordedDraw[s]\next = 0
+  avkRecordedDraw[s]\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+  avkRecordedDraw[s]\pipeline = 0 : avkRecordedDraw[s]\descriptorSet = 0
+  avkRecordedDraw[s]\firstVertex = 0 : avkRecordedDraw[s]\vertexCount = 0
+  avkRecordedDraw[s]\indexBuffer = 0 : avkRecordedDraw[s]\indexOffset = 0 : avkRecordedDraw[s]\indexType = 0
+  avkRecordedDraw[s]\pushBytes = 0
+  avkRecordedDraw[s]\viewportX = x : avkRecordedDraw[s]\viewportY = y
+  avkRecordedDraw[s]\viewportW = w : avkRecordedDraw[s]\viewportH = h
+  avkRecordedDraw[s]\scissorX = 0 : avkRecordedDraw[s]\scissorY = 0
+  avkRecordedDraw[s]\scissorW = 0 : avkRecordedDraw[s]\scissorH = 0
+  k = 0
+  While k < 4
+    avkRecordedDraw[s]\vertexBuffer[k] = 0 : avkRecordedDraw[s]\vertexOffset[k] = 0
+    avkRecordedDraw[s]\pushWord[k] = 0
+    k = k + 1
+  Wend
+  avkRecordedDraw[s]\pushWord[0] = bgra & $FFFFFFFF
   avkRecordedDrawFreeHead = nextFree
   avkRecordedDrawFreeCount = avkRecordedDrawFreeCount - 1
   If avkCbDrawCount[c] = 0
