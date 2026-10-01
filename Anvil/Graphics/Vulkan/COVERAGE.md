@@ -287,9 +287,17 @@ all-or-none hook keeps the existing widget calls unchanged while persistent
 Vulkan resources translate boxes, atlas text and clip operations into ordered
 draws. The real-widget scene is desk-proved at 109 quads, 47 draws, 654 vertices
 and five scissor states, with one submit and one display-owner present intent.
-It has no processor pixel fallback. The immediate remaining acceptance is the
-bounded Pi 4 run and screenshot of that exact scene, followed by fans/lines and
-HDMI/DSI/rotation/resize coverage. After that, the broader backend stages are
+It has no processor pixel fallback. A current-tree short Pi 4 run passed on
+2026-10-01: 109 quads, 47 draws, 654 vertices, 35 box calls, 12 text calls,
+74 glyph quads, four expected scissor calls, one display-DMA operation, zero DMA fallback
+or refusal, zero pending presentation/backend error, and 12 pixel probes. The
+scene defines five scissor states; the diagnostic records four expected set/clear API calls
+and does not separately measure unique states. The run skipped capacity and
+paired-scene checks and produced no screenshot; see
+`docs/evidence/vulkan-neon-widget-short-pi4-20261001/README.md`. The earlier
+2026-09-26 all-15-scene proof at commit `a6b9a93` includes fan/line paired
+frames, but it proves that historical source only. Current-tree paired fan/line
+checks and broader HDMI/DSI/rotation/resize coverage remain. After that, the broader backend stages are
 per-object GPU virtual addressing and residency above
 today's single window, arithmetic beyond the current straight-line binary32
 `FAdd`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
