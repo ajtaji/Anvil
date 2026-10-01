@@ -1,0 +1,7 @@
+# Pi 4 1024×768 standalone image clear proof
+
+The public `vkCmdClearColorImage` path cleared a 1024×768 linear BGRA8 image at 4,096-byte pitch in an offscreen window. All 786,432 pixels matched `$FF3380B2`, including the first and last pixels; the mismatch count was zero. The adjacent native guard checksum was unchanged. V3D bin and render completion counters each advanced 0→1. Binner OOM, MMU faults, native error, validation faults, submit error and fence-wait error were zero. The diagnostic did not present the image.
+
+The bin and render `ERR_STAT` snapshots were both `$1000`. Bit 12 is the read-only VCDI idle status, not a fault; `RaspberryPi4/Lib/v3d.pi4` documents this distinction at the `V3dErrStatNow` definition. The original report checker expected raw zero and rejected this successful run. The corrected checker rejects every other error bit. `python tools/vulkan_clear_extent_1024_check.py --self-test --report docs/evidence/vulkan-clear-extent1024-pi4-20261001/report.bin` passes the saved report and 45 hostile mutations. This result measures one offscreen Pi 4 clear; it does not establish presentation, other extents or other-board execution.
+
+`report.bin` is the exact 512-byte board report, SHA-256 `1057269F8F32931B049363A4025A8FA3B325924C5BF105559435C50F9001F733`. Diagnostic source SHA-256: `786ED313D5EFE80FEA373B7EA1AC54722A7740458F76F65587EBFB3CA80D5335`. PMF SHA-256: `1836674A71E0BE6B74AC1C9CE1E7E7CFEE5EB779735AADE0128501A2645AAF08`. Checker SHA-256: `F9D97A155E482CCEA1360BE05A12D0687415722B42A765F1C8C3FAAD689C9776`.
