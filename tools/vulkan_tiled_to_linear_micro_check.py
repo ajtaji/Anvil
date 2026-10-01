@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Focused public optimal-to-linear microcopy and pure UIF validator gate."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+
+import vulkan_pipeline_check as pipeline
+import vulkan_v3d_backend_check as backend
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compiler", required=True)
+    args = parser.parse_args()
+    compiler = pipeline.locate_compiler(args.compiler)
+    digest = hashlib.sha256(compiler.read_bytes()).hexdigest().upper()
+    a64 = pipeline.load_interpreter(pipeline.ROOT / "tools" / "a64" / "a64_interp.py")
+    total = 0
+    for stem in ("vulkan_tiled_to_linear_micro_gate", "vulkan_tiled_micro_readback_validator_gate"):
+        source = pipeline.ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests" / (stem + ".pi4")
+        image = pipeline.compile_one(compiler, source, "anvil_" + stem + ".img", backend.LOAD, backend.STACK)
+        _cpu, result, steps = backend.execute(a64, image)
+        if result != 0:
+            print(f"vulkan_tiled_to_linear_micro_check: FAIL - {stem} checkpoint {result} after {steps:,} A64 instructions")
+            return 1
+        total += steps
+    print(f"vulkan_tiled_to_linear_micro_check: PASS - 2 fixtures; public image layouts/offset/cap and pure UIF micro window over {total:,} A64 instructions")
+    print(f"  compiler SHA-256 {digest}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
