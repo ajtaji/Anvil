@@ -89,6 +89,7 @@ EndStructure
 #ANVIL_VK_BUFFER_TILED_RECT_TAG = 1 ; avkOpDstOffset marker for optimal buffer uploads
 #ANVIL_VK_BUFFER_TILED_MICRO_TAG = 2 ; one-utile, byte-bounded optimal buffer upload
 #ANVIL_VK_BUFFER_TILED_GRID_TAG = 3 ; at most two adjacent UIF tile rows and columns
+#ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG = 4 ; at most four adjacent UIF tile rows and columns
 
 ; "the tracker does not know yet" for a layout inside a recording.
 #ANVIL_VK_LAYOUT_UNKNOWN = -2
@@ -687,7 +688,7 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
   Define sourceBufferBytes.i, sourceBufferBase.i
   Define priorSource.i, priorDestination.i, priorBytes.i, priorPitch.i
   Define partialOptimal.i, tailOptimal.i, microOptimal.i, gridOptimal.i
-  Define priorPartialOp.i, tileCount.i, tailCols.i, gridCols.i, gridRows.i, firstCols.i
+  Define priorPartialOp.i, tileCount.i, tailCols.i, gridCols.i, gridRows.i, firstCols.i, lastCols.i, gridWide.i
   Define gridCopy.AnvilVkBackendLinearTiledRectCopy
   Define *r.VkBufferImageCopy, *prior.VkBufferImageCopy
   c = avkCmdSlot(commandBuffer)
@@ -709,7 +710,7 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
   EndIf
   o = avkCbOpHead[c]
   While o <> 0
-    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG)
+    If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG)
       avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage keeps a micro or grid upload in its own command buffer (Anvil code -20005); nothing was recorded.")
       ProcedureReturn
     EndIf
@@ -788,7 +789,8 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     partialOptimal = 1
     gridCols = (*r\imageOffset\x + *r\imageExtent\width - 1) / 4 - *r\imageOffset\x / 4 + 1
     gridRows = (*r\imageOffset\y + *r\imageExtent\height - 1) / 4 - *r\imageOffset\y / 4 + 1
-    gridOptimal = Bool(gridCols <= 2 And gridRows <= 2 And gridCols * gridRows >= 2 And ((*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or ((*r\imageExtent\width % 4) <> 0 And *r\imageOffset\x <> avkImgW[s] - *r\imageExtent\width) Or ((*r\imageExtent\height % 4) <> 0 And *r\imageOffset\y <> avkImgH[s] - *r\imageExtent\height)))
+    gridOptimal = Bool(gridCols <= 4 And gridRows <= 4 And gridCols * gridRows >= 2 And ((*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or ((*r\imageExtent\width % 4) <> 0 And *r\imageOffset\x <> avkImgW[s] - *r\imageExtent\width) Or ((*r\imageExtent\height % 4) <> 0 And *r\imageOffset\y <> avkImgH[s] - *r\imageExtent\height)))
+    gridWide = Bool(gridOptimal <> 0 And (gridCols > 2 Or gridRows > 2))
     If *r\imageExtent\width <= 4 And *r\imageExtent\height <= 4 And (*r\imageOffset\x % 4) + *r\imageExtent\width <= 4 And (*r\imageOffset\y % 4) + *r\imageExtent\height <= 4 And ((*r\imageOffset\x % 4) <> 0 Or (*r\imageOffset\y % 4) <> 0 Or ((*r\imageExtent\width % 4) <> 0 And *r\imageOffset\x <> avkImgW[s] - *r\imageExtent\width) Or ((*r\imageExtent\height % 4) <> 0 And *r\imageOffset\y <> avkImgH[s] - *r\imageExtent\height))
       microOptimal = 1
       gridOptimal = 0
@@ -797,7 +799,15 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
         ProcedureReturn
       EndIf
     ElseIf gridOptimal <> 0
-      If (avkBackendCaps() & (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY)) <> (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY)
+      If gridWide <> 0 And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY) = 0
+        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage extended UIF grid upload requires its dedicated guarded-DMA backend capability (Anvil code -20005); nothing was recorded.")
+        ProcedureReturn
+      EndIf
+      If gridWide = 0 And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY) = 0
+        avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage interior UIF grid upload requires its dedicated guarded-DMA backend capability (Anvil code -20005); nothing was recorded.")
+        ProcedureReturn
+      EndIf
+      If (avkBackendCaps() & (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY)) <> (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY)
         avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage interior UIF grid upload requires its dedicated guarded-DMA backend capability (Anvil code -20005); nothing was recorded.")
         ProcedureReturn
       EndIf
@@ -817,8 +827,8 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
         avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage keeps a micro upload in its own command buffer (Anvil code -20005); nothing was recorded.")
         ProcedureReturn
       EndIf
-      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG)
-        If microOptimal <> 0 Or gridOptimal <> 0 Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG)
+        If microOptimal <> 0 Or gridOptimal <> 0 Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
           avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage keeps a micro upload in its own command buffer (Anvil code -20005); nothing was recorded.")
           ProcedureReturn
         EndIf
@@ -875,7 +885,10 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
     firstCols = 4 - (*r\imageOffset\x % 4)
     If firstCols > *r\imageExtent\width : firstCols = *r\imageExtent\width : EndIf
     tailCols = firstCols
-    If gridCols = 2 And *r\imageExtent\width - firstCols < tailCols : tailCols = *r\imageExtent\width - firstCols : EndIf
+    If gridCols > 1
+      lastCols = (*r\imageOffset\x + *r\imageExtent\width - 1) % 4 + 1
+      If lastCols < tailCols : tailCols = lastCols : EndIf
+    EndIf
   EndIf
   If partialOptimal <> 0 And bufferPitch - tailCols * 4 > 32767
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdCopyBufferToImage partial optimal upload exceeds the backend DMA source stride (Anvil code -20005); nothing was recorded.")
@@ -978,6 +991,7 @@ Procedure AnvilVkCmdCopyBufferToImage(commandBuffer.i, srcBuffer.i, dstImage.i, 
       avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG
       If microOptimal <> 0 : avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG : EndIf
       If gridOptimal <> 0 : avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG : EndIf
+      If gridWide <> 0 : avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG : EndIf
       avkOpImageX[o] = *r\imageOffset\x : avkOpImageY[o] = *r\imageOffset\y
     EndIf
     avkOpSourcePitch[o] = *r\imageExtent\width * #ANVIL_VK_BGRA8_TEXEL_BYTES
@@ -2328,14 +2342,18 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       target = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
       copies = copies + 1
-      If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+      If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
         partialBufferTiledCount = partialBufferTiledCount + 1
         If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG
           microBufferTiledCount = microBufferTiledCount + 1
           partialBufferTiledTiles = partialBufferTiledTiles + 1
-        ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+        ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
           gridBufferTiledCount = gridBufferTiledCount + 1
-          partialBufferTiledTiles = partialBufferTiledTiles + 4
+          If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+            partialBufferTiledTiles = partialBufferTiledTiles + 4
+          Else
+            partialBufferTiledTiles = partialBufferTiledTiles + 16
+          EndIf
         ElseIf avkOpSourcePitch[o] > #ANVIL_VK_TILED_RECT_MAX_UTILES * 16 Or avkOpRows[o] > #ANVIL_VK_TILED_RECT_MAX_UTILES * 4
           partialBufferTiledTiles = #ANVIL_VK_TILED_RECT_MAX_UTILES + 1
         ElseIf avkOpSourcePitch[o] >= 4 And avkOpRows[o] >= 1
@@ -2426,13 +2444,13 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If partialBufferTiledCount > 0
     o = avkCbOpHead[c]
     While o <> 0
-      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG)
+      If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE And (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG)
         If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG
           If (avkBackendCaps() & (#ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY)) <> (#ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_MICRO_COPY)
             ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires the one-utile micro upload backend capability (Anvil code -20005); nothing was submitted.")
           EndIf
-        ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
-          If (avkBackendCaps() & (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY)) <> (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY | #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY)
+        ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
+          If (avkBackendCaps() & (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY)) <> (#ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY) Or (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_COPY) = 0) Or (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG And (avkBackendCaps() & #ANVIL_VK_CAP_BUFFER_TO_TILED_GRID_4X4_COPY) = 0)
             ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit requires the dedicated UIF grid upload backend capability (Anvil code -20005); nothing was submitted.")
           EndIf
         ElseIf (avkOpSourcePitch[o] % 16) <> 0 Or (avkOpRows[o] % 4) <> 0
@@ -2526,7 +2544,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           If avkImgBackendLayout[target] = 0
             ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an incomplete optimal-image TFU transaction (Anvil code -20004); nothing was submitted.")
           EndIf
-          If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+          If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
             copyBytes = avkOpSourcePitch[o] : copyRows = avkOpRows[o]
             sourcePitch = avkOpBufferPitch[o] : sourceSpan = avkOpSourceBytes[o]
             If copyBytes < 4 Or (copyBytes % 4) <> 0 Or copyRows < 1 Or sourcePitch < copyBytes Or (sourcePitch % 4) <> 0 Or sourceSpan <> (copyRows - 1) * sourcePitch + copyBytes
@@ -2536,8 +2554,8 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               If copyBytes > 16 Or copyRows > 4 Or sourcePitch - copyBytes > 32767 Or avkOpImageX[o] < 0 Or avkOpImageY[o] < 0 Or avkOpImageX[o] > avkImgW[target] - copyBytes / 4 Or avkOpImageY[o] > avkImgH[target] - copyRows Or (avkOpImageX[o] % 4) + copyBytes / 4 > 4 Or (avkOpImageY[o] % 4) + copyRows > 4
                 ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a micro upload crossing a UIF utile or exceeding its DMA stride (Anvil code -20004); nothing was submitted.")
               EndIf
-            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
-              If avkOpImageX[o] < 0 Or avkOpImageY[o] < 0 Or avkOpImageX[o] > avkImgW[target] - copyBytes / 4 Or avkOpImageY[o] > avkImgH[target] - copyRows Or (avkOpImageX[o] + copyBytes / 4 - 1) / 4 - avkOpImageX[o] / 4 > 1 Or (avkOpImageY[o] + copyRows - 1) / 4 - avkOpImageY[o] / 4 > 1
+            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
+              If avkOpImageX[o] < 0 Or avkOpImageY[o] < 0 Or avkOpImageX[o] > avkImgW[target] - copyBytes / 4 Or avkOpImageY[o] > avkImgH[target] - copyRows Or (avkOpImageX[o] + copyBytes / 4 - 1) / 4 - avkOpImageX[o] / 4 > 3 Or (avkOpImageY[o] + copyRows - 1) / 4 - avkOpImageY[o] / 4 > 3 Or (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG And ((avkOpImageX[o] + copyBytes / 4 - 1) / 4 - avkOpImageX[o] / 4 > 1 Or (avkOpImageY[o] + copyRows - 1) / 4 - avkOpImageY[o] / 4 > 1)) Or (avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG And (avkOpImageX[o] + copyBytes / 4 - 1) / 4 - avkOpImageX[o] / 4 <= 1 And (avkOpImageY[o] + copyRows - 1) / 4 - avkOpImageY[o] / 4 <= 1)
                 ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid or oversized interior UIF grid upload (Anvil code -20004); nothing was submitted.")
               EndIf
             Else
@@ -2564,7 +2582,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               If avkBackendLinearTiledMicroCopyValidate(@linearTiledRect) <> 0
                 ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid one-utile micro DMA copy (Anvil code -20004); nothing was submitted.")
               EndIf
-            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
               If avkBackendLinearTiledGridCopyValidate(@linearTiledRect) <> 0
                 ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found an invalid per-tile UIF grid DMA copy (Anvil code -20004); nothing was submitted.")
               EndIf
@@ -3168,7 +3186,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             avkFlightComplete(0)
             ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the optimal-image source changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
           EndIf
-          If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+          If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
             linearTiledRect\windowBase = avkHeapBase : linearTiledRect\windowBytes = avkHeapBytes
             linearTiledRect\sourceBase = sourceBase : linearTiledRect\sourceBytes = avkOpSourceBytes[o] : linearTiledRect\sourcePitch = avkOpBufferPitch[o]
             linearTiledRect\sourceViewWidth = avkOpSourcePitch[o] / 4 : linearTiledRect\sourceViewHeight = avkOpRows[o]
@@ -3182,7 +3200,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             linearTiledRect\regionWidth = avkOpSourcePitch[o] / 4 : linearTiledRect\regionHeight = avkOpRows[o]
             If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG
               job = avkBackendSubmitLinearTiledMicroCopy(@linearTiledRect)
-            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG
+            ElseIf avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
               job = avkBackendSubmitLinearTiledGridCopy(@linearTiledRect)
             Else
               job = avkBackendSubmitLinearTiledRectCopy(@linearTiledRect)

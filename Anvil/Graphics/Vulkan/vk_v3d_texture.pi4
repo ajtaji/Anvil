@@ -511,7 +511,7 @@ Procedure.i AnvilVkV3dTextureMicroValidate(*copy.AvkV3dTextureLinearRectCopy, *p
   ProcedureReturn #ANVIL_V3D_TEXTURE_OK
 EndProcedure
 
-; Decompose an interior rectangle into at most four micro tile intersections.
+; Decompose an interior rectangle into at most sixteen micro tile intersections.
 ; Every source row span and destination utile is checked before DMA starts.
 Procedure.i AnvilVkV3dTextureGridValidate(*copy.AvkV3dTextureLinearRectCopy, *plan.AvkV3dTexturePlan)
   Protected tile.AvkV3dTextureLinearRectCopy
@@ -523,7 +523,7 @@ Procedure.i AnvilVkV3dTextureGridValidate(*copy.AvkV3dTextureLinearRectCopy, *pl
   firstX = (*copy\destinationX / 4) * 4 : firstY = (*copy\destinationY / 4) * 4
   lastX = ((*copy\destinationX + *copy\regionWidth - 1) / 4) * 4
   lastY = ((*copy\destinationY + *copy\regionHeight - 1) / 4) * 4
-  If lastX - firstX > 4 Or lastY - firstY > 4 Or (lastX = firstX And lastY = firstY) : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
+  If lastX - firstX > 12 Or lastY - firstY > 12 Or (lastX = firstX And lastY = firstY) : ProcedureReturn #ANVIL_V3D_TEXTURE_ERR_ARGS : EndIf
   tile\windowBase = *copy\windowBase : tile\windowBytes = *copy\windowBytes
   tile\sourceBase = *copy\sourceBase : tile\sourceBytes = *copy\sourceBytes : tile\sourcePitch = *copy\sourcePitch
   tile\sourceViewWidth = *copy\sourceViewWidth : tile\sourceViewHeight = *copy\sourceViewHeight
