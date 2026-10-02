@@ -121,7 +121,9 @@ WHAT IS PROVEN, AND WHY EACH IS DIFFERENT EVIDENCE
      base64 line is, which is the measured defect stated as an assertion.
      Typed on the local console instead, the same stream goes out the
      serial port and nothing goes on the wire.  A stopped stream says
-     `stopped`, with the count and checksum of what really went.
+     `stopped`, with the count and checksum of what really went. A refused
+     link send stops at the first failed block and uses a distinct `failed`
+     verdict with only the accepted prefix counted and checked.
 
 THE NEGATIVE CONTROLS (--mutate).  The first reverts NetConsoleRearm to the
 pre-fix body - re-bind the port, arm nothing - in a COPY of the library,
@@ -383,6 +385,7 @@ Global Dim fxTx.a[#FX_TX_MAX]
 Global fxTxLen.i
 Global fxTxCalls.i
 Global fxTxKind.i
+Global fxFailAt.i
 
 ; AND EVERY FRAME, NOT ONLY THE LAST. fxTx above keeps the most recent
 ; frame and every case written before 2026-09-16 grades that one. A bulk
@@ -493,6 +496,10 @@ Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
   Define i.i
   fxTxCalls = fxTxCalls + 1
   fxTxKind = kind
+  If fxFailAt <> 0 And fxTxCalls = fxFailAt
+    fxFailAt = 0
+    ProcedureReturn 0
+  EndIf
   If n <= 0 Or n > #FX_TX_MAX
     ProcedureReturn 0
   EndIf
@@ -625,6 +632,12 @@ Procedure TcpInput()
   fxTcpKind = NetRxKind()
 EndProcedure
 
+; The scripted peer never leaves a partially typed editor line. The real
+; console may discard one when ownership lapses; keep that unrelated editor
+; seam inert in this link/readback fixture.
+Procedure.i TextEditLength() : ProcedureReturn 0 : EndProcedure
+Procedure TextEditDiscard() : EndProcedure
+
 XIncludeFile "__LIB__"
 
 ; ---- THE READBACK, over the same seam -------------------------------
@@ -677,6 +690,7 @@ Procedure fxReset()
   fxTxLen = 0
   fxTxCalls = 0
   fxTxKind = 0
+  fxFailAt = 0
   fxLogLen = 0
   fxLogFrames = 0
   fxBreakAt = 0
@@ -989,6 +1003,10 @@ Procedure.i Main()
       ; Both go back to zero on op 1.
       r = fxTcpCalls
       e1 = fxTcpKind
+    ElseIf op = 33
+      ; Refuse the a-th following frame once, then recover for the verdict.
+      fxFailAt = fxTxCalls + a
+      r = fxFailAt
     EndIf
 
     PokeN(q, op)
@@ -1205,6 +1223,7 @@ LISTENING = b"Network console listening on UDP"
 RB_ADDR_NET = 0x07000000
 RB_ADDR_LOCAL = 0x07010000
 RB_ADDR_STOP = 0x07020000
+RB_ADDR_FAIL = 0x07040000
 # 2000 bytes: two full 720-byte blocks and a 560-byte third, 41 full
 # 48-byte lines and a 32-byte last line that carries one '='.
 RB_NET_BYTES = 2000
@@ -1227,7 +1246,7 @@ def rb_pattern(seed: int) -> bytes:
 
 
 RB_PATTERNS = {RB_ADDR_NET: rb_pattern(7), RB_ADDR_LOCAL: rb_pattern(61),
-               RB_ADDR_STOP: rb_pattern(113)}
+               RB_ADDR_STOP: rb_pattern(113), RB_ADDR_FAIL: rb_pattern(157)}
 # The monitor's numbers, restated independently: 48 bytes of memory a
 # base64 line, 720 bytes a datagram. If the file changes either without
 # this changing too, the count below goes red, which is the point.
@@ -1656,6 +1675,26 @@ def build_script() -> tuple[Script, dict]:
                              label="the readback that is stopped")
     at["wire_l_stop"] = s.add(27, label="every frame the stopped one sent")
     at["done_l_stop"] = s.add(24, label="the command completes")
+    #  One link refusal on the second payload datagram must stop the stream
+    #  immediately. The first 720 source bytes, and no refused/later block,
+    #  form the reported count and CRC. The fixture recovers for the verdict.
+    at["load_l_fail"] = s.add(25, RB_ADDR_FAIL,
+                              blob=RB_PATTERNS[RB_ADDR_FAIL],
+                              label="bytes for the failed readback")
+    at["rx_l_fail"] = s.add(6, LINK_WIRED,
+                            blob=datagram(WIRED_PEER, WIRED_IP, WIRED_MAC,
+                                          b"readback %X %X\n"
+                                          % (RB_ADDR_FAIL, RB_NET_BYTES)),
+                            label="the host types a failing readback")
+    at["tick_l_fail"] = s.add(12, 50, label="50 ms of prompt spinning")
+    at["pump_l_fail"] = s.add(7, label="the pump takes the line")
+    at["clear_l_fail"] = s.add(27, label="clear the wire log")
+    at["no_break_l_fail"] = s.add(28, 0, label="no Ctrl-C in this transfer")
+    at["fail_l"] = s.add(33, 3, label="the second payload frame is refused")
+    at["run_l_fail"] = s.add(26, RB_ADDR_FAIL, RB_NET_BYTES,
+                             label="the readback stopped on link refusal")
+    at["wire_l_fail"] = s.add(27, label="frames from the failed readback")
+    at["done_l_fail"] = s.add(24, label="the command completes")
 
     # ==== L7. THE CHECKSUM ITSELF ====================================
     #  Every verdict above rests on Anvil/Core/crc.pbi, which became a
@@ -2387,6 +2426,30 @@ def check_readback(res, at, console: bytes, fails: list[str]) -> None:
            "L6. the stopped readback reports %d bytes sent and %d went"
            % (R("run_l_stop").r, len(part)), fails)
 
+    # ---- L8. a failed send stops at that block -----------------------
+    accepted = RB_PATTERNS[RB_ADDR_FAIL][:RB_BLOCK]
+    refused = RB_PATTERNS[RB_ADDR_FAIL][RB_BLOCK:2 * RB_BLOCK]
+    fail = R("wire_l_fail")
+    fframes = rb_frames(fail.blob, fail.r, "L8.", fails)
+    fstream = b"".join(frame[2] for frame in fframes)
+    fheader = (b"readback %08X %d bytes base64\r\n"
+               % (RB_ADDR_FAIL, RB_NET_BYTES))
+    fverdict = (b"readback failed after %d of %d bytes crc32 %08X\r\n"
+                % (len(accepted), RB_NET_BYTES,
+                   zlib.crc32(accepted) & 0xFFFFFFFF))
+    expect(fstream.startswith(fheader + rb_lines(accepted)),
+           "L8. the failed readback did not put its header and first accepted "
+           "720-byte block on the wire", fails)
+    expect(fverdict in fstream and rb_lines(refused) not in fstream
+           and b"readback end " not in fstream,
+           "L8. after one refused block the stream did not stop with the "
+           "accepted-byte count and CRC, or it sent later data", fails)
+    frun = R("run_l_fail")
+    expect(frun.r == len(accepted) and frun.e1 == 2 and frun.e2 == 1,
+           "L8. a failed second payload must return 720 accepted bytes, "
+           "2 attempted blocks, 1 refusal; got %d, %d, %d"
+           % (frun.r, frun.e1, frun.e2), fails)
+
     # ---- L7. the checksum, against zlib ------------------------------
     wrong = [v for v in range(256)
              if (R("crc1_%d" % v).r & 0xFFFFFFFF)
@@ -2628,7 +2691,7 @@ def main() -> int:
     if fails:
         return fail_out(fails)
 
-    cases = 25 + 7
+    cases = 25 + 8
     if args.mutate:
         mutant = WORK / "mutant" / "netconsole_prefix_rearm.pi4"
         write_mutant(mutant)

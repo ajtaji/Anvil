@@ -90,7 +90,8 @@
 ;  same reason (see OutBreakCtrlC) and one rule for bulk streams is
 ;  better than two. A stopped readback says `readback stopped`, with the
 ;  count and the checksum OF WHAT REALLY WENT, so a host cannot mistake
-;  a partial stream for a whole one.
+;  a partial stream for a whole one. A refused link send stops at that block:
+;  continuing would keep the command loop busy for every later timeout.
 ; ======================================================================
 
 ; 48 source bytes -> 64 base64 characters, no padding. The only line
@@ -113,6 +114,7 @@ Global Dim rbAlpha.a[64]
 Global rbAlphaReady.i = 0
 Global gRbDatagrams.i          ; blocks handed to the console
 Global gRbFails.i              ; blocks the console could not send
+Global gRbSendFailed.i         ; stop rather than retrying every later block
 
 ; ----------------------------------------------------------------------
 ;  ConsoleWriteBulk - where a transfer's payload goes.
@@ -122,11 +124,10 @@ Global gRbFails.i              ; blocks the console could not send
 ;  back to the other console halfway through a stream would arrive in
 ;  two places, in two formats, and neither copy would be whole.
 ;
-;  1 if the block went, 0 if it did not. A refusal is counted and named
-;  in the closing line rather than silently retried: the length and the
-;  checksum there are what say whether the stream is usable, and a host
-;  that gets a short one asks for the range again - `readback` reads and
-;  changes nothing, so asking twice cannot cost anything but time.
+;  1 if the block was accepted for sending, 0 if it was refused. A refusal
+;  stops this stream immediately: waiting on every later block can starve
+;  the prompt and link service. The failed verdict counts and checksums only
+;  the blocks accepted before that refusal; the host rejects the whole chunk.
 ; ----------------------------------------------------------------------
 Procedure.i ConsoleWriteBulk(toPeer.i, *p, n.i)
   Define i.i
@@ -252,9 +253,9 @@ EndProcedure
 ;  different answers, one of which then goes on the wire while the other
 ;  goes into the checksum.
 ;
-;  gRbCrcOut is the finished checksum of what actually went, not of what
-;  was asked for, so a stopped stream carries a checksum a host can
-;  still verify against the part it received.
+;  gRbCrcOut is the finished checksum of blocks accepted for sending, not
+;  of what was asked for, so a stopped or failed stream names only its
+;  completed prefix. The host still verifies actual delivery independently.
 ; ----------------------------------------------------------------------
 Global gRbCrcOut.i
 
@@ -269,6 +270,7 @@ Procedure.i ReadbackStream(a.i, n.i)
   toPeer = NetConsoleOwnsCommand()
   gRbDatagrams = 0
   gRbFails = 0
+  gRbSendFailed = 0
   crc = $FFFFFFFF
   i = 0
   While i < n
@@ -287,11 +289,14 @@ Procedure.i ReadbackStream(a.i, n.i)
       rbSrc[k] = PeekA(a + i + k)
       k = k + 1
     Wend
-    crc = Crc32Part(crc, @rbSrc[0], take)
     nOut = rb_EncodeBlock(take)
     If ConsoleWriteBulk(toPeer, @rbOut[0], nOut) = 0
       gRbFails = gRbFails + 1
+      gRbDatagrams = gRbDatagrams + 1
+      gRbSendFailed = 1
+      Break
     EndIf
+    crc = Crc32Part(crc, @rbSrc[0], take)
     gRbDatagrams = gRbDatagrams + 1
     i = i + take
   Wend
@@ -342,15 +347,18 @@ Procedure.i ReadbackRun(a.i, n.i)
   ; lands in the next command's settle and is never seen by the tool that
   ; needed it.
   If gRbFails > 0
-    Print("!! ")
-    PrintDec(gRbFails)
-    Print(" of ")
-    PrintDec(gRbDatagrams)
-    PrintN(" blocks could not be put on the wire, so the stream above is")
-    PrintN("   INCOMPLETE and the checksum below is of the whole range rather than")
-    PrintN("   of what arrived. Check the link with net and ask again.")
+    PrintN("!! readback stopped on the first block the link refused.")
+    PrintN("   The count and checksum below cover only blocks accepted for sending.")
   EndIf
-  If sent < n
+  If gRbSendFailed <> 0
+    Print("readback failed after ")
+    PrintDec(sent)
+    Print(" of ")
+    PrintDec(n)
+    Print(" bytes crc32 ")
+    PutHexN(gRbCrcOut, 8)
+    PrintNl()
+  ElseIf sent < n
     Print("readback stopped after ")
     PrintDec(sent)
     Print(" of ")

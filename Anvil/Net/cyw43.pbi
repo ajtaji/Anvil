@@ -10096,11 +10096,19 @@ EndProcedure
 ;  a shorter message, it is a corrupt one, and it would be dropped by
 ;  the far end with no error anybody here could see.
 ;
-;  THE CREDIT RULE IS THE SAME AS AN IOCTL'S and is not re-argued here:
-;  drain briefly, send anyway, count the stall. A hard block would turn
-;  one lost credit into a board that stops responding, and over Wi-Fi
-;  that would take away the way to fix it.
+;  DATA FRAMES MUST STAY INSIDE THE FIRMWARE'S TX WINDOW. The window
+;  and sequence are eight-bit counters; subtraction is modulo 256 and a
+;  difference with bit 7 set is behind us, not a huge grant. A bounded
+;  poll may refresh the window. If it does not, return a timeout rather
+;  than feeding another frame to firmware that has granted no credit.
+;  The control-channel ioctl path keeps its separate policy.
 ; ----------------------------------------------------------------------
+Procedure.i cyw43_DataCreditReady()
+  Define available.i
+  available = (cyw43_credit - cyw43_seq) & $FF
+  ProcedureReturn Bool(available <> 0 And available < $80)
+EndProcedure
+
 Procedure.i Cyw43Send(length.i)
   Define total.i
   Define padded.i
@@ -10141,12 +10149,13 @@ Procedure.i Cyw43Send(length.i)
   PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_FC, 0)
   PokeB(@cyw43_tx[0] + #CYW43_SDPCM_OFF_WIN, 0)
 
-  If cyw43_credit = (cyw43_seq & $FF)
+  If cyw43_DataCreditReady() = 0
     cyw43_creditPolls = cyw43_creditPolls + 1
     cyw43_Trace(#CYW43_TR_IOCTL_STALL)
-    cyw43_Poll(-1, 0, 5, #CYW43_POLL_CREDIT)
-    If cyw43_credit = (cyw43_seq & $FF)
+    cyw43_Poll(-1, 0, 100, #CYW43_POLL_CREDIT)
+    If cyw43_DataCreditReady() = 0
       cyw43_stalls = cyw43_stalls + 1
+      ProcedureReturn #CYW43_IO_TIMEOUT
     EndIf
   EndIf
 
