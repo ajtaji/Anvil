@@ -344,16 +344,16 @@ Procedure.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
   oldFormat = Neon_SurfaceFormat()
   oldRotation = Neon_SurfaceRotation()
 
-  rc = NeonRebindSurface(base, w, h, pitch, bytes, #V3D_OFMT_RGBA8, 0)
+  rc = NeonHardwareRebindSurface(base, w, h, pitch, bytes, #V3D_OFMT_RGBA8, 0)
   If rc = #NEON_OK
-    rc = NeonFrameBegin(bgra)
+    rc = NeonHardwareFrameBegin(bgra)
   EndIf
   If rc = #NEON_OK
-    rc = NeonFrameEnd()
+    rc = NeonHardwareFrameEnd()
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
 
-  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  restoreRc = NeonHardwareRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
   If restoreRc <> #NEON_OK And avkV3dNative = 0
     avkV3dNative = restoreRc
   EndIf
@@ -1521,9 +1521,9 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
   oldFormat = Neon_SurfaceFormat()
   oldRotation = Neon_SurfaceRotation()
 
-  rc = NeonRebindSurface(*d\targetBase, *d\width, *d\height, *d\pitch, *d\targetBytes, #V3D_OFMT_RGBA8, 0)
+  rc = NeonHardwareRebindSurface(*d\targetBase, *d\width, *d\height, *d\pitch, *d\targetBytes, #V3D_OFMT_RGBA8, 0)
   If rc = #NEON_OK
-    rc = NeonFrameBegin(*d\clearBgra)
+    rc = NeonHardwareFrameBegin(*d\clearBgra)
   EndIf
   If rc = #NEON_OK
     ; Replace Neon's integer-centred UI viewport with the pipeline's exact
@@ -1582,11 +1582,11 @@ Procedure.i avkV3dSubmitLegacyDraw(*d.AnvilVkBackendDraw)
     EndIf
   EndIf
   If rc = #NEON_OK
-    rc = NeonFrameEnd()
+    rc = NeonHardwareFrameEnd()
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
 
-  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  restoreRc = NeonHardwareRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
   If restoreRc <> #NEON_OK And avkV3dNative = 0
     avkV3dNative = restoreRc
   EndIf
@@ -1807,9 +1807,9 @@ Procedure.i avkBackendSubmitDraw(*payload)
   oldFormat = Neon_SurfaceFormat()
   oldRotation = Neon_SurfaceRotation()
 
-  rc = NeonRebindSurface(*first\targetBase, *first\width, *first\height, *first\pitch, *first\targetBytes, #V3D_OFMT_RGBA8, 0)
+  rc = NeonHardwareRebindSurface(*first\targetBase, *first\width, *first\height, *first\pitch, *first\targetBytes, #V3D_OFMT_RGBA8, 0)
   If rc = #NEON_OK
-    rc = NeonFrameBegin(*first\clearBgra)
+    rc = NeonHardwareFrameBegin(*first\clearBgra)
     If rc = #NEON_OK : began = 1 : EndIf
   EndIf
   If rc = #NEON_OK And liveDraws > 0
@@ -1882,12 +1882,12 @@ Procedure.i avkBackendSubmitDraw(*payload)
   ; V3dBclFinish refuses an errored list before submit. Calling End after an
   ; emitter error also clears Neon's in-frame latch so restoration is reliable.
   If began <> 0
-    endRc = NeonFrameEnd()
+    endRc = NeonHardwareFrameEnd()
     If rc = #NEON_OK : rc = endRc : EndIf
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
 
-  restoreRc = NeonRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
+  restoreRc = NeonHardwareRebindSurface(oldBase, oldW, oldH, oldPitch, oldBytes, oldFormat, oldRotation)
   If restoreRc <> #NEON_OK And avkV3dNative = 0 : avkV3dNative = restoreRc : EndIf
   avkInternalFree(arenaMem)
   If rc <> #NEON_OK Or restoreRc <> #NEON_OK : ProcedureReturn -1 : EndIf

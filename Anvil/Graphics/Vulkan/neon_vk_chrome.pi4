@@ -175,6 +175,7 @@ Global nvcClipW.i
 Global nvcClipH.i
 
 Global Dim nvcFs.l[256]
+Global Dim nvcLifecycleClear.l[4]
 
 XIncludeFile "Anvil/Graphics/truetype_renderer.pbi"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_wsi_bridge.pi4"
@@ -2120,4 +2121,59 @@ Procedure NeonVkChromeDestroy()
   nvcTTCount = 0 : nvcTTDirty = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
   nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
   nvcTargetGeneration = 0
+EndProcedure
+
+; Optional public Neon lifecycle for a caller that already created Chrome
+; against its own Vulkan device and target. The native V3D context remains the
+; hardware executor underneath the Pi 4 Vulkan backend. The caller consumes
+; each present intent and destroys its Vulkan objects after NeonShutdown;
+; NeonLifecyclePreparedOwnerPending then names the returned native context.
+Procedure.i nvcLifecycleInit()
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcHooksInstalled = 0 Or NeonDrawBackendActive() = 0 Or NeonVkChromePresentPending() <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvcLifecycleBegin(colour.i)
+  If nvcReady = 0 Or nvcInFrame <> 0 Or NeonVkChromePresentPending() <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  nvcLifecycleClear[0] = neon_F32Ratio(Neon_R(colour), 255)
+  nvcLifecycleClear[1] = neon_F32Ratio(Neon_G(colour), 255)
+  nvcLifecycleClear[2] = neon_F32Ratio(Neon_B(colour), 255)
+  nvcLifecycleClear[3] = neon_F32Ratio(Neon_A(colour), 255)
+  If NeonVkChromeBegin(@nvcLifecycleClear[0]) <> #VK_SUCCESS
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvcLifecycleEnd()
+  If nvcReady = 0 Or nvcInFrame = 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS Or NeonVkChromePresentPending() <> 1
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvcLifecycleShutdown()
+  If nvcInFrame <> 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
+  If nvcDevice <> 0 And vkDeviceWaitIdle(nvcDevice) <> #VK_SUCCESS
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  NeonVkChromeDestroy()
+  If nvcReady <> 0 Or NeonDrawBackendActive() <> 0 Or NeonVkChromePresentPending() <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkChromeLifecycleInstallPrepared()
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcHooksInstalled = 0 Or NeonVkChromePresentPending() <> 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  ProcedureReturn NeonLifecycleInstallPrepared(@nvcLifecycleInit, @nvcLifecycleBegin, @nvcLifecycleEnd, @nvcLifecycleShutdown)
 EndProcedure
