@@ -45,6 +45,7 @@ import zlib
 #    <64 base64 characters>           48 bytes of memory a line
 #    ...
 #    readback end 1812000 bytes crc32 A1B2C3D4
+#  A refused link send instead ends promptly with `readback failed after ...`.
 #
 #  and over the network console the base64 goes ONLY to the peer that
 #  typed it, never through the board's serial port. That is the whole of
@@ -87,8 +88,10 @@ READBACK_END = re.compile(
     r"(?m)^readback end ([0-9]+) bytes crc32 ([0-9A-Fa-f]{8})$")
 READBACK_STOPPED = re.compile(
     r"(?m)^readback stopped after ([0-9]+) of ([0-9]+) bytes crc32 ([0-9A-Fa-f]{8})$")
+READBACK_FAILED = re.compile(
+    r"(?m)^readback failed after ([0-9]+) of ([0-9]+) bytes crc32 ([0-9A-Fa-f]{8})$")
 READBACK_VERDICT = re.compile(
-    r"(?m)^readback (?:end [0-9]+ bytes|stopped after [0-9]+ of [0-9]+ bytes)"
+    r"(?m)^readback (?:end [0-9]+ bytes|(?:stopped|failed) after [0-9]+ of [0-9]+ bytes)"
     r" crc32 [0-9A-Fa-f]{8}\r?\n")
 BASE64_LINE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 
@@ -172,8 +175,15 @@ def parse_readback(reply, address, count):
             "board's monitor has the readback command (type help on it)."
             % (address, count))
     body = text[header.end():]
+    failed = READBACK_FAILED.search(body)
     stopped = READBACK_STOPPED.search(body)
     ended = READBACK_END.search(body)
+    if failed and (not ended or failed.start() < ended.start()):
+        raise ReadbackError(
+            "Error 42: the board's link refused a readback block: %r. "
+            "The board stopped at the first failed send; this host accepts "
+            "none of this partial chunk. Check the link before asking again."
+            % failed.group(0).strip())
     if stopped and (not ended or stopped.start() < ended.start()):
         raise ReadbackError(
             "Error 32: the board stopped this readback part way: %r. Ctrl-C "
