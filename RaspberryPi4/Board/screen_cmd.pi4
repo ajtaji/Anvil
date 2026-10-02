@@ -2280,6 +2280,7 @@ EndProcedure
 
 Procedure CmdScreenKeyboard()
   Define up.i
+  Define vkReady.i
 
   SkipSpace()
   gWordAt = gPos
@@ -2396,7 +2397,13 @@ Procedure CmdScreenKeyboard()
     PrintN("nothing.")
   EndIf
   Print("  Renderer: ")
-  If gCursorGpuOwned <> 0
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  vkReady = VulkanConsoleReady()
+  CompilerEndIf
+  If vkReady <> 0
+    PrintN("the resident Vulkan/Neon tier composes the band on the GPU")
+    PrintN("  with the selected font and presents the complete frame by DMA.")
+  ElseIf gCursorGpuOwned <> 0
     PrintN("the V3D tier composes the band with the CPU and carries it")
     PrintN("  through each GPU frame, so the key labels are the 30 px anti-aliased")
     PrintN("  face - the same kind the banner's title is set in.")
