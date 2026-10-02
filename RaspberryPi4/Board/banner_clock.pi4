@@ -194,6 +194,10 @@ Procedure BannerClockTick()
     ProcedureReturn
   EndIf
   BannerClockCopy(@gBannerClockText[0], @gBannerClockNext[0], gBannerClockChars)
+  If *gBannerGpuInvalidate <> 0
+    gBannerGpuInvalidate()
+    ProcedureReturn
+  EndIf
   overlap = BannerClockIntersectsCursor()
 
   If gCursorGpuOwned = 0
@@ -411,6 +415,10 @@ Procedure TouchKeyboardComposeCpu()
   Define y0.i
   Define y1.i
 
+  ; The active Vulkan endpoint composes the complete keyboard into its frame.
+  If *gBannerGpuInvalidate <> 0
+    ProcedureReturn
+  EndIf
   If gScreen = 0 Or DisplayBase() = 0
     ProcedureReturn
   EndIf

@@ -38,7 +38,7 @@ STACK_BYTES = 0x00100000
 LOADER_LR = 0xDEAD0000
 STEP_LIMIT = 2_000_000
 HOOK_STEP_LIMIT = 6_000_000
-HOOK_ASSERTIONS = 48
+HOOK_ASSERTIONS = 54
 GEOMETRY_ASSERTIONS = 45
 BOX_BATCH_ASSERTIONS = 19
 
@@ -418,6 +418,9 @@ def source_gate(text: str) -> int:
     checks += 1
     if "Neon_AtlasRasterGlyphUV(" not in glyph:
         raise AssertionError("text path does not consume the copied Neon glyph UV contract")
+    checks += 1
+    if "nvcAtlasMapBitmapUV(@uv, NeonBitmapFontBold(font))" not in glyph:
+        raise AssertionError("bitmap text ignores the configured NeonFontSetup bold face")
     checks += 1
     batch_begin = bodies["NeonVkChromeBoxBatchBegin"]
     batch_end = bodies["NeonVkChromeBoxBatchEnd"]

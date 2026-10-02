@@ -437,6 +437,9 @@ Global gBannerClockX.i = 0
 Global gBannerClockW.i = 0
 Global gBannerClockChars.i = 0
 Global gBannerClockMs.i = 0
+; The active GPU renderer may request a new complete frame when a banner
+; caption or glint changes. The framebuffer tiers leave this hook unset.
+Global *gBannerGpuInvalidate = 0
 
 Procedure BannerClockCopy(*dst, *src, lim.i)
   Define i.i
@@ -652,6 +655,11 @@ Procedure ScreenBannerTick()
   phase = gBannerAnimPhase + 1
   If phase >= #BANNER_ANIM_PHASES
     phase = 0
+  EndIf
+  If *gBannerGpuInvalidate <> 0
+    gBannerAnimPhase = phase : gBannerAnimMs = now
+    gBannerGpuInvalidate()
+    ProcedureReturn
   EndIf
   logoX = DisplayWidth() - #ANVIL_PIC_W - #LOGO_MARGIN
   If logoX < 0

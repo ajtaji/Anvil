@@ -3927,6 +3927,18 @@ Procedure.i NeonBitmapLineHeight(font.i)
   ProcedureReturn neon_fh * neon_FontScaleOf(font)
 EndProcedure
 
+; The selected bitmap face style is shared by the native rectangle path and
+; renderer adapters. A face index does not imply bold after NeonFontSetup().
+Procedure.i NeonBitmapFontBold(font.i)
+  If font < 0 Or font > 3
+    ProcedureReturn 0
+  EndIf
+  If neon_fontEmbolden[font] <> 0
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  Neon_TextWidth - GetGLTextWidth, GlUtilities.pbi:1672-1707.
 ;
@@ -4014,7 +4026,7 @@ Procedure.i neon_GlyphRects(ch.i, gx.i, gy.i, font.i)
     ProcedureReturn 0
   EndIf
   sc   = neon_FontScaleOf(font)
-  bold = neon_fontEmbolden[font]
+  bold = NeonBitmapFontBold(font)
   nRect = 0
 
   row = 0
