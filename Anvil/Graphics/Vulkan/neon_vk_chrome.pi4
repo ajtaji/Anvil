@@ -115,6 +115,13 @@ Global nvcAtlasUploadMapped.i
 Global nvcAtlasUploadCount.i
 Global nvcAtlasGeneration.i
 Global nvcAtlasFaulted.i
+; An optional RGB sprite occupies a bounded shelf below the TrueType cache.
+; It shares the existing sampled atlas, so it needs no second image allocation.
+Global nvcLogoSource.i
+Global nvcLogoW.i
+Global nvcLogoH.i
+Global nvcLogoY.i
+Global nvcTTLimitY.i
 ; Preserve the first failing create boundary before rollback can replace the
 ; Vulkan fault with a secondary cleanup diagnostic.
 Global nvcCreateStage.i
@@ -204,6 +211,19 @@ EndProcedure
 
 Procedure.i NeonVkChromeReady()
   ProcedureReturn nvcReady
+EndProcedure
+
+Procedure.i NeonVkChromeLogoSource(*rgb, width.i, height.i)
+  If nvcReady <> 0 Or nvcInFrame <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
+  If *rgb = 0 And width = 0 And height = 0
+    nvcLogoSource = 0 : nvcLogoW = 0 : nvcLogoH = 0
+    ProcedureReturn #NEON_VK_CHROME_OK
+  EndIf
+  If *rgb = 0 Or width < 1 Or width > (#NEON_VK_CHROME_TT_ATLAS_W - 32) Or height < 1 Or height > 256
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  nvcLogoSource = *rgb : nvcLogoW = width : nvcLogoH = height
+  ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
 Procedure.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
@@ -597,6 +617,10 @@ Procedure.i nvcAtlasCreateAndUpload()
   Define y.i
   Define target.i
   Define rc.i
+  Define logoX.i
+  Define logoR.i
+  Define logoG.i
+  Define logoB.i
   Define white.NeonAtlasGlyphUV
 
   rc = Neon_AtlasRasterEnsure()
@@ -613,6 +637,16 @@ Procedure.i nvcAtlasCreateAndUpload()
   nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W
   nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
   If nvcAtlasBaseH > nvcAtlasH : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+  nvcTTLimitY = nvcAtlasH
+  nvcLogoY = 0
+  If nvcLogoSource <> 0
+    If nvcLogoW < 1 Or nvcLogoW > nvcAtlasW - 32 Or nvcLogoH < 1 Or nvcLogoH > 256
+      ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+    EndIf
+    nvcLogoY = nvcAtlasH - nvcLogoH
+    nvcTTLimitY = nvcLogoY
+    If nvcTTLimitY < 2 : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+  EndIf
   nvcAtlasBytes = nvcAtlasW * nvcAtlasH * 4
   bytes = nvcAtlasBytes
   If bytes < sourceBytes Or bytes > 8388608
@@ -662,6 +696,16 @@ Procedure.i nvcAtlasCreateAndUpload()
   Wend
   nvcAtlasUploadMapped = mapped
   If nvcBitmapStageCopy(source, nvcAtlasBaseW, nvcAtlasBaseH) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
+  If nvcLogoSource <> 0
+    For y = 0 To nvcLogoH - 1
+      For x = 0 To nvcLogoW - 1
+        i = nvcLogoSource + (y * nvcLogoW + x) * 3
+        logoR = PeekA(i) : logoG = PeekA(i + 1) : logoB = PeekA(i + 2)
+        logoX = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (((nvcLogoY + y) * nvcAtlasW + 32 + x) * 4)
+        PokeL(logoX, $FF000000 | (logoR << 16) | (logoG << 8) | logoB)
+      Next
+    Next
+  EndIf
   nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
@@ -1156,6 +1200,24 @@ Procedure.i nvcDraw(first.i, count.i, colour.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
+; Draw the registered opaque RGB sprite from the atlas's reserved shelf.
+Procedure.i NeonVkChromeLogo(x.i, y.i)
+  Define first.i
+  Define u0.i, v0.i, u1.i, v1.i
+  If nvcInFrame = 0 Or nvcLogoSource = 0 Or nvcLogoW < 1 Or nvcLogoH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  u0 = neon_F32Ratio(32, nvcAtlasW) : u1 = neon_F32Ratio(32 + nvcLogoW, nvcAtlasW)
+  v0 = neon_F32Ratio(nvcLogoY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + nvcLogoH, nvcAtlasH)
+  first = nvcVertices
+  nvcQuad(first, x, y, x + nvcLogoW, y + nvcLogoH, u0, v0, u1, v1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn nvcDraw(first, 6, Neon_RGB(255, 255, 255))
+EndProcedure
+
 Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
   Define first.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -1201,7 +1263,7 @@ EndProcedure
 Procedure.i nvcTTCacheClear()
   Define x.i, y.i, p.i
   If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 : ProcedureReturn 0 : EndIf
-  For y = 0 To nvcAtlasH - 1
+  For y = 0 To nvcTTLimitY - 1
     p = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (y * nvcAtlasW + 32) * 4
     For x = 32 To nvcAtlasW - 1
       PokeL(p, 0) : p + 4
@@ -1224,11 +1286,11 @@ Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
   EndIf
   x = nvcTTNextX : y = nvcTTNextY : shelfHeight = nvcTTRowH
   paddedW = width + 2 : paddedH = height + 2
-  If paddedW > nvcAtlasW - 32 Or paddedH > nvcAtlasH - 1 : ProcedureReturn -1 : EndIf
+  If paddedW > nvcAtlasW - 32 Or paddedH > nvcTTLimitY - 1 : ProcedureReturn -1 : EndIf
   If x + paddedW > nvcAtlasW
     x = 32 : y = y + shelfHeight : shelfHeight = 0
   EndIf
-  If y + paddedH > nvcAtlasH : ProcedureReturn -1 : EndIf
+  If y + paddedH > nvcTTLimitY : ProcedureReturn -1 : EndIf
   If width > 0 And height > 0
     For copyRow = 0 To height - 1
       For col = 0 To width - 1
@@ -1697,7 +1759,7 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
       If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv, font = #NEON_FONT_BOLD) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        If nvcAtlasMapBitmapUV(@uv, NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
         nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
         nvcVertices = nvcVertices + 6 : count = count + 6
       EndIf

@@ -1,0 +1,82 @@
+; Complete logical banner composition for a Neon/Vulkan frame.
+; The caller owns the frame and supplies stable text and logo dimensions.
+
+Structure NeonVkBannerArgs
+  width.i
+  height.i
+  logoWidth.i
+  logoHeight.i
+  platformText.i
+  buildText.i
+  clockText.i
+  glintActive.i
+  glintX.i
+  glintY.i
+EndStructure
+
+Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
+  Define rc.i, logoX.i, logoY.i, labelX.i, titleX.i
+  Define clockX.i, clockRight.i, titleWidth.i, buildWidth.i, labelWidth.i
+  Define steel.i, warm.i, faint.i
+  If *args = 0 Or *args\width < 128 Or *args\height < 120 Or *args\logoWidth < 1 Or *args\logoHeight < 1
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  If *args\platformText = 0 Or *args\buildText = 0 Or *args\clockText = 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  steel = Neon_RGB(226, 232, 240)
+  warm = Neon_RGB(255, 176, 64)
+  faint = Neon_RGB(120, 132, 150)
+  rc = NeonVkChromeBox(0, 0, *args\width, 120, Neon_RGB(0, 0, 40))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_BOLD, 26, 12, "PureMetal", steel)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  titleWidth = Neon_TextWidth(#NEON_FONT_BOLD, "PureMetal ")
+  buildWidth = Neon_TextWidth(#NEON_FONT_SMALL, *args\buildText)
+  labelWidth = Neon_TextWidth(#NEON_FONT_SMALL, "A N V I L")
+  If titleWidth < 0 Or buildWidth < 0 Or labelWidth < 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  titleX = 26 + titleWidth
+  rc = Neon_Text(#NEON_FONT_BOLD, titleX, 12, "Forge", Neon_RGB(255, 148, 48))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_SMALL, 28, 70, *args\platformText, faint)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = Neon_Text(#NEON_FONT_SMALL, 28, 94, *args\buildText, steel)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  clockRight = *args\width - *args\logoWidth - 12 - 16
+  clockX = 28 + buildWidth + 24
+  If clockRight > clockX And PeekA(*args\clockText) <> 0
+    NeonVkChromeScissorSet(clockX, 94, clockRight - clockX, 16)
+    If NeonVkChromeError() <> #NEON_VK_CHROME_OK : ProcedureReturn NeonVkChromeError() : EndIf
+    rc = Neon_Text(#NEON_FONT_SMALL, clockX, 94, *args\clockText, faint)
+    NeonVkChromeScissorClear()
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    If NeonVkChromeError() <> #NEON_VK_CHROME_OK : ProcedureReturn NeonVkChromeError() : EndIf
+  EndIf
+  rc = NeonVkChromeBox(24, 114, *args\width - 48, 1, Neon_RGB(255, 148, 48))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeBox(24, 115, *args\width - 48, 1, Neon_RGB(60, 40, 20))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  logoX = *args\width - *args\logoWidth - 12
+  If logoX < 0 : logoX = 0 : EndIf
+  logoY = 12
+  rc = NeonVkChromeLogo(logoX, logoY)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  labelX = logoX + (*args\logoWidth - labelWidth) / 2
+  rc = Neon_Text(#NEON_FONT_SMALL, labelX, logoY + *args\logoHeight + 6, "A N V I L", warm)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  If *args\glintActive <> 0
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY, 1, 1, warm)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX - 1, logoY + *args\glintY, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX + 1, logoY + *args\glintY, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY - 1, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkChromeBox(logoX + *args\glintX, logoY + *args\glintY + 1, 1, 1, steel)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure

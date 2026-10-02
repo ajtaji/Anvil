@@ -1354,6 +1354,11 @@
 ;     the bus.
 ;    ------------------------------------------------------------------
 ;
+;    The Neon draw adapter shares the board's selected bitmap font style.
+;    This query is about the current face, not a fixed font index; renderer
+;    backends use it to choose the same atlas glyphs as native Neon.
+;                 NeonBitmapFontBold(font)   1 for bold, 0 otherwise.
+;
 ;    HwCon*    (#CAP_CONSOLE)  A PIXEL SURFACE ANVIL CAN HAND TO A
 ;              PAYLOAD. Not the monitor's own console - that is a terminal
 ;              grid and belongs to Anvil. This is the raw surface an

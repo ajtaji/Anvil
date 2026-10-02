@@ -49,10 +49,15 @@ Global avcPitch.i
 Global avcRotation.i
 Global avcUiHeight.i
 Global avcFallbackPaint.i
+Global avcBannerFrameReady.i
 Global avcPayloadWasActive.i
 Global Dim avcClear.l[4]
 Global Dim avcGlyph.a[2]
 Global Dim avcGridGlyphs.l[#NEON_VK_CHROME_TT_CACHE_MAX - 1]
+
+Procedure avcBannerInvalidate()
+  ConGridMarkAll()
+EndProcedure
 
 Procedure.i VulkanConsoleError()
   ProcedureReturn avcError
@@ -195,6 +200,7 @@ Procedure.i VulkanConsoleDestroy()
     ProcedureReturn 0
   EndIf
   If NeonVkChromeReady() <> 0 : NeonVkChromeDestroy() : EndIf
+  NeonVkChromeLogoSource(0, 0, 0)
   If avcDevice <> 0
     If avcFramebuffer <> 0 : vkDestroyFramebuffer(avcDevice, avcFramebuffer, 0) : EndIf
     If avcRenderPass <> 0 : vkDestroyRenderPass(avcDevice, avcRenderPass, 0) : EndIf
@@ -231,6 +237,8 @@ Procedure.i avcFailover(reason.i)
   hadCursor = gCurShown
   If avcError = 0 : avcError = reason : EndIf
   AnvilTrueTypeRasterAlphaHandlerSet(0)
+  *gBannerGpuInvalidate = 0
+  avcBannerFrameReady = 0
   avcActive = 0
   avcReady = 0
   ConNoRenderer()
@@ -272,6 +280,8 @@ EndProcedure
 
 Procedure.i avcStartupFallback(reason.i)
   avcError = reason
+  *gBannerGpuInvalidate = 0
+  avcBannerFrameReady = 0
   ConNoRenderer()
   If V3dConInvalidate() = 0
     avcQuarantined = 1
@@ -291,6 +301,8 @@ Procedure.i VulkanConsoleStart()
   Define dramBytes.i
   If avcActive <> 0 : ProcedureReturn #AVC_OK : EndIf
   AnvilTrueTypeRasterAlphaHandlerSet(0)
+  *gBannerGpuInvalidate = 0
+  avcBannerFrameReady = 0
   avcError = 0
   If gScreen = 0 Or DisplayBase() = 0 Or DisplayBytesPerPixel() <> 4
     avcError = #AVC_ERR_DISPLAY
@@ -361,6 +373,10 @@ Procedure.i VulkanConsoleStart()
     avcStartupFallback(#AVC_ERR_PRESENT)
     ProcedureReturn #AVC_ERR_PRESENT
   EndIf
+  If NeonVkChromeLogoSource(?anvilPix, #ANVIL_PIC_W, #ANVIL_PIC_H) <> #NEON_VK_CHROME_OK
+    avcStartupFallback(#AVC_ERR_CHROME)
+    ProcedureReturn #AVC_ERR_CHROME
+  EndIf
   rc = avcCreateTarget()
   If rc <> #AVC_OK
     avcError = rc
@@ -396,7 +412,10 @@ Procedure.i VulkanConsoleStart()
   If avcNeonAllowed <> 0
     AnvilTrueTypeRasterAlphaHandlerSet(@AnvilTrueTypeCoverageCountsToAlphaNeon)
   EndIf
+  NeonFontSetup(#NEON_FONT_BOLD, 3, 1)
+  NeonFontSetup(#NEON_FONT_SMALL, 1, 0)
   ConSetRenderer(@VulkanConsolePump)
+  *gBannerGpuInvalidate = @avcBannerInvalidate
   avcActive = 1 : avcReady = 1 : avcError = 0
   ConGridMarkAll()
   ProcedureReturn #AVC_OK
@@ -405,6 +424,8 @@ EndProcedure
 Procedure.i VulkanConsoleStop()
   Define hadCursor.i
   hadCursor = gCurShown
+  *gBannerGpuInvalidate = 0
+  avcBannerFrameReady = 0
   If avcActive = 0 And avcReady = 0
     If avcQuarantined <> 0
       If avcDeviceUnsafe <> 0 : ConNoRenderer() : ProcedureReturn 0 : EndIf
@@ -533,9 +554,11 @@ Procedure.i avcWarmGrid()
     ; The touch-keyboard labels are another set of the same Neon text calls.
     ; Warm their exact scaled mono faces before Begin as well; painting them
     ; after Begin must never trigger rasterization or an atlas upload.
-    If rc >= 0 And TouchKeyboardLayoutOk() <> 0 And TouchKeyboardViewVisible() = 0
+    If rc >= 0 And TouchKeyboardLayoutOk() <> 0
       n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
+      If TouchKeyboardDrawOverflowed() <> 0 : rc = #NEON_VK_CHROME_ERR_CAPACITY : EndIf
       For i = 0 To n - 1
+        If rc < 0 : Break : EndIf
         If TouchKeyboardDrawKind(i) = #TKB_DRAW_TEXT
       at = TouchKeyboardDrawScale(i)
       NeonFontSetup(#NEON_FONT_MONO, at, 0)
@@ -546,12 +569,71 @@ Procedure.i avcWarmGrid()
       Next
       NeonFontSetup(#NEON_FONT_MONO, gScrScale, 0)
     EndIf
+    If rc >= 0
+      If NeonVkChromeFontHeightSet(#NEON_FONT_BOLD, 48) <> #NEON_VK_CHROME_OK
+        rc = #NEON_VK_CHROME_ERR_ARGS
+      ElseIf NeonVkChromeFontHeightSet(#NEON_FONT_SMALL, 16) <> #NEON_VK_CHROME_OK
+        rc = #NEON_VK_CHROME_ERR_ARGS
+      EndIf
+    EndIf
+    If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(48, "PureMetal Forge") : EndIf
+    If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, BannerPlatformText()) : EndIf
+    If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME)) : EndIf
+    If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, @gBannerClockText[0]) : EndIf
+    If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "A N V I L") : EndIf
     If rc >= 0 : ProcedureReturn #VK_SUCCESS : EndIf
     ; Atlas capacity can be recovered only outside an active frame. Reset the
     ; complete cache, then warm the exact current grid again before Begin.
     If pass <> 0 : ProcedureReturn rc : EndIf
     If NeonVkChromeTTCacheReset() <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
   Next
+  ProcedureReturn rc
+EndProcedure
+
+Procedure.i avcRenderBanner()
+  Define args.NeonVkBannerArgs
+  args\width = avcLogicalW : args\height = avcLogicalH
+  args\logoWidth = #ANVIL_PIC_W : args\logoHeight = #ANVIL_PIC_H
+  args\platformText = BannerPlatformText()
+  args\buildText = AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME)
+  args\clockText = @gBannerClockText[0]
+  args\glintActive = Bool(gBannerAnimPhase >= 0)
+  If args\glintActive <> 0
+    args\glintX = BannerGlintX(gBannerAnimPhase)
+    args\glintY = BannerGlintY(gBannerAnimPhase)
+  EndIf
+  ProcedureReturn NeonVkBannerRender(@args)
+EndProcedure
+
+; Compose both the small keyboard button and the expanded key band into the
+; Vulkan frame. Native V3D retains its separate CPU key-band compositor.
+Procedure.i avcRenderKeyboard()
+  Define n.i, i.i, kind.i, colour.i, scale.i, priorScale.i
+  Define x.i, y.i, w.i, h.i, textWidth.i, lineHeight.i, rc.i
+  If TouchKeyboardLayoutOk() = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  n = TouchKeyboardPaint(#TKB_RENDER_GPU, #TKB_DAMAGE_ALL)
+  If TouchKeyboardDrawOverflowed() <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+  priorScale = gScrScale
+  NeonFontSetup(#NEON_FONT_MONO, priorScale, 0)
+  For i = 0 To n - 1
+    kind = TouchKeyboardDrawKind(i)
+    colour = TouchKeyboardDrawFg(i)
+    x = TouchKeyboardDrawX(i) : y = TouchKeyboardDrawY(i)
+    w = TouchKeyboardDrawW(i) : h = TouchKeyboardDrawH(i)
+    If kind = #TKB_DRAW_RECT
+      rc = Neon_Box(x, y, w, h, Neon_RGBA((colour >> 16) & $FF, (colour >> 8) & $FF, colour & $FF, 255))
+    ElseIf kind = #TKB_DRAW_TEXT
+      scale = TouchKeyboardDrawScale(i)
+       If scale < 1 Or scale > #TKB_SCALE_MAX : rc = #NEON_VK_CHROME_ERR_ARGS : Break : EndIf
+      NeonFontSetup(#NEON_FONT_MONO, scale, 0)
+      textWidth = Neon_TextWidth(#NEON_FONT_MONO, TouchKeyboardDrawText(i))
+      lineHeight = Neon_LineHeight(#NEON_FONT_MONO)
+      If textWidth < 0 Or lineHeight < 1 : rc = #NEON_VK_CHROME_ERR_ARGS : Break : EndIf
+      rc = Neon_Text(#NEON_FONT_MONO, x + (w - textWidth) / 2, y + (h - lineHeight) / 2, TouchKeyboardDrawText(i), Neon_RGBA((colour >> 16) & $FF, (colour >> 8) & $FF, colour & $FF, 255))
+    EndIf
+    If rc <> #NEON_VK_CHROME_OK : Break : EndIf
+  Next
+  NeonFontSetup(#NEON_FONT_MONO, priorScale, 0)
   ProcedureReturn rc
 EndProcedure
 
@@ -588,6 +670,21 @@ Procedure.i avcCopyToDisplay()
   width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
   If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight
     ProcedureReturn 0
+  EndIf
+  If avcBannerFrameReady <> 0
+    If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+    If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, 0, 0, width, height) = 0
+      ProcedureReturn 0
+    EndIf
+    bytes = ScrGpuBytes()
+    MmuCleanRange(dst, bytes)
+    If gScrSrc = #SCR_SRC_DSI
+      ScrDsiWaitFrameStart()
+      DmaCacheRange(#MON_FB_SCAN, bytes)
+      If DmaCopy(#MON_FB_SCAN, dst, bytes) = 0 : ProcedureReturn 0 : EndIf
+      DmaCacheRange(#MON_FB_SCAN, bytes)
+    EndIf
+    ProcedureReturn 1
   EndIf
   bx = 0 : by = 0 : bw = width : bh = LogoHeight()
   rotation = ScrGpuRotation()
@@ -686,6 +783,13 @@ Procedure VulkanConsolePump()
     avcFailover(#AVC_ERR_CHROME)
     ProcedureReturn
   EndIf
+  avcBannerFrameReady = 0
+  rc = avcRenderBanner()
+  If rc <> #NEON_VK_CHROME_OK
+    avcFailover(#AVC_ERR_CHROME)
+    ProcedureReturn
+  EndIf
+  avcBannerFrameReady = 1
   ch = Neon_LineHeight(#NEON_FONT_UI) : cw = Neon_CharWidth(#NEON_FONT_UI)
   ; The console model owns fixed cell positions. Font-size changes may alter
   ; glyph fit inside a cell, but never change cursor/row geometry.
@@ -749,7 +853,11 @@ Procedure VulkanConsolePump()
       Wend
     Next
   EndIf
-  TouchKeyboardComposeNeon()
+  rc = avcRenderKeyboard()
+  If rc <> #NEON_VK_CHROME_OK
+    avcFailover(#AVC_ERR_CHROME)
+    ProcedureReturn
+  EndIf
   V3dConRenderCursor()
   rc = NeonVkChromeError()
   endRc = NeonVkChromeEnd()

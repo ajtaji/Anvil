@@ -13,7 +13,8 @@
 ;     --load-addr 0x700000 --stack-addr 0x4F00000 --entry-returns \
 ;     -o vulkanNeonWidgetProof.img
 ; #NW_PROOF_MODE selects the historical full proof (0), one widget frame (1),
-; or the fan/outline and line GPU frames with fixed RAM captures (2).
+; the fan/outline and line GPU frames with fixed RAM captures (2), or a
+; three-rotation banner readback with bounded RAM captures (3).
 ;
 ; The return value is a pointer to exactly 64 little-endian 32-bit report
 ; words (256 bytes). tools/vulkan_neon_widget_proof_check.py owns the separate
@@ -35,6 +36,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
 XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/anvil_logo.pbi"
+XIncludeFile "RaspberryPi4/Board/vulkan_banner.pi4"
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanBannerTinyFont.pbi"
 XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.pbi"
 
 #NW_MAGIC             = $4157564E       ; bytes "NVWA"
@@ -53,6 +57,12 @@ XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAcceptanceScene.
 #NW_DSI_SCAN          = $08A00000
 #NW_SHOW_MS           = 0
 #NW_PROOF_MODE        = 0
+#NW_BANNER0           = $07000000
+#NW_BANNER90          = $07060000
+#NW_BANNER270         = $07100000
+#NW_BANNER_CHANGED    = $071A0000
+#NW_BANNER0_BYTES     = 800 * 120 * 4
+#NW_BANNER_SIDE_BYTES = 120 * 1280 * 4
 #NW_CAPACITY_BOXES    = 3505
 #NW_STRESS_DRAWS      = 1183         ; one box batch + 2*(252+339) text calls
 #NW_STRESS_QUADS      = 6373         ; 3505 boxes + 2868 text glyphs
@@ -189,6 +199,49 @@ Procedure nwCapturePixels(base.i, pitch.i)
     k = k + 1
   Wend
   nwPut(#NW_S_PIXEL_COUNT, 12)
+EndProcedure
+
+; Optional mode 3 captures only the banner bands from three completed GPU
+; frames. These CPU copies are readback evidence; they never paint a display.
+Procedure.i nwBannerFrame(imageBase.i, imagePitch.i, framebuffer.i, rotation.i, capture.i, *clock, glintX.i)
+  Define args.NeonVkBannerArgs
+  Define Dim clear.l[4]
+  Define rc.i, x.i, y.i, sourceX.i, copyW.i, copyH.i, copyPitch.i
+  Define logicalW.i, logicalH.i
+  logicalW = 800 : logicalH = 1280
+  copyW = 800 : copyH = 120 : copyPitch = 3200
+  If rotation = 90 Or rotation = 270
+    logicalW = 1280 : logicalH = 800
+    copyW = 120 : copyH = 1280 : copyPitch = 480
+    If rotation = 90 : sourceX = 680 : EndIf
+  EndIf
+  rc = NeonVkChromeRebind(framebuffer, logicalW, logicalH, 800, 1280, imagePitch, rotation)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  args\width = logicalW : args\height = logicalH
+  args\logoWidth = #ANVIL_PIC_W : args\logoHeight = #ANVIL_PIC_H
+  args\platformText = "Anvil Monitor | Pi4 | EL3"
+  args\buildText = "Build 227 | 2026-10-02 15:19:59"
+  args\clockText = *clock
+  args\glintActive = 1 : args\glintX = glintX : args\glintY = 25
+  clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = $3F800000
+  rc = NeonVkChromeBegin(@clear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rc = NeonVkBannerRender(@args)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If #NW_PROOF_MODE = 4
+    If NeonVkChromeFrameRasterDelta() <> 0 Or NeonVkChromeFrameUploadDelta() <> 0
+      ProcedureReturn #NW_ERR_COUNTS
+    EndIf
+  EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn #NW_ERR_PRESENT : EndIf
+  For y = 0 To copyH - 1
+    For x = 0 To copyW - 1
+      PokeL(capture + y * copyPitch + x * 4, PeekL(imageBase + y * imagePitch + (sourceX + x) * 4))
+    Next
+  Next
+  ProcedureReturn #NW_OK
 EndProcedure
 
 ; Run the native oracle's 3,505 consecutive boxes through one real Vulkan
@@ -890,6 +943,29 @@ Procedure.i Main()
     vkDestroyInstance(inst, 0) : NeonShutdown()
     ProcedureReturn nwReturn(#NW_ERR_PRIME)
   EndIf
+  If #NW_PROOF_MODE = 3 Or #NW_PROOF_MODE = 4
+    ; Mode 3 shares the resident banner's exact RGB source and bitmap setup.
+    NeonFontSetup(#NEON_FONT_BOLD, 3, 1)
+    NeonFontSetup(#NEON_FONT_SMALL, 1, 0)
+    If #NW_PROOF_MODE = 4
+      nwPut(#NW_S_DRAW_EXPECT, Neon_TextWidth(#NEON_FONT_BOLD, "PureMetal Forge"))
+      If AnvilTrueTypeSlotLoad(0, ?nvbfData, #NVBF_BYTES) = 0 Or AnvilTrueTypeSlotSelect(0) = 0
+        vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+        vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+        vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+        vkDestroyInstance(inst, 0) : NeonShutdown()
+        ProcedureReturn nwReturn(#NW_ERR_ADAPTER)
+      EndIf
+    EndIf
+    rc = NeonVkChromeLogoSource(?anvilPix, #ANVIL_PIC_W, #ANVIL_PIC_H)
+    If rc <> #NEON_VK_CHROME_OK
+      vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+      vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+      vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+      vkDestroyInstance(inst, 0) : NeonShutdown()
+      ProcedureReturn nwReturn(#NW_ERR_ADAPTER)
+    EndIf
+  EndIf
 
   ; The shipped adapter allocates all resident resources here and publishes
   ; the widget callbacks only after its Vulkan atlas upload has completed.
@@ -898,6 +974,7 @@ Procedure.i Main()
   If #NW_PROOF_MODE <> 0
     adapterDraws = #NVWA_EXPECT_DRAWS : adapterQuads = #NVWA_EXPECT_QUADS
   EndIf
+  If #NW_PROOF_MODE = 3 Or #NW_PROOF_MODE = 4 : adapterDraws = 128 : adapterQuads = 512 : EndIf
   rc = NeonVkChromeCreateWithCapacities(phys, dev, queue, pool, renderPass, framebuffer, #NVWA_WIDTH, #NVWA_HEIGHT, adapterDraws, adapterQuads)
   nwPut(#NW_S_CREATE_RC, rc)
   nwPut(#NW_S_READY_BEFORE, NeonVkChromeReady())
@@ -912,7 +989,76 @@ Procedure.i Main()
   EndIf
   adapterMade = 1
 
-  If #NW_PROOF_MODE = 2
+  If #NW_PROOF_MODE = 3 Or #NW_PROOF_MODE = 4
+    ; All captures are CPU-only readback buffers, disjoint from the Vulkan
+    ; window, Neon arena, linear attachment, and one another. The existing
+    ; surface map ends below the first buffer; no QPU addresses these bytes.
+    nwPut(#NW_S_STEP, 5)
+    If #NW_SURFACE + #NW_MAP_SPAN > #NW_BANNER0 Or #NW_WINDOW + #NW_WINDOW_BYTES > #NW_BANNER0 Or #NW_BANNER0 + #NW_BANNER0_BYTES > #NW_BANNER90 Or #NW_BANNER90 + #NW_BANNER_SIDE_BYTES > #NW_BANNER270 Or #NW_BANNER270 + #NW_BANNER_SIDE_BYTES > #NW_BANNER_CHANGED Or #NW_BANNER_CHANGED + #NW_BANNER0_BYTES > #NW_ARENA
+      rc = #NW_ERR_WINDOW
+    ElseIf imageBase < #NW_WINDOW Or imageBase + imagePitch * #NVWA_HEIGHT > #NW_WINDOW + #NW_WINDOW_BYTES
+      rc = #NW_ERR_WINDOW
+    Else
+      If #NW_PROOF_MODE = 4
+        rc = NeonVkChromeFontHeightSet(#NEON_FONT_BOLD, 48)
+        If rc = #NW_OK : rc = NeonVkChromeFontHeightSet(#NEON_FONT_SMALL, 16) : EndIf
+        nwPut(#NW_S_DRAW_ACTUAL, AnvilTrueTypeSlotSelected())
+        nwPut(#NW_S_VERTEX_EXPECT, NeonVkChromeMeasureWidth(#NEON_FONT_BOLD, "PureMetal Forge"))
+        If rc = #NW_OK And (nwGet(#NW_S_DRAW_ACTUAL) <> 0 Or nwGet(#NW_S_VERTEX_EXPECT) < 1 Or nwGet(#NW_S_DRAW_EXPECT) = nwGet(#NW_S_VERTEX_EXPECT))
+          rc = #NW_ERR_COUNTS
+        EndIf
+        ; Warm returns the decoded glyph count on success, not zero.
+        If rc = #NW_OK : rc = NeonVkChromeWarmTrueTypeText(48, "PureMetal Forge") : EndIf
+        If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "Anvil Monitor | Pi4 | EL3") : EndIf
+        If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "Build 227 | 2026-10-02 15:19:59") : EndIf
+        If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "15:20:01 42C") : EndIf
+        If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "15:20:01 42C+") : EndIf
+        If rc >= 0 : rc = NeonVkChromeWarmTrueTypeText(16, "A N V I L") : EndIf
+        nwPut(#NW_S_VERTEX_ACTUAL, AnvilTrueTypeRasterCount())
+        If rc >= 0 And nwGet(#NW_S_VERTEX_ACTUAL) < 1 : rc = #NW_ERR_COUNTS : EndIf
+        If rc >= 0 : rc = #NW_OK : EndIf
+      EndIf
+      If rc = #NW_OK : rc = nwBannerFrame(imageBase, imagePitch, framebuffer, 0, #NW_BANNER0, "15:20:01 42C", 37) : EndIf
+      If rc = #NW_OK : rc = nwBannerFrame(imageBase, imagePitch, framebuffer, 90, #NW_BANNER90, "15:20:01 42C", 37) : EndIf
+      If rc = #NW_OK : rc = nwBannerFrame(imageBase, imagePitch, framebuffer, 270, #NW_BANNER270, "15:20:01 42C", 37) : EndIf
+      If rc = #NW_OK And #NW_PROOF_MODE = 4 : rc = nwBannerFrame(imageBase, imagePitch, framebuffer, 0, #NW_BANNER_CHANGED, "15:20:01 42C+", 55) : EndIf
+    EndIf
+    nwPut(#NW_S_SCENE_RC, rc)
+    nwPut(#NW_S_BACKEND_ERROR, NeonVkChromeError())
+    If rc <> #NW_OK
+      NeonVkChromeDestroy()
+      vkDestroyFramebuffer(dev, framebuffer, 0) : vkDestroyRenderPass(dev, renderPass, 0)
+      vkDestroyImageView(dev, view, 0) : vkFreeMemory(dev, memory, 0) : vkDestroyImage(dev, image, 0)
+      vkDestroyCommandPool(dev, pool, 0) : vkDestroyDevice(dev, 0)
+      vkDestroyInstance(inst, 0) : NeonShutdown()
+      ProcedureReturn nwReturn(#NW_ERR_PIXELS)
+    EndIf
+    nwPut(#NW_S_PIXEL_COUNT, 3)
+    nwPut(#NW_S_PIXEL0 + 0, #NW_BANNER0)
+    nwPut(#NW_S_PIXEL0 + 1, #NW_BANNER90)
+    nwPut(#NW_S_PIXEL0 + 2, #NW_BANNER270)
+    nwPut(#NW_S_PIXEL0 + 3, #NW_BANNER0_BYTES)
+    nwPut(#NW_S_PIXEL0 + 4, #NW_BANNER_SIDE_BYTES)
+    nwPut(#NW_S_PIXEL0 + 5, #NW_BANNER_SIDE_BYTES)
+    nwPut(#NW_S_PIXEL0 + 6, 0)
+    nwPut(#NW_S_PIXEL0 + 7, 90)
+    nwPut(#NW_S_PIXEL0 + 8, 270)
+    nwPut(#NW_S_PIXEL0 + 9, 120)
+    nwPut(#NW_S_PIXEL0 + 10, #ANVIL_PIC_W)
+    nwPut(#NW_S_PIXEL0 + 11, #ANVIL_PIC_H)
+    If #NW_PROOF_MODE = 4
+      nwPut(#NW_S_PIXEL_COUNT, 4)
+      nwPut(#NW_S_PIXEL0 + 3, #NW_BANNER_CHANGED)
+      nwPut(#NW_S_PIXEL0 + 4, #NW_BANNER0_BYTES)
+      nwPut(#NW_S_PIXEL0 + 5, #NW_BANNER_SIDE_BYTES)
+      nwPut(#NW_S_PIXEL0 + 6, #NW_BANNER_SIDE_BYTES)
+      nwPut(#NW_S_PIXEL0 + 7, #NW_BANNER0_BYTES)
+      nwPut(#NW_S_PIXEL0 + 8, 0)
+      nwPut(#NW_S_PIXEL0 + 9, 90)
+      nwPut(#NW_S_PIXEL0 + 10, 270)
+      nwPut(#NW_S_PIXEL0 + 11, 0)
+    EndIf
+  ElseIf #NW_PROOF_MODE = 2
     ; These constants are normally seeded by the boxes paired frame. The
     ; fan/line-only proof uses that same clear without running another scene.
     nwPairClear[0] = $3D888889 : nwPairClear[1] = $3E048485
