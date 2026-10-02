@@ -292,6 +292,10 @@ EndStructure
 Global neon_err.i      = #NEON_OK
 Global gNeonReady.i    = 0        ; NeonInit() completed
 Global neon_inFrame.i  = 0
+; The Vulkan hardware backend may submit its own native V3D list while an
+; external renderer owns a public Neon frame. Keep those two frame latches
+; independent so neither path can consume the other's Begin/End pair.
+Global neon_hwInFrame.i = 0
 
 ; ---- optional primitive backend -------------------------------------
 ; The widget layer below is intentionally renderer-neutral.  Normally its
@@ -325,6 +329,8 @@ Global gNeonMeasureActive.i       = 0
 ; external renderer installs all four callbacks atomically and then owns
 ; the public lifecycle without calling these public procedures recursively.
 Global gNeonLifecycleMode.i       = #NEON_BACKEND_NATIVE
+Global gNeonLifecyclePrepared.i   = 0
+Global gNeonPreparedOwnerPending.i = 0
 Declare.i neon_LifecycleInitUnbound()
 Declare.i neon_LifecycleBeginUnbound(colour.i)
 Declare.i neon_LifecycleEndUnbound()
@@ -686,6 +692,41 @@ Procedure.i neon_LifecycleShutdownUnbound()
   ProcedureReturn #NEON_ERR_BACKEND
 EndProcedure
 
+Procedure neon_LifecycleRestoreNative()
+  gNeonLifecycleInit = @neon_LifecycleInitUnbound
+  gNeonLifecycleBegin = @neon_LifecycleBeginUnbound
+  gNeonLifecycleEnd = @neon_LifecycleEndUnbound
+  gNeonLifecycleShutdown = @neon_LifecycleShutdownUnbound
+  gNeonLifecycleError = #NEON_OK
+  gNeonLifecycleMode = #NEON_BACKEND_NATIVE
+  gNeonLifecyclePrepared = 0
+EndProcedure
+
+; A prepared external renderer borrows an already-live native V3D context.
+; After it shuts down, the caller must destroy its Vulkan device/target and
+; call NeonShutdown once more to release that returned native context.
+Procedure.i NeonLifecyclePreparedOwnerPending()
+  ProcedureReturn gNeonPreparedOwnerPending
+EndProcedure
+
+Procedure.i neon_PreparedInitRollback()
+  Protected r.i
+  If gNeonLifecyclePrepared = 0 Or gNeonLifecycleShutdown = 0
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  r = gNeonLifecycleShutdown()
+  If r <> #NEON_OK
+    gNeonLifecycleError = r
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  NeonDrawBackendClear()
+  neon_LifecycleRestoreNative()
+  neon_inFrame = 0
+  gNeonReady = 1
+  gNeonPreparedOwnerPending = 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
 ; Install one complete lifecycle family. The callback ABI is deliberately
 ; small: Init(), Begin(colour), End(), Shutdown(). The external owner may
 ; use its own prepared Vulkan/display resources; Neon only dispatches the
@@ -705,6 +746,33 @@ Procedure.i NeonLifecycleInstall(initProc.i, beginProc.i, endProc.i, shutdownPro
   gNeonLifecycleShutdown = shutdownProc
   gNeonLifecycleError = #NEON_OK
   gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
+  gNeonLifecyclePrepared = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; A caller that already owns a native V3D context and a complete external
+; draw backend may transfer that prepared context to the public lifecycle.
+; This opt-in is distinct from NeonLifecycleInstall's unprepared contract.
+; Successful NeonShutdown retires the external renderer and returns the native
+; context to its caller; a second native NeonShutdown releases that context after
+; the caller destroys its Vulkan objects. A failed external Init does likewise.
+Procedure.i NeonLifecycleInstallPrepared(initProc.i, beginProc.i, endProc.i, shutdownProc.i)
+  If gNeonLifecycleMode <> #NEON_BACKEND_NATIVE Or gNeonReady = 0 Or v3d_owner = 0 Or neon_inFrame <> 0 Or neon_hwInFrame <> 0 Or NeonDrawBackendActive() = 0
+    neon_err = #NEON_ERR_BACKEND
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  If initProc = 0 Or beginProc = 0 Or endProc = 0 Or shutdownProc = 0
+    neon_err = #NEON_ERR_ARGS
+    ProcedureReturn #NEON_ERR_ARGS
+  EndIf
+  gNeonLifecycleInit = initProc
+  gNeonLifecycleBegin = beginProc
+  gNeonLifecycleEnd = endProc
+  gNeonLifecycleShutdown = shutdownProc
+  gNeonLifecycleError = #NEON_OK
+  gNeonLifecyclePrepared = 1
+  gNeonPreparedOwnerPending = 0
+  gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -713,12 +781,7 @@ Procedure.i NeonLifecycleUseNative()
     neon_err = #NEON_ERR_BACKEND
     ProcedureReturn #NEON_ERR_BACKEND
   EndIf
-  gNeonLifecycleInit = @neon_LifecycleInitUnbound
-  gNeonLifecycleBegin = @neon_LifecycleBeginUnbound
-  gNeonLifecycleEnd = @neon_LifecycleEndUnbound
-  gNeonLifecycleShutdown = @neon_LifecycleShutdownUnbound
-  gNeonLifecycleError = #NEON_OK
-  gNeonLifecycleMode = #NEON_BACKEND_NATIVE
+  neon_LifecycleRestoreNative()
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -1327,7 +1390,7 @@ EndProcedure
 ; and pool check happens before the current V3D state is changed.  If one of
 ; the V3D setters nevertheless refuses, the old complete geometry is restored
 ; before the error is returned.  Surface globals are published last.
-Procedure.i NeonRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.i)
+Procedure.i NeonHardwareRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.i)
   Protected pw.i
   Protected ph.i
   Protected cx.i
@@ -1350,7 +1413,7 @@ Procedure.i NeonRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.
     neon_err = #NEON_ERR_ARENA
     ProcedureReturn #NEON_ERR_ARENA
   EndIf
-  If neon_inFrame <> 0
+  If neon_hwInFrame <> 0
     neon_err = #NEON_ERR_INFRAME
     ProcedureReturn #NEON_ERR_INFRAME
   EndIf
@@ -1453,6 +1516,16 @@ Procedure.i NeonRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.
   neon_cy = cy
   neon_err = #NEON_OK
   ProcedureReturn #NEON_OK
+EndProcedure
+
+; Public retargeting remains forbidden throughout any public Neon frame. The
+; Vulkan backend uses the private entry above for its nested native submit.
+Procedure.i NeonRebindSurface(base.i, w.i, h.i, pitch.i, bytes.i, outFmt.i, rot.i)
+  If neon_inFrame <> 0
+    neon_err = #NEON_ERR_INFRAME
+    ProcedureReturn #NEON_ERR_INFRAME
+  EndIf
+  ProcedureReturn NeonHardwareRebindSurface(base, w, h, pitch, bytes, outFmt, rot)
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -2179,6 +2252,7 @@ EndProcedure
 
 Procedure.i NeonInit()
   Protected r.i
+  Protected rollbackRc.i
   Protected p.i
   Protected n.i
   Protected maxVa.i
@@ -2198,12 +2272,19 @@ Procedure.i NeonInit()
     r = gNeonLifecycleInit()
     gNeonLifecycleError = r
     If r <> #NEON_OK
+      If gNeonLifecyclePrepared <> 0
+        rollbackRc = neon_PreparedInitRollback()
+        If rollbackRc = #NEON_OK : gNeonLifecycleError = r : EndIf
+      EndIf
       neon_err = #NEON_ERR_BACKEND
       ProcedureReturn #NEON_ERR_BACKEND
     EndIf
     If NeonDrawBackendActive() = 0
       gNeonLifecycleError = #NEON_ERR_BACKEND
-      If gNeonLifecycleShutdown <> 0
+      If gNeonLifecyclePrepared <> 0
+        rollbackRc = neon_PreparedInitRollback()
+        If rollbackRc = #NEON_OK : gNeonLifecycleError = #NEON_ERR_BACKEND : EndIf
+      ElseIf gNeonLifecycleShutdown <> 0
         gNeonLifecycleShutdown()
       EndIf
       neon_err = #NEON_ERR_BACKEND
@@ -2659,7 +2740,15 @@ Procedure.i NeonShutdown()
     EndIf
     NeonDrawBackendClear()
     neon_inFrame = 0
-    gNeonReady = 0
+    If gNeonLifecyclePrepared <> 0
+      ; The caller still owns the Vulkan device/target and must destroy them
+      ; before releasing the native V3D context it lent to this adapter.
+      neon_LifecycleRestoreNative()
+      gNeonReady = 1
+      gNeonPreparedOwnerPending = 1
+    Else
+      gNeonReady = 0
+    EndIf
     neon_err = #NEON_OK
     ProcedureReturn #NEON_OK
   EndIf
@@ -2673,7 +2762,9 @@ Procedure.i NeonShutdown()
     ProcedureReturn #NEON_ERR_V3D
   EndIf
   neon_inFrame = 0
+  neon_hwInFrame = 0
   gNeonReady   = 0
+  gNeonPreparedOwnerPending = 0
   neon_mapBase = 0 : neon_mapBytes = 0
   neon_extraMapBase = 0
   neon_extraMapBytes = 0
@@ -2803,33 +2894,13 @@ EndProcedure
 ;  file's packed AARRGGBB with no channel swap. See the channel-order
 ;  section above for why the shader path is the other way round.
 ; ----------------------------------------------------------------------
-Procedure.i NeonFrameBegin(colour.i)
+; Internal native entry. The Vulkan backend uses this after closing and
+; validating its command list; it never dispatches back through the public
+; external lifecycle that may have initiated the submission.
+Procedure.i NeonHardwareFrameBegin(colour.i)
   Protected r.i
   Protected t0.i
   Protected hz.i
-
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If gNeonReady = 0
-      neon_err = #NEON_ERR_ARENA
-      ProcedureReturn #NEON_ERR_ARENA
-    EndIf
-    If neon_inFrame <> 0
-      neon_err = #NEON_ERR_INFRAME
-      ProcedureReturn #NEON_ERR_INFRAME
-    EndIf
-    If gNeonLifecycleBegin = 0
-      neon_err = #NEON_ERR_BACKEND
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleBegin(colour)
-    gNeonLifecycleError = r
-    If r <> #NEON_OK
-      neon_err = #NEON_ERR_BACKEND
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    neon_inFrame = 1
-    ProcedureReturn #NEON_OK
-  EndIf
 
   ; THE GUARD IS NOT DECORATION. V3dCounterHz() reads CNTFRQ_EL0, which
   ; is 54,000,000 on this part and ZERO on a part where nothing set it.
@@ -2846,9 +2917,13 @@ Procedure.i NeonFrameBegin(colour.i)
     neon_err = #NEON_ERR_ARENA
     ProcedureReturn #NEON_ERR_ARENA
   EndIf
-  If neon_inFrame <> 0
+  If neon_hwInFrame <> 0
     neon_err = #NEON_ERR_INFRAME
     ProcedureReturn #NEON_ERR_INFRAME
+  EndIf
+  If v3d_owner = 0
+    neon_err = #NEON_ERR_V3D
+    ProcedureReturn #NEON_ERR_V3D
   EndIf
 
   neon_nDraws   = 0
@@ -2891,9 +2966,44 @@ Procedure.i NeonFrameBegin(colour.i)
     ProcedureReturn #NEON_ERR_LIST
   EndIf
 
-  neon_inFrame = 1
+  neon_hwInFrame = 1
   gNeonUsBegin = (V3dTicks() - t0) / hz
   ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonFrameBegin(colour.i)
+  Protected r.i
+
+  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
+    If gNeonReady = 0
+      neon_err = #NEON_ERR_ARENA
+      ProcedureReturn #NEON_ERR_ARENA
+    EndIf
+    If neon_inFrame <> 0
+      neon_err = #NEON_ERR_INFRAME
+      ProcedureReturn #NEON_ERR_INFRAME
+    EndIf
+    If gNeonLifecycleBegin = 0
+      neon_err = #NEON_ERR_BACKEND
+      ProcedureReturn #NEON_ERR_BACKEND
+    EndIf
+    r = gNeonLifecycleBegin(colour)
+    gNeonLifecycleError = r
+    If r <> #NEON_OK
+      neon_err = #NEON_ERR_BACKEND
+      ProcedureReturn #NEON_ERR_BACKEND
+    EndIf
+    neon_inFrame = 1
+    ProcedureReturn #NEON_OK
+  EndIf
+
+  If neon_inFrame <> 0
+    neon_err = #NEON_ERR_INFRAME
+    ProcedureReturn #NEON_ERR_INFRAME
+  EndIf
+  r = NeonHardwareFrameBegin(colour)
+  If r = #NEON_OK : neon_inFrame = 1 : EndIf
+  ProcedureReturn r
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -2917,42 +3027,21 @@ EndProcedure
 ;  vertex arena on a frame that drew four rectangles would be most of
 ;  the frame time on a cacheable run.
 ; ----------------------------------------------------------------------
-Procedure.i NeonFrameEnd()
+Procedure.i NeonHardwareFrameEnd()
   Protected r.i
   Protected t0.i
   Protected hz.i
-
-  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
-    If neon_inFrame = 0
-      neon_err = #NEON_ERR_NOFRAME
-      ProcedureReturn #NEON_ERR_NOFRAME
-    EndIf
-    If gNeonLifecycleEnd = 0
-      neon_inFrame = 0
-      neon_err = #NEON_ERR_BACKEND
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    r = gNeonLifecycleEnd()
-    gNeonLifecycleError = r
-    neon_inFrame = 0
-    If r <> #NEON_OK
-      neon_err = #NEON_ERR_BACKEND
-      ProcedureReturn #NEON_ERR_BACKEND
-    EndIf
-    neon_err = #NEON_OK
-    ProcedureReturn #NEON_OK
-  EndIf
 
   hz = V3dCounterHz() / 1000000
   If hz < 1
     hz = 1
   EndIf
   t0 = V3dTicks()
-  If neon_inFrame = 0
+  If neon_hwInFrame = 0
     neon_err = #NEON_ERR_NOFRAME
     ProcedureReturn #NEON_ERR_NOFRAME
   EndIf
-  neon_inFrame = 0
+  neon_hwInFrame = 0
 
   r = V3dBclFinish()
   If r <> #V3D_OK
@@ -3009,6 +3098,39 @@ Procedure.i NeonFrameEnd()
   gNeonUsRender = (V3dTicks() - t0) / hz
 
   ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonFrameEnd()
+  Protected r.i
+
+  If gNeonLifecycleMode = #NEON_BACKEND_EXTERNAL
+    If neon_inFrame = 0
+      neon_err = #NEON_ERR_NOFRAME
+      ProcedureReturn #NEON_ERR_NOFRAME
+    EndIf
+    If gNeonLifecycleEnd = 0
+      neon_inFrame = 0
+      neon_err = #NEON_ERR_BACKEND
+      ProcedureReturn #NEON_ERR_BACKEND
+    EndIf
+    r = gNeonLifecycleEnd()
+    gNeonLifecycleError = r
+    neon_inFrame = 0
+    If r <> #NEON_OK
+      neon_err = #NEON_ERR_BACKEND
+      ProcedureReturn #NEON_ERR_BACKEND
+    EndIf
+    neon_err = #NEON_OK
+    ProcedureReturn #NEON_OK
+  EndIf
+
+  If neon_inFrame = 0
+    neon_err = #NEON_ERR_NOFRAME
+    ProcedureReturn #NEON_ERR_NOFRAME
+  EndIf
+  r = NeonHardwareFrameEnd()
+  neon_inFrame = 0
+  ProcedureReturn r
 EndProcedure
 
 
