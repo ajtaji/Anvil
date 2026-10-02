@@ -790,9 +790,10 @@ Procedure VulkanConsolePump()
     ProcedureReturn
   EndIf
   avcBannerFrameReady = 1
-  ch = Neon_LineHeight(#NEON_FONT_UI) : cw = Neon_CharWidth(#NEON_FONT_UI)
-  ; The console model owns fixed cell positions. Font-size changes may alter
-  ; glyph fit inside a cell, but never change cursor/row geometry.
+  ; The console grid was sized with DisplayCharWidth/Height. TrueType's
+  ; measured line height can exceed that cell (Lato 16 px measures 19 px),
+  ; so it must affect glyph fit only, never the row or column position.
+  ch = DisplayCharHeight() : cw = DisplayCharWidth()
   If AnvilTrueTypeSlotSelected() >= 0
     ; Append fixed cells into one contiguous vertex stream per ink. This
     ; preserves the model's cursor positions without spending one Vulkan
