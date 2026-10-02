@@ -1433,8 +1433,8 @@ Procedure.i NeonVkChromeGridBatchReserve(neededQuads.i, drawSegments.i)
 EndProcedure
 
 ; Append a previously warmed glyph inside its fixed cell. Preserve the full
-; atlas rectangle: translate a fitting glyph only when its bearing puts it
-; outside the cell, and uniformly shrink oversized bitmap bounds to fit.
+; atlas rectangle and the font's vertical baseline. Fit wide bitmap bounds
+; horizontally without also shrinking their cap height.
 ; The cache key is checked exactly; a miss during a render pass fails before
 ; touching the vertex buffer because raster/upload is pre-frame work.
 Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i)
@@ -1484,28 +1484,20 @@ Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i
   glyphTop = baseline - nvcTTBearingY[entry]
   glyphW = nvcTTW[entry] : glyphH = nvcTTH[entry]
   cellRight = cellX + cellW : cellBottom = cellY + cellH
-  If glyphW > cellW Or glyphH > cellH
-    ; Pick the limiting axis and apply one uniform scale. Keep the complete
-    ; source UV range so narrow console cells cannot cut off glyph strokes.
-    If cellW * glyphH < cellH * glyphW
-      glyphW = cellW : glyphH = (nvcTTH[entry] * glyphW) / nvcTTW[entry]
-    Else
-      glyphH = cellH : glyphW = (nvcTTW[entry] * glyphH) / nvcTTH[entry]
-    EndIf
-    If glyphW < 1 : glyphW = 1 : EndIf
-    If glyphH < 1 : glyphH = 1 : EndIf
-    If glyphW > cellW : glyphW = cellW : EndIf
-    If glyphH > cellH : glyphH = cellH : EndIf
-    glyphLeft = cellX + ((cellW - glyphW) / 2)
-    glyphTop = cellY + ((cellH - glyphH) / 2)
+  If glyphW > cellW
+    ; Compress only X and retain the complete source UV rectangle. The
+    ; baseline and bitmap height must match a glyph that already fits.
+    glyphW = cellW
+    glyphLeft = cellX
   Else
-    ; Preserve the existing baseline/advance placement unless its bitmap
-    ; extends beyond a cell edge; then move it only as far as needed.
     If glyphLeft < cellX : glyphLeft = cellX : EndIf
     If glyphLeft + glyphW > cellRight : glyphLeft = cellRight - glyphW : EndIf
-    If glyphTop < cellY : glyphTop = cellY : EndIf
-    If glyphTop + glyphH > cellBottom : glyphTop = cellBottom - glyphH : EndIf
   EndIf
+  ; A truly oversized bitmap is bounded on Y independently; horizontal
+  ; fitting alone never changes its height or vertically centres it.
+  If glyphH > cellH : glyphH = cellH : EndIf
+  If glyphTop < cellY : glyphTop = cellY : EndIf
+  If glyphTop + glyphH > cellBottom : glyphTop = cellBottom - glyphH : EndIf
   glyphRight = glyphLeft + glyphW : glyphBottom = glyphTop + glyphH
   u0 = neon_F32Ratio(nvcTTX[entry], nvcAtlasW)
   v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
