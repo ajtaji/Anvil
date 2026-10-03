@@ -618,8 +618,10 @@ Procedure ScreenDsiReadoptAbandon()
   ConSetRenderer(*gScreenReadoptPaint)
   UartMirrorSetDrain(@ConMirrorDrain)
   gScreenReadoptSuspended = 0
-  ConRepaint()
-  ScrPresentAll()
+  If gScreenDeferFirstFrame = 0
+    ConRepaint()
+    ScrPresentAll()
+  EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -665,10 +667,41 @@ EndProcedure
 ;  changes shape at boot and a screen that does not must be told apart
 ;  from the wire.
 ; ----------------------------------------------------------------------
+; A settings-driven geometry change retires the old GPU target while the
+; previous scanout frame remains on glass. Rebind to the new dimensions before
+; releasing the first-frame gate; a failed rebind stays visibly diagnosed on
+; serial instead of claiming that Vulkan is still driving a live console.
+Procedure.i ScreenStoredGeometryVulkanResume(hadVulkan.i)
+  Define rc.i
+  If hadVulkan = 0 : ProcedureReturn 1 : EndIf
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  rc = VulkanConsoleStart()
+  If rc <> #AVC_OK
+    ConNoRenderer()
+    Print("!! Vulkan could not rebind after stored geometry (code ")
+    PrintDec(rc)
+    PrintN("); screen rendering remains deferred.")
+    ProcedureReturn 0
+  EndIf
+  VulkanConsolePump()
+  If avcFramePresented = 0
+    PrintN("!! Vulkan did not present after stored geometry; screen rendering remains deferred.")
+    If VulkanConsoleReady() <> 0 And VulkanConsoleStop() = 0
+      PrintN("!! Vulkan could not retire the unpresented geometry target.")
+    EndIf
+    ConNoRenderer()
+    ProcedureReturn 0
+  EndIf
+  gScreenDeferFirstFrame = 0
+  CompilerEndIf
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i ScreenApplyStoredGeometry()
   Define rot.i
   Define scale.i
   Define deadline.i
+  Define hadVulkan.i
 
   If gScreen = 0
     ProcedureReturn 0
@@ -696,6 +729,17 @@ Procedure.i ScreenApplyStoredGeometry()
     ProcedureReturn 0
   EndIf
 
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  hadVulkan = VulkanConsoleReady()
+  If hadVulkan <> 0
+    gScreenDeferFirstFrame = 1
+    If VulkanConsoleStop() = 0
+      PrintN("!! Vulkan could not retire its old geometry; screen rendering remains deferred.")
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  CompilerEndIf
+
   BootTimingMark(#BTM_READOPT_BEGIN, rot, scale)
 
   ; ---- HDMI: the magnification, and only the magnification -----------
@@ -709,6 +753,7 @@ Procedure.i ScreenApplyStoredGeometry()
       PrintN("   Rotation is a property of the DSI panel and is applied there only.")
     EndIf
     If scale = gScrScale
+      ScreenStoredGeometryVulkanResume(hadVulkan)
       ProcedureReturn 0
     EndIf
     Print("The settings store asks for magnification ")
@@ -721,10 +766,11 @@ Procedure.i ScreenApplyStoredGeometry()
       PrintN("!! that magnification was refused, so the console was left exactly as")
       PrintN("   it was. Only 1 to 8 are accepted; type screen scale to see what is")
       PrintN("   in the store and screen scale auto to remove it.")
+      ScreenStoredGeometryVulkanResume(hadVulkan)
       ProcedureReturn 0
     EndIf
     BootTimingMark(#BTM_READOPT_DONE, BootTranscriptCount(), BootTranscriptLost())
-    ProcedureReturn 1
+    ProcedureReturn ScreenStoredGeometryVulkanResume(hadVulkan)
   EndIf
 
   ; ---- the DSI panel: in place, without the panel ever stopping ------
@@ -742,6 +788,7 @@ Procedure.i ScreenApplyStoredGeometry()
     PrintN("   console is still exactly as it came up. The rotation must be 0, 90,")
     PrintN("   180 or 270 and the magnification 1 to 8; type screen rotate and")
     PrintN("   screen scale to see what the store actually says.")
+    ScreenStoredGeometryVulkanResume(hadVulkan)
     ProcedureReturn 0
   EndIf
 
@@ -761,6 +808,7 @@ Procedure.i ScreenApplyStoredGeometry()
       PrintN("   controller's list slots now describe the picture on the glass, so")
       PrintN("   a late switch cannot change it. The panel is still scanning and")
       PrintN("   the serial line is unaffected. Type screen rotate to try again.")
+      ScreenStoredGeometryVulkanResume(hadVulkan)
       ProcedureReturn 0
     EndIf
   Wend
@@ -775,7 +823,7 @@ Procedure.i ScreenApplyStoredGeometry()
     PrintN("   are where a hang shows. The serial line and the network console")
     PrintN("   received every byte.")
   EndIf
-  ProcedureReturn 1
+  ProcedureReturn ScreenStoredGeometryVulkanResume(hadVulkan)
 EndProcedure
 
 Procedure.i ScreenUpOn(src.i, index.i)

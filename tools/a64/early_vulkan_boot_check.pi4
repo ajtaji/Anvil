@@ -1,0 +1,53 @@
+#ANVIL_VULKAN_CONSOLE = 1
+#AVC_OK = 0
+
+Global gScreenDeferFirstFrame.i, avcFramePresented.i
+Global gReady.i, gStartResult.i, gPresentResult.i
+Global gStartCalls.i, gPumpCalls.i, gStopCalls.i
+
+Procedure.i VulkanConsoleReady() : ProcedureReturn gReady : EndProcedure
+Procedure.i VulkanConsoleStart()
+  gStartCalls + 1
+  If gStartResult = #AVC_OK : gReady = 1 : avcFramePresented = 0 : EndIf
+  ProcedureReturn gStartResult
+EndProcedure
+Procedure VulkanConsolePump()
+  gPumpCalls + 1
+  avcFramePresented = gPresentResult
+EndProcedure
+Procedure.i VulkanConsoleStop()
+  gStopCalls + 1 : gReady = 0 : ProcedureReturn 1
+EndProcedure
+Procedure ConNoRenderer() : EndProcedure
+__RESUME__
+
+Procedure.i CheckResume()
+  gScreenDeferFirstFrame = 1
+  gReady = 0 : gStartResult = #AVC_OK : gPresentResult = 1
+  gStartCalls = 0 : gPumpCalls = 0 : gStopCalls = 0
+  If ScreenStoredGeometryVulkanResume(1) <> 1 : ProcedureReturn 1 : EndIf
+  If gScreenDeferFirstFrame <> 0 Or gReady <> 1 : ProcedureReturn 2 : EndIf
+  If gStartCalls <> 1 Or gPumpCalls <> 1 Or gStopCalls <> 0 : ProcedureReturn 3 : EndIf
+
+  gScreenDeferFirstFrame = 1
+  gReady = 0 : gStartResult = 17 : gPresentResult = 1
+  gStartCalls = 0 : gPumpCalls = 0 : gStopCalls = 0
+  If ScreenStoredGeometryVulkanResume(1) <> 0 : ProcedureReturn 4 : EndIf
+  If gScreenDeferFirstFrame <> 1 Or gReady <> 0 : ProcedureReturn 5 : EndIf
+  If gStartCalls <> 1 Or gPumpCalls <> 0 Or gStopCalls <> 0 : ProcedureReturn 6 : EndIf
+
+  gScreenDeferFirstFrame = 1
+  gReady = 0 : gStartResult = #AVC_OK : gPresentResult = 0
+  gStartCalls = 0 : gPumpCalls = 0 : gStopCalls = 0
+  If ScreenStoredGeometryVulkanResume(1) <> 0 : ProcedureReturn 7 : EndIf
+  If gScreenDeferFirstFrame <> 1 Or gReady <> 0 : ProcedureReturn 8 : EndIf
+  If gStartCalls <> 1 Or gPumpCalls <> 1 Or gStopCalls <> 1 : ProcedureReturn 9 : EndIf
+
+  gScreenDeferFirstFrame = 0
+  gReady = 1 : gStartCalls = 0 : gPumpCalls = 0 : gStopCalls = 0
+  If ScreenStoredGeometryVulkanResume(0) <> 1 : ProcedureReturn 10 : EndIf
+  If gReady <> 1 Or gStartCalls <> 0 Or gPumpCalls <> 0 Or gStopCalls <> 0 : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+PokeI($300000, CheckResume())
