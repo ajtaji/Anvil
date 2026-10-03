@@ -480,7 +480,14 @@ EndProcedure
 Procedure BannerClockLayout()
   Define left.i
   Define right.i
+  Define savedScale.i
+  ; The identity row has fixed banner geometry even when the console uses
+  ; a larger text scale. This also lets deferred Vulkan startup calculate
+  ; its caption bounds without drawing the CPU framebuffer banner.
+  savedScale = dsp_scale
+  DisplayScale(1)
   left = 28 + DisplayTextWidth(AnvilBuildLabel(#ANVIL_BUILD, #ANVIL_BUILD_DATE, #ANVIL_BUILD_TIME)) + #BANNER_CLOCK_GAP
+  DisplayScale(savedScale)
   right = DisplayWidth() - #ANVIL_PIC_W - #LOGO_MARGIN - 16
   gBannerClockX = left
   gBannerClockW = right - left

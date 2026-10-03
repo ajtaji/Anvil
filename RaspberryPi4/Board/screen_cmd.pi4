@@ -507,6 +507,8 @@ Procedure ScreenRebuildAtGeometry(fontOnly.i)
   DisplayAutoFlush(1)
   gScreenBg = DisplayRGB(0, 0, 40)
   DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
+  BannerClockLayout()
+  BannerClockCopy(@gBannerClockText[0], BannerCaptionLast(), gBannerClockChars)
   If keepVulkan = 0 And gScreenDeferFirstFrame = 0
     DisplayClear(gScreenBg)
     DrawBanner()
@@ -1190,6 +1192,11 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; console grid takes a single boot byte. The embedded TrueType face is
   ; selected before screen acquisition; saved settings may replace it later.
   ScreenFontCellMetricsApply()
+  ; Vulkan owns the first frame, so DrawBanner() is intentionally skipped.
+  ; Initialize the shared caption geometry and text independently of that
+  ; CPU painter; BannerClockTick will replace it with sampled status.
+  BannerClockLayout()
+  BannerClockCopy(@gBannerClockText[0], BannerCaptionLast(), gBannerClockChars)
 
   ; THE BLITTER, BEFORE ANYTHING IS DRAWN. It has to come after the
   ; surface is installed, whichever way it was got, because it is bound
