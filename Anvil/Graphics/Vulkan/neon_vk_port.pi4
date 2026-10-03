@@ -1,0 +1,148 @@
+; Float-coordinate drawing adapter for porting Neon canvas code to Anvil.
+; Include after neon.pi4 and select the Vulkan lifecycle separately. This
+; layer owns no device, display, image, font, or backend selection.
+
+XIncludeFile "RaspberryPi4/Lib/math.pi4"
+
+#NEON_VK_PORT_ERR_CONFIG = -21301
+#NEON_VK_PORT_ERR_TEXT_SCALE = -21302
+
+Global nvpCanvasW.i
+Global nvpCanvasH.i
+Global nvpTargetW.i
+Global nvpTargetH.i
+Global nvpCanvasWf.f
+Global nvpCanvasHf.f
+Global nvpTargetWf.f
+Global nvpTargetHf.f
+Global nvpCameraX.f
+Global nvpCameraY.f
+Global nvpCameraZoom.f = 1.0
+
+Procedure.i nvpRound(v.f)
+  If v < 0.0 : ProcedureReturn -Int(0.5 - v) : EndIf
+  ProcedureReturn Int(v + 0.5)
+EndProcedure
+
+Procedure.i nvpChannel(v.f)
+  If v <= 0.0 : ProcedureReturn 0 : EndIf
+  If v >= 1.0 : ProcedureReturn 255 : EndIf
+  ProcedureReturn Int(v * 255.0 + 0.5)
+EndProcedure
+
+Procedure.i NeonVkPortColour(r.f, g.f, b.f, a.f)
+  ProcedureReturn Neon_RGBA(nvpChannel(r), nvpChannel(g), nvpChannel(b), nvpChannel(a))
+EndProcedure
+
+; Target dimensions are the Vulkan renderer's logical framebuffer extent.
+; The canvas is Neon's virtual coordinate space, independent of that extent.
+Procedure.i NeonVkPortCanvas(canvasW.i, canvasH.i, targetW.i, targetH.i)
+  If canvasW < 1 Or canvasH < 1 Or targetW < 1 Or targetH < 1 Or canvasW > 8192 Or canvasH > 8192 Or targetW > 8192 Or targetH > 8192
+    ProcedureReturn #NEON_VK_PORT_ERR_CONFIG
+  EndIf
+  nvpCanvasW = canvasW : nvpCanvasH = canvasH
+  nvpTargetW = targetW : nvpTargetH = targetH
+  nvpCanvasWf = MathFFromInt(canvasW) : nvpCanvasHf = MathFFromInt(canvasH)
+  nvpTargetWf = MathFFromInt(targetW) : nvpTargetHf = MathFFromInt(targetH)
+  nvpCameraX = 0.0 : nvpCameraY = 0.0 : nvpCameraZoom = 1.0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortCamera(x.f, y.f, zoom.f)
+  If nvpCanvasW = 0 Or zoom <= 0.0
+    ProcedureReturn #NEON_VK_PORT_ERR_CONFIG
+  EndIf
+  nvpCameraX = x : nvpCameraY = y : nvpCameraZoom = zoom
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortFrameBegin(r.f, g.f, b.f, a.f)
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  ProcedureReturn NeonFrameBegin(NeonVkPortColour(r, g, b, a))
+EndProcedure
+
+Procedure.i NeonVkPortFrameEnd()
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  ProcedureReturn NeonFrameEnd()
+EndProcedure
+
+; Matches DrawGLBox's top-left, RGBA, Scaled and IgnoreCamera semantics.
+; Scaled=1 uses the virtual canvas; Scaled=0 uses target coordinates.
+; Extents are converted by rounding both edges, avoiding accumulated drift.
+Procedure.i NeonVkPortBox(x.f, y.f, w.f, h.f, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected spaceW.f, spaceH.f, x0.i, y0.i, x1.i, y1.i
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  If w <= 0.0 Or h <= 0.0 : ProcedureReturn #NEON_OK : EndIf
+  spaceW = nvpTargetWf : spaceH = nvpTargetHf
+  If scaled <> 0 : spaceW = nvpCanvasWf : spaceH = nvpCanvasHf : EndIf
+  If ignoreCamera = 0
+    x = spaceW / 2.0 + ((x - nvpCameraX - spaceW / 2.0) * nvpCameraZoom)
+    y = spaceH / 2.0 + ((y - nvpCameraY - spaceH / 2.0) * nvpCameraZoom)
+    w = w * nvpCameraZoom : h = h * nvpCameraZoom
+  EndIf
+  x0 = nvpRound(x * nvpTargetWf / spaceW)
+  y0 = nvpRound(y * nvpTargetHf / spaceH)
+  x1 = nvpRound((x + w) * nvpTargetWf / spaceW)
+  y1 = nvpRound((y + h) * nvpTargetHf / spaceH)
+  ProcedureReturn Neon_Box(x0, y0, x1 - x0, y1 - y0, NeonVkPortColour(r, g, b, a))
+EndProcedure
+
+; Desktop chrome scissor coordinates are always in the virtual canvas.
+Procedure.i NeonVkPortScissorSet(x.f, y.f, w.f, h.f)
+  Protected x0.i, y0.i, x1.i, y1.i
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  x0 = nvpRound(x * nvpTargetWf / nvpCanvasWf)
+  y0 = nvpRound(y * nvpTargetHf / nvpCanvasHf)
+  x1 = nvpRound((x + w) * nvpTargetWf / nvpCanvasWf)
+  y1 = nvpRound((y + h) * nvpTargetHf / nvpCanvasHf)
+  Neon_ScissorSet(x0, y0, x1 - x0, y1 - y0)
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortScissorClear()
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  Neon_ScissorClear()
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Glyph sizes come from the selected Neon font resource. The current font
+; callbacks cannot stretch a run by an arbitrary canvas ratio or camera zoom.
+Procedure.i nvpTextScaleSupported(scaled.i, ignoreCamera.i)
+  If nvpCanvasW = 0 : ProcedureReturn 0 : EndIf
+  If scaled <> 0 And (nvpCanvasW <> nvpTargetW Or nvpCanvasH <> nvpTargetH)
+    ProcedureReturn 0
+  EndIf
+  If ignoreCamera = 0 And nvpCameraZoom <> 1.0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Text is NUL-terminated UTF-8 and font is an Anvil Neon face slot, not a
+; desktop GLFont pointer. Width and draw use the same installed metrics.
+Procedure.f NeonVkPortTextWidth(font.i, *s, scaled.i)
+  If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn -1.0 : EndIf
+  ProcedureReturn MathFFromInt(Neon_TextWidth(font, *s))
+EndProcedure
+
+Procedure.i NeonVkPortText(font.i, x.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  If nvpTextScaleSupported(scaled, ignoreCamera) = 0
+    ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE
+  EndIf
+  If ignoreCamera = 0
+    x = x - nvpCameraX : y = y - nvpCameraY
+  EndIf
+  ProcedureReturn Neon_Text(font, nvpRound(x), nvpRound(y), *s, NeonVkPortColour(r, g, b, a))
+EndProcedure
+
+Procedure.i NeonVkPortTextRight(font.i, xRight.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected width.f = NeonVkPortTextWidth(font, *s, scaled)
+  If width < 0.0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
+  ProcedureReturn NeonVkPortText(font, xRight - width, y, *s, r, g, b, a, scaled, ignoreCamera)
+EndProcedure
+
+; Preserve the desktop order x, width, y.
+Procedure.i NeonVkPortTextCentre(font.i, x.f, w.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected width.f = NeonVkPortTextWidth(font, *s, scaled)
+  If width < 0.0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
+  ProcedureReturn NeonVkPortText(font, x + (w - width) / 2.0, y, *s, r, g, b, a, scaled, ignoreCamera)
+EndProcedure

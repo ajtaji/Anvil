@@ -1,0 +1,180 @@
+; Emitted-code gate for the float Neon canvas adapter. The spies stand in
+; for the renderer-neutral Neon entry points; no display hardware is used.
+
+EnableFloatingPoint
+
+#NEON_OK = 0
+
+Global nvpTestBeginCalls.i
+Global nvpTestEndCalls.i
+Global nvpTestBoxCalls.i
+Global nvpTestSetCalls.i
+Global nvpTestClearCalls.i
+Global nvpTestColour.i
+Global nvpTestTextCalls.i
+Global nvpTestTextFont.i
+Global nvpTestTextPointer.i
+Global nvpTestSpriteGen.i
+Global nvpTestSpriteUploadCalls.i
+Global nvpTestSpriteClearCalls.i
+Global nvpTestSpriteDrawCalls.i
+Global nvpTestSpriteId.i
+Global nvpTestSourceX.i
+Global nvpTestSourceY.i
+Global nvpTestSourceW.i
+Global nvpTestSourceH.i
+Global nvpTestAngle.i
+Global nvpTestCameraX.i
+Global nvpTestCameraY.i
+Global nvpTestZoom.i
+Global nvpTestIgnoreCamera.i
+Global nvpTestX.i
+Global nvpTestY.i
+Global nvpTestW.i
+Global nvpTestH.i
+
+Procedure.i Neon_RGBA(r.i, g.i, b.i, a.i)
+  ProcedureReturn ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
+EndProcedure
+
+Procedure.i NeonFrameBegin(colour.i)
+  nvpTestBeginCalls = nvpTestBeginCalls + 1
+  nvpTestColour = colour
+  ProcedureReturn 17
+EndProcedure
+
+Procedure.i NeonFrameEnd()
+  nvpTestEndCalls = nvpTestEndCalls + 1
+  ProcedureReturn 18
+EndProcedure
+
+Procedure.i Neon_Box(x.i, y.i, w.i, h.i, colour.i)
+  nvpTestBoxCalls = nvpTestBoxCalls + 1
+  nvpTestX = x : nvpTestY = y : nvpTestW = w : nvpTestH = h
+  nvpTestColour = colour
+  ProcedureReturn 19
+EndProcedure
+
+Procedure.i Neon_TextWidth(font.i, *s)
+  nvpTestTextFont = font : nvpTestTextPointer = *s
+  ProcedureReturn 32
+EndProcedure
+
+Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i)
+  nvpTestTextCalls = nvpTestTextCalls + 1
+  nvpTestTextFont = font : nvpTestTextPointer = *s
+  nvpTestX = x : nvpTestY = y : nvpTestColour = colour
+  ProcedureReturn 23
+EndProcedure
+
+Procedure Neon_ScissorSet(x.i, y.i, w.i, h.i)
+  nvpTestSetCalls = nvpTestSetCalls + 1
+  nvpTestX = x : nvpTestY = y : nvpTestW = w : nvpTestH = h
+EndProcedure
+
+Procedure Neon_ScissorClear()
+  nvpTestClearCalls = nvpTestClearCalls + 1
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *pixels, width.i, height.i)
+  nvpTestSpriteUploadCalls = nvpTestSpriteUploadCalls + 1
+  If width = 13 : ProcedureReturn -99 : EndIf
+  nvpTestSpriteGen = nvpTestSpriteGen + 1
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *pixels, width.i, height.i)
+  ProcedureReturn NeonVkChromeImageSpriteReplaceId(id, *pixels, width, height)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteGenerationId(id.i)
+  ProcedureReturn nvpTestSpriteGen
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteClearId(id.i)
+  nvpTestSpriteClearCalls = nvpTestSpriteClearCalls + 1
+  nvpTestSpriteGen = nvpTestSpriteGen + 1
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  nvpTestSpriteDrawCalls = nvpTestSpriteDrawCalls + 1
+  nvpTestSpriteId = id : nvpTestX = x : nvpTestY = y
+  nvpTestSourceX = sourceX : nvpTestSourceY = sourceY
+  nvpTestSourceW = sourceW : nvpTestSourceH = sourceH
+  nvpTestW = drawW : nvpTestH = drawH : nvpTestColour = colour
+  nvpTestAngle = angleQ16 : nvpTestCameraX = cameraX : nvpTestCameraY = cameraY
+  nvpTestZoom = zoomQ16 : nvpTestIgnoreCamera = ignoreCamera
+  ProcedureReturn 31
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
+
+Procedure.i Main()
+  Protected textByte.a = 65
+  Protected pixel.a = 255
+  Protected sprite.NeonVkPortSpriteRef
+  If NeonVkPortFrameBegin(0.0, 0.0, 0.0, 1.0) <> #NEON_VK_PORT_ERR_CONFIG : ProcedureReturn 1 : EndIf
+  If NeonVkPortBox(0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_PORT_ERR_CONFIG : ProcedureReturn 2 : EndIf
+  If NeonVkPortCanvas(0, 600, 1600, 1200) <> #NEON_VK_PORT_ERR_CONFIG : ProcedureReturn 3 : EndIf
+  If NeonVkPortCanvas(800, 600, 1600, 1200) <> #NEON_OK : ProcedureReturn 4 : EndIf
+  If NeonVkPortCamera(10.0, 20.0, 2.0) <> #NEON_OK : ProcedureReturn 5 : EndIf
+  If NeonVkPortFrameBegin(0.5, -0.1, 2.0, 0.25) <> 17 : ProcedureReturn 6 : EndIf
+  If nvpTestBeginCalls <> 1 Or nvpTestColour <> $408000FF : ProcedureReturn 7 : EndIf
+  If NeonVkPortBox(100.0, 100.0, 50.0, 20.0, 1.0, 0.0, 0.5, 1.0, 1, 0) <> 19 : ProcedureReturn 8 : EndIf
+  If nvpTestX <> -440 Or nvpTestY <> -280 Or nvpTestW <> 200 Or nvpTestH <> 80 : ProcedureReturn 9 : EndIf
+  If nvpTestColour <> $FFFF0080 : ProcedureReturn 10 : EndIf
+  If NeonVkPortBox(10.25, 20.25, 30.5, 40.5, 0.0, 1.0, 0.0, 1.0, 1, 1) <> 19 : ProcedureReturn 11 : EndIf
+  If nvpTestX <> 21 Or nvpTestY <> 41 Or nvpTestW <> 61 Or nvpTestH <> 81 : ProcedureReturn 12 : EndIf
+  If NeonVkPortBox(1.0, 1.0, 0.0, 10.0, 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_OK : ProcedureReturn 13 : EndIf
+  If nvpTestBoxCalls <> 2 : ProcedureReturn 14 : EndIf
+  If NeonVkPortScissorSet(-5.25, 2.5, 20.0, 10.0) <> #NEON_OK : ProcedureReturn 15 : EndIf
+  If nvpTestSetCalls <> 1 Or nvpTestX <> -11 Or nvpTestY <> 5 Or nvpTestW <> 41 Or nvpTestH <> 20 : ProcedureReturn 16 : EndIf
+  If NeonVkPortScissorClear() <> #NEON_OK Or nvpTestClearCalls <> 1 : ProcedureReturn 17 : EndIf
+  If NeonVkPortFrameEnd() <> 18 Or nvpTestEndCalls <> 1 : ProcedureReturn 18 : EndIf
+  If NeonVkPortTextWidth(2, @textByte, 1) <> -1.0 : ProcedureReturn 19 : EndIf
+  If NeonVkPortText(2, 10.0, 20.0, @textByte, 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_PORT_ERR_TEXT_SCALE : ProcedureReturn 20 : EndIf
+  If NeonVkPortText(2, 11.5, 20.5, @textByte, 0.5, 0.0, 1.0, 1.0, 0, 1) <> 23 : ProcedureReturn 21 : EndIf
+  If nvpTestX <> 12 Or nvpTestY <> 21 Or nvpTestTextFont <> 2 Or nvpTestTextPointer <> @textByte : ProcedureReturn 22 : EndIf
+  If nvpTestColour <> $FF8000FF : ProcedureReturn 23 : EndIf
+  If NeonVkPortText(2, 10.0, 20.0, @textByte, 1.0, 1.0, 1.0, 1.0, 0, 0) <> #NEON_VK_PORT_ERR_TEXT_SCALE : ProcedureReturn 24 : EndIf
+  If NeonVkPortCanvas(1600, 1200, 1600, 1200) <> #NEON_OK : ProcedureReturn 25 : EndIf
+  If NeonVkPortTextWidth(3, @textByte, 1) <> 32.0 : ProcedureReturn 26 : EndIf
+  If NeonVkPortTextRight(3, 100.0, 25.0, @textByte, 0.0, 1.0, 0.0, 1.0, 1, 1) <> 23 : ProcedureReturn 27 : EndIf
+  If nvpTestX <> 68 Or nvpTestY <> 25 Or nvpTestColour <> $FF00FF00 : ProcedureReturn 28 : EndIf
+  If NeonVkPortTextCentre(3, 100.0, 80.0, 25.0, @textByte, 1.0, 0.0, 0.0, 1.0, 1, 1) <> 23 : ProcedureReturn 29 : EndIf
+  If nvpTestX <> 124 Or nvpTestY <> 25 Or nvpTestColour <> $FFFF0000 : ProcedureReturn 30 : EndIf
+  If NeonVkPortCamera(5.0, 7.0, 1.0) <> #NEON_OK : ProcedureReturn 56 : EndIf
+  If NeonVkPortText(3, 100.0, 50.0, @textByte, 1.0, 1.0, 1.0, 1.0, 1, 0) <> 23 : ProcedureReturn 57 : EndIf
+  If nvpTestX <> 95 Or nvpTestY <> 43 : ProcedureReturn 58 : EndIf
+  If nvpTestTextCalls <> 4 : ProcedureReturn 31 : EndIf
+  If NeonVkPortSpriteUpload(@sprite, 2, @pixel, 64, 32, 0) <> 0 : ProcedureReturn 32 : EndIf
+  If sprite\id <> 2 Or sprite\width <> 64 Or sprite\height <> 32 Or sprite\generation <> 1 : ProcedureReturn 33 : EndIf
+  If NeonVkPortSpriteUpload(@sprite, 2, @pixel, 13, 32, 0) <> -99 : ProcedureReturn 59 : EndIf
+  If sprite\id <> 2 Or sprite\width <> 64 Or sprite\height <> 32 Or sprite\generation <> 1 : ProcedureReturn 60 : EndIf
+  If NeonVkPortCamera(10.0, 20.0, 2.0) <> #NEON_OK : ProcedureReturn 34 : EndIf
+  If NeonVkPortSprite(@sprite, 100.0, 50.0, 0.5, 1.5, 0.5, 0.25, 1.0, 1.0, 1, -1.0, -1.0, -1.0, -1.0, 0) <> 31 : ProcedureReturn 35 : EndIf
+  If nvpTestSpriteId <> 2 Or nvpTestX <> 100 Or nvpTestY <> 50 Or nvpTestW <> 96 Or nvpTestH <> 48 : ProcedureReturn 36 : EndIf
+  If nvpTestSourceX <> 0 Or nvpTestSourceY <> 0 Or nvpTestSourceW <> 64 Or nvpTestSourceH <> 32 : ProcedureReturn 37 : EndIf
+  If nvpTestAngle <> 32768 Or nvpTestCameraX <> 10 Or nvpTestCameraY <> 20 Or nvpTestZoom <> 131072 Or nvpTestIgnoreCamera <> 0 : ProcedureReturn 38 : EndIf
+  If nvpTestColour <> $FF8040FF : ProcedureReturn 39 : EndIf
+  If NeonVkPortSprite(@sprite, 100.0, 50.0, 0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1, 8.0, 4.0, 16.0, 8.0, 1) <> 31 : ProcedureReturn 40 : EndIf
+  If nvpTestSourceX <> 8 Or nvpTestSourceY <> 4 Or nvpTestSourceW <> 16 Or nvpTestSourceH <> 8 Or nvpTestW <> 32 Or nvpTestH <> 16 : ProcedureReturn 41 : EndIf
+  If NeonVkPortSprite(@sprite, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 60.0, 0.0, 8.0, 8.0, 1) <> #NEON_VK_PORT_ERR_SPRITE : ProcedureReturn 42 : EndIf
+  If NeonVkPortSprite(@sprite, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 8.5, 0.0, 8.0, 8.0, 1) <> #NEON_VK_PORT_ERR_SPRITE : ProcedureReturn 43 : EndIf
+  If nvpTestSpriteDrawCalls <> 2 : ProcedureReturn 44 : EndIf
+  If NeonVkPortCanvas(800, 600, 1600, 1200) <> #NEON_OK : ProcedureReturn 45 : EndIf
+  If NeonVkPortCamera(5.0, 7.0, 1.25) <> #NEON_OK : ProcedureReturn 46 : EndIf
+  If NeonVkPortSprite(@sprite, 10.0, 20.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, -1.0, -1.0, -1.0, -1.0, 0) <> 31 : ProcedureReturn 47 : EndIf
+  If nvpTestX <> 20 Or nvpTestY <> 40 Or nvpTestW <> 128 Or nvpTestH <> 64 Or nvpTestCameraX <> 10 Or nvpTestCameraY <> 14 Or nvpTestZoom <> 81920 : ProcedureReturn 48 : EndIf
+  If NeonVkPortCanvas(800, 600, 1600, 1000) <> #NEON_OK : ProcedureReturn 49 : EndIf
+  If NeonVkPortSprite(@sprite, 10.0, 20.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1, -1.0, -1.0, -1.0, -1.0, 1) <> #NEON_VK_PORT_ERR_SPRITE_SCALE : ProcedureReturn 50 : EndIf
+  If NeonVkPortSprite(@sprite, 10.0, 20.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, -1.0, -1.0, -1.0, -1.0, 1) <> 31 : ProcedureReturn 54 : EndIf
+  If nvpTestX <> 20 Or nvpTestY <> 33 Or nvpTestW <> 128 Or nvpTestH <> 53 : ProcedureReturn 55 : EndIf
+  nvpTestSpriteGen = nvpTestSpriteGen + 1
+  If NeonVkPortSprite(@sprite, 10.0, 20.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, -1.0, -1.0, -1.0, -1.0, 1) <> #NEON_VK_PORT_ERR_SPRITE_STALE : ProcedureReturn 51 : EndIf
+  If NeonVkPortSpriteClear(@sprite) <> #NEON_VK_PORT_ERR_SPRITE_STALE : ProcedureReturn 52 : EndIf
+  If nvpTestSpriteDrawCalls <> 4 Or nvpTestSpriteClearCalls <> 0 : ProcedureReturn 53 : EndIf
+  ProcedureReturn 0
+EndProcedure
