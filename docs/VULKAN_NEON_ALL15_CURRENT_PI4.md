@@ -27,6 +27,15 @@ The exact source and payload digests, board conditions, report, slab, and
 screenshot digests are in
 `docs/evidence/vulkan-neon-all15-build242-20261002/manifest.json`.
 
+A later source-parity run fed lowercase `project` to the Neon panel procedure
+and kept the desktop engine's uppercase `PROJECT` output. Its current source
+compiled and the Pi 4 again matched all 245,760 native reference pixel bytes
+and passed all 124 widget checks. The draw-side TrueType layout now uses the
+same single-line width rule as its measurement callback. This edge-positioned
+text behavior was code-reviewed and compiled but is outside the 15 pixel
+scenes. Capture and source hashes are in
+`docs/evidence/neon-source-parity-build242-20261002/manifest.json`.
+
 This is Pi 4 hardware evidence for Anvil's implemented Neon-derived graphics
 path, not a proof of desktop Neon Arcade Vulkan support or another board's
 backend. The 3,505 boxes are batched into one Vulkan draw; this proof does not
