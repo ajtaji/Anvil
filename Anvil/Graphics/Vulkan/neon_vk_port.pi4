@@ -6,6 +6,11 @@ XIncludeFile "RaspberryPi4/Lib/math.pi4"
 
 #NEON_VK_PORT_ERR_CONFIG = -21301
 #NEON_VK_PORT_ERR_TEXT_SCALE = -21302
+#NEON_VK_PORT_ERR_GEOMETRY = -21306
+#NEON_VK_PORT_ERR_GEOMETRY_CAPACITY = -21307
+#NEON_VK_PORT_ERR_BATCH = -21308
+#NEON_VK_PORT_MAX_POLYGON_SIDES = 2048
+#NEON_VK_PORT_MAX_LINE_VERTICES = 4096
 
 Global nvpCanvasW.i
 Global nvpCanvasH.i
@@ -18,6 +23,7 @@ Global nvpTargetHf.f
 Global nvpCameraX.f
 Global nvpCameraY.f
 Global nvpCameraZoom.f = 1.0
+Global nvpBatchActive.i
 
 Procedure.i nvpRound(v.f)
   If v < 0.0 : ProcedureReturn -Int(0.5 - v) : EndIf
@@ -63,6 +69,7 @@ EndProcedure
 
 Procedure.i NeonVkPortFrameEnd()
   If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
   ProcedureReturn NeonFrameEnd()
 EndProcedure
 
@@ -85,6 +92,80 @@ Procedure.i NeonVkPortBox(x.f, y.f, w.f, h.f, r.f, g.f, b.f, a.f, scaled.i, igno
   x1 = nvpRound((x + w) * nvpTargetWf / spaceW)
   y1 = nvpRound((y + h) * nvpTargetHf / spaceH)
   ProcedureReturn Neon_Box(x0, y0, x1 - x0, y1 - y0, NeonVkPortColour(r, g, b, a))
+EndProcedure
+
+
+; Match DrawGLPolygon's centre/radii, clockwise screen-space vertices,
+; virtual-canvas switch and camera order. Coordinates become whole target
+; pixels. A closed outline uses the Vulkan line-list route.
+Procedure.i NeonVkPortPolygon(x.f, y.f, radiusX.f, radiusY.f, sides.i, r.f, g.f, b.f, a.f, solid.i, scaled.i, ignoreCamera.i)
+  Protected spaceW.f, spaceH.f, ratioX.f, ratioY.f, angle.f
+  Protected centerX.i, centerY.i, px.i, py.i, firstX.i, firstY.i, lastX.i, lastY.i
+  Protected i.i, rc.i
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  If sides < 3 : ProcedureReturn #NEON_OK : EndIf
+  If sides > #NEON_VK_PORT_MAX_POLYGON_SIDES : ProcedureReturn #NEON_VK_PORT_ERR_GEOMETRY_CAPACITY : EndIf
+  spaceW = nvpTargetWf : spaceH = nvpTargetHf
+  If scaled <> 0 : spaceW = nvpCanvasWf : spaceH = nvpCanvasHf : EndIf
+  If ignoreCamera = 0
+    x = spaceW / 2.0 + ((x - nvpCameraX - spaceW / 2.0) * nvpCameraZoom)
+    y = spaceH / 2.0 + ((y - nvpCameraY - spaceH / 2.0) * nvpCameraZoom)
+    radiusX = radiusX * nvpCameraZoom : radiusY = radiusY * nvpCameraZoom
+  EndIf
+  ratioX = nvpTargetWf / spaceW : ratioY = nvpTargetHf / spaceH
+  centerX = nvpRound(x * ratioX) : centerY = nvpRound(y * ratioY)
+  If solid <> 0
+    rc = NeonFanBegin()
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+    NeonFanPoint(centerX, centerY)
+  Else
+    rc = NeonLinesBegin()
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  EndIf
+  For i = 0 To sides - 1
+    angle = MathFFromInt(i) * 6.28318530718 / MathFFromInt(sides)
+    px = nvpRound((x + Cos(angle) * radiusX) * ratioX)
+    py = nvpRound((y + Sin(angle) * radiusY) * ratioY)
+    If i = 0 : firstX = px : firstY = py : EndIf
+    If solid <> 0
+      NeonFanPoint(px, py)
+    Else
+      If i > 0 : NeonLine(lastX, lastY, px, py) : EndIf
+      lastX = px : lastY = py
+    EndIf
+  Next
+  If solid <> 0
+    NeonFanPoint(firstX, firstY)
+    ProcedureReturn NeonFanEnd(NeonVkPortColour(r, g, b, a))
+  EndIf
+  NeonLine(lastX, lastY, firstX, firstY)
+  ProcedureReturn NeonLinesEnd(NeonVkPortColour(r, g, b, a))
+EndProcedure
+
+
+; DrawGLStaticLines uses base-canvas positions and ignores the camera.
+; The caller owns an interleaved float x,y buffer for this immediate draw.
+; GL_LINES ignores a trailing unmatched vertex; LimitVertices does too.
+Procedure.i NeonVkPortStaticLines(*xy, vertexCount.i, r.f, g.f, b.f, a.f, limitVertices.i)
+  Protected drawn.i, i.i, rc.i
+  Protected x0.f, y0.f, x1.f, y1.f
+  If nvpCanvasW = 0 : ProcedureReturn #NEON_VK_PORT_ERR_CONFIG : EndIf
+  If vertexCount < 0 Or (vertexCount > 0 And *xy = 0)
+    ProcedureReturn #NEON_VK_PORT_ERR_GEOMETRY
+  EndIf
+  drawn = vertexCount
+  If limitVertices > 0 And limitVertices < drawn : drawn = limitVertices : EndIf
+  drawn = (drawn / 2) * 2
+  If drawn = 0 : ProcedureReturn #NEON_OK : EndIf
+  If drawn > #NEON_VK_PORT_MAX_LINE_VERTICES : ProcedureReturn #NEON_VK_PORT_ERR_GEOMETRY_CAPACITY : EndIf
+  rc = NeonLinesBegin()
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  For i = 0 To drawn - 1 Step 2
+    x0 = MathFromBits(PeekL(*xy + i * 8)) : y0 = MathFromBits(PeekL(*xy + i * 8 + 4))
+    x1 = MathFromBits(PeekL(*xy + i * 8 + 8)) : y1 = MathFromBits(PeekL(*xy + i * 8 + 12))
+    NeonLine(nvpRound(x0 * nvpTargetWf / nvpCanvasWf), nvpRound(y0 * nvpTargetHf / nvpCanvasHf), nvpRound(x1 * nvpTargetWf / nvpCanvasWf), nvpRound(y1 * nvpTargetHf / nvpCanvasHf))
+  Next
+  ProcedureReturn NeonLinesEnd(NeonVkPortColour(r, g, b, a))
 EndProcedure
 
 ; Desktop chrome scissor coordinates are always in the virtual canvas.

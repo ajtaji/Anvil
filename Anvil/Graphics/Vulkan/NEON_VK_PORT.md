@@ -9,10 +9,13 @@ Vulkan chrome primitives. They do not select a board backend or present a frame.
 | Restored Neon interface | Anvil Vulkan route | This adapter |
 | --- | --- | --- |
 | `DrawGLBox` and `Neon_Box` | `Neon_Box` → `NeonVkChromeBox` | `NeonVkPortBox` converts float coordinates, color, `Scaled`, and `IgnoreCamera`. |
+| `DrawGLPolygon` | `NeonFanBegin/Point/End` or `NeonLinesBegin/Line/End` → Vulkan chrome geometry | `NeonVkPortPolygon` keeps center/radii, side count, fill/outline, color, canvas and camera order. |
+| `CreateGLStaticLines` and `DrawGLStaticLines` | `NeonLinesBegin/Line/End` → Vulkan chrome line list | `NeonVkPortStaticLines` draws an interleaved float x/y buffer in virtual-canvas coordinates. |
 | `Neon_ScissorSet/Clear` | `Neon_ScissorSet/Clear` → Vulkan scissor | `NeonVkPortScissorSet/Clear` converts virtual-canvas bounds. |
 | Frame clear and buffer flip | `NeonFrameBegin/End` → configured Vulkan lifecycle; completed frame goes to the existing present record | `NeonVkPortFrameBegin/End` converts clear color and preserves return codes. |
 | `GetGLTextWidth`, `Neon_Text`, `Neon_TextRight/Centre` | `Neon_TextWidth`, `Neon_Text`, and the Vulkan font callbacks | `NeonVkPortTextWidth/Text/TextRight/TextCentre` keep float position and RGBA arguments. |
 | `DrawGLSprite` | `NeonVkChromeImageSpriteDrawTransformId` and image registration | `NeonVkPortSpriteUpload/Sprite/Clear` keep crop, tint, angle, scale, and camera order through an explicit image reference. |
+| `BeginBatch/AddBatchedSprite/EndBatch` | `NeonVkChromeSpriteBatchBegin/Add/End` | `NeonVkPortSpriteBatchBegin/Add/End` retain one uploaded image reference and ordered full-image sprite calls. |
 
 Call `NeonVkPortCanvas(canvasWidth, canvasHeight, targetWidth, targetHeight)`
 after the Vulkan render target is created. Target dimensions are its logical
@@ -45,6 +48,40 @@ represented by this renderer. Uploaded rows are top-down: the crop's top V
 coordinate samples its top row, matching Neon's Linux sprite UV branch. A
 Windows OpenGL texture import whose rows are bottom-up needs a vertical row
 flip before upload.
+
+`NeonVkPortPolygon` rounds each generated vertex to a target pixel. Solid
+polygons use a center fan with the first perimeter point repeated; outlines
+connect each perimeter point to the next with one-pixel Vulkan line quads.
+It accepts 3–2048 sides. Larger shapes return
+`#NEON_VK_PORT_ERR_GEOMETRY_CAPACITY` before starting a path. A side count
+below three is a no-op, as in `DrawGLPolygon`.
+
+`NeonVkPortStaticLines` takes a caller-owned pointer to interleaved float
+`x,y` values plus a vertex count. The pointer is read during the call; this
+does not create a persistent GPU mesh or accept a desktop `GLStaticMesh`
+handle. Coordinates use the virtual canvas and ignore the camera, matching
+`CreateGLStaticLines`. A positive `LimitVertices` truncates the list; an
+unmatched final vertex is ignored as with `GL_LINES`. More than 4096 effective
+vertices are refused before reading the buffer. Lines are one-pixel Vulkan
+quads, so edge coverage can differ from OpenGL rasterization.
+
+`NeonVkPortSpriteBatchBegin` binds one uploaded image reference. Add uses
+target/window-space position and size, full-image UVs, tint, radians and the
+same center-based camera/rotation order as the desktop batch call. End appends
+the ordered group to the frame. The underlying retained group supports 128
+sprites; an excess returns a capacity error. It emits one Vulkan draw record
+per sprite rather than the desktop batcher's single draw call. Image
+replacement and clear are refused while a port batch is active; the Vulkan
+renderer also disallows image replacement during an open frame. A failed End
+keeps the group active for retry. Begin can discard that group and start a
+fresh one, matching the desktop batch count reset. The port's FrameEnd refuses
+an unfinished group so it cannot disappear without an explicit End.
+
+The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
+the desktop procedures' optional parameter syntax or by-value `Text.s` copy
+in this target, so a same-name include would hide required resource and call
+changes. Font slots, uploaded sprite references, and static-line buffers
+must be bound through the Anvil interfaces above.
 
 Letterboxed or cropped viewports require their own viewport mapping; these
 adapters assume the full logical target. The default native Neon path and
