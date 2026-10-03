@@ -391,6 +391,29 @@ def refusal_reason(text: str, line: str) -> str:
     return command_body(text, line)
 
 
+def listener_failure(why: str, reply: str, line: str,
+                     datagrams: int) -> str:
+    """Describe only what the listener handshake actually established.
+
+    No echo means the command may not have reached the monitor; an echo
+    without the listening line does not prove whether it armed. Neither
+    silence case authorizes sending the image or repeating the command.
+    """
+    if why == "prompt":
+        reason = refusal_reason(reply, line)
+        if reason:
+            return "The monitor ended the command without arming a listener. It said:\n" + indent(reason)
+        return "The monitor ended the command without arming a listener and gave no reason."
+    echoed = echo_pattern(line).search(reply.replace("\r", "")) is not None
+    if not echoed:
+        return ("No echo or listener announcement arrived within 15 s "
+                f"({datagrams} reply datagrams). Whether the monitor received "
+                "the command is unknown.")
+    return ("The command echo arrived, but no listener announcement or "
+            f"ending prompt arrived within 15 s ({datagrams} reply datagrams). "
+            "Whether a listener armed is unknown.")
+
+
 def board_refusal(text: str, line: str = "") -> str:
     """The refusal lines in one command's reply, or an empty string.
 
@@ -1443,21 +1466,25 @@ def run(args: argparse.Namespace) -> int:
         # ends this step at once rather than at the fifteen-second bound.
         recv_line = f"net recv {args.port} {addr:X}"
         console.settle(quiet=0.3, cap=3.0)
+        listen_datagram_start = len(console.accepted_datagrams)
+        listen_keepalive_start = console.keepalives
         console.send(recv_line)
         listen, why = console.read_until_or_prompt(
             recv_line, ["for ONE connection"], 15)
+        record["listener_observation"] = {
+            "boundary": why,
+            "echo_seen": echo_pattern(recv_line).search(
+                listen.replace("\r", "")) is not None,
+            "reply_datagrams": len(console.accepted_datagrams) - listen_datagram_start,
+            "keepalives_sent": console.keepalives - listen_keepalive_start,
+        }
         if why != "needle":
-            reason = refusal_reason(listen, recv_line)
             failures.append(
-                "the board did not arm a listener, so nothing was sent and "
-                "nothing was booted. " + (
-                    "Its prompt came back instead, and it said:\n" + indent(reason)
-                    if why == "prompt" and reason else
-                    "Its prompt came back and it gave no reason at all."
-                    if why == "prompt" else
-                    "It said nothing this tool recognised within 15 s; the "
-                    "whole reply is in the transcript beside this record."))
-            journal.step("listener refused")
+                "No image was sent and nothing was booted. " +
+                listener_failure(why, listen, recv_line,
+                                 record["listener_observation"]["reply_datagrams"]))
+            journal.step("listener refused" if why == "prompt" else
+                         "listener unconfirmed")
             raise RunStopped()
         journal.step("listener armed")
         elapsed = stream_file(board_ip, args.port, data)
