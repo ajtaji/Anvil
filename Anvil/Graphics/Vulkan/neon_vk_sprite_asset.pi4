@@ -1,0 +1,178 @@
+; Bounded sprite asset bridge. Include after neon_vk_sprite_port.pi4 and the
+; board's HwFile* implementation. The caller owns every encoded and RGBA
+; buffer and brings storage up before a file load.
+;
+; Memory input is length-delimited, unlike desktop CatchImage. BMP support is
+; deliberately limited to uncompressed Windows 24-bit BGR and 32-bit BGRA.
+; PNG, JPEG, palette, RLE and bitfield BMP need a separate decoder. For 32-bit
+; BI_RGB, the fourth byte is treated as straight alpha; BMPs that use it as an
+; unused byte should instead be decoded by their asset pipeline to RGBA.
+
+#NEON_VK_ASSET_MAX_DIM = 1024
+#NEON_VK_ASSET_MAX_BYTES = 4194432
+#NEON_VK_ASSET_ERR_ARGUMENT = -21320
+#NEON_VK_ASSET_ERR_FORMAT = -21321
+#NEON_VK_ASSET_ERR_TRUNCATED = -21322
+#NEON_VK_ASSET_ERR_CAPACITY = -21323
+#NEON_VK_ASSET_ERR_IO = -21324
+
+; BMP fields are not naturally aligned (file size starts at byte 2).
+; Bare-metal Device memory faults on unaligned word loads.
+Procedure.i nvpAssetU16(*source)
+  ProcedureReturn (PeekA(*source) & 255) | ((PeekA(*source + 1) & 255) << 8)
+EndProcedure
+
+Procedure.i nvpAssetU32(*source)
+  ProcedureReturn (PeekA(*source) & 255) | ((PeekA(*source + 1) & 255) << 8) | ((PeekA(*source + 2) & 255) << 16) | ((PeekA(*source + 3) & 255) << 24)
+EndProcedure
+
+; colourKey has PureBasic RGB() layout: $00BBGGRR; -1 disables it. Keyed
+; pixels become transparent black. Non-key pixels retain straight alpha.
+; A supplied mask receives one byte per pixel: 1 for alpha > 0, else 0.
+Procedure.i NeonVkPortSpriteLoadRGBA(*sprite.NeonVkPortSpriteRef, id.i, *source, sourceBytes.i, width.i, height.i, *rgba, rgbaCapacity.i, colourKey.i, *mask, maskCapacity.i)
+  Protected pixels.i, bytes.i, i.i, sourceOffset.i, targetOffset.i
+  Protected red.i, green.i, blue.i, alpha.i, key.i
+  If *sprite = 0 Or *source = 0 Or *rgba = 0 Or id < 1 Or id > 16 Or width < 1 Or height < 1 Or width > #NEON_VK_ASSET_MAX_DIM Or height > #NEON_VK_ASSET_MAX_DIM
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
+  pixels = width * height : bytes = pixels * 4
+  If sourceBytes < bytes Or rgbaCapacity < bytes Or (*mask <> 0 And maskCapacity < pixels)
+    ProcedureReturn #NEON_VK_ASSET_ERR_CAPACITY
+  EndIf
+  If *source <> *rgba And *source < *rgba + bytes And *rgba < *source + bytes
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If *mask <> 0
+    If (*mask < *source + bytes And *source < *mask + pixels) Or (*mask < *rgba + bytes And *rgba < *mask + pixels)
+      ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+    EndIf
+  EndIf
+  For i = 0 To pixels - 1
+    sourceOffset = i * 4 : targetOffset = sourceOffset
+    red = PeekA(*source + sourceOffset) & 255
+    green = PeekA(*source + sourceOffset + 1) & 255
+    blue = PeekA(*source + sourceOffset + 2) & 255
+    alpha = PeekA(*source + sourceOffset + 3) & 255
+    key = red | (green << 8) | (blue << 16)
+    If colourKey <> -1 And key = colourKey
+      red = 0 : green = 0 : blue = 0 : alpha = 0
+    EndIf
+    PokeA(*rgba + targetOffset, red)
+    PokeA(*rgba + targetOffset + 1, green)
+    PokeA(*rgba + targetOffset + 2, blue)
+    PokeA(*rgba + targetOffset + 3, alpha)
+    If *mask <> 0
+      If alpha > 0 : PokeA(*mask + i, 1) : Else : PokeA(*mask + i, 0) : EndIf
+    EndIf
+  Next
+  ProcedureReturn NeonVkPortSpriteUpload(*sprite, id, *rgba, width, height, 0)
+EndProcedure
+
+; Decode a bounded BMP into top-down, tightly packed RGBA, then publish the
+; sprite only after the complete decode and renderer upload succeed.
+Procedure.i NeonVkPortSpriteLoadMemory(*sprite.NeonVkPortSpriteRef, id.i, *encoded, encodedBytes.i, *rgba, rgbaCapacity.i, colourKey.i, *mask, maskCapacity.i)
+  Protected offset.i, dib.i, width.i, signedHeight.i, height.i, topDown.i
+  Protected planes.i, depth.i, compression.i, rowBytes.i, required.i, pixels.i
+  Protected x.i, y.i, sourceRow.i, sourcePixel.i, targetPixel.i, alpha.i
+  If *sprite = 0 Or *encoded = 0 Or *rgba = 0 Or id < 1 Or id > 16 Or encodedBytes < 0
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
+  If encodedBytes < 2 : ProcedureReturn #NEON_VK_ASSET_ERR_TRUNCATED : EndIf
+  If (PeekA(*encoded) & 255) <> 66 Or (PeekA(*encoded + 1) & 255) <> 77
+    ProcedureReturn #NEON_VK_ASSET_ERR_FORMAT
+  EndIf
+  If encodedBytes < 54 : ProcedureReturn #NEON_VK_ASSET_ERR_TRUNCATED : EndIf
+  If encodedBytes > #NEON_VK_ASSET_MAX_BYTES
+    ProcedureReturn #NEON_VK_ASSET_ERR_CAPACITY
+  EndIf
+  offset = nvpAssetU32(*encoded + 10) & $FFFFFFFF
+  dib = nvpAssetU32(*encoded + 14) & $FFFFFFFF
+  width = nvpAssetU32(*encoded + 18) & $FFFFFFFF
+  signedHeight = nvpAssetU32(*encoded + 22) & $FFFFFFFF
+  planes = nvpAssetU16(*encoded + 26)
+  depth = nvpAssetU16(*encoded + 28)
+  compression = nvpAssetU32(*encoded + 30) & $FFFFFFFF
+  If dib <> 40 Or planes <> 1 Or (depth <> 24 And depth <> 32) Or compression <> 0
+    ProcedureReturn #NEON_VK_ASSET_ERR_FORMAT
+  EndIf
+  If width < 1 Or width > #NEON_VK_ASSET_MAX_DIM Or signedHeight = 0 Or signedHeight = $80000000 Or offset < 54
+    ProcedureReturn #NEON_VK_ASSET_ERR_FORMAT
+  EndIf
+  topDown = 0 : height = signedHeight
+  If signedHeight > $7FFFFFFF
+    height = $100000000 - signedHeight : topDown = 1
+  EndIf
+  If height < 1 Or height > #NEON_VK_ASSET_MAX_DIM
+    ProcedureReturn #NEON_VK_ASSET_ERR_FORMAT
+  EndIf
+  rowBytes = ((width * (depth / 8)) + 3) & $FFFFFFFC
+  required = offset + rowBytes * height
+  pixels = width * height
+  If required > encodedBytes : ProcedureReturn #NEON_VK_ASSET_ERR_TRUNCATED : EndIf
+  If rgbaCapacity < pixels * 4 Or (*mask <> 0 And maskCapacity < pixels)
+    ProcedureReturn #NEON_VK_ASSET_ERR_CAPACITY
+  EndIf
+  If *mask <> 0 And *mask < *rgba + pixels * 4 And *rgba < *mask + pixels
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If *encoded < *rgba + pixels * 4 And *rgba < *encoded + encodedBytes
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If *mask <> 0 And *mask < *encoded + encodedBytes And *encoded < *mask + pixels
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  For y = 0 To height - 1
+    sourceRow = y
+    If topDown = 0 : sourceRow = height - 1 - y : EndIf
+    For x = 0 To width - 1
+      sourcePixel = offset + sourceRow * rowBytes + x * (depth / 8)
+      targetPixel = (y * width + x) * 4
+      PokeA(*rgba + targetPixel, PeekA(*encoded + sourcePixel + 2) & 255)
+      PokeA(*rgba + targetPixel + 1, PeekA(*encoded + sourcePixel + 1) & 255)
+      PokeA(*rgba + targetPixel + 2, PeekA(*encoded + sourcePixel) & 255)
+      alpha = 255
+      If depth = 32 : alpha = PeekA(*encoded + sourcePixel + 3) & 255 : EndIf
+      PokeA(*rgba + targetPixel + 3, alpha)
+    Next
+  Next
+  ProcedureReturn NeonVkPortSpriteLoadRGBA(*sprite, id, *rgba, pixels * 4, width, height, *rgba, rgbaCapacity, colourKey, *mask, maskCapacity)
+EndProcedure
+
+; HwFile* is the board-neutral Anvil file seam. It does not mount storage.
+; ReadAt can return a partial count; the loop checks progress and closes on
+; every path. The encoded buffer may be reused after the call returns.
+Procedure.i NeonVkPortSpriteLoadFile(*sprite.NeonVkPortSpriteRef, id.i, *path, *encoded, encodedCapacity.i, *rgba, rgbaCapacity.i, colourKey.i, *mask, maskCapacity.i)
+  Protected size.i, offset.i, count.i, result.i
+  If *sprite = 0 Or *path = 0 Or *encoded = 0 Or *rgba = 0 Or id < 1 Or id > 16 Or encodedCapacity < 1
+    ProcedureReturn #NEON_VK_ASSET_ERR_ARGUMENT
+  EndIf
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
+  If HwFileOpen(*path) = 0 : ProcedureReturn #NEON_VK_ASSET_ERR_IO : EndIf
+  size = HwFileSize()
+  If size < 1
+    HwFileClose()
+    ProcedureReturn #NEON_VK_ASSET_ERR_FORMAT
+  EndIf
+  If size > encodedCapacity Or size > #NEON_VK_ASSET_MAX_BYTES
+    HwFileClose()
+    ProcedureReturn #NEON_VK_ASSET_ERR_CAPACITY
+  EndIf
+  offset = 0
+  While offset < size
+    count = HwFileReadAt(offset, *encoded + offset, size - offset)
+    If count < 0
+      HwFileClose()
+      ProcedureReturn #NEON_VK_ASSET_ERR_IO
+    EndIf
+    If count = 0
+      HwFileClose()
+      ProcedureReturn #NEON_VK_ASSET_ERR_TRUNCATED
+    EndIf
+    offset = offset + count
+  Wend
+  HwFileClose()
+  result = NeonVkPortSpriteLoadMemory(*sprite, id, *encoded, size, *rgba, rgbaCapacity, colourKey, *mask, maskCapacity)
+  ProcedureReturn result
+EndProcedure
