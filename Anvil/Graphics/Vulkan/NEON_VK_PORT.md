@@ -49,3 +49,9 @@ flip before upload.
 Letterboxed or cropped viewports require their own viewport mapping; these
 adapters assume the full logical target. The default native Neon path and
 compile-time Vulkan backend selection are unchanged.
+
+The Pi 4 board proof in `docs/evidence/neon-vk-port-frame-pi4-20261003/`
+exercised this adapter through the real V3D Vulkan backend. It checked a
+rectangle, text and a cropped sprite in one offscreen frame. The report and
+its checker are saved there; this is a Pi 4 proof, not an assertion of other
+board acceleration.
