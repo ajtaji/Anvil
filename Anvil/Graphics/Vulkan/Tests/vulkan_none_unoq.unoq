@@ -1,0 +1,14 @@
+; Compile-only no-backend Vulkan link probe for the UNO Q target.
+; pmf:target unoq
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_none.pbi"
+
+Procedure.i Main()
+  Define info.VkInstanceCreateInfo
+  Define instance.i = #VK_NULL_HANDLE
+  info\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@info, 0, @instance) <> #VK_ERROR_INCOMPATIBLE_DRIVER
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn Bool(instance <> #VK_NULL_HANDLE)
+EndProcedure
