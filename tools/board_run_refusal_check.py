@@ -338,7 +338,19 @@ def anchor_checks(tool) -> int:
         "a clamped/incorrect timeout was accepted")
     require(tool.argument_parser().parse_args(["payload.pmf"]).deadman == 15,
             "the command-line default is not the 15-second deadman")
-    return 14
+    # A timed-out listener handshake is not proof that the board refused.
+    # This is the 2026-10-03 Wi-Fi case: the transcript had no echo at all.
+    line = "net recv 5001 800000"
+    require("Whether the monitor received the command is unknown" in
+            tool.listener_failure("timeout", "", line, 0),
+            "no-echo silence was mislabeled as a listener refusal")
+    require("Whether a listener armed is unknown" in
+            tool.listener_failure("timeout", line + "\r\n", line, 1),
+            "echo-only silence was mislabeled as a listener refusal")
+    require("ended the command without arming" in
+            tool.listener_failure("prompt", line + "\r\npmf> ", line, 2),
+            "an explicit prompt was not classified as a refusal")
+    return 17
 
 
 # =====================================================================
