@@ -35,6 +35,11 @@
 #NVC_SPRITE_MAX_ANGLE_Q16      = 6588400 ; sixteen signed turns
 #NVC_MULTI_SPRITE_MAX          = 16
 #NVC_RETAINED_BATCH_MAX        = 128
+#NVC_PARTICLE_MAX              = 10000
+#NVC_PARTICLE_PALETTE_W        = 128
+#NVC_PARTICLE_PALETTE_H        = 80
+#NVC_PARTICLE_PALETTE_BYTES    = #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H * 4
+#NVC_PARTICLE_CLIP_CACHE       = 4096
 #NVC_SPRITE_SHELF_H            = 256
 #NEON_VK_CHROME_TT_ATLAS_W     = 512
 ; Keep the image and persistent staging buffer within the shared 16 MiB
@@ -73,6 +78,21 @@ Structure NvcRetainedSprite
   ignoreCamera.i
 EndStructure
 
+; Colour is packed AARRGGBB. The active chrome scissor clips the batch.
+Structure NvcParticle
+  x.i
+  y.i
+  width.i
+  height.i
+  colour.i
+  angleQ16.i
+  cameraX.i
+  cameraY.i
+  zoomQ16.i
+  ignoreCamera.i
+EndStructure
+
+
 Global nvcReady.i
 Global nvcInFrame.i
 Global nvcMapped.i
@@ -100,6 +120,22 @@ Global nvcRetainedBatchLogicalW.i
 Global nvcRetainedBatchLogicalH.i
 Global nvcRetainedBatchTargetGeneration.i
 Global Dim nvcRetainedItems.NvcRetainedSprite[#NVC_RETAINED_BATCH_MAX]
+Global Dim nvcParticleItems.NvcParticle[#NVC_PARTICLE_MAX]
+Global nvcParticleCount.i
+Global nvcParticlePrepared.i
+Global nvcParticleStageSafe.i
+Global nvcParticleUploaded.i
+Global nvcParticleTargetGeneration.i
+Global nvcParticleLogicalW.i
+Global nvcParticleLogicalH.i
+Global Dim nvcParticleU.i[#NVC_PARTICLE_PALETTE_W]
+Global Dim nvcParticleV.i[#NVC_PARTICLE_PALETTE_H]
+Global Dim nvcParticleXKey.i[#NVC_PARTICLE_CLIP_CACHE]
+Global Dim nvcParticleXBits.i[#NVC_PARTICLE_CLIP_CACHE]
+Global Dim nvcParticleXGen.i[#NVC_PARTICLE_CLIP_CACHE]
+Global Dim nvcParticleYKey.i[#NVC_PARTICLE_CLIP_CACHE]
+Global Dim nvcParticleYBits.i[#NVC_PARTICLE_CLIP_CACHE]
+Global Dim nvcParticleYGen.i[#NVC_PARTICLE_CLIP_CACHE]
 Global nvcGridBatchActive.i
 Global nvcGridBatchFirst.i
 Global nvcGridBatchSlot.i
@@ -142,6 +178,13 @@ Global nvcDescriptorPool.i
 Global nvcDescriptorSet.i
 Global nvcPipelineLayout.i
 Global nvcPipeline.i
+Global nvcParticleImage.i
+Global nvcParticleMemory.i
+Global nvcParticleView.i
+Global nvcParticleSet.i
+Global nvcParticleStage.i
+Global nvcParticleStageMemory.i
+Global nvcParticleMapped.i
 
 ; Slot 1 keeps the original public image state. Slots 2..16 use identical
 ; independent image, view, descriptor and device-memory ownership.
@@ -269,6 +312,8 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_display.pi4"
 
 Declare NeonVkChromeDestroy()
 Declare.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
+Declare.i nvcParticlePaletteCreate()
+Declare nvcParticlePaletteRelease()
 Declare.i NeonVkChromeRebind(framebuffer.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, pitch.i, rotation.i)
 Declare.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
 Declare.i NeonVkChromeBoxBatchBegin()
@@ -1053,11 +1098,11 @@ Procedure.i nvcDescriptorsAndPipeline()
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   ; Atlas, sixteen resident images and one unpublished replacement may
   ; coexist. Individual sets retire after the bounded wait.
-  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 2
-  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 2
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 3
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 3
   dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
   dpci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
-  dpci\maxSets = #NVC_MULTI_SPRITE_MAX + 2 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  dpci\maxSets = #NVC_MULTI_SPRITE_MAX + 3 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
   rc = vkCreateDescriptorPool(nvcDevice, @dpci, 0, @nvcDescriptorPool)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   layoutArray = nvcSetLayout
@@ -1611,6 +1656,7 @@ Procedure.i NeonVkChromeBegin(*clearValue)
     vkUnmapMemory(nvcDevice, nvcVertexMemory) : nvcMapped = 0
     ProcedureReturn nvcFail(rc)
   EndIf
+
   rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
   rpbi\renderPass = nvcRenderPass : rpbi\framebuffer = nvcFramebuffer
   rpbi\renderArea\extent\width = nvcPhysicalW : rpbi\renderArea\extent\height = nvcPhysicalH
@@ -2068,7 +2114,7 @@ Procedure.i NeonVkChromeSpriteBatchEnd()
   If nvcLogicalW <> nvcRetainedBatchLogicalW Or nvcLogicalH <> nvcRetainedBatchLogicalH Or nvcTargetGeneration <> nvcRetainedBatchTargetGeneration
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
-  If nvcRetainedBatchCount > nvcMaxQuads - nvcDrawCount Or nvcRetainedBatchCount > nvcMaxVertexQuads - nvcVertices / 6
+  If nvcRetainedBatchCount > nvcMaxQuads - nvcDrawCount Or nvcRetainedBatchCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
   If nvcRetainedBatchCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
@@ -3121,6 +3167,7 @@ Procedure NeonVkChromeDestroy()
     If nvcImageSpritePendingStageMemory <> 0 : vkFreeMemory(nvcDevice, nvcImageSpritePendingStageMemory, 0) : EndIf
     nvcImageSpriteRelease(nvcImageSpritePendingSet, nvcImageSpritePendingView, nvcImageSpritePendingImage, nvcImageSpritePendingMemory)
     nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
+    nvcParticlePaletteRelease()
     For slot = 2 To #NVC_MULTI_SPRITE_MAX
       nvcImageSpriteRelease(nvcImageSpriteSets[slot], nvcImageSpriteViews[slot], nvcImageSpriteImages[slot], nvcImageSpriteMemories[slot])
     Next
@@ -3159,6 +3206,11 @@ Procedure NeonVkChromeDestroy()
   Next
   nvcImageSpritePendingImage = 0 : nvcImageSpritePendingMemory = 0 : nvcImageSpritePendingView = 0 : nvcImageSpritePendingSet = 0
   nvcImageSpritePendingStage = 0 : nvcImageSpritePendingStageMemory = 0
+  nvcParticleImage = 0 : nvcParticleMemory = 0 : nvcParticleView = 0 : nvcParticleSet = 0
+  nvcParticleStage = 0 : nvcParticleStageMemory = 0 : nvcParticleMapped = 0
+  nvcParticleCount = 0 : nvcParticlePrepared = 0
+  nvcParticleUploaded = 0 : nvcParticleStageSafe = 0
+  nvcParticleTargetGeneration = 0 : nvcParticleLogicalW = 0 : nvcParticleLogicalH = 0
   nvcSampler = 0 : nvcAtlasView = 0 : nvcAtlasImage = 0 : nvcAtlasMemory = 0
   nvcUploadBuffer = 0 : nvcUploadMemory = 0
   nvcUniformBuffer = 0 : nvcUniformMemory = 0 : nvcVertexBuffer = 0 : nvcVertexMemory = 0
@@ -3233,3 +3285,5 @@ Procedure.i NeonVkChromeLifecycleInstallPrepared()
   EndIf
   ProcedureReturn NeonLifecycleInstallPrepared(@nvcLifecycleInit, @nvcLifecycleBegin, @nvcLifecycleEnd, @nvcLifecycleShutdown)
 EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particles.pi4"

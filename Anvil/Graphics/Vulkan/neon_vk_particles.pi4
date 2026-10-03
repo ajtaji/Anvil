@@ -1,0 +1,396 @@
+; One ordered Vulkan draw for up to 10,000 Neon-style coloured quads. Each
+; particle samples its own nearest-filtered palette texel; draw tint is white.
+; The portable command engine accepts transfer and render as separate jobs:
+; Prepare submits and waits for the palette upload before Begin can draw it.
+
+; Creation is optional. A failed first allocation can release only particle
+; resources and leave Chrome live for other rendering and a later retry.
+Procedure nvcParticlePaletteRelease()
+  If nvcDevice <> 0
+    If nvcParticleMapped <> 0 And nvcParticleStageMemory <> 0
+      vkUnmapMemory(nvcDevice, nvcParticleStageMemory)
+    EndIf
+    If nvcParticleStage <> 0 : vkDestroyBuffer(nvcDevice, nvcParticleStage, 0) : EndIf
+    If nvcParticleStageMemory <> 0 : vkFreeMemory(nvcDevice, nvcParticleStageMemory, 0) : EndIf
+    nvcImageSpriteRelease(nvcParticleSet, nvcParticleView, nvcParticleImage, nvcParticleMemory)
+  EndIf
+  nvcParticleMapped = 0 : nvcParticleStage = 0 : nvcParticleStageMemory = 0
+  nvcParticleSet = 0 : nvcParticleView = 0 : nvcParticleImage = 0 : nvcParticleMemory = 0
+  nvcParticleCount = 0 : nvcParticlePrepared = 0
+  nvcParticleStageSafe = 0 : nvcParticleUploaded = 0
+  nvcParticleTargetGeneration = 0 : nvcParticleLogicalW = 0 : nvcParticleLogicalH = 0
+EndProcedure
+
+Procedure.i nvcParticlePaletteCreate()
+  Define ici.VkImageCreateInfo
+  Define props.VkImageFormatProperties
+  Define req.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define dii.VkDescriptorImageInfo
+  Define write.VkWriteDescriptorSet
+  Define layoutHandle.i, rc.i, i.i, memoryType.i
+
+  rc = vkGetPhysicalDeviceImageFormatProperties(nvcPhysical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT, 0, @props)
+  If rc <> #VK_SUCCESS Or props\maxExtent\width < #NVC_PARTICLE_PALETTE_W Or props\maxExtent\height < #NVC_PARTICLE_PALETTE_H Or props\maxResourceSize < #NVC_PARTICLE_PALETTE_BYTES
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+
+  ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  ici\imageType = #VK_IMAGE_TYPE_2D : ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ici\extent\width = #NVC_PARTICLE_PALETTE_W : ici\extent\height = #NVC_PARTICLE_PALETTE_H : ici\extent\depth = 1
+  ici\mipLevels = 1 : ici\arrayLayers = 1 : ici\samples = #VK_SAMPLE_COUNT_1_BIT
+  ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+  ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nvcDevice, @ici, 0, @nvcParticleImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  vkGetImageMemoryRequirements(nvcDevice, nvcParticleImage, @req)
+  memoryType = nvcHostMemoryType(req\memoryTypeBits)
+  If memoryType < 0 : ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = memoryType
+  rc = vkAllocateMemory(nvcDevice, @mai, 0, @nvcParticleMemory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(nvcDevice, nvcParticleImage, nvcParticleMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  rc = nvcBufferCreate(#NEON_VK_CHROME_ATLAS_PAD + #NVC_PARTICLE_PALETTE_BYTES, #VK_BUFFER_USAGE_TRANSFER_SRC_BIT, @nvcParticleStage, @nvcParticleStageMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  rc = vkMapMemory(nvcDevice, nvcParticleStageMemory, 0, #VK_WHOLE_SIZE, 0, @nvcParticleMapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  For i = 0 To #NVC_PARTICLE_PALETTE_BYTES - 4 Step 4
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i, 0)
+  Next
+
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = nvcParticleImage : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(nvcDevice, @ivci, 0, @nvcParticleView)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  layoutHandle = nvcSetLayout
+  dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  dsai\descriptorPool = nvcDescriptorPool : dsai\descriptorSetCount = 1
+  dsai\pSetLayouts = @layoutHandle
+  rc = vkAllocateDescriptorSets(nvcDevice, @dsai, @nvcParticleSet)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+
+  dbi\buffer = nvcUniformBuffer : dbi\range = 16
+  write\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+  write\dstSet = nvcParticleSet : write\dstBinding = 0
+  write\descriptorCount = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  write\pBufferInfo = @dbi
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+  If AnvilVkFaultCode() <> #ANVIL_VK_OK : ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN : EndIf
+
+  dii\sampler = nvcSampler : dii\imageView = nvcParticleView
+  dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  write\dstBinding = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  write\pBufferInfo = 0 : write\pImageInfo = @dii
+  AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+  If AnvilVkFaultCode() <> #ANVIL_VK_OK : ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN : EndIf
+
+  For i = 0 To #NVC_PARTICLE_PALETTE_W - 1
+    nvcParticleU[i] = neon_F32Ratio(i * 2 + 1, #NVC_PARTICLE_PALETTE_W * 2)
+  Next
+  For i = 0 To #NVC_PARTICLE_PALETTE_H - 1
+    nvcParticleV[i] = neon_F32Ratio(i * 2 + 1, #NVC_PARTICLE_PALETTE_H * 2)
+  Next
+  nvcParticleStageSafe = 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; The staging buffer is modified only between completed submissions. A failed
+; upload leaves the palette unusable until the adapter is destroyed/recreated.
+Procedure.i nvcParticleUploadNow()
+  Define bi.VkCommandBufferBeginInfo
+  Define bar.VkImageMemoryBarrier
+  Define copy.VkBufferImageCopy
+  Define rc.i
+  If nvcParticleStageSafe = 0 Or nvcParticleMapped = 0 Or nvcParticleImage = 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  nvcParticleStageSafe = 0
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  rc = vkResetCommandBuffer(nvcCommand, 0)
+  If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(nvcCommand, @bi) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = nvcParticleImage
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  If nvcParticleUploaded <> 0
+    bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  Else
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  EndIf
+  copy\bufferOffset = #NEON_VK_CHROME_ATLAS_PAD
+  copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  copy\imageSubresource\layerCount = 1
+  copy\imageExtent\width = #NVC_PARTICLE_PALETTE_W
+  copy\imageExtent\height = #NVC_PARTICLE_PALETTE_H
+  copy\imageExtent\depth = 1
+  vkCmdCopyBufferToImage(nvcCommand, nvcParticleStage, nvcParticleImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+  bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+  rc = vkEndCommandBuffer(nvcCommand)
+  If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  nvcParticleStageSafe = 1
+  nvcParticleUploaded = 1
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Compute all four Q8 corners without touching a mapped vertex buffer.
+; The same routine validates Prepare and supplies DrawPrepared vertices.
+Procedure.i nvcParticleGeometry(*p.NvcParticle, *corners)
+  Define xQ8.i, yQ8.i, wQ8.i, hQ8.i, halfWQ8.i, halfHQ8.i
+  Define centerXQ8.i, centerYQ8.i, cosQ16.i, sinQ16.i
+  Define i.i, coordinate.i
+  If *p = 0 Or *corners = 0 : ProcedureReturn 0 : EndIf
+  If *p\width < 1 Or *p\height < 1 Or *p\width > 4096 Or *p\height > 4096
+    ProcedureReturn 0
+  EndIf
+  If *p\x < -16384 Or *p\x > 16384 Or *p\y < -16384 Or *p\y > 16384
+    ProcedureReturn 0
+  EndIf
+  If *p\angleQ16 < -#NVC_SPRITE_MAX_ANGLE_Q16 Or *p\angleQ16 > #NVC_SPRITE_MAX_ANGLE_Q16
+    ProcedureReturn 0
+  EndIf
+  If nvcLogicalW < 1 Or nvcLogicalH < 1 Or nvcLogicalW > 8192 Or nvcLogicalH > 8192 Or nvcPhysicalW < 1 Or nvcPhysicalH < 1 Or nvcPhysicalW > 8192 Or nvcPhysicalH > 8192
+    ProcedureReturn 0
+  EndIf
+  If *p\ignoreCamera = 0
+    If *p\cameraX < -16384 Or *p\cameraX > 16384 Or *p\cameraY < -16384 Or *p\cameraY > 16384 Or *p\zoomQ16 < 1 Or *p\zoomQ16 > 1048576
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  xQ8 = *p\x * 256 : yQ8 = *p\y * 256
+  wQ8 = *p\width * 256 : hQ8 = *p\height * 256
+  If *p\ignoreCamera = 0
+    centerXQ8 = nvcLogicalW * 128 : centerYQ8 = nvcLogicalH * 128
+    xQ8 = centerXQ8 + ((xQ8 - *p\cameraX * 256 - centerXQ8) * *p\zoomQ16) / 65536
+    yQ8 = centerYQ8 + ((yQ8 - *p\cameraY * 256 - centerYQ8) * *p\zoomQ16) / 65536
+    wQ8 = (wQ8 * *p\zoomQ16) / 65536 : hQ8 = (hQ8 * *p\zoomQ16) / 65536
+  EndIf
+  If wQ8 < 1 Or hQ8 < 1 : ProcedureReturn 0 : EndIf
+  If *p\angleQ16 = 0 And (*p\ignoreCamera <> 0 Or *p\zoomQ16 = 65536)
+    ; Integer-size, unrotated quads have exact Q8 corners. This avoids
+    ; CORDIC and duplicate products without approximating their geometry.
+    PokeI(*corners + 0 * SizeOf(.i), xQ8) : PokeI(*corners + 1 * SizeOf(.i), yQ8)
+    PokeI(*corners + 2 * SizeOf(.i), xQ8 + wQ8) : PokeI(*corners + 3 * SizeOf(.i), yQ8)
+    PokeI(*corners + 4 * SizeOf(.i), xQ8) : PokeI(*corners + 5 * SizeOf(.i), yQ8 + hQ8)
+    PokeI(*corners + 6 * SizeOf(.i), xQ8 + wQ8) : PokeI(*corners + 7 * SizeOf(.i), yQ8 + hQ8)
+    For i = 0 To 7
+      coordinate = PeekI(*corners + i * SizeOf(.i))
+      If coordinate < -#NVC_SPRITE_Q8_LIMIT Or coordinate > #NVC_SPRITE_Q8_LIMIT
+        ProcedureReturn 0
+      EndIf
+    Next
+    ProcedureReturn 1
+  EndIf
+  halfWQ8 = wQ8 / 2 : halfHQ8 = hQ8 / 2
+  centerXQ8 = xQ8 + halfWQ8 : centerYQ8 = yQ8 + halfHQ8
+  nvcSpriteTrigQ16(*p\angleQ16, @cosQ16, @sinQ16)
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, -halfWQ8, -halfHQ8, cosQ16, sinQ16, *corners + 0 * SizeOf(.i), *corners + 1 * SizeOf(.i))
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, halfWQ8, -halfHQ8, cosQ16, sinQ16, *corners + 2 * SizeOf(.i), *corners + 3 * SizeOf(.i))
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, -halfWQ8, halfHQ8, cosQ16, sinQ16, *corners + 4 * SizeOf(.i), *corners + 5 * SizeOf(.i))
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, halfWQ8, halfHQ8, cosQ16, sinQ16, *corners + 6 * SizeOf(.i), *corners + 7 * SizeOf(.i))
+  For i = 0 To 7
+    coordinate = PeekI(*corners + i * SizeOf(.i))
+    If coordinate < -#NVC_SPRITE_Q8_LIMIT Or coordinate > #NVC_SPRITE_Q8_LIMIT
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Prepare validates the whole list before changing retained state or staging.
+; Inputs can be freed immediately after this returns success.
+Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
+  Define Dim corners.i[8]
+  Define i.i, rc.i
+  Define *p.NvcParticle
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If count < 0 Or count > #NVC_PARTICLE_MAX Or (count > 0 And *particles = 0)
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If count = 0
+    If nvcParticleImage <> 0 And nvcParticleStageSafe = 0
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    EndIf
+    ; An empty prepared list never samples the previous palette contents.
+    nvcParticleCount = 0 : nvcParticlePrepared = 1
+    nvcParticleTargetGeneration = nvcTargetGeneration
+    nvcParticleLogicalW = nvcLogicalW : nvcParticleLogicalH = nvcLogicalH
+    nvcError = 0
+    ProcedureReturn #NEON_VK_CHROME_OK
+  EndIf
+  For i = 0 To count - 1
+    *p = *particles + i * SizeOf(NvcParticle)
+    If nvcParticleGeometry(*p, @corners[0]) = 0
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+  Next
+  If nvcParticleImage = 0
+    rc = nvcParticlePaletteCreate()
+    If rc <> #VK_SUCCESS
+      nvcParticlePaletteRelease()
+      ProcedureReturn nvcFail(rc)
+    EndIf
+  EndIf
+  If nvcParticleStageSafe = 0 Or nvcParticleMapped = 0 Or nvcParticleSet = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  ; The shared command buffer and sampled palette cannot be recycled while
+  ; an earlier render submission still owns them, including an error path.
+  rc = vkDeviceWaitIdle(nvcDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  ; The previous draw has completed: End waits on its fence. Invalidating the
+  ; prior prepared list before upload also prevents use of a partial transfer.
+  nvcParticlePrepared = 0
+  For i = 0 To count - 1
+    *p = *particles + i * SizeOf(NvcParticle)
+    nvcParticleItems[i]\x = *p\x : nvcParticleItems[i]\y = *p\y
+    nvcParticleItems[i]\width = *p\width : nvcParticleItems[i]\height = *p\height
+    nvcParticleItems[i]\colour = *p\colour : nvcParticleItems[i]\angleQ16 = *p\angleQ16
+    nvcParticleItems[i]\cameraX = *p\cameraX : nvcParticleItems[i]\cameraY = *p\cameraY
+    nvcParticleItems[i]\zoomQ16 = *p\zoomQ16 : nvcParticleItems[i]\ignoreCamera = *p\ignoreCamera
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, *p\colour)
+  Next
+  For i = count To #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H - 1
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, 0)
+  Next
+  If count > 0
+    i = nvcParticleUploadNow()
+    If i <> #VK_SUCCESS : ProcedureReturn nvcFail(i) : EndIf
+  EndIf
+  nvcParticleCount = count : nvcParticlePrepared = 1
+  nvcParticleTargetGeneration = nvcTargetGeneration
+  nvcParticleLogicalW = nvcLogicalW : nvcParticleLogicalH = nvcLogicalH
+  nvcError = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Cache the exact software float conversion by transformed Q8 coordinate.
+; Different targets have different denominators and generation stamps.
+Procedure.i nvcParticleClipXBits(xQ8.i)
+  Define slot.i, bits.i
+  slot = ((xQ8 >> 8) * 131 + (xQ8 & 255)) & (#NVC_PARTICLE_CLIP_CACHE - 1)
+  If nvcParticleXGen[slot] = nvcTargetGeneration And nvcParticleXKey[slot] = xQ8
+    ProcedureReturn nvcParticleXBits[slot]
+  EndIf
+  bits = neon_F32Ratio(xQ8 * 2 - nvcPhysicalW * 256, nvcPhysicalW * 256)
+  nvcParticleXGen[slot] = nvcTargetGeneration
+  nvcParticleXKey[slot] = xQ8 : nvcParticleXBits[slot] = bits
+  ProcedureReturn bits
+EndProcedure
+
+Procedure.i nvcParticleClipYBits(yQ8.i)
+  Define slot.i, bits.i
+  slot = ((yQ8 >> 8) * 131 + (yQ8 & 255)) & (#NVC_PARTICLE_CLIP_CACHE - 1)
+  If nvcParticleYGen[slot] = nvcTargetGeneration And nvcParticleYKey[slot] = yQ8
+    ProcedureReturn nvcParticleYBits[slot]
+  EndIf
+  bits = neon_F32Ratio(yQ8 * 2 - nvcPhysicalH * 256, nvcPhysicalH * 256)
+  nvcParticleYGen[slot] = nvcTargetGeneration
+  nvcParticleYKey[slot] = yQ8 : nvcParticleYBits[slot] = bits
+  ProcedureReturn bits
+EndProcedure
+
+Procedure nvcParticleCornerBits(xQ8.i, yQ8.i, *outX, *outY)
+  Define txQ8.i, tyQ8.i
+  If nvcRotation = 90
+    txQ8 = nvcLogicalH * 256 - yQ8 : tyQ8 = xQ8
+  ElseIf nvcRotation = 180
+    txQ8 = nvcLogicalW * 256 - xQ8 : tyQ8 = nvcLogicalH * 256 - yQ8
+  ElseIf nvcRotation = 270
+    txQ8 = yQ8 : tyQ8 = nvcLogicalW * 256 - xQ8
+  Else
+    txQ8 = xQ8 : tyQ8 = yQ8
+  EndIf
+  PokeI(*outX, nvcParticleClipXBits(txQ8))
+  PokeI(*outY, nvcParticleClipYBits(tyQ8))
+EndProcedure
+
+Procedure nvcParticleVertexBits(index.i, xBits.i, yBits.i, u.i, v.i)
+  Define p.i
+  p = nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
+  PokeL(p + 0, xBits) : PokeL(p + 4, yBits)
+  PokeL(p + 8, u) : PokeL(p + 12, v)
+  PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+EndProcedure
+
+; The array order becomes Vulkan primitive order within one draw. The current
+; scissor applies to every particle, including rotated/camera-transformed ones.
+Procedure.i NeonVkChromeParticlesDrawPrepared()
+  Define Dim corners.i[8]
+  Define Dim xBits.i[4]
+  Define Dim yBits.i[4]
+  Define i.i, first.i, base.i, col.i, row.i, u.i, v.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcParticlePrepared = 0 Or nvcParticleSet = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcParticleTargetGeneration <> nvcTargetGeneration Or nvcParticleLogicalW <> nvcLogicalW Or nvcParticleLogicalH <> nvcLogicalH
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcParticleCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcParticleUploaded = 0 Or nvcParticleStageSafe = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcVertices < 0 Or nvcVertices > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcParticleCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  first = nvcVertices
+  For i = 0 To nvcParticleCount - 1
+    nvcParticleGeometry(@nvcParticleItems[i], @corners[0])
+    If nvcRotation = 0 And nvcParticleItems[i]\angleQ16 = 0 And (nvcParticleItems[i]\ignoreCamera <> 0 Or nvcParticleItems[i]\zoomQ16 = 65536)
+      xBits[0] = nvcParticleClipXBits(corners[0]) : xBits[1] = nvcParticleClipXBits(corners[2])
+      xBits[2] = xBits[0] : xBits[3] = xBits[1]
+      yBits[0] = nvcParticleClipYBits(corners[1]) : yBits[2] = nvcParticleClipYBits(corners[5])
+      yBits[1] = yBits[0] : yBits[3] = yBits[2]
+    Else
+      nvcParticleCornerBits(corners[0], corners[1], @xBits[0], @yBits[0])
+      nvcParticleCornerBits(corners[2], corners[3], @xBits[1], @yBits[1])
+      nvcParticleCornerBits(corners[4], corners[5], @xBits[2], @yBits[2])
+      nvcParticleCornerBits(corners[6], corners[7], @xBits[3], @yBits[3])
+    EndIf
+    col = i % #NVC_PARTICLE_PALETTE_W : row = i / #NVC_PARTICLE_PALETTE_W
+    u = nvcParticleU[col] : v = nvcParticleV[row]
+    base = nvcVertices
+    nvcParticleVertexBits(base + 0, xBits[0], yBits[0], u, v)
+    nvcParticleVertexBits(base + 1, xBits[2], yBits[2], u, v)
+    nvcParticleVertexBits(base + 2, xBits[3], yBits[3], u, v)
+    nvcParticleVertexBits(base + 3, xBits[0], yBits[0], u, v)
+    nvcParticleVertexBits(base + 4, xBits[3], yBits[3], u, v)
+    nvcParticleVertexBits(base + 5, xBits[1], yBits[1], u, v)
+    nvcVertices + 6
+  Next
+  ProcedureReturn nvcDrawSet(first, nvcParticleCount * 6, $FFFFFFFF, nvcParticleSet)
+EndProcedure

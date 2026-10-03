@@ -343,6 +343,26 @@ Procedure.i Main()
   nmsReport[37] = NeonVkChromeSpriteBatchEnd()
   nmsReport[38] = nvcDrawCount
   If nmsReport[37] <> #NEON_VK_CHROME_OK Or nmsReport[38] <> 1 Or nvcRetainedBatchCount <> 0 : ProcedureReturn nmsReturn(75) : EndIf
+
+  ; A five-point fan adds nine vertices after the six-vertex blue box. Two
+  ; retained sprites need twelve more, but only nine of 24 slots remain.
+  ; The whole batch must refuse before either sprite is appended.
+  nmsReport[2] = 11
+  If NeonVkChromeFanBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(76) : EndIf
+  NeonVkChromeFanPoint(4, 20)
+  NeonVkChromeFanPoint(12, 20)
+  NeonVkChromeFanPoint(16, 28)
+  NeonVkChromeFanPoint(8, 36)
+  NeonVkChromeFanPoint(0, 28)
+  nmsReport[39] = NeonVkChromeFanEnd(Neon_RGB(0, 255, 0))
+  nmsReport[40] = nvcVertices : nmsReport[41] = nvcDrawCount
+  If nmsReport[39] <> #NEON_VK_CHROME_OK Or nmsReport[40] <> 15 Or nmsReport[41] <> 2 : ProcedureReturn nmsReturn(77) : EndIf
+  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(78) : EndIf
+  If NeonVkChromeSpriteBatchAdd(1, 24, 20, 0, 0, 1, 1, 4, 4, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(79) : EndIf
+  If NeonVkChromeSpriteBatchAdd(1, 32, 20, 0, 0, 1, 1, 4, 4, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(80) : EndIf
+  nmsReport[42] = NeonVkChromeSpriteBatchEnd()
+  nmsReport[43] = nvcDrawCount : nmsReport[44] = nvcVertices
+  If nmsReport[42] <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[43] <> 2 Or nmsReport[44] <> 15 : ProcedureReturn nmsReturn(81) : EndIf
   If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(68) : EndIf
   If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(69) : EndIf
   NeonVkChromeDestroy() : nmsAdapter = 0
