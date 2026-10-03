@@ -36,11 +36,15 @@ framebuffer and shared grid are established. A clean startup failure tries the
 native V3D console, then leaves the DMA/CPU framebuffer renderer in place if
 the GPU is unavailable. An unsafe GPU handoff failure quarantines the screen
 rather than transferring ownership. The explicit `screen vulkan`, `screen v3d`,
-`screen dma`, and `screen cpu` commands remain available. Build 242 booted on
-Pi 4 hardware with the Vulkan console selected before USB/storage setup,
-then reached a real prompt over Wi-Fi; its saved TrueType settings and Vulkan
-painter remained active after reset. This verifies that boot selection on the
-measured Pi 4, not recovery on every display or network failure.
+`screen dma`, and `screen cpu` commands remain available. Build 244 is now
+installed on the Pi 4 and reached a real prompt over Wi-Fi after reset, with
+the Vulkan console selected before USB/storage setup. A live 1280x800 capture
+shows its TrueType banner and clock, CPU, temperature, and fan caption; the
+caption layout is initialized before Vulkan's first frame instead of depending
+on a skipped CPU banner draw. This verifies the measured Pi 4 boot and screen,
+not recovery on every display or network failure. Before/after screenshots,
+checksums, and the boot-file verification are in
+`docs/evidence/pi4-build244-banner-20261003/README.md`.
 
 The Pi 5 full Anvil monitor is built from `RaspberryPi4/Board/board.pi4` under
 its BCM2712 branches, not from the older `RaspberryPi5/Boot/board.pi4` entry
@@ -89,9 +93,9 @@ height and glyph identity checks. A returning RAM diagnostic on resident build
 reset and teardown oracle. The unchanged sixteen-image atlas/GPU pixel proof
 also passed after recompilation against the indexed adapter. These checks do
 not re-prove real TrueType glyph raster pixels or show a measured frame-rate
-gain. See `docs/evidence/neon-tt-index-pi4-20261003/`. The updated full Pi 4
-monitor desk-compiles but is not installed; the current monitor remains build
-242.
+gain. See `docs/evidence/neon-tt-index-pi4-20261003/`. This change was
+desk-compiled before installation and is part of the later installed build
+244; the returning cache diagnostic remains the specific silicon proof.
 
 The Pi 4 Neon adapter now batches new TrueType atlas texels into one bounded,
 source-aligned dirty rectangle (at most 256 UIF tiles) instead of uploading
@@ -108,8 +112,9 @@ rate, and only Pi 4 was run on hardware. See
 `docs/evidence/neon-tt-partial-pi4-20261003/`. The updated full Pi 4 monitor desk-compiled with `--no-bump` as a
 5,251,408-byte image, SHA-256
 `F69BB278AB44B768A373A2773882CC80D85A2EFEABF1903D0C39A99D0E349DAF`,
-linked at `$200000..$70214F`; it is not installed. The resident
-monitor remains build 242, and any future RAM stage must use its live `map`.
+linked at `$200000..$70214F`; that particular image was not installed.
+The later installed build 244 includes the source change and has the same
+image extent. Any future RAM stage must use the running monitor's live `map`.
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
