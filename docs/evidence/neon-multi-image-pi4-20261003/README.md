@@ -26,8 +26,9 @@ passed with stage 9, status zero and no Vulkan faults. The board returned to
 `pmf>`, `last run` reported a clean return, and the deadman was explicitly
 disabled. No boot image, flash or filesystem was changed.
 
-This verifies two simultaneous separate images on Pi 4, including the highest
-supported ID. The code has capacity for 16 IDs, but all 16 have not been
-loaded simultaneously on hardware. The indexed image draw currently covers
-untransformed rectangles; transformed sprite drawing still samples the atlas.
-Other boards have no hardware proof for this path.
+This run verifies two simultaneous separate images on Pi 4, including the
+highest supported ID. Subsequent
+[sixteen-image](../neon-sixteen-images-pi4-20261003/README.md) and
+[indexed-transform](../neon-multi-image-transform-pi4-20261003/README.md)
+RAM proofs cover all sixteen small images together and transformed ID 16
+drawing. Other boards have no hardware proof for this path.
