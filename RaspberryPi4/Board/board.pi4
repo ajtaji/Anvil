@@ -1184,7 +1184,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 241        ; pmf:build
+#ANVIL_BUILD = 242        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1193,7 +1193,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261002   ; pmf:builddate
-#ANVIL_BUILD_TIME = 201311     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 203100     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2701,6 +2701,40 @@ Procedure Main()
   ; exists, so the banner is followed by the log rather than by a pause.
   ScreenServiceTick()
 
+  ; The embedded face and framebuffer are ready before storage. Present the
+  ; first Vulkan frame now so PCIe, USB and mount progress is visible live.
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If gScreen <> 0
+    If AnvilTrueTypeSlotSelected() < 0 Or gScreenFontMetricFault <> 0
+      PrintN("!! TrueType face or metrics unavailable; screen rendering remains deferred.")
+    Else
+      vulkanBootRc = VulkanConsoleStart()
+      If vulkanBootRc = #AVC_OK
+        VulkanConsolePump()
+        If avcFramePresented <> 0
+          gScreenDeferFirstFrame = 0
+          PrintN("display renderer: Vulkan on V3D (NeonArcade); the preferred tier is up.")
+        Else
+          If VulkanConsoleReady() <> 0 : VulkanConsoleStop() : EndIf
+          ConNoRenderer()
+          PrintN("!! Vulkan did not present a first frame before storage; screen rendering remains deferred.")
+        EndIf
+      Else
+        ConNoRenderer()
+        Print("!! Vulkan console unavailable before storage (code ")
+        PrintDec(vulkanBootRc)
+        PrintN("); screen rendering remains deferred.")
+      EndIf
+    EndIf
+  EndIf
+  BootTimingMark(#BTM_V3D_END, Bool(VulkanConsoleReady() <> 0 Or gV3dConOn <> 0), 0)
+  CompilerElseIf #ANVIL_V3D_CONSOLE = 1
+  V3dConAutoStart()
+  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
+  CompilerElse
+  BootTimingMark(#BTM_V3D_END, 0, 0)
+  CompilerEndIf
+
   ; The slow half, now with somewhere to print. Every line of it lands on
   ; the panel as it is produced: StorageUp and UsbEnumerate call
   ; ScreenServiceTick themselves (boot.pi4), so this is live progress and
@@ -2723,41 +2757,6 @@ Procedure Main()
   HwClockSeed()
   CompilerEndIf
   NtpServiceBoot()
-  ; The screen first needs a live framebuffer for its banner and shared grid.
-  ; Once it exists, prefer the resident Vulkan/Neon renderer. A clean Vulkan
-  ; startup failure can fall back through native V3D to DMA/CPU. A quarantined
-  ; GPU must never be handed to a different renderer until ownership is safe.
-  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
-  If gScreen <> 0
-    If AnvilTrueTypeSlotSelected() < 0 Or gScreenFontMetricFault <> 0
-      PrintN("!! TrueType face or metrics unavailable; screen rendering remains deferred.")
-    Else
-      ; The first framebuffer text must be a completed TrueType Vulkan frame.
-      ; ScreenUp only established the surface and grid while this gate is set.
-      ScreenServiceTick()
-      vulkanBootRc = VulkanConsoleStart()
-      If vulkanBootRc = #AVC_OK
-        VulkanConsolePump()
-        If avcFramePresented <> 0
-          gScreenDeferFirstFrame = 0
-          PrintN("display renderer: Vulkan on V3D (NeonArcade); the preferred tier is up.")
-        Else
-          PrintN("!! Vulkan did not present a first frame; screen rendering remains deferred.")
-        EndIf
-      Else
-        Print("Vulkan console unavailable at boot (code ")
-        PrintDec(vulkanBootRc)
-        PrintN("); screen rendering remains deferred.")
-      EndIf
-    EndIf
-  EndIf
-  BootTimingMark(#BTM_V3D_END, Bool(VulkanConsoleReady() <> 0 Or gV3dConOn <> 0), 0)
-  CompilerElseIf #ANVIL_V3D_CONSOLE = 1
-  V3dConAutoStart()
-  BootTimingMark(#BTM_V3D_END, gV3dConOn, 0)
-  CompilerElse
-  BootTimingMark(#BTM_V3D_END, 0, 0)
-  CompilerEndIf
   ScreenEarlyLogFinish()
   GenetSetProgressHook(@ScreenServiceTick)
   NetWaitSetProgressHook(@ScreenServiceTick)
