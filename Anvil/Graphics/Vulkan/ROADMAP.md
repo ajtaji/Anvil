@@ -165,8 +165,16 @@ with 12 report probes passing. CPU work copied the completed GPU attachment to
 RAM for observation; it did not render pixels. See
 `docs/evidence/vulkan-neon-fan-line-pi4-20261001/README.md`. The earlier
 2026-09-26 all-15-scene run at `a6b9a93` remains historical evidence for that
-source. A fresh current-tree all-15-scene run and HDMI/DSI/rotation/resize and
-clean recovery coverage remain.
+source. The current-source all-15-scene Pi 4 run on build 242 matched 245,760
+native reference pixel bytes and passed 124 widget checks; see
+`docs/VULKAN_NEON_ALL15_CURRENT_PI4.md`. The same sampled atlas path now accepts
+one registered RGBA8 sprite with bounded crop, destination scaling and tint.
+Four Pi 4 V3D draws produced six exact sprite pixels, including transparent
+and half-alpha texels; see
+`docs/evidence/neon-sprite-pi4-20261002/README.md`. Sprite rotation, camera
+mapping, multiple simultaneous images, and other board backends remain open.
+HDMI/DSI/rotation/resize and clean recovery coverage beyond these bounded
+scenes also remain.
 
 ## API and object gaps
 
