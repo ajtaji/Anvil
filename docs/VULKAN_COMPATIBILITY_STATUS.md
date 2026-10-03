@@ -52,6 +52,18 @@ V3D implementation and shader records remain Pi 4/V3D 4.2. There is no Pi 5
 Vulkan hardware-acceleration claim; the current tree has not been rerun on
 Pi 5 silicon during this work.
 
+On Pi 4, the Neon Vulkan adapter now has one separately allocated sampled
+RGBA8 sprite image beside its shared TrueType/sprite atlas. A returning RAM
+proof on resident build 242 verified interleaved atlas and separate-image
+draws, exact BGRA pixels, an oversized replacement refusal that preserved the
+resident image, and two successful small replacements. The Vulkan object tables
+have reserve capacity for more images, but this API currently exposes one
+separate sprite image; other boards have no hardware proof for it. The full
+monitor compiles with this source but was not installed. Its compiled extent
+crosses `$700000`, so future RAM payload staging must follow that monitor's
+live `map` output. Evidence is in
+`docs/evidence/neon-separate-sprite-pi4-20261002/`.
+
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
