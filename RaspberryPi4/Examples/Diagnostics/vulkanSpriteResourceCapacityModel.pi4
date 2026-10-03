@@ -1,0 +1,134 @@
+; Object-table and heap refusal model. This uses the state-only Vulkan test
+; backend; it never samples an image or claims a Pi 4 pixel result.
+; Build with --entry-returns. x0 is zero on success or the first failed gate.
+
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+CompilerIf #ANVIL_VK_MAX_IMAGES < 25 Or #ANVIL_VK_MAX_IMAGE_VIEWS < 21 Or #ANVIL_VK_MAX_DESCRIPTOR_SETS < 21 Or #ANVIL_VK_MAX_MEMORY < 34
+  CompilerError "Sprite resource profile lacks sixteen images and one replacement generation"
+CompilerEndIf
+
+#SRC_HEAP_BYTES = 262144
+Global Dim srcHeap.a[#SRC_HEAP_BYTES - 1]
+Global Dim srcImages.i[#ANVIL_VK_MAX_IMAGES]
+Global Dim srcViews.i[#ANVIL_VK_MAX_IMAGE_VIEWS]
+Global Dim srcMemory.i[#ANVIL_VK_MAX_MEMORY]
+Global Dim srcSets.i[#ANVIL_VK_MAX_DESCRIPTOR_SETS]
+
+Procedure.i Main()
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define alloc.VkMemoryAllocateInfo
+  Define binding.VkDescriptorSetLayoutBinding
+  Define layoutInfo.VkDescriptorSetLayoutCreateInfo
+  Define poolSize.VkDescriptorPoolSize
+  Define poolInfo.VkDescriptorPoolCreateInfo
+  Define setInfo.VkDescriptorSetAllocateInfo
+  Define memoryProps.VkPhysicalDeviceMemoryProperties
+  Define instance.i, physical.i, device.i, count.i, rc.i, i.i
+  Define layout.i, pool.i, oneLayout.i, spare.i, priority.l
+
+  AnvilVkTestBackendHeap(@srcHeap[0], #SRC_HEAP_BYTES)
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  If vkCreateInstance(@ici, 0, @instance) <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  count = 1
+  If vkEnumeratePhysicalDevices(instance, @count, @physical) <> #VK_SUCCESS Or count <> 1 : ProcedureReturn 2 : EndIf
+  vkGetPhysicalDeviceMemoryProperties(physical, @memoryProps)
+  If memoryProps\memoryHeapCount <> 1 Or memoryProps\memoryHeaps[0]\size <> #SRC_HEAP_BYTES : ProcedureReturn 3 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  If vkCreateDevice(physical, @dci, 0, @device) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+
+  ; A request larger than the reported heap must fail before a slot is
+  ; published. A subsequent small allocation proves the refusal is atomic.
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\memoryTypeIndex = 0 : alloc\allocationSize = #SRC_HEAP_BYTES + 1
+  spare = 123
+  rc = vkAllocateMemory(device, @alloc, 0, @spare)
+  If rc <> #VK_ERROR_OUT_OF_DEVICE_MEMORY Or spare <> 0 : ProcedureReturn 5 : EndIf
+  alloc\allocationSize = 4096
+  For i = 1 To #ANVIL_VK_MAX_MEMORY
+    If vkAllocateMemory(device, @alloc, 0, @srcMemory[i]) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  Next
+  rc = vkAllocateMemory(device, @alloc, 0, @spare)
+  If rc <> #VK_ERROR_TOO_MANY_OBJECTS Or spare <> 0 : ProcedureReturn 7 : EndIf
+  vkFreeMemory(device, srcMemory[1], 0)
+  If vkAllocateMemory(device, @alloc, 0, @spare) <> #VK_SUCCESS : ProcedureReturn 8 : EndIf
+  vkFreeMemory(device, spare, 0)
+  srcMemory[1] = 0
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = 1 : imageInfo\extent\height = 1 : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1 : imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  For i = 1 To #ANVIL_VK_MAX_IMAGES
+    If vkCreateImage(device, @imageInfo, 0, @srcImages[i]) <> #VK_SUCCESS : ProcedureReturn 9 : EndIf
+  Next
+  spare = 123
+  rc = vkCreateImage(device, @imageInfo, 0, @spare)
+  If rc <> #VK_ERROR_TOO_MANY_OBJECTS Or spare <> 0 : ProcedureReturn 10 : EndIf
+  vkDestroyImage(device, srcImages[1], 0)
+  If vkCreateImage(device, @imageInfo, 0, @spare) <> #VK_SUCCESS : ProcedureReturn 11 : EndIf
+  srcImages[1] = spare
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = srcImages[1] : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  For i = 1 To #ANVIL_VK_MAX_IMAGE_VIEWS
+    If vkCreateImageView(device, @viewInfo, 0, @srcViews[i]) <> #VK_SUCCESS : ProcedureReturn 12 : EndIf
+  Next
+  spare = 123
+  rc = vkCreateImageView(device, @viewInfo, 0, @spare)
+  If rc <> #VK_ERROR_TOO_MANY_OBJECTS Or spare <> 0 : ProcedureReturn 13 : EndIf
+  vkDestroyImageView(device, srcViews[1], 0)
+  If vkCreateImageView(device, @viewInfo, 0, @spare) <> #VK_SUCCESS : ProcedureReturn 14 : EndIf
+  srcViews[1] = spare
+
+  binding\binding = 0 : binding\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  binding\descriptorCount = 1 : binding\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  layoutInfo\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  layoutInfo\bindingCount = 1 : layoutInfo\pBindings = @binding
+  If vkCreateDescriptorSetLayout(device, @layoutInfo, 0, @layout) <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+  poolSize\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+  poolSize\descriptorCount = #ANVIL_VK_MAX_DESCRIPTOR_SETS
+  poolInfo\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  poolInfo\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  poolInfo\maxSets = #ANVIL_VK_MAX_DESCRIPTOR_SETS
+  poolInfo\poolSizeCount = 1 : poolInfo\pPoolSizes = @poolSize
+  If vkCreateDescriptorPool(device, @poolInfo, 0, @pool) <> #VK_SUCCESS : ProcedureReturn 16 : EndIf
+  oneLayout = layout
+  setInfo\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  setInfo\descriptorPool = pool : setInfo\descriptorSetCount = 1 : setInfo\pSetLayouts = @oneLayout
+  For i = 1 To #ANVIL_VK_MAX_DESCRIPTOR_SETS
+    If vkAllocateDescriptorSets(device, @setInfo, @srcSets[i]) <> #VK_SUCCESS : ProcedureReturn 17 : EndIf
+  Next
+  spare = 123
+  rc = vkAllocateDescriptorSets(device, @setInfo, @spare)
+  If rc <> #VK_ERROR_OUT_OF_POOL_MEMORY Or spare <> 0 : ProcedureReturn 18 : EndIf
+  If vkFreeDescriptorSets(device, pool, 1, @srcSets[1]) <> #VK_SUCCESS : ProcedureReturn 19 : EndIf
+  If vkAllocateDescriptorSets(device, @setInfo, @spare) <> #VK_SUCCESS : ProcedureReturn 20 : EndIf
+  srcSets[1] = spare
+
+  vkDestroyDescriptorPool(device, pool, 0)
+  vkDestroyDescriptorSetLayout(device, layout, 0)
+  For i = 1 To #ANVIL_VK_MAX_IMAGE_VIEWS : vkDestroyImageView(device, srcViews[i], 0) : Next
+  For i = 1 To #ANVIL_VK_MAX_IMAGES : vkDestroyImage(device, srcImages[i], 0) : Next
+  For i = 2 To #ANVIL_VK_MAX_MEMORY : vkFreeMemory(device, srcMemory[i], 0) : Next
+  vkDestroyDevice(device, 0)
+  vkDestroyInstance(instance, 0)
+  ProcedureReturn 0
+EndProcedure

@@ -41,6 +41,19 @@ lowered shape. A frame-level preflight is required where the caller declares a
 bounded batch or where resource replacement could otherwise leave a partial
 frame. A refusal leaves the public state and already recorded sequence intact.
 
+The Vulkan object tables now provide 25 image slots, 21 image-view slots,
+21 descriptor-set slots, and 34 memory-allocation slots. The added rows
+reserve table room for sixteen sprite resources, one replacement generation,
+and one transient staging allocation above the prior budgets of 8 images,
+4 views, 4 sets, and 16 allocations. The Pi 4 heap remains the byte window
+supplied to `AnvilVkV3dWindow`; the table increase does not enlarge it.
+Before a sprite transaction, the caller must query each
+image's `vkGetImageMemoryRequirements`, include staging and existing resident
+allocations, compare the required bytes with the reported heap size, and
+still treat each allocation result as authoritative because alignment and
+fragmentation can refuse a fit. The table increase alone establishes no
+separate-image sprite render path.
+
 # Atlas generations
 
 The CPU atlas is a borrowed view owned by Neon. A Vulkan atlas resource owns

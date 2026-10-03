@@ -299,7 +299,7 @@ Procedure.i AnvilVkDescriptorPoolCreate(device.i, *ci.VkDescriptorPoolCreateInfo
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given a creation flag this implementation does not have (Anvil code -20005, unsupported flags); no pool was created.")
   EndIf
   If (*ci\maxSets & $FFFFFFFF) < 1 Or (*ci\maxSets & $FFFFFFFF) > #ANVIL_VK_MAX_DESCRIPTOR_SETS
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given a maxSets of zero or more than four (Anvil code -20005, unsupported pool size); this implementation holds four descriptor sets in total.")
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateDescriptorPool was given a maxSets of zero or above the configured descriptor-set limit (Anvil code -20005, unsupported pool size); reduce maxSets to the supported table capacity.")
   EndIf
   n = *ci\poolSizeCount & $FFFFFFFF
   If n < 1 Or *ci\pPoolSizes = 0
