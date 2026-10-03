@@ -175,8 +175,13 @@ and half-alpha texels; see
 matched eleven transformed sprite pixels for a clockwise quarter-turn, camera
 translation/2× zoom and ignored-camera draw; an extreme coordinate was
 rejected before fixed-point math. See
-`docs/evidence/neon-sprite-transform-pi4-20261002/README.md`. Multiple
-simultaneous images, desktop Neon Vulkan integration, and other board backends
+`docs/evidence/neon-sprite-transform-pi4-20261002/README.md`. A subsequent
+bounded Pi 4 proof registered multiple stable-ID RGBA sprites alongside the
+legacy source in the shared atlas, including a wrapped row. Four V3D draws,
+24 vertices and eight exact BGRA probes passed; an oversized two-image layout
+was refused before Vulkan allocation. See
+`docs/evidence/neon-multi-sprite-pi4-20261002/README.md`. Desktop Neon Vulkan
+integration, dynamic image replacement while active, and other board backends
 remain open.
 HDMI/DSI/rotation/resize and clean recovery coverage beyond these bounded
 scenes also remain.

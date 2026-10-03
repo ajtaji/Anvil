@@ -33,6 +33,8 @@
 #NVC_SPRITE_PI_Q16             = 205887
 #NVC_SPRITE_HALF_PI_Q16        = 102944
 #NVC_SPRITE_MAX_ANGLE_Q16      = 6588400 ; sixteen signed turns
+#NVC_MULTI_SPRITE_MAX          = 16
+#NVC_SPRITE_SHELF_H            = 256
 #NEON_VK_CHROME_TT_ATLAS_W     = 512
 ; Keep the image and persistent staging buffer within the shared 16 MiB
 ; Vulkan heap alongside renderer targets, vertices, and backend state. A
@@ -120,14 +122,20 @@ Global nvcAtlasUploadMapped.i
 Global nvcAtlasUploadCount.i
 Global nvcAtlasGeneration.i
 Global nvcAtlasFaulted.i
-; One optional RGB or RGBA sprite occupies a bounded shelf below the TrueType cache.
-; It shares the existing sampled atlas, so it needs no second image allocation.
+; The legacy RGB/RGBA source and sixteen stable-ID RGBA sources share a bounded
+; shelf below the TrueType cache and the existing sampled atlas allocation.
 Global nvcLogoSource.i
 Global nvcLogoW.i
 Global nvcLogoH.i
 Global nvcLogoChannels.i
+Global nvcLogoX.i
 Global nvcLogoY.i
 Global nvcTTLimitY.i
+Global Dim nvcSpriteSource.i[#NVC_MULTI_SPRITE_MAX]
+Global Dim nvcSpriteW.i[#NVC_MULTI_SPRITE_MAX]
+Global Dim nvcSpriteH.i[#NVC_MULTI_SPRITE_MAX]
+Global Dim nvcSpriteX.i[#NVC_MULTI_SPRITE_MAX]
+Global Dim nvcSpriteY.i[#NVC_MULTI_SPRITE_MAX]
 Global nvcSpriteAtanReady.i
 Global Dim nvcSpriteAtanQ16.i[16]
 ; Preserve the first failing create boundary before rollback can replace the
@@ -254,6 +262,24 @@ Procedure.i NeonVkChromeSpriteSource(*rgba, width.i, height.i)
     ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
   EndIf
   nvcLogoSource = *rgba : nvcLogoW = width : nvcLogoH = height : nvcLogoChannels = 4
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Stable IDs are 1..16. Source memory must remain valid for
+; every later Create until replaced or cleared. Registration may be changed
+; only while Chrome is destroyed. The legacy source is independent.
+Procedure.i NeonVkChromeSpriteRegister(id.i, *rgba, width.i, height.i)
+  If nvcReady <> 0 Or nvcInFrame <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn #NEON_VK_CHROME_ERR_ARGS : EndIf
+  If *rgba = 0 And width = 0 And height = 0
+    nvcSpriteSource[id] = 0 : nvcSpriteW[id] = 0 : nvcSpriteH[id] = 0
+    nvcSpriteX[id] = 0 : nvcSpriteY[id] = 0
+    ProcedureReturn #NEON_VK_CHROME_OK
+  EndIf
+  If *rgba = 0 Or width < 1 Or width > (#NEON_VK_CHROME_TT_ATLAS_W - 32) Or height < 1 Or height > #NVC_SPRITE_SHELF_H
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  nvcSpriteSource[id] = *rgba : nvcSpriteW[id] = width : nvcSpriteH[id] = height
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
@@ -625,6 +651,50 @@ Procedure.i nvcBuildFragmentShader()
   ProcedureReturn vtpN * 4
 EndProcedure
 
+Procedure.i nvcSpriteShelfPlan()
+  Define slot.i, itemSource.i, itemW.i, itemH.i, itemChannels.i
+  Define shelfX.i, shelfY.i, shelfRowH.i, shelfUsedH.i
+  nvcTTLimitY = nvcAtlasH
+  nvcLogoX = 0 : nvcLogoY = 0
+  shelfX = 32 : shelfY = 0 : shelfRowH = 0 : shelfUsedH = 0
+  ; Pack in ID order, leaving one texel between entries and rows. The layout
+  ; is fully validated before any Vulkan image or staging allocation.
+  For slot = 0 To #NVC_MULTI_SPRITE_MAX
+    itemSource = 0 : itemW = 0 : itemH = 0 : itemChannels = 4
+    If slot = 0
+      itemSource = nvcLogoSource : itemW = nvcLogoW : itemH = nvcLogoH : itemChannels = nvcLogoChannels
+    Else
+      itemSource = nvcSpriteSource[slot] : itemW = nvcSpriteW[slot] : itemH = nvcSpriteH[slot]
+    EndIf
+    If itemSource <> 0
+      If itemW < 1 Or itemW > nvcAtlasW - 32 Or itemH < 1 Or itemH > #NVC_SPRITE_SHELF_H Or (itemChannels <> 3 And itemChannels <> 4)
+        ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+      EndIf
+      If shelfX + itemW > nvcAtlasW
+        shelfX = 32 : shelfY = shelfY + shelfRowH + 1 : shelfRowH = 0
+      EndIf
+      If shelfY + itemH > #NVC_SPRITE_SHELF_H : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+      If slot = 0
+        nvcLogoX = shelfX : nvcLogoY = shelfY
+      Else
+        nvcSpriteX[slot] = shelfX : nvcSpriteY[slot] = shelfY
+      EndIf
+      If itemH > shelfRowH : shelfRowH = itemH : EndIf
+      If shelfY + shelfRowH > shelfUsedH : shelfUsedH = shelfY + shelfRowH : EndIf
+      shelfX = shelfX + itemW + 1
+    EndIf
+  Next
+  If shelfUsedH > 0
+    nvcTTLimitY = nvcAtlasH - shelfUsedH - 1
+    If nvcTTLimitY < 2 : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+    If nvcLogoSource <> 0 : nvcLogoY = nvcLogoY + nvcTTLimitY + 1 : EndIf
+    For slot = 1 To #NVC_MULTI_SPRITE_MAX
+      If nvcSpriteSource[slot] <> 0 : nvcSpriteY[slot] = nvcSpriteY[slot] + nvcTTLimitY + 1 : EndIf
+    Next
+  EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 Procedure.i nvcAtlasCreateAndUpload()
   Define ici.VkImageCreateInfo
   Define imageProps.VkImageFormatProperties
@@ -653,6 +723,13 @@ Procedure.i nvcAtlasCreateAndUpload()
   Define logoG.i
   Define logoB.i
   Define logoA.i
+  Define slot.i
+  Define itemSource.i
+  Define itemW.i
+  Define itemH.i
+  Define itemChannels.i
+  Define itemX.i
+  Define itemY.i
   Define white.NeonAtlasGlyphUV
 
   rc = Neon_AtlasRasterEnsure()
@@ -669,16 +746,6 @@ Procedure.i nvcAtlasCreateAndUpload()
   nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W
   nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
   If nvcAtlasBaseH > nvcAtlasH : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
-  nvcTTLimitY = nvcAtlasH
-  nvcLogoY = 0
-  If nvcLogoSource <> 0
-    If nvcLogoW < 1 Or nvcLogoW > nvcAtlasW - 32 Or nvcLogoH < 1 Or nvcLogoH > 256 Or (nvcLogoChannels <> 3 And nvcLogoChannels <> 4)
-      ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
-    EndIf
-    nvcLogoY = nvcAtlasH - nvcLogoH
-    nvcTTLimitY = nvcLogoY
-    If nvcTTLimitY < 2 : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
-  EndIf
   nvcAtlasBytes = nvcAtlasW * nvcAtlasH * 4
   bytes = nvcAtlasBytes
   If bytes < sourceBytes Or bytes > 8388608
@@ -728,18 +795,28 @@ Procedure.i nvcAtlasCreateAndUpload()
   Wend
   nvcAtlasUploadMapped = mapped
   If nvcBitmapStageCopy(source, nvcAtlasBaseW, nvcAtlasBaseH) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
-  If nvcLogoSource <> 0
-    For y = 0 To nvcLogoH - 1
-      For x = 0 To nvcLogoW - 1
-        i = nvcLogoSource + (y * nvcLogoW + x) * nvcLogoChannels
-        logoR = PeekA(i) : logoG = PeekA(i + 1) : logoB = PeekA(i + 2)
-        logoA = 255
-        If nvcLogoChannels = 4 : logoA = PeekA(i + 3) : EndIf
-        logoX = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (((nvcLogoY + y) * nvcAtlasW + 32 + x) * 4)
-        PokeL(logoX, (logoA << 24) | (logoR << 16) | (logoG << 8) | logoB)
+  For slot = 0 To #NVC_MULTI_SPRITE_MAX
+    itemSource = 0 : itemW = 0 : itemH = 0 : itemChannels = 4 : itemX = 0 : itemY = 0
+    If slot = 0
+      itemSource = nvcLogoSource : itemW = nvcLogoW : itemH = nvcLogoH
+      itemChannels = nvcLogoChannels : itemX = nvcLogoX : itemY = nvcLogoY
+    Else
+      itemSource = nvcSpriteSource[slot] : itemW = nvcSpriteW[slot] : itemH = nvcSpriteH[slot]
+      itemX = nvcSpriteX[slot] : itemY = nvcSpriteY[slot]
+    EndIf
+    If itemSource <> 0
+      For y = 0 To itemH - 1
+        For x = 0 To itemW - 1
+          i = itemSource + (y * itemW + x) * itemChannels
+          logoR = PeekA(i) : logoG = PeekA(i + 1) : logoB = PeekA(i + 2)
+          logoA = 255
+          If itemChannels = 4 : logoA = PeekA(i + 3) : EndIf
+          logoX = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (((itemY + y) * nvcAtlasW + itemX + x) * 4)
+          PokeL(logoX, (logoA << 24) | (logoR << 16) | (logoG << 8) | logoB)
+        Next
       Next
-    Next
-  EndIf
+    EndIf
+  Next
   nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
@@ -987,6 +1064,9 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
   nvcError = 0
   nvcCreateStage = 0 : nvcCreateFaultCode = 0 : nvcCreateFaultText = 0
+  nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W : nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
+  rc = nvcSpriteShelfPlan()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nvcFail(rc) : EndIf
   nvdPresentClear()
 
   cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
@@ -1300,47 +1380,58 @@ Procedure.i nvcDraw(first.i, count.i, colour.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
-; Match Neon's source-rectangle, destination-size and tint sprite semantics.
-; Rotation and camera mapping remain the caller's concern in this bounded path.
-Procedure.i NeonVkChromeSprite(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+; Shared source-rectangle, destination-size and tint path for the legacy slot
+; and every stable-ID atlas entry.
+Procedure.i nvcSpriteRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i)
   Define first.i
   Define u0.i, v0.i, u1.i, v1.i
-  If nvcInFrame = 0 Or nvcLogoSource = 0 Or nvcLogoW < 1 Or nvcLogoH < 1
+  If nvcInFrame = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  If sourceX >= nvcLogoW Or sourceY >= nvcLogoH Or sourceW > nvcLogoW - sourceX Or sourceH > nvcLogoH - sourceY
+  If sourceX >= spriteW Or sourceY >= spriteH Or sourceW > spriteW - sourceX Or sourceH > spriteH - sourceY
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
   If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
-  u0 = neon_F32Ratio(32 + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(32 + sourceX + sourceW, nvcAtlasW)
-  v0 = neon_F32Ratio(nvcLogoY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + sourceY + sourceH, nvcAtlasH)
+  u0 = neon_F32Ratio(atlasX + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, nvcAtlasW)
+  v0 = neon_F32Ratio(atlasY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, nvcAtlasH)
   first = nvcVertices
   nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
   ProcedureReturn nvcDraw(first, 6, colour)
 EndProcedure
 
+Procedure.i NeonVkChromeSprite(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+  If nvcLogoSource = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ProcedureReturn nvcSpriteRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH)
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteDraw(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If nvcSpriteSource[id] = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ProcedureReturn nvcSpriteRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id])
+EndProcedure
+
 ; `x,y` and `drawW,drawH` are Neon's pre-camera top-left and scaled size.
 ; Camera coordinates are in the same logical canvas. A positive Q16 radian
 ; angle rotates clockwise on the screen, as in DrawGLSprite. `zoomQ16=65536`
 ; is 1.0. This records vertices only; V3D samples/blends the image.
-Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i)
   Define xQ8.i, yQ8.i, wQ8.i, hQ8.i, centerXQ8.i, centerYQ8.i
   Define halfWQ8.i, halfHQ8.i, cosQ16.i, sinQ16.i, first.i
   Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
   Define u0.i, u1.i, v0.i, v1.i
-  If nvcInFrame = 0 Or nvcLogoSource = 0 Or nvcLogoW < 1 Or nvcLogoH < 1
+  If nvcInFrame = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  If sourceX >= nvcLogoW Or sourceY >= nvcLogoH Or sourceW > nvcLogoW - sourceX Or sourceH > nvcLogoH - sourceY
+  If sourceX >= spriteW Or sourceY >= spriteH Or sourceW > spriteW - sourceX Or sourceH > spriteH - sourceY
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
   ; These input limits precede every fixed-point product and turn reduction.
@@ -1384,8 +1475,8 @@ Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.
   If blX < -#NVC_SPRITE_Q8_LIMIT Or blX > #NVC_SPRITE_Q8_LIMIT Or blY < -#NVC_SPRITE_Q8_LIMIT Or blY > #NVC_SPRITE_Q8_LIMIT Or brX < -#NVC_SPRITE_Q8_LIMIT Or brX > #NVC_SPRITE_Q8_LIMIT Or brY < -#NVC_SPRITE_Q8_LIMIT Or brY > #NVC_SPRITE_Q8_LIMIT
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  u0 = neon_F32Ratio(32 + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(32 + sourceX + sourceW, nvcAtlasW)
-  v0 = neon_F32Ratio(nvcLogoY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + sourceY + sourceH, nvcAtlasH)
+  u0 = neon_F32Ratio(atlasX + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, nvcAtlasW)
+  v0 = neon_F32Ratio(atlasY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, nvcAtlasH)
   first = nvcVertices
   nvcSpriteVertexQ8(first + 0, tlX, tlY, u0, v0)
   nvcSpriteVertexQ8(first + 1, blX, blY, u0, v1)
@@ -1395,6 +1486,17 @@ Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.
   nvcSpriteVertexQ8(first + 5, trX, trY, u1, v0)
   nvcVertices = nvcVertices + 6
   ProcedureReturn nvcDraw(first, 6, colour)
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  If nvcLogoSource = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH)
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteDrawTransform(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If nvcSpriteSource[id] = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id])
 EndProcedure
 
 ; Preserve the original full-size, opaque RGB logo call.
