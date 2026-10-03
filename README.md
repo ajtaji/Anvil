@@ -125,10 +125,11 @@ long version of all of this, including the EL3 stub and how to keep a way back.
 
 | Target | Boot model | Current status |
 |---|---|---|
-| Raspberry Pi 4 / BCM2711 / Cortex-A72 | Bare-metal AArch64 image (`pi4`, build 214) | Mature target. The current distribution package selects the required custom EL3 stub. Hardware acceptance is recorded for Build 99; Build 214 is the current compiled artifact, not a new hardware-validation claim. Existing proofs cover HDMI/DSI, DMA console, wired/Wi-Fi networking and the experimental Vulkan-compatible V3D subset. |
+| Raspberry Pi 4 / BCM2711 / Cortex-A72 | Bare-metal AArch64 image (`pi4`); packaged build 212, live monitor build 242 | Mature target. The package selects the required custom EL3 stub. Build 242 booted on hardware with the resident Vulkan/Neon console selected before USB and storage initialization; Wi-Fi, saved TrueType settings and the command prompt were verified after reboot. The bounded V3D Vulkan path passed a current-source 15-scene exact-pixel proof. The older package image below is not build 242. |
 | Raspberry Pi 3 / BCM2837 / Cortex-A53 | Bare-metal AArch64 image (`pi3`, build 42) | Build 42 is the current compiled artifact. Hardware evidence through Build 35 covers EL3 boot, early TrueType, saved Wi-Fi/DHCP, transfer, and a VideoCore IV offscreen clear. The new HDMI connection lifecycle has emitted-code coverage and still needs a supervised hotplug run. USB host/Ethernet and Vulkan remain unimplemented. See [RaspberryPi3/README.md](RaspberryPi3/README.md). |
 | Arduino UNO Q / QCM2290 / Cortex-A53 | AArch64 UEFI application (`unoq`, build 83) | Experimental; Build 83 compiles with the shared display policy inert and is not new display or boot proof. It requires an existing UEFI environment, and current application entry is EL1, below Anvil's mandatory EL3 runtime policy. See [ArduinoQ/README.md](ArduinoQ/README.md). |
-| ROCK Pi 4C / RK3399 / Cortex-A72 + A53 | Direct-SD BL3X trust image (`rockpi4c`, build 99) | Experimental hardware target. Build 99 boots from SD at EL3, owns the exFAT filesystem, updates both trust copies with readback, and uses acknowledged 16 KiB serial windows. A 2 MiB filesystem download matched the host SHA-256. HDMI remains a diagnostic path and networking is unavailable. See [RockPi4C/README.md](RockPi4C/README.md). |
+| ROCK Pi 4C / RK3399 / Cortex-A72 + A53 | Direct-SD BL3X trust image (`rockpi4c`, packaged build 147) | Experimental hardware target. Build 147 boots Anvil from SD at EL3 with exFAT and eMMC file commands, acknowledged serial transfers and 1920×1080 HDMI. RGA2 accelerates console publication, and guarded Mali fragment jobs have drawn bounded payload images; production Vulkan/Mali rendering and networking remain unavailable. See [RockPi4C/README.md](RockPi4C/README.md). |
+| Raspberry Pi 5 / BCM2712 | Shared Anvil monitor in `RaspberryPi4/Board/board.pi4` under `#PMF_CHIP = 2712`, with `RaspberryPi5/Board/armstub8-2712.asm` | Anvil booted at EL3 and reached `pmf>` on Pi 5 hardware from the `$80000` image at commit `f385c7b`. HDMI console, UART, caches, clock, memory and fan were observed; PCIe/RP1 failed to adopt the inbound window on that boot, so USB, storage and Ethernet were unavailable. Later driver and V3D 7.1 work is not a production Pi 5 Vulkan backend. See [RaspberryPi5/README.md](RaspberryPi5/README.md). |
 
 The Pi 4 HDMI DDC combined fixture currently loses its preferred timing after
 EDID parsing; this host-gate failure is unresolved and does not establish a
@@ -152,8 +153,8 @@ for tested behavior and limits.
 | `Boards/RaspberryPi4/sdcard/` | `armstub8.bin` | — | 512 | `9f96324d137ebb4c1452ab00477ffe8c5bf77c53a3bb80ae7fb34234d693f2a2` |
 | `Boards/ArduinoQ/uefi/` | `anvil.efi` | 81 | 693,760 | `989c12292a0345895394b90841b29fcc8d0667f792d28dd7a598f689b0279a84` |
 | `Boards/RockPi4C/uboot/` | `Image` | 81 | 244,828 | `ea50e18081b082eb25af06980fbeae9315c92ba8e8e29fc78643b76cff0aaab7` |
-| `Boards/RockPi4C/direct-sd/` | `anvil.bin` | 99 | 1,669,536 | `34d6bec594437e8b8946a27bbc91e3cf745aba45be98db87e92831783792258b` |
-| `Boards/RockPi4C/direct-sd/` | `trust-anvil.img` | 99 | 4,194,304 | `d145f9ad1cc079af28908f0b9bdfa31d55abe320d580505fd92a5755465c6c3e` |
+| `Boards/RockPi4C/direct-sd/` | `anvil.bin` | 147 | 1,671,168 | `6cd269ee9d428e4335d6ade43432c753360f8d856c9694aef5e27b54bceba7ed` |
+| `Boards/RockPi4C/direct-sd/` | `trust-anvil.img` | 147 | 4,194,304 | `36017c6cb8889c4a1fb754d7112040c5facbc773d4765f8731d756cb854ba60b` |
 
 Each package includes its own `SHA256SUMS` and build manifest. Pi 3 and Pi 4
 ship a custom EL3 stub with the monitor. The UNO Q application and the packaged
@@ -161,23 +162,16 @@ ROCK Pi U-Boot `Image` remain legacy experimental artifacts. The Rock Pi
 direct-SD package is the current EL3 hardware-accepted path; its trust image
 updates the fixed Anvil range on a card with the tested DDR/miniloader layout.
 
-The Pi 3 currently has a hardware-proven VideoCore IV identity and offscreen
-clear path; it has no Vulkan implementation. The experimental Pi 4 Vulkan path
-records bounded ordered draw lists,
-exact source-over blending and public per-draw dynamic scissors, lowers a
-complete list through one V3D bin/render transaction, batches its cache ranges
-under one final barrier, and presents the finished attachment through display
-DMA. The final 8x8 optimal-atlas IDE-chrome acceptance scene passed on the Pi 4:
-build 148 returned exact `x0=0x6C85A0`, its 211-check report/pixel oracle passed,
-and the run recorded one TFU advance, one bin/render pair and one DMA
-presentation with a clean rotated 800x1280 capture. A resident Vulkan-backed
-Neon adapter is now desk-green: the existing panel, menu, text and clipped-list
-widgets run unchanged through persistent atlas, descriptor, pipeline and vertex
-resources, 47 ordered draws, dynamic scissors, one frame submission and one
-display-owner present intent. Its production full-stack image compiles and its
-emitted/source/mutation gates pass, but this exact adapter frame still awaits
-the shared Pi 4 lease and screenshot proof. This remains an experimental
-bounded subset, not a Vulkan conformance claim.
+The Pi 3 has a hardware-proven VideoCore IV identity and offscreen clear path;
+its monitor has no Vulkan backend. On Pi 4, the bounded Vulkan path records
+ordered draws, source-over blending and dynamic scissor, executes graphics on
+V3D, and presents through display DMA. The current-source 15-scene Neon run on
+build 242 matched all 245,760 reference pixel bytes, passed 124 widget checks,
+and returned safely with a screenshot and the deadman off. The resident
+Vulkan/Neon console was also verified on a normal build-242 boot, including
+saved TrueType settings and Wi-Fi. See
+[the current Pi 4 proof](docs/VULKAN_NEON_ALL15_CURRENT_PI4.md). This is a
+bounded implementation, not Vulkan conformance.
 
 The read-only Neon atlas contract now also reserves and publishes an opaque
 white texel so solid boxes and glyphs share one sampled+tinted pipeline. Its
@@ -374,10 +368,11 @@ on-board use.
   records exist and have executable tests. Neither board activates the engine
   yet; discovery, loading, service binding, and safe reload are not present.
 - **Vulkan compatibility:** the tree contains a pinned core-1.0 vocabulary
-  slice, native object/command-buffer lifecycle work, and an explicitly named
-  V3D development clear path. Production exposes no Vulkan physical device.
-  Complete API vocabulary, memory and synchronization semantics, SPIR-V,
-  pipelines, WSI, fault recovery, and CTS remain on the roadmap.
+  slice and a bounded Pi 4 V3D physical device used by the resident console.
+  The Pi 3, ROCK Pi 4C, UNO Q and Pi 5 monitor paths have no production Vulkan
+  hardware backend, although Pi 5 V3D 7.1 TFU/CSD components have desk gates.
+  Complete Vulkan 1.0 behavior, general SPIR-V, WSI, fault
+  recovery and CTS remain on the roadmap.
 - **Current Pi integration:** lossless high-volume console modeling, rotated
   capture, banner activity, touch, and ongoing network changes must pass an
   integrated hardware run before they are described as released behavior.

@@ -59,11 +59,13 @@ a hardware sample-mask packet. Evidence:
 ### What this backend still cannot do, and says so
 
 The rotating Pi 4 pyramid demo (`docs/VULKAN_PYRAMID_DEMO_PI4_2026-09-27.md`)
-proves 12 V3D triangle renders and 12 DMA presentations on silicon. Its five
-3D points are still projected on the CPU and its faces sorted there because
-this vertex path accepts pass-through 2D positions and the render pass has no
-depth attachment. GPU vertex transformation and depth testing are the next
-rendering capabilities to add.
+proves 12 V3D triangle renders and 12 DMA presentations on silicon. Its
+coordinate and vertex QPUs now compute two three-component transform-row dot
+products and apply the per-vertex perspective scale. The CPU still computes
+the frame row coefficients and reciprocal scale, sorts faces, and uploads the
+vertex buffer. Clip Z/W remain fixed and the render pass has no depth
+attachment. General matrix/clip handling and hardware depth testing remain
+the next 3D rendering gaps; the existing XY transform is already on V3D.
 
 
 - **Extents beyond the proved capacity.** The backend accepts linear BGRA8

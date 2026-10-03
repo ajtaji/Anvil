@@ -31,14 +31,16 @@ limits before a conformance claim is possible.
 
 ## What exists now
 
-The normal Pi 4 build now attempts to start the resident Vulkan/Neon console
-after the framebuffer and shared grid are established. A clean startup failure
-tries the native V3D console, then leaves the DMA/CPU framebuffer renderer in
-place if the GPU is unavailable. An unsafe GPU-owner failure quarantines the
-screen rather than transferring ownership. The explicit `screen vulkan`,
-`screen v3d`, `screen dma`, and `screen cpu` commands remain available. This
-boot selection has passed compilation and owner-lifecycle desk checks; a boot
-of the new default on Pi 4 silicon is still to be verified.
+The normal Pi 4 build starts the resident Vulkan/Neon console after the
+framebuffer and shared grid are established. A clean startup failure tries the
+native V3D console, then leaves the DMA/CPU framebuffer renderer in place if
+the GPU is unavailable. An unsafe GPU handoff failure quarantines the screen
+rather than transferring ownership. The explicit `screen vulkan`, `screen v3d`,
+`screen dma`, and `screen cpu` commands remain available. Build 242 booted on
+Pi 4 hardware with the Vulkan console selected before USB/storage setup,
+then reached a real prompt over Wi-Fi; its saved TrueType settings and Vulkan
+painter remained active after reset. This verifies that boot selection on the
+measured Pi 4, not recovery on every display or network failure.
 
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
@@ -1240,3 +1242,5 @@ The direct buffer-fill route has a bounded Pi 4 silicon proof. A 16-word `vkCmdF
 ### Exact 256-tile partial optimal-image upload on Pi 4
 
 Four bounded Pi 4 RAM runs exercised two ordered `vkCmdCopyBufferToImage` calls into one 72×64 optimal BGRA8 image at aggregate budgets 64, 128, 192 and 256 complete UIF utiles. TFU initialization and an independent mapped UIF oracle established all 4,608 baseline texels before the partial work. The maximum run changed 4,096 texels and preserved 512 in the center gap, the checksum of all 1,536 padded UIF texels, 128 image guards and 64 source guards. Guarded DMA advanced 0→256 and backend jobs 1→3, while TFU stayed at one job after initialization; all error and fault checks passed. The full payload took 1.233617 seconds, with about 1.4 seconds observed by the monitor under a 15-second deadman and no flash. This measured bound applies to Pi 4 only; other backends remain fail-closed. See `docs/evidence/vulkan-two-partial-optimal-aggregate-pi4-20261001/README.md`.
+
+\n
