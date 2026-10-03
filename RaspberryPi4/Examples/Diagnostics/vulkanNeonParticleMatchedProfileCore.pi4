@@ -1,0 +1,431 @@
+; Shared implementation for matched CPU and CSD 10k returning profiles.
+; Set #NMP_GPU in a one-line wrapper before including this file.
+; Arm a 15-second deadman before a board run; never run as resident code.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd.pi4"
+
+CompilerIf #NMP_GPU
+  #NGP_MAGIC = $474D504E
+  #NGP_TAIL = $4E504D47
+CompilerElse
+  #NGP_MAGIC = $434D504E
+  #NGP_TAIL = $4E504D43
+CompilerEndIf
+#NGP_W = 800
+#NGP_H = 800
+#NGP_SURFACE = $06000000
+#NGP_SURFACE_PITCH = 3200
+#NGP_WINDOW = $063E8000
+#NGP_WINDOW_BYTES = $01000000
+#NGP_MAP_SPAN = $013E8000
+#NGP_ARENA = $0A000000
+#NGP_ARENA_BYTES = $01000000
+#NGP_PAGE = 4096
+#NGP_ITEMS = 10000
+#NGP_GROUPS = #NGP_ITEMS / 16
+#NGP_RECORD = 48
+#NGP_VERTEX = 24
+#NGP_LIVE = #NGP_ITEMS * 6 * #NGP_VERTEX
+#NGP_INPUT_LIVE = #NGP_ITEMS * #NGP_RECORD
+; One extra poison page makes an overrun observable even at an exact page end.
+#NGP_INPUT_ALLOC = ((#NGP_INPUT_LIVE + #NGP_PAGE - 1) / #NGP_PAGE + 1) * #NGP_PAGE
+#NGP_OUT_ALLOC = ((#NGP_LIVE + #NGP_PAGE - 1) / #NGP_PAGE + 1) * #NGP_PAGE
+#NGP_POISON = $A5A5A5A5
+#NGP_ONE = $3F800000
+#NGP_SETUP_BUDGET_US = 5000000
+#NGP_FRAME_BUDGET_US = 10000000
+#NGP_PIXEL_BUDGET_US = 11000000
+#NGP_WARMUP = 1
+#NGP_SAMPLES = 3
+
+; 64 little-endian report words, 256 bytes; x0 returns @ngpReport[0].
+Global Dim ngpReport.l[64]
+Global ngpInst.i, ngpPhys.i, ngpDev.i, ngpQueue.i, ngpPool.i
+Global ngpImage.i, ngpMemory.i, ngpView.i, ngpPass.i, ngpFramebuffer.i
+Global ngpImageBase.i, ngpImagePitch.i
+Global ngpVulkanSubmitted.i
+Global ngpStart.i
+Global Dim ngpParticles.NvcParticle[10000]
+
+Procedure.i ngpObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If ngpDev <> 0 : rc = vkDeviceWaitIdle(ngpDev) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If ngpFramebuffer <> 0 : vkDestroyFramebuffer(ngpDev, ngpFramebuffer, 0) : ngpFramebuffer = 0 : EndIf
+  If ngpPass <> 0 : vkDestroyRenderPass(ngpDev, ngpPass, 0) : ngpPass = 0 : EndIf
+  If ngpView <> 0 : vkDestroyImageView(ngpDev, ngpView, 0) : ngpView = 0 : EndIf
+  If ngpImage <> 0 : vkDestroyImage(ngpDev, ngpImage, 0) : ngpImage = 0 : EndIf
+  If ngpMemory <> 0 : vkFreeMemory(ngpDev, ngpMemory, 0) : ngpMemory = 0 : EndIf
+  If ngpPool <> 0 : vkDestroyCommandPool(ngpDev, ngpPool, 0) : ngpPool = 0 : EndIf
+  If ngpDev <> 0 : vkDestroyDevice(ngpDev, 0) : ngpDev = 0 : EndIf
+  If ngpInst <> 0 : vkDestroyInstance(ngpInst, 0) : ngpInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpInside(base.i, bytes.i)
+  If base < #NGP_WINDOW Or bytes <= 0 Or base > $FFFFFFFF
+    ProcedureReturn 0
+  EndIf
+  If bytes > #NGP_WINDOW_BYTES Or (base - #NGP_WINDOW) > (#NGP_WINDOW_BYTES - bytes)
+    ProcedureReturn 0
+  EndIf
+  If base > ($FFFFFFFF - (bytes - 1)) : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpOverlap(a.i, aBytes.i, b.i, bBytes.i)
+  ProcedureReturn Bool(a < b + bBytes And b < a + aBytes)
+EndProcedure
+
+Procedure.i ngpPixel(x.i, y.i)
+  ProcedureReturn PeekL(ngpImageBase + y * ngpImagePitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i ngpCheckPixels()
+  Define i.i, x.i, y.i
+  ngpReport[25] = ngpPixel(0, 0)
+  ngpReport[26] = ngpPixel(3, 3)
+  ngpReport[27] = ngpPixel(795, 3)
+  ngpReport[28] = ngpPixel(3, 795)
+  ngpReport[29] = ngpPixel(795, 795)
+  For i = 0 To #NGP_ITEMS - 1
+    If (i & 255) = 0 And (Micros() - ngpStart) > #NGP_PIXEL_BUDGET_US
+      ngpReport[1] = 34 : ProcedureReturn 0
+    EndIf
+    x = (i % 100) * 8 + 1 : y = (i / 100) * 8 + 1
+    If ngpPixel(x + 2, y + 2) <> $FF00FF00 : ngpReport[30] = ngpReport[30] + 1 : EndIf
+    If ngpPixel(x + 6, y + 2) <> $FF000000 : ngpReport[30] = ngpReport[30] + 1 : EndIf
+  Next
+  ProcedureReturn Bool(ngpReport[30] = 0)
+EndProcedure
+
+; A timeout or failed idle may leave a CSD or renderer job in flight.
+; Keep the payload, every page, buffer and MMU mapping live until the
+; already armed 15-second deadman resets the board. Returning
+; would disarm that deadman and resume the monitor over live GPU work.
+Procedure.i ngpUnsafe(status.i)
+  ngpReport[1] = status
+  ngpReport[55] = 1
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  ngpReport[63] = #NGP_TAIL
+  ; UART writes are bounded. The RAM report is retained for a live debugger,
+  ; but a deadman reset will erase it; emit the two-digit failure code too.
+  If UartRunning() <> 0
+    UartWrite(78) : UartWrite(71) : UartWrite(80) : UartWrite(33)
+    UartWrite(48 + status / 10) : UartWrite(48 + status % 10)
+    UartWriteNl()
+  EndIf
+  Repeat
+    V3dBarrier()
+  ForEver
+EndProcedure
+
+Procedure.i ngpFinish(status.i)
+  ngpReport[1] = status
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  ; No destroy, unmap, shutdown or monitor return without a verified idle.
+  If ngpVulkanSubmitted <> 0 Or NeonVkParticleCsdState() = #NVPC_LOST : ngpUnsafe(90) : EndIf
+  If ngpDev <> 0
+    If vkDeviceWaitIdle(ngpDev) <> #VK_SUCCESS : ngpUnsafe(91) : EndIf
+  EndIf
+  If NeonVkParticleCsdState() <> #NVPC_EMPTY
+    If NeonVkParticleCsdRelease() <> #NVPC_OK : ngpUnsafe(97) : EndIf
+  EndIf
+  If nvcExternalProducerAttached <> 0 Or nvcExternalProducerQuarantined <> 0 : ngpUnsafe(98) : EndIf
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK : ngpUnsafe(92) : EndIf
+  ElseIf nvcDevice <> 0
+    NeonVkChromeDestroy()
+  EndIf
+  If nvcDevice <> 0 : ngpUnsafe(93) : EndIf
+  If ngpObjectsDestroy() = 0 : ngpUnsafe(94) : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK : ngpUnsafe(95) : EndIf
+  EndIf
+  ngpReport[58] = Neon_Ready()
+  ngpReport[59] = v3d_owner
+  ngpReport[60] = NeonDrawBackendActive()
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  If ngpReport[1] = 0 And ngpReport[56] <> 0 : ngpReport[1] = 96 : EndIf
+  ngpReport[15] = Micros() - ngpStart
+  If ngpReport[1] = 0 And ngpReport[15] > 14000000 : ngpReport[1] = 97 : EndIf
+  ngpReport[63] = #NGP_TAIL
+  ProcedureReturn @ngpReport[0]
+EndProcedure
+
+Procedure.i ngpObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @ngpInst)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(ngpInst, @count, @ngpPhys)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS Or count <> 1 Or ngpPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(ngpPhys, @dci, 0, @ngpDev)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(ngpDev, 0, 0, @ngpQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(ngpDev, @pci, 0, @ngpPool)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NGP_W : imageInfo\extent\height = #NGP_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(ngpDev, @imageInfo, 0, @ngpImage)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(ngpDev, ngpImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(ngpDev, @alloc, 0, @ngpMemory)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(ngpDev, ngpImage, ngpMemory, 0)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ngpImageBase = AnvilVkImageAddress(ngpImage)
+  ngpImagePitch = AnvilVkImageRowPitch(ngpImage)
+  If ngpImageBase = 0 Or ngpImagePitch < (#NGP_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(ngpDev, ngpMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> ngpImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(ngpDev, ngpMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = ngpImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(ngpDev, @viewInfo, 0, @ngpView)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(ngpDev, @passInfo, 0, @ngpPass)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = ngpPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @ngpView : frameInfo\width = #NGP_W
+  frameInfo\height = #NGP_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(ngpDev, @frameInfo, 0, @ngpFramebuffer)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure ngpBuildParticles()
+  Define i.i
+  Define *p.NvcParticle
+  For i = 0 To #NGP_ITEMS - 1
+    *p = @ngpParticles[i]
+    *p\x = (i % 100) * 8 + 1 : *p\y = (i / 100) * 8 + 1
+    *p\width = 4 : *p\height = 4
+    *p\colour = $FF00FF00
+    *p\zoomQ16 = 65536 : *p\ignoreCamera = 1
+  Next
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, frame.i, sample.i, frameStart.i, t0.i
+  Define binBefore.i, renderBefore.i
+  Define Dim clear.l[4]
+  ngpReport[0] = #NGP_MAGIC : ngpReport[63] = #NGP_TAIL
+  ngpReport[6] = #NGP_ITEMS : ngpReport[7] = #NGP_SAMPLES
+  ngpReport[46] = #NGP_WINDOW : ngpReport[47] = #NGP_WINDOW_BYTES
+  TimerInit() : ngpStart = Micros()
+  If #NGP_ITEMS <> 10000 Or #NGP_GROUPS <> 625 Or #NGP_RECORD <> #NVPC_RECORD
+    ProcedureReturn ngpFinish(36)
+  EndIf
+
+  ngpReport[2] = 1
+  If NeonArena(#NGP_ARENA, #NGP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn ngpFinish(1) : EndIf
+  If NeonSurface(#NGP_SURFACE, 800, 1280, #NGP_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn ngpFinish(2) : EndIf
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn ngpFinish(3) : EndIf
+  NeonSurfaceMapSpan(#NGP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn ngpFinish(4) : EndIf
+  rc = NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  ngpReport[52] = rc
+  If rc <> #NEON_OK : ProcedureReturn ngpFinish(29) : EndIf
+  NeonPalette() : NeonFontDefaults() : NeonAnimReset() : NeonStateReset()
+  rc = Neon_AtlasRasterEnsure()
+  ngpReport[53] = rc : ngpReport[54] = Neon_AtlasRasterReady()
+  If rc <> #NEON_OK Or ngpReport[54] = 0 : ProcedureReturn ngpFinish(30) : EndIf
+  If AnvilVkV3dWindow(#NGP_WINDOW, #NGP_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn ngpFinish(5) : EndIf
+  If ngpObjectsCreate() = 0 : ProcedureReturn ngpFinish(6) : EndIf
+  ngpReport[4] = ngpImageBase : ngpReport[5] = ngpImagePitch
+  If ngpInside(ngpImageBase, ngpImagePitch * #NGP_H) = 0 Or (ngpImageBase % #NGP_PAGE) <> 0
+    ProcedureReturn ngpFinish(6)
+  EndIf
+  ; Both modes deliberately allocate the same Chrome shared vertex capacity.
+  rc = NeonVkChromeCreateWithCapacities(ngpPhys, ngpDev, ngpQueue, ngpPool, ngpPass, ngpFramebuffer, #NGP_W, #NGP_H, 4, #NGP_ITEMS)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(7) : EndIf
+  CompilerIf #NMP_GPU
+    rc = NeonVkParticleCsdCreate(#NGP_ITEMS)
+    ngpReport[9] = rc : ngpReport[10] = nvpcCodeBytes
+    If nvpcState = #NVPC_LOST : ProcedureReturn ngpUnsafe(8) : EndIf
+    If rc <> #NVPC_OK : ProcedureReturn ngpFinish(8) : EndIf
+    ngpReport[48] = nvpcVertexAddr : ngpReport[49] = nvpcVertexBytes
+    If nvpcVertexBytes <> #NGP_OUT_ALLOC Or nvpcInputBytes <> #NGP_INPUT_ALLOC Or nvpcCheckAddresses() = 0
+      ProcedureReturn ngpFinish(10)
+    EndIf
+    If ngpOverlap(nvpcVertexAddr, nvpcVertexBytes, ngpImageBase, ngpImagePitch * #NGP_H) <> 0 Or ngpOverlap(nvpcCodeAddr, #NGP_PAGE, ngpImageBase, ngpImagePitch * #NGP_H) <> 0 Or ngpOverlap(nvpcUnifAddr, #NGP_PAGE, ngpImageBase, ngpImagePitch * #NGP_H) <> 0 Or ngpOverlap(nvpcInputAddr, nvpcInputBytes, ngpImageBase, ngpImagePitch * #NGP_H) <> 0
+      ProcedureReturn ngpFinish(16)
+    EndIf
+  CompilerEndIf
+  ngpBuildParticles()
+  If (Micros() - ngpStart) > #NGP_SETUP_BUDGET_US : ProcedureReturn ngpFinish(31) : EndIf
+
+  ngpReport[2] = 2
+  clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = #NGP_ONE
+  For frame = 0 To #NGP_WARMUP + #NGP_SAMPLES - 1
+    If (Micros() - ngpStart) > #NGP_FRAME_BUDGET_US : ProcedureReturn ngpFinish(32) : EndIf
+    frameStart = Micros()
+    If vkDeviceWaitIdle(ngpDev) <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(40) : EndIf
+    t0 = Micros()
+    CompilerIf #NMP_GPU
+      rc = NeonVkParticleCsdPrepare(@ngpParticles[0], #NGP_ITEMS)
+      If nvpcState = #NVPC_LOST : ProcedureReturn ngpUnsafe(41) : EndIf
+      If rc <> #NVPC_OK Or nvpcState <> #NVPC_GPU_READY Or nvcExternalProducerQuarantined <> 0
+        ProcedureReturn ngpFinish(21)
+      EndIf
+    CompilerElse
+      rc = NeonVkChromeParticlesPrepare(@ngpParticles[0], #NGP_ITEMS)
+      If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(21) : EndIf
+    CompilerEndIf
+    ngpReport[11] = rc
+    If (Micros() - ngpStart) > #NGP_FRAME_BUDGET_US : ProcedureReturn ngpFinish(32) : EndIf
+    If frame >= #NGP_WARMUP
+      sample = frame - #NGP_WARMUP
+      ngpReport[16 + sample] = Micros() - t0
+      CompilerIf #NMP_GPU
+        ngpReport[34 + sample] = nvpcLastCsdUs
+        ngpReport[37 + sample] = nvpcLastStageUs
+        ngpReport[40 + sample] = nvpcLastPaletteUs
+      CompilerEndIf
+    EndIf
+    rc = NeonVkChromeBegin(@clear[0])
+    If rc <> #VK_SUCCESS
+      If nvcInFrame <> 0 Or nvcFrameAbortable <> 0
+        If NeonVkChromeAbort() <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(24) : EndIf
+      EndIf
+      ProcedureReturn ngpFinish(24)
+    EndIf
+    t0 = Micros()
+    CompilerIf #NMP_GPU
+      rc = NeonVkParticleCsdDraw()
+    CompilerElse
+      rc = NeonVkChromeParticlesDrawPrepared()
+    CompilerEndIf
+    ngpReport[12] = rc
+    If rc <> 0
+      If nvcInFrame <> 0
+        If NeonVkChromeAbort() <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(25) : EndIf
+      EndIf
+      ProcedureReturn ngpFinish(25)
+    EndIf
+    If NeonVkChromeDrawCount() <> 1 Or NeonVkChromeVertexCount() <> #NGP_ITEMS * 6
+      If NeonVkChromeAbort() <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(35) : EndIf
+      ProcedureReturn ngpFinish(35)
+    EndIf
+    If frame >= #NGP_WARMUP : ngpReport[19 + sample] = Micros() - t0 : EndIf
+    binBefore = V3dBinJobs() : renderBefore = V3dRenderJobs()
+    ngpVulkanSubmitted = 1 : t0 = Micros()
+    rc = NeonVkChromeEnd()
+    ngpReport[13] = rc
+    If rc <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(26) : EndIf
+    ngpVulkanSubmitted = 0
+    ngpReport[31] = ngpReport[31] + V3dBinJobs() - binBefore
+    ngpReport[32] = ngpReport[32] + V3dRenderJobs() - renderBefore
+    If frame >= #NGP_WARMUP : ngpReport[22 + sample] = Micros() - t0 : EndIf
+    If NeonVkChromePresentPending() <> 0
+      If NeonVkChromePresentConsume() <> 1 : ProcedureReturn ngpFinish(27) : EndIf
+    EndIf
+    If frame >= #NGP_WARMUP : ngpReport[43 + sample] = Micros() - frameStart : EndIf
+    ngpReport[8] = frame + 1
+  Next
+  ngpReport[33] = V3dMmuFaultsNow()
+  If (Micros() - ngpStart) > #NGP_FRAME_BUDGET_US : ProcedureReturn ngpFinish(32) : EndIf
+  ngpReport[2] = 3
+  rc = ngpCheckPixels()
+  ngpReport[14] = Micros() - ngpStart
+  If rc = 0
+    If ngpReport[1] = 34 : ProcedureReturn ngpFinish(34) : EndIf
+    ProcedureReturn ngpFinish(28)
+  EndIf
+  If ngpReport[14] > #NGP_PIXEL_BUDGET_US : ProcedureReturn ngpFinish(34) : EndIf
+  If ngpReport[8] <> #NGP_WARMUP + #NGP_SAMPLES Or ngpReport[31] <> ngpReport[8] Or ngpReport[32] <> ngpReport[8] Or ngpReport[33] <> 0
+    ProcedureReturn ngpFinish(35)
+  EndIf
+  ngpReport[2] = 4
+  ProcedureReturn ngpFinish(0)
+EndProcedure

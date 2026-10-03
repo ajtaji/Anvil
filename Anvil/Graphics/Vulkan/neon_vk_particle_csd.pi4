@@ -1,0 +1,475 @@
+; Opt-in Pi 4 particle vertex producer. Include after neon_vk_chrome.pi4.
+; Chrome's default particle path remains unchanged. This module owns every
+; Vulkan buffer/page it allocates and never resolves a V3D address elsewhere.
+CompilerIf #PMF_CHIP = 2711
+
+#NVPC_OK = 0
+#NVPC_ERR_ARGS = -1
+#NVPC_ERR_STATE = -2
+#NVPC_ERR_CAPACITY = -3
+#NVPC_ERR_VULKAN = -4
+#NVPC_ERR_QPU = -5
+#NVPC_ERR_CSD = -6
+#NVPC_ERR_LOST = -7
+
+#NVPC_EMPTY = 0
+#NVPC_READY = 1
+#NVPC_GPU_READY = 2
+#NVPC_LOST = 3
+
+#NVPC_PAGE = 4096
+#NVPC_RECORD = 48
+#NVPC_VERTEX = 24
+#NVPC_VERTICES_PER_ITEM = 6
+#NVPC_OUTPUT_PER_ITEM = #NVPC_VERTEX * #NVPC_VERTICES_PER_ITEM
+#NVPC_ONE = $3F800000
+#NVPC_LOAD_VEC4 = $FFFFFF7C
+#NVPC_WAIT_US = 1000000
+
+Global nvpcState.i = #NVPC_EMPTY
+Global nvpcDevice.i, nvpcWindowBase.i, nvpcWindowBytes.i
+Global nvpcCapacity.i, nvpcPaddedCapacity.i, nvpcCount.i, nvpcCornerBank.i
+Global nvpcTargetGeneration.i, nvpcLogicalW.i, nvpcLogicalH.i
+Global nvpcVertex.i, nvpcVertexMemory.i, nvpcVertexAddr.i, nvpcVertexBytes.i
+Global nvpcCodeMemory.i, nvpcUnifMemory.i, nvpcInputMemory.i
+Global nvpcCodeAddr.i, nvpcUnifAddr.i, nvpcInputAddr.i, nvpcInputBytes.i
+Global nvpcCodeBytes.i, nvpcLastVulkan.i, nvpcLastCsd.i
+Global nvpcLastDoneBefore.i, nvpcLastDoneAfter.i
+Global nvpcLastPaletteUs.i, nvpcLastStageUs.i, nvpcLastCsdUs.i
+Global nvpcCodeMapped.i, nvpcUnifMapped.i, nvpcInputMapped.i
+Global nvpcAttached.i
+
+Procedure.i nvpcAligned(bytes.i)
+  ProcedureReturn ((bytes + #NVPC_PAGE - 1) / #NVPC_PAGE + 1) * #NVPC_PAGE
+EndProcedure
+
+Procedure.i nvpcInside(addr.i, bytes.i)
+  If addr <= 0 Or bytes <= 0 Or addr > $FFFFFFFF Or nvpcWindowBase <= 0 Or nvpcWindowBytes < #NVPC_PAGE
+    ProcedureReturn 0
+  EndIf
+  If addr < nvpcWindowBase Or bytes > nvpcWindowBytes Or (addr - nvpcWindowBase) > nvpcWindowBytes - bytes
+    ProcedureReturn 0
+  EndIf
+  If addr > $FFFFFFFF - (bytes - 1) : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvpcOverlap(a.i, aBytes.i, b.i, bBytes.i)
+  ProcedureReturn Bool(a < b + bBytes And b < a + aBytes)
+EndProcedure
+
+Procedure.i nvpcCheckAddresses()
+  If nvpcInside(nvpcVertexAddr, nvpcVertexBytes) = 0 Or nvpcInside(nvpcCodeAddr, #NVPC_PAGE) = 0 Or nvpcInside(nvpcUnifAddr, #NVPC_PAGE) = 0 Or nvpcInside(nvpcInputAddr, nvpcInputBytes) = 0
+    ProcedureReturn 0
+  EndIf
+  If (nvpcVertexAddr % #NVPC_PAGE) <> 0 Or (nvpcCodeAddr % #NVPC_PAGE) <> 0 Or (nvpcUnifAddr % #NVPC_PAGE) <> 0 Or (nvpcInputAddr % #NVPC_PAGE) <> 0
+    ProcedureReturn 0
+  EndIf
+  If nvpcOverlap(nvpcVertexAddr, nvpcVertexBytes, nvpcCodeAddr, #NVPC_PAGE) <> 0 Or nvpcOverlap(nvpcVertexAddr, nvpcVertexBytes, nvpcUnifAddr, #NVPC_PAGE) <> 0 Or nvpcOverlap(nvpcVertexAddr, nvpcVertexBytes, nvpcInputAddr, nvpcInputBytes) <> 0 Or nvpcOverlap(nvpcCodeAddr, #NVPC_PAGE, nvpcUnifAddr, #NVPC_PAGE) <> 0 Or nvpcOverlap(nvpcCodeAddr, #NVPC_PAGE, nvpcInputAddr, nvpcInputBytes) <> 0 Or nvpcOverlap(nvpcUnifAddr, #NVPC_PAGE, nvpcInputAddr, nvpcInputBytes) <> 0
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Memory type zero is the Pi 4 backend's host-visible V3D window heap.
+; The returned mapped pointer must equal that heap's GPU/ARM identity VA.
+Procedure.i nvpcPage(bytes.i, *memoryOut, *addrOut)
+  Define mai.VkMemoryAllocateInfo
+  Define memory.i, addr.i, rc.i
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = bytes : mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nvpcDevice, @mai, 0, @memory)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  PokeI(*memoryOut, memory)
+  addr = AnvilVkMemoryAddress(memory)
+  If AnvilVkMemorySize(memory) < bytes Or nvpcInside(addr, bytes) = 0 Or (addr % #NVPC_PAGE) <> 0
+    ProcedureReturn #NVPC_ERR_CAPACITY
+  EndIf
+  PokeI(*addrOut, addr)
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+; Internal cleanup is called only before CSD submission or after verified
+; Vulkan idle and CSD completion. LOST never reaches this procedure.
+Procedure nvpcDestroyOwned()
+  If nvpcInputMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcInputMemory) : nvpcInputMapped = 0 : EndIf
+  If nvpcUnifMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcUnifMemory) : nvpcUnifMapped = 0 : EndIf
+  If nvpcCodeMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcCodeMemory) : nvpcCodeMapped = 0 : EndIf
+  If nvpcVertex <> 0 : vkDestroyBuffer(nvpcDevice, nvpcVertex, 0) : nvpcVertex = 0 : EndIf
+  If nvpcVertexMemory <> 0 : vkFreeMemory(nvpcDevice, nvpcVertexMemory, 0) : nvpcVertexMemory = 0 : EndIf
+  If nvpcInputMemory <> 0 : vkFreeMemory(nvpcDevice, nvpcInputMemory, 0) : nvpcInputMemory = 0 : EndIf
+  If nvpcUnifMemory <> 0 : vkFreeMemory(nvpcDevice, nvpcUnifMemory, 0) : nvpcUnifMemory = 0 : EndIf
+  If nvpcCodeMemory <> 0 : vkFreeMemory(nvpcDevice, nvpcCodeMemory, 0) : nvpcCodeMemory = 0 : EndIf
+EndProcedure
+
+Procedure nvpcReset()
+  nvpcDevice = 0 : nvpcWindowBase = 0 : nvpcWindowBytes = 0
+  nvpcCapacity = 0 : nvpcPaddedCapacity = 0 : nvpcCount = 0
+  nvpcVertexAddr = 0 : nvpcVertexBytes = 0 : nvpcCodeAddr = 0 : nvpcUnifAddr = 0
+  nvpcInputAddr = 0 : nvpcInputBytes = 0 : nvpcCodeBytes = 0
+  nvpcTargetGeneration = 0 : nvpcLogicalW = 0 : nvpcLogicalH = 0
+  nvpcAttached = 0
+  nvpcState = #NVPC_EMPTY
+EndProcedure
+
+Procedure.i nvpcLoad4(addressRf.i, firstRf.i)
+  Define r.i, k.i
+  V3dQpuReset()
+  r = V3dQpuSig(#V3DQ_SIG_THRSW)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
+  V3dQpuRaddr(addressRf, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  For k = 0 To 3
+    r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, firstRf + k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Next
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; TMUD carries a word and TMUA fires its store. rf14 is the output
+; cursor, incremented after each store. TMUWT at vertex boundaries
+; keeps the first proof bounded to six completed writes at a time.
+Procedure.i nvpcStoreWord(sourceRf.i)
+  Define r.i
+  r = V3dQpuMov(#V3DQ_WADDR_TMUD, 1, #V3DQ_MUX_A, sourceRf)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuMov(#V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 14)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAddImm(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, 14, 4)
+EndProcedure
+
+Procedure.i nvpcStoreVertex(xRf.i, yRf.i)
+  Define r.i
+  r = nvpcStoreWord(xRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreWord(yRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreWord(8) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreWord(9) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAdd0(#V3DQ_A_TMUWT, #V3DQ_WADDR_NOP, 1)
+EndProcedure
+
+Procedure.i nvpcBuildShader()
+  Define r.i
+  r = V3dQpuProgramBegin(nvpcCodeAddr, #NVPC_PAGE)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 9, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 15, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 6, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 7, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Compute global item from the hardware-provided packed workgroup ID.
+  ; r0[15:0] = group X; y is in r0[31:16], so mask it explicitly.
+  r = V3dQpuAdd2(#V3DQ_A_AND, 6, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 6, 0, #V3DQ_MUX_A, 6, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 10, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 10, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; input = rf8 + global item * (32 + 16), a 48-byte record.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 11, 0, #V3DQ_MUX_A, 10, 5)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 12, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 11, 12)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 8, 11)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Keep both later vec4 addresses before rf7 (uniform 16) is loaded over.
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 12, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 13, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcLoad4(12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcLoad4(13, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; output = rf9 + global item * (128 + 16), six 24-byte vertices.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 13, 0, #V3DQ_MUX_A, 10, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 14, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 13)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 9)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Third vec4 supplies palette U/V in rf8/9 and canaries in rf10/11.
+  ; The output cursor is established before rf9 is overwritten.
+  r = nvpcLoad4(11, 8)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Existing particle triangle order: 0,2,3, 0,3,1.
+  r = nvpcStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreVertex(4, 5) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreVertex(6, 7) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreVertex(6, 7) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nvpcStoreVertex(2, 3) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+Procedure.i nvpcAbortCreate(status.i)
+  ; No CSD job has been submitted while Create is running.
+  nvpcDestroyOwned()
+  If nvpcAttached <> 0
+    If NeonVkChromeExternalProducerDetach() <> #NEON_VK_CHROME_OK
+      nvpcState = #NVPC_LOST
+      ProcedureReturn #NVPC_ERR_LOST
+    EndIf
+  EndIf
+  nvpcReset()
+  ProcedureReturn status
+EndProcedure
+
+; A failed idle or palette upload may leave device work outstanding. Keep the
+; producer's allocations and Chrome's device/MMU live, even if Chrome refuses
+; the normal quarantine transition because its own state is already damaged.
+; The direct flag write is a last-resort guard if Chrome's transition or
+; attachment invariant is broken while this module still owns resources.
+Procedure.i nvpcMarkLost()
+  Define rc.i
+  If nvpcAttached <> 0 And nvcExternalProducerQuarantined = 0
+    rc = NeonVkChromeExternalProducerQuarantine()
+    If rc <> #NEON_VK_CHROME_OK
+      nvcExternalProducerQuarantined = 1
+    EndIf
+  EndIf
+  nvpcState = #NVPC_LOST
+  ProcedureReturn #NVPC_ERR_LOST
+EndProcedure
+
+Procedure.i NeonVkParticleCsdState()
+  ProcedureReturn nvpcState
+EndProcedure
+
+Procedure.i NeonVkParticleCsdCapacity()
+  ProcedureReturn nvpcCapacity
+EndProcedure
+
+Procedure.i NeonVkParticleCsdCount()
+  ProcedureReturn nvpcCount
+EndProcedure
+
+Procedure.i NeonVkParticleCsdCreate(capacity.i)
+  Define rc.i, mapped.i
+  If nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  If nvpcState <> #NVPC_EMPTY : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  If capacity < 1 Or capacity > #NVC_PARTICLE_MAX : ProcedureReturn #NVPC_ERR_ARGS : EndIf
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcDevice = 0 Or nvcMaxQuads < 1 Or nvdPresentPending() <> 0
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  If avkV3dWindowBase <= 0 Or avkV3dWindowBytes < #NVPC_PAGE Or v3d_ready = 0 Or v3d_mmuOn = 0
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  rc = vkDeviceWaitIdle(nvcDevice)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  rc = NeonVkChromeExternalProducerAttach()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  nvpcAttached = 1
+  nvpcDevice = nvcDevice
+  nvpcWindowBase = avkV3dWindowBase : nvpcWindowBytes = avkV3dWindowBytes
+  nvpcCapacity = capacity
+  nvpcPaddedCapacity = ((capacity + 15) / 16) * 16
+  nvpcInputBytes = nvpcAligned(nvpcPaddedCapacity * #NVPC_RECORD)
+  nvpcVertexBytes = nvpcAligned(nvpcPaddedCapacity * #NVPC_OUTPUT_PER_ITEM)
+  If nvpcInputBytes > nvpcWindowBytes Or nvpcVertexBytes > nvpcWindowBytes
+    ProcedureReturn nvpcAbortCreate(#NVPC_ERR_CAPACITY)
+  EndIf
+  rc = nvcBufferCreate(nvpcVertexBytes, #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, @nvpcVertex, @nvpcVertexMemory)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nvpcAbortCreate(#NVPC_ERR_CAPACITY) : EndIf
+  nvpcVertexAddr = AnvilVkBufferAddress(nvpcVertex)
+  If AnvilVkBufferSize(nvpcVertex) <> nvpcVertexBytes Or AnvilVkMemorySize(nvpcVertexMemory) < nvpcVertexBytes
+    ProcedureReturn nvpcAbortCreate(#NVPC_ERR_VULKAN)
+  EndIf
+  rc = nvpcPage(#NVPC_PAGE, @nvpcCodeMemory, @nvpcCodeAddr)
+  If rc <> #NVPC_OK : ProcedureReturn nvpcAbortCreate(rc) : EndIf
+  rc = nvpcPage(#NVPC_PAGE, @nvpcUnifMemory, @nvpcUnifAddr)
+  If rc <> #NVPC_OK : ProcedureReturn nvpcAbortCreate(rc) : EndIf
+  rc = nvpcPage(nvpcInputBytes, @nvpcInputMemory, @nvpcInputAddr)
+  If rc <> #NVPC_OK : ProcedureReturn nvpcAbortCreate(rc) : EndIf
+  If nvpcCheckAddresses() = 0 : ProcedureReturn nvpcAbortCreate(#NVPC_ERR_CAPACITY) : EndIf
+  rc = vkMapMemory(nvpcDevice, nvpcCodeMemory, 0, #NVPC_PAGE, 0, @mapped)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nvpcAbortCreate(#NVPC_ERR_VULKAN) : EndIf
+  nvpcCodeMapped = 1
+  If mapped <> nvpcCodeAddr : ProcedureReturn nvpcAbortCreate(#NVPC_ERR_VULKAN) : EndIf
+  rc = nvpcBuildShader()
+  nvpcCodeBytes = V3dQpuProgramBytes()
+  If rc <> #V3DQ_OK Or nvpcCodeBytes < 8 Or nvpcCodeBytes > #NVPC_PAGE
+    ProcedureReturn nvpcAbortCreate(#NVPC_ERR_QPU)
+  EndIf
+  vkUnmapMemory(nvpcDevice, nvpcCodeMemory) : nvpcCodeMapped = 0
+  nvpcState = #NVPC_READY
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+; The prior Chrome Prepare supplies the exact CPU four-corner oracle and
+; palette pixels. Pad to a full 16-lane group so every TMU read is defined.
+Procedure.i nvpcStageRecords(count.i)
+  Define i.i, c.i, p.i, xb.i, yb.i, mapped.i, rc.i, padded.i
+  Define *corners.NvcParticleCorners
+  rc = vkMapMemory(nvpcDevice, nvpcInputMemory, 0, nvpcInputBytes, 0, @mapped)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  nvpcInputMapped = 1
+  If mapped <> nvpcInputAddr : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  padded = ((count + 15) / 16) * 16
+  For i = 0 To padded - 1
+    p = mapped + i * #NVPC_RECORD
+    If i < count
+      If nvcParticleCornerBank = 0
+        *corners = @nvcParticleCornersA[i]
+      Else
+        *corners = @nvcParticleCornersB[i]
+      EndIf
+      For c = 0 To 3
+        nvcParticleCornerBits(PeekI(*corners + c * 2 * SizeOf(.i)), PeekI(*corners + (c * 2 + 1) * SizeOf(.i)), @xb, @yb)
+        PokeL(p + c * 8, xb) : PokeL(p + c * 8 + 4, yb)
+      Next
+      PokeL(p + 32, nvcParticleU[i % #NVC_PARTICLE_PALETTE_W])
+      PokeL(p + 36, nvcParticleV[i / #NVC_PARTICLE_PALETTE_W])
+    Else
+      For c = 0 To 9 : PokeL(p + c * 4, 0) : Next
+    EndIf
+    PokeL(p + 40, $D00D0000 | i) : PokeL(p + 44, $FACE0000 | i)
+  Next
+  vkUnmapMemory(nvpcDevice, nvpcInputMemory) : nvpcInputMapped = 0
+  rc = vkMapMemory(nvpcDevice, nvpcUnifMemory, 0, #NVPC_PAGE, 0, @mapped)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  nvpcUnifMapped = 1
+  If mapped <> nvpcUnifAddr : ProcedureReturn #NVPC_ERR_VULKAN : EndIf
+  PokeL(mapped + 0, nvpcInputAddr) : PokeL(mapped + 4, nvpcVertexAddr)
+  PokeL(mapped + 8, #NVPC_ONE) : PokeL(mapped + 12, $0000FFFF)
+  PokeL(mapped + 16, 16)
+  PokeL(mapped + 20, #NVPC_LOAD_VEC4)
+  PokeL(mapped + 24, #NVPC_LOAD_VEC4)
+  PokeL(mapped + 28, #NVPC_LOAD_VEC4)
+  vkUnmapMemory(nvpcDevice, nvpcUnifMemory) : nvpcUnifMapped = 0
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
+  Define rc.i, padded.i, groups.i, t0.i
+  If nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  If nvpcState <> #NVPC_READY And nvpcState <> #NVPC_GPU_READY : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  If count < 0 Or count > nvpcCapacity Or (count > 0 And *particles = 0) : ProcedureReturn #NVPC_ERR_ARGS : EndIf
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcDevice <> nvpcDevice Or avkV3dWindowBase <> nvpcWindowBase Or avkV3dWindowBytes <> nvpcWindowBytes Or nvdPresentPending() <> 0
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  rc = vkDeviceWaitIdle(nvpcDevice)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nvpcMarkLost() : EndIf
+  nvpcState = #NVPC_READY : nvpcCount = 0
+  nvpcLastPaletteUs = 0 : nvpcLastStageUs = 0 : nvpcLastCsdUs = 0
+  t0 = Micros()
+  rc = NeonVkChromeParticlesPrepare(*particles, count)
+  nvpcLastPaletteUs = Micros() - t0
+  If rc = #NEON_VK_CHROME_ERR_ARGS : ProcedureReturn #NVPC_ERR_ARGS : EndIf
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nvpcMarkLost() : EndIf
+  rc = vkDeviceWaitIdle(nvpcDevice)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nvpcMarkLost() : EndIf
+  If count = 0
+    nvpcTargetGeneration = nvcTargetGeneration
+    nvpcLogicalW = nvcLogicalW : nvpcLogicalH = nvcLogicalH
+    nvpcCornerBank = nvcParticleCornerBank
+    nvpcState = #NVPC_GPU_READY
+    ProcedureReturn #NVPC_OK
+  EndIf
+  padded = ((count + 15) / 16) * 16
+  groups = padded / 16
+  If padded > nvpcPaddedCapacity Or padded * #NVPC_RECORD > nvpcInputBytes Or padded * #NVPC_OUTPUT_PER_ITEM > nvpcVertexBytes
+    ProcedureReturn #NVPC_ERR_CAPACITY
+  EndIf
+  t0 = Micros()
+  rc = nvpcStageRecords(count)
+  nvpcLastStageUs = Micros() - t0
+  If nvpcInputMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcInputMemory) : nvpcInputMapped = 0 : EndIf
+  If nvpcUnifMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcUnifMemory) : nvpcUnifMapped = 0 : EndIf
+  If rc <> #NVPC_OK : ProcedureReturn rc : EndIf
+  rc = V3dCsdBegin(groups, 1, 1, 16, 1)
+  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
+  rc = V3dCsdCode(nvpcCodeAddr, nvpcCodeBytes, 0)
+  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
+  rc = V3dCsdUniforms(nvpcUnifAddr, 32)
+  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
+  V3dCsdOutput(nvpcVertexAddr, nvpcVertexBytes)
+  V3dCacheRange(nvpcInputAddr, padded * #NVPC_RECORD)
+  rc = NeonVkChromeExternalProducerQuarantine()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  t0 = Micros()
+  rc = V3dCsdSubmit()
+  nvpcLastCsd = rc
+  If rc <> #V3D_OK : nvpcLastCsdUs = Micros() - t0 : nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  rc = V3dCsdWait(#NVPC_WAIT_US)
+  nvpcLastCsdUs = Micros() - t0
+  nvpcLastCsd = rc
+  nvpcLastDoneBefore = V3dCsdDoneBefore() : nvpcLastDoneAfter = V3dCsdDoneAfter()
+  If rc <> #V3D_OK Or V3dCsdCleanResult() <> #V3D_OK Or nvpcLastDoneBefore = nvpcLastDoneAfter
+    nvpcState = #NVPC_LOST
+    ProcedureReturn #NVPC_ERR_LOST
+  EndIf
+  V3dCacheRange(nvpcVertexAddr, padded * #NVPC_OUTPUT_PER_ITEM)
+  rc = NeonVkChromeExternalProducerUnquarantine()
+  If rc <> #NEON_VK_CHROME_OK : nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  nvpcCount = count
+  nvpcCornerBank = nvcParticleCornerBank
+  nvpcTargetGeneration = nvcTargetGeneration
+  nvpcLogicalW = nvcLogicalW : nvpcLogicalH = nvcLogicalH
+  nvpcState = #NVPC_GPU_READY
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+Procedure.i NeonVkParticleCsdDraw()
+  Define rc.i
+  If nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  If nvpcState <> #NVPC_GPU_READY Or nvcReady = 0 Or nvcInFrame = 0 Or nvcDevice <> nvpcDevice
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  If nvcParticlePrepared = 0 Or nvcParticleCount <> nvpcCount Or nvcParticleCornerBank <> nvpcCornerBank Or nvcTargetGeneration <> nvpcTargetGeneration Or nvcLogicalW <> nvpcLogicalW Or nvcLogicalH <> nvpcLogicalH
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  If nvpcCount = 0 : ProcedureReturn #NVPC_OK : EndIf
+  rc = NeonVkChromeParticlesDrawExternal(nvpcVertex, nvpcCount * #NVPC_VERTICES_PER_ITEM)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+Procedure.i NeonVkParticleCsdRelease()
+  Define rc.i
+  If nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  If nvpcState = #NVPC_EMPTY : ProcedureReturn #NVPC_OK : EndIf
+  ; A failed pre-submit Chrome End may leave an abortable command buffer even
+  ; though nvcInFrame is clear. The caller must abort it before Release.
+  If nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcDevice <> nvpcDevice Or nvpcAttached = 0
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
+  rc = vkDeviceWaitIdle(nvpcDevice)
+  nvpcLastVulkan = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nvpcMarkLost() : EndIf
+  nvpcDestroyOwned()
+  rc = NeonVkChromeExternalProducerDetach()
+  If rc <> #NEON_VK_CHROME_OK : nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
+  nvpcReset()
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+CompilerEndIf

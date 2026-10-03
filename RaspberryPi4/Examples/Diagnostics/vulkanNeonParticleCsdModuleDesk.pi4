@@ -1,0 +1,32 @@
+; Compile-only Pi 4 gate for the opt-in particle CSD module and Chrome seam.
+; No board run is required or intended for this source.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd.pi4"
+
+Procedure.i Main()
+  If #NVPC_RECORD <> 48 Or #NVPC_OUTPUT_PER_ITEM <> 144 : ProcedureReturn 1 : EndIf
+  If nvpcAligned(1) <> 8192 Or nvpcAligned(480000) <> 487424 : ProcedureReturn 2 : EndIf
+  If nvpcAligned(1440000) <> 1445888 : ProcedureReturn 3 : EndIf
+  If NeonVkParticleCsdState() <> #NVPC_EMPTY : ProcedureReturn 4 : EndIf
+  If NeonVkParticleCsdCreate(0) <> #NVPC_ERR_ARGS : ProcedureReturn 5 : EndIf
+  If NeonVkParticleCsdPrepare(0, 1) <> #NVPC_ERR_STATE : ProcedureReturn 6 : EndIf
+  If NeonVkParticleCsdDraw() <> #NVPC_ERR_STATE : ProcedureReturn 7 : EndIf
+  If NeonVkParticleCsdRelease() <> #NVPC_OK : ProcedureReturn 8 : EndIf
+  ProcedureReturn 0
+EndProcedure
