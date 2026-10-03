@@ -122,7 +122,14 @@ Global nvcRotation.i
 Global nvcMaxQuads.i
 Global nvcMaxVertexQuads.i
 Global nvcVertices.i
+Global nvcExternalVertices.i
 Global nvcDrawCount.i
+; Set only while a frame command buffer can be discarded without a submit.
+Global nvcFrameAbortable.i
+; An optional producer owns device-tied resources outside Chrome. Its CSD
+; quarantine also covers work which Vulkan device-idle cannot observe.
+Global nvcExternalProducerAttached.i
+Global nvcExternalProducerQuarantined.i
 Global nvcRetainedBatchActive.i
 Global nvcRetainedBatchCount.i
 Global nvcRetainedBatchLogicalW.i
@@ -357,6 +364,44 @@ Procedure.i NeonVkChromeReady()
   ProcedureReturn nvcReady
 EndProcedure
 
+Procedure.i NeonVkChromeExternalProducerAttach()
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcExternalProducerAttached = 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; The producer calls this before a submit whose completion may be uncertain.
+Procedure.i NeonVkChromeExternalProducerQuarantine()
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcExternalProducerQuarantined = 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Only the producer can establish completed compute and successful cache clean.
+Procedure.i NeonVkChromeExternalProducerUnquarantine()
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcExternalProducerQuarantined = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Call only after the producer has proved idle and released its allocations.
+Procedure.i NeonVkChromeExternalProducerDetach()
+  Define rc.i
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  rc = vkDeviceWaitIdle(nvcDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  nvcExternalProducerAttached = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 Procedure.i NeonVkChromeLogoSource(*rgb, width.i, height.i)
   If nvcReady <> 0 Or nvcInFrame <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
   If *rgb = 0 And width = 0 And height = 0
@@ -405,7 +450,7 @@ Procedure.i NeonVkChromeSpriteRegister(id.i, *rgba, width.i, height.i)
 EndProcedure
 
 Procedure.i NeonVkChromeWsiAttach(device.i, swapchain.i, imageIndex.i)
-  If nvcReady = 0 Or nvdPresentPending() <> 0
+  If nvcReady = 0 Or nvcExternalProducerQuarantined <> 0 Or nvdPresentPending() <> 0
     ProcedureReturn #NEON_VK_CHROME_ERR_STATE
   EndIf
   ProcedureReturn nvdWsiAttach(device, swapchain, imageIndex, nvcTargetGeneration)
@@ -419,7 +464,7 @@ EndProcedure
 Procedure.i NeonVkChromeRebind(framebuffer.i, logicalW.i, logicalH.i, physicalW.i, physicalH.i, pitch.i, rotation.i)
   Define expectedW.i
   Define expectedH.i
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvdWsiEnabled() <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvdPresentPending() <> 0 Or nvdWsiEnabled() <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If framebuffer = 0 Or logicalW < 1 Or logicalH < 1 Or physicalW < 1 Or physicalH < 1
@@ -458,7 +503,7 @@ Procedure.i NeonVkChromeDrawCount()
 EndProcedure
 
 Procedure.i NeonVkChromeVertexCount()
-  ProcedureReturn nvcVertices
+  ProcedureReturn nvcVertices + nvcExternalVertices
 EndProcedure
 
 Procedure.i NeonVkChromePresentPending()
@@ -553,6 +598,8 @@ Procedure.i nvcSubmitAndWait()
   si\commandBufferCount = 1 : si\pCommandBuffers = @cmdHandle
   If rc = #VK_SUCCESS
     nvcSubmitStage = 3
+    ; From this point a failed queue call may have submitted GPU work.
+    If nvcFrameAbortable <> 0 : nvcFrameAbortable = 0 : EndIf
     rc = vkQueueSubmit(nvcQueue, 1, @si, nvcFence)
   EndIf
   If rc = #VK_SUCCESS
@@ -1645,7 +1692,7 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   Define offset.q
   Define rc.i
 
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If nvcTTDirty <> 0
@@ -1686,7 +1733,9 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   vkCmdBindVertexBuffers(nvcCommand, 0, 1, @bufferHandle, @offset)
   setHandle = nvcDescriptorSet
   vkCmdBindDescriptorSets(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipelineLayout, 0, 1, @setHandle, 0, 0)
-  nvcVertices = 0 : nvcDrawCount = 0 : nvcInFrame = 1 : nvcError = 0
+  nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
+  nvcInFrame = 1 : nvcFrameAbortable = 1 : nvcError = 0
+  nvcSubmitStage = 0 : nvcSubmitRc = #VK_SUCCESS
   nvcAtlasRasterCountAtFrame = AnvilTrueTypeRasterCount()
   nvcAtlasUploadAtFrame = nvcAtlasUploadCount
   nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
@@ -3153,9 +3202,36 @@ Procedure.i NeonVkChromeEnd()
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+; Discard only an unsubmitted frame, including a failed End before QueueSubmit.
+; A queue-submit attempt clears nvcFrameAbortable before it can be ambiguous.
+Procedure.i NeonVkChromeAbort()
+  Define rc.i
+  If nvcReady = 0 Or nvcFrameAbortable = 0 Or nvcCommand = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  rc = vkResetCommandBuffer(nvcCommand, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  If nvcMapped <> 0
+    vkUnmapMemory(nvcDevice, nvcVertexMemory) : nvcMapped = 0
+  EndIf
+  nvcInFrame = 0 : nvcFrameAbortable = 0
+  nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
+  nvcGridBatchActive = 0 : nvcBoxBatchActive = 0
+  nvcGridBatchFirst = 0 : nvcBoxBatchFirst = 0 : nvcBoxBatchCount = 0
+  nvcRetainedBatchActive = 0 : nvcRetainedBatchCount = 0
+  nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
+  nvcSubmitStage = 0 : nvcSubmitRc = #VK_SUCCESS
+  nvcError = 0
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
 Procedure NeonVkChromeDestroy()
   Define cmd.i, slot.i
   Define idleRc.i
+  If nvcExternalProducerAttached <> 0 Or nvcExternalProducerQuarantined <> 0
+    nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    ProcedureReturn
+  EndIf
   nvdWsiRollback()
   nvdPresentClear()
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
@@ -3167,7 +3243,7 @@ Procedure NeonVkChromeDestroy()
   If nvcMapped <> 0 And nvcDevice <> 0 And nvcVertexMemory <> 0
     vkUnmapMemory(nvcDevice, nvcVertexMemory)
   EndIf
-  nvcMapped = 0 : nvcInFrame = 0 : nvcReady = 0
+  nvcMapped = 0 : nvcInFrame = 0 : nvcFrameAbortable = 0 : nvcReady = 0
   nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
   If nvcDevice <> 0
     idleRc = vkDeviceWaitIdle(nvcDevice)
@@ -3229,7 +3305,7 @@ Procedure NeonVkChromeDestroy()
   nvcPhysical = 0 : nvcDevice = 0 : nvcQueue = 0 : nvcCommandPool = 0
   nvcRenderPass = 0 : nvcFramebuffer = 0 : nvcWidth = 0 : nvcHeight = 0
   nvcLogicalW = 0 : nvcLogicalH = 0 : nvcPhysicalW = 0 : nvcPhysicalH = 0 : nvcPitch = 0 : nvcRotation = 0
-  nvcMaxQuads = 0 : nvcMaxVertexQuads = 0 : nvcVertices = 0 : nvcDrawCount = 0
+  nvcMaxQuads = 0 : nvcMaxVertexQuads = 0 : nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
   nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0
@@ -3241,6 +3317,7 @@ Procedure NeonVkChromeDestroy()
   For slot = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[slot] = 0 : Next
   nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
   nvcTargetGeneration = 0
+  nvcExternalProducerAttached = 0 : nvcExternalProducerQuarantined = 0
 EndProcedure
 
 ; Optional public Neon lifecycle for a caller that already created Chrome
@@ -3281,6 +3358,7 @@ EndProcedure
 
 Procedure.i nvcLifecycleShutdown()
   If nvcInFrame <> 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
+  If nvcExternalProducerAttached <> 0 Or nvcExternalProducerQuarantined <> 0 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
   If nvcDevice <> 0 And vkDeviceWaitIdle(nvcDevice) <> #VK_SUCCESS
     ProcedureReturn #NEON_ERR_BACKEND
   EndIf

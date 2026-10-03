@@ -126,15 +126,39 @@ extent. Float edges, colors and angles are rounded to integral pixels,
 The adapter owns a fixed CPU list and no Vulkan objects. Chrome creates and
 releases its palette and staging resources, and draws the prepared list in
 one ordered draw record. The current production Chrome route expands six
-vertices per particle on the CPU during DrawPrepared; a future direct GPU
-particle path can retain this Prepare/DrawPrepared seam. This is call and
+vertices per particle on the CPU during DrawPrepared; the opt-in GPU
+producer retains the same Prepare/DrawPrepared ordering. This is call and
 ordering portability, not GPU instancing or throughput parity. The restored
 desktop shader uses a square with local corners at ±0.5 while its fragment
 mask starts outside radius 0.8, so that source currently gives its square
 interior full alpha rather than a feathered circle. The Vulkan route keeps
 the square footprint and supports the same source-alpha blending, but raster
 edges and rotations remain quantized. The caller must reserve enough Chrome
-vertex capacity for six vertices per particle and one draw slot.
+vertex capacity for six vertices per particle and one draw slot on this CPU
+route.
+
+Chrome also has an opt-in `NeonVkChromeParticlesDrawExternal` recording seam
+for a producer that has already prepared a dedicated vertex `VkBuffer`.
+It binds that buffer for one ordered particle draw, then restores Chrome's
+shared buffer for later UI draws. `NeonVkChromeVertexCount` includes these
+external vertices without consuming shared-buffer capacity. The producer
+attaches before allocating device resources and detaches only after verified
+idle and release. It quarantines Chrome before uncertain compute submission;
+Begin, Prepare, Rebind and Destroy refuse while quarantined. A completed
+compute wait and cache clean permit unquarantine. `NeonVkChromeAbort` can
+discard a frame only before queue submission. These calls do not dispatch
+compute or assume a board-specific GPU address mapping.
+
+On Pi 4, the opt-in `neon_vk_particle_csd.pi4` module uses that seam to write
+Chrome-format particle vertices directly into a live Vulkan buffer. Its
+32-particle correctness and 10,000-particle profile reports are under
+`docs/evidence/neon-particle-csd-module-pi4-20261003/` and
+`docs/evidence/neon-particle-csd-module-10k-pi4-20261003/`. A matched
+10,000-particle comparison found a 724,647 µs median CSD frame versus
+589,087 µs for CPU expansion on Pi 4 build 244. CPU record staging makes the
+current CSD route slower, so the default Chrome path remains CPU-expanded.
+The producer is board-specific; the Chrome seam and default renderer remain
+available without it.
 
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy

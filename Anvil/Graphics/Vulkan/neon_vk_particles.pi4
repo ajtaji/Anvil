@@ -231,7 +231,7 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
   Define i.i, rc.i
   Define *p.NvcParticle
   Define *candidate.NvcParticleCorners
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvdPresentPending() <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If count < 0 Or count > #NVC_PARTICLE_MAX Or (count > 0 And *particles = 0)
@@ -425,4 +425,65 @@ Procedure.i NeonVkChromeParticlesDrawPrepared()
     nvcVertices + 6
   Next
   ProcedureReturn nvcDrawSet(first, nvcParticleCount * 6, $FFFFFFFF, nvcParticleSet)
+EndProcedure
+
+; Opt-in draw of vertices prepared by a separate producer. The producer keeps
+; the bound buffer live until Chrome End has completed its Vulkan fence. The
+; six 24-byte vertices for each prepared particle must already contain the
+; palette UVs and white tint expected by Chrome's particle descriptor.
+Procedure.i NeonVkChromeParticlesDrawExternal(vertexBuffer.i, vertexCount.i)
+  Define offset.q
+  Define sharedBuffer.i, rc.i, drawFault.i, restoreFault.i, abortRc.i
+
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcFrameAbortable = 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0 Or nvcParticlePrepared = 0 Or nvcParticleSet = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcParticleTargetGeneration <> nvcTargetGeneration Or nvcParticleLogicalW <> nvcLogicalW Or nvcParticleLogicalH <> nvcLogicalH
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE Or nvcParticleUploaded = 0 Or nvcParticleStageSafe = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If vertexCount <> nvcParticleCount * 6 Or vertexCount < 0 Or vertexBuffer = 0 Or vertexBuffer = nvcVertexBuffer
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  ; A previous void recording call may already have invalidated this frame.
+  rc = AnvilVkFaultCode()
+  If rc <> #ANVIL_VK_OK
+    abortRc = NeonVkChromeAbort()
+    If abortRc <> #VK_SUCCESS : ProcedureReturn nvcFail(abortRc) : EndIf
+    ProcedureReturn nvcFail(rc)
+  EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices < 0 Or nvcVertices > nvcMaxVertexQuads * 6 Or AnvilVkBufferSize(vertexBuffer) < vertexCount * #NEON_VK_CHROME_VERTEX_BYTES
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  If vertexCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+
+  offset = 0
+  AnvilVkFaultClear()
+  vkCmdBindVertexBuffers(nvcCommand, 0, 1, @vertexBuffer, @offset)
+  rc = AnvilVkFaultCode()
+  If rc <> #ANVIL_VK_OK
+    abortRc = NeonVkChromeAbort()
+    If abortRc <> #VK_SUCCESS : ProcedureReturn nvcFail(abortRc) : EndIf
+    ProcedureReturn nvcFail(rc)
+  EndIf
+
+  AnvilVkFaultClear()
+  rc = nvcDrawSet(0, vertexCount, $FFFFFFFF, nvcParticleSet)
+  drawFault = AnvilVkFaultCode()
+  sharedBuffer = nvcVertexBuffer
+  AnvilVkFaultClear()
+  vkCmdBindVertexBuffers(nvcCommand, 0, 1, @sharedBuffer, @offset)
+  restoreFault = AnvilVkFaultCode()
+  If rc <> #NEON_VK_CHROME_OK Or drawFault <> #ANVIL_VK_OK Or restoreFault <> #ANVIL_VK_OK
+    abortRc = NeonVkChromeAbort()
+    If abortRc <> #VK_SUCCESS : ProcedureReturn nvcFail(abortRc) : EndIf
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nvcFail(rc) : EndIf
+    If drawFault <> #ANVIL_VK_OK : ProcedureReturn nvcFail(drawFault) : EndIf
+    ProcedureReturn nvcFail(restoreFault)
+  EndIf
+
+  nvcExternalVertices = nvcExternalVertices + vertexCount
+  ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
