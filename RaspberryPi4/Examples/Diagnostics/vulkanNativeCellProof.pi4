@@ -1,0 +1,258 @@
+; Returning RAM-only proof for native-size Pi 4 Vulkan terminal glyphs.
+; The monitor owns the deadman. This payload does not touch a boot medium.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "RaspberryPi4/Examples/Diagnostics/vulkanBannerTinyFont.pbi"
+
+#NLP_MAGIC = $504C564E
+#NLP_TAIL = $4E564C50
+#NLP_W = 64
+#NLP_H = 64
+#NLP_SURFACE = $06000000
+#NLP_SURFACE_PITCH = 3200
+#NLP_WINDOW = $063E8000
+#NLP_WINDOW_BYTES = $00C00000
+#NLP_MAP_SPAN = $00FE8000
+#NLP_ARENA = $0A000000
+#NLP_ARENA_BYTES = $01000000
+
+Global Dim nlReport.l[32]
+Global nlInst.i, nlPhys.i, nlDev.i, nlQueue.i, nlPool.i
+Global nlImage.i, nlMemory.i, nlView.i, nlPass.i, nlFramebuffer.i
+Global nlImageBase.i, nlImagePitch.i
+
+Procedure.i nlReturn(status.i)
+  nlReport[1] = status
+  nlReport[30] = NeonLifecyclePreparedOwnerPending()
+  nlReport[31] = #NLP_TAIL
+  ProcedureReturn @nlReport[0]
+EndProcedure
+
+Procedure.i nlObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If nlDev <> 0 : rc = vkDeviceWaitIdle(nlDev) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If nlFramebuffer <> 0 : vkDestroyFramebuffer(nlDev, nlFramebuffer, 0) : nlFramebuffer = 0 : EndIf
+  If nlPass <> 0 : vkDestroyRenderPass(nlDev, nlPass, 0) : nlPass = 0 : EndIf
+  If nlView <> 0 : vkDestroyImageView(nlDev, nlView, 0) : nlView = 0 : EndIf
+  If nlImage <> 0 : vkDestroyImage(nlDev, nlImage, 0) : nlImage = 0 : EndIf
+  If nlMemory <> 0 : vkFreeMemory(nlDev, nlMemory, 0) : nlMemory = 0 : EndIf
+  If nlPool <> 0 : vkDestroyCommandPool(nlDev, nlPool, 0) : nlPool = 0 : EndIf
+  If nlDev <> 0 : vkDestroyDevice(nlDev, 0) : nlDev = 0 : EndIf
+  If nlInst <> 0 : vkDestroyInstance(nlInst, 0) : nlInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nlFinish(status.i)
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If nvcInFrame <> 0 : NeonVkChromeDestroy() : EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK : ProcedureReturn nlReturn(90) : EndIf
+  ElseIf NeonVkChromeReady() <> 0
+    NeonVkChromeDestroy()
+  EndIf
+  If nlObjectsDestroy() = 0 : ProcedureReturn nlReturn(91) : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK : ProcedureReturn nlReturn(92) : EndIf
+  EndIf
+  nlReport[27] = Neon_Ready()
+  nlReport[28] = v3d_owner
+  nlReport[29] = NeonDrawBackendActive()
+  ProcedureReturn nlReturn(status)
+EndProcedure
+
+Procedure.i nlObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @nlInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(nlInst, @count, @nlPhys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or nlPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(nlPhys, @dci, 0, @nlDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(nlDev, 0, 0, @nlQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(nlDev, @pci, 0, @nlPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NLP_W : imageInfo\extent\height = #NLP_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nlDev, @imageInfo, 0, @nlImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(nlDev, nlImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nlDev, @alloc, 0, @nlMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(nlDev, nlImage, nlMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  nlImageBase = AnvilVkImageAddress(nlImage)
+  nlImagePitch = AnvilVkImageRowPitch(nlImage)
+  If nlImageBase = 0 Or nlImagePitch < (#NLP_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(nlDev, nlMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> nlImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(nlDev, nlMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = nlImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(nlDev, @viewInfo, 0, @nlView)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(nlDev, @passInfo, 0, @nlPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = nlPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @nlView : frameInfo\width = #NLP_W
+  frameInfo\height = #NLP_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(nlDev, @frameInfo, 0, @nlFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Compare a legacy squeezed cell with the measured native-size cell.
+Procedure.i Main()
+  Define rc.i, glyph.i, entry.i, narrowW.i, wideW.i, metricH.i, baseline.i
+  Define x.i, y.i, pixel.i, leftX.i, rightX.i
+  Dim clear.l[4]
+  nlReport[0] = #NLP_MAGIC
+  nlReport[1] = 1
+  nlReport[31] = #NLP_TAIL
+  TimerInit()
+
+  nlReport[2] = 1
+  If NeonArena(#NLP_ARENA, #NLP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn nlFinish(1) : EndIf
+  If NeonSurface(#NLP_SURFACE, 800, 1280, #NLP_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn nlFinish(2) : EndIf
+  NeonSurfaceMapSpan(#NLP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn nlFinish(3) : EndIf
+  NeonPalette() : NeonFontDefaults()
+  NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  If AnvilTrueTypeSlotLoad(0, ?nvbfData, #NVBF_BYTES) = 0 Or AnvilTrueTypeSlotSelect(0) = 0
+    ProcedureReturn nlFinish(4)
+  EndIf
+  If NeonVkChromeGridMeasure(24, @wideW, @metricH, @baseline) = 0
+    ProcedureReturn nlFinish(22)
+  EndIf
+  nlReport[15] = wideW : nlReport[16] = metricH : nlReport[17] = baseline
+  If AnvilVkV3dWindow(#NLP_WINDOW, #NLP_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn nlFinish(5) : EndIf
+
+  nlReport[2] = 2
+  If nlObjectsCreate() = 0 : ProcedureReturn nlFinish(6) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(nlPhys, nlDev, nlQueue, nlPool, nlPass, nlFramebuffer, #NLP_W, #NLP_H, 64, 256)
+  If rc <> #VK_SUCCESS : ProcedureReturn nlFinish(7) : EndIf
+  glyph = AnvilTrueTypeGlyphForCodepoint(87)
+  If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount() : ProcedureReturn nlFinish(8) : EndIf
+  rc = NeonVkChromeGridWarm(@glyph, 1, 24)
+  If rc <> 1 : ProcedureReturn nlFinish(9) : EndIf
+  entry = nvcTTCacheFind(AnvilTrueTypeSlotSelected(), AnvilTrueTypeSlotGeneration(0), 24, glyph)
+  If entry < 0 : ProcedureReturn nlFinish(10) : EndIf
+  nlReport[3] = nvcTTW[entry] : nlReport[4] = nvcTTH[entry]
+  narrowW = nvcTTW[entry] / 2
+  nlReport[5] = narrowW : nlReport[6] = wideW
+  If narrowW < 3 Or wideW > 36 Or metricH > 32 Or nvcTTH[entry] < 4 Or nvcTTH[entry] > metricH
+    ProcedureReturn nlFinish(11)
+  EndIf
+
+  nlReport[2] = 3
+  clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = $3F800000
+  If NeonVkChromeBegin(@clear[0]) <> #VK_SUCCESS : ProcedureReturn nlFinish(12) : EndIf
+  If NeonVkChromeGridBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nlFinish(13) : EndIf
+  If NeonVkChromeGridGlyphAppend(glyph, 24, 2, 2, narrowW, 28) <> #NEON_VK_CHROME_OK : ProcedureReturn nlFinish(14) : EndIf
+  If NeonVkChromeGridGlyphAppendNative(glyph, 24, 26, 2, wideW, metricH) <> #NEON_VK_CHROME_OK : ProcedureReturn nlFinish(15) : EndIf
+  If NeonVkChromeGridBatchFlush($FFFFFFFF) <> #NEON_VK_CHROME_OK : ProcedureReturn nlFinish(16) : EndIf
+  If NeonVkChromeGridBatchEnd() <> #NEON_VK_CHROME_OK : ProcedureReturn nlFinish(17) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nlFinish(18) : EndIf
+  nlReport[13] = NeonVkChromeFrameRasterDelta()
+  nlReport[14] = NeonVkChromeFrameUploadDelta()
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nlFinish(19) : EndIf
+
+  nlReport[2] = 4
+  nlReport[7] = 64 : nlReport[9] = 64
+  For y = 0 To 31
+    For x = 2 To 2 + narrowW - 1
+      pixel = PeekL(nlImageBase + y * nlImagePitch + x * 4) & $00FFFFFF
+      If pixel <> 0
+        If y < nlReport[7] : nlReport[7] = y : EndIf
+        If y > nlReport[8] : nlReport[8] = y : EndIf
+        nlReport[11] = nlReport[11] + 1
+      EndIf
+    Next
+    For x = 26 To 26 + wideW - 1
+      pixel = PeekL(nlImageBase + y * nlImagePitch + x * 4) & $00FFFFFF
+      If pixel <> 0
+        If y < nlReport[9] : nlReport[9] = y : EndIf
+        If y > nlReport[10] : nlReport[10] = y : EndIf
+        nlReport[12] = nlReport[12] + 1
+      EndIf
+    Next
+  Next
+  If nlReport[11] = 0 Or nlReport[12] = 0
+    ProcedureReturn nlFinish(20)
+  EndIf
+  If nlReport[13] <> 0 Or nlReport[14] <> 0 : ProcedureReturn nlFinish(21) : EndIf
+  nlReport[2] = 5
+  ProcedureReturn nlFinish(0)
+EndProcedure

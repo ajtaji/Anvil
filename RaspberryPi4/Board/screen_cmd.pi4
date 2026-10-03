@@ -23,11 +23,12 @@ Procedure ConPaintDma()
   Define c.i
   Define cw.i
   Define style.i
+  Define cp.i
   Define hadCur.i
   Define pLo.i
   Define pHi.i
 
-  If DisplayBase() = 0
+  If gScreenDeferFirstFrame <> 0 Or DisplayBase() = 0
     ProcedureReturn
   EndIf
   ch = DisplayCharHeight()
@@ -78,25 +79,40 @@ Procedure ConPaintDma()
     If ConGridRowDirty(r) <> 0
       y = LogoHeight() + r * ch
       DisplayFillRect(0, y, DisplayWidth(), ch, gScreenBg)
-      ; One draw per contiguous style run. The row was cleared above, and
-      ; x is derived from the run's first cell, so splitting the string
-      ; changes colour only - never spacing or terminal content.
-      c = 0
-      While c < ConGridCols()
-        style = ConGridCellStyle(r, c)
-        n = ConGridStyleRunText(r, c, @gConRowBuf[0])
-        If style = #UART_SCREEN_STYLE_PROMPT
-          fg = DisplayRGB(80, 255, 120)
-        Else
-          fg = DisplayRGB(226, 232, 240)
-        EndIf
-        If n > 0
-          DisplayTextClear(c * cw, y, @gConRowBuf[0], fg)
-          c = c + n
-        Else
-          c = c + 1
-        EndIf
-      Wend
+      If dsp_gridCellW > 0
+        ; A GPU failure keeps the measured terminal geometry until the next
+        ; rebuild. Place fallback bitmap characters at those same columns;
+        ; DisplayTextClear would advance by the bitmap's narrower width.
+        For c = 0 To ConGridCols() - 1
+          cp = ConGridCell(r, c)
+          If cp <> 32
+            If ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT
+              fg = DisplayRGB(80, 255, 120)
+            Else
+              fg = DisplayRGB(226, 232, 240)
+            EndIf
+            DisplayCharClear(c * cw, y, cp, fg)
+          EndIf
+        Next
+      Else
+        ; One draw per contiguous style run with the bitmap cell width.
+        c = 0
+        While c < ConGridCols()
+          style = ConGridCellStyle(r, c)
+          n = ConGridStyleRunText(r, c, @gConRowBuf[0])
+          If style = #UART_SCREEN_STYLE_PROMPT
+            fg = DisplayRGB(80, 255, 120)
+          Else
+            fg = DisplayRGB(226, 232, 240)
+          EndIf
+          If n > 0
+            DisplayTextClear(c * cw, y, @gConRowBuf[0], fg)
+            c = c + n
+          Else
+            c = c + 1
+          EndIf
+        Wend
+      EndIf
       If y < pLo
         pLo = y
       EndIf
@@ -158,12 +174,14 @@ Procedure.i ScreenAttachFramebuffer(dmaOn.i)
     DisplayUseDma(0)
   EndIf
   ConSetRenderer(@ConPaintDma)
-  DisplayClear(gScreenBg)
-  DrawBanner()
+  If gScreenDeferFirstFrame = 0
+    DisplayClear(gScreenBg)
+    DrawBanner()
+  EndIf
   ConRepaint()
   ; The banner band is not part of the console grid, so ConRepaint's own
   ; present does not cover it. This is the one call that does the lot.
-  ScrPresentAll()
+  If gScreenDeferFirstFrame = 0 : ScrPresentAll() : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -300,6 +318,134 @@ EndProcedure
 Global *gScreenReadoptPaint
 Global gScreenReadoptSuspended.i
 
+; Measure the selected face when it is installed. The console uses its actual
+; advances for horizontal layout and the measured raster bounds only for row
+; height/baseline; the bitmap fallback keeps its own 8-pixel cell width.
+Global gScreenFontSlot.i = -1
+Global gScreenFontGeneration.i = -1
+Global gScreenFontPixels.i = 0
+Global Dim gScreenGlyph.i[128]
+Global Dim gScreenGlyphAdvance.i[128]
+Global Dim gScreenPairAdvance.i[16384]
+Global Dim gScreenPairValid.a[16384]
+Global Dim gScreenPairValues.i[8]
+Global gScreenMetricSlot.i = -1
+Global gScreenMetricGeneration.i = -1
+Global gScreenMetricPixels.i = 0
+Global gScreenMetricUnits.i = 0
+Global gScreenPairErrors.i = 0
+Global gScreenFontMetricFault.i = 0
+
+; Measure every printable glyph when the face or size is selected, before any
+; console draw. Pair adjustments are cached on their first occurrence.
+Procedure.i ScreenFontMetricCacheBuild()
+  Define slot.i, generation.i, pixels.i, units.i, cp.i, glyph.i, metric.i, lsb.i, idx.i
+  gScreenMetricSlot = -1
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 : ProcedureReturn 0 : EndIf
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  pixels = AnvilTrueTypePixelHeight()
+  units = AnvilTrueTypeUnitsPerEm()
+  If pixels < 1 Or units < 1 : ProcedureReturn 0 : EndIf
+  For cp = 32 To 126
+    glyph = AnvilTrueTypeGlyphForCodepoint(cp)
+    If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount() : ProcedureReturn 0 : EndIf
+    If AnvilTrueTypeHorizontalMetric(glyph, @metric, @lsb) = 0 : ProcedureReturn 0 : EndIf
+    gScreenGlyph[cp] = glyph
+    gScreenGlyphAdvance[cp] = anvil_ttl_Scale(metric, pixels, units)
+    ; ASCII input must always move the pen. Reject a broken hmtx/scale
+    ; reading before allowing the face to control console wrapping.
+    If gScreenGlyphAdvance[cp] <= 0 Or gScreenGlyphAdvance[cp] > pixels * 4 * 65536
+      ProcedureReturn 0
+    EndIf
+  Next
+  For idx = 0 To 16383 : gScreenPairValid[idx] = 0 : Next
+  gScreenMetricSlot = slot : gScreenMetricGeneration = generation
+  gScreenMetricPixels = pixels : gScreenMetricUnits = units
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ScreenProportionalAdvance(previous.i, current.i)
+  Define idx.i, pairRc.i, delta.i, slot.i, pairIndex.i
+  If current < 32 Or current > 126 : ProcedureReturn 0 : EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 : ProcedureReturn 0 : EndIf
+  If slot <> gScreenMetricSlot Or AnvilTrueTypeSlotGeneration(slot) <> gScreenMetricGeneration Or AnvilTrueTypePixelHeight() <> gScreenMetricPixels
+    If ScreenFontMetricCacheBuild() = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  delta = gScreenGlyphAdvance[current]
+  If previous >= 32 And previous <= 126
+    idx = previous * 128 + current
+    If gScreenPairValid[idx] = 0
+      ; A no-match GPOS kern feature may return success without writing
+      ; valuesOut. Never apply the previous pair's offsets to this glyph.
+      For pairIndex = 0 To 7 : gScreenPairValues[pairIndex] = 0 : Next
+      pairRc = AnvilTrueTypePairPosition(gScreenGlyph[previous], gScreenGlyph[current], @gScreenPairValues[0])
+      If pairRc <> 0
+        gScreenPairAdvance[idx] = delta + anvil_ttl_Scale(gScreenPairValues[2], gScreenMetricPixels, gScreenMetricUnits) + anvil_ttl_Scale(gScreenPairValues[6], gScreenMetricPixels, gScreenMetricUnits)
+      Else
+        gScreenPairAdvance[idx] = delta
+      EndIf
+      ; Pair data is an adjustment to a measured glyph, never permission
+      ; for a zero or screen-wide advance. Retain the hmtx measurement
+      ; and count the failure without sending an error code into layout.
+      If pairRc = 0 Or gScreenPairAdvance[idx] <= 0 Or gScreenPairAdvance[idx] > gScreenMetricPixels * 4 * 65536
+        gScreenPairErrors = gScreenPairErrors + 1
+        gScreenPairAdvance[idx] = delta
+      EndIf
+      gScreenPairValid[idx] = 1
+    EndIf
+    delta = gScreenPairAdvance[idx]
+  EndIf
+  ProcedureReturn delta
+EndProcedure
+
+Procedure ScreenConsoleGridInit()
+  If AnvilTrueTypeSlotSelected() >= 0
+    ConGridInit(#CON_MAXCOLS, DisplayRows())
+    ConGridProportionalSet(DisplayWidth(), 1)
+  Else
+    ConGridInit(DisplayCols(), DisplayRows())
+    ConGridProportionalSet(0, 0)
+  EndIf
+EndProcedure
+
+Procedure.i ScreenFontCellMetricsApply()
+  Define oldW.i, oldH.i, cellW.i, cellH.i, baseline.i, slot.i, generation.i, pixels.i, changed.i
+  oldW = DisplayCharWidth() : oldH = DisplayCharHeight()
+  slot = AnvilTrueTypeSlotSelected()
+  generation = -1 : pixels = 0
+  If slot >= 0
+    generation = AnvilTrueTypeSlotGeneration(slot)
+    pixels = AnvilTrueTypePixelHeight()
+  EndIf
+  changed = Bool(slot <> gScreenFontSlot Or generation <> gScreenFontGeneration Or pixels <> gScreenFontPixels)
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If AnvilTrueTypeSlotSelected() >= 0
+    If NeonVkChromeGridMeasure(AnvilTrueTypePixelHeight(), @cellW, @cellH, @baseline) = 0 Or ScreenFontMetricCacheBuild() = 0
+      gScreenFontMetricFault = 1
+      PrintN("!! TrueType console glyph metrics could not be measured")
+      If gScreenDeferFirstFrame = 0
+        AnvilTrueTypeSlotDeselect()
+        DisplayConsoleCellSet(0, 0)
+      EndIf
+    Else
+      gScreenFontMetricFault = 0
+      DisplayConsoleCellSet(8, cellH)
+    EndIf
+  Else
+    gScreenFontMetricFault = 1
+    DisplayConsoleCellSet(0, 0)
+  EndIf
+  CompilerElse
+  DisplayConsoleCellSet(0, 0)
+  CompilerEndIf
+  gScreenFontSlot = AnvilTrueTypeSlotSelected()
+  gScreenFontGeneration = generation
+  gScreenFontPixels = pixels
+  ProcedureReturn Bool(changed <> 0 Or oldW <> DisplayCharWidth() Or oldH <> DisplayCharHeight())
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  ScreenRebuildAtGeometry - THE SHARED COMPOSITION TAIL.
 ;
@@ -342,10 +488,12 @@ Procedure ScreenRebuildAtGeometry()
   DisplayAutoFlush(1)
   gScreenBg = DisplayRGB(0, 0, 40)
   DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
-  DisplayClear(gScreenBg)
-  DrawBanner()
+  If gScreenDeferFirstFrame = 0
+    DisplayClear(gScreenBg)
+    DrawBanner()
+  EndIf
   DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
-  ConGridInit(DisplayCols(), DisplayRows())
+  ScreenConsoleGridInit()
   ConSetRenderer(@ConPaintDma)
   UartMirrorSetDrain(@ConMirrorDrain)
 
@@ -375,7 +523,7 @@ Procedure ScreenRebuildAtGeometry()
   ; same call, for the same reason, that ScreenUpOn makes after a move.
   HwTouchFlush()
 
-  ScrPresentAll()
+  If gScreenDeferFirstFrame = 0 : ScrPresentAll() : EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -963,6 +1111,11 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ScreenDsiEarlyCache(earlyCache)
   BootTimingMark(#BTM_MAPPED, gCacheOn, 0)
 
+  ; Font metrics determine row height and per-glyph advances before the
+  ; console grid takes a single boot byte. The embedded TrueType face is
+  ; selected before screen acquisition; saved settings may replace it later.
+  ScreenFontCellMetricsApply()
+
   ; THE BLITTER, BEFORE ANYTHING IS DRAWN. It has to come after the
   ; surface is installed, whichever way it was got, because it is bound
   ; to THAT surface - and it wants to be before the first clear, because
@@ -993,13 +1146,13 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; The WHOLE screen, once. Everything after this only ever touches the
   ; console rectangle, so whatever the firmware left in the logo band
   ; would survive forever if it were not cleared here.
-  DisplayClear(DisplayRGB(0, 0, 40))
+  If gScreenDeferFirstFrame = 0 : DisplayClear(DisplayRGB(0, 0, 40)) : EndIf
   ; INTO RAM. Nothing is on the glass yet at 90 or 270: this cleared the
   ; buffer the console draws into, and the panel is scanning the other
   ; one until the present below.
   BootTimingMark(#BTM_CLEAR_DONE, 0, 0)
 
-  DrawBanner()
+  If gScreenDeferFirstFrame = 0 : DrawBanner() : EndIf
   BootTimingMark(#BTM_BANNER_DRAWN, 0, 0)
 
   ; The console starts BELOW the band. Everything printed from here on
@@ -1032,7 +1185,7 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; library more columns than the grid holds, and text would wrap at 256
   ; on a screen the console appeared to own. If you widen the request,
   ; widen the grid or floor the magnification with it.
-  ConGridInit(DisplayCols(), DisplayRows())
+  ScreenConsoleGridInit()
   ConSetRenderer(@ConPaintDma)
   ; Long synchronous commands can produce much more than the UART mirror's
   ; 8 KiB staging ring before the prompt pumps again. Drain those bytes into
@@ -1044,7 +1197,7 @@ Procedure.i ScreenUpOn(src.i, index.i)
   ; present it. On HDMI, and on the panel at 0 and 180, this costs one
   ; comparison; on a rotated panel it is the one pass that puts the
   ; anvil on the glass.
-  ScrPresentAll()
+  If gScreenDeferFirstFrame = 0 : ScrPresentAll() : EndIf
   ; ON THE PANEL. This is the first tick at which the pixels above are the
   ; pixels being scanned, and the gap between it and #BTM_BANNER_DRAWN is
   ; what the transpose costs on a turned panel - zero on HDMI and at 0/180.

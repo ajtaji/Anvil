@@ -386,6 +386,7 @@ Global fxTxLen.i
 Global fxTxCalls.i
 Global fxTxKind.i
 Global fxFailAt.i
+Global fxFailNext.i
 
 ; AND EVERY FRAME, NOT ONLY THE LAST. fxTx above keeps the most recent
 ; frame and every case written before 2026-09-16 grades that one. A bulk
@@ -496,6 +497,10 @@ Procedure.i HwLinkSend(kind.i, buf.i, n.i, ms.i)
   Define i.i
   fxTxCalls = fxTxCalls + 1
   fxTxKind = kind
+  If fxFailNext > 0
+    fxFailNext = fxFailNext - 1
+    ProcedureReturn 0
+  EndIf
   If fxFailAt <> 0 And fxTxCalls = fxFailAt
     fxFailAt = 0
     ProcedureReturn 0
@@ -691,6 +696,7 @@ Procedure fxReset()
   fxTxCalls = 0
   fxTxKind = 0
   fxFailAt = 0
+  fxFailNext = 0
   fxLogLen = 0
   fxLogFrames = 0
   fxBreakAt = 0
@@ -1007,6 +1013,15 @@ Procedure.i Main()
       ; Refuse the a-th following frame once, then recover for the verdict.
       fxFailAt = fxTxCalls + a
       r = fxFailAt
+    ElseIf op = 34
+      ; Refuse the next a sends, then recover.
+      fxFailNext = a
+      r = fxFailNext
+    ElseIf op = 35
+      ; Console output failure diagnostics and pending-session boundary.
+      r = NetConsoleOutputDiscarded()
+      e1 = gConOutPending
+      e2 = NetConsoleOutputFailures()
     EndIf
 
     PokeN(q, op)
@@ -1381,6 +1396,20 @@ def build_script() -> tuple[Script, dict]:
     at["answer_w"] = s.add(10, blob=ANSWERED, label="the board answers")
     at["wire_wired"] = s.add(9, label="the datagram on the wire")
 
+    # A refused console datagram must remain pending. Two link refusals
+    # exhaust this flush's bounded attempts; the next flush sends that
+    # same byte sequence before anything printed later.
+    at["clear_retry"] = s.add(27, label="clear earlier console frames")
+    at["fail_retry"] = s.add(34, 2, label="two console sends are refused")
+    at["held_retry"] = s.add(10, blob=b"held",
+                             label="refused output remains pending")
+    at["empty_retry"] = s.add(27, label="no refused output on the wire")
+    at["cool_retry"] = s.add(10, label="an immediate flush does not spin")
+    at["tick_retry"] = s.add(12, 100, label="retry interval passes")
+    at["tail_retry"] = s.add(10, blob=b"tail\r\n",
+                             label="the next flush sends pending output first")
+    at["wire_retry"] = s.add(27, label="both output pieces in order")
+
     # ==== H. A DATAGRAM ON THE SECOND ADDRESSED INTERFACE ===========
     #  The radio comes up and takes an address of its own, and a console
     #  datagram arrives on it while the console announces the cable. It
@@ -1405,6 +1434,22 @@ def build_script() -> tuple[Script, dict]:
     at["ring_busy"] = s.add(8, label="the ring - must be empty")
     at["wire_busy"] = s.add(9, label="the answer to the second host")
     at["done_h"] = s.add(24, label="the cable host's command completes")
+    at["rx_lost"] = s.add(6, LINK_WIRED,
+                           blob=datagram(WIRED_PEER, WIRED_IP, WIRED_MAC,
+                                         b"noop\n"),
+                           label="the cable host starts another command")
+    at["tick_lost"] = s.add(12, 50, label="50 ms of prompt spinning")
+    at["pump_lost"] = s.add(7, label="the pump takes the new command")
+    at["ring_lost"] = s.add(8, label="drain its keystrokes")
+    at["clear_lost"] = s.add(27, label="clear earlier wire frames")
+    at["fail_lost"] = s.add(34, 4,
+                            label="all bounded sends for this command fail")
+    at["write_lost"] = s.add(10, blob=b"old",
+                             label="output cannot be transmitted")
+    at["done_lost"] = s.add(24,
+                            label="the failed command releases its session")
+    at["state_lost"] = s.add(35,
+                             label="lost bytes are counted and not pending")
     at["rx_other"] = s.add(6, LINK_WIFI,
                            blob=datagram(RADIO_PEER, RADIO_IP, RADIO_MAC,
                                          TYPED3),
@@ -1413,6 +1458,10 @@ def build_script() -> tuple[Script, dict]:
     at["pump_other"] = s.add(7, label="one turn of the pump")
     at["still_there"] = s.add(17, label="is that frame still queued")
     at["ring_other"] = s.add(8, label="the ring after that pump")
+    at["answer_other"] = s.add(10, blob=b"new\r\n",
+                               label="the next peer receives only new output")
+    at["wire_other"] = s.add(27,
+                             label="no previous peer's output reaches it")
     #  and the radio is put back down, so section E can bring it up as
     #  the join it is modelling.
     at["wifi_down_h"] = s.add(2, LINK_WIFI, 0, label="the radio drops again")
@@ -1924,6 +1973,18 @@ def check(res, at, console: bytes, fails: list[str], mutated: str) -> None:
            fails)
     grade_answer("C.", R("wire_wired").blob, WIRED_MAC, WIRED_IP,
                  WIRED_PEER, ANSWERED, fails)
+    expect(R("empty_retry").r == 0,
+           "C1. output refused by the link appeared on the wire anyway",
+           fails)
+    expect(R("cool_retry").r == R("held_retry").r,
+           "C1. an immediate retry after two link refusals spun on the "
+           "radio instead of preserving the pending output", fails)
+    retry = R("wire_retry")
+    retry_frames = rb_frames(retry.blob, retry.r, "C1.", fails)
+    retry_payloads = [frame[2] for frame in retry_frames]
+    expect(retry_payloads == [b"held", b"tail\r\n"],
+           "C1. two refused sends did not retain the pending bytes ahead "
+           "of the next console line: %r" % retry_payloads, fails)
 
     # ---- H. THE PUMP READS EVERY ADDRESSED INTERFACE ----------------
     #  WHAT THIS CASE USED TO SAY, AND WHY IT SAID IT. Until 2026-09-07
@@ -1955,6 +2016,13 @@ def check(res, at, console: bytes, fails: list[str], mutated: str) -> None:
            % (R("wire_busy").e2, busy[42:48]), fails)
     expect(R("done_h").r == 0,
            "H. the session was still owned after the command completed", fails)
+    expect(R("ring_lost").blob == b"noop\n",
+           "H1. the second cable command did not reach the console", fails)
+    expect(R("done_lost").r == 0 and R("state_lost").r == 3
+           and R("state_lost").e1 == 0,
+           "H1. output that never found transmit credit was not counted "
+           "and cleared at the session boundary (lost=%d pending=%d)"
+           % (R("state_lost").r, R("state_lost").e1), fails)
     expect(R("still_there").r == 0,
            "H. a console datagram on the OTHER addressed interface was "
            "left unconsumed by the pump. The console listens on every "
@@ -1964,6 +2032,11 @@ def check(res, at, console: bytes, fails: list[str], mutated: str) -> None:
            "H. the datagram that arrived on the second interface did not "
            "reach the keystroke ring\n%s"
            % hexdiff(R("ring_other").blob, TYPED3), fails)
+    other_frames = rb_frames(R("wire_other").blob, R("wire_other").r,
+                             "H1.", fails)
+    expect([frame[2] for frame in other_frames] == [b"new\r\n"],
+           "H1. a new peer received output from the command whose link "
+           "send failed: %r" % [frame[2] for frame in other_frames], fails)
 
     # ---- F ----------------------------------------------------------
     for i in range(10):
@@ -2691,7 +2764,7 @@ def main() -> int:
     if fails:
         return fail_out(fails)
 
-    cases = 25 + 8
+    cases = 25 + 8 + 2
     if args.mutate:
         mutant = WORK / "mutant" / "netconsole_prefix_rearm.pi4"
         write_mutant(mutant)

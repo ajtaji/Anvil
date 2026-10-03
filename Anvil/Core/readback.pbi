@@ -99,6 +99,10 @@
 #RB_LINE_SRC   = 48
 ; 15 lines a datagram: 15 * (64 + 2) = 990 <= #NETCON_OUT_MAX.
 #RB_BLOCK_SRC  = 720
+; A network command is bounded so the Pi 4 command-scoped hardware
+; watchdog can cover one complete request. The host reads larger ranges
+; in independently verified chunks; local serial reads keep their old limit.
+#RB_NET_MAX    = $40000
 ; The staging buffer for the encoded block. 1024 rather than the 990 the
 ; arithmetic above gives, because a bound that is only just large enough
 ; is a bound that goes wrong the first time somebody changes a constant.
@@ -397,8 +401,8 @@ Procedure CmdReadback()
     PrintN("  with the byte count and a crc32 over it. Both numbers are hex and")
     PrintN("  the length is in bytes. This is how a tool gets bytes OFF the board;")
     PrintN("  memory is how a person LOOKS at them, and it is unchanged.")
-    PrintN("  There is no length limit and no default: a bulk read with a guessed")
-    PrintN("  length is not a bulk read. Ctrl-C stops it and says how far it got.")
+    PrintN("  There is no default. Network reads are limited to 256 KiB per")
+    PrintN("  command; use verified chunks for larger ranges. Ctrl-C stops it.")
     ProcedureReturn
   EndIf
   n = ParseHex()
@@ -413,6 +417,12 @@ Procedure CmdReadback()
     PrintN("!! a length of zero bytes sends nothing, so nothing was read. Give a")
     PrintN("   length in hexadecimal bytes - readback 500000 1000 sends 4096 of")
     PrintN("   them from 00500000.")
+    ProcedureReturn
+  EndIf
+  If NetConsoleOwnsCommand() <> 0 And n > #RB_NET_MAX
+    PrintN("!! network readback is limited to 256 KiB per command so its")
+    PrintN("   watchdog can cover the whole transfer. Read larger ranges in")
+    PrintN("   verified chunks. Nothing was read.")
     ProcedureReturn
   EndIf
   If n > #LEN_MAX

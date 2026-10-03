@@ -1,0 +1,89 @@
+; Execute the real TrueType layout with both a failed pair lookup and a
+; successful GPOS no-match that leaves its outputs untouched.
+Global gPairCalls.i
+Global gPairMode.i
+
+Procedure.i AnvilTrueTypeDecodeUtf8(text.i, byteCount.i, glyphOut.i, capacity.i)
+  Define index.i
+  If byteCount = 3 And (PeekA(text) & $FF) = 65 And (PeekA(text + 1) & $FF) = $CC And (PeekA(text + 2) & $FF) = $81
+    If capacity < 2 : ProcedureReturn -1 : EndIf
+    PokeI(glyphOut, 65) : PokeI(glyphOut + SizeOf(.i), 769)
+    ProcedureReturn 2
+  EndIf
+  If byteCount > capacity : ProcedureReturn -1 : EndIf
+  For index = 0 To byteCount - 1
+    PokeI(glyphOut + index * SizeOf(.i), PeekA(text + index) & $FF)
+  Next
+  ProcedureReturn byteCount
+EndProcedure
+
+Procedure.i AnvilTrueTypeMetricsOpenState() : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeCmapOpenState() : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeKernOpenState() : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeGposOpenState() : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeUnitsPerEm() : ProcedureReturn 2048 : EndProcedure
+
+Procedure.i AnvilTrueTypeHorizontalMetric(glyph.i, metricOut.i, lsbOut.i)
+  If glyph <> 65 And glyph <> 66 And glyph <> 769 : ProcedureReturn 0 : EndIf
+  If glyph = 769 : PokeI(metricOut, 0) : Else : PokeI(metricOut, 1024) : EndIf
+  PokeI(lsbOut, 0)
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i AnvilTrueTypePairPosition(leftGlyph.i, rightGlyph.i, valuesOut.i)
+  gPairCalls + 1
+  ; Leave all eight output fields untouched, as the real parser may do on
+  ; failure or on a successful GPOS kern-feature no-match.
+  If gPairMode = 2
+    PokeI(valuesOut + 2 * SizeOf(.i), -2048)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn gPairMode
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/truetype_layout.pbi"
+
+Procedure.i CheckPairFallback()
+  Define text.i, glyphs.i, xs.i, ys.i, advances.i
+  Define count.i, lines.i, width.i, rc.i, index.i
+  Dim glyph.i(2) : Dim x.i(2) : Dim y.i(2) : Dim adv.i(2)
+  Dim input.a(3)
+  input(0) = 65 : input(1) = 66 : input(2) = 0
+  ; Dirty the shared pair buffer before a failed lookup. Reusing these
+  ; stale values would shift the B glyph and change its advance.
+  For index = 0 To 7 : anvil_ttl_pairValues[index] = 4096 : Next
+  text = @input(0) : glyphs = @glyph(0) : xs = @x(0)
+  ys = @y(0) : advances = @adv(0)
+  rc = AnvilTrueTypeLayoutUtf8(text, 2, 16, 1280, 20, glyphs, xs, ys, advances, #ANVIL_TTL_ALIGN_LEFT, 2, @count, @lines, @width)
+  If rc <> 0 Or AnvilTrueTypeLayoutError() <> #ANVIL_TTL_E_PAIR : ProcedureReturn 1 : EndIf
+  If gPairCalls <> 1 : ProcedureReturn 2 : EndIf
+  ; The successful no-match path must also discard stale data from a
+  ; preceding pair. Some real GPOS tables take this branch.
+  For index = 0 To 7 : anvil_ttl_pairValues[index] = 4096 : Next
+  gPairMode = 1
+  rc = AnvilTrueTypeLayoutUtf8(text, 2, 16, 1280, 20, glyphs, xs, ys, advances, #ANVIL_TTL_ALIGN_LEFT, 2, @count, @lines, @width)
+  If rc <> 1 Or gPairCalls <> 2 : ProcedureReturn 3 : EndIf
+  If count <> 2 Or lines <> 1 : ProcedureReturn 4 : EndIf
+  If glyph(0) <> 65 Or glyph(1) <> 66 : ProcedureReturn 5 : EndIf
+  If x(0) <> 0 Or x(1) <> 8 * 65536 : ProcedureReturn 6 : EndIf
+  If adv(0) <> 8 * 65536 Or adv(1) <> 8 * 65536 : ProcedureReturn 7 : EndIf
+  If width <> 16 * 65536 : ProcedureReturn 8 : EndIf
+  If AnvilTrueTypeLayoutError() <> #ANVIL_TTL_E_NONE : ProcedureReturn 9 : EndIf
+  ; U+0301 combining acute has zero hmtx advance. It must draw at the
+  ; current pen without causing either a wrap or a pair-data error.
+  input(0) = 65 : input(1) = $CC : input(2) = $81
+  rc = AnvilTrueTypeLayoutUtf8(text, 3, 16, 1280, 20, glyphs, xs, ys, advances, #ANVIL_TTL_ALIGN_LEFT, 2, @count, @lines, @width)
+  If rc <> 1 Or gPairCalls <> 3 : ProcedureReturn 10 : EndIf
+  If count <> 2 Or lines <> 1 Or glyph(1) <> 769 : ProcedureReturn 11 : EndIf
+  If x(1) <> 8 * 65536 Or adv(1) <> 0 Or width <> 8 * 65536 : ProcedureReturn 12 : EndIf
+  If AnvilTrueTypeLayoutError() <> #ANVIL_TTL_E_NONE : ProcedureReturn 13 : EndIf
+  ; A pair adjustment that drives the pen backward still reports a hard
+  ; parser/layout error rather than being silently accepted.
+  input(0) = 65 : input(1) = 66 : input(2) = 0
+  gPairMode = 2
+  rc = AnvilTrueTypeLayoutUtf8(text, 2, 16, 1280, 20, glyphs, xs, ys, advances, #ANVIL_TTL_ALIGN_LEFT, 2, @count, @lines, @width)
+  If rc <> 0 Or AnvilTrueTypeLayoutError() <> #ANVIL_TTL_E_PAIR : ProcedureReturn 14 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+PokeI($300000, CheckPairFallback())

@@ -91,9 +91,9 @@ XIncludeFile "Anvil/Graphics/touch_keyboard_view.pbi"
 XIncludeFile "Anvil/Core/boot_transcript.pbi"
 XIncludeFile "Anvil/Core/console_style.pbi"
 
-#CON_MAXCOLS = 256
+#CON_MAXCOLS = 512
 #CON_MAXROWS = 80
-#CON_CELLS   = 20480              ; 256 * 80
+#CON_CELLS   = 40960              ; 512 * 80
 
 Global Dim gConGrid.a[#CON_CELLS]        ; one byte per cell, ASCII (space = blank)
 Global Dim gConStyle.a[#CON_CELLS]       ; screen-only style beside each character
@@ -108,6 +108,21 @@ Global gConScrollN.i = 0                 ; net rows scrolled UP since the last p
 Global gConFullClear.i = 0               ; the whole console was cleared
 Global gConDirty.i  = 0                  ; anything at all changed since the last paint
 Global gConReady.i  = 0                  ; geometry has been set
+Global gConProportional.i = 0             ; selected face has measured advances
+Global gConPixelWidth.i = 0              ; console width in physical text pixels
+Global gConCurPen.i = 0                  ; cumulative 16.16 advance to the cursor
+; Boot acquires and models the screen before the selected TrueType face is
+; known. Until Vulkan has presented a complete frame, no CPU text is painted.
+Global gScreenDeferFirstFrame.i = 0
+
+; The byte/style grid is bounded storage, not a fixed-pitch layout. With a
+; selected proportional face the callback returns the measured advance for
+; one glyph after its predecessor, including pair positioning.
+Procedure ConGridProportionalSet(pixelWidth.i, enabled.i)
+  gConPixelWidth = pixelWidth
+  gConProportional = enabled
+  gConCurPen = 0
+EndProcedure
 
 ; ---- THE VIEWPORT ----------------------------------------------------
 ; How many of the gConRows stored rows are currently VISIBLE, and which
@@ -330,6 +345,7 @@ Procedure ConGridClear()
   Wend
   gConCurR = 0
   gConCurC = 0
+  gConCurPen = 0
   gConFullClear = 1
   gConOverlayWhole = 1
   gConScrollN = 0
@@ -402,6 +418,7 @@ EndProcedure
 
 Procedure ConGridNewline()
   gConCurC = 0
+  gConCurPen = 0
   gConCurR = gConCurR + 1
   If gConCurR >= gConRows
     ConGridScroll()
@@ -415,16 +432,46 @@ Procedure ConGridNewline()
   EndIf
 EndProcedure
 
+; One printable byte, used by ordinary input and by tab expansion. Keeping
+; this loop-free also keeps the compiler's fixed stack-depth guarantee.
+Procedure ConGridPutPrintable(c.i, style.i)
+  Define previous.i, advance.i
+  advance = 0
+  If gConProportional <> 0 And gConPixelWidth > 0
+    previous = 0
+    If gConCurC > 0 : previous = gConGrid[gConCurR * gConCols + gConCurC - 1] & $FF : EndIf
+    advance = ScreenProportionalAdvance(previous, c)
+    If gConCurC > 0 And gConCurPen + advance > gConPixelWidth * 65536
+      ConGridNewline()
+      advance = ScreenProportionalAdvance(0, c)
+    EndIf
+  EndIf
+  gConGrid[gConCurR * gConCols + gConCurC] = c
+  If style = #UART_SCREEN_STYLE_PROMPT
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_PROMPT
+  Else
+    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
+  EndIf
+  gConRowDirty[gConCurR] = 1
+  gConDirty = 1
+  gConCurC = gConCurC + 1
+  gConCurPen = gConCurPen + advance
+  If gConCurC >= gConCols
+    ConGridNewline()
+  EndIf
+EndProcedure
+
 ; The terminal state machine, one byte at a time. Newline, carriage
 ; return, backspace, tab, wrap and scroll - the ordinary console rules,
 ; kept ONCE here for every renderer.
 Procedure ConGridPutcStyle(c.i, style.i)
-  Define t.i
+  Define t.i, i.i, previous.i
   If gConReady = 0
     ProcedureReturn
   EndIf
   If c = 13                          ; CR
     gConCurC = 0
+    gConCurPen = 0
     ProcedureReturn
   EndIf
   If c = 10                          ; LF
@@ -438,37 +485,28 @@ Procedure ConGridPutcStyle(c.i, style.i)
       gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
       gConRowDirty[gConCurR] = 1
       gConDirty = 1
+      gConCurPen = 0
+      i = 0
+      While i < gConCurC
+        previous = 0
+        If i > 0 : previous = gConGrid[gConCurR * gConCols + i - 1] & $FF : EndIf
+        If gConProportional <> 0 : gConCurPen = gConCurPen + ScreenProportionalAdvance(previous, gConGrid[gConCurR * gConCols + i] & $FF) : EndIf
+        i = i + 1
+      Wend
     EndIf
     ProcedureReturn
   EndIf
   If c = 9                           ; tab -> next multiple of 8
-    t = (gConCurC + 8) - ((gConCurC + 8) % 8)
-    While gConCurC < t And gConCurC < gConCols
-      gConGrid[gConCurR * gConCols + gConCurC] = 32
-      gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
-      gConCurC = gConCurC + 1
+    t = 8 - (gConCurC % 8)
+    i = 0
+    While i < t
+      ConGridPutPrintable(32, #UART_SCREEN_STYLE_NORMAL)
+      i = i + 1
     Wend
-    gConRowDirty[gConCurR] = 1
-    gConDirty = 1
-    If gConCurC >= gConCols
-      ConGridNewline()
-    EndIf
     ProcedureReturn
   EndIf
-  If c < 32 Or c > 126               ; other control bytes: ignore
-    ProcedureReturn
-  EndIf
-  gConGrid[gConCurR * gConCols + gConCurC] = c
-  If style = #UART_SCREEN_STYLE_PROMPT
-    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_PROMPT
-  Else
-    gConStyle[gConCurR * gConCols + gConCurC] = #UART_SCREEN_STYLE_NORMAL
-  EndIf
-  gConRowDirty[gConCurR] = 1
-  gConDirty = 1
-  gConCurC = gConCurC + 1
-  If gConCurC >= gConCols
-    ConGridNewline()
+  If c >= 32 And c <= 126
+    ConGridPutPrintable(c, style)
   EndIf
 EndProcedure
 

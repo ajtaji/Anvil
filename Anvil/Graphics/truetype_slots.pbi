@@ -3,7 +3,8 @@
 ; Rendering caches use slot generation as identity, while T0 revision guards
 ; every live parser pointer after a select or validation attempt.
 
-#ANVIL_TTS_MAX_SLOTS = 4
+#ANVIL_TTS_MAX_SLOTS = 5
+#ANVIL_TTS_BOOT_SLOT = 4
 #ANVIL_TTS_MAX_BYTES = 1048576
 
 #ANVIL_TTS_E_NONE = 0
@@ -36,7 +37,7 @@ Procedure.i AnvilTrueTypeSetPixelHeight(pixelHeight.i)
   ProcedureReturn 1
 EndProcedure
 
-; -1 means bitmap fallback; 0..3 names the configured resident font slot.
+; -1 means bitmap fallback; 0..3 are file slots, 4 is the embedded boot face.
 Procedure.i AnvilTrueTypeDefaultSlot()
   AnvilTrueTypeSlotsInit()
   ProcedureReturn anvil_tts_defaultSlot

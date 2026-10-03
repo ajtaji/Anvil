@@ -1290,6 +1290,8 @@ Global dsp_frb.i    = 0        ; bytes per glyph row = (cellW + 7) / 8
 Global dsp_ffirst.i = 32
 Global dsp_flast.i  = 126
 Global dsp_scale.i  = 1
+Global dsp_gridCellW.i = 0     ; measured TrueType console cell, 0 = bitmap
+Global dsp_gridCellH.i = 0
 
 Global dsp_cox.i    = 0        ; console origin, in pixels
 Global dsp_coy.i    = 0
@@ -4072,13 +4074,28 @@ Procedure.i DisplayScale(n.i)
   ProcedureReturn 1
 EndProcedure
 
-; The cell size actually drawn, scale included. The console's geometry
-; is computed from these and so should a caller's layout be.
+; Keep terminal geometry separate from the fallback bitmap dimensions.
+; A TrueType console uses measured cells while the CPU fallback still owns
+; its original 8x16 bitmap. Zero restores the bitmap's scaled cell.
+Procedure.i DisplayConsoleCellSet(width.i, height.i)
+  If width = 0 And height = 0
+    dsp_gridCellW = 0 : dsp_gridCellH = 0
+    ProcedureReturn 1
+  EndIf
+  If width < 1 Or height < 1 : ProcedureReturn 0 : EndIf
+  dsp_gridCellW = width : dsp_gridCellH = height
+  ProcedureReturn 1
+EndProcedure
+
+; The console grid cell size. DisplayChar still paints the selected bitmap
+; at its native dimensions when the GPU renderer is unavailable.
 Procedure.i DisplayCharWidth()
+  If dsp_gridCellW > 0 : ProcedureReturn dsp_gridCellW : EndIf
   ProcedureReturn dsp_fw * dsp_scale
 EndProcedure
 
 Procedure.i DisplayCharHeight()
+  If dsp_gridCellH > 0 : ProcedureReturn dsp_gridCellH : EndIf
   ProcedureReturn dsp_fh * dsp_scale
 EndProcedure
 

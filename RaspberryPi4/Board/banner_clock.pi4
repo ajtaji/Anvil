@@ -1204,6 +1204,13 @@ EndProcedure
 ; or driver phase tick, never for every character and never from UartWrite.
 Global gScreenMemoryFault.i
 Procedure ScreenServiceTick()
+  ; During boot the grid may receive serial output before its selected
+  ; TrueType face is ready. Consume the mirror into that model, but do not
+  ; let the old CPU banner, keyboard, or bitmap painter touch the scanout.
+  If gScreenDeferFirstFrame <> 0
+    ConDrainRing()
+    ProcedureReturn
+  EndIf
   If DisplayMemorySafe() = 0
     If gScreenMemoryFault = 0
       gScreenMemoryFault = 1

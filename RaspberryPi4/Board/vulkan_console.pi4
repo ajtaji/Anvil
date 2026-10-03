@@ -20,7 +20,9 @@
 #AVC_ARENA_BYTES        = $01000000
 #AVC_MAX_DRAWS          = #NEON_VK_CHROME_MAX_QUADS
 #AVC_UI_QUAD_RESERVE    = 512
-#AVC_MAX_QUADS          = (#CON_MAXCOLS * #CON_MAXROWS) + #AVC_UI_QUAD_RESERVE
+; The vertex heap is sized for actual visible ink, not the maximum byte-grid
+; storage. Reserving every possible byte cell would waste the 16 MiB GPU heap.
+#AVC_MAX_QUADS          = #NEON_VK_CHROME_MAX_VERTEX_QUADS
 
 Global avcReady.i
 Global avcActive.i
@@ -50,10 +52,15 @@ Global avcRotation.i
 Global avcUiHeight.i
 Global avcFallbackPaint.i
 Global avcBannerFrameReady.i
+Global avcFramePresented.i
 Global avcPayloadWasActive.i
 Global Dim avcClear.l[4]
 Global Dim avcGlyph.a[2]
 Global Dim avcGridGlyphs.l[#NEON_VK_CHROME_TT_CACHE_MAX - 1]
+Global Dim avcLayoutGlyph.i[#CON_MAXCOLS]
+Global Dim avcLayoutX.i[#CON_MAXCOLS]
+Global Dim avcLayoutY.i[#CON_MAXCOLS]
+Global Dim avcLayoutAdvance.i[#CON_MAXCOLS]
 
 Procedure avcBannerInvalidate()
   ConGridMarkAll()
@@ -239,6 +246,7 @@ Procedure.i avcFailover(reason.i)
   AnvilTrueTypeRasterAlphaHandlerSet(0)
   *gBannerGpuInvalidate = 0
   avcBannerFrameReady = 0
+  avcFramePresented = 0
   avcActive = 0
   avcReady = 0
   ConNoRenderer()
@@ -263,6 +271,11 @@ Procedure.i avcFailover(reason.i)
   ; re-enter the UART pump. Use the proven CPU framebuffer painter here.
   gDma = 0 : DisplayUseDma(0)
   If avcFallbackPaint = 0 : avcFallbackPaint = @ConPaintDma : EndIf
+  If gScreenDeferFirstFrame <> 0
+    ConNoRenderer()
+    avcFallbackPaint = 0
+    ProcedureReturn 1
+  EndIf
   If gScreen <> 0
     DisplayClear(gScreenBg) : DrawBanner()
     DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
@@ -291,6 +304,7 @@ Procedure.i avcStartupFallback(reason.i)
   avcQuarantined = 0
   NeonGpuExtraMap(0, 0)
   gDma = ScreenDmaUp()
+  If gScreenDeferFirstFrame <> 0 : ProcedureReturn 1 : EndIf
   ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
   ProcedureReturn 1
 EndProcedure
@@ -303,6 +317,7 @@ Procedure.i VulkanConsoleStart()
   AnvilTrueTypeRasterAlphaHandlerSet(0)
   *gBannerGpuInvalidate = 0
   avcBannerFrameReady = 0
+  avcFramePresented = 0
   avcError = 0
   If gScreen = 0 Or DisplayBase() = 0 Or DisplayBytesPerPixel() <> 4
     avcError = #AVC_ERR_DISPLAY
@@ -395,6 +410,7 @@ Procedure.i VulkanConsoleStart()
     avcQuarantined = 0
     NeonGpuExtraMap(0, 0)
     gDma = ScreenDmaUp()
+    If gScreenDeferFirstFrame <> 0 : ProcedureReturn rc : EndIf
     ConSetRenderer(@ConPaintDma) : ConPaintDma() : TouchKeyboardComposeCpu() : ScrPresentAll()
     ProcedureReturn rc
   EndIf
@@ -528,22 +544,23 @@ Procedure.i avcWarmGrid()
     For r = 0 To ConGridRows() - 1
       For c = 0 To ConGridCols() - 1
         cp = ConGridCell(r, c)
-        If cp <> 32
-          glyph = AnvilTrueTypeGlyphForCodepoint(cp)
-          If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
-            rc = #NEON_VK_CHROME_ERR_ATLAS : Break
+        ; Layout emits a positioned glyph for spaces too. Cache its zero-ink
+        ; entry before Begin so the append path never mistakes a valid space
+        ; for a missing atlas glyph in the middle of a frame.
+        glyph = AnvilTrueTypeGlyphForCodepoint(cp)
+        If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
+          rc = #NEON_VK_CHROME_ERR_ATLAS : Break
+        EndIf
+        found = 0
+        For j = 0 To glyphCount - 1
+          If avcGridGlyphs[j] = glyph : found = 1 : Break : EndIf
+        Next
+        If found = 0
+          If glyphCount >= #NEON_VK_CHROME_TT_CACHE_MAX
+            rc = #NEON_VK_CHROME_ERR_CAPACITY : Break
           EndIf
-          found = 0
-          For j = 0 To glyphCount - 1
-            If avcGridGlyphs[j] = glyph : found = 1 : Break : EndIf
-          Next
-          If found = 0
-            If glyphCount >= #NEON_VK_CHROME_TT_CACHE_MAX
-              rc = #NEON_VK_CHROME_ERR_CAPACITY : Break
-            EndIf
-            avcGridGlyphs[glyphCount] = glyph
-            glyphCount + 1
-          EndIf
+          avcGridGlyphs[glyphCount] = glyph
+          glyphCount + 1
         EndIf
       Next
       If rc < 0 : Break : EndIf
@@ -768,8 +785,8 @@ Procedure.i avcCopyToDisplay()
 EndProcedure
 
 Procedure VulkanConsolePump()
-  Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i, cp.i
-  Define glyph.q
+  Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i
+  Define layoutCount.i, layoutLines.i, layoutWidth.i, baseline.i, visible.i
   If avcReady = 0 Or avcActive = 0 Or gScreen = 0
     ProcedureReturn
   EndIf
@@ -790,35 +807,38 @@ Procedure VulkanConsolePump()
     ProcedureReturn
   EndIf
   avcBannerFrameReady = 1
-  ; The console grid was sized with DisplayCharWidth/Height. TrueType's
-  ; measured line height can exceed that cell (Lato 16 px measures 19 px),
-  ; so it must affect glyph fit only, never the row or column position.
+  ; The console row follows the face's measured advances and pair positioning.
+  ; Every quad keeps the atlas bitmap's exact pixel dimensions.
   ch = DisplayCharHeight() : cw = DisplayCharWidth()
   If AnvilTrueTypeSlotSelected() >= 0
-    ; Append fixed cells into one contiguous vertex stream per ink. This
-    ; preserves the model's cursor positions without spending one Vulkan
-    ; draw record per glyph; the full grid remains bounded by CON_MAXCOLS x
-    ; CON_MAXROWS and Chrome separately bounds its vertex arena.
+    ; Layout each full row before separating its styles. This preserves
+    ; kerning across a colour change while retaining two bounded draw calls.
+    visible = #AVC_UI_QUAD_RESERVE
+    For r = 0 To ConGridRows() - 1
+      For c = 0 To ConGridCols() - 1
+        If ConGridCell(r, c) <> 32 : visible = visible + 1 : EndIf
+      Next
+    Next
     rc = NeonVkChromeGridBatchBegin()
     If rc = #NEON_VK_CHROME_OK
-      rc = NeonVkChromeGridBatchReserve(ConGridCols() * ConGridRows() + #AVC_UI_QUAD_RESERVE, 2)
+      rc = NeonVkChromeGridBatchReserve(visible, 2)
     EndIf
     If rc = #NEON_VK_CHROME_OK
+      baseline = NeonVkChromeGridBaseline()
       For pass = 0 To 1
         If pass = 0 : colour = V3dCon_Ink() : Else : colour = V3dCon_PromptInk() : EndIf
         For r = 0 To ConGridRows() - 1
           y = LogoHeight() + r * ch
-          For c = 0 To ConGridCols() - 1
+          n = ConGridRowText(r, @gConRowBuf[0])
+          If n > 0
+            If AnvilTrueTypeLayoutUtf8(@gConRowBuf[0], n, avcUiHeight, 0, ch, @avcLayoutGlyph[0], @avcLayoutX[0], @avcLayoutY[0], @avcLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #CON_MAXCOLS, @layoutCount, @layoutLines, @layoutWidth) = 0 Or layoutCount <> n Or layoutLines <> 1
+              rc = #NEON_VK_CHROME_ERR_ATLAS : Break
+            EndIf
+          EndIf
+          For c = 0 To n - 1
             If (pass = 1 And ConGridCellStyle(r, c) = #UART_SCREEN_STYLE_PROMPT) Or (pass = 0 And ConGridCellStyle(r, c) <> #UART_SCREEN_STYLE_PROMPT)
-              cp = ConGridCell(r, c)
-              If cp <> 32
-                glyph = AnvilTrueTypeGlyphForCodepoint(cp)
-                If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount()
-                  rc = #NEON_VK_CHROME_ERR_ATLAS : Break
-                EndIf
-                rc = NeonVkChromeGridGlyphAppend(glyph, avcUiHeight, c * cw, y, cw, ch)
-                If rc <> #NEON_VK_CHROME_OK : Break : EndIf
-              EndIf
+              rc = NeonVkChromeGridGlyphAppendPositioned(avcLayoutGlyph[c], avcUiHeight, avcLayoutX[c], y + baseline, avcLayoutY[c])
+              If rc <> #NEON_VK_CHROME_OK : Break : EndIf
             EndIf
           Next
           If rc <> #NEON_VK_CHROME_OK : Break : EndIf
@@ -879,6 +899,7 @@ Procedure VulkanConsolePump()
     avcFailover(#AVC_ERR_PRESENT)
     ProcedureReturn
   EndIf
+  avcFramePresented = 1
   ConGridClearDirty()
   ; ScreenPump invokes the overlay immediately after this renderer. Marking
   ; it dirty here would schedule another whole GPU frame on every prompt
