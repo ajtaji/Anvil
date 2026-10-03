@@ -1,0 +1,112 @@
+; The test runner inserts the current production sprite transform and corner
+; procedures at the marker below. Integer spies record its ordered vertices.
+
+EnableFloatingPoint
+
+#NEON_OK = 0
+#NEON_VK_CHROME_OK = 0
+#NEON_VK_CHROME_ERR_ARGS = -21201
+#NEON_VK_CHROME_ERR_STATE = -21202
+#NEON_VK_CHROME_ERR_CAPACITY = -21203
+#NVC_SPRITE_MAX_ANGLE_Q16 = 6588400
+#NVC_SPRITE_Q8_LIMIT = 1500000
+
+Global nvcInFrame.i = 1
+Global nvcGridBatchActive.i
+Global nvcBoxBatchActive.i
+Global nvcDrawCount.i
+Global nvcMaxQuads.i = 10
+Global nvcVertices.i
+Global nvcMaxVertexQuads.i = 100
+Global nvcLogicalW.i = 320
+Global nvcLogicalH.i = 240
+Global nvcPhysicalW.i = 320
+Global nvcPhysicalH.i = 240
+Global nvcSpriteGeneration.i
+Global nvcObservedColour.i
+Global nvcObservedCount.i
+Global Dim nvcObservedX.i[17]
+Global Dim nvcObservedY.i[17]
+Global Dim nvcObservedU.i[17]
+Global Dim nvcObservedV.i[17]
+
+Procedure.i Neon_RGBA(r.i, g.i, b.i, a.i)
+  ProcedureReturn ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
+EndProcedure
+
+Procedure.i NeonFrameBegin(colour.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NeonFrameEnd() : ProcedureReturn 0 : EndProcedure
+Procedure.i Neon_Box(x.i, y.i, w.i, h.i, colour.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Neon_TextWidth(font.i, *s) : ProcedureReturn 0 : EndProcedure
+Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i) : ProcedureReturn 0 : EndProcedure
+Procedure Neon_ScissorSet(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure Neon_ScissorClear() : EndProcedure
+
+Procedure.i nvcFail(code.i) : ProcedureReturn code : EndProcedure
+Procedure.i neon_F32Ratio(num.i, den.i) : ProcedureReturn (num * 65536) / den : EndProcedure
+Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
+  nvcDrawCount = nvcDrawCount + 1
+  nvcObservedColour = colour : nvcObservedCount = count
+  ProcedureReturn 0
+EndProcedure
+
+Procedure nvcSpriteVertexQ8(index.i, xQ8.i, yQ8.i, u.i, v.i)
+  nvcObservedX[index] = xQ8 : nvcObservedY[index] = yQ8
+  nvcObservedU[index] = u : nvcObservedV[index] = v
+EndProcedure
+
+; Exact cardinal angles isolate the production geometry and vertex ordering
+; from the CORDIC approximation while retaining its Q16 calling contract.
+Procedure nvcSpriteTrigQ16(angleQ16.i, *cosQ16, *sinQ16)
+  If angleQ16 = 102944
+    PokeI(*cosQ16, 0) : PokeI(*sinQ16, 65536)
+  Else
+    PokeI(*cosQ16, 65536) : PokeI(*sinQ16, 0)
+  EndIf
+EndProcedure
+
+; @PRODUCTION_SPRITE_GEOMETRY@
+
+Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *pixels, width.i, height.i)
+  nvcSpriteGeneration = nvcSpriteGeneration + 1
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *pixels, width.i, height.i)
+  ProcedureReturn NeonVkChromeImageSpriteReplaceId(id, *pixels, width, height)
+EndProcedure
+Procedure.i NeonVkChromeImageSpriteGenerationId(id.i)
+  ProcedureReturn nvcSpriteGeneration
+EndProcedure
+Procedure.i NeonVkChromeImageSpriteClearId(id.i)
+  nvcSpriteGeneration = nvcSpriteGeneration + 1
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, 0, 0, 64, 32, 64, 32, 1, 0)
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
+
+Procedure.i Main()
+  Protected pixel.a = 255
+  Protected sprite.NeonVkPortSpriteRef
+  If NeonVkPortCanvas(320, 240, 320, 240) <> 0 : ProcedureReturn 1 : EndIf
+  If NeonVkPortSpriteUpload(@sprite, 1, @pixel, 64, 32, 0) <> 0 : ProcedureReturn 2 : EndIf
+  If NeonVkPortSprite(@sprite, 20.0, 30.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1, 8.0, 4.0, 16.0, 8.0, 1) <> 0 : ProcedureReturn 3 : EndIf
+  If nvcVertices <> 6 Or nvcDrawCount <> 1 Or nvcObservedCount <> 6 Or nvcObservedColour <> $FFFF0000 : ProcedureReturn 4 : EndIf
+  If nvcObservedX[0] <> 5120 Or nvcObservedY[0] <> 7680 Or nvcObservedX[1] <> 5120 Or nvcObservedY[1] <> 9728 Or nvcObservedX[2] <> 9216 Or nvcObservedY[2] <> 9728 : ProcedureReturn 5 : EndIf
+  If nvcObservedX[3] <> 5120 Or nvcObservedY[3] <> 7680 Or nvcObservedX[4] <> 9216 Or nvcObservedY[4] <> 9728 Or nvcObservedX[5] <> 9216 Or nvcObservedY[5] <> 7680 : ProcedureReturn 6 : EndIf
+  If nvcObservedU[0] <> 8192 Or nvcObservedV[0] <> 8192 Or nvcObservedU[1] <> 8192 Or nvcObservedV[1] <> 24576 Or nvcObservedU[2] <> 24576 Or nvcObservedV[2] <> 24576 : ProcedureReturn 7 : EndIf
+  If nvcObservedU[3] <> 8192 Or nvcObservedV[3] <> 8192 Or nvcObservedU[4] <> 24576 Or nvcObservedV[4] <> 24576 Or nvcObservedU[5] <> 24576 Or nvcObservedV[5] <> 8192 : ProcedureReturn 8 : EndIf
+  If NeonVkPortSprite(@sprite, 20.0, 30.0, 1.5707964, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 8.0, 4.0, 16.0, 8.0, 1) <> 0 : ProcedureReturn 9 : EndIf
+  If nvcVertices <> 12 Or nvcDrawCount <> 2 : ProcedureReturn 10 : EndIf
+  If nvcObservedX[6] <> 8192 Or nvcObservedY[6] <> 6656 Or nvcObservedX[7] <> 6144 Or nvcObservedY[7] <> 6656 Or nvcObservedX[8] <> 6144 Or nvcObservedY[8] <> 10752 : ProcedureReturn 11 : EndIf
+  If nvcObservedX[9] <> 8192 Or nvcObservedY[9] <> 6656 Or nvcObservedX[10] <> 6144 Or nvcObservedY[10] <> 10752 Or nvcObservedX[11] <> 8192 Or nvcObservedY[11] <> 10752 : ProcedureReturn 12 : EndIf
+  If NeonVkPortSprite(@sprite, 20.0, 30.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 48.0, 24.0, 16.0, 8.0, 1) <> 0 : ProcedureReturn 15 : EndIf
+  If nvcVertices <> 18 Or nvcDrawCount <> 3 : ProcedureReturn 16 : EndIf
+  If nvcObservedU[12] <> 49152 Or nvcObservedV[12] <> 49152 Or nvcObservedU[14] <> 65536 Or nvcObservedV[14] <> 65536 : ProcedureReturn 17 : EndIf
+  If NeonVkPortSprite(@sprite, 20.0, 30.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 60.0, 4.0, 8.0, 8.0, 1) <> #NEON_VK_PORT_ERR_SPRITE : ProcedureReturn 13 : EndIf
+  If nvcVertices <> 18 Or nvcDrawCount <> 3 : ProcedureReturn 14 : EndIf
+  ProcedureReturn 0
+EndProcedure

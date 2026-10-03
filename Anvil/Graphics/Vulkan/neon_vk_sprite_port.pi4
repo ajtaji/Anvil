@@ -1,0 +1,102 @@
+; Sprite call adapter for the resident Vulkan chrome renderer.
+; Include after neon_vk_port.pi4 and neon_vk_chrome.pi4. Pixel uploads are
+; explicit because a desktop GLSprite texture handle has no bare-metal peer.
+
+#NEON_VK_PORT_ERR_SPRITE = -21303
+#NEON_VK_PORT_ERR_SPRITE_SCALE = -21304
+#NEON_VK_PORT_ERR_SPRITE_STALE = -21305
+
+Structure NeonVkPortSpriteRef
+  id.i
+  width.i
+  height.i
+  generation.i
+EndStructure
+
+; Publish the reference only after a complete renderer upload. The source
+; buffer must contain width*height tightly packed RGBA or BGRA pixels.
+Procedure.i NeonVkPortSpriteUpload(*sprite.NeonVkPortSpriteRef, id.i, *pixels, width.i, height.i, bgra.i)
+  Protected result.i
+  If *sprite = 0 Or *pixels = 0 Or id < 1 Or id > 16 Or width < 1 Or height < 1
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  If bgra <> 0
+    result = NeonVkChromeImageSpriteReplaceBGRAId(id, *pixels, width, height)
+  Else
+    result = NeonVkChromeImageSpriteReplaceId(id, *pixels, width, height)
+  EndIf
+  If result <> 0 : ProcedureReturn result : EndIf
+  *sprite\id = id : *sprite\width = width : *sprite\height = height
+  *sprite\generation = NeonVkChromeImageSpriteGenerationId(id)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i NeonVkPortSpriteClear(*sprite.NeonVkPortSpriteRef)
+  Protected result.i
+  If *sprite = 0 Or *sprite\id < 1 : ProcedureReturn #NEON_VK_PORT_ERR_SPRITE : EndIf
+  If NeonVkChromeImageSpriteGenerationId(*sprite\id) <> *sprite\generation
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_STALE
+  EndIf
+  result = NeonVkChromeImageSpriteClearId(*sprite\id)
+  If result <> 0 : ProcedureReturn result : EndIf
+  *sprite\id = 0 : *sprite\width = 0 : *sprite\height = 0 : *sprite\generation = 0
+  ProcedureReturn 0
+EndProcedure
+
+; Mirrors DrawGLSprite's top-left, center rotation, source crop, tint and
+; camera order. Source crop is integral because the Vulkan image API uses
+; texel rectangles. Canvas scaling must be uniform to preserve rotation.
+Procedure.i NeonVkPortSprite(*sprite.NeonVkPortSpriteRef, screenX.f, screenY.f, angleRadians.f, scale.f, r.f, g.f, b.f, a.f, scaled.i, srcX.f, srcY.f, srcW.f, srcH.f, ignoreCamera.i)
+  Protected sourceX.i, sourceY.i, sourceW.i, sourceH.i
+  Protected drawW.i, drawH.i, x.i, y.i, angleQ16.i, zoomQ16.i
+  Protected cameraX.i, cameraY.i, ratioX.f, ratioY.f
+  If nvpCanvasW = 0 Or *sprite = 0 Or *sprite\id < 1 Or *sprite\width < 1 Or *sprite\height < 1
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  If NeonVkChromeImageSpriteGenerationId(*sprite\id) <> *sprite\generation
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_STALE
+  EndIf
+  If scale <= 0.0 Or angleRadians < -100.53 Or angleRadians > 100.53
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  angleQ16 = nvpRound(angleRadians * 65536.0)
+  If angleQ16 < -6588400 Or angleQ16 > 6588400
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  ratioX = 1.0 : ratioY = 1.0
+  If scaled <> 0
+    If angleQ16 <> 0 And nvpTargetW * nvpCanvasH <> nvpTargetH * nvpCanvasW
+      ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_SCALE
+    EndIf
+    ratioX = nvpTargetWf / nvpCanvasWf
+    ratioY = nvpTargetHf / nvpCanvasHf
+  EndIf
+  sourceX = 0 : sourceY = 0
+  sourceW = *sprite\width : sourceH = *sprite\height
+  If srcX <> -1.0
+    sourceX = nvpRound(srcX) : sourceY = nvpRound(srcY)
+    sourceW = nvpRound(srcW) : sourceH = nvpRound(srcH)
+    If MathFEq(srcX, MathFFromInt(sourceX)) = 0 Or MathFEq(srcY, MathFFromInt(sourceY)) = 0 Or MathFEq(srcW, MathFFromInt(sourceW)) = 0 Or MathFEq(srcH, MathFFromInt(sourceH)) = 0
+      ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+    EndIf
+  EndIf
+  If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or sourceX + sourceW > *sprite\width Or sourceY + sourceH > *sprite\height
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  x = nvpRound(screenX * ratioX) : y = nvpRound(screenY * ratioY)
+  drawW = nvpRound(MathFFromInt(sourceW) * scale * ratioX)
+  drawH = nvpRound(MathFFromInt(sourceH) * scale * ratioY)
+  If drawW < 1 Or drawH < 1 Or drawW > 4096 Or drawH > 4096
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+  EndIf
+  zoomQ16 = 65536 : cameraX = 0 : cameraY = 0
+  If ignoreCamera = 0
+    zoomQ16 = nvpRound(nvpCameraZoom * 65536.0)
+    cameraX = nvpRound(nvpCameraX * ratioX)
+    cameraY = nvpRound(nvpCameraY * ratioY)
+    If zoomQ16 < 1 Or zoomQ16 > 1048576
+      ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
+    EndIf
+  EndIf
+  ProcedureReturn NeonVkChromeImageSpriteDrawTransformId(*sprite\id, x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, NeonVkPortColour(r, g, b, a), angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera)
+EndProcedure
