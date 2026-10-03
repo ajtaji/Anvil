@@ -1754,7 +1754,7 @@ EndProcedure
 
 Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
   Define length.i, i.i, slot.i, generation.i, entry.i, rc.i
-  Define count.i, lines.i, measured.i, visible.i, maxWidth.i, originX.i, baseline.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
+  Define count.i, lines.i, measured.i, visible.i, originX.i, baseline.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
   nvcTTErrorStage = 0 : nvcTTUnitsProbe = 0 : nvcTTCountProbe = 0
   nvcTTLinesProbe = 0 : nvcTTMeasuredProbe = 0 : nvcTTMetricsStateProbe = 0
   If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -1764,10 +1764,9 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
   If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0 : nvcTTErrorStage = 2 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   While length < 4096 And PeekA(*s + length) <> 0 : length + 1 : Wend
   If length >= 4096 : nvcTTErrorStage = 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
-  maxWidth = nvcWidth - x
-  If maxWidth < 1 : maxWidth = 1 : EndIf
-  If maxWidth > 32767 : maxWidth = 32767 : EndIf
-  rc = AnvilTrueTypeLayoutUtf8(*s, length, nvcTTFontPixels, maxWidth, nvcTTFontPixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured)
+  ; Match NeonVkChromeMeasureWidth: chrome text stays on one line at the
+  ; framebuffer edge and lets the scissor clip its overflow.
+  rc = AnvilTrueTypeLayoutUtf8(*s, length, nvcTTFontPixels, 0, nvcTTFontPixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured)
   nvcTTLayoutRc = rc
   nvcTTLayoutError = AnvilTrueTypeLayoutError()
   nvcTTCountProbe = count : nvcTTLinesProbe = lines : nvcTTMeasuredProbe = measured

@@ -171,7 +171,7 @@ Procedure.i NvwaCompose()
 
   ; Ground and a real titled panel.
   Neon_Box(0, 0, #NVWA_WIDTH, #NVWA_HEIGHT, Neon_C_Bg)
-  Neon_Panel(#NVWA_PANEL_X, #NVWA_PANEL_Y, #NVWA_PANEL_W, #NVWA_PANEL_H, "PROJECT", Neon_C_Acc, #NVWA_PANEL_HEADER_H)
+Neon_Panel(#NVWA_PANEL_X, #NVWA_PANEL_Y, #NVWA_PANEL_W, #NVWA_PANEL_H, "project", Neon_C_Acc, #NVWA_PANEL_HEADER_H)
   Neon_TextTex(#NEON_FONT_UI, #NVWA_TEXT_X, #NVWA_TEXT_Y, "VULKAN PATH", Neon_C_Text)
 
   ; The list owns a real widget clip and scrollbar. The fourth visible call is

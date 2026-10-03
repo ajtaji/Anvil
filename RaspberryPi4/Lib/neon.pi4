@@ -5143,14 +5143,27 @@ EndProcedure
 ;  unscaled literals. headerH's default in the engine is the raw
 ;  literal 26.0, not Neon_S(26).
 ; ----------------------------------------------------------------------
+Global Dim neon_panelTitleBuf.a[4097]
+
 Procedure Neon_Panel(x.i, y.i, w.i, h.i, *title, accent.i, headerH.i)
+  Protected i.i
+  Protected ch.i
   Neon_Box(x, y, w, h, Neon_C_Panel)
   If *title <> 0
     If PeekA(*title) <> 0
       Neon_Box(x, y, w, headerH, Neon_C_Head)
       Neon_Box(x, y, 3, headerH, accent)
       Neon_Box(x, y + headerH, w, 1, Neon_C_Line)
-      Neon_Text(#NEON_FONT_UI, x + 12, y + 5, *title, accent)
+      i = 0
+      While i < 4096
+        ch = PeekA(*title + i)
+        If ch = 0 : Break : EndIf
+        If ch >= 97 And ch <= 122 : ch = ch - 32 : EndIf
+        neon_panelTitleBuf[i] = ch
+        i = i + 1
+      Wend
+      neon_panelTitleBuf[i] = 0
+      Neon_Text(#NEON_FONT_UI, x + 12, y + 5, @neon_panelTitleBuf[0], accent)
     EndIf
   EndIf
   Neon_Frame(x, y, w, h, Neon_C_Line)
