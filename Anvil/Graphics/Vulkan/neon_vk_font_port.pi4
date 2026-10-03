@@ -1,0 +1,105 @@
+; Bounded Neon-style TrueType handle for the Vulkan canvas port.
+; Include after neon_vk_port.pi4 and neon_vk_chrome.pi4. The caller owns the
+; handle and must keep its selected TrueType slot loaded for its lifetime.
+
+#NEON_VK_FONT_ERR_HANDLE = -21309
+#NEON_VK_FONT_ERR_STALE = -21310
+#NEON_VK_FONT_ERR_SEQUENCE = -21311
+#NEON_VK_FONT_ERR_METRICS = -21312
+
+Structure NeonVkPortFontRef
+  slot.i
+  generation.i
+  face.i
+  pixelHeight.i
+EndStructure
+
+; Slots 0..3 hold loaded file faces; slot 4 is Anvil's embedded boot face.
+; This binds existing bytes only. It does not load, replace or own a face.
+Procedure.i NeonVkPortFontBind(*font.NeonVkPortFontRef, slot.i, face.i, pixelHeight.i)
+  If *font = 0 Or slot < 0 Or slot >= #ANVIL_TTS_MAX_SLOTS Or face < 0 Or face > 3 Or pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn #NEON_VK_FONT_ERR_HANDLE
+  EndIf
+  If AnvilTrueTypeSlotBytes(slot) < 1 Or AnvilTrueTypeSlotGeneration(slot) < 1
+    ProcedureReturn #NEON_VK_FONT_ERR_HANDLE
+  EndIf
+  *font\slot = slot : *font\generation = AnvilTrueTypeSlotGeneration(slot)
+  *font\face = face : *font\pixelHeight = pixelHeight
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i nvpFontActivate(*font.NeonVkPortFontRef)
+  If *font = 0 Or *font\slot < 0 Or *font\slot >= #ANVIL_TTS_MAX_SLOTS Or *font\face < 0 Or *font\face > 3 Or *font\pixelHeight < 1 Or *font\pixelHeight > 512
+    ProcedureReturn #NEON_VK_FONT_ERR_HANDLE
+  EndIf
+  If *font\generation < 1 Or AnvilTrueTypeSlotGeneration(*font\slot) <> *font\generation Or AnvilTrueTypeSlotBytes(*font\slot) < 1
+    ProcedureReturn #NEON_VK_FONT_ERR_STALE
+  EndIf
+  If nvcInFrame <> 0
+    If AnvilTrueTypeSlotSelected() <> *font\slot Or nvcTTDirty <> 0
+      ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE
+    EndIf
+  ElseIf AnvilTrueTypeSlotSelected() <> *font\slot
+    If AnvilTrueTypeSlotSelect(*font\slot) = 0 : ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE : EndIf
+  EndIf
+  If AnvilTrueTypeSlotParserBound() = 0 : ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE : EndIf
+  If NeonVkChromeFontHeightSet(*font\face, *font\pixelHeight) <> 0
+    ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE
+  EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Every run that may appear in a frame must be warmed before FrameBegin.
+; Several heights of the same selected face may be warmed in one frame.
+Procedure.i NeonVkPortFontWarm(*font.NeonVkPortFontRef, *s)
+  Protected rc.i
+  If nvcInFrame <> 0 Or *s = 0 : ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE : EndIf
+  rc = nvpFontActivate(*font)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkChromeWarmTrueTypeText(*font\pixelHeight, *s)
+  If rc < 0 : ProcedureReturn rc : EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Width and line height are the active Anvil TrueType layout metrics. They
+; are not the desktop font's point-size, fixed-advance or DPI semantics.
+Procedure.f NeonVkPortFontTextWidth(*font.NeonVkPortFontRef, *s, scaled.i)
+  If nvpTextScaleSupported(scaled, 1) = 0 Or *s = 0 : ProcedureReturn -1.0 : EndIf
+  If nvpFontActivate(*font) <> #NEON_OK : ProcedureReturn -1.0 : EndIf
+  ProcedureReturn MathFFromInt(NeonVkChromeMeasureWidth(*font\face, *s))
+EndProcedure
+
+Procedure.i NeonVkPortFontLineHeight(*font.NeonVkPortFontRef)
+  If nvpFontActivate(*font) <> #NEON_OK : ProcedureReturn #NEON_VK_FONT_ERR_SEQUENCE : EndIf
+  ProcedureReturn NeonVkChromeMeasureLineHeight(*font\face)
+EndProcedure
+
+Procedure.i NeonVkPortFontText(*font.NeonVkPortFontRef, x.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected rc.i = nvpFontActivate(*font)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  ProcedureReturn NeonVkPortText(*font\face, x, y, *s, r, g, b, a, scaled, ignoreCamera)
+EndProcedure
+
+Procedure.i NeonVkPortFontTextRight(*font.NeonVkPortFontRef, xRight.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected rc.i = nvpFontActivate(*font)
+  Protected measured.i
+  Protected width.f
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
+  measured = NeonVkChromeMeasureWidth(*font\face, *s)
+  If measured < 0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
+  width = MathFFromInt(measured)
+  ProcedureReturn NeonVkPortFontText(*font, xRight - width, y, *s, r, g, b, a, scaled, ignoreCamera)
+EndProcedure
+
+Procedure.i NeonVkPortFontTextCentre(*font.NeonVkPortFontRef, x.f, w.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  Protected rc.i = nvpFontActivate(*font)
+  Protected measured.i
+  Protected width.f
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
+  measured = NeonVkChromeMeasureWidth(*font\face, *s)
+  If measured < 0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
+  width = MathFFromInt(measured)
+  ProcedureReturn NeonVkPortFontText(*font, x + (w - width) / 2.0, y, *s, r, g, b, a, scaled, ignoreCamera)
+EndProcedure

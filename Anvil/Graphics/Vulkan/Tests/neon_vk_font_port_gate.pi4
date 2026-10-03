@@ -1,0 +1,131 @@
+; Emitted-code gate for the bounded Neon-style Vulkan font handle.
+; The spies model face selection, the prewarm boundary, measured advances,
+; and the canvas draw placement without using a board or font rasterizer.
+EnableFloatingPoint
+
+#NEON_OK = 0
+#NEON_VK_PORT_ERR_TEXT_SCALE = -21302
+#ANVIL_TTS_MAX_SLOTS = 5
+Global Dim fontBytes.i[5]
+Global Dim fontGeneration.i[5]
+Global fontSelected.i = -1
+Global nvcInFrame.i
+Global nvcTTDirty.i
+Global fontPixelHeight.i
+Global fontFace.i
+Global fontWarmCalls.i
+Global fontWarmSlot.i
+Global fontDrawCalls.i
+Global fontDrawX.f
+Global fontDrawY.f
+Global fontDrawFace.i
+Global fontDrawPointer.i
+Global fontCanvasEqual.i = 1
+
+Procedure.f MathFFromInt(value.i)
+  ProcedureReturn value
+EndProcedure
+Procedure.i nvpTextScaleSupported(scaled.i, ignoreCamera.i)
+  If scaled <> 0 And fontCanvasEqual = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypeSlotBytes(slot.i)
+  If slot < 0 Or slot >= 5 : ProcedureReturn 0 : EndIf
+  ProcedureReturn fontBytes[slot]
+EndProcedure
+Procedure.i AnvilTrueTypeSlotGeneration(slot.i)
+  If slot < 0 Or slot >= 5 : ProcedureReturn 0 : EndIf
+  ProcedureReturn fontGeneration[slot]
+EndProcedure
+Procedure.i AnvilTrueTypeSlotSelected()
+  ProcedureReturn fontSelected
+EndProcedure
+Procedure.i AnvilTrueTypeSlotParserBound()
+  If fontSelected < 0 Or fontSelected >= 5 : ProcedureReturn 0 : EndIf
+  If fontBytes[fontSelected] < 1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i AnvilTrueTypeSlotSelect(slot.i)
+  If AnvilTrueTypeSlotBytes(slot) < 1 : ProcedureReturn 0 : EndIf
+  fontSelected = slot
+  ProcedureReturn 1
+EndProcedure
+Procedure.i NeonVkChromeFontHeightSet(face.i, pixelHeight.i)
+  If face < 0 Or face > 3 Or pixelHeight < 1 Or pixelHeight > 512 : ProcedureReturn -1 : EndIf
+  fontFace = face : fontPixelHeight = pixelHeight
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NeonVkChromeWarmTrueTypeText(pixelHeight.i, *s)
+  If nvcInFrame <> 0 Or *s = 0 Or fontSelected < 0 : ProcedureReturn -50 : EndIf
+  fontWarmCalls = fontWarmCalls + 1 : fontWarmSlot = fontSelected
+  ProcedureReturn 3
+EndProcedure
+Procedure.i NeonVkChromeMeasureWidth(face.i, *s)
+  Protected at.i, width.i, ch.i
+  If face <> fontFace Or *s = 0 : ProcedureReturn -1 : EndIf
+  Repeat
+    ch = PeekA(*s + at)
+    If ch = 0 : Break : EndIf
+    If ch = 87 : width = width + 12
+    ElseIf ch = 105 : width = width + 4
+    Else : width = width + 8
+    EndIf
+    at = at + 1
+  ForEver
+  ProcedureReturn (width * fontPixelHeight) / 20
+EndProcedure
+Procedure.i NeonVkChromeMeasureLineHeight(face.i)
+  If face <> fontFace : ProcedureReturn -1 : EndIf
+  ProcedureReturn fontPixelHeight + 2
+EndProcedure
+Procedure.i NeonVkPortText(face.i, x.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If nvcInFrame = 0 Or nvcTTDirty <> 0 : ProcedureReturn -51 : EndIf
+  fontDrawCalls = fontDrawCalls + 1 : fontDrawX = x : fontDrawY = y
+  fontDrawFace = face : fontDrawPointer = *s
+  ProcedureReturn 23
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_font_port.pi4"
+
+Procedure.i Main()
+  Protected first.NeonVkPortFontRef
+  Protected other.NeonVkPortFontRef
+  Protected boot.NeonVkPortFontRef
+  Protected Dim text.a[4]
+  text[0] = 87 : text[1] = 105 : text[2] = 87 : text[3] = 0
+  fontBytes[0] = 1024 : fontGeneration[0] = 1
+  fontBytes[1] = 2048 : fontGeneration[1] = 5
+  fontBytes[4] = 4096 : fontGeneration[4] = 2
+  If NeonVkPortFontBind(@first, 0, 2, 20) <> 0 : ProcedureReturn 1 : EndIf
+  If NeonVkPortFontBind(@other, 1, 1, 10) <> 0 : ProcedureReturn 2 : EndIf
+  If NeonVkPortFontBind(@boot, 4, 0, 16) <> 0 : ProcedureReturn 3 : EndIf
+  If NeonVkPortFontBind(0, 0, 2, 20) <> #NEON_VK_FONT_ERR_HANDLE : ProcedureReturn 4 : EndIf
+  If NeonVkPortFontBind(@other, 2, 1, 10) <> #NEON_VK_FONT_ERR_HANDLE : ProcedureReturn 5 : EndIf
+  If NeonVkPortFontWarm(@boot, @text[0]) <> 0 Or fontSelected <> 4 Or fontWarmSlot <> 4 : ProcedureReturn 6 : EndIf
+  If NeonVkPortFontLineHeight(@boot) <> 18 : ProcedureReturn 7 : EndIf
+  If fontBytes[4] <> 4096 Or fontGeneration[4] <> 2 : ProcedureReturn 8 : EndIf
+  If NeonVkPortFontWarm(@other, @text[0]) <> 0 Or fontSelected <> 1 : ProcedureReturn 23 : EndIf
+  If NeonVkPortFontTextWidth(@other, @text[0], 1) <> 14.0 Or NeonVkPortFontLineHeight(@other) <> 12 : ProcedureReturn 24 : EndIf
+  If NeonVkPortFontWarm(@first, @text[0]) <> 0 Or fontSelected <> 0 Or fontWarmCalls <> 3 : ProcedureReturn 9 : EndIf
+  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> 28.0 : ProcedureReturn 10 : EndIf
+  If NeonVkPortFontLineHeight(@first) <> 22 : ProcedureReturn 11 : EndIf
+  fontCanvasEqual = 0
+  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> -1.0 : ProcedureReturn 12 : EndIf
+  fontCanvasEqual = 1
+  nvcInFrame = 1
+  If NeonVkPortFontWarm(@first, @text[0]) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 13 : EndIf
+  If NeonVkPortFontText(@other, 0.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 14 : EndIf
+  If fontSelected <> 0 Or fontDrawCalls <> 0 : ProcedureReturn 15 : EndIf
+  If NeonVkPortFontTextRight(@first, 100.0, 7.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> 23 : ProcedureReturn 16 : EndIf
+  If fontDrawX <> 72.0 Or fontDrawY <> 7.0 Or fontDrawFace <> 2 Or fontDrawPointer <> @text[0] : ProcedureReturn 17 : EndIf
+  If NeonVkPortFontTextCentre(@first, 10.0, 100.0, 9.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> 23 : ProcedureReturn 18 : EndIf
+  If fontDrawX <> 46.0 Or fontDrawY <> 9.0 Or fontDrawCalls <> 2 : ProcedureReturn 19 : EndIf
+  nvcTTDirty = 1
+  If NeonVkPortFontText(@first, 0.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 20 : EndIf
+  nvcTTDirty = 0
+  fontGeneration[0] = 2
+  If NeonVkPortFontText(@first, 0.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_STALE : ProcedureReturn 21 : EndIf
+  If NeonVkPortFontTextRight(@first, 100.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_STALE : ProcedureReturn 25 : EndIf
+  If fontDrawCalls <> 2 : ProcedureReturn 22 : EndIf
+  ProcedureReturn 0
+EndProcedure
