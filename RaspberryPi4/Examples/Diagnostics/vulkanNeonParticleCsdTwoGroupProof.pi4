@@ -1,0 +1,297 @@
+; Returning RAM diagnostic: two V3D CSD groups expand thirty-two compact
+; particle records into disjoint, exact six-vertex, 24-byte Vulkan streams.
+; Mesa's Pi 4 compute lowering identifies r0[15:0] as workgroup X and
+; EIDX as the local lane. This proof checks global = (r0 & $FFFF)*16 + EIDX.
+; No Neon worker or Vulkan production state is touched.
+; Run only under Anvil's armed deadman. Build with --entry-returns.
+; x0 returns global_nceReport; read exactly 256 bytes.
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+
+#NCE_MAGIC       = $3243504E
+#NCE_PT          = $02F00000
+#NCE_PT_BYTES    = $0000D000
+#NCE_ILLEGAL     = $02F10000
+#NCE_CODE        = $03000000
+#NCE_UNIF        = $03001000
+#NCE_INPUT       = $03002000
+#NCE_OUTPUT      = $03003000
+#NCE_PAGE        = 4096
+#NCE_GROUPS      = 2
+#NCE_ITEMS       = #NCE_GROUPS * 16
+#NCE_RECORD      = 32
+#NCE_VERTEX      = 24
+#NCE_OUT_BYTES   = #NCE_ITEMS * 6 * #NCE_VERTEX
+#NCE_OUT_ALLOC   = #NCE_PAGE * 2
+#NCE_POISON      = $A5A5A5A5
+#NCE_ONE         = $3F800000
+#NCE_LOAD_VEC4   = $FFFFFF7C
+#NCE_WAIT_US     = 100000
+
+Global Dim nceReport.l[64]
+
+; Each global invocation owns one record and 144 output bytes. The record contains
+; x0,y0,x1,y1,u,v and two canaries; both four-word TMU loads are exercised.
+Procedure nceFill()
+  Define i.i, j.i, p.i
+  For i = 0 To (#NCE_PAGE / 4) - 1
+    PokeL(#NCE_INPUT + i * 4, #NCE_POISON)
+  Next
+  For i = 0 To (#NCE_OUT_ALLOC / 4) - 1
+    PokeL(#NCE_OUTPUT + i * 4, #NCE_POISON)
+  Next
+  For i = 0 To #NCE_ITEMS - 1
+    p = #NCE_INPUT + i * #NCE_RECORD
+    PokeL(p + 0, $3F000000 + i * 4096)
+    PokeL(p + 4, $3E800000 + i * 4096)
+    PokeL(p + 8, $3F800000 + i * 4096)
+    PokeL(p + 12, $3F400000 + i * 4096)
+    PokeL(p + 16, $3C000000 + i * 4096)
+    PokeL(p + 20, $3E000000 + i * 4096)
+    PokeL(p + 24, $D00D0000 | i)
+    PokeL(p + 28, $FACE0000 | i)
+  Next
+  PokeL(#NCE_UNIF + 0, #NCE_INPUT)
+  PokeL(#NCE_UNIF + 4, #NCE_OUTPUT)
+  PokeL(#NCE_UNIF + 8, #NCE_ONE)
+  PokeL(#NCE_UNIF + 12, $0000FFFF)
+  PokeL(#NCE_UNIF + 16, 16)
+  PokeL(#NCE_UNIF + 20, #NCE_LOAD_VEC4)
+  PokeL(#NCE_UNIF + 24, #NCE_LOAD_VEC4)
+  For j = 28 To #NCE_PAGE - 4 Step 4
+    PokeL(#NCE_UNIF + j, #NCE_POISON)
+  Next
+EndProcedure
+
+; A plain TMUAU launch consumes the next uniform as its general-load
+; configuration. THRSW and two delay slots precede four LDTMU results.
+Procedure.i nceLoad4(addressRf.i, firstRf.i)
+  Define r.i, k.i
+  V3dQpuReset()
+  r = V3dQpuSig(#V3DQ_SIG_THRSW)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
+  V3dQpuRaddr(addressRf, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  For k = 0 To 3
+    r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, firstRf + k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Next
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; TMUD carries a word and TMUA fires its store. rf14 is the output
+; cursor, incremented after each store. TMUWT at vertex boundaries
+; keeps the first proof bounded to six completed writes at a time.
+Procedure.i nceStoreWord(sourceRf.i)
+  Define r.i
+  r = V3dQpuMov(#V3DQ_WADDR_TMUD, 1, #V3DQ_MUX_A, sourceRf)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuMov(#V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 14)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAddImm(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, 14, 4)
+EndProcedure
+
+Procedure.i nceStoreVertex(xRf.i, yRf.i)
+  Define r.i
+  r = nceStoreWord(xRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(yRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(4) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(5) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAdd0(#V3DQ_A_TMUWT, #V3DQ_WADDR_NOP, 1)
+EndProcedure
+
+Procedure.i nceBuildShader()
+  Define r.i
+  r = V3dQpuProgramBegin(#NCE_CODE, #NCE_PAGE)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 9, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 15, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 6, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 7, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Compute global item from the hardware-provided packed workgroup ID.
+  ; r0[15:0] = group X; y is in r0[31:16], so mask it explicitly.
+  r = V3dQpuAdd2(#V3DQ_A_AND, 6, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 6, 0, #V3DQ_MUX_A, 6, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 10, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 10, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; input = rf8 + global item * 32
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 11, 0, #V3DQ_MUX_A, 10, 5)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 8, 11)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceLoad4(12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 12, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceLoad4(13, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; output = rf9 + global item * (128 + 16), six 24-byte vertices.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 11, 0, #V3DQ_MUX_A, 10, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 12, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 11, 12)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 9)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Existing particle triangle order: 0,2,3, 0,3,1.
+  r = nceStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(0, 3) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(2, 3) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(2, 3) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(2, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+Procedure.i nceExpected(item.i, vertex.i, component.i)
+  Select component
+    Case 0
+      If vertex = 0 Or vertex = 1 Or vertex = 3
+        ProcedureReturn $3F000000 + item * 4096
+      EndIf
+      ProcedureReturn $3F800000 + item * 4096
+    Case 1
+      If vertex = 0 Or vertex = 3 Or vertex = 5
+        ProcedureReturn $3E800000 + item * 4096
+      EndIf
+      ProcedureReturn $3F400000 + item * 4096
+    Case 2 : ProcedureReturn $3C000000 + item * 4096
+    Case 3 : ProcedureReturn $3E000000 + item * 4096
+    Default : ProcedureReturn #NCE_ONE
+  EndSelect
+EndProcedure
+
+Procedure.i nceReturn(status.i)
+  nceReport[1] = status
+  nceReport[9] = V3dCsdDoneBefore()
+  nceReport[10] = V3dCsdDoneAfter()
+  nceReport[11] = V3dCsdCleanResult()
+  nceReport[12] = V3dCsdMmuCtlAfter()
+  nceReport[13] = V3dCsdVioAddrAfter()
+  nceReport[14] = V3dCsdVioIdAfter()
+  ProcedureReturn @nceReport[0]
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, i.i, v.i, c.i, got.i, want.i, off.i, t0.i
+  nceReport[0] = #NCE_MAGIC
+  nceReport[2] = #NCE_ITEMS
+  nceReport[3] = #NCE_OUT_BYTES
+  nceReport[15] = #NCE_GROUPS
+  TimerInit()
+  rc = V3dInit()
+  nceReport[4] = rc
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(1) : EndIf
+  nceFill()
+  rc = nceBuildShader()
+  nceReport[5] = rc
+  nceReport[8] = V3dQpuProgramBytes()
+  If rc <> #V3DQ_OK : ProcedureReturn nceReturn(2) : EndIf
+  rc = V3dMmuInit(#NCE_PT, #NCE_PT_BYTES, #NCE_ILLEGAL)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(3) : EndIf
+  rc = V3dMmuMap(#NCE_CODE, #NCE_CODE, #NCE_PAGE)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(4) : EndIf
+  rc = V3dMmuMap(#NCE_UNIF, #NCE_UNIF, #NCE_PAGE)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(5) : EndIf
+  rc = V3dMmuMap(#NCE_INPUT, #NCE_INPUT, #NCE_PAGE)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(6) : EndIf
+  rc = V3dMmuMap(#NCE_OUTPUT, #NCE_OUTPUT, #NCE_OUT_ALLOC)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(7) : EndIf
+  rc = V3dCsdBegin(#NCE_GROUPS, 1, 1, 16, 1)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(8) : EndIf
+  rc = V3dCsdCode(#NCE_CODE, V3dQpuProgramBytes(), 0)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(9) : EndIf
+  rc = V3dCsdUniforms(#NCE_UNIF, 28)
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(10) : EndIf
+  V3dCsdOutput(#NCE_OUTPUT, #NCE_OUT_ALLOC)
+  ; The CSD helper cleans code, uniforms and output. Input is separately
+  ; CPU-owned, so publish its full page before the GPU's TMU reads it.
+  V3dCacheRange(#NCE_INPUT, #NCE_PAGE)
+  t0 = Micros()
+  rc = V3dCsdSubmit()
+  nceReport[16] = rc
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(11) : EndIf
+  rc = V3dCsdWait(#NCE_WAIT_US)
+  nceReport[17] = rc
+  nceReport[18] = Micros() - t0
+  If rc <> #V3D_OK : ProcedureReturn nceReturn(12) : EndIf
+  ; Wait cleans the V3D write combiner/L2T. Drop any ARM-side copy only
+  ; after that completion, including when the monitor left caches enabled.
+  V3dCacheRange(#NCE_OUTPUT, #NCE_OUT_ALLOC)
+  For i = 0 To #NCE_ITEMS - 1
+    For v = 0 To 5
+      For c = 0 To 5
+        off = (i * 6 * 6 + v * 6 + c) * 4
+        got = PeekL(#NCE_OUTPUT + off)
+        want = nceExpected(i, v, c)
+        If got <> want
+          nceReport[6] = nceReport[6] + 1
+          If nceReport[19] = 0
+            nceReport[19] = off + 1 : nceReport[20] = want : nceReport[21] = got
+          EndIf
+        EndIf
+      Next
+    Next
+  Next
+  For off = #NCE_OUT_BYTES To #NCE_OUT_ALLOC - 4 Step 4
+    If (PeekL(#NCE_OUTPUT + off) & $FFFFFFFF) <> (#NCE_POISON & $FFFFFFFF)
+      nceReport[7] = nceReport[7] + 1
+    EndIf
+  Next
+  For i = 0 To #NCE_ITEMS - 1
+    For c = 0 To 7
+      got = PeekL(#NCE_INPUT + i * #NCE_RECORD + c * 4) & $FFFFFFFF
+      Select c
+        Case 0 : want = $3F000000 + i * 4096
+        Case 1 : want = $3E800000 + i * 4096
+        Case 2 : want = $3F800000 + i * 4096
+        Case 3 : want = $3F400000 + i * 4096
+        Case 4 : want = $3C000000 + i * 4096
+        Case 5 : want = $3E000000 + i * 4096
+        Case 6 : want = $D00D0000 | i
+        Case 7 : want = $FACE0000 | i
+      EndSelect
+      If got <> (want & $FFFFFFFF) : nceReport[22] = nceReport[22] + 1 : EndIf
+    Next
+  Next
+  For off = #NCE_ITEMS * #NCE_RECORD To #NCE_PAGE - 4 Step 4
+    If (PeekL(#NCE_INPUT + off) & $FFFFFFFF) <> (#NCE_POISON & $FFFFFFFF)
+      nceReport[22] = nceReport[22] + 1
+    EndIf
+  Next
+  nceReport[23] = PeekL(#NCE_OUTPUT)
+  nceReport[24] = PeekL(#NCE_OUTPUT + #NCE_OUT_BYTES - 4)
+  nceReport[25] = PeekL(#NCE_OUTPUT + (16 * 6 * #NCE_VERTEX) - 4)
+  nceReport[26] = PeekL(#NCE_OUTPUT + 16 * 6 * #NCE_VERTEX)
+  If nceReport[6] <> 0 Or nceReport[7] <> 0 Or nceReport[22] <> 0
+    ProcedureReturn nceReturn(13)
+  EndIf
+  If V3dCsdDoneBefore() = V3dCsdDoneAfter() Or V3dCsdCleanResult() <> #V3D_OK
+    ProcedureReturn nceReturn(14)
+  EndIf
+  ProcedureReturn nceReturn(0)
+EndProcedure
