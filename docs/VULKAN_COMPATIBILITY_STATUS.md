@@ -74,7 +74,7 @@ mutation. The original atlas transform passed its full pixel-oracle regression.
 See `docs/evidence/neon-multi-image-transform-pi4-20261003/` and
 `docs/evidence/neon-sixteen-images-pi4-20261003/`. Other boards have
 no hardware proof for this path. The full Pi 4 monitor desk-compiles with this
-source but has not been installed; its image reaches `$70094F`. A future RAM
+source but has not been installed; the latest image reaches `$70214F`. A future RAM
 payload at `$700000` would overlap it. Use the running monitor's `map` output
 for staging.
 Evidence is in
