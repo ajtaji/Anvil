@@ -1,6 +1,6 @@
 # CSD output into a Pi 4 Vulkan vertex buffer: ownership review
 
-Status: **design and desk audit only**. The two-workgroup CSD diagnostic in this directory passed on Pi 4, proving its `32 × 144`-byte output and guards. It wrote to fixed RAM after installing its own V3D page table. It did **not** write into an Anvil `VkBuffer`, run under Neon's page table, or feed a Vulkan vertex fetch. No renderer or board change follows from this review.
+Status: **small Pi 4 shared-buffer diagnostic passed**. The earlier two-workgroup CSD diagnostic proved `32 × 144` bytes and guards in fixed RAM. The later [live-buffer board proof](../../../docs/evidence/neon-particle-csd-vkbuffer-pi4-20261003/README.md) wrote 192 vertices into a bound Anvil `VkBuffer` under Neon's page table and fetched them in a Vulkan draw. This remains a board-specific diagnostic, not a production particle path.
 
 ## Smallest physical handoff
 
@@ -17,6 +17,6 @@ Therefore a **Pi 4-specific diagnostic** can reverse the old fixed-output arrang
 
 ## Gates before implementation
 
-The existing two-group proof establishes indexing and byte-exact expansion only. It does not prove the shared page-table handoff, a CSD write to a live Vulkan allocation, or a subsequent vertex fetch. The next isolated board diagnostic should allocate a small Vulkan vertex buffer within the Neon-mapped heap, run two CSD groups into it, check exact bytes and guard space, submit one non-indexed Vulkan draw from that buffer, and compare pixels. Keep both submissions synchronous and under the supervisor's deadman. No production speed claim follows until a 10,000-particle profile measures the complete prepare/CSD/draw/end path.
+The small shared-page-table handoff has now passed: two CSD groups wrote exact bytes and guards into a live Vulkan allocation, and one draw passed 64 pixel probes. Both submissions were synchronous under an armed deadman. No production speed claim follows until a 10,000-particle profile measures the complete prepare/CSD/draw/end path.
 
 The present 32-byte compact record and QPU program encode axis-aligned x/y corners only. Chrome's current particle path also handles camera transforms and rotation (`neon_vk_particles.pi4:379–425`); full replacement needs either a proven four-corner record/shader or a correctly ordered CPU fallback. A CSD timeout or GPU cache-clean failure may leave writes in flight; `V3dCsdWait` reports the fault but does not cancel the job. A production bridge must treat that as device loss and prevent reuse/free of its buffer until the engine is reset or known idle. Finally, Vulkan's resource-retention counts cover Vulkan submissions, not this external CSD interval. Any reusable bridge must own the buffer and memory across **both** intervals, rather than exposing a raw address to arbitrary callers. These are the reasons no runtime integration was made here.

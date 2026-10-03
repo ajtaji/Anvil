@@ -101,7 +101,9 @@ PNG, JPEG, palette, RLE, and bitfield BMP return an unsupported-format error.
 The restored desktop library delegates these formats to PureBasic's selected
 image decoders; its repository has no asset files or loading call sites from
 which to infer a production format. This subset has a desktop compiler and
-emitted-code gate, but no board image-load proof yet.
+emitted-code gate. The Pi 4 [BMP asset proof](../../../docs/evidence/neon-vk-bmp-asset-pi4-20261003/README.md)
+passed decoding, color key, alpha mask and an ordered Vulkan draw from a
+2×2 in-memory BMP. File loading and larger assets remain unproved on board.
 
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
