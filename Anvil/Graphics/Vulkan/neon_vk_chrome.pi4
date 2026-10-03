@@ -113,6 +113,22 @@ Global nvcDescriptorSet.i
 Global nvcPipelineLayout.i
 Global nvcPipeline.i
 
+; One independent sampled image. Its descriptor uses the same pipeline layout
+; as the atlas but owns a separate image, view and device-memory allocation.
+Global nvcImageSpriteImage.i
+Global nvcImageSpriteMemory.i
+Global nvcImageSpriteView.i
+Global nvcImageSpriteSet.i
+Global nvcImageSpriteW.i
+Global nvcImageSpriteH.i
+Global nvcImageSpriteGeneration.i
+Global nvcImageSpritePendingImage.i
+Global nvcImageSpritePendingMemory.i
+Global nvcImageSpritePendingView.i
+Global nvcImageSpritePendingSet.i
+Global nvcImageSpritePendingStage.i
+Global nvcImageSpritePendingStageMemory.i
+
 Global nvcAtlasW.i
 Global nvcAtlasH.i
 Global nvcAtlasBaseW.i
@@ -933,10 +949,13 @@ Procedure.i nvcDescriptorsAndPipeline()
   dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
   rc = vkCreateDescriptorSetLayout(nvcDevice, @dslci, 0, @nvcSetLayout)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
-  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 1
-  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 1
+  ; Atlas, resident sprite and unpublished replacement coexist during a
+  ; transaction. Individual sets can be retired after the bounded wait.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 3
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 3
   dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
-  dpci\maxSets = 1 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  dpci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  dpci\maxSets = 3 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
   rc = vkCreateDescriptorPool(nvcDevice, @dpci, 0, @nvcDescriptorPool)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   layoutArray = nvcSetLayout
@@ -1031,12 +1050,255 @@ Procedure.i nvcDescriptorsAndPipeline()
   ProcedureReturn rc
 EndProcedure
 
+Procedure nvcImageSpriteRelease(setHandle.i, view.i, image.i, memory.i)
+  Define handle.i
+  If nvcDevice = 0
+    ProcedureReturn
+  EndIf
+  If setHandle <> 0 And nvcDescriptorPool <> 0
+    handle = setHandle
+    vkFreeDescriptorSets(nvcDevice, nvcDescriptorPool, 1, @handle)
+  EndIf
+  If view <> 0 : vkDestroyImageView(nvcDevice, view, 0) : EndIf
+  If image <> 0 : vkDestroyImage(nvcDevice, image, 0) : EndIf
+  If memory <> 0 : vkFreeMemory(nvcDevice, memory, 0) : EndIf
+EndProcedure
+
+; A necessary byte and table preflight over the caller's actual heap window.
+; Individual Vulkan allocations remain authoritative if fragmentation keeps
+; two aligned runs from fitting even though their aggregate bytes fit.
+Procedure.i nvcImageSpritePreflight(imageBytes.i, stagingBytes.i)
+  Define props.VkPhysicalDeviceMemoryProperties
+  Define used.i, freeRows.i, i.i, alignment.i
+  If imageBytes < 1 Or stagingBytes < 1 Or avkHeapBind() <> #VK_SUCCESS
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  vkGetPhysicalDeviceMemoryProperties(nvcPhysical, @props)
+  If props\memoryHeapCount < 1 Or props\memoryHeaps[0]\size <> avkHeapBytes
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  For i = 1 To #ANVIL_VK_MAX_MEMORY
+    If avkMemLive[i] <> 0
+      used = used + avkMemSize[i]
+    Else
+      freeRows = freeRows + 1
+    EndIf
+  Next
+  alignment = avkBackendImageAlignment()
+  If freeRows < 2 Or alignment < 1 Or used < 0 Or used > avkHeapBytes
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  If imageBytes > avkHeapBytes - used Or stagingBytes > avkHeapBytes - used - imageBytes
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  ; Leave one alignment gap for each new allocation. This may refuse a
+  ; borderline fit but never approves a request larger than free bytes.
+  If avkHeapBytes - used - imageBytes - stagingBytes < alignment * 2
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Replace the one independently owned RGBA8 sprite while no frame or present
+; transaction is active. Old handles remain published until image upload,
+; view creation and descriptor writes all succeed. Source bytes are copied
+; during this call and need not remain live afterwards.
+Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
+  Define ici.VkImageCreateInfo
+  Define imageProps.VkImageFormatProperties
+  Define imageReq.VkMemoryRequirements
+  Define bufferReq.VkMemoryRequirements
+  Define mai.VkMemoryAllocateInfo
+  Define bci.VkBufferCreateInfo
+  Define ivci.VkImageViewCreateInfo
+  Define dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo
+  Define dii.VkDescriptorImageInfo
+  Define write.VkWriteDescriptorSet
+  Define bar.VkImageMemoryBarrier
+  Define copy.VkBufferImageCopy
+  Define bi.VkCommandBufferBeginInfo
+  Define image.i, imageMemory.i, view.i, setHandle.i
+  Define stage.i, stageMemory.i, mapped.i, layoutHandle.i
+  Define oldImage.i, oldMemory.i, oldView.i, oldSet.i
+  Define pixelBytes.i, x.i, y.i, src.i, dst.i, rc.i
+
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If *rgba = 0 Or width < 1 Or height < 1 Or width > 2048 Or height > 2048
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcImageSpriteGeneration = #NVC_MAX_GENERATION
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  pixelBytes = width * height * 4
+  rc = vkGetPhysicalDeviceImageFormatProperties(nvcPhysical, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TYPE_2D, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT, 0, @imageProps)
+  If rc <> #VK_SUCCESS Or imageProps\maxExtent\width < width Or imageProps\maxExtent\height < height Or imageProps\maxResourceSize < pixelBytes
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  ; The shared command buffer is reusable only after the preceding submit.
+  rc = vkDeviceWaitIdle(nvcDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  ici\imageType = #VK_IMAGE_TYPE_2D : ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ici\extent\width = width : ici\extent\height = height : ici\extent\depth = 1
+  ici\mipLevels = 1 : ici\arrayLayers = 1 : ici\samples = #VK_SAMPLE_COUNT_1_BIT
+  ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+  ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nvcDevice, @ici, 0, @image)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  vkGetImageMemoryRequirements(nvcDevice, image, @imageReq)
+  bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bci\size = #NEON_VK_CHROME_ATLAS_PAD + pixelBytes
+  bci\usage = #VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+  bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  rc = vkCreateBuffer(nvcDevice, @bci, 0, @stage)
+  If rc = #VK_SUCCESS : vkGetBufferMemoryRequirements(nvcDevice, stage, @bufferReq) : EndIf
+  If rc = #VK_SUCCESS : rc = nvcImageSpritePreflight(imageReq\size, bufferReq\size) : EndIf
+  If rc <> #VK_SUCCESS
+    If stage <> 0 : vkDestroyBuffer(nvcDevice, stage, 0) : EndIf
+    vkDestroyImage(nvcDevice, image, 0)
+    ProcedureReturn nvcFail(rc)
+  EndIf
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = imageReq\size : mai\memoryTypeIndex = nvcHostMemoryType(imageReq\memoryTypeBits)
+  If mai\memoryTypeIndex < 0 : rc = #NEON_VK_CHROME_ERR_VULKAN : Else : rc = vkAllocateMemory(nvcDevice, @mai, 0, @imageMemory) : EndIf
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(nvcDevice, image, imageMemory, 0) : EndIf
+  If rc = #VK_SUCCESS
+    mai\allocationSize = bufferReq\size : mai\memoryTypeIndex = nvcHostMemoryType(bufferReq\memoryTypeBits)
+    If mai\memoryTypeIndex < 0 : rc = #NEON_VK_CHROME_ERR_VULKAN : Else : rc = vkAllocateMemory(nvcDevice, @mai, 0, @stageMemory) : EndIf
+  EndIf
+  If rc = #VK_SUCCESS : rc = vkBindBufferMemory(nvcDevice, stage, stageMemory, 0) : EndIf
+  If rc = #VK_SUCCESS : rc = vkMapMemory(nvcDevice, stageMemory, 0, #VK_WHOLE_SIZE, 0, @mapped) : EndIf
+  If rc = #VK_SUCCESS
+    For y = 0 To height - 1
+      For x = 0 To width - 1
+        src = *rgba + (y * width + x) * 4
+        dst = mapped + #NEON_VK_CHROME_ATLAS_PAD + (y * width + x) * 4
+        PokeL(dst, (PeekA(src + 3) << 24) | (PeekA(src) << 16) | (PeekA(src + 1) << 8) | PeekA(src + 2))
+      Next
+    Next
+    bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+    bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+    bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+    bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+    bar\image = image
+    bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+    copy\bufferOffset = #NEON_VK_CHROME_ATLAS_PAD
+    copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    copy\imageSubresource\layerCount = 1
+    copy\imageExtent\width = width : copy\imageExtent\height = height : copy\imageExtent\depth = 1
+    bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+    bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    rc = vkResetCommandBuffer(nvcCommand, 0)
+    If rc = #VK_SUCCESS : rc = vkBeginCommandBuffer(nvcCommand, @bi) : EndIf
+    If rc = #VK_SUCCESS
+      vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      vkCmdCopyBufferToImage(nvcCommand, stage, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+      bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+      bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+      bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      bar\newLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+      rc = vkEndCommandBuffer(nvcCommand)
+    EndIf
+    If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
+  EndIf
+  If mapped <> 0 : vkUnmapMemory(nvcDevice, stageMemory) : mapped = 0 : EndIf
+  If rc = #VK_SUCCESS
+    ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    ivci\image = image : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+    ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+    ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+    rc = vkCreateImageView(nvcDevice, @ivci, 0, @view)
+  EndIf
+  If rc = #VK_SUCCESS
+    layoutHandle = nvcSetLayout
+    dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    dsai\descriptorPool = nvcDescriptorPool
+    dsai\descriptorSetCount = 1 : dsai\pSetLayouts = @layoutHandle
+    rc = vkAllocateDescriptorSets(nvcDevice, @dsai, @setHandle)
+  EndIf
+  If rc = #VK_SUCCESS
+    dbi\buffer = nvcUniformBuffer : dbi\range = 16
+    write\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    write\dstSet = setHandle : write\dstBinding = 0
+    write\descriptorCount = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+    write\pBufferInfo = @dbi
+    AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+    If AnvilVkFaultCode() <> #ANVIL_VK_OK : rc = #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  EndIf
+  If rc = #VK_SUCCESS
+    dii\sampler = nvcSampler : dii\imageView = view
+    dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    write\dstBinding = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    write\pBufferInfo = 0 : write\pImageInfo = @dii
+    AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+    If AnvilVkFaultCode() <> #ANVIL_VK_OK : rc = #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  EndIf
+  ; The transfer has completed before staging is retired. A failed transfer
+  ; must reach idle before candidate handles are released.
+  If rc <> #VK_SUCCESS
+    If vkDeviceWaitIdle(nvcDevice) <> #VK_SUCCESS
+      ; The transfer may still reference staging and image memory. Keep all
+      ; candidate handles until a later successful device-idle retirement.
+      nvcImageSpritePendingImage = image : nvcImageSpritePendingMemory = imageMemory
+      nvcImageSpritePendingView = view : nvcImageSpritePendingSet = setHandle
+      nvcImageSpritePendingStage = stage : nvcImageSpritePendingStageMemory = stageMemory
+      ProcedureReturn nvcFail(rc)
+    EndIf
+  EndIf
+  If stage <> 0 : vkDestroyBuffer(nvcDevice, stage, 0) : EndIf
+  If stageMemory <> 0 : vkFreeMemory(nvcDevice, stageMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS
+    nvcImageSpriteRelease(setHandle, view, image, imageMemory)
+    ProcedureReturn nvcFail(rc)
+  EndIf
+  oldImage = nvcImageSpriteImage : oldMemory = nvcImageSpriteMemory
+  oldView = nvcImageSpriteView : oldSet = nvcImageSpriteSet
+  nvcImageSpriteImage = image : nvcImageSpriteMemory = imageMemory
+  nvcImageSpriteView = view : nvcImageSpriteSet = setHandle
+  nvcImageSpriteW = width : nvcImageSpriteH = height
+  nvcImageSpriteGeneration = nvcImageSpriteGeneration + 1
+  nvcImageSpriteRelease(oldSet, oldView, oldImage, oldMemory)
+  nvcError = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteGeneration()
+  ProcedureReturn nvcImageSpriteGeneration
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteClear()
+  Define rc.i
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0 Or nvcImageSpriteGeneration = #NVC_MAX_GENERATION
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcImageSpriteSet = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  rc = vkDeviceWaitIdle(nvcDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
+  nvcImageSpriteSet = 0 : nvcImageSpriteView = 0
+  nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
+  nvcImageSpriteW = 0 : nvcImageSpriteH = 0
+  nvcImageSpriteGeneration = nvcImageSpriteGeneration + 1
+  nvcError = 0
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxDraws.i, maxVertexQuads.i)
   Define cbai.VkCommandBufferAllocateInfo
   Define fci.VkFenceCreateInfo
   Define rc.i
 
-  If nvcReady <> 0 Or nvcInFrame <> 0
+  If nvcReady <> 0 Or nvcInFrame <> 0 Or nvcDevice <> 0 Or nvcCommand <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If NeonDrawBackendActive() <> 0
@@ -1054,8 +1316,6 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   If nvcNextTargetGeneration = #NVC_MAX_GENERATION
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
-  nvcPhysical = physicalDevice : nvcDevice = device : nvcQueue = queue : nvcCommandPool = commandPool
-  nvcRenderPass = renderPass : nvcFramebuffer = framebuffer
   nvcLogicalW = width : nvcLogicalH = height
   nvcPhysicalW = width : nvcPhysicalH = height : nvcPitch = width * 4 : nvcRotation = 0
   nvcWidth = width : nvcHeight = height
@@ -1067,6 +1327,11 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W : nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
   rc = nvcSpriteShelfPlan()
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nvcFail(rc) : EndIf
+  ; Only publish the device after the allocation-free shelf preflight passes.
+  ; A refused layout may then be corrected and retried without a false live
+  ; device state, while the guard above still protects a failed teardown.
+  nvcPhysical = physicalDevice : nvcDevice = device : nvcQueue = queue : nvcCommandPool = commandPool
+  nvcRenderPass = renderPass : nvcFramebuffer = framebuffer
   nvdPresentClear()
 
   cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
@@ -1138,7 +1403,7 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   Define offset.q
   Define rc.i
 
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If nvcTTDirty <> 0
@@ -1363,7 +1628,7 @@ Procedure nvcTint(colour.i, *push)
   PokeL(*push + 12, neon_F32Byte((colour >> 24) & $FF))
 EndProcedure
 
-Procedure.i nvcDraw(first.i, count.i, colour.i)
+Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
   Define sc.VkRect2D
   Define Dim push.l[4]
   If nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -1373,11 +1638,16 @@ Procedure.i nvcDraw(first.i, count.i, colour.i)
   sc\offset\x = nvcClipX : sc\offset\y = nvcClipY
   sc\extent\width = nvcClipW : sc\extent\height = nvcClipH
   vkCmdSetScissor(nvcCommand, 0, 1, @sc)
+  vkCmdBindDescriptorSets(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipelineLayout, 0, 1, @setHandle, 0, 0)
   nvcTint(colour, @push[0])
   vkCmdPushConstants(nvcCommand, nvcPipelineLayout, #VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, @push[0])
   vkCmdDraw(nvcCommand, count, 1, first, 0)
   nvcDrawCount = nvcDrawCount + 1
   ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i nvcDraw(first.i, count.i, colour.i)
+  ProcedureReturn nvcDrawSet(first, count, colour, nvcDescriptorSet)
 EndProcedure
 
 ; Shared source-rectangle, destination-size and tint path for the legacy slot
@@ -1414,6 +1684,28 @@ Procedure.i NeonVkChromeSpriteDraw(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW
   If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
   If nvcSpriteSource[id] = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   ProcedureReturn nvcSpriteRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id])
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteDraw(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+  Define first.i, u0.i, u1.i, v0.i, v1.i
+  If nvcInFrame = 0 Or nvcImageSpriteSet = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If sourceX >= nvcImageSpriteW Or sourceY >= nvcImageSpriteH Or sourceW > nvcImageSpriteW - sourceX Or sourceH > nvcImageSpriteH - sourceY
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  u0 = neon_F32Ratio(sourceX, nvcImageSpriteW) : u1 = neon_F32Ratio(sourceX + sourceW, nvcImageSpriteW)
+  v0 = neon_F32Ratio(sourceY, nvcImageSpriteH) : v1 = neon_F32Ratio(sourceY + sourceH, nvcImageSpriteH)
+  first = nvcVertices
+  nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn nvcDrawSet(first, 6, colour, nvcImageSpriteSet)
 EndProcedure
 
 ; `x,y` and `drawW,drawH` are Neon's pre-camera top-left and scaled size.
@@ -2449,6 +2741,7 @@ EndProcedure
 
 Procedure NeonVkChromeDestroy()
   Define cmd.i
+  Define idleRc.i
   nvdWsiRollback()
   nvdPresentClear()
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
@@ -2462,7 +2755,15 @@ Procedure NeonVkChromeDestroy()
   nvcMapped = 0 : nvcInFrame = 0 : nvcReady = 0
   nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
   If nvcDevice <> 0
-    vkDeviceWaitIdle(nvcDevice)
+    idleRc = vkDeviceWaitIdle(nvcDevice)
+    If idleRc <> #VK_SUCCESS
+      nvcFail(idleRc)
+      ProcedureReturn
+    EndIf
+    If nvcImageSpritePendingStage <> 0 : vkDestroyBuffer(nvcDevice, nvcImageSpritePendingStage, 0) : EndIf
+    If nvcImageSpritePendingStageMemory <> 0 : vkFreeMemory(nvcDevice, nvcImageSpritePendingStageMemory, 0) : EndIf
+    nvcImageSpriteRelease(nvcImageSpritePendingSet, nvcImageSpritePendingView, nvcImageSpritePendingImage, nvcImageSpritePendingMemory)
+    nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
     If nvcPipeline <> 0 : vkDestroyPipeline(nvcDevice, nvcPipeline, 0) : EndIf
     If nvcPipelineLayout <> 0 : vkDestroyPipelineLayout(nvcDevice, nvcPipelineLayout, 0) : EndIf
     If nvcDescriptorPool <> 0 : vkDestroyDescriptorPool(nvcDevice, nvcDescriptorPool, 0) : EndIf
@@ -2488,6 +2789,10 @@ Procedure NeonVkChromeDestroy()
   EndIf
   nvcCommand = 0 : nvcFence = 0 : nvcPipeline = 0 : nvcPipelineLayout = 0
   nvcDescriptorSet = 0 : nvcDescriptorPool = 0 : nvcSetLayout = 0
+  nvcImageSpriteSet = 0 : nvcImageSpriteView = 0 : nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
+  nvcImageSpriteW = 0 : nvcImageSpriteH = 0 : nvcImageSpriteGeneration = 0
+  nvcImageSpritePendingImage = 0 : nvcImageSpritePendingMemory = 0 : nvcImageSpritePendingView = 0 : nvcImageSpritePendingSet = 0
+  nvcImageSpritePendingStage = 0 : nvcImageSpritePendingStageMemory = 0
   nvcSampler = 0 : nvcAtlasView = 0 : nvcAtlasImage = 0 : nvcAtlasMemory = 0
   nvcUploadBuffer = 0 : nvcUploadMemory = 0
   nvcUniformBuffer = 0 : nvcUniformMemory = 0 : nvcVertexBuffer = 0 : nvcVertexMemory = 0

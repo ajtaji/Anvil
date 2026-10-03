@@ -1,0 +1,328 @@
+; Returning Pi 4 proof for one independently owned sampled sprite image.
+; Run only under Anvil's armed deadman. No boot or storage writes.
+; Build with --entry-returns. x0 returns global_nmsreport from the NEW .sym.
+; Read exactly 192 report bytes; the payload checks its own pixel oracle.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+
+#NMS_SIZE         = 64
+#NMS_ARENA        = $0A000000
+#NMS_ARENA_BYTES  = $01000000
+#NMS_SURFACE      = $06000000
+#NMS_WINDOW       = $063E8000
+#NMS_WINDOW_BYTES = $00C00000
+#NMS_MAGIC        = $4D534E56
+
+Global Dim nmsReport.l[48]
+Global Dim nmsPixels.a[16]
+Global Dim nmsPixelsA.a[16]
+Global Dim nmsPixelsB.a[16]
+Global Dim nmsWide.a[1912]
+Global Dim nmsLarge.a[491520]
+Global Dim nmsRejectPixels.a[4194303]
+Global Dim nmsClear.l[4]
+Global nmsInstance.i, nmsDevice.i, nmsPool.i, nmsImage.i, nmsMemory.i
+Global nmsView.i, nmsPass.i, nmsFrame.i, nmsAdapter.i, nmsNeon.i
+
+Procedure nmsCleanup()
+  If nmsAdapter <> 0 : NeonVkChromeDestroy() : EndIf
+  NeonVkChromeSpriteSource(0, 0, 0)
+  NeonVkChromeSpriteRegister(1, 0, 0, 0)
+  NeonVkChromeSpriteRegister(2, 0, 0, 0)
+  NeonVkChromeSpriteRegister(11, 0, 0, 0)
+  If nmsDevice <> 0 : vkDeviceWaitIdle(nmsDevice) : EndIf
+  If nmsFrame <> 0 : vkDestroyFramebuffer(nmsDevice, nmsFrame, 0) : EndIf
+  If nmsPass <> 0 : vkDestroyRenderPass(nmsDevice, nmsPass, 0) : EndIf
+  If nmsView <> 0 : vkDestroyImageView(nmsDevice, nmsView, 0) : EndIf
+  If nmsImage <> 0 : vkDestroyImage(nmsDevice, nmsImage, 0) : EndIf
+  If nmsMemory <> 0 : vkFreeMemory(nmsDevice, nmsMemory, 0) : EndIf
+  If nmsPool <> 0 : vkDestroyCommandPool(nmsDevice, nmsPool, 0) : EndIf
+  If nmsDevice <> 0 : vkDestroyDevice(nmsDevice, 0) : EndIf
+  If nmsInstance <> 0 : vkDestroyInstance(nmsInstance, 0) : EndIf
+  If nmsNeon <> 0 : NeonShutdown() : EndIf
+EndProcedure
+
+Procedure.i nmsReturn(status.i)
+  nmsReport[1] = status
+  nmsReport[13] = AnvilVkFaultCount()
+  nmsReport[14] = AnvilVkFaultText()
+  nmsCleanup()
+  ProcedureReturn @nmsReport[0]
+EndProcedure
+
+Procedure.i nmsPixel(base.i, pitch.i, x.i, y.i)
+  ProcedureReturn PeekL(base + y * pitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i nmsWord(slot.i)
+  ProcedureReturn nmsReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, count.i, phys.i, queue.i, base.i, pitch.i, green.i
+  Define residentImage.i, residentMemory.i, residentView.i, residentSet.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+  Define priority.l
+
+  nmsReport[0] = #NMS_MAGIC
+  nmsReport[15] = #NMS_MAGIC
+  nmsReport[31] = #NMS_MAGIC
+  nmsReport[47] = #NMS_MAGIC
+  ; Top row: opaque red, half-alpha green. Bottom row: invisible blue,
+  ; opaque white. Explicit bytes avoid image-decoder and host pixel layouts.
+  nmsPixels[0] = 255 : nmsPixels[1] = 0 : nmsPixels[2] = 0 : nmsPixels[3] = 255
+  nmsPixels[4] = 0 : nmsPixels[5] = 255 : nmsPixels[6] = 0 : nmsPixels[7] = 128
+  nmsPixels[8] = 0 : nmsPixels[9] = 0 : nmsPixels[10] = 255 : nmsPixels[11] = 0
+  nmsPixels[12] = 255 : nmsPixels[13] = 255 : nmsPixels[14] = 255 : nmsPixels[15] = 255
+  nmsPixelsA[0] = 255 : nmsPixelsA[1] = 0 : nmsPixelsA[2] = 0 : nmsPixelsA[3] = 255
+  nmsPixelsA[4] = 0 : nmsPixelsA[5] = 255 : nmsPixelsA[6] = 0 : nmsPixelsA[7] = 255
+  nmsPixelsA[8] = 0 : nmsPixelsA[9] = 0 : nmsPixelsA[10] = 255 : nmsPixelsA[11] = 255
+  nmsPixelsA[12] = 255 : nmsPixelsA[13] = 255 : nmsPixelsA[14] = 255 : nmsPixelsA[15] = 255
+  nmsPixelsB[0] = 255 : nmsPixelsB[1] = 255 : nmsPixelsB[2] = 0 : nmsPixelsB[3] = 255
+  nmsPixelsB[4] = 255 : nmsPixelsB[5] = 255 : nmsPixelsB[6] = 255 : nmsPixelsB[7] = 255
+  nmsPixelsB[8] = 255 : nmsPixelsB[9] = 255 : nmsPixelsB[10] = 255 : nmsPixelsB[11] = 255
+  nmsPixelsB[12] = 255 : nmsPixelsB[13] = 255 : nmsPixelsB[14] = 255 : nmsPixelsB[15] = 255
+  nmsClear[0] = 0 : nmsClear[1] = 0 : nmsClear[2] = 0 : nmsClear[3] = $3F800000
+
+  TimerInit()
+  nmsReport[2] = 1
+  If NeonArena(#NMS_ARENA, #NMS_ARENA_BYTES) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  If NeonSurface(#NMS_SURFACE, #NMS_SIZE, #NMS_SIZE, #NMS_SIZE * 4) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  ; The sampled TrueType/sprite atlas is 512x1024 even though this proof's
+  ; attachment is 64x64. Declare that capacity before NeonInit so Vulkan's
+  ; truthful maxImageDimension2D covers the atlas.
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  NeonSurfaceMapSpan($00FE8000)
+  If NeonInit() <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  nmsNeon = 1
+  NeonPalette() : NeonFontDefaults() : NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  NeonAnimReset() : NeonStateReset()
+  rc = AnvilVkV3dWindow(#NMS_WINDOW, #NMS_WINDOW_BYTES)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(2) : EndIf
+
+  nmsReport[2] = 2
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @nmsInstance)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(3) : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(nmsInstance, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or phys = 0 : ProcedureReturn nmsReturn(4) : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @nmsDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(5) : EndIf
+  vkGetDeviceQueue(nmsDevice, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(nmsDevice, @pci, 0, @nmsPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(6) : EndIf
+
+  nmsReport[2] = 3
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NMS_SIZE : imageInfo\extent\height = #NMS_SIZE : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1 : imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nmsDevice, @imageInfo, 0, @nmsImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(7) : EndIf
+  vkGetImageMemoryRequirements(nmsDevice, nmsImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nmsDevice, @alloc, 0, @nmsMemory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(nmsDevice, nmsImage, nmsMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(8) : EndIf
+  base = AnvilVkImageAddress(nmsImage) : pitch = AnvilVkImageRowPitch(nmsImage)
+  If base = 0 Or pitch < #NMS_SIZE * 4 : ProcedureReturn nmsReturn(9) : EndIf
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = nmsImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(nmsDevice, @viewInfo, 0, @nmsView)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(10) : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(nmsDevice, @passInfo, 0, @nmsPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(11) : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = nmsPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @nmsView : frameInfo\width = #NMS_SIZE
+  frameInfo\height = #NMS_SIZE : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(nmsDevice, @frameInfo, 0, @nmsFrame)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(12) : EndIf
+
+  nmsReport[2] = 4
+  rc = NeonVkChromeSpriteRegister(1, @nmsLarge[0], 480, 256)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(28) : EndIf
+  rc = NeonVkChromeSpriteRegister(2, @nmsLarge[0], 480, 256)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(29) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(phys, nmsDevice, queue, nmsPool, nmsPass, nmsFrame, #NMS_SIZE, #NMS_SIZE, 8, 8)
+  nmsReport[24] = rc : nmsReport[25] = nvcCommand : nmsReport[26] = nvcAtlasImage
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY Or nvcCommand <> 0 Or nvcAtlasImage <> 0
+    ProcedureReturn nmsReturn(30)
+  EndIf
+  rc = NeonVkChromeSpriteSource(@nmsPixels[0], 2, 2)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(13) : EndIf
+  rc = NeonVkChromeSpriteRegister(1, @nmsWide[0], 478, 1)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(14) : EndIf
+  rc = NeonVkChromeSpriteRegister(2, @nmsPixelsA[0], 2, 2)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(15) : EndIf
+  rc = NeonVkChromeSpriteRegister(11, @nmsPixelsB[0], 2, 2)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(16) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(phys, nmsDevice, queue, nmsPool, nmsPass, nmsFrame, #NMS_SIZE, #NMS_SIZE, 8, 8)
+  nmsReport[3] = rc
+  If rc <> #VK_SUCCESS
+    nmsReport[4] = nvcCreateStage : nmsReport[5] = nvcCreateFaultCode : nmsReport[6] = nvcCreateFaultText
+    NeonVkChromeDestroy()
+    ProcedureReturn nmsReturn(17)
+  EndIf
+  nmsAdapter = 1
+  nmsReport[9] = nvcSpriteY[2] : nmsReport[10] = nvcSpriteY[11]
+  nmsReport[11] = nvcLogoY
+  If nvcLogoY >= nvcSpriteY[1] Or nvcSpriteY[1] >= nvcSpriteY[2] Or nvcSpriteY[2] <> nvcSpriteY[11]
+    ProcedureReturn nmsReturn(18)
+  EndIf
+  rc = NeonVkChromeSpriteRegister(2, 0, 0, 0)
+  nmsReport[8] = rc
+  If rc <> #NEON_VK_CHROME_ERR_STATE : ProcedureReturn nmsReturn(19) : EndIf
+  rc = NeonVkChromeBegin(@nmsClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(20) : EndIf
+  rc = NeonVkChromeSpriteDraw(17, 0, 0, 0, 0, 1, 1, 1, 1, Neon_RGB(255, 255, 255))
+  nmsReport[7] = rc
+  If rc <> #NEON_VK_CHROME_ERR_ARGS Or NeonVkChromeDrawCount() <> 0 : ProcedureReturn nmsReturn(21) : EndIf
+  rc = NeonVkChromeSprite(4, 4, 0, 0, 2, 2, 8, 8, Neon_RGB(255, 255, 255))
+  If rc = #NEON_VK_CHROME_OK : rc = NeonVkChromeSpriteDraw(2, 20, 4, 1, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255)) : EndIf
+  If rc = #NEON_VK_CHROME_OK : rc = NeonVkChromeSpriteDraw(11, 36, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 128, 255)) : EndIf
+  If rc = #NEON_VK_CHROME_OK : rc = NeonVkChromeSpriteDraw(2, 4, 20, 0, 0, 2, 2, 16, 16, Neon_RGB(255, 255, 255)) : EndIf
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(22) : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(23) : EndIf
+  nmsReport[4] = NeonVkChromeDrawCount() : nmsReport[5] = NeonVkChromeVertexCount()
+  nmsReport[6] = NeonVkChromePresentPending()
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(24) : EndIf
+  nmsReport[2] = 5
+  nmsReport[16] = nmsPixel(base, pitch, 2, 2)
+  nmsReport[17] = nmsPixel(base, pitch, 5, 5)
+  nmsReport[18] = nmsPixel(base, pitch, 21, 5)
+  nmsReport[19] = nmsPixel(base, pitch, 37, 5)
+  nmsReport[20] = nmsPixel(base, pitch, 6, 22)
+  nmsReport[21] = nmsPixel(base, pitch, 14, 22)
+  nmsReport[22] = nmsPixel(base, pitch, 6, 30)
+  nmsReport[23] = nmsPixel(base, pitch, 14, 30)
+  If nmsReport[4] <> 4 Or nmsReport[5] <> 24 Or nmsReport[6] <> 1 : ProcedureReturn nmsReturn(25) : EndIf
+  If nmsWord(16) <> $FF000000 Or nmsWord(17) <> $FFFF0000 Or nmsWord(18) <> $FF00FF00 Or nmsWord(19) <> $FFFF8000
+    ProcedureReturn nmsReturn(26)
+  EndIf
+  If nmsWord(20) <> $FFFF0000 Or nmsWord(21) <> $FF00FF00 Or nmsWord(22) <> $FF0000FF Or nmsWord(23) <> $FFFFFFFF
+    ProcedureReturn nmsReturn(27)
+  EndIf
+
+  nmsReport[2] = 6
+  rc = NeonVkChromeImageSpriteReplace(@nmsPixelsA[0], 2, 2)
+  nmsReport[32] = rc : nmsReport[33] = NeonVkChromeImageSpriteGeneration()
+  If rc <> #NEON_VK_CHROME_OK Or nmsReport[33] <> 1 Or nvcImageSpriteImage = nvcAtlasImage
+    ProcedureReturn nmsReturn(31)
+  EndIf
+  residentImage = nvcImageSpriteImage : residentMemory = nvcImageSpriteMemory
+  residentView = nvcImageSpriteView : residentSet = nvcImageSpriteSet
+  ; Both a replacement image and its staging copy must coexist with the
+  ; resident image, atlas, upload staging and render target. The 12 MiB
+  ; caller window cannot admit this candidate; the source is never read.
+  rc = NeonVkChromeImageSpriteReplace(@nmsRejectPixels[0], 1024, 1024)
+  nmsReport[34] = rc : nmsReport[35] = NeonVkChromeImageSpriteGeneration()
+  nmsReport[36] = avkHeapBytes
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[35] <> 1
+    ProcedureReturn nmsReturn(32)
+  EndIf
+  If nvcImageSpriteImage <> residentImage Or nvcImageSpriteMemory <> residentMemory Or nvcImageSpriteView <> residentView Or nvcImageSpriteSet <> residentSet
+    ProcedureReturn nmsReturn(33)
+  EndIf
+  nmsReport[2] = 7
+  rc = NeonVkChromeBegin(@nmsClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(34) : EndIf
+  rc = NeonVkChromeImageSpriteDraw(4, 40, 0, 0, 2, 2, 16, 16, Neon_RGB(255, 255, 255))
+  If rc = #NEON_VK_CHROME_OK : rc = NeonVkChromeSprite(24, 40, 0, 0, 2, 2, 16, 16, Neon_RGB(255, 255, 255)) : EndIf
+  If rc = #NEON_VK_CHROME_OK : rc = NeonVkChromeImageSpriteDraw(44, 40, 1, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255)) : EndIf
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(35) : EndIf
+  rc = NeonVkChromeEnd()
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(36) : EndIf
+  nmsReport[37] = NeonVkChromeDrawCount() : nmsReport[38] = NeonVkChromeVertexCount()
+  nmsReport[39] = NeonVkChromePresentPending()
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(37) : EndIf
+  nmsReport[40] = nmsPixel(base, pitch, 6, 42)
+  nmsReport[41] = nmsPixel(base, pitch, 14, 42)
+  nmsReport[42] = nmsPixel(base, pitch, 6, 50)
+  nmsReport[43] = nmsPixel(base, pitch, 14, 50)
+  nmsReport[44] = nmsPixel(base, pitch, 26, 42)
+  nmsReport[45] = nmsPixel(base, pitch, 46, 42)
+  If nmsReport[37] <> 3 Or nmsReport[38] <> 18 Or nmsReport[39] <> 1
+    ProcedureReturn nmsReturn(38)
+  EndIf
+  If nmsWord(40) <> $FFFF0000 Or nmsWord(41) <> $FF00FF00 Or nmsWord(42) <> $FF0000FF Or nmsWord(43) <> $FFFFFFFF Or nmsWord(44) <> $FFFF0000 Or nmsWord(45) <> $FF00FF00
+    ProcedureReturn nmsReturn(39)
+  EndIf
+  ; Two successful replacements exercise the unpublished third descriptor
+  ; and reuse the set freed when the prior generation retires.
+  nmsReport[2] = 8
+  rc = NeonVkChromeImageSpriteReplace(@nmsPixelsB[0], 2, 2)
+  nmsReport[27] = rc : nmsReport[28] = NeonVkChromeImageSpriteGeneration()
+  If rc <> #NEON_VK_CHROME_OK Or nmsReport[28] <> 2 : ProcedureReturn nmsReturn(40) : EndIf
+  rc = NeonVkChromeImageSpriteReplace(@nmsPixelsA[0], 2, 2)
+  nmsReport[29] = rc : nmsReport[30] = NeonVkChromeImageSpriteGeneration()
+  If rc <> #NEON_VK_CHROME_OK Or nmsReport[30] <> 3 : ProcedureReturn nmsReturn(41) : EndIf
+  rc = NeonVkChromeBegin(@nmsClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(42) : EndIf
+  rc = NeonVkChromeImageSpriteDraw(4, 40, 1, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(43) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(44) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(45) : EndIf
+  nmsReport[46] = nmsPixel(base, pitch, 6, 42)
+  If nmsWord(46) <> $FF00FF00 : ProcedureReturn nmsReturn(46) : EndIf
+  ProcedureReturn nmsReturn(0)
+EndProcedure

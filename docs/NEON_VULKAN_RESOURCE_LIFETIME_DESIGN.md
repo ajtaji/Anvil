@@ -51,8 +51,25 @@ Before a sprite transaction, the caller must query each
 image's `vkGetImageMemoryRequirements`, include staging and existing resident
 allocations, compare the required bytes with the reported heap size, and
 still treat each allocation result as authoritative because alignment and
-fragmentation can refuse a fit. The table increase alone establishes no
-separate-image sprite render path.
+fragmentation can refuse a fit. `NeonVkChromeImageSpriteReplace` and
+`NeonVkChromeImageSpriteDraw` now provide one separately allocated sampled
+image beside the shared atlas. Replacement keeps the resident handles until
+upload, view creation and descriptor writes succeed. A Pi 4 returning proof
+checks a refused oversized replacement, resident pixels, two successful small
+replacements and descriptor reuse; see
+`docs/evidence/neon-separate-sprite-pi4-20261002/`. Supporting all sixteen
+reserved sprite rows simultaneously remains future work.
+
+A bounded first separate-image path now lives in `neon_vk_chrome.pi4`.
+`NeonVkChromeImageSpriteReplace` copies one RGBA8 source into a separately
+allocated optimal-tiled image through `vkCmdCopyBufferToImage`, then publishes
+its view and descriptor after the upload completes. The prior image remains
+resident until that publication; a capacity refusal releases only candidate
+objects. `NeonVkChromeImageSpriteDraw` binds the image's descriptor for its
+draw, and atlas draws bind the atlas descriptor for theirs. Replace and clear
+require a quiescent frame and consumed present intent. This path has one
+resident sprite slot; the larger object tables do not yet provide a public
+sixteen-sprite registry.
 
 # Atlas generations
 
