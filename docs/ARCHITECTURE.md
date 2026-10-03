@@ -34,15 +34,14 @@ entry gaps. A lower-level path remains a gap, not an approved exception:
 | Board | Observed source entry path | Status under this rule |
 |---|---|---|
 | Raspberry Pi 3 | The custom Pi 3 stub remains at EL3; the direct monitor captures `x0`, installs EL3 vectors, and refuses a non-EL3 handoff. | Hardware verified on a Pi 3 Model B v1.2 through Build 35: EL3 boot, automatic Wi-Fi/DHCP, TrueType before banner, CRC-checked wireless transfer, and a VideoCore IV offscreen clear. The clear does not establish a Vulkan or scanout backend. |
-| Raspberry Pi 4 | `RaspberryPi4/Board/armstub8.asm` retains EL3 and the monitor verifies EL3 at runtime. The supported card configuration must select the custom `armstub8.bin`; stock-stub EL2 is refused. | EL3 hardware acceptance exists in the historical Build 99 record. Keep the distributed card package and configuration aligned with the required stub before treating a fresh installation as verified. |
-| Rock Pi 4C | Current `RockValidateEntry()` requires non-secure EL2 from U-Boot `booti`; exception and recovery code use EL2 registers. | Experimental port; EL3 entry is pending. Preserve the existing port while replacing the entry contract; no impossibility has been established. |
+| Raspberry Pi 4 | `RaspberryPi4/Board/armstub8.asm` retains EL3 and the monitor verifies EL3 at runtime. The supported card configuration must select the custom `armstub8.bin`; stock-stub EL2 is refused. | EL3 hardware acceptance exists from Build 99 onward. Live build 242 also booted with the resident Vulkan/Neon console, Wi-Fi and saved TrueType settings; the packaged image remains older than this live build. |
+| Rock Pi 4C | The direct-SD BL3X trust image enters Anvil at EL3. `RockPi4C/Board/board.rockpi4c` captures EL3 state, checks the entry contract and initializes timer/UART before display and storage. | Build 147 boots Anvil at EL3 on the original 4C v1.2. HDMI, SD/exFAT and eMMC file operations are documented in `RockPi4C/README.md`; production Vulkan/Mali rendering remains open. The older U-Boot EL2 route is not the current direct-SD path. |
 | Arduino UNO Q | Current board composition is a UEFI application entered at EL1. | Experimental port; EL3 entry is pending. Preserve the existing port while replacing the entry contract; UEFI's current launch level is not evidence that EL3 is impossible. |
+| Raspberry Pi 5 | `RaspberryPi5/Board/armstub8-2712.asm` retains EL3. The shared `RaspberryPi4/Board/board.pi4` composition has BCM2712 branches, links at `$80000` and validates the Pi 5 boot placement. `RaspberryPi5/Boot/board.pi4` is an older serial-only probe. | Hardware boot from commit `f385c7b` reached Anvil's `pmf>` at EL3 with HDMI console, caches and board services. PCIe/RP1 inbound-window adoption blocked USB, storage and Ethernet on that boot; later fixes and GPU work require separate validation. |
 
-The Pi 3 EL3 path is hardware-verified; the Pi 4 has an older hardware
-acceptance record and its current package now selects the required stub. The
-UNO Q and ROCK Pi ports remain experimental and below the required EL3 level.
-Do not resolve either gap by changing the rule or treating current firmware
-behavior as an exception.
+The Pi 3, Pi 4, Pi 5 and ROCK Pi 4C direct-SD EL3 paths have hardware boot
+evidence. UNO Q remains below the required level. Do not resolve that gap by
+changing the rule or treating current firmware behavior as an exception.
 
 ## Layers
 
@@ -54,7 +53,7 @@ behavior as an exception.
 | Filesystems | `Anvil/Storage/*.pbi` | FAT32, exFAT, and the one path and partition layer over them. A board supplies a block reader and writer by pointer and nothing else |
 | File seam | `Anvil/Storage/hwfile.pbi` | The `HwFile*` / `HwDir*` families over those filesystems, for **any** board with a block device. The board sets three values - mounted, writable, and the ranged writer - and writes no file code of its own. A board without a block device answers the same seam differently; the UNO Q does it through UEFI |
 | A/B records | `Anvil/Storage/ab_record.pbi` | The two-slot boot-control record: layout, checksum, state machine and handoff page, driven by two caller-supplied callbacks. No filesystem and no chip in it, so a board reaches its records by name through the shared layer rather than by walking a cluster chain |
-| Graphics experiments | `Anvil/Graphics/Vulkan/*` | Architecture-neutral Vulkan-compatible vocabulary and lifecycle foundation; no production physical device is exposed |
+| Graphics experiments | `Anvil/Graphics/Vulkan/*` | Shared Vulkan object and command layer with a bounded Pi 4 V3D physical device; other board monitor paths have no production Vulkan hardware backend |
 | Pi 4 composition | `RaspberryPi4/Board/*.pi4` | BCM2711 memory map, boot order, HAL implementations, console, storage, display, and board policy |
 | Pi 4 drivers | `RaspberryPi4/Lib/*.pi4` | BCM2711 and attached-device implementations |
 | UNO Q composition | `ArduinoQ/Board/*.unoq` | QCM2290/UEFI memory map, console, file services, and HAL implementations |
