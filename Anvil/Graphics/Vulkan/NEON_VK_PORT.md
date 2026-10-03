@@ -152,11 +152,13 @@ compute or assume a board-specific GPU address mapping.
 On Pi 4, the opt-in `neon_vk_particle_csd.pi4` module uses that seam to write
 Chrome-format particle vertices directly into a live Vulkan buffer. Its
 32-particle correctness and 10,000-particle profile reports are under
-`docs/evidence/neon-particle-csd-module-pi4-20261003/` and
-`docs/evidence/neon-particle-csd-module-10k-pi4-20261003/`. A matched
-10,000-particle comparison found a 724,647 µs median CSD frame versus
-589,087 µs for CPU expansion on Pi 4 build 244. CPU record staging makes the
-current CSD route slower, so the default Chrome path remains CPU-expanded.
+`docs/evidence/neon-particle-csd-module-fast-pi4-20261003/` and
+`docs/evidence/neon-particle-matched-csd-fast-pi4-20261003/`. With the
+axis-aligned staging fast path, two matched 10,000-particle comparisons on
+Pi 4 build 244 measured CSD medians of 553,604 and 553,626 µs versus CPU
+medians of 589,087 and 588,397 µs. The roughly 35 ms gain applies to this
+static-color offscreen workload; it is still far above a 60 Hz frame budget.
+The CSD route stays opt-in, and the default Chrome path remains CPU-expanded.
 The producer is board-specific; the Chrome seam and default renderer remain
 available without it.
 

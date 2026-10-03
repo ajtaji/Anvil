@@ -324,6 +324,7 @@ EndProcedure
 ; palette pixels. Pad to a full 16-lane group so every TMU read is defined.
 Procedure.i nvpcStageRecords(count.i)
   Define i.i, c.i, p.i, xb.i, yb.i, mapped.i, rc.i, padded.i
+  Define xb0.i, xb1.i, yb0.i, yb2.i
   Define *corners.NvcParticleCorners
   rc = vkMapMemory(nvpcDevice, nvpcInputMemory, 0, nvpcInputBytes, 0, @mapped)
   nvpcLastVulkan = rc
@@ -339,10 +340,20 @@ Procedure.i nvpcStageRecords(count.i)
       Else
         *corners = @nvcParticleCornersB[i]
       EndIf
-      For c = 0 To 3
-        nvcParticleCornerBits(PeekI(*corners + c * 2 * SizeOf(.i)), PeekI(*corners + (c * 2 + 1) * SizeOf(.i)), @xb, @yb)
-        PokeL(p + c * 8, xb) : PokeL(p + c * 8 + 4, yb)
-      Next
+      ; Reuse the exact axis-aligned Chrome fast path: two X/two Y clips.
+      If nvcRotation = 0 And nvcParticleItems[i]\angleQ16 = 0 And (nvcParticleItems[i]\ignoreCamera <> 0 Or nvcParticleItems[i]\zoomQ16 = 65536)
+        xb0 = nvcParticleClipXBits(*corners\x0) : xb1 = nvcParticleClipXBits(*corners\x1)
+        yb0 = nvcParticleClipYBits(*corners\y0) : yb2 = nvcParticleClipYBits(*corners\y2)
+        PokeL(p + 0, xb0) : PokeL(p + 4, yb0)
+        PokeL(p + 8, xb1) : PokeL(p + 12, yb0)
+        PokeL(p + 16, xb0) : PokeL(p + 20, yb2)
+        PokeL(p + 24, xb1) : PokeL(p + 28, yb2)
+      Else
+        For c = 0 To 3
+          nvcParticleCornerBits(PeekI(*corners + c * 2 * SizeOf(.i)), PeekI(*corners + (c * 2 + 1) * SizeOf(.i)), @xb, @yb)
+          PokeL(p + c * 8, xb) : PokeL(p + c * 8 + 4, yb)
+        Next
+      EndIf
       PokeL(p + 32, nvcParticleU[i % #NVC_PARTICLE_PALETTE_W])
       PokeL(p + 36, nvcParticleV[i / #NVC_PARTICLE_PALETTE_W])
     Else
