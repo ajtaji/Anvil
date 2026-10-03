@@ -82,6 +82,17 @@ Evidence is in
 `docs/evidence/neon-sprite-bgra-pi4-20261003/`, and
 `docs/evidence/neon-multi-image-pi4-20261003/`.
 
+The Pi 4 Neon adapter's TrueType cache lookup now uses a bounded 1,024-slot
+index over at most 512 cached glyphs, with full font slot, generation, pixel
+height and glyph identity checks. A returning RAM diagnostic on resident build
+242 passed a deliberately colliding 512-key lookup, miss, full-table refusal,
+reset and teardown oracle. The unchanged sixteen-image atlas/GPU pixel proof
+also passed after recompilation against the indexed adapter. These checks do
+not re-prove real TrueType glyph raster pixels or show a measured frame-rate
+gain. See `docs/evidence/neon-tt-index-pi4-20261003/`. The updated full Pi 4
+monitor desk-compiles but is not installed; the current monitor remains build
+242.
+
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
