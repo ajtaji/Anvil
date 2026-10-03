@@ -273,15 +273,14 @@ recorded two new V3D bin jobs, two render jobs, one completed display DMA
 operation, and fresh capture 36. Evidence is in
 `runs/vulkan-cache-triangle-20260926/dma2/`.
 
-The resident Pi 4 Vulkan console previously copied the finished V3D raster
-to scanout row by row on the CPU. Its HDMI and DSI frame paths now submit
-bounded two-dimensional DMA transfers instead. HDMI retains its banner and
-keyboard band by excluding those rows; DSI retains its established physical
-banner/keyboard restore and front-buffer present. A refused DMA transfer
-causes a Vulkan present failure and renderer failover rather than silently
-continuing the Vulkan tier with a CPU frame copy. The normal Pi 4 image and
-Vulkan backend gate compile this path, but this monitor image has not yet
-been booted and its live frame rate has not been measured.
+The Pi 4 Vulkan console once copied its finished V3D raster to scanout row by
+row on the CPU and retained separately painted banner and keyboard bands.
+The current console renders its banner, text, cursor and keyboard in the
+Vulkan/Neon frame, then presents the complete image through bounded display
+DMA. A refused transfer causes Vulkan presentation failure and renderer
+failover rather than a silent CPU copy within the Vulkan tier. Build 242 has
+booted with this renderer selected and reached a prompt over Wi-Fi; that boot
+does not establish a measured live frame rate or every display-mode path.
 
 ### The implemented public entry points
 
