@@ -60,14 +60,19 @@ proofs on resident build 242 verified the original image replacement path,
 including odd-width half-alpha BGRA pixels. A further RAM proof drew the atlas
 and separate IDs 1 and 16 together, verified both slots' pixels and handles
 after an oversized replacement refusal, replaced ID 16 without changing ID 1,
-and checked clear and repeated teardown. Only two simultaneous image IDs have
-been tested on Pi 4 silicon; all 16 have not been loaded at once. Indexed
+and checked clear and repeated teardown. A further Pi 4 RAM proof loaded all
+16 separate IDs simultaneously as small distinct BGRA images beside the atlas,
+checked pairwise-distinct live image and descriptor handles, drew all 16 in
+one ordered frame, refused invalid ID 17, matched every output pixel and
+verified teardown. This proves the 1×1 shape, not aggregate capacity for
+large images. Indexed
 separate-image drawing now uses the same rotation, camera, zoom, crop and tint
 geometry as atlas sprites, while binding each image's descriptor. A Pi 4 RAM
 proof checked rotated ID 16 quadrants, a cropped/tinted camera-zoomed draw,
 atlas and ID 1 coexistence, and extreme-coordinate refusal before draw-record
 mutation. The original atlas transform passed its full pixel-oracle regression.
-See `docs/evidence/neon-multi-image-transform-pi4-20261003/`. Other boards have
+See `docs/evidence/neon-multi-image-transform-pi4-20261003/` and
+`docs/evidence/neon-sixteen-images-pi4-20261003/`. Other boards have
 no hardware proof for this path. The full Pi 4 monitor desk-compiles with this
 source but has not been installed; its image reaches `$70094F`. A future RAM
 payload at `$700000` would overlap it. Use the running monitor's `map` output
