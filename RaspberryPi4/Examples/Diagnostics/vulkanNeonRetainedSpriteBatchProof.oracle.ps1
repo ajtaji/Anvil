@@ -7,11 +7,12 @@ if ($words[1] -ne 0) {
     throw ('Payload stopped at stage {0}, status {1}, Vulkan fault count {2}, text 0x{3:X8}.' -f $words[2], $words[1], $words[13], $words[14])
 }
 $checks = @{
-    0 = 0x4D42524E; 1 = 0; 2 = 9; 3 = 0; 4 = 0; 5 = 0; 6 = 1
+    0 = 0x4D42524E; 1 = 0; 2 = 10; 3 = 0; 4 = 0; 5 = 0; 6 = 1
     7 = 4; 8 = 24; 9 = 0xFFFF0000; 10 = 0xFF0000FF; 12 = 0
     13 = 0; 14 = 0; 15 = 0x4D42524E; 16 = 0; 17 = 1
     21 = 1; 22 = 6; 24 = 2; 25 = 12; 27 = 1; 28 = 6
-    29 = 0; 30 = 0
+    29 = 0; 30 = 0; 31 = 128; 32 = 128; 33 = 1; 35 = 128
+    36 = 128; 37 = 0; 38 = 1
 }
 foreach ($slot in $checks.Keys) {
     $expected = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$checks[$slot]), 0)
@@ -20,13 +21,13 @@ foreach ($slot in $checks.Keys) {
     }
 }
 if ($words[18] -eq 0) { throw 'Retained source image handles changed before repeat submission.' }
-$refusals = @{ 19 = -21201; 20 = -21201; 23 = -21203; 26 = -21202 }
+$refusals = @{ 19 = -21201; 20 = -21201; 23 = -21203; 26 = -21202; 34 = -21203 }
 foreach ($slot in $refusals.Keys) {
     if ([BitConverter]::ToInt32($bytes, [int]$slot * 4) -ne $refusals[$slot]) {
         throw "Report[$slot] was not the expected refusal."
     }
 }
-foreach ($slot in @(11) + @(31..63)) {
+foreach ($slot in @(11) + @(39..63)) {
     if ($words[$slot] -ne 0) { throw "Reserved report[$slot] is nonzero." }
 }
-Write-Output 'Retained sprite-batch proof passed: atomic ordered append, direct-draw pixel parity, repeat-frame reuse, clip/transform/tint, capacity and stale-source refusals, teardown.'
+Write-Output 'Retained sprite-batch proof passed: atomic ordered append, direct-draw pixel parity, repeat-frame reuse, clip/transform/tint, 128-record boundary, capacity and stale-source refusals, teardown.'

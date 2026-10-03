@@ -321,6 +321,28 @@ Procedure.i Main()
   nmsReport[26] = NeonVkChromeSpriteBatchEnd()
   nmsReport[27] = nvcDrawCount : nmsReport[28] = nvcVertices
   If nmsReport[26] <> #NEON_VK_CHROME_ERR_STATE Or nmsReport[27] <> 1 Or nmsReport[28] <> 6 : ProcedureReturn nmsReturn(67) : EndIf
+
+  ; Bracket dimensions are element counts: prove the last of 128 records is
+  ; addressable, then refuse the 129th before indexing the retained array.
+  nmsReport[2] = 10
+  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(71) : EndIf
+  For j = 1 To 128
+    rc = NeonVkChromeSpriteBatchAdd(1, j, 2, 0, 0, 1, 1, 1, 1, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(72) : EndIf
+  Next
+  nmsReport[31] = nvcRetainedBatchCount
+  nmsReport[32] = nvcRetainedItems[127]\x
+  nmsReport[33] = nvcRetainedItems[127]\id
+  nmsReport[34] = NeonVkChromeSpriteBatchAdd(1, 129, 2, 0, 0, 1, 1, 1, 1, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1)
+  nmsReport[35] = nvcRetainedBatchCount
+  nmsReport[36] = nvcRetainedItems[127]\x
+  If nmsReport[31] <> 128 Or nmsReport[32] <> 128 Or nmsReport[33] <> 1 Or nmsReport[34] <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[35] <> 128 Or nmsReport[36] <> 128
+    ProcedureReturn nmsReturn(73)
+  EndIf
+  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(74) : EndIf
+  nmsReport[37] = NeonVkChromeSpriteBatchEnd()
+  nmsReport[38] = nvcDrawCount
+  If nmsReport[37] <> #NEON_VK_CHROME_OK Or nmsReport[38] <> 1 Or nvcRetainedBatchCount <> 0 : ProcedureReturn nmsReturn(75) : EndIf
   If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(68) : EndIf
   If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(69) : EndIf
   NeonVkChromeDestroy() : nmsAdapter = 0
