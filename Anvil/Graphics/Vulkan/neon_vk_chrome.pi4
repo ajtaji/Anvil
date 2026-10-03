@@ -28,6 +28,11 @@
 #NEON_VK_CHROME_MAX_PATH_POINTS = 4096
 #NEON_VK_CHROME_WAIT_NS        = 2000000000
 #NEON_VK_CHROME_F_ONE          = $3F800000
+#NVC_SPRITE_Q8_LIMIT           = 1500000
+#NVC_SPRITE_TAU_Q16            = 411775
+#NVC_SPRITE_PI_Q16             = 205887
+#NVC_SPRITE_HALF_PI_Q16        = 102944
+#NVC_SPRITE_MAX_ANGLE_Q16      = 6588400 ; sixteen signed turns
 #NEON_VK_CHROME_TT_ATLAS_W     = 512
 ; Keep the image and persistent staging buffer within the shared 16 MiB
 ; Vulkan heap alongside renderer targets, vertices, and backend state. A
@@ -123,6 +128,8 @@ Global nvcLogoH.i
 Global nvcLogoChannels.i
 Global nvcLogoY.i
 Global nvcTTLimitY.i
+Global nvcSpriteAtanReady.i
+Global Dim nvcSpriteAtanQ16.i[16]
 ; Preserve the first failing create boundary before rollback can replace the
 ; Vulkan fault with a secondary cleanup diagnostic.
 Global nvcCreateStage.i
@@ -1135,6 +1142,72 @@ Procedure nvcQuad(first.i, x0.i, y0.i, x1.i, y1.i, u0.i, v0.i, u1.i, v1.i)
   nvcVertex(first + 5, x1, y0, u1, v0)
 EndProcedure
 
+; Neon's DrawGLSprite rotates around the centre after camera translation and
+; zoom. Q8 positions retain subpixel corners without changing the monitor's
+; floating-point mode; the Vulkan vertex format stays float32.
+Procedure nvcSpriteVertexQ8(index.i, xQ8.i, yQ8.i, u.i, v.i)
+  Define p.i, txQ8.i, tyQ8.i
+  If nvcRotation = 90
+    txQ8 = nvcLogicalH * 256 - yQ8 : tyQ8 = xQ8
+  ElseIf nvcRotation = 180
+    txQ8 = nvcLogicalW * 256 - xQ8 : tyQ8 = nvcLogicalH * 256 - yQ8
+  ElseIf nvcRotation = 270
+    txQ8 = yQ8 : tyQ8 = nvcLogicalW * 256 - xQ8
+  Else
+    txQ8 = xQ8 : tyQ8 = yQ8
+  EndIf
+  p = nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
+  PokeL(p + 0, neon_F32Ratio(txQ8 * 2 - nvcPhysicalW * 256, nvcPhysicalW * 256))
+  PokeL(p + 4, neon_F32Ratio(tyQ8 * 2 - nvcPhysicalH * 256, nvcPhysicalH * 256))
+  PokeL(p + 8, u) : PokeL(p + 12, v)
+  PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+EndProcedure
+
+; Sixteen CORDIC steps resolve the radians argument to Q16 sine/cosine.
+; Its constants are round(atan(2^-step) * 65536); 39797 is the inverse
+; cumulative CORDIC gain in Q16. The range reduction preserves signed turns.
+Procedure nvcSpriteTrigQ16(angleQ16.i, *cosQ16, *sinQ16)
+  Define z.i, x.i, y.i, nextX.i, nextY.i, i.i, divisor.i, flipCos.i
+  If nvcSpriteAtanReady = 0
+    nvcSpriteAtanQ16[0] = 51472 : nvcSpriteAtanQ16[1] = 30386
+    nvcSpriteAtanQ16[2] = 16055 : nvcSpriteAtanQ16[3] = 8150
+    nvcSpriteAtanQ16[4] = 4091 : nvcSpriteAtanQ16[5] = 2047
+    nvcSpriteAtanQ16[6] = 1024 : nvcSpriteAtanQ16[7] = 512
+    nvcSpriteAtanQ16[8] = 256 : nvcSpriteAtanQ16[9] = 128
+    nvcSpriteAtanQ16[10] = 64 : nvcSpriteAtanQ16[11] = 32
+    nvcSpriteAtanQ16[12] = 16 : nvcSpriteAtanQ16[13] = 8
+    nvcSpriteAtanQ16[14] = 4 : nvcSpriteAtanQ16[15] = 2
+    nvcSpriteAtanReady = 1
+  EndIf
+  z = angleQ16 - (angleQ16 / #NVC_SPRITE_TAU_Q16) * #NVC_SPRITE_TAU_Q16
+  If z > #NVC_SPRITE_PI_Q16 : z = z - #NVC_SPRITE_TAU_Q16 : EndIf
+  If z < -#NVC_SPRITE_PI_Q16 : z = z + #NVC_SPRITE_TAU_Q16 : EndIf
+  If z > #NVC_SPRITE_HALF_PI_Q16
+    z = #NVC_SPRITE_PI_Q16 - z : flipCos = 1
+  ElseIf z < -#NVC_SPRITE_HALF_PI_Q16
+    z = -#NVC_SPRITE_PI_Q16 - z : flipCos = 1
+  EndIf
+  x = 39797 : y = 0
+  For i = 0 To 15
+    divisor = 1 << i
+    If z >= 0
+      nextX = x - y / divisor : nextY = y + x / divisor
+      z = z - nvcSpriteAtanQ16[i]
+    Else
+      nextX = x + y / divisor : nextY = y - x / divisor
+      z = z + nvcSpriteAtanQ16[i]
+    EndIf
+    x = nextX : y = nextY
+  Next
+  If flipCos <> 0 : x = -x : EndIf
+  PokeI(*cosQ16, x) : PokeI(*sinQ16, y)
+EndProcedure
+
+Procedure nvcSpriteCornerQ8(centerXQ8.i, centerYQ8.i, localXQ8.i, localYQ8.i, cosQ16.i, sinQ16.i, *xQ8, *yQ8)
+  PokeI(*xQ8, centerXQ8 + (localXQ8 * cosQ16 - localYQ8 * sinQ16) / 65536)
+  PokeI(*yQ8, centerYQ8 + (localXQ8 * sinQ16 + localYQ8 * cosQ16) / 65536)
+EndProcedure
+
 ; The public Vulkan pipeline is triangle-list only. These helpers lower solid
 ; fan triangles and one-pixel line quads through the atlas's owned white texel;
 ; no native Neon/V3D record or CPU framebuffer path is reachable here.
@@ -1248,6 +1321,78 @@ Procedure.i NeonVkChromeSprite(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, source
   v0 = neon_F32Ratio(nvcLogoY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + sourceY + sourceH, nvcAtlasH)
   first = nvcVertices
   nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn nvcDraw(first, 6, colour)
+EndProcedure
+
+; `x,y` and `drawW,drawH` are Neon's pre-camera top-left and scaled size.
+; Camera coordinates are in the same logical canvas. A positive Q16 radian
+; angle rotates clockwise on the screen, as in DrawGLSprite. `zoomQ16=65536`
+; is 1.0. This records vertices only; V3D samples/blends the image.
+Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  Define xQ8.i, yQ8.i, wQ8.i, hQ8.i, centerXQ8.i, centerYQ8.i
+  Define halfWQ8.i, halfHQ8.i, cosQ16.i, sinQ16.i, first.i
+  Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
+  Define u0.i, u1.i, v0.i, v1.i
+  If nvcInFrame = 0 Or nvcLogoSource = 0 Or nvcLogoW < 1 Or nvcLogoH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If sourceX >= nvcLogoW Or sourceY >= nvcLogoH Or sourceW > nvcLogoW - sourceX Or sourceH > nvcLogoH - sourceY
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  ; These input limits precede every fixed-point product and turn reduction.
+  ; They keep all Q8 and Q16 intermediates in signed 64-bit range.
+  If x < -16384 Or x > 16384 Or y < -16384 Or y > 16384
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If drawW > 4096 Or drawH > 4096 Or angleQ16 < -#NVC_SPRITE_MAX_ANGLE_Q16 Or angleQ16 > #NVC_SPRITE_MAX_ANGLE_Q16
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If nvcLogicalW < 1 Or nvcLogicalH < 1 Or nvcLogicalW > 8192 Or nvcLogicalH > 8192 Or nvcPhysicalW < 1 Or nvcPhysicalH < 1 Or nvcPhysicalW > 8192 Or nvcPhysicalH > 8192
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If ignoreCamera = 0
+    If cameraX < -16384 Or cameraX > 16384 Or cameraY < -16384 Or cameraY > 16384 Or zoomQ16 < 1 Or zoomQ16 > 1048576
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+  EndIf
+  If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  xQ8 = x * 256 : yQ8 = y * 256
+  wQ8 = drawW * 256 : hQ8 = drawH * 256
+  If ignoreCamera = 0
+    centerXQ8 = nvcLogicalW * 128 : centerYQ8 = nvcLogicalH * 128
+    xQ8 = centerXQ8 + ((xQ8 - cameraX * 256 - centerXQ8) * zoomQ16) / 65536
+    yQ8 = centerYQ8 + ((yQ8 - cameraY * 256 - centerYQ8) * zoomQ16) / 65536
+    wQ8 = (wQ8 * zoomQ16) / 65536 : hQ8 = (hQ8 * zoomQ16) / 65536
+  EndIf
+  If wQ8 < 1 Or hQ8 < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  halfWQ8 = wQ8 / 2 : halfHQ8 = hQ8 / 2
+  centerXQ8 = xQ8 + halfWQ8 : centerYQ8 = yQ8 + halfHQ8
+  nvcSpriteTrigQ16(angleQ16, @cosQ16, @sinQ16)
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, -halfWQ8, -halfHQ8, cosQ16, sinQ16, @tlX, @tlY)
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, halfWQ8, -halfHQ8, cosQ16, sinQ16, @trX, @trY)
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, -halfWQ8, halfHQ8, cosQ16, sinQ16, @blX, @blY)
+  nvcSpriteCornerQ8(centerXQ8, centerYQ8, halfWQ8, halfHQ8, cosQ16, sinQ16, @brX, @brY)
+  If tlX < -#NVC_SPRITE_Q8_LIMIT Or tlX > #NVC_SPRITE_Q8_LIMIT Or tlY < -#NVC_SPRITE_Q8_LIMIT Or tlY > #NVC_SPRITE_Q8_LIMIT Or trX < -#NVC_SPRITE_Q8_LIMIT Or trX > #NVC_SPRITE_Q8_LIMIT Or trY < -#NVC_SPRITE_Q8_LIMIT Or trY > #NVC_SPRITE_Q8_LIMIT
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If blX < -#NVC_SPRITE_Q8_LIMIT Or blX > #NVC_SPRITE_Q8_LIMIT Or blY < -#NVC_SPRITE_Q8_LIMIT Or blY > #NVC_SPRITE_Q8_LIMIT Or brX < -#NVC_SPRITE_Q8_LIMIT Or brX > #NVC_SPRITE_Q8_LIMIT Or brY < -#NVC_SPRITE_Q8_LIMIT Or brY > #NVC_SPRITE_Q8_LIMIT
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  u0 = neon_F32Ratio(32 + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(32 + sourceX + sourceW, nvcAtlasW)
+  v0 = neon_F32Ratio(nvcLogoY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + sourceY + sourceH, nvcAtlasH)
+  first = nvcVertices
+  nvcSpriteVertexQ8(first + 0, tlX, tlY, u0, v0)
+  nvcSpriteVertexQ8(first + 1, blX, blY, u0, v1)
+  nvcSpriteVertexQ8(first + 2, brX, brY, u1, v1)
+  nvcSpriteVertexQ8(first + 3, tlX, tlY, u0, v0)
+  nvcSpriteVertexQ8(first + 4, brX, brY, u1, v1)
+  nvcSpriteVertexQ8(first + 5, trX, trY, u1, v0)
   nvcVertices = nvcVertices + 6
   ProcedureReturn nvcDraw(first, 6, colour)
 EndProcedure
