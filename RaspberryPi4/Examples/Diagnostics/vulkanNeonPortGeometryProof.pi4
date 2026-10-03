@@ -1,0 +1,281 @@
+; Returning RAM-only proof for Neon polygon, lines and batch through Pi 4 Vulkan.
+; Uses the same Vulkan target composition and memory ranges as the prepared
+; lifecycle proof. Build with --entry-returns and read the fresh report symbol.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
+
+#NGP_MAGIC = $47504E56
+#NGP_TAIL = $564E5047
+#NGP_W = 64
+#NGP_H = 64
+#NGP_SURFACE = $06000000
+#NGP_SURFACE_PITCH = 3200
+#NGP_WINDOW = $063E8000
+#NGP_WINDOW_BYTES = $00C00000
+#NGP_MAP_SPAN = $00FE8000
+#NGP_ARENA = $0A000000
+#NGP_ARENA_BYTES = $01000000
+
+; 32 little-endian words, 128 bytes, at global_ngpreport in the fresh .sym.
+; [0,31] markers; [1] status; [2] stage; [3..13] route results;
+; [14..16] draw/vertex/present counts; [17..23] sampled BGRA pixels;
+; [24..25] outline/line color counts; [26..27] faults;
+; [28..30] post-cleanup state.
+Global Dim ngpReport.l[32]
+Global Dim ngpPixels.a[4]
+Global Dim ngpLines.f[4]
+Global ngpSprite.NeonVkPortSpriteRef
+Global ngpInst.i, ngpPhys.i, ngpDev.i, ngpQueue.i, ngpPool.i
+Global ngpImage.i, ngpMemory.i, ngpView.i, ngpPass.i, ngpFramebuffer.i
+Global ngpImageBase.i, ngpImagePitch.i
+
+Procedure.i ngpObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If ngpDev <> 0 : rc = vkDeviceWaitIdle(ngpDev) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If ngpFramebuffer <> 0 : vkDestroyFramebuffer(ngpDev, ngpFramebuffer, 0) : ngpFramebuffer = 0 : EndIf
+  If ngpPass <> 0 : vkDestroyRenderPass(ngpDev, ngpPass, 0) : ngpPass = 0 : EndIf
+  If ngpView <> 0 : vkDestroyImageView(ngpDev, ngpView, 0) : ngpView = 0 : EndIf
+  If ngpImage <> 0 : vkDestroyImage(ngpDev, ngpImage, 0) : ngpImage = 0 : EndIf
+  If ngpMemory <> 0 : vkFreeMemory(ngpDev, ngpMemory, 0) : ngpMemory = 0 : EndIf
+  If ngpPool <> 0 : vkDestroyCommandPool(ngpDev, ngpPool, 0) : ngpPool = 0 : EndIf
+  If ngpDev <> 0 : vkDestroyDevice(ngpDev, 0) : ngpDev = 0 : EndIf
+  If ngpInst <> 0 : vkDestroyInstance(ngpInst, 0) : ngpInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpFinish(status.i)
+  ngpReport[1] = status
+  ngpReport[26] = AnvilVkFaultCount()
+  ngpReport[27] = AnvilVkFaultText()
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If nvcInFrame <> 0 : NeonVkChromeDestroy() : EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK : ngpReport[1] = 90 : EndIf
+  ElseIf NeonVkChromeReady() <> 0
+    NeonVkChromeDestroy()
+  EndIf
+  If ngpObjectsDestroy() = 0 : ngpReport[1] = 91 : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK : ngpReport[1] = 92 : EndIf
+  EndIf
+  ngpReport[28] = Neon_Ready()
+  ngpReport[29] = v3d_owner
+  ngpReport[30] = NeonDrawBackendActive() | (NeonLifecycleBackend() << 8)
+  ngpReport[31] = #NGP_TAIL
+  ProcedureReturn @ngpReport[0]
+EndProcedure
+
+Procedure.i ngpObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @ngpInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(ngpInst, @count, @ngpPhys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or ngpPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(ngpPhys, @dci, 0, @ngpDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(ngpDev, 0, 0, @ngpQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(ngpDev, @pci, 0, @ngpPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NGP_W : imageInfo\extent\height = #NGP_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(ngpDev, @imageInfo, 0, @ngpImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(ngpDev, ngpImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(ngpDev, @alloc, 0, @ngpMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(ngpDev, ngpImage, ngpMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ngpImageBase = AnvilVkImageAddress(ngpImage)
+  ngpImagePitch = AnvilVkImageRowPitch(ngpImage)
+  If ngpImageBase = 0 Or ngpImagePitch < (#NGP_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(ngpDev, ngpMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> ngpImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(ngpDev, ngpMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = ngpImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(ngpDev, @viewInfo, 0, @ngpView)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(ngpDev, @passInfo, 0, @ngpPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = ngpPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @ngpView : frameInfo\width = #NGP_W
+  frameInfo\height = #NGP_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(ngpDev, @frameInfo, 0, @ngpFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpPixel(x.i, y.i)
+  ProcedureReturn PeekL(ngpImageBase + y * ngpImagePitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, x.i, y.i, green.i, yellow.i
+  ngpReport[0] = #NGP_MAGIC : ngpReport[31] = #NGP_TAIL
+  ngpPixels[0] = 255 : ngpPixels[1] = 255 : ngpPixels[2] = 255 : ngpPixels[3] = 255
+  ngpLines[0] = 2.0 : ngpLines[1] = 32.0
+  ngpLines[2] = 22.0 : ngpLines[3] = 32.0
+
+  TimerInit()
+  ngpReport[2] = 1
+  If NeonArena(#NGP_ARENA, #NGP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn ngpFinish(1) : EndIf
+  If NeonSurface(#NGP_SURFACE, 800, 1280, #NGP_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn ngpFinish(2) : EndIf
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn ngpFinish(3) : EndIf
+  NeonSurfaceMapSpan(#NGP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn ngpFinish(4) : EndIf
+  NeonPalette() : NeonFontDefaults()
+  If NeonFontUse(?dsp_font8x16, 8, 16, 32, 126) <> #NEON_OK : ProcedureReturn ngpFinish(5) : EndIf
+  NeonAnimReset() : NeonStateReset()
+  If AnvilVkV3dWindow(#NGP_WINDOW, #NGP_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn ngpFinish(6) : EndIf
+
+  ngpReport[2] = 2
+  If ngpObjectsCreate() = 0 : ProcedureReturn ngpFinish(7) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(ngpPhys, ngpDev, ngpQueue, ngpPool, ngpPass, ngpFramebuffer, #NGP_W, #NGP_H, 32, 256)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(8) : EndIf
+  If NeonVkPortCanvas(#NGP_W, #NGP_H, #NGP_W, #NGP_H) <> #NEON_OK : ProcedureReturn ngpFinish(9) : EndIf
+  rc = NeonVkPortSpriteUpload(@ngpSprite, 1, @ngpPixels[0], 1, 1, 0)
+  ngpReport[4] = rc
+  If rc <> 0 : ProcedureReturn ngpFinish(10) : EndIf
+  If NeonVkChromeLifecycleInstallPrepared() <> #NEON_OK : ProcedureReturn ngpFinish(11) : EndIf
+  If NeonInit() <> #NEON_OK Or NeonLifecycleBackend() <> #NEON_BACKEND_EXTERNAL : ProcedureReturn ngpFinish(12) : EndIf
+
+  ngpReport[2] = 3
+  rc = NeonVkPortFrameBegin(0.0, 0.0, 0.0, 1.0)
+  ngpReport[5] = rc
+  If rc <> #NEON_OK : ProcedureReturn ngpFinish(13) : EndIf
+  rc = NeonVkPortPolygon(12.0, 12.0, 8.0, 8.0, 4, 1.0, 0.0, 0.0, 1.0, 1, 1, 1)
+  ngpReport[6] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(14) : EndIf
+  rc = NeonVkPortPolygon(35.0, 12.0, 8.0, 8.0, 4, 0.0, 1.0, 0.0, 1.0, 0, 1, 1)
+  ngpReport[7] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(15) : EndIf
+  rc = NeonVkPortStaticLines(@ngpLines[0], 2, 1.0, 1.0, 0.0, 1.0, 0)
+  ngpReport[8] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(16) : EndIf
+  rc = NeonVkPortSpriteBatchBegin(@ngpSprite)
+  ngpReport[9] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(17) : EndIf
+  rc = NeonVkPortSpriteBatchAdd(32.0, 32.0, 16.0, 16.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1)
+  ngpReport[10] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(18) : EndIf
+  rc = NeonVkPortSpriteBatchAdd(40.0, 40.0, 16.0, 16.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1)
+  ngpReport[11] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(19) : EndIf
+  If NeonVkChromeDrawCount() <> 3 Or NeonVkChromeVertexCount() <> 42 : ProcedureReturn ngpFinish(20) : EndIf
+  rc = NeonVkPortSpriteBatchEnd()
+  ngpReport[12] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(21) : EndIf
+  rc = NeonVkPortFrameEnd()
+  ngpReport[13] = rc
+  If rc <> #NEON_OK : ProcedureReturn ngpFinish(22) : EndIf
+  ngpReport[14] = NeonVkChromeDrawCount()
+  ngpReport[15] = NeonVkChromeVertexCount()
+  ngpReport[16] = NeonVkChromePresentPending()
+  If ngpReport[16] <> 1 : ProcedureReturn ngpFinish(23) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn ngpFinish(24) : EndIf
+
+  ngpReport[2] = 4
+  ngpReport[17] = ngpPixel(0, 0)
+  ngpReport[18] = ngpPixel(14, 10)
+  ngpReport[19] = ngpPixel(35, 12)
+  ngpReport[20] = ngpPixel(24, 32)
+  ngpReport[21] = ngpPixel(36, 36)
+  ngpReport[22] = ngpPixel(44, 44)
+  ngpReport[23] = ngpPixel(60, 60)
+  For y = 3 To 21
+    For x = 26 To 44
+      If ngpPixel(x, y) = $FF00FF00 : green = green + 1 : EndIf
+    Next
+  Next
+  For y = 30 To 34
+    For x = 2 To 22
+      If ngpPixel(x, y) = $FFFFFF00 : yellow = yellow + 1 : EndIf
+    Next
+  Next
+  ngpReport[24] = green : ngpReport[25] = yellow
+  If ngpReport[14] <> 5 Or ngpReport[15] <> 54 : ProcedureReturn ngpFinish(25) : EndIf
+  If (ngpReport[17] & $FFFFFFFF) <> $FF000000 Or (ngpReport[18] & $FFFFFFFF) <> $FFFF0000 : ProcedureReturn ngpFinish(26) : EndIf
+  If (ngpReport[19] & $FFFFFFFF) <> $FF000000 Or (ngpReport[20] & $FFFFFFFF) <> $FF000000 : ProcedureReturn ngpFinish(27) : EndIf
+  If (ngpReport[21] & $FFFFFFFF) <> $FF0000FF Or (ngpReport[22] & $FFFFFFFF) <> $FFFF00FF Or (ngpReport[23] & $FFFFFFFF) <> $FF000000 : ProcedureReturn ngpFinish(28) : EndIf
+  If green < 16 Or green > 96 Or yellow < 8 Or yellow > 40 : ProcedureReturn ngpFinish(29) : EndIf
+  ngpReport[2] = 5
+  ProcedureReturn ngpFinish(0)
+EndProcedure

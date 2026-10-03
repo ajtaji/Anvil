@@ -83,6 +83,15 @@ in this target, so a same-name include would hide required resource and call
 changes. Font slots, uploaded sprite references, and static-line buffers
 must be bound through the Anvil interfaces above.
 
+The Pi 4 hardware frame reports are
+`docs/evidence/neon-vk-port-frame-pi4-20261003/README.md` (box, one glyph,
+cropped sprite) and `docs/evidence/neon-vk-port-geometry-pi4-20261003/README.md`
+(polygon fill/outline, static line, two-sprite batch). These are offscreen
+application-level proofs. The resident Pi 4 console includes Vulkan chrome,
+but does not include this port adapter or a complete Neon-authored application.
+Image/color-key loading, desktop font handles, UI layout/events, viewport
+presentation, and particle API compatibility remain to be ported.
+
 Letterboxed or cropped viewports require their own viewport mapping; these
 adapters assume the full logical target. The default native Neon path and
 compile-time Vulkan backend selection are unchanged.
