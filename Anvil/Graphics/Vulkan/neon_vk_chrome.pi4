@@ -113,8 +113,8 @@ Global nvcDescriptorSet.i
 Global nvcPipelineLayout.i
 Global nvcPipeline.i
 
-; One independent sampled image. Its descriptor uses the same pipeline layout
-; as the atlas but owns a separate image, view and device-memory allocation.
+; Slot 1 keeps the original public image state. Slots 2..16 use identical
+; independent image, view, descriptor and device-memory ownership.
 Global nvcImageSpriteImage.i
 Global nvcImageSpriteMemory.i
 Global nvcImageSpriteView.i
@@ -122,6 +122,13 @@ Global nvcImageSpriteSet.i
 Global nvcImageSpriteW.i
 Global nvcImageSpriteH.i
 Global nvcImageSpriteGeneration.i
+Global Dim nvcImageSpriteImages.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteMemories.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteViews.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteSets.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteWidths.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteHeights.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcImageSpriteGenerations.i[#NVC_MULTI_SPRITE_MAX + 1]
 Global nvcImageSpritePendingImage.i
 Global nvcImageSpritePendingMemory.i
 Global nvcImageSpritePendingView.i
@@ -147,11 +154,11 @@ Global nvcLogoChannels.i
 Global nvcLogoX.i
 Global nvcLogoY.i
 Global nvcTTLimitY.i
-Global Dim nvcSpriteSource.i[#NVC_MULTI_SPRITE_MAX]
-Global Dim nvcSpriteW.i[#NVC_MULTI_SPRITE_MAX]
-Global Dim nvcSpriteH.i[#NVC_MULTI_SPRITE_MAX]
-Global Dim nvcSpriteX.i[#NVC_MULTI_SPRITE_MAX]
-Global Dim nvcSpriteY.i[#NVC_MULTI_SPRITE_MAX]
+Global Dim nvcSpriteSource.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcSpriteW.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcSpriteH.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcSpriteX.i[#NVC_MULTI_SPRITE_MAX + 1]
+Global Dim nvcSpriteY.i[#NVC_MULTI_SPRITE_MAX + 1]
 Global nvcSpriteAtanReady.i
 Global Dim nvcSpriteAtanQ16.i[16]
 ; Preserve the first failing create boundary before rollback can replace the
@@ -949,13 +956,13 @@ Procedure.i nvcDescriptorsAndPipeline()
   dslci\bindingCount = 2 : dslci\pBindings = @bindings[0]
   rc = vkCreateDescriptorSetLayout(nvcDevice, @dslci, 0, @nvcSetLayout)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
-  ; Atlas, resident sprite and unpublished replacement coexist during a
-  ; transaction. Individual sets can be retired after the bounded wait.
-  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = 3
-  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = 3
+  ; Atlas, sixteen resident images and one unpublished replacement may
+  ; coexist. Individual sets retire after the bounded wait.
+  sizes[0]\type = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : sizes[0]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 2
+  sizes[1]\type = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : sizes[1]\descriptorCount = #NVC_MULTI_SPRITE_MAX + 2
   dpci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
   dpci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
-  dpci\maxSets = 3 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
+  dpci\maxSets = #NVC_MULTI_SPRITE_MAX + 2 : dpci\poolSizeCount = 2 : dpci\pPoolSizes = @sizes[0]
   rc = vkCreateDescriptorPool(nvcDevice, @dpci, 0, @nvcDescriptorPool)
   If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   layoutArray = nvcSetLayout
@@ -1124,7 +1131,7 @@ EndProcedure
 ; transaction is active. Old handles remain published until image upload,
 ; view creation and descriptor writes all succeed. Source bytes are copied
 ; during this call and need not remain live afterwards.
-Procedure.i nvcImageSpriteReplace(*pixels, width.i, height.i, sourceBgra.i)
+Procedure.i nvcImageSpriteReplace(id.i, *pixels, width.i, height.i, sourceBgra.i)
   Define ici.VkImageCreateInfo
   Define imageProps.VkImageFormatProperties
   Define imageReq.VkMemoryRequirements
@@ -1142,15 +1149,17 @@ Procedure.i nvcImageSpriteReplace(*pixels, width.i, height.i, sourceBgra.i)
   Define image.i, imageMemory.i, view.i, setHandle.i
   Define stage.i, stageMemory.i, mapped.i, layoutHandle.i
   Define oldImage.i, oldMemory.i, oldView.i, oldSet.i
-  Define pixelBytes.i, x.i, y.i, src.i, dst.i, rc.i
+  Define pixelBytes.i, x.i, y.i, src.i, dst.i, rc.i, generation.i
 
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
   If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If *pixels = 0 Or width < 1 Or height < 1 Or width > 2048 Or height > 2048 Or (sourceBgra <> 0 And sourceBgra <> 1)
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  If nvcImageSpriteGeneration = #NVC_MAX_GENERATION
+  If id = 1 : generation = nvcImageSpriteGeneration : Else : generation = nvcImageSpriteGenerations[id] : EndIf
+  If generation = #NVC_MAX_GENERATION
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   pixelBytes = width * height * 4
@@ -1288,44 +1297,89 @@ Procedure.i nvcImageSpriteReplace(*pixels, width.i, height.i, sourceBgra.i)
     nvcImageSpriteRelease(setHandle, view, image, imageMemory)
     ProcedureReturn nvcFail(rc)
   EndIf
-  oldImage = nvcImageSpriteImage : oldMemory = nvcImageSpriteMemory
-  oldView = nvcImageSpriteView : oldSet = nvcImageSpriteSet
-  nvcImageSpriteImage = image : nvcImageSpriteMemory = imageMemory
-  nvcImageSpriteView = view : nvcImageSpriteSet = setHandle
-  nvcImageSpriteW = width : nvcImageSpriteH = height
-  nvcImageSpriteGeneration = nvcImageSpriteGeneration + 1
+  If id = 1
+    oldImage = nvcImageSpriteImage : oldMemory = nvcImageSpriteMemory
+    oldView = nvcImageSpriteView : oldSet = nvcImageSpriteSet
+    nvcImageSpriteImage = image : nvcImageSpriteMemory = imageMemory
+    nvcImageSpriteView = view : nvcImageSpriteSet = setHandle
+    nvcImageSpriteW = width : nvcImageSpriteH = height
+    nvcImageSpriteGeneration = generation + 1
+  Else
+    oldImage = nvcImageSpriteImages[id] : oldMemory = nvcImageSpriteMemories[id]
+    oldView = nvcImageSpriteViews[id] : oldSet = nvcImageSpriteSets[id]
+    nvcImageSpriteImages[id] = image : nvcImageSpriteMemories[id] = imageMemory
+    nvcImageSpriteViews[id] = view : nvcImageSpriteSets[id] = setHandle
+    nvcImageSpriteWidths[id] = width : nvcImageSpriteHeights[id] = height
+    nvcImageSpriteGenerations[id] = generation + 1
+  EndIf
   nvcImageSpriteRelease(oldSet, oldView, oldImage, oldMemory)
   nvcError = 0
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
-  ProcedureReturn nvcImageSpriteReplace(*rgba, width, height, 0)
+  ProcedureReturn nvcImageSpriteReplace(1, *rgba, width, height, 0)
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteReplaceBGRA(*bgra, width.i, height.i)
-  ProcedureReturn nvcImageSpriteReplace(*bgra, width, height, 1)
+  ProcedureReturn nvcImageSpriteReplace(1, *bgra, width, height, 1)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *rgba, width.i, height.i)
+  ProcedureReturn nvcImageSpriteReplace(id, *rgba, width, height, 0)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *bgra, width.i, height.i)
+  ProcedureReturn nvcImageSpriteReplace(id, *bgra, width, height, 1)
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteGeneration()
   ProcedureReturn nvcImageSpriteGeneration
 EndProcedure
 
-Procedure.i NeonVkChromeImageSpriteClear()
-  Define rc.i
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0 Or nvcImageSpriteGeneration = #NVC_MAX_GENERATION
+Procedure.i NeonVkChromeImageSpriteGenerationId(id.i)
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn -1 : EndIf
+  If id = 1 : ProcedureReturn nvcImageSpriteGeneration : EndIf
+  ProcedureReturn nvcImageSpriteGenerations[id]
+EndProcedure
+
+Procedure.i nvcImageSpriteClear(id.i)
+  Define rc.i, generation.i, setHandle.i
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If id = 1
+    generation = nvcImageSpriteGeneration : setHandle = nvcImageSpriteSet
+  Else
+    generation = nvcImageSpriteGenerations[id] : setHandle = nvcImageSpriteSets[id]
+  EndIf
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0 Or generation = #NVC_MAX_GENERATION
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
-  If nvcImageSpriteSet = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If setHandle = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   rc = vkDeviceWaitIdle(nvcDevice)
   If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
-  nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
-  nvcImageSpriteSet = 0 : nvcImageSpriteView = 0
-  nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
-  nvcImageSpriteW = 0 : nvcImageSpriteH = 0
-  nvcImageSpriteGeneration = nvcImageSpriteGeneration + 1
+  If id = 1
+    nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
+    nvcImageSpriteSet = 0 : nvcImageSpriteView = 0
+    nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
+    nvcImageSpriteW = 0 : nvcImageSpriteH = 0
+    nvcImageSpriteGeneration = generation + 1
+  Else
+    nvcImageSpriteRelease(nvcImageSpriteSets[id], nvcImageSpriteViews[id], nvcImageSpriteImages[id], nvcImageSpriteMemories[id])
+    nvcImageSpriteSets[id] = 0 : nvcImageSpriteViews[id] = 0
+    nvcImageSpriteImages[id] = 0 : nvcImageSpriteMemories[id] = 0
+    nvcImageSpriteWidths[id] = 0 : nvcImageSpriteHeights[id] = 0
+    nvcImageSpriteGenerations[id] = generation + 1
+  EndIf
   nvcError = 0
   ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteClear()
+  ProcedureReturn nvcImageSpriteClear(1)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteClearId(id.i)
+  ProcedureReturn nvcImageSpriteClear(id)
 EndProcedure
 
 Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i, commandPool.i, renderPass.i, framebuffer.i, width.i, height.i, maxDraws.i, maxVertexQuads.i)
@@ -1721,26 +1775,36 @@ Procedure.i NeonVkChromeSpriteDraw(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW
   ProcedureReturn nvcSpriteRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id])
 EndProcedure
 
-Procedure.i NeonVkChromeImageSpriteDraw(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
-  Define first.i, u0.i, u1.i, v0.i, v1.i
-  If nvcInFrame = 0 Or nvcImageSpriteSet = 0
+Procedure.i NeonVkChromeImageSpriteDrawId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+  Define first.i, u0.i, u1.i, v0.i, v1.i, setHandle.i, imageW.i, imageH.i
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If id = 1
+    setHandle = nvcImageSpriteSet : imageW = nvcImageSpriteW : imageH = nvcImageSpriteH
+  Else
+    setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
+  EndIf
+  If nvcInFrame = 0 Or setHandle = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  If sourceX >= nvcImageSpriteW Or sourceY >= nvcImageSpriteH Or sourceW > nvcImageSpriteW - sourceX Or sourceH > nvcImageSpriteH - sourceY
+  If sourceX >= imageW Or sourceY >= imageH Or sourceW > imageW - sourceX Or sourceH > imageH - sourceY
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
   If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
-  u0 = neon_F32Ratio(sourceX, nvcImageSpriteW) : u1 = neon_F32Ratio(sourceX + sourceW, nvcImageSpriteW)
-  v0 = neon_F32Ratio(sourceY, nvcImageSpriteH) : v1 = neon_F32Ratio(sourceY + sourceH, nvcImageSpriteH)
+  u0 = neon_F32Ratio(sourceX, imageW) : u1 = neon_F32Ratio(sourceX + sourceW, imageW)
+  v0 = neon_F32Ratio(sourceY, imageH) : v1 = neon_F32Ratio(sourceY + sourceH, imageH)
   first = nvcVertices
   nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
-  ProcedureReturn nvcDrawSet(first, 6, colour, nvcImageSpriteSet)
+  ProcedureReturn nvcDrawSet(first, 6, colour, setHandle)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteDraw(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
+  ProcedureReturn NeonVkChromeImageSpriteDrawId(1, x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour)
 EndProcedure
 
 ; `x,y` and `drawW,drawH` are Neon's pre-camera top-left and scaled size.
@@ -2775,7 +2839,7 @@ Procedure.i NeonVkChromeEnd()
 EndProcedure
 
 Procedure NeonVkChromeDestroy()
-  Define cmd.i
+  Define cmd.i, slot.i
   Define idleRc.i
   nvdWsiRollback()
   nvdPresentClear()
@@ -2799,6 +2863,9 @@ Procedure NeonVkChromeDestroy()
     If nvcImageSpritePendingStageMemory <> 0 : vkFreeMemory(nvcDevice, nvcImageSpritePendingStageMemory, 0) : EndIf
     nvcImageSpriteRelease(nvcImageSpritePendingSet, nvcImageSpritePendingView, nvcImageSpritePendingImage, nvcImageSpritePendingMemory)
     nvcImageSpriteRelease(nvcImageSpriteSet, nvcImageSpriteView, nvcImageSpriteImage, nvcImageSpriteMemory)
+    For slot = 2 To #NVC_MULTI_SPRITE_MAX
+      nvcImageSpriteRelease(nvcImageSpriteSets[slot], nvcImageSpriteViews[slot], nvcImageSpriteImages[slot], nvcImageSpriteMemories[slot])
+    Next
     If nvcPipeline <> 0 : vkDestroyPipeline(nvcDevice, nvcPipeline, 0) : EndIf
     If nvcPipelineLayout <> 0 : vkDestroyPipelineLayout(nvcDevice, nvcPipelineLayout, 0) : EndIf
     If nvcDescriptorPool <> 0 : vkDestroyDescriptorPool(nvcDevice, nvcDescriptorPool, 0) : EndIf
@@ -2826,6 +2893,12 @@ Procedure NeonVkChromeDestroy()
   nvcDescriptorSet = 0 : nvcDescriptorPool = 0 : nvcSetLayout = 0
   nvcImageSpriteSet = 0 : nvcImageSpriteView = 0 : nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
   nvcImageSpriteW = 0 : nvcImageSpriteH = 0 : nvcImageSpriteGeneration = 0
+  For slot = 2 To #NVC_MULTI_SPRITE_MAX
+    nvcImageSpriteSets[slot] = 0 : nvcImageSpriteViews[slot] = 0
+    nvcImageSpriteImages[slot] = 0 : nvcImageSpriteMemories[slot] = 0
+    nvcImageSpriteWidths[slot] = 0 : nvcImageSpriteHeights[slot] = 0
+    nvcImageSpriteGenerations[slot] = 0
+  Next
   nvcImageSpritePendingImage = 0 : nvcImageSpritePendingMemory = 0 : nvcImageSpritePendingView = 0 : nvcImageSpritePendingSet = 0
   nvcImageSpritePendingStage = 0 : nvcImageSpritePendingStageMemory = 0
   nvcSampler = 0 : nvcAtlasView = 0 : nvcAtlasImage = 0 : nvcAtlasMemory = 0
