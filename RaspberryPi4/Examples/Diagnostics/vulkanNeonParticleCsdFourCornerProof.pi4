@@ -1,0 +1,690 @@
+; Returning RAM-only proof: two CSD groups expand exact Chrome particle
+; corners and palette UVs into a live bound VkBuffer for one Vulkan draw.
+; Arm a 15-second deadman before a board run.
+; Build with --entry-returns at $800000; never run as resident code.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+
+#NGP_MAGIC = $3443564E
+#NGP_TAIL = $4E564334
+#NGP_W = 128
+#NGP_H = 128
+#NGP_SURFACE = $06000000
+#NGP_SURFACE_PITCH = 3200
+#NGP_WINDOW = $063E8000
+#NGP_WINDOW_BYTES = $00C00000
+#NGP_MAP_SPAN = $00FE8000
+#NGP_ARENA = $0A000000
+#NGP_ARENA_BYTES = $01000000
+#NGP_PAGE = 4096
+#NGP_ITEMS = 32
+; 48-byte input: x0,y0,x1,y1,x2,y2,x3,y3,U,V,canary0,canary1.
+; Chrome Q8/camera/rotation and clip conversion run on ARM once; the QPU
+; expands only the exact four-corner record to six 24-byte vertices.
+#NGP_RECORD = 48
+#NGP_VERTEX = 24
+#NGP_LIVE = #NGP_ITEMS * 6 * #NGP_VERTEX
+#NGP_OUT_ALLOC = #NGP_PAGE * 2
+#NGP_POISON = $A5A5A5A5
+#NGP_ONE = $3F800000
+#NGP_LOAD_VEC4 = $FFFFFF7C
+#NGP_WAIT_US = 100000
+#NGP_PRE_CSD_BUDGET_US = 7000000
+#NGP_SCAN_BUDGET_US = 10000000
+#NGP_DRAW_BUDGET_US = 12000000
+#NGP_PIXEL_BUDGET_US = 13000000
+
+; 64 little-endian report words, 256 bytes; x0 returns @ngpReport[0].
+Global Dim ngpReport.l[64]
+Global ngpInst.i, ngpPhys.i, ngpDev.i, ngpQueue.i, ngpPool.i
+Global ngpImage.i, ngpMemory.i, ngpView.i, ngpPass.i, ngpFramebuffer.i
+Global ngpImageBase.i, ngpImagePitch.i
+Global ngpVertex.i, ngpVertexMemory.i, ngpVertexAddr.i
+Global ngpCodeMemory.i, ngpUnifMemory.i, ngpInputMemory.i
+Global ngpCodeAddr.i, ngpUnifAddr.i, ngpInputAddr.i
+Global ngpCsdSubmitted.i, ngpVulkanSubmitted.i
+Global ngpCodeMap.i, ngpUnifMap.i, ngpInputMap.i, ngpVertexMap.i
+Global Dim ngpParticles.NvcParticle[32]
+Global ngpStart.i
+
+Procedure.i ngpObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If ngpDev <> 0 : rc = vkDeviceWaitIdle(ngpDev) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If ngpVertexMap <> 0 : vkUnmapMemory(ngpDev, ngpVertexMemory) : ngpVertexMap = 0 : EndIf
+  If ngpInputMap <> 0 : vkUnmapMemory(ngpDev, ngpInputMemory) : ngpInputMap = 0 : EndIf
+  If ngpUnifMap <> 0 : vkUnmapMemory(ngpDev, ngpUnifMemory) : ngpUnifMap = 0 : EndIf
+  If ngpCodeMap <> 0 : vkUnmapMemory(ngpDev, ngpCodeMemory) : ngpCodeMap = 0 : EndIf
+  If ngpVertex <> 0 : vkDestroyBuffer(ngpDev, ngpVertex, 0) : ngpVertex = 0 : EndIf
+  If ngpVertexMemory <> 0 : vkFreeMemory(ngpDev, ngpVertexMemory, 0) : ngpVertexMemory = 0 : EndIf
+  If ngpInputMemory <> 0 : vkFreeMemory(ngpDev, ngpInputMemory, 0) : ngpInputMemory = 0 : EndIf
+  If ngpUnifMemory <> 0 : vkFreeMemory(ngpDev, ngpUnifMemory, 0) : ngpUnifMemory = 0 : EndIf
+  If ngpCodeMemory <> 0 : vkFreeMemory(ngpDev, ngpCodeMemory, 0) : ngpCodeMemory = 0 : EndIf
+  If ngpFramebuffer <> 0 : vkDestroyFramebuffer(ngpDev, ngpFramebuffer, 0) : ngpFramebuffer = 0 : EndIf
+  If ngpPass <> 0 : vkDestroyRenderPass(ngpDev, ngpPass, 0) : ngpPass = 0 : EndIf
+  If ngpView <> 0 : vkDestroyImageView(ngpDev, ngpView, 0) : ngpView = 0 : EndIf
+  If ngpImage <> 0 : vkDestroyImage(ngpDev, ngpImage, 0) : ngpImage = 0 : EndIf
+  If ngpMemory <> 0 : vkFreeMemory(ngpDev, ngpMemory, 0) : ngpMemory = 0 : EndIf
+  If ngpPool <> 0 : vkDestroyCommandPool(ngpDev, ngpPool, 0) : ngpPool = 0 : EndIf
+  If ngpDev <> 0 : vkDestroyDevice(ngpDev, 0) : ngpDev = 0 : EndIf
+  If ngpInst <> 0 : vkDestroyInstance(ngpInst, 0) : ngpInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpInside(base.i, bytes.i)
+  If base < #NGP_WINDOW Or bytes <= 0 Or base > $FFFFFFFF
+    ProcedureReturn 0
+  EndIf
+  If bytes > #NGP_WINDOW_BYTES Or (base - #NGP_WINDOW) > (#NGP_WINDOW_BYTES - bytes)
+    ProcedureReturn 0
+  EndIf
+  If base > ($FFFFFFFF - (bytes - 1)) : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i ngpOverlap(a.i, aBytes.i, b.i, bBytes.i)
+  ProcedureReturn Bool(a < b + bBytes And b < a + aBytes)
+EndProcedure
+
+; Keep these pages mapped only while the ARM writes them. They are ordinary
+; live Vulkan heap allocations, so the allocator protects all other resources.
+Procedure.i ngpPage(*memoryOut, *baseOut)
+  Define mai.VkMemoryAllocateInfo
+  Define mem.i, addr.i, rc.i
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = #NGP_PAGE : mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(ngpDev, @mai, 0, @mem)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  PokeI(*memoryOut, mem)
+  rc = vkMapMemory(ngpDev, mem, 0, #NGP_PAGE, 0, @addr)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  If addr <> AnvilVkMemoryAddress(mem) Or (addr % #NGP_PAGE) <> 0 Or ngpInside(addr, #NGP_PAGE) = 0
+    vkUnmapMemory(ngpDev, mem)
+    ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
+  EndIf
+  PokeI(*baseOut, addr)
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Four classes exercise baseline, rotation, camera pan and camera zoom plus
+; rotation. The transformed quads stay within disjoint 32x16 cells.
+Procedure ngpBuildParticles()
+  Define i.i, x.i, y.i
+  Define *p.NvcParticle
+  For i = 0 To #NGP_ITEMS - 1
+    *p = @ngpParticles[i]
+    x = (i % 4) * 32 + 10 : y = (i / 4) * 16 + 4
+    *p\x = x : *p\y = y : *p\width = 10 : *p\height = 7
+    *p\colour = $FF000000 | (((i * 67 + 31) & 255) << 16) | (((i * 43 + 59) & 255) << 8) | ((i * 29 + 97) & 255)
+    *p\zoomQ16 = 65536 : *p\ignoreCamera = 1
+    Select i % 4
+      Case 1
+        *p\angleQ16 = 16384
+      Case 2
+        *p\cameraX = 3 : *p\cameraY = -2 : *p\ignoreCamera = 0
+        *p\x = x + 3 : *p\y = y - 2
+      Case 3
+        *p\cameraX = 3 : *p\cameraY = -2 : *p\ignoreCamera = 0
+        *p\zoomQ16 = 131072 : *p\angleQ16 = -13107
+        *p\x = (x + #NGP_W / 2) / 2 + 3
+        *p\y = (y + #NGP_H / 2) / 2 - 2
+        *p\width = 5 : *p\height = 4
+    EndSelect
+  Next
+EndProcedure
+
+; Independently rebuild Chrome's CPU oracle from the original particle,
+; without reading the compact GPU input record or emitted vertex buffer.
+Procedure.i ngpRecordExpected(item.i, component.i)
+  Define corners.NvcParticleCorners
+  Define x.i, y.i, xb.i, yb.i, corner.i
+  If component = 8 : ProcedureReturn nvcParticleU[item % #NVC_PARTICLE_PALETTE_W] : EndIf
+  If component = 9 : ProcedureReturn nvcParticleV[item / #NVC_PARTICLE_PALETTE_W] : EndIf
+  If component = 10 : ProcedureReturn $D00D0000 | item : EndIf
+  If component = 11 : ProcedureReturn $FACE0000 | item : EndIf
+  If nvcParticleGeometry(@ngpParticles[item], @corners) = 0 : ProcedureReturn 0 : EndIf
+  corner = component / 2
+  x = PeekI(@corners + corner * 2 * SizeOf(.i))
+  y = PeekI(@corners + (corner * 2 + 1) * SizeOf(.i))
+  nvcParticleCornerBits(x, y, @xb, @yb)
+  If component % 2 = 0 : ProcedureReturn xb : EndIf
+  ProcedureReturn yb
+EndProcedure
+
+Procedure ngpFillInput()
+  Define i.i, p.i, c.i, j.i
+  For j = 0 To #NGP_PAGE - 4 Step 4
+    PokeL(ngpInputAddr + j, #NGP_POISON)
+    PokeL(ngpUnifAddr + j, #NGP_POISON)
+  Next
+  For i = 0 To #NGP_ITEMS - 1
+    p = ngpInputAddr + i * #NGP_RECORD
+    For c = 0 To 11
+      PokeL(p + c * 4, ngpRecordExpected(i, c))
+    Next
+  Next
+  PokeL(ngpUnifAddr + 0, ngpInputAddr)
+  PokeL(ngpUnifAddr + 4, ngpVertexAddr)
+  PokeL(ngpUnifAddr + 8, #NGP_ONE)
+  PokeL(ngpUnifAddr + 12, $0000FFFF)
+  PokeL(ngpUnifAddr + 16, 16)
+  PokeL(ngpUnifAddr + 20, #NGP_LOAD_VEC4)
+  PokeL(ngpUnifAddr + 24, #NGP_LOAD_VEC4)
+  PokeL(ngpUnifAddr + 28, #NGP_LOAD_VEC4)
+EndProcedure
+
+Procedure.i ngpExpected(item.i, vertex.i, component.i)
+  Define corner.i
+  If component = 0 Or component = 1
+    If vertex = 0 Or vertex = 3
+      corner = 0
+    ElseIf vertex = 1
+      corner = 2
+    ElseIf vertex = 2 Or vertex = 4
+      corner = 3
+    Else
+      corner = 1
+    EndIf
+    ProcedureReturn ngpRecordExpected(item, corner * 2 + component)
+  EndIf
+  If component = 2 : ProcedureReturn ngpRecordExpected(item, 8) : EndIf
+  If component = 3 : ProcedureReturn ngpRecordExpected(item, 9) : EndIf
+  ProcedureReturn #NGP_ONE
+EndProcedure
+
+Procedure.i ngpCheckBytes()
+  Define i.i, v.i, c.i, off.i, got.i, want.i, mapped.i, rc.i
+  V3dCacheRange(ngpVertexAddr, #NGP_OUT_ALLOC)
+  rc = vkMapMemory(ngpDev, ngpVertexMemory, 0, #NGP_OUT_ALLOC, 0, @mapped)
+  ngpReport[50] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ngpVertexMap = 1
+  If mapped <> ngpVertexAddr : ProcedureReturn 0 : EndIf
+  rc = vkMapMemory(ngpDev, ngpInputMemory, 0, #NGP_PAGE, 0, @mapped)
+  ngpReport[51] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ngpInputMap = 1
+  If mapped <> ngpInputAddr : ProcedureReturn 0 : EndIf
+  For i = 0 To #NGP_ITEMS - 1
+    For v = 0 To 5
+      For c = 0 To 5
+        off = ((i * 6 + v) * 6 + c) * 4
+        got = PeekL(ngpVertexAddr + off) & $FFFFFFFF
+        want = ngpExpected(i, v, c) & $FFFFFFFF
+        If got <> want
+          ngpReport[16] = ngpReport[16] + 1
+          If ngpReport[19] = 0
+            ngpReport[19] = off + 1 : ngpReport[20] = want : ngpReport[21] = got
+          EndIf
+        EndIf
+      Next
+    Next
+  Next
+  For off = #NGP_LIVE To #NGP_OUT_ALLOC - 4 Step 4
+    If (PeekL(ngpVertexAddr + off) & $FFFFFFFF) <> (#NGP_POISON & $FFFFFFFF)
+      ngpReport[17] = ngpReport[17] + 1
+    EndIf
+  Next
+  For i = 0 To #NGP_ITEMS - 1
+    For c = 0 To 11
+      got = PeekL(ngpInputAddr + i * #NGP_RECORD + c * 4) & $FFFFFFFF
+      want = ngpRecordExpected(i, c) & $FFFFFFFF
+      If got <> (want & $FFFFFFFF) : ngpReport[18] = ngpReport[18] + 1 : EndIf
+    Next
+  Next
+  For off = #NGP_ITEMS * #NGP_RECORD To #NGP_PAGE - 4 Step 4
+    If (PeekL(ngpInputAddr + off) & $FFFFFFFF) <> (#NGP_POISON & $FFFFFFFF)
+      ngpReport[18] = ngpReport[18] + 1
+    EndIf
+  Next
+  ngpReport[40] = PeekL(ngpVertexAddr)
+  ngpReport[41] = PeekL(ngpVertexAddr + #NGP_LIVE - 4)
+  ngpReport[42] = PeekL(ngpVertexAddr + 16 * 144 + 4)
+  vkUnmapMemory(ngpDev, ngpInputMemory) : ngpInputMap = 0
+  vkUnmapMemory(ngpDev, ngpVertexMemory) : ngpVertexMap = 0
+  ProcedureReturn Bool(ngpReport[16] = 0 And ngpReport[17] = 0 And ngpReport[18] = 0)
+EndProcedure
+
+Procedure.i ngpPixel(x.i, y.i)
+  ProcedureReturn PeekL(ngpImageBase + y * ngpImagePitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i ngpCheckPixels()
+  Define i.i, x.i, y.i
+  ngpReport[25] = ngpPixel(0, 0)
+  ngpReport[26] = ngpPixel(15, 8)
+  ngpReport[27] = ngpPixel(47, 8)
+  ngpReport[28] = ngpPixel(79, 8)
+  ngpReport[29] = ngpPixel(111, 8)
+  For i = 0 To #NGP_ITEMS - 1
+    x = (i % 4) * 32 + 10 : y = (i / 4) * 16 + 4
+    If ngpPixel(x + 5, y + 4) <> (ngpParticles[i]\colour & $FFFFFFFF) : ngpReport[30] = ngpReport[30] + 1 : EndIf
+    If ngpPixel(x + 16, y + 4) <> $FF000000 : ngpReport[30] = ngpReport[30] + 1 : EndIf
+  Next
+  ProcedureReturn Bool(ngpReport[30] = 0)
+EndProcedure
+
+; A timeout or failed idle may leave a CSD or renderer job in flight.
+; Keep the payload, every page, buffer and MMU mapping live until the
+; already armed 15-second deadman resets the board. Returning
+; would disarm that deadman and resume the monitor over live GPU work.
+Procedure.i ngpUnsafe(status.i)
+  ngpReport[1] = status
+  ngpReport[55] = 1
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  ngpReport[63] = #NGP_TAIL
+  ; UART writes are bounded. The RAM report is retained for a live debugger,
+  ; but a deadman reset will erase it; emit the two-digit failure code too.
+  If UartRunning() <> 0
+    UartWrite(78) : UartWrite(71) : UartWrite(80) : UartWrite(33)
+    UartWrite(48 + status / 10) : UartWrite(48 + status % 10)
+    UartWriteNl()
+  EndIf
+  Repeat
+    V3dBarrier()
+  ForEver
+EndProcedure
+
+Procedure.i ngpFinish(status.i)
+  ngpReport[1] = status
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  ; No destroy, unmap, shutdown or monitor return without a verified idle.
+  If ngpCsdSubmitted <> 0 Or ngpVulkanSubmitted <> 0 : ngpUnsafe(90) : EndIf
+  If ngpDev <> 0
+    If vkDeviceWaitIdle(ngpDev) <> #VK_SUCCESS : ngpUnsafe(91) : EndIf
+  EndIf
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK : ngpUnsafe(92) : EndIf
+  ElseIf nvcDevice <> 0
+    NeonVkChromeDestroy()
+  EndIf
+  If nvcDevice <> 0 : ngpUnsafe(93) : EndIf
+  If ngpObjectsDestroy() = 0 : ngpUnsafe(94) : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK : ngpUnsafe(95) : EndIf
+  EndIf
+  ngpReport[58] = Neon_Ready()
+  ngpReport[59] = v3d_owner
+  ngpReport[60] = NeonDrawBackendActive()
+  ngpReport[56] = AnvilVkFaultCount()
+  ngpReport[57] = AnvilVkFaultText()
+  If ngpReport[1] = 0 And ngpReport[56] <> 0 : ngpReport[1] = 96 : EndIf
+  ngpReport[63] = #NGP_TAIL
+  ProcedureReturn @ngpReport[0]
+EndProcedure
+
+Procedure.i ngpObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @ngpInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(ngpInst, @count, @ngpPhys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or ngpPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(ngpPhys, @dci, 0, @ngpDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(ngpDev, 0, 0, @ngpQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(ngpDev, @pci, 0, @ngpPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NGP_W : imageInfo\extent\height = #NGP_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(ngpDev, @imageInfo, 0, @ngpImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(ngpDev, ngpImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(ngpDev, @alloc, 0, @ngpMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(ngpDev, ngpImage, ngpMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ngpImageBase = AnvilVkImageAddress(ngpImage)
+  ngpImagePitch = AnvilVkImageRowPitch(ngpImage)
+  If ngpImageBase = 0 Or ngpImagePitch < (#NGP_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(ngpDev, ngpMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> ngpImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(ngpDev, ngpMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = ngpImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(ngpDev, @viewInfo, 0, @ngpView)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(ngpDev, @passInfo, 0, @ngpPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = ngpPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @ngpView : frameInfo\width = #NGP_W
+  frameInfo\height = #NGP_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(ngpDev, @frameInfo, 0, @ngpFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nceLoad4(addressRf.i, firstRf.i)
+  Define r.i, k.i
+  V3dQpuReset()
+  r = V3dQpuSig(#V3DQ_SIG_THRSW)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
+  V3dQpuRaddr(addressRf, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  For k = 0 To 3
+    r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, firstRf + k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Next
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; TMUD carries a word and TMUA fires its store. rf14 is the output
+; cursor, incremented after each store. TMUWT at vertex boundaries
+; keeps the first proof bounded to six completed writes at a time.
+Procedure.i nceStoreWord(sourceRf.i)
+  Define r.i
+  r = V3dQpuMov(#V3DQ_WADDR_TMUD, 1, #V3DQ_MUX_A, sourceRf)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuMov(#V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 14)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAddImm(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, 14, 4)
+EndProcedure
+
+Procedure.i nceStoreVertex(xRf.i, yRf.i)
+  Define r.i
+  r = nceStoreWord(xRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(yRf) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(8) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(9) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreWord(15) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAdd0(#V3DQ_A_TMUWT, #V3DQ_WADDR_NOP, 1)
+EndProcedure
+
+Procedure.i nceBuildShader()
+  Define r.i
+  r = V3dQpuProgramBegin(ngpCodeAddr, #NGP_PAGE)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 9, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 15, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 6, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 7, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Compute global item from the hardware-provided packed workgroup ID.
+  ; r0[15:0] = group X; y is in r0[31:16], so mask it explicitly.
+  r = V3dQpuAdd2(#V3DQ_A_AND, 6, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 6, 0, #V3DQ_MUX_A, 6, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 10, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 10, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; input = rf8 + global item * (32 + 16), a 48-byte record.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 11, 0, #V3DQ_MUX_A, 10, 5)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 12, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 11, 12)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 8, 11)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Keep both later vec4 addresses before rf7 (uniform 16) is loaded over.
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 12, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 13, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceLoad4(12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceLoad4(13, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; output = rf9 + global item * (128 + 16), six 24-byte vertices.
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 13, 0, #V3DQ_MUX_A, 10, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 14, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 13)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 9)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Third vec4 supplies palette U/V in rf8/9 and canaries in rf10/11.
+  ; The output cursor is established before rf9 is overwritten.
+  r = nceLoad4(11, 8)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ; Existing particle triangle order: 0,2,3, 0,3,1.
+  r = nceStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(4, 5) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(6, 7) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(0, 1) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(6, 7) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = nceStoreVertex(2, 3) : If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuProgramEnd()
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, mapped.i, off.i, i.i, t0.i, binBefore.i, renderBefore.i
+  Define offset.q
+  Define Dim clear.l[4]
+  ngpReport[0] = #NGP_MAGIC : ngpReport[63] = #NGP_TAIL
+  ngpReport[5] = #NGP_OUT_ALLOC
+  ngpReport[46] = #NGP_WINDOW : ngpReport[47] = #NGP_WINDOW_BYTES
+  TimerInit()
+  ngpStart = Micros()
+  If #NGP_ITEMS <> 32 Or #NGP_ITEMS % 16 <> 0 Or #NGP_ITEMS * #NGP_RECORD > #NGP_PAGE Or #NGP_LIVE > #NGP_OUT_ALLOC
+    ProcedureReturn ngpFinish(36)
+  EndIf
+
+  ngpReport[2] = 1
+  If NeonArena(#NGP_ARENA, #NGP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn ngpFinish(1) : EndIf
+  If NeonSurface(#NGP_SURFACE, 800, 1280, #NGP_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn ngpFinish(2) : EndIf
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn ngpFinish(3) : EndIf
+  NeonSurfaceMapSpan(#NGP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn ngpFinish(4) : EndIf
+  ; Chrome's sampled atlas borrows Neon's bitmap raster. Face defaults only
+  ; set style; they do not select the required 8x16 bitmap source.
+  rc = NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  ngpReport[52] = rc
+  If rc <> #NEON_OK : ProcedureReturn ngpFinish(29) : EndIf
+  NeonPalette() : NeonFontDefaults() : NeonAnimReset() : NeonStateReset()
+  rc = Neon_AtlasRasterEnsure()
+  ngpReport[53] = rc : ngpReport[54] = Neon_AtlasRasterReady()
+  If rc <> #NEON_OK Or ngpReport[54] = 0 : ProcedureReturn ngpFinish(30) : EndIf
+  If AnvilVkV3dWindow(#NGP_WINDOW, #NGP_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn ngpFinish(5) : EndIf
+  If ngpObjectsCreate() = 0 : ProcedureReturn ngpFinish(6) : EndIf
+  ngpReport[44] = ngpImageBase : ngpReport[45] = ngpImagePitch
+  If ngpInside(ngpImageBase, #NGP_W * #NGP_H * 4) = 0 Or (ngpImageBase % #NGP_PAGE) <> 0
+    ProcedureReturn ngpFinish(6)
+  EndIf
+  rc = NeonVkChromeCreateWithCapacities(ngpPhys, ngpDev, ngpQueue, ngpPool, ngpPass, ngpFramebuffer, #NGP_W, #NGP_H, 4, #NGP_ITEMS)
+  ngpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(7) : EndIf
+  ngpBuildParticles()
+  rc = NeonVkChromeParticlesPrepare(@ngpParticles[0], #NGP_ITEMS)
+  ngpReport[43] = rc
+  If rc <> #NEON_VK_CHROME_OK Or nvcParticleSet = 0 : ProcedureReturn ngpFinish(31) : EndIf
+  If vkDeviceWaitIdle(ngpDev) <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(8) : EndIf
+
+  ngpReport[2] = 2
+  rc = nvcBufferCreate(#NGP_OUT_ALLOC, #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, @ngpVertex, @ngpVertexMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(9) : EndIf
+  If AnvilVkBufferSize(ngpVertex) <> #NGP_OUT_ALLOC Or AnvilVkMemorySize(ngpVertexMemory) < #NGP_OUT_ALLOC
+    ProcedureReturn ngpFinish(10)
+  EndIf
+  ngpVertexAddr = AnvilVkBufferAddress(ngpVertex)
+  ngpReport[4] = ngpVertexAddr
+  If ngpInside(ngpVertexAddr, #NGP_OUT_ALLOC) = 0 Or (ngpVertexAddr % #NGP_PAGE) <> 0
+    ProcedureReturn ngpFinish(10)
+  EndIf
+  rc = vkMapMemory(ngpDev, ngpVertexMemory, 0, #NGP_OUT_ALLOC, 0, @mapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(11) : EndIf
+  ngpVertexMap = 1
+  If mapped <> ngpVertexAddr : ProcedureReturn ngpFinish(12) : EndIf
+  For off = 0 To #NGP_OUT_ALLOC - 4 Step 4
+    PokeL(mapped + off, #NGP_POISON)
+  Next
+  vkUnmapMemory(ngpDev, ngpVertexMemory) : ngpVertexMap = 0
+
+  rc = ngpPage(@ngpCodeMemory, @ngpCodeAddr)
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(13) : EndIf
+  ngpCodeMap = 1 : ngpReport[6] = ngpCodeAddr
+  rc = ngpPage(@ngpUnifMemory, @ngpUnifAddr)
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(14) : EndIf
+  ngpUnifMap = 1 : ngpReport[7] = ngpUnifAddr
+  rc = ngpPage(@ngpInputMemory, @ngpInputAddr)
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(15) : EndIf
+  ngpInputMap = 1 : ngpReport[8] = ngpInputAddr
+  If ngpOverlap(ngpVertexAddr, #NGP_OUT_ALLOC, ngpCodeAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpVertexAddr, #NGP_OUT_ALLOC, ngpUnifAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpVertexAddr, #NGP_OUT_ALLOC, ngpInputAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpCodeAddr, #NGP_PAGE, ngpUnifAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpCodeAddr, #NGP_PAGE, ngpInputAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpUnifAddr, #NGP_PAGE, ngpInputAddr, #NGP_PAGE) <> 0 Or ngpOverlap(ngpVertexAddr, #NGP_OUT_ALLOC, ngpImageBase, #NGP_W * #NGP_H * 4) <> 0 Or ngpOverlap(ngpCodeAddr, #NGP_PAGE, ngpImageBase, #NGP_W * #NGP_H * 4) <> 0 Or ngpOverlap(ngpUnifAddr, #NGP_PAGE, ngpImageBase, #NGP_W * #NGP_H * 4) <> 0 Or ngpOverlap(ngpInputAddr, #NGP_PAGE, ngpImageBase, #NGP_W * #NGP_H * 4) <> 0
+    ProcedureReturn ngpFinish(16)
+  EndIf
+  ngpFillInput()
+  If (Micros() - ngpStart) > #NGP_PRE_CSD_BUDGET_US : ProcedureReturn ngpFinish(32) : EndIf
+  rc = nceBuildShader()
+  ngpReport[9] = rc : ngpReport[10] = V3dQpuProgramBytes()
+  If rc <> #V3DQ_OK Or ngpReport[10] < 1 Or ngpReport[10] > #NGP_PAGE
+    ProcedureReturn ngpFinish(17)
+  EndIf
+  vkUnmapMemory(ngpDev, ngpInputMemory) : ngpInputMap = 0
+  vkUnmapMemory(ngpDev, ngpUnifMemory) : ngpUnifMap = 0
+  vkUnmapMemory(ngpDev, ngpCodeMemory) : ngpCodeMap = 0
+  ngpReport[37] = Micros() - ngpStart
+  If ngpReport[37] > #NGP_PRE_CSD_BUDGET_US : ProcedureReturn ngpFinish(32) : EndIf
+
+  ngpReport[2] = 3
+  rc = V3dCsdBegin(2, 1, 1, 16, 1)
+  If rc <> #V3D_OK : ProcedureReturn ngpFinish(18) : EndIf
+  rc = V3dCsdCode(ngpCodeAddr, V3dQpuProgramBytes(), 0)
+  If rc <> #V3D_OK : ProcedureReturn ngpFinish(19) : EndIf
+  rc = V3dCsdUniforms(ngpUnifAddr, 32)
+  If rc <> #V3D_OK : ProcedureReturn ngpFinish(20) : EndIf
+  V3dCsdOutput(ngpVertexAddr, #NGP_OUT_ALLOC)
+  V3dCacheRange(ngpInputAddr, #NGP_PAGE)
+  t0 = Micros()
+  rc = V3dCsdSubmit()
+  ngpReport[11] = rc
+  If rc <> #V3D_OK : ProcedureReturn ngpUnsafe(21) : EndIf
+  ngpCsdSubmitted = 1
+  rc = V3dCsdWait(#NGP_WAIT_US)
+  ngpReport[12] = rc : ngpReport[13] = V3dCsdCleanResult()
+  ngpReport[14] = V3dCsdDoneBefore() : ngpReport[15] = V3dCsdDoneAfter()
+  ngpReport[34] = V3dCsdMmuCtlAfter()
+  ngpReport[35] = V3dCsdVioAddrAfter() : ngpReport[36] = V3dCsdVioIdAfter()
+  ngpReport[48] = Micros() - t0
+  If rc <> #V3D_OK Or ngpReport[13] <> #V3D_OK Or ngpReport[14] = ngpReport[15]
+    ProcedureReturn ngpUnsafe(22)
+  EndIf
+  ngpCsdSubmitted = 0
+  t0 = Micros()
+  If ngpCheckBytes() = 0 : ProcedureReturn ngpFinish(23) : EndIf
+  ngpReport[61] = Micros() - t0
+  If (Micros() - ngpStart) > #NGP_SCAN_BUDGET_US : ProcedureReturn ngpFinish(33) : EndIf
+
+  ngpReport[2] = 4
+  clear[0] = 0 : clear[1] = 0 : clear[2] = 0 : clear[3] = #NGP_ONE
+  rc = NeonVkChromeBegin(@clear[0])
+  ngpReport[22] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpFinish(24) : EndIf
+  offset = 0
+  vkCmdBindVertexBuffers(nvcCommand, 0, 1, @ngpVertex, @offset)
+  nvcVertices = #NGP_ITEMS * 6
+  rc = nvcDrawSet(0, #NGP_ITEMS * 6, $FFFFFFFF, nvcParticleSet)
+  ngpReport[23] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn ngpFinish(25) : EndIf
+  ngpReport[38] = NeonVkChromeDrawCount() : ngpReport[39] = NeonVkChromeVertexCount()
+  binBefore = V3dBinJobs() : renderBefore = V3dRenderJobs()
+  ngpVulkanSubmitted = 1 : t0 = Micros()
+  rc = NeonVkChromeEnd()
+  ngpReport[24] = rc : ngpReport[49] = Micros() - t0
+  If rc <> #VK_SUCCESS : ProcedureReturn ngpUnsafe(26) : EndIf
+  ngpVulkanSubmitted = 0
+  ngpReport[31] = V3dBinJobs() - binBefore
+  ngpReport[32] = V3dRenderJobs() - renderBefore
+  ngpReport[33] = V3dMmuFaultsNow()
+  If (Micros() - ngpStart) > #NGP_DRAW_BUDGET_US : ProcedureReturn ngpFinish(34) : EndIf
+  If ngpCheckPixels() = 0 : ProcedureReturn ngpFinish(27) : EndIf
+  ngpReport[62] = Micros() - ngpStart
+  If ngpReport[62] > #NGP_PIXEL_BUDGET_US : ProcedureReturn ngpFinish(35) : EndIf
+  If ngpReport[31] <> 1 Or ngpReport[32] <> 1 Or ngpReport[33] <> 0 Or ngpReport[38] <> 1 Or ngpReport[39] <> #NGP_ITEMS * 6
+    ProcedureReturn ngpFinish(28)
+  EndIf
+  ngpReport[2] = 5
+  ProcedureReturn ngpFinish(0)
+EndProcedure
