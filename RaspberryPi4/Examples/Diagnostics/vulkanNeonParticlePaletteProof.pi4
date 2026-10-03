@@ -1,7 +1,8 @@
-; Returning Pi 4 proof for a retained ordered sprite batch.
+; Returning Pi 4 proof for a 10,000-colour Vulkan particle palette draw.
 ; Run only under Anvil's armed deadman. No boot or storage writes.
 ; Build with --entry-returns. x0 returns global_nmsreport from the NEW .sym.
-; Read exactly 256 report bytes; the payload checks draw order and frame pixels.
+; Read exactly 256 report bytes; the payload checks ordered translucent pixels,
+; two-frame reuse, capacity refusal, and one draw for 60,000 vertices.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -29,6 +30,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 #NMS_MAGIC        = $4D42524E
 
 Global Dim nmsReport.l[64]
+Global Dim nppItems.NvcParticle[10000]
 Global Dim nrbCapture.l[4096]
 Global Dim nmsImagePixels.a[64]
 Global Dim nmsPixels.a[16]
@@ -81,7 +83,8 @@ EndProcedure
 
 Procedure.i Main()
   Define rc.i, count.i, phys.i, queue.i, base.i, pitch.i, green.i
-  Define id.i, j.i, index.i, ox.i, oy.i, imageHandle.i, setHandle.i
+  Define t0.i, t1.i
+  Define id.i, i.i, j.i, index.i, ox.i, oy.i, imageHandle.i, setHandle.i
   Define residentImage.i, residentMemory.i, residentView.i, residentSet.i
   Define resident2Image.i, resident2Memory.i, resident2View.i, resident2Set.i
   Define ici.VkInstanceCreateInfo
@@ -215,7 +218,7 @@ Procedure.i Main()
   nmsReport[2] = 4
   rc = NeonVkChromeSpriteSource(@nmsPixelsA[0], 2, 2)
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(20) : EndIf
-  rc = NeonVkChromeCreateWithCapacities(phys, nmsDevice, queue, nmsPool, nmsPass, nmsFrame, #NMS_SIZE, #NMS_SIZE, 4, 4)
+  rc = NeonVkChromeCreateWithCapacities(phys, nmsDevice, queue, nmsPool, nmsPass, nmsFrame, #NMS_SIZE, #NMS_SIZE, 4, 10000)
   nmsReport[3] = rc
   If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(21) : EndIf
   nmsAdapter = 1
@@ -224,149 +227,175 @@ Procedure.i Main()
   residentImage = nvcImageSpriteImage : residentSet = nvcImageSpriteSet
   resident2Image = nvcImageSpriteImages[2] : resident2Set = nvcImageSpriteSets[2]
   If residentImage = 0 Or residentSet = 0 Or resident2Image = 0 Or resident2Set = 0 : ProcedureReturn nmsReturn(24) : EndIf
-
-  ; Add records no Vulkan draw. End appends after the blue box, with its clip.
-  nmsReport[2] = 5
-  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(25) : EndIf
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(26) : EndIf
-  If NeonVkChromeSpriteBatchAdd(1, 4, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(27) : EndIf
-  If NeonVkChromeSpriteBatchAdd(2, 20, 4, 0, 0, 2, 2, 8, 8, Neon_RGBA(255, 255, 255, 128), #NVC_SPRITE_HALF_PI_Q16, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(28) : EndIf
-  If NeonVkChromeSpriteBatchAdd(1, 38, 32, 1, 1, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 98304, 0) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(29) : EndIf
-  nmsReport[4] = nvcDrawCount : nmsReport[5] = nvcVertices
-  If nmsReport[4] <> 0 Or nmsReport[5] <> 0 : ProcedureReturn nmsReturn(30) : EndIf
-  If NeonVkChromeBox(0, 0, 64, 64, Neon_RGB(0, 0, 255)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(31) : EndIf
-  nmsReport[6] = nvcDrawCount
-  NeonVkChromeScissorSet(0, 0, 43, 64)
-  rc = NeonVkChromeSpriteBatchEnd()
-  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(32) : EndIf
-  nmsReport[7] = nvcDrawCount : nmsReport[8] = nvcVertices
-  NeonVkChromeScissorClear()
-  If nmsReport[6] <> 1 Or nmsReport[7] <> 4 Or nmsReport[8] <> 24 : ProcedureReturn nmsReturn(33) : EndIf
-  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(34) : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(35) : EndIf
-  For oy = 0 To 63
-    For ox = 0 To 63
-      nrbCapture[oy * 64 + ox] = nmsPixel(base, pitch, ox, oy)
-    Next
-  Next
-  nmsReport[9] = nmsPixel(base, pitch, 5, 5)
-  nmsReport[10] = nmsPixel(base, pitch, 50, 40)
-  If nmsWord(9) <> $FFFF0000 Or nmsWord(10) <> $FF0000FF : ProcedureReturn nmsReturn(36) : EndIf
-
-  ; The direct path is an independent ordering/geometry reference.
-  nmsReport[2] = 6
-  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(37) : EndIf
-  If NeonVkChromeBox(0, 0, 64, 64, Neon_RGB(0, 0, 255)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(38) : EndIf
-  NeonVkChromeScissorSet(0, 0, 43, 64)
-  If NeonVkChromeImageSpriteDrawTransformId(1, 4, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(39) : EndIf
-  If NeonVkChromeImageSpriteDrawTransformId(2, 20, 4, 0, 0, 2, 2, 8, 8, Neon_RGBA(255, 255, 255, 128), #NVC_SPRITE_HALF_PI_Q16, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(40) : EndIf
-  If NeonVkChromeImageSpriteDrawTransformId(1, 38, 32, 1, 1, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 98304, 0) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(41) : EndIf
-  NeonVkChromeScissorClear()
-  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(42) : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(43) : EndIf
-  For oy = 0 To 63
-    For ox = 0 To 63
-      If nmsPixel(base, pitch, ox, oy) <> (nrbCapture[oy * 64 + ox] & $FFFFFFFF) : nmsReport[12] = nmsReport[12] + 1 : EndIf
-    Next
-  Next
-  If nmsReport[12] <> 0 : ProcedureReturn nmsReturn(44) : EndIf
-
-  ; Mutating the original CPU bytes does not change retained GPU images.
-  nmsReport[2] = 7
-  nmsPixelsA[0] = 0
-  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(45) : EndIf
-  If NeonVkChromeBox(0, 0, 64, 64, Neon_RGB(0, 0, 255)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(46) : EndIf
-  NeonVkChromeScissorSet(0, 0, 43, 64)
-  If NeonVkChromeSpriteBatchEnd() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(47) : EndIf
-  NeonVkChromeScissorClear()
-  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(48) : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(49) : EndIf
-  For oy = 0 To 63
-    For ox = 0 To 63
-      If nmsPixel(base, pitch, ox, oy) <> (nrbCapture[oy * 64 + ox] & $FFFFFFFF) : nmsReport[16] = nmsReport[16] + 1 : EndIf
-    Next
-  Next
-  nmsReport[17] = NeonVkChromeImageSpriteGenerationId(1)
-  nmsReport[18] = (nvcImageSpriteImage = residentImage And nvcImageSpriteSet = residentSet And nvcImageSpriteImages[2] = resident2Image And nvcImageSpriteSets[2] = resident2Set)
-  If nmsReport[16] <> 0 Or nmsReport[17] <> 1 Or nmsReport[18] = 0 : ProcedureReturn nmsReturn(50) : EndIf
-
-  ; A bad late item and a full draw budget must leave prior draws untouched.
-  nmsReport[2] = 8
-  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(51) : EndIf
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(52) : EndIf
-  If NeonVkChromeSpriteBatchAdd(1, 4, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(53) : EndIf
-  nmsReport[19] = NeonVkChromeSpriteBatchAdd(17, 4, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1)
-  If nmsReport[19] <> #NEON_VK_CHROME_ERR_ARGS Or nvcRetainedBatchCount <> 1 : ProcedureReturn nmsReturn(54) : EndIf
-  If NeonVkChromeSpriteBatchAdd(2, 20000, 4, 0, 0, 1, 1, 8, 8, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(55) : EndIf
-  If NeonVkChromeBox(0, 0, 64, 64, Neon_RGB(0, 0, 255)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(56) : EndIf
-  nmsReport[20] = NeonVkChromeSpriteBatchEnd()
-  nmsReport[21] = nvcDrawCount : nmsReport[22] = nvcVertices
-  If nmsReport[20] <> #NEON_VK_CHROME_ERR_ARGS Or nmsReport[21] <> 1 Or nmsReport[22] <> 6 : ProcedureReturn nmsReturn(57) : EndIf
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(58) : EndIf
-  For id = 1 To 3
-    If NeonVkChromeSpriteBatchAdd(1, 4 + id * 8, 4, 0, 0, 1, 1, 4, 4, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(59) : EndIf
-  Next
-  If NeonVkChromeBox(0, 0, 2, 2, Neon_RGB(255, 0, 0)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(60) : EndIf
-  nmsReport[23] = NeonVkChromeSpriteBatchEnd()
-  nmsReport[24] = nvcDrawCount : nmsReport[25] = nvcVertices
-  If nmsReport[23] <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[24] <> 2 Or nmsReport[25] <> 12 : ProcedureReturn nmsReturn(61) : EndIf
-  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(62) : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(63) : EndIf
-
-  ; A replacement changes generation; retained old commands fail closed.
-  nmsReport[2] = 9
-  If NeonVkChromeImageSpriteReplaceId(1, @nmsPixelsA[0], 2, 2) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(64) : EndIf
-  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(65) : EndIf
-  If NeonVkChromeBox(0, 0, 64, 64, Neon_RGB(0, 0, 255)) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(66) : EndIf
-  nmsReport[26] = NeonVkChromeSpriteBatchEnd()
-  nmsReport[27] = nvcDrawCount : nmsReport[28] = nvcVertices
-  If nmsReport[26] <> #NEON_VK_CHROME_ERR_STATE Or nmsReport[27] <> 1 Or nmsReport[28] <> 6 : ProcedureReturn nmsReturn(67) : EndIf
-
-  ; Bracket dimensions are element counts: prove the last of 128 records is
-  ; addressable, then refuse the 129th before indexing the retained array.
-  nmsReport[2] = 10
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(71) : EndIf
-  For j = 1 To 128
-    rc = NeonVkChromeSpriteBatchAdd(1, j, 2, 0, 0, 1, 1, 1, 1, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(72) : EndIf
-  Next
-  nmsReport[31] = nvcRetainedBatchCount
-  nmsReport[32] = nvcRetainedItems[127]\x
-  nmsReport[33] = nvcRetainedItems[127]\id
-  nmsReport[34] = NeonVkChromeSpriteBatchAdd(1, 129, 2, 0, 0, 1, 1, 1, 1, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1)
-  nmsReport[35] = nvcRetainedBatchCount
-  nmsReport[36] = nvcRetainedItems[127]\x
-  If nmsReport[31] <> 128 Or nmsReport[32] <> 128 Or nmsReport[33] <> 1 Or nmsReport[34] <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[35] <> 128 Or nmsReport[36] <> 128
-    ProcedureReturn nmsReturn(73)
+  If nvcParticleImage <> 0 Or nvcParticleMemory <> 0 Or nvcParticleView <> 0 Or nvcParticleSet <> 0 Or nvcParticleStage <> 0 Or nvcParticleStageMemory <> 0 Or nvcParticleMapped <> 0 Or nvcParticleStageSafe <> 0
+    ProcedureReturn nmsReturn(59)
   EndIf
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(74) : EndIf
-  nmsReport[37] = NeonVkChromeSpriteBatchEnd()
-  nmsReport[38] = nvcDrawCount
-  If nmsReport[37] <> #NEON_VK_CHROME_OK Or nmsReport[38] <> 1 Or nvcRetainedBatchCount <> 0 : ProcedureReturn nmsReturn(75) : EndIf
+  nmsReport[44] = 1
+  If NeonVkChromeParticlesPrepare(0, 0) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(60) : EndIf
+  If nvcParticleImage <> 0 Or nvcParticleStage <> 0 Or nvcParticleSet <> 0 Or nvcParticleMapped <> 0
+    ProcedureReturn nmsReturn(61)
+  EndIf
 
-  ; A five-point fan adds nine vertices after the six-vertex blue box. Two
-  ; retained sprites need twelve more, but only nine of 24 slots remain.
-  ; The whole batch must refuse before either sprite is appended.
-  nmsReport[2] = 11
-  If NeonVkChromeFanBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(76) : EndIf
-  NeonVkChromeFanPoint(4, 20)
-  NeonVkChromeFanPoint(12, 20)
-  NeonVkChromeFanPoint(16, 28)
-  NeonVkChromeFanPoint(8, 36)
-  NeonVkChromeFanPoint(0, 28)
-  nmsReport[39] = NeonVkChromeFanEnd(Neon_RGB(0, 255, 0))
-  nmsReport[40] = nvcVertices : nmsReport[41] = nvcDrawCount
-  If nmsReport[39] <> #NEON_VK_CHROME_OK Or nmsReport[40] <> 15 Or nmsReport[41] <> 2 : ProcedureReturn nmsReturn(77) : EndIf
-  If NeonVkChromeSpriteBatchBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(78) : EndIf
-  If NeonVkChromeSpriteBatchAdd(1, 24, 20, 0, 0, 1, 1, 4, 4, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(79) : EndIf
-  If NeonVkChromeSpriteBatchAdd(1, 32, 20, 0, 0, 1, 1, 4, 4, Neon_RGB(255, 255, 255), 0, 0, 0, 65536, 1) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(80) : EndIf
-  nmsReport[42] = NeonVkChromeSpriteBatchEnd()
-  nmsReport[43] = nvcDrawCount : nmsReport[44] = nvcVertices
-  If nmsReport[42] <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[43] <> 2 Or nmsReport[44] <> 15 : ProcedureReturn nmsReturn(81) : EndIf
-  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(68) : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(69) : EndIf
+  ; Prepare uploads a 128x80 palette in a completed transfer submission.
+  ; Render only two ordered quads first, with an overlapping translucent pixel.
+  nmsReport[2] = 5
+  nppItems[0]\x = 4 : nppItems[0]\y = 4
+  nppItems[0]\width = 12 : nppItems[0]\height = 12
+  nppItems[0]\colour = $FFFF0000
+  nppItems[0]\zoomQ16 = 65536 : nppItems[0]\ignoreCamera = 1
+  nppItems[1]\x = 8 : nppItems[1]\y = 8
+  nppItems[1]\width = 12 : nppItems[1]\height = 12
+  nppItems[1]\colour = $8000FF00
+  nppItems[1]\zoomQ16 = 65536 : nppItems[1]\ignoreCamera = 1
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 2)
+  nmsReport[3] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(25) : EndIf
+  If nvcParticleImage = 0 Or nvcParticleMemory = 0 Or nvcParticleView = 0 Or nvcParticleSet = 0 Or nvcParticleStage = 0 Or nvcParticleStageMemory = 0 Or nvcParticleMapped = 0 Or nvcParticleStageSafe = 0 Or nvcParticleUploaded = 0
+    ProcedureReturn nmsReturn(62)
+  EndIf
+  nmsReport[45] = 1
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(26) : EndIf
+  rc = NeonVkChromeParticlesDrawPrepared()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(27) : EndIf
+  nmsReport[4] = nvcDrawCount : nmsReport[5] = nvcVertices
+  If nmsReport[4] <> 1 Or nmsReport[5] <> 12 : ProcedureReturn nmsReturn(28) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(29) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(30) : EndIf
+  nmsReport[9] = nmsPixel(base, pitch, 5, 5)
+  nmsReport[10] = nmsPixel(base, pitch, 10, 10)
+  nmsReport[11] = nmsPixel(base, pitch, 18, 18)
+  nmsReport[12] = nmsPixel(base, pitch, 25, 25)
+  If nmsWord(9) <> $FFFF0000 Or nmsWord(12) <> $FF000000
+    ProcedureReturn nmsReturn(31)
+  EndIf
+  ; Green over red must remain ordered and translucent: neither source alone.
+  If (nmsReport[10] & $00FFFFFF) = $00FF0000 Or (nmsReport[10] & $00FFFFFF) = $0000FF00
+    ProcedureReturn nmsReturn(32)
+  EndIf
+
+  ; The CPU snapshot and GPU palette survive a second frame unchanged.
+  nmsReport[2] = 6
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(33) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(34) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(35) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(36) : EndIf
+  If nmsPixel(base, pitch, 10, 10) <> (nmsReport[10] & $FFFFFFFF)
+    ProcedureReturn nmsReturn(37)
+  EndIf
+  nmsReport[19] = NeonVkChromeParticlesPrepare(@nppItems[0], 10001)
+  If nmsReport[19] <> #NEON_VK_CHROME_ERR_ARGS Or nvcParticleCount <> 2
+    ProcedureReturn nmsReturn(38)
+  EndIf
+
+  ; A quarter-turn sends the first quad above its unrotated rectangle.
+  ; The second quad moves and doubles through the camera transform.
+  nmsReport[2] = 7
+  nppItems[0]\x = 12 : nppItems[0]\y = 8
+  nppItems[0]\width = 12 : nppItems[0]\height = 4
+  nppItems[0]\colour = $FFFF00FF : nppItems[0]\angleQ16 = #NVC_SPRITE_HALF_PI_Q16
+  nppItems[0]\cameraX = 0 : nppItems[0]\cameraY = 0
+  nppItems[0]\zoomQ16 = 65536 : nppItems[0]\ignoreCamera = 1
+  nppItems[1]\x = 20 : nppItems[1]\y = 20
+  nppItems[1]\width = 4 : nppItems[1]\height = 4
+  nppItems[1]\colour = $FF0000FF : nppItems[1]\angleQ16 = 0
+  nppItems[1]\cameraX = 4 : nppItems[1]\cameraY = 2
+  nppItems[1]\zoomQ16 = 131072 : nppItems[1]\ignoreCamera = 0
+  If NeonVkChromeParticlesPrepare(@nppItems[0], 2) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(63) : EndIf
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(64) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(65) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(66) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(67) : EndIf
+  nmsReport[40] = nmsPixel(base, pitch, 18, 6)
+  nmsReport[41] = nmsPixel(base, pitch, 13, 9)
+  nmsReport[42] = nmsPixel(base, pitch, 4, 8)
+  nmsReport[43] = nmsPixel(base, pitch, 21, 21)
+  If nmsWord(40) <> $FFFF00FF Or nmsWord(41) <> $FF000000 Or nmsWord(42) <> $FF0000FF Or nmsWord(43) <> $FF000000
+    ProcedureReturn nmsReturn(68)
+  EndIf
+
+  ; A full palette is still one graphics draw (60,000 vertices), not 10,000
+  ; Vulkan draw records. Distribute the one-pixel squares across 64x64.
+  nmsReport[2] = 8
+  For i = 0 To 9999
+    nppItems[i]\x = i % 64 : nppItems[i]\y = (i / 64) % 64
+    nppItems[i]\width = 1 : nppItems[i]\height = 1
+    nppItems[i]\colour = $FF000000 | (((i * 73) & $FF) << 16)
+    nppItems[i]\angleQ16 = 0 : nppItems[i]\cameraX = 0 : nppItems[i]\cameraY = 0
+    nppItems[i]\zoomQ16 = 65536 : nppItems[i]\ignoreCamera = 1
+  Next
+  t0 = Micros()
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 10000)
+  t1 = Micros() : nmsReport[23] = t1 - t0
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(39) : EndIf
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(40) : EndIf
+  t0 = Micros()
+  rc = NeonVkChromeParticlesDrawPrepared()
+  t1 = Micros() : nmsReport[24] = t1 - t0
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(41) : EndIf
+  nmsReport[6] = nvcDrawCount : nmsReport[7] = nvcVertices
+  If nmsReport[6] <> 1 Or nmsReport[7] <> 60000 : ProcedureReturn nmsReturn(42) : EndIf
+  t0 = Micros()
+  rc = NeonVkChromeEnd()
+  t1 = Micros() : nmsReport[25] = t1 - t0
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(43) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(44) : EndIf
+  nmsReport[8] = nmsPixel(base, pitch, 0, 0)
+  nmsReport[20] = nmsPixel(base, pitch, 63, 0)
+  nmsReport[21] = nmsPixel(base, pitch, 8, 14)
+  nmsReport[22] = nmsPixel(base, pitch, 15, 28)
+  If nmsWord(20) <> $FFF70000 Or nmsWord(21) <> $FFC80000 Or nmsWord(22) <> $FF470000
+    ProcedureReturn nmsReturn(45)
+  EndIf
+  ; A triangle fan consumes three of the 60,000 vertex slots. The prepared
+  ; 10,000-particle draw needs all 60,000, so it must refuse before writing
+  ; even its first vertex. The canary is in the first slot it would touch.
+  nmsReport[2] = 9
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(52) : EndIf
+  If NeonVkChromeFanBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(53) : EndIf
+  NeonVkChromeFanPoint(0, 0) : NeonVkChromeFanPoint(1, 0) : NeonVkChromeFanPoint(0, 1)
+  If NeonVkChromeFanEnd($FFFFFFFF) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(54) : EndIf
+  If nvcVertices <> 3 Or nvcDrawCount <> 1 Or nvcMapped = 0 : ProcedureReturn nmsReturn(55) : EndIf
+  PokeL(nvcMapped + 3 * #NEON_VK_CHROME_VERTEX_BYTES, $5A36C07D)
+  rc = NeonVkChromeParticlesDrawPrepared()
+  nmsReport[36] = rc : nmsReport[37] = nvcVertices : nmsReport[38] = nvcDrawCount
+  nmsReport[39] = PeekL(nvcMapped + 3 * #NEON_VK_CHROME_VERTEX_BYTES)
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY Or nvcVertices <> 3 Or nvcDrawCount <> 1 Or nmsWord(39) <> $5A36C07D
+    ProcedureReturn nmsReturn(56)
+  EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(57) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(58) : EndIf
+  ; Ordinary moving-scene sizes after the 10k stress frame. Each input is
+  ; repositioned, forcing a fresh snapshot and palette upload.
+  For j = 0 To 1
+    count = 100
+    If j = 1 : count = 1000 : EndIf
+    nmsReport[2] = 10 + j
+    For i = 0 To count - 1
+      nppItems[i]\x = (i * 7 + j * 11) % 64
+      nppItems[i]\y = (i * 13 + j * 17) % 64
+      nppItems[i]\width = 1 : nppItems[i]\height = 1
+      nppItems[i]\colour = $FF000000 | (((i * 73) & $FF) << 16)
+      nppItems[i]\angleQ16 = 0 : nppItems[i]\cameraX = 0 : nppItems[i]\cameraY = 0
+      nppItems[i]\zoomQ16 = 65536 : nppItems[i]\ignoreCamera = 1
+    Next
+    t0 = Micros()
+    rc = NeonVkChromeParticlesPrepare(@nppItems[0], count)
+    t1 = Micros() : nmsReport[26 + j * 3] = t1 - t0
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(46) : EndIf
+    If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(47) : EndIf
+    t0 = Micros()
+    rc = NeonVkChromeParticlesDrawPrepared()
+    t1 = Micros() : nmsReport[27 + j * 3] = t1 - t0
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(48) : EndIf
+    nmsReport[32 + j * 2] = nvcDrawCount : nmsReport[33 + j * 2] = nvcVertices
+    If nvcDrawCount <> 1 Or nvcVertices <> count * 6 : ProcedureReturn nmsReturn(49) : EndIf
+    t0 = Micros()
+    rc = NeonVkChromeEnd()
+    t1 = Micros() : nmsReport[28 + j * 3] = t1 - t0
+    If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(50) : EndIf
+    If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(51) : EndIf
+  Next
+  nmsReport[2] = 12
   NeonVkChromeDestroy() : nmsAdapter = 0
-  nmsReport[29] = nvcRetainedBatchActive : nmsReport[30] = nvcRetainedBatchCount
-  If nmsReport[29] <> 0 Or nmsReport[30] <> 0 : ProcedureReturn nmsReturn(70) : EndIf
   ProcedureReturn nmsReturn(0)
 EndProcedure
