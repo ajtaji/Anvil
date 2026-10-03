@@ -1811,7 +1811,7 @@ EndProcedure
 ; Camera coordinates are in the same logical canvas. A positive Q16 radian
 ; angle rotates clockwise on the screen, as in DrawGLSprite. `zoomQ16=65536`
 ; is 1.0. This records vertices only; V3D samples/blends the image.
-Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i)
+Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i, textureW.i, textureH.i, setHandle.i)
   Define xQ8.i, yQ8.i, wQ8.i, hQ8.i, centerXQ8.i, centerYQ8.i
   Define halfWQ8.i, halfHQ8.i, cosQ16.i, sinQ16.i, first.i
   Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
@@ -1824,6 +1824,9 @@ Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, 
   EndIf
   If sourceX >= spriteW Or sourceY >= spriteH Or sourceW > spriteW - sourceX Or sourceH > spriteH - sourceY
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If textureW < 1 Or textureH < 1 Or setHandle = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   ; These input limits precede every fixed-point product and turn reduction.
   ; They keep all Q8 and Q16 intermediates in signed 64-bit range.
@@ -1866,8 +1869,8 @@ Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, 
   If blX < -#NVC_SPRITE_Q8_LIMIT Or blX > #NVC_SPRITE_Q8_LIMIT Or blY < -#NVC_SPRITE_Q8_LIMIT Or blY > #NVC_SPRITE_Q8_LIMIT Or brX < -#NVC_SPRITE_Q8_LIMIT Or brX > #NVC_SPRITE_Q8_LIMIT Or brY < -#NVC_SPRITE_Q8_LIMIT Or brY > #NVC_SPRITE_Q8_LIMIT
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
-  u0 = neon_F32Ratio(atlasX + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, nvcAtlasW)
-  v0 = neon_F32Ratio(atlasY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, nvcAtlasH)
+  u0 = neon_F32Ratio(atlasX + sourceX, textureW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, textureW)
+  v0 = neon_F32Ratio(atlasY + sourceY, textureH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, textureH)
   first = nvcVertices
   nvcSpriteVertexQ8(first + 0, tlX, tlY, u0, v0)
   nvcSpriteVertexQ8(first + 1, blX, blY, u0, v1)
@@ -1876,18 +1879,34 @@ Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, 
   nvcSpriteVertexQ8(first + 4, brX, brY, u1, v1)
   nvcSpriteVertexQ8(first + 5, trX, trY, u1, v0)
   nvcVertices = nvcVertices + 6
-  ProcedureReturn nvcDraw(first, 6, colour)
+  ProcedureReturn nvcDrawSet(first, 6, colour, setHandle)
 EndProcedure
 
 Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   If nvcLogoSource = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH)
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH, nvcAtlasW, nvcAtlasH, nvcDescriptorSet)
 EndProcedure
 
 Procedure.i NeonVkChromeSpriteDrawTransform(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
   If nvcSpriteSource[id] = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id])
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id], nvcAtlasW, nvcAtlasH, nvcDescriptorSet)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  Define setHandle.i, imageW.i, imageH.i
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If id = 1
+    setHandle = nvcImageSpriteSet : imageW = nvcImageSpriteW : imageH = nvcImageSpriteH
+  Else
+    setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
+  EndIf
+  If setHandle = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, 0, 0, imageW, imageH, imageW, imageH, setHandle)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteDrawTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  ProcedureReturn NeonVkChromeImageSpriteDrawTransformId(1, x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera)
 EndProcedure
 
 ; Preserve the original full-size, opaque RGB logo call.
