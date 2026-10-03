@@ -467,9 +467,26 @@ EndProcedure
 ;  present covers the band it painted and the banner band is not part of
 ;  the grid, so this is the one call that puts the anvil on the glass.
 ; ----------------------------------------------------------------------
-Procedure ScreenRebuildAtGeometry()
+; fontOnly keeps a live Vulkan frame and renderer while the shared text model
+; is rebuilt for the new face. Geometry changes still take the normal path.
+Procedure ScreenRebuildAtGeometry(fontOnly.i)
   Define i.i
   Define c.i
+  Define keepVulkan.i
+
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If fontOnly <> 0 And VulkanConsoleReady() <> 0
+    If AnvilTrueTypeSlotSelected() >= 0 And gScreenFontMetricFault = 0
+      keepVulkan = 1
+    Else
+      ; A failed font selection cannot leave a Vulkan renderer attached to a
+      ; CPU painter with stale ready status.
+      If VulkanConsoleStop() = 0
+        ProcedureReturn
+      EndIf
+    EndIf
+  EndIf
+  CompilerEndIf
 
   ; THE GPU'S STATE IS DERIVED FROM A GEOMETRY THAT NO LONGER EXISTS, and
   ; it has to be told so BEFORE anything is drawn - the same statement
@@ -478,23 +495,33 @@ Procedure ScreenRebuildAtGeometry()
   ; the next time it is asked to; a renderer pointer moved out from under
   ; a GPU that still believed it owned the frame is how a cursor ends up
   ; drawn by two things at once.
-  CompilerIf #ANVIL_V3D_CONSOLE = 1
-  V3dConInvalidate()
-  gV3dConOn = 0
-  gCursorGpuOwned = 0
-  CompilerEndIf
+  If keepVulkan = 0
+    CompilerIf #ANVIL_V3D_CONSOLE = 1
+    V3dConInvalidate()
+    gV3dConOn = 0
+    gCursorGpuOwned = 0
+    CompilerEndIf
+  EndIf
 
-  gDma = ScreenDmaUp()
+  If keepVulkan = 0 : gDma = ScreenDmaUp() : EndIf
   DisplayAutoFlush(1)
   gScreenBg = DisplayRGB(0, 0, 40)
   DisplayColour(DisplayRGB(226, 232, 240), gScreenBg)
-  If gScreenDeferFirstFrame = 0
+  If keepVulkan = 0 And gScreenDeferFirstFrame = 0
     DisplayClear(gScreenBg)
     DrawBanner()
   EndIf
   DisplayConsole(0, LogoHeight(), DisplayWidth(), DisplayHeight() - LogoHeight())
   ScreenConsoleGridInit()
+  CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+  If keepVulkan <> 0
+    ConSetRenderer(@VulkanConsolePump)
+  Else
+    ConSetRenderer(@ConPaintDma)
+  EndIf
+  CompilerElse
   ConSetRenderer(@ConPaintDma)
+  CompilerEndIf
   UartMirrorSetDrain(@ConMirrorDrain)
 
   ; THE RETAINED LOG, FROM BYTE ZERO, EVERY TIME. There is no cursor to
@@ -523,7 +550,7 @@ Procedure ScreenRebuildAtGeometry()
   ; same call, for the same reason, that ScreenUpOn makes after a move.
   HwTouchFlush()
 
-  If gScreenDeferFirstFrame = 0 : ScrPresentAll() : EndIf
+  If keepVulkan = 0 And gScreenDeferFirstFrame = 0 : ScrPresentAll() : EndIf
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -564,7 +591,7 @@ Procedure.i ScreenDsiReadoptService()
   If ScrDsiReadoptResolve() = 0
     ProcedureReturn 0
   EndIf
-  ScreenRebuildAtGeometry()
+  ScreenRebuildAtGeometry(0)
   gScreenReadoptSuspended = 0
   ProcedureReturn 1
 EndProcedure
@@ -621,7 +648,7 @@ Procedure.i ScreenHdmiRescale(scale.i)
   PointerHide()
   gScrScale = scale
   DisplayScale(gScrScale)
-  ScreenRebuildAtGeometry()
+  ScreenRebuildAtGeometry(0)
   ProcedureReturn 1
 EndProcedure
 
