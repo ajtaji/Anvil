@@ -200,6 +200,14 @@ offscreen case, CSD End fell to about 103 ms and its median frame to about
 471 ms; the paired CPU frame was about 521 ms. These timings establish a
 narrow gain, not complete engine throughput or a 60 Hz frame rate.
 
+The [moving-particle proof](../../../docs/evidence/neon-particle-dynamic-pi4-20261003/README.md)
+shifted all 10,000 particles on each of four frames and checked both colored
+pixels and cleared positions after every frame. On Pi 4 build 244, the matched
+CPU median was 528,344 µs and the opt-in CSD median was 479,372 µs. Both
+returned cleanly with correct pixels and no GPU faults. This verifies motion
+in the tested integer-pixel grid, while leaving full Neon application
+performance and unquantized geometry open.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
