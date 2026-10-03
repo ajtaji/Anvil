@@ -10,7 +10,18 @@ EnableFloatingPoint
 #NEON_VK_CHROME_ERR_CAPACITY = -21203
 #NVC_SPRITE_MAX_ANGLE_Q16 = 6588400
 #NVC_SPRITE_Q8_LIMIT = 1500000
+#NVC_RETAINED_BATCH_MAX = 128
+#NVC_MULTI_SPRITE_MAX = 16
+#NVC_PATH_NONE = 0
 
+Structure NvcRetainedSprite
+  id.i : generation.i : x.i : y.i
+  sourceX.i : sourceY.i : sourceW.i : sourceH.i
+  drawW.i : drawH.i : colour.i : angleQ16.i
+  cameraX.i : cameraY.i : zoomQ16.i : ignoreCamera.i
+EndStructure
+
+Global nvcReady.i = 1
 Global nvcInFrame.i = 1
 Global nvcGridBatchActive.i
 Global nvcBoxBatchActive.i
@@ -23,12 +34,28 @@ Global nvcLogicalH.i = 240
 Global nvcPhysicalW.i = 320
 Global nvcPhysicalH.i = 240
 Global nvcSpriteGeneration.i
+Global nvcImageSpriteSet.i = 1
+Global nvcImageSpriteW.i = 64
+Global nvcImageSpriteH.i = 32
+Global nvcImageSpriteGeneration.i
+Global Dim nvcImageSpriteSets.i[17]
+Global Dim nvcImageSpriteWidths.i[17]
+Global Dim nvcImageSpriteHeights.i[17]
+Global Dim nvcImageSpriteGenerations.i[17]
+Global nvcTargetGeneration.i = 1
+Global nvcRetainedBatchActive.i
+Global nvcRetainedBatchCount.i
+Global nvcRetainedBatchLogicalW.i
+Global nvcRetainedBatchLogicalH.i
+Global nvcRetainedBatchTargetGeneration.i
+Global nvcPathKind.i
+Global Dim nvcRetainedItems.NvcRetainedSprite[#NVC_RETAINED_BATCH_MAX]
 Global nvcObservedColour.i
 Global nvcObservedCount.i
-Global Dim nvcObservedX.i[17]
-Global Dim nvcObservedY.i[17]
-Global Dim nvcObservedU.i[17]
-Global Dim nvcObservedV.i[17]
+Global Dim nvcObservedX.i[42]
+Global Dim nvcObservedY.i[42]
+Global Dim nvcObservedU.i[42]
+Global Dim nvcObservedV.i[42]
 
 Procedure.i Neon_RGBA(r.i, g.i, b.i, a.i)
   ProcedureReturn ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
@@ -41,6 +68,12 @@ Procedure.i Neon_TextWidth(font.i, *s) : ProcedureReturn 0 : EndProcedure
 Procedure.i Neon_Text(font.i, x.i, y.i, *s, colour.i) : ProcedureReturn 0 : EndProcedure
 Procedure Neon_ScissorSet(x.i, y.i, w.i, h.i) : EndProcedure
 Procedure Neon_ScissorClear() : EndProcedure
+Procedure.i NeonFanBegin() : ProcedureReturn 0 : EndProcedure
+Procedure NeonFanPoint(x.i, y.i) : EndProcedure
+Procedure.i NeonFanEnd(colour.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NeonLinesBegin() : ProcedureReturn 0 : EndProcedure
+Procedure NeonLine(x0.i, y0.i, x1.i, y1.i) : EndProcedure
+Procedure.i NeonLinesEnd(colour.i) : ProcedureReturn 0 : EndProcedure
 
 Procedure.i nvcFail(code.i) : ProcedureReturn code : EndProcedure
 Procedure.i neon_F32Ratio(num.i, den.i) : ProcedureReturn (num * 65536) / den : EndProcedure
@@ -69,6 +102,7 @@ EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *pixels, width.i, height.i)
   nvcSpriteGeneration = nvcSpriteGeneration + 1
+  nvcImageSpriteGeneration = nvcSpriteGeneration
   ProcedureReturn 0
 EndProcedure
 Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *pixels, width.i, height.i)
@@ -84,6 +118,7 @@ EndProcedure
 Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, 0, 0, 64, 32, 64, 32, 1, 0)
 EndProcedure
+; @PRODUCTION_SPRITE_BATCH@
 
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
@@ -108,5 +143,16 @@ Procedure.i Main()
   If nvcObservedU[12] <> 49152 Or nvcObservedV[12] <> 49152 Or nvcObservedU[14] <> 65536 Or nvcObservedV[14] <> 65536 : ProcedureReturn 17 : EndIf
   If NeonVkPortSprite(@sprite, 20.0, 30.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 60.0, 4.0, 8.0, 8.0, 1) <> #NEON_VK_PORT_ERR_SPRITE : ProcedureReturn 13 : EndIf
   If nvcVertices <> 18 Or nvcDrawCount <> 3 : ProcedureReturn 14 : EndIf
+  If NeonVkPortSpriteBatchBegin(@sprite) <> 0 : ProcedureReturn 18 : EndIf
+  If NeonVkPortSpriteBatchAdd(12.0, 16.0, 8.0, 8.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1) <> 0 : ProcedureReturn 19 : EndIf
+  If NeonVkPortSpriteBatchAdd(24.0, 16.0, 8.0, 8.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1) <> 0 : ProcedureReturn 20 : EndIf
+  If nvcDrawCount <> 3 Or nvcVertices <> 18 : ProcedureReturn 21 : EndIf
+  nvcImageSpriteGeneration = nvcImageSpriteGeneration + 1
+  If NeonVkPortSpriteBatchEnd() <> #NEON_VK_CHROME_ERR_STATE Or nvpBatchActive <> 1 Or nvcDrawCount <> 3 : ProcedureReturn 22 : EndIf
+  nvcImageSpriteGeneration = nvcImageSpriteGeneration - 1
+  If NeonVkPortSpriteBatchEnd() <> 0 Or nvpBatchActive <> 0 : ProcedureReturn 23 : EndIf
+  If nvcDrawCount <> 5 Or nvcVertices <> 30 : ProcedureReturn 24 : EndIf
+  If nvcObservedX[18] <> 3072 Or nvcObservedY[18] <> 4096 Or nvcObservedX[24] <> 6144 Or nvcObservedY[24] <> 4096 : ProcedureReturn 25 : EndIf
+  If nvcObservedU[18] <> 0 Or nvcObservedV[18] <> 0 Or nvcObservedU[20] <> 65536 Or nvcObservedV[20] <> 65536 : ProcedureReturn 26 : EndIf
   ProcedureReturn 0
 EndProcedure

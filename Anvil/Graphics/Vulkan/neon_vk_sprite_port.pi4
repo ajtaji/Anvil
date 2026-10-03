@@ -13,10 +13,13 @@ Structure NeonVkPortSpriteRef
   generation.i
 EndStructure
 
+Global nvpBatchSprite.NeonVkPortSpriteRef
+
 ; Publish the reference only after a complete renderer upload. The source
 ; buffer must contain width*height tightly packed RGBA or BGRA pixels.
 Procedure.i NeonVkPortSpriteUpload(*sprite.NeonVkPortSpriteRef, id.i, *pixels, width.i, height.i, bgra.i)
   Protected result.i
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
   If *sprite = 0 Or *pixels = 0 Or id < 1 Or id > 16 Or width < 1 Or height < 1
     ProcedureReturn #NEON_VK_PORT_ERR_SPRITE
   EndIf
@@ -33,6 +36,7 @@ EndProcedure
 
 Procedure.i NeonVkPortSpriteClear(*sprite.NeonVkPortSpriteRef)
   Protected result.i
+  If nvpBatchActive <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
   If *sprite = 0 Or *sprite\id < 1 : ProcedureReturn #NEON_VK_PORT_ERR_SPRITE : EndIf
   If NeonVkChromeImageSpriteGenerationId(*sprite\id) <> *sprite\generation
     ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_STALE
@@ -99,4 +103,60 @@ Procedure.i NeonVkPortSprite(*sprite.NeonVkPortSpriteRef, screenX.f, screenY.f, 
     EndIf
   EndIf
   ProcedureReturn NeonVkChromeImageSpriteDrawTransformId(*sprite\id, x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, NeonVkPortColour(r, g, b, a), angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera)
+EndProcedure
+
+
+; Desktop BeginBatch fixes one texture for the group. The Vulkan renderer
+; retains up to 128 ordered sprites, with one draw record per sprite.
+Procedure.i NeonVkPortSpriteBatchBegin(*sprite.NeonVkPortSpriteRef)
+  Protected rc.i
+  If nvpCanvasW = 0 Or *sprite = 0 Or *sprite\id < 1 Or *sprite\width < 1 Or *sprite\height < 1
+    ProcedureReturn #NEON_VK_PORT_ERR_BATCH
+  EndIf
+  If NeonVkChromeImageSpriteGenerationId(*sprite\id) <> *sprite\generation
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_STALE
+  EndIf
+  rc = NeonVkChromeSpriteBatchBegin()
+  If rc <> 0 : ProcedureReturn rc : EndIf
+  nvpBatchSprite\id = *sprite\id : nvpBatchSprite\width = *sprite\width
+  nvpBatchSprite\height = *sprite\height : nvpBatchSprite\generation = *sprite\generation
+  nvpBatchActive = 1
+  ProcedureReturn 0
+EndProcedure
+
+
+; AddBatchedSprite uses target/window coordinates, not virtual-canvas scale.
+; The explicit width and height replace the source image dimensions; the
+; camera and rotation use the same centre transform as DrawGLSprite.
+Procedure.i NeonVkPortSpriteBatchAdd(screenX.f, screenY.f, width.f, height.f, angleRadians.f, r.f, g.f, b.f, a.f, ignoreCamera.i)
+  Protected x.i, y.i, drawW.i, drawH.i, angleQ16.i
+  Protected cameraX.i, cameraY.i, zoomQ16.i
+  If nvpBatchActive = 0 Or width <= 0.0 Or height <= 0.0 Or angleRadians < -100.53 Or angleRadians > 100.53
+    ProcedureReturn #NEON_VK_PORT_ERR_BATCH
+  EndIf
+  If NeonVkChromeImageSpriteGenerationId(nvpBatchSprite\id) <> nvpBatchSprite\generation
+    ProcedureReturn #NEON_VK_PORT_ERR_SPRITE_STALE
+  EndIf
+  x = nvpRound(screenX) : y = nvpRound(screenY)
+  drawW = nvpRound(width) : drawH = nvpRound(height)
+  angleQ16 = nvpRound(angleRadians * 65536.0)
+  If drawW < 1 Or drawH < 1 Or drawW > 4096 Or drawH > 4096 Or angleQ16 < -6588400 Or angleQ16 > 6588400
+    ProcedureReturn #NEON_VK_PORT_ERR_BATCH
+  EndIf
+  cameraX = 0 : cameraY = 0 : zoomQ16 = 65536
+  If ignoreCamera = 0
+    cameraX = nvpRound(nvpCameraX) : cameraY = nvpRound(nvpCameraY)
+    zoomQ16 = nvpRound(nvpCameraZoom * 65536.0)
+    If zoomQ16 < 1 Or zoomQ16 > 1048576 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
+  EndIf
+  ProcedureReturn NeonVkChromeSpriteBatchAdd(nvpBatchSprite\id, x, y, 0, 0, nvpBatchSprite\width, nvpBatchSprite\height, drawW, drawH, NeonVkPortColour(r, g, b, a), angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera)
+EndProcedure
+
+
+Procedure.i NeonVkPortSpriteBatchEnd()
+  Protected rc.i
+  If nvpBatchActive = 0 : ProcedureReturn #NEON_VK_PORT_ERR_BATCH : EndIf
+  rc = NeonVkChromeSpriteBatchEnd()
+  If rc = 0 : nvpBatchActive = 0 : EndIf
+  ProcedureReturn rc
 EndProcedure

@@ -32,6 +32,23 @@ Global nvpTestX.i
 Global nvpTestY.i
 Global nvpTestW.i
 Global nvpTestH.i
+Global nvpTestFanCount.i
+Global nvpTestLineCount.i
+Global nvpTestFirstX.i
+Global nvpTestFirstY.i
+Global nvpTestLastX.i
+Global nvpTestLastY.i
+Global Dim nvpTestFanX.i[6]
+Global Dim nvpTestFanY.i[6]
+Global Dim nvpTestLineX0.i[4]
+Global Dim nvpTestLineY0.i[4]
+Global Dim nvpTestLineX1.i[4]
+Global Dim nvpTestLineY1.i[4]
+Global Dim nvpTestLineCoords.f[6]
+Global nvpTestBatchBeginCalls.i
+Global nvpTestBatchAddCalls.i
+Global nvpTestBatchEndCalls.i
+Global nvpTestBatchEndFailures.i
 
 Procedure.i Neon_RGBA(r.i, g.i, b.i, a.i)
   ProcedureReturn ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255)
@@ -76,6 +93,24 @@ Procedure Neon_ScissorClear()
   nvpTestClearCalls = nvpTestClearCalls + 1
 EndProcedure
 
+Procedure.i NeonFanBegin() : nvpTestFanCount = 0 : ProcedureReturn 0 : EndProcedure
+Procedure NeonFanPoint(x.i, y.i)
+  If nvpTestFanCount = 0 : nvpTestFirstX = x : nvpTestFirstY = y : EndIf
+  If nvpTestFanCount < 6 : nvpTestFanX[nvpTestFanCount] = x : nvpTestFanY[nvpTestFanCount] = y : EndIf
+  nvpTestLastX = x : nvpTestLastY = y : nvpTestFanCount = nvpTestFanCount + 1
+EndProcedure
+Procedure.i NeonFanEnd(colour.i) : nvpTestColour = colour : ProcedureReturn 43 : EndProcedure
+Procedure.i NeonLinesBegin() : nvpTestLineCount = 0 : ProcedureReturn 0 : EndProcedure
+Procedure NeonLine(x0.i, y0.i, x1.i, y1.i)
+  If nvpTestLineCount = 0 : nvpTestFirstX = x0 : nvpTestFirstY = y0 : EndIf
+  If nvpTestLineCount < 4
+    nvpTestLineX0[nvpTestLineCount] = x0 : nvpTestLineY0[nvpTestLineCount] = y0
+    nvpTestLineX1[nvpTestLineCount] = x1 : nvpTestLineY1[nvpTestLineCount] = y1
+  EndIf
+  nvpTestLastX = x1 : nvpTestLastY = y1 : nvpTestLineCount = nvpTestLineCount + 1
+EndProcedure
+Procedure.i NeonLinesEnd(colour.i) : nvpTestColour = colour : ProcedureReturn 44 : EndProcedure
+
 Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *pixels, width.i, height.i)
   nvpTestSpriteUploadCalls = nvpTestSpriteUploadCalls + 1
   If width = 13 : ProcedureReturn -99 : EndIf
@@ -106,6 +141,29 @@ Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, so
   nvpTestAngle = angleQ16 : nvpTestCameraX = cameraX : nvpTestCameraY = cameraY
   nvpTestZoom = zoomQ16 : nvpTestIgnoreCamera = ignoreCamera
   ProcedureReturn 31
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteBatchBegin()
+  nvpTestBatchBeginCalls = nvpTestBatchBeginCalls + 1
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NeonVkChromeSpriteBatchAdd(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  nvpTestBatchAddCalls = nvpTestBatchAddCalls + 1
+  nvpTestSpriteId = id : nvpTestX = x : nvpTestY = y
+  nvpTestSourceX = sourceX : nvpTestSourceY = sourceY
+  nvpTestSourceW = sourceW : nvpTestSourceH = sourceH
+  nvpTestW = drawW : nvpTestH = drawH : nvpTestColour = colour
+  nvpTestAngle = angleQ16 : nvpTestCameraX = cameraX : nvpTestCameraY = cameraY
+  nvpTestZoom = zoomQ16 : nvpTestIgnoreCamera = ignoreCamera
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NeonVkChromeSpriteBatchEnd()
+  nvpTestBatchEndCalls = nvpTestBatchEndCalls + 1
+  If nvpTestBatchEndFailures > 0
+    nvpTestBatchEndFailures = nvpTestBatchEndFailures - 1
+    ProcedureReturn -77
+  EndIf
+  ProcedureReturn 0
 EndProcedure
 
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
@@ -176,5 +234,46 @@ Procedure.i Main()
   If NeonVkPortSprite(@sprite, 10.0, 20.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, -1.0, -1.0, -1.0, -1.0, 1) <> #NEON_VK_PORT_ERR_SPRITE_STALE : ProcedureReturn 51 : EndIf
   If NeonVkPortSpriteClear(@sprite) <> #NEON_VK_PORT_ERR_SPRITE_STALE : ProcedureReturn 52 : EndIf
   If nvpTestSpriteDrawCalls <> 4 Or nvpTestSpriteClearCalls <> 0 : ProcedureReturn 53 : EndIf
+  If NeonVkPortCanvas(100, 100, 200, 200) <> 0 : ProcedureReturn 61 : EndIf
+  If NeonVkPortPolygon(20.0, 30.0, 10.0, 5.0, 4, 1.0, 0.0, 0.0, 1.0, 1, 1, 1) <> 43 : ProcedureReturn 62 : EndIf
+  If nvpTestFanCount <> 6 Or nvpTestFirstX <> 40 Or nvpTestFirstY <> 60 Or nvpTestLastX <> 60 Or nvpTestLastY <> 60 : ProcedureReturn 63 : EndIf
+  If nvpTestFanX[1] <> 60 Or nvpTestFanY[1] <> 60 Or nvpTestFanX[2] <> 40 Or nvpTestFanY[2] <> 70 Or nvpTestFanX[3] <> 20 Or nvpTestFanY[3] <> 60 Or nvpTestFanX[4] <> 40 Or nvpTestFanY[4] <> 50 : ProcedureReturn 104 : EndIf
+  If nvpTestColour <> $FFFF0000 : ProcedureReturn 64 : EndIf
+  If NeonVkPortPolygon(20.0, 30.0, 10.0, 5.0, 4, 0.0, 1.0, 0.0, 1.0, 0, 1, 1) <> 44 : ProcedureReturn 65 : EndIf
+  If nvpTestLineCount <> 4 Or nvpTestFirstX <> 60 Or nvpTestFirstY <> 60 Or nvpTestLastX <> 60 Or nvpTestLastY <> 60 : ProcedureReturn 66 : EndIf
+  If nvpTestLineX1[0] <> 40 Or nvpTestLineY1[0] <> 70 Or nvpTestLineX0[3] <> 40 Or nvpTestLineY0[3] <> 50 : ProcedureReturn 105 : EndIf
+  If nvpTestColour <> $FF00FF00 : ProcedureReturn 67 : EndIf
+  If NeonVkPortPolygon(0.0, 0.0, 1.0, 1.0, 2, 1.0, 1.0, 1.0, 1.0, 1, 1, 1) <> 0 : ProcedureReturn 68 : EndIf
+  If NeonVkPortPolygon(0.0, 0.0, 1.0, 1.0, 2049, 1.0, 1.0, 1.0, 1.0, 1, 1, 1) <> #NEON_VK_PORT_ERR_GEOMETRY_CAPACITY : ProcedureReturn 69 : EndIf
+  nvpTestLineCoords[0] = 1.0 : nvpTestLineCoords[1] = 2.0
+  nvpTestLineCoords[2] = 3.0 : nvpTestLineCoords[3] = 4.0
+  nvpTestLineCoords[4] = 5.0 : nvpTestLineCoords[5] = 6.0
+  If NeonVkPortCamera(10.0, 20.0, 2.0) <> 0 : ProcedureReturn 70 : EndIf
+  If NeonVkPortPolygon(20.0, 30.0, 10.0, 5.0, 4, 1.0, 1.0, 1.0, 1.0, 1, 0, 0) <> 43 : ProcedureReturn 101 : EndIf
+  If nvpTestFirstX <> -80 Or nvpTestFirstY <> -80 Or nvpTestLastX <> -60 Or nvpTestLastY <> -80 : ProcedureReturn 102 : EndIf
+  If NeonVkPortStaticLines(@nvpTestLineCoords[0], 3, 0.0, 0.0, 1.0, 1.0, 3) <> 44 : ProcedureReturn 71 : EndIf
+  If nvpTestLineCount <> 1 Or nvpTestFirstX <> 2 Or nvpTestFirstY <> 4 Or nvpTestLastX <> 6 Or nvpTestLastY <> 8 : ProcedureReturn 72 : EndIf
+  If nvpTestColour <> $FF0000FF : ProcedureReturn 73 : EndIf
+  If NeonVkPortStaticLines(@nvpTestLineCoords[0], 4100, 1.0, 1.0, 1.0, 1.0, 0) <> #NEON_VK_PORT_ERR_GEOMETRY_CAPACITY : ProcedureReturn 74 : EndIf
+  If NeonVkPortStaticLines(0, 2, 1.0, 1.0, 1.0, 1.0, 0) <> #NEON_VK_PORT_ERR_GEOMETRY : ProcedureReturn 75 : EndIf
+  If NeonVkPortStaticLines(@nvpTestLineCoords[0], 3, 1.0, 1.0, 1.0, 1.0, -1) <> 44 Or nvpTestLineCount <> 1 : ProcedureReturn 103 : EndIf
+  If NeonVkPortSpriteUpload(@sprite, 2, @pixel, 64, 32, 0) <> 0 : ProcedureReturn 76 : EndIf
+  If NeonVkPortSpriteBatchAdd(0.0, 0.0, 8.0, 8.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1) <> #NEON_VK_PORT_ERR_BATCH : ProcedureReturn 77 : EndIf
+  If NeonVkPortSpriteBatchBegin(@sprite) <> 0 : ProcedureReturn 78 : EndIf
+  If NeonVkPortSpriteBatchBegin(@sprite) <> 0 Or nvpTestBatchBeginCalls <> 2 : ProcedureReturn 79 : EndIf
+  If NeonVkPortFrameEnd() <> #NEON_VK_PORT_ERR_BATCH Or nvpTestEndCalls <> 1 : ProcedureReturn 106 : EndIf
+  If NeonVkPortSpriteUpload(@sprite, 2, @pixel, 64, 32, 0) <> #NEON_VK_PORT_ERR_BATCH : ProcedureReturn 107 : EndIf
+  If NeonVkPortSpriteClear(@sprite) <> #NEON_VK_PORT_ERR_BATCH : ProcedureReturn 108 : EndIf
+  If NeonVkPortSpriteBatchAdd(20.5, 30.5, 16.0, 8.0, 0.5, 1.0, 0.5, 0.0, 1.0, 0) <> 0 : ProcedureReturn 80 : EndIf
+  If nvpTestBatchAddCalls <> 1 Or nvpTestSpriteId <> 2 Or nvpTestX <> 21 Or nvpTestY <> 31 Or nvpTestW <> 16 Or nvpTestH <> 8 : ProcedureReturn 81 : EndIf
+  If nvpTestSourceX <> 0 Or nvpTestSourceY <> 0 Or nvpTestSourceW <> 64 Or nvpTestSourceH <> 32 : ProcedureReturn 82 : EndIf
+  If nvpTestAngle <> 32768 Or nvpTestCameraX <> 10 Or nvpTestCameraY <> 20 Or nvpTestZoom <> 131072 Or nvpTestIgnoreCamera <> 0 : ProcedureReturn 83 : EndIf
+  If nvpTestColour <> $FFFF8000 : ProcedureReturn 84 : EndIf
+  nvpTestBatchEndFailures = 1
+  If NeonVkPortSpriteBatchEnd() <> -77 Or nvpBatchActive <> 1 Or nvpTestBatchEndCalls <> 1 : ProcedureReturn 109 : EndIf
+  If NeonVkPortSpriteBatchEnd() <> 0 Or nvpBatchActive <> 0 Or nvpTestBatchBeginCalls <> 2 Or nvpTestBatchEndCalls <> 2 : ProcedureReturn 85 : EndIf
+  If NeonVkPortSpriteBatchEnd() <> #NEON_VK_PORT_ERR_BATCH : ProcedureReturn 86 : EndIf
+  nvpTestSpriteGen = nvpTestSpriteGen + 1
+  If NeonVkPortSpriteBatchBegin(@sprite) <> #NEON_VK_PORT_ERR_SPRITE_STALE : ProcedureReturn 87 : EndIf
   ProcedureReturn 0
 EndProcedure

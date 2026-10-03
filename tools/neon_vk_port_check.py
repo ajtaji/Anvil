@@ -37,6 +37,13 @@ def main() -> int:
             gate.procedure_body(production, name)
             for name in ("nvcSpriteCornerQ8", "nvcSpriteTransformRegion")
         ))
+        batch_marker = "; @PRODUCTION_SPRITE_BATCH@"
+        if geometry.count(batch_marker) != 1:
+            raise AssertionError("sprite batch marker missing or duplicated")
+        geometry = geometry.replace(batch_marker, "\n\n".join(
+            gate.procedure_body(production, name)
+            for name in ("NeonVkChromeSpriteBatchBegin", "NeonVkChromeSpriteBatchAdd", "NeonVkChromeSpriteBatchEnd")
+        ))
         geometry_source = work / "neon_vk_port_geometry_gate.pi4"
         geometry_source.write_text(geometry, encoding="utf-8")
         hook = NEON_HOOK_GATE.read_text(encoding="utf-8-sig")
@@ -49,6 +56,9 @@ Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *pixels, width.i, height.
 Procedure.i NeonVkChromeImageSpriteGenerationId(id.i) : ProcedureReturn 1 : EndProcedure
 Procedure.i NeonVkChromeImageSpriteClearId(id.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NeonVkChromeSpriteBatchBegin() : ProcedureReturn 0 : EndProcedure
+Procedure.i NeonVkChromeSpriteBatchAdd(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i NeonVkChromeSpriteBatchEnd() : ProcedureReturn 0 : EndProcedure
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
 XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
 """
