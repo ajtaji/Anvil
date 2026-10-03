@@ -115,11 +115,12 @@ Global nvcAtlasUploadMapped.i
 Global nvcAtlasUploadCount.i
 Global nvcAtlasGeneration.i
 Global nvcAtlasFaulted.i
-; An optional RGB sprite occupies a bounded shelf below the TrueType cache.
+; One optional RGB or RGBA sprite occupies a bounded shelf below the TrueType cache.
 ; It shares the existing sampled atlas, so it needs no second image allocation.
 Global nvcLogoSource.i
 Global nvcLogoW.i
 Global nvcLogoH.i
+Global nvcLogoChannels.i
 Global nvcLogoY.i
 Global nvcTTLimitY.i
 ; Preserve the first failing create boundary before rollback can replace the
@@ -223,13 +224,29 @@ EndProcedure
 Procedure.i NeonVkChromeLogoSource(*rgb, width.i, height.i)
   If nvcReady <> 0 Or nvcInFrame <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
   If *rgb = 0 And width = 0 And height = 0
-    nvcLogoSource = 0 : nvcLogoW = 0 : nvcLogoH = 0
+    nvcLogoSource = 0 : nvcLogoW = 0 : nvcLogoH = 0 : nvcLogoChannels = 0
     ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
   If *rgb = 0 Or width < 1 Or width > (#NEON_VK_CHROME_TT_ATLAS_W - 32) Or height < 1 Or height > 256
     ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
   EndIf
-  nvcLogoSource = *rgb : nvcLogoW = width : nvcLogoH = height
+  nvcLogoSource = *rgb : nvcLogoW = width : nvcLogoH = height : nvcLogoChannels = 3
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; Register one tightly packed RGBA8 image before Create. The atlas upload
+; copies it, but this registration persists across Destroy/Create. Keep the
+; source valid for each later Create, replace it, or clear it explicitly.
+Procedure.i NeonVkChromeSpriteSource(*rgba, width.i, height.i)
+  If nvcReady <> 0 Or nvcInFrame <> 0 : ProcedureReturn #NEON_VK_CHROME_ERR_STATE : EndIf
+  If *rgba = 0 And width = 0 And height = 0
+    nvcLogoSource = 0 : nvcLogoW = 0 : nvcLogoH = 0 : nvcLogoChannels = 0
+    ProcedureReturn #NEON_VK_CHROME_OK
+  EndIf
+  If *rgba = 0 Or width < 1 Or width > (#NEON_VK_CHROME_TT_ATLAS_W - 32) Or height < 1 Or height > 256
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  nvcLogoSource = *rgba : nvcLogoW = width : nvcLogoH = height : nvcLogoChannels = 4
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
@@ -628,6 +645,7 @@ Procedure.i nvcAtlasCreateAndUpload()
   Define logoR.i
   Define logoG.i
   Define logoB.i
+  Define logoA.i
   Define white.NeonAtlasGlyphUV
 
   rc = Neon_AtlasRasterEnsure()
@@ -647,7 +665,7 @@ Procedure.i nvcAtlasCreateAndUpload()
   nvcTTLimitY = nvcAtlasH
   nvcLogoY = 0
   If nvcLogoSource <> 0
-    If nvcLogoW < 1 Or nvcLogoW > nvcAtlasW - 32 Or nvcLogoH < 1 Or nvcLogoH > 256
+    If nvcLogoW < 1 Or nvcLogoW > nvcAtlasW - 32 Or nvcLogoH < 1 Or nvcLogoH > 256 Or (nvcLogoChannels <> 3 And nvcLogoChannels <> 4)
       ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
     EndIf
     nvcLogoY = nvcAtlasH - nvcLogoH
@@ -706,10 +724,12 @@ Procedure.i nvcAtlasCreateAndUpload()
   If nvcLogoSource <> 0
     For y = 0 To nvcLogoH - 1
       For x = 0 To nvcLogoW - 1
-        i = nvcLogoSource + (y * nvcLogoW + x) * 3
+        i = nvcLogoSource + (y * nvcLogoW + x) * nvcLogoChannels
         logoR = PeekA(i) : logoG = PeekA(i + 1) : logoB = PeekA(i + 2)
+        logoA = 255
+        If nvcLogoChannels = 4 : logoA = PeekA(i + 3) : EndIf
         logoX = nvcAtlasUploadMapped + #NEON_VK_CHROME_ATLAS_PAD + (((nvcLogoY + y) * nvcAtlasW + 32 + x) * 4)
-        PokeL(logoX, $FF000000 | (logoR << 16) | (logoG << 8) | logoB)
+        PokeL(logoX, (logoA << 24) | (logoR << 16) | (logoG << 8) | logoB)
       Next
     Next
   EndIf
@@ -1207,22 +1227,34 @@ Procedure.i nvcDraw(first.i, count.i, colour.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
-; Draw the registered opaque RGB sprite from the atlas's reserved shelf.
-Procedure.i NeonVkChromeLogo(x.i, y.i)
+; Match Neon's source-rectangle, destination-size and tint sprite semantics.
+; Rotation and camera mapping remain the caller's concern in this bounded path.
+Procedure.i NeonVkChromeSprite(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
   Define first.i
   Define u0.i, v0.i, u1.i, v1.i
   If nvcInFrame = 0 Or nvcLogoSource = 0 Or nvcLogoW < 1 Or nvcLogoH < 1
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
+  If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If sourceX >= nvcLogoW Or sourceY >= nvcLogoH Or sourceW > nvcLogoW - sourceX Or sourceH > nvcLogoH - sourceY
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
   If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
-  u0 = neon_F32Ratio(32, nvcAtlasW) : u1 = neon_F32Ratio(32 + nvcLogoW, nvcAtlasW)
-  v0 = neon_F32Ratio(nvcLogoY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + nvcLogoH, nvcAtlasH)
+  u0 = neon_F32Ratio(32 + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(32 + sourceX + sourceW, nvcAtlasW)
+  v0 = neon_F32Ratio(nvcLogoY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(nvcLogoY + sourceY + sourceH, nvcAtlasH)
   first = nvcVertices
-  nvcQuad(first, x, y, x + nvcLogoW, y + nvcLogoH, u0, v0, u1, v1)
+  nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
-  ProcedureReturn nvcDraw(first, 6, Neon_RGB(255, 255, 255))
+  ProcedureReturn nvcDraw(first, 6, colour)
+EndProcedure
+
+; Preserve the original full-size, opaque RGB logo call.
+Procedure.i NeonVkChromeLogo(x.i, y.i)
+  ProcedureReturn NeonVkChromeSprite(x, y, 0, 0, nvcLogoW, nvcLogoH, nvcLogoW, nvcLogoH, Neon_RGB(255, 255, 255))
 EndProcedure
 
 Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
