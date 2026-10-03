@@ -1,0 +1,96 @@
+; Emitted-code geometry and rollback gate. No V3D job is submitted.
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+
+#CR_X = $06100000
+#CR_Y = $06200000
+#CR_OUT = $06300000
+#CR_FB = $08000000
+#CR_TARGET = $09000000
+#CR_RECORD_WORDS = 16
+
+Procedure CrRecord(slot.i, rc.i)
+  Define out.i, n.i, hx.i, hy.i
+  out = #CR_OUT + slot * #CR_RECORD_WORDS * 4
+  hx = 2166136261 : hy = 2166136261
+  n = 0
+  While n < neon_coordActiveW * 3
+    hx = (hx * 33 + (PeekN(neon_xcTab + n * 4) & $FFFFFFFF)) & $FFFFFFFF
+    n = n + 1
+  Wend
+  n = 0
+  While n < neon_coordActiveH * 3
+    hy = (hy * 33 + (PeekN(neon_ycTab + n * 4) & $FFFFFFFF)) & $FFFFFFFF
+    n = n + 1
+  Wend
+  PokeN(out + 0, rc)
+  PokeN(out + 4, neon_coordActiveW) : PokeN(out + 8, neon_coordActiveH)
+  PokeN(out + 12, neon_coordSpareW) : PokeN(out + 16, neon_coordSpareH)
+  PokeN(out + 20, neon_coordBuildCount) : PokeN(out + 24, neon_coordReuseCount)
+  PokeN(out + 28, hx) : PokeN(out + 32, hy)
+  PokeN(out + 36, neon_physW) : PokeN(out + 40, neon_physH)
+  PokeN(out + 44, neon_w) : PokeN(out + 48, neon_h)
+  PokeN(out + 52, neon_rot) : PokeN(out + 56, gNeonReady)
+  PokeN(out + 60, v3d_jobH)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  neon_xcTab = #CR_X : neon_ycTab = #CR_Y
+  neon_capPhysW = 4096 : neon_capPhysH = 4096
+  neon_fb = #CR_FB : neon_w = 800 : neon_h = 1280
+  neon_physW = 800 : neon_physH = 1280
+  neon_pitch = 3200 : neon_fbBytes = 4096000
+  neon_outFmt = #V3D_OFMT_RGBA8 : neon_rot = 0
+  neon_cx = 400 : neon_cy = 640
+  neon_mapBase = #CR_FB : neon_mapBytes = $60000000
+  neon_talloc = $0A000000 : neon_tallocBytes = $01000000
+  neon_tstate = $0B000000 : neon_tstateBytes = $01000000
+  neon_overflow = 0 : neon_overflowBytes = 0
+  rc = V3dRenderBegin(800, 1280, #V3D_OFMT_RGBA8)
+  If rc <> #V3D_OK : ProcedureReturn 1 : EndIf
+  rc = V3dRenderTarget(#CR_FB, 4096000, #V3D_MEMFMT_RASTER, 3200, 0)
+  If rc <> #V3D_OK : ProcedureReturn 2 : EndIf
+  rc = V3dRenderPool(neon_talloc, neon_tallocBytes, neon_tstate, neon_tstateBytes)
+  If rc <> #V3D_OK : ProcedureReturn 3 : EndIf
+  gNeonReady = 1
+  neon_BuildCoordinateTables(800, 1280, 400, 640)
+  neon_coordActiveW = 800 : neon_coordActiveH = 1280
+  CrRecord(0, 0)
+
+  rc = NeonHardwareRebindSurface(#CR_TARGET, 800, 800, 3200, 2560000, #V3D_OFMT_RGBA8, 0)
+  CrRecord(1, rc)
+  rc = NeonHardwareRebindSurface(#CR_FB, 800, 1280, 3200, 4096000, #V3D_OFMT_RGBA8, 0)
+  CrRecord(2, rc)
+  rc = NeonHardwareRebindSurface(#CR_TARGET, 800, 800, 3200, 2560000, #V3D_OFMT_RGBA8, 0)
+  CrRecord(3, rc)
+
+  ; Preflight rejects an unmapped surface before touching V3D or tables.
+  rc = NeonHardwareRebindSurface($70000000, 800, 1280, 3200, 4096000, #V3D_OFMT_RGBA8, 0)
+  CrRecord(4, rc)
+  ; The stride exceeds V3dRenderTarget's 20-bit limit. Preflight passes,
+  ; then the setter refuses and the original geometry must be restored.
+  rc = NeonHardwareRebindSurface(#CR_TARGET, 800, 1280, $100000, $50000000, #V3D_OFMT_RGBA8, 0)
+  CrRecord(5, rc)
+
+  ; Logical rotation changes; the physical table key is still 800x1280.
+  rc = NeonHardwareRebindSurface(#CR_FB, 1280, 800, 3200, 4096000, #V3D_OFMT_RGBA8, 90)
+  CrRecord(6, rc)
+  ; Above the bounded spare size, build exact bits without caching the
+  ; oversized active pair. The previous 800x1280 pair can still be restored.
+  neon_SelectCoordinateTables(4097, 8, 2048, 4)
+  CrRecord(7, 0)
+  neon_SelectCoordinateTables(800, 1280, 400, 640)
+  CrRecord(8, 0)
+  rc = NeonArena($0C000000, $01000000)
+  CrRecord(9, rc)
+  PokeN(#CR_OUT - 4, $43525247)
+  ProcedureReturn 0
+EndProcedure
