@@ -42,6 +42,7 @@
 ; Larger targets may fail allocation cleanly if the board heap is insufficient.
 #NEON_VK_CHROME_TT_ATLAS_H     = 1024
 #NEON_VK_CHROME_TT_CACHE_MAX   = 512
+#NVC_TT_INDEX_SIZE             = 1024
 #NEON_VK_CHROME_TT_COVERAGE    = 1048576
 #NEON_VK_CHROME_TT_RUN_GLYPHS  = 4096
 
@@ -175,6 +176,8 @@ Global nvcTTNextX.i
 Global nvcTTNextY.i
 Global nvcTTRowH.i
 Global nvcTTCount.i
+; A zero slot is empty; a nonzero slot holds cache entry + 1.
+Global Dim nvcTTIndex.i[#NVC_TT_INDEX_SIZE]
 Global nvcTTFontPixels.i = 16
 Global nvcTTLayoutRc.i
 Global nvcTTLayoutError.i
@@ -841,6 +844,7 @@ Procedure.i nvcAtlasCreateAndUpload()
     EndIf
   Next
   nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
+  For i = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[i] = 0 : Next
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
   nvcWhiteU1 = neon_F32Ratio(nvcF32Pixel(white\right, nvcAtlasBaseW), nvcAtlasW)
@@ -1941,12 +1945,34 @@ Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
   ProcedureReturn nvcDraw(first, 6, colour)
 EndProcedure
 
+; The table stores entry + 1, so zero remains an unambiguous empty marker.
+; Identity checks use the full generation; the masked generation below only
+; selects a starting bucket and collisions are resolved by bounded probing.
+Procedure.i nvcTTCacheBucket(slot.i, generation.i, pixelHeight.i, glyph.i)
+  ProcedureReturn (((slot & 1023) * 7) + ((generation & 1023) * 29) + ((pixelHeight & 1023) * 17) + ((glyph & 1023) * 131)) & (#NVC_TT_INDEX_SIZE - 1)
+EndProcedure
+
 Procedure.i nvcTTCacheFind(slot.i, generation.i, pixelHeight.i, glyph.i)
-  Define i.i
-  For i = 0 To nvcTTCount - 1
-    If nvcTTSlot[i] = slot And nvcTTGen[i] = generation And nvcTTHeight[i] = pixelHeight And nvcTTGlyph[i] = glyph
-      ProcedureReturn i
+  Define bucket.i, probe.i, entry.i
+  bucket = nvcTTCacheBucket(slot, generation, pixelHeight, glyph)
+  For probe = 0 To #NVC_TT_INDEX_SIZE - 1
+    entry = nvcTTIndex[bucket] - 1
+    If entry < 0 : ProcedureReturn -1 : EndIf
+    If entry >= nvcTTCount : ProcedureReturn -1 : EndIf
+    If nvcTTSlot[entry] = slot And nvcTTGen[entry] = generation And nvcTTHeight[entry] = pixelHeight And nvcTTGlyph[entry] = glyph
+      ProcedureReturn entry
     EndIf
+    bucket = (bucket + 1) & (#NVC_TT_INDEX_SIZE - 1)
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i nvcTTCacheVacant(slot.i, generation.i, pixelHeight.i, glyph.i)
+  Define bucket.i, probe.i
+  bucket = nvcTTCacheBucket(slot, generation, pixelHeight, glyph)
+  For probe = 0 To #NVC_TT_INDEX_SIZE - 1
+    If nvcTTIndex[bucket] = 0 : ProcedureReturn bucket : EndIf
+    bucket = (bucket + 1) & (#NVC_TT_INDEX_SIZE - 1)
   Next
   ProcedureReturn -1
 EndProcedure
@@ -1966,14 +1992,17 @@ Procedure.i nvcTTCacheClear()
     Next
   Next
   nvcTTCount = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
+  For x = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[x] = 0 : Next
   nvcTTDirty = 1
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
   Define width.i, height.i, stride.i, bearingX.i, bearingY.i, advance.i
-  Define paddedW.i, paddedH.i, x.i, y.i, shelfHeight.i, copyRow.i, col.i, entry.i, p.i
+  Define paddedW.i, paddedH.i, x.i, y.i, shelfHeight.i, copyRow.i, col.i, entry.i, p.i, bucket.i
   If nvcTTCount >= #NEON_VK_CHROME_TT_CACHE_MAX : ProcedureReturn -1 : EndIf
+  bucket = nvcTTCacheVacant(slot, generation, pixelHeight, glyph)
+  If bucket < 0 : ProcedureReturn -1 : EndIf
   If AnvilTrueTypeRasterizeGlyph(glyph, pixelHeight, @nvcTTCoverage[0], #NEON_VK_CHROME_TT_COVERAGE, @width, @height, @stride, @bearingX, @bearingY, @advance) = 0
     ProcedureReturn -1
   EndIf
@@ -2005,6 +2034,7 @@ Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
   EndIf
   nvcTTW[entry] = width : nvcTTH[entry] = height
   nvcTTBearingX[entry] = bearingX : nvcTTBearingY[entry] = bearingY : nvcTTAdvance[entry] = advance
+  nvcTTIndex[bucket] = entry + 1
   nvcTTCount = nvcTTCount + 1
   nvcTTNextX = x + paddedW
   nvcTTNextY = y
@@ -2932,6 +2962,7 @@ Procedure NeonVkChromeDestroy()
   nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0
   nvcAtlasGeneration = 0 : nvcAtlasFaulted = 0
   nvcTTCount = 0 : nvcTTDirty = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
+  For slot = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[slot] = 0 : Next
   nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
   nvcTargetGeneration = 0
 EndProcedure
