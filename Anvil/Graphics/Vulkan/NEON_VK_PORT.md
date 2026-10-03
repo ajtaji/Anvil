@@ -184,6 +184,14 @@ wait. Nested backend measurements included 8,624 µs for binning and
 72,646 µs for rendering; the remaining submit time still needs a finer
 split before changing the queue implementation.
 
+The deeper Pi 4 backend split under
+`docs/evidence/neon-particle-backend-split-800-pi4-20261003/` measured
+42,403 µs rebuilding coordinate tables when binding the 800×800 target and
+55,145 µs when restoring the 800×1280 surface. These are nested inside the
+two rebinds and account for about 97.5 ms of the measured submission. Table
+reuse is a candidate optimization; it still needs correctness and board
+validation before changing the renderer.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
