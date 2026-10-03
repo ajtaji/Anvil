@@ -1,0 +1,5 @@
+# Pi 4 Neon/Vulkan all-scene evidence, build 242
+
+The RAM-only payload compiled from `RaspberryPi4/Examples/Diagnostics/vulkanNeonWidgetAll15Proof.pi4` on Anvil commit `cc5161d8fd1ccf6320913c422f1bd094ff766ab5`. It returned under the 15-second deadman with a status-zero report. The full 15-scene BGRA corpus matched Neon's pinned native reference exactly. The report records 47 widget draws, 654 vertices, one display DMA operation, no processor fallback, and no native fault. `screenshot.png` is the monitor's capture of the returned frame.
+
+Run the two checks in `docs/VULKAN_NEON_ALL15_CURRENT_PI4.md` against `report.bin` and `slab.bin`. `manifest.json` binds those files to the source, container, board build, return value, and hashes. This evidence applies to the Anvil Pi 4 port; desktop Neon Arcade remains a separate renderer integration.
