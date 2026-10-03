@@ -17,6 +17,7 @@ Procedure nvcParticlePaletteRelease()
   nvcParticleMapped = 0 : nvcParticleStage = 0 : nvcParticleStageMemory = 0
   nvcParticleSet = 0 : nvcParticleView = 0 : nvcParticleImage = 0 : nvcParticleMemory = 0
   nvcParticleCount = 0 : nvcParticlePrepared = 0
+  nvcParticleCornerBank = 0
   nvcParticleStageSafe = 0 : nvcParticleUploaded = 0
   nvcParticleTargetGeneration = 0 : nvcParticleLogicalW = 0 : nvcParticleLogicalH = 0
 EndProcedure
@@ -195,16 +196,17 @@ Procedure.i nvcParticleGeometry(*p.NvcParticle, *corners)
   If *p\angleQ16 = 0 And (*p\ignoreCamera <> 0 Or *p\zoomQ16 = 65536)
     ; Integer-size, unrotated quads have exact Q8 corners. This avoids
     ; CORDIC and duplicate products without approximating their geometry.
+    ; Four unique extrema suffice for the same eight-corner range check.
+    If xQ8 < -#NVC_SPRITE_Q8_LIMIT Or xQ8 > #NVC_SPRITE_Q8_LIMIT Or xQ8 + wQ8 < -#NVC_SPRITE_Q8_LIMIT Or xQ8 + wQ8 > #NVC_SPRITE_Q8_LIMIT
+      ProcedureReturn 0
+    EndIf
+    If yQ8 < -#NVC_SPRITE_Q8_LIMIT Or yQ8 > #NVC_SPRITE_Q8_LIMIT Or yQ8 + hQ8 < -#NVC_SPRITE_Q8_LIMIT Or yQ8 + hQ8 > #NVC_SPRITE_Q8_LIMIT
+      ProcedureReturn 0
+    EndIf
     PokeI(*corners + 0 * SizeOf(.i), xQ8) : PokeI(*corners + 1 * SizeOf(.i), yQ8)
     PokeI(*corners + 2 * SizeOf(.i), xQ8 + wQ8) : PokeI(*corners + 3 * SizeOf(.i), yQ8)
     PokeI(*corners + 4 * SizeOf(.i), xQ8) : PokeI(*corners + 5 * SizeOf(.i), yQ8 + hQ8)
     PokeI(*corners + 6 * SizeOf(.i), xQ8 + wQ8) : PokeI(*corners + 7 * SizeOf(.i), yQ8 + hQ8)
-    For i = 0 To 7
-      coordinate = PeekI(*corners + i * SizeOf(.i))
-      If coordinate < -#NVC_SPRITE_Q8_LIMIT Or coordinate > #NVC_SPRITE_Q8_LIMIT
-        ProcedureReturn 0
-      EndIf
-    Next
     ProcedureReturn 1
   EndIf
   halfWQ8 = wQ8 / 2 : halfHQ8 = hQ8 / 2
@@ -226,9 +228,9 @@ EndProcedure
 ; Prepare validates the whole list before changing retained state or staging.
 ; Inputs can be freed immediately after this returns success.
 Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
-  Define Dim corners.i[8]
   Define i.i, rc.i
   Define *p.NvcParticle
+  Define *candidate.NvcParticleCorners
   If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
@@ -248,7 +250,12 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
   EndIf
   For i = 0 To count - 1
     *p = *particles + i * SizeOf(NvcParticle)
-    If nvcParticleGeometry(*p, @corners[0]) = 0
+    If nvcParticleCornerBank = 0
+      *candidate = @nvcParticleCornersB[i]
+    Else
+      *candidate = @nvcParticleCornersA[i]
+    EndIf
+    If nvcParticleGeometry(*p, *candidate) = 0
       ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
     EndIf
   Next
@@ -286,6 +293,7 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     If i <> #VK_SUCCESS : ProcedureReturn nvcFail(i) : EndIf
   EndIf
   nvcParticleCount = count : nvcParticlePrepared = 1
+  If nvcParticleCornerBank = 0 : nvcParticleCornerBank = 1 : Else : nvcParticleCornerBank = 0 : EndIf
   nvcParticleTargetGeneration = nvcTargetGeneration
   nvcParticleLogicalW = nvcLogicalW : nvcParticleLogicalH = nvcLogicalH
   nvcError = 0
@@ -344,10 +352,10 @@ EndProcedure
 ; The array order becomes Vulkan primitive order within one draw. The current
 ; scissor applies to every particle, including rotated/camera-transformed ones.
 Procedure.i NeonVkChromeParticlesDrawPrepared()
-  Define Dim corners.i[8]
   Define Dim xBits.i[4]
   Define Dim yBits.i[4]
   Define i.i, first.i, base.i, col.i, row.i, u.i, v.i
+  Define *corners.NvcParticleCorners
   If nvcReady = 0 Or nvcInFrame = 0 Or nvcParticlePrepared = 0 Or nvcParticleSet = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
@@ -369,17 +377,21 @@ Procedure.i NeonVkChromeParticlesDrawPrepared()
   EndIf
   first = nvcVertices
   For i = 0 To nvcParticleCount - 1
-    nvcParticleGeometry(@nvcParticleItems[i], @corners[0])
+    If nvcParticleCornerBank = 0
+      *corners = @nvcParticleCornersA[i]
+    Else
+      *corners = @nvcParticleCornersB[i]
+    EndIf
     If nvcRotation = 0 And nvcParticleItems[i]\angleQ16 = 0 And (nvcParticleItems[i]\ignoreCamera <> 0 Or nvcParticleItems[i]\zoomQ16 = 65536)
-      xBits[0] = nvcParticleClipXBits(corners[0]) : xBits[1] = nvcParticleClipXBits(corners[2])
+      xBits[0] = nvcParticleClipXBits(*corners\x0) : xBits[1] = nvcParticleClipXBits(*corners\x1)
       xBits[2] = xBits[0] : xBits[3] = xBits[1]
-      yBits[0] = nvcParticleClipYBits(corners[1]) : yBits[2] = nvcParticleClipYBits(corners[5])
+      yBits[0] = nvcParticleClipYBits(*corners\y0) : yBits[2] = nvcParticleClipYBits(*corners\y2)
       yBits[1] = yBits[0] : yBits[3] = yBits[2]
     Else
-      nvcParticleCornerBits(corners[0], corners[1], @xBits[0], @yBits[0])
-      nvcParticleCornerBits(corners[2], corners[3], @xBits[1], @yBits[1])
-      nvcParticleCornerBits(corners[4], corners[5], @xBits[2], @yBits[2])
-      nvcParticleCornerBits(corners[6], corners[7], @xBits[3], @yBits[3])
+      nvcParticleCornerBits(*corners\x0, *corners\y0, @xBits[0], @yBits[0])
+      nvcParticleCornerBits(*corners\x1, *corners\y1, @xBits[1], @yBits[1])
+      nvcParticleCornerBits(*corners\x2, *corners\y2, @xBits[2], @yBits[2])
+      nvcParticleCornerBits(*corners\x3, *corners\y3, @xBits[3], @yBits[3])
     EndIf
     col = i % #NVC_PARTICLE_PALETTE_W : row = i / #NVC_PARTICLE_PALETTE_W
     u = nvcParticleU[col] : v = nvcParticleV[row]

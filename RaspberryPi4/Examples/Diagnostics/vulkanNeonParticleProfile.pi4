@@ -1,8 +1,9 @@
-; Returning Pi 4 proof for a 10,000-colour Vulkan particle palette draw.
+; Returning Pi 4 profile for the unchanged 10,000-particle Vulkan draw.
 ; Run only under Anvil's armed deadman. No boot or storage writes.
 ; Build with --entry-returns. x0 returns global_nmsreport from the NEW .sym.
 ; Read exactly 256 report bytes; the payload checks ordered translucent pixels,
 ; two-frame reuse, capacity refusal, and one draw for 60,000 vertices.
+; Extra timings repeat the same operations beside the production calls.
 
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/timer.pi4"
@@ -85,6 +86,11 @@ Procedure.i Main()
   Define rc.i, count.i, phys.i, queue.i, base.i, pitch.i, green.i
   Define t0.i, t1.i
   Define bankBefore.i
+  Define *profileParticle.NvcParticle
+  Define checksum.i
+  Define Dim profileCorners.i[8]
+  Define Dim profileXBits.i[4]
+  Define Dim profileYBits.i[4]
   Define id.i, i.i, j.i, index.i, ox.i, oy.i, imageHandle.i, setHandle.i
   Define residentImage.i, residentMemory.i, residentView.i, residentSet.i
   Define resident2Image.i, resident2Memory.i, resident2View.i, resident2Set.i
@@ -347,7 +353,75 @@ Procedure.i Main()
   rc = NeonVkChromeParticlesPrepare(@nppItems[0], 10000)
   t1 = Micros() : nmsReport[23] = t1 - t0
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(39) : EndIf
+  ; Repeat Prepare's phases on identical data without changing the
+  ; already prepared list or resulting palette. Each phase has its own
+  ; timer; the original whole-Prepare measurement above stays untouched.
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nppItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(69) : EndIf
+  Next
+  t1 = Micros() : nmsReport[46] = t1 - t0
+  t0 = Micros()
+  rc = vkDeviceWaitIdle(nvcDevice)
+  t1 = Micros() : nmsReport[47] = t1 - t0
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(70) : EndIf
+  t0 = Micros()
+  For i = 0 To 9999
+    *profileParticle = @nppItems[i]
+    nvcParticleItems[i]\x = *profileParticle\x : nvcParticleItems[i]\y = *profileParticle\y
+    nvcParticleItems[i]\width = *profileParticle\width : nvcParticleItems[i]\height = *profileParticle\height
+    nvcParticleItems[i]\colour = *profileParticle\colour : nvcParticleItems[i]\angleQ16 = *profileParticle\angleQ16
+    nvcParticleItems[i]\cameraX = *profileParticle\cameraX : nvcParticleItems[i]\cameraY = *profileParticle\cameraY
+    nvcParticleItems[i]\zoomQ16 = *profileParticle\zoomQ16 : nvcParticleItems[i]\ignoreCamera = *profileParticle\ignoreCamera
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, *profileParticle\colour)
+  Next
+  For i = 10000 To #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H - 1
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, 0)
+  Next
+  t1 = Micros() : nmsReport[48] = t1 - t0
+  t0 = Micros()
+  rc = nvcParticleUploadNow()
+  t1 = Micros() : nmsReport[49] = t1 - t0
+  If rc <> #VK_SUCCESS Or nvcParticleStageSafe = 0 : ProcedureReturn nmsReturn(71) : EndIf
   If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(40) : EndIf
+  ; Geometry without vertex writes, then geometry plus the same clip-bit
+  ; lookups as the unrotated Draw path. Reset the temporary lookup cache
+  ; afterward so the unchanged Draw has a cold cache again.
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nvcParticleItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(72) : EndIf
+  Next
+  t1 = Micros() : nmsReport[50] = t1 - t0
+  For j = 0 To #NVC_PARTICLE_CLIP_CACHE - 1
+    nvcParticleXGen[j] = 0 : nvcParticleYGen[j] = 0
+  Next
+  checksum = 0
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nvcParticleItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(73) : EndIf
+    profileXBits[0] = nvcParticleClipXBits(profileCorners[0])
+    profileXBits[1] = nvcParticleClipXBits(profileCorners[2])
+    profileYBits[0] = nvcParticleClipYBits(profileCorners[1])
+    profileYBits[2] = nvcParticleClipYBits(profileCorners[5])
+    checksum = checksum + (profileXBits[0] & $FF) + (profileXBits[1] & $FF)
+    checksum = checksum + (profileYBits[0] & $FF) + (profileYBits[2] & $FF)
+  Next
+  t1 = Micros() : nmsReport[51] = t1 - t0
+  nmsReport[53] = checksum
+  For j = 0 To #NVC_PARTICLE_CLIP_CACHE - 1
+    nvcParticleXGen[j] = 0 : nvcParticleYGen[j] = 0
+  Next
+  ; All 60,000 mapped writes are overwritten by the real draw before
+  ; submission. This uses the exact production vertex-store helper.
+  t0 = Micros()
+  For i = 0 To 59999
+    nvcParticleVertexBits(i, 0, 0, 0, 0)
+  Next
+  t1 = Micros() : nmsReport[52] = t1 - t0
+  If nvcVertices <> 0 Or nvcDrawCount <> 0 Or PeekL(nvcMapped + 16) <> #NEON_VK_CHROME_F_ONE Or PeekL(nvcMapped + 59999 * #NEON_VK_CHROME_VERTEX_BYTES + 20) <> #NEON_VK_CHROME_F_ONE
+    ProcedureReturn nmsReturn(74)
+  EndIf
+  nmsReport[54] = 1
   t0 = Micros()
   rc = NeonVkChromeParticlesDrawPrepared()
   t1 = Micros() : nmsReport[24] = t1 - t0

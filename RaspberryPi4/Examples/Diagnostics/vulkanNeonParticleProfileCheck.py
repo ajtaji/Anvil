@@ -1,4 +1,4 @@
-"""Check the 256-byte returning Pi 4 particle proof report."""
+"""Check the 256-byte returning Pi 4 particle profile and pixel oracle."""
 
 import struct
 import sys
@@ -11,7 +11,7 @@ def rgba_word(word):
 
 def main() -> int:
     if len(sys.argv) != 2:
-        print("usage: vulkanNeonParticlePaletteProofCheck.py REPORT.BIN")
+        print("usage: vulkanNeonParticleProfileCheck.py REPORT.BIN")
         return 2
     payload = Path(sys.argv[1]).read_bytes()
     if len(payload) != 256:
@@ -52,10 +52,15 @@ def main() -> int:
     assert signed(words[55]) == -21201
     assert words[56] == words[57] and words[56] in (0, 1)
     assert words[58] == words[10]
+    phases = words[46:53]
+    assert all(0 < value < 10_000_000 for value in phases[:1] + phases[2:]), phases
+    assert phases[1] < 10_000_000, phases
+    assert words[54] == 1
     print(
-        "particle palette proof: 10,000 particles, one draw, ordered alpha, repeat, "
-        "lazy allocation, rotated/camera pixels, and exact fan-boundary refusal pass; "
+        "particle profile and pixel oracle pass; "
         f"10k prepare/draw/end {timings[0]}/{timings[1]}/{timings[2]} us; "
+        f"prepare validation/idle/stage/upload {phases[0]}/{phases[1]}/{phases[2]}/{phases[3]} us; "
+        f"draw geometry/geometry+clip/mapped stores {phases[4]}/{phases[5]}/{phases[6]} us; "
         f"100 {hundred[0]}/{hundred[1]}/{hundred[2]} us; "
         f"1k {thousand[0]}/{thousand[1]}/{thousand[2]} us"
     )
