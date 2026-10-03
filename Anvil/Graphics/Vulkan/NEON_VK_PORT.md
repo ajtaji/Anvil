@@ -16,6 +16,7 @@ Vulkan chrome primitives. They do not select a board backend or present a frame.
 | `GetGLTextWidth`, `Neon_Text`, `Neon_TextRight/Centre` | `Neon_TextWidth`, `Neon_Text`, and the Vulkan font callbacks | `NeonVkPortTextWidth/Text/TextRight/TextCentre` keep float position and RGBA arguments. |
 | `DrawGLSprite` | `NeonVkChromeImageSpriteDrawTransformId` and image registration | `NeonVkPortSpriteUpload/Sprite/Clear` keep crop, tint, angle, scale, and camera order through an explicit image reference. |
 | `BeginBatch/AddBatchedSprite/EndBatch` | `NeonVkChromeSpriteBatchBegin/Add/End` | `NeonVkPortSpriteBatchBegin/Add/End` retain one uploaded image reference and ordered full-image sprite calls. |
+| `InitParticleEngine/ClearParticles/AddParticle/RenderParticles` | `NeonVkChromeParticlesPrepare/DrawPrepared` | `NeonVkPortParticleInit/Clear/Add/ParticlesPrepare/ParticlesDrawPrepared` retain the ordered list and issue one Vulkan draw after explicit pre-frame preparation. |
 
 Call `NeonVkPortCanvas(canvasWidth, canvasHeight, targetWidth, targetHeight)`
 after the Vulkan render target is created. Target dimensions are its logical
@@ -105,6 +106,36 @@ emitted-code gate. The Pi 4 [BMP asset proof](../../../docs/evidence/neon-vk-bmp
 passed decoding, color key, alpha mask and an ordered Vulkan draw from a
 2×2 in-memory BMP. File loading and larger assets remain unproved on board.
 
+Include `neon_vk_particle_port.pi4` after the canvas port and Vulkan chrome.
+Call `NeonVkPortParticleInit(1)` to accept the quantized coordinate path,
+then `NeonVkPortParticleAdd` for each desktop
+center position, size, radian angle and RGBA color. `NeonVkPortParticleClear`
+resets the list. Call `NeonVkPortParticlesPrepare` after the final Add and
+camera update, before `NeonVkPortFrameBegin`; call
+`NeonVkPortParticlesDrawPrepared` at the former `RenderParticles` position
+inside the frame. DrawPrepared reuses the list on later frames. A changed
+camera, added particle, or clear requires another Prepare; otherwise a
+nonempty draw refuses stale data. Empty draws are no-ops. Prepare validates
+and uploads at most 10,000 ordered particles and snapshots the current
+`NeonVkPortCamera` values. Particle positions and camera offsets are in
+target/window pixels, matching the desktop particle shader's `screenSize`;
+virtual-canvas scaling is not applied. The target must match Chrome's logical
+extent. Float edges, colors and angles are rounded to integral pixels,
+8-bit channels and Q16 radians, so subpixel positions differ from desktop GL.
+
+The adapter owns a fixed CPU list and no Vulkan objects. Chrome creates and
+releases its palette and staging resources, and draws the prepared list in
+one ordered draw record. The current production Chrome route expands six
+vertices per particle on the CPU during DrawPrepared; a future direct GPU
+particle path can retain this Prepare/DrawPrepared seam. This is call and
+ordering portability, not GPU instancing or throughput parity. The restored
+desktop shader uses a square with local corners at ±0.5 while its fragment
+mask starts outside radius 0.8, so that source currently gives its square
+interior full alpha rather than a feathered circle. The Vulkan route keeps
+the square footprint and supports the same source-alpha blending, but raster
+edges and rotations remain quantized. The caller must reserve enough Chrome
+vertex capacity for six vertices per particle and one draw slot.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
@@ -118,7 +149,7 @@ cropped sprite) and `docs/evidence/neon-vk-port-geometry-pi4-20261003/README.md`
 application-level proofs. The resident Pi 4 console includes Vulkan chrome,
 but does not include this port adapter or a complete Neon-authored application.
 Broader image decoding, desktop font handles, UI layout/events, viewport
-presentation, and particle API compatibility remain to be ported.
+presentation, and particle throughput parity remain to be ported.
 
 Letterboxed or cropped viewports require their own viewport mapping; these
 adapters assume the full logical target. The default native Neon path and

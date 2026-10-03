@@ -1,0 +1,110 @@
+; Neon particle-call adapter for the resident Vulkan chrome particle route.
+; Include after neon_vk_port.pi4 and neon_vk_chrome.pi4. The adapter owns only
+; fixed CPU records. Chrome owns the palette image, staging buffer and draw.
+;
+; Neon RenderParticles samples camera state at render time, but Chrome needs
+; a validated/uploaded list before FrameBegin. Call Prepare after the final
+; Add and camera update, before FrameBegin; DrawPrepared replaces RenderParticles
+; inside the frame. A later Add, Clear, or camera change needs a new Prepare.
+
+#NEON_VK_PORT_ERR_PARTICLE_STATE = -21330
+#NEON_VK_PORT_ERR_PARTICLE_CAPACITY = -21331
+#NEON_VK_PORT_ERR_PARTICLE_ARGS = -21332
+#NEON_VK_PORT_ERR_PARTICLE_PREPARE = -21333
+
+Global Dim nvpParticleItems.NvcParticle[#NVC_PARTICLE_MAX]
+Global nvpParticleCount.i
+Global nvpParticleInitialized.i
+Global nvpParticlePrepared.i
+Global nvpParticleCameraX.f
+Global nvpParticleCameraY.f
+Global nvpParticleCameraZoom.f
+Global nvpParticleTargetW.i
+Global nvpParticleTargetH.i
+
+; Passing 1 explicitly accepts integral-pixel/Q16 quantization on this path.
+Procedure.i NeonVkPortParticleInit(acceptQuantized.i)
+  If acceptQuantized <> 1
+    nvpParticleInitialized = 0 : nvpParticlePrepared = 0
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  nvpParticleCount = 0 : nvpParticlePrepared = 0
+  nvpParticleInitialized = 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortParticleClear()
+  nvpParticleCount = 0 : nvpParticlePrepared = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; X/Y are desktop particle centres in target/window pixels. The underlying
+; Vulkan path stores integral top-left squares and a Q16 radian rotation.
+Procedure.i NeonVkPortParticleAdd(x.f, y.f, size.f, angle.f, r.f, g.f, b.f, a.f)
+  Protected left.i, top.i, right.i, bottom.i, angleQ16.i
+  If nvpParticleInitialized = 0 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE : EndIf
+  If nvpParticleCount >= #NVC_PARTICLE_MAX : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_CAPACITY : EndIf
+  If size <= 0.0 Or size > 4096.0 Or angle < -100.53 Or angle > 100.53
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  If x < -20000.0 Or x > 20000.0 Or y < -20000.0 Or y > 20000.0
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  left = nvpRound(x - size * 0.5) : right = nvpRound(x + size * 0.5)
+  top = nvpRound(y - size * 0.5) : bottom = nvpRound(y + size * 0.5)
+  angleQ16 = nvpRound(angle * 65536.0)
+  If left < -16384 Or left > 16384 Or top < -16384 Or top > 16384
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  If right - left < 1 Or bottom - top < 1 Or right - left > 4096 Or bottom - top > 4096 Or angleQ16 < -6588400 Or angleQ16 > 6588400
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  nvpParticleItems[nvpParticleCount]\x = left : nvpParticleItems[nvpParticleCount]\y = top
+  nvpParticleItems[nvpParticleCount]\width = right - left : nvpParticleItems[nvpParticleCount]\height = bottom - top
+  nvpParticleItems[nvpParticleCount]\angleQ16 = angleQ16
+  nvpParticleItems[nvpParticleCount]\colour = NeonVkPortColour(r, g, b, a)
+  nvpParticleItems[nvpParticleCount]\ignoreCamera = 0
+  nvpParticleCount = nvpParticleCount + 1
+  nvpParticlePrepared = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; Validate once and upload one ordered palette. No device resources are owned
+; here; a failure leaves the list dirty and DrawPrepared refuses stale data.
+Procedure.i NeonVkPortParticlesPrepare()
+  Protected i.i, rc.i, cameraX.i, cameraY.i, zoomQ16.i
+  If nvpParticleInitialized = 0 Or nvpCanvasW = 0 Or nvpTargetW <> nvcLogicalW Or nvpTargetH <> nvcLogicalH
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE
+  EndIf
+  If nvpCameraX < -16384.0 Or nvpCameraX > 16384.0 Or nvpCameraY < -16384.0 Or nvpCameraY > 16384.0 Or nvpCameraZoom <= 0.0 Or nvpCameraZoom > 16.0
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
+  EndIf
+  cameraX = nvpRound(nvpCameraX) : cameraY = nvpRound(nvpCameraY)
+  zoomQ16 = nvpRound(nvpCameraZoom * 65536.0)
+  If zoomQ16 < 1 Or zoomQ16 > 1048576 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS : EndIf
+  nvpParticlePrepared = 0
+  If nvpParticleCount > 0
+    For i = 0 To nvpParticleCount - 1
+      nvpParticleItems[i]\cameraX = cameraX : nvpParticleItems[i]\cameraY = cameraY
+      nvpParticleItems[i]\zoomQ16 = zoomQ16
+    Next
+    rc = NeonVkChromeParticlesPrepare(@nvpParticleItems[0], nvpParticleCount)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  EndIf
+  nvpParticleCameraX = nvpCameraX : nvpParticleCameraY = nvpCameraY
+  nvpParticleCameraZoom = nvpCameraZoom
+  nvpParticleTargetW = nvpTargetW : nvpParticleTargetH = nvpTargetH
+  nvpParticlePrepared = 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+; One Vulkan draw record for the ordered list. Chrome expands the vertices in
+; its existing path; this wrapper does not loop or draw per particle here.
+Procedure.i NeonVkPortParticlesDrawPrepared()
+  If nvpParticleInitialized = 0 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE : EndIf
+  If nvpParticleCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvpParticlePrepared = 0 Or nvpTargetW <> nvpParticleTargetW Or nvpTargetH <> nvpParticleTargetH Or nvpCameraX <> nvpParticleCameraX Or nvpCameraY <> nvpParticleCameraY Or nvpCameraZoom <> nvpParticleCameraZoom
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_PREPARE
+  EndIf
+  ProcedureReturn NeonVkChromeParticlesDrawPrepared()
+EndProcedure
