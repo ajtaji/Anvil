@@ -1644,8 +1644,12 @@ def run(args: argparse.Namespace) -> int:
             print(f"  screen {args.tier}")
 
         # ---- what the capture area holds BEFORE the run -------------------
-        before = parse_shot_status_seq(console.command("shot status", 10))
-        record["shot_seq_before"] = before
+        # Offscreen tests explicitly request no capture. They have no
+        # sequence to compare and need not spend a UDP command on this.
+        before = 0
+        if not args.no_shot:
+            before = parse_shot_status_seq(console.command("shot status", 10))
+            record["shot_seq_before"] = before
 
         # ---- the transfer -------------------------------------------------
         # THE LISTENER IS ARMED WITHOUT WAITING FOR A PROMPT, because the
