@@ -2,7 +2,7 @@
 ; TrueType slot layer borrows immutable committed buffers, and renderers may
 ; consume only the currently selected parser face.
 
-#ANVIL_FONT_SLOT_COUNT = #ANVIL_TTS_MAX_SLOTS
+#ANVIL_FONT_SLOT_COUNT = 4
 #ANVIL_FONT_MAX_BYTES = #ANVIL_TTS_MAX_BYTES
 #ANVIL_FONT_READ_CHUNK = 4096
 #ANVIL_FONT_PATH_BYTES = 1024
@@ -10,7 +10,31 @@
 Global Dim anvil_font_slot_data.a[#ANVIL_FONT_SLOT_COUNT * #ANVIL_FONT_MAX_BYTES]
 Global Dim anvil_font_slot_path.a[#ANVIL_FONT_SLOT_COUNT * #ANVIL_FONT_PATH_BYTES]
 Global anvil_font_bootChecked.i
+Global anvil_font_embeddedReady.i
 Global anvil_font_pixel_limit.i = 512
+
+; The image carries one parser-ready face for the first screen frame. Its
+; private slot borrows immutable image bytes; the four command slots remain
+; available for files loaded after the storage medium mounts.
+Procedure.i AnvilFontBootEmbeddedInit()
+  If anvil_font_embeddedReady <> 0 : ProcedureReturn 1 : EndIf
+  AnvilTrueTypeSlotsInit()
+  If #ANVIL_BOOT_TTF_BYTES < 1 Or #ANVIL_BOOT_TTF_BYTES > #ANVIL_TTS_MAX_BYTES
+    PrintN("!! embedded TrueType font is outside the slot size limit")
+    ProcedureReturn 0
+  EndIf
+  If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT, ?anvilBootTtf, #ANVIL_BOOT_TTF_BYTES) = 0
+    PrintN("!! embedded TrueType font failed validation")
+    ProcedureReturn 0
+  EndIf
+  If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT) = 0
+    PrintN("!! embedded TrueType font could not be selected")
+    ProcedureReturn 0
+  EndIf
+  AnvilTrueTypeSetDefaultSlot(#ANVIL_TTS_BOOT_SLOT)
+  anvil_font_embeddedReady = 1
+  ProcedureReturn 1
+EndProcedure
 
 ; Boards with a fixed-cell display may narrow the shared command's size
 ; range without changing the parser or other boards' default behavior.
@@ -27,8 +51,6 @@ Procedure.i AnvilFontSettingsBootApply()
   If anvil_font_bootChecked <> 0 : ProcedureReturn 1 : EndIf
   anvil_font_bootChecked = 1
   If SettingsLoadState() = 0
-    AnvilTrueTypeSetDefaultSlot(-1)
-    AnvilTrueTypeSlotDeselect()
     ProcedureReturn 1
   EndIf
   *value = SettingsGet("font.size")
@@ -46,28 +68,24 @@ Procedure.i AnvilFontSettingsBootApply()
   EndIf
   *value = SettingsGet("font.default")
   If *value = 0
-    AnvilTrueTypeSetDefaultSlot(-1)
-    AnvilTrueTypeSlotDeselect()
     ProcedureReturn 1
   EndIf
   If SettingsLength("font.default")=6 And PeekA(*value)=98 And PeekA(*value+1)=105 And PeekA(*value+2)=116 And PeekA(*value+3)=109 And PeekA(*value+4)=97 And PeekA(*value+5)=112
-    AnvilTrueTypeSetDefaultSlot(-1)
-    AnvilTrueTypeSlotDeselect()
+    PrintN("saved bitmap font choice skipped; the boot display requires TrueType")
     ProcedureReturn 1
   EndIf
   pathBytes = SettingsLength("font.default")
-  AnvilTrueTypeSetDefaultSlot(0)
   If pathBytes > 0 And pathBytes < #ANVIL_FONT_PATH_BYTES
     If anvil_font_LoadFile(0, *value, pathBytes) <> 0
       If AnvilTrueTypeSlotSelect(0) <> 0
+        AnvilTrueTypeSetDefaultSlot(0)
         Print("default TrueType font loaded from ") : UartWriteStr(*value) : PrintNl()
         ProcedureReturn 1
       EndIf
     EndIf
   EndIf
-  AnvilTrueTypeSlotDeselect()
   Print("!! configured default font is unavailable: ") : UartWriteStr(*value)
-  PrintN("; built-in bitmap font remains active")
+  PrintN("; embedded TrueType font remains active")
   ProcedureReturn 0
 EndProcedure
 
@@ -145,7 +163,9 @@ Procedure anvil_font_Info()
   Print("  text size ") : PrintDec(AnvilTrueTypePixelHeight()) : PrintN(" pixels")
   defaultSlot = AnvilTrueTypeDefaultSlot()
   *defaultPath = SettingsGet("font.default")
-  If defaultSlot < 0
+  If defaultSlot = #ANVIL_TTS_BOOT_SLOT
+    PrintN("  default font: embedded TrueType")
+  ElseIf defaultSlot < 0
     PrintN("  default font: built-in bitmap")
   ElseIf AnvilTrueTypeSlotBytes(defaultSlot) > 0
     Print("  default font: slot ") : PrintDec(defaultSlot)

@@ -68,7 +68,7 @@ Procedure.i AnvilTrueTypeLayoutUtf8(text.i,byteCount.i,pixelHeight.i,maxWidth.i,
   Protected count.i,unitsPerEm.i,index.i,lineStart.i,lineEnd.i
   Protected metric.i,lsb.i,pen.q,maxWidthFixed.q,lineHeightFixed.q,lineBaseline.q,lineOffset.q
   Protected lines.i,maxMeasured.q,advance.q,position.i,pairResult.i,pendingLines.i
-  Protected pairAdvance1.q,pairAdvance2.q
+  Protected pairAdvance1.q,pairAdvance2.q,pairStep.q,pairIndex.i
   If glyphCountOut=0 Or lineCountOut=0 Or measuredWidthOut=0 Or capacity<0 Or pixelHeight<=0 Or lineHeight<=0 Or maxWidth<0 Or alignment<0 Or alignment>2
     anvil_ttl_error=#ANVIL_TTL_E_ARGUMENT : ProcedureReturn 0
   EndIf
@@ -115,10 +115,20 @@ Procedure.i AnvilTrueTypeLayoutUtf8(text.i,byteCount.i,pixelHeight.i,maxWidth.i,
       If lineEnd=lineStart
         pen=advance : lineEnd+1
       Else
+        ; The pair API may report a valid no-match without writing all
+        ; eight fields. Clear the last pair's offsets before every query.
+        For pairIndex=0 To 7 : anvil_ttl_pairValues[pairIndex]=0 : Next
         pairResult=AnvilTrueTypePairPosition(anvil_ttl_glyph[lineEnd-1],anvil_ttl_glyph[lineEnd],@anvil_ttl_pairValues[0])
         If pairResult=0 : anvil_ttl_error=#ANVIL_TTL_E_PAIR : ProcedureReturn 0 : EndIf
         pairAdvance1=anvil_ttl_Scale(anvil_ttl_pairValues[2],pixelHeight,unitsPerEm)
         pairAdvance2=anvil_ttl_Scale(anvil_ttl_pairValues[6],pixelHeight,unitsPerEm)
+        pairStep=pairAdvance1+advance+pairAdvance2
+        ; A combining mark can legitimately have zero hmtx advance and
+        ; leave the pen in place. A negative or screen-wide pair step is
+        ; invalid here and must still be reported.
+        If pairStep<0 Or pairStep>pixelHeight*4*65536
+          anvil_ttl_error=#ANVIL_TTL_E_PAIR : ProcedureReturn 0
+        EndIf
         ; Previous pen already included value1/value2 from earlier pairs.
         ; Add this pair's first advance to the previous glyph and second to this one.
         If maxWidthFixed>0 And pen+pairAdvance1+advance+pairAdvance2>maxWidthFixed

@@ -202,6 +202,11 @@ Global Dim gConIn.a[#NETCON_IN_RING]
 Global gConInHead.i = 0
 Global gConInTail.i = 0
 Global Dim gConOut.a[#NETCON_OUT_MAX]
+Global gConOutPending.i
+Global gConOutDiscarded.i
+Global gConOutFail.i
+Global gConOutCooling.i
+Global gConOutRetryAt.i
 Global Dim gConTx.a[#NETCON_TX_MAX]
 Global Dim gConRx.a[#NETCON_RX_MAX]
 Global Dim gConNetMac.a[6]         ; scratch for NetGetMac
@@ -463,6 +468,15 @@ EndProcedure
 
 Procedure netcon_ForgetOwner()
   Define i.i
+  Define c.i
+  ; A command that never regained transmit credit must not hand its
+  ; remaining output to the next endpoint that claims this console.
+  gConOutDiscarded = gConOutDiscarded + gConOutPending
+  c = UartAuxGet()
+  While c >= 0
+    gConOutDiscarded = gConOutDiscarded + 1
+    c = UartAuxGet()
+  Wend
   gConOwner = #NETCON_OWNER_NONE
   gConPeerOk = 0
   gConPeerIp = 0
@@ -471,6 +485,8 @@ Procedure netcon_ForgetOwner()
   gConPeerDstIp = 0
   gConInHead = 0
   gConInTail = 0
+  gConOutPending = 0
+  gConOutCooling = 0
   For i = 0 To 5 : gConPeerMac[i] = 0 : Next
 EndProcedure
 
@@ -533,6 +549,14 @@ Procedure.i NetConsoleTxFails()
   ProcedureReturn gConTxFail
 EndProcedure
 
+Procedure.i NetConsoleOutputFailures()
+  ProcedureReturn gConOutFail
+EndProcedure
+
+Procedure.i NetConsoleOutputDiscarded()
+  ProcedureReturn gConOutDiscarded
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  NetConsoleFlush - send whatever the aux tap captured to the peer.
 ;
@@ -542,22 +566,26 @@ EndProcedure
 ;  it is re-entry guarded so a print from deep in the send path cannot
 ;  recurse back into it.
 ; ----------------------------------------------------------------------
-Procedure NetConsoleFlush()
+Procedure.i NetConsoleFlush()
   Define c.i
   Define nOut.i
   Define fn.i
+  Define tries.i
+  Define sent.i
   If gConOn = 0 Or gConFlushing <> 0
-    ProcedureReturn
+    ProcedureReturn 0
   EndIf
   gConFlushing = 1
   ; With no peer, still drain so the ring cannot fill and start dropping.
   If gConPeerOk = 0
+    gConOutPending = 0
+    gConOutCooling = 0
     c = UartAuxGet()
     While c >= 0
       c = UartAuxGet()
     Wend
     gConFlushing = 0
-    ProcedureReturn
+    ProcedureReturn 1
   EndIf
   ; Drain the WHOLE ring, a datagram at a time. Ordinary per-line output
   ; leaves one short line here and this sends a single datagram; a
@@ -565,21 +593,44 @@ Procedure NetConsoleFlush()
   ; it as back-to-back full datagrams IN ORDER, so the terminator the
   ; emitter prints after the last run really does follow every run on the
   ; wire rather than being stranded behind an un-flushed tail.
+  ; A producer may flush on every byte once its mirror is nearly full.
+  ; After a refused send, space out later retries rather than spending another
+  ; pair of link timeouts on every character of a long command.
+  If gConOutCooling <> 0
+    If ((millis() - gConOutRetryAt) & $FFFFFFFF) < 100
+      gConFlushing = 0
+      ProcedureReturn 0
+    EndIf
+    gConOutCooling = 0
+  EndIf
   Repeat
-    nOut = 0
-    While nOut < #NETCON_OUT_MAX
-      c = UartAuxGet()
-      If c < 0
-        Break
-      EndIf
-      gConOut[nOut] = c
-      nOut = nOut + 1
-    Wend
+    nOut = gConOutPending
+    If nOut = 0
+      While nOut < #NETCON_OUT_MAX
+        c = UartAuxGet()
+        If c < 0
+          Break
+        EndIf
+        gConOut[nOut] = c
+        nOut = nOut + 1
+      Wend
+      gConOutPending = nOut
+    EndIf
     If nOut = 0
       Break
     EndIf
     fn = netcon_BuildUdp(@gConOut[0], nOut)
-    If fn > 0
+    If fn <= 0
+      gConOutFail = gConOutFail + 1
+      gConFlushing = 0
+      ProcedureReturn 0
+    EndIf
+    ; Only a refused link send may be tried again. The pending bytes stay
+    ; intact until one send succeeds, so a later flush cannot skip them.
+    tries = 0
+    sent = 0
+    Repeat
+      tries = tries + 1
       ; OUT OF THE PEER'S OWN INTERFACE, NOT THE ANNOUNCED ONE. This is
       ; where the board's OUTPUT goes back to whoever is driving it, and
       ; a board with a cable and a radio both addressed has two doors: a
@@ -587,13 +638,26 @@ Procedure NetConsoleFlush()
       ; gets nothing, and the board reports having answered. gConKind
       ; was right while the console could only be in one place, and the
       ; gate catches this one directly - a64_wificon_check case D.
-      HwLinkSend(gConPeerKind, @gConTx[0], fn, 100)
+      If HwLinkSend(gConPeerKind, @gConTx[0], fn, 100) = 1
+        sent = 1
+        Break
+      EndIf
+      gConOutFail = gConOutFail + 1
+    Until tries >= 2
+    If sent = 0
+      gConOutCooling = 1
+      gConOutRetryAt = millis()
+      gConFlushing = 0
+      ProcedureReturn 0
     EndIf
+    gConOutPending = 0
+    gConOutCooling = 0
     If uart_auxBulk <> 0
       delayMicroseconds(#NETCON_PACE_US)
     EndIf
   ForEver
   gConFlushing = 0
+  ProcedureReturn 1
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -661,7 +725,9 @@ Procedure.i NetConsoleWriteBulk(*p, n.i)
   If n <= 0 Or n > #NETCON_OUT_MAX
     ProcedureReturn 0
   EndIf
-  NetConsoleFlush()
+  If NetConsoleFlush() = 0
+    ProcedureReturn 0
+  EndIf
   fn = netcon_BuildUdp(*p, n)
   If fn <= 0
     gConTxFail = gConTxFail + 1
@@ -826,6 +892,12 @@ EndProcedure
 ; convergence point this procedure already is, is where it belongs; the
 ; release happens before ReadLine, which is the next thing that pumps.
 Procedure NetConsoleCommandDone()
+  ; A failed output send remains pending. Give it one final bounded chance
+  ; while the command's peer is still known, then release the session.
+  If gConOutPending <> 0
+    gConOutCooling = 0
+    NetConsoleFlush()
+  EndIf
   NetIfReleaseRx()
   netcon_ForgetOwner()
   gConAtPrompt = 1

@@ -21,9 +21,9 @@
 #NEON_VK_CHROME_ATLAS_PAD      = 64
 #NEON_VK_CHROME_MAX_QUADS      = 4096
 #NEON_VK_CHROME_MAX_VERTICES   = #NEON_VK_CHROME_MAX_QUADS * 6
-; Draw records remain capped at 4096. Resident console text uses one cached
-; glyph quad per visible cell, bounded by the full 256x80 grid plus 512 UI
-; quads. At the current 24-byte vertex stride this reserves 3,022,848 bytes.
+; Draw records remain capped at 4096. The resident console counts actual ink
+; quads before each frame and reserves this vertex budget plus UI headroom.
+; At the current 24-byte vertex stride this reserves 3,022,848 bytes.
 #NEON_VK_CHROME_MAX_VERTEX_QUADS = 20992
 #NEON_VK_CHROME_MAX_PATH_POINTS = 4096
 #NEON_VK_CHROME_WAIT_NS        = 2000000000
@@ -160,6 +160,12 @@ Global Dim nvcTTBearingX.i[#NEON_VK_CHROME_TT_CACHE_MAX]
 Global Dim nvcTTBearingY.i[#NEON_VK_CHROME_TT_CACHE_MAX]
 Global Dim nvcTTAdvance.i[#NEON_VK_CHROME_TT_CACHE_MAX]
 Global Dim nvcTTCoverage.a[#NEON_VK_CHROME_TT_COVERAGE]
+Global nvcGridMetricSlot.i = -1
+Global nvcGridMetricGeneration.i = -1
+Global nvcGridMetricPixels.i = 0
+Global nvcGridMetricW.i = 0
+Global nvcGridMetricH.i = 0
+Global nvcGridMetricBaseline.i = 0
 Global Dim nvcTTDecoded.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global Dim nvcTTLayoutGlyph.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global Dim nvcTTLayoutX.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
@@ -1319,6 +1325,57 @@ Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
   ProcedureReturn entry
 EndProcedure
 
+; Measure the printable console alphabet from the rasterizer's actual bitmap
+; bounds before choosing terminal geometry. No cell may rescale a glyph: the
+; width covers both advance and overhang when the advance is centered.
+Procedure.i NeonVkChromeGridMeasure(pixelHeight.i, widthOut.i, heightOut.i, baselineOut.i)
+  Define slot.i, generation.i, units.i, ascent.i, descent.i, gap.i
+  Define cp.i, glyph.i, width.i, height.i, stride.i, bearingX.i, bearingY.i, advance.i
+  Define needW.i, right.i, maxW.i, above.i, below.i, baseline.i, cellH.i
+  If widthOut = 0 Or heightOut = 0 Or baselineOut = 0 Or pixelHeight < 1 Or pixelHeight > 512
+    ProcedureReturn 0
+  EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot < 0 Or AnvilTrueTypeSlotParserBound() = 0 : ProcedureReturn 0 : EndIf
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  If slot = nvcGridMetricSlot And generation = nvcGridMetricGeneration And pixelHeight = nvcGridMetricPixels
+    PokeI(widthOut, nvcGridMetricW) : PokeI(heightOut, nvcGridMetricH) : PokeI(baselineOut, nvcGridMetricBaseline)
+    ProcedureReturn 1
+  EndIf
+  units = AnvilTrueTypeUnitsPerEm()
+  If units < 1 : ProcedureReturn 0 : EndIf
+  ascent = (AnvilTrueTypeAscender() * pixelHeight + units - 1) / units
+  descent = (0 - AnvilTrueTypeDescender() * pixelHeight + units - 1) / units
+  gap = (AnvilTrueTypeLineGap() * pixelHeight + units - 1) / units
+  If ascent < 0 : ascent = 0 : EndIf
+  If descent < 0 : descent = 0 : EndIf
+  If gap < 0 : gap = 0 : EndIf
+  maxW = 1 : above = 0 : below = 0
+  For cp = 32 To 126
+    glyph = AnvilTrueTypeGlyphForCodepoint(cp)
+    If glyph < 0 Or glyph >= AnvilTrueTypeGlyphCount() : ProcedureReturn 0 : EndIf
+    If AnvilTrueTypeRasterizeGlyph(glyph, pixelHeight, @nvcTTCoverage[0], #NEON_VK_CHROME_TT_COVERAGE, @width, @height, @stride, @bearingX, @bearingY, @advance) = 0
+      ProcedureReturn 0
+    EndIf
+    needW = advance
+    If bearingX < 0 And advance - 2 * bearingX > needW : needW = advance - 2 * bearingX : EndIf
+    right = bearingX + width
+    If right > advance And 2 * right - advance > needW : needW = 2 * right - advance : EndIf
+    If needW > maxW : maxW = needW : EndIf
+    If bearingY > above : above = bearingY : EndIf
+    If height - bearingY > below : below = height - bearingY : EndIf
+  Next
+  baseline = ascent
+  If above > baseline : baseline = above : EndIf
+  baseline = baseline + 1
+  If descent > below : below = descent : EndIf
+  cellH = baseline + below + gap + 1
+  nvcGridMetricSlot = slot : nvcGridMetricGeneration = generation : nvcGridMetricPixels = pixelHeight
+  nvcGridMetricW = maxW + 2 : nvcGridMetricH = cellH : nvcGridMetricBaseline = baseline
+  PokeI(widthOut, nvcGridMetricW) : PokeI(heightOut, nvcGridMetricH) : PokeI(baselineOut, baseline)
+  ProcedureReturn 1
+EndProcedure
+
 ; Warm complete UTF-8 runs before Begin. The cache key includes slot generation
 ; and pixel height; a miss is rasterized once and uploaded as one full-atlas
 ; transaction before any frame can reference the new UVs.
@@ -1437,7 +1494,7 @@ EndProcedure
 ; horizontally without also shrinking their cap height.
 ; The cache key is checked exactly; a miss during a render pass fails before
 ; touching the vertex buffer because raster/upload is pre-frame work.
-Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i)
+Procedure.i nvcGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i, nativeSize.i)
   Define slot.i
   Define entry.i
   Define units.i
@@ -1479,25 +1536,35 @@ Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i
   If units < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
   ascent = (AnvilTrueTypeAscender() * pixelHeight) / units
   lineHeight = ((AnvilTrueTypeAscender() - AnvilTrueTypeDescender()) * pixelHeight) / units
-  baseline = cellY + ((cellH - lineHeight) / 2) + ascent
+  If nativeSize <> 0
+    If slot <> nvcGridMetricSlot Or nvcGridBatchGeneration <> nvcGridMetricGeneration Or pixelHeight <> nvcGridMetricPixels Or cellW <> nvcGridMetricW Or cellH <> nvcGridMetricH
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+    baseline = cellY + nvcGridMetricBaseline
+  Else
+    baseline = cellY + ((cellH - lineHeight) / 2) + ascent
+  EndIf
   glyphLeft = cellX + ((cellW - nvcTTAdvance[entry]) / 2) + nvcTTBearingX[entry]
   glyphTop = baseline - nvcTTBearingY[entry]
   glyphW = nvcTTW[entry] : glyphH = nvcTTH[entry]
   cellRight = cellX + cellW : cellBottom = cellY + cellH
-  If glyphW > cellW
-    ; Compress only X and retain the complete source UV rectangle. The
-    ; baseline and bitmap height must match a glyph that already fits.
-    glyphW = cellW
-    glyphLeft = cellX
+  If nativeSize <> 0
+    ; The grid was measured from real raster bounds. A mismatch is an error,
+    ; never an invitation to stretch, squeeze or clip a TrueType bitmap.
+    If glyphLeft < cellX Or glyphLeft + glyphW > cellRight Or glyphTop < cellY Or glyphTop + glyphH > cellBottom
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
   Else
-    If glyphLeft < cellX : glyphLeft = cellX : EndIf
-    If glyphLeft + glyphW > cellRight : glyphLeft = cellRight - glyphW : EndIf
+    If glyphW > cellW
+      glyphW = cellW : glyphLeft = cellX
+    Else
+      If glyphLeft < cellX : glyphLeft = cellX : EndIf
+      If glyphLeft + glyphW > cellRight : glyphLeft = cellRight - glyphW : EndIf
+    EndIf
+    If glyphH > cellH : glyphH = cellH : EndIf
+    If glyphTop < cellY : glyphTop = cellY : EndIf
+    If glyphTop + glyphH > cellBottom : glyphTop = cellBottom - glyphH : EndIf
   EndIf
-  ; A truly oversized bitmap is bounded on Y independently; horizontal
-  ; fitting alone never changes its height or vertically centres it.
-  If glyphH > cellH : glyphH = cellH : EndIf
-  If glyphTop < cellY : glyphTop = cellY : EndIf
-  If glyphTop + glyphH > cellBottom : glyphTop = cellBottom - glyphH : EndIf
   glyphRight = glyphLeft + glyphW : glyphBottom = glyphTop + glyphH
   u0 = neon_F32Ratio(nvcTTX[entry], nvcAtlasW)
   v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
@@ -1506,6 +1573,50 @@ Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i
   nvcQuad(nvcVertices, glyphLeft, glyphTop, glyphRight, glyphBottom, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
   ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i)
+  ProcedureReturn nvcGridGlyphAppend(glyph, pixelHeight, cellX, cellY, cellW, cellH, 0)
+EndProcedure
+
+Procedure.i NeonVkChromeGridGlyphAppendNative(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i, cellH.i)
+  ProcedureReturn nvcGridGlyphAppend(glyph, pixelHeight, cellX, cellY, cellW, cellH, 1)
+EndProcedure
+
+; Append at the font layout engine's actual 16.16 pen position. The atlas
+; bitmap and its bearings are used unchanged; there is no fixed-width cell
+; and no per-glyph rounding of the advance before the next glyph is placed.
+Procedure.i NeonVkChromeGridGlyphAppendPositioned(glyph.i, pixelHeight.i, penXFixed.i, baselineY.i, placementYFixed.i)
+  Define slot.i, entry.i, left.i, top.i, u0.i, v0.i, u1.i, v1.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcMapped = 0 Or nvcGridBatchActive = 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If pixelHeight < 1 Or pixelHeight > 512 Or glyph < 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  slot = AnvilTrueTypeSlotSelected()
+  If slot <> nvcGridBatchSlot Or AnvilTrueTypeSlotParserBound() = 0 Or AnvilTrueTypeSlotGeneration(slot) <> nvcGridBatchGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  entry = nvcTTCacheFind(slot, nvcGridBatchGeneration, pixelHeight, glyph)
+  If entry < 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  If nvcTTW[entry] = 0 Or nvcTTH[entry] = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcVertices > (nvcMaxVertexQuads * 6) - 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  left = nvcTTFixed16Floor(penXFixed) + nvcTTBearingX[entry]
+  top = baselineY - nvcTTFixed16Floor(placementYFixed) - nvcTTBearingY[entry]
+  u0 = neon_F32Ratio(nvcTTX[entry], nvcAtlasW)
+  v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
+  u1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
+  v1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
+  nvcQuad(nvcVertices, left, top, left + nvcTTW[entry], top + nvcTTH[entry], u0, v0, u1, v1)
+  nvcVertices = nvcVertices + 6
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeGridBaseline()
+  ProcedureReturn nvcGridMetricBaseline
 EndProcedure
 
 ; Flush only the vertices appended since the last flush, then advance the
