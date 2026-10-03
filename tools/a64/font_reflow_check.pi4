@@ -1,0 +1,77 @@
+; The runner inserts ScreenRebuildAtGeometry from screen_cmd.pi4 here.
+#ANVIL_VULKAN_CONSOLE = 1
+#ANVIL_V3D_CONSOLE = 1
+
+Global gVkReady.i, gSlot.i, gScreenFontMetricFault.i
+Global gV3dConOn.i, gCursorGpuOwned.i, gDma.i, gScreenBg.i
+Global gScreenDeferFirstFrame.i, gPaint.i
+Global gStopCalls.i, gInvalidateCalls.i, gDmaCalls.i
+Global gClearCalls.i, gPresentCalls.i, gGridCalls.i, gReplayCalls.i
+
+Procedure.i VulkanConsoleReady() : ProcedureReturn gVkReady : EndProcedure
+Procedure.i AnvilTrueTypeSlotSelected() : ProcedureReturn gSlot : EndProcedure
+Procedure.i VulkanConsoleStop()
+  gStopCalls + 1 : gVkReady = 0 : ProcedureReturn 1
+EndProcedure
+Procedure.i V3dConInvalidate()
+  gInvalidateCalls + 1 : ProcedureReturn 1
+EndProcedure
+Procedure.i ScreenDmaUp()
+  gDmaCalls + 1 : ProcedureReturn 1
+EndProcedure
+Procedure DisplayAutoFlush(on.i) : EndProcedure
+Procedure.i DisplayRGB(r.i, g.i, b.i) : ProcedureReturn r + g + b : EndProcedure
+Procedure DisplayColour(fg.i, bg.i) : EndProcedure
+Procedure DisplayClear(bg.i) : gClearCalls + 1 : EndProcedure
+Procedure DrawBanner() : EndProcedure
+Procedure.i LogoHeight() : ProcedureReturn 120 : EndProcedure
+Procedure.i DisplayWidth() : ProcedureReturn 1280 : EndProcedure
+Procedure.i DisplayHeight() : ProcedureReturn 800 : EndProcedure
+Procedure DisplayConsole(x.i, y.i, w.i, h.i) : EndProcedure
+Procedure ScreenConsoleGridInit() : gGridCalls + 1 : EndProcedure
+Procedure ConPaintDma() : EndProcedure
+Procedure VulkanConsolePump() : EndProcedure
+Procedure ConSetRenderer(renderer.i) : gPaint = renderer : EndProcedure
+Procedure ConMirrorDrain() : EndProcedure
+Procedure UartMirrorSetDrain(renderer.i) : EndProcedure
+Procedure.i BootTranscriptCount() : ProcedureReturn 3 : EndProcedure
+Procedure.i BootTranscriptAt(index.i) : ProcedureReturn 65 + index : EndProcedure
+Procedure ConGridPutc(c.i) : gReplayCalls + 1 : EndProcedure
+Procedure TouchKeyboardOverlayReset() : EndProcedure
+Procedure HwTouchFlush() : EndProcedure
+Procedure ScrPresentAll() : gPresentCalls + 1 : EndProcedure
+
+__REBUILD__
+
+Procedure ResetCounts()
+  gStopCalls = 0 : gInvalidateCalls = 0 : gDmaCalls = 0
+  gClearCalls = 0 : gPresentCalls = 0 : gGridCalls = 0 : gReplayCalls = 0
+  gPaint = 0 : gScreenDeferFirstFrame = 0
+EndProcedure
+
+Procedure.i CheckReflow()
+  ResetCounts()
+  gVkReady = 1 : gSlot = 1 : gScreenFontMetricFault = 0
+  ScreenRebuildAtGeometry(1)
+  If gPaint <> @VulkanConsolePump : ProcedureReturn 1 : EndIf
+  If gStopCalls <> 0 Or gInvalidateCalls <> 0 Or gDmaCalls <> 0 : ProcedureReturn 2 : EndIf
+  If gClearCalls <> 0 Or gPresentCalls <> 0 : ProcedureReturn 3 : EndIf
+  If gGridCalls <> 1 Or gReplayCalls <> 3 : ProcedureReturn 4 : EndIf
+  If gVkReady <> 1 : ProcedureReturn 5 : EndIf
+
+  ResetCounts()
+  gVkReady = 1 : gSlot = 1 : gScreenFontMetricFault = 0
+  ScreenRebuildAtGeometry(0)
+  If gPaint <> @ConPaintDma : ProcedureReturn 6 : EndIf
+  If gInvalidateCalls <> 1 Or gDmaCalls <> 1 : ProcedureReturn 7 : EndIf
+  If gClearCalls <> 1 Or gPresentCalls <> 1 : ProcedureReturn 8 : EndIf
+
+  ResetCounts()
+  gVkReady = 1 : gSlot = -1 : gScreenFontMetricFault = 1
+  ScreenRebuildAtGeometry(1)
+  If gStopCalls <> 1 Or gVkReady <> 0 : ProcedureReturn 9 : EndIf
+  If gPaint <> @ConPaintDma : ProcedureReturn 10 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+PokeI($300000, CheckReflow())
