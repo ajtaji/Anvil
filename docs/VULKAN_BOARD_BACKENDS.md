@@ -2,7 +2,7 @@
 
 The shared Vulkan object and command layer is board-neutral. Its backend seam is declared in `Anvil/Graphics/Vulkan/vk_foundation.pbi`: capabilities, device preparation and limits, memory/image planning, validated transfer submission, completion polling, and closed draw/pipeline records. Portable code passes resolved records rather than board handles or packet formats.
 
-Backend choice is **static at build time**. Exactly one backend file is included; none and test both deliberately implement the same seam. There is no runtime registration or dynamic backend loading. Capability bits describe the linked backend, so device, clear, GPU, draw, source-over blend, and draw-list support can be reported independently.
+Backend choice is **static at build time**. Exactly one backend file is included; none, test, software, and V3D implementations share the seam. There is no runtime registration or dynamic backend loading. Capability bits describe the linked backend, so device, clear, GPU, draw, source-over blend, and draw-list support can be reported independently.
 
 | Board/build | Current backend or monitor composition | GPU capability and proven scope |
 |---|---|---|
@@ -12,7 +12,7 @@ Backend choice is **static at build time**. Exactly one backend file is included
 | ROCK Pi 4C monitor | `RockPi4C/Board/board.rockpi4c` | The EL3 monitor root does not include a Vulkan API/backend. Guarded Mali-T860 fragment payloads have rendered bounded images, but production console drawing uses RGA2/PL330 and no Vulkan/Mali driver is installed. |
 | Raspberry Pi 5 monitor | The shared `RaspberryPi4/Board/board.pi4` has a BCM2712 composition, built for the card by `tools/pi5_card_build.py` with `RaspberryPi5/Board/armstub8-2712.asm`. The older `RaspberryPi5/Boot/board.pi4` is only an entry probe. | Anvil reached `pmf>` at EL3 on Pi 5 silicon from commit `f385c7b`, with an HDMI console. V3D 7.1 TFU and CSD/QPU support has desk-gated probes, but the production monitor has no Pi 5 Vulkan graphics backend or GPU-rendered console proof. |
 
-`vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. A future board build that includes the portable API but has no GPU backend can link `vk_backend_none.pbi`; it enumerates no physical device.
+`vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. `vk_backend_software.pbi` executes a bounded command subset on the CPU and deliberately omits the GPU capability bit; no production board monitor currently links it or presents its frames. A build may instead link `vk_backend_none.pbi`, which enumerates no physical device. These choices keep the public Vulkan command layer available for future board integration without treating a compile/link probe as display support.
 
 The current Pi 4 production adapter has also passed a fresh 15-scene Neon
 widget run: all 245,760 reference pixels matched the native golden corpus,
