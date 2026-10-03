@@ -77,6 +77,32 @@ keeps the group active for retry. Begin can discard that group and start a
 fresh one, matching the desktop batch count reset. The port's FrameEnd refuses
 an unfinished group so it cannot disappear without an explicit End.
 
+Include `neon_vk_sprite_asset.pi4` after the sprite adapter and the selected
+board's `HwFile*` implementation to load pixels. `NeonVkPortSpriteLoadRGBA`
+accepts a caller-owned, length-delimited, tightly packed, top-down RGBA
+buffer. It applies a PureBasic-layout `RGB()` color key (`$00BBGGRR`, or `-1`
+to disable) and can fill a one-byte-per-pixel alpha mask. Matching key pixels
+become transparent black; other pixels retain their straight alpha. The source
+and output can be the same buffer or disjoint buffers; a supplied mask must be disjoint from
+both, and from encoded input. `NeonVkPortSpriteLoadMemory` accepts an
+encoded buffer with an explicit byte length; `NeonVkPortSpriteLoadFile` reads
+it through the board-neutral `HwFileOpen/Size/ReadAt/Close` seam. The caller
+must mount storage first and provide both encoded and RGBA buffers. The file
+reader handles partial reads and closes before decoding. Neon's intermediate
+PureBasic alpha-blend draw can change RGB values on translucent source pixels,
+so exact color-key parity for those pixels is not established.
+
+The included decoder accepts only uncompressed Windows BMP with a 40-byte
+header and 24-bit BGR or 32-bit BGRA pixels, up to 1024 by 1024 and
+4,194,432 encoded bytes. It handles top-down and bottom-up rows and 24-bit
+padding. For 32-bit `BI_RGB` it interprets the fourth byte as alpha; assets
+that use this byte as padding should be converted to explicit RGBA first.
+PNG, JPEG, palette, RLE, and bitfield BMP return an unsupported-format error.
+The restored desktop library delegates these formats to PureBasic's selected
+image decoders; its repository has no asset files or loading call sites from
+which to infer a production format. This subset has a desktop compiler and
+emitted-code gate, but no board image-load proof yet.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
@@ -89,7 +115,7 @@ cropped sprite) and `docs/evidence/neon-vk-port-geometry-pi4-20261003/README.md`
 (polygon fill/outline, static line, two-sprite batch). These are offscreen
 application-level proofs. The resident Pi 4 console includes Vulkan chrome,
 but does not include this port adapter or a complete Neon-authored application.
-Image/color-key loading, desktop font handles, UI layout/events, viewport
+Broader image decoding, desktop font handles, UI layout/events, viewport
 presentation, and particle API compatibility remain to be ported.
 
 Letterboxed or cropped viewports require their own viewport mapping; these
