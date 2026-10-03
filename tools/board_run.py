@@ -77,6 +77,12 @@ the flow the firewall keeps. See docs/BOARD_RUN.md. A record that also
 carries a `finished` timestamp is one this tool wrote the ending of; a
 record without one was killed where its `stage` says.
 
+PRE-FLIGHT UDP LOSS. `version` and `map` are read-only. If either has no
+complete echo-anchored reply, this tool records received-byte/echo evidence,
+opens a fresh console, confirms its prompt, and retries that command once.
+`net recv` and `boot mem` remain single-shot. A timed-out deadman arm is
+queried first; it is resent only if the board explicitly reports OFF.
+
 THE EXIT CODES
 
     0   the payload returned what was expected and its picture is on disk
@@ -446,8 +452,52 @@ def deadman_armed_seconds(text: str, line: str, requested: int) -> int | None:
     return int(match.group(1))
 
 
+def deadman_status_seconds(text: str) -> int | None:
+    """Read the bare, side-effect-free `deadman` report in power.pi4.
+
+    Zero means explicitly off; a positive value is the pending next-payload
+    arm. Anything else, including an unknown-word reply, is uncertainty.
+    """
+    body = command_body(text, "deadman")
+    if board_refusal(text, "deadman"):
+        return None
+    lines = body.splitlines()
+    if len(lines) < 2:
+        return None
+    if (lines[0] == "The deadman watchdog is off. A payload that hangs "
+                    "will hang the board" and
+            lines[1] == "with it, and getting out of that means a reset "
+                        "or the mains."):
+        return 0
+    match = re.fullmatch(
+        r"The deadman watchdog is armed for ([0-9]+) seconds\. "
+        r"The next payload you", lines[0])
+    if lines[1] != "run gets a watchdog, and if it hangs the board resets itself.":
+        return None
+    return int(match.group(1)) if match else None
+
+
 class StreamError(RuntimeError):
     """The board's answer was not a whole, well-formed picture."""
+
+
+class CommandTimeout(StreamError):
+    """One UDP command lacked an echo-anchored, prompt-ended reply."""
+
+    def __init__(self, line: str, seconds: float, received_bytes: int,
+                 received_datagrams: int, echo_seen: bool):
+        self.line = line
+        self.seconds = seconds
+        self.received_bytes = received_bytes
+        self.received_datagrams = received_datagrams
+        self.echo_seen = echo_seen
+        super().__init__(
+            f"Error 1: no complete response to {line!r} arrived within "
+            f"{seconds:.0f} s (received {received_bytes} bytes in "
+            f"{received_datagrams} board datagrams; echo "
+            f"{'seen' if echo_seen else 'not seen'}). The command may have "
+            "executed; do not resend a state-changing command without "
+            "checking the board's run record.")
 
 
 class RunStopped(StreamError):
@@ -1004,12 +1054,13 @@ class NetConsole:
 
         A LEFTOVER PROMPT DOES NOT ACKNOWLEDGE A LATER COMMAND. The reply is
         only this command's once the echoed line has been seen AND a prompt
-        after it; anything earlier belongs to whatever came before. A
-        command that times out is NEVER resent - it may have executed, and
-        a second `boot` is not a retry, it is a second boot.
+        after it; anything earlier belongs to whatever came before. This
+        method never resends; only the separate version/map wrapper makes
+        one read-only retry after a timeout.
         """
         self.settle(quiet=0.3, cap=3.0)
         self.send(line)
+        datagram_start = len(self.accepted_datagrams)
         echo = echo_pattern(line)
         end = time.monotonic() + seconds
         out = ""
@@ -1020,11 +1071,9 @@ class NetConsole:
             # From the echo's own newline - see read_until_or_prompt.
             if start and PROMPT_RE.search(flat, max(0, start.end() - 1)):
                 return flat[start.start():]
-        raise StreamError(
-            f"Error 1: no complete response to {line!r} arrived within "
-            f"{seconds:.0f} s. The command may have executed; it was NOT "
-            "retried, because a repeated boot is a second boot and not a "
-            "retry. Check the board's console before sending another.")
+        packets = self.accepted_datagrams[datagram_start:]
+        raise CommandTimeout(line, seconds, sum(map(len, packets)),
+                             len(packets), echo.search(out.replace("\r", "")) is not None)
 
     def at_prompt(self, timeout: float = 30.0) -> bool:
         end = time.time() + timeout
@@ -1039,6 +1088,140 @@ class NetConsole:
 
     def close(self) -> None:
         self.sock.close()
+
+
+def read_only_command_with_recovery(
+        console: NetConsole, line: str, seconds: float
+        ) -> tuple[NetConsole, str, dict | None]:
+    """Retry only version/map once after an incomplete UDP response.
+
+    A fresh socket gets a new peer claim and firewall flow. A prompt probe
+    must complete before the second send; if it cannot, leave the original
+    timeout as a failure. Upload, deadman and boot never enter this helper.
+    """
+    if line not in ("version", "map"):
+        raise ValueError("recovery is restricted to read-only version/map")
+    try:
+        return console, console.command(line, seconds), None
+    except CommandTimeout as first:
+        detail = {
+            "command": line,
+            "first_received_bytes": first.received_bytes,
+            "first_received_datagrams": first.received_datagrams,
+            "first_echo_seen": first.echo_seen,
+        }
+        try:
+            fresh = NetConsole(console.addr[0], console.addr[1])
+        except OSError as error:
+            raise StreamError(
+                f"{line!r} timed out ({first.received_bytes} bytes, echo "
+                f"{'seen' if first.echo_seen else 'not seen'}); could not open "
+                f"a fresh console for its one read-only retry: {error}") from error
+        try:
+            if not fresh.at_prompt(timeout=5.0):
+                raise StreamError("fresh console did not answer its prompt")
+            answer = fresh.command(line, seconds)
+        except (StreamError, OSError) as error:
+            fresh.close()
+            raise StreamError(
+                f"{line!r} timed out ({first.received_bytes} bytes in "
+                f"{first.received_datagrams} datagrams, echo "
+                f"{'seen' if first.echo_seen else 'not seen'}); its one "
+                f"read-only retry also failed: {error}") from error
+        fresh.transcript = (console.transcript +
+                            [f"\n[host: {line} timed out; "
+                             f"{first.received_bytes} bytes in "
+                             f"{first.received_datagrams} datagrams; echo "
+                             f"{'seen' if first.echo_seen else 'not seen'}; "
+                             "retrying once on a fresh console]\n"] +
+                            fresh.transcript)
+        console.close()
+        return fresh, answer, detail
+
+
+def arm_deadman_with_recovery(
+        console: NetConsole, requested: int, seconds: float = 10.0
+        ) -> tuple[NetConsole, str, int | None, dict | None]:
+    """Resolve a lost arm acknowledgement before the payload can boot.
+
+    Bare `deadman` only reads gDead. The hardware timer is not running at
+    the prompt: gDead is consumed when the next payload starts. After a
+    timeout, ask on a fresh socket. An exact pending arm is sufficient; an
+    explicit OFF permits exactly one new arm command. If its acknowledgement
+    is lost too, ask once more on another fresh socket. Unknown state never
+    authorizes boot.
+    """
+    line = f"deadman {requested}"
+    try:
+        reply = console.command(line, seconds)
+        return console, reply, deadman_armed_seconds(reply, line, requested), None
+    except CommandTimeout as first:
+        detail = {
+            "first_received_bytes": first.received_bytes,
+            "first_received_datagrams": first.received_datagrams,
+            "first_echo_seen": first.echo_seen,
+            "retry_sent": False,
+        }
+        original = console
+        current = console
+
+        def fresh_peer(reason: str) -> NetConsole:
+            nonlocal current
+            fresh = NetConsole(current.addr[0], current.addr[1])
+            fresh.transcript = (current.transcript +
+                                [f"\n[host: {reason}; fresh console]\n"] +
+                                fresh.transcript)
+            current.close()
+            current = fresh
+            if not current.at_prompt(timeout=5.0):
+                raise StreamError("fresh console did not answer its prompt")
+            return current
+
+        try:
+            fresh_peer(f"{line} timed out: {first.received_bytes} bytes, "
+                       f"echo {'seen' if first.echo_seen else 'not seen'}")
+            status_reply = current.command("deadman", seconds)
+            state = deadman_status_seconds(status_reply)
+            detail["first_status_seconds"] = state
+            if state == requested:
+                detail["verified_by"] = "status after lost arm acknowledgement"
+                return current, status_reply, requested, detail
+            if state != 0:
+                raise StreamError(f"deadman status was {state!r}, not explicit OFF "
+                                  f"or the requested {requested} seconds")
+
+            detail["retry_sent"] = True
+            try:
+                retry_reply = current.command(line, seconds)
+            except CommandTimeout as retry_timeout:
+                detail["retry_received_bytes"] = retry_timeout.received_bytes
+                detail["retry_echo_seen"] = retry_timeout.echo_seen
+            else:
+                effective = deadman_armed_seconds(retry_reply, line, requested)
+                if effective == requested:
+                    detail["verified_by"] = "retry acknowledgement"
+                    return current, retry_reply, effective, detail
+
+            fresh_peer("one deadman retry had no valid acknowledgement")
+            status_reply = current.command("deadman", seconds)
+            state = deadman_status_seconds(status_reply)
+            detail["final_status_seconds"] = state
+            if state != requested:
+                raise StreamError(f"deadman status after one retry was {state!r}, "
+                                  f"not the requested {requested} seconds")
+            detail["verified_by"] = "status after lost retry acknowledgement"
+            return current, status_reply, requested, detail
+        except (StreamError, OSError) as error:
+            # The journal still points at the original console on failure.
+            # Preserve every status probe in its transcript before stopping.
+            original.transcript = current.transcript
+            if current is not original:
+                current.close()
+            raise StreamError(
+                f"{line!r} acknowledgement timed out ({first.received_bytes} "
+                f"bytes, echo {'seen' if first.echo_seen else 'not seen'}); "
+                f"deadman recovery did not establish a verified arm: {error}. "
+                "Nothing was booted.") from error
 
 
 def capture_fatal_exception(console: NetConsole, initial: str,
@@ -1403,10 +1586,17 @@ def run(args: argparse.Namespace) -> int:
                   "console address and port? Nothing was written.")
             return 2
 
-        record["version"] = console.command("version", 10).strip()
+        console, version, retry = read_only_command_with_recovery(console, "version", 10)
+        record["version"] = version.strip()
+        if retry is not None:
+            record.setdefault("console_retries", []).append(retry)
+            print("  version: recovered one incomplete UDP reply on a fresh console")
 
         # ---- where the container goes ------------------------------------
-        board_map = console.command("map", 12)
+        console, board_map, retry = read_only_command_with_recovery(console, "map", 12)
+        if retry is not None:
+            record.setdefault("console_retries", []).append(retry)
+            print("  map: recovered one incomplete UDP reply on a fresh console")
         stage = parse_stage_address(board_map)
         extent = parse_image_extent(board_map)
         addr = int(args.addr, 16) if args.addr else stage
@@ -1521,7 +1711,8 @@ def run(args: argparse.Namespace) -> int:
         # ---- the deadman ---------------------------------------------------
         deadman_line = f"deadman {args.deadman}"
         try:
-            reply = console.command(deadman_line, 10)
+            console, reply, effective_deadman, recovery = arm_deadman_with_recovery(
+                console, args.deadman, 10)
         except StreamError as error:
             record["deadman"] = {"requested_seconds": args.deadman,
                                   "confirmed": False, "error": str(error)}
@@ -1530,9 +1721,12 @@ def run(args: argparse.Namespace) -> int:
                 f"{args.deadman} s deadman; nothing was booted. {error}")
             journal.step("deadman refused")
             raise RunStopped()
+        if recovery is not None:
+            journal.console = console
+            record["deadman_recovery"] = recovery
+            print(f"  deadman: verified on {recovery['verified_by']}")
         record["deadman"] = reply.strip()
         refused = board_refusal(reply, deadman_line)
-        effective_deadman = deadman_armed_seconds(reply, deadman_line, args.deadman)
         if refused or effective_deadman is None:
             record["deadman_confirmed"] = False
             details = ("The board said:\n" + indent(refused)) if refused else (
