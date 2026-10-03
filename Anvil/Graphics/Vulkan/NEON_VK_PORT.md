@@ -208,6 +208,13 @@ returned cleanly with correct pixels and no GPU faults. This verifies motion
 in the tested integer-pixel grid, while leaving full Neon application
 performance and unquantized geometry open.
 
+The [axis-fast Prepare proof](../../../docs/evidence/neon-particle-axis-fast-pi4-20261003/README.md)
+retains exact corners for unrotated, camera-independent quads and keeps the
+full-list validation boundary. Repeating the moving profile on Pi 4 reduced
+the CPU median frame to 454,279 µs and the CSD median to 419,668 µs. This
+optimizes a common geometry case; other particle shapes still take the
+original path and the CSD route remains opt-in.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call

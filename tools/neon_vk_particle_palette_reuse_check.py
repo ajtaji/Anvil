@@ -23,6 +23,7 @@ FIXTURE = r'''
 #NVC_PARTICLE_MAX = 4
 #NVC_PARTICLE_PALETTE_W = 4
 #NVC_PARTICLE_PALETTE_H = 2
+#NVC_SPRITE_Q8_LIMIT = 1500000
 #NEON_VK_CHROME_ATLAS_PAD = 64
 Structure NvcParticle
   x.i : y.i : width.i : height.i : colour.i : angleQ16.i
@@ -34,6 +35,7 @@ EndStructure
 Global nvcReady.i : Global nvcInFrame.i : Global nvcExternalProducerQuarantined.i
 Global nvcDevice.i : Global nvcError.i : Global nvcTargetGeneration.i
 Global nvcLogicalW.i : Global nvcLogicalH.i
+Global nvcPhysicalW.i : Global nvcPhysicalH.i
 Global nvcParticleImage.i : Global nvcParticleSet.i : Global nvcParticleMapped.i
 Global nvcParticleStageSafe.i : Global nvcParticleUploaded.i
 Global nvcParticlePrepared.i : Global nvcParticleCount.i : Global nvcParticleCornerBank.i
@@ -87,7 +89,8 @@ EndProcedure
 
 Procedure.i Main()
   nvcReady = 1 : nvcDevice = 1
-  nvcLogicalW = 64 : nvcLogicalH = 64 : nvcTargetGeneration = 7
+  nvcLogicalW = 64 : nvcLogicalH = 64
+  nvcPhysicalW = 64 : nvcPhysicalH = 64 : nvcTargetGeneration = 7
   testItems[0]\x = 4 : testItems[0]\width = 2 : testItems[0]\height = 2
   testItems[0]\colour = $FF112233 : testItems[0]\zoomQ16 = 65536
   testItems[1]\x = 8 : testItems[1]\width = 2 : testItems[1]\height = 2

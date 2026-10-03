@@ -12,7 +12,7 @@ from neon_vk_particle_prepare_split_build import check_container, replace_once
 
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "runs/neon-particle-dynamic-desk-20261003"
+DEFAULT_OUT = "runs/neon-particle-dynamic-desk-20261003"
 CORE = ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleMatchedProfileCore.pi4"
 SOURCE_FILES = (
     ROOT / "RaspberryPi4/Lib/neon.pi4",
@@ -161,17 +161,22 @@ def build_one(compiler: str, entry: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help="repository-relative scratch output directory")
     args = parser.parse_args()
     compiler = resolve_compiler(args.compiler)
-    OUT.mkdir(parents=True, exist_ok=True)
-    core = OUT / "vulkanNeonParticleDynamicCore.pi4"
+    out = (ROOT / args.out).resolve()
+    if not out.is_relative_to(ROOT) or out == ROOT:
+        parser.error("--out must be a directory within the repository")
+    out.mkdir(parents=True, exist_ok=True)
+    core = out / "vulkanNeonParticleDynamicCore.pi4"
     core.write_text(dynamic_core(CORE.read_text(encoding="utf-8-sig")), encoding="utf-8")
     builds = {}
     for label, gpu in (("cpu", 0), ("csd", 1)):
-        entry = OUT / f"vulkanNeonParticleDynamic{label.upper()}.pi4"
+        entry = out / f"vulkanNeonParticleDynamic{label.upper()}.pi4"
         entry.write_text(f"; Matched returning Pi 4 10k dynamic particle {label} profile.\n"
                          f"#NMP_GPU = {gpu}\n"
-                         'XIncludeFile "runs/neon-particle-dynamic-desk-20261003/vulkanNeonParticleDynamicCore.pi4"\n',
+                         f'XIncludeFile "{core.relative_to(ROOT).as_posix()}"\n',
                          encoding="utf-8")
         builds[label] = build_one(compiler, entry)
     manifest = {
@@ -187,7 +192,7 @@ def main() -> int:
         "unsafe_policy": "Failed submit, failed idle, or lost CSD spins without teardown until the armed deadman resets",
         "board_prerequisite": "Confirm live monitor/memory map and arm a 15-second deadman before load/run",
     }
-    (OUT / "safety-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (out / "safety-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     for label, build in builds.items():
         print(f"PASS: {label} image {build['image_bytes']:,} bytes; PMF SHA-256 {build['container_sha256']}; report {build['report_address_hex']}")
     return 0

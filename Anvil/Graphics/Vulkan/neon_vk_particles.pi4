@@ -229,6 +229,7 @@ EndProcedure
 ; Inputs can be freed immediately after this returns success.
 Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
   Define i.i, rc.i, reusePalette.i
+  Define xQ8.i, yQ8.i, wQ8.i, hQ8.i
   Define *p.NvcParticle
   Define *candidate.NvcParticleCorners
   If nvcReady = 0 Or nvcInFrame <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvdPresentPending() <> 0
@@ -248,6 +249,9 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     nvcError = 0
     ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
+  If nvcLogicalW < 1 Or nvcLogicalH < 1 Or nvcLogicalW > 8192 Or nvcLogicalH > 8192 Or nvcPhysicalW < 1 Or nvcPhysicalH < 1 Or nvcPhysicalW > 8192 Or nvcPhysicalH > 8192
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
   ; The retained items describe the last successful upload. Compare packed
   ; colors by slot, not by hash, before copying a new geometry snapshot.
   reusePalette = Bool(nvcParticlePrepared <> 0 And nvcParticleUploaded <> 0 And nvcParticleStageSafe <> 0 And nvcParticleImage <> 0 And nvcParticleSet <> 0 And nvcParticleCount = count)
@@ -258,8 +262,29 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     Else
       *candidate = @nvcParticleCornersA[i]
     EndIf
-    If nvcParticleGeometry(*p, *candidate) = 0
-      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    If *p\angleQ16 = 0 And *p\ignoreCamera <> 0
+      ; Camera fields and zoom are ignored in this exact integer-size case.
+      ; Keep validation and corner writes in the scan to avoid a geometry
+      ; procedure call for the common moving-particle workload.
+      If *p\width < 1 Or *p\height < 1 Or *p\width > 4096 Or *p\height > 4096 Or *p\x < -16384 Or *p\x > 16384 Or *p\y < -16384 Or *p\y > 16384
+        ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+      EndIf
+      xQ8 = *p\x * 256 : yQ8 = *p\y * 256
+      wQ8 = *p\width * 256 : hQ8 = *p\height * 256
+      If xQ8 < -#NVC_SPRITE_Q8_LIMIT Or xQ8 > #NVC_SPRITE_Q8_LIMIT Or xQ8 + wQ8 < -#NVC_SPRITE_Q8_LIMIT Or xQ8 + wQ8 > #NVC_SPRITE_Q8_LIMIT
+        ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+      EndIf
+      If yQ8 < -#NVC_SPRITE_Q8_LIMIT Or yQ8 > #NVC_SPRITE_Q8_LIMIT Or yQ8 + hQ8 < -#NVC_SPRITE_Q8_LIMIT Or yQ8 + hQ8 > #NVC_SPRITE_Q8_LIMIT
+        ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+      EndIf
+      *candidate\x0 = xQ8 : *candidate\y0 = yQ8
+      *candidate\x1 = xQ8 + wQ8 : *candidate\y1 = yQ8
+      *candidate\x2 = xQ8 : *candidate\y2 = yQ8 + hQ8
+      *candidate\x3 = xQ8 + wQ8 : *candidate\y3 = yQ8 + hQ8
+    Else
+      If nvcParticleGeometry(*p, *candidate) = 0
+        ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+      EndIf
     EndIf
     If reusePalette <> 0 And *p\colour <> nvcParticleItems[i]\colour
       reusePalette = 0
