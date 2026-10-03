@@ -1,0 +1,101 @@
+; Focused host smoke test for the bounded software backend.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+#ANVIL_VULKAN_BACKEND = 2
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_select.pbi"
+
+
+Procedure.i Check(ok.i)
+  If ok <> 0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i Smoke()
+Define ci.VkInstanceCreateInfo
+Define instance.i
+Define count.l
+Define physical.i
+Define plan.AnvilVkBackendImagePlan
+Define copy.AnvilVkBackendImageCopy
+Define tiled.AnvilVkBackendTiledRectCopy
+Define target.i
+Define staging.i
+Define draw.AnvilVkBackendDraw
+Define list.AnvilVkBackendDrawList
+Define binding.AnvilVkBackendBinding
+Define vertexBase.i
+Dim push.l(4)
+
+If Check(AnvilVkBackendAvailable() = 1 And AnvilVkBackendIsGpu() = 0) = 0 : ProcedureReturn 1 : EndIf
+ci\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+If Check(vkCreateInstance(@ci, 0, @instance) = #VK_SUCCESS) = 0 : ProcedureReturn 2 : EndIf
+If Check(vkEnumeratePhysicalDevices(instance, @count, 0) = #VK_SUCCESS And count = 1) = 0 : ProcedureReturn 3 : EndIf
+If Check(vkEnumeratePhysicalDevices(instance, @count, @physical) = #VK_SUCCESS And physical <> 0) = 0 : ProcedureReturn 4 : EndIf
+If Check(avkBackendImagePlan(8, 8, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_OPTIMAL, #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT, @plan) = #VK_SUCCESS) = 0 : ProcedureReturn 5 : EndIf
+If Check(plan\bytes = 256 And plan\rowPitch = 0 And plan\backendLayout = #AVK_SW_IMAGE_LAYOUT) = 0 : ProcedureReturn 6 : EndIf
+
+staging = avkBackendHeapBase() + 1024
+target = avkBackendHeapBase() + 4096
+PokeL(staging, $FF112233)
+copy\windowBase = avkBackendHeapBase() : copy\windowBytes = avkBackendHeapBytes()
+copy\sourceBase = staging : copy\sourceBytes = 256 : copy\sourcePitch = 32
+copy\destinationBase = target : copy\destinationBytes = 256
+copy\width = 8 : copy\height = 8 : copy\destinationLayout = #AVK_SW_IMAGE_LAYOUT
+If avkBackendSubmitImageCopy(@copy) <> #ANVIL_VK_JOB_DONE : ProcedureReturn 71 : EndIf
+If (PeekL(target) & $FFFFFF) <> $112233 Or PeekA(target + 3) <> $FF : ProcedureReturn 72 : EndIf
+If Check(avkBackendSubmitClear(target, 256, 8, 8, 32, $FF445566) = #ANVIL_VK_JOB_DONE And (PeekL(target + 252) & $FFFFFF) = $445566) = 0 : ProcedureReturn 8 : EndIf
+
+; The software backend reports the bounded tiled transfer capabilities too.
+; Its declared software layout is linear, so this exercises the same closed
+; rectangle contract without pretending to emulate UIF addressing.
+PokeL(staging + 2048, $FF102030)
+PokeL(staging + 2052, $FF405060)
+tiledwindowBase = avkBackendHeapBase() : tiled\windowBytes = avkBackendHeapBytes()
+tiled\sourceBase = staging + 2048 : tiled\sourceBytes = 256
+tiled\destinationBase = target + 1024 : tiled\destinationBytes = 256
+tiled\width = 8 : tiled\height = 8 : tiled\sourceLayout = #AVK_SW_IMAGE_LAYOUT : tiled\destinationLayout = #AVK_SW_IMAGE_LAYOUT
+tiled\paddedWidth = 8 : tiled\paddedHeight = 8
+tiled\sourceX = 0 : tiled\sourceY = 0 : tiled\destinationX = 2 : tiled\destinationY = 2
+tiled\regionWidth = 2 : tiled\regionHeight = 1
+If Check(avkBackendSubmitTiledRectCopy(@tiled) = #ANVIL_VK_JOB_DONE And (PeekL(tiled\destinationBase + 2 * 32 + 2 * 4) & $FFFFFF) = $102030) = 0 : ProcedureReturn 81 : EndIf
+tiled\sourceLayout = 0
+If Check(avkBackendSubmitTiledRectCopy(@tiled) <> #ANVIL_VK_JOB_DONE) = 0 : ProcedureReturn 82 : EndIf
+
+draw\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
+draw\targetBase = target : draw\targetBytes = 256
+draw\width = 8 : draw\height = 8 : draw\pitch = 32
+draw\clearBgra = $FF000000
+draw\clearRectX = 2 : draw\clearRectY = 2
+draw\clearRectW = 2 : draw\clearRectH = 2
+draw\clearRectBgra = $FFABCDEF
+list\drawCount = 1 : list\draws = @draw
+If Check(avkBackendSubmitDraw(@list) = #ANVIL_VK_JOB_DONE) = 0 : ProcedureReturn 9 : EndIf
+If Check((PeekL(target) & $FFFFFF) = 0 And (PeekL(target + 2 * 32 + 2 * 4) & $FFFFFF) = $ABCDEF) = 0 : ProcedureReturn 10 : EndIf
+
+; Exercise the closed draw-list executor with one public pipeline plan shape.
+vertexBase = staging + 512
+PokeL(vertexBase + 0, $BF800000) : PokeL(vertexBase + 4, $BF800000)
+PokeL(vertexBase + 8, $3F800000) : PokeL(vertexBase + 12, $BF800000)
+PokeL(vertexBase + 16, $BF800000) : PokeL(vertexBase + 20, $3F800000)
+avkPipeTopology[1] = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+avkPipePosAttr[1] = 0 : avkPipeAttrCount[1] = 1 : avkPipeBindCount[1] = 1
+avkPipeAttrComp[1 * #ANVIL_SPV_MAX_ATTRS] = 2
+avkPipeAttrBinding[1 * #ANVIL_SPV_MAX_ATTRS] = 0
+avkPipeAttrOffset[1 * #ANVIL_SPV_MAX_ATTRS] = 0
+avkPipeColourSrc[1] = #ANVIL_SPV_COLOUR_PUSH
+binding\base = vertexBase : binding\stride = 8
+push(0) = $3F800000 : push(1) = 0 : push(2) = 0 : push(3) = $3F800000
+draw\kind = #ANVIL_VK_RENDER_OP_DRAW : draw\pipeline = 1
+draw\bindings = @binding : draw\bindingCount = 1
+draw\vertexCount = 3 : draw\firstVertex = 0 : draw\maxVertex = 2 : draw\sampleMask = 1
+draw\viewportX = 0 : draw\viewportY = 0 : draw\viewportW = 8 : draw\viewportH = 8
+draw\scissorX = 0 : draw\scissorY = 0 : draw\scissorW = 8 : draw\scissorH = 8
+draw\pushBase = @push(0) : draw\pushBytes = 16
+If Check(avkBackendSubmitDraw(@list) = #ANVIL_VK_JOB_DONE) = 0 : ProcedureReturn 11 : EndIf
+If Check((PeekL(target + 1 * 32 + 1 * 4) & $FFFFFF) = $FF0000 And (PeekL(target + 7 * 32 + 7 * 4) & $FFFFFF) = 0) = 0 : ProcedureReturn 12 : EndIf
+vkDestroyInstance(instance, 0)
+ProcedureReturn 0
+EndProcedure
+
+Procedure Main()
+  ProcedureReturn Smoke()
+EndProcedure
