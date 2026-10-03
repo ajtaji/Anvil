@@ -313,8 +313,17 @@ byte-for-byte, with 12 report probes passing. The diagnostic copied completed
 GPU attachment bytes to RAM for comparison; it did not render pixels on the CPU.
 See `docs/evidence/vulkan-neon-fan-line-pi4-20261001/README.md`. The earlier
 2026-09-26 all-15-scene proof at commit `a6b9a93` remains historical evidence
-for that source. A fresh current-tree all-15-scene run and broader HDMI/DSI/
-rotation/resize coverage remain. After that, the broader backend stages are
+for that source. A later current-source all-15-scene Pi 4 run on build 242
+matched 245,760 native reference pixel bytes and passed 124 widget checks;
+see `docs/VULKAN_NEON_ALL15_CURRENT_PI4.md`. The same adapter now accepts
+bounded RGBA sprites with source crop, scale, tint, rotation and camera mapping.
+A Pi 4 multi-sprite proof exercised the sixteen-slot stable-ID atlas and passed
+four V3D draws, 24 vertices, eight exact BGRA probes and pre-allocation
+capacity refusal; see
+`docs/evidence/neon-multi-sprite-pi4-20261002/README.md`. These paths were
+proved by returning RAM payloads; resident build 242 was not replaced with
+the new sprite API. Broader HDMI/DSI/rotation/resize coverage remains. After
+that, the broader backend stages are
 per-object GPU virtual addressing and residency above
 today's single window, arithmetic beyond the current straight-line binary32
 `FAdd`/`FMul` typed-IR subset, broader optimal-image shapes and transfer commands beyond the proved
