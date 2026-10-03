@@ -1,0 +1,495 @@
+; Returning Pi 4 profile for the unchanged 10,000-particle Vulkan draw.
+; Run only under Anvil's armed deadman. No boot or storage writes.
+; Build with --entry-returns. x0 returns global_nmsreport from the NEW .sym.
+; Read exactly 256 report bytes; the payload checks ordered translucent pixels,
+; two-frame reuse, capacity refusal, and one draw for 60,000 vertices.
+; Extra timings repeat the same operations beside the production calls.
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+
+#NMS_SIZE         = 64
+#NMS_ARENA        = $0A000000
+#NMS_ARENA_BYTES  = $01000000
+#NMS_SURFACE      = $06000000
+#NMS_WINDOW       = $063E8000
+#NMS_WINDOW_BYTES = $00C00000
+#NMS_MAGIC        = $4D42524E
+
+Global Dim nmsReport.l[64]
+Global Dim nppItems.NvcParticle[10000]
+Global Dim nrbCapture.l[4096]
+Global Dim nmsImagePixels.a[64]
+Global Dim nmsPixels.a[16]
+Global Dim nmsPixelsA.a[16]
+Global Dim nmsPixelsABgra.a[16]
+Global Dim nmsPixelsB.a[16]
+Global Dim nmsPixelsOddBgra.a[12]
+Global Dim nmsWide.a[1912]
+Global Dim nmsLarge.a[491520]
+Global Dim nmsRejectPixels.a[4194303]
+Global Dim nmsClear.l[4]
+Global Dim nmsLiveImages.i[17]
+Global Dim nmsLiveSets.i[17]
+Global nmsInstance.i, nmsDevice.i, nmsPool.i, nmsImage.i, nmsMemory.i
+Global nmsView.i, nmsPass.i, nmsFrame.i, nmsAdapter.i, nmsNeon.i
+
+Procedure nmsCleanup()
+  If nmsAdapter <> 0 : NeonVkChromeDestroy() : EndIf
+  NeonVkChromeSpriteSource(0, 0, 0)
+  NeonVkChromeSpriteRegister(1, 0, 0, 0)
+  NeonVkChromeSpriteRegister(2, 0, 0, 0)
+  NeonVkChromeSpriteRegister(11, 0, 0, 0)
+  If nmsDevice <> 0 : vkDeviceWaitIdle(nmsDevice) : EndIf
+  If nmsFrame <> 0 : vkDestroyFramebuffer(nmsDevice, nmsFrame, 0) : EndIf
+  If nmsPass <> 0 : vkDestroyRenderPass(nmsDevice, nmsPass, 0) : EndIf
+  If nmsView <> 0 : vkDestroyImageView(nmsDevice, nmsView, 0) : EndIf
+  If nmsImage <> 0 : vkDestroyImage(nmsDevice, nmsImage, 0) : EndIf
+  If nmsMemory <> 0 : vkFreeMemory(nmsDevice, nmsMemory, 0) : EndIf
+  If nmsPool <> 0 : vkDestroyCommandPool(nmsDevice, nmsPool, 0) : EndIf
+  If nmsDevice <> 0 : vkDestroyDevice(nmsDevice, 0) : EndIf
+  If nmsInstance <> 0 : vkDestroyInstance(nmsInstance, 0) : EndIf
+  If nmsNeon <> 0 : NeonShutdown() : EndIf
+EndProcedure
+
+Procedure.i nmsReturn(status.i)
+  nmsReport[1] = status
+  nmsReport[13] = AnvilVkFaultCount()
+  nmsReport[14] = AnvilVkFaultText()
+  nmsCleanup()
+  ProcedureReturn @nmsReport[0]
+EndProcedure
+
+Procedure.i nmsPixel(base.i, pitch.i, x.i, y.i)
+  ProcedureReturn PeekL(base + y * pitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i nmsWord(slot.i)
+  ProcedureReturn nmsReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, count.i, phys.i, queue.i, base.i, pitch.i, green.i
+  Define t0.i, t1.i
+  Define bankBefore.i
+  Define *profileParticle.NvcParticle
+  Define checksum.i
+  Define Dim profileCorners.i[8]
+  Define Dim profileXBits.i[4]
+  Define Dim profileYBits.i[4]
+  Define id.i, i.i, j.i, index.i, ox.i, oy.i, imageHandle.i, setHandle.i
+  Define residentImage.i, residentMemory.i, residentView.i, residentSet.i
+  Define resident2Image.i, resident2Memory.i, resident2View.i, resident2Set.i
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+  Define priority.l
+
+  nmsReport[0] = #NMS_MAGIC
+  nmsReport[15] = #NMS_MAGIC
+  ; Top row: opaque red, half-alpha green. Bottom row: invisible blue,
+  ; opaque white. Explicit bytes avoid image-decoder and host pixel layouts.
+  nmsPixels[0] = 255 : nmsPixels[1] = 0 : nmsPixels[2] = 0 : nmsPixels[3] = 255
+  nmsPixels[4] = 0 : nmsPixels[5] = 255 : nmsPixels[6] = 0 : nmsPixels[7] = 128
+  nmsPixels[8] = 0 : nmsPixels[9] = 0 : nmsPixels[10] = 255 : nmsPixels[11] = 0
+  nmsPixels[12] = 255 : nmsPixels[13] = 255 : nmsPixels[14] = 255 : nmsPixels[15] = 255
+  nmsPixelsA[0] = 255 : nmsPixelsA[1] = 0 : nmsPixelsA[2] = 0 : nmsPixelsA[3] = 255
+  nmsPixelsA[4] = 0 : nmsPixelsA[5] = 255 : nmsPixelsA[6] = 0 : nmsPixelsA[7] = 255
+  nmsPixelsA[8] = 0 : nmsPixelsA[9] = 0 : nmsPixelsA[10] = 255 : nmsPixelsA[11] = 255
+  nmsPixelsA[12] = 255 : nmsPixelsA[13] = 255 : nmsPixelsA[14] = 255 : nmsPixelsA[15] = 255
+  ; The same 2x2 image in BGRA byte order exercises the direct staging copy.
+  nmsPixelsABgra[0] = 0 : nmsPixelsABgra[1] = 0 : nmsPixelsABgra[2] = 255 : nmsPixelsABgra[3] = 255
+  nmsPixelsABgra[4] = 0 : nmsPixelsABgra[5] = 255 : nmsPixelsABgra[6] = 0 : nmsPixelsABgra[7] = 255
+  nmsPixelsABgra[8] = 255 : nmsPixelsABgra[9] = 0 : nmsPixelsABgra[10] = 0 : nmsPixelsABgra[11] = 255
+  nmsPixelsABgra[12] = 255 : nmsPixelsABgra[13] = 255 : nmsPixelsABgra[14] = 255 : nmsPixelsABgra[15] = 255
+  nmsPixelsB[0] = 255 : nmsPixelsB[1] = 255 : nmsPixelsB[2] = 0 : nmsPixelsB[3] = 255
+  nmsPixelsB[4] = 255 : nmsPixelsB[5] = 255 : nmsPixelsB[6] = 255 : nmsPixelsB[7] = 255
+  nmsPixelsB[8] = 255 : nmsPixelsB[9] = 255 : nmsPixelsB[10] = 255 : nmsPixelsB[11] = 255
+  nmsPixelsB[12] = 255 : nmsPixelsB[13] = 255 : nmsPixelsB[14] = 255 : nmsPixelsB[15] = 255
+  ; Odd width and half-alpha center detect BGRA channel, extent and blend errors.
+  nmsPixelsOddBgra[0] = 255 : nmsPixelsOddBgra[1] = 0 : nmsPixelsOddBgra[2] = 255 : nmsPixelsOddBgra[3] = 255
+  nmsPixelsOddBgra[4] = 0 : nmsPixelsOddBgra[5] = 255 : nmsPixelsOddBgra[6] = 255 : nmsPixelsOddBgra[7] = 128
+  nmsPixelsOddBgra[8] = 255 : nmsPixelsOddBgra[9] = 0 : nmsPixelsOddBgra[10] = 0 : nmsPixelsOddBgra[11] = 255
+  nmsClear[0] = 0 : nmsClear[1] = 0 : nmsClear[2] = 0 : nmsClear[3] = $3F800000
+
+  TimerInit()
+  nmsReport[2] = 1
+  If NeonArena(#NMS_ARENA, #NMS_ARENA_BYTES) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  If NeonSurface(#NMS_SURFACE, #NMS_SIZE, #NMS_SIZE, #NMS_SIZE * 4) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  ; The sampled TrueType/sprite atlas is 512x1024 even though this proof's
+  ; attachment is 64x64. Declare that capacity before NeonInit so Vulkan's
+  ; truthful maxImageDimension2D covers the atlas.
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  NeonSurfaceMapSpan($00FE8000)
+  If NeonInit() <> #NEON_OK : ProcedureReturn nmsReturn(1) : EndIf
+  nmsNeon = 1
+  NeonPalette() : NeonFontDefaults() : NeonFontUse(?dsp_font8x16, 8, 16, 32, 126)
+  NeonAnimReset() : NeonStateReset()
+  rc = AnvilVkV3dWindow(#NMS_WINDOW, #NMS_WINDOW_BYTES)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(2) : EndIf
+
+  nmsReport[2] = 2
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @nmsInstance)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(3) : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(nmsInstance, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or phys = 0 : ProcedureReturn nmsReturn(4) : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @nmsDevice)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(5) : EndIf
+  vkGetDeviceQueue(nmsDevice, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(nmsDevice, @pci, 0, @nmsPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(6) : EndIf
+
+  nmsReport[2] = 3
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NMS_SIZE : imageInfo\extent\height = #NMS_SIZE : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1 : imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nmsDevice, @imageInfo, 0, @nmsImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(7) : EndIf
+  vkGetImageMemoryRequirements(nmsDevice, nmsImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nmsDevice, @alloc, 0, @nmsMemory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(nmsDevice, nmsImage, nmsMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(8) : EndIf
+  base = AnvilVkImageAddress(nmsImage) : pitch = AnvilVkImageRowPitch(nmsImage)
+  If base = 0 Or pitch < #NMS_SIZE * 4 : ProcedureReturn nmsReturn(9) : EndIf
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = nmsImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(nmsDevice, @viewInfo, 0, @nmsView)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(10) : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(nmsDevice, @passInfo, 0, @nmsPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(11) : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = nmsPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @nmsView : frameInfo\width = #NMS_SIZE
+  frameInfo\height = #NMS_SIZE : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(nmsDevice, @frameInfo, 0, @nmsFrame)
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(12) : EndIf
+
+  nmsReport[2] = 4
+  rc = NeonVkChromeSpriteSource(@nmsPixelsA[0], 2, 2)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(20) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(phys, nmsDevice, queue, nmsPool, nmsPass, nmsFrame, #NMS_SIZE, #NMS_SIZE, 4, 10000)
+  nmsReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(21) : EndIf
+  nmsAdapter = 1
+  If NeonVkChromeImageSpriteReplaceId(1, @nmsPixelsA[0], 2, 2) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(22) : EndIf
+  If NeonVkChromeImageSpriteReplaceId(2, @nmsPixelsB[0], 2, 2) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(23) : EndIf
+  residentImage = nvcImageSpriteImage : residentSet = nvcImageSpriteSet
+  resident2Image = nvcImageSpriteImages[2] : resident2Set = nvcImageSpriteSets[2]
+  If residentImage = 0 Or residentSet = 0 Or resident2Image = 0 Or resident2Set = 0 : ProcedureReturn nmsReturn(24) : EndIf
+  If nvcParticleImage <> 0 Or nvcParticleMemory <> 0 Or nvcParticleView <> 0 Or nvcParticleSet <> 0 Or nvcParticleStage <> 0 Or nvcParticleStageMemory <> 0 Or nvcParticleMapped <> 0 Or nvcParticleStageSafe <> 0
+    ProcedureReturn nmsReturn(59)
+  EndIf
+  nmsReport[44] = 1
+  If NeonVkChromeParticlesPrepare(0, 0) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(60) : EndIf
+  If nvcParticleImage <> 0 Or nvcParticleStage <> 0 Or nvcParticleSet <> 0 Or nvcParticleMapped <> 0
+    ProcedureReturn nmsReturn(61)
+  EndIf
+
+  ; Prepare uploads a 128x80 palette in a completed transfer submission.
+  ; Render only two ordered quads first, with an overlapping translucent pixel.
+  nmsReport[2] = 5
+  nppItems[0]\x = 4 : nppItems[0]\y = 4
+  nppItems[0]\width = 12 : nppItems[0]\height = 12
+  nppItems[0]\colour = $FFFF0000
+  nppItems[0]\zoomQ16 = 65536 : nppItems[0]\ignoreCamera = 1
+  nppItems[1]\x = 8 : nppItems[1]\y = 8
+  nppItems[1]\width = 12 : nppItems[1]\height = 12
+  nppItems[1]\colour = $8000FF00
+  nppItems[1]\zoomQ16 = 65536 : nppItems[1]\ignoreCamera = 1
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 2)
+  nmsReport[3] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(25) : EndIf
+  If nvcParticleImage = 0 Or nvcParticleMemory = 0 Or nvcParticleView = 0 Or nvcParticleSet = 0 Or nvcParticleStage = 0 Or nvcParticleStageMemory = 0 Or nvcParticleMapped = 0 Or nvcParticleStageSafe = 0 Or nvcParticleUploaded = 0
+    ProcedureReturn nmsReturn(62)
+  EndIf
+  nmsReport[45] = 1
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(26) : EndIf
+  rc = NeonVkChromeParticlesDrawPrepared()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(27) : EndIf
+  nmsReport[4] = nvcDrawCount : nmsReport[5] = nvcVertices
+  If nmsReport[4] <> 1 Or nmsReport[5] <> 12 : ProcedureReturn nmsReturn(28) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(29) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(30) : EndIf
+  nmsReport[9] = nmsPixel(base, pitch, 5, 5)
+  nmsReport[10] = nmsPixel(base, pitch, 10, 10)
+  nmsReport[11] = nmsPixel(base, pitch, 18, 18)
+  nmsReport[12] = nmsPixel(base, pitch, 25, 25)
+  If nmsWord(9) <> $FFFF0000 Or nmsWord(12) <> $FF000000
+    ProcedureReturn nmsReturn(31)
+  EndIf
+  ; Green over red must remain ordered and translucent: neither source alone.
+  If (nmsReport[10] & $00FFFFFF) = $00FF0000 Or (nmsReport[10] & $00FFFFFF) = $0000FF00
+    ProcedureReturn nmsReturn(32)
+  EndIf
+
+  ; The CPU snapshot and GPU palette survive a second frame unchanged.
+  nmsReport[2] = 6
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(33) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(34) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(35) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(36) : EndIf
+  If nmsPixel(base, pitch, 10, 10) <> (nmsReport[10] & $FFFFFFFF)
+    ProcedureReturn nmsReturn(37)
+  EndIf
+  ; Validation writes into the inactive corner bank. A later invalid item
+  ; must leave the last prepared list, active bank, palette and pixels live.
+  bankBefore = nvcParticleCornerBank
+  nppItems[0]\x = 25 : nppItems[0]\colour = $FF0000FF
+  nppItems[1]\width = 0
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 2)
+  nmsReport[55] = rc : nmsReport[56] = bankBefore
+  nmsReport[57] = nvcParticleCornerBank
+  If rc <> #NEON_VK_CHROME_ERR_ARGS Or nvcParticleCount <> 2 Or nvcParticlePrepared = 0 Or nvcParticleCornerBank <> bankBefore
+    ProcedureReturn nmsReturn(75)
+  EndIf
+  nppItems[0]\x = 4 : nppItems[0]\colour = $FFFF0000
+  nppItems[1]\width = 12
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(76) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(77) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(78) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(79) : EndIf
+  nmsReport[58] = nmsPixel(base, pitch, 10, 10)
+  If nmsWord(58) <> nmsWord(10) : ProcedureReturn nmsReturn(80) : EndIf
+  nmsReport[19] = NeonVkChromeParticlesPrepare(@nppItems[0], 10001)
+  If nmsReport[19] <> #NEON_VK_CHROME_ERR_ARGS Or nvcParticleCount <> 2
+    ProcedureReturn nmsReturn(38)
+  EndIf
+
+  ; A quarter-turn sends the first quad above its unrotated rectangle.
+  ; The second quad moves and doubles through the camera transform.
+  nmsReport[2] = 7
+  nppItems[0]\x = 12 : nppItems[0]\y = 8
+  nppItems[0]\width = 12 : nppItems[0]\height = 4
+  nppItems[0]\colour = $FFFF00FF : nppItems[0]\angleQ16 = #NVC_SPRITE_HALF_PI_Q16
+  nppItems[0]\cameraX = 0 : nppItems[0]\cameraY = 0
+  nppItems[0]\zoomQ16 = 65536 : nppItems[0]\ignoreCamera = 1
+  nppItems[1]\x = 20 : nppItems[1]\y = 20
+  nppItems[1]\width = 4 : nppItems[1]\height = 4
+  nppItems[1]\colour = $FF0000FF : nppItems[1]\angleQ16 = 0
+  nppItems[1]\cameraX = 4 : nppItems[1]\cameraY = 2
+  nppItems[1]\zoomQ16 = 131072 : nppItems[1]\ignoreCamera = 0
+  If NeonVkChromeParticlesPrepare(@nppItems[0], 2) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(63) : EndIf
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(64) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(65) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(66) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(67) : EndIf
+  nmsReport[40] = nmsPixel(base, pitch, 18, 6)
+  nmsReport[41] = nmsPixel(base, pitch, 13, 9)
+  nmsReport[42] = nmsPixel(base, pitch, 4, 8)
+  nmsReport[43] = nmsPixel(base, pitch, 21, 21)
+  If nmsWord(40) <> $FFFF00FF Or nmsWord(41) <> $FF000000 Or nmsWord(42) <> $FF0000FF Or nmsWord(43) <> $FF000000
+    ProcedureReturn nmsReturn(68)
+  EndIf
+
+  ; A full palette is still one graphics draw (60,000 vertices), not 10,000
+  ; Vulkan draw records. Distribute the one-pixel squares across 64x64.
+  nmsReport[2] = 8
+  For i = 0 To 9999
+    nppItems[i]\x = i % 64 : nppItems[i]\y = (i / 64) % 64
+    nppItems[i]\width = 1 : nppItems[i]\height = 1
+    nppItems[i]\colour = $FF000000 | (((i * 73) & $FF) << 16)
+    nppItems[i]\angleQ16 = 0 : nppItems[i]\cameraX = 0 : nppItems[i]\cameraY = 0
+    nppItems[i]\zoomQ16 = 65536 : nppItems[i]\ignoreCamera = 1
+  Next
+  t0 = Micros()
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 10000)
+  t1 = Micros() : nmsReport[23] = t1 - t0
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(39) : EndIf
+  ; Repeat Prepare's phases on identical data without changing the
+  ; already prepared list or resulting palette. Each phase has its own
+  ; timer; the original whole-Prepare measurement above stays untouched.
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nppItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(69) : EndIf
+  Next
+  t1 = Micros() : nmsReport[46] = t1 - t0
+  t0 = Micros()
+  rc = vkDeviceWaitIdle(nvcDevice)
+  t1 = Micros() : nmsReport[47] = t1 - t0
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(70) : EndIf
+  t0 = Micros()
+  For i = 0 To 9999
+    *profileParticle = @nppItems[i]
+    nvcParticleItems[i]\x = *profileParticle\x : nvcParticleItems[i]\y = *profileParticle\y
+    nvcParticleItems[i]\width = *profileParticle\width : nvcParticleItems[i]\height = *profileParticle\height
+    nvcParticleItems[i]\colour = *profileParticle\colour : nvcParticleItems[i]\angleQ16 = *profileParticle\angleQ16
+    nvcParticleItems[i]\cameraX = *profileParticle\cameraX : nvcParticleItems[i]\cameraY = *profileParticle\cameraY
+    nvcParticleItems[i]\zoomQ16 = *profileParticle\zoomQ16 : nvcParticleItems[i]\ignoreCamera = *profileParticle\ignoreCamera
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, *profileParticle\colour)
+  Next
+  For i = 10000 To #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H - 1
+    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, 0)
+  Next
+  t1 = Micros() : nmsReport[48] = t1 - t0
+  t0 = Micros()
+  rc = nvcParticleUploadNow()
+  t1 = Micros() : nmsReport[49] = t1 - t0
+  If rc <> #VK_SUCCESS Or nvcParticleStageSafe = 0 : ProcedureReturn nmsReturn(71) : EndIf
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(40) : EndIf
+  ; Geometry without vertex writes, then geometry plus the same clip-bit
+  ; lookups as the unrotated Draw path. Reset the temporary lookup cache
+  ; afterward so the unchanged Draw has a cold cache again.
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nvcParticleItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(72) : EndIf
+  Next
+  t1 = Micros() : nmsReport[50] = t1 - t0
+  For j = 0 To #NVC_PARTICLE_CLIP_CACHE - 1
+    nvcParticleXGen[j] = 0 : nvcParticleYGen[j] = 0
+  Next
+  checksum = 0
+  t0 = Micros()
+  For i = 0 To 9999
+    If nvcParticleGeometry(@nvcParticleItems[i], @profileCorners[0]) = 0 : ProcedureReturn nmsReturn(73) : EndIf
+    profileXBits[0] = nvcParticleClipXBits(profileCorners[0])
+    profileXBits[1] = nvcParticleClipXBits(profileCorners[2])
+    profileYBits[0] = nvcParticleClipYBits(profileCorners[1])
+    profileYBits[2] = nvcParticleClipYBits(profileCorners[5])
+    checksum = checksum + (profileXBits[0] & $FF) + (profileXBits[1] & $FF)
+    checksum = checksum + (profileYBits[0] & $FF) + (profileYBits[2] & $FF)
+  Next
+  t1 = Micros() : nmsReport[51] = t1 - t0
+  nmsReport[53] = checksum
+  For j = 0 To #NVC_PARTICLE_CLIP_CACHE - 1
+    nvcParticleXGen[j] = 0 : nvcParticleYGen[j] = 0
+  Next
+  ; All 60,000 mapped writes are overwritten by the real draw before
+  ; submission. This uses the exact production vertex-store helper.
+  t0 = Micros()
+  For i = 0 To 59999
+    nvcParticleVertexBits(i, 0, 0, 0, 0)
+  Next
+  t1 = Micros() : nmsReport[52] = t1 - t0
+  If nvcVertices <> 0 Or nvcDrawCount <> 0 Or PeekL(nvcMapped + 16) <> #NEON_VK_CHROME_F_ONE Or PeekL(nvcMapped + 59999 * #NEON_VK_CHROME_VERTEX_BYTES + 20) <> #NEON_VK_CHROME_F_ONE
+    ProcedureReturn nmsReturn(74)
+  EndIf
+  nmsReport[54] = 1
+  t0 = Micros()
+  rc = NeonVkChromeParticlesDrawPrepared()
+  t1 = Micros() : nmsReport[24] = t1 - t0
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(41) : EndIf
+  nmsReport[6] = nvcDrawCount : nmsReport[7] = nvcVertices
+  If nmsReport[6] <> 1 Or nmsReport[7] <> 60000 : ProcedureReturn nmsReturn(42) : EndIf
+  t0 = Micros()
+  rc = NeonVkChromeEnd()
+  t1 = Micros() : nmsReport[25] = t1 - t0
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(43) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(44) : EndIf
+  nmsReport[8] = nmsPixel(base, pitch, 0, 0)
+  nmsReport[20] = nmsPixel(base, pitch, 63, 0)
+  nmsReport[21] = nmsPixel(base, pitch, 8, 14)
+  nmsReport[22] = nmsPixel(base, pitch, 15, 28)
+  If nmsWord(20) <> $FFF70000 Or nmsWord(21) <> $FFC80000 Or nmsWord(22) <> $FF470000
+    ProcedureReturn nmsReturn(45)
+  EndIf
+  ; A triangle fan consumes three of the 60,000 vertex slots. The prepared
+  ; 10,000-particle draw needs all 60,000, so it must refuse before writing
+  ; even its first vertex. The canary is in the first slot it would touch.
+  nmsReport[2] = 9
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(52) : EndIf
+  If NeonVkChromeFanBegin() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(53) : EndIf
+  NeonVkChromeFanPoint(0, 0) : NeonVkChromeFanPoint(1, 0) : NeonVkChromeFanPoint(0, 1)
+  If NeonVkChromeFanEnd($FFFFFFFF) <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(54) : EndIf
+  If nvcVertices <> 3 Or nvcDrawCount <> 1 Or nvcMapped = 0 : ProcedureReturn nmsReturn(55) : EndIf
+  PokeL(nvcMapped + 3 * #NEON_VK_CHROME_VERTEX_BYTES, $5A36C07D)
+  rc = NeonVkChromeParticlesDrawPrepared()
+  nmsReport[36] = rc : nmsReport[37] = nvcVertices : nmsReport[38] = nvcDrawCount
+  nmsReport[39] = PeekL(nvcMapped + 3 * #NEON_VK_CHROME_VERTEX_BYTES)
+  If rc <> #NEON_VK_CHROME_ERR_CAPACITY Or nvcVertices <> 3 Or nvcDrawCount <> 1 Or nmsWord(39) <> $5A36C07D
+    ProcedureReturn nmsReturn(56)
+  EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(57) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(58) : EndIf
+  ; Ordinary moving-scene sizes after the 10k stress frame. Each input is
+  ; repositioned, forcing a fresh snapshot and palette upload.
+  For j = 0 To 1
+    count = 100
+    If j = 1 : count = 1000 : EndIf
+    nmsReport[2] = 10 + j
+    For i = 0 To count - 1
+      nppItems[i]\x = (i * 7 + j * 11) % 64
+      nppItems[i]\y = (i * 13 + j * 17) % 64
+      nppItems[i]\width = 1 : nppItems[i]\height = 1
+      nppItems[i]\colour = $FF000000 | (((i * 73) & $FF) << 16)
+      nppItems[i]\angleQ16 = 0 : nppItems[i]\cameraX = 0 : nppItems[i]\cameraY = 0
+      nppItems[i]\zoomQ16 = 65536 : nppItems[i]\ignoreCamera = 1
+    Next
+    t0 = Micros()
+    rc = NeonVkChromeParticlesPrepare(@nppItems[0], count)
+    t1 = Micros() : nmsReport[26 + j * 3] = t1 - t0
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(46) : EndIf
+    If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(47) : EndIf
+    t0 = Micros()
+    rc = NeonVkChromeParticlesDrawPrepared()
+    t1 = Micros() : nmsReport[27 + j * 3] = t1 - t0
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(48) : EndIf
+    nmsReport[32 + j * 2] = nvcDrawCount : nmsReport[33 + j * 2] = nvcVertices
+    If nvcDrawCount <> 1 Or nvcVertices <> count * 6 : ProcedureReturn nmsReturn(49) : EndIf
+    t0 = Micros()
+    rc = NeonVkChromeEnd()
+    t1 = Micros() : nmsReport[28 + j * 3] = t1 - t0
+    If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(50) : EndIf
+    If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(51) : EndIf
+  Next
+  nmsReport[2] = 12
+  NeonVkChromeDestroy() : nmsAdapter = 0
+  ProcedureReturn nmsReturn(0)
+EndProcedure

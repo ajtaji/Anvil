@@ -49,6 +49,9 @@ def main() -> int:
         0xFFFF00FF, 0xFF000000, 0xFF0000FF, 0xFF000000
     ), tuple(hex(words[i]) for i in range(40, 44))
     assert (words[44], words[45]) == (1, 1)
+    assert signed(words[55]) == -21201
+    assert words[56] == words[57] and words[56] in (0, 1)
+    assert words[58] == words[10]
     print(
         "particle palette proof: 10,000 particles, one draw, ordered alpha, repeat, "
         "lazy allocation, rotated/camera pixels, and exact fan-boundary refusal pass; "

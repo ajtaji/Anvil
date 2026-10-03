@@ -84,6 +84,7 @@ EndProcedure
 Procedure.i Main()
   Define rc.i, count.i, phys.i, queue.i, base.i, pitch.i, green.i
   Define t0.i, t1.i
+  Define bankBefore.i
   Define id.i, i.i, j.i, index.i, ox.i, oy.i, imageHandle.i, setHandle.i
   Define residentImage.i, residentMemory.i, residentView.i, residentSet.i
   Define resident2Image.i, resident2Memory.i, resident2View.i, resident2Set.i
@@ -282,6 +283,25 @@ Procedure.i Main()
   If nmsPixel(base, pitch, 10, 10) <> (nmsReport[10] & $FFFFFFFF)
     ProcedureReturn nmsReturn(37)
   EndIf
+  ; Validation writes into the inactive corner bank. A later invalid item
+  ; must leave the last prepared list, active bank, palette and pixels live.
+  bankBefore = nvcParticleCornerBank
+  nppItems[0]\x = 25 : nppItems[0]\colour = $FF0000FF
+  nppItems[1]\width = 0
+  rc = NeonVkChromeParticlesPrepare(@nppItems[0], 2)
+  nmsReport[55] = rc : nmsReport[56] = bankBefore
+  nmsReport[57] = nvcParticleCornerBank
+  If rc <> #NEON_VK_CHROME_ERR_ARGS Or nvcParticleCount <> 2 Or nvcParticlePrepared = 0 Or nvcParticleCornerBank <> bankBefore
+    ProcedureReturn nmsReturn(75)
+  EndIf
+  nppItems[0]\x = 4 : nppItems[0]\colour = $FFFF0000
+  nppItems[1]\width = 12
+  If NeonVkChromeBegin(@nmsClear[0]) <> #VK_SUCCESS : ProcedureReturn nmsReturn(76) : EndIf
+  If NeonVkChromeParticlesDrawPrepared() <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(77) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(78) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(79) : EndIf
+  nmsReport[58] = nmsPixel(base, pitch, 10, 10)
+  If nmsWord(58) <> nmsWord(10) : ProcedureReturn nmsReturn(80) : EndIf
   nmsReport[19] = NeonVkChromeParticlesPrepare(@nppItems[0], 10001)
   If nmsReport[19] <> #NEON_VK_CHROME_ERR_ARGS Or nvcParticleCount <> 2
     ProcedureReturn nmsReturn(38)
