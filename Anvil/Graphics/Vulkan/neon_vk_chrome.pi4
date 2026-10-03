@@ -34,6 +34,7 @@
 #NVC_SPRITE_HALF_PI_Q16        = 102944
 #NVC_SPRITE_MAX_ANGLE_Q16      = 6588400 ; sixteen signed turns
 #NVC_MULTI_SPRITE_MAX          = 16
+#NVC_RETAINED_BATCH_MAX        = 128
 #NVC_SPRITE_SHELF_H            = 256
 #NEON_VK_CHROME_TT_ATLAS_W     = 512
 ; Keep the image and persistent staging buffer within the shared 16 MiB
@@ -50,6 +51,27 @@
 #NVC_PATH_NONE                 = 0
 #NVC_PATH_FAN                  = 1
 #NVC_PATH_LINES                = 2
+
+; A retained batch keeps draw parameters, not image ownership. An image ID
+; must keep the generation captured by Add until each End submission.
+Structure NvcRetainedSprite
+  id.i
+  generation.i
+  x.i
+  y.i
+  sourceX.i
+  sourceY.i
+  sourceW.i
+  sourceH.i
+  drawW.i
+  drawH.i
+  colour.i
+  angleQ16.i
+  cameraX.i
+  cameraY.i
+  zoomQ16.i
+  ignoreCamera.i
+EndStructure
 
 Global nvcReady.i
 Global nvcInFrame.i
@@ -72,6 +94,12 @@ Global nvcMaxQuads.i
 Global nvcMaxVertexQuads.i
 Global nvcVertices.i
 Global nvcDrawCount.i
+Global nvcRetainedBatchActive.i
+Global nvcRetainedBatchCount.i
+Global nvcRetainedBatchLogicalW.i
+Global nvcRetainedBatchLogicalH.i
+Global nvcRetainedBatchTargetGeneration.i
+Global Dim nvcRetainedItems.NvcRetainedSprite[#NVC_RETAINED_BATCH_MAX - 1]
 Global nvcGridBatchActive.i
 Global nvcGridBatchFirst.i
 Global nvcGridBatchSlot.i
@@ -1478,6 +1506,7 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   nvcMaxQuads = maxDraws : nvcMaxVertexQuads = maxVertexQuads
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
+  nvcRetainedBatchActive = 0 : nvcRetainedBatchCount = 0
   nvcError = 0
   nvcCreateStage = 0 : nvcCreateFaultCode = 0 : nvcCreateFaultText = 0
   nvcAtlasW = #NEON_VK_CHROME_TT_ATLAS_W : nvcAtlasH = #NEON_VK_CHROME_TT_ATLAS_H
@@ -1878,7 +1907,7 @@ EndProcedure
 ; Camera coordinates are in the same logical canvas. A positive Q16 radian
 ; angle rotates clockwise on the screen, as in DrawGLSprite. `zoomQ16=65536`
 ; is 1.0. This records vertices only; V3D samples/blends the image.
-Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i, textureW.i, textureH.i, setHandle.i)
+Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i, atlasX.i, atlasY.i, spriteW.i, spriteH.i, textureW.i, textureH.i, setHandle.i, dryRun.i)
   Define xQ8.i, yQ8.i, wQ8.i, hQ8.i, centerXQ8.i, centerYQ8.i
   Define halfWQ8.i, halfHQ8.i, cosQ16.i, sinQ16.i, first.i
   Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
@@ -1936,6 +1965,7 @@ Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, 
   If blX < -#NVC_SPRITE_Q8_LIMIT Or blX > #NVC_SPRITE_Q8_LIMIT Or blY < -#NVC_SPRITE_Q8_LIMIT Or blY > #NVC_SPRITE_Q8_LIMIT Or brX < -#NVC_SPRITE_Q8_LIMIT Or brX > #NVC_SPRITE_Q8_LIMIT Or brY < -#NVC_SPRITE_Q8_LIMIT Or brY > #NVC_SPRITE_Q8_LIMIT
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
+  If dryRun <> 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   u0 = neon_F32Ratio(atlasX + sourceX, textureW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, textureW)
   v0 = neon_F32Ratio(atlasY + sourceY, textureH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, textureH)
   first = nvcVertices
@@ -1951,13 +1981,13 @@ EndProcedure
 
 Procedure.i NeonVkChromeSpriteTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   If nvcLogoSource = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH, nvcAtlasW, nvcAtlasH, nvcDescriptorSet)
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcLogoX, nvcLogoY, nvcLogoW, nvcLogoH, nvcAtlasW, nvcAtlasH, nvcDescriptorSet, 0)
 EndProcedure
 
 Procedure.i NeonVkChromeSpriteDrawTransform(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   If id < 1 Or id > #NVC_MULTI_SPRITE_MAX : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
   If nvcSpriteSource[id] = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id], nvcAtlasW, nvcAtlasH, nvcDescriptorSet)
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, nvcSpriteX[id], nvcSpriteY[id], nvcSpriteW[id], nvcSpriteH[id], nvcAtlasW, nvcAtlasH, nvcDescriptorSet, 0)
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
@@ -1969,11 +1999,106 @@ Procedure.i NeonVkChromeImageSpriteDrawTransformId(id.i, x.i, y.i, sourceX.i, so
     setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
   EndIf
   If setHandle = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, 0, 0, imageW, imageH, imageW, imageH, setHandle)
+  ProcedureReturn nvcSpriteTransformRegion(x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera, 0, 0, imageW, imageH, imageW, imageH, setHandle, 0)
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteDrawTransform(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
   ProcedureReturn NeonVkChromeImageSpriteDrawTransformId(1, x, y, sourceX, sourceY, sourceW, sourceH, drawW, drawH, colour, angleQ16, cameraX, cameraY, zoomQ16, ignoreCamera)
+EndProcedure
+
+; Begin and Add retain commands only. End appends the entire group after all
+; intervening draws, using the clip active at End. IDs refer to live images;
+; replacing or clearing one invalidates the group rather than sampling a new
+; generation under old geometry. The group may be submitted in later frames
+; while its target geometry and image generations remain unchanged.
+Procedure.i NeonVkChromeSpriteBatchBegin()
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcRetainedBatchLogicalW = nvcLogicalW : nvcRetainedBatchLogicalH = nvcLogicalH
+  nvcRetainedBatchTargetGeneration = nvcTargetGeneration
+  nvcRetainedBatchCount = 0 : nvcRetainedBatchActive = 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteBatchAdd(id.i, x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i, angleQ16.i, cameraX.i, cameraY.i, zoomQ16.i, ignoreCamera.i)
+  Define setHandle.i, imageW.i, imageH.i, generation.i
+  Define *item.NvcRetainedSprite
+  If nvcInFrame = 0 Or nvcRetainedBatchActive = 0 Or nvcLogicalW <> nvcRetainedBatchLogicalW Or nvcLogicalH <> nvcRetainedBatchLogicalH Or nvcTargetGeneration <> nvcRetainedBatchTargetGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcRetainedBatchCount >= #NVC_RETAINED_BATCH_MAX
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  If id < 1 Or id > #NVC_MULTI_SPRITE_MAX
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If id = 1
+    setHandle = nvcImageSpriteSet : imageW = nvcImageSpriteW : imageH = nvcImageSpriteH
+    generation = nvcImageSpriteGeneration
+  Else
+    setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
+    generation = nvcImageSpriteGenerations[id]
+  EndIf
+  If setHandle = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If sourceX < 0 Or sourceY < 0 Or sourceW < 1 Or sourceH < 1 Or drawW < 1 Or drawH < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If sourceX >= imageW Or sourceY >= imageH Or sourceW > imageW - sourceX Or sourceH > imageH - sourceY
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  *item = @nvcRetainedItems[nvcRetainedBatchCount]
+  *item\id = id : *item\generation = generation
+  *item\x = x : *item\y = y
+  *item\sourceX = sourceX : *item\sourceY = sourceY
+  *item\sourceW = sourceW : *item\sourceH = sourceH
+  *item\drawW = drawW : *item\drawH = drawH : *item\colour = colour
+  *item\angleQ16 = angleQ16 : *item\cameraX = cameraX : *item\cameraY = cameraY
+  *item\zoomQ16 = zoomQ16 : *item\ignoreCamera = ignoreCamera
+  nvcRetainedBatchCount = nvcRetainedBatchCount + 1
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeSpriteBatchEnd()
+  Define i.i, id.i, setHandle.i, imageW.i, imageH.i, generation.i, rc.i
+  Define *item.NvcRetainedSprite
+  If nvcInFrame = 0 Or nvcRetainedBatchActive = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcLogicalW <> nvcRetainedBatchLogicalW Or nvcLogicalH <> nvcRetainedBatchLogicalH Or nvcTargetGeneration <> nvcRetainedBatchTargetGeneration
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If nvcRetainedBatchCount > nvcMaxQuads - nvcDrawCount Or nvcRetainedBatchCount > nvcMaxVertexQuads - nvcVertices / 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  If nvcRetainedBatchCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ; The first pass is read-only: a bad later item cannot append an earlier one.
+  For i = 0 To nvcRetainedBatchCount - 1
+    *item = @nvcRetainedItems[i] : id = *item\id
+    If id = 1
+      setHandle = nvcImageSpriteSet : imageW = nvcImageSpriteW : imageH = nvcImageSpriteH
+      generation = nvcImageSpriteGeneration
+    Else
+      setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
+      generation = nvcImageSpriteGenerations[id]
+    EndIf
+    If setHandle = 0 Or generation <> *item\generation
+      ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+    EndIf
+    rc = nvcSpriteTransformRegion(*item\x, *item\y, *item\sourceX, *item\sourceY, *item\sourceW, *item\sourceH, *item\drawW, *item\drawH, *item\colour, *item\angleQ16, *item\cameraX, *item\cameraY, *item\zoomQ16, *item\ignoreCamera, 0, 0, imageW, imageH, imageW, imageH, setHandle, 1)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  For i = 0 To nvcRetainedBatchCount - 1
+    *item = @nvcRetainedItems[i] : id = *item\id
+    If id = 1
+      setHandle = nvcImageSpriteSet : imageW = nvcImageSpriteW : imageH = nvcImageSpriteH
+    Else
+      setHandle = nvcImageSpriteSets[id] : imageW = nvcImageSpriteWidths[id] : imageH = nvcImageSpriteHeights[id]
+    EndIf
+    rc = nvcSpriteTransformRegion(*item\x, *item\y, *item\sourceX, *item\sourceY, *item\sourceW, *item\sourceH, *item\drawW, *item\drawH, *item\colour, *item\angleQ16, *item\cameraX, *item\cameraY, *item\zoomQ16, *item\ignoreCamera, 0, 0, imageW, imageH, imageW, imageH, setHandle, 0)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  Next
+  ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
 ; Preserve the original full-size, opaque RGB logo call.
@@ -2976,6 +3101,7 @@ Procedure NeonVkChromeDestroy()
   nvdWsiRollback()
   nvdPresentClear()
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
+  nvcRetainedBatchActive = 0 : nvcRetainedBatchCount = 0
   If nvcHooksInstalled <> 0
     NeonDrawBackendClear()
     nvcHooksInstalled = 0
