@@ -43,6 +43,7 @@
 #NEON_VK_CHROME_TT_ATLAS_H     = 1024
 #NEON_VK_CHROME_TT_CACHE_MAX   = 512
 #NVC_TT_INDEX_SIZE             = 1024
+#NVC_TT_PARTIAL_MAX_TILES      = 256
 #NEON_VK_CHROME_TT_COVERAGE    = 1048576
 #NEON_VK_CHROME_TT_RUN_GLYPHS  = 4096
 
@@ -144,6 +145,9 @@ Global nvcAtlasBaseH.i
 Global nvcAtlasBytes.i
 Global nvcAtlasUploadMapped.i
 Global nvcAtlasUploadCount.i
+Global nvcAtlasPartialUploadCount.i
+Global nvcAtlasFullUploadCount.i
+Global nvcAtlasLastUploadBytes.i
 Global nvcAtlasGeneration.i
 Global nvcAtlasFaulted.i
 ; The legacy RGB/RGBA source and sixteen stable-ID RGBA sources share a bounded
@@ -170,6 +174,12 @@ Global nvcCreateFaultText.i
 Global nvcAtlasRasterCountAtFrame.i
 Global nvcAtlasUploadAtFrame.i
 Global nvcTTDirty.i
+Global nvcTTForceFull.i
+Global nvcTTDirtyRectValid.i
+Global nvcTTDirtyLeft.i
+Global nvcTTDirtyTop.i
+Global nvcTTDirtyRight.i
+Global nvcTTDirtyBottom.i
 Global nvcTTCacheHits.i
 Global nvcTTCacheMisses.i
 Global nvcTTNextX.i
@@ -507,15 +517,54 @@ Procedure.i nvcAtlasMapBitmapUV(*uv.NeonAtlasGlyphUV, bold.i)
   ProcedureReturn 1
 EndProcedure
 
-; Dynamic glyph misses are uploaded only before a frame begins. The persistent
-; host-visible staging allocation is fully rewritten, then copied to the one
-; shared sampled image; callers never mutate its texels during a render pass.
-Procedure.i nvcAtlasUploadWarm()
+; One conservative partial shape works with the bounded optimal-image copy
+; contract: tile-aligned interior, one region, no more than 256 4x4 tiles.
+; The source offset is checked against the public device alignment query.
+; Any unsupported shape takes the established full-atlas transfer path.
+Procedure.i nvcTTPartialPlan(*copy.VkBufferImageCopy)
+  Define props.VkPhysicalDeviceProperties
+  Define x0.i, y0.i, x1.i, y1.i, width.i, height.i, align.i, offset.i, caps.i, required.i
+  If *copy = 0 Or nvcTTDirtyRectValid = 0 Or nvcTTForceFull <> 0 Or nvcPhysical = 0
+    ProcedureReturn 0
+  EndIf
+  If nvcTTDirtyLeft < 32 Or nvcTTDirtyTop < 0 Or nvcTTDirtyRight > nvcAtlasW Or nvcTTDirtyBottom > nvcAtlasH
+    ProcedureReturn 0
+  EndIf
+  required = #ANVIL_VK_CAP_BUFFER_TRANSFER | #ANVIL_VK_CAP_LINEAR_TRANSFER | #ANVIL_VK_CAP_BUFFER_TO_TILED_RECT_COPY
+  caps = avkBackendCaps()
+  If (caps & required) <> required : ProcedureReturn 0 : EndIf
+  x0 = (nvcTTDirtyLeft / 16) * 16
+  y0 = (nvcTTDirtyTop / 4) * 4
+  x1 = ((nvcTTDirtyRight + 3) / 4) * 4
+  y1 = ((nvcTTDirtyBottom + 3) / 4) * 4
+  width = x1 - x0 : height = y1 - y0
+  If x0 < 32 Or y0 < 0 Or x1 > nvcAtlasW Or y1 > nvcAtlasH Or width < 4 Or height < 4
+    ProcedureReturn 0
+  EndIf
+  If (width / 4) * (height / 4) > #NVC_TT_PARTIAL_MAX_TILES
+    ProcedureReturn 0
+  EndIf
+  vkGetPhysicalDeviceProperties(nvcPhysical, @props)
+  align = props\limits\optimalBufferCopyOffsetAlignment
+  If align < 1 Or (align & (align - 1)) <> 0 : ProcedureReturn 0 : EndIf
+  offset = #NEON_VK_CHROME_ATLAS_PAD + ((y0 * nvcAtlasW + x0) * 4)
+  If (offset % align) <> 0 : ProcedureReturn 0 : EndIf
+  *copy\bufferOffset = offset
+  *copy\bufferRowLength = nvcAtlasW
+  *copy\imageOffset\x = x0 : *copy\imageOffset\y = y0
+  *copy\imageExtent\width = width : *copy\imageExtent\height = height
+  ProcedureReturn 1
+EndProcedure
+
+; Dynamic glyph misses are uploaded only before a frame begins. The mapped
+; staging allocation remains the complete atlas; the copy rectangle may be
+; smaller. Callers never mutate sampled texels during a render pass.
+Procedure.i nvcAtlasUploadWarm(allowPartial.i)
   Define bi.VkCommandBufferBeginInfo
   Define bar.VkImageMemoryBarrier
   Define copy.VkBufferImageCopy
-  Define rc.i
-  If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 Or nvcUploadBuffer = 0
+  Define rc.i, partial.i
+  If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 Or nvcUploadBuffer = 0 Or nvcAtlasFaulted <> 0
     ProcedureReturn #NEON_VK_CHROME_ERR_STATE
   EndIf
   rc = vkResetCommandBuffer(nvcCommand, 0)
@@ -536,6 +585,7 @@ Procedure.i nvcAtlasUploadWarm()
   copy\imageSubresource\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   copy\imageSubresource\layerCount = 1
   copy\imageExtent\width = nvcAtlasW : copy\imageExtent\height = nvcAtlasH : copy\imageExtent\depth = 1
+  If allowPartial <> 0 : partial = nvcTTPartialPlan(@copy) : EndIf
   If rc = #VK_SUCCESS
     vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
     vkCmdCopyBufferToImage(nvcCommand, nvcUploadBuffer, nvcAtlasImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
@@ -547,7 +597,17 @@ Procedure.i nvcAtlasUploadWarm()
     rc = vkEndCommandBuffer(nvcCommand)
   EndIf
   If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
-  If rc = #VK_SUCCESS : nvcAtlasUploadCount + 1 : EndIf
+  If rc = #VK_SUCCESS
+    nvcAtlasUploadCount + 1
+    nvcAtlasLastUploadBytes = copy\imageExtent\width * copy\imageExtent\height * 4
+    If partial <> 0
+      nvcAtlasPartialUploadCount + 1
+    Else
+      nvcAtlasFullUploadCount + 1
+    EndIf
+  Else
+    nvcAtlasFaulted = 1
+  EndIf
   ProcedureReturn rc
 EndProcedure
 
@@ -576,7 +636,7 @@ Procedure.i nvcAtlasRefresh()
     Next
   Next
   If nvcBitmapStageCopy(source, width, height) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
-  rc = nvcAtlasUploadWarm()
+  rc = nvcAtlasUploadWarm(0)
   If rc <> #VK_SUCCESS
     nvcAtlasFaulted = 1
     ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN
@@ -844,6 +904,7 @@ Procedure.i nvcAtlasCreateAndUpload()
     EndIf
   Next
   nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0 : nvcTTCount = 0 : nvcTTDirty = 0
+  nvcTTForceFull = 0 : nvcTTDirtyRectValid = 0
   For i = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[i] = 0 : Next
   If Neon_AtlasRasterWhiteUV(@white) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, nvcAtlasBaseW), nvcAtlasW)
@@ -903,6 +964,8 @@ Procedure.i nvcAtlasCreateAndUpload()
   EndIf
   If rc = #VK_SUCCESS
     nvcAtlasUploadCount = 1
+    nvcAtlasFullUploadCount = 1 : nvcAtlasPartialUploadCount = 0
+    nvcAtlasLastUploadBytes = nvcAtlasBytes
     nvcAtlasGeneration = Neon_AtlasRasterGeneration()
     nvcAtlasFaulted = 0
   EndIf
@@ -1982,6 +2045,25 @@ Procedure.i nvcTTFixed16Floor(value.i)
   ProcedureReturn 0 - (((0 - value) + $FFFF) >> 16)
 EndProcedure
 
+Procedure nvcTTDirtyRectMark(x.i, y.i, width.i, height.i)
+  If nvcTTDirtyRectValid = 0
+    nvcTTDirtyLeft = x : nvcTTDirtyTop = y
+    nvcTTDirtyRight = x + width : nvcTTDirtyBottom = y + height
+    nvcTTDirtyRectValid = 1
+  Else
+    If x < nvcTTDirtyLeft : nvcTTDirtyLeft = x : EndIf
+    If y < nvcTTDirtyTop : nvcTTDirtyTop = y : EndIf
+    If x + width > nvcTTDirtyRight : nvcTTDirtyRight = x + width : EndIf
+    If y + height > nvcTTDirtyBottom : nvcTTDirtyBottom = y + height : EndIf
+  EndIf
+EndProcedure
+
+Procedure nvcTTUploadCommitted()
+  nvcTTDirty = 0 : nvcTTForceFull = 0 : nvcTTDirtyRectValid = 0
+  nvcTTDirtyLeft = 0 : nvcTTDirtyTop = 0
+  nvcTTDirtyRight = 0 : nvcTTDirtyBottom = 0
+EndProcedure
+
 Procedure.i nvcTTCacheClear()
   Define x.i, y.i, p.i
   If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 : ProcedureReturn 0 : EndIf
@@ -1993,7 +2075,7 @@ Procedure.i nvcTTCacheClear()
   Next
   nvcTTCount = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
   For x = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[x] = 0 : Next
-  nvcTTDirty = 1
+  nvcTTDirty = 1 : nvcTTForceFull = 1 : nvcTTDirtyRectValid = 0
   ProcedureReturn 1
 EndProcedure
 
@@ -2040,6 +2122,7 @@ Procedure.i nvcTTAddGlyph(slot.i, generation.i, pixelHeight.i, glyph.i)
   nvcTTNextY = y
   If height + 2 > shelfHeight : shelfHeight = height + 2 : EndIf
   nvcTTRowH = shelfHeight
+  nvcTTDirtyRectMark(x, y, paddedW, paddedH)
   nvcTTDirty = 1 : nvcTTCacheMisses + 1
   ProcedureReturn entry
 EndProcedure
@@ -2126,8 +2209,8 @@ Procedure.i NeonVkChromeWarmTrueTypeText(pixelHeight.i, *s)
     EndIf
   Next
   If nvcTTDirty <> 0
-    If nvcAtlasUploadWarm() <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
-    nvcTTDirty = 0
+    If nvcAtlasUploadWarm(1) <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
+    nvcTTUploadCommitted()
   EndIf
   ProcedureReturn decoded
 EndProcedure
@@ -2167,8 +2250,8 @@ Procedure.i NeonVkChromeGridWarm(*glyphs, count.i, pixelHeight.i)
     EndIf
   Next
   If nvcTTDirty <> 0
-    If nvcAtlasUploadWarm() <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
-    nvcTTDirty = 0
+    If nvcAtlasUploadWarm(1) <> #VK_SUCCESS : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_VULKAN) : EndIf
+    nvcTTUploadCommitted()
   EndIf
   ProcedureReturn count
 EndProcedure
@@ -2960,8 +3043,11 @@ Procedure NeonVkChromeDestroy()
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
   nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0
+  nvcAtlasPartialUploadCount = 0 : nvcAtlasFullUploadCount = 0 : nvcAtlasLastUploadBytes = 0
   nvcAtlasGeneration = 0 : nvcAtlasFaulted = 0
   nvcTTCount = 0 : nvcTTDirty = 0 : nvcTTNextX = 32 : nvcTTNextY = 1 : nvcTTRowH = 0
+  nvcTTForceFull = 0 : nvcTTDirtyRectValid = 0
+  nvcTTDirtyLeft = 0 : nvcTTDirtyTop = 0 : nvcTTDirtyRight = 0 : nvcTTDirtyBottom = 0
   For slot = 0 To #NVC_TT_INDEX_SIZE - 1 : nvcTTIndex[slot] = 0 : Next
   nvcTTCacheHits = 0 : nvcTTCacheMisses = 0
   nvcTargetGeneration = 0

@@ -93,6 +93,23 @@ gain. See `docs/evidence/neon-tt-index-pi4-20261003/`. The updated full Pi 4
 monitor desk-compiles but is not installed; the current monitor remains build
 242.
 
+The Pi 4 Neon adapter now batches new TrueType atlas texels into one bounded,
+source-aligned dirty rectangle (at most 256 UIF tiles) instead of uploading
+the full 512×1024 BGRA atlas for each new glyph. Full uploads remain for cache
+reset, bitmap revision changes and larger unions. The partial path requires
+`BUFFER_TRANSFER`, `LINEAR_TRANSFER` and `BUFFER_TO_TILED_RECT_COPY`; a
+backend lacking those capabilities selects the full path. A returning RAM
+proof on build 242 passed exact GPU pixel and untouched-atlas checks for
+4×8 and 4×4 uploads, with guarded DMA operations 2 and 1 versus a
+complete 2,097,152-byte upload. The unchanged all-16 image/atlas GPU
+regression also passed after recompilation. These are synthetic staging pixels,
+not a repeat of real TrueType rasterization, measured bus traffic or frame
+rate, and only Pi 4 was run on hardware. See
+`docs/evidence/neon-tt-partial-pi4-20261003/`. The updated full Pi 4 monitor desk-compiled with `--no-bump` as a
+5,251,408-byte image, SHA-256
+`F69BB278AB44B768A373A2773882CC80D85A2EFEABF1903D0C39A99D0E349DAF`,
+linked at `$200000..$70214F`; it is not installed. The resident
+monitor remains build 242, and any future RAM stage must use its live `map`.
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
