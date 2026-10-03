@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "Anvil" / "Graphics" / "Vulkan" / "Tests"
 CASES = (("pi3", 0x00400000, 0x03000000),
          ("rockpi4c", 0x02000000, 0x05000000),
-         ("pi4", 0x00400000, 0x03000000))
+         ("pi4", 0x00400000, 0x03000000),
+         ("unoq", 0x70000000, 0x68000000))
 RETURN_ADDRESS = 0xDEAD0000
 
 
@@ -52,17 +53,18 @@ def compile_case(compiler: Path, work: Path, source: Path, target: str,
     return result.returncode, image, result.stdout
 
 
-def run_a64(a64, image: Path, load: int, stack: int) -> tuple[int, int]:
+def run_a64(a64, image: Path, load: int, stack: int,
+            max_steps: int = 100_000) -> tuple[int, int]:
     cpu = a64.A64()
     for index, byte in enumerate(image.read_bytes()):
         cpu.memory[load + index] = byte
     a64.attach_symbols(cpu, image, load)
     cpu.pc, cpu.sp, cpu.x[30] = load, stack, RETURN_ADDRESS
-    for steps in range(100_000):
+    for steps in range(max_steps):
         if cpu.pc == RETURN_ADDRESS:
             return cpu.x[0] & 0xFFFFFFFFFFFFFFFF, steps
         cpu.step()
-    raise RuntimeError(f"{image.name} did not return in 100,000 instructions")
+    raise RuntimeError(f"{image.name} did not return in {max_steps:,} instructions")
 
 
 def main() -> int:
@@ -95,6 +97,12 @@ def main() -> int:
                 raise RuntimeError(f"{target} no-backend link failed; see {image.with_suffix('.log')}")
             print(f"{target}: no-backend API compiled and linked ({image.stat().st_size} bytes)")
             count += 1
+            if target in ("pi3", "unoq"):
+                result, steps = run_a64(a64, image, load, stack, 5_000_000)
+                if result:
+                    raise RuntimeError(f"{target} no-backend returned {result}; expected incompatible driver")
+                print(f"{target}: no-backend API refused device in {steps} A64 instructions")
+                count += 1
 
     source = TESTS / "vulkan_alignc_negative.pico2"
     code, image, output = compile_case(args.compiler, args.work, source,

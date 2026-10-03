@@ -30,6 +30,15 @@ The Pi 4 ordered partial `vkCmdCopyBufferToImage` route has a separate silicon p
 
 Compile-only probes built with the compiler fix shipped on `PureBasicCode` `main` at commit `1752ead85bad59fadcbb633da68ed289a84e2639`: the A64 ABI gate in `tools/vulkan_alignc_cross_target_check.py` passed 39 checks (12 `SizeOf`/`OffsetOf` checks each for Pi 3, ROCK Pi 4C, and Pi 4, plus an RP2350 negative control); standalone `pi3` and `rockpi4c` Vulkan API + none-backend probes each linked a 192,784-byte image, and a UNO Q none-backend probe also compiled. These are compile/link results only: the production non-Pi 4 monitor roots still omit Vulkan, and no non-Pi 4 GPU path is claimed.
 
+The 2026-10-03 cross-target gate extends that desk proof to UNO Q: all four
+AArch64 targets passed the twelve Vulkan C-layout size/offset checks, and the
+Pi 3, ROCK Pi 4C and UNO Q no-backend API probes linked 207,360-byte images.
+The Pi 3 and UNO Q probes also executed in the AArch64 interpreter and
+returned `VK_ERROR_INCOMPATIBLE_DRIVER` with no instance handle; the RP2350
+negative control still rejected `AlignC`. The gate reported 54 checks. No
+physical-device enumeration, GPU execution or monitor integration is inferred
+for those three boards from these desk probes.
+
 ## Bounded image readback
 
 The Pi 4 backend supports full-image and bounded partial level-zero optimal BGRA8 readback into a transfer-destination buffer through guarded 2D DMA. The 2026-09-27 37×13 whole-image diagnostic checked all 481 texels, untouched padding and 40 DMA operations. R2 checked a 4×4-aligned 16-texel partial region with 16 padding words, 32 guard words and one DMA; an unaligned request returned `-20005`. R3 checked a padded `(32,8)` `5×5` region ending at the right and bottom edges of a 37×13 image: all 25 texels matched, 15 padding words and 32 guard words remained intact, with four DMA operations. A same-sized `(28,4)` non-edge request returned `-20005` without extra work. Source offsets must align to 4×4 utiles; a short width or height is accepted only when it reaches that respective image edge. Mips, layers, format conversion, and other edge cases remain unsupported. This is Pi 4-specific evidence, not support on other backends; see `docs/evidence/vulkan-optimal-edge-tail-pi4-20260930/README.md`.
