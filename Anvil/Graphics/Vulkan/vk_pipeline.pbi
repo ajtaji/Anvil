@@ -70,7 +70,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_ir_adapter.pbi"
 ; exactly on refuses the next honest use of it.
 #ANVIL_VK_MAX_LAYOUTS = 8
 #ANVIL_VK_MAX_RENDER_PASSES = 4
-#ANVIL_VK_MAX_IMAGE_VIEWS = 4
+#ANVIL_VK_MAX_IMAGE_VIEWS = 4 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
 #ANVIL_VK_MAX_FRAMEBUFFERS = 4
 #ANVIL_VK_MAX_PIPELINES = 4
 

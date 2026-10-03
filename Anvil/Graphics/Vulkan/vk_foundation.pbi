@@ -88,6 +88,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 #ANVIL_VK_MAX_COMMAND_POOLS = 16
 #ANVIL_VK_MAX_COMMAND_BUFFERS = 32
 #ANVIL_VK_MAX_EVENTS = 16
+
+; Object-table room for sixteen separately owned sprite images and one
+; replacement generation. This only raises handle ceilings. The backend
+; heap window still must fit actual image and staging allocation sizes.
+#ANVIL_VK_SPRITE_RESOURCE_CAPACITY = 16
+#ANVIL_VK_SPRITE_RESOURCE_SLOTS = #ANVIL_VK_SPRITE_RESOURCE_CAPACITY + 1
+#ANVIL_VK_SPRITE_STAGING_SLOTS = 1
 #ANVIL_VK_MAX_PIPELINE_CACHES = 8
 
 ; HOW MANY VERTEX INPUT BINDINGS one pipeline may describe, and therefore
@@ -107,7 +114,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; include the descriptor layer to learn the shape.
 #ANVIL_VK_MAX_SET_LAYOUTS = 4
 #ANVIL_VK_MAX_DESCRIPTOR_POOLS = 2
-#ANVIL_VK_MAX_DESCRIPTOR_SETS = 4
+#ANVIL_VK_MAX_DESCRIPTOR_SETS = 4 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
 #ANVIL_VK_MAX_SET_BINDINGS = 2
 #ANVIL_VK_MAX_SAMPLERS = 8
 

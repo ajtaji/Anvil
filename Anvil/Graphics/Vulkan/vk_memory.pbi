@@ -25,8 +25,8 @@
 
 XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 
-; SIXTEEN ALLOCATIONS, raised from eight when the descriptor path and the
-; split vertex layout arrived. This table holds the APPLICATION's
+; The prior sixteen-allocation table was raised from eight when the
+; descriptor path and split vertex layout arrived. It holds the APPLICATION's
 ; VkDeviceMemory objects AND the internal allocation each compiled
 ; pipeline takes for its shaders, which no handle names - so a program
 ; with four pipelines and five allocations needs nine slots, and both
@@ -34,8 +34,11 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 ; sits on refuses the next honest use of it, and the failure it produces
 ; is VK_ERROR_OUT_OF_DEVICE_MEMORY on a heap with almost all of itself
 ; still free, which reads as the wrong problem entirely.
-#ANVIL_VK_MAX_MEMORY = 16
-#ANVIL_VK_MAX_IMAGES = 8
+; The sprite table reserve adds one memory row per separate image,
+; one additional image generation for replacement, and one transient
+; staging row. The heap itself remains caller-sized and may still refuse.
+#ANVIL_VK_MAX_MEMORY = 16 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS + #ANVIL_VK_SPRITE_STAGING_SLOTS
+#ANVIL_VK_MAX_IMAGES = 8 + #ANVIL_VK_SPRITE_RESOURCE_SLOTS
 
 ; BGRA8 is four bytes per texel. This is the one format this slice knows,
 ; and the constant exists so the arithmetic below names it rather than
