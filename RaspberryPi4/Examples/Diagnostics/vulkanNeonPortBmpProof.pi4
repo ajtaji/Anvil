@@ -1,0 +1,316 @@
+; Returning RAM-only proof for a BMP decoded through the Neon Vulkan port.
+; Reuses the proven 64x64 offscreen target and safe RAM ranges. Build with
+; --entry-returns and read the fresh report symbol. Storage is not involved.
+; Board execution requires an armed deadman: uncertain GPU work spins until
+; reset rather than returning into the monitor.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_port.pi4"
+; The file loader uses the HwFile seam; this proof exercises memory only.
+Procedure.i HwFileOpen(*path) : ProcedureReturn 0 : EndProcedure
+Procedure.i HwFileSize() : ProcedureReturn 0 : EndProcedure
+Procedure.i HwFileReadAt(offset.i, *target, count.i) : ProcedureReturn -1 : EndProcedure
+Procedure HwFileClose() : EndProcedure
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_sprite_asset.pi4"
+
+#NBP_MAGIC = $42504E56
+#NBP_TAIL = $564E5042
+#NBP_W = 64
+#NBP_H = 64
+#NBP_SURFACE = $06000000
+#NBP_SURFACE_PITCH = 3200
+#NBP_WINDOW = $063E8000
+#NBP_WINDOW_BYTES = $00C00000
+#NBP_MAP_SPAN = $00FE8000
+#NBP_ARENA = $0A000000
+#NBP_ARENA_BYTES = $01000000
+
+; 32 little-endian words, 128 bytes, at global_nbpreport in the fresh .sym.
+; [0,31] markers; [1] status; [2] stage; [3..5] route results;
+; [6..9] decoded RGBA pixels; [10..16] sampled BGRA pixels;
+; [17..18] faults; [19..22] post-cleanup state; [23..25] draw/present counts;
+; [26..29] alpha mask and decoded sprite dimensions.
+Global Dim nbpReport.l[32]
+Global Dim nbpBmp.a[70]
+Global Dim nbpPixels.a[16]
+Global Dim nbpMask.a[4]
+Global nbpSprite.NeonVkPortSpriteRef
+Global nbpInst.i, nbpPhys.i, nbpDev.i, nbpQueue.i, nbpPool.i
+Global nbpImage.i, nbpMemory.i, nbpView.i, nbpPass.i, nbpFramebuffer.i
+Global nbpImageBase.i, nbpImagePitch.i
+
+; Leave all GPU resources untouched if submission or idle state is uncertain.
+; The armed deadman resets the machine after this non-returning path.
+Procedure.i nbpUnsafe(status.i)
+  nbpReport[1] = status
+  nbpReport[17] = AnvilVkFaultCount()
+  nbpReport[18] = AnvilVkFaultText()
+  While 1 : Wend
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i nbpObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If nbpDev <> 0 : rc = vkDeviceWaitIdle(nbpDev) : EndIf
+  If rc <> #VK_SUCCESS : ProcedureReturn nbpUnsafe(93) : EndIf
+  If nbpFramebuffer <> 0 : vkDestroyFramebuffer(nbpDev, nbpFramebuffer, 0) : nbpFramebuffer = 0 : EndIf
+  If nbpPass <> 0 : vkDestroyRenderPass(nbpDev, nbpPass, 0) : nbpPass = 0 : EndIf
+  If nbpView <> 0 : vkDestroyImageView(nbpDev, nbpView, 0) : nbpView = 0 : EndIf
+  If nbpImage <> 0 : vkDestroyImage(nbpDev, nbpImage, 0) : nbpImage = 0 : EndIf
+  If nbpMemory <> 0 : vkFreeMemory(nbpDev, nbpMemory, 0) : nbpMemory = 0 : EndIf
+  If nbpPool <> 0 : vkDestroyCommandPool(nbpDev, nbpPool, 0) : nbpPool = 0 : EndIf
+  If nbpDev <> 0 : vkDestroyDevice(nbpDev, 0) : nbpDev = 0 : EndIf
+  If nbpInst <> 0 : vkDestroyInstance(nbpInst, 0) : nbpInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nbpFinish(status.i)
+  nbpReport[1] = status
+  nbpReport[17] = AnvilVkFaultCount()
+  nbpReport[18] = AnvilVkFaultText()
+  ; Verify idle before any cleanup. A failed wait cannot authorize teardown.
+  If nbpDev <> 0 And vkDeviceWaitIdle(nbpDev) <> #VK_SUCCESS
+    ProcedureReturn nbpUnsafe(94)
+  EndIf
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If nvcInFrame <> 0
+    NeonVkChromeDestroy()
+    If nvcDevice <> 0 : ProcedureReturn nbpUnsafe(95) : EndIf
+  EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK
+      If nvcDevice <> 0 : ProcedureReturn nbpUnsafe(96) : EndIf
+      nbpReport[1] = 90
+    EndIf
+  ElseIf NeonVkChromeReady() <> 0
+    NeonVkChromeDestroy()
+    If nvcDevice <> 0 : ProcedureReturn nbpUnsafe(97) : EndIf
+  EndIf
+  If nbpObjectsDestroy() = 0 : ProcedureReturn nbpUnsafe(98) : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK
+      If nvcDevice <> 0 : ProcedureReturn nbpUnsafe(99) : EndIf
+      nbpReport[1] = 92
+    EndIf
+  EndIf
+  nbpReport[19] = Neon_Ready()
+  nbpReport[20] = v3d_owner
+  nbpReport[21] = NeonDrawBackendActive()
+  nbpReport[22] = NeonLifecycleBackend()
+  nbpReport[31] = #NBP_TAIL
+  ProcedureReturn @nbpReport[0]
+EndProcedure
+
+Procedure.i nbpObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @nbpInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(nbpInst, @count, @nbpPhys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or nbpPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(nbpPhys, @dci, 0, @nbpDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(nbpDev, 0, 0, @nbpQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(nbpDev, @pci, 0, @nbpPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NBP_W : imageInfo\extent\height = #NBP_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nbpDev, @imageInfo, 0, @nbpImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(nbpDev, nbpImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nbpDev, @alloc, 0, @nbpMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(nbpDev, nbpImage, nbpMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  nbpImageBase = AnvilVkImageAddress(nbpImage)
+  nbpImagePitch = AnvilVkImageRowPitch(nbpImage)
+  If nbpImageBase = 0 Or nbpImagePitch < (#NBP_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(nbpDev, nbpMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> nbpImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(nbpDev, nbpMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = nbpImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(nbpDev, @viewInfo, 0, @nbpView)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(nbpDev, @passInfo, 0, @nbpPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = nbpPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @nbpView : frameInfo\width = #NBP_W
+  frameInfo\height = #NBP_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(nbpDev, @frameInfo, 0, @nbpFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i nbpPixel(x.i, y.i)
+  ProcedureReturn PeekL(nbpImageBase + y * nbpImagePitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+; BMP header fields are unaligned in RAM.
+Procedure nbpPut16(*target, value.i)
+  PokeA(*target, value & 255) : PokeA(*target + 1, (value >> 8) & 255)
+EndProcedure
+
+Procedure nbpPut32(*target, value.i)
+  PokeA(*target, value & 255) : PokeA(*target + 1, (value >> 8) & 255)
+  PokeA(*target + 2, (value >> 16) & 255) : PokeA(*target + 3, (value >> 24) & 255)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i
+  nbpReport[0] = #NBP_MAGIC : nbpReport[31] = #NBP_TAIL
+  ; 2x2 bottom-up, uncompressed 32-bit BMP. Top: blue, keyed green.
+  ; Bottom: half-alpha white, invisible blue. The decoded rows must flip.
+  nbpBmp[0] = 66 : nbpBmp[1] = 77
+  nbpPut32(@nbpBmp[2], 70) : nbpPut32(@nbpBmp[10], 54)
+  nbpPut32(@nbpBmp[14], 40) : nbpPut32(@nbpBmp[18], 2)
+  nbpPut32(@nbpBmp[22], 2) : nbpPut16(@nbpBmp[26], 1)
+  nbpPut16(@nbpBmp[28], 32)
+  nbpBmp[54] = 255 : nbpBmp[55] = 255 : nbpBmp[56] = 255 : nbpBmp[57] = 128
+  nbpBmp[58] = 255
+  nbpBmp[62] = 255 : nbpBmp[65] = 255
+  nbpBmp[67] = 255 : nbpBmp[69] = 255
+
+  TimerInit()
+  nbpReport[2] = 1
+  If NeonArena(#NBP_ARENA, #NBP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn nbpFinish(1) : EndIf
+  If NeonSurface(#NBP_SURFACE, 800, 1280, #NBP_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn nbpFinish(2) : EndIf
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn nbpFinish(3) : EndIf
+  NeonSurfaceMapSpan(#NBP_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn nbpFinish(4) : EndIf
+  NeonPalette() : NeonFontDefaults()
+  If NeonFontUse(?dsp_font8x16, 8, 16, 32, 126) <> #NEON_OK : ProcedureReturn nbpFinish(5) : EndIf
+  NeonAnimReset() : NeonStateReset()
+  If AnvilVkV3dWindow(#NBP_WINDOW, #NBP_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn nbpFinish(6) : EndIf
+
+  nbpReport[2] = 2
+  If nbpObjectsCreate() = 0 : ProcedureReturn nbpFinish(7) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(nbpPhys, nbpDev, nbpQueue, nbpPool, nbpPass, nbpFramebuffer, #NBP_W, #NBP_H, 32, 256)
+  nbpReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn nbpFinish(8) : EndIf
+  If NeonVkPortCanvas(#NBP_W, #NBP_H, #NBP_W, #NBP_H) <> #NEON_OK : ProcedureReturn nbpFinish(9) : EndIf
+  rc = NeonVkPortSpriteLoadMemory(@nbpSprite, 1, @nbpBmp[0], 70, @nbpPixels[0], 16, $0000FF00, @nbpMask[0], 4)
+  nbpReport[4] = rc
+  If rc <> 0 : ProcedureReturn nbpFinish(10) : EndIf
+  nbpReport[6] = nvpAssetU32(@nbpPixels[0])
+  nbpReport[7] = nvpAssetU32(@nbpPixels[4])
+  nbpReport[8] = nvpAssetU32(@nbpPixels[8])
+  nbpReport[9] = nvpAssetU32(@nbpPixels[12])
+  nbpReport[26] = nbpMask[0] | (nbpMask[1] << 8) | (nbpMask[2] << 16) | (nbpMask[3] << 24)
+  nbpReport[27] = nbpSprite\width : nbpReport[28] = nbpSprite\height
+  nbpReport[29] = nbpSprite\generation
+  If (nbpReport[6] & $FFFFFFFF) <> $FFFF0000 Or (nbpReport[7] & $FFFFFFFF) <> 0 : ProcedureReturn nbpFinish(25) : EndIf
+  If (nbpReport[8] & $FFFFFFFF) <> $80FFFFFF Or (nbpReport[9] & $FFFFFFFF) <> $00FF0000 : ProcedureReturn nbpFinish(26) : EndIf
+  If nbpReport[26] <> $00010001 Or nbpReport[27] <> 2 Or nbpReport[28] <> 2 Or nbpReport[29] < 1 : ProcedureReturn nbpFinish(27) : EndIf
+  If NeonVkChromeLifecycleInstallPrepared() <> #NEON_OK : ProcedureReturn nbpFinish(11) : EndIf
+  If NeonInit() <> #NEON_OK Or NeonLifecycleBackend() <> #NEON_BACKEND_EXTERNAL : ProcedureReturn nbpFinish(12) : EndIf
+
+  nbpReport[2] = 3
+  rc = NeonVkPortFrameBegin(0.0, 0.0, 0.0, 1.0)
+  nbpReport[5] = rc
+  If rc <> #NEON_OK : ProcedureReturn nbpFinish(13) : EndIf
+  rc = NeonVkPortBox(8.0, 8.0, 32.0, 32.0, 1.0, 0.0, 0.0, 1.0, 1, 1)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nbpFinish(14) : EndIf
+  rc = NeonVkPortSprite(@nbpSprite, 10.0, 10.0, 0.0, 8.0, 1.0, 1.0, 1.0, 1.0, 1, -1.0, -1.0, -1.0, -1.0, 1)
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nbpFinish(17) : EndIf
+  rc = NeonVkPortFrameEnd()
+  nbpReport[5] = rc
+  If rc <> #NEON_OK : ProcedureReturn nbpUnsafe(18) : EndIf
+  nbpReport[23] = NeonVkChromeDrawCount()
+  nbpReport[24] = NeonVkChromeVertexCount()
+  nbpReport[25] = NeonVkChromePresentPending()
+  If nbpReport[25] <> 1 : ProcedureReturn nbpFinish(19) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nbpFinish(20) : EndIf
+
+  nbpReport[2] = 4
+  nbpReport[10] = nbpPixel(0, 0)
+  nbpReport[11] = nbpPixel(8, 8)
+  nbpReport[12] = nbpPixel(12, 12)
+  nbpReport[13] = nbpPixel(20, 12)
+  nbpReport[14] = nbpPixel(12, 20)
+  nbpReport[15] = nbpPixel(20, 20)
+  nbpReport[16] = nbpPixel(42, 42)
+  If nbpReport[23] <> 2 Or nbpReport[24] <> 12 : ProcedureReturn nbpFinish(21) : EndIf
+  If (nbpReport[10] & $FFFFFFFF) <> $FF000000 Or (nbpReport[11] & $FFFFFFFF) <> $FFFF0000 : ProcedureReturn nbpFinish(22) : EndIf
+  If (nbpReport[12] & $FFFFFFFF) <> $FF0000FF Or (nbpReport[13] & $FFFFFFFF) <> $FFFF0000 : ProcedureReturn nbpFinish(23) : EndIf
+  If (nbpReport[15] & $FFFFFFFF) <> $FFFF0000 Or (nbpReport[16] & $FFFFFFFF) <> $FF000000 : ProcedureReturn nbpFinish(24) : EndIf
+  ; Neon GL and Vulkan chrome use SRC_ALPHA / ONE_MINUS_SRC_ALPHA for both
+  ; color and alpha. Half-alpha white over opaque red yields $BFFF8080.
+  If (nbpReport[14] & $FFFFFFFF) <> $BFFF8080 : ProcedureReturn nbpFinish(28) : EndIf
+  nbpReport[2] = 5
+  ProcedureReturn nbpFinish(0)
+EndProcedure

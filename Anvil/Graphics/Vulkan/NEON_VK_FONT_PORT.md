@@ -36,5 +36,8 @@ the face, kerning and raster metrics can differ.
 executes its emitted A64 under a desk interpreter. The gate checks loaded file
 and boot slots, two pixel heights, measured width and line height, right and
 centre placement, and refusal of mid-frame prewarm, face switch, dirty atlas,
-stale generation and unsupported canvas stretch. It has no board proof and is
-not included in the resident Pi 4 monitor.
+stale generation and unsupported canvas stretch. The Pi 4
+[offscreen board proof](../../../docs/evidence/neon-vk-font-port-pi4-20261003/README.md)
+passed boot-slot TrueType width, right/centre placement and exact translated
+pixels through three Vulkan draws. This adapter is not included in the
+resident Pi 4 monitor.
