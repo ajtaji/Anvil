@@ -355,6 +355,7 @@ Procedure.i NeonVkChromeParticlesDrawPrepared()
   Define Dim xBits.i[4]
   Define Dim yBits.i[4]
   Define i.i, first.i, base.i, col.i, row.i, u.i, v.i
+  Define p.i
   Define *corners.NvcParticleCorners
   If nvcReady = 0 Or nvcInFrame = 0 Or nvcParticlePrepared = 0 Or nvcParticleSet = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
@@ -396,12 +397,31 @@ Procedure.i NeonVkChromeParticlesDrawPrepared()
     col = i % #NVC_PARTICLE_PALETTE_W : row = i / #NVC_PARTICLE_PALETTE_W
     u = nvcParticleU[col] : v = nvcParticleV[row]
     base = nvcVertices
-    nvcParticleVertexBits(base + 0, xBits[0], yBits[0], u, v)
-    nvcParticleVertexBits(base + 1, xBits[2], yBits[2], u, v)
-    nvcParticleVertexBits(base + 2, xBits[3], yBits[3], u, v)
-    nvcParticleVertexBits(base + 3, xBits[0], yBits[0], u, v)
-    nvcParticleVertexBits(base + 4, xBits[3], yBits[3], u, v)
-    nvcParticleVertexBits(base + 5, xBits[1], yBits[1], u, v)
+    p = nvcMapped + base * #NEON_VK_CHROME_VERTEX_BYTES
+    ; Write the six vertices directly; the capacity check above covers them all.
+    PokeL(p + 0, xBits[0]) : PokeL(p + 4, yBits[0])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+    p = p + #NEON_VK_CHROME_VERTEX_BYTES
+    PokeL(p + 0, xBits[2]) : PokeL(p + 4, yBits[2])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+    p = p + #NEON_VK_CHROME_VERTEX_BYTES
+    PokeL(p + 0, xBits[3]) : PokeL(p + 4, yBits[3])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+    p = p + #NEON_VK_CHROME_VERTEX_BYTES
+    PokeL(p + 0, xBits[0]) : PokeL(p + 4, yBits[0])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+    p = p + #NEON_VK_CHROME_VERTEX_BYTES
+    PokeL(p + 0, xBits[3]) : PokeL(p + 4, yBits[3])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
+    p = p + #NEON_VK_CHROME_VERTEX_BYTES
+    PokeL(p + 0, xBits[1]) : PokeL(p + 4, yBits[1])
+    PokeL(p + 8, u) : PokeL(p + 12, v)
+    PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
     nvcVertices + 6
   Next
   ProcedureReturn nvcDrawSet(first, nvcParticleCount * 6, $FFFFFFFF, nvcParticleSet)
