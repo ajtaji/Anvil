@@ -171,8 +171,13 @@ native reference pixel bytes and passed 124 widget checks; see
 one registered RGBA8 sprite with bounded crop, destination scaling and tint.
 Four Pi 4 V3D draws produced six exact sprite pixels, including transparent
 and half-alpha texels; see
-`docs/evidence/neon-sprite-pi4-20261002/README.md`. Sprite rotation, camera
-mapping, multiple simultaneous images, and other board backends remain open.
+`docs/evidence/neon-sprite-pi4-20261002/README.md`. A subsequent Pi 4 proof
+matched eleven transformed sprite pixels for a clockwise quarter-turn, camera
+translation/2× zoom and ignored-camera draw; an extreme coordinate was
+rejected before fixed-point math. See
+`docs/evidence/neon-sprite-transform-pi4-20261002/README.md`. Multiple
+simultaneous images, desktop Neon Vulkan integration, and other board backends
+remain open.
 HDMI/DSI/rotation/resize and clean recovery coverage beyond these bounded
 scenes also remain.
 
