@@ -62,11 +62,16 @@ and separate IDs 1 and 16 together, verified both slots' pixels and handles
 after an oversized replacement refusal, replaced ID 16 without changing ID 1,
 and checked clear and repeated teardown. Only two simultaneous image IDs have
 been tested on Pi 4 silicon; all 16 have not been loaded at once. Indexed
-separate-image drawing currently covers untransformed rectangles; transformed
-sprite drawing still samples the atlas. Other boards have no hardware proof
-for this path. The full Pi 4 monitor desk-compiles with this source but has
-not been installed; its image reaches `$70094F`, so a future RAM payload at
-`$700000` would overlap it. Use the running monitor's `map` output for staging.
+separate-image drawing now uses the same rotation, camera, zoom, crop and tint
+geometry as atlas sprites, while binding each image's descriptor. A Pi 4 RAM
+proof checked rotated ID 16 quadrants, a cropped/tinted camera-zoomed draw,
+atlas and ID 1 coexistence, and extreme-coordinate refusal before draw-record
+mutation. The original atlas transform passed its full pixel-oracle regression.
+See `docs/evidence/neon-multi-image-transform-pi4-20261003/`. Other boards have
+no hardware proof for this path. The full Pi 4 monitor desk-compiles with this
+source but has not been installed; its image reaches `$70094F`. A future RAM
+payload at `$700000` would overlap it. Use the running monitor's `map` output
+for staging.
 Evidence is in
 `docs/evidence/neon-separate-sprite-pi4-20261002/`,
 `docs/evidence/neon-sprite-bgra-pi4-20261003/`, and
