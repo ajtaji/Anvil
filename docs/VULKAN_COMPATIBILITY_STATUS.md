@@ -52,21 +52,25 @@ V3D implementation and shader records remain Pi 4/V3D 4.2. There is no Pi 5
 Vulkan hardware-acceleration claim; the current tree has not been rerun on
 Pi 5 silicon during this work.
 
-On Pi 4, the Neon Vulkan adapter now has one separately allocated sampled
-BGRA8 sprite image beside its shared TrueType/sprite atlas. Its replacement
-API accepts either RGBA input with channel conversion or already-BGRA input
-with a checked CPU word copy before hardware upload. Returning RAM proofs on
-resident build 242 verified interleaved atlas and separate-image draws, exact
-BGRA pixels including an odd-width half-alpha sprite, an oversized replacement
-refusal that preserved the resident image, and two successful small
-replacements. The Vulkan object tables
-have reserve capacity for more images, but this API currently exposes one
-separate sprite image; other boards have no hardware proof for it. The full
-monitor compiles with this source but was not installed. Its compiled extent
-crosses `$700000`, so future RAM payload staging must follow that monitor's
-live `map` output. Evidence is in
-`docs/evidence/neon-separate-sprite-pi4-20261002/` and
-`docs/evidence/neon-sprite-bgra-pi4-20261003/`.
+On Pi 4, the Neon Vulkan adapter accepts separately allocated sampled BGRA8
+sprite images at IDs 1 through 16 beside its shared TrueType/sprite atlas.
+The unindexed calls still select ID 1. RGBA input is converted; already-BGRA
+input uses a checked CPU word copy before hardware upload. Returning RAM
+proofs on resident build 242 verified the original image replacement path,
+including odd-width half-alpha BGRA pixels. A further RAM proof drew the atlas
+and separate IDs 1 and 16 together, verified both slots' pixels and handles
+after an oversized replacement refusal, replaced ID 16 without changing ID 1,
+and checked clear and repeated teardown. Only two simultaneous image IDs have
+been tested on Pi 4 silicon; all 16 have not been loaded at once. Indexed
+separate-image drawing currently covers untransformed rectangles; transformed
+sprite drawing still samples the atlas. Other boards have no hardware proof
+for this path. The full Pi 4 monitor desk-compiles with this source but has
+not been installed; its image reaches `$70094F`, so a future RAM payload at
+`$700000` would overlap it. Use the running monitor's `map` output for staging.
+Evidence is in
+`docs/evidence/neon-separate-sprite-pi4-20261002/`,
+`docs/evidence/neon-sprite-bgra-pi4-20261003/`, and
+`docs/evidence/neon-multi-image-pi4-20261003/`.
 
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
