@@ -1099,11 +1099,32 @@ Procedure.i nvcImageSpritePreflight(imageBytes.i, stagingBytes.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
-; Replace the one independently owned RGBA8 sprite while no frame or present
+; The target has no CopyMemory or 64-bit Poke intrinsic. Copy aligned BGRA
+; words without channel conversion, or bytes for unaligned source buffers.
+Procedure.i nvcCopyBgraStaging(*source, *target, byteCount.i)
+  Define offset.i
+  If *source = 0 Or *target = 0 Or byteCount < 4 Or byteCount > 2048 * 2048 * 4 Or (byteCount & 3) <> 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_ARGS
+  EndIf
+  If ((*source | *target) & 3) = 0
+    While offset < byteCount
+      PokeL(*target + offset, PeekL(*source + offset))
+      offset = offset + 4
+    Wend
+  Else
+    While offset < byteCount
+      PokeA(*target + offset, PeekA(*source + offset))
+      offset = offset + 1
+    Wend
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Replace the one independently owned sprite while no frame or present
 ; transaction is active. Old handles remain published until image upload,
 ; view creation and descriptor writes all succeed. Source bytes are copied
 ; during this call and need not remain live afterwards.
-Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
+Procedure.i nvcImageSpriteReplace(*pixels, width.i, height.i, sourceBgra.i)
   Define ici.VkImageCreateInfo
   Define imageProps.VkImageFormatProperties
   Define imageReq.VkMemoryRequirements
@@ -1126,7 +1147,7 @@ Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
   If nvcReady = 0 Or nvcInFrame <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
-  If *rgba = 0 Or width < 1 Or height < 1 Or width > 2048 Or height > 2048
+  If *pixels = 0 Or width < 1 Or height < 1 Or width > 2048 Or height > 2048 Or (sourceBgra <> 0 And sourceBgra <> 1)
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
   If nvcImageSpriteGeneration = #NVC_MAX_GENERATION
@@ -1174,13 +1195,19 @@ Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
   If rc = #VK_SUCCESS : rc = vkBindBufferMemory(nvcDevice, stage, stageMemory, 0) : EndIf
   If rc = #VK_SUCCESS : rc = vkMapMemory(nvcDevice, stageMemory, 0, #VK_WHOLE_SIZE, 0, @mapped) : EndIf
   If rc = #VK_SUCCESS
-    For y = 0 To height - 1
-      For x = 0 To width - 1
-        src = *rgba + (y * width + x) * 4
-        dst = mapped + #NEON_VK_CHROME_ATLAS_PAD + (y * width + x) * 4
-        PokeL(dst, (PeekA(src + 3) << 24) | (PeekA(src) << 16) | (PeekA(src + 1) << 8) | PeekA(src + 2))
+    If sourceBgra <> 0
+      rc = nvcCopyBgraStaging(*pixels, mapped + #NEON_VK_CHROME_ATLAS_PAD, pixelBytes)
+    Else
+      For y = 0 To height - 1
+        For x = 0 To width - 1
+          src = *pixels + (y * width + x) * 4
+          dst = mapped + #NEON_VK_CHROME_ATLAS_PAD + (y * width + x) * 4
+          PokeL(dst, (PeekA(src + 3) << 24) | (PeekA(src) << 16) | (PeekA(src + 1) << 8) | PeekA(src + 2))
+        Next
       Next
-    Next
+    EndIf
+  EndIf
+  If rc = #VK_SUCCESS
     bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
     bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
     bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
@@ -1270,6 +1297,14 @@ Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
   nvcImageSpriteRelease(oldSet, oldView, oldImage, oldMemory)
   nvcError = 0
   ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplace(*rgba, width.i, height.i)
+  ProcedureReturn nvcImageSpriteReplace(*rgba, width, height, 0)
+EndProcedure
+
+Procedure.i NeonVkChromeImageSpriteReplaceBGRA(*bgra, width.i, height.i)
+  ProcedureReturn nvcImageSpriteReplace(*bgra, width, height, 1)
 EndProcedure
 
 Procedure.i NeonVkChromeImageSpriteGeneration()

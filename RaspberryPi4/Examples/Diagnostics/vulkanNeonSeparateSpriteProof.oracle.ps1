@@ -8,7 +8,8 @@ if ($words[1] -ne 0) {
     throw ('Payload stopped at stage {0} with status {1}; create result 0x{2:X8}.' -f $words[2], $words[1], $words[3])
 }
 $checks = @{
-    0 = 0x4D534E56; 1 = 0; 2 = 8; 4 = 4; 5 = 24; 6 = 1
+    0 = 0x4D534E56; 1 = 0; 2 = 9; 4 = 4; 5 = 24; 6 = 1
+    12 = 0xBF808000; 25 = 0xFFFF00FF; 26 = 0xFF0000FF
     15 = 0x4D534E56; 16 = 0xFF000000; 17 = 0xFFFF0000
     18 = 0xFF00FF00; 19 = 0xFFFF8000; 20 = 0xFFFF0000
     21 = 0xFF00FF00; 22 = 0xFF0000FF; 23 = 0xFFFFFFFF
@@ -29,4 +30,4 @@ foreach ($slot in $checks.Keys) {
 if ([BitConverter]::ToInt32($bytes, 34 * 4) -ne -21203) {
     throw "Replacement refusal was not NEON_VK_CHROME_ERR_CAPACITY."
 }
-Write-Output 'Separate-image sprite proof passed: resident pixels survived rejected replacement.'
+Write-Output 'Separate-image sprite proof passed: RGBA and BGRA pixels, odd width and rejected replacement.'

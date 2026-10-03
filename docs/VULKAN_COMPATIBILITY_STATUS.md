@@ -53,16 +53,20 @@ Vulkan hardware-acceleration claim; the current tree has not been rerun on
 Pi 5 silicon during this work.
 
 On Pi 4, the Neon Vulkan adapter now has one separately allocated sampled
-RGBA8 sprite image beside its shared TrueType/sprite atlas. A returning RAM
-proof on resident build 242 verified interleaved atlas and separate-image
-draws, exact BGRA pixels, an oversized replacement refusal that preserved the
-resident image, and two successful small replacements. The Vulkan object tables
+BGRA8 sprite image beside its shared TrueType/sprite atlas. Its replacement
+API accepts either RGBA input with channel conversion or already-BGRA input
+with a checked CPU word copy before hardware upload. Returning RAM proofs on
+resident build 242 verified interleaved atlas and separate-image draws, exact
+BGRA pixels including an odd-width half-alpha sprite, an oversized replacement
+refusal that preserved the resident image, and two successful small
+replacements. The Vulkan object tables
 have reserve capacity for more images, but this API currently exposes one
 separate sprite image; other boards have no hardware proof for it. The full
 monitor compiles with this source but was not installed. Its compiled extent
 crosses `$700000`, so future RAM payload staging must follow that monitor's
 live `map` output. Evidence is in
-`docs/evidence/neon-separate-sprite-pi4-20261002/`.
+`docs/evidence/neon-separate-sprite-pi4-20261002/` and
+`docs/evidence/neon-sprite-bgra-pi4-20261003/`.
 
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
