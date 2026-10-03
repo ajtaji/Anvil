@@ -1,0 +1,309 @@
+; Returning RAM-only proof for a bound Neon-style TrueType handle on Pi 4.
+; Renders three translated copies of one run to an offscreen Vulkan image.
+; Build with --entry-returns and read the fresh report symbol.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_font_port.pi4"
+XIncludeFile "RaspberryPi4/Monitor/anvil_boot_ttf.pi4"
+
+#NPF_MAGIC = $46464E56
+#NPF_TAIL = $564E4646
+#NPF_W = 64
+#NPF_H = 64
+#NPF_SURFACE = $06000000
+#NPF_SURFACE_PITCH = 3200
+#NPF_WINDOW = $063E8000
+#NPF_WINDOW_BYTES = $00C00000
+#NPF_MAP_SPAN = $00FE8000
+#NPF_ARENA = $0A000000
+#NPF_ARENA_BYTES = $01000000
+
+; 32 little-endian words, 128 bytes, at global_npfreport in the fresh .sym.
+; [0] magic, [31] tail; [1] status; [2] stage; [3] create, [4] bind,
+; [5] warm, [6] width, [7] line height, [8..12] begin/draw/draw/draw/end;
+; [13..14] draws/vertices; [15] base ink, [16..17] shifted mismatch counts;
+; [18] lower guard ink; [19..20] faults; [21..24] cleanup state;
+; [25] present pending, [26] selected boot slot, [27] boot generation;
+; [28] checked device-idle result before any teardown or monitor return;
+; [29] DMA error after warm, [30] completed full-atlas upload count.
+Global Dim npfReport.l[32]
+Global npfFont.NeonVkPortFontRef
+Global npfInst.i, npfPhys.i, npfDev.i, npfQueue.i, npfPool.i
+Global npfImage.i, npfMemory.i, npfView.i, npfPass.i, npfFramebuffer.i
+Global npfImageBase.i, npfImagePitch.i
+
+; The monitor disarms its deadman as soon as this returning payload exits.
+; An unresolved GPU completion must therefore remain in the payload until
+; the already-armed 15-second deadman resets the board.
+Procedure npfUnsafeWait()
+  While 1
+    a64_wait_for_event()
+  Wend
+EndProcedure
+
+Procedure.i npfObjectsDestroy()
+  Define rc.i
+  rc = #VK_SUCCESS
+  If npfDev <> 0 : rc = vkDeviceWaitIdle(npfDev) : EndIf
+  If rc <> #VK_SUCCESS : npfUnsafeWait() : EndIf
+  If npfFramebuffer <> 0 : vkDestroyFramebuffer(npfDev, npfFramebuffer, 0) : npfFramebuffer = 0 : EndIf
+  If npfPass <> 0 : vkDestroyRenderPass(npfDev, npfPass, 0) : npfPass = 0 : EndIf
+  If npfView <> 0 : vkDestroyImageView(npfDev, npfView, 0) : npfView = 0 : EndIf
+  If npfImage <> 0 : vkDestroyImage(npfDev, npfImage, 0) : npfImage = 0 : EndIf
+  If npfMemory <> 0 : vkFreeMemory(npfDev, npfMemory, 0) : npfMemory = 0 : EndIf
+  If npfPool <> 0 : vkDestroyCommandPool(npfDev, npfPool, 0) : npfPool = 0 : EndIf
+  If npfDev <> 0 : vkDestroyDevice(npfDev, 0) : npfDev = 0 : EndIf
+  If npfInst <> 0 : vkDestroyInstance(npfInst, 0) : npfInst = 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i npfFinish(status.i)
+  Define idleRc.i
+  npfReport[1] = status
+  npfReport[19] = AnvilVkFaultCount()
+  npfReport[20] = AnvilVkFaultText()
+  ; FrameEnd and the atlas warm path can submit work even when they report an
+  ; error. Prove the entire device idle before touching Chrome or Neon state.
+  idleRc = #VK_SUCCESS
+  If npfDev <> 0 : idleRc = vkDeviceWaitIdle(npfDev) : EndIf
+  npfReport[28] = idleRc
+  If idleRc <> #VK_SUCCESS : npfUnsafeWait() : EndIf
+  If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+  If nvcInFrame <> 0
+    NeonVkChromeDestroy()
+    If nvcDevice <> 0 : npfUnsafeWait() : EndIf
+  EndIf
+  If NeonLifecycleBackend() = #NEON_BACKEND_EXTERNAL
+    If NeonShutdown() <> #NEON_OK : npfUnsafeWait() : EndIf
+    If nvcDevice <> 0 : npfUnsafeWait() : EndIf
+  ElseIf NeonVkChromeReady() <> 0 Or nvcDevice <> 0
+    NeonVkChromeDestroy()
+    If nvcDevice <> 0 : npfUnsafeWait() : EndIf
+  EndIf
+  If npfObjectsDestroy() = 0 : npfReport[1] = 91 : EndIf
+  If Neon_Ready() <> 0
+    If NeonShutdown() <> #NEON_OK : npfReport[1] = 92 : EndIf
+  EndIf
+  npfReport[21] = Neon_Ready()
+  npfReport[22] = v3d_owner
+  npfReport[23] = NeonDrawBackendActive()
+  npfReport[24] = NeonLifecycleBackend()
+  npfReport[31] = #NPF_TAIL
+  ProcedureReturn @npfReport[0]
+EndProcedure
+
+Procedure.i npfObjectsCreate()
+  Define rc.i, count.i, mapped.i
+  Define priority.l
+  Define ici.VkInstanceCreateInfo
+  Define qci.VkDeviceQueueCreateInfo
+  Define dci.VkDeviceCreateInfo
+  Define pci.VkCommandPoolCreateInfo
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define attachment.VkAttachmentDescription
+  Define attachmentRef.VkAttachmentReference
+  Define subpass.VkSubpassDescription
+  Define passInfo.VkRenderPassCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @npfInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  count = 1
+  rc = vkEnumeratePhysicalDevices(npfInst, @count, @npfPhys)
+  If rc <> #VK_SUCCESS Or count <> 1 Or npfPhys = 0 : ProcedureReturn 0 : EndIf
+  priority = 0
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(npfPhys, @dci, 0, @npfDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetDeviceQueue(npfDev, 0, 0, @npfQueue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  pci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(npfDev, @pci, 0, @npfPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = #NPF_W : imageInfo\extent\height = #NPF_H : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(npfDev, @imageInfo, 0, @npfImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(npfDev, npfImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(npfDev, @alloc, 0, @npfMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  rc = vkBindImageMemory(npfDev, npfImage, npfMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  npfImageBase = AnvilVkImageAddress(npfImage)
+  npfImagePitch = AnvilVkImageRowPitch(npfImage)
+  If npfImageBase = 0 Or npfImagePitch < (#NPF_W * 4) : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(npfDev, npfMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> npfImageBase : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(npfDev, npfMemory)
+
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = npfImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(npfDev, @viewInfo, 0, @npfView)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+
+  attachment\format = #VK_FORMAT_B8G8R8A8_UNORM
+  attachment\samples = #VK_SAMPLE_COUNT_1_BIT
+  attachment\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR
+  attachment\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  attachment\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  attachment\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  attachment\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  attachment\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  attachmentRef\attachment = 0 : attachmentRef\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  subpass\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  subpass\colorAttachmentCount = 1 : subpass\pColorAttachments = @attachmentRef
+  passInfo\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  passInfo\attachmentCount = 1 : passInfo\pAttachments = @attachment
+  passInfo\subpassCount = 1 : passInfo\pSubpasses = @subpass
+  rc = vkCreateRenderPass(npfDev, @passInfo, 0, @npfPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = npfPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @npfView : frameInfo\width = #NPF_W
+  frameInfo\height = #NPF_H : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(npfDev, @frameInfo, 0, @npfFramebuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i npfPixel(x.i, y.i)
+  ProcedureReturn PeekL(npfImageBase + y * npfImagePitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, x.i, y.i, sourceX.i, basePixel.i, expected.i
+  Define rightShift.i, centreShift.i
+  npfReport[0] = #NPF_MAGIC : npfReport[31] = #NPF_TAIL
+
+  TimerInit()
+  npfReport[2] = 1
+  If NeonArena(#NPF_ARENA, #NPF_ARENA_BYTES) <> #NEON_OK : ProcedureReturn npfFinish(1) : EndIf
+  If NeonSurface(#NPF_SURFACE, 800, 1280, #NPF_SURFACE_PITCH) <> #NEON_OK : ProcedureReturn npfFinish(2) : EndIf
+  If NeonRenderCapacity(1024, 1024) <> #NEON_OK : ProcedureReturn npfFinish(3) : EndIf
+  NeonSurfaceMapSpan(#NPF_MAP_SPAN)
+  If NeonInit() <> #NEON_OK : ProcedureReturn npfFinish(4) : EndIf
+  NeonPalette() : NeonFontDefaults()
+  If NeonFontUse(?dsp_font8x16, 8, 16, 32, 126) <> #NEON_OK : ProcedureReturn npfFinish(5) : EndIf
+  NeonAnimReset() : NeonStateReset()
+  If AnvilTrueTypeSlotLoad(#ANVIL_TTS_BOOT_SLOT, ?anvilBootTtf, #ANVIL_BOOT_TTF_BYTES) = 0
+    ProcedureReturn npfFinish(6)
+  EndIf
+  If AnvilTrueTypeSlotSelect(#ANVIL_TTS_BOOT_SLOT) = 0 : ProcedureReturn npfFinish(7) : EndIf
+  npfReport[26] = AnvilTrueTypeSlotSelected()
+  npfReport[27] = AnvilTrueTypeSlotGeneration(#ANVIL_TTS_BOOT_SLOT)
+  If npfReport[26] <> 4 Or npfReport[27] < 1 : ProcedureReturn npfFinish(8) : EndIf
+  If AnvilVkV3dWindow(#NPF_WINDOW, #NPF_WINDOW_BYTES) <> #VK_SUCCESS : ProcedureReturn npfFinish(28) : EndIf
+
+  npfReport[2] = 2
+  If npfObjectsCreate() = 0 : ProcedureReturn npfFinish(7) : EndIf
+  rc = NeonVkChromeCreateWithCapacities(npfPhys, npfDev, npfQueue, npfPool, npfPass, npfFramebuffer, #NPF_W, #NPF_H, 32, 256)
+  npfReport[3] = rc
+  If rc <> #VK_SUCCESS : ProcedureReturn npfFinish(8) : EndIf
+  If NeonVkPortCanvas(#NPF_W, #NPF_H, #NPF_W, #NPF_H) <> #NEON_OK : ProcedureReturn npfFinish(9) : EndIf
+  rc = NeonVkPortFontBind(@npfFont, #ANVIL_TTS_BOOT_SLOT, #NEON_FONT_UI, 16)
+  npfReport[4] = rc
+  If rc <> 0 : ProcedureReturn npfFinish(10) : EndIf
+  If NeonVkChromeLifecycleInstallPrepared() <> #NEON_OK : ProcedureReturn npfFinish(11) : EndIf
+  If NeonInit() <> #NEON_OK Or NeonLifecycleBackend() <> #NEON_BACKEND_EXTERNAL : ProcedureReturn npfFinish(12) : EndIf
+  rc = NeonVkPortFontWarm(@npfFont, "Wi")
+  npfReport[5] = rc
+  npfReport[29] = DmaError()
+  npfReport[30] = nvcAtlasFullUploadCount
+  If rc <> #NEON_OK : ProcedureReturn npfFinish(26) : EndIf
+  npfReport[6] = MathFToInt(NeonVkPortFontTextWidth(@npfFont, "Wi", 1))
+  npfReport[7] = NeonVkPortFontLineHeight(@npfFont)
+  If npfReport[6] < 8 Or npfReport[6] > 28 Or npfReport[7] <> 18
+    ProcedureReturn npfFinish(27)
+  EndIf
+
+  npfReport[2] = 3
+  rc = NeonVkPortFrameBegin(0.0, 0.0, 0.0, 1.0)
+  npfReport[8] = rc
+  If rc <> #NEON_OK : ProcedureReturn npfFinish(13) : EndIf
+  rc = NeonVkPortFontText(@npfFont, 4.0, 1.0, "Wi", 1.0, 1.0, 1.0, 1.0, 1, 1)
+  npfReport[9] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn npfFinish(14) : EndIf
+  rc = NeonVkPortFontTextRight(@npfFont, 33.0, 21.0, "Wi", 1.0, 1.0, 1.0, 1.0, 1, 1)
+  npfReport[10] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn npfFinish(16) : EndIf
+  rc = NeonVkPortFontTextCentre(@npfFont, 34.0, 28.0, 41.0, "Wi", 1.0, 1.0, 1.0, 1.0, 1, 1)
+  npfReport[11] = rc
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn npfFinish(17) : EndIf
+  rc = NeonVkPortFrameEnd()
+  npfReport[12] = rc
+  If rc <> #NEON_OK : ProcedureReturn npfFinish(18) : EndIf
+  npfReport[13] = NeonVkChromeDrawCount()
+  npfReport[14] = NeonVkChromeVertexCount()
+  npfReport[25] = NeonVkChromePresentPending()
+  If npfReport[25] <> 1 : ProcedureReturn npfFinish(19) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn npfFinish(20) : EndIf
+
+  npfReport[2] = 4
+  rightShift = nvpRound(33.0 - MathFFromInt(npfReport[6])) - 4
+  centreShift = nvpRound(34.0 + (28.0 - MathFFromInt(npfReport[6])) / 2.0) - 4
+  For y = 0 To 19
+    For x = 0 To #NPF_W - 1
+      basePixel = npfPixel(x, y)
+      If basePixel <> $FF000000 : npfReport[15] = npfReport[15] + 1 : EndIf
+      sourceX = x - rightShift
+      expected = $FF000000
+      If sourceX >= 0 And sourceX < #NPF_W : expected = npfPixel(sourceX, y) : EndIf
+      If npfPixel(x, y + 20) <> expected : npfReport[16] = npfReport[16] + 1 : EndIf
+      sourceX = x - centreShift
+      expected = $FF000000
+      If sourceX >= 0 And sourceX < #NPF_W : expected = npfPixel(sourceX, y) : EndIf
+      If npfPixel(x, y + 40) <> expected : npfReport[17] = npfReport[17] + 1 : EndIf
+    Next
+  Next
+  For y = 60 To #NPF_H - 1
+    For x = 0 To #NPF_W - 1
+      If npfPixel(x, y) <> $FF000000 : npfReport[18] = npfReport[18] + 1 : EndIf
+    Next
+  Next
+  If npfReport[13] <> 3 Or npfReport[14] <> 36 : ProcedureReturn npfFinish(21) : EndIf
+  If npfReport[15] < 8 Or npfReport[16] <> 0 Or npfReport[17] <> 0 Or npfReport[18] <> 0
+    ProcedureReturn npfFinish(22)
+  EndIf
+  npfReport[2] = 5
+  ProcedureReturn npfFinish(0)
+EndProcedure
