@@ -228,7 +228,7 @@ EndProcedure
 ; Prepare validates the whole list before changing retained state or staging.
 ; Inputs can be freed immediately after this returns success.
 Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
-  Define i.i, rc.i
+  Define i.i, rc.i, reusePalette.i
   Define *p.NvcParticle
   Define *candidate.NvcParticleCorners
   If nvcReady = 0 Or nvcInFrame <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvdPresentPending() <> 0
@@ -248,6 +248,9 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     nvcError = 0
     ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
+  ; The retained items describe the last successful upload. Compare packed
+  ; colors by slot, not by hash, before copying a new geometry snapshot.
+  reusePalette = Bool(nvcParticlePrepared <> 0 And nvcParticleUploaded <> 0 And nvcParticleStageSafe <> 0 And nvcParticleImage <> 0 And nvcParticleSet <> 0 And nvcParticleCount = count)
   For i = 0 To count - 1
     *p = *particles + i * SizeOf(NvcParticle)
     If nvcParticleCornerBank = 0
@@ -257,6 +260,9 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     EndIf
     If nvcParticleGeometry(*p, *candidate) = 0
       ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+    If reusePalette <> 0 And *p\colour <> nvcParticleItems[i]\colour
+      reusePalette = 0
     EndIf
   Next
   If nvcParticleImage = 0
@@ -283,12 +289,14 @@ Procedure.i NeonVkChromeParticlesPrepare(*particles.NvcParticle, count.i)
     nvcParticleItems[i]\colour = *p\colour : nvcParticleItems[i]\angleQ16 = *p\angleQ16
     nvcParticleItems[i]\cameraX = *p\cameraX : nvcParticleItems[i]\cameraY = *p\cameraY
     nvcParticleItems[i]\zoomQ16 = *p\zoomQ16 : nvcParticleItems[i]\ignoreCamera = *p\ignoreCamera
-    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, *p\colour)
+    If reusePalette = 0
+      PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, *p\colour)
+    EndIf
   Next
-  For i = count To #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H - 1
-    PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, 0)
-  Next
-  If count > 0
+  If reusePalette = 0
+    For i = count To #NVC_PARTICLE_PALETTE_W * #NVC_PARTICLE_PALETTE_H - 1
+      PokeL(nvcParticleMapped + #NEON_VK_CHROME_ATLAS_PAD + i * 4, 0)
+    Next
     i = nvcParticleUploadNow()
     If i <> #VK_SUCCESS : ProcedureReturn nvcFail(i) : EndIf
   EndIf

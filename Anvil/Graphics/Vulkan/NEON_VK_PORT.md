@@ -162,6 +162,14 @@ The CSD route stays opt-in, and the default Chrome path remains CPU-expanded.
 The producer is board-specific; the Chrome seam and default renderer remain
 available without it.
 
+Chrome now reuses its uploaded particle palette when a prepared list has the
+same count and identical packed colors. Geometry and camera state are still
+validated and copied each time. Changed colors or count force an upload.
+The Pi 4 returning-payload proof is under
+`docs/evidence/neon-particle-palette-reuse-pi4-20261003/`. Its Prepare timing
+includes geometry work, so it does not establish a frame-rate gain from
+skipping the palette transfer.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call

@@ -24,6 +24,8 @@ In the first pairing, median CPU and CSD frame times were 589,087 µs and
 553,604 µs, a 35,483 µs CSD gain. In the repeat pairing they were 588,397 µs
 and 553,626 µs, a 34,771 µs gain. CSD compact-record staging fell from
 291,879 µs in the earlier implementation to about 121,000 µs. CSD compute
-itself remained about 21,100 µs, while the unchanged palette upload still
-took about 201,000 µs per frame. This is a narrow static-color workload,
+itself remained about 21,100 µs, while Chrome particle Prepare still
+took about 201,000 µs per frame. That span includes geometry validation,
+state copying, idle checks, and any palette transfer; it does not isolate
+upload cost. This is a narrow static-color workload,
 and the frame remains far above 16.7 ms. The CSD route remains opt-in.
