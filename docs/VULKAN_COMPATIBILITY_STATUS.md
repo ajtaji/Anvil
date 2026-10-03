@@ -42,6 +42,16 @@ then reached a real prompt over Wi-Fi; its saved TrueType settings and Vulkan
 painter remained active after reset. This verifies that boot selection on the
 measured Pi 4, not recovery on every display or network failure.
 
+The Pi 5 full Anvil monitor is built from `RaspberryPi4/Board/board.pi4` under
+its BCM2712 branches, not from the older `RaspberryPi5/Boot/board.pi4` entry
+probe. The 2026-09-27 Pi 5 run reached an EL3 prompt from commit `f385c7b`.
+Current source still disables both V3D and Vulkan console startup for BCM2712:
+`V3dBinSubmit`, `V3dRenderSubmit`, and ownership reset refuse unported V3D 7.1
+work. The shared Vulkan dispatch and backend-selection seam exists, but its
+V3D implementation and shader records remain Pi 4/V3D 4.2. There is no Pi 5
+Vulkan hardware-acceleration claim; the current tree has not been rerun on
+Pi 5 silicon during this work.
+
 The production Pi 4 backend's physical-device properties query also passed a
 returning RAM payload on 2026-09-26. Its report returned status zero with an
 integrated-GPU device type, 1280-pixel 2D/framebuffer maxima, a 16-byte
