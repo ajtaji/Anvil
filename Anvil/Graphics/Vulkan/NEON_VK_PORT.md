@@ -176,6 +176,14 @@ Its first-frame palette upload was 2,825 µs. This controlled profile calls
 Prepare every frame even though the list is unchanged; applications can keep
 using a prepared list until its particles or camera change.
 
+The matched Pi 4 End timing split is under
+`docs/evidence/neon-particle-end-split-800-pi4-20261003/`. On this same
+10,000-particle 800×800 case, Chrome End's 188,949 µs median included
+188,803 µs in synchronous `vkQueueSubmit` and only 37 µs in the later fence
+wait. Nested backend measurements included 8,624 µs for binning and
+72,646 µs for rendering; the remaining submit time still needs a finer
+split before changing the queue implementation.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
