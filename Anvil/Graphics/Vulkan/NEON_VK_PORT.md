@@ -168,7 +168,13 @@ validated and copied each time. Changed colors or count force an upload.
 The Pi 4 returning-payload proof is under
 `docs/evidence/neon-particle-palette-reuse-pi4-20261003/`. Its Prepare timing
 includes geometry work, so it does not establish a frame-rate gain from
-skipping the palette transfer.
+skipping the palette transfer. The separate
+`docs/evidence/neon-particle-prepare-split-pi4-20261003/` diagnostic measured
+154,235 µs for 10,000 geometry validations, 43,184 µs for item copying,
+12 µs for the idle check, and zero palette-upload time on unchanged frames.
+Its first-frame palette upload was 2,825 µs. This controlled profile calls
+Prepare every frame even though the list is unchanged; applications can keep
+using a prepared list until its particles or camera change.
 
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
