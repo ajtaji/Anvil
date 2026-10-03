@@ -31,7 +31,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
 Global Dim nmsReport.l[48]
 Global Dim nmsPixels.a[16]
 Global Dim nmsPixelsA.a[16]
+Global Dim nmsPixelsABgra.a[16]
 Global Dim nmsPixelsB.a[16]
+Global Dim nmsPixelsOddBgra.a[12]
 Global Dim nmsWide.a[1912]
 Global Dim nmsLarge.a[491520]
 Global Dim nmsRejectPixels.a[4194303]
@@ -105,10 +107,19 @@ Procedure.i Main()
   nmsPixelsA[4] = 0 : nmsPixelsA[5] = 255 : nmsPixelsA[6] = 0 : nmsPixelsA[7] = 255
   nmsPixelsA[8] = 0 : nmsPixelsA[9] = 0 : nmsPixelsA[10] = 255 : nmsPixelsA[11] = 255
   nmsPixelsA[12] = 255 : nmsPixelsA[13] = 255 : nmsPixelsA[14] = 255 : nmsPixelsA[15] = 255
+  ; The same 2x2 image in BGRA byte order exercises the direct staging copy.
+  nmsPixelsABgra[0] = 0 : nmsPixelsABgra[1] = 0 : nmsPixelsABgra[2] = 255 : nmsPixelsABgra[3] = 255
+  nmsPixelsABgra[4] = 0 : nmsPixelsABgra[5] = 255 : nmsPixelsABgra[6] = 0 : nmsPixelsABgra[7] = 255
+  nmsPixelsABgra[8] = 255 : nmsPixelsABgra[9] = 0 : nmsPixelsABgra[10] = 0 : nmsPixelsABgra[11] = 255
+  nmsPixelsABgra[12] = 255 : nmsPixelsABgra[13] = 255 : nmsPixelsABgra[14] = 255 : nmsPixelsABgra[15] = 255
   nmsPixelsB[0] = 255 : nmsPixelsB[1] = 255 : nmsPixelsB[2] = 0 : nmsPixelsB[3] = 255
   nmsPixelsB[4] = 255 : nmsPixelsB[5] = 255 : nmsPixelsB[6] = 255 : nmsPixelsB[7] = 255
   nmsPixelsB[8] = 255 : nmsPixelsB[9] = 255 : nmsPixelsB[10] = 255 : nmsPixelsB[11] = 255
   nmsPixelsB[12] = 255 : nmsPixelsB[13] = 255 : nmsPixelsB[14] = 255 : nmsPixelsB[15] = 255
+  ; Odd width and half-alpha center detect BGRA channel, extent and blend errors.
+  nmsPixelsOddBgra[0] = 255 : nmsPixelsOddBgra[1] = 0 : nmsPixelsOddBgra[2] = 255 : nmsPixelsOddBgra[3] = 255
+  nmsPixelsOddBgra[4] = 0 : nmsPixelsOddBgra[5] = 255 : nmsPixelsOddBgra[6] = 255 : nmsPixelsOddBgra[7] = 128
+  nmsPixelsOddBgra[8] = 255 : nmsPixelsOddBgra[9] = 0 : nmsPixelsOddBgra[10] = 0 : nmsPixelsOddBgra[11] = 255
   nmsClear[0] = 0 : nmsClear[1] = 0 : nmsClear[2] = 0 : nmsClear[3] = $3F800000
 
   TimerInit()
@@ -264,7 +275,7 @@ Procedure.i Main()
   EndIf
 
   nmsReport[2] = 6
-  rc = NeonVkChromeImageSpriteReplace(@nmsPixelsA[0], 2, 2)
+  rc = NeonVkChromeImageSpriteReplaceBGRA(@nmsPixelsABgra[0], 2, 2)
   nmsReport[32] = rc : nmsReport[33] = NeonVkChromeImageSpriteGeneration()
   If rc <> #NEON_VK_CHROME_OK Or nmsReport[33] <> 1 Or nvcImageSpriteImage = nvcAtlasImage
     ProcedureReturn nmsReturn(31)
@@ -274,7 +285,7 @@ Procedure.i Main()
   ; Both a replacement image and its staging copy must coexist with the
   ; resident image, atlas, upload staging and render target. The 12 MiB
   ; caller window cannot admit this candidate; the source is never read.
-  rc = NeonVkChromeImageSpriteReplace(@nmsRejectPixels[0], 1024, 1024)
+  rc = NeonVkChromeImageSpriteReplaceBGRA(@nmsRejectPixels[0], 1024, 1024)
   nmsReport[34] = rc : nmsReport[35] = NeonVkChromeImageSpriteGeneration()
   nmsReport[36] = avkHeapBytes
   If rc <> #NEON_VK_CHROME_ERR_CAPACITY Or nmsReport[35] <> 1
@@ -324,5 +335,20 @@ Procedure.i Main()
   If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(45) : EndIf
   nmsReport[46] = nmsPixel(base, pitch, 6, 42)
   If nmsWord(46) <> $FF00FF00 : ProcedureReturn nmsReturn(46) : EndIf
+  nmsReport[2] = 9
+  rc = NeonVkChromeImageSpriteReplaceBGRA(@nmsPixelsOddBgra[0], 3, 1)
+  If rc <> #NEON_VK_CHROME_OK Or NeonVkChromeImageSpriteGeneration() <> 4 : ProcedureReturn nmsReturn(47) : EndIf
+  rc = NeonVkChromeBegin(@nmsClear[0])
+  If rc <> #VK_SUCCESS : ProcedureReturn nmsReturn(48) : EndIf
+  rc = NeonVkChromeImageSpriteDraw(4, 40, 0, 0, 3, 1, 24, 8, Neon_RGB(255, 255, 255))
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn nmsReturn(49) : EndIf
+  If NeonVkChromeEnd() <> #VK_SUCCESS : ProcedureReturn nmsReturn(50) : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn nmsReturn(51) : EndIf
+  nmsReport[25] = nmsPixel(base, pitch, 6, 42)
+  nmsReport[12] = nmsPixel(base, pitch, 14, 42)
+  nmsReport[26] = nmsPixel(base, pitch, 22, 42)
+  If nmsWord(25) <> $FFFF00FF Or nmsWord(12) <> $BF808000 Or nmsWord(26) <> $FF0000FF
+    ProcedureReturn nmsReturn(52)
+  EndIf
   ProcedureReturn nmsReturn(0)
 EndProcedure
