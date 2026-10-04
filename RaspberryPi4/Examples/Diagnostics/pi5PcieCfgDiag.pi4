@@ -1,0 +1,145 @@
+; ======================================================================
+;  pi5PcieCfgDiag.pi4 - WHY DOES PcieEnumerate NOT FIND RP1? Configuration
+;  space on pcie2 as the firmware left it. A payload for a RUNNING Pi 5.
+; ======================================================================
+;  MEASURED (pi5PcieDmaProof.pi4, 2026-09-27): PcieInit adopts the
+;  firmware's window (BAR2, base 0, 64 GiB) and the link stays up, but
+;  PcieEnumerate returns 0 - its read of bus 1 device 0's ID did not give
+;  1DE4:0001. This records, without changing anything the firmware set up:
+;    - EXT_CFG_INDEX as the firmware left it, and EXT_CFG_DATA read through
+;      that untouched index;
+;    - the root port's own header (bus 0 device 0, read straight from the
+;      register block): ID, command, class, BARs, the bus numbers at $18,
+;      the memory windows;
+;    - what pcie.pi4's own PcieCfgRead32(1, 0, 0, off) returns, and
+;      PcieEnumerate's error;
+;    - bus 1 device 0 and the secondary bus the root port names, through
+;      the index/data pair (brcm_pcie_map_bus: EXT_CFG_INDEX $9000 =
+;      bus << 20 | dev << 15 | fn << 12, data at $8000 + offset,
+;      pcie_offsets_bcm7712), with the index read back after each write.
+;  THE ONLY WRITES are to EXT_CFG_INDEX - selecting what to read - and the
+;  last one puts back the value the firmware left. No config-space write,
+;  no window, no RP1 register.
+;
+;  THE REPORT, 32-bit words at $00600000 (read with  md.l 600000 100):
+;    +00 'PCG1' ($31474350)
+;    +04 EXT_CFG_INDEX as found     +08 EXT_CFG_DATA+0 through it
+;    +0C PcieInit()                 +10 PcieError() after it
+;    +14 PcieCfgRead32(1,0,0,$00)   +18 PcieEnumerate()
+;    +1C PcieError() after it       +20 PcieLinkUp() at the end
+;    +24..+54  root port header $00 $04 $08 $0C $10 $14 $18 $1C $20 $24
+;              $28 $2C $3C (13 words)
+;    +58  the secondary bus number from $18 bits 15:8
+;    +5C  bus 1 dev 0: EXT_CFG_INDEX read back after writing it
+;    +60..+7C  bus 1 dev 0 fn 0: $00 $04 $08 $0C $10 $14 $18 $2C
+;    +80  the secondary bus: EXT_CFG_INDEX read back
+;    +84..+A0  secondary bus dev 0 fn 0: $00 $04 $08 $0C $10 $14 $18 $2C
+;    +A4  EXT_CFG_INDEX at the end (restored to +04)
+;  Returns $00600000 in x0.
+;
+;  BUILD
+;    PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi5PcieCfgDiag.pi4
+;        -t pi5 --load-addr 0x400000 --stack-addr 0x7E00000 --entry-returns
+;        -o pi5pcig.img -s
+; ======================================================================
+EnableExplicit
+
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+
+#OUT = $00600000
+#RC  = $1000120000
+#IDX = $9000
+#DAT = $8000
+
+Procedure W(off.i, v.i)
+  PokeL(#OUT + off, v & $FFFFFFFF)
+EndProcedure
+
+Procedure.i Rd(off.i)
+  Define v.i
+  v = PeekL(#RC + off) & $FFFFFFFF
+  ASM
+    dsb sy
+    isb
+  EndASM
+  ProcedureReturn v
+EndProcedure
+
+Procedure Wr(off.i, v.i)
+  ASM
+    dsb sy
+  EndASM
+  PokeL(#RC + off, v & $FFFFFFFF)
+  ASM
+    dsb sy
+    isb
+  EndASM
+EndProcedure
+
+; Select (bus, 0, 0), record the index read back at +at, then eight
+; config words from +at+4.
+Procedure Probe(bus.i, at.i)
+  Define i.i
+  Define offs.i
+  Wr(#IDX, bus << 20)
+  W(at, Rd(#IDX))
+  i = 0
+  While i < 8
+    Select i
+      Case 0 : offs = $00
+      Case 1 : offs = $04
+      Case 2 : offs = $08
+      Case 3 : offs = $0C
+      Case 4 : offs = $10
+      Case 5 : offs = $14
+      Case 6 : offs = $18
+      Default : offs = $2C
+    EndSelect
+    W(at + 4 + (4 * i), Rd(#DAT + offs))
+    i = i + 1
+  Wend
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define idx0.i
+  Define sec.i
+  Define ok.i
+  i = 0
+  While i < $100
+    PokeL(#OUT + i, 0)
+    i = i + 4
+  Wend
+  idx0 = Rd(#IDX)
+  W($04, idx0)
+  W($08, Rd(#DAT))
+  PcieSetMemoryBytes($40000000)
+  ok = PcieInit()
+  W($0C, ok)
+  W($10, PcieError())
+  W($14, PcieCfgRead32(1, 0, 0, $00))
+  If ok <> 0
+    W($18, PcieEnumerate())
+    W($1C, PcieError())
+  EndIf
+  i = 0
+  While i < 13
+    If i < 12
+      W($24 + (4 * i), Rd(4 * i))
+    Else
+      W($24 + (4 * i), Rd($3C))
+    EndIf
+    i = i + 1
+  Wend
+  sec = (Rd($18) >> 8) & $FF
+  W($58, sec)
+  Probe(1, $5C)
+  If sec <> 0 And sec <> 1
+    Probe(sec, $80)
+  EndIf
+  Wr(#IDX, idx0)
+  W($A4, Rd(#IDX))
+  W($20, PcieLinkUp())
+  W($00, $31474350)
+  ProcedureReturn #OUT
+EndProcedure

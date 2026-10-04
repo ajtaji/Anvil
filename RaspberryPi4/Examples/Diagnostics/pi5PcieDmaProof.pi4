@@ -1,0 +1,117 @@
+; ======================================================================
+;  pi5PcieDmaProof.pi4 - BRING RP1 UP THROUGH THE FIRMWARE'S PCIe STATE,
+;  STEP BY STEP, AND PROVE ITS DMA REACHES ARM MEMORY. A payload for a
+;  RUNNING Pi 5 monitor. It runs the monitor's own pcie.pi4 and xhci.pi4.
+; ======================================================================
+;  WHAT THE FIRMWARE LEAVES (measured 2026-09-27, build 215):
+;    - the inbound window in BAR2: 64 GiB at PCIe 0 -> ARM 0. PcieInit
+;      ADOPTS it (base 0) and writes no pcie2 register.
+;    - the root port's bus numbers ($18) all 0, so no configuration read
+;      reaches RP1. PcieEnumerate now writes primary 0 / secondary 1 /
+;      subordinate 1 into the ROOT PORT's own header - the one write this
+;      makes to pcie2 - then reads RP1's ID and COMMAND and ADOPTS the BAR
+;      the firmware gave RP1 (it must decode at PCIe 0, where the outbound
+;      window points), assigning nothing.
+;  THEN THE PROOF: XhciInit on RP1's USB host 0 (sets RP1's Bus Master
+;  Enable - rp1.c pci_set_master - resets the DWC3 core and the xHCI,
+;  powers the root ports; VBUS is not switched) and two No-Op commands. A
+;  No-Op's TRB is READ by the controller and its completion WRITTEN, both
+;  by DMA at ARM + the adopted base: a completion arriving is the proof.
+;  Nothing touches the console (RP1 UART0), the fan or the link.
+;
+;  THE REPORT, 32-bit words at $00600000 (read with  md.l 600000 70):
+;    +00 'PCX2' ($32584350)
+;    +04 PcieInit()                 1
+;    +08 PcieError() after it       0
+;    +0C PcieDmaWindowBar()         2
+;    +10 PcieDmaWindowBase() lo     0
+;    +14 PcieDmaWindowBase() hi     0
+;    +18 PcieDmaWindowSize() hi     $10 (64 GiB)
+;    +1C root port $18 BEFORE       0 as the firmware leaves it
+;    +20 PcieEnumerate()            1
+;    +24 PcieError() after it       0 (-24 bus numbers, -7 no RP1, -25 BAR)
+;    +28 root port $18 AFTER        $00010100
+;    +2C PcieBusNumbersWritten()    1
+;    +30 RP1 config $00             $00011DE4
+;    +34 RP1 BAR0 ($10), raw        as the firmware assigned it
+;    +38 RP1 BAR1 ($14), raw
+;    +3C PcieRp1BarIndex()          which of them decodes at PCIe 0
+;    +40 RP1 COMMAND before XhciInit
+;    +44 XhciInit()                 1
+;    +48 XhciLastError()            0
+;    +4C XhciNoOp() first           1 = THE PROOF
+;    +50 XhciLastComp()             1 = Success
+;    +54 XhciNoOp() second          1
+;    +58 USBSTS                     bit 2 HSE clear
+;    +5C RP1 COMMAND after          bit 2 (bus master) set
+;    +60 PcieLinkUp() at the end    1
+;    +64 command ring, CPU lo
+;    +68 command ring as handed over, lo    (= +64 at base 0)
+;    +6C command ring as handed over, hi
+;  Returns $00600000 in x0.
+;
+;  BUILD
+;    PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi5PcieDmaProof.pi4
+;        -t pi5 --load-addr 0x400000 --stack-addr 0x7E00000 --entry-returns
+;        -o pi5pcix.img -s
+; ======================================================================
+EnableExplicit
+
+XIncludeFile "RaspberryPi4/Lib/pcie.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio_rp1.pi4"
+XIncludeFile "RaspberryPi4/Lib/xhci.pi4"
+
+#OUT = $00600000
+
+Procedure W(off.i, v.i)
+  PokeL(#OUT + off, v & $FFFFFFFF)
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  Define ok.i
+  i = 0
+  While i < $70
+    PokeL(#OUT + i, 0)
+    i = i + 4
+  Wend
+  PcieSetMemoryBytes($40000000)
+  ok = PcieInit()
+  W($04, ok)
+  W($08, PcieError())
+  W($0C, PcieDmaWindowBar())
+  W($10, PcieDmaWindowBase())
+  W($14, PcieDmaWindowBase() >> 32)
+  W($18, PcieDmaWindowSize() >> 32)
+  W($1C, PcieRcPeek($18))
+  If ok <> 0
+    ok = PcieEnumerate()
+    W($20, ok)
+    W($24, PcieError())
+    W($28, PcieRcPeek($18))
+    W($2C, PcieBusNumbersWritten())
+    W($30, PcieCfgRead32(1, 0, 0, $00))
+    W($34, PcieCfgRead32(1, 0, 0, $10))
+    W($38, PcieCfgRead32(1, 0, 0, $14))
+    W($3C, PcieRp1BarIndex())
+    W($40, PcieCfgRead32(1, 0, 0, $04))
+  EndIf
+  If ok <> 0
+    ok = XhciInit()
+    W($44, ok)
+    W($48, XhciLastError())
+  EndIf
+  If ok <> 0
+    W($4C, XhciNoOp())
+    W($50, XhciLastComp())
+    W($54, XhciNoOp())
+    W($58, XhciUsbSts())
+    W($5C, PcieCfgRead32(1, 0, 0, $04))
+    W($64, XhciCmdRing())
+    W($68, PcieDmaBus(XhciCmdRing()))
+    W($6C, PcieDmaBus(XhciCmdRing()) >> 32)
+  EndIf
+  W($60, PcieLinkUp())
+  W($00, $32584350)
+  ProcedureReturn #OUT
+EndProcedure

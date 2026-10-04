@@ -119,7 +119,8 @@ class Rp1HidCtl(H.Ctl):
         self.cfg = {0x00: P5.RP1_ID, 0x04: 0x00100002, 0x10: 0, 0x14: 0}
         self.cfg_index = None
         self.rc = {P5.PCIE_STATUS: 0x80 if scenario == "rp1-absent" else 0xB0,
-                   P5.LNK_WORD: ((4 << 4 | 2) << 16)}
+                   P5.LNK_WORD: ((4 << 4 | 2) << 16),
+                   0x18: 0x00010100}   # root port buses 0/1/1 - see a64_xhci_pi5_check
         if scenario != "no-window":
             self.rc[P5.rc_bar(1)] = 21
             self.rc[P5.rc_bar(1) + 4] = 0x10

@@ -644,6 +644,8 @@ CompilerIf #PMF_CHIP = 2712
   #PCIE_ERR_INBOUND   = -16
   #PCIE_ERR_RP1_MEM   = -17
   #PCIE_ERR_NOT_UP    = -18
+  #PCIE_ERR_BUSNUM    = -24
+  #PCIE_ERR_RP1_BAR   = -25
 
 ; The phase numbers the board's boot trail prints, shared with the Pi 4.
   #PCIE_PH_IDLE     = 0
@@ -669,6 +671,7 @@ CompilerIf #PMF_CHIP = 2712
   Global pcie_linkWidth.i = -1
   Global pcie_dmaWin.i            ; bytes of ARM memory the inbound window maps
   Global pcie_dmaBar.i            ; which RC_BARn it was found in, 0 = none
+  Global pcie_dmaBase.i           ; the PCIe address that window puts ARM 0 at
   Global pcie_phaseAt.i = #PCIE_PH_IDLE
   Global *pcie_phaseHook = 0
 
@@ -799,12 +802,29 @@ CompilerIf #PMF_CHIP = 2712
     ProcedureReturn 0
   EndProcedure
 
-; Find the inbound window the DMA arithmetic above depends on: PCIe
-; $10_0000_0000 onto CPU 0, access enabled. set_inbound_win_registers()
+; Find the inbound window the DMA arithmetic depends on: one that puts ARM
+; physical 0 somewhere on PCIe, access enabled. set_inbound_win_registers()
 ; writes RC_BARn LO = low(pci_offset) | size code, HI = high(pci_offset),
 ; and on 7712-class parts UBUS_BARn REMAP LO = low(cpu) & ~$FFF | ACCESS_EN,
 ; HI = high(cpu). Which BAR number the firmware used is not assumed; all
-; ten are read. Records the window size, or 0.
+; ten are read.
+;
+; THE PCIe BASE IS ADOPTED, NOT ASSUMED (2026-09-27). Linux programs PCIe
+; $10_0000_0000 -> ARM 0 (pcie2 dma-ranges entry 2), and this file used to
+; accept nothing else. MEASURED on Pi 5 (build 215, pciex4_reset=0,
+; pi5PcieInboundDump.pi4): the firmware leaves RC_BAR2 = $00000015 / 0
+; (64 GiB at PCIe 0) with UBUS_BAR2 = 1 (ARM 0, ACCESS_EN) - the same memory
+; at PCIe 0, a zero offset. That window is the one the firmware itself runs
+; RP1 with, so it is ADOPTED as it is and NO REGISTER IS WRITTEN: the link
+; the console runs through is left exactly as the firmware set it. Every
+; DMA address handed to RP1 (PcieDmaBus - the xHCI, the GEM) is then
+; physical + that base. If more than one BAR maps ARM 0, the Linux layout
+; ($10_0000_0000) wins, so the pointers stay the ones the device tree
+; describes; otherwise the lowest-numbered BAR.
+;
+; A window is accepted only if its base is a multiple of its size (the
+; hardware requires it - brcm_pcie_get_inbound_wins) and its remap is ARM
+; 0 with access on. Records the size, the BAR and the base, or 0.
   Procedure.i pcie_FindDmaWindow()
     Define n.i
     Define lo.i
@@ -814,8 +834,10 @@ CompilerIf #PMF_CHIP = 2712
     Define reg.i
     Define ubus.i
     Define bytes.i
+    Define base.i
     pcie_dmaWin = 0
     pcie_dmaBar = 0
+    pcie_dmaBase = 0
     n = 1
     While n <= #PCIE_INBOUND_WINS
       If n <= 3
@@ -830,16 +852,22 @@ CompilerIf #PMF_CHIP = 2712
       rlo = PcieRcPeek(ubus)
       rhi = PcieRcPeek(ubus + 4)
       bytes = pcie_IbarBytes(lo & $1F)
-      If bytes > 0 And (lo & $FFFFFFE0) = 0 And hi = (#PCIE_DMA_BUS >> 32)
+      base = ((hi & $FFFFFFFF) << 32) | (lo & $FFFFFFE0)
+      If bytes > 0 And (base & (bytes - 1)) = 0
         If (rlo & 1) <> 0 And (rlo & $FFFFF000) = 0 And rhi = 0
-          pcie_dmaWin = bytes
-          pcie_dmaBar = n
-          ProcedureReturn 1
+          If pcie_dmaBar = 0 Or base = #PCIE_DMA_BUS
+            pcie_dmaWin = bytes
+            pcie_dmaBar = n
+            pcie_dmaBase = base
+          EndIf
         EndIf
       EndIf
       n = n + 1
     Wend
-    ProcedureReturn 0
+    If pcie_dmaBar = 0
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
   EndProcedure
 
   Procedure.i PcieInit()
@@ -873,6 +901,96 @@ CompilerIf #PMF_CHIP = 2712
     ProcedureReturn 1
   EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE ROOT PORT'S BUS NUMBERS (2026-09-27)
+; ----------------------------------------------------------------------
+;  MEASURED on Pi 5 (build 215, pciex4_reset=0, pi5PcieCfgDiag.pi4):
+;  the root port answers 14E4:2712, class $060400, header type 1, command
+;  $0146 - but its bus-number register ($18) is 0: primary, secondary AND
+;  subordinate all 0. Every configuration read of bus 1 through
+;  EXT_CFG_INDEX/DATA then came back $FFFFFFFF, so PcieEnumerate refused
+;  with -7 although RP1 was there - its UART0 is the console, through the
+;  outbound window, which does not depend on the bridge's configuration.
+;
+;  pcie-brcmstb.c does not write $18 either: brcm_pcie_map_bus() only turns
+;  (bus, devfn) into EXT_CFG_INDEX, and the numbers come from the PCI core's
+;  pci_scan_bridge(), which writes PCI_PRIMARY_BUS/SECONDARY/SUBORDINATE on
+;  the root port before scanning behind it (PCI-to-PCI Bridge Architecture
+;  1.2 section 3.2.5.3: a Type 1 configuration request whose bus number
+;  equals the SECONDARY bus is turned into a Type 0 request on that bus).
+;  With secondary 0 no bus number is ever routed as Type 0, so nothing
+;  answers. So this does what pci_scan_bridge() would do for the one bus
+;  there is: primary 0, secondary 1, subordinate 1 - a write to the ROOT
+;  PORT's own header (the register block, not the index), keeping bits
+;  31:24 (the secondary latency timer). Nothing else is written: the
+;  command register already has memory and bus-master on ($0146), and the
+;  memory window at $20 is left as the firmware set it - the outbound path
+;  to RP1 works with it as it is (measured: the console, the fan).
+;
+;  Numbers the firmware DID set are adopted if they put RP1 on bus 1, and
+;  refused (#PCIE_ERR_BUSNUM) if they name another bus - every RP1 access
+;  in this tree says bus 1, and renumbering a live bridge is not ours to do.
+  #PCI_CFG_BUSES = $18
+  #PCIE_RP1_BUS  = 1
+  Global pcie_busWritten.i          ; 1 if this file wrote the bus numbers
+  Global pcie_rp1Bar.i = -1         ; which RP1 BAR maps the outbound window
+  Global pcie_rp1BarVal.i           ; its raw value as the firmware left it
+
+  Procedure.i pcie_Buses()
+    Define v.i
+    Define sec.i
+    Define sub.i
+    v = PcieRcPeek(#PCI_CFG_BUSES)
+    If v < 0
+      pcie_err = #PCIE_ERR_BUSNUM
+      ProcedureReturn 0
+    EndIf
+    sec = (v >> 8) & $FF
+    sub = (v >> 16) & $FF
+    If sec = #PCIE_RP1_BUS And sub >= sec
+      ProcedureReturn 1
+    EndIf
+    If (v & $FFFFFF) <> 0
+      pcie_err = #PCIE_ERR_BUSNUM
+      ProcedureReturn 0
+    EndIf
+    pcie_Poke(#PCI_CFG_BUSES, (v & $FF000000) | (#PCIE_RP1_BUS << 16) | (#PCIE_RP1_BUS << 8))
+    pcie_busWritten = 1
+    v = PcieRcPeek(#PCI_CFG_BUSES)
+    If v < 0 Or ((v >> 8) & $FFFF) <> ((#PCIE_RP1_BUS << 8) | #PCIE_RP1_BUS) Or (v & $FF) <> 0
+      pcie_err = #PCIE_ERR_BUSNUM
+      ProcedureReturn 0
+    EndIf
+    ProcedureReturn 1
+  EndProcedure
+
+; RP1'S BAR IS ADOPTED, NOT ASSIGNED. The firmware gave RP1 its BAR - the
+; outbound window (PCIe #PCIE_OUT_BUS, CPU #PCIE_OUT_CPU) reaches RP1's
+; peripherals through it. Every RP1 address in this tree is that window
+; plus a fixed offset, so the BAR must decode at #PCIE_OUT_BUS: BAR0 and
+; BAR1 are read and the first memory BAR there is recorded. If neither
+; is, the fixed arithmetic would aim at the wrong place; refused
+; (#PCIE_ERR_RP1_BAR), nothing written.
+  Procedure.i pcie_AdoptRp1Bar()
+    Define n.i
+    Define v.i
+    n = 0
+    While n <= 1
+      v = PcieCfgRead32(#PCIE_RP1_BUS, 0, 0, $10 + (4 * n))
+      If v >= 0 And (v & 1) = 0 And (v & $FFFFFFF0) = #PCIE_OUT_BUS
+        pcie_rp1Bar = n
+        pcie_rp1BarVal = v
+        ProcedureReturn 1
+      EndIf
+      n = n + 1
+    Wend
+    pcie_err = #PCIE_ERR_RP1_BAR
+    ProcedureReturn 0
+  EndProcedure
+
+  Procedure.i PcieBusNumbersWritten() : ProcedureReturn pcie_busWritten : EndProcedure
+  Procedure.i PcieRp1BarIndex()       : ProcedureReturn pcie_rp1Bar : EndProcedure
+
   Procedure.i PcieEnumerate()
     Define id.i
     Define cmd.i
@@ -885,6 +1003,9 @@ CompilerIf #PMF_CHIP = 2712
       ProcedureReturn 0
     EndIf
     pcie_Phase(#PCIE_PH_ENUM)
+    If pcie_Buses() = 0
+      ProcedureReturn 0
+    EndIf
     id = PcieCfgRead32(1, 0, 0, $00)
     If id <> #PCIE_RP1_ID
       pcie_err = #PCIE_ERR_NO_ENDPOINT
@@ -896,6 +1017,9 @@ CompilerIf #PMF_CHIP = 2712
     cmd = PcieCfgRead32(1, 0, 0, #PCI_CFG_COMMAND)
     If (cmd & #PCI_CMD_MEMORY) = 0
       pcie_err = #PCIE_ERR_RP1_MEM
+      ProcedureReturn 0
+    EndIf
+    If pcie_AdoptRp1Bar() = 0
       ProcedureReturn 0
     EndIf
     pcie_enumerated = 1
@@ -942,6 +1066,14 @@ CompilerIf #PMF_CHIP = 2712
     If (addr + len) > pcie_dmaWin Or (addr + len) > #PCIE_DMA_LIMIT
       ProcedureReturn 0
     EndIf
+    ; WITH THE WINDOW AT PCIe 0 (the firmware's, adopted) the first
+    ; #PCIE_OUT_SIZE bytes of ARM memory have the same PCIe addresses as
+    ; RP1's own peripheral BAR. RP1 addressing them might reach its own
+    ; registers, not memory; they are refused. Nothing here puts a buffer
+    ; that low - the monitor's data is at $0D000000.
+    If pcie_dmaBase < #PCIE_OUT_SIZE And addr < #PCIE_OUT_SIZE
+      ProcedureReturn 0
+    EndIf
     ProcedureReturn 1
   EndProcedure
 
@@ -951,16 +1083,16 @@ CompilerIf #PMF_CHIP = 2712
     If physAddr < 0 Or pcie_dmaWin = 0 Or physAddr >= pcie_dmaWin
       ProcedureReturn #PCIE_ERR_RANGE
     EndIf
-    ProcedureReturn physAddr + #PCIE_DMA_BUS
+    ProcedureReturn physAddr + pcie_dmaBase
   EndProcedure
 
 ; The inverse, for a pointer the controller hands back in an event.
 ; Anything outside the window is not a pointer this driver issued.
   Procedure.i PcieDmaCpu(busAddr.i)
-    If busAddr < #PCIE_DMA_BUS Or busAddr >= (#PCIE_DMA_BUS + pcie_dmaWin)
+    If pcie_dmaWin = 0 Or busAddr < pcie_dmaBase Or busAddr >= (pcie_dmaBase + pcie_dmaWin)
       ProcedureReturn #PCIE_ERR_RANGE
     EndIf
-    ProcedureReturn busAddr - #PCIE_DMA_BUS
+    ProcedureReturn busAddr - pcie_dmaBase
   EndProcedure
 
   ; The Pi 4 ownership seam, answered for BCM2712. Nothing is adopted and
@@ -979,7 +1111,7 @@ CompilerIf #PMF_CHIP = 2712
     If pcie_dmaWin = 0
       ProcedureReturn 0
     EndIf
-    ProcedureReturn #PCIE_DMA_BUS
+    ProcedureReturn pcie_dmaBase
   EndProcedure
 
   ; An RP1 BAR-relative bus address -> CPU, refused outside the window.
@@ -992,6 +1124,9 @@ CompilerIf #PMF_CHIP = 2712
 
   Procedure.i PcieDmaWindowSize() : ProcedureReturn pcie_dmaWin : EndProcedure
   Procedure.i PcieDmaWindowBar()  : ProcedureReturn pcie_dmaBar : EndProcedure
+  ; The PCIe address the adopted window puts ARM physical 0 at: $10_0000_0000
+  ; in the Linux layout, 0 as the firmware leaves it (measured, build 215).
+  Procedure.i PcieDmaWindowBase() : ProcedureReturn pcie_dmaBase : EndProcedure
   Procedure.i PcieAdopted()       : ProcedureReturn 0 : EndProcedure
   Procedure.i PcieError()         : ProcedureReturn pcie_err : EndProcedure
   Procedure.i PcieLinkSpeed()     : ProcedureReturn pcie_linkSpeed : EndProcedure
@@ -1011,11 +1146,15 @@ CompilerIf #PMF_CHIP = 2712
       Case #PCIE_ERR_EP_MODE
         ProcedureReturn "pcie error -5: pcie2 does not report root-complex mode (PCIE_STATUS bit 7 clear)"
       Case #PCIE_ERR_INBOUND
-        ProcedureReturn "pcie error -16: no inbound window maps PCIe $10_0000_0000 onto ARM physical 0 (RC_BAR1..10 / UBUS_BAR1..10 read back). RP1's DMA - the USB rings - cannot reach memory; refused rather than run a controller that reports success into nothing."
+        ProcedureReturn "pcie error -16: no inbound window maps ARM physical 0 onto PCIe at any base (RC_BAR1..10 / UBUS_BAR1..10 read back; nothing is written to them). RP1's DMA - the USB rings - cannot reach memory; refused rather than run a controller that reports success into nothing."
       Case #PCIE_ERR_NO_ENDPOINT
         ProcedureReturn "pcie error -7: bus 1 device 0 is not RP1 (1DE4:0001)"
       Case #PCIE_ERR_RP1_MEM
         ProcedureReturn "pcie error -17: RP1 is present but its memory decoding is off - the firmware did not leave RP1 usable"
+      Case #PCIE_ERR_BUSNUM
+        ProcedureReturn "pcie error -24: the root port's bus numbers ($18) name a bus other than 1 for RP1, or writing primary 0 / secondary 1 / subordinate 1 did not read back - configuration reads cannot reach RP1"
+      Case #PCIE_ERR_RP1_BAR
+        ProcedureReturn "pcie error -25: neither of RP1's BAR0/BAR1 decodes at PCIe 0, where the outbound window sends every RP1 access - the firmware's assignment is not the one this code reaches RP1 through; nothing was reassigned"
     EndSelect
     ProcedureReturn "pcie: unknown error"
   EndProcedure
