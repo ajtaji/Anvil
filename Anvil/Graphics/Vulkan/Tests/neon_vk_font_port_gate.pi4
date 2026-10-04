@@ -26,7 +26,6 @@ Procedure.f MathFFromInt(value.i)
   ProcedureReturn value
 EndProcedure
 Procedure.i nvpTextScaleSupported(scaled.i, ignoreCamera.i)
-  If scaled <> 0 And fontCanvasEqual = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 Procedure.i AnvilTrueTypeSlotBytes(slot.i)
@@ -60,7 +59,7 @@ Procedure.i NeonVkChromeWarmTrueTypeText(pixelHeight.i, *s)
   fontWarmCalls = fontWarmCalls + 1 : fontWarmSlot = fontSelected
   ProcedureReturn 3
 EndProcedure
-Procedure.i NeonVkChromeMeasureWidth(face.i, *s)
+Procedure.i NeonVkChromeMeasureWidthFixed(face.i, *s)
   Protected at.i, width.i, ch.i
   If face <> fontFace Or *s = 0 : ProcedureReturn -1 : EndIf
   Repeat
@@ -72,7 +71,7 @@ Procedure.i NeonVkChromeMeasureWidth(face.i, *s)
     EndIf
     at = at + 1
   ForEver
-  ProcedureReturn (width * fontPixelHeight) / 20
+  ProcedureReturn ((width * fontPixelHeight) / 20) * 65536 + 32768
 EndProcedure
 Procedure.i NeonVkChromeMeasureLineHeight(face.i)
   If face <> fontFace : ProcedureReturn -1 : EndIf
@@ -105,21 +104,21 @@ Procedure.i Main()
   If NeonVkPortFontLineHeight(@boot) <> 18 : ProcedureReturn 7 : EndIf
   If fontBytes[4] <> 4096 Or fontGeneration[4] <> 2 : ProcedureReturn 8 : EndIf
   If NeonVkPortFontWarm(@other, @text[0]) <> 0 Or fontSelected <> 1 : ProcedureReturn 23 : EndIf
-  If NeonVkPortFontTextWidth(@other, @text[0], 1) <> 14.0 Or NeonVkPortFontLineHeight(@other) <> 12 : ProcedureReturn 24 : EndIf
+  If NeonVkPortFontTextWidth(@other, @text[0], 1) <> 14.5 Or NeonVkPortFontLineHeight(@other) <> 12 : ProcedureReturn 24 : EndIf
   If NeonVkPortFontWarm(@first, @text[0]) <> 0 Or fontSelected <> 0 Or fontWarmCalls <> 3 : ProcedureReturn 9 : EndIf
-  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> 28.0 : ProcedureReturn 10 : EndIf
+  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> 28.5 : ProcedureReturn 10 : EndIf
   If NeonVkPortFontLineHeight(@first) <> 22 : ProcedureReturn 11 : EndIf
   fontCanvasEqual = 0
-  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> -1.0 : ProcedureReturn 12 : EndIf
+  If NeonVkPortFontTextWidth(@first, @text[0], 1) <> 28.5 : ProcedureReturn 12 : EndIf
   fontCanvasEqual = 1
   nvcInFrame = 1
   If NeonVkPortFontWarm(@first, @text[0]) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 13 : EndIf
   If NeonVkPortFontText(@other, 0.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 14 : EndIf
   If fontSelected <> 0 Or fontDrawCalls <> 0 : ProcedureReturn 15 : EndIf
   If NeonVkPortFontTextRight(@first, 100.0, 7.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> 23 : ProcedureReturn 16 : EndIf
-  If fontDrawX <> 72.0 Or fontDrawY <> 7.0 Or fontDrawFace <> 2 Or fontDrawPointer <> @text[0] : ProcedureReturn 17 : EndIf
+  If fontDrawX <> 71.5 Or fontDrawY <> 7.0 Or fontDrawFace <> 2 Or fontDrawPointer <> @text[0] : ProcedureReturn 17 : EndIf
   If NeonVkPortFontTextCentre(@first, 10.0, 100.0, 9.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> 23 : ProcedureReturn 18 : EndIf
-  If fontDrawX <> 46.0 Or fontDrawY <> 9.0 Or fontDrawCalls <> 2 : ProcedureReturn 19 : EndIf
+  If fontDrawX <> 45.75 Or fontDrawY <> 9.0 Or fontDrawCalls <> 2 : ProcedureReturn 19 : EndIf
   nvcTTDirty = 1
   If NeonVkPortFontText(@first, 0.0, 0.0, @text[0], 1.0, 1.0, 1.0, 1.0, 1, 1) <> #NEON_VK_FONT_ERR_SEQUENCE : ProcedureReturn 20 : EndIf
   nvcTTDirty = 0

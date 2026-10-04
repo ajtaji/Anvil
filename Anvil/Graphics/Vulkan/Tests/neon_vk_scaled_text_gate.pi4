@@ -1,0 +1,103 @@
+; Emitted A64 gate for the production TrueType quad transform.
+
+#NEON_VK_CHROME_OK = 0
+#NEON_VK_CHROME_ERR_ARGS = -21201
+#NEON_VK_CHROME_ERR_CAPACITY = -21203
+#NEON_VK_CHROME_ERR_ATLAS = -21204
+#NEON_VK_CHROME_ERR_STATE = -21202
+#NEON_VK_CHROME_TT_RUN_GLYPHS = 4
+#NVC_SPRITE_Q8_LIMIT = 1500000
+#ANVIL_TTL_ALIGN_LEFT = 0
+
+Global nvcInFrame.i = 1
+Global nvcGridBatchActive.i
+Global nvcBoxBatchActive.i
+Global nvcTTDirty.i
+Global nvcTTErrorStage.i
+Global nvcTTUnitsProbe.i
+Global nvcTTCountProbe.i
+Global nvcTTLinesProbe.i
+Global nvcTTMeasuredProbe.i
+Global nvcTTMetricsStateProbe.i
+Global nvcTTLayoutRc.i
+Global nvcTTLayoutError.i
+Global nvcTTFontPixels.i = 16
+Global nvcDrawCount.i
+Global nvcMaxQuads.i = 16
+Global nvcVertices.i
+Global nvcMaxVertexQuads.i = 16
+Global nvcAtlasW.i = 64
+Global nvcAtlasH.i = 64
+Global nvcObservedColour.i
+Global nvcObservedCount.i
+Global Dim nvcObservedX.i[12]
+Global Dim nvcObservedY.i[12]
+Global Dim nvcTTLayoutGlyph.i[4]
+Global Dim nvcTTLayoutX.i[4]
+Global Dim nvcTTLayoutY.i[4]
+Global Dim nvcTTLayoutAdvance.i[4]
+Global Dim nvcTTMapX0Q8.i[4]
+Global Dim nvcTTMapY0Q8.i[4]
+Global Dim nvcTTMapX1Q8.i[4]
+Global Dim nvcTTMapY1Q8.i[4]
+Global Dim nvcTTW.i[4]
+Global Dim nvcTTH.i[4]
+Global Dim nvcTTX.i[4]
+Global Dim nvcTTY.i[4]
+Global Dim nvcTTBearingX.i[4]
+Global Dim nvcTTBearingY.i[4]
+
+Procedure.i nvcFail(code.i) : ProcedureReturn code : EndProcedure
+Procedure.i AnvilTrueTypeSlotSelected() : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilTrueTypeSlotParserBound() : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeSlotGeneration(slot.i) : ProcedureReturn 1 : EndProcedure
+Procedure.i AnvilTrueTypeUnitsPerEm() : ProcedureReturn 1000 : EndProcedure
+Procedure.i AnvilTrueTypeAscender() : ProcedureReturn 625 : EndProcedure
+Procedure.i AnvilTrueTypeLayoutError() : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilTrueTypeMetricsOpenState() : ProcedureReturn 1 : EndProcedure
+Procedure.i nvcTTFontHeightFor(font.i) : ProcedureReturn 16 : EndProcedure
+Procedure.i nvcTTCacheFind(slot.i, generation.i, pixelHeight.i, glyph.i) : ProcedureReturn glyph - 1 : EndProcedure
+Procedure.i nvcTTFixed16Floor(value.i) : ProcedureReturn value / 65536 : EndProcedure
+Procedure.i neon_F32Ratio(num.i, den.i) : ProcedureReturn 0 : EndProcedure
+Procedure nvcQuad(first.i, x0.i, y0.i, x1.i, y1.i, u0.i, v0.i, u1.i, v1.i) : EndProcedure
+Procedure nvcSpriteVertexQ8(index.i, xQ8.i, yQ8.i, u.i, v.i)
+  nvcObservedX[index] = xQ8 : nvcObservedY[index] = yQ8
+EndProcedure
+Procedure.i nvcDraw(first.i, count.i, colour.i)
+  nvcDrawCount + 1 : nvcObservedCount = count : nvcObservedColour = colour
+  ProcedureReturn 0
+EndProcedure
+Procedure.i AnvilTrueTypeLayoutUtf8(text.i, byteCount.i, pixelHeight.i, maxWidth.i, lineHeight.i, glyphOut.i, xOut.i, yOut.i, advanceOut.i, alignment.i, capacity.i, glyphCountOut.i, lineCountOut.i, measuredWidthOut.i)
+  If byteCount <> 2 Or pixelHeight <> 16 : ProcedureReturn 0 : EndIf
+  PokeI(glyphOut + 0, 1) : PokeI(glyphOut + 8, 2)
+  PokeI(xOut + 0, 0) : PokeI(xOut + 8, 9 * 65536 + 16384)
+  PokeI(yOut + 0, 0) : PokeI(yOut + 8, 0)
+  PokeI(advanceOut + 0, 9 * 65536 + 16384) : PokeI(advanceOut + 8, 2 * 65536)
+  PokeI(glyphCountOut, 2) : PokeI(lineCountOut, 1)
+  PokeI(measuredWidthOut, 11 * 65536 + 16384)
+  ProcedureReturn 1
+EndProcedure
+
+; @PRODUCTION_TEXT_TRANSFORM@
+
+Procedure.i Main()
+  Protected Dim sample.a[3]
+  sample[0] = 65 : sample[1] = 66 : sample[2] = 0
+  nvcTTW[0] = 4 : nvcTTH[0] = 6 : nvcTTBearingX[0] = 1 : nvcTTBearingY[0] = 7
+  nvcTTW[1] = 2 : nvcTTH[1] = 5 : nvcTTBearingX[1] = 0 : nvcTTBearingY[1] = 7
+  If NeonVkChromeTextMapped(0, 671744, 1327104, @sample[0], 45, 100, 100, 200, 300, 163840, 98304, 131072, 0) <> 0 : ProcedureReturn 1 : EndIf
+  If nvcVertices <> 12 Or nvcDrawCount <> 1 Or nvcObservedCount <> 12 Or nvcObservedColour <> 45 : ProcedureReturn 2 : EndIf
+  If nvcObservedX[0] <> -16896 Or nvcObservedY[0] <> -5376 Or nvcObservedX[2] <> -12800 Or nvcObservedY[2] <> 3840 : ProcedureReturn 3 : EndIf
+  If nvcObservedX[6] <> -7680 Or nvcObservedY[6] <> -5376 : ProcedureReturn 4 : EndIf
+  nvcVertices = 0 : nvcDrawCount = 0
+  If NeonVkChromeTextMapped(0, 671744, 1327104, @sample[0], 46, 100, 100, 200, 300, 163840, 98304, 131072, 1) <> 0 : ProcedureReturn 5 : EndIf
+  If nvcObservedX[0] <> 5632 Or nvcObservedY[0] <> 17664 Or nvcObservedX[2] <> 7680 Or nvcObservedY[2] <> 22272 : ProcedureReturn 6 : EndIf
+  If nvcObservedX[6] <> 10240 Or nvcObservedY[6] <> 17664 : ProcedureReturn 7 : EndIf
+  nvcVertices = 0 : nvcDrawCount = 0 : nvcTTBearingX[1] = 6000
+  If NeonVkChromeTextMapped(0, 671744, 1327104, @sample[0], 47, 100, 100, 200, 300, 163840, 98304, 131072, 1) <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 8 : EndIf
+  If nvcVertices <> 0 Or nvcDrawCount <> 0 Or nvcTTErrorStage <> 9 : ProcedureReturn 9 : EndIf
+  nvcTTBearingX[1] = 20000000
+  If NeonVkChromeTextMapped(0, 671744, 1327104, @sample[0], 48, 100, 100, 200, 300, 163840, 98304, 131072, 0) <> #NEON_VK_CHROME_ERR_CAPACITY : ProcedureReturn 10 : EndIf
+  If nvcVertices <> 0 Or nvcDrawCount <> 0 Or nvcTTErrorStage <> 9 : ProcedureReturn 11 : EndIf
+  ProcedureReturn 0
+EndProcedure
