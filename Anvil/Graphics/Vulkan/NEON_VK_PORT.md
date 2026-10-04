@@ -215,6 +215,13 @@ the CPU median frame to 454,279 µs and the CSD median to 419,668 µs. This
 optimizes a common geometry case; other particle shapes still take the
 original path and the CSD route remains opt-in.
 
+The Pi 4 CSD producer's [Y-pair reuse proof](../../../docs/evidence/neon-particle-ypair-pi4-20261003/README.md)
+reused exact clip words for adjacent axis-aligned particles sharing Y
+endpoints. In the same moving profile, CSD staging fell from 126,824 to
+113,088 µs and the frame median from 419,668 to 405,927 µs. It does not
+change the general geometry path or turn the opt-in producer into a
+board-neutral implementation.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
@@ -230,9 +237,22 @@ but does not include this port adapter or a complete Neon-authored application.
 Broader image decoding, desktop font handles, UI layout/events, viewport
 presentation, and particle throughput parity remain to be ported.
 
-Letterboxed or cropped viewports require their own viewport mapping; these
-adapters assume the full logical target. The default native Neon path and
-compile-time Vulkan backend selection are unchanged.
+For a fixed-aspect canvas, include the board-neutral
+`neon_vk_viewport.pbi` after `EnableFloatingPoint`.
+`NeonVkPortViewportPlan` follows the desktop's float32 width fit, conditional
+height fit, and independent size/offset rounding. It validates canvas and
+screen dimensions from 1 to 8192 pixels and refuses a viewport that rounds
+to zero or would extend outside the screen. `NeonVkPortViewportMapPointer` returns signed Q16 canvas
+coordinates for a physical pointer; its result distinguishes pixels inside
+the canvas from letterbox bars, and refuses coordinates outside the screen.
+The map does not clamp bars or apply the desktop's optional CRT warp. A host
+can use the planned width and height as its Vulkan target, place the completed
+image at the planned offset during presentation, and discard pointer events
+in the bars. The module neither presents nor owns a display; the resident
+monitor does not yet use it. Its gate desk-compiles for Pi 3, Pi 4 and Pi 5;
+the Pi 4 returning math proof passed. No visible application is claimed. Cropped viewports
+remain unsupported. The default native Neon path and compile-time Vulkan
+backend selection are unchanged.
 
 The Pi 4 board proof in `docs/evidence/neon-vk-port-frame-pi4-20261003/`
 exercised this adapter through the real V3D Vulkan backend. It checked a

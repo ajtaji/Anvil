@@ -1,0 +1,125 @@
+; Returning desk gate for board-neutral Neon fixed-canvas viewport math.
+; This does not create a Vulkan device or present a frame.
+
+EnableFloatingPoint
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_viewport.pbi"
+
+#NVV_MAGIC = $56504E56
+Global Dim nvvReport.l[32]
+
+Procedure.i nvvFinish(status.i)
+  nvvReport[1] = status
+  ProcedureReturn @nvvReport[0]
+EndProcedure
+
+Procedure.i Main()
+  Define view.NeonVkPortViewport
+  Define xQ16.i, yQ16.i, rc.i
+  nvvReport[0] = #NVV_MAGIC
+
+  ; 16:9 content on a 16:10 physical screen leaves 40-pixel top/bottom bars.
+  nvvReport[2] = 1
+  rc = NeonVkPortViewportPlan(1280, 720, 1280, 800, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\valid <> 1 Or view\x <> 0 Or view\y <> 40 Or view\width <> 1280 Or view\height <> 720
+    ProcedureReturn nvvFinish(10)
+  EndIf
+  nvvReport[3] = view\x : nvvReport[4] = view\y
+  nvvReport[5] = view\width : nvvReport[6] = view\height
+  rc = NeonVkPortViewportMapPointer(@view, 640, 400, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_INSIDE Or xQ16 <> 640 * 65536 Or yQ16 <> 360 * 65536
+    ProcedureReturn nvvFinish(11)
+  EndIf
+  nvvReport[7] = xQ16 : nvvReport[8] = yQ16
+  rc = NeonVkPortViewportMapPointer(@view, 640, 39, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_BAR Or xQ16 <> 640 * 65536 Or yQ16 <> -65536
+    ProcedureReturn nvvFinish(12)
+  EndIf
+  rc = NeonVkPortViewportMapPointer(@view, 640, 760, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_BAR Or yQ16 <> 720 * 65536
+    ProcedureReturn nvvFinish(13)
+  EndIf
+
+  ; Height-fit with an odd horizontal difference rounds its left offset up.
+  nvvReport[2] = 2
+  rc = NeonVkPortViewportPlan(1280, 720, 1000, 500, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\x <> 56 Or view\y <> 0 Or view\width <> 889 Or view\height <> 500
+    ProcedureReturn nvvFinish(20)
+  EndIf
+  nvvReport[9] = view\x : nvvReport[10] = view\width
+  rc = NeonVkPortViewportMapPointer(@view, 945, 250, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_BAR Or xQ16 <> 1280 * 65536 Or yQ16 <> 360 * 65536
+    ProcedureReturn nvvFinish(21)
+  EndIf
+
+  ; Width-fit with fractional height is rounded before centering.
+  nvvReport[2] = 3
+  rc = NeonVkPortViewportPlan(1280, 720, 1001, 777, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\x <> 0 Or view\y <> 107 Or view\width <> 1001 Or view\height <> 563
+    ProcedureReturn nvvFinish(30)
+  EndIf
+  nvvReport[11] = view\y : nvvReport[12] = view\height
+  rc = NeonVkPortViewportMapPointer(@view, 0, 107, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_INSIDE Or xQ16 <> 0 Or yQ16 <> 0
+    ProcedureReturn nvvFinish(31)
+  EndIf
+
+  ; Size and offset round independently from the original fractional extent.
+  ; Centering the rounded width would be one pixel wrong in the first case.
+  nvvReport[2] = 4
+  rc = NeonVkPortViewportPlan(1280, 720, 1000, 507, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\x <> 49 Or view\width <> 901 Or view\y <> 0 Or view\height <> 507
+    ProcedureReturn nvvFinish(40)
+  EndIf
+  nvvReport[13] = view\x : nvvReport[14] = view\width
+  rc = NeonVkPortViewportMapPointer(@view, 950, 253, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_BAR Or xQ16 <> 1280 * 65536
+    ProcedureReturn nvvFinish(41)
+  EndIf
+  rc = NeonVkPortViewportPlan(1280, 720, 1001, 778, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\y <> 107 Or view\height <> 563 Or view\x <> 0 Or view\width <> 1001
+    ProcedureReturn nvvFinish(42)
+  EndIf
+  nvvReport[15] = view\y : nvvReport[16] = view\height
+
+  ; These two layouts distinguish desktop float32 arithmetic from exact
+  ; rational rounding at a half-pixel boundary.
+  nvvReport[2] = 5
+  rc = NeonVkPortViewportPlan(5228, 7855, 6649, 7704, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\x <> 761 Or view\y <> 0 Or view\width <> 5128 Or view\height <> 7704
+    ProcedureReturn nvvFinish(43)
+  EndIf
+  nvvReport[17] = view\x : nvvReport[18] = view\width
+  rc = NeonVkPortViewportPlan(1746, 2910, 6692, 6155, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK Or view\x <> 1499 Or view\y <> 0 Or view\width <> 3693 Or view\height <> 6155
+    ProcedureReturn nvvFinish(44)
+  EndIf
+  nvvReport[19] = view\x : nvvReport[20] = view\width
+
+  ; Invalid replanning poisons the old plan and leaves output pointers alone.
+  nvvReport[2] = 6
+  rc = NeonVkPortViewportPlan(0, 720, 1001, 777, @view)
+  If rc <> #NEON_VK_VIEWPORT_ERR_ARGS Or view\valid <> 0
+    ProcedureReturn nvvFinish(50)
+  EndIf
+  xQ16 = 123 : yQ16 = 456
+  rc = NeonVkPortViewportMapPointer(@view, 10, 10, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_ERR_STATE Or xQ16 <> 123 Or yQ16 <> 456
+    ProcedureReturn nvvFinish(51)
+  EndIf
+  rc = NeonVkPortViewportPlan(1280, 720, 1280, 800, @view)
+  If rc <> #NEON_VK_VIEWPORT_OK : ProcedureReturn nvvFinish(52) : EndIf
+  rc = NeonVkPortViewportMapPointer(@view, -1, 10, @xQ16, @yQ16)
+  If rc <> #NEON_VK_VIEWPORT_ERR_ARGS Or xQ16 <> 123 Or yQ16 <> 456
+    ProcedureReturn nvvFinish(53)
+  EndIf
+  If NeonVkPortViewportPlan(1280, 720, 1280, 800, 0) <> #NEON_VK_VIEWPORT_ERR_ARGS
+    ProcedureReturn nvvFinish(54)
+  EndIf
+  rc = NeonVkPortViewportPlan(8192, 1, 1, 1, @view)
+  If rc <> #NEON_VK_VIEWPORT_ERR_STATE Or view\valid <> 0
+    ProcedureReturn nvvFinish(55)
+  EndIf
+
+  nvvReport[2] = 7
+  ProcedureReturn nvvFinish(0)
+EndProcedure
