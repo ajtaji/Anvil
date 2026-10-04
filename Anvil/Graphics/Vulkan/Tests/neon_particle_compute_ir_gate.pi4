@@ -1,0 +1,36 @@
+; Passive emitted-A64 compute SPIR-V dataflow gate. The host supplies one
+; module at CG_IN and reads this report; no public Vulkan entry is called.
+XIncludeFile "../vk_spirv.pbi"
+XIncludeFile "../vk_ir.pbi"
+XIncludeFile "../vk_spirv_ir_adapter.pbi"
+
+#CG_IN=$06000000
+#CG_OUT=$06010000
+Global cgPlan.AvkComputeIr
+
+Procedure.i Main()
+  Protected address.i=PeekI(#CG_IN)
+  Protected bytes.i=PeekI(#CG_IN+8)
+  Protected rc.i
+  Protected k.i
+  rc=AnvilVkSpirvComputeAdapt(address,bytes,@cgPlan)
+  PokeI(#CG_OUT,rc)
+  PokeI(#CG_OUT+8,cgPlan\valid)
+  PokeI(#CG_OUT+16,cgPlan\localX)
+  PokeI(#CG_OUT+24,cgPlan\localY)
+  PokeI(#CG_OUT+32,cgPlan\localZ)
+  PokeI(#CG_OUT+40,cgPlan\inputStride)
+  PokeI(#CG_OUT+48,cgPlan\outputStride)
+  PokeI(#CG_OUT+56,cgPlan\inputIndexScale)
+  PokeI(#CG_OUT+64,cgPlan\outputIndexScale)
+  PokeI(#CG_OUT+72,cgPlan\inputBinding)
+  PokeI(#CG_OUT+80,cgPlan\outputBinding)
+  PokeI(#CG_OUT+88,cgPlan\storeCount)
+  For k=0 To #ANVIL_COMPUTE_MAX_STORES-1
+    PokeI(#CG_OUT+96+k*32,cgPlan\stores[k]\outputWord)
+    PokeI(#CG_OUT+104+k*32,cgPlan\stores[k]\sourceKind)
+    PokeI(#CG_OUT+112+k*32,cgPlan\stores[k]\inputByte)
+    PokeI(#CG_OUT+120+k*32,cgPlan\stores[k]\constantBits)
+  Next
+  ProcedureReturn rc
+EndProcedure

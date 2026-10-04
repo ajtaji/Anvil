@@ -93,7 +93,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 ; Bounds. A module larger than this is refused rather than truncated: a
 ; front end that stops reading half way through a module and reports
 ; success is the one failure mode that cannot be caught downstream.
-#ANVIL_SPV_MAX_ID = 192
+#ANVIL_SPV_MAX_ID = 256
 #ANVIL_SPV_MAX_WORDS = 2048             ; 8 KiB of module
 #ANVIL_SPV_MAX_ATTRS = 4
 #ANVIL_SPV_MAX_VARYINGS = 4
@@ -241,9 +241,13 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_foundation.pbi"
 #SpvDecorationBinding = 33
 #SpvDecorationDescriptorSet = 34
 #SpvDecorationOffset = 35
+#SpvDecorationNonWritable = 24
+#SpvDecorationNonReadable = 25
 
 ; Built-ins (3.21).
 #SpvBuiltInPosition = 0
+#SpvBuiltInGlobalInvocationId = 28
+#SpvBuiltInWorkgroupSize = 25
 #SpvBuiltInPointSize = 1
 #SpvBuiltInClipDistance = 3
 #SpvBuiltInCullDistance = 4
@@ -623,7 +627,7 @@ Procedure.i avkSpvHeader(*words, wordCount.i)
     ProcedureReturn avkSpvMalformed("vkCreateShaderModule was given a SPIR-V module whose id bound is zero (Anvil code -20001, malformed header); the fourth header word must be one more than the largest result id the module uses.")
   EndIf
   If spvBound > (#ANVIL_SPV_MAX_ID + 1)
-    ProcedureReturn avkSpvMalformed("vkCreateShaderModule was given a SPIR-V module with more result ids than Anvil's front end can hold (Anvil code -20001, module too large); the id bound must be at most 193. This is a limit of the implementation and not of SPIR-V, so a smaller shader is the answer today.")
+    ProcedureReturn avkSpvMalformed("vkCreateShaderModule was given a SPIR-V module with more result ids than Anvil's front end can hold (Anvil code -20001, module too large); the id bound must be at most 257. This is a limit of the implementation and not of SPIR-V, so a smaller shader is the answer today.")
   EndIf
   If avkSpvWord(*words, 4) <> 0
     ProcedureReturn avkSpvMalformed("vkCreateShaderModule was given a SPIR-V module that declares an instruction schema (Anvil code -20001, unsupported schema); the fifth header word must be zero, which is the only schema the SPIR-V specification defines.")

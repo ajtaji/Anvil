@@ -38,6 +38,33 @@
 
 ; Current front-end storage bounds, not SPIR-V or IR architectural limits.
 #ANVIL_IR_MAX_ID          = 192
+
+; A bounded, passive compute dataflow summary. Every store retains its
+; destination affine word and its typed float32 source. No queue/backend path
+; consumes this yet; accepting a module here makes no execution claim.
+#ANVIL_COMPUTE_MAX_STORES = 36
+#ANVIL_COMPUTE_SOURCE_INPUT = 1
+#ANVIL_COMPUTE_SOURCE_CONSTANT = 2
+Structure AvkComputeStore Align #PB_Structure_AlignC
+  outputWord.i
+  sourceKind.i
+  inputByte.i
+  constantBits.i
+EndStructure
+Structure AvkComputeIr Align #PB_Structure_AlignC
+  valid.i
+  localX.i
+  localY.i
+  localZ.i
+  inputStride.i
+  outputStride.i
+  inputIndexScale.i
+  outputIndexScale.i
+  inputBinding.i
+  outputBinding.i
+  storeCount.i
+  stores.AvkComputeStore[#ANVIL_COMPUTE_MAX_STORES]
+EndStructure
 #ANVIL_IR_MAX_TYPES       = 64
 #ANVIL_IR_MAX_CONSTANTS   = 64
 #ANVIL_IR_MAX_VARIABLES   = 32

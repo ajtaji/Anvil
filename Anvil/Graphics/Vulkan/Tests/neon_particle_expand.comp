@@ -1,0 +1,66 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 1, local_size_z = 1) in;
+
+struct ParticleRecord {
+    vec4 corners01;
+    vec4 corners23;
+    vec4 uvChecks;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ParticleInput {
+    ParticleRecord records[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer ParticleOutput {
+    float vertices[];
+};
+
+void main() {
+    uint item = gl_GlobalInvocationID.x;
+    ParticleRecord p = records[item];
+    uint dst = item * 36u;
+
+    // Two triangles in Neon's retained particle order: 0,2,3, 0,3,1.
+    vertices[dst + 0u] = p.corners01.x;
+    vertices[dst + 1u] = p.corners01.y;
+    vertices[dst + 2u] = p.uvChecks.x;
+    vertices[dst + 3u] = p.uvChecks.y;
+    vertices[dst + 4u] = 1.0;
+    vertices[dst + 5u] = 1.0;
+
+    vertices[dst + 6u] = p.corners23.x;
+    vertices[dst + 7u] = p.corners23.y;
+    vertices[dst + 8u] = p.uvChecks.x;
+    vertices[dst + 9u] = p.uvChecks.y;
+    vertices[dst + 10u] = 1.0;
+    vertices[dst + 11u] = 1.0;
+
+    vertices[dst + 12u] = p.corners23.z;
+    vertices[dst + 13u] = p.corners23.w;
+    vertices[dst + 14u] = p.uvChecks.x;
+    vertices[dst + 15u] = p.uvChecks.y;
+    vertices[dst + 16u] = 1.0;
+    vertices[dst + 17u] = 1.0;
+
+    vertices[dst + 18u] = p.corners01.x;
+    vertices[dst + 19u] = p.corners01.y;
+    vertices[dst + 20u] = p.uvChecks.x;
+    vertices[dst + 21u] = p.uvChecks.y;
+    vertices[dst + 22u] = 1.0;
+    vertices[dst + 23u] = 1.0;
+
+    vertices[dst + 24u] = p.corners23.z;
+    vertices[dst + 25u] = p.corners23.w;
+    vertices[dst + 26u] = p.uvChecks.x;
+    vertices[dst + 27u] = p.uvChecks.y;
+    vertices[dst + 28u] = 1.0;
+    vertices[dst + 29u] = 1.0;
+
+    vertices[dst + 30u] = p.corners01.z;
+    vertices[dst + 31u] = p.corners01.w;
+    vertices[dst + 32u] = p.uvChecks.x;
+    vertices[dst + 33u] = p.uvChecks.y;
+    vertices[dst + 34u] = 1.0;
+    vertices[dst + 35u] = 1.0;
+}
