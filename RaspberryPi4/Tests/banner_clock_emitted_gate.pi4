@@ -18,6 +18,7 @@ XIncludeFile "RaspberryPi4/Board/screen_geom.pi4"
 #BC_META = $06800000
 
 Global gScreen.i = 1
+Global gScreenDeferFirstFrame.i = 0
 Global gScreenBg.i = $FF101820
 Global gCursorGpuOwned.i = 1
 Global gCurShown.i = 1
@@ -28,6 +29,7 @@ Global gBannerClockX.i = 10
 Global gBannerClockW.i = 16
 Global gBannerClockChars.i = 1
 Global gBannerClockMs.i
+Global *gBannerGpuInvalidate = 0
 Global Dim gBannerClockText.a[#BANNER_CLOCK_MAX + 1]
 Global Dim gBannerClockNext.a[#BANNER_CLOCK_MAX + 1]
 Global probeSlot.i
@@ -53,6 +55,8 @@ Procedure.i Ticks()
   ProcedureReturn probeTicks
 EndProcedure
 Procedure UartWrite(c.i) : EndProcedure
+Procedure str_print_at(p.i) : EndProcedure
+Procedure PrintNl() : EndProcedure
 Procedure.i UartMirrorCount() : ProcedureReturn 0 : EndProcedure
 Procedure.i UartMirrorGet() : ProcedureReturn -1 : EndProcedure
 
@@ -68,6 +72,7 @@ XIncludeFile "RaspberryPi4/Monitor/anvil_fonts.pi4"
 ; arms and disarms. The console has its own gates; what is needed here is
 ; that the shipped banner_clock.pi4 compiles and runs.
 Procedure.i ConGridReady() : ProcedureReturn 1 : EndProcedure
+Procedure ConDrainRing() : EndProcedure
 Procedure.i ConsoleRows() : ProcedureReturn 8 : EndProcedure
 Procedure ConMarkViewRowQuiet(r.i) : EndProcedure
 Procedure ConOverlayDamage() : EndProcedure
@@ -92,6 +97,7 @@ Procedure.i DisplayWidth() : ProcedureReturn #BC_PANEL_W : EndProcedure
 Procedure.i DisplayHeight() : ProcedureReturn #BC_PANEL_H : EndProcedure
 Procedure.i LogoHeight() : ProcedureReturn 0 : EndProcedure
 Procedure.i DisplayBase() : ProcedureReturn 0 : EndProcedure
+Procedure.i DisplayMemorySafe() : ProcedureReturn 1 : EndProcedure
 Procedure.i DisplayCharWidth() : ProcedureReturn 8 * dsp_scale : EndProcedure
 Procedure.i DisplayCharHeight() : ProcedureReturn 16 * dsp_scale : EndProcedure
 Procedure DisplayScale(s.i) : dsp_scale = s : EndProcedure
