@@ -1664,6 +1664,8 @@ Procedure.i avkqBuildRecordAt(pipe.i, pipelineBase.i, recordBase.i, coordinateUn
   Define bidx.i
   Define vbase.i
   Define stride.i
+  Define attrMax.i
+  Define rate.i
   Define singleSegFs.i
   Define *bind.AnvilVkBackendBinding
 
@@ -1697,9 +1699,19 @@ Procedure.i avkqBuildRecordAt(pipe.i, pipelineBase.i, recordBase.i, coordinateUn
     vbase = *bind\base
     stride = *bind\stride
     If vbase = 0 Or stride <= 0 : ProcedureReturn #V3D_ERR_CL_ARGS : EndIf
+    rate = AnvilVkPipelineBindingRate(pipe, bidx)
+    attrMax = maxIndex
+    If rate = #VK_VERTEX_INPUT_RATE_INSTANCE
+      attrMax = *d\firstInstance + *d\instanceCount - 1
+    ElseIf rate <> #VK_VERTEX_INPUT_RATE_VERTEX
+      ProcedureReturn #V3D_ERR_CL_ARGS
+    EndIf
     c = 0
     While c < AnvilVkPipelineAttrComponents(pipe, a)
-      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, maxIndex, 1, 1)
+      V3dAttrRecord(n, vbase + AnvilVkPipelineAttrOffset(pipe, a) + (c * 4), stride, attrMax, 1, 1)
+      If rate = #VK_VERTEX_INPUT_RATE_INSTANCE
+        V3dAttrRecordType(n, 1, #V3D_ATTR_FLOAT, 0, 0, 0, 1)
+      EndIf
       n = n + 1
       c = c + 1
     Wend

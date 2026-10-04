@@ -44,9 +44,9 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 ; shared pool preserves that complete capacity without charging each of the 32
 ; command buffers half a megabyte while it is idle.
 #ANVIL_VK_MAX_RECORDED_DRAWS = 4096
-#ANVIL_VK_RECORDED_DRAW_BYTES = 224
+#ANVIL_VK_RECORDED_DRAW_BYTES = 240
 
-; Exactly 224 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values
+; Exactly 240 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values
 ; remain generation-tagged Vulkan handles. They are deliberately not resolved
 ; to slots or addresses while recording: submission owns that later lifetime
 ; boundary. Binding count/strides and all other immutable graphics state remain
@@ -73,6 +73,8 @@ Structure AnvilVkRecordedDraw Align #PB_Structure_AlignC
   vertexBuffer.i[4]
   vertexOffset.i[4]
   pushWord.l[4]
+  instanceCount.i
+  firstInstance.i
 EndStructure
 
 #ANVIL_VK_OP_NONE = 0
@@ -265,17 +267,17 @@ Procedure avkRecordedDrawPoolInit()
 EndProcedure
 
 ; Snapshot the command buffer's current graphics bind state and append one
-; non-empty draw. Returns its positive slot, zero for Vulkan's zero-vertex
-; no-op, or -1 when the aggregate pool/invariants refuse the draw. No pool or
+; non-empty draw. Returns its positive slot, zero for a zero-vertex or
+; zero-instance no-op, or -1 when the aggregate pool refuses the draw. No pool or
 ; command-buffer field changes on either non-success path.
-Procedure.i avkRecordedDrawAppend(c.i, firstVertex.i, vertexCount.i, viewportX.i, viewportY.i, viewportW.i, viewportH.i, scissorX.i, scissorY.i, scissorW.i, scissorH.i, indexBuffer.i, indexOffset.i, indexType.i)
+Procedure.i avkRecordedDrawAppend(c.i, firstVertex.i, vertexCount.i, viewportX.i, viewportY.i, viewportW.i, viewportH.i, scissorX.i, scissorY.i, scissorW.i, scissorH.i, indexBuffer.i, indexOffset.i, indexType.i, instanceCount.i, firstInstance.i)
   Define s.i
   Define nextFree.i
   Define k.i
-  If c < 1 Or c > #ANVIL_VK_MAX_COMMAND_BUFFERS Or vertexCount < 0 Or firstVertex < 0
+  If c < 1 Or c > #ANVIL_VK_MAX_COMMAND_BUFFERS Or vertexCount < 0 Or firstVertex < 0 Or instanceCount < 0 Or firstInstance < 0
     ProcedureReturn -1
   EndIf
-  If vertexCount = 0 : ProcedureReturn 0 : EndIf
+  If vertexCount = 0 Or instanceCount = 0 : ProcedureReturn 0 : EndIf
   avkRecordedDrawPoolInit()
   If avkCbDrawCount[c] < 0 Or avkCbDrawCount[c] >= #ANVIL_VK_MAX_RECORDED_DRAWS
     ProcedureReturn -1
@@ -297,6 +299,8 @@ Procedure.i avkRecordedDrawAppend(c.i, firstVertex.i, vertexCount.i, viewportX.i
   avkRecordedDraw[s]\descriptorSet = avkCbDescSet[c]
   avkRecordedDraw[s]\firstVertex = firstVertex
   avkRecordedDraw[s]\vertexCount = vertexCount
+  avkRecordedDraw[s]\instanceCount = instanceCount
+  avkRecordedDraw[s]\firstInstance = firstInstance
   avkRecordedDraw[s]\indexBuffer = indexBuffer
   avkRecordedDraw[s]\indexOffset = indexOffset
   avkRecordedDraw[s]\indexType = indexType
@@ -352,6 +356,7 @@ Procedure.i avkRecordedClearRectAppend(c.i, x.i, y.i, w.i, h.i, bgra.i)
   avkRecordedDraw[s]\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT
   avkRecordedDraw[s]\pipeline = 0 : avkRecordedDraw[s]\descriptorSet = 0
   avkRecordedDraw[s]\firstVertex = 0 : avkRecordedDraw[s]\vertexCount = 0
+  avkRecordedDraw[s]\instanceCount = 0 : avkRecordedDraw[s]\firstInstance = 0
   avkRecordedDraw[s]\indexBuffer = 0 : avkRecordedDraw[s]\indexOffset = 0 : avkRecordedDraw[s]\indexType = 0
   avkRecordedDraw[s]\pushBytes = 0
   avkRecordedDraw[s]\viewportX = x : avkRecordedDraw[s]\viewportY = y

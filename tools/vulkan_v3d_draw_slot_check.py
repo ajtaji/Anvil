@@ -29,7 +29,7 @@ EMITTER = ROOT / "Anvil" / "Graphics" / "Vulkan" / "vk_v3d_shader.pi4"
 DEFAULT_COMPILER = pathlib.Path(
     r"C:\Embedded Compiler\PureBasicCode\OpenGl Work\ArduinoBasic\PureMetalForge.exe"
 )
-COMPILER_SHA256 = "bde17c26fd5ba64ddad92dad05d429e14b7d4048d2877834ec7e1e8cf32a9335"
+COMPILER_SHA256 = "04307c6aaaa7334b3c9c8a1228bdf97de3ad1f3afdf32802b83d91e734a4328c"
 
 LOAD = 0x00400000
 STACK = 0x03000000
@@ -230,7 +230,7 @@ def fnv(data) -> int:
 
 
 def grade(cpu, rc: int) -> list[str]:
-    slots = [u64(cpu, OUT + i * 8) for i in range(73)]
+    slots = [u64(cpu, OUT + i * 8) for i in range(77)]
     failures: list[str] = []
 
     def need(name: str, got_value: int, expected: int) -> None:
@@ -293,6 +293,10 @@ def grade(cpu, rc: int) -> list[str]:
         ("513-wide texture low six width bits", 71, 1 << 26),
         ("513-wide texture upper width bits plus height/depth", 72,
          8 | (1024 << 8) | (1 << 22)),
+        ("instance-rate slot preparation", 73, 0),
+        ("instance-rate record build", 74, 0),
+        ("instance divisor", 75, 1),
+        ("base instance plus two records bounds fetch to index four", 76, 4),
     ):
         need(name, slots[index], expected)
 
@@ -366,7 +370,7 @@ def main() -> int:
             print("  " + failure)
         return 1
     print(
-        "vulkan_v3d_draw_slot_check: PASS - 72 independent properties, "
+        "vulkan_v3d_draw_slot_check: PASS - 76 independent properties, "
         f"{steps:,} executed A64 instructions"
     )
     print(f"  compiler sha256 {got}")

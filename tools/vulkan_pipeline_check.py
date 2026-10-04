@@ -620,7 +620,7 @@ def grade(cpu, rc) -> Grader:
            slot(46), ERR_UNSUPPORTED)
     g.need("a fragment shader that reads push constants through a layout "
            "without a range is refused", slot(49), ERR_ARGS)
-    g.need("a draw of two instances is refused", slot(43), ERR_UNSUPPORTED)
+    g.need("a draw of two instances records", slot(43), 0)
     g.need("a draw with one incomplete final triangle records", slot(44), 0)
     g.need("the incomplete-triangle draw submits", slot(161), 0)
     g.need("the incomplete-triangle draw's fence signals", slot(162), 0)
@@ -1976,15 +1976,15 @@ PIPELINE_MUTANTS = (
     ("a pipeline layout may declare a set layout no shader reads",
      "  If avkShUniform[fs] = 0 And avkShSample[fs] = 0 And avkLaySetCount[lay] <> 0\n",
      "  If avkShUniform[fs] = 0 And avkShSample[fs] = 0 And avkLaySetCount[lay] < 0\n"),
-    ("a draw of more than one instance is accepted",
-     "  If instanceCount <> 1 Or firstInstance <> 0\n",
-     "  If instanceCount < 0 Or firstInstance <> 0\n"),
+    ("a draw of more than one instance is refused",
+     "  If instanceCount > $FFFFFFFF Or firstInstance > $FFFFFFFF Or (instanceCount - 1) > ($FFFFFFFF - firstInstance)\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdDraw's instance range exceeds uint32",
+     "  If instanceCount <> 1 Or firstInstance > $FFFFFFFF Or (instanceCount - 1) > ($FFFFFFFF - firstInstance)\n    avkCbFail(c, #ANVIL_VK_ERR_ARGS, \"vkCmdDraw's instance range exceeds uint32"),
     ("a zero-vertex draw consumes the backend's real-draw slot",
-     "  If vertexCount = 0\n    ProcedureReturn\n  EndIf\n",
-     "  If vertexCount = 0\n    avkCbDrawCount[c] = 1\n    ProcedureReturn\n  EndIf\n"),
+     "  If vertexCount = 0 Or instanceCount = 0\n    ProcedureReturn\n  EndIf\n",
+     "  If vertexCount = 0 Or instanceCount = 0\n    avkCbDrawCount[c] = 1\n    ProcedureReturn\n  EndIf\n"),
     ("an incomplete final triangle is refused",
-     "  If vertexCount < 0\n",
-     "  If vertexCount < 0 Or (vertexCount > 0 And (vertexCount % 3) <> 0)\n"),
+     "  If vertexCount < 0 Or instanceCount < 0 Or firstInstance < 0\n",
+     "  If vertexCount < 0 Or (vertexCount > 0 And (vertexCount % 3) <> 0) Or instanceCount < 0 Or firstInstance < 0\n"),
     ("a blend equation other than source-over is accepted",
      "  If (*a\\srcColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\\dstColorBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\\colorBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD Or (*a\\srcAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_SRC_ALPHA Or (*a\\dstAlphaBlendFactor & $FFFFFFFF) <> #VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA Or (*a\\alphaBlendOp & $FFFFFFFF) <> #VK_BLEND_OP_ADD\n",
      "  If (*a\\srcColorBlendFactor & $FFFFFFFF) < 0\n"),
