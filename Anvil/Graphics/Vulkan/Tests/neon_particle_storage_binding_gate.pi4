@@ -1,0 +1,128 @@
+; Passive Pi 4 compute descriptor preflight. The host places tracked SPIR-V
+; at SB_IN; this gate creates real Vulkan buffers and set 0 descriptors.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#SB_IN = $06000000
+#SB_OUT = $06100000
+#SB_HEAP = $06200000
+Global sbIr.AvkComputeIr
+Global sbPlan.AnvilVkComputeBindingPlan
+
+Procedure sbPut(n.i, value.i)
+  PokeI(#SB_OUT + n * 8, value)
+EndProcedure
+
+Procedure.i Main()
+  Define inst.i, phys.i, dev.i, dev2.i, buffer.i, memory.i, wrong.i, wrongMemory.i, limitBuffer.i, limitMemory.i, foreignBuffer.i, foreignMemory.i
+  Define layout.i, pool.i, poolShort.i, set.i, setTry.i, stale.i, count.l, k.i, rc.i
+  Define Dim binds.VkDescriptorSetLayoutBinding[2]
+  Define dsl.VkDescriptorSetLayoutCreateInfo
+  Define poolSize.VkDescriptorPoolSize
+  Define pci.VkDescriptorPoolCreateInfo
+  Define ai.VkDescriptorSetAllocateInfo
+  Define Dim infos.VkDescriptorBufferInfo[2]
+  Define Dim writes.VkWriteDescriptorSet[2]
+  Define properties.VkPhysicalDeviceProperties
+  sbPut(0, $53425034)
+  AnvilVkTestBackendHeap(#SB_HEAP, $20000000)
+  If AnvilVkInstanceCreate(@inst) <> #VK_SUCCESS : ProcedureReturn 10 : EndIf
+  count = 1
+  If AnvilVkPhysicalEnumerate(inst, @count, @phys) <> #VK_SUCCESS : ProcedureReturn 11 : EndIf
+  If AnvilVkDeviceCreate(phys, @dev) <> #VK_SUCCESS : ProcedureReturn 12 : EndIf
+  If AnvilVkDeviceCreate(phys, @dev2) <> #VK_SUCCESS : ProcedureReturn 13 : EndIf
+  vkGetPhysicalDeviceProperties(phys, @properties)
+  sbPut(26, properties\limits\maxStorageBufferRange)
+  sbPut(27, properties\limits\maxPerStageDescriptorStorageBuffers)
+  sbPut(28, properties\limits\maxDescriptorSetStorageBuffers)
+  sbPut(29, properties\limits\minStorageBufferOffsetAlignment)
+  rc = AnvilVkSpirvComputeAdapt(PeekI(#SB_IN), PeekI(#SB_IN + 8), @sbIr)
+  sbPut(1, rc)
+  If rc <> 0 : ProcedureReturn 14 : EndIf
+
+  If AnvilVkBufferCreate(dev, 8192, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @buffer) <> #VK_SUCCESS : ProcedureReturn 20 : EndIf
+  If AnvilVkMemoryAllocate(dev, 8192, 0, @memory) <> #VK_SUCCESS : ProcedureReturn 21 : EndIf
+  If AnvilVkBufferBindMemory(dev, buffer, memory, 0) <> #VK_SUCCESS : ProcedureReturn 22 : EndIf
+  For k = 0 To 1
+    binds[k]\binding = k : binds[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    binds[k]\descriptorCount = 1 : binds[k]\stageFlags = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  dsl\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dsl\bindingCount = 2 : dsl\pBindings = @binds[0]
+  If AnvilVkDescriptorSetLayoutCreate(dev, @dsl, @layout) <> #VK_SUCCESS : ProcedureReturn 23 : EndIf
+  poolSize\type = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : poolSize\descriptorCount = 2
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\maxSets = 1 : pci\poolSizeCount = 1 : pci\pPoolSizes = @poolSize
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  If AnvilVkDescriptorPoolCreate(dev, @pci, @pool) <> #VK_SUCCESS : ProcedureReturn 24 : EndIf
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool : ai\descriptorSetCount = 1 : ai\pSetLayouts = @layout
+  If AnvilVkDescriptorSetsAllocate(dev, @ai, @set) <> #VK_SUCCESS : ProcedureReturn 25 : EndIf
+  sbPut(2, avkDpStorageOut[avkDpSlot(pool)])
+  poolSize\descriptorCount = 1 : pci\maxSets = 2
+  If AnvilVkDescriptorPoolCreate(dev, @pci, @poolShort) <> #VK_SUCCESS : ProcedureReturn 41 : EndIf
+  ai\descriptorPool = poolShort : setTry = $5A5A5A5A
+  sbPut(31, AnvilVkDescriptorSetsAllocate(dev, @ai, @setTry))
+  sbPut(32, Bool(setTry = 0 And avkDpStorageOut[avkDpSlot(poolShort)] = 0))
+  ai\descriptorPool = pool
+  infos[0]\buffer = buffer : infos[0]\offset = 0 : infos[0]\range = 768
+  infos[1]\buffer = buffer : infos[1]\offset = 4096 : infos[1]\range = 2304
+  For k = 0 To 1
+    writes[k]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    writes[k]\dstSet = set : writes[k]\dstBinding = k
+    writes[k]\descriptorCount = 1 : writes[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    writes[k]\pBufferInfo = @infos[k]
+    If AnvilVkDescriptorSetWriteOne(dev, @writes[k]) <> #VK_SUCCESS : ProcedureReturn 26 + k : EndIf
+  Next
+  rc = AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan)
+  sbPut(3, rc) : sbPut(4, sbPlan\inputBase) : sbPut(5, sbPlan\inputBytes)
+  sbPut(6, sbPlan\outputBase) : sbPut(7, sbPlan\outputBytes)
+  sbPut(8, sbPlan\outputWrittenBytes) : sbPut(9, sbPlan\items)
+  sbPut(10, AnvilVkBufferAddress(buffer))
+  If rc <> #VK_SUCCESS : ProcedureReturn 30 : EndIf
+  sbPut(11, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 2, 1, 1, @sbPlan)) ; exact group capacity
+  sbPut(12, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 2, 1, @sbPlan))
+  sbPut(13, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 0, 1, 1, @sbPlan))
+  sbPut(14, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 65536, 1, 1, @sbPlan))
+  sbPut(15, AnvilVkComputeBindingPreflight(dev2, @sbIr, set, 1, 1, 1, @sbPlan))
+  sbIr\inputBinding = 1
+  sbPut(16, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan))
+  sbIr\inputBinding = 0
+  sbIr\stores[0]\outputWord = 2
+  sbPut(17, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan))
+  sbIr\stores[0]\outputWord = 0
+  infos[0]\range = 764
+  If AnvilVkDescriptorSetWriteOne(dev, @writes[0]) <> #VK_SUCCESS : ProcedureReturn 31 : EndIf
+  sbPut(18, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan))
+  infos[0]\range = 768
+  If AnvilVkDescriptorSetWriteOne(dev, @writes[0]) <> #VK_SUCCESS : ProcedureReturn 32 : EndIf
+  infos[1]\offset = 512
+  If AnvilVkDescriptorSetWriteOne(dev, @writes[1]) <> #VK_SUCCESS : ProcedureReturn 33 : EndIf
+  sbPut(19, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan))
+  infos[1]\offset = 4096
+  If AnvilVkDescriptorSetWriteOne(dev, @writes[1]) <> #VK_SUCCESS : ProcedureReturn 34 : EndIf
+  If AnvilVkBufferCreate(dev, 4096, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, #VK_SHARING_MODE_EXCLUSIVE, @wrong) <> #VK_SUCCESS : ProcedureReturn 35 : EndIf
+  infos[0]\buffer = wrong
+  sbPut(20, AnvilVkDescriptorSetWriteOne(dev, @writes[0])) ; unbound and wrong usage
+  If AnvilVkMemoryAllocate(dev, 4096, 0, @wrongMemory) <> #VK_SUCCESS : ProcedureReturn 36 : EndIf
+  If AnvilVkBufferBindMemory(dev, wrong, wrongMemory, 0) <> #VK_SUCCESS : ProcedureReturn 37 : EndIf
+  sbPut(23, AnvilVkDescriptorSetWriteOne(dev, @writes[0])) ; bound but missing storage usage
+  If AnvilVkBufferCreate(dev, #ANVIL_VK_STORAGE_MAX_RANGE + 4, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @limitBuffer) <> #VK_SUCCESS : ProcedureReturn 38 : EndIf
+  If AnvilVkMemoryAllocate(dev, #ANVIL_VK_STORAGE_MAX_RANGE + 4, 0, @limitMemory) <> #VK_SUCCESS : ProcedureReturn 39 : EndIf
+  If AnvilVkBufferBindMemory(dev, limitBuffer, limitMemory, 0) <> #VK_SUCCESS : ProcedureReturn 40 : EndIf
+  infos[0]\buffer = limitBuffer : infos[0]\range = #ANVIL_VK_STORAGE_MAX_RANGE + 4
+  sbPut(30, AnvilVkDescriptorSetWriteOne(dev, @writes[0])) ; over published maximum
+  If AnvilVkBufferCreate(dev2, 768, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @foreignBuffer) <> #VK_SUCCESS : ProcedureReturn 42 : EndIf
+  If AnvilVkMemoryAllocate(dev2, 768, 0, @foreignMemory) <> #VK_SUCCESS : ProcedureReturn 43 : EndIf
+  If AnvilVkBufferBindMemory(dev2, foreignBuffer, foreignMemory, 0) <> #VK_SUCCESS : ProcedureReturn 44 : EndIf
+  infos[0]\buffer = foreignBuffer : infos[0]\range = 768
+  sbPut(33, AnvilVkDescriptorSetWriteOne(dev, @writes[0])) ; foreign live buffer
+  infos[0]\buffer = buffer
+  stale = buffer
+  AnvilVkBufferDestroy(dev, buffer)
+  sbPut(21, AnvilVkComputeBindingPreflight(dev, @sbIr, set, 1, 1, 1, @sbPlan))
+  sbPut(22, Bool(stale <> 0))
+  sbPut(24, AnvilVkDescriptorSetsFree(dev, pool, 1, @set))
+  sbPut(25, avkDpStorageOut[avkDpSlot(pool)])
+  ProcedureReturn 0
+EndProcedure

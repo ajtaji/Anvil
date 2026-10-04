@@ -460,8 +460,8 @@ Procedure.i AnvilVkBufferCreate(device.i, size.i, usage.i, sharing.i, *out)
   If sharing <> #VK_SHARING_MODE_EXCLUSIVE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for VK_SHARING_MODE_CONCURRENT (Anvil code -20005, unsupported sharing mode); there is one queue family on this device, so concurrent sharing has no second family to share with.")
   EndIf
-  If usage = 0 Or (usage & (~(#VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | #VK_BUFFER_USAGE_INDEX_BUFFER_BIT | #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT))) <> 0
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for a buffer usage Anvil does not implement (Anvil code -20005, unsupported usage); the implemented bits are VERTEX_BUFFER, INDEX_BUFFER, UNIFORM_BUFFER, TRANSFER_SRC and TRANSFER_DST. Storage, indirect and texel-buffer usage remain unsupported.")
+  If usage = 0 Or (usage & (~(#VK_BUFFER_USAGE_TRANSFER_SRC_BIT | #VK_BUFFER_USAGE_TRANSFER_DST_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | #VK_BUFFER_USAGE_INDEX_BUFFER_BIT | #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT))) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateBuffer was asked for an unsupported usage; storage, vertex, index, uniform and transfer usages are accepted, but indirect and texel-buffer usages are not.")
   EndIf
   s = 1
   While s <= #ANVIL_VK_MAX_BUFFERS And avkBufLive[s] <> 0 : s = s + 1 : Wend
@@ -661,7 +661,7 @@ Procedure avkCopyBufferRelease(c.i)
 EndProcedure
 
 ; ----------------------------------------------------------------------
-;  THE SEAM vk_descriptor.pbi DECLARED. Five questions about a VkBuffer,
+;  THE SEAM vk_descriptor.pbi DECLARED. Buffer questions,
 ;  answered here because the buffer objects live in this file and the
 ;  descriptor objects are included before it and must not reach into it.
 ; ----------------------------------------------------------------------
@@ -677,6 +677,13 @@ Procedure.i avkDescBufferUniform(buffer.i)
   s = avkBufSlot(buffer)
   If s = 0 : ProcedureReturn 0 : EndIf
   If (avkBufUsage[s] & #VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) = 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkDescBufferStorage(buffer.i)
+  Define s.i = avkBufSlot(buffer)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  If (avkBufUsage[s] & #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
 EndProcedure
 
@@ -696,6 +703,81 @@ Procedure.i avkDescBufferDevice(buffer.i)
   s = avkBufSlot(buffer)
   If s = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn avkBufDev[s]
+EndProcedure
+
+; Private, passive binding contract for the currently represented particle
+; compute graph. It resolves live descriptors and arithmetic only. Nothing
+; here records a dispatch or submits CSD work to the backend.
+Structure AnvilVkComputeBindingPlan Align #PB_Structure_AlignC
+  inputBase.i
+  inputBytes.i
+  outputBase.i
+  outputBytes.i
+  outputWrittenBytes.i
+  groupsX.i
+  items.i
+EndStructure
+
+Procedure.i AnvilVkComputeBindingPreflight(device.i, *ir.AvkComputeIr, set.i, groupsX.i, groupsY.i, groupsZ.i, *out.AnvilVkComputeBindingPlan)
+  Define d.i, inputBuffer.i, outputBuffer.i, inputRange.i, outputRange.i
+  Define inputOffset.i, outputOffset.i, inputBase.i, outputBase.i
+  Define items.i, inputNeed.i, outputNeed.i, k.i, source.i
+  If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  *out\inputBase = 0 : *out\inputBytes = 0
+  *out\outputBase = 0 : *out\outputBytes = 0
+  *out\outputWrittenBytes = 0 : *out\groupsX = 0 : *out\items = 0
+  d = avkDevSlot(device)
+  If d = 0 Or *ir = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If *ir\valid <> 1 Or *ir\localX <> 16 Or *ir\localY <> 1 Or *ir\localZ <> 1 Or *ir\inputStride <> 48 Or *ir\outputStride <> 4 Or *ir\inputIndexScale <> 1 Or *ir\outputIndexScale <> 36 Or *ir\inputBinding <> 0 Or *ir\outputBinding <> 1 Or *ir\storeCount <> #ANVIL_COMPUTE_MAX_STORES
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  For k = 0 To #ANVIL_COMPUTE_MAX_STORES - 1
+    If *ir\stores[k]\outputWord <> k : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+    source = *ir\stores[k]\sourceKind
+    If source = #ANVIL_COMPUTE_SOURCE_INPUT
+      If *ir\stores[k]\inputByte < 0 Or *ir\stores[k]\inputByte > 44 Or (*ir\stores[k]\inputByte % 4) <> 0 : ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED : EndIf
+    ElseIf source <> #ANVIL_COMPUTE_SOURCE_CONSTANT
+      ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+    EndIf
+  Next
+  If groupsX < 1 Or groupsX > 65535 Or groupsY <> 1 Or groupsZ <> 1 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  items = groupsX * 16
+  inputNeed = items * 48
+  outputNeed = items * 144
+  If AnvilVkDescriptorSetDeviceSlot(set) <> d Or AnvilVkDescriptorSetSchemaCount(set) <> 2 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  For k = 0 To 1
+    If AnvilVkDescriptorSetSchemaType(set, k) <> #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER Or AnvilVkDescriptorSetSchemaStages(set, k) <> #VK_SHADER_STAGE_COMPUTE_BIT
+      ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+    EndIf
+  Next
+  inputBuffer = AnvilVkDescriptorSetStorageBuffer(set, 0)
+  outputBuffer = AnvilVkDescriptorSetStorageBuffer(set, 1)
+  inputRange = AnvilVkDescriptorSetStorageRange(set, 0)
+  outputRange = AnvilVkDescriptorSetStorageRange(set, 1)
+  inputOffset = AnvilVkDescriptorSetStorageOffset(set, 0)
+  outputOffset = AnvilVkDescriptorSetStorageOffset(set, 1)
+  If inputBuffer = 0 Or outputBuffer = 0 Or inputRange < inputNeed Or outputRange < outputNeed
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If avkTransferBufferResolve(inputBuffer, d, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, inputOffset, inputRange, @inputBase) = 0 Or avkTransferBufferResolve(outputBuffer, d, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, outputOffset, outputRange, @outputBase) = 0
+    ProcedureReturn #ANVIL_VK_ERR_HANDLE
+  EndIf
+  ; Reject arithmetic wrap and all descriptor-range aliasing, even where the
+  ; presently accessed subspans would happen to be disjoint.
+  If inputBase > $7FFFFFFFFFFFFFFF - inputRange Or outputBase > $7FFFFFFFFFFFFFFF - outputRange
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  If inputBase < outputBase + outputRange And outputBase < inputBase + inputRange
+    ProcedureReturn #ANVIL_VK_ERR_ARGS
+  EndIf
+  *out\inputBase = inputBase
+  *out\inputBytes = inputRange
+  *out\outputBase = outputBase
+  *out\outputBytes = outputRange
+  *out\outputWrittenBytes = outputNeed
+  *out\groupsX = groupsX
+  *out\items = items
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 ; ======================================================================
