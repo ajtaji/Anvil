@@ -72,11 +72,11 @@ REQUIRED_CALLS = ("NeonRebindSurface", "NeonFrameBegin", "NeonFrameEnd",
                   "Neon_SurfaceRotation", "Neon_CapacityPhysicalW",
                   "Neon_CapacityPhysicalH")
 REQUIRED_DESCRIPTOR_CONTRACT = (
-    "If (*d\\uniformBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)",
+    "If (*d\\uniformBase - avkV3dWindowBase) > (avkV3dWindowBytes - 16)\n",
     "V3dCacheRange(*d\\uniformBase, 16)",
 )
 REQUIRED_SAMPLE_MASK_CONTRACT = (
-    "If *d\\sampleMask <> 0",
+    "If *d\\sampleMask <> 0\n      V3dClGlShaderState",
     "V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\\vertexCount, *d\\firstVertex)",
 )
 REQUIRED_BLEND_CONTRACT = (
@@ -102,9 +102,8 @@ FORBIDDEN_TOKENS = ("PokeN(", "PokeI(", "PokeL(", "PokeA(", "DspCopy", "DmaCopy"
 MUTANTS = (
     (
         "the backend claims a device with the engine down",
-        "  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf\n"
-        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER\n",
-        "  ProcedureReturn #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER\n",
+        "  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf\n  caps = #ANVIL_VK_CAP_DEVICE",
+        "  caps = #ANVIL_VK_CAP_DEVICE",
     ),
     (
         "vkCreateDevice no longer checks that the engine is initialised",
@@ -138,23 +137,23 @@ MUTANTS = (
     ),
     (
         "source-over loses the CFG_BITS master blend bit",
-        "V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))",
-        "V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))",
+        "\n      V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS) | (1 << 19))",
+        "\n      V3dClCfgBits(V3dCfgBitsWord(#AVK_V3D_CFG_FWD, #AVK_V3D_CFG_REV, #AVK_V3D_CFG_CW, #AVK_V3D_CFG_DEPTH_ALWAYS))",
     ),
     (
         "source-over no longer enables render target zero",
-        "      V3dClBlendEnables(1)\n",
-        "      V3dClBlendEnables(0)\n",
+        "\n      V3dClBlendEnables(1)\n",
+        "\n      V3dClBlendEnables(0)\n",
     ),
     (
         "source-over swaps its source and destination color factors",
-        "V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)",
-        "V3dClBlendCfg(1, #V3D_BF_SRC_ALPHA, #V3D_BF_INV_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)",
+        "\n      V3dClBlendCfg(1, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)",
+        "\n      V3dClBlendCfg(1, #V3D_BF_SRC_ALPHA, #V3D_BF_INV_SRC_ALPHA, #V3D_BM_ADD, #V3D_BF_INV_SRC_ALPHA, #V3D_BF_SRC_ALPHA, #V3D_BM_ADD)",
     ),
     (
         "a disabled pipeline inherits Neon's enabled render target",
-        "      V3dClBlendEnables(0)\n",
-        "      V3dClBlendEnables(1)\n",
+        "\n      V3dClBlendEnables(0)\n",
+        "\n      V3dClBlendEnables(1)\n",
     ),
     (
         "a HOST_COHERENT vertex range reaches the GPU without cache maintenance",
@@ -187,8 +186,8 @@ DYNAMIC_MUTANTS = (
     (
         "a geometry change is accepted during an active frame",
         NEON_CORE,
-        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_inFrame <> 0\n",
-        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_inFrame < 0\n",
+        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_hwInFrame <> 0\n",
+        "  Protected plan.V3dRenderPlan\n\n  If gNeonReady = 0\n    neon_err = #NEON_ERR_ARENA\n    ProcedureReturn #NEON_ERR_ARENA\n  EndIf\n  If neon_hwInFrame < 0\n",
     ),
     (
         "a render target outside the mapped span reaches V3D",
@@ -217,7 +216,7 @@ DYNAMIC_MUTANTS = (
     (
         "a successful rebind leaves stale coordinate tables",
         NEON_CORE,
-        "  neon_BuildCoordinateTables(pw, ph, cx, cy)\n",
+        "  neon_SelectCoordinateTables(pw, ph, cx, cy)\n",
         "  ; coordinate tables deliberately left stale\n",
     ),
 )
@@ -408,9 +407,16 @@ def source_contract(text: str) -> list[str]:
     for snippet in REQUIRED_SAMPLE_MASK_CONTRACT:
         if snippet not in text:
             failures.append("the sample-mask suppression contract lost: " + snippet)
-    for snippet in REQUIRED_BLEND_CONTRACT:
-        if snippet not in text:
-            failures.append("the normalized blend contract lost: " + snippet)
+    for procedure in ("avkV3dSubmitLegacyDraw", "avkBackendSubmitDraw"):
+        start = text.find("Procedure.i " + procedure + "(")
+        end = text.find("EndProcedure", start)
+        body = text[start:end] if start >= 0 and end > start else ""
+        blend_start = body.find("If *d\\blendMode = #ANVIL_VK_BLEND_SRC_OVER")
+        blend_end = body.find("EndIf", blend_start)
+        blend = body[blend_start:blend_end] if blend_start >= 0 and blend_end > blend_start else ""
+        for snippet in REQUIRED_BLEND_CONTRACT:
+            if snippet not in blend:
+                failures.append(procedure + " normalized blend contract lost: " + snippet)
     for snippet in REQUIRED_HOST_COHERENT_BACKEND:
         if snippet not in text:
             failures.append("the HOST_COHERENT submit contract lost: " + snippet)
@@ -454,16 +460,22 @@ def source_contract(text: str) -> list[str]:
             failures.append("the backend holds a processor-side fallback token " + token)
 
     neon = NEON_CORE.read_text(encoding="utf-8")
-    begin = neon.find("Procedure.i NeonRebindSurface(")
+    begin = neon.find("Procedure.i NeonHardwareRebindSurface(")
     end = neon.find("EndProcedure", begin)
     rebind = neon[begin:end] if begin >= 0 and end > begin else ""
+    begin = neon.find("Procedure.i NeonRebindSurface(")
+    end = neon.find("EndProcedure", begin)
+    public_rebind = neon[begin:end] if begin >= 0 and end > begin else ""
+    if ("If neon_inFrame <> 0" not in public_rebind
+            or "NeonHardwareRebindSurface(base, w, h, pitch, bytes, outFmt, rot)" not in public_rebind):
+        failures.append("the public rebind no longer guards an active frame or delegates to the transactional hardware rebind")
     dynamic_required = (
-        "If neon_inFrame <> 0",
+        "If neon_hwInFrame <> 0",
         "mappedOk = NeonGpuRangeMapped(base, bytes)",
         "If pw > neon_capPhysW Or ph > neon_capPhysH",
         "If plan\\tileAllocBytes > neon_tallocBytes Or plan\\tileStateBytes > neon_tstateBytes",
         "rollbackRc = V3dRenderBegin(oldPw, oldPh, oldFmt)",
-        "neon_BuildCoordinateTables(pw, ph, cx, cy)",
+        "neon_SelectCoordinateTables(pw, ph, cx, cy)",
     )
     for snippet in dynamic_required:
         if snippet not in rebind:
@@ -479,7 +491,7 @@ def source_contract(text: str) -> list[str]:
         if snippet not in mapped:
             failures.append("the mapped-range contract lost: " + snippet)
     planned = rebind.find("r = V3dRenderBegin(pw, ph, outFmt)")
-    tabled = rebind.find("neon_BuildCoordinateTables(pw, ph, cx, cy)")
+    tabled = rebind.find("neon_SelectCoordinateTables(pw, ph, cx, cy)")
     published = rebind.find("neon_fb = base")
     if planned < 0 or tabled < planned or published < tabled:
         failures.append("the new surface is published before V3D and its coordinate tables are complete")
