@@ -251,10 +251,20 @@ recompiled both routes together and passed four 10,000-particle moving
 frames on Pi 4 build 244. CPU and CSD median frames were 454,115 and
 389,334 µs respectively, a 64,781 µs (14.3%) reduction in that workload.
 The V3D 4.2 [instanced packet encoding proof](../../../docs/evidence/neon-instanced-packets-pi4-20261004/README.md)
-is a first step toward the desktop engine's GPU instancing. It only checks
-command-list bytes in RAM; Vulkan still rejects multiple instances and
-per-instance vertex bindings, so it does not change the opt-in particle
-route or its measured speed.
+checked command-list bytes in RAM. The Pi 4 Vulkan source now records
+`instanceCount` and `firstInstance`, accepts vertex and instance-rate bindings,
+and emits non-indexed or indexed V3D instanced packets. The path compiles and
+has desk validation, but it has not yet passed a Pi 4 render with distinct
+pixels from two instances. The returning
+`RaspberryPi4/Examples/Diagnostics/vulkanInstancedTriangleProof.pi4`
+diagnostic is prepared for that proof. No instanced particle route or
+throughput claim follows from packet encoding or desk checks alone.
+
+The opt-in particle producer uses Pi 4 `V3dCsd*` calls directly and is separate
+from public Vulkan compute. `vkCmdDispatch`, compute pipelines, storage-buffer
+descriptors and a compute queue capability are absent, so an application
+cannot express this producer as a Vulkan compute command. The measured CSD
+gain above applies only to that private Pi 4 producer.
 
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy

@@ -19,8 +19,11 @@ under a confirmed 15-second deadman. It returned `x0=15`, matching all
 prompt, and reported the deadman off. The [run report](report.json) and
 [screen capture](screen.png) are preserved here.
 
-This establishes packet bytes on Pi 4 silicon only. Vulkan
-`vkCmdDraw`/`vkCmdDrawIndexed` still reject multiple instances and
-`VK_VERTEX_INPUT_RATE_INSTANCE`; the packet additions do not make
-Neon's instanced particle renderer available or accelerated yet. A GPU
-pixel proof with distinct per-instance data is still required.
+This establishes packet bytes on Pi 4 silicon only. Since this run, the Pi 4
+Vulkan source has gained multiple-instance `vkCmdDraw`/`vkCmdDrawIndexed`
+recording, instance-rate vertex bindings and V3D instanced packet emission.
+That path compiles and has desk validation. The returning
+`RaspberryPi4/Examples/Diagnostics/vulkanInstancedTriangleProof.pi4`
+diagnostic is prepared, but a GPU pixel proof with distinct per-instance
+data has not yet been recorded. The packet result above therefore does not
+establish rendered instancing or particle throughput.
