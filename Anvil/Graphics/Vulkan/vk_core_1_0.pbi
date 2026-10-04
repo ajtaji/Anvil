@@ -794,6 +794,7 @@ EndStructure
 #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO = 26
 #VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO = 27
 #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO = 28
+#VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO = 29
 #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO = 30
 #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO = 37
 #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO = 38
@@ -1100,6 +1101,16 @@ Structure VkGraphicsPipelineCreateInfo Align #PB_Structure_AlignC
   layout.i
   renderPass.i
   subpass.l
+  basePipelineHandle.i
+  basePipelineIndex.l
+EndStructure
+
+Structure VkComputePipelineCreateInfo Align #PB_Structure_AlignC
+  sType.l
+  *pNext
+  flags.l
+  stage.VkPipelineShaderStageCreateInfo
+  layout.i
   basePipelineHandle.i
   basePipelineIndex.l
 EndStructure

@@ -60,6 +60,10 @@ Procedure.i avkBackendPrepare()
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+Procedure.i avkBackendComputeCanLower(*ir)
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i avkBackendHeapBase()
   ProcedureReturn avkSwHeap
 EndProcedure

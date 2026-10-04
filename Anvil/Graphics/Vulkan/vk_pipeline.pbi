@@ -104,6 +104,8 @@ Global Dim avkShGen.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShDev.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShIr.AvkSpirvIrStorage[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShIrGen.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShComputeIr.AvkComputeIr[#ANVIL_VK_MAX_SHADER_MODULES + 1]
+Global Dim avkShComputeGen.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShIrLive.a[193]
 Global Dim avkShStage.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
 Global Dim avkShWords.i[#ANVIL_VK_MAX_SHADER_MODULES + 1]
@@ -180,6 +182,8 @@ Global Dim avkFbInFlight.i[#ANVIL_VK_MAX_FRAMEBUFFERS + 1]
 Global Dim avkPipeLive.a[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeGen.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeDev.i[#ANVIL_VK_MAX_PIPELINES + 1]
+Global Dim avkPipeKind.i[#ANVIL_VK_MAX_PIPELINES + 1] ; 0 graphics, 1 compute
+Global Dim avkPipeComputeIr.AvkComputeIr[#ANVIL_VK_MAX_PIPELINES + 1]
 ; A pipeline owns the complete layout compatibility signature it was created
 ; against. It does not chase a pipeline-layout slot that may be destroyed and
 ; reused before an already-created pipeline is submitted.
@@ -1076,10 +1080,34 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
   Define rc.i
   Define k.i
   Define base.i
+  Define compute.AvkComputeIr
   If *out = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
   PokeI(*out, #VK_NULL_HANDLE)
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  ; Compute's bounded adapter owns its complete typed dataflow. It is tried
+  ; before the older graphics walker, which deliberately rejects GLCompute.
+  rc = AnvilVkSpirvComputeAdapt(*code, bytes, @compute)
+  If rc = #ANVIL_IR_OK
+    s = 1
+    While s <= #ANVIL_VK_MAX_SHADER_MODULES And avkShLive[s] <> 0 : s = s + 1 : Wend
+    If s > #ANVIL_VK_MAX_SHADER_MODULES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+    k = 0
+    While k < SizeOf(AvkComputeIr)
+      PokeA(@avkShComputeIr[s] + k, PeekA(@compute + k))
+      k = k + 1
+    Wend
+    avkShComputeIr[s]\valid = 0
+    avkShIr[s]\valid = 0 : avkShIrGen[s] = 0
+    avkShGen[s] = avkNextGen(avkShGen[s])
+    avkShDev[s] = d : avkShStage[s] = #SpvExecutionModelGLCompute
+    avkShWords[s] = bytes / 4 : avkShInstr[s] = 0
+    avkShComputeGen[s] = avkShGen[s]
+    avkShComputeIr[s]\valid = 1
+    avkShLive[s] = 1
+    PokeI(*out, avkToken(#ANVIL_VK_TYPE_SHADER_MODULE, s, avkShGen[s]))
+    ProcedureReturn #VK_SUCCESS
+  EndIf
   rc = AnvilVkSpirvWalkIr(*code, bytes)
   If rc <> #ANVIL_VK_OK : ProcedureReturn rc : EndIf
   s = 1
@@ -1090,6 +1118,7 @@ Procedure.i AnvilVkShaderModuleCreate(device.i, *code, bytes.i, *out)
     ProcedureReturn avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateShaderModule could not retain the accepted SPIR-V as verified typed IR (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no shader module was published and the adapter's last-error fields identify the semantic record that failed.")
   EndIf
   avkShGen[s] = avkNextGen(avkShGen[s])
+  avkShComputeIr[s]\valid = 0 : avkShComputeGen[s] = 0
   avkShDev[s] = d
   If avkShIr[s]\module\stage = #ANVIL_IR_STAGE_VERTEX
     avkShStage[s] = 0
@@ -1160,7 +1189,16 @@ Procedure AnvilVkShaderModuleDestroy(device.i, module.i)
   EndIf
   avkShIr[s]\valid = 0
   avkShIrGen[s] = 0
+  avkShComputeIr[s]\valid = 0
+  avkShComputeGen[s] = 0
   avkShLive[s] = 0
+EndProcedure
+
+Procedure.i AnvilVkShaderModuleComputeIr(module.i)
+  Define s.i = avkShSlot(module)
+  If s = 0 : ProcedureReturn 0 : EndIf
+  If avkShStage[s] <> #SpvExecutionModelGLCompute Or avkShComputeGen[s] <> avkShGen[s] Or avkShComputeIr[s]\valid <> 1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn @avkShComputeIr[s]
 EndProcedure
 
 Procedure.i AnvilVkShaderModuleIr(module.i)
@@ -2126,6 +2164,75 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
     ProcedureReturn rc
   EndIf
   avkPipeGen[s] = avkNextGen(avkPipeGen[s])
+  avkPipeKind[s] = 0 : avkPipeComputeIr[s]\valid = 0
+  avkPipeLive[s] = 1
+  PokeI(*out, avkToken(#ANVIL_VK_TYPE_PIPELINE, s, avkPipeGen[s]))
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Compute pipeline creation is currently an immutable, CPU-side object.
+; Its backend must attest that it can lower the exact typed graph; dispatch
+; and queue submission remain unavailable until they own code and lifetimes.
+Procedure.i AnvilVkComputePipelineCreate(device.i, *ci.VkComputePipelineCreateInfo, *out)
+  Define d.i, lay.i, sh.i, s.i, k.i
+  Define *ir.AvkComputeIr
+  Define *st.VkPipelineShaderStageCreateInfo
+  If *out = 0 Or *ci = 0 : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  PokeI(*out, #VK_NULL_HANDLE)
+  d = avkDevSlot(device)
+  If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If (*ci\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines needs VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO.")
+  EndIf
+  If *ci\pNext <> 0 Or (*ci\flags & $FFFFFFFF) <> 0 Or *ci\basePipelineHandle <> #VK_NULL_HANDLE Or (*ci\basePipelineIndex & $FFFFFFFF) <> $FFFFFFFF
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateComputePipelines does not support pNext, creation flags or derivative pipelines.")
+  EndIf
+  *st = @*ci\stage
+  If (*st\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO Or (*st\stage & $FFFFFFFF) <> #VK_SHADER_STAGE_COMPUTE_BIT
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines requires one compute shader stage with the correct sType.")
+  EndIf
+  If *st\pNext <> 0 Or (*st\flags & $FFFFFFFF) <> 0 Or *st\pSpecializationInfo <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateComputePipelines does not support shader-stage extensions, flags or specialization constants.")
+  EndIf
+  If *st\pName = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines requires entry point main.") : EndIf
+  If PeekA(*st\pName) <> 109 Or PeekA(*st\pName + 1) <> 97 Or PeekA(*st\pName + 2) <> 105 Or PeekA(*st\pName + 3) <> 110 Or PeekA(*st\pName + 4) <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateComputePipelines supports only entry point main.")
+  EndIf
+  sh = avkShSlot(*st\module)
+  If sh = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkShDev[sh] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  *ir = AnvilVkShaderModuleComputeIr(*st\module)
+  If *ir = 0 : ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines needs a live GLCompute shader module with retained typed IR.") : EndIf
+  lay = avkLaySlot(*ci\layout)
+  If lay = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkLayDev[lay] <> d : ProcedureReturn #ANVIL_VK_ERR_OWNER : EndIf
+  If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] <> 2 Or avkLayPushBytes[lay] <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines requires set zero with exactly two storage buffers and no push constants.")
+  EndIf
+  For k = 0 To 1
+    If avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER Or avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> #VK_SHADER_STAGE_COMPUTE_BIT
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateComputePipelines requires compute-stage storage buffers at bindings zero and one.")
+    EndIf
+  Next
+  If avkBackendComputeCanLower(*ir) = 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateComputePipelines backend cannot lower this typed compute graph.")
+  EndIf
+  s = 1
+  While s <= #ANVIL_VK_MAX_PIPELINES And avkPipeLive[s] <> 0 : s = s + 1 : Wend
+  If s > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #VK_ERROR_TOO_MANY_OBJECTS : EndIf
+  k = 0
+  While k < SizeOf(AvkComputeIr)
+    PokeA(@avkPipeComputeIr[s] + k, PeekA(*ir + k))
+    k = k + 1
+  Wend
+  avkPipeDev[s] = d : avkPipeKind[s] = 1
+  avkPipeSetCount[s] = 1 : avkPipeBindingCount[s] = 2 : avkPipePushBytes[s] = 0
+  For k = 0 To 1
+    avkPipeBindingType[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    avkPipeBindingStages[(s * #ANVIL_VK_MAX_SET_BINDINGS) + k] = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  avkPipeCodeMem[s] = 0 : avkPipeCodeBase[s] = 0 : avkPipeCodeBytes[s] = 0
+  avkPipeGen[s] = avkNextGen(avkPipeGen[s])
   avkPipeLive[s] = 1
   PokeI(*out, avkToken(#ANVIL_VK_TYPE_PIPELINE, s, avkPipeGen[s]))
   ProcedureReturn #VK_SUCCESS
@@ -2150,12 +2257,13 @@ Procedure AnvilVkPipelineDestroy(device.i, pipeline.i)
     avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyPipeline was called while a submitted command buffer still uses this pipeline (Anvil code -20004, resource in use); nothing was destroyed. Wait on the submission's fence, or call vkDeviceWaitIdle, first.")
     ProcedureReturn
   EndIf
-  avkBackendPipelineRelease(s)
+  If avkPipeKind[s] = 0 : avkBackendPipelineRelease(s) : EndIf
   If avkPipeCodeMem[s] <> 0
     avkInternalFree(avkPipeCodeMem[s])
     avkPipeCodeMem[s] = 0
   EndIf
   avkPipeLive[s] = 0
+  avkPipeKind[s] = 0 : avkPipeComputeIr[s]\valid = 0
   avkPipeTopology[s] = 0
   avkPipeDynamicViewport[s] = 0
   avkPipeDynamicScissor[s] = 0
@@ -2496,6 +2604,10 @@ Procedure AnvilVkCmdBindPipeline(commandBuffer.i, bindPoint.i, pipeline.i)
   p = avkPipeSlot(pipeline)
   If p = 0
     avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "vkCmdBindPipeline was given a VkPipeline handle that is not live (Anvil code -20002, stale or foreign handle); the command buffer is now invalid and vkEndCommandBuffer will say so.")
+    ProcedureReturn
+  EndIf
+  If avkPipeKind[p] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdBindPipeline graphics bind point requires a graphics pipeline.")
     ProcedureReturn
   EndIf
   If avkPipeDev[p] <> avkPoolDev[avkCmdPool[c]]

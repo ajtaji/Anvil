@@ -1657,6 +1657,11 @@ Procedure.i vkCreateGraphicsPipelines(device.i, pipelineCache.i, createInfoCount
   ProcedureReturn firstError
 EndProcedure
 
+Procedure.i vkCreateComputePipelines(device.i, pipelineCache.i, createInfoCount.i, *pCreateInfos.VkComputePipelineCreateInfo, *pAllocator, *pPipelines)
+  If *pPipelines <> 0 And createInfoCount > 0 : PokeI(*pPipelines, #VK_NULL_HANDLE) : EndIf
+  ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateComputePipelines is unavailable until a compute-capable queue, dispatch recording and submission are implemented.")
+EndProcedure
+
 Procedure vkDestroyPipeline(device.i, pipeline.i, *pAllocator)
   If avkNoAllocator(*pAllocator, 0) <> #VK_SUCCESS
     ProcedureReturn

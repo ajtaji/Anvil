@@ -2133,3 +2133,184 @@ EndProcedure
 Procedure.i AnvilVkV3dLastCacheMergedRangeCount()
   ProcedureReturn avkV3dLastCacheMergedRanges
 EndProcedure
+
+; Bounded Pi 4 V3D 4.2 compute lowering for the passive particle IR.
+; This emits code and uniforms only; it does not publish a pipeline or
+; submit work.
+
+#AVK_V3D_COMPUTE_LOAD_VEC4 = $FFFFFF7C
+#AVK_V3D_COMPUTE_UNIFORM_BYTES = 32
+#AVK_V3D_COMPUTE_CODE_BYTES = 1296
+#AVK_V3D_COMPUTE_ERR = -23501
+
+Structure AnvilVkV3dComputeCode Align #PB_Structure_AlignC
+  codeBytes.i
+  uniformBytes.i
+EndStructure
+
+Procedure.i avkV3dComputeLoad4(addressRf.i, firstRf.i)
+  Protected r.i, k.i
+  V3dQpuReset()
+  r = V3dQpuSig(#V3DQ_SIG_THRSW)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  V3dQpuAdd(#V3DQ_A_OR, #V3DQ_WADDR_TMUAU, 1, #V3DQ_MUX_A, #V3DQ_MUX_A)
+  V3dQpuRaddr(addressRf, 0)
+  r = V3dQpuEmit()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNop()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  For k = 0 To 3
+    r = V3dQpuNopSig(#V3DQ_SIG_LDTMU, firstRf + k, 0)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  Next
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+Procedure.i avkV3dComputeStoreWord(sourceRf.i)
+  Protected r.i
+  r = V3dQpuMov(#V3DQ_WADDR_TMUD, 1, #V3DQ_MUX_A, sourceRf)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuMov(#V3DQ_WADDR_TMUA, 1, #V3DQ_MUX_A, 14)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  ProcedureReturn V3dQpuAddImm(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, 14, 4)
+EndProcedure
+
+; This predicate has no writes or QPU state changes, so pipeline creation can
+; refuse a graph before any code allocation or command recording.
+Procedure.i AnvilVkV3dComputeCanLower(*ir.AvkComputeIr)
+  Protected k.i, constantBits.i, haveConstant.i
+  If *ir = 0 : ProcedureReturn 0 : EndIf
+  If *ir\valid <> 1 Or *ir\localX <> 16 Or *ir\localY <> 1 Or *ir\localZ <> 1 Or *ir\inputStride <> 48 Or *ir\outputStride <> 4 Or *ir\inputIndexScale <> 1 Or *ir\outputIndexScale <> 36 Or *ir\inputBinding <> 0 Or *ir\outputBinding <> 1 Or *ir\storeCount <> #ANVIL_COMPUTE_MAX_STORES
+    ProcedureReturn 0
+  EndIf
+  haveConstant = 0 : constantBits = 0
+  For k = 0 To #ANVIL_COMPUTE_MAX_STORES - 1
+    If *ir\stores[k]\outputWord <> k : ProcedureReturn 0 : EndIf
+    If *ir\stores[k]\sourceKind = #ANVIL_COMPUTE_SOURCE_INPUT
+      If *ir\stores[k]\inputByte < 0 Or *ir\stores[k]\inputByte > 44 Or (*ir\stores[k]\inputByte % 4) <> 0
+        ProcedureReturn 0
+      EndIf
+    ElseIf *ir\stores[k]\sourceKind = #ANVIL_COMPUTE_SOURCE_CONSTANT
+      If haveConstant <> 0 And *ir\stores[k]\constantBits <> constantBits
+        ProcedureReturn 0
+      EndIf
+      haveConstant = 1 : constantBits = *ir\stores[k]\constantBits
+    Else
+      ProcedureReturn 0
+    EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; The represented class has 16 lanes, 48 input bytes per invocation and 36
+; ordered output words. Up to one distinct literal is carried by uniform 2.
+; Refuse other IR before the first code byte or uniform word is changed.
+Procedure.i AnvilVkV3dComputeLower(*ir.AvkComputeIr, codeAddr.i, codeCapacity.i, uniformAddr.i, uniformCapacity.i, inputBase.i, inputBytes.i, outputBase.i, outputBytes.i, *out.AnvilVkV3dComputeCode)
+  Protected r.i, k.i, sourceRf.i, constantBits.i
+  If *out = 0 : ProcedureReturn #AVK_V3D_COMPUTE_ERR : EndIf
+  *out\codeBytes = 0 : *out\uniformBytes = 0
+  If AnvilVkV3dComputeCanLower(*ir) = 0 Or codeAddr <= 0 Or (codeAddr % 8) <> 0 Or codeCapacity < #AVK_V3D_COMPUTE_CODE_BYTES Or uniformAddr <= 0 Or (uniformAddr % 4) <> 0 Or uniformCapacity < #AVK_V3D_COMPUTE_UNIFORM_BYTES
+    ProcedureReturn #AVK_V3D_COMPUTE_ERR
+  EndIf
+  If codeAddr > $100000000 - #AVK_V3D_COMPUTE_CODE_BYTES Or uniformAddr > $100000000 - #AVK_V3D_COMPUTE_UNIFORM_BYTES
+    ProcedureReturn #AVK_V3D_COMPUTE_ERR
+  EndIf
+  If inputBase <= 0 Or inputBase > $FFFFFFFF Or inputBytes < 1 Or inputBytes > $100000000 - inputBase Or outputBase <= 0 Or outputBase > $FFFFFFFF Or outputBytes < 1 Or outputBytes > $100000000 - outputBase Or (inputBase % 4) <> 0 Or (outputBase % 4) <> 0
+    ProcedureReturn #AVK_V3D_COMPUTE_ERR
+  EndIf
+  If avkV3dCsdInside(codeAddr, codeCapacity) = 0 Or avkV3dCsdInside(uniformAddr, uniformCapacity) = 0 Or avkV3dCsdInside(inputBase, inputBytes) = 0 Or avkV3dCsdInside(outputBase, outputBytes) = 0
+    ProcedureReturn #AVK_V3D_COMPUTE_ERR
+  EndIf
+  If avkV3dCsdOverlap(codeAddr, codeCapacity, uniformAddr, uniformCapacity) <> 0 Or avkV3dCsdOverlap(codeAddr, codeCapacity, inputBase, inputBytes) <> 0 Or avkV3dCsdOverlap(codeAddr, codeCapacity, outputBase, outputBytes) <> 0 Or avkV3dCsdOverlap(uniformAddr, uniformCapacity, inputBase, inputBytes) <> 0 Or avkV3dCsdOverlap(uniformAddr, uniformCapacity, outputBase, outputBytes) <> 0 Or avkV3dCsdOverlap(inputBase, inputBytes, outputBase, outputBytes) <> 0
+    ProcedureReturn #AVK_V3D_COMPUTE_ERR
+  EndIf
+  constantBits = 0
+  For k = 0 To #ANVIL_COMPUTE_MAX_STORES - 1
+    If *ir\stores[k]\sourceKind = #ANVIL_COMPUTE_SOURCE_CONSTANT
+      constantBits = *ir\stores[k]\constantBits
+      Break
+    EndIf
+  Next
+
+  r = V3dQpuProgramBegin(codeAddr, codeCapacity)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 8, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 9, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 15, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 6, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuNopSig(#V3DQ_SIG_LDUNIFRF, 7, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd0(#V3DQ_A_EIDX, 10, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_AND, 6, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 0, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 6, 0, #V3DQ_MUX_A, 6, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 10, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 10, 6)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 11, 0, #V3DQ_MUX_A, 10, 5)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 12, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 11, 12)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 12, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 8, 11)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 13, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 12, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 11, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 13, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = avkV3dComputeLoad4(12, 0)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = avkV3dComputeLoad4(13, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 13, 0, #V3DQ_MUX_A, 10, 7)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAddImm(#V3DQ_A_SHL, 14, 0, #V3DQ_MUX_A, 10, 4)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 13)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuAdd2(#V3DQ_A_ADD, 14, 0, #V3DQ_MUX_A, #V3DQ_MUX_B, 14, 9)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = avkV3dComputeLoad4(11, 8)
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  For k = 0 To #ANVIL_COMPUTE_MAX_STORES - 1
+    sourceRf = 15
+    If *ir\stores[k]\sourceKind = #ANVIL_COMPUTE_SOURCE_INPUT
+      sourceRf = *ir\stores[k]\inputByte / 4
+    EndIf
+    r = avkV3dComputeStoreWord(sourceRf)
+    If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    If (k % 6) = 5
+      r = V3dQpuAdd0(#V3DQ_A_TMUWT, #V3DQ_WADDR_NOP, 1)
+      If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+    EndIf
+  Next
+  r = V3dQpuThreadEnd()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  r = V3dQpuProgramEnd()
+  If r <> #V3DQ_OK : ProcedureReturn r : EndIf
+  If V3dQpuProgramBytes() <> #AVK_V3D_COMPUTE_CODE_BYTES : ProcedureReturn #AVK_V3D_COMPUTE_ERR : EndIf
+  PokeL(uniformAddr + 0, inputBase)
+  PokeL(uniformAddr + 4, outputBase)
+  PokeL(uniformAddr + 8, constantBits)
+  PokeL(uniformAddr + 12, $0000FFFF)
+  PokeL(uniformAddr + 16, 16)
+  PokeL(uniformAddr + 20, #AVK_V3D_COMPUTE_LOAD_VEC4)
+  PokeL(uniformAddr + 24, #AVK_V3D_COMPUTE_LOAD_VEC4)
+  PokeL(uniformAddr + 28, #AVK_V3D_COMPUTE_LOAD_VEC4)
+  *out\codeBytes = V3dQpuProgramBytes()
+  *out\uniformBytes = #AVK_V3D_COMPUTE_UNIFORM_BYTES
+  ProcedureReturn #V3DQ_OK
+EndProcedure
+
+; Compute-pipeline capability is gated by this exact backend lowering class.
+Procedure.i avkBackendComputeCanLower(*ir.AvkComputeIr)
+  ProcedureReturn AnvilVkV3dComputeCanLower(*ir)
+EndProcedure

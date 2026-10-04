@@ -208,6 +208,11 @@ Procedure.i AnvilVkSpirvComputeAdapt(*code, bytes.i, *out.AvkComputeIr)
         If (wc < 6) | (a <> #SpvExecutionModelGLCompute) | (Not avkComputeId(b,bound)) | (entrySeen) | (functionSeen)
          ProcedureReturn #ANVIL_COMPUTE_ERR
          EndIf
+        ; Pipeline creation currently names only main. Require the module's
+        ; actual NUL-terminated entry name, not merely a caller-supplied name.
+        If wc <> 6 Or avkComputeWord(*code,pos+3) <> $6E69616D Or avkComputeWord(*code,pos+4) <> 0
+         ProcedureReturn #ANVIL_COMPUTE_ERR
+        EndIf
         nameEnd=3
         While nameEnd < wc
           value=avkComputeWord(*code,pos+nameEnd)

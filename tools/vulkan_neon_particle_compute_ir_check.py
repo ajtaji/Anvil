@@ -169,6 +169,7 @@ def main() -> int:
               "GlobalInvocationID.x scale 1, LocalSize 16x1x1")
 
         reject = [
+            ("entry point foo", mutate(blob, 15, lambda x: x[:2] == [5, 4], 2, 0x006F6F66)),
             ("LocalSize", mutate(blob, 16, lambda x: x[:2] == [4, 17], 2, 8)),
             ("input member offset", mutate(blob, 72, lambda x: x[:3] == [21, 1, 35], 3, 20)),
             ("input array stride", mutate(blob, 71, lambda x: x[:2] == [22, 6], 2, 64)),
@@ -203,7 +204,7 @@ def main() -> int:
         got, changed = execute(image, image_path, reflected)
         check_positive(got, changed, {0: 4, 18: 4})
         print("reflect: changed source component appears in stores 0 and 18")
-    print("compute IR gate: PASS (20 cases, all 36 ordered stores checked)")
+    print(f"compute IR gate: PASS ({len(reject) + 2} cases, all 36 ordered stores checked)")
     return 0
 
 
