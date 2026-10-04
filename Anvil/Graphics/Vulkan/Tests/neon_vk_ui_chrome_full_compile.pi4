@@ -1,0 +1,36 @@
+; Full Pi 4 composition compile gate for the drawing-only UI chrome port.
+; It links the real Neon, Vulkan backend, Chrome and float-coordinate port.
+; Compile only: Main intentionally has no runtime initialization or cleanup.
+
+EnableFloatingPoint
+
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_ui_chrome_port.pi4"
+
+Procedure.i Main()
+  Protected rc.i
+  rc = NeonVkPortCanvas(800, 600, 800, 600)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  NeonVkUiFontSet(#NEON_FONT_UI)
+  rc = NeonVkUiPanel(10.0, 20.0, 200.0, 80.0, "Panel", 0.353, 0.741, 0.816, 26.0)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiButtonDraw(20.0, 50.0, 80.0, 30.0, "OK", 1, 1, 0.5)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  ProcedureReturn NeonVkUiTextRight(200.0, 20.0, "READY", 0.863, 0.863, 0.863, 1.0)
+EndProcedure

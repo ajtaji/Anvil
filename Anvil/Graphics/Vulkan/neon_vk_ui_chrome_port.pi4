@@ -1,0 +1,135 @@
+; Drawing-only port of GlUIChrome's primitive, panel and button surfaces.
+; Include after neon_vk_port.pi4. The caller configures NeonVkPortCanvas,
+; selects the Vulkan Chrome lifecycle and brackets draws with its frame calls.
+; Pass a NUL-terminated UTF-8 label/title and a Neon font slot to FontSet;
+; button centering reads that face's measured canvas-space line height.
+; A negative slot skips text. The caller supplies hover easing, input state
+; and click handling.
+; Coordinates are in the virtual canvas. Palette globals remain adjustable.
+; Colours pass through the port's eight-bit RGBA conversion. Panel title
+; uppercasing covers ASCII only; non-ASCII UTF-8 bytes are preserved, unlike
+; a locale-aware desktop UCase. Titles longer than 1023 bytes are refused.
+
+#NEON_VK_UI_ERR_TITLE = -21330
+#NEON_VK_UI_TITLE_BYTES = 1024
+
+Global nvuiFont.i = -1
+Global Dim nvuiTitle.a[#NEON_VK_UI_TITLE_BYTES]
+
+Global nvuiBgR.f = 0.129, nvuiBgG.f = 0.133, nvuiBgB.f = 0.145
+Global nvuiPanelR.f = 0.145, nvuiPanelG.f = 0.149, nvuiPanelB.f = 0.161
+Global nvuiHeadR.f = 0.169, nvuiHeadG.f = 0.173, nvuiHeadB.f = 0.184
+Global nvuiLineR.f = 0.196, nvuiLineG.f = 0.200, nvuiLineB.f = 0.212
+Global nvuiTextR.f = 0.863, nvuiTextG.f = 0.863, nvuiTextB.f = 0.863
+Global nvuiFaintR.f = 0.435, nvuiFaintG.f = 0.459, nvuiFaintB.f = 0.498
+Global nvuiAccR.f = 0.353, nvuiAccG.f = 0.741, nvuiAccB.f = 0.816
+
+; A negative face disables text, like the desktop's null GLFont pointer.
+Procedure NeonVkUiFontSet(face.i)
+  nvuiFont = face
+EndProcedure
+
+Procedure.i NeonVkUiBox(x.f, y.f, w.f, h.f, r.f, g.f, b.f, a.f)
+  ProcedureReturn NeonVkPortBox(x, y, w, h, r, g, b, a, 1, 1)
+EndProcedure
+
+Procedure.i NeonVkUiText(x.f, y.f, *label, r.f, g.f, b.f, a.f)
+  If nvuiFont < 0 Or *label = 0 : ProcedureReturn #NEON_OK : EndIf
+  ProcedureReturn NeonVkPortText(nvuiFont, x, y, *label, r, g, b, a, 1, 1)
+EndProcedure
+
+Procedure.i NeonVkUiTextRight(xRight.f, y.f, *label, r.f, g.f, b.f, a.f)
+  If nvuiFont < 0 Or *label = 0 : ProcedureReturn #NEON_OK : EndIf
+  ProcedureReturn NeonVkPortTextRight(nvuiFont, xRight, y, *label, r, g, b, a, 1, 1)
+EndProcedure
+
+Procedure.i NeonVkUiTextCentre(x.f, w.f, y.f, *label, r.f, g.f, b.f, a.f)
+  If nvuiFont < 0 Or *label = 0 : ProcedureReturn #NEON_OK : EndIf
+  ProcedureReturn NeonVkPortTextCentre(nvuiFont, x, w, y, *label, r, g, b, a, 1, 1)
+EndProcedure
+
+Procedure.i NeonVkUiGlow(x.f, y.f, w.f, h.f, r.f, g.f, b.f, strength.f)
+  Protected i.i, rc.i, offset.f = 1.0
+  For i = 1 To 4
+    rc = NeonVkUiBox(x - offset, y - offset, w + offset * 2.0, h + offset * 2.0, r, g, b, strength / (offset * 1.5))
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+    offset = offset + 1.0
+  Next
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkUiFrame(x.f, y.f, w.f, h.f, r.f, g.f, b.f, a.f)
+  Protected rc.i
+  rc = NeonVkUiBox(x, y, w, 1.0, r, g, b, a)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiBox(x, y + h - 1.0, w, 1.0, r, g, b, a)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiBox(x, y, 1.0, h, r, g, b, a)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  ProcedureReturn NeonVkUiBox(x + w - 1.0, y, 1.0, h, r, g, b, a)
+EndProcedure
+
+; Uppercase ASCII in a bounded UTF-8 copy. Other UTF-8 bytes pass through.
+Procedure.i nvuiUpperTitle(*title)
+  Protected i.i, ch.i
+  If *title = 0 : nvuiTitle[0] = 0 : ProcedureReturn #NEON_OK : EndIf
+  For i = 0 To #NEON_VK_UI_TITLE_BYTES - 2
+    ch = PeekA(*title + i)
+    If ch = 0 : nvuiTitle[i] = 0 : ProcedureReturn #NEON_OK : EndIf
+    If ch >= 97 And ch <= 122 : ch = ch - 32 : EndIf
+    nvuiTitle[i] = ch
+  Next
+  If PeekA(*title + #NEON_VK_UI_TITLE_BYTES - 1) <> 0
+    ProcedureReturn #NEON_VK_UI_ERR_TITLE
+  EndIf
+  nvuiTitle[#NEON_VK_UI_TITLE_BYTES - 1] = 0
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkUiPanel(x.f, y.f, w.f, h.f, *title, ar.f, ag.f, ab.f, headerH.f)
+  Protected rc.i
+  rc = nvuiUpperTitle(*title)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiBox(x, y, w, h, nvuiPanelR, nvuiPanelG, nvuiPanelB, 1.0)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  If nvuiTitle[0] <> 0
+    rc = NeonVkUiBox(x, y, w, headerH, nvuiHeadR, nvuiHeadG, nvuiHeadB, 1.0)
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkUiBox(x, y, 3.0, headerH, ar, ag, ab, 1.0)
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkUiBox(x, y + headerH, w, 1.0, nvuiLineR, nvuiLineG, nvuiLineB, 1.0)
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+    rc = NeonVkUiText(x + 12.0, y + 5.0, @nvuiTitle[0], ar, ag, ab, 1.0)
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  EndIf
+  ProcedureReturn NeonVkUiFrame(x, y, w, h, nvuiLineR, nvuiLineG, nvuiLineB, 1.0)
+EndProcedure
+
+; Hover is the already eased value from Neon_Animate (normally 0..1).
+; This procedure only draws; it never registers a hot zone or reports clicks.
+Procedure.i NeonVkUiButtonDraw(x.f, y.f, w.f, h.f, *label, lit.i, enabled.i, hover.f)
+  Protected br.f = nvuiLineR, bg.f = nvuiLineG, bb.f = nvuiLineB
+  Protected tr.f = nvuiTextR, tg.f = nvuiTextG, tb.f = nvuiTextB
+  Protected lineHeight.f = 19.0
+  Protected rc.i
+  If lit <> 0
+    br = 0.157 : bg = 0.365 : bb = 0.408
+    tr = 0.588 : tg = 0.816 : tb = 0.867
+  EndIf
+  If enabled = 0
+    tr = nvuiFaintR : tg = nvuiFaintG : tb = nvuiFaintB
+  EndIf
+  If hover > 0.0
+    br = br + 0.06 * hover : bg = bg + 0.07 * hover : bb = bb + 0.08 * hover
+    rc = NeonVkUiGlow(x, y, w, h, nvuiAccR, nvuiAccG, nvuiAccB, 0.16 * hover)
+    If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  EndIf
+  rc = NeonVkUiBox(x, y, w, h, br, bg, bb, 1.0)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiBox(x, y, w, 1.0, 0.216, 0.259, 0.325, 1.0)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkUiBox(x, y + h - 1.0, w, 1.0, nvuiBgR, nvuiBgG, nvuiBgB, 1.0)
+  If rc <> #NEON_OK : ProcedureReturn rc : EndIf
+  If nvuiFont >= 0 : lineHeight = Neon_LineHeight(nvuiFont) : EndIf
+  ProcedureReturn NeonVkUiTextCentre(x, w, y + (h - lineHeight) / 2.0, *label, tr, tg, tb, 1.0)
+EndProcedure
