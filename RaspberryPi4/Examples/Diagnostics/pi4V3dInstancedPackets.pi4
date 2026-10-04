@@ -1,0 +1,55 @@
+; Pi 4 V3D 4.2 instanced control-list packet encoding proof.
+; This checks bytes in RAM only; it never submits a list to the GPU.
+; The expected offsets and field widths come from v3d_packet.xml packets
+; 38, 34 and 43, independently of the emitter's calls to v3d_ClU32.
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+
+#TEST_CL = $00650000
+#TEST_BYTES = 4096
+#TEST_PASS = 15
+
+Procedure.i PacketU32(addr.i)
+  ProcedureReturn (PeekA(addr) & $FF) | ((PeekA(addr + 1) & $FF) << 8) | ((PeekA(addr + 2) & $FF) << 16) | ((PeekA(addr + 3) & $FF) << 24)
+EndProcedure
+
+Procedure.i Main()
+  Define good.i
+  Define rc.i
+  Define i.i
+
+  i = 0
+  While i < #TEST_BYTES
+    PokeA(#TEST_CL + i, $A5)
+    i = i + 1
+  Wend
+  rc = V3dClBegin(#TEST_CL, #TEST_BYTES)
+  If rc <> #V3D_OK : ProcedureReturn 0 : EndIf
+  V3dClVertexArrayInstancedPrims(4, $00010203, $00030405, $01020304)
+  V3dClIndexedInstancedPrims(4, $01020304, $05060708, 1, $090A0B0C)
+  V3dClBaseVertexBaseInstance(0, $0D0E0F10)
+  rc = V3dClFinish()
+  If rc <> #V3D_OK Or V3dClLen() <> 37 : ProcedureReturn 0 : EndIf
+
+  good = 0
+  If PeekA(#TEST_CL + 0) = 38 : good = good + 1 : EndIf
+  If PeekA(#TEST_CL + 1) = 4 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 2) = $00010203 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 6) = $00030405 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 10) = $01020304 : good = good + 1 : EndIf
+  If PeekA(#TEST_CL + 14) = 34 : good = good + 1 : EndIf
+  If PeekA(#TEST_CL + 15) = $44 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 16) = $01020304 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 20) = $05060708 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 24) = $090A0B0C : good = good + 1 : EndIf
+  If PeekA(#TEST_CL + 28) = 43 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 29) = 0 : good = good + 1 : EndIf
+  If PacketU32(#TEST_CL + 33) = $0D0E0F10 : good = good + 1 : EndIf
+  If PeekA(#TEST_CL + 37) = $A5 : good = good + 1 : EndIf
+
+  ; A zero instance count must be refused before a partial packet appears.
+  V3dClBegin(#TEST_CL + 256, #TEST_BYTES - 256)
+  V3dClVertexArrayInstancedPrims(4, 6, 0, 0)
+  If V3dClError() = #V3D_ERR_CL_ARGS And V3dClLen() = 0 : good = good + 1 : EndIf
+  ProcedureReturn good
+EndProcedure

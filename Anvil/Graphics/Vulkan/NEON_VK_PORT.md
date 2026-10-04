@@ -246,6 +246,16 @@ from 113,088 to 94,378 µs and the frame median from 405,927 to 389,483 µs.
 All four moving-frame pixel checks passed. The CSD route remains opt-in and
 the measured frame is still far above a 60 Hz budget.
 
+The [current-source moving comparison](../../../docs/evidence/neon-particle-dynamic-current-pi4-20261004/README.md)
+recompiled both routes together and passed four 10,000-particle moving
+frames on Pi 4 build 244. CPU and CSD median frames were 454,115 and
+389,334 µs respectively, a 64,781 µs (14.3%) reduction in that workload.
+The V3D 4.2 [instanced packet encoding proof](../../../docs/evidence/neon-instanced-packets-pi4-20261004/README.md)
+is a first step toward the desktop engine's GPU instancing. It only checks
+command-list bytes in RAM; Vulkan still rejects multiple instances and
+per-instance vertex bindings, so it does not change the opt-in particle
+route or its measured speed.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call
