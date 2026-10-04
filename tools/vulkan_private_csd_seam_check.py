@@ -25,7 +25,10 @@ FIXTURE = r'''
 #V3D_ERR_NOINIT = 11
 #V3D_ERR_MMU_OFF = 17
 #V3D_CSD_CFG5_FLAG_MASK = 7
+#ANVIL_VK_GPU_LEASE_QUEUE = 1
+#ANVIL_VK_GPU_LEASE_EXTERNAL = 2
 Global avkV3dWindowBase.i, avkV3dWindowBytes.i
+Global avkV3dGpuLease.i = 0
 Global v3d_ready.i = 1, v3d_mmuOn.i = 1
 Global testBegin.i, testCode.i, testUniform.i, testOutput.i
 Global testSubmit.i, testWait.i, testCache.i
@@ -35,6 +38,7 @@ Global testBeginRc.i, testSubmitRc.i, testWaitRc.i, testCleanRc.i
 Global testDoneAfter.i = 2
 Global testInputBase.i, testInputBytes.i, testOutputBase.i, testOutputBytes.i
 Global testGroups.i, testTimeout.i
+Global testLeaseErrors.i
 
 Procedure testMark(step.i)
   testSteps[testOrder] = step
@@ -100,6 +104,10 @@ EndProcedure
 ; @PRODUCTION_CSD@
 
 Procedure testReset()
+  If avkBackendGpuLeaseState() = #ANVIL_VK_GPU_LEASE_EXTERNAL
+    If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : testLeaseErrors = testLeaseErrors + 1 : EndIf
+  EndIf
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : testLeaseErrors = testLeaseErrors + 1 : EndIf
   testBegin = 0 : testCode = 0 : testUniform = 0 : testOutput = 0
   testSubmit = 0 : testWait = 0 : testCache = 0
   testBeginRc = 0 : testSubmitRc = 0 : testWaitRc = 0 : testCleanRc = 0
@@ -120,10 +128,24 @@ EndProcedure
 Procedure.i Main()
   Define p.AnvilVkV3dCsdPlan, r.AnvilVkV3dCsdResult, i.i
   avkV3dWindowBase = $20000000 : avkV3dWindowBytes = $10000
+  testPlan(@p)
+  If AnvilVkV3dCsdConfigure(@p, @r) <> #V3D_ERR_CSD_ARGS Or avkV3dCsdConfigured <> 0 Or testBegin <> 0 : ProcedureReturn 39 : EndIf
+  If AnvilVkV3dCsdSubmit(@r) <> -1 Or testSubmit <> 0 : ProcedureReturn 40 : EndIf
   testReset() : testPlan(@p)
   If AnvilVkV3dCsdConfigure(@p, @r) <> 0 : ProcedureReturn 1 : EndIf
   If testBegin <> 1 Or testCode <> 1 Or testUniform <> 1 Or testOutput <> 1 Or testCache <> 1 Or testGroups <> 1 : ProcedureReturn 2 : EndIf
   If testInputBase <> p\inputBase Or testInputBytes <> p\inputBytes Or testOutputBase <> p\outputBase Or testOutputBytes <> p\outputBytes : ProcedureReturn 3 : EndIf
+  If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 41 : EndIf
+  If AnvilVkV3dCsdConfigure(@p, @r) <> #V3D_ERR_CSD_ARGS Or avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL Or testBegin <> 1 : ProcedureReturn 42 : EndIf
+  AnvilVkV3dCsdCancel()
+  If avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL : ProcedureReturn 48 : EndIf
+  If AnvilVkV3dCsdSubmit(@r) <> -1 Or avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL Or testSubmit <> 0 : ProcedureReturn 43 : EndIf
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_QUEUE) = 0 : ProcedureReturn 44 : EndIf
+  If AnvilVkV3dCsdConfigure(@p, @r) <> #V3D_ERR_CSD_ARGS Or avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL Or testBegin <> 1 : ProcedureReturn 50 : EndIf
+  AnvilVkV3dCsdCancel()
+  If avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL : ProcedureReturn 49 : EndIf
+  If AnvilVkV3dCsdSubmit(@r) <> -1 Or avkV3dCsdConfigured <> 1 Or avkV3dCsdLeaseOwner <> #ANVIL_VK_GPU_LEASE_EXTERNAL Or testSubmit <> 0 : ProcedureReturn 45 : EndIf
+  If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) = 0 Or avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 46 : EndIf
   If AnvilVkV3dCsdSubmit(@r) <> 0 : ProcedureReturn 4 : EndIf
   If testSubmit <> 1 Or testWait <> 1 Or testTimeout <> p\timeoutUs Or testCache <> 2 Or testOutputBytes <> p\outputWrittenBytes : ProcedureReturn 5 : EndIf
   If r\native <> 0 Or r\waited <> 1 Or r\doneBefore <> 1 Or r\doneAfter <> 2 : ProcedureReturn 6 : EndIf
@@ -193,6 +215,7 @@ Procedure.i Main()
   If AnvilVkV3dCsdConfigure(@p, @r) <> 0 Or AnvilVkV3dCsdSubmit(@r) <> -1 Or testCache <> 1 : ProcedureReturn 17 : EndIf
   testReset() : testPlan(@p) : testDoneAfter = 1
   If AnvilVkV3dCsdConfigure(@p, @r) <> 0 Or AnvilVkV3dCsdSubmit(@r) <> -1 Or testCache <> 1 : ProcedureReturn 18 : EndIf
+  If testLeaseErrors <> 0 Or avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 Or avkBackendGpuLeaseState() <> 0 : ProcedureReturn 47 : EndIf
   ProcedureReturn 0
 EndProcedure
 '''
@@ -206,19 +229,27 @@ def main() -> int:
     end_marker = "#AVK_V3D_CSD_MAX_WORKGROUPS = 65535"
     end = backend.index(end_marker, start)
     declarations = backend[start:end + len(end_marker)]
-    names = ("avkV3dCsdInside", "avkV3dCsdOverlap", "AnvilVkV3dCsdConfigure", "AnvilVkV3dCsdCancel", "AnvilVkV3dCsdSubmit")
+    names = ("avkBackendGpuLeaseAcquire", "avkBackendGpuLeaseRelease", "avkBackendGpuLeaseQuarantine", "avkBackendGpuLeaseState",
+             "avkV3dCsdInside", "avkV3dCsdOverlap", "AnvilVkV3dCsdConfigure", "AnvilVkV3dCsdCancel", "AnvilVkV3dCsdSubmit")
     body = declarations + "\n\n" + "\n\n".join(gate.procedure_body(backend, name) for name in names)
     prepare = gate.procedure_body(producer, "NeonVkParticleCsdPrepare")
-    ordered = ("AnvilVkV3dCsdConfigure(@csd, @result)", "NeonVkChromeExternalProducerQuarantine()",
+    ordered = ("avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL)",
+               "AnvilVkV3dCsdConfigure(@csd, @result)", "NeonVkChromeExternalProducerQuarantine()",
                "AnvilVkV3dCsdSubmit(@result)", "NeonVkChromeExternalProducerUnquarantine()")
     if [prepare.index(item) for item in ordered] != sorted(prepare.index(item) for item in ordered):
-        raise AssertionError("producer CSD configuration/quarantine/submission order changed")
+        raise AssertionError("producer lease/configuration/Chrome quarantine/submission order changed")
+    submit = prepare.index("AnvilVkV3dCsdSubmit(@result)")
+    if prepare.rfind("avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_EXTERNAL)") <= submit:
+        raise AssertionError("uncertain CSD submission does not quarantine the shared GPU lease")
+    if prepare.rfind("avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL)") <= submit:
+        raise AssertionError("proven CSD completion does not release the shared GPU lease")
     if "V3dCsd" in prepare.replace("AnvilVkV3dCsd", "") or "V3dCacheRange" in prepare:
         raise AssertionError("producer bypasses the private backend CSD transaction")
     if "NeonVkChromeExternalProducer" in body:
         raise AssertionError("backend depends on Chrome quarantine")
-    if "If rc <> #NEON_VK_CHROME_OK : AnvilVkV3dCsdCancel() : ProcedureReturn #NVPC_ERR_STATE : EndIf" not in prepare:
-        raise AssertionError("producer does not cancel configuration when Chrome quarantine refuses")
+    if ("If rc <> #NEON_VK_CHROME_OK\n    AnvilVkV3dCsdCancel()\n"
+            "    avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL)" not in prepare):
+        raise AssertionError("producer does not cancel configuration and release its lease when Chrome quarantine refuses")
     queue = gate.procedure_body(api, "vkGetPhysicalDeviceQueueFamilyProperties")
     if "#VK_QUEUE_COMPUTE_BIT" in queue:
         raise AssertionError("private CSD was advertised as public compute")

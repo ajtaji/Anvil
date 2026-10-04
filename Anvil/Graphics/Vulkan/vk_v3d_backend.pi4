@@ -81,6 +81,34 @@ Global avkV3dWindowBase.i = 0
 Global avkV3dWindowBytes.i = 0
 Global avkV3dNative.i = 0
 Global avkV3dJobs.i = 0
+Global avkV3dGpuLease.i = 0
+
+; The queue and the direct particle producer share this V3D ownership
+; boundary. A negative owner marks completion uncertain and cannot be
+; released without a hardware reset outside this backend's live session.
+Procedure.i avkBackendGpuLeaseAcquire(owner.i)
+  If (owner <> #ANVIL_VK_GPU_LEASE_QUEUE And owner <> #ANVIL_VK_GPU_LEASE_EXTERNAL) Or avkV3dGpuLease <> 0
+    ProcedureReturn 0
+  EndIf
+  avkV3dGpuLease = owner
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseRelease(owner.i)
+  If owner < 1 Or avkV3dGpuLease <> owner : ProcedureReturn 0 : EndIf
+  avkV3dGpuLease = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseQuarantine(owner.i)
+  If owner < 1 Or avkV3dGpuLease <> owner : ProcedureReturn 0 : EndIf
+  avkV3dGpuLease = -owner
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseState()
+  ProcedureReturn avkV3dGpuLease
+EndProcedure
 
 ; Private Pi 4 CSD transaction. The producer supplies only already-mapped
 ; closed ranges. Configure cannot launch hardware, so its refusals leave the
@@ -116,6 +144,7 @@ Global avkV3dCsdOutputBase.i = 0
 Global avkV3dCsdOutputWrittenBytes.i = 0
 Global avkV3dCsdResultPtr.i = 0
 Global avkV3dCsdTimeoutUs.i = 0
+Global avkV3dCsdLeaseOwner.i = 0
 #AVK_V3D_CSD_MAX_WORKGROUPS = 65535
 
 ; Declare the offscreen window this backend may suballocate as Vulkan
@@ -862,9 +891,11 @@ EndProcedure
 ; Validate every GPU-accessed span before changing the V3D CSD job builder.
 Procedure.i AnvilVkV3dCsdConfigure(*plan.AnvilVkV3dCsdPlan, *result.AnvilVkV3dCsdResult)
   Define rc.i, groups.i
+  If avkV3dGpuLease <= 0 : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
+  If avkV3dCsdConfigured <> 0 And avkV3dCsdLeaseOwner <> avkV3dGpuLease : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
   avkV3dCsdConfigured = 0
   avkV3dCsdOutputBase = 0 : avkV3dCsdOutputWrittenBytes = 0
-  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0 : avkV3dCsdLeaseOwner = 0
   If *plan = 0 Or *result = 0 : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
   If v3d_ready = 0 : ProcedureReturn #V3D_ERR_NOINIT : EndIf
   If v3d_mmuOn = 0 : ProcedureReturn #V3D_ERR_MMU_OFF : EndIf
@@ -896,6 +927,7 @@ Procedure.i AnvilVkV3dCsdConfigure(*plan.AnvilVkV3dCsdPlan, *result.AnvilVkV3dCs
   avkV3dCsdOutputWrittenBytes = *plan\outputWrittenBytes
   avkV3dCsdResultPtr = *result
   avkV3dCsdTimeoutUs = *plan\timeoutUs
+  avkV3dCsdLeaseOwner = avkV3dGpuLease
   avkV3dCsdConfigured = 1
   ProcedureReturn #V3D_OK
 EndProcedure
@@ -903,15 +935,19 @@ EndProcedure
 ; A caller that cannot exclude other GPU work must discard the prepared
 ; transaction. No CSD register has been written at this point.
 Procedure AnvilVkV3dCsdCancel()
+  If avkV3dGpuLease <= 0 Or avkV3dGpuLease <> avkV3dCsdLeaseOwner
+    ProcedureReturn
+  EndIf
   avkV3dCsdConfigured = 0
   avkV3dCsdOutputBase = 0 : avkV3dCsdOutputWrittenBytes = 0
-  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0 : avkV3dCsdLeaseOwner = 0
 EndProcedure
 
 ; Call only while the producer has excluded Chrome work. A failed submit or
 ; uncertain wait never releases that exclusion; the producer retains resources.
 Procedure.i AnvilVkV3dCsdSubmit(*result.AnvilVkV3dCsdResult)
   Define rc.i, cleanRc.i, timeoutUs.i
+  If avkV3dGpuLease <= 0 Or avkV3dGpuLease <> avkV3dCsdLeaseOwner : ProcedureReturn -1 : EndIf
   If *result = 0 Or *result <> avkV3dCsdResultPtr Or avkV3dCsdConfigured = 0 Or avkV3dCsdTimeoutUs < 1
     AnvilVkV3dCsdCancel()
     ProcedureReturn -1
@@ -920,7 +956,7 @@ Procedure.i AnvilVkV3dCsdSubmit(*result.AnvilVkV3dCsdResult)
   *result\doneBefore = 0 : *result\doneAfter = 0
   timeoutUs = avkV3dCsdTimeoutUs
   avkV3dCsdConfigured = 0
-  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0 : avkV3dCsdLeaseOwner = 0
   rc = V3dCsdSubmit()
   *result\native = rc
   If rc <> #V3D_OK : ProcedureReturn -1 : EndIf

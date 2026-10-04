@@ -32,6 +32,23 @@ Procedure.i avkBackendComputeCanLower(*ir)
   ProcedureReturn 0
 EndProcedure
 
+; No V3D is owned by this backend; refuse GPU lease requests.
+Procedure.i avkBackendGpuLeaseAcquire(owner.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseRelease(owner.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseQuarantine(owner.i)
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseState()
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i avkBackendHeapBase()
   ProcedureReturn 0
 EndProcedure

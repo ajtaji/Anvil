@@ -541,6 +541,16 @@ Declare.i avkBackendTicksUs()
 ; AvkComputeIr in the pipeline layer; foundation precedes that type's include.
 Declare.i avkBackendComputeCanLower(*ir)
 
+; One backend-owned GPU lease excludes queue work from a direct producer.
+; A negative state is quarantined: only a proven hardware completion may
+; release a held lease, and no caller can release a quarantined one.
+#ANVIL_VK_GPU_LEASE_QUEUE = 1
+#ANVIL_VK_GPU_LEASE_EXTERNAL = 2
+Declare.i avkBackendGpuLeaseAcquire(owner.i)
+Declare.i avkBackendGpuLeaseRelease(owner.i)
+Declare.i avkBackendGpuLeaseQuarantine(owner.i)
+Declare.i avkBackendGpuLeaseState()
+
 ; The graphics half of the seam. A backend with no #ANVIL_VK_CAP_DRAW bit
 ; still defines all four: they answer "not on this backend" rather than
 ; being absent, so a build that reaches one links and refuses instead of

@@ -1,0 +1,44 @@
+; Emitted-A64 proof of the Pi 4 backend's shared V3D GPU lease.
+; No V3D initialization, register writes or board work is performed.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#LEASE_REPORT = $06100000
+
+Procedure leasePut(index.i, value.i)
+  PokeI(#LEASE_REPORT + index * 8, value)
+EndProcedure
+
+Procedure.i Main()
+  leasePut(0, avkBackendGpuLeaseState())
+  leasePut(1, avkBackendGpuLeaseAcquire(0))
+  leasePut(2, avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_QUEUE))
+  leasePut(3, avkBackendGpuLeaseState())
+  leasePut(4, avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(5, avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(6, avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(7, avkBackendGpuLeaseState())
+  leasePut(8, avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE))
+  leasePut(9, avkBackendGpuLeaseState())
+  leasePut(10, avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(11, avkBackendGpuLeaseState())
+  leasePut(12, avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(13, avkBackendGpuLeaseState())
+  leasePut(14, avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL))
+  leasePut(15, avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_QUEUE))
+  leasePut(16, avkBackendGpuLeaseState())
+  ProcedureReturn 0
+EndProcedure
