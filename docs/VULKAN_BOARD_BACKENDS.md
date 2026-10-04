@@ -21,6 +21,11 @@ input/output guards and pixel probes, and one V3D bin/render job; see
 opt-in producer feeding a Vulkan vertex buffer, not `vkCmdDispatch`, a default
 particle renderer, or a capability advertised by another board.
 
+A current-source moving 10,000-particle comparison on build 244 passed four
+frames and all per-cell pixel checks on both the CPU and V3D CSD routes.
+Measured frame medians were 454,115 µs and 389,334 µs respectively; see
+`docs/evidence/neon-particle-dynamic-current-pi4-20261004/README.md`.
+
 The current Pi 4 production adapter has also passed a fresh 15-scene Neon
 widget run: all 245,760 reference pixels matched the native golden corpus,
 with one display DMA presentation and no processor pixel fallback. The separate
