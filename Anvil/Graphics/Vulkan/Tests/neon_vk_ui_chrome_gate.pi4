@@ -1,0 +1,109 @@
+; Emitted AArch64 gate for the production drawing adapter. Renderer calls
+; record ordered canvas geometry and text arguments without a Vulkan device.
+
+EnableFloatingPoint
+#NEON_OK = 0
+
+Global uiCalls.i, uiTextCalls.i, uiCentreCalls.i, uiRightCalls.i, uiFailAt.i
+Global uiTextX.f, uiTextY.f, uiCentreX.f, uiCentreW.f, uiCentreY.f
+Global uiTextR.f, uiTextG.f, uiTextB.f
+Global uiTextPtr.i
+Global Dim uiX.f[31]
+Global Dim uiY.f[31]
+Global Dim uiW.f[31]
+Global Dim uiH.f[31]
+Global Dim uiA.f[31]
+Global Dim uiR.f[31]
+Global Dim uiG.f[31]
+Global Dim uiB.f[31]
+
+Procedure.i NeonVkPortBox(x.f, y.f, w.f, h.f, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If scaled <> 1 Or ignoreCamera <> 1 : ProcedureReturn -90 : EndIf
+  If uiCalls >= 32 : ProcedureReturn -91 : EndIf
+  uiX[uiCalls] = x : uiY[uiCalls] = y : uiW[uiCalls] = w : uiH[uiCalls] = h
+  uiR[uiCalls] = r : uiG[uiCalls] = g : uiB[uiCalls] = b : uiA[uiCalls] = a
+  uiCalls = uiCalls + 1
+  If uiCalls = uiFailAt : ProcedureReturn -7 : EndIf
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortText(font.i, x.f, y.f, *label, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If font <> 2 Or scaled <> 1 Or ignoreCamera <> 1 : ProcedureReturn -92 : EndIf
+  uiTextCalls = uiTextCalls + 1
+  uiTextX = x : uiTextY = y : uiTextPtr = *label
+  uiTextR = r : uiTextG = g : uiTextB = b
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortTextRight(font.i, xRight.f, y.f, *label, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If font <> 2 Or scaled <> 1 Or ignoreCamera <> 1 : ProcedureReturn -93 : EndIf
+  uiRightCalls = uiRightCalls + 1
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i NeonVkPortTextCentre(font.i, x.f, w.f, y.f, *label, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
+  If font <> 2 Or scaled <> 1 Or ignoreCamera <> 1 : ProcedureReturn -94 : EndIf
+  uiCentreCalls = uiCentreCalls + 1
+  uiCentreX = x : uiCentreW = w : uiCentreY = y
+  uiTextR = r : uiTextG = g : uiTextB = b : uiTextPtr = *label
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+Procedure.i Neon_LineHeight(font.i)
+  If font = 2 : ProcedureReturn 17 : EndIf
+  ProcedureReturn 19
+EndProcedure
+
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_ui_chrome_port.pi4"
+
+Procedure.i Main()
+  Protected Dim title.a[4]
+  Protected Dim label.a[3]
+  title[0] = 77 : title[1] = 105 : title[2] = 88 : title[3] = 0
+  label[0] = 79 : label[1] = 75 : label[2] = 0
+
+  If NeonVkUiGlow(10.0, 20.0, 30.0, 40.0, 1.0, 0.0, 0.0, 0.16) <> 0 : ProcedureReturn 1 : EndIf
+  If uiCalls <> 4 Or uiX[0] <> 9.0 Or uiY[0] <> 19.0 Or uiW[0] <> 32.0 Or uiH[0] <> 42.0 : ProcedureReturn 2 : EndIf
+  If uiX[3] <> 6.0 Or uiY[3] <> 16.0 Or uiW[3] <> 38.0 Or uiH[3] <> 48.0 : ProcedureReturn 3 : EndIf
+  If uiA[0] < 0.106 Or uiA[0] > 0.107 Or uiA[3] < 0.026 Or uiA[3] > 0.027 : ProcedureReturn 4 : EndIf
+
+  uiCalls = 0
+  If NeonVkUiFrame(5.0, 7.0, 20.0, 12.0, 0.1, 0.2, 0.3, 0.8) <> 0 : ProcedureReturn 5 : EndIf
+  If uiCalls <> 4 Or uiX[0] <> 5.0 Or uiY[0] <> 7.0 Or uiW[0] <> 20.0 Or uiH[0] <> 1.0 : ProcedureReturn 6 : EndIf
+  If uiY[1] <> 18.0 Or uiW[2] <> 1.0 Or uiX[3] <> 24.0 Or uiH[3] <> 12.0 : ProcedureReturn 7 : EndIf
+  If uiA[3] <> 0.8 : ProcedureReturn 8 : EndIf
+
+  NeonVkUiFontSet(2)
+  uiCalls = 0
+  If NeonVkUiPanel(10.0, 20.0, 100.0, 60.0, @title[0], 0.3, 0.7, 0.8, 26.0) <> 0 : ProcedureReturn 9 : EndIf
+  If uiCalls <> 8 Or uiTextCalls <> 1 : ProcedureReturn 10 : EndIf
+  If uiX[0] <> 10.0 Or uiY[0] <> 20.0 Or uiW[0] <> 100.0 Or uiH[0] <> 60.0 : ProcedureReturn 11 : EndIf
+  If uiW[2] <> 3.0 Or uiH[2] <> 26.0 Or uiY[3] <> 46.0 Or uiH[3] <> 1.0 : ProcedureReturn 12 : EndIf
+  If uiTextX <> 22.0 Or uiTextY <> 25.0 : ProcedureReturn 13 : EndIf
+  If PeekA(uiTextPtr) <> 77 Or PeekA(uiTextPtr + 1) <> 73 Or PeekA(uiTextPtr + 2) <> 88 Or PeekA(uiTextPtr + 3) <> 0 : ProcedureReturn 14 : EndIf
+
+  uiCalls = 0 : uiTextCalls = 0
+  If NeonVkUiPanel(1.0, 2.0, 30.0, 20.0, 0, 1.0, 0.0, 0.0, 26.0) <> 0 : ProcedureReturn 15 : EndIf
+  If uiCalls <> 5 Or uiTextCalls <> 0 : ProcedureReturn 16 : EndIf
+
+  uiCalls = 0 : uiCentreCalls = 0
+  If NeonVkUiButtonDraw(10.0, 20.0, 100.0, 30.0, @label[0], 1, 1, 0.0) <> 0 : ProcedureReturn 17 : EndIf
+  If uiCalls <> 3 Or uiCentreCalls <> 1 : ProcedureReturn 18 : EndIf
+  If uiR[0] <> 0.157 Or uiG[0] <> 0.365 Or uiB[0] <> 0.408 : ProcedureReturn 19 : EndIf
+  If uiCentreX <> 10.0 Or uiCentreW <> 100.0 Or uiCentreY <> 26.5 : ProcedureReturn 20 : EndIf
+  If uiTextR <> 0.588 Or uiTextG <> 0.816 Or uiTextB <> 0.867 : ProcedureReturn 21 : EndIf
+
+  uiCalls = 0
+  If NeonVkUiButtonDraw(10.0, 20.0, 100.0, 30.0, @label[0], 0, 0, 1.0) <> 0 : ProcedureReturn 22 : EndIf
+  If uiCalls <> 7 Or uiX[0] <> 9.0 Or uiR[4] < 0.255 Or uiR[4] > 0.257 : ProcedureReturn 23 : EndIf
+  If uiTextR <> nvuiFaintR Or uiTextG <> nvuiFaintG Or uiTextB <> nvuiFaintB : ProcedureReturn 24 : EndIf
+
+  uiCalls = 0 : uiFailAt = 2
+  If NeonVkUiFrame(0.0, 0.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0) <> -7 Or uiCalls <> 2 : ProcedureReturn 25 : EndIf
+  uiFailAt = 0
+  NeonVkUiFontSet(-1)
+  uiTextCalls = 0 : uiCentreCalls = 0
+  If NeonVkUiText(0.0, 0.0, @label[0], 1.0, 1.0, 1.0, 1.0) <> 0 Or uiTextCalls <> 0 : ProcedureReturn 26 : EndIf
+  If NeonVkUiTextCentre(0.0, 10.0, 0.0, @label[0], 1.0, 1.0, 1.0, 1.0) <> 0 Or uiCentreCalls <> 0 : ProcedureReturn 27 : EndIf
+  ProcedureReturn 0
+EndProcedure

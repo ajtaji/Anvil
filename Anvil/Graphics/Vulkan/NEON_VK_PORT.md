@@ -17,6 +17,21 @@ Vulkan chrome primitives. They do not select a board backend or present a frame.
 | `DrawGLSprite` | `NeonVkChromeImageSpriteDrawTransformId` and image registration | `NeonVkPortSpriteUpload/Sprite/Clear` keep crop, tint, angle, scale, and camera order through an explicit image reference. |
 | `BeginBatch/AddBatchedSprite/EndBatch` | `NeonVkChromeSpriteBatchBegin/Add/End` | `NeonVkPortSpriteBatchBegin/Add/End` retain one uploaded image reference and ordered full-image sprite calls. |
 | `InitParticleEngine/ClearParticles/AddParticle/RenderParticles` | `NeonVkChromeParticlesPrepare/DrawPrepared` | `NeonVkPortParticleInit/Clear/Add/ParticlesPrepare/ParticlesDrawPrepared` retain the ordered list and issue one Vulkan draw after explicit pre-frame preparation. |
+| `Neon_Glow/Frame/Panel` and the drawing part of `Neon_Button` | Canvas boxes and TrueType text through Vulkan chrome | `NeonVkUiGlow/Frame/Panel/ButtonDraw` keep the desktop drawing order, palette and canvas coordinates. |
+
+Include `neon_vk_ui_chrome_port.pi4` after `neon_vk_port.pi4` for the UI
+drawing helpers. Configure the canvas, Vulkan chrome lifecycle and selected
+Neon font slot before drawing. Button centering reads that slot's measured
+line height from Neon. The caller supplies the eased button hover value,
+input state and click handling. The button wrapper only draws; it does not
+register hot zones or return clicks. Labels
+are NUL-terminated UTF-8 pointers, and panel titles accept up to 1,023 bytes.
+Title uppercasing covers ASCII; other UTF-8 bytes pass through. Glow strength,
+frame alpha and panel header height must be passed explicitly because the
+target compiler does not accept the desktop default-parameter syntax. The
+port's normal eight-bit RGBA conversion quantizes the desktop float colours.
+The emitted drawing gate and full Pi 4 Vulkan composition compile pass; the
+new helpers have not yet had an offscreen Pi 4 pixel proof.
 
 Call `NeonVkPortCanvas(canvasWidth, canvasHeight, targetWidth, targetHeight)`
 after the Vulkan render target is created. Target dimensions are its logical
