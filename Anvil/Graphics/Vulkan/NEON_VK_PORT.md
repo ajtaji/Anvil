@@ -239,6 +239,13 @@ endpoints. In the same moving profile, CSD staging fell from 126,824 to
 change the general geometry path or turn the opt-in producer into a
 board-neutral implementation.
 
+The Pi 4 CSD producer's [X-pair reuse proof](../../../docs/evidence/neon-particle-xpair-pi4-20261003/README.md)
+adds a Prepare-local, collision-checked cache for exact X endpoints repeated
+across rows. On the same moving 10,000-particle profile, record staging fell
+from 113,088 to 94,378 µs and the frame median from 405,927 to 389,483 µs.
+All four moving-frame pixel checks passed. The CSD route remains opt-in and
+the measured frame is still far above a 60 Hz budget.
+
 The port uses explicit `NeonVkPort*` names. PureMetalForge does not compile
 the desktop procedures' optional parameter syntax or by-value `Text.s` copy
 in this target, so a same-name include would hide required resource and call

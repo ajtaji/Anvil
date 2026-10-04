@@ -103,6 +103,33 @@ class FastPathGate(unittest.TestCase):
             self.assertEqual(value, expected)
         self.assertLess(calls, 10_000)  # 20,000 uncached Y calls in this mix
 
+    def test_local_x_pair_cache_keeps_words_exact_across_rows_and_collisions(self) -> None:
+        fast = self.fast
+        self.assertLess(self.stage.index("For i = 0 To 127 : cachedXValid[i] = 0 : Next"),
+                        self.stage.index("For i = 0 To padded - 1"))
+        self.assertIn("xSlot = (*corners\\x0 >> 11) & 127", fast)
+        self.assertIn("cachedXValid[xSlot] <> 0 And cachedX0[xSlot] = *corners\\x0 And cachedX1[xSlot] = *corners\\x1", fast)
+        self.assertIn("xb0 = cachedXb0[xSlot] : xb1 = cachedXb1[xSlot]", fast)
+        self.assertIn("cachedXb0[xSlot] = xb0 : cachedXb1[xSlot] = xb1 : cachedXValid[xSlot] = 1", fast)
+        self.assertEqual(fast.count("nvcParticleClipXBits("), 2)
+
+        cache = [None] * 128
+        calls = 0
+        for row in range(100):
+            for column in range(100):
+                # A changed width and a deliberately colliding column must
+                # always miss; the unchanged columns recur in later rows.
+                x0 = (column * 8 + (row % 17 == 0 and column == 71) * 1024) * 256
+                x1 = x0 + (4 + (row == 29 and column == 37)) * 256
+                slot = (x0 >> 11) & 127
+                expected = ((x0 * 1315423911 + 0x12345678) & 0xFFFFFFFF,
+                            (x1 * 1315423911 + 0x12345678) & 0xFFFFFFFF)
+                if cache[slot] is None or cache[slot][:2] != (x0, x1):
+                    cache[slot] = (x0, x1, *expected)
+                    calls += 2
+                self.assertEqual(cache[slot][2:], expected)
+        self.assertLess(calls, 20_000)
+
 
 if __name__ == "__main__":
     unittest.main()

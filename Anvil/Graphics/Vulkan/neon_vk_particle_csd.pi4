@@ -323,9 +323,14 @@ EndProcedure
 ; The prior Chrome Prepare supplies the exact CPU four-corner oracle and
 ; palette pixels. Pad to a full 16-lane group so every TMU read is defined.
 Procedure.i nvpcStageRecords(count.i)
-  Define i.i, c.i, p.i, xb.i, yb.i, mapped.i, rc.i, padded.i
+  Define i.i, c.i, p.i, xb.i, yb.i, mapped.i, rc.i, padded.i, xSlot.i
   Define xb0.i, xb1.i, yb0.i, yb2.i
   Define cachedY0.i, cachedY2.i, cachedYb0.i, cachedYb2.i, haveYPair.i
+  Define Dim cachedX0.i[128]
+  Define Dim cachedX1.i[128]
+  Define Dim cachedXb0.i[128]
+  Define Dim cachedXb1.i[128]
+  Define Dim cachedXValid.i[128]
   Define *corners.NvcParticleCorners
   rc = vkMapMemory(nvpcDevice, nvpcInputMemory, 0, nvpcInputBytes, 0, @mapped)
   nvpcLastVulkan = rc
@@ -336,6 +341,7 @@ Procedure.i nvpcStageRecords(count.i)
   ; This cache is local to one Prepare, so its clip target/generation cannot
   ; outlive the current target. General-path calls cannot change its values.
   haveYPair = 0
+  For i = 0 To 127 : cachedXValid[i] = 0 : Next
   For i = 0 To padded - 1
     p = mapped + i * #NVPC_RECORD
     If i < count
@@ -346,7 +352,17 @@ Procedure.i nvpcStageRecords(count.i)
       EndIf
       ; Reuse the exact axis-aligned Chrome fast path: two X/two Y clips.
       If nvcRotation = 0 And nvcParticleItems[i]\angleQ16 = 0 And (nvcParticleItems[i]\ignoreCamera <> 0 Or nvcParticleItems[i]\zoomQ16 = 65536)
-        xb0 = nvcParticleClipXBits(*corners\x0) : xb1 = nvcParticleClipXBits(*corners\x1)
+        ; A bounded, Prepare-local column cache avoids both clip procedure
+        ; calls when a later row repeats the exact X-corner pair. Collisions
+        ; fall back to the ordinary conversions and replace only that slot.
+        xSlot = (*corners\x0 >> 11) & 127
+        If cachedXValid[xSlot] <> 0 And cachedX0[xSlot] = *corners\x0 And cachedX1[xSlot] = *corners\x1
+          xb0 = cachedXb0[xSlot] : xb1 = cachedXb1[xSlot]
+        Else
+          xb0 = nvcParticleClipXBits(*corners\x0) : xb1 = nvcParticleClipXBits(*corners\x1)
+          cachedX0[xSlot] = *corners\x0 : cachedX1[xSlot] = *corners\x1
+          cachedXb0[xSlot] = xb0 : cachedXb1[xSlot] = xb1 : cachedXValid[xSlot] = 1
+        EndIf
         If haveYPair <> 0 And *corners\y0 = cachedY0 And *corners\y2 = cachedY2
           yb0 = cachedYb0 : yb2 = cachedYb2
         Else
