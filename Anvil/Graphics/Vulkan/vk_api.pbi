@@ -934,6 +934,7 @@ Procedure vkGetPhysicalDeviceProperties(physicalDevice.i, *pProperties.VkPhysica
   *pProperties\limits\maxImageDimension2D = dimension
   *pProperties\limits\maxImageArrayLayers = 1
   *pProperties\limits\maxUniformBufferRange = #ANVIL_VK_UNIFORM_BYTES
+  *pProperties\limits\maxStorageBufferRange = #ANVIL_VK_STORAGE_MAX_RANGE
   *pProperties\limits\maxPushConstantsSize = #ANVIL_VK_UNIFORM_BYTES
   *pProperties\limits\maxMemoryAllocationCount = #ANVIL_VK_MAX_MEMORY
   *pProperties\limits\maxSamplerAllocationCount = #ANVIL_VK_MAX_SAMPLERS
@@ -941,10 +942,12 @@ Procedure vkGetPhysicalDeviceProperties(physicalDevice.i, *pProperties.VkPhysica
   *pProperties\limits\maxBoundDescriptorSets = 1
   *pProperties\limits\maxPerStageDescriptorSamplers = 1
   *pProperties\limits\maxPerStageDescriptorUniformBuffers = 1
+  *pProperties\limits\maxPerStageDescriptorStorageBuffers = #ANVIL_VK_MAX_SET_BINDINGS
   *pProperties\limits\maxPerStageDescriptorSampledImages = 1
   *pProperties\limits\maxPerStageResources = #ANVIL_VK_MAX_SET_BINDINGS
   *pProperties\limits\maxDescriptorSetSamplers = 1
   *pProperties\limits\maxDescriptorSetUniformBuffers = 1
+  *pProperties\limits\maxDescriptorSetStorageBuffers = #ANVIL_VK_MAX_SET_BINDINGS
   *pProperties\limits\maxDescriptorSetSampledImages = 1
   *pProperties\limits\maxVertexInputAttributes = #ANVIL_SPV_MAX_ATTRS
   *pProperties\limits\maxVertexInputBindings = #ANVIL_VK_MAX_BINDINGS
@@ -960,6 +963,7 @@ Procedure vkGetPhysicalDeviceProperties(physicalDevice.i, *pProperties.VkPhysica
   *pProperties\limits\sampledImageColorSampleCounts = #VK_SAMPLE_COUNT_1_BIT
   *pProperties\limits\minMemoryMapAlignment = 1
   *pProperties\limits\minUniformBufferOffsetAlignment = #ANVIL_VK_UNIFORM_ALIGN
+  *pProperties\limits\minStorageBufferOffsetAlignment = #ANVIL_VK_STORAGE_ALIGN
   *pProperties\limits\optimalBufferCopyOffsetAlignment = avkBackendImageCopySourceAlignment()
   *pProperties\limits\nonCoherentAtomSize = 1
   *ranges = *pProperties + OffsetOf(VkPhysicalDeviceProperties\limits) + OffsetOf(VkPhysicalDeviceLimits\lineWidthRange)
