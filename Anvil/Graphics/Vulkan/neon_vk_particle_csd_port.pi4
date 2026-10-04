@@ -1,0 +1,40 @@
+; Explicit Pi 4 GPU particle route for the Neon canvas adapter.
+; Include after neon_vk_particle_port.pi4 and neon_vk_particle_csd.pi4.
+; The caller creates the producer after Chrome, prepares before FrameBegin,
+; draws inside the frame, then releases it before Chrome is destroyed.
+CompilerIf #PMF_CHIP = 2711
+
+Procedure.i NeonVkPortParticlesGpuCreate(capacity.i)
+  If nvpParticleInitialized = 0 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE : EndIf
+  ProcedureReturn NeonVkParticleCsdCreate(capacity)
+EndProcedure
+
+Procedure.i NeonVkPortParticlesGpuPrepare()
+  Protected rc.i
+  rc = nvpParticleStage()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  rc = NeonVkParticleCsdPrepare(@nvpParticleItems[0], nvpParticleCount)
+  If rc <> #NVPC_OK : ProcedureReturn rc : EndIf
+  nvpParticlePublish(2)
+  ProcedureReturn #NVPC_OK
+EndProcedure
+
+Procedure.i NeonVkPortParticlesGpuDrawPrepared()
+  If nvpParticleInitialized = 0 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE : EndIf
+  If nvpParticleCount = 0 : ProcedureReturn #NVPC_OK : EndIf
+  If nvpParticlePrepared = 0 Or nvpParticlePreparedRoute <> 2 Or nvpTargetW <> nvpParticleTargetW Or nvpTargetH <> nvpParticleTargetH Or nvpCameraX <> nvpParticleCameraX Or nvpCameraY <> nvpParticleCameraY Or nvpCameraZoom <> nvpParticleCameraZoom
+    ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_PREPARE
+  EndIf
+  ProcedureReturn NeonVkParticleCsdDraw()
+EndProcedure
+
+Procedure.i NeonVkPortParticlesGpuRelease()
+  Protected rc.i
+  rc = NeonVkParticleCsdRelease()
+  If rc = #NVPC_OK
+    nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
+  EndIf
+  ProcedureReturn rc
+EndProcedure
+
+CompilerEndIf

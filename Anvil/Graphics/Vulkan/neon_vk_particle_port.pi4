@@ -16,6 +16,7 @@ Global Dim nvpParticleItems.NvcParticle[#NVC_PARTICLE_MAX]
 Global nvpParticleCount.i
 Global nvpParticleInitialized.i
 Global nvpParticlePrepared.i
+Global nvpParticlePreparedRoute.i
 Global nvpParticleCameraX.f
 Global nvpParticleCameraY.f
 Global nvpParticleCameraZoom.f
@@ -25,16 +26,16 @@ Global nvpParticleTargetH.i
 ; Passing 1 explicitly accepts integral-pixel/Q16 quantization on this path.
 Procedure.i NeonVkPortParticleInit(acceptQuantized.i)
   If acceptQuantized <> 1
-    nvpParticleInitialized = 0 : nvpParticlePrepared = 0
+    nvpParticleInitialized = 0 : nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
     ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS
   EndIf
-  nvpParticleCount = 0 : nvpParticlePrepared = 0
+  nvpParticleCount = 0 : nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
   nvpParticleInitialized = 1
   ProcedureReturn #NEON_OK
 EndProcedure
 
 Procedure.i NeonVkPortParticleClear()
-  nvpParticleCount = 0 : nvpParticlePrepared = 0
+  nvpParticleCount = 0 : nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
   ProcedureReturn #NEON_OK
 EndProcedure
 
@@ -65,14 +66,15 @@ Procedure.i NeonVkPortParticleAdd(x.f, y.f, size.f, angle.f, r.f, g.f, b.f, a.f)
   nvpParticleItems[nvpParticleCount]\colour = NeonVkPortColour(r, g, b, a)
   nvpParticleItems[nvpParticleCount]\ignoreCamera = 0
   nvpParticleCount = nvpParticleCount + 1
-  nvpParticlePrepared = 0
+  nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
   ProcedureReturn #NEON_OK
 EndProcedure
 
-; Validate once and upload one ordered palette. No device resources are owned
-; here; a failure leaves the list dirty and DrawPrepared refuses stale data.
-Procedure.i NeonVkPortParticlesPrepare()
-  Protected i.i, rc.i, cameraX.i, cameraY.i, zoomQ16.i
+; Common camera snapshot for the CPU and Pi 4 GPU producers. A failed
+; producer leaves the list dirty; only its matching DrawPrepared may consume it.
+Procedure.i nvpParticleStage()
+  Protected i.i, cameraX.i, cameraY.i, zoomQ16.i
+  nvpParticlePrepared = 0 : nvpParticlePreparedRoute = 0
   If nvpParticleInitialized = 0 Or nvpCanvasW = 0 Or nvpTargetW <> nvcLogicalW Or nvpTargetH <> nvcLogicalH
     ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE
   EndIf
@@ -82,19 +84,34 @@ Procedure.i NeonVkPortParticlesPrepare()
   cameraX = nvpRound(nvpCameraX) : cameraY = nvpRound(nvpCameraY)
   zoomQ16 = nvpRound(nvpCameraZoom * 65536.0)
   If zoomQ16 < 1 Or zoomQ16 > 1048576 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_ARGS : EndIf
-  nvpParticlePrepared = 0
   If nvpParticleCount > 0
     For i = 0 To nvpParticleCount - 1
       nvpParticleItems[i]\cameraX = cameraX : nvpParticleItems[i]\cameraY = cameraY
       nvpParticleItems[i]\zoomQ16 = zoomQ16
     Next
-    rc = NeonVkChromeParticlesPrepare(@nvpParticleItems[0], nvpParticleCount)
-    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
   EndIf
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
+Procedure nvpParticlePublish(route.i)
   nvpParticleCameraX = nvpCameraX : nvpParticleCameraY = nvpCameraY
   nvpParticleCameraZoom = nvpCameraZoom
   nvpParticleTargetW = nvpTargetW : nvpParticleTargetH = nvpTargetH
+  nvpParticlePreparedRoute = route
   nvpParticlePrepared = 1
+EndProcedure
+
+; Validate once and upload one ordered palette. No device resources are owned
+; here; a failure leaves the list dirty and DrawPrepared refuses stale data.
+Procedure.i NeonVkPortParticlesPrepare()
+  Protected rc.i
+  rc = nvpParticleStage()
+  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  If nvpParticleCount > 0
+    rc = NeonVkChromeParticlesPrepare(@nvpParticleItems[0], nvpParticleCount)
+    If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  EndIf
+  nvpParticlePublish(1)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
@@ -103,7 +120,7 @@ EndProcedure
 Procedure.i NeonVkPortParticlesDrawPrepared()
   If nvpParticleInitialized = 0 : ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_STATE : EndIf
   If nvpParticleCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If nvpParticlePrepared = 0 Or nvpTargetW <> nvpParticleTargetW Or nvpTargetH <> nvpParticleTargetH Or nvpCameraX <> nvpParticleCameraX Or nvpCameraY <> nvpParticleCameraY Or nvpCameraZoom <> nvpParticleCameraZoom
+  If nvpParticlePrepared = 0 Or nvpParticlePreparedRoute <> 1 Or nvpTargetW <> nvpParticleTargetW Or nvpTargetH <> nvpParticleTargetH Or nvpCameraX <> nvpParticleCameraX Or nvpCameraY <> nvpParticleCameraY Or nvpCameraZoom <> nvpParticleCameraZoom
     ProcedureReturn #NEON_VK_PORT_ERR_PARTICLE_PREPARE
   EndIf
   ProcedureReturn NeonVkChromeParticlesDrawPrepared()

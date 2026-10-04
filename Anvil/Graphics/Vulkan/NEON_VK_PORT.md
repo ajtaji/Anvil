@@ -162,6 +162,23 @@ The CSD route stays opt-in, and the default Chrome path remains CPU-expanded.
 The producer is board-specific; the Chrome seam and default renderer remain
 available without it.
 
+For Pi 4 applications that elect this producer, include
+`neon_vk_particle_csd_port.pi4` after the canvas particle adapter and the CSD
+module. Once Chrome is ready, call `NeonVkPortParticlesGpuCreate(capacity)`.
+The ordinary `NeonVkPortParticleAdd` and `NeonVkPortCamera` calls still build the
+ordered list. Use `NeonVkPortParticlesGpuPrepare` before FrameBegin and
+`NeonVkPortParticlesGpuDrawPrepared` inside the frame, then call
+`NeonVkPortParticlesGpuRelease` before destroying Chrome. The GPU prepare
+performs Chrome's geometry/palette validation before the CSD dispatch and
+reports the CSD error if that work fails. CPU and GPU prepare results carry
+different route tags, so a draw through the wrong route refuses stale data.
+This is an explicit opt-in path; callers must not silently switch to the CPU
+route after an uncertain CSD submission. The adapter owns no additional GPU
+memory. A successful prepare is invalidated by particle or camera changes and
+by a failed later prepare. The combined adapter and CSD call path passed a
+returning Pi 4 hardware proof with 32 particles and 192 GPU vertices; see
+`docs/evidence/neon-particle-csd-port-pi4-20261003/README.md`.
+
 Chrome now reuses its uploaded particle palette when a prepared list has the
 same count and identical packed colors. Geometry and camera state are still
 validated and copied each time. Changed colors or count force an upload.
