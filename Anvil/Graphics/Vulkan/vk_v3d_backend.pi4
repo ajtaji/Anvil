@@ -1097,6 +1097,8 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   Define indexWidth.i
   Define indexOffset.i
   Define vertexBytes.i
+  Define maxInput.i
+  Define rate.i
   Define *bind.AnvilVkBackendBinding
   Define *sampled.AnvilVkBackendSampledImage
   Define texturePlan.AvkV3dTexturePlan
@@ -1137,7 +1139,7 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   If *d\bindingCount < 1 Or *d\bindingCount > #ANVIL_VK_MAX_BINDINGS Or *d\bindings = 0
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
-  If *d\firstVertex < 0 Or *d\firstVertex > $FFFFFFFF Or *d\vertexCount < 1 Or *d\vertexCount > $FFFFFFFF Or *d\maxVertex < 0 Or *d\maxVertex > $FFFFFFFF
+  If *d\firstVertex < 0 Or *d\firstVertex > $FFFFFFFF Or *d\vertexCount < 1 Or *d\vertexCount > $7FFFFFFF Or *d\maxVertex < 0 Or *d\maxVertex > $FFFFFFFF Or *d\instanceCount < 1 Or *d\instanceCount > $FFFFFFFF Or *d\firstInstance < 0 Or *d\firstInstance > $FFFFFFFF Or (*d\instanceCount - 1) > ($FFFFFFFF - *d\firstInstance)
     ProcedureReturn #ANVIL_VK_ERR_ARGS
   EndIf
   If *d\indexBase = 0
@@ -1170,12 +1172,22 @@ Procedure.i avkV3dValidateClosedDraw(*d.AnvilVkBackendDraw, *first.AnvilVkBacken
   b = 0
   While b < *d\bindingCount
     *bind = *d\bindings + (b * SizeOf(AnvilVkBackendBinding))
-    If *bind\stride <= 0 Or *bind\base < avkV3dWindowBase Or *bind\base > $FFFFFFFF
+    If *bind\stride <= 0 Or *bind\base < avkV3dWindowBase Or *bind\base > $FFFFFFFF Or (*bind\base - avkV3dWindowBase) >= avkV3dWindowBytes
       ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT
     EndIf
     available = avkV3dWindowBytes - (*bind\base - avkV3dWindowBase)
-    If *d\maxVertex > ((available / *bind\stride) - 1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
-    If *d\indexBase = 0
+    rate = AnvilVkPipelineBindingRate(pipe, b)
+    maxInput = *d\maxVertex
+    If rate = #VK_VERTEX_INPUT_RATE_INSTANCE
+      maxInput = *d\firstInstance + *d\instanceCount - 1
+    ElseIf rate <> #VK_VERTEX_INPUT_RATE_VERTEX
+      ProcedureReturn #ANVIL_VK_ERR_ARGS
+    EndIf
+    If available < *bind\stride Or maxInput > ((available / *bind\stride) - 1) : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
+    If rate = #VK_VERTEX_INPUT_RATE_INSTANCE
+      off = *d\firstInstance * *bind\stride
+      bytes = *d\instanceCount * *bind\stride
+    ElseIf *d\indexBase = 0
       off = *d\firstVertex * *bind\stride
       bytes = *d\vertexCount * *bind\stride
     Else
@@ -1307,6 +1319,8 @@ Procedure.i avkV3dListPacketBytes(*list.AnvilVkBackendDrawList)
       EndIf
       If vary <> AnvilVkV3dVaryingComponents(pipe) : bytes = bytes + 5 : vary = AnvilVkV3dVaryingComponents(pipe) : EndIf
       bytes = bytes + 15
+      If *d\instanceCount > 1 : bytes = bytes + 4 : EndIf
+      If *d\firstInstance > 0 : bytes = bytes + 9 : EndIf
       If *d\indexBase <> 0 : bytes = bytes + 9 : EndIf
     EndIf
     draw = draw + 1
@@ -1870,13 +1884,31 @@ Procedure.i avkBackendSubmitDraw(*payload)
         V3dClGlShaderState(drawBase + #AVKQ_DRAW_OFF_SHREC, AnvilVkV3dRecordCount(pipe))
         If *d\indexBase <> 0
           V3dClIndexBufferSetup(*d\indexBase, *d\indexBytes)
+          If *d\firstInstance > 0
+            V3dClBaseVertexBaseInstance(0, *d\firstInstance)
+          EndIf
           If *d\indexType = #VK_INDEX_TYPE_UINT16
-            V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 1, *d\firstVertex * 2)
+            If *d\instanceCount > 1
+              V3dClIndexedInstancedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\instanceCount, 1, *d\firstVertex * 2)
+            Else
+              V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 1, *d\firstVertex * 2)
+            EndIf
           Else
-            V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 2, *d\firstVertex * 4)
+            If *d\instanceCount > 1
+              V3dClIndexedInstancedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\instanceCount, 2, *d\firstVertex * 4)
+            Else
+              V3dClIndexedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, 2, *d\firstVertex * 4)
+            EndIf
           EndIf
         Else
-          V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\firstVertex)
+          If *d\firstInstance > 0
+            V3dClBaseVertexBaseInstance(0, *d\firstInstance)
+          EndIf
+          If *d\instanceCount > 1
+            V3dClVertexArrayInstancedPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\instanceCount, *d\firstVertex)
+          Else
+            V3dClVertexArrayPrims(avkV3dPrimitiveMode(pipe), *d\vertexCount, *d\firstVertex)
+          EndIf
         EndIf
       EndIf
       draw = draw + 1

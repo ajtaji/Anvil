@@ -25,9 +25,9 @@
 ; ======================================================================
 ;  WHAT THIS SLICE IMPLEMENTS
 ; ======================================================================
-;   * one vertex input binding, VK_VERTEX_INPUT_RATE_VERTEX
+;   * up to four vertex input bindings at vertex or instance rate
 ;   * attributes at locations 0..n-1 (n <= 4), R32G32_SFLOAT,
-;     R32G32B32_SFLOAT or R32G32B32A32_SFLOAT, all from binding 0
+;     R32G32B32_SFLOAT or R32G32B32A32_SFLOAT
 ;   * TRIANGLE_LIST and TRIANGLE_STRIP, no primitive restart
 ;   * one viewport and one scissor; either, both or neither may be dynamic
 ;   * VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, no depth bias, line width
@@ -192,6 +192,7 @@ Global Dim avkPipeRp.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeTopology.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipeBindStride.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_BINDINGS]
+Global Dim avkPipeBindRate.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_VK_MAX_BINDINGS]
 Global Dim avkPipeAttrBinding.i[(#ANVIL_VK_MAX_PIPELINES + 1) * #ANVIL_SPV_MAX_ATTRS]
 Global Dim avkPipeAttrCount.i[#ANVIL_VK_MAX_PIPELINES + 1]
 Global Dim avkPipePosAttr.i[#ANVIL_VK_MAX_PIPELINES + 1]
@@ -1582,6 +1583,7 @@ Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreat
   k = 0
   While k < #ANVIL_VK_MAX_BINDINGS
     avkPipeBindStride[bbase + k] = 0
+    avkPipeBindRate[bbase + k] = #VK_VERTEX_INPUT_RATE_VERTEX
     k = k + 1
   Wend
   seenBind = 0
@@ -1596,14 +1598,15 @@ Procedure.i avkPipeVertexInput(pipe.i, vs.i, *vi.VkPipelineVertexInputStateCreat
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given two vertex input bindings with the same binding number (Anvil code -20001, duplicate binding); each binding is described exactly once, and a second description of one would silently replace the stride the first declared.")
     EndIf
     seenBind = seenBind | (1 << bidx)
-    If (*bind\inputRate & $FFFFFFFF) <> #VK_VERTEX_INPUT_RATE_VERTEX
-      ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was given a vertex input binding at VK_VERTEX_INPUT_RATE_INSTANCE (Anvil code -20005, instancing not implemented); vkCmdDraw here takes one instance, so a per-instance attribute would be fetched once and would look like a per-vertex one.")
+    If (*bind\inputRate & $FFFFFFFF) <> #VK_VERTEX_INPUT_RATE_VERTEX And (*bind\inputRate & $FFFFFFFF) <> #VK_VERTEX_INPUT_RATE_INSTANCE
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex input binding rate outside VK_VERTEX_INPUT_RATE_VERTEX or VK_VERTEX_INPUT_RATE_INSTANCE (Anvil code -20001, invalid binding rate).")
     EndIf
     stride = *bind\stride & $FFFFFFFF
     If stride <= 0 Or (stride % 4) <> 0
       ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a vertex input binding whose stride is zero, negative or not a multiple of four (Anvil code -20001, invalid stride); every component is a four-byte binary32 and the vertex fetcher advances by whole components.")
     EndIf
     avkPipeBindStride[bbase + bidx] = stride
+    avkPipeBindRate[bbase + bidx] = *bind\inputRate & $FFFFFFFF
     k = k + 1
   Wend
 
@@ -1996,6 +1999,7 @@ Procedure.i AnvilVkGraphicsPipelineCreate(device.i, *ci.VkGraphicsPipelineCreate
   k = 0
   While k < #ANVIL_VK_MAX_BINDINGS
     avkPipeBindStride[base + k] = 0
+    avkPipeBindRate[base + k] = #VK_VERTEX_INPUT_RATE_VERTEX
     k = k + 1
   Wend
   rc = avkPipeVertexInput(s, vs, *ci\pVertexInputState)
@@ -2118,6 +2122,12 @@ Procedure.i AnvilVkPipelineBindingStride(pipe.i, b.i)
   If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
   If b < 0 Or b >= #ANVIL_VK_MAX_BINDINGS : ProcedureReturn 0 : EndIf
   ProcedureReturn avkPipeBindStride[(pipe * #ANVIL_VK_MAX_BINDINGS) + b]
+EndProcedure
+
+Procedure.i AnvilVkPipelineBindingRate(pipe.i, b.i)
+  If pipe < 1 Or pipe > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn #VK_VERTEX_INPUT_RATE_VERTEX : EndIf
+  If b < 0 Or b >= #ANVIL_VK_MAX_BINDINGS : ProcedureReturn #VK_VERTEX_INPUT_RATE_VERTEX : EndIf
+  ProcedureReturn avkPipeBindRate[(pipe * #ANVIL_VK_MAX_BINDINGS) + b]
 EndProcedure
 
 Procedure.i AnvilVkPipelinePositionAttr(pipe.i)
@@ -2624,7 +2634,8 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
   Define b.i
   Define k.i
   Define stride.i
-  Define need.i
+  Define available.i
+  Define records.i
   Define sx.i
   Define sy.i
   Define sw.i
@@ -2646,14 +2657,14 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDraw was called outside a render pass (Anvil code -20004, no render pass); a draw belongs between vkCmdBeginRenderPass and vkCmdEndRenderPass, because the render pass is what says where the pixels go.")
     ProcedureReturn
   EndIf
-  If vertexCount < 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a negative vertexCount (Anvil code -20001, invalid argument); vertexCount is an unsigned count in the Vulkan ABI.")
+  If vertexCount < 0 Or instanceCount < 0 Or firstInstance < 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a negative unsigned vertex, instance, or first-instance argument (Anvil code -20001, invalid argument).")
     ProcedureReturn
   EndIf
   ; A zero-vertex draw generates no work. In particular, it must not use
   ; the backend seam's one real-draw slot and make a following non-empty
   ; draw look like an unsupported second draw.
-  If vertexCount = 0
+  If vertexCount = 0 Or instanceCount = 0
     ProcedureReturn
   EndIf
   p = avkPipeSlot(avkCbPipe[c])
@@ -2682,12 +2693,12 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was called with a pipeline created for a different render pass from the one that is begun (Anvil code -20001, incompatible render pass); a pipeline may only be used inside a render pass compatible with the one it was created against.")
     ProcedureReturn
   EndIf
-  If instanceCount <> 1 Or firstInstance <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDraw was asked for other than exactly one instance starting at instance zero (Anvil code -20005, instancing not implemented); the control list this backend writes draws one instance, so a second one would be declared and never drawn.")
+  If instanceCount > $FFFFFFFF Or firstInstance > $FFFFFFFF Or (instanceCount - 1) > ($FFFFFFFF - firstInstance)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw's instance range exceeds uint32 (Anvil code -20001, invalid instance range).")
     ProcedureReturn
   EndIf
-  If firstVertex < 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw was given a negative firstVertex (Anvil code -20001, invalid argument); the index of the first vertex is an unsigned count from the start of the bound buffer.")
+  If firstVertex < 0 Or firstVertex > $FFFFFFFF Or vertexCount > $FFFFFFFF Or (vertexCount - 1) > ($FFFFFFFF - firstVertex)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw's vertex range exceeds uint32 (Anvil code -20001, invalid vertex range).")
     ProcedureReturn
   EndIf
   If avkPipeDynamicViewport[p] <> 0
@@ -2725,9 +2736,14 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
   While k < avkPipeBindCount[p]
     b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
     stride = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + k]
-    need = (firstVertex + vertexCount) * stride
-    If stride <= 0 Or need <= 0 Or (avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]) < need
-      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw names vertices past the end of one of the bound vertex buffers (Anvil code -20001, vertex range outside the buffer); for every binding, firstVertex plus vertexCount multiplied by THAT binding's stride must fit between its bind offset and the end of its VkBuffer. Reading past it would be a GPU fetch from memory this allocation does not own.")
+    If avkPipeBindRate[(p * #ANVIL_VK_MAX_BINDINGS) + k] = #VK_VERTEX_INPUT_RATE_INSTANCE
+      records = firstInstance + instanceCount
+    Else
+      records = firstVertex + vertexCount
+    EndIf
+    available = avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]
+    If stride <= 0 Or available < 0 Or records > (available / stride)
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDraw names data past the end of a bound vertex or instance buffer (Anvil code -20001, input range outside the buffer).")
       ProcedureReturn
     EndIf
     k = k + 1
@@ -2772,7 +2788,7 @@ Procedure AnvilVkCmdDraw(commandBuffer.i, vertexCount.i, instanceCount.i, firstV
       ProcedureReturn
     EndIf
   EndIf
-  If avkRecordedDrawAppend(c, firstVertex, vertexCount, vx, vy, vw, vh, sx, sy, sw, sh, 0, 0, 0) < 1
+  If avkRecordedDrawAppend(c, firstVertex, vertexCount, vx, vy, vw, vh, sx, sy, sw, sh, 0, 0, 0, instanceCount, firstInstance) < 1
     avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDraw exhausted the shared 4096-entry recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked. Reset or free command buffers that own older draws before recording more.")
     ProcedureReturn
   EndIf
@@ -2825,8 +2841,8 @@ Procedure AnvilVkCmdBindIndexBuffer(commandBuffer.i, buffer.i, offset.i, indexTy
   avkCbIndexType[c] = indexType
 EndProcedure
 
-; Core indexed drawing, deliberately bounded to one instance, zero base
-; vertex/base instance and the pipeline's triangle-list or strip topology. Index bytes
+; Core indexed drawing accepts instance count and base instance, but still
+; requires zero vertexOffset and triangle-list or strip topology. Index bytes
 ; remain application memory: submission preflight re-resolves and scans the
 ; live uint16/uint32 range before any fence, retain counter or backend job
 ; changes state.
@@ -2838,6 +2854,8 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
   Define k.i
   Define indexBytes.i
   Define available.i
+  Define stride.i
+  Define records.i
   Define sx.i
   Define sy.i
   Define sw.i
@@ -2859,11 +2877,11 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDrawIndexed was called outside a render pass (Anvil code -20004, no render pass); begin a compatible render pass first.")
     ProcedureReturn
   EndIf
-  If indexCount < 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed was given a negative indexCount (Anvil code -20001, invalid argument); indexCount is unsigned in the Vulkan ABI.")
+  If indexCount < 0 Or instanceCount < 0 Or firstInstance < 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed was given a negative unsigned count or firstInstance (Anvil code -20001, invalid argument).")
     ProcedureReturn
   EndIf
-  If indexCount = 0
+  If indexCount = 0 Or instanceCount = 0
     ProcedureReturn
   EndIf
   p = avkPipeSlot(avkCbPipe[c])
@@ -2888,16 +2906,16 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed used a pipeline incompatible with the active render pass (Anvil code -20001, incompatible render pass); bind a compatible pipeline.")
     ProcedureReturn
   EndIf
-  If instanceCount <> 1 Or firstInstance <> 0
-    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed was asked for instancing or a nonzero firstInstance (Anvil code -20005, instancing not implemented); this backend executes exactly one instance starting at zero.")
+  If instanceCount > $FFFFFFFF Or firstInstance > $FFFFFFFF Or (instanceCount - 1) > ($FFFFFFFF - firstInstance)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed's instance range exceeds uint32 (Anvil code -20001, invalid instance range).")
     ProcedureReturn
   EndIf
   If vertexOffset <> 0
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdDrawIndexed was given a nonzero vertexOffset (Anvil code -20005, base vertex not implemented); this tranche accepts indices relative to vertex zero.")
     ProcedureReturn
   EndIf
-  If firstIndex < 0
-    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed was given a negative firstIndex (Anvil code -20001, invalid argument); firstIndex is unsigned in the Vulkan ABI.")
+  If firstIndex < 0 Or firstIndex > $FFFFFFFF Or indexCount > $FFFFFFFF Or (indexCount - 1) > ($FFFFFFFF - firstIndex)
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed's index range exceeds uint32 (Anvil code -20001, invalid index range).")
     ProcedureReturn
   EndIf
   b = avkBufSlot(avkCbIndexBuf[c])
@@ -2926,6 +2944,20 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
     avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed names indices past the bound VkBuffer (Anvil code -20001, index range outside buffer); firstIndex plus indexCount must fit at the selected index width.")
     ProcedureReturn
   EndIf
+  k = 0
+  While k < avkPipeBindCount[p]
+    b = avkBufSlot(avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k])
+    stride = avkPipeBindStride[(p * #ANVIL_VK_MAX_BINDINGS) + k]
+    If avkPipeBindRate[(p * #ANVIL_VK_MAX_BINDINGS) + k] = #VK_VERTEX_INPUT_RATE_INSTANCE
+      records = firstInstance + instanceCount
+      available = avkBufSize[b] - avkCbVtxOffset[(c * #ANVIL_VK_MAX_BINDINGS) + k]
+      If stride <= 0 Or available < 0 Or records > (available / stride)
+        avkCbFail(c, #ANVIL_VK_ERR_ARGS, "vkCmdDrawIndexed names instance data past a bound buffer (Anvil code -20001, input range outside the buffer).")
+        ProcedureReturn
+      EndIf
+    EndIf
+    k = k + 1
+  Wend
   If avkPipeDynamicViewport[p] <> 0
     If avkCbViewportSet[c] = 0
       avkCbFail(c, #ANVIL_VK_ERR_STATE, "vkCmdDrawIndexed used dynamic viewport before vkCmdSetViewport supplied it (Anvil code -20004, dynamic viewport not set); set the viewport first.")
@@ -2972,7 +3004,7 @@ Procedure AnvilVkCmdDrawIndexed(commandBuffer.i, indexCount.i, instanceCount.i, 
       ProcedureReturn
     EndIf
   EndIf
-  If avkRecordedDrawAppend(c, firstIndex, indexCount, vx, vy, vw, vh, sx, sy, sw, sh, avkCbIndexBuf[c], avkCbIndexOffset[c], avkCbIndexType[c]) < 1
+  If avkRecordedDrawAppend(c, firstIndex, indexCount, vx, vy, vw, vh, sx, sy, sw, sh, avkCbIndexBuf[c], avkCbIndexOffset[c], avkCbIndexType[c], instanceCount, firstInstance) < 1
     avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "vkCmdDrawIndexed exhausted the shared 4096-entry recorded-draw pool (VkResult -1, VK_ERROR_OUT_OF_HOST_MEMORY); no partial draw was linked.")
   EndIf
 EndProcedure
@@ -3437,6 +3469,7 @@ Procedure.i avkDrawListPreflight(c.i)
   Define indexAddress.i
   Define indexValue.i
   Define maxVertex.i
+  Define maxInput.i
   Define indexMem.i
   Define address.i
   Define range.i
@@ -3515,6 +3548,7 @@ Procedure.i avkDrawListPreflight(c.i)
       avkFlightDraw[draw]\pitch = avkImgPitch[img]
       avkFlightDraw[draw]\clearBgra = avkCbClearWord[c]
       avkFlightDraw[draw]\bindingCount = 0 : avkFlightDraw[draw]\bindings = 0
+      avkFlightDraw[draw]\instanceCount = 0 : avkFlightDraw[draw]\firstInstance = 0
       avkFlightDraw[draw]\sampleMask = 0 : avkFlightDraw[draw]\sampledImage = 0
       avkFlightDraw[draw]\clearRectX = avkRecordedDraw[slot]\viewportX
       avkFlightDraw[draw]\clearRectY = avkRecordedDraw[slot]\viewportY
@@ -3574,6 +3608,8 @@ Procedure.i avkDrawListPreflight(c.i)
     avkFlightDraw[draw]\bindings = @avkFlightBinding[baseIdx]
     avkFlightDraw[draw]\vertexCount = avkRecordedDraw[slot]\vertexCount
     avkFlightDraw[draw]\firstVertex = avkRecordedDraw[slot]\firstVertex
+    avkFlightDraw[draw]\instanceCount = avkRecordedDraw[slot]\instanceCount
+    avkFlightDraw[draw]\firstInstance = avkRecordedDraw[slot]\firstInstance
     avkFlightDraw[draw]\indexBase = 0
     avkFlightDraw[draw]\indexBytes = 0
     avkFlightDraw[draw]\indexType = 0
@@ -3657,7 +3693,11 @@ Procedure.i avkDrawListPreflight(c.i)
         ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded vertex offset outside its live buffer (Anvil code -20004, stale vertex range); nothing was submitted.")
       EndIf
       available = avkBufSize[b] - avkRecordedDraw[slot]\vertexOffset[k]
-      If available < stride Or maxVertex > ((available / stride) - 1)
+      maxInput = maxVertex
+      If avkPipeBindRate[(p * #ANVIL_VK_MAX_BINDINGS) + k] = #VK_VERTEX_INPUT_RATE_INSTANCE
+        maxInput = avkRecordedDraw[slot]\firstInstance + avkRecordedDraw[slot]\instanceCount - 1
+      EndIf
+      If available < stride Or maxInput > ((available / stride) - 1)
         ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit found a recorded vertex range outside its live buffer (Anvil code -20004, stale vertex range); nothing was submitted.")
       EndIf
       bindingMem = avkBufMemSlot[b]

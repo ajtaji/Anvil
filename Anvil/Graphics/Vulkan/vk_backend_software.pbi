@@ -654,10 +654,14 @@ Procedure.i avkBackendSubmitDraw(*payload)
     EndIf
     If *d\kind = #ANVIL_VK_RENDER_OP_DRAW
       If *d\pipeline < 1 Or *d\pipeline > #ANVIL_VK_MAX_PIPELINES Or *d\bindings = 0 Or *d\bindingCount < 1 : ProcedureReturn -1 : EndIf
+      ; Reject unsupported instance fetch before clearing the target. A
+      ; multi-draw submission must not leave a partially updated image.
+      If *d\instanceCount <> 1 Or *d\firstInstance <> 0 : ProcedureReturn -1 : EndIf
       topology = AnvilVkPipelineTopology(*d\pipeline)
       If topology <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST And topology <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : ProcedureReturn -1 : EndIf
       If *d\vertexCount < 3 Or *d\maxVertex < 0 : ProcedureReturn -1 : EndIf
       For bindIndex = 0 To *d\bindingCount - 1
+        If AnvilVkPipelineBindingRate(*d\pipeline, bindIndex) <> #VK_VERTEX_INPUT_RATE_VERTEX : ProcedureReturn -1 : EndIf
         *binding = *d\bindings + bindIndex * SizeOf(AnvilVkBackendBinding)
         If *binding\stride < 4 Or *d\maxVertex > (#AVK_SW_HEAP_BYTES / *binding\stride)
           ProcedureReturn -1

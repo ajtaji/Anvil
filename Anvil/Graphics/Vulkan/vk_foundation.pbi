@@ -452,6 +452,8 @@ Structure AnvilVkBackendDraw Align #PB_Structure_AlignC
   clearRectW.i
   clearRectH.i
   clearRectBgra.i
+  instanceCount.i      ; positive for a draw; zero for a clear entry
+  firstInstance.i      ; Vulkan's firstInstance, before the instance divisor
 EndStructure
 
 ; One already-closed ordered draw list. `draws` points to `drawCount`

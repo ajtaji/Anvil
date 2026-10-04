@@ -31,12 +31,14 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv.pbi"
 ; the public Vulkan/pipeline gates own handle parsing and create-info state.
 Global Dim vdsgAttrComp.i[4]
 Global Dim vdsgAttrOff.i[4]
+Global vdsgBindingRate.i = #VK_VERTEX_INPUT_RATE_VERTEX
 Global Dim vdsgUses.a[4]
 
 Procedure.i AnvilVkPipelineAttrCount(pipe.i) : ProcedureReturn 4 : EndProcedure
 Procedure.i AnvilVkPipelineAttrComponents(pipe.i, k.i) : ProcedureReturn vdsgAttrComp[k] : EndProcedure
 Procedure.i AnvilVkPipelineAttrOffset(pipe.i, k.i) : ProcedureReturn vdsgAttrOff[k] : EndProcedure
 Procedure.i AnvilVkPipelineAttrBinding(pipe.i, k.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i AnvilVkPipelineBindingRate(pipe.i, b.i) : ProcedureReturn vdsgBindingRate : EndProcedure
 Procedure.i AnvilVkPipelinePositionAttr(pipe.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineVaryingCount(pipe.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i AnvilVkPipelineVaryingComponents(pipe.i, k.i) : ProcedureReturn 0 : EndProcedure
@@ -251,5 +253,14 @@ Procedure.i Main()
   vdsgPut(70, vdsgHash(#VDSG_PIPE + #AVKQ_OFF_UNIF_VS, #AVKQ_DRAW_UNIF_VS_BYTES))
   vdsgPut(71, PeekL(d1 + #AVKQ_DRAW_OFF_TEX_STATE + 4) & $FFFFFFFF)
   vdsgPut(72, PeekL(d1 + #AVKQ_DRAW_OFF_TEX_STATE + 8) & $FFFFFFFF)
+  ; One instance-rate record uses divisor one and bounds fetch by the
+  ; requested base instance plus count, rather than the vertex index.
+  vdsgDraw\viewportW = 64 : vdsgDraw\viewportH = 32
+  vdsgDraw\instanceCount = 2 : vdsgDraw\firstInstance = 3
+  vdsgBindingRate = #VK_VERTEX_INPUT_RATE_INSTANCE
+  vdsgPut(73, AnvilVkV3dPrepareClosedDrawSlot(1, #VDSG_PIPE, d2, @vdsgDraw))
+  vdsgPut(74, AnvilVkV3dBuildDrawSlotRecord(1, #VDSG_PIPE, d2, @vdsgDraw, 15, 0))
+  vdsgPut(75, PeekU(d2 + #V3D_SHREC_BYTES + 6) & $FFFF)
+  vdsgPut(76, PeekL(d2 + #V3D_SHREC_BYTES + 12) & $FFFFFFFF)
   ProcedureReturn #VDSG_OUT
 EndProcedure
