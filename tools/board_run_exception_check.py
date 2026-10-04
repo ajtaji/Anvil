@@ -40,7 +40,7 @@ def args_for(payload: pathlib.Path, out: pathlib.Path, trace: str | None):
         payload=str(payload), console_ip="192.0.2.10", console_port=5555,
         board_ip=None, port=5001, addr=None, out=str(out), name="proof",
         tier=None, deadman=15, trace=trace, timeout=1.0, shot_timeout=1.0,
-        settle=0.01, twin=False, no_shot=False, expect_x0="0",
+        settle=0.01, twin=False, no_shot=False, shot_text=True, expect_x0="0",
     )
 
 
@@ -200,6 +200,7 @@ class FakeConsole:
         self.name = f"{ip}:{port}"
         self.transcript = []
         self.accepted_datagrams = []
+        self.keepalives = 0
         self.sent = []
         self.listen_read = False
         self.shot_read = False

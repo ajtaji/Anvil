@@ -276,7 +276,7 @@ def args_for(payload, out, **extra):
         payload=str(payload), console_ip="192.0.2.10", console_port=5555,
         board_ip=None, port=5001, addr=None, out=str(out), name="proof",
         tier=None, deadman=15, trace=None, timeout=2.0, shot_timeout=5.0,
-        settle=0.05, twin=False, no_shot=False, expect_x0="0",
+        settle=0.05, twin=False, no_shot=False, shot_text=True, expect_x0="0",
         ask_seconds=2.5,
     )
     for key, value in extra.items():
