@@ -73,7 +73,7 @@ FIXTURE = pathlib.PurePosixPath("RaspberryPi5/Tests/gem2712_probe.pi5")
 LIBRARY = pathlib.PurePosixPath("RaspberryPi4/Lib/gem.pi4")
 SEAM = pathlib.PurePosixPath("RaspberryPi4/Board/hw_link.pi4")
 HAL = pathlib.PurePosixPath("Anvil/Hal/hal.pbi")
-DEFAULT_SOURCES = pathlib.Path(r"C:\Users\ajtaj\Desktop\CompilerEmbedded\Raspberry Pi 5")
+DEFAULT_SOURCES = pathlib.Path(os.environ.get("PI5_SOURCES", str(ROOT / "RaspberryPi5" / "Reference")))
 
 LOAD, STACK, LOADER_SP, LOADER_LR = 0x00400000, 0x03000000, 0x00100000, 0xDEADBEE0
 CTL, OUT, DONE = 0x00E00000, 0x00E00100, 0x600DF00D
@@ -268,7 +268,8 @@ class Board:
         self.log = []
         # pcie2 + RP1
         self.rc = {PCIE_STATUS: 0x80 if scen == "rp1-down" else 0xB0, LNK_WORD: ((4 << 4 | 2) << 16),
-                   rc_bar(1): 21, rc_bar(1) + 4: 0x10, ubus_bar(1): 1, ubus_bar(1) + 4: 0}
+                   rc_bar(1): 21, rc_bar(1) + 4: 0x10, ubus_bar(1): 1, ubus_bar(1) + 4: 0,
+                   0x18: 0x00010100}   # root port buses 0/1/1 - see a64_xhci_pi5_check
         self.cfg = {0x00: RP1_ID, 0x04: 0x00100002}
         self.cfg_index = 0
         self.rp1_touched = False

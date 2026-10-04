@@ -14,10 +14,14 @@ readings, and fan control. That boot refused PCIe because the RP1 inbound
 window was not adopted; USB, card storage and Ethernet could not start. The
 card did not yet contain the later PCIe, storage-order and idle changes saved
 for the next hardware session. A later returning PCIe/RP1 payload adopted the
-firmware window and completed two xHCI No-Op DMA requests on silicon; its
-remaining desk gates and monitor integration were still parked. The first
-prompt proves Anvil boots here, while those device paths remain separate
-acceptance work.
+firmware's base-zero inbound window, set the root port's missing bus numbers,
+adopted RP1's BAR, and completed two xHCI No-Op DMA requests on silicon. The
+shared monitor source now includes that adoption path. Its modeled PCIe,
+xHCI, keyboard, USB-storage and GEM gates pass, and the Pi 4 image is
+byte-identical before and after the BCM2712-only change. The updated monitor
+has **not** been booted on Pi 5; the first prompt remains the last full-monitor
+silicon result, and USB, card storage and Ethernet remain separate acceptance
+work.
 
 The board-specific `RaspberryPi5/Board/board.pi4` is an earlier framebuffer,
 logo and serial composition. `RaspberryPi5/Boot/board.pi4` is an even earlier
@@ -31,9 +35,9 @@ GPU-rendered console proof. Its display currently uses the firmware surface;
 the DMA/blitter path was still failing at the pause point. Pi 5 HDMI EDID,
 DSI video and further GPU bring-up remain open.
 
-The next board session should first finish the saved PCIe inbound-window
-adoption, storage boot order and idle-sleep gates, then build a checked card
-from main and verify that SD, USB and Ethernet work from `pmf>`. Returning RAM
+The next board session should build a checked card from main and verify the
+PCIe adoption in the full monitor, then check SD, USB and Ethernet from
+`pmf>`. Storage boot order and idle-sleep work remains parked. Returning RAM
 payloads with the deadman armed are the test path for V3D 7.1 before changing
 the resident monitor. Do not infer device or Vulkan support from a compile
 gate alone.

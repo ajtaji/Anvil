@@ -53,7 +53,8 @@ Pi 5 firmware ignored kernel_address=0x200000 with our arm stub (measured
 Every store into the running image's code is a failure, with the writer
 named.
 
-    py -3 tools/a64/pi5_boot_to_prompt_check.py --compiler PureMetalForge.exe [--commit REV]
+    py -3 tools/a64/pi5_boot_to_prompt_check.py --compiler PureMetalForge.exe
+        --boot-staging <directory-with-dtb-and-config.txt> [--commit REV]
 """
 from __future__ import annotations
 
@@ -79,8 +80,8 @@ from a64_interp import A64, attach_symbols               # noqa: E402
 
 LOAD = 0x80000
 DTB_AT = 0x2EFEC600
-DTB_FILE = pathlib.Path(r"C:\Users\ajtaj\Desktop\CompilerEmbedded\Raspberry Pi 5\Boot staging\bcm2712-rpi-5-b.dtb")
-CONFIG_FILE = DTB_FILE.parent / "config.txt"
+DTB_FILE: pathlib.Path
+CONFIG_FILE: pathlib.Path
 FIRMWARE_LOAD = 0x80000      # measured 2026-09-27, kernel_address or not (docstring)
 WRONG_LOAD = 0x200000        # the `wrongload` scenario: the old link address
 FORCED_LOAD = None
@@ -443,12 +444,21 @@ def judge(label, scen, r, check):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default=os.environ.get("PMF_COMPILER"))
+    ap.add_argument("--boot-staging", default=os.environ.get("PI5_BOOT_STAGING"),
+                    type=pathlib.Path, help="directory containing bcm2712-rpi-5-b.dtb and config.txt")
     ap.add_argument("--commit", default="HEAD")
     ap.add_argument("--images", type=pathlib.Path, help="a directory already holding ANVIL5.IMG/.NOC (+ .dbg/.sym)")
     ap.add_argument("--scenarios", default="absent,rp1-down,nocard,wrongload")
     ap.add_argument("--transcripts", type=pathlib.Path)
     ap.add_argument("--load", type=lambda s: int(s, 0), help="override the load address (every scenario)")
     a = ap.parse_args()
+    if a.boot_staging is None:
+        ap.error("pass --boot-staging or set PI5_BOOT_STAGING")
+    staging = a.boot_staging.expanduser().resolve()
+    globals()["DTB_FILE"] = staging / "bcm2712-rpi-5-b.dtb"
+    globals()["CONFIG_FILE"] = staging / "config.txt"
+    if not DTB_FILE.is_file() or not CONFIG_FILE.is_file():
+        ap.error("boot staging must contain bcm2712-rpi-5-b.dtb and config.txt")
     globals()["FORCED_LOAD"] = a.load
     print("  load address: %s" % ("$%X, given" % a.load if a.load is not None else
                                   "$%X, the firmware's (wrongload: $%X)" % (FIRMWARE_LOAD, WRONG_LOAD)))

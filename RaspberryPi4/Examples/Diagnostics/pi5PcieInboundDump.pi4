@@ -1,0 +1,85 @@
+; ======================================================================
+;  pi5PcieInboundDump.pi4 - READ-ONLY: the pcie2 (RP1 link) registers as
+;  the firmware left them. A payload for a RUNNING Pi 5 monitor.
+; ======================================================================
+;  WHY. Build 215 refused USB and Ethernet with "pcie error -16: no inbound
+;  window maps PCIe $10_0000_0000 onto ARM physical 0". Before anything
+;  writes a window, this records exactly what the firmware left: every
+;  inbound BAR (RC_BAR1..10, UBUS_BAR1..10), MISC_CTRL, the status, the
+;  link word, the outbound window 0 and the BAR2 endian mode.
+;
+;  IT WRITES NO REGISTER. Every access is a 32-bit read of the pcie2 block
+;  at $10_0012_0000 (bcm2712.dtsi pcie2 reg). RP1's config space is NOT
+;  read, because that takes a write to EXT_CFG_INDEX. The only memory
+;  written is the report below.
+;
+;  THE REPORT, 32-bit words at $00600000 (in the monitor's low payload
+;  window, well above this image and its data):
+;    +0   'PCD1' ($31444350)
+;    +4   the number of (offset, value) pairs that follow
+;    +8   pairs: pcie2 register offset, the value read
+;  The payload returns $00600000 in x0. Read the report with
+;    md.l 600000 1B0
+;
+;  BUILD
+;    PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi5PcieInboundDump.pi4
+;        -t pi5 --load-addr 0x400000 --stack-addr 0x7E00000 --entry-returns
+;        -o pi5pcid.img -s
+; ======================================================================
+EnableExplicit
+
+#RC   = $1000120000
+#OUT  = $00600000
+
+Global n.i = 0
+
+Procedure Rd(off.i)
+  Define v.i
+  v = PeekL(#RC + off) & $FFFFFFFF
+  ASM
+    dsb sy
+  EndASM
+  PokeL(#OUT + 8 + (n * 8), off)
+  PokeL(#OUT + 12 + (n * 8), v)
+  n = n + 1
+EndProcedure
+
+Procedure.i Main()
+  Define i.i
+  n = 0
+  Rd($4068)                 ; PCIE_STATUS: bit7 RC mode, 5 DL_ACTIVE, 4 PHYLINKUP
+  Rd($00BC)                 ; LNKCTL/LNKSTA: speed 19:16, width 25:20
+  Rd($4008)                 ; MISC_CTRL: SCB_ACCESS_EN $1000, burst 21:20
+  Rd($4064)                 ; MISC_PCIE_CTRL: PERSTB bit 2
+  Rd($0188)                 ; VENDOR_SPECIFIC_REG1: BAR2 endian 3:2
+  Rd($40A4)                 ; UBUS_CTRL
+  Rd($40A8)                 ; UBUS_TIMEOUT
+  Rd($400C)                 ; CPU_2_PCIE_MEM_WIN0_LO
+  Rd($4010)                 ; CPU_2_PCIE_MEM_WIN0_HI
+  Rd($4070)                 ; WIN0_BASE_LIMIT
+  Rd($4080)                 ; WIN0_BASE_HI
+  Rd($4084)                 ; WIN0_LIMIT_HI
+  i = 0
+  While i < 6               ; RC_BAR1..3 CONFIG_LO/HI
+    Rd($402C + 4 * i)
+    i = i + 1
+  Wend
+  i = 0
+  While i < 14              ; RC_BAR4..10 CONFIG_LO/HI
+    Rd($40D4 + 4 * i)
+    i = i + 1
+  Wend
+  i = 0
+  While i < 6               ; UBUS_BAR1..3 CONFIG_REMAP LO/HI
+    Rd($40AC + 4 * i)
+    i = i + 1
+  Wend
+  i = 0
+  While i < 14              ; UBUS_BAR4..10 CONFIG_REMAP LO/HI
+    Rd($410C + 4 * i)
+    i = i + 1
+  Wend
+  PokeL(#OUT + 0, $31444350)
+  PokeL(#OUT + 4, n)
+  ProcedureReturn #OUT
+EndProcedure

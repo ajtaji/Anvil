@@ -161,6 +161,11 @@ class Rp1Ctl(X.Ctl):
         self.rc: dict[int, int] = {
             PCIE_STATUS: 0x80 if scenario == "link-down" else 0xB0,
             LNK_WORD: ((4 << 4 | 2) << 16),      # x4, 5 GT/s (max-link-speed 2)
+            # The root port's bus numbers ($18): primary 0, secondary 1,
+            # subordinate 1 - as the kernel's pci_scan_bridge leaves them.
+            # The firmware leaves them 0 (measured 2026-09-27); that state,
+            # and PcieEnumerate writing them, is a64_pcie_pi5_inbound_check's.
+            0x18: 0x00010100,
         }
         if scenario != "no-inbound":
             # BAR1: PCIe $10_0000_0000, 64 GiB (size code 36 - 15 = 21),
@@ -685,7 +690,9 @@ MUTANTS = {
                                  "    Wend\n", "\n"),
     "no-rp1-bus-master": (PCIE, "    PcieCfgWrite32(1, 0, 0, #PCI_CFG_COMMAND, cmd | #PCI_CMD_BUS_MASTER)\n    ProcedureReturn Bool(",
                           "    ProcedureReturn Bool("),
-    "dma-offset-zero": (PCIE, "  #PCIE_DMA_BUS  = $1000000000", "  #PCIE_DMA_BUS  = $0000000000"),
+    # Re-aimed 2026-09-27: the base is ADOPTED from the window (pcie.pi4's
+    # pcie_dmaBase), so a zero offset is PcieDmaBus ignoring it.
+    "dma-offset-zero": (PCIE, "    ProcedureReturn physAddr + pcie_dmaBase\n", "    ProcedureReturn physAddr\n"),
     "no-link-check": (PCIE, "    If PcieLinkUp() = 0\n      pcie_err = #PCIE_ERR_LINK\n",
                       "    If 0 = 1\n      pcie_err = #PCIE_ERR_LINK\n"),
     "no-inbound-check": (PCIE, "    If pcie_FindDmaWindow() = 0\n      pcie_err = #PCIE_ERR_INBOUND\n",
