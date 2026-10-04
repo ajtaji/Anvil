@@ -1,0 +1,224 @@
+; Desk-only deterministic internal queue compute and lease proof.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#DR_IN = $06000000
+#DR_OUT = $06100000
+#DR_HEAP = $06200000
+#DR_NAME = $06300000
+
+Procedure drPut(n.i, value.i)
+  PokeI(#DR_OUT + n * 8, value)
+EndProcedure
+
+Procedure.i drRecordClear(commandBuffer.i, image.i)
+  Define bar.VkImageMemoryBarrier
+  Define range.VkImageSubresourceRange
+  Dim colour.l[4]
+  If AnvilVkCommandBufferReset(commandBuffer, 0) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If AnvilVkCommandBufferBegin(commandBuffer, 0) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+  bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
+  bar\oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\image = image
+  bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
+  AnvilVkCmdImageBarrier(commandBuffer, #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, @bar)
+  range\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  range\levelCount = 1 : range\layerCount = 1
+  colour[0] = $3F800000 : colour[3] = $3F800000
+  AnvilVkCmdClearColorImage(commandBuffer, image, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, @colour[0], @range)
+  If AnvilVkCommandBufferEnd(commandBuffer) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i Main()
+  Protected device.i, queue.i, module.i, pipeline.i, dslHandle.i, layout.i
+  Protected buffer.i, memory.i, pool.i, set.i, cmdPool.i, cmd.i, c.i, rc.i, k.i, before.i
+  Protected fence.i, semaphore.i, reservation.i, pipeSlot.i, setSlot.i, bufferSlot.i, memorySlot.i
+  Protected image.i, imageMemory.i, graphicsCmd.i, imageSlot.i
+  Protected semCI.VkSemaphoreCreateInfo
+  Protected submitInfo.VkSubmitInfo
+  Protected sm.VkShaderModuleCreateInfo
+  Protected Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Protected dsl.VkDescriptorSetLayoutCreateInfo
+  Protected pl.VkPipelineLayoutCreateInfo
+  Protected cp.VkComputePipelineCreateInfo
+  Protected poolSize.VkDescriptorPoolSize
+  Protected pci.VkDescriptorPoolCreateInfo
+  Protected ai.VkDescriptorSetAllocateInfo
+  Protected Dim infos.VkDescriptorBufferInfo[2]
+  Protected Dim writes.VkWriteDescriptorSet[2]
+  drPut(0, $44525034)
+  avkDevGen[1] = avkNextGen(avkDevGen[1]) : avkDevLive[1] = 1
+  device = avkToken(#ANVIL_VK_TYPE_DEVICE, 1, avkDevGen[1])
+  avkQueueGen[1] = avkNextGen(avkQueueGen[1]) : avkQueueLive[1] = 1 : avkQueueDev[1] = 1
+  queue = avkToken(#ANVIL_VK_TYPE_QUEUE, 1, avkQueueGen[1])
+  AnvilVkTestBackendHeap(#DR_HEAP, $04000000)
+  avkTbComputeMode = 1 : avkTbLeaseRequired = 1
+  sm\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  sm\pCode = PeekI(#DR_IN) : sm\codeSize = PeekI(#DR_IN + 8)
+  If vkCreateShaderModule(device, @sm, 0, @module) <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  For k = 0 To 1
+    bindings[k]\binding = k : bindings[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    bindings[k]\descriptorCount = 1 : bindings[k]\stageFlags = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  dsl\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dsl\bindingCount = 2 : dsl\pBindings = @bindings[0]
+  If vkCreateDescriptorSetLayout(device, @dsl, 0, @dslHandle) <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  pl\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  pl\setLayoutCount = 1 : pl\pSetLayouts = @dslHandle
+  If vkCreatePipelineLayout(device, @pl, 0, @layout) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  cp\sType = #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  cp\stage\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  cp\stage\stage = #VK_SHADER_STAGE_COMPUTE_BIT
+  PokeL(#DR_NAME, $6E69616D) : PokeA(#DR_NAME + 4, 0)
+  cp\stage\module = module : cp\stage\pName = #DR_NAME
+  cp\layout = layout : cp\basePipelineIndex = -1
+  If AnvilVkComputePipelineCreate(device, @cp, @pipeline) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+  If AnvilVkBufferCreate(device, 8192, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @buffer) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  If AnvilVkMemoryAllocate(device, 8192, 0, @memory) <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  If AnvilVkBufferBindMemory(device, buffer, memory, 0) <> #VK_SUCCESS : ProcedureReturn 8 : EndIf
+  poolSize\type = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : poolSize\descriptorCount = 2
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  pci\maxSets = 1 : pci\poolSizeCount = 1 : pci\pPoolSizes = @poolSize
+  If AnvilVkDescriptorPoolCreate(device, @pci, @pool) <> #VK_SUCCESS : ProcedureReturn 9 : EndIf
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool : ai\descriptorSetCount = 1 : ai\pSetLayouts = @dslHandle
+  If AnvilVkDescriptorSetsAllocate(device, @ai, @set) <> #VK_SUCCESS : ProcedureReturn 10 : EndIf
+  infos[0]\buffer = buffer : infos[0]\offset = 0 : infos[0]\range = 768
+  infos[1]\buffer = buffer : infos[1]\offset = 4096 : infos[1]\range = 2304
+  For k = 0 To 1
+    writes[k]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    writes[k]\dstSet = set : writes[k]\dstBinding = k
+    writes[k]\descriptorCount = 1 : writes[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    writes[k]\pBufferInfo = @infos[k]
+    If AnvilVkDescriptorSetWriteOne(device, @writes[k]) <> #VK_SUCCESS : ProcedureReturn 11 + k : EndIf
+  Next
+  If AnvilVkCommandPoolCreate(device, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @cmdPool) <> #VK_SUCCESS : ProcedureReturn 13 : EndIf
+  If AnvilVkCommandBufferAllocate(device, cmdPool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmd) <> #VK_SUCCESS : ProcedureReturn 14 : EndIf
+  c = avkCmdSlot(cmd)
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  drPut(1, avkCbFailCode[c]) : drPut(2, avkCbComputeRecorded[c])
+  drPut(3, avkCbComputeGroupsX[c]) : drPut(4, avkCbComputeItems[c])
+  drPut(5, avkCbComputeInputBase[c]) : drPut(6, avkCbComputeOutputBase[c])
+  drPut(7, avkCbComputeOutputWrittenBytes[c])
+  drPut(8, Bool(avkCbComputeRecordPipe[c] = pipeline And avkCbComputeRecordSet[c] = set))
+  drPut(9, AnvilVkCommandBufferEnd(cmd))
+  pipeSlot = avkPipeSlot(pipeline) : setSlot = avkDsSlot(set)
+  bufferSlot = avkBufSlot(buffer) : memorySlot = avkMemSlot(memory)
+  before = avkSubmitCount
+  drPut(10, AnvilVkQueueSubmitOne(queue, cmd, 0, 0))
+  drPut(11, Bool(avkSubmitCount = before + 1 And avkCompleteCount = avkSubmitCount And avkFlightActive = 0 And avkTbLeaseOwner = 0 And avkTbComputeSubmitCalls = 1))
+  drPut(12, Bool(avkPipeInFlight[pipeSlot] = 0 And avkDsInFlight[setSlot] = 0 And avkBufInFlight[bufferSlot] = 0 And avkMemInFlight[memorySlot] = 0 And avkFlightComputeScratch = 0))
+
+  If PeekI(#DR_IN + 16) = 2
+    If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 51 : EndIf
+    If avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 52 : EndIf
+    drPut(34, avkFlightPoll())
+    drPut(35, AnvilVkDeviceWaitIdle(device))
+    drPut(36, Bool(avkFlightActive = 0 And avkTbLeaseOwner = -#ANVIL_VK_GPU_LEASE_EXTERNAL))
+    If AnvilVkFenceCreate(device, 0, @fence) <> #VK_SUCCESS : ProcedureReturn 53 : EndIf
+    before = avkSubmitCount
+    drPut(37, AnvilVkQueueSubmitOne(queue, 0, fence, 0))
+    drPut(38, AnvilVkDeviceDestroy(device))
+    drPut(39, Bool(avkSubmitCount = before And avkDevLive[1] = 1 And avkTbLeaseOwner = -#ANVIL_VK_GPU_LEASE_EXTERNAL))
+    drPut(40, AnvilVkFenceStatus(device, fence))
+    ProcedureReturn 0
+  EndIf
+
+  ; A second emitted run probes the ordinary graphics clear path.
+  If PeekI(#DR_IN + 16) = 1
+  If AnvilVkImageCreate(device, 16, 16, #VK_FORMAT_B8G8R8A8_UNORM, #VK_IMAGE_TILING_LINEAR, #VK_IMAGE_USAGE_TRANSFER_DST_BIT, #VK_IMAGE_LAYOUT_UNDEFINED, @image) <> #VK_SUCCESS : ProcedureReturn 42 : EndIf
+  If AnvilVkMemoryAllocate(device, 4096, 0, @imageMemory) <> #VK_SUCCESS : ProcedureReturn 43 : EndIf
+  If AnvilVkImageBindMemory(device, image, imageMemory, 0) <> #VK_SUCCESS : ProcedureReturn 44 : EndIf
+  If AnvilVkCommandBufferAllocate(device, cmdPool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @graphicsCmd) <> #VK_SUCCESS : ProcedureReturn 45 : EndIf
+  If drRecordClear(graphicsCmd, image) = 0 : ProcedureReturn 46 : EndIf
+  imageSlot = avkImgSlot(image)
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 47 : EndIf
+  before = avkTbCalls
+  drPut(26, AnvilVkQueueSubmitOne(queue, graphicsCmd, 0, 0))
+  drPut(27, Bool(avkTbCalls = before And avkCmdState[avkCmdSlot(graphicsCmd)] = #ANVIL_VK_CB_EXECUTABLE And avkTbLeaseOwner = #ANVIL_VK_GPU_LEASE_EXTERNAL))
+  If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 48 : EndIf
+  drPut(28, AnvilVkQueueSubmitOne(queue, graphicsCmd, 0, 0))
+  drPut(29, Bool(avkTbCalls = before + 1 And avkTbLeaseOwner = 0 And avkFlightActive = 0 And avkImgInFlight[imageSlot] = 0))
+  If drRecordClear(graphicsCmd, image) = 0 : ProcedureReturn 49 : EndIf
+  If AnvilVkFenceCreate(device, 0, @fence) <> #VK_SUCCESS : ProcedureReturn 50 : EndIf
+  avkTbFail = 992
+  drPut(30, AnvilVkQueueSubmitOne(queue, graphicsCmd, fence, 0))
+  drPut(31, Bool(avkFlightActive = 1 And avkFlightQuarantined = 1 And avkTbLeaseOwner = -#ANVIL_VK_GPU_LEASE_QUEUE And avkImgInFlight[imageSlot] = 1 And avkCmdState[avkCmdSlot(graphicsCmd)] = #ANVIL_VK_CB_PENDING))
+  drPut(32, AnvilVkFenceStatus(device, fence))
+  drPut(33, avkFlightPoll())
+  ProcedureReturn 0
+  EndIf
+
+  ; A rejected backend before CSD launch releases the lease and every ref.
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 30 : EndIf
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 31 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  If AnvilVkCommandBufferEnd(cmd) <> #VK_SUCCESS : ProcedureReturn 32 : EndIf
+  avkTbComputeMode = 2
+  drPut(13, AnvilVkQueueSubmitOne(queue, cmd, 0, 0))
+  drPut(14, Bool(avkFlightActive = 0 And avkTbLeaseOwner = 0 And avkCmdState[c] = #ANVIL_VK_CB_INVALID And avkPipeInFlight[pipeSlot] = 0 And avkDsInFlight[setSlot] = 0 And avkBufInFlight[bufferSlot] = 0 And avkMemInFlight[memorySlot] = 0 And avkFlightComputeScratch = 0))
+
+  ; An external lease refusal occurs before a fence, semaphore or flight is claimed.
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 33 : EndIf
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 34 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  If AnvilVkCommandBufferEnd(cmd) <> #VK_SUCCESS : ProcedureReturn 35 : EndIf
+  avkTbComputeMode = 1
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 36 : EndIf
+  before = avkTbComputeSubmitCalls
+  drPut(15, AnvilVkQueueSubmitOne(queue, cmd, 0, 0))
+  drPut(16, Bool(avkTbComputeSubmitCalls = before And avkFlightActive = 0 And avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE And avkTbLeaseOwner = #ANVIL_VK_GPU_LEASE_EXTERNAL))
+  If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn 37 : EndIf
+
+  ; A changed descriptor address is refused at submit, before acquiring the lease.
+  infos[0]\offset = 4
+  If AnvilVkDescriptorSetWriteOne(device, @writes[0]) <> #VK_SUCCESS : ProcedureReturn 38 : EndIf
+  before = avkTbComputeSubmitCalls
+  drPut(17, AnvilVkQueueSubmitOne(queue, cmd, 0, 0))
+  drPut(18, Bool(avkTbComputeSubmitCalls = before And avkFlightActive = 0 And avkTbLeaseOwner = 0 And avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE))
+  infos[0]\offset = 0
+  If AnvilVkDescriptorSetWriteOne(device, @writes[0]) <> #VK_SUCCESS : ProcedureReturn 39 : EndIf
+
+  ; An attempted CSD with uncertain completion permanently owns its flight.
+  semCI\sType = #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+  If vkCreateSemaphore(device, @semCI, 0, @semaphore) <> #VK_SUCCESS : ProcedureReturn 40 : EndIf
+  If AnvilVkFenceCreate(device, 0, @fence) <> #VK_SUCCESS : ProcedureReturn 41 : EndIf
+  submitInfo\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  submitInfo\commandBufferCount = 1 : submitInfo\pCommandBuffers = @cmd
+  submitInfo\signalSemaphoreCount = 1 : submitInfo\pSignalSemaphores = @semaphore
+  avkTbComputeMode = 3
+  drPut(19, vkQueueSubmit(queue, 1, @submitInfo, fence))
+  reservation = avkFlightSemaphoreReservation
+  drPut(20, Bool(avkFlightActive = 1 And avkFlightQuarantined = 1 And avkCmdState[c] = #ANVIL_VK_CB_PENDING And avkTbLeaseOwner = -#ANVIL_VK_GPU_LEASE_QUEUE And reservation <> 0 And avkSemaphoreReservationSlot(reservation) <> 0))
+  drPut(21, Bool(avkPipeInFlight[pipeSlot] = 1 And avkDsInFlight[setSlot] = 1 And avkBufInFlight[bufferSlot] = 2 And avkMemInFlight[memorySlot] = 2 And avkFlightComputeScratch <> 0))
+  drPut(22, AnvilVkFenceStatus(device, fence))
+  drPut(23, avkFlightPoll())
+  drPut(24, AnvilVkDeviceWaitIdle(device))
+  drPut(25, Bool(avkFlightActive = 1 And avkFlightQuarantined = 1 And avkFlightSemaphoreReservation = reservation And avkSemaphoreReservationSlot(reservation) <> 0 And avkFlightComputeScratch <> 0))
+  ProcedureReturn 0
+EndProcedure

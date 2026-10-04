@@ -158,8 +158,10 @@ Global Dim avkCbComputeRecordPipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeRecordSet.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeGroupsX.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeInputBase.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeInputBuffer.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeInputBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeOutputBase.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeOutputBuffer.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeOutputBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeOutputWrittenBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 Global Dim avkCbComputeItems.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
@@ -449,8 +451,40 @@ Global avkFlightActive.i = 0
 Global avkFlightCb.i = 0
 Global avkFlightFence.i = 0
 Global avkFlightSemaphoreReservation.i = 0
+Global avkFlightGpuLeaseHeld.i = 0
+Global avkFlightBackendAttempted.i = 0
+Global avkFlightQuarantined.i = 0
+Global avkFlightComputePipe.i = 0
+Global avkFlightComputeSet.i = 0
+Global avkFlightComputeInputBuf.i = 0
+Global avkFlightComputeOutputBuf.i = 0
+Global avkFlightComputeInputMem.i = 0
+Global avkFlightComputeOutputMem.i = 0
+Global avkFlightComputeScratch.i = 0
 Global avkSubmitCount.i = 0
 Global avkCompleteCount.i = 0
+
+Structure AnvilVkComputeFlightPlan Align #PB_Structure_AlignC
+  pipelineSlot.i
+  setSlot.i
+  inputBufferSlot.i
+  outputBufferSlot.i
+  inputBuffer.i
+  outputBuffer.i
+  inputMemorySlot.i
+  outputMemorySlot.i
+  inputBase.i
+  inputBytes.i
+  outputBase.i
+  outputBytes.i
+  outputWrittenBytes.i
+  groupsX.i
+  items.i
+EndStructure
+Declare.i avkComputeFlightPreflight(deviceSlot.i, pipeline.i, set.i, groupsX.i, *out.AnvilVkComputeFlightPlan)
+Declare.i avkComputeFlightIr(pipelineSlot.i)
+Declare avkComputeFlightRetain(*plan.AnvilVkComputeFlightPlan)
+Declare avkComputeFlightRelease()
 
 Procedure.i avkRefIndex(c.i, k.i)
   ProcedureReturn ((c - 1) * #ANVIL_VK_MAX_CB_REFS) + k
@@ -1589,7 +1623,9 @@ Procedure.i avkCbClear(c.i)
   avkCbComputeRecordPipe[c] = 0 : avkCbComputeRecordSet[c] = 0
   avkCbComputeGroupsX[c] = 0 : avkCbComputeItems[c] = 0
   avkCbComputeInputBase[c] = 0 : avkCbComputeInputBytes[c] = 0
+  avkCbComputeInputBuffer[c] = 0
   avkCbComputeOutputBase[c] = 0 : avkCbComputeOutputBytes[c] = 0
+  avkCbComputeOutputBuffer[c] = 0
   avkCbComputeOutputWrittenBytes[c] = 0
   k = 0
   While k < #ANVIL_VK_MAX_BINDINGS
@@ -2176,6 +2212,13 @@ Procedure avkFlightReleaseRefs(c.i)
     EndIf
     k = k + 1
   Wend
+  If avkFlightComputePipe > 0
+    avkComputeFlightRelease()
+    avkFlightComputePipe = 0 : avkFlightComputeSet = 0
+    avkFlightComputeInputBuf = 0 : avkFlightComputeOutputBuf = 0
+    avkFlightComputeInputMem = 0 : avkFlightComputeOutputMem = 0
+    avkFlightComputeScratch = 0
+  EndIf
 EndProcedure
 
 ; Apply the recorded layout results and let the retained resources go.
@@ -2189,6 +2232,22 @@ Procedure avkFlightComplete(ok.i)
   Define semRc.i
   If avkFlightActive = 0
     ProcedureReturn
+  EndIf
+  If avkFlightQuarantined <> 0
+    ProcedureReturn
+  EndIf
+  If ok = 0 And avkFlightGpuLeaseHeld <> 0 And avkFlightBackendAttempted <> 0
+    avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_QUEUE)
+    avkFlightQuarantined = 1
+    ProcedureReturn
+  EndIf
+  If avkFlightGpuLeaseHeld <> 0
+    If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) = 0
+      avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_QUEUE)
+      avkFlightQuarantined = 1
+      ProcedureReturn
+    EndIf
+    avkFlightGpuLeaseHeld = 0
   EndIf
   c = avkFlightCb
   If ok <> 0
@@ -2229,7 +2288,97 @@ Procedure avkFlightComplete(ok.i)
   avkFlightCb = 0
   avkFlightFence = 0
   avkFlightSemaphoreReservation = 0
+  avkFlightBackendAttempted = 0
   avkCompleteCount = avkCompleteCount + 1
+EndProcedure
+
+; Internal one-dispatch path. Public vkCmdDispatch and the queue's compute
+; capability remain withheld until hardware proof.
+Procedure.i avkQueueSubmitRecordedCompute(deviceSlot.i, commandSlot.i, fence.i, semaphoreReservation.i)
+  Define plan.AnvilVkComputeFlightPlan
+  Define work.AnvilVkBackendComputeJob
+  Define result.AnvilVkBackendComputeResult
+  Define rc.i, f.i, scratch.i, scratchBytes.i, lease.i
+  If avkCbComputeRecordPipe[commandSlot] = 0 Or avkCbComputeRecordSet[commandSlot] = 0 Or avkCmdOps[commandSlot] <> 0 Or avkCbDrawCount[commandSlot] <> 0 Or avkCbRpDone[commandSlot] <> 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "compute submission needs exactly one isolated recorded dispatch.")
+  EndIf
+  rc = avkComputeFlightPreflight(deviceSlot, avkCbComputeRecordPipe[commandSlot], avkCbComputeRecordSet[commandSlot], avkCbComputeGroupsX[commandSlot], @plan)
+  If rc <> #VK_SUCCESS : ProcedureReturn avkFault(rc, "compute submission found a stale pipeline, descriptor, buffer or range.") : EndIf
+  If plan\inputBuffer <> avkCbComputeInputBuffer[commandSlot] Or plan\outputBuffer <> avkCbComputeOutputBuffer[commandSlot] Or plan\inputBase <> avkCbComputeInputBase[commandSlot] Or plan\inputBytes <> avkCbComputeInputBytes[commandSlot] Or plan\outputBase <> avkCbComputeOutputBase[commandSlot] Or plan\outputBytes <> avkCbComputeOutputBytes[commandSlot] Or plan\outputWrittenBytes <> avkCbComputeOutputWrittenBytes[commandSlot] Or plan\items <> avkCbComputeItems[commandSlot]
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "compute descriptors changed after dispatch recording; re-record the command buffer.")
+  EndIf
+  scratchBytes = avkBackendComputeScratchBytes()
+  If scratchBytes <> 4096 Or avkBackendComputeCanLower(avkComputeFlightIr(plan\pipelineSlot)) = 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "the selected backend cannot execute this compute graph.")
+  EndIf
+  lease = avkBackendGpuLeaseRequired()
+  If lease <> 0
+    If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_QUEUE) = 0
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "another GPU owner holds the shared lease; compute was not submitted.")
+    EndIf
+  EndIf
+  rc = avkHeapBind()
+  If rc <> #VK_SUCCESS
+    If lease <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
+    ProcedureReturn rc
+  EndIf
+  scratch = avkInternalAlloc(scratchBytes)
+  If scratch = 0
+    If lease <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
+    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_DEVICE_MEMORY, "compute could not reserve its private GPU scratch page.")
+  EndIf
+  If (avkInternalBase(scratch) % 4096) <> 0
+    avkInternalFree(scratch)
+    If lease <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
+    ProcedureReturn avkFault(#VK_ERROR_OUT_OF_DEVICE_MEMORY, "compute scratch is not page aligned.")
+  EndIf
+  f = 0
+  If fence <> #VK_NULL_HANDLE
+    f = avkFenceAcquire(deviceSlot, fence)
+    If f <= 0
+      avkInternalFree(scratch)
+      If lease <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
+      ProcedureReturn f
+    EndIf
+  EndIf
+  If semaphoreReservation <> #VK_NULL_HANDLE
+    rc = avkSemaphoreCommit(semaphoreReservation)
+    If rc <> #VK_SUCCESS
+      If f > 0 : avkFenceRelease(f) : EndIf
+      avkInternalFree(scratch)
+      If lease <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
+      ProcedureReturn rc
+    EndIf
+  EndIf
+  avkFlightActive = 1 : avkFlightCb = commandSlot : avkFlightFence = f
+  avkFlightSemaphoreReservation = semaphoreReservation
+  avkFlightGpuLeaseHeld = lease : avkFlightBackendAttempted = 0 : avkFlightQuarantined = 0
+  avkFlightComputePipe = plan\pipelineSlot : avkFlightComputeSet = plan\setSlot
+  avkFlightComputeInputBuf = plan\inputBufferSlot : avkFlightComputeOutputBuf = plan\outputBufferSlot
+  avkFlightComputeInputMem = plan\inputMemorySlot : avkFlightComputeOutputMem = plan\outputMemorySlot
+  avkFlightComputeScratch = scratch
+  avkComputeFlightRetain(@plan)
+  avkCmdState[commandSlot] = #ANVIL_VK_CB_PENDING
+  avkSubmitCount = avkSubmitCount + 1
+  work\ir = avkComputeFlightIr(plan\pipelineSlot)
+  work\scratchBase = avkInternalBase(scratch) : work\scratchBytes = scratchBytes
+  work\inputBase = plan\inputBase : work\inputBytes = plan\inputBytes
+  work\outputBase = plan\outputBase : work\outputBytes = plan\outputBytes
+  work\outputWrittenBytes = plan\outputWrittenBytes : work\groupsX = plan\groupsX
+  work\timeoutUs = 250000
+  rc = avkBackendSubmitCompute(@work, @result)
+  If rc = #ANVIL_VK_JOB_DONE And result\complete <> 0
+    avkFlightComplete(1)
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  If result\mayHaveLaunched <> 0
+    avkFlightBackendAttempted = 1
+    avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_QUEUE)
+    avkFlightQuarantined = 1
+    ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "compute CSD completion is uncertain; its GPU lease, resources, semaphore and fence remain quarantined.")
+  EndIf
+  avkFlightComplete(0)
+  ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "compute backend refused before launch; the queue reservation was rolled back.")
 EndProcedure
 
 ; Submit one primary command buffer, optionally signalling one fence and
@@ -2299,11 +2448,15 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   Define tiledRect.AnvilVkBackendTiledRectCopy
   Define linearTiledRect.AnvilVkBackendLinearTiledRectCopy
   Define tiledRead.AnvilVkBackendTiledReadback
+  Define leaseRequired.i
   q = avkQueueSlot(queue)
   If q = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   d = avkQueueDev[q]
   If avkFlightActive <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was called while an earlier submission on this queue has not completed (Anvil code -20004, queue busy); this slice runs one submission at a time. Wait on the earlier submission's fence, or call vkDeviceWaitIdle, before submitting again.")
+  EndIf
+  If avkBackendGpuLeaseRequired() <> 0 And avkBackendGpuLeaseState() < 0
+    ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "vkQueueSubmit found the shared GPU lease quarantined after uncertain external completion (VkResult -4, VK_ERROR_DEVICE_LOST). Check the external producer before submitting or signalling synchronization.")
   EndIf
   ; A previous draw submission may have closed its private list and then
   ; refused a signalled fence or semaphore transaction before a flight owned
@@ -2349,7 +2502,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer that is not in the executable state (Anvil code -20004, wrong command buffer state); record it and call vkEndCommandBuffer before submitting it.")
   EndIf
   If avkCbComputeRecorded[c] <> 0
-    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot execute a passive compute dispatch record while the compute queue and backend submission path are unavailable; nothing was submitted.")
+    ProcedureReturn avkQueueSubmitRecordedCompute(d, c, fence, semaphoreReservation)
   EndIf
   ; Every image the recording assumed something about must actually be
   ; in that layout now. This is the join between what was recorded and
@@ -3063,10 +3216,18 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       o = avkOpNext[o]
     Wend
   EndIf
+  leaseRequired = avkBackendGpuLeaseRequired()
+  If leaseRequired <> 0
+    If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_QUEUE) = 0
+      avkDrawListDiscard()
+      ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "another GPU owner holds the shared lease; queue work was not submitted.")
+    EndIf
+  EndIf
   f = 0
   If fence <> #VK_NULL_HANDLE
     f = avkFenceAcquire(d, fence)
     If f <= 0
+      If leaseRequired <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
       avkDrawListDiscard()
       ProcedureReturn f
     EndIf
@@ -3074,6 +3235,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If semaphoreReservation <> #VK_NULL_HANDLE
     job = avkSemaphoreCommit(semaphoreReservation)
     If job <> #VK_SUCCESS
+      If leaseRequired <> 0 : avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_QUEUE) : EndIf
       If f > 0 : avkFenceRelease(f) : EndIf
       avkDrawListDiscard()
       ProcedureReturn job
@@ -3083,6 +3245,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   avkFlightCb = c
   avkFlightFence = f
   avkFlightSemaphoreReservation = semaphoreReservation
+  avkFlightGpuLeaseHeld = leaseRequired : avkFlightBackendAttempted = 0 : avkFlightQuarantined = 0
   avkCmdState[c] = #ANVIL_VK_CB_PENDING
   avkFlightRetain(c)
   avkDrawListRetain(c)
@@ -3092,8 +3255,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If avkCbDrawCount[c] > 0
     job = avkDrawListSubmit()
     If job < 0
+      avkFlightBackendAttempted = 1
       avkFlightComplete(0)
-      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a draw (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own diagnostic code; inspect that backend's fault and capacity telemetry before resubmitting.")
+      avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a draw (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven. AnvilVkBackendNativeError() carries the backend's own diagnostic code; inspect that backend's fault and capacity telemetry before resubmitting.")
       ProcedureReturn #VK_ERROR_DEVICE_LOST
     EndIf
     If job = #ANVIL_VK_JOB_DONE
@@ -3104,8 +3268,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   If avkCbRpDone[c] <> 0
     job = avkRenderClearSubmit()
     If job < 0
+      avkFlightBackendAttempted = 1
       avkFlightComplete(0)
-      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while clearing a render-pass attachment (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. Inspect the selected backend's fault telemetry before retrying.")
+      ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while clearing a render-pass attachment (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven. Inspect the selected backend's fault telemetry before retrying.")
     EndIf
     If job = #ANVIL_VK_JOB_DONE : avkFlightComplete(1) : EndIf
     ProcedureReturn #VK_SUCCESS
@@ -3137,8 +3302,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             job = avkBackendSubmitTiledReadback(@tiledRead)
           EndIf
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while copying an optimal Vulkan image to linear memory (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while copying an optimal Vulkan image to linear memory (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
         ElseIf avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_OPTIMAL
           If avkOpRows[o] = 1 Or avkOpRows[o] = 3 Or avkOpRows[o] = 6
@@ -3161,8 +3327,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               job = avkBackendSubmitTiledRectCopy(@tiledRect)
             EndIf
             If job <> #ANVIL_VK_JOB_DONE
+              avkFlightBackendAttempted = 1
               avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while copying partial optimal-image tiles (VkResult -4); the command buffer was invalidated and its fence signalled.")
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while copying partial optimal-image tiles (VkResult -4); the flight may remain quarantined until completion is proven.")
             EndIf
           Else
           tiledCopy\windowBase = avkHeapBase : tiledCopy\windowBytes = avkHeapBytes
@@ -3176,8 +3343,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           tiledCopy\timeoutUs = 250000
           job = avkBackendSubmitTiledImageCopy(@tiledCopy)
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying an optimal Vulkan image (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying an optimal Vulkan image (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
           EndIf
         ElseIf avkImgTiling[destinationImageSlot] = #VK_IMAGE_TILING_OPTIMAL
@@ -3200,8 +3368,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               job = avkBackendSubmitLinearTiledRectCopy(@linearTiledRect)
             EndIf
             If job <> #ANVIL_VK_JOB_DONE
+              avkFlightBackendAttempted = 1
               avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while copying partial linear-image rows to optimal tiles (VkResult -4); the command buffer was invalidated and its fence signalled.")
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while copying partial linear-image rows to optimal tiles (VkResult -4); the flight may remain quarantined until completion is proven.")
             EndIf
           Else
           copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
@@ -3216,8 +3385,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           copy\timeoutUs = 250000
           job = avkBackendSubmitImageCopy(@copy)
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying a linear Vulkan image into an optimal image (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the TFU backend failed while copying a linear Vulkan image into an optimal image (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
           EndIf
         Else
@@ -3233,8 +3403,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
         EndIf
         If job <> #ANVIL_VK_JOB_DONE
+          avkFlightBackendAttempted = 1
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while copying a Vulkan image region (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while copying a Vulkan image region (VkResult -4); the flight may remain quarantined until completion is proven.")
         EndIf
         EndIf
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER_IMAGE
@@ -3247,25 +3418,27 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           destinationBase = avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target] + avkOpDstOffset[o]
           If avkCopyBufferResolve(avkOpBuffer[o], d, avkOpBufferOffset[o], avkOpSourceBytes[o], @sourceBase) = 0
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the buffer-to-image source changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the buffer-to-image source changed after submission preflight (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
           If copyBytes = sourcePitch And copyBytes = destinationPitch
             job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
             If job <> #ANVIL_VK_JOB_DONE
+              avkFlightBackendAttempted = 1
               avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image (VkResult -4); the command buffer was invalidated and its fence signalled.")
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading a linear Vulkan image (VkResult -4); the flight may remain quarantined until completion is proven.")
             EndIf
           Else
             job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
             If job <> #ANVIL_VK_JOB_DONE
+              avkFlightBackendAttempted = 1
               avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading linear Vulkan image rows (VkResult -4); the command buffer was invalidated and its fence signalled.")
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while uploading linear Vulkan image rows (VkResult -4); the flight may remain quarantined until completion is proven.")
             EndIf
           EndIf
         Else
           If avkCopyBufferResolve(avkOpBuffer[o], d, avkOpBufferOffset[o], avkOpSourceBytes[o], @sourceBase) = 0
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the optimal-image source changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the optimal-image source changed after submission preflight (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
           If avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_RECT_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_MICRO_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_TAG Or avkOpDstOffset[o] = #ANVIL_VK_BUFFER_TILED_GRID_4X4_TAG
             linearTiledRect\windowBase = avkHeapBase : linearTiledRect\windowBytes = avkHeapBytes
@@ -3287,8 +3460,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
               job = avkBackendSubmitLinearTiledRectCopy(@linearTiledRect)
             EndIf
             If job <> #ANVIL_VK_JOB_DONE
+              avkFlightBackendAttempted = 1
               avkFlightComplete(0)
-              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while scattering buffer rows into optimal-image tiles (VkResult -4); the command buffer was invalidated and its fence signalled.")
+              ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the guarded DMA backend failed while scattering buffer rows into optimal-image tiles (VkResult -4); the flight may remain quarantined until completion is proven.")
             EndIf
           Else
           copy\windowBase = avkHeapBase : copy\windowBytes = avkHeapBytes
@@ -3302,8 +3476,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
           copy\timeoutUs = 250000
           job = avkBackendSubmitImageCopy(@copy)
           If job < 0 Or (copies + imageCopies + bufferCopies + readbacks > 1 And job <> #ANVIL_VK_JOB_DONE)
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing ordered vkCmdCopyBufferToImage transfers (VkResult -4); the destination layout was not advanced, the command buffer is invalid and its fence is signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing ordered vkCmdCopyBufferToImage transfers (VkResult -4); the destination layout was not advanced, the flight may remain quarantined until completion is proven.")
           EndIf
           If job = #ANVIL_VK_JOB_PENDING : ProcedureReturn #VK_SUCCESS : EndIf
           EndIf
@@ -3313,22 +3488,25 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         destinationBase = AnvilVkBufferAddress(avkOpDstBuffer[o]) + avkOpDstOffset[o]
         job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, avkOpSourceBytes[o])
         If job <> #ANVIL_VK_JOB_DONE
+          avkFlightBackendAttempted = 1
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdCopyBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdCopyBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven.")
         EndIf
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER
         destinationBase = AnvilVkBufferAddress(avkOpBuffer[o]) + avkOpBufferOffset[o]
         job = avkBackendSubmitBufferFill(destinationBase, avkOpSourceBytes[o], avkOpColor[o])
         If job <> #ANVIL_VK_JOB_DONE
+          avkFlightBackendAttempted = 1
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdFillBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdFillBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven.")
         EndIf
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
         destinationBase = AnvilVkBufferAddress(avkOpBuffer[o]) + avkOpBufferOffset[o]
         job = avkBackendSubmitBufferCopy(@avkOpUpdateData[(o - 1) * #ANVIL_VK_MAX_UPDATE_BYTES], destinationBase, avkOpSourceBytes[o])
         If job <> #ANVIL_VK_JOB_DONE
+          avkFlightBackendAttempted = 1
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdUpdateBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the backend failed to complete an ordered vkCmdUpdateBuffer transfer (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven.")
         EndIf
       ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_IMAGE_BUFFER
         sourceImageSlot = avkRefSlot[avkRefIndex(c, avkOpRef[o])]
@@ -3337,7 +3515,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         destinationPitch = avkOpBufferPitch[o]
         If avkTransferBufferResolve(avkOpBuffer[o], d, #VK_BUFFER_USAGE_TRANSFER_DST_BIT, avkOpBufferOffset[o], (copyRows - 1) * destinationPitch + copyBytes, @destinationBase) = 0
           avkFlightComplete(0)
-          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the image-to-buffer readback destination changed after submission preflight (VkResult -4); the command buffer was invalidated and its fence signalled.")
+          ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the image-to-buffer readback destination changed after submission preflight (VkResult -4); the flight may remain quarantined until completion is proven.")
         EndIf
         If avkImgTiling[sourceImageSlot] = #VK_IMAGE_TILING_OPTIMAL
           tiledRead\windowBase = avkHeapBase : tiledRead\windowBytes = avkHeapBytes
@@ -3357,8 +3535,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
             job = avkBackendSubmitTiledReadback(@tiledRead)
           EndIf
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading an optimal Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading an optimal Vulkan image into a buffer (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
           o = avkOpNext[o]
           Continue
@@ -3368,14 +3547,16 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
         If copyBytes = sourcePitch And copyBytes = destinationPitch
           job = avkBackendSubmitBufferCopy(sourceBase, destinationBase, copyBytes * copyRows)
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading a Vulkan image into a buffer (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
         Else
           job = avkBackendSubmitBufferCopyRows(sourceBase, sourcePitch, destinationBase, destinationPitch, copyBytes, copyRows)
           If job <> #ANVIL_VK_JOB_DONE
+            avkFlightBackendAttempted = 1
             avkFlightComplete(0)
-            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading Vulkan image rows into a buffer (VkResult -4); the command buffer was invalidated and its fence signalled.")
+            ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "the DMA backend failed while reading Vulkan image rows into a buffer (VkResult -4); the flight may remain quarantined until completion is proven.")
           EndIf
         EndIf
       EndIf
@@ -3393,8 +3574,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   EndIf
   job = avkBackendSubmitClear(avkHeapBase + avkMemOffset[avkImgMemSlot[target]] + avkImgMemOffset[target], avkImgSize[target], avkImgW[target], avkImgH[target], avkImgPitch[target], colour)
   If job < 0
+    avkFlightBackendAttempted = 1
     avkFlightComplete(0)
-    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a clear (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own diagnostic code; inspect that backend's fault telemetry before resubmitting.")
+    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device failed while executing a clear (VkResult -4, VK_ERROR_DEVICE_LOST). Check AnvilVkBackendNativeError() before retrying; a Pi4 flight may remain quarantined until completion is proven.")
     ProcedureReturn #VK_ERROR_DEVICE_LOST
   EndIf
   If job = #ANVIL_VK_JOB_DONE
@@ -3423,11 +3605,22 @@ EndProcedure
 ; settle the submission if it has. Returns 1 if nothing is outstanding.
 Procedure.i avkFlightPoll()
   Define r.i
-  If avkFlightActive = 0 : ProcedureReturn 1 : EndIf
+  If avkFlightActive = 0
+    If avkBackendGpuLeaseRequired() <> 0 And avkBackendGpuLeaseState() < 0
+      avkFault(#VK_ERROR_DEVICE_LOST, "an external GPU owner left the shared lease quarantined; check the producer's completion telemetry before using this device.")
+      ProcedureReturn -1
+    EndIf
+    ProcedureReturn 1
+  EndIf
+  If avkFlightQuarantined <> 0
+    avkFault(#VK_ERROR_DEVICE_LOST, "a GPU submission has uncertain completion; its resources and synchronization remain quarantined.")
+    ProcedureReturn -1
+  EndIf
   r = avkBackendPoll()
   If r < 0
+    avkFlightBackendAttempted = 1
     avkFlightComplete(0)
-    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device reported a fault while a submitted clear was running (VkResult -4, VK_ERROR_DEVICE_LOST); the command buffer is invalid and its fence is signalled. AnvilVkBackendNativeError() carries the backend's own code.")
+    avkFault(#VK_ERROR_DEVICE_LOST, "the graphics device reported a fault while a submitted clear was running (VkResult -4, VK_ERROR_DEVICE_LOST); the flight may remain quarantined until completion is proven. AnvilVkBackendNativeError() carries the backend's own code.")
     ProcedureReturn -1
   EndIf
   If r = 0 : ProcedureReturn 0 : EndIf
@@ -3501,6 +3694,7 @@ Procedure.i AnvilVkDeviceWaitIdle(device.i)
   Define pollResult.i
   d = avkDevSlot(device)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkFlightActive = 0 And avkFlightPoll() < 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
   polls = 0
   While avkFlightActive <> 0
     pollResult = avkFlightPoll()
@@ -3523,6 +3717,9 @@ Procedure.i AnvilVkDeviceDestroy(device.i)
   If d = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   If avkFlightActive <> 0
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkDestroyDevice was called with a submission still outstanding (Anvil code -20004, device busy); nothing was destroyed. Call vkDeviceWaitIdle before destroying a device.")
+  EndIf
+  If avkBackendGpuLeaseRequired() <> 0 And avkBackendGpuLeaseState() < 0
+    ProcedureReturn avkFault(#VK_ERROR_DEVICE_LOST, "vkDestroyDevice found an external GPU lease quarantined after uncertain completion (VkResult -4, VK_ERROR_DEVICE_LOST). Check the external producer; device memory remains owned and was not torn down.")
   EndIf
   ; Retire every generation-matched semaphore while the VkDevice handle is
   ; still live. A pending/reserved transaction aborts teardown atomically.

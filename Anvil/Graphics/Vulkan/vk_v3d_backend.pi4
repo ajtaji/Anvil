@@ -110,6 +110,10 @@ Procedure.i avkBackendGpuLeaseState()
   ProcedureReturn avkV3dGpuLease
 EndProcedure
 
+Procedure.i avkBackendGpuLeaseRequired()
+  ProcedureReturn 1
+EndProcedure
+
 ; Private Pi 4 CSD transaction. The producer supplies only already-mapped
 ; closed ranges. Configure cannot launch hardware, so its refusals leave the
 ; caller outside its quarantine. Submit consumes one successful configure.
@@ -2177,6 +2181,7 @@ EndProcedure
 #AVK_V3D_COMPUTE_LOAD_VEC4 = $FFFFFF7C
 #AVK_V3D_COMPUTE_UNIFORM_BYTES = 32
 #AVK_V3D_COMPUTE_CODE_BYTES = 1296
+#AVK_V3D_COMPUTE_SCRATCH_BYTES = 4096
 #AVK_V3D_COMPUTE_ERR = -23501
 
 Structure AnvilVkV3dComputeCode Align #PB_Structure_AlignC
@@ -2349,4 +2354,59 @@ EndProcedure
 ; Compute-pipeline capability is gated by this exact backend lowering class.
 Procedure.i avkBackendComputeCanLower(*ir.AvkComputeIr)
   ProcedureReturn AnvilVkV3dComputeCanLower(*ir)
+EndProcedure
+
+Procedure.i avkBackendComputeScratchBytes()
+  ProcedureReturn #AVK_V3D_COMPUTE_SCRATCH_BYTES
+EndProcedure
+
+; The queue owns the scratch page and live resource references. This wrapper
+; marks the launch boundary before calling CSD Submit, whose failure may leave
+; hardware reading those ranges. Only a proven wait and cache clean completes.
+Procedure.i avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.AnvilVkBackendComputeResult)
+  Protected code.AnvilVkV3dComputeCode
+  Protected csd.AnvilVkV3dCsdPlan
+  Protected csdResult.AnvilVkV3dCsdResult
+  Protected inputNeed.i, outputNeed.i, rc.i
+  If *result = 0 : ProcedureReturn -1 : EndIf
+  *result\mayHaveLaunched = 0 : *result\complete = 0
+  *result\native = #AVK_V3D_COMPUTE_ERR : *result\waited = 0
+  *result\doneBefore = 0 : *result\doneAfter = 0
+  If *job = 0 Or avkV3dGpuLease <> #ANVIL_VK_GPU_LEASE_QUEUE : ProcedureReturn -1 : EndIf
+  If *job\ir = 0 Or *job\scratchBytes <> #AVK_V3D_COMPUTE_SCRATCH_BYTES Or (*job\scratchBase % 4096) <> 0 Or *job\groupsX < 1 Or *job\groupsX > #AVK_V3D_CSD_MAX_WORKGROUPS Or *job\timeoutUs < 1
+    ProcedureReturn -1
+  EndIf
+  inputNeed = *job\groupsX * 16 * 48
+  outputNeed = *job\groupsX * 16 * 144
+  If *job\inputBytes < inputNeed Or *job\outputBytes < outputNeed Or *job\outputWrittenBytes <> outputNeed
+    ProcedureReturn -1
+  EndIf
+  If avkV3dCsdInside(*job\scratchBase, *job\scratchBytes) = 0 Or avkV3dCsdInside(*job\inputBase, *job\inputBytes) = 0 Or avkV3dCsdInside(*job\outputBase, *job\outputBytes) = 0
+    ProcedureReturn -1
+  EndIf
+  If avkV3dCsdOverlap(*job\scratchBase, *job\scratchBytes, *job\inputBase, *job\inputBytes) <> 0 Or avkV3dCsdOverlap(*job\scratchBase, *job\scratchBytes, *job\outputBase, *job\outputBytes) <> 0 Or avkV3dCsdOverlap(*job\inputBase, *job\inputBytes, *job\outputBase, *job\outputBytes) <> 0
+    ProcedureReturn -1
+  EndIf
+  rc = AnvilVkV3dComputeLower(*job\ir, *job\scratchBase, #AVK_V3D_COMPUTE_CODE_BYTES, *job\scratchBase + #AVK_V3D_COMPUTE_CODE_BYTES, #AVK_V3D_COMPUTE_UNIFORM_BYTES, *job\inputBase, *job\inputBytes, *job\outputBase, *job\outputBytes, @code)
+  If rc <> #V3DQ_OK : *result\native = rc : ProcedureReturn -1 : EndIf
+  csd\codeBase = *job\scratchBase : csd\codeBytes = code\codeBytes : csd\codeFlags = 0
+  csd\uniformBase = *job\scratchBase + #AVK_V3D_COMPUTE_CODE_BYTES : csd\uniformBytes = code\uniformBytes
+  csd\inputBase = *job\inputBase : csd\inputBytes = *job\inputBytes
+  csd\outputBase = *job\outputBase : csd\outputBytes = *job\outputBytes
+  csd\outputWrittenBytes = *job\outputWrittenBytes
+  csd\groupsX = *job\groupsX : csd\groupsY = 1 : csd\groupsZ = 1
+  csd\workgroupSize = 16 : csd\workgroupsPerSupergroup = 1
+  csd\timeoutUs = *job\timeoutUs
+  rc = AnvilVkV3dCsdConfigure(@csd, @csdResult)
+  If rc <> #V3D_OK : *result\native = rc : ProcedureReturn -1 : EndIf
+  csdResult\native = #AVK_V3D_COMPUTE_ERR : csdResult\waited = 0
+  csdResult\doneBefore = 0 : csdResult\doneAfter = 0
+  *result\mayHaveLaunched = 1
+  rc = AnvilVkV3dCsdSubmit(@csdResult)
+  *result\native = csdResult\native : *result\waited = csdResult\waited
+  *result\doneBefore = csdResult\doneBefore : *result\doneAfter = csdResult\doneAfter
+  If rc <> #V3D_OK : ProcedureReturn -1 : EndIf
+  *result\complete = 1
+  avkV3dJobs = avkV3dJobs + 1
+  ProcedureReturn #ANVIL_VK_JOB_DONE
 EndProcedure

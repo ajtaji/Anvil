@@ -68,7 +68,7 @@ def main() -> None:
         if cpu.x[0] != 0:
             raise AssertionError(f"gate setup failed at return {cpu.x[0]}; report={values}")
         expected = {0: 0x44525034, 1: 0, 2: 1, 3: 1, 4: 16,
-                    7: 2304, 8: 1, 9: 0, 10: -8, 11: 1,
+                    7: 2304, 8: 1, 9: 0, 10: 0, 11: 1,
                     12: 0, 13: 1, 14: -20002, 15: 0,
                     16: -20002, 17: -20001, 18: 0,
                     19: -20001, 20: -20005, 21: 1}
@@ -79,7 +79,7 @@ def main() -> None:
             raise AssertionError(f"recorded descriptor addresses mismatch: {values}")
         print(f"vulkan_neon_particle_dispatch_record_check: PASS - {steps:,} emitted A64 instructions; "
               "one typed dispatch snapshot, reset, stale generations, group refusal, "
-              "and queue-submit refusal")
+              "without queue submission")
 
 
 if __name__ == "__main__":

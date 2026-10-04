@@ -1236,7 +1236,7 @@ Procedure.i vkQueueSubmit(queue.i, submitCount.i, *pSubmits.VkSubmitInfo, fence.
   commandBuffer = #VK_NULL_HANDLE
   If commandCount = 1 : commandBuffer = PeekI(*pSubmits\pCommandBuffers) : EndIf
   rc = AnvilVkQueueSubmitOne(queue, commandBuffer, fence, reservation)
-  If rc <> #VK_SUCCESS And reservation <> #VK_NULL_HANDLE And avkSemaphoreReservationSlot(reservation) <> 0
+  If rc <> #VK_SUCCESS And reservation <> #VK_NULL_HANDLE And avkSemaphoreReservationSlot(reservation) <> 0 And (avkFlightQuarantined = 0 Or avkFlightSemaphoreReservation <> reservation)
     avkSemaphoreRollback(reservation)
   EndIf
   ProcedureReturn rc

@@ -64,6 +64,14 @@ Procedure.i avkBackendComputeCanLower(*ir)
   ProcedureReturn 0
 EndProcedure
 
+Procedure.i avkBackendComputeScratchBytes()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.AnvilVkBackendComputeResult)
+  ProcedureReturn -1
+EndProcedure
+
 ; No V3D is owned by this backend; refuse GPU lease requests.
 Procedure.i avkBackendGpuLeaseAcquire(owner.i)
   ProcedureReturn 0
@@ -78,6 +86,10 @@ Procedure.i avkBackendGpuLeaseQuarantine(owner.i)
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseState()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseRequired()
   ProcedureReturn 0
 EndProcedure
 

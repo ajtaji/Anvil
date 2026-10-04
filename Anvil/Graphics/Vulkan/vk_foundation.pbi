@@ -541,6 +541,34 @@ Declare.i avkBackendTicksUs()
 ; AvkComputeIr in the pipeline layer; foundation precedes that type's include.
 Declare.i avkBackendComputeCanLower(*ir)
 
+; One bounded internal compute submission. The queue owns the scratch page
+; and all referenced objects. A failed call is safe to roll back only when
+; mayHaveLaunched remains zero; otherwise completion is uncertain.
+Structure AnvilVkBackendComputeJob Align #PB_Structure_AlignC
+  ir.i
+  scratchBase.i
+  scratchBytes.i
+  inputBase.i
+  inputBytes.i
+  outputBase.i
+  outputBytes.i
+  outputWrittenBytes.i
+  groupsX.i
+  timeoutUs.i
+EndStructure
+
+Structure AnvilVkBackendComputeResult Align #PB_Structure_AlignC
+  mayHaveLaunched.i
+  complete.i
+  native.i
+  waited.i
+  doneBefore.i
+  doneAfter.i
+EndStructure
+
+Declare.i avkBackendComputeScratchBytes()
+Declare.i avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.AnvilVkBackendComputeResult)
+
 ; One backend-owned GPU lease excludes queue work from a direct producer.
 ; A negative state is quarantined: only a proven hardware completion may
 ; release a held lease, and no caller can release a quarantined one.
@@ -550,6 +578,7 @@ Declare.i avkBackendGpuLeaseAcquire(owner.i)
 Declare.i avkBackendGpuLeaseRelease(owner.i)
 Declare.i avkBackendGpuLeaseQuarantine(owner.i)
 Declare.i avkBackendGpuLeaseState()
+Declare.i avkBackendGpuLeaseRequired()
 
 ; The graphics half of the seam. A backend with no #ANVIL_VK_CAP_DRAW bit
 ; still defines all four: they answer "not on this backend" rather than

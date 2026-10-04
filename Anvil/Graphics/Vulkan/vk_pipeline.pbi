@@ -784,6 +784,60 @@ Procedure.i AnvilVkComputeBindingPreflight(device.i, *ir.AvkComputeIr, set.i, gr
   ProcedureReturn #VK_SUCCESS
 EndProcedure
 
+; Re-resolve the recorded compute handles and descriptors at the submission
+; boundary. The queue captures these slots before committing a flight.
+Procedure.i avkComputeFlightPreflight(deviceSlot.i, pipeline.i, set.i, groupsX.i, *out.AnvilVkComputeFlightPlan)
+  Define p.i, ds.i, inputBuf.i, outputBuf.i, rc.i
+  Define plan.AnvilVkComputeBindingPlan
+  If *out = 0 Or deviceSlot < 1 Or deviceSlot > #ANVIL_VK_MAX_DEVICES : ProcedureReturn #ANVIL_VK_ERR_ARGS : EndIf
+  p = avkPipeSlot(pipeline)
+  ds = avkDsSlot(set)
+  If p = 0 Or ds = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkPipeDev[p] <> deviceSlot Or avkDsDev[ds] <> deviceSlot Or avkPipeKind[p] <> 1 Or avkPipeComputeIr[p]\valid <> 1
+    ProcedureReturn #ANVIL_VK_ERR_HANDLE
+  EndIf
+  rc = AnvilVkComputeBindingPreflight(avkToken(#ANVIL_VK_TYPE_DEVICE, deviceSlot, avkDevGen[deviceSlot]), @avkPipeComputeIr[p], set, groupsX, 1, 1, @plan)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  inputBuf = avkBufSlot(AnvilVkDescriptorSetStorageBuffer(set, 0))
+  outputBuf = avkBufSlot(AnvilVkDescriptorSetStorageBuffer(set, 1))
+  If inputBuf = 0 Or outputBuf = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkBufMemSlot[inputBuf] = 0 Or avkBufMemSlot[outputBuf] = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  *out\pipelineSlot = p : *out\setSlot = ds
+  *out\inputBufferSlot = inputBuf : *out\outputBufferSlot = outputBuf
+  *out\inputBuffer = AnvilVkDescriptorSetStorageBuffer(set, 0)
+  *out\outputBuffer = AnvilVkDescriptorSetStorageBuffer(set, 1)
+  *out\inputMemorySlot = avkBufMemSlot[inputBuf] : *out\outputMemorySlot = avkBufMemSlot[outputBuf]
+  *out\inputBase = plan\inputBase : *out\inputBytes = plan\inputBytes
+  *out\outputBase = plan\outputBase : *out\outputBytes = plan\outputBytes
+  *out\outputWrittenBytes = plan\outputWrittenBytes
+  *out\groupsX = plan\groupsX : *out\items = plan\items
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i avkComputeFlightIr(pipelineSlot.i)
+  If pipelineSlot < 1 Or pipelineSlot > #ANVIL_VK_MAX_PIPELINES : ProcedureReturn 0 : EndIf
+  ProcedureReturn @avkPipeComputeIr[pipelineSlot]
+EndProcedure
+
+Procedure avkComputeFlightRetain(*plan.AnvilVkComputeFlightPlan)
+  avkPipeInFlight[*plan\pipelineSlot] = avkPipeInFlight[*plan\pipelineSlot] + 1
+  avkDsInFlight[*plan\setSlot] = avkDsInFlight[*plan\setSlot] + 1
+  avkBufInFlight[*plan\inputBufferSlot] = avkBufInFlight[*plan\inputBufferSlot] + 1
+  avkBufInFlight[*plan\outputBufferSlot] = avkBufInFlight[*plan\outputBufferSlot] + 1
+  avkMemInFlight[*plan\inputMemorySlot] = avkMemInFlight[*plan\inputMemorySlot] + 1
+  avkMemInFlight[*plan\outputMemorySlot] = avkMemInFlight[*plan\outputMemorySlot] + 1
+EndProcedure
+
+Procedure avkComputeFlightRelease()
+  If avkPipeInFlight[avkFlightComputePipe] > 0 : avkPipeInFlight[avkFlightComputePipe] = avkPipeInFlight[avkFlightComputePipe] - 1 : EndIf
+  If avkDsInFlight[avkFlightComputeSet] > 0 : avkDsInFlight[avkFlightComputeSet] = avkDsInFlight[avkFlightComputeSet] - 1 : EndIf
+  If avkBufInFlight[avkFlightComputeInputBuf] > 0 : avkBufInFlight[avkFlightComputeInputBuf] = avkBufInFlight[avkFlightComputeInputBuf] - 1 : EndIf
+  If avkBufInFlight[avkFlightComputeOutputBuf] > 0 : avkBufInFlight[avkFlightComputeOutputBuf] = avkBufInFlight[avkFlightComputeOutputBuf] - 1 : EndIf
+  If avkMemInFlight[avkFlightComputeInputMem] > 0 : avkMemInFlight[avkFlightComputeInputMem] = avkMemInFlight[avkFlightComputeInputMem] - 1 : EndIf
+  If avkMemInFlight[avkFlightComputeOutputMem] > 0 : avkMemInFlight[avkFlightComputeOutputMem] = avkMemInFlight[avkFlightComputeOutputMem] - 1 : EndIf
+  avkInternalFree(avkFlightComputeScratch)
+EndProcedure
+
 ; ======================================================================
 ;  SHADER MODULES
 ; ======================================================================
@@ -2700,7 +2754,9 @@ Procedure AnvilVkCmdRecordComputeDispatch(commandBuffer.i, groupsX.i, groupsY.i,
   avkCbComputeRecordSet[c] = avkCbComputeSet[c]
   avkCbComputeGroupsX[c] = plan\groupsX : avkCbComputeItems[c] = plan\items
   avkCbComputeInputBase[c] = plan\inputBase : avkCbComputeInputBytes[c] = plan\inputBytes
+  avkCbComputeInputBuffer[c] = AnvilVkDescriptorSetStorageBuffer(avkCbComputeSet[c], 0)
   avkCbComputeOutputBase[c] = plan\outputBase : avkCbComputeOutputBytes[c] = plan\outputBytes
+  avkCbComputeOutputBuffer[c] = AnvilVkDescriptorSetStorageBuffer(avkCbComputeSet[c], 1)
   avkCbComputeOutputWrittenBytes[c] = plan\outputWrittenBytes
   avkCbComputeRecorded[c] = 1
 EndProcedure
