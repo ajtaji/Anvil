@@ -88,6 +88,9 @@ EndStructure
 #ANVIL_VK_OP_MEMORY_BARRIER = 8
 #ANVIL_VK_OP_COPY_IMAGE = 9
 #ANVIL_VK_OP_COPY_IMAGE_BUFFER = 10
+; avkOpSourcePitch=1 marks the private CSD-write -> vertex-read barrier.
+; It reuses the existing buffer-barrier op so normal in-flight retention applies.
+#ANVIL_VK_PRIVATE_COMPUTE_VERTEX_BARRIER = 1
 #ANVIL_VK_BUFFER_TILED_RECT_TAG = 1 ; avkOpDstOffset marker for optimal buffer uploads
 #ANVIL_VK_BUFFER_TILED_MICRO_TAG = 2 ; one-utile, byte-bounded optimal buffer upload
 #ANVIL_VK_BUFFER_TILED_GRID_TAG = 3 ; at most two adjacent UIF tile rows and columns
@@ -1808,6 +1811,12 @@ Procedure.i AnvilVkCommandBufferEnd(commandBuffer.i)
     avkCmdState[c] = #ANVIL_VK_CB_INVALID
     ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkEndCommandBuffer cannot mix the passive compute dispatch record with graphics or transfer work; no compute queue execution exists yet.")
   EndIf
+  If avkCbOpHead[c] <> 0 And avkOpKind[avkCbOpHead[c]] = #ANVIL_VK_OP_BUFFER_BARRIER And avkOpSourcePitch[avkCbOpHead[c]] = #ANVIL_VK_PRIVATE_COMPUTE_VERTEX_BARRIER
+    If avkCmdOps[c] <> 1 Or avkCbDrawCount[c] <> 0 Or avkCbRpDone[c] <> 0 Or avkCbComputeRecorded[c] <> 0
+      avkCmdState[c] = #ANVIL_VK_CB_INVALID
+      ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "private compute output barrier must be the only command in its command buffer.")
+    EndIf
+  EndIf
   ; A reference whose layout was never established inside the recording
   ; leaves the image exactly as it found it.
   k = 0
@@ -1935,17 +1944,70 @@ EndProcedure
 
 Procedure.i avkStagesKnown(mask.i)
   If mask = 0 : ProcedureReturn 0 : EndIf
-  If (mask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | #VK_PIPELINE_STAGE_HOST_BIT | #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | #VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | #VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT))) <> 0
+  If (mask & (~(#VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT | #VK_PIPELINE_STAGE_TRANSFER_BIT | #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | #VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | #VK_PIPELINE_STAGE_HOST_BIT | #VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | #VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | #VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT))) <> 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkAccessKnown(mask.i)
-  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_SHADER_READ_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT | #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT))) <> 0
+  If (mask & (~(#VK_ACCESS_TRANSFER_READ_BIT | #VK_ACCESS_TRANSFER_WRITE_BIT | #VK_ACCESS_SHADER_READ_BIT | #VK_ACCESS_SHADER_WRITE_BIT | #VK_ACCESS_HOST_READ_BIT | #VK_ACCESS_HOST_WRITE_BIT | #VK_ACCESS_MEMORY_READ_BIT | #VK_ACCESS_MEMORY_WRITE_BIT | #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | #VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT))) <> 0
     ProcedureReturn 0
   EndIf
   ProcedureReturn 1
+EndProcedure
+
+; Private, exact-scope synchronization record for the one supported CSD output
+; buffer. The Pi4 CSD submit proves completion and cleans its written range;
+; a later graphics submit cleans vertex-read ranges before V3D consumes them.
+; Queue submission is serialized under the GPU lease. This marker is therefore
+; an ordered dependency between separate command buffers, not a cache no-op
+; standing in for an unproven asynchronous compute completion. Public
+; vkCmdPipelineBarrier continues to refuse COMPUTE_SHADER while queueFlags
+; lacks VK_QUEUE_COMPUTE_BIT.
+Procedure.i AnvilVkCmdRecordComputeOutputBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, *barrier.VkBufferMemoryBarrier)
+  Define c.i, d.i, o.i, actualBytes.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING Or avkCmdOps[c] <> 0 Or avkCbComputeRecorded[c] <> 0 Or avkCbDrawCount[c] <> 0 Or avkCbRpActive[c] <> 0 Or avkCbRpDone[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "private compute output barrier requires an empty recording command buffer outside a render pass.")
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  If avkBackendGpuLeaseRequired() = 0 Or avkBackendComputeScratchBytes() = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "private compute output barrier requires the leased GPU compute backend.")
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  If srcStageMask <> #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT Or dstStageMask <> #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT Or *barrier = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "private compute output barrier requires COMPUTE_SHADER to VERTEX_INPUT and one buffer barrier.")
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  If *barrier\sType <> #VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER Or *barrier\pNext <> 0 Or *barrier\srcAccessMask <> #VK_ACCESS_SHADER_WRITE_BIT Or *barrier\dstAccessMask <> #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "private compute output barrier requires SHADER_WRITE to VERTEX_ATTRIBUTE_READ without extensions.")
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  If Not (((*barrier\srcQueueFamilyIndex & $FFFFFFFF) = #VK_QUEUE_FAMILY_IGNORED And (*barrier\dstQueueFamilyIndex & $FFFFFFFF) = #VK_QUEUE_FAMILY_IGNORED) Or (*barrier\srcQueueFamilyIndex = #ANVIL_VK_QUEUE_FAMILY And *barrier\dstQueueFamilyIndex = #ANVIL_VK_QUEUE_FAMILY))
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "private compute output barrier cannot transfer queue-family ownership.")
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkBufferBarrierResolve(*barrier\buffer, d, *barrier\offset, *barrier\size, @actualBytes) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "private compute output barrier needs a live, bound same-device buffer and nonempty range.")
+    ProcedureReturn #ANVIL_VK_ERR_STATE
+  EndIf
+  If avkTransferBufferResolve(*barrier\buffer, d, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, *barrier\offset, actualBytes, 0) = 0 Or avkTransferBufferResolve(*barrier\buffer, d, #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, *barrier\offset, actualBytes, 0) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "private compute output barrier requires a storage and vertex buffer.")
+    ProcedureReturn #ANVIL_VK_ERR_UNSUPPORTED
+  EndIf
+  o = avkOpAppend(c, #ANVIL_VK_OP_BUFFER_BARRIER)
+  If o = 0
+    avkCbFail(c, #VK_ERROR_OUT_OF_HOST_MEMORY, "the command pool cannot retain the private compute output barrier.")
+    ProcedureReturn #VK_ERROR_OUT_OF_HOST_MEMORY
+  EndIf
+  avkOpBuffer[o] = *barrier\buffer
+  avkOpBufferOffset[o] = *barrier\offset
+  avkOpSourceBytes[o] = actualBytes
+  avkOpSourcePitch[o] = #ANVIL_VK_PRIVATE_COMPUTE_VERTEX_BARRIER
+  ProcedureReturn #VK_SUCCESS
 EndProcedure
 
 Procedure.i avkLayoutKnown(v.i)
@@ -2438,6 +2500,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   Define otherBytes.i
   Define otherRows.i
   Define bufferCopies.i
+  Define privateComputeBarrier.i
   Define colour.i
   Define target.i
   Define sourceBase.i
@@ -2551,6 +2614,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   readbackGroup = 0
   readbackGroups = 0
   bufferCopies = 0
+  privateComputeBarrier = 0
   colour = 0
   target = 0
   o = avkCbOpHead[c]
@@ -2611,11 +2675,16 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       ElseIf avkOpCopyGroup[o] <> readbackGroup
         readbackGroups = readbackGroups + 1
       EndIf
+    ElseIf avkOpKind[o] = #ANVIL_VK_OP_BUFFER_BARRIER And avkOpSourcePitch[o] = #ANVIL_VK_PRIVATE_COMPUTE_VERTEX_BARRIER
+      privateComputeBarrier = privateComputeBarrier + 1
     ElseIf avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_FILL_BUFFER Or avkOpKind[o] = #ANVIL_VK_OP_UPDATE_BUFFER
       bufferCopies = bufferCopies + 1
     EndIf
     o = avkOpNext[o]
   Wend
+  If privateComputeBarrier <> 0 And (privateComputeBarrier <> 1 Or avkCmdOps[c] <> 1 Or avkCbDrawCount[c] <> 0 Or avkCbRpDone[c] <> 0 Or avkCbComputeRecorded[c] <> 0)
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit requires the private compute output barrier to occupy its own command buffer.")
+  EndIf
   If tiledRectCount > 1
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkQueueSubmit supports one partial optimal-to-optimal rectangle per command buffer (Anvil code -20005); nothing was submitted.")
   EndIf
@@ -3190,7 +3259,7 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
       o = avkOpNext[o]
     Wend
   EndIf
-  If bufferCopies > 0
+  If bufferCopies > 0 Or privateComputeBarrier > 0
     o = avkCbOpHead[c]
     While o <> 0
       If avkOpKind[o] = #ANVIL_VK_OP_COPY_BUFFER

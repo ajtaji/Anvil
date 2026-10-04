@@ -1,0 +1,124 @@
+; Desk-only private CSD-output synchronization foundation. No CSD launch.
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
+
+#NS_OUT = $06000000
+#NS_HEAP = $06200000
+
+Global nsChecks.i = 0
+Global nsFails.i = 0
+
+Procedure nsCheck(ok.i)
+  nsChecks = nsChecks + 1
+  If ok = 0
+    nsFails = nsFails + 1
+    If nsFails = 1 : PokeI(#NS_OUT + 24, nsChecks) : EndIf
+  EndIf
+EndProcedure
+
+Procedure.i Main()
+  Protected device.i, queue.i, buffer.i, memory.i, pool.i, cmd.i, c.i, op.i
+  Protected spare.i, rebound.i, stale.i, before.i, stage.l, dummy.i, fence.i
+  Protected bar.VkBufferMemoryBarrier
+  Protected submit.VkSubmitInfo
+  avkDevGen[1] = avkNextGen(avkDevGen[1]) : avkDevLive[1] = 1
+  device = avkToken(#ANVIL_VK_TYPE_DEVICE, 1, avkDevGen[1])
+  avkQueueGen[1] = avkNextGen(avkQueueGen[1]) : avkQueueLive[1] = 1 : avkQueueDev[1] = 1
+  queue = avkToken(#ANVIL_VK_TYPE_QUEUE, 1, avkQueueGen[1])
+  AnvilVkTestBackendHeap(#NS_HEAP, $00100000)
+  avkTbLeaseRequired = 1 : avkTbComputeMode = 1
+  If AnvilVkBufferCreate(device, 4096, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @buffer) <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  If AnvilVkMemoryAllocate(device, 4096, 0, @memory) <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  If AnvilVkBufferBindMemory(device, buffer, memory, 0) <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  If AnvilVkCommandPoolCreate(device, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @pool) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  If AnvilVkCommandBufferAllocate(device, pool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmd) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+  c = avkCmdSlot(cmd)
+  bar\sType = #VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER
+  bar\srcAccessMask = #VK_ACCESS_SHADER_WRITE_BIT
+  bar\dstAccessMask = #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+  bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
+  bar\buffer = buffer : bar\offset = 128 : bar\size = 512
+
+  nsCheck(#VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = $800 And #VK_ACCESS_SHADER_WRITE_BIT = $40)
+  nsCheck(avkStagesKnown(#VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) <> 0 And avkAccessKnown(#VK_ACCESS_SHADER_WRITE_BIT) <> 0)
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #VK_SUCCESS)
+  op = avkCbOpHead[c]
+  nsCheck(op <> 0 And avkCmdOps[c] = 1 And avkOpKind[op] = #ANVIL_VK_OP_BUFFER_BARRIER And avkOpSourcePitch[op] = #ANVIL_VK_PRIVATE_COMPUTE_VERTEX_BARRIER)
+  nsCheck(avkOpBuffer[op] = buffer And avkOpBufferOffset[op] = 128 And avkOpSourceBytes[op] = 512)
+  nsCheck(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  before = avkSubmitCount
+  nsCheck(avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) <> 0)
+  nsCheck(AnvilVkQueueSubmitOne(queue, cmd, 0, 0) = #ANVIL_VK_ERR_STATE)
+  nsCheck(avkSubmitCount = before And avkFlightActive = 0 And avkTbLeaseOwner = #ANVIL_VK_GPU_LEASE_EXTERNAL)
+  nsCheck(avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) <> 0)
+  nsCheck(AnvilVkFenceCreate(device, 0, @fence) = #VK_SUCCESS)
+  nsCheck(AnvilVkQueueSubmitOne(queue, cmd, fence, 0) = #VK_SUCCESS)
+  nsCheck(avkSubmitCount = before + 1 And avkCompleteCount = avkSubmitCount And avkTbLeaseOwner = 0 And avkFlightActive = 0)
+  nsCheck(AnvilVkFenceStatus(device, fence) = #VK_SUCCESS)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS And avkCbOpHead[c] = 0)
+  avkTbComputeMode = 0
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #ANVIL_VK_ERR_UNSUPPORTED)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  avkTbComputeMode = 1
+
+  ; Exact scope, access, span, usage, and isolation refusals invalidate the CB.
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_TRANSFER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #ANVIL_VK_ERR_UNSUPPORTED)
+  nsCheck(AnvilVkCommandBufferEnd(cmd) = #ANVIL_VK_ERR_UNSUPPORTED)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #ANVIL_VK_ERR_UNSUPPORTED)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  bar\dstAccessMask = #VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+  bar\offset = 4096
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #ANVIL_VK_ERR_STATE)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  bar\offset = 128
+  If AnvilVkBufferCreate(device, 4096, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @spare) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  bar\buffer = spare
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) <> #VK_SUCCESS)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  bar\buffer = buffer
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #ANVIL_VK_ERR_STATE)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+
+  ; Revalidation happens before lease/flight commit; stale generation refuses.
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  nsCheck(AnvilVkCmdRecordComputeOutputBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, @bar) = #VK_SUCCESS)
+  nsCheck(AnvilVkCommandBufferEnd(cmd) = #VK_SUCCESS)
+  stale = buffer
+  AnvilVkBufferDestroy(device, buffer)
+  nsCheck(avkBufSlot(stale) = 0)
+  nsCheck(AnvilVkBufferCreate(device, 4096, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @rebound) = #VK_SUCCESS)
+  nsCheck(AnvilVkBufferBindMemory(device, rebound, memory, 0) = #VK_SUCCESS And rebound <> stale)
+  before = avkSubmitCount
+  nsCheck(AnvilVkQueueSubmitOne(queue, cmd, 0, 0) = #ANVIL_VK_ERR_STATE)
+  nsCheck(avkSubmitCount = before And avkFlightActive = 0 And avkTbLeaseOwner = 0)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+
+  ; Public queue remains non-compute: neither barrier nor semaphore wait may
+  ; name COMPUTE_SHADER, even though the private validator knows that bit.
+  nsCheck(AnvilVkCommandBufferBegin(cmd, 0) = #VK_SUCCESS)
+  bar\buffer = stale
+  vkCmdPipelineBarrier(cmd, #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, #VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, 0, 1, @bar, 0, 0)
+  nsCheck(AnvilVkCommandBufferEnd(cmd) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  nsCheck(AnvilVkCommandBufferReset(cmd, 0) = #VK_SUCCESS)
+  submit\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  submit\waitSemaphoreCount = 1
+  dummy = 1 : stage = #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+  submit\pWaitSemaphores = @dummy : submit\pWaitDstStageMask = @stage
+  nsCheck(vkQueueSubmit(queue, 1, @submit, 0) = #VK_ERROR_FEATURE_NOT_PRESENT)
+  nsCheck(avkSubmitCount = before And avkFlightActive = 0)
+  PokeI(#NS_OUT, $4E535934)
+  PokeI(#NS_OUT + 8, nsChecks)
+  PokeI(#NS_OUT + 16, nsFails)
+  ProcedureReturn 0
+EndProcedure

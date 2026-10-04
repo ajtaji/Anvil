@@ -771,6 +771,10 @@ Procedure vkCmdPipelineBarrier(commandBuffer.i, srcStageMask.i, dstStageMask.i, 
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier was given a stage mask this implementation does not track (Anvil code -20005, unsupported stage); both stage masks must name supported, nonzero stages.")
     ProcedureReturn
   EndIf
+  If (srcStageMask & #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) <> 0 Or (dstStageMask & #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) <> 0
+    avkCbFail(c, #VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdPipelineBarrier cannot name COMPUTE_SHADER while this queue family does not expose VK_QUEUE_COMPUTE_BIT.")
+    ProcedureReturn
+  EndIf
   If memoryBarrierCount > 8 Or bufferMemoryBarrierCount > 8
     avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "vkCmdPipelineBarrier accepts up to eight global and eight buffer barriers per call (Anvil code -20005, bounded barrier arrays); split a larger dependency across calls.")
     ProcedureReturn
@@ -952,6 +956,9 @@ Procedure vkGetPhysicalDeviceProperties(physicalDevice.i, *pProperties.VkPhysica
   *pProperties\limits\maxVertexInputAttributes = #ANVIL_SPV_MAX_ATTRS
   *pProperties\limits\maxVertexInputBindings = #ANVIL_VK_MAX_BINDINGS
   *pProperties\limits\maxFragmentOutputAttachments = 1
+  ; Leave maxCompute* zero while the queue family omits COMPUTE. The private
+  ; particle CSD path supports fixed 16x1x1 groups, below Vulkan 1.0's
+  ; required general compute limits; publishing those limits would mislead.
   *pProperties\limits\maxViewports = 1
   *pProperties\limits\maxViewportDimensions[0] = dimension
   *pProperties\limits\maxViewportDimensions[1] = dimension
@@ -1204,6 +1211,11 @@ Procedure.i vkQueueSubmit(queue.i, submitCount.i, *pSubmits.VkSubmitInfo, fence.
   i = 0
   While i < waitCount
     stage = PeekL(*pSubmits\pWaitDstStageMask + (i * 4)) & $FFFFFFFF
+    ; The internal CSD queue path is private. A public semaphore wait cannot
+    ; name COMPUTE_SHADER until queueFlags exposes VK_QUEUE_COMPUTE_BIT.
+    If (stage & #VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) <> 0
+      ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot wait at COMPUTE_SHADER while this queue family does not expose VK_QUEUE_COMPUTE_BIT; nothing was reserved or submitted.")
+    EndIf
     If stage = 0 Or (stage & (~allowedStages & $FFFFFFFF)) <> 0
       ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit was given a wait destination stage mask this backend does not execute (VkResult -8, VK_ERROR_FEATURE_NOT_PRESENT); nothing was reserved or submitted. Use only the reported transfer/graphics pipeline stages for this queue.")
     EndIf
