@@ -132,6 +132,55 @@ EndProcedure
 '''
 
 
+GPU_STUBS = r'''
+#NVPC_OK = 0
+Global nvpGpuCreateCalls.i, nvpGpuPrepareCalls.i, nvpGpuDrawCalls.i, nvpGpuReleaseCalls.i
+Global nvpGpuPrepareRc.i, nvpGpuDrawRc.i, nvpGpuCount.i, nvpGpuCameraX.i
+Procedure.i NeonVkParticleCsdCreate(capacity.i)
+  nvpGpuCreateCalls = nvpGpuCreateCalls + 1
+  If capacity <> 8 : ProcedureReturn -1 : EndIf
+  ProcedureReturn #NVPC_OK
+EndProcedure
+Procedure.i NeonVkParticleCsdPrepare(*items.NvcParticle, count.i)
+  nvpGpuPrepareCalls = nvpGpuPrepareCalls + 1
+  nvpGpuCount = count
+  If count > 0 : nvpGpuCameraX = *items\cameraX : EndIf
+  ProcedureReturn nvpGpuPrepareRc
+EndProcedure
+Procedure.i NeonVkParticleCsdDraw()
+  nvpGpuDrawCalls = nvpGpuDrawCalls + 1
+  ProcedureReturn nvpGpuDrawRc
+EndProcedure
+Procedure.i NeonVkParticleCsdRelease()
+  nvpGpuReleaseCalls = nvpGpuReleaseCalls + 1
+  ProcedureReturn #NVPC_OK
+EndProcedure
+'''
+
+GPU_ASSERTS = r'''
+  If NeonVkPortParticleAdd(10.0, 20.0, 4.0, 0.0, 1.0, 0.0, 0.0, 1.0) <> 0 : ProcedureReturn 41 : EndIf
+  If NeonVkPortParticlesGpuCreate(8) <> 0 Or nvpGpuCreateCalls <> 1 : ProcedureReturn 42 : EndIf
+  If NeonVkPortParticlesGpuPrepare() <> 0 Or nvpGpuPrepareCalls <> 1 Or nvpGpuCount <> 1 Or nvpGpuCameraX <> 3 : ProcedureReturn 43 : EndIf
+  If NeonVkPortParticlesDrawPrepared() <> #NEON_VK_PORT_ERR_PARTICLE_PREPARE : ProcedureReturn 44 : EndIf
+  If NeonVkPortParticlesGpuDrawPrepared() <> 0 Or nvpGpuDrawCalls <> 1 : ProcedureReturn 45 : EndIf
+  If NeonVkPortCamera(4.0, 4.0, 1.5) <> 0 : ProcedureReturn 46 : EndIf
+  If NeonVkPortParticlesGpuDrawPrepared() <> #NEON_VK_PORT_ERR_PARTICLE_PREPARE Or nvpGpuDrawCalls <> 1 : ProcedureReturn 47 : EndIf
+  nvpGpuPrepareRc = -77
+  If NeonVkPortParticlesGpuPrepare() <> -77 Or nvpParticlePrepared <> 0 : ProcedureReturn 48 : EndIf
+  If NeonVkPortParticlesGpuDrawPrepared() <> #NEON_VK_PORT_ERR_PARTICLE_PREPARE : ProcedureReturn 49 : EndIf
+  nvpGpuPrepareRc = 0
+  If NeonVkPortParticlesGpuPrepare() <> 0 Or nvpGpuCameraX <> 4 : ProcedureReturn 50 : EndIf
+  nvpGpuDrawRc = -88
+  If NeonVkPortParticlesGpuDrawPrepared() <> -88 : ProcedureReturn 51 : EndIf
+  nvpGpuDrawRc = 0
+  If NeonVkPortParticlesPrepare() <> 0 : ProcedureReturn 52 : EndIf
+  If NeonVkPortParticlesGpuDrawPrepared() <> #NEON_VK_PORT_ERR_PARTICLE_PREPARE : ProcedureReturn 53 : EndIf
+  If NeonVkPortParticlesDrawPrepared() <> 0 : ProcedureReturn 54 : EndIf
+  If NeonVkPortParticlesGpuRelease() <> 0 Or nvpGpuReleaseCalls <> 1 : ProcedureReturn 55 : EndIf
+  If NeonVkPortParticlesDrawPrepared() <> #NEON_VK_PORT_ERR_PARTICLE_PREPARE : ProcedureReturn 56 : EndIf
+'''
+
+
 def main() -> int:
     if not COMPILER.is_file():
         raise SystemExit(f"compiler not found: {COMPILER}")
@@ -176,6 +225,34 @@ def main() -> int:
         if result:
             raise AssertionError(f"particle port assertion {result} failed after {steps:,} instructions")
         print(f"PASS: Neon Vulkan particle port ({steps:,} emitted A64 instructions)")
+        marker = 'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"'
+        gpu_body = emitted_gate.replace(marker, GPU_STUBS + '\n' + marker, 1)
+        gpu_body = gpu_body.replace(
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_port.pi4"',
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_port.pi4"\n'
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd_port.pi4"', 1)
+        end_marker = ('  If NeonVkPortParticleInit(1) <> 0 Or nvpParticleCount <> 0 : ProcedureReturn 35 : EndIf\n'
+                      '  ProcedureReturn 0\nEndProcedure\n')
+        if gpu_body.count(end_marker) != 1:
+            raise AssertionError("particle gate Main end changed")
+        gpu_body = gpu_body.replace(end_marker, end_marker.replace('  ProcedureReturn 0\n',
+                                                              GPU_ASSERTS + '  ProcedureReturn 0\n'), 1)
+        gpu_source = Path(temp) / "neon_vk_particle_gpu_port_gate.pi4"
+        gpu_image = Path(temp) / "neon_vk_particle_gpu_port_gate.img"
+        gpu_source.write_text(prelude + gpu_body, encoding="utf-8")
+        run = subprocess.run(
+            [str(COMPILER), "--compile", str(gpu_source), "-t", "pi4", "-s",
+             "--entry-returns", "--load-addr", "0x400000", "--bss-addr", "0x800000",
+             "--stack-addr", "0x3000000", "-o", str(gpu_image)],
+            cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)),
+            capture_output=True, text=True,
+        )
+        if run.returncode or not gpu_image.is_file():
+            raise AssertionError(f"GPU particle port compilation failed:\n{run.stdout}\n{run.stderr}")
+        result, steps = gate.execute(a64, gpu_image, 3_000_000)
+        if result:
+            raise AssertionError(f"GPU particle port assertion {result} failed after {steps:,} instructions")
+        print(f"PASS: CPU/GPU particle route isolation ({steps:,} emitted A64 instructions)")
         production = PRODUCTION.read_text(encoding="utf-8-sig")
         marker = 'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"'
         if production.count(marker) != 1:
@@ -202,6 +279,26 @@ def main() -> int:
         if not production_image.is_file():
             raise AssertionError("production include linker did not emit an image")
         print("PASS: particle adapter compiles with the real Vulkan/Neon composition")
+        csd_proof = (ROOT / "RaspberryPi4/Examples/Diagnostics/vulkanNeonParticleCsdModuleProof.pi4").read_text(encoding="utf-8-sig")
+        marker = 'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd.pi4"'
+        if csd_proof.count(marker) != 1:
+            raise AssertionError("CSD production include point changed")
+        csd_source = Path(temp) / "neon_vk_particle_gpu_production_include.pi4"
+        csd_image = Path(temp) / "neon_vk_particle_gpu_production_include.img"
+        csd_source.write_text(csd_proof.replace(marker, marker + '\n'
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_port.pi4"\n'
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_port.pi4"\n'
+            'XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd_port.pi4"'), encoding="utf-8")
+        run = subprocess.run(
+            [str(COMPILER), "--compile", str(csd_source), "-t", "pi4", "-s",
+             "--entry-returns", "--load-addr", "0x800000", "--bss-addr", "0x2000000",
+             "--stack-addr", "0x4000000", "-o", str(csd_image)],
+            cwd=ROOT, env=dict(os.environ, PMF_ROOT=str(ROOT)),
+            capture_output=True, text=True,
+        )
+        if run.returncode or not csd_image.is_file():
+            raise AssertionError(f"GPU port + production CSD composition failed:\n{run.stdout}\n{run.stderr}")
+        print("PASS: GPU particle adapter compiles with the real Pi 4 CSD backend")
     return 0
 
 
