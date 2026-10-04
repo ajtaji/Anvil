@@ -14,6 +14,13 @@ Backend choice is **static at build time**. Exactly one backend file is included
 
 `vk_backend_test.pbi` is a development/test backend, not hardware acceleration: it models state and logs calls, and never writes image pixels. `vk_backend_software.pbi` executes a bounded command subset on the CPU and deliberately omits the GPU capability bit; no production board monitor currently links it or presents its frames. A build may instead link `vk_backend_none.pbi`, which enumerates no physical device. These choices keep the public Vulkan command layer available for future board integration without treating a compile/link probe as display support.
 
+The Pi 4 Neon particle adapter has an explicit CSD producer route. A returning
+offscreen proof passed 32 ordered particles, 192 exact GPU-generated vertices,
+input/output guards and pixel probes, and one V3D bin/render job; see
+`docs/evidence/neon-particle-csd-port-pi4-20261003/README.md`. This is an
+opt-in producer feeding a Vulkan vertex buffer, not `vkCmdDispatch`, a default
+particle renderer, or a capability advertised by another board.
+
 The current Pi 4 production adapter has also passed a fresh 15-scene Neon
 widget run: all 245,760 reference pixels matched the native golden corpus,
 with one display DMA presentation and no processor pixel fallback. The separate
