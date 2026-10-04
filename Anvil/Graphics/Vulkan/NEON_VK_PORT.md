@@ -286,8 +286,11 @@ pixels from two instances. The returning
 diagnostic is prepared for that proof. No instanced particle route or
 throughput claim follows from packet encoding or desk checks alone.
 
-The opt-in particle producer uses Pi 4 `V3dCsd*` calls directly and is separate
-from public Vulkan compute. `vkCmdDispatch`, compute pipelines, storage-buffer
+The opt-in particle producer submits a private Pi 4 CSD job through the Vulkan
+backend's closed `AnvilVkV3dCsdConfigure/Submit` seam. The backend validates
+mapped ranges and workgroup counts and handles cache maintenance and completion;
+Chrome retains its exclusion and lost-device state around submission. This is
+separate from public Vulkan compute. `vkCmdDispatch`, compute pipelines, storage-buffer
 descriptors and a compute queue capability are absent, so an application
 cannot express this producer as a Vulkan compute command. The measured CSD
 gain above applies only to that private Pi 4 producer.

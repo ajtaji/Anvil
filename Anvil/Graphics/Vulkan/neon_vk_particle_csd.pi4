@@ -405,6 +405,7 @@ EndProcedure
 
 Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
   Define rc.i, padded.i, groups.i, t0.i
+  Define csd.AnvilVkV3dCsdPlan, result.AnvilVkV3dCsdResult
   If nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
   If nvpcState <> #NVPC_READY And nvpcState <> #NVPC_GPU_READY : ProcedureReturn #NVPC_ERR_STATE : EndIf
   If count < 0 Or count > nvpcCapacity Or (count > 0 And *particles = 0) : ProcedureReturn #NVPC_ERR_ARGS : EndIf
@@ -442,29 +443,29 @@ Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
   If nvpcInputMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcInputMemory) : nvpcInputMapped = 0 : EndIf
   If nvpcUnifMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcUnifMemory) : nvpcUnifMapped = 0 : EndIf
   If rc <> #NVPC_OK : ProcedureReturn rc : EndIf
-  rc = V3dCsdBegin(groups, 1, 1, 16, 1)
+  csd\codeBase = nvpcCodeAddr : csd\codeBytes = nvpcCodeBytes : csd\codeFlags = 0
+  csd\uniformBase = nvpcUnifAddr : csd\uniformBytes = 32
+  csd\inputBase = nvpcInputAddr : csd\inputBytes = padded * #NVPC_RECORD
+  csd\outputBase = nvpcVertexAddr : csd\outputBytes = nvpcVertexBytes
+  csd\outputWrittenBytes = padded * #NVPC_OUTPUT_PER_ITEM
+  csd\groupsX = groups : csd\groupsY = 1 : csd\groupsZ = 1
+  csd\workgroupSize = 16 : csd\workgroupsPerSupergroup = 1
+  csd\timeoutUs = #NVPC_WAIT_US
+  rc = AnvilVkV3dCsdConfigure(@csd, @result)
   If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
-  rc = V3dCsdCode(nvpcCodeAddr, nvpcCodeBytes, 0)
-  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
-  rc = V3dCsdUniforms(nvpcUnifAddr, 32)
-  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
-  V3dCsdOutput(nvpcVertexAddr, nvpcVertexBytes)
-  V3dCacheRange(nvpcInputAddr, padded * #NVPC_RECORD)
   rc = NeonVkChromeExternalProducerQuarantine()
-  If rc <> #NEON_VK_CHROME_OK : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  If rc <> #NEON_VK_CHROME_OK : AnvilVkV3dCsdCancel() : ProcedureReturn #NVPC_ERR_STATE : EndIf
   t0 = Micros()
-  rc = V3dCsdSubmit()
-  nvpcLastCsd = rc
-  If rc <> #V3D_OK : nvpcLastCsdUs = Micros() - t0 : nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
-  rc = V3dCsdWait(#NVPC_WAIT_US)
+  rc = AnvilVkV3dCsdSubmit(@result)
   nvpcLastCsdUs = Micros() - t0
-  nvpcLastCsd = rc
-  nvpcLastDoneBefore = V3dCsdDoneBefore() : nvpcLastDoneAfter = V3dCsdDoneAfter()
-  If rc <> #V3D_OK Or V3dCsdCleanResult() <> #V3D_OK Or nvpcLastDoneBefore = nvpcLastDoneAfter
+  nvpcLastCsd = result\native
+  If result\waited <> 0
+    nvpcLastDoneBefore = result\doneBefore : nvpcLastDoneAfter = result\doneAfter
+  EndIf
+  If rc <> #V3D_OK
     nvpcState = #NVPC_LOST
     ProcedureReturn #NVPC_ERR_LOST
   EndIf
-  V3dCacheRange(nvpcVertexAddr, padded * #NVPC_OUTPUT_PER_ITEM)
   rc = NeonVkChromeExternalProducerUnquarantine()
   If rc <> #NEON_VK_CHROME_OK : nvpcState = #NVPC_LOST : ProcedureReturn #NVPC_ERR_LOST : EndIf
   nvpcCount = count
