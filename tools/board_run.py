@@ -26,7 +26,8 @@ WHAT ONE RUN IS
                                             works is allowed to take minutes)
      and if it does not come, ask the board  `last run`
  10. read the payload's trace, if asked     `readback <addr> <len>`
- 11. read the kept picture                  `shot`
+ 11. read the kept picture                  `sr` acknowledged binary,
+                                            with sequence, x0 and CRC32
  12. write <name>.png, <name>.json and <name>.txt
 
 and exit NON-ZERO if x0 is not the explicitly expected value (zero by
@@ -148,6 +149,9 @@ tool reads it before the run and refuses a picture whose number did not move.
                     Default 60, which covers a deadman reset and the boot
                     after it.
     --settle S      twin mode only: how long to let it draw. Default 20.
+    --shot-timeout S  deadline for the kept picture transfer. Default 900.
+    --shot-text     use the older `shot` text stream only when the resident
+                    monitor does not support `sr`.
     --no-shot       do not arm or retrieve a picture. The payload return,
                     requested trace and run record remain available.
 
@@ -179,6 +183,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from anvil_readback import ReadbackError, read_range  # noqa: E402
+from pmfshot_wifi import ReliableShotError, grab_kept_reliable  # noqa: E402
 
 DEFAULT_CONSOLE_PORT = 5555
 DEFAULT_RECV_PORT = 5001
@@ -1862,29 +1867,39 @@ def run(args: argparse.Namespace) -> int:
             journal.step("trace")
 
         # ---- the picture -----------------------------------------------------
-        # A PICTURE IS SENT AS TENS OF THOUSANDS OF LINES and takes minutes on
-        # a big screen, so the wait is generous and ends at the terminator
-        # rather than at a prompt: the prompt comes after the last of three
-        # repeated END markers, and waiting for it doubles the timeout risk
-        # for nothing.
+        # sr reads the retained capture as bounded, acknowledged datagrams.
+        # The sequence travels in its binary header and is checked before
+        # its first ACK, so a stale capture never becomes a picture on disk.
         if not skip_evidence and not args.no_shot:
             console.settle(quiet=0.3, cap=3.0)
-            console.send("shot")
-            reply = console.read_until(["END ", "ABORT ", "!! there is no kept"],
-                                       args.shot_timeout)
-            reply += console.read_until(["pmf>"], 5.0)
-            (out_dir / f"{name}.shot.txt").write_text(reply, encoding="utf-8",
-                                                      errors="replace")
-            header = parse_shot_header(reply)
-            record["shot_header"] = header
             try:
-                w, h, bpp, rows = parse_pic_stream(reply)
+                if getattr(args, "shot_text", False):
+                    # Explicit compatibility path for a board without sr.
+                    console.send("shot")
+                    reply = console.read_until(
+                        ["END ", "ABORT ", "!! there is no kept"], args.shot_timeout)
+                    reply += console.read_until(["pmf>"], 5.0)
+                    (out_dir / f"{name}.shot.txt").write_text(
+                        reply, encoding="utf-8", errors="replace")
+                    header = parse_shot_header(reply)
+                    w, h, bpp, rows = parse_pic_stream(reply)
+                else:
+                    header, rows = grab_kept_reliable(
+                        console_ip, timeout=args.shot_timeout,
+                        console=console, min_seq=before,
+                        expected_x0=None if args.twin else x0)
+                    console.settle(quiet=0.3, cap=3.0)
+                    header["tier_name"] = TIER_NAMES.get(header["tier"], "unknown")
+                    header["src_name"] = SRC_NAMES.get(header["src"], "unknown")
+                    header["who_name"] = WHO_NAMES.get(header["who"], "unknown")
+                    w, h, bpp = header["w"], header["h"], header["bpp"]
+                record["shot_header"] = header
                 picture = png(w, h, rows)
                 record["picture"] = {
                     "width": w, "height": h, "bytes_per_pixel": bpp,
                     "pixel_sha256": pixel_sha256(rows),
                 }
-            except StreamError as error:
+            except (StreamError, ReliableShotError) as error:
                 failures.append(f"no picture came back: {error}")
             journal.step("picture")
 
@@ -1984,6 +1999,8 @@ def argument_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_ASK_SECONDS)
     parser.add_argument("--shot-timeout", dest="shot_timeout", type=float,
                         default=900.0)
+    parser.add_argument("--shot-text", dest="shot_text", action="store_true",
+                        help="use the older shot text stream with a board lacking sr")
     parser.add_argument("--settle", type=float, default=20.0)
     parser.add_argument("--twin", action="store_true")
     parser.add_argument("--no-shot", dest="no_shot", action="store_true")

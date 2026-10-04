@@ -1941,6 +1941,8 @@ EndProcedure
 #PICR_TAG_END  = $FFFFFFFF
 #PICR_TRIES    = 8               ; resends before declaring the host gone
 #PICR_ACK_MS   = 600             ; wait per try for the echoed tag
+#PICR_SHOT_MAGIC = $31525350     ; "PSR1" in little-endian byte order
+#PICR_SHOT_VERSION = 1
 
 Global Dim gPicrBuf.a[1024]      ; [tag:4][payload up to 1020]
 Global gPicrN.i                  ; run records in the buffer, not yet sent
@@ -2164,6 +2166,238 @@ Procedure CmdPicR()
     Print(" runs (")
     PrintDec(gPicrOff)
     PrintN(" bytes), every datagram acknowledged, CRC32 checked host-side.")
+  EndIf
+EndProcedure
+
+; sr reads the completed capture area, not the live front. The capture
+; service writes the pixels first and its validity word last; no payload
+; runs while this monitor command is sending them. The area is therefore
+; stable across both counting and transfer passes. pr's packet buffer is
+; only one datagram and is never a second copy of the picture.
+;
+; Header payload: 18 little-endian words (72 bytes). The first four are
+; pr's width, height, run count and record size. The remaining words are
+; magic, version, seq, pitch, rotation, tier, x0 low/high, panel width/
+; height, bpp, source, who and captured byte count. Chunks and END use
+; pr's existing stop-and-wait tags and CRC unchanged.
+Procedure CmdShotR()
+  Define fb.i
+  Define w.i
+  Define h.i
+  Define pitch.i
+  Define rot.i
+  Define panelW.i
+  Define panelH.i
+  Define x.i
+  Define y.i
+  Define px.i
+  Define run.i
+  Define cur.i
+  Define runs1.i
+  Define x0.i
+  Define keptBytes.i
+  Define wasMirror.i
+  Define wasAux.i
+  Define aborted.i
+
+  If ScrShotValid() = 0
+    ShotSayNothing()
+    ProcedureReturn
+  EndIf
+  If NetConsoleOn() = 0 Or NetConsolePeerOk() = 0
+    PrintN("!! sr needs a wireless console peer. Run it from the kept")
+    PrintN("   capture tool on the host, or use shot on a serial console.")
+    ProcedureReturn
+  EndIf
+
+  fb     = ScrShotPixels()
+  w      = ScrShotField(#MON_SHOT_OFF_W)
+  h      = ScrShotField(#MON_SHOT_OFF_H)
+  pitch  = ScrShotField(#MON_SHOT_OFF_PITCH)
+  rot    = ScrShotField(#MON_SHOT_OFF_ROT)
+  panelW = ScrShotField(#MON_SHOT_OFF_PANELW)
+  panelH = ScrShotField(#MON_SHOT_OFF_PANELH)
+  x0     = ScrShotField(#MON_SHOT_OFF_X0)
+  keptBytes = ScrShotField(#MON_SHOT_OFF_BYTES)
+  If w < 1 Or h < 1 Or pitch < 4 Or panelW < 1 Or panelH < 1 Or ScrShotField(#MON_SHOT_OFF_SEQ) < 1
+    PrintN("!! the kept capture header is invalid, so nothing was sent.")
+    ProcedureReturn
+  EndIf
+  ; Divide before multiplying, so even a corrupt 64-bit header cannot
+  ; overflow a size check and make ScrCapturePixel read outside the area.
+  If panelW > (#MON_SHOT_PIX_BYTES / 4) Or pitch > #MON_SHOT_PIX_BYTES
+    PrintN("!! the kept capture geometry exceeds its reserved area.")
+    ProcedureReturn
+  EndIf
+  If pitch < panelW * 4 Or panelH > (#MON_SHOT_PIX_BYTES / pitch)
+    PrintN("!! the kept capture geometry exceeds its reserved area.")
+    ProcedureReturn
+  EndIf
+  If keptBytes < (pitch * panelH) Or keptBytes > #MON_SHOT_PIX_BYTES
+    PrintN("!! the kept capture byte count is invalid.")
+    ProcedureReturn
+  EndIf
+  If rot = 0 Or rot = 180
+    If w <> panelW Or h <> panelH
+      PrintN("!! the kept capture dimensions disagree with its rotation.")
+      ProcedureReturn
+    EndIf
+  ElseIf rot = 90 Or rot = 270
+    If w <> panelH Or h <> panelW
+      PrintN("!! the kept capture dimensions disagree with its rotation.")
+      ProcedureReturn
+    EndIf
+  Else
+    PrintN("!! the kept capture rotation is invalid.")
+    ProcedureReturn
+  EndIf
+  If ScrShotField(#MON_SHOT_OFF_BPP) <> 4
+    PrintN("!! the kept capture format is invalid.")
+    ProcedureReturn
+  EndIf
+  If ScrShotField(#MON_SHOT_OFF_SRC) < #SCR_SRC_HDMI Or ScrShotField(#MON_SHOT_OFF_SRC) > #SCR_SRC_DSI
+    PrintN("!! the kept capture format is invalid.")
+    ProcedureReturn
+  EndIf
+  If ScrShotField(#MON_SHOT_OFF_TIER) < #HW_TIER_CPU Or ScrShotField(#MON_SHOT_OFF_TIER) > #HW_TIER_V3D
+    PrintN("!! the kept capture tier is invalid.")
+    ProcedureReturn
+  EndIf
+  If ScrShotField(#MON_SHOT_OFF_WHO) < #MON_SHOT_WHO_PAYLOAD Or ScrShotField(#MON_SHOT_OFF_WHO) > #MON_SHOT_WHO_RETURN
+    PrintN("!! the kept capture header is invalid, so nothing was sent.")
+    ProcedureReturn
+  EndIf
+
+  runs1 = 0
+  y = 0
+  While y < h
+    If OutBreakCtrlC() <> 0
+      Break
+    EndIf
+    x = 0
+    cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+    While x < w
+      px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+      If px <> cur
+        runs1 = runs1 + 1
+        cur = px
+      EndIf
+      x = x + 1
+    Wend
+    runs1 = runs1 + 1
+    y = y + 1
+  Wend
+  If OutBroke() <> 0
+    PrintN("Kept screenshot aborted before anything was sent.")
+    ProcedureReturn
+  EndIf
+
+  wasMirror = UartMirrorOn()
+  UartMirror(0)
+  NetConsoleFlush()
+  wasAux = UartAuxOn()
+  UartAuxMirror(0)
+
+  gPicrN = 0
+  gPicrOff = 0
+  gPicrRuns = 0
+  gPicrCrc = $FFFFFFFF
+  gPicrOk = 1
+  aborted = 0
+
+  PokeL(@gPicrBuf[4], w)
+  PokeL(@gPicrBuf[8], h)
+  PokeL(@gPicrBuf[12], runs1)
+  PokeL(@gPicrBuf[16], 8)
+  PokeL(@gPicrBuf[20], #PICR_SHOT_MAGIC)
+  PokeL(@gPicrBuf[24], #PICR_SHOT_VERSION)
+  PokeL(@gPicrBuf[28], ScrShotField(#MON_SHOT_OFF_SEQ))
+  PokeL(@gPicrBuf[32], pitch)
+  PokeL(@gPicrBuf[36], rot)
+  PokeL(@gPicrBuf[40], ScrShotField(#MON_SHOT_OFF_TIER))
+  PokeL(@gPicrBuf[44], x0 & $FFFFFFFF)
+  PokeL(@gPicrBuf[48], (x0 >> 32) & $FFFFFFFF)
+  PokeL(@gPicrBuf[52], panelW)
+  PokeL(@gPicrBuf[56], panelH)
+  PokeL(@gPicrBuf[60], ScrShotField(#MON_SHOT_OFF_BPP))
+  PokeL(@gPicrBuf[64], ScrShotField(#MON_SHOT_OFF_SRC))
+  PokeL(@gPicrBuf[68], ScrShotField(#MON_SHOT_OFF_WHO))
+  PokeL(@gPicrBuf[72], ScrShotField(#MON_SHOT_OFF_BYTES))
+  If picr_SendWait(#PICR_TAG_HDR, 72) = 0
+    gPicrOk = 0
+  EndIf
+
+  If gPicrOk <> 0
+    y = 0
+    While y < h
+      If OutBreakCtrlC() <> 0
+        aborted = 1
+        Break
+      EndIf
+      If gPicrOk = 0
+        Break
+      EndIf
+      x = 0
+      cur = ScrCapturePixel(fb, pitch, rot, panelW, panelH, 0, y)
+      run = 0
+      While x < w
+        px = ScrCapturePixel(fb, pitch, rot, panelW, panelH, x, y)
+        If px = cur
+          run = run + 1
+        Else
+          picr_PushRun(run, cur)
+          cur = px
+          run = 1
+        EndIf
+        x = x + 1
+      Wend
+      If run > 0
+        picr_PushRun(run, cur)
+      EndIf
+      y = y + 1
+    Wend
+  EndIf
+
+  If gPicrOk <> 0 And aborted = 0 And gPicrN > 0
+    gPicrCrc = Crc32Part(gPicrCrc, @gPicrBuf[4], gPicrN * 8)
+    If picr_SendWait(gPicrOff, gPicrN * 8) = 0
+      gPicrOk = 0
+    EndIf
+    gPicrOff = gPicrOff + (gPicrN * 8)
+    gPicrN = 0
+  EndIf
+
+  If gPicrOk <> 0
+    PokeL(@gPicrBuf[4], gPicrRuns)
+    PokeL(@gPicrBuf[8], (gPicrCrc ! $FFFFFFFF) & $FFFFFFFF)
+    If aborted <> 0
+      PokeL(@gPicrBuf[12], 0)
+    Else
+      PokeL(@gPicrBuf[12], 1)
+    EndIf
+    If picr_SendWait(#PICR_TAG_END, 12) = 0
+      gPicrOk = 0
+    EndIf
+  EndIf
+
+  If wasAux <> 0
+    UartAuxMirror(1)
+  EndIf
+  If wasMirror <> 0
+    UartMirror(0)
+    UartMirror(1)
+  EndIf
+  If gPicrOk = 0
+    PrintN("!! the peer stopped acknowledging; the kept picture did not")
+    PrintN("   complete. Run sr again.")
+  ElseIf aborted <> 0
+    PrintN("Kept screenshot aborted by Ctrl-C; the host was told so.")
+  Else
+    Print("Sent kept picture ")
+    PrintDec(ScrShotField(#MON_SHOT_OFF_SEQ))
+    Print(" as ")
+    PrintDec(gPicrRuns)
+    PrintN(" acknowledged runs with a CRC32.")
   EndIf
 EndProcedure
 
