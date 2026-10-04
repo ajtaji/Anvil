@@ -27,14 +27,15 @@ class FastPathGate(unittest.TestCase):
             "(nvcParticleItems[i]\\ignoreCamera <> 0 Or nvcParticleItems[i]\\zoomQ16 = 65536)"
         )
         start = cls.stage.index(cls.predicate)
-        end = cls.stage.index("      EndIf", start)
+        end = start + re.search(r"^      EndIf$", cls.stage[start:], re.MULTILINE).start()
         cls.branch = cls.stage[start:end]
+        cls.fast, cls.general = re.split(r"^      Else$", cls.branch, maxsplit=1,
+                                         flags=re.MULTILINE)
 
     def test_predicate_and_general_fallback_match_chrome(self) -> None:
         self.assertIn(self.predicate, self.chrome)
         self.assertEqual(self.stage.count(self.predicate), 1)
-        general = self.branch.split("      Else\n", 1)[1]
-        self.assertEqual([line.strip() for line in general.strip().splitlines()], [
+        self.assertEqual([line.strip() for line in self.general.strip().splitlines()], [
             "For c = 0 To 3",
             "nvcParticleCornerBits(PeekI(*corners + c * 2 * SizeOf(.i)), PeekI(*corners + (c * 2 + 1) * SizeOf(.i)), @xb, @yb)",
             "PokeL(p + c * 8, xb) : PokeL(p + c * 8 + 4, yb)",
@@ -42,7 +43,7 @@ class FastPathGate(unittest.TestCase):
         ])
 
     def test_four_clips_and_all_eight_fast_stores(self) -> None:
-        fast = self.branch.split("      Else\n", 1)[0]
+        fast = self.fast
         self.assertEqual(re.findall(r"nvcParticleClipXBits\(\*corners\\(x\d)\)", fast), ["x0", "x1"])
         self.assertEqual(re.findall(r"nvcParticleClipYBits\(\*corners\\(y\d)\)", fast), ["y0", "y2"])
         stores = re.findall(r"PokeL\(p \+ (\d+), (\w+)\)", fast)
@@ -52,7 +53,7 @@ class FastPathGate(unittest.TestCase):
         ])
 
     def test_fast_stores_equal_general_for_axis_aligned_geometry(self) -> None:
-        fast = self.branch.split("      Else\n", 1)[0]
+        fast = self.fast
         stores = [(int(off) // 4, name) for off, name in
                   re.findall(r"PokeL\(p \+ (\d+), (\w+)\)", fast)]
         rng = random.Random(0xC5D)
@@ -71,6 +72,36 @@ class FastPathGate(unittest.TestCase):
             for index, name in stores:
                 emitted[index] = values[name]
             self.assertEqual(tuple(emitted), general)
+
+    def test_local_y_pair_cache_keeps_words_exact_across_fast_and_general_items(self) -> None:
+        self.assertLess(self.stage.index("haveYPair = 0"),
+                        self.stage.index("For i = 0 To padded - 1"))
+        fast = self.fast
+        self.assertIn("*corners\\y0 = cachedY0 And *corners\\y2 = cachedY2", fast)
+        self.assertIn("yb0 = cachedYb0 : yb2 = cachedYb2", fast)
+        self.assertIn("cachedY0 = *corners\\y0 : cachedY2 = *corners\\y2", fast)
+        self.assertIn("cachedYb0 = yb0 : cachedYb2 = yb2 : haveYPair = 1", fast)
+        self.assertEqual(fast.count("nvcParticleClipYBits("), 2)
+
+        rng = random.Random(0xA51)
+        items = []
+        for row in range(100):
+            for column in range(100):
+                y0 = row * 2048 + rng.randrange(-2, 3) * 256 if row % 17 == 0 else row * 2048
+                y2 = y0 + 1024
+                fast_item = (column % 19 != 0)
+                items.append((fast_item, y0, y2))
+        have, key, value, calls = False, None, None, 0
+        for fast_item, y0, y2 in items:
+            expected = ((y0 * 2654435761 + 0x12345678) & 0xFFFFFFFF,
+                        (y2 * 2654435761 + 0x12345678) & 0xFFFFFFFF)
+            if not fast_item:
+                continue  # the unchanged general branch may call the clip cache
+            if not have or key != (y0, y2):
+                key, value, have = (y0, y2), expected, True
+                calls += 2
+            self.assertEqual(value, expected)
+        self.assertLess(calls, 10_000)  # 20,000 uncached Y calls in this mix
 
 
 if __name__ == "__main__":
