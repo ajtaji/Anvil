@@ -246,13 +246,23 @@ to zero or would extend outside the screen. `NeonVkPortViewportMapPointer` retur
 coordinates for a physical pointer; its result distinguishes pixels inside
 the canvas from letterbox bars, and refuses coordinates outside the screen.
 The map does not clamp bars or apply the desktop's optional CRT warp. A host
-can use the planned width and height as its Vulkan target, place the completed
-image at the planned offset during presentation, and discard pointer events
-in the bars. The module neither presents nor owns a display; the resident
+can use the planned rectangle with `NeonVkChromeViewportSet` immediately after
+frame begin, then discard pointer events in the bars. Chrome clears the full
+target before drawing and restores the full viewport on the next frame. The
+module neither presents nor owns a display; the resident
 monitor does not yet use it. Its gate desk-compiles for Pi 3, Pi 4 and Pi 5;
 the Pi 4 returning math proof passed. No visible application is claimed. Cropped viewports
 remain unsupported. The default native Neon path and compile-time Vulkan
 backend selection are unchanged.
+
+The [Pi 4 viewport frame proof](../../../docs/evidence/neon-viewport-frame-pi4-20261003/README.md)
+placed an 800×450 canvas in an 800×800 GPU target. Its checked pixels include
+black bars, clipped geometry and a cropped sprite; a separate non-opt-in
+frame passed the existing box, text and sprite regression. Both were returning
+offscreen payloads. The current backend refused a 1280×800 GPU target under
+the test's 1024-pixel image cap, and scaled text remains unsupported when
+canvas and target sizes differ. This does not yet install a Neon app host in
+the resident monitor.
 
 The Pi 4 board proof in `docs/evidence/neon-vk-port-frame-pi4-20261003/`
 exercised this adapter through the real V3D Vulkan backend. It checked a
