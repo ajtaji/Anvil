@@ -537,6 +537,9 @@ Declare.i avkBackendSubmitClear(base.i, bytes.i, w.i, h.i, pitch.i, bgra.i)
 Declare.i avkBackendPoll()
 Declare.i avkBackendLastNativeError()
 Declare.i avkBackendTicksUs()
+; Pure capability check for an immutable typed compute graph. The pointer is
+; AvkComputeIr in the pipeline layer; foundation precedes that type's include.
+Declare.i avkBackendComputeCanLower(*ir)
 
 ; The graphics half of the seam. A backend with no #ANVIL_VK_CAP_DRAW bit
 ; still defines all four: they answer "not on this backend" rather than

@@ -1,0 +1,99 @@
+; Emitted-A64 proof of the closed Pi 4 compute IR to QPU lowering.
+; It builds the current private producer's QPU program as an independent
+; reference but never initializes V3D, submits CSD, or advertises compute.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_chrome.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/neon_vk_particle_csd.pi4"
+
+#CQ_IN = $06000000
+#CQ_REPORT = $06100000
+#CQ_PRIVATE = $06200000
+#CQ_LOWERED = $06201000
+#CQ_CHANGED = $06202000
+#CQ_REFUSED = $06203000
+#CQ_UNIFORM = $06204000
+#CQ_CHANGED_UNIFORM = $06205000
+Global cqIr.AvkComputeIr
+Global cqCode.AnvilVkV3dComputeCode
+
+Procedure cqPut(index.i, value.i)
+  PokeI(#CQ_REPORT + index * 8, value)
+EndProcedure
+
+Procedure.i Main()
+  Protected rc.i, originalSource.i, originalConstant.i, k.i
+  avkV3dWindowBase = $06200000 : avkV3dWindowBytes = $00400000
+  cqPut(0, $43515034)
+  rc = AnvilVkSpirvComputeAdapt(PeekI(#CQ_IN), PeekI(#CQ_IN + 8), @cqIr)
+  cqPut(1, rc)
+  If rc <> 0 : ProcedureReturn 1 : EndIf
+  cqPut(2, AnvilVkV3dComputeCanLower(@cqIr))
+  rc = AnvilVkV3dComputeLower(@cqIr, #CQ_LOWERED, 4096, #CQ_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode)
+  cqPut(3, rc) : cqPut(4, cqCode\codeBytes) : cqPut(5, cqCode\uniformBytes)
+  If rc <> 0 : ProcedureReturn 2 : EndIf
+  nvpcCodeAddr = #CQ_PRIVATE
+  rc = nvpcBuildShader()
+  cqPut(6, rc) : cqPut(7, V3dQpuProgramBytes())
+  If rc <> 0 : ProcedureReturn 3 : EndIf
+  originalSource = cqIr\stores[0]\inputByte
+  cqIr\stores[0]\inputByte = 4
+  cqPut(8, AnvilVkV3dComputeCanLower(@cqIr))
+  rc = AnvilVkV3dComputeLower(@cqIr, #CQ_CHANGED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode)
+  cqPut(9, rc) : cqPut(10, cqCode\codeBytes)
+  cqIr\stores[0]\inputByte = originalSource
+  If rc <> 0 : ProcedureReturn 4 : EndIf
+  originalConstant = cqIr\stores[4]\constantBits
+  cqIr\stores[4]\constantBits = $3F000000
+  cqPut(11, AnvilVkV3dComputeCanLower(@cqIr))
+  PokeL(#CQ_REFUSED, $A5A5A5A5)
+  rc = AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode)
+  cqPut(12, rc) : cqPut(13, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqIr\stores[4]\constantBits = originalConstant
+  cqIr\inputStride = 52
+  cqPut(14, AnvilVkV3dComputeCanLower(@cqIr))
+  rc = AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode)
+  cqPut(15, rc) : cqPut(16, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqIr\inputStride = 48
+  cqPut(17, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 1295, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode))
+  cqPut(18, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(19, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_REFUSED + 128, 32, $06400000, 768, $06500000, 2304, @cqCode))
+  cqPut(20, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(21, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, #CQ_REFUSED + 16, 768, $06500000, 2304, @cqCode))
+  cqPut(22, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(23, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, #CQ_CHANGED_UNIFORM + 16, 2304, @cqCode))
+  cqPut(24, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(25, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06400200, 2304, @cqCode))
+  cqPut(26, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(27, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $FFFFFFF0, 768, $06500000, 2304, @cqCode))
+  cqPut(28, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(29, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $FFFFFFF0, 2304, @cqCode))
+  cqPut(30, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(31, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06600000, 768, $06500000, 2304, @cqCode))
+  cqPut(32, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(33, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, $06600000, 32, $06400000, 768, $06500000, 2304, @cqCode))
+  cqPut(34, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  cqPut(35, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06600000, 2304, @cqCode))
+  cqPut(36, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  avkV3dWindowBase = $06204000 : avkV3dWindowBytes = $003FC000
+  cqPut(37, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, $06400000, 768, $06500000, 2304, @cqCode))
+  cqPut(38, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  avkV3dWindowBase = $06200000 : avkV3dWindowBytes = $00400000
+  cqPut(39, AnvilVkV3dComputeLower(@cqIr, #CQ_REFUSED, 4096, #CQ_CHANGED_UNIFORM, 32, #CQ_REFUSED + 2048, 768, $06500000, 2304, @cqCode))
+  cqPut(40, PeekL(#CQ_REFUSED) & $FFFFFFFF)
+  ProcedureReturn 0
+EndProcedure

@@ -1,0 +1,134 @@
+; Desk-only typed compute module and internal pipeline proof for Pi4 particle SPIR-V.
+; The public pipeline entry refuses while queue compute is unadvertised.
+; Link the real Pi 4 backend predicate. Device state is injected because
+; avkBackendPrepare requires initialized Neon/MMIO, unavailable to A64 desk.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_dispatch.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#PP_IN = $06000000
+#PP_OUT = $06100000
+#PP_NAME = $06300000
+
+Procedure ppPut(n.i, value.i)
+  PokeI(#PP_OUT + n * 8, value)
+EndProcedure
+
+Procedure.i Main()
+  Protected device.i, otherDevice.i, module.i, staleModule.i, layout.i, wrongLayout.i, pipeline.i, stalePipeline.i, setLayout.i, wrongSetLayout.i
+  Protected rc.i, slot.i, savedWord.i, k.i, proc.i
+  Protected sm.VkShaderModuleCreateInfo
+  Protected Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Protected dsl.VkDescriptorSetLayoutCreateInfo
+  Protected pl.VkPipelineLayoutCreateInfo
+  Protected cp.VkComputePipelineCreateInfo
+  Protected spec.VkSpecializationInfo
+  ppPut(0, $50503434)
+  ; Only the handle/device generation is synthesized. All public creation
+  ; and the production Pi4 graph-lowering predicate run unmodified.
+  avkDevGen[1] = avkNextGen(avkDevGen[1]) : avkDevLive[1] = 1
+  avkDevGen[2] = avkNextGen(avkDevGen[2]) : avkDevLive[2] = 1
+  device = avkToken(#ANVIL_VK_TYPE_DEVICE, 1, avkDevGen[1])
+  otherDevice = avkToken(#ANVIL_VK_TYPE_DEVICE, 2, avkDevGen[2])
+  sm\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  sm\pCode = PeekI(#PP_IN) : sm\codeSize = PeekI(#PP_IN + 8)
+  rc = vkCreateShaderModule(device, @sm, 0, @module)
+  ppPut(1, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  slot = avkShSlot(module)
+  ppPut(2, avkShComputeIr[slot]\storeCount)
+  ppPut(3, avkShComputeIr[slot]\localX)
+  ppPut(4, Bool(AnvilVkShaderModuleComputeIr(module) <> 0))
+  For k = 0 To 1
+    bindings[k]\binding = k : bindings[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    bindings[k]\descriptorCount = 1 : bindings[k]\stageFlags = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  dsl\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dsl\bindingCount = 2 : dsl\pBindings = @bindings[0]
+  rc = vkCreateDescriptorSetLayout(device, @dsl, 0, @setLayout)
+  ppPut(5, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  pl\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  pl\setLayoutCount = 1 : pl\pSetLayouts = @setLayout
+  rc = vkCreatePipelineLayout(device, @pl, 0, @layout)
+  ppPut(6, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  cp\sType = #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  cp\stage\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  cp\stage\stage = #VK_SHADER_STAGE_COMPUTE_BIT
+  PokeL(#PP_NAME, $6E69616D) : PokeA(#PP_NAME + 4, 0)
+  cp\stage\module = module : cp\stage\pName = #PP_NAME
+  cp\layout = layout : cp\basePipelineIndex = -1
+  rc = AnvilVkComputePipelineCreate(device, @cp, @pipeline)
+  ppPut(7, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  slot = avkPipeSlot(pipeline)
+  ppPut(8, avkPipeKind[slot]) : ppPut(9, avkPipeComputeIr[slot]\storeCount)
+  ppPut(10, Bool(avkPipeComputeIr[slot]\stores[0]\inputByte = 0 And avkPipeComputeIr[slot]\stores[35]\outputWord = 35))
+  staleModule = module
+  vkDestroyShaderModule(device, module, 0)
+  ppPut(11, Bool(AnvilVkShaderModuleComputeIr(staleModule) = 0 And avkPipeComputeIr[slot]\valid = 1))
+  cp\stage\module = staleModule
+  ppPut(12, AnvilVkComputePipelineCreate(device, @cp, @module))
+  cp\stage\module = 0
+  cp\stage\stage = #VK_SHADER_STAGE_FRAGMENT_BIT
+  ppPut(13, AnvilVkComputePipelineCreate(device, @cp, @module))
+  cp\stage\stage = #VK_SHADER_STAGE_COMPUTE_BIT
+  sm\codeSize = sm\codeSize - 4
+  ppPut(14, vkCreateShaderModule(device, @sm, 0, @module))
+  sm\codeSize = sm\codeSize + 4
+  If vkCreateShaderModule(device, @sm, 0, @module) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+  cp\stage\module = module
+  PokeA(#PP_NAME, 120)
+  ppPut(15, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  PokeA(#PP_NAME, 109)
+  cp\stage\pSpecializationInfo = @spec
+  ppPut(16, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  cp\stage\pSpecializationInfo = 0
+  ppPut(17, AnvilVkComputePipelineCreate(otherDevice, @cp, @stalePipeline))
+  stalePipeline = $5A5A5A5A
+  ppPut(18, vkCreateComputePipelines(device, 0, 1, @cp, 0, @stalePipeline))
+  ppPut(19, Bool(stalePipeline = #VK_NULL_HANDLE))
+  savedWord = avkShComputeIr[avkShSlot(module)]\stores[0]\outputWord
+  avkShComputeIr[avkShSlot(module)]\stores[0]\outputWord = 1
+  ppPut(20, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  avkShComputeIr[avkShSlot(module)]\stores[0]\outputWord = savedWord
+  ppPut(21, Bool(avkPipeComputeIr[slot]\stores[0]\outputWord = 0))
+  cp\basePipelineIndex = 0
+  ppPut(29, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  cp\basePipelineIndex = -1
+  bindings[1]\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+  bindings[1]\stageFlags = #VK_SHADER_STAGE_FRAGMENT_BIT
+  rc = vkCreateDescriptorSetLayout(device, @dsl, 0, @wrongSetLayout)
+  ppPut(26, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  pl\pSetLayouts = @wrongSetLayout
+  rc = vkCreatePipelineLayout(device, @pl, 0, @wrongLayout)
+  ppPut(27, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  cp\layout = wrongLayout
+  ppPut(28, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  cp\layout = layout
+  cp\sType = 0
+  ppPut(22, AnvilVkComputePipelineCreate(device, @cp, @stalePipeline))
+  cp\sType = #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  stalePipeline = pipeline
+  vkDestroyPipeline(device, pipeline, 0)
+  ppPut(25, Bool(avkPipeSlot(stalePipeline) = 0))
+  vkDestroyShaderModule(device, module, 0)
+  ProcedureReturn 0
+EndProcedure

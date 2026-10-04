@@ -28,6 +28,10 @@ Procedure.i avkBackendPrepare()
   ProcedureReturn #VK_ERROR_INCOMPATIBLE_DRIVER
 EndProcedure
 
+Procedure.i avkBackendComputeCanLower(*ir)
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i avkBackendHeapBase()
   ProcedureReturn 0
 EndProcedure
