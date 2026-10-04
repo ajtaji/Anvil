@@ -1,0 +1,331 @@
+; Returning RAM-only Pi 4 proof of Anvil's internal recorded compute queue path.
+; Build via tools/vulkan_neon_particle_queue_silicon_proof.py. Arm deadman 15.
+; This deliberately does not call public vkCmdDispatch or advertise compute.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#PQ_MAGIC = $51504334
+#PQ_TAIL = $34435051
+#PQ_SURFACE = $06000000
+#PQ_WIN = $063E8000
+#PQ_WIN_BYTES = $00800000
+#PQ_ARENA = $0A000000
+#PQ_ARENA_BYTES = $01000000
+#PQ_ITEMS = 32
+#PQ_INPUT_RECORD = 48
+#PQ_OUTPUT_RECORD = 144
+#PQ_INPUT_LIVE = #PQ_ITEMS * #PQ_INPUT_RECORD
+#PQ_OUTPUT_LIVE = #PQ_ITEMS * #PQ_OUTPUT_RECORD
+#PQ_ALLOC = 12288
+#PQ_OUTPUT_OFFSET = 4096
+#PQ_OUTPUT_BYTES = 8192
+#PQ_GUARD = $A55AA55A
+#PQ_ONE = $3F800000
+#PQ_SPV_BYTES = 4036
+#PQ_SPV_WORDS = #PQ_SPV_BYTES / 4
+
+; 64 little-endian words. x0 is this record's address.
+; 0 magic, 1 status, 2 stage, 3..9 API results, 10..14 GPU telemetry,
+; 15..18 mismatch counts, 19..21 first mismatch, 22..27 allocation/address
+; checks, 28..31 first/last output and expected, 63 tail.
+Global Dim pqReport.l[64]
+Global Dim pqSpv.l[#PQ_SPV_WORDS]
+Global Dim pqMainName.a[5]
+Global pqDev.i, pqInst.i, pqPool.i, pqCmd.i, pqBuffer.i, pqMemory.i
+Global pqModule.i, pqDsl.i, pqLayout.i, pqPipeline.i, pqDescPool.i, pqSet.i
+Global pqFence.i, pqSignal.i, pqMapped.i, pqBase.i
+Global pqNeon.i, pqSubmitted.i
+
+Procedure pqPut(slot.i, value.i)
+  If slot >= 0 And slot < 64 : pqReport[slot] = value & $FFFFFFFF : EndIf
+EndProcedure
+
+Procedure.i pqFinish(status.i)
+  pqPut(1, status)
+  pqPut(12, avkFlightActive) : pqPut(13, avkFlightQuarantined)
+  pqPut(14, avkV3dGpuLease) : pqPut(32, AnvilVkFaultCount())
+  pqPut(63, #PQ_TAIL)
+  If UartRunning() <> 0
+    UartWrite(80) : UartWrite(81)
+    If status = 0 : UartWrite(79) : UartWrite(75) : Else : UartWrite(69) : UartWrite(82) : EndIf
+    UartWriteNl()
+  EndIf
+  ProcedureReturn @pqReport[0]
+EndProcedure
+
+; A failed or timed-out submit can leave the CSD accessing live allocations.
+; Never unmap, free, or return in that case; the armed deadman owns recovery.
+Procedure.i pqUnsafe(status.i)
+  pqFinish(status)
+  If UartRunning() <> 0 : UartWrite(33) : UartWriteNl() : EndIf
+  Repeat : ForEver
+  ProcedureReturn 0
+EndProcedure
+
+Procedure.i pqInputWord(item.i, component.i)
+  ; Distinct exact IEEE-754 finite bit patterns in all twelve input fields.
+  ProcedureReturn $3F000000 + item * $1000 + component * $10
+EndProcedure
+
+Procedure.i pqExpected(item.i, vertex.i, component.i)
+  Define source.i
+  If component = 4 Or component = 5 : ProcedureReturn #PQ_ONE : EndIf
+  If component = 2 : ProcedureReturn pqInputWord(item, 8) : EndIf
+  If component = 3 : ProcedureReturn pqInputWord(item, 9) : EndIf
+  Select vertex
+    Case 0 : source = 0
+    Case 1 : source = 4
+    Case 2 : source = 6
+    Case 3 : source = 0
+    Case 4 : source = 6
+    Default : source = 2
+  EndSelect
+  ProcedureReturn pqInputWord(item, source + component)
+EndProcedure
+
+Procedure pqLoadSpv()
+  Define i.i, word.l
+  Restore PqTrackedSpv
+  For i = 0 To #PQ_SPV_WORDS - 1
+    Read.l word
+    pqSpv[i] = word
+  Next
+EndProcedure
+
+Procedure.i pqCheck()
+  Define i.i, c.i, v.i, offset.i, got.i, want.i
+  If vkMapMemory(pqDev, pqMemory, 0, #PQ_ALLOC, 0, @pqMapped) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If pqMapped <> pqBase : ProcedureReturn 0 : EndIf
+  V3dCacheRange(pqBase, #PQ_ALLOC)
+  For i = 0 To #PQ_ITEMS - 1
+    For v = 0 To 5
+      For c = 0 To 5
+        offset = ((i * 6 + v) * 6 + c) * 4
+        got = PeekL(pqBase + #PQ_OUTPUT_OFFSET + offset) & $FFFFFFFF
+        want = pqExpected(i, v, c) & $FFFFFFFF
+        If got <> want
+          pqReport[15] = pqReport[15] + 1
+          If pqReport[19] = 0
+            pqPut(19, offset + 1) : pqPut(20, want) : pqPut(21, got)
+          EndIf
+        EndIf
+      Next
+    Next
+  Next
+  For i = 0 To #PQ_ITEMS - 1
+    For c = 0 To 11
+      If (PeekL(pqBase + i * #PQ_INPUT_RECORD + c * 4) & $FFFFFFFF) <> pqInputWord(i, c)
+        pqReport[16] = pqReport[16] + 1
+      EndIf
+    Next
+  Next
+  For offset = #PQ_INPUT_LIVE To #PQ_OUTPUT_OFFSET - 4 Step 4
+    If (PeekL(pqBase + offset) & $FFFFFFFF) <> #PQ_GUARD : pqReport[17] = pqReport[17] + 1 : EndIf
+  Next
+  For offset = #PQ_OUTPUT_OFFSET + #PQ_OUTPUT_LIVE To #PQ_ALLOC - 4 Step 4
+    If (PeekL(pqBase + offset) & $FFFFFFFF) <> #PQ_GUARD : pqReport[18] = pqReport[18] + 1 : EndIf
+  Next
+  pqPut(28, PeekL(pqBase + #PQ_OUTPUT_OFFSET))
+  pqPut(29, pqExpected(0, 0, 0))
+  pqPut(30, PeekL(pqBase + #PQ_OUTPUT_OFFSET + #PQ_OUTPUT_LIVE - 4))
+  pqPut(31, pqExpected(#PQ_ITEMS - 1, 5, 5))
+  vkUnmapMemory(pqDev, pqMemory) : pqMapped = 0
+  ProcedureReturn Bool(pqReport[15] = 0 And pqReport[16] = 0 And pqReport[17] = 0 And pqReport[18] = 0)
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, count.i, phys.i, queue.i, i.i, priority.l, signalHandle.i, cb.i, proofStatus.i
+  Define ici.VkInstanceCreateInfo, qci.VkDeviceQueueCreateInfo, dci.VkDeviceCreateInfo
+  Define sm.VkShaderModuleCreateInfo, dsl.VkDescriptorSetLayoutCreateInfo
+  Define pl.VkPipelineLayoutCreateInfo, cp.VkComputePipelineCreateInfo
+  Define poolSize.VkDescriptorPoolSize, pci.VkDescriptorPoolCreateInfo
+  Define ai.VkDescriptorSetAllocateInfo, info.VkDescriptorBufferInfo
+  Define write.VkWriteDescriptorSet, bci.VkBufferCreateInfo
+  Define mai.VkMemoryAllocateInfo, req.VkMemoryRequirements
+  Define cmdPci.VkCommandPoolCreateInfo, cbai.VkCommandBufferAllocateInfo
+  Define bi.VkCommandBufferBeginInfo, fci.VkFenceCreateInfo
+  Define sci.VkSemaphoreCreateInfo, si.VkSubmitInfo
+
+  pqPut(0, #PQ_MAGIC) : pqPut(2, 1)
+  pqPut(22, #PQ_WIN) : pqPut(23, #PQ_WIN_BYTES)
+  pqPut(24, #PQ_INPUT_LIVE) : pqPut(25, #PQ_OUTPUT_LIVE)
+  TimerInit()
+  If NeonArena(#PQ_ARENA, #PQ_ARENA_BYTES) <> #NEON_OK : ProcedureReturn pqFinish(2) : EndIf
+  If NeonSurface(#PQ_SURFACE, 800, 1280, 3200) <> #NEON_OK : ProcedureReturn pqFinish(2) : EndIf
+  NeonSurfaceMapSpan(4096000 + #PQ_WIN_BYTES)
+  If NeonInit() <> #NEON_OK : ProcedureReturn pqFinish(2) : EndIf
+  pqNeon = 1
+  If AnvilVkV3dWindow(#PQ_WIN, #PQ_WIN_BYTES) <> #VK_SUCCESS : ProcedureReturn pqFinish(2) : EndIf
+
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @pqInst) : pqPut(3, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(3) : EndIf
+  count = 1 : rc = vkEnumeratePhysicalDevices(pqInst, @count, @phys)
+  If rc <> #VK_SUCCESS Or phys = 0 : ProcedureReturn pqFinish(4) : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
+  qci\queueFamilyIndex = 0 : qci\queueCount = 1 : qci\pQueuePriorities = @priority
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
+  dci\queueCreateInfoCount = 1 : dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @pqDev) : pqPut(4, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(5) : EndIf
+  vkGetDeviceQueue(pqDev, 0, 0, @queue)
+  pqLoadSpv()
+  sm\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  sm\pCode = @pqSpv[0] : sm\codeSize = #PQ_SPV_BYTES
+  rc = vkCreateShaderModule(pqDev, @sm, 0, @pqModule) : pqPut(5, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(6) : EndIf
+
+  Dim setBindings.VkDescriptorSetLayoutBinding[2]
+  For i = 0 To 1
+    setBindings[i]\binding = i : setBindings[i]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    setBindings[i]\descriptorCount = 1 : setBindings[i]\stageFlags = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  dsl\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dsl\bindingCount = 2 : dsl\pBindings = @setBindings[0]
+  rc = vkCreateDescriptorSetLayout(pqDev, @dsl, 0, @pqDsl)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(7) : EndIf
+  pl\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  pl\setLayoutCount = 1 : pl\pSetLayouts = @pqDsl
+  rc = vkCreatePipelineLayout(pqDev, @pl, 0, @pqLayout)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(8) : EndIf
+  cp\sType = #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  cp\stage\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  cp\stage\stage = #VK_SHADER_STAGE_COMPUTE_BIT
+  PokeL(@pqMainName[0], $6E69616D) : PokeA(@pqMainName[4], 0)
+  cp\stage\module = pqModule : cp\stage\pName = @pqMainName[0]
+  cp\layout = pqLayout : cp\basePipelineIndex = -1
+  rc = AnvilVkComputePipelineCreate(pqDev, @cp, @pqPipeline) : pqPut(6, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(9) : EndIf
+
+  bci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bci\size = #PQ_ALLOC : bci\usage = #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+  bci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  rc = vkCreateBuffer(pqDev, @bci, 0, @pqBuffer)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(10) : EndIf
+  vkGetBufferMemoryRequirements(pqDev, pqBuffer, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(pqDev, @mai, 0, @pqMemory)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(11) : EndIf
+  rc = vkBindBufferMemory(pqDev, pqBuffer, pqMemory, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(12) : EndIf
+  rc = vkMapMemory(pqDev, pqMemory, 0, #PQ_ALLOC, 0, @pqMapped)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(13) : EndIf
+  pqBase = pqMapped : pqPut(26, pqBase)
+  If pqBase <> AnvilVkMemoryAddress(pqMemory) Or (pqBase % 4096) <> 0 Or pqBase < #PQ_WIN Or pqBase > #PQ_WIN + #PQ_WIN_BYTES - #PQ_ALLOC
+    ProcedureReturn pqFinish(14)
+  EndIf
+  For i = 0 To #PQ_ALLOC - 4 Step 4 : PokeL(pqBase + i, #PQ_GUARD) : Next
+  For i = 0 To #PQ_ITEMS * 12 - 1
+    PokeL(pqBase + i * 4, pqInputWord(i / 12, i % 12))
+  Next
+  DmaCacheRange(pqBase, #PQ_ALLOC)
+  vkUnmapMemory(pqDev, pqMemory) : pqMapped = 0
+
+  poolSize\type = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : poolSize\descriptorCount = 2
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  pci\maxSets = 1 : pci\poolSizeCount = 1 : pci\pPoolSizes = @poolSize
+  rc = vkCreateDescriptorPool(pqDev, @pci, 0, @pqDescPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(15) : EndIf
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pqDescPool : ai\descriptorSetCount = 1 : ai\pSetLayouts = @pqDsl
+  rc = vkAllocateDescriptorSets(pqDev, @ai, @pqSet)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(16) : EndIf
+  Dim infos.VkDescriptorBufferInfo[2]
+  Dim writes.VkWriteDescriptorSet[2]
+  infos[0]\buffer = pqBuffer : infos[0]\offset = 0 : infos[0]\range = #PQ_INPUT_LIVE
+  infos[1]\buffer = pqBuffer : infos[1]\offset = #PQ_OUTPUT_OFFSET : infos[1]\range = #PQ_OUTPUT_BYTES
+  For i = 0 To 1
+    writes[i]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    writes[i]\dstSet = pqSet : writes[i]\dstBinding = i
+    writes[i]\descriptorCount = 1 : writes[i]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    writes[i]\pBufferInfo = @infos[i]
+    rc = AnvilVkDescriptorSetWriteOne(pqDev, @writes[i])
+    If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(17) : EndIf
+  Next
+
+  cmdPci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  cmdPci\flags = #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+  rc = vkCreateCommandPool(pqDev, @cmdPci, 0, @pqPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(18) : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = pqPool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  rc = vkAllocateCommandBuffers(pqDev, @cbai, @pqCmd)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(19) : EndIf
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  rc = vkBeginCommandBuffer(pqCmd, @bi)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(20) : EndIf
+  AnvilVkCmdBindComputePipeline(pqCmd, pqPipeline)
+  AnvilVkCmdBindComputeDescriptorSet(pqCmd, pqLayout, pqSet)
+  AnvilVkCmdRecordComputeDispatch(pqCmd, 2, 1, 1)
+  pqPut(7, avkCbFailCode[avkCmdSlot(pqCmd)])
+  pqPut(8, avkCbComputeItems[avkCmdSlot(pqCmd)])
+  If pqReport[7] <> 0 Or pqReport[8] <> #PQ_ITEMS : ProcedureReturn pqFinish(21) : EndIf
+  rc = vkEndCommandBuffer(pqCmd)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(22) : EndIf
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  rc = vkCreateFence(pqDev, @fci, 0, @pqFence)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(23) : EndIf
+  sci\sType = #VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
+  rc = vkCreateSemaphore(pqDev, @sci, 0, @pqSignal)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqFinish(24) : EndIf
+
+  pqPut(2, 2) : pqPut(10, V3dCsdJobs()) : pqPut(11, avkBackendJobs())
+  cb = pqCmd : signalHandle = pqSignal
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cb
+  si\signalSemaphoreCount = 1 : si\pSignalSemaphores = @signalHandle
+  rc = vkQueueSubmit(queue, 1, @si, pqFence) : pqPut(9, rc)
+  pqSubmitted = 1
+  If rc <> #VK_SUCCESS : ProcedureReturn pqUnsafe(25) : EndIf
+  pqPut(2, 3)
+  rc = vkWaitForFences(pqDev, 1, @pqFence, 1, 2000000000)
+  pqPut(27, rc)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqUnsafe(26) : EndIf
+  If avkFlightActive <> 0 Or avkFlightQuarantined <> 0 Or avkV3dGpuLease <> 0 : ProcedureReturn pqUnsafe(27) : EndIf
+  pqPut(33, V3dCsdJobs()) : pqPut(34, avkBackendJobs())
+  proofStatus = 0
+  If pqReport[33] <> pqReport[10] + 1 Or pqReport[34] <> pqReport[11] + 1 : proofStatus = 28 : EndIf
+  pqPut(2, 4)
+  If pqCheck() = 0 : proofStatus = 29 : EndIf
+
+  ; Completion is proven. Teardown is safe and must release all queue refs.
+  rc = vkDeviceWaitIdle(pqDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn pqUnsafe(30) : EndIf
+  If pqMapped <> 0 : vkUnmapMemory(pqDev, pqMemory) : pqMapped = 0 : EndIf
+  vkDestroyFence(pqDev, pqFence, 0) : vkDestroySemaphore(pqDev, pqSignal, 0)
+  vkFreeCommandBuffers(pqDev, pqPool, 1, @pqCmd) : vkDestroyCommandPool(pqDev, pqPool, 0)
+  vkFreeDescriptorSets(pqDev, pqDescPool, 1, @pqSet)
+  vkDestroyDescriptorPool(pqDev, pqDescPool, 0)
+  AnvilVkPipelineDestroy(pqDev, pqPipeline)
+  vkDestroyPipelineLayout(pqDev, pqLayout, 0)
+  vkDestroyDescriptorSetLayout(pqDev, pqDsl, 0)
+  vkDestroyShaderModule(pqDev, pqModule, 0)
+  vkDestroyBuffer(pqDev, pqBuffer, 0) : vkFreeMemory(pqDev, pqMemory, 0)
+  vkDestroyDevice(pqDev, 0) : vkDestroyInstance(pqInst, 0)
+  If NeonShutdown() <> #NEON_OK : proofStatus = 31 : EndIf
+  pqPut(2, 5)
+  ProcedureReturn pqFinish(proofStatus)
+EndProcedure
+
+DataSection
+PqTrackedSpv:
+; @TRACKED_SPV_WORDS@
+EndDataSection
