@@ -84,6 +84,7 @@ Global Dim pgReport.i[849]
 Global Dim pgClear.l[4]
 Global Dim pgPush.l[4]
 Global Dim pgSavedB.a[8192]
+Global Dim pgSavedD.a[8192]
 Global Dim pgBatchBytes.a[1024]
 Global Dim pgBatchOut.i[3]
 Global Dim pgSavedConstant.a[8192]
@@ -104,7 +105,7 @@ EndProcedure
 
 Procedure.i pgStop(status.i)
   pgPut(1, status)
-  pgPut(32, AnvilVkFaultText())
+  If status <> 99 : pgPut(32, AnvilVkFaultText()) : EndIf
   pgPut(31, AnvilVkFaultCount())
   ProcedureReturn @pgReport[0]
 EndProcedure
@@ -1593,7 +1594,15 @@ Procedure.i Main()
   ; The fragment uniform stream for a descriptor colour is built from
   ; the descriptor's own address, exactly as the backend builds it.
   AnvilVkV3dFragmentUniforms(4, AnvilVkV3dCodeBase(4), 0, AnvilVkDescriptorSetAddress(dset, 0), 0)
-  pgPut(127, AnvilVkV3dCodeBase(4))
+  ; D's live pipeline slot is later released to retain E for the ordered
+  ; draw/clear/draw case. Preserve its emitted bytes for the independent
+  ; checker before the slot can be reused.
+  i = 0
+  While i < 8192
+    pgSavedD[i] = PeekA(AnvilVkV3dCodeBase(4) + i)
+    i = i + 1
+  Wend
+  pgPut(127, @pgSavedD[0])
 
   ; Put the shared create-info back the way pipeline A left it, so the
   ; recording refusals below still describe pipeline A's own layout.
@@ -1951,8 +1960,10 @@ Procedure.i Main()
   ;  A separate one-texel image is essential: sampling the colour target
   ;  while it is also an attachment would be a false Vulkan proof.
   ; ------------------------------------------------------------------
-  vkDestroyPipeline(dev, pipeE, 0)
-  pipeE = 0
+  ; E is exercised again by the ordered draw/clear/draw case below.
+  ; D has no further draws, so release D's slot for the sampled pipeline.
+  vkDestroyPipeline(dev, pipeD, 0)
+  pipeD = 0
   imgci\extent\width = 1
   imgci\extent\height = 1
   imgci\usage = #VK_IMAGE_USAGE_SAMPLED_BIT
@@ -3360,6 +3371,10 @@ Procedure.i Main()
   vkCmdDraw(cmd, 3, 1, 0, 0)
   vkCmdEndRenderPass(cmd)
   i = vkEndCommandBuffer(cmd)
+  If i <> #VK_SUCCESS
+    pgPut(32, AnvilVkCommandBufferFailureText(cmd))
+    ProcedureReturn pgStop(99)
+  EndIf
   AnvilVkTestBackendHold(1) : vkResetFences(dev, 1, @fenceArray)
   rc = vkQueueSubmit(queue, 1, @si, fence)
   *multiList = AnvilVkLastDrawList()
@@ -3368,7 +3383,18 @@ Procedure.i Main()
   *multi2 = *multiList\draws + (2 * SizeOf(AnvilVkBackendDraw))
   clearOk = Bool(i = #VK_SUCCESS And rc = #VK_SUCCESS And *multiList\drawCount = 3 And *multi0\kind = #ANVIL_VK_RENDER_OP_DRAW And *multi0\sampleMask = 0 And *multi1\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT And *multi1\clearRectBgra = $00FF8000 And *multi2\kind = #ANVIL_VK_RENDER_OP_DRAW And *multi2\sampleMask <> 0 And avkPipeInFlight[0] = 0)
   AnvilVkTestBackendHold(0)
-  If vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000) <> #VK_SUCCESS : clearOk = 0 : EndIf
+  If rc <> #VK_SUCCESS
+    pgPut(696, rc)
+    ProcedureReturn pgStop(2)
+  EndIf
+  ; A released test-backend hold completes on the next poll. Keep this
+  ; deterministic wait short so a broken fence reports instead of consuming
+  ; the interpreter's whole instruction budget.
+  rc = vkWaitForFences(dev, 1, @fenceArray, 1, 1000000)
+  If rc <> #VK_SUCCESS
+    pgPut(696, rc)
+    ProcedureReturn pgStop(3)
+  EndIf
   pgPut(696, clearOk)
 
   ; A render pass with only a whole-attachment clear is a real GPU job.
