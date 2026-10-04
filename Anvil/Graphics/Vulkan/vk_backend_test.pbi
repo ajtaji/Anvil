@@ -35,6 +35,12 @@ Global avkTbFail.i = 0
 Global avkTbPollFail.i = 0
 Global avkTbTicks.i = 0
 Global avkTbCalls.i = 0
+; Opt-in desk injector for the queue's compute and GPU-lease transactions.
+; Mode 0 preserves this backend's ordinary no-compute, no-GPU behavior.
+Global avkTbComputeMode.i = 0
+Global avkTbComputeSubmitCalls.i = 0
+Global avkTbLeaseRequired.i = 0
+Global avkTbLeaseOwner.i = 0
 Global avkTbTiledRectCopies.i = 0
 Global avkTbTiledMicroCopies.i = 0
 Global avkTbTiledEdgeTailCopies.i = 0
@@ -209,24 +215,61 @@ Procedure.i avkBackendPrepare()
 EndProcedure
 
 Procedure.i avkBackendComputeCanLower(*ir)
+  ProcedureReturn Bool(avkTbComputeMode > 0 And *ir <> 0)
+EndProcedure
+
+Procedure.i avkBackendComputeScratchBytes()
+  If avkTbComputeMode > 0 : ProcedureReturn 4096 : EndIf
   ProcedureReturn 0
 EndProcedure
 
-; No V3D is owned by this backend; refuse GPU lease requests.
+Procedure.i avkBackendSubmitCompute(*job.AnvilVkBackendComputeJob, *result.AnvilVkBackendComputeResult)
+  If *result = 0 : ProcedureReturn -1 : EndIf
+  *result\mayHaveLaunched = 0 : *result\complete = 0
+  *result\native = -1 : *result\waited = 0
+  *result\doneBefore = 0 : *result\doneAfter = 0
+  If *job = 0 Or avkTbComputeMode < 1 Or avkTbComputeMode > 3 : ProcedureReturn -1 : EndIf
+  avkTbComputeSubmitCalls = avkTbComputeSubmitCalls + 1
+  If avkTbComputeMode = 1
+    *result\mayHaveLaunched = 1 : *result\complete = 1
+    *result\native = 0 : *result\waited = 1
+    *result\doneBefore = 1 : *result\doneAfter = 2
+    ProcedureReturn #ANVIL_VK_JOB_DONE
+  EndIf
+  If avkTbComputeMode = 2
+    *result\native = -23501
+    ProcedureReturn -1
+  EndIf
+  *result\mayHaveLaunched = 1 : *result\native = 25
+  *result\waited = 1 : *result\doneBefore = 1 : *result\doneAfter = 1
+  ProcedureReturn -1
+EndProcedure
+
+; No V3D is owned by default. Opt-in state is only for emitted queue gates.
 Procedure.i avkBackendGpuLeaseAcquire(owner.i)
-  ProcedureReturn 0
+  If avkTbLeaseRequired = 0 Or avkTbLeaseOwner <> 0 Or (owner <> #ANVIL_VK_GPU_LEASE_QUEUE And owner <> #ANVIL_VK_GPU_LEASE_EXTERNAL) : ProcedureReturn 0 : EndIf
+  avkTbLeaseOwner = owner
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseRelease(owner.i)
-  ProcedureReturn 0
+  If avkTbLeaseRequired = 0 Or owner < 1 Or avkTbLeaseOwner <> owner : ProcedureReturn 0 : EndIf
+  avkTbLeaseOwner = 0
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseQuarantine(owner.i)
-  ProcedureReturn 0
+  If avkTbLeaseRequired = 0 Or owner < 1 Or avkTbLeaseOwner <> owner : ProcedureReturn 0 : EndIf
+  avkTbLeaseOwner = -owner
+  ProcedureReturn 1
 EndProcedure
 
 Procedure.i avkBackendGpuLeaseState()
-  ProcedureReturn 0
+  ProcedureReturn avkTbLeaseOwner
+EndProcedure
+
+Procedure.i avkBackendGpuLeaseRequired()
+  ProcedureReturn Bool(avkTbLeaseRequired <> 0)
 EndProcedure
 
 Procedure.i avkBackendHeapBase()
