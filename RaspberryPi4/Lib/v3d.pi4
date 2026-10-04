@@ -5141,7 +5141,10 @@ EndProcedure
 #V3D_PKT_END_OF_TILE_MARKER    = 27   ; :390
 #V3D_PKT_STORE_TILE_BUFFER_GEN = 29   ; :392
 #V3D_PKT_INDEXED_PRIM_LIST     = 32   ; :500
+#V3D_PKT_INDEXED_INSTANCED     = 34   ; :493
 #V3D_PKT_VERTEX_ARRAY_PRIMS    = 36   ; :508
+#V3D_PKT_VERTEX_INSTANCED      = 38   ; :523
+#V3D_PKT_BASE_VERTEX_INSTANCE  = 43   ; :539
 #V3D_PKT_INDEX_BUFFER_SETUP    = 44   ; :520
 #V3D_PKT_SET_INSTANCEID        = 54   ; :550
 #V3D_PKT_PRIM_LIST_FORMAT      = 56   ; :558
@@ -6043,6 +6046,21 @@ Procedure V3dClVertexArrayPrims(mode.i, length.i, firstVertex.i)
   v3d_ClU32(firstVertex)
 EndProcedure
 
+; v3d_packet.xml:523-529, packet 38. The three uint32 fields begin on
+; byte boundaries after the one-byte mode. Mesa emits this packet for a
+; non-indexed draw with more than one instance (v3dx_draw.c:1317-1322).
+Procedure V3dClVertexArrayInstancedPrims(mode.i, instanceLength.i, instances.i, firstVertex.i)
+  If mode < 0 Or mode > 255 Or instanceLength <= 0 Or instanceLength > $FFFFFFFF Or instances <= 0 Or instances > $FFFFFFFF Or firstVertex < 0 Or firstVertex > $FFFFFFFF
+    v3d_clErr = #V3D_ERR_CL_ARGS
+    ProcedureReturn
+  EndIf
+  v3d_ClU8(#V3D_PKT_VERTEX_INSTANCED)
+  v3d_ClU8(mode)
+  v3d_ClU32(instanceLength)
+  v3d_ClU32(instances)
+  v3d_ClU32(firstVertex)
+EndProcedure
+
 ; v3d_packet.xml:500-506. The first payload byte holds the six-bit
 ; primitive mode and two-bit index type. Length occupies the low 31 bits of
 ; the next word; its high bit is primitive restart, deliberately clear here.
@@ -6056,6 +6074,33 @@ Procedure V3dClIndexedPrims(mode.i, length.i, indexType.i, indexOffset.i)
   v3d_ClU8((mode & $3F) | ((indexType & 3) << 6))
   v3d_ClU32(length)
   v3d_ClU32(indexOffset)
+EndProcedure
+
+; v3d_packet.xml:493-506, packet 34. Primitive restart remains disabled,
+; so instanceLength occupies only the low 31 bits of its word.
+Procedure V3dClIndexedInstancedPrims(mode.i, instanceLength.i, instances.i, indexType.i, indexOffset.i)
+  If mode < 0 Or mode > 63 Or instanceLength <= 0 Or instanceLength > $7FFFFFFF Or instances <= 0 Or instances > $FFFFFFFF Or indexType < 1 Or indexType > 2 Or indexOffset < 0 Or indexOffset > $FFFFFFFF
+    v3d_clErr = #V3D_ERR_CL_ARGS
+    ProcedureReturn
+  EndIf
+  v3d_ClU8(#V3D_PKT_INDEXED_INSTANCED)
+  v3d_ClU8((mode & $3F) | ((indexType & 3) << 6))
+  v3d_ClU32(instanceLength)
+  v3d_ClU32(instances)
+  v3d_ClU32(indexOffset)
+EndProcedure
+
+; v3d_packet.xml:539-543, packet 43. Mesa emits it immediately before a
+; draw with a nonzero firstInstance or indexed vertex bias; it applies to
+; that next draw only (v3dx_draw.c:1224-1235).
+Procedure V3dClBaseVertexBaseInstance(baseVertex.i, baseInstance.i)
+  If baseVertex < -2147483648 Or baseVertex > $FFFFFFFF Or baseInstance < 0 Or baseInstance > $FFFFFFFF
+    v3d_clErr = #V3D_ERR_CL_ARGS
+    ProcedureReturn
+  EndIf
+  v3d_ClU8(#V3D_PKT_BASE_VERTEX_INSTANCE)
+  v3d_ClU32(baseVertex & $FFFFFFFF)
+  v3d_ClU32(baseInstance)
 EndProcedure
 
 ; v3d_packet.xml:520-523. Address and byte size are the complete bounded
