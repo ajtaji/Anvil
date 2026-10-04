@@ -3,10 +3,10 @@
 ; ======================================================================
 ; SPDX-License-Identifier: MIT
 ;
-; This is the hardware half of the seam declared in vk_foundation.pbi. It
-; turns one closed, already validated colour clear into real V3D work and
-; it does nothing else. It is the ONLY file in the Vulkan tree that knows
-; what a render target, a control list or a tile is.
+; This is the Pi 4 hardware half of the Vulkan backend seam. It executes the
+; bounded clears, draws and transfers and owns a private, closed CSD job for
+; the opt-in particle producer. That job is not public Vulkan compute. This
+; file owns the V3D render targets, control lists and tile layout.
 ;
 ; THE EXECUTION PATH IS THE ONE THIS TREE ALREADY PROVES ON SILICON.
 ; NeonRebindSurface transactionally points the engine at the image and its
@@ -19,9 +19,8 @@
 ; the processor-side maintenance for the target. The console and
 ; NeonArcade drive the same path at 1920x1080 on this board.
 ;
-; THERE IS NO PROCESSOR-SIDE AND NO DMA FALLBACK. If the GPU does not do
-; it, this file reports a device loss and the image is left alone. A
-; fallback here would mean a green test could be a test of memcpy.
+; Clears and draws have no processor or DMA pixel fallback. Transfers use
+; the guarded DMA/TFU paths below; the private CSD job runs on V3D.
 ;
 ; WHAT THIS BACKEND CANNOT DO, and says so through
 ; avkBackendClearSupported rather than by guessing:
@@ -82,6 +81,42 @@ Global avkV3dWindowBase.i = 0
 Global avkV3dWindowBytes.i = 0
 Global avkV3dNative.i = 0
 Global avkV3dJobs.i = 0
+
+; Private Pi 4 CSD transaction. The producer supplies only already-mapped
+; closed ranges. Configure cannot launch hardware, so its refusals leave the
+; caller outside its quarantine. Submit consumes one successful configure.
+Structure AnvilVkV3dCsdPlan Align #PB_Structure_AlignC
+  codeBase.i
+  codeBytes.i
+  codeFlags.i
+  uniformBase.i
+  uniformBytes.i
+  inputBase.i
+  inputBytes.i
+  outputBase.i
+  outputBytes.i
+  outputWrittenBytes.i
+  groupsX.i
+  groupsY.i
+  groupsZ.i
+  workgroupSize.i
+  workgroupsPerSupergroup.i
+  timeoutUs.i
+EndStructure
+
+Structure AnvilVkV3dCsdResult Align #PB_Structure_AlignC
+  native.i
+  waited.i
+  doneBefore.i
+  doneAfter.i
+EndStructure
+
+Global avkV3dCsdConfigured.i = 0
+Global avkV3dCsdOutputBase.i = 0
+Global avkV3dCsdOutputWrittenBytes.i = 0
+Global avkV3dCsdResultPtr.i = 0
+Global avkV3dCsdTimeoutUs.i = 0
+#AVK_V3D_CSD_MAX_WORKGROUPS = 65535
 
 ; Declare the offscreen window this backend may suballocate as Vulkan
 ; device memory. It must already be inside the span NeonSurfaceMapSpan
@@ -803,6 +838,103 @@ Procedure.i avkBackendSubmitBufferFill(destination.i, bytes.i, data.i)
   CompilerEndIf
   avkV3dJobs = avkV3dJobs + 1
   ProcedureReturn #ANVIL_VK_JOB_DONE
+EndProcedure
+
+Procedure.i avkV3dCsdInside(addr.i, bytes.i)
+  If avkV3dWindowBase <= 0 Or avkV3dWindowBase > $FFFFFFFF Or avkV3dWindowBytes < 1 Or avkV3dWindowBytes > $100000000 - avkV3dWindowBase
+    ProcedureReturn 0
+  EndIf
+  If addr < avkV3dWindowBase Or addr > $FFFFFFFF Or bytes < 1 Or bytes > avkV3dWindowBytes
+    ProcedureReturn 0
+  EndIf
+  If (addr - avkV3dWindowBase) > (avkV3dWindowBytes - bytes) Or addr > $100000000 - bytes
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i avkV3dCsdOverlap(a.i, aBytes.i, b.i, bBytes.i)
+  ProcedureReturn Bool(a < b + bBytes And b < a + aBytes)
+EndProcedure
+
+; This closed job is deliberately private: there is no compute pipeline,
+; descriptor-backed storage buffer, recorded dispatch or compute queue bit.
+; Validate every GPU-accessed span before changing the V3D CSD job builder.
+Procedure.i AnvilVkV3dCsdConfigure(*plan.AnvilVkV3dCsdPlan, *result.AnvilVkV3dCsdResult)
+  Define rc.i, groups.i
+  avkV3dCsdConfigured = 0
+  avkV3dCsdOutputBase = 0 : avkV3dCsdOutputWrittenBytes = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+  If *plan = 0 Or *result = 0 : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
+  If v3d_ready = 0 : ProcedureReturn #V3D_ERR_NOINIT : EndIf
+  If v3d_mmuOn = 0 : ProcedureReturn #V3D_ERR_MMU_OFF : EndIf
+  If avkV3dCsdInside(*plan\codeBase, *plan\codeBytes) = 0 Or avkV3dCsdInside(*plan\uniformBase, *plan\uniformBytes) = 0 Or avkV3dCsdInside(*plan\inputBase, *plan\inputBytes) = 0 Or avkV3dCsdInside(*plan\outputBase, *plan\outputBytes) = 0
+    ProcedureReturn #V3D_ERR_CSD_ARGS
+  EndIf
+  If *plan\codeBytes < 8 Or (*plan\codeBase % 8) <> 0 Or (*plan\codeFlags & #V3D_CSD_CFG5_FLAG_MASK) <> *plan\codeFlags Or (*plan\uniformBase % 4) <> 0 Or (*plan\uniformBytes % 4) <> 0 Or (*plan\inputBase % 4) <> 0 Or (*plan\outputBase % 4) <> 0 Or *plan\outputWrittenBytes < 1 Or *plan\outputWrittenBytes > *plan\outputBytes Or *plan\timeoutUs < 1
+    ProcedureReturn #V3D_ERR_CSD_ARGS
+  EndIf
+  If avkV3dCsdOverlap(*plan\codeBase, *plan\codeBytes, *plan\uniformBase, *plan\uniformBytes) <> 0 Or avkV3dCsdOverlap(*plan\codeBase, *plan\codeBytes, *plan\inputBase, *plan\inputBytes) <> 0 Or avkV3dCsdOverlap(*plan\codeBase, *plan\codeBytes, *plan\outputBase, *plan\outputBytes) <> 0 Or avkV3dCsdOverlap(*plan\uniformBase, *plan\uniformBytes, *plan\inputBase, *plan\inputBytes) <> 0 Or avkV3dCsdOverlap(*plan\uniformBase, *plan\uniformBytes, *plan\outputBase, *plan\outputBytes) <> 0 Or avkV3dCsdOverlap(*plan\inputBase, *plan\inputBytes, *plan\outputBase, *plan\outputBytes) <> 0
+    ProcedureReturn #V3D_ERR_CSD_ARGS
+  EndIf
+  ; Bound multiplication before V3dCsdBegin computes its batch count.
+  If *plan\groupsX < 1 Or *plan\groupsX > #AVK_V3D_CSD_MAX_WORKGROUPS Or *plan\groupsY < 1 Or *plan\groupsY > #AVK_V3D_CSD_MAX_WORKGROUPS Or *plan\groupsZ < 1 Or *plan\groupsZ > #AVK_V3D_CSD_MAX_WORKGROUPS Or *plan\workgroupSize < 1 Or *plan\workgroupSize > 255 Or *plan\workgroupsPerSupergroup < 1 Or *plan\workgroupsPerSupergroup > 16
+    ProcedureReturn #V3D_ERR_CSD_ARGS
+  EndIf
+  If *plan\groupsX > #AVK_V3D_CSD_MAX_WORKGROUPS / *plan\groupsY : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
+  groups = *plan\groupsX * *plan\groupsY
+  If groups > #AVK_V3D_CSD_MAX_WORKGROUPS / *plan\groupsZ : ProcedureReturn #V3D_ERR_CSD_ARGS : EndIf
+  rc = V3dCsdBegin(*plan\groupsX, *plan\groupsY, *plan\groupsZ, *plan\workgroupSize, *plan\workgroupsPerSupergroup)
+  If rc <> #V3D_OK : ProcedureReturn rc : EndIf
+  rc = V3dCsdCode(*plan\codeBase, *plan\codeBytes, *plan\codeFlags)
+  If rc <> #V3D_OK : ProcedureReturn rc : EndIf
+  rc = V3dCsdUniforms(*plan\uniformBase, *plan\uniformBytes)
+  If rc <> #V3D_OK : ProcedureReturn rc : EndIf
+  V3dCsdOutput(*plan\outputBase, *plan\outputBytes)
+  V3dCacheRange(*plan\inputBase, *plan\inputBytes)
+  avkV3dCsdOutputBase = *plan\outputBase
+  avkV3dCsdOutputWrittenBytes = *plan\outputWrittenBytes
+  avkV3dCsdResultPtr = *result
+  avkV3dCsdTimeoutUs = *plan\timeoutUs
+  avkV3dCsdConfigured = 1
+  ProcedureReturn #V3D_OK
+EndProcedure
+
+; A caller that cannot exclude other GPU work must discard the prepared
+; transaction. No CSD register has been written at this point.
+Procedure AnvilVkV3dCsdCancel()
+  avkV3dCsdConfigured = 0
+  avkV3dCsdOutputBase = 0 : avkV3dCsdOutputWrittenBytes = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+EndProcedure
+
+; Call only while the producer has excluded Chrome work. A failed submit or
+; uncertain wait never releases that exclusion; the producer retains resources.
+Procedure.i AnvilVkV3dCsdSubmit(*result.AnvilVkV3dCsdResult)
+  Define rc.i, cleanRc.i, timeoutUs.i
+  If *result = 0 Or *result <> avkV3dCsdResultPtr Or avkV3dCsdConfigured = 0 Or avkV3dCsdTimeoutUs < 1
+    AnvilVkV3dCsdCancel()
+    ProcedureReturn -1
+  EndIf
+  *result\native = #V3D_OK : *result\waited = 0
+  *result\doneBefore = 0 : *result\doneAfter = 0
+  timeoutUs = avkV3dCsdTimeoutUs
+  avkV3dCsdConfigured = 0
+  avkV3dCsdResultPtr = 0 : avkV3dCsdTimeoutUs = 0
+  rc = V3dCsdSubmit()
+  *result\native = rc
+  If rc <> #V3D_OK : ProcedureReturn -1 : EndIf
+  rc = V3dCsdWait(timeoutUs)
+  *result\native = rc
+  *result\waited = 1
+  *result\doneBefore = V3dCsdDoneBefore()
+  *result\doneAfter = V3dCsdDoneAfter()
+  cleanRc = V3dCsdCleanResult()
+  If rc <> #V3D_OK Or cleanRc <> #V3D_OK Or *result\doneBefore = *result\doneAfter
+    ProcedureReturn -1
+  EndIf
+  V3dCacheRange(avkV3dCsdOutputBase, avkV3dCsdOutputWrittenBytes)
+  ProcedureReturn #V3D_OK
 EndProcedure
 
 Procedure.i avkBackendPoll()
