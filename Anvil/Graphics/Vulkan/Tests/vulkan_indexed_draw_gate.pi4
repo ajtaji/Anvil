@@ -14,7 +14,7 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_backend_test.pbi"
 #VID_W = 16
 #VID_H = 16
 #VID_STRIDE = 16
-#VID_REPORT_WORDS = 48
+#VID_REPORT_WORDS = 56
 
 Global Dim vidReport.i[#VID_REPORT_WORDS]
 Global Dim vidClear.l[4]
@@ -49,7 +49,7 @@ Procedure.i Main()
   Define inst.i, phys.i, dev.i, queue.i, pool.i, cmd.i
   Define img.i, imgMem.i, view.i, rp.i, fb.i
   Define vertex.i, vertexMem.i, index16.i, index16Mem.i, index32.i, index32Mem.i
-  Define pipe.i, fence.i, fenceArray.i, count.i, rc.i, c.i, b.i, m.i
+  Define pipe.i, fence.i, fenceArray.i, count.i, rc.i, c.i, b.i, m.i, n.i
   Define beforeSubmit.i, beforeComplete.i, beforeCalls.i, beforeDraws.i
   Define vertexHandle.i, vertexOffset.q, cmdHandle.i
   Define *list.AnvilVkBackendDrawList, *draw.AnvilVkBackendDraw
@@ -188,7 +188,7 @@ Procedure.i Main()
 
   ; Live resource but hostile index value: maxVertex=3 cannot fit a three-
   ; vertex binding. This is also an atomic preflight refusal.
-  bufci\size = 16 : If vkCreateBuffer(dev, @bufci, 0, @index32) <> #VK_SUCCESS : ProcedureReturn vidStop(27) : EndIf
+  bufci\size = 4096 : If vkCreateBuffer(dev, @bufci, 0, @index32) <> #VK_SUCCESS : ProcedureReturn vidStop(27) : EndIf
   vkGetBufferMemoryRequirements(dev, index32, @req) : mai\allocationSize = req\size
   If vkAllocateMemory(dev, @mai, 0, @index32Mem) <> #VK_SUCCESS Or vkBindBufferMemory(dev, index32, index32Mem, 0) <> #VK_SUCCESS : ProcedureReturn vidStop(28) : EndIf
   PokeL(AnvilVkBufferAddress(index32), 0) : PokeL(AnvilVkBufferAddress(index32) + 4, 3) : PokeL(AnvilVkBufferAddress(index32) + 8, 1)
@@ -200,5 +200,84 @@ Procedure.i Main()
   vidPut(28, vkQueueSubmit(queue, 1, @si, fence))
   vidPut(29, AnvilVkSubmitCount() - beforeSubmit) : vidPut(30, AnvilVkTestBackendCalls() - beforeCalls)
   vidPut(31, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And AnvilVkSubmissionOutstanding() = 0))
+
+  ; Six UINT32 indices exercise three paired loads with no tail. A value
+  ; written after recording must be scanned as unsigned and refused before
+  ; any submit-side state moves. Restoring it makes that same record valid.
+  PokeL(AnvilVkBufferAddress(index32), 2) : PokeL(AnvilVkBufferAddress(index32) + 4, 0)
+  PokeL(AnvilVkBufferAddress(index32) + 8, 1) : PokeL(AnvilVkBufferAddress(index32) + 12, 0)
+  PokeL(AnvilVkBufferAddress(index32) + 16, 1) : PokeL(AnvilVkBufferAddress(index32) + 20, 2)
+  PokeL(AnvilVkBufferAddress(index32) + 24, $FFFFFFFF)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 0, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(32, vkEndCommandBuffer(cmd))
+  PokeL(AnvilVkBufferAddress(index32) + 20, $80000000)
+  beforeSubmit = AnvilVkSubmitCount() : beforeCalls = AnvilVkTestBackendCalls()
+  vidPut(33, vkQueueSubmit(queue, 1, @si, fence))
+  vidPut(34, AnvilVkSubmitCount() - beforeSubmit) : vidPut(35, AnvilVkTestBackendCalls() - beforeCalls)
+  vidPut(36, Bool(avkFlightDrawCount = 0 And avkFlightLedgerCommitted = 0 And AnvilVkSubmissionOutstanding() = 0))
+  PokeL(AnvilVkBufferAddress(index32) + 20, 2)
+  AnvilVkTestBackendHold(1) : vidPut(37, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(38, Bool(*list\drawCount = 1 And *draw\vertexCount = 6 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(39, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; UINT16's even range ends exactly at the bound buffer's final byte.
+  PokeW(AnvilVkBufferAddress(index16) + 10, 2)
+  PokeW(AnvilVkBufferAddress(index16) + 12, 1)
+  PokeW(AnvilVkBufferAddress(index16) + 14, 0)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index16, 2, #VK_INDEX_TYPE_UINT16) : vkCmdDrawIndexed(cmd, 6, 1, 1, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(40, vkEndCommandBuffer(cmd)) : vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1) : vidPut(41, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(42, Bool(*list\drawCount = 1 And *draw\vertexCount = 6 And *draw\firstVertex = 1 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(43, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; A longer even span exercises the scan cost under an ordinary valid draw.
+  ; The word immediately after its selected range remains a hostile guard.
+  n = 0
+  While n < 1002
+    PokeL(AnvilVkBufferAddress(index32) + (n * 4), n % 3)
+    n = n + 1
+  Wend
+  PokeL(AnvilVkBufferAddress(index32) + 4008, $FFFFFFFF)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 0, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 1002, 1, 0, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(44, vkEndCommandBuffer(cmd)) : vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1) : vidPut(45, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(46, Bool(*list\drawCount = 1 And *draw\vertexCount = 1002 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(47, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; A valid UINT32 bind at byte 4 starts on a four-byte boundary only.
+  ; Its pair must use two word reads instead of an unaligned 64-bit read.
+  PokeL(AnvilVkBufferAddress(index32) + 4, 2)
+  PokeL(AnvilVkBufferAddress(index32) + 8, 0)
+  PokeL(AnvilVkBufferAddress(index32) + 12, 1)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index32, 4, #VK_INDEX_TYPE_UINT32) : vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(48, vkEndCommandBuffer(cmd)) : vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1) : vidPut(49, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(50, Bool(*list\drawCount = 1 And *draw\indexBase = AnvilVkBufferAddress(index32) + 4 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(51, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
+
+  ; UINT16 also permits a selected cursor at byte 2 mod 4.
+  PokeW(AnvilVkBufferAddress(index16) + 2, 2)
+  PokeW(AnvilVkBufferAddress(index16) + 4, 0)
+  PokeW(AnvilVkBufferAddress(index16) + 6, 1)
+  vkResetCommandBuffer(cmd, 0) : vkBeginCommandBuffer(cmd, @bi) : vkCmdBeginRenderPass(cmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(cmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, pipe) : vkCmdBindVertexBuffers(cmd, 0, 1, @vertexHandle, @vertexOffset)
+  vkCmdBindIndexBuffer(cmd, index16, 2, #VK_INDEX_TYPE_UINT16) : vkCmdDrawIndexed(cmd, 3, 1, 0, 0, 0)
+  vkCmdEndRenderPass(cmd) : vidPut(52, vkEndCommandBuffer(cmd)) : vkResetFences(dev, 1, @fenceArray)
+  AnvilVkTestBackendHold(1) : vidPut(53, vkQueueSubmit(queue, 1, @si, fence))
+  *list = AnvilVkLastDrawList() : *draw = *list\draws
+  vidPut(54, Bool(*list\drawCount = 1 And *draw\indexBase = AnvilVkBufferAddress(index16) + 2 And *draw\maxVertex = 2))
+  AnvilVkTestBackendHold(0) : vidPut(55, vkWaitForFences(dev, 1, @fenceArray, 1, 1000000000))
   ProcedureReturn @vidReport[0]
 EndProcedure

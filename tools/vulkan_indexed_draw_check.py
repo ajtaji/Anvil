@@ -43,6 +43,11 @@ PUBLIC_EXPECTED = {
     16: 0, 17: -20001, 18: 0, 19: -20001,
     20: 0, 21: -20004, 22: 0, 23: 0, 24: 0, 25: 0, 26: 1,
     27: 0, 28: -20004, 29: 0, 30: 0, 31: 1,
+    32: 0, 33: -20004, 34: 0, 35: 0, 36: 1,
+    37: 0, 38: 1, 39: 0, 40: 0, 41: 0, 42: 1, 43: 0,
+    44: 0, 45: 0, 46: 1, 47: 0,
+    48: 0, 49: 0, 50: 1, 51: 0,
+    52: 0, 53: 0, 54: 1, 55: 0,
 }
 
 PACKET_RESULTS = (0, 0, 19, 0, 0, 19, 0, 27, 0, 0, 27, 0)
@@ -72,9 +77,9 @@ CONTRACTS = {
 }
 
 PUBLIC_MUTANTS = (
-    ("max-index scan is disabled",
-     "If indexValue > maxVertex : maxVertex = indexValue : EndIf",
-     "If indexValue < maxVertex : maxVertex = indexValue : EndIf"),
+    ("upper UINT32 index loses its high bit",
+     "indexValue = (indexPair >> 32) & $FFFFFFFF",
+     "indexValue = (indexPair >> 32) & $7FFFFFFF"),
     ("index buffer lifetime is not retained",
      "    s = avkFlightIndexBuf[draw]\n    If s > 0\n      avkBufInFlight[s] = avkBufInFlight[s] + 1",
      "    s = avkFlightIndexBuf[draw]\n    If s < 0\n      avkBufInFlight[s] = avkBufInFlight[s] + 1"),
@@ -223,8 +228,8 @@ def main() -> int:
         print("vulkan_indexed_draw_check: FAIL")
         for failure in failures: print("  " + failure)
         return 1
-    print(f"vulkan_indexed_draw_check: PASS - 32 public-path cells, 12 encoder results and 46 exact packet/refusal bytes, {public_steps + packet_steps:,} emitted A64 instructions")
-    print("  UINT16/UINT32, firstIndex once, max-index vertex bound, atomic refusals and index lifetime passed")
+    print(f"vulkan_indexed_draw_check: PASS - 56 public-path cells, 12 encoder results and 46 exact packet/refusal bytes, {public_steps + packet_steps:,} emitted A64 instructions")
+    print("  UINT16/UINT32 odd/even spans, unsigned high-bit refusal, post-record mutation, firstIndex once, atomic refusals and index lifetime passed")
     if not args.mutate:
         return 0
     misses = 0
