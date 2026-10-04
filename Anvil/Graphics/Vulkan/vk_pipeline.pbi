@@ -3467,6 +3467,9 @@ Procedure.i avkDrawListPreflight(c.i)
   Define available.i
   Define indexBytes.i
   Define indexAddress.i
+  Define indexCursor.i
+  Define indexRemaining.i
+  Define indexPair.i
   Define indexValue.i
   Define maxVertex.i
   Define maxInput.i
@@ -3657,16 +3660,64 @@ Procedure.i avkDrawListPreflight(c.i)
       indexMem = avkBufMemSlot[b]
       indexAddress = avkHeapBase + avkMemOffset[indexMem] + avkBufMemOffset[b] + avkRecordedDraw[slot]\indexOffset
       maxVertex = 0
-      k = 0
-      While k < avkRecordedDraw[slot]\vertexCount
-        If indexBytes = 2
-          indexValue = PeekU(indexAddress + ((avkRecordedDraw[slot]\firstVertex + k) * 2)) & $FFFF
+      indexCursor = indexAddress + (avkRecordedDraw[slot]\firstVertex * indexBytes)
+      indexRemaining = avkRecordedDraw[slot]\vertexCount
+      ; The selected span was checked above. Read two indices per load and
+      ; keep the type branch outside the loop; the odd tail reads one element.
+      If indexBytes = 2
+        If (indexCursor & 3) = 0
+          While indexRemaining >= 2
+            indexPair = PeekL(indexCursor) & $FFFFFFFF
+            indexValue = indexPair & $FFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexValue = (indexPair >> 16) & $FFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexCursor = indexCursor + 4
+            indexRemaining = indexRemaining - 2
+          Wend
         Else
-          indexValue = PeekL(indexAddress + ((avkRecordedDraw[slot]\firstVertex + k) * 4)) & $FFFFFFFF
+          ; A two-byte-aligned bind may start at byte 2 mod 4.
+          While indexRemaining >= 2
+            indexValue = PeekU(indexCursor) & $FFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexValue = PeekU(indexCursor + 2) & $FFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexCursor = indexCursor + 4
+            indexRemaining = indexRemaining - 2
+          Wend
         EndIf
-        If indexValue > maxVertex : maxVertex = indexValue : EndIf
-        k = k + 1
-      Wend
+        If indexRemaining <> 0
+          indexValue = PeekU(indexCursor) & $FFFF
+          If indexValue > maxVertex : maxVertex = indexValue : EndIf
+        EndIf
+      Else
+        ; UINT32 binds require only four-byte alignment. Avoid an unaligned
+        ; 64-bit load when the selected first index starts at byte 4 mod 8.
+        If (indexCursor & 7) = 0
+          While indexRemaining >= 2
+            indexPair = PeekI(indexCursor)
+            indexValue = indexPair & $FFFFFFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexValue = (indexPair >> 32) & $FFFFFFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexCursor = indexCursor + 8
+            indexRemaining = indexRemaining - 2
+          Wend
+        Else
+          While indexRemaining >= 2
+            indexValue = PeekL(indexCursor) & $FFFFFFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexValue = PeekL(indexCursor + 4) & $FFFFFFFF
+            If indexValue > maxVertex : maxVertex = indexValue : EndIf
+            indexCursor = indexCursor + 8
+            indexRemaining = indexRemaining - 2
+          Wend
+        EndIf
+        If indexRemaining <> 0
+          indexValue = PeekL(indexCursor) & $FFFFFFFF
+          If indexValue > maxVertex : maxVertex = indexValue : EndIf
+        EndIf
+      EndIf
       avkFlightIndexBuf[draw] = b
       avkFlightIndexMem[draw] = indexMem
       avkFlightDraw[draw]\indexBase = indexAddress
