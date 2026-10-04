@@ -1,0 +1,464 @@
+; Returning Pi 4 RAM proof: one vkCmdDraw(3, 2, 0, 0), two distinct
+; per-instance triangles. Only the operator may run it, after `screen dma`
+; and with a 15-second deadman armed. x0 returns a 256-byte report.
+; A possibly live GPU job never returns to the monitor.
+
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 0
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#VIP_MAGIC = $49505456
+#VIP_TAIL = $56545049
+#VIP_SURFACE = $06000000
+#VIP_SURFACE_BYTES = 4096000
+#VIP_WINDOW = $063E8000
+#VIP_WINDOW_BYTES = $00400000
+#VIP_ARENA = $0A000000
+#VIP_ARENA_BYTES = $01000000
+#VIP_W = 128
+#VIP_H = 128
+#VIP_CLEAR = $FF000000
+#VIP_RED = $FFFF0000
+#VIP_GREEN = $FF00FF00
+#VIP_GUARD = $A55A3CC3
+#VIP_VERTEX_BYTES = 48
+#VIP_INSTANCE_BYTES = 80
+#VIP_PRE_SUBMIT_US = 7000000
+#VIP_POST_FENCE_US = 11000000
+
+#VIP_OK = 0
+#VIP_ERR_SETUP = 1
+#VIP_ERR_SHADER = 2
+#VIP_ERR_PIPELINE = 3
+#VIP_ERR_RECORD = 4
+#VIP_ERR_SUBMIT = 5
+#VIP_ERR_WAIT = 6
+#VIP_ERR_PIXEL = 7
+#VIP_ERR_GUARD = 8
+#VIP_ERR_JOBS = 9
+#VIP_ERR_PACKET = 10
+#VIP_ERR_TIME = 11
+#VIP_ERR_FAULT = 12
+
+; Report word: 0/63 magic, 1 status, 2 phase, 3 VkResult/detail, 4 native,
+; 5 target address, 6 vertex address, 7 instance address, 8/9 allocation
+; sizes, 10 image pitch, 11 shader record, 12/13 shader bytes,
+; 16..23 eight exact pixels, 24..26 pixel/vertex/instance mismatch counts,
+; 27 surface guard mismatch count, 28/29 bin jobs, 30/31 render jobs,
+; 32/33 MMU faults, 34/35 bin OOM, 36 packet count, 37 first packet offset,
+; 38 elapsed us, 39 backend draw delta, 40 command-buffer failure text,
+; 41 fault text, 42 Vulkan device idle result, 43 unsafe-in-flight flag.
+Global Dim vipReport.l[64]
+Global Dim vipClear.l[4]
+Global Dim vipBuffers.i[2]
+Global Dim vipOffsets.q[2]
+Global vipInst.i, vipDev.i, vipPool.i, vipCmd.i, vipImage.i, vipImageMem.i
+Global vipView.i, vipPass.i, vipFb.i, vipVertex.i, vipVertexMem.i
+Global vipInstance.i, vipInstanceMem.i, vipVs.i, vipFs.i, vipLayout.i
+Global vipPipe.i, vipFence.i, vipNeon.i, vipSubmitted.i, vipStart.i
+
+Procedure vipPut(slot.i, value.i)
+  If slot >= 0 And slot < 64 : vipReport[slot] = value & $FFFFFFFF : EndIf
+EndProcedure
+
+Procedure.i vipWord(slot.i)
+  ProcedureReturn vipReport[slot] & $FFFFFFFF
+EndProcedure
+
+Procedure vipFill(base.i, bytes.i, word.i)
+  Define i.i
+  For i = 0 To bytes - 4 Step 4 : PokeL(base + i, word) : Next
+EndProcedure
+
+Procedure.i vipPixel(base.i, pitch.i, x.i, y.i)
+  ProcedureReturn PeekL(base + y * pitch + x * 4) & $FFFFFFFF
+EndProcedure
+
+Procedure.i vipLe32(addr.i)
+  ProcedureReturn (PeekA(addr) & $FF) | ((PeekA(addr + 1) & $FF) << 8) | ((PeekA(addr + 2) & $FF) << 16) | ((PeekA(addr + 3) & $FF) << 24)
+EndProcedure
+
+; Match the complete 14-byte V3D packet, including mode and all three
+; uint32 fields. An opcode-like byte inside another packet is not evidence.
+Procedure.i vipInstancedPackets(base.i, bytes.i)
+  Define i.i, count.i, first.i = -1
+  If base <= 0 Or bytes < 14 : ProcedureReturn -1 : EndIf
+  For i = 0 To bytes - 14
+    If (PeekA(base + i) & $FF) = #V3D_PKT_VERTEX_INSTANCED And (PeekA(base + i + 1) & $FF) = 4
+      If vipLe32(base + i + 2) = 3 And vipLe32(base + i + 6) = 2 And vipLe32(base + i + 10) = 0
+        count = count + 1 : If first = -1 : first = i : EndIf
+      EndIf
+    EndIf
+  Next
+  vipPut(37, first)
+  ProcedureReturn count
+EndProcedure
+
+; The deadman must reset the board if submission/wait/idle is ambiguous.
+Procedure.i vipUnsafe(status.i, detail.i)
+  vipPut(1, status) : vipPut(3, detail) : vipPut(43, 1)
+  While 1 : delay(100) : Wend
+EndProcedure
+
+Procedure.i vipFinish(status.i, detail.i)
+  Define idle.i = #VK_SUCCESS
+  vipPut(1, status) : vipPut(3, detail)
+  If vipDev <> 0
+    idle = vkDeviceWaitIdle(vipDev)
+    vipPut(42, idle)
+    If idle <> #VK_SUCCESS : ProcedureReturn vipUnsafe(#VIP_ERR_WAIT, idle) : EndIf
+  EndIf
+  If vipFence <> 0 : vkDestroyFence(vipDev, vipFence, 0) : EndIf
+  If vipPipe <> 0 : vkDestroyPipeline(vipDev, vipPipe, 0) : EndIf
+  If vipLayout <> 0 : vkDestroyPipelineLayout(vipDev, vipLayout, 0) : EndIf
+  If vipVs <> 0 : vkDestroyShaderModule(vipDev, vipVs, 0) : EndIf
+  If vipFs <> 0 : vkDestroyShaderModule(vipDev, vipFs, 0) : EndIf
+  If vipFb <> 0 : vkDestroyFramebuffer(vipDev, vipFb, 0) : EndIf
+  If vipPass <> 0 : vkDestroyRenderPass(vipDev, vipPass, 0) : EndIf
+  If vipView <> 0 : vkDestroyImageView(vipDev, vipView, 0) : EndIf
+  If vipVertex <> 0 : vkDestroyBuffer(vipDev, vipVertex, 0) : EndIf
+  If vipInstance <> 0 : vkDestroyBuffer(vipDev, vipInstance, 0) : EndIf
+  If vipImage <> 0 : vkDestroyImage(vipDev, vipImage, 0) : EndIf
+  If vipVertexMem <> 0 : vkFreeMemory(vipDev, vipVertexMem, 0) : EndIf
+  If vipInstanceMem <> 0 : vkFreeMemory(vipDev, vipInstanceMem, 0) : EndIf
+  If vipImageMem <> 0 : vkFreeMemory(vipDev, vipImageMem, 0) : EndIf
+  If vipPool <> 0 : vkDestroyCommandPool(vipDev, vipPool, 0) : EndIf
+  If vipDev <> 0 : vkDestroyDevice(vipDev, 0) : EndIf
+  If vipInst <> 0 : vkDestroyInstance(vipInst, 0) : EndIf
+  If vipNeon <> 0 : NeonShutdown() : EndIf
+  vipPut(41, AnvilVkFaultText())
+  ProcedureReturn @vipReport[0]
+EndProcedure
+
+Procedure.i Main()
+  Define rc.i, phys.i, count.i = 1, queue.i, mapped.i, req.VkMemoryRequirements
+  Define addr.i, instAddr.i, imgAddr.i, pitch.i, bin0.i, render0.i
+  Define mmu0.i, oom0.i, draw0.i, i.i, bad.i, bcl.i, bclBytes.i
+  Define ici.VkInstanceCreateInfo, dci.VkDeviceCreateInfo, qci.VkDeviceQueueCreateInfo
+  Define prio.l, pci.VkCommandPoolCreateInfo, cbai.VkCommandBufferAllocateInfo
+  Define imgci.VkImageCreateInfo, mai.VkMemoryAllocateInfo, ivci.VkImageViewCreateInfo
+  Define att.VkAttachmentDescription, aref.VkAttachmentReference, sub.VkSubpassDescription
+  Define rpci.VkRenderPassCreateInfo, fbci.VkFramebufferCreateInfo
+  Define bufci.VkBufferCreateInfo, smci.VkShaderModuleCreateInfo
+  Define plci.VkPipelineLayoutCreateInfo
+  Define Dim stages.VkPipelineShaderStageCreateInfo[2]
+  Define Dim binds.VkVertexInputBindingDescription[2]
+  Define Dim attrs.VkVertexInputAttributeDescription[4]
+  Define vi.VkPipelineVertexInputStateCreateInfo, ia.VkPipelineInputAssemblyStateCreateInfo
+  Define vpstate.VkPipelineViewportStateCreateInfo, vp.VkViewport, sc.VkRect2D
+  Define rs.VkPipelineRasterizationStateCreateInfo, ms.VkPipelineMultisampleStateCreateInfo
+  Define cba.VkPipelineColorBlendAttachmentState, cb.VkPipelineColorBlendStateCreateInfo
+  Define gp.VkGraphicsPipelineCreateInfo, rpbi.VkRenderPassBeginInfo
+  Define bi.VkCommandBufferBeginInfo, fci.VkFenceCreateInfo, si.VkSubmitInfo
+  Define cmdHandle.i, fenceHandle.i, vsBytes.i, fsBytes.i
+
+  vipPut(0, #VIP_MAGIC) : vipPut(63, #VIP_TAIL) : vipPut(1, #VIP_ERR_SETUP)
+  TimerInit() : vipStart = Micros()
+  vipFill(#VIP_SURFACE, #VIP_SURFACE_BYTES, #VIP_GUARD)
+  vipPut(2, 1)
+  If NeonArena(#VIP_ARENA, #VIP_ARENA_BYTES) <> #NEON_OK : ProcedureReturn vipFinish(#VIP_ERR_SETUP, Neon_Error()) : EndIf
+  If NeonSurface(#VIP_SURFACE, 800, 1280, 3200) <> #NEON_OK : ProcedureReturn vipFinish(#VIP_ERR_SETUP, Neon_Error()) : EndIf
+  NeonSurfaceMapSpan(#VIP_SURFACE_BYTES + #VIP_WINDOW_BYTES)
+  If NeonInit() <> #NEON_OK : ProcedureReturn vipFinish(#VIP_ERR_SETUP, Neon_Error()) : EndIf
+  vipNeon = 1
+  rc = AnvilVkV3dWindow(#VIP_WINDOW, #VIP_WINDOW_BYTES)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
+  rc = vkCreateInstance(@ici, 0, @vipInst)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  rc = vkEnumeratePhysicalDevices(vipInst, @count, @phys)
+  If rc <> #VK_SUCCESS Or count <> 1 : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  qci\sType = #VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO : qci\queueCount = 1
+  qci\pQueuePriorities = @prio
+  dci\sType = #VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO : dci\queueCreateInfoCount = 1
+  dci\pQueueCreateInfos = @qci
+  rc = vkCreateDevice(phys, @dci, 0, @vipDev)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vkGetDeviceQueue(vipDev, 0, 0, @queue)
+  pci\sType = #VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+  rc = vkCreateCommandPool(vipDev, @pci, 0, @vipPool)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  cbai\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+  cbai\commandPool = vipPool : cbai\level = #VK_COMMAND_BUFFER_LEVEL_PRIMARY
+  cbai\commandBufferCount = 1
+  rc = vkAllocateCommandBuffers(vipDev, @cbai, @vipCmd)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+
+  vipPut(2, 2)
+  imgci\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imgci\imageType = #VK_IMAGE_TYPE_2D : imgci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imgci\extent\width = #VIP_W : imgci\extent\height = #VIP_H : imgci\extent\depth = 1
+  imgci\mipLevels = 1 : imgci\arrayLayers = 1 : imgci\samples = #VK_SAMPLE_COUNT_1_BIT
+  imgci\tiling = #VK_IMAGE_TILING_LINEAR
+  imgci\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imgci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imgci\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(vipDev, @imgci, 0, @vipImage)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vkGetImageMemoryRequirements(vipDev, vipImage, @req)
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO : mai\allocationSize = req\size
+  rc = vkAllocateMemory(vipDev, @mai, 0, @vipImageMem)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  rc = vkBindImageMemory(vipDev, vipImage, vipImageMem, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  imgAddr = AnvilVkImageAddress(vipImage) : pitch = AnvilVkImageRowPitch(vipImage)
+  vipPut(5, imgAddr) : vipPut(10, pitch)
+  If imgAddr < #VIP_WINDOW Or pitch <> #VIP_W * 4 Or req\size <> #VIP_W * #VIP_H * 4
+    ProcedureReturn vipFinish(#VIP_ERR_SETUP, req\size)
+  EndIf
+  rc = vkMapMemory(vipDev, vipImageMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> imgAddr : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vipFill(mapped, req\size, $A5A5A5A5) : vkUnmapMemory(vipDev, vipImageMem)
+  ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  ivci\image = vipImage : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(vipDev, @ivci, 0, @vipView)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  att\format = #VK_FORMAT_B8G8R8A8_UNORM : att\samples = #VK_SAMPLE_COUNT_1_BIT
+  att\loadOp = #VK_ATTACHMENT_LOAD_OP_CLEAR : att\storeOp = #VK_ATTACHMENT_STORE_OP_STORE
+  att\stencilLoadOp = #VK_ATTACHMENT_LOAD_OP_DONT_CARE
+  att\stencilStoreOp = #VK_ATTACHMENT_STORE_OP_DONT_CARE
+  att\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  att\finalLayout = #VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+  aref\attachment = 0 : aref\layout = #VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  sub\pipelineBindPoint = #VK_PIPELINE_BIND_POINT_GRAPHICS
+  sub\colorAttachmentCount = 1 : sub\pColorAttachments = @aref
+  rpci\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO
+  rpci\attachmentCount = 1 : rpci\pAttachments = @att
+  rpci\subpassCount = 1 : rpci\pSubpasses = @sub
+  rc = vkCreateRenderPass(vipDev, @rpci, 0, @vipPass)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  fbci\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  fbci\renderPass = vipPass : fbci\attachmentCount = 1 : fbci\pAttachments = @vipView
+  fbci\width = #VIP_W : fbci\height = #VIP_H : fbci\layers = 1
+  rc = vkCreateFramebuffer(vipDev, @fbci, 0, @vipFb)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+
+  ; Binding 0: three local vec4 positions, x/y/z/scale. Binding 1:
+  ; two 40-byte instance rows: color vec4, row-X vec3, row-Y vec3.
+  vipPut(2, 3)
+  bufci\sType = #VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+  bufci\usage = #VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+  bufci\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  bufci\size = #VIP_VERTEX_BYTES
+  rc = vkCreateBuffer(vipDev, @bufci, 0, @vipVertex)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vkGetBufferMemoryRequirements(vipDev, vipVertex, @req)
+  vipPut(8, req\size) : mai\allocationSize = req\size
+  rc = vkAllocateMemory(vipDev, @mai, 0, @vipVertexMem)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  rc = vkBindBufferMemory(vipDev, vipVertex, vipVertexMem, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  addr = AnvilVkBufferAddress(vipVertex) : vipPut(6, addr)
+  rc = vkMapMemory(vipDev, vipVertexMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> addr : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vipFill(mapped, req\size, #VIP_GUARD)
+  ; A local triangle with its centre well inside, so all probes avoid edges.
+  PokeL(mapped + 0, $BF000000) : PokeL(mapped + 4, $BF000000)
+  PokeL(mapped + 8, $3F800000) : PokeL(mapped + 12, $3F800000)
+  PokeL(mapped + 16, $3F000000) : PokeL(mapped + 20, $BF000000)
+  PokeL(mapped + 24, $3F800000) : PokeL(mapped + 28, $3F800000)
+  PokeL(mapped + 32, 0) : PokeL(mapped + 36, $3F000000)
+  PokeL(mapped + 40, $3F800000) : PokeL(mapped + 44, $3F800000)
+  vkUnmapMemory(vipDev, vipVertexMem)
+  bufci\size = #VIP_INSTANCE_BYTES
+  rc = vkCreateBuffer(vipDev, @bufci, 0, @vipInstance)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vkGetBufferMemoryRequirements(vipDev, vipInstance, @req)
+  vipPut(9, req\size) : mai\allocationSize = req\size
+  rc = vkAllocateMemory(vipDev, @mai, 0, @vipInstanceMem)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  rc = vkBindBufferMemory(vipDev, vipInstance, vipInstanceMem, 0)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  instAddr = AnvilVkBufferAddress(vipInstance) : vipPut(7, instAddr)
+  rc = vkMapMemory(vipDev, vipInstanceMem, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> instAddr : ProcedureReturn vipFinish(#VIP_ERR_SETUP, rc) : EndIf
+  vipFill(mapped, req\size, #VIP_GUARD)
+  ; Red instance at clip X=-0.5; green at X=+0.5. Row scale is 0.45.
+  For i = 0 To 1
+    addr = mapped + i * 40
+    If i = 0
+      PokeL(addr + 0, $3F800000) : PokeL(addr + 4, 0)
+      PokeL(addr + 24, $BF000000)
+    Else
+      PokeL(addr + 0, 0) : PokeL(addr + 4, $3F800000)
+      PokeL(addr + 24, $3F000000)
+    EndIf
+    PokeL(addr + 8, 0) : PokeL(addr + 12, $3F800000)
+    PokeL(addr + 16, $3EE66666) : PokeL(addr + 20, 0)
+    PokeL(addr + 28, 0) : PokeL(addr + 32, $3EE66666)
+    PokeL(addr + 36, 0)
+  Next
+  vkUnmapMemory(vipDev, vipInstanceMem)
+
+  vipPut(2, 4)
+  vsBytes = vtpBuildVsBScaled() : fsBytes = vtpBuildFsB()
+  vipPut(12, vsBytes) : vipPut(13, fsBytes)
+  smci\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  smci\pCode = @vtpVsBScaled[0] : smci\codeSize = vsBytes
+  rc = vkCreateShaderModule(vipDev, @smci, 0, @vipVs)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SHADER, rc) : EndIf
+  smci\pCode = @vtpFsB[0] : smci\codeSize = fsBytes
+  rc = vkCreateShaderModule(vipDev, @smci, 0, @vipFs)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_SHADER, rc) : EndIf
+  plci\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  rc = vkCreatePipelineLayout(vipDev, @plci, 0, @vipLayout)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_PIPELINE, rc) : EndIf
+  stages[0]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[0]\stage = #VK_SHADER_STAGE_VERTEX_BIT : stages[0]\module = vipVs
+  stages[1]\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  stages[1]\stage = #VK_SHADER_STAGE_FRAGMENT_BIT : stages[1]\module = vipFs
+  binds[0]\binding = 0 : binds[0]\stride = 16
+  binds[0]\inputRate = #VK_VERTEX_INPUT_RATE_VERTEX
+  binds[1]\binding = 1 : binds[1]\stride = 40
+  binds[1]\inputRate = #VK_VERTEX_INPUT_RATE_INSTANCE
+  attrs[0]\location = 0 : attrs[0]\binding = 0
+  attrs[0]\format = #VK_FORMAT_R32G32B32A32_SFLOAT : attrs[0]\offset = 0
+  attrs[1]\location = 1 : attrs[1]\binding = 1
+  attrs[1]\format = #VK_FORMAT_R32G32B32A32_SFLOAT : attrs[1]\offset = 0
+  attrs[2]\location = 2 : attrs[2]\binding = 1
+  attrs[2]\format = #VK_FORMAT_R32G32B32_SFLOAT : attrs[2]\offset = 16
+  attrs[3]\location = 3 : attrs[3]\binding = 1
+  attrs[3]\format = #VK_FORMAT_R32G32B32_SFLOAT : attrs[3]\offset = 28
+  vi\sType = #VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+  vi\vertexBindingDescriptionCount = 2 : vi\pVertexBindingDescriptions = @binds[0]
+  vi\vertexAttributeDescriptionCount = 4 : vi\pVertexAttributeDescriptions = @attrs[0]
+  ia\sType = #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+  ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+  PokeL(@vp\x, 0) : PokeL(@vp\y, 0)
+  PokeL(@vp\width, $43000000) : PokeL(@vp\height, $43000000)
+  PokeL(@vp\minDepth, 0) : PokeL(@vp\maxDepth, $3F800000)
+  sc\extent\width = #VIP_W : sc\extent\height = #VIP_H
+  vpstate\sType = #VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+  vpstate\viewportCount = 1 : vpstate\pViewports = @vp
+  vpstate\scissorCount = 1 : vpstate\pScissors = @sc
+  rs\sType = #VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+  rs\polygonMode = #VK_POLYGON_MODE_FILL : rs\cullMode = #VK_CULL_MODE_NONE
+  rs\frontFace = #VK_FRONT_FACE_COUNTER_CLOCKWISE
+  PokeL(@rs\lineWidth, $3F800000)
+  ms\sType = #VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+  ms\rasterizationSamples = #VK_SAMPLE_COUNT_1_BIT
+  cba\blendEnable = #VK_FALSE
+  cba\colorWriteMask = #VK_COLOR_COMPONENT_R_BIT | #VK_COLOR_COMPONENT_G_BIT | #VK_COLOR_COMPONENT_B_BIT | #VK_COLOR_COMPONENT_A_BIT
+  cb\sType = #VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+  cb\attachmentCount = 1 : cb\pAttachments = @cba
+  gp\sType = #VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+  gp\stageCount = 2 : gp\pStages = @stages[0]
+  gp\pVertexInputState = @vi : gp\pInputAssemblyState = @ia
+  gp\pViewportState = @vpstate : gp\pRasterizationState = @rs
+  gp\pMultisampleState = @ms : gp\pColorBlendState = @cb
+  gp\layout = vipLayout : gp\renderPass = vipPass : gp\basePipelineIndex = -1
+  rc = vkCreateGraphicsPipelines(vipDev, 0, 1, @gp, 0, @vipPipe)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_PIPELINE, rc) : EndIf
+
+  vipPut(2, 5)
+  vipClear[3] = $3F800000
+  rpbi\sType = #VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO
+  rpbi\renderPass = vipPass : rpbi\framebuffer = vipFb
+  rpbi\renderArea\extent\width = #VIP_W : rpbi\renderArea\extent\height = #VIP_H
+  rpbi\clearValueCount = 1 : rpbi\pClearValues = @vipClear[0]
+  bi\sType = #VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+  bi\flags = #VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  rc = vkBeginCommandBuffer(vipCmd, @bi)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_RECORD, rc) : EndIf
+  vipBuffers[0] = vipVertex : vipBuffers[1] = vipInstance
+  vipOffsets[0] = 0 : vipOffsets[1] = 0
+  vkCmdBeginRenderPass(vipCmd, @rpbi, #VK_SUBPASS_CONTENTS_INLINE)
+  vkCmdBindPipeline(vipCmd, #VK_PIPELINE_BIND_POINT_GRAPHICS, vipPipe)
+  vkCmdBindVertexBuffers(vipCmd, 0, 2, @vipBuffers[0], @vipOffsets[0])
+  vkCmdDraw(vipCmd, 3, 2, 0, 0)
+  vkCmdEndRenderPass(vipCmd)
+  rc = vkEndCommandBuffer(vipCmd)
+  vipPut(40, AnvilVkCommandBufferFailureText(vipCmd))
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_RECORD, rc) : EndIf
+  fci\sType = #VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  rc = vkCreateFence(vipDev, @fci, 0, @vipFence)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipFinish(#VIP_ERR_RECORD, rc) : EndIf
+  If Micros() - vipStart > #VIP_PRE_SUBMIT_US
+    ProcedureReturn vipFinish(#VIP_ERR_TIME, Micros() - vipStart)
+  EndIf
+
+  vipPut(2, 6)
+  bin0 = V3dBinJobs() : render0 = V3dRenderJobs()
+  mmu0 = V3dMmuFaultsNow() : oom0 = V3dBinOomCount()
+  draw0 = avkBackendDraws()
+  vipPut(28, bin0) : vipPut(30, render0) : vipPut(32, mmu0) : vipPut(34, oom0)
+  cmdHandle = vipCmd
+  si\sType = #VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si\commandBufferCount = 1 : si\pCommandBuffers = @cmdHandle
+  rc = vkQueueSubmit(queue, 1, @si, vipFence)
+  vipPut(4, AnvilVkBackendNativeError())
+  If rc <> #VK_SUCCESS : ProcedureReturn vipUnsafe(#VIP_ERR_SUBMIT, rc) : EndIf
+  vipSubmitted = 1
+  fenceHandle = vipFence
+  rc = vkWaitForFences(vipDev, 1, @fenceHandle, 1, 2000000000)
+  If rc <> #VK_SUCCESS : ProcedureReturn vipUnsafe(#VIP_ERR_WAIT, rc) : EndIf
+  vipPut(2, 7)
+  vipPut(29, V3dBinJobs()) : vipPut(31, V3dRenderJobs())
+  vipPut(33, V3dMmuFaultsNow()) : vipPut(35, V3dBinOomCount())
+  vipPut(39, avkBackendDraws() - draw0)
+  vipPut(11, AnvilVkV3dLastShaderRecord())
+  bcl = V3dBclStartAddr() : bclBytes = V3dBclBytes()
+  vipPut(36, vipInstancedPackets(bcl, bclBytes))
+  If Micros() - vipStart > #VIP_POST_FENCE_US
+    ProcedureReturn vipFinish(#VIP_ERR_TIME, Micros() - vipStart)
+  EndIf
+  vipPut(16, vipPixel(imgAddr, pitch, 32, 64))
+  vipPut(17, vipPixel(imgAddr, pitch, 32, 60))
+  vipPut(18, vipPixel(imgAddr, pitch, 96, 64))
+  vipPut(19, vipPixel(imgAddr, pitch, 96, 60))
+  vipPut(20, vipPixel(imgAddr, pitch, 64, 64))
+  vipPut(21, vipPixel(imgAddr, pitch, 4, 4))
+  vipPut(22, vipPixel(imgAddr, pitch, 124, 124))
+  vipPut(23, vipPixel(imgAddr, pitch, 64, 4))
+  bad = 0
+  If vipWord(16) <> #VIP_RED : bad = bad + 1 : EndIf
+  If vipWord(17) <> #VIP_RED : bad = bad + 1 : EndIf
+  If vipWord(18) <> #VIP_GREEN : bad = bad + 1 : EndIf
+  If vipWord(19) <> #VIP_GREEN : bad = bad + 1 : EndIf
+  For i = 20 To 23
+    If vipWord(i) <> #VIP_CLEAR : bad = bad + 1 : EndIf
+  Next
+  vipPut(24, bad)
+  If bad <> 0 : ProcedureReturn vipFinish(#VIP_ERR_PIXEL, bad) : EndIf
+  bad = 0
+  For i = 0 To #VIP_SURFACE_BYTES - 4 Step 4
+    If (PeekL(#VIP_SURFACE + i) & $FFFFFFFF) <> #VIP_GUARD : bad = bad + 1 : EndIf
+  Next
+  vipPut(27, bad)
+  If bad <> 0 : ProcedureReturn vipFinish(#VIP_ERR_GUARD, bad) : EndIf
+  bad = 0
+  For i = #VIP_VERTEX_BYTES To vipWord(8) - 4 Step 4
+    If (PeekL(vipWord(6) + i) & $FFFFFFFF) <> #VIP_GUARD : bad = bad + 1 : EndIf
+  Next
+  vipPut(25, bad)
+  If bad <> 0 : ProcedureReturn vipFinish(#VIP_ERR_GUARD, bad) : EndIf
+  bad = 0
+  For i = #VIP_INSTANCE_BYTES To vipWord(9) - 4 Step 4
+    If (PeekL(vipWord(7) + i) & $FFFFFFFF) <> #VIP_GUARD : bad = bad + 1 : EndIf
+  Next
+  vipPut(26, bad)
+  If bad <> 0 : ProcedureReturn vipFinish(#VIP_ERR_GUARD, bad) : EndIf
+  If vipWord(29) <> bin0 + 1 Or vipWord(31) <> render0 + 1 Or vipWord(39) <> 1
+    ProcedureReturn vipFinish(#VIP_ERR_JOBS, vipWord(39))
+  EndIf
+  If vipWord(33) <> mmu0 Or vipWord(35) <> oom0
+    ProcedureReturn vipFinish(#VIP_ERR_FAULT, vipWord(33))
+  EndIf
+  If vipWord(36) <> 1 : ProcedureReturn vipFinish(#VIP_ERR_PACKET, vipWord(36)) : EndIf
+  vipPut(2, 8) : vipPut(38, Micros() - vipStart)
+  ProcedureReturn vipFinish(#VIP_OK, 0)
+EndProcedure
