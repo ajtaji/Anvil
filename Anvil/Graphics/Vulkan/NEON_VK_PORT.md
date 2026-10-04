@@ -23,15 +23,26 @@ after the Vulkan render target is created. Target dimensions are its logical
 framebuffer extent; the adapter maps the full virtual canvas to that extent.
 `NeonVkPortCamera(x, y, zoom)` uses the desktop box transform: subtract camera
 position, zoom around the center of the selected coordinate space, then map
-to target pixels. Pass `Scaled=1, IgnoreCamera=1` for application chrome.
+to target pixels. Text applies this to each positioned TrueType glyph quad.
+Pass `Scaled=1, IgnoreCamera=1` for application chrome.
 Rectangles round both edges to pixels so adjacent edges stay aligned.
 
 Text uses a NUL-terminated UTF-8 pointer and one of Anvil's four Neon font
-slots; a desktop `GLFont` pointer cannot cross this interface. The text
-wrappers use the installed Vulkan measurement callback so width and draw share
-the same font metrics. They refuse virtual-canvas stretch or camera zoom other
-than 1.0 because the current font draw callback cannot scale glyph geometry
-by an arbitrary ratio. Text translation and alignment remain supported.
+slots; a desktop `GLFont` pointer cannot cross this interface. With a selected
+TrueType slot, width and Right/Centre alignment use the same fixed-point
+layout advances as the glyph draw. The adapter anchors the run in its source
+coordinate space, snaps each positioned ink origin to a source pixel, applies
+the optional camera transform, then maps each quad to the target at 1/256-pixel
+precision. Virtual-canvas scaling may differ on the X and Y axes; it does not
+rerasterize glyphs. Glyphs therefore grow or shrink with the canvas or zoom,
+as in the desktop path, while their source-space advances stay unchanged.
+The desktop font's configurable `SnapToPixel=0` setting has no font-handle
+equivalent here; this port uses the snapped behavior. Scaled or zoomed text
+requires a selected TrueType slot. The bitmap fallback retains its original
+unscaled callback behavior. Text positions and camera offsets must be within
+±1,000,000 source pixels, and mapped text zoom is limited to 16× so the
+fixed-point transform stays within signed 64-bit intermediates. Other canvas
+primitives keep their existing camera range.
 
 A desktop `GLSprite` texture handle cannot cross this interface. Upload a
 tightly packed RGBA or BGRA buffer into one of the Vulkan chrome image slots
@@ -304,8 +315,9 @@ placed an 800×450 canvas in an 800×800 GPU target. Its checked pixels include
 black bars, clipped geometry and a cropped sprite; a separate non-opt-in
 frame passed the existing box, text and sprite regression. Both were returning
 offscreen payloads. The current backend refused a 1280×800 GPU target under
-the test's 1024-pixel image cap, and scaled text remains unsupported when
-canvas and target sizes differ. This does not yet install a Neon app host in
+the test's 1024-pixel image cap. Scaled TrueType text now passes emitted-code
+geometry and adapter gates, but was not exercised by that board proof. This
+does not yet install a Neon app host in
 the resident monitor.
 
 The Pi 4 board proof in `docs/evidence/neon-vk-port-frame-pi4-20261003/`

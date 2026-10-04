@@ -51,6 +51,9 @@ def main() -> int:
         if hook.count(entry) != 1:
             raise AssertionError("Neon hook gate entry changed")
         image_stubs = """
+Procedure.i AnvilTrueTypeSlotSelected() : ProcedureReturn -1 : EndProcedure
+Procedure.i NeonVkChromeMeasureWidthFixed(font.i, *s) : ProcedureReturn -1 : EndProcedure
+Procedure.i NeonVkChromeTextMapped(font.i, xQ16.i, yQ16.i, *s, colour.i, spaceW.i, spaceH.i, targetW.i, targetH.i, cameraXQ16.i, cameraYQ16.i, zoomQ16.i, ignoreCamera.i) : ProcedureReturn -1 : EndProcedure
 Procedure.i NeonVkChromeImageSpriteReplaceId(id.i, *pixels, width.i, height.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i NeonVkChromeImageSpriteReplaceBGRAId(id.i, *pixels, width.i, height.i) : ProcedureReturn 0 : EndProcedure
 Procedure.i NeonVkChromeImageSpriteGenerationId(id.i) : ProcedureReturn 1 : EndProcedure

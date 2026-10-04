@@ -64,9 +64,12 @@ EndProcedure
 ; Width and line height are the active Anvil TrueType layout metrics. They
 ; are not the desktop font's point-size, fixed-advance or DPI semantics.
 Procedure.f NeonVkPortFontTextWidth(*font.NeonVkPortFontRef, *s, scaled.i)
+  Protected measured.i
   If nvpTextScaleSupported(scaled, 1) = 0 Or *s = 0 : ProcedureReturn -1.0 : EndIf
   If nvpFontActivate(*font) <> #NEON_OK : ProcedureReturn -1.0 : EndIf
-  ProcedureReturn MathFFromInt(NeonVkChromeMeasureWidth(*font\face, *s))
+  measured = NeonVkChromeMeasureWidthFixed(*font\face, *s)
+  If measured < 0 : ProcedureReturn -1.0 : EndIf
+  ProcedureReturn MathFFromInt(measured) / 65536.0
 EndProcedure
 
 Procedure.i NeonVkPortFontLineHeight(*font.NeonVkPortFontRef)
@@ -82,24 +85,20 @@ EndProcedure
 
 Procedure.i NeonVkPortFontTextRight(*font.NeonVkPortFontRef, xRight.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
   Protected rc.i = nvpFontActivate(*font)
-  Protected measured.i
   Protected width.f
   If rc <> #NEON_OK : ProcedureReturn rc : EndIf
   If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
-  measured = NeonVkChromeMeasureWidth(*font\face, *s)
-  If measured < 0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
-  width = MathFFromInt(measured)
+  width = NeonVkPortFontTextWidth(*font, *s, scaled)
+  If width < 0.0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
   ProcedureReturn NeonVkPortFontText(*font, xRight - width, y, *s, r, g, b, a, scaled, ignoreCamera)
 EndProcedure
 
 Procedure.i NeonVkPortFontTextCentre(*font.NeonVkPortFontRef, x.f, w.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, ignoreCamera.i)
   Protected rc.i = nvpFontActivate(*font)
-  Protected measured.i
   Protected width.f
   If rc <> #NEON_OK : ProcedureReturn rc : EndIf
   If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
-  measured = NeonVkChromeMeasureWidth(*font\face, *s)
-  If measured < 0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
-  width = MathFFromInt(measured)
+  width = NeonVkPortFontTextWidth(*font, *s, scaled)
+  If width < 0.0 : ProcedureReturn #NEON_VK_FONT_ERR_METRICS : EndIf
   ProcedureReturn NeonVkPortFontText(*font, x + (w - width) / 2.0, y, *s, r, g, b, a, scaled, ignoreCamera)
 EndProcedure

@@ -30,6 +30,12 @@ Procedure.i nvpRound(v.f)
   ProcedureReturn Int(v + 0.5)
 EndProcedure
 
+; Q16 text inputs can exceed Int()'s documented 32-bit return range.
+Procedure.i nvpTextQ16(v.f)
+  If v < 0.0 : ProcedureReturn -MathFToInt(0.5 - v * 65536.0) : EndIf
+  ProcedureReturn MathFToInt(v * 65536.0 + 0.5)
+EndProcedure
+
 Procedure.i nvpChannel(v.f)
   If v <= 0.0 : ProcedureReturn 0 : EndIf
   If v >= 1.0 : ProcedureReturn 255 : EndIf
@@ -186,21 +192,28 @@ Procedure.i NeonVkPortScissorClear()
   ProcedureReturn #NEON_OK
 EndProcedure
 
-; Glyph sizes come from the selected Neon font resource. The current font
-; callbacks cannot stretch a run by an arbitrary canvas ratio or camera zoom.
 Procedure.i nvpTextScaleSupported(scaled.i, ignoreCamera.i)
   If nvpCanvasW = 0 : ProcedureReturn 0 : EndIf
-  If scaled <> 0 And (nvpCanvasW <> nvpTargetW Or nvpCanvasH <> nvpTargetH)
-    ProcedureReturn 0
-  EndIf
-  If ignoreCamera = 0 And nvpCameraZoom <> 1.0 : ProcedureReturn 0 : EndIf
   ProcedureReturn 1
+EndProcedure
+
+Procedure.i nvpTextNeedsMap(scaled.i, ignoreCamera.i)
+  If scaled <> 0 And (nvpCanvasW <> nvpTargetW Or nvpCanvasH <> nvpTargetH) : ProcedureReturn 1 : EndIf
+  If ignoreCamera = 0 And nvpCameraZoom <> 1.0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
 EndProcedure
 
 ; Text is NUL-terminated UTF-8 and font is an Anvil Neon face slot, not a
 ; desktop GLFont pointer. Width and draw use the same installed metrics.
 Procedure.f NeonVkPortTextWidth(font.i, *s, scaled.i)
+  Protected measured.i
   If nvpTextScaleSupported(scaled, 1) = 0 : ProcedureReturn -1.0 : EndIf
+  If AnvilTrueTypeSlotSelected() >= 0
+    measured = NeonVkChromeMeasureWidthFixed(font, *s)
+    If measured < 0 : ProcedureReturn -1.0 : EndIf
+    ProcedureReturn MathFFromInt(measured) / 65536.0
+  EndIf
+  If nvpTextNeedsMap(scaled, 1) <> 0 : ProcedureReturn -1.0 : EndIf
   ProcedureReturn MathFFromInt(Neon_TextWidth(font, *s))
 EndProcedure
 
@@ -209,6 +222,17 @@ Procedure.i NeonVkPortText(font.i, x.f, y.f, *s, r.f, g.f, b.f, a.f, scaled.i, i
   If nvpTextScaleSupported(scaled, ignoreCamera) = 0
     ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE
   EndIf
+  If AnvilTrueTypeSlotSelected() >= 0
+    Protected spaceW.i = nvpTargetW
+    Protected spaceH.i = nvpTargetH
+    ; These Q16 bounds keep Chrome's camera and target products in signed 64 bits.
+    If x < -1000000.0 Or x > 1000000.0 Or y < -1000000.0 Or y > 1000000.0 Or nvpCameraX < -1000000.0 Or nvpCameraX > 1000000.0 Or nvpCameraY < -1000000.0 Or nvpCameraY > 1000000.0 Or nvpCameraZoom > 16.0
+      ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE
+    EndIf
+    If scaled <> 0 : spaceW = nvpCanvasW : spaceH = nvpCanvasH : EndIf
+    ProcedureReturn NeonVkChromeTextMapped(font, nvpTextQ16(x), nvpTextQ16(y), *s, NeonVkPortColour(r, g, b, a), spaceW, spaceH, nvpTargetW, nvpTargetH, nvpTextQ16(nvpCameraX), nvpTextQ16(nvpCameraY), nvpTextQ16(nvpCameraZoom), ignoreCamera)
+  EndIf
+  If nvpTextNeedsMap(scaled, ignoreCamera) <> 0 : ProcedureReturn #NEON_VK_PORT_ERR_TEXT_SCALE : EndIf
   If ignoreCamera = 0
     x = x - nvpCameraX : y = y - nvpCameraY
   EndIf

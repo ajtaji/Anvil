@@ -313,6 +313,10 @@ Global Dim nvcTTLayoutGlyph.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global Dim nvcTTLayoutX.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global Dim nvcTTLayoutY.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global Dim nvcTTLayoutAdvance.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTMapX0Q8.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTMapY0Q8.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTMapX1Q8.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
+Global Dim nvcTTMapY1Q8.i[#NEON_VK_CHROME_TT_RUN_GLYPHS]
 Global nvcWhiteU0.i
 Global nvcWhiteV0.i
 Global nvcWhiteU1.i
@@ -2769,7 +2773,7 @@ EndProcedure
 
 ; UTF-8 width with the same pair positioning used by the draw callback. This
 ; path is intentionally CPU-only: it does not rasterize or touch the atlas.
-Procedure.i NeonVkChromeMeasureWidth(font.i, *s)
+Procedure.i NeonVkChromeMeasureWidthFixed(font.i, *s)
   Define length.i, pixels.i, count.i, lines.i, measured.i
   If *s = 0 Or AnvilTrueTypeSlotSelected() < 0 Or AnvilTrueTypeSlotParserBound() = 0
     ProcedureReturn -1
@@ -2783,7 +2787,13 @@ Procedure.i NeonVkChromeMeasureWidth(font.i, *s)
   If AnvilTrueTypeLayoutUtf8(*s, length, pixels, 0, pixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured) = 0
     ProcedureReturn -1
   EndIf
-  If measured <= 0 : ProcedureReturn 0 : EndIf
+  ProcedureReturn measured
+EndProcedure
+
+Procedure.i NeonVkChromeMeasureWidth(font.i, *s)
+  Define measured.i = NeonVkChromeMeasureWidthFixed(font, *s)
+  If measured < 0 : ProcedureReturn -1 : EndIf
+  If measured = 0 : ProcedureReturn 0 : EndIf
   ProcedureReturn (measured + 65535) / 65536
 EndProcedure
 
@@ -2827,9 +2837,15 @@ Procedure.i NeonVkChromeTTCacheMisses()
   ProcedureReturn nvcTTCacheMisses
 EndProcedure
 
-Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
+Procedure.i nvcTTRoundDiv(numerator.i, denominator.i)
+  If numerator < 0 : ProcedureReturn -((0 - numerator + denominator / 2) / denominator) : EndIf
+  ProcedureReturn (numerator + denominator / 2) / denominator
+EndProcedure
+
+Procedure.i nvcTTTextMapped(xQ16.i, yQ16.i, *s, colour.i, mapped.i, spaceW.i, spaceH.i, targetW.i, targetH.i, cameraXQ16.i, cameraYQ16.i, zoomQ16.i, ignoreCamera.i)
   Define length.i, i.i, slot.i, generation.i, entry.i, rc.i
-  Define count.i, lines.i, measured.i, visible.i, originX.i, baseline.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
+  Define count.i, lines.i, measured.i, visible.i, originX.i, baseline.i, anchorX.i, anchorY.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
+  Define leftQ16.i, topQ16.i, rightQ16.i, bottomQ16.i, centerXQ16.i, centerYQ16.i
   nvcTTErrorStage = 0 : nvcTTUnitsProbe = 0 : nvcTTCountProbe = 0
   nvcTTLinesProbe = 0 : nvcTTMeasuredProbe = 0 : nvcTTMetricsStateProbe = 0
   If nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -2848,19 +2864,61 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
   nvcTTMetricsStateProbe = AnvilTrueTypeMetricsOpenState()
   If rc = 0 Or count < 0 Or count > #NEON_VK_CHROME_TT_RUN_GLYPHS : nvcTTErrorStage = 4 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
   generation = AnvilTrueTypeSlotGeneration(slot)
+  units = AnvilTrueTypeUnitsPerEm()
+  nvcTTUnitsProbe = units
+  If units < 1 : nvcTTErrorStage = 7 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  lineAscent = (AnvilTrueTypeAscender() * nvcTTFontPixels) / units
+  If mapped <> 0
+    If spaceW < 1 Or spaceH < 1 Or targetW < 1 Or targetH < 1 Or spaceW > 8192 Or spaceH > 8192 Or targetW > 8192 Or targetH > 8192 Or zoomQ16 < 1 Or zoomQ16 > 1048576
+      nvcTTErrorStage = 9 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+    EndIf
+    If xQ16 < -1000000000000 Or xQ16 > 1000000000000 Or yQ16 < -1000000000000 Or yQ16 > 1000000000000 Or cameraXQ16 < -1000000000000 Or cameraXQ16 > 1000000000000 Or cameraYQ16 < -1000000000000 Or cameraYQ16 > 1000000000000
+      nvcTTErrorStage = 9 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+    EndIf
+    centerXQ16 = spaceW * 32768 : centerYQ16 = spaceH * 32768
+  Else
+    anchorX = xQ16 / 65536 : anchorY = yQ16 / 65536
+  EndIf
   For i = 0 To count - 1
     entry = nvcTTCacheFind(slot, generation, nvcTTFontPixels, nvcTTLayoutGlyph[i])
     If entry < 0 : nvcTTErrorStage = 5 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
-    If nvcTTW[entry] > 0 And nvcTTH[entry] > 0 : visible + 1 : EndIf
+    If nvcTTW[entry] > 0 And nvcTTH[entry] > 0
+      visible + 1
+      If mapped <> 0
+        leftQ16 = xQ16 + nvcTTLayoutX[i] + nvcTTBearingX[entry] * 65536
+        topQ16 = yQ16 + lineAscent * 65536 - nvcTTLayoutY[i] - nvcTTBearingY[entry] * 65536
+        ; Snap each positioned ink origin before camera, as the desktop face does.
+        leftQ16 = nvcTTRoundDiv(leftQ16, 65536) * 65536
+        topQ16 = nvcTTRoundDiv(topQ16, 65536) * 65536
+        If leftQ16 < -1000000000000 Or leftQ16 > 1000000000000 Or topQ16 < -1000000000000 Or topQ16 > 1000000000000
+          nvcTTErrorStage = 9 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+        EndIf
+        If ignoreCamera = 0
+          leftQ16 = centerXQ16 + ((leftQ16 - cameraXQ16 - centerXQ16) * zoomQ16) / 65536
+          topQ16 = centerYQ16 + ((topQ16 - cameraYQ16 - centerYQ16) * zoomQ16) / 65536
+          rightQ16 = leftQ16 + nvcTTW[entry] * zoomQ16
+          bottomQ16 = topQ16 + nvcTTH[entry] * zoomQ16
+        Else
+          rightQ16 = leftQ16 + nvcTTW[entry] * 65536
+          bottomQ16 = topQ16 + nvcTTH[entry] * 65536
+        EndIf
+        If leftQ16 < -1000000000000 Or leftQ16 > 1000000000000 Or topQ16 < -1000000000000 Or topQ16 > 1000000000000 Or rightQ16 < -1000000000000 Or rightQ16 > 1000000000000 Or bottomQ16 < -1000000000000 Or bottomQ16 > 1000000000000
+          nvcTTErrorStage = 9 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+        EndIf
+        nvcTTMapX0Q8[i] = nvcTTRoundDiv(leftQ16 * targetW, spaceW * 256)
+        nvcTTMapY0Q8[i] = nvcTTRoundDiv(topQ16 * targetH, spaceH * 256)
+        nvcTTMapX1Q8[i] = nvcTTRoundDiv(rightQ16 * targetW, spaceW * 256)
+        nvcTTMapY1Q8[i] = nvcTTRoundDiv(bottomQ16 * targetH, spaceH * 256)
+        If nvcTTMapX0Q8[i] < -#NVC_SPRITE_Q8_LIMIT Or nvcTTMapX0Q8[i] > #NVC_SPRITE_Q8_LIMIT Or nvcTTMapY0Q8[i] < -#NVC_SPRITE_Q8_LIMIT Or nvcTTMapY0Q8[i] > #NVC_SPRITE_Q8_LIMIT Or nvcTTMapX1Q8[i] < -#NVC_SPRITE_Q8_LIMIT Or nvcTTMapX1Q8[i] > #NVC_SPRITE_Q8_LIMIT Or nvcTTMapY1Q8[i] < -#NVC_SPRITE_Q8_LIMIT Or nvcTTMapY1Q8[i] > #NVC_SPRITE_Q8_LIMIT
+          nvcTTErrorStage = 9 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+        EndIf
+      EndIf
+    EndIf
   Next
   If visible = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices + visible * 6 > nvcMaxVertexQuads * 6
     nvcTTErrorStage = 6 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
-  units = AnvilTrueTypeUnitsPerEm()
-  nvcTTUnitsProbe = units
-  If units < 1 : nvcTTErrorStage = 7 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
-  lineAscent = (AnvilTrueTypeAscender() * nvcTTFontPixels) / units
   first = nvcVertices
   For i = 0 To count - 1
     entry = nvcTTCacheFind(slot, generation, nvcTTFontPixels, nvcTTLayoutGlyph[i])
@@ -2869,9 +2927,18 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
       uv1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
       vv0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
       vv1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
-      originX = x + nvcTTFixed16Floor(nvcTTLayoutX[i])
-      baseline = y + lineAscent - nvcTTFixed16Floor(nvcTTLayoutY[i])
-      nvcQuad(nvcVertices, originX + nvcTTBearingX[entry], baseline - nvcTTBearingY[entry], originX + nvcTTBearingX[entry] + nvcTTW[entry], baseline - nvcTTBearingY[entry] + nvcTTH[entry], uv0, vv0, uv1, vv1)
+      If mapped <> 0
+        nvcSpriteVertexQ8(nvcVertices + 0, nvcTTMapX0Q8[i], nvcTTMapY0Q8[i], uv0, vv0)
+        nvcSpriteVertexQ8(nvcVertices + 1, nvcTTMapX0Q8[i], nvcTTMapY1Q8[i], uv0, vv1)
+        nvcSpriteVertexQ8(nvcVertices + 2, nvcTTMapX1Q8[i], nvcTTMapY1Q8[i], uv1, vv1)
+        nvcSpriteVertexQ8(nvcVertices + 3, nvcTTMapX0Q8[i], nvcTTMapY0Q8[i], uv0, vv0)
+        nvcSpriteVertexQ8(nvcVertices + 4, nvcTTMapX1Q8[i], nvcTTMapY1Q8[i], uv1, vv1)
+        nvcSpriteVertexQ8(nvcVertices + 5, nvcTTMapX1Q8[i], nvcTTMapY0Q8[i], uv1, vv0)
+      Else
+        originX = anchorX + nvcTTFixed16Floor(nvcTTLayoutX[i])
+        baseline = anchorY + lineAscent - nvcTTFixed16Floor(nvcTTLayoutY[i])
+        nvcQuad(nvcVertices, originX + nvcTTBearingX[entry], baseline - nvcTTBearingY[entry], originX + nvcTTBearingX[entry] + nvcTTW[entry], baseline - nvcTTBearingY[entry] + nvcTTH[entry], uv0, vv0, uv1, vv1)
+      EndIf
       nvcVertices + 6
     EndIf
   Next
@@ -2879,6 +2946,21 @@ Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
   rc = nvcDraw(first, visible * 6, colour)
   If rc <> #NEON_VK_CHROME_OK : nvcTTErrorStage = 8 : EndIf
   ProcedureReturn rc
+EndProcedure
+
+Procedure.i nvcTTText(x.i, y.i, *s, colour.i)
+  ProcedureReturn nvcTTTextMapped(x * 65536, y * 65536, *s, colour, 0, 1, 1, 1, 1, 0, 0, 65536, 1)
+EndProcedure
+
+; Apply canvas and camera geometry to each already-positioned TrueType glyph.
+; The atlas raster size and source-space advances remain unchanged.
+Procedure.i NeonVkChromeTextMapped(font.i, xQ16.i, yQ16.i, *s, colour.i, spaceW.i, spaceH.i, targetW.i, targetH.i, cameraXQ16.i, cameraYQ16.i, zoomQ16.i, ignoreCamera.i)
+  If nvcInFrame = 0 Or font < 0 Or font > 3 Or spaceW < 1 Or spaceH < 1 Or targetW < 1 Or targetH < 1 Or zoomQ16 < 1
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  nvcTTFontPixels = nvcTTFontHeightFor(font)
+  If nvcTTFontPixels < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  ProcedureReturn nvcTTTextMapped(xQ16, yQ16, *s, colour, 1, spaceW, spaceH, targetW, targetH, cameraXQ16, cameraYQ16, zoomQ16, ignoreCamera)
 EndProcedure
 
 Procedure.i NeonVkChromeTrueTypeText(pixelHeight.i, x.i, y.i, *s, colour.i)
