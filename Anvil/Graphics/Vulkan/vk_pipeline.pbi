@@ -2585,6 +2585,126 @@ Procedure AnvilVkCmdClearAttachments(commandBuffer.i, *attachment.VkClearAttachm
   EndIf
 EndProcedure
 
+; Internal-only compute recording. These functions are intentionally absent
+; from vk_api.pbi and vk_dispatch.pbi until the queue can execute CSD jobs.
+Procedure AnvilVkCmdBindComputePipeline(commandBuffer.i, pipeline.i)
+  Define c.i, p.i, d.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "compute pipeline bind needs a live command buffer.")
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "compute pipeline bind requires a recording command buffer.")
+    ProcedureReturn
+  EndIf
+  p = avkPipeSlot(pipeline)
+  If p = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "compute pipeline bind found a stale pipeline generation.")
+    ProcedureReturn
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkPipeDev[p] <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "compute pipeline belongs to another device.")
+    ProcedureReturn
+  EndIf
+  If avkPipeKind[p] <> 1 Or avkPipeComputeIr[p]\valid <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "compute pipeline bind requires an immutable typed compute pipeline.")
+    ProcedureReturn
+  EndIf
+  avkCbComputePipe[c] = pipeline
+EndProcedure
+
+Procedure AnvilVkCmdBindComputeDescriptorSet(commandBuffer.i, layout.i, set.i)
+  Define c.i, lay.i, d.i, k.i
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "compute descriptor bind needs a live command buffer.")
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "compute descriptor bind requires a recording command buffer.")
+    ProcedureReturn
+  EndIf
+  lay = avkLaySlot(layout)
+  If lay = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "compute descriptor bind found a stale pipeline layout.")
+    ProcedureReturn
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkLayDev[lay] <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "compute pipeline layout belongs to another device.")
+    ProcedureReturn
+  EndIf
+  If avkLaySetCount[lay] <> 1 Or avkLayBindingCount[lay] <> 2 Or avkLayPushBytes[lay] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "compute descriptor bind requires the exact two-storage set-zero layout.")
+    ProcedureReturn
+  EndIf
+  For k = 0 To 1
+    If avkLayBindingType[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER Or avkLayBindingStages[(lay * #ANVIL_VK_MAX_SET_BINDINGS) + k] <> #VK_SHADER_STAGE_COMPUTE_BIT
+      avkCbFail(c, #ANVIL_VK_ERR_ARGS, "compute descriptor bind requires compute-stage storage bindings zero and one.")
+      ProcedureReturn
+    EndIf
+  Next
+  If AnvilVkDescriptorSetDeviceSlot(set) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "compute descriptor bind found a stale descriptor-set generation.")
+    ProcedureReturn
+  EndIf
+  If AnvilVkDescriptorSetDeviceSlot(set) <> d
+    avkCbFail(c, #ANVIL_VK_ERR_OWNER, "compute descriptor set belongs to another device.")
+    ProcedureReturn
+  EndIf
+  If avkSetMatchesLayout(set, lay) = 0
+    avkCbFail(c, #ANVIL_VK_ERR_ARGS, "compute descriptor set schema differs from its pipeline layout.")
+    ProcedureReturn
+  EndIf
+  avkCbComputeSet[c] = set
+EndProcedure
+
+Procedure AnvilVkCmdRecordComputeDispatch(commandBuffer.i, groupsX.i, groupsY.i, groupsZ.i)
+  Define c.i, p.i, d.i, rc.i
+  Define plan.AnvilVkComputeBindingPlan
+  c = avkCmdSlot(commandBuffer)
+  If c = 0
+    avkFault(#ANVIL_VK_ERR_HANDLE, "compute dispatch recording needs a live command buffer.")
+    ProcedureReturn
+  EndIf
+  If avkCmdState[c] <> #ANVIL_VK_CB_RECORDING
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "compute dispatch requires a recording command buffer.")
+    ProcedureReturn
+  EndIf
+  If avkCbComputeRecorded[c] <> 0 Or avkCmdOps[c] <> 0 Or avkCbDrawCount[c] <> 0 Or avkCbRpActive[c] <> 0 Or avkCbRpDone[c] <> 0
+    avkCbFail(c, #ANVIL_VK_ERR_UNSUPPORTED, "compute dispatch recording supports one isolated dispatch per command buffer.")
+    ProcedureReturn
+  EndIf
+  p = avkPipeSlot(avkCbComputePipe[c])
+  If p = 0
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "compute dispatch found no live bound pipeline generation.")
+    ProcedureReturn
+  EndIf
+  d = avkPoolDev[avkCmdPool[c]]
+  If avkPipeDev[p] <> d Or avkPipeKind[p] <> 1 Or avkPipeComputeIr[p]\valid <> 1
+    avkCbFail(c, #ANVIL_VK_ERR_STATE, "compute dispatch found an incompatible bound pipeline.")
+    ProcedureReturn
+  EndIf
+  If AnvilVkDescriptorSetDeviceSlot(avkCbComputeSet[c]) <> d
+    avkCbFail(c, #ANVIL_VK_ERR_HANDLE, "compute dispatch found no live bound descriptor-set generation on this device.")
+    ProcedureReturn
+  EndIf
+  rc = AnvilVkComputeBindingPreflight(avkToken(#ANVIL_VK_TYPE_DEVICE, d, avkDevGen[d]), @avkPipeComputeIr[p], avkCbComputeSet[c], groupsX, groupsY, groupsZ, @plan)
+  If rc <> #VK_SUCCESS
+    avkCbFail(c, rc, "compute dispatch preflight refused its group count or live storage descriptors.")
+    ProcedureReturn
+  EndIf
+  avkCbComputeRecordPipe[c] = avkCbComputePipe[c]
+  avkCbComputeRecordSet[c] = avkCbComputeSet[c]
+  avkCbComputeGroupsX[c] = plan\groupsX : avkCbComputeItems[c] = plan\items
+  avkCbComputeInputBase[c] = plan\inputBase : avkCbComputeInputBytes[c] = plan\inputBytes
+  avkCbComputeOutputBase[c] = plan\outputBase : avkCbComputeOutputBytes[c] = plan\outputBytes
+  avkCbComputeOutputWrittenBytes[c] = plan\outputWrittenBytes
+  avkCbComputeRecorded[c] = 1
+EndProcedure
+
 Procedure AnvilVkCmdBindPipeline(commandBuffer.i, bindPoint.i, pipeline.i)
   Define c.i
   Define p.i

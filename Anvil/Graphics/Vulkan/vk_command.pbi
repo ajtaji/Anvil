@@ -148,6 +148,21 @@ Global Dim avkRefCur.i[#ANVIL_VK_MAX_COMMAND_BUFFERS * #ANVIL_VK_MAX_CB_REFS]
 ;  there, the same seam shape the backend uses.
 ; ----------------------------------------------------------------------
 Global Dim avkCbPipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+; Passive compute binding and one immutable dispatch snapshot. Public compute
+; recording and queue execution remain unavailable. Handles retain generation
+; tokens; reset clears every field through avkCbClear.
+Global Dim avkCbComputePipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeSet.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeRecorded.a[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeRecordPipe.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeRecordSet.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeGroupsX.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeInputBase.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeInputBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeOutputBase.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeOutputBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeOutputWrittenBytes.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
+Global Dim avkCbComputeItems.i[#ANVIL_VK_MAX_COMMAND_BUFFERS + 1]
 ; ONE BOUND BUFFER PER BINDING. vkCmdBindVertexBuffers names a first
 ; binding and a count, so the state it sets is per binding and cannot be
 ; one buffer and one offset: a pipeline that reads position from binding
@@ -1569,6 +1584,13 @@ Procedure.i avkCbClear(c.i)
   avkCmdOps[c] = 0
   avkCmdState[c] = #ANVIL_VK_CB_INITIAL
   avkCbPipe[c] = 0
+  avkCbComputePipe[c] = 0 : avkCbComputeSet[c] = 0
+  avkCbComputeRecorded[c] = 0
+  avkCbComputeRecordPipe[c] = 0 : avkCbComputeRecordSet[c] = 0
+  avkCbComputeGroupsX[c] = 0 : avkCbComputeItems[c] = 0
+  avkCbComputeInputBase[c] = 0 : avkCbComputeInputBytes[c] = 0
+  avkCbComputeOutputBase[c] = 0 : avkCbComputeOutputBytes[c] = 0
+  avkCbComputeOutputWrittenBytes[c] = 0
   k = 0
   While k < #ANVIL_VK_MAX_BINDINGS
     avkCbVtxBuf[(c * #ANVIL_VK_MAX_BINDINGS) + k] = 0
@@ -1745,6 +1767,10 @@ Procedure.i AnvilVkCommandBufferEnd(commandBuffer.i)
   If avkCbRpActive[c] <> 0
     avkCmdState[c] = #ANVIL_VK_CB_INVALID
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkEndCommandBuffer was called inside a render pass (Anvil code -20004, render pass still open); the specification requires every vkCmdBeginRenderPass to be matched by a vkCmdEndRenderPass before the recording ends, and a pass left open would have had its store operation skipped.")
+  EndIf
+  If avkCbComputeRecorded[c] <> 0 And (avkCmdOps[c] <> 0 Or avkCbDrawCount[c] <> 0 Or avkCbRpDone[c] <> 0)
+    avkCmdState[c] = #ANVIL_VK_CB_INVALID
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkEndCommandBuffer cannot mix the passive compute dispatch record with graphics or transfer work; no compute queue execution exists yet.")
   EndIf
   ; A reference whose layout was never established inside the recording
   ; leaves the image exactly as it found it.
@@ -2321,6 +2347,9 @@ Procedure.i AnvilVkQueueSubmitOne(queue.i, commandBuffer.i, fence.i, semaphoreRe
   EndIf
   If avkCmdState[c] <> #ANVIL_VK_CB_EXECUTABLE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_STATE, "vkQueueSubmit was given a command buffer that is not in the executable state (Anvil code -20004, wrong command buffer state); record it and call vkEndCommandBuffer before submitting it.")
+  EndIf
+  If avkCbComputeRecorded[c] <> 0
+    ProcedureReturn avkFault(#VK_ERROR_FEATURE_NOT_PRESENT, "vkQueueSubmit cannot execute a passive compute dispatch record while the compute queue and backend submission path are unavailable; nothing was submitted.")
   EndIf
   ; Every image the recording assumed something about must actually be
   ; in that layout now. This is the join between what was recorded and

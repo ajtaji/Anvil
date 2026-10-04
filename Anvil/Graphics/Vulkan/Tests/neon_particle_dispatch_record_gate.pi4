@@ -1,0 +1,156 @@
+; Desk-only compute bind/dispatch recording proof. The public dispatch API
+; and compute queue remain unavailable; real Pi4 backend is linked but no
+; Neon/V3D initialization or CSD submission occurs.
+EnableFloatingPoint
+XIncludeFile "RaspberryPi4/Lib/uart.pi4"
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/safety.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+#DSP_DMA_LINKED = 1
+XIncludeFile "RaspberryPi4/Lib/dma.pi4"
+XIncludeFile "RaspberryPi4/Lib/display.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3dqpu.pi4"
+XIncludeFile "RaspberryPi4/Lib/v3d.pi4"
+XIncludeFile "RaspberryPi4/Lib/neon.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_api.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_spirv_fixtures.pbi"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_shader.pi4"
+XIncludeFile "RaspberryPi4/Board/vulkan_dma.pi4"
+XIncludeFile "Anvil/Graphics/Vulkan/vk_v3d_backend.pi4"
+
+#DR_IN = $06000000
+#DR_OUT = $06100000
+#DR_HEAP = $06200000
+#DR_NAME = $06300000
+
+Procedure drPut(n.i, value.i)
+  PokeI(#DR_OUT + n * 8, value)
+EndProcedure
+
+Procedure.i Main()
+  Protected device.i, queue.i, module.i, pipeline.i, stalePipeline.i, dslHandle.i, layout.i
+  Protected buffer.i, memory.i, pool.i, set.i, staleSet.i, cmdPool.i, cmd.i, c.i, rc.i, k.i, before.i
+  Protected sm.VkShaderModuleCreateInfo
+  Protected Dim bindings.VkDescriptorSetLayoutBinding[2]
+  Protected dsl.VkDescriptorSetLayoutCreateInfo
+  Protected pl.VkPipelineLayoutCreateInfo
+  Protected cp.VkComputePipelineCreateInfo
+  Protected poolSize.VkDescriptorPoolSize
+  Protected pci.VkDescriptorPoolCreateInfo
+  Protected ai.VkDescriptorSetAllocateInfo
+  Protected Dim infos.VkDescriptorBufferInfo[2]
+  Protected Dim writes.VkWriteDescriptorSet[2]
+  drPut(0, $44525034)
+  avkDevGen[1] = avkNextGen(avkDevGen[1]) : avkDevLive[1] = 1
+  device = avkToken(#ANVIL_VK_TYPE_DEVICE, 1, avkDevGen[1])
+  avkQueueGen[1] = avkNextGen(avkQueueGen[1]) : avkQueueLive[1] = 1 : avkQueueDev[1] = 1
+  queue = avkToken(#ANVIL_VK_TYPE_QUEUE, 1, avkQueueGen[1])
+  If AnvilVkV3dWindow(#DR_HEAP, $04000000) <> #VK_SUCCESS : ProcedureReturn 1 : EndIf
+  sm\sType = #VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+  sm\pCode = PeekI(#DR_IN) : sm\codeSize = PeekI(#DR_IN + 8)
+  If vkCreateShaderModule(device, @sm, 0, @module) <> #VK_SUCCESS : ProcedureReturn 2 : EndIf
+  For k = 0 To 1
+    bindings[k]\binding = k : bindings[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    bindings[k]\descriptorCount = 1 : bindings[k]\stageFlags = #VK_SHADER_STAGE_COMPUTE_BIT
+  Next
+  dsl\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+  dsl\bindingCount = 2 : dsl\pBindings = @bindings[0]
+  If vkCreateDescriptorSetLayout(device, @dsl, 0, @dslHandle) <> #VK_SUCCESS : ProcedureReturn 3 : EndIf
+  pl\sType = #VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+  pl\setLayoutCount = 1 : pl\pSetLayouts = @dslHandle
+  If vkCreatePipelineLayout(device, @pl, 0, @layout) <> #VK_SUCCESS : ProcedureReturn 4 : EndIf
+  cp\sType = #VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  cp\stage\sType = #VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO
+  cp\stage\stage = #VK_SHADER_STAGE_COMPUTE_BIT
+  PokeL(#DR_NAME, $6E69616D) : PokeA(#DR_NAME + 4, 0)
+  cp\stage\module = module : cp\stage\pName = #DR_NAME
+  cp\layout = layout : cp\basePipelineIndex = -1
+  If AnvilVkComputePipelineCreate(device, @cp, @pipeline) <> #VK_SUCCESS : ProcedureReturn 5 : EndIf
+  If AnvilVkBufferCreate(device, 8192, #VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, #VK_SHARING_MODE_EXCLUSIVE, @buffer) <> #VK_SUCCESS : ProcedureReturn 6 : EndIf
+  If AnvilVkMemoryAllocate(device, 8192, 0, @memory) <> #VK_SUCCESS : ProcedureReturn 7 : EndIf
+  If AnvilVkBufferBindMemory(device, buffer, memory, 0) <> #VK_SUCCESS : ProcedureReturn 8 : EndIf
+  poolSize\type = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : poolSize\descriptorCount = 2
+  pci\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+  pci\flags = #VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+  pci\maxSets = 1 : pci\poolSizeCount = 1 : pci\pPoolSizes = @poolSize
+  If AnvilVkDescriptorPoolCreate(device, @pci, @pool) <> #VK_SUCCESS : ProcedureReturn 9 : EndIf
+  ai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+  ai\descriptorPool = pool : ai\descriptorSetCount = 1 : ai\pSetLayouts = @dslHandle
+  If AnvilVkDescriptorSetsAllocate(device, @ai, @set) <> #VK_SUCCESS : ProcedureReturn 10 : EndIf
+  infos[0]\buffer = buffer : infos[0]\offset = 0 : infos[0]\range = 768
+  infos[1]\buffer = buffer : infos[1]\offset = 4096 : infos[1]\range = 2304
+  For k = 0 To 1
+    writes[k]\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    writes[k]\dstSet = set : writes[k]\dstBinding = k
+    writes[k]\descriptorCount = 1 : writes[k]\descriptorType = #VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    writes[k]\pBufferInfo = @infos[k]
+    If AnvilVkDescriptorSetWriteOne(device, @writes[k]) <> #VK_SUCCESS : ProcedureReturn 11 + k : EndIf
+  Next
+  If AnvilVkCommandPoolCreate(device, #VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, @cmdPool) <> #VK_SUCCESS : ProcedureReturn 13 : EndIf
+  If AnvilVkCommandBufferAllocate(device, cmdPool, #VK_COMMAND_BUFFER_LEVEL_PRIMARY, @cmd) <> #VK_SUCCESS : ProcedureReturn 14 : EndIf
+  c = avkCmdSlot(cmd)
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 15 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  drPut(1, avkCbFailCode[c]) : drPut(2, avkCbComputeRecorded[c])
+  drPut(3, avkCbComputeGroupsX[c]) : drPut(4, avkCbComputeItems[c])
+  drPut(5, avkCbComputeInputBase[c]) : drPut(6, avkCbComputeOutputBase[c])
+  drPut(7, avkCbComputeOutputWrittenBytes[c])
+  drPut(8, Bool(avkCbComputeRecordPipe[c] = pipeline And avkCbComputeRecordSet[c] = set))
+  drPut(9, AnvilVkCommandBufferEnd(cmd))
+  before = avkSubmitCount
+  drPut(10, AnvilVkQueueSubmitOne(queue, cmd, 0, 0))
+  drPut(11, Bool(avkSubmitCount = before And avkCmdState[c] = #ANVIL_VK_CB_EXECUTABLE))
+  drPut(12, AnvilVkCommandBufferReset(cmd, 0))
+  drPut(13, Bool(avkCbComputeRecorded[c] = 0 And avkCbComputePipe[c] = 0 And avkCbComputeSet[c] = 0 And avkCbComputeInputBase[c] = 0 And avkCbComputeOutputBase[c] = 0))
+
+  ; Generation-aware stale pipeline bind.
+  stalePipeline = pipeline
+  AnvilVkPipelineDestroy(device, pipeline)
+  If AnvilVkComputePipelineCreate(device, @cp, @pipeline) <> #VK_SUCCESS : ProcedureReturn 18 : EndIf
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 16 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, stalePipeline)
+  drPut(14, AnvilVkCommandBufferEnd(cmd))
+  drPut(15, avkCbComputeRecorded[c])
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 17 : EndIf
+
+  ; Generation-aware stale set bind.
+  staleSet = set
+  If AnvilVkDescriptorSetsFree(device, pool, 1, @set) <> #VK_SUCCESS : ProcedureReturn 19 : EndIf
+  If AnvilVkDescriptorSetsAllocate(device, @ai, @set) <> #VK_SUCCESS : ProcedureReturn 22 : EndIf
+  For k = 0 To 1
+    writes[k]\dstSet = set
+    If AnvilVkDescriptorSetWriteOne(device, @writes[k]) <> #VK_SUCCESS : ProcedureReturn 23 + k : EndIf
+  Next
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 20 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, staleSet)
+  drPut(16, AnvilVkCommandBufferEnd(cmd))
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 21 : EndIf
+
+  ; Capacity and grouping are checked before publishing any record.
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 25 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 2, 1, 1)
+  drPut(17, AnvilVkCommandBufferEnd(cmd))
+  drPut(18, avkCbComputeRecorded[c])
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 26 : EndIf
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 27 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 2, 1)
+  drPut(19, AnvilVkCommandBufferEnd(cmd))
+  If AnvilVkCommandBufferReset(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 28 : EndIf
+
+  ; A second dispatch invalidates the command buffer rather than losing one.
+  If AnvilVkCommandBufferBegin(cmd, 0) <> #VK_SUCCESS : ProcedureReturn 29 : EndIf
+  AnvilVkCmdBindComputePipeline(cmd, pipeline)
+  AnvilVkCmdBindComputeDescriptorSet(cmd, layout, set)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  AnvilVkCmdRecordComputeDispatch(cmd, 1, 1, 1)
+  drPut(20, AnvilVkCommandBufferEnd(cmd))
+  drPut(21, avkCbComputeRecorded[c])
+  ProcedureReturn 0
+EndProcedure

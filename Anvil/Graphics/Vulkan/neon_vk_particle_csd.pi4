@@ -443,6 +443,7 @@ Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
   If nvpcInputMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcInputMemory) : nvpcInputMapped = 0 : EndIf
   If nvpcUnifMapped <> 0 : vkUnmapMemory(nvpcDevice, nvpcUnifMemory) : nvpcUnifMapped = 0 : EndIf
   If rc <> #NVPC_OK : ProcedureReturn rc : EndIf
+  If avkBackendGpuLeaseAcquire(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0 : ProcedureReturn #NVPC_ERR_STATE : EndIf
   csd\codeBase = nvpcCodeAddr : csd\codeBytes = nvpcCodeBytes : csd\codeFlags = 0
   csd\uniformBase = nvpcUnifAddr : csd\uniformBytes = 32
   csd\inputBase = nvpcInputAddr : csd\inputBytes = padded * #NVPC_RECORD
@@ -452,9 +453,17 @@ Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
   csd\workgroupSize = 16 : csd\workgroupsPerSupergroup = 1
   csd\timeoutUs = #NVPC_WAIT_US
   rc = AnvilVkV3dCsdConfigure(@csd, @result)
-  If rc <> #V3D_OK : nvpcLastCsd = rc : ProcedureReturn #NVPC_ERR_CSD : EndIf
+  If rc <> #V3D_OK
+    nvpcLastCsd = rc
+    avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL)
+    ProcedureReturn #NVPC_ERR_CSD
+  EndIf
   rc = NeonVkChromeExternalProducerQuarantine()
-  If rc <> #NEON_VK_CHROME_OK : AnvilVkV3dCsdCancel() : ProcedureReturn #NVPC_ERR_STATE : EndIf
+  If rc <> #NEON_VK_CHROME_OK
+    AnvilVkV3dCsdCancel()
+    avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL)
+    ProcedureReturn #NVPC_ERR_STATE
+  EndIf
   t0 = Micros()
   rc = AnvilVkV3dCsdSubmit(@result)
   nvpcLastCsdUs = Micros() - t0
@@ -463,6 +472,11 @@ Procedure.i NeonVkParticleCsdPrepare(*particles.NvcParticle, count.i)
     nvpcLastDoneBefore = result\doneBefore : nvpcLastDoneAfter = result\doneAfter
   EndIf
   If rc <> #V3D_OK
+    avkBackendGpuLeaseQuarantine(#ANVIL_VK_GPU_LEASE_EXTERNAL)
+    nvpcState = #NVPC_LOST
+    ProcedureReturn #NVPC_ERR_LOST
+  EndIf
+  If avkBackendGpuLeaseRelease(#ANVIL_VK_GPU_LEASE_EXTERNAL) = 0
     nvpcState = #NVPC_LOST
     ProcedureReturn #NVPC_ERR_LOST
   EndIf
