@@ -321,6 +321,11 @@ Global nvcClipX.i
 Global nvcClipY.i
 Global nvcClipW.i
 Global nvcClipH.i
+; Optional physical viewport placement. Begin restores the full target.
+Global nvcViewportX.i
+Global nvcViewportY.i
+Global nvcViewportW.i
+Global nvcViewportH.i
 
 Global Dim nvcFs.l[256]
 Global Dim nvcLifecycleClear.l[4]
@@ -1728,6 +1733,8 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   PokeL(@viewport\height, neon_F32Int(nvcPhysicalH))
   PokeL(@viewport\minDepth, 0) : PokeL(@viewport\maxDepth, #NEON_VK_CHROME_F_ONE)
   vkCmdSetViewport(nvcCommand, 0, 1, @viewport)
+  nvcViewportX = 0 : nvcViewportY = 0
+  nvcViewportW = nvcPhysicalW : nvcViewportH = nvcPhysicalH
   vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipeline)
   bufferHandle = nvcVertexBuffer : offset = 0
   vkCmdBindVertexBuffers(nvcCommand, 0, 1, @bufferHandle, @offset)
@@ -1741,6 +1748,31 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
   NeonVkChromeScissorClear()
   ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+; Place the current frame's normalized drawing coordinates in one physical
+; rectangle. Call immediately after Begin, before any geometry or batch work.
+; The render-pass clear still covers the full attachment, including the bars.
+Procedure.i NeonVkChromeViewportSet(x.i, y.i, w.i, h.i)
+  Define viewport.VkViewport
+  Define faultCount.i
+  If nvcReady = 0 Or nvcInFrame = 0 Or nvcFrameAbortable = 0 Or nvcDrawCount <> 0 Or nvcVertices <> 0 Or nvcExternalVertices <> 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcRetainedBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If x < 0 Or y < 0 Or w < 1 Or h < 1 Or x > nvcPhysicalW Or y > nvcPhysicalH Or w > nvcPhysicalW - x Or h > nvcPhysicalH - y
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  PokeL(@viewport\x, neon_F32Int(x)) : PokeL(@viewport\y, neon_F32Int(y))
+  PokeL(@viewport\width, neon_F32Int(w)) : PokeL(@viewport\height, neon_F32Int(h))
+  PokeL(@viewport\minDepth, 0) : PokeL(@viewport\maxDepth, #NEON_VK_CHROME_F_ONE)
+  faultCount = AnvilVkFaultCount()
+  vkCmdSetViewport(nvcCommand, 0, 1, @viewport)
+  If AnvilVkFaultCount() <> faultCount
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcViewportX = x : nvcViewportY = y
+  nvcViewportW = w : nvcViewportH = h
+  ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
 Procedure.i nvcClipXBits2(x2.i)
@@ -1927,8 +1959,17 @@ Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
-  sc\offset\x = nvcClipX : sc\offset\y = nvcClipY
-  sc\extent\width = nvcClipW : sc\extent\height = nvcClipH
+  ; Keep the default full-target path unchanged. A placed viewport maps the
+  ; logical scissor's two endpoints into the same physical rectangle.
+  If nvcViewportX = 0 And nvcViewportY = 0 And nvcViewportW = nvcPhysicalW And nvcViewportH = nvcPhysicalH
+    sc\offset\x = nvcClipX : sc\offset\y = nvcClipY
+    sc\extent\width = nvcClipW : sc\extent\height = nvcClipH
+  Else
+    sc\offset\x = nvcViewportX + (nvcClipX * nvcViewportW + nvcPhysicalW / 2) / nvcPhysicalW
+    sc\offset\y = nvcViewportY + (nvcClipY * nvcViewportH + nvcPhysicalH / 2) / nvcPhysicalH
+    sc\extent\width = nvcViewportX + ((nvcClipX + nvcClipW) * nvcViewportW + nvcPhysicalW / 2) / nvcPhysicalW - sc\offset\x
+    sc\extent\height = nvcViewportY + ((nvcClipY + nvcClipH) * nvcViewportH + nvcPhysicalH / 2) / nvcPhysicalH - sc\offset\y
+  EndIf
   vkCmdSetScissor(nvcCommand, 0, 1, @sc)
   vkCmdBindDescriptorSets(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipelineLayout, 0, 1, @setHandle, 0, 0)
   nvcTint(colour, @push[0])
@@ -3305,6 +3346,7 @@ Procedure NeonVkChromeDestroy()
   nvcPhysical = 0 : nvcDevice = 0 : nvcQueue = 0 : nvcCommandPool = 0
   nvcRenderPass = 0 : nvcFramebuffer = 0 : nvcWidth = 0 : nvcHeight = 0
   nvcLogicalW = 0 : nvcLogicalH = 0 : nvcPhysicalW = 0 : nvcPhysicalH = 0 : nvcPitch = 0 : nvcRotation = 0
+  nvcViewportX = 0 : nvcViewportY = 0 : nvcViewportW = 0 : nvcViewportH = 0
   nvcMaxQuads = 0 : nvcMaxVertexQuads = 0 : nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
