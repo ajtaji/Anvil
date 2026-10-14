@@ -14,7 +14,11 @@ Structure NeonVkBannerArgs
   glintY.i
 EndStructure
 
+; Counter ticks spent in the banner's text and in its logo, summed since vkstat last read them.
+Global gVkBanTicksText.i, gVkBanTicksLogo.i
+
 Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
+  Define tb0.i, tb1.i
   Define rc.i, logoX.i, logoY.i, labelX.i, titleX.i
   Define clockX.i, clockRight.i, titleWidth.i, buildWidth.i, labelWidth.i
   Define steel.i, warm.i, faint.i
@@ -29,6 +33,7 @@ Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
   faint = Neon_RGB(120, 132, 150)
   rc = NeonVkChromeBox(0, 0, *args\width, 120, Neon_RGB(0, 0, 40))
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
+  tb0 = Ticks()
   rc = Neon_Text(#NEON_FONT_BOLD, 26, 12, "PureMetal", steel)
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
   titleWidth = Neon_TextWidth(#NEON_FONT_BOLD, "PureMetal ")
@@ -61,7 +66,9 @@ Procedure.i NeonVkBannerRender(*args.NeonVkBannerArgs)
   logoX = *args\width - *args\logoWidth - 12
   If logoX < 0 : logoX = 0 : EndIf
   logoY = 12
+  tb1 = Ticks() : gVkBanTicksText = gVkBanTicksText + (tb1 - tb0)
   rc = NeonVkChromeLogo(logoX, logoY)
+  gVkBanTicksLogo = gVkBanTicksLogo + (Ticks() - tb1)
   If rc <> #NEON_VK_CHROME_OK : ProcedureReturn rc : EndIf
   labelX = logoX + (*args\logoWidth - labelWidth) / 2
   rc = Neon_Text(#NEON_FONT_SMALL, labelX, logoY + *args\logoHeight + 6, "A N V I L", warm)
