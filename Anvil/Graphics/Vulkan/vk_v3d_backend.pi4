@@ -1819,6 +1819,11 @@ EndProcedure
 ; Consume one portable closed list as one hardware transaction. The arena is
 ; an ordinary internal heap allocation, so it is visible to the same overlap
 ; tracker as application memory and is returned on every exit path.
+; WHERE A DRAW LIST'S TIME GOES (2026-10-14, for the 60 fps work), microseconds at: 0 the start,
+; 1 the closed list checked, 2 every draw's slot record built, 3 the cache cleaned, 4 the control list
+; written, 5 the GPU's frame finished (NeonHardwareFrameEnd: kick and wait). Read by a payload.
+Global Dim avkV3dProf.i[8]
+
 Procedure.i avkBackendSubmitDraw(*payload)
   Define *list.AnvilVkBackendDrawList
   Define *first.AnvilVkBackendDraw
@@ -1870,6 +1875,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
 
   avkV3dNative = 0
   avkV3dCacheIntervalCount = 0
+  avkV3dProf[0] = Micros()
   If *payload = 0 : ProcedureReturn -1 : EndIf
   *list = *payload
   If *list\drawCount < 1 Or *list\drawCount > #ANVIL_VK_MAX_RECORDED_DRAWS Or *list\draws = 0
@@ -1893,6 +1899,7 @@ Procedure.i avkBackendSubmitDraw(*payload)
     If *d\kind = #ANVIL_VK_RENDER_OP_CLEAR_RECT Or *d\sampleMask <> 0 : liveDraws = liveDraws + 1 : EndIf
     draw = draw + 1
   Wend
+  avkV3dProf[1] = Micros()
   packetBytes = avkV3dListPacketBytes(*list)
   If packetBytes < 0 Or Neon_BclBytes() <= 8192 Or packetBytes > (Neon_BclBytes() - 8192)
     avkV3dNative = #VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -1979,8 +1986,10 @@ Procedure.i avkBackendSubmitDraw(*payload)
       EndIf
       draw = draw + 1
     Wend
+    avkV3dProf[2] = Micros()
     cacheInputRanges = avkV3dCacheIntervalCount
     vertexCacheRanges = avkV3dCleanCacheIntervals()
+    avkV3dProf[3] = Micros()
     If vertexCacheRanges < 0
       avkInternalFree(arenaMem)
       avkV3dNative = #ANVIL_VK_ERR_STATE
@@ -2090,7 +2099,9 @@ Procedure.i avkBackendSubmitDraw(*payload)
   ; V3dBclFinish refuses an errored list before submit. Calling End after an
   ; emitter error also clears Neon's in-frame latch so restoration is reliable.
   If began <> 0
+    avkV3dProf[4] = Micros()
     endRc = NeonHardwareFrameEnd()
+    avkV3dProf[5] = Micros()
     If rc = #NEON_OK : rc = endRc : EndIf
   EndIf
   If rc <> #NEON_OK : avkV3dNative = rc : EndIf
