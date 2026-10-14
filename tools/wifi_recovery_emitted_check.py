@@ -49,7 +49,7 @@ def probe_source() -> str:
         "wifi_HexVal", "wifi_HexDigit", "wifi_ByteToHex", "wifi_U32ToHex",
         "wifi_HexToU32", "wifi_HexToBytes", "wifi_HexValid",
         "wifi_CandidateFinish", "wifi_AssocHandshake", "wifi_AssocProgress",
-        "wifi_AssocEvent", "wifi_TrySlot", "wifi_ServiceEapol",
+        "wifi_AssocEvent", "wifi_TrySlot", "wifi_ServiceEapol", "wifi_PtkRekeyFinish",
         "WifiRecoveryCancel", "WifiRecoveryActive", "WifiRecoveryInitialJoinFailed",
         "wifi_RecoverForgetPmk",
         "wifi_RecoverCandidateFail", "wifi_RecoverFail",
@@ -124,6 +124,7 @@ Global gate_dropOnJoinPoll.i
 Global gate_receives.i
 Global gate_eapolCode.i
 Global gate_eapolAfter.i
+Global gate_m3Repeats.i
 Global gate_eapolHandles.i
 Global gate_sendRc.i
 Global gate_sendCalls.i
@@ -277,7 +278,7 @@ Procedure WifiRec(code.i, a.i, b.i) : gate_recEvents = gate_recEvents + 1 : EndP
 Procedure.i WifiRecSave(*why, *counters) : gate_recSaves = gate_recSaves + 1 : ProcedureReturn 1 : EndProcedure
 #WIFI_EP_SAVE_EVERY = 10
 #WIFI_EP_RESET_AFTER = 8
-Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i, gWifiLastChan.i
 Procedure.i wifi_EpCounters() : ProcedureReturn 0 : EndProcedure
 Procedure wifi_EpFail(code.i, a.i, b.i, *why) : WifiRec(code, a, b) : If gWifiEp = 0 : gWifiEp = 1 : gWifiEpFails = 0 : gWifiEpReset = 0 : WifiRecSave(*why, 0) : EndIf : EndProcedure
 Procedure wifi_EpRecovered() : WifiRec(#WR_REC_OK, 0, gWifiEpFails) : If gWifiEp <> 0 : gWifiEp = 0 : WifiRecSave(0, 0) : EndIf : EndProcedure
@@ -347,6 +348,15 @@ Procedure.i Wpa2SupHandle(p.i, n.i)
   Define code.i
   code = gate_eapolCode : gate_eapolHandles = gate_eapolHandles + 1
   If gate_eapolAfter <> 0 : gate_eapolCode = gate_eapolAfter : EndIf
+  ; After message 3 the access point is quiet unless the case asks it to
+  ; re-send message 3 (gate_m3Repeats more times).
+  If code = #WPA2SUP_SENT_M4
+    If gate_m3Repeats > 0
+      gate_m3Repeats = gate_m3Repeats - 1 : gate_eapolCode = #WPA2SUP_SENT_M4
+    Else
+      gate_eapolCode = 0 : gate_eapolAfter = 0
+    EndIf
+  EndIf
   ProcedureReturn code
 EndProcedure
 Procedure.i Wpa2SupPeekPtkM1(p.i, n.i) : ProcedureReturn gate_peekPtkM1 : EndProcedure
@@ -393,7 +403,7 @@ Procedure GateInit()
   gate_pbkdfPw = 0 : gate_pbkdfBegins = 0 : gate_pbkdfBeginRc = #PBKDF2_STEP_RUNNING : gate_cacheHit = 1 : gate_passwordUseAlt = 0
   gate_scanPolls = 0 : gate_scanVerdict = #CYW43_SCAN_DONE
   gate_joinPolls = 0 : gate_joinVerdict = #CYW43_JOIN_JOINED : gate_dropOnJoinPoll = 0
-  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = 0 : gate_eapolHandles = 0
+  gate_receives = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = 0 : gate_m3Repeats = 0 : gWifiPtkPend = 0 : gWifiPtkPendAt = 0 : gate_eapolHandles = 0
   gate_sendRc = 0 : gate_sendCalls = 0
   gate_sessionCode = 0 : gate_sessionArms = 0 : gate_ptkRc = 0 : gate_gtkRc = 0 : gate_progress = 0
   gate_dhcpStart = 0 : gate_dhcpRc = 1 : gate_dhcpAcquire = 0 : gate_leave = 0 : gate_leaveRc = 0
@@ -484,8 +494,23 @@ Procedure.i Main()
   WifiRecoveryTick()
   If gate_receives <> 1 Or gWifiRecM1 <> 1 Or gWifiRecPhase <> #WIFI_REC_EAPOL_RX : ProcedureReturn 8 : EndIf
   gate_service = gate_service + 1 : gate_eapolCode = #WPA2SUP_SENT_M4
+  gate_m3Repeats = 1
   WifiRecoveryTick()
-  If gate_receives <> 2 Or gWifiRecPhase <> #WIFI_REC_PTK_INSTALL : ProcedureReturn 9 : EndIf
+  ; Message 4 is out, but no key may go in yet: the settle window holds it.
+  If gate_receives <> 2 Or gWifiRecPhase <> #WIFI_REC_M4_SETTLE Or gate_setKey <> 0 : ProcedureReturn 9 : EndIf
+  ; The access point re-sends message 3: message 4 again, window restarts.
+  gate_ms = gate_ms + 1000
+  i = gate_sendCalls
+  WifiRecoveryTick()
+  If gate_sendCalls <> i + 1 Or gWifiRecPhase <> #WIFI_REC_M4_SETTLE Or gate_setKey <> 0 Or gWifiRecAt <> gate_ms : ProcedureReturn 107 : EndIf
+  ; Quiet, but inside the restarted window: still no key.
+  gate_ms = gate_ms + 1000
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_M4_SETTLE Or gate_setKey <> 0 Or gate_sendCalls <> i + 1 : ProcedureReturn 108 : EndIf
+  ; The window ends with the access point quiet: now the keys.
+  gate_ms = gate_ms + 300
+  WifiRecoveryTick()
+  If gWifiRecPhase <> #WIFI_REC_PTK_INSTALL Or gate_setKey <> 0 : ProcedureReturn 109 : EndIf
 
   ; PTK and GTK installation are separate firmware-control phases.
   WifiRecoveryTick()
@@ -804,6 +829,9 @@ Procedure.i Main()
     If gWifiRecPhase = #WIFI_REC_QUIET Or gWifiRecPhase = #WIFI_REC_JOIN_QUIET
       gate_ms = gate_ms + #WIFI_REC_QUIET_MS
     EndIf
+    If gWifiRecPhase = #WIFI_REC_M4_SETTLE
+      gate_ms = gate_ms + #WIFI_M4_SETTLE_MS
+    EndIf
     If gWifiRecPhase = #WIFI_REC_EAPOL_RX
       If gWifiRecM1 = 0 : gate_eapolCode = #WPA2SUP_SENT_M2 : Else : gate_eapolCode = #WPA2SUP_SENT_M4 : EndIf
     EndIf
@@ -826,7 +854,8 @@ Procedure.i Main()
   If turns < 20 : ProcedureReturn 27 : EndIf
   If gate_service <> turns : ProcedureReturn 28 : EndIf
   If gate_leave <> 1 Or gate_scanPolls <> 1 Or gate_disassoc <> 1 Or gate_joinStart <> 1 : ProcedureReturn 24 : EndIf
-  If gate_joinPolls <> 1 Or gate_readSsid <> 1 Or gate_receives <> 2 Or gate_setKey <> 2 : ProcedureReturn 25 : EndIf
+  ; M1, M3, then one quiet read in the message-4 settle window.
+  If gate_joinPolls <> 1 Or gate_readSsid <> 1 Or gate_receives <> 3 Or gate_setKey <> 2 : ProcedureReturn 25 : EndIf
   If gate_dhcpStart <> 1 Or gate_dhcpAcquire <> 0 Or gWifiRejoins <> 1 Or gWifiHaveIp = 0 : ProcedureReturn 26 : EndIf
 
   ; Foreground handshake sends are state transitions, not narration. A refused
@@ -856,15 +885,38 @@ Procedure.i Main()
   If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M4_TX Or gWifiEapolRecoverRc <> -10 : ProcedureReturn 87 : EndIf
   If gate_setKey <> 0 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 87 : EndIf
 
+  ; A PTK rekey's message 4 goes out under the CURRENT key and the new keys
+  ; wait out #WIFI_M4_SETTLE_MS: nothing is installed by the receive itself.
   GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4 : gate_ptkRc = -11
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gate_sendCalls <> 1 Or gate_setKey <> 0 Or gWifiPtkPend <> 1 Or gWifiPtkPendAt <> gate_ms : ProcedureReturn 110 : EndIf
+  ; A re-sent message 3 inside the window: message 4 again, window restarts.
+  gate_ms = gate_ms + 900
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gate_sendCalls <> 2 Or gate_setKey <> 0 Or gWifiPtkPend <> 1 Or gWifiPtkPendAt <> gate_ms : ProcedureReturn 111 : EndIf
+  wifi_PtkRekeyFinish()
+  If gWifiPtkPend <> 0 : ProcedureReturn 88 : EndIf
   If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_PTK Or gWifiEapolRecoverRc <> -11 : ProcedureReturn 88 : EndIf
   If gate_setKey <> 1 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 88 : EndIf
 
   GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4 : gate_gtkRc = -12
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  wifi_PtkRekeyFinish()
   If gWifiEapolRecoverStage <> #WIFI_EAPOL_FAIL_REKEY_M4_GTK Or gWifiEapolRecoverRc <> -12 : ProcedureReturn 89 : EndIf
   If gate_setKey <> 2 Or gate_sessionArms <> 0 Or gWifiPtkKeyed <> 0 : ProcedureReturn 89 : EndIf
+
+  ; A new rekey message 1 while message 4's keys still wait cancels them:
+  ; they belong to the handshake the access point has just abandoned.
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  gate_sessionCode = #WPA2SUP_SENT_M2
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  If gWifiPtkPend <> 0 Or gate_setKey <> 0 : ProcedureReturn 112 : EndIf
+  ; The success path: the finisher installs both and re-arms the session.
+  GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4
+  wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  wifi_PtkRekeyFinish()
+  If gate_setKey <> 2 Or gate_sessionArms <> 1 Or gWifiPtkKeyed <> 1 Or gWifiPtkPend <> 0 : ProcedureReturn 113 : EndIf
 
   GateInit() : gate_sessionCode = #WPA2SUP_SENT_G2 : gate_gtkRc = -13
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
@@ -879,6 +931,7 @@ Procedure.i Main()
   ; A complete M4/G2 remains the only route to success counters/session arm.
   GateInit() : gate_sessionCode = #WPA2SUP_SENT_M4
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
+  wifi_PtkRekeyFinish()
   If gate_setKey <> 2 Or gate_sessionArms <> 1 Or gWifiPtkKeyed <> 1 Or gWifiEapolRecover <> 0 : ProcedureReturn 92 : EndIf
   GateInit() : gate_sessionCode = #WPA2SUP_SENT_G2
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
@@ -924,6 +977,12 @@ Procedure.i Main()
   wifi_ServiceEapol(@gateCache[0], #WPA2_FRAME_MIN)
   If gate_snonceSets <> 1 Or gate_sessionHandles <> 1 Or gate_sendCalls <> 1 : ProcedureReturn 98 : EndIf
   If gWifiEapolRecover <> 0 Or gWifiEapolErr <> 0 : ProcedureReturn 98 : EndIf
+
+  ; The join: the access point re-sends message 3 once (our message 4 was
+  ; lost). Message 4 goes out again and the keys go in once, afterwards.
+  GateInit() : gate_autoMs = 1 : gate_eapolCode = #WPA2SUP_SENT_M2 : gate_eapolAfter = #WPA2SUP_SENT_M4 : gate_m3Repeats = 1
+  If wifi_Handshake() = 0 : ProcedureReturn 114 : EndIf
+  If gate_sendCalls <> 3 Or gate_setKey <> 2 Or gate_sessionArms <> 1 : ProcedureReturn 114 : EndIf
 
   ; Exercise the actual foreground candidate path. The cached PMK belongs to
   ; TrySlot across both attempts: a refused first M2 may not make the second
@@ -1121,7 +1180,7 @@ def main() -> int:
         print(f"wifi_recovery_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     print(
-        "wifi_recovery_emitted_check: PASS - 106 assertions, "
+        "wifi_recovery_emitted_check: PASS - 114 assertions, "
         f"{steps:,} A64 instructions; candidate-owner/cache/send mutants rejected"
     )
     return 0
