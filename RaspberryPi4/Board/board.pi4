@@ -1184,7 +1184,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 257        ; pmf:build
+#ANVIL_BUILD = 260        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1193,7 +1193,7 @@ StackAddress $8000000
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
 #ANVIL_BUILD_DATE = 20261014   ; pmf:builddate
-#ANVIL_BUILD_TIME = 091211     ; pmf:buildtime
+#ANVIL_BUILD_TIME = 103846     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -1476,6 +1476,7 @@ XIncludeFile "RaspberryPi4/Lib/usbmsc.pi4"
 ; linked above for the boot stick, so this costs one library and no new
 ; hardware bring-up.
 XIncludeFile "RaspberryPi4/Lib/hid.pi4"
+XIncludeFile "RaspberryPi4/Lib/usbserial.pi4"      ; a GNSS receiver on USB: CDC-ACM and the bridge chips
 XIncludeFile "RaspberryPi4/Lib/emmc.pi4"
 XIncludeFile "RaspberryPi4/Lib/fat.pi4"
 ; THE HAL FOUNDATION - the capability gate (RequireCap) and the portable
@@ -1814,9 +1815,12 @@ CompilerEndIf
 ; board not having the hardware, and a payload that can tell them apart
 ; can say which one it is looking at. Phase A item 2c writes the seam and
 ; the slots start answering; nothing here changes when it does.
-#CAP_GNSS     = 0   ; NO BACKEND YET, and no receiver on the bench. The UBX
-                    ; decoder exists as an AVR example and has to be lifted
-                    ; into a Lib; Phase A item 2b.
+#CAP_GNSS     = 1   ; 2026-10-14: a receiver on USB (CDC-ACM, and the FTDI,
+                    ; Prolific, Silicon Labs and WCH bridges GNSS Bridge
+                    ; accepts) through Lib/usbserial.pi4, framed and decoded
+                    ; by Anvil/Services/gnss.pbi (GNSS Bridge's framer and
+                    ; fix rules), seam Board/hw_gnss.pi4. Bluetooth, BLE and
+                    ; network sources are named placeholders. No PPS input.
 #CAP_UART     = 0   ; NO BACKEND YET. The part has spare PL011s, but WHICH
                     ; one is free depends on what else the board is using,
                     ; and that decision belongs in a backend that also names
@@ -2212,6 +2216,9 @@ XIncludeFile "Anvil/Core/crypto_cmd.pbi"
 ;                 below pmfboot.pi4 breaks the build at PmfEnter - loudly,
 ;                 which is the right failure.
 XIncludeFile "RaspberryPi4/Board/hw_board.pi4"
+XIncludeFile "Anvil/Services/gnss.pbi"            ; sources, GNSS Bridge's framer, the fix
+XIncludeFile "RaspberryPi4/Board/hw_gnss.pi4"     ; the HwGnss* seam (Phase A item 2b)
+XIncludeFile "Anvil/Core/gnss_cmd.pbi"
 XIncludeFile "RaspberryPi4/Board/hw_con.pi4"
 XIncludeFile "Anvil/Hal/abi_version.pbi"
 ; BCM2712: the HwClock* backend over the firmware RTC; abi.pbi's SvcUtc and
@@ -3300,6 +3307,8 @@ Procedure Main()
       CmdI2c()
     ElseIf WordIs("bt") <> 0
       CmdBt()
+    ElseIf WordIs("gnss") <> 0
+      CmdGnss()
 
     ; touch - the DSI panel's touch controller and its power MCU. A whole
     ; word only; t is not free, and this family is not worth a letter

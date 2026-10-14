@@ -1,0 +1,273 @@
+; ======================================================================
+;  usbserial.pi4 - a GNSS receiver (or any serial device) on USB.
+;
+;  WHICH DEVICES. The ones GNSS Bridge's Android app accepts as a receiver
+;  (GpsService.kt, knownGpsVids), so a receiver that works there works here:
+;    CDC-ACM      any device with a CDC data interface (class $0A) - u-blox
+;                 ($1546) and most modern receivers. Baud is the device's own
+;                 business on a native USB port; it is set anyway.
+;    FTDI         $0403  FT232R/FT-X and kin. Every IN packet starts with two
+;                 modem-status bytes, which the pipe takes out (XhciSerialSetStrip).
+;    PROLIFIC     $067B  PL2303. A vendor wake-up sequence, then CDC-style
+;                 line coding on interface 0.
+;    SILICON LABS $10C4  CP210x. Vendor requests: enable, baud, 8N1, lines.
+;    WCH          $1A86  CH340/CH341. Vendor registers for baud and line.
+;  Only CDC-ACM has been run on silicon here (a u-blox 1546:01A9, 2026-10-14).
+;  The four bridge chips follow the published sequences of the open driver
+;  the Android app uses (usb-serial-for-android 3.8) and have NOT been run on
+;  a board: no such chip is on the bench. Their first real test is owed, and
+;  UsbSerKindText() says "not proven" beside their names until it is done.
+;
+;  WHAT THIS FILE IS NOT. The transport is xhci.pi4's serial pipe (rings 11
+;  and 12, read without waiting); this file finds the device, picks its
+;  endpoints, sets its line and strips what a chip adds. It never waits for
+;  data. THIS FILE NAMES NO OTHER FILE (house rule): the board includes
+;  xhci.pi4 before it.
+; ======================================================================
+
+#USBSER_NONE     = 0
+#USBSER_CDC      = 1
+#USBSER_FTDI     = 2
+#USBSER_PL2303   = 3
+#USBSER_CP210X   = 4
+#USBSER_CH34X    = 5
+
+#USBSER_CFG_MAX = 512
+Global Dim usbser_cfg.a[#USBSER_CFG_MAX]
+Global Dim usbser_dev.a[32]
+Global Dim usbser_tmp.a[16]
+Global usbser_kind.i, usbser_slot.i, usbser_vid.i, usbser_pid.i, usbser_iface.i, usbser_baud.i
+Global usbser_epIn.i, usbser_epOut.i, usbser_mpsIn.i, usbser_mpsOut.i, usbser_err.i
+
+Procedure.i UsbSerKind()  : ProcedureReturn usbser_kind : EndProcedure
+Procedure.i UsbSerSlot()  : ProcedureReturn usbser_slot : EndProcedure
+Procedure.i UsbSerVid()   : ProcedureReturn usbser_vid  : EndProcedure
+Procedure.i UsbSerPid()   : ProcedureReturn usbser_pid  : EndProcedure
+Procedure.i UsbSerBaud()  : ProcedureReturn usbser_baud : EndProcedure
+Procedure.i UsbSerError() : ProcedureReturn usbser_err  : EndProcedure
+
+; The chip as words, and whether it has been proven on silicon.
+Procedure.i UsbSerKindText(kind.i)
+  Select kind
+    Case #USBSER_CDC    : ProcedureReturn "CDC-ACM"
+    Case #USBSER_FTDI   : ProcedureReturn "FTDI (not proven on a board)"
+    Case #USBSER_PL2303 : ProcedureReturn "Prolific PL2303 (not proven on a board)"
+    Case #USBSER_CP210X : ProcedureReturn "Silicon Labs CP210x (not proven on a board)"
+    Case #USBSER_CH34X  : ProcedureReturn "WCH CH34x (not proven on a board)"
+  EndSelect
+  ProcedureReturn "none"
+EndProcedure
+
+; Does the chip need its baud set to the receiver's? (A native USB port does not.)
+Procedure.i UsbSerNeedsBaud()
+  If usbser_kind = #USBSER_NONE Or usbser_kind = #USBSER_CDC
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i usbser_Out(rt.i, req.i, val.i, idx.i, *src, len.i)
+  ProcedureReturn XhciControlOut(rt, req, val, idx, *src, len)
+EndProcedure
+
+Procedure.i usbser_In(rt.i, req.i, val.i, idx.i, len.i)
+  Define n.i
+  n = XhciControlIn(rt, req, val, idx, len)
+  If n > 0 : XhciCopyIn(@usbser_tmp[0], n) : EndIf
+  ProcedureReturn n
+EndProcedure
+
+; CDC SET_LINE_CODING on interface `iface`: baud, 1 stop, no parity, 8 bits.
+Procedure.i usbser_LineCoding(iface.i, baud.i)
+  PokeA(@usbser_tmp[0], baud & 255) : PokeA(@usbser_tmp[1], (baud >> 8) & 255)
+  PokeA(@usbser_tmp[2], (baud >> 16) & 255) : PokeA(@usbser_tmp[3], (baud >> 24) & 255)
+  PokeA(@usbser_tmp[4], 0) : PokeA(@usbser_tmp[5], 0) : PokeA(@usbser_tmp[6], 8)
+  ProcedureReturn usbser_Out($21, $20, 0, iface, @usbser_tmp[0], 7)
+EndProcedure
+
+; FTDI's baud divisor on a 3 MHz base, for the rates a GNSS receiver uses
+; (the table FTDI's AN232B-05 gives; value = wValue, index high byte = 0).
+Procedure.i usbser_FtdiDivisor(baud.i)
+  Select baud
+    Case 4800   : ProcedureReturn $0271
+    Case 9600   : ProcedureReturn $4138
+    Case 19200  : ProcedureReturn $809C
+    Case 38400  : ProcedureReturn $C04E
+    Case 57600  : ProcedureReturn $0034
+    Case 115200 : ProcedureReturn $001A
+    Case 230400 : ProcedureReturn $000D
+    Case 460800 : ProcedureReturn $4006
+  EndSelect
+  ProcedureReturn -1
+EndProcedure
+
+; Sets the line's baud on the chip found. 1, or 0 when the chip refused it or
+; the rate is not one this file knows for that chip.
+Procedure.i UsbSerSetBaud(baud.i)
+  Define prev.i, ok.i, d.i, v1.i, v2.i
+  If usbser_kind = #USBSER_NONE
+    ProcedureReturn 0
+  EndIf
+  prev = XhciSlot()
+  If XhciUseSlot(usbser_slot) = 0
+    ProcedureReturn 0
+  EndIf
+  ok = 0
+  Select usbser_kind
+    Case #USBSER_CDC
+      If usbser_LineCoding(usbser_iface, baud) >= 0 : ok = 1 : EndIf
+    Case #USBSER_PL2303
+      If usbser_LineCoding(usbser_iface, baud) >= 0 : ok = 1 : EndIf
+    Case #USBSER_FTDI
+      d = usbser_FtdiDivisor(baud)
+      If d >= 0
+        If usbser_Out($40, 3, d, 0, 0, 0) >= 0 : ok = 1 : EndIf
+      EndIf
+    Case #USBSER_CP210X
+      PokeA(@usbser_tmp[0], baud & 255) : PokeA(@usbser_tmp[1], (baud >> 8) & 255)
+      PokeA(@usbser_tmp[2], (baud >> 16) & 255) : PokeA(@usbser_tmp[3], (baud >> 24) & 255)
+      If usbser_Out($41, $1E, 0, usbser_iface, @usbser_tmp[0], 4) >= 0 : ok = 1 : EndIf
+    Case #USBSER_CH34X
+      v1 = -1
+      Select baud
+        Case 2400   : v1 = $D901 : v2 = $0038
+        Case 4800   : v1 = $6402 : v2 = $001F
+        Case 9600   : v1 = $B202 : v2 = $0013
+        Case 19200  : v1 = $D902 : v2 = $000D
+        Case 38400  : v1 = $6403 : v2 = $000A
+        Case 115200 : v1 = $CC03 : v2 = $0008
+      EndSelect
+      If v1 >= 0
+        If usbser_Out($40, $9A, $1312, v1, 0, 0) >= 0 And usbser_Out($40, $9A, $0F2C, v2, 0, 0) >= 0 : ok = 1 : EndIf
+      EndIf
+  EndSelect
+  If prev > 0 : XhciUseSlot(prev) : EndIf
+  If ok <> 0 : usbser_baud = baud : EndIf
+  ProcedureReturn ok
+EndProcedure
+
+; The chip's own set-up after its endpoints are configured. 1 or 0.
+Procedure.i usbser_Init()
+  Define ok.i, i.i
+  ok = 1
+  Select usbser_kind
+    Case #USBSER_CDC
+      usbser_LineCoding(usbser_iface, 9600)                  ; ignored by a native port, harmless
+      usbser_Out($21, $22, $0003, usbser_iface, 0, 0)        ; DTR and RTS on: some receivers wait for DTR
+    Case #USBSER_FTDI
+      usbser_Out($40, 0, 0, 0, 0, 0)                         ; reset
+      usbser_Out($40, 1, $0303, 0, 0, 0)                     ; DTR and RTS on
+      usbser_Out($40, 2, 0, 0, 0, 0)                         ; no flow control
+      usbser_Out($40, 4, $0008, 0, 0, 0)                     ; 8 bits, no parity, 1 stop
+    Case #USBSER_PL2303
+      ; the vendor wake-up the open driver sends, reads and writes in this order
+      usbser_In($C0, 1, $8484, 0, 1) : usbser_Out($40, 1, $0404, 0, 0, 0)
+      usbser_In($C0, 1, $8484, 0, 1) : usbser_In($C0, 1, $8383, 0, 1)
+      usbser_In($C0, 1, $8484, 0, 1) : usbser_Out($40, 1, $0404, 1, 0, 0)
+      usbser_In($C0, 1, $8484, 0, 1) : usbser_In($C0, 1, $8383, 0, 1)
+      usbser_Out($40, 1, 0, 1, 0, 0) : usbser_Out($40, 1, 1, 0, 0, 0) : usbser_Out($40, 1, 2, $44, 0, 0)
+      usbser_Out($21, $22, $0003, 0, 0, 0)
+    Case #USBSER_CP210X
+      usbser_Out($41, $00, $0001, usbser_iface, 0, 0)        ; IFC_ENABLE
+      usbser_Out($41, $03, $0800, usbser_iface, 0, 0)        ; SET_LINE_CTL: 8 bits, no parity, 1 stop
+      usbser_Out($41, $07, $0303, usbser_iface, 0, 0)        ; SET_MHS: DTR and RTS on
+    Case #USBSER_CH34X
+      usbser_In($C0, $5F, 0, 0, 2)                           ; the chip's version
+      usbser_Out($40, $A1, 0, 0, 0, 0)                       ; serial init
+      usbser_Out($40, $9A, $2518, $00C3, 0, 0)               ; LCR: receive and send on, 8 bits
+      usbser_Out($40, $A4, (~$60) & $FF, 0, 0, 0)            ; DTR and RTS on (active low)
+  EndSelect
+  ProcedureReturn ok
+EndProcedure
+
+; Looks at every addressed device except the storage device and the hub for
+; one this file can drive, and brings the first one up. 1, or 0 with
+; UsbSerError(): 1 nothing found, 2 its descriptors could not be read,
+; 3 no bulk pair, 4 SET_CONFIGURATION refused, 5 the endpoints refused.
+Procedure.i UsbSerFind()
+  Define slot.i, prev.i, n.i, off.i, len.i, ty.i, cfgVal.i, cls.i, ifn.i, curIf.i, curCls.i
+  Define dataIf.i, commIf.i, epIn.i, epOut.i, mpsIn.i, mpsOut.i, kind.i, a.i, attr.i, mps.i, total.i
+  usbser_err = 1 : usbser_kind = #USBSER_NONE
+  prev = XhciSlot()
+  For slot = 1 To 8
+    If slot = XhciBulkReady() Or slot = XhciHubSlot() Or slot = XhciSerialSlot() : Continue : EndIf
+    If XhciUseSlot(slot) = 0 : Continue : EndIf
+    n = XhciGetDeviceDescriptor(@usbser_dev[0], 18)
+    If n < 18 : Continue : EndIf
+    usbser_vid = usbser_dev[8] | (usbser_dev[9] << 8) : usbser_pid = usbser_dev[10] | (usbser_dev[11] << 8)
+    cls = usbser_dev[4]
+    kind = #USBSER_NONE
+    If usbser_vid = $0403 : kind = #USBSER_FTDI : EndIf
+    If usbser_vid = $067B : kind = #USBSER_PL2303 : EndIf
+    If usbser_vid = $10C4 : kind = #USBSER_CP210X : EndIf
+    If usbser_vid = $1A86 : kind = #USBSER_CH34X : EndIf
+    ; the configuration: interfaces and their endpoints
+    total = UsbGetConfiguration(@usbser_cfg[0], #USBSER_CFG_MAX)
+    If total < 9
+      usbser_err = 2 : Continue
+    EndIf
+    If total > #USBSER_CFG_MAX : total = #USBSER_CFG_MAX : EndIf
+    cfgVal = usbser_cfg[5]
+    dataIf = -1 : commIf = -1 : epIn = 0 : epOut = 0 : curIf = -1 : curCls = -1
+    off = 0
+    While off + 2 <= total
+      len = usbser_cfg[off] : ty = usbser_cfg[off + 1]
+      If len < 2 : Break : EndIf
+      If ty = 4 And off + 9 <= total
+        curIf = usbser_cfg[off + 2] : curCls = usbser_cfg[off + 5]
+        If curCls = $02 And commIf < 0 : commIf = curIf : EndIf
+      ElseIf ty = 5 And off + 7 <= total
+        a = usbser_cfg[off + 2] : attr = usbser_cfg[off + 3] & 3 : mps = usbser_cfg[off + 4] | (usbser_cfg[off + 5] << 8)
+        ; the bulk pair: on a CDC device the data interface's ($0A); on a bridge chip the first
+        If attr = 2 And (curCls = $0A Or (kind <> #USBSER_NONE And dataIf < 0) Or dataIf = curIf)
+          If (a & $80) <> 0 And epIn = 0 : epIn = a : mpsIn = mps & $7FF : dataIf = curIf : EndIf
+          If (a & $80) = 0 And epOut = 0 : epOut = a : mpsOut = mps & $7FF : dataIf = curIf : EndIf
+        EndIf
+      EndIf
+      off = off + len
+    Wend
+    If kind = #USBSER_NONE And dataIf >= 0 And epIn <> 0 And epOut <> 0 And commIf >= 0
+      kind = #USBSER_CDC
+    EndIf
+    If kind = #USBSER_NONE : Continue : EndIf
+    If epIn = 0 Or epOut = 0
+      usbser_err = 3 : Continue
+    EndIf
+    If XhciSetConfiguration(cfgVal) = 0
+      usbser_err = 4 : Continue
+    EndIf
+    If XhciSerialConfigure(slot, epOut, mpsOut, epIn, mpsIn) = 0
+      usbser_err = 5 : Continue
+    EndIf
+    usbser_kind = kind : usbser_slot = slot
+    usbser_epIn = epIn : usbser_epOut = epOut : usbser_mpsIn = mpsIn : usbser_mpsOut = mpsOut
+    usbser_iface = dataIf
+    If kind = #USBSER_CDC : usbser_iface = commIf : EndIf
+    If kind = #USBSER_FTDI : XhciSerialSetStrip(2) : EndIf     ; every packet starts with two status bytes
+    usbser_Init()
+    If prev > 0 : XhciUseSlot(prev) : EndIf
+    usbser_err = 0
+    ProcedureReturn 1
+  Next
+  If prev > 0 : XhciUseSlot(prev) : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Services the pipe without waiting, then up to max of the receiver's bytes
+; into *dst (an FTDI chip's status bytes already taken out by the pipe).
+; Answers the bytes given, or -1 when no device is up.
+Procedure.i UsbSerRead(*dst, max.i)
+  If usbser_kind = #USBSER_NONE
+    ProcedureReturn -1
+  EndIf
+  XhciSerialPoll()
+  ProcedureReturn XhciSerialRead(*dst, max)
+EndProcedure
+
+; Sends len bytes to the receiver (its configuration messages). len or -1.
+Procedure.i UsbSerWrite(*src, len.i)
+  If usbser_kind = #USBSER_NONE
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn XhciSerialWrite(*src, len)
+EndProcedure

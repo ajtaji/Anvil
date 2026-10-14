@@ -1,0 +1,44 @@
+; ======================================================================
+;  hw_gnss.pi4 - the HwGnss* seam (Anvil/Hal/hal.pbi) on the Pi 4 and 5.
+;
+;  Phase A item 2b. The receiver is reached through Anvil/Services/gnss.pbi,
+;  which reads it from a source - USB today (Lib/usbserial.pi4: CDC-ACM and
+;  the four bridge chips GNSS Bridge accepts), Bluetooth, Bluetooth LE and
+;  the network as named placeholders - and frames and decodes its stream
+;  the way the GNSS Bridge Pico does.
+;
+;  HwGnssUp() opens USB. Choosing another source is GnssOpen(src); the
+;  placeholders answer with a sentence (HwGnssErrText) rather than nothing.
+;  There is no PPS input wired on this board, so HwGnssPpsTicks() is -1.
+; ======================================================================
+
+Procedure.i HwGnssUp()
+  If GnssSource() <> #GNSS_SRC_NONE
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn GnssOpen(#GNSS_SRC_USB)
+EndProcedure
+
+Procedure.i HwGnssPoll()
+  ProcedureReturn GnssPump()
+EndProcedure
+
+Procedure.i HwGnssFix(*fix)
+  ProcedureReturn GnssFix(*fix)
+EndProcedure
+
+Procedure.i HwGnssAgeMs()
+  ProcedureReturn GnssAgeMs()
+EndProcedure
+
+Procedure.i HwGnssPpsTicks()
+  ProcedureReturn -1
+EndProcedure
+
+Procedure.i HwGnssSatsUsed()
+  ProcedureReturn GnssSatsUsed()
+EndProcedure
+
+Procedure.i HwGnssErrText()
+  ProcedureReturn GnssWhy()
+EndProcedure
