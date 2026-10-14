@@ -454,6 +454,10 @@
 ; 192 and not one existing index moves.
 #SVC_BASE_PAR     = 184
 
+; NEW AT 1.4. Several files open at once - see GROUP 16 below. Eight
+; reserved, four used; entry_count rises 192 to 200.
+#SVC_BASE_FILEH   = 192
+
 ; ======================================================================
 ;  THE TABLE ITSELF.
 ;
@@ -1504,6 +1508,10 @@ CompilerEndIf
 ;  A straight re-export of the existing HwFile* seam. NO NEW SEMANTICS,
 ;  with the single exception of SvcFileAppend - see slot 55.
 ; ======================================================================
+; The handle the one-file engine currently has open for the handle group (base 192), 0 = none.
+; Declared here because every slot below that moves the engine clears it.
+Global gSvcFhCurrent.i
+
 Procedure.i SvcStorageUp()
   If SvcRequireCap(#CAP_STORAGE, "storage", "this board offers Anvil no medium to read files from") = 0
     ProcedureReturn #SVC_ENOCAP
@@ -1519,6 +1527,7 @@ Procedure.i SvcFileOpen(*name)
     gSvcDetail = "the name pointer was zero"
     ProcedureReturn #SVC_EARG
   EndIf
+  gSvcFhCurrent = 0
   ProcedureReturn HwFileOpen(*name)
 EndProcedure
 
@@ -1541,6 +1550,7 @@ Procedure.i SvcFileReadAt(off.i, dst.i, n.i)
 EndProcedure
 
 Procedure.i SvcFileClose()
+  gSvcFhCurrent = 0
   HwFileClose()
   ProcedureReturn #SVC_OK
 EndProcedure
@@ -1560,6 +1570,7 @@ Procedure.i SvcFileWriteAll(*name, src.i, n.i)
     gSvcDetail = "a zero name or source pointer, or a negative length"
     ProcedureReturn #SVC_EARG
   EndIf
+  gSvcFhCurrent = 0
   ProcedureReturn HwFileWriteAll(*name, src, n)
 EndProcedure
 
@@ -1599,6 +1610,150 @@ Procedure.i SvcFileLastError()
   ProcedureReturn HwFileLastError()
 EndProcedure
 
+; ======================================================================
+;  GROUP 16 - FILE HANDLES, base 192. NEW AT 1.4.
+;
+;  The file group above is one file at a time: SvcFileOpen names it and
+;  the next three slots mean "that one". A program that reads a map, an
+;  index and a font cannot keep them straight through one name, and
+;  closing and reopening by hand is the same bug written three times.
+;
+;    slot 0  SvcFileHOpen(*name)             -> handle 1..8, or a #SVC_ error
+;    slot 1  SvcFileHSize(h)                 -> bytes
+;    slot 2  SvcFileHReadAt(h, off, dst, n)  -> bytes read
+;    slot 3  SvcFileHClose(h)                -> #SVC_OK
+;
+;  READ-ONLY. Writing stays with SvcFileWriteAll, which is all-or-nothing
+;  and takes a name.
+;
+;  HOW IT IS BUILT, AND WHAT THAT COSTS. The filesystem underneath still
+;  holds ONE open file. A handle is a remembered name and size; a read
+;  through a handle that is not the engine's current file closes that
+;  file and opens this one first. So the handles are real - eight files,
+;  any order - and a read that SWITCHES files pays one directory walk.
+;  Runs of reads from the same handle pay nothing. If that walk is ever
+;  measured to matter, the cure is an extent kept per handle, behind
+;  these same four slots, and no payload changes.
+;
+;  THE TWO GROUPS SHARE THE ENGINE, SO THEY MUST NOT BE MIXED BLINDLY.
+;  SvcFileOpen, SvcFileWriteAll and the directory slots move the engine
+;  off whatever handle was current; the handle slots notice (they open
+;  again on their next read) but a file opened with SvcFileOpen does NOT
+;  survive a handle read. A payload uses one group or the other for
+;  reading.
+; ======================================================================
+#SVC_FILEH_MAX  = 8
+#SVC_FILEH_NAME = 256
+Global Dim gSvcFhName.a[#SVC_FILEH_MAX * #SVC_FILEH_NAME]
+Global Dim gSvcFhUsed.i[#SVC_FILEH_MAX]
+Global Dim gSvcFhSize.i[#SVC_FILEH_MAX]
+
+Procedure.i SvcFileHOpen(*name)
+  Define h.i, i.i, c.i, size.i
+  If SvcRequireCap(#CAP_STORAGE, "storage", "this board offers Anvil no medium to read files from") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  If *name = 0
+    gSvcDetail = "the name pointer was zero"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  h = 0
+  For i = #SVC_FILEH_MAX - 1 To 0 Step -1
+    If gSvcFhUsed[i] = 0
+      h = i + 1
+    EndIf
+  Next
+  If h = 0
+    gSvcDetail = "all eight file handles are open; close one first"
+    ProcedureReturn #SVC_EBUSY
+  EndIf
+  i = 0
+  c = PeekA(*name)
+  While c <> 0 And i < #SVC_FILEH_NAME - 1
+    gSvcFhName[(h - 1) * #SVC_FILEH_NAME + i] = c
+    i = i + 1
+    c = PeekA(*name + i)
+  Wend
+  If c <> 0
+    gSvcDetail = "the file name is longer than 255 bytes"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  gSvcFhName[(h - 1) * #SVC_FILEH_NAME + i] = 0
+  HwFileClose()
+  gSvcFhCurrent = 0
+  If HwFileOpen(@gSvcFhName[(h - 1) * #SVC_FILEH_NAME]) = 0
+    gSvcDetail = "the file could not be opened; SvcFileErrText says why"
+    ProcedureReturn #SVC_EIO
+  EndIf
+  size = HwFileSize()
+  gSvcFhSize[h - 1] = size
+  gSvcFhUsed[h - 1] = 1
+  gSvcFhCurrent = h
+  ProcedureReturn h
+EndProcedure
+
+Procedure.i SvcFileHSize(h.i)
+  If h < 1 Or h > #SVC_FILEH_MAX
+    gSvcDetail = "not a file handle"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  If gSvcFhUsed[h - 1] = 0
+    gSvcDetail = "that file handle is not open"
+    ProcedureReturn #SVC_ESTATE
+  EndIf
+  ProcedureReturn gSvcFhSize[h - 1]
+EndProcedure
+
+Procedure.i SvcFileHReadAt(h.i, off.i, dst.i, n.i)
+  If h < 1 Or h > #SVC_FILEH_MAX Or dst = 0 Or off < 0 Or n < 0
+    gSvcDetail = "not a file handle, a zero destination, or a negative offset or count"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  If gSvcFhUsed[h - 1] = 0
+    gSvcDetail = "that file handle is not open"
+    ProcedureReturn #SVC_ESTATE
+  EndIf
+  ; The one-file slots and the directory slots clear gSvcFhCurrent when
+  ; they move the engine, so a handle read after one of them opens again.
+  If gSvcFhCurrent <> h
+    HwFileClose()
+    gSvcFhCurrent = 0
+    If HwFileOpen(@gSvcFhName[(h - 1) * #SVC_FILEH_NAME]) = 0
+      gSvcDetail = "the file behind this handle could not be opened again"
+      ProcedureReturn #SVC_EIO
+    EndIf
+    gSvcFhCurrent = h
+  EndIf
+  ProcedureReturn HwFileReadAt(off, dst, n)
+EndProcedure
+
+Procedure.i SvcFileHClose(h.i)
+  If h < 1 Or h > #SVC_FILEH_MAX
+    gSvcDetail = "not a file handle"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  If gSvcFhUsed[h - 1] = 0
+    gSvcDetail = "that file handle is not open"
+    ProcedureReturn #SVC_ESTATE
+  EndIf
+  If gSvcFhCurrent = h
+    HwFileClose()
+    gSvcFhCurrent = 0
+  EndIf
+  gSvcFhUsed[h - 1] = 0
+  ProcedureReturn #SVC_OK
+EndProcedure
+
+; Every handle is closed when a payload is entered: a handle left open by
+; the last payload would be a file the next one never opened.
+Procedure SvcFileHReset()
+  Define i.i
+  For i = 0 To #SVC_FILEH_MAX - 1
+    gSvcFhUsed[i] = 0
+  Next
+  gSvcFhCurrent = 0
+EndProcedure
+
 Procedure.i SvcFileErrText()
   ProcedureReturn HwFileErrorText()
 EndProcedure
@@ -1614,6 +1769,7 @@ Procedure.i SvcDirOpen()
   If SvcRequireCap(#CAP_STORAGE, "storage", "this board offers Anvil no medium to read files from") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  gSvcFhCurrent = 0
   ProcedureReturn HwDirRewind()
 EndProcedure
 
@@ -2436,6 +2592,12 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_PAR + 0] = @SvcParallelCores
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_PAR + 1] = @SvcParallelRun
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_PAR + 2] = @SvcParallelStatus
+
+  ; --- file handles, base 192 (new at 1.4) ----------------------------
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 0] = @SvcFileHOpen
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 1] = @SvcFileHSize
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 2] = @SvcFileHReadAt
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 3] = @SvcFileHClose
 
   gSvcBuilt = 1
 EndProcedure
