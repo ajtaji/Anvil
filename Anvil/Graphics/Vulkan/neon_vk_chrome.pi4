@@ -1782,11 +1782,43 @@ Procedure.i NeonVkChromeViewportSet(x.i, y.i, w.i, h.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
+; A line's clip coordinates are whole half-pixels from the centre over half the target's size, and
+; neon_F32Ratio builds each by long division - twelve divisions a line quad, which on a map of 30,000
+; lines was half of a 136 ms frame. The answers for every half-pixel within #NVC_CLIP_TAB_HALF of
+; the centre are kept, made by the same procedure, so the bits written are the same ones; a target
+; of another size rebuilds them, and a coordinate further out is still divided.
+#NVC_CLIP_TAB_HALF = 8192
+Global Dim nvcClipTabX.l[#NVC_CLIP_TAB_HALF * 2]
+Global Dim nvcClipTabY.l[#NVC_CLIP_TAB_HALF * 2]
+Global nvcClipTabW.i, nvcClipTabH.i
+
 Procedure.i nvcClipXBits2(x2.i)
+  Define k.i
+  If nvcClipTabW <> nvcPhysicalW
+    For k = 0 To #NVC_CLIP_TAB_HALF * 2 - 1
+      nvcClipTabX[k] = neon_F32Ratio(k - #NVC_CLIP_TAB_HALF, nvcPhysicalW)
+    Next
+    nvcClipTabW = nvcPhysicalW
+  EndIf
+  k = x2 - nvcPhysicalW + #NVC_CLIP_TAB_HALF
+  If k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    ProcedureReturn nvcClipTabX[k] & $FFFFFFFF
+  EndIf
   ProcedureReturn neon_F32Ratio(x2 - nvcPhysicalW, nvcPhysicalW)
 EndProcedure
 
 Procedure.i nvcClipYBits2(y2.i)
+  Define k.i
+  If nvcClipTabH <> nvcPhysicalH
+    For k = 0 To #NVC_CLIP_TAB_HALF * 2 - 1
+      nvcClipTabY[k] = neon_F32Ratio(k - #NVC_CLIP_TAB_HALF, nvcPhysicalH)
+    Next
+    nvcClipTabH = nvcPhysicalH
+  EndIf
+  k = y2 - nvcPhysicalH + #NVC_CLIP_TAB_HALF
+  If k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    ProcedureReturn nvcClipTabY[k] & $FFFFFFFF
+  EndIf
   ProcedureReturn neon_F32Ratio(y2 - nvcPhysicalH, nvcPhysicalH)
 EndProcedure
 
