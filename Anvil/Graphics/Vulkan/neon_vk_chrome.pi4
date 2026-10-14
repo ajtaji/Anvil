@@ -2215,6 +2215,20 @@ Procedure.i nvcDraw(first.i, count.i, colour.i)
   ProcedureReturn nvcDrawSet(first, count, colour, nvcDescriptorSet)
 EndProcedure
 
+; FILLED TRIANGLES IN BULK (2026-10-14, for map areas: water, land, parks). A reserved quad is six
+; vertices, so it holds two triangles: NeonVkChromeTriAt writes one triangle's three vertices (72 bytes)
+; at p, corners in pixels, with the same white texel and clip-coordinate table as the line quads, and
+; writes nothing else - any core may call it. Draw the range with NeonVkChromeLinesDraw as usual; an odd
+; triangle count fills the last half-quad by writing the last triangle twice.
+Procedure NeonVkChromeTriAt(p.i, x0.i, y0.i, x1.i, y1.i, x2.i, y2.i)
+  Define uv.i, one.i
+  uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
+  one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
+  PokeI(p, nvcLinePosW(x0 * 2, y0 * 2)) : PokeI(p + 8, uv) : PokeI(p + 16, one)
+  PokeI(p + 24, nvcLinePosW(x1 * 2, y1 * 2)) : PokeI(p + 32, uv) : PokeI(p + 40, one)
+  PokeI(p + 48, nvcLinePosW(x2 * 2, y2 * 2)) : PokeI(p + 56, uv) : PokeI(p + 64, one)
+EndProcedure
+
 ; The reserved run of line quads, drawn as one draw in colour.
 Procedure.i NeonVkChromeLinesDraw(first.i, quads.i, colour.i)
   If quads < 1
