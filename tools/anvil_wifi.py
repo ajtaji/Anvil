@@ -474,17 +474,21 @@ def main():
     if oneshot is not None:
         # Register as the peer, send the command, collect for a moment.
         s.sendto((oneshot + "\r").encode(), (ip, port))
+        # The reply is complete when the board prints its prompt again. A
+        # command that goes quiet while it works (an HTTPS handshake, a
+        # deaf radio) used to be cut off after 0.4 s of silence; now the
+        # listen lasts until the prompt, or --timeout (at least 3 s).
         s.settimeout(0.4)
         buf = b""
-        end = time.time() + 3.0
+        end = time.time() + max(3.0, timeout)
         while time.time() < end:
             try:
                 data, _ = s.recvfrom(4096)
                 buf += data
-                end = time.time() + 0.5   # keep going while it streams
-            except socket.timeout:
-                if buf:
+                if b"pmf>" in buf[-64:]:
                     break
+            except socket.timeout:
+                pass
         sys.stdout.write(buf.decode("utf-8", "replace"))
         sys.stdout.flush()
         if not buf:

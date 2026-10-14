@@ -103,6 +103,15 @@
 ;  #SVC_ENOSYS from the net group - the honest "this monitor cannot".
 ;  #SVC_SLOT_COUNT does not move.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 5
+;  1.6 - 2026-10-14. TLS, slots 80..83 and 87.
+;
+;  SvcTlsOpen(*host, port), SvcTlsSend, SvcTlsRecv, SvcTlsClose and, in
+;  the last of the merge's reserved three, SvcTlsState. HTTPS to any server
+;  whose chain reaches a root in the store on the stick, every check always
+;  on (Anvil/Core/tls_client.pbi, tls_roots.pbi). 84, the HTTP convenience,
+;  stays SvcUnimplemented. Every slot already existed, so this is a minor
+;  bump; a 1.6 payload on a 1.5 monitor gets #SVC_ENOSYS from them.
+; ----------------------------------------------------------------------
+#SVC_ABI_MINOR   = 6
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.
