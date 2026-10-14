@@ -1952,34 +1952,85 @@ Procedure nvcLineVertex(index.i, x2.i, y2.i)
   PokeL(p + 16, #NEON_VK_CHROME_F_ONE) : PokeL(p + 20, #NEON_VK_CHROME_F_ONE)
 EndProcedure
 
+; One corner of a line quad, in half-pixels of the logical screen, as the vertex's two clip
+; coordinates packed for one 8-byte store: x in the low half, y in the high half - the same bytes
+; nvcLineVertex writes with two 4-byte ones. The rotation and both table reads are done here once.
+Procedure.i nvcLinePos(x2.i, y2.i)
+  Define tx2.i, ty2.i, k.i, xb.i, yb.i
+  If nvcRotation = 90
+    tx2 = nvcLogicalH * 2 - y2 : ty2 = x2
+  ElseIf nvcRotation = 180
+    tx2 = nvcLogicalW * 2 - x2 : ty2 = nvcLogicalH * 2 - y2
+  ElseIf nvcRotation = 270
+    tx2 = y2 : ty2 = nvcLogicalW * 2 - x2
+  Else
+    tx2 = x2 : ty2 = y2
+  EndIf
+  k = tx2 - nvcPhysicalW + #NVC_CLIP_TAB_HALF
+  If nvcClipTabW = nvcPhysicalW And k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    xb = nvcClipTabX[k] & $FFFFFFFF
+  Else
+    xb = nvcClipXBits2(tx2) & $FFFFFFFF
+  EndIf
+  k = ty2 - nvcPhysicalH + #NVC_CLIP_TAB_HALF
+  If nvcClipTabH = nvcPhysicalH And k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    yb = nvcClipTabY[k] & $FFFFFFFF
+  Else
+    yb = nvcClipYBits2(ty2) & $FFFFFFFF
+  EndIf
+  ProcedureReturn xb | (yb << 32)
+EndProcedure
+
+; A line quad is two triangles over four distinct corners: c0 c1 c2, then c0 c2 c3. Each corner is
+; worked out once (nvcLinePos) and each vertex goes down as three 8-byte stores - position, the white
+; texel's u v, and the two constant ones - where it was six 4-byte stores and two divisions or table
+; reads per vertex. The bytes are the ones nvcLineVertex writes; it is still the path when the mapped
+; vertices are not 8-byte aligned.
 Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
-  Define dx.i
-  Define dy.i
-  Define a.i
-  Define b.i
-  Define c.i
-  Define d.i
+  Define dx.i, dy.i, a.i, b.i, c.i, d.i
+  Define c0.i, c1.i, c2.i, c3.i, uv.i, one.i, p.i
   dx = x1 - x0 : If dx < 0 : dx = 0 - dx : EndIf
   dy = y1 - y0 : If dy < 0 : dy = 0 - dy : EndIf
   If dx = 0 And dy = 0
     nvcSolidQuad(x0, y0, x0 + 1, y0, x0 + 1, y0 + 1, x0, y0 + 1)
-  ElseIf dx >= dy
-    a = y0 * 2 - 1 : b = y1 * 2 - 1 : c = y1 * 2 + 1 : d = y0 * 2 + 1
-    nvcLineVertex(nvcVertices + 0, x0 * 2, a)
-    nvcLineVertex(nvcVertices + 1, x1 * 2, b)
-    nvcLineVertex(nvcVertices + 2, x1 * 2, c)
-    nvcLineVertex(nvcVertices + 3, x0 * 2, a)
-    nvcLineVertex(nvcVertices + 4, x1 * 2, c)
-    nvcLineVertex(nvcVertices + 5, x0 * 2, d)
-  Else
-    a = x0 * 2 - 1 : b = x1 * 2 - 1 : c = x1 * 2 + 1 : d = x0 * 2 + 1
-    nvcLineVertex(nvcVertices + 0, a, y0 * 2)
-    nvcLineVertex(nvcVertices + 1, b, y1 * 2)
-    nvcLineVertex(nvcVertices + 2, c, y1 * 2)
-    nvcLineVertex(nvcVertices + 3, a, y0 * 2)
-    nvcLineVertex(nvcVertices + 4, c, y1 * 2)
-    nvcLineVertex(nvcVertices + 5, d, y0 * 2)
+    ProcedureReturn
   EndIf
+  p = nvcMapped + nvcVertices * #NEON_VK_CHROME_VERTEX_BYTES
+  If (p & 7) <> 0
+    If dx >= dy
+      a = y0 * 2 - 1 : b = y1 * 2 - 1 : c = y1 * 2 + 1 : d = y0 * 2 + 1
+      nvcLineVertex(nvcVertices + 0, x0 * 2, a)
+      nvcLineVertex(nvcVertices + 1, x1 * 2, b)
+      nvcLineVertex(nvcVertices + 2, x1 * 2, c)
+      nvcLineVertex(nvcVertices + 3, x0 * 2, a)
+      nvcLineVertex(nvcVertices + 4, x1 * 2, c)
+      nvcLineVertex(nvcVertices + 5, x0 * 2, d)
+    Else
+      a = x0 * 2 - 1 : b = x1 * 2 - 1 : c = x1 * 2 + 1 : d = x0 * 2 + 1
+      nvcLineVertex(nvcVertices + 0, a, y0 * 2)
+      nvcLineVertex(nvcVertices + 1, b, y1 * 2)
+      nvcLineVertex(nvcVertices + 2, c, y1 * 2)
+      nvcLineVertex(nvcVertices + 3, a, y0 * 2)
+      nvcLineVertex(nvcVertices + 4, c, y1 * 2)
+      nvcLineVertex(nvcVertices + 5, d, y0 * 2)
+    EndIf
+    ProcedureReturn
+  EndIf
+  If dx >= dy
+    c0 = nvcLinePos(x0 * 2, y0 * 2 - 1) : c1 = nvcLinePos(x1 * 2, y1 * 2 - 1)
+    c2 = nvcLinePos(x1 * 2, y1 * 2 + 1) : c3 = nvcLinePos(x0 * 2, y0 * 2 + 1)
+  Else
+    c0 = nvcLinePos(x0 * 2 - 1, y0 * 2) : c1 = nvcLinePos(x1 * 2 - 1, y1 * 2)
+    c2 = nvcLinePos(x1 * 2 + 1, y1 * 2) : c3 = nvcLinePos(x0 * 2 + 1, y0 * 2)
+  EndIf
+  uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
+  one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
+  PokeI(p, c0) : PokeI(p + 8, uv) : PokeI(p + 16, one)
+  PokeI(p + 24, c1) : PokeI(p + 32, uv) : PokeI(p + 40, one)
+  PokeI(p + 48, c2) : PokeI(p + 56, uv) : PokeI(p + 64, one)
+  PokeI(p + 72, c0) : PokeI(p + 80, uv) : PokeI(p + 88, one)
+  PokeI(p + 96, c2) : PokeI(p + 104, uv) : PokeI(p + 112, one)
+  PokeI(p + 120, c3) : PokeI(p + 128, uv) : PokeI(p + 136, one)
 EndProcedure
 
 ; Neon colours are logical packed 0xAARRGGBB. The sampled fragment shader
