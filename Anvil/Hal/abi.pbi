@@ -1744,10 +1744,16 @@ Procedure.i SvcFileHClose(h.i)
   ProcedureReturn #SVC_OK
 EndProcedure
 
-; Every handle is closed when a payload is entered: a handle left open by
-; the last payload would be a file the next one never opened.
+; EVERY FILE A PAYLOAD OPENED IS CLOSED WHEN IT IS ENTERED AND AGAIN WHEN IT
+; RETURNS - handles and the one-file slot alike. On entry, because a handle
+; left by the last payload would be a file this one never opened. On return,
+; because the filesystem will not mount another partition while a file is
+; open on this one: a payload that came back holding a file on partition 2
+; left the monitor unable to list, load from or save to partition 1 until
+; something else closed it. Found on the board, build 248.
 Procedure SvcFileHReset()
   Define i.i
+  HwFileClose()
   For i = 0 To #SVC_FILEH_MAX - 1
     gSvcFhUsed[i] = 0
   Next
