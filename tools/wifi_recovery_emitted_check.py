@@ -48,7 +48,8 @@ def probe_source() -> str:
         "wifi_RecordEapolFailure", "wifi_HandshakeFinish", "wifi_Handshake",
         "wifi_HexVal", "wifi_HexDigit", "wifi_ByteToHex", "wifi_U32ToHex",
         "wifi_HexToU32", "wifi_HexToBytes", "wifi_HexValid",
-        "wifi_CandidateFinish", "wifi_TrySlot", "wifi_ServiceEapol",
+        "wifi_CandidateFinish", "wifi_AssocHandshake", "wifi_AssocProgress",
+        "wifi_AssocEvent", "wifi_TrySlot", "wifi_ServiceEapol",
         "WifiRecoveryCancel", "WifiRecoveryActive", "WifiRecoveryInitialJoinFailed",
         "wifi_RecoverForgetPmk",
         "wifi_RecoverCandidateFail", "wifi_RecoverFail",
@@ -60,7 +61,10 @@ def probe_source() -> str:
         "wifi_RecoverLeaseBound",
         "WifiRecoveryStart", "WifiRecoveryTick",
     )
-    bodies = "\n\n".join(procedure(source, name) for name in names)
+    # wifi_TrySlot joins through the shared association controller; emit the
+    # shipped one so the join paths below run the real retry flow.
+    assoc = (ROOT / "Anvil" / "Net" / "wifi_assoc.pbi").read_text(encoding="utf-8")
+    bodies = assoc + "\n\n" + "\n\n".join(procedure(source, name) for name in names)
     prelude = r'''
 EnableExplicit
 
@@ -245,6 +249,38 @@ Procedure Cyw43KeyWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure AesWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure KwWipe() : gate_wipes = gate_wipes + 1 : EndProcedure
 Procedure NetDhcpLinkDown(k.i) : gate_down = gate_down + 1 : EndProcedure
+; the Wi-Fi flight recorder (Anvil/Core/wifi_incident.pbi), stubbed: it records and saves, it never decides
+#WR_EAPOL_IN = 1
+#WR_EAPOL_OUT = 2
+#WR_EAPOL_FAIL = 3
+#WR_KEY_SET = 4
+#WR_TEARDOWN = 5
+#WR_ASSOC_POLL = 6
+#WR_KA_PROBE = 7
+#WR_KA_PROOF = 8
+#WR_TXONLY = 9
+#WR_REC_START = 10
+#WR_REC_PHASE = 11
+#WR_REC_OK = 12
+#WR_REC_FAIL = 13
+#WR_DHCP_OUT = 14
+#WR_DHCP_IN = 15
+#WR_PAYLOAD_IN = 16
+#WR_PAYLOAD_OUT = 17
+#WR_RADIO_RESET = 18
+#WR_COUNTS = 19
+#WR_CREDIT = 20
+#WR_JOIN = 21
+#WR_NOTE = 22
+Global gate_recEvents.i, gate_recSaves.i, gate_radioResets.i
+Procedure WifiRec(code.i, a.i, b.i) : gate_recEvents = gate_recEvents + 1 : EndProcedure
+Procedure.i WifiRecSave(*why, *counters) : gate_recSaves = gate_recSaves + 1 : ProcedureReturn 1 : EndProcedure
+#WIFI_EP_SAVE_EVERY = 10
+#WIFI_EP_RESET_AFTER = 8
+Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Procedure.i wifi_EpCounters() : ProcedureReturn 0 : EndProcedure
+Procedure wifi_EpFail(code.i, a.i, b.i, *why) : WifiRec(code, a, b) : If gWifiEp = 0 : gWifiEp = 1 : gWifiEpFails = 0 : gWifiEpReset = 0 : WifiRecSave(*why, 0) : EndIf : EndProcedure
+Procedure wifi_EpRecovered() : WifiRec(#WR_REC_OK, 0, gWifiEpFails) : If gWifiEp <> 0 : gWifiEp = 0 : WifiRecSave(0, 0) : EndIf : EndProcedure
 Procedure wifi_RecordLinkDown() : NetDhcpLinkDown(#HW_LINK_WIFI) : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiSecDone = 0 : gWifiTeardown = 0 : EndProcedure
 Procedure WifiDrainEvents() : gate_eventDrains = gate_eventDrains + 1 : If gate_teardownOnDrain : gWifiTeardown = 1 : EndIf : EndProcedure
 Procedure.i Cyw43Leave(ms.i) : gate_leave = gate_leave + 1 : ProcedureReturn gate_leaveRc : EndProcedure

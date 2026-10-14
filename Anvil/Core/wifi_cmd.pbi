@@ -589,6 +589,13 @@ Procedure CmdWifi()
   ; `wifi link off` stops the periodic keepalive/health check; `wifi link on`
   ; starts it again. `wifi drop` simulates an access-point deauth (a REAL
   ; disassociation) so the detector can be watched reconnecting on its own.
+  ; incidents - WIFILOG.TXT: every Wi-Fi failure detected, the events that led to it (saved before
+  ; recovery touched anything), each recovery step and its outcome. See Anvil/Core/wifi_incident.pbi.
+  If WordIs("incidents") <> 0 Or WordIs("log") <> 0
+    WifiRecShow()
+    ProcedureReturn
+  EndIf
+
   If WordIs("link") <> 0 Or WordIs("health") <> 0
     ; The optional on/off word, matched case-insensitively (| $20 folds an
     ; ASCII letter to lower) and exactly (the trailing NUL, so "onward" is

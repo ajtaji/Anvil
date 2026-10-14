@@ -305,8 +305,8 @@ def main() -> int:
         ),
         (
             "clock stale generation",
-            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)\n      If wifi_RadioInitStillOwned(generation) = 0\n        ProcedureReturn\n      EndIf",
-            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)",
+            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)\nCompilerEndIf\n      If wifi_RadioInitStillOwned(generation) = 0\n        ProcedureReturn\n      EndIf",
+            "      r = MailboxClockRate(#WIFI_CLOCK_ID_EMMC)\nCompilerEndIf",
         ),
         (
             "clock new-generation reset",
