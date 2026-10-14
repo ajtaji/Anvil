@@ -2845,6 +2845,81 @@ Procedure.i nvcTTRoundDiv(numerator.i, denominator.i)
   ProcedureReturn (numerator + denominator / 2) / denominator
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE LAYOUT OF A SHORT TEXT IS KEPT AND USED AGAIN WHILE THE TEXT IS THE SAME.
+;  Shaping a TrueType line is the expensive half of drawing it: the Pi 4 banner
+;  spent 4.75 ms of every 4.9 ms frame re-shaping five strings, four of which
+;  never change, about four times a second (vkstat, build 255). A layout is a
+;  function of the bytes, the face (slot and its generation) and the pixel
+;  size, so those - the bytes compared in full, not only hashed - are the key.
+;  Only short single-line runs are kept; anything longer is shaped as before.
+; ----------------------------------------------------------------------
+#NVC_TTLC_ENTRIES = 16
+#NVC_TTLC_BYTES   = 160
+#NVC_TTLC_GLYPHS  = 160
+Global Dim nvcTTLCBytes.a[#NVC_TTLC_ENTRIES * #NVC_TTLC_BYTES]
+Global Dim nvcTTLCKey.i[#NVC_TTLC_ENTRIES * 4]          ; slot, generation, pixels, length (length 0 = empty)
+Global Dim nvcTTLCCount.i[#NVC_TTLC_ENTRIES]
+Global Dim nvcTTLCLines.i[#NVC_TTLC_ENTRIES]
+Global Dim nvcTTLCMeasured.i[#NVC_TTLC_ENTRIES]
+Global Dim nvcTTLCGlyph.i[#NVC_TTLC_ENTRIES * #NVC_TTLC_GLYPHS]
+Global Dim nvcTTLCX.i[#NVC_TTLC_ENTRIES * #NVC_TTLC_GLYPHS]
+Global Dim nvcTTLCY.i[#NVC_TTLC_ENTRIES * #NVC_TTLC_GLYPHS]
+Global Dim nvcTTLCAdvance.i[#NVC_TTLC_ENTRIES * #NVC_TTLC_GLYPHS]
+Global nvcTTLCNext.i, nvcTTLCHits.i, nvcTTLCMisses.i
+
+; The entry holding this exact text in this face and size, or -1.
+Procedure.i nvcTTLCFind(*s, length.i, slot.i, generation.i, pixels.i)
+  Define e.i, i.i, same.i
+  If length < 1 Or length > #NVC_TTLC_BYTES : ProcedureReturn -1 : EndIf
+  For e = 0 To #NVC_TTLC_ENTRIES - 1
+    If nvcTTLCKey[e * 4 + 3] = length And nvcTTLCKey[e * 4] = slot And nvcTTLCKey[e * 4 + 1] = generation And nvcTTLCKey[e * 4 + 2] = pixels
+      same = 1
+      For i = 0 To length - 1
+        If nvcTTLCBytes[e * #NVC_TTLC_BYTES + i] <> PeekA(*s + i)
+          same = 0
+          Break
+        EndIf
+      Next
+      If same <> 0 : ProcedureReturn e : EndIf
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+
+; Keeps the layout now in nvcTTLayout* for this text, over the oldest entry.
+Procedure nvcTTLCStore(*s, length.i, slot.i, generation.i, pixels.i, count.i, lines.i, measured.i)
+  Define e.i, i.i
+  If length < 1 Or length > #NVC_TTLC_BYTES Or count < 0 Or count > #NVC_TTLC_GLYPHS
+    ProcedureReturn
+  EndIf
+  e = nvcTTLCNext
+  nvcTTLCNext = (nvcTTLCNext + 1) % #NVC_TTLC_ENTRIES
+  For i = 0 To length - 1
+    nvcTTLCBytes[e * #NVC_TTLC_BYTES + i] = PeekA(*s + i)
+  Next
+  For i = 0 To count - 1
+    nvcTTLCGlyph[e * #NVC_TTLC_GLYPHS + i] = nvcTTLayoutGlyph[i]
+    nvcTTLCX[e * #NVC_TTLC_GLYPHS + i] = nvcTTLayoutX[i]
+    nvcTTLCY[e * #NVC_TTLC_GLYPHS + i] = nvcTTLayoutY[i]
+    nvcTTLCAdvance[e * #NVC_TTLC_GLYPHS + i] = nvcTTLayoutAdvance[i]
+  Next
+  nvcTTLCCount[e] = count : nvcTTLCLines[e] = lines : nvcTTLCMeasured[e] = measured
+  nvcTTLCKey[e * 4] = slot : nvcTTLCKey[e * 4 + 1] = generation : nvcTTLCKey[e * 4 + 2] = pixels
+  nvcTTLCKey[e * 4 + 3] = length
+EndProcedure
+
+; Puts a kept layout back into nvcTTLayout*.
+Procedure nvcTTLCLoad(e.i)
+  Define i.i
+  For i = 0 To nvcTTLCCount[e] - 1
+    nvcTTLayoutGlyph[i] = nvcTTLCGlyph[e * #NVC_TTLC_GLYPHS + i]
+    nvcTTLayoutX[i] = nvcTTLCX[e * #NVC_TTLC_GLYPHS + i]
+    nvcTTLayoutY[i] = nvcTTLCY[e * #NVC_TTLC_GLYPHS + i]
+    nvcTTLayoutAdvance[i] = nvcTTLCAdvance[e * #NVC_TTLC_GLYPHS + i]
+  Next
+EndProcedure
+
 Procedure.i nvcTTTextMapped(xQ16.i, yQ16.i, *s, colour.i, mapped.i, spaceW.i, spaceH.i, targetW.i, targetH.i, cameraXQ16.i, cameraYQ16.i, zoomQ16.i, ignoreCamera.i)
   Define length.i, i.i, slot.i, generation.i, entry.i, rc.i
   Define count.i, lines.i, measured.i, visible.i, originX.i, baseline.i, anchorX.i, anchorY.i, lineAscent.i, units.i, first.i, uv0.i, uv1.i, vv0.i, vv1.i
@@ -2860,7 +2935,17 @@ Procedure.i nvcTTTextMapped(xQ16.i, yQ16.i, *s, colour.i, mapped.i, spaceW.i, sp
   If length >= 4096 : nvcTTErrorStage = 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   ; Match NeonVkChromeMeasureWidth: chrome text stays on one line at the
   ; framebuffer edge and lets the scissor clip its overflow.
-  rc = AnvilTrueTypeLayoutUtf8(*s, length, nvcTTFontPixels, 0, nvcTTFontPixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured)
+  generation = AnvilTrueTypeSlotGeneration(slot)
+  entry = nvcTTLCFind(*s, length, slot, generation, nvcTTFontPixels)
+  If entry >= 0
+    nvcTTLCLoad(entry)
+    count = nvcTTLCCount[entry] : lines = nvcTTLCLines[entry] : measured = nvcTTLCMeasured[entry]
+    rc = 1 : nvcTTLCHits + 1
+  Else
+    rc = AnvilTrueTypeLayoutUtf8(*s, length, nvcTTFontPixels, 0, nvcTTFontPixels + 2, @nvcTTLayoutGlyph[0], @nvcTTLayoutX[0], @nvcTTLayoutY[0], @nvcTTLayoutAdvance[0], #ANVIL_TTL_ALIGN_LEFT, #NEON_VK_CHROME_TT_RUN_GLYPHS, @count, @lines, @measured)
+    nvcTTLCMisses + 1
+    If rc <> 0 And lines = 1 : nvcTTLCStore(*s, length, slot, generation, nvcTTFontPixels, count, lines, measured) : EndIf
+  EndIf
   nvcTTLayoutRc = rc
   nvcTTLayoutError = AnvilTrueTypeLayoutError()
   nvcTTCountProbe = count : nvcTTLinesProbe = lines : nvcTTMeasuredProbe = measured

@@ -78,7 +78,7 @@ Declare.i avcCreateBannerTarget()
 ; and whole frames are kept apart.
 Global Dim avcStatBanner.i[3]
 Global Dim avcStatFull.i[3]
-Global avcStatBannerN.i, avcStatFullN.i, avcStatSince.i
+Global avcStatBannerN.i, avcStatFullN.i, avcStatSince.i, avcStatBeginTicks.i
 
 Procedure avcBannerInvalidate()
   avcBannerDirty = 1
@@ -1021,7 +1021,7 @@ EndProcedure
 ; A frame that holds the banner and nothing else, for a change of the clock or
 ; the glint while the text is unchanged. Returns 1 when it was presented.
 Procedure.i avcPumpBannerOnly()
-  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i, own.i
+  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i, own.i, tBegin0.i
   t0 = Ticks()
   own = 0
   If avcBanReady <> 0
@@ -1033,10 +1033,12 @@ Procedure.i avcPumpBannerOnly()
     EndIf
   EndIf
   avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
+  tBegin0 = Ticks()
   If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS
     If own <> 0 : NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation) : EndIf
     ProcedureReturn 0
   EndIf
+  avcStatBeginTicks = avcStatBeginTicks + (Ticks() - tBegin0)
   avcBannerFrameReady = 0
   rc = avcRenderBanner()
   t1 = Ticks()
@@ -1245,6 +1247,18 @@ Procedure CmdVkStat()
   PrintN(" seconds:")
   avcStatLine("banner only: ", avcStatBannerN, avcStatBanner[0], avcStatBanner[1], avcStatBanner[2], hz)
   avcStatLine("whole frame: ", avcStatFullN, avcStatFull[0], avcStatFull[1], avcStatFull[2], hz)
+  If avcStatBannerN > 0 And hz > 0
+    Print("  of a banner frame's build, microseconds: starting the frame ")
+    PrintDec(((avcStatBeginTicks / avcStatBannerN) * 1000000) / hz)
+    Print(", the text ")
+    PrintDec(((gVkBanTicksText / avcStatBannerN) * 1000000) / hz)
+    Print(", the logo ")
+    PrintDec(((gVkBanTicksLogo / avcStatBannerN) * 1000000) / hz)
+    PrintNl()
+  EndIf
+  Print("  text layouts reused ") : PrintDec(nvcTTLCHits) : Print(", shaped afresh ") : PrintDec(nvcTTLCMisses) : PrintNl()
+  nvcTTLCHits = 0 : nvcTTLCMisses = 0
+  avcStatBeginTicks = 0 : gVkBanTicksText = 0 : gVkBanTicksLogo = 0
   busy = avcStatBanner[0] + avcStatBanner[1] + avcStatBanner[2] + avcStatFull[0] + avcStatFull[1] + avcStatFull[2]
   If span > 0
     share = (busy * 10000) / span
