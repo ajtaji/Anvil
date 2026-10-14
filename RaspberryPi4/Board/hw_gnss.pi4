@@ -7,14 +7,23 @@
 ;  the network as named placeholders - and frames and decodes its stream
 ;  the way the GNSS Bridge Pico does.
 ;
-;  HwGnssUp() opens USB. Choosing another source is GnssOpen(src); the
+;  HwGnssUp() opens the source set at the prompt (gnss.source: USB unless
+;  `gnss source network` set the network). Choosing another source is GnssOpen(src); the
 ;  placeholders answer with a sentence (HwGnssErrText) rather than nothing.
 ;  There is no PPS input wired on this board, so HwGnssPpsTicks() is -1.
 ; ======================================================================
 
+; The source set at the prompt (the setting gnss.source: usb, the default, or network); see gnss_cmd.pbi.
 Procedure.i HwGnssUp()
+  Define *p
   If GnssSource() <> #GNSS_SRC_NONE
     ProcedureReturn 1
+  EndIf
+  *p = SettingsGet("gnss.source")
+  If *p <> 0
+    If PeekA(*p) = 110 And PeekA(*p + 1) = 101 And PeekA(*p + 2) = 116            ; "net..."
+      ProcedureReturn GnssOpen(#GNSS_SRC_NETWORK)
+    EndIf
   EndIf
   ProcedureReturn GnssOpen(#GNSS_SRC_USB)
 EndProcedure

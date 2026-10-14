@@ -4,8 +4,10 @@
 ;    gnss                      open the receiver (USB) if it is not, and say what it has
 ;    gnss watch [seconds]      read it for that long (10 by default), a line a second
 ;    gnss raw [seconds]        print what it sends, as text (5 by default)
-;    gnss source usb | bluetooth | ble | network
-;                              open that source instead (the last three are placeholders)
+;    gnss source usb | bluetooth | ble | network [<host>[:<port>]]
+;                              open that source instead (bluetooth and ble are placeholders);
+;                              network looks the host up once, stores it (gnss.net.*) and makes
+;                              it the source a payload's GNSS open uses (gnss.source)
 ;
 ;  Nothing here waits on the receiver: every loop pumps it and looks at the
 ;  clock, and any key ends it.
@@ -74,6 +76,11 @@ Procedure.i GnssCmdOpen(src.i)
     Print(" on USB slot ") : PrintDec(UsbSerSlot())
     If UsbSerNeedsBaud() <> 0 : Print(", baud searched from 9600") : EndIf
   EndIf
+  If src = #GNSS_SRC_NETWORK
+    Print(", ") : PrintDec((GnssNetIp() >> 24) & 255) : Print(".") : PrintDec((GnssNetIp() >> 16) & 255) : Print(".")
+    PrintDec((GnssNetIp() >> 8) & 255) : Print(".") : PrintDec(GnssNetIp() & 255) : Print(":") : PrintDec(GnssNetPort())
+    Print(" (connecting in the background)")
+  EndIf
   PrintN(".")
   ProcedureReturn 1
 EndProcedure
@@ -110,6 +117,76 @@ Procedure GnssCmdWatch(seconds.i, raw.i)
   NetConsoleFlush()
 EndProcedure
 
+; `gnss source network <host>[:<port>]`: the address looked up once (a name through DNS), stored in the
+; settings with gnss.source = network so a payload's GNSS open uses it, and the source opened. With no
+; address, the stored one.
+; v (0..99999) as decimal text at *dst; answers how many bytes
+Procedure.i GnssCmdDecTo(v.i, *dst)
+  Define Dim d.a[8]
+  Define n.i, i.i
+  Repeat
+    d[n] = 48 + v % 10 : v = v / 10 : n = n + 1
+  Until v = 0 Or n >= 6
+  For i = 0 To n - 1 : PokeA(*dst + i, d[n - 1 - i]) : Next
+  PokeA(*dst + n, 0)
+  ProcedureReturn n
+EndProcedure
+
+Procedure GnssCmdNetwork()
+  Define i.i, c.i, ip.i, port.i, hl.i
+  Define Dim host.a[128]
+  Define Dim txt.a[32]
+  SkipSpace()
+  If gLine[gPos] <> 0
+    hl = 0 : port = #GNSS_NET_PORT
+    c = gLine[gPos]
+    While c <> 0 And c <> 32 And c <> 58 And hl < 127
+      host[hl] = c : hl = hl + 1 : gPos = gPos + 1 : c = gLine[gPos]
+    Wend
+    host[hl] = 0
+    If c = 58
+      gPos = gPos + 1 : port = 0
+      c = gLine[gPos]
+      While c >= 48 And c <= 57 And port < 70000
+        port = port * 10 + c - 48 : gPos = gPos + 1 : c = gLine[gPos]
+      Wend
+      If port < 1 Or port > 65535
+        PrintN("!! the port must be 1 to 65535.")
+        ProcedureReturn
+      EndIf
+    EndIf
+    ip = ParseDotted(@host[0])
+    If ip <= 0
+      If NetLinkUpSay(1) = 0
+        ProcedureReturn
+      EndIf
+      ip = ResolveName(@host[0])
+      If ip <= 0
+        ProcedureReturn                              ; ResolveName said why
+      EndIf
+    EndIf
+    ; the dotted quad, as the setting stores it
+    i = 0
+    For c = 3 To 0 Step -1
+      i = i + GnssCmdDecTo((ip >> (c * 8)) & 255, @txt[i])
+      If c > 0 : txt[i] = 46 : i = i + 1 : EndIf
+    Next
+    txt[i] = 0
+    If SettingsSet("gnss.net.ip", @txt[0]) = 0
+      PrintN("!! the address could not be stored in the settings.")
+      ProcedureReturn
+    EndIf
+    GnssCmdDecTo(port, @txt[0])
+    SettingsSet("gnss.net.port", @txt[0])
+    SettingsSet("gnss.net.host", @host[0])
+    SettingsSet("gnss.source", "network")
+    If SettingsSave() = 0
+      PrintN("!! the settings could not be saved to the stick; the network source is set until the next reset.")
+    EndIf
+  EndIf
+  GnssCmdOpen(#GNSS_SRC_NETWORK)
+EndProcedure
+
 Procedure CmdGnss()
   Define s.i
   SkipSpace()
@@ -143,13 +220,14 @@ Procedure CmdGnss()
     SkipSpace()
     gWordAt = gPos : SkipWord() : gWordLen = gPos - gWordAt
     If WordIs("usb") <> 0
+      SettingsSet("gnss.source", "usb") : SettingsSave()
       GnssCmdOpen(#GNSS_SRC_USB)
     ElseIf WordIs("bluetooth") <> 0
       GnssCmdOpen(#GNSS_SRC_BLUETOOTH)
     ElseIf WordIs("ble") <> 0
       GnssCmdOpen(#GNSS_SRC_BLE)
     ElseIf WordIs("network") <> 0
-      GnssCmdOpen(#GNSS_SRC_NETWORK)
+      GnssCmdNetwork()
     Else
       PrintN("!! the sources are usb, bluetooth, ble and network.")
     EndIf
