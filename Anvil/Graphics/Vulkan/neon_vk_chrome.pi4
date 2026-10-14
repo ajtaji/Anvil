@@ -2033,6 +2033,100 @@ Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
   PokeI(p + 120, c3) : PokeI(p + 128, uv) : PokeI(p + 136, one)
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  LINES IN BULK, FOR MANY CORES (2026-10-14).
+;
+;  A caller with thousands of lines (a map: 28,738 on one frame) reserves room
+;  for all of them in the vertex buffer, writes the quads itself - on as many
+;  cores as it has, because NeonVkChromeLineQuadAt reads the adapter's state
+;  and writes nothing but the 144 bytes it is given - and draws them as ONE
+;  draw. The bytes are exactly nvcLineQuad's (and, for a line of no length,
+;  nvcSolidQuad's): the same corners, the same clip-coordinate table, the same
+;  white texel. NeonVkChromeLinesReserve builds the table first, so no worker
+;  ever writes it.
+;
+;    first = NeonVkChromeLinesReserve(quads)     -1: refused (state, capacity)
+;    addr  = NeonVkChromeVertexAddress(first)    quad i is at addr + i * 144
+;    NeonVkChromeLineQuadAt(addr + i * 144, x0, y0, x1, y1)    any core
+;    NeonVkChromeLinesDraw(first, quads, colour)               after all are written
+; ----------------------------------------------------------------------
+#NVC_QUAD_BYTES = 144                  ; 6 vertices of #NEON_VK_CHROME_VERTEX_BYTES
+
+; nvcLinePos without the table build: for a worker core, which must write nothing shared.
+Procedure.i nvcLinePosW(x2.i, y2.i)
+  Define tx2.i, ty2.i, k.i, xb.i, yb.i
+  If nvcRotation = 90
+    tx2 = nvcLogicalH * 2 - y2 : ty2 = x2
+  ElseIf nvcRotation = 180
+    tx2 = nvcLogicalW * 2 - x2 : ty2 = nvcLogicalH * 2 - y2
+  ElseIf nvcRotation = 270
+    tx2 = y2 : ty2 = nvcLogicalW * 2 - x2
+  Else
+    tx2 = x2 : ty2 = y2
+  EndIf
+  k = tx2 - nvcPhysicalW + #NVC_CLIP_TAB_HALF
+  If nvcClipTabW = nvcPhysicalW And k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    xb = nvcClipTabX[k] & $FFFFFFFF
+  Else
+    xb = neon_F32Ratio(tx2 - nvcPhysicalW, nvcPhysicalW) & $FFFFFFFF
+  EndIf
+  k = ty2 - nvcPhysicalH + #NVC_CLIP_TAB_HALF
+  If nvcClipTabH = nvcPhysicalH And k >= 0 And k < #NVC_CLIP_TAB_HALF * 2
+    yb = nvcClipTabY[k] & $FFFFFFFF
+  Else
+    yb = neon_F32Ratio(ty2 - nvcPhysicalH, nvcPhysicalH) & $FFFFFFFF
+  EndIf
+  ProcedureReturn xb | (yb << 32)
+EndProcedure
+
+; One line's quad at p (8-byte aligned), as nvcLineQuad writes it. Writes nothing else: any core may call it.
+Procedure NeonVkChromeLineQuadAt(p.i, x0.i, y0.i, x1.i, y1.i)
+  Define dx.i, dy.i, c0.i, c1.i, c2.i, c3.i, uv.i, one.i
+  dx = x1 - x0 : If dx < 0 : dx = 0 - dx : EndIf
+  dy = y1 - y0 : If dy < 0 : dy = 0 - dy : EndIf
+  If dx = 0 And dy = 0
+    ; nvcSolidQuad(x0, y0, x0 + 1, y0, x0 + 1, y0 + 1, x0, y0 + 1): triangles c0 c1 c2, c0 c2 c3
+    c0 = nvcLinePosW(x0 * 2, y0 * 2) : c1 = nvcLinePosW(x0 * 2 + 2, y0 * 2)
+    c2 = nvcLinePosW(x0 * 2 + 2, y0 * 2 + 2) : c3 = nvcLinePosW(x0 * 2, y0 * 2 + 2)
+  ElseIf dx >= dy
+    c0 = nvcLinePosW(x0 * 2, y0 * 2 - 1) : c1 = nvcLinePosW(x1 * 2, y1 * 2 - 1)
+    c2 = nvcLinePosW(x1 * 2, y1 * 2 + 1) : c3 = nvcLinePosW(x0 * 2, y0 * 2 + 1)
+  Else
+    c0 = nvcLinePosW(x0 * 2 - 1, y0 * 2) : c1 = nvcLinePosW(x1 * 2 - 1, y1 * 2)
+    c2 = nvcLinePosW(x1 * 2 + 1, y1 * 2) : c3 = nvcLinePosW(x0 * 2 + 1, y0 * 2)
+  EndIf
+  uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
+  one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
+  PokeI(p, c0) : PokeI(p + 8, uv) : PokeI(p + 16, one)
+  PokeI(p + 24, c1) : PokeI(p + 32, uv) : PokeI(p + 40, one)
+  PokeI(p + 48, c2) : PokeI(p + 56, uv) : PokeI(p + 64, one)
+  PokeI(p + 72, c0) : PokeI(p + 80, uv) : PokeI(p + 88, one)
+  PokeI(p + 96, c2) : PokeI(p + 104, uv) : PokeI(p + 112, one)
+  PokeI(p + 120, c3) : PokeI(p + 128, uv) : PokeI(p + 136, one)
+EndProcedure
+
+; Room for `quads` line quads; answers the first vertex index, or -1.
+Procedure.i NeonVkChromeLinesReserve(quads.i)
+  Define first.i
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn -1
+  EndIf
+  If quads < 1 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + quads * 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn -1
+  EndIf
+  If ((nvcMapped + nvcVertices * #NEON_VK_CHROME_VERTEX_BYTES) & 7) <> 0
+    ProcedureReturn -1                              ; the 8-byte stores need an aligned start
+  EndIf
+  nvcClipXBits2(nvcPhysicalW) : nvcClipYBits2(nvcPhysicalH)      ; the tables, built here and not by a worker
+  first = nvcVertices
+  nvcVertices = nvcVertices + quads * 6
+  ProcedureReturn first
+EndProcedure
+
+Procedure.i NeonVkChromeVertexAddress(index.i)
+  ProcedureReturn nvcMapped + index * #NEON_VK_CHROME_VERTEX_BYTES
+EndProcedure
+
 ; Neon colours are logical packed 0xAARRGGBB. The sampled fragment shader
 ; consumes float RGBA, independent of the attachment's BGRA byte layout.
 Procedure nvcTint(colour.i, *push)
@@ -2071,6 +2165,14 @@ EndProcedure
 
 Procedure.i nvcDraw(first.i, count.i, colour.i)
   ProcedureReturn nvcDrawSet(first, count, colour, nvcDescriptorSet)
+EndProcedure
+
+; The reserved run of line quads, drawn as one draw in colour.
+Procedure.i NeonVkChromeLinesDraw(first.i, quads.i, colour.i)
+  If quads < 1
+    ProcedureReturn #NEON_VK_CHROME_OK
+  EndIf
+  ProcedureReturn nvcDraw(first, quads * 6, colour)
 EndProcedure
 
 ; Shared source-rectangle, destination-size and tint path for the legacy slot
