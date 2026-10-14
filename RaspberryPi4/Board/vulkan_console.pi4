@@ -70,6 +70,13 @@ Global Dim avcLayoutAdvance.i[#CON_MAXCOLS]
 ; now asks for a frame that holds the banner alone; the pump copies only the
 ; banner strip to the display and the text on the glass is left as it is.
 Global avcBannerDirty.i
+; Where a console frame's time goes, counted on the board's own counter since
+; the last `vkstat`: [0] building the frame on the processor, [1] submitting it
+; and waiting for the GPU, [2] copying it to the display. Banner-only frames
+; and whole frames are kept apart.
+Global Dim avcStatBanner.i[3]
+Global Dim avcStatFull.i[3]
+Global avcStatBannerN.i, avcStatFullN.i, avcStatSince.i
 
 Procedure avcBannerInvalidate()
   avcBannerDirty = 1
@@ -867,25 +874,34 @@ EndProcedure
 ; A frame that holds the banner and nothing else, for a change of the clock or
 ; the glint while the text is unchanged. Returns 1 when it was presented.
 Procedure.i avcPumpBannerOnly()
-  Define rc.i, endRc.i
+  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i
+  t0 = Ticks()
   avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
   If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
   avcBannerFrameReady = 0
   rc = avcRenderBanner()
+  t1 = Ticks()
   *gV3dWaitIdle = @avcGpuWaitIdle
   endRc = NeonVkChromeEnd()
   *gV3dWaitIdle = 0
+  t2 = Ticks()
   If rc <> #NEON_VK_CHROME_OK Or NeonVkChromeError() <> 0 Or endRc <> #VK_SUCCESS
     If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
     ProcedureReturn 0
   EndIf
   If NeonVkChromePresentPending() <> 1 : ProcedureReturn 0 : EndIf
   If NeonVkChromePresentConsume() <> 1 : ProcedureReturn 0 : EndIf
-  ProcedureReturn avcCopyBannerToDisplay()
+  ok = avcCopyBannerToDisplay()
+  avcStatBanner[0] = avcStatBanner[0] + (t1 - t0)
+  avcStatBanner[1] = avcStatBanner[1] + (t2 - t1)
+  avcStatBanner[2] = avcStatBanner[2] + (Ticks() - t2)
+  avcStatBannerN = avcStatBannerN + 1
+  ProcedureReturn ok
 EndProcedure
 
 Procedure VulkanConsolePump()
   Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i
+  Define st0.i, st1.i, st2.i
   Define layoutCount.i, layoutLines.i, layoutWidth.i, baseline.i, visible.i
   If avcReady = 0 Or avcActive = 0 Or gScreen = 0
     ProcedureReturn
@@ -903,6 +919,7 @@ Procedure VulkanConsolePump()
     EndIf
   EndIf
   avcBannerDirty = 0
+  st0 = Ticks()
   rc = avcWarmGrid()
   If rc < 0
     avcFailover(#AVC_ERR_CHROME)
@@ -994,7 +1011,9 @@ Procedure VulkanConsolePump()
   EndIf
   V3dConRenderCursor()
   rc = NeonVkChromeError()
+  st1 = Ticks()
   endRc = NeonVkChromeEnd()
+  st2 = Ticks()
   If rc <> 0 Or endRc <> #VK_SUCCESS
     If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
     avcFailover(#AVC_ERR_CHROME)
@@ -1014,8 +1033,52 @@ Procedure VulkanConsolePump()
   EndIf
   avcFramePresented = 1
   ConGridClearDirty()
+  avcStatFull[0] = avcStatFull[0] + (st1 - st0)
+  avcStatFull[1] = avcStatFull[1] + (st2 - st1)
+  avcStatFull[2] = avcStatFull[2] + (Ticks() - st2)
+  avcStatFullN = avcStatFullN + 1
   ; ScreenPump invokes the overlay immediately after this renderer. Marking
   ; it dirty here would schedule another whole GPU frame on every prompt
   ; service tick, even when the console and keyboard had not changed.
   avcError = 0
+EndProcedure
+
+Procedure avcStatLine(*label, n.i, sum0.i, sum1.i, sum2.i, hz.i)
+  Print("  ")
+  UartWriteStr(*label)
+  PrintDec(n)
+  If n > 0 And hz > 0
+    Print(" frames; per frame, microseconds: build ")
+    PrintDec(((sum0 / n) * 1000000) / hz)
+    Print(", submit and GPU wait ")
+    PrintDec(((sum1 / n) * 1000000) / hz)
+    Print(", copy to the display ")
+    PrintDec(((sum2 / n) * 1000000) / hz)
+  EndIf
+  PrintNl()
+EndProcedure
+
+; vkstat - what the Vulkan console's frames cost since the last vkstat.
+Procedure CmdVkStat()
+  Define hz.i, span.i, busy.i, share.i
+  hz = TickHz()
+  span = Ticks() - avcStatSince
+  If avcActive = 0
+    PrintN("The Vulkan console is not the active renderer now (type screen vulkan).")
+  EndIf
+  Print("Vulkan console frames over the last ")
+  If hz > 0 : PrintDec(span / hz) : EndIf
+  PrintN(" seconds:")
+  avcStatLine("banner only: ", avcStatBannerN, avcStatBanner[0], avcStatBanner[1], avcStatBanner[2], hz)
+  avcStatLine("whole frame: ", avcStatFullN, avcStatFull[0], avcStatFull[1], avcStatFull[2], hz)
+  busy = avcStatBanner[0] + avcStatBanner[1] + avcStatBanner[2] + avcStatFull[0] + avcStatFull[1] + avcStatFull[2]
+  If span > 0
+    share = (busy * 10000) / span
+    Print("  their share of the time, the GPU waits included: ")
+    PrintDec(share / 100) : Print(".") : PrintDec(share % 100) : PrintN("%")
+  EndIf
+  avcStatBannerN = 0 : avcStatFullN = 0
+  avcStatBanner[0] = 0 : avcStatBanner[1] = 0 : avcStatBanner[2] = 0
+  avcStatFull[0] = 0 : avcStatFull[1] = 0 : avcStatFull[2] = 0
+  avcStatSince = Ticks()
 EndProcedure
