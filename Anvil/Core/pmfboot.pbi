@@ -995,6 +995,7 @@ Procedure PmfEnter()
 
   If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
     BuildServiceTable()
+    SvcFileHReset()              ; no file handle outlives the payload that opened it
     gGoX0 = SvcTableAddr()
     Print("This payload asked for the service table, so it is entered with x0 = ")
     PutAddr(gGoX0)

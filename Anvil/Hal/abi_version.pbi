@@ -83,6 +83,10 @@
 ;  #SVCCAP_MAX raised to 16, which is the same append this file's 1.1 note
 ;  describes for #SVCCAP_THERMAL.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 3
-#SVC_SLOT_COUNT  = 192         ; 184 at 1.0-1.2; group 15 appended at 1.3.
+#SVC_ABI_MINOR   = 4
+;  1.4 - FILE HANDLES, a new group at base 192. The file group at base 48
+;  had two slots left and handles need four, so by the versioning rule the
+;  group that cannot hold them gets a new block at the end rather than a
+;  renumbering. #SVC_SLOT_COUNT moves 192 -> 200; no existing index moves.
+#SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.
