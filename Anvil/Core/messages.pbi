@@ -61,6 +61,7 @@ Global gMsgOpen.i = 0                  ; 1 while the current bracket has a line
 Global gMsgNewestSlot.i = -1           ; first line of the newest message
 Global Dim gMsgCur.a[#MSG_LINE + 1]
 Global gMsgCurLen.i = 0
+Global *gMsgLineHook                    ; when set: (line, length, message number) for every kept line - the file copy
 Global Dim gMsgNone.a[1]               ; the empty string MessagesNewest returns
 
 Procedure.i msg_Secs()
@@ -122,6 +123,9 @@ Procedure msg_Commit()
   gMsgText[base + gMsgCurLen] = 0
   gMsgNoOf[gMsgNext] = gMsgNo
   gMsgSecsOf[gMsgNext] = msg_Secs()
+  If *gMsgLineHook <> 0
+    gMsgLineHook(@gMsgCur[0], gMsgCurLen, gMsgNo)
+  EndIf
   gMsgLines = gMsgLines + 1
   gMsgNext = gMsgNext + 1
   If gMsgNext >= #MSG_SLOTS

@@ -277,6 +277,8 @@ Procedure AnvilSchedulerAccount()
   EndIf
 EndProcedure
 
+Global *gAnvilIdleHook                    ; set by a board that has idle work of its own; called from slot 3
+
 Procedure AnvilPromptServiceOne()
   UartMessageBegin()
   Select anvil_promptServiceSlot
@@ -303,6 +305,9 @@ Procedure AnvilPromptServiceOne()
         FanTick()
       CompilerEndIf
       HwTempSampleTick()
+      If *gAnvilIdleHook <> 0          ; a board's own idle work (the Pi 4: the message log's file copy)
+        gAnvilIdleHook()
+      EndIf
     Case 4
       NetConsoleRearm()
       NetConsolePump()

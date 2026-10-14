@@ -52,7 +52,7 @@ def probe_source() -> str:
         "wifi_AssocEvent", "wifi_TrySlot", "wifi_ServiceEapol", "wifi_PtkRekeyFinish",
         "WifiRecoveryCancel", "WifiRecoveryActive", "WifiRecoveryInitialJoinFailed",
         "wifi_RecoverForgetPmk",
-        "wifi_RecoverCandidateFail", "wifi_RecoverFail",
+        "wifi_EpAttemptFailed", "wifi_RecoverCandidateFail", "wifi_RecoverFail",
         "wifi_RecoverControlFail", "wifi_RecoverSupplicantSendFail",
         "wifi_RecoverEventDropFail",
         "wifi_RecoverTeardownOk",
@@ -280,6 +280,10 @@ Procedure.i WifiRecSave(*why, *counters) : gate_recSaves = gate_recSaves + 1 : P
 #WIFI_EP_RESET_AFTER = 8
 Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i, gWifiLastChan.i
 Procedure.i wifi_EpCounters() : ProcedureReturn 0 : EndProcedure
+Global gWifiRecJoinAt.i, gWifiRecJoinRx.i, gWifiRecJoinTx.i, gWifiTdType.i, gWifiTdReason.i
+Global cyw43_rxData.i, cyw43_txFrames.i, cyw43_linkChannel.i, cyw43_linkRssi.i
+Procedure.i Cyw43ReadChannel(ms.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReadRssi(ms.i) : ProcedureReturn 0 : EndProcedure
 Procedure wifi_EpFail(code.i, a.i, b.i, *why) : WifiRec(code, a, b) : If gWifiEp = 0 : gWifiEp = 1 : gWifiEpFails = 0 : gWifiEpReset = 0 : WifiRecSave(*why, 0) : EndIf : EndProcedure
 Procedure wifi_EpRecovered() : WifiRec(#WR_REC_OK, 0, gWifiEpFails) : If gWifiEp <> 0 : gWifiEp = 0 : WifiRecSave(0, 0) : EndIf : EndProcedure
 Procedure wifi_RecordLinkDown() : NetDhcpLinkDown(#HW_LINK_WIFI) : gWifiKeyed = 0 : gWifiHaveIp = 0 : gWifiSecDone = 0 : gWifiTeardown = 0 : EndProcedure
@@ -637,10 +641,29 @@ Procedure.i Main()
   If gate_eventDrains <> 1 Or gWifiRecGeneration = generation Or gWifiRecPhase <> #WIFI_REC_LEAVE : ProcedureReturn 42 : EndIf
   If gate_receives <> before Or gWifiTeardown <> 0 : ProcedureReturn 43 : EndIf
 
+
   ; Failure leaves truthful down state and arms the existing slow retry clock.
   gWifiRecPhase = #WIFI_REC_SCAN_POLL : gate_scanVerdict = #CYW43_SCAN_FAILED : gate_ms = 9000
   WifiRecoveryTick()
   If gWifiRecPhase <> #WIFI_REC_IDLE Or gWifiHealPend = 0 Or gWifiHealLast <> gate_ms : ProcedureReturn 21 : EndIf
+
+  ; That restart IS a failed attempt (2026-10-14): counted, saved, and the eighth
+  ; climbs to the radio reset rung - it used to bypass the count, and an
+  ; eleven-minute loop of losses never saved again nor reset the radio.
+  GateInit() : gWifiEp = 0 : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiUp = 1
+  before = gate_radioArms
+  For i = 1 To #WIFI_EP_RESET_AFTER
+    WifiRecoveryStart(0)
+    gWifiRecPhase = #WIFI_REC_EAPOL_RX : gWifiRecSlot = 1 : gWifiRecSsidLen = 4 : gWifiRecFp = 123
+    GateBindCredential() : gate_teardownOnDrain = 1
+    WifiRecoveryTick()
+    gate_teardownOnDrain = 0
+    If i < #WIFI_EP_RESET_AFTER
+      If gWifiEpFails <> i Or gWifiRecPhase <> #WIFI_REC_LEAVE Or gate_radioArms <> before : ProcedureReturn 115 : EndIf
+    EndIf
+  Next
+  If gWifiEp <> 1 Or gWifiEpFails <> #WIFI_EP_RESET_AFTER Or gWifiEpReset <> 1 Or gWifiRadioResets < 1 : ProcedureReturn 116 : EndIf
+  If gate_radioArms <> before + 1 Or gWifiUp <> 0 Or gWifiRecPhase <> #WIFI_REC_IDLE : ProcedureReturn 117 : EndIf
 
   ; RNG warm-up/FIFO pending is nonblocking and has an elapsed deadline.
   GateInit() : WifiRecoveryStart(0)
@@ -1180,7 +1203,7 @@ def main() -> int:
         print(f"wifi_recovery_emitted_check: FAIL assertion {result} after {steps:,} A64 instructions")
         return 1
     print(
-        "wifi_recovery_emitted_check: PASS - 114 assertions, "
+        "wifi_recovery_emitted_check: PASS - 117 assertions, "
         f"{steps:,} A64 instructions; candidate-owner/cache/send mutants rejected"
     )
     return 0

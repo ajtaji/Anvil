@@ -182,6 +182,7 @@ EndProcedure
 ; newest #WIFI_LOG_MAX bytes kept). why: a short sentence. 1 saved, 0 not (wrec_saveErr says why).
 Procedure.i WifiRecSave(*why, *counters)
   Define i.i, k.i, now.i, n.i, old.i, keep.i, total.i
+  MsgLogFlush(1)                                   ; the messages up to now go out with the incident
   wrec_at = 0 : now = millis()
   wrec_incidents = wrec_incidents + 1
   wrec_Str("===== Wi-Fi incident ") : wrec_Dec(wrec_incidents) : wrec_Str(" at ") : wrec_When()
