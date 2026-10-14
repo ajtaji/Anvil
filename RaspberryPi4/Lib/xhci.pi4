@@ -930,7 +930,16 @@ EnableExplicit
 ; The arena is checked once with PcieDmaOk() and xh_Alloc() refuses
 ; rather than overruns, so getting this too SMALL is a named error
 ; (#XHCI_ERR_ARENA) and not corruption. Getting it too large costs BSS.
-#XHCI_ARENA_BYTES = 558912
+; Grown 2026-10-14 for THE SERIAL PIPE (a GNSS receiver on USB):
+;
+;   +  2048  serial OUT and serial IN rings
+;   +  1024  the serial reading transfer's buffer
+;   +   512  the serial write buffer
+;   +  4608  room for the 64 KB-boundary padding those three may need, and slack
+;   =  8192 more, 567104 in all. Without it the arena had 120 bytes to spare and
+;   the allocations after these - the event ring among them - would have been
+;   refused at boot, which is USB, and the boot medium with it, gone.
+#XHCI_ARENA_BYTES = 567104
 
 ; ======================================================================
 ;  RING IDS. Two producer rings, indexed rather than pointed at,
@@ -1012,7 +1021,16 @@ EnableExplicit
 ; these numbers; they are indices into xh_ringBase[].
 #XHCI_RING_BULK_OUT = 9
 #XHCI_RING_BULK_IN  = 10
-#XHCI_RING_N   = 11         ; 1 command + 8 slot rings + 2 bulk rings.
+; Rings 11 and 12 are THE SERIAL PAIR: one USB serial device (a GNSS receiver
+; on a CDC-ACM port or a USB-to-serial bridge) on a slot of its own, beside the
+; bulk pair the storage device holds. See THE SERIAL PIPE at the end of this
+; file. Added 2026-10-14.
+#XHCI_RING_SER_OUT = 11
+#XHCI_RING_SER_IN  = 12
+#XHCI_RING_N   = 13         ; 1 command + 8 slot rings + 2 bulk rings + 2 serial rings.
+#XHCI_SER_XFER = 1024           ; one reading transfer, bytes
+#XHCI_SER_RING = 16384          ; the bytes kept until they are read
+#XHCI_SER_OUTMAX = 512          ; one write, bytes
                             ; Written out because a constant expression
                             ; is not parsed here; keep the three in step
                             ; with #XHCI_MAX_DEVS.
@@ -1481,6 +1499,12 @@ Global xh_setup.i   = 0
 Global Dim xh_ringBase.i[#XHCI_RING_N]
 Global Dim xh_ringEnq.i[#XHCI_RING_N]    ; index of the next free TRB
 Global Dim xh_ringCycle.i[#XHCI_RING_N]  ; the Producer Cycle State
+; the serial pipe's state (THE SERIAL PIPE, end of file)
+Global xh_serSlot.i, xh_serDciIn.i, xh_serDciOut.i, xh_serMpsIn.i, xh_serMpsOut.i
+Global xh_serBuf.i, xh_serOutBuf.i, xh_serPend.i, xh_serTrb.i, xh_serDone.i, xh_serComp.i, xh_serResid.i
+Global xh_serHead.i, xh_serTail.i, xh_serLost.i, xh_serXfers.i, xh_serErrs.i, xh_serStalls.i, xh_serBytes.i
+Global xh_serStrip.i                ; bytes a chip puts at the head of every packet (FTDI: 2), taken out
+Global Dim xh_serRing.a[#XHCI_SER_RING]
 
 ; The event ring - consumer side, no link TRB.
 Global xh_evBase.i  = 0
@@ -3124,6 +3148,10 @@ Procedure.i xh_MemInit()
   ; Transfer Ring segments again: 64 KB.
   xh_ringBase[#XHCI_RING_BULK_OUT] = xh_Alloc(#XHCI_SEGMENT_SIZE, #XHCI_ALIGN, #XHCI_BOUND_64K)
   xh_ringBase[#XHCI_RING_BULK_IN]  = xh_Alloc(#XHCI_SEGMENT_SIZE, #XHCI_ALIGN, #XHCI_BOUND_64K)
+  xh_ringBase[#XHCI_RING_SER_OUT] = xh_Alloc(#XHCI_SEGMENT_SIZE, #XHCI_ALIGN, #XHCI_BOUND_64K)
+  xh_ringBase[#XHCI_RING_SER_IN]  = xh_Alloc(#XHCI_SEGMENT_SIZE, #XHCI_ALIGN, #XHCI_BOUND_64K)
+  xh_serBuf    = xh_Alloc(#XHCI_SER_XFER, #XHCI_ALIGN, #XHCI_BOUND_64K)
+  xh_serOutBuf = xh_Alloc(#XHCI_SER_OUTMAX, #XHCI_ALIGN, #XHCI_BOUND_64K)
   If xh_ringBase[#XHCI_RING_BULK_OUT] = 0 Or xh_ringBase[#XHCI_RING_BULK_IN] = 0
     ProcedureReturn xh_Fail(#XHCI_ERR_ARENA)
   EndIf
@@ -3384,6 +3412,36 @@ EndProcedure
 ; alternative and was not chosen: xh_Bulk's residual arithmetic
 ; ((xh_evTrb - firstTrb) / 16) assumes the same contiguity, so a
 ; wrap-aware match alone would trade a timeout for a wrong byte count.
+; ----------------------------------------------------------------------
+;  THE SERIAL PIPE'S STATE (procedures at the end of the file). It sits
+;  here because the event code below must recognise the pipe's
+;  completions: the event ring is shared by every endpoint on every slot,
+;  and a wait for some other transfer drops what it does not expect - so a
+;  completion of the serial pipe's reading transfer is taken out of the
+;  stream wherever events are read, and never counted as stale.
+; ----------------------------------------------------------------------
+
+; 1 when the event (type ty, fields f0..f3) is the serial pipe's reading
+; transfer completing - its result is kept and the caller drops the event.
+Procedure.i xh_SerTake(ty.i, f0.i, f1.i, f2.i)
+  Define trb.i
+  If ty <> #XHCI_TRB_TRANSFER Or xh_serPend = 0 Or xh_serTrb = 0
+    ProcedureReturn 0
+  EndIf
+CompilerIf #PMF_CHIP = 2712
+  trb = xh_DmaCpu((f1 << 32) | (f0 & $FFFFFFFF))
+CompilerElse
+  trb = (f1 << 32) | (f0 & $FFFFFFFF)
+CompilerEndIf
+  If trb <> xh_serTrb
+    ProcedureReturn 0
+  EndIf
+  xh_serComp = (f2 >> 24) & $FF
+  xh_serResid = f2 & $FFFFFF
+  xh_serDone = 1
+  ProcedureReturn 1
+EndProcedure
+
 #XHCI_ERR_TD_WRAP = 50
 
 Procedure.i xh_WaitEventFor(expect.i, wantLo.i, wantHi.i, ms.i)
@@ -3434,6 +3492,9 @@ Procedure.i xh_WaitEventFor(expect.i, wantLo.i, wantHi.i, ms.i)
       ; transferred, for a transfer event.
       xh_lastResid = xh_evF2 & $FFFFFF
       xh_AckEvent()
+      If xh_SerTake(ty, xh_evF0, xh_evF1, xh_evF2) <> 0
+        Continue                       ; the serial pipe's, kept for it; not this wait's
+      EndIf
       If ty = expect
         ; MATCH THE EVENT TO THE TRB THAT CAUSED IT, when the caller
         ; knows which one that is.
@@ -3532,8 +3593,10 @@ Procedure.i xh_DrainEvents()
     EndIf
     at = xh_evBase + (xh_evDeq * #XHCI_TRB_BYTES)
     ty = (PeekN(at + 12) & $FC00) >> 10
-    If ty = #XHCI_TRB_TRANSFER
-      xh_drainedXfer = xh_drainedXfer + 1
+    If xh_SerTake(ty, PeekN(at + 0), PeekN(at + 4), PeekN(at + 8)) = 0
+      If ty = #XHCI_TRB_TRANSFER
+        xh_drainedXfer = xh_drainedXfer + 1
+      EndIf
     EndIf
     xh_AckEvent()
     n = n + 1
@@ -7297,4 +7360,226 @@ EndProcedure
 
 Procedure.i XhciErrorText()
   ProcedureReturn XhciErrorTextOf(xh_err)
+EndProcedure
+
+
+; ======================================================================
+;  THE SERIAL PIPE - one USB serial device's bulk pair, read without waiting.
+;
+;  For a GNSS receiver on USB: a CDC-ACM port (u-blox and most modern
+;  receivers) or a USB-to-serial bridge (FTDI, Prolific, Silicon Labs, WCH).
+;  The chip's own set-up (line coding, baud, modem lines) is the caller's -
+;  see Lib/usbserial.pi4; this is only the transport, and it knows no chip.
+;
+;  READING NEVER WAITS. One reading transfer of #XHCI_SER_XFER bytes is kept
+;  queued on the IN endpoint at all times; the device answers it with what it
+;  has (a short packet ends it - ISP), the controller posts a transfer event,
+;  and XhciSerialPoll() takes that event, keeps the bytes and queues the next
+;  transfer. A receiver that has nothing to say leaves the transfer pending
+;  for as long as it likes, and nothing here is held up by that.
+;
+;  THE EVENT RING IS SHARED, and that is the whole difficulty. Every wait in
+;  this file reads events, and before this pipe existed a transfer event
+;  that was not the one being waited for was dropped as stale. xh_SerTake()
+;  is consulted by every reader of events (xh_WaitEventFor, xh_DrainEvents and
+;  XhciSerialPoll itself): an event naming the serial pipe's queued TRB is
+;  kept for the pipe and is never mistaken for, or by, anything else.
+;
+;  ONE SERIAL DEVICE AT A TIME, on rings 11 and 12, for the same reason the
+;  bulk pair is one device's: two owners of one ring is the 2026-08-26 defect.
+; ======================================================================
+
+; Configures the serial pipe's two bulk endpoints on slot `slot` (already
+; addressed; its configuration already set with SET_CONFIGURATION). 1, or 0
+; with XhciLastError(). Leaves the current control slot as it was.
+Procedure.i XhciSerialConfigure(slot.i, epOut.i, mpsOut.i, epIn.i, mpsIn.i)
+  Define ictl.i, sctx.i, eo.i, ei.i, deq.i, maxDci.i, dOut.i, dIn.i
+  If xh_ready = 0
+    ProcedureReturn xh_Fail(#XHCI_ERR_NOT_READY)
+  EndIf
+  If slot < 1 Or slot > #XHCI_MAX_DEVS Or xh_devMps[slot] = 0
+    ProcedureReturn xh_Fail(#XHCI_ERR_BAD_SLOT)
+  EndIf
+  If slot = xh_mscSlot
+    ProcedureReturn xh_Fail(#XHCI_ERR_EP_BUSY)
+  EndIf
+  If (epOut & $80) <> 0 Or (epIn & $80) = 0 Or mpsOut <= 0 Or mpsIn <= 0
+    ProcedureReturn xh_Fail(#XHCI_ERR_EP_ARG)
+  EndIf
+  If xh_serBuf = 0 Or xh_serOutBuf = 0
+    ProcedureReturn xh_Fail(#XHCI_ERR_ARENA)
+  EndIf
+  dOut = xh_Dci(epOut) : dIn = xh_Dci(epIn)
+  If dOut < 2 Or dIn < 2 Or dOut > 31 Or dIn > 31
+    ProcedureReturn xh_Fail(#XHCI_ERR_EP_ARG)
+  EndIf
+  xh_RingReset(#XHCI_RING_SER_OUT)
+  xh_RingReset(#XHCI_RING_SER_IN)
+  ictl = xh_inCtx
+  sctx = xh_inCtx + xh_ctxSize
+  eo   = xh_inCtx + (xh_ctxSize * (dOut + 1))
+  ei   = xh_inCtx + (xh_ctxSize * (dIn + 1))
+  PokeN(ictl + 0, 0)
+  PokeN(ictl + 4, #XHCI_SLOT_FLAG | (1 << dOut) | (1 << dIn))
+  maxDci = dOut
+  If dIn > maxDci : maxDci = dIn : EndIf
+  xh_Inval(xh_devCtx[slot], #XHCI_DEV_CTX_BYTES)
+  PokeN(sctx + 0, (PeekN(xh_devCtx[slot] + 0) & $07FFFFFF) | (maxDci << 27))
+  PokeN(sctx + 4, PeekN(xh_devCtx[slot] + 4))
+  PokeN(sctx + 8, PeekN(xh_devCtx[slot] + 8))
+  PokeN(sctx + 12, 0)
+  PokeN(eo + 0, 0)
+  PokeN(eo + 4, #XHCI_EP_TYPE_BULK_OUT | #XHCI_EP_ERRCNT_3 | ((mpsOut & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[#XHCI_RING_SER_OUT]) | xh_ringCycle[#XHCI_RING_SER_OUT]
+CompilerElse
+  deq = xh_ringBase[#XHCI_RING_SER_OUT] | xh_ringCycle[#XHCI_RING_SER_OUT]
+CompilerEndIf
+  PokeN(eo + 8, deq & $FFFFFFFF) : PokeN(eo + 12, (deq >> 32) & $FFFFFFFF)
+  PokeN(eo + 16, mpsOut & $FFFF)
+  PokeN(ei + 0, 0)
+  PokeN(ei + 4, #XHCI_EP_TYPE_BULK_IN | #XHCI_EP_ERRCNT_3 | ((mpsIn & $FFFF) << 16))
+CompilerIf #PMF_CHIP = 2712
+  deq = xh_Dma(xh_ringBase[#XHCI_RING_SER_IN]) | xh_ringCycle[#XHCI_RING_SER_IN]
+CompilerElse
+  deq = xh_ringBase[#XHCI_RING_SER_IN] | xh_ringCycle[#XHCI_RING_SER_IN]
+CompilerEndIf
+  PokeN(ei + 8, deq & $FFFFFFFF) : PokeN(ei + 12, (deq >> 32) & $FFFFFFFF)
+  PokeN(ei + 16, mpsIn & $FFFF)
+  xh_Clean(xh_inCtx, #XHCI_IN_CTX_BYTES)
+  If xh_Command(#XHCI_TRB_CONFIG_EP, xh_inCtx, slot, #XHCI_TMO_EVENT_MS) = 0
+    ProcedureReturn 0
+  EndIf
+  xh_Inval(xh_devCtx[slot], #XHCI_DEV_CTX_BYTES)
+  xh_serSlot = slot : xh_serDciIn = dIn : xh_serDciOut = dOut
+  xh_serMpsIn = mpsIn : xh_serMpsOut = mpsOut
+  xh_serPend = 0 : xh_serDone = 0 : xh_serTrb = 0
+  xh_serHead = 0 : xh_serTail = 0 : xh_serLost = 0 : xh_serStrip = 0
+  ProcedureReturn 1
+EndProcedure
+
+Procedure.i XhciSerialSlot()   : ProcedureReturn xh_serSlot   : EndProcedure
+; Bytes the chip puts at the head of every IN packet, to be taken out (FTDI: 2). Packets
+; are whole within one transfer, so the count restarts at each transfer's first byte.
+Procedure XhciSerialSetStrip(n.i)
+  xh_serStrip = n
+EndProcedure
+Procedure.i XhciSerialMpsIn()  : ProcedureReturn xh_serMpsIn  : EndProcedure
+Procedure.i XhciSerialXfers()  : ProcedureReturn xh_serXfers  : EndProcedure
+Procedure.i XhciSerialErrors() : ProcedureReturn xh_serErrs   : EndProcedure
+Procedure.i XhciSerialStalls() : ProcedureReturn xh_serStalls : EndProcedure
+Procedure.i XhciSerialLost()   : ProcedureReturn xh_serLost   : EndProcedure
+Procedure.i XhciSerialBytes()  : ProcedureReturn xh_serBytes  : EndProcedure
+
+; Forget the device (it went away, or another is wanted). A reading transfer
+; still queued is left to complete on its own; its event is then stale.
+Procedure XhciSerialForget()
+  xh_serSlot = 0 : xh_serPend = 0 : xh_serTrb = 0 : xh_serDone = 0
+EndProcedure
+
+; Queue the next reading transfer.
+Procedure.i xh_SerQueue()
+  Define f3.i
+  xh_Clean(xh_serBuf, #XHCI_SER_XFER)
+  f3 = #XHCI_TRB_ISP | #XHCI_TRB_IOC | (#XHCI_TRB_NORMAL << 10)
+CompilerIf #PMF_CHIP = 2712
+  xh_serTrb = xh_QueueTrb(#XHCI_RING_SER_IN, xh_Dma(xh_serBuf) & $FFFFFFFF, (xh_Dma(xh_serBuf) >> 32) & $FFFFFFFF, #XHCI_SER_XFER, f3)
+CompilerElse
+  xh_serTrb = xh_QueueTrb(#XHCI_RING_SER_IN, xh_serBuf & $FFFFFFFF, (xh_serBuf >> 32) & $FFFFFFFF, #XHCI_SER_XFER, f3)
+CompilerEndIf
+  xh_serDone = 0 : xh_serPend = 1
+  xh_Doorbell(xh_serSlot, xh_serDciIn)
+  ProcedureReturn 1
+EndProcedure
+
+; Services the pipe and NEVER WAITS. Takes any events already posted (a wait
+; is not running when this is called, so an event that is not the pipe's is
+; one nothing is waiting for - counted by the drain as before), keeps the bytes
+; of a completed transfer and queues the next. Answers the bytes kept by this
+; call, 0, or -1 when no serial device is configured.
+Procedure.i XhciSerialPoll()
+  Define n.i, i.i, at.i, ty.i, room.i
+  If xh_serSlot = 0
+    ProcedureReturn -1
+  EndIf
+  If xh_serPend = 0
+    xh_SerQueue()
+    ProcedureReturn 0
+  EndIf
+  If xh_serDone = 0
+    xh_DrainEvents()
+  EndIf
+  If xh_serDone = 0
+    ProcedureReturn 0
+  EndIf
+  xh_serPend = 0 : xh_serDone = 0
+  n = 0
+  If xh_serComp = #XHCI_COMP_SUCCESS Or xh_serComp = #XHCI_COMP_SHORT_TX
+    n = #XHCI_SER_XFER - xh_serResid
+    If n < 0 : n = 0 : EndIf
+    If n > #XHCI_SER_XFER : n = #XHCI_SER_XFER : EndIf
+    xh_Inval(xh_serBuf, #XHCI_SER_XFER)
+    For i = 0 To n - 1
+      If xh_serStrip > 0 And xh_serMpsIn > 0
+        If (i % xh_serMpsIn) < xh_serStrip : Continue : EndIf      ; a packet's status bytes, not data
+      EndIf
+      If xh_serHead - xh_serTail < #XHCI_SER_RING
+        xh_serRing[xh_serHead % #XHCI_SER_RING] = PeekA(xh_serBuf + i)
+        xh_serHead = xh_serHead + 1
+      Else
+        xh_serLost = xh_serLost + 1
+      EndIf
+    Next
+    xh_serXfers = xh_serXfers + 1 : xh_serBytes = xh_serBytes + n
+  ElseIf xh_serComp = #XHCI_COMP_STALL
+    xh_serStalls = xh_serStalls + 1
+    xh_ClearHalt(xh_serSlot, #XHCI_RING_SER_IN, xh_serDciIn)
+  Else
+    xh_serErrs = xh_serErrs + 1
+    If xh_EpStateAt(xh_serSlot, xh_serDciIn) = #XHCI_EP_STATE_HALTED
+      xh_ClearHalt(xh_serSlot, #XHCI_RING_SER_IN, xh_serDciIn)
+    EndIf
+  EndIf
+  xh_SerQueue()
+  ProcedureReturn n
+EndProcedure
+
+; Up to max kept bytes into *dst; answers how many.
+Procedure.i XhciSerialRead(*dst, max.i)
+  Define n.i
+  n = 0
+  While n < max And xh_serTail < xh_serHead
+    PokeA(*dst + n, xh_serRing[xh_serTail % #XHCI_SER_RING])
+    xh_serTail = xh_serTail + 1 : n = n + 1
+  Wend
+  ProcedureReturn n
+EndProcedure
+
+; Writes len bytes (a receiver's configuration message), waiting at most
+; 200 ms for the device to take them. Answers len, or -1. The reading
+; transfer's completion, if it lands meanwhile, is kept by xh_SerTake.
+Procedure.i XhciSerialWrite(*src, len.i)
+  Define i.i, trb.i, f3.i
+  If xh_serSlot = 0 Or *src = 0 Or len < 1 Or len > #XHCI_SER_OUTMAX
+    ProcedureReturn -1
+  EndIf
+  For i = 0 To len - 1 : PokeA(xh_serOutBuf + i, PeekA(*src + i)) : Next
+  xh_Clean(xh_serOutBuf, len)
+  f3 = #XHCI_TRB_IOC | (#XHCI_TRB_NORMAL << 10)
+CompilerIf #PMF_CHIP = 2712
+  trb = xh_QueueTrb(#XHCI_RING_SER_OUT, xh_Dma(xh_serOutBuf) & $FFFFFFFF, (xh_Dma(xh_serOutBuf) >> 32) & $FFFFFFFF, len, f3)
+CompilerElse
+  trb = xh_QueueTrb(#XHCI_RING_SER_OUT, xh_serOutBuf & $FFFFFFFF, (xh_serOutBuf >> 32) & $FFFFFFFF, len, f3)
+CompilerEndIf
+  xh_Doorbell(xh_serSlot, xh_serDciOut)
+  If xh_WaitEventFor(#XHCI_TRB_TRANSFER, trb, trb, 200) = 0
+    ProcedureReturn -1
+  EndIf
+  If xh_lastComp <> #XHCI_COMP_SUCCESS And xh_lastComp <> #XHCI_COMP_SHORT_TX
+    If xh_EpStateAt(xh_serSlot, xh_serDciOut) = #XHCI_EP_STATE_HALTED
+      xh_ClearHalt(xh_serSlot, #XHCI_RING_SER_OUT, xh_serDciOut)
+    EndIf
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn len
 EndProcedure

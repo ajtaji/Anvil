@@ -2325,52 +2325,96 @@ EndProcedure
 ;  4.3.1.2(b) requires speed from the ECM, and GNSS speed at a standstill
 ;  is noise, which is precisely how phantom driving events are made.
 ;
-;  No board declares #CAP_GNSS yet. hw_gnss.pi4 is Phase A item 2b.
+;  THE PI 4 AND 5 DECLARE #CAP_GNSS (2026-10-14): Board/hw_gnss.pi4 over
+;  Anvil/Services/gnss.pbi - a receiver on USB, framed and decoded the way the
+;  GNSS Bridge Pico does it. A board that does not declare it keeps the
+;  refusals below, unchanged.
+;
+;  SvcGnssUp()      opens the receiver (USB). #SVC_OK, or #SVC_EIO with the
+;                   reason in SvcErrDetail (the whole sentence).
+;  SvcGnssPoll()    reads what has arrived and decodes it; NEVER WAITS. 1 a
+;                   new fix landed, 0 not, negative an error. Call it every
+;                   pass of the payload's loop.
+;  SvcGnssFix(*fix) the 64-byte record, laid out in gnss.pbi; answers the
+;                   quality (#HW_GNSS_*). Always fills.
 ; ======================================================================
 Procedure.i SvcGnssUp()
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  If HwGnssUp() = 0
+    gSvcDetail = HwGnssErrText()
+    ProcedureReturn #SVC_EIO
+  EndIf
+  gSvcDetail = 0
+  ProcedureReturn #SVC_OK
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssPoll()
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssPoll()
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssFix(*fix)
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssFix(*fix)
+  CompilerElse
   ProcedureReturn #SVC_ENOSYS
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssAgeMs()
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssAgeMs()
+  CompilerElse
   ProcedureReturn -1
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssPpsTicks()
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssPpsTicks()
+  CompilerElse
   ProcedureReturn -1
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssSatsUsed()
   If SvcRequireCap(#CAP_GNSS, "gnss", "this board has no satellite receiver Anvil can reach") = 0
     ProcedureReturn #SVC_ENOCAP
   EndIf
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssSatsUsed()
+  CompilerElse
   ProcedureReturn 0
+  CompilerEndIf
 EndProcedure
 
 Procedure.i SvcGnssErrText()
+  CompilerIf #CAP_GNSS = 1
+  ProcedureReturn HwGnssErrText()
+  CompilerElse
   ProcedureReturn "this board has no satellite receiver Anvil can reach, so there is no fix and no age to report"
+  CompilerEndIf
 EndProcedure
 
 ; ======================================================================
