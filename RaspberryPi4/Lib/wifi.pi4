@@ -2288,6 +2288,7 @@ EndProcedure
 #WIFI_EP_SAVE_EVERY = 10
 #WIFI_EP_RESET_AFTER = 8
 Global gWifiPayloadT0.i
+Global gWifiRecJoinAt.i, gWifiRecJoinRx.i, gWifiRecJoinTx.i   ; the recorder: this attempt's join
 Global gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i, gWifiLastChan.i
 Global Dim wifi_epTxt.a[1024]
 Global wifi_epAt.i
@@ -3003,8 +3004,14 @@ EndProcedure
 ; A failed candidate is not a neutral cancellation. In particular, a failure
 ; after GTK installation or during DHCP must revoke the keyed/addressed route
 ; rather than leave an unaccepted candidate eligible while retry is pending.
-Procedure wifi_RecoverCandidateFail()
-  WifiRec(#WR_REC_FAIL, gWifiRecLastFailPhase, gWifiRecLastFailRc)
+; ONE FAILED ATTEMPT, COUNTED. Every way a recovery attempt can end without the
+; link - a candidate refused, or the link lost again part-way through (the
+; restart in WifiRecoveryTick) - comes through here, so the episode is saved
+; every #WIFI_EP_SAVE_EVERY attempts and the radio reset rung fires after
+; #WIFI_EP_RESET_AFTER. 2026-10-14: the restart path used to bypass this, and
+; an eleven-minute loop of 33 losses saved once and never reset the radio.
+; Returns 1 when the radio reset rung has just fired (the caller stops).
+Procedure.i wifi_EpAttemptFailed()
   If gWifiEp = 0
     gWifiEp = 1 : gWifiEpT0 = millis() : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiEpN = gWifiEpN + 1
     WifiRecSave("a recovery attempt failed (no earlier sign was recorded)", wifi_EpCounters())
@@ -3022,6 +3029,14 @@ Procedure wifi_RecoverCandidateFail()
     wifi_RecordLinkDown()
     gWifiUp = 0
     WifiRadioInitArm(1)
+    ProcedureReturn 1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Procedure wifi_RecoverCandidateFail()
+  WifiRec(#WR_REC_FAIL, gWifiRecLastFailPhase, gWifiRecLastFailRc)
+  If wifi_EpAttemptFailed() <> 0
     ProcedureReturn
   EndIf
   WifiRecoveryCancel()
@@ -3233,6 +3248,7 @@ Procedure WifiRecoveryStart(announce.i)
   EndIf
   gWifiRecStepGeneration = gWifiRecGeneration
   gWifiRecAnnounce = Bool(announce <> 0)
+  WifiRec(#WR_REC_START, gWifiRecGeneration, gWifiRecAnnounce)
   gWifiRecPhase = #WIFI_REC_LEAVE
   gWifiHealPend = 1
   If announce <> 0
@@ -3292,6 +3308,16 @@ Procedure WifiRecoveryTick()
   If gWifiRecPhase >= #WIFI_REC_VERIFY_SSID And gWifiRecPhase <= #WIFI_REC_PERSIST
     WifiDrainEvents()
     If gWifiTeardown <> 0
+      ; lost again part-way through: what the radio said, the phase it caught, how
+      ; long after the join, and the frames that moved since - then COUNTED as a
+      ; failed attempt (wifi_EpAttemptFailed), which saves and climbs the ladder
+      WifiRec(#WR_TEARDOWN, gWifiTdType, gWifiTdReason)
+      WifiRec(#WR_REC_PHASE, gWifiRecPhase, (millis() - gWifiRecJoinAt) & $FFFFFFFF)
+      WifiRec(#WR_COUNTS, cyw43_rxData - gWifiRecJoinRx, cyw43_txFrames - gWifiRecJoinTx)
+      gWifiTeardown = 0
+      If wifi_EpAttemptFailed() <> 0
+        ProcedureReturn
+      EndIf
       WifiRecoveryStart(1)
       ProcedureReturn
     EndIf
@@ -3530,6 +3556,16 @@ Procedure WifiRecoveryTick()
       If Cyw43EventsDropped() <> gWifiRecEventDropBase
         wifi_RecoverEventDropFail()
       ElseIf r = #CYW43_JOIN_JOINED
+        ; the flight recorder: the channel and signal this attempt joined on, and the frame
+        ; counts at that moment (the loss that may follow says how many came after it)
+        If Cyw43ReadChannel(200) = #CYW43_IO_OK
+          gWifiLastChan = cyw43_linkChannel
+        EndIf
+        If Cyw43ReadRssi(200) = #CYW43_IO_OK
+          gWifiLastRssi = cyw43_linkRssi
+        EndIf
+        gWifiRecJoinAt = millis() : gWifiRecJoinRx = cyw43_rxData : gWifiRecJoinTx = cyw43_txFrames
+        WifiRec(#WR_JOIN, gWifiLastChan, gWifiLastRssi)
         gWifiRecPhase = #WIFI_REC_VERIFY_SSID
       ElseIf r = #CYW43_JOIN_FAILED Or gWifiRecSlices >= #WIFI_JOIN_SLICES
         wifi_RecoverJoinFailed()
