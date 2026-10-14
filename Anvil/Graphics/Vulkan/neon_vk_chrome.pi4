@@ -21,10 +21,13 @@
 #NEON_VK_CHROME_ATLAS_PAD      = 64
 #NEON_VK_CHROME_MAX_QUADS      = 4096
 #NEON_VK_CHROME_MAX_VERTICES   = #NEON_VK_CHROME_MAX_QUADS * 6
-; Draw records remain capped at 4096. The resident console counts actual ink
-; quads before each frame and reserves this vertex budget plus UI headroom.
-; At the current 24-byte vertex stride this reserves 3,022,848 bytes.
-#NEON_VK_CHROME_MAX_VERTEX_QUADS = 20992
+; Draw records remain capped at 4096. This is the CEILING a caller may ask
+; NeonVkChromeCreateWithCapacities for; the vertex buffer is sized from what the
+; caller asked, 144 bytes a quad at the current 24-byte stride. The resident
+; console asks for its own figure (#AVC_MAX_QUADS in vulkan_console.pi4, 20,992
+; quads = 3,022,848 bytes), so raising this ceiling costs the monitor nothing.
+; A full-screen application - a map draws one quad a line - may ask for more.
+#NEON_VK_CHROME_MAX_VERTEX_QUADS = 65536
 #NEON_VK_CHROME_MAX_PATH_POINTS = 4096
 #NEON_VK_CHROME_WAIT_NS        = 2000000000
 #NEON_VK_CHROME_F_ONE          = $3F800000
@@ -170,8 +173,8 @@ Global nvcBoxBatchClipH.i
 Global nvcPathKind.i
 Global nvcPathCount.i
 Global nvcPathError.i
-Global Dim nvcPathX.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
-Global Dim nvcPathY.i[#NEON_VK_CHROME_MAX_PATH_POINTS - 1]
+Global Dim nvcPathX.i[#NEON_VK_CHROME_MAX_PATH_POINTS]
+Global Dim nvcPathY.i[#NEON_VK_CHROME_MAX_PATH_POINTS]
 
 Global nvcPhysical.i
 Global nvcDevice.i

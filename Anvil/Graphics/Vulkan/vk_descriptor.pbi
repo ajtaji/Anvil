@@ -881,12 +881,12 @@ Procedure.i AnvilVkDescriptorSetsUpdate(device.i, writeCount.i, *pWrites.VkWrite
   ; PMF's current A64 lowering can lose the fifth parameter after nested
   ; calls; capture its entry value before any validation calls.
   Define copyBase.i = *pCopies
-  Define Dim priorBuf.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
-  Define Dim priorOffset.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
-  Define Dim priorRange.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
-  Define Dim priorSampler.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
-  Define Dim priorView.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
-  Define Dim priorImageLayout.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS - 1]
+  Define Dim priorBuf.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+  Define Dim priorOffset.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+  Define Dim priorRange.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+  Define Dim priorSampler.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+  Define Dim priorView.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
+  Define Dim priorImageLayout.i[(#ANVIL_VK_MAX_DESCRIPTOR_SETS + 1) * #ANVIL_VK_MAX_SET_BINDINGS]
 
   If avkDevSlot(device) = 0 : ProcedureReturn #ANVIL_VK_ERR_HANDLE : EndIf
   If writeCount < 0 Or writeCount > 16 Or copyCount < 0 Or copyCount > 16 Or (writeCount <> 0 And *pWrites = 0) Or (copyCount <> 0 And copyBase = 0)
