@@ -394,6 +394,7 @@ Procedure CmdWifi()
   Define n.i
   Define s.i
   Define k.i
+  Define r.i
 
   SkipSpace()
   gWordAt = gPos
@@ -642,6 +643,36 @@ Procedure CmdWifi()
     ProcedureReturn
   EndIf
 
+  ; deaf <seconds> [ask] - a payload without a payload: the radio goes
+  ; unserviced for that long, then the board does what it does when a
+  ; payload returns. With ask, a group rekey is requested first, so the
+  ; access point's kick lands while nobody listens - the lost-link case
+  ; reproduced in a minute instead of waiting for the hourly rekey.
+  If WordIs("deaf") <> 0
+    n = ParseDec()
+    If n < 1 Or n > 600
+      PrintN("wifi deaf <seconds> [ask]   - 1 to 600 seconds.")
+      ProcedureReturn
+    EndIf
+    r = 0
+    k = ArgWord()
+    If k <> 0
+      If (PeekA(k) | $20) = 97
+        r = 1
+      EndIf
+    EndIf
+    Print("Wi-Fi: not servicing the radio for ")
+    PrintDec(n)
+    If r <> 0
+      PrintN(" s, after asking for a group rekey...")
+    Else
+      PrintN(" s...")
+    EndIf
+    WifiDeaf(n, r)
+    PrintN("Wi-Fi: listening again; the link check runs now. wifi incidents shows what happened.")
+    ProcedureReturn
+  EndIf
+
   ; rekey [on|off] - service the access point's mid-session rekey (the
   ; TX-only-death CURE) or, off, log it without answering to reproduce the
   ; death. Bare word shows the state.
@@ -658,6 +689,37 @@ Procedure CmdWifi()
         gWifiRekeyOn = 0
         PrintN("Wi-Fi: mid-session rekey servicing is OFF. A rekey will be logged")
         PrintN("but NOT answered - the link will go TX-only dead when one arrives.")
+        ProcedureReturn
+      EndIf
+      ; ask [group|pair] - send a signed EAPOL-Key Request so the access
+      ; point rekeys NOW (WifiRekeyAsk). With servicing on it is answered;
+      ; with servicing off the access point kicks the board within seconds.
+      If (PeekA(k) | $20) = 97 And (PeekA(k + 1) | $20) = 115 And (PeekA(k + 2) | $20) = 107 And PeekA(k + 3) = 0
+        k = ArgWord()
+        n = 0
+        If k <> 0
+          If (PeekA(k) | $20) = 112
+            n = 1
+          EndIf
+        EndIf
+        r = WifiRekeyAsk(n)
+        If r = 0
+          If n <> 0
+            PrintN("Wi-Fi: asked the access point for a PAIRWISE rekey (EAPOL-Key Request sent).")
+          Else
+            PrintN("Wi-Fi: asked the access point for a GROUP rekey (EAPOL-Key Request sent).")
+          EndIf
+          PrintN("Type wifi eapol to see whether it answered.")
+        Else
+          Print("Wi-Fi: the request was not sent (")
+          If r = -1
+            PrintN("no keyed session to sign it with).")
+          Else
+            Print("driver rc ")
+            PrintDec(r)
+            PrintN(").")
+          EndIf
+        EndIf
         ProcedureReturn
       EndIf
     EndIf
@@ -1240,6 +1302,8 @@ Procedure CmdWifi()
   PrintN("  wifi rejoin                re-associate and re-lease right now")
   PrintN("  wifi link [on|off]         the keepalive + auto-reconnect, and its count")
   PrintN("  wifi drop                  simulate an access-point drop and watch it recover")
+  PrintN("  wifi rekey ask [group|pair] ask the access point to rekey now")
+  PrintN("  wifi deaf <s> [ask]        leave the radio unserviced like a payload; ask = get kicked")
   PrintN("  wifi eapol                 the mid-session rekey panel (root-cause evidence)")
   PrintN("  wifi rekey [on|off]        service the hourly rekey (the cure), or reproduce it")
   PrintN("  wifi heal [on|off]         the automatic re-association backstop")
