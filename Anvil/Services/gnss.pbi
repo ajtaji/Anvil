@@ -12,8 +12,8 @@
 ;    #GNSS_SRC_BLUETOOTH  PLACEHOLDER: an SPP link over Anvil/Net/hci.pbi
 ;    #GNSS_SRC_BLE        PLACEHOLDER: the Nordic UART service, as a GNSS
 ;                         Bridge Pico serves it
-;    #GNSS_SRC_NETWORK    PLACEHOLDER: a TCP stream (a GNSS Bridge on Wi-Fi,
-;                         an NTRIP caster's NMEA, gpsd's JSON)
+;    #GNSS_SRC_NETWORK    LIVE (2026-10-14): a TCP stream - a GNSS Bridge on Wi-Fi,
+;                         a phone's app, a multiplexer, gpsd (asked for NMEA)
 ;  A placeholder is a source this file names and opens with a sentence
 ;  saying it is not built yet - never a silent nothing. Filling one in is
 ;  one procedure: give gnss_SrcRead() its bytes.
@@ -733,6 +733,127 @@ Procedure gnss_Byte(c.i)
   EndIf
 EndProcedure
 
+; ---------------------------------------------------------------- the network source
+; A RECEIVER OVER THE NETWORK (2026-10-14, the PC's tcp:host:port source). A TCP stream from a GNSS
+; Bridge on Wi-Fi, a phone's GNSS-over-network app, an NMEA multiplexer or gpsd: the bytes go through the
+; same framer as a USB receiver's, so every protocol above is read from it. The address is the setting
+; gnss.net.ip (a dotted quad: `gnss source network <host>[:<port>]` looks a name up once, at the prompt,
+; and stores what it found) and gnss.net.port (#GNSS_NET_PORT if unset - IANA's port for NMEA-0183 over
+; TCP). Port 2947 is gpsd, which streams nothing until asked: the source asks for NMEA, as the PC does.
+; NOTHING WAITS: every pump advances Anvil's TCP for one millisecond and takes what has arrived; the
+; connection is made, and made again after a drop or a refusal (#GNSS_NET_RETRY_US apart), in the
+; background. The connection is routed by the destination (NetIfForDest), so it rides whichever link
+; reaches the host.
+#GNSS_NET_PORT = 10110
+#GNSS_NET_RETRY_US = 3000000
+#GNSS_NET_ARP_US = 200000
+Global gnss_netIp.i, gnss_netPort.i, gnss_netSock.i = -1, gnss_netState.i, gnss_netTryUs.i, gnss_netConnects.i, gnss_netLastErr.i
+Global Dim gnss_netWatch.a[48]
+DataSection
+  gnss_netWatchBytes:
+  Data.a 63, 87, 65, 84, 67, 72, 61, 123, 34, 101, 110, 97, 98, 108, 101, 34, 58, 116, 114, 117, 101, 44, 34, 110, 109, 101, 97, 34, 58, 116, 114, 117, 101, 125, 10
+EndDataSection
+
+Procedure.i gnss_NetDec(*s)
+  Define v.i, c.i, i.i
+  If *s = 0
+    ProcedureReturn -1
+  EndIf
+  c = PeekA(*s)
+  If c < 48 Or c > 57
+    ProcedureReturn -1
+  EndIf
+  While c >= 48 And c <= 57 And i < 6
+    v = v * 10 + c - 48 : i = i + 1 : c = PeekA(*s + i)
+  Wend
+  ProcedureReturn v
+EndProcedure
+
+; The stored address into gnss_netIp / gnss_netPort. 1, or 0 when there is none.
+Procedure.i gnss_NetSettings()
+  Define *p, ip.i, port.i
+  *p = SettingsGet("gnss.net.ip")
+  If *p = 0
+    ProcedureReturn 0
+  EndIf
+  ip = ParseDotted(*p)
+  If ip <= 0
+    ProcedureReturn 0
+  EndIf
+  port = gnss_NetDec(SettingsGet("gnss.net.port"))
+  If port < 1 Or port > 65535 : port = #GNSS_NET_PORT : EndIf
+  gnss_netIp = ip : gnss_netPort = port
+  ProcedureReturn 1
+EndProcedure
+
+Procedure gnss_NetClose()
+  If gnss_netSock >= 0
+    TcpUse(gnss_netSock)
+    If TcpState() <> #TCP_CLOSED : TcpClose() : EndIf
+  EndIf
+  gnss_netSock = -1 : gnss_netState = 0
+EndProcedure
+
+; 0 nothing open, 1 connecting, 2 connected, 3 waiting to try again.
+Procedure.i GnssNetState() : ProcedureReturn gnss_netState : EndProcedure
+Procedure.i GnssNetIp() : ProcedureReturn gnss_netIp : EndProcedure
+Procedure.i GnssNetPort() : ProcedureReturn gnss_netPort : EndProcedure
+Procedure.i GnssNetConnects() : ProcedureReturn gnss_netConnects : EndProcedure
+Procedure.i GnssNetLastError() : ProcedureReturn gnss_netLastErr : EndProcedure
+
+Procedure.i gnss_NetRead(*dst, max.i)
+  Define now.i, s.i, rc.i, k.i, i.i, n.i, t.i
+  now = HwMicros()
+  TcpPoll(1)                                         ; the stack moves on: frames in, timers, what is queued out
+  If gnss_netSock >= 0
+    TcpUse(gnss_netSock)
+    If TcpState() = #TCP_ESTABLISHED
+      If gnss_netState <> 2
+        gnss_netState = 2 : gnss_netConnects = gnss_netConnects + 1
+        If gnss_netPort = 2947                       ; gpsd: ask for its NMEA
+          Restore gnss_netWatchBytes
+          For n = 0 To 34 : Read.a t : gnss_netWatch[n] = t : Next
+          TcpSend(@gnss_netWatch[0], 35)
+        EndIf
+      EndIf
+      ProcedureReturn TcpRead(*dst, max)
+    EndIf
+    If TcpState() = #TCP_CLOSED                      ; refused, reset or closed by the far end
+      gnss_netLastErr = TcpError()
+      gnss_netSock = -1 : gnss_netState = 3 : gnss_netTryUs = now
+    EndIf
+    ProcedureReturn 0                                ; still connecting
+  EndIf
+  ; no connection: make one, not oftener than #GNSS_NET_RETRY_US after a failure
+  If gnss_netState = 3 And now - gnss_netTryUs < #GNSS_NET_RETRY_US
+    ProcedureReturn 0
+  EndIf
+  If gnss_netState = 1 And now - gnss_netTryUs < #GNSS_NET_ARP_US    ; the next hop's address is being asked for
+    ProcedureReturn 0
+  EndIf
+  k = NetIfForDest(gnss_netIp)
+  gnss_netTryUs = now
+  If k = #HW_LINK_NONE
+    gnss_netState = 3 : gnss_netLastErr = -1
+    ProcedureReturn 0
+  EndIf
+  s = TcpAlloc()
+  If s < 0
+    gnss_netState = 3 : gnss_netLastErr = -2
+    ProcedureReturn 0
+  EndIf
+  TcpUse(s)
+  rc = TcpConnect(k, gnss_netIp, gnss_netPort)
+  If rc = #NET_TCP_OK
+    gnss_netSock = s : gnss_netState = 1
+  ElseIf rc = #NET_TCP_E_ARP
+    gnss_netState = 1                                ; asked; the next try in #GNSS_NET_ARP_US
+  Else
+    gnss_netState = 3 : gnss_netLastErr = rc
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 ; ---------------------------------------------------------------- the sources
 ; The bytes waiting at the open source, up to max, into *dst; -1 if it is not up.
 Procedure.i gnss_SrcRead(*dst, max.i)
@@ -744,7 +865,7 @@ Procedure.i gnss_SrcRead(*dst, max.i)
     Case #GNSS_SRC_BLE
       ProcedureReturn -1                                      ; PLACEHOLDER: the Nordic UART service
     Case #GNSS_SRC_NETWORK
-      ProcedureReturn -1                                      ; PLACEHOLDER: a TCP stream
+      ProcedureReturn gnss_NetRead(*dst, max)
   EndSelect
   ProcedureReturn -1
 EndProcedure
@@ -770,7 +891,7 @@ Procedure.i GnssWhy()
     Case 5 : ProcedureReturn "the USB controller refused the device's endpoints"
     Case 10 : ProcedureReturn "Bluetooth (SPP) is a placeholder: the source is named but not built yet"
     Case 11 : ProcedureReturn "Bluetooth LE (the GNSS Bridge Nordic UART service) is a placeholder: not built yet"
-    Case 12 : ProcedureReturn "a network stream is a placeholder: not built yet"
+    Case 12 : ProcedureReturn "no network source is set: type gnss source network <host>[:<port>] at the prompt"
     Case 13 : ProcedureReturn "there is no such source"
   EndSelect
   ProcedureReturn "an unknown reason"
@@ -779,6 +900,7 @@ EndProcedure
 ; Opens a source. 1, or 0 with GnssWhy().
 Procedure.i GnssOpen(src.i)
   Define i.i
+  gnss_NetClose()                                   ; a connection of an earlier source is let go
   gnss_src = #GNSS_SRC_NONE : gnss_why = 0
   GnfReset(0) : GnfReset(1)
   gnss_n = 0 : gnss_bytes = 0 : gnss_good = 0 : gnss_bad = 0 : gnss_lastGoodUs = 0
@@ -798,7 +920,12 @@ Procedure.i GnssOpen(src.i)
       If UsbSerNeedsBaud() <> 0 : UsbSerSetBaud(gnss_bauds[0]) : EndIf
     Case #GNSS_SRC_BLUETOOTH : gnss_why = 10 : ProcedureReturn 0
     Case #GNSS_SRC_BLE       : gnss_why = 11 : ProcedureReturn 0
-    Case #GNSS_SRC_NETWORK   : gnss_why = 12 : ProcedureReturn 0
+    Case #GNSS_SRC_NETWORK
+      If gnss_NetSettings() = 0
+        gnss_why = 12
+        ProcedureReturn 0
+      EndIf
+      gnss_netState = 0 : gnss_netTryUs = 0
     Default                  : gnss_why = 13 : ProcedureReturn 0
   EndSelect
   gnss_src = src : gnss_openUs = HwMicros()
