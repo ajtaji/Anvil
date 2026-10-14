@@ -673,6 +673,42 @@ Procedure CmdWifi()
     ProcedureReturn
   EndIf
 
+  ; iovar <name> - read one 32-bit firmware variable (bcn_timeout, roam_off,
+  ; PM-adjacent knobs) off the radio as it is, not as this file believes
+  ; it set it. Read-only: nothing here writes to the firmware.
+  If WordIs("iovar") <> 0
+    k = ArgWord()
+    n = 0
+    If k <> 0
+      While PeekA(k + n) <> 0 And n < 32
+        n = n + 1
+      Wend
+    EndIf
+    If n < 1 Or n >= 32
+      PrintN("wifi iovar <name>   - read one 32-bit firmware variable, e.g. bcn_timeout.")
+      ProcedureReturn
+    EndIf
+    If gWifiUp = 0
+      PrintN("Wi-Fi: the radio is not up, so there is no firmware to ask.")
+      ProcedureReturn
+    EndIf
+    r = Cyw43GetIovarData(k, n, n + 1 + 4, 2000)
+    str_print_at(k)
+    If r <> #CYW43_IO_OK
+      Print(": the firmware refused the read (rc ")
+      PrintDec(r)
+      Print(", firmware status ")
+      PrintDec(cyw43_Signed32(cyw43_ioctlStatus))
+      PrintN(").")
+      ProcedureReturn
+    EndIf
+    v = cyw43_RxLE32(cyw43_replyOff)
+    Print(" = ")
+    PrintDec(cyw43_Signed32(v))
+    PrintN("")
+    ProcedureReturn
+  EndIf
+
   ; rekey [on|off] - service the access point's mid-session rekey (the
   ; TX-only-death CURE) or, off, log it without answering to reproduce the
   ; death. Bare word shows the state.
