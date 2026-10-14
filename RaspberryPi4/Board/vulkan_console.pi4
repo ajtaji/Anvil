@@ -62,8 +62,28 @@ Global Dim avcLayoutX.i[#CON_MAXCOLS]
 Global Dim avcLayoutY.i[#CON_MAXCOLS]
 Global Dim avcLayoutAdvance.i[#CON_MAXCOLS]
 
+; THE BANNER CHANGES EVERY SECOND (the clock) AND EVERY 350 ms WHILE THE LOGO
+; GLINTS, AND THE TEXT UNDER IT DOES NOT. This used to mark the whole grid, so
+; each tick laid out every line of TrueType text again, rebuilt every glyph
+; quad and copied the full four-megabyte frame: 38% of core 0 at a quiet
+; prompt on build 248, against 4% for the native V3D console. A banner change
+; now asks for a frame that holds the banner alone; the pump copies only the
+; banner strip to the display and the text on the glass is left as it is.
+Global avcBannerDirty.i
+
 Procedure avcBannerInvalidate()
-  ConGridMarkAll()
+  avcBannerDirty = 1
+  gConDirty = 1                 ; wakes ScreenPump; no row is marked
+EndProcedure
+
+; 1 when the text grid itself has something to repaint.
+Procedure.i avcGridNeedsPaint()
+  Define r.i
+  If ConGridFullClear() <> 0 : ProcedureReturn 1 : EndIf
+  For r = 0 To ConGridRows() - 1
+    If ConGridRowDirty(r) <> 0 : ProcedureReturn 1 : EndIf
+  Next
+  ProcedureReturn 0
 EndProcedure
 
 Procedure.i VulkanConsoleError()
@@ -784,12 +804,105 @@ Procedure.i avcCopyToDisplay()
   ProcedureReturn 1
 EndProcedure
 
+; The banner strip of the finished Vulkan image, copied to the display and, on
+; the DSI panel, to the buffer the scaler reads. The rest of both is untouched.
+Procedure.i avcCopyBannerToDisplay()
+  Define dst.i, dstPitch.i, width.i, height.i, bx.i, by.i, bw.i, bh.i, rotation.i
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
+  width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
+  If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight
+    ProcedureReturn 0
+  EndIf
+  If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  rotation = ScrGpuRotation()
+  bx = 0 : by = 0 : bw = width : bh = LogoHeight()
+  If rotation = 90
+    bx = width - LogoHeight() : bw = LogoHeight() : bh = height
+  ElseIf rotation = 270
+    bw = LogoHeight() : bh = height
+  ElseIf rotation = 180
+    by = height - LogoHeight()
+  EndIf
+  If bx < 0 Or by < 0 Or bw < 1 Or bh < 1 Or bx + bw > width Or by + bh > height
+    ProcedureReturn 0
+  EndIf
+  If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, bx, by, bw, bh) = 0
+    ProcedureReturn 0
+  EndIf
+  If gScrSrc = #SCR_SRC_DSI
+    If avcDmaCopyRect(#MON_FB_SCAN, dstPitch, avcImageBase, avcImagePitch, bx, by, bw, bh) = 0
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; While a banner-only frame waits for the GPU the core sleeps between polls,
+; exactly as the prompt does between services, and the time is counted as idle.
+; Only when the prompt's own wait has been qualified on this board.
+Procedure avcGpuWaitIdle()
+  Define t0.i, dt.i
+  If anvil_promptWfeEnabled = 0 Or anvil_promptWfeReady = 0
+    ProcedureReturn
+  EndIf
+  If MmuEl() <> 3
+    ProcedureReturn
+  EndIf
+  CompilerIf #CAP_PWM = 1
+    If HwPwmKind() = #HW_PWM_KIND_SOFT
+      ProcedureReturn
+    EndIf
+  CompilerEndIf
+  t0 = Ticks()
+  Asm
+    wfe
+  EndAsm
+  dt = Ticks() - t0
+  If dt > 0
+    anvil_promptIdleTicks = anvil_promptIdleTicks + dt
+  EndIf
+EndProcedure
+
+; A frame that holds the banner and nothing else, for a change of the clock or
+; the glint while the text is unchanged. Returns 1 when it was presented.
+Procedure.i avcPumpBannerOnly()
+  Define rc.i, endRc.i
+  avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
+  If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  avcBannerFrameReady = 0
+  rc = avcRenderBanner()
+  *gV3dWaitIdle = @avcGpuWaitIdle
+  endRc = NeonVkChromeEnd()
+  *gV3dWaitIdle = 0
+  If rc <> #NEON_VK_CHROME_OK Or NeonVkChromeError() <> 0 Or endRc <> #VK_SUCCESS
+    If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
+    ProcedureReturn 0
+  EndIf
+  If NeonVkChromePresentPending() <> 1 : ProcedureReturn 0 : EndIf
+  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn 0 : EndIf
+  ProcedureReturn avcCopyBannerToDisplay()
+EndProcedure
+
 Procedure VulkanConsolePump()
   Define r.i, c.i, n.i, y.i, ch.i, cw.i, colour.i, rc.i, endRc.i, pass.i
   Define layoutCount.i, layoutLines.i, layoutWidth.i, baseline.i, visible.i
   If avcReady = 0 Or avcActive = 0 Or gScreen = 0
     ProcedureReturn
   EndIf
+  ; Only the banner changed, and a whole frame is already on the glass: draw
+  ; the banner alone. If that cannot be done the full frame below still is.
+  If avcBannerDirty <> 0 And avcFramePresented <> 0 And gConOverlayDirty = 0
+    If avcGridNeedsPaint() = 0
+      If avcPumpBannerOnly() <> 0
+        avcBannerDirty = 0
+        ConGridClearDirty()
+        avcError = 0
+        ProcedureReturn
+      EndIf
+    EndIf
+  EndIf
+  avcBannerDirty = 0
   rc = avcWarmGrid()
   If rc < 0
     avcFailover(#AVC_ERR_CHROME)

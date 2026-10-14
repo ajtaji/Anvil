@@ -2870,6 +2870,15 @@ EndProcedure
 ;  than more cleverly, so a reader who has understood one has
 ;  understood both.
 ; ----------------------------------------------------------------------
+; A WAIT FOR THE GPU IS A SPIN, AND A SPIN IS A BUSY PROCESSOR. The bin and
+; render waits below poll a status register for the few milliseconds a frame
+; takes. A resident console that draws several small frames a second spends
+; that time at full power for nothing. The owner may put a procedure here; it
+; is called once a pass of each wait loop and may sleep the core (wfe, woken
+; by the counter event stream). Zero - the default, and what every payload
+; gets - leaves the waits exactly as they were.
+Global *gV3dWaitIdle = 0
+
 Procedure.i v3d_WaitHubClear(off.i, mask.i, us.i)
   Protected v.i
   Protected hz.i
@@ -3031,6 +3040,9 @@ Procedure.i V3dCleanCaches()
         Break
       EndIf
     EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
+    EndIf
   ForEver
   If ok = 0
     v3d_cleanSpins = spins
@@ -3065,6 +3077,9 @@ Procedure.i V3dCleanCaches()
       If V3dTicks() > deadline
         Break
       EndIf
+    EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
     EndIf
   ForEver
 
@@ -4060,6 +4075,9 @@ Procedure.i V3dTfuWait(us.i)
         Break
       EndIf
     EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
+    EndIf
   ForEver
 
   ; The barrier goes here and not after the compare: the DRAM the
@@ -4651,6 +4669,9 @@ Procedure.i V3dCsdWait(us.i)
       If V3dTicks() > deadline
         Break
       EndIf
+    EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
     EndIf
   ForEver
 
@@ -8347,6 +8368,9 @@ Procedure.i V3dBinWait(us.i)
         Break
       EndIf
     EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
+    EndIf
   ForEver
 
   V3dBarrier()
@@ -8512,6 +8536,9 @@ Procedure.i V3dRenderWait(us.i)
       If V3dTicks() > deadline
         Break
       EndIf
+    EndIf
+    If *gV3dWaitIdle <> 0
+      gV3dWaitIdle()            ; the owner may sleep the core until the next counter event
     EndIf
   ForEver
 

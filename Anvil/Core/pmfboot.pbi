@@ -1016,6 +1016,9 @@ Procedure PmfEnter()
   ; not required to give back.
   ScreenServiceTick()
   RunAt(gPmfEntry)
+  If (gPmfFlags & #PMF_FLAG_WANTS_SERVICES) <> 0
+    SvcFileHReset()              ; and none is left open behind it
+  EndIf
 EndProcedure
 
 ; ======================================================================
