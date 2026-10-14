@@ -5786,6 +5786,10 @@ Procedure.i cyw43_RxAbortStep()
 EndProcedure
 
 
+; Key slots Cyw43SetWsecKey filled in THIS firmware generation; bit n =
+; index n. Cyw43ClearKeys empties them on every disassociation.
+Global cyw43_keySet.i = 0
+
 ; ----------------------------------------------------------------------
 ;  Cyw43TransportReset - the bookkeeping, once, before the first ioctl.
 ;
@@ -5802,6 +5806,7 @@ Procedure.i Cyw43TransportReset()
   cyw43_seq = 0
   cyw43_credit = 1
   cyw43_reqid = 0
+  cyw43_keySet = 0               ; a fresh firmware holds no key
   cyw43_stalls = 0
   cyw43_creditPolls = 0
   cyw43_replyOff = 0
@@ -9236,8 +9241,21 @@ EndProcedure
 ;  mechanism is that our own disassociation is what clears the AP's
 ;  belief that a station which vanished mid-association is still there.
 ; ----------------------------------------------------------------------
+;
+;  THE KEYS GO WITH THE ASSOCIATION. Every disassociation also clears
+;  every key slot Cyw43SetWsecKey filled (Cyw43ClearKeys, below), which
+;  is what the reference does on every disconnect: cfg80211's
+;  __cfg80211_disconnected (net/wireless/sme.c) deletes key indexes 0-5,
+;  and brcmf_cfg80211_del_key turns each configured one into a cleared
+;  wsec_key. Without it the firmware keeps the last session's pairwise
+;  and group keys across a re-association, and only a firmware reload -
+;  a board reset - ever removed them.
+; ----------------------------------------------------------------------
 Procedure.i Cyw43Disassoc(timeoutMs.i)
-  ProcedureReturn Cyw43IoctlSet(#CYW43_C_DISASSOC, 0, 0, timeoutMs)
+  Define r.i
+  r = Cyw43IoctlSet(#CYW43_C_DISASSOC, 0, 0, timeoutMs)
+  Cyw43ClearKeys(timeoutMs)
+  ProcedureReturn r
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -10699,6 +10717,13 @@ Procedure.i Cyw43SetWsecKey(index.i, *key, keylen.i, algo.i, *ea, *rsc, timeoutM
   EndIf
 
   r = Cyw43SetBsscfgData(?cyw43_WsecKeyName, #CYW43_WSECKEY_NAMELEN, #CYW43_IFACE_STA, @cyw43_keybuf[0], #CYW43_KEY_STRUCT, timeoutMs)
+  If r = 0
+    If keylen > 0
+      cyw43_keySet = cyw43_keySet | (1 << index)
+    Else
+      cyw43_keySet = cyw43_keySet & (~(1 << index))
+    EndIf
+  EndIf
 
   ; The key is gone from OUR staging copy the moment it is on the wire.
   ; cyw43_arg and cyw43_tx still hold it; those two are wiped by the
@@ -10709,6 +10734,46 @@ Procedure.i Cyw43SetWsecKey(index.i, *key, keylen.i, algo.i, *ea, *rsc, timeoutM
     PokeB(@cyw43_keybuf[0] + i, 0)
   Next
   ProcedureReturn r
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  Cyw43ClearKeys - remove every key this file installed, the way
+;  brcmf_cfg80211_del_key does: a wsec_key with the index, flags
+;  BRCMF_PRIMARY_KEY, algorithm CRYPTO_ALGO_OFF, length 0, no address.
+;  Only slots that were filled are sent, as brcmfmac skips a slot whose
+;  algorithm is already OFF. Called by Cyw43Disassoc.
+;
+;  Returns 0 when every filled slot cleared, otherwise the first nonzero
+;  rc. A slot that would not clear stays marked, so the next
+;  disassociation tries it again.
+; ----------------------------------------------------------------------
+Procedure.i Cyw43ClearKeys(timeoutMs.i)
+  Define index.i
+  Define i.i
+  Define r.i
+  Define first.i
+  first = 0
+  For index = 0 To 3
+    If (cyw43_keySet & (1 << index)) <> 0
+      For i = 0 To #CYW43_KEY_STRUCT - 1
+        PokeB(@cyw43_keybuf[0] + i, 0)
+      Next
+      cyw43_PutLE32(@cyw43_keybuf[0] + #CYW43_KEY_OFF_INDEX, index)
+      cyw43_PutLE32(@cyw43_keybuf[0] + #CYW43_KEY_OFF_ALGO, #CYW43_CRYPTO_ALGO_OFF)
+      cyw43_PutLE32(@cyw43_keybuf[0] + #CYW43_KEY_OFF_FLAGS, #CYW43_PRIMARY_KEY)
+      r = Cyw43SetBsscfgData(?cyw43_WsecKeyName, #CYW43_WSECKEY_NAMELEN, #CYW43_IFACE_STA, @cyw43_keybuf[0], #CYW43_KEY_STRUCT, timeoutMs)
+      If r = 0
+        cyw43_keySet = cyw43_keySet & (~(1 << index))
+      ElseIf first = 0
+        first = r
+      EndIf
+    EndIf
+  Next
+  ProcedureReturn first
+EndProcedure
+
+Procedure.i Cyw43KeysInstalled()
+  ProcedureReturn cyw43_keySet
 EndProcedure
 
 ; ----------------------------------------------------------------------
