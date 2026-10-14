@@ -238,6 +238,14 @@ Procedure CacheMapNc()
   ; literal is #ETH_RX_BASE .. +#ETH_RX_BYTES because eth_globals.pi4 is
   ; included after this file.
   MmuAddNc($08100000, $08180000)
+  ; THE GPU'S OWN MEMORY (2026-10-14). The Vulkan heap (the console's render target, its vertices and
+  ; glyph atlas) and the V3D engine's arena (page table, control lists, shaders) are shared with the GPU
+  ; and nothing else; mapped Write-Back, every console paint had the CPU clean and invalidate the 4 MB
+  ; render target line by line twice (2.15 ms each, measured), for coherency that Non-Cacheable gives by
+  ; construction. CacheDmaPolicy declares both to the V3D and DMA libraries, which then skip those walks.
+  ; The arena literal is #V3DCON_ARENA / #AVC_ARENA_BASE (both $0A000000, 16 MiB), included after this file.
+  MmuAddNc($0C000000, $0D000000)                  ; #MON_VK_HEAP_LO .. _HI (memmap.pi4)
+  MmuAddNc($0A000000, $0B000000)
   CompilerEndIf
 EndProcedure
 
@@ -256,6 +264,13 @@ EndProcedure
 ; ----------------------------------------------------------------------
 Procedure CacheDmaPolicy()
   DmaClearUncached()
+  CompilerIf #PMF_CHIP <> 2712 And #ANVIL_V3D_CONSOLE = 1
+  V3dClearUncached()
+  If gCacheOn <> 0                                 ; mapped Non-Cacheable by CacheMapNc: no line to clean
+    V3dDeclareUncached($0C000000, $0D000000)
+    V3dDeclareUncached($0A000000, $0B000000)
+  EndIf
+  CompilerEndIf
   If gCacheOn = 0
     DmaSetCacheOff(1)
     ProcedureReturn
@@ -265,6 +280,10 @@ Procedure CacheDmaPolicy()
   If gCacheDspHi > gCacheDspLo
     DmaAddUncached(gCacheDspLo, gCacheDspHi)
   EndIf
+  CompilerIf #PMF_CHIP <> 2712
+  DmaAddUncached($0C000000, $0D000000)
+  DmaAddUncached($0A000000, $0B000000)
+  CompilerEndIf
 EndProcedure
 
 ; Turn the cached MMU on. Rebuilds the tables every time (a returned
