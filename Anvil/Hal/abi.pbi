@@ -417,9 +417,9 @@
 ;     40   Touch                      8         4
 ;     48   File and storage          16        12
 ;     64   Settings                   8         4
-;     72   Net                       24        10   (at 1.5 - 72..79 and 85..86;
-;                                                   80..84, TLS and HTTP, wait
-;                                                   for the TLS port)
+;     72   Net                       24        15   (at 1.6 - 72..83 and 85..87;
+;                                                   84, the HTTP convenience,
+;                                                   stays unimplemented)
 ;     96   USB                       12         6
 ;    108   GPIO                       8         6
 ;    116   I2C                       12         8
@@ -1946,8 +1946,17 @@ EndProcedure
 ;    78  SvcTcpRecv(h, *b, n)     bytes delivered, 0 = nothing yet
 ;    79  SvcTcpClose(h)           #SVC_OK; the handle is free at once, the
 ;                                 orderly close carries on behind it
-;    80..83  TLS                  SvcUnimplemented until the TLS port lands
-;    84  SvcHttpRequest           SvcUnimplemented
+;    80  SvcTlsOpen(*host, port)  1.6. Handle 1 AT ONCE, or negative; the
+;                                 name, TCP and the TLS 1.3 handshake run in
+;                                 the background. ONE connection at a time
+;                                 (#SVC_EBUSY otherwise). Refused #SVC_ESTATE
+;                                 without a trusted clock or a root store.
+;    81  SvcTlsSend(h, *b, n)     plaintext bytes taken, 0..n (0 until open,
+;                                 or while the last record is still going)
+;    82  SvcTlsRecv(h, *b, n)     plaintext bytes delivered, 0 = nothing yet
+;    83  SvcTlsClose(h)           #SVC_OK; close_notify is sent if open
+;    84  SvcHttpRequest           SvcUnimplemented - HTTP is the payload's,
+;                                 over the TLS slots
 ;    85  SvcNetService(sliceMs)   NEW. Runs the monitor's own network
 ;                                 services - the Wi-Fi keepalive and rekey,
 ;                                 DHCP, NTP, the console, TCP timers - the
@@ -1960,7 +1969,10 @@ EndProcedure
 ;    86  SvcTcpState(h)           NEW. #SVC_TCP_CONNECTING / _OPEN /
 ;                                 _PEER_CLOSED, or the negative code the
 ;                                 connection failed with
-;    87  reserved                 SvcUnimplemented
+;    87  SvcTlsState(h)           1.6. #SVC_TLS_RESOLVING / _CONNECTING /
+;                                 _HANDSHAKE / _OPEN / _PEER_CLOSED (1..5),
+;                                 or the negative code the connection
+;                                 failed with
 ;
 ;  WHY 85 AND 86, AND WHY THE DNS POLL IS NOT A THIRD. The brief reserved
 ;  85..87 "for the one-IP-layer merge"; these two are what the merge turned
@@ -2054,6 +2066,47 @@ Procedure.i SvcTcpState(h.i)
     ProcedureReturn #SVC_ENOCAP
   EndIf
   ProcedureReturn PayNetTcpState(h)
+EndProcedure
+
+; ---- TLS, 80..83 and 87 (1.6). Anvil/Core/tls_client.pbi is the engine:
+; HTTPS to any server whose chain reaches a root in the store on the stick
+; (Anvil/Core/tls_roots.pbi), verified always - chain, signatures, the
+; host name, the dates against a trusted clock. One connection, handle 1.
+; Nothing waits: Open answers at once and the name, TCP and the handshake
+; advance in SvcNetService and every TLS slot.
+Procedure.i SvcTlsOpen(*host, port.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientOpen(*host, port)
+EndProcedure
+
+Procedure.i SvcTlsSend(h.i, *b, n.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientSend(h, *b, n)
+EndProcedure
+
+Procedure.i SvcTlsRecv(h.i, *b, n.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientRecv(h, *b, n)
+EndProcedure
+
+Procedure.i SvcTlsClose(h.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientClose(h)
+EndProcedure
+
+Procedure.i SvcTlsState(h.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn TlsClientState(h)
 EndProcedure
 
 CompilerEndIf
@@ -2716,10 +2769,9 @@ Procedure BuildServiceTable()
 
   ; --- net, base 72 (1.5) --------------------------------------------
   ; Filled at 1.5, once the two IP layers had merged - see GROUP 6 above.
-  ; 80..84 (TLS and the HTTP convenience) stay at SvcUnimplemented until
-  ; the TLS port lands; 85 and 86 are two of the three the brief reserved
-  ; for the merge, and 87 stays spare. Only where the composition built
-  ; the engine.
+  ; 80..83 and 87 are TLS (1.6); 84, the HTTP convenience, stays at
+  ; SvcUnimplemented. 85 and 86 are two of the three the brief reserved
+  ; for the merge. Only where the composition built the engine.
   CompilerIf #ANVIL_PAYLOAD_NET = 1
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  0] = @SvcNetUp
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  1] = @SvcNetLink
@@ -2731,6 +2783,11 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  7] = @SvcTcpClose
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 13] = @SvcNetService
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 14] = @SvcTcpState
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  8] = @SvcTlsOpen
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  9] = @SvcTlsSend
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 10] = @SvcTlsRecv
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 11] = @SvcTlsClose
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 15] = @SvcTlsState
   CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------

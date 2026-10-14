@@ -9,10 +9,10 @@ No board is contacted and no host network is used.
 WHAT IT PROVES
 ==============
 A. STATIC - the sources agree with each other:
-     * the slot installer puts exactly ten procedures in the net block -
-       72..79, 85 and 86 - and leaves 80..84 (TLS, HTTP) and 87..95 at
-       SvcUnimplemented; each slot calls the engine procedure of its own
-       name; the minor is 5 and #SVC_EAGAIN is -110;
+     * the slot installer puts exactly fifteen procedures in the net block -
+       72..79, 85 and 86 (1.5), TLS at 80..83 and 87 (1.6) - and leaves 84
+       (HTTP) and 88..95 at SvcUnimplemented; each slot calls the engine
+       procedure of its own name; the minor is 6 and #SVC_EAGAIN is -110;
      * the engine's service pass (PayNetService in Anvil/Core/payload_net.pbi)
        calls exactly the network services the prompt's scheduler runs
        (AnvilPromptServiceOne slots 2 and 4 in Anvil/Core/parse.pbi), in the
@@ -90,6 +90,12 @@ NET_SLOTS = {
     7: ("SvcTcpClose", "PayNetTcpClose"),
     13: ("SvcNetService", "PayNetService"),
     14: ("SvcTcpState", "PayNetTcpState"),
+    # 1.6: TLS over the same engine (Anvil/Core/tls_client.pbi)
+    8: ("SvcTlsOpen", "TlsClientOpen"),
+    9: ("SvcTlsSend", "TlsClientSend"),
+    10: ("SvcTlsRecv", "TlsClientRecv"),
+    11: ("SvcTlsClose", "TlsClientClose"),
+    15: ("SvcTlsState", "TlsClientState"),
 }
 
 MUTATIONS = {
@@ -177,9 +183,9 @@ def static_checks() -> int:
     abi = text(ABI)
     version = consts(text(ABI_VERSION))
     published = consts(abi)
-    if version.get("#SVC_ABI_MINOR") != 5:
-        raise GateFailure(f"#SVC_ABI_MINOR is {version.get('#SVC_ABI_MINOR')}, expected 5 "
-                          "- filling the net group is a minor bump")
+    if version.get("#SVC_ABI_MINOR") != 6:
+        raise GateFailure(f"#SVC_ABI_MINOR is {version.get('#SVC_ABI_MINOR')}, expected 6 "
+                          "- the net group at 1.5 and its TLS slots at 1.6 are minor bumps")
     if version.get("#SVC_SLOT_COUNT") != 200:
         raise GateFailure("#SVC_SLOT_COUNT moved; filling reserved slots must not move it")
     if published.get("#SVC_EAGAIN") != -110:

@@ -972,6 +972,7 @@ Procedure.i PayNetService(sliceMs.i)
   ; ---- the payload's own: a query to send or retry, connects to start.
   paynet_DnsStep(millis())
   paynet_TcpAdvanceAll(millis())
+  TlsClientAdvance()                ; the TLS connection, if one is open
   ; ---- the rest of the slice: drain while frames keep coming.
   passes = 0
   While sliceMs > 0 And (millis() - t0) < sliceMs And passes < #PAYNET_DRAIN_PASSES
@@ -985,10 +986,28 @@ Procedure.i PayNetService(sliceMs.i)
   If passes > 0
     paynet_DnsStep(millis())
     paynet_TcpAdvanceAll(millis())
+    TlsClientAdvance()
   EndIf
   UartMessageEnd()
   gSvcDetail = 0
   ProcedureReturn LinkRxFrames() - frames
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  PayNetCommandPump(sliceMs) - the same engine, driven from a MONITOR
+;  COMMAND (`https get`) rather than a payload. The prompt is the caller,
+;  and the network console is the very thing printing the command's
+;  output, so the console pump, its re-arm and the message bracket that
+;  PayNetService runs are NOT run here: pumping the console from inside a
+;  command it is executing swallowed that command's output. What runs is
+;  the receive drain (TcpPoll), then this engine's own steps and the TLS
+;  connection.
+; ----------------------------------------------------------------------
+Procedure PayNetCommandPump(sliceMs.i)
+  TcpPoll(sliceMs)
+  paynet_DnsStep(millis())
+  paynet_TcpAdvanceAll(millis())
+  TlsClientAdvance()
 EndProcedure
 
 ; ----------------------------------------------------------------------
@@ -1053,6 +1072,9 @@ EndProcedure
 Procedure PayNetPayloadReturned()
   Define i.i
   Define keep.i
+  ; The TLS connection rides on one of the TCP handles below; it is closed
+  ; first, with its close_notify, while that handle still exists.
+  TlsClientPayloadReturned()
   keep = TcpCurrent()
   For i = 0 To #PAYNET_TCP_HANDLES - 1
     If paynet_tcpUsed[i] <> 0
