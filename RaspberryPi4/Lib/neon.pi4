@@ -3130,6 +3130,8 @@ EndProcedure
 ;  vertex arena on a frame that drew four rectangles would be most of
 ;  the frame time on a cacheable run.
 ; ----------------------------------------------------------------------
+Global gNeonKickOnly.i, gNeonRenderT0.i          ; the frame end in two halves: see NeonHardwareFrameKick
+
 Procedure.i NeonHardwareFrameEnd()
   Protected r.i
   Protected t0.i
@@ -3193,6 +3195,10 @@ Procedure.i NeonHardwareFrameEnd()
     neon_err = #NEON_ERR_RENDER
     ProcedureReturn #NEON_ERR_RENDER
   EndIf
+  gNeonRenderT0 = V3dTicks()
+  If gNeonKickOnly <> 0
+    ProcedureReturn #NEON_OK                         ; NeonHardwareFrameJoin finishes it
+  EndIf
   r = V3dRenderWait(2000000)
   If r <> #V3D_OK
     neon_err = #NEON_ERR_RENDER
@@ -3200,6 +3206,37 @@ Procedure.i NeonHardwareFrameEnd()
   EndIf
   gNeonUsRender = (V3dTicks() - t0) / hz
 
+  ProcedureReturn #NEON_OK
+EndProcedure
+
+; THE FRAME END IN TWO HALVES (2026-10-14), so a caller can work while the GPU renders: the kick is
+; NeonHardwareFrameEnd up to the render's start (the binning is waited for: it is short, and the render
+; needs it); NeonHardwareFrameDone asks without waiting; NeonHardwareFrameJoin waits and finishes.
+Procedure.i NeonHardwareFrameKick()
+  Protected r.i
+  gNeonKickOnly = 1
+  r = NeonHardwareFrameEnd()
+  gNeonKickOnly = 0
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i NeonHardwareFrameDone()
+  ProcedureReturn V3dRenderDone()
+EndProcedure
+
+Procedure.i NeonHardwareFrameJoin()
+  Protected r.i
+  Protected hz.i
+  hz = V3dCounterHz() / 1000000
+  If hz < 1
+    hz = 1
+  EndIf
+  r = V3dRenderWait(2000000)
+  gNeonUsRender = (V3dTicks() - gNeonRenderT0) / hz
+  If r <> #V3D_OK
+    neon_err = #NEON_ERR_RENDER
+    ProcedureReturn #NEON_ERR_RENDER
+  EndIf
   ProcedureReturn #NEON_OK
 EndProcedure
 
