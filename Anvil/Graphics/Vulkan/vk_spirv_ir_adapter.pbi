@@ -109,7 +109,10 @@ Procedure.i AnvilVkSpirvComputeAdapt(*code, bytes.i, *out.AvkComputeIr)
   If (bound < 2) | (bound > #ANVIL_SPV_MAX_ID)
     ProcedureReturn #ANVIL_COMPUTE_ERR
   EndIf
-  For id=0 To #ANVIL_SPV_MAX_ID
+  ; To MAX_ID - 1: the arrays hold #ANVIL_SPV_MAX_ID slots, numbered from 0, and
+  ; avkComputeId admits only ids below bound. Clearing slot MAX_ID wrote one slot
+  ; past the end, over whatever the linker placed next.
+  For id=0 To #ANVIL_SPV_MAX_ID - 1
     avkComputeClear(@avkComputeSlot(id),SizeOf(AvkComputeSlot))
     avkComputeSlot(id)\builtin=-1
     avkComputeSlot(id)\binding=-1
