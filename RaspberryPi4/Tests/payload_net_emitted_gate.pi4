@@ -1,0 +1,695 @@
+; Executable emitted-code gate for the payload ABI's net group engine,
+; Anvil/Core/payload_net.pbi. Driven by tools/payload_net_emitted_check.py.
+;
+; Every network, TCP, link and service seam below is a stub with a counter;
+; no device, no host network and no board is touched. Main returns 0 when
+; every assertion holds, or the number of the first that did not.
+;
+; The #SVC_* numbers are RESTATED here because this fixture cannot include
+; abi.pbi (it would drag the whole monitor in); the driver compares each one
+; with abi.pbi's before it trusts a run.
+
+#HW_LINK_NONE  = 0
+#HW_LINK_WIRED = 1
+#HW_LINK_WIFI  = 2
+#NETIF_KINDS   = 3
+#CAP_NET       = 1
+#NET_E_NO_ARP  = -118
+#DNS_PORT      = 53
+#DNS_E_LABEL   = -202
+#DNS_E_ID      = -204
+#DNS_E_RCODE   = -206
+
+#SVC_OK        =    0
+#SVC_EARG      = -102
+#SVC_EBUSY     = -103
+#SVC_ETIMEOUT  = -104
+#SVC_EIO       = -105
+#SVC_ESTATE    = -108
+#SVC_EAGAIN    = -110
+#SVC_TCP_CONNECTING  = 1
+#SVC_TCP_OPEN        = 2
+#SVC_TCP_PEER_CLOSED = 3
+
+#TCP_CLOSED       = 0
+#TCP_LISTEN       = 1
+#TCP_SYN_SENT     = 2
+#TCP_SYN_RECEIVED = 3
+#TCP_ESTABLISHED  = 4
+#TCP_FIN_WAIT_1   = 5
+#TCP_CLOSE_WAIT   = 7
+#NET_TCP_OK       = 0
+#NET_TCP_E_BUSY   = -300
+#NET_TCP_E_NOADDR = -301
+#NET_TCP_E_STATE  = -302
+#NET_TCP_E_ARP    = -303
+#NET_TCP_E_RESET  = -304
+#NET_TCP_E_TIMEOUT = -305
+#NET_TCP_E_NOLINK = -307
+#NET_TCP_E_PORT   = -310
+#NET_TCP_E_ROUTE  = -311
+#NET_TCP_E_ARG    = -312
+
+#GATE_SOCKS = 6                  ; socket 5 is "the monitor's own"
+#GATE_RING  = 256
+
+Global gSvcDetail.i
+
+Global gate_ms.i
+Global gate_frames.i
+Global gate_frameEvery.i         ; frames each TcpPoll brings in (0 = none)
+Global gate_msEvery.i            ; milliseconds each TcpPoll costs
+Global gate_polls.i
+Global gate_msgDepth.i
+Global gate_outside.i            ; a service ran outside the message bracket
+Global gate_order.i              ; the service calls, one decimal digit each
+Global gate_checkNow.i
+Global gate_linkTicks.i
+Global gate_inInput.i
+Global gate_reentrantIo.i
+Global gate_sends.i
+Global gate_arps.i
+Global gate_noArp.i
+Global gate_netError.i
+Global gate_preferred.i
+Global gate_routeKind.i
+Global gate_lastKind.i
+Global gate_lastDst.i
+Global gate_lastDstPort.i
+Global gate_lastSrcPort.i
+Global gate_lastQid.i
+Global gate_dnsAccept.i
+Global gate_dnsForce.i
+Global gate_dnsResult.i
+Global gate_rxFrom.i
+Global gate_rxPort.i
+Global gate_rxDstPort.i
+Global gate_rxTo.i
+Global gate_rxLen.i
+Global *gate_hook
+Global Dim gate_usable.i[3]
+Global Dim gate_ready.i[3]
+Global Dim gate_ip.i[3]
+Global Dim gate_dns.i[3]
+Global Dim gate_listen.i[3]
+Global Dim gate_dnsQuery.a[260]
+Global Dim gate_rx.a[64]
+
+; ---- the TCP stub ----
+Global gate_cur.i
+Global gate_arpPending.i
+Global gate_connects.i
+Global gate_closes.i
+Global gate_aborts.i
+Global gate_sndCap.i
+Global Dim gate_sInuse.i[#GATE_SOCKS]
+Global Dim gate_sState.i[#GATE_SOCKS]
+Global Dim gate_sGen.i[#GATE_SOCKS]
+Global Dim gate_sErr.i[#GATE_SOCKS]
+Global Dim gate_sReset.i[#GATE_SOCKS]
+Global Dim gate_sIp.i[#GATE_SOCKS]
+Global Dim gate_sPort.i[#GATE_SOCKS]
+Global Dim gate_sTxLen.i[#GATE_SOCKS]
+Global Dim gate_sRxLen.i[#GATE_SOCKS]
+Global Dim gate_sRxPos.i[#GATE_SOCKS]
+Global Dim gate_sTx.a[#GATE_SOCKS * #GATE_RING]
+Global Dim gate_sRx.a[#GATE_SOCKS * #GATE_RING]
+Global Dim gate_buf.a[64]
+
+Procedure GateOrder(code.i)
+  If gate_msgDepth <= 0
+    gate_outside = 1
+  EndIf
+  gate_order = gate_order * 10 + code
+EndProcedure
+
+; ---- time, the message bracket, the prompt's services ----------------
+Procedure.i millis() : ProcedureReturn gate_ms : EndProcedure
+Procedure UartMessageBegin() : gate_msgDepth = gate_msgDepth + 1 : EndProcedure
+Procedure UartMessageEnd() : gate_msgDepth = gate_msgDepth - 1 : EndProcedure
+Procedure WifiLinkTick() : gate_linkTicks = gate_linkTicks + 1 : GateOrder(1) : EndProcedure
+Procedure NetDhcpTick() : GateOrder(2) : EndProcedure
+Procedure NtpServiceTick() : GateOrder(3) : EndProcedure
+Procedure NetConsoleRearm() : GateOrder(4) : EndProcedure
+Procedure NetConsolePump() : GateOrder(5) : EndProcedure
+Procedure NetConsoleLlTick() : GateOrder(6) : EndProcedure
+Procedure HttpServerPoll() : GateOrder(7) : EndProcedure
+Procedure TcpTick() : GateOrder(8) : EndProcedure
+Procedure WifiLinkCheckNow()
+  If gate_msgDepth <= 0
+    gate_outside = 1
+  EndIf
+  gate_checkNow = gate_checkNow + 1
+EndProcedure
+Procedure.i LinkRxFrames() : ProcedureReturn gate_frames : EndProcedure
+
+; ---- strings ----------------------------------------------------------
+Procedure.i GateEq(*a, *b)
+  Define i.i
+  Define ca.i
+  Define cb.i
+  i = 0
+  Repeat
+    ca = PeekA(*a + i) & $FF
+    cb = PeekA(*b + i) & $FF
+    If ca <> cb : ProcedureReturn 0 : EndIf
+    If ca = 0 : ProcedureReturn 1 : EndIf
+    i = i + 1
+  ForEver
+EndProcedure
+
+; 1 when *needle occurs in *hay. A zero *hay never contains anything.
+Procedure.i GateHas(*hay, *needle)
+  Define i.i
+  Define j.i
+  Define c.i
+  If *hay = 0
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While (PeekA(*hay + i) & $FF) <> 0
+    j = 0
+    Repeat
+      c = PeekA(*needle + j) & $FF
+      If c = 0
+        ProcedureReturn 1
+      EndIf
+      If (PeekA(*hay + i + j) & $FF) <> c
+        Break
+      EndIf
+      j = j + 1
+    ForEver
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ---- settings and address parsing ------------------------------------
+Procedure.i SettingsGet(*key) : ProcedureReturn 0 : EndProcedure
+Procedure.i EthKeyDns() : ProcedureReturn "net.dns" : EndProcedure
+
+Procedure.i ParseDotted(*s)
+  Define i.i
+  Define c.i
+  Define fields.i
+  Define digits.i
+  Define part.i
+  Define ip.i
+  If *s = 0 : ProcedureReturn -1 : EndIf
+  i = 0 : fields = 0 : digits = 0 : part = 0 : ip = 0
+  Repeat
+    c = PeekA(*s + i) & $FF
+    If c >= 48 And c <= 57
+      If digits >= 3 : ProcedureReturn -1 : EndIf
+      part = part * 10 + (c - 48)
+      If part > 255 : ProcedureReturn -1 : EndIf
+      digits = digits + 1
+    ElseIf c = 46 Or c = 0
+      If digits = 0 : ProcedureReturn -1 : EndIf
+      ip = (ip << 8) | part
+      fields = fields + 1
+      digits = 0 : part = 0
+      If c = 0 : Break : EndIf
+    Else
+      ProcedureReturn -1
+    EndIf
+    i = i + 1
+  ForEver
+  If fields <> 4 : ProcedureReturn -1 : EndIf
+  ProcedureReturn ip
+EndProcedure
+
+; ---- interfaces --------------------------------------------------------
+Procedure.i NetIfDns(kind.i) : ProcedureReturn gate_dns[kind] : EndProcedure
+Procedure.i NetIfPreferred() : ProcedureReturn gate_preferred : EndProcedure
+Procedure.i NetIfUsable(kind.i) : ProcedureReturn gate_usable[kind] : EndProcedure
+Procedure.i NetIfUsableCount() : ProcedureReturn gate_usable[1] + gate_usable[2] : EndProcedure
+Procedure.i NetIfNext(after.i)
+  Define k.i
+  k = after + 1
+  While k < #NETIF_KINDS
+    If gate_usable[k] <> 0 : ProcedureReturn k : EndIf
+    k = k + 1
+  Wend
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+Procedure.i NetIfForDest(ip.i)
+  If gate_routeKind > 0
+    If gate_usable[gate_routeKind] <> 0 : ProcedureReturn gate_routeKind : EndIf
+  EndIf
+  ProcedureReturn #HW_LINK_NONE
+EndProcedure
+Procedure.i NetNextHop(kind.i, ip.i)
+  If gate_usable[kind] <> 0 And ip <> 0 : ProcedureReturn ip : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i NetSrcFor(kind.i, ip.i) : ProcedureReturn gate_ip[kind] : EndProcedure
+Procedure.i NetIPv4(kind.i) : ProcedureReturn gate_ip[kind] : EndProcedure
+Procedure.i HwLinkHas(kind.i)
+  If kind = #HW_LINK_WIRED Or kind = #HW_LINK_WIFI : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+Procedure.i HwLinkReady(kind.i) : ProcedureReturn gate_ready[kind] : EndProcedure
+
+; ---- UDP and the dispatcher ------------------------------------------
+Procedure.i NetUdpListen(kind.i, port.i, on.i)
+  If gate_inInput <> 0 : gate_reentrantIo = 1 : EndIf
+  If port = 49240 + kind
+    gate_listen[kind] = on
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+Procedure.i NetUdpBuild(kind.i, dst.i, dp.i, sp.i, *p, n.i)
+  If gate_inInput <> 0 : gate_reentrantIo = 1 : EndIf
+  gate_lastKind = kind : gate_lastDst = dst : gate_lastDstPort = dp : gate_lastSrcPort = sp
+  If gate_noArp <> 0
+    gate_netError = #NET_E_NO_ARP
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn n
+EndProcedure
+Procedure.i NetError() : ProcedureReturn gate_netError : EndProcedure
+Procedure.i NetArpRequest(kind.i, hop.i) : gate_arps = gate_arps + 1 : ProcedureReturn 1 : EndProcedure
+Procedure.i LinkTxStagedOn(kind.i)
+  If gate_inInput <> 0 : gate_reentrantIo = 1 : EndIf
+  gate_sends = gate_sends + 1
+  ProcedureReturn 1
+EndProcedure
+Procedure NetServiceSetUdpHook(*fn) : *gate_hook = *fn : EndProcedure
+
+; A DNS name the way dns_codec encodes it: a label empty or over 63 bytes
+; is refused.
+Procedure.i DnsBuildQuery(*name, qid.i)
+  Define i.i
+  Define c.i
+  Define lab.i
+  i = 0 : lab = 0
+  Repeat
+    c = PeekA(*name + i) & $FF
+    If c = 46 Or c = 0
+      If lab = 0 Or lab > 63 : ProcedureReturn #DNS_E_LABEL : EndIf
+      lab = 0
+      If c = 0 : Break : EndIf
+    Else
+      lab = lab + 1
+    EndIf
+    If i < 258 : gate_dnsQuery[i] = c : EndIf
+    i = i + 1
+  ForEver
+  gate_dnsQuery[i] = 0
+  gate_lastQid = qid
+  ProcedureReturn 20 + i
+EndProcedure
+Procedure.i DnsQueryBuf() : ProcedureReturn @gate_dnsQuery[0] : EndProcedure
+Procedure.i DnsParseReply(*p, n.i, qid.i)
+  If gate_dnsForce <> 0 : ProcedureReturn gate_dnsForce : EndIf
+  If qid <> gate_lastQid : ProcedureReturn #DNS_E_ID : EndIf
+  ProcedureReturn gate_dnsAccept
+EndProcedure
+Procedure.i DnsResultIp(i.i) : ProcedureReturn gate_dnsResult : EndProcedure
+Procedure.i NetRxTo() : ProcedureReturn gate_rxTo : EndProcedure
+Procedure.i NetUdpRxFrom() : ProcedureReturn gate_rxFrom : EndProcedure
+Procedure.i NetUdpRxPort() : ProcedureReturn gate_rxPort : EndProcedure
+Procedure.i NetUdpRxDstPort() : ProcedureReturn gate_rxDstPort : EndProcedure
+Procedure.i NetUdpRxData() : ProcedureReturn @gate_rx[0] : EndProcedure
+Procedure.i NetUdpRxLen() : ProcedureReturn gate_rxLen : EndProcedure
+
+; ---- TCP, socket by socket -------------------------------------------
+Procedure.i TcpCurrent() : ProcedureReturn gate_cur : EndProcedure
+Procedure.i TcpUse(s.i)
+  If s < 0 Or s >= #GATE_SOCKS : ProcedureReturn -309 : EndIf
+  gate_cur = s
+  ProcedureReturn 0
+EndProcedure
+Procedure.i TcpAlloc()
+  Define i.i
+  For i = 0 To #GATE_SOCKS - 1
+    If gate_sInuse[i] = 0
+      gate_cur = i
+      ProcedureReturn i
+    EndIf
+  Next
+  ProcedureReturn -1
+EndProcedure
+Procedure.i TcpConnect(kind.i, ip.i, port.i)
+  gate_connects = gate_connects + 1
+  If gate_arpPending <> 0 : ProcedureReturn #NET_TCP_E_ARP : EndIf
+  gate_sInuse[gate_cur] = 1
+  gate_sState[gate_cur] = #TCP_SYN_SENT
+  gate_sGen[gate_cur] = gate_sGen[gate_cur] + 1
+  gate_sErr[gate_cur] = 0
+  gate_sReset[gate_cur] = 0
+  gate_sIp[gate_cur] = ip
+  gate_sPort[gate_cur] = port
+  gate_sTxLen[gate_cur] = 0
+  gate_sRxLen[gate_cur] = 0
+  gate_sRxPos[gate_cur] = 0
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+Procedure.i TcpGeneration() : ProcedureReturn gate_sGen[gate_cur] : EndProcedure
+Procedure.i TcpState() : ProcedureReturn gate_sState[gate_cur] : EndProcedure
+Procedure.i TcpError() : ProcedureReturn gate_sErr[gate_cur] : EndProcedure
+Procedure.i TcpWasReset() : ProcedureReturn gate_sReset[gate_cur] : EndProcedure
+Procedure.i TcpErrorText(e.i) : ProcedureReturn "tcp: the stub's sentence" : EndProcedure
+Procedure.i TcpSend(*src, len.i)
+  Define n.i
+  Define i.i
+  If gate_sState[gate_cur] <> #TCP_ESTABLISHED And gate_sState[gate_cur] <> #TCP_CLOSE_WAIT
+    ProcedureReturn 0
+  EndIf
+  n = len
+  If n > gate_sndCap - gate_sTxLen[gate_cur] : n = gate_sndCap - gate_sTxLen[gate_cur] : EndIf
+  If n < 0 : n = 0 : EndIf
+  For i = 0 To n - 1
+    gate_sTx[gate_cur * #GATE_RING + gate_sTxLen[gate_cur] + i] = PeekA(*src + i) & $FF
+  Next
+  gate_sTxLen[gate_cur] = gate_sTxLen[gate_cur] + n
+  ProcedureReturn n
+EndProcedure
+Procedure.i TcpRead(*dst, maxlen.i)
+  Define n.i
+  Define i.i
+  n = gate_sRxLen[gate_cur] - gate_sRxPos[gate_cur]
+  If n > maxlen : n = maxlen : EndIf
+  For i = 0 To n - 1
+    PokeA(*dst + i, gate_sRx[gate_cur * #GATE_RING + gate_sRxPos[gate_cur] + i])
+  Next
+  gate_sRxPos[gate_cur] = gate_sRxPos[gate_cur] + n
+  ProcedureReturn n
+EndProcedure
+Procedure.i TcpClose()
+  gate_closes = gate_closes + 1
+  gate_sState[gate_cur] = #TCP_FIN_WAIT_1
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+Procedure.i TcpAbort()
+  gate_aborts = gate_aborts + 1
+  gate_sGen[gate_cur] = gate_sGen[gate_cur] + 1
+  gate_sState[gate_cur] = #TCP_CLOSED
+  gate_sInuse[gate_cur] = 0
+  ProcedureReturn #NET_TCP_OK
+EndProcedure
+; Each receive pass costs gate_msEvery milliseconds and brings in
+; gate_frameEvery frames - a link that never goes quiet when both are set.
+Procedure.i TcpPoll(ms.i)
+  gate_polls = gate_polls + 1
+  gate_ms = gate_ms + gate_msEvery
+  gate_frames = gate_frames + gate_frameEvery
+  ProcedureReturn 0
+EndProcedure
+
+XIncludeFile "Anvil/Core/payload_net.pbi"
+
+; ---- helpers for the scenarios ---------------------------------------
+Procedure GateWipe(s.i, err.i, reset.i)
+  gate_sGen[s] = gate_sGen[s] + 1
+  gate_sErr[s] = err
+  gate_sReset[s] = reset
+  gate_sState[s] = #TCP_CLOSED
+  gate_sInuse[s] = 0
+EndProcedure
+
+; The socket a payload handle is riding, read back out of the engine.
+Procedure.i GateSock(h.i) : ProcedureReturn paynet_tcpSock[h - 1] : EndProcedure
+
+; Deliver the DNS reply the engine is waiting for, through the hook the
+; dispatcher would call, with the dispatcher's no-I/O rule watched.
+Procedure.i GateDnsReply(kind.i, from.i)
+  Define r.i
+  gate_rxTo = gate_ip[kind]
+  gate_rxFrom = from
+  gate_rxPort = 53
+  gate_rxDstPort = 49240 + kind
+  gate_rxLen = 40
+  gate_inInput = 1
+  r = gate_hook(kind)
+  gate_inInput = 0
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i Main()
+  Define r.i
+  Define h.i
+  Define i.i
+  Define sends.i
+  Define connects.i
+  Define t0.i
+  Dim hs.i[8]
+
+  gate_ms = 1000
+  gate_cur = 5
+  gate_sInuse[5] = 1               ; the monitor's own socket, current
+  gate_sndCap = 8
+
+  ; ================= A WI-FI-ONLY BOARD =================
+  gate_usable[#HW_LINK_WIFI] = 1
+  gate_ready[#HW_LINK_WIFI] = 1
+  gate_ip[#HW_LINK_WIFI] = $C0A80116
+  gate_dns[#HW_LINK_WIFI] = $C0A80101
+  gate_preferred = #HW_LINK_WIFI
+  gate_routeKind = #HW_LINK_WIFI
+
+  ; ---- SvcNetUp / Link / Addr
+  If PayNetUp() <> #SVC_OK : ProcedureReturn 1 : EndIf
+  If gate_order <> 1234567 : ProcedureReturn 2 : EndIf      ; the prompt's list, in order
+  If gate_outside <> 0 Or gate_msgDepth <> 0 : ProcedureReturn 3 : EndIf
+  If PayNetLink() <> #HW_LINK_WIFI : ProcedureReturn 4 : EndIf
+  If PayNetAddr() <> $C0A80116 : ProcedureReturn 5 : EndIf
+  ; a link up and still getting an address, and no link at all
+  gate_preferred = #HW_LINK_NONE
+  If PayNetUp() <> #SVC_EAGAIN : ProcedureReturn 6 : EndIf
+  gate_ready[#HW_LINK_WIFI] = 0
+  If PayNetUp() <> #SVC_ESTATE : ProcedureReturn 7 : EndIf
+  If GateHas(gSvcDetail, "wired port is stopped") = 0 : ProcedureReturn 8 : EndIf
+  If PayNetAddr() <> 0 : ProcedureReturn 9 : EndIf
+  gate_ready[#HW_LINK_WIFI] = 1
+  gate_preferred = #HW_LINK_WIFI
+
+  ; ================= DNS =================
+  ; a dotted quad never leaves the board
+  If PayNetDnsResolve("10.1.2.3") <> $0A010203 : ProcedureReturn 10 : EndIf
+  If gate_sends <> 0 : ProcedureReturn 11 : EndIf
+  If PayNetDnsResolve("255.255.255.255") <> #SVC_EARG : ProcedureReturn 12 : EndIf
+  If PayNetDnsResolve(0) <> #SVC_EARG : ProcedureReturn 13 : EndIf
+  If PayNetDnsResolve("") <> #SVC_EARG : ProcedureReturn 14 : EndIf
+  If PayNetDnsResolve("a..b") <> #SVC_EARG : ProcedureReturn 15 : EndIf
+  If gate_sends <> 0 : ProcedureReturn 16 : EndIf
+
+  ; first ask: the query goes out over the radio, and the answer is PENDING
+  If PayNetDnsResolve("Example.COM") <> #SVC_EAGAIN : ProcedureReturn 17 : EndIf
+  If gate_sends <> 1 Or gate_lastKind <> #HW_LINK_WIFI : ProcedureReturn 18 : EndIf
+  If gate_lastDst <> $C0A80101 Or gate_lastDstPort <> 53 : ProcedureReturn 19 : EndIf
+  If gate_lastSrcPort <> 49242 Or gate_listen[#HW_LINK_WIFI] <> 1 : ProcedureReturn 20 : EndIf
+  If GateEq(@gate_dnsQuery[0], "Example.COM") = 0 : ProcedureReturn 21 : EndIf
+  If *gate_hook = 0 : ProcedureReturn 22 : EndIf
+  ; asking again is a poll, not a second query
+  gate_ms = gate_ms + 10
+  If PayNetDnsResolve("Example.COM") <> #SVC_EAGAIN : ProcedureReturn 23 : EndIf
+  If gate_sends <> 1 : ProcedureReturn 24 : EndIf
+  ; one question at a time
+  If PayNetDnsResolve("other.example") <> #SVC_EBUSY : ProcedureReturn 25 : EndIf
+  ; somebody else's datagram on the cable is not ours; a wrong source on our
+  ; port is consumed and rejected, never accepted
+  If GateDnsReply(#HW_LINK_WIRED, $C0A80101) <> 0 : ProcedureReturn 26 : EndIf
+  gate_dnsAccept = 1 : gate_dnsResult = $5DB8D822
+  If GateDnsReply(#HW_LINK_WIFI, $08080808) <> 1 : ProcedureReturn 27 : EndIf
+  If PayNetDnsRejects() <> 1 : ProcedureReturn 28 : EndIf
+  If PayNetDnsResolve("example.com") <> #SVC_EAGAIN : ProcedureReturn 29 : EndIf
+  ; the real answer, delivered without any I/O inside the callback
+  If GateDnsReply(#HW_LINK_WIFI, $C0A80101) <> 1 : ProcedureReturn 30 : EndIf
+  If gate_reentrantIo <> 0 : ProcedureReturn 31 : EndIf
+  If gate_listen[#HW_LINK_WIFI] <> 1 : ProcedureReturn 32 : EndIf   ; closed by the step, not the callback
+  If PayNetDnsResolve("EXAMPLE.com") <> $5DB8D822 : ProcedureReturn 33 : EndIf
+  If gate_listen[#HW_LINK_WIFI] <> 0 : ProcedureReturn 34 : EndIf
+  ; remembered: no second query
+  If PayNetDnsResolve("example.com") <> $5DB8D822 Or gate_sends <> 1 : ProcedureReturn 35 : EndIf
+
+  ; a resolver that never answers: three tries 1.5 s apart, then the timeout
+  ; is said ONCE, and the next ask starts again
+  If PayNetDnsResolve("slow.example") <> #SVC_EAGAIN : ProcedureReturn 36 : EndIf
+  sends = gate_sends
+  gate_ms = gate_ms + 1500 : PayNetService(0)
+  If gate_sends <> sends + 1 : ProcedureReturn 37 : EndIf
+  gate_ms = gate_ms + 1500 : PayNetService(0)
+  If gate_sends <> sends + 2 : ProcedureReturn 38 : EndIf
+  If PayNetDnsResolve("slow.example") <> #SVC_EAGAIN : ProcedureReturn 39 : EndIf
+  gate_ms = gate_ms + 1500 : PayNetService(0)
+  If PayNetDnsResolve("slow.example") <> #SVC_ETIMEOUT : ProcedureReturn 40 : EndIf
+  If GateHas(gSvcDetail, "three tries") = 0 : ProcedureReturn 41 : EndIf
+  If gate_listen[#HW_LINK_WIFI] <> 0 : ProcedureReturn 42 : EndIf
+  If PayNetDnsResolve("slow.example") <> #SVC_EAGAIN : ProcedureReturn 43 : EndIf
+  ; the server says the name does not exist
+  gate_dnsForce = #DNS_E_RCODE
+  If GateDnsReply(#HW_LINK_WIFI, $C0A80101) <> 1 : ProcedureReturn 44 : EndIf
+  gate_dnsForce = 0
+  If PayNetDnsResolve("slow.example") <> #SVC_EIO : ProcedureReturn 45 : EndIf
+  ; no next hop yet: an ARP request, then the query once it is known
+  gate_noArp = 1 : gate_arps = 0 : sends = gate_sends
+  If PayNetDnsResolve("arp.example") <> #SVC_EAGAIN : ProcedureReturn 46 : EndIf
+  If gate_arps <> 1 Or gate_sends <> sends + 1 : ProcedureReturn 47 : EndIf  ; the ARP itself
+  gate_noArp = 0
+  gate_ms = gate_ms + 250 : PayNetService(0)
+  If gate_sends <> sends + 2 Or GateEq(@gate_dnsQuery[0], "arp.example") = 0 : ProcedureReturn 48 : EndIf
+  gate_dnsResult = $01020304
+  GateDnsReply(#HW_LINK_WIFI, $C0A80101)
+  If PayNetDnsResolve("arp.example") <> $01020304 : ProcedureReturn 49 : EndIf
+  ; no resolver anywhere
+  gate_dns[#HW_LINK_WIFI] = 0
+  If PayNetDnsResolve("new.example") <> #SVC_ESTATE : ProcedureReturn 50 : EndIf
+  gate_dns[#HW_LINK_WIFI] = $C0A80101
+  If gate_cur <> 5 : ProcedureReturn 51 : EndIf
+
+  ; ================= TCP =================
+  If PayNetTcpOpen($C0A80164, 0) <> #SVC_EARG : ProcedureReturn 60 : EndIf
+  If PayNetTcpOpen(0, 80) <> #SVC_EARG : ProcedureReturn 61 : EndIf
+  If PayNetTcpOpen($E0000001, 80) <> #SVC_EARG : ProcedureReturn 62 : EndIf
+  ; four handles, then a refusal - and the refusal takes no socket
+  For i = 0 To 3
+    hs[i] = PayNetTcpOpen($C0A80164, 8000 + i)
+    If hs[i] <> i + 1 : ProcedureReturn 63 : EndIf
+  Next
+  connects = gate_connects
+  If PayNetTcpOpen($C0A80164, 9000) <> #SVC_EBUSY : ProcedureReturn 64 : EndIf
+  If GateHas(gSvcDetail, "all four") = 0 Or gate_connects <> connects : ProcedureReturn 65 : EndIf
+  If gate_cur <> 5 : ProcedureReturn 66 : EndIf          ; the monitor's socket is put back
+  If gate_sPort[GateSock(2)] <> 8001 : ProcedureReturn 67 : EndIf
+  ; a bad handle is refused BY NAME: never a handle, or not open
+  If PayNetTcpSend(0, @gate_buf[0], 1) <> #SVC_EARG : ProcedureReturn 68 : EndIf
+  If GateHas(gSvcDetail, "not a TCP handle") = 0 : ProcedureReturn 69 : EndIf
+  If PayNetTcpRecv(5, @gate_buf[0], 1) <> #SVC_EARG : ProcedureReturn 70 : EndIf
+  If GateHas(gSvcDetail, "not a TCP handle") = 0 : ProcedureReturn 71 : EndIf
+  If PayNetTcpClose(hs[3]) <> #SVC_OK : ProcedureReturn 72 : EndIf
+  If PayNetTcpState(hs[3]) <> #SVC_EARG : ProcedureReturn 73 : EndIf
+  If GateHas(gSvcDetail, "not open") = 0 : ProcedureReturn 74 : EndIf
+  If PayNetTcpClose(hs[3]) <> #SVC_EARG : ProcedureReturn 75 : EndIf
+  If gate_closes <> 1 : ProcedureReturn 76 : EndIf         ; a live socket is handed to TcpClose
+  ; and the handle is free for the next open
+  hs[3] = PayNetTcpOpen($C0A80164, 8003)
+  If hs[3] <> 4 : ProcedureReturn 77 : EndIf
+
+  ; connecting, then open; bytes move both ways through the stub
+  h = hs[0]
+  If PayNetTcpState(h) <> #SVC_TCP_CONNECTING : ProcedureReturn 78 : EndIf
+  If PayNetTcpSend(h, "early", 5) <> 0 : ProcedureReturn 79 : EndIf      ; not yet
+  gate_sState[GateSock(h)] = #TCP_ESTABLISHED
+  If PayNetTcpState(h) <> #SVC_TCP_OPEN : ProcedureReturn 80 : EndIf
+  If PayNetTcpSend(h, "hello", 5) <> 5 : ProcedureReturn 81 : EndIf
+  If PayNetTcpSend(h, "world!", 6) <> 3 : ProcedureReturn 82 : EndIf     ; a short take is not an error
+  If gate_sTxLen[GateSock(h)] <> 8 : ProcedureReturn 83 : EndIf
+  If gate_sTx[GateSock(h) * #GATE_RING] <> 104 Or gate_sTx[GateSock(h) * #GATE_RING + 7] <> 114 : ProcedureReturn 84 : EndIf
+  If PayNetTcpRecv(h, @gate_buf[0], 16) <> 0 : ProcedureReturn 85 : EndIf  ; nothing yet
+  gate_sRx[GateSock(h) * #GATE_RING + 0] = 79      ; "OK 1!"
+  gate_sRx[GateSock(h) * #GATE_RING + 1] = 75
+  gate_sRx[GateSock(h) * #GATE_RING + 2] = 32
+  gate_sRx[GateSock(h) * #GATE_RING + 3] = 49
+  gate_sRx[GateSock(h) * #GATE_RING + 4] = 33
+  gate_sRxLen[GateSock(h)] = 5
+  If PayNetTcpRecv(h, @gate_buf[0], 3) <> 3 : ProcedureReturn 86 : EndIf
+  If PayNetTcpRecv(h, @gate_buf[0] + 3, 16) <> 2 : ProcedureReturn 87 : EndIf
+  If gate_buf[0] <> 79 Or gate_buf[4] <> 33 : ProcedureReturn 88 : EndIf
+  If PayNetTcpSend(h, 0, 4) <> #SVC_EARG Or PayNetTcpRecv(h, @gate_buf[0], -1) <> #SVC_EARG : ProcedureReturn 89 : EndIf
+  ; the peer finishes: still readable, reported as such
+  gate_sState[GateSock(h)] = #TCP_CLOSE_WAIT
+  If PayNetTcpState(h) <> #SVC_TCP_PEER_CLOSED : ProcedureReturn 90 : EndIf
+  If gate_cur <> 5 : ProcedureReturn 91 : EndIf
+
+  ; a reset ends handle 2: every call on it now answers the code, and the
+  ; reason was read before the socket could be reused
+  h = hs[1]
+  gate_sState[GateSock(h)] = #TCP_ESTABLISHED
+  GateWipe(GateSock(h), #NET_TCP_E_RESET, 1)
+  If PayNetTcpState(h) <> #SVC_EIO : ProcedureReturn 92 : EndIf
+  If GateHas(gSvcDetail, "stub's sentence") = 0 : ProcedureReturn 93 : EndIf
+  If PayNetTcpRecv(h, @gate_buf[0], 4) <> #SVC_EIO Or PayNetTcpSend(h, "x", 1) <> #SVC_EIO : ProcedureReturn 94 : EndIf
+  ; a socket wiped and reused by another connection: said, not guessed
+  h = hs[2]
+  GateWipe(GateSock(h), #NET_TCP_E_TIMEOUT, 0)
+  gate_sGen[GateSock(h)] = gate_sGen[GateSock(h)] + 1
+  If PayNetTcpState(h) <> #SVC_EIO : ProcedureReturn 95 : EndIf
+  If GateHas(gSvcDetail, "taken by another connection") = 0 : ProcedureReturn 96 : EndIf
+  ; a retransmission timeout is a timeout
+  h = hs[3]
+  GateWipe(GateSock(h), #NET_TCP_E_TIMEOUT, 0)
+  If PayNetTcpState(h) <> #SVC_ETIMEOUT : ProcedureReturn 97 : EndIf
+  ; closing: the open one gets its orderly close, the failed ones just go
+  If PayNetTcpClose(hs[0]) <> #SVC_OK Or gate_closes <> 2 : ProcedureReturn 98 : EndIf
+  For i = 1 To 3
+    If PayNetTcpClose(hs[i]) <> #SVC_OK : ProcedureReturn 99 : EndIf
+  Next
+  If gate_closes <> 2 Or PayNetTcpOpenCount() <> 0 : ProcedureReturn 100 : EndIf
+
+  ; the next hop does not answer ARP: a handle at once, attempts every
+  ; 250 ms and not every call, and a timeout at five seconds
+  For i = 0 To 4 : gate_sInuse[i] = 0 : Next
+  gate_arpPending = 1
+  connects = gate_connects
+  h = PayNetTcpOpen($C0A80164, 443)
+  If h <> 1 : ProcedureReturn 101 : EndIf
+  If gate_connects <> connects + 1 : ProcedureReturn 102 : EndIf
+  If PayNetTcpState(h) <> #SVC_TCP_CONNECTING Or gate_connects <> connects + 1 : ProcedureReturn 103 : EndIf
+  gate_ms = gate_ms + 250
+  If PayNetTcpState(h) <> #SVC_TCP_CONNECTING Or gate_connects <> connects + 2 : ProcedureReturn 104 : EndIf
+  gate_arpPending = 0
+  gate_ms = gate_ms + 250
+  If PayNetTcpState(h) <> #SVC_TCP_CONNECTING Or GateSock(h) < 0 : ProcedureReturn 105 : EndIf
+  PayNetTcpClose(h)
+  gate_arpPending = 1
+  h = PayNetTcpOpen($C0A80164, 443)
+  gate_ms = gate_ms + 5000
+  If PayNetTcpState(h) <> #SVC_ETIMEOUT : ProcedureReturn 106 : EndIf
+  If GateHas(gSvcDetail, "hardware-address") = 0 : ProcedureReturn 107 : EndIf
+  PayNetTcpClose(h)
+  gate_arpPending = 0
+  ; every socket in the monitor taken: no handle is consumed
+  For i = 0 To 4 : gate_sInuse[i] = 1 : Next
+  If PayNetTcpOpen($C0A80164, 80) <> #SVC_EBUSY : ProcedureReturn 108 : EndIf
+  If GateHas(gSvcDetail, "TIME-WAIT") = 0 Or PayNetTcpOpenCount() <> 0 : ProcedureReturn 109 : EndIf
+  For i = 0 To 4 : gate_sInuse[i] = 0 : Next
+  ; no route at all
+  gate_routeKind = #HW_LINK_NONE
+  If PayNetTcpOpen($08080808, 80) <> #SVC_ESTATE : ProcedureReturn 110 : EndIf
+  gate_routeKind = #HW_LINK_WIFI
+  If gate_cur <> 5 : ProcedureReturn 111 : EndIf
+
+  ; ================= THE SERVICE SLOT IS BOUNDED =================
+  If PayNetService(-1) <> #SVC_EARG : ProcedureReturn 120 : EndIf
+  ; zero: every prompt network service once, in order, inside the bracket,
+  ; and no extra drain at all
+  gate_order = 0 : gate_polls = 0 : gate_frameEvery = 1 : gate_msEvery = 1
+  If PayNetService(0) <> 0 : ProcedureReturn 121 : EndIf
+  If gate_order <> 1234567 Or gate_polls <> 0 : ProcedureReturn 122 : EndIf
+  If gate_outside <> 0 Or gate_msgDepth <> 0 : ProcedureReturn 123 : EndIf
+  ; a link that never goes quiet: the slice ends it, not the traffic
+  t0 = gate_ms : gate_polls = 0
+  r = PayNetService(5)
+  If gate_polls < 4 Or gate_polls > 5 Or (gate_ms - t0) > 5 : ProcedureReturn 124 : EndIf
+  If r <> gate_polls : ProcedureReturn 125 : EndIf
+  ; a slice beyond the cap is the cap
+  t0 = gate_ms : gate_polls = 0
+  PayNetService(100000)
+  If (gate_ms - t0) > 50 Or gate_polls > 50 Or gate_polls < 49 : ProcedureReturn 126 : EndIf
+  ; a frozen clock with endless frames: the pass count ends it
+  gate_msEvery = 0 : gate_polls = 0
+  PayNetService(20)
+  If gate_polls <> 64 : ProcedureReturn 127 : EndIf
+  ; a quiet link: one pass finds nothing and the slot returns at once
+  gate_frameEvery = 0 : gate_msEvery = 1 : gate_polls = 0
+  If PayNetService(50) <> 0 Or gate_polls <> 1 : ProcedureReturn 128 : EndIf
+  If gate_outside <> 0 Or gate_msgDepth <> 0 : ProcedureReturn 129 : EndIf
+
+  ; ================= THE PAYLOAD RETURNS =================
+  h = PayNetTcpOpen($C0A80164, 80)
+  gate_sState[GateSock(h)] = #TCP_ESTABLISHED
+  i = PayNetTcpOpen($C0A80164, 81)
+  PayNetDnsResolve("left.example")
+  gate_aborts = 0 : gate_linkTicks = 0 : gate_checkNow = 0
+  PayNetPayloadReturned()
+  If gate_aborts <> 2 Or PayNetTcpOpenCount() <> 0 : ProcedureReturn 130 : EndIf
+  If gate_listen[#HW_LINK_WIFI] <> 0 Or PayNetDnsState() <> #PAYNET_DNS_IDLE : ProcedureReturn 131 : EndIf
+  If gate_checkNow <> 1 Or gate_linkTicks <> 1 : ProcedureReturn 132 : EndIf
+  If gate_outside <> 0 Or gate_msgDepth <> 0 Or gate_cur <> 5 : ProcedureReturn 133 : EndIf
+  If PayNetTcpState(h) <> #SVC_EARG : ProcedureReturn 134 : EndIf
+
+  ProcedureReturn 0
+EndProcedure
+

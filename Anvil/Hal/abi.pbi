@@ -347,6 +347,12 @@
 #SVC_ESTATE    = -108    ; called in the wrong order
 #SVC_EABI      = -109    ; this table is OLDER than the payload was built
                          ; against - see the version gate below
+#SVC_EAGAIN    = -110    ; NEW AT 1.5. Not finished yet, and not failed:
+                         ; the operation was started and a later call with
+                         ; the same arguments carries on with it. Only the
+                         ; net group answers it (a name being resolved, a
+                         ; link still being given an address), because only
+                         ; the net group starts work that outlives one call.
 
 ; The bounds the gate checks. Stated as constants so the gate reads them
 ; rather than transcribing them, and so a reader sees the reservation.
@@ -411,7 +417,9 @@
 ;     40   Touch                      8         4
 ;     48   File and storage          16        12
 ;     64   Settings                   8         4
-;     72   Net                       24        13
+;     72   Net                       24        10   (at 1.5 - 72..79 and 85..86;
+;                                                   80..84, TLS and HTTP, wait
+;                                                   for the TLS port)
 ;     96   USB                       12         6
 ;    108   GPIO                       8         6
 ;    116   I2C                       12         8
@@ -970,6 +978,9 @@ Procedure.i SvcErrText(code.i)
   EndIf
   If code = #SVC_EABI
     ProcedureReturn "this monitor's service table is older than the payload was built against, at code -109 (SVC_EABI): update the monitor, or rebuild the payload against the version this monitor offers - the two numbers are in the payload's own refusal"
+  EndIf
+  If code = #SVC_EAGAIN
+    ProcedureReturn "the operation has been started and has not finished yet, at code -110 (SVC_EAGAIN): it is not a failure - call the network service slot and ask again with the same arguments"
   EndIf
   ProcedureReturn "this monitor has no sentence for that code, which means it did not come from the service table's own error set"
 EndProcedure
@@ -1895,6 +1906,159 @@ Procedure.i SvcSettingDel(*key)
 EndProcedure
 
 ; ======================================================================
+;  GROUP 6 - NET, base 72. FILLED AT ABI 1.5.
+; ----------------------------------------------------------------------
+;  THE PREREQUISITE THIS GROUP WAITED FOR HAS LANDED. It stayed empty
+;  "until the two IP layers merge into one riding whichever link is up"
+;  (ruling 2026-09-02, Anvil todo 119). They have: one IP layer with a row
+;  per interface, a route chosen by destination, TCP latched to the
+;  interface it connected over, and the radio's lease supplying its own
+;  resolver - Anvil/Core/payload_net.pbi's header traces the path a
+;  Wi-Fi-only board takes through each of them.
+;
+;  EVERY SLOT HERE IS NON-BLOCKING, because a payload calls them from a
+;  draw loop. Work that takes longer than one call is STARTED by one call
+;  and answered by later ones, and the network itself moves only when the
+;  payload calls SvcNetService once a frame. The engine, and every rule a
+;  payload can observe, is in Anvil/Core/payload_net.pbi; each slot below
+;  asks the capability question and calls it.
+;
+;    72  SvcNetUp()               #SVC_OK a link carries traffic;
+;                                 #SVC_EAGAIN one is up and still getting
+;                                 an address; #SVC_ESTATE none is up (the
+;                                 wired port is stopped while a payload
+;                                 runs, so on this board that means the
+;                                 radio)
+;    73  SvcNetLink()             #HW_LINK_NONE / _WIRED / _WIFI
+;    74  SvcNetAddr()             the IPv4 address, or 0
+;    75  SvcDnsResolve(*name)     IPv4 (positive), or negative. START AND
+;                                 POLL IN ONE SLOT: the first call sends the
+;                                 query and answers #SVC_EAGAIN, later
+;                                 calls with the same name answer
+;                                 #SVC_EAGAIN until the address arrives.
+;                                 Another name while one is in flight is
+;                                 #SVC_EBUSY. Four answers are remembered
+;                                 for five minutes. A dotted quad answers
+;                                 at once.
+;    76  SvcTcpOpen(ip, port)     a handle 1..4 AT ONCE, or negative; the
+;                                 connect proceeds in the background
+;    77  SvcTcpSend(h, *b, n)     bytes accepted, 0..n (0 while connecting)
+;    78  SvcTcpRecv(h, *b, n)     bytes delivered, 0 = nothing yet
+;    79  SvcTcpClose(h)           #SVC_OK; the handle is free at once, the
+;                                 orderly close carries on behind it
+;    80..83  TLS                  SvcUnimplemented until the TLS port lands
+;    84  SvcHttpRequest           SvcUnimplemented
+;    85  SvcNetService(sliceMs)   NEW. Runs the monitor's own network
+;                                 services - the Wi-Fi keepalive and rekey,
+;                                 DHCP, NTP, the console, TCP timers - the
+;                                 same procedures the prompt runs, then
+;                                 drains receive for what is left of
+;                                 sliceMs (at most 50). Frames received, or
+;                                 #SVC_EARG. CALL IT ONCE A FRAME: nothing
+;                                 else services the network while a
+;                                 payload runs.
+;    86  SvcTcpState(h)           NEW. #SVC_TCP_CONNECTING / _OPEN /
+;                                 _PEER_CLOSED, or the negative code the
+;                                 connection failed with
+;    87  reserved                 SvcUnimplemented
+;
+;  WHY 85 AND 86, AND WHY THE DNS POLL IS NOT A THIRD. The brief reserved
+;  85..87 "for the one-IP-layer merge"; these two are what the merge turned
+;  out to need. A payload that resolves a name asks for the same name
+;  again - the name is its own ticket - so polling DNS needs no slot of
+;  its own, and 87 stays spare.
+;
+;  A BAD HANDLE IS REFUSED BY NAME: #SVC_EARG, and SvcErrDetail says
+;  whether the number was never a handle (outside 1..4) or is a handle
+;  that is not open.
+; ======================================================================
+#SVC_TCP_CONNECTING  = 1   ; the next hop or the handshake still to answer
+#SVC_TCP_OPEN        = 2   ; established; sends are taken
+#SVC_TCP_PEER_CLOSED = 3   ; the peer finished sending; its bytes are still
+                           ; readable and this end may still send
+
+; BUILT ONLY WHERE THE COMPOSITION INCLUDES THE ENGINE. #CAP_NET is not
+; the question: the Pi 3 has an interface and no TCP stack under it. A
+; composition that declares #ANVIL_PAYLOAD_NET = 0 compiles none of this,
+; and BuildServiceTable leaves 72..95 at SvcUnimplemented there - the
+; honest #SVC_ENOSYS, "this monitor has no code for that slot".
+CompilerIf #ANVIL_PAYLOAD_NET = 1
+
+Procedure.i SvcNetUp()
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetUp()
+EndProcedure
+
+Procedure.i SvcNetLink()
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  gSvcDetail = 0
+  ProcedureReturn PayNetLink()
+EndProcedure
+
+Procedure.i SvcNetAddr()
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn 0
+  EndIf
+  gSvcDetail = 0
+  ProcedureReturn PayNetAddr()
+EndProcedure
+
+Procedure.i SvcDnsResolve(*name)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetDnsResolve(*name)
+EndProcedure
+
+Procedure.i SvcTcpOpen(ip.i, port.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpOpen(ip, port)
+EndProcedure
+
+Procedure.i SvcTcpSend(h.i, *b, n.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpSend(h, *b, n)
+EndProcedure
+
+Procedure.i SvcTcpRecv(h.i, *b, n.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpRecv(h, *b, n)
+EndProcedure
+
+Procedure.i SvcTcpClose(h.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpClose(h)
+EndProcedure
+
+Procedure.i SvcNetService(sliceMs.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetService(sliceMs)
+EndProcedure
+
+Procedure.i SvcTcpState(h.i)
+  If SvcRequireCap(#CAP_NET, "net", "this board has no network interface Anvil can reach") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  ProcedureReturn PayNetTcpState(h)
+EndProcedure
+
+CompilerEndIf
+
+; ======================================================================
 ;  GROUP 7 - USB, base 96
 ;
 ;  A straight re-export of HwUsb*, speaking the same #HW_USB_* vocabulary.
@@ -2550,22 +2714,24 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_SETTING + 2] = @SvcSettingSave
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_SETTING + 3] = @SvcSettingDel
 
-  ; --- net, base 72 ---------------------------------------------------
-  ; DELIBERATELY EMPTY IN THIS BUILD, and the reason is a prerequisite
-  ; outside Phase A rather than an oversight. It was settled on 2026-09-02
-  ; that the two IP layers merge into one riding whichever link is up
-  ; (Anvil todo 119); until that lands, the Ethernet-only stack cannot
-  ; resolve a name over the Wi-Fi the bench actually has, and Ethernet RX
-  ; is still silent. The brief says in as many words that "Phase A can
-  ; ship with the seam correct and the plumbing incomplete; phase 5
-  ; cannot."
-  ;
-  ; SO THE SLOTS STAY AT SvcUnimplemented AND ANSWER #SVC_ENOSYS. That is
-  ; the truth. Installing a SvcNetUp that returned #SVC_OK over a stack
-  ; that cannot reach the bench would be the plausible-stub failure this
-  ; whole file's error convention exists to prevent, and the reserved
-  ; block at base 72 is untouched so that filling it later is an
-  ; abi_minor bump and nothing else.
+  ; --- net, base 72 (1.5) --------------------------------------------
+  ; Filled at 1.5, once the two IP layers had merged - see GROUP 6 above.
+  ; 80..84 (TLS and the HTTP convenience) stay at SvcUnimplemented until
+  ; the TLS port lands; 85 and 86 are two of the three the brief reserved
+  ; for the merge, and 87 stays spare. Only where the composition built
+  ; the engine.
+  CompilerIf #ANVIL_PAYLOAD_NET = 1
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  0] = @SvcNetUp
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  1] = @SvcNetLink
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  2] = @SvcNetAddr
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  3] = @SvcDnsResolve
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  4] = @SvcTcpOpen
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  5] = @SvcTcpSend
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  6] = @SvcTcpRecv
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET +  7] = @SvcTcpClose
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 13] = @SvcNetService
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_NET + 14] = @SvcTcpState
+  CompilerEndIf
 
   ; --- usb, base 96 ---------------------------------------------------
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_USB + 0] = @SvcUsbEnumerate

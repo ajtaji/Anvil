@@ -1503,6 +1503,7 @@ XIncludeFile "Anvil/Storage/hwfile.pbi"
 ; ours. It still never installs a block writer itself; hwfile.pbi arms
 ; one around the single call that writes and disarms it on every path out.
 XIncludeFile "Anvil/Core/settings.pbi"
+XIncludeFile "Anvil/Core/wifi_incident.pbi"     ; the Wi-Fi flight recorder and WIFILOG.TXT (2026-10-14)
 ; THE NETWORK, for get, put and net. Three libraries, none of which does
 ; a byte of input or output on its own - see THE NETWORK further down for
 ; what that costs this file and why it is worth it. The order is the one
@@ -1702,6 +1703,11 @@ CompilerElse
                     ; load / save / mount work today.
 #CAP_NET      = 1   ; an IP-capable interface. Gigabit Ethernet via
                     ; Lib/genet under Lib/net + Lib/tftp - get / put / net.
+#ANVIL_PAYLOAD_NET = 1  ; the payload ABI's net group (base 72) is built:
+                    ; Anvil/Core/payload_net.pbi over Lib/tcp, included
+                    ; after abi.pbi below. Not a #CAP_: #CAP_NET says the
+                    ; board has an interface, and a board can have one
+                    ; (the Pi 3) without the TCP stack this group rides on.
 #CAP_GPIO     = 1   ; general-purpose I/O. Lib/gpio over the HwGpio* seam
                     ; (RaspberryPi4/Board/hw_gpio.pi4) - the `gpio` command.
 #CAP_I2C      = 1   ; the header I2C bus (BSC1 on GPIO 2/3), driven by
@@ -2227,6 +2233,13 @@ CompilerIf #PMF_CHIP = 2712
 XIncludeFile "RaspberryPi4/Board/hw_clock.pi4"
 CompilerEndIf
 XIncludeFile "Anvil/Hal/abi.pbi"
+; The engine behind the service table's net group. After abi.pbi because it
+; answers in the table's #SVC_* vocabulary and sets its detail fragment;
+; abi.pbi's net slots call into it (a forward call, which this language
+; resolves), and RunAt's return path in cache.pi4 calls its
+; PayNetPayloadReturned. Everything it calls - tcp.pi4, the link pump, the
+; DNS codec, the prompt's network services - is above.
+XIncludeFile "Anvil/Core/payload_net.pbi"
 XIncludeFile "Anvil/Core/pmfboot.pbi"
 ; ----------------------------------------------------------------------
 ;  THE DRIVER-MODULE LOADER. After pmfboot.pbi because the two are the

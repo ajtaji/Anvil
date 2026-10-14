@@ -115,8 +115,12 @@
 ; stays 0 while this restatement follows the table. What the count is for
 ; is the probe's own bounds check on a slot index; raising it does not
 ; make the probe reach for anything new.
-#SVC_ABI_MINOR   = 3
-#SVC_SLOT_COUNT  = 192
+;
+; 5 since then: 1.4 appended file handles at 192 (the count to 200), and
+; 1.5 filled the net group at 72 - which IS one slot this probe calls, and
+; its expectation below changed with it.
+#SVC_ABI_MINOR   = 5
+#SVC_SLOT_COUNT  = 200
 #SVC_HDR_BYTES   = 16          ; magic, major, minor, entry_count
 
 #SVC_OK        =    0
@@ -125,6 +129,8 @@
 #SVC_EARG      = -102
 #SVC_EPERM     = -106
 #SVC_EABI      = -109
+#SVC_ESTATE    = -108
+#SVC_EAGAIN    = -110
 
 ; ----------------------------------------------------------------------
 ;  WHAT THIS PAYLOAD WAS BUILT AGAINST, and it is NOT the same fact as
@@ -900,10 +906,17 @@ Procedure.i Main()
   ; many-record append test and this line is what points at it.
   Expect(#R_APPENDRC, svc_fileappend("SVCPROBE.LOG", $01500000, 16), #SVC_ENOSYS)
 
-  ; The net group is reserved and empty in this build - the one-IP-layer
-  ; merge has not landed (see the net group in abi.pbi). #SVC_ENOSYS is the
-  ; truth.
-  Expect(#R_NETUPRC, svc_netup(), #SVC_ENOSYS)
+  ; THE NET GROUP IS FILLED AT 1.5, so SvcNetUp is now an answer about the
+  ; bench rather than a fixed refusal: #SVC_OK with a link up, #SVC_EAGAIN
+  ; while one is still getting an address, #SVC_ESTATE with none, and
+  ; #SVC_ENOCAP on a board with no interface. Any of the four is honest and
+  ; is recorded as read. #SVC_ENOSYS is now the WRONG answer - it would mean
+  ; the slot fell back to SvcUnimplemented on a monitor that claims 1.5.
+  rc = svc_netup()
+  Put(#R_NETUPRC, rc)
+  If rc <> #SVC_OK And rc <> #SVC_EAGAIN And rc <> #SVC_ESTATE And rc <> #SVC_ENOCAP
+    gFails = gFails + 1
+  EndIf
 
   ; A reserved slot inside a group that IS implemented must also answer
   ; #SVC_ENOSYS rather than fault. Slot 46 is inside the touch block's

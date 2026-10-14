@@ -925,6 +925,23 @@ Procedure.i netcon_OwnerLapsed()
   ProcedureReturn 0
 EndProcedure
 
+; ONE MORE UDP OWNER, REGISTERED RATHER THAN NAMED. The payload network
+; service (Anvil/Core/payload_net.pbi) resolves names over DNS without
+; blocking, exactly the way the NTP service does, so its replies have to
+; enter here like the NTP service's. It is reached through a pointer and not
+; by name because this file is built into compositions that have no payload
+; table at all (the Pi 3 monitor, the desk gates' fixtures), and a call by
+; name would make every one of them define it. Zero means nobody registered
+; and costs one compare. The hook follows NtpServiceInput's contract: it
+; validates and copies bounded state only, never builds or transmits a
+; packet while this receive scratch is live, and answers 1 when the
+; datagram was its own.
+Global *gNetUdpSvcHook = 0
+
+Procedure NetServiceSetUdpHook(*fn)
+  *gNetUdpSvcHook = *fn
+EndProcedure
+
 ; One automatic protocol dispatcher for every hardware consumer. ARP and
 ; ICMP replies, TCP, the DHCP service and console UDP therefore have one
 ; ownership decision. Command-owned UDP returns 0 to its waiting caller.
@@ -954,6 +971,11 @@ Procedure.i NetServiceInput(kind.i, *frame, rc.i)
     ; remain in NtpServiceTick after receive scratch is no longer live.
     If NtpServiceInput(kind) <> 0
       ProcedureReturn 1
+    EndIf
+    If *gNetUdpSvcHook <> 0
+      If gNetUdpSvcHook(kind) <> 0
+        ProcedureReturn 1
+      EndIf
     EndIf
     own = NetConsoleOfferUdp(*frame, kind)
     If own = 2

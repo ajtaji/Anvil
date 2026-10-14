@@ -260,7 +260,7 @@ def source_checks(read) -> int:
     require_bracketed(read(WIFI), "Procedure.i WifiServiceEapolFrame(", ["wifi_ServiceEapol"],
                       "WifiServiceEapolFrame")
     # 4. The payload-return housekeeping, before the result lines.
-    require_bracketed(read(RUNAT), "Procedure RunAt(", ["NetDhcpTick", "NetConsoleRearm"], "RunAt")
+    require_bracketed(read(RUNAT), "Procedure RunAt(", ["NetDhcpTick", "PayNetPayloadReturned", "NetConsoleRearm"], "RunAt")
     count += 3
     # 5. A fault leaves every bracket before its first mirrored line.
     report = "\n".join(body_of(read(EXCEPTION), "Procedure HwExceptionReport()"))

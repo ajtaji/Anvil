@@ -179,8 +179,11 @@ ABI_MAJOR = 1
 # AND THE FOURTH MOVED NONE EITHER: the core group was full at 16 of 16, so
 # the new block was APPENDED and entry_count rose rather than anything being
 # renumbered.  That is still a minor bump - abi_version.pbi.
-ABI_MINOR = 3
-SLOT_COUNT = 192
+# 1.4 appended group 16 - file handles - at base 192 (entry_count 192 -> 200),
+# and 1.5 filled the net group's reserved slots (72..79, 85, 86) once the two
+# IP layers had merged.  Neither moved an existing slot.
+ABI_MINOR = 5
+SLOT_COUNT = 200
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'
 
@@ -201,6 +204,7 @@ GROUPS = [
     (156, "gnss",     12),
     (168, "crypto",   16),
     (184, "par",       8),
+    (192, "fileh",     8),
 ]
 
 INSTALLED = {
@@ -265,13 +269,22 @@ INSTALLED = {
     # without the capability answers one core and #SVC_ENOCAP rather than
     # leaving the slots pointing at SvcUnimplemented.
     184: "SvcParallelCores", 185: "SvcParallelRun", 186: "SvcParallelStatus",
+
+    # ABI 1.4: several files open at once.
+    192: "SvcFileHOpen", 193: "SvcFileHSize", 194: "SvcFileHReadAt",
+    195: "SvcFileHClose",
+
+    # ABI 1.5: the net group.  80..84 (TLS, HTTP) and 87..95 stay reserved.
+    72: "SvcNetUp", 73: "SvcNetLink", 74: "SvcNetAddr", 75: "SvcDnsResolve",
+    76: "SvcTcpOpen", 77: "SvcTcpSend", 78: "SvcTcpRecv", 79: "SvcTcpClose",
+    85: "SvcNetService", 86: "SvcTcpState",
 }
 
 SVC_ERRS = {
     "#SVC_OK": 0, "#SVC_ENOSYS": -100, "#SVC_ENOCAP": -101,
     "#SVC_EARG": -102, "#SVC_EBUSY": -103, "#SVC_ETIMEOUT": -104,
     "#SVC_EIO": -105, "#SVC_EPERM": -106, "#SVC_EFLAG": -107,
-    "#SVC_ESTATE": -108, "#SVC_EABI": -109,
+    "#SVC_ESTATE": -108, "#SVC_EABI": -109, "#SVC_EAGAIN": -110,
 }
 SVC_RANGE_LO, SVC_RANGE_HI = -199, -100
 HW_FLOOR = -99
@@ -403,7 +416,8 @@ def check_static() -> list[str]:
              "gpio": "#SVC_BASE_GPIO", "i2c": "#SVC_BASE_I2C",
              "spi": "#SVC_BASE_SPI", "uart": "#SVC_BASE_UART",
              "veh": "#SVC_BASE_VEH", "gnss": "#SVC_BASE_GNSS",
-             "crypto": "#SVC_BASE_CRYPTO", "par": "#SVC_BASE_PAR"}
+             "crypto": "#SVC_BASE_CRYPTO", "par": "#SVC_BASE_PAR",
+             "fileh": "#SVC_BASE_FILEH"}
     for base, g, _res in GROUPS:
         if abi.get(names[g]) != base:
             fail(problems, f"{names[g]} is {abi.get(names[g])}, expected {base}")
@@ -695,8 +709,8 @@ def check_dynamic() -> list[str]:
                        "null slot is a branch to address 0 the first time an "
                        "over-new payload reaches for it.")
 
-    # The net group is deliberately empty in this build and the crypto group
-    # is one slot; both are stated in abi.pbi with their reasons.
+    # The crypto group is one slot, and the net group's TLS/HTTP slots wait
+    # for the TLS port; both are stated in abi.pbi with their reasons.
     expected_unimpl = set(range(SLOT_COUNT)) - set(INSTALLED)
     for i in sorted(expected_unimpl):
         if slots[i] != unimpl:

@@ -91,9 +91,11 @@ def production() -> dict[str, str]:
     rxbreak = RXBREAK.read_text(encoding="utf-8")
     cmd = NET_CMD.read_text(encoding="utf-8")
     blocks = {
+        # From the registered-UDP-owner hook down: NetServiceInput reads it,
+        # so the global and its setter travel with the procedure.
         "service": span(
             console,
-            "Procedure.i NetServiceInput(kind.i, *frame, rc.i)",
+            "Global *gNetUdpSvcHook = 0",
             "Procedure.i NetServiceInput(kind.i, *frame, rc.i)",
             "NetServiceInput",
         ),
