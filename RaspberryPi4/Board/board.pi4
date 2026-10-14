@@ -1184,7 +1184,7 @@ StackAddress $8000000
 ;      #ANVIL_BUILD = 1        ; pmf:build off
 ;  The IDE's Compiler > Build Number... window writes that word for you.
 ; ======================================================================
-#ANVIL_BUILD = 251        ; pmf:build
+#ANVIL_BUILD = 253        ; pmf:build
 
 ;  The two optional siblings, written by the same successful build. They
 ;  are INTEGERS because `#NAME = <literal>` takes a number and nothing
@@ -1192,8 +1192,8 @@ StackAddress $8000000
 ;  constant, and inventing one would be a language change nobody asked
 ;  for. YYYYMMDD and HHMMSS read correctly as decimal numbers anyway, and
 ;  CmdVersion() prints them with their separators put back.
-#ANVIL_BUILD_DATE = 20261013   ; pmf:builddate
-#ANVIL_BUILD_TIME = 204347     ; pmf:buildtime
+#ANVIL_BUILD_DATE = 20261014   ; pmf:builddate
+#ANVIL_BUILD_TIME = 065658     ; pmf:buildtime
 
 ; ======================================================================
 ;  THE LIBRARIES. A library never includes a library - the main file
@@ -2240,6 +2240,8 @@ XIncludeFile "Anvil/Core/mod_cmd.pbi"
 ; settings, and BootFileWait(). Separate from the engine above so the
 ; engine can be built - and gated - without a line editor.
 XIncludeFile "Anvil/Core/bootfile_cmd.pbi"
+; programs - the containers on the medium, and running one by typing its name.
+XIncludeFile "Anvil/Core/programs_cmd.pbi"
 ; Text/reporting half of the explicit multicore acceptance command. Its
 ; hardware owner was included above cache.pi4 so the payload and cache paths
 ; can see the ownership boundary. This reporting half uses the console's real
@@ -3013,6 +3015,19 @@ Procedure Main()
     ElseIf WordIs("boot") <> 0
       CmdBoot()
 
+    ; programs - what can be run from the medium. A listed name typed on its
+    ; own runs it; that is tried in the unknown-command arm below, last.
+    ElseIf WordIs("programs") <> 0
+      CmdPrograms()
+
+    ; vkstat - where the Vulkan console's frame time goes (Board/vulkan_console.pi4)
+    ElseIf WordIs("vkstat") <> 0
+      CompilerIf #ANVIL_VULKAN_CONSOLE = 1
+      CmdVkStat()
+      CompilerElse
+      PrintN("This build has no Vulkan console.")
+      CompilerEndIf
+
     ; "md" IS U-BOOT'S NAME FOR THIS and it is dispatched. The help text
     ; has said "coming from U-Boot: md is memory" for as long as the memory
     ; family has existed, and mw, cmp and cp were all wired up as aliases -
@@ -3449,6 +3464,10 @@ Procedure Main()
     ElseIf WordIs("help") <> 0 Or WordIs("commands") <> 0 Or LetterIs(104) <> 0 Or LetterIs(63) <> 0   ; h, ?
       Help()
       PrintNl()
+      PrintN("PROGRAMS")
+      PrintN("  programs             the payload containers (.pmf) on the boot medium")
+      PrintN("  <name>               a listed name typed on its own runs that program")
+      PrintNl()
       PrintN("PI 4 EL3 ACCEPTANCE")
       PrintN("  el3test              one bounded secure-timer IRQ, then one controlled BRK")
       PrintN("  coretest status      resident secondary-core ownership and last result")
@@ -3456,6 +3475,9 @@ Procedure Main()
       PrintN("  coretest stop        acknowledge and permanently park those workers")
       PrintN("These are explicit diagnostics, never boot actions. After coretest run,")
       PrintN("restart before changing cache policy or entering a payload.")
+
+    ElseIf ProgramsTryRun() <> 0
+      ; the word was the name of a program on the medium, and it was run
 
     Else
       ; ECHO WHAT WAS ACTUALLY TYPED. "unknown command" with no subject is
