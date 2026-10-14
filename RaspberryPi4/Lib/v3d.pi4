@@ -8569,6 +8569,22 @@ EndProcedure
 ;  If the cache did hold the only copy of a pixel, an invalidate would
 ;  destroy it - which is exactly the mistake stage 2 nearly made.
 ; ----------------------------------------------------------------------
+; Is the render that V3dRenderSubmit started finished? 1 done, 0 not yet, -1 the GPU's MMU faulted.
+; NEVER WAITS: for a caller that has other work to do while the GPU renders (2026-10-14). The finish -
+; the caches cleaned - is still V3dRenderWait's, which returns at once once this says 1.
+Procedure.i V3dRenderDone()
+  If v3d_renJobs = 0
+    ProcedureReturn 1
+  EndIf
+  If (V3dCoreRead(#V3D_CTL_INT_STS) & #V3D_CTL_INT_FRDONE) <> 0
+    ProcedureReturn 1
+  EndIf
+  If (V3dHubRead(#V3D_MMU_CTL) & #V3D_MMU_CTL_FAULTS) <> 0
+    ProcedureReturn -1
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
 Procedure.i V3dRenderWait(us.i)
   Protected sts.i
   Protected hz.i

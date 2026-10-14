@@ -107,6 +107,7 @@ EndStructure
 
 Global nvcReady.i
 Global nvcInFrame.i
+Global nvcAsync.i, nvcSubmitNoWait.i, nvcFramePending.i     ; a frame finished later: see NeonVkChromeFinish
 Global nvcMapped.i
 Global nvcTargetGeneration.i
 Global nvcNextTargetGeneration.i
@@ -377,7 +378,7 @@ Procedure.i NeonVkChromeReady()
 EndProcedure
 
 Procedure.i NeonVkChromeExternalProducerAttach()
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcExternalProducerAttached = 1
@@ -386,7 +387,7 @@ EndProcedure
 
 ; The producer calls this before a submit whose completion may be uncertain.
 Procedure.i NeonVkChromeExternalProducerQuarantine()
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcExternalProducerQuarantined = 1
@@ -395,7 +396,7 @@ EndProcedure
 
 ; Only the producer can establish completed compute and successful cache clean.
 Procedure.i NeonVkChromeExternalProducerUnquarantine()
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined = 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined = 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   nvcExternalProducerQuarantined = 0
@@ -405,7 +406,7 @@ EndProcedure
 ; Call only after the producer has proved idle and released its allocations.
 Procedure.i NeonVkChromeExternalProducerDetach()
   Define rc.i
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerAttached = 0 Or nvcExternalProducerQuarantined <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   rc = vkDeviceWaitIdle(nvcDevice)
@@ -614,7 +615,7 @@ Procedure.i nvcSubmitAndWait()
     If nvcFrameAbortable <> 0 : nvcFrameAbortable = 0 : EndIf
     rc = vkQueueSubmit(nvcQueue, 1, @si, nvcFence)
   EndIf
-  If rc = #VK_SUCCESS
+  If rc = #VK_SUCCESS And nvcSubmitNoWait = 0
     nvcSubmitStage = 4
     rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS)
   EndIf
@@ -1704,7 +1705,7 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   Define offset.q
   Define rc.i
 
-  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
+  If nvcReady = 0 Or nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvcFrameAbortable <> 0 Or nvcExternalProducerQuarantined <> 0 Or nvcGridBatchActive <> 0 Or nvdPresentPending() <> 0 Or nvcImageSpritePendingImage <> 0
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If nvcTTDirty <> 0
@@ -2082,8 +2083,49 @@ EndProcedure
 ; One line's quad at p (8-byte aligned), as nvcLineQuad writes it. Writes nothing else: any core may call it.
 Procedure NeonVkChromeLineQuadAt(p.i, x0.i, y0.i, x1.i, y1.i)
   Define dx.i, dy.i, c0.i, c1.i, c2.i, c3.i, uv.i, one.i
+  Define offX.i, offY.i, ka.i, kb.i, kc.i, kd.i, ke.i, kf.i, lim.i
   dx = x1 - x0 : If dx < 0 : dx = 0 - dx : EndIf
   dy = y1 - y0 : If dy < 0 : dy = 0 - dy : EndIf
+  ; THE PANEL'S OWN CASE, done in line: rotation 90 with the tables built. A quad's corners have two
+  ; distinct values along the line and four across it, so after the turn it is six table reads, not eight,
+  ; and no call per corner. The same table entries nvcLinePosW would read: the same bits.
+  If nvcRotation = 90 And nvcClipTabW = nvcPhysicalW And nvcClipTabH = nvcPhysicalH And (dx <> 0 Or dy <> 0)
+    offX = nvcLogicalH * 2 - nvcPhysicalW + #NVC_CLIP_TAB_HALF      ; X entry of a corner = offX - its y2
+    offY = #NVC_CLIP_TAB_HALF - nvcPhysicalH                         ; Y entry of a corner = its x2 + offY
+    lim = #NVC_CLIP_TAB_HALF * 2
+    If dx >= dy
+      ka = offX - (y0 * 2 - 1) : kb = offX - (y1 * 2 - 1) : kc = offX - (y1 * 2 + 1) : kd = offX - (y0 * 2 + 1)
+      ke = x0 * 2 + offY : kf = x1 * 2 + offY
+      If ka >= 0 And ka < lim And kb >= 0 And kb < lim And kc >= 0 And kc < lim And kd >= 0 And kd < lim And ke >= 0 And ke < lim And kf >= 0 And kf < lim
+        c0 = (nvcClipTabX[ka] & $FFFFFFFF) | ((nvcClipTabY[ke] & $FFFFFFFF) << 32)
+        c1 = (nvcClipTabX[kb] & $FFFFFFFF) | ((nvcClipTabY[kf] & $FFFFFFFF) << 32)
+        c2 = (nvcClipTabX[kc] & $FFFFFFFF) | ((nvcClipTabY[kf] & $FFFFFFFF) << 32)
+        c3 = (nvcClipTabX[kd] & $FFFFFFFF) | ((nvcClipTabY[ke] & $FFFFFFFF) << 32)
+        lim = 0
+      EndIf
+    Else
+      ka = offX - y0 * 2 : kb = offX - y1 * 2
+      kc = x0 * 2 - 1 + offY : kd = x1 * 2 - 1 + offY : ke = x1 * 2 + 1 + offY : kf = x0 * 2 + 1 + offY
+      If ka >= 0 And ka < lim And kb >= 0 And kb < lim And kc >= 0 And kc < lim And kd >= 0 And kd < lim And ke >= 0 And ke < lim And kf >= 0 And kf < lim
+        c0 = (nvcClipTabX[ka] & $FFFFFFFF) | ((nvcClipTabY[kc] & $FFFFFFFF) << 32)
+        c1 = (nvcClipTabX[kb] & $FFFFFFFF) | ((nvcClipTabY[kd] & $FFFFFFFF) << 32)
+        c2 = (nvcClipTabX[kb] & $FFFFFFFF) | ((nvcClipTabY[ke] & $FFFFFFFF) << 32)
+        c3 = (nvcClipTabX[ka] & $FFFFFFFF) | ((nvcClipTabY[kf] & $FFFFFFFF) << 32)
+        lim = 0
+      EndIf
+    EndIf
+    If lim = 0
+      uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
+      one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
+      PokeI(p, c0) : PokeI(p + 8, uv) : PokeI(p + 16, one)
+      PokeI(p + 24, c1) : PokeI(p + 32, uv) : PokeI(p + 40, one)
+      PokeI(p + 48, c2) : PokeI(p + 56, uv) : PokeI(p + 64, one)
+      PokeI(p + 72, c0) : PokeI(p + 80, uv) : PokeI(p + 88, one)
+      PokeI(p + 96, c2) : PokeI(p + 104, uv) : PokeI(p + 112, one)
+      PokeI(p + 120, c3) : PokeI(p + 128, uv) : PokeI(p + 136, one)
+      ProcedureReturn
+    EndIf
+  EndIf
   If dx = 0 And dy = 0
     ; nvcSolidQuad(x0, y0, x0 + 1, y0, x0 + 1, y0 + 1, x0, y0 + 1): triangles c0 c1 c2, c0 c2 c3
     c0 = nvcLinePosW(x0 * 2, y0 * 2) : c1 = nvcLinePosW(x0 * 2 + 2, y0 * 2)
@@ -3631,6 +3673,8 @@ Procedure NeonVkChromeScissorClear()
   nvcClipX = 0 : nvcClipY = 0 : nvcClipW = nvcPhysicalW : nvcClipH = nvcPhysicalH
 EndProcedure
 
+Declare.i nvcFramePublish()
+
 Procedure.i NeonVkChromeEnd()
   Define rc.i
   If nvcReady = 0 Or nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0
@@ -3648,9 +3692,55 @@ Procedure.i NeonVkChromeEnd()
   EndIf
   nvcSubmitStage = 1 : nvcSubmitRc = rc
   If rc = #VK_SUCCESS : rc = vkEndCommandBuffer(nvcCommand) : nvcSubmitRc = rc : EndIf
-  If rc = #VK_SUCCESS : rc = nvcSubmitAndWait() : EndIf
+  If rc = #VK_SUCCESS
+    nvcSubmitNoWait = nvcAsync
+    rc = nvcSubmitAndWait()
+    nvcSubmitNoWait = 0
+  EndIf
   nvcInFrame = 0
   If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  If nvcAsync <> 0
+    nvcFramePending = 1                            ; NeonVkChromeFinish waits for it and publishes it
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  ProcedureReturn nvcFramePublish()
+EndProcedure
+
+; A FRAME FINISHED LATER (2026-10-14, for 60 fps). With NeonVkChromeAsync(1), NeonVkChromeEnd submits
+; the frame and returns while the GPU draws it; NeonVkChromeFinish waits for it and publishes it as End
+; does. Between the two the caller may do anything that does not touch the frame's resources - the
+; command buffer and the vertex memory are the GPU's until Finish - and Begin refuses until then.
+Procedure.i NeonVkChromeAsync(on.i)
+  If nvcFramePending <> 0 Or nvcInFrame <> 0
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  nvcAsync = 0
+  If on <> 0
+    nvcAsync = 1
+  EndIf
+  ProcedureReturn #VK_SUCCESS
+EndProcedure
+
+Procedure.i NeonVkChromeFramePending()
+  ProcedureReturn nvcFramePending
+EndProcedure
+
+; Waits for the frame End submitted and publishes it. Nothing pending: at once.
+Procedure.i NeonVkChromeFinish()
+  Define rc.i, fenceHandle.i
+  If nvcFramePending = 0
+    ProcedureReturn #VK_SUCCESS
+  EndIf
+  nvcSubmitStage = 4
+  fenceHandle = nvcFence
+  rc = vkWaitForFences(nvcDevice, 1, @fenceHandle, 1, #NEON_VK_CHROME_WAIT_NS)
+  nvcSubmitRc = rc
+  nvcFramePending = 0
+  If rc <> #VK_SUCCESS : ProcedureReturn nvcFail(rc) : EndIf
+  ProcedureReturn nvcFramePublish()
+EndProcedure
+
+Procedure.i nvcFramePublish()
   nvcNextFrameSequence = nvcNextFrameSequence + 1
   If nvdWsiEnabled() <> 0
     If nvdWsiMarkReady() <> #VK_SUCCESS : nvdWsiRollback() : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -3813,7 +3903,12 @@ Procedure.i nvcLifecycleEnd()
   If nvcReady = 0 Or nvcInFrame = 0
     ProcedureReturn #NEON_ERR_BACKEND
   EndIf
-  If NeonVkChromeEnd() <> #VK_SUCCESS Or NeonVkChromePresentPending() <> 1
+  If NeonVkChromeEnd() <> #VK_SUCCESS
+    ProcedureReturn #NEON_ERR_BACKEND
+  EndIf
+  If nvcAsync <> 0                                ; submitted, not yet published: NeonVkChromeFinish does that
+    If nvcFramePending <> 1 : ProcedureReturn #NEON_ERR_BACKEND : EndIf
+  ElseIf NeonVkChromePresentPending() <> 1
     ProcedureReturn #NEON_ERR_BACKEND
   EndIf
   ProcedureReturn #NEON_OK

@@ -977,9 +977,6 @@ Procedure.i AnvilVkV3dCsdSubmit(*result.AnvilVkV3dCsdResult)
   ProcedureReturn #V3D_OK
 EndProcedure
 
-Procedure.i avkBackendPoll()
-  ProcedureReturn 1
-EndProcedure
 
 Procedure.i avkBackendLastNativeError()
   ProcedureReturn avkV3dNative
@@ -1824,6 +1821,37 @@ EndProcedure
 ; written, 5 the GPU's frame finished (NeonHardwareFrameEnd: kick and wait). Read by a payload.
 Global Dim avkV3dProf.i[8]
 
+; A DRAW LIST'S RENDER, FINISHED LATER (2026-10-14). With avkV3dAsync set, avkBackendSubmitDraw starts
+; the render and answers #ANVIL_VK_JOB_PENDING; the submission stays in flight and the caller works on
+; while the GPU renders. avkBackendPoll - called by the fence wait - asks without waiting, and once the
+; render is done finishes it exactly as the waiting path does: the caches, the surface put back, the
+; draw arena given back. Off by default: a caller opts in.
+Global avkV3dAsync.i, avkV3dPend.i, avkV3dPendArena.i, avkV3dPendDraws.i, avkV3dPendLive.i, avkV3dPendRc.i
+Global avkV3dPOldBase.i, avkV3dPOldW.i, avkV3dPOldH.i, avkV3dPOldPitch.i, avkV3dPOldBytes.i, avkV3dPOldFormat.i, avkV3dPOldRot.i
+Global avkV3dAsyncJobs.i
+
+Procedure.i avkBackendPoll()
+  Define r.i, endRc.i, restoreRc.i
+  If avkV3dPend = 0
+    ProcedureReturn 1
+  EndIf
+  r = NeonHardwareFrameDone()
+  If r = 0
+    ProcedureReturn 0
+  EndIf
+  endRc = NeonHardwareFrameJoin()
+  avkV3dProf[5] = Micros()
+  restoreRc = NeonHardwareRebindSurface(avkV3dPOldBase, avkV3dPOldW, avkV3dPOldH, avkV3dPOldPitch, avkV3dPOldBytes, avkV3dPOldFormat, avkV3dPOldRot)
+  avkInternalFree(avkV3dPendArena)
+  avkV3dPend = 0
+  If endRc <> #NEON_OK : avkV3dNative = endRc : ProcedureReturn -1 : EndIf
+  If restoreRc <> #NEON_OK : avkV3dNative = restoreRc : ProcedureReturn -1 : EndIf
+  avkV3dLastListCount = avkV3dPendDraws
+  avkV3dLastListPrimitives = avkV3dPendLive
+  avkV3dJobs = avkV3dJobs + 1 : avkV3dDraws = avkV3dDraws + avkV3dPendDraws : avkV3dAsyncJobs = avkV3dAsyncJobs + 1
+  ProcedureReturn 1
+EndProcedure
+
 Procedure.i avkBackendSubmitDraw(*payload)
   Define *list.AnvilVkBackendDrawList
   Define *first.AnvilVkBackendDraw
@@ -2100,7 +2128,19 @@ Procedure.i avkBackendSubmitDraw(*payload)
   ; emitter error also clears Neon's in-frame latch so restoration is reliable.
   If began <> 0
     avkV3dProf[4] = Micros()
-    endRc = NeonHardwareFrameEnd()
+    If avkV3dAsync <> 0 And rc = #NEON_OK
+      endRc = NeonHardwareFrameKick()
+      If endRc = #NEON_OK
+        ; the render runs on; avkBackendPoll finishes it (the surface, the arena and the counts wait for it)
+        avkV3dPOldBase = oldBase : avkV3dPOldW = oldW : avkV3dPOldH = oldH : avkV3dPOldPitch = oldPitch
+        avkV3dPOldBytes = oldBytes : avkV3dPOldFormat = oldFormat : avkV3dPOldRot = oldRotation
+        avkV3dPendArena = arenaMem : avkV3dPendDraws = *list\drawCount : avkV3dPendLive = liveDraws
+        avkV3dPend = 1
+        ProcedureReturn #ANVIL_VK_JOB_PENDING
+      EndIf
+    Else
+      endRc = NeonHardwareFrameEnd()
+    EndIf
     avkV3dProf[5] = Micros()
     If rc = #NEON_OK : rc = endRc : EndIf
   EndIf
