@@ -79,9 +79,11 @@ SVCP_DONE = 0x454E4F44           # 'DONE'
 # never answered, and this constant is it saying so.
 SVCP_UNSET = 0x2154495257544F4E
 SVC_MAGIC = 0x53564E41           # 'ANVS'
-# Anvil main publishes 1.2 (Anvil/Hal/abi_version.pbi).  The reference probe
-# is built needing 1.0 and the major-mismatch control needing 2.0.
-ABI_MAJOR, ABI_MINOR, SLOT_COUNT = 1, 2, 184
+# Anvil main publishes 1.5 (Anvil/Hal/abi_version.pbi): 1.3 and 1.4 appended
+# blocks at 184 and 192 (entry_count 200), and 1.5 filled the net group.
+# The reference probe is built needing 1.0 and the major-mismatch control
+# needing 2.0.
+ABI_MAJOR, ABI_MINOR, SLOT_COUNT = 1, 5, 200
 PROBE_NEED_MINOR = 0
 
 # The result block, word by word, from pi4SvcProbe.pi4's own header.

@@ -137,8 +137,10 @@ def abi_checks(c: base.Checks) -> None:
     minor = const(version, "SVC_ABI_MINOR")
     count = const(version, "SVC_SLOT_COUNT")
     c.yes(major == 1, "the major did not move: adding a group is not a major bump")
-    c.yes(minor == 3, "abi_minor is 3")
-    c.yes(count == 192, "entry_count is 192")
+    # 1.3 is where this group arrived; later minors append and may only
+    # raise these two numbers, never lower them.
+    c.yes(minor >= 3, "abi_minor is at least 3")
+    c.yes(count >= 192, "entry_count is at least 192")
 
     # Every base that existed before 1.3, with the reserved size the table
     # comment publishes. A group that moved would change a payload's
@@ -162,9 +164,10 @@ def abi_checks(c: base.Checks) -> None:
     c.yes(last_base + last_size == par,
           "the new group starts exactly where the crypto block ends - "
           "it was appended, not squeezed in")
-    c.yes(par + 8 == count,
-          "entry_count is the new base plus its eight reserved slots, so the "
-          "block is fully inside the table and nothing follows it yet")
+    c.yes(par + 8 <= count,
+          "entry_count reaches at least the new base plus its eight reserved "
+          "slots, so the block is fully inside the table (1.4 appended the "
+          "file-handle block after it)")
 
     # The core group is full, which is WHY a new block exists. If a spare
     # ever reappears there the reasoning in this tranche is stale and the

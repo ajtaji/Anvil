@@ -83,10 +83,26 @@
 ;  #SVCCAP_MAX raised to 16, which is the same append this file's 1.1 note
 ;  describes for #SVCCAP_THERMAL.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 4
 ;  1.4 - FILE HANDLES, a new group at base 192. The file group at base 48
 ;  had two slots left and handles need four, so by the versioning rule the
 ;  group that cannot hold them gets a new block at the end rather than a
 ;  renumbering. #SVC_SLOT_COUNT moves 192 -> 200; no existing index moves.
+; ----------------------------------------------------------------------
+;  1.5 - 2026-10-14. THE NET GROUP, base 72.
+;
+;  Slots 72..79 (SvcNetUp, SvcNetLink, SvcNetAddr, SvcDnsResolve,
+;  SvcTcpOpen, SvcTcpSend, SvcTcpRecv, SvcTcpClose) and two of the three
+;  the brief reserved for the IP-layer merge: 85 SvcNetService and 86
+;  SvcTcpState. #SVC_EAGAIN (-110) joins the error set, and only these
+;  slots answer it. 80..84 (TLS, HTTP) and 87..95 stay SvcUnimplemented.
+;
+;  THE BRIEF SAID FILLING THESE IS "an abi_minor bump and nothing else",
+;  AND IT IS: every one of the ten already existed and pointed at
+;  SvcUnimplemented, so a payload built at 1.4 or earlier finds every slot
+;  it knows where it left it, and one built at 1.5 on an older monitor gets
+;  #SVC_ENOSYS from the net group - the honest "this monitor cannot".
+;  #SVC_SLOT_COUNT does not move.
+; ----------------------------------------------------------------------
+#SVC_ABI_MINOR   = 5
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.

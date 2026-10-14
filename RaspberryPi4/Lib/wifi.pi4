@@ -3871,6 +3871,27 @@ Procedure WifiLinkDrop()
   PrintN("the re-association line, or type wifi link to see the count.")
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  WifiLinkCheckNow - make the NEXT WifiLinkTick run the health check and
+;  the keepalive at once instead of waiting out #WIFI_KA_MS.
+;
+;  FOR THE PAYLOAD RETURN PATH. While a payload owns the CPU nothing ticks
+;  the radio unless the payload calls the network service slot, and a
+;  board that came back from a ninety-second payload with the firmware
+;  still claiming an association the air no longer carries was found that
+;  way: the twenty-second cadence then meant the first question was asked
+;  up to twenty seconds after the prompt returned, and the round-trip proof
+;  forty-five seconds after that. This is the same lever a DISASSOC event
+;  already pulls (gWifiVerify), so it adds no new path through the
+;  detector: the association poll runs, a keepalive goes out, and the
+;  proof clock has something to measure. It sends nothing itself.
+; ----------------------------------------------------------------------
+Procedure WifiLinkCheckNow()
+  If gWifiKeyed <> 0
+    gWifiVerify = 1
+  EndIf
+EndProcedure
+
 ; Read-only accessors for the wifi command's status line.
 Procedure.i WifiLinkActive()
   ProcedureReturn gWifiLinkOn

@@ -917,6 +917,17 @@ Procedure RunAt(a.i)
   UartMessageBegin()
   NetDhcpTick()
 
+  ; THE PAYLOAD'S NETWORK STATE ENDS WITH IT, AND THE RADIO IS ASKED AT
+  ; ONCE. Connections the payload opened through the service table are
+  ; reset and its handles forgotten; a DNS question still in flight is
+  ; dropped; and the Wi-Fi health check runs now instead of up to twenty
+  ; seconds from now - a payload that never called the network service
+  ; slot left the radio unserviced for as long as it ran
+  ; (Anvil/Core/payload_net.pbi).
+  CompilerIf #ANVIL_PAYLOAD_NET = 1
+  PayNetPayloadReturned()
+  CompilerEndIf
+
   ; Re-derive listening and exact peer ownership before the first final line.
   ; If wired recovery failed or its lease expired, the stale peer is forgotten
   ; and these lines remain available on the local UART instead of being sent

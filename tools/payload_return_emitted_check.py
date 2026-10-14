@@ -35,6 +35,7 @@ HOOK_NAMES = (
     "displayusedma", "ethmacfetch", "genetprobe", "genetsetmac",
     "genetsetrxregion", "genetstart", "netmacset", "netarpflush",
     "netsetmac", "netdhcptick", "netconsolerearm", "puthex16",
+    "paynetpayloadreturned",
 )
 FORBIDDEN_HOOKS = (
     "netdefaults", "netclearipv4", "netifclear", "netreset", "netinit",
@@ -383,6 +384,9 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
     install("netarpflush", event("wired-arp-flush", argument=1))
     install("netsetmac", set_mac("software-mac", int(case.mac_set), (1, mac_address)))
     install("netdhcptick", event("dhcp-tick"))
+    # The payload's network state ends with it and the radio is asked at once
+    # (Anvil/Core/payload_net.pbi). Modeled: its own desk gate drives it.
+    install("paynetpayloadreturned", event("payload-net"))
     install("netconsolerearm", event("console-rearm"))
     # These are forbidden logical resets, not callbacks silently modeled away.
     for name in FORBIDDEN_HOOKS:
@@ -465,7 +469,7 @@ def check_case(a64, image: Path, case: Case, mutant: str = "", guards=False) -> 
             if must_reset:
                 expected += ["rc-output", "uart-drain", "firmware-reset"]
             else:
-                expected += ["dhcp-tick", "console-rearm", "watchdog-stop", "rc-output", "flush"]
+                expected += ["dhcp-tick", "payload-net", "console-rearm", "watchdog-stop", "rc-output", "flush"]
             assert get("gGoX0") == 0
             assert get("gEthUp") == int(restarted)
             assert get("genet_started") == int(restarted)
@@ -520,7 +524,7 @@ def check(a64, image: Path, image_hash=None, symbols_hash=None):
             replace(base, name="cleanup single-field refusal: " + field, restart=False, cleanup_stop=False, stuck_register=index),
         ]
     steps = sum(check_case(a64, image, case, guards=(index == 0)) for index, case in enumerate(cases))
-    for mutant in ("ethpayloadreclaim", "netdhcptick", "netconsolerearm", "safetywatchdogstop"):
+    for mutant in ("ethpayloadreclaim", "netdhcptick", "paynetpayloadreturned", "netconsolerearm", "safetywatchdogstop"):
         try:
             check_case(a64, image, base, mutant)
         except AssertionError as error:
@@ -531,7 +535,7 @@ def check(a64, image: Path, image_hash=None, symbols_hash=None):
     for el in (2,3):
         must_refuse(lambda el=el: check_case(a64,image,replace(base,el=el),"exceptioninstall"),
                     "payload vector ownership not restored")
-    print(f"payload_return_emitted_check: PASS {len(cases)} machine-code routes, 6 killed mutations, {admission_count} admission refusals, 7 memory guards, {steps:,} returned-route instructions")
+    print(f"payload_return_emitted_check: PASS {len(cases)} machine-code routes, 7 killed mutations, {admission_count} admission refusals, 7 memory guards, {steps:,} returned-route instructions")
     print("  Real EL2/EL3 ExceptionInstall restores poisoned VBAR/TFP; DAIF instruction checked, asynchronous masking not simulated.")
     print("  Hardware/printing/network-service seams modeled; no physical DMA, DHCP-expiry or board claim.")
 
