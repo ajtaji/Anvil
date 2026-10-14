@@ -1513,6 +1513,51 @@ EndProcedure
 ;  through under CACHE COHERENCY in the header. Buffers here travel in
 ;  both directions.
 ; ----------------------------------------------------------------------
+;  MEMORY THE CPU MAPS UNCACHED (2026-10-14).
+;
+;  A program whose own page tables map a range Normal Non-Cacheable (a
+;  payload's GPU window) says so here, and the cache walks below pass that
+;  range over: there is no cache line to clean, so the walk is pure cost -
+;  measured on a 1280 x 800 frame, two walks over the render target took
+;  4.3 ms of every frame, more than the GPU's own work. dma.pi4's
+;  DmaAddUncached() is the same idea for the DMA engine. Nothing declared,
+;  nothing skipped: the monitor's own behaviour is unchanged. A range that
+;  only PARTLY lies in a declared one is walked whole.
+; ----------------------------------------------------------------------
+#V3D_NC_MAX = 8
+Global Dim v3d_ncLo.i[#V3D_NC_MAX] : Global Dim v3d_ncHi.i[#V3D_NC_MAX]
+Global v3d_ncN.i, v3d_ncSkipped.i
+
+; [lo, hi) is mapped uncached by the caller's own page tables. 1, or 0 when the table is full.
+Procedure.i V3dDeclareUncached(lo.i, hi.i)
+  If hi <= lo Or v3d_ncN >= #V3D_NC_MAX
+    ProcedureReturn 0
+  EndIf
+  v3d_ncLo[v3d_ncN] = lo : v3d_ncHi[v3d_ncN] = hi : v3d_ncN = v3d_ncN + 1
+  ProcedureReturn 1
+EndProcedure
+
+Procedure V3dClearUncached()
+  v3d_ncN = 0
+EndProcedure
+
+Procedure.i V3dUncachedSkips() : ProcedureReturn v3d_ncSkipped : EndProcedure
+
+; 1 when all of [addr, addr + len) lies in one declared uncached range.
+Procedure.i v3d_IsUncached(addr.i, len.i)
+  Define i.i
+  i = 0
+  While i < v3d_ncN
+    If addr >= v3d_ncLo[i] And addr + len <= v3d_ncHi[i]
+      v3d_ncSkipped = v3d_ncSkipped + 1
+      ProcedureReturn 1
+    EndIf
+    i = i + 1
+  Wend
+  ProcedureReturn 0
+EndProcedure
+
+; ----------------------------------------------------------------------
 Procedure V3dCacheLine()
   ASM
     adrp x9, global_v3d_flushaddr
@@ -1542,6 +1587,11 @@ Procedure V3dCacheLines(addr.i, len.i)
   Protected e.i
   If len <= 0
     ProcedureReturn
+  EndIf
+  If v3d_ncN > 0
+    If v3d_IsUncached(addr, len) <> 0
+      ProcedureReturn
+    EndIf
   EndIf
   a = (addr / #V3D_CACHE_LINE) * #V3D_CACHE_LINE
   e = addr + len
@@ -1591,6 +1641,12 @@ Procedure V3dCacheRange(addr.i, len.i)
   Protected e.i
   If len <= 0
     ProcedureReturn
+  EndIf
+  If v3d_ncN > 0
+    If v3d_IsUncached(addr, len) <> 0
+      V3dBarrier()                     ; the ordering the walk ended with is still owed
+      ProcedureReturn
+    EndIf
   EndIf
   a = (addr / #V3D_CACHE_LINE) * #V3D_CACHE_LINE
   e = addr + len
@@ -8007,6 +8063,10 @@ EndProcedure
 ;  fewer moving parts, and the ones that are moving are visible.
 ; ======================================================================
 
+; A MEASURING SWITCH (2026-10-14): 1 = every tile is rendered and NOT stored, so a render's time
+; can be split into drawing and writing the image out. Never set outside a measurement.
+Global v3d_probeNoStore.i
+
 Procedure.i V3dRclBuild(tileListAddr.i, tileListBytes.i, rclAddr.i, rclBytes.i)
   Protected r.i
   Protected i.i
@@ -8057,7 +8117,11 @@ Procedure.i V3dRclBuild(tileListAddr.i, tileListBytes.i, rclAddr.i, rclBytes.i)
   ; `store.clear_buffer_being_stored = false` and GFXH-1461/GFXH-1689
   ; (:299-303) says that bit is broken for depth/stencil anyway. The
   ; clear is done by the separate CLEAR_TILE_BUFFERS below.
-  V3dClStoreTileBufferGeneral(#V3D_BUF_RT0, v3d_rtAddr, v3d_rtOutFmt, v3d_rtMemFmt, v3d_rtStride, v3d_rtRbSwap, 0)
+  If v3d_probeNoStore <> 0
+    V3dClStoreNone()
+  Else
+    V3dClStoreTileBufferGeneral(#V3D_BUF_RT0, v3d_rtAddr, v3d_rtOutFmt, v3d_rtMemFmt, v3d_rtStride, v3d_rtRbSwap, 0)
+  EndIf
 
   ; job->clear_tlb is set for a target nothing has written yet
   ; (v3d_job.c:419-425), so v3d_rcl_emit_stores emits this.
@@ -8407,6 +8471,11 @@ EndProcedure
 ;  registers: the renderer reads the tile lists the binner already
 ;  wrote and allocates nothing.
 ; ----------------------------------------------------------------------
+; WHERE A RENDER'S TIME GOES (2026-10-14), counter ticks at: 0 submit entered, 1 the control lists and
+; the render target cleaned from the CPU's cache, 2 the GPU's caches invalidated, 3 the job kicked, 4 frame
+; done seen, 5 the GPU's caches cleaned, 6 the render target cleaned from the CPU's cache again.
+Global v3d_tProf0.i, v3d_tProf1.i, v3d_tProf2.i, v3d_tProf3.i, v3d_tProf4.i, v3d_tProf5.i, v3d_tProf6.i
+
 Procedure.i V3dRenderSubmit()
   CompilerIf #PMF_CHIP = 2712
   ; V3D 4.2 only: the render packets change shape (vault "GPU - V3D 7.1 port plan", D1-D5). Refused by
@@ -8442,9 +8511,11 @@ Procedure.i V3dRenderSubmit()
     ProcedureReturn #V3D_ERR_JOB_BUSY
   EndIf
 
+  v3d_tProf0 = V3dTicks()
   V3dCacheRange(v3d_rclStart, v3d_rclEnd - v3d_rclStart)
   V3dCacheRange(v3d_tlStart, v3d_tlEnd - v3d_tlStart)
   V3dCacheRange(v3d_rtAddr, v3d_rtBytes)
+  v3d_tProf1 = V3dTicks()
 
   ; v3d_sched.c:251, and its comment is worth keeping because it says
   ; why the flush is repeated when the bin already did one: "Can we
@@ -8453,6 +8524,7 @@ Procedure.i V3dRenderSubmit()
   ; executed as bin0, bin1, render0, render1, so that render1's flush
   ; at bin time wasn't enough."
   V3dInvalidateCaches()
+  v3d_tProf2 = V3dTicks()
 
   V3dCoreWrite(#V3D_CTL_INT_CLR, #V3D_CTL_INT_FRDONE)
   v3d_renRfcBefore = V3dCoreRead(#V3D_CLE_RFC)
@@ -8461,6 +8533,7 @@ Procedure.i V3dRenderSubmit()
   V3dCoreWrite(#V3D_CLE_CT1QBA, v3d_rclStart)
   V3dCoreWrite(#V3D_CLE_CT1QEA, v3d_rclEnd)
   V3dBarrier()
+  v3d_tProf3 = V3dTicks()
 
   v3d_renJobs = v3d_renJobs + 1
   ProcedureReturn #V3D_OK
@@ -8520,6 +8593,7 @@ Procedure.i V3dRenderWait(us.i)
     sts = V3dCoreRead(#V3D_CTL_INT_STS)
     If (sts & #V3D_CTL_INT_FRDONE) <> 0
       rc = #V3D_OK
+      v3d_tProf4 = V3dTicks()
       Break
     EndIf
 
@@ -8548,6 +8622,7 @@ Procedure.i V3dRenderWait(us.i)
   ; produce.
   v3d_renCleanRc = V3dCleanCaches()
   V3dBarrier()
+  v3d_tProf5 = V3dTicks()
 
   ; And the ARM side of the same edge. With the ARM MMU off this is
   ; free; with DRAM cacheable it is what stops the CPU reading the
@@ -8557,6 +8632,7 @@ Procedure.i V3dRenderWait(us.i)
   ; the top of this file.
   V3dCacheRange(v3d_rtAddr, v3d_rtBytes)
   V3dBarrier()
+  v3d_tProf6 = V3dTicks()
 
   v3d_renSpins    = spins
   v3d_renRfcAfter = V3dCoreRead(#V3D_CLE_RFC)
