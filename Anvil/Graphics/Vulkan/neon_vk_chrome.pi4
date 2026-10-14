@@ -1982,6 +1982,12 @@ Procedure.i nvcLinePos(x2.i, y2.i)
   ProcedureReturn xb | (yb << 32)
 EndProcedure
 
+; WHICH PIXELS A LINE LIGHTS (2026-10-14). Its width is the pixel itself: a flat line at y covers y .. y + 1
+; (half-pixel units 2y .. 2y + 2), a steep one at x covers x .. x + 1, so the named pixel's centre is inside
+; the quad, not on its edge. The edges used to run through pixel centres (y - 0.5 .. y + 0.5), and which row
+; lit was the rasteriser's top-left tie-break: row y - 1 at rotation 0 and column x - 1 for steep lines at
+; 90 - measured on the Pi 4 by TruckGPS's line pixel probe (#TG_GPUPROBE). Now NeonLine(x0, y, x1, y)
+; lights row y from x0 to x1 - 1 at every rotation.
 ; A line quad is two triangles over four distinct corners: c0 c1 c2, then c0 c2 c3. Each corner is
 ; worked out once (nvcLinePos) and each vertex goes down as three 8-byte stores - position, the white
 ; texel's u v, and the two constant ones - where it was six 4-byte stores and two divisions or table
@@ -1999,7 +2005,7 @@ Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
   p = nvcMapped + nvcVertices * #NEON_VK_CHROME_VERTEX_BYTES
   If (p & 7) <> 0
     If dx >= dy
-      a = y0 * 2 - 1 : b = y1 * 2 - 1 : c = y1 * 2 + 1 : d = y0 * 2 + 1
+      a = y0 * 2 : b = y1 * 2 : c = y1 * 2 + 2 : d = y0 * 2 + 2
       nvcLineVertex(nvcVertices + 0, x0 * 2, a)
       nvcLineVertex(nvcVertices + 1, x1 * 2, b)
       nvcLineVertex(nvcVertices + 2, x1 * 2, c)
@@ -2007,7 +2013,7 @@ Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
       nvcLineVertex(nvcVertices + 4, x1 * 2, c)
       nvcLineVertex(nvcVertices + 5, x0 * 2, d)
     Else
-      a = x0 * 2 - 1 : b = x1 * 2 - 1 : c = x1 * 2 + 1 : d = x0 * 2 + 1
+      a = x0 * 2 : b = x1 * 2 : c = x1 * 2 + 2 : d = x0 * 2 + 2
       nvcLineVertex(nvcVertices + 0, a, y0 * 2)
       nvcLineVertex(nvcVertices + 1, b, y1 * 2)
       nvcLineVertex(nvcVertices + 2, c, y1 * 2)
@@ -2018,11 +2024,11 @@ Procedure nvcLineQuad(x0.i, y0.i, x1.i, y1.i)
     ProcedureReturn
   EndIf
   If dx >= dy
-    c0 = nvcLinePos(x0 * 2, y0 * 2 - 1) : c1 = nvcLinePos(x1 * 2, y1 * 2 - 1)
-    c2 = nvcLinePos(x1 * 2, y1 * 2 + 1) : c3 = nvcLinePos(x0 * 2, y0 * 2 + 1)
+    c0 = nvcLinePos(x0 * 2, y0 * 2) : c1 = nvcLinePos(x1 * 2, y1 * 2)
+    c2 = nvcLinePos(x1 * 2, y1 * 2 + 2) : c3 = nvcLinePos(x0 * 2, y0 * 2 + 2)
   Else
-    c0 = nvcLinePos(x0 * 2 - 1, y0 * 2) : c1 = nvcLinePos(x1 * 2 - 1, y1 * 2)
-    c2 = nvcLinePos(x1 * 2 + 1, y1 * 2) : c3 = nvcLinePos(x0 * 2 + 1, y0 * 2)
+    c0 = nvcLinePos(x0 * 2, y0 * 2) : c1 = nvcLinePos(x1 * 2, y1 * 2)
+    c2 = nvcLinePos(x1 * 2 + 2, y1 * 2) : c3 = nvcLinePos(x0 * 2 + 2, y0 * 2)
   EndIf
   uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
   one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
@@ -2094,7 +2100,7 @@ Procedure NeonVkChromeLineQuadAt(p.i, x0.i, y0.i, x1.i, y1.i)
     offY = #NVC_CLIP_TAB_HALF - nvcPhysicalH                         ; Y entry of a corner = its x2 + offY
     lim = #NVC_CLIP_TAB_HALF * 2
     If dx >= dy
-      ka = offX - (y0 * 2 - 1) : kb = offX - (y1 * 2 - 1) : kc = offX - (y1 * 2 + 1) : kd = offX - (y0 * 2 + 1)
+      ka = offX - (y0 * 2) : kb = offX - (y1 * 2) : kc = offX - (y1 * 2 + 2) : kd = offX - (y0 * 2 + 2)
       ke = x0 * 2 + offY : kf = x1 * 2 + offY
       If ka >= 0 And ka < lim And kb >= 0 And kb < lim And kc >= 0 And kc < lim And kd >= 0 And kd < lim And ke >= 0 And ke < lim And kf >= 0 And kf < lim
         c0 = (nvcClipTabX[ka] & $FFFFFFFF) | ((nvcClipTabY[ke] & $FFFFFFFF) << 32)
@@ -2105,7 +2111,7 @@ Procedure NeonVkChromeLineQuadAt(p.i, x0.i, y0.i, x1.i, y1.i)
       EndIf
     Else
       ka = offX - y0 * 2 : kb = offX - y1 * 2
-      kc = x0 * 2 - 1 + offY : kd = x1 * 2 - 1 + offY : ke = x1 * 2 + 1 + offY : kf = x0 * 2 + 1 + offY
+      kc = x0 * 2 + offY : kd = x1 * 2 + offY : ke = x1 * 2 + 2 + offY : kf = x0 * 2 + 2 + offY
       If ka >= 0 And ka < lim And kb >= 0 And kb < lim And kc >= 0 And kc < lim And kd >= 0 And kd < lim And ke >= 0 And ke < lim And kf >= 0 And kf < lim
         c0 = (nvcClipTabX[ka] & $FFFFFFFF) | ((nvcClipTabY[kc] & $FFFFFFFF) << 32)
         c1 = (nvcClipTabX[kb] & $FFFFFFFF) | ((nvcClipTabY[kd] & $FFFFFFFF) << 32)
@@ -2131,11 +2137,11 @@ Procedure NeonVkChromeLineQuadAt(p.i, x0.i, y0.i, x1.i, y1.i)
     c0 = nvcLinePosW(x0 * 2, y0 * 2) : c1 = nvcLinePosW(x0 * 2 + 2, y0 * 2)
     c2 = nvcLinePosW(x0 * 2 + 2, y0 * 2 + 2) : c3 = nvcLinePosW(x0 * 2, y0 * 2 + 2)
   ElseIf dx >= dy
-    c0 = nvcLinePosW(x0 * 2, y0 * 2 - 1) : c1 = nvcLinePosW(x1 * 2, y1 * 2 - 1)
-    c2 = nvcLinePosW(x1 * 2, y1 * 2 + 1) : c3 = nvcLinePosW(x0 * 2, y0 * 2 + 1)
+    c0 = nvcLinePosW(x0 * 2, y0 * 2) : c1 = nvcLinePosW(x1 * 2, y1 * 2)
+    c2 = nvcLinePosW(x1 * 2, y1 * 2 + 2) : c3 = nvcLinePosW(x0 * 2, y0 * 2 + 2)
   Else
-    c0 = nvcLinePosW(x0 * 2 - 1, y0 * 2) : c1 = nvcLinePosW(x1 * 2 - 1, y1 * 2)
-    c2 = nvcLinePosW(x1 * 2 + 1, y1 * 2) : c3 = nvcLinePosW(x0 * 2 + 1, y0 * 2)
+    c0 = nvcLinePosW(x0 * 2, y0 * 2) : c1 = nvcLinePosW(x1 * 2, y1 * 2)
+    c2 = nvcLinePosW(x1 * 2 + 2, y1 * 2) : c3 = nvcLinePosW(x0 * 2 + 2, y0 * 2)
   EndIf
   uv = (nvcWhiteU0 & $FFFFFFFF) | ((nvcWhiteV0 & $FFFFFFFF) << 32)
   one = #NEON_VK_CHROME_F_ONE | (#NEON_VK_CHROME_F_ONE << 32)
