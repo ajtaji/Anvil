@@ -106,7 +106,7 @@ def fixture(src):
     return ("EnableExplicit\n" + "\n".join(const(mmu, n) for n in names) + "\n"
             + "\n".join(const(memmap, n) for n in fb) + "\n"
             + const(dma, "DMA_CACHE_LINE") + "\n" + const(dma, "DMA_NC_MAX") + "\n"
-            + "#ANVIL_CACHE = 1\n"
+            + "#ANVIL_CACHE = 1\n#ANVIL_V3D_CONSOLE = 0\n"
             "Global Dim mmu_ncLo.i[#MMU_NC_MAX]\nGlobal Dim mmu_ncHi.i[#MMU_NC_MAX]\n"
             "Global mmu_ncN.i\nGlobal mmu_ttbr.i\nGlobal mmu_tcr.i\nGlobal mmu_mair.i\n"
             "Global gCacheOn.i\nGlobal gCacheDspLo.i\nGlobal gCacheDspHi.i\n"
