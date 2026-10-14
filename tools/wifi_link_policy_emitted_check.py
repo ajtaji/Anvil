@@ -137,7 +137,7 @@ Global gWifiRoams.i
 #WIFI_REC_IDLE = 0
 #WIFI_REC_QUIET = 2
 #WIFI_REC_JOIN_POLL = 15
-#WIFI_REC_DHCP_WAIT = 24
+#WIFI_REC_DHCP_WAIT = 25
 #CYW43_JS_ACTIVE = $0001
 
 Global Dim cyw43_evrType.i[#CYW43_EVRING]
@@ -232,14 +232,18 @@ Procedure.i NetDhcpStart(kind.i, automatic.i) : gate_dhcpStarts = gate_dhcpStart
 #WR_NOTE = 22
 Global gate_recEvents.i, gate_recSaves.i, gate_radioResets.i
 Procedure WifiRec(code.i, a.i, b.i) : gate_recEvents = gate_recEvents + 1 : EndProcedure
+Procedure wifi_PtkRekeyFinish() : gWifiPtkPend = 0 : EndProcedure
 Procedure.i WifiRecSave(*why, *counters) : gate_recSaves = gate_recSaves + 1 : ProcedureReturn 1 : EndProcedure
 #WIFI_EP_SAVE_EVERY = 10
 #WIFI_EP_RESET_AFTER = 8
-Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i, gWifiLastChan.i
 Procedure.i wifi_EpCounters() : ProcedureReturn 0 : EndProcedure
 Procedure wifi_EpFail(code.i, a.i, b.i, *why) : WifiRec(code, a, b) : If gWifiEp = 0 : gWifiEp = 1 : gWifiEpFails = 0 : gWifiEpReset = 0 : WifiRecSave(*why, 0) : EndIf : EndProcedure
 Procedure wifi_EpRecovered() : WifiRec(#WR_REC_OK, 0, gWifiEpFails) : If gWifiEp <> 0 : gWifiEp = 0 : WifiRecSave(0, 0) : EndIf : EndProcedure
 Procedure.i Cyw43ReadRssi(ms.i) : ProcedureReturn 0 : EndProcedure
+Procedure.i Cyw43ReadChannel(ms.i) : ProcedureReturn 0 : EndProcedure
+Global cyw43_linkChannel.i
+#CYW43_IO_OK = 0
 Global cyw43_linkRssi.i
 Procedure.i Cyw43ReadBssid(ms.i) : gate_assocCalls = gate_assocCalls + 1 : ProcedureReturn gate_assoc : EndProcedure
 Procedure.i wifi_KeepAliveArp(target.i) : ProcedureReturn gate_keepalive : EndProcedure

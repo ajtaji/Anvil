@@ -566,6 +566,24 @@ Global gWifiEapolFailStage.i = #WIFI_EAPOL_FAIL_NONE
 Global gWifiEapolFailRc.i = 0
 Global gWifiEapolRecover.i = 0
 Global gWifiEapolRecoverStage.i = #WIFI_EAPOL_FAIL_NONE
+; MESSAGE 4 SETTLE. Cyw43Send returns when message 4 has crossed the bus
+; into the radio, not when it is on the air, and a pairwise key installed
+; before it leaves gets it sent encrypted - which the access point, holding
+; no key yet, cannot read. So after message 4 every handshake path keeps
+; reading for this long before installing anything. A re-sent message 3 in
+; the window means message 4 was lost: it is answered with message 4 again
+; (still under the old key state, as the first one was) and the window
+; restarts. 1200 ms is past hostapd's 1000 ms message-3 retransmit
+; (eapol_key_timeout_subseq). The keys are never installed twice - a
+; reinstall is the KRACK attack, and wpa_supplicant refuses it too.
+#WIFI_M4_SETTLE_MS  = 1200
+
+; A mid-session PTK rekey whose message 4 is out and whose keys are waiting
+; out #WIFI_M4_SETTLE_MS. WifiRadioPump installs them when it expires; a
+; re-sent message 3 restarts it; a new message 1 or a link-down cancels it.
+Global gWifiPtkPend.i = 0
+Global gWifiPtkPendAt.i = 0
+
 Global gWifiEapolRecoverRc.i = 0
 Global gWifiKeyed.i = 0
 Global gWifiSecDone.i = 0
@@ -765,7 +783,7 @@ Procedure.i wifi_Handshake()
   keyed = 0
   waitMs = #WIFI_EAPOL_M1_MS
   t0 = millis()
-  While (millis() - t0) < waitMs And m3 = 0
+  While (millis() - t0) < waitMs
     n = Cyw43Receive(60)
     If n >= 14
       code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
@@ -780,28 +798,39 @@ Procedure.i wifi_Handshake()
           Print("Wi-Fi: handshake message 2 was not transmitted (driver rc ")
           PrintDec(r)
           PrintN(").")
+          m3 = 0
           Break
         EndIf
       ElseIf code = #WPA2SUP_SENT_M4
+        ; The first message 3, or the access point re-sending it because
+        ; our message 4 did not reach it. Either way message 4 goes out
+        ; and the settle window (#WIFI_M4_SETTLE_MS) starts again.
         r = wifi_SendSup()
         If r = 0
-          m3 = 1
-          jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
-          r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
-          If jrc = 0 And r = 0
-            keyed = 1
-          EndIf
+          m3 = m3 + 1
+          t0 = millis()
+          waitMs = #WIFI_M4_SETTLE_MS
         Else
           wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_JOIN_M4_TX, r, 0)
           Print("Wi-Fi: handshake message 4 was not transmitted (driver rc ")
           PrintDec(r)
           PrintN(").")
+          m3 = 0
           Break
         EndIf
       EndIf
     EndIf
     wifi_Progress()
   Wend
+  ; Message 4 has had the whole window to leave and the access point has
+  ; stopped asking for it: now, once, the keys.
+  If m3 > 0
+    jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+    r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+    If jrc = 0 And r = 0
+      keyed = 1
+    EndIf
+  EndIf
   ProcedureReturn wifi_HandshakeFinish(keyed)
 EndProcedure
 
@@ -1487,6 +1516,29 @@ Procedure wifi_SendNetOut()
   Cyw43Send(n)
 EndProcedure
 
+Procedure wifi_PtkRekeyFinish()
+  Define jrc.i
+  Define r.i
+  gWifiPtkPend = 0
+  jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
+  If jrc <> 0
+    gWifiEapolErr = gWifiEapolErr + 1
+    wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_PTK, jrc, 1)
+    ProcedureReturn
+  EndIf
+  r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
+  If r <> 0
+    gWifiEapolErr = gWifiEapolErr + 1
+    wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_GTK, r, 1)
+    ProcedureReturn
+  EndIf
+  Wpa2SupSessionArm()
+  gWifiPtkKeyed = gWifiPtkKeyed + 1
+  If gWifiEapolLog <> 0
+    PrintN("Wi-Fi: pairwise key rekeyed mid-session - the link stays up.")
+  EndIf
+EndProcedure
+
 ; ----------------------------------------------------------------------
 ;  wifi_ServiceEapol - one received EAPOL-Key (ethertype 0x888E) frame,
 ;  DURING a live association. This is the receive path the death hid in:
@@ -1563,6 +1615,7 @@ Procedure wifi_ServiceEapol(*frame, len.i)
 
   If code = #WPA2SUP_SENT_M2
     ; PTK rekey, message 2 out. Keys not ready until message 3.
+    gWifiPtkPend = 0
     r = wifi_SendSup()
     If r <> 0
       gWifiEapolErr = gWifiEapolErr + 1
@@ -1570,31 +1623,18 @@ Procedure wifi_ServiceEapol(*frame, len.i)
     EndIf
 
   ElseIf code = #WPA2SUP_SENT_M4
-    ; PTK rekey complete. SEND MESSAGE 4 FIRST, then install - the AP
-    ; installs its PTK on receiving message 4, so a frame sent under the
-    ; new key before then arrives as noise (the join learned this).
+    ; PTK rekey, message 4 - or a re-sent message 3 asking for it again.
+    ; Message 4 goes out under the CURRENT pairwise key; the new one waits
+    ; out #WIFI_M4_SETTLE_MS (installed by WifiRadioPump through
+    ; wifi_PtkRekeyFinish), so it cannot encrypt the message 4 that tells
+    ; the access point to switch.
     r = wifi_SendSup()
     If r <> 0
       gWifiEapolErr = gWifiEapolErr + 1
       wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_TX, r, 1)
     Else
-      jrc = Cyw43SetWsecKey(0, Wpa2SupTk(), Wpa2SupTkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, Wpa2SupApMac(), 0, 2000)
-      If jrc <> 0
-        gWifiEapolErr = gWifiEapolErr + 1
-        wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_PTK, jrc, 1)
-      Else
-        r = Cyw43SetWsecKey(Wpa2SupGtkIndex(), Wpa2SupGtk(), Wpa2SupGtkLen(), #CYW43_CRYPTO_ALGO_AES_CCM, 0, Wpa2SupGtkRsc(), 2000)
-        If r <> 0
-          gWifiEapolErr = gWifiEapolErr + 1
-          wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_M4_GTK, r, 1)
-        Else
-          Wpa2SupSessionArm()
-          gWifiPtkKeyed = gWifiPtkKeyed + 1
-          If gWifiEapolLog <> 0
-            PrintN("Wi-Fi: pairwise key rekeyed mid-session - the link stays up.")
-          EndIf
-        EndIf
-      EndIf
+      gWifiPtkPend = 1
+      gWifiPtkPendAt = millis()
     EndIf
 
   ElseIf code = #WPA2SUP_SENT_G2
@@ -1868,6 +1908,11 @@ Procedure WifiRadioPump()
   If gWifiKeyed = 0
     ProcedureReturn
   EndIf
+  If gWifiPtkPend <> 0
+    If ((millis() - gWifiPtkPendAt) & $FFFFFFFF) >= #WIFI_M4_SETTLE_MS
+      wifi_PtkRekeyFinish()
+    EndIf
+  EndIf
   If gWifiConOwnsRx <> 0
     ProcedureReturn
   EndIf
@@ -2000,11 +2045,12 @@ Global gWifiHealLast.i = 0     ; millis() of the last automatic heal retry
 #WIFI_REC_ASSOC_IE      = 17
 #WIFI_REC_EAPOL_BEGIN   = 18
 #WIFI_REC_EAPOL_RX      = 19
-#WIFI_REC_PTK_INSTALL   = 20
-#WIFI_REC_GTK_INSTALL   = 21
-#WIFI_REC_PERSIST       = 22
-#WIFI_REC_DHCP_START    = 23
-#WIFI_REC_DHCP_WAIT     = 24
+#WIFI_REC_M4_SETTLE     = 20  ; message 4 out; keys wait #WIFI_M4_SETTLE_MS
+#WIFI_REC_PTK_INSTALL   = 21
+#WIFI_REC_GTK_INSTALL   = 22
+#WIFI_REC_PERSIST       = 23
+#WIFI_REC_DHCP_START    = 24
+#WIFI_REC_DHCP_WAIT     = 25
 
 ; Radio initialization is deliberately a DIFFERENT generation from association
 ; recovery. It advances one existing top-level primitive per WifiLinkTick and
@@ -2242,7 +2288,7 @@ EndProcedure
 #WIFI_EP_SAVE_EVERY = 10
 #WIFI_EP_RESET_AFTER = 8
 Global gWifiPayloadT0.i
-Global gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Global gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i, gWifiLastChan.i
 Global Dim wifi_epTxt.a[1024]
 Global wifi_epAt.i
 
@@ -2273,7 +2319,7 @@ EndProcedure
 Procedure.i wifi_EpCounters()
   wifi_epAt = 0
   wifi_EpS("keyed ") : wifi_EpD(gWifiKeyed) : wifi_EpS(", address ") : wifi_EpD(gWifiHaveIp)
-  wifi_EpS(", rssi ") : wifi_EpD(gWifiLastRssi) : wifi_EpS(" dBm, channel ") : wifi_EpD(cyw43_linkChannel)
+  wifi_EpS(", rssi ") : wifi_EpD(gWifiLastRssi) : wifi_EpS(" dBm, channel ") : wifi_EpD(gWifiLastChan)
   wifi_EpS("; data frames out ") : wifi_EpD(cyw43_txFrames) : wifi_EpS(", in ") : wifi_EpD(cyw43_rxData)
   wifi_EpS("; SDPCM seq ") : wifi_EpD(cyw43_seq) : wifi_EpS(" credit ") : wifi_EpD(cyw43_credit) : wifi_EpS(" stalls ") : wifi_EpD(cyw43_stalls)
   wifi_EpS("; EAPOL seen ") : wifi_EpD(gWifiEapolSeen) : wifi_EpS(" errors ") : wifi_EpD(gWifiEapolErr) : wifi_EpS(" group rekeys ") : wifi_EpD(gWifiGrpKeyed)
@@ -2305,6 +2351,7 @@ Procedure wifi_EpRecovered()
 EndProcedure
 
 Procedure wifi_RecordLinkDown()
+  gWifiPtkPend = 0
   NetDhcpLinkDown(#HW_LINK_WIFI)
   gWifiKeyed = 0
   gWifiHaveIp = 0
@@ -3543,7 +3590,8 @@ Procedure WifiRecoveryTick()
         ElseIf code = #WPA2SUP_SENT_M4
           r = wifi_SendSup()
           If r = 0
-            gWifiRecPhase = #WIFI_REC_PTK_INSTALL
+            gWifiRecAt = millis()
+            gWifiRecPhase = #WIFI_REC_M4_SETTLE
           Else
             wifi_RecoverSupplicantSendFail(r)
           EndIf
@@ -3558,6 +3606,27 @@ Procedure WifiRecoveryTick()
           EndIf
         ElseIf ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_EAPOL_M3_MS
           wifi_RecoverHandshakeFailed()
+        EndIf
+      EndIf
+
+    Case #WIFI_REC_M4_SETTLE
+      ; See #WIFI_M4_SETTLE_MS: the keys wait until message 4 has had time
+      ; to leave and the access point has stopped re-sending message 3.
+      n = Cyw43Receive(#WIFI_JOIN_SLICE_MS)
+      If n >= 14
+        code = Wpa2SupHandle(Cyw43ReceivePtr(), n)
+        If code = #WPA2SUP_SENT_M4
+          r = wifi_SendSup()
+          If r = 0
+            gWifiRecAt = millis()
+          Else
+            wifi_RecoverSupplicantSendFail(r)
+          EndIf
+        EndIf
+      EndIf
+      If gWifiRecPhase = #WIFI_REC_M4_SETTLE
+        If ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_M4_SETTLE_MS
+          gWifiRecPhase = #WIFI_REC_PTK_INSTALL
         EndIf
       EndIf
 
@@ -3952,7 +4021,14 @@ Procedure WifiLinkTick()
   ; Fall back to the DHCP server if there is no gateway. Each send is
   ; counted so the proof check above knows an answer was solicited - and
   ; the count is zeroed by any frame that arrives.
-  If Cyw43ReadRssi(200) = 1 : gWifiLastRssi = cyw43_linkRssi : EndIf
+  ; Signal and channel for the flight recorder. Both reads return
+  ; #CYW43_IO_OK (0) on success; the last good value is kept.
+  If Cyw43ReadRssi(200) = #CYW43_IO_OK
+    gWifiLastRssi = cyw43_linkRssi
+  EndIf
+  If Cyw43ReadChannel(200) = #CYW43_IO_OK
+    gWifiLastChan = cyw43_linkChannel
+  EndIf
   WifiRec(#WR_KA_PROBE, gWifiKaProbes, gWifiLastRssi)
   If gWifiGw <> 0
     If wifi_KeepAliveArp(gWifiGw) <> 0
@@ -4008,6 +4084,49 @@ Procedure WifiLinkCheckNow()
   If gWifiKeyed <> 0
     gWifiVerify = 1
   EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  THE ON-DEMAND KICK - so a lost-link test takes a minute, not the
+;  access point's hour.
+;
+;  WifiRekeyAsk asks the access point to rekey NOW with a signed
+;  EAPOL-Key Request (Wpa2SupBuildRequest). Answered (wifi rekey on), the
+;  rekey proves the servicing; unanswered (wifi rekey off, or WifiDeaf
+;  below), the access point retries and then deauthenticates the board -
+;  the same kick its hourly rekey delivered. Returns the send rc, or -1
+;  when there is no keyed session to sign a request with.
+;
+;  WifiDeaf is a payload without a payload: the radio is not serviced for
+;  `seconds`, then the board does what RunAt does when a payload returns -
+;  records it and asks the radio at once (WifiLinkCheckNow). With ask <> 0
+;  the group rekey is requested first, so the access point's retries and
+;  its deauthentication all land while nobody is listening.
+; ----------------------------------------------------------------------
+Procedure.i WifiRekeyAsk(pairwise.i)
+  Define r.i
+  If gWifiKeyed = 0 Or Wpa2SupInSession() = 0
+    ProcedureReturn -1
+  EndIf
+  If Wpa2SupBuildRequest(pairwise) = 0
+    ProcedureReturn -1
+  EndIf
+  r = wifi_SendSup()
+  WifiRec(#WR_EAPOL_OUT, $0800 | Bool(pairwise <> 0) * 8, 2)
+  ProcedureReturn r
+EndProcedure
+
+Procedure WifiDeaf(seconds.i, ask.i)
+  Define t0.i
+  If ask <> 0
+    WifiRekeyAsk(0)
+  EndIf
+  WifiRec(#WR_PAYLOAD_IN, 0, seconds)
+  t0 = millis()
+  While ((millis() - t0) & $FFFFFFFF) < seconds * 1000
+  Wend
+  WifiRec(#WR_PAYLOAD_OUT, seconds, 0)
+  WifiLinkCheckNow()
 EndProcedure
 
 ; Read-only accessors for the wifi command's status line.
