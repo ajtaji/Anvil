@@ -3202,6 +3202,72 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
   ProcedureReturn nvcDraw(first, count, colour)
 EndProcedure
 
+; Text along a direction: the bitmap font's glyphs laid out on a baseline through (cx, cy), the middle of
+; the run, pointing along (cosQ16, sinQ16) - a unit vector in 16.16, screen y downward, so (65536, 0) is the
+; upright text NeonVkChromeText draws. Each glyph is the same atlas cell, its four corners turned about the
+; run's middle with the rotated sprite's own corner and vertex writers (Q8 positions keep the sub-pixel
+; corners). The bitmap font only: with a TrueType face selected this refuses (ERR_STATE) rather than draw
+; something else, and the caller can fall back to upright text.
+Procedure.i NeonVkChromeTextAngled(font.i, cx.i, cy.i, *s, colour.i, cosQ16.i, sinQ16.i)
+  Define uv.NeonAtlasGlyphUV
+  Define i.i, ch.i, adv.i, cellH.i, glyphCount.i, advances.i, first.i, count.i
+  Define cxQ8.i, cyQ8.i, halfWQ8.i, halfHQ8.i, lxQ8.i, advQ8.i
+  Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If AnvilTrueTypeSlotSelected() >= 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
+  If Neon_AtlasRasterGeneration() <> nvcAtlasGeneration : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  If cx < -16384 Or cx > 16384 Or cy < -16384 Or cy > 16384 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  If cosQ16 < -65536 Or cosQ16 > 65536 Or sinQ16 < -65536 Or sinQ16 > 65536 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
+  adv = Neon_CharWidth(font) : cellH = Neon_LineHeight(font)
+  If adv < 1 Or cellH < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+  ; Count first, as NeonVkChromeText does: a capacity refusal leaves nothing half written.
+  i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      advances = advances + 1
+      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
+        glyphCount = glyphCount + 1
+      EndIf
+    EndIf
+    i = i + 1
+  Wend
+  If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+  EndIf
+  cxQ8 = cx * 256 : cyQ8 = cy * 256
+  advQ8 = adv * 256
+  halfWQ8 = (advances * advQ8) / 2 : halfHQ8 = (cellH * 256) / 2
+  first = nvcVertices : lxQ8 = 0 - halfWQ8 : i = 0
+  While i < 4096
+    ch = PeekA(*s + i)
+    If ch = 0 : Break : EndIf
+    If ch >= 32 And ch <> 127
+      If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
+        If nvcAtlasMapBitmapUV(@uv, NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8, 0 - halfHQ8, cosQ16, sinQ16, @tlX, @tlY)
+        nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8 + advQ8, 0 - halfHQ8, cosQ16, sinQ16, @trX, @trY)
+        nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8, halfHQ8, cosQ16, sinQ16, @blX, @blY)
+        nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8 + advQ8, halfHQ8, cosQ16, sinQ16, @brX, @brY)
+        nvcSpriteVertexQ8(nvcVertices + 0, tlX, tlY, uv\left, uv\top)
+        nvcSpriteVertexQ8(nvcVertices + 1, blX, blY, uv\left, uv\bottom)
+        nvcSpriteVertexQ8(nvcVertices + 2, brX, brY, uv\right, uv\bottom)
+        nvcSpriteVertexQ8(nvcVertices + 3, tlX, tlY, uv\left, uv\top)
+        nvcSpriteVertexQ8(nvcVertices + 4, brX, brY, uv\right, uv\bottom)
+        nvcSpriteVertexQ8(nvcVertices + 5, trX, trY, uv\right, uv\top)
+        nvcVertices = nvcVertices + 6 : count = count + 6
+      EndIf
+      lxQ8 = lxQ8 + advQ8
+    EndIf
+    i = i + 1
+  Wend
+  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  ProcedureReturn nvcDraw(first, count, colour)
+EndProcedure
+
 ; Consecutive boxes with one tint and scissor are one ordered triangle-list
 ; draw. This is opt-in so ordinary chrome draw counts remain unchanged.
 Procedure.i NeonVkChromeBoxBatchBegin()
