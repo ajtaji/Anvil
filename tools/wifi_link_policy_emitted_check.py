@@ -207,6 +207,40 @@ Procedure WifiRecoveryTick()
   EndIf
 EndProcedure
 Procedure.i NetDhcpStart(kind.i, automatic.i) : gate_dhcpStarts = gate_dhcpStarts + 1 : ProcedureReturn 1 : EndProcedure
+; the Wi-Fi flight recorder (Anvil/Core/wifi_incident.pbi), stubbed: it records and saves, it never decides
+#WR_EAPOL_IN = 1
+#WR_EAPOL_OUT = 2
+#WR_EAPOL_FAIL = 3
+#WR_KEY_SET = 4
+#WR_TEARDOWN = 5
+#WR_ASSOC_POLL = 6
+#WR_KA_PROBE = 7
+#WR_KA_PROOF = 8
+#WR_TXONLY = 9
+#WR_REC_START = 10
+#WR_REC_PHASE = 11
+#WR_REC_OK = 12
+#WR_REC_FAIL = 13
+#WR_DHCP_OUT = 14
+#WR_DHCP_IN = 15
+#WR_PAYLOAD_IN = 16
+#WR_PAYLOAD_OUT = 17
+#WR_RADIO_RESET = 18
+#WR_COUNTS = 19
+#WR_CREDIT = 20
+#WR_JOIN = 21
+#WR_NOTE = 22
+Global gate_recEvents.i, gate_recSaves.i, gate_radioResets.i
+Procedure WifiRec(code.i, a.i, b.i) : gate_recEvents = gate_recEvents + 1 : EndProcedure
+Procedure.i WifiRecSave(*why, *counters) : gate_recSaves = gate_recSaves + 1 : ProcedureReturn 1 : EndProcedure
+#WIFI_EP_SAVE_EVERY = 10
+#WIFI_EP_RESET_AFTER = 8
+Global gWifiPayloadT0.i, gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Procedure.i wifi_EpCounters() : ProcedureReturn 0 : EndProcedure
+Procedure wifi_EpFail(code.i, a.i, b.i, *why) : WifiRec(code, a, b) : If gWifiEp = 0 : gWifiEp = 1 : gWifiEpFails = 0 : gWifiEpReset = 0 : WifiRecSave(*why, 0) : EndIf : EndProcedure
+Procedure wifi_EpRecovered() : WifiRec(#WR_REC_OK, 0, gWifiEpFails) : If gWifiEp <> 0 : gWifiEp = 0 : WifiRecSave(0, 0) : EndIf : EndProcedure
+Procedure.i Cyw43ReadRssi(ms.i) : ProcedureReturn 0 : EndProcedure
+Global cyw43_linkRssi.i
 Procedure.i Cyw43ReadBssid(ms.i) : gate_assocCalls = gate_assocCalls + 1 : ProcedureReturn gate_assoc : EndProcedure
 Procedure.i wifi_KeepAliveArp(target.i) : ProcedureReturn gate_keepalive : EndProcedure
 Procedure.i DhcpClientServer(kind.i) : ProcedureReturn 0 : EndProcedure

@@ -1517,6 +1517,7 @@ Procedure wifi_ServiceEapol(*frame, len.i)
     info = 0
   EndIf
   gWifiEapolInfo = info
+  WifiRec(#WR_EAPOL_IN, info, len)
 
   If gWifiEapolLog <> 0
     Print("Wi-Fi: EAPOL-Key in, ")
@@ -1611,6 +1612,7 @@ Procedure wifi_ServiceEapol(*frame, len.i)
         wifi_RecordEapolFailure(#WIFI_EAPOL_FAIL_REKEY_G2_TX, r, 1)
       Else
         gWifiGrpKeyed = gWifiGrpKeyed + 1
+        WifiRec(#WR_EAPOL_OUT, info, 1)
         If gWifiEapolLog <> 0
           PrintN("Wi-Fi: group key rekeyed - the hourly rekey is now serviced,")
           PrintN("       so the link no longer goes TX-only dead when it happens.")
@@ -2212,6 +2214,96 @@ EndProcedure
 ; Record the link-down truth independently of the policy that decides
 ; whether to re-associate. Observation mode may suppress healing, but it
 ; must not leave a dead association keyed, addressed and route-eligible.
+; ----------------------------------------------------------------------
+;  THE FLIGHT RECORDER'S EPISODES, AND THE LAST RUNG (2026-10-14).
+;
+;  Ron: "build into anvil a wifi network reset when it drops but save what
+;  happened to make it fail in the first place". An EPISODE starts at the
+;  first sign the link is gone (a teardown event, the association poll's
+;  strikes, the round trip lost, a rekey that could not be serviced) and ends
+;  when recovery reaches an address. Its first moment is SAVED to WIFILOG.TXT
+;  before any recovery step changes anything (Anvil/Core/wifi_incident.pbi),
+;  progress every #WIFI_EP_SAVE_EVERY failed attempts, and its end.
+;
+;  THE LAST RUNG. On 2026-10-14 a dead link survived `wifi rejoin` and
+;  `wifi join` and only `reset` restored it; the same day an idle board lost
+;  the access point's beacons (LINK, reason 1) and failed ~35 re-associations
+;  in a row for ten minutes. A re-association that keeps failing is not
+;  retried for ever on the same radio state: after #WIFI_EP_RESET_AFTER
+;  failed attempts in one episode the radio is let go and brought up again
+;  from cold - the SDIO function re-initialised and the chip's firmware
+;  reloaded (WifiRadioInitArm), which is what a reset does to the radio. On
+;  the Pi 4 the chip's power line cannot be cycled (WL_ON is behind the
+;  firmware's GPIO expander, which refuses the falling edge - sdio.pi4), so
+;  this is the strongest reset there is short of rebooting the board. Every
+;  rung it takes is saved. It is a BACKSTOP: an episode that needs it is a
+;  defect to be found, and the file says so.
+; ----------------------------------------------------------------------
+#WIFI_EP_SAVE_EVERY = 10
+#WIFI_EP_RESET_AFTER = 8
+Global gWifiPayloadT0.i
+Global gWifiEp.i, gWifiEpT0.i, gWifiEpFails.i, gWifiEpReset.i, gWifiEpN.i, gWifiRadioResets.i, gWifiLastRssi.i
+Global Dim wifi_epTxt.a[1024]
+Global wifi_epAt.i
+
+Procedure wifi_EpC(c.i)
+  If wifi_epAt < 1020 : wifi_epTxt[wifi_epAt] = c : wifi_epAt = wifi_epAt + 1 : EndIf
+EndProcedure
+Procedure wifi_EpS(*s)
+  Define i.i, c.i
+  If *s = 0
+    ProcedureReturn
+  EndIf
+  c = PeekA(*s)
+  While c <> 0 And i < 300
+    wifi_EpC(c) : i = i + 1 : c = PeekA(*s + i)
+  Wend
+EndProcedure
+Procedure wifi_EpD(v.i)
+  Define Dim d.a[24]
+  Define n.i
+  If v < 0 : wifi_EpC(45) : v = 0 - v : EndIf
+  Repeat
+    d[n] = 48 + v % 10 : v = v / 10 : n = n + 1
+  Until v = 0 Or n >= 20
+  While n > 0 : n = n - 1 : wifi_EpC(d[n]) : Wend
+EndProcedure
+
+; Every counter that tells the failures apart, as one line.
+Procedure.i wifi_EpCounters()
+  wifi_epAt = 0
+  wifi_EpS("keyed ") : wifi_EpD(gWifiKeyed) : wifi_EpS(", address ") : wifi_EpD(gWifiHaveIp)
+  wifi_EpS(", rssi ") : wifi_EpD(gWifiLastRssi) : wifi_EpS(" dBm, channel ") : wifi_EpD(cyw43_linkChannel)
+  wifi_EpS("; data frames out ") : wifi_EpD(cyw43_txFrames) : wifi_EpS(", in ") : wifi_EpD(cyw43_rxData)
+  wifi_EpS("; SDPCM seq ") : wifi_EpD(cyw43_seq) : wifi_EpS(" credit ") : wifi_EpD(cyw43_credit) : wifi_EpS(" stalls ") : wifi_EpD(cyw43_stalls)
+  wifi_EpS("; EAPOL seen ") : wifi_EpD(gWifiEapolSeen) : wifi_EpS(" errors ") : wifi_EpD(gWifiEapolErr) : wifi_EpS(" group rekeys ") : wifi_EpD(gWifiGrpKeyed)
+  wifi_EpS("; keepalive probes outstanding ") : wifi_EpD(gWifiKaProbes) : wifi_EpS(", last round trip ") : wifi_EpD((millis() - gWifiRxProof) / 1000) : wifi_EpS(" s ago")
+  wifi_EpS("; re-associations ") : wifi_EpD(gWifiRejoins) : wifi_EpS(", radio resets ") : wifi_EpD(gWifiRadioResets)
+  wifi_EpS("; recovery last fail phase ") : wifi_EpD(gWifiRecLastFailPhase) : wifi_EpS(" rc ") : wifi_EpD(gWifiRecLastFailRc) : wifi_EpS(" status ") : wifi_EpD(gWifiRecLastFailStatus)
+  wifi_EpS("; episode attempts ") : wifi_EpD(gWifiEpFails) : wifi_EpS(", for ") : wifi_EpD((millis() - gWifiEpT0) / 1000) : wifi_EpS(" s")
+  wifi_EpC(0)
+  ProcedureReturn @wifi_epTxt[0]
+EndProcedure
+
+; The first sign of a failure. Records it, and if no episode is open opens one and SAVES the evidence
+; - before recovery touches anything.
+Procedure wifi_EpFail(code.i, a.i, b.i, *why)
+  WifiRec(code, a, b)
+  If gWifiEp = 0
+    gWifiEp = 1 : gWifiEpT0 = millis() : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiEpN = gWifiEpN + 1
+    WifiRecSave(*why, wifi_EpCounters())
+  EndIf
+EndProcedure
+
+; The link has an address again: the episode ends, saved with what it took.
+Procedure wifi_EpRecovered()
+  WifiRec(#WR_REC_OK, gWifiIp, gWifiEpFails)
+  If gWifiEp <> 0
+    gWifiEp = 0
+    WifiRecSave("RECOVERED - the link has an address again; the state line says how many attempts and how long it took", wifi_EpCounters())
+  EndIf
+EndProcedure
+
 Procedure wifi_RecordLinkDown()
   NetDhcpLinkDown(#HW_LINK_WIFI)
   gWifiKeyed = 0
@@ -2756,7 +2848,7 @@ Procedure.i WifiRejoin(announce.i)
   ; prompt, so the console is back within one turn either way.
 
   gWifiHealPend = 0
-  gWifiRejoins = gWifiRejoins + 1
+  gWifiRejoins = gWifiRejoins + 1 : wifi_EpRecovered()
   gWifiKaLast = millis()
   If announce <> 0
     Print("Wi-Fi: reconnected as ")
@@ -2865,6 +2957,26 @@ EndProcedure
 ; after GTK installation or during DHCP must revoke the keyed/addressed route
 ; rather than leave an unaccepted candidate eligible while retry is pending.
 Procedure wifi_RecoverCandidateFail()
+  WifiRec(#WR_REC_FAIL, gWifiRecLastFailPhase, gWifiRecLastFailRc)
+  If gWifiEp = 0
+    gWifiEp = 1 : gWifiEpT0 = millis() : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiEpN = gWifiEpN + 1
+    WifiRecSave("a recovery attempt failed (no earlier sign was recorded)", wifi_EpCounters())
+  EndIf
+  gWifiEpFails = gWifiEpFails + 1
+  If gWifiEpFails % #WIFI_EP_SAVE_EVERY = 0
+    WifiRecSave("STILL FAILING - recovery attempts keep failing", wifi_EpCounters())
+  EndIf
+  If gWifiEpFails >= #WIFI_EP_RESET_AFTER And gWifiEpReset = 0 And gWifiUp <> 0
+    gWifiEpReset = 1 : gWifiRadioResets = gWifiRadioResets + 1
+    WifiRec(#WR_RADIO_RESET, gWifiEpFails, 0)
+    WifiRecSave("RADIO RESET - re-associations keep failing, so the radio is let go and brought up from cold (firmware reloaded). A backstop: this episode is a defect to find", wifi_EpCounters())
+    WifiRecoveryCancel()
+    Wpa2SupWipe() : Cyw43KeyWipe() : AesWipe() : KwWipe()
+    wifi_RecordLinkDown()
+    gWifiUp = 0
+    WifiRadioInitArm(1)
+    ProcedureReturn
+  EndIf
   WifiRecoveryCancel()
   Wpa2SupWipe()
   Cyw43KeyWipe()
@@ -3515,7 +3627,7 @@ Procedure WifiRecoveryTick()
       If wifi_RecoverLeaseBound() <> 0
         gWifiRecPhase = #WIFI_REC_IDLE
         gWifiHealPend = 0
-        gWifiRejoins = gWifiRejoins + 1
+        gWifiRejoins = gWifiRejoins + 1 : wifi_EpRecovered()
         gWifiKaLast = millis()
         wifi_RecoverForgetPmk()
         If gWifiRecAnnounce <> 0
@@ -3684,6 +3796,7 @@ Procedure WifiLinkTick()
     et = gWifiTdType
     er = gWifiTdReason
     gWifiVerify = 0
+    wifi_EpFail(#WR_TEARDOWN, et, er, "the radio reported the link gone (event type and 802.11 reason in the last line; LINK reason 1 = the access point's beacons were lost)")
     Print("Wi-Fi: the radio reports ")
     UartWriteStr(Cyw43EventName(et))
     Print(" (reason ")
@@ -3790,8 +3903,10 @@ Procedure WifiLinkTick()
     ; Either way the link is not usable. Require a couple in a row so a
     ; single flaky read does not trigger a disruptive re-association.
     gWifiBadReads = gWifiBadReads + 1
+    WifiRec(#WR_ASSOC_POLL, assoc, gWifiBadReads)
     If gWifiBadReads >= #WIFI_LINK_STRIKES
       gWifiBadReads = 0
+      wifi_EpFail(#WR_ASSOC_POLL, assoc, #WIFI_LINK_STRIKES, "the firmware says the board is no longer associated")
       If gWifiHealOn <> 0
         WifiRecoveryStart(1)
         ProcedureReturn
@@ -3812,6 +3927,7 @@ Procedure WifiLinkTick()
   ; the receive side busy the whole time, and only the missing round
   ; trip gave it away.
   If gWifiKaProbes >= 2 And (now - gWifiRxProof) >= #WIFI_PROOF_MS
+    wifi_EpFail(#WR_TXONLY, gWifiKaProbes, now - gWifiRxProof, "TX-only dead: the gateway stopped answering the keepalives while the firmware still claimed the association")
     PrintN("Wi-Fi: the gateway has stopped answering this board's keepalives -")
     PrintN("the firmware still claims the association, but nothing sent out is")
     PrintN("coming back. The link is TX-only dead.")
@@ -3836,6 +3952,8 @@ Procedure WifiLinkTick()
   ; Fall back to the DHCP server if there is no gateway. Each send is
   ; counted so the proof check above knows an answer was solicited - and
   ; the count is zeroed by any frame that arrives.
+  If Cyw43ReadRssi(200) = 1 : gWifiLastRssi = cyw43_linkRssi : EndIf
+  WifiRec(#WR_KA_PROBE, gWifiKaProbes, gWifiLastRssi)
   If gWifiGw <> 0
     If wifi_KeepAliveArp(gWifiGw) <> 0
       gWifiKaProbes = gWifiKaProbes + 1

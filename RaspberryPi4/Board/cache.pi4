@@ -686,6 +686,7 @@ Procedure RunAt(a.i)
   ; leaves a record saying the payload came back. `last run` reads it, and a
   ; host whose return line was lost asks it. See RaspberryPi4/Board/runrecord.pi4.
   RunRecordEnter(a, dead)
+  gWifiPayloadT0 = millis() : WifiRec(#WR_PAYLOAD_IN, a & $FFFFFFFF, 0)     ; the flight recorder: the radio is unserviced from here
 
   CallAddr()
   RunRecordReturn(gGoRc)
@@ -927,6 +928,7 @@ Procedure RunAt(a.i)
   CompilerIf #ANVIL_PAYLOAD_NET = 1
   PayNetPayloadReturned()
   CompilerEndIf
+  WifiRec(#WR_PAYLOAD_OUT, (millis() - gWifiPayloadT0) / 1000, 0)     ; the flight recorder: how long the radio went unserviced
 
   ; Re-derive listening and exact peer ownership before the first final line.
   ; If wired recovery failed or its lease expired, the stale peer is forgotten
