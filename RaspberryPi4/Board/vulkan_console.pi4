@@ -70,6 +70,8 @@ Global Dim avcLayoutAdvance.i[#CON_MAXCOLS]
 ; now asks for a frame that holds the banner alone; the pump copies only the
 ; banner strip to the display and the text on the glass is left as it is.
 Global avcBannerDirty.i
+Declare avcDestroyBannerTarget()
+Declare.i avcCreateBannerTarget()
 ; Where a console frame's time goes, counted on the board's own counter since
 ; the last `vkstat`: [0] building the frame on the processor, [1] submitting it
 ; and waiting for the GPU, [2] copying it to the display. Banner-only frames
@@ -236,6 +238,7 @@ Procedure.i VulkanConsoleDestroy()
   If NeonVkChromeReady() <> 0 : NeonVkChromeDestroy() : EndIf
   NeonVkChromeLogoSource(0, 0, 0)
   If avcDevice <> 0
+    avcDestroyBannerTarget()
     If avcFramebuffer <> 0 : vkDestroyFramebuffer(avcDevice, avcFramebuffer, 0) : EndIf
     If avcRenderPass <> 0 : vkDestroyRenderPass(avcDevice, avcRenderPass, 0) : EndIf
     If avcView <> 0 : vkDestroyImageView(avcDevice, avcView, 0) : EndIf
@@ -420,6 +423,9 @@ Procedure.i VulkanConsoleStart()
     ProcedureReturn #AVC_ERR_CHROME
   EndIf
   rc = avcCreateTarget()
+  If rc = #AVC_OK
+    avcCreateBannerTarget()                       ; optional: without it the banner uses the whole target
+  EndIf
   If rc <> #AVC_OK
     avcError = rc
     avcActive = 0
@@ -811,37 +817,178 @@ Procedure.i avcCopyToDisplay()
   ProcedureReturn 1
 EndProcedure
 
-; The banner strip of the finished Vulkan image, copied to the display and, on
-; the DSI panel, to the buffer the scaler reads. The rest of both is untouched.
-Procedure.i avcCopyBannerToDisplay()
-  Define dst.i, dstPitch.i, width.i, height.i, bx.i, by.i, bw.i, bh.i, rotation.i
-  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+; ----------------------------------------------------------------------
+;  THE BANNER'S OWN TARGET, AND ONLY THE PIXELS THAT CHANGED.
+;
+;  The backend renders a whole framebuffer or nothing (a smaller render area
+;  is refused), so a banner frame drawn into the console's own 800 x 1280
+;  target made the GPU render and store every tile of the screen for a band
+;  120 pixels deep: 8.4 ms of waiting, four times a second (vkstat, build 253).
+;  The banner now has a target of its own, the size of the band, and the
+;  adapter is rebound to it for the frame and back afterwards (a rebind is a
+;  few field stores). If that target could not be made, the old whole-target
+;  banner frame is used.
+;
+;  Of that band only what changed goes to the display: the clock line when its
+;  text changed, the logo when the glint moved, the whole band otherwise (the
+;  first frame, a geometry change). Copying the whole 614 KB strip twice was
+;  the other 5.7 ms.
+; ----------------------------------------------------------------------
+Global avcBanImage.i, avcBanMemory.i, avcBanView.i, avcBanFramebuffer.i
+Global avcBanBase.i, avcBanPitch.i, avcBanW.i, avcBanH.i, avcBanReady.i
+Global avcBanLastClock.i = -1, avcBanLastGlint.i = -2, avcBanShown.i
+
+Procedure avcDestroyBannerTarget()
+  If avcDevice <> 0
+    If avcBanFramebuffer <> 0 : vkDestroyFramebuffer(avcDevice, avcBanFramebuffer, 0) : EndIf
+    If avcBanView <> 0 : vkDestroyImageView(avcDevice, avcBanView, 0) : EndIf
+    If avcBanImage <> 0 : vkDestroyImage(avcDevice, avcBanImage, 0) : EndIf
+    If avcBanMemory <> 0 : vkFreeMemory(avcDevice, avcBanMemory, 0) : EndIf
+  EndIf
+  avcBanFramebuffer = 0 : avcBanView = 0 : avcBanImage = 0 : avcBanMemory = 0
+  avcBanBase = 0 : avcBanPitch = 0 : avcBanReady = 0 : avcBanShown = 0
+EndProcedure
+
+; 1 when the band's own target exists. Any failure leaves none and the old path in use.
+Procedure.i avcCreateBannerTarget()
+  Define rc.i, mapped.i
+  Define imageInfo.VkImageCreateInfo
+  Define req.VkMemoryRequirements
+  Define alloc.VkMemoryAllocateInfo
+  Define viewInfo.VkImageViewCreateInfo
+  Define frameInfo.VkFramebufferCreateInfo
+  avcDestroyBannerTarget()
+  If avcDevice = 0 Or avcRenderPass = 0 Or LogoHeight() < 1 : ProcedureReturn 0 : EndIf
+  If avcRotation = 90 Or avcRotation = 270
+    avcBanW = LogoHeight() : avcBanH = avcHeight
+  Else
+    avcBanW = avcWidth : avcBanH = LogoHeight()
+  EndIf
+  imageInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  imageInfo\imageType = #VK_IMAGE_TYPE_2D
+  imageInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  imageInfo\extent\width = avcBanW : imageInfo\extent\height = avcBanH : imageInfo\extent\depth = 1
+  imageInfo\mipLevels = 1 : imageInfo\arrayLayers = 1
+  imageInfo\samples = #VK_SAMPLE_COUNT_1_BIT
+  imageInfo\tiling = #VK_IMAGE_TILING_LINEAR
+  imageInfo\usage = #VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | #VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+  imageInfo\sharingMode = #VK_SHARING_MODE_EXCLUSIVE
+  imageInfo\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(avcDevice, @imageInfo, 0, @avcBanImage)
+  If rc <> #VK_SUCCESS : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  vkGetImageMemoryRequirements(avcDevice, avcBanImage, @req)
+  alloc\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  alloc\allocationSize = req\size : alloc\memoryTypeIndex = 0
+  rc = vkAllocateMemory(avcDevice, @alloc, 0, @avcBanMemory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(avcDevice, avcBanImage, avcBanMemory, 0) : EndIf
+  If rc <> #VK_SUCCESS : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  avcBanBase = AnvilVkImageAddress(avcBanImage)
+  avcBanPitch = AnvilVkImageRowPitch(avcBanImage)
+  If avcBanBase = 0 Or avcBanPitch < avcBanW * 4 : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  mapped = 0
+  rc = vkMapMemory(avcDevice, avcBanMemory, 0, #VK_WHOLE_SIZE, 0, @mapped)
+  If rc <> #VK_SUCCESS Or mapped <> avcBanBase : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  vkUnmapMemory(avcDevice, avcBanMemory)
+  viewInfo\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+  viewInfo\image = avcBanImage : viewInfo\viewType = #VK_IMAGE_VIEW_TYPE_2D
+  viewInfo\format = #VK_FORMAT_B8G8R8A8_UNORM
+  viewInfo\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+  viewInfo\subresourceRange\levelCount = 1 : viewInfo\subresourceRange\layerCount = 1
+  rc = vkCreateImageView(avcDevice, @viewInfo, 0, @avcBanView)
+  If rc <> #VK_SUCCESS : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  frameInfo\sType = #VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO
+  frameInfo\renderPass = avcRenderPass : frameInfo\attachmentCount = 1
+  frameInfo\pAttachments = @avcBanView : frameInfo\width = avcBanW
+  frameInfo\height = avcBanH : frameInfo\layers = 1
+  rc = vkCreateFramebuffer(avcDevice, @frameInfo, 0, @avcBanFramebuffer)
+  If rc <> #VK_SUCCESS : avcDestroyBannerTarget() : ProcedureReturn 0 : EndIf
+  avcBanReady = 1
+  ProcedureReturn 1
+EndProcedure
+
+; A DMA copy of a rectangle between two different places in two surfaces.
+Procedure.i avcDmaCopyRectAt(dst.i, dstPitch.i, dx.i, dy.i, src.i, srcPitch.i, sx.i, sy.i, w.i, h.i)
+  Define d.i, s.i, rowBytes.i
+  If w <= 0 Or h <= 0 : ProcedureReturn 1 : EndIf
+  rowBytes = w * 4
+  d = dst + dy * dstPitch + dx * 4
+  s = src + sy * srcPitch + sx * 4
+  DmaCacheRect(d, dstPitch, rowBytes, h)
+  If DmaCopy2D(d, dstPitch, s, srcPitch, rowBytes, h) = 0
+    ProcedureReturn 0
+  EndIf
+  DmaCacheRect(d, dstPitch, rowBytes, h)
+  ProcedureReturn 1
+EndProcedure
+
+; One rectangle of the band, given in LOGICAL banner coordinates (x across the
+; screen, y down the band), from the band's source to the display draw buffer
+; and, on DSI, the scan buffer. The source is the band's own target, or the
+; console's whole target when the band has none (bandInSource = 0).
+Procedure.i avcCopyBandRect(lx.i, ly.i, lw.i, lh.i, src.i, srcPitch.i, bandInSource.i)
+  Define dst.i, dstPitch.i, width.i, height.i, band.i
+  Define px.i, py.i, pw.i, ph.i, ox.i, oy.i, sx.i, sy.i
+  band = LogoHeight()
+  If lx < 0 : lw = lw + lx : lx = 0 : EndIf
+  If ly < 0 : lh = lh + ly : ly = 0 : EndIf
+  If lx + lw > avcLogicalW : lw = avcLogicalW - lx : EndIf
+  If ly + lh > band : lh = band - ly : EndIf
+  If lw < 1 Or lh < 1 : ProcedureReturn 1 : EndIf
   dst = ScrGpuBase() : dstPitch = ScrGpuPitch()
   width = ScrGpuPhysicalW() : height = ScrGpuPhysicalH()
-  If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight
-    ProcedureReturn 0
+  If dst = 0 Or dstPitch < width * 4 Or width <> avcWidth Or height <> avcHeight : ProcedureReturn 0 : EndIf
+  ; the rectangle in the band's physical coordinates, and where the band sits on the display
+  ox = 0 : oy = 0
+  If avcRotation = 90
+    px = band - (ly + lh) : py = lx : pw = lh : ph = lw : ox = width - band
+  ElseIf avcRotation = 270
+    px = ly : py = avcLogicalW - (lx + lw) : pw = lh : ph = lw
+  ElseIf avcRotation = 180
+    px = avcLogicalW - (lx + lw) : py = band - (ly + lh) : pw = lw : ph = lh : oy = height - band
+  Else
+    px = lx : py = ly : pw = lw : ph = lh
   EndIf
-  If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
-  rotation = ScrGpuRotation()
-  bx = 0 : by = 0 : bw = width : bh = LogoHeight()
-  If rotation = 90
-    bx = width - LogoHeight() : bw = LogoHeight() : bh = height
-  ElseIf rotation = 270
-    bw = LogoHeight() : bh = height
-  ElseIf rotation = 180
-    by = height - LogoHeight()
-  EndIf
-  If bx < 0 Or by < 0 Or bw < 1 Or bh < 1 Or bx + bw > width Or by + bh > height
-    ProcedureReturn 0
-  EndIf
-  If avcDmaCopyRect(dst, dstPitch, avcImageBase, avcImagePitch, bx, by, bw, bh) = 0
-    ProcedureReturn 0
-  EndIf
+  sx = px : sy = py
+  If bandInSource = 0 : sx = px + ox : sy = py + oy : EndIf
+  If avcDmaCopyRectAt(dst, dstPitch, px + ox, py + oy, src, srcPitch, sx, sy, pw, ph) = 0 : ProcedureReturn 0 : EndIf
   If gScrSrc = #SCR_SRC_DSI
-    If avcDmaCopyRect(#MON_FB_SCAN, dstPitch, avcImageBase, avcImagePitch, bx, by, bw, bh) = 0
-      ProcedureReturn 0
+    If avcDmaCopyRectAt(#MON_FB_SCAN, dstPitch, px + ox, py + oy, src, srcPitch, sx, sy, pw, ph) = 0 : ProcedureReturn 0 : EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; A number that changes when the banner's text line changes.
+Procedure.i avcClockSum()
+  Define i.i, c.i, h.i
+  h = 0
+  For i = 0 To #BANNER_CLOCK_MAX
+    c = gBannerClockText[i] & $FF
+    If c = 0 : Break : EndIf
+    h = ((h * 31) + c) & $FFFFFFFF
+  Next
+  ProcedureReturn h
+EndProcedure
+
+; Copies the parts of the band that changed since the last banner frame.
+Procedure.i avcCopyBannerToDisplay(src.i, srcPitch.i, bandInSource.i)
+  Define clock.i, glint.i, any.i, logoX.i
+  If DisplayMemorySafe() = 0 : ProcedureReturn 0 : EndIf
+  If gDma = 0 Or DmaReady() = 0 : ProcedureReturn 0 : EndIf
+  clock = avcClockSum() : glint = gBannerAnimPhase
+  If avcBanShown = 0
+    any = avcCopyBandRect(0, 0, avcLogicalW, LogoHeight(), src, srcPitch, bandInSource)
+  Else
+    any = 1
+    If clock <> avcBanLastClock                     ; the build, date, clock and status line
+      any = avcCopyBandRect(0, 88, avcLogicalW - #ANVIL_PIC_W - 12, 28, src, srcPitch, bandInSource)
+    EndIf
+    If any <> 0 And glint <> avcBanLastGlint        ; the logo, where the glint runs
+      logoX = avcLogicalW - #ANVIL_PIC_W - 12
+      any = avcCopyBandRect(logoX - 2, 10, #ANVIL_PIC_W + 4, #ANVIL_PIC_H + 4, src, srcPitch, bandInSource)
     EndIf
   EndIf
+  If any = 0 : ProcedureReturn 0 : EndIf
+  avcBanLastClock = clock : avcBanLastGlint = glint : avcBanShown = 1
   ProcedureReturn 1
 EndProcedure
 
@@ -874,10 +1021,22 @@ EndProcedure
 ; A frame that holds the banner and nothing else, for a change of the clock or
 ; the glint while the text is unchanged. Returns 1 when it was presented.
 Procedure.i avcPumpBannerOnly()
-  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i
+  Define rc.i, endRc.i, t0.i, t1.i, t2.i, ok.i, own.i
   t0 = Ticks()
+  own = 0
+  If avcBanReady <> 0
+    If NeonVkChromeRebind(avcBanFramebuffer, avcLogicalW, LogoHeight(), avcBanW, avcBanH, avcBanPitch, avcRotation) = #VK_SUCCESS
+      own = 1
+    Else
+      NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation)
+      avcDestroyBannerTarget()                      ; never again this session: the whole-target frame is used
+    EndIf
+  EndIf
   avcClear[0] = 0 : avcClear[1] = 0 : avcClear[2] = 0 : avcClear[3] = $3F800000
-  If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS : ProcedureReturn 0 : EndIf
+  If NeonVkChromeBegin(@avcClear[0]) <> #VK_SUCCESS
+    If own <> 0 : NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation) : EndIf
+    ProcedureReturn 0
+  EndIf
   avcBannerFrameReady = 0
   rc = avcRenderBanner()
   t1 = Ticks()
@@ -885,13 +1044,27 @@ Procedure.i avcPumpBannerOnly()
   endRc = NeonVkChromeEnd()
   *gV3dWaitIdle = 0
   t2 = Ticks()
+  ok = 1
   If rc <> #NEON_VK_CHROME_OK Or NeonVkChromeError() <> 0 Or endRc <> #VK_SUCCESS
     If NeonVkChromePresentPending() <> 0 : NeonVkChromePresentConsume() : EndIf
-    ProcedureReturn 0
+    ok = 0
+  ElseIf NeonVkChromePresentPending() <> 1
+    ok = 0
+  ElseIf NeonVkChromePresentConsume() <> 1
+    ok = 0
   EndIf
-  If NeonVkChromePresentPending() <> 1 : ProcedureReturn 0 : EndIf
-  If NeonVkChromePresentConsume() <> 1 : ProcedureReturn 0 : EndIf
-  ok = avcCopyBannerToDisplay()
+  ; back to the console's own target before anything else can draw
+  If own <> 0
+    If NeonVkChromeRebind(avcFramebuffer, avcLogicalW, avcLogicalH, avcWidth, avcHeight, avcPitch, avcRotation) <> #VK_SUCCESS
+      ProcedureReturn 0
+    EndIf
+  EndIf
+  If ok = 0 : ProcedureReturn 0 : EndIf
+  If own <> 0
+    ok = avcCopyBannerToDisplay(avcBanBase, avcBanPitch, 1)
+  Else
+    ok = avcCopyBannerToDisplay(avcImageBase, avcImagePitch, 0)
+  EndIf
   avcStatBanner[0] = avcStatBanner[0] + (t1 - t0)
   avcStatBanner[1] = avcStatBanner[1] + (t2 - t1)
   avcStatBanner[2] = avcStatBanner[2] + (Ticks() - t2)
@@ -1032,6 +1205,7 @@ Procedure VulkanConsolePump()
     ProcedureReturn
   EndIf
   avcFramePresented = 1
+  avcBanShown = 1 : avcBanLastClock = avcClockSum() : avcBanLastGlint = gBannerAnimPhase
   ConGridClearDirty()
   avcStatFull[0] = avcStatFull[0] + (st1 - st0)
   avcStatFull[1] = avcStatFull[1] + (st2 - st1)
