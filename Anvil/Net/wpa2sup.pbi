@@ -261,6 +261,7 @@ Global wpaM3Seen.i   = 0
 Global wpaLastErr.i  = 0
 Global wpaGrpSeen.i  = 0      ; group-key rekeys serviced this session
 Global wpaPtkRe.i    = 0      ; mid-session PTK rekeys serviced this session
+Global wpaReqCtr.i   = 0      ; EAPOL-Key Requests sent this association
 
 ; ----------------------------------------------------------------------
 ;  Little helpers. Big-endian, because everything in 802.1X is.
@@ -565,6 +566,7 @@ Procedure.i Wpa2SupBegin(*pmk32, *ourMac, *apMac, *rsnIe, rsnIeLen.i)
   wpaTxLen = 0
   wpaM1Seen = 0
   wpaM3Seen = 0
+  wpaReqCtr = 0
   wpaKdv = 0
   wpaEapolVer = 2
   wpaLastErr = 0
@@ -857,6 +859,43 @@ EndProcedure
 ;      Delegated to Wpa2SupHandle by re-arming the state, so the exact
 ;      same, gate-tested four-way runs again.
 ; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+;  Wpa2SupBuildRequest - an EAPOL-Key REQUEST asking the access point to
+;  rekey: the group key (pairwise = 0) or the pairwise key (pairwise <> 0).
+;  IEEE 802.11 12.7.2 b): the supplicant may ask at any time. The frame is
+;  wpa_supplicant's wpa_sm_key_request: Request + MIC + Secure, Key Type
+;  set for pairwise, no key data, and the replay counter is the
+;  supplicant's OWN request counter, incremented per request (the
+;  authenticator drops a request whose counter does not advance -
+;  hostapd's req_replay_counter). hostapd answers a group request with
+;  wpa_rekey_gtk and a pairwise one with a new four-way handshake.
+;
+;  Only in a live session, where the KCK that signs it exists. Returns 1
+;  with the frame in Wpa2SupTxPtr()/Wpa2SupTxLen(), or 0.
+; ----------------------------------------------------------------------
+Procedure.i Wpa2SupBuildRequest(pairwise.i)
+  Define keyInfo.i
+  Define i.i
+  Define v.i
+  If wpaState <> #WPA2SUP_SESSION
+    wpaLastErr = #WPA2SUP_E_NOTREADY
+    ProcedureReturn 0
+  EndIf
+  keyInfo = #WPA2_KDV_SHA1 | #WPA2_KI_MIC | #WPA2_KI_SECURE | #WPA2_KI_REQUEST
+  If pairwise <> 0
+    keyInfo = keyInfo | #WPA2_KI_PAIRWISE
+  EndIf
+  wpa_BuildReply(keyInfo, 0)
+  wpaReqCtr = wpaReqCtr + 1
+  v = wpaReqCtr
+  For i = 7 To 0 Step -1
+    wpaTx[#WPA2_K_REPLAY + i] = v & $FF
+    v = v >> 8
+  Next
+  wpa_Mic(@wpaTx[0], 0, @wpaTx[0] + #WPA2_K_MIC)
+  ProcedureReturn 1
+EndProcedure
 
 ; Arm the session hold. Called by the join once both keys are installed,
 ; IN PLACE OF Wpa2SupWipe, so the key material survives to answer a rekey.
