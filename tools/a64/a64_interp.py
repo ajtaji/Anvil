@@ -22,6 +22,14 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+# THE FIRST RULE: no model runs while a Pi is available (no_emulator_link.py). A statement of the
+# module, so every gate that imports this core - or loads it from its path - is refused before a
+# machine of it exists.
+import sys as _sys
+if str(Path(__file__).resolve().parent) not in _sys.path:
+    _sys.path.append(str(Path(__file__).resolve().parent))
+import no_emulator_link; no_emulator_link.require('pi', 'a64_interp (the Python A64 core)')  # noqa: E402
+
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 
