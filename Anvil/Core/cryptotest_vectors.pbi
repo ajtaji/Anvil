@@ -541,14 +541,14 @@ DataSection
   Data.l 15, 44, 65, 32, 5, 0, 0, 0, 196611, 45170
   ; ecdsa      45  EcdsaVrfyAsn1, malformed der case 46: well-formed DER but r = s = 1 (not a signature)
   Data.l 15, 45, 65, 32, 8, 0, 0, 0, 65539, 45272
-  ; ecdsa      46  curve gate: P-384 must answer -1 (cannot answer), never 0 (a verdict)
-  Data.l 15, 46, 65, 32, 72, 0, 0, 0, 402784770, 45377
-  ; ecdsa      47  curve gate: P-521 must answer -1 (cannot answer), never 0 (a verdict)
-  Data.l 15, 47, 65, 32, 72, 0, 0, 0, 419561986, 45546
-  ; ecdsa      48  curve gate: curve id 0 must answer -1 (cannot answer), never 0 (a verdict)
-  Data.l 15, 48, 65, 32, 72, 0, 0, 0, 131586, 45715
-  ; ecdsa      49  curve gate: curve id 29 must answer -1 (cannot answer), never 0 (a verdict)
-  Data.l 15, 49, 65, 32, 72, 0, 0, 0, 486670850, 45884
+  ; ecdsa      46  curve gate: curve id 0 must answer -1 (cannot answer), never 0 (a verdict)
+  Data.l 15, 46, 65, 32, 72, 0, 0, 0, 131586, 45377
+  ; ecdsa      47  curve gate: curve id 29 must answer -1 (cannot answer), never 0 (a verdict)
+  Data.l 15, 47, 65, 32, 72, 0, 0, 0, 486670850, 45546
+  ; ecdsa      48  curve gate: P-384 is computed now; a P-256 key under it is rejected (0), not 'cannot answer'
+  Data.l 15, 48, 65, 32, 72, 0, 0, 0, 402718722, 45715
+  ; ecdsa      49  curve gate: P-521 is computed now; a P-256 key under it is rejected (0), not 'cannot answer'
+  Data.l 15, 49, 65, 32, 72, 0, 0, 0, 419495938, 45884
   ; ecdsa      50  curve gate: P-256 on the same record still answers 1
   Data.l 15, 50, 65, 32, 72, 0, 0, 0, 385876226, 46053
   ; rsa         0  PKCS#1 v1.5, 2048-bit modulus, e = 3, MUST VERIFY (gen_rsa_vectors record 0)
@@ -3799,7 +3799,7 @@ DataSection
   Data.b 153, 175, 43, 219, 225, 170, 155, 110, 193, 226, 173, 225, 214, 148, 244, 31
   Data.b 199, 26, 131, 29, 2, 104, 233, 137, 21, 98, 17, 61, 138, 98, 173, 209
   Data.b 191, 48, 6, 2, 1, 1, 2, 1, 1
-  ; ---- ecdsa 46 at +45377 : curve gate: P-384 must answer -1 (cannot answer), never 0 (a verdict) ----
+  ; ---- ecdsa 46 at +45377 : curve gate: curve id 0 must answer -1 (cannot answer), never 0 (a verdict) ----
   Data.b 4, 96, 254, 212, 186, 37, 90, 157, 49, 201, 97, 235, 116, 198, 53, 109
   Data.b 104, 192, 73, 184, 146, 59, 97, 250, 108, 230, 105, 98, 46, 96, 242, 159
   Data.b 182, 121, 3, 254, 16, 8, 184, 188, 153, 164, 26, 233, 233, 86, 40, 188
@@ -3811,7 +3811,7 @@ DataSection
   Data.b 14, 168, 78, 175, 55, 22, 2, 33, 0, 247, 203, 28, 148, 45, 101, 124
   Data.b 65, 212, 54, 199, 161, 182, 226, 159, 101, 243, 233, 0, 219, 185, 175, 244
   Data.b 6, 77, 196, 171, 47, 132, 58, 205, 168
-  ; ---- ecdsa 47 at +45546 : curve gate: P-521 must answer -1 (cannot answer), never 0 (a verdict) ----
+  ; ---- ecdsa 47 at +45546 : curve gate: curve id 29 must answer -1 (cannot answer), never 0 (a verdict) ----
   Data.b 4, 96, 254, 212, 186, 37, 90, 157, 49, 201, 97, 235, 116, 198, 53, 109
   Data.b 104, 192, 73, 184, 146, 59, 97, 250, 108, 230, 105, 98, 46, 96, 242, 159
   Data.b 182, 121, 3, 254, 16, 8, 184, 188, 153, 164, 26, 233, 233, 86, 40, 188
@@ -3823,7 +3823,7 @@ DataSection
   Data.b 14, 168, 78, 175, 55, 22, 2, 33, 0, 247, 203, 28, 148, 45, 101, 124
   Data.b 65, 212, 54, 199, 161, 182, 226, 159, 101, 243, 233, 0, 219, 185, 175, 244
   Data.b 6, 77, 196, 171, 47, 132, 58, 205, 168
-  ; ---- ecdsa 48 at +45715 : curve gate: curve id 0 must answer -1 (cannot answer), never 0 (a verdict) ----
+  ; ---- ecdsa 48 at +45715 : curve gate: P-384 is computed now; a P-256 key under it is rejected (0), not 'cannot answer' ----
   Data.b 4, 96, 254, 212, 186, 37, 90, 157, 49, 201, 97, 235, 116, 198, 53, 109
   Data.b 104, 192, 73, 184, 146, 59, 97, 250, 108, 230, 105, 98, 46, 96, 242, 159
   Data.b 182, 121, 3, 254, 16, 8, 184, 188, 153, 164, 26, 233, 233, 86, 40, 188
@@ -3835,7 +3835,7 @@ DataSection
   Data.b 14, 168, 78, 175, 55, 22, 2, 33, 0, 247, 203, 28, 148, 45, 101, 124
   Data.b 65, 212, 54, 199, 161, 182, 226, 159, 101, 243, 233, 0, 219, 185, 175, 244
   Data.b 6, 77, 196, 171, 47, 132, 58, 205, 168
-  ; ---- ecdsa 49 at +45884 : curve gate: curve id 29 must answer -1 (cannot answer), never 0 (a verdict) ----
+  ; ---- ecdsa 49 at +45884 : curve gate: P-521 is computed now; a P-256 key under it is rejected (0), not 'cannot answer' ----
   Data.b 4, 96, 254, 212, 186, 37, 90, 157, 49, 201, 97, 235, 116, 198, 53, 109
   Data.b 104, 192, 73, 184, 146, 59, 97, 250, 108, 230, 105, 98, 46, 96, 242, 159
   Data.b 182, 121, 3, 254, 16, 8, 184, 188, 153, 164, 26, 233, 233, 86, 40, 188

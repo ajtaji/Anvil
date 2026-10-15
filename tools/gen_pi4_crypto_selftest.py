@@ -664,12 +664,23 @@ def build_ecdsa(t: Table):
               "EcdsaVrfyAsn1, malformed der case %d: %s" % (tag, note))
 
     q, h, sig, expect, tag, note = asn1[0]
-    for cid, name in ((24, "P-384"), (25, "P-521"), (0, "curve id 0"),
-                      (29, "curve id 29")):
+    for cid, name in ((0, "curve id 0"), (29, "curve id 29")):
         t.add(MOD_ECDSA, (q, h, sig, b"", b"", b""),
               param(ECDSA_K_SEAM, ECDSA_V_MINUS1, ag.ERR_CURVE, cid),
               "curve gate: %s must answer -1 (cannot answer), never 0 "
               "(a verdict)" % name)
+    # P-384 and P-521 ARE computed since 2026-10-14 (ecp.pi4, Anvil
+    # 6540e43), so handed this P-256 record they give a real verdict: a
+    # 65-byte point is not a point on either curve, so the signature is
+    # REJECTED (0, BADSIG) - never -1, and never 1. The same expectation
+    # as a64_ecdsa_check.py's CheckCurves. Until 2026-10-15 this table
+    # still said -1, and the board (build 271) failed both records for
+    # answering correctly.
+    for cid, name in ((24, "P-384"), (25, "P-521")):
+        t.add(MOD_ECDSA, (q, h, sig, b"", b"", b""),
+              param(ECDSA_K_SEAM, ECDSA_V_ZERO, ag.ERR_BADSIG, cid),
+              "curve gate: %s is computed now; a P-256 key under it is "
+              "rejected (0), not 'cannot answer'" % name)
     t.add(MOD_ECDSA, (q, h, sig, b"", b"", b""),
           param(ECDSA_K_SEAM, ECDSA_V_ONE, ag.ERR_OK, 23),
           "curve gate: P-256 on the same record still answers 1")
