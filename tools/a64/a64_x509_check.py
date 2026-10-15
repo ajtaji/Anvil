@@ -56,8 +56,16 @@ WHY THIS FILE IS WRITTEN THE WAY IT IS
   proof, so no .pico/.pico2/.unor4 image has ever run this path.  The
   RSA chains that answer 200 in modes A and B answer #X509ERR_OK (32)
   here, and their tampered variants answer #X509ERR_BAD_SIGNATURE (52).
-  Run bare, this gate runs all three; --stub-only is A, --linked-only
-  is B and C, --mode picks exactly one.
+  MODE D (2026-10-14) RUNS THE MODE C IMAGE ON REAL PUBLIC CHAINS:
+  what www.google.com, github.com, example.com, letsencrypt.org and
+  www.microsoft.com sent, anchored at the Mozilla roots that issue them
+  - P-384 roots and intermediates, ecdsa-with-SHA384 and
+  sha384WithRSAEncryption (RSA-4096) - with OpenSSL's verdict as every
+  expectation and three tampered signatures refused by name.  See
+  load_modeD and tools/x509_public_chains_gen.py.
+
+  Run bare, this gate runs all four; --stub-only is A, --linked-only
+  is B, C and D, --mode picks exactly one.
 
   EVERY VERDICT IS STORED AND CHECKED AT FULL 64-BIT WIDTH.  The
   harness writes with PokeI and this file unpacks with "<Q".  The A64
@@ -101,6 +109,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -160,6 +169,7 @@ JOB_STRIDE = 256            # one script record
 RESULT_STRIDE = 32          # four i64 fields
 SENTINEL = 0xA5
 MAX_CERTS = 4
+CASE_FILTER = None          # --case, mode D only
 MAX_ANCHORS = 4
 
 OP_END, OP_VALIDATE, OP_CELLPROBE = 0, 1, 2
@@ -245,6 +255,7 @@ EnableExplicit
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
 XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/sha512.pbi"
 __SIGINC__
 XIncludeFile "__BLOB__"
 XIncludeFile "__X509__"
@@ -373,6 +384,7 @@ EndProcedure
 # RSA chain in mode B still reports #X509ERR_SEAM (200).
 SIGINC_LINKED = '''XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
 XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
 XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
 
 ; The RSA half of the seam, unlinked in this image. -1 is exactly what
@@ -399,6 +411,7 @@ EndProcedure
 # module already speaks.  Nothing is stubbed here.
 SIGINC_FULL = '''XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
 XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
 XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
 XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
 '''
@@ -794,6 +807,59 @@ def load_modeC():
     return out, blobs
 
 
+def load_modeD():
+    """REAL PUBLIC CHAINS, through the mode C image (whole seam linked).
+
+    tools/fixtures/x509_public_chains.json, written by
+    tools/x509_public_chains_gen.py: chains real HTTPS servers sent
+    (captured with openssl s_client, kept as PEM beside the fixture),
+    anchored at the Mozilla roots that issue them, at the capture time.
+    EVERY EXPECTATION IS OPENSSL'S: each positive validated with
+    `openssl verify -attime T -verify_hostname HOST`, each tamper refused
+    by it, and the engine code each tamper must answer is written beside
+    it in the generator with the rule that picks it (52 for a signature
+    checked inside the chain walk - which includes a failed anchor step
+    that the chain then carries on past, as google.com's does with GTS
+    Root R4's cross-certificate).
+
+    This is the corpus that proves the 2026-10-14 work: P-384 roots and
+    intermediates (GTS Root R4, Sectigo E46, SSL.com ECC 2022, ISRG Root
+    X2 through Let's Encrypt's Root YE), ecdsa-with-SHA384 throughout, and
+    sha384WithRSAEncryption with RSA-4096 keys (www.microsoft.com) - the
+    chains that answered #X509ERR_UNSUPPORTED (49) before SHA-384 and
+    P-384 existed here.
+    """
+    path = ROOT / "tools" / "fixtures" / "x509_public_chains.json"
+    if not path.exists():
+        raise SystemExit("%s is missing - run tools/x509_public_chains_gen.py"
+                         % path)
+    fx = json.loads(path.read_text())
+    cases, blobs = [], {}
+    for i, c in enumerate(fx["cases"]):
+        tag = "D%d" % i
+        certs = []
+        for k, h in enumerate(c["certs"]):
+            lab = "%s_cert%d" % (tag, k)
+            blobs[lab] = bytes.fromhex(h)
+            certs.append((lab, len(blobs[lab])))
+        anchors = []
+        for k, a in enumerate(c["anchors"]):
+            dn, ka, kb = ("%s_anc%d_%s" % (tag, k, s) for s in ("dn", "a", "b"))
+            blobs[dn] = bytes.fromhex(a["dn"])
+            blobs[ka] = bytes.fromhex(a["a"])
+            blobs[kb] = bytes.fromhex(a["b"])
+            anchors.append(dict(isCA=1, type=a["type"], dn=dn, dnlen=len(blobs[dn]),
+                                curve=a["curve"], a=ka, alen=len(blobs[ka]),
+                                b=kb if a["type"] == 1 else None,
+                                blen=len(blobs[kb])))
+        srv = "srv_" + c["host"]
+        blobs[srv] = c["host"].encode()
+        cases.append(dict(anchors=anchors, certs=certs, server=srv,
+                          srvlen=len(blobs[srv]), time=c["time"],
+                          expect=c["expect"], label=c["label"]))
+    return cases, blobs
+
+
 # =====================================================================
 #  BUILDING THE SCRIPT
 # =====================================================================
@@ -888,6 +954,8 @@ def build_script(mode, mutant=False):
         cases, blobs = load_modeA()
     elif mode == "B":
         cases, blobs, _g = load_modeB()
+    elif mode == "D":
+        cases, blobs = load_modeD()
     else:
         cases, blobs = load_modeC()
     if mutant and mode in ("B", "C"):
@@ -910,7 +978,14 @@ def build_script(mode, mutant=False):
                 "generator stopped emitting one; fix that rather than "
                 "letting the sweep run on a corpus that cannot see the "
                 "thing it is sweeping." % mode)
-    labels = name_cases(cases, mode)
+    if mode == "D":
+        if CASE_FILTER:
+            cases = [c for c in cases if CASE_FILTER in c["label"]]
+            if not cases:
+                raise SystemExit("--case %r matches no mode D case" % CASE_FILTER)
+        labels = ["D " + c["label"] for c in cases]
+    else:
+        labels = name_cases(cases, mode)
     s = Script()
     for lab, c in zip(labels, cases):
         kt = None
@@ -934,7 +1009,8 @@ def build_script(mode, mutant=False):
 # =====================================================================
 def build(mode, x509_include, blob_include, harness_path, img):
     WORK.mkdir(exist_ok=True)
-    siginc = {"A": "", "B": SIGINC_LINKED, "C": SIGINC_FULL}[mode]
+    siginc = {"A": "", "B": SIGINC_LINKED, "C": SIGINC_FULL,
+              "D": SIGINC_FULL}[mode]
     src = (HARNESS
            .replace("__LINKED__", "0" if mode == "A" else "1")
            .replace("__SIGINC__", siginc)
@@ -1326,9 +1402,12 @@ def main(argv=None):
     ap.add_argument("--stub-only", action="store_true",
                     help="mode A only (#X509_SIG_LINKED = 0)")
     ap.add_argument("--linked-only", action="store_true",
-                    help="modes B and C only (#X509_SIG_LINKED = 1)")
-    ap.add_argument("--mode", choices=["A", "B", "C"], default=None,
+                    help="modes B, C and D only (#X509_SIG_LINKED = 1)")
+    ap.add_argument("--mode", choices=["A", "B", "C", "D"], default=None,
                     help="run exactly one mode")
+    ap.add_argument("--case", default=None,
+                    help="mode D only: run the cases whose label contains "
+                         "this text (a re-check, not the gate)")
     ap.add_argument("--mutate", action="store_true", help="the mutation sweep")
     ap.add_argument("--mutation", type=int, default=None,
                     help="run ONE mutation by index (used by the pool)")
@@ -1336,6 +1415,7 @@ def main(argv=None):
                     help="worker processes (default: cores - 2)")
     args = ap.parse_args(argv)
     globals()["PMFC"] = resolve_compiler(args.compiler)
+    globals()["CASE_FILTER"] = args.case
 
     print("[gate] tree under test: %s" % ROOT, file=sys.stderr)
     proven, _n = check_blob()
@@ -1374,11 +1454,11 @@ def main(argv=None):
               "argument in the table)" % (len(MUTATIONS), expected))
         return 0
 
-    modes = ["A", "B", "C"]
+    modes = ["A", "B", "C", "D"]
     if args.stub_only:
         modes = ["A"]
     if args.linked_only:
-        modes = ["B", "C"]
+        modes = ["B", "C", "D"]
     if args.mode:
         modes = [args.mode]
 
@@ -1390,6 +1470,9 @@ def main(argv=None):
         "C": "#X509_SIG_LINKED = 1, ecdsa.pi4 AND rsa.pi4 LINKED - an image "
              "no 32-bit family can build, because the eight-argument seam "
              "split is what makes RsaVrfy satisfiable",
+        "D": "the mode C image on REAL PUBLIC CHAINS - P-384 roots and "
+             "intermediates, SHA-384 ECDSA and RSA - against the Mozilla "
+             "roots, every expectation OpenSSL's",
     }
     rc = 0
     total = 0

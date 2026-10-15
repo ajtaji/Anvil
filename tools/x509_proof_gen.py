@@ -28,9 +28,32 @@ is read or needed.
 Run on its own, this prints the corpus summary.
 """
 import os, sys, datetime
-from cryptography import x509
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
+# THE CERTIFICATES ARE READ WITH THE STANDARD LIBRARY (2026-10-14). This
+# module used to import the third-party `cryptography` package for four
+# things - PEM to DER, the subject Name's DER, and the EC point or RSA
+# modulus/exponent - and on a machine without that package the whole x509
+# gate (tools/a64/a64_x509_check.py, which imports this file) could not
+# start. The same four things are now taken by the small DER reader in
+# tools/x509_public_chains_gen.py. Where `cryptography` IS installed, every
+# value is still cross-checked against it, so the package went from being
+# a requirement to being a second opinion.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import x509_public_chains_gen as _der  # noqa: E402
+try:
+    from cryptography import x509 as _cx509
+    from cryptography.hazmat.primitives.serialization import Encoding as _Enc, PublicFormat as _PF
+    from cryptography.hazmat.primitives.asymmetric import ec as _cec, rsa as _crsa
+except ImportError:
+    _cx509 = None
+
+
+class _Cert:
+    """The DER of one certificate and the parts this generator reads."""
+
+    def __init__(self, der_bytes):
+        self.der = der_bytes
+        self.parts = _der.cert_parts(der_bytes)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, ".."))
@@ -48,15 +71,25 @@ def load(n):
         sys.exit("The BearSSL sample certificate %s was not found. Check that "
                  "RaspberryPi4/Reference/ holds the six cert-*.pem files from "
                  "BearSSL's samples directory." % p)
-    return x509.load_pem_x509_certificate(open(p, "rb").read())
+    text = open(p, "rb").read()
+    ders = _der.pem_certs(text.decode("ascii", "replace"))
+    if len(ders) != 1:
+        sys.exit("%s should hold exactly one certificate" % p)
+    c = _Cert(ders[0])
+    if _cx509 is not None:
+        ref = _cx509.load_pem_x509_certificate(text)
+        if ref.public_bytes(_Enc.DER) != c.der or ref.subject.public_bytes() != c.parts["subject"]:
+            sys.exit("the standard-library DER reader and the cryptography "
+                     "package disagree about %s" % p)
+    return c
 
 
 def der(c):
-    return c.public_bytes(Encoding.DER)
+    return c.der
 
 
 def subject_dn_der(c, full_der):
-    b = c.subject.public_bytes()
+    b = c.parts["subject"]
     if b not in full_der:
         sys.exit("The subject DN of a sample certificate does not appear "
                  "verbatim in its DER; check that the certificate file is the "
@@ -66,15 +99,26 @@ def subject_dn_der(c, full_der):
 
 def pubkey_of(c):
     """Return ('EC', curve_id, point_bytes) or ('RSA', n_bytes, e_bytes)."""
-    pk = c.public_key()
-    if isinstance(pk, ec.EllipticCurvePublicKey):
-        pt = pk.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
-        return ("EC", CURVE_ID[pk.curve.name], pt)
-    if isinstance(pk, rsa.RSAPublicKey):
-        nums = pk.public_numbers()
-        n = nums.n.to_bytes((nums.n.bit_length() + 7) // 8, "big")
-        e = nums.e.to_bytes((nums.e.bit_length() + 7) // 8, "big")
-        return ("RSA", n, e)
+    k = _der.spki_key(c.parts["spki"])
+    out = None
+    if k is not None and k["type"] == 2:
+        out = ("EC", k["curve"], k["a"])
+    elif k is not None and k["type"] == 1:
+        out = ("RSA", k["a"], k["b"])
+    if out is not None and _cx509 is not None:
+        pk = _cx509.load_der_x509_certificate(c.der).public_key()
+        if isinstance(pk, _cec.EllipticCurvePublicKey):
+            ref = ("EC", CURVE_ID[pk.curve.name],
+                   pk.public_bytes(_Enc.X962, _PF.UncompressedPoint))
+        else:
+            nums = pk.public_numbers()
+            ref = ("RSA", nums.n.to_bytes((nums.n.bit_length() + 7) // 8, "big"),
+                   nums.e.to_bytes((nums.e.bit_length() + 7) // 8, "big"))
+        if ref != out:
+            sys.exit("the standard-library key reader and the cryptography "
+                     "package disagree about a sample certificate")
+    if out is not None:
+        return out
     sys.exit("A sample certificate carries a key that is neither EC nor RSA; "
              "check the certificate files in RaspberryPi4/Reference/.")
 

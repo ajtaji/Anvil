@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The Pi 4 crypto image-size ladder.
 
-Nine cumulative images, each one adding one module to the one above it,
+Eleven cumulative images, each one adding one module to the one above it,
 so a module's code size is a DIFFERENCE that was measured rather than a
 line count that was guessed.  Every image is built by the same compiler
 with the same load/stack addresses the gates use, and every Main() calls
@@ -28,6 +28,8 @@ STACK = 0x03000000
 
 UART = 'XIncludeFile "RaspberryPi4/Lib/uart.pi4"'
 SHA = 'XIncludeFile "Anvil/Core/sha256.pbi"'
+SHA512 = 'XIncludeFile "Anvil/Crypto/sha512.pbi"'
+ECP = 'XIncludeFile "RaspberryPi4/Lib/ecp.pi4"'
 BN = 'XIncludeFile "RaspberryPi4/Lib/bignum.pi4"'
 EC = 'XIncludeFile "RaspberryPi4/Lib/ec256.pi4"'
 X255 = 'XIncludeFile "RaspberryPi4/Lib/x25519.pi4"'
@@ -59,6 +61,11 @@ CALL_SHA = """  Sha256Begin()
   Sha256Update(@szb[0], 32)
   Sha256End(@szb[0])
   Sha256Of(@szb[0], 32, @szb[0])"""
+CALL_SHA512 = """  Sha512Of(@szb[0], 32, @szb[0])
+  Sha384Of(@szb[0], 32, @szb[0])
+  Sha512Snapshot(@szb[0])
+  Sha512Restore(@szb[0])"""
+CALL_ECP = """  r = r + EcpVrfyRaw(24, @szb[0], 48, @szb[0], 97, @szb[0], 96)"""
 CALL_ECDSA = """  EcdsaInit()
   r = r + EcdsaVrfyRaw(@szb[0], 32, @szb[0], 65, @szb[0], 64)
   r = r + EcdsaVrfyAsn1(@szb[0], 32, @szb[0], 65, @szb[0], 70)
@@ -90,29 +97,37 @@ LADDER = [
     ("L4  + sha256",
      [UART, SHA, BN, EC, X255],
      [CALL_SHA, CALL_BN, CALL_EC, CALL_X255, CALL_UART], 0),
-    ("L5  + ecdsa",
-     [UART, SHA, BN, EC, X255, ECDSA],
-     [CALL_SHA, CALL_BN, CALL_EC, CALL_X255, CALL_ECDSA, CALL_UART], 0),
-    ("L6  + rsa",
-     [UART, SHA, BN, EC, X255, ECDSA, RSA],
-     [CALL_SHA, CALL_BN, CALL_EC, CALL_X255, CALL_ECDSA, CALL_RSA,
+    ("L5  + sha512 (SHA-384 and SHA-512)",
+     [UART, SHA, SHA512, BN, EC, X255],
+     [CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255, CALL_UART], 0),
+    ("L6  + ecp (P-384 / P-521)",
+     [UART, SHA, SHA512, BN, EC, X255, ECP],
+     [CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255, CALL_ECP,
       CALL_UART], 0),
-    ("L7  + t0vm",
-     [UART, T0, SHA, BN, EC, X255, ECDSA, RSA],
-     [CALL_T0, CALL_SHA, CALL_BN, CALL_EC, CALL_X255, CALL_ECDSA, CALL_RSA,
-      CALL_UART], 0),
-    ("L8  + x509_blob + x509, WHOLE SEAM LINKED (mode C)",
-     [UART, T0, SHA, BN, EC, X255, ECDSA, RSA, BLOB, X509],
-     [CALL_T0, CALL_SHA, CALL_BN, CALL_EC, CALL_X255, CALL_ECDSA, CALL_RSA,
-      CALL_X509, CALL_UART], 1),
+    ("L7  + ecdsa",
+     [UART, SHA, SHA512, BN, EC, X255, ECP, ECDSA],
+     [CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255, CALL_ECP,
+      CALL_ECDSA, CALL_UART], 0),
+    ("L8  + rsa",
+     [UART, SHA, SHA512, BN, EC, X255, ECP, ECDSA, RSA],
+     [CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255, CALL_ECP,
+      CALL_ECDSA, CALL_RSA, CALL_UART], 0),
+    ("L9  + t0vm",
+     [UART, T0, SHA, SHA512, BN, EC, X255, ECP, ECDSA, RSA],
+     [CALL_T0, CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255,
+      CALL_ECP, CALL_ECDSA, CALL_RSA, CALL_UART], 0),
+    ("L10 + x509_blob + x509, WHOLE SEAM LINKED (mode C)",
+     [UART, T0, SHA, SHA512, BN, EC, X255, ECP, ECDSA, RSA, BLOB, X509],
+     [CALL_T0, CALL_SHA, CALL_SHA512, CALL_BN, CALL_EC, CALL_X255,
+      CALL_ECP, CALL_ECDSA, CALL_RSA, CALL_X509, CALL_UART], 1),
 ]
 
 # One extra image, off the ladder: the stub build, so the cost of
 # LINKING the seam is a measurement and not an inference.
-STUB_IMAGE = ("S   uart + t0vm + sha256 + x509_blob + x509, "
+STUB_IMAGE = ("S   uart + t0vm + sha256 + sha512 + x509_blob + x509, "
               "SEAM UNLINKED (mode A)",
-              [UART, T0, SHA, BLOB, X509],
-              [CALL_T0, CALL_SHA, CALL_X509, CALL_UART], 0)
+              [UART, T0, SHA, SHA512, BLOB, X509],
+              [CALL_T0, CALL_SHA, CALL_SHA512, CALL_X509, CALL_UART], 0)
 
 
 def build(name, includes, calls, linked, tag):

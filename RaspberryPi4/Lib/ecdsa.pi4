@@ -8,10 +8,14 @@
 ;
 ;     XIncludeFile "RaspberryPi4/Lib/bignum.pi4"   ; REQUIRED, first
 ;     XIncludeFile "RaspberryPi4/Lib/ec256.pi4"    ; REQUIRED, second
+;     XIncludeFile "RaspberryPi4/Lib/ecp.pi4"      ; REQUIRED, third
 ;     XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
 ;
 ;  ECDSA signature verification on the NIST P-256 (secp256r1) curve, in
-;  both signature encodings a TLS client meets:
+;  both signature encodings a TLS client meets - and, through the
+;  certificate seam EcdsaVrfy, on P-384 and P-521 as well (2026-10-14:
+;  the curve arithmetic for those two is ecp.pi4's; the DER walk, the
+;  seam and the verdict conventions are this file's for all three):
 ;    * RAW  - r || s, two fixed-width big-endian integers (64 bytes for
 ;             P-256).  Used by TLS 1.2's own signature format in some
 ;             profiles and by the NIST CAVP vector files.
@@ -23,8 +27,9 @@
 ;  followed.  VERIFY ONLY - there is no private key, no signing, no
 ;  nonce, and no random number generator anywhere in this file.
 ;
-;  REQUIRES bignum.pi4 AND ec256.pi4, INCLUDED BEFORE THIS FILE, IN THAT
-;  ORDER.  A library never includes a library (house rule 10 - the MAIN
+;  REQUIRES bignum.pi4, ec256.pi4 AND ecp.pi4, INCLUDED BEFORE THIS
+;  FILE, IN THAT ORDER (ecp.pi4 since 2026-10-14; it computes P-384 and
+;  P-521 for EcdsaVrfy and has no dependency of its own).  A library never includes a library (house rule 10 - the MAIN
 ;  file lists them, one per line, in order).  The modular arithmetic on
 ;  the curve order rides bignum's i15 core (BnDecode, BnEncode, BnSub,
 ;  BnZero, BnRshift, BnIsZero, BnNinv15, BnMontmul, BnFromMonty,
@@ -62,8 +67,10 @@
 ;        path validator calls; when this file is present ahead of it and
 ;        the main defines #X509_SIG_LINKED = 1, the validator's stub is
 ;        compiled out and its ECDSA verdicts go live.  curve is the named
-;        curve id: 23 = P-256 (implemented), 24 = P-384, 25 = P-521.
-;        The signature is ASN.1 DER, as it is in a certificate.
+;        curve id: 23 = P-256, 24 = P-384, 25 = P-521 - all three
+;        implemented since 2026-10-14 (24 and 25 by ecp.pi4); any other
+;        id answers -1.  The signature is ASN.1 DER, as it is in a
+;        certificate.
 ;
 ;    EcdsaLastErr - the reason for the last answer, for diagnosis only:
 ;        0 valid, 1 signature rejected, 2 curve not supported,
@@ -77,13 +84,13 @@
 ;  > caller that tests an ECDSA verdict as "non-zero" ACCEPTS -1, which
 ;  > means it treats "I cannot compute this curve" as "valid".
 ;
-;  P-384 AND P-521 ARE NOT IMPLEMENTED, AND SAY SO.  A request for curve
-;  24 or 25 returns -1 with EcdsaLastErr = 2.  It never returns 0,
-;  because 0 means "this signature is bad" and answering that about a
-;  curve this module cannot compute would be a wrong answer wearing a
-;  verdict's clothes.  The path validator turns -1 into its loud
-;  "signature engine cannot answer" verdict rather than accepting or
-;  rejecting the chain.
+;  A CURVE THIS MODULE CANNOT COMPUTE SAYS SO.  Until 2026-10-14 that was
+;  P-384 and P-521; ecp.pi4 now computes both, and the rule stands for
+;  every other curve id: -1 with EcdsaLastErr = 2, never 0, because 0
+;  means "this signature is bad" and answering that about a curve this
+;  module cannot compute would be a wrong answer wearing a verdict's
+;  clothes.  The path validator turns -1 into its loud "signature engine
+;  cannot answer" verdict rather than accepting or rejecting the chain.
 ;
 ;  NOT CONSTANT TIME, AND IT DOES NOT NEED TO BE.  Everything this file
 ;  touches is public: the signature travelled in clear on the wire, the
@@ -810,13 +817,44 @@ EndProcedure
 ;  in a certificate. An unimplemented curve returns -1, never 0: "I
 ;  cannot compute this" and "this signature is forged" are different
 ;  answers and only one of them is true.
+;
+;  THREE CURVES ANSWER. P-256 (23) is this file's own i15 path over
+;  ec256.pi4, unchanged. P-384 (24) and P-521 (25) go to ecp.pi4's
+;  EcpVrfyRaw, after the DER has been turned into r||s by THIS file's
+;  strict parser - one DER parser for every curve, so the refusals
+;  listed in the header hold for all three. A P-521 signature body is
+;  longer than 127 bytes, so it is the one curve whose SEQUENCE always
+;  takes the single long form 0x81 the parser accepts. Every other id is
+;  still -1.
 ; ----------------------------------------------------------------------
 Procedure.i EcdsaVrfy(curve.i, hashAddr.i, hashLen.i, qAddr.i, qLen.i, sigAddr.i, sigLen.i)
-  If curve <> #ECDSA_CURVE_P256
+  Protected i.i
+  Protected rawLen.i
+  Protected r.i
+  If curve = #ECDSA_CURVE_P256
+    ProcedureReturn EcdsaVrfyAsn1(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+  EndIf
+  If curve <> #ECDSA_CURVE_P384 And curve <> #ECDSA_CURVE_P521
     EcdsaLastErr = #ECDSA_ERR_CURVE
     ProcedureReturn -1
   EndIf
-  ProcedureReturn EcdsaVrfyAsn1(hashAddr, hashLen, qAddr, qLen, sigAddr, sigLen)
+  EcdsaLastErr = #ECDSA_ERR_MALFORMED
+  If sigLen <= 0 Or sigLen > #ECDSA_SIGMAX
+    ProcedureReturn 0
+  EndIf
+  i = 0
+  While i < sigLen
+    PokeB(@EcdsaRsig + i, PeekA(sigAddr + i) & 255)
+    i = i + 1
+  Wend
+  rawLen = EcdsaAsn1ToRaw(@EcdsaRsig, sigLen)
+  If rawLen = 0
+    EcdsaLastErr = #ECDSA_ERR_MALFORMED
+    ProcedureReturn 0
+  EndIf
+  r = EcpVrfyRaw(curve, hashAddr, hashLen, qAddr, qLen, @EcdsaRsig, rawLen)
+  EcdsaLastErr = EcpLastErr
+  ProcedureReturn r
 EndProcedure
 
 ; ----------------------------------------------------------------------

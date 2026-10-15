@@ -630,6 +630,7 @@ a4 69 32 fc 32 25 d0 5f 82 aa 1b 36 e3 0e fa f9 7d 90 e6 df fc 60 2d cb
 INCLUDES = """EnableExplicit
 #X509_SIG_LINKED = 1
 XIncludeFile "Anvil/Core/sha256.pbi"
+XIncludeFile "Anvil/Crypto/sha512.pbi"
 XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
 XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
 XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
@@ -639,6 +640,7 @@ XIncludeFile "__GCM__"
 XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
 XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
 XIncludeFile "RaspberryPi4/Lib/x25519.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
 XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
 XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
 XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
@@ -748,6 +750,8 @@ Procedure.i Op(op.i)
       r = HServerRecord(HA(0), HA(1), HA(2), HA(3))
     Case 35
       r = Tls13Connected()
+    Case 41
+      r = TlsHandleCertificateVerify(HA(0), HA(1))
     Case 40
       TlsKdfFault = 0
       TlsExpandLabel(@secTlsSAp[0], @TlsLbl[#TLS_L_UPD], #TLS_L_UPD_N, 0, 0, HA(0), HA(1))
@@ -900,6 +904,7 @@ R = dict(  # the #TLS13_REFUSE_* table
     NOT_TLS13=37, NO_KEY_SHARE=38, PSK_OFFERED=41, EARLY_DATA_ACCEPTED=50,
     UNOFFERED_EXTENSION=51, EXT_NOT_ALLOWED_HERE=52, CERT_EXTENSION_UNSOLICITED=63,
     CHAIN_INVALID=64, SIGALG_PKCS1_IN_CV=71, SIGNATURE_INVALID=73, FINISHED_MISMATCH=81,
+    SIGALG_NOT_OFFERED=70, SIGALG_KEY_MISMATCH=72,
     CLIENT_AUTH_REQUESTED=90, KEY_UPDATE_BAD_REQUEST=92, KEY_UPDATE_LENGTH=93,
     POST_HS_UNKNOWN=94,
 )
@@ -1449,6 +1454,15 @@ def job_client_hello(m, k):
     while p < n:
         et, el = (o[p] << 8) | o[p + 1], (o[p + 2] << 8) | o[p + 3]
         p += 4
+        if et == 13:
+            # signature_algorithms: every scheme x509 and the
+            # CertificateVerify handler can check, and nothing else
+            # (RFC 8446 4.2.3 - with no signature_algorithms_cert this one
+            # list governs the certificates too).
+            lst = [(o[p + 2 + 2 * i] << 8) | o[p + 3 + 2 * i]
+                   for i in range(((o[p] << 8) | o[p + 1]) // 2)]
+            k.eq("signature_algorithms offered", lst,
+                 [0x0403, 0x0503, 0x0603, 0x0804, 0x0401, 0x0501, 0x0601])
         if et == 51:
             k.eq("key_share group x25519", (o[p + 2] << 8) | o[p + 3], C["X25519"])
             k.eq("key_share length 32", (o[p + 4] << 8) | o[p + 5], 32)
@@ -1502,12 +1516,100 @@ def job_p256(m, k):
     k.eq("scalar n-1 in range", m.op(29), 1)
 
 
+# ---------------------------------------------------------------- T10
+#  THE ECDSA CERTIFICATEVERIFY SCHEMES ON P-384 AND P-521 (2026-10-14).
+#  RFC 8446 4.4.3: the server signs 64 spaces, the context string, a 0x00
+#  and Transcript-Hash(ClientHello..Certificate), with the scheme's own
+#  hash - SHA-384 for ecdsa_secp384r1_sha384, SHA-512 for
+#  ecdsa_secp521r1_sha512 - and in TLS 1.3 the scheme also names the
+#  CURVE. The handler is driven directly (Op 41) with the end-entity key
+#  x509 would have handed back written into x509's own globals, because
+#  no trace in RFC 8448 carries an ECDSA server. The signature is made
+#  here by an independent pure-Python FIPS 186-4 signer over the curve
+#  constants that tools/a64/a64_ecp_check.py proves equal to OpenSSL's.
+CV_CTX = b" " * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00"
+
+
+def _cv_case(m, k, curve, alg, digest, key_curve=None, tamper=False,
+             expect=1, err=None, label=""):
+    import hashlib as _h
+    sys.path.insert(0, str(ROOT / "tools" / "a64"))
+    import a64_ecp_check as ecpg  # noqa: E402
+    import gen_ecp_vectors as gen  # noqa: E402
+    name, lab, L, _nl = ecpg.CURVES[curve]
+    c = ecpg.table_bytes(ecpg.LIB.read_text(encoding="utf-8"), lab, L)
+    c = dict(c, a=c["p"] - 3, L=L)
+    d = int.from_bytes(_h.sha512(b"anvil cv key " + name.encode()).digest(), "big") % (c["n"] - 1) + 1
+    Q = gen.pt_mul(d, (c["gx"], c["gy"]), c)
+    q = b"\x04" + Q[0].to_bytes(L, "big") + Q[1].to_bytes(L, "big")
+    th = _h.sha256(b"anvil transcript " + name.encode()).digest()
+    hsh = _h.new(digest, CV_CTX + th).digest()
+    r, s = gen.py_sign(d, hsh, c)
+    if not gen.py_verify(q, hsh, r, s, c):
+        raise Fail("the Python signer made a signature its own verifier refuses")
+    sig = bytearray(gen.der_sig(r, s))
+    if tamper:
+        sig[-1] ^= 1
+    body = alg.to_bytes(2, "big") + len(sig).to_bytes(2, "big") + bytes(sig)
+    msg = bytes([15]) + len(body).to_bytes(3, "big") + body
+    snap = m.snapshot()
+    m.setgb("TlsThCert", th)
+    m.setg("X509EePkeyType", 2)
+    m.setg("X509EeCurve", key_curve or curve)
+    m.put_at(TMP, q)
+    m.setg("X509EeQAddr", TMP)
+    m.setg("X509EeQLen", len(q))
+    m.put_at(MSG, msg)
+    m.setg("Tls13State", 5)                       # WAIT_CV
+    got = m.op(41, MSG, len(msg))
+    k.eq(label + ": handler verdict", got, expect)
+    if expect == 1:
+        k.eq(label + ": state WAIT_FINISHED", m.g("Tls13State"), 6)
+    else:
+        k.eq(label + ": state FAILED", m.g("Tls13State"), C["ST_FAILED"])
+        k.eq(label + ": refusal named", m.g("Tls13Err"), R[err])
+    m.restore(snap)
+
+
+def _cv_setup(m):
+    for i, b in enumerate(b"rsa"):
+        m.put_at(NAME + i, bytes([b]))
+    m.op(11)
+    m.op(12, 0, m.addr["AnchorDn"], len(m.V["AnchorDn"]), m.addr["AnchorN"],
+         len(m.V["AnchorN"]), m.addr["AnchorE"], len(m.V["AnchorE"]))
+    m.op(13, HSBUF, HSBUF_N)
+    m.op(14, C["X25519"])
+    if m.op(15, NAME, 3, TIME_OK) != 1:
+        raise Fail("Tls13Init refused")
+
+
+def job_cv_p384(m, k):
+    _cv_setup(m)
+    _cv_case(m, k, 24, 0x0503, "sha384", label="ecdsa_secp384r1_sha384, valid")
+    _cv_case(m, k, 24, 0x0503, "sha384", tamper=True, expect=0,
+             err="SIGNATURE_INVALID", label="ecdsa_secp384r1_sha384, s tampered")
+    # the scheme names the curve: a P-256 key under 0x0503 is refused
+    # before any arithmetic, by name
+    _cv_case(m, k, 24, 0x0503, "sha384", key_curve=23, expect=0,
+             err="SIGALG_KEY_MISMATCH", label="0x0503 with a P-256 end-entity key")
+
+
+def job_cv_p521(m, k):
+    _cv_setup(m)
+    _cv_case(m, k, 25, 0x0603, "sha512", label="ecdsa_secp521r1_sha512, valid")
+    _cv_case(m, k, 25, 0x0603, "sha512", key_curve=24, expect=0,
+             err="SIGALG_KEY_MISMATCH", label="0x0603 with a P-384 end-entity key")
+    _cv_case(m, k, 25, 0x0601, "sha512", expect=0, err="SIGALG_PKCS1_IN_CV",
+             label="rsa_pkcs1_sha512 in CertificateVerify")
+
+
 JOBS = [
     ("early", job_early), ("record", job_record), ("handshake", job_handshake), ("sh-refusals", job_sh_refusals),
     ("flight-a", job_flight_a), ("flight-b", job_flight_b), ("policy", job_policy),
     ("dispatch-a", job_dispatch_a), ("dispatch-b", job_dispatch_b),
     ("dispatch-c", job_dispatch_c), ("kdf-fault", job_kdf_fault),
     ("client-hello", job_client_hello), ("p256", job_p256),
+    ("cv-p384", job_cv_p384), ("cv-p521", job_cv_p521),
 ]
 
 

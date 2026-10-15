@@ -17,6 +17,7 @@
 ;
 ;     #X509_SIG_LINKED = 1
 ;     XIncludeFile "Anvil/Core/sha256.pbi"
+;     XIncludeFile "Anvil/Crypto/sha512.pbi"
 ;     XIncludeFile "RaspberryPi4/Lib/hmac.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/hkdf.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/entropy.pi4"
@@ -26,6 +27,7 @@
 ;     XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/x25519.pi4"
+;     XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/ecdsa.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/rsa.pi4"
 ;     XIncludeFile "RaspberryPi4/Lib/t0vm.pi4"
@@ -56,9 +58,10 @@
 ;     ANCHOR.
 ;
 ;  SCOPE. TLS_AES_128_GCM_SHA256 only; key exchange x25519 (default) or
-;  secp256r1; CertificateVerify ecdsa_secp256r1_sha256 or
-;  rsa_pss_rsae_sha256 (rsa_pkcs1_sha256 is offered for CERTIFICATE
-;  signatures only and refused in CertificateVerify). NOT implemented,
+;  secp256r1; CertificateVerify ecdsa_secp256r1_sha256,
+;  ecdsa_secp384r1_sha384, ecdsa_secp521r1_sha512 (2026-10-14) or
+;  rsa_pss_rsae_sha256 (rsa_pkcs1_sha256/384/512 are offered for
+;  CERTIFICATE signatures only and refused in CertificateVerify). NOT implemented,
 ;  each refused by name: PSK / resumption, 0-RTT, HelloRetryRequest (so a
 ;  server that will not use x25519 or secp256r1 cannot be reached), client
 ;  certificates, a synthetic message_hash on the wire. A post-handshake
@@ -218,7 +221,11 @@
 #TLS_GROUP_X25519    = $001D
 
 #TLS_SIG_ECDSA_P256_SHA256   = $0403
+#TLS_SIG_ECDSA_P384_SHA384   = $0503
+#TLS_SIG_ECDSA_P521_SHA512   = $0603
 #TLS_SIG_RSA_PKCS1_SHA256    = $0401   ; certificates only - never in CV
+#TLS_SIG_RSA_PKCS1_SHA384    = $0501   ; certificates only - never in CV
+#TLS_SIG_RSA_PKCS1_SHA512    = $0601   ; certificates only - never in CV
 #TLS_SIG_RSA_PSS_RSAE_SHA256 = $0804
 
 #TLS_HS_CLIENT_HELLO         = 1
@@ -431,7 +438,8 @@ Global TlsCertCount.i
 
 ; --- scratch ---
 Global Dim TlsScratch.a[72]          ; basepoint / P-256 point / small message work
-Global Dim TlsMsgHash.a[32]          ; the CertificateVerify message hash
+Global Dim TlsMsgHash.a[64]          ; the CertificateVerify message hash
+                                     ; (32, 48 or 64 bytes by scheme)
 Global Dim TlsVerifyData.a[32]
 Global Dim TlsHrrRandom.a[32]        ; the RFC 8446 4.1.3 HRR sentinel
 Global Dim TlsP256Order.a[32]        ; the P-256 group order n
@@ -1117,15 +1125,26 @@ Procedure.i Tls13BuildClientHello(dst.i, dstmax.i)
   TlsWr16(p, g2) : p = p + 2
   TlsNoteOffered(#TLS_EXT_SUPPORTED_GROUPS)
 
-  ; ---- signature_algorithms. rsa_pkcs1_sha256 is listed because chains
-  ;      are still signed with it; RFC 8446 4.4.3 forbids it in
-  ;      CertificateVerify, and this client refuses it there by name. ----
+  ; ---- signature_algorithms. With no signature_algorithms_cert sent,
+  ;      RFC 8446 4.2.3 makes this ONE list govern both the
+  ;      CertificateVerify and the certificate signatures, so it names
+  ;      everything x509 can verify: ECDSA on P-256, P-384 and P-521 with
+  ;      their own hashes, RSA-PSS with SHA-256, and PKCS#1 v1.5 with
+  ;      SHA-256/384/512 - the last three because chains are still signed
+  ;      with them; RFC 8446 4.4.3 forbids PKCS#1 in CertificateVerify,
+  ;      and this client refuses it there by name. rsa_pss_rsae_sha384 /
+  ;      sha512 are NOT offered: rsa.pi4's PSS is SHA-256 only, and every
+  ;      RSA server must accept rsa_pss_rsae_sha256 (RFC 8446 9.1). ----
   TlsWr16(p, #TLS_EXT_SIGNATURE_ALGORITHMS) : p = p + 2
-  TlsWr16(p, 8) : p = p + 2
-  TlsWr16(p, 6) : p = p + 2
+  TlsWr16(p, 16) : p = p + 2
+  TlsWr16(p, 14) : p = p + 2
   TlsWr16(p, #TLS_SIG_ECDSA_P256_SHA256) : p = p + 2
+  TlsWr16(p, #TLS_SIG_ECDSA_P384_SHA384) : p = p + 2
+  TlsWr16(p, #TLS_SIG_ECDSA_P521_SHA512) : p = p + 2
   TlsWr16(p, #TLS_SIG_RSA_PSS_RSAE_SHA256) : p = p + 2
   TlsWr16(p, #TLS_SIG_RSA_PKCS1_SHA256) : p = p + 2
+  TlsWr16(p, #TLS_SIG_RSA_PKCS1_SHA384) : p = p + 2
+  TlsWr16(p, #TLS_SIG_RSA_PKCS1_SHA512) : p = p + 2
   TlsNoteOffered(#TLS_EXT_SIGNATURE_ALGORITHMS)
 
   ; ---- supported_versions: 1.3 and nothing else. There is no version
@@ -1549,15 +1568,46 @@ Procedure.i TlsHandleCertificateVerify(msg.i, mlen.i)
 
   ; ---- the RFC 8446 4.4.3 signed content: 64 spaces, the context
   ;      string, a 0x00 separator, then Transcript-Hash(CH..Certificate).
-  ;      Hashed here, streamed rather than buffered; the running
-  ;      transcript is a snapshot so this is free to use the hasher. ----
+  ;      Hashed here, streamed rather than buffered, with the SCHEME's
+  ;      hash - SHA-256 for 0403/0804, SHA-384 for 0503, SHA-512 for 0603
+  ;      (the transcript hash inside it is the suite's SHA-256 either
+  ;      way). The running transcript is a snapshot, so this is free to
+  ;      use the hashers. ----
   Sha256Begin()
   Sha256Update(@TlsCvCtx[0], 98)
   Sha256Update(@TlsThCert[0], 32)
   Sha256End(@TlsMsgHash[0])
 
   ok = 0
-  If alg = #TLS_SIG_RSA_PSS_RSAE_SHA256
+  If alg = #TLS_SIG_ECDSA_P384_SHA384 Or alg = #TLS_SIG_ECDSA_P521_SHA512
+    ; RFC 8446 4.2.3: in TLS 1.3 an ECDSA scheme names its CURVE as well
+    ; as its hash, so the end-entity key must be on exactly that curve.
+    If X509EePkeyType <> 2
+      ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_KEY_MISMATCH, #TLS_ALERT_ILLEGAL_PARAMETER)
+    EndIf
+    If alg = #TLS_SIG_ECDSA_P384_SHA384
+      If X509EeCurve <> 24
+        ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_KEY_MISMATCH, #TLS_ALERT_ILLEGAL_PARAMETER)
+      EndIf
+      Sha384Begin()
+      Sha384Update(@TlsCvCtx[0], 98)
+      Sha384Update(@TlsThCert[0], 32)
+      Sha384End(@TlsMsgHash[0])
+      ok = EcdsaVrfy(24, @TlsMsgHash[0], 48, X509EeQAddr, X509EeQLen, sig, slen)
+    Else
+      If X509EeCurve <> 25
+        ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_KEY_MISMATCH, #TLS_ALERT_ILLEGAL_PARAMETER)
+      EndIf
+      Sha512Begin()
+      Sha512Update(@TlsCvCtx[0], 98)
+      Sha512Update(@TlsThCert[0], 32)
+      Sha512End(@TlsMsgHash[0])
+      ok = EcdsaVrfy(25, @TlsMsgHash[0], 64, X509EeQAddr, X509EeQLen, sig, slen)
+    EndIf
+    If ok < 0
+      ok = 0
+    EndIf
+  ElseIf alg = #TLS_SIG_RSA_PSS_RSAE_SHA256
     If X509EePkeyType <> 1
       ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_KEY_MISMATCH, #TLS_ALERT_ILLEGAL_PARAMETER)
     EndIf
@@ -1577,10 +1627,10 @@ Procedure.i TlsHandleCertificateVerify(msg.i, mlen.i)
     If ok < 0
       ok = 0
     EndIf
-  ElseIf alg = #TLS_SIG_RSA_PKCS1_SHA256
+  ElseIf alg = #TLS_SIG_RSA_PKCS1_SHA256 Or alg = #TLS_SIG_RSA_PKCS1_SHA384 Or alg = #TLS_SIG_RSA_PKCS1_SHA512
     ; RFC 8446 4.4.3: "RSASSA-PKCS1-v1_5 algorithms ... MUST NOT be used
-    ; in CertificateVerify". It is offered for CERTIFICATES only. This is
-    ; its own refusal so the log says what actually happened.
+    ; in CertificateVerify". They are offered for CERTIFICATES only. This
+    ; is its own refusal so the log says what actually happened.
     ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_PKCS1_IN_CV, #TLS_ALERT_ILLEGAL_PARAMETER)
   Else
     ProcedureReturn TlsFail(#TLS13_REFUSE_SIGALG_NOT_OFFERED, #TLS_ALERT_ILLEGAL_PARAMETER)
