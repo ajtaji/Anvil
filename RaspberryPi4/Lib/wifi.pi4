@@ -2397,6 +2397,35 @@ Procedure WifiEpManualFailed(which.i, stage.i)
   EndIf
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  wifi_RecLinkInfo - WHICH access point, on WHICH channel, at what signal
+;  (2026-10-15). The log recorded channels 2, 7, 2, 5 at joins for a router
+;  that stays on 2, and join signals alternating near -30 and -57 dBm, while
+;  `wifi chan` showed the radio never leaving channel 2 once joined. So at
+;  every join and every loss the ring now keeps the radio's hardware AND
+;  target channel (ioctl 29's whole reply), the RSSI and the BSSID: the next
+;  drop says whether the board joined the wrong AP / channel, or lost a
+;  good link. Read-only firmware queries, 200 ms each.
+; ----------------------------------------------------------------------
+Procedure wifi_RecLinkInfo()
+  Define r.i
+  If Cyw43ReadChannelInfo(200) = #CYW43_IO_OK
+    gWifiLastChan = cyw43_chHw
+    If Cyw43ReadRssi(200) = #CYW43_IO_OK
+      gWifiLastRssi = cyw43_linkRssi
+    EndIf
+    WifiRec(#WR_LINKINFO, cyw43_chHw * 100 + cyw43_chTarget, gWifiLastRssi)
+  EndIf
+  ; Cyw43ReadBssid answers 1 associated / 0 not associated (-17) / -1 other -
+  ; NOT #CYW43_IO_OK. A loss is recorded as a = -1, b = that answer.
+  r = Cyw43ReadBssid(200)
+  If r <> 1
+    WifiRec(#WR_BSSID, -1, r)
+  Else
+    WifiRec(#WR_BSSID, (Cyw43LinkBssidByte(0) << 16) | (Cyw43LinkBssidByte(1) << 8) | Cyw43LinkBssidByte(2), (Cyw43LinkBssidByte(3) << 16) | (Cyw43LinkBssidByte(4) << 8) | Cyw43LinkBssidByte(5))
+  EndIf
+EndProcedure
+
 ; The link has an address again: the episode ends, saved with what it took.
 Procedure wifi_EpRecovered()
   WifiRec(#WR_REC_OK, gWifiIp, gWifiEpFails)
@@ -3617,12 +3646,7 @@ Procedure WifiRecoveryTick()
       ElseIf r = #CYW43_JOIN_JOINED
         ; the flight recorder: the channel and signal this attempt joined on, and the frame
         ; counts at that moment (the loss that may follow says how many came after it)
-        If Cyw43ReadChannel(200) = #CYW43_IO_OK
-          gWifiLastChan = cyw43_linkChannel
-        EndIf
-        If Cyw43ReadRssi(200) = #CYW43_IO_OK
-          gWifiLastRssi = cyw43_linkRssi
-        EndIf
+        wifi_RecLinkInfo()
         gWifiRecJoinAt = millis() : gWifiRecJoinRx = cyw43_rxData : gWifiRecJoinTx = cyw43_txFrames
         WifiRec(#WR_JOIN, gWifiLastChan, gWifiLastRssi)
         gWifiRecPhase = #WIFI_REC_VERIFY_SSID
@@ -3972,6 +3996,7 @@ Procedure WifiLinkTick()
     et = gWifiTdType
     er = gWifiTdReason
     gWifiVerify = 0
+    wifi_RecLinkInfo()
     wifi_EpFail(#WR_TEARDOWN, et, er, "the radio reported the link gone (event type and 802.11 reason in the last line; LINK reason 1 = the access point's beacons were lost)")
     Print("Wi-Fi: the radio reports ")
     UartWriteStr(Cyw43EventName(et))
@@ -4097,6 +4122,7 @@ Procedure WifiLinkTick()
     WifiRec(#WR_ASSOC_POLL, assoc, gWifiBadReads)
     If gWifiBadReads >= #WIFI_LINK_STRIKES
       gWifiBadReads = 0
+      wifi_RecLinkInfo()
       wifi_EpFail(#WR_ASSOC_POLL, assoc, #WIFI_LINK_STRIKES, "the firmware says the board is no longer associated")
       If gWifiHealOn <> 0
         WifiRecoveryStart(1)
@@ -4118,6 +4144,7 @@ Procedure WifiLinkTick()
   ; the receive side busy the whole time, and only the missing round
   ; trip gave it away.
   If gWifiKaProbes >= 2 And (now - gWifiRxProof) >= #WIFI_PROOF_MS
+    wifi_RecLinkInfo()
     wifi_EpFail(#WR_TXONLY, gWifiKaProbes, now - gWifiRxProof, "TX-only dead: the gateway stopped answering the keepalives while the firmware still claimed the association")
     PrintN("Wi-Fi: the gateway has stopped answering this board's keepalives -")
     PrintN("the firmware still claims the association, but nothing sent out is")

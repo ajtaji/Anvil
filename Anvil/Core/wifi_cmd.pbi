@@ -640,6 +640,33 @@ Procedure CmdWifi()
     ProcedureReturn
   EndIf
 
+  ; chan [n] - sample the firmware's channel reply n times (default 100),
+  ; 50 ms apart: hardware / target / scan channel. Read-only. Answers
+  ; whether the radio leaves the association's channel (2026-10-15).
+  If WordIs("chan") <> 0 Or WordIs("channel") <> 0
+    Define chN.i, chI.i, chOff.i, chFail.i, chHw0.i, chTg0.i
+    chN = ParseDec()
+    If gParseOk = 0 Or chN < 1 : chN = 100 : EndIf
+    If chN > 2000 : chN = 2000 : EndIf
+    chOff = 0 : chFail = 0
+    For chI = 1 To chN
+      If Cyw43ReadChannelInfo(200) <> 0
+        chFail = chFail + 1
+      Else
+        If chI = 1 Or cyw43_chHw <> cyw43_chTarget Or cyw43_chScan > 0
+          Print("  #") : PrintDec(chI) : Print("  hw ") : PrintDec(cyw43_chHw)
+          Print("  target ") : PrintDec(cyw43_chTarget) : Print("  scan ") : PrintDec(cyw43_chScan)
+          Print("  (reply ") : PrintDec(cyw43_chLen) : PrintN(" bytes)")
+        EndIf
+        If cyw43_chHw <> cyw43_chTarget : chOff = chOff + 1 : EndIf
+      EndIf
+      delay(50)
+    Next
+    Print("wifi chan: ") : PrintDec(chN) : Print(" samples, hardware off the target channel in ")
+    PrintDec(chOff) : Print(", read failures ") : PrintDec(chFail) : PrintNl()
+    ProcedureReturn
+  EndIf
+
   ; drop - the test hook. Really disassociate, then let the automatic
   ; health check detect it and reconnect. This proves the whole loop on
   ; silicon without waiting for a two-hour idle-out.
