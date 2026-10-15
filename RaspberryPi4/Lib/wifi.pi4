@@ -408,16 +408,14 @@ CompilerEndIf
   ;  the receiver stays on. "A board that is joined but cannot be
   ;  reached is not joined."
   ; --------------------------------------------------------------
-  r = Cyw43SetRoamOff(1, 2000)
+  r = Cyw43ConfigLikeRaspbian(2000)
   If r <> 0
-    Print("Wi-Fi: the firmware would not turn its own roaming off (")
-    PrintDec(r)
-    PrintN("). It may")
-    PrintN("   move the association by itself; a roam is reported and re-joined.")
+    Print("Wi-Fi: ") : PrintDec(r) : PrintN(" of the Raspberry Pi OS radio settings were refused (wifi rpicfg lists them).")
   EndIf
-  r = Cyw43SetPowerMode(#CYW43_PM_OFF, 2000)
+  ; roam_off is item 6 of Cyw43ConfigLikeRaspbian above.
+  r = Cyw43SetPowerMode(#CYW43_PM_FAST, 2000)
   If r <> 0
-    Print("Wi-Fi: the firmware would not turn power save off (")
+    Print("Wi-Fi: the firmware would not set power save (PM_FAST, as Raspberry Pi OS) (")
     PrintDec(r)
     PrintN("). The radio")
     PrintN("   may doze between beacons, which costs latency, not the link.")
@@ -1409,6 +1407,7 @@ Procedure wifi_BindAddress(ip.i, mask.i, gw.i)
   ; path, silently.
   NetSetMac(#HW_LINK_WIFI, @wifi_ourMac[0])
   NetSetIPv4(#HW_LINK_WIFI, ip, mask, gw)
+  Cyw43ArpHostIp(ip, 500)               ; brcmf_inetaddr_changed NETDEV_UP (2026-10-15)
   ; ------------------------------------------------------------------
   ; AND RECORD WHERE THE ADDRESS CAME FROM, 2026-09-07.
   ;
@@ -1488,6 +1487,7 @@ Procedure WifiAdoptAddress(ip.i, mask.i, gw.i)
     gWifiMask = 0
     gWifiGw = 0
     gWifiHaveIp = 0
+    Cyw43ArpHostIp(0, 500)              ; brcmf_inetaddr_changed NETDEV_DOWN (2026-10-15)
     ProcedureReturn
   EndIf
   gWifiIp   = ip
@@ -1796,6 +1796,7 @@ Procedure WifiDrainEvents()
     gWifiEvtLast = millis()
     gWifiEvtType = et
     gWifiEvtReason = er
+    WifiRec(#WR_FWEVENT, et, er)        ; every event, for the flight recorder (2026-10-15)
 
     down = 0
     If et = #CYW43_EV_DEAUTH Or et = #CYW43_EV_DEAUTH_IND Or et = #CYW43_EV_DISASSOC_IND
@@ -2426,9 +2427,57 @@ Procedure wifi_RecLinkInfo()
   EndIf
 EndProcedure
 
+; ----------------------------------------------------------------------
+;  THE POST-JOIN WATCH (Ron, 2026-10-15: "yes build and install it"). In the
+;  flapping bursts the link is lost about 12 s after every good join (router
+;  04:42:1A:A5:BC:90, channel 2, -30 dBm), and nothing was recorded between
+;  "joined" and "lost". For 15 s after the link gets its address, the radio's
+;  hardware / target channel and RSSI are sampled every 0.5 s into the ring
+;  (#WR_WATCH), and every firmware event is recorded (#WR_FWEVENT, in
+;  WifiDrainEvents). The next burst then shows whether the radio leaves
+;  channel 2 BEFORE the loss, or stays and stops hearing beacons. Read-only
+;  firmware queries, only while keyed and addressed (the keepalive's state).
+; ----------------------------------------------------------------------
+#WIFI_WATCH_MS = 15000
+#WIFI_WATCH_EVERY_MS = 500
+Global gWifiWatchUntil.i, gWifiWatchNext.i, gWifiWatchOn.i
+
+Procedure wifi_WatchStart()
+  gWifiWatchOn = 1
+  gWifiWatchUntil = (millis() + #WIFI_WATCH_MS) & $FFFFFFFF
+  gWifiWatchNext = millis()
+EndProcedure
+
+Procedure wifi_WatchTick()
+  Define now.i
+  Define rssi.i
+  If gWifiWatchOn = 0
+    ProcedureReturn
+  EndIf
+  now = millis()
+  If ((now - gWifiWatchUntil) & $FFFFFFFF) < $80000000
+    gWifiWatchOn = 0
+    ProcedureReturn
+  EndIf
+  If ((now - gWifiWatchNext) & $FFFFFFFF) >= $80000000
+    ProcedureReturn
+  EndIf
+  gWifiWatchNext = (now + #WIFI_WATCH_EVERY_MS) & $FFFFFFFF
+  rssi = 0
+  If Cyw43ReadRssi(200) = #CYW43_IO_OK
+    rssi = cyw43_linkRssi
+  EndIf
+  If Cyw43ReadChannelInfo(200) = #CYW43_IO_OK
+    WifiRec(#WR_WATCH, cyw43_chHw * 100 + cyw43_chTarget, rssi)
+  Else
+    WifiRec(#WR_WATCH, -1, rssi)
+  EndIf
+EndProcedure
+
 ; The link has an address again: the episode ends, saved with what it took.
 Procedure wifi_EpRecovered()
   WifiRec(#WR_REC_OK, gWifiIp, gWifiEpFails)
+  wifi_WatchStart()
   If gWifiEp <> 0
     gWifiEp = 0
     WifiRecSave("RECOVERED - the link has an address again; the state line says how many attempts and how long it took", wifi_EpCounters())
@@ -2804,7 +2853,9 @@ CompilerEndIf
       gWifiRinitPhase = #WIFI_RINIT_ROAM
 
     Case #WIFI_RINIT_ROAM
-      r = Cyw43SetRoamOff(1, 2000)
+      ; Everything Raspberry Pi OS sends before a join, roam_off included
+      ; (Cyw43ConfigLikeRaspbian, 2026-10-15). r = how many were refused.
+      r = Cyw43ConfigLikeRaspbian(2000)
       If wifi_RadioInitStillOwned(generation) = 0
         ProcedureReturn
       EndIf
@@ -2812,7 +2863,8 @@ CompilerEndIf
       gWifiRinitPhase = #WIFI_RINIT_POWER
 
     Case #WIFI_RINIT_POWER
-      r = Cyw43SetPowerMode(#CYW43_PM_OFF, 2000)
+      ; PM_FAST, as Raspberry Pi OS (brcmfmac cfg->pwr_save defaults true).
+      r = Cyw43SetPowerMode(#CYW43_PM_FAST, 2000)
       If wifi_RadioInitStillOwned(generation) = 0
         ProcedureReturn
       EndIf
@@ -4075,6 +4127,7 @@ Procedure WifiLinkTick()
     ProcedureReturn
   EndIf
   gWifiNoIpSince = 0
+  wifi_WatchTick()
 
   now = millis()
   If gWifiKaLast = 0

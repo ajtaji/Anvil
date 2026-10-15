@@ -8536,6 +8536,30 @@ DataSection
   ;        r    o    a    m    _    o    f    f
   cyw43_RoamOffName:
     Data.b 114, 111,  97, 109,  95, 111, 102, 102
+  ;    b    c    n    _    t    i    m    e    o    u    t
+  cyw43_BcnTimeoutName:
+    Data.b  98,  99, 110,  95, 116, 105, 109, 101, 111, 117, 116
+  ;    a    r    p    _    o    l
+  cyw43_ArpOlName:
+    Data.b  97, 114, 112,  95, 111, 108
+  ;    a    r    p    o    e
+  cyw43_ArpoeName:
+    Data.b  97, 114, 112, 111, 101
+  ;    n    d    o    e
+  cyw43_NdoeName:
+    Data.b 110, 100, 111, 101
+  ;    m    p    c
+  cyw43_MpcName:
+    Data.b 109, 112,  99
+  ;    t    x    b    f
+  cyw43_TxbfName:
+    Data.b 116, 120,  98, 102
+  ;    a    r    p    _    h    o    s    t    i    p
+  cyw43_ArpHostIpName:
+    Data.b  97, 114, 112,  95, 104, 111, 115, 116, 105, 112
+  ;    a    r    p    _    h    o    s    t    i    p    _    c    l    e    a    r
+  cyw43_ArpHostIpClearName:
+    Data.b  97, 114, 112,  95, 104, 111, 115, 116, 105, 112,  95,  99, 108, 101,  97, 114
   ;        m    f    p
   cyw43_MfpName:
     Data.b 109, 102, 112
@@ -8841,6 +8865,100 @@ Procedure.i Cyw43SetPowerMode(mode.i, timeoutMs.i)
   cyw43_PutLE32(@cyw43_arg[0], mode)
   ProcedureReturn Cyw43IoctlSet(#CYW43_C_SET_PM, @cyw43_arg[0], 4, timeoutMs)
 EndProcedure
+
+; ======================================================================
+;  Cyw43ConfigLikeRaspbian - EVERY SETTING RASPBERRY PI OS SENDS THIS
+;  FIRMWARE BEFORE A JOIN, EXACTLY (Ron, 2026-10-15: "do it like raspbian
+;  so it works"; Wi-Fi "needs to work unconditionally").
+;
+;  Read from the Raspberry Pi kernel, rpi-6.12.y,
+;  drivers/net/wireless/broadcom/brcm80211/brcmfmac, and the Raspberry Pi
+;  OS firmware package RPi-Distro/firmware-nonfree (bookworm):
+;    * the firmware is THE SAME FILE: Raspberry Pi OS selects
+;      cyfmac43455-sdio-standard.bin (update-alternatives priority 50 over
+;      minimal's 10, debian/firmware-brcm80211.postinst) - 609309 bytes,
+;      7.45.265, as Firmware/CYW43455/ here.
+;    * debian/rpi-brcmfmac.conf: "options brcmfmac roamoff=1
+;      feature_disable=0x282000" (FWSUP, SAE, DUMP_OBSS off: none used here).
+;    * brcmf_c_preinit_dcmds (common.c): mpc 1, scan channel / unassoc time,
+;      txbf 1.
+;    * brcmf_config_dongle (cfg80211.c): BRCMF_C_UP; brcmf_dongle_scantime
+;      40 / 40 / 120 ms (cfg80211.c:85-87; ioctls 185 / 187 / 258); PM =
+;      PM_FAST because cfg->pwr_save defaults to true (cfg80211.c:7054);
+;      brcmf_dongle_roam: bcn_timeout = BRCMF_DEFAULT_BCN_TIMEOUT_ROAM_OFF
+;      = 4 (cfg80211.h:91), roam_off = 1, WLC_SET_ROAM_TRIGGER {-75,
+;      BRCM_BAND_ALL 3} (55), WLC_SET_ROAM_DELTA {20, 3} (57)
+;      (cfg80211.h:23-24, include/defs.h:64); brcmf_configure_arp_nd_offload
+;      (core.c): arp_ol = AGENT | PEER_AUTO_REPLY (9), arpoe 1, ndoe 1;
+;      BRCMF_C_SET_FAKEFRAG 1 (219).
+;  Until this, Anvil set only roam_off and PM OFF; bcn_timeout stayed at the
+;  firmware's 8, the scan times at 20 / 40 / 110, and the rest unset.
+;  The power mode is set by the caller (Cyw43SetPowerMode(#CYW43_PM_FAST)),
+;  as before. Each refusal is kept (cyw43_rpiRc) and counted; none is fatal,
+;  the same as brcmfmac, which logs and goes on for every one of these but
+;  the roam block.
+; ======================================================================
+#CYW43_RPI_BCNTIMEOUTNAME_LEN = 11
+#CYW43_RPI_ARPOLNAME_LEN = 6
+#CYW43_RPI_ARPOENAME_LEN = 5
+#CYW43_RPI_NDOENAME_LEN = 4
+#CYW43_RPI_MPCNAME_LEN = 3
+#CYW43_RPI_TXBFNAME_LEN = 4
+#CYW43_RPI_ARPHOSTIPNAME_LEN = 10
+#CYW43_RPI_ARPHOSTIPCLEARNAME_LEN = 16
+#CYW43_C_SET_ROAM_TRIGGER = 55
+#CYW43_C_SET_ROAM_DELTA = 57
+#CYW43_C_SET_SCAN_CHANNEL_TIME = 185
+#CYW43_C_SET_SCAN_UNASSOC_TIME = 187
+#CYW43_C_SET_SCAN_PASSIVE_TIME = 258
+#CYW43_C_SET_FAKEFRAG = 219
+#CYW43_RPI_STEPS = 13
+Global Dim cyw43_rpiRc.i[#CYW43_RPI_STEPS]
+
+Procedure.i cyw43_IoctlSetI32(cmd.i, v.i, timeoutMs.i)
+  cyw43_PutLE32(@cyw43_arg[0], v & $FFFFFFFF)
+  ProcedureReturn Cyw43IoctlSet(cmd, @cyw43_arg[0], 4, timeoutMs)
+EndProcedure
+
+Procedure.i cyw43_IoctlSetI32x2(cmd.i, a.i, b.i, timeoutMs.i)
+  cyw43_PutLE32(@cyw43_arg[0], a & $FFFFFFFF)
+  cyw43_PutLE32(@cyw43_arg[0] + 4, b & $FFFFFFFF)
+  ProcedureReturn Cyw43IoctlSet(cmd, @cyw43_arg[0], 8, timeoutMs)
+EndProcedure
+
+Procedure.i Cyw43ConfigLikeRaspbian(timeoutMs.i)
+  Define bad.i
+  Define i.i
+  ; brcmf_c_preinit_dcmds
+  cyw43_rpiRc[0] = Cyw43SetIovarU32(?cyw43_MpcName, #CYW43_RPI_MPCNAME_LEN, 1, timeoutMs)
+  cyw43_rpiRc[1] = Cyw43SetIovarU32(?cyw43_TxbfName, #CYW43_RPI_TXBFNAME_LEN, 1, timeoutMs)
+  ; brcmf_config_dongle -> brcmf_dongle_scantime
+  cyw43_rpiRc[2] = cyw43_IoctlSetI32(#CYW43_C_SET_SCAN_CHANNEL_TIME, 40, timeoutMs)
+  cyw43_rpiRc[3] = cyw43_IoctlSetI32(#CYW43_C_SET_SCAN_UNASSOC_TIME, 40, timeoutMs)
+  cyw43_rpiRc[4] = cyw43_IoctlSetI32(#CYW43_C_SET_SCAN_PASSIVE_TIME, 120, timeoutMs)
+  ; brcmf_dongle_roam (roamoff = 1)
+  cyw43_rpiRc[5] = Cyw43SetIovarU32(?cyw43_BcnTimeoutName, #CYW43_RPI_BCNTIMEOUTNAME_LEN, 4, timeoutMs)
+  cyw43_rpiRc[6] = Cyw43SetRoamOff(1, timeoutMs)
+  cyw43_rpiRc[7] = cyw43_IoctlSetI32x2(#CYW43_C_SET_ROAM_TRIGGER, -75, 3, timeoutMs)
+  cyw43_rpiRc[8] = cyw43_IoctlSetI32x2(#CYW43_C_SET_ROAM_DELTA, 20, 3, timeoutMs)
+  ; brcmf_configure_arp_nd_offload(ifp, true)
+  cyw43_rpiRc[9] = Cyw43SetIovarU32(?cyw43_ArpOlName, #CYW43_RPI_ARPOLNAME_LEN, 9, timeoutMs)
+  cyw43_rpiRc[10] = Cyw43SetIovarU32(?cyw43_ArpoeName, #CYW43_RPI_ARPOENAME_LEN, 1, timeoutMs)
+  cyw43_rpiRc[11] = Cyw43SetIovarU32(?cyw43_NdoeName, #CYW43_RPI_NDOENAME_LEN, 1, timeoutMs)
+  ; BRCMF_C_SET_FAKEFRAG
+  cyw43_rpiRc[12] = cyw43_IoctlSetI32(#CYW43_C_SET_FAKEFRAG, 1, timeoutMs)
+  bad = 0
+  For i = 0 To #CYW43_RPI_STEPS - 1
+    If cyw43_rpiRc[i] <> 0 : bad = bad + 1 : EndIf
+  Next
+  ProcedureReturn bad
+EndProcedure
+
+Procedure.i Cyw43RpiConfigRc(i.i)
+  If i < 0 Or i >= #CYW43_RPI_STEPS : ProcedureReturn 0 : EndIf
+  ProcedureReturn cyw43_rpiRc[i]
+EndProcedure
+
 
 ; ----------------------------------------------------------------------
 ;  THE SECURITY BLOCK, ONE KNOB PER CALL.
@@ -10434,6 +10552,20 @@ Procedure.i Cyw43SetIovarData(src.i, namelen.i, *data, datalen.i, timeoutMs.i)
     PokeB(@cyw43_arg[0] + n + i, PeekA(*data + i))
   Next
   ProcedureReturn Cyw43IoctlSet(#CYW43_C_SET_VAR, @cyw43_arg[0], n + datalen, timeoutMs)
+EndProcedure
+
+; brcmf_inetaddr_changed (core.c), NETDEV_UP / NETDEV_DOWN: the firmware's
+; ARP agent answers for the host's address. The address goes as the four
+; bytes of ifa_address, network order. Best effort, as there.
+Procedure.i Cyw43ArpHostIp(ip.i, timeoutMs.i)
+  Define Dim b.a[4]
+  Define r.i
+  r = Cyw43SetIovarData(?cyw43_ArpHostIpClearName, #CYW43_RPI_ARPHOSTIPCLEARNAME_LEN, 0, 0, timeoutMs)
+  If ip = 0
+    ProcedureReturn r
+  EndIf
+  b[0] = (ip >> 24) & 255 : b[1] = (ip >> 16) & 255 : b[2] = (ip >> 8) & 255 : b[3] = ip & 255
+  ProcedureReturn Cyw43SetIovarData(?cyw43_ArpHostIpName, #CYW43_RPI_ARPHOSTIPNAME_LEN, @b[0], 4, timeoutMs)
 EndProcedure
 
 ; ----------------------------------------------------------------------
