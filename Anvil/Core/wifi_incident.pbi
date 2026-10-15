@@ -61,6 +61,8 @@
 #WR_NOTE = 22                           ; a, b as the caller says (free)
 #WR_LINKINFO = 24                       ; a = hw channel * 100 + target channel, b = RSSI (at a join, and at a loss)
 #WR_BSSID = 25                          ; a = BSSID bytes 0-2, b = bytes 3-5 (printed as the address)
+#WR_FWEVENT = 26                        ; a = firmware event type, b = reason (every event the steady-state drain reads)
+#WR_WATCH = 27                          ; a = hw channel * 100 + target, b = RSSI (sampled every 0.5 s for 15 s after an address)
 #WR_MANUAL = 23                         ; a = 1 wifi rejoin / 2 wifi join typed, b = 0 begun / 1 no keys / 2 keyed, no DHCP
 
 Global Dim wrec_t.i[#WIFI_REC_N] : Global Dim wrec_c.i[#WIFI_REC_N] : Global Dim wrec_a.i[#WIFI_REC_N] : Global Dim wrec_b.i[#WIFI_REC_N]
@@ -184,6 +186,8 @@ Procedure wrec_Name(c.i)
     Case #WR_MANUAL : wrec_Str("MANUAL wifi command (1 rejoin / 2 join), stage")
     Case #WR_LINKINFO : wrec_Str("link: channel hw*100+target / RSSI")
     Case #WR_BSSID : wrec_Str("access point")
+    Case #WR_FWEVENT : wrec_Str("firmware event type / reason")
+    Case #WR_WATCH : wrec_Str("watch: channel hw*100+target / RSSI")
     Default : wrec_Str("note")
   EndSelect
 EndProcedure

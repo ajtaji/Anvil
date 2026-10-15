@@ -640,6 +640,21 @@ Procedure CmdWifi()
     ProcedureReturn
   EndIf
 
+  ; rpicfg - what the firmware answered to each Raspberry Pi OS setting.
+  If WordIs("rpicfg") <> 0
+    Define rpiI.i
+    PrintN("Raspberry Pi OS radio settings (Cyw43ConfigLikeRaspbian), firmware answers (0 = accepted):")
+    PrintN("  0 mpc 1   1 txbf 1   2 scan channel 40   3 scan unassoc 40   4 scan passive 120")
+    PrintN("  5 bcn_timeout 4   6 roam_off 1   7 roam trigger -75   8 roam delta 20")
+    PrintN("  9 arp_ol 9   10 arpoe 1   11 ndoe 1   12 fakefrag 1")
+    Print(" ")
+    For rpiI = 0 To 12
+      Print("  ") : PrintDec(rpiI) : Print(":") : PrintDec(Cyw43RpiConfigRc(rpiI))
+    Next
+    PrintNl()
+    ProcedureReturn
+  EndIf
+
   ; chan [n] - sample the firmware's channel reply n times (default 100),
   ; 50 ms apart: hardware / target / scan channel. Read-only. Answers
   ; whether the radio leaves the association's channel (2026-10-15).
