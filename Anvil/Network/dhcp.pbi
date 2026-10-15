@@ -306,8 +306,14 @@ Procedure.i DhcpBuildReboot(xid.i, *mac, rememberedIp.i)
   dhcp_out[p + 1] = 1
   dhcp_out[p + 2] = #DHCP_REQUEST
   p = p + 3
+  ; Option 50 is FOUR bytes (RFC 2132 section 9.1), as DhcpBuildRequest
+  ; writes it. Until 2026-10-15 this said 5 (since the baseline): the
+  ; server read option 55's code byte as a fifth address byte and every
+  ; option after it misaligned, so after a link loss the INIT-REBOOT that
+  ; follows every rejoin was a malformed request the router ignored. A reset
+  ; "cured" it only because a fresh boot starts in INIT and sends DISCOVER.
   dhcp_out[p + 0] = #DHCP_OPT_REQ_IP
-  dhcp_out[p + 1] = 5
+  dhcp_out[p + 1] = 4
   net_PutBE32(@dhcp_out[p + 2], rememberedIp & $FFFFFFFF)
   p = p + 6
   p = dhcp_ParamList(p)

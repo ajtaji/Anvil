@@ -2051,6 +2051,13 @@ Global gWifiHealLast.i = 0     ; millis() of the last automatic heal retry
 #WIFI_REC_PERSIST       = 23
 #WIFI_REC_DHCP_START    = 24
 #WIFI_REC_DHCP_WAIT     = 25
+; KEYED BUT NO ADDRESS HAS A DEADLINE (2026-10-15). Before, the DHCP wait
+; only asked "bound yet?" - forever - and WifiLinkTick returned before every
+; health check while keyed without an address, so a board in that state was
+; never detected or escalated: Ron's rejoin-then-no-DHCP-until-reset. 90 s is
+; one 60 s INIT-REBOOT window plus a DISCOVER / OFFER / REQUEST / ACK.
+#WIFI_DHCP_DEADLINE_MS  = 90000
+Global gWifiNoIpSince.i = 0
 
 ; Radio initialization is deliberately a DIFFERENT generation from association
 ; recovery. It advances one existing top-level primitive per WifiLinkTick and
@@ -3724,6 +3731,7 @@ Procedure WifiRecoveryTick()
         wifi_RecoverCandidateFail()
       Else
         gWifiRecPhase = #WIFI_REC_DHCP_WAIT
+        gWifiRecAt = millis()
       EndIf
 
     Case #WIFI_REC_DHCP_WAIT
@@ -3742,6 +3750,17 @@ Procedure WifiRecoveryTick()
           PrintDec(gWifiRejoins)
           PrintN(").")
         EndIf
+      ElseIf ((millis() - gWifiRecAt) & $FFFFFFFF) >= #WIFI_DHCP_DEADLINE_MS
+        ; Keyed, and the deadline passed with no lease: a failed candidate,
+        ; so the ladder climbs (other slots, then the radio reset) instead of
+        ; waiting on DHCP for ever.
+        gWifiRecLastFailPhase = #WIFI_REC_DHCP_WAIT
+        gWifiRecLastFailRc = NetDhcpAttempts(#HW_LINK_WIFI)
+        gWifiRecLastFailStatus = DhcpClientState(#HW_LINK_WIFI)
+        Print("Wi-Fi: keyed, but DHCP gave no address in ")
+        PrintDec(#WIFI_DHCP_DEADLINE_MS / 1000)
+        PrintN(" s. Trying the next recovery step.")
+        wifi_RecoverCandidateFail()
       EndIf
   EndSelect
 EndProcedure
@@ -3962,8 +3981,23 @@ Procedure WifiLinkTick()
   ; DISCOVER/REQUEST/renew/rebind and the prompt calls NetDhcpTick next.
   If gWifiHaveIp = 0
     NetDhcpStart(#HW_LINK_WIFI, 1)
+    ; Keyed with no address (after `wifi rejoin`, `wifi join`, or anything
+    ; else outside the recovery machine): give DHCP the same deadline, then
+    ; hand the link to the recovery ladder rather than wait for ever.
+    If WifiRecoveryActive() <> 0
+      gWifiNoIpSince = 0                ; the recovery's DHCP_WAIT has its own deadline
+    ElseIf gWifiNoIpSince = 0
+      gWifiNoIpSince = millis()
+    ElseIf ((millis() - gWifiNoIpSince) & $FFFFFFFF) >= #WIFI_DHCP_DEADLINE_MS
+      gWifiNoIpSince = 0
+      Print("Wi-Fi: keyed, but DHCP gave no address in ")
+      PrintDec(#WIFI_DHCP_DEADLINE_MS / 1000)
+      PrintN(" s. Starting recovery.")
+      WifiRecoveryStart(1)
+    EndIf
     ProcedureReturn
   EndIf
+  gWifiNoIpSince = 0
 
   now = millis()
   If gWifiKaLast = 0
