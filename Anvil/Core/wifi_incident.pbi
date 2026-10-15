@@ -59,6 +59,8 @@
 #WR_CREDIT = 20                         ; a = the host's tx sequence, b = the dongle's max sequence
 #WR_JOIN = 21                           ; a = step, b = result
 #WR_NOTE = 22                           ; a, b as the caller says (free)
+#WR_LINKINFO = 24                       ; a = hw channel * 100 + target channel, b = RSSI (at a join, and at a loss)
+#WR_BSSID = 25                          ; a = BSSID bytes 0-2, b = bytes 3-5 (printed as the address)
 #WR_MANUAL = 23                         ; a = 1 wifi rejoin / 2 wifi join typed, b = 0 begun / 1 no keys / 2 keyed, no DHCP
 
 Global Dim wrec_t.i[#WIFI_REC_N] : Global Dim wrec_c.i[#WIFI_REC_N] : Global Dim wrec_a.i[#WIFI_REC_N] : Global Dim wrec_b.i[#WIFI_REC_N]
@@ -180,6 +182,8 @@ Procedure wrec_Name(c.i)
     Case #WR_CREDIT : wrec_Str("SDIO credit: host seq / dongle max")
     Case #WR_JOIN : wrec_Str("join step")
     Case #WR_MANUAL : wrec_Str("MANUAL wifi command (1 rejoin / 2 join), stage")
+    Case #WR_LINKINFO : wrec_Str("link: channel hw*100+target / RSSI")
+    Case #WR_BSSID : wrec_Str("access point")
     Default : wrec_Str("note")
   EndSelect
 EndProcedure
@@ -202,6 +206,13 @@ Procedure.i WifiRecSave(*why, *counters)
     wrec_Name(wrec_c[k]) : wrec_Str("  ") : wrec_Dec(wrec_a[k])
     wrec_Str(" / ") : wrec_Dec(wrec_b[k])
     If wrec_c[k] = #WR_EAPOL_IN Or wrec_c[k] = #WR_EAPOL_OUT : wrec_Str("  (key-info ") : wrec_Hex(wrec_a[k], 4) : wrec_Ch(41) : EndIf
+    If wrec_c[k] = #WR_BSSID And wrec_a[k] < 0
+      If wrec_b[k] = 0 : wrec_Str("  (not associated)") : Else : wrec_Str("  (could not be read)") : EndIf
+    ElseIf wrec_c[k] = #WR_BSSID
+      wrec_Str("  (")
+      wrec_Hex((wrec_a[k] >> 16) & 255, 2) : wrec_Ch(58) : wrec_Hex((wrec_a[k] >> 8) & 255, 2) : wrec_Ch(58) : wrec_Hex(wrec_a[k] & 255, 2) : wrec_Ch(58)
+      wrec_Hex((wrec_b[k] >> 16) & 255, 2) : wrec_Ch(58) : wrec_Hex((wrec_b[k] >> 8) & 255, 2) : wrec_Ch(58) : wrec_Hex(wrec_b[k] & 255, 2) : wrec_Ch(41)
+    EndIf
     wrec_NL()
   Next
   wrec_NL()

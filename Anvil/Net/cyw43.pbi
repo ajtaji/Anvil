@@ -9745,6 +9745,36 @@ Procedure.i Cyw43LinkChannel()
 EndProcedure
 
 ; ----------------------------------------------------------------------
+;  Cyw43ReadChannelInfo - ioctl 29 asked for its WHOLE reply (2026-10-15).
+;  brcmfmac's struct brcmf_channel_info_le (fwil_types.h) is three LE32s:
+;  hw_channel, target_channel, scan_channel. Cyw43ReadChannel above reads
+;  only the first, the channel the HARDWARE is on at that instant - which is
+;  not the association's channel while the radio is away scanning. The Wi-Fi
+;  log recorded channels 2, 7, 2, 5 for an access point that stays on 2, so
+;  `wifi chan` samples all three to show whether this radio leaves its
+;  channel while associated (and therefore misses the beacons it then
+;  reports lost). A reply shorter than 12 bytes is reported, not guessed.
+; ----------------------------------------------------------------------
+Global cyw43_chHw.i, cyw43_chTarget.i, cyw43_chScan.i, cyw43_chLen.i
+Procedure.i Cyw43ReadChannelInfo(timeoutMs.i)
+  Define r.i
+  Define i.i
+  cyw43_chHw = -1 : cyw43_chTarget = -1 : cyw43_chScan = -1 : cyw43_chLen = 0
+  For i = 0 To 11
+    PokeB(@cyw43_arg[0] + i, 0)
+  Next
+  r = Cyw43IoctlGet(#CYW43_C_GET_CHANNEL, @cyw43_arg[0], 12, timeoutMs)
+  If r <> #CYW43_IO_OK
+    ProcedureReturn r
+  EndIf
+  cyw43_chLen = cyw43_replyLen
+  If cyw43_replyLen >= 4  : cyw43_chHw = cyw43_Signed32(cyw43_RxLE32(cyw43_replyOff)) : EndIf
+  If cyw43_replyLen >= 8  : cyw43_chTarget = cyw43_Signed32(cyw43_RxLE32(cyw43_replyOff + 4)) : EndIf
+  If cyw43_replyLen >= 12 : cyw43_chScan = cyw43_Signed32(cyw43_RxLE32(cyw43_replyOff + 8)) : EndIf
+  ProcedureReturn #CYW43_IO_OK
+EndProcedure
+
+; ----------------------------------------------------------------------
 ;  Cyw43ReadSsid - ioctl 25, the same 36-byte struct WLC_SET_SSID takes.
 ;
 ;  READING BACK WHAT WE ASKED FOR IS NOT CIRCULAR HERE, and it is worth
