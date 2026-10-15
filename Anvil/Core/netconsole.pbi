@@ -1366,6 +1366,23 @@ Procedure.i NetDhcpAttempts(kind.i)
   ProcedureReturn netdhcp_attempts[kind]
 EndProcedure
 
+; The client's own counters, for a recorder that must not reach into this
+; file's arrays (the Wi-Fi incident line, 2026-10-15).
+Procedure.i NetDhcpSends(kind.i)
+  If kind <= 0 Or kind >= #DHCPC_IFS : ProcedureReturn 0 : EndIf
+  ProcedureReturn netdhcp_tx[kind]
+EndProcedure
+
+Procedure.i NetDhcpSendFails(kind.i)
+  If kind <= 0 Or kind >= #DHCPC_IFS : ProcedureReturn 0 : EndIf
+  ProcedureReturn netdhcp_txFail[kind]
+EndProcedure
+
+Procedure.i NetDhcpBinds(kind.i)
+  If kind <= 0 Or kind >= #DHCPC_IFS : ProcedureReturn 0 : EndIf
+  ProcedureReturn netdhcp_binds[kind]
+EndProcedure
+
 Procedure.i NetDhcpStateText(kind.i)
   Select DhcpClientState(kind)
     Case #DHCPC_INIT       : ProcedureReturn "idle"

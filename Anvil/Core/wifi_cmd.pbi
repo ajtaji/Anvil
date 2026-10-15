@@ -514,11 +514,16 @@ Procedure CmdWifi()
     ; A manual join owns the radio now. Cancel any automatic recovery
     ; generation before the synchronous compatibility path reads settings.
     WifiRecoveryCancel()
+    WifiEpManualBegin(2)                ; recorded before the join acts (2026-10-15)
     If WifiJoinKnown() <> 0
       If WifiDhcp() <> 0
+        wifi_EpRecovered()
         NetConsoleRearm()
+      Else
+        WifiEpManualFailed(2, 2)
       EndIf
     Else
+      WifiEpManualFailed(2, 1)
       WifiRecoveryInitialJoinFailed()
     EndIf
     ; AND AGAIN AFTER THE ATTEMPT, whatever it returned. DHCP may have

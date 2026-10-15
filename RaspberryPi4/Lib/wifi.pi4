@@ -2335,6 +2335,11 @@ Procedure.i wifi_EpCounters()
   wifi_EpS("; re-associations ") : wifi_EpD(gWifiRejoins) : wifi_EpS(", radio resets ") : wifi_EpD(gWifiRadioResets)
   wifi_EpS("; recovery last fail phase ") : wifi_EpD(gWifiRecLastFailPhase) : wifi_EpS(" rc ") : wifi_EpD(gWifiRecLastFailRc) : wifi_EpS(" status ") : wifi_EpD(gWifiRecLastFailStatus)
   wifi_EpS("; episode attempts ") : wifi_EpD(gWifiEpFails) : wifi_EpS(", for ") : wifi_EpD((millis() - gWifiEpT0) / 1000) : wifi_EpS(" s")
+  ; DHCP (2026-10-15): whether requests left the board, failed to, or were
+  ; answered - the half of a "keyed but no address" failure the line lacked.
+  wifi_EpS("; DHCP ") : wifi_EpS(NetDhcpStateText(#HW_LINK_WIFI))
+  wifi_EpS(", sends ") : wifi_EpD(NetDhcpSends(#HW_LINK_WIFI)) : wifi_EpS(" send failures ") : wifi_EpD(NetDhcpSendFails(#HW_LINK_WIFI))
+  wifi_EpS(" attempts ") : wifi_EpD(NetDhcpAttempts(#HW_LINK_WIFI)) : wifi_EpS(" binds ") : wifi_EpD(NetDhcpBinds(#HW_LINK_WIFI))
   wifi_EpC(0)
   ProcedureReturn @wifi_epTxt[0]
 EndProcedure
@@ -2346,6 +2351,49 @@ Procedure wifi_EpFail(code.i, a.i, b.i, *why)
   If gWifiEp = 0
     gWifiEp = 1 : gWifiEpT0 = millis() : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiEpN = gWifiEpN + 1
     WifiRecSave(*why, wifi_EpCounters())
+  EndIf
+EndProcedure
+
+; ----------------------------------------------------------------------
+;  A MANUAL rejoin / join IS RECORDED (Ron, 2026-10-15: "fix the wifi log so
+;  manual rejoins get recorded"). Until then only the automatic recovery
+;  opened or saved an episode, so a `wifi rejoin` typed at the panel whose
+;  DHCP then failed - the exact case of 2026-10-14 and 10-15 - left nothing
+;  in WIFILOG.TXT, and the reset that followed wiped the ring. Now the state
+;  BEFORE the command acts is saved, and so is its outcome.
+;    which: 1 = wifi rejoin, 2 = wifi join
+;    WifiEpManualBegin(which)          - before anything is changed
+;    WifiEpManualFailed(which, stage)  - stage 1: no association / keys,
+;                                        stage 2: keyed, DHCP gave no address
+;  Success ends the episode through wifi_EpRecovered, as the automatic path.
+; ----------------------------------------------------------------------
+Procedure WifiEpManualBegin(which.i)
+  WifiRec(#WR_MANUAL, which, 0)
+  If gWifiEp = 0
+    gWifiEp = 1 : gWifiEpT0 = millis() : gWifiEpFails = 0 : gWifiEpReset = 0 : gWifiEpN = gWifiEpN + 1
+  EndIf
+  If which = 1
+    WifiRecSave("MANUAL - wifi rejoin typed at the prompt; the state line is the link BEFORE it acted", wifi_EpCounters())
+  Else
+    WifiRecSave("MANUAL - wifi join typed at the prompt; the state line is the link BEFORE it acted", wifi_EpCounters())
+  EndIf
+EndProcedure
+
+Procedure WifiEpManualFailed(which.i, stage.i)
+  WifiRec(#WR_MANUAL, which, stage)
+  gWifiEpFails = gWifiEpFails + 1
+  If stage = 1
+    If which = 1
+      WifiRecSave("MANUAL wifi rejoin FAILED - no association / keys this attempt (the heal retries on its cadence)", wifi_EpCounters())
+    Else
+      WifiRecSave("MANUAL wifi join FAILED - no association / keys this attempt", wifi_EpCounters())
+    EndIf
+  Else
+    If which = 1
+      WifiRecSave("MANUAL wifi rejoin: KEYED, BUT DHCP GAVE NO ADDRESS in the foreground window - the DHCP fields say whether requests left and were answered", wifi_EpCounters())
+    Else
+      WifiRecSave("MANUAL wifi join: KEYED, BUT DHCP GAVE NO ADDRESS in the foreground window - the DHCP fields say whether requests left and were answered", wifi_EpCounters())
+    EndIf
   EndIf
 EndProcedure
 
@@ -2840,6 +2888,8 @@ EndProcedure
 ;  `wifi rejoin` command); 0 is silent. Returns 1 once keyed AND leased.
 ; ----------------------------------------------------------------------
 Procedure.i WifiRejoin(announce.i)
+  ; Recorded first, with the link as it is before this command changes it.
+  WifiEpManualBegin(1)
   ; An explicit/manual recovery owns the radio now. It must invalidate any
   ; older cooperative generation before its blocking compatibility path acts.
   WifiRecoveryCancel()
@@ -2872,6 +2922,7 @@ Procedure.i WifiRejoin(announce.i)
   Cyw43DrainEvents(120)
 
   If WifiJoinKnown() = 0
+    WifiEpManualFailed(1, 1)
     PrintN("Wi-Fi: re-association did not succeed this time. It will be retried.")
     ; Leave gWifiKaLast unseeded so the next tick retries promptly instead
     ; of waiting a whole keepalive period. And FLAG THE PENDING HEAL:
@@ -2890,6 +2941,7 @@ Procedure.i WifiRejoin(announce.i)
   ; starts a fresh transaction and continues asynchronously if unanswered.
   WifiDhcp()
   If gWifiHaveIp = 0
+    WifiEpManualFailed(1, 2)
     PrintN("Wi-Fi: re-associated, but DHCP did not return an address. Retrying.")
     gWifiKaLast = 0
     ProcedureReturn 0
