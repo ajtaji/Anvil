@@ -112,6 +112,15 @@
 ;  stays SvcUnimplemented. Every slot already existed, so this is a minor
 ;  bump; a 1.6 payload on a 1.5 monitor gets #SVC_ENOSYS from them.
 ; ----------------------------------------------------------------------
-#SVC_ABI_MINOR   = 6
+;  1.7 - 2026-10-14. A DIRECTORY BY PATH, slots 196 and 197 (file-handle
+;  group, base 192, slots 4 and 5).
+;
+;  SvcDirHOpen(*path) and SvcDirHNext(*name, cap): any folder, with its long
+;  UTF-8 names and file-or-folder, as the monitor's ls walks it. The group's
+;  old directory slots stay, root only and 8.3. Both slots already existed
+;  as SvcUnimplemented, so this is a minor bump; a 1.7 payload on a 1.6
+;  monitor gets #SVC_ENOSYS from them.
+; ----------------------------------------------------------------------
+#SVC_ABI_MINOR   = 7
 #SVC_SLOT_COUNT  = 200         ; 184 at 1.0-1.2; 192 at 1.3; file handles appended at 1.4.
                                ; The boot code sizes its check by it.

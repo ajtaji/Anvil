@@ -181,8 +181,9 @@ ABI_MAJOR = 1
 # renumbered.  That is still a minor bump - abi_version.pbi.
 # 1.4 appended group 16 - file handles - at base 192 (entry_count 192 -> 200),
 # and 1.5 filled the net group's reserved slots (72..79, 85, 86) once the two
-# IP layers had merged.  Neither moved an existing slot.
-ABI_MINOR = 5
+# IP layers had merged.  Neither moved an existing slot.  1.6 filled TLS (80..83, 87) and 1.7 the
+# file-handle group's directory-by-path slots (196, 197): minor bumps, nothing moved.
+ABI_MINOR = 7
 SLOT_COUNT = 200
 HDR_BYTES = 16
 MAGIC = 0x53564E41              # 'ANVS'
@@ -278,6 +279,13 @@ INSTALLED = {
     72: "SvcNetUp", 73: "SvcNetLink", 74: "SvcNetAddr", 75: "SvcDnsResolve",
     76: "SvcTcpOpen", 77: "SvcTcpSend", 78: "SvcTcpRecv", 79: "SvcTcpClose",
     85: "SvcNetService", 86: "SvcTcpState",
+
+    # ABI 1.6: TLS.  84 (HTTP) and 88..95 stay reserved.
+    80: "SvcTlsOpen", 81: "SvcTlsSend", 82: "SvcTlsRecv", 83: "SvcTlsClose",
+    87: "SvcTlsState",
+
+    # ABI 1.7: a directory by its path, with long names (file-handle group slots 4, 5).
+    196: "SvcDirHOpen", 197: "SvcDirHNext",
 }
 
 SVC_ERRS = {
