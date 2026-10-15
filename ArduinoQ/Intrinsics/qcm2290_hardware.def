@@ -84,3 +84,15 @@
   ld1 { v0.4s }, [%2]
   st1 { v0.4s }, [%1]
 @END
+
+@INTRINSIC a64_fsqrt_d
+@ARGS 1
+@RETURNS_VALUE
+@DOC The IEEE-754 binary64 square root of a 64-bit bit pattern, as a 64-bit bit pattern: one fsqrt, correctly rounded. Takes and returns the PATTERN, not a number - RaspberryPi4/Lib/mathd.pi4's SqrD(x.d) wraps it for a .d. sqrt(-0) is -0; a negative or NaN argument gives a NaN.
+@SIG a64_fsqrt_d(bits)
+@EXAMPLE PokeI(@r, a64_fsqrt_d(PeekI(@x)))      ; r.d = sqrt(x.d)
+@ASM
+  fmov d0, %2
+  fsqrt d0, d0
+  fmov %1, d0
+@END

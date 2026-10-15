@@ -1,0 +1,700 @@
+; ======================================================================
+; mathd.pi4 - the desktop BASIC maths functions, in 64-bit binary double
+;             (.d), on the 64-bit ARM boards (Raspberry Pi 4, 3 and 5,
+;             ROCK Pi 4C, UNO Q)
+; ----------------------------------------------------------------------
+;
+;     EnableFloatingPoint                        ; REQUIRED - .d needs it
+;     XIncludeFile "RaspberryPi4/Lib/mathd.pi4"
+;
+;     Procedure Main()
+;       Protected h.d
+;       h = SqrD(2.0)                            ; 1.4142135623730951
+;       h = SinD(RadianD(30.0))                  ; 0.49999999999999994
+;       h = PowD(3.0, 2)                         ; 9.0
+;       h = RoundD(-2.5, #PB_Round_Nearest)      ; -3.0
+;     EndProcedure
+;
+; THE NAMES CARRY A D, and that is deliberate. The desktop's Sqr, Sin,
+; Cos, ASin, Pow, Radian, Degree, Abs, Int and Round take a .d there; on
+; these boards math.pi4 (the Anvil repository) already owns those names
+; for .f, a procedure cannot be declared twice, and a name the language
+; may one day reserve as a built-in would break every program using this
+; file the day it did. So a port renames the calls - SinD for Sin - and
+; nothing else changes:
+;
+;     desktop                       here
+;     Sqr(x)                        SqrD(x)
+;     Sin(x) Cos(x) ASin(x)         SinD(x) CosD(x) ASinD(x)
+;     Pow(x, y)                     PowD(x, y)
+;     Radian(x) Degree(x)           RadianD(x) DegreeD(x)
+;     Abs(x)                        AbsD(x)
+;     Int(x)                        IntD(x)
+;     Round(x, mode)                RoundD(x, mode), with the desktop's
+;                                   #PB_Round_Down / _Up / _Nearest
+;     StrD(x [, n])                 StrDTo(*buffer, x, n) - this target
+;                                   has no strings, so the text is
+;                                   written into bytes you give it
+;     Print(x)                      Print(x) - the compiler sends a .d to
+;                                   PrintDouble, below
+;
+; ======================================================================
+;  WHAT IS EXACT, AND WHAT IS NOT - read this before trusting a last bit
+; ======================================================================
+; EXACT - the same bits as the desktop (measured on the desktop
+; compiler, 6023 arguments, 2026-10-14), because each is one correctly
+; rounded operation or an exact rule:
+;     SqrD     the A72's fsqrt, correctly rounded as IEEE-754 requires
+;     RadianD  x * 0.017453292519943295 - the desktop's own formula, bit
+;              for bit on all 6023 arguments
+;     DegreeD  x * 57.29577951308232
+;     AbsD     the sign bit cleared
+;     IntD     truncated toward zero; a NaN or a value past the 64-bit
+;              range gives -9223372036854775808, as the desktop's does
+;     RoundD   floor, ceiling, or the desktop's own nearest - x > 0:
+;              floor(x + 0.5), else ceil(x - 0.5) - edges included
+;     StrDTo   the exact decimal value rounded once, halves to EVEN, as
+;              the desktop's StrD does (0.125 to 2 places is "0.12")
+;
+; CORRECTLY ROUNDED, BUT NOT ALWAYS THE DESKTOP'S:
+;     PowD     for y = 2 it is x * x, one correctly rounded multiply. The
+;              desktop's Pow(x, 2) is its C runtime's pow and differs
+;              from x * x by one ulp on 10 of 6023 arguments (measured).
+;
+; NOT GUARANTEED BIT-IDENTICAL TO THE DESKTOP, AND CANNOT BE:
+;     SinD CosD ASinD
+; These are the fdlibm algorithms (Sun Microsystems, 1993 - the ones most
+; C libraries descend from), which are within ONE ulp of the true value.
+; The desktop's Sin and Cos are its C runtime's, and that runtime is not
+; correctly rounded either: measured against a 60-digit reference it is
+; off by one in the last place for 66 of 2000 sines, 72 of 2000 cosines
+; and 110 of 2000 arc sines (2026-10-14). Two implementations that are
+; each within an ulp of the truth do not land on the same ulp every time,
+; and nothing on this board can reproduce that runtime's private choices.
+; The measured agreement with the desktop is printed by
+; tools/a64_double_math_check.py. A program that must give the desktop's
+; answers to the last bit has to use THE SAME FUNCTION ON BOTH - this
+; file uses only + - * / and a square root, all correctly rounded on both
+; machines, so the same algorithm compiled for the desktop would agree
+; with it exactly.
+;
+; REFUSED, as a NaN result, because a library cannot refuse at compile
+; time and a wrong number would be worse:
+;     PowD(x, y) for y that is not a whole number (except 0.5, which is
+;     SqrD); fdlibm's general pow is not ported.
+;     SinD / CosD for |x| above 823549.6 (2^19 * pi/2): the argument
+;     reduction needs Payne-Hanek beyond that, which is not ported.
+; ======================================================================
+
+#PB_Round_Down    = 0
+#PB_Round_Up      = 1
+#PB_Round_Nearest = 2
+
+; --- the bit pattern of a .d, and back ---------------------------------
+; Through memory, eight bytes as they are: no conversion on either side.
+Procedure.i MathDBits(x.d)
+  Protected t.d
+  t = x
+  ProcedureReturn PeekI(@t)
+EndProcedure
+
+Procedure.d MathDFromBits(b.i)
+  Protected t.d
+  PokeI(@t, b)
+  ProcedureReturn t
+EndProcedure
+
+; The high 32 bits as a signed number, fdlibm's GET_HIGH_WORD.
+Procedure.i MathDHigh(x.d)
+  ProcedureReturn MathDBits(x) >> 32
+EndProcedure
+
+Procedure.d MathDNaN()
+  ProcedureReturn MathDFromBits($7FF8000000000000)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; SqrD(x) - the square root, correctly rounded: the A72's fsqrt d0, d0,
+; reached through the one intrinsic this file needs (a64_fsqrt_d, in the
+; board's hardware .def) because the language has no way to name the
+; instruction. sqrt(-0) is -0, sqrt of a negative is a NaN.
+; ----------------------------------------------------------------------
+Procedure.d SqrD(x.d)
+  Protected r.d
+  PokeI(@r, a64_fsqrt_d(PeekI(@x)))
+  ProcedureReturn r
+EndProcedure
+
+Procedure.d AbsD(x.d)
+  Protected r.d
+  PokeI(@r, PeekI(@x) & $7FFFFFFFFFFFFFFF)
+  ProcedureReturn r
+EndProcedure
+
+Procedure.d RadianD(x.d)
+  ProcedureReturn x * 0.017453292519943295
+EndProcedure
+
+Procedure.d DegreeD(x.d)
+  ProcedureReturn x * 57.29577951308232
+EndProcedure
+
+; ----------------------------------------------------------------------
+; IntD(x) - the whole part, truncated toward zero, as a .q - and the
+; DESKTOP's answer where the two processors disagree: a NaN, or a value
+; outside the 64-bit range, gives -9223372036854775808 (the x86's
+; "indefinite integer"), measured on the desktop compiler 2026-10-14. The
+; plain conversion 'q.q = d' does NOT do this - it is the A72's, which
+; saturates and turns a NaN into 0, the same rule .f follows; IntD is the
+; desktop function and answers as the desktop does.
+; ----------------------------------------------------------------------
+Procedure.q IntD(x.d)
+  Protected q.q
+  If x <> x : ProcedureReturn $8000000000000000 : EndIf
+  If x >= 9223372036854775808.0 Or x < -9223372036854775808.0
+    ProcedureReturn $8000000000000000
+  EndIf
+  q = x
+  ProcedureReturn q
+EndProcedure
+
+; The floor and the ceiling, kept a .d, exact. Below 2^52 the truncation
+; and its conversion back are exact, and so is the fraction x - t. A zero
+; answer keeps the sign of x (the ceiling of -0.5 is -0.0, as C's is).
+; 2^52 or more is already whole; NaN and the infinities come back as
+; they are.
+Procedure.d MathDFloorCeil(x.d, up.i)
+  Protected t.d, fr.d, q.q, b.i
+  b = PeekI(@x)
+  If (b & $7FF0000000000000) = $7FF0000000000000 : ProcedureReturn x : EndIf
+  If ((b >> 52) & $7FF) >= 1075 : ProcedureReturn x : EndIf     ; |x| >= 2^52
+  q = x
+  t = q
+  fr = x - t
+  If up
+    If fr > 0.0 : t = t + 1.0 : EndIf
+  Else
+    If fr < 0.0 : t = t - 1.0 : EndIf
+  EndIf
+  If t = 0.0
+    ProcedureReturn MathDFromBits(b & $8000000000000000)
+  EndIf
+  ProcedureReturn t
+EndProcedure
+
+; ----------------------------------------------------------------------
+; RoundD(x, mode) - to a whole number, kept a .d, BIT FOR BIT AS THE
+; DESKTOP'S Round. #PB_Round_Down is the floor, #PB_Round_Up the ceiling.
+; #PB_Round_Nearest is the desktop's own formula, recovered from its
+; answers on 2026-10-14 and NOT the textbook one:
+;     x > 0:     floor(x + 0.5)        otherwise:  ceil(x - 0.5)
+; A half goes away from zero (2.5 is 3, -2.5 is -3), and the formula's
+; own roundings show at the edges, where the desktop shows them too:
+; 0.49999999999999994 gives 1.0 (x + 0.5 rounds up to 1), 4503599627370497
+; gives 4503599627370498 (x + 0.5 rounds to even), and +0.0 gives -0.0
+; (0 is not above 0, and the ceiling of -0.5 is -0.0). A program that
+; must match the desktop's Round has to make exactly these choices.
+; ----------------------------------------------------------------------
+Procedure.d RoundD(x.d, mode.i)
+  Select mode
+    Case #PB_Round_Down
+      ProcedureReturn MathDFloorCeil(x, 0)
+    Case #PB_Round_Up
+      ProcedureReturn MathDFloorCeil(x, 1)
+  EndSelect
+  If x > 0.0
+    ProcedureReturn MathDFloorCeil(x + 0.5, 0)
+  EndIf
+  ProcedureReturn MathDFloorCeil(x - 0.5, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; PowD(x, y) - x to the power y, for a WHOLE-NUMBER y (and y = 0.5).
+; y = 2 is x * x, one correctly rounded multiply. Other whole powers are
+; repeated squaring: |y| <= 3 is within one ulp, larger powers gather
+; about one rounding per bit of |y|. A negative y is 1 / x^|y|.
+; A y with a fraction is REFUSED with a NaN - see the header.
+; ----------------------------------------------------------------------
+Procedure.d PowD(x.d, y.d)
+  Protected n.q, r.d, base.d, neg.i
+  If y = 2.0 : ProcedureReturn x * x : EndIf                 ; the hot case, first
+  If y = 0.5 : ProcedureReturn SqrD(x) : EndIf
+  If y <> y : ProcedureReturn y : EndIf                         ; NaN
+  If AbsD(y) >= 2147483648.0 : ProcedureReturn MathDNaN() : EndIf
+  n = y
+  If n <> y : ProcedureReturn MathDNaN() : EndIf                ; not whole
+  If n = 0 : ProcedureReturn 1.0 : EndIf
+  If n = 2 : ProcedureReturn x * x : EndIf
+  neg = 0
+  If n < 0 : neg = 1 : n = 0 - n : EndIf
+  r = 1.0
+  base = x
+  While n > 0
+    If n & 1 : r = r * base : EndIf
+    n = n >> 1
+    If n > 0 : base = base * base : EndIf
+  Wend
+  If neg : ProcedureReturn 1.0 / r : EndIf
+  ProcedureReturn r
+EndProcedure
+
+; THE BIT PATTERN IS READ IN PLACE - PeekI(@x) of the parameter's own slot -
+; rather than through MathDBits(): every call here is on the router's hot
+; path, and a call costs a frame (2026-10-14 speed requirement).
+
+; ======================================================================
+;  SINE AND COSINE - fdlibm's k_sin.c, k_cos.c and the medium case of
+;  e_rem_pio2.c, transcribed. Every coefficient below was checked to
+;  carry exactly the bit pattern fdlibm writes beside it in hex.
+; ======================================================================
+Global MathDRemY0.d, MathDRemY1.d
+
+; sin(x + y) for |x| <= pi/4, y the tail of x. iy = 0: y is zero.
+Procedure.d MathDKSin(x.d, y.d, iy.i)
+  Protected ix.i = (PeekI(@x) >> 32) & $7FFFFFFF
+  Protected z.d, v.d, r.d
+  If ix < $3E400000 : ProcedureReturn x : EndIf                 ; |x| < 2^-27
+  z = x * x
+  v = z * x
+  ; S2+z*(S3+z*(S4+z*(S5+z*S6))), one Horner step per line - the same
+  ; operations in the same order, in fewer live registers
+  r = -2.50507602534068634195e-08 + z * 1.58969099521155010221e-10
+  r = 2.75573137070700676789e-06 + z * r
+  r = -1.98412698298579493134e-04 + z * r
+  r = 8.33333333332248946124e-03 + z * r
+  If iy = 0
+    ProcedureReturn x + v * (-1.66666666666666324348e-01 + z * r)
+  EndIf
+  ; x - ((z*(y/2 - v*r) - y) - v*S1), with S1 = -1.666...e-01
+  ProcedureReturn x - ((z * (0.5 * y - v * r) - y) + v * 1.66666666666666324348e-01)
+EndProcedure
+
+; cos(x + y) for |x| <= pi/4.
+Procedure.d MathDKCos(x.d, y.d)
+  Protected ix.i = (PeekI(@x) >> 32) & $7FFFFFFF
+  Protected z.d, r.d, qx.d, hz.d, a.d
+  If ix < $3E400000 : ProcedureReturn 1.0 : EndIf               ; |x| < 2^-27
+  z = x * x
+  ; z*(C1+z*(C2+z*(C3+z*(C4+z*(C5+z*C6))))), one Horner step per line
+  r = 2.08757232129817482790e-09 + z * -1.13596475577881948265e-11
+  r = -2.75573143513906633035e-07 + z * r
+  r = 2.48015872894767294178e-05 + z * r
+  r = -1.38888888888741095749e-03 + z * r
+  r = 4.16666666666666019037e-02 + z * r
+  r = z * r
+  If ix < $3FD33333                                             ; |x| < 0.3
+    ProcedureReturn 1.0 - (0.5 * z - (z * r - x * y))
+  EndIf
+  If ix > $3FE90000                                             ; |x| > 0.78125
+    qx = 0.28125
+  Else
+    PokeI(@qx, (ix - $00200000) << 32)                          ; x/4, low word zero
+  EndIf
+  hz = 0.5 * z - qx
+  a = 1.0 - qx
+  ProcedureReturn a - (hz - (z * r - x * y))
+EndProcedure
+
+; x reduced by a multiple of pi/2, for |x| up to 2^19 * pi/2. Answers n
+; (the quarter turn) and leaves the remainder as MathDRemY0 + MathDRemY1.
+; The quick no-cancellation table of the original is left out: the
+; iterations below are what it skips, and they are always correct.
+Procedure.i MathDRemPio2(x.d)
+  Protected hx.i = (PeekI(@x) >> 32), ix.i, n.i, j.i, i.i
+  Protected z.d, t.d, r.d, w.d, fn.d
+  ix = hx & $7FFFFFFF
+  If ix <= $3FE921FB                                            ; |x| <= pi/4
+    MathDRemY0 = x : MathDRemY1 = 0.0
+    ProcedureReturn 0
+  EndIf
+  If ix < $4002D97C                                             ; |x| < 3pi/4
+    If hx > 0
+      z = x - 1.57079632673412561417e+00
+      If ix <> $3FF921FB
+        MathDRemY0 = z - 6.07710050650619224932e-11
+        MathDRemY1 = (z - MathDRemY0) - 6.07710050650619224932e-11
+      Else
+        z = z - 6.07710050630396597660e-11
+        MathDRemY0 = z - 2.02226624879595063154e-21
+        MathDRemY1 = (z - MathDRemY0) - 2.02226624879595063154e-21
+      EndIf
+      ProcedureReturn 1
+    EndIf
+    z = x + 1.57079632673412561417e+00
+    If ix <> $3FF921FB
+      MathDRemY0 = z + 6.07710050650619224932e-11
+      MathDRemY1 = (z - MathDRemY0) + 6.07710050650619224932e-11
+    Else
+      z = z + 6.07710050630396597660e-11
+      MathDRemY0 = z + 2.02226624879595063154e-21
+      MathDRemY1 = (z - MathDRemY0) + 2.02226624879595063154e-21
+    EndIf
+    ProcedureReturn -1
+  EndIf
+  ; THE MEDIUM CASE.
+  t = AbsD(x)
+  n = IntD(t * 6.36619772367581382433e-01 + 0.5)
+  fn = n
+  r = t - fn * 1.57079632673412561417e+00
+  w = fn * 6.07710050650619224932e-11                           ; first round, good to 85 bits
+  j = ix >> 20
+  MathDRemY0 = r - w
+  i = j - (((PeekI(@MathDRemY0) >> 32) >> 20) & $7FF)
+  If i > 16                                                     ; second round, good to 118 bits
+    t = r
+    w = fn * 6.07710050630396597660e-11
+    r = t - w
+    w = fn * 2.02226624879595063154e-21 - ((t - r) - w)
+    MathDRemY0 = r - w
+    i = j - (((PeekI(@MathDRemY0) >> 32) >> 20) & $7FF)
+    If i > 49                                                   ; third round, 151 bits
+      t = r
+      w = fn * 2.02226624871116645580e-21
+      r = t - w
+      w = fn * 8.47842766036889956997e-32 - ((t - r) - w)
+      MathDRemY0 = r - w
+    EndIf
+  EndIf
+  MathDRemY1 = (r - MathDRemY0) - w
+  If hx < 0
+    MathDRemY0 = -MathDRemY0 : MathDRemY1 = -MathDRemY1
+    ProcedureReturn -n
+  EndIf
+  ProcedureReturn n
+EndProcedure
+
+Procedure.d SinD(x.d)
+  Protected ix.i = (PeekI(@x) >> 32) & $7FFFFFFF, n.i
+  If ix <= $3FE921FB : ProcedureReturn MathDKSin(x, 0.0, 0) : EndIf
+  If ix >= $7FF00000 : ProcedureReturn MathDNaN() : EndIf       ; NaN or infinity
+  If ix > $413921FB : ProcedureReturn MathDNaN() : EndIf        ; refused - see the header
+  n = MathDRemPio2(x)
+  Select n & 3
+    Case 0 : ProcedureReturn MathDKSin(MathDRemY0, MathDRemY1, 1)
+    Case 1 : ProcedureReturn MathDKCos(MathDRemY0, MathDRemY1)
+    Case 2 : ProcedureReturn -MathDKSin(MathDRemY0, MathDRemY1, 1)
+  EndSelect
+  ProcedureReturn -MathDKCos(MathDRemY0, MathDRemY1)
+EndProcedure
+
+Procedure.d CosD(x.d)
+  Protected ix.i = (PeekI(@x) >> 32) & $7FFFFFFF, n.i
+  If ix <= $3FE921FB : ProcedureReturn MathDKCos(x, 0.0) : EndIf
+  If ix >= $7FF00000 : ProcedureReturn MathDNaN() : EndIf
+  If ix > $413921FB : ProcedureReturn MathDNaN() : EndIf
+  n = MathDRemPio2(x)
+  Select n & 3
+    Case 0 : ProcedureReturn MathDKCos(MathDRemY0, MathDRemY1)
+    Case 1 : ProcedureReturn -MathDKSin(MathDRemY0, MathDRemY1, 1)
+    Case 2 : ProcedureReturn -MathDKCos(MathDRemY0, MathDRemY1)
+  EndSelect
+  ProcedureReturn MathDKSin(MathDRemY0, MathDRemY1, 1)
+EndProcedure
+
+; ----------------------------------------------------------------------
+; ASinD(x) - the arc sine, fdlibm's e_asin.c. |x| > 1 is a NaN.
+; ----------------------------------------------------------------------
+Procedure.d MathDAsinR(t.d)
+  Protected p.d, q.d
+  ; p = t*(pS0+t*(pS1+t*(pS2+t*(pS3+t*(pS4+t*pS5))))), one step per line
+  p = 7.91534994289814532176e-04 + t * 3.47933107596021167570e-05
+  p = -4.00555345006794114027e-02 + t * p
+  p = 2.01212532134862925881e-01 + t * p
+  p = -3.25565818622400915405e-01 + t * p
+  p = 1.66666666666666657415e-01 + t * p
+  p = t * p
+  ; q = 1+t*(qS1+t*(qS2+t*(qS3+t*qS4)))
+  q = -6.88283971605453293030e-01 + t * 7.70381505559019352791e-02
+  q = 2.02094576023350569471e+00 + t * q
+  q = -2.40339491173441421878e+00 + t * q
+  q = 1.0 + t * q
+  ProcedureReturn p / q
+EndProcedure
+
+Procedure.d ASinD(x.d)
+  Protected b.i = PeekI(@x)
+  Protected hx.i = b >> 32, ix.i
+  Protected t.d, w.d, s.d, c.d, r.d, p.d, q.d
+  ix = hx & $7FFFFFFF
+  If ix >= $3FF00000                                            ; |x| >= 1
+    If ((ix - $3FF00000) | (b & $FFFFFFFF)) = 0
+      ProcedureReturn x * 1.57079632679489655800e+00 + x * 6.12323399573676603587e-17
+    EndIf
+    ProcedureReturn MathDNaN()
+  EndIf
+  If ix < $3FE00000                                             ; |x| < 0.5
+    If ix < $3E400000 : ProcedureReturn x : EndIf               ; |x| < 2^-27
+    t = x * x
+    ProcedureReturn x + x * MathDAsinR(t)
+  EndIf
+  w = 1.0 - AbsD(x)
+  t = w * 0.5
+  r = MathDAsinR(t)
+  s = SqrD(t)
+  If ix >= $3FEF3333                                            ; |x| > 0.975
+    t = 1.57079632679489655800e+00 - (2.0 * (s + s * r) - 6.12323399573676603587e-17)
+  Else
+    PokeI(@w, PeekI(@s) & $FFFFFFFF00000000)                    ; s with its low word zero
+    c = (t - w * w) / (s + w)
+    p = 2.0 * s * r - (6.12323399573676603587e-17 - 2.0 * c)
+    q = 7.85398163397448278999e-01 - 2.0 * w
+    t = 7.85398163397448278999e-01 - (p - q)
+  EndIf
+  If hx > 0 : ProcedureReturn t : EndIf
+  ProcedureReturn -t
+EndProcedure
+
+; ======================================================================
+;  TEXT - StrDTo and PrintDouble
+; ======================================================================
+; THE EXACT VALUE, ROUNDED ONCE. A double is m * 2^e exactly, so its
+; decimal expansion to n places is round(m * 2^e * 10^n), worked out in
+; whole numbers - a little big-integer arithmetic in 32-bit limbs, up to
+; 36 of them for the largest finite value - and rounded with halves to
+; EVEN, which is what the desktop's StrD does (0.125 to 2 places "0.12",
+; 0.375 "0.38", 2.5 to none "2"). No floating-point operation touches the
+; digits, so nothing can round twice.
+;
+; THE DESKTOP'S SHAPE, measured 2026-10-14:
+;   n < 0 (the default): ten places, trailing zeros and then the point
+;          dropped - 1/3 is "0.3333333333", -7.0 is "-7", 1e-11 is "0";
+;   n >= 0: exactly n places - StrD(1.005, 2) is "1.00";
+;   a minus sign when the VALUE is below zero, even if it rounds to zero
+;   (-1e-11 is "-0") - and none for -0.0 ("0");
+;   NaN is "NaN", the infinities "+Infinity" and "-Infinity".
+; n is limited to 0..30 here. The buffer must hold up to 352 bytes for
+; the largest finite value (309 digits, the point, 30 places, the sign,
+; the terminator); 64 bytes is enough below 10^20 with ten places.
+; Answers the length written, without the terminating zero.
+Global Dim MathDBig.q(48)
+Global MathDBigN.i
+
+Procedure MathDBigSet(v.q)
+  MathDBig(0) = v & $FFFFFFFF
+  MathDBig(1) = (v >> 32) & $FFFFFFFF
+  MathDBigN = 2
+EndProcedure
+
+Procedure MathDBigMulSmall(k.i)
+  Protected i.i, t.q, carry.q = 0
+  For i = 0 To MathDBigN - 1
+    t = MathDBig(i) * k + carry
+    MathDBig(i) = t & $FFFFFFFF
+    carry = (t >> 32) & $FFFFFFFF
+  Next
+  If carry <> 0
+    MathDBig(MathDBigN) = carry
+    MathDBigN = MathDBigN + 1
+  EndIf
+EndProcedure
+
+Procedure MathDBigShl(n.i)
+  Protected words.i = n / 32, bits.i = n % 32, i.i
+  If n <= 0 : ProcedureReturn : EndIf
+  MathDBig(MathDBigN) = 0
+  MathDBigN = MathDBigN + 1
+  If bits > 0
+    For i = MathDBigN - 1 To 1 Step -1
+      MathDBig(i) = ((MathDBig(i) << bits) | (MathDBig(i - 1) >> (32 - bits))) & $FFFFFFFF
+    Next
+    MathDBig(0) = (MathDBig(0) << bits) & $FFFFFFFF
+  EndIf
+  If words > 0
+    For i = MathDBigN - 1 To 0 Step -1
+      MathDBig(i + words) = MathDBig(i)
+    Next
+    For i = 0 To words - 1
+      MathDBig(i) = 0
+    Next
+    MathDBigN = MathDBigN + words
+  EndIf
+EndProcedure
+
+Procedure.i MathDBigBit(j.i)
+  If j < 0 : ProcedureReturn 0 : EndIf
+  If j / 32 >= MathDBigN : ProcedureReturn 0 : EndIf
+  ProcedureReturn (MathDBig(j / 32) >> (j % 32)) & 1
+EndProcedure
+
+; Any bit below j set?
+Procedure.i MathDBigAnyBelow(j.i)
+  Protected i.i, w.i = j / 32
+  If j <= 0 : ProcedureReturn 0 : EndIf
+  For i = 0 To w - 1
+    If i < MathDBigN And MathDBig(i) <> 0 : ProcedureReturn 1 : EndIf
+  Next
+  If w < MathDBigN And (j % 32) > 0
+    If (MathDBig(w) & ((1 << (j % 32)) - 1)) <> 0 : ProcedureReturn 1 : EndIf
+  EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; Shift right by n bits, dropping them.
+Procedure MathDBigShr(n.i)
+  Protected words.i = n / 32, bits.i = n % 32, i.i
+  If n <= 0 : ProcedureReturn : EndIf
+  If words >= MathDBigN
+    MathDBig(0) = 0 : MathDBigN = 1
+    ProcedureReturn
+  EndIf
+  For i = 0 To MathDBigN - 1 - words
+    MathDBig(i) = MathDBig(i + words)
+  Next
+  MathDBigN = MathDBigN - words
+  If bits > 0
+    For i = 0 To MathDBigN - 1
+      If i + 1 < MathDBigN
+        MathDBig(i) = ((MathDBig(i) >> bits) | (MathDBig(i + 1) << (32 - bits))) & $FFFFFFFF
+      Else
+        MathDBig(i) = (MathDBig(i) >> bits) & $FFFFFFFF
+      EndIf
+    Next
+  EndIf
+EndProcedure
+
+Procedure MathDBigAddOne()
+  Protected i.i = 0, t.q
+  Repeat
+    t = MathDBig(i) + 1
+    MathDBig(i) = t & $FFFFFFFF
+    If t <= $FFFFFFFF : ProcedureReturn : EndIf
+    i = i + 1
+    If i >= MathDBigN
+      MathDBig(i) = 1
+      MathDBigN = MathDBigN + 1
+      ProcedureReturn
+    EndIf
+  ForEver
+EndProcedure
+
+Procedure.i MathDBigIsZero()
+  Protected i.i
+  For i = 0 To MathDBigN - 1
+    If MathDBig(i) <> 0 : ProcedureReturn 0 : EndIf
+  Next
+  ProcedureReturn 1
+EndProcedure
+
+; Divide by 10^9 in place, answering the remainder.
+Procedure.i MathDBigDiv1e9()
+  Protected i.i, rem.q = 0, t.q
+  For i = MathDBigN - 1 To 0 Step -1
+    t = (rem << 32) | MathDBig(i)
+    MathDBig(i) = t / 1000000000
+    rem = t % 1000000000
+  Next
+  While MathDBigN > 1 And MathDBig(MathDBigN - 1) = 0
+    MathDBigN = MathDBigN - 1
+  Wend
+  ProcedureReturn rem
+EndProcedure
+
+Global Dim MathDDigit.a(400)
+
+Procedure.i MathDPutText(*dest, txt.i)
+  ; txt selects one of the three special spellings.
+  Protected p.i = *dest
+  Select txt
+    Case 1  ; NaN
+      PokeA(p, 78) : PokeA(p + 1, 97) : PokeA(p + 2, 78) : PokeA(p + 3, 0)
+      ProcedureReturn 3
+    Case 2  ; +Infinity
+      PokeA(p, 43) : p = p + 1
+    Case 3  ; -Infinity
+      PokeA(p, 45) : p = p + 1
+  EndSelect
+  PokeA(p, 73) : PokeA(p + 1, 110) : PokeA(p + 2, 102) : PokeA(p + 3, 105) : PokeA(p + 4, 110)
+  PokeA(p + 5, 105) : PokeA(p + 6, 116) : PokeA(p + 7, 121) : PokeA(p + 8, 0)
+  ProcedureReturn 9
+EndProcedure
+
+Procedure.i StrDTo(*dest, x.d, decimals.i)
+  Protected b.i = PeekI(@x), be.i, m.q, e.i, d.i, trim.i, i.i, nd.i, chunk.i, k.i
+  Protected p.i = *dest, neg.i, half.i, sticky.i, odd.i, pointAt.i, last.i
+  be = (b >> 52) & $7FF
+  If be = $7FF
+    If (b & $000FFFFFFFFFFFFF) <> 0 : ProcedureReturn MathDPutText(*dest, 1) : EndIf
+    If b < 0 : ProcedureReturn MathDPutText(*dest, 3) : EndIf
+    ProcedureReturn MathDPutText(*dest, 2)
+  EndIf
+  neg = 0
+  If x < 0.0 : neg = 1 : EndIf
+  trim = 0
+  d = decimals
+  If d < 0 : d = 10 : trim = 1 : EndIf
+  If d > 30 : d = 30 : EndIf
+  m = b & $000FFFFFFFFFFFFF
+  If be = 0
+    e = -1074
+  Else
+    m = m | $0010000000000000
+    e = be - 1075
+  EndIf
+  ; N = round(m * 2^e * 10^d), halves to even
+  MathDBigSet(m)
+  For i = 1 To d
+    MathDBigMulSmall(10)
+  Next
+  If e >= 0
+    MathDBigShl(e)
+  Else
+    half = MathDBigBit(-e - 1)
+    sticky = MathDBigAnyBelow(-e - 1)
+    MathDBigShr(-e)
+    odd = MathDBig(0) & 1
+    If half <> 0 And (sticky <> 0 Or odd <> 0) : MathDBigAddOne() : EndIf
+  EndIf
+  ; the decimal digits, least significant first
+  nd = 0
+  Repeat
+    chunk = MathDBigDiv1e9()
+    If MathDBigIsZero()
+      While chunk > 0
+        MathDDigit(nd) = chunk % 10 : nd = nd + 1
+        chunk = chunk / 10
+      Wend
+      Break
+    EndIf
+    For k = 1 To 9
+      MathDDigit(nd) = chunk % 10 : nd = nd + 1
+      chunk = chunk / 10
+    Next
+  ForEver
+  While nd < d + 1
+    MathDDigit(nd) = 0 : nd = nd + 1
+  Wend
+  ; the shape
+  If neg : PokeA(p, 45) : p = p + 1 : EndIf
+  For i = nd - 1 To d Step -1
+    PokeA(p, 48 + MathDDigit(i)) : p = p + 1
+  Next
+  If d > 0
+    last = 0
+    If trim
+      ; the lowest digit worth keeping
+      last = 0
+      While last < d And MathDDigit(last) = 0
+        last = last + 1
+      Wend
+    EndIf
+    If last < d
+      PokeA(p, 46) : p = p + 1
+      For i = d - 1 To last Step -1
+        PokeA(p, 48 + MathDDigit(i)) : p = p + 1
+      Next
+    EndIf
+  EndIf
+  PokeA(p, 0)
+  ProcedureReturn p - *dest
+EndProcedure
+
+; Print(v.d) and PrintN(v.d) come here (the compiler routes a .d to
+; PrintDouble). The text is the desktop's StrD(v): ten places, trailing
+; zeros dropped. The characters go out through str_print_at - the same
+; board-library procedure Print("text") uses - so this file names no
+; transport of its own.
+Global Dim MathDText.a(400)
+Procedure PrintDouble(v.d)
+  StrDTo(@MathDText(0), v, -1)
+  str_print_at(@MathDText(0))
+EndProcedure
