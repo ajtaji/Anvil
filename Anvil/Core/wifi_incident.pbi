@@ -59,6 +59,7 @@
 #WR_CREDIT = 20                         ; a = the host's tx sequence, b = the dongle's max sequence
 #WR_JOIN = 21                           ; a = step, b = result
 #WR_NOTE = 22                           ; a, b as the caller says (free)
+#WR_MANUAL = 23                         ; a = 1 wifi rejoin / 2 wifi join typed, b = 0 begun / 1 no keys / 2 keyed, no DHCP
 
 Global Dim wrec_t.i[#WIFI_REC_N] : Global Dim wrec_c.i[#WIFI_REC_N] : Global Dim wrec_a.i[#WIFI_REC_N] : Global Dim wrec_b.i[#WIFI_REC_N]
 Global wrec_head.i, wrec_n.i, wrec_total.i, wrec_saved.i, wrec_saveErr.i, wrec_incidents.i
@@ -88,8 +89,13 @@ Procedure wrec_Str(*s)
   If *s = 0
     ProcedureReturn
   EndIf
+  ; 1023, not 200 (2026-10-15): the counters line (wifi_EpCounters, built in
+  ; a 1024-byte buffer) is about 400 characters, and a 200 cap cut every saved
+  ; state line of WIFILOG.TXT short since the recorder was built - the
+  ; re-associations, radio resets, recovery fail phase, episode attempts and
+  ; DHCP fields never reached the card, and nothing said so.
   c = PeekA(*s)
-  While c <> 0 And i < 200
+  While c <> 0 And i < 1023
     wrec_Ch(c) : i = i + 1 : c = PeekA(*s + i)
   Wend
 EndProcedure
@@ -173,6 +179,7 @@ Procedure wrec_Name(c.i)
     Case #WR_COUNTS : wrec_Str("frames in/out since last mark")
     Case #WR_CREDIT : wrec_Str("SDIO credit: host seq / dongle max")
     Case #WR_JOIN : wrec_Str("join step")
+    Case #WR_MANUAL : wrec_Str("MANUAL wifi command (1 rejoin / 2 join), stage")
     Default : wrec_Str("note")
   EndSelect
 EndProcedure
