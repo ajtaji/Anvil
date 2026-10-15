@@ -1755,6 +1755,63 @@ Procedure.i SvcFileHClose(h.i)
   ProcedureReturn #SVC_OK
 EndProcedure
 
+; GROUP 16 slots 4 and 5, NEW AT 1.7: A DIRECTORY BY ITS PATH, WITH ITS LONG NAMES.
+; The file group's directory slots walk the medium's root in 8.3 names only, so a
+; payload could not see what is in 2:/TruckGPS/cache/osm - the folder TruckGPS's
+; router reads its speed-limit overlays from, every file of it, as the PC does
+; (2026-10-14). The monitor's ls already walks any folder by path; these two are
+; that walk, for a payload.
+;
+;    slot 4  SvcDirHOpen(*path)        -> #SVC_OK, or a #SVC_ error (SvcFileErrText says why)
+;    slot 5  SvcDirHNext(*name, cap)   -> 1 a file, 2 a folder, 0 the end, #SVC_EIO the walk broke
+;
+; The name is the entry's whole name, UTF-8 and NUL-terminated, cut to cap - 1
+; bytes. LIKE THE OTHER DIRECTORY SLOTS IT MOVES THE ENGINE: an open handle reads
+; again on its next read (gSvcFhCurrent is cleared).
+Procedure.i SvcDirHOpen(*path)
+  If SvcRequireCap(#CAP_STORAGE, "storage", "this board offers Anvil no medium to read files from") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  If *path = 0
+    gSvcDetail = "the path pointer was zero"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  HwFileClose()
+  gSvcFhCurrent = 0
+  If HwDirOpen(*path) = 0
+    gSvcDetail = "the folder could not be opened; SvcFileErrText says why"
+    ProcedureReturn #SVC_EIO
+  EndIf
+  ProcedureReturn #SVC_OK
+EndProcedure
+
+Procedure.i SvcDirHNext(*name, cap.i)
+  Define r.i
+  If SvcRequireCap(#CAP_STORAGE, "storage", "this board offers Anvil no medium to read files from") = 0
+    ProcedureReturn #SVC_ENOCAP
+  EndIf
+  If *name = 0 Or cap < 2
+    gSvcDetail = "a zero name pointer, or room for less than one byte and its end"
+    ProcedureReturn #SVC_EARG
+  EndIf
+  gSvcFhCurrent = 0
+  r = HwDirNext()
+  If r = 0
+    ProcedureReturn 0
+  EndIf
+  If r < 0
+    gSvcDetail = "the folder walk broke; SvcFileErrText says why"
+    ProcedureReturn #SVC_EIO
+  EndIf
+  If HwDirNameUtf8(*name, cap) < 0
+    PokeA(*name, 0)
+  EndIf
+  If HwDirIsDir() <> 0
+    ProcedureReturn 2
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
 ; EVERY FILE A PAYLOAD OPENED IS CLOSED WHEN IT IS ENTERED AND AGAIN WHEN IT
 ; RETURNS - handles and the one-file slot alike. On entry, because a handle
 ; left by the last payload would be a file this one never opened. On return,
@@ -2871,6 +2928,8 @@ Procedure BuildServiceTable()
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 1] = @SvcFileHSize
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 2] = @SvcFileHReadAt
   gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 3] = @SvcFileHClose
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 4] = @SvcDirHOpen
+  gSvcTab[#SVC_HDR_WORDS + #SVC_BASE_FILEH + 5] = @SvcDirHNext
 
   gSvcBuilt = 1
 EndProcedure

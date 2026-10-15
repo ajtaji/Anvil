@@ -183,8 +183,8 @@ def static_checks() -> int:
     abi = text(ABI)
     version = consts(text(ABI_VERSION))
     published = consts(abi)
-    if version.get("#SVC_ABI_MINOR") != 6:
-        raise GateFailure(f"#SVC_ABI_MINOR is {version.get('#SVC_ABI_MINOR')}, expected 6 "
+    if (version.get("#SVC_ABI_MINOR") or 0) < 6:
+        raise GateFailure(f"#SVC_ABI_MINOR is {version.get('#SVC_ABI_MINOR')}, expected 6 or later "
                           "- the net group at 1.5 and its TLS slots at 1.6 are minor bumps")
     if version.get("#SVC_SLOT_COUNT") != 200:
         raise GateFailure("#SVC_SLOT_COUNT moved; filling reserved slots must not move it")
