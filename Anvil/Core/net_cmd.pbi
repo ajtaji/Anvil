@@ -2625,11 +2625,21 @@ Procedure.i CmdDhcp()
   EndIf
   kind = LinkKind()
 
-  If DhcpClientState(kind) >= #DHCPC_BOUND
+  If DhcpClientState(kind) >= #DHCPC_BOUND And DhcpClientState(kind) <= #DHCPC_REBINDING
     PrintN("This interface already has a tracked DHCP lease. Its renewal and")
     PrintN("rebind are automatic; the live lease was left unchanged.")
     NetDhcpSay(kind)
     ProcedureReturn 1
+  EndIf
+  ; OFFLINE and REBOOTING are numbered above BOUND but are NOT a live lease:
+  ; the link was lost and only a remembered address is kept for INIT-REBOOT.
+  ; Until 2026-10-15 the test above was ">= BOUND", so `dhcp` typed in exactly
+  ; that state said "already has a lease" and did nothing. Typing it is an
+  ; explicit request for a fresh exchange: forget the remembered lease and
+  ; start a new DISCOVER below.
+  If DhcpClientState(kind) = #DHCPC_OFFLINE Or DhcpClientState(kind) = #DHCPC_REBOOTING
+    PrintN("The remembered lease is not in use (the link was lost); starting a fresh DISCOVER.")
+    NetDhcpCancel(kind)
   EndIf
 
   ; A direct-cable server is an explicit interface role. Silently stopping

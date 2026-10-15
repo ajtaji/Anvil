@@ -1392,7 +1392,14 @@ Procedure NetDhcpSay(kind.i)
   Print(", accepted binds ") : PrintDec(netdhcp_binds[kind])
   Print(", drops ") : PrintDec(netdhcp_drops[kind]) : PrintNl()
   If DhcpClientState(kind) >= #DHCPC_BOUND
-    Print("    address ") : PutIp(DhcpClientIp(kind))
+    ; OFFLINE / REBOOTING keep the address only to ask for it back; saying
+    ; "address" there read as a working lease on a board with none.
+    If DhcpClientState(kind) >= #DHCPC_OFFLINE
+      Print("    remembered address (not in use) ")
+    Else
+      Print("    address ")
+    EndIf
+    PutIp(DhcpClientIp(kind))
     Print(", server ") : PutIp(DhcpClientServer(kind))
     If DhcpClientNtp(kind) <> 0
       Print(", NTP ") : PutIp(DhcpClientNtp(kind))
