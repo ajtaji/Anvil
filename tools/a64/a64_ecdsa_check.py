@@ -180,6 +180,7 @@ HARNESS = r'''
 XIncludeFile "RaspberryPi4/Lib/uart.pi4"
 XIncludeFile "RaspberryPi4/Lib/bignum.pi4"
 XIncludeFile "RaspberryPi4/Lib/ec256.pi4"
+XIncludeFile "RaspberryPi4/Lib/ecp.pi4"
 XIncludeFile "__ECDSA__"
 
 #H_SCRIPT = $06000000
@@ -527,11 +528,18 @@ def build_script(g, level="full"):
 
     # ---- CheckCurves: -1 is not 0, and that distinction is the point -
     q, h, sig, expect, tag, note = asn1[0]
-    for cid, name in ((24, "P-384"), (25, "P-521"), (0, "curve id 0"),
-                      (29, "curve id 29")):
+    for cid, name in ((0, "curve id 0"), (29, "curve id 29")):
         s.add(OP_SEAM, "curve gate: %s must answer -1 (cannot answer), "
                        "never 0 (a verdict)" % name,
               curve=cid, q=q, h=h, sig=sig, verdict=M64, err=ERR_CURVE)
+    # P-384 and P-521 ARE computed since 2026-10-14 (ecp.pi4), so handed
+    # this P-256 record they give a real verdict: a 65-byte point is not
+    # a point on either curve, so the signature is REJECTED (0, BADSIG) -
+    # never -1, and never 1. Their own vectors are in a64_ecp_check.py.
+    for cid, name in ((24, "P-384"), (25, "P-521")):
+        s.add(OP_SEAM, "curve gate: %s is computed now; a P-256 key under "
+                       "it is rejected (0), not 'cannot answer'" % name,
+              curve=cid, q=q, h=h, sig=sig, verdict=0, err=ERR_BADSIG)
     if not mutant:
         s.add(OP_SEAM, "curve gate: P-256 on the same record still answers "
                        "a real verdict",

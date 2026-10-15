@@ -112,11 +112,13 @@
 ;
 ;  REQUIRES (the MAIN file lists these, in order, before this one):
 ;    * t0vm      - the bytecode VM this engine runs on.
-;    * sha256    - the TBS hash and the DN hash are both SHA-256 here.
+;    * sha256    - the DN hash, and the TBS hash of a SHA-256 signature.
 ;                  ON THIS PART THAT FILE IS Anvil/Core/sha256.pbi, not
 ;                  RaspberryPi4/Lib/sha256.pi4: it moved into the shared
 ;                  Anvil core when Anvil became a real bootloader and the
 ;                  Arduino UNO Q includes it from there.
+;    * sha512    - Anvil/Crypto/sha512.pbi: the TBS hash of a SHA-384 or
+;                  SHA-512 signature (2026-10-14).
 ;    * x509_blob - the lifted engine bytecode (defines T0LoadX509 and the
 ;                  #T0N_* native ids serviced below).
 ;    * ecdsa, rsa (optional) - the signature-verify seam. Absent => stub.
@@ -313,8 +315,29 @@
 ;  under tools/check_tls_twins.py --cross x509.
 ;  NOTHING HERE HAS RUN ON SILICON.
 ;
-;  ONLY SHA-256 signature/DN hashing is wired (the landed hash). A chain
-;  signed under SHA-1/384/512 is reported UNSUPPORTED, loudly, not guessed.
+;  THE TBS IS HASHED THE WAY BearSSL's br_multihash DOES IT (2026-10-14):
+;  the engine starts the TBS hash before it knows which algorithm signed
+;  the certificate - the signatureAlgorithm that names it comes AFTER the
+;  TBSCertificate - so every byte between start-tbs-hash and
+;  stop-tbs-hash is absorbed by SHA-256, SHA-384 and SHA-512 at once,
+;  each in its own snapshot (xTbsSnap, xTbs384Snap, xTbs512Snap), and
+;  compute-tbs-hash finishes the one the engine names by BearSSL's hash
+;  id: 4 = SHA-256 (32 bytes), 5 = SHA-384 (48), 6 = SHA-512 (64).
+;  SHA-1 (2) and SHA-224 (3) are NOT wired and answer 0, which the
+;  engine turns into #X509ERR_UNSUPPORTED (49) - loudly, never guessed.
+;  SHA-1 stays out on purpose: it is collision-broken, no public chain
+;  signs with it any more, and a validator that accepted it would accept
+;  forgeries a browser refuses. The DN hash is SHA-256 only, as before;
+;  it is this engine's private fingerprint of a name, not a signature.
+;
+;  THE HASH LENGTH TRAVELS. The length compute-tbs-hash pushes is what
+;  the engine stores in #X_cert_sig_hash_len, and X509VerifySig hands
+;  exactly that many bytes of xTbsHash to the verifier: RSA compares a
+;  48- or 64-byte DigestInfo hash under the SHA-384/512 OID the engine
+;  points at (rsa.pi4's DigestInfo check is OID- and length-generic),
+;  and ECDSA truncates the hash to the curve order's length itself
+;  (bits2int), so a P-256 key under ecdsa-with-SHA384 works as the
+;  standard says. xTbsHash and xTmpHash are 64 bytes for the largest.
 ;
 ;  CONTEXT RAM IS BOUNDS-CHECKED HERE, NOT IN THE VM. This engine owns its
 ;  own context array because it was lifted with --native-ram, which takes
@@ -420,13 +443,28 @@ Global xErr.i                  ; engine err set by fail / trust natives
 Global xHbuf.i
 Global xHlen.i
 
-; ---- hashing: two running SHA-256 kept as 104-byte snapshots so the TBS
-;      hash and the DN hash can both absorb the same byte stream through
-;      the one landed single-context hasher ----
+; ---- hashing: the running digests kept as snapshots so the TBS hashes
+;      and the DN hash can all absorb the same byte stream through the
+;      single-context hashers. The TBS is hashed three ways at once - the
+;      multihash - because the algorithm that signed it is named only
+;      after it; see the header. ----
 Global xDoMhash.i
 Global xDoDnhash.i
-Global Dim xTbsSnap.a[104]
+Global Dim xTbsSnap.a[104]           ; TBS, SHA-256 (sha256.pbi image)
+Global Dim xTbs384Snap.a[208]        ; TBS, SHA-384 (sha512.pbi image)
+Global Dim xTbs512Snap.a[208]        ; TBS, SHA-512 (sha512.pbi image)
 Global Dim xDnSnap.a[104]
+; THE TBS BYTE QUEUE. The engine reads DER headers one byte at a time,
+; and three restore/feed/snapshot rounds per byte (one per SHA-2 width,
+; 520 bytes of state copied) is where the multihash would spend its
+; time. Single bytes bound for the TBS hashes therefore queue here and
+; reach the three digests as one chunk - when the queue fills, before
+; any chunk is fed, and before the TBS hash is stopped. The order of
+; the bytes each digest sees is unchanged, which is all a hash can
+; observe. The DN hash is fed directly, as before.
+#X_TBSQ = 128
+Global Dim xTbsQ.a[#X_TBSQ]
+Global xTbsQn.i
 Global Dim xTbsHash.a[64]      ; finished TBS hash
 Global Dim xHashByte.a[4]      ; 1-byte feed scratch (for Sha256Update)
 Global Dim xTmpHash.a[64]      ; scratch for anchor DN hashing / recovered hash
@@ -664,12 +702,35 @@ EndProcedure
 ;  into whichever running hashes are active, snapshotting around each use
 ;  of the one shared hasher.
 ; ----------------------------------------------------------------------
+; The three TBS digests, one chunk. Each is restored, fed and saved
+; again, so the one SHA-512 context serves SHA-384 and SHA-512 in turn.
+Procedure XfeedTbs(addr.i, len.i)
+  Sha256Restore(@xTbsSnap)
+  Sha256Update(addr, len)
+  Sha256Snapshot(@xTbsSnap)
+  Sha512Restore(@xTbs384Snap)
+  Sha512Update(addr, len)
+  Sha512Snapshot(@xTbs384Snap)
+  Sha512Restore(@xTbs512Snap)
+  Sha512Update(addr, len)
+  Sha512Snapshot(@xTbs512Snap)
+EndProcedure
+
+Procedure XflushTbs()
+  If xTbsQn > 0
+    XfeedTbs(@xTbsQ, xTbsQn)
+    xTbsQn = 0
+  EndIf
+EndProcedure
+
 Procedure XfeedByte(b.i)
   xHashByte[0] = b & 255
   If xDoMhash
-    Sha256Restore(@xTbsSnap)
-    Sha256Update(@xHashByte, 1)
-    Sha256Snapshot(@xTbsSnap)
+    xTbsQ[xTbsQn] = b & 255
+    xTbsQn = xTbsQn + 1
+    If xTbsQn = #X_TBSQ
+      XflushTbs()
+    EndIf
   EndIf
   If xDoDnhash
     Sha256Restore(@xDnSnap)
@@ -683,9 +744,8 @@ Procedure XfeedChunk(addr.i, len.i)
     ProcedureReturn
   EndIf
   If xDoMhash
-    Sha256Restore(@xTbsSnap)
-    Sha256Update(addr, len)
-    Sha256Snapshot(@xTbsSnap)
+    XflushTbs()
+    XfeedTbs(addr, len)
   EndIf
   If xDoDnhash
     Sha256Restore(@xDnSnap)
@@ -886,8 +946,14 @@ Procedure XnHash(nid.i)
     Case #T0N_start_tbs_hash
       Sha256Begin()
       Sha256Snapshot(@xTbsSnap)
+      Sha384Begin()
+      Sha384Snapshot(@xTbs384Snap)
+      Sha512Begin()
+      Sha512Snapshot(@xTbs512Snap)
+      xTbsQn = 0
       xDoMhash = 1
     Case #T0N_stop_tbs_hash
+      XflushTbs()
       xDoMhash = 0
     Case #T0N_start_dn_hash
       Sha256Begin()
@@ -898,13 +964,25 @@ Procedure XnHash(nid.i)
       Sha256End(@xRam[#X_current_dn_hash])
       xDoDnhash = 0
     Case #T0N_compute_tbs_hash
+      ; BearSSL hash ids: 2 SHA-1, 3 SHA-224, 4 SHA-256, 5 SHA-384,
+      ; 6 SHA-512. The pushed value is the digest length; 0 means "not
+      ; computed here" and the engine fails with #X509ERR_UNSUPPORTED.
       id = T0Pop()
-      If id = 4                        ; only SHA-256 is wired
+      XflushTbs()
+      If id = 4
         Sha256Restore(@xTbsSnap)
         Sha256End(@xTbsHash)
         T0Push(32)
+      ElseIf id = 5
+        Sha384Restore(@xTbs384Snap)
+        Sha384End(@xTbsHash)
+        T0Push(48)
+      ElseIf id = 6
+        Sha512Restore(@xTbs512Snap)
+        Sha512End(@xTbsHash)
+        T0Push(64)
       Else
-        T0Push(0)                      ; unsupported hash -> engine faults loudly
+        T0Push(0)                      ; SHA-1 / SHA-224 -> engine faults loudly
       EndIf
   EndSelect
 EndProcedure
@@ -1348,6 +1426,7 @@ Procedure.i X509ValidateChain(certsAddr.i, lensAddr.i, count.i, serverAddr.i, se
   X509Err = 0
   xDoMhash = 0
   xDoDnhash = 0
+  xTbsQn = 0
   xPkeyType = 0
   X509EePkeyType = 0
   xServerAddr = serverAddr

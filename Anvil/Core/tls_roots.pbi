@@ -20,11 +20,12 @@
 ;  and tls13_hs's work, per connection.
 ;
 ;  WHAT x509 CAN AND CANNOT VERIFY, SAID HERE SO A COUNT IS NOT MISREAD.
-;  RSA roots and EC P-256 roots verify. ecdsa.pi4 does not implement
-;  P-384 or P-521 (it says so by name), and the Mozilla store has ~38
-;  such roots. They ARE registered, so a chain ending at one is refused
-;  as "curve not implemented" - a named gap - rather than as an unknown
-;  CA. `tls roots` prints the counts by kind.
+;  RSA roots and EC roots on P-256, P-384 and P-521 all verify (P-384
+;  and P-521 since 2026-10-14, through RaspberryPi4/Lib/ecp.pi4; the
+;  Mozilla store has ~38 such roots - GTS Root R4, USERTrust ECC, ISRG
+;  Root X2, DigiCert Global Root G3 among them). Certificates signed with
+;  SHA-256, SHA-384 or SHA-512 verify; SHA-1 is refused by name.
+;  `tls roots` prints the counts by kind.
 ;
 ;  x509 KEEPS EVERY ANCHOR BY ADDRESS, so the DN and key bytes are copied
 ;  into tlsroot_arena, which lives for the life of the monitor. The PEM
@@ -55,7 +56,7 @@ Global tlsroot_err.i
 Global tlsroot_certs.i             ; certificates seen in the file
 Global tlsroot_rsa.i
 Global tlsroot_p256.i
-Global tlsroot_ecOther.i           ; P-384 / P-521: registered, not verifiable
+Global tlsroot_ecOther.i           ; P-384 / P-521 roots
 Global tlsroot_bad.i               ; armour or DER this file would not parse
 Global tlsroot_full.i              ; certificates past x509's table
 Global tlsroot_bytes.i             ; size of the bundle read
@@ -541,7 +542,7 @@ Procedure TlsRootsShow()
   PrintN("   verifiable")
   Print("  EC P-384 / P-521 roots    ")
   PrintDec(tlsroot_ecOther)
-  PrintN("   registered; ecdsa.pi4 cannot verify these curves yet")
+  PrintN("   verifiable")
   If tlsroot_bad > 0
     Print("  not parsed                ")
     PrintDec(tlsroot_bad)
