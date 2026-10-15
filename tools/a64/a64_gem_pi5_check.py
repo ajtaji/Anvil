@@ -106,6 +106,8 @@ DMA_WIN = 0x10_0000_0000
 # RP1 GPIO: pinctrl-rp1.c rp1_iobanks[] - bank 1 is GPIO 28..33 at +$4000.
 IO_BANK0, RIO0, PADS0 = RP1_CPU + 0xD0000, RP1_CPU + 0xE0000, RP1_CPU + 0xF0000
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def fail(msg):
     raise SystemExit("a64_gem_pi5_check: FAIL - " + msg)

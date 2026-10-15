@@ -46,6 +46,8 @@ UART0 = 0x1F00030000
 PCIE1, PCIE1_SIZE = 0x1000110000, 0x10000
 BOUND_MS = 5000
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def die(msg):
     raise SystemExit("pi5_storage_order_check: FAIL - " + msg)

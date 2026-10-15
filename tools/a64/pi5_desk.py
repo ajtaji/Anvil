@@ -37,6 +37,7 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 from a64_interp import A64, attach_symbols        # noqa: E402
+import no_emulator_link; no_emulator_link.board("pi5")   # noqa: E402 - the first rule asks about the Pi 5
 from pmf_compiler import resolve_compiler          # noqa: E402
 
 LOAD = 0x400000

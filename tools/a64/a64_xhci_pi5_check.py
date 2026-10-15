@@ -77,6 +77,8 @@ LNK_WORD = 0xBC
 CFG_INDEX = 0x9000
 CFG_DATA = 0x8000
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def rc_bar(n: int) -> int:
     return 0x402C + 8 * (n - 1) if n <= 3 else 0x40D4 + 8 * (n - 4)

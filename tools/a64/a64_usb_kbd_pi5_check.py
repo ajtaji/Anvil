@@ -72,6 +72,8 @@ SCRIPT = [H.kr(0), H.kr(0), H.kr(0, 0x0B), H.kr(0), H.kr(0, 0x0C),
           H.kr(0x02, 0x1E), H.kr(0), H.kr(0, 0x28), H.kr(0), H.kr(0),
           H.kr(0), H.kr(0), H.kr(0), H.kr(0), H.kr(0), H.kr(0)]
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def ref_char(prev: bytes, cur: bytes) -> int:
     """The first key newly DOWN in cur (not in prev), as KeyboardChar

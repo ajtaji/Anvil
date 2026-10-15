@@ -96,6 +96,8 @@ HUB_INT_TFUC, HUB_INT_TFUF = K["HUB_INT_TFUC"], K["HUB_INT_TFUF"]
 
 P4.MBX_BUS_OFFSET = 0     # Firmware.submit reads it; 2712 buffers are ARM-physical
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 class Tfu71:
     """The 7.1 TFU. `mode`: normal, dead, fail, tfuc_never, raster_out."""

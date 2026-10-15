@@ -51,6 +51,8 @@ mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 class Fail(Exception):
     pass

@@ -73,6 +73,8 @@ SETWAY_OPS = 2 * 8 * 4
 WANT_TCR = 0x80823518
 WANT_MAIR = 0xFF440C0400
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)

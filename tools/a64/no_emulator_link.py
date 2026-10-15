@@ -48,8 +48,26 @@ def _guard():
     return None
 
 
-def require(families, what):
-    """Ask before the first instruction of `what` runs; a refusal ends the tool as NOT RUN (exit 2)."""
+#: the board this process's A64 model stands in for. EACH BOARD IS ITS OWN (ruling 2026-10-15): a Pi 4
+#: on the bench stops a Pi 4 gate and leaves a Pi 5 gate alone. The Pi 4 unless the gate says otherwise:
+#: a gate that grades another board's code calls board() before its first instruction (pi5_desk.py does
+#: it for every Pi 5 desk gate; a64_target.apply_target() for every gate that picks its target).
+BOARD = ["pi4"]
+
+
+def board(name):
+    """Say which board (no_emulator.BOARDS['pi']: pi4, pi3, pi5, unoq, rockpi4c) this process's model is."""
+    BOARD[0] = name
+
+
+def require_model(what):
+    """The A64 model's question, for the board set by board()."""
+    require("pi", "%s as a %s" % (what, BOARD[0]), boards=BOARD[0])
+
+
+def require(families, what, boards=None):
+    """Ask before the first instruction of `what` runs; a refusal ends the tool as NOT RUN (exit 2).
+    `boards`: the board(s) `what` stands in for (None = any board of the family)."""
     guard = _guard()
     if guard is None:
         msg = ("not run: the compiler's tools/no_emulator.py was not found (looked in %s), so it cannot be "
@@ -61,4 +79,4 @@ def require(families, what):
         except Exception:                     # noqa: BLE001
             pass
         raise SystemExit(NOT_RUN_EXIT)
-    guard.require(families, what)
+    guard.require(families, what, boards=boards)

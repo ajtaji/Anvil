@@ -81,6 +81,8 @@ REL_DUMP = "RaspberryPi4/Examples/Diagnostics/pi5PcieInboundDump.pi4"
 LIBS = (REL_LIB, "RaspberryPi4/Lib/gpio_rp1.pi4", "RaspberryPi4/Lib/xhci.pi4")
 RP1_ID = 0x00011DE4
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def rc_bar(n):
     return 0x402C + 8 * (n - 1) if n <= 3 else 0x40D4 + 8 * (n - 4)

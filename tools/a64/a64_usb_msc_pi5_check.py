@@ -70,6 +70,8 @@ DISK_SECTORS = PART_LBA + PART_SECTORS + 64
 HELLO = b"Hello from a Pi 5 USB stick, read through RP1.\r\n"
 NEW = bytes((i * 7 + 3) & 0x7F | 0x20 for i in range(64))
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 # ======================================================================
 #  THE STICK - USB 3.0, Bulk-Only Transport (USB MSC BOT 1.0), SCSI SBC.
