@@ -22,13 +22,21 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-# THE FIRST RULE: no model runs while a Pi is available (no_emulator_link.py). A statement of the
-# module, so every gate that imports this core - or loads it from its path - is refused before a
-# machine of it exists.
+# THE FIRST RULE: no model runs while its board is available (no_emulator_link.py). Asked by the
+# FIRST INSTRUCTION this core executes (A64.step - every subclass and every run loop goes through it),
+# not at import, because only then is it known which board the process stands in for: each board is
+# its own (ruling 2026-10-15), so a Pi 4 on the bench stops a Pi 4 gate and leaves a Pi 5 gate alone.
+# The board is the Pi 4 unless the gate said otherwise (no_emulator_link.board("pi5")).
 import sys as _sys
 if str(Path(__file__).resolve().parent) not in _sys.path:
     _sys.path.append(str(Path(__file__).resolve().parent))
-import no_emulator_link; no_emulator_link.require('pi', 'a64_interp (the Python A64 core)')  # noqa: E402
+import no_emulator_link  # noqa: E402
+_GUARD_ASKED = [False]
+
+
+def _guard_first_instruction() -> None:
+    no_emulator_link.require_model('a64_interp (the Python A64 core)')
+    _GUARD_ASKED[0] = True
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -937,6 +945,8 @@ class A64:
         return self.system_registers.get(write_base)
 
     def step(self) -> None:
+        if not _GUARD_ASKED[0]:
+            _guard_first_instruction()
         here = self.pc
         # THE FAULT MUST NAME THE INSTRUCTION THAT MADE THE ACCESS, not
         # the one after it.  self.pc is advanced below before the operand

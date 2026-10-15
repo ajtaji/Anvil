@@ -75,6 +75,8 @@ MMIO_FLOOR = 0x10_0000_0000
 COMPILER = {"path": None}
 OVERRIDE: dict = {}
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def die(msg: str):
     raise SystemExit("a64_fan_pi5_check: " + msg)

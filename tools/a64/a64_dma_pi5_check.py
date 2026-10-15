@@ -92,6 +92,8 @@ PINNED = {
     "XI_BURST_SHIFT": (8, "298"),
 }
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def fail(msg: str) -> None:
     raise SystemExit("a64_dma_pi5_check: FAIL - " + msg)

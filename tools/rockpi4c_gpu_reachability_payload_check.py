@@ -79,7 +79,7 @@ def emitted_mmio(assembly: Path) -> tuple[list[int], list[int]]:
 
 def emulate(data: bytes, infra: dict[int, int]) -> tuple[int, bytes, list[int], list[int]]:
     import sys; sys.path.append(str(Path(__file__).resolve().parent / "a64"))
-    import no_emulator_link; no_emulator_link.require('pi', 'unicorn (an in-process AArch64 emulator)')  # noqa: E402
+    import no_emulator_link; no_emulator_link.require('pi', 'unicorn (an in-process AArch64 emulator) as a ROCK Pi 4C', boards='rockpi4c')  # noqa: E402
     from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
     from unicorn.arm64_const import UC_ARM64_REG_SP, UC_ARM64_REG_X0, UC_ARM64_REG_X30
 

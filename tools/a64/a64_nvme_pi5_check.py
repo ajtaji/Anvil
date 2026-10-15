@@ -65,6 +65,8 @@ CTL, OUT, BUF, ARENA, DONE = 0x00E00000, 0x00E00100, 0x00E01000, 0x01000000, 0x6
 BIG = 0x00E20000
 RAW_LBA, RAW_N = 1000, 48
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def raw_pattern(sector):
     return bytes(((sector * 31 + i * 7) ^ (i >> 3)) & 0xFF for i in range(512))

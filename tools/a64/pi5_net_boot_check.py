@@ -53,6 +53,8 @@ TAG_MAC = 0x00010003
 MAC = bytes.fromhex("2ccf67000001")
 LL_WORST_MS = 19000          # netll.pbi: "nine seconds if nobody objects, nineteen in the worst case"
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def die(msg):
     raise SystemExit("pi5_net_boot_check: FAIL - " + msg)

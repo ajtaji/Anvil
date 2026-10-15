@@ -69,6 +69,8 @@ DR, FR, IBRD, FBRD, LCRH, CR, IMSC, ICR = 0x00, 0x18, 0x24, 0x28, 0x2C, 0x30, 0x
 FR_TXFF, FR_RXFE = 0x20, 0x10
 STUB_IBRD, STUB_CR, STUB_LCRH = 24, 0x301, 0x70    # armstub8-2712.asm primary_prepare
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def fail(msg):
     raise SystemExit("a64_uart10_pi5_check: FAIL - " + msg)

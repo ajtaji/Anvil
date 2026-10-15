@@ -80,6 +80,8 @@ FW, NV, CLM, DTB = 0x01000000, 0x01200000, 0x01300000, 0x02000000
 FW_PREFIX = 32768
 TREES = {"bcm2712-rpi-5-b.dtb": "C0", "bcm2712d0-rpi-5-b.dtb": "D0", "bcm2712-d-rpi-5-b.dtb": None}
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 class Cyw43Card2712(pi4gate.Cyw43Card):
     """The Pi 4 gate's CYW43455, with function 2 slow to come ready."""

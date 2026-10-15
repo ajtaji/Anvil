@@ -92,6 +92,8 @@ DEVICE_ADDRS = {
     "RP1 GPIO $1F_000D_0000": 0x1F_000D_0000,
 }
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def ram_ranges(fb_lo: int, fb_hi: int) -> dict[str, tuple[int, int]]:
     return {

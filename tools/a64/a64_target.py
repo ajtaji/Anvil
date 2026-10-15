@@ -106,6 +106,8 @@ def apply_target(g: dict, name: str) -> dict:
             "tools/a64/a64_target.py, not by editing a gate."
             % (name, ", ".join(sorted(TARGETS))))
     row = TARGETS[name]
+    import no_emulator_link             # the first rule asks about THIS board (each board is its own)
+    no_emulator_link.board(name)
     offset = None
     if "H_SCRIPT" in g and "H_RESULT" in g:
         offset = g["H_RESULT"] - g["H_SCRIPT"]

@@ -81,6 +81,8 @@ SMS_IDLE, SMS_ISO_RESET, SMS_RESETTING, SMS_POWER_OFF_STATE = 0x0, 0xA, 0xB, 0xD
 MIDR_A76 = 0x414FD0B1    # implementer $41, part $D0B (cputype.h:54,75); variant/rev illustrative
 MIDR_A72 = 0x410FD083    # part $D08 (cputype.h:69); the Pi 4's value per a64_interp.py
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 class Hang(SystemExit):
     pass

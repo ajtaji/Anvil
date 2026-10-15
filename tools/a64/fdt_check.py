@@ -50,6 +50,8 @@ DTB_AT = 0x1000000
 IN, OUT = 0x5F0000, 0x5F1000
 NQ = 19
 
+import no_emulator_link; no_emulator_link.board("pi5")  # noqa: E402 - the first rule asks about the Pi 5 (each board is its own)
+
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)

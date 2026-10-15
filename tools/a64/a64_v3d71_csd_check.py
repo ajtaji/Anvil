@@ -44,7 +44,7 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
-import no_emulator_link; no_emulator_link.require('pi', 'a64_v3d71_csd_check (its own model of the V3D 7.1 QPU)')  # noqa: E402
+import no_emulator_link; no_emulator_link.require('pi', 'a64_v3d71_csd_check (its own model of the Pi 5 V3D 7.1 QPU)', boards='pi5')  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 import a64_v3d71_tfu_check as T  # noqa: E402
 import v3d71_qpu as Q  # noqa: E402
