@@ -1407,6 +1407,7 @@ Procedure wifi_BindAddress(ip.i, mask.i, gw.i)
   ; path, silently.
   NetSetMac(#HW_LINK_WIFI, @wifi_ourMac[0])
   NetSetIPv4(#HW_LINK_WIFI, ip, mask, gw)
+  wifi_RetryReset()                     ; a connection completed (wpa_supplicant clears both counts)
   Cyw43ArpHostIp(ip, 500)               ; brcmf_inetaddr_changed NETDEV_UP (2026-10-15)
   ; ------------------------------------------------------------------
   ; AND RECORD WHERE THE ADDRESS CAME FROM, 2026-09-07.
@@ -2006,7 +2007,70 @@ EndProcedure
 #WIFI_PROOF_MS     = 45000     ; nothing heard for this long, with keepalives asking
                                ;   for an answer -> the link is dead whatever the
                                ;   firmware's association poll says (see below)
-#WIFI_HEAL_MS      = 60000     ; cadence of automatic rejoin retries after a heal failed
+#WIFI_HEAL_MS      = 60000     ; the radio bring-up backoff (and, until 2026-10-15, every rejoin retry)
+; ----------------------------------------------------------------------
+;  THE REJOIN RETRY SCHEDULE IS wpa_supplicant's (2026-10-15, Ron: "yes
+;  please" to matching it). Raspberry Pi OS (bookworm) runs wpa_supplicant
+;  2.10; read from hostap_2_10:
+;    wpas_connection_failed (wpa_supplicant/wpa_supplicant.c:7654): the
+;      next attempt after 100 / 500 / 1000 / 5000 ms for consecutive
+;      failure 1 / 2 / 3 / 4, then 10000 ms; and from the 4th consecutive
+;      failure on it also calls wpas_auth_failed,
+;    wpas_auth_failed: the network is held off for 10 / 20 / 30 / 60 / 90 /
+;      120 / 300 s as auth_failures passes 1 / 2 / 3 / 4-5 / 6-10 / 11-50 /
+;      over 50, plus os_random() % (auth_failures * 10) s once it is over 1.
+;    Both are cleared when a connection completes. A disconnection by the
+;    access point is retried at once (wpa_supplicant_event_disassoc_finish:
+;    fast reconnect, or a scan in 100 ms) - Anvil's recovery already starts
+;    within the same tick.
+;  Until this every failed attempt waited a flat 60 s: the router's 03:00
+;  deauthentication of 2026-10-16 (reason 3) cost 83 s, 60 of them that wait.
+; ----------------------------------------------------------------------
+Global gWifiHealDelay.i = 60000, gWifiConnFails.i, gWifiAuthFails.i
+
+Procedure.i wifi_RetryDelayAfterFail()
+  Define t.i
+  Define dur.i
+  gWifiConnFails = gWifiConnFails + 1
+  Select gWifiConnFails
+    Case 1 : t = 100
+    Case 2 : t = 500
+    Case 3 : t = 1000
+    Case 4 : t = 5000
+    Default : t = 10000
+  EndSelect
+  If gWifiConnFails > 3
+    gWifiAuthFails = gWifiAuthFails + 1
+    If gWifiAuthFails > 50
+      dur = 300
+    ElseIf gWifiAuthFails > 10
+      dur = 120
+    ElseIf gWifiAuthFails > 5
+      dur = 90
+    ElseIf gWifiAuthFails > 3
+      dur = 60
+    ElseIf gWifiAuthFails > 2
+      dur = 30
+    ElseIf gWifiAuthFails > 1
+      dur = 20
+    Else
+      dur = 10
+    EndIf
+    If gWifiAuthFails > 1
+      dur = dur + ((millis() * 1103515245 + 12345) & $7FFFFFFF) % (gWifiAuthFails * 10)
+    EndIf
+    If dur * 1000 > t : t = dur * 1000 : EndIf
+  EndIf
+  gWifiHealDelay = t
+  ProcedureReturn t
+EndProcedure
+
+; A connection completed (an address is bound): both counts start again.
+Procedure wifi_RetryReset()
+  gWifiConnFails = 0
+  gWifiAuthFails = 0
+  gWifiHealDelay = #WIFI_HEAL_MS
+EndProcedure
 
 Global gWifiLinkOn.i   = 1     ; 1 = periodic keepalive + health active
 Global gWifiKaLast.i   = 0     ; millis() of the last health cycle (0 = unseeded)
@@ -2915,6 +2979,7 @@ Procedure WifiRecoveryInitialJoinFailed()
   EndIf
   gWifiHealPend = 1
   gWifiHealLast = millis()
+  wifi_RetryDelayAfterFail()
   gWifiKaLast = 0
   PrintN("Wi-Fi: the radio is ready; the failed boot join will be retried cooperatively.")
 EndProcedure
@@ -3013,6 +3078,7 @@ Procedure.i WifiRejoin(announce.i)
     ; keeps the automatic retry alive on the #WIFI_HEAL_MS cadence.
     gWifiHealPend = 1
     gWifiHealLast = millis()
+    wifi_RetryDelayAfterFail()
     gWifiKaLast = 0
     ProcedureReturn 0
   EndIf
@@ -3187,6 +3253,7 @@ Procedure wifi_RecoverCandidateFail()
   wifi_RecordLinkDown()
   gWifiHealPend = 1
   gWifiHealLast = millis()
+  wifi_RetryDelayAfterFail()
   gWifiKaLast = 0
 EndProcedure
 
@@ -4098,7 +4165,7 @@ Procedure WifiLinkTick()
     ; attempt strands the board. The new phase generation starts silently
     ; here; its final success/failure owns any narration.
     If gWifiHealPend <> 0 And gWifiHealOn <> 0
-      If ((millis() - gWifiHealLast) & $FFFFFFFF) >= #WIFI_HEAL_MS
+      If ((millis() - gWifiHealLast) & $FFFFFFFF) >= gWifiHealDelay
         gWifiHealLast = millis()
         WifiRecoveryStart(0)
       EndIf
