@@ -8,7 +8,11 @@
 ;    BCM2711 (Pi 4)  RaspberryPi4/Lib/bt_uart.pi4 - the PL011 on GPIO 30-33
 ;  The board includes exactly one of those two, under the same
 ;  CompilerIf #PMF_CHIP = 2712, before this file.
-;  DESK PROOF ONLY (tools/a64/hci_bt_check.py). Silicon owed.
+;  THE PI 4 LENDS ITS CONSOLE (2026-10-16): the console's PL011 is the
+;  only one that reaches the controller, so HwBtOpen borrows it
+;  (bt_uart.pi4, THE BORROW) and tells uart.pi4 the PL011 is lent: the
+;  serial wire goes quiet until HwBtClose, the screen and the network
+;  console keep every line. The Pi 5's Bluetooth UART is its own.
 ; ======================================================================
 CompilerIf #PMF_CHIP = 2712
 
@@ -36,14 +40,78 @@ Procedure.i HwBtWhy()
   ProcedureReturn Bt7Why()
 EndProcedure
 
+Procedure.i HwBtConsoleLent()
+  ProcedureReturn 0
+EndProcedure
+
+Procedure HwBtDiag()
+  PrintN("No Pi 5 Bluetooth diagnostics yet.")
+EndProcedure
+
 CompilerElse
 
 Procedure.i HwBtOpen()
-  ProcedureReturn BtuOpen()
+  Define lend.i
+  BtuMayBorrowConsole(1)
+  lend = BtuConsoleOnPl011()
+  If lend <> 0 : UartLend(1) : EndIf
+  If BtuOpen() = 0
+    UartLend(0)
+    ProcedureReturn 0
+  EndIf
+  ProcedureReturn 1
 EndProcedure
 
 Procedure HwBtClose()
   BtuClose()
+  UartLend(0)
+EndProcedure
+
+; 1 while the serial console is lent to Bluetooth (the Pi 4 only).
+Procedure.i HwBtConsoleLent()
+  ProcedureReturn BtuBorrowed()
+EndProcedure
+
+; `bt diag`: what the PL011, the pins and BT_ON say right now.
+Procedure HwBtDiag()
+  Print("BT_ON reads ")
+  PrintDec(BtuPowerState())
+  Print(" (before the first open: ")
+  PrintDec(btu_powerBefore)
+  Print(", mailbox failures ")
+  PrintDec(btu_powerErr)
+  Print("); UART open ")
+  PrintDec(btu_open)
+  Print(", console lent ")
+  PrintDec(btu_borrowed)
+  PrintN(".")
+  Print("PL011 FR ")
+  PrintDec(BtuRd(#BTU_FR) & $FFFF)
+  Print(" CR ")
+  PrintDec(BtuRd(#BTU_CR) & $FFFF)
+  Print(" IBRD ")
+  PrintDec(BtuRd(#BTU_IBRD))
+  Print(" FBRD ")
+  PrintDec(BtuRd(#BTU_FBRD))
+  Print(" LCRH ")
+  PrintDec(BtuRd(#BTU_LCRH) & $FF)
+  Print("; GPIO 30-33 functions ")
+  PrintDec(PinModeGet(30))
+  Print(" ")
+  PrintDec(PinModeGet(31))
+  Print(" ")
+  PrintDec(PinModeGet(32))
+  Print(" ")
+  PrintDec(PinModeGet(33))
+  Print(" (ALT3 = ")
+  PrintDec(#PIN_ALT3)
+  Print("), 14/15 ")
+  PrintDec(PinModeGet(14))
+  Print(" ")
+  PrintDec(PinModeGet(15))
+  Print(", CTS (GPIO 30) level ")
+  PrintDec(DigitalRead(30))
+  PrintN(".")
 EndProcedure
 
 Procedure.i HwBtPut(b.i)

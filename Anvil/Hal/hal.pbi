@@ -1597,6 +1597,8 @@
 ;                 HwBtGet()              a byte, or -1: never blocks
 ;                 HwBtSetBaud(baud)      the host side only; 1 or 0
 ;                 HwBtWhy()              ADDRESS of a sentence
+;                 HwBtConsoleLent()      1 while the serial console
+;                                        is lent to Bluetooth (Pi 4)
 ;
 ;    HwSpi*    (#CAP_SPI)  SPI. It stays on the critical path after the
 ;              2026-09-04 ruling because LoRa is a module on SPI and LoRa

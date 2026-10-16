@@ -1,0 +1,283 @@
+; pi4BtProbe.pi4 - Anvil's own Bluetooth stack on the Pi 4, as a RAM payload.
+;
+; DIAGNOSTIC. Does not ship. (Ron, 2026-10-16: "you have payloads on anvil to
+; test things" - iterate the driver here, in seconds, and build the monitor
+; once it is proven.)
+;
+; It compiles Anvil's shared files unchanged - RaspberryPi4/Lib/bt_uart.pi4,
+; Anvil/Net/hci.pbi, l2cap.pbi, a2dp.pbi, Anvil/Audio/sbc.pbi - over a payload
+; HwBt* seam (no console to lend: a payload owns the machine while it runs).
+;
+; BEFORE RUNNING: load BRCMBT.HCD 2000000   (the CYW43455 patch, 63806 bytes)
+; Build (cwd = the Anvil tree, PMF_ROOT = the same):
+;   PureMetalForge.exe --compile RaspberryPi4/Examples/Diagnostics/pi4BtProbe.pi4
+;     -t pi4 --load-addr 0x800000 --stack-addr 0x4F00000 --entry-returns --wants-services -o <out>.img
+; Run: tools/board_run_leased.py ... --addr 0x800000 --deadman 60 --trace 3000000:256
+;
+; MODE: bring up and report; and if the six bytes at $3000200 are not all zero
+; (a device address, most significant first, written there with `write`
+; before the run), stream a 1 kHz tone to it for #BTP_TONE_S seconds.
+; Build with --wants-services: the deadman is petted through slot 6 (SvcPet)
+; from hci.pbi's wait hook and the tone loop, so a long run stays alive.
+;
+; THE TRACE at $3000000, 32 quads (read with --trace 3000000:256):
+;   0 'BTPR'  1 step reached  2 HciError()  3 HciStatus()
+;   4 BT_ON before  5 BT_ON after open  6 PL011 FR after open  7 bytes received
+;   8 HCI version  9 manufacturer  10 LMP subversion  11 ACL buffers
+;   12 ACL bytes  13 pairing answers  14 A2DP state  15 A2DP fail step
+;   16 A2DP fail code  17 packets sent  18 setup ms  19 waits for a buffer
+;   20 receive errors  21 commands from the sink  22 mailbox failures
+;   23 GPIO 30-33 functions (4 bits each)  24 CTS level
+;   at $3000100 (once the peer address is copied out): the first 64 bytes received
+; x0: 0 = every step of the mode passed, else the step number that failed.
+
+#BTP_TONE_S = 10
+#BTP_LEAD_FRAMES = 75     ; 200 ms ahead of the clock (375 frames a second)
+#BTP_TRACE  = $3000000
+#BTP_PEER   = $3000200
+#BTP_SCAN   = $3000400
+#BTP_BOND   = $3000300      ; 'BOND' + 22 bytes, kept in RAM between runs
+#BTP_TABLES = $4F80000      ; this payload's own translation tables (12 KB)
+#BTP_OWNADDR = $3000330     ; 'ADDR' + 6 bytes (MSB first): use this address
+#BTP_PATCH  = $2000000
+#BTP_PATCH_BYTES = 63806
+
+XIncludeFile "RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+XIncludeFile "RaspberryPi4/Lib/bt_uart.pi4"
+
+; ---- the payload's HwBt* seam: bt_uart.pi4, borrowing the PL011 ---------
+Procedure.i HwBtOpen()
+  BtuMayBorrowConsole(1)
+  ProcedureReturn BtuOpen()
+EndProcedure
+Procedure HwBtClose()
+  BtuClose()
+EndProcedure
+Procedure.i HwBtPut(b.i)
+  ProcedureReturn BtuPut(b)
+EndProcedure
+Procedure.i HwBtGet()
+  ProcedureReturn BtuGet()
+EndProcedure
+Procedure.i HwBtSetBaud(baud.i)
+  ProcedureReturn BtuSetBaud(baud)
+EndProcedure
+Procedure.i HwBtWhy()
+  ProcedureReturn BtuWhy()
+EndProcedure
+
+XIncludeFile "Anvil/Net/hci.pbi"
+XIncludeFile "Anvil/Audio/sbc.pbi"
+XIncludeFile "Anvil/Net/l2cap.pbi"
+XIncludeFile "Anvil/Net/a2dp.pbi"
+
+Global Dim btp_frames.a[256]
+Global gTable.i
+Global *svc_pet
+Global *svc_uptimeus
+
+Procedure CaptureX0()
+  ASM
+    adrp x1, global_gtable
+    add  x1, x1, #:lo12:global_gtable
+    str  x0, [x1]
+  EndASM
+EndProcedure
+
+Procedure PetIdle()
+  If *svc_pet <> 0 : svc_pet() : EndIf
+EndProcedure
+
+Procedure.i PeerGiven()
+  Define i.i
+  For i = 0 To 5
+    If PeekA(#BTP_PEER + i) <> 0 : ProcedureReturn 1 : EndIf
+  Next
+  ProcedureReturn 0
+EndProcedure
+
+Procedure Tr(i.i, v.i)
+  PokeI(#BTP_TRACE + i * 8, v)
+EndProcedure
+
+Procedure TraceState(step.i)
+  Define i.i
+  Tr(1, step)
+  Tr(2, HciError())
+  Tr(3, HciStatus())
+  Tr(4, btu_powerBefore)
+  Tr(7, HciRxBytes())
+  Tr(13, HciPairings())
+  Tr(20, HciRxErrors())
+  Tr(22, btu_powerErr)
+  Tr(23, (PinModeGet(30) << 12) | (PinModeGet(31) << 8) | (PinModeGet(32) << 4) | PinModeGet(33))
+  Tr(24, DigitalRead(30))
+  For i = 0 To 63 : PokeA(#BTP_TRACE + 256 + i, HciRxRingByte(i)) : Next
+EndProcedure
+
+Procedure.i Tone()
+  Define hz.i, t0.i, due.i, sent.i, have.i, i.i, k.i, phase.i, fb.i, misses.i, state.i
+  hz = TickHz()
+  SbcStereo = 1
+  fb = 68
+  t0 = Ticks()
+  If PeekL(#BTP_BOND) = $444E4F42
+    HciLinkKeySet(#BTP_BOND + 4)
+  EndIf
+  If A2dpBegin(#BTP_PEER, 1) = 0 : ProcedureReturn 20 : EndIf
+  Repeat
+    state = A2dpPoll()
+    PetIdle()
+  Until state = #A2DP_STREAMING Or state = #A2DP_FAILED
+  Tr(18, (Ticks() - t0) / (hz / 1000))
+  Tr(14, state)
+  Tr(15, A2dpFailStep())
+  Tr(16, A2dpFailCode())
+  Tr(26, HciKeysGiven())
+  Tr(27, HciKeysNew())
+  If HciLinkKeyGet(#BTP_BOND + 4) <> 0 : PokeL(#BTP_BOND, $444E4F42) : EndIf
+  If state = #A2DP_FAILED
+    A2dpEnd()
+    ProcedureReturn 21
+  EndIf
+  t0 = Ticks()
+  If *svc_uptimeus <> 0 : Tr(31, svc_uptimeus()) : EndIf
+  sent = 0 : have = 0 : phase = 0 : misses = 0
+  Repeat
+    A2dpPoll()
+    PetIdle()
+    If A2dpStreaming() = 0 : Break : EndIf
+    due = ((Ticks() - t0) * 375) / hz
+    If have < 3 And sent + have < due + #BTP_LEAD_FRAMES
+      For i = 0 To 127
+        SbcPcm(i) = PeekW(?btp_sine + phase * 2)
+        phase = phase + 1
+        If phase >= 48 : phase = 0 : EndIf
+      Next
+      SbcEncode()
+      For k = 0 To fb - 1 : btp_frames[have * fb + k] = SbcEncoded(k) : Next
+      have = have + 1
+    EndIf
+    If have = 3
+      If A2dpSend(@btp_frames[0], 3) <> 0
+        sent = sent + 3 : have = 0
+      Else
+        misses = misses + 1
+      EndIf
+    EndIf
+  Until sent >= #BTP_TONE_S * 375
+  Tr(28, Ticks() - t0)
+  Tr(30, hz)
+  If *svc_uptimeus <> 0 : Tr(31, svc_uptimeus() - PeekI(#BTP_TRACE + 31 * 8)) : EndIf
+  Tr(14, A2dpState())
+  Tr(17, A2dpPackets())
+  Tr(19, misses)
+  Tr(21, A2dpPeerCommands())
+  state = A2dpState()
+  A2dpEnd()
+  If HciLinkKeyGet(#BTP_BOND + 4) <> 0 : PokeL(#BTP_BOND, $444E4F42) : EndIf
+  If state <> #A2DP_STREAMING : ProcedureReturn 22 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+Global btpMmuOn.i
+Declare.i BtpMain()
+
+; CACHES ON (as TruckGPS): with them off the SBC encoder ran at 39% of real
+; time on the board (10 s of tone took 25.9 s to send) and the headset
+; played it as a pulse. The framebuffer and Ethernet windows stay uncached,
+; as in the monitor's own map.
+Procedure BtpCachesOn()
+  MmuClearNc()
+  MmuAddNc($08A00000, $09200000)
+  MmuAddNc($08100000, $08180000)
+  If MmuBuildTables(#BTP_TABLES) = 0
+    MmuEnableCached()
+    btpMmuOn = MmuEnabled()
+  EndIf
+EndProcedure
+
+Procedure BtpCachesOff()
+  If btpMmuOn <> 0 : MmuDisableCachedFlushed() : btpMmuOn = 0 : EndIf
+EndProcedure
+
+Procedure.i Main()
+  Define i.i, r.i
+  CaptureX0()
+  BtpCachesOn()
+  r = BtpMain()
+  BtpCachesOff()
+  ProcedureReturn r
+EndProcedure
+
+Procedure.i BtpMain()
+  Define i.i, r.i, n.i, k.i
+  If gTable <> 0
+    *svc_pet = PeekI(gTable + 16 + 6 * 8)
+    *svc_uptimeus = PeekI(gTable + 16 + 11 * 8)
+    *hci_idle = @PetIdle
+  EndIf
+  For i = 0 To 31 : Tr(i, 0) : Next
+  PokeL(#BTP_TRACE, $52505442)            ; "BTPR"
+  If MailboxInit() = 0 : ProcedureReturn 1 : EndIf
+  TraceState(2)
+  If HciOpen() = 0
+    TraceState(2)
+    Tr(5, BtuPowerState())
+    Tr(6, BtuRd(#BTU_FR))
+    HciClose()
+    ProcedureReturn 2
+  EndIf
+  Tr(5, BtuPowerState())
+  Tr(6, BtuRd(#BTU_FR))
+  TraceState(3)
+  If HciLoadPatch(#BTP_PATCH, #BTP_PATCH_BYTES) = 0 : TraceState(3) : HciClose() : ProcedureReturn 3 : EndIf
+  TraceState(4)
+  If HciSetBaud(3000000) = 0 : TraceState(4) : HciClose() : ProcedureReturn 4 : EndIf
+  TraceState(5)
+  If HciReadLocalVersion() = 0 Or HciReadBdAddr() = 0 : TraceState(5) : HciClose() : ProcedureReturn 5 : EndIf
+  Tr(8, HciHciVer())
+  Tr(9, HciManufacturer())
+  Tr(10, HciLmpSubver())
+  TraceState(6)
+  If HciReadBufferSize() = 0 : TraceState(6) : HciClose() : ProcedureReturn 6 : EndIf
+  Tr(11, HciAclTotal())
+  Tr(12, HciAclMax())
+  If PeekL(#BTP_OWNADDR) = $52444441
+    If HciWriteBdAddr(#BTP_OWNADDR + 4) = 0 : TraceState(7) : HciClose() : ProcedureReturn 10 : EndIf
+  EndIf
+  For i = 0 To 5 : PokeA(#BTP_TRACE + 232 + i, HciBdAddrByte(i)) : Next
+  TraceState(7)
+  If HciLinkSetup() = 0 : TraceState(7) : HciClose() : ProcedureReturn 7 : EndIf
+  TraceState(8)
+  r = 0
+  If PeerGiven() <> 0
+    r = Tone()
+    TraceState(r)
+  Else
+    ; No device named: scan 8 x 1.28 s and keep what answered at $3000400,
+    ; 16 bytes each - address (6, most significant first), class (3),
+    ; RSSI + 128 (1).
+    n = HciInquiry(8)
+    Tr(25, n)
+    For i = 0 To n - 1
+      For k = 0 To 5 : PokeA(#BTP_SCAN + i * 16 + k, HciDeviceAddrByte(i, k)) : Next
+      PokeA(#BTP_SCAN + i * 16 + 6, (HciDeviceClass(i) >> 16) & $FF)
+      PokeA(#BTP_SCAN + i * 16 + 7, (HciDeviceClass(i) >> 8) & $FF)
+      PokeA(#BTP_SCAN + i * 16 + 8, HciDeviceClass(i) & $FF)
+      PokeA(#BTP_SCAN + i * 16 + 9, HciDeviceRssi(i) + 128)
+    Next
+    If n < 0 : r = 9 : EndIf
+  EndIf
+  HciClose()
+  ProcedureReturn r
+EndProcedure
+
+DataSection
+btp_sine:
+  Data.w 0,783,1553,2296,3000,3653,4243,4760,5196,5543,5796,5949,6000,5949,5796,5543,5196,4760,4243,3653,3000,2296,1553,783
+  Data.w 0,-783,-1553,-2296,-3000,-3653,-4243,-4760,-5196,-5543,-5796,-5949,-6000,-5949,-5796,-5543,-5196,-4760,-4243,-3653,-3000,-2296,-1553,-783
+EndDataSection
