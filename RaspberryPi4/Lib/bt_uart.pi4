@@ -40,7 +40,24 @@
 ;  bcm2711-rpi-4-b.dts uart1_bt_pins ALT5 at 230400, ties Bluetooth to the
 ;  VPU clock; not done.)
 ;
-;  DESK PROOF ONLY (tools/a64/hci_bt_check.py). SILICON OWED.
+;  THE BORROW (2026-10-16, from the NES payload, which ran Bluetooth audio
+;  through this file on the board): with BtuMayBorrowConsole(1) BtuOpen no
+;  longer refuses. It waits for the console's last byte to leave, saves the
+;  PL011's rate, format, control, interrupt mask and FIFO levels and the
+;  GPIO function and pull registers it changes, takes GPIO 14/15 off the
+;  PL011 and opens it for Bluetooth. BtuClose gives every one of those
+;  back - after clearing FEN, which empties both FIFOs, so no Bluetooth
+;  byte becomes a console keystroke. The CALLER must also stop the console
+;  from touching the PL011 meanwhile (hw_bt.pi4: UartLend).
+;
+;  BT_ON KEEPS ITS POLARITY (the NES payload's finding; the Linux
+;  firmware-expander driver does the same): BtuPower reads the line's
+;  configuration first and writes it back with only the state changed; if
+;  the line still reads wrong it drives the state alone. BtuClose turns
+;  the controller off again only if it was off before the first BtuOpen.
+;
+;  ON SILICON: the NES payload's H4 adapter ran over these Btu* procedures
+;  (2026-10-15/16). The `bt` command path: see Anvil/Net/hci.pbi.
 ;
 ;  DEPENDENCIES: gpio.pi4 (PinAlt, PinPull, PinModeGet), mailbox.pi4
 ;  (MailboxBegin/SetWord/Send/Word), listed before this file.
@@ -72,14 +89,27 @@ EnableExplicit
 #BTU_PIN_RXD = 33
 #BTU_ALT     = 3
 
+#BTU_TAG_GET_GPIO_CONFIG = $00030043
+#BTU_TAG_GET_GPIO_STATE  = $00030041
 #BTU_TAG_SET_GPIO_CONFIG = $00038043
 #BTU_TAG_SET_GPIO_STATE  = $00038041
+#BTU_IFLS  = $34
+
+#BTU_GPFSEL1 = $FE200004           ; GPIO 10-19 (the console's 14/15)
+#BTU_GPFSEL3 = $FE20000C           ; GPIO 30-39 (Bluetooth's 30-33)
+#BTU_GPPULL0 = $FE2000E4           ; GPIO_PUP_PDN_CNTRL_REG0..2, GPIO 0-47
 #BTU_EXP_BT_ON = 128              ; expgpio 0 + RPI_EXP_GPIO_BASE
 
 #BTU_TX_SPIN = 2000000
 
 Global btu_why.i
 Global btu_open.i
+Global btu_mayBorrow.i
+Global btu_borrowed.i
+Global btu_powerBefore.i = -1      ; BT_ON before the first BtuOpen: -1 unknown
+Global btu_powerErr.i
+Global Dim btu_savedUart.l[6]      ; IBRD FBRD LCRH CR IMSC IFLS
+Global Dim btu_savedGpio.l[5]      ; GPFSEL1 GPFSEL3 PULL0 PULL1 PULL2
 
 Procedure.i BtuRd(off.i)
   ProcedureReturn PeekN(#BTU_BASE + off) & $FFFFFFFF
@@ -96,21 +126,43 @@ Procedure BtuBarrier()
   EndASM
 EndProcedure
 
-; BT_ON through the firmware expander: configure as an output, then drive.
+; BT_ON as the firmware expander reports it: 1, 0, or -1 unreadable.
+Procedure.i BtuPowerState()
+  If MailboxBegin(#BTU_TAG_GET_GPIO_STATE, 4, 8) = 0 : ProcedureReturn -1 : EndIf
+  MailboxSetWord(0, #BTU_EXP_BT_ON)
+  If MailboxSend() = 0 : ProcedureReturn -1 : EndIf
+  If MailboxWord(0) <> 0 : ProcedureReturn -1 : EndIf
+  ProcedureReturn MailboxWord(1) & 1
+EndProcedure
+
+; BT_ON through the firmware expander. The line's polarity is read and
+; written back unchanged (gpio-raspberrypi-exp.c keeps it); then the state
+; alone if the configuration did not take. 1 when the line reads `on`.
 Procedure.i BtuPower(on.i)
+  Define state.i, polarity.i
+  state = BtuPowerState()
+  If btu_powerBefore < 0 : btu_powerBefore = state : EndIf
+  If state = on : ProcedureReturn 1 : EndIf
+  If state < 0 : ProcedureReturn 0 : EndIf
+  If MailboxBegin(#BTU_TAG_GET_GPIO_CONFIG, 4, 20) = 0 : ProcedureReturn 0 : EndIf
+  MailboxSetWord(0, #BTU_EXP_BT_ON)
+  If MailboxSend() = 0 Or MailboxWord(0) <> 0 : ProcedureReturn 0 : EndIf
+  polarity = MailboxWord(2)
   If MailboxBegin(#BTU_TAG_SET_GPIO_CONFIG, 24, 24) = 0 : ProcedureReturn 0 : EndIf
   MailboxSetWord(0, #BTU_EXP_BT_ON)
   MailboxSetWord(1, 1)
-  MailboxSetWord(2, 0)
+  MailboxSetWord(2, polarity)
   MailboxSetWord(3, 0)
   MailboxSetWord(4, 0)
   MailboxSetWord(5, on)
-  If MailboxSend() = 0 Or MailboxWord(0) <> 0 : ProcedureReturn 0 : EndIf
+  If MailboxSend() = 0 : btu_powerErr = btu_powerErr + 1 : EndIf
+  If BtuPowerState() = on : ProcedureReturn 1 : EndIf
   If MailboxBegin(#BTU_TAG_SET_GPIO_STATE, 8, 8) = 0 : ProcedureReturn 0 : EndIf
   MailboxSetWord(0, #BTU_EXP_BT_ON)
   MailboxSetWord(1, on)
-  If MailboxSend() = 0 Or MailboxWord(0) <> 0 : ProcedureReturn 0 : EndIf
-  ProcedureReturn 1
+  If MailboxSend() = 0 : btu_powerErr = btu_powerErr + 1 : EndIf
+  If BtuPowerState() = on : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
 EndProcedure
 
 ; The 64ths-of-a-divisor value, rounded; 0 if out of the PL011's range.
@@ -148,15 +200,99 @@ Procedure.i BtuWhy()
   ProcedureReturn btu_why
 EndProcedure
 
+Procedure BtuDelayMs(ms.i)
+  Define hz.i = TickHz()
+  Define t.i
+  If hz <= 0 : ProcedureReturn : EndIf
+  t = Ticks() + (hz / 1000) * ms
+  While Ticks() < t
+  Wend
+EndProcedure
+
+; 1 if the serial console is on this PL011 (GPIO 14 or 15 on ALT0).
+Procedure.i BtuConsoleOnPl011()
+  If PinModeGet(14) = #PIN_ALT0 Or PinModeGet(15) = #PIN_ALT0 : ProcedureReturn 1 : EndIf
+  ProcedureReturn 0
+EndProcedure
+
+; 1 = BtuOpen may borrow the console's PL011 (see THE BORROW above).
+Procedure BtuMayBorrowConsole(on.i)
+  btu_mayBorrow = on
+EndProcedure
+
+Procedure.i BtuBorrowed()
+  ProcedureReturn btu_borrowed
+EndProcedure
+
+; Save what the open will change, then take GPIO 14/15 off the PL011.
+; 0 if the console's transmitter never went idle (nothing was changed).
+Procedure.i BtuBorrowConsole()
+  Define n.i, i.i
+  n = 0
+  While (BtuRd(#BTU_FR) & #BTU_FR_BUSY) <> 0
+    n + 1
+    If n > #BTU_TX_SPIN : ProcedureReturn 0 : EndIf
+  Wend
+  btu_savedUart[0] = BtuRd(#BTU_IBRD)
+  btu_savedUart[1] = BtuRd(#BTU_FBRD)
+  btu_savedUart[2] = BtuRd(#BTU_LCRH)
+  btu_savedUart[3] = BtuRd(#BTU_CR)
+  btu_savedUart[4] = BtuRd(#BTU_IMSC)
+  btu_savedUart[5] = BtuRd(#BTU_IFLS)
+  btu_savedGpio[0] = PeekL(#BTU_GPFSEL1)
+  btu_savedGpio[1] = PeekL(#BTU_GPFSEL3)
+  For i = 0 To 2 : btu_savedGpio[2 + i] = PeekL(#BTU_GPPULL0 + i * 4) : Next
+  btu_borrowed = 1
+  ; GPIO 14 and 15 to inputs (FSEL bits 12-14 and 15-17 of GPFSEL1).
+  PokeL(#BTU_GPFSEL1, btu_savedGpio[0] & ~((7 << 12) | (7 << 15)))
+  ProcedureReturn 1
+EndProcedure
+
+; Give the console its PL011 back exactly as it was. FEN goes to zero
+; first: that empties both FIFOs, so nothing Bluetooth said is left in
+; them to be read as a keystroke.
+Procedure BtuReturnConsole()
+  Define i.i
+  If btu_borrowed = 0 : ProcedureReturn : EndIf
+  BtuWr(#BTU_CR, 0)
+  BtuWr(#BTU_LCRH, 0)
+  BtuWr(#BTU_ICR, $7FF)
+  BtuWr(#BTU_IBRD, btu_savedUart[0])
+  BtuWr(#BTU_FBRD, btu_savedUart[1])
+  BtuWr(#BTU_LCRH, btu_savedUart[2])
+  BtuWr(#BTU_IMSC, btu_savedUart[4])
+  BtuWr(#BTU_IFLS, btu_savedUart[5])
+  PokeL(#BTU_GPFSEL1, btu_savedGpio[0])
+  PokeL(#BTU_GPFSEL3, btu_savedGpio[1])
+  For i = 0 To 2 : PokeL(#BTU_GPPULL0 + i * 4, btu_savedGpio[2 + i]) : Next
+  BtuWr(#BTU_CR, btu_savedUart[3])
+  BtuBarrier()
+  btu_borrowed = 0
+EndProcedure
+
 Procedure.i BtuOpen()
   btu_open = 0
   btu_why = 0
   ; THE SWAP. Read only - a refusal writes nothing.
-  If PinModeGet(14) = #PIN_ALT0 Or PinModeGet(15) = #PIN_ALT0
-    btu_why = "the PL011 is this board's serial console on GPIO 14 and 15; Bluetooth needs the same PL011 on GPIO 30 to 33, so the console must move to the mini UART first"
-    ProcedureReturn 0
+  If BtuConsoleOnPl011() <> 0
+    If btu_mayBorrow = 0
+      btu_why = "the PL011 is this board's serial console on GPIO 14 and 15; Bluetooth needs the same PL011 on GPIO 30 to 33, so the console must move to the mini UART first"
+      ProcedureReturn 0
+    EndIf
+    If BtuBorrowConsole() = 0
+      btu_why = "the serial console's transmitter never went idle, so its PL011 could not be lent to Bluetooth"
+      ProcedureReturn 0
+    EndIf
   EndIf
+  ; ALWAYS FROM OFF (2026-10-16, found on the board): a controller left
+  ; powered by an earlier user - the NES payload leaves it on if it found
+  ; it on - is still at that user's 3,000,000 baud, and a reset sent at
+  ; 115200 is never heard. Linux's hci_bcm powers the part off at close
+  ; and on at open; here: off, 50 ms, on (hci.pbi then waits 120 ms).
+  BtuPower(0)
+  BtuDelayMs(50)
   If BtuPower(1) = 0
+    BtuReturnConsole()
     btu_why = "the firmware would not drive BT_ON (expander line 0) through the mailbox"
     ProcedureReturn 0
   EndIf
@@ -179,6 +315,8 @@ Procedure BtuClose()
     BtuWr(#BTU_CR, 0)
   EndIf
   btu_open = 0
+  If btu_powerBefore = 0 : BtuPower(0) : EndIf
+  BtuReturnConsole()
 EndProcedure
 
 Procedure.i BtuPut(b.i)

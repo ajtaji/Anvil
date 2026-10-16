@@ -736,6 +736,7 @@ CompilerEndIf
 
 Global uart_ready.i            ; 0 = never brought up or adopted
 Global uart_dropped.i          ; characters given up on - see UartDropped()
+Global uart_lent.i             ; 1 while the PL011 is lent to Bluetooth - see UartLend()
 
 ; ----------------------------------------------------------------------
 ;  THE MIRROR - a copy of everything written, for a second console.
@@ -1203,6 +1204,24 @@ EndProcedure
 ;  Waits until the transmit FIFO is NOT full. THE SENSE IS THE OPPOSITE
 ;  OF THE MINI-UART'S LSR BIT 5, which means "ready" - see the header.
 ; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+;  UartLend(on) - the PL011 is lent to another device (2026-10-16: the
+;  Pi 4's Bluetooth controller, RaspberryPi4/Board/hw_bt.pi4). While lent
+;  the console NEVER touches the PL011's data register: a byte written to
+;  it would go to the controller inside an HCI packet, and a byte read
+;  from it would be stolen from one. UartWrite still feeds the mirror and
+;  the aux tap (the screen and the network console keep the output; the
+;  serial wire is silent), UartReadReady says nothing is waiting,
+;  UartReadWait answers -1 and UartRead waits for the lend to end.
+; ----------------------------------------------------------------------
+Procedure UartLend(on.i)
+  uart_lent = on
+EndProcedure
+
+Procedure.i UartLent()
+  ProcedureReturn uart_lent
+EndProcedure
+
 Procedure UartWrite(c.i)
   Define f.i
   Define n.i
@@ -1222,6 +1241,15 @@ Procedure UartWrite(c.i)
     uart10_Put(c)
   EndIf
   CompilerEndIf
+  If uart_lent <> 0
+    If uart_mirrorOn <> 0
+      uart_MirrorPut(c)
+    EndIf
+    If uart_auxOn <> 0
+      uart_AuxPut(c)
+    EndIf
+    ProcedureReturn 1
+  EndIf
   n = 0
   Repeat
     f = PeekN(#UART_BASE + #UART_FR_OFF)
@@ -1286,6 +1314,9 @@ EndProcedure
 ;  mini-UART, whose LSR bit 0 is "Data ready".
 ; ----------------------------------------------------------------------
 Procedure UartReadReady()
+  If uart_lent <> 0
+    ProcedureReturn 0
+  EndIf
   If (PeekN(#UART_BASE + #UART_FR_OFF) & #FR_RXFE) = 0
     ProcedureReturn 1
   EndIf
@@ -1307,7 +1338,10 @@ EndProcedure
 Procedure.i UartRead()
   Define f.i
   Repeat
-    f = PeekN(#UART_BASE + #UART_FR_OFF)
+    f = #FR_RXFE
+    If uart_lent = 0
+      f = PeekN(#UART_BASE + #UART_FR_OFF)
+    EndIf
   Until (f & #FR_RXFE) = 0
   ProcedureReturn PeekN(#UART_BASE + #UART_DR_OFF) & $FF
 EndProcedure
@@ -1324,6 +1358,9 @@ Procedure.i UartReadWait(spins.i)
   Define n.i
   If spins <= 0
     spins = #UART_SPIN_MAX
+  EndIf
+  If uart_lent <> 0
+    ProcedureReturn -1
   EndIf
   n = 0
   Repeat
