@@ -1,0 +1,42 @@
+; ======================================================================
+;  hw_bt_payload.pi4 - the HwBt* seam (Anvil/Hal/hal.pbi) for a RAM
+;  PAYLOAD on the Pi 4 that runs Anvil's Bluetooth stack itself
+;  (Anvil/Net/hci.pbi, l2cap.pbi, a2dp.pbi) - the NES payload, the
+;  pi4BtProbe diagnostic. A payload owns the machine while it runs, so
+;  there is no console to lend: bt_uart.pi4 borrows the PL011 and gives
+;  every register back at HwBtClose (BtuClose).
+;
+;  The monitor's own seam is RaspberryPi4/Board/hw_bt.pi4 (it also tells
+;  uart.pi4 the PL011 is lent). Include ONE of the two, after
+;  RaspberryPi4/Lib/bt_uart.pi4 and before Anvil/Net/hci.pbi.
+;  Pi 4 (BCM2711) only.
+; ======================================================================
+
+Procedure.i HwBtOpen()
+  BtuMayBorrowConsole(1)
+  ProcedureReturn BtuOpen()
+EndProcedure
+
+Procedure HwBtClose()
+  BtuClose()
+EndProcedure
+
+Procedure.i HwBtPut(b.i)
+  ProcedureReturn BtuPut(b)
+EndProcedure
+
+Procedure.i HwBtGet()
+  ProcedureReturn BtuGet()
+EndProcedure
+
+Procedure.i HwBtSetBaud(baud.i)
+  ProcedureReturn BtuSetBaud(baud)
+EndProcedure
+
+Procedure.i HwBtWhy()
+  ProcedureReturn BtuWhy()
+EndProcedure
+
+Procedure.i HwBtConsoleLent()
+  ProcedureReturn 0
+EndProcedure
