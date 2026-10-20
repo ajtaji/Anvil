@@ -604,7 +604,7 @@ def upload(console: br.NetConsole, board_ip: str, port: int, address: int,
             (f"It said:\n{br.indent(reason)}" if reason else
              "It gave no reason within 15 s; the reply is in the transcript."))
     began = time.monotonic()
-    br.stream_file(board_ip, port, data)
+    br.stream_file(board_ip, port, data, keepalive=console.keepalive)
     verdict, _why = console.read_until_or_prompt(
         line, [br.RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
     got_len, got_ms, got_sha = br.parse_recv_verdict(listen + verdict)

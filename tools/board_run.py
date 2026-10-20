@@ -772,6 +772,9 @@ class NetConsole:
         self.sock.settimeout(0.2)
         self.transcript: list[str] = []
         self.accepted_datagrams: list[bytes] = []
+        self._reply_command = ""
+        self._reply_tail = ""
+        self._reply_echo_seen = False
         self._sendto(b"\r")
         self.last_sent = time.monotonic()
 
@@ -862,12 +865,34 @@ class NetConsole:
         if peer != self.addr:
             return None
         immutable = bytes(data)
-        if b"pmf>" in immutable:
-            # The board is back at its prompt: our command is finished and
-            # the console is nobody's, so a keepalive now would take it.
-            self.command_open = False
+        self._track_command_reply(immutable)
         self.accepted_datagrams.append(immutable)
         return immutable
+
+    def _track_command_reply(self, data: bytes) -> None:
+        """Only a prompt AFTER this command's echo ends its keepalives.
+
+        The old prompt can prefix the command echo in one datagram. The
+        echo and final prompt can also cross datagram boundaries. Remember
+        the echo once seen, retaining only a bounded tail of reply text.
+        """
+        if not self.command_open:
+            return
+        flat = (self._reply_tail + data.decode("utf-8", "replace")).replace("\r", "")
+        if not self._reply_echo_seen:
+            echoed = echo_pattern(self._reply_command).search(flat)
+            if echoed:
+                self._reply_echo_seen = True
+                # Discard the pre-echo prompt permanently, including from
+                # the tail that will be reconsidered on the next packet.
+                flat = flat[max(0, echoed.end() - 1):]
+        if self._reply_echo_seen and PROMPT_RE.search(flat):
+            self.command_open = False
+        limit = max(1024, len(self._reply_command) * 2 + 64)
+        self._reply_tail = flat[-limit:]
+        if len(flat) > limit and flat[-limit - 1] != "\n":
+            # Do not manufacture a line boundary by truncating mid-line.
+            self._reply_tail = "\x00" + self._reply_tail
 
     @staticmethod
     def _bound_socket(ip: str) -> socket.socket:
@@ -921,6 +946,9 @@ class NetConsole:
                     "Nothing was sent; check the board and run again.")
             return
         self.command_open = bool(line.strip())
+        self._reply_command = line
+        self._reply_tail = ""
+        self._reply_echo_seen = False
 
     def recv_some(self) -> str:
         """One datagram from the board as text, or "" after one timeout.
@@ -1407,7 +1435,7 @@ def local_bind_for(ip: str) -> str | None:
 
 
 def stream_file(ip: str, port: int, data: bytes,
-                connect_timeout: float = 20.0) -> float:
+                connect_timeout: float = 20.0, keepalive=None) -> float:
     """Queue every byte to the board's one-shot listener and half-close.
 
     THE CLOSE IS THE END-OF-FILE MARKER, and it is a half close: the FIN
@@ -1421,6 +1449,8 @@ def stream_file(ip: str, port: int, data: bytes,
     last: OSError | None = None
     sock = None
     while time.monotonic() < end:
+        if keepalive:
+            keepalive()
         try:
             sock = socket.create_connection(
                 (ip, port), timeout=5.0,
@@ -1437,14 +1467,39 @@ def stream_file(ip: str, port: int, data: bytes,
             "dropping the connection. Nothing was booted.")
     started = time.monotonic()
     with sock:
-        sock.settimeout(60.0)
-        sock.sendall(data)
+        # TCP upload/FIN waits can outlast the UDP flow timeout too. Pump
+        # its keepalive without reading the console from another thread.
+        sock.settimeout(1.0)
+        view = memoryview(data)
+        sent = 0
+        deadline = time.monotonic() + 60.0
+        while sent < len(view):
+            if keepalive:
+                keepalive()
+            try:
+                count = sock.send(view[sent:sent + 65536])
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    raise StreamError("TCP upload made no progress for 60 seconds; nothing was booted.")
+                continue
+            if count <= 0:
+                raise StreamError("TCP upload closed before all bytes were sent; nothing was booted.")
+            sent += count
+            deadline = time.monotonic() + 60.0
         sock.shutdown(socket.SHUT_WR)
-        try:
-            while sock.recv(4096):
-                pass
-        except OSError:
-            pass
+        deadline = time.monotonic() + 60.0
+        while True:
+            if keepalive:
+                keepalive()
+            try:
+                if not sock.recv(4096):
+                    break
+                deadline = time.monotonic() + 60.0
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    break
+            except OSError:
+                break
     return time.monotonic() - started
 
 
@@ -1686,7 +1741,7 @@ def run(args: argparse.Namespace) -> int:
                          "listener unconfirmed")
             raise RunStopped()
         journal.step("listener armed")
-        elapsed = stream_file(board_ip, args.port, data)
+        elapsed = stream_file(board_ip, args.port, data, keepalive=console.keepalive)
         print(f"  sent {len(data)} bytes in {elapsed:.2f} s")
         record["sent_seconds"] = elapsed
         journal.step("sent")

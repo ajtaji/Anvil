@@ -253,6 +253,22 @@ EMPTY datagram when nothing has gone to the board for `KEEPALIVE_SECONDS` (20,
 above RFC 8085's 15 s floor and well inside the shortest loss measured). An
 empty datagram is no keystrokes to the monitor.
 
+The command remains active until its own echoed line has been followed by a
+prompt. A prompt preceding the echo belongs to the previous command and must
+not disable keepalives. Echoes and prompts may cross datagram boundaries; the
+client remembers the echo and keeps a bounded reply tail. TCP upload and FIN
+waits also service the same UDP keepalive, including during partial sends and
+socket timeouts. They do not read the console from a second thread. Upload
+length/digest and deadman acknowledgement checks remain mandatory.
+
+`python tools/board_run_console_check.py` checks leading/stale prompts, split
+echoes/prompts, active and idle keepalive behavior, bounded tails, partial TCP
+sends and FIN timeouts. On 2026-10-20 a real Pi 4 transfer of 4,779,572 bytes
+verified, was saved to its own application data path and reloaded with the same
+SHA-256. A 25-second console wait returned after sending a keepalive, followed
+by a successful watchdog-status read. Host outcome checks also passed 37
+assertions across the existing eight protocol scenarios.
+
 ## A missing return line is asked about, not believed
 
 When no return line arrives inside `--timeout`, the tool does not say "never
