@@ -280,7 +280,7 @@ def case_good_runs(root: Path) -> None:
     manifest, lease, _m = make_fixture(root)
     board = ScriptedBoard()
     real_stream = tool.br.stream_file
-    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0: (board.receive(data), 0.01)[1]
+    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0, keepalive=None: (board.receive(data), 0.01)[1]
     try:
         code, text = run_tool(options(manifest, lease), board)
         require(code == 0, f"run 1 exited {code}:\n{text}")
@@ -344,7 +344,7 @@ def case_refusals(root: Path) -> None:
     # the boot is refused: failure, deadman off, lease released
     board = ScriptedBoard(refuse_boot=True)
     real_stream = tool.br.stream_file
-    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0: (board.receive(data), 0.01)[1]
+    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0, keepalive=None: (board.receive(data), 0.01)[1]
     try:
         code, text = run_tool(options(manifest, lease), board)
     finally:
@@ -389,7 +389,7 @@ def case_lease_wait_and_collision(root: Path) -> None:
 
     tool.BoardLease.write = colliding_write
     real_stream = tool.br.stream_file
-    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0: (board.receive(data), 0.01)[1]
+    tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0, keepalive=None: (board.receive(data), 0.01)[1]
     try:
         code, text = run_tool(options(manifest, lease), board)
     finally:
@@ -421,8 +421,41 @@ def case_no_prompt(root: Path) -> None:
             "a silent board did not release the lease with a row saying so")
 
 
+def case_latched_core_failures(root: Path) -> None:
+    class LatchedBoard(ScriptedBoard):
+        def __init__(self, after_return):
+            super().__init__()
+            self.after_return = after_return
+
+        def answer(self, line):
+            if line == "coretest status" and (not self.after_return or self.run > 3):
+                self.say(line + "\r\ncoretest started=1 stopped=0 runs=0 nonce=27 error=-20 core=1\r\n"
+                         "Failure latched. No re-release or warm rejoin.\r\npmf> ")
+            else:
+                super().answer(line)
+
+    for after_return in (False, True):
+        case_root = root / ("after-return" if after_return else "before-upload")
+        case_root.mkdir()
+        manifest, lease, _m = make_fixture(case_root)
+        board = LatchedBoard(after_return)
+        real_stream = tool.br.stream_file
+        tool.br.stream_file = lambda ip, port, data, connect_timeout=20.0, keepalive=None: (board.receive(data), 0.01)[1]
+        try:
+            code, text = run_tool(options(manifest, lease), board)
+        finally:
+            tool.br.stream_file = real_stream
+        require(code == 1 and "secondary-core failure is latched" in text,
+                f"latched failure was not rejected:\n{text}")
+        require("WAV ready:" not in text, "latched worker failure published waveform output")
+        if not after_return:
+            require(not any(x.startswith("net recv") or x.startswith("boot mem") for x in board.lines),
+                    "pre-existing core failure allowed an upload or boot")
+
+
 def main() -> int:
-    cases = [case_good_runs, case_refusals, case_lease_wait_and_collision, case_no_prompt]
+    cases = [case_good_runs, case_refusals, case_lease_wait_and_collision, case_no_prompt,
+             case_latched_core_failures]
     failed = 0
     for case in cases:
         with tempfile.TemporaryDirectory() as temp:

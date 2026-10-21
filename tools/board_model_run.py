@@ -149,7 +149,7 @@ HASH_FLOOR_BYTES_PER_SECOND = 1_000_000
 CACHE_RE = re.compile(r"(?m)^The D-cache and MMU are (ON|OFF)\b")
 SHA256SUM_RE = re.compile(r"The sha256sum is ([0-9a-f]{64})")
 CORETEST_RE = re.compile(
-    r"coretest started=(\d+) stopped=(\d+) runs=(\d+) nonce=(\d+) error=(\d+)")
+    r"coretest started=(\d+) stopped=(\d+) runs=(\d+) nonce=(\d+) error=(-?\d+)")
 BUILD_RE = re.compile(r"build (\d+)")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -644,6 +644,14 @@ def coretest(console: br.NetConsole) -> dict:
             "runs": runs, "nonce": nonce, "error": error}
 
 
+def require_coretest_healthy(status: dict) -> None:
+    if status.get("error", 0) or "Failure latched" in status.get("line", ""):
+        raise RunFailed("secondary-core failure is latched; no further payload or asset writes: "
+                        + status.get("line", "core status unavailable"))
+    if "coretest started=" in status.get("line", "") and "error" not in status:
+        raise RunFailed("secondary-core status could not be parsed; no further payload or asset writes.")
+
+
 # =====================================================================
 #  THE OUTPUTS
 # =====================================================================
@@ -786,6 +794,7 @@ def run(options: argparse.Namespace, console_factory=None) -> int:
         record["stage_addr"] = f"{stage:08X}"
         record["coretest_before"] = coretest(console)
         say(clock, f"board: {record['version']}; {record['coretest_before'].get('line', '')}")
+        require_coretest_healthy(record["coretest_before"])
         timings["connect_seconds"] = round(time.monotonic() - started, 3)
         turned_cache_on = cache_on(console)
         record["cache_turned_on"] = turned_cache_on
@@ -877,6 +886,11 @@ def run(options: argparse.Namespace, console_factory=None) -> int:
         say(clock, f"returned: x0 = {x0:016X} after {timings['run_seconds']:.1f} s; reading back now")
         journal.step("return")
 
+        # A primary return does not prove its secondary partitions finished.
+        # Reject their latched faults before publishing waveform output.
+        record["coretest_return"] = coretest(console)
+        require_coretest_healthy(record["coretest_return"])
+
         # ---- readback, at once, same connection ------------------------------
         # THE REGIONS A WAV IS MADE FROM COME FIRST, and the WAV and its line
         # follow the moment they are verified; the other regions, `deadman off`
@@ -938,6 +952,7 @@ def run(options: argparse.Namespace, console_factory=None) -> int:
             deadman_off = True
         record["coretest_after"] = coretest(console)
         journal.step("deadman off")
+        require_coretest_healthy(record["coretest_after"])
 
         journal.step("outputs")
         exit_code = 0 if not failures else 1
