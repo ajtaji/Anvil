@@ -320,6 +320,19 @@ wired: link-local 169.254.170.250 (no DHCP answer)
 wired: no cable
 @ENDFRAG
 
+A board that took a link-local address on the cable then **becomes the
+DHCP server on it**, because nothing else was (`Anvil/Core/dhcpd.pbi`).
+What it prints, quoted from `RaspberryPi4/Board/eth.pi4`:
+
+@FRAG
+wired: nothing answered a DHCP discover on this cable, so THIS BOARD is
+   the DHCP server on it now: 192.168.137.1 for itself, leases from 192.168.137.2 to 192.168.137.20,
+   one hour each. A machine at the other end set to DHCP - which is what
+   an Ethernet port is by default - gets a real address with nothing
+   changed on it. If a real DHCP server ever answers on this cable, this
+   board gives the role up at once and takes a lease like anybody else.
+@ENDFRAG
+
 A DHCP lease first, because a DHCP server is the only thing on a segment
 that can say for certain an address is free. Then a saved address, if
 somebody typed one on purpose and ran `settings save` - that outranks
@@ -333,10 +346,11 @@ The practical consequence is the one worth remembering:
 @NOTE **A Pi 4 on a bare Ethernet cable into a laptop answers its
 console after a reset with nothing typed on the board and nothing
 changed on the laptop.** No DHCP server, no connection sharing, no
-static address, no firewall rule. Both ends give themselves a
-link-local address the way the standard says to, and the board's is
-seeded from its hardware address - so it comes back to the same one
-across flashes.
+static address, no firewall rule. The board serves the laptop a lease,
+so the laptop is on `192.168.137.x` and the board is `192.168.137.1`.
+The board's link-local address stays on the cable as well (it is seeded
+from its hardware address, so it is the same one across flashes), and
+the console answers on both.
 
 @TRAP A link-local address is **never** written to `SETTINGS.TXT`. If it
 were saved, the next boot would put a `169.254.x` address on the wire

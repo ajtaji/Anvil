@@ -862,6 +862,8 @@ Nothing may be booted from it.
 run [address]        also go, g - enter a raw image
 boot mem <address>   enter a PMFBOOT container already in memory
 boot <name>          read a container off the medium and enter it
+boot <path>          the same for a container in a folder or on partition 2
+programs             list the containers on the medium (Pi 4)
 boot status          what is armed, and the loop-guard counter
 boot ok              clear the loop-guard counter
 boot clear           stop booting a file automatically
@@ -894,6 +896,53 @@ you put the container. For a monitor image that address is `00200000` -
 on top of the running monitor. Entering a monitor image with `boot mem`
 takes the board down with no console. Chapter 3 says this too; it is
 worth saying twice.
+
+@SECTION Programs on the medium
+
+`boot` takes a path as well as a bare name. A name with no prefix is a
+file in the root of partition 1, the FAT partition the board boots from,
+and that partition takes 8.3 names only. A path starting `2:/` is on the
+data partition, where folders and long names are fine. Quote a path that
+has spaces in it:
+
+@FRAG
+boot SLOW.PMF
+boot 2:/TruckGPS/tgdemo.pmf
+boot "2:/my programs/slow.pmf"
+@ENDFRAG
+
+On the Pi 4, `programs` lists every container it finds: the root of
+partition 2, each folder of that root, and the root of partition 1. A
+container is recognised by its first eight bytes (`PMFBOOT` and a zero),
+not by its name. What it prints, quoted from
+`Anvil/Core/programs_cmd.pbi` (the rows are name, size and path):
+
+@FRAG
+Programs on the boot medium - type a name to run it:
+  <name>            <bytes> bytes   <path>
+  Typing a name is the same as boot <its path>. A command of the same name wins.
+@ENDFRAG
+
+and on a medium with none:
+
+@FRAG
+No programs were found. A program is a payload container (.pmf) in the root
+of partition 2, in a folder of that root, or in the root of partition 1.
+@ENDFRAG
+
+**Typing a listed name runs it**: the file name without `.pmf`, in any
+case. `tgdemo` at the prompt prints `Running 2:/TruckGPS/tgdemo.pmf` and
+then does exactly what `boot 2:/TruckGPS/tgdemo.pmf` does - the
+container's own load address, its SHA-256 checked before the jump, the
+deadman if one is armed. You do not have to type `programs` first; the
+first name typed in a session builds the list quietly.
+
+@NOTE A program's name only runs when no command has it. The prompt asks
+for programs last, after every command, so a program called `ls` can
+never take the place of the command. Nothing here starts anything by
+itself: starting a program at power-up is the `boot.file` setting's job
+(`setenv boot.file SLOW.PMF`, then `saveenv`; `boot status` and `boot clear`
+above).
 
 @SECTION The deadman
 
