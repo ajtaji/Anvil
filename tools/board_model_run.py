@@ -609,15 +609,19 @@ def upload(console: br.NetConsole, board_ip: str, port: int, address: int,
         line, [br.RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
     got_len, got_ms, got_sha = br.parse_recv_verdict(listen + verdict)
     seconds = time.monotonic() - began
+    recovery = None
     if got_len is None or got_sha is None:
-        raise RunFailed(
-            f"the board never printed a length and a digest for {label}, so that "
-            "upload has no verdict at all - which is not the same as a good one.")
+        _, recovery = br.verify_upload_after_reply_loss(console, address, len(data), want)
+        got_len, got_sha = recovery["bytes"], recovery["sha256"]
+        seconds = time.monotonic() - began
     if got_len != len(data) or got_sha != want:
         raise RunFailed(
             f"THE UPLOAD OF {label} DID NOT VERIFY: this host sent {len(data)} bytes with "
             f"sha256 {want} and the board holds {got_len} bytes with sha256 {got_sha}.")
-    return {"bytes": got_len, "board_ms": got_ms, "seconds": round(seconds, 3)}
+    result = {"bytes": got_len, "board_ms": got_ms, "seconds": round(seconds, 3)}
+    if recovery is not None:
+        result["recovery"] = recovery
+    return result
 
 
 def cache_on(console: br.NetConsole) -> bool:

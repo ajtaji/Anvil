@@ -486,6 +486,10 @@ class StreamError(RuntimeError):
     """The board's answer was not a whole, well-formed picture."""
 
 
+class UploadDigestMismatch(StreamError):
+    """The destination RAM is known not to match the intended upload."""
+
+
 class CommandTimeout(StreamError):
     """One UDP command lacked an echo-anchored, prompt-ended reply."""
 
@@ -1172,6 +1176,62 @@ def read_only_command_with_recovery(
         return fresh, answer, detail
 
 
+def verify_upload_after_reply_loss(
+        console: NetConsole, address: int, size: int, expected_sha256: str,
+        attempts: int = 3,
+        ) -> tuple[NetConsole, dict]:
+    """Recover a lost upload reply with bounded, read-only RAM verification.
+
+    A send/FIN completion is not verification. Fresh UDP endpoints must
+    establish a prompt and receive an echo-anchored SHA256 of the complete
+    intended destination range. No upload, boot, watchdog or reset is retried.
+    A real digest mismatch ends immediately, preserving the failure.
+    """
+    if (attempts < 1 or attempts > 3 or size <= 0 or address < 0 or
+            re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) is None):
+        raise ValueError("upload recovery needs 1..3 attempts and a nonempty range")
+    observations = []
+    original = console
+    for attempt in range(attempts):
+        fresh = None
+        try:
+            fresh = NetConsole(original.addr[0], original.addr[1])
+            if not fresh.at_prompt(timeout=3.0):
+                raise StreamError("fresh console did not confirm its prompt")
+            line = f"sha256sum {address:X} {size:X}"
+            reply = fresh.command(line, min(65.0, 15.0 + size / 50000.0))
+            found = re.search(r"The sha256sum is ([0-9a-fA-F]{64})", reply)
+            if not found:
+                raise StreamError("RAM verification reply contained no SHA256")
+            digest = found.group(1).lower()
+            if digest != expected_sha256.lower():
+                raise UploadDigestMismatch(
+                    f"upload RAM digest mismatch at {address:X} for {size} bytes: "
+                    f"expected {expected_sha256}, received {digest}; nothing was booted")
+            fresh.transcript = (original.transcript +
+                                ["\n[host: upload reply lost; complete RAM range "
+                                 "verified on a fresh console]\n"] + fresh.transcript)
+            original.close()
+            # Keep the original object's identity: model-run callers hold it
+            # throughout their lease, including bound keepalive callbacks.
+            original.__dict__.update(fresh.__dict__)
+            return original, {"verified_by": "destination_range_sha256",
+                           "attempt": attempt + 1, "bytes": size,
+                           "sha256": digest, "earlier_attempts": observations}
+        except UploadDigestMismatch:
+            original.transcript.extend(fresh.transcript)
+            fresh.close()
+            raise
+        except (StreamError, OSError) as error:
+            observations.append(str(error))
+            if fresh is not None:
+                original.transcript.extend(fresh.transcript)
+                fresh.close()
+    raise StreamError("upload reply was lost and three bounded console/RAM "
+                      "verification attempts failed; nothing was booted: " +
+                      "; ".join(observations))
+
+
 def arm_deadman_with_recovery(
         console: NetConsole, requested: int, seconds: float = 10.0
         ) -> tuple[NetConsole, str, int | None, dict | None]:
@@ -1753,6 +1813,11 @@ def run(args: argparse.Namespace) -> int:
             recv_line, ["sha256 "], 30.0 + len(data) / 40000.0, seen=listen)
         verdict = listen + verdict
         got_len, got_ms, got_sha = parse_recv_verdict(verdict)
+        if got_len is None or got_sha is None:
+            console, recovered = verify_upload_after_reply_loss(
+                console, addr, len(data), want)
+            record["upload_recovery"] = recovered
+            got_len, got_sha = recovered["bytes"], recovered["sha256"]
         record["transfer"] = {"bytes": got_len, "ms": got_ms, "sha256": got_sha}
         if got_len is None or got_sha is None:
             failures.append(

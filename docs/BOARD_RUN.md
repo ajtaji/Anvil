@@ -578,3 +578,7 @@ the bytes at `#MON_FB_SCAN` are the bytes the glass is lit with, that a real
 12 MiB region is free on real silicon, that a 4 MB copy fits in the window
 between a payload returning and the console repainting, or that a picture
 survives the trip over UDP 5555. Those are board facts and they are owed.
+
+## Lost upload replies: bounded verification recovery
+
+Both RAM-run paths now use the same recovery helper when TCP upload finishes but its UDP length/checksum reply is lost. Up to three fresh console connections may establish a prompt and query SHA256 over the complete intended RAM range. Only an exact match permits the existing boot sequence to continue. A real mismatch fails immediately; upload, boot, watchdog and reset commands are never replayed by this helper. The report records the recovery method and attempt count. Host coverage: tools/board_upload_retry_check.py. Real Pi evidence: a partial upload was rejected by its different RAM digest; a subsequent complete upload with another lost reply was recovered by matching RAM SHA256 and its silent payload completed with healthy secondary cores.
