@@ -1,0 +1,12 @@
+#!/bin/sh
+# The Anvil Guide may not fall behind the code: tools/guide_check.py, on every commit.
+# Turned on once per clone with:  git config core.hooksPath .githooks
+# (docs/GUIDE.md, "Keeping it current"). It needs no compiler and no board.
+cd "$(git rev-parse --show-toplevel)" || exit 1
+for p in python3 python "py -3"; do
+  if $p -c "import sys" >/dev/null 2>&1; then
+    exec $p tools/guide_check.py --hook
+  fi
+done
+echo "pre-commit: no Python found, so tools/guide_check.py could not run; the commit is stopped." >&2
+exit 1

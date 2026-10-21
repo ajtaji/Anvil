@@ -39,6 +39,7 @@ path in.** Chapter 11 is the map back out to them, by topic.
 | 21 | [Anvil on the ROCK Pi 4C](guide/21_the_rock_pi_4c.txt) | EL3 direct-SD boot, checked recovery, SD and eMMC file commands, HDMI TrueType and RGA console, and bounded Mali payload proofs. |
 | 22 | [Raspberry Pi 5: source bring-up](guide/22_the_raspberry_pi_5.txt) | EL3 `pmf>` boot captured on Pi 5; PCIe/RP1, storage, network and GPU acceptance remain open. |
 | 23 | [Vulkan on a Raspberry Pi 4](guide/23_vulkan_on_pi4.txt) | GPU drawing, hardware transfer paths, the bounded linear readback, and the desk versus board proof boundary. |
+| 24 | [Every command](guide/24_every_command.txt) | The monitor's own `help`, as each board prints it - generated from the help text, so it cannot say less than the board does. |
 
 [`guide/00_OUTLINE.txt`](guide/00_OUTLINE.txt) documents the book itself: the
 markup, the rules the chapters are written to, and the chapter plan. Files whose
@@ -49,8 +50,19 @@ names begin with `00_` are never rendered.
 The chapters are written in the house `@`-markup — `@CHAPTER`, `@INTRO`,
 `@SECTION`, `@CODE`/`@ENDCODE`, `@FRAG`/`@ENDFRAG`, `@NOTE`, `@TRAP` — and are
 rendered by the PureMetal compiler repository's `tools/build_help_pdf.py`, the
-same renderer that produces the shipped guides. Its `--book` option takes any
-folder of chapter files, inside that repository or not:
+same renderer that produces the shipped guides. From this repository,
+
+```sh
+python tools/render_guide.py --pmf-repo <compiler repository>
+```
+
+runs it with the book's own arguments and then writes
+`guide/AnvilGuide.pdf.sources`, the SHA-256 of the chapters it rendered, which
+`tools/guide_check.py` compares with the chapters as they are. `--pmf-repo` can
+be left off when `PMF_REPO`, or `PMF_COMPILER` as `tools/build.py` uses it, says
+where the compiler repository is. The renderer's `--book` option takes any
+folder of chapter files, inside that repository or not; by hand, the same
+render is:
 
 ```sh
 python tools/build_help_pdf.py \
@@ -83,6 +95,31 @@ too.
 A book that lags the code is a **defect**, not a chore, and is filed and fixed
 like any other. The test is not "did I break a chapter"; it is *would a
 developer following this book now do something that does not work?*
+
+**It is enforced, not hoped for.** `python tools/guide_check.py` fails when the
+book is behind the code, and the repository's pre-commit hook runs it on every
+commit. Turn the hook on once in each clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+What it fails on, and what to do:
+
+| It says | Do this |
+|---|---|
+| a command is in neither the board's help nor the guide | add the command to its board's help (`Anvil/Core/help.pbi`, or the board tail in the help arm of `board.<board>`), then `python tools/guide_check.py --write` |
+| `24_every_command.txt` is not the current help text | `python tools/guide_check.py --write` - chapter 24 is generated from the help text and is never edited by hand |
+| a line quoted from a file is not in that file any more | the message changed: copy the new wording into the chapter |
+| a tool has no `--flag` any more | the tool's options changed: fix the command line in the chapter |
+| a chapter is not in the table above | add its row |
+| the PDF was not rendered from the chapters as they are | `python tools/render_guide.py` |
+
+A `@FRAG` whose paragraph says **quoted from `path`** is checked line by line
+against that file's string literals, so use that phrase whenever a chapter
+shows what a source file prints. Commands that were already undocumented when
+the check was written are listed in `guide/00_COMMANDS_OWED.txt`; that list may
+only shrink.
 
 ## How the chapters are written
 

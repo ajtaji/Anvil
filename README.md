@@ -17,9 +17,9 @@ the machine's physical services, and exposes a versioned service-table ABI to
 payloads instead of making each payload bring a second hardware stack.
 
 > **New here? Read [the guide](docs/GUIDE.md)** ([PDF](docs/guide/AnvilGuide.pdf)).
-> Twenty chapters covering the build, installing on a Raspberry Pi 4, the
-> console, writing and running payloads, all four cores, replacing the monitor
-> in place, and how anything here is proven. The notes under `docs/` are the
+> The build, installing on a Raspberry Pi 4, the console, writing and running
+> payloads, all four cores, replacing the monitor in place, how anything here is
+> proven, and every command the monitor accepts. The notes under `docs/` are the
 > engineering record; the guide is the way in.
 
 > [!IMPORTANT]
