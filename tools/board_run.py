@@ -1209,7 +1209,7 @@ def verify_upload_after_reply_loss(
                     f"upload RAM digest mismatch at {address:X} for {size} bytes: "
                     f"expected {expected_sha256}, received {digest}; nothing was booted")
             fresh.transcript = (original.transcript +
-                                ["\n[host: upload reply lost; complete RAM range "
+                                ["\n[host: complete upload RAM range "
                                  "verified on a fresh console]\n"] + fresh.transcript)
             original.close()
             # Keep the original object's identity: model-run callers hold it
@@ -1232,20 +1232,47 @@ def verify_upload_after_reply_loss(
                       "; ".join(observations))
 
 
+RAM_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
 def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
                         address: int, data: bytes, want: str,
                         label: str = "payload", on_stage=None) -> dict:
-    """One shared verified transfer, with one resend after a proven mismatch.
+    """Verified RAM transfer, at most one resend per bounded chunk.
 
-    Missing UDP replies first use read-only destination verification. Only
-    a known mismatch permits a resend, and a fresh prompt is required before
-    it. Boot, watchdog and reset are outside this function and never replayed.
+    Images above1MiB use independently verified chunks, then a mandatory
+    complete-range digest. Interrupted sends and missing replies first use
+    read-only verification. Only a known mismatch permits a resend after a
+    fresh prompt. Boot, watchdog and reset are outside and never replayed.
     """
     began = time.monotonic()
     reuploads = []
+    send_interruptions = []
     def stage(name, detail):
         if on_stage is not None:
             on_stage(name, detail)
+    if len(data) > RAM_UPLOAD_CHUNK_BYTES:
+        chunks = []
+        for offset in range(0, len(data), RAM_UPLOAD_CHUNK_BYTES):
+            part = data[offset:offset + RAM_UPLOAD_CHUNK_BYTES]
+            def chunk_stage(name, detail, at=offset):
+                stage(name, {**detail, "chunk_offset": at, "total_bytes": len(data)})
+            report = verified_ram_upload(console, board_ip, port, address + offset,
+                                         part, hashlib.sha256(part).hexdigest(),
+                                         label=f"{label} chunk at +{offset:X}", on_stage=chunk_stage)
+            chunks.append({"offset": offset, **report})
+        # Per-chunk checks alone cannot authorize boot: re-read the complete
+        # contiguous destination after every piece has been written.
+        _, verification = verify_upload_after_reply_loss(console, address, len(data), want)
+        board_times = [c["board_ms"] for c in chunks]
+        result = {"bytes": len(data), "sha256": want,
+                  "board_ms": sum(board_times) if all(t is not None for t in board_times) else None,
+                  "seconds": round(time.monotonic() - began, 3),
+                  "sent_seconds": sum(c["sent_seconds"] for c in chunks),
+                  "chunks": chunks, "verification": verification}
+        stage("verified complete RAM image", {"transfer": result})
+        print(f"  verified complete {len(data)}-byte RAM image across {len(chunks)} chunks", flush=True)
+        return result
     for attempt in range(2):
         line = f"net recv {port} {address:X}"
         console.settle(quiet=0.3, cap=3.0)
@@ -1262,12 +1289,23 @@ def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
         if why != "needle":
             raise StreamError("No image was sent and nothing was booted. " +
                               listener_failure(why, listen, line, observation["reply_datagrams"]))
-        elapsed = stream_file(board_ip, port, data, keepalive=console.keepalive)
-        print(f"  sent {len(data)} bytes in {elapsed:.2f} s", flush=True)
-        stage("sent", {"sent_seconds": elapsed})
-        verdict, _ = console.read_until_or_prompt(
-            line, [RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
-        got_len, got_ms, got_sha = parse_recv_verdict(listen + verdict)
+        send_started = time.monotonic()
+        try:
+            elapsed = stream_file(board_ip, port, data, keepalive=console.keepalive)
+        except (OSError, StreamError) as error:
+            elapsed = time.monotonic() - send_started
+            interruption = {"attempt": attempt + 1, "error": str(error),
+                            "seconds": round(elapsed, 3)}
+            send_interruptions.append(interruption)
+            stage("send interrupted; verifying RAM", {"send_interruption": interruption})
+            print("  TCP send interrupted; verifying destination RAM before any retry", flush=True)
+            got_len, got_ms, got_sha = None, None, None
+        else:
+            print(f"  sent {len(data)} bytes in {elapsed:.2f} s", flush=True)
+            stage("sent", {"sent_seconds": elapsed})
+            verdict, _ = console.read_until_or_prompt(
+                line, [RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
+            got_len, got_ms, got_sha = parse_recv_verdict(listen + verdict)
         recovery = None
         try:
             if got_len is None or got_sha is None:
@@ -1313,6 +1351,9 @@ def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
         if reuploads:
             result["reuploads"] = reuploads
             detail["reuploads"] = reuploads
+        if send_interruptions:
+            result["send_interruptions"] = send_interruptions
+            detail["send_interruptions"] = send_interruptions
         stage("verified", detail)
         print(f"  verified on the board: {got_len} bytes, digest matches", flush=True)
         return result
