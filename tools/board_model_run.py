@@ -593,35 +593,7 @@ def board_sha256(console: br.NetConsole, address: int, size: int) -> tuple[str, 
 def upload(console: br.NetConsole, board_ip: str, port: int, address: int,
            data: bytes, want: str, label: str) -> dict:
     """`net recv`, the bytes over TCP, and the board's verdict on its memory."""
-    line = f"net recv {port} {address:X}"
-    console.settle(quiet=0.3, cap=3.0)
-    console.send(line)
-    listen, why = console.read_until_or_prompt(line, ["for ONE connection"], 15)
-    if why != "needle":
-        reason = br.refusal_reason(listen, line)
-        raise RunFailed(
-            f"the board did not arm a listener for {label}, so nothing was sent. " +
-            (f"It said:\n{br.indent(reason)}" if reason else
-             "It gave no reason within 15 s; the reply is in the transcript."))
-    began = time.monotonic()
-    br.stream_file(board_ip, port, data, keepalive=console.keepalive)
-    verdict, _why = console.read_until_or_prompt(
-        line, [br.RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
-    got_len, got_ms, got_sha = br.parse_recv_verdict(listen + verdict)
-    seconds = time.monotonic() - began
-    recovery = None
-    if got_len is None or got_sha is None:
-        _, recovery = br.verify_upload_after_reply_loss(console, address, len(data), want)
-        got_len, got_sha = recovery["bytes"], recovery["sha256"]
-        seconds = time.monotonic() - began
-    if got_len != len(data) or got_sha != want:
-        raise RunFailed(
-            f"THE UPLOAD OF {label} DID NOT VERIFY: this host sent {len(data)} bytes with "
-            f"sha256 {want} and the board holds {got_len} bytes with sha256 {got_sha}.")
-    result = {"bytes": got_len, "board_ms": got_ms, "seconds": round(seconds, 3)}
-    if recovery is not None:
-        result["recovery"] = recovery
-    return result
+    return br.verified_ram_upload(console, board_ip, port, address, data, want, label)
 
 
 def cache_on(console: br.NetConsole) -> bool:

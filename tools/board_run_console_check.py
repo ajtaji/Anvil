@@ -68,7 +68,10 @@ class TcpSocket:
     def __enter__(self): return self
     def __exit__(self, *args): pass
     def settimeout(self, value): pass
+    def setsockopt(self, level, option, value):
+        assert (level, option, value) == (br.socket.SOL_SOCKET, br.socket.SO_SNDBUF, 16384)
     def send(self, data):
+        assert len(data) <= 16384
         count = min(97, len(data))
         self.data.extend(data[:count])
         return count

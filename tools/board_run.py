@@ -1232,6 +1232,93 @@ def verify_upload_after_reply_loss(
                       "; ".join(observations))
 
 
+def verified_ram_upload(console: NetConsole, board_ip: str, port: int,
+                        address: int, data: bytes, want: str,
+                        label: str = "payload", on_stage=None) -> dict:
+    """One shared verified transfer, with one resend after a proven mismatch.
+
+    Missing UDP replies first use read-only destination verification. Only
+    a known mismatch permits a resend, and a fresh prompt is required before
+    it. Boot, watchdog and reset are outside this function and never replayed.
+    """
+    began = time.monotonic()
+    reuploads = []
+    def stage(name, detail):
+        if on_stage is not None:
+            on_stage(name, detail)
+    for attempt in range(2):
+        line = f"net recv {port} {address:X}"
+        console.settle(quiet=0.3, cap=3.0)
+        packet_start = len(console.accepted_datagrams)
+        keepalive_start = console.keepalives
+        console.send(line)
+        listen, why = console.read_until_or_prompt(line, ["for ONE connection"], 15)
+        observation = {"boundary": why,
+                       "echo_seen": echo_pattern(line).search(listen.replace("\r", "")) is not None,
+                       "reply_datagrams": len(console.accepted_datagrams) - packet_start,
+                       "keepalives_sent": console.keepalives - keepalive_start}
+        stage("listener armed" if why == "needle" else "listener unconfirmed",
+              {"listener_observation": observation})
+        if why != "needle":
+            raise StreamError("No image was sent and nothing was booted. " +
+                              listener_failure(why, listen, line, observation["reply_datagrams"]))
+        elapsed = stream_file(board_ip, port, data, keepalive=console.keepalive)
+        print(f"  sent {len(data)} bytes in {elapsed:.2f} s", flush=True)
+        stage("sent", {"sent_seconds": elapsed})
+        verdict, _ = console.read_until_or_prompt(
+            line, [RECV_SHA_RE], 30.0 + len(data) / 40000.0, seen=listen)
+        got_len, got_ms, got_sha = parse_recv_verdict(listen + verdict)
+        recovery = None
+        try:
+            if got_len is None or got_sha is None:
+                _, recovery = verify_upload_after_reply_loss(console, address, len(data), want)
+                got_len, got_sha = recovery["bytes"], recovery["sha256"]
+            if got_len != len(data) or got_sha != want:
+                raise UploadDigestMismatch(
+                    f"{label} upload mismatch: expected {len(data)} bytes/SHA256 {want}, "
+                    f"received {got_len} bytes/SHA256 {got_sha}; nothing was booted")
+        except UploadDigestMismatch as error:
+            if attempt != 0:
+                raise
+            errors = []
+            for _ in range(3):
+                fresh = None
+                try:
+                    fresh = NetConsole(console.addr[0], console.addr[1])
+                    if not fresh.at_prompt(timeout=3.0):
+                        raise StreamError("fresh prompt not confirmed before resend")
+                    fresh.transcript = console.transcript + fresh.transcript
+                    console.close()
+                    console.__dict__.update(fresh.__dict__)
+                    break
+                except (StreamError, OSError) as probe_error:
+                    errors.append(str(probe_error))
+                    if fresh is not None:
+                        console.transcript.extend(fresh.transcript)
+                        fresh.close()
+            else:
+                raise StreamError("known upload mismatch, but no confirmed prompt for "
+                                  "its one resend; nothing was booted: " + "; ".join(errors))
+            reuploads.append({"reason": str(error), "prompt_confirmed": True})
+            stage("verified mismatch; resending once", {"reuploads": reuploads})
+            print("  destination mismatch confirmed; resending RAM upload once", flush=True)
+            continue
+        result = {"bytes": got_len, "board_ms": got_ms, "sha256": got_sha,
+                  "seconds": round(time.monotonic() - began, 3), "sent_seconds": elapsed,
+                  "listener_observation": observation}
+        detail = {"transfer": {"bytes": got_len, "ms": got_ms, "sha256": got_sha}}
+        if recovery is not None:
+            result["recovery"] = recovery
+            detail["upload_recovery"] = recovery
+        if reuploads:
+            result["reuploads"] = reuploads
+            detail["reuploads"] = reuploads
+        stage("verified", detail)
+        print(f"  verified on the board: {got_len} bytes, digest matches", flush=True)
+        return result
+    raise StreamError("RAM upload retry bound exhausted; nothing was booted")
+
+
 def arm_deadman_with_recovery(
         console: NetConsole, requested: int, seconds: float = 10.0
         ) -> tuple[NetConsole, str, int | None, dict | None]:
@@ -1529,6 +1616,10 @@ def stream_file(ip: str, port: int, data: bytes,
     with sock:
         # TCP upload/FIN waits can outlast the UDP flow timeout too. Pump
         # its keepalive without reading the console from another thread.
+        # Bound queued data as well as each write. A multi-megabyte host
+        # send buffer can accept nearly the entire image before the bare-
+        # metal receiver's early close becomes visible to this loop.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
         sock.settimeout(1.0)
         view = memoryview(data)
         sent = 0
@@ -1537,7 +1628,7 @@ def stream_file(ip: str, port: int, data: bytes,
             if keepalive:
                 keepalive()
             try:
-                count = sock.send(view[sent:sent + 65536])
+                count = sock.send(view[sent:sent + 16384])
             except socket.timeout:
                 if time.monotonic() >= deadline:
                     raise StreamError("TCP upload made no progress for 60 seconds; nothing was booted.")
@@ -1778,64 +1869,11 @@ def run(args: argparse.Namespace) -> int:
         # that says it is listening and starts streaming against that. A
         # prompt arriving INSTEAD of that line is the board refusing, and it
         # ends this step at once rather than at the fifteen-second bound.
-        recv_line = f"net recv {args.port} {addr:X}"
-        console.settle(quiet=0.3, cap=3.0)
-        listen_datagram_start = len(console.accepted_datagrams)
-        listen_keepalive_start = console.keepalives
-        console.send(recv_line)
-        listen, why = console.read_until_or_prompt(
-            recv_line, ["for ONE connection"], 15)
-        record["listener_observation"] = {
-            "boundary": why,
-            "echo_seen": echo_pattern(recv_line).search(
-                listen.replace("\r", "")) is not None,
-            "reply_datagrams": len(console.accepted_datagrams) - listen_datagram_start,
-            "keepalives_sent": console.keepalives - listen_keepalive_start,
-        }
-        if why != "needle":
-            failures.append(
-                "No image was sent and nothing was booted. " +
-                listener_failure(why, listen, recv_line,
-                                 record["listener_observation"]["reply_datagrams"]))
-            journal.step("listener refused" if why == "prompt" else
-                         "listener unconfirmed")
-            raise RunStopped()
-        journal.step("listener armed")
-        elapsed = stream_file(board_ip, args.port, data, keepalive=console.keepalive)
-        print(f"  sent {len(data)} bytes in {elapsed:.2f} s")
-        record["sent_seconds"] = elapsed
-        journal.step("sent")
-
-        # HOW LONG TO WAIT FOR THE VERDICT IS A FUNCTION OF THE IMAGE, not a
-        # constant: SHA-256 is 61 KB/s on this part with the caches off and
-        # 4 MB/s with them on, so the digest is the slow half of a cold run.
-        verdict, _why = console.read_until_or_prompt(
-            recv_line, ["sha256 "], 30.0 + len(data) / 40000.0, seen=listen)
-        verdict = listen + verdict
-        got_len, got_ms, got_sha = parse_recv_verdict(verdict)
-        if got_len is None or got_sha is None:
-            console, recovered = verify_upload_after_reply_loss(
-                console, addr, len(data), want)
-            record["upload_recovery"] = recovered
-            got_len, got_sha = recovered["bytes"], recovered["sha256"]
-        record["transfer"] = {"bytes": got_len, "ms": got_ms, "sha256": got_sha}
-        if got_len is None or got_sha is None:
-            failures.append(
-                "the board never printed a length and a digest, so this "
-                "transfer HAS NO VERDICT AT ALL - which is not the same as a "
-                "good one. Nothing was booted.")
-            journal.step("no transfer verdict")
-            raise RunStopped()
-        if got_len != len(data) or got_sha != want:
-            failures.append(
-                f"THE UPLOAD DID NOT VERIFY, so nothing was booted: this host "
-                f"sent {len(data)} bytes with digest {want} and the board read "
-                f"back {got_len} bytes with digest {got_sha} out of the memory "
-                "it is about to be told to enter.")
-            journal.step("upload did not verify")
-            raise RunStopped()
-        print(f"  verified on the board: {got_len} bytes, digest matches")
-        journal.step("verified")
+        def upload_stage(name, detail):
+            record.update(detail)
+            journal.step(name)
+        verified_ram_upload(console, board_ip, args.port, addr, data, want,
+                            on_stage=upload_stage)
 
         # ---- the deadman ---------------------------------------------------
         deadman_line = f"deadman {args.deadman}"
