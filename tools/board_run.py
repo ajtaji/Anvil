@@ -1192,14 +1192,27 @@ def verify_upload_after_reply_loss(
         raise ValueError("upload recovery needs 1..3 attempts and a nonempty range")
     observations = []
     original = console
+    # Large model assets can need more than the old 65-second checksum cap.
+    # Share one sub-five-minute budget across all read-only recovery attempts.
+    hash_timeout = min(65.0, 15.0 + size / 50_000.0)
+    if size > 35_000_000:
+        hash_timeout = 30.0 + size / 1_000_000.0
+    deadline = time.monotonic() + min(290.0, attempts * (3.0 + hash_timeout))
     for attempt in range(attempts):
         fresh = None
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                observations.append("complete-range verification exhausted its 290-second budget")
+                break
             fresh = NetConsole(original.addr[0], original.addr[1])
-            if not fresh.at_prompt(timeout=3.0):
+            if not fresh.at_prompt(timeout=min(3.0, remaining)):
                 raise StreamError("fresh console did not confirm its prompt")
             line = f"sha256sum {address:X} {size:X}"
-            reply = fresh.command(line, min(65.0, 15.0 + size / 50000.0))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise StreamError("complete-range verification exhausted its deadline")
+            reply = fresh.command(line, min(hash_timeout, remaining))
             found = re.search(r"The sha256sum is ([0-9a-fA-F]{64})", reply)
             if not found:
                 raise StreamError("RAM verification reply contained no SHA256")
