@@ -244,6 +244,7 @@ Global nvcAtlasFullUploadCount.i
 Global nvcAtlasLastUploadBytes.i
 Global nvcAtlasGeneration.i
 Global nvcAtlasFaulted.i
+Global nvcAtlasPendingImage.i, nvcAtlasPendingMemory.i, nvcAtlasPendingView.i, nvcAtlasPendingSet.i
 ; The legacy RGB/RGBA source and sixteen stable-ID RGBA sources share a bounded
 ; shelf below the TrueType cache and the existing sampled atlas allocation.
 Global nvcLogoSource.i
@@ -704,11 +705,11 @@ EndProcedure
 ; Dynamic glyph misses are uploaded only before a frame begins. The mapped
 ; staging allocation remains the complete atlas; the copy rectangle may be
 ; smaller. Callers never mutate sampled texels during a render pass.
-Procedure.i nvcAtlasUploadWarm(allowPartial.i)
+Procedure.i nvcAtlasUploadImage(targetImage.i, oldLayout.i, allowPartial.i, poisonOnFailure.i)
   Define bi.VkCommandBufferBeginInfo
   Define bar.VkImageMemoryBarrier
   Define copy.VkBufferImageCopy
-  Define rc.i, partial.i
+  Define rc.i, partial.i, sourceStage.i
   If nvcInFrame <> 0 Or nvcAtlasUploadMapped = 0 Or nvcUploadBuffer = 0 Or nvcAtlasFaulted <> 0
     ProcedureReturn #NEON_VK_CHROME_ERR_STATE
   EndIf
@@ -719,11 +720,15 @@ Procedure.i nvcAtlasUploadWarm(allowPartial.i)
   bar\sType = #VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
   bar\srcAccessMask = #VK_ACCESS_SHADER_READ_BIT
   bar\dstAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
-  bar\oldLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+  bar\oldLayout = oldLayout
+  sourceStage = #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+  If oldLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+    bar\srcAccessMask = 0 : sourceStage = #VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+  EndIf
   bar\newLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
   bar\srcQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
   bar\dstQueueFamilyIndex = #VK_QUEUE_FAMILY_IGNORED
-  bar\image = nvcAtlasImage
+  bar\image = targetImage
   bar\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
   bar\subresourceRange\levelCount = 1 : bar\subresourceRange\layerCount = 1
   copy\bufferOffset = #NEON_VK_CHROME_ATLAS_PAD
@@ -732,8 +737,8 @@ Procedure.i nvcAtlasUploadWarm(allowPartial.i)
   copy\imageExtent\width = nvcAtlasW : copy\imageExtent\height = nvcAtlasH : copy\imageExtent\depth = 1
   If allowPartial <> 0 : partial = nvcTTPartialPlan(@copy) : EndIf
   If rc = #VK_SUCCESS
-    vkCmdPipelineBarrier(nvcCommand, #VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
-    vkCmdCopyBufferToImage(nvcCommand, nvcUploadBuffer, nvcAtlasImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
+    vkCmdPipelineBarrier(nvcCommand, sourceStage, #VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, 0, 0, 0, 1, @bar)
+    vkCmdCopyBufferToImage(nvcCommand, nvcUploadBuffer, targetImage, #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, @copy)
     bar\srcAccessMask = #VK_ACCESS_TRANSFER_WRITE_BIT
     bar\dstAccessMask = #VK_ACCESS_SHADER_READ_BIT
     bar\oldLayout = #VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
@@ -750,15 +755,20 @@ Procedure.i nvcAtlasUploadWarm(allowPartial.i)
     Else
       nvcAtlasFullUploadCount + 1
     EndIf
-  Else
+  ElseIf poisonOnFailure <> 0
     nvcAtlasFaulted = 1
   EndIf
   ProcedureReturn rc
 EndProcedure
+Procedure.i nvcAtlasUploadWarm(allowPartial.i)
+  ProcedureReturn nvcAtlasUploadImage(nvcAtlasImage, #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, allowPartial, 1)
+EndProcedure
+Declare.i nvcAtlasReplaceGeneration()
 
-; Refresh the bitmap-owned atlas columns only while the frame is quiescent.
-; TrueType glyphs live from x=32 onward. A failed GPU upload poisons this
-; owner because the prior image contents can no longer be trusted.
+
+; Replace bitmap generations only while quiescent. TrueType glyphs retain
+; their staging columns, and preparation failure leaves the active GPU
+; generation unchanged. Ordinary glyph additions retain partial uploads.
 Procedure.i nvcAtlasRefresh()
   Define source.i, width.i, height.i, bytes.i, generation.i
   Define x.i, y.i, target.i, rc.i
@@ -781,11 +791,8 @@ Procedure.i nvcAtlasRefresh()
     Next
   Next
   If nvcBitmapStageCopy(source, width, height) = 0 : ProcedureReturn #NEON_VK_CHROME_ERR_ATLAS : EndIf
-  rc = nvcAtlasUploadWarm(0)
-  If rc <> #VK_SUCCESS
-    nvcAtlasFaulted = 1
-    ProcedureReturn #NEON_VK_CHROME_ERR_VULKAN
-  EndIf
+  rc = nvcAtlasReplaceGeneration()
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
   nvcAtlasBaseW = width : nvcAtlasBaseH = height
   nvcWhiteU0 = neon_F32Ratio(nvcF32Pixel(white\left, width), nvcAtlasW)
   nvcWhiteU1 = neon_F32Ratio(nvcF32Pixel(white\right, width), nvcAtlasW)
@@ -1317,6 +1324,88 @@ Procedure.i nvcImageSpritePreflight(imageBytes.i, stagingBytes.i)
   EndIf
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
+
+; Prepare an unpublished atlas generation. The old image and descriptor stay
+; live until the candidate upload and descriptor writes have completed.
+Procedure.i nvcAtlasReplaceGeneration()
+  Define ici.VkImageCreateInfo, req.VkMemoryRequirements, mai.VkMemoryAllocateInfo
+  Define ivci.VkImageViewCreateInfo, dsai.VkDescriptorSetAllocateInfo
+  Define dbi.VkDescriptorBufferInfo, dii.VkDescriptorImageInfo, write.VkWriteDescriptorSet
+  Define image.i, memory.i, view.i, setHandle.i, layoutHandle.i, rc.i, used.i, freeRows.i, i.i
+  Define oldImage.i, oldMemory.i, oldView.i, oldSet.i
+  If nvcInFrame <> 0 Or nvcFramePending <> 0 Or nvdPresentPending() <> 0 Or nvcAtlasFaulted <> 0
+    ProcedureReturn #NEON_VK_CHROME_ERR_STATE
+  EndIf
+  If avkHeapBind() <> #VK_SUCCESS : ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY : EndIf
+  ici\sType = #VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+  ici\imageType = #VK_IMAGE_TYPE_2D : ici\format = #VK_FORMAT_B8G8R8A8_UNORM
+  ici\extent\width = nvcAtlasW : ici\extent\height = nvcAtlasH : ici\extent\depth = 1
+  ici\mipLevels = 1 : ici\arrayLayers = 1 : ici\samples = #VK_SAMPLE_COUNT_1_BIT
+  ici\tiling = #VK_IMAGE_TILING_OPTIMAL
+  ici\usage = #VK_IMAGE_USAGE_TRANSFER_DST_BIT | #VK_IMAGE_USAGE_SAMPLED_BIT
+  ici\sharingMode = #VK_SHARING_MODE_EXCLUSIVE : ici\initialLayout = #VK_IMAGE_LAYOUT_UNDEFINED
+  rc = vkCreateImage(nvcDevice, @ici, 0, @image)
+  If rc <> #VK_SUCCESS : ProcedureReturn rc : EndIf
+  vkGetImageMemoryRequirements(nvcDevice, image, @req)
+  For i = 1 To #ANVIL_VK_MAX_MEMORY
+    If avkMemLive[i] <> 0 : used = used + avkMemSize[i] : Else : freeRows = freeRows + 1 : EndIf
+  Next
+  If freeRows < 1 Or used < 0 Or used > avkHeapBytes Or req\size < 1 Or req\size > avkHeapBytes - used
+    vkDestroyImage(nvcDevice, image, 0)
+    ProcedureReturn #NEON_VK_CHROME_ERR_CAPACITY
+  EndIf
+  mai\sType = #VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO
+  mai\allocationSize = req\size : mai\memoryTypeIndex = 0
+  rc = vkAllocateMemory(nvcDevice, @mai, 0, @memory)
+  If rc = #VK_SUCCESS : rc = vkBindImageMemory(nvcDevice, image, memory, 0) : EndIf
+  If rc = #VK_SUCCESS
+    ivci\sType = #VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+    ivci\image = image : ivci\viewType = #VK_IMAGE_VIEW_TYPE_2D : ivci\format = #VK_FORMAT_B8G8R8A8_UNORM
+    ivci\subresourceRange\aspectMask = #VK_IMAGE_ASPECT_COLOR_BIT
+    ivci\subresourceRange\levelCount = 1 : ivci\subresourceRange\layerCount = 1
+    rc = vkCreateImageView(nvcDevice, @ivci, 0, @view)
+  EndIf
+  If rc = #VK_SUCCESS
+    layoutHandle = nvcSetLayout
+    dsai\sType = #VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+    dsai\descriptorPool = nvcDescriptorPool : dsai\descriptorSetCount = 1 : dsai\pSetLayouts = @layoutHandle
+    rc = vkAllocateDescriptorSets(nvcDevice, @dsai, @setHandle)
+  EndIf
+  If rc = #VK_SUCCESS : rc = nvcAtlasUploadImage(image, #VK_IMAGE_LAYOUT_UNDEFINED, 0, 0) : EndIf
+  If rc = #VK_SUCCESS
+    dbi\buffer = nvcUniformBuffer : dbi\range = 16
+    write\sType = #VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+    write\dstSet = setHandle : write\dstBinding = 0
+    write\descriptorCount = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : write\pBufferInfo = @dbi
+    AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+    If AnvilVkFaultCode() <> #ANVIL_VK_OK : rc = #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  EndIf
+  If rc = #VK_SUCCESS
+    dii\sampler = nvcSampler : dii\imageView = view : dii\imageLayout = #VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    write\dstBinding = 1 : write\descriptorType = #VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    write\pBufferInfo = 0 : write\pImageInfo = @dii
+    AnvilVkFaultClear() : vkUpdateDescriptorSets(nvcDevice, 1, @write, 0, 0)
+    If AnvilVkFaultCode() <> #ANVIL_VK_OK : rc = #NEON_VK_CHROME_ERR_VULKAN : EndIf
+  EndIf
+  If rc <> #VK_SUCCESS
+    If vkDeviceWaitIdle(nvcDevice) <> #VK_SUCCESS
+      ; Neither active nor candidate resources may be retired while work
+      ; is uncertain. Destroy retries device idle before releasing either.
+      nvcAtlasPendingImage = image : nvcAtlasPendingMemory = memory
+      nvcAtlasPendingView = view : nvcAtlasPendingSet = setHandle
+      nvcAtlasFaulted = 1 : nvcReady = 0
+      ProcedureReturn rc
+    EndIf
+    nvcImageSpriteRelease(setHandle, view, image, memory)
+    ProcedureReturn rc
+  EndIf
+  oldImage = nvcAtlasImage : oldMemory = nvcAtlasMemory
+  oldView = nvcAtlasView : oldSet = nvcDescriptorSet
+  nvcAtlasImage = image : nvcAtlasMemory = memory : nvcAtlasView = view : nvcDescriptorSet = setHandle
+  nvcImageSpriteRelease(oldSet, oldView, oldImage, oldMemory)
+  ProcedureReturn #NEON_VK_CHROME_OK
+EndProcedure
+
 
 ; The target has no CopyMemory or 64-bit Poke intrinsic. Copy aligned BGRA
 ; words without channel conversion, or bytes for unaligned source buffers.
@@ -3823,6 +3912,7 @@ Procedure NeonVkChromeDestroy()
       nvcFail(idleRc)
       ProcedureReturn
     EndIf
+    nvcImageSpriteRelease(nvcAtlasPendingSet, nvcAtlasPendingView, nvcAtlasPendingImage, nvcAtlasPendingMemory)
     If nvcImageSpritePendingStage <> 0 : vkDestroyBuffer(nvcDevice, nvcImageSpritePendingStage, 0) : EndIf
     If nvcImageSpritePendingStageMemory <> 0 : vkFreeMemory(nvcDevice, nvcImageSpritePendingStageMemory, 0) : EndIf
     nvcImageSpriteRelease(nvcImageSpritePendingSet, nvcImageSpritePendingView, nvcImageSpritePendingImage, nvcImageSpritePendingMemory)
@@ -3864,6 +3954,7 @@ Procedure NeonVkChromeDestroy()
     nvcImageSpriteWidths[slot] = 0 : nvcImageSpriteHeights[slot] = 0
     nvcImageSpriteGenerations[slot] = 0
   Next
+  nvcAtlasPendingImage = 0 : nvcAtlasPendingMemory = 0 : nvcAtlasPendingView = 0 : nvcAtlasPendingSet = 0
   nvcImageSpritePendingImage = 0 : nvcImageSpritePendingMemory = 0 : nvcImageSpritePendingView = 0 : nvcImageSpritePendingSet = 0
   nvcImageSpritePendingStage = 0 : nvcImageSpritePendingStageMemory = 0
   nvcParticleImage = 0 : nvcParticleMemory = 0 : nvcParticleView = 0 : nvcParticleSet = 0

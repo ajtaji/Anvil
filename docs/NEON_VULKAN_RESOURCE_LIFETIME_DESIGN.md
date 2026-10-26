@@ -209,3 +209,23 @@ cover HDMI and DSI, all available rotations, odd extents, draw/scan buffer
 ownership, DMA presentation, single-buffer fallback, and recovery to a valid
 next frame. Public counters and resource generations must be checked at every
 transition.
+
+
+## Transactional bitmap atlas generations - 25 October 2026
+
+The adapter now creates an unpublished atlas image/view/descriptor, uploads
+the prepared staging pixels, and waits before swapping active handles.
+Preparation or capacity failure preserves the old generation and GPU bytes.
+An uncertain completion retains candidate and active resources and disables
+the owner until device-idle retirement; it never frees possibly referenced
+memory speculatively. Existing TrueType partial/full glyph uploads are retained.
+
+The physical Pi 4 proof preserves all 2 MiB of the old atlas under memory-table
+exhaustion, then completes three generation swaps with exact text/sprite
+pixels and unchanged live allocation count. A private diagnostic injects
+unknown completion after a real upload and proves retention/idle teardown;
+the GPU is not intentionally hung. The complete current 15-scene baseline and
+existing partial-upload pixel/transfer oracle remain exact. Historical line
+scenes 4/5 already differ from the old native corpus due to the 14 October line
+placement contract; that golden is preserved. Evidence and repeatable tools:
+`docs/evidence/neon-atlas-generation-pi4-20261025/README.md`.

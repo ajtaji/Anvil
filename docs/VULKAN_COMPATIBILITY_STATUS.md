@@ -1322,3 +1322,23 @@ The Anvil-only Neon port adapter also passed a Pi 4 offscreen Vulkan frame with 
 Four bounded Pi 4 RAM runs exercised two ordered `vkCmdCopyBufferToImage` calls into one 72×64 optimal BGRA8 image at aggregate budgets 64, 128, 192 and 256 complete UIF utiles. TFU initialization and an independent mapped UIF oracle established all 4,608 baseline texels before the partial work. The maximum run changed 4,096 texels and preserved 512 in the center gap, the checksum of all 1,536 padded UIF texels, 128 image guards and 64 source guards. Guarded DMA advanced 0→256 and backend jobs 1→3, while TFU stayed at one job after initialization; all error and fault checks passed. The full payload took 1.233617 seconds, with about 1.4 seconds observed by the monitor under a 15-second deadman and no flash. This measured bound applies to Pi 4 only; other backends remain fail-closed. See `docs/evidence/vulkan-two-partial-optimal-aggregate-pi4-20261001/README.md`.
 
 \n
+
+
+## Transactional bitmap atlas generations - 25 October 2026
+
+The adapter now creates an unpublished atlas image/view/descriptor, uploads
+the prepared staging pixels, and waits before swapping active handles.
+Preparation or capacity failure preserves the old generation and GPU bytes.
+An uncertain completion retains candidate and active resources and disables
+the owner until device-idle retirement; it never frees possibly referenced
+memory speculatively. Existing TrueType partial/full glyph uploads are retained.
+
+The physical Pi 4 proof preserves all 2 MiB of the old atlas under memory-table
+exhaustion, then completes three generation swaps with exact text/sprite
+pixels and unchanged live allocation count. A private diagnostic injects
+unknown completion after a real upload and proves retention/idle teardown;
+the GPU is not intentionally hung. The complete current 15-scene baseline and
+existing partial-upload pixel/transfer oracle remain exact. Historical line
+scenes 4/5 already differ from the old native corpus due to the 14 October line
+placement contract; that golden is preserved. Evidence and repeatable tools:
+`docs/evidence/neon-atlas-generation-pi4-20261025/README.md`.
