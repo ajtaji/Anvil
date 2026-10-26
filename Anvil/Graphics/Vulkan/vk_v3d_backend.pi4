@@ -172,7 +172,7 @@ EndProcedure
 Procedure.i avkBackendCaps()
   Define caps.i
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
-  If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
+  If NeonHardwareReady() = 0 : ProcedureReturn 0 : EndIf
   caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TRIANGLE_FAN
   CompilerIf #DSP_DMA_LINKED = 1
     ; A linked DMA driver is not an initialized DMA channel. Atlas prewarm
@@ -189,7 +189,7 @@ Procedure.i avkBackendName()
 EndProcedure
 
 Procedure.i avkBackendPrepare()
-  If Neon_Ready() = 0
+  If NeonHardwareReady() = 0
     avkFault(#VK_ERROR_INITIALIZATION_FAILED, "vkCreateDevice found the Pi 4 graphics engine not initialised (VkResult -3, VK_ERROR_INITIALIZATION_FAILED); no device was created. Call NeonArena, NeonSurface, NeonSurfaceMapSpan and NeonInit, and check Neon_Error(), before creating a Vulkan device.")
     ProcedureReturn #VK_ERROR_INITIALIZATION_FAILED
   EndIf
@@ -370,7 +370,7 @@ Procedure.i avkBackendSubmitImageCopy(*copy.AnvilVkBackendImageCopy)
 EndProcedure
 
 Procedure.i avkBackendClearSupported(base.i, bytes.i, w.i, h.i, pitch.i)
-  If Neon_Ready() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
+  If NeonHardwareReady() = 0 : ProcedureReturn #VK_ERROR_DEVICE_LOST : EndIf
   If base <= 0 Or bytes <= 0 : ProcedureReturn #VK_ERROR_FEATURE_NOT_PRESENT : EndIf
   ; Inside the declared window, written as differences so that a base
   ; plus size which wraps cannot pass the check.

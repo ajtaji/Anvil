@@ -426,3 +426,22 @@ flat cells removed from physical vertex counts. Evidence and limits:
 `docs/evidence/neon-family-budgets-pi4-20261025/README.md`. Native maximum
 path/storage, public-counter ownership, external/grid quota-specific physical
 cases, desktop integration and broad Vulkan completion remain open.
+
+
+## Public renderer state ownership - 25 October 2026
+
+The optional typed state-query/error-writer pair now makes public counters,
+clip enable, error and readiness belong to the installed drawing owner.
+Vulkan publishes its native-unit ledgers and ancillary counts. Native GPU
+internals query hardware readiness independently. Replacement/removal clears
+both callbacks; native fallback remains independent, and partial installation
+refuses without changing the binding. Frontend errors forward to the owner.
+
+Physical bug1440 before/after evidence checks nine counters before/after submit,
+refusal and clip/error semantics, six contract groups, all16384 exact GPU bytes
+and zero final allocations. Ninety-three corrupt proofs are rejected. The
+complete current15-scene PMF still matches the physical regression and all245760
+bytes /124widget checks pass. Evidence:
+`docs/evidence/neon-public-state-pi4-20261025/README.md`. Hardware timing/address
+accessors, maximum point/storage work, dedicated external/grid quota cases,
+desktop integration and the broader completion goal remain outside this claim.
