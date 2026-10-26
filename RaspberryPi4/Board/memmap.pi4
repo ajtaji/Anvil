@@ -31,9 +31,9 @@
 ;    #AB_BASE      the autoboot record. A FIXED page that no image size
 ;                  can reach - see THE AUTOBOOT RECORD below, which is
 ;                  where it moved to on 2026-09-08 and why.
-;    #MON_DATA_*   where --bss-addr puts this program's variables. A
-;                  placement decision, not a budget; the 8 MiB size is
-;                  what HitsMonitor() refuses and is argued below.
+;    #MON_DATA_*   where --bss-addr puts this program's variables and the
+;                  minimum reserved band. On Pi 4 the upper bound also
+;                  follows the linked end of ordinary and NoClear storage.
 ;    #PAY0_HI      the top of the low payload window - one clear megabyte
 ;                  below the default payload stack top.
 ;    #PAY1_LO/HI   the whole of DRAM bank 1, measured from bdinfo.
@@ -305,7 +305,7 @@ CompilerEndIf
 ;  The original 8 MiB reservation at $08200000 was clear of the payload
 ;  stack and Ethernet ring, but the TrueType renderer and Vulkan backend
 ;  grew the linked monitor's BSS beyond its former reservation. The old bound was
-;  therefore no longer safe. The new 16 MiB window starts at $0D000000,
+;  therefore no longer safe. The minimum 16 MiB window starts at $0D000000,
 ;  immediately above the independently reserved Vulkan heap
 ;  ($0C000000..$0CFFFFFF), and ends at $0DFFFFFF.
 ;
@@ -313,17 +313,21 @@ CompilerEndIf
 ;  exists on every supported Pi 4. It is above the low payload window,
 ;  payload stack, Ethernet ring, DSI framebuffer, module region, V3D
 ;  arena, screenshot capture and Vulkan heap. It is below bank 1 and the
-;  hole between banks. The linker and tools/a64/a64_anvil_check.py check
-;  the exact emitted BSS extent against this named 16 MiB refusal range.
+;  hole between banks. Pi 4 expands the refusal through the actual linked
+;  variable end, rounded to the same MiB grain as code. The minimum band
+;  remains reserved so existing placement decisions do not move backwards.
+;  Pi 5 retains its separate fixed layout: its records immediately above
+;  that band require a separate relocation before extending the band there.
 ;
 ;  BSS is not copied from the image. _start clears the linker-emitted
 ;  __bss_start__..__bss_end__ range at the address selected by BssAddress.
-;  Keeping that directive equal to #MON_DATA_LO and protecting the whole
-;  reserved window through HwMonRegion*() prevents both silent overlap and
-;  writes from monitor memory commands.
+;  NoClear follows that zeroed range. A NoClear anchor guarantees the end
+;  label exists even when no other preserved variable is declared; the
+;  anchor's value is never read. MonDataEnd measures __noclear_end__, not
+;  the earlier zeroing boundary. HwMonRegionHi(1) protects the entire span.
 ; ----------------------------------------------------------------------
 #MON_DATA_LO    = $0D000000    ; monitor BSS follows the Vulkan heap
-#MON_DATA_BYTES = $01000000    ; 16 MiB; emitted BSS currently uses 14.3 MiB
+#MON_DATA_BYTES = $01000000    ; minimum reservation; Pi 4 grows from linked extent
 #MON_DATA_HI    = $0DFFFFFF
 
 ; ----------------------------------------------------------------------
@@ -764,6 +768,11 @@ CompilerEndIf
 ; ======================================================================
 Global monimage_lo.i = 0       ; written by MonImageLo()'s ASM, read next line
 Global monimage_end.i = 0      ; written by MonImageEnd()'s ASM, read next line
+CompilerIf #PMF_CHIP = 2712
+CompilerElse
+NoClear Global mondata_extent_anchor.i
+Global mondata_end.i
+CompilerEndIf
 
 Procedure.i MonImageLo()
   ASM
@@ -788,6 +797,30 @@ Procedure.i MonImageEnd()
     str  x16, [x17]
   EndASM
   ProcedureReturn monimage_end
+EndProcedure
+
+; One past ALL variable storage, including preserved globals. The address
+; bridge is the same linker-symbol-only operation as MonImageEnd above.
+Procedure.i MonDataEnd()
+  CompilerIf #PMF_CHIP = 2712
+    ProcedureReturn #MON_DATA_HI + 1
+  CompilerElse
+  ASM
+    adrp x16, __noclear_end__
+    add  x16, x16, #:lo12:__noclear_end__
+    adrp x17, global_mondata_end
+    add  x17, x17, #:lo12:global_mondata_end
+    str  x16, [x17]
+  EndASM
+  ProcedureReturn mondata_end
+  CompilerEndIf
+EndProcedure
+
+Procedure.i HwMonDataHi()
+  Define last.i
+  last = MonDataEnd() - 1
+  If last <= #MON_DATA_HI : ProcedureReturn #MON_DATA_HI : EndIf
+  ProcedureReturn ((last / #MON_GRAIN) + 1) * #MON_GRAIN - 1
 EndProcedure
 
 ; ======================================================================
@@ -1181,7 +1214,7 @@ Procedure.i HwMonRegionHi(i.i)
   CompilerEndIf
   Select i
     Case 0 : ProcedureReturn HwMonHi()
-    Case 1 : ProcedureReturn #MON_DATA_HI
+    Case 1 : ProcedureReturn HwMonDataHi()
     Case 2 : ProcedureReturn #AB_BASE + #AB_BYTES - 1
     Case 3 : ProcedureReturn #MON_FB_HI
     Case 4 : ProcedureReturn #CORE_RAW_STACK_HI

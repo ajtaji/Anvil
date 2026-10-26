@@ -109,3 +109,19 @@ only at bounded forward-progress checkpoints. The initial whole-payload
 15-second trial failed with a watchdog restart; it is not a passing result.
 No firmware was installed. Evidence and repeatable tools are documented in
 docs/evidence/neon-combined-draws-pi4-20261025/README.md.
+
+
+@SECTION Pi 4 variable reservation follows the linked extent
+
+The Pi 4 map and memory-command guard now extend the monitor variable
+reservation through the final linked ordinary and preserved storage, rounded
+up to 1 MiB. The original 16 MiB band remains a minimum. This prevents growing
+Vulkan tables from silently escaping the guard. Build 331 compiles with its
+last variable byte at 0E60D92F and a resulting reservation end of 0E6FFFFF.
+
+Safe relocated physical tests cover both a small layout and one beyond the
+old limit, including preserved variables, exact boundary refusals and the
+first free byte. Eighteen native checks pass and 13 corrupt proofs are
+rejected. The resident monitor was not replaced; build 328 still reports its
+older map. Pi 5 retains its separate fixed layout. Evidence and repeatable
+tools: docs/evidence/pi4-linked-variables-20261025/README.md.

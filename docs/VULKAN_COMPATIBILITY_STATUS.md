@@ -1369,3 +1369,15 @@ watchdog progress checkpoints and returned in 21.5 seconds; the earlier
 15-second whole-payload attempt failed with a watchdog restart. Separate
 family vertex budgets and maximum vertex workloads remain open. Evidence:
 `docs/evidence/neon-combined-draws-pi4-20261025/README.md`.
+
+
+## Pi 4 variable-region guard corrected in source - 25 October 2026
+
+Monitor variables now grow their Pi 4 map/guard reservation from the linked
+ordinary-plus-preserved end rather than stopping at the 16 MiB minimum.
+Safe relocated silicon fixtures on both sides of that minimum pass 18 native
+checks and match PMF/linker extents; 13 corrupted proofs are rejected. Normal
+build 331 compiles and derives reservation 0D000000..0E6FFFFF, but is not
+installed. Resident 328 still uses the older map. Topic 1249 remains open
+pending deployment acceptance. Pi 5 layout is unchanged. Evidence:
+`docs/evidence/pi4-linked-variables-20261025/README.md`.

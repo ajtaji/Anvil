@@ -451,6 +451,11 @@ def window_edges(ctx: Ctx) -> dict[str, int]:
                  "MON_DATA_HI", "AB_BASE", "AB_BYTES", "MON_GRAIN"):
         out[name] = const(text, name)
     grain = out["MON_GRAIN"]
+    out["MON_DATA_MIN_HI"] = out["MON_DATA_HI"]
+    variable_end = ctx.sym.get("__noclear_end__", ctx.sym.get("__bss_end__"))
+    if variable_end is None:
+        raise SystemExit("The linked variable end is missing; layout checks cannot run.")
+    out["MON_DATA_HI"] = max(out["MON_DATA_MIN_HI"], ((variable_end + grain - 1) // grain) * grain - 1)
     size = IMG.stat().st_size
     end = ctx.load + size
 
@@ -519,7 +524,8 @@ def section_layout(ctx: Ctx) -> None:
         top = addr + sizes[name]
         lo = addr if lo is None else min(lo, addr)
         hi = top if hi is None else max(hi, top)
-    bs, be = ctx.sym.get("__bss_start__"), ctx.sym.get("__bss_end__")
+    bs = ctx.sym.get("__bss_start__")
+    be = ctx.sym.get("__noclear_end__", ctx.sym.get("__bss_end__"))
     if ctx.case(bs is not None and be is not None,
                 "the .sym has no __bss_start__ / __bss_end__, so the Globals "
                 "cannot be bracketed"):
@@ -542,9 +548,9 @@ def section_layout(ctx: Ctx) -> None:
              "BSS ends at $%08X, past #MON_DATA_HI $%08X"
              % (hi - 1, e["MON_DATA_HI"]))
     map_text = MAP.read_text(encoding="utf-8", errors="replace")
-    ctx.case(e["MON_DATA_HI"] - e["MON_DATA_LO"] + 1 ==
+    ctx.case(e["MON_DATA_MIN_HI"] - e["MON_DATA_LO"] + 1 ==
              const(map_text, "MON_DATA_BYTES"),
-             "the protected BSS region's endpoints do not match its declared size")
+             "the minimum BSS reservation endpoints do not match its declared size")
     ctx.case(ctx.call(cpu, "hwmonregionlo", 1) == e["MON_DATA_LO"],
              "HwMonRegionLo(1) does not protect the relocated monitor BSS")
     ctx.case(ctx.call(cpu, "hwmonregionhi", 1) == e["MON_DATA_HI"],
