@@ -99,24 +99,38 @@ Global SbcProtoPtr.i, SbcCosPtr.i, SbcCosEnd.i, SbcAnalysisBlock.i
 ; i/24-i negated) as 8 terms; integer sums are unchanged.
 Global Dim SbcWindow.i(104)
 Global Dim SbcZ.i(8)
+Global Dim SbcLinear.w(208)
 Procedure SbcAnalyze()
-  Protected block.i,i.i,j.i,k.i,sum.i,v.i
-  For block=0 To 15
-    For i=79 To 8 Step -1 : SbcHistory(i)=SbcHistory(i-8) : Next
-    For i=0 To 7 : SbcHistory(i)=SbcPcm(block*8+7-i) : Next
-    For i=0 To 15
-      sum=0
-      For j=0 To 4 : k=i+j*16 : sum=sum+SbcHistory(k)*PeekW(?SbcProto+k*2) : Next
-      SbcY(i)=SbcSar(sum,16)
-    Next
-    For k=0 To 7
-      sum=0
-      For i=0 To 15 : sum=sum+SbcY(i)*PeekW(?SbcCos+(k*16+i)*2) : Next
-      v=SbcSar(sum,12)
-      If v>32767 : v=32767 : ElseIf v< -32767 : v= -32767 : EndIf
-      SbcSub(block*8+k)=v
-    Next
+ Protected block.i,i.i,j.i,k.i,sum.i,v.i,offset.i
+ ; One reversed frame followed by its previous history, shared by all blocks.
+ For i=0 To 127 : SbcLinear(i)=SbcPcm(127-i) : Next
+ For i=0 To 79 : SbcLinear(128+i)=SbcHistory(i) : Next
+ For block=0 To 15
+  offset=(15-block)*8
+  For i=0 To 15
+   sum=0
+   For j=0 To 4
+    k=i+j*16 : sum=sum+SbcLinear(offset+k)*PeekW(?SbcProto+k*2)
+   Next
+   SbcY(i)=SbcSar(sum,16)
   Next
+  For k=0 To 7
+   ; Exact integer regrouping of equal/opposite cosine coefficients.
+   offset=k*16
+   sum=(SbcY(0)+SbcY(8))*PeekW(?SbcCos+offset*2)
+   sum=sum+(SbcY(1)+SbcY(7))*PeekW(?SbcCos+(offset+1)*2)
+   sum=sum+(SbcY(2)+SbcY(6))*PeekW(?SbcCos+(offset+2)*2)
+   sum=sum+(SbcY(3)+SbcY(5))*PeekW(?SbcCos+(offset+3)*2)
+   sum=sum+SbcY(4)*PeekW(?SbcCos+(offset+4)*2)
+   sum=sum+(SbcY(9)-SbcY(15))*PeekW(?SbcCos+(offset+9)*2)
+   sum=sum+(SbcY(10)-SbcY(14))*PeekW(?SbcCos+(offset+10)*2)
+   sum=sum+(SbcY(11)-SbcY(13))*PeekW(?SbcCos+(offset+11)*2)
+   v=SbcSar(sum,12)
+   If v>32767 : v=32767 : ElseIf v< -32767 : v= -32767 : EndIf
+   SbcSub(block*8+k)=v
+  Next
+ Next
+ For i=0 To 79 : SbcHistory(i)=SbcLinear(i) : Next
 EndProcedure
 ; Scale factor per subband: smallest s (<=15) with every |sample| < 2^(s+1).
 ; Channel 1 of duplicated stereo shares channel 0's factors.

@@ -375,3 +375,42 @@ reverse of what had been predicted.
 The model stays right for the things a board cannot do: exact
 instruction counts, constant-time work, a run with no board attached,
 and developing the model itself.
+
+
+@SECTION Pi4 optional Bluetooth TX queue evidence
+
+tests/pi4_bt_tx_queue_gate.pi4 passes 296,896 physical byte push/pop checks,
+including empty/full refusal, wraparound, bursts and unchanged UART-open
+state. It never opens Bluetooth. Two warm eight-direction speech-only
+payloads then retain complete generated PCM and recurrent-state identity,
+with zero underruns, RX errors, late events, core faults or disconnect
+timeouts. The second also verifies an empty queue, closed UART and zero
+transmit timeouts after shutdown. Peak occupancy stays below 1,600 of 4,095 bytes.
+
+Against the same blocking-UART application, sustained generation ratios
+fall from 0.909..0.981 to about 0.841..0.908. First non-silent scheduled stream
+positions stay below 350 ms; these are sender positions, not microphone
+measurements. The audio-service maximum gap is 1.93 ms and 2.71 ms in the two
+buffered runs versus 4.21 ms blocking. This improves headroom but does not
+prove simultaneous map rendering. All payloads return with healthy cores,
+the deadman off and Vulkan console restored; no firmware flash is required.
+
+
+@SECTION Exact shared SBC analysis movement and matrix reduction
+
+The fixed-point encoder now forms one reversed frame-plus-history window
+instead of shifting 72 history words for each of 16 blocks. Eight exact
+coefficient symmetries replace the 16-term cosine matrix sum; integer
+regrouping preserves every result. History is committed once per frame.
+There is no sample-rate, bitpool, rounding, precision or voice change.
+
+tests/pi4_sbc_linear_gate.pi4 retains the prior analysis as its reference.
+The physical differential covers 1,024 entire encoded mono/stereo frames,
+all 128 subband values and all 80 history words, including silence, extrema,
+alternating signs, ramps, impulses and pseudorandom sequences. A paired
+cached run measured 4,783,149 versus 3,678,749 counter ticks, 23.1% less encoder
+time. In the whole warm eight-direction Bluetooth run, encoding/resampling/
+diagnostic capture falls from 1.314 s to 1.118 s; sustained generation ratios
+fall from 0.841..0.908 to 0.834..0.901. Complete speech PCM/state identity,
+zero underruns/transport faults and clean Bluetooth shutdown all remain.
+Simultaneous map rendering still needs its own later acceptance run.

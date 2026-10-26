@@ -111,12 +111,69 @@ Global btu_powerErr.i
 Global Dim btu_savedUart.l[6]      ; IBRD FBRD LCRH CR IMSC IFLS
 Global Dim btu_savedGpio.l[5]      ; GPFSEL1 GPFSEL3 PULL0 PULL1 PULL2
 
+; Optional primary-core TX queue. Startup remains synchronous by default.
+; BtuBufferedTx(1) copies bytes into a bounded 4095-byte FIFO. HCI polling
+; through BtuGet drains free hardware FIFO slots without waiting. The caller
+; must keep polling, and all queue access must remain on one primary core.
+; Disable, baud changes and close flush pending bytes with a 250ms bound;
+; close always restores the console, even after a reported flush failure.
+; Enabling does not reconfigure the controller or change the default seam.
+#BTU_TX_QUEUE_BYTES=4096
+Global Dim btu_txQueue.a[#BTU_TX_QUEUE_BYTES]
+Global btu_txHead.i,btu_txTail.i,btu_txBuffered.i,btu_txPeak.i,btu_txTimeout.i
+Procedure BtuQueueReset()
+ btu_txHead=0 : btu_txTail=0 : btu_txBuffered=0
+EndProcedure
+Procedure.i BtuQueueUsed()
+ ProcedureReturn (btu_txHead-btu_txTail) & (#BTU_TX_QUEUE_BYTES-1)
+EndProcedure
+Procedure.i BtuQueuePush(value.i)
+ Protected nextHead.i=(btu_txHead+1) & (#BTU_TX_QUEUE_BYTES-1),used.i
+ If nextHead=btu_txTail : ProcedureReturn 0 : EndIf
+ btu_txQueue[btu_txHead]=value & $FF : btu_txHead=nextHead
+ used=BtuQueueUsed() : If used>btu_txPeak : btu_txPeak=used : EndIf
+ ProcedureReturn 1
+EndProcedure
+Procedure.i BtuQueuePop()
+ Protected value.i
+ If btu_txHead=btu_txTail : ProcedureReturn -1 : EndIf
+ value=btu_txQueue[btu_txTail] & $FF
+ btu_txTail=(btu_txTail+1) & (#BTU_TX_QUEUE_BYTES-1)
+ ProcedureReturn value
+EndProcedure
+
 Procedure.i BtuRd(off.i)
   ProcedureReturn PeekN(#BTU_BASE + off) & $FFFFFFFF
 EndProcedure
 
 Procedure BtuWr(off.i, v.i)
   PokeL(#BTU_BASE + off, v)
+EndProcedure
+
+ ; Service only free FIFO slots; never wait for the UART here.
+Procedure BtuDrainTx()
+ If btu_open=0 : ProcedureReturn : EndIf
+ While btu_txHead<>btu_txTail
+  If (BtuRd(#BTU_FR) & #BTU_FR_TXFF)<>0 : Break : EndIf
+  BtuWr(#BTU_DR,BtuQueuePop())
+ Wend
+EndProcedure
+Procedure.i BtuFlushPending()
+ Protected deadline.i=Ticks()+TickHz()/4
+ While BtuQueueUsed()>0
+  BtuDrainTx()
+  If Ticks()>deadline
+   btu_txTimeout+1 : btu_why="Bluetooth software transmit queue did not drain"
+   ProcedureReturn 0
+  EndIf
+ Wend
+ ProcedureReturn 1
+EndProcedure
+Procedure.i BtuBufferedTx(enable.i)
+ If btu_open=0 : ProcedureReturn 0 : EndIf
+ If BtuFlushPending()=0 : ProcedureReturn 0 : EndIf
+ btu_txBuffered=Bool(enable<>0)
+ ProcedureReturn 1
 EndProcedure
 
 Procedure BtuBarrier()
@@ -271,6 +328,7 @@ Procedure BtuReturnConsole()
 EndProcedure
 
 Procedure.i BtuOpen()
+  BtuQueueReset() : btu_txPeak=0 : btu_txTimeout=0
   btu_open = 0
   btu_why = 0
   ; THE SWAP. Read only - a refusal writes nothing.
@@ -312,15 +370,29 @@ EndProcedure
 
 Procedure BtuClose()
   If btu_open
+    BtuFlushPending()
     BtuWr(#BTU_CR, 0)
   EndIf
   btu_open = 0
+  BtuQueueReset()
   If btu_powerBefore = 0 : BtuPower(0) : EndIf
   BtuReturnConsole()
 EndProcedure
 
 Procedure.i BtuPut(b.i)
   Define n.i = 0
+  If btu_txBuffered
+    BtuDrainTx()
+    While BtuQueuePush(b)=0
+      BtuDrainTx() : n+1
+      If n>#BTU_TX_SPIN
+        btu_txTimeout+1
+        btu_why="Bluetooth software transmit queue remained full"
+        ProcedureReturn 0
+      EndIf
+    Wend
+    ProcedureReturn 1
+  EndIf
   While (BtuRd(#BTU_FR) & #BTU_FR_TXFF) <> 0
     n + 1
     If n > #BTU_TX_SPIN : ProcedureReturn 0 : EndIf
@@ -330,6 +402,7 @@ Procedure.i BtuPut(b.i)
 EndProcedure
 
 Procedure.i BtuGet()
+  If btu_txBuffered : BtuDrainTx() : EndIf
   If (BtuRd(#BTU_FR) & #BTU_FR_RXFE) <> 0 : ProcedureReturn -1 : EndIf
   ProcedureReturn BtuRd(#BTU_DR) & $FF
 EndProcedure
@@ -338,5 +411,6 @@ EndProcedure
 ; Complete first); drain what is in flight, then re-program.
 Procedure.i BtuSetBaud(baud.i)
   If BtuDiv64(baud) = 0 : ProcedureReturn 0 : EndIf
+  If BtuFlushPending()=0 : ProcedureReturn 0 : EndIf
   ProcedureReturn BtuProgram(baud)
 EndProcedure

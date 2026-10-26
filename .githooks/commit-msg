@@ -1,0 +1,15 @@
+#!/bin/sh
+# Ron, 2026-10-24: "neither codex or claude should be listed without permission". GitHub lists anyone named in a
+# Co-Authored-By line, and any <user>@users.noreply.github.com address, as a contributor. This refuses both.
+if grep -qiE '^[[:space:]]*co-authored-by:.*(claude|anthropic|codex|openai|chatgpt|copilot)' "$1"; then
+  echo "commit refused: a Co-Authored-By line credits an AI tool (Ron: none without his permission). Remove it." >&2
+  exit 1
+fi
+for who in "$(git var GIT_AUTHOR_IDENT)" "$(git var GIT_COMMITTER_IDENT)"; do
+  case "$who" in
+    *anthropic*|*openai*|*@users.noreply.github.com*)
+      echo "commit refused: author/committer '$who' is not Ron's address (it would credit someone else on GitHub)." >&2
+      exit 1;;
+  esac
+done
+exit 0

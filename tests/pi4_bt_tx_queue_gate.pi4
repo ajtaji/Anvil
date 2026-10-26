@@ -1,0 +1,38 @@
+; Physical Pi4 FIFO gate: full/empty, wrap, bursts; no UART open or audio.
+XIncludeFile "../RaspberryPi4/Lib/timer.pi4"
+XIncludeFile "../RaspberryPi4/Lib/mailbox.pi4"
+XIncludeFile "../RaspberryPi4/Lib/gpio.pi4"
+XIncludeFile "../RaspberryPi4/Lib/bt_uart.pi4"
+Procedure.i Main(services.i)
+ Protected pass.i,i.i,expected.i,count.i,rc.i,*pet
+ *pet=0
+ BtuQueueReset()
+ If BtuQueuePop()<>-1 Or BtuQueueUsed()<>0 Or BtuBufferedTx(1)<>0 : ProcedureReturn 91 : EndIf
+ For pass=0 To 31
+  For i=0 To 4094
+   If BtuQueuePush(i+pass)=0 : ProcedureReturn 92 : EndIf
+   count+1
+  Next
+  If BtuQueueUsed()<>4095 Or BtuQueuePush(123)<>0 : ProcedureReturn 93 : EndIf
+  For i=0 To 4094
+   If BtuQueuePop()<>((i+pass) & $FF) : ProcedureReturn 94 : EndIf
+   count+1
+  Next
+  If BtuQueueUsed()<>0 Or BtuQueuePop()<>-1 : ProcedureReturn 95 : EndIf
+  If *pet : pet() : EndIf
+ Next
+ For pass=0 To 1023
+  For i=0 To 16
+   If BtuQueuePush(i+pass)=0 : ProcedureReturn 96 : EndIf
+  Next
+  For i=0 To 16
+   If BtuQueuePop()<>((i+pass) & $FF) : ProcedureReturn 97 : EndIf
+  Next
+  count+34
+ Next
+ BtuDrainTx()
+ If BtuQueueUsed()<>0 Or btu_txPeak<>4095 Or btu_txTimeout<>0 : ProcedureReturn 98 : EndIf
+ PokeI($E1C00000,count) : PokeI($E1C00008,btu_txPeak)
+ PokeI($E1C00010,btu_open) : PokeI($E1C00018,btu_txTimeout)
+ ProcedureReturn 0
+EndProcedure

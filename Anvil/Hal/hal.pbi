@@ -1593,7 +1593,11 @@
 ;                 HwBtOpen()             pins, power, UART at 115200 with
 ;                                        RTS/CTS. 1, or 0 with HwBtWhy()
 ;                 HwBtClose()
-;                 HwBtPut(b)             1, or 0 if the byte never left
+;                 HwBtPut(b)             1 accepted, 0 transmit failure
+;                                        Pi4 defaults to a blocking FIFO
+;                                        write; explicit BtuBufferedTx(1)
+;                                        copies into a bounded software
+;                                        queue serviced by HwBtGet polls.
 ;                 HwBtGet()              a byte, or -1: never blocks
 ;                 HwBtSetBaud(baud)      the host side only; 1 or 0
 ;                 HwBtWhy()              ADDRESS of a sentence

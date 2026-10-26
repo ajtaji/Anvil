@@ -917,7 +917,9 @@ EndProcedure
 
 ; One ACL packet on the link: the first (or only) fragment of an L2CAP
 ; frame, n bytes at *data. 1, or 0 with hci_err (no credit, no link, too
-; big). The caller keeps the data until it is sent; nothing is queued.
+; big). No caller pointer is retained: all bytes are accepted by the UART
+; seam before return. An explicitly buffered Pi4 seam copies pending bytes
+; into its private FIFO; continue HCI polling to drain that FIFO.
 Procedure.i HciAclSend(*data, n.i)
   Define i.i
   hci_err = #HCI_OK

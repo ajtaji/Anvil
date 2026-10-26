@@ -564,3 +564,21 @@ Chapter 6 is that tool in full.
 7. Did you ask SvcMmuState() rather than assuming the cache state?
 8. Arm a deadman. Every time.
 @ENDFRAG
+
+
+@SECTION Optional Pi4 Bluetooth transmit buffering
+
+The PL011 Bluetooth byte pipe remains blocking by default. A Pi4 payload
+which owns its HCI stack can opt in with BtuBufferedTx(1) after opening the
+link. Each successful put has copied its byte into a bounded 4095-byte FIFO;
+it has not necessarily reached the controller yet. Continue HCI polling:
+BtuGet drains only currently free hardware FIFO slots before reading RX.
+Keep all queue accesses on the same primary core. No background worker,
+interrupt ownership change or retained caller pointer is introduced.
+
+BtuBufferedTx(0), baud changes and close flush pending software bytes with
+a 250 ms bound. Failure returns zero where a result is available, increments
+btu_txTimeout and records BtuWhy(). Close always restores the console and
+clears the queue even when draining fails. Startup/open resets the mode;
+other boards and existing clients retain their previous blocking behavior.
+Queue peak occupancy is available as btu_txPeak for bounded diagnostics.
