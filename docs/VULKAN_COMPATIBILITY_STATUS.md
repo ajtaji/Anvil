@@ -1342,3 +1342,16 @@ existing partial-upload pixel/transfer oracle remain exact. Historical line
 scenes 4/5 already differ from the old native corpus due to the 14 October line
 placement contract; that golden is preserved. Evidence and repeatable tools:
 `docs/evidence/neon-atlas-generation-pi4-20261025/README.md`.
+
+
+## Current line placement at four rotations - 25 October 2026
+
+The independent Pi 4 line proof matches all 131,072 logical BGRA bytes from
+eight frames: both immediate and bulk line paths at 0, 90, 180 and 270 degrees.
+Horizontal/vertical lines with reversed endpoints, a degenerate pixel, shallow
+and steep diagonals match a rational pixel-center oracle. The chosen inputs
+avoid rasterizer edge ties; arbitrary clipped lines and outline joins are
+outside this proof. Twenty corrupted reports/captures are rejected. The
+public builder emits the exact whole PMF used on hardware. Historical native
+line/outline scenes remain preserved, with their prior differences explicit.
+See `docs/evidence/neon-line-contract-pi4-20261025/README.md`.
