@@ -206,3 +206,23 @@ strict checker rejects 93 corrupt proofs. The full current 15-scene executable
 still matches its physical regression: 245,760 bytes and 124 widget checks.
 Build 336 compiles but is not installed. Evidence and exact scope:
 docs/evidence/neon-public-state-pi4-20261025/README.md.
+
+
+@SECTION Full native point input
+
+Fan and line staging now follow the native flat input limit of 262,144 points,
+replacing the adapter's separate 4,096-point cutoff. The coordinate arrays use
+an additional 3.9375 MiB, covered by the linked variable reservation.
+
+On Pi 4, all 262,144 fan vertices execute through the real fan pipeline. Only
+the final vertices form the checked rectangle, so the pixel oracle detects
+truncated addressing. All 16,384 GPU bytes match; extra-input refusal preserves
+data and guards, and teardown releases every allocation. The strict checker
+rejects 38 corrupted proofs. The full current 15 scenes still match 245,760
+bytes and pass 124 widget checks with the larger variable layout.
+
+Line staging accepts the same input boundary, but its quad expansion needs
+786,432 output vertices and still refuses before writing. Line/outline storage
+remains open. Build 337 compiles but is not installed. The current port target
+is Pi 4/Anvil, using desktop OpenGL behavior as its reference. Evidence:
+docs/evidence/neon-native-points-pi4-20261026/README.md.

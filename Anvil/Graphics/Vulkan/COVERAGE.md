@@ -445,3 +445,24 @@ bytes /124widget checks pass. Evidence:
 `docs/evidence/neon-public-state-pi4-20261025/README.md`. Hardware timing/address
 accessors, maximum point/storage work, dedicated external/grid quota cases,
 desktop integration and the broader completion goal remain outside this claim.
+
+
+## Full native point staging and fan input - 26 October 2026
+
+The staging boundary now follows the native262144 flat-input vertex limit.
+The real Pi4 fan pipeline emits all262144 points; only the final vertices
+form the checked rectangle, detecting high-index truncation. All16384 GPU
+bytes match the independent oracle; refusal guards and teardown pass, with
+38 corrupted proofs rejected. The full current15-scene corpus remains exact
+across245760 bytes and124widget checks under the larger variable layout.
+
+Line staging reaches the same boundary, but quad lowering still needs786432
+vertices and refuses atomically; line/outline output storage remains open.
+The extra staging arrays use3.9375MiB, covered by the linked monitor variable
+reservation. Build337 compiles, notinstalled. Evidence:
+`docs/evidence/neon-native-points-pi4-20261026/README.md`.
+
+The immediate engine port targets Vulkan on Pi4/Anvil, as the original plan
+records; desktop OpenGL is its behavior reference. A separate desktop Vulkan
+backend is not established by these proofs. Wider recovery and Vulkan work
+remain open; this is a point-boundary result, not full port completion.
