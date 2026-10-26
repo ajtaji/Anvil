@@ -40,10 +40,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_semaphore.pbi"
 #ANVIL_VK_MAX_CB_REFS = 2
 
 ; One shared pool holds every non-empty vkCmdDraw snapshot recorded by every
-; command buffer. 4096 is Neon's real per-frame draw ceiling; making this a
-; shared pool preserves that complete capacity without charging each of the 32
-; command buffers half a megabyte while it is idle.
-#ANVIL_VK_MAX_RECORDED_DRAWS = 4096
+; command buffer. Native Neon has 4096 flat plus 2048 textured draw records.
+; The pool must hold their combined 6144 records without reserving that many
+; snapshots separately for each of the 32 command buffers.
+#ANVIL_VK_MAX_RECORDED_DRAWS = 6144
 #ANVIL_VK_RECORDED_DRAW_BYTES = 240
 
 ; Exactly 240 bytes on the AArch64 ABI. Pipeline, descriptor and buffer values

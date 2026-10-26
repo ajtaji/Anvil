@@ -1355,3 +1355,17 @@ outside this proof. Twenty corrupted reports/captures are rejected. The
 public builder emits the exact whole PMF used on hardware. Historical native
 line/outline scenes remain preserved, with their prior differences explicit.
 See `docs/evidence/neon-line-contract-pi4-20261025/README.md`.
+
+
+## Combined draw-record capacity - 25 October 2026
+
+The shared command pool, private V3D slots and configurable Chrome ceiling
+now hold 6,144 records. A physical Pi 4 frame accepted 4,096 boxes plus 2,048
+text calls, refused the next call without cursor/guard changes, rendered exact
+pixels, and freed every row. Recreating with a two-draw limit preserved that
+limit and rendered a fresh exact frame. All 32,768 GPU bytes match; 31 checker
+mutations are rejected. The final unmodified-renderer payload used bounded
+watchdog progress checkpoints and returned in 21.5 seconds; the earlier
+15-second whole-payload attempt failed with a watchdog restart. Separate
+family vertex budgets and maximum vertex workloads remain open. Evidence:
+`docs/evidence/neon-combined-draws-pi4-20261025/README.md`.
