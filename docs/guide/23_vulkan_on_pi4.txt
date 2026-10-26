@@ -226,3 +226,24 @@ Line staging accepts the same input boundary, but its quad expansion needs
 remains open. Build 337 compiles but is not installed. The current port target
 is Pi 4/Anvil, using desktop OpenGL behavior as its reference. Evidence:
 docs/evidence/neon-native-points-pi4-20261026/README.md.
+
+
+@SECTION Shared vertex memory and bounded transforms
+
+Shared VPM segments now reserve enough rows for both vertex inputs and shader
+outputs. A twelve-input-row compact shader previously received only eight
+rows. The same code now renders correctly with the larger shared reservation;
+existing extra space for varyings is retained.
+
+The position planner accepts sixteen scalar multiply/add operations and
+reuses dead input-index registers for large layouts within the four-way
+register budget. Seventeen operations refuse before a pipeline is published.
+Physical checks cover 510 sizing cases, four rotations, 131,072 exact GPU
+bytes, zero live allocations and 41 rejected corrupt proofs. The complete
+15-scene regression retains 245,760 bytes and passes 124 widget checks.
+
+The isolated Vulkan proof stores lines in 32 bytes rather than the production
+144-byte representation. Production integration and full line/outline capacity
+remain open; this is not a throughput or completion claim. Build 338 compiles
+but is not installed. The broader high-register execution-mode issue remains
+open. See docs/evidence/vertex-shared-vpm-pi4-20261026/README.md.

@@ -1,8 +1,9 @@
 # Isolated typed-IR to V3D 4.2 lowering contract
 
-`vk_ir_v3d42.pi4` is a desk-proven downstream unit. It is not included by the
-SPIR-V parser, Vulkan pipeline, current shader emitter, or backend, and it adds
-no advertised shader support.
+`vk_ir_v3d42.pi4` is the typed downstream lowerer used by the Pi 4 Vulkan
+shader emitter. Its earlier isolated contract remains the basis for exact
+publication; public support is bounded by pipeline validation and physical
+evidence, not by this document alone.
 
 The lowerer consumes an `AvkIrModule` only after `AnvilVkIrVerify` succeeds.
 It supports the existing one-block binary32 operations: input or descriptor
@@ -56,3 +57,14 @@ V3D encodings and scheduling follow the locally pinned Mesa sources cited in
 `qpu_validate.c`, and `nir_to_vir.c`. The independent Python gate decodes every
 published 64-bit word with `tools/v3d42_qpu_decode.py`; it does not trust the
 emitter's own field packer.
+
+
+The paired coordinate/vertex path now admits at most sixteen scalar multiply
+or add nodes in a position graph. Large input layouts reuse dead input-index
+registers above all coordinate output indices. Scratch allocation respects the
+current four-way RF0..31 budget and still refuses insufficient register/code
+space before publication. The shared VPM record covers the larger of input
+and output row requirements. The physical sixteen-node compact proof, a
+seventeen-node public refusal, raw code/register checks and all four-rotation
+pixels are recorded in `docs/evidence/vertex-shared-vpm-pi4-20261026/README.md`.
+Fragment high-register execution modes are not covered by that proof.

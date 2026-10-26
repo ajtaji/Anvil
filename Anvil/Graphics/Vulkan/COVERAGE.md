@@ -466,3 +466,23 @@ The immediate engine port targets Vulkan on Pi4/Anvil, as the original plan
 records; desktop OpenGL is its behavior reference. A separate desktop Vulkan
 backend is not established by these proofs. Wider recovery and Vulkan work
 remain open; this is a point-boundary result, not full port completion.
+
+
+## Shared vertex-memory inputs and sixteen-node transforms - 26 October 2026
+
+The Pi4 shared VPM reservation now covers both input and output row counts,
+retaining existing varying padding. A twelve-input/six-output compact shader
+previously drew blank frames. With unchanged QPU code, larger shared segments
+now match all131072 GPU bytes over four rotations. The bounded position planner
+accepts sixteen scalar operations, reuses dead index registers for large input
+layouts and refuses seventeen operations before publishing a pipeline.
+
+The compiled510-case sizing table, independent instruction/register decoder,
+41 damaged-proof refusals and zero-allocation teardown pass. The full current
+15 scenes retain245760 bytes and124widget checks. Build338 compiles, notinstalled.
+Evidence: `docs/evidence/vertex-shared-vpm-pi4-20261026/README.md`.
+
+Compact32-byte line records work in the isolated public Vulkan proof; production
+Neon still uses its prior144-byte lowering. Full native line/outline capacity
+and integration remain open, as does the wider high-register stage/mode issue.
+No throughput or full engine/Vulkan completion claim follows from this proof.

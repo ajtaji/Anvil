@@ -366,6 +366,14 @@ Procedure.i avkqOutSeg(slots.i, varyComps.i)
   ProcedureReturn n
 EndProcedure
 
+; Inputs and outputs share a VPM segment on this backend. Its output-size
+; field therefore reserves space for whichever side has more rows. Retain
+; the existing extra varying sector until its separate contract is measured.
+Procedure.i avkqSharedOutSeg(inputSlots.i, outputSlots.i, varyComps.i)
+  If inputSlots > outputSlots : outputSlots = inputSlots : EndIf
+  ProcedureReturn avkqOutSeg(outputSlots, varyComps)
+EndProcedure
+
 ; ======================================================================
 ;  THE COORDINATE SHADER
 ; ======================================================================
@@ -1681,7 +1689,7 @@ Procedure.i avkqBuildRecordAt(pipe.i, pipelineBase.i, recordBase.i, coordinateUn
   ; line varyings, and the number of varying COMPONENTS the fragment
   ; shader reads.
   V3dShaderRecordFlags(1, 0, 0, 0, 1, varyComps)
-  V3dShaderRecordVpm(avkqOutSeg(6 + varyComps, varyComps), 0, 1, 1, avkqOutSeg(4 + varyComps, varyComps), 0, 1, 1)
+  V3dShaderRecordVpm(avkqSharedOutSeg(avkqInSlots[pipe], 6 + varyComps, varyComps), 0, 1, 1, avkqSharedOutSeg(avkqInSlots[pipe], 4 + varyComps, varyComps), 0, 1, 1)
   V3dShaderRecordDefaults(pipelineBase + #AVKQ_OFF_DEFAULTS)
   ; The fragment program switches threads before its tile-buffer writes,
   ; so it is NOT single segment; the other two are. The record's bit and

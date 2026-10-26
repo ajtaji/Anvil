@@ -28,6 +28,9 @@ XIncludeFile "../../../RaspberryPi4/Lib/v3dqpu.pi4"
 #ANVIL_IR_V3D42_MAX_REG      = 63
 #ANVIL_IR_V3D42_CODE_BYTES   = 1024
 #ANVIL_IR_V3D42_UNIFORM_WORDS = 64
+; Position expression size is independent of live register pressure. The
+; emitter still checks register lifetimes and bounded code storage separately.
+#ANVIL_IR_V3D42_MAX_POSITION_ARITHMETIC = 16
 #ANVIL_IR_V3D42_TMU_VEC4     = $FFFFFF7C
 
 Structure AvkIrV3d42Io Align #PB_Structure_AlignC
@@ -1146,7 +1149,7 @@ Procedure.i avk42VertexPositionGraph(*m.AvkIrModule, xId.i, yId.i, *variableOut)
       avk42VertexGraphUsed[*load\sourceId] = 1
     ElseIf *n\kind = #ANVIL_IR_OP_FADD Or *n\kind = #ANVIL_IR_OP_FMUL
       arithmeticCount = arithmeticCount + 1
-      If arithmeticCount > 12 : ProcedureReturn 0 : EndIf
+      If arithmeticCount > #ANVIL_IR_V3D42_MAX_POSITION_ARITHMETIC : ProcedureReturn 0 : EndIf
       If *n\operandCount <> 2 Or sp > 509 : ProcedureReturn 0 : EndIf
       pending[sp] = *n\operand0 : sp = sp + 1
       pending[sp] = *n\operand1 : sp = sp + 1
@@ -1383,7 +1386,9 @@ Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, 
   Protected i.i
   Protected id.i
   Protected scratchBase.i = temp + 2
-  Protected scratchLimit.i = #ANVIL_IR_V3D42_MAX_REG + 1
+  ; The current shader records schedule four-way programs, whose register
+  ; budget is RF0..31. Never emit an apparently successful larger graph.
+  Protected scratchLimit.i = 32
   Protected nextReg.i
   Protected left.i
   Protected right.i
@@ -1396,10 +1401,12 @@ Procedure.i avk42VertexEmitGraph(*m.AvkIrModule, *t.AvkIrV3d42VertexPairTarget, 
   Protected *c.AvkIrConstant
   Protected *io.AvkIrV3d42Io
   Dim freeReg.i[64]
-  ; With 14 input words, RF10..13 are input VPM indices that have already
-  ; been consumed. Coordinate output writes only slots 0..9, so these four
-  ; registers can hold the graph while RF0..9 retain their slot indices.
-  If inputSlots = 14 : scratchBase = 10 : scratchLimit = 14 : EndIf
+  ; All inputs are loaded before this graph. Index registers above the last
+  ; coordinate output slot are now dead, while input values remain live in
+  ; their separate register bank. Reclaim them for the large input layouts.
+  If inputSlots >= 12
+    scratchBase = 6 + *p\varyingComponents : scratchLimit = inputSlots
+  EndIf
   nextReg = scratchBase
   i = 0 : While i < 193 : avk42VertexGraphReg[i] = -1 : i = i + 1 : Wend
   i = 0 : While i < 193 : avk42VertexGraphUses[i] = 0 : i = i + 1 : Wend
