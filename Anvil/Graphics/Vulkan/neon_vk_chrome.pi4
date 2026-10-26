@@ -129,6 +129,11 @@ Global nvcMaxVertexQuads.i
 Global nvcVertices.i
 Global nvcExternalVertices.i
 Global nvcDrawCount.i
+; Logical family units are independent of the shared physical vertex cursor.
+; Path points are charged once; repeated outline/fill draws reuse those units.
+Global nvcFlatDraws.i, nvcFlatVertices.i, nvcTexDraws.i, nvcTexVertices.i
+Global Dim nvcBitmapPlan.NeonAtlasGlyphUV[4096]
+Global Dim nvcBitmapPlanLive.i[4096]
 ; Set only while a frame command buffer can be discarded without a submit.
 Global nvcFrameAbortable.i
 ; An optional producer owns device-tied resources outside Chrome. Its CSD
@@ -370,6 +375,80 @@ Declare.i NeonVkChromeLinesEnd(colour.i)
 Procedure.i nvcFail(code.i)
   nvcError = code
   ProcedureReturn code
+EndProcedure
+
+; Capacity checks never mutate a family. Physical storage and total command
+; limits remain separate and may be smaller when explicitly configured.
+Procedure.i nvcBudgetCan(textured.i, draws.i, vertices.i)
+  If draws < 0 Or vertices < 0 : ProcedureReturn 0 : EndIf
+  If textured = 0
+    If draws > #NEON_MAX_DRAWS - nvcFlatDraws Or vertices > #NEON_MAX_VERTS - nvcFlatVertices : ProcedureReturn 0 : EndIf
+  Else
+    If draws > #NEON_MAX_TDRAWS - nvcTexDraws Or vertices > #NEON_MAX_TVERTS - nvcTexVertices : ProcedureReturn 0 : EndIf
+  EndIf
+  ProcedureReturn 1
+EndProcedure
+
+Procedure nvcBudgetVertices(textured.i, vertices.i)
+  If textured = 0 : nvcFlatVertices = nvcFlatVertices + vertices
+  Else : nvcTexVertices = nvcTexVertices + vertices : EndIf
+EndProcedure
+
+Procedure nvcBudgetReset()
+  nvcFlatDraws = 0 : nvcFlatVertices = 0 : nvcTexDraws = 0 : nvcTexVertices = 0
+EndProcedure
+
+; Invert the physical scissor into logical coordinates once. All arithmetic
+; here is bounded by the validated target extent, independent of caller x+w.
+Procedure nvcLogicalClip(*rect.VkRect2D)
+  If nvcRotation = 90
+    *rect\offset\x = nvcClipY : *rect\offset\y = nvcLogicalH - nvcClipX - nvcClipW
+    *rect\extent\width = nvcClipH : *rect\extent\height = nvcClipW
+  ElseIf nvcRotation = 180
+    *rect\offset\x = nvcLogicalW - nvcClipX - nvcClipW : *rect\offset\y = nvcLogicalH - nvcClipY - nvcClipH
+    *rect\extent\width = nvcClipW : *rect\extent\height = nvcClipH
+  ElseIf nvcRotation = 270
+    *rect\offset\x = nvcLogicalW - nvcClipY - nvcClipH : *rect\offset\y = nvcClipX
+    *rect\extent\width = nvcClipH : *rect\extent\height = nvcClipW
+  Else
+    *rect\offset\x = nvcClipX : *rect\offset\y = nvcClipY
+    *rect\extent\width = nvcClipW : *rect\extent\height = nvcClipH
+  EndIf
+EndProcedure
+
+Procedure.i nvcLogicalVisible(x.i, y.i, w.i, h.i)
+  Define clip.VkRect2D
+  If w <= 0 Or h <= 0 : ProcedureReturn 0 : EndIf
+  nvcLogicalClip(@clip)
+  If clip\extent\width = 0 Or clip\extent\height = 0 : ProcedureReturn 0 : EndIf
+  If x >= clip\offset\x + clip\extent\width Or y >= clip\offset\y + clip\extent\height : ProcedureReturn 0 : EndIf
+  ; clip offsets are nonnegative, so offset-positiveSize cannot underflow.
+  If x <= clip\offset\x - w Or y <= clip\offset\y - h : ProcedureReturn 0 : EndIf
+  ProcedureReturn 1
+EndProcedure
+
+; Native flat bitmap text stores six vertices per vertically merged bit run,
+; rather than six per atlas cell. Count the font's authoritative row bits
+; without emitting native geometry or changing its counters.
+Procedure.i nvcBitmapGlyphCost(ch.i, font.i)
+  Define row.i, bits.i, span.i, col.i, inRun.i, rectangles.i
+  If ch < neon_ffirst Or ch > neon_flast : ProcedureReturn 0 : EndIf
+  While row < neon_fh
+    bits = neon_GlyphRow(ch, row, NeonBitmapFontBold(font))
+    span = 1
+    While row + span < neon_fh
+      If neon_GlyphRow(ch, row + span, NeonBitmapFontBold(font)) <> bits : Break : EndIf
+      span = span + 1
+    Wend
+    inRun = 0
+    For col = 0 To neon_fw - 1
+      If (bits & (128 >> col)) <> 0
+        If inRun = 0 : rectangles = rectangles + 1 : inRun = 1 : EndIf
+      Else : inRun = 0 : EndIf
+    Next
+    row = row + span
+  Wend
+  ProcedureReturn rectangles * 6
 EndProcedure
 
 Procedure.i NeonVkChromeError()
@@ -1716,6 +1795,7 @@ Procedure.i NeonVkChromeCreateWithCapacities(physicalDevice.i, device.i, queue.i
   nvcPhysicalW = width : nvcPhysicalH = height : nvcPitch = width * 4 : nvcRotation = 0
   nvcWidth = width : nvcHeight = height
   nvcMaxQuads = maxDraws : nvcMaxVertexQuads = maxVertexQuads
+  nvcBudgetReset()
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcBoxBatchActive = 0 : nvcBoxBatchCount = 0
   nvcRetainedBatchActive = 0 : nvcRetainedBatchCount = 0
@@ -1844,6 +1924,7 @@ Procedure.i NeonVkChromeBegin(*clearValue)
   setHandle = nvcDescriptorSet
   vkCmdBindDescriptorSets(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipelineLayout, 0, 1, @setHandle, 0, 0)
   nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
+  nvcBudgetReset()
   nvcInFrame = 1 : nvcFrameAbortable = 1 : nvcError = 0
   nvcSubmitStage = 0 : nvcSubmitRc = #VK_SUCCESS
   nvcAtlasRasterCountAtFrame = AnvilTrueTypeRasterCount()
@@ -2265,6 +2346,8 @@ Procedure.i NeonVkChromeLinesReserve(quads.i)
   If ((nvcMapped + nvcVertices * #NEON_VK_CHROME_VERTEX_BYTES) & 7) <> 0
     ProcedureReturn -1                              ; the 8-byte stores need an aligned start
   EndIf
+  If nvcBudgetCan(0, 1, quads * 6) = 0 : ProcedureReturn -1 : EndIf
+  nvcBudgetVertices(0, quads * 6)
   nvcClipXBits2(nvcPhysicalW) : nvcClipYBits2(nvcPhysicalH)      ; the tables, built here and not by a worker
   first = nvcVertices
   nvcVertices = nvcVertices + quads * 6
@@ -2284,7 +2367,7 @@ Procedure nvcTint(colour.i, *push)
   PokeL(*push + 12, neon_F32Byte((colour >> 24) & $FF))
 EndProcedure
 
-Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
+Procedure.i nvcDrawSetRaw(first.i, count.i, colour.i, setHandle.i)
   Define sc.VkRect2D
   Define Dim push.l[4]
   If nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
@@ -2311,8 +2394,20 @@ Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
+Procedure.i nvcDrawSet(first.i, count.i, colour.i, setHandle.i)
+  Define rc.i
+  If nvcBudgetCan(1, 1, 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  rc = nvcDrawSetRaw(first, count, colour, setHandle)
+  If rc = 0 : nvcTexDraws = nvcTexDraws + 1 : EndIf
+  ProcedureReturn rc
+EndProcedure
+
 Procedure.i nvcDraw(first.i, count.i, colour.i)
-  ProcedureReturn nvcDrawSet(first, count, colour, nvcDescriptorSet)
+  Define rc.i
+  If nvcBudgetCan(0, 1, 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  rc = nvcDrawSetRaw(first, count, colour, nvcDescriptorSet)
+  If rc = 0 : nvcFlatDraws = nvcFlatDraws + 1 : EndIf
+  ProcedureReturn rc
 EndProcedure
 
 ; FILLED TRIANGLES IN BULK (2026-10-14, for map areas: water, land, parks). A reserved quad is six
@@ -2367,10 +2462,12 @@ Procedure.i nvcSpriteRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i
   EndIf
   u0 = neon_F32Ratio(atlasX + sourceX, nvcAtlasW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, nvcAtlasW)
   v0 = neon_F32Ratio(atlasY + sourceY, nvcAtlasH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, nvcAtlasH)
+  If nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, 6)
   first = nvcVertices
   nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
-  ProcedureReturn nvcDraw(first, 6, colour)
+  ProcedureReturn nvcDrawSet(first, 6, colour, nvcDescriptorSet)
 EndProcedure
 
 Procedure.i NeonVkChromeSprite(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, sourceH.i, drawW.i, drawH.i, colour.i)
@@ -2406,6 +2503,8 @@ Procedure.i NeonVkChromeImageSpriteDrawId(id.i, x.i, y.i, sourceX.i, sourceY.i, 
   EndIf
   u0 = neon_F32Ratio(sourceX, imageW) : u1 = neon_F32Ratio(sourceX + sourceW, imageW)
   v0 = neon_F32Ratio(sourceY, imageH) : v1 = neon_F32Ratio(sourceY + sourceH, imageH)
+  If nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, 6)
   first = nvcVertices
   nvcQuad(first, x, y, x + drawW, y + drawH, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
@@ -2478,9 +2577,12 @@ Procedure.i nvcSpriteTransformRegion(x.i, y.i, sourceX.i, sourceY.i, sourceW.i, 
   If blX < -#NVC_SPRITE_Q8_LIMIT Or blX > #NVC_SPRITE_Q8_LIMIT Or blY < -#NVC_SPRITE_Q8_LIMIT Or blY > #NVC_SPRITE_Q8_LIMIT Or brX < -#NVC_SPRITE_Q8_LIMIT Or brX > #NVC_SPRITE_Q8_LIMIT Or brY < -#NVC_SPRITE_Q8_LIMIT Or brY > #NVC_SPRITE_Q8_LIMIT
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
   EndIf
+  If nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   If dryRun <> 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   u0 = neon_F32Ratio(atlasX + sourceX, textureW) : u1 = neon_F32Ratio(atlasX + sourceX + sourceW, textureW)
   v0 = neon_F32Ratio(atlasY + sourceY, textureH) : v1 = neon_F32Ratio(atlasY + sourceY + sourceH, textureH)
+  If nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, 6)
   first = nvcVertices
   nvcSpriteVertexQ8(first + 0, tlX, tlY, u0, v0)
   nvcSpriteVertexQ8(first + 1, blX, blY, u0, v1)
@@ -2584,6 +2686,7 @@ Procedure.i NeonVkChromeSpriteBatchEnd()
   If nvcRetainedBatchCount > nvcMaxQuads - nvcDrawCount Or nvcRetainedBatchCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  If nvcBudgetCan(1, nvcRetainedBatchCount, nvcRetainedBatchCount * 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   If nvcRetainedBatchCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   ; The first pass is read-only: a bad later item cannot append an earlier one.
   For i = 0 To nvcRetainedBatchCount - 1
@@ -2620,9 +2723,22 @@ Procedure.i NeonVkChromeLogo(x.i, y.i)
 EndProcedure
 
 Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
-  Define first.i
+  Define first.i, right.i, bottom.i
+  Define clip.VkRect2D
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  If w <= 0 Or h <= 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If Neon_A(colour) = 0 Or nvcLogicalVisible(x, y, w, h) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  nvcLogicalClip(@clip)
+  right = clip\offset\x + clip\extent\width : bottom = clip\offset\y + clip\extent\height
+  If x <= 0 Or w <= $7FFFFFFFFFFFFFFF - x
+    If x + w < right : right = x + w : EndIf
+  EndIf
+  If y <= 0 Or h <= $7FFFFFFFFFFFFFFF - y
+    If y + h < bottom : bottom = y + h : EndIf
+  EndIf
+  If x < clip\offset\x : x = clip\offset\x : EndIf
+  If y < clip\offset\y : y = clip\offset\y : EndIf
+  w = right - x : h = bottom - y
+  If nvcBudgetCan(0, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   ; Reserve one draw for either this box or the complete active box span.
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices + 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
@@ -2635,10 +2751,12 @@ Procedure.i NeonVkChromeBox(x.i, y.i, w.i, h.i, colour.i)
     ElseIf colour <> nvcBoxBatchColour Or nvcClipX <> nvcBoxBatchClipX Or nvcClipY <> nvcBoxBatchClipY Or nvcClipW <> nvcBoxBatchClipW Or nvcClipH <> nvcBoxBatchClipH
       ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
     EndIf
+    nvcBudgetVertices(0, 6)
     nvcQuad(nvcVertices, x, y, x + w, y + h, nvcWhiteU0, nvcWhiteV0, nvcWhiteU1, nvcWhiteV1)
     nvcVertices = nvcVertices + 6 : nvcBoxBatchCount = nvcBoxBatchCount + 6
     ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
+  nvcBudgetVertices(0, 6)
   first = nvcVertices
   ; Boxes sample only Neon's dedicated opaque-white atlas texel.
   nvcQuad(first, x, y, x + w, y + h, nvcWhiteU0, nvcWhiteV0, nvcWhiteU1, nvcWhiteV1)
@@ -2926,6 +3044,7 @@ Procedure.i NeonVkChromeGridBatchReserve(neededQuads.i, drawSegments.i)
   If nvcVertices > (nvcMaxVertexQuads - neededQuads) * 6 Or nvcDrawCount > nvcMaxQuads - drawSegments
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  If nvcBudgetCan(1, drawSegments, neededQuads * 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
 
@@ -3010,6 +3129,8 @@ Procedure.i nvcGridGlyphAppend(glyph.i, pixelHeight.i, cellX.i, cellY.i, cellW.i
   v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
   u1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
   v1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
+  If nvcDrawCount >= nvcMaxQuads Or nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, 6)
   nvcQuad(nvcVertices, glyphLeft, glyphTop, glyphRight, glyphBottom, u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
   ProcedureReturn #NEON_VK_CHROME_OK
@@ -3050,6 +3171,8 @@ Procedure.i NeonVkChromeGridGlyphAppendPositioned(glyph.i, pixelHeight.i, penXFi
   v0 = neon_F32Ratio(nvcTTY[entry], nvcAtlasH)
   u1 = neon_F32Ratio(nvcTTX[entry] + nvcTTW[entry], nvcAtlasW)
   v1 = neon_F32Ratio(nvcTTY[entry] + nvcTTH[entry], nvcAtlasH)
+  If nvcDrawCount >= nvcMaxQuads Or nvcBudgetCan(1, 1, 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, 6)
   nvcQuad(nvcVertices, left, top, left + nvcTTW[entry], top + nvcTTH[entry], u0, v0, u1, v1)
   nvcVertices = nvcVertices + 6
   ProcedureReturn #NEON_VK_CHROME_OK
@@ -3070,7 +3193,7 @@ Procedure.i NeonVkChromeGridBatchFlush(colour.i)
   count = nvcVertices - nvcGridBatchFirst
   If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If (count % 6) <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  rc = nvcDraw(nvcGridBatchFirst, count, colour)
+  rc = nvcDrawSet(nvcGridBatchFirst, count, colour, nvcDescriptorSet)
   If rc = #NEON_VK_CHROME_OK : nvcGridBatchFirst = nvcVertices : EndIf
   ProcedureReturn rc
 EndProcedure
@@ -3365,6 +3488,8 @@ Procedure.i nvcTTTextMapped(xQ16.i, yQ16.i, *s, colour.i, mapped.i, spaceW.i, sp
   If nvcDrawCount >= nvcMaxQuads Or nvcVertices + visible * 6 > nvcMaxVertexQuads * 6
     nvcTTErrorStage = 6 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  If nvcBudgetCan(0, 1, visible * 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(0, visible * 6)
   first = nvcVertices
   For i = 0 To count - 1
     entry = nvcTTCacheFind(slot, generation, nvcTTFontPixels, nvcTTLayoutGlyph[i])
@@ -3417,23 +3542,13 @@ Procedure.i NeonVkChromeTrueTypeText(pixelHeight.i, x.i, y.i, *s, colour.i)
   ProcedureReturn nvcTTText(x, y, *s, colour)
 EndProcedure
 
-; One NUL-terminated Neon text call becomes one ordered Vulkan draw containing
-; every supported glyph quad, including the transparent atlas cell for space.
+; One native-visible bitmap text run becomes one ordered Vulkan draw. Blank
+; glyphs advance without geometry; logical cost counts native bit rectangles.
 Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
-  Define uv.NeonAtlasGlyphUV
-  Define i.i
-  Define ch.i
-  Define cx.i
-  Define first.i
-  Define count.i
-  Define glyphCount.i
-  Define adv.i
-  Define cellH.i
+  Define i.i, ch.i, cx.i, first.i, glyphCount.i, adv.i, cellH.i, cost.i, logicalVertices.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If AnvilTrueTypeSlotSelected() < 0 And Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
-    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
-  EndIf
+  If *s = 0 Or Neon_A(colour) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If AnvilTrueTypeSlotSelected() < 0 And Neon_AtlasRasterGeneration() <> nvcAtlasGeneration : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
   If AnvilTrueTypeSlotSelected() >= 0
     If font < 0 Or font > 3 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
     nvcTTFontPixels = nvcTTFontHeightFor(font)
@@ -3442,39 +3557,47 @@ Procedure.i NeonVkChromeText(font.i, x.i, y.i, *s, colour.i)
   EndIf
   adv = Neon_CharWidth(font) : cellH = Neon_LineHeight(font)
   If adv < 1 Or cellH < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
-  ; Count the complete immutable run first. A capacity refusal must not leave
-  ; half a string in reusable storage or advance either ordered cursor.
-  i = 0
+  ; Plan all native-visible ink and atlas coordinates before any charge/write.
+  cx = x : i = 0
   While i < 4096
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
+    nvcBitmapPlanLive[i] = 0
     If ch >= 32 And ch <> 127
-      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
-        glyphCount = glyphCount + 1
+      If nvcLogicalVisible(cx, y, adv, cellH) <> 0
+        cost = nvcBitmapGlyphCost(ch, font)
+        If cost > 0 And Neon_AtlasRasterGlyphUV(ch, @nvcBitmapPlan[i]) <> 0
+          If nvcAtlasMapBitmapUV(@nvcBitmapPlan[i], NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+          logicalVertices = logicalVertices + cost : glyphCount = glyphCount + 1 : nvcBitmapPlanLive[i] = 1
+        EndIf
       EndIf
+      ; Eligible characters advance even when rejected or blank. Stop once
+      ; the remaining monotonically advancing run cannot meet the target.
+      If cx >= nvcLogicalW : Break : EndIf
+      cx = cx + adv
     EndIf
     i = i + 1
   Wend
   If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+  If nvcBudgetCan(0, 1, logicalVertices) = 0 Or nvcDrawCount >= nvcMaxQuads Or glyphCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  nvcBudgetVertices(0, logicalVertices)
   first = nvcVertices : cx = x : i = 0
   While i < 4096
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
-      If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv, NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
-        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
-        nvcVertices = nvcVertices + 6 : count = count + 6
+      If nvcBitmapPlanLive[i] <> 0
+        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, nvcBitmapPlan[i]\left, nvcBitmapPlan[i]\top, nvcBitmapPlan[i]\right, nvcBitmapPlan[i]\bottom)
+        nvcVertices = nvcVertices + 6
       EndIf
+      If cx >= nvcLogicalW : Break : EndIf
       cx = cx + adv
     EndIf
     i = i + 1
   Wend
-  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  ProcedureReturn nvcDraw(first, count, colour)
+  ProcedureReturn nvcDraw(first, glyphCount * 6, colour)
 EndProcedure
 
 ; Text along a direction: the bitmap font's glyphs laid out on a baseline through (cx, cy), the middle of
@@ -3485,11 +3608,11 @@ EndProcedure
 ; something else, and the caller can fall back to upright text.
 Procedure.i NeonVkChromeTextAngled(font.i, cx.i, cy.i, *s, colour.i, cosQ16.i, sinQ16.i)
   Define uv.NeonAtlasGlyphUV
-  Define i.i, ch.i, adv.i, cellH.i, glyphCount.i, advances.i, first.i, count.i
+  Define i.i, ch.i, adv.i, cellH.i, glyphCount.i, advances.i, first.i, count.i, cost.i, logicalVertices.i
   Define cxQ8.i, cyQ8.i, halfWQ8.i, halfHQ8.i, lxQ8.i, advQ8.i
   Define tlX.i, tlY.i, trX.i, trY.i, blX.i, blY.i, brX.i, brY.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
-  If *s = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
+  If *s = 0 Or Neon_A(colour) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   If AnvilTrueTypeSlotSelected() >= 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If Neon_AtlasRasterGeneration() <> nvcAtlasGeneration : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
   If cx < -16384 Or cx > 16384 Or cy < -16384 Or cy > 16384 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS) : EndIf
@@ -3501,18 +3624,22 @@ Procedure.i NeonVkChromeTextAngled(font.i, cx.i, cy.i, *s, colour.i, cosQ16.i, s
   While i < 4096
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
+    nvcBitmapPlanLive[i] = 0
     If ch >= 32 And ch <> 127
       advances = advances + 1
-      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
-        glyphCount = glyphCount + 1
+      cost = nvcBitmapGlyphCost(ch, font)
+      If cost > 0 And Neon_AtlasRasterGlyphUV(ch, @nvcBitmapPlan[i]) <> 0
+        If nvcAtlasMapBitmapUV(@nvcBitmapPlan[i], NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        logicalVertices = logicalVertices + cost : glyphCount = glyphCount + 1 : nvcBitmapPlanLive[i] = 1
       EndIf
     EndIf
     i = i + 1
   Wend
   If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+  If nvcBudgetCan(0, 1, logicalVertices) = 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  nvcBudgetVertices(0, logicalVertices)
   cxQ8 = cx * 256 : cyQ8 = cy * 256
   advQ8 = adv * 256
   halfWQ8 = (advances * advQ8) / 2 : halfHQ8 = (cellH * 256) / 2
@@ -3521,8 +3648,9 @@ Procedure.i NeonVkChromeTextAngled(font.i, cx.i, cy.i, *s, colour.i, cosQ16.i, s
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
-      If Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv, NeonBitmapFontBold(font)) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+      If nvcBitmapPlanLive[i] <> 0
+        uv\left = nvcBitmapPlan[i]\left : uv\top = nvcBitmapPlan[i]\top
+        uv\right = nvcBitmapPlan[i]\right : uv\bottom = nvcBitmapPlan[i]\bottom
         nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8, 0 - halfHQ8, cosQ16, sinQ16, @tlX, @tlY)
         nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8 + advQ8, 0 - halfHQ8, cosQ16, sinQ16, @trX, @trY)
         nvcSpriteCornerQ8(cxQ8, cyQ8, lxQ8, halfHQ8, cosQ16, sinQ16, @blX, @blY)
@@ -3550,6 +3678,7 @@ Procedure.i NeonVkChromeBoxBatchBegin()
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
   EndIf
   If nvcDrawCount >= nvcMaxQuads : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  If nvcBudgetCan(0, 1, 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   nvcBoxBatchActive = 1 : nvcBoxBatchFirst = nvcVertices : nvcBoxBatchCount = 0
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure
@@ -3566,64 +3695,47 @@ EndProcedure
 ; The public textured-text primitive has native bitmap metrics and rejection
 ; rules. Preflight the visible run before touching the ordered vertex cursor.
 Procedure.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
-  Define uv.NeonAtlasGlyphUV
-  Define i.i, ch.i, cx.i, adv.i, cellH.i
-  Define glyphCount.i, first.i, count.i, visible.i
+  Define i.i, ch.i, cx.i, adv.i, cellH.i, glyphCount.i, first.i
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE) : EndIf
   If *s = 0 Or Neon_A(colour) = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If Neon_AtlasRasterReady() = 0 Or Neon_AtlasRasterGeneration() <> nvcAtlasGeneration
-    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS)
-  EndIf
+  If Neon_AtlasRasterReady() = 0 Or Neon_AtlasRasterGeneration() <> nvcAtlasGeneration : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
   adv = Neon_CharWidth(font) : cellH = Neon_LineHeight(font)
   If adv < 1 Or cellH < 1 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
-  If (y + cellH) <= 0 Or y >= nvcHeight : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If neon_clipOn <> 0
-    If (y + cellH) <= neon_clipY Or y >= (neon_clipY + neon_clipH) : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  EndIf
   cx = x : i = 0
   While i < 4096
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
+    nvcBitmapPlanLive[i] = 0
     If ch >= 32 And ch <> 127
-      If ch >= Neon_AtlasRasterFirstGlyph() And ch <= Neon_AtlasRasterLastGlyph()
-        visible = 0
-        If (cx + adv) > 0 And cx < nvcWidth
-          If neon_clipOn = 0 : visible = 1
-          ElseIf (cx + adv) > neon_clipX And cx < (neon_clipX + neon_clipW) : visible = 1
-          EndIf
-        EndIf
-        If visible <> 0 : glyphCount = glyphCount + 1 : EndIf
+      If nvcLogicalVisible(cx, y, adv, cellH) <> 0 And Neon_AtlasRasterGlyphUV(ch, @nvcBitmapPlan[i]) <> 0
+        If nvcAtlasMapBitmapUV(@nvcBitmapPlan[i], 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
+        glyphCount = glyphCount + 1 : nvcBitmapPlanLive[i] = 1
       EndIf
+      If cx >= nvcLogicalW : Break : EndIf
       cx = cx + adv
     EndIf
     i = i + 1
   Wend
   If glyphCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + glyphCount * 6 > nvcMaxVertexQuads * 6
+  If nvcBudgetCan(1, 1, glyphCount * 6) = 0 Or nvcDrawCount >= nvcMaxQuads Or glyphCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  nvcBudgetVertices(1, glyphCount * 6)
   first = nvcVertices : cx = x : i = 0
   While i < 4096
     ch = PeekA(*s + i)
     If ch = 0 : Break : EndIf
     If ch >= 32 And ch <> 127
-      visible = 0
-      If (cx + adv) > 0 And cx < nvcWidth
-        If neon_clipOn = 0 : visible = 1
-        ElseIf (cx + adv) > neon_clipX And cx < (neon_clipX + neon_clipW) : visible = 1
-        EndIf
+      If nvcBitmapPlanLive[i] <> 0
+        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, nvcBitmapPlan[i]\left, nvcBitmapPlan[i]\top, nvcBitmapPlan[i]\right, nvcBitmapPlan[i]\bottom)
+        nvcVertices = nvcVertices + 6
       EndIf
-      If visible <> 0 And Neon_AtlasRasterGlyphUV(ch, @uv) <> 0
-        If nvcAtlasMapBitmapUV(@uv, 0) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ATLAS) : EndIf
-        nvcQuad(nvcVertices, cx, y, cx + adv, y + cellH, uv\left, uv\top, uv\right, uv\bottom)
-        nvcVertices = nvcVertices + 6 : count = count + 6
-      EndIf
+      If cx >= nvcLogicalW : Break : EndIf
       cx = cx + adv
     EndIf
     i = i + 1
   Wend
-  If count = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
-  ProcedureReturn nvcDraw(first, count, colour)
+  ProcedureReturn nvcDrawSet(first, glyphCount * 6, colour, nvcDescriptorSet)
 EndProcedure
 
 ; Fan and line builders retain only bounded logical points. End preflights
@@ -3650,6 +3762,10 @@ Procedure NeonVkChromeFanPoint(x.i, y.i)
     nvcFail(nvcPathError)
     ProcedureReturn
   EndIf
+  If nvcBudgetCan(0, 0, 1) = 0
+    nvcPathError = #NEON_VK_CHROME_ERR_CAPACITY : nvcFail(nvcPathError) : ProcedureReturn
+  EndIf
+  nvcBudgetVertices(0, 1)
   nvcPathX[nvcPathCount] = x : nvcPathY[nvcPathCount] = y
   nvcPathCount = nvcPathCount + 1
 EndProcedure
@@ -3663,7 +3779,7 @@ Procedure.i NeonVkChromeFanOutline(colour.i)
   If nvcPathError <> 0 : ProcedureReturn nvcPathError : EndIf
   If nvcPathCount < 2 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
   needed = nvcPathCount * 6
-  If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+  If nvcBudgetCan(0, 1, 0) = 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
   first = nvcVertices : i = 0
@@ -3688,7 +3804,7 @@ Procedure.i NeonVkChromeFanEnd(colour.i)
   Else
     needed = (nvcPathCount - 2) * 3
     If nvcFanPipeline <> 0 : needed = nvcPathCount : EndIf
-    If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+    If nvcBudgetCan(0, 1, 0) = 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
       rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
     Else
       first = nvcVertices
@@ -3732,6 +3848,10 @@ Procedure NeonVkChromeLine(x0.i, y0.i, x1.i, y1.i)
     nvcFail(nvcPathError)
     ProcedureReturn
   EndIf
+  If nvcBudgetCan(0, 0, 2) = 0
+    nvcPathError = #NEON_VK_CHROME_ERR_CAPACITY : nvcFail(nvcPathError) : ProcedureReturn
+  EndIf
+  nvcBudgetVertices(0, 2)
   nvcPathX[nvcPathCount] = x0 : nvcPathY[nvcPathCount] = y0
   nvcPathX[nvcPathCount + 1] = x1 : nvcPathY[nvcPathCount + 1] = y1
   nvcPathCount = nvcPathCount + 2
@@ -3749,7 +3869,7 @@ Procedure.i NeonVkChromeLinesEnd(colour.i)
     rc = #NEON_VK_CHROME_OK
   Else
     needed = (nvcPathCount / 2) * 6
-    If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
+    If nvcBudgetCan(0, 1, 0) = 0 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
       rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
     Else
       first = nvcVertices : i = 0
@@ -3827,7 +3947,13 @@ Procedure.i NeonVkChromeEnd()
   ; chrome frame still owns a clear/present transaction, so record one fully
   ; transparent quad; blending makes it a visual no-op.
   If nvcDrawCount = 0
-    rc = NeonVkChromeBox(0, 0, nvcWidth, nvcHeight, 0)
+    If nvcVertices + 6 > nvcMaxVertexQuads * 6
+      rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
+    Else
+      nvcQuad(nvcVertices, 0, 0, nvcWidth, nvcHeight, nvcWhiteU0, nvcWhiteV0, nvcWhiteU1, nvcWhiteV1)
+      nvcVertices = nvcVertices + 6
+      rc = nvcDrawSetRaw(nvcVertices - 6, 6, 0, nvcDescriptorSet)
+    EndIf
   EndIf
   vkCmdEndRenderPass(nvcCommand)
   If nvcMapped <> 0
@@ -3911,6 +4037,7 @@ Procedure.i NeonVkChromeAbort()
   EndIf
   nvcInFrame = 0 : nvcFrameAbortable = 0
   nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
+  nvcBudgetReset()
   nvcGridBatchActive = 0 : nvcBoxBatchActive = 0
   nvcGridBatchFirst = 0 : nvcBoxBatchFirst = 0 : nvcBoxBatchCount = 0
   nvcRetainedBatchActive = 0 : nvcRetainedBatchCount = 0
@@ -4005,6 +4132,7 @@ Procedure NeonVkChromeDestroy()
   nvcLogicalW = 0 : nvcLogicalH = 0 : nvcPhysicalW = 0 : nvcPhysicalH = 0 : nvcPitch = 0 : nvcRotation = 0
   nvcViewportX = 0 : nvcViewportY = 0 : nvcViewportW = 0 : nvcViewportH = 0
   nvcMaxQuads = 0 : nvcMaxVertexQuads = 0 : nvcVertices = 0 : nvcExternalVertices = 0 : nvcDrawCount = 0
+  nvcBudgetReset()
   nvcGridBatchActive = 0 : nvcGridBatchFirst = 0 : nvcGridBatchSlot = -1 : nvcGridBatchGeneration = 0
   nvcAtlasW = 0 : nvcAtlasH = 0 : nvcAtlasBaseW = 0 : nvcAtlasBaseH = 0 : nvcAtlasBytes = 0
   nvcAtlasUploadMapped = 0 : nvcAtlasUploadCount = 0 : nvcAtlasUploadAtFrame = 0 : nvcAtlasRasterCountAtFrame = 0

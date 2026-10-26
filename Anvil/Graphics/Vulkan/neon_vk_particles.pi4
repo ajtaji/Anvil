@@ -409,6 +409,8 @@ Procedure.i NeonVkChromeParticlesDrawPrepared()
   If nvcDrawCount >= nvcMaxQuads Or nvcParticleCount * 6 > nvcMaxVertexQuads * 6 - nvcVertices
     ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
   EndIf
+  If nvcBudgetCan(1, 1, nvcParticleCount * 6) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
+  nvcBudgetVertices(1, nvcParticleCount * 6)
   first = nvcVertices
   For i = 0 To nvcParticleCount - 1
     If nvcParticleCornerBank = 0
@@ -492,6 +494,7 @@ Procedure.i NeonVkChromeParticlesDrawExternal(vertexBuffer.i, vertexCount.i)
   EndIf
   If vertexCount = 0 : ProcedureReturn #NEON_VK_CHROME_OK : EndIf
 
+  If nvcBudgetCan(1, 1, vertexCount) = 0 : ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_CAPACITY) : EndIf
   offset = 0
   AnvilVkFaultClear()
   vkCmdBindVertexBuffers(nvcCommand, 0, 1, @vertexBuffer, @offset)
@@ -517,6 +520,7 @@ Procedure.i NeonVkChromeParticlesDrawExternal(vertexBuffer.i, vertexCount.i)
     ProcedureReturn nvcFail(restoreFault)
   EndIf
 
+  nvcBudgetVertices(1, vertexCount)
   nvcExternalVertices = nvcExternalVertices + vertexCount
   ProcedureReturn #NEON_VK_CHROME_OK
 EndProcedure

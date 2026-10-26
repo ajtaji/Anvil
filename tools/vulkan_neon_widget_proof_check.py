@@ -150,10 +150,10 @@ def check_source() -> int:
     exact_constants = {
         "NVWA_EXPECT_BOX_CALLS": 35,
         "NVWA_EXPECT_TEXT_CALLS": 12,
-        "NVWA_EXPECT_GLYPH_QUADS": 74,
-        "NVWA_EXPECT_QUADS": 109,
+        "NVWA_EXPECT_GLYPH_QUADS": 72,
+        "NVWA_EXPECT_QUADS": 107,
         "NVWA_EXPECT_DRAWS": 47,
-        "NVWA_EXPECT_VERTICES": 654,
+        "NVWA_EXPECT_VERTICES": 642,
         "NVWA_EXPECT_SCISSOR_CALLS": 4,
     }
     for name, value in exact_constants.items():
@@ -174,8 +174,8 @@ def check_report_bytes(data: bytes) -> int:
         0: MAGIC, 1: 0, 2: 9, 3: REPORT_BYTES,
         17: 0, 18: 0, 19: 0,
         20: 1, 21: 0, 22: 0, 23: 1,
-        24: 47, 25: 654, 26: 47, 27: 654,
-        28: 35, 29: 12, 30: 74, 31: 4,
+        24: 47, 25: 642, 26: 47, 27: 642,
+        28: 35, 29: 12, 30: 72, 31: 4,
         32: 1, 33: 0, 34: 0, 35: 0, 36: 0, 37: 1,
         38: len(PROBES), 51: 0, 53: 1,
         54: 0x181, 55: 1, 56: 1, 57: 0,
@@ -314,8 +314,8 @@ def check_png(path: Path, record: dict | None = None) -> int:
 def synthetic() -> tuple[bytes, bytes]:
     words = [0] * REPORT_WORDS
     exact = {0: MAGIC, 1: 0, 2: 9, 3: REPORT_BYTES, 17: 0, 18: 0, 19: 0,
-             20: 1, 21: 0, 22: 0, 23: 1, 24: 47, 25: 654, 26: 47,
-             27: 654, 28: 35, 29: 12, 30: 74, 31: 4, 32: 1, 37: 1, 38: 12,
+             20: 1, 21: 0, 22: 0, 23: 1, 24: 47, 25: 642, 26: 47,
+             27: 642, 28: 35, 29: 12, 30: 72, 31: 4, 32: 1, 37: 1, 38: 12,
              53: 1, 54: 0x181, 55: 1, 56: 1, 57: 0, 58: 0x3DCCCCCD,
              59: 0x3E4CCCCD, 60: 0x3E99999A, 61: 0x3F800000,
              62: 3505, 63: TAIL}

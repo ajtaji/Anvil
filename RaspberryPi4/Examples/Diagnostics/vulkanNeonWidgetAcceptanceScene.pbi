@@ -26,8 +26,8 @@
 ; display owner's DisplayBlit once. It refuses a CPU fallback.
 ;
 ; The adapter's contract appends one ordered six-vertex draw for every box and
-; one ordered draw containing all supported glyph quads for every nonempty
-; text call. All text is ASCII and all faces are scale 1. This makes the
+; one ordered draw containing native-visible ink for flat bitmap text, or
+; supported cells (including spaces) for textured text. All faces are scale 1. This makes the
 ; geometry, draw and vertex ledgers exact rather than photograph-only.
 
 #NVWA_OK                 = 0
@@ -80,10 +80,10 @@
 ; Callback and Vulkan ledger for the settled frame.
 #NVWA_EXPECT_BOX_CALLS       = 35
 #NVWA_EXPECT_TEXT_CALLS      = 12
-#NVWA_EXPECT_GLYPH_QUADS     = 74
-#NVWA_EXPECT_QUADS           = 109
+#NVWA_EXPECT_GLYPH_QUADS     = 72 ; flat spaces in "Clipped row" and "Word Wrap" have no ink
+#NVWA_EXPECT_QUADS           = 107
 #NVWA_EXPECT_DRAWS           = 47
-#NVWA_EXPECT_VERTICES        = 654
+#NVWA_EXPECT_VERTICES        = 642
 #NVWA_EXPECT_SCISSOR_SETS    = 2
 #NVWA_EXPECT_SCISSOR_CLEARS  = 2
 #NVWA_EXPECT_SCISSOR_CALLS   = 4

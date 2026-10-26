@@ -1408,3 +1408,23 @@ capacity subranges match all 16,384 GPU bytes, with zero final allocations.
 The strict oracle rejects 65 corrupted proofs and the old report. Evidence:
 `docs/evidence/neon-bulk-range-pi4-20261025/README.md`. Separate family budgets,
 maximum native workloads, desktop integration and the broader goal remain open.
+
+
+## Separate Neon family accounting - 25 October 2026
+
+Default flat4096/262144 and textured2048/98304 record/input-vertex limits
+are now enforced independently of configured total commands and actual
+emitted storage. All draw families are classified; native path points charge
+once, bitmap flat glyphs count native bit rectangles, retained sprite groups
+preflight as a whole. Bitmap planning preserves advance/clip/blank semantics.
+Begin/Abort/Destroy own ledger resets; the private clear sentinel is uncharged.
+
+Physical tests fill all four logical dimensions, retain the other family,
+compare190native glyph/font costs, preserve refusal state/guards, and match
+81920 GPU bytes at all rotations plus clear-only output. Seven seeded side-path
+refusals and successful recording are separate from actual maximum loads.
+All245760 current15-scene bytes and124widget checks remain exact, with blank
+flat cells removed from physical vertex counts. Evidence and limits:
+`docs/evidence/neon-family-budgets-pi4-20261025/README.md`. Native maximum
+path/storage, public-counter ownership, external/grid quota-specific physical
+cases, desktop integration and broad Vulkan completion remain open.
