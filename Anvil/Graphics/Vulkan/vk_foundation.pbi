@@ -215,6 +215,10 @@ XIncludeFile "Anvil/Graphics/Vulkan/vk_core_1_0.pbi"
 ; only where both source and destination reach their image edge.
 #ANVIL_VK_CAP_TILED_EDGE_TAIL_COPY = $100000
 
+; A backend can execute a closed triangle fan without expanding its vertices.
+; Other backends keep refusing this topology until they advertise this bit.
+#ANVIL_VK_CAP_TRIANGLE_FAN = $200000
+
 ; Target-neutral closed-draw blend semantics. A backend maps these values to
 ; its own packet vocabulary; V3D blend-factor numbers never cross this seam.
 #ANVIL_VK_BLEND_DISABLED = 0

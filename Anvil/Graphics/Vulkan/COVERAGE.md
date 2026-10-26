@@ -379,3 +379,17 @@ The 2026-10-01 Pi 4 run exercised public `vkCmdFillBuffer` with a 16-word fill i
 ### Exact 256-tile two-call optimal-image upload
 
 A separate Pi 4 RAM proof exercised the existing two-call `vkCmdCopyBufferToImage` path at aggregate budgets 64, 128, 192 and exactly 256 utiles. On a 72×64 optimal image, the maximum run changed 4,096 texels and preserved a 512-texel gap; a TFU-produced baseline first verified all 4,608 logical texels through an independent UIF oracle. The 1,536 padded UIF texels retained their checksum, and 128 image plus 64 source guard words passed. At 256 tiles, guarded DMA advanced 0→256, backend jobs 1→3, and TFU remained at one job after baseline initialization. All four reports pass the strict checker; the full payload took 1.233617 seconds and the monitor run about 1.4 seconds under a 15-second deadman, without a flash. This is Pi 4 evidence only. See `docs/evidence/vulkan-two-partial-optimal-aggregate-pi4-20261001/README.md`.
+
+
+## Triangle-fan execution and Neon storage - 25 October 2026
+
+TRIANGLE_FAN now has a separate backend capability and Pi 4 primitive mode 6.
+The shared validator refuses that topology when the capability is absent.
+Neon records n original fan points on capable backends and retains its prior
+triangle-list fallback elsewhere. Four-rotation mixed/tight tests match
+262,144 combined candidate/fallback GPU bytes, preserve whole-primitive
+refusal and retire all objects. A physical no-restoration control is rejected
+for 576 wrong bytes; 28 host mutations are rejected. All 245,760 current scene
+bytes and 124 widget checks remain exact. Indexed/instanced fan hardware
+coverage, native maximum vertex budgets and conformance remain unproven.
+Evidence: `../../../docs/evidence/neon-triangle-fan-pi4-20261025/README.md`.

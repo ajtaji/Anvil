@@ -405,7 +405,7 @@ one gets a compile-time refusal naming it.
 | `vkCmdPushConstants` | Implemented for the whole sixteen-byte fragment-stage block at offset 0. |
 | `vkCmdSetScissor` | Implemented for `firstScissor` zero and one `VkRect2D`. A pipeline may declare dynamic scissor alone or with dynamic viewport; reset clears the supplied state, a nonempty draw requires it, and each draw snapshots its rectangle so later changes cannot alter earlier records. Signed offsets and unsigned extents are normalized without overflow by the backend; empty and wholly out-of-bounds rectangles become a zero-size clip. |
 | `vkCmdSetViewport` | Implemented for one nonnegative whole-pixel viewport with depth range exactly zero to one. Dynamic viewport and scissor may be declared independently; every draw snapshots the effective state. The viewport must fit its active framebuffer and its centre must fit V3D's u14.8 offset field; QPU scale and V3D clipper/offset follow each draw. Pyramid captures 99–103 show scissor clipping, smaller and translated viewport mapping, and independent static scissor on Pi 4; see `docs/VULKAN_DYNAMIC_VIEWPORT_SCISSOR_PI4_2026-09-27.md` and `docs/VULKAN_STATIC_SCISSOR_PI4_2026-09-27.md`. |
-| `vkCmdDraw` | One instance is verified on Pi 4. The source now records `instanceCount` and `firstInstance`, checks each vertex- or instance-rate binding, and emits V3D's instanced packet; multiple instances still await a distinct-pixel Pi 4 proof. A zero vertex or instance count consumes no draw slot. A command buffer snapshots up to 4,096 ordered draws, including the active pipeline, bindings, push data and generation-safe resource ledger. `TRIANGLE_LIST` discards an incomplete final triangle. `TRIANGLE_STRIP` filled both halves of a square on Pi 4 in capture 106. |
+| `vkCmdDraw` | One instance is verified on Pi 4. The source now records `instanceCount` and `firstInstance`, checks each vertex- or instance-rate binding, and emits V3D's instanced packet; multiple instances still await a distinct-pixel Pi 4 proof. A zero vertex or instance count consumes no draw slot. A command buffer snapshots up to 6,144 ordered draws, including the active pipeline, bindings, push data and generation-safe resource ledger. `TRIANGLE_LIST` discards an incomplete final triangle. `TRIANGLE_STRIP` filled both halves of a square on Pi 4 in capture 106. |
 | `vkCmdDrawIndexed` | One instance with `firstInstance = 0` is verified on Pi 4. The source now carries multiple instances and base instance through the indexed V3D packet path, pending a Pi 4 pixel proof. `vertexOffset` remains zero; UINT16/UINT32 indices and triangle-list or triangle-strip topology are supported. Submit scans coherent indices, bounds vertex and instance fetches, includes exact index and input ranges in cache maintenance, and retains resources through completion. Capture 107's indexed strip was pixel-identical to capture 106's array strip. |
 
 The fixed-function state a pipeline may declare: one to four vertex input
@@ -1381,3 +1381,17 @@ build 331 compiles and derives reservation 0D000000..0E6FFFFF, but is not
 installed. Resident 328 still uses the older map. Topic 1249 remains open
 pending deployment acceptance. Pi 5 layout is unchanged. Evidence:
 `docs/evidence/pi4-linked-variables-20261025/README.md`.
+
+
+## Direct triangle fans - 25 October 2026
+
+The shared pipeline validator accepts TRIANGLE_FAN only with the separate
+backend capability, now advertised by Pi 4. Neon stores n original points
+instead of 3*(n-2) expanded vertices and restores its ordinary pipeline after
+the draw. Capability-masked fallback retains triangle-list lowering. The
+selected non-indexed four-rotation hardware tests match 262,144 GPU bytes,
+check tight-buffer refusal and full retirement, and reject a physical stale-
+topology control. All 245,760 current baseline scene bytes and 124 widget
+checks remain exact. Native family budgets, maximum point/vertex workloads,
+indexed/instanced fan hardware evidence and full port completion remain open.
+See `docs/evidence/neon-triangle-fan-pi4-20261025/README.md`.

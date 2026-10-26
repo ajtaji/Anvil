@@ -202,6 +202,7 @@ Global nvcDescriptorPool.i
 Global nvcDescriptorSet.i
 Global nvcPipelineLayout.i
 Global nvcPipeline.i
+Global nvcFanPipeline.i
 Global nvcParticleImage.i
 Global nvcParticleMemory.i
 Global nvcParticleView.i
@@ -1272,6 +1273,10 @@ Procedure.i nvcDescriptorsAndPipeline()
   gp\pMultisampleState = @ms : gp\pColorBlendState = @cb : gp\pDynamicState = @dyn
   gp\layout = nvcPipelineLayout : gp\renderPass = nvcRenderPass : gp\subpass = 0 : gp\basePipelineIndex = -1
   rc = vkCreateGraphicsPipelines(nvcDevice, 0, 1, @gp, 0, @nvcPipeline)
+  If rc = #VK_SUCCESS And (avkBackendCaps() & #ANVIL_VK_CAP_TRIANGLE_FAN) <> 0
+    ia\topology = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+    rc = vkCreateGraphicsPipelines(nvcDevice, 0, 1, @gp, 0, @nvcFanPipeline)
+  EndIf
   vkDestroyShaderModule(nvcDevice, vs, 0)
   vkDestroyShaderModule(nvcDevice, fs, 0)
   ProcedureReturn rc
@@ -2007,8 +2012,8 @@ Procedure nvcSpriteCornerQ8(centerXQ8.i, centerYQ8.i, localXQ8.i, localYQ8.i, co
   PokeI(*yQ8, centerYQ8 + (localXQ8 * sinQ16 + localYQ8 * cosQ16) / 65536)
 EndProcedure
 
-; The public Vulkan pipeline is triangle-list only. These helpers lower solid
-; fan triangles and one-pixel line quads through the atlas's owned white texel;
+; Triangle-list helpers retain the fallback fan lowering and one-pixel line
+; quads through the atlas's owned white texel. Capable backends also own a fan pipeline;
 ; no native Neon/V3D record or CPU framebuffer path is reachable here.
 Procedure nvcSolidTriangle(first.i, x0.i, y0.i, x1.i, y1.i, x2.i, y2.i)
   nvcVertex(first + 0, x0, y0, nvcWhiteU0, nvcWhiteV0)
@@ -3605,9 +3610,10 @@ Procedure.i NeonVkChromeTextTex(font.i, x.i, y.i, *s, colour.i)
   ProcedureReturn nvcDraw(first, count, colour)
 EndProcedure
 
-; Fan and line builders retain only bounded logical points. End performs one
-; complete capacity preflight, writes triangle-list geometry, then appends one
-; ordered Vulkan draw. FanOutline deliberately keeps the fan cursor alive so
+; Fan and line builders retain only bounded logical points. End preflights
+; the complete primitive. Fan fills use the advertised fan pipeline, with
+; triangle-list fallback; outlines and lines retain their quad lowering.
+; FanOutline deliberately keeps the fan cursor alive so
 ; the existing outline-then-fill call order reuses the same logical points.
 Procedure.i NeonVkChromeFanBegin()
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
@@ -3665,15 +3671,26 @@ Procedure.i NeonVkChromeFanEnd(colour.i)
     rc = #NEON_VK_CHROME_OK
   Else
     needed = (nvcPathCount - 2) * 3
+    If nvcFanPipeline <> 0 : needed = nvcPathCount : EndIf
     If nvcDrawCount >= nvcMaxQuads Or nvcVertices + needed > nvcMaxVertexQuads * 6
       rc = nvcFail(#NEON_VK_CHROME_ERR_CAPACITY)
     Else
-      first = nvcVertices : i = 1
-      While i < nvcPathCount - 1
-        nvcSolidTriangle(nvcVertices, nvcPathX[0], nvcPathY[0], nvcPathX[i], nvcPathY[i], nvcPathX[i + 1], nvcPathY[i + 1])
-        nvcVertices = nvcVertices + 3 : i = i + 1
-      Wend
+      first = nvcVertices
+      If nvcFanPipeline <> 0
+        For i = 0 To nvcPathCount - 1
+          nvcVertex(nvcVertices, nvcPathX[i], nvcPathY[i], nvcWhiteU0, nvcWhiteV0)
+          nvcVertices = nvcVertices + 1
+        Next
+        vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcFanPipeline)
+      Else
+        i = 1
+        While i < nvcPathCount - 1
+          nvcSolidTriangle(nvcVertices, nvcPathX[0], nvcPathY[0], nvcPathX[i], nvcPathY[i], nvcPathX[i + 1], nvcPathY[i + 1])
+          nvcVertices = nvcVertices + 3 : i = i + 1
+        Wend
+      EndIf
       rc = nvcDraw(first, needed, colour)
+      If nvcFanPipeline <> 0 : vkCmdBindPipeline(nvcCommand, #VK_PIPELINE_BIND_POINT_GRAPHICS, nvcPipeline) : EndIf
     EndIf
   EndIf
   nvcPathKind = #NVC_PATH_NONE : nvcPathCount = 0 : nvcPathError = 0
@@ -3922,6 +3939,7 @@ Procedure NeonVkChromeDestroy()
     For slot = 2 To #NVC_MULTI_SPRITE_MAX
       nvcImageSpriteRelease(nvcImageSpriteSets[slot], nvcImageSpriteViews[slot], nvcImageSpriteImages[slot], nvcImageSpriteMemories[slot])
     Next
+    If nvcFanPipeline <> 0 : vkDestroyPipeline(nvcDevice, nvcFanPipeline, 0) : EndIf
     If nvcPipeline <> 0 : vkDestroyPipeline(nvcDevice, nvcPipeline, 0) : EndIf
     If nvcPipelineLayout <> 0 : vkDestroyPipelineLayout(nvcDevice, nvcPipelineLayout, 0) : EndIf
     If nvcDescriptorPool <> 0 : vkDestroyDescriptorPool(nvcDevice, nvcDescriptorPool, 0) : EndIf
@@ -3945,7 +3963,7 @@ Procedure NeonVkChromeDestroy()
       vkFreeCommandBuffers(nvcDevice, nvcCommandPool, 1, @cmd)
     EndIf
   EndIf
-  nvcCommand = 0 : nvcFence = 0 : nvcPipeline = 0 : nvcPipelineLayout = 0
+  nvcCommand = 0 : nvcFence = 0 : nvcPipeline = 0 : nvcFanPipeline = 0 : nvcPipelineLayout = 0
   nvcDescriptorSet = 0 : nvcDescriptorPool = 0 : nvcSetLayout = 0
   nvcImageSpriteSet = 0 : nvcImageSpriteView = 0 : nvcImageSpriteImage = 0 : nvcImageSpriteMemory = 0
   nvcImageSpriteW = 0 : nvcImageSpriteH = 0 : nvcImageSpriteGeneration = 0

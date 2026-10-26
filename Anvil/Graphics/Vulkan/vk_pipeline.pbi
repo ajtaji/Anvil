@@ -28,7 +28,8 @@
 ;   * up to four vertex input bindings at vertex or instance rate
 ;   * attributes at locations 0..n-1 (n <= 4), R32G32_SFLOAT,
 ;     R32G32B32_SFLOAT or R32G32B32A32_SFLOAT
-;   * TRIANGLE_LIST and TRIANGLE_STRIP, no primitive restart
+;   * TRIANGLE_LIST, TRIANGLE_STRIP and capability-gated TRIANGLE_FAN
+;     without primitive restart
 ;   * one viewport and one scissor; either, both or neither may be dynamic
 ;   * VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, no depth bias, line width
 ;     1.0, no depth clamp, no rasteriser discard
@@ -1623,8 +1624,11 @@ Procedure.i avkPipeCheckInputAssembly(*ia.VkPipelineInputAssemblyStateCreateInfo
   If (*ia\sType & $FFFFFFFF) <> #VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
     ProcedureReturn avkFault(#ANVIL_VK_ERR_ARGS, "vkCreateGraphicsPipelines was given a VkPipelineInputAssemblyStateCreateInfo whose sType is wrong (Anvil code -20001, wrong sType).")
   EndIf
-  If (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST And (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
-    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than TRIANGLE_LIST or TRIANGLE_STRIP (Anvil code -20005, unsupported topology); point, line and fan primitives need validated command support and a backend path.")
+  If (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST And (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP And (*ia\topology & $FFFFFFFF) <> #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for a primitive topology other than TRIANGLE_LIST, TRIANGLE_STRIP or TRIANGLE_FAN (Anvil code -20005, unsupported topology); point and line primitives need validated command support and a backend path.")
+  EndIf
+  If (*ia\topology & $FFFFFFFF) = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN And (avkBackendCaps() & #ANVIL_VK_CAP_TRIANGLE_FAN) = 0
+    ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for TRIANGLE_FAN but the active backend does not advertise it (Anvil code -20005, unsupported topology); use TRIANGLE_LIST or select a backend with triangle-fan support.")
   EndIf
   If (*ia\primitiveRestartEnable & $FFFFFFFF) <> #VK_FALSE
     ProcedureReturn avkFault(#ANVIL_VK_ERR_UNSUPPORTED, "vkCreateGraphicsPipelines was asked for primitive restart (Anvil code -20005, unsupported state); indexed strip restart is not implemented.")
@@ -3212,7 +3216,7 @@ Procedure AnvilVkCmdBindIndexBuffer(commandBuffer.i, buffer.i, offset.i, indexTy
 EndProcedure
 
 ; Core indexed drawing accepts instance count and base instance, but still
-; requires zero vertexOffset and triangle-list or strip topology. Index bytes
+; requires zero vertexOffset and an accepted triangle topology. Index bytes
 ; remain application memory: submission preflight re-resolves and scans the
 ; live uint16/uint32 range before any fence, retain counter or backend job
 ; changes state.

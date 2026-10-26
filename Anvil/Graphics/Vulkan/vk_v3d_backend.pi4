@@ -173,7 +173,7 @@ Procedure.i avkBackendCaps()
   Define caps.i
   If avkV3dWindowBase <= 0 Or avkV3dWindowBytes <= 0 : ProcedureReturn 0 : EndIf
   If Neon_Ready() = 0 : ProcedureReturn 0 : EndIf
-  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT
+  caps = #ANVIL_VK_CAP_DEVICE | #ANVIL_VK_CAP_CLEAR_COLOR | #ANVIL_VK_CAP_GPU | #ANVIL_VK_CAP_DRAW | #ANVIL_VK_CAP_BLEND_SRC_OVER | #ANVIL_VK_CAP_DRAW_LIST | #ANVIL_VK_CAP_CLEAR_ATTACHMENT_RECT | #ANVIL_VK_CAP_TRIANGLE_FAN
   CompilerIf #DSP_DMA_LINKED = 1
     ; A linked DMA driver is not an initialized DMA channel. Atlas prewarm
     ; selects the full-image TFU upload until DmaInit has actually succeeded.
@@ -1253,6 +1253,9 @@ Procedure.i avkV3dPrimitiveMode(pipe.i)
   EndIf
   If AnvilVkPipelineTopology(pipe) = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
     ProcedureReturn #AVKQ_PRIM_TRIANGLE_STRIP
+  EndIf
+  If AnvilVkPipelineTopology(pipe) = #VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+    ProcedureReturn #AVKQ_PRIM_TRIANGLE_FAN
   EndIf
   ProcedureReturn -1
 EndProcedure
