@@ -2254,7 +2254,12 @@ Procedure.i NeonVkChromeLinesReserve(quads.i)
   If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
     ProcedureReturn -1
   EndIf
-  If quads < 1 Or nvcDrawCount >= nvcMaxQuads Or nvcVertices + quads * 6 > nvcMaxVertexQuads * 6
+  ; Compare in quad units before multiplying. A large positive count can
+  ; otherwise wrap its six-vertex extent into a negative or tiny value.
+  If nvcVertices < 0 Or nvcVertices > nvcMaxVertexQuads * 6
+    ProcedureReturn -1
+  EndIf
+  If quads < 1 Or nvcDrawCount >= nvcMaxQuads Or quads > (nvcMaxVertexQuads * 6 - nvcVertices) / 6
     ProcedureReturn -1
   EndIf
   If ((nvcMapped + nvcVertices * #NEON_VK_CHROME_VERTEX_BYTES) & 7) <> 0
@@ -2326,7 +2331,18 @@ EndProcedure
 
 ; The reserved run of line quads, drawn as one draw in colour.
 Procedure.i NeonVkChromeLinesDraw(first.i, quads.i, colour.i)
-  If quads < 1
+  If nvcInFrame = 0 Or nvcGridBatchActive <> 0 Or nvcBoxBatchActive <> 0 Or nvcPathKind <> #NVC_PATH_NONE
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_STATE)
+  EndIf
+  If first < 0 Or quads < 0 Or first > nvcVertices
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  ; A bulk draw may select a subrange, but may not read beyond storage
+  ; already reserved in this frame. Subtraction/division cannot wrap.
+  If quads > (nvcVertices - first) / 6
+    ProcedureReturn nvcFail(#NEON_VK_CHROME_ERR_ARGS)
+  EndIf
+  If quads = 0
     ProcedureReturn #NEON_VK_CHROME_OK
   EndIf
   ProcedureReturn nvcDraw(first, quads * 6, colour)

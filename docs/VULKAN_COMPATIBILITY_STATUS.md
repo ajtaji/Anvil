@@ -1395,3 +1395,16 @@ topology control. All 245,760 current baseline scene bytes and 124 widget
 checks remain exact. Native family budgets, maximum point/vertex workloads,
 indexed/instanced fan hardware evidence and full port completion remain open.
 See `docs/evidence/neon-triangle-fan-pi4-20261025/README.md`.
+
+
+## Neon bulk range preflight - 25 October 2026
+
+Bulk reservations check remaining capacity before multiplying and bulk draws
+validate their full span against reserved storage before recording. Physical
+Pi 4 before/after evidence records five wrapped-count admissions and four
+invalid-draw admissions in the old implementation; the corrected implementation
+refuses them without cursor, free-row, fault or buffer changes. Valid exact-
+capacity subranges match all 16,384 GPU bytes, with zero final allocations.
+The strict oracle rejects 65 corrupted proofs and the old report. Evidence:
+`docs/evidence/neon-bulk-range-pi4-20261025/README.md`. Separate family budgets,
+maximum native workloads, desktop integration and the broader goal remain open.
