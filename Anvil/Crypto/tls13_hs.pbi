@@ -2134,7 +2134,7 @@ EndProcedure
 ;  with the rest if it took fewer than offered (which happens when a
 ;  record completed and the caller should look at Tls13AppLen first).
 ; ----------------------------------------------------------------------
-Procedure.i Tls13FeedBytes(src.i, len.i)
+Procedure.i Tls13FeedBytesLimited(src.i, len.i, records.i)
   Protected took.i
   Protected want.i
   Protected flen.i
@@ -2149,6 +2149,8 @@ Procedure.i Tls13FeedBytes(src.i, len.i)
     ProcedureReturn -1
   EndIf
 
+  ; A zero budget performs no work and consumes no bytes.
+  If records <= 0 : ProcedureReturn 0 : EndIf
   took = 0
   While took < len
     ; first fill the 5-byte header
@@ -2193,13 +2195,20 @@ Procedure.i Tls13FeedBytes(src.i, len.i)
     If Tls13FeedRecord(TlsRecvAddr, total) = 0
       ProcedureReturn -1
     EndIf
-    If Tls13AppLen > 0
+    records = records - 1
+    If Tls13AppLen > 0 Or records = 0
       ; the plaintext lives in the caller's buffer and the next record
       ; would overwrite it, so hand control back now
       ProcedureReturn took
     EndIf
   Wend
   ProcedureReturn took
+EndProcedure
+
+; Compatibility entry: legacy callers may still consume a complete batch.
+; Cooperative callers use Tls13FeedBytesLimited with a positive record budget.
+Procedure.i Tls13FeedBytes(src.i, len.i)
+  ProcedureReturn Tls13FeedBytesLimited(src, len, $7FFFFFFF)
 EndProcedure
 
 ; ==== PORTABLE CORE A64 END ====

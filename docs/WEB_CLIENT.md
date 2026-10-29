@@ -182,8 +182,9 @@ The shared TLS service also now refuses TCP resets and missing close_notify
 instead of reporting successful end-of-stream, drains queued TCP data before
 judging FIN, and retains authenticated closed state while plaintext is drained.
 Eight physical service-owner tests passed using TCP/crypto doubles. This service
-change compiled in build 414; it has not yet replaced resident 405 or received
-new on-wire qualification in an updated resident image.
+change was installed in builds 416 and 418. Live verified HTTPS gzip and
+deflate requests pass on the updated resident image; injected transport faults
+remain covered by controlled doubles rather than on-wire fault injection.
 
 
 ## DNS reply ownership and large answers
@@ -214,3 +215,25 @@ Physical checks cover 30 decoder cases, five cache boundaries, 16 TCP lifecycle
 cases and three rejected UDP triggers. A separate live TCP query to a public
 resolver returned two matching addresses in 58 ms; UDP truncation was exercised
 with deterministic transport inputs, not an on-wire fault-injection server.
+
+
+## TLS service scheduling
+
+`Tls13FeedBytesLimited` accepts a maximum record count and returns the consumed
+input length. A zero budget consumes nothing; partially received records remain
+buffered. The legacy `Tls13FeedBytes` entry retains batch behavior. The shared TLS
+client now processes at most one incoming record per advance and performs one
+TCP send attempt per flush. Partial sends remain queued, and an impossible send
+count is an explicit transport failure. Application plaintext is drained before
+the receive buffer is reused.
+
+This separates coalesced records and partial-send retries across service calls.
+It does not make individual certificate verification or key-share arithmetic
+resumable, and one TLS record can still contain several handshake messages.
+There is no frame-time guarantee. Physical scheduling and transport-close checks
+use controlled crypto/TCP doubles; live HTTPS qualification is recorded separately.
+
+Installed419 passes live verified HTTPS gzip and deflate requests after reboot.
+The longest measured handshake service calls remain about347 ms; record budgeting
+has not removed this arithmetic bottleneck. First open with cold root setup took
+41 ms in this sample, while the following warm open took654 microseconds.

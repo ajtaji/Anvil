@@ -1,9 +1,9 @@
-"""Physical known-length and chunked upload proof; no emulator is started."""
+"""Physical TLS close and transport-failure proof; no emulator is started."""
 from pathlib import Path
 import subprocess,os,re,json,hashlib
 import argparse
 from pmf_compiler import resolve_compiler
-ap=argparse.ArgumentParser(description="Compile streaming HTTP upload qualification for a physical Pi 4")
+ap=argparse.ArgumentParser(description="Compile TLS closure qualification for a physical Pi 4")
 ap.add_argument('--compiler',required=True);ap.add_argument('--out',type=Path,required=True);args=ap.parse_args()
 r=Path(__file__).resolve().parents[1];d=args.out.resolve();d.mkdir(parents=True,exist_ok=False)
 names=['Anvil/Core/tls_client.pbi','Anvil/Hal/abi.pbi','Anvil/Crypto/tls13_hs.pbi']
@@ -48,7 +48,7 @@ Procedure.i PayNetTcpRecv(h.i,p.i,n.i)
  If mode=6 And reads=1 : ProcedureReturn 3 : EndIf
  ProcedureReturn 0
 EndProcedure
-Procedure.i Tls13FeedBytes(p.i,n.i)
+Procedure.i Tls13FeedBytesLimited(p.i,n.i,records.i)
  feeds=feeds+1
  If mode=3 Or (mode=2 And reads=2) : Tls13State=#TLS13_ST_CLOSED : EndIf
  If mode=2 And reads=1

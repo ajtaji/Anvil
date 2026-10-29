@@ -121,20 +121,22 @@ Procedure.i tlsc_RingFree()
   ProcedureReturn #TLSC_RING - 1 - tlsc_RingUsed()
 EndProcedure
 
-; Pushes queued record bytes into TCP. 0, or -1 when TCP refused.
+; One send attempt per flush; partial progress stays queued for the next pass.
+; 0, or -1 when TCP refused.
 Procedure.i tlsc_Flush()
   Define k.i
-  While tlsc_txOff < tlsc_txLen
+  If tlsc_txOff < tlsc_txLen
     k = PayNetTcpSend(tlsc_tcp, @tlsc_tx[tlsc_txOff], tlsc_txLen - tlsc_txOff)
     If k < 0
       tlsc_Refuse(k, "the TCP connection under TLS refused a send")
       ProcedureReturn -1
     EndIf
-    If k = 0
-      Break
+    If k > tlsc_txLen - tlsc_txOff
+      tlsc_Refuse(#SVC_EIO, "TCP reported more sent bytes than TLS offered")
+      ProcedureReturn -1
     EndIf
     tlsc_txOff = tlsc_txOff + k
-  Wend
+  EndIf
   If tlsc_txOff >= tlsc_txLen
     tlsc_txOff = 0
     tlsc_txLen = 0
@@ -147,15 +149,15 @@ Procedure tlsc_Queued(n.i)
   tlsc_txLen = tlsc_txLen + n
 EndProcedure
 
-; Feeds received TCP bytes to TLS while the plaintext ring can take a
+; Feeds at most one TLS record per pass when the plaintext ring can take a
 ; whole record. 0, or -1 when TLS refused.
 Procedure.i tlsc_Feed()
   Define fed.i
   Define i.i
   Define n.i
-  While tlsc_inOff < tlsc_inLen And tlsc_RingFree() >= #TLSC_APP_CHUNK + 256
+  If tlsc_inOff < tlsc_inLen And tlsc_RingFree() >= #TLSC_APP_CHUNK + 256
     Tls13AppLen = 0
-    fed = Tls13FeedBytes(@tlsc_in[tlsc_inOff], tlsc_inLen - tlsc_inOff)
+    fed = Tls13FeedBytesLimited(@tlsc_in[tlsc_inOff], tlsc_inLen - tlsc_inOff, 1)
     If fed < 0
       tlsc_Refuse(#SVC_EIO, "the server's TLS was refused - certificate, signature, Finished or record (tls status for the codes)")
       ProcedureReturn -1
@@ -169,10 +171,7 @@ Procedure.i tlsc_Feed()
       Next
       Tls13AppLen = 0
     EndIf
-    If fed = 0
-      Break
-    EndIf
-  Wend
+  EndIf
   If tlsc_inOff >= tlsc_inLen
     tlsc_inOff = 0
     tlsc_inLen = 0
