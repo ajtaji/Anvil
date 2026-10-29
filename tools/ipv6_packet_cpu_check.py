@@ -12,6 +12,7 @@ def check(raw,cases):
    actual=[q(p+j*8) for j in range(1,8)]
    assert actual==[c['packet_bytes'],c['offset'],c['payload_bytes'],c['protocol'],64,165,0x12345],(i,'view',actual)
    assert q(p+80)==40 and q(p+88)==1,(i,'build/guard')
+   assert q(p+96)==c.get('fragmented',0),(i,'fragment flag')
    h=bytes.fromhex(c['header']);assert raw[p+128:p+168]==h,(i,'header')
    assert raw[p+176:p+208]==h[8:40],(i,'addresses')
  return dict(passed=True,cases=len(cases))

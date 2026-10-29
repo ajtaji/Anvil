@@ -10,7 +10,7 @@ def build(compiler,out):
  def packet(proto,data):return struct.pack('!IHBB',0x6a512345,len(data),proto,64)+src+dst+data
  cases=[];vectors=[]
  def add(name,p,rc=0,offset=40,proto=None,length=None,action=0):
-  c=dict(name=name,rc=rc,action=action)
+  c=dict(name=name,rc=rc,action=action,fragmented=int(name=='atomic fragment'))
   if rc==0:c.update(header=p[:40].hex(),packet_bytes=40+int.from_bytes(p[4:6],'big'),offset=offset,protocol=p[6] if proto is None else proto,payload_bytes=len(p)-offset if length is None else length)
   cases.append(c);vectors.append(p)
  add('UDP payload',packet(17,b'hello'))
@@ -65,7 +65,7 @@ Procedure PacketFixture(index.i,data.i,n.i)
   For i=0 To 63 : If header[i]<>$A5 : guards=0 : EndIf : Next
   built=IPv6PacketHeader(@header[0],64,view\source,view\destination,plen,proto,64,165,$12345)
   For i=40 To 63 : If header[i]<>$A5 : guards=0 : EndIf : Next
-  PokeI(p+80,built) : PokeI(p+88,guards)
+  PokeI(p+80,built) : PokeI(p+88,guards) : PokeI(p+96,view\fragmented)
   For i=0 To 39 : PokeA(p+128+i,header[i]) : Next
   For i=0 To 15 : PokeA(p+176+i,PeekA(view\source+i)) : PokeA(p+192+i,PeekA(view\destination+i)) : Next
  EndIf

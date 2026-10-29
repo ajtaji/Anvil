@@ -1,0 +1,317 @@
+XIncludeFile "Anvil/Network/ipv6_packet.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Global wtable.i
+Global *pet
+Global view.IPv6PacketView
+Global Dim header.a[64]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_wtable
+ add x1, x1, #:lo12:global_wtable
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure PacketFixture(index.i,data.i,n.i)
+ Define p.i,rc.i,i.i,small.i,built.i,guards.i,plen.i,proto.i
+ p=$E1C00100+index*256
+ rc=IPv6PacketParse(data,n,@view)
+ PokeI(p,rc) : PokeI(p+64,view\errorOffset) : PokeI(p+72,view\optionAction)
+ If rc=0
+  PokeI(p+8,view\packetBytes) : PokeI(p+16,view\payload-data) : PokeI(p+24,view\payloadBytes)
+  PokeI(p+32,view\protocol) : PokeI(p+40,view\hopLimit) : PokeI(p+48,view\trafficClass) : PokeI(p+56,view\flowLabel)
+  For i=0 To 63 : header[i]=$A5 : Next
+  plen=NetReadBE16(data+4) : proto=PeekA(data+6)
+  small=IPv6PacketHeader(@header[0],39,view\source,view\destination,plen,proto,64,165,$12345)
+  guards=1
+  If small<>#IPV6_PACKET_ARGUMENT : guards=0 : EndIf
+  For i=0 To 63 : If header[i]<>$A5 : guards=0 : EndIf : Next
+  built=IPv6PacketHeader(@header[0],64,view\source,view\destination,plen,proto,64,165,$12345)
+  For i=40 To 63 : If header[i]<>$A5 : guards=0 : EndIf : Next
+  PokeI(p+80,built) : PokeI(p+88,guards) : PokeI(p+96,view\fragmented)
+  For i=0 To 39 : PokeA(p+128+i,header[i]) : Next
+  For i=0 To 15 : PokeA(p+176+i,PeekA(view\source+i)) : PokeA(p+192+i,PeekA(view\destination+i)) : Next
+ EndIf
+ pet()
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$49503632)
+ pet=PeekI(wtable+16+6*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ PacketFixture(0,?IPv6PacketVector0,45)
+ PacketFixture(1,?IPv6PacketVector1,47)
+ PacketFixture(2,?IPv6PacketVector2,40)
+ PacketFixture(3,?IPv6PacketVector3,43)
+ PacketFixture(4,?IPv6PacketVector4,51)
+ PacketFixture(5,?IPv6PacketVector5,51)
+ PacketFixture(6,?IPv6PacketVector6,48)
+ PacketFixture(7,?IPv6PacketVector7,48)
+ PacketFixture(8,?IPv6PacketVector8,48)
+ PacketFixture(9,?IPv6PacketVector9,48)
+ PacketFixture(10,?IPv6PacketVector10,49)
+ PacketFixture(11,?IPv6PacketVector11,49)
+ PacketFixture(12,?IPv6PacketVector12,48)
+ PacketFixture(13,?IPv6PacketVector13,51)
+ PacketFixture(14,?IPv6PacketVector14,51)
+ PacketFixture(15,?IPv6PacketVector15,51)
+ PacketFixture(16,?IPv6PacketVector16,51)
+ PacketFixture(17,?IPv6PacketVector17,56)
+ PacketFixture(18,?IPv6PacketVector18,56)
+ PacketFixture(19,?IPv6PacketVector19,112)
+ PacketFixture(20,?IPv6PacketVector20,49)
+ PacketFixture(21,?IPv6PacketVector21,49)
+ PacketFixture(22,?IPv6PacketVector22,48)
+ PacketFixture(23,?IPv6PacketVector23,43)
+ PacketFixture(24,?IPv6PacketVector24,0)
+ PacketFixture(25,?IPv6PacketVector25,1)
+ PacketFixture(26,?IPv6PacketVector26,2)
+ PacketFixture(27,?IPv6PacketVector27,3)
+ PacketFixture(28,?IPv6PacketVector28,4)
+ PacketFixture(29,?IPv6PacketVector29,5)
+ PacketFixture(30,?IPv6PacketVector30,6)
+ PacketFixture(31,?IPv6PacketVector31,7)
+ PacketFixture(32,?IPv6PacketVector32,8)
+ PacketFixture(33,?IPv6PacketVector33,9)
+ PacketFixture(34,?IPv6PacketVector34,10)
+ PacketFixture(35,?IPv6PacketVector35,11)
+ PacketFixture(36,?IPv6PacketVector36,12)
+ PacketFixture(37,?IPv6PacketVector37,13)
+ PacketFixture(38,?IPv6PacketVector38,14)
+ PacketFixture(39,?IPv6PacketVector39,15)
+ PacketFixture(40,?IPv6PacketVector40,16)
+ PacketFixture(41,?IPv6PacketVector41,17)
+ PacketFixture(42,?IPv6PacketVector42,18)
+ PacketFixture(43,?IPv6PacketVector43,19)
+ PacketFixture(44,?IPv6PacketVector44,20)
+ PacketFixture(45,?IPv6PacketVector45,21)
+ PacketFixture(46,?IPv6PacketVector46,22)
+ PacketFixture(47,?IPv6PacketVector47,23)
+ PacketFixture(48,?IPv6PacketVector48,24)
+ PacketFixture(49,?IPv6PacketVector49,25)
+ PacketFixture(50,?IPv6PacketVector50,26)
+ PacketFixture(51,?IPv6PacketVector51,27)
+ PacketFixture(52,?IPv6PacketVector52,28)
+ PacketFixture(53,?IPv6PacketVector53,29)
+ PacketFixture(54,?IPv6PacketVector54,30)
+ PacketFixture(55,?IPv6PacketVector55,31)
+ PacketFixture(56,?IPv6PacketVector56,32)
+ PacketFixture(57,?IPv6PacketVector57,33)
+ PacketFixture(58,?IPv6PacketVector58,34)
+ PacketFixture(59,?IPv6PacketVector59,35)
+ PacketFixture(60,?IPv6PacketVector60,36)
+ PacketFixture(61,?IPv6PacketVector61,37)
+ PacketFixture(62,?IPv6PacketVector62,38)
+ PacketFixture(63,?IPv6PacketVector63,39)
+ PacketFixture(64,?IPv6PacketVector64,44)
+ PacketFixture(65,?IPv6PacketVector65,45)
+ PacketFixture(66,?IPv6PacketVector66,52)
+ PokeI($E1C00008,67)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+IPv6PacketVector0:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,104,101,108,108,111,90
+IPv6PacketVector1:
+ Data.a 106,81,35,69,0,7,59,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,105,103,110,111,114,101,100,90
+IPv6PacketVector2:
+ Data.a 106,81,35,69,0,0,59,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,90
+IPv6PacketVector3:
+ Data.a 106,81,35,69,0,3,250,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,97,98,99,90
+IPv6PacketVector4:
+ Data.a 106,81,35,69,0,11,0,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,0,1,3,0,0,0
+ Data.a 97,98,99,90
+IPv6PacketVector5:
+ Data.a 106,81,35,69,0,11,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,6,0,30,2,4,5,0,0
+ Data.a 49,50,51,90
+IPv6PacketVector6:
+ Data.a 106,81,35,69,0,8,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,64,0,0,0,0,0
+ Data.a 90
+IPv6PacketVector7:
+ Data.a 106,81,35,69,0,8,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,128,0,0,0,0,0
+ Data.a 90
+IPv6PacketVector8:
+ Data.a 106,81,35,69,0,8,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,192,0,0,0,0,0
+ Data.a 90
+IPv6PacketVector9:
+ Data.a 106,81,35,69,0,8,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,30,7,0,0,0,0
+ Data.a 90
+IPv6PacketVector10:
+ Data.a 106,81,35,69,0,9,43,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,77,0,0,0,0,0
+ Data.a 120,90
+IPv6PacketVector11:
+ Data.a 106,81,35,69,0,9,43,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,0,0,0,0,0,0
+ Data.a 120,90
+IPv6PacketVector12:
+ Data.a 106,81,35,69,0,8,43,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,77,1,0,0,0,0
+ Data.a 90
+IPv6PacketVector13:
+ Data.a 106,81,35,69,0,11,44,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,0,0,0,0,4,210
+ Data.a 97,98,99,90
+IPv6PacketVector14:
+ Data.a 106,81,35,69,0,11,44,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,0,1,0,0,4,210
+ Data.a 97,98,99,90
+IPv6PacketVector15:
+ Data.a 106,81,35,69,0,11,44,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,0,8,0,0,4,210
+ Data.a 97,98,99,90
+IPv6PacketVector16:
+ Data.a 106,81,35,69,0,11,44,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,0,255,249,0,0,4,210
+ Data.a 97,98,99,90
+IPv6PacketVector17:
+ Data.a 106,81,35,69,0,16,44,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,44,0,0,0,0,0,4,210
+ Data.a 17,0,0,0,0,0,4,210,90
+IPv6PacketVector18:
+ Data.a 106,81,35,69,0,16,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,0,0,0,0,0,0,0,0
+ Data.a 17,0,0,0,0,0,0,0,90
+IPv6PacketVector19:
+ Data.a 106,81,35,69,0,72,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,60,0,0,0,0,0,0,0
+ Data.a 60,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0
+ Data.a 60,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0,60,0,0,0,0,0,0,0
+ Data.a 60,0,0,0,0,0,0,0,17,0,0,0,0,0,0,0,90
+IPv6PacketVector20:
+ Data.a 106,81,35,69,0,9,50,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,97,98,99,100,101,102,103,104
+ Data.a 105,90
+IPv6PacketVector21:
+ Data.a 106,81,35,69,0,9,51,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,97,98,99,100,101,102,103,104
+ Data.a 105,90
+IPv6PacketVector22:
+ Data.a 106,81,35,69,0,8,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,17,2,0,0,0,0,0,0
+ Data.a 90
+IPv6PacketVector23:
+ Data.a 106,81,35,69,0,3,60,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,97,98,99,90
+IPv6PacketVector24:
+ Data.a 90
+IPv6PacketVector25:
+ Data.a 106,90
+IPv6PacketVector26:
+ Data.a 106,81,90
+IPv6PacketVector27:
+ Data.a 106,81,35,90
+IPv6PacketVector28:
+ Data.a 106,81,35,69,90
+IPv6PacketVector29:
+ Data.a 106,81,35,69,0,90
+IPv6PacketVector30:
+ Data.a 106,81,35,69,0,5,90
+IPv6PacketVector31:
+ Data.a 106,81,35,69,0,5,17,90
+IPv6PacketVector32:
+ Data.a 106,81,35,69,0,5,17,64,90
+IPv6PacketVector33:
+ Data.a 106,81,35,69,0,5,17,64,32,90
+IPv6PacketVector34:
+ Data.a 106,81,35,69,0,5,17,64,32,1,90
+IPv6PacketVector35:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,90
+IPv6PacketVector36:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,90
+IPv6PacketVector37:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,90
+IPv6PacketVector38:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,90
+IPv6PacketVector39:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,90
+IPv6PacketVector40:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,90
+IPv6PacketVector41:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,90
+IPv6PacketVector42:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,90
+IPv6PacketVector43:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,90
+IPv6PacketVector44:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,90
+IPv6PacketVector45:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector46:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector47:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector48:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 90
+IPv6PacketVector49:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,90
+IPv6PacketVector50:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,90
+IPv6PacketVector51:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,90
+IPv6PacketVector52:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,90
+IPv6PacketVector53:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,90
+IPv6PacketVector54:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,90
+IPv6PacketVector55:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,90
+IPv6PacketVector56:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,90
+IPv6PacketVector57:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,90
+IPv6PacketVector58:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,90
+IPv6PacketVector59:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector60:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector61:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector62:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,90
+IPv6PacketVector63:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,90
+IPv6PacketVector64:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,104,101,108,108,90
+IPv6PacketVector65:
+ Data.a 74,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,104,101,108,108,111,90
+IPv6PacketVector66:
+ Data.a 106,81,35,69,0,5,17,64,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,171,205,104,101,108,108,111,112,97,100
+ Data.a 100,105,110,103,90
+EndDataSection

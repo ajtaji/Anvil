@@ -25,6 +25,7 @@ Structure IPv6PacketView
  flowLabel.i
  errorOffset.i
  optionAction.i
+ fragmented.i
 EndStructure
 
 ; Returns 0 or a negative reason. Only errorOffset/optionAction are usable
@@ -96,6 +97,7 @@ Procedure.i IPv6PacketParse(packet.i,bytes.i,*view.IPv6PacketView)
  *view\payload=packet+at : *view\payloadBytes=size-at
  If nextHeader=59 : *view\payloadBytes=0 : EndIf
  *view\protocol=nextHeader : *view\hopLimit=PeekA(packet+7)
+ *view\fragmented=fragment
  word=NetReadBE32(packet)
  *view\trafficClass=(word>>20)&255 : *view\flowLabel=word&$FFFFF
  *view\errorOffset=0

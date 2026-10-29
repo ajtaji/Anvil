@@ -1,0 +1,213 @@
+XIncludeFile "Anvil/Network/ipv6_neighbor.pbi"
+XIncludeFile "RaspberryPi4/Lib/mmu.pi4"
+
+Global wtable.i
+Global *pet
+Global ip.IPv6PacketView
+Global nd.IPv6NeighborView
+Global Dim output.a[128]
+Global Dim fallbackMac.a[6]
+Procedure CaptureTable()
+ ASM
+ adrp x1, global_wtable
+ add x1, x1, #:lo12:global_wtable
+ str x0, [x1]
+ EndASM
+EndProcedure
+Procedure NeighborFixture(index.i,data.i,n.i)
+ Define p.i,i.i,rc.i,built.i,small.i,guard.i,mac.i
+ p=$E1C00100+index*256
+ rc=IPv6NeighborParse(data,n,@ip,@nd)
+ PokeI(p,rc)
+ If rc=0
+  PokeI(p+8,nd\kind) : PokeI(p+16,nd\flags)
+  If nd\target<>0
+   For i=0 To 15 : PokeA(p+64+i,PeekA(nd\target+i)) : Next
+  EndIf
+  For i=0 To 127 : output[i]=$A5 : Next
+  built=0 : small=0 : guard=1
+  If nd\kind=135
+   small=IPv6NeighborSolicit(@output[0],63,ip\source,nd\target,nd\sourceMac)
+  ElseIf nd\kind=136
+   small=IPv6NeighborAdvertise(@output[0],63,nd\target,ip\destination,nd\targetMac,nd\flags)
+  EndIf
+  For i=0 To 127 : If output[i]<>$A5 : guard=0 : EndIf : Next
+  If nd\kind=135
+   built=IPv6NeighborSolicit(@output[0],128,ip\source,nd\target,nd\sourceMac)
+  ElseIf nd\kind=136
+   built=IPv6NeighborAdvertise(@output[0],128,nd\target,ip\destination,nd\targetMac,nd\flags)
+  EndIf
+  If built>0
+   For i=built To 127 : If output[i]<>$A5 : guard=0 : EndIf : Next
+   For i=0 To built-1 : PokeA(p+96+i,output[i]) : Next
+  EndIf
+  PokeI(p+24,built) : PokeI(p+32,small) : PokeI(p+40,guard)
+ EndIf
+ pet()
+EndProcedure
+Procedure.i Main()
+ Define i.i,rc.i
+ CaptureTable()
+ For i=0 To 65535 : PokeA($E1C00000+i,0) : Next
+ PokeI($E1C00000,$49503634)
+ pet=PeekI(wtable+16+6*8)
+ MmuClearNc() : MmuAddNc($08A00000,$09200000) : MmuAddNc($08100000,$08180000)
+ rc=MmuBuildTables($4F80000) : If rc<>0 : ProcedureReturn 2 : EndIf
+ MmuEnableCached()
+ NeighborFixture(0,?IPv6NeighborVector0,72)
+ NeighborFixture(1,?IPv6NeighborVector1,64)
+ NeighborFixture(2,?IPv6NeighborVector2,72)
+ NeighborFixture(3,?IPv6NeighborVector3,72)
+ NeighborFixture(4,?IPv6NeighborVector4,64)
+ NeighborFixture(5,?IPv6NeighborVector5,56)
+ NeighborFixture(6,?IPv6NeighborVector6,48)
+ NeighborFixture(7,?IPv6NeighborVector7,72)
+ NeighborFixture(8,?IPv6NeighborVector8,72)
+ NeighborFixture(9,?IPv6NeighborVector9,72)
+ NeighborFixture(10,?IPv6NeighborVector10,48)
+ NeighborFixture(11,?IPv6NeighborVector11,80)
+ NeighborFixture(12,?IPv6NeighborVector12,72)
+ NeighborFixture(13,?IPv6NeighborVector13,72)
+ NeighborFixture(14,?IPv6NeighborVector14,64)
+ NeighborFixture(15,?IPv6NeighborVector15,72)
+ NeighborFixture(16,?IPv6NeighborVector16,72)
+ NeighborFixture(17,?IPv6NeighborVector17,72)
+ NeighborFixture(18,?IPv6NeighborVector18,72)
+ NeighborFixture(19,?IPv6NeighborVector19,56)
+ NeighborFixture(20,?IPv6NeighborVector20,48)
+ NeighborFixture(21,?IPv6NeighborVector21,72)
+ NeighborFixture(22,?IPv6NeighborVector22,72)
+ NeighborFixture(23,?IPv6NeighborVector23,80)
+ NeighborFixture(24,?IPv6NeighborVector24,72)
+ NeighborFixture(25,?IPv6NeighborVector25,80)
+ NeighborFixture(26,?IPv6NeighborVector26,64)
+ NeighborFixture(27,?IPv6NeighborVector27,80)
+ NeighborFixture(28,?IPv6NeighborVector28,72)
+ NeighborFixture(29,?IPv6NeighborVector29,72)
+ PokeI($E1C00008,30)
+ MmuDisableCachedFlushed()
+ ProcedureReturn 0
+EndProcedure
+DataSection
+IPv6NeighborVector0:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,181,111,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+IPv6NeighborVector1:
+ Data.a 96,0,0,0,0,24,58,255,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,207,54,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+IPv6NeighborVector2:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52,136,0,82,243,96,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,2,1,2,1,2,3,4,5
+IPv6NeighborVector3:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,136,0,164,164,32,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,2,1,2,1,2,3,4,5
+IPv6NeighborVector4:
+ Data.a 96,0,0,0,0,24,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,134,0,96,234,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,1,1,2,1,2,3,4,5
+IPv6NeighborVector5:
+ Data.a 96,0,0,0,0,16,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,2,133,0,97,241,0,0,0,0
+ Data.a 1,1,2,1,2,3,4,5
+IPv6NeighborVector6:
+ Data.a 96,0,0,0,0,8,58,255,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,2,133,0,123,184,0,0,0,0
+IPv6NeighborVector7:
+ Data.a 96,0,0,0,0,32,58,254,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,181,111,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+IPv6NeighborVector8:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,1,181,110,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+IPv6NeighborVector9:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,181,111,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,4
+IPv6NeighborVector10:
+ Data.a 96,0,0,0,0,8,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,19,139,0,0,0,0
+IPv6NeighborVector11:
+ Data.a 96,0,0,0,0,40,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,137,0,102,228,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0
+IPv6NeighborVector12:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,11,101,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,2,1,2,3,4,5
+IPv6NeighborVector13:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,10,105,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,2,1,2,3,4,5
+IPv6NeighborVector14:
+ Data.a 96,0,0,0,0,24,58,255,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,135,0,36,176,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+IPv6NeighborVector15:
+ Data.a 96,0,0,0,0,32,58,255,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,198,36,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+IPv6NeighborVector16:
+ Data.a 96,0,0,0,0,32,58,255,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52,136,0,167,236,96,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,2,1,2,1,2,3,4,5
+IPv6NeighborVector17:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52,136,0,168,232,96,0,0,0
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,1,2,1,2,3,4,5
+IPv6NeighborVector18:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,136,0,100,164,96,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,2,1,2,1,2,3,4,5
+IPv6NeighborVector19:
+ Data.a 96,0,0,0,0,16,58,255,32,1,13,184,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,134,0,76,247,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0
+IPv6NeighborVector20:
+ Data.a 96,0,0,0,0,8,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,134,0,106,4,0,0,0,0
+IPv6NeighborVector21:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,189,121,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,0,0,0,0,0,0,0
+IPv6NeighborVector22:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,189,119,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,2,0,0,0,0,0,0
+IPv6NeighborVector23:
+ Data.a 96,0,0,0,0,40,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,189,111,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,2,0,0,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0
+IPv6NeighborVector24:
+ Data.a 96,0,0,0,0,32,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,180,111,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,3,1,2,3,4,5
+IPv6NeighborVector25:
+ Data.a 96,0,0,0,0,40,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,172,93,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+ Data.a 1,1,2,1,2,3,4,5
+IPv6NeighborVector26:
+ Data.a 96,0,0,0,0,24,58,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1,134,0,108,242,0,0,0,0
+ Data.a 0,0,0,0,0,0,0,0,253,1,0,0,0,0,0,0
+IPv6NeighborVector27:
+ Data.a 96,0,0,0,0,40,44,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,58,0,0,0,0,0,0,123
+ Data.a 135,0,181,111,0,0,0,0,254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120
+ Data.a 1,1,2,1,2,3,4,5
+IPv6NeighborVector28:
+ Data.a 96,0,0,0,0,32,17,255,254,128,0,0,0,0,0,0,0,0,0,0,0,0,18,52
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,181,152,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+IPv6NeighborVector29:
+ Data.a 96,0,0,0,0,32,58,255,255,2,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+ Data.a 255,2,0,0,0,0,0,0,0,0,0,1,255,0,86,120,135,0,199,32,0,0,0,0
+ Data.a 254,128,0,0,0,0,0,0,0,0,0,0,0,0,86,120,1,1,2,1,2,3,4,5
+EndDataSection

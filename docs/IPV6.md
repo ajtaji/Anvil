@@ -88,3 +88,29 @@ existing IPv4 link after installing the shared checksum owner. Capture 281
 returned healthy; the cooperative TLS timings remained approximately 2.7 ms
 maximum service and 8.6 ms HTTP Step in that run. This is IPv4 regression
 evidence, not an IPv6 wire test.
+
+
+## Neighbor discovery messages
+
+`ipv6_neighbor.pbi` validates Ethernet Router Solicitation, Router Advertisement,
+Neighbor Solicitation and Neighbor Advertisement messages. It checks the IPv6
+hop limit, ICMPv6 code/checksum, source/target restrictions, bounded options and
+DAD destination rules. Fragmented ND is refused, including atomic fragments
+(RFC 6980). The packet view now exposes `fragmented` for this policy.
+Redirect messages are not implemented. A successful parse is not authorization
+to update a neighbor cache: ownership, interface scope and state remain the
+endpoint's responsibility. Returned spans borrow the input packet.
+
+`IPv6NeighborSolicit` and `IPv6NeighborAdvertise` emit complete IPv6 messages
+with checksums. Solicitation with an unspecified source emits the DAD form
+without a source link-layer option. Advertisement emits the owned address and
+Ethernet target option; a multicast destination forbids the solicited flag.
+Inputs must not overlap output, and insufficient capacity fails before writes.
+
+Anvil 427 capture 282 passed 30 independently constructed message cases and
+byte-exact output/guard checks. Capture 283 passed 67 packet cases including
+the explicit atomic-fragment marker. Both returned with cores, fonts and
+Vulkan healthy. Pi 3 and Rock Pi compile the shared neighbor implementation;
+these are compile checks, not physical qualification on those targets.
+Multicast reception, neighbor state, DAD/SLAAC and IPv6 transport integration
+are still required before this can carry web traffic.
